@@ -29,6 +29,19 @@ func (f *fakeWakeSender) Deliver(_ context.Context, target, text string, source 
 	return f.delivery, f.reason
 }
 
+// fakeAgentDirectory is an in-memory AgentDirectory. It records lookups and
+// returns a fixed candidate set so tests can prove selection follows declared
+// capabilities rather than names.
+type fakeAgentDirectory struct {
+	candidates []CandidateAgent
+	calls      int
+}
+
+func (f *fakeAgentDirectory) CandidateAgents(_ context.Context) []CandidateAgent {
+	f.calls++
+	return f.candidates
+}
+
 // connectWakeServer drives an already-built server through in-memory
 // transports. It lets a test attach the wake tool first, then inspect tools or
 // call them over the same MCP path CI exercises.
@@ -794,5 +807,274 @@ func TestWokeOverInMemoryTransport(t *testing.T) {
 	}
 	if !out.Woke || !out.OK || out.Delivery != DeliveryQueue {
 		t.Errorf("client saw woke=%v ok=%v delivery=%q, want true/true/queue", out.Woke, out.OK, out.Delivery)
+	}
+}
+
+// TestSelectAgentByCapabilitiesRequiresAll proves the pure matcher only picks
+// a session that declares every requested capability and never guesses when
+// the required set is empty (ADR 0037 p1).
+func TestSelectAgentByCapabilitiesRequiresAll(t *testing.T) {
+	candidates := []CandidateAgent{
+		{Target: "chat-only", Capabilities: []Capability{"chat"}},
+		{Target: "has-both", Capabilities: []Capability{"review", "build"}},
+	}
+	if got, ok := selectAgentByCapabilities(candidates, []Capability{"review", "build"}); !ok || got != "has-both" {
+		t.Errorf("select(review, build) = %q, %v; want has-both, true", got, ok)
+	}
+	if got, ok := selectAgentByCapabilities(candidates, []Capability{"deploy"}); ok || got != "" {
+		t.Errorf("select(deploy) = %q, %v; want empty, false", got, ok)
+	}
+	if got, ok := selectAgentByCapabilities(candidates, nil); ok || got != "" {
+		t.Errorf("select(nil) = %q, %v; want empty, false", got, ok)
+	}
+}
+
+// TestWakeSelectsAgentByCapability is the T3.47 acceptance core: the caller
+// asks for capabilities without naming a session, and wake delivers to the
+// session that declares them.
+func TestWakeSelectsAgentByCapability(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "chat-session", Capabilities: []Capability{"chat"}},
+		{Target: "review-session", Capabilities: []Capability{"review", "build"}},
+	}}
+	handler := NewCapabilityWakeHandler(sender, directory)
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Text:                 "obligation-1@7",
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliverySteer || !out.OK {
+		t.Errorf("delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
+	}
+	if sender.calls != 1 || sender.lastTarget != "review-session" {
+		t.Errorf("sender calls=%d target=%q, want 1 and review-session", sender.calls, sender.lastTarget)
+	}
+	if directory.calls != 1 {
+		t.Errorf("directory calls=%d, want 1", directory.calls)
+	}
+}
+
+// TestWakeCapabilityIsNotANameLookup proves a session name is a delivery key,
+// not a selection criterion (ADR 0037 p1). The capable session wins whether or
+// not the caller names a different session, and renaming it does not change the
+// choice.
+func TestWakeCapabilityIsNotANameLookup(t *testing.T) {
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "favourite-name", Capabilities: []Capability{"chat"}},
+		{Target: "worker-7", Capabilities: []Capability{"review"}},
+	}}
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	first, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Target:               "favourite-name",
+		Text:                 "p",
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !first.OK || sender.lastTarget != "worker-7" {
+		t.Errorf("got ok=%v target=%q, want true/worker-7", first.OK, sender.lastTarget)
+	}
+
+	directory.candidates[1].Target = "worker-99"
+	renamedSender := &fakeWakeSender{delivery: DeliveryQueue}
+	renamed, err := NewCapabilityWakeHandler(renamedSender, directory).Wake(context.Background(), WakeInput{
+		Text:                 "p",
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("Wake() after rename error = %v, want nil", err)
+	}
+	if !renamed.OK || renamedSender.lastTarget != "worker-99" {
+		t.Errorf("after rename got ok=%v target=%q, want true/worker-99", renamed.OK, renamedSender.lastTarget)
+	}
+}
+
+// TestWakeNoCapabilityMatchIsAnHonestRefusal keeps an unmatched capability
+// request from becoming a delivery. The reason explains the refusal and no
+// sender is touched.
+func TestWakeNoCapabilityMatchIsAnHonestRefusal(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "chat-session", Capabilities: []Capability{"chat"}},
+	}}
+	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Text:                 "p",
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil for an honest refusal", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK {
+		t.Errorf("delivery=%q ok=%v, want unsupported/false", out.Delivery, out.OK)
+	}
+	if !strings.Contains(out.Reason, "capabilit") {
+		t.Errorf("reason=%q, want it to name the missing capabilities", out.Reason)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls=%d, want 0 when no session matches", sender.calls)
+	}
+}
+
+// TestWakeCapabilityWithoutDirectoryIsUnsupported proves a capability request
+// is never turned into a guessed name when the environment has no directory.
+func TestWakeCapabilityWithoutDirectoryIsUnsupported(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Text:                 "p",
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK {
+		t.Errorf("delivery=%q ok=%v, want unsupported/false", out.Delivery, out.OK)
+	}
+	if !strings.Contains(out.Reason, "directory") {
+		t.Errorf("reason=%q, want it to name the missing directory", out.Reason)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls=%d, want 0 without a directory", sender.calls)
+	}
+}
+
+// TestWakeCapabilityKeepsHumanFlagsFirst guards T2.24: a pending question or
+// approval interrupts before the directory is consulted or delivery attempted.
+func TestWakeCapabilityKeepsHumanFlagsFirst(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "review-session", Capabilities: []Capability{"review"}},
+	}}
+	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Text:                 "p",
+		HasPendingQuestion:   true,
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.Interrupted || out.Delivery != DeliveryInterrupted || out.OK {
+		t.Errorf("got interrupted=%v delivery=%q ok=%v, want true/%q/false", out.Interrupted, out.Delivery, out.OK, DeliveryInterrupted)
+	}
+	if directory.calls != 0 || sender.calls != 0 {
+		t.Errorf("directory calls=%d sender calls=%d, want 0/0 on interruption", directory.calls, sender.calls)
+	}
+}
+
+// TestWakeCapabilityKeepsBothDeliveryModes guards T2.20: capability selection
+// feeds the same two honest success modes as the explicit-target path.
+func TestWakeCapabilityKeepsBothDeliveryModes(t *testing.T) {
+	for _, delivery := range []Delivery{DeliverySteer, DeliveryQueue} {
+		sender := &fakeWakeSender{delivery: delivery}
+		directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+			{Target: "review-session", Capabilities: []Capability{"review"}},
+		}}
+		out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+			Text:                 "p",
+			RequiredCapabilities: []Capability{"review"},
+		})
+		if err != nil {
+			t.Fatalf("Wake(%q) error = %v, want nil", delivery, err)
+		}
+		if out.Delivery != delivery || !out.OK {
+			t.Errorf("Wake(%q) delivery=%q ok=%v, want %q/true", delivery, out.Delivery, out.OK, delivery)
+		}
+		if out.Reason != "" {
+			t.Errorf("Wake(%q) reason=%q, want empty on success", delivery, out.Reason)
+		}
+	}
+}
+
+// TestWakeWithoutCapabilitiesKeepsExplicitTarget keeps the path used before
+// ADR 0037 p1: an explicit target is still the delivery key and no directory
+// lookup happens.
+func TestWakeWithoutCapabilitiesKeepsExplicitTarget(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "capable-session", Capabilities: []Capability{"review"}},
+	}}
+	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Target: "named-session",
+		Text:   "p",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.OK || sender.lastTarget != "named-session" {
+		t.Errorf("ok=%v target=%q, want true/named-session", out.OK, sender.lastTarget)
+	}
+	if directory.calls != 0 {
+		t.Errorf("directory calls=%d, want 0 when no capabilities are requested", directory.calls)
+	}
+}
+
+// TestWakeSchemaHasRequiredCapabilities proves an MCP client can send the
+// capability request that drives the new selection path.
+func TestWakeSchemaHasRequiredCapabilities(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "requiredCapabilities") {
+		t.Errorf("wake input schema missing requiredCapabilities: %s", inputSchema)
+	}
+}
+
+// TestWakeCapabilityOverInMemoryTransport drives capability selection through
+// a real MCP client and server. It proves the request is decoded from the
+// schema and the chosen target reaches the sender, not just the local handler.
+func TestWakeCapabilityOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "chat-session", Capabilities: []Capability{"chat"}},
+		{Target: "review-session", Capabilities: []Capability{"review"}},
+	}}
+	AttachWake(server, NewCapabilityWakeHandler(sender, directory))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Text:                 "p",
+			RequiredCapabilities: []Capability{"review"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Delivery != DeliveryQueue || !out.OK {
+		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
+	}
+	if sender.lastTarget != "review-session" {
+		t.Errorf("sender target=%q, want review-session", sender.lastTarget)
 	}
 }

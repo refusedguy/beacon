@@ -26,6 +26,12 @@
 // not derived from delivery, OK, or the delivered/claimed/read timestamps of
 // ADR 0014: a message can be delivered without starting a new agent turn.
 //
+// ADR 0037 p1 adds capability-based recipient selection. A session declares
+// capabilities and the environment reports those declarations through a port.
+// When a caller requests capabilities, the core picks the session that declares
+// them all and uses its name only as the delivery key. The core keeps no list
+// of agent names (ADR 0024).
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -107,6 +113,11 @@ type WakeInput struct {
 	// caller reports it when it observes the new turn, never from a steer or
 	// queue receipt. The tool echoes it without interpreting it.
 	Woke bool `json:"woke,omitempty" jsonschema:"separate confirmation that the agent began work; not derived from delivery or delivery timestamps"`
+	// RequiredCapabilities are the abilities the recipient must declare
+	// (ADR 0037 p1). When set, the core selects the delivery target through the
+	// AgentDirectory instead of using a name from the call. An empty list keeps
+	// the explicit Target path used by earlier callers.
+	RequiredCapabilities []Capability `json:"requiredCapabilities,omitempty" jsonschema:"capabilities the recipient session must declare; selection is by capability, not by session name"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -152,17 +163,82 @@ type WakeSender interface {
 	Deliver(ctx context.Context, target, text string, source WakeSource) (Delivery, string)
 }
 
-// WakeHandler implements the wake tool over a WakeSender. It holds no state
-// beyond the sender and performs no I/O of its own.
+// Capability is one declared ability of an agent session (ADR 0037 p1). The
+// core treats it as an opaque string. The environment owns the vocabulary and
+// the core only compares values.
+type Capability string
+
+// CandidateAgent is one session the environment offers as a possible
+// recipient. Target is the opaque delivery key and Capabilities are the
+// abilities that session declares. The name in Target is never a selection
+// criterion.
+type CandidateAgent struct {
+	Target       string       `json:"target"`
+	Capabilities []Capability `json:"capabilities"`
+}
+
+// AgentDirectory is the port the environment adapter implements so the core
+// can match a follow-up to a session by declared capability. The core does not
+// know which concrete agents exist and hardcodes no names (ADR 0037 p1 and
+// ADR 0024).
+type AgentDirectory interface {
+	CandidateAgents(ctx context.Context) []CandidateAgent
+}
+
+// declaresAll reports whether declared covers every required capability. A
+// session may declare more capabilities than the caller needs.
+func declaresAll(declared, required []Capability) bool {
+	set := make(map[Capability]struct{}, len(declared))
+	for _, c := range declared {
+		set[c] = struct{}{}
+	}
+	for _, c := range required {
+		if _, ok := set[c]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// selectAgentByCapabilities picks the first candidate that declares all
+// required capabilities. Input order breaks ties so the choice is repeatable.
+// It never compares session names and returns false when nothing matches.
+func selectAgentByCapabilities(candidates []CandidateAgent, required []Capability) (string, bool) {
+	if len(required) == 0 {
+		return "", false
+	}
+	for _, candidate := range candidates {
+		if candidate.Target == "" {
+			continue
+		}
+		if declaresAll(candidate.Capabilities, required) {
+			return candidate.Target, true
+		}
+	}
+	return "", false
+}
+
+// WakeHandler implements the wake tool over a WakeSender and, optionally, an
+// AgentDirectory. It holds no state beyond those ports and performs no I/O of
+// its own.
 type WakeHandler struct {
-	sender WakeSender
+	sender    WakeSender
+	directory AgentDirectory
 }
 
 // NewWakeHandler builds a handler over sender. A nil sender is allowed here and
 // is reported as unsupported at call time, so a misconfigured environment
-// cannot fake a successful delivery.
+// cannot fake a successful delivery. Callers that only have a sender keep the
+// explicit-target path from before ADR 0037 p1.
 func NewWakeHandler(sender WakeSender) *WakeHandler {
 	return &WakeHandler{sender: sender}
+}
+
+// NewCapabilityWakeHandler builds a handler that can resolve a delivery target
+// from declared capabilities. A nil directory is allowed and makes a capability
+// request an honest refusal instead of a guess.
+func NewCapabilityWakeHandler(sender WakeSender, directory AgentDirectory) *WakeHandler {
+	return &WakeHandler{sender: sender, directory: directory}
 }
 
 // Handle adapts Wake to the go-sdk typed tool handler signature.
@@ -182,17 +258,49 @@ func (h *WakeHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 // Source is normalized and passed to the sender, then echoed on the output so
 // a review (diff comment) can be traced onto its ADR 0014 receipt. Woke is
 // only echoed from the input; no delivery outcome sets it (ADR 0032 p2).
+// Required capabilities are resolved through the directory into a delivery
+// target (ADR 0037 p1); without them the explicit Target still applies.
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	if in.HasPendingQuestion || in.PendingApproval {
 		return interruptedWake(in), nil
 	}
-	if in.Target == "" || in.Text == "" {
-		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wake: target and text are required")
+	if in.Text == "" {
+		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wake: text is required")
 	}
 	source := normalizeSource(in.Source)
 	if !validSource(source) {
 		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source)))
 	}
+
+	target := in.Target
+	if len(in.RequiredCapabilities) > 0 {
+		if h == nil || h.directory == nil {
+			return WakeOutput{
+				Delivery: DeliveryUnsupported,
+				OK:       false,
+				Source:   source,
+				Executor: in.Executor,
+				Reason:   "wake: no agent directory configured for capability selection",
+				Woke:     in.Woke,
+			}, nil
+		}
+		selected, ok := selectAgentByCapabilities(h.directory.CandidateAgents(ctx), in.RequiredCapabilities)
+		if !ok {
+			return WakeOutput{
+				Delivery: DeliveryUnsupported,
+				OK:       false,
+				Source:   source,
+				Executor: in.Executor,
+				Reason:   "wake: no session declares the required capabilities",
+				Woke:     in.Woke,
+			}, nil
+		}
+		target = selected
+	}
+	if target == "" {
+		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no capabilities are requested")
+	}
+
 	if h == nil || h.sender == nil {
 		return WakeOutput{
 			Delivery: DeliveryUnsupported,
@@ -204,7 +312,7 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 		}, nil
 	}
 
-	delivery, reason := h.sender.Deliver(ctx, in.Target, in.Text, source)
+	delivery, reason := h.sender.Deliver(ctx, target, in.Text, source)
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
 		return WakeOutput{Delivery: delivery, OK: true, Source: source, Executor: in.Executor, Woke: in.Woke}, nil
