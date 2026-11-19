@@ -1863,3 +1863,377 @@ func (d *DB) AcceptedTaskCount() (int, error) {
 	}
 	return n, nil
 }
+
+// ---- Named queues with fenced leases and atomic continuations (ADR 0058 feature 5, T3.132) ----
+//
+// A named queue is a durable FIFO list of tasks identified only by a name.
+// Leasing the oldest pending task hands one worker a fencing token that is
+// strictly higher than every token this store has issued before. Completing a
+// leased task and enqueueing its continuation happen in ONE transaction (ADR
+// 0015), so the next step can never be lost in the gap between two commits.
+//
+// This is a different object from the T3.97 worktree lease (an in-memory lease
+// of a directory with a heartbeat) and from the T3.116 fenced enqueue (which
+// stores a token minted elsewhere together with a receipt and an inbox
+// message). Here the queue mints the token when it leases the task, and the
+// continuation is another task in a named queue written by the same
+// transaction that completes the current one.
+
+const (
+	queueStatePending = "pending"
+	queueStateLeased  = "leased"
+	queueStateDone    = "done"
+)
+
+// createQueueTablesSQL owns the named-queue tables. As with the other tables
+// in this file, this card owns no migration file, so they are created on first
+// use inside the caller's Write transaction. queue_tasks keeps one row per task
+// with its current lease; queue_fence_counters keeps the monotonic token source
+// so tokens keep increasing across restarts.
+var createQueueTablesSQL = []string{
+	`CREATE TABLE IF NOT EXISTS queue_tasks (
+	   id            TEXT PRIMARY KEY,
+	   queue         TEXT NOT NULL,
+	   payload       BLOB NOT NULL,
+	   state         TEXT NOT NULL,
+	   owner_id      TEXT NOT NULL DEFAULT '',
+	   fencing_token INTEGER NOT NULL DEFAULT 0,
+	   lease_until   INTEGER NOT NULL DEFAULT 0,
+	   created_at    INTEGER NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS queue_tasks_by_queue ON queue_tasks(queue, state, created_at, id)`,
+	`CREATE TABLE IF NOT EXISTS queue_fence_counters (
+	   id         INTEGER PRIMARY KEY CHECK (id = 1),
+	   last_token INTEGER NOT NULL)`,
+}
+
+func ensureQueueTables(tx *sql.Tx) error {
+	for _, stmt := range createQueueTablesSQL {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("store: queue: create table: %w", err)
+		}
+	}
+	return nil
+}
+
+// nextQueueFenceToken returns the next strictly increasing lease number. It is
+// called inside a Write transaction, so the single writer serialises every
+// lease; the counter is durable, so a restart cannot reuse a token.
+func nextQueueFenceToken(tx *sql.Tx) (uint64, error) {
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO queue_fence_counters (id, last_token) VALUES (1, 0)`); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`UPDATE queue_fence_counters SET last_token = last_token + 1 WHERE id = 1`); err != nil {
+		return 0, err
+	}
+	var token int64
+	if err := tx.QueryRow(`SELECT last_token FROM queue_fence_counters WHERE id = 1`).Scan(&token); err != nil {
+		return 0, err
+	}
+	return uint64(token), nil
+}
+
+// QueueTask is one task stored in a named queue. State is one of pending,
+// leased or done. OwnerID, FencingToken and LeaseUntil describe the lease and
+// are populated by LeaseQueueTask; writers of a new task leave them empty.
+type QueueTask struct {
+	ID           string
+	Queue        string
+	Payload      []byte
+	State        string
+	OwnerID      string
+	FencingToken uint64
+	LeaseUntil   int64
+	CreatedAt    int64
+}
+
+// QueueLease is the task a worker got from a named queue. FencingToken is the
+// lease number it must present to complete the task; a later lease of the same
+// task carries a higher token and makes this one stale.
+type QueueLease struct {
+	TaskID       string
+	Queue        string
+	OwnerID      string
+	Payload      []byte
+	FencingToken uint64
+	LeaseUntil   int64
+}
+
+// QueueContinuation is the next step to enqueue atomically with a completion.
+// It may name a different queue from the task that produced it.
+type QueueContinuation struct {
+	Queue   string
+	TaskID  string
+	Payload []byte
+}
+
+// QueueCompletionResult reports what one CompleteQueueTask committed.
+// Completed marks the current task's transition to done. Continued marks a
+// newly enqueued continuation; it is false on an idempotent repeat.
+type QueueCompletionResult struct {
+	TaskID       string
+	FencingToken uint64
+	Completed    bool
+	Continued    bool
+}
+
+// QueueFenceStaleError reports a completion whose token is not the one the task
+// currently holds. The lease was reclaimed and handed to another worker, so
+// the store refuses the whole write: no completion, no continuation.
+type QueueFenceStaleError struct {
+	TaskID    string
+	Presented uint64
+	Current   uint64
+}
+
+func (e *QueueFenceStaleError) Error() string {
+	return fmt.Sprintf("store: queue: task %q fencing token %d is stale, task holds token %d",
+		e.TaskID, e.Presented, e.Current)
+}
+
+// IsQueueFenceStale reports whether err is a stale queue-fence rejection.
+func IsQueueFenceStale(err error) bool {
+	var stale *QueueFenceStaleError
+	return errors.As(err, &stale)
+}
+
+func scanQueueTask(scanner interface{ Scan(...any) error }) (QueueTask, error) {
+	var t QueueTask
+	var token int64
+	err := scanner.Scan(&t.ID, &t.Queue, &t.Payload, &t.State, &t.OwnerID,
+		&token, &t.LeaseUntil, &t.CreatedAt)
+	t.FencingToken = uint64(token)
+	return t, err
+}
+
+// EnqueueQueueTask puts a task into a named queue in pending state. A repeat
+// with the same task id inserts nothing, so a redelivered enqueue cannot
+// create a second task. Payload is redacted before it reaches the file (ADR
+// 0012).
+func (d *DB) EnqueueQueueTask(queue, taskID string, payload []byte) error {
+	if strings.TrimSpace(queue) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty queue name")
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty task id")
+	}
+	clean := Redact(payload)
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureQueueTables(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			INSERT OR IGNORE INTO queue_tasks
+			  (id, queue, payload, state, owner_id, fencing_token, lease_until, created_at)
+			VALUES (?, ?, ?, ?, '', 0, 0, ?)`,
+			taskID, queue, clean, queueStatePending, time.Now().UTC().UnixNano())
+		return err
+	})
+}
+
+// LeaseQueueTask reclaims expired leases in queue and hands the oldest pending
+// task to ownerID for ttl, all in one transaction. Every successful lease mints
+// a fresh fencing token, so a worker whose lease was reclaimed can no longer
+// complete the task with its old token. found=false means the queue has no
+// available task. The task is not deleted on lease: it stays until completion,
+// so a reclaim can hand the same work to a new owner.
+func (d *DB) LeaseQueueTask(queue, ownerID string, now time.Time, ttl time.Duration) (QueueLease, bool, error) {
+	if strings.TrimSpace(queue) == "" {
+		return QueueLease{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty queue name")
+	}
+	if strings.TrimSpace(ownerID) == "" {
+		return QueueLease{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty owner id")
+	}
+	if ttl <= 0 {
+		return QueueLease{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: queue: non-positive ttl")
+	}
+	leaseUntil := now.Add(ttl).UnixNano()
+	var out QueueLease
+	found := false
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureQueueTables(tx); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			UPDATE queue_tasks
+			SET state = ?, owner_id = '', fencing_token = 0, lease_until = 0
+			WHERE queue = ? AND state = ? AND lease_until <= ?`,
+			queueStatePending, queue, queueStateLeased, now.UnixNano()); err != nil {
+			return fmt.Errorf("store: queue: reclaim: %w", err)
+		}
+		row := tx.QueryRow(`
+			SELECT id, queue, payload, state, owner_id, fencing_token, lease_until, created_at
+			FROM queue_tasks
+			WHERE queue = ? AND state = ? ORDER BY created_at, id LIMIT 1`,
+			queue, queueStatePending)
+		task, err := scanQueueTask(row)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("store: queue: select pending: %w", err)
+		}
+		token, err := nextQueueFenceToken(tx)
+		if err != nil {
+			return fmt.Errorf("store: queue: fence token: %w", err)
+		}
+		if _, err := tx.Exec(`
+			UPDATE queue_tasks
+			SET state = ?, owner_id = ?, fencing_token = ?, lease_until = ?
+			WHERE id = ?`,
+			queueStateLeased, ownerID, int64(token), leaseUntil, task.ID); err != nil {
+			return fmt.Errorf("store: queue: lease: %w", err)
+		}
+		out = QueueLease{
+			TaskID: task.ID, Queue: task.Queue, OwnerID: ownerID,
+			Payload:      append([]byte(nil), task.Payload...),
+			FencingToken: token, LeaseUntil: leaseUntil,
+		}
+		found = true
+		return nil
+	})
+	if err != nil {
+		return QueueLease{}, false, err
+	}
+	return out, found, nil
+}
+
+// CompleteQueueTask marks a leased task done and enqueues its continuation in
+// ONE transaction (ADR 0058 feature 5). finish, when non-nil, runs inside that
+// transaction as the completion side effect; if it fails, neither the
+// completion nor the continuation is committed. A token other than the one the
+// task currently holds is refused before any row changes, so a worker whose
+// lease was reclaimed cannot finish the task twice. A repeat with the current
+// token after the task is already done writes nothing and reports no effect.
+func (d *DB) CompleteQueueTask(taskID, ownerID string, fencingToken uint64, next *QueueContinuation, finish func(*sql.Tx) error) (QueueCompletionResult, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return QueueCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty task id")
+	}
+	if strings.TrimSpace(ownerID) == "" {
+		return QueueCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty owner id")
+	}
+	if fencingToken == 0 {
+		return QueueCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: queue: fencing token is required")
+	}
+	if next != nil {
+		if strings.TrimSpace(next.Queue) == "" {
+			return QueueCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty continuation queue")
+		}
+		if strings.TrimSpace(next.TaskID) == "" {
+			return QueueCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: queue: empty continuation task id")
+		}
+	}
+
+	var out QueueCompletionResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureQueueTables(tx); err != nil {
+			return err
+		}
+		var state, holder string
+		var current int64
+		err := tx.QueryRow(`
+			SELECT state, owner_id, fencing_token FROM queue_tasks WHERE id = ?`, taskID,
+		).Scan(&state, &holder, &current)
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.NewAppError(domain.CodeInvalidInput, "store: queue: unknown task "+taskID)
+		}
+		if err != nil {
+			return fmt.Errorf("store: queue: load task: %w", err)
+		}
+		if uint64(current) != fencingToken {
+			return &QueueFenceStaleError{TaskID: taskID, Presented: fencingToken, Current: uint64(current)}
+		}
+		if state == queueStateDone {
+			// Idempotent retry of a completed task: no second continuation.
+			out = QueueCompletionResult{TaskID: taskID, FencingToken: fencingToken}
+			return nil
+		}
+		if state != queueStateLeased {
+			return domain.NewAppError(domain.CodeRejectDuplicate, "store: queue: task "+taskID+" is not leased")
+		}
+		if holder != ownerID {
+			return domain.NewAppError(domain.CodeRejectDuplicate,
+				"store: queue: task "+taskID+" is held by "+holder+", not "+ownerID)
+		}
+
+		if finish != nil {
+			if err := finish(tx); err != nil {
+				return fmt.Errorf("store: queue: finish: %w", err)
+			}
+		}
+		if _, err := tx.Exec(`
+			UPDATE queue_tasks SET state = ?, owner_id = '', lease_until = 0 WHERE id = ?`,
+			queueStateDone, taskID); err != nil {
+			return fmt.Errorf("store: queue: complete: %w", err)
+		}
+		out.Completed = true
+
+		if next != nil {
+			res, err := tx.Exec(`
+				INSERT OR IGNORE INTO queue_tasks
+				  (id, queue, payload, state, owner_id, fencing_token, lease_until, created_at)
+				VALUES (?, ?, ?, ?, '', 0, 0, ?)`,
+				next.TaskID, next.Queue, Redact(next.Payload), queueStatePending,
+				time.Now().UTC().UnixNano())
+			if err != nil {
+				return fmt.Errorf("store: queue: continuation: %w", err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("store: queue: continuation rows: %w", err)
+			}
+			out.Continued = n == 1
+		}
+		out.TaskID = taskID
+		out.FencingToken = fencingToken
+		return nil
+	})
+	if err != nil {
+		return QueueCompletionResult{}, err
+	}
+	return out, nil
+}
+
+// QueueTask returns one task by id with its current state and lease. found=false
+// means no task with that id is stored. Reads use the separate pool, so a
+// restarted process sees the committed completion and continuation.
+func (d *DB) QueueTask(taskID string) (QueueTask, bool, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "queue_tasks")
+	if err != nil || !ok {
+		return QueueTask{}, false, err
+	}
+	t, err := scanQueueTask(d.readDB.QueryRow(`
+		SELECT id, queue, payload, state, owner_id, fencing_token, lease_until, created_at
+		FROM queue_tasks WHERE id = ?`, taskID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return QueueTask{}, false, nil
+	}
+	if err != nil {
+		return QueueTask{}, false, err
+	}
+	return t, true, nil
+}
+
+// QueueTasks returns every task in a named queue in FIFO order, including
+// leased and done rows. Used by tests and diagnostics.
+func (d *DB) QueueTasks(queue string) ([]QueueTask, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "queue_tasks")
+	if err != nil || !ok {
+		return nil, err
+	}
+	rows, err := d.readDB.Query(`
+		SELECT id, queue, payload, state, owner_id, fencing_token, lease_until, created_at
+		FROM queue_tasks WHERE queue = ? ORDER BY created_at, id`, queue)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []QueueTask
+	for rows.Next() {
+		t, err := scanQueueTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
