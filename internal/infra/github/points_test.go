@@ -321,6 +321,134 @@ func TestLaunchGateWithNilCounterAllows(t *testing.T) {
 	}
 }
 
+// TestPreflightAllowsWhenQuotaAvailable covers the happy path of T3.100: a
+// live quota reading with points left allows the task to be sent.
+func TestPreflightAllowsWhenQuotaAvailable(t *testing.T) {
+	c, _, calls := newTestCounter(t, 0)
+	guard := NewPreflightGuard(c)
+	before := calls.Load()
+
+	d := guard.Check(context.Background())
+	if !d.Allowed {
+		t.Fatalf("Check = %+v, want allowed", d)
+	}
+	if d.Reason != "" {
+		t.Fatalf("Reason = %q, want empty", d.Reason)
+	}
+	if got := calls.Load(); got != before+1 {
+		t.Fatalf("GET /rate_limit calls = %d, want %d (live read)", got, before+1)
+	}
+}
+
+// TestPreflightRefusesWhenLiveQuotaExhausted covers the acceptance criterion
+// of T3.100: a task whose live quota is spent is not sent and gets a refusal
+// reason before any work starts.
+func TestPreflightRefusesWhenLiveQuotaExhausted(t *testing.T) {
+	c, used, _ := newTestCounter(t, 0)
+	guard := NewPreflightGuard(c)
+
+	used.Store(BudgetPerHour)
+	sent := false
+	d, err := guard.Send(context.Background(), func() error {
+		sent = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if d.Allowed {
+		t.Fatal("Check allowed a send with an exhausted live quota")
+	}
+	if d.Reason != PreflightQuotaExhausted {
+		t.Fatalf("Reason = %q, want %q", d.Reason, PreflightQuotaExhausted)
+	}
+	if sent {
+		t.Fatal("send was called with an exhausted quota, task was started")
+	}
+}
+
+// TestPreflightReadsLiveQuotaOnEachCheck proves the check uses the live quota
+// at send time, not a stale value from startup. A recovery at the source flips
+// the next decision without a Resume call or a response from a task.
+func TestPreflightReadsLiveQuotaOnEachCheck(t *testing.T) {
+	c, used, _ := newTestCounter(t, 0)
+	guard := NewPreflightGuard(c)
+
+	used.Store(BudgetPerHour)
+	if d := guard.Check(context.Background()); d.Allowed || d.Reason != PreflightQuotaExhausted {
+		t.Fatalf("check with exhausted quota = %+v, want refusal", d)
+	}
+
+	used.Store(10)
+	if d := guard.Check(context.Background()); !d.Allowed {
+		t.Fatalf("check after live recovery = %+v, want allowed", d)
+	}
+
+	sent := false
+	if _, err := guard.Send(context.Background(), func() error { sent = true; return nil }); err != nil || !sent {
+		t.Fatalf("send after recovery: sent=%v err=%v, want true, nil", sent, err)
+	}
+}
+
+// TestPreflightDoesNotDeferOrResume pins the difference from T3.54
+// backpressure: repeated refusals do not accumulate pending launches and a
+// later send is allowed as soon as the live quota recovers. There is no
+// Resume to call and no wait to schedule.
+func TestPreflightDoesNotDeferOrResume(t *testing.T) {
+	c, used, _ := newTestCounter(t, 0)
+	used.Store(BudgetPerHour)
+	guard := NewPreflightGuard(c)
+
+	for i := 0; i < 3; i++ {
+		d := guard.Check(context.Background())
+		if d.Allowed || d.Reason != PreflightQuotaExhausted {
+			t.Fatalf("check %d = %+v, want refusal", i, d)
+		}
+	}
+	used.Store(1)
+	if d := guard.Check(context.Background()); !d.Allowed {
+		t.Fatalf("check after recovery = %+v, want allowed without Resume", d)
+	}
+}
+
+// TestPreflightRefusesWhenLiveQuotaUnreadable checks the fail-closed path: a
+// failed live reading refuses the send with a reason instead of spending an
+// attempt on an unknown quota.
+func TestPreflightRefusesWhenLiveQuotaUnreadable(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer fail.Close()
+	c.baseURL = fail.URL
+	guard := NewPreflightGuard(c)
+
+	sent := false
+	d, err := guard.Send(context.Background(), func() error { sent = true; return nil })
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if d.Allowed || d.Reason != PreflightQuotaUnknown {
+		t.Fatalf("Check = %+v, want refusal with reason %q", d, PreflightQuotaUnknown)
+	}
+	if sent {
+		t.Fatal("send was called without a live quota reading")
+	}
+}
+
+// TestPreflightGuardWithNilCounterAllows mirrors the backpressure nil case:
+// with no counter there is no quota to enforce.
+func TestPreflightGuardWithNilCounterAllows(t *testing.T) {
+	guard := NewPreflightGuard(nil)
+	if d := guard.Check(context.Background()); !d.Allowed || d.Reason != "" {
+		t.Fatalf("Check with nil counter = %+v, want allowed", d)
+	}
+	sent := false
+	if _, err := guard.Send(context.Background(), func() error { sent = true; return nil }); err != nil || !sent {
+		t.Fatalf("Send with nil counter: sent=%v err=%v, want true, nil", sent, err)
+	}
+}
+
 // TestWebhookRedeliveryHasNoSecondEffect covers the acceptance criterion of
 // T3.34: delivering the same event.id again leaves state and effect count
 // untouched and does not call the state source a second time.
