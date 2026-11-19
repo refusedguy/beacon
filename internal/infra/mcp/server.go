@@ -212,16 +212,21 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: name, Annotations: &annotations}, stubHandler)
 	}
 
-	// The real read tools carry an explicit output schema. go-sdk infers one by
-	// reflection from the handler's Go type, but that inferred schema rejects
-	// the null a fresh Watch emits for its nil maps (ADR 0003, ADR 0009).
-	// AllOutputSchemas relaxes exactly those fields. A derivation failure is a
-	// broken contract type: log it and leave the tool unregistered instead of
-	// advertising a schema that rejects the tool's own output.
+	// The real read tools carry an explicit output schema. go-sdk cannot infer
+	// one for these types and panics on a nil OutputSchema, so the schema comes
+	// from AllOutputSchemas, which relaxes the null a fresh Watch emits for its
+	// nil maps (ADR 0003, ADR 0009). A derivation failure is a broken contract
+	// type: log it and fall back to a permissive object schema so every real
+	// handler is still registered. The precise schema is optional; the real
+	// tool is not. Returning here would leave all seven tools on startup stubs
+	// (T3.59).
 	schemas, err := AllOutputSchemas()
 	if err != nil {
-		log.Printf("mcp: output schemas: %v; real read tools not registered", err)
-		return s
+		log.Printf("mcp: output schemas: %v; read tools use permissive schemas", err)
+		schemas = map[string]*jsonschema.Schema{
+			"beacon_list_running": {Type: "object"},
+			"beacon_stats":        {Type: "object"},
+		}
 	}
 
 	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
@@ -229,14 +234,10 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	getResult := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
 	getResult.SetAfter(deps.After)
 	AttachGetResult(s, getResult)
-	if err := attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"]); err != nil {
-		log.Printf("mcp: beacon_list_running: %v; tool not registered", err)
-	}
+	attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"])
 	AttachAck(s, NewAckHandler(deps.Store, deps.Stamper, deps.Clock))
 	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
-	if err := attachStats(s, deps.Snapshot, schemas["beacon_stats"]); err != nil {
-		log.Printf("mcp: beacon_stats: %v; tool not registered", err)
-	}
+	attachStats(s, deps.Snapshot, schemas["beacon_stats"])
 	return s
 }
 
@@ -245,13 +246,12 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 // so the registration lives in this composition file. A nil reader falls back
 // to an empty snapshot so the tool never panics before a caller wires a store.
 // The caller supplies the schema from AllOutputSchemas so go-sdk never infers
-// one from the handler's Go type.
-func attachListRunning(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema) error {
+// one from the handler's Go type. A nil schema means derivation failed; the
+// real handler is registered anyway and go-sdk infers a schema, so a broken
+// optional schema never leaves a stub behind (T3.59).
+func attachListRunning(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema) {
 	if s == nil {
-		return nil
-	}
-	if outputSchema == nil {
-		return fmt.Errorf("no output schema for beacon_list_running")
+		return
 	}
 	if reader == nil {
 		reader = emptySnapshotReader()
@@ -264,18 +264,15 @@ func attachListRunning(s *mcpsdk.Server, reader SnapshotReader, outputSchema *js
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, NewListRunningHandler(reader).Handle)
-	return nil
 }
 
 // attachStats installs the real read-only stats tool. Its handler is defined in
 // tool_stats.go and has no separate Attach helper. The schema comes from
-// AllOutputSchemas for the same reason as list_running.
-func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema) error {
+// AllOutputSchemas for the same reason as list_running; a nil schema still
+// registers the real handler so the tool never falls back to a stub (T3.59).
+func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema) {
 	if s == nil {
-		return nil
-	}
-	if outputSchema == nil {
-		return fmt.Errorf("no output schema for beacon_stats")
+		return
 	}
 	if reader == nil {
 		reader = emptySnapshotReader()
@@ -288,7 +285,6 @@ func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonsche
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, NewStatsHandler(reader).Handle)
-	return nil
 }
 
 // emptySnapshotReader is the minimal dependency used when no SnapshotReader is
