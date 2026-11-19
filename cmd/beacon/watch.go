@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -169,6 +170,7 @@ func runWatch(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	interval := fs.Duration("interval", 2*time.Second, "интервал обновления (зарезервировано, один снимок)")
 	format := fs.String("format", "table", "формат вывода: table или json")
+	wake := fs.Bool("wake", false, "батч событий за 200мс в одно пробуждение сессии")
 	if !parseFlags("watch", args, c.errOut, fs) {
 		return 2
 	}
@@ -202,6 +204,20 @@ func runWatch(c *CLI, args []string) int {
 	}
 
 	rows := joinWatches(snap, sessions)
+	if *wake {
+		wakeOut := c.out
+		if *format == "json" {
+			wakeOut = c.errOut
+		}
+		send := func(target, text string) error {
+			fmt.Fprintf(wakeOut, "wake session=%s %s\n", target, text)
+			return nil
+		}
+		if err := runWatchBatchedWake(rows, time.Now(), send); err != nil {
+			fmt.Fprintf(c.errOut, "beacon watch: wake: %v\n", err)
+			return 2
+		}
+	}
 	if *format == "json" {
 		if err := renderWatchJSON(c.out, rows); err != nil {
 			fmt.Fprintf(c.errOut, "beacon watch: %v\n", err)
@@ -410,4 +426,118 @@ func runGC(c *CLI, args []string) int {
 	}
 	renderGCTable(c.out, removed, true)
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// T3.125 / ADR 0056 p4: батчинг событий в одно пробуждение сессии.
+//
+// События, пришедшие в одном окне 200 мс, сливаются в один wake сессии. Это
+// ограничивает кратность пробуждения, когда лог сыплет строками. Механизм не
+// добавляет ступени в лестницу ADR 0017 и не разносит пробуждения во времени,
+// как wake_between из T3.80: все события окна дают ровно один wake.
+// ---------------------------------------------------------------------------
+
+// wakeBatchWindow is the burst window of ADR 0056 p4. Events of one session
+// inside this window produce a single wake.
+const wakeBatchWindow = 200 * time.Millisecond
+
+// wakeEvent is one notification that would otherwise wake a session by itself.
+// At is the arrival time used to decide which 200ms window the event belongs
+// to, Target is the session and Text is the detail carried into the wake.
+type wakeEvent struct {
+	At     time.Time
+	Target string
+	Text   string
+}
+
+// wakeBatch is the collapsed result: one wake for Target carrying every event
+// text of the window in arrival order.
+type wakeBatch struct {
+	Target string
+	Texts  []string
+}
+
+type openWakeBatch struct {
+	at    time.Time
+	texts []string
+}
+
+// batchWakeEvents groups events by target session into windows of `window`
+// measured from that session's first event. An event joins the open window
+// while its timestamp is before open+window; at or after that point it closes
+// the current batch and opens the next one. Output is ordered by window open
+// time then target, so the function is deterministic and never staggers wakes
+// in time the way T3.80 does.
+func batchWakeEvents(events []wakeEvent, window time.Duration) []wakeBatch {
+	open := make(map[string]*openWakeBatch)
+	type closed struct {
+		at     time.Time
+		target string
+		texts  []string
+	}
+	var batches []closed
+	closeBatch := func(target string) {
+		p := open[target]
+		batches = append(batches, closed{at: p.at, target: target, texts: p.texts})
+		delete(open, target)
+	}
+	for _, ev := range events {
+		if p, ok := open[ev.Target]; ok && !ev.At.Before(p.at.Add(window)) {
+			closeBatch(ev.Target)
+		}
+		p, ok := open[ev.Target]
+		if !ok {
+			open[ev.Target] = &openWakeBatch{at: ev.At}
+			p = open[ev.Target]
+		}
+		p.texts = append(p.texts, ev.Text)
+	}
+	for target := range open {
+		closeBatch(target)
+	}
+	sort.Slice(batches, func(i, j int) bool {
+		if batches[i].at.Equal(batches[j].at) {
+			return batches[i].target < batches[j].target
+		}
+		return batches[i].at.Before(batches[j].at)
+	})
+	out := make([]wakeBatch, 0, len(batches))
+	for _, b := range batches {
+		out = append(out, wakeBatch{Target: b.target, Texts: b.texts})
+	}
+	return out
+}
+
+// wakeSend delivers one collapsed wake. watch.go does not own a wake tool;
+// delivery of the follow-up stays with ADR 0026. The sender is injected so
+// tests can count wakes without a live session.
+type wakeSend func(target, text string) error
+
+// emitWakeBatches sends one wake per batch. The texts of a burst are joined
+// into a single follow-up so the session wakes once and reads the whole burst.
+func emitWakeBatches(batches []wakeBatch, send wakeSend) error {
+	for _, b := range batches {
+		if err := send(b.Target, strings.Join(b.Texts, "; ")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runWatchBatchedWake turns the joined watch rows into wake events and emits
+// one wake per session per 200ms window. Only rows with a subscriber can wake
+// a session. now is injected so tests do not depend on wall time.
+func runWatchBatchedWake(rows []watchRow, now time.Time, send wakeSend) error {
+	events := make([]wakeEvent, 0, len(rows))
+	for _, r := range rows {
+		if r.Subscriber == "" {
+			continue
+		}
+		events = append(events, wakeEvent{
+			At:     now,
+			Target: r.Subscriber,
+			Text:   fmt.Sprintf("%s@%d", r.Verdict, r.Revision),
+		})
+	}
+	return emitWakeBatches(batchWakeEvents(events, wakeBatchWindow), send)
 }
