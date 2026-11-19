@@ -194,3 +194,165 @@ func callListRunning(t *testing.T, handler *ListRunningHandler, in ListRunningIn
 	}
 	return out
 }
+
+// watchWithSubscriber builds a watch subscribed by one agent session. The
+// subscriber Target is the sessionID a SessionLiveness row is keyed by.
+func watchWithSubscriber(id, sessionID string) domain.Watch {
+	return domain.Watch{
+		ID:      id,
+		Repo:    "refusedguy/beacon",
+		PR:      1,
+		Status:  domain.StatusWatching,
+		Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{
+			{ID: id + "-sub", Target: sessionID, Role: domain.RoleExecutor},
+		},
+	}
+}
+
+// withProcessAlive replaces the PID probe for one test and records the PIDs it
+// was asked about. The default probe uses syscall.Kill(pid, 0) and starts no
+// process; this seam keeps the tests independent of the machine's process
+// table.
+func withProcessAlive(t *testing.T, alive map[int]bool) *[]int {
+	t.Helper()
+	original := processAlive
+	calls := new([]int)
+	processAlive = func(pid int) bool {
+		*calls = append(*calls, pid)
+		return alive[pid]
+	}
+	t.Cleanup(func() { processAlive = original })
+	return calls
+}
+
+func writeArtifact(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("{}"), 0600); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	return path
+}
+
+func TestListRunningDeadPIDTurnsWatchIdle(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const deadPID = 424242
+	calls := withProcessAlive(t, map[int]bool{deadPID: false})
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+		Sessions: []SessionLiveness{{
+			SessionID: "s1",
+			Artifacts: []string{artifact},
+			PID:       deadPID,
+		}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+
+	if len(out.Watches) != 1 {
+		t.Fatalf("watches = %d, want 1", len(out.Watches))
+	}
+	if got := out.Watches[0].Status; got != domain.Status(StatusIdle) {
+		t.Errorf("watch status = %q, want %q", got, StatusIdle)
+	}
+	if out.Status != StatusIdle {
+		t.Errorf("aggregate status = %q, want %q", out.Status, StatusIdle)
+	}
+	if len(out.Events) != 1 || out.Events[0].Status != StatusIdle {
+		t.Errorf("events = %#v, want one idle event", out.Events)
+	}
+	if len(*calls) == 0 {
+		t.Fatal("PID probe was not called")
+	}
+	for _, pid := range *calls {
+		if pid != deadPID {
+			t.Errorf("PID probe called with %d, want %d", pid, deadPID)
+		}
+	}
+}
+
+func TestListRunningLivePIDKeepsStatus(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const livePID = 424243
+	withProcessAlive(t, map[int]bool{livePID: true})
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+		Sessions:      []SessionLiveness{{SessionID: "s1", Artifacts: []string{artifact}, PID: livePID}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+
+	if got := out.Watches[0].Status; got != domain.StatusWatching {
+		t.Errorf("watch status = %q, want watching", got)
+	}
+	if out.Status != string(domain.StatusWatching) {
+		t.Errorf("aggregate status = %q, want watching", out.Status)
+	}
+}
+
+func TestListRunningMissingArtifactTurnsIdle(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gone.json")
+	const livePID = 424244
+	withProcessAlive(t, map[int]bool{livePID: true})
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+		Sessions:      []SessionLiveness{{SessionID: "s1", Artifacts: []string{missing}, PID: livePID}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+
+	if got := out.Watches[0].Status; got != domain.Status(StatusIdle) {
+		t.Errorf("watch status = %q, want %q", got, StatusIdle)
+	}
+}
+
+func TestListRunningUnknownSessionKeepsStatus(t *testing.T) {
+	// A watch with a subscriber but no SessionLiveness row is left alone: the
+	// absence of liveness data is not evidence of a dead session.
+	withProcessAlive(t, map[int]bool{})
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "unknown")},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+
+	if got := out.Watches[0].Status; got != domain.StatusWatching {
+		t.Errorf("watch status = %q, want watching", got)
+	}
+}
+
+func TestListRunningClosedWatchStaysClosedWithDeadPID(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const deadPID = 424245
+	withProcessAlive(t, map[int]bool{deadPID: false})
+
+	w := watchWithSubscriber("w1", "s1")
+	w.Status = domain.StatusClosed
+	w.Verdict = domain.VerdictMerged
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{w},
+		Sessions:      []SessionLiveness{{SessionID: "s1", Artifacts: []string{artifact}, PID: deadPID}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+
+	if got := out.Watches[0].Status; got != domain.StatusClosed {
+		t.Errorf("watch status = %q, want closed", got)
+	}
+	if out.Status != string(domain.StatusClosed) {
+		t.Errorf("aggregate status = %q, want closed", out.Status)
+	}
+}
+
+func TestProcessAliveUsesSignalZero(t *testing.T) {
+	// The default probe asks the kernel about one PID with signal 0. It must
+	// see this process as alive and a PID far above Linux pid_max as dead,
+	// without enumerating processes or starting ps.
+	if !processAlive(os.Getpid()) {
+		t.Error("processAlive(self) = false, want true")
+	}
+	const impossiblePID = 1 << 30
+	if processAlive(impossiblePID) {
+		t.Errorf("processAlive(%d) = true, want false", impossiblePID)
+	}
+}
