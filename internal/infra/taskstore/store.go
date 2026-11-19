@@ -490,6 +490,15 @@ func CreateExclusive(filePath string, data []byte) error {
 
 // AtomicWrite пишет данные во временный файл и заменяет целевой переименованием.
 func AtomicWrite(filePath string, data []byte, perm os.FileMode) error {
+	return atomicWrite(filePath, data, perm, nil)
+}
+
+// atomicWrite публикует данные одним переименованием. beforePublish вызывается
+// после того, как временный файл записан и синхронизирован, прямо перед rename.
+// Ошибка в нём прерывает транзакцию: временный файл удаляется, а filePath
+// остаётся в прежнем состоянии. Через этот хук тест имитирует прерывание и
+// проверяет, что не публикуется половинчатая запись.
+func atomicWrite(filePath string, data []byte, perm os.FileMode, beforePublish func() error) error {
 	dir := filepath.Dir(filePath)
 	f, err := os.CreateTemp(dir, ".beacon-tmp-")
 	if err != nil {
@@ -516,6 +525,11 @@ func AtomicWrite(filePath string, data []byte, perm os.FileMode) error {
 	if err = os.Chmod(tmp, perm); err != nil {
 		return Startupf("не заданы права временного файла: %v", err)
 	}
+	if beforePublish != nil {
+		if err := beforePublish(); err != nil {
+			return Startupf("транзакция прервана: %v", err)
+		}
+	}
 	if err = os.Rename(tmp, filePath); err != nil {
 		return Startupf("не заменён файл %s: %v", filePath, err)
 	}
@@ -534,6 +548,149 @@ func SyncDir(dir string) error {
 		return Startupf("не синхронизирован каталог %s: %v", dir, err)
 	}
 	return nil
+}
+
+// TaskEvent — одно событие задачи из ADR 0030 п.4. Событие хранится в том же
+// файле, что и карточка, и публикуется вместе с ней одной транзакцией.
+type TaskEvent struct {
+	ID     string    `json:"id"`
+	Kind   string    `json:"kind"`
+	TaskID string    `json:"taskID"`
+	At     time.Time `json:"at"`
+}
+
+// Границы блока событий внутри файла карточки. ParseCard игнорирует эти
+// строки: они не начинаются с буквы и не выглядят как поле «Ключ: значение».
+const (
+	eventBlockBegin = "\n<!-- beacon-task-events v1\n"
+	eventBlockEnd   = "<!-- end-beacon-task-events -->\n"
+)
+
+// TaskEventTx — одна транзакция: карточка задачи и событие, которые станут
+// видимы только вместе. ADR 0030 п.4 требует держать очередь, события и данные
+// задачи в одном месте и писать их одной транзакцией. Файловое хранилище даёт
+// ту же гарантию одним atomicWrite: читатель видит либо прежнее полное
+// состояние, либо новое, но никогда карточку без события или событие без
+// карточки.
+type TaskEventTx struct {
+	Path  string
+	Card  []byte
+	Event TaskEvent
+}
+
+// Write проверяет транзакцию и публикует карточку вместе с событием.
+// beforePublish вызывается после подготовки временного файла перед rename;
+// ошибка прерывает транзакцию и оставляет Path неизменным. Событие с уже
+// записанным ID не добавляется второй раз, что даёт идемпотентность по ID.
+func (tx TaskEventTx) Write(beforePublish func() error) error {
+	if tx.Path == "" {
+		return Validationf("путь карточки не задан")
+	}
+	card := stripEventBlock(tx.Card)
+	parsed, err := ParseCard(filepath.Base(tx.Path), card)
+	if err != nil {
+		return err
+	}
+	if tx.Event.ID == "" || tx.Event.Kind == "" {
+		return Validationf("событие должно иметь ID и вид")
+	}
+	if tx.Event.TaskID != parsed.ID {
+		return Validationf("событие %s относится к задаче %s, а карточка имеет ID %s",
+			tx.Event.ID, tx.Event.TaskID, parsed.ID)
+	}
+	if tx.Event.At.IsZero() {
+		return Validationf("событие %s не имеет времени", tx.Event.ID)
+	}
+
+	events, err := ReadTaskEvents(tx.Path)
+	if err != nil {
+		return err
+	}
+	for _, existing := range events {
+		if existing.ID == tx.Event.ID {
+			return nil
+		}
+	}
+	events = append(events, tx.Event)
+
+	block, err := encodeEventBlock(events)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(tx.Path, append(card, block...), 0644, beforePublish)
+}
+
+// ReadTaskEvents читает журнал событий из файла карточки. Отсутствующий файл
+// равен пустому журналу. События и карточка читаются из одного файла, поэтому
+// нельзя получить событие без карточки.
+func ReadTaskEvents(path string) ([]TaskEvent, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return []TaskEvent{}, nil
+	}
+	if err != nil {
+		return nil, Startupf("не прочитана карточка %s: %v", path, err)
+	}
+	s := string(data)
+	i := strings.Index(s, eventBlockBegin)
+	if i < 0 {
+		return []TaskEvent{}, nil
+	}
+	rest := s[i+len(eventBlockBegin):]
+	j := strings.Index(rest, eventBlockEnd)
+	if j < 0 {
+		return nil, Startupf("карточка %s: незакрытый блок событий", path)
+	}
+	body := strings.TrimSpace(rest[:j])
+	if body == "" {
+		return []TaskEvent{}, nil
+	}
+	events := make([]TaskEvent, 0, 2)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev TaskEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			return nil, Startupf("карточка %s: повреждено событие: %v", path, err)
+		}
+		events = append(events, ev)
+	}
+	return events, nil
+}
+
+// encodeEventBlock собирает блок событий, который дописывается к тексту карточки.
+func encodeEventBlock(events []TaskEvent) ([]byte, error) {
+	var b strings.Builder
+	b.WriteString(eventBlockBegin)
+	for _, ev := range events {
+		line, err := json.Marshal(ev)
+		if err != nil {
+			return nil, Startupf("не собрано событие: %v", err)
+		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	b.WriteString(eventBlockEnd)
+	return []byte(b.String()), nil
+}
+
+// stripEventBlock убирает блок событий из текста карточки, чтобы повторная
+// запись не дублировала его. Возвращается отдельный срез, независимый от data.
+func stripEventBlock(data []byte) []byte {
+	s := string(data)
+	i := strings.Index(s, eventBlockBegin)
+	if i < 0 {
+		return append([]byte(nil), data...)
+	}
+	j := strings.Index(s[i:], eventBlockEnd)
+	if j < 0 {
+		return append([]byte(nil), data...)
+	}
+	end := i + j + len(eventBlockEnd)
+	out := s[:i] + s[end:]
+	return []byte(out)
 }
 
 // ReplaceFields меняет три строки карточки при взятии задачи.

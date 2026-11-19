@@ -246,3 +246,156 @@ func TestReplaceFields(t *testing.T) {
 		t.Fatal("ReplaceFields изменил карточку, статус которой уже in_progress")
 	}
 }
+
+func taskEventTxFixture(t *testing.T) TaskEventTx {
+	t.Helper()
+	return TaskEventTx{
+		Path: filepath.Join(t.TempDir(), "T2.4.md"),
+		Card: []byte(validCard),
+		Event: TaskEvent{
+			ID:     "e1",
+			Kind:   "created",
+			TaskID: "T2.4",
+			At:     time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC),
+		},
+	}
+}
+
+// assertPaired проверяет приёмку карточки: задача и событие есть вместе или
+// нет ни того, ни другого.
+func assertPaired(t *testing.T, path string) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	hasTask := err == nil
+	if hasTask {
+		_, err = ParseCard(filepath.Base(path), data)
+		hasTask = err == nil
+	}
+	events, err := ReadTaskEvents(path)
+	hasEvents := err == nil && len(events) > 0
+	if hasTask != hasEvents {
+		t.Fatalf("задача без события или событие без задачи: задача=%v, события=%d", hasTask, len(events))
+	}
+}
+
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".beacon-tmp-") {
+			t.Fatalf("остался временный файл %s", e.Name())
+		}
+	}
+}
+
+func interruptTx() error { return fmt.Errorf("имитация прерывания") }
+
+func TestTaskEventTxInterruptPublishesNothing(t *testing.T) {
+	tx := taskEventTxFixture(t)
+	if err := tx.Write(interruptTx); err == nil {
+		t.Fatal("прерванная транзакция должна давать ошибку")
+	}
+	if _, err := os.Stat(tx.Path); !os.IsNotExist(err) {
+		t.Fatalf("карточка опубликована после прерывания: %v", err)
+	}
+	events, err := ReadTaskEvents(tx.Path)
+	if err != nil || len(events) != 0 {
+		t.Fatalf("событие опубликовано после прерывания: %v, %v", events, err)
+	}
+	assertPaired(t, tx.Path)
+	assertNoTempFiles(t, filepath.Dir(tx.Path))
+}
+
+func TestTaskEventTxCommitKeepsTaskAndEventTogether(t *testing.T) {
+	tx := taskEventTxFixture(t)
+	if err := tx.Write(nil); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	data, err := os.ReadFile(tx.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := ParseCard(filepath.Base(tx.Path), data)
+	if err != nil {
+		t.Fatalf("карточка после транзакции не разбирается: %v", err)
+	}
+	if card.ID != "T2.4" {
+		t.Fatalf("ID карточки = %q, ждали T2.4", card.ID)
+	}
+	events, err := ReadTaskEvents(tx.Path)
+	if err != nil {
+		t.Fatalf("ReadTaskEvents: %v", err)
+	}
+	if len(events) != 1 || events[0].ID != tx.Event.ID || events[0].TaskID != card.ID {
+		t.Fatalf("событие не связано с карточкой: %+v, карточка %q", events, card.ID)
+	}
+	assertPaired(t, tx.Path)
+	assertNoTempFiles(t, filepath.Dir(tx.Path))
+}
+
+func TestTaskEventTxInterruptDoesNotSplitExistingRecord(t *testing.T) {
+	tx := taskEventTxFixture(t)
+	if err := tx.Write(nil); err != nil {
+		t.Fatalf("первый Write: %v", err)
+	}
+	before, err := os.ReadFile(tx.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	next := TaskEventTx{
+		Path: tx.Path,
+		Card: before,
+		Event: TaskEvent{
+			ID:     "e2",
+			Kind:   "taken",
+			TaskID: "T2.4",
+			At:     time.Date(2026, 11, 19, 13, 0, 0, 0, time.UTC),
+		},
+	}
+	if err := next.Write(interruptTx); err == nil {
+		t.Fatal("прерванная запись второго события должна давать ошибку")
+	}
+	after, err := os.ReadFile(tx.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("прерывание изменило уже записанную карточку")
+	}
+	events, err := ReadTaskEvents(tx.Path)
+	if err != nil || len(events) != 1 || events[0].ID != "e1" {
+		t.Fatalf("состояние разделилось: %+v, %v", events, err)
+	}
+	assertPaired(t, tx.Path)
+	assertNoTempFiles(t, filepath.Dir(tx.Path))
+}
+
+func TestTaskEventTxRejectsMismatchedEvent(t *testing.T) {
+	tx := taskEventTxFixture(t)
+	tx.Event.TaskID = "T9.9"
+	if err := tx.Write(nil); Code(err) != ExitValidation {
+		t.Fatalf("ожидали код 1, получил %v", err)
+	}
+	if _, err := os.Stat(tx.Path); !os.IsNotExist(err) {
+		t.Fatalf("карточка создана при неверном событии: %v", err)
+	}
+}
+
+func TestTaskEventTxRepeatIsNoOp(t *testing.T) {
+	tx := taskEventTxFixture(t)
+	if err := tx.Write(nil); err != nil {
+		t.Fatalf("первый Write: %v", err)
+	}
+	if err := tx.Write(nil); err != nil {
+		t.Fatalf("повторный Write: %v", err)
+	}
+	events, err := ReadTaskEvents(tx.Path)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("повтор добавил событие: %+v, %v", events, err)
+	}
+	assertPaired(t, tx.Path)
+}
