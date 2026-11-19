@@ -2551,6 +2551,452 @@ func TestAcceptTaskRejectsInvalidInput(t *testing.T) {
 	}
 }
 
+// queueFinishEffect records one completion side effect and commits a durable
+// row for it inside the same transaction as the queue completion. The counter
+// observes the call and the row observes the commit (ADR 0058 feature 5).
+func queueFinishEffect(called *int32) func(*sql.Tx) error {
+	return func(tx *sql.Tx) error {
+		atomic.AddInt32(called, 1)
+		if _, err := tx.Exec(`
+			CREATE TABLE IF NOT EXISTS queue_effects (
+			  seq INTEGER PRIMARY KEY AUTOINCREMENT)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO queue_effects (seq) VALUES (NULL)`)
+		return err
+	}
+}
+
+func queueEffectCount(t *testing.T, d *DB) int {
+	t.Helper()
+	var n int
+	if err := d.readDB.QueryRow(`
+		SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'queue_effects'
+	`).Scan(&n); err != nil {
+		t.Fatalf("check queue_effects: %v", err)
+	}
+	if n == 0 {
+		return 0
+	}
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM queue_effects`).Scan(&n); err != nil {
+		t.Fatalf("count queue effects: %v", err)
+	}
+	return n
+}
+
+// TestNamedQueueAtomicContinuation is the acceptance check for ADR 0058 feature 5:
+// the continuation task and the completion of the current task commit in one
+// transaction, and the continuation is immediately leaseable from its queue.
+func TestNamedQueueAtomicContinuation(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.EnqueueQueueTask("build", "build-1", []byte("first job")); err != nil {
+		t.Fatalf("EnqueueQueueTask build-1: %v", err)
+	}
+	if err := d.EnqueueQueueTask("build", "build-2", []byte("second job")); err != nil {
+		t.Fatalf("EnqueueQueueTask build-2: %v", err)
+	}
+
+	now := time.Now()
+	lease, found, err := d.LeaseQueueTask("build", "worker-a", now, time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseQueueTask: %v", err)
+	}
+	if !found {
+		t.Fatal("lease found no task in build queue")
+	}
+	if lease.TaskID != "build-1" || lease.Queue != "build" || lease.OwnerID != "worker-a" {
+		t.Fatalf("lease = %+v, want build-1 in build owned by worker-a", lease)
+	}
+	if lease.FencingToken == 0 {
+		t.Fatal("lease has no fencing token")
+	}
+	if string(lease.Payload) != "first job" {
+		t.Errorf("lease payload = %q, want first job", lease.Payload)
+	}
+
+	var effects int32
+	next := &QueueContinuation{Queue: "verify", TaskID: "verify-1", Payload: []byte("verify job")}
+	res, err := d.CompleteQueueTask("build-1", "worker-a", lease.FencingToken, next, queueFinishEffect(&effects))
+	if err != nil {
+		t.Fatalf("CompleteQueueTask: %v", err)
+	}
+	if !res.Completed || !res.Continued {
+		t.Fatalf("completion = %+v, want completed and continued", res)
+	}
+	if res.TaskID != "build-1" || res.FencingToken != lease.FencingToken {
+		t.Errorf("completion ids = %+v, want build-1 at token %d", res, lease.FencingToken)
+	}
+	if got := atomic.LoadInt32(&effects); got != 1 {
+		t.Errorf("finish calls = %d, want 1", got)
+	}
+	if got := queueEffectCount(t, d); got != 1 {
+		t.Errorf("committed finish rows = %d, want 1", got)
+	}
+
+	task, found, err := d.QueueTask("build-1")
+	if err != nil || !found {
+		t.Fatalf("QueueTask build-1: found=%v err=%v", found, err)
+	}
+	if task.State != queueStateDone || task.FencingToken != lease.FencingToken {
+		t.Errorf("completed task = %+v, want done at token %d", task, lease.FencingToken)
+	}
+	cont, found, err := d.QueueTask("verify-1")
+	if err != nil || !found {
+		t.Fatalf("QueueTask verify-1: found=%v err=%v", found, err)
+	}
+	if cont.Queue != "verify" || cont.State != queueStatePending || string(cont.Payload) != "verify job" {
+		t.Errorf("continuation = %+v, want pending verify job in verify", cont)
+	}
+
+	// The remaining build task and the new verify task are both leaseable from
+	// their own named queues.
+	nextBuild, found, err := d.LeaseQueueTask("build", "worker-b", now, time.Minute)
+	if err != nil || !found || nextBuild.TaskID != "build-2" {
+		t.Fatalf("next build lease = %+v, found=%v, err=%v; want build-2", nextBuild, found, err)
+	}
+	vlease, found, err := d.LeaseQueueTask("verify", "worker-v", now, time.Minute)
+	if err != nil || !found || vlease.TaskID != "verify-1" {
+		t.Fatalf("verify lease = %+v, found=%v, err=%v; want verify-1", vlease, found, err)
+	}
+}
+
+// TestQueueLeaseFencesStaleCompletion proves the lease is fenced: reclaiming an
+// expired lease issues a higher token, and the old worker's completion is
+// refused in full, so it cannot emit a side effect or enqueue a continuation.
+func TestQueueLeaseFencesStaleCompletion(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.EnqueueQueueTask("q", "task-1", []byte("work")); err != nil {
+		t.Fatalf("EnqueueQueueTask: %v", err)
+	}
+	now := time.Now()
+	first, found, err := d.LeaseQueueTask("q", "worker-1", now, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("first lease: %+v found=%v err=%v", first, found, err)
+	}
+
+	// The lease expired; a second worker reclaims the same task with a new token.
+	later := now.Add(2 * time.Minute)
+	second, found, err := d.LeaseQueueTask("q", "worker-2", later, time.Minute)
+	if err != nil || !found {
+		t.Fatalf("second lease: %+v found=%v err=%v", second, found, err)
+	}
+	if second.TaskID != first.TaskID {
+		t.Fatalf("reclaimed task = %q, want %q", second.TaskID, first.TaskID)
+	}
+	if second.FencingToken <= first.FencingToken {
+		t.Fatalf("reclaim token %d not higher than %d", second.FencingToken, first.FencingToken)
+	}
+
+	var effects int32
+	orphan := &QueueContinuation{Queue: "q2", TaskID: "orphan", Payload: []byte("must not exist")}
+	_, err = d.CompleteQueueTask("task-1", "worker-1", first.FencingToken, orphan, queueFinishEffect(&effects))
+	if !IsQueueFenceStale(err) {
+		t.Fatalf("stale completion error = %v, want stale fence", err)
+	}
+	if got := atomic.LoadInt32(&effects); got != 0 {
+		t.Errorf("stale completion ran finish %d times, want 0", got)
+	}
+	if got := queueEffectCount(t, d); got != 0 {
+		t.Errorf("stale completion committed %d effect rows, want 0", got)
+	}
+	if _, found, err := d.QueueTask("orphan"); err != nil || found {
+		t.Fatalf("stale completion enqueued continuation: found=%v err=%v", found, err)
+	}
+	task, found, err := d.QueueTask("task-1")
+	if err != nil || !found {
+		t.Fatalf("QueueTask after stale: found=%v err=%v", found, err)
+	}
+	if task.State != queueStateLeased || task.OwnerID != "worker-2" || task.FencingToken != second.FencingToken {
+		t.Errorf("task after stale = %+v, want leased by worker-2 at token %d", task, second.FencingToken)
+	}
+
+	// The current token still completes the task and enqueues the continuation.
+	res, err := d.CompleteQueueTask("task-1", "worker-2", second.FencingToken, orphan, queueFinishEffect(&effects))
+	if err != nil || !res.Completed || !res.Continued {
+		t.Fatalf("current completion = %+v, %v; want completed and continued", res, err)
+	}
+	if got := queueEffectCount(t, d); got != 1 {
+		t.Errorf("committed effects after completion = %d, want 1", got)
+	}
+	if _, found, err := d.QueueTask("orphan"); err != nil || !found {
+		t.Fatalf("continuation after completion: found=%v err=%v; want found", found, err)
+	}
+}
+
+// TestQueueCompletionRollsBackOnFailedFinish proves the continuation is not
+// stored when the completion's side effect fails: the whole transaction rolls
+// back and a retry with the same lease succeeds once.
+func TestQueueCompletionRollsBackOnFailedFinish(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.EnqueueQueueTask("q", "t", []byte("work")); err != nil {
+		t.Fatalf("EnqueueQueueTask: %v", err)
+	}
+	lease, found, err := d.LeaseQueueTask("q", "w", time.Now(), time.Minute)
+	if err != nil || !found {
+		t.Fatalf("lease: %+v found=%v err=%v", lease, found, err)
+	}
+
+	boom := errors.New("boom")
+	var called int32
+	failFinish := func(tx *sql.Tx) error {
+		atomic.AddInt32(&called, 1)
+		if _, err := tx.Exec(`
+			CREATE TABLE IF NOT EXISTS queue_effects (
+			  seq INTEGER PRIMARY KEY AUTOINCREMENT)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO queue_effects (seq) VALUES (NULL)`); err != nil {
+			return err
+		}
+		return boom
+	}
+	next := &QueueContinuation{Queue: "next", TaskID: "next-1", Payload: []byte("next")}
+	_, err = d.CompleteQueueTask("t", "w", lease.FencingToken, next, failFinish)
+	if !errors.Is(err, boom) {
+		t.Fatalf("completion with failing finish = %v, want boom", err)
+	}
+	if got := atomic.LoadInt32(&called); got != 1 {
+		t.Errorf("finish calls = %d, want 1", got)
+	}
+	if got := queueEffectCount(t, d); got != 0 {
+		t.Errorf("effect rows after failed finish = %d, want 0", got)
+	}
+	if _, found, err := d.QueueTask("next-1"); err != nil || found {
+		t.Fatalf("continuation after failed finish: found=%v err=%v; want not found", found, err)
+	}
+	task, found, err := d.QueueTask("t")
+	if err != nil || !found {
+		t.Fatalf("QueueTask after failed finish: found=%v err=%v", found, err)
+	}
+	if task.State != queueStateLeased || task.FencingToken != lease.FencingToken {
+		t.Errorf("task after failed finish = %+v, want leased at token %d", task, lease.FencingToken)
+	}
+
+	var effects int32
+	res, err := d.CompleteQueueTask("t", "w", lease.FencingToken, next, queueFinishEffect(&effects))
+	if err != nil || !res.Completed || !res.Continued {
+		t.Fatalf("retry completion = %+v, %v; want completed and continued", res, err)
+	}
+	if got := queueEffectCount(t, d); got != 1 {
+		t.Errorf("effect rows after retry = %d, want 1", got)
+	}
+}
+
+// TestQueueCompletionIdempotentRepeat keeps a retried completion from enqueuing
+// the continuation a second time.
+func TestQueueCompletionIdempotentRepeat(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.EnqueueQueueTask("q", "t", []byte("work")); err != nil {
+		t.Fatalf("EnqueueQueueTask: %v", err)
+	}
+	lease, found, err := d.LeaseQueueTask("q", "w", time.Now(), time.Minute)
+	if err != nil || !found {
+		t.Fatalf("lease: %+v found=%v err=%v", lease, found, err)
+	}
+
+	var effects int32
+	next := &QueueContinuation{Queue: "next", TaskID: "next-1", Payload: []byte("n")}
+	first, err := d.CompleteQueueTask("t", "w", lease.FencingToken, next, queueFinishEffect(&effects))
+	if err != nil || !first.Completed || !first.Continued {
+		t.Fatalf("first completion = %+v, %v; want completed and continued", first, err)
+	}
+	second, err := d.CompleteQueueTask("t", "w", lease.FencingToken, next, queueFinishEffect(&effects))
+	if err != nil {
+		t.Fatalf("repeat completion: %v", err)
+	}
+	if second.Completed || second.Continued {
+		t.Fatalf("repeat completion = %+v, want no new effect", second)
+	}
+	if got := atomic.LoadInt32(&effects); got != 1 {
+		t.Errorf("finish calls after repeat = %d, want 1", got)
+	}
+	if got := queueEffectCount(t, d); got != 1 {
+		t.Errorf("effect rows after repeat = %d, want 1", got)
+	}
+	tasks, err := d.QueueTasks("next")
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("QueueTasks(next) = %d tasks, %v; want 1", len(tasks), err)
+	}
+}
+
+// TestNamedQueuesAreIsolated keeps tasks of one queue out of another.
+func TestNamedQueuesAreIsolated(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.EnqueueQueueTask("alpha", "a1", []byte("a")); err != nil {
+		t.Fatalf("EnqueueQueueTask alpha: %v", err)
+	}
+	if err := d.EnqueueQueueTask("beta", "b1", []byte("b")); err != nil {
+		t.Fatalf("EnqueueQueueTask beta: %v", err)
+	}
+	now := time.Now()
+	al, found, err := d.LeaseQueueTask("alpha", "w", now, time.Minute)
+	if err != nil || !found || al.TaskID != "a1" {
+		t.Fatalf("alpha lease = %+v found=%v err=%v; want a1", al, found, err)
+	}
+	if _, found, err := d.LeaseQueueTask("alpha", "w", now, time.Minute); err != nil || found {
+		t.Fatalf("alpha second lease found=%v err=%v; want no task (b1 is in beta)", found, err)
+	}
+	bl, found, err := d.LeaseQueueTask("beta", "w", now, time.Minute)
+	if err != nil || !found || bl.TaskID != "b1" {
+		t.Fatalf("beta lease = %+v found=%v err=%v; want b1", bl, found, err)
+	}
+	aTasks, err := d.QueueTasks("alpha")
+	if err != nil || len(aTasks) != 1 || aTasks[0].ID != "a1" {
+		t.Fatalf("QueueTasks(alpha) = %+v, %v; want only a1", aTasks, err)
+	}
+	bTasks, err := d.QueueTasks("beta")
+	if err != nil || len(bTasks) != 1 || bTasks[0].ID != "b1" {
+		t.Fatalf("QueueTasks(beta) = %+v, %v; want only b1", bTasks, err)
+	}
+}
+
+// TestQueueFenceTokenMonotonicAcrossRestart proves the counter is durable: a
+// lease taken after a reopen carries a higher token than one before it.
+func TestQueueFenceTokenMonotonicAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	if err := first.EnqueueQueueTask("q", "t1", []byte("1")); err != nil {
+		first.Close()
+		t.Fatalf("EnqueueQueueTask t1: %v", err)
+	}
+	lease1, found, err := first.LeaseQueueTask("q", "w", time.Now(), time.Minute)
+	if err != nil || !found {
+		first.Close()
+		t.Fatalf("lease #1: %+v found=%v err=%v", lease1, found, err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	if err := second.EnqueueQueueTask("q", "t2", []byte("2")); err != nil {
+		t.Fatalf("EnqueueQueueTask t2: %v", err)
+	}
+	lease2, found, err := second.LeaseQueueTask("q", "w", time.Now(), time.Minute)
+	if err != nil || !found {
+		t.Fatalf("lease #2: %+v found=%v err=%v", lease2, found, err)
+	}
+	if lease2.FencingToken <= lease1.FencingToken {
+		t.Fatalf("token after restart %d, want higher than %d", lease2.FencingToken, lease1.FencingToken)
+	}
+}
+
+// TestQueueRedactsPayloads applies ADR 0012 to both an enqueued task and a
+// continuation: a secret must not reach the file or a lease.
+func TestQueueRedactsPayloads(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte(`{"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`)
+	if err := d.EnqueueQueueTask("q", "t", secret); err != nil {
+		t.Fatalf("EnqueueQueueTask: %v", err)
+	}
+	task, found, err := d.QueueTask("t")
+	if err != nil || !found {
+		t.Fatalf("QueueTask: found=%v err=%v", found, err)
+	}
+	if bytes.Contains(task.Payload, []byte("ghp_")) {
+		t.Errorf("stored task kept a raw token: %s", task.Payload)
+	}
+	lease, found, err := d.LeaseQueueTask("q", "w", time.Now(), time.Minute)
+	if err != nil || !found {
+		t.Fatalf("lease: %+v found=%v err=%v", lease, found, err)
+	}
+	if bytes.Contains(lease.Payload, []byte("ghp_")) {
+		t.Errorf("lease kept a raw token: %s", lease.Payload)
+	}
+	next := &QueueContinuation{Queue: "q2", TaskID: "t2", Payload: secret}
+	if _, err := d.CompleteQueueTask("t", "w", lease.FencingToken, next, nil); err != nil {
+		t.Fatalf("CompleteQueueTask: %v", err)
+	}
+	cont, found, err := d.QueueTask("t2")
+	if err != nil || !found {
+		t.Fatalf("QueueTask t2: found=%v err=%v", found, err)
+	}
+	if bytes.Contains(cont.Payload, []byte("ghp_")) {
+		t.Errorf("stored continuation kept a raw token: %s", cont.Payload)
+	}
+}
+
+func TestQueueRejectsInvalidInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.EnqueueQueueTask("  ", "t", []byte("x")); err == nil {
+		t.Error("EnqueueQueueTask with blank queue must fail")
+	}
+	if err := d.EnqueueQueueTask("q", " ", []byte("x")); err == nil {
+		t.Error("EnqueueQueueTask with blank task id must fail")
+	}
+	now := time.Now()
+	if _, _, err := d.LeaseQueueTask(" ", "w", now, time.Minute); err == nil {
+		t.Error("LeaseQueueTask with blank queue must fail")
+	}
+	if _, _, err := d.LeaseQueueTask("q", " ", now, time.Minute); err == nil {
+		t.Error("LeaseQueueTask with blank owner must fail")
+	}
+	if _, _, err := d.LeaseQueueTask("q", "w", now, 0); err == nil {
+		t.Error("LeaseQueueTask with zero ttl must fail")
+	}
+	if _, err := d.CompleteQueueTask(" ", "w", 1, nil, nil); err == nil {
+		t.Error("CompleteQueueTask with blank task id must fail")
+	}
+	if _, err := d.CompleteQueueTask("t", " ", 1, nil, nil); err == nil {
+		t.Error("CompleteQueueTask with blank owner must fail")
+	}
+	if _, err := d.CompleteQueueTask("t", "w", 0, nil, nil); err == nil {
+		t.Error("CompleteQueueTask with zero token must fail")
+	}
+	if _, err := d.CompleteQueueTask("t", "w", 1, &QueueContinuation{Queue: " ", TaskID: "n"}, nil); err == nil {
+		t.Error("CompleteQueueTask with blank continuation queue must fail")
+	}
+	if _, err := d.CompleteQueueTask("t", "w", 1, &QueueContinuation{Queue: "q", TaskID: " "}, nil); err == nil {
+		t.Error("CompleteQueueTask with blank continuation task id must fail")
+	}
+	tasks, err := d.QueueTasks("q")
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("QueueTasks after rejected input = %d, %v; want 0", len(tasks), err)
+	}
+}
+
 // TestAcceptTaskRedactsState applies ADR 0012 to the WAL payload: a secret
 // must not reach the file, and a poll returns the redacted copy.
 func TestAcceptTaskRedactsState(t *testing.T) {
