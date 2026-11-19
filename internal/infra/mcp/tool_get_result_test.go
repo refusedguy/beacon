@@ -678,3 +678,116 @@ func TestGetResultKeepsLeaseKeyAndFieldOrder(t *testing.T) {
 		last = at
 	}
 }
+
+// --- Ship facts wiring, T3.75 ----------------------------------------------
+
+func greenRequiredChecks(names ...string) map[string]domain.Check {
+	m := make(map[string]domain.Check, len(names))
+	for _, name := range names {
+		m[name] = domain.Check{State: "SUCCESS", Conclusion: "SUCCESS", Required: true}
+	}
+	return m
+}
+
+func readyWatchWithChecks(checks map[string]domain.Check) domain.Watch {
+	return domain.Watch{
+		ID:      "w-ready",
+		Repo:    "o/r",
+		PR:      2,
+		HeadSHA: "sha-ready",
+		Checks:  checks,
+		Merge: domain.MergeInfo{
+			Mergeable:        "MERGEABLE",
+			MergeStateStatus: "CLEAN",
+			ReviewDecision:   "APPROVED",
+		},
+		Policy: domain.Policy{RequireUpToDate: true},
+	}
+}
+
+// readySnapshotBase satisfies every row-7 condition except Ship. The adapter
+// under test is the only thing that fills Ship before Evaluate sees the
+// snapshot, so this reproduces the production shape of the regression.
+func readySnapshotBase() domain.Snapshot {
+	return domain.Snapshot{
+		State:            "OPEN",
+		HeadSHA:          "sha-ready",
+		WatchHeadSHA:     "sha-ready",
+		Rollup:           "SUCCESS",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		SuitesValid:      true,
+	}
+}
+
+// TestReadyReachableWithObservedShipFacts proves the ready verdict is reachable
+// from observed Watch data. T3.72 added ShipAllowed to Evaluate but left the
+// facts unpopulated; here a Snapshot with green required checks passes through
+// the adapter and then through Evaluate. The negative rows prove that an
+// unobserved fact stays false instead of being silently granted.
+func TestReadyReachableWithObservedShipFacts(t *testing.T) {
+	cases := []struct {
+		name      string
+		checks    map[string]domain.Check
+		wantFacts domain.ShipFacts
+		want      domain.Verdict
+	}{
+		{
+			name:      "green build audit and test make ready reachable",
+			checks:    greenRequiredChecks("build", "audit", "test"),
+			wantFacts: domain.ShipFacts{Build: true, Audit: true, TDD: true},
+			want:      domain.VerdictReady,
+		},
+		{
+			name:      "green build and audit without a test fact stay honest",
+			checks:    greenRequiredChecks("build", "audit"),
+			wantFacts: domain.ShipFacts{Build: true, Audit: true},
+			want:      domain.VerdictWatching,
+		},
+		{
+			name: "a failed required build is not an observed fact",
+			checks: map[string]domain.Check{
+				"build": {State: "FAILURE", Conclusion: "FAILURE", Required: true},
+				"audit": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+				"test":  {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+			},
+			wantFacts: domain.ShipFacts{Audit: true, TDD: true},
+			want:      domain.VerdictWatching,
+		},
+		{
+			name: "green non-required checks are not facts",
+			checks: map[string]domain.Check{
+				"build": {State: "SUCCESS", Conclusion: "SUCCESS", Required: false},
+				"audit": {State: "SUCCESS", Conclusion: "SUCCESS", Required: false},
+				"test":  {State: "SUCCESS", Conclusion: "SUCCESS", Required: false},
+			},
+			wantFacts: domain.ShipFacts{},
+			want:      domain.VerdictWatching,
+		},
+		{
+			name:      "no observed checks cannot grant ready",
+			checks:    map[string]domain.Check{},
+			wantFacts: domain.ShipFacts{},
+			want:      domain.VerdictWatching,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := readyWatchWithChecks(tc.checks)
+			gotFacts := shipFactsFromWatch(w)
+			if gotFacts != tc.wantFacts {
+				t.Fatalf("shipFactsFromWatch = %+v, want %+v", gotFacts, tc.wantFacts)
+			}
+
+			s := withShipFacts(readySnapshotBase(), w)
+			got, wake := domain.Evaluate(s, w.Policy)
+			if got != tc.want {
+				t.Fatalf("Evaluate = %q, want %q (facts %+v)", got, tc.want, gotFacts)
+			}
+			if tc.want == domain.VerdictReady && len(wake) == 0 {
+				t.Fatal("a ready verdict must wake the orchestrator")
+			}
+		})
+	}
+}
