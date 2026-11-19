@@ -47,6 +47,15 @@
 // is the wake-up point of a waiter, not the redelivery jitter of ADR 0017 and
 // not the backpressure quota of ADR 0038 p2.
 //
+// ADR 0042 p3 addresses a notification to the worktree path, not to a session
+// id and not to the PEER_NAME of ADR 0039. The environment advertises the
+// worktree of each candidate session; when a caller names a target worktree,
+// the core resolves the delivery key from the candidate running in it. The
+// worktree path survives a session restart, so a restarted session in the same
+// worktree receives the notification without reconfiguring the recipient, and
+// a session in another worktree does not receive it. The explicit Target path
+// of callers written before ADR 0042 is unchanged.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -166,6 +175,14 @@ type WakeInput struct {
 	// callers written before ADR 0041. The window is a property of the wait,
 	// never a per-agent setting.
 	WakeBetweenMillis int64 `json:"wakeBetweenMillis,omitempty" jsonschema:"wait window in milliseconds; wake at one random point inside it to spread waiters on the same event; zero means wake immediately"`
+	// TargetWorktree is the worktree path the notification is addressed to
+	// (ADR 0042 p3). When set, the core resolves the delivery key from the
+	// candidate session running in that worktree instead of using a session id
+	// or a PEER_NAME. The path is stable across a session restart, so a
+	// restarted session in the same worktree still receives the wake and a
+	// session in another worktree does not. An empty path keeps the explicit
+	// Target or capability path used by earlier callers.
+	TargetWorktree string `json:"targetWorktree,omitempty" jsonschema:"worktree path the notification is addressed to; resolves the recipient by worktree, stable across a session restart; empty keeps the explicit target or capability path"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -249,14 +266,19 @@ type Capability string
 // CandidateAgent is one session the environment offers as a possible
 // recipient. Target is the opaque delivery key and Capabilities are the
 // abilities that session declares. The name in Target is never a selection
-// criterion.
+// criterion. WorktreePath (ADR 0042 p3) is the worktree this session runs in;
+// it is the stable routing key for a notification. The environment reports a
+// fresh Target for a restarted session while the WorktreePath stays the same,
+// so a wake addressed to the worktree reaches the restarted session.
 type CandidateAgent struct {
 	Target       string       `json:"target"`
 	Capabilities []Capability `json:"capabilities"`
+	WorktreePath string       `json:"worktreePath,omitempty"`
 }
 
 // AgentDirectory is the port the environment adapter implements so the core
-// can match a follow-up to a session by declared capability. The core does not
+// can match a follow-up to a session by declared capability (ADR 0037 p1) or
+// by the worktree path the session runs in (ADR 0042 p3). The core does not
 // know which concrete agents exist and hardcodes no names (ADR 0037 p1 and
 // ADR 0024).
 type AgentDirectory interface {
@@ -315,22 +337,42 @@ func declaresAll(declared, required []Capability) bool {
 	return true
 }
 
-// selectAgentByCapabilities picks the first candidate that declares all
-// required capabilities. Input order breaks ties so the choice is repeatable.
-// It never compares session names and returns false when nothing matches.
-func selectAgentByCapabilities(candidates []CandidateAgent, required []Capability) (string, bool) {
-	if len(required) == 0 {
+// selectAgent picks the first candidate satisfying every requested routing
+// constraint: all required capabilities and, when worktreePath is set, the
+// worktree the session runs in. Input order breaks ties so the choice is
+// repeatable. It never uses a session name as a criterion and returns false
+// when nothing matches. With no constraints it returns false, so a caller
+// that requests no routing key keeps its explicit Target.
+func selectAgent(candidates []CandidateAgent, required []Capability, worktreePath string) (string, bool) {
+	if len(required) == 0 && worktreePath == "" {
 		return "", false
 	}
 	for _, candidate := range candidates {
 		if candidate.Target == "" {
 			continue
 		}
-		if declaresAll(candidate.Capabilities, required) {
-			return candidate.Target, true
+		if len(required) > 0 && !declaresAll(candidate.Capabilities, required) {
+			continue
 		}
+		if worktreePath != "" && candidate.WorktreePath != worktreePath {
+			continue
+		}
+		return candidate.Target, true
 	}
 	return "", false
+}
+
+// selectAgentByCapabilities keeps the capability-only entry point used before
+// ADR 0042: it resolves a target by declared capabilities alone.
+func selectAgentByCapabilities(candidates []CandidateAgent, required []Capability) (string, bool) {
+	return selectAgent(candidates, required, "")
+}
+
+// selectAgentByWorktree resolves a target by the worktree path a candidate
+// runs in (ADR 0042 p3). The returned target is the session's current delivery
+// key, which may change on a restart while the worktree path does not.
+func selectAgentByWorktree(candidates []CandidateAgent, worktreePath string) (string, bool) {
+	return selectAgent(candidates, nil, worktreePath)
 }
 
 // WakeHandler implements the wake tool over a WakeSender and, optionally, an
@@ -404,8 +446,19 @@ func NewWakeHandler(sender WakeSender) *WakeHandler {
 
 // NewCapabilityWakeHandler builds a handler that can resolve a delivery target
 // from declared capabilities. A nil directory is allowed and makes a capability
-// request an honest refusal instead of a guess.
+// request an honest refusal instead of a guess. The handler also resolves
+// worktree-addressed wakes (ADR 0042 p3) through the same directory.
 func NewCapabilityWakeHandler(sender WakeSender, directory AgentDirectory) *WakeHandler {
+	return &WakeHandler{sender: sender, directory: directory}
+}
+
+// NewWorktreeWakeHandler builds a handler that resolves the delivery target
+// from the worktree path a candidate session runs in (ADR 0042 p3). The path
+// is stable across a session restart, so a restarted session in the same
+// worktree is reached without reconfiguring the recipient. It is the same
+// wiring as NewCapabilityWakeHandler; the name states the addressing key this
+// caller uses. A nil directory makes a worktree request an honest refusal.
+func NewWorktreeWakeHandler(sender WakeSender, directory AgentDirectory) *WakeHandler {
 	return &WakeHandler{sender: sender, directory: directory}
 }
 
@@ -420,7 +473,8 @@ func NewFallbackWakeHandler(sender FallbackWakeSender, confirmer ReceiptConfirme
 
 // NewCapabilityFallbackWakeHandler adds capability-based target selection to
 // the fallback chain. It keeps the ADR 0037 p1 path intact while the chain
-// drives delivery.
+// drives delivery. The same directory resolves worktree-addressed wakes
+// (ADR 0042 p3), so the chain delivers to the session in the requested worktree.
 func NewCapabilityFallbackWakeHandler(sender FallbackWakeSender, confirmer ReceiptConfirmer, tracer TaskTracer, directory AgentDirectory) *WakeHandler {
 	return &WakeHandler{
 		fallbackSender: sender,
@@ -459,8 +513,10 @@ type wakeSetup struct {
 }
 
 // prepareWake validates input and resolves the target without attempting any
-// delivery. An interruption or an honest capability refusal arrives as a
-// refusal; a malformed call arrives as an error.
+// delivery. An interruption or an honest refusal from a routing-key lookup
+// (capability or worktree) arrives as a refusal; a malformed call arrives as
+// an error. Routing keys are resolved in one pass so a caller may request both
+// a capability set and a worktree path.
 func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 	if in.HasPendingQuestion || in.PendingApproval {
 		out := interruptedWake(in)
@@ -474,33 +530,53 @@ func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source)))}
 	}
 
+	hasCapabilities := len(in.RequiredCapabilities) > 0
+	hasWorktree := in.TargetWorktree != ""
 	target := in.Target
-	if len(in.RequiredCapabilities) > 0 {
+	if hasCapabilities || hasWorktree {
 		if h == nil || h.directory == nil {
+			reason := "wake: no agent directory configured for "
+			switch {
+			case hasCapabilities && hasWorktree:
+				reason += "capability or worktree selection"
+			case hasWorktree:
+				reason += "worktree addressing"
+			default:
+				reason += "capability selection"
+			}
 			return wakeSetup{refusal: &WakeOutput{
 				Delivery: DeliveryUnsupported,
 				OK:       false,
 				Source:   source,
 				Executor: in.Executor,
-				Reason:   "wake: no agent directory configured for capability selection",
+				Reason:   reason,
 				Woke:     in.Woke,
 			}}
 		}
-		selected, ok := selectAgentByCapabilities(h.directory.CandidateAgents(ctx), in.RequiredCapabilities)
+		selected, ok := selectAgent(h.directory.CandidateAgents(ctx), in.RequiredCapabilities, in.TargetWorktree)
 		if !ok {
+			reason := "wake: no session "
+			switch {
+			case hasCapabilities && hasWorktree:
+				reason += "declares the required capabilities in the requested worktree"
+			case hasWorktree:
+				reason += "runs in the requested worktree"
+			default:
+				reason += "declares the required capabilities"
+			}
 			return wakeSetup{refusal: &WakeOutput{
 				Delivery: DeliveryUnsupported,
 				OK:       false,
 				Source:   source,
 				Executor: in.Executor,
-				Reason:   "wake: no session declares the required capabilities",
+				Reason:   reason,
 				Woke:     in.Woke,
 			}}
 		}
 		target = selected
 	}
 	if target == "" {
-		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no capabilities are requested")}
+		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no routing key is requested")}
 	}
 	return wakeSetup{target: target, source: source}
 }
@@ -520,10 +596,13 @@ func isSuccessDelivery(delivery Delivery) bool {
 // Source is normalized and passed to the sender, then echoed on the output so
 // a review (diff comment) can be traced onto its ADR 0014 receipt. Woke is
 // only echoed from the input; no delivery outcome sets it (ADR 0032 p2).
-// Required capabilities are resolved through the directory into a delivery
-// target (ADR 0037 p1); without them the explicit Target still applies. When
-// the wait contract names a window, the wake is staggered to one random point
-// inside it before any sender is touched (ADR 0041 p5).
+// Required capabilities and the target worktree are resolved through the
+// directory into a delivery target (ADR 0037 p1 and ADR 0042 p3); without
+// either routing key the explicit Target still applies. A worktree path is a
+// stable key: a restarted session in the same worktree is reached, and a
+// session in another worktree is not. When the wait contract names a window,
+// the wake is staggered to one random point inside it before any sender is
+// touched (ADR 0041 p5).
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -575,7 +654,8 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 // message is written to the task trace and the honest delivery stays
 // unsupported; a trace is never reported as a delivery into the running turn.
 // The ADR 0041 p5 stagger runs before the chain so all channels of one waiter
-// share the same wake point.
+// share the same wake point. A target worktree (ADR 0042 p3) is resolved once
+// by prepareWake, so every channel of the chain addresses the same session.
 func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -685,7 +765,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
