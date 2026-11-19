@@ -28,6 +28,7 @@ var catalog = []command{
 	{Name: "task", Summary: "Работа с карточками задач", Usage: "beacon task <list|new|take> [flags]"},
 	{Name: "watch", Summary: "Показать вотчи Beacon с вердиктами и сессиями OpenCode", Usage: "beacon watch [--interval 2s] [--format table|json]"},
 	{Name: "what", Summary: "Показать описание одной команды", Usage: "beacon what <command>"},
+	{Name: "why", Summary: "Показать цепочку блокировок карточки", Usage: "beacon why <task>"},
 }
 
 func parseFlags(name string, args []string, errOut io.Writer, fs *flag.FlagSet) bool {

@@ -83,7 +83,7 @@ func TestT06ListJSONCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what"}
+	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what", "why"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
 	}
@@ -137,7 +137,7 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 	if errOut.Len() != 0 {
 		t.Fatalf("stderr не пустой: %q", errOut.String())
 	}
-	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what"} {
+	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what", "why"} {
 		if !strings.Contains(out.String(), name) {
 			t.Fatalf("таблица не содержит %s: %q", name, out.String())
 		}
@@ -374,6 +374,23 @@ func TestT06TaskDelegates(t *testing.T) {
 		t.Fatalf("код выхода %d, ожидался 3", code)
 	}
 	if out.String() != "task:[list --format json]\n" || errOut.Len() != 0 {
+		t.Fatalf("аргументы не переданы: stdout %q stderr %q", out.String(), errOut.String())
+	}
+}
+
+func TestT105WhyDelegates(t *testing.T) {
+	previous := taskRunner
+	taskRunner = func(args []string, out, errOut io.Writer) int {
+		fmt.Fprintf(out, "why:%v\n", args)
+		return 3
+	}
+	t.Cleanup(func() { taskRunner = previous })
+
+	c, out, errOut, _ := t06NewCLI(t, t06NoChild(t))
+	if code := c.Run([]string{"why", "T3.105"}); code != 3 {
+		t.Fatalf("код выхода %d, ожидался 3", code)
+	}
+	if out.String() != "why:[why T3.105]\n" || errOut.Len() != 0 {
 		t.Fatalf("аргументы не переданы: stdout %q stderr %q", out.String(), errOut.String())
 	}
 }
