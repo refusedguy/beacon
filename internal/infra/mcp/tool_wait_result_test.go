@@ -1074,10 +1074,51 @@ func TestWaitResultHandleSkipsWorkWhenTreeAlreadyCancelled(t *testing.T) {
 	}
 }
 
+// coalescingCIWaiter is the test stand-in for the store gate: the first caller
+// runs the expensive operation, the rest join the active round and share its
+// end. It keeps the acceptance test inside mcp without importing a sibling
+// infra package (ADR 0005).
+type coalescingCIWaiter struct {
+	mu    sync.Mutex
+	calls map[string]*coalescingCIRound
+}
+
+type coalescingCIRound struct {
+	done chan struct{}
+}
+
+func newCoalescingCIWaiter() *coalescingCIWaiter {
+	return &coalescingCIWaiter{calls: make(map[string]*coalescingCIRound)}
+}
+
+func (g *coalescingCIWaiter) wait(ctx context.Context, key string, fn func(context.Context) error) error {
+	g.mu.Lock()
+	if round, ok := g.calls[key]; ok {
+		g.mu.Unlock()
+		select {
+		case <-round.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	round := &coalescingCIRound{done: make(chan struct{})}
+	g.calls[key] = round
+	g.mu.Unlock()
+
+	err := fn(ctx)
+
+	g.mu.Lock()
+	delete(g.calls, key)
+	close(round.done)
+	g.mu.Unlock()
+	return err
+}
+
 // TestWaitResultSharedCIWaitCoalescesOneCI is the T3.76 acceptance check.
 // Fifteen units waiting on one CI (same repo/PR/headSHA) run the expensive
-// shared wait once. Removing the SharedCIWait call from wait makes the run
-// count reach 15 and this test fails.
+// shared wait once. Removing the gate call from wait makes the operation never
+// run and this test fails.
 func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 	const units = 15
 	var (
@@ -1094,6 +1135,7 @@ func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 		return nil
 	}
 
+	gate := newCoalescingCIWaiter()
 	start := make(chan struct{})
 	type result struct {
 		out WaitResultOutput
@@ -1105,6 +1147,7 @@ func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 	for i := 0; i < units; i++ {
 		svc, _, _, _, timeout := newWaitTestService()
 		svc.SetCIWait(op)
+		svc.SetSharedCIWaiter(gate.wait)
 		timeouts[i] = timeout
 		wg.Add(1)
 		go func(i int, svc *WaitResultService) {
