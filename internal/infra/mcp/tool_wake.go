@@ -20,6 +20,12 @@
 // fallback chain; it only echoes the executor supplied by the CLI manager so a
 // handover after a 429 stays visible in the wake receipt and in status.
 //
+// ADR 0032 p2 adds a separate woke fact. Delivery (steer or queue) reports that
+// a follow-up was sent; it never proves the agent started work. Woke is an
+// independent confirmation supplied by the caller and echoed unchanged. It is
+// not derived from delivery, OK, or the delivered/claimed/read timestamps of
+// ADR 0014: a message can be delivered without starting a new agent turn.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -96,6 +102,11 @@ type WakeInput struct {
 	// on (ADR 0031 p4). It is metadata, not check contents. The CLI manager owns
 	// the fallback chain; the core only echoes the value on the output.
 	Executor string `json:"executor,omitempty" jsonschema:"agent currently executing the job (fallback chain)"`
+	// Woke is the caller's separate confirmation that the agent actually began
+	// work on the follow-up (ADR 0032 p2). It is not a delivery outcome: the
+	// caller reports it when it observes the new turn, never from a steer or
+	// queue receipt. The tool echoes it without interpreting it.
+	Woke bool `json:"woke,omitempty" jsonschema:"separate confirmation that the agent began work; not derived from delivery or delivery timestamps"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -108,7 +119,10 @@ type WakeInput struct {
 // Source echoes the normalized message source so a caller can put it on the
 // ADR 0014 receipt: review means the follow-up was a diff comment. Executor
 // echoes the current executor supplied by the caller, so a handover after a
-// 429 is visible in the wake status (ADR 0031 p4).
+// 429 is visible in the wake status (ADR 0031 p4). Woke echoes the caller's
+// separate confirmation that the agent began work (ADR 0032 p2); it stays
+// false on every dispatch path unless the caller reports it, so a delivered
+// follow-up is never mistaken for a started agent turn.
 type WakeOutput struct {
 	Delivery    Delivery   `json:"delivery"`
 	OK          bool       `json:"ok"`
@@ -116,6 +130,7 @@ type WakeOutput struct {
 	Executor    string     `json:"executor,omitempty"`
 	Interrupted bool       `json:"interrupted,omitempty"`
 	Reason      string     `json:"reason,omitempty"`
+	Woke        bool       `json:"woke,omitempty"`
 }
 
 // Interruption reasons are fixed strings so tests and callers can rely on the
@@ -165,7 +180,8 @@ func (h *WakeHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 // The ADR 0028 human flags are checked first: when the agent needs a human,
 // the wait is interrupted before any delivery attempt and the reason is returned.
 // Source is normalized and passed to the sender, then echoed on the output so
-// a review (diff comment) can be traced onto its ADR 0014 receipt.
+// a review (diff comment) can be traced onto its ADR 0014 receipt. Woke is
+// only echoed from the input; no delivery outcome sets it (ADR 0032 p2).
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	if in.HasPendingQuestion || in.PendingApproval {
 		return interruptedWake(in), nil
@@ -184,18 +200,19 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 			Source:   source,
 			Executor: in.Executor,
 			Reason:   "wake: no delivery sender configured",
+			Woke:     in.Woke,
 		}, nil
 	}
 
 	delivery, reason := h.sender.Deliver(ctx, in.Target, in.Text, source)
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
-		return WakeOutput{Delivery: delivery, OK: true, Source: source, Executor: in.Executor}, nil
+		return WakeOutput{Delivery: delivery, OK: true, Source: source, Executor: in.Executor, Woke: in.Woke}, nil
 	case DeliveryUnsupported:
 		if reason == "" {
 			reason = "wake: delivery to an open session is not supported"
 		}
-		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: source, Executor: in.Executor, Reason: reason}, nil
+		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: source, Executor: in.Executor, Reason: reason, Woke: in.Woke}, nil
 	default:
 		// An unknown value is never promoted to success. Report it as an
 		// unsupported delivery with a reason so the caller can branch safely.
@@ -205,6 +222,7 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 			Source:   source,
 			Executor: in.Executor,
 			Reason:   fmt.Sprintf("wake: unknown delivery value %q", string(delivery)),
+			Woke:     in.Woke,
 		}, nil
 	}
 }
@@ -227,6 +245,7 @@ func interruptedWake(in WakeInput) WakeOutput {
 		Executor:    in.Executor,
 		Interrupted: true,
 		Reason:      reason,
+		Woke:        in.Woke,
 	}
 }
 
@@ -241,7 +260,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Source review marks a diff comment delivered as steer.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,

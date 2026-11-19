@@ -46,6 +46,20 @@ INSERT OR IGNORE INTO stream_health (id, chunks, missing, duplicates, last_seq)
 VALUES (1, 0, '[]', 0, 0);
 `
 
+// ADR 0032 p2 keeps "the follow-up was sent" and "the agent started work" as
+// two separate facts. They live in their own table, not in persist_progress or
+// stream_health, and are not the delivered/claimed/read timestamps of an
+// obligation (ADR 0014). One row per obligation; each fact can be recorded on
+// its own and the two are merged with OR, so observing a wake then a start, or
+// only a start, both converge on one honest row.
+const createWakeObservationsSQL = `
+CREATE TABLE IF NOT EXISTS wake_observations (
+  obligation_id TEXT PRIMARY KEY,
+  sent          INTEGER NOT NULL DEFAULT 0,
+  woke          INTEGER NOT NULL DEFAULT 0
+);
+`
+
 // PersistState is the persist{seq,lastError} block of beacon_stats. FailedSince
 // is when the last failed write was recorded; it is zero while the last write
 // succeeded. The JSON names match the stats contract.
@@ -65,6 +79,17 @@ type StreamHealth struct {
 	Missing    []uint64 `json:"missing"`
 	Duplicates uint64   `json:"duplicates"`
 	LastSeq    uint64   `json:"lastSeq"`
+}
+
+// WakeObservation is the observability view of one wake episode (ADR 0032 p2).
+// Sent means a follow-up was dispatched; Woke means the confirmation that the
+// agent began work arrived. They are independent facts: Sent never implies
+// Woke, and Woke is never inferred from delivered, claimed or read. The JSON
+// names are separate so a manager can tell "отправил" from "начал работу".
+type WakeObservation struct {
+	ObligationID string `json:"obligationID"`
+	Sent         bool   `json:"sent"`
+	Woke         bool   `json:"woke"`
 }
 
 // LoadError is one damaged journal row. Line is the event seq, the SQLite
@@ -225,6 +250,84 @@ func (d *DB) StreamHealth() (StreamHealth, error) {
 // hold only the ObservedPersist.
 func (p *ObservedPersist) StreamHealth() (StreamHealth, error) {
 	return p.db.StreamHealth()
+}
+
+// RecordWake stores one wake fact for an obligation (ADR 0032 p2). Sent and
+// Woke are independent observations: each may be true without the other, and a
+// later call merges them with OR so observing a dispatch then a start, or only
+// a start, converges on one honest row. It writes through the underlying DB,
+// not through Write, so recording wake facts does not advance the persist seq.
+func (p *ObservedPersist) RecordWake(ctx context.Context, obs WakeObservation) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if obs.ObligationID == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: wake observation requires an obligation id")
+	}
+	sent, woke := 0, 0
+	if obs.Sent {
+		sent = 1
+	}
+	if obs.Woke {
+		woke = 1
+	}
+	err := p.db.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createWakeObservationsSQL); err != nil {
+			return fmt.Errorf("store: wake observations: create table: %w", err)
+		}
+		_, err := tx.Exec(`
+			INSERT INTO wake_observations (obligation_id, sent, woke)
+			VALUES (?, ?, ?)
+			ON CONFLICT(obligation_id) DO UPDATE SET
+			  sent = wake_observations.sent OR excluded.sent,
+			  woke = wake_observations.woke OR excluded.woke`, obs.ObligationID, sent, woke)
+		return err
+	})
+	if err != nil {
+		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+	}
+	return nil
+}
+
+// WakeObservations reads all recorded wake facts (ADR 0032 p2). A store that
+// never recorded a wake reports an empty list and does not create the table.
+func (d *DB) WakeObservations() ([]WakeObservation, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "wake_observations")
+	if err != nil || !ok {
+		return []WakeObservation{}, err
+	}
+	rows, err := d.readDB.Query(`
+		SELECT obligation_id, sent, woke FROM wake_observations ORDER BY obligation_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []WakeObservation{}
+	for rows.Next() {
+		var (
+			obs        WakeObservation
+			sent, woke int
+		)
+		if err := rows.Scan(&obs.ObligationID, &sent, &woke); err != nil {
+			return nil, err
+		}
+		obs.Sent = sent != 0
+		obs.Woke = woke != 0
+		out = append(out, obs)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// WakeObservations is the same read method on the wrapped writer, for callers
+// that hold only the ObservedPersist.
+func (p *ObservedPersist) WakeObservations() ([]WakeObservation, error) {
+	return p.db.WakeObservations()
 }
 
 // PersistState reads persist{seq,lastError} without writing. A store that has

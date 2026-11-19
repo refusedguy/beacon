@@ -668,3 +668,131 @@ func TestWakeExecutorOverInMemoryTransport(t *testing.T) {
 		t.Errorf("client saw executor=%q, want %q", out.Executor, "hermes")
 	}
 }
+
+// TestWokeIsNotDerivedFromDelivery is the T3.26 acceptance core (ADR 0032 p2):
+// a dispatch receipt, successful or refused, never sets woke. Sending a
+// follow-up is a different event from the agent starting work.
+func TestWokeIsNotDerivedFromDelivery(t *testing.T) {
+	cases := []struct {
+		name     string
+		delivery Delivery
+	}{
+		{name: "steer", delivery: DeliverySteer},
+		{name: "queue", delivery: DeliveryQueue},
+		{name: "unsupported", delivery: DeliveryUnsupported},
+		{name: "unknown delivery", delivery: Delivery("bogus")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &fakeWakeSender{delivery: tc.delivery, reason: "no channel"}
+			out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
+			if err != nil {
+				t.Fatalf("Wake() error = %v", err)
+			}
+			if out.Woke {
+				t.Error("woke = true from a dispatch alone; woke must be reported separately (ADR 0032 p2)")
+			}
+		})
+	}
+}
+
+// TestWokeIsReportedIndependently proves a caller-supplied woke fact survives
+// every delivery outcome, including a refusal and an interruption. It is not
+// gated by OK and does not change the honest delivery result.
+func TestWokeIsReportedIndependently(t *testing.T) {
+	cases := []struct {
+		name         string
+		delivery     Delivery
+		wantOK       bool
+		wantDelivery Delivery
+	}{
+		{name: "steer", delivery: DeliverySteer, wantOK: true, wantDelivery: DeliverySteer},
+		{name: "unsupported", delivery: DeliveryUnsupported, wantOK: false, wantDelivery: DeliveryUnsupported},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &fakeWakeSender{delivery: tc.delivery, reason: "no channel"}
+			out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p", Woke: true})
+			if err != nil {
+				t.Fatalf("Wake() error = %v", err)
+			}
+			if !out.Woke {
+				t.Error("woke = false, want the caller's separate confirmation")
+			}
+			if out.OK != tc.wantOK || out.Delivery != tc.wantDelivery {
+				t.Errorf("delivery=%q ok=%v, want %q/%v; woke must not alter delivery", out.Delivery, out.OK, tc.wantDelivery, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestWokeOnInterruption keeps the fact independent of the ADR 0028 path too:
+// a human interruption sends nothing, yet a reported start is still visible.
+func TestWokeOnInterruption(t *testing.T) {
+	out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).Wake(
+		context.Background(), WakeInput{Target: "s", Text: "p", HasPendingQuestion: true, Woke: true})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if !out.Woke || !out.Interrupted || out.OK {
+		t.Errorf("woke=%v interrupted=%v ok=%v, want true/true/false", out.Woke, out.Interrupted, out.OK)
+	}
+}
+
+// TestWakeSchemaHasWoke proves an MCP client can send the separate woke fact.
+func TestWakeSchemaHasWoke(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "woke") {
+		t.Errorf("wake input schema missing woke: %s", inputSchema)
+	}
+}
+
+// TestWokeOverInMemoryTransport drives woke through a real MCP client and
+// server. It proves the fact is decoded from the schema and echoed back, not
+// just handled in process.
+func TestWokeOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target: "session-1",
+			Text:   "obligation-1@7",
+			Woke:   true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if !out.Woke || !out.OK || out.Delivery != DeliveryQueue {
+		t.Errorf("client saw woke=%v ok=%v delivery=%q, want true/true/queue", out.Woke, out.OK, out.Delivery)
+	}
+}
