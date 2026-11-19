@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -501,5 +503,209 @@ func TestT3114RegisterWiring(t *testing.T) {
 	}
 	if state, err := gcReadState(); err != nil || len(state.Leases) != 2 {
 		t.Fatalf("RegisterGCStores не подключил чтение: %+v, %v", state, err)
+	}
+}
+
+// --- T3.125 / ADR 0056 p4: батчинг событий в одно пробуждение ---
+
+var w3125Base = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+func TestWakeBatchCollapsesBurst(t *testing.T) {
+	events := []wakeEvent{
+		{At: w3125Base, Target: "ses-1", Text: "ready@7"},
+		{At: w3125Base.Add(30 * time.Millisecond), Target: "ses-1", Text: "ready@8"},
+		{At: w3125Base.Add(150 * time.Millisecond), Target: "ses-1", Text: "ready@9"},
+	}
+	batches := batchWakeEvents(events, wakeBatchWindow)
+	if len(batches) != 1 {
+		t.Fatalf("батчей %d, ожидался 1: %+v", len(batches), batches)
+	}
+	if batches[0].Target != "ses-1" || len(batches[0].Texts) != 3 {
+		t.Fatalf("неверный батч: %+v", batches[0])
+	}
+	for i, want := range []string{"ready@7", "ready@8", "ready@9"} {
+		if batches[0].Texts[i] != want {
+			t.Fatalf("текст %d = %q, хотим %q", i, batches[0].Texts[i], want)
+		}
+	}
+}
+
+func TestWakeBatchWindowOpensNewBatch(t *testing.T) {
+	events := []wakeEvent{
+		{At: w3125Base, Target: "ses-1", Text: "a"},
+		{At: w3125Base.Add(199 * time.Millisecond), Target: "ses-1", Text: "b"},
+		{At: w3125Base.Add(200 * time.Millisecond), Target: "ses-1", Text: "c"},
+		{At: w3125Base.Add(350 * time.Millisecond), Target: "ses-1", Text: "d"},
+	}
+	batches := batchWakeEvents(events, wakeBatchWindow)
+	if len(batches) != 2 {
+		t.Fatalf("батчей %d, ожидалось 2: %+v", len(batches), batches)
+	}
+	if len(batches[0].Texts) != 2 || len(batches[1].Texts) != 2 {
+		t.Fatalf("размеры батчей %d и %d, хотим 2 и 2: %+v", len(batches[0].Texts), len(batches[1].Texts), batches)
+	}
+	if batches[0].Texts[0] != "a" || batches[0].Texts[1] != "b" ||
+		batches[1].Texts[0] != "c" || batches[1].Texts[1] != "d" {
+		t.Fatalf("порядок событий в батчах: %+v", batches)
+	}
+}
+
+func TestWakeBatchSeparatesTargets(t *testing.T) {
+	events := []wakeEvent{
+		{At: w3125Base, Target: "ses-1", Text: "a"},
+		{At: w3125Base.Add(10 * time.Millisecond), Target: "ses-2", Text: "b"},
+		{At: w3125Base.Add(20 * time.Millisecond), Target: "ses-1", Text: "c"},
+	}
+	batches := batchWakeEvents(events, wakeBatchWindow)
+	if len(batches) != 2 {
+		t.Fatalf("батчей %d, ожидалось 2: %+v", len(batches), batches)
+	}
+	if batches[0].Target != "ses-1" || batches[1].Target != "ses-2" {
+		t.Fatalf("порядок батчей (по времени открытия): %+v", batches)
+	}
+	if len(batches[0].Texts) != 2 || len(batches[1].Texts) != 1 {
+		t.Fatalf("размеры батчей: %+v", batches)
+	}
+}
+
+func TestWakeBatchIsNotWakeBetween(t *testing.T) {
+	// T3.80 разносит пробуждения во времени. T3.125 уменьшает кратность:
+	// 50 событий в окне дают ровно один wake без случайной задержки.
+	events := make([]wakeEvent, 0, 50)
+	for i := 0; i < 50; i++ {
+		events = append(events, wakeEvent{
+			At:     w3125Base.Add(time.Duration(i) * time.Millisecond),
+			Target: "ses-1",
+			Text:   fmt.Sprintf("line-%d", i),
+		})
+	}
+	batches := batchWakeEvents(events, wakeBatchWindow)
+	if len(batches) != 1 || len(batches[0].Texts) != 50 {
+		t.Fatalf("ожидался 1 батч из 50 событий: %d батчей, %+v", len(batches), batches)
+	}
+	second := batchWakeEvents([]wakeEvent{{At: w3125Base.Add(250 * time.Millisecond), Target: "ses-1", Text: "late"}}, wakeBatchWindow)
+	if len(second) != 1 || second[0].Texts[0] != "late" {
+		t.Fatalf("событие после окна не открыло новый wake: %+v", second)
+	}
+}
+
+func TestEmitWakeBatchesSendsOncePerBatch(t *testing.T) {
+	batches := []wakeBatch{
+		{Target: "ses-1", Texts: []string{"a", "b"}},
+		{Target: "ses-2", Texts: []string{"c"}},
+	}
+	var sends []string
+	err := emitWakeBatches(batches, func(target, text string) error {
+		sends = append(sends, target+"|"+text)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sends) != 2 {
+		t.Fatalf("wake вызовов %d, ожидалось 2: %q", len(sends), sends)
+	}
+	if sends[0] != "ses-1|a; b" || sends[1] != "ses-2|c" {
+		t.Fatalf("wake вызовы: %q", sends)
+	}
+}
+
+func TestEmitWakeBatchesStopsOnError(t *testing.T) {
+	batches := []wakeBatch{
+		{Target: "ses-1", Texts: []string{"a"}},
+		{Target: "ses-2", Texts: []string{"b"}},
+	}
+	calls := 0
+	err := emitWakeBatches(batches, func(string, string) error {
+		calls++
+		return errors.New("send failed")
+	})
+	if err == nil {
+		t.Fatal("ожидалась ошибка отправки")
+	}
+	if calls != 1 {
+		t.Fatalf("send вызовов %d, ожидался 1", calls)
+	}
+}
+
+func TestRunWatchBatchedWakeGroupsBySession(t *testing.T) {
+	rows := []watchRow{
+		{Watch: "watch-1", Verdict: "ready", Revision: 7, Subscriber: "ses-1"},
+		{Watch: "watch-1", Verdict: "ready", Revision: 8, Subscriber: "ses-1"},
+		{Watch: "watch-2", Verdict: "ready", Revision: 3, Subscriber: "ses-2"},
+		{Watch: "watch-2", Verdict: "ready", Revision: 3},
+	}
+	var sends []string
+	err := runWatchBatchedWake(rows, w3125Base, func(target, text string) error {
+		sends = append(sends, target+"|"+text)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sends) != 2 {
+		t.Fatalf("wake вызовов %d, ожидалось 2: %q", len(sends), sends)
+	}
+	found := make(map[string]string)
+	for _, s := range sends {
+		parts := strings.SplitN(s, "|", 2)
+		found[parts[0]] = parts[1]
+	}
+	if found["ses-1"] != "ready@7; ready@8" || found["ses-2"] != "ready@3" {
+		t.Fatalf("wake содержимое: %+v", found)
+	}
+	if _, ok := found[""]; ok {
+		t.Fatalf("wake для строки без подписчика: %+v", found)
+	}
+}
+
+func TestRunWatchWakeFlagEmitsOneWakePerSession(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictReady, 7, "ses-1", "ses-1", "ses-2"),
+		}}, nil
+	})
+	c, out, errOut, _ := w69CLI(t, func(w69Call) runResult { return w69SessionList() })
+	if code := runWatch(c, []string{"--wake"}); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, errOut.String())
+	}
+	if n := strings.Count(out.String(), "wake session=ses-1 "); n != 1 {
+		t.Fatalf("ses-1 разбужен %d раз, ожидался 1: %q", n, out.String())
+	}
+	if n := strings.Count(out.String(), "wake session=ses-2 "); n != 1 {
+		t.Fatalf("ses-2 разбужен %d раз, ожидался 1: %q", n, out.String())
+	}
+}
+
+func TestRunWatchNoWakeWithoutFlag(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictReady, 7, "ses-1"),
+		}}, nil
+	})
+	c, out, _, _ := w69CLI(t, func(w69Call) runResult { return w69SessionList() })
+	if code := runWatch(c, nil); code != 0 {
+		t.Fatalf("код выхода %d", code)
+	}
+	if strings.Contains(out.String(), "wake session=") {
+		t.Fatalf("wake без флага: %q", out.String())
+	}
+}
+
+func TestRunWatchWakeJSONKeepsStdoutValid(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictReady, 7, "ses-1"),
+		}}, nil
+	})
+	c, out, errOut, _ := w69CLI(t, func(w69Call) runResult { return w69SessionList() })
+	if code := runWatch(c, []string{"--format", "json", "--wake"}); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, errOut.String())
+	}
+	if !json.Valid(out.Bytes()) {
+		t.Fatalf("stdout не JSON: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "wake session=ses-1 ") {
+		t.Fatalf("wake не в stderr: %q", errOut.String())
 	}
 }
