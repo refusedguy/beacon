@@ -62,6 +62,7 @@ package mcp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"time"
@@ -277,6 +278,89 @@ type WakeOutput struct {
 	// push-unreachable or expired message keeps OK false even when a channel
 	// acknowledged the send, so a rejection is never read as a delivery.
 	State DeliveryState `json:"state"`
+}
+
+// T3.110 (ADR 0046 feature 2) makes a wake error repairable. ADR 0009 fixes the
+// six MCP error fields ok, code, message, status, retryAfterMs and newWatchID;
+// that envelope is not rewritten. Three recovery fields are added on top:
+// retryable says whether a retry can succeed, recoveryHint names the one
+// parameter the model should fix, and partial.cursor marks the position the
+// call reached so work continues from that offset instead of restarting.
+
+// PartialResult is the already-processed position of a repairable wake error.
+// Cursor is opaque to the core. The model fixes the named parameter and passes
+// the cursor back to resume at that position.
+type PartialResult struct {
+	Cursor string `json:"cursor"`
+}
+
+// RepairableErrorShape is the ADR 0009 error envelope plus the three ADR 0046
+// recovery fields. Embedding ErrorShape keeps the six original fields intact;
+// nothing in ADR 0009 or schema.go is changed.
+type RepairableErrorShape struct {
+	ErrorShape
+	Retryable    bool          `json:"retryable"`
+	RecoveryHint string        `json:"recoveryHint,omitempty"`
+	Partial      PartialResult `json:"partial,omitempty"`
+}
+
+// RecoveryError is a wake boundary error that carries repair metadata while
+// remaining a domain.AppError. Unwrap keeps errors.As(err, *domain.AppError)
+// working for callers written before ADR 0046.
+type RecoveryError struct {
+	*domain.AppError
+	Retryable    bool
+	RecoveryHint string
+	Partial      PartialResult
+}
+
+func (e *RecoveryError) Error() string {
+	if e == nil || e.AppError == nil {
+		return ""
+	}
+	return e.AppError.Error()
+}
+
+func (e *RecoveryError) Unwrap() error {
+	if e == nil || e.AppError == nil {
+		return nil
+	}
+	return e.AppError
+}
+
+// Stable cursors name the input position a repairable wake error reached. The
+// model fixes that one field and continues from its offset.
+const (
+	recoveryCursorText   = "input.text"
+	recoveryCursorSource = "input.source"
+	recoveryCursorState  = "input.state"
+	recoveryCursorTarget = "input.target"
+	recoveryCursorWindow = "input.wakeBetweenMillis"
+)
+
+// repairableError wraps a domain error with repair metadata. The hint names the
+// single parameter to fix; the cursor marks where to resume.
+func repairableError(base *domain.AppError, retryable bool, hint, cursor string) error {
+	return &RecoveryError{AppError: base, Retryable: retryable, RecoveryHint: hint, Partial: PartialResult{Cursor: cursor}}
+}
+
+// ToRepairableErrorShape converts an error into the repairable envelope. It
+// reuses ToErrorShape so the six ADR 0009 fields are unchanged, then adds the
+// three recovery fields when err carries a RecoveryError. The bool is false
+// when err carries no AppError, matching ToErrorShape.
+func ToRepairableErrorShape(err error) (RepairableErrorShape, bool) {
+	base, ok := ToErrorShape(err)
+	if !ok {
+		return RepairableErrorShape{}, false
+	}
+	shape := RepairableErrorShape{ErrorShape: base}
+	var recovery *RecoveryError
+	if errors.As(err, &recovery) {
+		shape.Retryable = recovery.Retryable
+		shape.RecoveryHint = recovery.RecoveryHint
+		shape.Partial = recovery.Partial
+	}
+	return shape, true
 }
 
 // Interruption reasons are fixed strings so tests and callers can rely on the
@@ -496,7 +580,12 @@ func (h *WakeHandler) applyWakeWindow(ctx context.Context, in WakeInput) error {
 		}
 	}
 	if err := sleeper.Sleep(ctx, pick(window)); err != nil {
-		return domain.NewAppError(domain.CodeCancelled, "wake: waiting inside wake window was cancelled: "+err.Error())
+		return repairableError(
+			domain.NewAppError(domain.CodeCancelled, "wake: waiting inside wake window was cancelled: "+err.Error()),
+			true,
+			"wake: reissue the wake with a fresh wait window; the previous wait was cancelled",
+			recoveryCursorWindow,
+		)
 	}
 	return nil
 }
@@ -588,14 +677,29 @@ func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 		return wakeSetup{refusal: &out}
 	}
 	if in.Text == "" {
-		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, "wake: text is required")}
+		return wakeSetup{err: repairableError(
+			domain.NewAppError(domain.CodeInvalidInput, "wake: text is required"),
+			true,
+			"wake: set the text field to a pointer-only wake message",
+			recoveryCursorText,
+		)}
 	}
 	source := normalizeSource(in.Source)
 	if !validSource(source) {
-		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source)))}
+		return wakeSetup{err: repairableError(
+			domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source))),
+			true,
+			"wake: set the source field to manual or review",
+			recoveryCursorSource,
+		)}
 	}
 	if in.State != "" && !validDeliveryState(in.State) {
-		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown receipt state %q", string(in.State)))}
+		return wakeSetup{err: repairableError(
+			domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown receipt state %q", string(in.State))),
+			true,
+			"wake: set the state field to one of the eight receipt lifecycle states",
+			recoveryCursorState,
+		)}
 	}
 
 	hasCapabilities := len(in.RequiredCapabilities) > 0
@@ -644,7 +748,12 @@ func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 		target = selected
 	}
 	if target == "" {
-		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no routing key is requested")}
+		return wakeSetup{err: repairableError(
+			domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no routing key is requested"),
+			true,
+			"wake: set the target field or a routing key (requiredCapabilities or targetWorktree)",
+			recoveryCursorTarget,
+		)}
 	}
 	return wakeSetup{target: target, source: source}
 }

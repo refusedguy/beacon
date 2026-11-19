@@ -2216,3 +2216,176 @@ func TestWakeSchemaHasState(t *testing.T) {
 		t.Errorf("wake input schema missing state: %s", inputSchema)
 	}
 }
+
+// TestT3_110WakeValidationErrorIsRepairable proves a rejected wake call carries
+// the repairable envelope: the six ADR 0009 fields plus retryable, recoveryHint
+// and partial.cursor (ADR 0046 feature 2). The error still unwraps to AppError.
+func TestT3_110WakeValidationErrorIsRepairable(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         WakeInput
+		wantCursor string
+	}{
+		{name: "text", in: WakeInput{Target: "s"}, wantCursor: recoveryCursorText},
+		{name: "source", in: WakeInput{Target: "s", Text: "p", Source: "bogus"}, wantCursor: recoveryCursorSource},
+		{name: "state", in: WakeInput{Target: "s", Text: "p", State: "bogus"}, wantCursor: recoveryCursorState},
+		{name: "target", in: WakeInput{Text: "p"}, wantCursor: recoveryCursorTarget},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer})
+			_, err := handler.Wake(context.Background(), tc.in)
+			if err == nil {
+				t.Fatal("Wake() error = nil, want a repairable error")
+			}
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Fatalf("error %v does not unwrap to AppError code %q", err, domain.CodeInvalidInput)
+			}
+			shape, ok := ToRepairableErrorShape(err)
+			if !ok {
+				t.Fatal("ToRepairableErrorShape returned false")
+			}
+			if shape.OK || shape.Code != domain.CodeInvalidInput || shape.Status != 400 {
+				t.Errorf("shape ok=%v code=%q status=%d, want false/%q/400", shape.OK, shape.Code, shape.Status, domain.CodeInvalidInput)
+			}
+			if !shape.Retryable {
+				t.Error("retryable=false, want true for a fixable input error")
+			}
+			if shape.RecoveryHint == "" {
+				t.Error("recoveryHint is empty")
+			}
+			if shape.Partial.Cursor != tc.wantCursor {
+				t.Errorf("partial.cursor=%q, want %q", shape.Partial.Cursor, tc.wantCursor)
+			}
+		})
+	}
+}
+
+// TestT3_110RecoveryHintLetsModelFixOneParameterAndContinue is the acceptance
+// check: the model reads recoveryHint and partial.cursor, fixes the single named
+// parameter, and the retried call reaches the sender instead of resending all.
+func TestT3_110RecoveryHintLetsModelFixOneParameterAndContinue(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender)
+
+	bad := WakeInput{Target: "session-1", Text: "obligation-1@7", Source: "revie"}
+	_, err := handler.Wake(context.Background(), bad)
+	if err == nil {
+		t.Fatal("Wake() error = nil, want a repairable error for a misspelled source")
+	}
+	shape, ok := ToRepairableErrorShape(err)
+	if !ok {
+		t.Fatal("ToRepairableErrorShape returned false")
+	}
+	if shape.Partial.Cursor != recoveryCursorSource {
+		t.Fatalf("partial.cursor=%q, want %q", shape.Partial.Cursor, recoveryCursorSource)
+	}
+	if !strings.Contains(shape.RecoveryHint, "source") {
+		t.Errorf("recoveryHint %q does not name the parameter to fix", shape.RecoveryHint)
+	}
+	if sender.calls != 0 {
+		t.Fatalf("sender calls=%d, want 0 before the parameter is fixed", sender.calls)
+	}
+
+	fixed := bad
+	fixed.Source = SourceReview
+	out, err := handler.Wake(context.Background(), fixed)
+	if err != nil {
+		t.Fatalf("Wake() after fix error = %v, want nil", err)
+	}
+	if !out.OK || out.Source != SourceReview {
+		t.Errorf("after fix ok=%v source=%q, want true/%q", out.OK, out.Source, SourceReview)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls=%d, want exactly one delivery after the fix", sender.calls)
+	}
+}
+
+// TestT3_110RepairableShapeKeepsADR0009Form proves the six original fields are
+// preserved, including code-specific retryAfterMs and newWatchID, and that the
+// JSON envelope carries exactly the three added recovery fields on top.
+func TestT3_110RepairableShapeKeepsADR0009Form(t *testing.T) {
+	base := domain.NewAppError(domain.CodeRateLimited, "slow down")
+	ms := int64(250)
+	base.RetryAfterMs = &ms
+	base.NewWatchID = "watch-1"
+	err := repairableError(base, true, "wake: set the source field to manual or review", recoveryCursorSource)
+
+	six, ok := ToErrorShape(err)
+	if !ok {
+		t.Fatal("ToErrorShape no longer recognises a RecoveryError as an AppError")
+	}
+	if six.OK || six.Code != domain.CodeRateLimited || six.Status != 429 || six.Message != "slow down" {
+		t.Errorf("ADR 0009 shape changed: %+v", six)
+	}
+	if six.RetryAfterMs == nil || *six.RetryAfterMs != ms || six.NewWatchID != "watch-1" {
+		t.Errorf("code-specific fields lost: retryAfterMs=%v newWatchID=%q", six.RetryAfterMs, six.NewWatchID)
+	}
+
+	shape, ok := ToRepairableErrorShape(err)
+	if !ok {
+		t.Fatal("ToRepairableErrorShape returned false")
+	}
+	if shape.RetryAfterMs == nil || *shape.RetryAfterMs != ms || shape.NewWatchID != "watch-1" {
+		t.Errorf("repairable shape lost code-specific fields: %+v", shape.ErrorShape)
+	}
+
+	raw, err := json.Marshal(shape)
+	if err != nil {
+		t.Fatalf("marshal repairable shape: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal repairable shape: %v", err)
+	}
+	for _, key := range []string{"ok", "code", "message", "status", "retryable", "recoveryHint", "partial"} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("repairable shape JSON missing %q: %s", key, raw)
+		}
+	}
+	partial, ok := fields["partial"].(map[string]any)
+	if !ok || partial["cursor"] != recoveryCursorSource {
+		t.Errorf("partial.cursor lost in JSON: %s", raw)
+	}
+}
+
+// TestT3_110CancelledWaitIsRepairable keeps a cancelled stagger repairable too,
+// pointing the model at the wake window instead of a dead session.
+func TestT3_110CancelledWaitIsRepairable(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithWakeSleeper(&recordingSleeper{err: context.Canceled})
+
+	_, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", WakeBetweenMillis: 1500,
+	})
+	if err == nil {
+		t.Fatal("Wake() error = nil, want a cancellation error")
+	}
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) || appErr.Code != domain.CodeCancelled {
+		t.Fatalf("error %v does not unwrap to AppError code %q", err, domain.CodeCancelled)
+	}
+	shape, ok := ToRepairableErrorShape(err)
+	if !ok {
+		t.Fatal("ToRepairableErrorShape returned false")
+	}
+	if shape.Code != domain.CodeCancelled || !shape.Retryable {
+		t.Errorf("shape code=%q retryable=%v, want %q/true", shape.Code, shape.Retryable, domain.CodeCancelled)
+	}
+	if shape.Partial.Cursor != recoveryCursorWindow {
+		t.Errorf("partial.cursor=%q, want %q", shape.Partial.Cursor, recoveryCursorWindow)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls=%d, want 0 after a cancelled wait", sender.calls)
+	}
+}
+
+// TestT3_110NonAppErrorIsNotRepairable keeps the conversion honest: a plain
+// error carries no contract code and must not fabricate a repairable envelope.
+func TestT3_110NonAppErrorIsNotRepairable(t *testing.T) {
+	if _, ok := ToRepairableErrorShape(errors.New("plain failure")); ok {
+		t.Error("ToRepairableErrorShape accepted an error with no AppError")
+	}
+}
