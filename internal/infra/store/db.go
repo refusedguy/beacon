@@ -1518,3 +1518,223 @@ func (d *DB) CompletionNotificationCount() (int, error) {
 	}
 	return n, nil
 }
+
+// createTaskLogSQL owns the three-part task log from ADR 0051 feature 2. As
+// with task_starts and the other on-first-use tables, it is created on first
+// write because this card owns only db.go and adds no migration file. One row
+// per (task_id, part) keeps the request, outcome and report as three separate
+// records that each can be read on its own. Live activity lives in a different
+// table below, so "what is happening now" never mixes into these three parts.
+const createTaskLogSQL = `
+CREATE TABLE IF NOT EXISTS task_log (
+  task_id    TEXT NOT NULL,
+  part       TEXT NOT NULL,
+  payload    BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (task_id, part)
+);
+`
+
+// createTaskActivitySQL owns current live activity, kept apart from the three
+// durable log parts (ADR 0051 feature 2). One row per task holds only the
+// latest message: activity is what is happening now, not a history record.
+const createTaskActivitySQL = `
+CREATE TABLE IF NOT EXISTS task_activity (
+  task_id    TEXT PRIMARY KEY,
+  message    TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`
+
+// The three durable parts of a task's log (ADR 0051 feature 2). These are
+// three separate records, not a status field: the request, outcome and report
+// are each written on their own and read independently. This is the journal
+// structure from ADR 0051, not the status/cursor of ADR 0025.
+const (
+	LogPartRequest = "request"
+	LogPartOutcome = "outcome"
+	LogPartReport  = "report"
+)
+
+func validLogPart(part string) bool {
+	switch part {
+	case LogPartRequest, LogPartOutcome, LogPartReport:
+		return true
+	}
+	return false
+}
+
+// TaskLogEntry is one committed part of a task's log.
+type TaskLogEntry struct {
+	TaskID    string
+	Part      string
+	Payload   []byte
+	CreatedAt int64
+}
+
+// SetLogPart writes one of the three parts (request, outcome, report) as a
+// separate record. A repeat of the same part is a no-op: the first bytes stay
+// stored, so a redelivery cannot overwrite the request with an outcome.
+// Payload is redacted before it reaches the file (ADR 0012).
+func (d *DB) SetLogPart(taskID, part string, payload []byte) error {
+	if strings.TrimSpace(taskID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: log: empty task id")
+	}
+	if !validLogPart(part) {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: log: invalid part "+part)
+	}
+	clean := Redact(payload)
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createTaskLogSQL); err != nil {
+			return fmt.Errorf("store: log: create table: %w", err)
+		}
+		_, err := tx.Exec(`
+			INSERT OR IGNORE INTO task_log (task_id, part, payload, created_at)
+			VALUES (?, ?, ?, ?)`, taskID, part, clean, time.Now().UTC().UnixNano())
+		return err
+	})
+}
+
+// TaskLogParts returns only the three durable parts for taskID, in request,
+// outcome, report order. Live activity is never included: it lives in
+// task_activity and is read by Activity. Reading the parts does not touch the
+// activity row or the ADR 0025 status/cursor.
+func (d *DB) TaskLogParts(taskID string) ([]TaskLogEntry, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return nil, domain.NewAppError(domain.CodeInvalidInput, "store: log: empty task id")
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "task_log")
+	if err != nil || !ok {
+		return nil, err
+	}
+	rows, err := d.readDB.Query(`
+		SELECT task_id, part, payload, created_at FROM task_log WHERE task_id = ?
+		ORDER BY CASE part WHEN ? THEN 0 WHEN ? THEN 1 WHEN ? THEN 2 ELSE 3 END`,
+		taskID, LogPartRequest, LogPartOutcome, LogPartReport)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []TaskLogEntry
+	for rows.Next() {
+		var e TaskLogEntry
+		if err := rows.Scan(&e.TaskID, &e.Part, &e.Payload, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// TaskActivity is the current live activity of a task. Message is the latest
+// "what is happening now" text; it is not one of the three durable log parts.
+type TaskActivity struct {
+	TaskID    string
+	Message   string
+	UpdatedAt int64
+}
+
+// SetActivity records what is happening now for taskID. Only the latest
+// message is kept: activity is current state, not a history record, and it is
+// stored separately from the three durable log parts (ADR 0051 feature 2).
+// The message is redacted before it reaches the file (ADR 0012).
+func (d *DB) SetActivity(taskID, message string) error {
+	if strings.TrimSpace(taskID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: activity: empty task id")
+	}
+	clean := Redact([]byte(message))
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createTaskActivitySQL); err != nil {
+			return fmt.Errorf("store: activity: create table: %w", err)
+		}
+		_, err := tx.Exec(`
+			INSERT INTO task_activity (task_id, message, updated_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(task_id) DO UPDATE SET
+			  message = excluded.message,
+			  updated_at = excluded.updated_at`,
+			taskID, string(clean), time.Now().UTC().UnixNano())
+		return err
+	})
+}
+
+// Activity returns the current live activity for taskID. found=false means
+// nothing is recorded right now. This read never returns the three log parts.
+func (d *DB) Activity(taskID string) (TaskActivity, bool, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return TaskActivity{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: activity: empty task id")
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "task_activity")
+	if err != nil || !ok {
+		return TaskActivity{}, false, err
+	}
+	var a TaskActivity
+	err = d.readDB.QueryRow(`
+		SELECT task_id, message, updated_at FROM task_activity WHERE task_id = ?`, taskID,
+	).Scan(&a.TaskID, &a.Message, &a.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TaskActivity{}, false, nil
+	}
+	if err != nil {
+		return TaskActivity{}, false, err
+	}
+	return a, true, nil
+}
+
+// ClearActivity removes the current activity for taskID, for example when the
+// task reaches its result. A second clear is not an error. It never touches
+// the three durable log parts.
+func (d *DB) ClearActivity(taskID string) error {
+	if strings.TrimSpace(taskID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: activity: empty task id")
+	}
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createTaskActivitySQL); err != nil {
+			return fmt.Errorf("store: activity: create table: %w", err)
+		}
+		_, err := tx.Exec(`DELETE FROM task_activity WHERE task_id = ?`, taskID)
+		return err
+	})
+}
+
+// The two CLI display states derived from a task's log (ADR 0051 feature 2).
+// They are computed from the parts, not stored as a status or cursor.
+const (
+	TaskStateRunning = "running"      // «работа идёт»
+	TaskStateReady   = "result_ready" // «результат готов»
+)
+
+// TaskView is what the CLI shows. It carries a display state plus the three
+// durable parts and the current activity, each read from its own store. The
+// state is running until the report part exists, then result_ready. This is a
+// view over the three-part log, not a replacement for ADR 0025 status/cursor.
+type TaskView struct {
+	TaskID      string
+	State       string
+	Parts       []TaskLogEntry
+	Activity    TaskActivity
+	HasActivity bool
+}
+
+// TaskView assembles the CLI view from independent reads. It does not write
+// anything and does not consult the ADR 0025 status/cursor.
+func (d *DB) TaskView(taskID string) (TaskView, error) {
+	parts, err := d.TaskLogParts(taskID)
+	if err != nil {
+		return TaskView{}, err
+	}
+	view := TaskView{TaskID: taskID, State: TaskStateRunning, Parts: parts}
+	for _, p := range parts {
+		if p.Part == LogPartReport {
+			view.State = TaskStateReady
+			break
+		}
+	}
+	act, found, err := d.Activity(taskID)
+	if err != nil {
+		return TaskView{}, err
+	}
+	view.Activity = act
+	view.HasActivity = found
+	return view, nil
+}
