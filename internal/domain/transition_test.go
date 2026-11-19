@@ -24,22 +24,23 @@ func TestTransition(t *testing.T) {
 	oldSHA, newSHA := "oldsha", "newsha"
 
 	tests := []struct {
-		name            string
-		status          Status
-		verdict         Verdict
-		headSHA         string
-		revision        uint64
-		event           Event
-		wantStatus      Status
-		wantVerdict     Verdict
-		wantRevision    uint64
-		wantCloseReason CloseReason
-		wantClosedAt    time.Time
-		wantEffectKind  EffectKind
-		wantEffectHead  string
-		wantEffectRev   uint64
-		wantEffectVrdt  Verdict
-		wantEffectSubs  int
+		name             string
+		status           Status
+		verdict          Verdict
+		headSHA          string
+		revision         uint64
+		event            Event
+		inputCloseReason CloseReason
+		wantStatus       Status
+		wantVerdict      Verdict
+		wantRevision     uint64
+		wantCloseReason  CloseReason
+		wantClosedAt     time.Time
+		wantEffectKind   EffectKind
+		wantEffectHead   string
+		wantEffectRev    uint64
+		wantEffectVrdt   Verdict
+		wantEffectSubs   int
 	}{
 		// watching -> watching: verdict watching repeated, no revision, no effect.
 		{
@@ -162,20 +163,23 @@ func TestTransition(t *testing.T) {
 		},
 		{
 			name: "cancelled stays closed on ready", status: StatusClosed, verdict: VerdictWatching, headSHA: oldSHA, revision: 3,
-			event:      VerdictEvent(VerdictReady, at),
-			wantStatus: StatusClosed, wantVerdict: VerdictWatching, wantRevision: 3,
+			event:            VerdictEvent(VerdictReady, at),
+			inputCloseReason: CloseReasonCancelled,
+			wantStatus:       StatusClosed, wantVerdict: VerdictWatching, wantRevision: 3,
 			wantCloseReason: CloseReasonCancelled,
 		},
 		{
 			name: "closed stays closed on cancel", status: StatusClosed, verdict: VerdictMerged, headSHA: oldSHA, revision: 5,
-			event:      CancelEvent(at),
-			wantStatus: StatusClosed, wantVerdict: VerdictMerged, wantRevision: 5,
+			event:            CancelEvent(at),
+			inputCloseReason: CloseReasonMerged,
+			wantStatus:       StatusClosed, wantVerdict: VerdictMerged, wantRevision: 5,
 			wantCloseReason: CloseReasonMerged,
 		},
 		{
 			name: "closed stays closed on head changed", status: StatusClosed, verdict: VerdictMerged, headSHA: oldSHA, revision: 5,
-			event:      HeadChangedEvent(newSHA, at),
-			wantStatus: StatusClosed, wantVerdict: VerdictMerged, wantRevision: 5,
+			event:            HeadChangedEvent(newSHA, at),
+			inputCloseReason: CloseReasonMerged,
+			wantStatus:       StatusClosed, wantVerdict: VerdictMerged, wantRevision: 5,
 			wantCloseReason: CloseReasonMerged,
 		},
 		// Invalid input and unknown events are total no-ops.
@@ -194,6 +198,7 @@ func TestTransition(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w := transitionWatch(tc.status, tc.verdict, tc.headSHA, tc.revision)
+			w.CloseReason = string(tc.inputCloseReason)
 			got, effects := Transition(w, tc.event)
 
 			if got.Status != tc.wantStatus {
