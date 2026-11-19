@@ -150,3 +150,50 @@ jobs:
             printf 'gate gate=%s\n' "$gate"
             "$bin" "$gate"
           done
+
+  # Пока не делаем e2e обязательным для merge: job запускает реальный
+  # opencode 2.3.0 и зависит от его бинарника в runner. continue-on-error
+  # поэтому он не блокирует остальные job, пока прогон не станет стабильным.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26.x'
+
+      # npm-пакет opencode-ai 2.3.0 не существует, а @opencode/cli 2.3.0
+      # требует postinstall, который npm 12 блокирует. Прямое извлечение
+      # бинарника из платформенного tarball проверено локально: opencode v2.3.0.
+      - name: Install opencode 2.3.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=2.3.0
+          work="$RUNNER_TEMP/opencode-install"
+          mkdir -p "$work" "$HOME/.opencode/bin"
+          curl -fsSL "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz" \
+            -o "$work/opencode.tgz"
+          tar -xzf "$work/opencode.tgz" -C "$work"
+          cp "$work/package/bin/opencode" "$HOME/.opencode/bin/opencode"
+          chmod 755 "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          "$HOME/.opencode/bin/opencode" --version
+
+      - name: Run e2e
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.opencode/bin:$PATH"
+          bash tests/e2e/run.sh
