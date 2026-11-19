@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	modernc.org/sqlite v1.62.0
+	pgregory.net/rapid v1.3.0
 )
 
 require (
