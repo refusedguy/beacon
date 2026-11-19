@@ -791,6 +791,131 @@ func (s *Service) BuildHandoff(id string) (Handoff, error) {
 	return Handoff{}, taskstore.Validationf("карточка %s не найдена", id)
 }
 
+// ---- ADR 0037 п2 / T3.48: возврат wait_result по событию, не по таймауту ----
+//
+// wait_result возвращается в момент события или границы одобрения. Интервал
+// опроса только обновляет наблюдаемое состояние и подсказку pollAfterMs. Он
+// никогда не служит причиной возврата. Лестница ADR 0017 не меняется: исход
+// доставки по-прежнему определяет подтверждение, повтор и эскалацию, а возврат
+// не переписывает маркеры лестницы.
+
+// WaitEventKind это вид сигнала, который видит ожидание. Только result и
+// approval заканчивают ожидание. Тик опроса и рабочее обновление оставляют его
+// в работе.
+type WaitEventKind string
+
+const (
+	WaitEventResult      WaitEventKind = "result"
+	WaitEventApproval    WaitEventKind = "approval"
+	WaitEventTick        WaitEventKind = "tick"
+	WaitEventWatch       WaitEventKind = "watch"
+	WaitEventSourceEnded WaitEventKind = "source-ended"
+)
+
+// WaitEvent это одно наблюдаемое ожиданием событие.
+type WaitEvent struct {
+	Kind     WaitEventKind
+	WatchID  string
+	Revision uint64
+	Status   string
+	Verdict  string
+}
+
+// WaitState это состояние, которое ожидание накопило до возврата.
+type WaitState struct {
+	WatchID  string
+	Revision uint64
+	Status   string
+	Verdict  string
+}
+
+// WaitOutcome это то, с чем ожидание возвращается. Cause называет событие,
+// закончившее ожидание, и никогда не бывает тиком опроса. PollAfterMs это
+// подсказка, а не дедлайн и не причина возврата.
+type WaitOutcome struct {
+	WatchID     string        `json:"watchID"`
+	Cause       WaitEventKind `json:"cause"`
+	Revision    uint64        `json:"revision"`
+	Status      string        `json:"status"`
+	Verdict     string        `json:"verdict"`
+	PollAfterMs int64         `json:"pollAfterMs"`
+}
+
+// Consume применяет одно событие к состоянию. Возврат (true) происходит только
+// на result или approval. Тик опроса и рабочее обновление обновляют наблюдаемое
+// состояние и возвращают false, поэтому вызывающий продолжает ждать.
+// Тик не меняет Cause и не заканчивает ожидание.
+func (st *WaitState) Consume(ev WaitEvent) (WaitOutcome, bool) {
+	switch ev.Kind {
+	case WaitEventResult, WaitEventApproval:
+		return WaitOutcome{
+			WatchID:  ev.WatchID,
+			Cause:    ev.Kind,
+			Revision: ev.Revision,
+			Status:   ev.Status,
+			Verdict:  ev.Verdict,
+		}, true
+	case WaitEventTick, WaitEventWatch:
+		if ev.WatchID != "" {
+			st.WatchID = ev.WatchID
+		}
+		if ev.Revision != 0 {
+			st.Revision = ev.Revision
+		}
+		if ev.Status != "" {
+			st.Status = ev.Status
+		}
+		if ev.Verdict != "" {
+			st.Verdict = ev.Verdict
+		}
+	}
+	return WaitOutcome{}, false
+}
+
+// AwaitResult читает события, пока не придёт result или approval, и возвращает
+// соответствующий исход. Тики опроса ожидание не заканчивают. Закрытый канал
+// без завершающего события даёт исход без побочных действий, чтобы мёртвый
+// источник не подвешивал вызывающего. Это не таймаут опроса. pollAfterMs
+// копируется в исход как подсказка и не используется как причина возврата.
+func AwaitResult(events <-chan WaitEvent, pollAfterMs int64) WaitOutcome {
+	var st WaitState
+	for ev := range events {
+		if out, done := st.Consume(ev); done {
+			out.PollAfterMs = pollAfterMs
+			return out
+		}
+	}
+	return WaitOutcome{
+		WatchID:     st.WatchID,
+		Cause:       WaitEventSourceEnded,
+		Revision:    st.Revision,
+		Status:      "watching",
+		Verdict:     "watching",
+		PollAfterMs: pollAfterMs,
+	}
+}
+
+// WaitLadderPosition это положение лестницы ADR 0017, которое ожидание обязано
+// оставить без изменений.
+type WaitLadderPosition struct {
+	Outcome    string
+	Attempts   int
+	EvidenceAt time.Time
+	Stopped    bool
+}
+
+// LadderRetries содержит ветвление ADR 0017 по исходу доставки. Повтор есть
+// только у transport-failed. posted и indeterminate повторов не имеют.
+func LadderRetries(outcome string) bool { return outcome == "transport-failed" }
+
+// AwaitWithLadder ждёт завершающего события и возвращает положение лестницы
+// таким же, каким его получил. Исход доставки по-прежнему выбирает
+// подтверждение, повтор и эскалацию через LadderRetries. Меняется только момент
+// возврата управления, а не маркеры лестницы (ADR 0037 п2).
+func AwaitWithLadder(events <-chan WaitEvent, pos WaitLadderPosition, pollAfterMs int64) (WaitOutcome, WaitLadderPosition) {
+	return AwaitResult(events, pollAfterMs), pos
+}
+
 // SelfTest прогоняет кейсы из раздела 7 спецификации с посаженными нарушениями.
 func SelfTest(w io.Writer) error {
 	root, err := os.MkdirTemp("", "beacon-selftest-")
