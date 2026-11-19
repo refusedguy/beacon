@@ -101,7 +101,7 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 			return next, nil
 		}
 		next.Status = StatusClosed
-		next.CloseReason = CloseReasonCancelled
+		next.CloseReason = string(CloseReasonCancelled)
 		next.ClosedAt = e.At
 		return next, nil
 	case EventHeadChanged:
@@ -109,7 +109,7 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 			return next, nil
 		}
 		next.Status = StatusClosed
-		next.CloseReason = CloseReasonHeadChanged
+		next.CloseReason = string(CloseReasonHeadChanged)
 		next.ClosedAt = e.At
 		return next, []Effect{{
 			Kind:        EffectCreateWatch,
@@ -143,7 +143,7 @@ func transitionVerdict(w Watch, e Event) (Watch, []Effect) {
 	switch {
 	case isTerminalVerdict(v):
 		next.Status = StatusClosed
-		next.CloseReason = CloseReason(string(v))
+		next.CloseReason = string(v)
 		next.ClosedAt = e.At
 		return next, nil
 	case v == VerdictWatching:
