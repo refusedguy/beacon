@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -167,6 +168,183 @@ func TestLegacyProtocolWithoutExperimentalRevision(t *testing.T) {
 	}
 	if !slices.Contains(LegacyProtocolVersions, negotiated) {
 		t.Fatalf("negotiated version %q is outside the legacy set %v", negotiated, LegacyProtocolVersions)
+	}
+}
+
+// connectDialectSession wires a client advertising one task dialect to a
+// server whose get_result handler uses the supplied --after threshold. The
+// handshake itself is untouched: a 2026-07-28 client is signalled only by
+// per-request capabilities, never by SupportedProtocolVersions.
+func connectDialectSession(t *testing.T, dialect TaskDialect, deps Dependencies) *mcpsdk.ClientSession {
+	t.Helper()
+	ctx := context.Background()
+
+	var clientOpts *mcpsdk.ClientOptions
+	if dialect == DialectTasks2025 {
+		clientOpts = &mcpsdk.ClientOptions{Capabilities: &mcpsdk.ClientCapabilities{
+			Experimental: map[string]any{tasksExperimentalKey: map[string]any{}},
+		}}
+	}
+
+	serverTransport, clientTransport := mcpsdk.NewInMemoryTransports()
+	serverSession, err := NewServerWithDeps(deps).Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "beacon-dialect-test", Version: "v0.0.1"}, clientOpts)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientSession.Close()
+		_ = serverSession.Wait()
+	})
+
+	negotiated := clientSession.InitializeResult().ProtocolVersion
+	if negotiated >= "2026-07-28" || !slices.Contains(LegacyProtocolVersions, negotiated) {
+		t.Fatalf("handshake negotiated %q, want a legacy version", negotiated)
+	}
+	return clientSession
+}
+
+// dialectGetResultDeps builds the real store, stamper and clock used by the
+// get_result handler in the dialect contract tests.
+func dialectGetResultDeps(t *testing.T) (Dependencies, domain.Watch, domain.Obligation) {
+	t.Helper()
+	w := resultFixture(domain.VerdictReady)
+	o := resultObligation(w, "dialect-session")
+	mem := newMemStore()
+	if err := mem.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := mem.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	deps := Dependencies{
+		Store:   mem,
+		Stamper: stamper,
+		Clock:   &dialectClock{t: time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC), step: time.Second},
+		After:   time.Millisecond,
+	}
+	return deps, w, o
+}
+
+// dialectClock advances by step on every Now call, so a test can observe a
+// call that crossed --after without sleeping.
+type dialectClock struct {
+	t    time.Time
+	step time.Duration
+}
+
+func (c *dialectClock) Now() time.Time {
+	now := c.t
+	c.t = c.t.Add(c.step)
+	return now
+}
+
+// callDialectGetResult calls beacon_get_result with the client's sessionID and,
+// for the 2026 dialect, the per-request tasks extension capability.
+func callDialectGetResult(t *testing.T, session *mcpsdk.ClientSession, dialect TaskDialect, watchID string) GetResultOutput {
+	t.Helper()
+	meta := mcpsdk.Meta{sessionIDMetaKey: "dialect-session"}
+	if dialect == DialectTasks2026 {
+		meta[clientCapabilitiesMetaKey] = map[string]any{
+			"extensions": map[string]any{tasksExtensionKey: map[string]any{}},
+		}
+	}
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_get_result",
+		Arguments: map[string]any{"watchID": watchID},
+		Meta:      meta,
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_get_result: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("beacon_get_result returned isError: %v", result.Content)
+	}
+	return decodeStructured[GetResultOutput](t, result)
+}
+
+// TestGetResultDialectForms is the contract test for ADR 0031 §2: a plain
+// client keeps the classical tools/call result, the 2025 dialect gets a real
+// task handle right away, and the 2026 dialect gets resultType "task" after
+// --after. None of the three changes the handshake version.
+func TestGetResultDialectForms(t *testing.T) {
+	tests := []struct {
+		name       string
+		dialect    TaskDialect
+		wantJob    bool
+		wantTaskID bool
+		wantType   string
+	}{
+		{name: "no tasks", dialect: DialectPlain, wantJob: true},
+		{name: "tasks 2025-11-25", dialect: DialectTasks2025, wantTaskID: true},
+		{name: "tasks 2026-07-28", dialect: DialectTasks2026, wantTaskID: true, wantType: TaskResultType},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, w, o := dialectGetResultDeps(t)
+			session := connectDialectSession(t, tc.dialect, deps)
+			out := callDialectGetResult(t, session, tc.dialect, w.ID)
+
+			if out.Status != string(domain.StatusNotifying) || out.Verdict != string(domain.VerdictReady) {
+				t.Fatalf("core projection changed by dialect: %+v", out)
+			}
+			if tc.wantJob {
+				if out.JobID != o.ID || out.Instructions == "" {
+					t.Errorf("plain client job form = %+v, want jobID and instructions", out)
+				}
+				if out.ResultType != "" || out.TaskID != "" {
+					t.Errorf("plain client must not see a task form: %+v", out)
+				}
+			}
+			if tc.wantTaskID && (out.TaskID != o.ID || out.TaskStatus != TaskStatusWorking) {
+				t.Errorf("%s task form = %+v, want taskId %q working", tc.dialect, out, o.ID)
+			}
+			if out.ResultType != tc.wantType {
+				t.Errorf("resultType = %q, want %q", out.ResultType, tc.wantType)
+			}
+			if out.JobID != "" && tc.dialect != DialectPlain {
+				t.Errorf("task dialect must not carry a plain jobID: %+v", out)
+			}
+		})
+	}
+}
+
+// TestGetResultAfterThresholdSwitchesForm proves the --after switch: a call
+// below the threshold keeps the classic result even for a Tasks client, while
+// a call at or above it takes the dialect form.
+func TestGetResultAfterThresholdSwitchesForm(t *testing.T) {
+	for _, dialect := range []TaskDialect{DialectPlain, DialectTasks2026} {
+		t.Run(string(dialect), func(t *testing.T) {
+			deps, w, _ := dialectGetResultDeps(t)
+			deps.After = time.Hour
+			session := connectDialectSession(t, dialect, deps)
+			below := callDialectGetResult(t, session, dialect, w.ID)
+			if below.ResultType != "" || below.TaskID != "" || below.JobID != "" {
+				t.Errorf("below --after must stay classic for %s: %+v", dialect, below)
+			}
+		})
+	}
+}
+
+// TestDialectFromRequestPrefersExtension proves capability detection is
+// per-request and that the extension wins over the initialize capability.
+func TestDialectFromRequestPrefersExtension(t *testing.T) {
+	req := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Meta: mcpsdk.Meta{clientCapabilitiesMetaKey: map[string]any{
+			"extensions": map[string]any{tasksExtensionKey: map[string]any{}},
+		}},
+	}}
+	if got := DialectFromRequest(req); got != DialectTasks2026 {
+		t.Errorf("DialectFromRequest = %q, want %q", got, DialectTasks2026)
+	}
+	if got := DialectFromRequest(nil); got != DialectPlain {
+		t.Errorf("DialectFromRequest(nil) = %q, want %q", got, DialectPlain)
 	}
 }
 

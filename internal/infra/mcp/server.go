@@ -6,9 +6,11 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -31,6 +33,48 @@ var LegacyProtocolVersions = []string{
 	"2025-06-18",
 	"2025-03-26",
 	"2024-11-05",
+}
+
+// Task dialect capability keys. They are read from the client's capabilities
+// at the MCP boundary; no protocol version is inferred and the handshake stays
+// on LegacyProtocolVersions. A 2026-07-28 client declares the extension in the
+// per-request _meta (io.modelcontextprotocol/clientCapabilities), while a
+// 2025-11-25 client declared Tasks as an experimental capability at initialize.
+const (
+	clientCapabilitiesMetaKey = "io.modelcontextprotocol/clientCapabilities"
+	tasksExtensionKey         = "io.modelcontextprotocol/tasks"
+	tasksExperimentalKey      = "tasks"
+)
+
+// DialectFromRequest detects the task dialect of one tool call from the
+// client's advertised capabilities. It never inspects the negotiated protocol
+// version and never changes it: ADR 0003 and server.go exclude 2026-07-28
+// from the handshake, so the extension form is an application-level response
+// shape only. Absent any capability the client is treated as having no Tasks.
+func DialectFromRequest(req *mcpsdk.CallToolRequest) TaskDialect {
+	if req == nil {
+		return DialectPlain
+	}
+	if req.Params != nil && req.Params.Meta != nil {
+		if raw, ok := req.Params.Meta[clientCapabilitiesMetaKey]; ok {
+			var caps struct {
+				Extensions map[string]json.RawMessage `json:"extensions"`
+			}
+			if b, err := json.Marshal(raw); err == nil && json.Unmarshal(b, &caps) == nil {
+				if _, ok := caps.Extensions[tasksExtensionKey]; ok {
+					return DialectTasks2026
+				}
+			}
+		}
+	}
+	if req.Session != nil {
+		if params := req.Session.InitializeParams(); params != nil && params.Capabilities != nil {
+			if _, ok := params.Capabilities.Experimental[tasksExperimentalKey]; ok {
+				return DialectTasks2025
+			}
+		}
+	}
+	return DialectPlain
 }
 
 // CycleInstructions is delivered to clients in the MCP handshake. The agent
@@ -136,6 +180,11 @@ type Dependencies struct {
 	Source   VerdictSource
 	Snapshot SnapshotReader
 	Clock    domain.Clock
+
+	// After is the MCP-boundary threshold that switches a slow response into
+	// the client's task dialect form. Zero disables the switch. It belongs to
+	// the boundary, never to the domain (ADR 0031 §2).
+	After time.Duration
 }
 
 // NewServer builds the Beacon MCP server with all seven real tools registered
@@ -177,7 +226,9 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 
 	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
 	AttachWaitResult(s, NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock))
-	AttachGetResult(s, NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock))
+	getResult := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
+	getResult.SetAfter(deps.After)
+	AttachGetResult(s, getResult)
 	if err := attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"]); err != nil {
 		log.Printf("mcp: beacon_list_running: %v; tool not registered", err)
 	}

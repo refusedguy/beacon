@@ -156,6 +156,7 @@ type GetResultHandler struct {
 	store   resultStoreReader
 	stamper ObligationStamper
 	clock   domain.Clock
+	after   time.Duration
 }
 
 // NewGetResultHandler builds a handler. A nil clock falls back to wall time.
@@ -166,6 +167,14 @@ func NewGetResultHandler(store resultStoreReader, stamper ObligationStamper, clo
 	return &GetResultHandler{store: store, stamper: stamper, clock: clock}
 }
 
+// SetAfter sets the MCP-boundary threshold that turns a slow call into the
+// dialect's task/job form. Zero keeps the classical response.
+func (h *GetResultHandler) SetAfter(after time.Duration) {
+	if h != nil {
+		h.after = after
+	}
+}
+
 type getResultWallClock struct{}
 
 func (getResultWallClock) Now() time.Time { return time.Now() }
@@ -173,9 +182,19 @@ func (getResultWallClock) Now() time.Time { return time.Now() }
 // Handle adapts Result to the go-sdk typed tool handler signature. Domain
 // errors are returned as-is for ToErrorShape to convert at the MCP boundary.
 func (h *GetResultHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in GetResultInput) (*mcpsdk.CallToolResult, GetResultOutput, error) {
+	start := time.Time{}
+	if h != nil {
+		start = h.clock.Now()
+	}
 	out, err := h.Result(ctx, req, in)
 	if err != nil {
 		return nil, GetResultOutput{}, err
+	}
+	// The core projection above is version-blind. Only this boundary layer
+	// chooses the wire form, using the client's capabilities and the --after
+	// threshold (ADR 0031 §2, ADR 0003).
+	if h != nil {
+		out = ApplyTaskForm(out, DialectFromRequest(req), h.clock.Now().Sub(start), h.after)
 	}
 	return nil, out, nil
 }

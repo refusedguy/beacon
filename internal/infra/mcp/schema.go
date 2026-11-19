@@ -7,6 +7,7 @@ package mcp
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 
@@ -50,7 +51,11 @@ type MergeSnapshot struct {
 	MergeStateStatus string `json:"mergeStateStatus"`
 }
 
-// GetResultOutput is the response of beacon_get_result.
+// GetResultOutput is the response of beacon_get_result. The five trailing
+// fields describe the MCP task dialect form and are absent for a plain client
+// whose call finishes before --after. They are chosen at the MCP boundary,
+// never by the domain: ADR 0031 §2 and ADR 0003 keep protocol versions out of
+// the core, and LegacyProtocolVersions still excludes 2026-07-28.
 type GetResultOutput struct {
 	Status       string        `json:"status"`
 	Verdict      string        `json:"verdict"`
@@ -59,6 +64,73 @@ type GetResultOutput struct {
 	FailedChecks []FailedCheck `json:"failedChecks"`
 	ObligationID string        `json:"obligationID"`
 	RetryBudget  int           `json:"retryBudget"`
+
+	ResultType     string `json:"resultType,omitempty"`
+	TaskID         string `json:"taskId,omitempty"`
+	JobID          string `json:"jobID,omitempty"`
+	TaskStatus     string `json:"taskStatus,omitempty"`
+	PollIntervalMs int64  `json:"pollIntervalMs,omitempty"`
+	Instructions   string `json:"instructions,omitempty"`
+}
+
+// TaskDialect is the application-level response form a client can consume.
+// It is derived from client capabilities at the MCP boundary, not from the
+// negotiated protocol version: the handshake never advertises 2026-07-28.
+type TaskDialect string
+
+const (
+	// DialectPlain has no Tasks: a long call yields an ordinary job id plus
+	// the existing result, status and cancel tools (ADR 0031 §2).
+	DialectPlain TaskDialect = "plain"
+	// DialectTasks2025 speaks the experimental Tasks of the 2025-11-25 core:
+	// a real task handle is handed back right away.
+	DialectTasks2025 TaskDialect = "tasks-2025-11-25"
+	// DialectTasks2026 speaks the io.modelcontextprotocol/tasks extension:
+	// resultType "task" appears only once the --after threshold is crossed.
+	DialectTasks2026 TaskDialect = "tasks-2026-07-28"
+)
+
+const (
+	// TaskResultType is the extension discriminator for a created task.
+	TaskResultType = "task"
+	// TaskStatusWorking is the seed status of a task handle.
+	TaskStatusWorking = "working"
+	// DefaultTaskPollIntervalMs is the suggested client polling interval.
+	DefaultTaskPollIntervalMs int64 = 5000
+	// PlainJobInstructions tells a client without Tasks how to collect its job.
+	PlainJobInstructions = "use beacon_get_result and beacon_wait_result with the jobID; cancel with beacon_cancel_watch"
+)
+
+// ApplyTaskForm selects the response form for one tool result. DialectPlain
+// keeps the classic tools/call shape until the call runs longer than after;
+// DialectTasks2025 always returns a task handle; DialectTasks2026 switches to
+// resultType "task" only after the threshold. A non-positive after disables
+// the threshold, so the default server keeps its exact previous responses.
+func ApplyTaskForm(out GetResultOutput, dialect TaskDialect, elapsed, after time.Duration) GetResultOutput {
+	long := after > 0 && elapsed >= after
+	if dialect != DialectTasks2025 && !long {
+		return out
+	}
+
+	handle := out.ObligationID
+	if handle == "" {
+		handle = out.Status
+	}
+	switch dialect {
+	case DialectTasks2025:
+		out.TaskID = handle
+		out.TaskStatus = TaskStatusWorking
+		out.PollIntervalMs = DefaultTaskPollIntervalMs
+	case DialectTasks2026:
+		out.ResultType = TaskResultType
+		out.TaskID = handle
+		out.TaskStatus = TaskStatusWorking
+		out.PollIntervalMs = DefaultTaskPollIntervalMs
+	case DialectPlain:
+		out.JobID = handle
+		out.Instructions = PlainJobInstructions
+	}
+	return out
 }
 
 // WatchCounts holds the counters of beacon_list_running.
@@ -131,9 +203,9 @@ func OutputSchema[T any]() (*jsonschema.Schema, error) {
 // outputSchemaFactories pairs each tool name with its output type. Keys are
 // tool names from WORKER-PROMPT §4.1.
 var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
-	"beacon_watch_pr":    func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
-	"beacon_wait_result": func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
-	"beacon_get_result":  func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
+	"beacon_watch_pr":     func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
+	"beacon_wait_result":  func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
+	"beacon_get_result":   func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
 	"beacon_list_running": listRunningOutputSchema,
 	"beacon_ack":          func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
