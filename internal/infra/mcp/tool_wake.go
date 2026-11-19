@@ -16,6 +16,10 @@
 // pointer, so the environment adapter can route it to steer and the plugin can
 // record it on the receipt (ADR 0014).
 //
+// ADR 0031 p4 adds the current executor. The wake tool does not own the
+// fallback chain; it only echoes the executor supplied by the CLI manager so a
+// handover after a 429 stays visible in the wake receipt and in status.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -88,6 +92,10 @@ type WakeInput struct {
 	HasPendingQuestion bool       `json:"hasPendingQuestion" jsonschema:"agent has a pending question that needs a human"`
 	PendingApproval    bool       `json:"pendingApproval" jsonschema:"agent is waiting for human approval"`
 	Source             WakeSource `json:"source" jsonschema:"message source: manual or review (diff comment)"`
+	// Executor is the agent currently executing the job this wake follows up
+	// on (ADR 0031 p4). It is metadata, not check contents. The CLI manager owns
+	// the fallback chain; the core only echoes the value on the output.
+	Executor string `json:"executor,omitempty" jsonschema:"agent currently executing the job (fallback chain)"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -98,11 +106,14 @@ type WakeInput struct {
 // interruption and empty on a successful delivery. Interrupted is true only
 // when the wait was cut short because the agent needs a human (ADR 0028).
 // Source echoes the normalized message source so a caller can put it on the
-// ADR 0014 receipt: review means the follow-up was a diff comment.
+// ADR 0014 receipt: review means the follow-up was a diff comment. Executor
+// echoes the current executor supplied by the caller, so a handover after a
+// 429 is visible in the wake status (ADR 0031 p4).
 type WakeOutput struct {
 	Delivery    Delivery   `json:"delivery"`
 	OK          bool       `json:"ok"`
 	Source      WakeSource `json:"source"`
+	Executor    string     `json:"executor,omitempty"`
 	Interrupted bool       `json:"interrupted,omitempty"`
 	Reason      string     `json:"reason,omitempty"`
 }
@@ -171,6 +182,7 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 			Delivery: DeliveryUnsupported,
 			OK:       false,
 			Source:   source,
+			Executor: in.Executor,
 			Reason:   "wake: no delivery sender configured",
 		}, nil
 	}
@@ -178,12 +190,12 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 	delivery, reason := h.sender.Deliver(ctx, in.Target, in.Text, source)
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
-		return WakeOutput{Delivery: delivery, OK: true, Source: source}, nil
+		return WakeOutput{Delivery: delivery, OK: true, Source: source, Executor: in.Executor}, nil
 	case DeliveryUnsupported:
 		if reason == "" {
 			reason = "wake: delivery to an open session is not supported"
 		}
-		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: source, Reason: reason}, nil
+		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: source, Executor: in.Executor, Reason: reason}, nil
 	default:
 		// An unknown value is never promoted to success. Report it as an
 		// unsupported delivery with a reason so the caller can branch safely.
@@ -191,6 +203,7 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 			Delivery: DeliveryUnsupported,
 			OK:       false,
 			Source:   source,
+			Executor: in.Executor,
 			Reason:   fmt.Sprintf("wake: unknown delivery value %q", string(delivery)),
 		}, nil
 	}
@@ -211,6 +224,7 @@ func interruptedWake(in WakeInput) WakeOutput {
 		Delivery:    DeliveryInterrupted,
 		OK:          false,
 		Source:      normalizeSource(in.Source),
+		Executor:    in.Executor,
 		Interrupted: true,
 		Reason:      reason,
 	}
