@@ -337,6 +337,179 @@ func TestHandoffValidate(t *testing.T) {
 	}
 }
 
+func TestTaskDescriptorValidation(t *testing.T) {
+	deadline := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	d, err := NewTaskDescriptor("  T3.85  ", deadline)
+	if err != nil {
+		t.Fatalf("valid descriptor rejected: %v", err)
+	}
+	if d.ID != "T3.85" || !d.DeadlineAt.Equal(deadline) {
+		t.Fatalf("descriptor = %+v, want id T3.85 and deadline %v", d, deadline)
+	}
+	if err := d.Validate(); err != nil {
+		t.Fatalf("valid descriptor failed Validate: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		id   string
+		at   time.Time
+	}{
+		{"empty id", "  ", deadline},
+		{"zero deadline", "T3.85", time.Time{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewTaskDescriptor(tc.id, tc.at)
+			if err == nil {
+				t.Fatal("invalid descriptor accepted")
+			}
+			var appErr *AppError
+			if !errors.As(err, &appErr) || appErr.Code != CodeInvalidInput {
+				t.Fatalf("want INVALID_INPUT, got %v", err)
+			}
+		})
+	}
+}
+
+func TestTaskDescriptorDeadlineSurvivesRestart(t *testing.T) {
+	deadline := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	d, err := NewTaskDescriptor("T3.85", deadline)
+	if err != nil {
+		t.Fatalf("NewTaskDescriptor: %v", err)
+	}
+
+	// What storage holds, and what a fresh process reads back after a crash.
+	b, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("marshal TaskDescriptor: %v", err)
+	}
+	assertJSONKeys(t, b, "id", "deadlineAt")
+
+	var restored TaskDescriptor
+	if err := json.Unmarshal(b, &restored); err != nil {
+		t.Fatalf("unmarshal TaskDescriptor: %v", err)
+	}
+	if restored.ID != d.ID || !restored.DeadlineAt.Equal(deadline) {
+		t.Fatalf("deadline lost on restart: got %+v, want deadline %v", restored, deadline)
+	}
+	if err := restored.Validate(); err != nil {
+		t.Fatalf("restored descriptor invalid: %v", err)
+	}
+
+	// The same instant gives the same deadline answer before and after restart.
+	at := deadline.Add(-time.Minute)
+	if expired, _ := d.CheckDeadline(at); expired {
+		t.Fatal("descriptor expired before the deadline")
+	}
+	if expired, _ := restored.CheckDeadline(at); expired {
+		t.Fatal("restored descriptor expired before the deadline")
+	}
+}
+
+func TestTaskDescriptorDeadlineTerminatesWithReason(t *testing.T) {
+	deadline := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	d, err := NewTaskDescriptor("T3.85", deadline)
+	if err != nil {
+		t.Fatalf("NewTaskDescriptor: %v", err)
+	}
+
+	before := deadline.Add(-time.Nanosecond)
+	if expired, reason := d.CheckDeadline(before); expired || reason != "" {
+		t.Fatalf("before deadline: expired=%v reason=%q", expired, reason)
+	}
+	if err := DeadlineError(d, before); err != nil {
+		t.Fatalf("DeadlineError before deadline: %v", err)
+	}
+
+	expired, reason := d.CheckDeadline(deadline)
+	if !expired || reason != DeadlineReasonExceeded {
+		t.Fatalf("at deadline: expired=%v reason=%q", expired, reason)
+	}
+	err = DeadlineError(d, deadline.Add(time.Second))
+	if err == nil {
+		t.Fatal("terminated task must carry a reason")
+	}
+	var appErr *AppError
+	if !errors.As(err, &appErr) || appErr.Code != CodeGone {
+		t.Fatalf("want CodeGone, got %v", err)
+	}
+	if !strings.Contains(err.Error(), DeadlineReasonExceeded) {
+		t.Fatalf("reason missing from error: %v", err)
+	}
+
+	// A missing deadline sets no hard limit and never terminates on its own.
+	var unbounded TaskDescriptor
+	if expired, _ := unbounded.CheckDeadline(time.Now().Add(1000 * time.Hour)); expired {
+		t.Fatal("zero deadline must not expire")
+	}
+	if err := DeadlineError(unbounded, time.Now()); err != nil {
+		t.Fatalf("zero deadline produced an error: %v", err)
+	}
+}
+
+func TestTaskDescriptorPassedToNestedCalls(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	d, err := NewTaskDescriptor("T3.85", deadline)
+	if err != nil {
+		t.Fatalf("NewTaskDescriptor: %v", err)
+	}
+
+	ctx := WithTaskDescriptor(context.Background(), d)
+	got, ok := TaskDescriptorFrom(ctx)
+	if !ok || got.ID != d.ID || !got.DeadlineAt.Equal(d.DeadlineAt) {
+		t.Fatalf("descriptor not propagated: got %+v ok=%v", got, ok)
+	}
+
+	// A nested context still carries the same descriptor, and its own deadline
+	// is capped by the parent even when the child asks for a much later one.
+	child, cancel := NestedContext(ctx, deadline.Add(24*time.Hour))
+	defer cancel()
+	childDesc, ok := TaskDescriptorFrom(child)
+	if !ok || childDesc.ID != d.ID || !childDesc.DeadlineAt.Equal(d.DeadlineAt) {
+		t.Fatalf("child lost the descriptor: got %+v ok=%v", childDesc, ok)
+	}
+	childDeadline, has := child.Deadline()
+	if !has || childDeadline.After(deadline) || !childDeadline.Equal(deadline) {
+		t.Fatalf("child deadline = %v has=%v, want parent deadline %v", childDeadline, has, deadline)
+	}
+}
+
+func TestNestedContextDeadlineRules(t *testing.T) {
+	deadline := time.Now().Add(time.Hour)
+	d, err := NewTaskDescriptor("T3.85", deadline)
+	if err != nil {
+		t.Fatalf("NewTaskDescriptor: %v", err)
+	}
+	ctx := WithTaskDescriptor(context.Background(), d)
+
+	// An earlier child deadline is kept.
+	earlier := deadline.Add(-time.Minute)
+	child, cancel := NestedContext(ctx, earlier)
+	got, has := child.Deadline()
+	if !has || !got.Equal(earlier) {
+		t.Errorf("earlier child deadline = %v has=%v, want %v", got, has, earlier)
+	}
+	cancel()
+
+	// A zero request inherits the parent deadline.
+	child, cancel = NestedContext(ctx, time.Time{})
+	got, has = child.Deadline()
+	if !has || !got.Equal(deadline) {
+		t.Errorf("inherited child deadline = %v has=%v, want %v", got, has, deadline)
+	}
+	cancel()
+
+	// Without a descriptor the requested deadline is used unchanged.
+	plain, cancel := NestedContext(context.Background(), earlier)
+	got, has = plain.Deadline()
+	if !has || !got.Equal(earlier) {
+		t.Errorf("plain context deadline = %v has=%v, want %v", got, has, earlier)
+	}
+	cancel()
+}
+
 func assertJSONKeys(t *testing.T, b []byte, keys ...string) {
 	t.Helper()
 	var fields map[string]json.RawMessage
