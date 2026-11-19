@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -335,5 +337,276 @@ func TestW92ProvisionSandboxRejectsEmptyPaths(t *testing.T) {
 				t.Fatalf("раннер не должен вызываться: %+v", *calls)
 			}
 		})
+	}
+}
+
+// w132State points Beacon state at a fresh temporary directory.
+func w132State(t *testing.T) {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+}
+
+func TestW132AssignUniquePortsForFifteenAgents(t *testing.T) {
+	r := newPortRegistry()
+	seen := map[int]string{}
+	for i := 0; i < portRegistryCount; i++ {
+		id := fmt.Sprintf("agent-%d", i)
+		port, err := r.assign(id)
+		if err != nil {
+			t.Fatalf("агент %s: %v", id, err)
+		}
+		if port < r.Base || port >= r.Base+r.Count {
+			t.Fatalf("порт %d агента %s вне диапазона %d-%d", port, id, r.Base, r.Base+r.Count-1)
+		}
+		if prev, ok := seen[port]; ok {
+			t.Fatalf("коллизия: %s и %s получили порт %d", prev, id, port)
+		}
+		seen[port] = id
+	}
+	if _, err := r.assign("agent-extra"); err == nil {
+		t.Fatal("16-й агент получил порт, ожидалась ошибка исчерпания")
+	}
+}
+
+func TestW132AssignIsIdempotent(t *testing.T) {
+	r := newPortRegistry()
+	p1, err := r.assign("task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := r.assign("task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p1 != p2 {
+		t.Fatalf("повторная выдача: %d и %d", p1, p2)
+	}
+	p3, err := r.assign("other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p3 == p1 {
+		t.Fatalf("две задачи получили порт %d", p1)
+	}
+}
+
+func TestW132AssignRejectsEmptyTask(t *testing.T) {
+	r := newPortRegistry()
+	for _, id := range []string{"", "  "} {
+		if _, err := r.assign(id); err == nil {
+			t.Fatalf("пустой ID %q принят", id)
+		}
+	}
+}
+
+func TestW132RegistrySurvivesRestart(t *testing.T) {
+	w132State(t)
+	reg, err := loadPortRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := reg.assign("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := savePortRegistry(reg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Новый процесс читает то же состояние из диска.
+	reloaded, err := loadPortRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reloaded.Used["task-1"]; !ok || got != port {
+		t.Fatalf("после рестарта порт задачи: %d, присутствие %v", got, ok)
+	}
+	other, err := reloaded.assign("task-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == port {
+		t.Fatalf("порт %d выдан повторно после рестарта", port)
+	}
+}
+
+func TestW132LoadRejectsCollidingState(t *testing.T) {
+	w132State(t)
+	bad := &portRegistry{
+		Base:  portRegistryBase,
+		Count: portRegistryCount,
+		Used:  map[string]int{"task-a": portRegistryBase, "task-b": portRegistryBase},
+	}
+	if err := savePortRegistry(bad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPortRegistry(); err == nil {
+		t.Fatal("коллизия в состоянии не отклонена")
+	}
+}
+
+func TestW132LoadRejectsOutOfRangePort(t *testing.T) {
+	w132State(t)
+	bad := &portRegistry{
+		Base:  portRegistryBase,
+		Count: portRegistryCount,
+		Used:  map[string]int{"task": portRegistryBase + portRegistryCount},
+	}
+	if err := savePortRegistry(bad); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadPortRegistry(); err == nil {
+		t.Fatal("порт вне диапазона не отклонён")
+	}
+}
+
+func TestW132ReleaseKillsProcessesBeforeFreeingPort(t *testing.T) {
+	r := newPortRegistry()
+	port, err := r.assign("task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kill := func(got int) error {
+		if got != port {
+			t.Fatalf("снятие процессов на порту %d, ожидался %d", got, port)
+		}
+		// Пока процессы не сняты, порт ещё занят и не выдаётся другой задаче.
+		other, err := r.assign("concurrent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if other == port {
+			t.Fatalf("порт %d выдан до снятия процессов", port)
+		}
+		return nil
+	}
+	if err := r.release("task", kill); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.Used["task"]; ok {
+		t.Fatal("порт остался занятым после освобождения")
+	}
+	next, err := r.assign("next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != port {
+		t.Fatalf("порт %d не выдан повторно после освобождения, получен %d", port, next)
+	}
+}
+
+func TestW132ReleaseKeepsPortWhenKillFails(t *testing.T) {
+	r := newPortRegistry()
+	port, err := r.assign("task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := fmt.Errorf("не удалось снять процесс")
+	called := false
+	kill := func(int) error {
+		called = true
+		return wantErr
+	}
+	if err := r.release("task", kill); !errors.Is(err, wantErr) {
+		t.Fatalf("ошибка %v, ожидалась %v", err, wantErr)
+	}
+	if !called {
+		t.Fatal("сниматель не вызван")
+	}
+	if got, ok := r.Used["task"]; !ok || got != port {
+		t.Fatalf("порт освобождён при ошибке снятия: %d, presence %v", got, ok)
+	}
+}
+
+func TestW132ReleaseUnknownTaskDoesNotKill(t *testing.T) {
+	r := newPortRegistry()
+	called := false
+	if err := r.release("missing", func(int) error {
+		called = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if called {
+		t.Fatal("сниматель вызван для задачи без порта")
+	}
+}
+
+func TestW132PortProcessKillerUsesRunner(t *testing.T) {
+	c, _, _, calls := w68CLI(t, func(w68Call) runResult {
+		return runResult{code: 0}
+	})
+	if err := c.portProcessKiller(4123); err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("вызовов раннера %d, ожидался 1", len(*calls))
+	}
+	call := (*calls)[0]
+	if call.name != "fuser" {
+		t.Fatalf("раннер вызвал %q, ожидался fuser", call.name)
+	}
+	if want := []string{"-k", "4123/tcp"}; !reflect.DeepEqual(call.args, want) {
+		t.Fatalf("аргументы %q, ожидались %q", call.args, want)
+	}
+}
+
+func TestW132PortProcessKillerNoListenerIsSuccess(t *testing.T) {
+	c, _, _, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{code: 1, stderr: []byte("no process found\n")}
+	})
+	if err := c.portProcessKiller(4123); err != nil {
+		t.Fatalf("отсутствие слушателя должно считаться успехом: %v", err)
+	}
+}
+
+func TestW132ReleasePortPersistsAfterKill(t *testing.T) {
+	w132State(t)
+	c, _, _, calls := w68CLI(t, func(w68Call) runResult {
+		return runResult{code: 0}
+	})
+	port, err := c.assignPort("task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.releasePort("task", c.portProcessKiller); err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("раннер вызван %d раз, ожидался 1", len(*calls))
+	}
+	reg, err := loadPortRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reg.Used["task"]; ok {
+		t.Fatal("задача осталась в реестре после освобождения")
+	}
+	next, err := c.assignPort("next")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != port {
+		t.Fatalf("порт %d не перевыдан после освобождения, получен %d", port, next)
+	}
+}
+
+func TestW132ReleasePortDoesNotPersistOnKillFailure(t *testing.T) {
+	w132State(t)
+	c, _, _, _ := w68CLI(t, nil)
+	port, err := c.assignPort("task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := fmt.Errorf("сбой снятия")
+	if err := c.releasePort("task", func(int) error { return wantErr }); !errors.Is(err, wantErr) {
+		t.Fatalf("ошибка %v, ожидалась %v", err, wantErr)
+	}
+	reloaded, err := loadPortRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := reloaded.Used["task"]; !ok || got != port {
+		t.Fatalf("порт потерян в состоянии при ошибке снятия: %d, presence %v", got, ok)
 	}
 }

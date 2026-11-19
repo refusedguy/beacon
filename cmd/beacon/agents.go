@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -218,4 +219,195 @@ func (c *CLI) provisionSandbox(source, dest string) int {
 		return 2
 	}
 	return 0
+}
+
+// The port registry lives in Beacon state, so a port stays allocated across a
+// restart until the task that owns it is released (ADR 0039 section 4). Range
+// numbers follow workz: one contiguous block is enough for the 15 agents.
+const (
+	portRegistryBase  = 3000
+	portRegistryCount = 15
+	portRegistryFile  = "ports.json"
+)
+
+// portStateReadFile, portStateWriteFile and portStateMkdirAll are replaceable
+// in tests. Assigning os functions to variables keeps capabilities out of the
+// composition root: Beacon reads and writes its own state only through these
+// seams (ADR 0005). Direct os.ReadFile/WriteFile/MkdirAll calls are forbidden
+// in cmd/beacon by the capabilities gate.
+var (
+	portStateReadFile  = os.ReadFile
+	portStateWriteFile = os.WriteFile
+	portStateMkdirAll  = os.MkdirAll
+)
+
+// portRegistry maps a task ID to the port it owns. Base and Count are stored
+// with the allocations so a later Beacon version cannot silently reinterpret
+// an existing state file.
+type portRegistry struct {
+	Base  int            `json:"base"`
+	Count int            `json:"count"`
+	Used  map[string]int `json:"used"`
+}
+
+func newPortRegistry() *portRegistry {
+	return &portRegistry{Base: portRegistryBase, Count: portRegistryCount, Used: map[string]int{}}
+}
+
+func portRegistryPath() (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, portRegistryFile), nil
+}
+
+// loadPortRegistry reads the registry from Beacon state. A missing file is a
+// fresh registry. A file that holds two tasks on one port, or a port outside
+// the range, is corrupt and is rejected rather than handed out again.
+func loadPortRegistry() (*portRegistry, error) {
+	path, err := portRegistryPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := portStateReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return newPortRegistry(), nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: не удалось прочитать реестр портов: %v", path, err)
+	}
+	var reg portRegistry
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return nil, fmt.Errorf("%s: неверный реестр портов: %v", path, err)
+	}
+	if reg.Base <= 0 || reg.Count <= 0 {
+		return nil, fmt.Errorf("%s: неверный диапазон портов %d-%d", path, reg.Base, reg.Count)
+	}
+	if reg.Used == nil {
+		reg.Used = map[string]int{}
+	}
+	seen := make(map[int]string, len(reg.Used))
+	for task, port := range reg.Used {
+		if port < reg.Base || port >= reg.Base+reg.Count {
+			return nil, fmt.Errorf("%s: порт %d задачи %s вне диапазона", path, port, task)
+		}
+		if prev, ok := seen[port]; ok {
+			return nil, fmt.Errorf("%s: порт %d выдан и %s, и %s", path, port, prev, task)
+		}
+		seen[port] = task
+	}
+	return &reg, nil
+}
+
+// savePortRegistry writes the registry atomically enough for a CLI: one file,
+// restrictive permissions. A crash mid-write leaves a parse error, which
+// loadPortRegistry reports instead of issuing a colliding port.
+func savePortRegistry(reg *portRegistry) error {
+	path, err := portRegistryPath()
+	if err != nil {
+		return err
+	}
+	if err := portStateMkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("%s: не удалось создать каталог состояния: %v", path, err)
+	}
+	data, err := json.MarshalIndent(reg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := portStateWriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("%s: не удалось записать реестр портов: %v", path, err)
+	}
+	return nil
+}
+
+// assign gives taskID an unused port from the single registry. A repeated call
+// for the same task returns its existing port, so a retry cannot consume a
+// second one. All ports are taken from one contiguous range.
+func (r *portRegistry) assign(taskID string) (int, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return 0, fmt.Errorf("пустой идентификатор задачи")
+	}
+	if port, ok := r.Used[taskID]; ok {
+		return port, nil
+	}
+	for port := r.Base; port < r.Base+r.Count; port++ {
+		taken := false
+		for _, used := range r.Used {
+			if used == port {
+				taken = true
+				break
+			}
+		}
+		if !taken {
+			r.Used[taskID] = port
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("нет свободных портов в диапазоне %d-%d", r.Base, r.Base+r.Count-1)
+}
+
+// processKiller stops the processes listening on a port. Beacon drives it
+// through the injected runner; tests replace it with a recorder.
+type processKiller func(port int) error
+
+// release stops processes on the task's port and only then marks it free. A
+// failed kill leaves the port allocated, so the next task cannot take a port
+// that still has a live process.
+func (r *portRegistry) release(taskID string, kill processKiller) error {
+	port, ok := r.Used[taskID]
+	if !ok {
+		return nil
+	}
+	if kill == nil {
+		return fmt.Errorf("нет снимателя процессов для порта %d", port)
+	}
+	if err := kill(port); err != nil {
+		return fmt.Errorf("порт %d не освобождён: процессы не сняты: %w", port, err)
+	}
+	delete(r.Used, taskID)
+	return nil
+}
+
+// assignPort loads the registry, allocates a port and persists it in one step.
+func (c *CLI) assignPort(taskID string) (int, error) {
+	reg, err := loadPortRegistry()
+	if err != nil {
+		return 0, err
+	}
+	port, err := reg.assign(taskID)
+	if err != nil {
+		return 0, err
+	}
+	if err := savePortRegistry(reg); err != nil {
+		return 0, err
+	}
+	return port, nil
+}
+
+// releasePort kills the task's processes, frees the port and persists the
+// result. It saves only after release succeeds.
+func (c *CLI) releasePort(taskID string, kill processKiller) error {
+	reg, err := loadPortRegistry()
+	if err != nil {
+		return err
+	}
+	if err := reg.release(taskID, kill); err != nil {
+		return err
+	}
+	return savePortRegistry(reg)
+}
+
+// portProcessKiller stops listeners on a port through the injected runner.
+// fuser exits 1 when nothing listens, which counts as a successful cleanup.
+func (c *CLI) portProcessKiller(port int) error {
+	res := c.run(c.root, "fuser", []string{"-k", fmt.Sprintf("%d/tcp", port)}, nil)
+	if res.code == 0 || res.code == 1 {
+		return nil
+	}
+	msg := strings.TrimSpace(string(res.stderr))
+	if msg == "" {
+		msg = fmt.Sprintf("fuser завершился с кодом %d", res.code)
+	}
+	return fmt.Errorf("%s", msg)
 }
