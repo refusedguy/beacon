@@ -21,7 +21,7 @@ func TestAckSetsClaimedAtOnce(t *testing.T) {
 	stamper.add(o)
 	h := NewAckHandler(store, stamper, clock)
 
-	out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
+	_, out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
 	if err != nil {
 		t.Fatalf("first ack: %v", err)
 	}
@@ -34,7 +34,7 @@ func TestAckSetsClaimedAtOnce(t *testing.T) {
 	}
 
 	clock.Advance(time.Hour)
-	out, err = h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
+	_, out, err = h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
 	if err != nil || !out.OK {
 		t.Fatalf("repeat ack: out %+v err %v", out, err)
 	}
@@ -106,7 +106,7 @@ func TestAckReadStopsLadder(t *testing.T) {
 		t.Errorf("ladder retried after read: %d attempts, want %d", len(after), len(read.Attempts))
 	}
 
-	if _, err := acker.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID}); err != nil {
+	if _, _, err := acker.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID}); err != nil {
 		t.Fatalf("ack: %v", err)
 	}
 	claimed, _ := stamper.snapshot(o.ID)
