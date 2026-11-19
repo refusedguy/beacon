@@ -52,6 +52,22 @@ var ToolNames = []string{
 	"beacon_stats",
 }
 
+func boolPtr(b bool) *bool { return &b }
+
+// toolAnnotations records the honest annotation class of each contracted tool
+// (WORKER-PROMPT §4.1). Tools that write readAt or claimedAt are additive, not
+// read-only; cancel_watch is the only destructive tool. DestructiveHint is a
+// pointer in the SDK, so it must be set explicitly even when false.
+var toolAnnotations = map[string]mcpsdk.ToolAnnotations{
+	"beacon_watch_pr":     {DestructiveHint: boolPtr(false), IdempotentHint: true},
+	"beacon_wait_result":  {DestructiveHint: boolPtr(false), IdempotentHint: true},
+	"beacon_get_result":   {DestructiveHint: boolPtr(false), IdempotentHint: true},
+	"beacon_list_running": {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+	"beacon_ack":          {DestructiveHint: boolPtr(false), IdempotentHint: true},
+	"beacon_cancel_watch": {DestructiveHint: boolPtr(true)},
+	"beacon_stats":        {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+}
+
 type stubInput struct{}
 
 type stubOutput struct {
@@ -73,7 +89,8 @@ func NewServer() *mcpsdk.Server {
 		},
 	)
 	for _, name := range ToolNames {
-		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: name}, stubHandler)
+		annotations := toolAnnotations[name]
+		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: name, Annotations: &annotations}, stubHandler)
 	}
 	return s
 }
