@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 func realRoot(t *testing.T) string {
@@ -79,6 +80,8 @@ func TestTaskCommandExitCodesAndStreams(t *testing.T) {
 		{"take без агента", []string{"task", "take", "T2.1"}, 1},
 		{"take без ID", []string{"task", "take"}, 1},
 		{"take с двумя ID", []string{"task", "take", "T2.1", "T2.2"}, 1},
+		{"done без доказательства", []string{"task", "done", "T0.1", "--summary", "готово"}, 1},
+		{"needs-input без вопроса", []string{"task", "needs-input", "T0.1"}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -300,5 +303,181 @@ func TestFindProjectRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("go.mod не найден в %s: %v", root, err)
+	}
+}
+
+// ---- ADR 0051 п4 / T3.120 ----
+
+func writeCompletionCard(t *testing.T, dir, id, status string) string {
+	t.Helper()
+	body := fmt.Sprintf(`# %s. Карточка завершения
+Тип: task
+Статус: %s
+Фаза: P1
+Владелец файлов: cmd/beacon/task.go
+Зависимости: нет
+Ссылка: ADR 0001
+Агент: тест
+Время: 2026-11-20T00:00:00Z
+Цель: Проверить завершение
+Контекст: ADR 0051 п4
+Шаги: Шаг
+Проверка: Проверка
+Приёмка: Приёмка
+`, id, status)
+	path := filepath.Join(dir, id+".md")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestTaskCommandDoneRejectsMissingEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := writeCompletionCard(t, dir, "T5.1", "in_progress")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		argv []string
+		want string
+	}{
+		{"без полей", []string{"task", "done", "T5.1"}, "доказательства"},
+		{"только итог", []string{"task", "done", "T5.1", "--summary", "готово"}, "доказательства"},
+		{"пустое доказательство", []string{"task", "done", "T5.1", "--summary", "готово", "--evidence", "   "}, "доказательства"},
+		{"только доказательство", []string{"task", "done", "T5.1", "--evidence", "go test"}, "итога"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := TaskCommandWithConfig(tc.argv, &stdout, &stderr, whyConfig(dir))
+			if code != 1 {
+				t.Errorf("код = %d, ждали 1", code)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout не пустой при отказе: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Errorf("в stderr нет %q: %q", tc.want, stderr.String())
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(before) {
+				t.Errorf("карточка изменена при отказе: %q", after)
+			}
+		})
+	}
+}
+
+func TestTaskCommandDoneWithEvidence(t *testing.T) {
+	dir := t.TempDir()
+	path := writeCompletionCard(t, dir, "T5.2", "in_progress")
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "done", "T5.2",
+		"--summary", "фича готова", "--evidence", "go test ./cmd/beacon\n"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "T5.2 done" {
+		t.Fatalf("stdout %q", stdout.String())
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Статус: done", "Итог: фича готова", "Доказательство: go test ./cmd/beacon"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("в карточке нет %q: %q", want, body)
+		}
+	}
+	// Карточка с новыми полями обязана разбираться основным парсером.
+	cards, err := taskstore.LoadCards(dir)
+	if err != nil {
+		t.Fatalf("карточка после done не разбирается: %v", err)
+	}
+	if len(cards) != 1 || cards[0].Status != "done" {
+		t.Fatalf("карточки после done: %+v", cards)
+	}
+	// Повторное завершение готовой карточки отклоняется.
+	stdout.Reset()
+	stderr.Reset()
+	code = TaskCommandWithConfig([]string{"task", "done", "T5.2",
+		"--summary", "ещё раз", "--evidence", "go test"}, &stdout, &stderr, whyConfig(dir))
+	if code != 1 || stdout.Len() != 0 {
+		t.Fatalf("повторный done: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestTaskCommandNeedsInput(t *testing.T) {
+	dir := t.TempDir()
+	path := writeCompletionCard(t, dir, "T5.3", "todo")
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "needs-input", "T5.3",
+		"--question", "нужен доступ к PR?"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("needs-input: код %d stderr %q", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != "T5.3 needs_input" {
+		t.Fatalf("stdout %q", stdout.String())
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Статус: in_progress", "Состояние: needs_input", "Вопрос: нужен доступ к PR?"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("в карточке нет %q: %q", want, body)
+		}
+	}
+	cards, err := taskstore.LoadCards(dir)
+	if err != nil {
+		t.Fatalf("карточка с needs_input не разбирается: %v", err)
+	}
+	if len(cards) != 1 || cards[0].Status != "in_progress" {
+		t.Fatalf("карточки с needs_input: %+v", cards)
+	}
+
+	// Завершение после ответа снимает маркер needs_input и требует доказательство.
+	stdout.Reset()
+	stderr.Reset()
+	code = TaskCommandWithConfig([]string{"task", "done", "T5.3",
+		"--summary", "ответ получен", "--evidence", "gh issue view 1 --comments"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("done после needs_input: код %d stderr %q", code, stderr.String())
+	}
+	body, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Статус: done") {
+		t.Errorf("нет статуса done: %q", body)
+	}
+	if strings.Contains(string(body), "needs_input") || strings.Contains(string(body), "Вопрос:") {
+		t.Errorf("маркер needs_input не снят: %q", body)
+	}
+}
+
+func TestTaskCommandNeedsInputRequiresQuestion(t *testing.T) {
+	dir := t.TempDir()
+	path := writeCompletionCard(t, dir, "T5.4", "in_progress")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "needs-input", "T5.4"}, &stdout, &stderr, whyConfig(dir))
+	if code != 1 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "--question") {
+		t.Fatalf("код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("карточка изменена при отказе: %q", after)
 	}
 }
