@@ -2,7 +2,7 @@
 
 Набор локальных проверок в стиле Harbor. Раннер печатает таблицу с ожидаемым
 результатом, фактическим результатом и вердиктом `PASS`/`FAIL`. В конце выводится
-строка вида `8 passed, 0 failed`. При наличии `FAIL` код выхода равен 1.
+строка вида `9 passed, 0 failed`. При наличии `FAIL` код выхода равен 1.
 
 ## Запуск
 
@@ -39,7 +39,7 @@ eval-специфичную точку входа `evals/cmd/evalserver`: она
 - `Snapshot`: `mcp.SnapshotFunc` поверх `db.ActiveWatches()`.
 
 Обработчики не подменяются заглушками: проверяется реальный код из
-`internal/infra/mcp`. `CIProvider` и `VerdictSource` не нужны этим восьми
+`internal/infra/mcp`. `CIProvider` и `VerdictSource` не нужны этим девяти
 кейсам: `headSHA` передан явно, а `wait_result` в прогон не входит. Если в
 будущем понадобится eval для `wait_result`, ему потребуется реальный источник
 вердикта, и его нельзя будет заменить фейком молча.
@@ -60,6 +60,16 @@ eval-специфичную точку входа `evals/cmd/evalserver`: она
 | `06_get` | Вызывает `beacon_get_result` по `watchID` | `isError=false`, есть `status` и `verdict` |
 | `07_ack` | Вызывает `beacon_ack` с `watchID` и `obligationID` | `ok=true` |
 | `08_cancel` | Вызывает `beacon_cancel_watch` с `watchID` | `ok=true` |
+| `09_ship_verdict` | Собирает `domain.Snapshot` с зелёными обязательными проверками и `ShipFacts{Build, Audit, TDD}` и вызывает `domain.Evaluate` | с `ShipFacts` вердикт `ready`; без `ShipFacts` вердикт не `ready` |
+
+`09_ship_verdict` работает в процессе раннера, без MCP-сервера. Он импортирует
+чистую функцию `domain.Evaluate` из родительского модуля. Позитивный контроль
+показывает, что `ready` достижим: зелёный rollup, `MERGEABLE`, `CLEAN`, валидная
+композиция suite и заполненные факты дают `VerdictReady`. Негативный контроль
+берёт тот же Snapshot с нулевыми `ShipFacts` и ожидает вердикт не `ready`.
+Если убрать `ShipAllowed` из `Evaluate`, негативный контроль начнёт возвращать
+`ready` и eval упадёт. Так eval ловит регрессию T3.72, которую не ловили
+восемь кейсов: `ready` недостижим, когда `Ship` не заполняется.
 
 `headSHA` задан константой `0123...4567`. Все вызовы несут `_meta` с ключом
 `ai.opencode/sessionID`: обработчики `get_result` и `cancel_watch` читают оттуда
