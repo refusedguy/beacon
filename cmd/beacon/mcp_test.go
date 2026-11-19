@@ -328,3 +328,133 @@ func TestMCPConnectFailurePropagates(t *testing.T) {
 		t.Fatalf("в stderr нет адреса подключения: %q", errOut.String())
 	}
 }
+
+// TestMCPPrecheckFailsFastWithoutBypass is the acceptance test for ADR 0041 §6.
+// With an init event expected and no bypass configured, `beacon mcp` ends with
+// precheck_failure and a clear reason before the server starts waiting. The
+// run must not hang for init_event_timeout.
+func TestMCPPrecheckFailsFastWithoutBypass(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv("BEACON_INIT_EVENT", "control-plane")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	t.Setenv("BEACON_INIT_EVENT_TIMEOUT", "")
+
+	previousServe := serveMCP
+	t.Cleanup(func() { serveMCP = previousServe })
+
+	serveCalled := false
+	serveMCP = func(context.Context, mcp.Dependencies) error {
+		serveCalled = true
+		return nil
+	}
+
+	start := time.Now()
+	errOut := new(bytes.Buffer)
+	code := mcpRunner(errOut)
+	elapsed := time.Since(start)
+
+	if code == 0 {
+		t.Fatalf("код выхода %d, ожидался не ноль; stderr %q", code, errOut.String())
+	}
+	if serveCalled {
+		t.Fatal("сервер начал ждать до отказа precheck")
+	}
+	if !strings.Contains(errOut.String(), mcpPrecheckFailure) {
+		t.Fatalf("в stderr нет precheck_failure: %q", errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "bypass") {
+		t.Fatalf("в stderr нет причины про bypass: %q", errOut.String())
+	}
+	if elapsed >= initEventTimeoutDefault/2 {
+		t.Fatalf("precheck занял %s, ожидался быстрый отказ (менее %s)", elapsed, initEventTimeoutDefault/2)
+	}
+}
+
+// TestMCPPrecheckSkippedWithoutInitEventSource proves that a run with no init
+// event to precheck proceeds. The reconnect tests in this file rely on that
+// behavior: they configure no init event source and no bypass.
+func TestMCPPrecheckSkippedWithoutInitEventSource(t *testing.T) {
+	t.Setenv("BEACON_INIT_EVENT", "")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	if err := runMCPPrecheck(context.Background(), readInitEventConfig()); err != nil {
+		t.Fatalf("без источника init event precheck должен проходить: %v", err)
+	}
+}
+
+// TestMCPPrecheckPassesWithBypass proves that a configured bypass lets the
+// server start waiting, so the precheck does not block the normal run.
+func TestMCPPrecheckPassesWithBypass(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv("BEACON_INIT_EVENT", "control-plane")
+	t.Setenv("BEACON_INIT_BYPASS", "1")
+
+	previousServe := serveMCP
+	t.Cleanup(func() { serveMCP = previousServe })
+
+	serveCalled := false
+	serveMCP = func(context.Context, mcp.Dependencies) error {
+		serveCalled = true
+		return nil
+	}
+
+	if code := mcpRunner(new(bytes.Buffer)); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0", code)
+	}
+	if !serveCalled {
+		t.Fatal("bypass не пропустил запуск сервера")
+	}
+}
+
+// TestMCPPrecheckFailureReason checks the error callers branch on. The outcome
+// is precheck_failure and the failure carries a non-empty reason.
+func TestMCPPrecheckFailureReason(t *testing.T) {
+	cfg := initEventConfig{source: "control-plane", bypass: false, timeout: 3 * time.Second}
+	err := runMCPPrecheck(context.Background(), cfg)
+	if !isPrecheckFailure(err) {
+		t.Fatalf("ожидалась ошибка precheck_failure, получено %v", err)
+	}
+	failure, ok := err.(*precheckFailureError)
+	if !ok {
+		t.Fatalf("тип ошибки %T, ожидался *precheckFailureError", err)
+	}
+	if failure.reason == "" {
+		t.Fatal("причина precheck пуста")
+	}
+	if !strings.Contains(err.Error(), mcpPrecheckFailure) {
+		t.Fatalf("в ошибке нет precheck_failure: %q", err.Error())
+	}
+	if !strings.Contains(failure.reason, "control-plane") {
+		t.Fatalf("в причине нет имени источника: %q", failure.reason)
+	}
+}
+
+// TestReadInitEventConfig covers parsing at the CLI boundary: the default
+// timeout, the opt-in bypass and a fallback for an invalid timeout value.
+func TestReadInitEventConfig(t *testing.T) {
+	t.Setenv("BEACON_INIT_EVENT", "")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	t.Setenv("BEACON_INIT_EVENT_TIMEOUT", "")
+	cfg := readInitEventConfig()
+	if cfg.source != "" || cfg.bypass {
+		t.Fatalf("пустая конфигурация дала %+v", cfg)
+	}
+	if cfg.timeout != initEventTimeoutDefault {
+		t.Fatalf("таймаут по умолчанию %s, ожидался %s", cfg.timeout, initEventTimeoutDefault)
+	}
+
+	t.Setenv("BEACON_INIT_EVENT", "control-plane")
+	t.Setenv("BEACON_INIT_BYPASS", "true")
+	t.Setenv("BEACON_INIT_EVENT_TIMEOUT", "2s")
+	cfg = readInitEventConfig()
+	if cfg.source != "control-plane" || !cfg.bypass || cfg.timeout != 2*time.Second {
+		t.Fatalf("конфигурация %+v, ожидался источник control-plane, bypass и таймаут 2s", cfg)
+	}
+
+	t.Setenv("BEACON_INIT_EVENT_TIMEOUT", "not-a-duration")
+	cfg = readInitEventConfig()
+	if cfg.timeout != initEventTimeoutDefault {
+		t.Fatalf("битый таймаут дал %s, ожидался %s", cfg.timeout, initEventTimeoutDefault)
+	}
+}

@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -22,6 +24,61 @@ const mcpStateDBName = "beacon.db"
 // The endpoint lives in this file, never in hardcoded process settings, so a
 // daemon that moves to a new address or port is picked up on the next start.
 const mcpConnectionFileName = "connection.json"
+
+// initEventTimeoutDefault bounds the startup precheck (ADR 0041 §6). A missing
+// bypass is a configuration error, so the precheck never waits for the full
+// timeout in that case. It fails immediately with a clear reason.
+const initEventTimeoutDefault = 10 * time.Second
+
+// mcpPrecheckFailure is the run outcome from ADR 0041 §6. A run whose bypass is
+// not configured ends with this outcome before it starts waiting.
+const mcpPrecheckFailure = "precheck_failure"
+
+// precheckFailureError carries the reason of a failed startup precheck. The
+// reason reaches the caller (and, in turn, wait_result and the journal)
+// instead of a silent wait.
+type precheckFailureError struct {
+	reason string
+}
+
+func (e *precheckFailureError) Error() string {
+	return fmt.Sprintf("mcp: %s: %s", mcpPrecheckFailure, e.reason)
+}
+
+// isPrecheckFailure reports whether err is a startup precheck failure. Callers
+// branch on the error type, not on the rendered message.
+func isPrecheckFailure(err error) bool {
+	var failure *precheckFailureError
+	return errors.As(err, &failure)
+}
+
+// initEventConfig is the startup precheck configuration from ADR 0041 §6.
+// source is empty when Beacon does not expect an init event; there is then
+// nothing to precheck and the run proceeds. bypass skips the check when an
+// init event is expected.
+type initEventConfig struct {
+	source  string
+	bypass  bool
+	timeout time.Duration
+}
+
+// readInitEventConfig parses the precheck configuration from the environment
+// at the CLI boundary. init_event_timeout defaults to ten seconds and bypass
+// is opt-in.
+func readInitEventConfig() initEventConfig {
+	cfg := initEventConfig{timeout: initEventTimeoutDefault}
+	cfg.source = os.Getenv("BEACON_INIT_EVENT")
+	switch os.Getenv("BEACON_INIT_BYPASS") {
+	case "1", "true", "yes", "on":
+		cfg.bypass = true
+	}
+	if raw := os.Getenv("BEACON_INIT_EVENT_TIMEOUT"); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			cfg.timeout = d
+		}
+	}
+	return cfg
+}
 
 // mcpConnection is the server endpoint Beacon connects to. Host, Port and
 // Token come from the connection file (ADR 0036 §1).
@@ -87,6 +144,30 @@ var activeMCPConnection mcpConnection
 // dialing a network master. It is a seam tests replace to observe reconnects
 // without a live server.
 var mcpConnector = func(_ context.Context, _ mcpConnection) error { return nil }
+
+// mcpPrecheck runs the startup precheck before the server begins waiting.
+// Tests replace it to observe the precheck without a live init event source.
+var mcpPrecheck = runMCPPrecheck
+
+// runMCPPrecheck enforces the ADR 0041 §6 contract. When an init event is
+// expected and bypass is not configured, the run fails immediately with a
+// clear reason instead of waiting silently until the timeout. It never blocks
+// on the init event channel: a missing bypass is a configuration error.
+func runMCPPrecheck(ctx context.Context, cfg initEventConfig) error {
+	if cfg.source == "" || cfg.bypass {
+		return nil
+	}
+	reason := fmt.Sprintf(
+		"bypass mode не настроен для init event %q: run завершён до входа в ожидание (init_event_timeout=%s)",
+		cfg.source, cfg.timeout,
+	)
+	select {
+	case <-ctx.Done():
+		return &precheckFailureError{reason: reason + "; " + ctx.Err().Error()}
+	default:
+		return &precheckFailureError{reason: reason}
+	}
+}
 
 // mcpRunner serves MCP over stdio. RegisterMCP replaces it, for example in tests.
 var mcpRunner = func(errOut io.Writer) int {
@@ -164,6 +245,14 @@ func runMCP(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	// ADR 0041 §6: precheck the init-event configuration before the server
+	// enters its wait loop. With no bypass for an expected init event this
+	// fails fast, so the run reports precheck_failure instead of hanging.
+	if err := mcpPrecheck(ctx, readInitEventConfig()); err != nil {
+		return err
+	}
+
 	if err := mcpConnector(ctx, conn); err != nil {
 		return fmt.Errorf("mcp: connect to %s: %w", conn.target(), err)
 	}
