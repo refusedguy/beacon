@@ -52,6 +52,8 @@ func newGraphQLServer(t *testing.T, reply replyFunc) *graphQLServer {
 	return s
 }
 
+// snapshot sorts the sizes because chunk requests run concurrently. The
+// order of requests is not deterministic, only the multiset of sizes is.
 func (s *graphQLServer) snapshot() (calls int, sizes []int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -146,7 +148,7 @@ func TestChunkCountsByTier(t *testing.T) {
 		want  []int
 	}{
 		{name: "tier1 100 aliases is one chunk", tier: Tier1, count: 100, want: []int{100}},
-		{name: "tier1 150 aliases is 100 plus 50", tier: Tier1, count: 150, want: []int{100, 50}},
+		{name: "tier1 150 aliases is 100 and 50", tier: Tier1, count: 150, want: []int{50, 100}},
 		{name: "tier2 100 aliases is two chunks of 50", tier: Tier2, count: 100, want: []int{50, 50}},
 	}
 
