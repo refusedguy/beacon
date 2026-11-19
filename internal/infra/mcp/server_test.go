@@ -64,6 +64,65 @@ func TestToolsListReturnsExactlySevenTools(t *testing.T) {
 	}
 }
 
+// TestReadToolsAdvertiseOutputSchema proves the two tools registered by the
+// composition root carry an explicit output schema rather than relying on the
+// one go-sdk infers by reflection from the handler's Go type.
+func TestReadToolsAdvertiseOutputSchema(t *testing.T) {
+	session := connectTestSession(t)
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	byName := make(map[string]*mcpsdk.Tool, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		byName[tool.Name] = tool
+	}
+	for _, name := range []string{"beacon_list_running", "beacon_stats"} {
+		tool, ok := byName[name]
+		if !ok {
+			t.Fatalf("tools/list missing %s", name)
+		}
+		if tool.OutputSchema == nil {
+			t.Errorf("%s: missing output schema", name)
+		}
+	}
+}
+
+// TestListRunningWithNilMapsValidates drives the real tool with a fresh Watch
+// whose Checks and Flaky.Used maps are nil. Those maps marshal to JSON null, so
+// a schema inferred by reflection (type "object") rejects the tool's own
+// output and tools/call returns a validation error. The explicit schema from
+// AllOutputSchemas accepts null, so the call must succeed without isError.
+func TestListRunningWithNilMapsValidates(t *testing.T) {
+	deps := Dependencies{
+		Snapshot: SnapshotFunc(func() (StateSnapshot, error) {
+			return StateSnapshot{
+				ActiveWatches: []domain.Watch{{ID: "fresh-watch"}},
+			}, nil
+		}),
+	}
+	session := connectTestSession(t, deps)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_list_running",
+		Arguments: map[string]any{},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_list_running with nil maps: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("beacon_list_running returned isError: %v", result.Content)
+	}
+	out := decodeStructured[ListRunningOutput](t, result)
+	if len(out.Watches) != 1 || out.Watches[0].ID != "fresh-watch" {
+		t.Fatalf("watches = %+v, want one watch with id fresh-watch", out.Watches)
+	}
+	if out.Watches[0].Checks != nil || out.Watches[0].Flaky.Used != nil {
+		t.Fatalf("fresh watch maps should be nil, got checks=%v, flaky.used=%v",
+			out.Watches[0].Checks, out.Watches[0].Flaky.Used)
+	}
+}
+
 func TestHandshakeInstructionsCarryCycleProtocol(t *testing.T) {
 	session := connectTestSession(t)
 
