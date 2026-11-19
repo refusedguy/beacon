@@ -330,3 +330,146 @@ func ClosedPRVerdict(state string) domain.Verdict {
 func IsTerminalArtifactVerdict(v domain.Verdict) bool {
 	return v == domain.VerdictMerged || v == domain.VerdictClosed
 }
+
+// Webhook delivery deduplication, ADR 0034 §4.
+//
+// The deduplication key here is the webhook delivery id event.id. This is a
+// different key from the ADR 0025 stream cursor, which marks a position in a
+// log, and from the ADR 0028 clientRequestId, which keys a client command. The
+// state after an event is read from an authoritative source (GET or a trusted
+// snapshot), never from the order in which events arrived or from state the
+// event carried with it.
+
+// webhookEventNamespace scopes an event.id so a store-backed cache cannot
+// collide with the clientRequestId index (ADR 0028) or the stream cursor
+// (ADR 0025) when they share one table.
+const webhookEventNamespace = "webhook-event-id"
+
+func webhookEventKey(id string) string {
+	return domain.IdempotencyKey(webhookEventNamespace, id)
+}
+
+// WebhookEvent is one webhook delivery. It carries the delivery id and the
+// event type only. The full resource state is never in the payload; it is read
+// through a WebhookStateSource.
+type WebhookEvent struct {
+	ID   string
+	Type string
+}
+
+// WebhookStateSource returns the authoritative state of the resource a webhook
+// event refers to. An adapter implements it with a GET request to the resource
+// or a trusted snapshot. Because the event carries no state, state can never
+// be reconstructed from delivery order.
+type WebhookStateSource func(ctx context.Context, event WebhookEvent) (domain.Snapshot, error)
+
+// WebhookEventCache is the index of already handled webhook delivery ids.
+// Implementations must be safe for concurrent use. A composition root can
+// replace the in-memory default with a store-backed index written in the same
+// transaction as the resulting state (ADR 0034 §4).
+type WebhookEventCache interface {
+	// Contains reports whether id is already in the index.
+	Contains(id string) bool
+	// Add records id in the index.
+	Add(id string)
+}
+
+// memoryWebhookEventCache keeps one entry per event.id for the lifetime of the
+// service.
+type memoryWebhookEventCache struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+}
+
+// NewWebhookEventCache builds the in-process event.id cache.
+func NewWebhookEventCache() WebhookEventCache {
+	return &memoryWebhookEventCache{seen: make(map[string]struct{})}
+}
+
+func (m *memoryWebhookEventCache) Contains(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.seen[webhookEventKey(id)]
+	return ok
+}
+
+func (m *memoryWebhookEventCache) Add(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seen[webhookEventKey(id)] = struct{}{}
+}
+
+// WebhookProcessor handles webhook deliveries for one bridge. It drops a
+// redelivery by event.id before doing any work, and reads the state produced by
+// an accepted event from the authoritative source rather than from the event
+// payload or the delivery order.
+type WebhookProcessor struct {
+	cache  WebhookEventCache
+	source WebhookStateSource
+
+	mu       sync.Mutex
+	state    domain.Snapshot
+	hasState bool
+	effects  int
+}
+
+// NewWebhookProcessor builds a processor over the given cache and state
+// source. A nil cache selects a fresh in-process cache.
+func NewWebhookProcessor(cache WebhookEventCache, source WebhookStateSource) *WebhookProcessor {
+	if cache == nil {
+		cache = NewWebhookEventCache()
+	}
+	return &WebhookProcessor{cache: cache, source: source}
+}
+
+// Handle processes one delivery. It returns true when the event was new and
+// produced an effect. A redelivery of the same event.id returns false and
+// leaves the state and the effect count unchanged. An event without an id is
+// dropped because it cannot be deduplicated.
+//
+// The state stored is whatever source returns at handling time. A later event
+// with a different id replaces it with the source's newer value; a redelivery
+// of an older id can never restore an older state, because state is never
+// derived from the event or from delivery order. The id is recorded only after
+// the source read succeeds, so a failed read leaves no effect and a redelivery
+// may retry.
+func (p *WebhookProcessor) Handle(ctx context.Context, ev WebhookEvent) (bool, error) {
+	if ev.ID == "" {
+		return false, nil
+	}
+	if p.source == nil {
+		return false, errors.New("webhook: no state source")
+	}
+
+	// Hold p.mu across the check, the source read and the record so concurrent
+	// redeliveries of one id cannot both pass the cache check.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cache.Contains(ev.ID) {
+		return false, nil
+	}
+	snap, err := p.source(ctx, ev)
+	if err != nil {
+		return false, err
+	}
+	p.cache.Add(ev.ID)
+	p.state = snap
+	p.hasState = true
+	p.effects++
+	return true, nil
+}
+
+// State returns the last authoritative state read from the source and whether
+// any event has produced an effect yet.
+func (p *WebhookProcessor) State() (domain.Snapshot, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.state, p.hasState
+}
+
+// Effects returns the number of accepted events that produced an effect.
+func (p *WebhookProcessor) Effects() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.effects
+}
