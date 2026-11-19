@@ -1083,6 +1083,296 @@ func TestWakeCapabilityOverInMemoryTransport(t *testing.T) {
 	}
 }
 
+// TestSelectAgentByWorktree proves the pure matcher selects the session in the
+// requested worktree and never picks a session from a different worktree
+// (ADR 0042 p3). A candidate with no worktree path cannot be selected.
+func TestSelectAgentByWorktree(t *testing.T) {
+	candidates := []CandidateAgent{
+		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
+		{Target: "no-worktree"},
+	}
+	if got, ok := selectAgentByWorktree(candidates, "/repo/worktrees/w2"); !ok || got != "session-w2" {
+		t.Errorf("select(w2) = %q, %v; want session-w2, true", got, ok)
+	}
+	if got, ok := selectAgentByWorktree(candidates, "/repo/worktrees/w9"); ok || got != "" {
+		t.Errorf("select(w9) = %q, %v; want empty, false", got, ok)
+	}
+	if got, ok := selectAgentByWorktree(candidates, ""); ok || got != "" {
+		t.Errorf("select(empty) = %q, %v; want empty, false", got, ok)
+	}
+}
+
+// TestSelectAgentCombinesRoutingKeys proves a caller can require both a
+// capability set and a worktree path, and a candidate must satisfy both.
+func TestSelectAgentCombinesRoutingKeys(t *testing.T) {
+	candidates := []CandidateAgent{
+		{Target: "caps-wrong-tree", Capabilities: []Capability{"review"}, WorktreePath: "/repo/w1"},
+		{Target: "tree-wrong-caps", Capabilities: []Capability{"chat"}, WorktreePath: "/repo/w2"},
+		{Target: "both-match", Capabilities: []Capability{"review", "build"}, WorktreePath: "/repo/w2"},
+	}
+	if got, ok := selectAgent(candidates, []Capability{"review"}, "/repo/w2"); !ok || got != "both-match" {
+		t.Errorf("select(review, w2) = %q, %v; want both-match, true", got, ok)
+	}
+	if got, ok := selectAgent(candidates, []Capability{"review"}, "/repo/w9"); ok || got != "" {
+		t.Errorf("select(review, w9) = %q, %v; want empty, false", got, ok)
+	}
+}
+
+// TestWakeAddressesByWorktree is the T3.87 acceptance core: the caller names a
+// worktree path, and wake delivers to the session running in that worktree
+// even though the caller never names a session id (ADR 0042 p3).
+func TestWakeAddressesByWorktree(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
+	}}
+	handler := NewWorktreeWakeHandler(sender, directory)
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Text:           "obligation-1@7",
+		TargetWorktree: "/repo/worktrees/w2",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliverySteer || !out.OK {
+		t.Errorf("delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
+	}
+	if sender.calls != 1 || sender.lastTarget != "session-w2" {
+		t.Errorf("sender calls=%d target=%q, want 1 and session-w2", sender.calls, sender.lastTarget)
+	}
+	if directory.calls != 1 {
+		t.Errorf("directory calls=%d, want 1", directory.calls)
+	}
+}
+
+// TestWakeWorktreeSurvivesRestart proves the worktree path is the stable key:
+// when the environment reports a new session id in the same worktree after a
+// restart, the next wake reaches the new session without reconfiguration
+// (ADR 0042 p3).
+func TestWakeWorktreeSurvivesRestart(t *testing.T) {
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-old", WorktreePath: "/repo/worktrees/w1"},
+	}}
+	in := WakeInput{Text: "p", TargetWorktree: "/repo/worktrees/w1"}
+
+	firstSender := &fakeWakeSender{delivery: DeliveryQueue}
+	if _, err := NewWorktreeWakeHandler(firstSender, directory).Wake(context.Background(), in); err != nil {
+		t.Fatalf("Wake() before restart error = %v, want nil", err)
+	}
+	if firstSender.lastTarget != "session-old" {
+		t.Errorf("target before restart = %q, want session-old", firstSender.lastTarget)
+	}
+
+	// Same worktree path, a different session id: a restart.
+	directory.candidates[0].Target = "session-new"
+	secondSender := &fakeWakeSender{delivery: DeliveryQueue}
+	if _, err := NewWorktreeWakeHandler(secondSender, directory).Wake(context.Background(), in); err != nil {
+		t.Fatalf("Wake() after restart error = %v, want nil", err)
+	}
+	if secondSender.lastTarget != "session-new" {
+		t.Errorf("target after restart = %q, want session-new", secondSender.lastTarget)
+	}
+}
+
+// TestWakeOtherWorktreeDoesNotReceive proves a session in a different worktree
+// is not woken: with no candidate in the requested worktree the call is an
+// honest refusal and no sender is touched (ADR 0042 p3).
+func TestWakeOtherWorktreeDoesNotReceive(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
+	}}
+	out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Text: "p", TargetWorktree: "/repo/worktrees/w1",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil for an honest refusal", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK {
+		t.Errorf("delivery=%q ok=%v, want unsupported/false", out.Delivery, out.OK)
+	}
+	if !strings.Contains(out.Reason, "worktree") {
+		t.Errorf("reason=%q, want it to name the worktree", out.Reason)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls=%d, want 0 when no session is in the worktree", sender.calls)
+	}
+}
+
+// TestWakeWorktreeWithoutDirectoryIsUnsupported proves a worktree request is
+// never turned into a guessed session id when the environment has no directory.
+func TestWakeWorktreeWithoutDirectoryIsUnsupported(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Text: "p", TargetWorktree: "/repo/worktrees/w1",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK {
+		t.Errorf("delivery=%q ok=%v, want unsupported/false", out.Delivery, out.OK)
+	}
+	if !strings.Contains(out.Reason, "directory") {
+		t.Errorf("reason=%q, want it to name the missing directory", out.Reason)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls=%d, want 0 without a directory", sender.calls)
+	}
+}
+
+// TestWakeWorktreeKeepsHumanFlagsFirst guards T2.24: a human flag interrupts
+// before the worktree directory is consulted or any delivery is attempted.
+func TestWakeWorktreeKeepsHumanFlagsFirst(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+	}}
+	out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Text: "p", TargetWorktree: "/repo/worktrees/w1", HasPendingQuestion: true,
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.Interrupted || out.Delivery != DeliveryInterrupted || out.OK {
+		t.Errorf("got interrupted=%v delivery=%q ok=%v, want true/%q/false", out.Interrupted, out.Delivery, out.OK, DeliveryInterrupted)
+	}
+	if directory.calls != 0 || sender.calls != 0 {
+		t.Errorf("directory calls=%d sender calls=%d, want 0/0 on interruption", directory.calls, sender.calls)
+	}
+}
+
+// TestWakeWorktreeKeepsBothDeliveryModes guards T2.20: worktree addressing
+// feeds the same two honest success modes as the explicit-target path.
+func TestWakeWorktreeKeepsBothDeliveryModes(t *testing.T) {
+	for _, delivery := range []Delivery{DeliverySteer, DeliveryQueue} {
+		sender := &fakeWakeSender{delivery: delivery}
+		directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+			{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+		}}
+		out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+			Text: "p", TargetWorktree: "/repo/worktrees/w1",
+		})
+		if err != nil {
+			t.Fatalf("Wake(%q) error = %v, want nil", delivery, err)
+		}
+		if out.Delivery != delivery || !out.OK {
+			t.Errorf("Wake(%q) delivery=%q ok=%v, want %q/true", delivery, out.Delivery, out.OK, delivery)
+		}
+	}
+}
+
+// TestWakeWorktreeKeepsExplicitTarget proves an explicit Target caller (no
+// worktree path) keeps the pre-ADR-0042 path: no directory lookup happens.
+func TestWakeWorktreeKeepsExplicitTarget(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+	}}
+	out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Target: "named-session", Text: "p",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.OK || sender.lastTarget != "named-session" {
+		t.Errorf("ok=%v target=%q, want true/named-session", out.OK, sender.lastTarget)
+	}
+	if directory.calls != 0 {
+		t.Errorf("directory calls=%d, want 0 without a routing key", directory.calls)
+	}
+}
+
+// TestWakeWorktreeWithCapabilities proves capability and worktree routing
+// compose: only a session that declares the capability and runs in the
+// requested worktree is chosen.
+func TestWakeWorktreeWithCapabilities(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "review-w1", Capabilities: []Capability{"review"}, WorktreePath: "/repo/worktrees/w1"},
+		{Target: "review-w2", Capabilities: []Capability{"review"}, WorktreePath: "/repo/worktrees/w2"},
+	}}
+	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		Text:                 "p",
+		RequiredCapabilities: []Capability{"review"},
+		TargetWorktree:       "/repo/worktrees/w2",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.OK || sender.lastTarget != "review-w2" {
+		t.Errorf("ok=%v target=%q, want true/review-w2", out.OK, sender.lastTarget)
+	}
+}
+
+// TestWakeSchemaHasTargetWorktree proves an MCP client can send the worktree
+// path that drives the new addressing path.
+func TestWakeSchemaHasTargetWorktree(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "targetWorktree") {
+		t.Errorf("wake input schema missing targetWorktree: %s", inputSchema)
+	}
+}
+
+// TestWakeWorktreeOverInMemoryTransport drives worktree addressing through a
+// real MCP client and server. It proves the path is decoded from the schema
+// and the session in that worktree receives the delivery.
+func TestWakeWorktreeOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
+	}}
+	AttachWake(server, NewWorktreeWakeHandler(sender, directory))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Text:           "p",
+			TargetWorktree: "/repo/worktrees/w2",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Delivery != DeliveryQueue || !out.OK {
+		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
+	}
+	if sender.lastTarget != "session-w2" {
+		t.Errorf("sender target=%q, want session-w2", sender.lastTarget)
+	}
+}
+
 // fallbackAttempt records one channel attempt of the ADR 0038 p6 chain. The
 // channel is the hint the core asked for; the delivery is what the adapter
 // reports actually happened.
@@ -1357,6 +1647,34 @@ func TestWakeFallbackKeepsCapabilitySelection(t *testing.T) {
 	}
 	if len(sender.attempts) != 1 || sender.attempts[0].target != "review-session" {
 		t.Errorf("attempts=%+v, want steer to review-session", sender.attempts)
+	}
+}
+
+// TestWakeFallbackKeepsWorktreeSelection guards T3.58 together with T3.87:
+// the worktree lookup picks the target, and the chosen session is the one the
+// fallback chain delivers to.
+func TestWakeFallbackKeepsWorktreeSelection(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
+		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
+	}}
+	handler := NewCapabilityFallbackWakeHandler(sender, confirmer, &fakeTracer{}, directory)
+
+	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
+		Text: "p", TargetWorktree: "/repo/worktrees/w2",
+	})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if !out.OK || out.Delivery != DeliverySteer {
+		t.Errorf("delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
+	}
+	if len(sender.attempts) != 1 || sender.attempts[0].target != "session-w2" {
+		t.Errorf("attempts=%+v, want steer to session-w2", sender.attempts)
 	}
 }
 
