@@ -363,6 +363,54 @@ func TestSubscribeDerivesIDAndFillsDefaults(t *testing.T) {
 	}
 }
 
+func TestEmitStreamEventMonotonicSeq(t *testing.T) {
+	f, _ := newTestFanout(t)
+
+	for i := 0; i < 5; i++ {
+		ev := f.EmitStreamEvent("w1", []byte(fmt.Sprintf("chunk %d", i)))
+		if ev.Seq != uint64(i+1) {
+			t.Fatalf("chunk %d seq = %d, want %d", i, ev.Seq, i+1)
+		}
+		if ev.WatchID != "w1" {
+			t.Errorf("chunk %d watchID = %q, want w1", i, ev.WatchID)
+		}
+		if string(ev.Payload) != fmt.Sprintf("chunk %d", i) {
+			t.Errorf("chunk %d payload = %q", i, ev.Payload)
+		}
+	}
+}
+
+func TestEmitStreamEventSeqIsUniqueUnderConcurrency(t *testing.T) {
+	f, _ := newTestFanout(t)
+
+	const goroutines = 20
+	seqs := make(chan uint64, goroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			seqs <- f.EmitStreamEvent("w1", []byte("x")).Seq
+		}()
+	}
+	wg.Wait()
+	close(seqs)
+
+	seen := make(map[uint64]bool, goroutines)
+	for seq := range seqs {
+		if seq == 0 || seq > goroutines {
+			t.Errorf("seq = %d, want within 1..%d", seq, goroutines)
+		}
+		if seen[seq] {
+			t.Errorf("duplicate seq %d emitted", seq)
+		}
+		seen[seq] = true
+	}
+	if len(seen) != goroutines {
+		t.Errorf("unique seqs = %d, want %d", len(seen), goroutines)
+	}
+}
+
 func TestSubscribeErrors(t *testing.T) {
 	t.Run("empty subscriber id", func(t *testing.T) {
 		f, _ := newTestFanout(t)

@@ -224,6 +224,82 @@ func TestPersistStatsIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestRecordStreamExposesMissingAndDuplicates(t *testing.T) {
+	d := openObservabilityDB(t)
+	op := NewObservedPersist(d)
+
+	// A read on a fresh store is zero and does not create the table.
+	empty, err := d.StreamHealth()
+	if err != nil {
+		t.Fatalf("StreamHealth on fresh store: %v", err)
+	}
+	if empty.Chunks != 0 || empty.LastSeq != 0 || empty.Duplicates != 0 || len(empty.Missing) != 0 {
+		t.Errorf("fresh stream health = %+v, want zero", empty)
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "stream_health")
+	if err != nil {
+		t.Fatalf("tableExists: %v", err)
+	}
+	if ok {
+		t.Error("a read created stream_health")
+	}
+
+	final := domain.StreamFinal{
+		Chunks:     5,
+		Missing:    []uint64{2, 4},
+		Duplicates: 3,
+		Streamed:   true,
+		Result:     []byte("full result"),
+	}
+	if err := op.RecordStream(context.Background(), final); err != nil {
+		t.Fatalf("RecordStream: %v", err)
+	}
+
+	got, err := d.StreamHealth()
+	if err != nil {
+		t.Fatalf("StreamHealth: %v", err)
+	}
+	if got.Chunks != 5 || got.LastSeq != 5 || got.Duplicates != 3 {
+		t.Errorf("stream health = %+v, want chunks 5, lastSeq 5, duplicates 3", got)
+	}
+	if !reflect.DeepEqual(got.Missing, []uint64{2, 4}) {
+		t.Errorf("missing = %v, want [2 4]", got.Missing)
+	}
+
+	// The same read is available on the wrapped writer, and recording stream
+	// health must not advance the persist seq.
+	viaWriter, err := op.StreamHealth()
+	if err != nil {
+		t.Fatalf("ObservedPersist.StreamHealth: %v", err)
+	}
+	if !reflect.DeepEqual(viaWriter, got) {
+		t.Errorf("writer view = %+v, db view = %+v", viaWriter, got)
+	}
+	state, err := d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState: %v", err)
+	}
+	if state.Seq != 0 || state.LastError != "" {
+		t.Errorf("persist state = %+v, want unchanged by RecordStream", state)
+	}
+}
+
+func TestRecordStreamEmptyMissingRoundTrips(t *testing.T) {
+	d := openObservabilityDB(t)
+	op := NewObservedPersist(d)
+
+	if err := op.RecordStream(context.Background(), domain.StreamFinal{Chunks: 2}); err != nil {
+		t.Fatalf("RecordStream: %v", err)
+	}
+	got, err := d.StreamHealth()
+	if err != nil {
+		t.Fatalf("StreamHealth: %v", err)
+	}
+	if len(got.Missing) != 0 {
+		t.Errorf("missing = %v, want empty", got.Missing)
+	}
+}
+
 func TestPersistStatsOnEmptyStoreDoesNotCreateState(t *testing.T) {
 	d := openObservabilityDB(t)
 	state, loadErrors, err := d.PersistStats()

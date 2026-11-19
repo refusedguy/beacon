@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -172,6 +173,98 @@ func TestTypes(t *testing.T) {
 			t.Fatalf("Notifier.Notify: outcome=%q err=%v", outcome, err)
 		}
 	})
+}
+
+func TestStreamEventJSON(t *testing.T) {
+	ev := StreamEvent{Seq: 3, WatchID: "w1", Payload: []byte("step 3")}
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal StreamEvent: %v", err)
+	}
+	assertJSONKeys(t, b, "seq", "watchID", "payload")
+
+	var got StreamEvent
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal StreamEvent: %v", err)
+	}
+	if got.Seq != 3 || got.WatchID != "w1" || string(got.Payload) != "step 3" {
+		t.Fatalf("StreamEvent round trip mismatch: %+v", got)
+	}
+}
+
+func TestStreamAssemblerRestoresOrderDropsDuplicatesAndKeepsResult(t *testing.T) {
+	a := NewStreamAssembler(0) // default window
+
+	// Chunks arrive out of order, one is repeated and one has an invalid seq.
+	a.Push(StreamEvent{Seq: 3, Payload: []byte("c")})
+	a.Push(StreamEvent{Seq: 1, Payload: []byte("a")})
+	a.Push(StreamEvent{Seq: 3, Payload: []byte("c-again")})
+	a.Push(StreamEvent{Seq: 2, Payload: []byte("b")})
+	a.Push(StreamEvent{Seq: 0, Payload: []byte("ignored")})
+
+	ordered := a.OrderedChunks()
+	want := []string{"a", "b", "c"}
+	if len(ordered) != len(want) {
+		t.Fatalf("ordered chunks = %d, want %d: %+v", len(ordered), len(want), ordered)
+	}
+	for i, ev := range ordered {
+		if ev.Seq != uint64(i+1) || string(ev.Payload) != want[i] {
+			t.Errorf("chunk %d = (seq %d, %q), want (seq %d, %q)", i, ev.Seq, ev.Payload, i+1, want[i])
+		}
+	}
+
+	const result = "the complete authoritative result"
+	final := a.Finish(3, []byte(result))
+	if final.Chunks != 3 || final.Duplicates != 1 || !final.Streamed {
+		t.Fatalf("final counters = %+v, want chunks 3, duplicates 1, streamed true", final)
+	}
+	if len(final.Missing) != 0 {
+		t.Errorf("missing = %v, want empty", final.Missing)
+	}
+	if string(final.Result) != result {
+		t.Errorf("result = %q, want %q", final.Result, result)
+	}
+}
+
+func TestStreamAssemblerReportsMissingAndStillReturnsFullResult(t *testing.T) {
+	a := NewStreamAssembler(2)
+
+	// Position 1 is lost. With a window of two the gap is still inside the
+	// window, so nothing is emitted until Finish closes the stream.
+	a.Push(StreamEvent{Seq: 2, Payload: []byte("b")})
+	a.Push(StreamEvent{Seq: 3, Payload: []byte("c")})
+	if got := a.OrderedChunks(); len(got) != 0 {
+		t.Fatalf("emitted %d chunks before Finish, want 0: %+v", len(got), got)
+	}
+
+	const result = "full result despite a lost chunk"
+	final := a.Finish(3, []byte(result))
+	if !reflect.DeepEqual(final.Missing, []uint64{1}) {
+		t.Errorf("missing = %v, want [1]", final.Missing)
+	}
+	if string(final.Result) != result {
+		t.Errorf("result = %q, want %q", final.Result, result)
+	}
+	if len(final.Events) != 2 || final.Events[0].Seq != 2 || final.Events[1].Seq != 3 {
+		t.Errorf("final events = %+v, want seq 2 and 3 in order", final.Events)
+	}
+}
+
+func TestStreamAssemblerGivesUpGapBeyondWindow(t *testing.T) {
+	a := NewStreamAssembler(2)
+
+	// Position 1 and 2 are lost; the gap to seq 3 exceeds the window, so the
+	// assembler reports them as missing as soon as it can.
+	a.Push(StreamEvent{Seq: 3, Payload: []byte("c")})
+	a.Push(StreamEvent{Seq: 4, Payload: []byte("d")})
+
+	final := a.Finish(4, []byte("full"))
+	if !reflect.DeepEqual(final.Missing, []uint64{1, 2}) {
+		t.Errorf("missing = %v, want [1 2]", final.Missing)
+	}
+	if len(final.Events) != 2 || final.Events[0].Seq != 3 || final.Events[1].Seq != 4 {
+		t.Errorf("final events = %+v, want seq 3 and 4 in order", final.Events)
+	}
 }
 
 func assertJSONKeys(t *testing.T, b []byte, keys ...string) {

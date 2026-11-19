@@ -39,9 +39,10 @@ type Subscription struct {
 // one process. A single writer per Store is still assumed; cross-process
 // exclusion belongs to the daemon's lock (ADR 0021).
 type Fanout struct {
-	mu    sync.Mutex
-	store Store
-	clock Clock
+	mu        sync.Mutex
+	store     Store
+	clock     Clock
+	streamSeq uint64
 }
 
 // NewFanout builds a Fanout over the given ports. A nil clock falls back to
@@ -56,6 +57,19 @@ func NewFanout(store Store, clock Clock) *Fanout {
 type wallClock struct{}
 
 func (wallClock) Now() time.Time { return time.Now() }
+
+// EmitStreamEvent assigns the next monotonic seq to one chunk for watchID and
+// returns it. Seq starts at one and increases across every call on one Fanout,
+// so a client can restore order over a whole stream, spot a gap as missing and
+// spot a repeated chunk as a duplicate (ADR 0031 §1). The same mutex that
+// serializes subscription check-then-act keeps numbering correct under
+// concurrent fan-out.
+func (f *Fanout) EmitStreamEvent(watchID string, payload []byte) StreamEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.streamSeq++
+	return StreamEvent{Seq: f.streamSeq, WatchID: watchID, Payload: payload}
+}
 
 // Subscribe registers s on the Watch identified by w's (repo, pr, headSHA)
 // alias. Reusing the alias keeps at most one active Watch per PR head. An
