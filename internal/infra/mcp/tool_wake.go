@@ -32,6 +32,13 @@
 // them all and uses its name only as the delivery key. The core keeps no list
 // of agent names (ADR 0024).
 //
+// ADR 0038 p6 adds a fallback chain. The adapter first tries the running turn,
+// then the next turn when the agent did not confirm receipt, and finally the
+// task trace for a later retry. The chain is driven by the core over narrow
+// ports; it reports the honest delivery value and keeps the trace as a separate
+// fact. A trace is never a delivery into the running turn, and falling back
+// never promotes unsupported into success. The ADR 0017 ladder is unchanged.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -71,6 +78,30 @@ type WakeSource string
 const (
 	SourceManual WakeSource = "manual"
 	SourceReview WakeSource = "review"
+)
+
+// WakeChannel is the channel the core asks the adapter to attempt for one step
+// of the ADR 0038 p6 fallback chain. It is an input hint, never an outcome: the
+// adapter still reports the Delivery that actually happened, so an environment
+// that supports only queue may answer queue to a steer request. The two values
+// share the steer/queue vocabulary but are not interchangeable.
+type WakeChannel string
+
+const (
+	ChannelSteer WakeChannel = "steer"
+	ChannelQueue WakeChannel = "queue"
+)
+
+// FallbackStage names the step at which a fallback wake ended. It is separate
+// from Delivery so the honest delivery value is never widened with a new
+// success meaning. FallbackTraced means the message was written to the task
+// trace for a later retry; it is not a delivery.
+type FallbackStage string
+
+const (
+	FallbackSteer  FallbackStage = "steer"
+	FallbackQueue  FallbackStage = "queue"
+	FallbackTraced FallbackStage = "traced"
 )
 
 // normalizeSource gives an absent source its documented default. Unknown
@@ -133,15 +164,20 @@ type WakeInput struct {
 // 429 is visible in the wake status (ADR 0031 p4). Woke echoes the caller's
 // separate confirmation that the agent began work (ADR 0032 p2); it stays
 // false on every dispatch path unless the caller reports it, so a delivered
-// follow-up is never mistaken for a started agent turn.
+// follow-up is never mistaken for a started agent turn. Fallback names the
+// last step of the ADR 0038 p6 chain and is empty when no chain ran; Traced is
+// a separate fact that stays true only when the message was written to the
+// task trace. Neither widens the honest Delivery value.
 type WakeOutput struct {
-	Delivery    Delivery   `json:"delivery"`
-	OK          bool       `json:"ok"`
-	Source      WakeSource `json:"source"`
-	Executor    string     `json:"executor,omitempty"`
-	Interrupted bool       `json:"interrupted,omitempty"`
-	Reason      string     `json:"reason,omitempty"`
-	Woke        bool       `json:"woke,omitempty"`
+	Delivery    Delivery      `json:"delivery"`
+	OK          bool          `json:"ok"`
+	Source      WakeSource    `json:"source"`
+	Executor    string        `json:"executor,omitempty"`
+	Interrupted bool          `json:"interrupted,omitempty"`
+	Reason      string        `json:"reason,omitempty"`
+	Woke        bool          `json:"woke,omitempty"`
+	Fallback    FallbackStage `json:"fallback,omitempty"`
+	Traced      bool          `json:"traced,omitempty"`
 }
 
 // Interruption reasons are fixed strings so tests and callers can rely on the
@@ -161,6 +197,31 @@ const (
 // does not know which concrete client implements the port (ADR 0001).
 type WakeSender interface {
 	Deliver(ctx context.Context, target, text string, source WakeSource) (Delivery, string)
+}
+
+// FallbackWakeSender attempts one delivery on a requested channel (ADR 0038
+// p6). The channel is only a hint: the adapter reports the Delivery that
+// actually happened and an honest reason. It must never report steer or queue
+// for an attempt it could not make. A handler built with
+// NewFallbackWakeHandler uses this port instead of WakeSender.
+type FallbackWakeSender interface {
+	Deliver(ctx context.Context, target, text string, source WakeSource, channel WakeChannel) (Delivery, string)
+}
+
+// ReceiptConfirmer reports whether the agent confirmed receipt of a follow-up
+// sent on a channel (ADR 0038 p6). It is consulted after each successful
+// channel attempt. A nil confirmer means unconfirmed, so the chain continues
+// to the next step instead of guessing a receipt.
+type ReceiptConfirmer interface {
+	Confirmed(ctx context.Context, target, text string, channel WakeChannel) bool
+}
+
+// TaskTracer records a follow-up in the task trace for a later retry (ADR 0038
+// p6). This is the last fallback step and is explicitly not a delivery: a
+// written trace never means the message reached the running turn and never
+// turns an unsupported delivery into success.
+type TaskTracer interface {
+	Trace(ctx context.Context, target, text string, source WakeSource) error
 }
 
 // Capability is one declared ability of an agent session (ADR 0037 p1). The
@@ -219,11 +280,16 @@ func selectAgentByCapabilities(candidates []CandidateAgent, required []Capabilit
 }
 
 // WakeHandler implements the wake tool over a WakeSender and, optionally, an
-// AgentDirectory. It holds no state beyond those ports and performs no I/O of
-// its own.
+// AgentDirectory. A handler built with NewFallbackWakeHandler instead drives
+// the ADR 0038 p6 chain over its own ports. In either case it holds no state
+// beyond those ports and performs no I/O of its own.
 type WakeHandler struct {
-	sender    WakeSender
-	directory AgentDirectory
+	sender         WakeSender
+	directory      AgentDirectory
+	fallbackSender FallbackWakeSender
+	confirmer      ReceiptConfirmer
+	tracer         TaskTracer
+	useFallback    bool
 }
 
 // NewWakeHandler builds a handler over sender. A nil sender is allowed here and
@@ -241,13 +307,107 @@ func NewCapabilityWakeHandler(sender WakeSender, directory AgentDirectory) *Wake
 	return &WakeHandler{sender: sender, directory: directory}
 }
 
-// Handle adapts Wake to the go-sdk typed tool handler signature.
+// NewFallbackWakeHandler builds a handler that runs the ADR 0038 p6 chain:
+// steer, then queue when the agent did not confirm, then the task trace when
+// confirmation failed again. Nil ports are honest refusals, never guesses: a
+// nil sender reports unsupported on every channel, a nil confirmer counts as
+// unconfirmed, and a nil tracer records Traced=false with a reason.
+func NewFallbackWakeHandler(sender FallbackWakeSender, confirmer ReceiptConfirmer, tracer TaskTracer) *WakeHandler {
+	return &WakeHandler{fallbackSender: sender, confirmer: confirmer, tracer: tracer, useFallback: true}
+}
+
+// NewCapabilityFallbackWakeHandler adds capability-based target selection to
+// the fallback chain. It keeps the ADR 0037 p1 path intact while the chain
+// drives delivery.
+func NewCapabilityFallbackWakeHandler(sender FallbackWakeSender, confirmer ReceiptConfirmer, tracer TaskTracer, directory AgentDirectory) *WakeHandler {
+	return &WakeHandler{
+		fallbackSender: sender,
+		confirmer:      confirmer,
+		tracer:         tracer,
+		directory:      directory,
+		useFallback:    true,
+	}
+}
+
+// Handle adapts Wake to the go-sdk typed tool handler signature. A fallback
+// handler dispatches to WakeWithFallback so the chain is reachable over MCP;
+// all earlier handlers keep the single-delivery Wake path.
 func (h *WakeHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in WakeInput) (*mcpsdk.CallToolResult, WakeOutput, error) {
-	out, err := h.Wake(ctx, in)
+	var out WakeOutput
+	var err error
+	if h != nil && h.useFallback {
+		out, err = h.WakeWithFallback(ctx, in)
+	} else {
+		out, err = h.Wake(ctx, in)
+	}
 	if err != nil {
 		return nil, WakeOutput{}, err
 	}
 	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// wakeSetup is the shared boundary result of validating a wake call and
+// resolving its delivery target. Both the single-delivery and the fallback
+// paths use it so the human-first rule and capability selection stay identical.
+type wakeSetup struct {
+	target  string
+	source  WakeSource
+	refusal *WakeOutput
+	err     error
+}
+
+// prepareWake validates input and resolves the target without attempting any
+// delivery. An interruption or an honest capability refusal arrives as a
+// refusal; a malformed call arrives as an error.
+func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
+	if in.HasPendingQuestion || in.PendingApproval {
+		out := interruptedWake(in)
+		return wakeSetup{refusal: &out}
+	}
+	if in.Text == "" {
+		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, "wake: text is required")}
+	}
+	source := normalizeSource(in.Source)
+	if !validSource(source) {
+		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source)))}
+	}
+
+	target := in.Target
+	if len(in.RequiredCapabilities) > 0 {
+		if h == nil || h.directory == nil {
+			return wakeSetup{refusal: &WakeOutput{
+				Delivery: DeliveryUnsupported,
+				OK:       false,
+				Source:   source,
+				Executor: in.Executor,
+				Reason:   "wake: no agent directory configured for capability selection",
+				Woke:     in.Woke,
+			}}
+		}
+		selected, ok := selectAgentByCapabilities(h.directory.CandidateAgents(ctx), in.RequiredCapabilities)
+		if !ok {
+			return wakeSetup{refusal: &WakeOutput{
+				Delivery: DeliveryUnsupported,
+				OK:       false,
+				Source:   source,
+				Executor: in.Executor,
+				Reason:   "wake: no session declares the required capabilities",
+				Woke:     in.Woke,
+			}}
+		}
+		target = selected
+	}
+	if target == "" {
+		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no capabilities are requested")}
+	}
+	return wakeSetup{target: target, source: source}
+}
+
+// isSuccessDelivery reports whether a delivery value is one of the two honest
+// success modes of ADR 0026. Any other value, including interrupted, is not a
+// delivery the fallback chain may treat as done.
+func isSuccessDelivery(delivery Delivery) bool {
+	return delivery == DeliverySteer || delivery == DeliveryQueue
 }
 
 // Wake performs one delivery and returns an honest receipt. Input is validated
@@ -261,78 +421,123 @@ func (h *WakeHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 // Required capabilities are resolved through the directory into a delivery
 // target (ADR 0037 p1); without them the explicit Target still applies.
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
-	if in.HasPendingQuestion || in.PendingApproval {
-		return interruptedWake(in), nil
+	setup := h.prepareWake(ctx, in)
+	if setup.err != nil {
+		return WakeOutput{}, setup.err
 	}
-	if in.Text == "" {
-		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wake: text is required")
-	}
-	source := normalizeSource(in.Source)
-	if !validSource(source) {
-		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source)))
-	}
-
-	target := in.Target
-	if len(in.RequiredCapabilities) > 0 {
-		if h == nil || h.directory == nil {
-			return WakeOutput{
-				Delivery: DeliveryUnsupported,
-				OK:       false,
-				Source:   source,
-				Executor: in.Executor,
-				Reason:   "wake: no agent directory configured for capability selection",
-				Woke:     in.Woke,
-			}, nil
-		}
-		selected, ok := selectAgentByCapabilities(h.directory.CandidateAgents(ctx), in.RequiredCapabilities)
-		if !ok {
-			return WakeOutput{
-				Delivery: DeliveryUnsupported,
-				OK:       false,
-				Source:   source,
-				Executor: in.Executor,
-				Reason:   "wake: no session declares the required capabilities",
-				Woke:     in.Woke,
-			}, nil
-		}
-		target = selected
-	}
-	if target == "" {
-		return WakeOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wake: target is required when no capabilities are requested")
+	if setup.refusal != nil {
+		return *setup.refusal, nil
 	}
 
 	if h == nil || h.sender == nil {
 		return WakeOutput{
 			Delivery: DeliveryUnsupported,
 			OK:       false,
-			Source:   source,
+			Source:   setup.source,
 			Executor: in.Executor,
 			Reason:   "wake: no delivery sender configured",
 			Woke:     in.Woke,
 		}, nil
 	}
 
-	delivery, reason := h.sender.Deliver(ctx, target, in.Text, source)
+	delivery, reason := h.sender.Deliver(ctx, setup.target, in.Text, setup.source)
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
-		return WakeOutput{Delivery: delivery, OK: true, Source: source, Executor: in.Executor, Woke: in.Woke}, nil
+		return WakeOutput{Delivery: delivery, OK: true, Source: setup.source, Executor: in.Executor, Woke: in.Woke}, nil
 	case DeliveryUnsupported:
 		if reason == "" {
 			reason = "wake: delivery to an open session is not supported"
 		}
-		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: source, Executor: in.Executor, Reason: reason, Woke: in.Woke}, nil
+		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: setup.source, Executor: in.Executor, Reason: reason, Woke: in.Woke}, nil
 	default:
 		// An unknown value is never promoted to success. Report it as an
 		// unsupported delivery with a reason so the caller can branch safely.
 		return WakeOutput{
 			Delivery: DeliveryUnsupported,
 			OK:       false,
-			Source:   source,
+			Source:   setup.source,
 			Executor: in.Executor,
 			Reason:   fmt.Sprintf("wake: unknown delivery value %q", string(delivery)),
 			Woke:     in.Woke,
 		}, nil
 	}
+}
+
+// WakeWithFallback runs the ADR 0038 p6 chain after the same boundary checks as
+// Wake. The first confirmed channel wins. When no channel is confirmed the
+// message is written to the task trace and the honest delivery stays
+// unsupported; a trace is never reported as a delivery into the running turn.
+func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
+	setup := h.prepareWake(ctx, in)
+	if setup.err != nil {
+		return WakeOutput{}, setup.err
+	}
+	if setup.refusal != nil {
+		return *setup.refusal, nil
+	}
+	return h.runFallback(ctx, in, setup.target, setup.source), nil
+}
+
+// fallbackStage maps a requested channel to the stage recorded on the receipt.
+func fallbackStage(channel WakeChannel) FallbackStage {
+	if channel == ChannelSteer {
+		return FallbackSteer
+	}
+	return FallbackQueue
+}
+
+// runFallback walks steer then queue. A channel that is unsupported or that
+// delivered without a confirmation moves the chain forward. Only a confirmed
+// delivery returns OK=true; exhausting both channels writes the task trace and
+// returns DeliveryUnsupported with Traced reporting the separate fact.
+func (h *WakeHandler) runFallback(ctx context.Context, in WakeInput, target string, source WakeSource) WakeOutput {
+	base := WakeOutput{Source: source, Executor: in.Executor, Woke: in.Woke}
+	outcomes := ""
+	record := func(outcome string) {
+		if outcomes != "" {
+			outcomes += "; "
+		}
+		outcomes += outcome
+	}
+	for _, channel := range []WakeChannel{ChannelSteer, ChannelQueue} {
+		delivery, reason := DeliveryUnsupported, "wake: no fallback sender configured"
+		if h != nil && h.fallbackSender != nil {
+			delivery, reason = h.fallbackSender.Deliver(ctx, target, in.Text, source, channel)
+		}
+		if !isSuccessDelivery(delivery) {
+			if reason == "" {
+				reason = "wake: channel " + string(channel) + " is not supported by the environment"
+			}
+			record(string(channel) + " unsupported: " + reason)
+			continue
+		}
+		confirmed := h != nil && h.confirmer != nil && h.confirmer.Confirmed(ctx, target, in.Text, channel)
+		if confirmed {
+			out := base
+			out.Delivery = delivery
+			out.OK = true
+			out.Fallback = fallbackStage(channel)
+			return out
+		}
+		record(string(channel) + " delivered but not confirmed")
+	}
+
+	out := base
+	out.Delivery = DeliveryUnsupported
+	out.OK = false
+	out.Fallback = FallbackTraced
+	reason := "wake: fallback exhausted (" + outcomes + "); follow-up written to task trace for retry"
+	if h == nil || h.tracer == nil {
+		out.Reason = reason + ", but no task tracer is configured"
+		return out
+	}
+	if err := h.tracer.Trace(ctx, target, in.Text, source); err != nil {
+		out.Reason = reason + ", task trace failed: " + err.Error()
+		return out
+	}
+	out.Traced = true
+	out.Reason = reason
+	return out
 }
 
 // interruptedWake builds the ADR 0028 interruption receipt. It never touches
@@ -368,7 +573,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
