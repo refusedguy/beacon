@@ -1161,3 +1161,147 @@ func TestEnqueueFencedRejectsInvalidInput(t *testing.T) {
 		t.Errorf("receipt count = %d, want 0 after rejected inputs", count)
 	}
 }
+
+// ADR 0058 §3. Checking the agent's own claims against git, test reports and
+// CI. These tests assert what a caller observes: a verdict and the exact
+// evidence that decided it, never the agent's words.
+
+func TestCheckClaimConfirmedByEachSource(t *testing.T) {
+	sources := []ClaimSourceKind{ClaimSourceTest, ClaimSourceCIRun, ClaimSourceGitFact}
+	for _, kind := range sources {
+		t.Run(string(kind), func(t *testing.T) {
+			evidence := ClaimEvidence{Kind: kind, Ref: "ref-" + string(kind), Observed: true, Passed: true}
+			claim := AgentClaim{ID: "c", Text: "I passed the check", Evidence: []ClaimEvidence{evidence}}
+			got := CheckClaim(claim)
+			if got.ClaimID != "c" || got.Verdict != ClaimConfirmed {
+				t.Fatalf("CheckClaim = %+v, want CONFIRMED for c", got)
+			}
+			if got.Evidence != evidence {
+				t.Fatalf("deciding evidence = %+v, want %+v", got.Evidence, evidence)
+			}
+		})
+	}
+}
+
+func TestCheckClaimFailedEvidenceRefutesEvenWithPass(t *testing.T) {
+	failed := ClaimEvidence{Kind: ClaimSourceCIRun, Ref: "run-1", Observed: true, Passed: false}
+	passed := ClaimEvidence{Kind: ClaimSourceTest, Ref: "test-1", Observed: true, Passed: true}
+	claim := AgentClaim{ID: "c", Text: "CI is green", Evidence: []ClaimEvidence{passed, failed}}
+	got := CheckClaim(claim)
+	if got.Verdict != ClaimRefuted {
+		t.Fatalf("verdict = %q, want REFUTED", got.Verdict)
+	}
+	if got.Evidence != failed {
+		t.Fatalf("deciding evidence = %+v, want the failed observation %+v", got.Evidence, failed)
+	}
+}
+
+func TestCheckClaimUnverifiableWithoutObservedEvidence(t *testing.T) {
+	cases := []struct {
+		name     string
+		evidence []ClaimEvidence
+	}{
+		{"no evidence", nil},
+		{"unobserved", []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "t", Observed: false, Passed: true}}},
+		{"unknown source", []ClaimEvidence{{Kind: ClaimSourceKind("log"), Ref: "x", Observed: true, Passed: true}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := CheckClaim(AgentClaim{ID: "c", Text: "anything", Evidence: tc.evidence})
+			if got.Verdict != ClaimUnverifiable {
+				t.Fatalf("verdict = %q, want UNVERIFIABLE", got.Verdict)
+			}
+			if got.Evidence != (ClaimEvidence{}) {
+				t.Fatalf("evidence = %+v, want zero value", got.Evidence)
+			}
+		})
+	}
+}
+
+func TestCheckClaimTextNeverDecidesVerdict(t *testing.T) {
+	evidence := []ClaimEvidence{{Kind: ClaimSourceGitFact, Ref: "abc123", Observed: true, Passed: true}}
+	modest := CheckClaim(AgentClaim{ID: "c", Text: "maybe", Evidence: evidence})
+	bold := CheckClaim(AgentClaim{ID: "c", Text: "absolutely proven, trust me", Evidence: evidence})
+	if modest.Verdict != bold.Verdict || modest.Evidence != bold.Evidence {
+		t.Fatalf("claim text changed the result: %+v vs %+v", modest, bold)
+	}
+}
+
+func TestCheckClaimsKeepsInputOrder(t *testing.T) {
+	claims := []AgentClaim{
+		{ID: "a", Evidence: []ClaimEvidence{{Kind: ClaimSourceTest, Observed: true, Passed: true}}},
+		{ID: "b", Evidence: []ClaimEvidence{{Kind: ClaimSourceTest, Observed: true, Passed: false}}},
+		{ID: "c"},
+	}
+	got := CheckClaims(claims)
+	want := []ClaimVerdict{ClaimConfirmed, ClaimRefuted, ClaimUnverifiable}
+	if len(got) != len(want) {
+		t.Fatalf("len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ClaimID != claims[i].ID || got[i].Verdict != want[i] {
+			t.Errorf("result %d = %+v, want %s/%s", i, got[i], claims[i].ID, want[i])
+		}
+	}
+}
+
+func TestSaveClaimsAndClaimResults(t *testing.T) {
+	d := newReceiptDB(t)
+	claims := []AgentClaim{
+		{ID: "b", Text: "CI failed", Evidence: []ClaimEvidence{{Kind: ClaimSourceCIRun, Ref: "run-9", Observed: true, Passed: false}}},
+		{ID: "a", Text: "tests pass", Evidence: []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "go test", Observed: true, Passed: true}}},
+		{ID: "c", Text: "no proof"},
+	}
+	if err := d.SaveClaims(claims); err != nil {
+		t.Fatalf("SaveClaims: %v", err)
+	}
+	got, err := d.ClaimResults()
+	if err != nil {
+		t.Fatalf("ClaimResults: %v", err)
+	}
+	want := []ClaimResult{
+		{ClaimID: "a", Verdict: ClaimConfirmed, Evidence: claims[1].Evidence[0]},
+		{ClaimID: "b", Verdict: ClaimRefuted, Evidence: claims[0].Evidence[0]},
+		{ClaimID: "c", Verdict: ClaimUnverifiable},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ClaimResults = %+v, want %+v", got, want)
+	}
+}
+
+func TestSaveClaimsUpsertById(t *testing.T) {
+	d := newReceiptDB(t)
+	pass := []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "t1", Observed: true, Passed: true}}
+	fail := []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "t1", Observed: true, Passed: false}}
+	if err := d.SaveClaims([]AgentClaim{{ID: "c", Text: "first", Evidence: pass}}); err != nil {
+		t.Fatalf("first SaveClaims: %v", err)
+	}
+	if err := d.SaveClaims([]AgentClaim{{ID: "c", Text: "second", Evidence: fail}}); err != nil {
+		t.Fatalf("second SaveClaims: %v", err)
+	}
+	got, err := d.ClaimResults()
+	if err != nil {
+		t.Fatalf("ClaimResults: %v", err)
+	}
+	if len(got) != 1 || got[0].Verdict != ClaimRefuted || got[0].Evidence != fail[0] {
+		t.Fatalf("ClaimResults = %+v, want one REFUTED from the second save", got)
+	}
+}
+
+func TestSaveClaimsRejectsEmptyID(t *testing.T) {
+	d := newReceiptDB(t)
+	if err := d.SaveClaims([]AgentClaim{{ID: "  ", Text: "no id"}}); err == nil {
+		t.Fatal("SaveClaims succeeded with an empty id, want validation error")
+	}
+}
+
+func TestClaimResultsEmptyBeforeFirstSave(t *testing.T) {
+	d := newReceiptDB(t)
+	got, err := d.ClaimResults()
+	if err != nil {
+		t.Fatalf("ClaimResults on empty table: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ClaimResults = %+v, want empty", got)
+	}
+}
