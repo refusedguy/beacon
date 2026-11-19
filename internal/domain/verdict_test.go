@@ -496,3 +496,85 @@ func TestConflictResultEmpty(t *testing.T) {
 		t.Fatal("a result with a type is not empty")
 	}
 }
+
+// TestReviewVerdictConstants pins the canonical journal spellings from ADR
+// 0038 §4. Changing one would break the recorded verdict contract.
+func TestReviewVerdictConstants(t *testing.T) {
+	cases := []struct {
+		v    ReviewVerdict
+		want string
+	}{
+		{ReviewShip, "SHIP"},
+		{ReviewFixFirst, "FIX-FIRST"},
+		{ReviewBlocked, "BLOCKED"},
+	}
+	for _, tc := range cases {
+		if string(tc.v) != tc.want {
+			t.Errorf("verdict = %q, want %q", tc.v, tc.want)
+		}
+	}
+}
+
+func TestReviewVerdictValid(t *testing.T) {
+	cases := []struct {
+		name string
+		v    ReviewVerdict
+		want bool
+	}{
+		{"ship", ReviewShip, true},
+		{"fix-first", ReviewFixFirst, true},
+		{"blocked", ReviewBlocked, true},
+		{"zero value", ReviewVerdict(""), false},
+		{"unknown", ReviewVerdict("MAYBE"), false},
+		{"lowercase is not canonical", ReviewVerdict("ship"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.v.Valid(); got != tc.want {
+				t.Fatalf("Valid(%q) = %v, want %v", tc.v, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseReviewVerdict(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     string
+		want   ReviewVerdict
+		wantOK bool
+	}{
+		{"ship", "SHIP", ReviewShip, true},
+		{"fix-first", "FIX-FIRST", ReviewFixFirst, true},
+		{"blocked", "BLOCKED", ReviewBlocked, true},
+		{"surrounding whitespace", "  FIX-FIRST\n", ReviewFixFirst, true},
+		{"empty", "", "", false},
+		{"whitespace only", "   ", "", false},
+		{"unknown", "APPROVE", "", false},
+		{"lowercase is not canonical", "ship", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseReviewVerdict(tc.in)
+			if ok != tc.wantOK || got != tc.want {
+				t.Fatalf("ParseReviewVerdict(%q) = (%q, %v), want (%q, %v)",
+					tc.in, got, ok, tc.want, tc.wantOK)
+			}
+			if ok && !got.Valid() {
+				t.Fatalf("accepted verdict %q must be valid", got)
+			}
+		})
+	}
+}
+
+// TestReviewVerdictJSON records that the verdict serializes to its canonical
+// string, which is the form written to the journal.
+func TestReviewVerdictJSON(t *testing.T) {
+	b, err := json.Marshal(ReviewBlocked)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(b) != `"BLOCKED"` {
+		t.Fatalf("json = %s, want %q", b, `"BLOCKED"`)
+	}
+}

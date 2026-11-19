@@ -256,3 +256,41 @@ func NewConflictResult(typ ConflictType, paths []string, message string) Conflic
 func (c ConflictResult) Empty() bool {
 	return c.Type == "" && len(c.Paths) == 0 && c.Message == ""
 }
+
+// ReviewVerdict is the outcome an independent reviewer returns at the review
+// gate (ADR 0038 §4). It is a separate concept from Verdict: Verdict is what CI
+// evaluation observed for one Watch revision, while ReviewVerdict is the
+// reviewer's decision on whether the code may ship. The three canonical string
+// values are also the journal form, so a verdict can be recorded verbatim.
+type ReviewVerdict string
+
+const (
+	// ReviewShip passes the gate; the task may complete.
+	ReviewShip ReviewVerdict = "SHIP"
+	// ReviewFixFirst returns the task to the executor for changes.
+	ReviewFixFirst ReviewVerdict = "FIX-FIRST"
+	// ReviewBlocked stops the task with a reason.
+	ReviewBlocked ReviewVerdict = "BLOCKED"
+)
+
+// Valid reports whether v is one of the three defined review verdicts. Any
+// other value, including the zero value, fails the gate rather than passing it.
+func (v ReviewVerdict) Valid() bool {
+	switch v {
+	case ReviewShip, ReviewFixFirst, ReviewBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseReviewVerdict converts an external verdict string into a ReviewVerdict.
+// Surrounding whitespace is trimmed, but the canonical spelling is otherwise
+// exact. An unknown value is rejected so it cannot silently pass the gate.
+func ParseReviewVerdict(s string) (ReviewVerdict, bool) {
+	v := ReviewVerdict(strings.TrimSpace(s))
+	if !v.Valid() {
+		return "", false
+	}
+	return v, true
+}
