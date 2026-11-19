@@ -25,12 +25,20 @@ function field(name) {
 }
 
 // Разбирает строки вида "- action: X" / "resource: Y" / "effect: Z".
+function unquote(value) {
+  return value.replace(/^["']|["']$/g, "")
+}
+
 function rules() {
   const found = []
   const pattern = /-\s*action:\s*(\S+)\s*\r?\n\s*resource:\s*(\S+)\s*\r?\n\s*effect:\s*(\S+)/g
   let match
   while ((match = pattern.exec(frontmatter())) !== null) {
-    found.push({ action: match[1], resource: match[2], effect: match[3] })
+    found.push({
+      action: unquote(match[1]),
+      resource: unquote(match[2]),
+      effect: unquote(match[3]),
+    })
   }
   return found
 }
