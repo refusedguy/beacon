@@ -10,6 +10,14 @@
 // it never shares a slot with the task-start key of ADR 0031. The raw key comes
 // from the caller; the namespace is applied here, at the tool boundary.
 //
+// ADR 0037 p5 adds a fencing token to each claim. Every assignment, including a
+// reassignment after a daemon restart, issues a monotonically higher token. A
+// worker presents that token before changing a task (here: releasing the claim),
+// and a token older than the one the task currently holds is refused. A lagging
+// worker whose lease was reassigned cannot change the new state. The fencing
+// token is a lease number, distinct from the task revision of T3.45 and from
+// the event.id of ADR 0034.
+//
 // Ownership lives in an in-memory store guarded by one mutex. The whole
 // check-then-set runs under that lock, so concurrent claims of one task have a
 // single winner. Wiring this store to the durable task store is a separate
@@ -19,6 +27,8 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 
@@ -50,18 +60,26 @@ type ClaimInput struct {
 
 // ClaimOutput is the claim held after the call. IdempotencyKey echoes the
 // namespaced key produced by domain.IdempotencyKey, so a caller can trace the
-// claim to the exact request that created it.
+// claim to the exact request that created it. FencingToken is the lease number
+// of this assignment (ADR 0037 p5); the worker must present it to change the
+// task, and a newer assignment makes it stale.
 type ClaimOutput struct {
 	TaskID         string `json:"taskID"`
 	OwnerID        string `json:"ownerID"`
 	IdempotencyKey string `json:"idempotencyKey"`
+	FencingToken   uint64 `json:"fencingToken"`
 }
 
 // ReleaseInput is the argument object of beacon_release. It names the task and
 // the owner giving it up; only the current owner can release a claim.
+// FencingToken is the lease number returned by the claim. Zero means the caller
+// did not pin a lease, so no staleness check is made (the same convention as a
+// zero revision in T3.45). A token that differs from the task's current one is
+// refused, so a worker whose lease was reassigned cannot release it.
 type ReleaseInput struct {
-	TaskID  string `json:"taskID" jsonschema:"identifier of the task being released"`
-	OwnerID string `json:"ownerID" jsonschema:"identifier of the current owner releasing the task"`
+	TaskID       string `json:"taskID" jsonschema:"identifier of the task being released"`
+	OwnerID      string `json:"ownerID" jsonschema:"identifier of the current owner releasing the task"`
+	FencingToken uint64 `json:"fencingToken,omitempty" jsonschema:"lease token from beacon_claim; an older token is refused; zero skips the check"`
 }
 
 // ReleaseOutput confirms which owner gave the task up.
@@ -70,21 +88,44 @@ type ReleaseOutput struct {
 	OwnerID string `json:"ownerID"`
 }
 
+// FencingTokenError reports a mutation whose fencing token is no longer the one
+// the task holds. The task was reassigned to a newer lease, so the change is
+// discarded before any state is touched (ADR 0037 p5).
+type FencingTokenError struct {
+	Presented uint64
+	Current   uint64
+}
+
+func (e *FencingTokenError) Error() string {
+	return fmt.Sprintf("claim: fencing token %d is stale, task was reassigned at token %d", e.Presented, e.Current)
+}
+
+// IsStaleFencingToken reports whether err is a stale fencing-token rejection.
+func IsStaleFencingToken(err error) bool {
+	var stale *FencingTokenError
+	return errors.As(err, &stale)
+}
+
 // claimRecord is one held task. Key is the namespaced idempotency key that
 // created the claim; it is the identity of the operation, not of the task.
+// Token is the fencing token of this lease (ADR 0037 p5).
 type claimRecord struct {
 	taskID  string
 	ownerID string
 	key     string
+	token   uint64
 }
 
 // claimStore holds the single owner of each task and the operation that claimed
 // it. Both maps change under one lock, so a task can never have two owners and
-// a key can never name two different claims.
+// a key can never name two different claims. nextToken is a store-wide counter:
+// every assignment takes the next value, so tokens are strictly monotonic even
+// across release and reassignment.
 type claimStore struct {
-	mu     sync.Mutex
-	byTask map[string]string      // taskID -> namespaced key of its current claim
-	byKey  map[string]claimRecord // namespaced key -> claim that used it
+	mu        sync.Mutex
+	byTask    map[string]string      // taskID -> namespaced key of its current claim
+	byKey     map[string]claimRecord // namespaced key -> claim that used it
+	nextToken uint64
 }
 
 func newClaimStore() *claimStore {
@@ -94,10 +135,18 @@ func newClaimStore() *claimStore {
 	}
 }
 
+// nextFencingToken returns the next strictly increasing lease number. It is
+// called with the store lock held.
+func (s *claimStore) nextFencingToken() uint64 {
+	s.nextToken++
+	return s.nextToken
+}
+
 // claim is the atomic boundary of ADR 0032 p4. A repeated key with the same
 // task and owner returns the existing claim. Every other request for a held
 // task is rejected, whether it comes from another owner or reuses a key from a
-// different operation. A free task can be claimed once.
+// different operation. A free task can be claimed once. A new claim issues a
+// fresh fencing token.
 func (s *claimStore) claim(taskID, ownerID, rawKey string) (ClaimOutput, error) {
 	key := domain.IdempotencyKey(claimNamespace, rawKey)
 
@@ -117,15 +166,48 @@ func (s *claimStore) claim(taskID, ownerID, rawKey string) (ClaimOutput, error) 
 			"claim: idempotency key " + strconv.Quote(key) + " already owns task " + strconv.Quote(rec.taskID))
 	}
 
-	rec := claimRecord{taskID: taskID, ownerID: ownerID, key: key}
+	rec := claimRecord{taskID: taskID, ownerID: ownerID, key: key, token: s.nextFencingToken()}
 	s.byKey[key] = rec
 	s.byTask[taskID] = key
 	return claimOutput(rec), nil
 }
 
-// release removes the claim only when the named owner holds the task. A
-// different owner cannot give up someone else's task.
-func (s *claimStore) release(taskID, ownerID string) (ReleaseOutput, error) {
+// reassign hands a task to a new owner and issues a fresh, strictly higher
+// fencing token. It models the daemon restart of ADR 0037 p5: the old lease is
+// replaced, so any token the previous owner holds becomes stale. A retry naming
+// the same owner and key returns the same token, so a retried reassignment does
+// not invalidate the worker it just installed. The single owner invariant is
+// preserved, one task still has exactly one record.
+func (s *claimStore) reassign(taskID, ownerID, rawKey string) (ClaimOutput, error) {
+	key := domain.IdempotencyKey(claimNamespace, rawKey)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if rec, used := s.byKey[key]; used && rec.taskID != taskID {
+		return ClaimOutput{}, claimConflict(
+			"claim: idempotency key " + strconv.Quote(key) + " already owns task " + strconv.Quote(rec.taskID))
+	}
+	if current, held := s.byTask[taskID]; held {
+		rec := s.byKey[current]
+		if rec.key == key && rec.ownerID == ownerID {
+			return claimOutput(rec), nil
+		}
+		delete(s.byKey, current)
+	}
+
+	rec := claimRecord{taskID: taskID, ownerID: ownerID, key: key, token: s.nextFencingToken()}
+	s.byKey[key] = rec
+	s.byTask[taskID] = key
+	return claimOutput(rec), nil
+}
+
+// release removes the claim only when the named owner holds the task and the
+// presented fencing token is the one the task still holds. A different owner
+// cannot give up someone else's task, and a stale token cannot change a task
+// that was reassigned since the caller claimed it. Token 0 skips the check, so
+// callers that do not pin a lease keep the T3.27 release contract.
+func (s *claimStore) release(taskID, ownerID string, token uint64) (ReleaseOutput, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -133,7 +215,11 @@ func (s *claimStore) release(taskID, ownerID string) (ReleaseOutput, error) {
 	if !held {
 		return ReleaseOutput{}, claimConflict("claim: task " + strconv.Quote(taskID) + " is not claimed")
 	}
-	if rec := s.byKey[key]; rec.ownerID != ownerID {
+	rec := s.byKey[key]
+	if token != 0 && token != rec.token {
+		return ReleaseOutput{}, &FencingTokenError{Presented: token, Current: rec.token}
+	}
+	if rec.ownerID != ownerID {
 		return ReleaseOutput{}, claimConflict(
 			"claim: task " + strconv.Quote(taskID) + " is owned by " + strconv.Quote(rec.ownerID) +
 				", not " + strconv.Quote(ownerID))
@@ -145,7 +231,12 @@ func (s *claimStore) release(taskID, ownerID string) (ReleaseOutput, error) {
 }
 
 func claimOutput(rec claimRecord) ClaimOutput {
-	return ClaimOutput{TaskID: rec.taskID, OwnerID: rec.ownerID, IdempotencyKey: rec.key}
+	return ClaimOutput{
+		TaskID:         rec.taskID,
+		OwnerID:        rec.ownerID,
+		IdempotencyKey: rec.key,
+		FencingToken:   rec.token,
+	}
 }
 
 // claimConflict has the 409 status of other conflicts. It uses the duplicate
@@ -188,6 +279,17 @@ func (h *ClaimHandler) HandleRelease(ctx context.Context, _ *mcpsdk.CallToolRequ
 	return &mcpsdk.CallToolResult{}, out, nil
 }
 
+// HandleReassign adapts Reassign to the go-sdk typed tool handler signature.
+// It is deliberately not registered as a tool: reassignment is a daemon
+// decision, not a client-facing call, and the seven default tools stay seven.
+func (h *ClaimHandler) HandleReassign(ctx context.Context, _ *mcpsdk.CallToolRequest, in ClaimInput) (*mcpsdk.CallToolResult, ClaimOutput, error) {
+	out, err := h.Reassign(ctx, in)
+	if err != nil {
+		return nil, ClaimOutput{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
 // Claim validates the request at the boundary, then takes the atomic claim.
 func (h *ClaimHandler) Claim(_ context.Context, in ClaimInput) (ClaimOutput, error) {
 	if in.TaskID == "" || in.OwnerID == "" || in.IdempotencyKey == "" {
@@ -200,8 +302,23 @@ func (h *ClaimHandler) Claim(_ context.Context, in ClaimInput) (ClaimOutput, err
 	return h.store.claim(in.TaskID, in.OwnerID, in.IdempotencyKey)
 }
 
+// Reassign hands a task to a new owner with a higher fencing token. It models a
+// daemon restart that moves a task to a fresh lease; every token issued before
+// it becomes stale. It is not registered as a client tool.
+func (h *ClaimHandler) Reassign(_ context.Context, in ClaimInput) (ClaimOutput, error) {
+	if in.TaskID == "" || in.OwnerID == "" || in.IdempotencyKey == "" {
+		return ClaimOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"claim: taskID, ownerID and idempotencyKey are required")
+	}
+	if h == nil || h.store == nil {
+		return ClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, "claim: no claim store configured")
+	}
+	return h.store.reassign(in.TaskID, in.OwnerID, in.IdempotencyKey)
+}
+
 // Release validates the request at the boundary, then frees the claim. Only the
-// current owner can release; the task can be claimed again afterwards.
+// current owner can release, and if a fencing token is pinned it must still be
+// the one the task holds. The task can be claimed again afterwards.
 func (h *ClaimHandler) Release(_ context.Context, in ReleaseInput) (ReleaseOutput, error) {
 	if in.TaskID == "" || in.OwnerID == "" {
 		return ReleaseOutput{}, domain.NewAppError(domain.CodeInvalidInput,
@@ -210,7 +327,7 @@ func (h *ClaimHandler) Release(_ context.Context, in ReleaseInput) (ReleaseOutpu
 	if h == nil || h.store == nil {
 		return ReleaseOutput{}, domain.NewAppError(domain.CodePersistFailed, "claim: no claim store configured")
 	}
-	return h.store.release(in.TaskID, in.OwnerID)
+	return h.store.release(in.TaskID, in.OwnerID, in.FencingToken)
 }
 
 // AttachClaim registers both claim tools on a server. NewServer keeps its
@@ -225,7 +342,7 @@ func AttachClaim(server *mcpsdk.Server, handler *ClaimHandler) {
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ClaimToolName,
-		Description: "Claim one task so exactly one owner holds it. A retry with the same idempotencyKey returns the same claim; a second owner is rejected until the first calls beacon_release.",
+		Description: "Claim one task so exactly one owner holds it. A retry with the same idempotencyKey returns the same claim and the same fencingToken; a second owner is rejected until the first calls beacon_release. Present fencingToken to beacon_release so a reassigned task cannot be changed by a stale owner.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  true,
@@ -234,7 +351,7 @@ func AttachClaim(server *mcpsdk.Server, handler *ClaimHandler) {
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ReleaseToolName,
-		Description: "Explicitly release a task claim. Only the current owner can release; another owner may claim the task afterwards.",
+		Description: "Explicitly release a task claim. Only the current owner can release; a fencingToken that is stale because the task was reassigned is refused. Another owner may claim the task afterwards.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
