@@ -705,3 +705,160 @@ func TestRetryJitterWithinBounds(t *testing.T) {
 		}
 	}
 }
+
+func addReview(t *testing.T, l *Ladder, taskID string, reviews ...string) {
+	t.Helper()
+	for _, id := range reviews {
+		if err := l.AddReview(context.Background(), taskID, id); err != nil {
+			t.Fatalf("AddReview(%s): %v", id, err)
+		}
+	}
+}
+
+func TestQuorumCountsOnlyCompletedShipReviews(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	const task = "task-quorum-completed"
+	addReview(t, l, task, "r1", "r2", "r3")
+
+	// Only SHIP from a finished review is an approval marker. FIX-FIRST is a
+	// finished review but not an approval; the third review is still running.
+	if err := l.CompleteReview(ctx, task, "r1", ReviewShip); err != nil {
+		t.Fatalf("CompleteReview(ship): %v", err)
+	}
+	if err := l.CompleteReview(ctx, task, "r2", ReviewFixFirst); err != nil {
+		t.Fatalf("CompleteReview(fix-first): %v", err)
+	}
+
+	got, err := l.Quorum(ctx, task, 2)
+	if err != nil {
+		t.Fatalf("Quorum: %v", err)
+	}
+	if got.Result != QuorumPending || got.Approvals != 1 || got.MaxPossible != 2 {
+		t.Fatalf("quorum = %+v, want pending 1/2", got)
+	}
+
+	// The running review finishes with SHIP and reaches the threshold.
+	if err := l.CompleteReview(ctx, task, "r3", ReviewShip); err != nil {
+		t.Fatalf("CompleteReview(ship r3): %v", err)
+	}
+	got, err = l.Quorum(ctx, task, 2)
+	if err != nil {
+		t.Fatalf("Quorum: %v", err)
+	}
+	if got.Result != QuorumReached || got.Approvals != 2 || got.MaxPossible != 2 {
+		t.Fatalf("quorum = %+v, want reached 2/2", got)
+	}
+}
+
+func TestQuorumRejectsUnreachableAfterAborts(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	const task = "task-quorum-unreachable"
+	addReview(t, l, task, "r1", "r2", "r3")
+
+	if err := l.CompleteReview(ctx, task, "r1", ReviewShip); err != nil {
+		t.Fatalf("CompleteReview(ship): %v", err)
+	}
+	// Interrupted/incomplete/errored reviews yield no approval marker and are
+	// removed from the pool of approvals still possible.
+	if err := l.AbortReview(ctx, task, "r2"); err != nil {
+		t.Fatalf("AbortReview(r2): %v", err)
+	}
+	if err := l.AbortReview(ctx, task, "r3"); err != nil {
+		t.Fatalf("AbortReview(r3): %v", err)
+	}
+
+	got, err := l.Quorum(ctx, task, 3)
+	if err != nil {
+		t.Fatalf("Quorum: %v", err)
+	}
+	if got.Result != QuorumUnreachable || got.Approvals != 1 || got.MaxPossible != 1 {
+		t.Fatalf("quorum = %+v, want unreachable 1/3", got)
+	}
+}
+
+func TestQuorumBlockedVerdictIsNotAnApproval(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	const task = "task-quorum-blocked"
+	addReview(t, l, task, "r1", "r2")
+
+	if err := l.CompleteReview(ctx, task, "r1", ReviewShip); err != nil {
+		t.Fatalf("CompleteReview(ship): %v", err)
+	}
+	if err := l.CompleteReview(ctx, task, "r2", ReviewBlocked); err != nil {
+		t.Fatalf("CompleteReview(blocked): %v", err)
+	}
+
+	got, err := l.Quorum(ctx, task, 2)
+	if err != nil {
+		t.Fatalf("Quorum: %v", err)
+	}
+	if got.Result != QuorumUnreachable || got.Approvals != 1 || got.MaxPossible != 1 {
+		t.Fatalf("quorum = %+v, want unreachable: BLOCKED is not an approval", got)
+	}
+}
+
+func TestQuorumAddReviewIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	const task = "task-quorum-idempotent"
+
+	addReview(t, l, task, "r1")
+	if err := l.CompleteReview(ctx, task, "r1", ReviewShip); err != nil {
+		t.Fatalf("CompleteReview: %v", err)
+	}
+	addReview(t, l, task, "r1") // at-least-once caller must not reset the review
+
+	got, err := l.Quorum(ctx, task, 1)
+	if err != nil {
+		t.Fatalf("Quorum: %v", err)
+	}
+	if got.Result != QuorumReached || got.Approvals != 1 {
+		t.Fatalf("quorum = %+v, want reached with one approval after re-add", got)
+	}
+}
+
+func TestQuorumReviewValidation(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	const task = "task-quorum-validation"
+
+	if err := l.CompleteReview(ctx, task, "gone", ReviewShip); !errors.Is(err, ErrReviewNotRunning) {
+		t.Fatalf("CompleteReview(unknown) = %v, want ErrReviewNotRunning", err)
+	}
+	addReview(t, l, task, "r1")
+	if err := l.CompleteReview(ctx, task, "r1", "SHIP?"); !errors.Is(err, ErrInvalidReviewVerdict) {
+		t.Fatalf("CompleteReview(bogus) = %v, want ErrInvalidReviewVerdict", err)
+	}
+	if err := l.AbortReview(ctx, task, "r1"); err != nil {
+		t.Fatalf("AbortReview: %v", err)
+	}
+	if err := l.CompleteReview(ctx, task, "r1", ReviewShip); !errors.Is(err, ErrReviewNotRunning) {
+		t.Fatalf("CompleteReview(aborted) = %v, want ErrReviewNotRunning", err)
+	}
+	if _, err := l.Quorum(ctx, task, 0); !errors.Is(err, ErrInvalidThreshold) {
+		t.Fatalf("Quorum(0) = %v, want ErrInvalidThreshold", err)
+	}
+}
+
+func TestClassifyQuorumUnreachableTakesPriority(t *testing.T) {
+	reviews := []ReviewMarker{
+		{ReviewID: "a", State: ReviewDone, Verdict: ReviewShip},
+		{ReviewID: "b", State: ReviewAborted},
+		{ReviewID: "c", State: ReviewDone, Verdict: ReviewFixFirst},
+	}
+	got, err := classifyQuorum(reviews, 2)
+	if err != nil {
+		t.Fatalf("classifyQuorum: %v", err)
+	}
+	if got.Result != QuorumUnreachable || got.Approvals != 1 || got.MaxPossible != 1 || got.Threshold != 2 {
+		t.Fatalf("quorum = %+v, want unreachable 1/2", got)
+	}
+}
