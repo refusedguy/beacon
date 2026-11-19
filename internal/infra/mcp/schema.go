@@ -134,12 +134,47 @@ var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_watch_pr":    func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
 	"beacon_wait_result": func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
 	"beacon_get_result":  func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
-	"beacon_list_running": func() (*jsonschema.Schema, error) {
-		return OutputSchema[ListRunningOutput]()
-	},
+	"beacon_list_running": listRunningOutputSchema,
 	"beacon_ack":          func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 	"beacon_stats":        func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
+}
+
+// nullableMap relaxes a reflected map schema to accept JSON null. A nil Go map
+// marshals to null, while reflection only infers "object", so the unadjusted
+// schema rejects perfectly valid handler output. Only the type is widened;
+// the schema of the map's values stays exactly the same.
+func nullableMap(s *jsonschema.Schema) {
+	if s == nil {
+		return
+	}
+	if s.Type == "object" {
+		s.Type = ""
+		s.Types = []string{"null", "object"}
+	}
+}
+
+// listRunningOutputSchema derives the list_running schema and accounts for the
+// nil maps in a fresh Watch: domain.FlakyConfig.Used has no per-check counters
+// and domain.Watch.Checks has no results yet, so the handler legitimately emits
+// null for both. Those two fields accept null or an object of the same value
+// types, nothing else.
+func listRunningOutputSchema() (*jsonschema.Schema, error) {
+	s, err := OutputSchema[ListRunningOutput]()
+	if err != nil {
+		return nil, err
+	}
+	watches := s.Properties["watches"]
+	if watches == nil || watches.Items == nil {
+		return s, nil
+	}
+	flaky := watches.Items.Properties["flaky"]
+	if flaky != nil {
+		nullableMap(flaky.Properties["used"])
+	}
+	// Checks is the other map on a Watch: an unexecuted Watch has no checks.
+	nullableMap(watches.Items.Properties["checks"])
+	return s, nil
 }
 
 // AllOutputSchemas returns the derived output schema of every tool, keyed by
