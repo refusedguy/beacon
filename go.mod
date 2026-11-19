@@ -3,6 +3,7 @@ module github.com/refusedguy/beacon
 go 1.26.0
 
 require (
+	github.com/google/go-github/v93 v93.0.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	modernc.org/sqlite v1.62.0
 	pgregory.net/rapid v1.3.0
@@ -10,6 +11,7 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
