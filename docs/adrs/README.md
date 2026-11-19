@@ -45,3 +45,4 @@
 | 0031 | Шесть фич из свежего отчёта Q | accepted |
 | 0032 | Четыре идеи из отчёта M-github для ночной смены | accepted |
 | 0033 | Три идеи из отчёта R-graft для ночной смены | accepted |
+| 0034 | Четыре фичи из отчёта M-web-orchestration-patterns | accepted |
