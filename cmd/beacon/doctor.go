@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const minGoVersion = "1.26.0"
@@ -23,9 +24,22 @@ type checkResult struct {
 }
 
 func (c *CLI) runDoctor(args []string) int {
+	flags, command := splitDoctorWatch(args)
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	if !parseFlags("doctor", args, c.errOut, fs) {
+	watch := fs.Bool("watch", false, "дешёвый watcher: внешняя проверка условия и wake по событию")
+	interval := fs.Duration("interval", 2*time.Second, "интервал внешней проверки условия")
+	session := fs.String("session", "", "сессия, для которой emit wake")
+	maxTicks := fs.Int("max-ticks", 0, "число проверок до останова, 0 без ограничения")
+	if !parseFlags("doctor", flags, c.errOut, fs) {
 		return 2
+	}
+	if *watch {
+		return c.runDoctorWatch(doctorWatchSpec{
+			check:    command,
+			session:  strings.TrimSpace(*session),
+			interval: *interval,
+			maxTicks: *maxTicks,
+		})
 	}
 
 	checks := []checkResult{c.checkGo(), c.checkGates(), c.checkStateDir()}
@@ -37,6 +51,118 @@ func (c *CLI) runDoctor(args []string) int {
 		}
 	}
 	if failed {
+		return 1
+	}
+	return 0
+}
+
+// splitDoctorWatch separates a trailing `-- <command...>` from doctor's own
+// flags. The command is the external, model-free condition check of the
+// watcher (ADR 0049 p1). Without `--` there is no command.
+func splitDoctorWatch(args []string) (flags, command []string) {
+	for i, arg := range args {
+		if arg == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	return args, nil
+}
+
+// doctorWatchSpec is one external watcher. check is an argv executed through
+// the CLI runner: exit 0 means the condition holds, exit 1 means it does not,
+// any other exit is an error. wake emits one event when the condition becomes
+// true; delivery of a follow-up stays with ADR 0026.
+type doctorWatchSpec struct {
+	check    []string
+	session  string
+	interval time.Duration
+	maxTicks int
+}
+
+type doctorCheck func() (met bool, detail string, err error)
+type doctorWake func(detail string) error
+
+// runDoctorWatcher checks an external condition without calling a model and
+// emits a wake only on a false-to-true edge. It has no retries, timers per
+// delivery or escalation, so it adds no step to the ADR 0017 ladder. sleep is
+// injected to keep tests off real time.
+func runDoctorWatcher(check doctorCheck, wake doctorWake, maxTicks int, sleep func()) (wakes, ticks int, err error) {
+	met := false
+	for maxTicks == 0 || ticks < maxTicks {
+		ticks++
+		now, detail, checkErr := check()
+		if checkErr != nil {
+			return wakes, ticks, checkErr
+		}
+		if now && !met {
+			if wakeErr := wake(detail); wakeErr != nil {
+				return wakes, ticks, wakeErr
+			}
+			wakes++
+		}
+		met = now
+		if maxTicks != 0 && ticks >= maxTicks {
+			break
+		}
+		sleep()
+	}
+	return wakes, ticks, nil
+}
+
+// runDoctorWatch wires the external check and the wake event to the CLI. The
+// event goes to stdout; the watcher never sends a prompt for the agent.
+func (c *CLI) runDoctorWatch(spec doctorWatchSpec) int {
+	if len(spec.check) == 0 {
+		fmt.Fprintln(c.errOut, "beacon doctor: для --watch нужна внешняя проверка: beacon doctor --watch -- <команда> [аргументы]")
+		writeUsage(c.errOut)
+		return 2
+	}
+	if spec.interval <= 0 {
+		fmt.Fprintf(c.errOut, "beacon doctor: интервал проверки должен быть положительным: %s\n", spec.interval)
+		return 2
+	}
+	if spec.maxTicks < 0 {
+		fmt.Fprintln(c.errOut, "beacon doctor: max-ticks не может быть отрицательным")
+		return 2
+	}
+
+	check := func() (bool, string, error) {
+		args := append([]string(nil), spec.check[1:]...)
+		res := c.run(c.root, spec.check[0], args, nil)
+		switch res.code {
+		case 0:
+			return true, strings.TrimSpace(string(res.stdout)), nil
+		case 1:
+			return false, "", nil
+		default:
+			reason := strings.TrimSpace(string(res.stderr))
+			if reason == "" {
+				reason = strings.TrimSpace(string(res.stdout))
+			}
+			if reason == "" {
+				reason = fmt.Sprintf("код выхода %d", res.code)
+			}
+			return false, "", fmt.Errorf("%s: %s", strings.Join(spec.check, " "), reason)
+		}
+	}
+	wake := func(detail string) error {
+		detail = strings.TrimSpace(detail)
+		if spec.session == "" {
+			fmt.Fprintf(c.out, "wake %s\n", detail)
+			return nil
+		}
+		fmt.Fprintf(c.out, "wake session=%s %s\n", spec.session, detail)
+		return nil
+	}
+	sleep := func() { time.Sleep(spec.interval) }
+
+	wakes, ticks, err := runDoctorWatcher(check, wake, spec.maxTicks, sleep)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon doctor watch: %v\n", err)
+		return 2
+	}
+	if spec.maxTicks > 0 && wakes == 0 {
+		fmt.Fprintf(c.errOut, "beacon doctor watch: условие не стало истинным за %d проверок\n", ticks)
 		return 1
 	}
 	return 0
