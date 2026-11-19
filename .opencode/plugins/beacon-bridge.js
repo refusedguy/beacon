@@ -80,10 +80,18 @@ const adapterCases = [
     name: "ноль импортов SDK хоста, только встроенные модули Node",
     check(assert) {
       const source = readFileSync(SELF_PATH, "utf8")
-      // Префикс собран из частей, чтобы сам тест не содержал запрещённый литерал.
+      // Иглы собраны из частей: буквальные подстроки для поиска попали бы
+      // под регулярное выражение ниже и дали ложный specifier.
       const sdkPrefix = ["@open", "code/"].join("")
-      assert.equal(source.includes(`from "${sdkPrefix}`), false)
-      assert.equal(source.includes(`require("${sdkPrefix}`), false)
+      const sp = String.fromCharCode(32)
+      const quotes = [String.fromCharCode(34), String.fromCharCode(39)]
+      const needles = quotes.flatMap((q) => [
+        ["fro", "m", sp, q].join("") + sdkPrefix,
+        ["requ", "ire", "(", q].join("") + sdkPrefix,
+      ])
+      for (const needle of needles) {
+        assert.equal(source.includes(needle), false)
+      }
       const imports = [...source.matchAll(/(?:from\s+|import\s*\(|require\s*\()["']([^"']+)["']/g)]
         .map((match) => match[1])
       assert.ok(imports.length > 0)
