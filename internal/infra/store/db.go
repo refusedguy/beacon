@@ -672,6 +672,228 @@ func (d *DB) JournalRecords(ctx context.Context, taskID string) ([]JournalRecord
 	return out, rows.Err()
 }
 
+// inboxStatePending is a stored message that is available for delivery.
+const (
+	inboxStatePending  = "pending"
+	inboxStateInflight = "inflight"
+)
+
+// createInboxSQL owns the durable inbox from ADR 0039 §6. Like task_starts and
+// task_journal, the table is created on first use: the card owns only db.go and
+// db_test.go, so no migration file is added for it.
+var createInboxSQL = []string{
+	`CREATE TABLE IF NOT EXISTS inbox_messages (
+	   key           TEXT PRIMARY KEY,
+	   watch_id      TEXT NOT NULL,
+	   revision      INTEGER NOT NULL,
+	   subscriber_id TEXT NOT NULL,
+	   peer_name     TEXT NOT NULL,
+	   payload       BLOB NOT NULL,
+	   state         TEXT NOT NULL,
+	   lease_until   INTEGER NOT NULL DEFAULT 0,
+	   created_at    INTEGER NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS inbox_by_peer_state ON inbox_messages(peer_name, state)`,
+}
+
+// InboxMessage is one durable message for a called session's inbox. Its
+// delivery key is derived from watchID, revision and subscriberID (ADR 0039 §6),
+// so a redelivery of the same logical message cannot create a second row.
+// State and LeaseUntil are populated by read and claim methods; writers ignore
+// them.
+type InboxMessage struct {
+	WatchID      string
+	Revision     int64
+	SubscriberID string
+	PeerName     string
+	Payload      []byte
+	State        string
+	LeaseUntil   int64
+}
+
+// InboxKey builds the delivery key for a message: watchID+revision+subscriberID.
+// It is the receiver's deduplication key from ADR 0039 §6, not a sessionID or an
+// event.id.
+func InboxKey(watchID string, revision int64, subscriberID string) string {
+	return watchID + ":" + strconv.FormatInt(revision, 10) + ":" + subscriberID
+}
+
+func ensureInbox(tx *sql.Tx) error {
+	for _, stmt := range createInboxSQL {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("store: inbox: create table: %w", err)
+		}
+	}
+	return nil
+}
+
+// InboxPut stores a message until it is acknowledged. A repeat with the same
+// delivery key inserts nothing (INSERT OR IGNORE), so at-least-once redelivery
+// does not duplicate held messages. Peer payloads are untrusted input (T3.4),
+// so the payload passes through Redact before it is written.
+func (d *DB) InboxPut(m InboxMessage) error {
+	if strings.TrimSpace(m.WatchID) == "" || strings.TrimSpace(m.SubscriberID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: inbox: empty watch or subscriber id")
+	}
+	if strings.TrimSpace(m.PeerName) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: inbox: empty peer name")
+	}
+	clean := Redact(m.Payload)
+	key := InboxKey(m.WatchID, m.Revision, m.SubscriberID)
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureInbox(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			INSERT OR IGNORE INTO inbox_messages
+			  (key, watch_id, revision, subscriber_id, peer_name, payload, state, lease_until, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+			key, m.WatchID, m.Revision, m.SubscriberID, m.PeerName, clean,
+			inboxStatePending, time.Now().UTC().UnixNano())
+		return err
+	})
+}
+
+// reclaimInbox frees messages a dead leaseholder cannot deliver: every
+// inflight row held by peerName (a restart with the same PEER_NAME is the same
+// owner coming back) and every inflight row whose lease has expired. It runs
+// inside the caller's Write transaction, so reclaiming and claiming cannot be
+// split by a crash. Returns the number of rows reset.
+func reclaimInbox(tx *sql.Tx, peerName string, now time.Time) (int64, error) {
+	res, err := tx.Exec(`
+		UPDATE inbox_messages
+		SET state = ?, lease_until = 0
+		WHERE state = ? AND (peer_name = ? OR lease_until <= ?)`,
+		inboxStatePending, inboxStateInflight, peerName, now.UnixNano())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// InboxReclaim is the explicit restart hook from ADR 0039 §6. With the same
+// PEER_NAME it returns held messages to the live process and clears stale
+// leases left by dead holders. It shares the predicate used by InboxClaim.
+func (d *DB) InboxReclaim(peerName string, now time.Time) (int, error) {
+	if strings.TrimSpace(peerName) == "" {
+		return 0, domain.NewAppError(domain.CodeInvalidInput, "store: inbox: empty peer name")
+	}
+	var n int64
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureInbox(tx); err != nil {
+			return err
+		}
+		var err error
+		n, err = reclaimInbox(tx, peerName, now)
+		return err
+	})
+	return int(n), err
+}
+
+// InboxClaim reclaims stale leases for peerName and hands the available
+// messages to it with a fresh lease, all in one transaction. A message is not
+// deleted on claim: it stays in the store until InboxAck, so delivery is
+// at-least-once and a restart can return the held message.
+func (d *DB) InboxClaim(peerName string, now time.Time, ttl time.Duration) ([]InboxMessage, error) {
+	if strings.TrimSpace(peerName) == "" {
+		return nil, domain.NewAppError(domain.CodeInvalidInput, "store: inbox: empty peer name")
+	}
+	leaseUntil := now.Add(ttl).UnixNano()
+	var claimed []InboxMessage
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureInbox(tx); err != nil {
+			return err
+		}
+		if _, err := reclaimInbox(tx, peerName, now); err != nil {
+			return err
+		}
+		rows, err := tx.Query(`
+			SELECT key, watch_id, revision, subscriber_id, peer_name, payload
+			FROM inbox_messages
+			WHERE peer_name = ? AND state = ? ORDER BY created_at, key`,
+			peerName, inboxStatePending)
+		if err != nil {
+			return err
+		}
+		var out []InboxMessage
+		for rows.Next() {
+			var m InboxMessage
+			var key string
+			if err := rows.Scan(&key, &m.WatchID, &m.Revision, &m.SubscriberID, &m.PeerName, &m.Payload); err != nil {
+				rows.Close()
+				return err
+			}
+			out = append(out, m)
+		}
+		rowsErr := rows.Err()
+		rows.Close()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		for _, m := range out {
+			if _, err := tx.Exec(`
+				UPDATE inbox_messages SET state = ?, lease_until = ? WHERE key = ?`,
+				inboxStateInflight, leaseUntil,
+				InboxKey(m.WatchID, m.Revision, m.SubscriberID)); err != nil {
+				return err
+			}
+			m.State = inboxStateInflight
+			m.LeaseUntil = leaseUntil
+			claimed = append(claimed, m)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return claimed, nil
+}
+
+// InboxAck acknowledges a message by its delivery key and removes it from the
+// store. A second ack of the same key is not an error; it reports false because
+// the row is already gone.
+func (d *DB) InboxAck(key string) (bool, error) {
+	var deleted bool
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureInbox(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM inbox_messages WHERE key = ?`, key)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		deleted = n > 0
+		return err
+	})
+	return deleted, err
+}
+
+// InboxMessages returns every stored message for peerName with its current
+// state and lease deadline, oldest first. Used by tests and diagnostics.
+func (d *DB) InboxMessages(peerName string) ([]InboxMessage, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "inbox_messages")
+	if err != nil || !ok {
+		return nil, err
+	}
+	rows, err := d.readDB.Query(`
+		SELECT watch_id, revision, subscriber_id, peer_name, payload, state, lease_until
+		FROM inbox_messages WHERE peer_name = ? ORDER BY created_at, key`, peerName)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []InboxMessage
+	for rows.Next() {
+		var m InboxMessage
+		if err := rows.Scan(&m.WatchID, &m.Revision, &m.SubscriberID, &m.PeerName,
+			&m.Payload, &m.State, &m.LeaseUntil); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // JournalStatus returns the current status of taskID without replaying or
 // rewriting the journal (ADR 0025). Status and Cursor come from the newest
 // record only; an unknown task yields a zero JournalStatus.
