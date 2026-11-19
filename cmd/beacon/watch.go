@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -208,5 +210,204 @@ func runWatch(c *CLI, args []string) int {
 		return 0
 	}
 	renderWatchTable(c.out, rows)
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// T3.114 / ADR 0048 p4: beacon gc.
+//
+// The command clears stale records left behind by leases and the queue: leases
+// whose TTL elapsed, records whose process is dead, and tickets whose deadline
+// passed. Deletion is an explicit, separate action: a plain run only lists what
+// would go, --apply removes it and reports what was removed. The command never
+// hands a worktree to a new owner (T3.65 reclaim) and never changes the lease
+// TTL of T3.97. It deletes stale records, nothing else.
+// ---------------------------------------------------------------------------
+
+// gcKind is the class of a stale object.
+type gcKind string
+
+const (
+	gcKindLease  gcKind = "lease"
+	gcKindPID    gcKind = "pid"
+	gcKindTicket gcKind = "ticket"
+
+	gcReasonExpired = "expired"
+	gcReasonDead    = "dead"
+	gcReasonStale   = "stale"
+)
+
+// gcItem is one object the collector found and may remove.
+type gcItem struct {
+	Kind   gcKind `json:"kind"`
+	ID     string `json:"id"`
+	Reason string `json:"reason"`
+}
+
+// The raw state is read from the stores that own each record type. watch.go
+// fixes only the shape, the scan/apply split and the report; it does not reach
+// into a concrete store. A zero ExpiresAt means the ticket has no deadline.
+type gcLease struct {
+	ID        string    `json:"id"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+type gcPID struct {
+	ID  string `json:"id"`
+	PID int    `json:"pid"`
+}
+
+type gcTicket struct {
+	ID        string    `json:"id"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+type gcState struct {
+	Leases  []gcLease  `json:"leases"`
+	PIDs    []gcPID    `json:"pids"`
+	Tickets []gcTicket `json:"tickets"`
+}
+
+// gcRead loads the raw records and gcWrite removes exactly the named ones.
+// Both are replaceable so the command can be tested without a live store.
+type gcRead func() (gcState, error)
+type gcWrite func(items []gcItem) ([]gcItem, error)
+
+var (
+	gcNow              = time.Now
+	gcReadState gcRead = func() (gcState, error) {
+		return gcState{}, errors.New("gc: хранилище аренд и талонов не подключено")
+	}
+	gcWriteState gcWrite = func([]gcItem) ([]gcItem, error) {
+		return nil, errors.New("gc: хранилище аренд и талонов не подключено")
+	}
+	// gcProcessAlive mirrors the signal-0 check of taskstore and tool_list_running:
+	// EPERM still means the process exists, only another user owns it.
+	gcProcessAlive = func(pid int) bool {
+		if pid <= 0 {
+			return false
+		}
+		err := syscall.Kill(pid, 0)
+		return err == nil || errors.Is(err, syscall.EPERM)
+	}
+	gcRunner = func(c *CLI, args []string) int { return runGC(c, args) }
+)
+
+// RegisterGC installs the gc command implementation, mirroring RegisterWatch.
+func RegisterGC(fn func(*CLI, []string) int) { gcRunner = fn }
+
+// RegisterGCStores installs the read and write halves of the collector store.
+// The stores own the records; this command only fixes the contract. A nil half
+// keeps the previous implementation.
+func RegisterGCStores(read gcRead, write gcWrite) {
+	if read != nil {
+		gcReadState = read
+	}
+	if write != nil {
+		gcWriteState = write
+	}
+}
+
+// gcStale selects what the collector may remove. A lease is stale once its
+// recorded expiry passed, a PID record once its process is gone, and a ticket
+// once its deadline passed. The check uses the recorded expiry, not a new TTL,
+// and never looks at who owns a worktree: reclamation and TTL renewal are other
+// mechanisms (T3.65 and T3.97).
+func gcStale(state gcState, now time.Time) []gcItem {
+	items := make([]gcItem, 0)
+	for _, l := range state.Leases {
+		if !now.Before(l.ExpiresAt) {
+			items = append(items, gcItem{Kind: gcKindLease, ID: l.ID, Reason: gcReasonExpired})
+		}
+	}
+	for _, p := range state.PIDs {
+		if !gcProcessAlive(p.PID) {
+			items = append(items, gcItem{Kind: gcKindPID, ID: p.ID, Reason: gcReasonDead})
+		}
+	}
+	for _, t := range state.Tickets {
+		if !t.ExpiresAt.IsZero() && !now.Before(t.ExpiresAt) {
+			items = append(items, gcItem{Kind: gcKindTicket, ID: t.ID, Reason: gcReasonStale})
+		}
+	}
+	return items
+}
+
+func renderGCTable(w io.Writer, items []gcItem, applied bool) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "KIND\tID\tREASON")
+	for _, it := range items {
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", it.Kind, it.ID, it.Reason)
+	}
+	_ = tw.Flush()
+	if applied {
+		fmt.Fprintf(w, "УДАЛЕНО: %d\n", len(items))
+		return
+	}
+	fmt.Fprintf(w, "НАЙДЕНО: %d (просмотр без удаления, --apply удалит)\n", len(items))
+}
+
+// gcResult is the JSON form of both a dry run and an apply. Items holds the
+// plan for a dry run and the actually removed records for an apply.
+type gcResult struct {
+	Mode    string   `json:"mode"`
+	Removed int      `json:"removed"`
+	Items   []gcItem `json:"items"`
+}
+
+func renderGCJSON(w io.Writer, result gcResult) error {
+	return json.NewEncoder(w).Encode(result)
+}
+
+// runGC is the beacon gc command. Without --apply it is read-only; with --apply
+// it removes exactly the objects found by the scan and reports the count.
+func runGC(c *CLI, args []string) int {
+	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
+	format := fs.String("format", "table", "формат вывода: table или json")
+	apply := fs.Bool("apply", false, "удалить найденные записи (по умолчанию только просмотр)")
+	if !parseFlags("gc", args, c.errOut, fs) {
+		return 2
+	}
+	if *format != "table" && *format != "json" {
+		fmt.Fprintf(c.errOut, "beacon gc: неизвестный формат %q, ожидается table или json\n", *format)
+		writeUsage(c.errOut)
+		return 2
+	}
+
+	state, err := gcReadState()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc: чтение состояния: %v\n", err)
+		return 2
+	}
+	plan := gcStale(state, gcNow())
+
+	if *format == "json" && !*apply {
+		if err := renderGCJSON(c.out, gcResult{Mode: "dry-run", Items: plan}); err != nil {
+			fmt.Fprintf(c.errOut, "beacon gc: %v\n", err)
+			return 2
+		}
+		return 0
+	}
+	if !*apply {
+		renderGCTable(c.out, plan, false)
+		return 0
+	}
+
+	removed, err := gcWriteState(plan)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc: удаление: %v\n", err)
+		return 2
+	}
+	if removed == nil {
+		removed = []gcItem{}
+	}
+	if *format == "json" {
+		if err := renderGCJSON(c.out, gcResult{Mode: "applied", Removed: len(removed), Items: removed}); err != nil {
+			fmt.Fprintf(c.errOut, "beacon gc: %v\n", err)
+			return 2
+		}
+		return 0
+	}
+	renderGCTable(c.out, removed, true)
 	return 0
 }
