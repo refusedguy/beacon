@@ -1363,3 +1363,158 @@ func (d *DB) WaitCheckpointCount() (int, error) {
 	}
 	return n, nil
 }
+
+// createCompletionNotificationsSQL owns the exactly-once completion notice
+// table from ADR 0044 feature 5. As with task_starts, the inbox, the replay and
+// wait tables, it is created on first use because this card owns only db.go.
+// One row per stable event ID is enough: the redacted notice payload and the
+// fact that it was already emitted live in the file, so any process that
+// re-delivers the event sees the first notice instead of emitting a second.
+const createCompletionNotificationsSQL = `
+CREATE TABLE IF NOT EXISTS completion_notifications (
+  key        TEXT PRIMARY KEY,
+  event_id   TEXT NOT NULL,
+  task_id    TEXT NOT NULL,
+  payload    BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`
+
+// completionNotificationNamespace scopes one completion notice. It is
+// deliberately distinct from a clientRequestId (ADR 0028), a task start
+// (ADR 0031), a scenario replay (ADR 0042) and a wait checkpoint (ADR 0043).
+// Those keys deduplicate one command, start, scenario or wait. This key
+// deduplicates one "background task finished" notice (ADR 0044 feature 5).
+const completionNotificationNamespace = "task-completion"
+
+// CompletionNotificationKey builds the durable key for one completion notice
+// from its stable event ID. Re-delivering the same event after a crash yields
+// the same key, so the notice cannot be emitted twice.
+func CompletionNotificationKey(eventID string) string {
+	return domain.IdempotencyKey(completionNotificationNamespace, eventID)
+}
+
+// CompletionNotification is one stored background-task completion notice.
+// EventID is the stable event identifier from the producer and Payload is the
+// redacted notice bytes stored on first delivery.
+type CompletionNotification struct {
+	EventID   string
+	TaskID    string
+	Payload   []byte
+	CreatedAt int64
+}
+
+// NotifyCompletionResult reports what a NotifyCompletion call did. Created
+// marks the first delivery, which wrote the key and emitted the notice.
+// Duplicate marks a re-delivery, which wrote nothing, emitted nothing and
+// returned the first notice unchanged (ADR 0044 feature 5).
+type NotifyCompletionResult struct {
+	Notification CompletionNotification
+	Created      bool
+	Duplicate    bool
+}
+
+// NotifyCompletion emits a background-task completion notice at most once per
+// stable event ID. The key, the emit side effect and the stored notice commit
+// in one transaction (ADR 0015): if emit fails, no key is written and a retry
+// can still deliver the notice. A repeat with the same event ID inserts no row,
+// runs no emit and returns a copy of the first notice, so a re-delivery after a
+// crash cannot double the effect. Payload is redacted before it reaches the
+// file (ADR 0012). This is the completion notice from ADR 0044 feature 5, not
+// the per-command clientRequestId from ADR 0028.
+func (d *DB) NotifyCompletion(eventID, taskID string, payload []byte, emit func(*sql.Tx) error) (NotifyCompletionResult, error) {
+	if strings.TrimSpace(eventID) == "" {
+		return NotifyCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: completion: empty event id")
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return NotifyCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: completion: empty task id")
+	}
+	if emit == nil {
+		return NotifyCompletionResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: completion: nil emit")
+	}
+	key := CompletionNotificationKey(eventID)
+	clean := Redact(payload)
+	now := time.Now().UTC().UnixNano()
+	var out NotifyCompletionResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createCompletionNotificationsSQL); err != nil {
+			return fmt.Errorf("store: completion: create table: %w", err)
+		}
+		res, err := tx.Exec(`
+			INSERT OR IGNORE INTO completion_notifications
+			  (key, event_id, task_id, payload, created_at)
+			VALUES (?, ?, ?, ?, ?)`, key, eventID, taskID, clean, now)
+		if err != nil {
+			return fmt.Errorf("store: completion: insert: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: completion: rows affected: %w", err)
+		}
+		if n == 0 {
+			var stored CompletionNotification
+			if err := tx.QueryRow(`
+				SELECT event_id, task_id, payload, created_at
+				FROM completion_notifications WHERE key = ?`, key,
+			).Scan(&stored.EventID, &stored.TaskID, &stored.Payload, &stored.CreatedAt); err != nil {
+				return fmt.Errorf("store: completion: load existing: %w", err)
+			}
+			out = NotifyCompletionResult{Notification: stored, Duplicate: true}
+			return nil
+		}
+		if err := emit(tx); err != nil {
+			return fmt.Errorf("store: completion: emit: %w", err)
+		}
+		out = NotifyCompletionResult{
+			Notification: CompletionNotification{
+				EventID: eventID, TaskID: taskID,
+				Payload: append([]byte(nil), clean...), CreatedAt: now,
+			},
+			Created: true,
+		}
+		return nil
+	})
+	if err != nil {
+		return NotifyCompletionResult{}, err
+	}
+	return out, nil
+}
+
+// CompletionNotification returns the first notice stored for eventID and
+// whether one exists. Reads use the separate read pool, so a restarted process
+// sees the committed notice without waiting on the writer.
+func (d *DB) CompletionNotification(eventID string) (CompletionNotification, bool, error) {
+	if strings.TrimSpace(eventID) == "" {
+		return CompletionNotification{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: completion: empty event id")
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "completion_notifications")
+	if err != nil || !ok {
+		return CompletionNotification{}, false, err
+	}
+	var n CompletionNotification
+	err = d.readDB.QueryRow(`
+		SELECT event_id, task_id, payload, created_at
+		FROM completion_notifications WHERE key = ?`, CompletionNotificationKey(eventID),
+	).Scan(&n.EventID, &n.TaskID, &n.Payload, &n.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CompletionNotification{}, false, nil
+	}
+	if err != nil {
+		return CompletionNotification{}, false, err
+	}
+	return n, true, nil
+}
+
+// CompletionNotificationCount returns the number of stored completion notices.
+// A repeated event ID must not increase it.
+func (d *DB) CompletionNotificationCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "completion_notifications")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM completion_notifications`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
