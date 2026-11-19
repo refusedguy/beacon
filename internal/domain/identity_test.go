@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -115,5 +116,66 @@ func TestObligationKeyInjectiveAcrossTriples(t *testing.T) {
 	b := ObligationKey("w", 1, "2:s")
 	if a == b {
 		t.Fatalf("different triples share key %q", a)
+	}
+}
+
+func TestIdempotencyKeyStableOnRepeat(t *testing.T) {
+	first := IdempotencyKey(StartNamespace, "req-abc")
+	for i := 0; i < 3; i++ {
+		if got := IdempotencyKey(StartNamespace, "req-abc"); got != first {
+			t.Fatalf("call %d: key changed: %q, want %q", i, got, first)
+		}
+	}
+}
+
+func TestIdempotencyKeySeparateFromClientRequestID(t *testing.T) {
+	// ADR 0031 idempotency_key and ADR 0028 clientRequestId are different keys.
+	// The namespace makes the start key differ from the raw client request id
+	// and from the same value scoped under another namespace.
+	raw := "req-abc"
+	start := IdempotencyKey(StartNamespace, raw)
+	if start == raw {
+		t.Fatalf("start key must be namespaced, got raw %q", raw)
+	}
+	if other := IdempotencyKey("client-request", raw); other == start {
+		t.Fatalf("different namespaces share key %q", start)
+	}
+}
+
+func TestIdempotencyKeyInjectiveWithSeparators(t *testing.T) {
+	base := IdempotencyKey(StartNamespace, "req:1")
+	cases := []struct {
+		namespace string
+		key       string
+	}{
+		{"task-start", "req:2"},
+		{"other", "req:1"},
+	}
+	for _, tc := range cases {
+		if got := IdempotencyKey(tc.namespace, tc.key); got == base {
+			t.Errorf("(%q, %q) collided with %q", tc.namespace, tc.key, base)
+		}
+	}
+	if IdempotencyKey("a:b", "c") == IdempotencyKey("a", "b:c") {
+		t.Error("escaping failed: two different pairs share a key")
+	}
+}
+
+func TestRejectDuplicateConflict(t *testing.T) {
+	err := NewRejectDuplicate("req-abc", "task-1")
+	if err.Code != CodeRejectDuplicate {
+		t.Errorf("Code = %q, want %q", err.Code, CodeRejectDuplicate)
+	}
+	if err.Status != 409 {
+		t.Errorf("Status = %d, want 409", err.Status)
+	}
+	if !IsRejectDuplicate(err) {
+		t.Error("IsRejectDuplicate must recognize the conflict")
+	}
+	if IsRejectDuplicate(NewAppError(CodeInvalidInput, "bad")) {
+		t.Error("IsRejectDuplicate must reject an unrelated error")
+	}
+	if !IsRejectDuplicate(fmt.Errorf("wrapped: %w", err)) {
+		t.Error("IsRejectDuplicate must recognize a wrapped conflict")
 	}
 }

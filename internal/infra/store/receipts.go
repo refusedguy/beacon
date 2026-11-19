@@ -430,6 +430,53 @@ func ensureReceiptSourceColumn(tx *sql.Tx) error {
 	return nil
 }
 
+// rejectDuplicateOutcome is the receipts outcome for a repeated task start.
+// The store writes it directly; it is never accepted from receipts.jsonl, so
+// the plugin's wire vocabulary of outcomes is unchanged.
+const rejectDuplicateOutcome = "reject-duplicate"
+
+// recordRejectDuplicate stores the conflict of a repeated idempotent start in
+// the same transaction as the key lookup (ADR 0015). obligation_id is the
+// namespaced idempotency key and attempt is 0, so UNIQUE(obligation_id,
+// attempt) gives at most one conflict row per key.
+func recordRejectDuplicate(tx *sql.Tx, namespacedKey, taskID string) error {
+	if _, err := tx.Exec(createReceiptsSQL); err != nil {
+		return fmt.Errorf("store: receipts: create table: %w", err)
+	}
+	if err := ensureReceiptSourceColumn(tx); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(struct {
+		IdempotencyKey string `json:"idempotencyKey"`
+		TaskID         string `json:"taskID"`
+	}{IdempotencyKey: namespacedKey, TaskID: taskID})
+	if err != nil {
+		return fmt.Errorf("store: receipts: encode conflict: %w", err)
+	}
+	at := time.Now().UTC().UnixNano()
+	_, err = tx.Exec(`
+		INSERT OR IGNORE INTO receipts
+		  (obligation_id, attempt, outcome, at, raw, imported_at, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		namespacedKey, 0, rejectDuplicateOutcome, at, Redact(raw), at, "")
+	if err != nil {
+		return fmt.Errorf("store: receipts: record reject duplicate: %w", err)
+	}
+	return nil
+}
+
+// RejectDuplicateCount returns the number of recorded duplicate-start
+// conflicts. A repeated start with the same key records at most one.
+func (d *DB) RejectDuplicateCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "receipts")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	err = d.readDB.QueryRow(`SELECT count(*) FROM receipts WHERE outcome = ?`, rejectDuplicateOutcome).Scan(&n)
+	return n, err
+}
+
 // insertReceipt stores a receipt only when the idempotency pair is new. The
 // RowsAffected result decides whether the obligation gets a second effect.
 // Only a validated artifact source is stored; no agent log path reaches here.

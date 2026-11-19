@@ -478,3 +478,52 @@ func TestClosedPRReceiptTerminalWithoutAgentLogs(t *testing.T) {
 }
 
 func jsonRaw(s string) json.RawMessage { return json.RawMessage(s) }
+
+func TestRejectDuplicateReceiptRecordedOnRepeat(t *testing.T) {
+	d := newReceiptDB(t)
+
+	first, err := d.StartTask("req-abc", "task-1", []byte("state"))
+	if err != nil {
+		t.Fatalf("first StartTask: %v", err)
+	}
+	if !first.Created || first.Conflict {
+		t.Fatalf("first start = %+v, want created with no conflict", first)
+	}
+	if n, err := d.RejectDuplicateCount(); err != nil || n != 0 {
+		t.Fatalf("RejectDuplicateCount after first start = %d, %v; want 0", n, err)
+	}
+
+	second, err := d.StartTask("req-abc", "task-2", []byte("other"))
+	if err != nil {
+		t.Fatalf("second StartTask: %v", err)
+	}
+	if !second.Conflict {
+		t.Fatalf("second start = %+v, want RejectDuplicate conflict", second)
+	}
+	if n, err := d.RejectDuplicateCount(); err != nil || n != 1 {
+		t.Fatalf("RejectDuplicateCount after repeat = %d, %v; want 1", n, err)
+	}
+
+	namespaced := domain.IdempotencyKey(domain.StartNamespace, "req-abc")
+	got, err := d.Receipts(namespaced)
+	if err != nil {
+		t.Fatalf("Receipts(%q): %v", namespaced, err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("conflict receipts = %+v, want 1", got)
+	}
+	if got[0].Outcome != domain.AttemptOutcome(rejectDuplicateOutcome) {
+		t.Errorf("conflict outcome = %q, want %q", got[0].Outcome, rejectDuplicateOutcome)
+	}
+
+	// A further repeat is still idempotent: no second task and no second row.
+	if _, err := d.StartTask("req-abc", "task-3", []byte("third")); err != nil {
+		t.Fatalf("third StartTask: %v", err)
+	}
+	if n, err := d.RejectDuplicateCount(); err != nil || n != 1 {
+		t.Fatalf("RejectDuplicateCount after third start = %d, %v; want 1", n, err)
+	}
+	if count, err := d.TaskStartCount(); err != nil || count != 1 {
+		t.Fatalf("TaskStartCount = %d, %v; want 1", count, err)
+	}
+}

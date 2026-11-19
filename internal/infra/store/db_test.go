@@ -342,3 +342,93 @@ func TestStorePortAndIdempotency(t *testing.T) {
 		}
 	}
 }
+
+func TestStartTaskIdempotentRepeatReturnsOriginal(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	first, err := d.StartTask("req-abc", "task-1", []byte(`{"role":"executor"}`))
+	if err != nil {
+		t.Fatalf("first StartTask: %v", err)
+	}
+	if !first.Created || first.Conflict {
+		t.Fatalf("first start = %+v, want created and no conflict", first)
+	}
+	if first.TaskID != "task-1" {
+		t.Errorf("first TaskID = %q, want task-1", first.TaskID)
+	}
+
+	second, err := d.StartTask("req-abc", "task-2", []byte(`{"role":"orchestrator"}`))
+	if err != nil {
+		t.Fatalf("second StartTask: %v", err)
+	}
+	if second.Created || !second.Conflict {
+		t.Fatalf("second start = %+v, want duplicate with RejectDuplicate conflict", second)
+	}
+	if second.TaskID != "task-1" {
+		t.Errorf("repeat returned task %q, want original task-1", second.TaskID)
+	}
+	if string(second.Payload) != string(first.Payload) {
+		t.Errorf("repeat payload = %q, want original %q", second.Payload, first.Payload)
+	}
+
+	count, err := d.TaskStartCount()
+	if err != nil || count != 1 {
+		t.Fatalf("TaskStartCount = %d, %v; want 1 (no second task)", count, err)
+	}
+
+	var storedKey string
+	if err := d.readDB.QueryRow(`SELECT key FROM task_starts`).Scan(&storedKey); err != nil {
+		t.Fatalf("read stored key: %v", err)
+	}
+	if want := domain.IdempotencyKey(domain.StartNamespace, "req-abc"); storedKey != want {
+		t.Errorf("stored key = %q, want namespaced %q", storedKey, want)
+	}
+}
+
+func TestStartTaskDistinctKeysCreateDistinctTasks(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for i, key := range []string{"req-1", "req-2"} {
+		res, err := d.StartTask(key, fmt.Sprintf("task-%d", i+1), []byte(key))
+		if err != nil {
+			t.Fatalf("StartTask(%s): %v", key, err)
+		}
+		if !res.Created || res.Conflict {
+			t.Errorf("StartTask(%s) = %+v, want created with no conflict", key, res)
+		}
+	}
+	count, err := d.TaskStartCount()
+	if err != nil || count != 2 {
+		t.Fatalf("TaskStartCount = %d, %v; want 2", count, err)
+	}
+}
+
+func TestStartTaskRejectsEmptyInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, tc := range []struct{ key, taskID string }{
+		{"", "task-1"},
+		{"req-1", ""},
+	} {
+		_, err := d.StartTask(tc.key, tc.taskID, []byte("state"))
+		if err == nil {
+			t.Fatalf("StartTask(%q, %q) must fail", tc.key, tc.taskID)
+		}
+		var appErr *domain.AppError
+		if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+			t.Errorf("StartTask(%q, %q) error = %v, want INVALID_INPUT", tc.key, tc.taskID, err)
+		}
+	}
+}
