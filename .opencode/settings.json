@@ -1,0 +1,31 @@
+{
+  "$comment": "T3.39. Детерминированная проверка 'только при новом факте' перед комментарием и мержем. Аналог PreToolUse из ADR 0035 п5 для OpenCode.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|gh).*(issue comment|pr comment|pr merge|issue close)",
+        "handler": "node tests/adapter/new-fact-check.test.js --check",
+        "on": {
+          "noNewFact": {
+            "permissionDecision": "deny",
+            "reason": "Комментарий или мерж без нового факта не отправляется"
+          }
+        }
+      }
+    ]
+  },
+  "checks": {
+    "newFact": {
+      "templatePhrases": [
+        "Прогресс:\\s*PR\\s+\\S+\\s+влит,\\s*CI\\s+зелёный",
+        "Прогресс:\\s*PR\\s+\\S+\\s+влит,\\s*CI\\s+зелёный,\\s*всё\\s+хорошо"
+      ],
+      "factPatterns": {
+        "mergedPRHash": "\\b[0-9a-fA-F]{7,40}\\b",
+        "measurement": "\\b\\d+(?:[.,]\\d+)?\\s*(?:%|мс|ms|с|s|ops|rps)(?![\\p{L}])",
+        "ownerDecision": "решение владельца|владелец решил|одобрено владельцем|решение принято владельцем",
+        "blocker": "блокер|блокирует|заблокирован|blocker"
+      }
+    }
+  }
+}
