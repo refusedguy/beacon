@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -45,13 +46,36 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskNew(args[1:], stdout, stderr, cfg)
 	case "take":
 		return runTaskTake(args[1:], stdout, stderr, cfg)
+	case "why":
+		return runTaskWhy(args[1:], stdout, stderr, cfg)
 	default:
 		fmt.Fprintf(stderr, "неизвестная подкоманда task %q\n%s", args[0], taskUsage)
 		return taskstore.ExitValidation
 	}
 }
 
-const taskUsage = "использование: beacon task list|new|take|--self-test [flags]"
+const taskUsage = "использование: beacon task list|new|take|why|--self-test [flags]"
+
+// whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
+var whyEdgeKinds = []string{
+	"depends-on", "conflicts-with", "part-of", "derived-from", "supersedes", "same-as",
+}
+
+// whyEdgeRE находит ребро и ID карточки в строке, например
+// "depends-on T3.17", "conflicts-with:T3.18" или "same-as: T3.19".
+var whyEdgeRE = regexp.MustCompile(`\b(depends-on|conflicts-with|part-of|derived-from|supersedes|same-as)[ \t]*[ :][ \t]*(T[0-9]+\.[0-9]+)\b`)
+
+type whyEdge struct {
+	kind string
+	to   string
+}
+
+type whyStep struct {
+	id     string
+	edge   string
+	status string
+	agent  string
+}
 
 type parsedArgs struct {
 	vals  map[string][]string
@@ -176,6 +200,113 @@ func runTaskTake(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 	}
 	fmt.Fprintln(stdout, out)
 	return taskstore.ExitOK
+}
+
+// runTaskWhy печатает цепочку блокировок карточки. Цепочка строится по графу
+// рёбер между карточками, а не по тексту статуса.
+func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, nil, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
+		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки вида T<g>.<n>"))
+	}
+	cards, err := taskstore.LoadCards(cfg.TasksDir)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	byID := make(map[string]taskstore.Card, len(cards))
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+	id := p.pos[0]
+	if _, ok := byID[id]; !ok {
+		return failTask(stderr, taskstore.Validationf("карточка %s не найдена", id))
+	}
+
+	fmt.Fprintln(stdout, id)
+	chain := whyChain(id, byID)
+	if len(chain) == 0 {
+		fmt.Fprintln(stdout, "  цепочка блокировок не найдена")
+		return taskstore.ExitOK
+	}
+	for i, step := range chain {
+		holder := step.agent
+		if holder == "" {
+			holder = "-"
+		}
+		fmt.Fprintf(stdout, "  %d. %s через %s: держит %s (%s)\n",
+			i+1, step.id, step.edge, holder, step.status)
+	}
+	return taskstore.ExitOK
+}
+
+// whyChain возвращает путь от карточки к держателям её шагов. Шагом считается
+// ребро к незавершённой карточке. Посещённые ID обрывают циклы.
+func whyChain(start string, byID map[string]taskstore.Card) []whyStep {
+	seen := map[string]bool{start: true}
+	cur := start
+	var chain []whyStep
+	for len(chain) <= len(byID) {
+		var next *whyStep
+		for _, e := range whyEdges(byID[cur]) {
+			other, ok := byID[e.to]
+			if !ok || seen[e.to] || whyClosed(other) {
+				continue
+			}
+			next = &whyStep{id: e.to, edge: e.kind, status: other.Status, agent: other.Agent}
+			break
+		}
+		if next == nil {
+			break
+		}
+		chain = append(chain, *next)
+		seen[next.id] = true
+		cur = next.id
+	}
+	return chain
+}
+
+func whyClosed(c taskstore.Card) bool {
+	return c.Status == "done" || c.Status == "dropped"
+}
+
+// whyEdges читает ребра из поля Зависимости и из текста карточки. Голый ID в
+// Зависимостях означает depends-on. Порядок рёбер детерминирован.
+func whyEdges(c taskstore.Card) []whyEdge {
+	seen := map[whyEdge]bool{}
+	var edges []whyEdge
+	add := func(kind, to string) {
+		if !taskstore.IsID(to) || !whyKnownEdge(kind) {
+			return
+		}
+		e := whyEdge{kind: kind, to: to}
+		if !seen[e] {
+			seen[e] = true
+			edges = append(edges, e)
+		}
+	}
+	for _, dep := range c.Dependencies {
+		if m := whyEdgeRE.FindStringSubmatch(dep); m != nil {
+			add(m[1], m[2])
+			continue
+		}
+		add("depends-on", dep)
+	}
+	for _, m := range whyEdgeRE.FindAllStringSubmatch(c.Raw, -1) {
+		add(m[1], m[2])
+	}
+	return edges
+}
+
+func whyKnownEdge(kind string) bool {
+	for _, k := range whyEdgeKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
 }
 
 func relativePath(root, filePath string) string {

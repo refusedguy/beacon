@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -146,6 +147,149 @@ func TestTaskCommandNewDryRunTakeAndSelfTest(t *testing.T) {
 	code = TaskCommandWithConfig([]string{"task", "--self-test"}, &stdout, &stderr, cfg)
 	if code != 0 || !strings.Contains(stdout.String(), "self-test passed") {
 		t.Fatalf("self-test: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+// writeWhyCard пишет карточку с обязательными полями для тестов why.
+func writeWhyCard(t *testing.T, dir, id, status, agent, deps, context string) {
+	t.Helper()
+	body := fmt.Sprintf(`# %s. Карточка %s
+
+Тип: task
+Статус: %s
+Фаза: P1
+Владелец файлов: cmd/%s.go
+Зависимости: %s
+Ссылка: ADR 0001
+Цель: Проверить цепочку
+Контекст: %s
+Шаги: Шаг
+Проверка: Проверка
+Приёмка: Приёмка
+Агент: %s
+Время: 2026-11-20T00:00:00Z
+`, id, id, status, strings.ReplaceAll(id, ".", "-"), deps, context, agent)
+	if err := os.WriteFile(filepath.Join(dir, id+".md"), []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func whyConfig(dir string) taskcli.Config {
+	return taskcli.Config{TasksDir: dir, ADRDir: dir, StateDir: dir, Root: dir}
+}
+
+func TestTaskCommandWhyChain(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "T1.1", "todo", "", "T1.2", "цепочка")
+	writeWhyCard(t, dir, "T1.2", "in_progress", "alice", "T1.3", "цепочка")
+	writeWhyCard(t, dir, "T1.3", "todo", "", "нет", "цепочка")
+
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "why", "T1.1"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"T1.1", "T1.2", "depends-on", "alice", "in_progress", "T1.3", "todo"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в выводе нет %q: %q", want, out)
+		}
+	}
+	if !strings.Contains(out, "1. T1.2 через depends-on") || !strings.Contains(out, "2. T1.3 через depends-on") {
+		t.Errorf("неверный порядок шагов: %q", out)
+	}
+
+	// Команда принимает и форму без префикса task.
+	stdout.Reset()
+	stderr.Reset()
+	code = TaskCommandWithConfig([]string{"why", "T1.1"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || !strings.Contains(stdout.String(), "T1.2 через depends-on") {
+		t.Fatalf("alias why: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestTaskCommandWhyEdgeKinds(t *testing.T) {
+	dir := t.TempDir()
+	edges := []struct{ from, to, kind string }{
+		{"T2.1", "T2.2", "depends-on"},
+		{"T2.2", "T2.3", "conflicts-with"},
+		{"T2.3", "T2.4", "part-of"},
+		{"T2.4", "T2.5", "derived-from"},
+		{"T2.5", "T2.6", "supersedes"},
+		{"T2.6", "T2.7", "same-as"},
+	}
+	for i, e := range edges {
+		deps := "нет"
+		status := "in_progress"
+		agent := "holder-" + e.from
+		if i == 0 {
+			status = "todo"
+		}
+		deps = e.kind + ":" + e.to
+		writeWhyCard(t, dir, e.from, status, agent, deps, "цепочка")
+	}
+	writeWhyCard(t, dir, "T2.7", "in_progress", "holder-T2.7", "нет", "цепочка")
+
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "why", "T2.1"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, kind := range whyEdgeKinds {
+		if !strings.Contains(out, "через "+kind+":") {
+			t.Errorf("в выводе нет ребра %q: %q", kind, out)
+		}
+	}
+	for _, e := range edges {
+		if !strings.Contains(out, "holder-"+e.to) {
+			t.Errorf("в выводе нет держателя %q: %q", e.to, out)
+		}
+	}
+}
+
+func TestTaskCommandWhyIgnoresBlockedText(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "T3.1", "todo", "", "нет", "карточка blocked без цепочки")
+
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "why", "T3.1"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "цепочка блокировок не найдена") {
+		t.Errorf("нет сообщения о пустой цепочке: %q", out)
+	}
+	if strings.Contains(out, "blocked") {
+		t.Errorf("вывод построен по тексту статуса: %q", out)
+	}
+}
+
+func TestTaskCommandWhyValidation(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "T4.1", "todo", "", "нет", "цепочка")
+	cfg := whyConfig(dir)
+	cases := []struct {
+		name string
+		argv []string
+	}{
+		{"без ID", []string{"task", "why"}},
+		{"два ID", []string{"task", "why", "T4.1", "T4.2"}},
+		{"неверный ID", []string{"task", "why", "four.one"}},
+		{"неизвестная карточка", []string{"task", "why", "T4.9"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := TaskCommandWithConfig(tc.argv, &stdout, &stderr, cfg)
+			if code != 1 {
+				t.Errorf("код = %d, ждали 1", code)
+			}
+			if stdout.Len() != 0 || stderr.Len() == 0 {
+				t.Errorf("stdout %q, stderr %q", stdout.String(), stderr.String())
+			}
+		})
 	}
 }
 
