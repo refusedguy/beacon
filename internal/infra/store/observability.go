@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -437,4 +438,115 @@ func (d *DB) PersistStats() (PersistState, []LoadError, error) {
 // hold only the ObservedPersist.
 func (p *ObservedPersist) PersistStats() (PersistState, []LoadError, error) {
 	return p.db.PersistStats()
+}
+
+// Shared gate (ADR 0037 p3, T3.49).
+//
+// Fifteen agents waiting on one CI must not produce fifteen independent
+// timers against it. The phantom timeouts that follow look like a code defect
+// even though the code is honest. SharedGate is the single point where units
+// that declare the same expensive command meet. The first unit to arrive runs
+// the wait; the others join it and receive the same result instead of starting
+// their own. When a second distinct unit arrives on a key, the gate prints a
+// WARNING so an operator can see the shared gate.
+//
+// Unit here means one active caller, not one session name: the key is the
+// command being awaited, so renaming a session does not create a new gate.
+
+// SharedGateWait is the expensive operation run once per active wait round, for
+// example one CI check. Callers re-read the state they care about after Wait
+// returns; the gate only guarantees that the wait happened once.
+type SharedGateWait func(ctx context.Context) error
+
+// sharedGateCall is one in-flight round for a key. done is closed by the leader
+// after err is set, which publishes err to every joined caller.
+type sharedGateCall struct {
+	done    chan struct{}
+	err     error
+	waiters int
+}
+
+// SharedGate coalesces concurrent waits on the same key into one wait and
+// warns when a key turns out to be shared. It is safe for concurrent use.
+type SharedGate struct {
+	mu    sync.Mutex
+	calls map[string]*sharedGateCall
+	warnf func(string, ...any)
+}
+
+// NewSharedGate returns an empty gate whose warnings go to the standard log.
+func NewSharedGate() *SharedGate {
+	return &SharedGate{
+		calls: make(map[string]*sharedGateCall),
+		warnf: log.Printf,
+	}
+}
+
+// SetWarningSink replaces the WARNING sink. A nil sink restores log.Printf.
+// It exists so tests can capture warnings without touching the global logger.
+func (g *SharedGate) SetWarningSink(f func(string, ...any)) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if f == nil {
+		f = log.Printf
+	}
+	g.warnf = f
+}
+
+// Wait runs fn once for key and shares the outcome with every caller that
+// arrives while that round is active. The first caller leads the round; later
+// callers join it and block on the same done channel rather than starting a
+// second wait. A caller that is cancelled or times out leaves with ctx.Err()
+// and does not disturb the round for the others.
+//
+// The first moment a key has more than one active caller is reported through
+// the warning sink, once per round.
+func (g *SharedGate) Wait(ctx context.Context, key string, fn SharedGateWait) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	g.mu.Lock()
+	if call, ok := g.calls[key]; ok {
+		call.waiters++
+		waiters := call.waiters
+		warnf := g.warnf
+		done := call.done
+		g.mu.Unlock()
+
+		if waiters == 2 {
+			warnf("WARNING: shared gate %q: multiple active units wait on the same expensive command; serialized into one wait", key)
+		}
+		select {
+		case <-done:
+			return call.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	call := &sharedGateCall{done: make(chan struct{}), waiters: 1}
+	g.calls[key] = call
+	g.mu.Unlock()
+
+	err := fn(ctx)
+
+	g.mu.Lock()
+	call.err = err
+	delete(g.calls, key)
+	close(call.done)
+	g.mu.Unlock()
+	return err
+}
+
+// ActiveWaiters reports how many callers are currently waiting on key. It
+// makes the shared gate observable: two or more means the key is shared and
+// its wait is being serialized (ADR 0037 p3).
+func (g *SharedGate) ActiveWaiters(key string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if call, ok := g.calls[key]; ok {
+		return call.waiters
+	}
+	return 0
 }
