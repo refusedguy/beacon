@@ -6,7 +6,11 @@ name: CI
 on:
   push:
     branches: [main]
+    # Документация и спайки не меняют код. Такой коммит не должен гонять
+    # компиляцию, тесты и гейты. По образцу Harbor ci.yml:120.
+    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
 
 permissions:
   contents: read

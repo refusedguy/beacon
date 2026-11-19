@@ -5,7 +5,9 @@ name: Gates binary
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
 
 permissions:
   contents: read
