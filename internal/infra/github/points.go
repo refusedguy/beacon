@@ -314,6 +314,101 @@ func (c *Counter) Record(resp *http.Response, bodyCost int) int {
 	return c.Observe(resp, bodyCost)
 }
 
+// Backpressure for task launches, ADR 0038 §2.
+//
+// The shared GitHub point budget gates when a task may start. While the budget
+// is spent or a secondary limit is active, a launch is deferred with reason
+// quota_exhausted instead of entering a blind retry. A deferred launch stays
+// held until Resume sees that the limit has recovered. The wake ladder from
+// ADR 0017 is untouched: this gate decides whether a task starts, not how a
+// delivery resolves.
+
+// QuotaExhausted is the reason recorded on a launch deferred by backpressure.
+const QuotaExhausted = "quota_exhausted"
+
+// LaunchDecision is the verdict for one launch attempt. Allowed reports
+// whether the launch may start now. Reason is QuotaExhausted when the launch
+// was deferred and empty otherwise. Wait is how long the counter expects the
+// limit to last, so the caller can schedule a wake-up instead of spinning.
+type LaunchDecision struct {
+	Allowed bool
+	Reason  string
+	Wait    time.Duration
+}
+
+// LaunchGate applies GitHub quota backpressure to task launches. It counts
+// deferred launches and releases them only when the shared counter shows the
+// limit has recovered. It never calls a launch itself, so a deferred launch
+// cannot turn into a blind retry loop.
+type LaunchGate struct {
+	counter *Counter
+
+	mu      sync.Mutex
+	pending int
+}
+
+// NewLaunchGate builds a gate over the shared point counter. A nil counter
+// means there is no quota to enforce, so every launch is allowed.
+func NewLaunchGate(counter *Counter) *LaunchGate {
+	return &LaunchGate{counter: counter}
+}
+
+// Admit decides whether a launch may start now. When the quota is exhausted
+// the launch is counted as deferred and the decision carries reason
+// quota_exhausted; nothing is launched and no retry is scheduled inside the
+// gate. The caller uses Wait to schedule a later Resume instead.
+func (g *LaunchGate) Admit() LaunchDecision {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.counter != nil && g.counter.LimitReached() {
+		g.pending++
+		return LaunchDecision{Reason: QuotaExhausted, Wait: g.waitLocked()}
+	}
+	return LaunchDecision{Allowed: true}
+}
+
+// Resume releases all deferred launches once the quota has recovered and
+// returns how many were released. While the limit is still active it returns
+// zero and leaves every launch deferred, so nothing is retried blindly.
+func (g *LaunchGate) Resume() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.pending == 0 {
+		return 0
+	}
+	if g.counter != nil && g.counter.LimitReached() {
+		return 0
+	}
+	released := g.pending
+	g.pending = 0
+	return released
+}
+
+// Pending returns the number of launches currently deferred.
+func (g *LaunchGate) Pending() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.pending
+}
+
+// waitLocked reports how long the counter expects the current limit to last.
+// The caller must hold g.mu. A secondary limit takes priority over the hourly
+// reset boundary, matching the counter's own view of the limit.
+func (g *LaunchGate) waitLocked() time.Duration {
+	if g.counter == nil {
+		return 0
+	}
+	if w := g.counter.RetryAfter(); w > 0 {
+		return w
+	}
+	if reset := g.counter.ResetAt(); !reset.IsZero() {
+		if w := reset.Sub(g.counter.now()); w > 0 {
+			return w
+		}
+	}
+	return 0
+}
+
 // Artifact verdict, ADR 0027. A closed or merged pull request is terminal and
 // needs no read of an agent's log, transcript or database. The typed artifact
 // locators are validated where receipts are imported; this helper is the

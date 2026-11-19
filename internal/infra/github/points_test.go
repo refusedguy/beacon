@@ -204,6 +204,122 @@ func TestCounterResetsAtHourBoundary(t *testing.T) {
 	}
 }
 
+// TestLaunchGateDefersWhenQuotaExhausted covers the acceptance criterion of
+// T3.54: a launch arriving with no points left is deferred, with the reason
+// required by ADR 0038 §2, and a wait until the hourly reset.
+func TestLaunchGateDefersWhenQuotaExhausted(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+	c.Add(BudgetPerHour)
+	gate := NewLaunchGate(c)
+
+	d := gate.Admit()
+	if d.Allowed {
+		t.Fatal("Admit allowed a launch with an exhausted quota")
+	}
+	if d.Reason != QuotaExhausted {
+		t.Fatalf("Reason = %q, want %q", d.Reason, QuotaExhausted)
+	}
+	if d.Wait <= 0 {
+		t.Fatalf("Wait = %v, want a positive delay until reset", d.Wait)
+	}
+	if got := gate.Pending(); got != 1 {
+		t.Fatalf("Pending = %d, want 1", got)
+	}
+}
+
+func TestLaunchGateAllowsWhenQuotaAvailable(t *testing.T) {
+	c, _, _ := newTestCounter(t, 10)
+	gate := NewLaunchGate(c)
+
+	d := gate.Admit()
+	if !d.Allowed {
+		t.Fatalf("Admit deferred at 10 points with reason %q", d.Reason)
+	}
+	if d.Reason != "" {
+		t.Fatalf("Reason = %q, want empty", d.Reason)
+	}
+	if d.Wait != 0 {
+		t.Fatalf("Wait = %v, want 0", d.Wait)
+	}
+	if got := gate.Pending(); got != 0 {
+		t.Fatalf("Pending = %d, want 0", got)
+	}
+}
+
+// TestLaunchGateDoesNotRetryWhileQuotaExhausted proves there is no blind
+// retry: while the limit holds, Resume releases nothing and every admission
+// stays deferred.
+func TestLaunchGateDoesNotRetryWhileQuotaExhausted(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+	c.Add(BudgetPerHour)
+	gate := NewLaunchGate(c)
+
+	if d := gate.Admit(); d.Allowed || d.Reason != QuotaExhausted {
+		t.Fatalf("first Admit = %+v, want deferred", d)
+	}
+	if got := gate.Resume(); got != 0 {
+		t.Fatalf("Resume released %d launches while quota exhausted, want 0", got)
+	}
+	if d := gate.Admit(); d.Allowed || d.Reason != QuotaExhausted {
+		t.Fatalf("second Admit = %+v, want deferred again", d)
+	}
+	if got := gate.Pending(); got != 2 {
+		t.Fatalf("Pending = %d, want 2", got)
+	}
+}
+
+// TestLaunchGateResumesAfterQuotaRecovered shows the held launch starts once
+// a reconciled reading reports that the budget is available again.
+func TestLaunchGateResumesAfterQuotaRecovered(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+	c.Add(BudgetPerHour)
+	gate := NewLaunchGate(c)
+
+	if d := gate.Admit(); d.Allowed || d.Reason != QuotaExhausted {
+		t.Fatalf("Admit = %+v, want deferred", d)
+	}
+
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("x-ratelimit-used", "0")
+	c.Observe(resp, 0)
+	if c.LimitReached() {
+		t.Fatal("counter still reports limit reached after a fresh reading")
+	}
+
+	if got := gate.Resume(); got != 1 {
+		t.Fatalf("Resume released %d launches, want 1", got)
+	}
+	if got := gate.Pending(); got != 0 {
+		t.Fatalf("Pending after Resume = %d, want 0", got)
+	}
+}
+
+func TestLaunchGateWaitUsesRetryAfter(t *testing.T) {
+	c, _, _ := newTestCounter(t, 10)
+	base := time.Now()
+	c.now = func() time.Time { return base }
+
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("retry-after", "30")
+	c.Observe(resp, 1)
+	gate := NewLaunchGate(c)
+
+	d := gate.Admit()
+	if d.Allowed || d.Reason != QuotaExhausted {
+		t.Fatalf("Admit = %+v, want deferred under secondary limit", d)
+	}
+	if d.Wait != 30*time.Second {
+		t.Fatalf("Wait = %v, want 30s from retry-after", d.Wait)
+	}
+}
+
+func TestLaunchGateWithNilCounterAllows(t *testing.T) {
+	gate := NewLaunchGate(nil)
+	if d := gate.Admit(); !d.Allowed {
+		t.Fatalf("Admit with no counter = %+v, want allowed", d)
+	}
+}
+
 // TestWebhookRedeliveryHasNoSecondEffect covers the acceptance criterion of
 // T3.34: delivering the same event.id again leaves state and effect count
 // untouched and does not call the state source a second time.
