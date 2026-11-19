@@ -6,10 +6,18 @@
 // retry-after or x-ratelimit-reset. Server timeouts (502/504) are a retry
 // decision with backoff, not an AppError. Header values are authoritative
 // over hints in the response body.
+//
+// The second half of the file is the cross-platform CI status adapter
+// (ADR 0039 §3, T3.62). Three providers expose different payloads; each
+// adapter keeps its format inside Parse and returns one provider-neutral
+// StatusResult or a structured domain.AppError. Nothing there evaluates a
+// verdict: StatusResult only prepares the Rollup and Failures that the domain
+// verdict engine already reads (T2.15).
 package github
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -275,4 +283,351 @@ func (n *Normalizer) jitterOr() time.Duration {
 
 func defaultJitter() time.Duration {
 	return time.Duration(rand.Int64N(int64(maxJitter) + 1))
+}
+
+// --- Cross-platform CI status adapter (ADR 0039 §3, T3.62) ---
+
+// Provider identifies a CI platform whose status payload an adapter parses.
+type Provider string
+
+const (
+	ProviderGitHub    Provider = "github"
+	ProviderGitLab    Provider = "gitlab"
+	ProviderBitbucket Provider = "bitbucket"
+)
+
+// CheckState is the provider-neutral state of one check. The values match the
+// rollup states the verdict engine reads, so the adapter only prepares input.
+type CheckState string
+
+const (
+	CheckSuccess CheckState = "SUCCESS"
+	CheckFailure CheckState = "FAILURE"
+	CheckError   CheckState = "ERROR"
+	CheckPending CheckState = "PENDING"
+	CheckSkipped CheckState = "SKIPPED"
+	CheckNeutral CheckState = "NEUTRAL"
+)
+
+// Check is one CI check after provider fields have been normalized.
+type Check struct {
+	Name       string     `json:"name"`
+	State      CheckState `json:"state"`
+	DetailsURL string     `json:"detailsUrl,omitempty"`
+}
+
+// StatusResult is the provider-neutral observation of a CI status. Rollup and
+// Failures are the fields the verdict engine reads from domain.Snapshot;
+// Apply copies them without computing or changing the verdict.
+type StatusResult struct {
+	Rollup   string   `json:"rollup"`
+	Checks   []Check  `json:"checks"`
+	Failures []string `json:"failures"`
+}
+
+// Apply stores the parsed observation in s. It sets only the status-derived
+// fields and leaves verdict evaluation to the domain package.
+func (r StatusResult) Apply(s *domain.Snapshot) {
+	s.Rollup = r.Rollup
+	s.Failures = append([]string(nil), r.Failures...)
+}
+
+// Structured error codes for status parsing. They travel as domain.AppError
+// codes so failures reach the unified MCP error shape (ADR 0009).
+const (
+	CodeCIUnknownProvider domain.ErrorCode = "CI_UNKNOWN_PROVIDER"
+	CodeCIMalformed       domain.ErrorCode = "CI_MALFORMED"
+	CodeCIMissingStatus   domain.ErrorCode = "CI_MISSING_STATUS"
+	CodeCIInvalidStatus   domain.ErrorCode = "CI_INVALID_STATUS"
+)
+
+func ciAppError(code domain.ErrorCode, message string) *domain.AppError {
+	return &domain.AppError{Code: code, Message: message, Status: http.StatusBadRequest}
+}
+
+func malformedStatus(provider Provider, err error) *domain.AppError {
+	return ciAppError(CodeCIMalformed,
+		fmt.Sprintf("%s: malformed status payload: %v", provider, err))
+}
+
+func missingStatus(provider Provider) *domain.AppError {
+	return ciAppError(CodeCIMissingStatus,
+		fmt.Sprintf("%s: status payload has no checks or status", provider))
+}
+
+func invalidStatus(provider Provider, value string) *domain.AppError {
+	return ciAppError(CodeCIInvalidStatus,
+		fmt.Sprintf("%s: unrecognized status %q", provider, value))
+}
+
+// StatusAdapter is the single interface every CI provider implements. All
+// provider-specific field names and status vocabularies live inside Parse.
+type StatusAdapter interface {
+	Provider() Provider
+	Parse(body []byte) (StatusResult, *domain.AppError)
+}
+
+// StatusParser is the one entry point for status parsing. It dispatches to a
+// provider adapter and turns an unknown provider into a structured error.
+type StatusParser struct {
+	adapters map[Provider]StatusAdapter
+}
+
+// NewStatusParser returns a parser with the GitHub, GitLab and Bitbucket
+// adapters registered.
+func NewStatusParser() *StatusParser {
+	p := &StatusParser{adapters: make(map[Provider]StatusAdapter)}
+	p.Register(NewGitHubActionsAdapter())
+	p.Register(NewGitLabAdapter())
+	p.Register(NewBitbucketAdapter())
+	return p
+}
+
+// Register adds or replaces an adapter for its provider.
+func (p *StatusParser) Register(a StatusAdapter) {
+	if p.adapters == nil {
+		p.adapters = make(map[Provider]StatusAdapter)
+	}
+	p.adapters[a.Provider()] = a
+}
+
+// Parse normalizes a raw status payload from provider into one StatusResult.
+func (p *StatusParser) Parse(provider Provider, body []byte) (StatusResult, *domain.AppError) {
+	a, ok := p.adapters[provider]
+	if !ok {
+		return StatusResult{}, ciAppError(CodeCIUnknownProvider,
+			fmt.Sprintf("unknown CI provider %q", provider))
+	}
+	return a.Parse(body)
+}
+
+// buildRollup derives the neutral rollup and the failing-check names from
+// checks. Skipped and neutral checks never appear in Failures, matching the
+// verdict engine's Snapshot contract.
+func buildRollup(checks []Check) (string, []string) {
+	var failures []string
+	hasFailure, hasError, hasPending := false, false, false
+	for _, c := range checks {
+		switch c.State {
+		case CheckFailure:
+			hasFailure = true
+			failures = append(failures, c.Name)
+		case CheckError:
+			hasError = true
+			failures = append(failures, c.Name)
+		case CheckPending:
+			hasPending = true
+		}
+	}
+	switch {
+	case hasFailure:
+		return "FAILURE", failures
+	case hasError:
+		return "ERROR", failures
+	case hasPending:
+		return "PENDING", failures
+	default:
+		return "SUCCESS", failures
+	}
+}
+
+// --- GitHub Actions ---
+
+// GitHubActionsAdapter parses a GitHub check-runs response.
+type GitHubActionsAdapter struct{}
+
+var _ StatusAdapter = GitHubActionsAdapter{}
+
+func NewGitHubActionsAdapter() StatusAdapter { return GitHubActionsAdapter{} }
+
+func (GitHubActionsAdapter) Provider() Provider { return ProviderGitHub }
+
+type ghCheckRun struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	HTMLURL    string `json:"html_url"`
+}
+
+type ghCheckRuns struct {
+	CheckRuns []ghCheckRun `json:"check_runs"`
+}
+
+func (a GitHubActionsAdapter) Parse(body []byte) (StatusResult, *domain.AppError) {
+	var doc ghCheckRuns
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return StatusResult{}, malformedStatus(a.Provider(), err)
+	}
+	if doc.CheckRuns == nil {
+		return StatusResult{}, missingStatus(a.Provider())
+	}
+	checks := make([]Check, 0, len(doc.CheckRuns))
+	for _, run := range doc.CheckRuns {
+		state, ok := githubCheckState(run.Status, run.Conclusion)
+		if !ok {
+			return StatusResult{}, invalidStatus(a.Provider(), run.Status+"/"+run.Conclusion)
+		}
+		checks = append(checks, Check{Name: run.Name, State: state, DetailsURL: run.HTMLURL})
+	}
+	roll, failures := buildRollup(checks)
+	return StatusResult{Rollup: roll, Checks: checks, Failures: failures}, nil
+}
+
+func githubCheckState(status, conclusion string) (CheckState, bool) {
+	if status != "completed" {
+		switch status {
+		case "queued", "in_progress", "requested", "waiting":
+			return CheckPending, true
+		default:
+			return "", false
+		}
+	}
+	switch conclusion {
+	case "success":
+		return CheckSuccess, true
+	case "failure", "timed_out", "startup_failure":
+		return CheckFailure, true
+	case "skipped":
+		return CheckSkipped, true
+	case "neutral", "cancelled", "canceled", "action_required", "stale":
+		return CheckNeutral, true
+	default:
+		return "", false
+	}
+}
+
+// --- GitLab CI ---
+
+// GitLabAdapter parses a GitLab pipeline response with its jobs.
+type GitLabAdapter struct{}
+
+var _ StatusAdapter = GitLabAdapter{}
+
+func NewGitLabAdapter() StatusAdapter { return GitLabAdapter{} }
+
+func (GitLabAdapter) Provider() Provider { return ProviderGitLab }
+
+type glJob struct {
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	AllowFailure bool   `json:"allow_failure"`
+	WebURL       string `json:"web_url"`
+}
+
+type glPipeline struct {
+	Status string  `json:"status"`
+	Jobs   []glJob `json:"jobs"`
+}
+
+func (a GitLabAdapter) Parse(body []byte) (StatusResult, *domain.AppError) {
+	var doc glPipeline
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return StatusResult{}, malformedStatus(a.Provider(), err)
+	}
+	if doc.Status == "" || doc.Jobs == nil {
+		return StatusResult{}, missingStatus(a.Provider())
+	}
+	if _, ok := gitlabCheckState(doc.Status, false); !ok {
+		return StatusResult{}, invalidStatus(a.Provider(), doc.Status)
+	}
+	checks := make([]Check, 0, len(doc.Jobs))
+	for _, job := range doc.Jobs {
+		state, ok := gitlabCheckState(job.Status, job.AllowFailure)
+		if !ok {
+			return StatusResult{}, invalidStatus(a.Provider(), job.Status)
+		}
+		checks = append(checks, Check{Name: job.Name, State: state, DetailsURL: job.WebURL})
+	}
+	roll, failures := buildRollup(checks)
+	return StatusResult{Rollup: roll, Checks: checks, Failures: failures}, nil
+}
+
+func gitlabCheckState(status string, allowFailure bool) (CheckState, bool) {
+	switch status {
+	case "success":
+		return CheckSuccess, true
+	case "failed":
+		if allowFailure {
+			return CheckNeutral, true
+		}
+		return CheckFailure, true
+	case "canceled":
+		return CheckNeutral, true
+	case "skipped":
+		return CheckSkipped, true
+	case "created", "preparing", "pending", "running", "waiting_for_resource", "scheduled", "manual":
+		return CheckPending, true
+	default:
+		return "", false
+	}
+}
+
+// --- Bitbucket Pipelines ---
+
+// BitbucketAdapter parses a Bitbucket build-status response.
+type BitbucketAdapter struct{}
+
+var _ StatusAdapter = BitbucketAdapter{}
+
+func NewBitbucketAdapter() StatusAdapter { return BitbucketAdapter{} }
+
+func (BitbucketAdapter) Provider() Provider { return ProviderBitbucket }
+
+type bbStatus struct {
+	State string `json:"state"`
+	Name  string `json:"name"`
+	Key   string `json:"key"`
+	URL   string `json:"url"`
+}
+
+type bbStatuses struct {
+	Values []bbStatus `json:"values"`
+}
+
+func (a BitbucketAdapter) Parse(body []byte) (StatusResult, *domain.AppError) {
+	var doc bbStatuses
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return StatusResult{}, malformedStatus(a.Provider(), err)
+	}
+	items := doc.Values
+	if items == nil {
+		// A single build-status payload has no values wrapper.
+		var one bbStatus
+		if err := json.Unmarshal(body, &one); err != nil {
+			return StatusResult{}, malformedStatus(a.Provider(), err)
+		}
+		if one.State == "" {
+			return StatusResult{}, missingStatus(a.Provider())
+		}
+		items = []bbStatus{one}
+	}
+	checks := make([]Check, 0, len(items))
+	for _, item := range items {
+		state, ok := bitbucketCheckState(item.State)
+		if !ok {
+			return StatusResult{}, invalidStatus(a.Provider(), item.State)
+		}
+		name := item.Name
+		if name == "" {
+			name = item.Key
+		}
+		checks = append(checks, Check{Name: name, State: state, DetailsURL: item.URL})
+	}
+	roll, failures := buildRollup(checks)
+	return StatusResult{Rollup: roll, Checks: checks, Failures: failures}, nil
+}
+
+func bitbucketCheckState(state string) (CheckState, bool) {
+	switch strings.ToUpper(state) {
+	case "SUCCESSFUL":
+		return CheckSuccess, true
+	case "FAILED":
+		return CheckFailure, true
+	case "INPROGRESS":
+		return CheckPending, true
+	case "STOPPED":
+		return CheckNeutral, true
+	default:
+		return "", false
+	}
 }
