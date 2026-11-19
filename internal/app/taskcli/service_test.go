@@ -1450,3 +1450,197 @@ func TestConcurrentBypassesAreAllLogged(t *testing.T) {
 		t.Fatalf("в журнале %d обходов, ждали %d", bypasses, n)
 	}
 }
+
+// ---- ADR 0044 п4 / T3.99: bounded handoff journal с recovery на старте ----
+
+func TestAppendHandoffStepAndRecoverOnStartup(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	steps := []struct{ step, note string }{
+		{"read-card", "прочитал карточку"},
+		{"plan-patch", "наметил правку"},
+		{"run-tests", "прогнал тест в CI"},
+	}
+	want := make([]HandoffJournalEntry, 0, len(steps))
+	for i, s := range steps {
+		entry, err := e.svc.AppendHandoffStep("T3.99", s.step, s.note, now.Add(time.Duration(i)*time.Second))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entry.Seq != uint64(i+1) {
+			t.Fatalf("шаг %d: seq %d, ждали %d", i, entry.Seq, i+1)
+		}
+		want = append(want, entry)
+	}
+
+	journal, err := e.svc.HandoffJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(journal, want) {
+		t.Fatalf("журнал: %+v, ждали %+v", journal, want)
+	}
+
+	// Свежий сервис с тем же каталогом состояния это старт процесса: он читает
+	// журнал и подставляет блок восстановления.
+	startup := NewService(e.cfg)
+	rec, err := startup.RecoverHandoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.HasJournal || rec.Count != len(want) || rec.LastSeq != uint64(len(want)) {
+		t.Fatalf("блок восстановления: %+v", rec)
+	}
+	if !reflect.DeepEqual(rec.Entries, want) {
+		t.Fatalf("entries восстановления: %+v, ждали %+v", rec.Entries, want)
+	}
+	wantSteps := []string{"read-card", "plan-patch", "run-tests"}
+	if !reflect.DeepEqual(rec.Steps, wantSteps) {
+		t.Fatalf("steps восстановления: %v, ждали %v", rec.Steps, wantSteps)
+	}
+}
+
+func TestHandoffRecoveryEmptyWithoutJournal(t *testing.T) {
+	e := newEnv(t)
+	rec, err := e.svc.RecoverHandoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.HasJournal || rec.Count != 0 || rec.LastSeq != 0 || len(rec.Entries) != 0 || len(rec.Steps) != 0 {
+		t.Fatalf("пустой журнал дал блок: %+v", rec)
+	}
+	journal, err := e.svc.HandoffJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) != 0 {
+		t.Fatalf("пустой журнал вернул записи: %+v", journal)
+	}
+}
+
+func TestHandoffJournalDropsOldestOnCountOverflow(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	total := MaxHandoffJournalEntries + 5
+	for i := 0; i < total; i++ {
+		if _, err := e.svc.AppendHandoffStep("T3.99", fmt.Sprintf("step-%d", i+1), "", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	journal, err := e.svc.HandoffJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) != MaxHandoffJournalEntries {
+		t.Fatalf("в журнале %d записей, лимит %d", len(journal), MaxHandoffJournalEntries)
+	}
+	// Seq не переиспользуется: отброшены шаги 1..5, остались 6..total.
+	if journal[0].Seq != 6 || journal[len(journal)-1].Seq != uint64(total) {
+		t.Fatalf("после отбрасывания seq от %d до %d, ждали %d..%d",
+			journal[0].Seq, journal[len(journal)-1].Seq, 6, total)
+	}
+	if journal[0].Step != "step-6" || journal[len(journal)-1].Step != fmt.Sprintf("step-%d", total) {
+		t.Fatalf("не те шаги остались: первый %s, последний %s",
+			journal[0].Step, journal[len(journal)-1].Step)
+	}
+}
+
+func TestHandoffJournalDropsOldestOnByteOverflow(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	big := strings.Repeat("x", 40*1024)
+	first, err := e.svc.AppendHandoffStep("T3.99", "first", big, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := e.svc.AppendHandoffStep("T3.99", "second", big, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Seq != 1 || second.Seq != 2 {
+		t.Fatalf("seq: %d и %d, ждали 1 и 2", first.Seq, second.Seq)
+	}
+	journal, err := e.svc.HandoffJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) != 1 {
+		t.Fatalf("после переполнения размером в журнале %d записей, ждали 1", len(journal))
+	}
+	if journal[0].Seq != 2 || journal[0].Step != "second" {
+		t.Fatalf("осталась не самая свежая запись: %+v", journal[0])
+	}
+}
+
+func TestAppendHandoffStepValidatesInput(t *testing.T) {
+	e := newEnv(t)
+	if _, err := e.svc.AppendHandoffStep("  ", "step", "note", time.Time{}); taskstore.Code(err) != 1 {
+		t.Fatalf("пустая задача: код %d, ждали 1", taskstore.Code(err))
+	}
+	if _, err := e.svc.AppendHandoffStep("T3.99", "  ", "note", time.Time{}); taskstore.Code(err) != 1 {
+		t.Fatalf("пустой шаг: код %d, ждали 1", taskstore.Code(err))
+	}
+	journal, err := e.svc.HandoffJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) != 0 {
+		t.Fatalf("неверные шаги попали в журнал: %+v", journal)
+	}
+}
+
+func TestConcurrentHandoffAppendsKeepUniqueSeq(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	const n = 12
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			_, err := e.svc.AppendHandoffStep("T3.99", fmt.Sprintf("step-%d", i), "", now)
+			errs <- err
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	journal, err := e.svc.HandoffJournal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(journal) != n {
+		t.Fatalf("в журнале %d записей, ждали %d", len(journal), n)
+	}
+	seen := make(map[uint64]bool, n)
+	for _, entry := range journal {
+		if seen[entry.Seq] {
+			t.Fatalf("повторный seq %d", entry.Seq)
+		}
+		seen[entry.Seq] = true
+	}
+}
+
+func TestHandoffJournalDoesNotReplaceStructuredHandoff(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.99", "todo", "task", "ADR 0001", "internal/app/w211/x.go", "нет", "нет")
+	// T3.25 пятиполевая передача читается из карточки и не зависит от журнала.
+	h, err := e.svc.BuildHandoff("T3.99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Intent != "ц" || h.Evidence != "к" || h.PatchPlan != "ш" ||
+		h.VerificationPlan != "п" || h.RiskNotes != "пр" {
+		t.Fatalf("structured handoff: %+v", h)
+	}
+	if _, err := e.svc.AppendHandoffStep("T3.99", "step", "note", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := e.svc.BuildHandoff("T3.99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, h) {
+		t.Fatalf("журнал изменил структурированную передачу: %+v против %+v", after, h)
+	}
+}
