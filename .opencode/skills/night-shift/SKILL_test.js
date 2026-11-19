@@ -4,12 +4,13 @@
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { readFileSync } from "node:fs"
+import { existsSync, readFileSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const SELF = fileURLToPath(import.meta.url)
-const SKILL_PATH = resolve(dirname(SELF), "SKILL.md")
+const SKILL_DIR = dirname(SELF)
+const SKILL_PATH = resolve(SKILL_DIR, "SKILL.md")
 
 const text = readFileSync(SKILL_PATH, "utf8")
 
@@ -25,6 +26,10 @@ function field(name) {
   return match[1]
 }
 
+function body() {
+  return text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "")
+}
+
 test("T3.35 SKILL.md: frontmatter содержит name и description", () => {
   assert.equal(field("name"), "night-shift")
   assert.match(
@@ -34,11 +39,21 @@ test("T3.35 SKILL.md: frontmatter содержит name и description", () => {
 })
 
 test("T3.35 SKILL.md: тело содержит процедуру разбора issue", () => {
-  const body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "")
-  assert.match(body, /^##\s+Процедура/m)
+  const route = body()
+  assert.match(route, /^##\s+Процедура/m)
   for (const marker of ["gh issue view", "PR", "CI", "новом факте"]) {
-    assert.ok(body.includes(marker), `процедура должна упоминать ${marker}`)
+    assert.ok(route.includes(marker), `процедура должна упоминать ${marker}`)
   }
-  const steps = body.split("\n").filter((line) => /^\d+\./.test(line.trim()))
+  const steps = route.split("\n").filter((line) => /^\d+\./.test(line.trim()))
   assert.ok(steps.length >= 3, "процедура должна содержать не менее трёх шагов")
+})
+
+test("T3.35 SKILL.md: справочники подключены по ссылке перед действием", () => {
+  const route = body()
+  assert.match(route, /Перед комментарием прочитать `references\/comment-rules\.md`/)
+  assert.match(route, /Перед мержем прочитать `references\/pr-readiness\.md`/)
+  for (const name of ["comment-rules.md", "pr-readiness.md"]) {
+    const path = resolve(SKILL_DIR, "references", name)
+    assert.equal(existsSync(path), true, `справочник должен существовать: ${name}`)
+  }
 })
