@@ -1909,3 +1909,94 @@ func (s *Service) ReservationLog() ([]ReservationLogEntry, error) {
 	}
 	return append([]ReservationLogEntry(nil), st.Journal...), nil
 }
+
+// ---- ADR 0041 п6 / T3.82: журнал причин отказа precheck ----
+//
+// Причина отказа precheck пишется в отдельный файл состояния под тем же замком
+// flock, что и другие журналы сервиса. Сигнатура RecordPrecheckFailure
+// совпадает с портом mcp.PrecheckJournal по примитивам, поэтому слой app
+// реализует порт, не импортируя infra.
+
+// PrecheckLogEntry — одна запись журнала. Исход фиксирован как precheck_failure.
+type PrecheckLogEntry struct {
+	Time    time.Time `json:"time"`
+	Outcome string    `json:"outcome"`
+	Reason  string    `json:"reason"`
+}
+
+type precheckState struct {
+	Journal []PrecheckLogEntry `json:"journal"`
+}
+
+func (s *Service) precheckPath() string {
+	return filepath.Join(s.Cfg.StateDir, "precheck.json")
+}
+
+func (s *Service) lockPrecheck() (func(), error) {
+	path := filepath.Join(s.Cfg.StateDir, "precheck.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, taskstore.Startupf("не открыт замок precheck: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, taskstore.Startupf("не взят замок precheck: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+func (s *Service) loadPrecheckState() (precheckState, error) {
+	data, err := os.ReadFile(s.precheckPath())
+	if os.IsNotExist(err) {
+		return precheckState{}, nil
+	}
+	if err != nil {
+		return precheckState{}, taskstore.Startupf("не прочитан журнал precheck: %v", err)
+	}
+	var st precheckState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return precheckState{}, taskstore.Startupf("не разобран журнал precheck: %v", err)
+	}
+	return st, nil
+}
+
+// RecordPrecheckFailure пишет причину отказа precheck в журнал. Пустая причина
+// отклоняется: журнал существует, чтобы причина была понятной.
+func (s *Service) RecordPrecheckFailure(reason string, at time.Time) error {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return taskstore.Validationf("не задана причина precheck")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	unlock, err := s.lockPrecheck()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	st, err := s.loadPrecheckState()
+	if err != nil {
+		return err
+	}
+	st.Journal = append(st.Journal, PrecheckLogEntry{
+		Time: at.UTC(), Outcome: "precheck_failure", Reason: reason,
+	})
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return taskstore.Startupf("не собран журнал precheck: %v", err)
+	}
+	return taskstore.AtomicWrite(s.precheckPath(), append(data, '\n'), 0644)
+}
+
+// PrecheckLog возвращает журнал причин precheck в порядке записи.
+func (s *Service) PrecheckLog() ([]PrecheckLogEntry, error) {
+	st, err := s.loadPrecheckState()
+	if err != nil {
+		return nil, err
+	}
+	return append([]PrecheckLogEntry(nil), st.Journal...), nil
+}
