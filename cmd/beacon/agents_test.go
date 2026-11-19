@@ -255,3 +255,85 @@ func TestW68AgentsEmptyListIsValidJSON(t *testing.T) {
 		t.Fatalf("пустой список: %q, ожидался []", got)
 	}
 }
+
+func TestW92SandboxCloneArgsUsesReference(t *testing.T) {
+	got := sandboxCloneArgs("/srv/beacon.git", "/work/agents/a1")
+	want := []string{"clone", "--reference", "/srv/beacon.git", "/srv/beacon.git", "/work/agents/a1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("аргументы клона %q, ожидались %q", got, want)
+	}
+}
+
+func TestW92ProvisionSandboxRunsGitWithReference(t *testing.T) {
+	c, out, errOut, calls := w68CLI(t, func(w68Call) runResult {
+		return runResult{}
+	})
+
+	if code := c.provisionSandbox("/srv/beacon.git", "/work/agents/a1"); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout не пустой: %q", out.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("вызовов раннера %d, ожидался 1", len(*calls))
+	}
+	call := (*calls)[0]
+	if call.name != "git" {
+		t.Fatalf("раннер вызвал %q, ожидался git", call.name)
+	}
+	want := []string{"clone", "--reference", "/srv/beacon.git", "/srv/beacon.git", "/work/agents/a1"}
+	if !reflect.DeepEqual(call.args, want) {
+		t.Fatalf("аргументы %q, ожидались %q", call.args, want)
+	}
+	if call.dir != c.root || len(call.env) != 0 {
+		t.Fatalf("неверный каталог или окружение: %+v", call)
+	}
+}
+
+func TestW92ProvisionSandboxCloneFailure(t *testing.T) {
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{code: 128, stderr: []byte("fatal: destination path already exists\n")}
+	})
+
+	if code := c.provisionSandbox("/srv/beacon.git", "/work/agents/a1"); code != 2 {
+		t.Fatalf("код выхода %d, ожидался 2", code)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout не пустой: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "destination path already exists") ||
+		!strings.Contains(errOut.String(), "--reference") {
+		t.Fatalf("нет понятной ошибки: %q", errOut.String())
+	}
+}
+
+func TestW92ProvisionSandboxRejectsEmptyPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		source string
+		dest   string
+	}{
+		{"пустой источник", "", "/work/agents/a1"},
+		{"пробельный источник", "  ", "/work/agents/a1"},
+		{"пустая песочница", "/srv/beacon.git", ""},
+		{"пробельная песочница", "/srv/beacon.git", "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, out, errOut, calls := w68CLI(t, nil)
+
+			if code := c.provisionSandbox(tc.source, tc.dest); code != 2 {
+				t.Fatalf("код выхода %d, ожидался 2", code)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("stdout не пустой: %q", out.String())
+			}
+			if errOut.Len() == 0 {
+				t.Fatal("stderr пустой")
+			}
+			if len(*calls) != 0 {
+				t.Fatalf("раннер не должен вызываться: %+v", *calls)
+			}
+		})
+	}
+}
