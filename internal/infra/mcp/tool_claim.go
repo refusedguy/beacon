@@ -33,6 +33,13 @@
 // passes, the worktree is free and the old token no longer authorizes a write,
 // even if the same owner takes a new lease.
 //
+// ADR 0046 p1 adds a heartbeat over the worktree lease. It returns false when
+// the lease was taken away, so the worker stops on the first false beat and
+// does not write its result a second time. The beat is a cheap fencing check,
+// not a new token: it does not renew the lease and it does not replace the
+// fencing token of T3.51, which still guards the write itself. The two checks
+// apply in sequence, beat first and token at the write boundary.
+//
 // Both stores live in memory behind one mutex each. Wiring them to the durable
 // stores is a separate integration task; the tools are attached explicitly and
 // are not part of the default NewServer contract set.
@@ -474,9 +481,10 @@ func AttachClaim(server *mcpsdk.Server, handler *ClaimHandler) {
 // Worktree lease tool names. They stay out of ToolNames; registration is done
 // by AttachWorktreeLease and is not part of the default NewServer set.
 const (
-	LeaseWorktreeToolName   = "beacon_lease_worktree"
-	WriteWorktreeToolName   = "beacon_write_worktree"
-	ReleaseWorktreeToolName = "beacon_release_worktree"
+	LeaseWorktreeToolName     = "beacon_lease_worktree"
+	WriteWorktreeToolName     = "beacon_write_worktree"
+	ReleaseWorktreeToolName   = "beacon_release_worktree"
+	HeartbeatWorktreeToolName = "beacon_heartbeat_worktree"
 )
 
 // WorktreeLeaseInput is the argument object of beacon_lease_worktree. The
@@ -529,6 +537,22 @@ type WorktreeReleaseInput struct {
 type WorktreeReleaseOutput struct {
 	WorktreeID string `json:"worktreeID"`
 	OwnerID    string `json:"ownerID"`
+}
+
+// WorktreeHeartbeatInput is the argument object of beacon_heartbeat_worktree.
+// It names the lease by worktree, owner and the fencing token from acquire. A
+// beat is read-only: it never renews the lease TTL.
+type WorktreeHeartbeatInput struct {
+	WorktreeID   string `json:"worktreeID" jsonschema:"identifier of the leased worktree being checked"`
+	OwnerID      string `json:"ownerID" jsonschema:"identifier of the worker beating its lease"`
+	FencingToken uint64 `json:"fencingToken" jsonschema:"fencing token from beacon_lease_worktree; a stale token means the lease was taken"`
+}
+
+// WorktreeHeartbeatOutput carries the beat result. Alive is true only while the
+// caller still holds the live lease; false means the lease was taken away and
+// the worker must stop without writing its result again (ADR 0046 p1).
+type WorktreeHeartbeatOutput struct {
+	Alive bool `json:"alive"`
 }
 
 // WorktreeLeaseBusyError reports an acquire on a worktree whose lease is still
@@ -647,6 +671,25 @@ func (s *worktreeLeaseStore) activeLease(worktreeID string) (worktreeLeaseRecord
 	return rec, nil
 }
 
+// heartbeat reports whether the caller still holds the lease. It returns a
+// plain false, not an error, when the lease was taken away: the TTL elapsed, the
+// lease was released, or a new owner acquired it with a higher token. A worker
+// beats before continuing and stops on the first false beat, so it cannot
+// finish the same work twice after its lease was reassigned (ADR 0046 p1). The
+// check is cheap and read-only under the store lock; it does not extend the TTL
+// and it does not change what Write accepts. The fencing token is still checked
+// at the write boundary, so beat and token apply in sequence.
+func (s *worktreeLeaseStore) heartbeat(worktreeID, ownerID string, token uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.activeLease(worktreeID)
+	if err != nil {
+		return false
+	}
+	return token == rec.fencingToken && ownerID == rec.ownerID
+}
+
 // acquire leases a whole worktree to one owner for ttl. A live lease blocks a
 // second holder. An expired lease is replaced by a fresh one with a higher
 // token, so any token the previous owner kept becomes stale.
@@ -758,6 +801,15 @@ func (h *WorktreeLeaseHandler) HandleWrite(ctx context.Context, _ *mcpsdk.CallTo
 	return &mcpsdk.CallToolResult{}, out, nil
 }
 
+// HandleHeartbeat adapts Heartbeat to the go-sdk typed tool handler signature.
+func (h *WorktreeLeaseHandler) HandleHeartbeat(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeHeartbeatInput) (*mcpsdk.CallToolResult, WorktreeHeartbeatOutput, error) {
+	out, err := h.Heartbeat(ctx, in)
+	if err != nil {
+		return nil, WorktreeHeartbeatOutput{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
 // HandleRelease adapts Release to the go-sdk typed tool handler signature.
 func (h *WorktreeLeaseHandler) HandleRelease(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeReleaseInput) (*mcpsdk.CallToolResult, WorktreeReleaseOutput, error) {
 	out, err := h.Release(ctx, in)
@@ -793,6 +845,20 @@ func (h *WorktreeLeaseHandler) Write(_ context.Context, in WorktreeWriteInput) (
 	return h.store.write(in.WorktreeID, in.OwnerID, in.FencingToken)
 }
 
+// Heartbeat validates the request at the boundary, then reports whether the
+// caller still holds the live lease. A lost lease is a false result, not an
+// error: the worker reads the boolean and stops before writing a result again.
+func (h *WorktreeLeaseHandler) Heartbeat(_ context.Context, in WorktreeHeartbeatInput) (WorktreeHeartbeatOutput, error) {
+	if in.WorktreeID == "" || in.OwnerID == "" || in.FencingToken == 0 {
+		return WorktreeHeartbeatOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"worktree heartbeat: worktreeID, ownerID and fencingToken are required")
+	}
+	if h == nil || h.store == nil {
+		return WorktreeHeartbeatOutput{}, domain.NewAppError(domain.CodePersistFailed, "worktree lease: no lease store configured")
+	}
+	return WorktreeHeartbeatOutput{Alive: h.store.heartbeat(in.WorktreeID, in.OwnerID, in.FencingToken)}, nil
+}
+
 // Release validates the request at the boundary, then frees the lease held by
 // the named owner with the current token.
 func (h *WorktreeLeaseHandler) Release(_ context.Context, in WorktreeReleaseInput) (WorktreeReleaseOutput, error) {
@@ -806,14 +872,15 @@ func (h *WorktreeLeaseHandler) Release(_ context.Context, in WorktreeReleaseInpu
 	return h.store.release(in.WorktreeID, in.OwnerID, in.FencingToken)
 }
 
-// AttachWorktreeLease registers the three lease tools on a server. NewServer
-// does not call it; repeating the attach leaves one of each tool.
+// AttachWorktreeLease registers the four lease tools on a server, including
+// the heartbeat. NewServer does not call it; repeating the attach leaves one of
+// each tool.
 func AttachWorktreeLease(server *mcpsdk.Server, handler *WorktreeLeaseHandler) {
 	if server == nil || handler == nil {
 		return
 	}
 	no := false
-	server.RemoveTools(LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName)
+	server.RemoveTools(LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName, HeartbeatWorktreeToolName)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        LeaseWorktreeToolName,
@@ -832,6 +899,15 @@ func AttachWorktreeLease(server *mcpsdk.Server, handler *WorktreeLeaseHandler) {
 			IdempotentHint:  false,
 		},
 	}, handler.HandleWrite)
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        HeartbeatWorktreeToolName,
+		Description: "Beat a worktree lease to learn whether it is still held. The result carries a single alive flag: true while the owner and fencing token still match a live lease, false once the lease expired, was released, or was taken by a new owner. Stop on the first false beat and do not write the result again. A beat is read-only and does not extend the TTL; the fencing token is still checked when writing.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  true,
+		},
+	}, handler.HandleHeartbeat)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ReleaseWorktreeToolName,
