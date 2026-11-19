@@ -64,6 +64,14 @@ type Receipt struct {
 	// configuration that produced it, not with today's configuration. Older
 	// lines without a version keep the zero value and still import.
 	Version AgentVersion `json:"version"`
+
+	// Verified reports whether the result passed its CI check (ADR 0040 §5,
+	// ADR 0022). Only a verified result is stored in results and published as
+	// delivered. An explicit false keeps the result inside the task: import
+	// stores no row and applies no deliveredAt, so wait_result stays pending.
+	// A receipt written before this flag existed has no verified field and is
+	// treated as verified, so an older receipts.jsonl still imports unchanged.
+	Verified bool `json:"verified"`
 }
 
 // AgentVersion is the version label of the agent that saved a receipt. It
@@ -259,6 +267,7 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 		At           json.RawMessage `json:"at"`
 		Source       json.RawMessage `json:"source"`
 		Version      json.RawMessage `json:"version"`
+		Verified     json.RawMessage `json:"verified"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -305,6 +314,15 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("receipt: bad version: %w", err)
 		}
 	}
+	// Absent or null means a legacy line from before verification was
+	// recorded; those results were accepted, so they stay verified. Only an
+	// explicit boolean can mark a result unverified.
+	r.Verified = true
+	if len(wire.Verified) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Verified), []byte("null")) {
+		if err := json.Unmarshal(wire.Verified, &r.Verified); err != nil {
+			return fmt.Errorf("receipt: bad verified: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -347,6 +365,7 @@ type ImportReceiptsResult struct {
 	Duplicates  int  // pairs already stored, no second effect applied
 	Malformed   int  // complete lines that failed validation
 	Missing     int  // receipts with no matching obligation
+	Unverified  int  // valid results that failed CI verification; not stored or published
 	PartialTail bool // trailing bytes without a newline were ignored
 }
 
@@ -354,6 +373,8 @@ type ImportReceiptsResult struct {
 // matching obligations in one transaction. A missing file is a no-op: no
 // receipt means indeterminate, not failed. A final line without a newline is
 // ignored, as are blank and malformed lines; neither stops the other lines.
+// Only a verified result is stored. An explicit verified=false line is counted
+// and skipped, keeping the result inside its task until a verified line arrives.
 func (d *DB) ImportReceipts(path string) (ImportReceiptsResult, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -380,6 +401,13 @@ func (d *DB) ImportReceipts(path string) (ImportReceiptsResult, error) {
 		var receipt Receipt
 		if err := json.Unmarshal(line, &receipt); err != nil {
 			result.Malformed++
+			continue
+		}
+		if !receipt.Verified {
+			// A failed or missing CI check leaves the result inside the task
+			// with verified=false as its reason. It is not written to results
+			// and sets no deliveredAt, so the call keeps waiting (ADR 0040 §5).
+			result.Unverified++
 			continue
 		}
 		entries = append(entries, entry{receipt: receipt, raw: line})
@@ -657,6 +685,9 @@ func (d *DB) Receipts(obligationID string) ([]Receipt, error) {
 			return nil, err
 		}
 		r.At = time.Unix(0, atNano).UTC()
+		// Only verified results reach the table, so a stored receipt is
+		// verified by construction (ADR 0040 §5).
+		r.Verified = true
 		if source != "" {
 			if err := json.Unmarshal([]byte(source), &r.Source); err != nil {
 				return nil, fmt.Errorf("store: receipts: decode source: %w", err)

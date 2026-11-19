@@ -71,6 +71,12 @@ func receiptLineWithVersion(obligationID string, attempt int, outcome, version s
 		obligationID, attempt, outcome, testReceiptAt, worktreeSourceJSON("result.json"), version)
 }
 
+func receiptLineWithVerified(obligationID string, attempt int, outcome string, verified bool) string {
+	return fmt.Sprintf(
+		`{"obligationID":%q,"attempt":%d,"outcome":%q,"at":%q,"source":%s,"verified":%t}`,
+		obligationID, attempt, outcome, testReceiptAt, worktreeSourceJSON("result.json"), verified)
+}
+
 func TestImportReceiptsIdempotent(t *testing.T) {
 	d := newReceiptDB(t)
 	seedReceiptObligation(t, d, "obl-1")
@@ -703,5 +709,189 @@ func TestReceiptVersionColumnAddedToLegacyTable(t *testing.T) {
 	}
 	if !hasVersion {
 		t.Error("legacy receipts table has no version column")
+	}
+}
+
+// ADR 0040 §5: only a verified result reaches results. An unverified result
+// stays inside its task with verified=false as its reason and publishes no
+// deliveredAt, so wait_result keeps waiting.
+func TestImportReceiptsUnverifiedNotStored(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "unverified")
+
+	path := writeReceiptsFile(t, receiptLineWithVerified("unverified", 1, "posted", false)+"\n")
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Lines != 1 || result.Imported != 0 || result.Unverified != 1 || result.Malformed != 0 {
+		t.Fatalf("result = %+v, want 1 line, 0 imported, 1 unverified, 0 malformed", result)
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("receipt count = %d, want 0", count)
+	}
+	got, err := d.Receipts("unverified")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("stored receipts = %+v, want none for an unverified result", got)
+	}
+	o, err := d.Obligation("unverified")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if !o.DeliveredAt.IsZero() {
+		t.Errorf("deliveredAt = %v, want zero", o.DeliveredAt)
+	}
+	if len(o.Attempts) != 0 {
+		t.Errorf("attempts = %+v, want none", o.Attempts)
+	}
+	pending, err := d.PendingObligations()
+	if err != nil {
+		t.Fatalf("PendingObligations: %v", err)
+	}
+	found := false
+	for _, p := range pending {
+		if p.ID == "unverified" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("unverified obligation is no longer pending")
+	}
+}
+
+func TestImportReceiptsUnverifiedKeepsWaitUntilVerified(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "wait")
+
+	unverified := receiptLineWithVerified("wait", 1, "posted", false)
+	first, err := d.ImportReceipts(writeReceiptsFile(t, unverified+"\n"))
+	if err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	if first.Imported != 0 || first.Unverified != 1 {
+		t.Fatalf("first import = %+v, want 0 imported and 1 unverified", first)
+	}
+	before, err := d.Obligation("wait")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if !before.DeliveredAt.IsZero() || len(before.Attempts) != 0 {
+		t.Fatalf("unverified result was published: %+v", before)
+	}
+
+	// The same (obligationID, attempt) arrives later with a passing check.
+	// The unverified row was never stored, so the verified one is new.
+	verified := receiptLineWithVerified("wait", 1, "posted", true)
+	second, err := d.ImportReceipts(writeReceiptsFile(t, unverified+"\n"+verified+"\n"))
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if second.Imported != 1 || second.Unverified != 1 || second.Malformed != 0 {
+		t.Fatalf("second import = %+v, want 1 imported and 1 unverified", second)
+	}
+	after, err := d.Obligation("wait")
+	if err != nil {
+		t.Fatalf("Obligation after verification: %v", err)
+	}
+	if after.DeliveredAt.IsZero() {
+		t.Error("verified result did not set deliveredAt")
+	}
+	if len(after.Attempts) != 1 || after.Attempts[0].Outcome != domain.OutcomePosted {
+		t.Errorf("attempts = %+v, want one posted attempt", after.Attempts)
+	}
+}
+
+func TestImportReceiptsLegacyLineWithoutVerifiedIsVerified(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "legacy")
+
+	// A receipts.jsonl written before verification was recorded has no
+	// verified field. It must still import, as older lines still do.
+	path := writeReceiptsFile(t, receiptLine("legacy", 1, "posted")+"\n")
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 1 || result.Unverified != 0 {
+		t.Fatalf("result = %+v, want 1 imported and 0 unverified", result)
+	}
+	got, err := d.Receipts("legacy")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 1 || !got[0].Verified {
+		t.Errorf("stored receipts = %+v, want one verified receipt", got)
+	}
+	o, err := d.Obligation("legacy")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if o.DeliveredAt.IsZero() {
+		t.Error("legacy posted receipt did not set deliveredAt")
+	}
+}
+
+func TestReceiptsOnlyContainVerifiedResults(t *testing.T) {
+	d := newReceiptDB(t)
+	for _, id := range []string{"v-yes", "v-no"} {
+		seedReceiptObligation(t, d, id)
+	}
+	lines := []string{
+		receiptLineWithVerified("v-yes", 1, "posted", true),
+		receiptLineWithVerified("v-no", 1, "posted", false),
+	}
+	if _, err := d.ImportReceipts(writeReceiptsFile(t, strings.Join(lines, "\n")+"\n")); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	yes, err := d.Receipts("v-yes")
+	if err != nil {
+		t.Fatalf("Receipts(v-yes): %v", err)
+	}
+	if len(yes) != 1 || !yes[0].Verified {
+		t.Fatalf("verified receipts = %+v, want one verified result", yes)
+	}
+	no, err := d.Receipts("v-no")
+	if err != nil {
+		t.Fatalf("Receipts(v-no): %v", err)
+	}
+	if len(no) != 0 {
+		t.Errorf("unverified receipts = %+v, want none in results", no)
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("receipt count = %d, want 1", count)
+	}
+}
+
+func TestImportReceiptsRejectsNonBoolVerified(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "v-bad")
+
+	line := `{"obligationID":"v-bad","attempt":1,"outcome":"posted","at":"` + testReceiptAt +
+		`","source":` + worktreeSourceJSON("result.json") + `,"verified":"yes"}`
+	result, err := d.ImportReceipts(writeReceiptsFile(t, line+"\n"))
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Malformed != 1 || result.Imported != 0 {
+		t.Fatalf("result = %+v, want 1 malformed and 0 imported", result)
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("receipt count = %d, want 0", count)
 	}
 }
