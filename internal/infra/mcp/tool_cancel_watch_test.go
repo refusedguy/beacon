@@ -246,22 +246,49 @@ func TestCancelWatchSubscriberLastOneClosesWatch(t *testing.T) {
 }
 
 func TestCancelWatchHandlerReadsSessionIDFromMeta(t *testing.T) {
-	svc, store, log, _ := cancelTestService()
+	const sessionID = "session-exec-1"
+	w := cancelFixtureWatch()
+	w.Subscribers[0].ID = sessionID
+	store := newCancelTestStore(w)
+	log := &cancelTestLog{}
+	at := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	svc := NewCancelWatcher(store, log, cancelTestClock{at: at})
 	handler := CancelWatchHandler(svc)
-	req := cancelWatchRequest("session-exec-1")
+	req := cancelWatchRequest(sessionID)
 	in := CancelWatchInput{WatchID: "watch-1", Scope: CancelScopeSubscriber}
 
 	_, out, err := handler(context.Background(), req, in)
 	if err != nil || !out.OK {
 		t.Fatalf("handler: ok=%v err=%v", out.OK, err)
 	}
-	if len(log.events) != 1 || log.events[0].SubscriberID != "session-exec-1" {
-		t.Fatalf("event subscriberID = %+v, want session-exec-1", log.events)
+	if len(log.events) != 1 || log.events[0].SubscriberID != sessionID {
+		t.Fatalf("event subscriberID = %+v, want %q", log.events, sessionID)
+	}
+	if log.events[0].Scope != CancelScopeSubscriber {
+		t.Errorf("event scope = %q, want %q", log.events[0].Scope, CancelScopeSubscriber)
 	}
 	for _, s := range store.watches["watch-1"].Subscribers {
-		if s.ID == "session-exec-1" {
+		if s.ID == sessionID {
 			t.Fatal("caller subscriber was not removed")
 		}
+	}
+}
+
+func TestCancelWatchSubscriberWithoutMetaIsRejected(t *testing.T) {
+	svc, store, log, _ := cancelTestService()
+	handler := CancelWatchHandler(svc)
+	in := CancelWatchInput{WatchID: "watch-1", Scope: CancelScopeSubscriber}
+
+	_, out, err := handler(context.Background(), cancelWatchRequest(""), in)
+	if out.OK {
+		t.Fatal("ok = true for subscriber scope without a sessionID")
+	}
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+		t.Fatalf("error = %v, want INVALID_INPUT", err)
+	}
+	if len(log.events) != 0 || store.saves != 0 {
+		t.Fatalf("rejected call mutated state: events=%d saves=%d", len(log.events), store.saves)
 	}
 }
 

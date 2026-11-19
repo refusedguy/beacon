@@ -238,10 +238,10 @@ func removeCancelSubscriber(subscribers []domain.Subscriber, id string) ([]domai
 	return kept, true
 }
 
-// cancelWatchCallerSessionID reads the opaque sessionID from _meta. It is used
-// only to name the subscriber; the value is never parsed or used for access.
+// cancelWatchCallerSessionID reads the opaque sessionID from _meta. The core
+// never parses it and never uses it for access (WORKER-PROMPT §2, ADR 0001).
 func cancelWatchCallerSessionID(req *mcpsdk.CallToolRequest) string {
-	if req == nil || req.Params == nil {
+	if req == nil || req.Params == nil || req.Params.Meta == nil {
 		return ""
 	}
 	v, ok := req.Params.Meta[cancelWatchMetaKey]
@@ -252,7 +252,8 @@ func cancelWatchCallerSessionID(req *mcpsdk.CallToolRequest) string {
 	return s
 }
 
-// CancelWatchHandler adapts CancelWatcher to a typed MCP tool handler.
+// CancelWatchHandler adapts CancelWatcher to a typed MCP tool handler. The
+// caller's subscriber id is the opaque sessionID from _meta.
 func CancelWatchHandler(svc *CancelWatcher) mcpsdk.ToolHandlerFor[CancelWatchInput, CancelWatchOutput] {
 	return func(ctx context.Context, req *mcpsdk.CallToolRequest, in CancelWatchInput) (*mcpsdk.CallToolResult, CancelWatchOutput, error) {
 		var subscriberID string
