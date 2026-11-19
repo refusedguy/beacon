@@ -361,3 +361,186 @@ func TestSQLObligationStamperMissingObligation(t *testing.T) {
 	_, _, err := stamper.StampRead(context.Background(), "no-such-obligation", time.Now())
 	assertCode(t, err, domain.CodeWatchNotFound)
 }
+
+// greenWatch is a Watch where every rubric criterion passes. All checks are
+// green, the merge is clean and the verdict is ready.
+func greenWatch() domain.Watch {
+	return domain.Watch{
+		ID:       "w-green",
+		Status:   domain.StatusClosed,
+		Verdict:  domain.VerdictReady,
+		Revision: 1,
+		Checks: map[string]domain.Check{
+			"ci/test": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+		},
+		Merge:    domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
+		ClosedAt: time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC),
+	}
+}
+
+func criterionByID(t *testing.T, ev RubricEvaluation, id CriterionID) CriterionEvaluation {
+	t.Helper()
+	for _, c := range ev.Criteria {
+		if c.Criterion == id {
+			return c
+		}
+	}
+	t.Fatalf("criterion %q missing from evaluation %+v", id, ev)
+	return CriterionEvaluation{}
+}
+
+// TestGradeResultFinishedRunIsNotDone is the headline case of ADR 0034 §1:
+// the run reached a terminal state, yet the work failed, so the verdict is
+// failed and no ready verdict is stamped on the task.
+func TestGradeResultFinishedRunIsNotDone(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	w.Status = domain.StatusClosed
+	w.ClosedAt = time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+
+	ev := gradeResult(w, DefaultResultRubric(), 0, false)
+
+	if ev.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want %q", ev.Outcome, OutcomeFailed)
+	}
+	if ev.ReadyVerdict != "" {
+		t.Errorf("readyVerdict = %q, want empty for a failed result", ev.ReadyVerdict)
+	}
+	if !criterionByID(t, ev, CriterionRunFinished).Passed {
+		t.Error("run_finished should pass: the run did reach a terminal state")
+	}
+	checks := criterionByID(t, ev, CriterionRequiredChecksOK)
+	if checks.Passed || !strings.Contains(checks.Explanation, "ci/failure") {
+		t.Errorf("required_checks_ok = %+v, want failed naming ci/failure", checks)
+	}
+	if merge := criterionByID(t, ev, CriterionMergeReady); merge.Passed {
+		t.Errorf("merge_ready should fail on a DIRTY merge: %+v", merge)
+	}
+}
+
+// TestGradeResultSatisfiedByRubric proves the ready verdict is produced only
+// when every verifiable criterion passes.
+func TestGradeResultSatisfiedByRubric(t *testing.T) {
+	ev := gradeResult(greenWatch(), DefaultResultRubric(), 0, false)
+
+	if ev.Outcome != OutcomeSatisfied {
+		t.Fatalf("outcome = %q, want %q", ev.Outcome, OutcomeSatisfied)
+	}
+	if ev.ReadyVerdict != domain.VerdictReady {
+		t.Errorf("readyVerdict = %q, want %q", ev.ReadyVerdict, domain.VerdictReady)
+	}
+	for _, c := range ev.Criteria {
+		if !c.Passed {
+			t.Errorf("criterion %q failed: %s", c.Criterion, c.Explanation)
+		}
+	}
+}
+
+// TestGradeResultNeedsRevisionCarriesExplanations checks that an unfinished
+// run feeds every criterion explanation back to the next iteration.
+func TestGradeResultNeedsRevisionCarriesExplanations(t *testing.T) {
+	ev := gradeResult(resultFixture(domain.VerdictKeepWorking), DefaultResultRubric(), 0, false)
+
+	if ev.Outcome != OutcomeNeedsRevision {
+		t.Fatalf("outcome = %q, want %q", ev.Outcome, OutcomeNeedsRevision)
+	}
+	if ev.ReadyVerdict != "" {
+		t.Errorf("readyVerdict = %q, want empty", ev.ReadyVerdict)
+	}
+	if len(ev.Criteria) != len(DefaultResultRubric().Criteria) {
+		t.Fatalf("criteria count = %d, want %d", len(ev.Criteria), len(DefaultResultRubric().Criteria))
+	}
+	for _, c := range ev.Criteria {
+		if c.Explanation == "" {
+			t.Errorf("criterion %q has no explanation", c.Criterion)
+		}
+	}
+}
+
+// TestGradeResultIterationCap covers the default budget, a custom budget and
+// the twenty-iteration ceiling from ADR 0034 §1.
+func TestGradeResultIterationCap(t *testing.T) {
+	w := resultFixture(domain.VerdictKeepWorking)
+
+	ev := gradeResult(w, DefaultResultRubric(), defaultOutcomeIterations, false)
+	if ev.Outcome != OutcomeMaxIterationsReached || ev.MaxIterations != defaultOutcomeIterations {
+		t.Fatalf("default cap = %q/%d, want %q/%d", ev.Outcome, ev.MaxIterations, OutcomeMaxIterationsReached, defaultOutcomeIterations)
+	}
+
+	custom := ResultRubric{Criteria: []CriterionID{CriterionRequiredChecksOK}, MaxIterations: 5}
+	ev = gradeResult(w, custom, 5, false)
+	if ev.Outcome != OutcomeMaxIterationsReached || ev.MaxIterations != 5 {
+		t.Fatalf("custom cap = %q/%d, want %q/5", ev.Outcome, ev.MaxIterations, OutcomeMaxIterationsReached)
+	}
+
+	over := ResultRubric{Criteria: []CriterionID{CriterionRequiredChecksOK}, MaxIterations: maxOutcomeIterations + 5}
+	ev = gradeResult(w, over, maxOutcomeIterations+5, false)
+	if ev.MaxIterations != maxOutcomeIterations || ev.Outcome != OutcomeMaxIterationsReached {
+		t.Fatalf("ceiling = %q/%d, want %q/%d", ev.Outcome, ev.MaxIterations, OutcomeMaxIterationsReached, maxOutcomeIterations)
+	}
+
+	zero := ResultRubric{Criteria: []CriterionID{CriterionRequiredChecksOK}}
+	ev = gradeResult(w, zero, 0, false)
+	if ev.MaxIterations != defaultOutcomeIterations || ev.Outcome != OutcomeNeedsRevision {
+		t.Fatalf("zero budget = %q/%d, want %q/%d", ev.Outcome, ev.MaxIterations, OutcomeNeedsRevision, defaultOutcomeIterations)
+	}
+}
+
+// TestGradeResultInterruptedWins proves a caller-driven interruption is never
+// reported as a satisfied result, even when all criteria pass.
+func TestGradeResultInterruptedWins(t *testing.T) {
+	ev := gradeResult(greenWatch(), DefaultResultRubric(), 0, true)
+
+	if ev.Outcome != OutcomeInterrupted {
+		t.Fatalf("outcome = %q, want %q", ev.Outcome, OutcomeInterrupted)
+	}
+	if ev.ReadyVerdict != "" {
+		t.Errorf("readyVerdict = %q, want empty when interrupted", ev.ReadyVerdict)
+	}
+}
+
+// TestGradeResultUnknownCriterion makes an undefined criterion a failing one
+// with an explanation instead of a silent pass.
+func TestGradeResultUnknownCriterion(t *testing.T) {
+	rubric := ResultRubric{Criteria: []CriterionID{"not_defined"}, MaxIterations: 1}
+	ev := gradeResult(greenWatch(), rubric, 1, false)
+
+	c := criterionByID(t, ev, "not_defined")
+	if c.Passed || c.Explanation != "unknown criterion" {
+		t.Errorf("unknown criterion = %+v", c)
+	}
+	if ev.Outcome != OutcomeMaxIterationsReached {
+		t.Errorf("outcome = %q, want %q", ev.Outcome, OutcomeMaxIterationsReached)
+	}
+}
+
+// TestGradeResultIsSeparateFromDelivery checks that the grader re-reads Watch
+// facts from the store and leaves the delivery stamps untouched.
+func TestGradeResultIsSeparateFromDelivery(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	w.Status = domain.StatusClosed
+	w.ClosedAt = time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+	o := resultObligation(w, "session-G")
+	store := newMemStore()
+	_ = store.SaveWatch(w)
+	_ = store.SaveObligation(o)
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+
+	ev, err := h.GradeResult(context.Background(), w.ID, DefaultResultRubric(), 0, false)
+	if err != nil {
+		t.Fatalf("GradeResult: %v", err)
+	}
+	if ev.Outcome != OutcomeFailed {
+		t.Fatalf("outcome = %q, want %q", ev.Outcome, OutcomeFailed)
+	}
+	reads, claims := stamper.counts()
+	if reads != 0 || claims != 0 {
+		t.Errorf("grading stamped the obligation: read %d claim %d", reads, claims)
+	}
+
+	_, err = h.GradeResult(context.Background(), "", DefaultResultRubric(), 0, false)
+	assertCode(t, err, domain.CodeInvalidInput)
+	_, err = h.GradeResult(context.Background(), "missing", DefaultResultRubric(), 0, false)
+	assertCode(t, err, domain.CodeWatchNotFound)
+}
