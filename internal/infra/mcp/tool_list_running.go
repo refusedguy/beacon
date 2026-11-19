@@ -4,9 +4,12 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
+	"syscall"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -17,7 +20,12 @@ import (
 // observability tools. A SnapshotReader produces it. No field is sourced from
 // a write path, so the tools only project what was already persisted.
 type StateSnapshot struct {
-	ActiveWatches   []domain.Watch
+	ActiveWatches []domain.Watch
+	// Sessions carries the disk signals used to decide session liveness
+	// without probing processes (ADR 0036 §4). The wiring layer fills it when
+	// session artifacts and recorded PIDs are available; a snapshot without
+	// sessions keeps the previous behavior.
+	Sessions        []SessionLiveness
 	PointsThisHour  int
 	Budget          int
 	PersistSeq      uint64
@@ -26,6 +34,21 @@ type StateSnapshot struct {
 	LadderPending   int
 	LadderEscalated int
 	Version         string
+}
+
+// StatusIdle is the status beacon_list_running reports for a watch whose agent
+// session is gone. It is a projection only: the store keeps the original
+// lifecycle status and never receives idle as a domain.Status (ADR 0036 §4).
+const StatusIdle = "idle"
+
+// SessionLiveness holds the disk signals used to decide whether an agent
+// session is still live (ADR 0036 §4). SessionID matches a subscriber's Target.
+// Artifacts are paths Beacon expects on disk while the session is active. PID
+// is the process recorded when the session started.
+type SessionLiveness struct {
+	SessionID string   `json:"sessionID"`
+	Artifacts []string `json:"artifacts"`
+	PID       int      `json:"pid"`
 }
 
 // SnapshotReader is the single read-only state accessor used by
@@ -109,15 +132,83 @@ func decodeEventCursor(s string) (uint64, error) {
 	return seq, nil
 }
 
+// processAlive checks one recorded PID with signal 0. The kernel reports
+// whether the process exists without delivering a signal, so this neither
+// enumerates processes nor starts ps (ADR 0036 §4). EPERM still means the
+// process is alive but owned by another user. The variable is replaceable in
+// tests; production uses the same syscall the taskstore lock uses.
+var processAlive = func(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// artifactsPresent reports whether every expected artifact path is a regular
+// file on disk. An empty list adds no requirement.
+func artifactsPresent(paths []string) bool {
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+// sessionLive combines the two liveness signals from ADR 0036 §4. A dead
+// recorded PID makes the session idle at once. With a live or unknown PID the
+// artifact files decide. A session with neither signal is unknown and is left
+// alone, so callers that supply no liveness data keep the previous behavior.
+func sessionLive(s SessionLiveness) bool {
+	if s.PID == 0 && len(s.Artifacts) == 0 {
+		return true
+	}
+	if s.PID != 0 && !processAlive(s.PID) {
+		return false
+	}
+	return artifactsPresent(s.Artifacts)
+}
+
+// effectiveStatus projects a stored watch status into the status Beacon
+// reports. A closed watch stays closed. Otherwise, if any subscriber belongs
+// to a session that is no longer live, the watch is idle (ADR 0036 §4).
+func effectiveStatus(w domain.Watch, sessions map[string]SessionLiveness) domain.Status {
+	if w.Status == domain.StatusClosed {
+		return w.Status
+	}
+	for _, sub := range w.Subscribers {
+		s, ok := sessions[sub.Target]
+		if ok && !sessionLive(s) {
+			return domain.Status(StatusIdle)
+		}
+	}
+	return w.Status
+}
+
+// statusRank orders the projected statuses: closed outranks idle, idle
+// outranks notifying and notifying outranks watching.
+func statusRank(s string) int {
+	switch domain.Status(s) {
+	case domain.StatusClosed:
+		return 3
+	case StatusIdle:
+		return 2
+	case domain.StatusNotifying:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // aggregateStatus returns the lifecycle status implied by the observed events.
-// A terminal watch wins over notifying, which wins over watching.
+// A closed watch wins over idle, which wins over notifying, which wins over
+// watching.
 func aggregateStatus(events []WatchEvent) string {
 	status := string(domain.StatusWatching)
 	for _, ev := range events {
-		if ev.Status == string(domain.StatusClosed) {
-			return ev.Status
-		}
-		if ev.Status == string(domain.StatusNotifying) {
+		if statusRank(ev.Status) > statusRank(status) {
 			status = ev.Status
 		}
 	}
@@ -140,11 +231,17 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 		return nil, ListRunningOutput{}, fmt.Errorf("beacon_list_running: %w", err)
 	}
 
+	sessions := make(map[string]SessionLiveness, len(snap.Sessions))
+	for _, s := range snap.Sessions {
+		sessions[s.SessionID] = s
+	}
+
 	watches := make([]domain.Watch, 0, len(snap.ActiveWatches))
 	for _, w := range snap.ActiveWatches {
 		if in.Filters != nil && !in.Filters.matches(w) {
 			continue
 		}
+		w.Status = effectiveStatus(w, sessions)
 		watches = append(watches, w)
 	}
 
@@ -164,7 +261,7 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 		ev := WatchEvent{
 			Seq:     uint64(i + 1),
 			WatchID: w.ID,
-			Status:  string(w.Status),
+			Status:  string(effectiveStatus(w, sessions)),
 			Verdict: string(w.Verdict),
 		}
 		events = append(events, ev)
