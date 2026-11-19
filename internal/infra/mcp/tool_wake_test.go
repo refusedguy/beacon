@@ -247,3 +247,165 @@ func TestWakeOverInMemoryTransport(t *testing.T) {
 		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
 	}
 }
+
+// TestWakeInterruptsWhenHumanNeeded is the T2.24 acceptance test (ADR 0028).
+// Either human flag stops the wait before any delivery is attempted and the
+// response names the cause. Both flags together name both causes.
+func TestWakeInterruptsWhenHumanNeeded(t *testing.T) {
+	cases := []struct {
+		name       string
+		in         WakeInput
+		reasonPart string
+		alsoPart   string
+	}{
+		{
+			name: "pending question",
+			in: WakeInput{
+				Target:             "session-1",
+				Text:               "obligation-1@7",
+				HasPendingQuestion: true,
+			},
+			reasonPart: "question",
+		},
+		{
+			name: "pending approval",
+			in: WakeInput{
+				Target:          "session-1",
+				Text:            "obligation-1@7",
+				PendingApproval: true,
+			},
+			reasonPart: "approval",
+		},
+		{
+			name: "both flags",
+			in: WakeInput{
+				Target:             "session-1",
+				Text:               "obligation-1@7",
+				HasPendingQuestion: true,
+				PendingApproval:    true,
+			},
+			reasonPart: "question",
+			alsoPart:   "approval",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &fakeWakeSender{delivery: DeliverySteer}
+			out, err := NewWakeHandler(sender).Wake(context.Background(), tc.in)
+			if err != nil {
+				t.Fatalf("Wake() error = %v, want nil", err)
+			}
+			if !out.Interrupted {
+				t.Error("interrupted = false, want true")
+			}
+			if out.Delivery != DeliveryInterrupted {
+				t.Errorf("delivery = %q, want %q", out.Delivery, DeliveryInterrupted)
+			}
+			if out.OK {
+				t.Error("ok = true on interruption, want false (no follow-up delivered)")
+			}
+			if strings.TrimSpace(out.Reason) == "" {
+				t.Error("reason is empty on interruption, want an explanation")
+			}
+			if !strings.Contains(out.Reason, tc.reasonPart) {
+				t.Errorf("reason = %q, want it to mention %q", out.Reason, tc.reasonPart)
+			}
+			if tc.alsoPart != "" && !strings.Contains(out.Reason, tc.alsoPart) {
+				t.Errorf("reason = %q, want it to mention %q", out.Reason, tc.alsoPart)
+			}
+			if sender.calls != 0 {
+				t.Errorf("sender calls = %d, want 0 (no delivery attempt on interruption)", sender.calls)
+			}
+		})
+	}
+}
+
+// TestWakeInterruptionWinsOverMissingInput proves the human-needed signal is
+// not blocked by the usual target/text validation. A pending question must
+// stop the wait even when the delivery fields are absent.
+func TestWakeInterruptionWinsOverMissingInput(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{HasPendingQuestion: true})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.Interrupted || out.Delivery != DeliveryInterrupted {
+		t.Errorf("got interrupted=%v delivery=%q, want true/%q", out.Interrupted, out.Delivery, DeliveryInterrupted)
+	}
+	if out.Reason == "" {
+		t.Error("reason is empty, want the interruption cause")
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls = %d, want 0 on interruption", sender.calls)
+	}
+}
+
+// TestWakeSchemaHasHumanFlags proves the two ADR 0028 flags are part of the
+// wake tool's input schema, so an MCP client can send them. The SDK reflects
+// the schema from WakeInput; no hand-written JSON is involved.
+func TestWakeSchemaHasHumanFlags(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	for _, flag := range []string{"hasPendingQuestion", "pendingApproval"} {
+		if !strings.Contains(string(inputSchema), flag) {
+			t.Errorf("wake input schema missing %q: %s", flag, inputSchema)
+		}
+	}
+}
+
+// TestWakeInterruptionOverInMemoryTransport drives a human flag through a real
+// MCP client and server session. It proves the flag is decoded from the schema
+// and the interruption reason reaches the client, not just the local handler.
+func TestWakeInterruptionOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target:          "session-1",
+			Text:            "obligation-1@7",
+			PendingApproval: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if !out.Interrupted || out.Delivery != DeliveryInterrupted {
+		t.Errorf("client saw interrupted=%v delivery=%q, want true/%q", out.Interrupted, out.Delivery, DeliveryInterrupted)
+	}
+	if out.OK {
+		t.Error("client saw ok=true on interruption, want false")
+	}
+	if !strings.Contains(out.Reason, "approval") {
+		t.Errorf("client saw reason = %q, want it to mention approval", out.Reason)
+	}
+}
