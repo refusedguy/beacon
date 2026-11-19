@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -634,5 +635,240 @@ func TestTaskJournalRejectsEmptyInput(t *testing.T) {
 		if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
 			t.Errorf("AppendEvent(%q, %q) error = %v, want INVALID_INPUT", tc.taskID, tc.kind, err)
 		}
+	}
+}
+
+// TestInboxHeldMessageReturnedAfterRestart is the acceptance check for T3.65:
+// a message held (inflight) by a process is returned after that process is
+// replaced by one with the same PEER_NAME, and it is not duplicated.
+func TestInboxHeldMessageReturnedAfterRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	const peer = "peer-A"
+	msg := InboxMessage{
+		WatchID: "w1", Revision: 3, SubscriberID: "s1",
+		PeerName: peer, Payload: []byte(`{"kind":"wake"}`),
+	}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	if err := first.InboxPut(msg); err != nil {
+		first.Close()
+		t.Fatalf("InboxPut: %v", err)
+	}
+	claimed, err := first.InboxClaim(peer, now, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		first.Close()
+		t.Fatalf("InboxClaim before restart = %d, %v; want 1", len(claimed), err)
+	}
+	if claimed[0].State != inboxStateInflight {
+		first.Close()
+		t.Fatalf("held message state = %q, want %q", claimed[0].State, inboxStateInflight)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	// Restart with the same PEER_NAME. The lease from the dead process may not
+	// have expired, but reclaim by PEER_NAME must still return the held message.
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	defer second.Close()
+	got, err := second.InboxClaim(peer, now, time.Minute)
+	if err != nil {
+		t.Fatalf("InboxClaim after restart: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("InboxClaim after restart returned %d messages, want 1", len(got))
+	}
+	if want := InboxKey(msg.WatchID, msg.Revision, msg.SubscriberID); InboxKey(got[0].WatchID, got[0].Revision, got[0].SubscriberID) != want {
+		t.Fatalf("reclaimed key = %q, want %q", InboxKey(got[0].WatchID, got[0].Revision, got[0].SubscriberID), want)
+	}
+	if !bytes.Equal(got[0].Payload, msg.Payload) {
+		t.Errorf("reclaimed payload = %s, want %s", got[0].Payload, msg.Payload)
+	}
+	var count int
+	if err := second.readDB.QueryRow(`SELECT count(*) FROM inbox_messages`).Scan(&count); err != nil {
+		t.Fatalf("count inbox: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("inbox rows = %d, want 1 (restart must not duplicate)", count)
+	}
+}
+
+// TestInboxReclaimResetsStaleLease proves an expired lease does not keep a
+// message held forever: the same PEER_NAME reclaims it and can claim it again.
+func TestInboxReclaimResetsStaleLease(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	const peer = "worker"
+
+	if err := d.InboxPut(InboxMessage{
+		WatchID: "w2", Revision: 1, SubscriberID: "s2",
+		PeerName: peer, Payload: []byte("held"),
+	}); err != nil {
+		t.Fatalf("InboxPut: %v", err)
+	}
+	held, err := d.InboxClaim(peer, now, time.Minute)
+	if err != nil || len(held) != 1 {
+		t.Fatalf("InboxClaim = %d, %v; want 1", len(held), err)
+	}
+
+	// After the lease deadline passed the message is stale and must be freed.
+	later := now.Add(2 * time.Minute)
+	n, err := d.InboxReclaim(peer, later)
+	if err != nil || n != 1 {
+		t.Fatalf("InboxReclaim = %d, %v; want 1 stale lease reset", n, err)
+	}
+	rows, err := d.InboxMessages(peer)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("InboxMessages = %d, %v; want 1", len(rows), err)
+	}
+	if rows[0].State != inboxStatePending || rows[0].LeaseUntil != 0 {
+		t.Fatalf("reclaimed row = %+v, want pending with no lease", rows[0])
+	}
+	claimed, err := d.InboxClaim(peer, later, time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("InboxClaim after reclaim = %d, %v; want 1", len(claimed), err)
+	}
+}
+
+// TestInboxPutIdempotentByDeliveryKey checks the ADR 0039 §6 receiver key:
+// a repeat delivery is ignored, while a different revision is a new message.
+func TestInboxPutIdempotentByDeliveryKey(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	base := InboxMessage{WatchID: "w3", SubscriberID: "s3", PeerName: "peer"}
+
+	for _, payload := range []string{`{"n":1}`, `{"n":2}`} {
+		m := base
+		m.Revision = 1
+		m.Payload = []byte(payload)
+		if err := d.InboxPut(m); err != nil {
+			t.Fatalf("InboxPut: %v", err)
+		}
+	}
+	m2 := base
+	m2.Revision = 2
+	m2.Payload = []byte(`{"n":3}`)
+	if err := d.InboxPut(m2); err != nil {
+		t.Fatalf("InboxPut rev 2: %v", err)
+	}
+
+	rows, err := d.InboxMessages("peer")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("InboxMessages = %d, %v; want 2", len(rows), err)
+	}
+	for _, r := range rows {
+		if r.Revision == 1 && string(r.Payload) != `{"n":1}` {
+			t.Errorf("duplicate delivery overwrote stored payload: %s", r.Payload)
+		}
+	}
+}
+
+// TestInboxAckRemovesMessage is at-least-once: a message stays stored until
+// ack, and a repeated ack is harmless.
+func TestInboxAckRemovesMessage(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	now := time.Now().UTC()
+
+	msg := InboxMessage{
+		WatchID: "w4", Revision: 1, SubscriberID: "s4",
+		PeerName: "peer", Payload: []byte("body"),
+	}
+	if err := d.InboxPut(msg); err != nil {
+		t.Fatalf("InboxPut: %v", err)
+	}
+	if _, err := d.InboxClaim("peer", now, time.Minute); err != nil {
+		t.Fatalf("InboxClaim: %v", err)
+	}
+	rows, err := d.InboxMessages("peer")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("InboxMessages before ack = %d, %v; want 1", len(rows), err)
+	}
+
+	key := InboxKey(msg.WatchID, msg.Revision, msg.SubscriberID)
+	deleted, err := d.InboxAck(key)
+	if err != nil || !deleted {
+		t.Fatalf("InboxAck = %v, %v; want true", deleted, err)
+	}
+	again, err := d.InboxAck(key)
+	if err != nil || again {
+		t.Fatalf("repeat InboxAck = %v, %v; want false, no error", again, err)
+	}
+	rows, err = d.InboxMessages("peer")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("InboxMessages after ack = %d, %v; want 0", len(rows), err)
+	}
+}
+
+// TestInboxTreatsPeerPayloadAsUntrusted checks ADR 0039 §6 and T3.4: peer
+// messages pass through Redact before they are stored.
+func TestInboxTreatsPeerPayloadAsUntrusted(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	if err := d.InboxPut(InboxMessage{
+		WatchID: "w5", Revision: 1, SubscriberID: "s5",
+		PeerName: "peer", Payload: []byte("token " + secret),
+	}); err != nil {
+		t.Fatalf("InboxPut: %v", err)
+	}
+	rows, err := d.InboxMessages("peer")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("InboxMessages = %d, %v; want 1", len(rows), err)
+	}
+	if bytes.Contains(rows[0].Payload, []byte("ghp_")) {
+		t.Errorf("stored inbox payload kept a raw token: %s", rows[0].Payload)
+	}
+}
+
+func TestInboxRejectsEmptyInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	now := time.Now().UTC()
+
+	cases := []InboxMessage{
+		{Revision: 1, SubscriberID: "s", PeerName: "peer"},
+		{WatchID: "w", Revision: 1, PeerName: "peer"},
+		{WatchID: "w", Revision: 1, SubscriberID: "s"},
+	}
+	for _, m := range cases {
+		if err := d.InboxPut(m); err == nil {
+			t.Errorf("InboxPut(%+v) must fail", m)
+		} else {
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Errorf("InboxPut error = %v, want INVALID_INPUT", err)
+			}
+		}
+	}
+	if _, err := d.InboxClaim("", now, time.Minute); err == nil {
+		t.Error("InboxClaim with empty peer must fail")
+	}
+	if _, err := d.InboxReclaim("", now); err == nil {
+		t.Error("InboxReclaim with empty peer must fail")
 	}
 }
