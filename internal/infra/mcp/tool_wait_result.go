@@ -16,6 +16,12 @@
 // ack(continueOf), the same Watch can be waited on again: continueOf names that
 // Watch so the wait resumes the existing task instead of creating a new one.
 //
+// A wait bound to a CapabilityContext (ADR 0040 §1) is cancelled as a whole
+// tree when its calling agent disappears. The caller's departure cancels the
+// context, which delivers one reason to every task and writes it to the cancel
+// journal. The long-poll timeout stays a private case and never cancels a tree.
+// Capability matching from T3.47 is unchanged.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -226,6 +232,202 @@ func callerExitFromContext(ctx context.Context) CallerExit {
 	return CallerExit{Cancelled: done, SessionClosed: done, ConnectionBroken: done}
 }
 
+// CapabilityID identifies the calling agent's capability context. It is an
+// opaque label supplied by the composition root; wait_result never interprets
+// it (ADR 0040 §1). Selecting which worker takes a task stays with the
+// capability matching of T3.47.
+type CapabilityID string
+
+// CancelReason is the journal-ready cause of a capability-context cancellation.
+// A caller walking away is distinct from the private long-poll timeout, which
+// never cancels a tree (ADR 0040 §1).
+type CancelReason string
+
+const (
+	CancelCallerCancelled  CancelReason = "caller_cancelled"
+	CancelSessionClosed    CancelReason = "session_closed"
+	CancelConnectionBroken CancelReason = "connection_broken"
+	CancelContextEnded     CancelReason = "caller_context_ended"
+)
+
+// reasonErrorCode maps a disappearance reason to the contract error code the
+// cancelled wait reports. It mirrors the three departure channels of CallerExit.
+func reasonErrorCode(reason CancelReason) domain.ErrorCode {
+	switch reason {
+	case CancelSessionClosed, CancelConnectionBroken:
+		return domain.CodeGone
+	default:
+		return domain.CodeCancelled
+	}
+}
+
+// CancellationRecord is one journal line: a task, why it was cancelled and when.
+type CancellationRecord struct {
+	Owner  CapabilityID
+	TaskID string
+	Reason CancelReason
+	At     time.Time
+}
+
+// CancelledTask is one node of a cancelled tree with the reason it received.
+type CancelledTask struct {
+	TaskID string
+	Reason CancelReason
+}
+
+// CancelJournal is the sink for cancellation reasons (ADR 0040 §1). The
+// composition root supplies durable persistence; the in-memory sink below is
+// the default so a bound wait always has somewhere to record the reason.
+type CancelJournal interface {
+	RecordCancellation(CancellationRecord)
+}
+
+type memoryCancelJournal struct {
+	mu      sync.Mutex
+	records []CancellationRecord
+}
+
+// NewMemoryCancelJournal builds the in-process cancellation journal.
+func NewMemoryCancelJournal() CancelJournal { return &memoryCancelJournal{} }
+
+func (j *memoryCancelJournal) RecordCancellation(r CancellationRecord) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.records = append(j.records, r)
+}
+
+// Records returns a snapshot of the journal in insertion order.
+func (j *memoryCancelJournal) Records() []CancellationRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]CancellationRecord, len(j.records))
+	copy(out, j.records)
+	return out
+}
+
+// capabilityTask is one node of the cancellation tree. reason is set when the
+// context is cancelled and is delivered to the node's wait.
+type capabilityTask struct {
+	id       string
+	parentID string
+	reason   CancelReason
+}
+
+// CapabilityContext is the cancellation scope of one calling agent's capability
+// (ADR 0040 §1). It owns a tree of tasks: a root wait and its descendants.
+// Cancel cancels the entire tree, delivers one reason to every node and writes
+// each node to the journal. A cancelled context refuses new tasks, so a
+// descendant cannot resume work after the initiator disappears. It is safe for
+// concurrent use.
+type CapabilityContext struct {
+	owner     CapabilityID
+	journal   CancelJournal
+	clock     domain.Clock
+	mu        sync.Mutex
+	tasks     map[string]*capabilityTask
+	order     []string
+	done      chan struct{}
+	reason    CancelReason
+	cancelled bool
+}
+
+// NewCapabilityContext builds a scope. A nil journal falls back to an in-memory
+// sink and a nil clock to the wall clock.
+func NewCapabilityContext(owner CapabilityID, journal CancelJournal, clock domain.Clock) *CapabilityContext {
+	if journal == nil {
+		journal = NewMemoryCancelJournal()
+	}
+	if clock == nil {
+		clock = waitResultWallClock{}
+	}
+	return &CapabilityContext{
+		owner:   owner,
+		journal: journal,
+		clock:   clock,
+		tasks:   make(map[string]*capabilityTask),
+		done:    make(chan struct{}),
+	}
+}
+
+// Owner returns the capability this context belongs to.
+func (c *CapabilityContext) Owner() CapabilityID { return c.owner }
+
+// AddTask registers a task in the tree. An empty parentID registers a root;
+// otherwise the parent must already exist. Adding to a cancelled context is
+// refused so a descendant cannot restart work after the initiator disappears.
+func (c *CapabilityContext) AddTask(id, parentID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelled {
+		return domain.NewAppError(domain.CodeCancelled, "capability context is cancelled")
+	}
+	if id == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "capability task id is required")
+	}
+	if _, exists := c.tasks[id]; exists {
+		return domain.NewAppError(domain.CodeInvalidInput, "capability task already registered: "+id)
+	}
+	if parentID != "" {
+		if _, ok := c.tasks[parentID]; !ok {
+			return domain.NewAppError(domain.CodeInvalidInput, "capability parent task not registered: "+parentID)
+		}
+	}
+	c.tasks[id] = &capabilityTask{id: id, parentID: parentID}
+	c.order = append(c.order, id)
+	return nil
+}
+
+// Cancel cancels the whole tree with one reason. It is idempotent: the first
+// call delivers the reason to every node, writes one journal record per node
+// and closes Done; later calls do nothing.
+func (c *CapabilityContext) Cancel(reason CancelReason) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cancelled {
+		return
+	}
+	c.cancelled = true
+	c.reason = reason
+	at := c.clock.Now()
+	for _, id := range c.order {
+		t := c.tasks[id]
+		t.reason = reason
+		c.journal.RecordCancellation(CancellationRecord{
+			Owner: c.owner, TaskID: t.id, Reason: reason, At: at,
+		})
+	}
+	close(c.done)
+}
+
+// Done is closed when the context is cancelled. A wait bound to this context
+// selects on it and stops when the calling agent disappears.
+func (c *CapabilityContext) Done() <-chan struct{} { return c.done }
+
+// IsCancelled reports whether Cancel has run.
+func (c *CapabilityContext) IsCancelled() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cancelled
+}
+
+// Reason returns the cancellation reason, or empty before cancellation.
+func (c *CapabilityContext) Reason() CancelReason {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reason
+}
+
+// CancelledTasks returns a snapshot of every node with the reason it received.
+func (c *CapabilityContext) CancelledTasks() []CancelledTask {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]CancelledTask, 0, len(c.order))
+	for _, id := range c.order {
+		out = append(out, CancelledTask{TaskID: id, Reason: c.tasks[id].reason})
+	}
+	return out
+}
+
 // WaitResultWriter marks one obligation read. The implementation must commit
 // the mutation before returning so the response is never sent ahead of the
 // disk write (WORKER-PROMPT §4.2 non-invariant 7).
@@ -309,6 +511,7 @@ type WaitResultService struct {
 	after       func(time.Duration) <-chan time.Time
 	departures  func(*mcpsdk.CallToolRequest) CallerExit
 	idempotency WaitResultIdempotencyStore
+	capability  func(*mcpsdk.CallToolRequest) *CapabilityContext
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -343,6 +546,16 @@ func (s *WaitResultService) SetIdempotencyStore(store WaitResultIdempotencyStore
 func (s *WaitResultService) SetDepartureProvider(fn func(*mcpsdk.CallToolRequest) CallerExit) {
 	if s != nil {
 		s.departures = fn
+	}
+}
+
+// SetCapabilityScope sets the provider that binds a request to the calling
+// agent's capability context (ADR 0040 §1). A disappearance then cancels the
+// context and its whole task tree. Without a provider a wait is stopped only by
+// its own departure channels and is not tree-cancellable.
+func (s *WaitResultService) SetCapabilityScope(fn func(*mcpsdk.CallToolRequest) *CapabilityContext) {
+	if s != nil {
+		s.capability = fn
 	}
 }
 
@@ -383,23 +596,58 @@ func isWaitResultVerdict(v domain.Verdict) bool {
 // Only successful outcomes are recorded: a departure or an error leaves no key
 // behind, so a later retry can still run the wait and produce a result.
 func (s *WaitResultService) Wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit) (WaitResultOutput, error) {
+	return s.waitScoped(ctx, subscriberID, in, exits, nil)
+}
+
+// WaitInCapability runs the wait inside the calling agent's capability context
+// (ADR 0040 §1). A caller disappearance cancels the context and its whole task
+// tree; the long-poll timeout does not. The plain Wait keeps the pre-capability
+// behaviour for callers that bind no context.
+func (s *WaitResultService) WaitInCapability(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
+	return s.waitScoped(ctx, subscriberID, in, exits, capCtx)
+}
+
+// waitScoped applies clientRequestId idempotency around the long-poll. A
+// departure or an error leaves no key behind, including a capability timeout.
+func (s *WaitResultService) waitScoped(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
 	if s == nil || in.ClientRequestID == "" || s.idempotency == nil {
-		return s.wait(ctx, subscriberID, in, exits)
+		return s.wait(ctx, subscriberID, in, exits, capCtx)
 	}
 	if out, ok := s.idempotency.Lookup(in.ClientRequestID); ok {
 		return out, nil
 	}
-	out, err := s.wait(ctx, subscriberID, in, exits)
+	out, err := s.wait(ctx, subscriberID, in, exits, capCtx)
 	if err == nil {
 		s.idempotency.Record(in.ClientRequestID, out)
 	}
 	return out, err
 }
 
+// cancelledByCapability builds the error for a wait whose capability context is
+// already cancelled. The reason travels with the error so a caller can see why.
+func cancelledByCapability(capCtx *CapabilityContext) (WaitResultOutput, error) {
+	reason := capCtx.Reason()
+	if reason == "" {
+		reason = CancelContextEnded
+	}
+	return WaitResultOutput{}, domain.NewAppError(reasonErrorCode(reason), "wait_result: capability context cancelled: "+string(reason))
+}
+
+// depart cancels the whole capability tree before returning a departure error.
+// A nil context keeps the original departure behaviour: no write, no key.
+func (s *WaitResultService) depart(capCtx *CapabilityContext, reason CancelReason, code domain.ErrorCode, msg string) (WaitResultOutput, error) {
+	if capCtx != nil {
+		capCtx.Cancel(reason)
+	}
+	return WaitResultOutput{}, domain.NewAppError(code, msg)
+}
+
 // wait runs the bounded long-poll. A result verdict writes readAt through the
 // writer and returns; a timeout or any caller departure returns without a
-// write, so no obligation is created and no delivery is marked.
-func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit) (WaitResultOutput, error) {
+// write, so no obligation is created and no delivery is marked. When capCtx is
+// set, a departure also cancels that context's entire task tree and journals
+// the reason (ADR 0040 §1).
+func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
 	if in.WatchID == "" {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: watchID is required")
 	}
@@ -408,6 +656,9 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	}
 	if s == nil || s.store == nil {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, "wait_result: store is nil")
+	}
+	if capCtx != nil && capCtx.IsCancelled() {
+		return cancelledByCapability(capCtx)
 	}
 
 	w, err := s.store.Watch(in.WatchID)
@@ -452,16 +703,27 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	}
 	timeoutCh := after(time.Duration(effectiveTimeoutMs(in.TimeoutMs)) * time.Millisecond)
 
+	// A nil channel disables the case, so an unbound wait keeps its original
+	// select set. A bound wait also stops when its capability context is
+	// cancelled, for example when another wait on the same tree sees the caller
+	// disappear and tears the tree down.
+	var capDone <-chan struct{}
+	if capCtx != nil {
+		capDone = capCtx.Done()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
-			return WaitResultOutput{}, domain.NewAppError(domain.CodeCancelled, "wait_result: caller context ended")
+			return s.depart(capCtx, CancelContextEnded, domain.CodeCancelled, "wait_result: caller context ended")
 		case <-exits.Cancelled:
-			return WaitResultOutput{}, domain.NewAppError(domain.CodeCancelled, "wait_result: caller cancelled")
+			return s.depart(capCtx, CancelCallerCancelled, domain.CodeCancelled, "wait_result: caller cancelled")
 		case <-exits.SessionClosed:
-			return WaitResultOutput{}, domain.NewAppError(domain.CodeGone, "wait_result: session closed")
+			return s.depart(capCtx, CancelSessionClosed, domain.CodeGone, "wait_result: session closed")
 		case <-exits.ConnectionBroken:
-			return WaitResultOutput{}, domain.NewAppError(domain.CodeGone, "wait_result: connection broken")
+			return s.depart(capCtx, CancelConnectionBroken, domain.CodeGone, "wait_result: connection broken")
+		case <-capDone:
+			return cancelledByCapability(capCtx)
 		case <-timeoutCh:
 			return watchingOutput(revision, checks), nil
 		case update, ok := <-updates:
@@ -569,7 +831,11 @@ func (s *WaitResultService) Handle(ctx context.Context, req *mcpsdk.CallToolRequ
 	if s != nil && s.departures != nil {
 		exits = s.departures(req)
 	}
-	out, err := s.Wait(ctx, subscriberID, in, exits)
+	var capCtx *CapabilityContext
+	if s != nil && s.capability != nil {
+		capCtx = s.capability(req)
+	}
+	out, err := s.WaitInCapability(ctx, subscriberID, in, exits, capCtx)
 	return &mcpsdk.CallToolResult{}, out, err
 }
 
