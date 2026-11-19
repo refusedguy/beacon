@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 
@@ -255,6 +256,48 @@ func TestAllOutputSchemas(t *testing.T) {
 	assertSchemaFromType[OKOutput](t, schemas["beacon_ack"])
 	assertSchemaFromType[OKOutput](t, schemas["beacon_cancel_watch"])
 	assertSchemaFromType[StatsOutput](t, schemas["beacon_stats"])
+}
+
+// TestGetResultSchemaDerivesTaskFields proves the dialect fields come from the
+// Go output type, so the resultType discriminator is part of the advertised
+// schema and can never drift from the response struct (ADR 0003).
+func TestGetResultSchemaDerivesTaskFields(t *testing.T) {
+	schema, err := OutputSchema[GetResultOutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	for _, name := range []string{"resultType", "taskId", "taskStatus", "pollIntervalMs", "jobID", "instructions"} {
+		if _, ok := schema.Properties[name]; !ok {
+			t.Errorf("get_result schema missing dialect property %q", name)
+		}
+	}
+}
+
+// TestApplyTaskFormIsVersionBlind proves the selector only takes a dialect,
+// a duration and an --after threshold; no protocol version reaches it.
+func TestApplyTaskFormIsVersionBlind(t *testing.T) {
+	base := GetResultOutput{Status: "notifying", ObligationID: "job-1"}
+	long := 2 * time.Second
+	after := time.Second
+
+	plain := ApplyTaskForm(base, DialectPlain, long, after)
+	if plain.JobID != "job-1" || plain.Instructions == "" || plain.ResultType != "" {
+		t.Errorf("plain long call = %+v", plain)
+	}
+	modern := ApplyTaskForm(base, DialectTasks2026, long, after)
+	if modern.ResultType != TaskResultType || modern.TaskID != "job-1" {
+		t.Errorf("2026 long call = %+v", modern)
+	}
+	legacy := ApplyTaskForm(base, DialectTasks2025, 0, after)
+	if legacy.TaskID != "job-1" || legacy.ResultType != "" {
+		t.Errorf("2025 immediate task = %+v", legacy)
+	}
+	if quick := ApplyTaskForm(base, DialectTasks2026, 0, after); quick.ResultType != "" || quick.TaskID != "" {
+		t.Errorf("2026 quick call must be classic: %+v", quick)
+	}
+	if disabled := ApplyTaskForm(base, DialectPlain, time.Hour, 0); disabled.JobID != "" {
+		t.Errorf("zero --after must disable the switch: %+v", disabled)
+	}
 }
 
 func TestOutputSchemaHonorsJSONTags(t *testing.T) {
