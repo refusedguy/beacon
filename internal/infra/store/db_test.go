@@ -872,3 +872,231 @@ func TestInboxRejectsEmptyInput(t *testing.T) {
 		t.Error("InboxReclaim with empty peer must fail")
 	}
 }
+
+// TestWatchOutcomeWakesAllReaders is the acceptance check for T3.79: one
+// worker result wakes all fifteen processes that opened the state file. Each
+// reader is a separate DB on the same path and receives the outcome through
+// its own reads; no broker is involved.
+func TestWatchOutcomeWakesAllReaders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open writer: %v", err)
+	}
+	defer writer.Close()
+
+	const readers = 15
+	dbs := make([]*DB, readers)
+	for i := range dbs {
+		d, err := Open(path)
+		if err != nil {
+			t.Fatalf("Open reader %d: %v", i, err)
+		}
+		defer d.Close()
+		dbs[i] = d
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	chans := make([]<-chan WatchOutcome, readers)
+	for i, d := range dbs {
+		ch, err := d.WatchOutcome(ctx, "worker-key")
+		if err != nil {
+			t.Fatalf("WatchOutcome reader %d: %v", i, err)
+		}
+		chans[i] = ch
+	}
+
+	for i, ch := range chans {
+		select {
+		case o, open := <-ch:
+			t.Fatalf("reader %d got %+v (open=%v) before publish", i, o, open)
+		default:
+		}
+	}
+
+	want := WatchOutcome{
+		Key: "worker-key", Revision: 7,
+		Result: []byte(`{"verdict":"ready"}`),
+	}
+	if err := writer.PublishOutcome(want); err != nil {
+		t.Fatalf("PublishOutcome: %v", err)
+	}
+
+	for i, ch := range chans {
+		select {
+		case o, open := <-ch:
+			if !open {
+				t.Fatalf("reader %d channel closed without outcome", i)
+			}
+			if o.Key != want.Key || o.Revision != want.Revision || !bytes.Equal(o.Result, want.Result) {
+				t.Errorf("reader %d outcome = %+v, want %+v", i, o, want)
+			}
+			if _, open := <-ch; open {
+				t.Errorf("reader %d got a second outcome from one result", i)
+			}
+		case <-ctx.Done():
+			t.Fatalf("reader %d was not woken: %v", i, ctx.Err())
+		}
+	}
+}
+
+// TestWatchOutcomeLateReaderFindsResultInFile proves the result is durable in
+// the file, not held in a process-local broker: a reader that opens after the
+// writer closed still receives the same outcome on its first read.
+func TestWatchOutcomeLateReaderFindsResultInFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	writer, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open writer: %v", err)
+	}
+	want := WatchOutcome{Key: "late-worker", Revision: 3, Result: []byte("done")}
+	if err := writer.PublishOutcome(want); err != nil {
+		t.Fatalf("PublishOutcome: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close writer: %v", err)
+	}
+
+	late, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open late reader: %v", err)
+	}
+	defer late.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ch, err := late.WatchOutcome(ctx, want.Key)
+	if err != nil {
+		t.Fatalf("WatchOutcome: %v", err)
+	}
+	select {
+	case o, open := <-ch:
+		if !open || o.Key != want.Key || o.Revision != want.Revision || !bytes.Equal(o.Result, want.Result) {
+			t.Fatalf("late outcome = %+v (open=%v), want %+v", o, open, want)
+		}
+	case <-ctx.Done():
+		t.Fatalf("late reader was not woken: %v", ctx.Err())
+	}
+}
+
+// TestWatchOutcomeStopsOnCancel keeps a watcher from leaking after its caller
+// gives up waiting.
+func TestWatchOutcomeStopsOnCancel(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, err := d.WatchOutcome(ctx, "no-result")
+	if err != nil {
+		t.Fatalf("WatchOutcome: %v", err)
+	}
+	cancel()
+	select {
+	case o, open := <-ch:
+		if open {
+			t.Errorf("cancelled watcher delivered %+v", o)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not stop on cancel")
+	}
+}
+
+func TestWatchOutcomeRejectsEmptyKey(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, key := range []string{"", "   "} {
+		if _, err := d.WatchOutcome(context.Background(), key); err == nil {
+			t.Errorf("WatchOutcome(%q) must fail", key)
+		} else {
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Errorf("WatchOutcome(%q) error = %v, want INVALID_INPUT", key, err)
+			}
+		}
+		if err := d.PublishOutcome(WatchOutcome{Key: key}); err == nil {
+			t.Errorf("PublishOutcome(%q) must fail", key)
+		}
+	}
+}
+
+// TestWatchOutcomeKeepsInboxWorking guards T3.65: adding the outcome table
+// and its writer path must not change durable inbox put, claim or ack.
+func TestWatchOutcomeKeepsInboxWorking(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	msg := InboxMessage{
+		WatchID: "w6", Revision: 1, SubscriberID: "s6",
+		PeerName: "peer", Payload: []byte("body"),
+	}
+	if err := d.InboxPut(msg); err != nil {
+		t.Fatalf("InboxPut: %v", err)
+	}
+	want := WatchOutcome{Key: "shared-writer", Revision: 1, Result: []byte("done")}
+	if err := d.PublishOutcome(want); err != nil {
+		t.Fatalf("PublishOutcome: %v", err)
+	}
+
+	claimed, err := d.InboxClaim("peer", time.Now().UTC(), time.Minute)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("InboxClaim after PublishOutcome = %d, %v; want 1", len(claimed), err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ch, err := d.WatchOutcome(ctx, want.Key)
+	if err != nil {
+		t.Fatalf("WatchOutcome: %v", err)
+	}
+	select {
+	case o, open := <-ch:
+		if !open || !bytes.Equal(o.Result, want.Result) {
+			t.Fatalf("outcome = %+v (open=%v), want %+v", o, open, want)
+		}
+	case <-ctx.Done():
+		t.Fatalf("watcher was not woken: %v", ctx.Err())
+	}
+	if ok, err := d.InboxAck(InboxKey(msg.WatchID, msg.Revision, msg.SubscriberID)); err != nil || !ok {
+		t.Fatalf("InboxAck after WatchOutcome = %v, %v; want true", ok, err)
+	}
+}
+
+// TestWatchOutcomeRedactsResult applies ADR 0012 to worker results as it does
+// to inbox payloads (T3.4): a secret in the result never reaches the file.
+func TestWatchOutcomeRedactsResult(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	if err := d.PublishOutcome(WatchOutcome{Key: "secret-worker", Result: []byte("token " + secret)}); err != nil {
+		t.Fatalf("PublishOutcome: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ch, err := d.WatchOutcome(ctx, "secret-worker")
+	if err != nil {
+		t.Fatalf("WatchOutcome: %v", err)
+	}
+	select {
+	case o := <-ch:
+		if bytes.Contains(o.Result, []byte("ghp_")) {
+			t.Errorf("delivered outcome kept a raw token: %s", o.Result)
+		}
+	case <-ctx.Done():
+		t.Fatalf("watcher was not woken: %v", ctx.Err())
+	}
+}
