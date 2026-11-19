@@ -428,3 +428,167 @@ func TestTransitionContinueRequiresSameWatch(t *testing.T) {
 		t.Errorf("continue revived a closed Watch: %+v, effects %+v", next, effects)
 	}
 }
+
+// TestTransitionParkOnFailure covers T3.60: a failed execution step parks the
+// Watch and carries the full error text and reason to the journal. The only
+// effect is a journal entry, so no wake, continue or successor is staged.
+func TestTransitionParkOnFailure(t *testing.T) {
+	at := time.Date(2026, 11, 20, 5, 0, 0, 0, time.UTC)
+	fullError := "limit exceeded: 429\ndetail: quota=999999\nstack: line 42\n<raw & unescaped>"
+
+	for _, reason := range []ParkReason{ParkReasonLimit, ParkReasonBudget, ParkReasonCrash, ParkReasonError} {
+		t.Run(string(reason), func(t *testing.T) {
+			for _, tc := range []struct {
+				name    string
+				status  Status
+				verdict Verdict
+			}{
+				{"from watching", StatusWatching, VerdictWatching},
+				{"from notifying", StatusNotifying, VerdictReady},
+				{"from needs_input", StatusNeedsInput, VerdictNeedsInput},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					w := transitionWatch(tc.status, tc.verdict, "sha", 3)
+					before := cloneWatch(w)
+					next, effects := Transition(w, ParkEvent(reason, fullError, at))
+
+					if next.Status != StatusParked {
+						t.Errorf("status = %q, want %q", next.Status, StatusParked)
+					}
+					if next.Verdict != VerdictParked {
+						t.Errorf("verdict = %q, want %q", next.Verdict, VerdictParked)
+					}
+					if next.Revision != 4 {
+						t.Errorf("revision = %d, want 4", next.Revision)
+					}
+					if next.ID != w.ID || !reflect.DeepEqual(next.Subscribers, w.Subscribers) {
+						t.Errorf("parking changed the task identity: %+v", next)
+					}
+					if !next.ClosedAt.IsZero() || next.CloseReason != "" {
+						t.Errorf("parking closed the Watch: reason %q at %v", next.CloseReason, next.ClosedAt)
+					}
+					if len(effects) != 1 {
+						t.Fatalf("effects = %+v, want exactly one journal effect", effects)
+					}
+					e := effects[0]
+					if e.Kind != EffectLogPark {
+						t.Errorf("effect kind = %q, want %q", e.Kind, EffectLogPark)
+					}
+					if e.WatchID != w.ID || e.Revision != 4 {
+						t.Errorf("effect = %+v, want w1 at revision 4", e)
+					}
+					if e.ParkReason != reason {
+						t.Errorf("effect reason = %q, want %q", e.ParkReason, reason)
+					}
+					if e.ParkError != fullError {
+						t.Errorf("effect error = %q, want full text %q", e.ParkError, fullError)
+					}
+					for _, eff := range effects {
+						switch eff.Kind {
+						case EffectWakeSubscribers, EffectContinueWatch, EffectCreateWatch:
+							t.Errorf("parking staged a retry effect: %+v", eff)
+						}
+					}
+					if !reflect.DeepEqual(w, before) {
+						t.Errorf("Transition mutated its input: %+v", w)
+					}
+				})
+			}
+		})
+	}
+}
+
+// TestTransitionParkIsIdempotent proves a repeated failure does not bump the
+// revision or write a second journal entry, and leaves the input untouched.
+func TestTransitionParkIsIdempotent(t *testing.T) {
+	at := time.Date(2026, 11, 20, 6, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 3)
+	event := ParkEvent(ParkReasonLimit, "first failure", at)
+
+	parked, effects := Transition(w, event)
+	again, effectsAgain := Transition(parked, ParkEvent(ParkReasonError, "second failure", at.Add(time.Minute)))
+
+	if !reflect.DeepEqual(again, parked) {
+		t.Errorf("re-park changed the Watch: %+v, want %+v", again, parked)
+	}
+	if len(effectsAgain) != 0 {
+		t.Errorf("re-park emitted journal entries: %+v", effectsAgain)
+	}
+	if len(effects) != 1 {
+		t.Fatalf("first park emitted %d effects, want 1", len(effects))
+	}
+	if w.Status != StatusWatching || w.Revision != 3 {
+		t.Errorf("Transition mutated its input: %+v", w)
+	}
+}
+
+// TestTransitionParkedHasNoAutomaticRetry covers the T3.60 acceptance: a
+// parked Watch never resumes from a verdict, a human-answer event or a
+// needs_input event. The failed step is not retried by any of them.
+func TestTransitionParkedHasNoAutomaticRetry(t *testing.T) {
+	at := time.Date(2026, 11, 20, 7, 0, 0, 0, time.UTC)
+	parked := transitionWatch(StatusParked, VerdictParked, "sha", 4)
+
+	events := []struct {
+		name string
+		e    Event
+	}{
+		{"actionable verdict", VerdictEvent(VerdictReady, at)},
+		{"watching verdict", VerdictEvent(VerdictWatching, at)},
+		{"terminal verdict", VerdictEvent(VerdictMerged, at)},
+		{"continue with valid round", ContinueEvent("w1", 1, at)},
+		{"needs input", NeedsInputEvent(at)},
+	}
+	for _, tc := range events {
+		t.Run(tc.name, func(t *testing.T) {
+			next, effects := Transition(parked, tc.e)
+			if !reflect.DeepEqual(next, parked) {
+				t.Errorf("event %+v changed the parked Watch: %+v", tc.e, next)
+			}
+			if len(effects) != 0 {
+				t.Errorf("event %+v staged effects: %+v", tc.e, effects)
+			}
+		})
+	}
+}
+
+// TestTransitionClosedCannotBeParked proves parking never reopens a closed Watch.
+func TestTransitionClosedCannotBeParked(t *testing.T) {
+	at := time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC)
+	closed := transitionWatch(StatusClosed, VerdictMerged, "sha", 5)
+	closed.CloseReason = string(CloseReasonMerged)
+	closed.ClosedAt = at
+
+	next, effects := Transition(closed, ParkEvent(ParkReasonCrash, "crash text", at))
+	if !reflect.DeepEqual(next, closed) || len(effects) != 0 {
+		t.Errorf("parking revived a closed Watch: %+v, effects %+v", next, effects)
+	}
+}
+
+// TestTransitionParkedTerminalEvents documents that cancel and head_changed
+// still close a parked Watch. Cancel is an explicit human action; head change
+// is the ADR 0019 response to a new PR head, not a retry of the failed step.
+// Neither touches the ADR 0017 delivery ladder.
+func TestTransitionParkedTerminalEvents(t *testing.T) {
+	at := time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)
+	parked := transitionWatch(StatusParked, VerdictParked, "oldsha", 4)
+
+	cancelled, effects := Transition(parked, CancelEvent(at))
+	if cancelled.Status != StatusClosed || cancelled.CloseReason != string(CloseReasonCancelled) {
+		t.Errorf("cancel from parked: %+v", cancelled)
+	}
+	if len(effects) != 0 {
+		t.Errorf("cancel from parked produced effects: %+v", effects)
+	}
+
+	closed, effects := Transition(parked, HeadChangedEvent("newsha", at))
+	if closed.Status != StatusClosed || closed.CloseReason != string(CloseReasonHeadChanged) {
+		t.Errorf("head change from parked: %+v", closed)
+	}
+	if len(effects) != 1 || effects[0].Kind != EffectCreateWatch {
+		t.Errorf("head change from parked effects: %+v", effects)
+	}
+	if parked.Status != StatusParked || parked.Revision != 4 {
+		t.Errorf("Transition mutated its input: %+v", parked)
+	}
+}
