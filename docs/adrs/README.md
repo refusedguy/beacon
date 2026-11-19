@@ -47,3 +47,4 @@
 | 0033 | Три идеи из отчёта R-graft для ночной смены | accepted |
 | 0034 | Четыре фичи из отчёта M-web-orchestration-patterns | accepted |
 | 0035 | Пять фич из отчёта O-claude-code-mechanics для ночной смены | accepted |
+| 0036 | Шесть фич из отчёта S-more-competitors | accepted |
