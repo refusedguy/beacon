@@ -872,3 +872,140 @@ func TestWaitOutcomeByteStable(t *testing.T) {
 		t.Fatalf("порядок полей изменился: %s", a)
 	}
 }
+
+// ---- ADR 0038 п3 / T3.55 ----
+
+func TestRankWorkersOrdersByHistoryNotName(t *testing.T) {
+	candidates := []WorkerCandidate{
+		{Key: "a-first", Metrics: WorkerMetrics{Passes: 5, Failures: 5, DelayMS: 900, Cost: 90, Samples: 1}},
+		{Key: "b-second", Metrics: WorkerMetrics{Passes: 5, Failures: 5, DelayMS: 100, Cost: 10, Samples: 1}},
+		{Key: "c-third", Metrics: WorkerMetrics{Passes: 9, Failures: 1, DelayMS: 800, Cost: 80, Samples: 1}},
+		{Key: "d-fourth", Metrics: WorkerMetrics{Passes: 5, Failures: 5, DelayMS: 100, Cost: 10, Samples: 1}},
+	}
+	got := RankWorkers(candidates)
+	want := []string{"c-third", "b-second", "d-fourth", "a-first"}
+	for i, k := range want {
+		if got[i].Key != k {
+			t.Fatalf("rank[%d]=%q, want %q", i, got[i].Key, k)
+		}
+	}
+}
+
+func TestRankWorkersUsesDelayBeforeCost(t *testing.T) {
+	candidates := []WorkerCandidate{
+		{Key: "slow-cheap", Metrics: WorkerMetrics{Passes: 2, DelayMS: 500, Cost: 1, Samples: 1}},
+		{Key: "fast-costly", Metrics: WorkerMetrics{Passes: 2, DelayMS: 50, Cost: 100, Samples: 1}},
+	}
+	got := RankWorkers(candidates)
+	if got[0].Key != "fast-costly" || got[1].Key != "slow-cheap" {
+		t.Fatalf("order=%q,%q; want fast-costly,slow-cheap", got[0].Key, got[1].Key)
+	}
+}
+
+func TestRankWorkersUsesCostAsLastCriterion(t *testing.T) {
+	candidates := []WorkerCandidate{
+		{Key: "costly", Metrics: WorkerMetrics{Passes: 3, Failures: 1, DelayMS: 100, Cost: 50, Samples: 1}},
+		{Key: "cheap", Metrics: WorkerMetrics{Passes: 3, Failures: 1, DelayMS: 100, Cost: 5, Samples: 1}},
+	}
+	got := RankWorkers(candidates)
+	if got[0].Key != "cheap" || got[1].Key != "costly" {
+		t.Fatalf("order=%q,%q; want cheap,costly", got[0].Key, got[1].Key)
+	}
+}
+
+func TestSelectWorkerMatchesCapabilitiesBeforeRanking(t *testing.T) {
+	candidates := []WorkerCandidate{
+		{Key: "chat-best-history", Capabilities: []string{"chat"}, Metrics: WorkerMetrics{Passes: 100, Samples: 1}},
+		{Key: "review-low", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 1, Failures: 9, Samples: 10}},
+		{Key: "review-high", Capabilities: []string{"review", "build"}, Metrics: WorkerMetrics{Passes: 8, Failures: 2, Samples: 10}},
+	}
+	got, ok := SelectWorker(candidates, []string{"review"})
+	if !ok || got.Key != "review-high" {
+		t.Fatalf("select=%q %v; want review-high true", got.Key, ok)
+	}
+}
+
+func TestSelectWorkerRequiresCapabilitiesAndMatch(t *testing.T) {
+	candidates := []WorkerCandidate{
+		{Key: "w", Capabilities: []string{"chat"}, Metrics: WorkerMetrics{Passes: 100}},
+	}
+	if _, ok := SelectWorker(candidates, nil); ok {
+		t.Fatal("пустой набор возможностей не должен выбирать воркера")
+	}
+	if _, ok := SelectWorker(candidates, []string{"review"}); ok {
+		t.Fatal("несовпадающие возможности не должны выбирать воркера")
+	}
+}
+
+func TestSelectWorkerRenamingDoesNotChangeChoice(t *testing.T) {
+	candidates := []WorkerCandidate{
+		{Key: "alpha", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 2, Samples: 1}},
+		{Key: "zeta", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 9, Samples: 1}},
+	}
+	first, ok := SelectWorker(candidates, []string{"review"})
+	if !ok || first.Key != "zeta" {
+		t.Fatalf("first=%q %v; want zeta true", first.Key, ok)
+	}
+	candidates[1].Key = "renamed-999"
+	second, ok := SelectWorker(candidates, []string{"review"})
+	if !ok || second.Key != "renamed-999" {
+		t.Fatalf("after rename=%q %v; want renamed-999 true", second.Key, ok)
+	}
+}
+
+func TestWorkerHistoryRecordLoadAttachAndSelect(t *testing.T) {
+	e := newEnv(t)
+	h, err := e.svc.LoadWorkerHistory()
+	if err != nil || len(h) != 0 {
+		t.Fatalf("initial history=%v err=%v; want empty", h, err)
+	}
+	for _, o := range []WorkerOutcome{
+		{Worker: "w1", Passed: true, DelayMS: 200, Cost: 10},
+		{Worker: "w1", Passed: false, DelayMS: 100, Cost: 5},
+		{Worker: "w2", Passed: true, DelayMS: 20, Cost: 2},
+	} {
+		if err := e.svc.RecordWorkerOutcome(o); err != nil {
+			t.Fatalf("RecordWorkerOutcome(%+v) error = %v", o, err)
+		}
+	}
+	h, err = e.svc.LoadWorkerHistory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w1 := h["w1"]
+	if w1.Passes != 1 || w1.Failures != 1 || w1.DelayMS != 300 || w1.Cost != 15 || w1.Samples != 2 {
+		t.Fatalf("w1=%+v; want 1/1/300/15/2", w1)
+	}
+	candidates := []WorkerCandidate{
+		{Key: "w1", Capabilities: []string{"review"}},
+		{Key: "w2", Capabilities: []string{"review"}},
+		{Key: "new", Capabilities: []string{"review"}},
+	}
+	withHistory, err := e.svc.AttachHistory(candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withHistory[0].Metrics.Samples != 2 || withHistory[2].Metrics.Samples != 0 {
+		t.Fatalf("attach=%+v; w1 should have history, new should not", withHistory)
+	}
+	sel, ok, err := e.svc.SelectWorkerByHistory(candidates, []string{"review"})
+	if err != nil || !ok {
+		t.Fatalf("SelectWorkerByHistory err=%v ok=%v", err, ok)
+	}
+	if sel.Key != "w2" {
+		t.Fatalf("selected=%q, want w2 (best pass history)", sel.Key)
+	}
+}
+
+func TestRecordWorkerOutcomeRejectsBadInput(t *testing.T) {
+	e := newEnv(t)
+	if got := taskstore.Code(e.svc.RecordWorkerOutcome(WorkerOutcome{Worker: "  ", Passed: true})); got != 1 {
+		t.Fatalf("пустой воркер: код %d, want 1", got)
+	}
+	if got := taskstore.Code(e.svc.RecordWorkerOutcome(WorkerOutcome{Worker: "w", DelayMS: -1})); got != 1 {
+		t.Fatalf("отрицательная задержка: код %d, want 1", got)
+	}
+	if got := taskstore.Code(e.svc.RecordWorkerOutcome(WorkerOutcome{Worker: "w", Cost: -1})); got != 1 {
+		t.Fatalf("отрицательная стоимость: код %d, want 1", got)
+	}
+}

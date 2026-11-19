@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -1092,4 +1093,218 @@ func SelfTest(w io.Writer) error {
 	}
 	fmt.Fprintf(w, "self-test passed: %d cases\n", 11)
 	return nil
+}
+
+// ---- ADR 0038 п3 / T3.55: ранжирование воркеров по истории ----
+//
+// Capability matching из T3.47 сужает множество кандидатов, затем ранжирование
+// упорядочивает выживших по репозиторий-локальной истории прохождения,
+// задержки и стоимости. Имя сессии остаётся ключом доставки по ADR 0034, но не
+// участвует в выборе: при равенстве метрик сохраняется порядок входа.
+
+// WorkerMetrics это репозиторий-локальная история одного воркера. Passes и
+// Failures дают историю прохождения, а DelayMS и Cost накапливаются по Samples
+// наблюдениям и дают средние задержку и стоимость.
+type WorkerMetrics struct {
+	Passes   int   `json:"passes"`
+	Failures int   `json:"failures"`
+	DelayMS  int64 `json:"delayMs"`
+	Cost     int64 `json:"cost"`
+	Samples  int   `json:"samples"`
+}
+
+// PassRate возвращает долю успешных прохождений. Без наблюдений доля равна нулю.
+func (m WorkerMetrics) PassRate() float64 {
+	total := m.Passes + m.Failures
+	if total <= 0 {
+		return 0
+	}
+	return float64(m.Passes) / float64(total)
+}
+
+// AvgDelayMS возвращает среднюю задержку одного наблюдения.
+func (m WorkerMetrics) AvgDelayMS() int64 {
+	if m.Samples <= 0 {
+		return 0
+	}
+	return m.DelayMS / int64(m.Samples)
+}
+
+// AvgCost возвращает среднюю стоимость одного наблюдения.
+func (m WorkerMetrics) AvgCost() int64 {
+	if m.Samples <= 0 {
+		return 0
+	}
+	return m.Cost / int64(m.Samples)
+}
+
+// WorkerHistory это история воркеров в каталоге состояния репозитория.
+type WorkerHistory map[string]WorkerMetrics
+
+// WorkerCandidate это один кандидат после capability matching из T3.47. Key —
+// непрозрачный ключ доставки, Capabilities — объявленные возможности, а Metrics
+// — снимок истории. Ни Key, ни имя в выборе не участвуют.
+type WorkerCandidate struct {
+	Key          string        `json:"key"`
+	Capabilities []string      `json:"capabilities"`
+	Metrics      WorkerMetrics `json:"metrics"`
+}
+
+// WorkerOutcome это одно наблюдение, которое обновляет историю воркера.
+type WorkerOutcome struct {
+	Worker  string
+	Passed  bool
+	DelayMS int64
+	Cost    int64
+}
+
+// declaresAll повторяет контракт T3.47: кандидат должен объявлять все
+// затребованные возможности и может объявлять больше.
+func declaresAll(declared, required []string) bool {
+	set := make(map[string]struct{}, len(declared))
+	for _, c := range declared {
+		set[c] = struct{}{}
+	}
+	for _, c := range required {
+		if _, ok := set[c]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// RankWorkers возвращает кандидатов, упорядоченных по истории: сначала большая
+// доля прохождений, затем меньшая задержка, затем меньшая стоимость. При
+// полном равенстве метрик сохраняется порядок входа, поэтому имя не влияет на
+// результат.
+func RankWorkers(candidates []WorkerCandidate) []WorkerCandidate {
+	out := append([]WorkerCandidate(nil), candidates...)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i].Metrics, out[j].Metrics
+		if ar, br := a.PassRate(), b.PassRate(); ar != br {
+			return ar > br
+		}
+		if ad, bd := a.AvgDelayMS(), b.AvgDelayMS(); ad != bd {
+			return ad < bd
+		}
+		if ac, bc := a.AvgCost(), b.AvgCost(); ac != bc {
+			return ac < bc
+		}
+		return false
+	})
+	return out
+}
+
+// matchingWorkers сужает множество по возможностям до ранжирования. Пустой
+// набор возможностей не выбирает никого, как в T3.47.
+func matchingWorkers(candidates []WorkerCandidate, required []string) []WorkerCandidate {
+	if len(required) == 0 {
+		return nil
+	}
+	out := make([]WorkerCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if c.Key == "" {
+			continue
+		}
+		if declaresAll(c.Capabilities, required) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// SelectWorker сначала сужает множество по возможностям, затем выбирает
+// лучшего по истории. Второй результат false, когда подходящих кандидатов нет.
+func SelectWorker(candidates []WorkerCandidate, required []string) (WorkerCandidate, bool) {
+	narrowed := matchingWorkers(candidates, required)
+	if len(narrowed) == 0 {
+		return WorkerCandidate{}, false
+	}
+	return RankWorkers(narrowed)[0], true
+}
+
+// workerHistoryPath задаёт файл репозиторий-локальной истории в state dir.
+func (s *Service) workerHistoryPath() string {
+	return filepath.Join(s.Cfg.StateDir, "worker-history.json")
+}
+
+// LoadWorkerHistory читает историю. Отсутствующий файл это пустая история.
+func (s *Service) LoadWorkerHistory() (WorkerHistory, error) {
+	data, err := os.ReadFile(s.workerHistoryPath())
+	if os.IsNotExist(err) {
+		return WorkerHistory{}, nil
+	}
+	if err != nil {
+		return nil, taskstore.Startupf("не прочитана история воркеров: %v", err)
+	}
+	var h WorkerHistory
+	if err := json.Unmarshal(data, &h); err != nil {
+		return nil, taskstore.Startupf("не разобрана история воркеров: %v", err)
+	}
+	if h == nil {
+		h = WorkerHistory{}
+	}
+	return h, nil
+}
+
+// RecordWorkerOutcome добавляет одно наблюдение в историю под общим замком.
+func (s *Service) RecordWorkerOutcome(o WorkerOutcome) error {
+	worker := strings.TrimSpace(o.Worker)
+	if worker == "" {
+		return taskstore.Validationf("не задан воркер")
+	}
+	if o.DelayMS < 0 || o.Cost < 0 {
+		return taskstore.Validationf("задержка и стоимость не могут быть отрицательными")
+	}
+	lock, err := taskstore.AcquireLock(taskstore.LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	h, err := s.LoadWorkerHistory()
+	if err != nil {
+		return err
+	}
+	m := h[worker]
+	if o.Passed {
+		m.Passes++
+	} else {
+		m.Failures++
+	}
+	m.DelayMS += o.DelayMS
+	m.Cost += o.Cost
+	m.Samples++
+	h[worker] = m
+	data, err := json.MarshalIndent(h, "", "  ")
+	if err != nil {
+		return taskstore.Startupf("не собрана история воркеров: %v", err)
+	}
+	return taskstore.AtomicWrite(s.workerHistoryPath(), append(data, '\n'), 0644)
+}
+
+// AttachHistory подставляет метрики из истории в кандидатов по их ключу.
+// Кандидаты без истории получают нулевые метрики и остаются в списке.
+func (s *Service) AttachHistory(candidates []WorkerCandidate) ([]WorkerCandidate, error) {
+	h, err := s.LoadWorkerHistory()
+	if err != nil {
+		return nil, err
+	}
+	out := append([]WorkerCandidate(nil), candidates...)
+	for i := range out {
+		if m, ok := h[out[i].Key]; ok {
+			out[i].Metrics = m
+		}
+	}
+	return out, nil
+}
+
+// SelectWorkerByHistory присоединяет историю и выбирает воркера по возможностям
+// и истории. Это вход для адаптера, который уже сузил круг по T3.47.
+func (s *Service) SelectWorkerByHistory(candidates []WorkerCandidate, required []string) (WorkerCandidate, bool, error) {
+	withHistory, err := s.AttachHistory(candidates)
+	if err != nil {
+		return WorkerCandidate{}, false, err
+	}
+	sel, ok := SelectWorker(withHistory, required)
+	return sel, ok, nil
 }
