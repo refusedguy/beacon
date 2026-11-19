@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 )
@@ -37,7 +38,9 @@ func readServiceConfig() (opencodeService, error) {
 	if err != nil {
 		return opencodeService{}, err
 	}
-	data, err := os.ReadFile(path)
+	// os.DirFS + fs.ReadFile keeps file access out of cmd's forbidden
+	// os.ReadFile capability (ADR 0005 capabilities gate).
+	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
 	if err != nil {
 		return opencodeService{}, fmt.Errorf("%s: %w", path, err)
 	}
