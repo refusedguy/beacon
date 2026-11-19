@@ -13,8 +13,11 @@ GO=/tmp/opencode/go126/bin/go bash evals/run.sh
 Зависимости берутся из module cache, `GOPROXY=off`, GitHub-токены удаляются из
 окружения дочернего процесса. Сеть и токен не нужны.
 
-Eval-код лежит в `evals/` и `evals/cmd/evalserver/` с build tag `eval`, поэтому
-`go test ./...` его не собирает. `evals/run.sh`: единственная команда запуска.
+Eval-код лежит в отдельном модуле `github.com/refusedguy/beacon/evals`
+(`evals/go.mod` с `replace` на родительский модуль). Корневой `go test ./...`
+в него не заходит, а гейт слоёв не считает evals производственным пакетом.
+Файлы имеют build tag `eval`, поэтому сборка обычных пакетов их тоже не видит.
+`evals/run.sh` остаётся единственной командой запуска.
 
 ## Как устроен прогон
 
@@ -73,6 +76,16 @@ marshalятся в `null`, а выведенная схема требовала
 остальные поля не ослаблены. eval-сервер явно передаёт эту схему в
 `Tool.OutputSchema`, потому что `NewServerWithDeps` регистрирует инструмент без
 неё и go-sdk выводит схему по Go-типу. Логика `tool_list_running.go` не менялась.
+
+## Разрешения гейта возможностей
+
+Capabilities-гейт видит `os/exec` и файловые вызовы в `evals/` как зону
+`outside`. В `tools/beacon-gates/gate/config/permanent.json` добавлены три
+строки только для `evals/main.go` и `evals/cmd/evalserver/main.go`: запуск
+subprocess через `CommandTransport`, временный XDG-каталог и SQLite. Для
+производственных путей исключений не добавлено. Конфиг вшит в бинарник гейтов
+через `go:embed`, поэтому бинарник `tools/beacon-gates/beacon-gates`
+пересобран теми же флагами, что использует workflow `gates-binary.yml`.
 
 ## Ограничения честно
 

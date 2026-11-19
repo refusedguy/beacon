@@ -3,7 +3,7 @@
 # Подробности: evals/README.md
 set -euo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 GO="${GO:-${GO_BIN:-}}"
 if [[ -z "$GO" || ! -x "$GO" ]]; then
@@ -15,4 +15,4 @@ export GO
 unset XDG_STATE_HOME || true
 
 # Зависимости уже лежат в module cache, сеть не нужна.
-GOPROXY=off exec "$GO" run -tags=eval ./evals
+GOPROXY=off exec "$GO" run -tags=eval .

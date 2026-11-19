@@ -459,7 +459,7 @@ func buildEvalServer(repoRoot string) (string, error) {
 		goBin = "go"
 	}
 	out := filepath.Join(os.TempDir(), fmt.Sprintf("beacon-evalserver-%d", os.Getpid()))
-	cmd := exec.Command(goBin, "build", "-tags=eval", "-o", out, "./evals/cmd/evalserver")
+	cmd := exec.Command(goBin, "build", "-tags=eval", "-o", out, "./cmd/evalserver")
 	cmd.Dir = repoRoot
 	cmd.Env = append(os.Environ(), "GOPROXY=off")
 	if combined, err := cmd.CombinedOutput(); err != nil {

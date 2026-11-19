@@ -1,5 +1,8 @@
 {
   "permanent": [
+    {"rule": "CAP-FILE-IN-OUTSIDE", "path": "evals/cmd/evalserver/main.go", "reason": "eval-сервер открывает SQLite во временном XDG_STATE_HOME, пользовательское состояние не трогается"},
+    {"rule": "CAP-EXEC-IN-OUTSIDE", "path": "evals/main.go", "reason": "eval-раннер поднимает MCP-сервер через go-sdk CommandTransport как subprocess"},
+    {"rule": "CAP-FILE-IN-OUTSIDE", "path": "evals/main.go", "reason": "eval-раннер создаёт и удаляет временный XDG_STATE_HOME и ищет корень модуля"},
     {"rule": "CAP-FILE-IN-CMD", "path": "cmd/beacon/commands.go", "reason": "cmd/ это composition root: он проверяет окружение и создаёт каталоги перед запуском"},
     {"rule": "CAP-EXEC-IN-CMD", "path": "cmd/beacon/doctor.go", "reason": "composition root запускает внешние команды для диагностики окружения"},
     {"rule": "CAP-FILE-IN-CMD", "path": "cmd/beacon/doctor.go", "reason": "composition root запускает внешние команды и проверяет окружение"},
