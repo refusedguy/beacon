@@ -34,6 +34,14 @@
 // a second task. That key gauges the start of waiting, unlike clientRequestId
 // (ADR 0028), which deduplicates repeats of a command.
 //
+// ADR 0046 p3 adds the stop reason to the same response. A wait now names why
+// it ended: terminal, input_required, unknown_submission, timeout or
+// interrupted. The reason is appended after the byte-stable fields of ADR 0036
+// §2 as a new constant field, so an output without a reason keeps its exact old
+// bytes. It only names a return that already happens; the event and approval
+// boundary of ADR 0037 is unchanged and needs_input still parks without a
+// readAt write.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -72,14 +80,157 @@ const (
 // field order with constants so the same state always serialises to the same
 // bytes and a prefix-cache keyed by the response prefix does not burn. The
 // canonical order is status, verdict, revision, checks, pollAfterMs; the
-// MarshalJSON method below is the single place that emits them.
+// MarshalJSON method below is the single place that emits them. ADR 0046 p3
+// appends one more field, reason, after the five fixed ones. Nothing is
+// reordered, so an output that carries no reason still serialises to the exact
+// bytes the ADR 0036 §2 contract locks.
 const (
 	waitResultFieldStatus      = "status"
 	waitResultFieldVerdict     = "verdict"
 	waitResultFieldRevision    = "revision"
 	waitResultFieldChecks      = "checks"
 	waitResultFieldPollAfterMs = "pollAfterMs"
+	waitResultFieldReason      = "reason"
 )
+
+// WaitStopReason is why a wait ended (ADR 0046 p3). The five values are
+// distinct: a script must not mistake a timeout for a terminal result, and it
+// must not resend a submission the server never registered. A reason names the
+// stop only; it does not move the event or approval return of ADR 0037 and does
+// not replace the delivery field of ADR 0026.
+type WaitStopReason string
+
+const (
+	WaitStopTerminal          WaitStopReason = "terminal"
+	WaitStopInputRequired     WaitStopReason = "input_required"
+	WaitStopUnknownSubmission WaitStopReason = "unknown_submission"
+	WaitStopTimeout           WaitStopReason = "timeout"
+	WaitStopInterrupted       WaitStopReason = "interrupted"
+)
+
+// valid reports whether r is one of the five contract reasons.
+func (r WaitStopReason) valid() bool {
+	switch r {
+	case WaitStopTerminal, WaitStopInputRequired, WaitStopUnknownSubmission,
+		WaitStopTimeout, WaitStopInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
+// ExitCode is the operation's exit code for this reason (ADR 0046 p3). A
+// terminal result and a parked input request end successfully. The three
+// failure reasons get distinct codes so a script can tell them apart: an
+// unknown submission is a usage error, an interruption is a signal, a timeout
+// is an expired budget. The CLI owns the process exit; this is the contract
+// value it reads.
+func (r WaitStopReason) ExitCode() int {
+	switch r {
+	case WaitStopUnknownSubmission:
+		return 2
+	case WaitStopInterrupted:
+		return 130
+	case WaitStopTimeout:
+		return 143
+	default:
+		return 0
+	}
+}
+
+// Retryable reports whether a caller may resend the wait. Only an unknown
+// submission is refused: the server never registered it, so a repeat cannot
+// succeed. The other four reasons describe a wait that ran and may be tried
+// again after an answer, a fresh budget or a new submission.
+func (r WaitStopReason) Retryable() bool {
+	return r.valid() && r != WaitStopUnknownSubmission
+}
+
+// WaitReasonOutput is the wait_result response with the stop reason as a real
+// field. It embeds WaitResultOutput so the five byte-stable ADR 0036 §2 fields
+// keep their names and their order; reason is appended last. The typed MCP
+// handler returns this type, so go-sdk derives an output schema that admits
+// the reason field and tools/call validation does not reject the response.
+// schema.go and its AllOutputSchemas factory are untouched.
+type WaitReasonOutput struct {
+	WaitResultOutput
+	Reason WaitStopReason `json:"reason,omitempty"`
+}
+
+// MarshalJSON keeps the byte-stable five-field prefix of WaitResultOutput and
+// appends reason. Reusing the embedded marshaller keeps one place that owns
+// the field order.
+func (o WaitReasonOutput) MarshalJSON() ([]byte, error) {
+	base := o.WaitResultOutput
+	if o.Reason.valid() {
+		base = withWaitStopReason(base, o.Reason)
+	}
+	return base.MarshalJSON()
+}
+
+// waitReasonOutput lifts a reason stamped on a WaitResultOutput into the
+// explicit field of WaitReasonOutput. The reserved Checks key is removed so a
+// client sees the reason once, as a top-level field.
+func waitReasonOutput(out WaitResultOutput) WaitReasonOutput {
+	reason := waitStopReasonOf(out)
+	if reason == "" {
+		return WaitReasonOutput{WaitResultOutput: out}
+	}
+	checks := make(map[string]domain.Check, len(out.Checks))
+	for name, check := range out.Checks {
+		if name != waitStopReasonCheckName {
+			checks[name] = check
+		}
+	}
+	out.Checks = checks
+	return WaitReasonOutput{WaitResultOutput: out, Reason: reason}
+}
+
+// waitStopReasonCheckName is the reserved Checks key that carries the reason
+// inside the byte-stable WaitResultOutput. WaitResultOutput is owned by
+// schema.go, which this card does not touch, so the reason rides in the map
+// that already belongs to the response. MarshalJSON lifts this entry to the
+// top-level reason field and hides it from checks. A user check that happens to
+// reuse the key with a value that is not a valid reason is emitted as an
+// ordinary check.
+const waitStopReasonCheckName = "_beaconWaitStopReason"
+
+// withWaitStopReason stamps reason onto out without mutating the caller's
+// Checks map. An empty or unknown reason leaves out untouched.
+func withWaitStopReason(out WaitResultOutput, reason WaitStopReason) WaitResultOutput {
+	if !reason.valid() {
+		return out
+	}
+	checks := make(map[string]domain.Check, len(out.Checks)+1)
+	for name, check := range out.Checks {
+		checks[name] = check
+	}
+	checks[waitStopReasonCheckName] = domain.Check{State: string(reason), Conclusion: string(reason)}
+	out.Checks = checks
+	return out
+}
+
+// StopReasonOf reads the stop reason from a wait_result response. It is the
+// public reader for callers outside this package. An empty result means the
+// output carries no reason, for example a precheck failure or an event tick.
+func StopReasonOf(out WaitResultOutput) WaitStopReason {
+	return waitStopReasonOf(out)
+}
+
+// waitStopReasonOf reads the reason stamped on out. It returns empty when no
+// reason was stamped or the reserved key holds something other than a valid
+// reason.
+func waitStopReasonOf(out WaitResultOutput) WaitStopReason {
+	check, ok := out.Checks[waitStopReasonCheckName]
+	if !ok {
+		return ""
+	}
+	reason := WaitStopReason(check.State)
+	if !reason.valid() {
+		return ""
+	}
+	return reason
+}
 
 // MarshalJSON writes a WaitResultOutput in the fixed order above. encoding/json
 // marshals struct fields in declaration order and map keys in sorted order,
@@ -91,16 +242,33 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 		name  string
 		value any
 	}
+	// The reason travels in Checks so schema.go need not change. Lift it out
+	// of checks here and append it after pollAfterMs: the five ADR 0036 §2
+	// fields keep their order and their exact bytes when no reason is present.
+	checks := o.Checks
+	reason := waitStopReasonOf(o)
+	if reason != "" {
+		checks = make(map[string]domain.Check, len(o.Checks))
+		for name, check := range o.Checks {
+			if name != waitStopReasonCheckName {
+				checks[name] = check
+			}
+		}
+	}
+
 	fields := []field{{name: waitResultFieldStatus, value: o.Status}}
 	if o.Verdict != "" {
 		fields = append(fields, field{name: waitResultFieldVerdict, value: o.Verdict})
 	}
 	fields = append(fields, field{name: waitResultFieldRevision, value: o.Revision})
-	if len(o.Checks) > 0 {
-		fields = append(fields, field{name: waitResultFieldChecks, value: o.Checks})
+	if len(checks) > 0 {
+		fields = append(fields, field{name: waitResultFieldChecks, value: checks})
 	}
 	if o.PollAfterMs != nil {
 		fields = append(fields, field{name: waitResultFieldPollAfterMs, value: o.PollAfterMs})
+	}
+	if reason != "" {
+		fields = append(fields, field{name: waitResultFieldReason, value: reason})
 	}
 
 	var buf bytes.Buffer
@@ -940,6 +1108,14 @@ func (s *WaitResultService) depart(capCtx *CapabilityContext, reason CancelReaso
 	return WaitResultOutput{}, domain.NewAppError(code, msg)
 }
 
+// interruptedResult names a departure as an interrupted wait (ADR 0046 p3).
+// The error code, cancellation reason and journal record are unchanged; only
+// the returned output gains the reason so a caller can tell a departure from a
+// timeout or a terminal result.
+func interruptedResult(out WaitResultOutput, err error) (WaitResultOutput, error) {
+	return withWaitStopReason(out, WaitStopInterrupted), err
+}
+
 // wait runs the bounded long-poll. A result verdict writes readAt through the
 // writer and returns; a timeout or any caller departure returns without a
 // write, so no obligation is created and no delivery is marked. When capCtx is
@@ -969,19 +1145,26 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, "wait_result: store is nil")
 	}
 	if capCtx != nil && capCtx.IsCancelled() {
-		return cancelledByCapability(capCtx)
+		out, err := cancelledByCapability(capCtx)
+		return interruptedResult(out, err)
 	}
 
 	w, err := s.store.Watch(in.WatchID)
 	if err != nil {
-		return WaitResultOutput{}, domain.NewAppError(domain.CodeWatchNotFound, "wait_result: watch "+in.WatchID+" not found")
+		// ADR 0046 p3: the submission was never registered here, so the caller
+		// must not resend it. The reason rides next to the unchanged
+		// CodeWatchNotFound error.
+		return withWaitStopReason(WaitResultOutput{}, WaitStopUnknownSubmission),
+			domain.NewAppError(domain.CodeWatchNotFound, "wait_result: watch "+in.WatchID+" not found")
 	}
 
 	// A parked Watch needs an answer, not a result. Return before any readAt
 	// write so the caller can answer through ack(continueOf) and wait again on
-	// this same Watch. An empty ContinueOf keeps the original contract.
+	// this same Watch. An empty ContinueOf keeps the original contract. The
+	// reason only names this existing return; ADR 0037's approval boundary is
+	// unchanged (ADR 0046 p3).
 	if isNeedsInput(w.Status, w.Verdict) {
-		return needsInputOutput(w.Revision, w.Checks), nil
+		return withWaitStopReason(needsInputOutput(w.Revision, w.Checks), WaitStopInputRequired), nil
 	}
 
 	// A result that landed before the call is delivered immediately. A Watch
@@ -1037,17 +1220,18 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	for {
 		select {
 		case <-ctx.Done():
-			return s.depart(capCtx, CancelContextEnded, domain.CodeCancelled, "wait_result: caller context ended")
+			return interruptedResult(s.depart(capCtx, CancelContextEnded, domain.CodeCancelled, "wait_result: caller context ended"))
 		case <-exits.Cancelled:
-			return s.depart(capCtx, CancelCallerCancelled, domain.CodeCancelled, "wait_result: caller cancelled")
+			return interruptedResult(s.depart(capCtx, CancelCallerCancelled, domain.CodeCancelled, "wait_result: caller cancelled"))
 		case <-exits.SessionClosed:
-			return s.depart(capCtx, CancelSessionClosed, domain.CodeGone, "wait_result: session closed")
+			return interruptedResult(s.depart(capCtx, CancelSessionClosed, domain.CodeGone, "wait_result: session closed"))
 		case <-exits.ConnectionBroken:
-			return s.depart(capCtx, CancelConnectionBroken, domain.CodeGone, "wait_result: connection broken")
+			return interruptedResult(s.depart(capCtx, CancelConnectionBroken, domain.CodeGone, "wait_result: connection broken"))
 		case <-capDone:
-			return cancelledByCapability(capCtx)
+			out, err := cancelledByCapability(capCtx)
+			return interruptedResult(out, err)
 		case <-timeoutCh:
-			return watchingOutput(revision, checks), nil
+			return withWaitStopReason(watchingOutput(revision, checks), WaitStopTimeout), nil
 		case update, ok := <-updates:
 			if !ok {
 				// The source ended; do not invent a result or a write.
@@ -1062,7 +1246,7 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 				// The agent just asked a human a question. Park here without
 				// marking the obligation read; an ack(continueOf) resumes this
 				// same Watch and the next wait carries on from its new revision.
-				return needsInputOutput(update.Revision, update.Checks), nil
+				return withWaitStopReason(needsInputOutput(update.Revision, update.Checks), WaitStopInputRequired), nil
 			}
 			if filter != nil {
 				// ADR 0045 p1: the filter, not the verdict, decides whether an
@@ -1159,13 +1343,16 @@ func (s *WaitResultService) deliver(ctx context.Context, watchID string, status 
 		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
 	ms := waitResultPollAfterMs
-	return WaitResultOutput{
+	out := WaitResultOutput{
 		Status:      string(status),
 		Verdict:     string(verdict),
 		Revision:    revision,
 		Checks:      checks,
 		PollAfterMs: &ms,
-	}, nil
+	}
+	// A delivered verdict is the terminal stop (ADR 0046 p3). The reason rides
+	// on the response without changing the readAt write or the field order.
+	return withWaitStopReason(out, WaitStopTerminal), nil
 }
 
 func (s *WaitResultService) now() time.Time {
@@ -1176,8 +1363,10 @@ func (s *WaitResultService) now() time.Time {
 }
 
 // Handle adapts the service to the go-sdk typed tool handler signature. The
-// caller id is the opaque sessionID from _meta and is never interpreted.
-func (s *WaitResultService) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in WaitResultInput) (*mcpsdk.CallToolResult, WaitResultOutput, error) {
+// caller id is the opaque sessionID from _meta and is never interpreted. It
+// returns WaitReasonOutput so the derived schema admits the reason field and
+// tools/call validation accepts the response (ADR 0046 p3).
+func (s *WaitResultService) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in WaitResultInput) (*mcpsdk.CallToolResult, WaitReasonOutput, error) {
 	subscriberID := ""
 	if id := SessionIDFromRequest(req); id != nil {
 		subscriberID = *id
@@ -1191,7 +1380,7 @@ func (s *WaitResultService) Handle(ctx context.Context, req *mcpsdk.CallToolRequ
 		capCtx = s.capability(req)
 	}
 	out, err := s.WaitInCapability(ctx, subscriberID, in, exits, capCtx)
-	return &mcpsdk.CallToolResult{}, out, err
+	return &mcpsdk.CallToolResult{}, waitReasonOutput(out), err
 }
 
 // AttachWaitResult registers the real tool on a server. NewServer keeps the
