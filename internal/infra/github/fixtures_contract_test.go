@@ -11,7 +11,6 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 )
@@ -287,7 +286,8 @@ func fixturePendingReasons(t2 *fixtureTier2PR) bool {
 }
 
 // fixtureMissingRequired returns required contexts from branch protection
-// that are absent from the recorded rollup contexts.
+// that are absent from the recorded rollup contexts. Order follows branch
+// protection, which is the order used in the expected reason.
 func fixtureMissingRequired(t2 *fixtureTier2PR, bp *fixtureBranchProtection) []string {
 	present := make(map[string]bool)
 	for _, n := range t2.StatusCheckRollup.Contexts.Nodes {
@@ -307,7 +307,6 @@ func fixtureMissingRequired(t2 *fixtureTier2PR, bp *fixtureBranchProtection) []s
 			missing = append(missing, ctx)
 		}
 	}
-	sort.Strings(missing)
 	return missing
 }
 
