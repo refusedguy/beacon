@@ -397,6 +397,72 @@ func (g *LaunchGate) waitLocked() time.Duration {
 	return 0
 }
 
+// Preflight quota check before sending a task, ADR 0044 §6.
+//
+// T3.54 backpressure (LaunchGate) reacts to a GitHub API quota response and
+// defers launches until Resume sees recovery. The preflight check is a
+// different mechanism: it stands at the entry to sending a task, reads the
+// live quota and either allows the send or refuses it with a reason before
+// anything starts. It holds no pending count, schedules no wait and resumes
+// nothing. A task refused here is not sent and is not retried by the guard.
+
+// PreflightQuotaExhausted is the reason returned when a live quota reading
+// shows the plan already spent. It shares the ADR 0038 §2 cause with
+// backpressure but is a refusal at send time, not a deferred launch.
+const PreflightQuotaExhausted = "quota_exhausted"
+
+// PreflightQuotaUnknown is the reason returned when the live quota cannot be
+// read. The send is refused so no attempt is spent on an unknown quota.
+const PreflightQuotaUnknown = "quota_unknown"
+
+// PreflightDecision is the verdict of the check before a task is sent.
+// Allowed reports whether the send may proceed. Reason is set only when
+// Allowed is false, so the caller can report why the task was not started.
+type PreflightDecision struct {
+	Allowed bool
+	Reason  string
+}
+
+// PreflightGuard checks live quota before a task is sent. A nil counter means
+// there is no quota to enforce, so every send is allowed.
+type PreflightGuard struct {
+	counter *Counter
+}
+
+// NewPreflightGuard builds a preflight check over the shared point counter.
+func NewPreflightGuard(c *Counter) *PreflightGuard {
+	return &PreflightGuard{counter: c}
+}
+
+// Check reads a fresh quota snapshot and reports whether the send may proceed.
+// The GET /rate_limit reading is taken at check time, so the verdict reflects
+// the live quota and does not depend on a response from a task already sent.
+// An exhausted or unreadable quota returns Allowed=false with a reason.
+func (g *PreflightGuard) Check(ctx context.Context) PreflightDecision {
+	if g.counter == nil {
+		return PreflightDecision{Allowed: true}
+	}
+	if err := g.counter.Sync(ctx); err != nil {
+		return PreflightDecision{Reason: PreflightQuotaUnknown}
+	}
+	if g.counter.LimitReached() {
+		return PreflightDecision{Reason: PreflightQuotaExhausted}
+	}
+	return PreflightDecision{Allowed: true}
+}
+
+// Send runs send only when Check allows the task to be sent. When the check
+// refuses, send is not called and the decision carries the reason, so the task
+// is never started against an exhausted quota and the refusal is known before
+// any work begins.
+func (g *PreflightGuard) Send(ctx context.Context, send func() error) (PreflightDecision, error) {
+	d := g.Check(ctx)
+	if !d.Allowed || send == nil {
+		return d, nil
+	}
+	return d, send()
+}
+
 // Artifact verdict, ADR 0027. A closed or merged pull request is terminal and
 // needs no read of an agent's log, transcript or database. The typed artifact
 // locators are validated where receipts are imported; this helper is the
