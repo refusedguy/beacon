@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -424,5 +426,269 @@ func TestRecordWakeRejectsEmptyObligation(t *testing.T) {
 	op := NewObservedPersist(d)
 	if err := op.RecordWake(context.Background(), WakeObservation{Sent: true}); err == nil {
 		t.Fatal("RecordWake with empty obligation id: error = nil, want invalid input")
+	}
+}
+
+// Shared gate acceptance (ADR 0037 p3, T3.49). Fifteen callers on one CI must
+// produce one wait, one warning, and no phantom per-agent timers.
+
+func waitForActiveWaiters(t *testing.T, g *SharedGate, key string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if g.ActiveWaiters(key) == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("active waiters for %q = %d, want %d", key, g.ActiveWaiters(key), want)
+}
+
+// TestSharedGateCoalescesFifteenUnitsOnOneCI is the 15-agents case from the
+// card: the expensive wait runs once, every unit sees the shared gate and one
+// WARNING is printed, and the gate is empty again afterwards.
+func TestSharedGateCoalescesFifteenUnitsOnOneCI(t *testing.T) {
+	g := NewSharedGate()
+	var mu sync.Mutex
+	var warnings []string
+	g.SetWarningSink(func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	})
+
+	const (
+		units = 15
+		key   = "ci:org/repo#7"
+	)
+	release := make(chan struct{})
+	var runs atomic.Int32
+	fn := func(context.Context) error {
+		runs.Add(1)
+		<-release
+		return nil
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, units)
+	var wg sync.WaitGroup
+	for i := 0; i < units; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = g.Wait(context.Background(), key, fn)
+		}(i)
+	}
+	close(start)
+
+	waitForActiveWaiters(t, g, key, units)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("expensive wait ran %d times, want 1 (one CI, one wait)", got)
+	}
+
+	close(release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("unit %d: Wait = %v, want nil", i, err)
+		}
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("expensive wait ran %d times, want 1", got)
+	}
+	if got := g.ActiveWaiters(key); got != 0 {
+		t.Errorf("active waiters after completion = %d, want 0", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %d (%q), want 1", len(warnings), warnings)
+	}
+	if !strings.Contains(warnings[0], "WARNING") || !strings.Contains(warnings[0], key) {
+		t.Errorf("warning = %q, want WARNING with key %q", warnings[0], key)
+	}
+}
+
+// TestSharedGateDifferentKeysDoNotCoalesce keeps two independent CIs
+// independent: no shared gate, no warning, two waits.
+func TestSharedGateDifferentKeysDoNotCoalesce(t *testing.T) {
+	g := NewSharedGate()
+	var mu sync.Mutex
+	var warnings []string
+	g.SetWarningSink(func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	})
+
+	release := make(chan struct{})
+	var runs atomic.Int32
+	fn := func(context.Context) error {
+		runs.Add(1)
+		<-release
+		return nil
+	}
+
+	keys := []string{"ci:org/repo#7", "ci:org/repo#8"}
+	var wg sync.WaitGroup
+	for _, key := range keys {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			_ = g.Wait(context.Background(), key, fn)
+		}(key)
+	}
+	waitForActiveWaiters(t, g, keys[0], 1)
+	waitForActiveWaiters(t, g, keys[1], 1)
+
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("expensive wait ran %d times, want 2 for two different keys", got)
+	}
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(warnings) != 0 {
+		t.Errorf("warnings = %q, want none: distinct keys are not a shared gate", warnings)
+	}
+}
+
+// TestSharedGateSharesLeaderError: one CI result is shared by all waiters,
+// success or failure. A failed shared wait is still one wait.
+func TestSharedGateSharesLeaderError(t *testing.T) {
+	g := NewSharedGate()
+	g.SetWarningSink(func(string, ...any) {})
+
+	boom := errors.New("ci red")
+	release := make(chan struct{})
+	var runs atomic.Int32
+	fn := func(context.Context) error {
+		runs.Add(1)
+		<-release
+		return boom
+	}
+
+	const units = 5
+	const key = "ci:org/repo#9"
+	start := make(chan struct{})
+	errs := make([]error, units)
+	var wg sync.WaitGroup
+	for i := 0; i < units; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = g.Wait(context.Background(), key, fn)
+		}(i)
+	}
+	close(start)
+	waitForActiveWaiters(t, g, key, units)
+
+	close(release)
+	wg.Wait()
+
+	if got := runs.Load(); got != 1 {
+		t.Errorf("expensive wait ran %d times, want 1", got)
+	}
+	for i, err := range errs {
+		if !errors.Is(err, boom) {
+			t.Errorf("unit %d: Wait = %v, want the shared leader error %v", i, err, boom)
+		}
+	}
+}
+
+// TestSharedGateCancelledFollowerLeavesRound: an agent that times out on its
+// own context leaves with ctx.Err() and does not abort the shared wait or
+// create a second one for the others.
+func TestSharedGateCancelledFollowerLeavesRound(t *testing.T) {
+	g := NewSharedGate()
+	g.SetWarningSink(func(string, ...any) {})
+
+	release := make(chan struct{})
+	var runs atomic.Int32
+	fn := func(context.Context) error {
+		runs.Add(1)
+		<-release
+		return nil
+	}
+
+	const key = "ci:org/repo#11"
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var leaderErr, followerErr, cancelledErr error
+	cancelledReturned := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); leaderErr = g.Wait(context.Background(), key, fn) }()
+	go func() { defer wg.Done(); followerErr = g.Wait(context.Background(), key, fn) }()
+	go func() {
+		defer wg.Done()
+		cancelledErr = g.Wait(cancelCtx, key, fn)
+		close(cancelledReturned)
+	}()
+
+	waitForActiveWaiters(t, g, key, 3)
+	cancel()
+	// Let the cancelled unit leave before the leader finishes, so the only
+	// ready case in its select is ctx.Done(), not the shared gate's done.
+	<-cancelledReturned
+
+	close(release)
+	wg.Wait()
+
+	if !errors.Is(cancelledErr, context.Canceled) {
+		t.Errorf("cancelled follower = %v, want context.Canceled", cancelledErr)
+	}
+	if leaderErr != nil || followerErr != nil {
+		t.Errorf("leader = %v, follower = %v, want both nil", leaderErr, followerErr)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("expensive wait ran %d times, want 1", got)
+	}
+	if got := g.ActiveWaiters(key); got != 0 {
+		t.Errorf("active waiters after completion = %d, want 0", got)
+	}
+}
+
+// TestSharedGateWarnsOnEverySharedRound: detection resets per round, so a
+// later shared wait on the same key is reported again.
+func TestSharedGateWarnsOnEverySharedRound(t *testing.T) {
+	g := NewSharedGate()
+	var mu sync.Mutex
+	warnings := 0
+	g.SetWarningSink(func(string, ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		warnings++
+	})
+
+	const key = "ci:org/repo#12"
+	for round := 0; round < 2; round++ {
+		release := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				defer wg.Done()
+				_ = g.Wait(context.Background(), key, func(context.Context) error {
+					<-release
+					return nil
+				})
+			}()
+		}
+		waitForActiveWaiters(t, g, key, 2)
+		close(release)
+		wg.Wait()
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if warnings != 2 {
+		t.Errorf("warnings = %d, want one per shared round (2)", warnings)
 	}
 }
