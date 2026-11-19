@@ -731,3 +731,244 @@ func (l *Ladder) Position(ctx context.Context, id string) (Marker, error) {
 	})
 	return m, err
 }
+
+// ---------------------------------------------------------------------------
+// Quorum from completed reviews (ADR 0038 section 5).
+//
+// A decision is adopted only after the required number of approvals comes from
+// reviews that reached the end and issued a verdict. Reviews that were
+// interrupted, never finished, or ended in error produce no approval marker and
+// shrink the pool of approvals still possible. When that pool falls below the
+// threshold the quorum is unreachable and is rejected at once instead of
+// waiting forever. The SHIP verdict of the independent review gate (ADR 0038
+// section 4) is one source of an approval marker.
+//
+// This is a separate concern from the ADR 0017 delivery ladder above: it reads
+// and writes no ladder marker and changes no ladder timing. Review markers live
+// in their own table in the same store, written through the same Writer.
+// ---------------------------------------------------------------------------
+
+// ReviewVerdict is the outcome a completed review issued. The three values
+// mirror the independent review gate of ADR 0038 section 4. Only ReviewShip is
+// an approval marker for the quorum.
+type ReviewVerdict string
+
+const (
+	ReviewShip     ReviewVerdict = "SHIP"
+	ReviewFixFirst ReviewVerdict = "FIX-FIRST"
+	ReviewBlocked  ReviewVerdict = "BLOCKED"
+)
+
+func validReviewVerdict(v ReviewVerdict) bool {
+	switch v {
+	case ReviewShip, ReviewFixFirst, ReviewBlocked:
+		return true
+	}
+	return false
+}
+
+// ReviewState is how far a review got. Only ReviewDone can carry an approval,
+// and only when its verdict is ReviewShip. ReviewRunning may still produce an
+// approval. ReviewAborted (interrupted, incomplete, or errored) cannot.
+type ReviewState string
+
+const (
+	ReviewRunning ReviewState = "running"
+	ReviewDone    ReviewState = "done"
+	ReviewAborted ReviewState = "aborted"
+)
+
+// QuorumResult is the decision of a quorum evaluation.
+type QuorumResult string
+
+const (
+	// QuorumPending means the threshold is not met yet but is still reachable.
+	QuorumPending QuorumResult = "pending"
+	// QuorumReached means completed approvals meet or exceed the threshold.
+	QuorumReached QuorumResult = "reached"
+	// QuorumUnreachable means the most approvals still possible is below the
+	// threshold, so the quorum must be rejected instead of waiting.
+	QuorumUnreachable QuorumResult = "unreachable"
+)
+
+// QuorumDecision reports a quorum evaluation with the counts behind it, so a
+// caller can tell approvals from markers that were still running or discarded.
+type QuorumDecision struct {
+	Result      QuorumResult
+	Approvals   int // completed reviews that issued ReviewShip
+	MaxPossible int // approvals plus reviews still running
+	Threshold   int
+}
+
+// ReviewMarker is one review's contribution to a quorum evaluation.
+type ReviewMarker struct {
+	ReviewID string
+	State    ReviewState
+	Verdict  ReviewVerdict
+}
+
+var (
+	// ErrInvalidThreshold reports a quorum threshold below one.
+	ErrInvalidThreshold = errors.New("ladder: invalid quorum threshold")
+	// ErrInvalidReviewVerdict reports a verdict outside the three review gate values.
+	ErrInvalidReviewVerdict = errors.New("ladder: invalid review verdict")
+	// ErrReviewNotRunning reports a transition for a review that is unknown or
+	// already terminal.
+	ErrReviewNotRunning = errors.New("ladder: review not running")
+)
+
+const createQuorumSQL = `
+CREATE TABLE IF NOT EXISTS quorum_reviews (
+  task_id   TEXT NOT NULL,
+  review_id TEXT NOT NULL,
+  state     TEXT NOT NULL,
+  verdict   TEXT NOT NULL,
+  PRIMARY KEY (task_id, review_id)
+);
+`
+
+func ensureQuorum(tx *sql.Tx) error {
+	if _, err := tx.Exec(createQuorumSQL); err != nil {
+		return fmt.Errorf("ladder: create quorum reviews: %w", err)
+	}
+	return nil
+}
+
+// AddReview registers a review as running for taskID. Re-adding an existing
+// review is a no-op so an at-least-once caller cannot reset a terminal review.
+func (l *Ladder) AddReview(ctx context.Context, taskID, reviewID string) error {
+	if taskID == "" || reviewID == "" {
+		return errors.New("ladder: add review: empty task or review id")
+	}
+	return l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureQuorum(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			INSERT OR IGNORE INTO quorum_reviews (task_id, review_id, state, verdict)
+			VALUES (?, ?, ?, ?)`, taskID, reviewID, string(ReviewRunning), "")
+		if err != nil {
+			return fmt.Errorf("ladder: add review: %w", err)
+		}
+		return nil
+	})
+}
+
+// CompleteReview records that a review reached the end and issued v. Only a
+// running review can be completed.
+func (l *Ladder) CompleteReview(ctx context.Context, taskID, reviewID string, v ReviewVerdict) error {
+	if !validReviewVerdict(v) {
+		return ErrInvalidReviewVerdict
+	}
+	return l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureQuorum(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`
+			UPDATE quorum_reviews SET state = ?, verdict = ?
+			WHERE task_id = ? AND review_id = ? AND state = ?`,
+			string(ReviewDone), string(v), taskID, reviewID, string(ReviewRunning))
+		if err != nil {
+			return fmt.Errorf("ladder: complete review: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("ladder: complete review rows: %w", err)
+		}
+		if n == 0 {
+			return ErrReviewNotRunning
+		}
+		return nil
+	})
+}
+
+// AbortReview records that a review was interrupted, left incomplete, or ended
+// in error. An aborted review yields no approval marker.
+func (l *Ladder) AbortReview(ctx context.Context, taskID, reviewID string) error {
+	return l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureQuorum(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`
+			UPDATE quorum_reviews SET state = ?, verdict = ''
+			WHERE task_id = ? AND review_id = ? AND state = ?`,
+			string(ReviewAborted), taskID, reviewID, string(ReviewRunning))
+		if err != nil {
+			return fmt.Errorf("ladder: abort review: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("ladder: abort review rows: %w", err)
+		}
+		if n == 0 {
+			return ErrReviewNotRunning
+		}
+		return nil
+	})
+}
+
+// classifyQuorum counts approval markers from completed reviews and decides
+// whether the quorum is reached, still pending, or unreachable. Only a review
+// that is done with the SHIP verdict counts as an approval. A running review can
+// still become an approval, so it adds to the maximum possible; a done review
+// with a non-SHIP verdict and an aborted review cannot.
+func classifyQuorum(reviews []ReviewMarker, threshold int) (QuorumDecision, error) {
+	if threshold < 1 {
+		return QuorumDecision{}, ErrInvalidThreshold
+	}
+	d := QuorumDecision{Threshold: threshold}
+	for _, r := range reviews {
+		switch {
+		case r.State == ReviewDone && r.Verdict == ReviewShip:
+			d.Approvals++
+		case r.State == ReviewRunning:
+			d.MaxPossible++
+		}
+	}
+	d.MaxPossible += d.Approvals
+	switch {
+	case d.Approvals >= threshold:
+		d.Result = QuorumReached
+	case d.MaxPossible < threshold:
+		d.Result = QuorumUnreachable
+	default:
+		d.Result = QuorumPending
+	}
+	return d, nil
+}
+
+// Quorum evaluates the decision for taskID against threshold. It counts only
+// approval markers from reviews that reached the end with the SHIP verdict.
+func (l *Ladder) Quorum(ctx context.Context, taskID string, threshold int) (QuorumDecision, error) {
+	if threshold < 1 {
+		return QuorumDecision{}, ErrInvalidThreshold
+	}
+	var reviews []ReviewMarker
+	err := l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureQuorum(tx); err != nil {
+			return err
+		}
+		rows, err := tx.Query(`
+			SELECT review_id, state, verdict FROM quorum_reviews
+			WHERE task_id = ? ORDER BY review_id`, taskID)
+		if err != nil {
+			return fmt.Errorf("ladder: quorum query: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var m ReviewMarker
+			var state, verdict string
+			if err := rows.Scan(&m.ReviewID, &state, &verdict); err != nil {
+				return fmt.Errorf("ladder: quorum scan: %w", err)
+			}
+			m.State = ReviewState(state)
+			m.Verdict = ReviewVerdict(verdict)
+			reviews = append(reviews, m)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return QuorumDecision{}, err
+	}
+	return classifyQuorum(reviews, threshold)
+}
