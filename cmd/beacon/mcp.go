@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +87,49 @@ func readInitEventConfig() initEventConfig {
 			cfg.timeout = d
 		}
 	}
+	return cfg
+}
+
+// syncCallTimeoutDefault is the default time a long synchronous MCP call may
+// run before it is converted into a ticket carrying a job id (ADR 0045 §2).
+const syncCallTimeoutDefault = 30 * time.Second
+
+// syncCallTimeoutMax is the hard ceiling for the threshold. A larger configured
+// value is clamped to this, so no call hangs in the connection for more than
+// two minutes (ADR 0045 §2).
+const syncCallTimeoutMax = 120 * time.Second
+
+// syncCallConfig is the single threshold shared by the long synchronous MCP
+// calls. The value flows into Dependencies.After, the one MCP-boundary knob
+// that switches a slow response into the client's task form. Past the threshold
+// the call returns a ticket with a job id instead of hanging in the connection,
+// and further waiting proceeds by that ticket (ADR 0045 §2, ADR 0031 §2).
+//
+// This is a time threshold, not the delivery field of ADR 0026. ADR 0026 says
+// honestly how a follow-up was delivered (steer, queue or unsupported); it does
+// not say when a call must become a ticket. This config does not touch delivery.
+type syncCallConfig struct {
+	after time.Duration
+}
+
+// readSyncCallConfig parses the unified sync-call threshold at the CLI
+// boundary. The default is 30 seconds, a configured value is capped at 120
+// seconds, and an invalid or non-positive value falls back to the default so a
+// broken setting can never disable the ticket conversion.
+func readSyncCallConfig() syncCallConfig {
+	cfg := syncCallConfig{after: syncCallTimeoutDefault}
+	raw := strings.TrimSpace(os.Getenv("BEACON_SYNC_CALL_TIMEOUT"))
+	if raw == "" {
+		return cfg
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return cfg
+	}
+	if d > syncCallTimeoutMax {
+		d = syncCallTimeoutMax
+	}
+	cfg.after = d
 	return cfg
 }
 
@@ -289,6 +333,11 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 		SharedCIWaiter:  sharedCIWaiter,
 		PrecheckJournal: taskcli.NewService(taskcli.Config{StateDir: dir}),
 		CallScopes:      mcp.NewCapabilityScopeRegistry(nil, nil),
+		// ADR 0045 §2: one threshold for all long synchronous MCP calls. Past
+		// it the server answers with a ticket carrying a job id rather than
+		// holding the connection open. This is a time bound, not ADR 0026's
+		// delivery field.
+		After: readSyncCallConfig().after,
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
 			watches, err := db.ActiveWatches()
 			if err != nil {
