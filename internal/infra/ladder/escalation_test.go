@@ -34,7 +34,7 @@ func newTestDB(t *testing.T) *testDB {
 }
 
 func (d *testDB) EscalatedCount(ctx context.Context) (int, error) {
-	if _, err := d.DB.Write(ctx, func(tx *sql.Tx) error {
+	if err := d.DB.Write(ctx, func(tx *sql.Tx) error {
 		_, err := tx.Exec(`
 			CREATE TABLE IF NOT EXISTS escalation_stats
 			  (id INTEGER PRIMARY KEY CHECK (id = 1),
