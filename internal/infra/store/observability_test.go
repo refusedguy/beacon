@@ -512,6 +512,59 @@ func TestSharedGateCoalescesFifteenUnitsOnOneCI(t *testing.T) {
 	}
 }
 
+// TestSharedCIWaitCoalescesOneCI is the T3.73 integration check. Fifteen units
+// waiting on one CI go through SharedCIWait and run the expensive wait once.
+// Removing the SharedGate call from SharedCIWait makes the run count reach 15
+// and this test fails.
+func TestSharedCIWaitCoalescesOneCI(t *testing.T) {
+	g := sharedCIWait()
+	const key = "T3.73:ci:org/repo#73"
+	g.SetWarningSink(func(string, ...any) {})
+	defer g.SetWarningSink(nil)
+
+	const units = 15
+	release := make(chan struct{})
+	var runs atomic.Int32
+	fn := func(context.Context) error {
+		runs.Add(1)
+		<-release
+		return nil
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, units)
+	var wg sync.WaitGroup
+	for i := 0; i < units; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			errs[i] = SharedCIWait(context.Background(), key, fn)
+		}(i)
+	}
+	close(start)
+
+	waitForActiveWaiters(t, g, key, units)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("SharedCIWait ran the expensive wait %d times, want 1 (one CI, one wait)", got)
+	}
+
+	close(release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("unit %d: SharedCIWait = %v, want nil", i, err)
+		}
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("expensive wait ran %d times after completion, want 1", got)
+	}
+	if got := g.ActiveWaiters(key); got != 0 {
+		t.Errorf("active waiters after completion = %d, want 0", got)
+	}
+}
+
 // TestSharedGateDifferentKeysDoNotCoalesce keeps two independent CIs
 // independent: no shared gate, no warning, two waits.
 func TestSharedGateDifferentKeysDoNotCoalesce(t *testing.T) {
