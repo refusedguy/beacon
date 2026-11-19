@@ -435,3 +435,105 @@ func (a *StreamAssembler) Finish(expected uint64, result []byte) StreamFinal {
 		Result:     result,
 	}
 }
+
+// ---- ADR 0042 п1 / T3.85: дескриптор задачи с дедлайном ----
+//
+// Дедлайн это сквозной контекст задачи, а не таймаут одного вызова и не
+// бюджет ожидания из ADR 0017. Три свойства задают контракт: дескриптор идёт
+// во вложенные вызовы, поэтому потомок не живёт дольше родителя; дескриптор
+// сохраняется в хранилище, поэтому абсолютный дедлайн переживает рестарт;
+// по истечении дедлайна задача завершается с причиной, а не уходит в вечное
+// ожидание. Дедлайн хранится абсолютным instant, а не длительностью: иначе
+// перезапуск процесса отсчитывал бы бюджет заново.
+
+// TaskDescriptor is the cross-cutting context of one task. DeadlineAt is an
+// absolute instant so a restarted process restores the same limit instead of
+// restarting a duration. The descriptor is passed by value into every nested
+// call, so a child cannot extend or mutate the parent's deadline.
+type TaskDescriptor struct {
+	ID         string    `json:"id"`
+	DeadlineAt time.Time `json:"deadlineAt"`
+}
+
+// DeadlineReasonExceeded is the termination reason recorded when a task hits
+// its hard deadline. It is not a poll tick and not a wait budget.
+const DeadlineReasonExceeded = "deadline_exceeded"
+
+// NewTaskDescriptor builds a descriptor and rejects an empty id or a zero
+// deadline. Validate reports the first problem as INVALID_INPUT.
+func NewTaskDescriptor(id string, deadlineAt time.Time) (TaskDescriptor, error) {
+	d := TaskDescriptor{ID: strings.TrimSpace(id), DeadlineAt: deadlineAt}
+	if err := d.Validate(); err != nil {
+		return TaskDescriptor{}, err
+	}
+	return d, nil
+}
+
+// Validate reports whether the descriptor is usable: it needs an id and an
+// absolute deadline. It returns INVALID_INPUT naming the first empty field.
+func (d TaskDescriptor) Validate() error {
+	if strings.TrimSpace(d.ID) == "" {
+		return NewAppError(CodeInvalidInput, "task descriptor: пустое поле id")
+	}
+	if d.DeadlineAt.IsZero() {
+		return NewAppError(CodeInvalidInput, "task descriptor: пустое поле deadlineAt")
+	}
+	return nil
+}
+
+// CheckDeadline checks the hard limit at at. When the deadline passed it
+// returns expired=true and the termination reason, so the caller ends the
+// task with a cause instead of waiting forever. Before the deadline it
+// returns expired=false and an empty reason. A zero deadline sets no limit.
+func (d TaskDescriptor) CheckDeadline(at time.Time) (bool, string) {
+	if !d.DeadlineAt.IsZero() && !at.Before(d.DeadlineAt) {
+		return true, DeadlineReasonExceeded
+	}
+	return false, ""
+}
+
+// DeadlineError builds the AppError for a task terminated on deadline expiry.
+// It returns nil while the task still has time. CodeGone (410) says the task
+// is gone because its hard limit passed; the message carries the reason.
+func DeadlineError(d TaskDescriptor, at time.Time) error {
+	expired, reason := d.CheckDeadline(at)
+	if !expired {
+		return nil
+	}
+	return NewAppError(CodeGone, fmt.Sprintf("task %s: %s", d.ID, reason))
+}
+
+// taskDescriptorKey is private so only this package can attach or read a
+// descriptor, keeping the propagation contract in one place.
+type taskDescriptorKey struct{}
+
+// WithTaskDescriptor returns a context carrying d. Every nested call receives
+// the same descriptor, so none of them can outlive the parent's deadline.
+func WithTaskDescriptor(ctx context.Context, d TaskDescriptor) context.Context {
+	return context.WithValue(ctx, taskDescriptorKey{}, d)
+}
+
+// TaskDescriptorFrom returns the descriptor carried by ctx. ok is false when
+// no descriptor was attached to the context chain.
+func TaskDescriptorFrom(ctx context.Context) (TaskDescriptor, bool) {
+	d, ok := ctx.Value(taskDescriptorKey{}).(TaskDescriptor)
+	return d, ok
+}
+
+// NestedContext derives a context for a nested call and caps its deadline by
+// the parent descriptor's deadline, so the child can never outlive the parent.
+// A requested deadline later than the parent's (or a zero one) is clamped to
+// the parent's; an earlier one is kept. When ctx carries no descriptor the
+// requested deadline is used unchanged, and a zero requested deadline yields a
+// plain cancellable context. The caller must call the returned cancel func.
+func NestedContext(ctx context.Context, requested time.Time) (context.Context, context.CancelFunc) {
+	if d, ok := TaskDescriptorFrom(ctx); ok && !d.DeadlineAt.IsZero() {
+		if requested.IsZero() || requested.After(d.DeadlineAt) {
+			requested = d.DeadlineAt
+		}
+	}
+	if requested.IsZero() {
+		return context.WithCancel(ctx)
+	}
+	return context.WithDeadline(ctx, requested)
+}
