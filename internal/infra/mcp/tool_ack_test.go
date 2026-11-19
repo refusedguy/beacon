@@ -1,10 +1,13 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/google/jsonschema-go/jsonschema"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -232,6 +235,167 @@ func TestAckDoesNotChangeVerdict(t *testing.T) {
 				t.Errorf("ack response = %s, want only ok:true", body)
 			}
 		})
+	}
+}
+
+// parkedAckWatch is a Watch whose agent asked a human a question.
+func parkedAckWatch() domain.Watch {
+	w := resultFixture(domain.VerdictNeedsInput)
+	w.Status = domain.StatusNeedsInput
+	return w
+}
+
+// TestAckInputSchemaHasContinueOf keeps continueOf in the derived MCP input
+// schema, so a client can send a human answer back to the same task.
+func TestAckInputSchemaHasContinueOf(t *testing.T) {
+	schema, err := jsonschema.For[AckInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"continueOf"`)) {
+		t.Fatalf("input schema has no continueOf property: %s", raw)
+	}
+}
+
+// TestAckContinueOfResumesSameWatch covers T3.21: an answer through
+// ack(continueOf) resumes the parked Watch, still only records an intention and
+// never creates a second task.
+func TestAckContinueOfResumesSameWatch(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 2, 0, 0, 0, time.UTC)}
+	w := parkedAckWatch()
+	o := resultObligation(w, "session-answer")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+
+	_, out, err := h.Handle(context.Background(), nil, AckInput{
+		WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID,
+	})
+	if err != nil || !out.OK {
+		t.Fatalf("ack continueOf: out %+v err %v", out, err)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read Watch after answer: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+		t.Errorf("answer did not resume the Watch: status %q verdict %q", got.Status, got.Verdict)
+	}
+	if got.Revision != w.Revision+1 {
+		t.Errorf("revision = %d, want %d", got.Revision, w.Revision+1)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("answer created %d Watches, want 1", len(store.watches))
+	}
+	if _, err := store.Watch("w-new"); err == nil {
+		t.Error("answer created a successor Watch")
+	}
+
+	stamped, ok := stamper.snapshot(o.ID)
+	if !ok || stamped.ClaimedAt.IsZero() {
+		t.Error("ack did not record the intention with claimedAt")
+	}
+	if !stamped.ReadAt.IsZero() {
+		t.Errorf("ack stamped readAt %v, want zero", stamped.ReadAt)
+	}
+	if stamped.VerdictPointer != o.VerdictPointer {
+		t.Errorf("ack changed the verdict pointer: %q -> %q", o.VerdictPointer, stamped.VerdictPointer)
+	}
+	if got := h.continuations.Rounds(w.ID); got != 1 {
+		t.Errorf("rounds = %d, want 1", got)
+	}
+}
+
+// TestAckContinueOfRoundLimit enforces the five-round cap from ADR 0031 §3.
+// The sixth answer is refused before the Watch or the obligation changes.
+func TestAckContinueOfRoundLimit(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 3, 0, 0, 0, time.UTC)}
+	w := parkedAckWatch()
+	o := resultObligation(w, "session-limit")
+	store := newMemStore()
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+
+	for round := 1; round <= int(domain.MaxContinueRounds)+1; round++ {
+		parked := w
+		parked.Revision = uint64(7 + round)
+		if err := store.SaveWatch(parked); err != nil {
+			t.Fatalf("SaveWatch for round %d: %v", round, err)
+		}
+		in := AckInput{WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID}
+		_, out, err := h.Handle(context.Background(), nil, in)
+		if round <= int(domain.MaxContinueRounds) {
+			if err != nil || !out.OK {
+				t.Fatalf("round %d: out %+v err %v", round, out, err)
+			}
+			got, err := store.Watch(w.ID)
+			if err != nil || got.Status != domain.StatusWatching {
+				t.Fatalf("round %d did not resume: %+v err %v", round, got, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Fatal("sixth answer was accepted")
+		}
+		assertCode(t, err, domain.CodeLimitExceeded)
+		got, err := store.Watch(w.ID)
+		if err != nil || got.Status != domain.StatusNeedsInput {
+			t.Errorf("refused answer changed the Watch: %+v err %v", got, err)
+		}
+	}
+
+	if got := h.continuations.Rounds(w.ID); got != domain.MaxContinueRounds {
+		t.Errorf("rounds = %d, want %d", got, domain.MaxContinueRounds)
+	}
+	_, claims := stamper.counts()
+	if claims != int(domain.MaxContinueRounds) {
+		t.Errorf("claimed %d times, want %d (the refused round must not stamp)", claims, domain.MaxContinueRounds)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("rounds created %d Watches, want 1", len(store.watches))
+	}
+}
+
+// TestAckContinueOfMustNameSameWatch rejects an answer that points at another
+// task, so a human reply can never start a new Watch.
+func TestAckContinueOfMustNameSameWatch(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 4, 0, 0, 0, time.UTC)}
+	w := parkedAckWatch()
+	o := resultObligation(w, "session-mismatch")
+	store := newMemStore()
+	_ = store.SaveWatch(w)
+	_ = store.SaveObligation(o)
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+
+	_, _, err := h.Handle(context.Background(), nil, AckInput{
+		WatchID: w.ID, ObligationID: o.ID, ContinueOf: "another-watch",
+	})
+	assertCode(t, err, domain.CodeInvalidInput)
+	got, _ := store.Watch(w.ID)
+	if got.Status != domain.StatusNeedsInput || got.Revision != w.Revision {
+		t.Errorf("mismatched answer changed the Watch: %+v", got)
+	}
+	_, claims := stamper.counts()
+	if claims != 0 {
+		t.Errorf("rejected answer stamped the obligation %d times", claims)
 	}
 }
 

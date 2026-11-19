@@ -11,6 +11,21 @@ import "time"
 // EventKind identifies what happened to a Watch.
 type EventKind string
 
+// StatusNeedsInput is the parked state of a Watch whose agent asked a human a
+// question. It is a lifecycle state alongside watching, notifying and closed
+// (ADR 0031 §3). The parked Watch keeps its ID: answering resumes the same
+// task through ContinueEvent instead of creating a successor Watch.
+const StatusNeedsInput Status = "needs_input"
+
+// VerdictNeedsInput is the verdict carried while a Watch is parked. It marks
+// the reason the wait stopped early and, like watching, is not a result that
+// marks an obligation read.
+const VerdictNeedsInput Verdict = "needs_input"
+
+// MaxContinueRounds is the ADR 0031 §3 cap on human-answer rounds for one
+// Watch. A fifth answer may resume the task; a sixth is refused.
+const MaxContinueRounds uint64 = 5
+
 const (
 	// EventVerdict carries the verdict computed by the verdict engine (T1.5).
 	EventVerdict EventKind = "verdict"
@@ -18,6 +33,10 @@ const (
 	EventCancel EventKind = "cancel"
 	// EventHeadChanged means the PR head SHA moved (ADR 0019).
 	EventHeadChanged EventKind = "head_changed"
+	// EventNeedsInput parks a Watch because the agent asked a human a question.
+	EventNeedsInput EventKind = "needs_input"
+	// EventContinue resumes a parked Watch with a human answer.
+	EventContinue EventKind = "continue"
 )
 
 // CloseReason is the machine-readable cause stored on a closed Watch.
@@ -32,11 +51,15 @@ const (
 
 // Event is one input to Transition. Only the fields relevant to Kind are set;
 // At is optional and supplies timestamps so Transition never calls time.Now.
+// ContinueOf names the Watch a human answer resumes and Round is the 1-based
+// answer round; both are used only by EventContinue.
 type Event struct {
 	Kind       EventKind
 	Verdict    Verdict
 	NewHeadSHA string
 	At         time.Time
+	ContinueOf string
+	Round      uint64
 }
 
 // EffectKind identifies a side effect the caller must perform after Transition.
@@ -48,6 +71,9 @@ const (
 	// EffectCreateWatch creates the successor Watch after head_changed, for the
 	// same subscribers (ADR 0019).
 	EffectCreateWatch EffectKind = "create_watch"
+	// EffectContinueWatch resumes the same parked Watch after a human answer.
+	// It never carries a new Watch ID: the task identity is preserved.
+	EffectContinueWatch EffectKind = "continue_watch"
 )
 
 // Effect describes work deferred to the adapter layer. Transition only returns
@@ -74,6 +100,24 @@ func HeadChangedEvent(newHeadSHA string, at time.Time) Event {
 	return Event{Kind: EventHeadChanged, NewHeadSHA: newHeadSHA, At: at}
 }
 
+// NeedsInputEvent parks a Watch while the agent waits for a human answer.
+func NeedsInputEvent(at time.Time) Event {
+	return Event{Kind: EventNeedsInput, At: at}
+}
+
+// ContinueEvent resumes the Watch named by continueOf at the given answer
+// round. Transition ignores it unless the Watch is parked and the round is
+// inside the ADR 0031 §3 cap.
+func ContinueEvent(continueOf string, round uint64, at time.Time) Event {
+	return Event{Kind: EventContinue, ContinueOf: continueOf, Round: round, At: at}
+}
+
+// CanContinueRound reports whether round is a permitted human-answer round.
+// Rounds start at one and stop at MaxContinueRounds.
+func CanContinueRound(round uint64) bool {
+	return round >= 1 && round <= MaxContinueRounds
+}
+
 // Transition applies e to w and returns the next Watch plus the effects the
 // caller must run. It never mutates w.
 //
@@ -85,10 +129,17 @@ func HeadChangedEvent(newHeadSHA string, at time.Time) Event {
 //	notifying -> notifying  : same actionable verdict repeated (idempotent) or a new actionable verdict
 //	notifying -> watching   : re-run downgrade to watching (ready/keep_working -> watching)
 //	notifying -> closed     : terminal verdict, cancel or head_changed
+//	watching  -> needs_input: the agent asked a human a question (ADR 0031 §3)
+//	notifying -> needs_input: same question after an actionable verdict
+//	needs_input -> watching : human answer via ContinueEvent with a valid round
+//	needs_input -> closed   : cancel or head_changed
+//	needs_input -> needs_input: repeated question or out-of-range answer (no-op)
 //	closed    -> closed     : no-op (terminal)
 //
 // Forbidden transitions: anything leaving closed (closed -> watching,
-// closed -> notifying). A cancelled Watch therefore never becomes ready.
+// closed -> notifying, closed -> needs_input). A cancelled Watch therefore
+// never becomes ready. A ContinueEvent whose ContinueOf is a different Watch
+// is also a no-op: an answer can never become a new task.
 //
 // Revision grows only when the verdict changes, including a re-run downgrade
 // to watching at the same SHA. It never grows on watching -> watching. There
@@ -119,9 +170,45 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		}}
 	case EventVerdict:
 		return transitionVerdict(w, e)
+	case EventNeedsInput:
+		return parkForInput(w, e)
+	case EventContinue:
+		return continueWatch(w, e)
 	default:
 		return next, nil
 	}
+}
+
+// parkForInput moves a live Watch to needs_input. It is idempotent: a second
+// question does not bump the revision again. The parked Watch keeps its ID and
+// subscribers, so a later answer resumes this task rather than creating one.
+func parkForInput(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed || w.Status == StatusNeedsInput {
+		return next, nil
+	}
+	next.Status = StatusNeedsInput
+	next.Verdict = VerdictNeedsInput
+	next.Revision = bumpRevision(w.Revision)
+	return next, nil
+}
+
+// continueWatch resumes a parked Watch on a human answer. It refuses an answer
+// for a different Watch, an unparked Watch, and a round past MaxContinueRounds.
+// The only effect is EffectContinueWatch, never EffectCreateWatch.
+func continueWatch(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status != StatusNeedsInput || e.ContinueOf != w.ID || !CanContinueRound(e.Round) {
+		return next, nil
+	}
+	next.Status = StatusWatching
+	next.Verdict = VerdictWatching
+	next.Revision = bumpRevision(w.Revision)
+	return next, []Effect{{
+		Kind:     EffectContinueWatch,
+		WatchID:  w.ID,
+		Revision: next.Revision,
+	}}
 }
 
 func transitionVerdict(w Watch, e Event) (Watch, []Effect) {

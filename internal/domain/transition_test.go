@@ -307,3 +307,124 @@ func TestTransitionDeterministic(t *testing.T) {
 		t.Fatalf("Transition is not deterministic:\n(%+v, %+v)\n(%+v, %+v)", a, ea, b, eb)
 	}
 }
+
+// TestTransitionNeedsInputParksWatch covers T3.21: an agent question parks the
+// Watch without closing it. A second question is idempotent.
+func TestTransitionNeedsInputParksWatch(t *testing.T) {
+	at := time.Date(2026, 11, 20, 1, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 3)
+
+	parked, effects := Transition(w, NeedsInputEvent(at))
+	if parked.Status != StatusNeedsInput {
+		t.Errorf("status = %q, want %q", parked.Status, StatusNeedsInput)
+	}
+	if parked.Verdict != VerdictNeedsInput {
+		t.Errorf("verdict = %q, want %q", parked.Verdict, VerdictNeedsInput)
+	}
+	if parked.Revision != 4 {
+		t.Errorf("revision = %d, want 4", parked.Revision)
+	}
+	if parked.ID != w.ID || !reflect.DeepEqual(parked.Subscribers, w.Subscribers) {
+		t.Errorf("parking changed the task identity: %+v", parked)
+	}
+	if len(effects) != 0 {
+		t.Errorf("parking produced effects %+v, want none", effects)
+	}
+	if !parked.ClosedAt.IsZero() || parked.CloseReason != "" {
+		t.Errorf("parking closed the Watch: reason %q at %v", parked.CloseReason, parked.ClosedAt)
+	}
+
+	again, effects := Transition(parked, NeedsInputEvent(at.Add(time.Minute)))
+	if !reflect.DeepEqual(again, parked) || len(effects) != 0 {
+		t.Errorf("repeated question changed the Watch: %+v, effects %+v", again, effects)
+	}
+	if w.Status != StatusWatching || w.Revision != 3 {
+		t.Errorf("Transition mutated its input: %+v", w)
+	}
+}
+
+// TestTransitionContinueResumesSameWatch proves the human answer resumes the
+// parked Watch and emits no successor Watch (T3.21 acceptance: no new task).
+func TestTransitionContinueResumesSameWatch(t *testing.T) {
+	at := time.Date(2026, 11, 20, 2, 0, 0, 0, time.UTC)
+	parked := transitionWatch(StatusNeedsInput, VerdictNeedsInput, "sha", 4)
+
+	resumed, effects := Transition(parked, ContinueEvent("w1", 1, at))
+	if resumed.Status != StatusWatching {
+		t.Errorf("status = %q, want %q", resumed.Status, StatusWatching)
+	}
+	if resumed.Verdict != VerdictWatching {
+		t.Errorf("verdict = %q, want %q", resumed.Verdict, VerdictWatching)
+	}
+	if resumed.ID != "w1" || resumed.Revision != 5 {
+		t.Errorf("resumed Watch = %+v, want w1 at revision 5", resumed)
+	}
+	if len(effects) != 1 {
+		t.Fatalf("effects = %+v, want one continue effect", effects)
+	}
+	if effects[0].Kind != EffectContinueWatch || effects[0].WatchID != "w1" || effects[0].Revision != 5 {
+		t.Errorf("effect = %+v, want continue_watch on w1 at revision 5", effects[0])
+	}
+	for _, effect := range effects {
+		if effect.Kind == EffectCreateWatch {
+			t.Error("a human answer created a new Watch")
+		}
+	}
+	if parked.Status != StatusNeedsInput || parked.Revision != 4 {
+		t.Errorf("Transition mutated its input: %+v", parked)
+	}
+}
+
+// TestTransitionContinueRoundLimit enforces the ADR 0031 §3 cap of five answer
+// rounds. A sixth answer is a no-op and does not create a Watch.
+func TestTransitionContinueRoundLimit(t *testing.T) {
+	at := time.Date(2026, 11, 20, 3, 0, 0, 0, time.UTC)
+	for round := uint64(1); round <= MaxContinueRounds+1; round++ {
+		t.Run(string(rune('0'+round)), func(t *testing.T) {
+			parked := transitionWatch(StatusNeedsInput, VerdictNeedsInput, "sha", round*2)
+			next, effects := Transition(parked, ContinueEvent("w1", round, at))
+			if round <= MaxContinueRounds {
+				if !CanContinueRound(round) {
+					t.Errorf("CanContinueRound(%d) = false, want true", round)
+				}
+				if next.Status != StatusWatching || next.Revision != parked.Revision+1 {
+					t.Errorf("round %d: next = %+v, want watching at %d", round, next, parked.Revision+1)
+				}
+				return
+			}
+			if CanContinueRound(round) {
+				t.Errorf("CanContinueRound(%d) = true, want false", round)
+			}
+			if next.Status != StatusNeedsInput || next.Revision != parked.Revision || len(effects) != 0 {
+				t.Errorf("round %d was accepted: %+v, effects %+v", round, next, effects)
+			}
+		})
+	}
+	if CanContinueRound(0) {
+		t.Error("round zero is not a valid answer round")
+	}
+}
+
+// TestTransitionContinueRequiresSameWatch rejects an answer that names a
+// different Watch: there is no path from continue_of to a new task.
+func TestTransitionContinueRequiresSameWatch(t *testing.T) {
+	at := time.Date(2026, 11, 20, 4, 0, 0, 0, time.UTC)
+	parked := transitionWatch(StatusNeedsInput, VerdictNeedsInput, "sha", 4)
+	for _, e := range []Event{
+		ContinueEvent("other", 1, at),
+		ContinueEvent("w1", 0, at),
+		ContinueEvent("w1", MaxContinueRounds+1, at),
+	} {
+		next, effects := Transition(parked, e)
+		if !reflect.DeepEqual(next, parked) || len(effects) != 0 {
+			t.Errorf("event %+v resumed the Watch: %+v, effects %+v", e, next, effects)
+		}
+	}
+
+	// A human answer cannot revive a closed Watch either.
+	closed := transitionWatch(StatusClosed, VerdictMerged, "sha", 5)
+	next, effects := Transition(closed, ContinueEvent("w1", 1, at))
+	if !reflect.DeepEqual(next, closed) || len(effects) != 0 {
+		t.Errorf("continue revived a closed Watch: %+v, effects %+v", next, effects)
+	}
+}

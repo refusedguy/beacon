@@ -11,6 +11,11 @@
 // after a broken connection returns the first result without running the wait
 // again or marking the obligation read a second time.
 //
+// A Watch parked in needs_input returns early with that status and marks no
+// obligation read (ADR 0031 §3, ADR 0028 §3). After the human answers through
+// ack(continueOf), the same Watch can be waited on again: continueOf names that
+// Watch so the wait resumes the existing task instead of creating a new one.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -53,6 +58,10 @@ type WaitResultInput struct {
 	WatchID         string `json:"watchID" jsonschema:"identifier of the Watch to wait on"`
 	TimeoutMs       *int64 `json:"timeoutMs,omitempty" jsonschema:"wait budget in milliseconds; default 50000, capped at 540000"`
 	ClientRequestID string `json:"clientRequestId,omitempty" jsonschema:"idempotency key; a repeat after a broken connection returns the first result without a second effect"`
+	// ContinueOf names the same Watch after a human answer resumed a parked
+	// needs_input task (ADR 0031 §3). The wait keeps polling that Watch; it
+	// never creates a new task. An empty value keeps the original contract.
+	ContinueOf string `json:"continueOf,omitempty" jsonschema:"watchID of the same task this wait continues after a human answer; must equal watchID and creates no new task"`
 }
 
 // WaitResultIdempotencyStore records the outcome of an idempotent wait_result
@@ -336,6 +345,9 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	if in.WatchID == "" {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: watchID is required")
 	}
+	if in.ContinueOf != "" && in.ContinueOf != in.WatchID {
+		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: continueOf must name the same Watch")
+	}
 	if s == nil || s.store == nil {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, "wait_result: store is nil")
 	}
@@ -343,6 +355,13 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	w, err := s.store.Watch(in.WatchID)
 	if err != nil {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeWatchNotFound, "wait_result: watch "+in.WatchID+" not found")
+	}
+
+	// A parked Watch needs an answer, not a result. Return before any readAt
+	// write so the caller can answer through ack(continueOf) and wait again on
+	// this same Watch. An empty ContinueOf keeps the original contract.
+	if isNeedsInput(w.Status, w.Verdict) {
+		return needsInputOutput(w.Revision, w.Checks), nil
 	}
 
 	// A result that landed before the call is delivered immediately. A Watch
@@ -397,6 +416,12 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 			}
 			revision = update.Revision
 			checks = update.Checks
+			if isNeedsInput(update.Status, update.Verdict) {
+				// The agent just asked a human a question. Park here without
+				// marking the obligation read; an ack(continueOf) resumes this
+				// same Watch and the next wait carries on from its new revision.
+				return needsInputOutput(update.Revision, update.Checks), nil
+			}
 			if !isWaitResultVerdict(update.Verdict) {
 				// A watching tick moves no revision and wakes nobody.
 				continue
@@ -421,6 +446,27 @@ func watchingOutput(revision uint64, checks map[string]domain.Check) WaitResultO
 		Checks:      checks,
 		PollAfterMs: &ms,
 	}
+}
+
+// needsInputOutput is the side-effect-free response for a Watch parked while
+// the agent waits for a human. It is not a verdict: no obligation is marked read,
+// so the caller can answer and come back to the same Watch (ADR 0031 §3).
+func needsInputOutput(revision uint64, checks map[string]domain.Check) WaitResultOutput {
+	ms := waitResultPollAfterMs
+	return WaitResultOutput{
+		Status:      string(domain.StatusNeedsInput),
+		Verdict:     string(domain.VerdictNeedsInput),
+		Revision:    revision,
+		Checks:      checks,
+		PollAfterMs: &ms,
+	}
+}
+
+// isNeedsInput reports whether the Watch is parked for a human answer. The
+// status is authoritative; the verdict is also checked for a source that only
+// stamps the verdict on an update.
+func isNeedsInput(status domain.Status, verdict domain.Verdict) bool {
+	return status == domain.StatusNeedsInput || verdict == domain.VerdictNeedsInput
 }
 
 // deliver writes readAt on the caller's obligation at the result revision, then
