@@ -2,7 +2,10 @@ module github.com/refusedguy/beacon
 
 go 1.26.0
 
-require modernc.org/sqlite v1.62.0
+require (
+	github.com/modelcontextprotocol/go-sdk v1.8.0
+	modernc.org/sqlite v1.62.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.1.0 // indirect
