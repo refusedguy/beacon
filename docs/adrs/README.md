@@ -34,3 +34,4 @@
 | 0020 | Инструмент работы с задачами | accepted |
 | 0021 | Изоляция агентов через worktree | accepted |
 | 0022 | Проверка только в CI | accepted |
+| 0023 | Сборка beacon-gates и версия Go | accepted |
