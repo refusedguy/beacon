@@ -297,6 +297,91 @@ func checkOwners(cards []taskstore.Card, owners []string) error {
 	return nil
 }
 
+// ---- ADR 0036 п6 / T3.46: конфликтное планирование до запуска агентов ----
+//
+// Планировщик статически анализирует границы изменяемых файлов до запуска
+// агентов. Если назначения пересекаются, агенты не стартуют, пока конфликт не
+// снят. Это проверка до запуска, а не структурированный ответ о конфликте из
+// ADR 0033: здесь конфликт предотвращается, а не разбирается после того, как
+// он случился. Агент в работе изолирован по ADR 0021, поэтому общий файл в
+// двух назначениях недопустим даже при разных ветках.
+
+// LaunchAssignment — одно назначение перед запуском: имя назначения и границы
+// файлов, которые оно будет менять. Путь может быть файлом или каталогом;
+// границы сравниваются по сегментам.
+type LaunchAssignment struct {
+	Name  string
+	Files []string
+}
+
+// IntersectingFiles статически сравнивает границы файлов двух назначений и
+// возвращает первую пересекающуюся пару. Третий результат false, если файлы
+// не пересекаются. Каталог пересекает любой путь внутри него.
+func IntersectingFiles(a, b LaunchAssignment) (string, string, bool) {
+	for _, fa := range a.Files {
+		for _, fb := range b.Files {
+			if taskstore.PathsConflict(fa, fb) {
+				return fa, fb, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// CheckLaunch — проверка до запуска. Она анализирует назначения, пока агенты
+// ещё не стартовали. Если границы каких-то двух назначений пересекаются,
+// запуск отменяется: возвращается ошибка валидации с именами назначений и
+// конфликтующими файлами. Конфликт должен быть снят до повторного запуска.
+// Пустой результат означает, что агенты могут стартовать.
+func CheckLaunch(assignments ...LaunchAssignment) error {
+	for i := range assignments {
+		for j := i + 1; j < len(assignments); j++ {
+			if fa, fb, ok := IntersectingFiles(assignments[i], assignments[j]); ok {
+				return taskstore.Validationf(
+					"запуск отменён: назначения %s и %s пересекаются по файлам %s и %s; снимите конфликт до запуска",
+					assignments[i].Name, assignments[j].Name, fa, fb)
+			}
+		}
+	}
+	return nil
+}
+
+// PlanLaunch читает карточки и применяет проверку до запуска к их агентам.
+// Карточки в статусе done или dropped освобождают свои файлы. Если владельцы
+// двух активных карточек пересекаются, агенты не стартуют и возвращается
+// ошибка валидации.
+func (s *Service) PlanLaunch(ids ...string) error {
+	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]taskstore.Card, len(cards))
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+	assignments := make([]LaunchAssignment, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSuffix(strings.TrimSpace(raw), ".md")
+		if !taskstore.IsID(id) {
+			return taskstore.Validationf("неверный ID карточки %q", raw)
+		}
+		if seen[id] {
+			return taskstore.Validationf("карточка %s указана дважды", id)
+		}
+		seen[id] = true
+		c, ok := byID[id]
+		if !ok {
+			return taskstore.Validationf("карточка %s не найдена", id)
+		}
+		if c.Status == "done" || c.Status == "dropped" {
+			continue
+		}
+		assignments = append(assignments, LaunchAssignment{Name: id, Files: c.OwnerFiles})
+	}
+	return CheckLaunch(assignments...)
+}
+
 func (s *Service) validateReference(ref, typ string, cards []taskstore.Card) error {
 	if m := adrRefRE.FindStringSubmatch(ref); m != nil {
 		ok, err := s.adrAccepted(m[1])

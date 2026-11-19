@@ -618,3 +618,118 @@ func TestSelfTest(t *testing.T) {
 		t.Fatalf("нет итоговой строки: %s", out.String())
 	}
 }
+
+func TestIntersectingFiles(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"разные файлы", []string{"internal/app/a.go"}, []string{"internal/app/b.go"}, false},
+		{"один файл", []string{"internal/app/a.go"}, []string{"internal/app/a.go"}, true},
+		{"каталог и файл внутри", []string{"internal/app"}, []string{"internal/app/a.go"}, true},
+		{"файл внутри каталога", []string{"internal/app/a.go"}, []string{"internal/app"}, true},
+		{"разные каталоги", []string{"internal/app"}, []string{"internal/infra"}, false},
+		{"пустые назначения", nil, []string{"internal/app/a.go"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fa, fb, got := IntersectingFiles(LaunchAssignment{Name: "a", Files: tc.a}, LaunchAssignment{Name: "b", Files: tc.b})
+			if got != tc.want {
+				t.Fatalf("IntersectingFiles = %v, ждали %v", got, tc.want)
+			}
+			if got && (fa == "" || fb == "") {
+				t.Errorf("пересечение без имён файлов: %q, %q", fa, fb)
+			}
+		})
+	}
+}
+
+func TestCheckLaunchPreStartGate(t *testing.T) {
+	disjoint := []LaunchAssignment{
+		{Name: "A", Files: []string{"internal/app/a.go"}},
+		{Name: "B", Files: []string{"internal/infra/b.go"}},
+	}
+	if err := CheckLaunch(disjoint...); err != nil {
+		t.Fatalf("непересекающиеся назначения дали %v, ждали запуск", err)
+	}
+	if err := CheckLaunch(disjoint[0]); err != nil {
+		t.Fatalf("одно назначение дало %v", err)
+	}
+	if err := CheckLaunch(); err != nil {
+		t.Fatalf("пустой план дал %v", err)
+	}
+
+	overlap := []LaunchAssignment{
+		{Name: "A", Files: []string{"internal/app/a.go"}},
+		{Name: "B", Files: []string{"internal/app"}},
+	}
+	err := CheckLaunch(overlap...)
+	if taskstore.Code(err) != 1 {
+		t.Fatalf("пересечение дало %v, ждали код 1", err)
+	}
+	for _, want := range []string{"A", "B", "internal/app/a.go", "internal/app", "отменён"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("в ошибке нет %q: %v", want, err)
+		}
+	}
+
+	// Три назначения: конфликт между непервой и невторой парой тоже блокирует.
+	three := []LaunchAssignment{
+		{Name: "A", Files: []string{"a.go"}},
+		{Name: "B", Files: []string{"b.go"}},
+		{Name: "C", Files: []string{"b.go"}},
+	}
+	if err := CheckLaunch(three...); taskstore.Code(err) != 1 || !strings.Contains(err.Error(), "C") {
+		t.Fatalf("конфликт в паре B/C не найден: %v", err)
+	}
+}
+
+func TestPlanLaunchReadsCards(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.1", "todo", "task", "ADR 0001", "internal/app/a.go", "нет", "нет")
+	e.card(t, "T3.2", "todo", "task", "ADR 0001", "internal/infra/b.go", "нет", "нет")
+
+	if err := e.svc.PlanLaunch("T3.1", "T3.2"); err != nil {
+		t.Fatalf("непересекающиеся карточки дали %v, ждали запуск", err)
+	}
+	if err := e.svc.PlanLaunch("T3.1.md", "T3.2.md"); err != nil {
+		t.Fatalf("ID с расширением дали %v", err)
+	}
+
+	// Пересечение по каталогу блокирует запуск до снятия конфликта.
+	e.card(t, "T3.3", "in_progress", "task", "ADR 0001", "internal/app", "agent-1", "2026-11-19T14:03:21Z")
+	err := e.svc.PlanLaunch("T3.1", "T3.3")
+	if taskstore.Code(err) != 1 || !strings.Contains(err.Error(), "T3.1") || !strings.Contains(err.Error(), "T3.3") {
+		t.Fatalf("пересекающиеся карточки дали %v, ждали код 1 с обоими ID", err)
+	}
+
+	// Закрытая карточка не блокирует запуск: её файлы свободны.
+	e.card(t, "T3.4", "done", "task", "ADR 0001", "internal/app/a.go", "agent-1", "2026-11-19T14:03:21Z")
+	if err := e.svc.PlanLaunch("T3.1", "T3.4"); err != nil {
+		t.Fatalf("карточка done должна освобождать файлы: %v", err)
+	}
+	e.card(t, "T3.5", "dropped", "task", "ADR 0001", "internal/app/a.go", "agent-1", "2026-11-19T14:03:21Z")
+	if err := e.svc.PlanLaunch("T3.1", "T3.5"); err != nil {
+		t.Fatalf("карточка dropped должна освобождать файлы: %v", err)
+	}
+}
+
+func TestPlanLaunchBadInput(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.1", "todo", "task", "ADR 0001", "internal/app/a.go", "нет", "нет")
+	for _, ids := range [][]string{
+		{"bad"},
+		{""},
+		{"T9.9"},
+		{"T3.1", "T3.1"},
+		{"T3.1", "T9.9"},
+	} {
+		if err := e.svc.PlanLaunch(ids...); taskstore.Code(err) != 1 {
+			t.Errorf("PlanLaunch(%v) дал %v, ждали код 1", ids, err)
+		}
+	}
+	if err := e.svc.PlanLaunch(); err != nil {
+		t.Errorf("PlanLaunch без карточек дал %v", err)
+	}
+}
