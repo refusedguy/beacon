@@ -1,11 +1,15 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -428,6 +432,126 @@ func TestWaitResultHandleUsesSessionID(t *testing.T) {
 	wantID := domain.ObligationKey("watch-1", 11, "session-X")
 	if len(writer.reads) != 1 || writer.reads[0].id != wantID {
 		t.Errorf("readAt writes = %+v, want one write of %q", writer.reads, wantID)
+	}
+}
+
+// TestWaitResultInputSchemaHasClientRequestID verifies that clientRequestId is
+// part of the derived input schema, so MCP clients can send the idempotency key.
+func TestWaitResultInputSchemaHasClientRequestID(t *testing.T) {
+	schema, err := jsonschema.For[WaitResultInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"clientRequestId"`)) {
+		t.Fatalf("input schema has no clientRequestId property: %s", raw)
+	}
+}
+
+// TestWaitResultClientRequestIDIdempotent proves ADR 0028 for wait_result: a
+// repeat with the same clientRequestId after a broken connection returns the
+// first result, runs no second wait and marks no obligation read twice.
+func TestWaitResultClientRequestIDIdempotent(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+	checks := map[string]domain.Check{"ci/test": {State: "COMPLETED", Conclusion: "SUCCESS"}}
+	source.publish(WaitVerdictUpdate{
+		WatchID:  "watch-1",
+		Status:   domain.StatusClosed,
+		Verdict:  domain.VerdictMerged,
+		Revision: 8,
+		Checks:   checks,
+		At:       at,
+	})
+
+	in := WaitResultInput{WatchID: "watch-1", ClientRequestID: "req-abc"}
+	first, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+
+	// The retry arrives after a broken connection with no new verdict on the
+	// subscription. It must still return the recorded result.
+	second, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("repeat Wait: %v", err)
+	}
+
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("repeat result = %+v, want %+v", second, first)
+	}
+	if second.Verdict != string(domain.VerdictMerged) || second.Revision != 8 {
+		t.Errorf("repeat result = %+v, want merged/8", second)
+	}
+	if len(writer.reads) != 1 {
+		t.Errorf("readAt writes = %d, want 1", len(writer.reads))
+	}
+	if store.obligationWrites != 0 {
+		t.Errorf("obligation writes = %d, want 0", store.obligationWrites)
+	}
+	if len(source.subscribed) != 1 {
+		t.Errorf("subscriptions = %d, want 1 (repeat must not open a second wait)", len(source.subscribed))
+	}
+}
+
+// TestWaitResultDistinctClientRequestIDsCreateDistinctEffects shows that the
+// key scopes idempotency: a new clientRequestId runs a new wait and returns its
+// own result.
+func TestWaitResultDistinctClientRequestIDsCreateDistinctEffects(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: time.Now(),
+	})
+	if _, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1", ClientRequestID: "req-1"}, CallerExit{}); err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictReady,
+		Revision: 9, At: time.Now(),
+	})
+	second, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1", ClientRequestID: "req-2"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("second Wait: %v", err)
+	}
+	if second.Verdict != string(domain.VerdictReady) || second.Revision != 9 {
+		t.Errorf("second result = %+v, want ready/9", second)
+	}
+	if len(writer.reads) != 2 {
+		t.Errorf("readAt writes = %d, want 2", len(writer.reads))
+	}
+}
+
+// TestWaitResultClientRequestIDFailureIsNotCached proves a severed first call
+// leaves no key: a retry with the same clientRequestId can still run the wait
+// and return a result.
+func TestWaitResultClientRequestIDFailureIsNotCached(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	broken := make(chan struct{})
+	close(broken)
+	_, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", ClientRequestID: "req-1"},
+		CallerExit{ConnectionBroken: broken})
+	assertCode(t, err, domain.CodeGone)
+
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: time.Now(),
+	})
+	got, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", ClientRequestID: "req-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("retry Wait: %v", err)
+	}
+	if got.Verdict != string(domain.VerdictMerged) {
+		t.Errorf("retry verdict = %q, want merged", got.Verdict)
+	}
+	if len(writer.reads) != 1 {
+		t.Errorf("readAt writes = %d, want 1", len(writer.reads))
 	}
 }
 
