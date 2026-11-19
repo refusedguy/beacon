@@ -9,7 +9,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -178,10 +181,48 @@ var mcpRunner = func(errOut io.Writer) int {
 	return 0
 }
 
+// precheckFailureReason is the reason of the startup precheck failure from
+// ADR 0041 §6. runMCP stores it here when the precheck refuses the run; the
+// production server installs it on its wait_result service so a tools/call
+// reports precheck_failure with the reason instead of waiting silently.
+var (
+	precheckFailureMu     sync.Mutex
+	precheckFailureReason string
+)
+
+func setPrecheckFailureReason(reason string) {
+	precheckFailureMu.Lock()
+	precheckFailureReason = reason
+	precheckFailureMu.Unlock()
+}
+
+// newMCPWaitResult builds the wait_result service used by the production
+// server. It keeps the SharedCIWait wiring from T3.83 and adds the startup
+// precheck reason from T3.84. An empty reason clears a previous failure, so a
+// run with a configured bypass waits normally.
+func newMCPWaitResult(deps mcp.Dependencies) *mcp.WaitResultService {
+	svc := mcp.NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock)
+	svc.SetSharedCIWaiter(deps.SharedCIWaiter)
+	precheckFailureMu.Lock()
+	reason := precheckFailureReason
+	precheckFailureMu.Unlock()
+	svc.SetPrecheckFailure(reason)
+	return svc
+}
+
+// newMCPServer composes the real server and replaces the wait_result tool with
+// the service that carries the startup precheck reason. AttachWaitResult is the
+// hook the mcp package exposes for this integration (T3.84, ADR 0041 §6).
+func newMCPServer(deps mcp.Dependencies) *mcpsdk.Server {
+	s := mcp.NewServerWithDeps(deps)
+	mcp.AttachWaitResult(s, newMCPWaitResult(deps))
+	return s
+}
+
 // serveMCP starts the stdio transport. Tests replace it to inspect the
 // composed dependencies without blocking on stdin.
 var serveMCP = func(ctx context.Context, deps mcp.Dependencies) error {
-	return mcp.RunWithDeps(ctx, deps)
+	return newMCPServer(deps).Run(ctx, &mcpsdk.StdioTransport{})
 }
 
 // sharedCIWaiter adapts the store gate to the port declared in mcp. The store
@@ -246,6 +287,10 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 // port or token is observed on the next start, while the watches stay in the
 // on-disk store and continue to wait.
 func runMCP(ctx context.Context) error {
+	// A run starts from a clean precheck state. A failure from an earlier run
+	// in the same process must not leak into this server's wait_result tool.
+	setPrecheckFailureReason("")
+
 	dir, err := stateDir()
 	if err != nil {
 		return err
@@ -258,7 +303,14 @@ func runMCP(ctx context.Context) error {
 	// ADR 0041 §6: precheck the init-event configuration before the server
 	// enters its wait loop. With no bypass for an expected init event this
 	// fails fast, so the run reports precheck_failure instead of hanging.
+	// T3.84: the reason is also installed on the wait_result service that the
+	// production server builds, so a tools/call sees precheck_failure with the
+	// same reason instead of only stderr.
 	if err := mcpPrecheck(ctx, readInitEventConfig()); err != nil {
+		var failure *precheckFailureError
+		if errors.As(err, &failure) {
+			setPrecheckFailureReason(failure.reason)
+		}
 		return err
 	}
 
