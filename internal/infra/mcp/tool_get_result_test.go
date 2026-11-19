@@ -791,3 +791,238 @@ func TestReadyReachableWithObservedShipFacts(t *testing.T) {
 		})
 	}
 }
+
+// --- Background task handle tests (ADR 0048 feature 3, T3.113) -------------
+
+// testTaskClock drives the wait contract without real sleeps. By default its
+// After channels stay pending; fireImmediately pre-fills them so a wait takes
+// the timeout branch synchronously. afterCalled signals that Wait registered a
+// timer, so a concurrency test knows the wait reached its select.
+type testTaskClock struct {
+	mu              sync.Mutex
+	now             time.Time
+	fireImmediately bool
+	afters          []<-chan time.Time
+	afterCalled     chan struct{}
+}
+
+func (c *testTaskClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *testTaskClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+func (c *testTaskClock) After(d time.Duration) <-chan time.Time {
+	ch := make(chan time.Time, 1)
+	if c.fireImmediately {
+		ch <- c.Now().Add(d)
+	}
+	c.mu.Lock()
+	c.afters = append(c.afters, ch)
+	c.mu.Unlock()
+	if c.afterCalled != nil {
+		select {
+		case c.afterCalled <- struct{}{}:
+		default:
+		}
+	}
+	return ch
+}
+
+func TestBackgroundTaskOutputByOffset(t *testing.T) {
+	clock := &testTaskClock{now: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)}
+	task := NewBackgroundTask("bg-output", clock)
+	if task.Handle() != "bg-output" {
+		t.Fatalf("handle = %q, want bg-output", task.Handle())
+	}
+
+	empty := task.Output(0)
+	if len(empty.Data) != 0 || empty.NextOffset != 0 {
+		t.Fatalf("empty output = %+v", empty)
+	}
+
+	task.AppendOutput([]byte("hello "))
+	task.AppendOutput([]byte("world"))
+
+	full := task.Output(0)
+	if string(full.Data) != "hello world" || full.NextOffset != 11 {
+		t.Fatalf("full output = %+v", full)
+	}
+
+	tail := task.Output(6)
+	if string(tail.Data) != "world" || tail.NextOffset != 11 {
+		t.Fatalf("offset 6 output = %+v", tail)
+	}
+
+	negative := task.Output(-5)
+	if string(negative.Data) != "hello world" || negative.NextOffset != 11 {
+		t.Fatalf("negative offset output = %+v", negative)
+	}
+
+	past := task.Output(99)
+	if len(past.Data) != 0 || past.NextOffset != 11 {
+		t.Fatalf("past-end output = %+v", past)
+	}
+
+	// The returned bytes are a copy: a caller cannot mutate stored output.
+	full.Data[0] = 'X'
+	if got := string(task.Output(0).Data); got != "hello world" {
+		t.Fatalf("stored output was mutated: %q", got)
+	}
+
+	// A later append is visible to a read from the previous NextOffset.
+	task.AppendOutput([]byte("!"))
+	next := task.Output(full.NextOffset)
+	if string(next.Data) != "!" || next.NextOffset != 12 {
+		t.Fatalf("continuation output = %+v", next)
+	}
+}
+
+func TestBackgroundTaskWaitTimeout(t *testing.T) {
+	clock := &testTaskClock{
+		now:             time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC),
+		fireImmediately: true,
+	}
+	task := NewBackgroundTask("bg-timeout", clock)
+
+	res := task.Wait(context.Background(), 250*time.Millisecond)
+	if !res.TimedOut || res.Done || res.WaitedMs != 250 {
+		t.Fatalf("timeout wait = %+v, want timedOut, not done, waitedMs=250", res)
+	}
+	if len(clock.afters) != 1 {
+		t.Fatalf("timer registrations = %d, want 1", len(clock.afters))
+	}
+
+	zeroClock := &testTaskClock{now: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC), fireImmediately: true}
+	zeroTask := NewBackgroundTask("bg-zero", zeroClock)
+	zero := zeroTask.Wait(context.Background(), 0)
+	if !zero.TimedOut || zero.Done || zero.WaitedMs != 0 {
+		t.Fatalf("zero timeout wait = %+v", zero)
+	}
+	if len(zeroClock.afters) != 0 {
+		t.Fatalf("zero timeout registered %d timers, want 0", len(zeroClock.afters))
+	}
+}
+
+func TestBackgroundTaskWaitDone(t *testing.T) {
+	clock := &testTaskClock{now: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)}
+	task := NewBackgroundTask("bg-done", clock)
+	task.Complete("ok")
+
+	res := task.Wait(context.Background(), time.Second)
+	if res.TimedOut || !res.Done || res.WaitedMs != 0 {
+		t.Fatalf("done wait = %+v, want done, not timed out, waitedMs=0", res)
+	}
+	if len(clock.afters) != 0 {
+		t.Fatalf("already-done wait registered %d timers, want 0", len(clock.afters))
+	}
+}
+
+func TestBackgroundTaskWaitUnblocksOnComplete(t *testing.T) {
+	clock := &testTaskClock{
+		now:         time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC),
+		afterCalled: make(chan struct{}, 1),
+	}
+	task := NewBackgroundTask("bg-unblock", clock)
+	resCh := make(chan TaskWaitResult, 1)
+	go func() { resCh <- task.Wait(context.Background(), 5*time.Second) }()
+
+	select {
+	case <-clock.afterCalled:
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not register its timer")
+	}
+
+	clock.Advance(40 * time.Millisecond)
+	task.Complete("done")
+
+	select {
+	case res := <-resCh:
+		if res.TimedOut || !res.Done || res.WaitedMs != 40 {
+			t.Fatalf("unblocked wait = %+v, want done, not timed out, waitedMs=40", res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not return after completion")
+	}
+}
+
+func TestBackgroundTaskCompletionNotification(t *testing.T) {
+	task := NewBackgroundTask("bg-notify", nil)
+	if _, ok := task.Completion(); ok {
+		t.Fatal("Completion reported done before Complete")
+	}
+	select {
+	case <-task.Done():
+		t.Fatal("Done channel closed before Complete")
+	default:
+	}
+
+	task.AppendOutput([]byte("tail"))
+	task.Complete("terminal-A")
+	task.Complete("terminal-B") // duplicate must be a no-op
+
+	select {
+	case <-task.Done():
+	default:
+		t.Fatal("Done channel not closed after Complete")
+	}
+
+	comp, ok := task.Completion()
+	if !ok || comp.Handle != "bg-notify" || comp.Terminal != "terminal-A" {
+		t.Fatalf("completion = %+v, ok=%v", comp, ok)
+	}
+	again, ok := task.Completion()
+	if !ok || again != comp {
+		t.Fatalf("second completion = %+v, ok=%v, want same value", again, ok)
+	}
+	if got := string(task.Output(0).Data); got != "tail" {
+		t.Fatalf("output after completion = %q, want tail", got)
+	}
+}
+
+func TestBackgroundTaskWaitContextCancel(t *testing.T) {
+	clock := &testTaskClock{now: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)}
+	task := NewBackgroundTask("bg-cancel", clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res := task.Wait(ctx, time.Second)
+	if res.TimedOut || res.Done || res.WaitedMs != 0 {
+		t.Fatalf("cancelled wait = %+v, want not timed out, not done, waitedMs=0", res)
+	}
+}
+
+func TestTaskRegistry(t *testing.T) {
+	reg := NewTaskRegistry(&testTaskClock{now: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)})
+	if _, err := reg.Start(""); err == nil {
+		t.Fatal("Start accepted an empty handle")
+	}
+
+	first, err := reg.Start("job-1")
+	if err != nil {
+		t.Fatalf("Start job-1: %v", err)
+	}
+	if first.Handle() != "job-1" {
+		t.Fatalf("first handle = %q", first.Handle())
+	}
+	if _, err := reg.Start("job-1"); err == nil {
+		t.Fatal("Start accepted a duplicate handle")
+	}
+	if _, err := reg.Start("job-2"); err != nil {
+		t.Fatalf("Start job-2: %v", err)
+	}
+
+	got, ok := reg.Get("job-1")
+	if !ok || got != first {
+		t.Fatalf("Get job-1 = %p, ok=%v, want first task", got, ok)
+	}
+	if _, ok := reg.Get("missing"); ok {
+		t.Fatal("Get returned a task for an unknown handle")
+	}
+}

@@ -17,6 +17,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -678,4 +679,223 @@ func AttachGetResult(server *mcpsdk.Server, handler *GetResultHandler) {
 			IdempotentHint:  true,
 		},
 	}, handler.Handle)
+}
+
+// --- Background task handle: wait, output, notify (ADR 0048 feature 3) -----
+//
+// A background task handle answers three questions that the mechanisms already
+// in this file do not. The signed opaque handle of T3.96 proves a name was
+// issued by Beacon, but says nothing about waiting or reading output. The
+// --after threshold of T3.103 (SetAfter/ApplyTaskForm above) turns a slow
+// synchronous call into a task form, but it is a single server-wide time limit,
+// not a per-call wait. This section fixes only the wait/output/notify contract:
+//
+//   - wait(timeout) reports how long it actually waited and whether it timed
+//     out; the timeout is supplied by the caller on every call, so no 30/120s
+//     threshold is duplicated here;
+//   - output(offset) reads the task's output from a byte offset, so a caller can
+//     stream bytes without restarting from zero;
+//   - completion is a single broadcast notification every waiter can observe.
+//
+// The handle here is a plain identifier. Signing or verifying it is T3.96's job
+// and is deliberately not repeated.
+
+// taskClock separates time from the wait so the contract is testable without
+// real sleeps. The production value delegates to wall time; tests drive it.
+type taskClock interface {
+	Now() time.Time
+	After(time.Duration) <-chan time.Time
+}
+
+type wallTaskClock struct{}
+
+func (wallTaskClock) Now() time.Time                         { return time.Now() }
+func (wallTaskClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+
+// TaskCompletion is the one notification published when a background task
+// finishes. It carries the handle and a caller-supplied terminal status. Output
+// bytes are never placed in the notification; they are read with Output.
+type TaskCompletion struct {
+	Handle   string `json:"handle"`
+	Terminal string `json:"terminal,omitempty"`
+}
+
+// TaskWaitResult is the answer of Wait. WaitedMs is the observed wait time in
+// milliseconds. TimedOut is true only when the caller's timeout elapsed before
+// the task completed. Done is true when the task had finished by the time Wait
+// returned.
+type TaskWaitResult struct {
+	WaitedMs int64 `json:"waitedMs"`
+	TimedOut bool  `json:"timedOut"`
+	Done     bool  `json:"done"`
+}
+
+// TaskOutputChunk is the answer of Output. Data holds the output bytes starting
+// at the requested offset. NextOffset is the byte offset to pass on the next
+// read, so repeated reads continue where the previous one stopped.
+type TaskOutputChunk struct {
+	Data       []byte `json:"data"`
+	NextOffset int    `json:"nextOffset"`
+}
+
+// BackgroundTask is one long-running task. Its output grows append-only, it can
+// be waited on up to a caller timeout, and its completion is broadcast once
+// through Done. The zero value is unusable; build one with NewBackgroundTask.
+type BackgroundTask struct {
+	handle string
+	clock  taskClock
+
+	mu       sync.Mutex
+	output   []byte
+	done     bool
+	terminal string
+	doneCh   chan struct{}
+}
+
+// NewBackgroundTask builds a task named by handle. A nil clock falls back to
+// wall time. The handle is stored as an opaque name; no signature is computed
+// or checked here (T3.96 owns that).
+func NewBackgroundTask(handle string, clock taskClock) *BackgroundTask {
+	if clock == nil {
+		clock = wallTaskClock{}
+	}
+	return &BackgroundTask{handle: handle, clock: clock, doneCh: make(chan struct{})}
+}
+
+// Handle returns the opaque name of the task.
+func (t *BackgroundTask) Handle() string { return t.handle }
+
+// AppendOutput adds chunk to the task output. Bytes appended after completion
+// are kept too, so a late tail is never silently lost.
+func (t *BackgroundTask) AppendOutput(chunk []byte) {
+	if len(chunk) == 0 {
+		return
+	}
+	t.mu.Lock()
+	t.output = append(t.output, chunk...)
+	t.mu.Unlock()
+}
+
+// Output returns the output bytes from offset. A negative offset reads from the
+// start; an offset past the end yields an empty chunk whose NextOffset is the
+// current end, so a caller that lost its position can resynchronise. The
+// returned slice is a copy: a caller cannot mutate the task's stored bytes.
+func (t *BackgroundTask) Output(offset int) TaskOutputChunk {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > len(t.output) {
+		offset = len(t.output)
+	}
+	data := append([]byte(nil), t.output[offset:]...)
+	return TaskOutputChunk{Data: data, NextOffset: offset + len(data)}
+}
+
+// Complete marks the task finished with terminal and closes the broadcast
+// channel exactly once. Later calls are no-ops, so a duplicated completion
+// cannot close the channel twice or replace the first terminal status.
+func (t *BackgroundTask) Complete(terminal string) {
+	t.mu.Lock()
+	if t.done {
+		t.mu.Unlock()
+		return
+	}
+	t.done = true
+	t.terminal = terminal
+	close(t.doneCh)
+	t.mu.Unlock()
+}
+
+// Done returns the channel closed by Complete. Selecting on it receives the
+// completion notification without polling; every waiter observes the same
+// close.
+func (t *BackgroundTask) Done() <-chan struct{} { return t.doneCh }
+
+// Completion returns the notification published by Complete and whether the
+// task has finished. Reading it does not consume it, so every waiter can read
+// the same value.
+func (t *BackgroundTask) Completion() (TaskCompletion, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.done {
+		return TaskCompletion{}, false
+	}
+	return TaskCompletion{Handle: t.handle, Terminal: t.terminal}, true
+}
+
+// Wait blocks until the task completes, the caller's timeout elapses, or ctx is
+// cancelled. A non-positive timeout checks completion once and returns at once.
+// The timeout is a per-call value from the caller, not the server sync-call
+// threshold of T3.103.
+func (t *BackgroundTask) Wait(ctx context.Context, timeout time.Duration) TaskWaitResult {
+	if timeout < 0 {
+		timeout = 0
+	}
+	start := t.clock.Now()
+	if _, done := t.Completion(); done {
+		return TaskWaitResult{WaitedMs: 0, Done: true}
+	}
+	if timeout == 0 {
+		return TaskWaitResult{WaitedMs: 0, TimedOut: true}
+	}
+	timer := t.clock.After(timeout)
+	select {
+	case <-t.doneCh:
+		return TaskWaitResult{WaitedMs: t.clock.Now().Sub(start).Milliseconds(), Done: true}
+	case <-timer:
+		done := t.isDone()
+		return TaskWaitResult{WaitedMs: timeout.Milliseconds(), TimedOut: !done, Done: done}
+	case <-ctx.Done():
+		return TaskWaitResult{WaitedMs: t.clock.Now().Sub(start).Milliseconds()}
+	}
+}
+
+func (t *BackgroundTask) isDone() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.done
+}
+
+// TaskRegistry addresses background tasks by their opaque handle. It is the set
+// of tasks a caller can wait on, read from and be notified about. Handle
+// verification stays in T3.96 and is intentionally not repeated here.
+type TaskRegistry struct {
+	mu    sync.Mutex
+	clock taskClock
+	tasks map[string]*BackgroundTask
+}
+
+// NewTaskRegistry builds a registry. A nil clock falls back to wall time.
+func NewTaskRegistry(clock taskClock) *TaskRegistry {
+	if clock == nil {
+		clock = wallTaskClock{}
+	}
+	return &TaskRegistry{clock: clock, tasks: map[string]*BackgroundTask{}}
+}
+
+// Start registers a new task under handle and returns it. An empty handle or a
+// duplicate is rejected, so a handle always names exactly one task.
+func (r *TaskRegistry) Start(handle string) (*BackgroundTask, error) {
+	if handle == "" {
+		return nil, fmt.Errorf("task: handle is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.tasks[handle]; exists {
+		return nil, fmt.Errorf("task: handle already started: %q", handle)
+	}
+	t := NewBackgroundTask(handle, r.clock)
+	r.tasks[handle] = t
+	return t, nil
+}
+
+// Get resolves a handle to its task. The bool reports whether the handle is
+// registered.
+func (r *TaskRegistry) Get(handle string) (*BackgroundTask, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t, ok := r.tasks[handle]
+	return t, ok
 }
