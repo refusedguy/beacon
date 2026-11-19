@@ -1410,3 +1410,311 @@ func TestReplayRedactsResult(t *testing.T) {
 		t.Errorf("stored result kept a raw token: %s", stored)
 	}
 }
+
+// checkpointWaitSteps writes steps 1..n with a state blob for each one.
+func checkpointWaitSteps(t *testing.T, d *DB, key, taskID string, n int) {
+	t.Helper()
+	for step := 1; step <= n; step++ {
+		state := []byte(fmt.Sprintf(`{"step":%d}`, step))
+		res, err := d.CheckpointWait(key, taskID, step, state, nil)
+		if err != nil {
+			t.Fatalf("CheckpointWait(step %d): %v", step, err)
+		}
+		if !res.Advanced {
+			t.Fatalf("CheckpointWait(step %d) = %+v, want advanced", step, res)
+		}
+	}
+}
+
+// TestCheckpointWaitResumesFromLastStep is the acceptance check for T3.92.
+// A restarted wait resumes from the last recorded step, and a stale step
+// cannot move progress backwards.
+func TestCheckpointWaitResumesFromLastStep(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	checkpointWaitSteps(t, d, "wait-1", "task-1", 3)
+	step, state, found, err := d.ResumeWait("wait-1")
+	if err != nil || !found {
+		t.Fatalf("ResumeWait: step=%d found=%v err=%v; want found", step, found, err)
+	}
+	if step != 3 {
+		t.Fatalf("resume step = %d, want 3", step)
+	}
+	if want := []byte(`{"step":3}`); !bytes.Equal(state, want) {
+		t.Errorf("resume state = %s, want %s", state, want)
+	}
+
+	// An out-of-order callback must not reset the wait to its first step.
+	stale, err := d.CheckpointWait("wait-1", "task-1", 1, []byte(`{"step":1}`), nil)
+	if err != nil {
+		t.Fatalf("stale CheckpointWait: %v", err)
+	}
+	if stale.Advanced || stale.Created {
+		t.Fatalf("stale checkpoint = %+v, want no write", stale)
+	}
+	if stale.Checkpoint.Step != 3 {
+		t.Errorf("stale checkpoint returned step %d, want stored 3", stale.Checkpoint.Step)
+	}
+
+	// A restart is a new DB handle on the same file.
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	step, state, found, err = reopened.ResumeWait("wait-1")
+	if err != nil || !found {
+		t.Fatalf("ResumeWait after restart: step=%d found=%v err=%v; want found", step, found, err)
+	}
+	if step != 3 {
+		t.Fatalf("resume step after restart = %d, want 3", step)
+	}
+	if want := []byte(`{"step":3}`); !bytes.Equal(state, want) {
+		t.Errorf("resume state after restart = %s, want %s", state, want)
+	}
+	if n, err := reopened.WaitCheckpointCount(); err != nil || n != 1 {
+		t.Fatalf("WaitCheckpointCount = %d, %v; want 1", n, err)
+	}
+}
+
+// TestCheckpointWaitNoCheckpointStartsFromZero proves an empty store is not
+// treated as a recorded step 0.
+func TestCheckpointWaitNoCheckpointStartsFromZero(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	step, state, found, err := d.ResumeWait("wait-fresh")
+	if err != nil || found {
+		t.Fatalf("ResumeWait on fresh store: step=%d found=%v err=%v; want not found", step, found, err)
+	}
+	if step != 0 || state != nil {
+		t.Errorf("fresh resume = (%d, %s), want (0, nil)", step, state)
+	}
+}
+
+// TestCheckpointWaitStateAndStepCommitTogether proves ADR 0015: the step and
+// the task state save are one transaction. A failing save commits neither.
+func TestCheckpointWaitStateAndStepCommitTogether(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	// saveState writes into the task-starts table through the same Tx, which
+	// makes the rollback observable from outside the checkpoint row.
+	saveTaskStart := func(id string) func(*sql.Tx) error {
+		return func(tx *sql.Tx) error {
+			if _, err := tx.Exec(createTaskStartsSQL); err != nil {
+				return err
+			}
+			_, err := tx.Exec(`
+				INSERT INTO task_starts (key, task_id, payload, created_at)
+				VALUES (?, ?, ?, ?)`,
+				domain.IdempotencyKey(domain.StartNamespace, id), "task-1", []byte("state"),
+				time.Now().UTC().UnixNano())
+			return err
+		}
+	}
+	if _, err := d.CheckpointWait("wait-1", "task-1", 1, []byte(`{"step":1}`), saveTaskStart("state-1")); err != nil {
+		t.Fatalf("first CheckpointWait: %v", err)
+	}
+
+	boom := errors.New("save failed")
+	failing := func(tx *sql.Tx) error {
+		if err := saveTaskStart("state-2")(tx); err != nil {
+			return err
+		}
+		return boom
+	}
+	if _, err := d.CheckpointWait("wait-1", "task-1", 2, []byte(`{"step":2}`), failing); !errors.Is(err, boom) {
+		t.Fatalf("CheckpointWait with failing save = %v, want boom", err)
+	}
+	step, state, found, err := d.ResumeWait("wait-1")
+	if err != nil || !found {
+		t.Fatalf("ResumeWait after failure: step=%d found=%v err=%v; want found", step, found, err)
+	}
+	if step != 1 {
+		t.Errorf("step after failed save = %d, want 1 (rolled back)", step)
+	}
+	if want := []byte(`{"step":1}`); !bytes.Equal(state, want) {
+		t.Errorf("state after failed save = %s, want %s", state, want)
+	}
+	if n, err := d.TaskStartCount(); err != nil || n != 1 {
+		t.Fatalf("TaskStartCount after failure = %d, %v; want 1 (state rolled back)", n, err)
+	}
+
+	// The stale state key is now free: a retry with the same step commits.
+	if _, err := d.CheckpointWait("wait-1", "task-1", 2, []byte(`{"step":2}`), saveTaskStart("state-2")); err != nil {
+		t.Fatalf("retry CheckpointWait: %v", err)
+	}
+	step, _, _, err = d.ResumeWait("wait-1")
+	if err != nil || step != 2 {
+		t.Fatalf("resume step after retry = %d, %v; want 2", step, err)
+	}
+	if n, err := d.TaskStartCount(); err != nil || n != 2 {
+		t.Fatalf("TaskStartCount after retry = %d, %v; want 2", n, err)
+	}
+}
+
+// TestCheckpointWaitKeySeparateFromOtherOperations shows the checkpoint key
+// cannot collide with a clientRequestId, a task start or a scenario replay,
+// even when all four receive the same raw string.
+func TestCheckpointWaitKeySeparateFromOtherOperations(t *testing.T) {
+	const raw = "req-abc"
+	checkpoint := WaitCheckpointKey(raw)
+	if checkpoint == raw {
+		t.Fatalf("WaitCheckpointKey(%q) = raw request id", raw)
+	}
+	if want := domain.IdempotencyKey(waitCheckpointNamespace, raw); checkpoint != want {
+		t.Fatalf("WaitCheckpointKey(%q) = %q, want %q", raw, checkpoint, want)
+	}
+	if checkpoint == ReplayKey(raw) || checkpoint == domain.IdempotencyKey(domain.StartNamespace, raw) {
+		t.Fatal("checkpoint key collides with replay or task-start key")
+	}
+	if checkpoint != WaitCheckpointKey(raw) {
+		t.Fatal("WaitCheckpointKey is not deterministic")
+	}
+
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if _, err := d.StartTask(raw, "task-1", []byte("start")); err != nil {
+		t.Fatalf("StartTask: %v", err)
+	}
+	var run int32
+	if _, err := d.Replay(raw, replayScenarioSteps(t, &run), []byte("scenario")); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := d.CheckpointWait(raw, "task-1", 2, []byte(`{"step":2}`), nil); err != nil {
+		t.Fatalf("CheckpointWait: %v", err)
+	}
+	if n, err := d.TaskStartCount(); err != nil || n != 1 {
+		t.Fatalf("TaskStartCount = %d, %v; want 1", n, err)
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 1 {
+		t.Fatalf("ReplayCount = %d, %v; want 1", n, err)
+	}
+	if n, err := d.WaitCheckpointCount(); err != nil || n != 1 {
+		t.Fatalf("WaitCheckpointCount = %d, %v; want 1", n, err)
+	}
+	c, found, err := d.WaitCheckpoint(raw)
+	if err != nil || !found {
+		t.Fatalf("WaitCheckpoint: %v, %v; want found", found, err)
+	}
+	if c.Key != checkpoint || c.Step != 2 || c.TaskID != "task-1" {
+		t.Errorf("checkpoint = %+v, want key %q step 2", c, checkpoint)
+	}
+}
+
+// TestCheckpointWaitDistinctWaitsKeepDistinctProgress scopes progress to one
+// wait: advancing one key leaves another key at its own step.
+func TestCheckpointWaitDistinctWaitsKeepDistinctProgress(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	checkpointWaitSteps(t, d, "wait-1", "task-1", 3)
+	checkpointWaitSteps(t, d, "wait-2", "task-2", 1)
+	if n, err := d.WaitCheckpointCount(); err != nil || n != 2 {
+		t.Fatalf("WaitCheckpointCount = %d, %v; want 2", n, err)
+	}
+	for key, want := range map[string]int{"wait-1": 3, "wait-2": 1} {
+		step, _, found, err := d.ResumeWait(key)
+		if err != nil || !found {
+			t.Fatalf("ResumeWait(%s): step=%d found=%v err=%v; want found", key, step, found, err)
+		}
+		if step != want {
+			t.Errorf("ResumeWait(%s) = %d, want %d", key, step, want)
+		}
+	}
+}
+
+func TestCheckpointWaitRejectsInvalidInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	bad := []struct {
+		name   string
+		key    string
+		taskID string
+		step   int
+	}{
+		{"empty key", "", "task-1", 1},
+		{"blank key", "  ", "task-1", 1},
+		{"empty task id", "wait-1", "", 1},
+		{"blank task id", "wait-1", "  ", 1},
+		{"negative step", "wait-1", "task-1", -1},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := d.CheckpointWait(tc.key, tc.taskID, tc.step, []byte("state"), nil)
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Fatalf("CheckpointWait error = %v, want INVALID_INPUT", err)
+			}
+		})
+	}
+	if _, _, found, err := d.ResumeWait("  "); err == nil || found {
+		t.Fatalf("ResumeWait(blank) = found %v, err %v; want INVALID_INPUT", found, err)
+	}
+	if n, err := d.WaitCheckpointCount(); err != nil || n != 0 {
+		t.Fatalf("WaitCheckpointCount after rejected input = %d, %v; want 0", n, err)
+	}
+}
+
+// TestCheckpointWaitRedactsState applies ADR 0012 to task state as it does to
+// inbox payloads, outcomes and scenario results: a secret never reaches the
+// file, and resume returns the redacted copy.
+func TestCheckpointWaitRedactsState(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	res, err := d.CheckpointWait("wait-secret", "task-1", 1, secret, nil)
+	if err != nil {
+		t.Fatalf("CheckpointWait: %v", err)
+	}
+	if bytes.Contains(res.Checkpoint.State, []byte("ghp_")) {
+		t.Errorf("checkpoint state kept a raw token: %s", res.Checkpoint.State)
+	}
+	if !bytes.Contains(secret, []byte("ghp_")) {
+		t.Fatal("test input lost its secret before the write")
+	}
+	_, state, found, err := d.ResumeWait("wait-secret")
+	if err != nil || !found {
+		t.Fatalf("ResumeWait: found=%v err=%v; want found", found, err)
+	}
+	if bytes.Contains(state, []byte("ghp_")) {
+		t.Errorf("resumed state kept a raw token: %s", state)
+	}
+	stored, found, err := d.WaitCheckpoint("wait-secret")
+	if err != nil || !found {
+		t.Fatalf("WaitCheckpoint: found=%v err=%v; want found", found, err)
+	}
+	if bytes.Contains(stored.State, []byte("ghp_")) {
+		t.Errorf("stored state kept a raw token: %s", stored.State)
+	}
+}

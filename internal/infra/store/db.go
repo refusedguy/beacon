@@ -1182,3 +1182,184 @@ func (d *DB) ScenarioResult(key string) ([]byte, bool, error) {
 	}
 	return stored, true, nil
 }
+
+// createWaitCheckpointsSQL owns the wait-progress table from ADR 0043 §1. As
+// with task_starts, the inbox and the replay table, it is created on first
+// use because this card owns only db.go and adds no migration file. One row
+// per wait is enough: the last completed step and the task state at that step
+// live in the file, so a restarted wait can resume without polling from the
+// beginning.
+const createWaitCheckpointsSQL = `
+CREATE TABLE IF NOT EXISTS wait_checkpoints (
+  key        TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL,
+  step       INTEGER NOT NULL,
+  state      BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`
+
+// waitCheckpointNamespace scopes one wait's progress. It is deliberately
+// different from a clientRequestId (ADR 0028), a task start (ADR 0031) and a
+// scenario replay (ADR 0042 §6): a checkpoint records how far one wait got,
+// not whether a command or a whole scenario already ran.
+const waitCheckpointNamespace = "wait-checkpoint"
+
+// WaitCheckpointKey builds the durable key for one wait. The same raw string
+// can name a request, a task start or a scenario and still address a distinct
+// checkpoint.
+func WaitCheckpointKey(key string) string {
+	return domain.IdempotencyKey(waitCheckpointNamespace, key)
+}
+
+// WaitCheckpoint is the recorded progress of one wait. Step is the last
+// completed step and State is the redacted task state saved with it.
+type WaitCheckpoint struct {
+	Key       string
+	TaskID    string
+	Step      int
+	State     []byte
+	CreatedAt int64
+	UpdatedAt int64
+}
+
+// WaitCheckpointResult reports what a CheckpointWait call did. Created marks
+// the first checkpoint for the key. Advanced marks a step that moved forward;
+// a stale step changes nothing and reports the stored checkpoint instead.
+type WaitCheckpointResult struct {
+	Checkpoint WaitCheckpoint
+	Created    bool
+	Advanced   bool
+}
+
+// CheckpointWait records the last completed step of one wait together with
+// the task state in a single transaction (ADR 0015). saveState, when non-nil,
+// runs inside that same transaction and is where the caller persists task
+// state outside this row; if it fails, neither the checkpoint nor that state
+// is committed. Progress is monotonic: a step not greater than the one
+// already recorded writes nothing, so a redelivered or out-of-order callback
+// cannot move the wait backwards. State is redacted before it reaches the
+// file (ADR 0012). This is progress of one wait, not command deduplication
+// (ADR 0028) and not the no-second-effect check of Replay (ADR 0042 §6).
+func (d *DB) CheckpointWait(key, taskID string, step int, state []byte, saveState func(*sql.Tx) error) (WaitCheckpointResult, error) {
+	if strings.TrimSpace(key) == "" {
+		return WaitCheckpointResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: checkpoint: empty wait key")
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return WaitCheckpointResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: checkpoint: empty task id")
+	}
+	if step < 0 {
+		return WaitCheckpointResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: checkpoint: negative step")
+	}
+
+	namespaced := WaitCheckpointKey(key)
+	clean := Redact(state)
+	var out WaitCheckpointResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createWaitCheckpointsSQL); err != nil {
+			return fmt.Errorf("store: checkpoint: create table: %w", err)
+		}
+		var prev WaitCheckpoint
+		err := tx.QueryRow(`
+			SELECT key, task_id, step, state, created_at, updated_at
+			FROM wait_checkpoints WHERE key = ?`, namespaced,
+		).Scan(&prev.Key, &prev.TaskID, &prev.Step, &prev.State, &prev.CreatedAt, &prev.UpdatedAt)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("store: checkpoint: load previous: %w", err)
+		}
+		found := err == nil
+		if found && step <= prev.Step {
+			// The wait has already reached this step. Write neither state nor
+			// checkpoint and report the stored progress to the caller.
+			out = WaitCheckpointResult{Checkpoint: prev}
+			return nil
+		}
+		if saveState != nil {
+			if err := saveState(tx); err != nil {
+				return fmt.Errorf("store: checkpoint: save state: %w", err)
+			}
+		}
+		now := time.Now().UTC().UnixNano()
+		createdAt := now
+		if found {
+			createdAt = prev.CreatedAt
+			_, err = tx.Exec(`
+				UPDATE wait_checkpoints
+				SET task_id = ?, step = ?, state = ?, updated_at = ?
+				WHERE key = ?`, taskID, step, clean, now, namespaced)
+		} else {
+			_, err = tx.Exec(`
+				INSERT INTO wait_checkpoints
+				  (key, task_id, step, state, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?)`, namespaced, taskID, step, clean, now, now)
+		}
+		if err != nil {
+			return fmt.Errorf("store: checkpoint: write: %w", err)
+		}
+		out = WaitCheckpointResult{
+			Checkpoint: WaitCheckpoint{
+				Key: namespaced, TaskID: taskID, Step: step,
+				State: append([]byte(nil), clean...), CreatedAt: createdAt, UpdatedAt: now,
+			},
+			Created:  !found,
+			Advanced: true,
+		}
+		return nil
+	})
+	if err != nil {
+		return WaitCheckpointResult{}, err
+	}
+	return out, nil
+}
+
+// WaitCheckpoint returns the recorded checkpoint for key and whether one
+// exists. Reads use the separate read pool, so a restarted process sees the
+// last committed step without waiting on the writer (ADR 0041 §4).
+func (d *DB) WaitCheckpoint(key string) (WaitCheckpoint, bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return WaitCheckpoint{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: checkpoint: empty wait key")
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "wait_checkpoints")
+	if err != nil || !ok {
+		return WaitCheckpoint{}, false, err
+	}
+	var c WaitCheckpoint
+	err = d.readDB.QueryRow(`
+		SELECT key, task_id, step, state, created_at, updated_at
+		FROM wait_checkpoints WHERE key = ?`, WaitCheckpointKey(key),
+	).Scan(&c.Key, &c.TaskID, &c.Step, &c.State, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WaitCheckpoint{}, false, nil
+	}
+	if err != nil {
+		return WaitCheckpoint{}, false, err
+	}
+	return c, true, nil
+}
+
+// ResumeWait returns the last completed step and its task state for key.
+// found=false means nothing was checkpointed and the wait starts at step 0;
+// otherwise the caller continues at step+1 instead of polling from the start
+// (ADR 0043 §1).
+func (d *DB) ResumeWait(key string) (int, []byte, bool, error) {
+	c, found, err := d.WaitCheckpoint(key)
+	if err != nil || !found {
+		return 0, nil, found, err
+	}
+	return c.Step, append([]byte(nil), c.State...), true, nil
+}
+
+// WaitCheckpointCount returns the number of stored wait checkpoints. A stale
+// step must not increase it.
+func (d *DB) WaitCheckpointCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "wait_checkpoints")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM wait_checkpoints`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
