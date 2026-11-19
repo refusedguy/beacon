@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	_ "modernc.org/sqlite"
@@ -445,4 +446,84 @@ func (d *DB) PendingObligations() ([]domain.Obligation, error) {
 		obligations = append(obligations, o)
 	}
 	return obligations, rows.Err()
+}
+
+// createTaskStartsSQL owns the idempotency_key index for task starts. The key
+// and the started task's state are written in one transaction (ADR 0015), so a
+// repeated start with the same key cannot create a second task. As in
+// receipts.go and observability.go, the table is created on first use.
+const createTaskStartsSQL = `
+CREATE TABLE IF NOT EXISTS task_starts (
+  key        TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL,
+  payload    BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`
+
+// StartTaskResult is the outcome of an idempotent task start.
+type StartTaskResult struct {
+	TaskID   string
+	Payload  []byte
+	Created  bool // first start with this key wrote the task state
+	Conflict bool // key was already used: RejectDuplicate (ADR 0031 §5)
+}
+
+// StartTask records an idempotency_key and the started task in one transaction.
+// The key is namespaced with domain.StartNamespace so it is never confused with
+// a clientRequestId from ADR 0028. A repeat with the same key inserts no second
+// task: the stored task is returned, the conflict is recorded in receipts as
+// RejectDuplicate, and both commits happen together with the key lookup.
+func (d *DB) StartTask(key, taskID string, payload []byte) (StartTaskResult, error) {
+	if strings.TrimSpace(key) == "" {
+		return StartTaskResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: empty idempotency key")
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return StartTaskResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: empty task id")
+	}
+	namespaced := domain.IdempotencyKey(domain.StartNamespace, key)
+	var result StartTaskResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createTaskStartsSQL); err != nil {
+			return fmt.Errorf("store: start task: create table: %w", err)
+		}
+		now := time.Now().UTC().UnixNano()
+		res, err := tx.Exec(`
+			INSERT OR IGNORE INTO task_starts (key, task_id, payload, created_at)
+			VALUES (?, ?, ?, ?)`, namespaced, taskID, payload, now)
+		if err != nil {
+			return fmt.Errorf("store: start task: insert: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: start task: rows affected: %w", err)
+		}
+		if n == 1 {
+			result = StartTaskResult{TaskID: taskID, Payload: append([]byte(nil), payload...), Created: true}
+			return nil
+		}
+		if err := tx.QueryRow(`SELECT task_id, payload FROM task_starts WHERE key = ?`, namespaced).Scan(&result.TaskID, &result.Payload); err != nil {
+			return fmt.Errorf("store: start task: load existing: %w", err)
+		}
+		result.Conflict = true
+		return recordRejectDuplicate(tx, namespaced, result.TaskID)
+	})
+	if err != nil {
+		return StartTaskResult{}, err
+	}
+	return result, nil
+}
+
+// TaskStartCount returns the number of stored task starts. A repeated key must
+// not increase it.
+func (d *DB) TaskStartCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "task_starts")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM task_starts`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
