@@ -555,3 +555,116 @@ func TestWakeReviewOverInMemoryTransport(t *testing.T) {
 		t.Errorf("sender got source=%q, want %q", sender.lastSource, SourceReview)
 	}
 }
+
+// TestWakeEchoesExecutor proves the ADR 0031 p4 field reaches the output, so a
+// CLI-manager handover after a 429 stays visible in the wake receipt.
+func TestWakeEchoesExecutor(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Target: "session-1", Text: "obligation-1@7", Executor: "hermes",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Executor != "hermes" {
+		t.Errorf("executor = %q, want %q", out.Executor, "hermes")
+	}
+	if sender.lastText != "obligation-1@7" {
+		t.Errorf("sender got text=%q, want the pointer unchanged", sender.lastText)
+	}
+}
+
+// TestWakeExecutorOptional keeps older callers working: an omitted executor is
+// empty on the output and does not turn into an invalid-input error.
+func TestWakeExecutorOptional(t *testing.T) {
+	out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).Wake(
+		context.Background(), WakeInput{Target: "s", Text: "p"})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Executor != "" {
+		t.Errorf("executor = %q, want empty when caller omits it", out.Executor)
+	}
+}
+
+// TestWakeExecutorOnRefusalAndInterruption keeps the executor visible on the
+// honest paths too: an unsupported delivery and a human interruption.
+func TestWakeExecutorOnRefusalAndInterruption(t *testing.T) {
+	refusal, err := NewWakeHandler(&fakeWakeSender{delivery: DeliveryUnsupported, reason: "no channel"}).Wake(
+		context.Background(), WakeInput{Target: "s", Text: "p", Executor: "gemini"})
+	if err != nil {
+		t.Fatalf("Wake() refusal error = %v", err)
+	}
+	if refusal.Executor != "gemini" || refusal.OK {
+		t.Errorf("refusal executor=%q ok=%v, want gemini/false", refusal.Executor, refusal.OK)
+	}
+
+	interrupted, err := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).Wake(
+		context.Background(), WakeInput{Target: "s", Text: "p", Executor: "gemini", HasPendingQuestion: true})
+	if err != nil {
+		t.Fatalf("Wake() interruption error = %v", err)
+	}
+	if interrupted.Executor != "gemini" || !interrupted.Interrupted {
+		t.Errorf("interruption executor=%q interrupted=%v, want gemini/true",
+			interrupted.Executor, interrupted.Interrupted)
+	}
+}
+
+// TestWakeSchemaHasExecutor proves an MCP client can send the current executor,
+// so a caller can report a fallback handover through the wake tool.
+func TestWakeSchemaHasExecutor(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "executor") {
+		t.Errorf("wake input schema missing executor: %s", inputSchema)
+	}
+}
+
+// TestWakeExecutorOverInMemoryTransport drives the executor through a real MCP
+// client and server. It proves the field is decoded from the schema and echoed
+// back to the client, not just handled in process.
+func TestWakeExecutorOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target:   "session-1",
+			Text:     "obligation-1@7",
+			Executor: "hermes",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Executor != "hermes" {
+		t.Errorf("client saw executor=%q, want %q", out.Executor, "hermes")
+	}
+}

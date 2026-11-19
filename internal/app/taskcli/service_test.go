@@ -358,6 +358,180 @@ func TestTakeRace20(t *testing.T) {
 	}
 }
 
+// httpStatusError имитирует внешнего клиента, который сообщает 429 своим типом.
+// Проверяет, что правило маршрутизации не привязано к конкретному пакету.
+type httpStatusError struct {
+	code int
+	msg  string
+}
+
+func (e httpStatusError) Error() string { return e.msg }
+func (e httpStatusError) Status() int   { return e.code }
+
+func TestFallbackChainOrder(t *testing.T) {
+	want := []string{"claude-code", "hermes", "gemini"}
+	if len(FallbackChain) != len(want) {
+		t.Fatalf("цепочка из %d звеньев, ждали %d", len(FallbackChain), len(want))
+	}
+	for i := range want {
+		if FallbackChain[i] != want[i] {
+			t.Errorf("звено %d = %q, ждали %q", i, FallbackChain[i], want[i])
+		}
+	}
+}
+
+func TestIsRateLimit(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"нет ошибки", nil, false},
+		{"RateLimited", &RateLimited{}, true},
+		{"завернутый RateLimited", fmt.Errorf("upstream: %w", &RateLimited{}), true},
+		{"чужой 429", httpStatusError{code: 429, msg: "quota"}, true},
+		{"чужой 500", httpStatusError{code: 500, msg: "boom"}, false},
+		{"обычная ошибка", fmt.Errorf("boom"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsRateLimit(tc.err); got != tc.want {
+				t.Errorf("IsRateLimit() = %v, ждали %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestJobFallbackKeepsExternalID(t *testing.T) {
+	job, err := NewJob("T3.22")
+	if err != nil || job.ID != "T3.22" || job.Executor != ExecutorClaudeCode {
+		t.Fatalf("NewJob: %+v %v", job, err)
+	}
+	steps := []struct {
+		from, to string
+		ok       bool
+	}{
+		{ExecutorClaudeCode, ExecutorHermes, true},
+		{ExecutorHermes, ExecutorGemini, true},
+		{ExecutorGemini, ExecutorGemini, false},
+	}
+	for i, step := range steps {
+		if job.Executor != step.from {
+			t.Fatalf("шаг %d: исполнитель %q, ждали %q", i, job.Executor, step.from)
+		}
+		next, ok := NextOnRateLimit(job)
+		if ok != step.ok {
+			t.Fatalf("шаг %d: ok = %v, ждали %v", i, ok, step.ok)
+		}
+		if next.ID != "T3.22" {
+			t.Errorf("шаг %d: внешний ID изменился на %q", i, next.ID)
+		}
+		if next.Executor != step.to {
+			t.Errorf("шаг %d: исполнитель %q, ждали %q", i, next.Executor, step.to)
+		}
+		job = next
+	}
+	if len(job.Tried) != 2 || job.Tried[0] != ExecutorClaudeCode || job.Tried[1] != ExecutorHermes {
+		t.Errorf("Tried = %v, ждали [claude-code hermes]", job.Tried)
+	}
+}
+
+func TestNewJobRejectsEmptyID(t *testing.T) {
+	if _, err := NewJob("  "); taskstore.Code(err) != 1 {
+		t.Errorf("NewJob с пустым ID дал %v, ждали код 1", err)
+	}
+}
+
+func TestRouteRateLimitWalksChainAndKeepsCardID(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.22", "in_progress", "task", "ADR 0001", "internal/app/x.go",
+		ExecutorClaudeCode, "2026-11-19T14:03:21Z")
+	path := filepath.Join(e.tasksDir, "T3.22.md")
+
+	fromExec := []string{ExecutorClaudeCode, ExecutorHermes, ExecutorGemini}
+	wantExec := []string{ExecutorHermes, ExecutorGemini, ExecutorGemini}
+	for i, want := range wantExec {
+		res, err := e.svc.RouteRateLimit("T3.22", &RateLimited{Executor: fromExec[i]})
+		if err != nil {
+			t.Fatalf("шаг %d: RouteRateLimit: %v", i, err)
+		}
+		if res.JobID != "T3.22" {
+			t.Errorf("шаг %d: внешний ID = %q, ждали T3.22", i, res.JobID)
+		}
+		if res.To != want || res.Status != "in_progress "+want {
+			t.Errorf("шаг %d: результат %+v, ждали исполнителя %q", i, res, want)
+		}
+		if res.Exhausted != (i == 2) {
+			t.Errorf("шаг %d: Exhausted = %v", i, res.Exhausted)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		card, err := taskstore.ParseCard("T3.22.md", data)
+		if err != nil {
+			t.Fatalf("шаг %d: карточка не читается: %v", i, err)
+		}
+		if card.ID != "T3.22" {
+			t.Errorf("шаг %d: ID карточки = %q", i, card.ID)
+		}
+		if card.Agent != want {
+			t.Errorf("шаг %d: Агент = %q, ждали %q", i, card.Agent, want)
+		}
+		if !strings.Contains(string(data), "Исполнитель: "+want) {
+			t.Errorf("шаг %d: в статусе нет исполнителя %q:\n%s", i, want, data)
+		}
+		if !strings.Contains(string(data), "Фолбэк:") {
+			t.Errorf("шаг %d: в статусе нет записи о фолбэке:\n%s", i, data)
+		}
+		if strings.Count(string(data), "Исполнитель:") != 1 || strings.Count(string(data), "Фолбэк:") != 1 {
+			t.Errorf("шаг %d: поля продублировались:\n%s", i, data)
+		}
+	}
+}
+
+func TestRouteRateLimitStartsFromFirstRungForForeignAgent(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.22", "todo", "task", "ADR 0001", "internal/app/x.go", "нет", "нет")
+	res, err := e.svc.RouteRateLimit("T3.22.md", &RateLimited{})
+	if err != nil || res.From != ExecutorClaudeCode || res.To != ExecutorHermes {
+		t.Fatalf("фолбэк с чужим агентом: %+v %v", res, err)
+	}
+}
+
+func TestRouteRateLimitRejectsNon429AndBadInput(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.22", "in_progress", "task", "ADR 0001", "internal/app/x.go",
+		ExecutorClaudeCode, "2026-11-19T14:03:21Z")
+	path := filepath.Join(e.tasksDir, "T3.22.md")
+	before, _ := os.ReadFile(path)
+
+	_, err := e.svc.RouteRateLimit("T3.22", fmt.Errorf("boom"))
+	if taskstore.Code(err) != 1 {
+		t.Errorf("не-429 дал %v, ждали код 1", err)
+	}
+	for _, id := range []string{"", "bad", "T9.9"} {
+		if _, err := e.svc.RouteRateLimit(id, &RateLimited{}); taskstore.Code(err) != 1 {
+			t.Errorf("ID %q дал %v, ждали код 1", id, err)
+		}
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Errorf("карточка изменилась при отклонённом фолбэке:\n%s", after)
+	}
+	if _, err := os.Stat(taskstore.LockPath(e.cfg.StateDir, e.cfg.Root)); !os.IsNotExist(err) {
+		t.Errorf("замок не отпущен: %v", err)
+	}
+}
+
+func TestRouteRateLimitRejectsClosedCard(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.22", "done", "task", "ADR 0001", "internal/app/x.go", ExecutorClaudeCode, "2026-11-19T14:03:21Z")
+	if _, err := e.svc.RouteRateLimit("T3.22", &RateLimited{}); taskstore.Code(err) != 1 {
+		t.Errorf("закрытая карточка дала %v, ждали код 1", err)
+	}
+}
+
 func TestSelfTest(t *testing.T) {
 	var out strings.Builder
 	if err := SelfTest(&out); err != nil {
