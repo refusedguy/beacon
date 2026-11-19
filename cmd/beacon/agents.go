@@ -186,3 +186,36 @@ func printAgentRows(format string, rows []agentRow, out, errOut io.Writer) int {
 		return 2
 	}
 }
+
+// sandboxCloneArgs builds the git arguments for one cheap agent sandbox. The
+// --reference flag makes the new clone read objects from source through
+// .git/objects/info/alternates, so the object store is shared and no repository
+// data is copied. git clone still gives the sandbox its own refs, index, HEAD
+// and working tree, which keeps agents isolated (ADR 0033 section 3, ADR 0021).
+// The same path is passed as reference and as clone source: Beacon provisions
+// sandboxes from a local repository and does not fetch from a transport.
+func sandboxCloneArgs(source, dest string) []string {
+	return []string{"clone", "--reference", source, source, dest}
+}
+
+// provisionSandbox creates an isolated working copy at dest from source and
+// reports failures to errOut. It returns a CLI exit code. Beacon only drives
+// git through the injected runner; it never calls exec or copies files itself
+// (ADR 0005, ADR 0021). Rust, FUSE and graft binaries are deliberately absent.
+func (c *CLI) provisionSandbox(source, dest string) int {
+	if strings.TrimSpace(source) == "" || strings.TrimSpace(dest) == "" {
+		fmt.Fprintln(c.errOut, "beacon: песочница: нужны путь исходного репозитория и путь песочницы")
+		return 2
+	}
+
+	res := c.run(c.root, "git", sandboxCloneArgs(source, dest), nil)
+	if res.code != 0 {
+		msg := strings.TrimSpace(string(res.stderr))
+		if msg == "" {
+			msg = fmt.Sprintf("git завершился с кодом %d", res.code)
+		}
+		fmt.Fprintf(c.errOut, "beacon: песочница: git clone --reference не удался: %s\n", msg)
+		return 2
+	}
+	return 0
+}
