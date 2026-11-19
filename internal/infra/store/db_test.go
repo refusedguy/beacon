@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -429,6 +430,209 @@ func TestStartTaskRejectsEmptyInput(t *testing.T) {
 		var appErr *domain.AppError
 		if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
 			t.Errorf("StartTask(%q, %q) error = %v, want INVALID_INPUT", tc.key, tc.taskID, err)
+		}
+	}
+}
+
+// TestTaskJournalIsAppendOnly is the acceptance check for T3.43. It appends an
+// event and an ack, snapshots the raw rows, appends more records, then proves
+// the original rows are byte-for-byte unchanged (ADR 0036 §3).
+func TestTaskJournalIsAppendOnly(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	// A secret in the first event must be redacted, and the redacted bytes must
+	// then stay frozen for the life of the row.
+	seq1, err := d.AppendEvent(ctx, "task-1", "started", "token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	if err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	seq2, err := d.AppendAck(ctx, "task-1", 1)
+	if err != nil {
+		t.Fatalf("AppendAck: %v", err)
+	}
+
+	before, err := d.JournalRecords(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("JournalRecords before: %v", err)
+	}
+	if len(before) != 2 {
+		t.Fatalf("journal rows = %d, want 2", len(before))
+	}
+	if before[0].Seq != seq1 || before[1].Seq != seq2 {
+		t.Fatalf("seqs = %d,%d; want %d,%d", before[0].Seq, before[1].Seq, seq1, seq2)
+	}
+	if before[1].Kind != journalKindAck || before[1].Revision != 1 {
+		t.Fatalf("ack row = %+v, want kind %q revision 1", before[1], journalKindAck)
+	}
+	if bytes.Contains(before[0].Payload, []byte("ghp_")) {
+		t.Errorf("event payload kept a raw token: %s", before[0].Payload)
+	}
+
+	// Deep copy: JournalRecords returns payload bytes from the driver, and we
+	// want to compare against a snapshot that later reads cannot touch.
+	snapshot := make([]JournalRecord, len(before))
+	for i, r := range before {
+		snapshot[i] = r
+		snapshot[i].Payload = append([]byte(nil), r.Payload...)
+	}
+
+	// Later writes: a new event and an ack for an older revision. Neither may
+	// rewrite the two rows above.
+	seq3, err := d.AppendEvent(ctx, "task-1", "progress", "halfway")
+	if err != nil {
+		t.Fatalf("second AppendEvent: %v", err)
+	}
+	seq4, err := d.AppendAck(ctx, "task-1", 1)
+	if err != nil {
+		t.Fatalf("second AppendAck: %v", err)
+	}
+	if seq3 <= seq2 || seq4 <= seq3 {
+		t.Fatalf("seqs not monotonic: %d,%d,%d,%d", seq1, seq2, seq3, seq4)
+	}
+
+	after, err := d.JournalRecords(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("JournalRecords after: %v", err)
+	}
+	if len(after) != 4 {
+		t.Fatalf("journal rows after appends = %d, want 4", len(after))
+	}
+	for i := range snapshot {
+		got, want := after[i], snapshot[i]
+		if got.Seq != want.Seq || got.TaskID != want.TaskID || got.Kind != want.Kind ||
+			got.Revision != want.Revision || got.CreatedAt != want.CreatedAt {
+			t.Errorf("row %d metadata changed:\n got %+v\nwant %+v", i, got, want)
+		}
+		if !bytes.Equal(got.Payload, want.Payload) {
+			t.Errorf("row %d payload changed:\n got %s\nwant %s", i, got.Payload, want.Payload)
+		}
+	}
+}
+
+// TestTaskJournalRejectsRewrite proves the database trigger enforces
+// append-only: a direct UPDATE or DELETE through Write fails, and the stored
+// row is untouched.
+func TestTaskJournalRejectsRewrite(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	if _, err := d.AppendEvent(ctx, "task-1", "started", "original"); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	before, err := d.JournalRecords(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("JournalRecords before: %v", err)
+	}
+	if len(before) != 1 {
+		t.Fatalf("journal rows = %d, want 1", len(before))
+	}
+
+	updateErr := d.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE task_journal SET payload = ? WHERE task_id = ?`,
+			[]byte(`tampered`), "task-1")
+		return err
+	})
+	if updateErr == nil {
+		t.Error("UPDATE task_journal must be rejected by the append-only trigger")
+	}
+
+	deleteErr := d.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM task_journal WHERE task_id = ?`, "task-1")
+		return err
+	})
+	if deleteErr == nil {
+		t.Error("DELETE task_journal must be rejected by the append-only trigger")
+	}
+
+	rows, err := d.JournalRecords(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("JournalRecords: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("journal rows after rewrites = %d, want 1", len(rows))
+	}
+	if rows[0].Seq != before[0].Seq || !bytes.Equal(rows[0].Payload, before[0].Payload) {
+		t.Fatalf("row changed after failed rewrite:\n got %+v\nwant %+v", rows[0], before[0])
+	}
+}
+
+// TestJournalStatusServedSeparately checks ADR 0025: the current status comes
+// from the newest record alone, and asking for it does not touch the history.
+func TestJournalStatusServedSeparately(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	if _, err := d.JournalStatus(ctx, "empty"); err != nil {
+		t.Fatalf("JournalStatus for unknown task: %v", err)
+	} else if got, _ := d.JournalStatus(ctx, "empty"); got.Status != "" || got.Cursor != 0 {
+		t.Fatalf("JournalStatus for unknown task = %+v, want zero", got)
+	}
+
+	if _, err := d.AppendEvent(ctx, "task-1", "started", "go"); err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	if _, err := d.AppendEvent(ctx, "task-1", "progress", "halfway"); err != nil {
+		t.Fatalf("second AppendEvent: %v", err)
+	}
+	seqAck, err := d.AppendAck(ctx, "task-1", 9)
+	if err != nil {
+		t.Fatalf("AppendAck: %v", err)
+	}
+
+	st, err := d.JournalStatus(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("JournalStatus: %v", err)
+	}
+	if st.Status != journalKindAck || st.Cursor != seqAck || st.Revision != 9 {
+		t.Fatalf("JournalStatus = %+v, want status %q cursor %d revision 9",
+			st, journalKindAck, seqAck)
+	}
+
+	// Reading the status must not append, update or delete any journal row.
+	again, err := d.JournalRecords(ctx, "task-1")
+	if err != nil {
+		t.Fatalf("JournalRecords after status: %v", err)
+	}
+	if len(again) != 3 {
+		t.Fatalf("journal rows after status read = %d, want 3", len(again))
+	}
+	if again[2].Seq != seqAck || again[2].Revision != 9 {
+		t.Fatalf("newest row changed after status read: %+v", again[2])
+	}
+}
+
+func TestTaskJournalRejectsEmptyInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	for _, tc := range []struct{ taskID, kind string }{
+		{"", "started"},
+		{"task-1", ""},
+	} {
+		_, err := d.AppendEvent(ctx, tc.taskID, tc.kind, "msg")
+		if err == nil {
+			t.Fatalf("AppendEvent(%q, %q) must fail", tc.taskID, tc.kind)
+		}
+		var appErr *domain.AppError
+		if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+			t.Errorf("AppendEvent(%q, %q) error = %v, want INVALID_INPUT", tc.taskID, tc.kind, err)
 		}
 	}
 }
