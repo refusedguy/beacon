@@ -123,7 +123,7 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
   return { delivery: STEER_DELIVERY, outcome, receipt }
 }
 
-export default {
+const plugin = {
   id: ID,
 
   setup(ctx) {
@@ -155,6 +155,8 @@ export default {
     return () => ac.abort()
   },
 }
+
+export default plugin
 
 // --- table-driven адаптер-тест (T3.1, шаг 4) ---
 // Запуск: node --test .opencode/plugins/beacon-bridge.js
@@ -336,6 +338,9 @@ const adapterCases = [
     },
   },
   {
+    // Проверка именно репозиторийского плагина, не эталона из fixtures.
+    // Плагин читает файл указателя и вызывает ctx.session.prompt; чтение
+    // events.jsonl по S2 остаётся отдельной карточкой и здесь не проверяется.
     name: "T3.16: плагин читает указатель по событию review",
     async check(assert) {
       const stateDir = mkdtempSync(join(tmpdir(), "beacon-t316-state-"))
