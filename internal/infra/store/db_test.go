@@ -1100,3 +1100,313 @@ func TestWatchOutcomeRedactsResult(t *testing.T) {
 		t.Fatalf("watcher was not woken: %v", ctx.Err())
 	}
 }
+
+// replayScenarioSteps builds a three-step scenario that touches three durable
+// tables: a task start (ADR 0031), an inbox message (ADR 0039) and a journal
+// event (ADR 0036). The steps use the same idempotent SQL the store uses, and
+// run counts how many times Apply was actually called. If a replay executes a
+// step a second time, run grows and the journal gains a second append-only row.
+func replayScenarioSteps(t *testing.T, run *int32) []ReplayStep {
+	t.Helper()
+	return []ReplayStep{
+		{
+			Name: "task-start",
+			Apply: func(tx *sql.Tx) error {
+				atomic.AddInt32(run, 1)
+				if _, err := tx.Exec(createTaskStartsSQL); err != nil {
+					return err
+				}
+				_, err := tx.Exec(`
+					INSERT OR IGNORE INTO task_starts (key, task_id, payload, created_at)
+					VALUES (?, ?, ?, ?)`,
+					domain.IdempotencyKey(domain.StartNamespace, "req-abc"),
+					"task-1", []byte(`{"role":"executor"}`), time.Now().UTC().UnixNano())
+				return err
+			},
+		},
+		{
+			Name: "inbox-put",
+			Apply: func(tx *sql.Tx) error {
+				atomic.AddInt32(run, 1)
+				if err := ensureInbox(tx); err != nil {
+					return err
+				}
+				m := InboxMessage{
+					WatchID: "w1", Revision: 3, SubscriberID: "s1",
+					PeerName: "peer-A", Payload: []byte(`{"kind":"wake"}`),
+				}
+				_, err := tx.Exec(`
+					INSERT OR IGNORE INTO inbox_messages
+					  (key, watch_id, revision, subscriber_id, peer_name, payload, state, lease_until, created_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+					InboxKey(m.WatchID, m.Revision, m.SubscriberID),
+					m.WatchID, m.Revision, m.SubscriberID, m.PeerName, Redact(m.Payload),
+					inboxStatePending, time.Now().UTC().UnixNano())
+				return err
+			},
+		},
+		{
+			Name: "journal-event",
+			Apply: func(tx *sql.Tx) error {
+				atomic.AddInt32(run, 1)
+				for _, stmt := range createTaskJournalSQL {
+					if _, err := tx.Exec(stmt); err != nil {
+						return err
+					}
+				}
+				_, err := tx.Exec(`
+					INSERT INTO task_journal (task_id, kind, revision, payload, created_at)
+					VALUES (?, ?, ?, ?, ?)`,
+					"task-1", "wake", 0, []byte(`{"kind":"wake"}`), time.Now().UTC().UnixNano())
+				return err
+			},
+		},
+	}
+}
+
+type replayEffects struct {
+	replays int
+	tasks   int
+	inbox   int
+	journal int
+}
+
+func snapshotReplayEffects(t *testing.T, d *DB) replayEffects {
+	t.Helper()
+	replays, err := d.ReplayCount()
+	if err != nil {
+		t.Fatalf("ReplayCount: %v", err)
+	}
+	tasks, err := d.TaskStartCount()
+	if err != nil {
+		t.Fatalf("TaskStartCount: %v", err)
+	}
+	inbox, err := d.InboxMessages("peer-A")
+	if err != nil {
+		t.Fatalf("InboxMessages: %v", err)
+	}
+	journal, err := d.JournalRecords(context.Background(), "task-1")
+	if err != nil {
+		t.Fatalf("JournalRecords: %v", err)
+	}
+	return replayEffects{replays: replays, tasks: tasks, inbox: len(inbox), journal: len(journal)}
+}
+
+// TestReplayWholeScenarioHasNoSecondEffect is the acceptance check for T3.90.
+// The same scenario replayed in full returns the first result and produces no
+// second task, inbox message, journal record or replay row (ADR 0042 §6).
+func TestReplayWholeScenarioHasNoSecondEffect(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	var run int32
+	steps := replayScenarioSteps(t, &run)
+	result := []byte(`{"verdict":"ready","cursor":9}`)
+
+	first, err := d.Replay("scenario-1", steps, result)
+	if err != nil {
+		t.Fatalf("first Replay: %v", err)
+	}
+	if !first.Created || first.Replayed {
+		t.Fatalf("first replay = %+v, want created and not replayed", first)
+	}
+	if !bytes.Equal(first.Result, result) {
+		t.Errorf("first result = %s, want %s", first.Result, result)
+	}
+	if got := atomic.LoadInt32(&run); got != 3 {
+		t.Fatalf("steps run on first replay = %d, want 3", got)
+	}
+	before := snapshotReplayEffects(t, d)
+	if before != (replayEffects{replays: 1, tasks: 1, inbox: 1, journal: 1}) {
+		t.Fatalf("effects after first replay = %+v, want one of each", before)
+	}
+
+	second, err := d.Replay("scenario-1", steps, result)
+	if err != nil {
+		t.Fatalf("second Replay: %v", err)
+	}
+	if !second.Replayed || second.Created {
+		t.Fatalf("second replay = %+v, want replayed and not created", second)
+	}
+	if !bytes.Equal(second.Result, first.Result) {
+		t.Errorf("replayed result = %s, want stored %s", second.Result, first.Result)
+	}
+	if got := atomic.LoadInt32(&run); got != 3 {
+		t.Errorf("steps run after repeat = %d, want 3 (no step may run twice)", got)
+	}
+	after := snapshotReplayEffects(t, d)
+	if after != before {
+		t.Errorf("effects after repeat = %+v, want unchanged %+v", after, before)
+	}
+
+	stored, ok, err := d.ScenarioResult("scenario-1")
+	if err != nil || !ok {
+		t.Fatalf("ScenarioResult: %v, %v; want found", ok, err)
+	}
+	if !bytes.Equal(stored, result) {
+		t.Errorf("stored result = %s, want %s", stored, result)
+	}
+}
+
+// TestReplayKeySeparateFromClientRequestID proves the scenario key does not
+// reuse the per-command clientRequestId from ADR 0028 or the task-start key
+// from ADR 0031, even when all three receive the same raw string.
+func TestReplayKeySeparateFromClientRequestID(t *testing.T) {
+	const raw = "req-abc"
+	replay := ReplayKey(raw)
+	if replay == raw {
+		t.Fatalf("ReplayKey(%q) = raw clientRequestId %q", raw, replay)
+	}
+	if want := domain.IdempotencyKey(replayNamespace, raw); replay != want {
+		t.Fatalf("ReplayKey(%q) = %q, want %q", raw, replay, want)
+	}
+	if replay == domain.IdempotencyKey(domain.StartNamespace, raw) {
+		t.Fatal("scenario key collides with task-start key")
+	}
+	if replay != ReplayKey(raw) {
+		t.Fatal("ReplayKey is not deterministic")
+	}
+
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if _, err := d.StartTask(raw, "task-1", []byte("start")); err != nil {
+		t.Fatalf("StartTask: %v", err)
+	}
+	var run int32
+	if _, err := d.Replay(raw, replayScenarioSteps(t, &run), []byte("scenario")); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if n, err := d.TaskStartCount(); err != nil || n != 1 {
+		t.Fatalf("TaskStartCount = %d, %v; want 1", n, err)
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 1 {
+		t.Fatalf("ReplayCount = %d, %v; want 1", n, err)
+	}
+}
+
+// TestReplayDistinctScenariosCreateDistinctEffects shows that the key scopes
+// the scenario: a new key runs a new scenario and records a second replay.
+func TestReplayDistinctScenariosCreateDistinctEffects(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, key := range []string{"scenario-1", "scenario-2"} {
+		var run int32
+		res, err := d.Replay(key, replayScenarioSteps(t, &run), []byte(key))
+		if err != nil {
+			t.Fatalf("Replay(%s): %v", key, err)
+		}
+		if !res.Created || res.Replayed {
+			t.Errorf("Replay(%s) = %+v, want created", key, res)
+		}
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 2 {
+		t.Fatalf("ReplayCount = %d, %v; want 2", n, err)
+	}
+	journal, err := d.JournalRecords(context.Background(), "task-1")
+	if err != nil || len(journal) != 2 {
+		t.Fatalf("JournalRecords = %d, %v; want 2", len(journal), err)
+	}
+}
+
+// TestReplayFailedStepLeavesNoKey proves a failed run is not cached: the key
+// and all side effects roll back together, so a retry can run the scenario.
+func TestReplayFailedStepLeavesNoKey(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	var run int32
+	steps := replayScenarioSteps(t, &run)
+	boom := errors.New("boom")
+	steps[2].Apply = func(tx *sql.Tx) error {
+		atomic.AddInt32(&run, 1)
+		return boom
+	}
+	if _, err := d.Replay("scenario-1", steps, []byte("result")); !errors.Is(err, boom) {
+		t.Fatalf("Replay with failing step = %v, want boom", err)
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 0 {
+		t.Fatalf("ReplayCount after failure = %d, %v; want 0", n, err)
+	}
+	if n, err := d.TaskStartCount(); err != nil || n != 0 {
+		t.Fatalf("TaskStartCount after failure = %d, %v; want 0 (rolled back)", n, err)
+	}
+
+	good := replayScenarioSteps(t, &run)
+	res, err := d.Replay("scenario-1", good, []byte("result"))
+	if err != nil || !res.Created {
+		t.Fatalf("retry Replay = %+v, %v; want created", res, err)
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 1 {
+		t.Fatalf("ReplayCount after retry = %d, %v; want 1", n, err)
+	}
+}
+
+func TestReplayRejectsEmptyInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	bad := []struct {
+		name  string
+		key   string
+		steps []ReplayStep
+	}{
+		{"empty key", "", nil},
+		{"blank key", "  ", nil},
+		{"nil apply", "scenario-1", []ReplayStep{{Name: "step", Apply: nil}}},
+		{"empty name", "scenario-1", []ReplayStep{{Name: "  ", Apply: func(*sql.Tx) error { return nil }}}},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := d.Replay(tc.key, tc.steps, []byte("result"))
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Fatalf("Replay error = %v, want INVALID_INPUT", err)
+			}
+		})
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 0 {
+		t.Fatalf("ReplayCount after rejected input = %d, %v; want 0", n, err)
+	}
+}
+
+// TestReplayRedactsResult applies ADR 0012 to a scenario result as it does to
+// inbox payloads and worker outcomes: a secret never reaches the file.
+func TestReplayRedactsResult(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	res, err := d.Replay("scenario-secret", nil, []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789"))
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if bytes.Contains(res.Result, []byte("ghp_")) {
+		t.Errorf("first result kept a raw token: %s", res.Result)
+	}
+	stored, ok, err := d.ScenarioResult("scenario-secret")
+	if err != nil || !ok {
+		t.Fatalf("ScenarioResult: %v, %v; want found", ok, err)
+	}
+	if bytes.Contains(stored, []byte("ghp_")) {
+		t.Errorf("stored result kept a raw token: %s", stored)
+	}
+}
