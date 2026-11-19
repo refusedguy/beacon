@@ -56,3 +56,4 @@
 | 0042 | Шесть фич из отчёта Y-wave | accepted |
 | 0043 | Шесть фич из отчёта Z-wave | accepted |
 | 0044 | Шесть фич из отчёта AA-wave | accepted |
+| 0045 | Шесть фич из отчёта AB-wave | accepted |
