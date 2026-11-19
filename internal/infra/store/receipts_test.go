@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/github"
 )
 
 const testReceiptAt = "2026-11-19T12:00:00Z"
@@ -48,9 +49,17 @@ func seedReceiptObligation(t *testing.T, d *DB, id string) {
 }
 
 func receiptLine(obligationID string, attempt int, outcome string) string {
+	return receiptLineWithSource(obligationID, attempt, outcome, worktreeSourceJSON("result.json"))
+}
+
+func receiptLineWithSource(obligationID string, attempt int, outcome, source string) string {
 	return fmt.Sprintf(
-		`{"obligationID":%q,"attempt":%d,"outcome":%q,"at":%q}`,
-		obligationID, attempt, outcome, testReceiptAt)
+		`{"obligationID":%q,"attempt":%d,"outcome":%q,"at":%q,"source":%s}`,
+		obligationID, attempt, outcome, testReceiptAt, source)
+}
+
+func worktreeSourceJSON(file string) string {
+	return fmt.Sprintf(`{"kind":"worktree","worktreeFile":%q}`, file)
 }
 
 func TestImportReceiptsIdempotent(t *testing.T) {
@@ -306,6 +315,165 @@ func TestParseReceiptTime(t *testing.T) {
 	}
 	if _, err := parseReceiptTime(jsonRaw(`null`)); err == nil {
 		t.Error("null timestamp was accepted")
+	}
+}
+
+func TestArtifactSourceKindsPersisted(t *testing.T) {
+	d := newReceiptDB(t)
+	for _, id := range []string{"src-branch", "src-pr", "src-worktree"} {
+		seedReceiptObligation(t, d, id)
+	}
+	lines := []string{
+		receiptLineWithSource("src-branch", 1, "posted", `{"kind":"branch","branch":"feat/w48"}`),
+		receiptLineWithSource("src-pr", 1, "posted", `{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"OPEN"}`),
+		receiptLineWithSource("src-worktree", 1, "posted", worktreeSourceJSON("worktrees/w48/result.json")),
+	}
+	path := writeReceiptsFile(t, strings.Join(lines, "\n")+"\n")
+
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 3 || result.Malformed != 0 {
+		t.Fatalf("result = %+v, want 3 imported, no malformed", result)
+	}
+
+	wantKind := map[string]ArtifactKind{
+		"src-branch":   ArtifactBranch,
+		"src-pr":       ArtifactPR,
+		"src-worktree": ArtifactWorktree,
+	}
+	for id, kind := range wantKind {
+		got, err := d.Receipts(id)
+		if err != nil {
+			t.Fatalf("Receipts(%s): %v", id, err)
+		}
+		if len(got) != 1 || got[0].Source.Kind != kind {
+			t.Errorf("Receipts(%s) = %+v, want one receipt with kind %q", id, got, kind)
+		}
+	}
+
+	branch, err := d.Receipts("src-branch")
+	if err != nil {
+		t.Fatalf("Receipts(branch): %v", err)
+	}
+	if len(branch) == 1 && branch[0].Source.Branch != "feat/w48" {
+		t.Errorf("branch source = %+v, want feat/w48", branch[0].Source)
+	}
+	pr, err := d.Receipts("src-pr")
+	if err != nil {
+		t.Fatalf("Receipts(pr): %v", err)
+	}
+	if len(pr) == 1 && (pr[0].Source.Repo != "refusedguy/beacon" || pr[0].Source.PR != 48) {
+		t.Errorf("pr source = %+v, want refusedguy/beacon#48", pr[0].Source)
+	}
+	worktree, err := d.Receipts("src-worktree")
+	if err != nil {
+		t.Fatalf("Receipts(worktree): %v", err)
+	}
+	if len(worktree) == 1 && worktree[0].Source.WorktreeFile != "worktrees/w48/result.json" {
+		t.Errorf("worktree source = %+v, want worktrees/w48/result.json", worktree[0].Source)
+	}
+}
+
+func TestArtifactSourceRejectsPrivateStatePaths(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "src-reject")
+
+	// A free-form path is not a source at all. The typed forms below try to
+	// smuggle the same private state through each of the three public kinds.
+	lines := []string{
+		receiptLineWithSource("src-reject", 1, "posted", `"~/.claude/jobs/123/session.jsonl"`),
+		receiptLineWithSource("src-reject", 2, "posted", worktreeSourceJSON("~/.claude/jobs/123/session.jsonl")),
+		receiptLineWithSource("src-reject", 3, "posted", worktreeSourceJSON("/home/agent/.claude/jobs/123")),
+		receiptLineWithSource("src-reject", 4, "posted", worktreeSourceJSON("../.claude/jobs/123")),
+		receiptLineWithSource("src-reject", 5, "posted", `{"kind":"branch","branch":"~/.claude/jobs/123"}`),
+		receiptLineWithSource("src-reject", 6, "posted", `{"kind":"pr","repo":"refusedguy/beacon","pr":48,"worktreeFile":"~/.claude/jobs/123"}`),
+	}
+	path := writeReceiptsFile(t, strings.Join(lines, "\n")+"\n")
+
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 0 || result.Malformed != len(lines) {
+		t.Fatalf("result = %+v, want 0 imported and %d malformed", result, len(lines))
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("receipt count = %d, want 0", count)
+	}
+	o, err := d.Obligation("src-reject")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if !o.DeliveredAt.IsZero() {
+		t.Errorf("deliveredAt = %v, want zero for rejected sources", o.DeliveredAt)
+	}
+}
+
+func TestClosedPRSourceTerminalVerdict(t *testing.T) {
+	var closed ArtifactSource
+	if err := json.Unmarshal([]byte(`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"CLOSED"}`), &closed); err != nil {
+		t.Fatalf("unmarshal closed PR source: %v", err)
+	}
+	if v := github.ClosedPRVerdict(closed.State); v != domain.VerdictClosed || !github.IsTerminalArtifactVerdict(v) {
+		t.Errorf("closed PR verdict = %q, want terminal %q", v, domain.VerdictClosed)
+	}
+	if v := closed.Verdict(); v != github.ClosedPRVerdict(closed.State) {
+		t.Errorf("source verdict = %q, want %q", v, github.ClosedPRVerdict(closed.State))
+	}
+
+	var merged ArtifactSource
+	if err := json.Unmarshal([]byte(`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"MERGED"}`), &merged); err != nil {
+		t.Fatalf("unmarshal merged PR source: %v", err)
+	}
+	if v := merged.Verdict(); v != domain.VerdictMerged || !github.IsTerminalArtifactVerdict(v) {
+		t.Errorf("merged PR verdict = %q, want terminal %q", v, domain.VerdictMerged)
+	}
+
+	var open ArtifactSource
+	if err := json.Unmarshal([]byte(`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"OPEN"}`), &open); err != nil {
+		t.Fatalf("unmarshal open PR source: %v", err)
+	}
+	if v := open.Verdict(); github.IsTerminalArtifactVerdict(v) {
+		t.Errorf("open PR verdict = %q, want non-terminal", v)
+	}
+}
+
+func TestClosedPRReceiptTerminalWithoutAgentLogs(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "closed-pr")
+
+	line := receiptLineWithSource("closed-pr", 1, "posted",
+		`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"CLOSED"}`)
+	path := writeReceiptsFile(t, line+"\n")
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 1 {
+		t.Fatalf("imported = %d, want 1", result.Imported)
+	}
+	got, err := d.Receipts("closed-pr")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 1 || !github.IsTerminalArtifactVerdict(got[0].Source.Verdict()) {
+		t.Fatalf("stored receipts = %+v, want a terminal PR verdict", got)
+	}
+
+	// The receipt carries only the PR locator and state. No agent log path
+	// reaches the store, so the verdict needs no log read.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read receipt file: %v", err)
+	}
+	if strings.Contains(string(data), ".claude") || strings.Contains(string(data), "/jobs/") {
+		t.Errorf("receipt carries a private agent log path: %s", data)
 	}
 }
 
