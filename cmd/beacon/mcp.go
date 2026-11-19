@@ -14,9 +14,15 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/refusedguy/beacon/internal/app/taskcli"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
+
+// The app service writes precheck reasons under the same state directory as
+// the MCP store, so it satisfies mcp.PrecheckJournal without the mcp package
+// importing app (ADR 0005).
+var _ mcp.PrecheckJournal = (*taskcli.Service)(nil)
 
 // mcpStateDBName is the SQLite file inside the Beacon state directory
 // (ADR 0011, ADR 0015).
@@ -197,17 +203,15 @@ func setPrecheckFailureReason(reason string) {
 }
 
 // newMCPWaitResult builds the wait_result service used by the production
-// server. It keeps the SharedCIWait wiring from T3.83 and adds the startup
-// precheck reason from T3.84. An empty reason clears a previous failure, so a
-// run with a configured bypass waits normally.
+// server. It reuses the mcp constructor so the tool replacement at the MCP
+// boundary applies the same setters as NewServerWithDeps (T3.91). Only the
+// startup precheck reason is CLI state: an empty reason clears a previous
+// failure, so a run with a configured bypass waits normally.
 func newMCPWaitResult(deps mcp.Dependencies) *mcp.WaitResultService {
-	svc := mcp.NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock)
-	svc.SetSharedCIWaiter(deps.SharedCIWaiter)
 	precheckFailureMu.Lock()
-	reason := precheckFailureReason
+	deps.PrecheckReason = precheckFailureReason
 	precheckFailureMu.Unlock()
-	svc.SetPrecheckFailure(reason)
-	return svc
+	return mcp.NewWaitResultServiceFromDeps(deps)
 }
 
 // newMCPServer composes the real server and replaces the wait_result tool with
@@ -264,12 +268,27 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 		return mcp.Dependencies{}, nil, err
 	}
 
+	// T3.91: the ports below are the real production implementations. The
+	// app service persists precheck reasons under this state directory, and
+	// the capability registry binds waits to the calling agent from _meta.
+	//
+	// The remaining setters are deliberately left at their real defaults.
+	// CIWait is a no-op until a CI adapter is bound to one Watch; the shared
+	// gate is still wired, so it coalesces callers honestly. The in-memory
+	// idempotency index lives as long as the process, which is the current
+	// store lifetime; a durable one would need the same transaction as the
+	// obligation write and does not exist yet. Only beacon_ack consumes the
+	// continuation counter, so its own counter is sufficient. store.SharedGate
+	// keeps its log.Printf warning sink in production; tests replace it to
+	// capture warnings without touching the global logger (SetWarningSink).
 	deps := mcp.Dependencies{
-		Store:          db,
-		Stamper:        mcp.NewSQLObligationStamper(db),
-		Writer:         mcp.NewSQLWaitResultWriter(db),
-		Events:         mcp.NewSQLCancelEventLog(db),
-		SharedCIWaiter: sharedCIWaiter,
+		Store:           db,
+		Stamper:         mcp.NewSQLObligationStamper(db),
+		Writer:          mcp.NewSQLWaitResultWriter(db),
+		Events:          mcp.NewSQLCancelEventLog(db),
+		SharedCIWaiter:  sharedCIWaiter,
+		PrecheckJournal: taskcli.NewService(taskcli.Config{StateDir: dir}),
+		CallScopes:      mcp.NewCapabilityScopeRegistry(nil, nil),
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
 			watches, err := db.ActiveWatches()
 			if err != nil {

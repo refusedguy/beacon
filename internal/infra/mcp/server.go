@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -191,6 +192,178 @@ type Dependencies struct {
 	// the client's task dialect form. Zero disables the switch. It belongs to
 	// the boundary, never to the domain (ADR 0031 §2).
 	After time.Duration
+
+	// CallScopes binds wait_result calls to the calling agent's capability
+	// context and departure channels, keyed by the opaque sessionID in _meta
+	// (ADR 0040 §1). A nil value keeps the pre-T3.66 context-only behaviour.
+	CallScopes *CapabilityScopeRegistry
+
+	// PrecheckJournal and PrecheckReason carry T3.82's startup failure reason
+	// into wait_result. The composition root builds the journal from app and
+	// passes it here, so this package still imports neither app nor store
+	// (ADR 0005).
+	PrecheckJournal PrecheckJournal
+	PrecheckReason  string
+
+	// CIWait is the expensive operation run through SharedCIWaiter. It stays
+	// nil until a composition root binds one to a concrete Watch; SetCIWait
+	// then restores the honest no-op default instead of inventing a CI poll.
+	CIWait func(context.Context) error
+
+	// WaitResultIdempotency replaces the in-process result index when a
+	// durable one exists. Nil is not passed to the setter: that would disable
+	// idempotency. The in-memory default is a real process-lifetime store.
+	WaitResultIdempotency WaitResultIdempotencyStore
+
+	// Continuations shares ack's answer-round counter when another tool needs
+	// to observe it. Nil keeps the handler's own real counter (ADR 0031 §3).
+	Continuations *ContinuationRegistry
+}
+
+// CapabilityScopeRegistry owns one cancellation scope per calling agent
+// (ADR 0040 §1). The key is the opaque sessionID from the request _meta; the
+// core never interprets it. A scope holds both the CapabilityContext (the task
+// tree) and the three departure channels of CallerExit. The registry lives in
+// this package and is injected by the composition root, so no bridge, app or
+// store import is introduced (ADR 0005).
+//
+// With no registry wired, wait_result derives its departures from the handler
+// context and binds no capability context, which is the original behaviour.
+type CapabilityScopeRegistry struct {
+	mu      sync.Mutex
+	journal CancelJournal
+	clock   domain.Clock
+	scopes  map[CapabilityID]*capabilityScope
+}
+
+type capabilityScope struct {
+	context          *CapabilityContext
+	cancelled        chan struct{}
+	sessionClosed    chan struct{}
+	connectionBroken chan struct{}
+}
+
+// NewCapabilityScopeRegistry builds an empty registry. A nil journal and a nil
+// clock fall back to the in-memory sink and wall clock used by
+// NewCapabilityContext.
+func NewCapabilityScopeRegistry(journal CancelJournal, clock domain.Clock) *CapabilityScopeRegistry {
+	if journal == nil {
+		journal = NewMemoryCancelJournal()
+	}
+	if clock == nil {
+		clock = waitResultWallClock{}
+	}
+	return &CapabilityScopeRegistry{
+		journal: journal,
+		clock:   clock,
+		scopes:  make(map[CapabilityID]*capabilityScope),
+	}
+}
+
+// ScopeFor binds req to the calling agent's capability context. A request
+// without a sessionID stays unbound, so a client that does not identify itself
+// keeps the pre-capability wait.
+func (r *CapabilityScopeRegistry) ScopeFor(req *mcpsdk.CallToolRequest) *CapabilityContext {
+	scope := r.scopeFor(req)
+	if scope == nil {
+		return nil
+	}
+	return scope.context
+}
+
+// DeparturesFor returns the departure channels of the caller's capability
+// scope. The handler context remains an independent select case in wait_result,
+// so installing this provider never removes go-sdk cancellation on a broken
+// connection or a cancelled call.
+func (r *CapabilityScopeRegistry) DeparturesFor(req *mcpsdk.CallToolRequest) CallerExit {
+	scope := r.scopeFor(req)
+	if scope == nil {
+		return CallerExit{}
+	}
+	return CallerExit{
+		Cancelled:        scope.cancelled,
+		SessionClosed:    scope.sessionClosed,
+		ConnectionBroken: scope.connectionBroken,
+	}
+}
+
+func (r *CapabilityScopeRegistry) scopeFor(req *mcpsdk.CallToolRequest) *capabilityScope {
+	if r == nil {
+		return nil
+	}
+	id := SessionIDFromRequest(req)
+	if id == nil || *id == "" {
+		return nil
+	}
+	owner := CapabilityID(*id)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if scope, ok := r.scopes[owner]; ok {
+		return scope
+	}
+	scope := &capabilityScope{
+		context:          NewCapabilityContext(owner, r.journal, r.clock),
+		cancelled:        make(chan struct{}),
+		sessionClosed:    make(chan struct{}),
+		connectionBroken: make(chan struct{}),
+	}
+	r.scopes[owner] = scope
+	return scope
+}
+
+// Depart reports that the agent identified by owner disappeared. It closes the
+// channel named by reason; wait_result's depart case then cancels the whole
+// capability tree and journals the reason. Closing is idempotent, and a
+// departure with no matching scope is ignored. An unknown reason is treated as
+// a plain cancellation.
+func (r *CapabilityScopeRegistry) Depart(owner CapabilityID, reason CancelReason) bool {
+	if r == nil {
+		return false
+	}
+	r.mu.Lock()
+	scope, ok := r.scopes[owner]
+	if !ok {
+		r.mu.Unlock()
+		return false
+	}
+	var ch chan struct{}
+	switch reason {
+	case CancelSessionClosed:
+		ch = scope.sessionClosed
+	case CancelConnectionBroken:
+		ch = scope.connectionBroken
+	default:
+		ch = scope.cancelled
+	}
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+	r.mu.Unlock()
+	return true
+}
+
+// NewWaitResultServiceFromDeps builds the production wait_result service and
+// applies every optional port in one place. NewServerWithDeps and the cmd
+// composition root both use it, so replacing the tool's service at the MCP
+// boundary cannot silently drop a setter again (T3.91).
+func NewWaitResultServiceFromDeps(deps Dependencies) *WaitResultService {
+	svc := NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock)
+	if deps.WaitResultIdempotency != nil {
+		svc.SetIdempotencyStore(deps.WaitResultIdempotency)
+	}
+	if deps.CallScopes != nil {
+		svc.SetDepartureProvider(deps.CallScopes.DeparturesFor)
+		svc.SetCapabilityScope(deps.CallScopes.ScopeFor)
+	}
+	svc.SetCIWait(deps.CIWait)
+	svc.SetSharedCIWaiter(deps.SharedCIWaiter)
+	if deps.PrecheckJournal != nil {
+		svc.SetPrecheckJournal(deps.PrecheckJournal)
+	}
+	svc.SetPrecheckFailure(deps.PrecheckReason)
+	return svc
 }
 
 // NewServer builds the Beacon MCP server with all seven real tools registered
@@ -236,14 +409,16 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	}
 
 	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
-	waitResult := NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock)
-	waitResult.SetSharedCIWaiter(deps.SharedCIWaiter)
-	AttachWaitResult(s, waitResult)
+	AttachWaitResult(s, NewWaitResultServiceFromDeps(deps))
 	getResult := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
 	getResult.SetAfter(deps.After)
 	AttachGetResult(s, getResult)
 	attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"])
-	AttachAck(s, NewAckHandler(deps.Store, deps.Stamper, deps.Clock))
+	ack := NewAckHandler(deps.Store, deps.Stamper, deps.Clock)
+	if deps.Continuations != nil {
+		ack.SetContinuationRegistry(deps.Continuations)
+	}
+	AttachAck(s, ack)
 	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
 	attachStats(s, deps.Snapshot, schemas["beacon_stats"])
 	return s

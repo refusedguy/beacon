@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -602,4 +603,385 @@ func TestNewServerWithDepsWiresSharedCIWaiter(t *testing.T) {
 	if want := "ci:org/repo/7/abc123"; gotKey != want {
 		t.Fatalf("shared CI gate key = %q, want %q", gotKey, want)
 	}
+}
+
+// --- T3.91: production wiring of the setters ---
+//
+// Every test below drives a tool through tools/call on a server built by
+// NewServerWithDeps. Calling a setter directly would only prove that the
+// setter works, not that the production path reaches it.
+
+// recordingPrecheckJournal stands in for the app service that persists
+// precheck reasons. Its signature is the PrecheckJournal port.
+type recordingPrecheckJournal struct {
+	mu      sync.Mutex
+	records []PrecheckFailureRecord
+}
+
+func (j *recordingPrecheckJournal) RecordPrecheckFailure(reason string, at time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.records = append(j.records, PrecheckFailureRecord{
+		Outcome: PrecheckFailureOutcome, Reason: reason, At: at,
+	})
+	return nil
+}
+
+func (j *recordingPrecheckJournal) Records() []PrecheckFailureRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]PrecheckFailureRecord(nil), j.records...)
+}
+
+// countingIdempotency wraps the real in-memory index so a test can see that
+// tools/call used the index injected through Dependencies.
+type countingIdempotency struct {
+	inner   WaitResultIdempotencyStore
+	lookups atomic.Int32
+	records atomic.Int32
+}
+
+func (c *countingIdempotency) Lookup(id string) (WaitResultOutput, bool) {
+	c.lookups.Add(1)
+	return c.inner.Lookup(id)
+}
+
+func (c *countingIdempotency) Record(id string, out WaitResultOutput) {
+	c.records.Add(1)
+	c.inner.Record(id, out)
+}
+
+// countingWriter wraps the SQL writer so a repeated tools/call can prove that
+// only the first one marked the obligation read.
+type countingWriter struct {
+	inner WaitResultWriter
+	calls atomic.Int32
+}
+
+func (w *countingWriter) MarkRead(ctx context.Context, id string, at time.Time) error {
+	w.calls.Add(1)
+	return w.inner.MarkRead(ctx, id, at)
+}
+
+func waitingWatchFixture(t *testing.T, id string) domain.Watch {
+	t.Helper()
+	w := domain.Watch{
+		ID:        id,
+		Repo:      "org/repo",
+		PR:        7,
+		HeadSHA:   "abc",
+		Status:    domain.StatusWatching,
+		Verdict:   domain.VerdictWatching,
+		Revision:  7,
+		CreatedAt: time.Now().UTC(),
+	}
+	return w
+}
+
+// TestToolsCallJournalsPrecheckFailure proves T3.82 in production: a server
+// built by NewServerWithDeps returns the startup reason from tools/call and
+// writes the same reason to the journal injected by the composition root.
+func TestToolsCallJournalsPrecheckFailure(t *testing.T) {
+	const reason = "bypass mode не настроен для init event"
+	journal := &recordingPrecheckJournal{}
+	deps := Dependencies{PrecheckJournal: journal, PrecheckReason: reason}
+	session := connectTestSession(t, deps)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_wait_result",
+		Arguments: WaitResultInput{WatchID: "precheck-watch"},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_wait_result: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("beacon_wait_result returned isError: %v", result.Content)
+	}
+	out := decodeStructured[WaitResultOutput](t, result)
+	if out.Status != PrecheckFailureOutcome || out.Verdict != PrecheckFailureOutcome {
+		t.Fatalf("status/verdict = %q/%q, want %q", out.Status, out.Verdict, PrecheckFailureOutcome)
+	}
+	check, ok := out.Checks[precheckCheckName]
+	if !ok || check.Conclusion != reason {
+		t.Fatalf("precheck check = %+v, want reason %q", check, reason)
+	}
+	records := journal.Records()
+	if len(records) != 1 || records[0].Reason != reason || records[0].Outcome != PrecheckFailureOutcome {
+		t.Fatalf("journal = %+v, want one record with reason %q", records, reason)
+	}
+}
+
+// TestToolsCallUsesCapabilityScopeAndDepartures proves T3.66 in production:
+// the registry injected through Dependencies binds a tools/call to the caller
+// from _meta. A departure closes the bound channel and tears down the tree;
+// wait_result journals the reason through the bound capability context.
+func TestToolsCallUsesCapabilityScopeAndDepartures(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	w := waitingWatchFixture(t, "watch-scope")
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	journal := NewMemoryCancelJournal()
+	registry := NewCapabilityScopeRegistry(journal, waitTestClock{at: time.Now().UTC()})
+	boundRequest := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Meta: mcpsdk.Meta{sessionIDMetaKey: "scope-session"},
+	}}
+	scope := registry.ScopeFor(boundRequest)
+	if scope == nil {
+		t.Fatal("capability scope was not created from the _meta sessionID")
+	}
+	if err := scope.AddTask(w.ID, ""); err != nil {
+		t.Fatalf("AddTask: %v", err)
+	}
+	if !registry.Depart(CapabilityID("scope-session"), CancelCallerCancelled) {
+		t.Fatal("Depart did not find the bound scope")
+	}
+
+	deps := Dependencies{
+		Store:      db,
+		Writer:     NewSQLWaitResultWriter(db),
+		Source:     &waitTestSource{},
+		CallScopes: registry,
+	}
+	session := connectTestSession(t, deps)
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_wait_result",
+		Arguments: WaitResultInput{WatchID: w.ID, TimeoutMs: int64Ptr(200)},
+		Meta:      mcpsdk.Meta{sessionIDMetaKey: "scope-session"},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_wait_result: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("departed wait did not fail: %+v", result.StructuredContent)
+	}
+	body, err := json.Marshal(result.Content)
+	if err != nil {
+		t.Fatalf("marshal error content: %v", err)
+	}
+	if !strings.Contains(string(body), "caller cancelled") {
+		t.Fatalf("departure error = %s, want the caller-cancelled reason", body)
+	}
+	if !scope.IsCancelled() {
+		t.Fatal("departure did not cancel the capability context")
+	}
+	tasks := scope.CancelledTasks()
+	if len(tasks) != 1 || tasks[0].TaskID != w.ID || tasks[0].Reason != CancelCallerCancelled {
+		t.Fatalf("cancelled tasks = %+v, want one task with reason %q", tasks, CancelCallerCancelled)
+	}
+	records := journal.Records()
+	if len(records) != 1 || records[0].TaskID != w.ID || records[0].Reason != CancelCallerCancelled {
+		t.Fatalf("cancel journal = %+v, want one record for %q", records, w.ID)
+	}
+}
+
+// TestToolsCallUsesInjectedCIWaitAndIdempotency drives both ports through
+// tools/call: the expensive operation must run inside the shared gate, and a
+// repeat with the same clientRequestId must reuse the injected result index
+// without a second operation or obligation write.
+func TestToolsCallUsesInjectedCIWaitAndIdempotency(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	w := waitingWatchFixture(t, "watch-ci")
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := db.SaveObligation(resultObligation(w, "ci-session")); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	source := &waitTestSource{}
+	source.publish(WaitVerdictUpdate{
+		WatchID: w.ID, Status: domain.StatusNotifying, Verdict: domain.VerdictReady,
+		Revision: w.Revision, Checks: w.Checks, At: time.Now().UTC(),
+	})
+
+	var gateCalls atomic.Int32
+	var gateKey string
+	gate := func(ctx context.Context, key string, fn func(context.Context) error) error {
+		gateCalls.Add(1)
+		gateKey = key
+		return fn(ctx)
+	}
+	var ciCalls atomic.Int32
+	writer := &countingWriter{inner: NewSQLWaitResultWriter(db)}
+	index := &countingIdempotency{inner: NewMemoryWaitResultIdempotency()}
+	deps := Dependencies{
+		Store:                 db,
+		Writer:                writer,
+		Source:                source,
+		SharedCIWaiter:        gate,
+		CIWait:                func(context.Context) error { ciCalls.Add(1); return nil },
+		WaitResultIdempotency: index,
+	}
+	session := connectTestSession(t, deps)
+
+	call := func() WaitResultOutput {
+		t.Helper()
+		result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+			Name:      "beacon_wait_result",
+			Arguments: WaitResultInput{WatchID: w.ID, ClientRequestID: "req-ci"},
+			Meta:      mcpsdk.Meta{sessionIDMetaKey: "ci-session"},
+		})
+		if err != nil {
+			t.Fatalf("tools/call beacon_wait_result: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("beacon_wait_result returned isError: %v", result.Content)
+		}
+		return decodeStructured[WaitResultOutput](t, result)
+	}
+
+	first, second := call(), call()
+	if first.Verdict != string(domain.VerdictReady) || second.Verdict != string(domain.VerdictReady) {
+		t.Fatalf("verdicts = %q/%q, want ready", first.Verdict, second.Verdict)
+	}
+	if got := gateCalls.Load(); got != 1 {
+		t.Fatalf("shared CI gate called %d times, want 1", got)
+	}
+	if want := "ci:org/repo/7/abc"; gateKey != want {
+		t.Fatalf("gate key = %q, want %q", gateKey, want)
+	}
+	if got := ciCalls.Load(); got != 1 {
+		t.Fatalf("CI wait operation called %d times, want 1", got)
+	}
+	if got := writer.calls.Load(); got != 1 {
+		t.Fatalf("obligation written %d times, want 1", got)
+	}
+	if got := index.records.Load(); got != 1 {
+		t.Fatalf("idempotency index recorded %d results, want 1", got)
+	}
+	if got := index.lookups.Load(); got != 2 {
+		t.Fatalf("idempotency index looked up %d times, want 2", got)
+	}
+}
+
+// TestToolsCallAckUsesInjectedContinuationRegistry proves the round counter
+// injected into the composition root is the one beacon_ack consumes: a
+// pre-filled registry refuses the answer through tools/call.
+func TestToolsCallAckUsesInjectedContinuationRegistry(t *testing.T) {
+	w := parkedAckWatch()
+	o := resultObligation(w, "session-answer")
+	mem := newMemStore()
+	if err := mem.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := mem.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	registry := NewContinuationRegistry()
+	for i := uint64(0); i < domain.MaxContinueRounds; i++ {
+		if _, err := registry.Next(w.ID); err != nil {
+			t.Fatalf("seed round %d: %v", i, err)
+		}
+	}
+	deps := Dependencies{Store: mem, Stamper: stamper, Continuations: registry}
+	session := connectTestSession(t, deps)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_ack",
+		Arguments: AckInput{WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_ack: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("answer past the round cap was accepted: %+v", result.StructuredContent)
+	}
+	if got := registry.Rounds(w.ID); got != domain.MaxContinueRounds {
+		t.Fatalf("rounds = %d, want %d", got, domain.MaxContinueRounds)
+	}
+	parked, err := mem.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch after refused answer: %v", err)
+	}
+	if parked.Status != domain.StatusNeedsInput {
+		t.Fatalf("refused answer changed the Watch status to %q", parked.Status)
+	}
+}
+
+// TestToolsCallOptionalPortsKeepRealDefaults is the invariant behind the
+// setters that production deliberately does not call. With no injected idempotency
+// store or continuation registry, tools/call still uses the real in-memory
+// index and the handler's own round counter. CIWait stays a no-op until a CI
+// adapter is bound; the shared gate is wired independently (T3.83).
+func TestToolsCallOptionalPortsKeepRealDefaults(t *testing.T) {
+	t.Run("idempotency", func(t *testing.T) {
+		db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatalf("open store: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+
+		w := waitingWatchFixture(t, "watch-default")
+		if err := db.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch: %v", err)
+		}
+		if err := db.SaveObligation(resultObligation(w, "default-session")); err != nil {
+			t.Fatalf("SaveObligation: %v", err)
+		}
+		source := &waitTestSource{}
+		source.publish(WaitVerdictUpdate{
+			WatchID: w.ID, Status: domain.StatusNotifying, Verdict: domain.VerdictReady,
+			Revision: w.Revision, Checks: w.Checks, At: time.Now().UTC(),
+		})
+		writer := &countingWriter{inner: NewSQLWaitResultWriter(db)}
+		session := connectTestSession(t, Dependencies{Store: db, Writer: writer, Source: source})
+		for i := 0; i < 2; i++ {
+			result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+				Name:      "beacon_wait_result",
+				Arguments: WaitResultInput{WatchID: w.ID, ClientRequestID: "req-default"},
+				Meta:      mcpsdk.Meta{sessionIDMetaKey: "default-session"},
+			})
+			if err != nil {
+				t.Fatalf("tools/call beacon_wait_result: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("beacon_wait_result returned isError: %v", result.Content)
+			}
+		}
+		if got := writer.calls.Load(); got != 1 {
+			t.Fatalf("default idempotency wrote the obligation %d times, want 1", got)
+		}
+	})
+
+	t.Run("continuations", func(t *testing.T) {
+		w := parkedAckWatch()
+		o := resultObligation(w, "session-default")
+		mem := newMemStore()
+		if err := mem.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch: %v", err)
+		}
+		if err := mem.SaveObligation(o); err != nil {
+			t.Fatalf("SaveObligation: %v", err)
+		}
+		stamper := newRecordingStamper()
+		stamper.add(o)
+		session := connectTestSession(t, Dependencies{Store: mem, Stamper: stamper})
+		result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+			Name:      "beacon_ack",
+			Arguments: AckInput{WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID},
+		})
+		if err != nil {
+			t.Fatalf("tools/call beacon_ack: %v", err)
+		}
+		if result.IsError {
+			t.Fatalf("default continuation registry refused the first answer: %v", result.Content)
+		}
+		out := decodeStructured[OKOutput](t, result)
+		if !out.OK {
+			t.Fatal("default continuation registry did not acknowledge the answer")
+		}
+	})
 }
