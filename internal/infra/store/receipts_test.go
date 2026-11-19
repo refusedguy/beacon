@@ -895,3 +895,269 @@ func TestImportReceiptsRejectsNonBoolVerified(t *testing.T) {
 		t.Errorf("receipt count = %d, want 0", count)
 	}
 }
+
+// ADR 0049 §3. The fence token, the enqueued task and the task data change
+// commit together. The helpers below build the three parts of one write.
+
+func mustParseReceipt(t *testing.T, line string) (Receipt, []byte) {
+	t.Helper()
+	raw := []byte(line)
+	var r Receipt
+	if err := json.Unmarshal(raw, &r); err != nil {
+		t.Fatalf("parse receipt: %v", err)
+	}
+	return r, raw
+}
+
+func fencedMessage(peer, suffix string) InboxMessage {
+	return InboxMessage{
+		WatchID:      "watch-" + suffix,
+		Revision:     1,
+		SubscriberID: "sub-" + suffix,
+		PeerName:     peer,
+		Payload:      []byte("work-" + suffix),
+	}
+}
+
+func corruptReceiptObligation(t *testing.T, d *DB, id string) {
+	t.Helper()
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			INSERT OR IGNORE INTO obligations
+			  (id, watch_id, revision, subscriber_id, verdict_pointer, delivered_at, payload)
+			VALUES (?, ?, ?, ?, ?, 0, ?)`,
+			id, "watch-"+id, 1, "sub-"+id, string(domain.VerdictReady), []byte("not json"))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("corrupt obligation: %v", err)
+	}
+}
+
+func TestEnqueueFencedCommitsTokenDataAndQueueTogether(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "fenced-ok")
+
+	r, raw := mustParseReceipt(t, receiptLine("fenced-ok", 1, "posted"))
+	got, err := d.EnqueueFenced(FencedEnqueue{
+		TaskID: "task-ok", OwnerID: "worker-a", FencingToken: 5,
+		Receipt: r, Raw: raw, Message: fencedMessage("worker-a", "ok"),
+	})
+	if err != nil {
+		t.Fatalf("EnqueueFenced: %v", err)
+	}
+	if got.FencingToken != 5 || !got.Enqueued || !got.Applied {
+		t.Fatalf("result = %+v, want token 5, enqueued and applied", got)
+	}
+	token, ok, err := d.TaskFence("task-ok")
+	if err != nil || !ok || token != 5 {
+		t.Fatalf("TaskFence = %d, %v, %v; want 5, true", token, ok, err)
+	}
+	o, err := d.Obligation("fenced-ok")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if o.DeliveredAt.IsZero() || len(o.Attempts) != 1 {
+		t.Fatalf("obligation did not change: %+v", o)
+	}
+	receipts, err := d.Receipts("fenced-ok")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("stored receipts = %d, want 1", len(receipts))
+	}
+	queued, err := d.InboxMessages("worker-a")
+	if err != nil {
+		t.Fatalf("InboxMessages: %v", err)
+	}
+	if len(queued) != 1 || string(queued[0].Payload) != "work-ok" {
+		t.Fatalf("queued = %+v, want one message work-ok", queued)
+	}
+}
+
+func TestEnqueueFencedStaleTokenRefusesWholeWrite(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "fenced-stale")
+
+	first, raw1 := mustParseReceipt(t, receiptLine("fenced-stale", 1, "posted"))
+	if _, err := d.EnqueueFenced(FencedEnqueue{
+		TaskID: "task-stale", OwnerID: "worker-old", FencingToken: 10,
+		Receipt: first, Raw: raw1, Message: fencedMessage("worker-old", "stale-1"),
+	}); err != nil {
+		t.Fatalf("first EnqueueFenced: %v", err)
+	}
+
+	later, raw2 := mustParseReceipt(t, receiptLine("fenced-stale", 2, "posted"))
+	_, err := d.EnqueueFenced(FencedEnqueue{
+		TaskID: "task-stale", OwnerID: "worker-late", FencingToken: 4,
+		Receipt: later, Raw: raw2, Message: fencedMessage("worker-late", "stale-2"),
+	})
+	if !IsStaleFenceToken(err) {
+		t.Fatalf("EnqueueFenced error = %v, want stale token", err)
+	}
+	token, ok, err := d.TaskFence("task-stale")
+	if err != nil || !ok || token != 10 {
+		t.Fatalf("TaskFence after stale = %d, %v, %v; want 10", token, ok, err)
+	}
+	o, err := d.Obligation("fenced-stale")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if len(o.Attempts) != 1 {
+		t.Fatalf("attempts after stale = %d, want 1", len(o.Attempts))
+	}
+	receipts, err := d.Receipts("fenced-stale")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipts after stale = %d, want 1", len(receipts))
+	}
+	late, err := d.InboxMessages("worker-late")
+	if err != nil {
+		t.Fatalf("InboxMessages(late): %v", err)
+	}
+	if len(late) != 0 {
+		t.Fatalf("late worker enqueued %d messages, want 0", len(late))
+	}
+}
+
+func TestEnqueueFencedRollbackLeavesNoPartialState(t *testing.T) {
+	d := newReceiptDB(t)
+	corruptReceiptObligation(t, d, "fenced-corrupt")
+
+	r, raw := mustParseReceipt(t, receiptLine("fenced-corrupt", 1, "posted"))
+	_, err := d.EnqueueFenced(FencedEnqueue{
+		TaskID: "task-corrupt", OwnerID: "worker-a", FencingToken: 6,
+		Receipt: r, Raw: raw, Message: fencedMessage("worker-a", "corrupt"),
+	})
+	if err == nil {
+		t.Fatal("EnqueueFenced with corrupt obligation succeeded, want failure")
+	}
+	if _, ok, _ := d.TaskFence("task-corrupt"); ok {
+		t.Error("fence row survived a failed enqueue")
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("receipt count = %d after failed enqueue, want 0", count)
+	}
+	queued, err := d.InboxMessages("worker-a")
+	if err != nil {
+		t.Fatalf("InboxMessages: %v", err)
+	}
+	if len(queued) != 0 {
+		t.Errorf("queue rows = %d after failed enqueue, want 0", len(queued))
+	}
+}
+
+func TestEnqueueFencedSameTokenIsIdempotent(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "fenced-same")
+
+	r, raw := mustParseReceipt(t, receiptLine("fenced-same", 1, "posted"))
+	in := FencedEnqueue{
+		TaskID: "task-same", OwnerID: "worker-a", FencingToken: 7,
+		Receipt: r, Raw: raw, Message: fencedMessage("worker-a", "same"),
+	}
+	first, err := d.EnqueueFenced(in)
+	if err != nil {
+		t.Fatalf("first EnqueueFenced: %v", err)
+	}
+	if !first.Enqueued || !first.Applied {
+		t.Fatalf("first result = %+v, want enqueued and applied", first)
+	}
+	second, err := d.EnqueueFenced(in)
+	if err != nil {
+		t.Fatalf("second EnqueueFenced: %v", err)
+	}
+	if second.FencingToken != 7 || second.Enqueued || second.Applied {
+		t.Fatalf("second result = %+v, want token 7, no new enqueue or apply", second)
+	}
+	receipts, err := d.Receipts("fenced-same")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(receipts) != 1 {
+		t.Fatalf("receipts = %d, want 1", len(receipts))
+	}
+	queued, err := d.InboxMessages("worker-a")
+	if err != nil {
+		t.Fatalf("InboxMessages: %v", err)
+	}
+	if len(queued) != 1 {
+		t.Fatalf("queue rows = %d, want 1", len(queued))
+	}
+}
+
+func TestEnqueueFencedHigherTokenSupersedes(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "fenced-higher")
+
+	r1, raw1 := mustParseReceipt(t, receiptLine("fenced-higher", 1, "posted"))
+	if _, err := d.EnqueueFenced(FencedEnqueue{
+		TaskID: "task-higher", OwnerID: "worker-a", FencingToken: 3,
+		Receipt: r1, Raw: raw1, Message: fencedMessage("worker-a", "higher-1"),
+	}); err != nil {
+		t.Fatalf("first EnqueueFenced: %v", err)
+	}
+
+	r2, raw2 := mustParseReceipt(t, receiptLine("fenced-higher", 2, "transport-failed"))
+	got, err := d.EnqueueFenced(FencedEnqueue{
+		TaskID: "task-higher", OwnerID: "worker-b", FencingToken: 9,
+		Receipt: r2, Raw: raw2, Message: fencedMessage("worker-b", "higher-2"),
+	})
+	if err != nil {
+		t.Fatalf("second EnqueueFenced: %v", err)
+	}
+	if got.FencingToken != 9 || !got.Enqueued || !got.Applied {
+		t.Fatalf("second result = %+v, want token 9, enqueued and applied", got)
+	}
+	token, ok, err := d.TaskFence("task-higher")
+	if err != nil || !ok || token != 9 {
+		t.Fatalf("TaskFence = %d, %v, %v; want 9", token, ok, err)
+	}
+	o, err := d.Obligation("fenced-higher")
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if len(o.Attempts) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(o.Attempts))
+	}
+	receipts, err := d.Receipts("fenced-higher")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(receipts) != 2 {
+		t.Fatalf("receipts = %d, want 2", len(receipts))
+	}
+}
+
+func TestEnqueueFencedRejectsInvalidInput(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "fenced-input")
+	r, raw := mustParseReceipt(t, receiptLine("fenced-input", 1, "posted"))
+	msg := fencedMessage("worker-a", "input")
+
+	bad := []FencedEnqueue{
+		{TaskID: "", OwnerID: "a", FencingToken: 1, Receipt: r, Raw: raw, Message: msg},
+		{TaskID: "t", OwnerID: "", FencingToken: 1, Receipt: r, Raw: raw, Message: msg},
+		{TaskID: "t", OwnerID: "a", FencingToken: 0, Receipt: r, Raw: raw, Message: msg},
+		{TaskID: "t", OwnerID: "a", FencingToken: 1, Receipt: r, Raw: raw, Message: InboxMessage{}},
+	}
+	for i, in := range bad {
+		if _, err := d.EnqueueFenced(in); err == nil {
+			t.Errorf("case %d: EnqueueFenced succeeded, want validation error", i)
+		}
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("receipt count = %d, want 0 after rejected inputs", count)
+	}
+}
