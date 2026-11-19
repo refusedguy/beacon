@@ -33,6 +33,7 @@ func readySnapshot() Snapshot {
 			"ci-build": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true},
 		},
 		SuitesValid: true,
+		Ship:        ShipFacts{Build: true, Audit: true, TDD: true},
 	}
 }
 
@@ -674,6 +675,59 @@ func TestShipAllowedHasNoConfigurationInput(t *testing.T) {
 	for i := 0; i < facts.NumField(); i++ {
 		if facts.Field(i).Type != boolType {
 			t.Errorf("ShipFacts.%s = %v, want bool", facts.Field(i).Name, facts.Field(i).Type)
+		}
+	}
+}
+
+// TestEvaluateRunsShipFormula proves the compiled-in formula is on the live
+// path to the ready verdict, not dead code. Every case starts from a snapshot
+// that satisfies all other row-7 conditions and changes only the ship facts.
+// If the ShipAllowed call is removed from Evaluate, every "not allowed" case
+// below turns ready and this test fails.
+func TestEvaluateRunsShipFormula(t *testing.T) {
+	cases := []struct {
+		name string
+		ship ShipFacts
+		want Verdict
+	}{
+		{"build audit tdd is ready", ShipFacts{Build: true, Audit: true, TDD: true}, VerdictReady},
+		{"build audit trivial is ready", ShipFacts{Build: true, Audit: true, Trivial: true}, VerdictReady},
+		{"all facts are ready", ShipFacts{Build: true, Audit: true, TDD: true, Trivial: true}, VerdictReady},
+		{"missing build blocks ready", ShipFacts{Audit: true, TDD: true}, VerdictWatching},
+		{"missing audit blocks ready", ShipFacts{Build: true, TDD: true}, VerdictWatching},
+		{"no alternative blocks ready", ShipFacts{Build: true, Audit: true}, VerdictWatching},
+		{"trivial cannot replace build", ShipFacts{Audit: true, Trivial: true}, VerdictWatching},
+		{"trivial cannot replace audit", ShipFacts{Build: true, Trivial: true}, VerdictWatching},
+		{"no facts block ready", ShipFacts{}, VerdictWatching},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := readySnapshot()
+			s.Ship = tc.ship
+			got, wake := Evaluate(s, Policy{})
+			if got != tc.want {
+				t.Fatalf("Evaluate with ship facts %+v = %q, want %q", tc.ship, got, tc.want)
+			}
+			if tc.want == VerdictWatching && wake != nil {
+				t.Fatalf("a blocked ship must watch silently, got wake %#v", wake)
+			}
+		})
+	}
+}
+
+// Evaluate stays pure with ship facts on the snapshot: repeated calls over the
+// same input give the same verdict and wake targets, and never mutate them.
+func TestEvaluateShipFactsDeterministic(t *testing.T) {
+	s := readySnapshot()
+	s.Ship = ShipFacts{Build: true, Audit: true, TDD: true}
+	want, wantWake := Evaluate(s, Policy{})
+	if want != VerdictReady {
+		t.Fatalf("verdict = %q, want ready", want)
+	}
+	for i := 0; i < 10; i++ {
+		got, wake := Evaluate(s, Policy{})
+		if got != want || !reflect.DeepEqual(wake, wantWake) {
+			t.Fatalf("call %d = (%q, %#v), want (%q, %#v)", i, got, wake, want, wantWake)
 		}
 	}
 }
