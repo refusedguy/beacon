@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -1077,4 +1078,327 @@ func TestWakeCapabilityOverInMemoryTransport(t *testing.T) {
 	if sender.lastTarget != "review-session" {
 		t.Errorf("sender target=%q, want review-session", sender.lastTarget)
 	}
+}
+
+// fallbackAttempt records one channel attempt of the ADR 0038 p6 chain. The
+// channel is the hint the core asked for; the delivery is what the adapter
+// reports actually happened.
+type fallbackAttempt struct {
+	channel WakeChannel
+	target  string
+	text    string
+	source  WakeSource
+}
+
+// channelResult is the canned answer of fakeFallbackSender for one channel.
+type channelResult struct {
+	delivery Delivery
+	reason   string
+}
+
+// fakeFallbackSender answers each channel from a map and records the order in
+// which the core tried them.
+type fakeFallbackSender struct {
+	results  map[WakeChannel]channelResult
+	attempts []fallbackAttempt
+}
+
+func (f *fakeFallbackSender) Deliver(_ context.Context, target, text string, source WakeSource, channel WakeChannel) (Delivery, string) {
+	f.attempts = append(f.attempts, fallbackAttempt{channel: channel, target: target, text: text, source: source})
+	if result, ok := f.results[channel]; ok {
+		return result.delivery, result.reason
+	}
+	return DeliveryUnsupported, ""
+}
+
+// fakeConfirmer reports confirmation per channel and records the order in
+// which channels were checked.
+type fakeConfirmer struct {
+	confirmed map[WakeChannel]bool
+	calls     []WakeChannel
+}
+
+func (f *fakeConfirmer) Confirmed(_ context.Context, _ string, _ string, channel WakeChannel) bool {
+	f.calls = append(f.calls, channel)
+	return f.confirmed[channel]
+}
+
+// fakeTracer records the last-resort task trace write of the fallback chain.
+type fakeTracer struct {
+	calls      int
+	lastTarget string
+	lastText   string
+	lastSource WakeSource
+	err        error
+}
+
+func (f *fakeTracer) Trace(_ context.Context, target, text string, source WakeSource) error {
+	f.calls++
+	f.lastTarget = target
+	f.lastText = text
+	f.lastSource = source
+	return f.err
+}
+
+// TestWakeFallbackConfirmedSteerStops is the first rung of the ADR 0038 p6
+// chain: a confirmed delivery into the running turn wins and no further
+// channel is touched.
+func TestWakeFallbackConfirmedSteerStops(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true, ChannelQueue: true}}
+	tracer := &fakeTracer{}
+
+	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7"})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliverySteer || !out.OK || out.Fallback != FallbackSteer {
+		t.Errorf("got delivery=%q ok=%v fallback=%q, want steer/true/steer", out.Delivery, out.OK, out.Fallback)
+	}
+	if out.Traced {
+		t.Error("traced = true on a confirmed steer delivery, want false")
+	}
+	if len(sender.attempts) != 1 || sender.attempts[0].channel != ChannelSteer {
+		t.Errorf("attempts = %+v, want only steer", sender.attempts)
+	}
+	if tracer.calls != 0 {
+		t.Errorf("tracer calls = %d, want 0 when a channel was confirmed", tracer.calls)
+	}
+}
+
+// TestWakeFallbackUnconfirmedSteerGoesToNextTurn is the T3.58 acceptance core:
+// an unconfirmed running-turn delivery falls through to the next turn, and the
+// honest delivery becomes queue when that channel is confirmed.
+func TestWakeFallbackUnconfirmedSteerGoesToNextTurn(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelQueue: true}}
+	tracer := &fakeTracer{}
+
+	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7"})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryQueue || !out.OK || out.Fallback != FallbackQueue {
+		t.Errorf("got delivery=%q ok=%v fallback=%q, want queue/true/queue", out.Delivery, out.OK, out.Fallback)
+	}
+	if got := channelsOf(sender.attempts); len(got) != 2 || got[0] != ChannelSteer || got[1] != ChannelQueue {
+		t.Errorf("attempt channels = %v, want [steer queue]", got)
+	}
+	if got := confirmer.calls; len(got) != 2 || got[0] != ChannelSteer || got[1] != ChannelQueue {
+		t.Errorf("confirm check order = %v, want [steer queue]", got)
+	}
+	if tracer.calls != 0 {
+		t.Errorf("tracer calls = %d, want 0 when queue was confirmed", tracer.calls)
+	}
+}
+
+// TestWakeFallbackExhaustedGoesToTaskTrace proves the last rung: with no
+// confirmation anywhere the message is written to the task trace, and the
+// honest delivery stays unsupported with OK=false.
+func TestWakeFallbackExhaustedGoesToTaskTrace(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{}}
+	tracer := &fakeTracer{}
+
+	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7", Source: SourceReview})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK {
+		t.Errorf("delivery=%q ok=%v, want unsupported/false on the trace path", out.Delivery, out.OK)
+	}
+	if out.Fallback != FallbackTraced || !out.Traced {
+		t.Errorf("fallback=%q traced=%v, want traced/true", out.Fallback, out.Traced)
+	}
+	if out.Source != SourceReview || out.Reason == "" {
+		t.Errorf("source=%q reason=%q, want review and a trace explanation", out.Source, out.Reason)
+	}
+	if !strings.Contains(out.Reason, "task trace") {
+		t.Errorf("reason=%q, want it to name the task trace", out.Reason)
+	}
+	if tracer.calls != 1 || tracer.lastTarget != "session-1" || tracer.lastText != "obligation-1@7" || tracer.lastSource != SourceReview {
+		t.Errorf("tracer got calls=%d target=%q text=%q source=%q", tracer.calls, tracer.lastTarget, tracer.lastText, tracer.lastSource)
+	}
+}
+
+// TestWakeFallbackUnsupportedIsNotSuccess keeps ADR 0026 honest under fallback:
+// a chain that never reaches a supported channel must still answer unsupported,
+// and the task trace must not be counted as a delivery.
+func TestWakeFallbackUnsupportedIsNotSuccess(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliveryUnsupported, reason: "no running turn"},
+		ChannelQueue: {delivery: DeliveryUnsupported, reason: "no queue channel"},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true, ChannelQueue: true}}
+	tracer := &fakeTracer{}
+
+	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "s", Text: "p"})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK || !out.Traced {
+		t.Errorf("delivery=%q ok=%v traced=%v, want unsupported/false/true", out.Delivery, out.OK, out.Traced)
+	}
+	for _, part := range []string{"no running turn", "no queue channel"} {
+		if !strings.Contains(out.Reason, part) {
+			t.Errorf("reason=%q, want it to keep %q", out.Reason, part)
+		}
+	}
+	if len(confirmer.calls) != 0 {
+		t.Errorf("confirm checks = %v, want none for unsupported channels", confirmer.calls)
+	}
+}
+
+// TestWakeFallbackWithoutConfirmerIsTraced keeps silence honest: without a
+// confirmer there is no receipt, so both channels are attempted and the
+// message ends in the task trace rather than being reported as delivered.
+func TestWakeFallbackWithoutConfirmerIsTraced(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	tracer := &fakeTracer{}
+
+	out, err := NewFallbackWakeHandler(sender, nil, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "s", Text: "p"})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK || !out.Traced {
+		t.Errorf("delivery=%q ok=%v traced=%v, want unsupported/false/true", out.Delivery, out.OK, out.Traced)
+	}
+}
+
+// TestWakeFallbackTracerFailureIsHonest proves a failed trace write is not
+// mistaken for a recorded follow-up: Traced stays false and the reason names
+// the failure.
+func TestWakeFallbackTracerFailureIsHonest(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	tracer := &fakeTracer{err: errors.New("store unavailable")}
+
+	out, err := NewFallbackWakeHandler(sender, &fakeConfirmer{}, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "s", Text: "p"})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK || out.Traced {
+		t.Errorf("delivery=%q ok=%v traced=%v, want unsupported/false/false", out.Delivery, out.OK, out.Traced)
+	}
+	if !strings.Contains(out.Reason, "store unavailable") {
+		t.Errorf("reason=%q, want it to name the trace failure", out.Reason)
+	}
+}
+
+// TestWakeFallbackKeepsHumanFlagsFirst guards T2.24: a pending question or
+// approval interrupts before any channel attempt or trace write.
+func TestWakeFallbackKeepsHumanFlagsFirst(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true, ChannelQueue: true}}
+	tracer := &fakeTracer{}
+
+	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+		context.Background(), WakeInput{Target: "s", Text: "p", HasPendingQuestion: true})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if !out.Interrupted || out.Delivery != DeliveryInterrupted || out.OK {
+		t.Errorf("got interrupted=%v delivery=%q ok=%v, want true/%q/false", out.Interrupted, out.Delivery, out.OK, DeliveryInterrupted)
+	}
+	if len(sender.attempts) != 0 || len(confirmer.calls) != 0 || tracer.calls != 0 {
+		t.Errorf("attempts=%v confirm=%v traces=%d, want 0/0/0 on interruption", sender.attempts, confirmer.calls, tracer.calls)
+	}
+}
+
+// TestWakeFallbackKeepsCapabilitySelection guards T3.47: the capability
+// directory still picks the target, and the chosen session is the one the
+// fallback chain delivers to.
+func TestWakeFallbackKeepsCapabilitySelection(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
+	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
+		{Target: "chat-session", Capabilities: []Capability{"chat"}},
+		{Target: "review-session", Capabilities: []Capability{"review"}},
+	}}
+	handler := NewCapabilityFallbackWakeHandler(sender, confirmer, &fakeTracer{}, directory)
+
+	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
+		Text:                 "p",
+		RequiredCapabilities: []Capability{"review"},
+	})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if !out.OK || out.Delivery != DeliverySteer {
+		t.Errorf("delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
+	}
+	if len(sender.attempts) != 1 || sender.attempts[0].target != "review-session" {
+		t.Errorf("attempts=%+v, want steer to review-session", sender.attempts)
+	}
+}
+
+// TestWakeFallbackOverInMemoryTransport drives the chain through a real MCP
+// client and server. It proves the honest delivery and the separate traced
+// fact reach the client, not just the in-process handler.
+func TestWakeFallbackOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	AttachWake(server, NewFallbackWakeHandler(sender, &fakeConfirmer{}, &fakeTracer{}))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target: "session-1",
+			Text:   "obligation-1@7",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Delivery != DeliveryUnsupported || out.OK || !out.Traced || out.Fallback != FallbackTraced {
+		t.Errorf("client saw delivery=%q ok=%v traced=%v fallback=%q, want unsupported/false/true/traced",
+			out.Delivery, out.OK, out.Traced, out.Fallback)
+	}
+}
+
+// channelsOf extracts the requested channels in attempt order.
+func channelsOf(attempts []fallbackAttempt) []WakeChannel {
+	channels := make([]WakeChannel, 0, len(attempts))
+	for _, attempt := range attempts {
+		channels = append(channels, attempt.channel)
+	}
+	return channels
 }
