@@ -27,6 +27,7 @@ import (
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 const (
@@ -63,7 +64,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 8)
+	results := make([]evalResult, 0, 9)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -325,6 +326,18 @@ func run() int {
 	}
 	record("08_cancel", fmt.Sprintf("ok=true для %s", orNone(watchID)), cancelActual, cancelPass)
 
+	// eval 9: сквозной вердикт ready. Snapshot с зелёными обязательными
+	// проверками и заполненными ShipFacts даёт ready. Тот же Snapshot без
+	// ShipFacts ready не даёт. Если убрать ShipAllowed из Evaluate, негативный
+	// контроль начнёт возвращать ready и eval упадёт (регрессия T3.72).
+	withShip := shipReadySnapshot(domain.ShipFacts{Build: true, Audit: true, TDD: true})
+	withoutShip := shipReadySnapshot(domain.ShipFacts{})
+	verdictWith, wakeWith := domain.Evaluate(withShip, domain.Policy{})
+	verdictWithout, _ := domain.Evaluate(withoutShip, domain.Policy{})
+	shipPass := verdictWith == domain.VerdictReady && verdictWithout != domain.VerdictReady
+	shipActual := fmt.Sprintf("с Ship: %s (wake=%d); без Ship: %s", verdictWith, len(wakeWith), verdictWithout)
+	record("09_ship_verdict", "с ShipFacts ready, без ShipFacts не ready", shipActual, shipPass)
+
 	printTable(results)
 	passed, failed := 0, 0
 	for _, r := range results {
@@ -339,6 +352,26 @@ func run() int {
 		return 1
 	}
 	return 0
+}
+
+// shipReadySnapshot возвращает Snapshot, удовлетворяющий всем условиям строки 7
+// таблицы решений: зелёный rollup, mergeable, чистое состояние, валидные
+// suite composition и зелёные обязательные проверки. Разница между двумя
+// вызовами eval 09 только в поле Ship.
+func shipReadySnapshot(ship domain.ShipFacts) domain.Snapshot {
+	return domain.Snapshot{
+		State:            "OPEN",
+		Rollup:           "SUCCESS",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		Checks: map[string]domain.Check{
+			"ci-build": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true},
+			"ci-audit": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true},
+		},
+		SuitesValid: true,
+		Ship:        ship,
+	}
 }
 
 // callTool добавляет непрозрачный sessionID в _meta: обработчики get_result и
