@@ -1046,3 +1046,139 @@ func readWatchOutcome(ctx context.Context, db *sql.DB, key string) (WatchOutcome
 	}
 	return o, true, nil
 }
+
+// createReplaysSQL owns the whole-scenario replay table from ADR 0042 §6. As
+// with task_starts, the inbox and watch_outcomes, the table is created on first
+// use because this card owns only db.go and adds no migration file. One row per
+// scenario key is enough: the committed result and the fact that the scenario
+// already ran live in the file, so a repeat can return the first result without
+// running the side steps again.
+const createReplaysSQL = `
+CREATE TABLE IF NOT EXISTS scenario_replays (
+  key        TEXT PRIMARY KEY,
+  result     BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`
+
+// replayNamespace scopes a whole-scenario key. It is deliberately different
+// from a clientRequestId (ADR 0028), which scopes one command, and from the
+// task-start namespace (ADR 0031). The three keys never share a storage slot
+// even when a caller passes the same raw string.
+const replayNamespace = "scenario-replay"
+
+// ReplayKey builds the durable key for a whole scenario. Unlike the
+// clientRequestId of ADR 0028, which makes one command idempotent, this key
+// makes the entire scenario idempotent, including the side steps between
+// commands (ADR 0042 §6).
+func ReplayKey(key string) string {
+	return domain.IdempotencyKey(replayNamespace, key)
+}
+
+// ReplayStep is one side-effecting step of a scenario. Apply runs inside the
+// scenario's single transaction, so a step cannot commit a second effect if a
+// later step fails. Name is used only in error messages.
+type ReplayStep struct {
+	Name  string
+	Apply func(*sql.Tx) error
+}
+
+// ReplayResult is the outcome of a whole-scenario replay. Created marks the
+// first run, which wrote the key, the side steps and the result. Replayed marks
+// a repeat, which wrote nothing and returned the stored result unchanged.
+type ReplayResult struct {
+	Result   []byte
+	Created  bool
+	Replayed bool
+}
+
+// Replay runs a whole scenario at most once per key. The key, every side step
+// and the result commit in one transaction (ADR 0015): a failed step leaves no
+// key and no partial effect, so the scenario can be retried. A repeat with the
+// same key inserts no row, runs no step and returns a copy of the stored
+// result, so it produces no second task, record, result or notification
+// (ADR 0042 §6). This is a scenario key, not the per-command clientRequestId
+// from ADR 0028.
+func (d *DB) Replay(key string, steps []ReplayStep, result []byte) (ReplayResult, error) {
+	if strings.TrimSpace(key) == "" {
+		return ReplayResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: empty scenario replay key")
+	}
+	for i, step := range steps {
+		if strings.TrimSpace(step.Name) == "" || step.Apply == nil {
+			return ReplayResult{}, domain.NewAppError(domain.CodeInvalidInput,
+				fmt.Sprintf("store: replay step %d: empty name or nil apply", i))
+		}
+	}
+
+	namespaced := ReplayKey(key)
+	clean := Redact(result)
+	var out ReplayResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createReplaysSQL); err != nil {
+			return fmt.Errorf("store: replay: create table: %w", err)
+		}
+		res, err := tx.Exec(`
+			INSERT OR IGNORE INTO scenario_replays (key, result, created_at)
+			VALUES (?, ?, ?)`, namespaced, clean, time.Now().UTC().UnixNano())
+		if err != nil {
+			return fmt.Errorf("store: replay: insert key: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: replay: rows affected: %w", err)
+		}
+		if n == 0 {
+			// The same scenario already ran: return the first result and run
+			// no step. A second effect is impossible by construction.
+			var stored []byte
+			if err := tx.QueryRow(`SELECT result FROM scenario_replays WHERE key = ?`, namespaced).Scan(&stored); err != nil {
+				return fmt.Errorf("store: replay: load existing: %w", err)
+			}
+			out = ReplayResult{Result: append([]byte(nil), stored...), Replayed: true}
+			return nil
+		}
+		for _, step := range steps {
+			if err := step.Apply(tx); err != nil {
+				return fmt.Errorf("store: replay: step %s: %w", step.Name, err)
+			}
+		}
+		out = ReplayResult{Result: append([]byte(nil), clean...), Created: true}
+		return nil
+	})
+	if err != nil {
+		return ReplayResult{}, err
+	}
+	return out, nil
+}
+
+// ReplayCount returns the number of stored scenario replays. A repeated key
+// must not increase it.
+func (d *DB) ReplayCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "scenario_replays")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM scenario_replays`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ScenarioResult returns the stored result for key and whether it exists.
+// It is the direct check that a replay returned the first result unchanged.
+func (d *DB) ScenarioResult(key string) ([]byte, bool, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "scenario_replays")
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	var stored []byte
+	err = d.readDB.QueryRow(`SELECT result FROM scenario_replays WHERE key = ?`, ReplayKey(key)).Scan(&stored)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return stored, true, nil
+}
