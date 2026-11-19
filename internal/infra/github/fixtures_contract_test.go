@@ -149,7 +149,8 @@ func loadFixtureManifest(t *testing.T) fixtureManifest {
 }
 
 // loadFixturePR reads a recorded GraphQL response, checks it against the
-// T2.11 body contract, and decodes data.p0 into out.
+// T2.11 body contract, and decodes data.p0.pullRequest into out. The alias
+// resolves to a repository object, so the PR fields sit one level deeper.
 func loadFixturePR(t *testing.T, rel string, out any) {
 	t.Helper()
 	path := fixturePath(rel)
@@ -171,8 +172,17 @@ func loadFixturePR(t *testing.T, rel string, out any) {
 	if !ok {
 		t.Fatalf("%s data has no p0 alias", path)
 	}
-	if err := json.Unmarshal(raw, out); err != nil {
+	var alias struct {
+		PullRequest json.RawMessage `json:"pullRequest"`
+	}
+	if err := json.Unmarshal(raw, &alias); err != nil {
 		t.Fatalf("decode data.p0 of %s: %v", path, err)
+	}
+	if len(alias.PullRequest) == 0 {
+		t.Fatalf("%s data.p0 has no pullRequest", path)
+	}
+	if err := json.Unmarshal(alias.PullRequest, out); err != nil {
+		t.Fatalf("decode data.p0.pullRequest of %s: %v", path, err)
 	}
 }
 
