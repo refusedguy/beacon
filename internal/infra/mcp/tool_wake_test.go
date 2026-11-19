@@ -2992,3 +2992,372 @@ func TestT3_124OverInMemoryTransport(t *testing.T) {
 		t.Errorf("sender calls = %d, want 1 over MCP", sender.calls)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T3.129 / ADR 0058 p2: addressed doorbell wake.
+// ---------------------------------------------------------------------------
+
+type listenResult struct {
+	msg DoorbellMessage
+	err error
+}
+
+func startDoorbellListener(ctx context.Context, d *Doorbell, address string) <-chan listenResult {
+	ch := make(chan listenResult, 1)
+	go func() {
+		msg, err := d.Listen(ctx, address)
+		ch <- listenResult{msg: msg, err: err}
+	}()
+	return ch
+}
+
+func awaitDoorbell(t *testing.T, ch <-chan listenResult) listenResult {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for a doorbell listener")
+		return listenResult{}
+	}
+}
+
+func assertDoorbellQuiet(t *testing.T, ch <-chan listenResult) {
+	t.Helper()
+	select {
+	case res := <-ch:
+		t.Fatalf("listener woke unexpectedly: msg=%+v err=%v", res.msg, res.err)
+	default:
+	}
+}
+
+// recordingDoorbell is a DoorbellPort that records rings and mirrors the
+// addressed-only rule in its return value, so handler-level tests can assert
+// the trigger fact without running a long-poll goroutine.
+type recordingDoorbell struct {
+	calls int
+	last  DoorbellMessage
+}
+
+func (r *recordingDoorbell) Ring(msg DoorbellMessage) bool {
+	r.calls++
+	r.last = msg
+	return !msg.Broadcast && msg.Address != ""
+}
+
+// TestT3_129AddressedWakeRingsListener is the acceptance test: a wake addressed
+// to a mailbox rings that doorbell and releases the long-poll listener with the
+// pointer-only message. Delivery is unchanged by the doorbell (ADR 0026).
+func TestT3_129AddressedWakeRingsListener(t *testing.T) {
+	d := NewDoorbell()
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithDoorbell(d)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startDoorbellListener(ctx, d, "mailbox-A")
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "session-1", Text: "obligation-1@7", Mailbox: "mailbox-A",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if !out.DoorbellRang {
+		t.Error("doorbellRang = false for an addressed mailbox, want true")
+	}
+	if out.Delivery != DeliverySteer || !out.OK {
+		t.Errorf("receipt = delivery %q ok %v, want steer/true", out.Delivery, out.OK)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1: the doorbell is orthogonal to delivery", sender.calls)
+	}
+
+	res := awaitDoorbell(t, ch)
+	if res.err != nil {
+		t.Fatalf("listener error = %v, want nil", res.err)
+	}
+	if res.msg.Address != "mailbox-A" || res.msg.Text != "obligation-1@7" || res.msg.Broadcast {
+		t.Errorf("message = %+v, want addressed mailbox-A with the pointer text", res.msg)
+	}
+}
+
+// TestT3_129BroadcastDoesNotRingDoorbell proves the doorbell is addressed: a
+// broadcast follow-up rings nothing and leaves the listener blocked, while a
+// later addressed message to the same mailbox wakes it.
+func TestT3_129BroadcastDoesNotRingDoorbell(t *testing.T) {
+	d := NewDoorbell()
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	handler := NewWakeHandler(sender).WithDoorbell(d)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startDoorbellListener(ctx, d, "mailbox-A")
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "session-1", Text: "obligation-1@7", Mailbox: "mailbox-A", Broadcast: true,
+	})
+	if err != nil {
+		t.Fatalf("broadcast Wake() error = %v", err)
+	}
+	if out.DoorbellRang {
+		t.Error("doorbellRang = true for a broadcast, want false")
+	}
+	assertDoorbellQuiet(t, ch)
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1: broadcast still delivers, it only skips the doorbell", sender.calls)
+	}
+
+	out, err = handler.Wake(context.Background(), WakeInput{
+		Target: "session-1", Text: "obligation-2@8", Mailbox: "mailbox-A",
+	})
+	if err != nil {
+		t.Fatalf("addressed Wake() error = %v", err)
+	}
+	if !out.DoorbellRang {
+		t.Error("doorbellRang = false for the addressed wake, want true")
+	}
+	res := awaitDoorbell(t, ch)
+	if res.err != nil {
+		t.Fatalf("listener error = %v, want nil", res.err)
+	}
+	if res.msg.Text != "obligation-2@8" || res.msg.Broadcast {
+		t.Errorf("message = %+v, want the addressed pointer text", res.msg)
+	}
+}
+
+// TestT3_129OnlyAddressedMailboxWakes proves address isolation: a message for
+// mailbox-B wakes only the listener on B, never the one on A.
+func TestT3_129OnlyAddressedMailboxWakes(t *testing.T) {
+	d := NewDoorbell()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := startDoorbellListener(ctx, d, "mailbox-A")
+	b := startDoorbellListener(ctx, d, "mailbox-B")
+
+	if !d.Ring(DoorbellMessage{Address: "mailbox-B", Text: "p"}) {
+		t.Fatal("Ring(B) = false, want true")
+	}
+	resB := awaitDoorbell(t, b)
+	if resB.err != nil || resB.msg.Address != "mailbox-B" {
+		t.Errorf("listener B = %+v, want the message addressed to B", resB)
+	}
+	assertDoorbellQuiet(t, a)
+
+	if !d.Ring(DoorbellMessage{Address: "mailbox-A", Text: "q"}) {
+		t.Fatal("Ring(A) = false, want true")
+	}
+	resA := awaitDoorbell(t, a)
+	if resA.err != nil || resA.msg.Address != "mailbox-A" {
+		t.Errorf("listener A = %+v, want the message addressed to A", resA)
+	}
+}
+
+// TestT3_129DoorbellRingRejectsBroadcastAndUnaddressed checks the boundary at
+// the switchboard itself: only an addressed, non-broadcast message rings.
+func TestT3_129DoorbellRingRejectsBroadcastAndUnaddressed(t *testing.T) {
+	d := NewDoorbell()
+	if d.Ring(DoorbellMessage{Address: "mailbox-A", Text: "p", Broadcast: true}) {
+		t.Error("broadcast Ring = true, want false")
+	}
+	if d.Ring(DoorbellMessage{Text: "p"}) {
+		t.Error("unaddressed Ring = true, want false")
+	}
+	if !d.Ring(DoorbellMessage{Address: "mailbox-A", Text: "p"}) {
+		t.Error("addressed Ring = false, want true")
+	}
+}
+
+// TestT3_129LongPollBlocksUntilCancel proves there is no timer trigger: a
+// listener stays blocked with no message and returns only when its context is
+// cancelled, which is the ADR 0017 ladder distinction for the doorbell.
+func TestT3_129LongPollBlocksUntilCancel(t *testing.T) {
+	d := NewDoorbell()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := startDoorbellListener(ctx, d, "mailbox-A")
+	assertDoorbellQuiet(t, ch)
+	cancel()
+	res := awaitDoorbell(t, ch)
+	if !errors.Is(res.err, context.Canceled) {
+		t.Errorf("listener error = %v, want context.Canceled", res.err)
+	}
+}
+
+// TestT3_129DuplicatePromptDoesNotRingDoorbell keeps T3.124 intact: a repeated
+// prompt is refused at entry and rings no second time.
+func TestT3_129DuplicatePromptDoesNotRingDoorbell(t *testing.T) {
+	bell := &recordingDoorbell{}
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithDoorbell(bell).WithOperationRegistry(NewMemoryOperationRegistry())
+	in := WakeInput{Target: "session-1", Text: "p", Mailbox: "mailbox-A", Prompt: "long job"}
+
+	first, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	if !first.DoorbellRang {
+		t.Error("first doorbellRang = false, want true")
+	}
+	if bell.calls != 1 {
+		t.Errorf("doorbell calls = %d after first wake, want 1", bell.calls)
+	}
+
+	second, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+	if !second.Duplicate {
+		t.Error("second duplicate = false, want true")
+	}
+	if second.DoorbellRang {
+		t.Error("duplicate doorbellRang = true, want false: no second ring")
+	}
+	if bell.calls != 1 {
+		t.Errorf("doorbell calls = %d after duplicate, want 1", bell.calls)
+	}
+	if bell.last.Address != "mailbox-A" || bell.last.Text != "p" || bell.last.Broadcast {
+		t.Errorf("ring = %+v, want the first addressed message", bell.last)
+	}
+}
+
+// TestT3_129BroadcastPassesThroughHandler proves the handler forwards the
+// broadcast flag to the port and reports the honest false trigger fact.
+func TestT3_129BroadcastPassesThroughHandler(t *testing.T) {
+	bell := &recordingDoorbell{}
+	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithDoorbell(bell)
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", Mailbox: "mailbox-A", Broadcast: true,
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if out.DoorbellRang {
+		t.Error("doorbellRang = true for a broadcast, want false")
+	}
+	if bell.calls != 1 || !bell.last.Broadcast || bell.last.Address != "mailbox-A" {
+		t.Errorf("ring = calls %d %+v, want one broadcast ring to mailbox-A", bell.calls, bell.last)
+	}
+}
+
+// TestT3_129FallbackWakeRingsDoorbell proves the fallback path carries the same
+// addressed trigger fact and keeps its honest delivery receipt.
+func TestT3_129FallbackWakeRingsDoorbell(t *testing.T) {
+	bell := &recordingDoorbell{}
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
+	handler := NewFallbackWakeHandler(sender, confirmer, &fakeTracer{}).WithDoorbell(bell)
+
+	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
+		Target: "s", Text: "p", Mailbox: "mailbox-A",
+	})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v", err)
+	}
+	if !out.DoorbellRang {
+		t.Error("doorbellRang = false on the fallback path, want true")
+	}
+	if out.Delivery != DeliverySteer || !out.OK {
+		t.Errorf("receipt = delivery %q ok %v, want steer/true", out.Delivery, out.OK)
+	}
+	if bell.calls != 1 {
+		t.Errorf("doorbell calls = %d, want 1", bell.calls)
+	}
+}
+
+// TestT3_129LegacyCallerWithoutDoorbell keeps an empty trigger fact when no
+// port is attached, so callers written before ADR 0058 p2 are unchanged.
+func TestT3_129LegacyCallerWithoutDoorbell(t *testing.T) {
+	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer})
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", Mailbox: "mailbox-A",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if out.DoorbellRang {
+		t.Error("doorbellRang = true with no doorbell attached, want false")
+	}
+}
+
+// TestT3_129ConcurrentRingsDoNotLoseMessages guards the switchboard's lock:
+// concurrent rings to one address all reach a later listener.
+func TestT3_129ConcurrentRingsDoNotLoseMessages(t *testing.T) {
+	d := NewDoorbell()
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.Ring(DoorbellMessage{Address: "mailbox-A", Text: "p"})
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		msg, err := d.Listen(ctx, "mailbox-A")
+		cancel()
+		if err != nil || msg.Address != "mailbox-A" {
+			t.Fatalf("drain %d = %+v, %v; want an addressed message", i, msg, err)
+		}
+	}
+}
+
+// TestT3_129OverInMemoryTransport drives the mailbox through a real MCP client
+// and server session, checking the schema and the structured output CI sees.
+func TestT3_129OverInMemoryTransport(t *testing.T) {
+	d := NewDoorbell()
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithDoorbell(d))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "mailbox") {
+		t.Errorf("wake input schema missing mailbox: %s", inputSchema)
+	}
+	if !strings.Contains(string(inputSchema), "broadcast") {
+		t.Errorf("wake input schema missing broadcast: %s", inputSchema)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startDoorbellListener(ctx, d, "mailbox-MCP")
+	result, err := session.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      WakeToolName,
+		Arguments: WakeInput{Target: "session-1", Text: "obligation-1@7", Mailbox: "mailbox-MCP"},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if !out.DoorbellRang {
+		t.Error("doorbellRang missing from structured output over MCP, want true")
+	}
+	res := awaitDoorbell(t, ch)
+	if res.err != nil || res.msg.Address != "mailbox-MCP" {
+		t.Errorf("listener = %+v, want the message addressed to mailbox-MCP", res)
+	}
+}
