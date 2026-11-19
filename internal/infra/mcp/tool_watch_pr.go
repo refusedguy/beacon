@@ -63,10 +63,11 @@ type WatchPRPolicy struct {
 // owns a Fanout, which serializes the check-then-act sequence inside one
 // process; cross-process exclusion remains the daemon's job (ADR 0021).
 type WatchPRHandler struct {
-	store  domain.Store
-	ci     domain.CIProvider
-	clock  domain.Clock
-	fanout *domain.Fanout
+	store   domain.Store
+	ci      domain.CIProvider
+	clock   domain.Clock
+	fanout  *domain.Fanout
+	bridges []Bridge
 }
 
 // NewWatchPRHandler builds a handler. A nil clock falls back to the wall
@@ -79,6 +80,18 @@ func NewWatchPRHandler(store domain.Store, ci domain.CIProvider, clock domain.Cl
 		clock:  clock,
 		fanout: domain.NewFanout(store, clock),
 	}
+}
+
+// WithBridges injects the bridges that a watch_pr registration is broadcast
+// to. It returns the receiver so callers can chain it after NewWatchPRHandler.
+// Adding another agent means passing another Bridge here; the core needs no
+// change (ADR 0024).
+func (h *WatchPRHandler) WithBridges(bridges ...Bridge) *WatchPRHandler {
+	if h == nil {
+		return nil
+	}
+	h.bridges = append([]Bridge(nil), bridges...)
+	return h
 }
 
 // Handle adapts Register to the go-sdk typed tool handler signature. Domain
@@ -162,6 +175,13 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	if err != nil {
 		return WatchPROutput{}, err
 	}
+
+	// One watch_pr call reaches every injected bridge through the same
+	// six-operation port. Each bridge decides whether the work applies to its
+	// agent; the core never names an agent (ADR 0024). Dispatch is best effort:
+	// the persisted Watch is the source of truth and per-agent delivery
+	// reliability belongs to the bridge.
+	h.startBridges(ctx, sub.Watch, s)
 
 	return WatchPROutput{
 		WatchID:     sub.Watch.ID,
@@ -261,6 +281,26 @@ func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, no
 		}
 	}
 	return carried, nil
+}
+
+// startBridges broadcasts the Start operation to every injected bridge. The
+// request carries neutral identifiers only, so the same call drives two
+// different agents without a core edit (ADR 0024). Errors are intentionally
+// not propagated: registration has already succeeded in the domain store.
+func (h *WatchPRHandler) startBridges(ctx context.Context, w domain.Watch, s domain.Subscriber) {
+	req := BridgeRequest{
+		WatchID:      w.ID,
+		Repo:         w.Repo,
+		PR:           w.PR,
+		HeadSHA:      w.HeadSHA,
+		SubscriberID: s.ID,
+	}
+	for _, bridge := range h.bridges {
+		if bridge == nil {
+			continue
+		}
+		_, _ = bridge.Start(ctx, req)
+	}
 }
 
 func (h *WatchPRHandler) now() time.Time {
