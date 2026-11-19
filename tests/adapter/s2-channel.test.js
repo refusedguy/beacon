@@ -6,8 +6,10 @@
 // детекция через node:fs.watch плюс polling не реже 2 с, курсор {offset, epoch}
 // в ctx.storage, разбор только полных строк, пропуск битых строк с записью
 // причины в лог, повторное чтение после пересоздания потока без потерь и дублей.
+// Признак потока это хэш прочитанного префикса: inode и mtime в CI переиспользуются.
 
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { test } from "node:test"
 import {
   appendFileSync,
@@ -15,7 +17,6 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
-  statSync,
   watch,
   writeFileSync,
 } from "node:fs"
@@ -101,34 +102,35 @@ function createS2Channel({
   let started = false
   const seen = new Set()
 
-  function epochOf() {
-    try {
-      const st = statSync(path)
-      return `${st.dev}:${st.ino}`
-    } catch {
-      return ""
-    }
+  // Отпечаток уже прочитанных байт. Append его не меняет, а пересоздание
+  // или перезапись прочитанной части меняет даже при переиспользовании inode.
+  function hashPrefix(buf, length) {
+    return createHash("sha256").update(buf.subarray(0, length)).digest("hex")
   }
 
   async function tick() {
     if (!started || ticking) return
     ticking = true
     try {
-      const epoch = epochOf()
-      if (epoch === "") return
-
-      if (cursor.epoch !== epoch) {
-        log.push(`epoch changed ${cursor.epoch || "none"} -> ${epoch}; re-read from offset 0`)
-        cursor = { offset: 0, epoch }
-        await storage.set(CURSOR_KEY, cursor)
-      }
-
       let buf
       try {
         buf = readFileSync(path)
-      } catch (err) {
-        log.push(`read failed: ${err.message}`)
-        return
+      } catch {
+        return // файл ещё не создан или временно отсутствует
+      }
+      if (buf.length === 0) return
+
+      const consumed = cursor.offset > 0
+        ? hashPrefix(buf, Math.min(cursor.offset, buf.length))
+        : ""
+      const recreated = cursor.offset > buf.length ||
+        (cursor.offset > 0 && consumed !== cursor.epoch)
+      if (recreated) {
+        log.push(
+          `epoch changed ${cursor.epoch || "none"} -> ${hashPrefix(buf, buf.length)}; re-read from offset 0`,
+        )
+        cursor = { offset: 0, epoch: "" }
+        await storage.set(CURSOR_KEY, cursor)
       }
       if (buf.length <= cursor.offset) return
 
@@ -159,6 +161,7 @@ function createS2Channel({
       }
 
       cursor.offset += complete.length
+      cursor.epoch = hashPrefix(buf, cursor.offset)
       await storage.set(CURSOR_KEY, cursor)
     } finally {
       ticking = false
@@ -263,15 +266,24 @@ test("пересоздание потока возвращает каждое с
     const before = channel.cursor()
     assert.ok(before.offset > 0)
 
-    const original = readFileSync(path, "utf8")
+    // Новый поток содержит те же пять указателей в другом порядке и три новых.
+    // Перестановка меняет префикс, поэтому сброс курсора обязателен даже когда
+    // GitHub Actions переиспользует inode удалённого файла.
+    const replayed = [
+      pointer("beacon-s2-005", "watch-003", "ob-005", 1),
+      pointer("beacon-s2-001", "watch-001", "ob-001", 1),
+      pointer("beacon-s2-002", "watch-001", "ob-002", 2),
+      pointer("beacon-s2-003", "watch-002", "ob-003", 1),
+      pointer("beacon-s2-004", "watch-002", "ob-004", 2),
+    ].join("")
+    const added = [
+      pointer("beacon-s2-006", "watch-004", "ob-006", 1),
+      pointer("beacon-s2-007", "watch-004", "ob-007", 2),
+      pointer("beacon-s2-008", "watch-005", "ob-008", 1),
+    ].join("")
+    const recreated = replayed + added
     rmSync(path)
-    writeFileSync(
-      path,
-      original +
-        pointer("beacon-s2-006", "watch-004", "ob-006", 1) +
-        pointer("beacon-s2-007", "watch-004", "ob-007", 2) +
-        pointer("beacon-s2-008", "watch-005", "ob-008", 1),
-    )
+    writeFileSync(path, recreated)
 
     const expected = [
       ...first,
@@ -285,6 +297,7 @@ test("пересоздание потока возвращает каждое с
 
     const after = channel.cursor()
     assert.notEqual(after.epoch, before.epoch)
+    assert.equal(after.offset, Buffer.byteLength(recreated))
     assert.ok(after.offset > before.offset)
     assert.deepEqual(await storage.get(CURSOR_KEY), after)
     assert.ok(log.some((line) => line.startsWith("epoch changed")))
