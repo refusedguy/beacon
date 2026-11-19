@@ -4,7 +4,7 @@ Beacon следит за пулл-реквестами и управляет а�
 
 Представьте пятнадцать терминалов. В каждом висит своя команда `gh ... --watch`, и каждый человек вручную следит за простым вопросом: прошла ли проверка, пора ли будить агента, можно ли сливать. Beacon заменяет эту кучу процессов одной конторой. Он хранит список наблюдений, помнит, кто за какой PR отвечает, будит агента только по нужному событию и не даёт оркестратору слить PR по пустому отчёту. Агент пишет "жду, watchID" и уходит спать. Beacon сам решает, когда его разбудить.
 
-Состояние на 20 ноября 2026 года: 102 из 102 карточек отмечены done, принято 37 ADR. Открытых PR нет. Плагин OpenCode в репозитории рабочий: S2 polling, prompt steer, квитанции. Регрессии после batch merge устранены.
+Состояние на 20 ноября 2026 года: 169 из 171 карточки отмечены done, в работе две: T3.118 (аренда продлением) и T3.99 (bounded handoff journal). Принято 54 ADR, ADR 0055 (AM-wave) в работе. Открытых PR нет, CI на main success. Плагин OpenCode в репозитории рабочий: S2 polling, prompt steer, квитанции. Регрессии после batch merge устранены.
 
 ## Архитектура
 
@@ -39,15 +39,17 @@ beacon list
 beacon what <command>
 beacon doctor
 beacon build
+beacon test
 beacon gates [gate] [flags]
 beacon mcp
 beacon task <list|new|take>
+beacon why <task>
 beacon agents [--format table|json]
 beacon watch [--interval 2s] [--format table|json]
 beacon attach <sessionID>
 ```
 
-Это десять команд каталога. `beacon list` показывает каталог команд. `beacon what <command>` печатает описание одной команды. Каталог служит единственным источником имён для этих двух команд.
+`beacon list` показывает каталог команд. `beacon what <command>` печатает описание одной команды. Каталог служит единственным источником имён для этих двух команд. `beacon test` запускает тесты, `beacon why <task>` показывает цепочку блокировок карточки. `beacon gc` пока не подключён к dispatch, это долг.
 
 `beacon doctor` проверяет три вещи: версию Go, наличие бинарника `beacon-gates` и каталог состояния. Минимальная версия Go в проверке это 1.26.0. Команда возвращает ненулевой код, если хоть одна проверка провалилась.
 
@@ -94,7 +96,7 @@ bash tests/e2e/run.sh
 GO=/tmp/opencode/go126/bin/go bash tests/e2e/run.sh
 ```
 
-Прогон от 20 ноября 2026 года: 4 PASS, 1 SKIP. Skip это опциональный MCP Inspector, он включается переменной `BEACON_E2E_INSPECTOR=1`. Токен GitHub не нужен.
+Прогон от 20 ноября 2026 года: 6 PASS. Прогон включает реальный `opencode` и негативный контроль. Токен GitHub не нужен.
 
 Прогон проверяет три вещи на реальных процессах. Первое: официальный go-sdk клиент подключается к `beacon mcp` через stdio, получает `initialize` с именем `beacon` и инструкциями цикла, видит ровно семь инструментов в `tools/list` и делает один `tools/call`. Второе: живой `opencode serve` грузит плагин, а указатель в `events.jsonl` будит сессию и пишет квитанцию. Третье: негативный контроль. Вместо рабочего плагина ставится заглушка, и проверка обязана провалиться. Иначе прогон не считается e2e.
 
@@ -108,7 +110,7 @@ GO=/tmp/opencode/go126/bin/go bash tests/e2e/run.sh
 GO=/tmp/opencode/go126/bin/go bash evals/run.sh
 ```
 
-Раннер поднимает MCP-сервер отдельным процессом через официальный go-sdk `CommandTransport` и печатает таблицу с ожидаемым результатом, фактическим и вердиктом `PASS`/`FAIL`. В конце строка вида `8 passed, 0 failed`. Прогон от 20 ноября 2026 года: 8 PASS.
+Раннер поднимает MCP-сервер отдельным процессом через официальный go-sdk `CommandTransport` и печатает таблицу с ожидаемым результатом, фактическим и вердиктом `PASS`/`FAIL`. В конце строка вида `9 passed, 0 failed`. Прогон от 20 ноября 2026 года: 9 PASS.
 
 | Кейс | Что проверяет | Результат |
 | --- | --- | --- |
@@ -120,6 +122,7 @@ GO=/tmp/opencode/go126/bin/go bash evals/run.sh
 | `06_get` | `beacon_get_result` возвращает `status` и `verdict` | PASS |
 | `07_ack` | `beacon_ack` с `watchID` и `obligationID`, `ok=true` | PASS |
 | `08_cancel` | `beacon_cancel_watch`, `ok=true` | PASS |
+| `09_ship_verdict` | С ShipFacts вердикт `ready`, без ShipFacts не `ready` | PASS |
 
 Сеть и GitHub-токен не нужны: зависимости берутся из module cache, `GOPROXY=off`, токены удаляются из окружения дочернего процесса. Подробности в `evals/README.md`.
 
@@ -135,18 +138,18 @@ GO=/tmp/opencode/go126/bin/go bash evals/run.sh
 
 ## Проверки, которые нельзя пропускать
 
-- Evals: 8 из 8, `GO=/tmp/opencode/go126/bin/go bash evals/run.sh`.
-- E2e: 4 PASS, 1 SKIP, `bash tests/e2e/run.sh`.
+- Evals: 9 из 9, `GO=/tmp/opencode/go126/bin/go bash evals/run.sh`.
+- E2e: 6 PASS, `bash tests/e2e/run.sh`.
 - JS-тесты: 99 PASS, `node --test tests/adapter/*.test.js`.
 - Self-test карточек: 11 cases, `beacon task --self-test`.
 - CI: success, зелёный прогон в GitHub Actions.
 
 ## Где подробности
 
-- `docs/adrs/` архитектурные решения. Начните с 0001 о цели, 0022 о проверке только в CI, 0024 о мосте на шесть операций. Принято 37 ADR.
-- `docs/tasks/` карточки от T0.* до T4.*, включая спайки и гейты. Все 102 карточки done.
+- `docs/adrs/` архитектурные решения. Начните с 0001 о цели, 0022 о проверке только в CI, 0024 о мосте на шесть операций. Принято 54 ADR, ADR 0055 (AM-wave) в работе.
+- `docs/tasks/` карточки от T0.* до T4.*, включая спайки и гейты. 169 из 171 карточки done, в работе T3.118 и T3.99.
 - `docs/design/opencode-cli-manager.md` предложение по CLI-менеджеру OpenCode. Это проект, который не меняет карточки и ADR.
-- `/home/nbook/Projects/tmp/beacon-research/` локальные исследования вне репозитория: отчёты A-U, на данный момент A-R плюс S и T, U когда придёт. Там же исходники SDK, заметки по Go, SQLite, CLI и доказательства e2e.
+- `/home/nbook/Projects/tmp/beacon-research/` локальные исследования вне репозитория: отчёты аналогов A-AM, 29 волн. Там же исходники SDK, заметки по Go, SQLite, CLI и доказательства e2e.
 
 ## Чего не делать
 
