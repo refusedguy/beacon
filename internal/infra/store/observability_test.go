@@ -623,9 +623,17 @@ func TestSharedGateCancelledFollowerLeavesRound(t *testing.T) {
 	var leaderErr, followerErr, cancelledErr error
 	cancelledReturned := make(chan struct{})
 	var wg sync.WaitGroup
-	wg.Add(3)
+
+	// Start the leader alone so it definitely owns the round. If the
+	// cancellable caller won the race to become leader, it would block in fn
+	// and the wait below for its return would deadlock.
+	wg.Add(1)
 	go func() { defer wg.Done(); leaderErr = g.Wait(context.Background(), key, fn) }()
+	waitForActiveWaiters(t, g, key, 1)
+
+	wg.Add(1)
 	go func() { defer wg.Done(); followerErr = g.Wait(context.Background(), key, fn) }()
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		cancelledErr = g.Wait(cancelCtx, key, fn)
