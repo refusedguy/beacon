@@ -21,6 +21,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon test
   beacon gates [gate] [flags]
   beacon task <list|new|take> [flags]
+  beacon why <task>
   beacon mcp
   beacon agents [--format table|json]
   beacon watch [--interval 2s] [--format table|json]
@@ -92,6 +93,8 @@ func (c *CLI) Run(args []string) int {
 		return c.runGates(args[1:])
 	case "task":
 		return taskRunner(args[1:], c.out, c.errOut)
+	case "why":
+		return taskRunner(append([]string{"why"}, args[1:]...), c.out, c.errOut)
 	case "mcp":
 		return mcpRunner(c.errOut)
 	case "agents":
