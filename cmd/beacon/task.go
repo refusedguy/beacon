@@ -46,6 +46,10 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskNew(args[1:], stdout, stderr, cfg)
 	case "take":
 		return runTaskTake(args[1:], stdout, stderr, cfg)
+	case "done":
+		return runTaskDone(args[1:], stdout, stderr, cfg)
+	case "needs-input":
+		return runTaskNeedsInput(args[1:], stdout, stderr, cfg)
 	case "why":
 		return runTaskWhy(args[1:], stdout, stderr, cfg)
 	default:
@@ -54,7 +58,7 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 	}
 }
 
-const taskUsage = "использование: beacon task list|new|take|why|--self-test [flags]"
+const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|--self-test [flags]"
 
 // whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
 var whyEdgeKinds = []string{
@@ -307,6 +311,181 @@ func whyKnownEdge(kind string) bool {
 		}
 	}
 	return false
+}
+
+// ---- ADR 0051 п4 / T3.120: отказ завершить без evidence, состояние needs_input ----
+//
+// Команда завершения принимает два отдельных поля: краткий итог и то, что
+// проверяли. Это не completion gate с proof из T3.88: здесь нет плана фаз и
+// одобренных proof-объектов, а есть обязательный текстовый ответ воркера на
+// вопрос «что проверяли». Итог не подменяет доказательство, потому что это
+// разные флаги и разные поля карточки. Попытка закрыться без доказательства
+// не закрывает карточку, а переводит её в needs_input.
+
+// completionFields это два входа команды завершения.
+type completionFields struct {
+	summary  string
+	evidence string
+}
+
+// runTaskDone завершает карточку только при наличии отдельного поля
+// --evidence. Без доказательства карточка не закрывается: она уходит в
+// needs_input с вопросом, который нужно закрыть перед повторной попыткой.
+func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"summary": true, "evidence": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
+		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки вида T<g>.<n>"))
+	}
+	report := completionFields{summary: p.value("summary"), evidence: p.value("evidence")}
+	hasEvidence := strings.TrimSpace(report.evidence) != ""
+	if hasEvidence && strings.TrimSpace(report.summary) == "" {
+		return failTask(stderr, taskstore.Validationf("завершение без итога отклонено: задайте --summary"))
+	}
+	id := p.pos[0]
+
+	lock, err := taskstore.AcquireLock(taskstore.LockPath(cfg.StateDir, cfg.Root), cfg.Root)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	defer lock.Release()
+
+	cards, err := taskstore.LoadCards(cfg.TasksDir)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	var target *taskstore.Card
+	for i := range cards {
+		if cards[i].ID == id {
+			target = &cards[i]
+			break
+		}
+	}
+	if target == nil {
+		return failTask(stderr, taskstore.Validationf("карточка %s не найдена", id))
+	}
+	if !taskActive(target.Status) {
+		return failTask(stderr, taskstore.Validationf("карточка %s в статусе %s, завершение неприменимо", id, target.Status))
+	}
+
+	if !hasEvidence {
+		reason := "завершение без доказательства: задайте --evidence"
+		newText := needsInputText(target.Raw, reason)
+		if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+			return failTask(stderr, err)
+		}
+		return failTask(stderr, taskstore.Validationf("завершение без доказательства отклонено: карточка %s переведена в needs_input, задайте --evidence", id))
+	}
+
+	newText := setCardField(target.Raw, "Статус", "done")
+	newText = setCardField(newText, "Итог", oneLine(report.summary))
+	newText = setCardField(newText, "Доказательство", oneLine(report.evidence))
+	newText = setCardField(newText, "Состояние", "")
+	newText = setCardField(newText, "Вопрос", "")
+	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintf(stdout, "%s done\n", id)
+	return taskstore.ExitOK
+}
+
+// runTaskNeedsInput сохраняет состояние воркера, который задал вопрос и пошёл
+// дальше. Статус карточки остаётся в допустимом множестве ParseCard, а
+// состояние пишется отдельным полем, поэтому карточка не ломает list и take.
+func runTaskNeedsInput(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"question": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
+		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки вида T<g>.<n>"))
+	}
+	question := oneLine(p.value("question"))
+	if question == "" {
+		return failTask(stderr, taskstore.Validationf("состояние needs_input без вопроса отклонено: задайте --question"))
+	}
+	id := p.pos[0]
+
+	lock, err := taskstore.AcquireLock(taskstore.LockPath(cfg.StateDir, cfg.Root), cfg.Root)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	defer lock.Release()
+
+	cards, err := taskstore.LoadCards(cfg.TasksDir)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	var target *taskstore.Card
+	for i := range cards {
+		if cards[i].ID == id {
+			target = &cards[i]
+			break
+		}
+	}
+	if target == nil {
+		return failTask(stderr, taskstore.Validationf("карточка %s не найдена", id))
+	}
+	if !taskActive(target.Status) {
+		return failTask(stderr, taskstore.Validationf("карточка %s в статусе %s, needs_input неприменимо", id, target.Status))
+	}
+
+	newText := needsInputText(target.Raw, question)
+	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintf(stdout, "%s needs_input\n", id)
+	return taskstore.ExitOK
+}
+
+func taskActive(status string) bool {
+	return status == "todo" || status == "in_progress"
+}
+
+// needsInputText переводит карточку в состояние ожидания ввода. Статус
+// остаётся в допустимом множестве ParseCard, поэтому карточка не ломает list
+// и take. Причина пишется отдельным полем Вопрос.
+func needsInputText(raw, reason string) string {
+	newText := setCardField(raw, "Статус", "in_progress")
+	newText = setCardField(newText, "Состояние", "needs_input")
+	newText = setCardField(newText, "Вопрос", reason)
+	return newText
+}
+
+// setCardField меняет значение одного поля карточки. Пустое значение удаляет
+// строку. Отсутствующее поле добавляется в конец, поэтому повторный вызов не
+// создаёт дублей, а ParseCard не видит неизвестные поля как ошибку.
+func setCardField(raw, name, value string) string {
+	cr := ""
+	if strings.Contains(raw, "\r\n") {
+		cr = "\r"
+	}
+	prefix := name + ":"
+	found := false
+	out := make([]string, 0, strings.Count(raw, "\n")+2)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.HasPrefix(line, prefix) {
+			found = true
+			if value != "" {
+				out = append(out, prefix+" "+value+cr)
+			}
+			continue
+		}
+		out = append(out, line+cr)
+	}
+	if !found && value != "" {
+		out = append(out, prefix+" "+value+cr)
+	}
+	return strings.Join(out, "\n")
+}
+
+// oneLine сводит значение флага к одной строке, чтобы переносы в --evidence не
+// разрывали поля карточки.
+func oneLine(v string) string {
+	return strings.Join(strings.Fields(v), " ")
 }
 
 func relativePath(root, filePath string) string {
