@@ -728,6 +728,10 @@ func TestToolsCallUsesCapabilityScopeAndDepartures(t *testing.T) {
 	}
 
 	journal := NewMemoryCancelJournal()
+	memoryJournal, ok := journal.(*memoryCancelJournal)
+	if !ok {
+		t.Fatalf("cancel journal type = %T, want *memoryCancelJournal", journal)
+	}
 	registry := NewCapabilityScopeRegistry(journal, waitTestClock{at: time.Now().UTC()})
 	boundRequest := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
 		Meta: mcpsdk.Meta{sessionIDMetaKey: "scope-session"},
@@ -775,7 +779,7 @@ func TestToolsCallUsesCapabilityScopeAndDepartures(t *testing.T) {
 	if len(tasks) != 1 || tasks[0].TaskID != w.ID || tasks[0].Reason != CancelCallerCancelled {
 		t.Fatalf("cancelled tasks = %+v, want one task with reason %q", tasks, CancelCallerCancelled)
 	}
-	records := journal.Records()
+	records := memoryJournal.Records()
 	if len(records) != 1 || records[0].TaskID != w.ID || records[0].Reason != CancelCallerCancelled {
 		t.Fatalf("cancel journal = %+v, want one record for %q", records, w.ID)
 	}
