@@ -8,6 +8,8 @@ import (
 	"context"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 const (
@@ -78,9 +80,39 @@ func stubHandler(_ context.Context, _ *mcpsdk.CallToolRequest, _ stubInput) (*mc
 	return &mcpsdk.CallToolResult{}, stubOutput{OK: true}, nil
 }
 
-// NewServer builds the Beacon MCP server with all seven tools registered and
-// the cycle protocol attached to the handshake.
+// Dependencies groups the ports the seven real handlers need. NewServer's
+// zero-dependency form still registers every real handler; handlers that lack a
+// backing port report a domain error instead of pretending to succeed. A
+// composition root supplies the real ports through NewServerWithDeps.
+//
+// The ports are all declared inside internal/domain or this package, so wiring
+// stays inside the layer matrix (ADR 0005): a caller in cmd or internal/app
+// builds them from store/github and passes them in; this package never imports
+// a sibling infra package.
+type Dependencies struct {
+	Store    domain.Store
+	CI       domain.CIProvider
+	Stamper  ObligationStamper
+	Writer   WaitResultWriter
+	Events   CancelEventLog
+	Source   VerdictSource
+	Snapshot SnapshotReader
+	Clock    domain.Clock
+}
+
+// NewServer builds the Beacon MCP server with all seven real tools registered
+// and the cycle protocol attached to the handshake. With no dependencies it
+// still exercises the real handlers; inject Dependencies with NewServerWithDeps
+// to give them a persistent store and the other production ports.
 func NewServer() *mcpsdk.Server {
+	return NewServerWithDeps(Dependencies{})
+}
+
+// NewServerWithDeps builds the server and replaces every startup stub with the
+// real handler from its Attach/Register helper. The PR #21 annotations are kept
+// on the initial registration; each helper re-registers its tool with the same
+// honest annotation class.
+func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	s := mcpsdk.NewServer(
 		&mcpsdk.Implementation{Name: ServerName, Version: ServerVersion},
 		&mcpsdk.ServerOptions{
@@ -92,7 +124,60 @@ func NewServer() *mcpsdk.Server {
 		annotations := toolAnnotations[name]
 		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: name, Annotations: &annotations}, stubHandler)
 	}
+
+	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
+	AttachWaitResult(s, NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock))
+	AttachGetResult(s, NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock))
+	attachListRunning(s, deps.Snapshot)
+	AttachAck(s, NewAckHandler(deps.Store, deps.Stamper, deps.Clock))
+	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
+	attachStats(s, deps.Snapshot)
 	return s
+}
+
+// attachListRunning installs the real read-only list_running tool. The handler
+// is defined in tool_list_running.go; there is no separate Attach helper there,
+// so the registration lives in this composition file. A nil reader falls back
+// to an empty snapshot so the tool never panics before a caller wires a store.
+func attachListRunning(s *mcpsdk.Server, reader SnapshotReader) {
+	if s == nil {
+		return
+	}
+	if reader == nil {
+		reader = emptySnapshotReader()
+	}
+	annotations := toolAnnotations["beacon_list_running"]
+	s.RemoveTools("beacon_list_running")
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:        "beacon_list_running",
+		Description: "List running Watches from a read-only state snapshot.",
+		Annotations: &annotations,
+	}, NewListRunningHandler(reader).Handle)
+}
+
+// attachStats installs the real read-only stats tool. Its handler is defined in
+// tool_stats.go and has no separate Attach helper.
+func attachStats(s *mcpsdk.Server, reader SnapshotReader) {
+	if s == nil {
+		return
+	}
+	if reader == nil {
+		reader = emptySnapshotReader()
+	}
+	annotations := toolAnnotations["beacon_stats"]
+	s.RemoveTools("beacon_stats")
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:        "beacon_stats",
+		Description: "Report persisted state counters from a read-only snapshot.",
+		Annotations: &annotations,
+	}, NewStatsHandler(reader).Handle)
+}
+
+// emptySnapshotReader is the minimal dependency used when no SnapshotReader is
+// injected. It is a real SnapshotFunc, not a stub handler: the observability
+// tools still run their own projection over the empty state.
+func emptySnapshotReader() SnapshotReader {
+	return SnapshotFunc(func() (StateSnapshot, error) { return StateSnapshot{}, nil })
 }
 
 // Run serves MCP over stdin/stdout until the client disconnects.
