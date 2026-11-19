@@ -63,6 +63,15 @@
 // content, not by the clientRequestId request key of ADR 0028 and T2.22, and a
 // duplicate consumes no delivery and creates no second follow-up.
 //
+// ADR 0058 p2 (T3.129) adds the addressed doorbell. An agent owns a private
+// mailbox and a long-poll listener blocks on its own address. A message
+// deposited in that mailbox is the only trigger that releases the listener;
+// a broadcast message or a message for another address never does. This is a
+// wake trigger, not a second delivery mode and not a step of the ADR 0017
+// ladder: Delivery keeps its ADR 0026 closed set and no timer is restarted.
+// The doorbell is attached as a narrow port, so callers written before this
+// feature keep their exact behaviour.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -265,6 +274,16 @@ type WakeInput struct {
 	// whitespace is ignored when comparing prompts. An empty prompt keeps the
 	// pointer-only wake message of ADR 0017 unchanged.
 	Prompt string `json:"prompt,omitempty" jsonschema:"prompt content of the long-running job; an equal prompt returns the existing operationId and starts no second task"`
+	// Mailbox is the address of the recipient's private doorbell (ADR 0058 p2,
+	// T3.129). When set and a doorbell is attached, wake deposits a message
+	// addressed to this mailbox, so a long-poll listener on the same address
+	// wakes. An empty address keeps the pre-feature wake unchanged. The address
+	// is the routing key; it is not a session name or a delivery mode.
+	Mailbox string `json:"mailbox,omitempty" jsonschema:"address of the recipient's private doorbell; a long-poll listener on this address wakes only on a message addressed to it"`
+	// Broadcast marks this follow-up as sent to everyone (ADR 0058 p2). A
+	// broadcast message is addressed to no single mailbox: it rings no doorbell
+	// and releases no listener, even when Mailbox names one.
+	Broadcast bool `json:"broadcast,omitempty" jsonschema:"broadcast follow-up; reaches no single mailbox and never rings a doorbell"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -308,6 +327,12 @@ type WakeOutput struct {
 	// Duplicate is true when an equal prompt was already running: the existing
 	// OperationID is returned and no second task or delivery is started.
 	Duplicate bool `json:"duplicate,omitempty"`
+	// DoorbellRang reports that an addressed message was deposited in the
+	// recipient's private mailbox and the doorbell rang (ADR 0058 p2, T3.129).
+	// It is a separate trigger fact: not a new Delivery value and not a ladder
+	// step. It stays false for a broadcast message, an empty Mailbox, and when
+	// no doorbell is attached.
+	DoorbellRang bool `json:"doorbellRang,omitempty"`
 }
 
 // T3.110 (ADR 0046 feature 2) makes a wake error repairable. ADR 0009 fixes the
@@ -569,6 +594,7 @@ type WakeHandler struct {
 	point          func(time.Duration) time.Duration
 	confirmations  *ConfirmationLedger
 	operations     OperationRegistry
+	doorbell       DoorbellPort
 }
 
 // WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
@@ -848,7 +874,9 @@ func withReceiptState(out WakeOutput, in WakeInput) WakeOutput {
 // touched (ADR 0041 p5). With a prompt and an operation registry attached, the
 // entry check of ADR 0056 p3 issues the operationId before any delivery and a
 // repeated prompt returns the existing id with Duplicate=true and no sender
-// call.
+// call. When a mailbox is named, ADR 0058 p2 rings that addressed doorbell
+// after the entry check, so a duplicate prompt rings nothing and a broadcast
+// message rings no mailbox.
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -867,8 +895,10 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
 	}
+	rang := h.ringDoorbell(in)
 
 	finish := func(out WakeOutput) WakeOutput {
+		out.DoorbellRang = rang
 		return withReceiptState(withOperation(out, op), in)
 	}
 
@@ -914,7 +944,9 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 // share the same wake point. A target worktree (ADR 0042 p3) is resolved once
 // by prepareWake, so every channel of the chain addresses the same session.
 // The duplicate-prompt entry check of ADR 0056 p3 runs before the chain, so a
-// repeated prompt never walks a channel or writes a trace.
+// repeated prompt never walks a channel or writes a trace. A named mailbox
+// rings its addressed doorbell (ADR 0058 p2) as a separate trigger fact; it
+// does not change the honest delivery the chain reports.
 func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -933,7 +965,9 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
 	}
+	rang := h.ringDoorbell(in)
 	out := withOperation(h.runFallback(ctx, in, setup.target, setup.source), op)
+	out.DoorbellRang = rang
 	return withReceiptState(out, in), nil
 }
 
@@ -1357,6 +1391,152 @@ func withOperation(out WakeOutput, op OperationResult) WakeOutput {
 	return out
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0058 p2 / T3.129: addressed doorbell wake.
+//
+// An agent owns a private mailbox and waits on its own address. The message in
+// that mailbox is the trigger: a long-poll listener returns only when a message
+// addressed to it arrives. A broadcast message or a message for another
+// address never releases a listener, and no ladder timer (ADR 0017) is started.
+// This is a wake trigger, not a new Delivery value and not a ladder step.
+// ---------------------------------------------------------------------------
+
+// DoorbellMessage is one message deposited in a private mailbox. Address names
+// the single mailbox it is for; Broadcast marks a message sent to everyone.
+// A broadcast or unaddressed message rings nothing. Text is pointer-only
+// content (ADR 0017): the doorbell wakes, it does not carry check contents.
+type DoorbellMessage struct {
+	Address   string `json:"address"`
+	Text      string `json:"text"`
+	Broadcast bool   `json:"broadcast,omitempty"`
+}
+
+// DoorbellPort is the narrow port the wake handler uses to ring an addressed
+// doorbell. The environment adapter supplies the real long-poll mailbox; the
+// in-memory Doorbell below is the default for tests and single-process use.
+type DoorbellPort interface {
+	Ring(msg DoorbellMessage) bool
+}
+
+// doorbellMailbox is one address's queue and waiting listeners.
+type doorbellMailbox struct {
+	pending []DoorbellMessage
+	signals []chan struct{}
+}
+
+// Doorbell is an in-memory switchboard of addressed private mailboxes. Each
+// address has its own queue, so a message for one address can never release a
+// listener on another. A broadcast or unaddressed message is deposited
+// nowhere, so it cannot wake any agent.
+type Doorbell struct {
+	mu        sync.Mutex
+	mailboxes map[string]*doorbellMailbox
+}
+
+// NewDoorbell builds an empty addressed-doorbell switchboard.
+func NewDoorbell() *Doorbell {
+	return &Doorbell{mailboxes: make(map[string]*doorbellMailbox)}
+}
+
+func (d *Doorbell) mailbox(address string) *doorbellMailbox {
+	mb := d.mailboxes[address]
+	if mb == nil {
+		mb = &doorbellMailbox{}
+		d.mailboxes[address] = mb
+	}
+	return mb
+}
+
+// removeSignal unregisters a listener's wake signal. It is called under the
+// switchboard lock on every Listen exit, so a finished waiter never keeps a
+// stale channel in the mailbox.
+func removeSignal(mb *doorbellMailbox, sig chan struct{}) {
+	for i, s := range mb.signals {
+		if s == sig {
+			mb.signals = append(mb.signals[:i], mb.signals[i+1:]...)
+			return
+		}
+	}
+}
+
+// Ring deposits msg in the mailbox named by its address and notifies that
+// mailbox's listeners. A broadcast message or an empty address is addressed to
+// no single mailbox: Ring returns false and releases no listener. The return
+// value is the separate trigger fact recorded on the wake receipt.
+func (d *Doorbell) Ring(msg DoorbellMessage) bool {
+	if d == nil || msg.Broadcast || msg.Address == "" {
+		return false
+	}
+	d.mu.Lock()
+	mb := d.mailbox(msg.Address)
+	mb.pending = append(mb.pending, msg)
+	signals := append([]chan struct{}(nil), mb.signals...)
+	d.mu.Unlock()
+	for _, sig := range signals {
+		select {
+		case sig <- struct{}{}:
+		default:
+		}
+	}
+	return true
+}
+
+// Listen is the long-poll entry point of the addressed doorbell. It blocks
+// until a message addressed to address arrives, then returns that message. It
+// never returns on a timer and never on a broadcast or a message for another
+// address: the addressed message is the only trigger (ADR 0058 p2). An empty
+// address is rejected. Cancelling ctx releases the waiter with an error and
+// leaves any pending message for another listener intact.
+func (d *Doorbell) Listen(ctx context.Context, address string) (DoorbellMessage, error) {
+	if d == nil || address == "" {
+		return DoorbellMessage{}, domain.NewAppError(domain.CodeInvalidInput, "doorbell: an address is required to listen")
+	}
+	sig := make(chan struct{}, 1)
+	d.mu.Lock()
+	mb := d.mailbox(address)
+	mb.signals = append(mb.signals, sig)
+	for {
+		if len(mb.pending) > 0 {
+			msg := mb.pending[0]
+			mb.pending = mb.pending[1:]
+			removeSignal(mb, sig)
+			d.mu.Unlock()
+			return msg, nil
+		}
+		d.mu.Unlock()
+		select {
+		case <-sig:
+			d.mu.Lock()
+		case <-ctx.Done():
+			d.mu.Lock()
+			removeSignal(mb, sig)
+			d.mu.Unlock()
+			return DoorbellMessage{}, ctx.Err()
+		}
+	}
+}
+
+// WithDoorbell attaches the addressed doorbell used to ring a listener when a
+// wake names a mailbox. A nil port disables the feature, so callers written
+// before ADR 0058 p2 keep their exact behaviour.
+func (h *WakeHandler) WithDoorbell(port DoorbellPort) *WakeHandler {
+	if h != nil {
+		h.doorbell = port
+	}
+	return h
+}
+
+// ringDoorbell deposits an addressed message in the recipient's private
+// mailbox (ADR 0058 p2). A broadcast message, an empty Mailbox or a missing
+// port rings nothing. It runs after the operation entry check, so a duplicate
+// prompt never rings a second time.
+func (h *WakeHandler) ringDoorbell(in WakeInput) bool {
+	if h == nil || h.doorbell == nil || in.Mailbox == "" {
+		return false
+	}
+	return h.doorbell.Ring(DoorbellMessage{Address: in.Mailbox, Text: in.Text, Broadcast: in.Broadcast})
+}
+
 // AttachWake registers the real wake tool on a server. NewServer keeps the
 // contracted stub set and does not call this function; registration is a
 // separate integration task.
@@ -1368,7 +1548,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task. mailbox names the recipient's private doorbell: a message addressed to it rings the bell so a long-poll listener on that address wakes, and doorbellRang reports it. A broadcast message reaches no single mailbox and rings nothing; the doorbell is a wake trigger, not a new delivery value or a ladder step.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
