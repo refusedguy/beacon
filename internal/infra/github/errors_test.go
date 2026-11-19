@@ -342,3 +342,212 @@ func TestNormalizeReturnsConflict(t *testing.T) {
 		t.Fatalf("plain 409 has Conflict = %#v", plain.Conflict)
 	}
 }
+
+// --- Cross-platform CI status adapter tests (ADR 0039 §3, T3.62) ---
+
+type statusCase struct {
+	name     string
+	provider Provider
+	body     string
+}
+
+// One status from three providers produces one neutral representation.
+func TestStatusParserSameStatusAcrossProviders(t *testing.T) {
+	p := NewStatusParser()
+	cases := []statusCase{
+		{"github success", ProviderGitHub,
+			`{"check_runs":[{"name":"build","status":"completed","conclusion":"success","html_url":"https://gh/build"}]}`},
+		{"gitlab success", ProviderGitLab,
+			`{"status":"success","jobs":[{"name":"build","status":"success","web_url":"https://gl/build"}]}`},
+		{"bitbucket success", ProviderBitbucket,
+			`{"values":[{"state":"SUCCESSFUL","name":"build","url":"https://bb/build"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, appErr := p.Parse(tc.provider, []byte(tc.body))
+			if appErr != nil {
+				t.Fatalf("Parse error = %+v, want none", appErr)
+			}
+			if got.Rollup != "SUCCESS" {
+				t.Fatalf("Rollup = %q, want SUCCESS", got.Rollup)
+			}
+			if len(got.Failures) != 0 {
+				t.Fatalf("Failures = %v, want empty", got.Failures)
+			}
+			if len(got.Checks) != 1 {
+				t.Fatalf("len(Checks) = %d, want 1", len(got.Checks))
+			}
+			c := got.Checks[0]
+			if c.Name != "build" || c.State != CheckSuccess || c.DetailsURL == "" {
+				t.Fatalf("Check = %+v, want build/SUCCESS with a URL", c)
+			}
+		})
+	}
+}
+
+func TestStatusParserFailureAcrossProviders(t *testing.T) {
+	p := NewStatusParser()
+	cases := []statusCase{
+		{"github failure", ProviderGitHub,
+			`{"check_runs":[{"name":"build","status":"completed","conclusion":"failure"}]}`},
+		{"gitlab failure", ProviderGitLab,
+			`{"status":"failed","jobs":[{"name":"build","status":"failed"}]}`},
+		{"bitbucket failure", ProviderBitbucket,
+			`{"values":[{"state":"FAILED","name":"build"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, appErr := p.Parse(tc.provider, []byte(tc.body))
+			if appErr != nil {
+				t.Fatalf("Parse error = %+v, want none", appErr)
+			}
+			if got.Rollup != "FAILURE" {
+				t.Fatalf("Rollup = %q, want FAILURE", got.Rollup)
+			}
+			if !reflect.DeepEqual(got.Failures, []string{"build"}) {
+				t.Fatalf("Failures = %v, want [build]", got.Failures)
+			}
+			if got.Checks[0].State != CheckFailure {
+				t.Fatalf("Check.State = %q, want FAILURE", got.Checks[0].State)
+			}
+		})
+	}
+}
+
+func TestStatusParserPendingAcrossProviders(t *testing.T) {
+	p := NewStatusParser()
+	cases := []statusCase{
+		{"github in_progress", ProviderGitHub,
+			`{"check_runs":[{"name":"build","status":"in_progress"}]}`},
+		{"gitlab running", ProviderGitLab,
+			`{"status":"running","jobs":[{"name":"build","status":"running"}]}`},
+		{"bitbucket inprogress", ProviderBitbucket,
+			`{"values":[{"state":"INPROGRESS","name":"build"}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, appErr := p.Parse(tc.provider, []byte(tc.body))
+			if appErr != nil {
+				t.Fatalf("Parse error = %+v, want none", appErr)
+			}
+			if got.Rollup != "PENDING" {
+				t.Fatalf("Rollup = %q, want PENDING", got.Rollup)
+			}
+			if len(got.Failures) != 0 {
+				t.Fatalf("Failures = %v, want empty", got.Failures)
+			}
+			if got.Checks[0].State != CheckPending {
+				t.Fatalf("Check.State = %q, want PENDING", got.Checks[0].State)
+			}
+		})
+	}
+}
+
+// Skipped and neutral results, including an allowed-failure GitLab job, never
+// enter Failures. Each provider spells that state differently.
+func TestStatusParserNeutralAndSkipped(t *testing.T) {
+	p := NewStatusParser()
+	cases := []struct {
+		statusCase
+		want CheckState
+	}{
+		{statusCase{"github skipped", ProviderGitHub,
+			`{"check_runs":[{"name":"doc","status":"completed","conclusion":"skipped"}]}`}, CheckSkipped},
+		{statusCase{"github neutral", ProviderGitHub,
+			`{"check_runs":[{"name":"lint","status":"completed","conclusion":"neutral"}]}`}, CheckNeutral},
+		{statusCase{"gitlab allow_failure", ProviderGitLab,
+			`{"status":"success","jobs":[{"name":"lint","status":"failed","allow_failure":true}]}`}, CheckNeutral},
+		{statusCase{"bitbucket stopped", ProviderBitbucket,
+			`{"values":[{"state":"STOPPED","name":"deploy"}]}`}, CheckNeutral},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, appErr := p.Parse(tc.provider, []byte(tc.body))
+			if appErr != nil {
+				t.Fatalf("Parse error = %+v, want none", appErr)
+			}
+			if got.Rollup != "SUCCESS" {
+				t.Fatalf("Rollup = %q, want SUCCESS", got.Rollup)
+			}
+			if len(got.Failures) != 0 {
+				t.Fatalf("Failures = %v, want empty", got.Failures)
+			}
+			if got.Checks[0].State != tc.want {
+				t.Fatalf("Check.State = %q, want %q", got.Checks[0].State, tc.want)
+			}
+		})
+	}
+}
+
+func TestStatusParserStructuredErrors(t *testing.T) {
+	p := NewStatusParser()
+	cases := []struct {
+		name     string
+		provider Provider
+		body     string
+		wantCode domain.ErrorCode
+	}{
+		{"unknown provider", Provider("circle"), `{}`, CodeCIUnknownProvider},
+		{"github malformed", ProviderGitHub, `{`, CodeCIMalformed},
+		{"github missing", ProviderGitHub, `{}`, CodeCIMissingStatus},
+		{"gitlab missing", ProviderGitLab, `{}`, CodeCIMissingStatus},
+		{"bitbucket missing", ProviderBitbucket, `{}`, CodeCIMissingStatus},
+		{"github invalid conclusion", ProviderGitHub,
+			`{"check_runs":[{"name":"x","status":"completed","conclusion":"mystery"}]}`, CodeCIInvalidStatus},
+		{"gitlab invalid status", ProviderGitLab,
+			`{"status":"mystery","jobs":[]}`, CodeCIInvalidStatus},
+		{"bitbucket invalid state", ProviderBitbucket,
+			`{"values":[{"state":"MYSTERY","name":"x"}]}`, CodeCIInvalidStatus},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, appErr := p.Parse(tc.provider, []byte(tc.body))
+			if appErr == nil {
+				t.Fatal("Parse error = nil, want a structured AppError")
+			}
+			if appErr.Code != tc.wantCode {
+				t.Fatalf("Code = %q, want %q", appErr.Code, tc.wantCode)
+			}
+			if appErr.Status != http.StatusBadRequest {
+				t.Fatalf("Status = %d, want %d", appErr.Status, http.StatusBadRequest)
+			}
+			if appErr.Error() == "" {
+				t.Fatal("AppError.Error() is empty")
+			}
+			if !reflect.DeepEqual(got, StatusResult{}) {
+				t.Fatalf("result on error = %+v, want zero", got)
+			}
+		})
+	}
+}
+
+// All three adapters satisfy one interface, and Apply only prepares verdict
+// input without calling the verdict engine.
+func TestStatusAdaptersViaInterfaceAndApply(t *testing.T) {
+	adapters := []StatusAdapter{
+		NewGitHubActionsAdapter(),
+		NewGitLabAdapter(),
+		NewBitbucketAdapter(),
+	}
+	want := []Provider{ProviderGitHub, ProviderGitLab, ProviderBitbucket}
+	for i, a := range adapters {
+		if a.Provider() != want[i] {
+			t.Errorf("adapter %d Provider = %q, want %q", i, a.Provider(), want[i])
+		}
+	}
+
+	p := NewStatusParser()
+	res, appErr := p.Parse(ProviderGitHub,
+		[]byte(`{"check_runs":[{"name":"build","status":"completed","conclusion":"failure"}]}`))
+	if appErr != nil {
+		t.Fatalf("Parse error = %+v, want none", appErr)
+	}
+	var snap domain.Snapshot
+	res.Apply(&snap)
+	if snap.Rollup != "FAILURE" {
+		t.Fatalf("Snapshot.Rollup = %q, want FAILURE", snap.Rollup)
+	}
+	if !reflect.DeepEqual(snap.Failures, []string{"build"}) {
+		t.Fatalf("Snapshot.Failures = %v, want [build]", snap.Failures)
+	}
+}
