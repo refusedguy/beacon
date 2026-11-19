@@ -731,3 +731,207 @@ func TestEvaluateShipFactsDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// completionPlan is a two-phase plan with approved, verifiable proof for each
+// phase. Individual cases break one condition at a time.
+func completionPlan() ([]Phase, []Proof) {
+	phases := []Phase{{ID: "implement", Done: true}, {ID: "verify", Done: true}}
+	proofs := []Proof{
+		{PhaseID: "implement", Artifact: "abc123def", Approved: true},
+		{PhaseID: "verify", Artifact: "ci/run/42", Approved: true},
+	}
+	return phases, proofs
+}
+
+// TestCompletionGate covers both closing conditions of ADR 0042 §4. Closing
+// requires every phase done and an approved, verifiable proof for each one;
+// any failure returns the task to work with a machine-readable reason.
+func TestCompletionGate(t *testing.T) {
+	tests := []struct {
+		name   string
+		phases []Phase
+		proofs []Proof
+		want   CompletionResult
+	}{
+		{
+			name:   "no plan cannot close",
+			phases: nil,
+			proofs: nil,
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonNoPlan},
+		},
+		{
+			name:   "open phase returns to work",
+			phases: []Phase{{ID: "implement", Done: true}, {ID: "verify", Done: false}},
+			proofs: []Proof{{PhaseID: "implement", Artifact: "abc123def", Approved: true}},
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonOpenPhase, PhaseID: "verify"},
+		},
+		{
+			name:   "done phase without proof returns to work",
+			phases: []Phase{{ID: "implement", Done: true}},
+			proofs: nil,
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonMissingProof, PhaseID: "implement"},
+		},
+		{
+			name:   "empty proof trace returns to work",
+			phases: []Phase{{ID: "implement", Done: true}},
+			proofs: []Proof{{PhaseID: "implement", Artifact: "   ", Approved: true}},
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonProofNoTrace, PhaseID: "implement"},
+		},
+		{
+			name:   "unapproved proof returns to work",
+			phases: []Phase{{ID: "implement", Done: true}},
+			proofs: []Proof{{PhaseID: "implement", Artifact: "abc123def", Approved: false}},
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonProofUnapproved, PhaseID: "implement"},
+		},
+		{
+			name:   "proof for another phase does not count",
+			phases: []Phase{{ID: "verify", Done: true}},
+			proofs: []Proof{{PhaseID: "implement", Artifact: "abc123def", Approved: true}},
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonMissingProof, PhaseID: "verify"},
+		},
+		{
+			name:   "all phases done with approved proof closes",
+			phases: []Phase{{ID: "implement", Done: true}, {ID: "verify", Done: true}},
+			proofs: []Proof{
+				{PhaseID: "implement", Artifact: "abc123def", Approved: true},
+				{PhaseID: "verify", Artifact: "ci/run/42", Approved: true},
+			},
+			want: CompletionResult{Outcome: CompletionAllow},
+		},
+		{
+			name:   "one phase missing proof blocks the whole plan",
+			phases: []Phase{{ID: "implement", Done: true}, {ID: "verify", Done: true}},
+			proofs: []Proof{{PhaseID: "implement", Artifact: "abc123def", Approved: true}},
+			want:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonMissingProof, PhaseID: "verify"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := CompletionGate(tt.phases, tt.proofs); got != tt.want {
+				t.Fatalf("CompletionGate = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Both conditions are independent: done phases alone and proof alone each
+// fail. Only the conjunction closes the task.
+func TestCompletionGateRequiresConditionsTogether(t *testing.T) {
+	phases, proofs := completionPlan()
+
+	// All phases done, but no proof left.
+	if got := CompletionGate(phases, nil); got.Outcome != CompletionRework ||
+		got.Reason != CompletionReasonMissingProof {
+		t.Fatalf("done phases without proof = %+v, want rework/missing_proof", got)
+	}
+
+	// Proof for every phase, but one phase still open.
+	open := []Phase{{ID: "implement", Done: true}, {ID: "verify", Done: false}}
+	if got := CompletionGate(open, proofs); got.Outcome != CompletionRework ||
+		got.Reason != CompletionReasonOpenPhase {
+		t.Fatalf("proof with an open phase = %+v, want rework/open_phase", got)
+	}
+
+	if got := CompletionGate(phases, proofs); got.Outcome != CompletionAllow {
+		t.Fatalf("both conditions met = %+v, want allow", got)
+	}
+}
+
+// The gate is a closing condition, not the review gate: its result carries no
+// Verdict or ReviewVerdict and its output is not one of those types. A REWORK
+// must not be mistaken for a downgraded review decision.
+func TestCompletionGateDoesNotChangeVerdict(t *testing.T) {
+	resultType := reflect.TypeOf(CompletionResult{})
+	verdictType := reflect.TypeOf(VerdictWatching)
+	reviewType := reflect.TypeOf(ReviewShip)
+	for i := 0; i < resultType.NumField(); i++ {
+		field := resultType.Field(i).Type
+		if field == verdictType || field == reviewType {
+			t.Errorf("CompletionResult.%s = %v, must not carry a verdict", resultType.Field(i).Name, field)
+		}
+	}
+
+	fn := reflect.TypeOf(CompletionGate)
+	if fn.NumOut() != 1 || fn.Out(0) != resultType {
+		t.Fatalf("CompletionGate output = %v, want exactly one CompletionResult", fn)
+	}
+
+	// Even with a SHIP review verdict on the table, a missing proof is REWORK.
+	phases, proofs := completionPlan()
+	proofs[1].Approved = false
+	got := CompletionGate(phases, proofs)
+	if got.Outcome != CompletionRework || got.Reason != CompletionReasonProofUnapproved {
+		t.Fatalf("gate with unapproved proof = %+v, want rework/proof_unapproved", got)
+	}
+}
+
+// The gate is pure: repeated calls give the same result and leave the plan and
+// its proofs untouched, so a caller can retry it without side effects.
+func TestCompletionGateDeterministicAndPure(t *testing.T) {
+	phases, proofs := completionPlan()
+	phases[1].Done = false
+	want := CompletionGate(phases, proofs)
+	phasesCopy := append([]Phase(nil), phases...)
+	proofsCopy := append([]Proof(nil), proofs...)
+
+	for i := 0; i < 10; i++ {
+		if got := CompletionGate(phases, proofs); got != want {
+			t.Fatalf("call %d = %+v, want %+v", i, got, want)
+		}
+	}
+	if !reflect.DeepEqual(phases, phasesCopy) || !reflect.DeepEqual(proofs, proofsCopy) {
+		t.Fatalf("gate mutated its inputs: phases=%+v proofs=%+v", phases, proofs)
+	}
+}
+
+// The canonical strings are the journal form. Changing one breaks recorded
+// completion results, the same way the review verdict strings are pinned.
+func TestCompletionCanonicalStrings(t *testing.T) {
+	if string(CompletionAllow) != "ALLOW" || string(CompletionRework) != "REWORK" {
+		t.Fatalf("outcome strings = %q, %q", CompletionAllow, CompletionRework)
+	}
+	cases := map[CompletionReason]string{
+		CompletionReasonNoPlan:          "no_plan",
+		CompletionReasonOpenPhase:       "open_phase",
+		CompletionReasonMissingProof:    "missing_proof",
+		CompletionReasonProofNoTrace:    "proof_no_trace",
+		CompletionReasonProofUnapproved: "proof_unapproved",
+	}
+	for reason, want := range cases {
+		if string(reason) != want {
+			t.Errorf("reason = %q, want %q", reason, want)
+		}
+	}
+}
+
+// The JSON shape is part of the recorded result contract: outcome is always
+// present, reason and phase are omitted on a clean allow.
+func TestCompletionResultJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   CompletionResult
+		want string
+	}{
+		{
+			name: "allow omits reason and phase",
+			in:   CompletionResult{Outcome: CompletionAllow},
+			want: `{"outcome":"ALLOW"}`,
+		},
+		{
+			name: "rework names the reason and phase",
+			in:   CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonOpenPhase, PhaseID: "verify"},
+			want: `{"outcome":"REWORK","reason":"open_phase","phase":"verify"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Fatalf("json = %s, want %s", b, tc.want)
+			}
+		})
+	}
+}

@@ -334,3 +334,95 @@ type ShipFacts struct {
 func ShipAllowed(f ShipFacts) bool {
 	return f.Build && f.Audit && (f.TDD || f.Trivial)
 }
+
+// Phase is one step of a task plan. Done records that the agent finished the
+// step. A done phase does not by itself close the task: under ADR 0042 §4 it
+// still owes proof before the completion gate allows the close.
+type Phase struct {
+	ID   string
+	Done bool
+}
+
+// Proof is the verifiable trace an agent leaves for a completed phase. It is
+// recorded next to the task and enters the archive with approval (ADR 0042 §4).
+// PhaseID binds the proof to a phase, Artifact is the reference a reviewer can
+// re-check, and Approved records that the archive accepted it. An empty
+// artifact or a missing approval cannot close a task.
+type Proof struct {
+	PhaseID  string
+	Artifact string
+	Approved bool
+}
+
+// CompletionOutcome is the completion gate decision. A REWORK result returns
+// the task to the agent. This is a closing condition, not the review gate from
+// ADR 0038 §4: the gate never returns a Verdict or ReviewVerdict and never
+// changes either one.
+type CompletionOutcome string
+
+const (
+	// CompletionAllow means every phase is done and carries approved proof.
+	CompletionAllow CompletionOutcome = "ALLOW"
+	// CompletionRework means a condition failed and the task stays in work.
+	CompletionRework CompletionOutcome = "REWORK"
+)
+
+// CompletionReason is the machine-readable cause of a REWORK decision. Callers
+// branch on it instead of parsing a message, as with ConflictType.
+type CompletionReason string
+
+const (
+	CompletionReasonNoPlan          CompletionReason = "no_plan"
+	CompletionReasonOpenPhase       CompletionReason = "open_phase"
+	CompletionReasonMissingProof    CompletionReason = "missing_proof"
+	CompletionReasonProofNoTrace    CompletionReason = "proof_no_trace"
+	CompletionReasonProofUnapproved CompletionReason = "proof_unapproved"
+)
+
+// CompletionResult is the gate answer. Reason and PhaseID are set only for
+// REWORK so a caller can name the exact condition that blocked the close.
+type CompletionResult struct {
+	Outcome CompletionOutcome `json:"outcome"`
+	Reason  CompletionReason  `json:"reason,omitempty"`
+	PhaseID string            `json:"phase,omitempty"`
+}
+
+// CompletionGate decides whether the agent may close a task. Both conditions
+// of ADR 0042 §4 must hold: every plan phase is done, and every phase carries
+// an approved, verifiable proof. Any failed condition returns the task to work
+// with a reason rather than flipping a verdict. This is distinct from the ship
+// formula (T3.67) and from the outcome rubric (T3.31): it checks only phases
+// and proof. The function is pure, so it reads no clock or state and mutates
+// neither phases nor proofs.
+func CompletionGate(phases []Phase, proofs []Proof) CompletionResult {
+	if len(phases) == 0 {
+		return CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonNoPlan}
+	}
+	for _, phase := range phases {
+		if !phase.Done {
+			return CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonOpenPhase, PhaseID: phase.ID}
+		}
+		proof, ok := proofForPhase(proofs, phase.ID)
+		if !ok {
+			return CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonMissingProof, PhaseID: phase.ID}
+		}
+		if strings.TrimSpace(proof.Artifact) == "" {
+			return CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonProofNoTrace, PhaseID: phase.ID}
+		}
+		if !proof.Approved {
+			return CompletionResult{Outcome: CompletionRework, Reason: CompletionReasonProofUnapproved, PhaseID: phase.ID}
+		}
+	}
+	return CompletionResult{Outcome: CompletionAllow}
+}
+
+// proofForPhase returns the proof bound to phaseID. A proof for another phase
+// does not count, so a task cannot borrow one phase's trace to close another.
+func proofForPhase(proofs []Proof, phaseID string) (Proof, bool) {
+	for _, proof := range proofs {
+		if proof.PhaseID == phaseID {
+			return proof, true
+		}
+	}
+	return Proof{}, false
+}
