@@ -86,7 +86,12 @@ func (s *waitTestSource) Subscribe(watchID string) VerdictSubscription {
 	return s.sub
 }
 
-func (s *waitTestSource) publish(u WaitVerdictUpdate) { s.sub.ch <- u }
+func (s *waitTestSource) publish(u WaitVerdictUpdate) {
+	if s.sub == nil {
+		s.sub = &waitTestSubscription{ch: make(chan WaitVerdictUpdate, 8)}
+	}
+	s.sub.ch <- u
+}
 
 type waitTestClock struct{ at time.Time }
 
