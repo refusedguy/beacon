@@ -244,6 +244,58 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	}, nil
 }
 
+// --- Ship facts from observed checks (ADR 0040 §2, T3.75) -------------------
+//
+// Evaluate gates the ready verdict on the compiled-in ship formula, so a
+// Snapshot assembled from a Watch must carry the facts the formula reads. The
+// Watch carries observed checks and nothing else that could serve as an
+// opinion: each fact turns on only for a required, green check with the
+// matching role. A missing or failing check leaves its fact false, which is
+// the honest value for a fact nobody observed.
+
+// shipFactsFromWatch derives the ship facts from a Watch's CI checks. Check
+// names are classified case-insensitively by substring so both "build" and
+// "ci/build" (or "test" and "ci/tests") work. Trivial has no observable
+// signal on a Watch, so it stays false rather than being invented.
+func shipFactsFromWatch(w domain.Watch) domain.ShipFacts {
+	var facts domain.ShipFacts
+	for name, check := range w.Checks {
+		if !check.Required || !isGreenCheck(check) {
+			continue
+		}
+		if checkNameHas(name, "build") {
+			facts.Build = true
+		}
+		if checkNameHas(name, "audit") {
+			facts.Audit = true
+		}
+		if checkNameHas(name, "test") {
+			facts.TDD = true
+		}
+	}
+	return facts
+}
+
+// withShipFacts returns a copy of s whose Ship field is derived from w. Any
+// caller that builds a Snapshot from a Watch before calling domain.Evaluate
+// must go through this helper, otherwise the ready gate sees zero facts.
+func withShipFacts(s domain.Snapshot, w domain.Watch) domain.Snapshot {
+	s.Ship = shipFactsFromWatch(w)
+	return s
+}
+
+// isGreenCheck reports whether c completed successfully. It is the green
+// counterpart of isFailedCheck: a missing conclusion with a SUCCESS state,
+// or a SUCCESS conclusion with a missing state, is still a green check.
+func isGreenCheck(c domain.Check) bool {
+	return strings.EqualFold(c.Conclusion, "SUCCESS") || strings.EqualFold(c.State, "SUCCESS")
+}
+
+// checkNameHas reports whether name contains want, ignoring case.
+func checkNameHas(name, want string) bool {
+	return strings.Contains(strings.ToLower(name), want)
+}
+
 // collectFailedChecks projects only the fields the contract allows. No check
 // output, log text or raw payload is copied into the response.
 func collectFailedChecks(w domain.Watch) []FailedCheck {
