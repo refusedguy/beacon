@@ -5,6 +5,7 @@ package domain
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -235,4 +236,171 @@ func (e *AppError) Error() string {
 		return string(e.Code)
 	}
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
+// StreamEvent is one chunk of a Beacon event stream. Seq is a monotonic,
+// 1-based position: a client restores chunk order by sorting on Seq and sees a
+// gap when a position never arrives. WatchID ties the chunk to a Watch and
+// Payload is an opaque preview of the result. The authoritative, complete
+// result travels separately in StreamFinal, so losing a chunk never costs the
+// client the full answer (ADR 0031 §1, Q 1.2 mcp-partials).
+type StreamEvent struct {
+	Seq     uint64 `json:"seq"`
+	WatchID string `json:"watchID"`
+	Payload []byte `json:"payload,omitempty"`
+}
+
+// StreamFinal is the terminal event of a Beacon stream. Chunks is the number
+// of chunks the producer emitted; Missing lists the 1-based positions the
+// client never received; Duplicates counts the extra copies of a position the
+// client saw. Events are the delivered chunks in ascending Seq order. Result
+// is the complete authoritative result, identical whether or not the chunks
+// were delivered, and Streamed reports whether at least one chunk arrived
+// (ADR 0031 §1).
+type StreamFinal struct {
+	Chunks     uint64        `json:"chunks"`
+	Missing    []uint64      `json:"missing"`
+	Duplicates uint64        `json:"duplicates"`
+	Streamed   bool          `json:"streamed"`
+	Events     []StreamEvent `json:"events,omitempty"`
+	Result     []byte        `json:"result,omitempty"`
+}
+
+// defaultReorderWindow is how far ahead of a gap the assembler waits before it
+// gives that position up as missing. It mirrors mcp-partials' reorderWindow.
+const defaultReorderWindow uint64 = 16
+
+// StreamAssembler restores chunk order on the client. It accepts chunks that
+// arrive out of order or more than once, emits them in ascending Seq order and
+// remembers which positions were never seen. Finish reports honest missing
+// and duplicate counts plus the complete result, so a client that lost chunks
+// still ends with the full answer.
+type StreamAssembler struct {
+	window     uint64
+	next       uint64
+	pending    map[uint64]StreamEvent
+	seen       map[uint64]bool
+	duplicates uint64
+	missing    []uint64
+	ordered    []StreamEvent
+}
+
+// NewStreamAssembler builds an assembler over the given reorder window. A
+// zero window selects the default, so callers cannot build one that waits
+// forever for a gap.
+func NewStreamAssembler(window uint64) *StreamAssembler {
+	if window == 0 {
+		window = defaultReorderWindow
+	}
+	return &StreamAssembler{
+		window:  window,
+		next:    1,
+		pending: make(map[uint64]StreamEvent),
+		seen:    make(map[uint64]bool),
+	}
+}
+
+// Push records a chunk. Seq zero is ignored because positions start at one.
+// Repeating a position is counted as a duplicate and never emitted twice.
+func (a *StreamAssembler) Push(ev StreamEvent) {
+	if ev.Seq == 0 {
+		return
+	}
+	if a.seen[ev.Seq] {
+		a.duplicates++
+		return
+	}
+	a.seen[ev.Seq] = true
+	a.pending[ev.Seq] = ev
+	a.flush()
+}
+
+// flush emits contiguous chunks and, once a gap is further ahead than the
+// window, gives up on the skipped positions and continues after them.
+func (a *StreamAssembler) flush() {
+	for {
+		if ev, ok := a.pending[a.next]; ok {
+			a.ordered = append(a.ordered, ev)
+			delete(a.pending, a.next)
+			a.next++
+			continue
+		}
+		if len(a.pending) == 0 {
+			return
+		}
+		minSeq := a.minPending()
+		if minSeq > a.next && minSeq-a.next > a.window {
+			for s := a.next; s < minSeq; s++ {
+				a.missing = append(a.missing, s)
+			}
+			a.next = minSeq
+			continue
+		}
+		return
+	}
+}
+
+// minPending returns the smallest buffered position. The caller only calls it
+// with a non-empty buffer.
+func (a *StreamAssembler) minPending() uint64 {
+	var min uint64
+	first := true
+	for seq := range a.pending {
+		if first || seq < min {
+			min = seq
+			first = false
+		}
+	}
+	return min
+}
+
+// OrderedChunks returns the chunks emitted so far in ascending Seq order.
+func (a *StreamAssembler) OrderedChunks() []StreamEvent {
+	out := make([]StreamEvent, len(a.ordered))
+	copy(out, a.ordered)
+	return out
+}
+
+// Finish closes the stream. expected is the number of chunks the producer
+// emitted and result is the complete authoritative result. Every position in
+// 1..expected that was never seen is reported missing, buffered chunks are
+// returned in ascending order, and the result is carried through unchanged.
+func (a *StreamAssembler) Finish(expected uint64, result []byte) StreamFinal {
+	a.flush()
+	// The producer count can never be smaller than the positions already
+	// emitted; take the larger value so accounting stays honest.
+	if emitted := a.next - 1; expected < emitted {
+		expected = emitted
+	}
+
+	reported := make(map[uint64]bool, len(a.missing))
+	for _, s := range a.missing {
+		reported[s] = true
+	}
+	for s := a.next; s <= expected; s++ {
+		if !a.seen[s] && !reported[s] {
+			a.missing = append(a.missing, s)
+		}
+	}
+	sort.Slice(a.missing, func(i, j int) bool { return a.missing[i] < a.missing[j] })
+
+	rest := make([]uint64, 0, len(a.pending))
+	for seq := range a.pending {
+		rest = append(rest, seq)
+	}
+	sort.Slice(rest, func(i, j int) bool { return rest[i] < rest[j] })
+	ordered := make([]StreamEvent, 0, len(a.ordered)+len(rest))
+	ordered = append(ordered, a.ordered...)
+	for _, seq := range rest {
+		ordered = append(ordered, a.pending[seq])
+	}
+
+	return StreamFinal{
+		Chunks:     expected,
+		Missing:    a.missing,
+		Duplicates: a.duplicates,
+		Streamed:   len(ordered) > 0,
+		Events:     ordered,
+		Result:     result,
+	}
 }

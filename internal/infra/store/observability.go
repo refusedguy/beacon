@@ -34,6 +34,18 @@ INSERT OR IGNORE INTO persist_progress (id, seq, last_error, failed_since)
 VALUES (1, 0, '', 0);
 `
 
+const createStreamHealthSQL = `
+CREATE TABLE IF NOT EXISTS stream_health (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  chunks     INTEGER NOT NULL DEFAULT 0,
+  missing    TEXT NOT NULL DEFAULT '[]',
+  duplicates INTEGER NOT NULL DEFAULT 0,
+  last_seq   INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO stream_health (id, chunks, missing, duplicates, last_seq)
+VALUES (1, 0, '[]', 0, 0);
+`
+
 // PersistState is the persist{seq,lastError} block of beacon_stats. FailedSince
 // is when the last failed write was recorded; it is zero while the last write
 // succeeded. The JSON names match the stats contract.
@@ -41,6 +53,18 @@ type PersistState struct {
 	Seq         uint64    `json:"seq"`
 	LastError   string    `json:"lastError"`
 	FailedSince time.Time `json:"failedSince,omitempty"`
+}
+
+// StreamHealth is the observability view of the last completed stream: how
+// many chunks the producer emitted, which seq positions were missing at the
+// client and how many duplicates arrived. Missing is always a sorted list of
+// 1-based positions. The counters are kept apart from persist_progress so the
+// beacon_stats persist block keeps its seq and lastError contract.
+type StreamHealth struct {
+	Chunks     uint64   `json:"chunks"`
+	Missing    []uint64 `json:"missing"`
+	Duplicates uint64   `json:"duplicates"`
+	LastSeq    uint64   `json:"lastSeq"`
 }
 
 // LoadError is one damaged journal row. Line is the event seq, the SQLite
@@ -134,6 +158,73 @@ func (p *ObservedPersist) recordSuccess(ctx context.Context) error {
 			WHERE id = 1`)
 		return err
 	})
+}
+
+// RecordStream persists the final counters of a completed stream. The missing
+// list is stored as JSON so an empty and a populated list round-trip the same
+// way. It writes directly through the underlying DB, not through Write, so
+// recording stream health does not advance the persist seq.
+func (p *ObservedPersist) RecordStream(ctx context.Context, final domain.StreamFinal) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	positions := final.Missing
+	if positions == nil {
+		positions = []uint64{}
+	}
+	missing, err := json.Marshal(positions)
+	if err != nil {
+		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+	}
+	err = p.db.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createStreamHealthSQL); err != nil {
+			return fmt.Errorf("store: stream health: create table: %w", err)
+		}
+		_, err := tx.Exec(`
+			UPDATE stream_health
+			SET chunks = ?, missing = ?, duplicates = ?, last_seq = ?
+			WHERE id = 1`, final.Chunks, string(missing), final.Duplicates, final.Chunks)
+		return err
+	})
+	if err != nil {
+		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+	}
+	return nil
+}
+
+// StreamHealth reads the last completed stream's counters without writing. A
+// store that has never recorded a stream reports a zero state with no missing
+// positions, and does not create the stream_health table.
+func (d *DB) StreamHealth() (StreamHealth, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "stream_health")
+	if err != nil || !ok {
+		return StreamHealth{}, err
+	}
+	var (
+		health StreamHealth
+		raw    string
+	)
+	err = d.readDB.QueryRow(`
+		SELECT chunks, missing, duplicates, last_seq FROM stream_health WHERE id = 1`,
+	).Scan(&health.Chunks, &raw, &health.Duplicates, &health.LastSeq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return StreamHealth{}, nil
+	}
+	if err != nil {
+		return StreamHealth{}, err
+	}
+	if err := json.Unmarshal([]byte(raw), &health.Missing); err != nil {
+		return StreamHealth{}, err
+	}
+	return health, nil
+}
+
+// StreamHealth is the same read method on the wrapped writer, for callers that
+// hold only the ObservedPersist.
+func (p *ObservedPersist) StreamHealth() (StreamHealth, error) {
+	return p.db.StreamHealth()
 }
 
 // PersistState reads persist{seq,lastError} without writing. A store that has
