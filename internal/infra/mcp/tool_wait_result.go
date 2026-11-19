@@ -7,6 +7,10 @@
 // All three ways the caller can leave (notifications/cancelled, a closed
 // session, a broken connection) are separate select cases and write nothing.
 //
+// A non-empty clientRequestId makes a call idempotent (ADR 0028): a repeat
+// after a broken connection returns the first result without running the wait
+// again or marking the obligation read a second time.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -16,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -40,9 +45,71 @@ const (
 
 // WaitResultInput is the argument object of beacon_wait_result. timeoutMs is
 // optional; the service applies the default and the nine-minute cap.
+// clientRequestId is the idempotency key (ADR 0028). When it is non-empty, a
+// repeat with the same key returns the first result and performs no second
+// effect. An empty key keeps the pre-idempotency behaviour for callers that do
+// not send the field.
 type WaitResultInput struct {
-	WatchID   string `json:"watchID" jsonschema:"identifier of the Watch to wait on"`
-	TimeoutMs *int64 `json:"timeoutMs,omitempty" jsonschema:"wait budget in milliseconds; default 50000, capped at 540000"`
+	WatchID         string `json:"watchID" jsonschema:"identifier of the Watch to wait on"`
+	TimeoutMs       *int64 `json:"timeoutMs,omitempty" jsonschema:"wait budget in milliseconds; default 50000, capped at 540000"`
+	ClientRequestID string `json:"clientRequestId,omitempty" jsonschema:"idempotency key; a repeat after a broken connection returns the first result without a second effect"`
+}
+
+// WaitResultIdempotencyStore records the outcome of an idempotent wait_result
+// call by clientRequestId. Lookup reports whether a result was already
+// recorded; Record stores one. Implementations must be safe for concurrent use.
+// The in-memory implementation below is the default. A composition root can
+// replace it with a transactional store that writes the index in the same
+// transaction as the obligation state (ADR 0028, ADR 0015).
+type WaitResultIdempotencyStore interface {
+	Lookup(clientRequestID string) (WaitResultOutput, bool)
+	Record(clientRequestID string, out WaitResultOutput)
+}
+
+// memoryWaitResultIdempotency is the in-process default. It keeps one result
+// per clientRequestId for the lifetime of the service.
+type memoryWaitResultIdempotency struct {
+	mu      sync.Mutex
+	results map[string]WaitResultOutput
+}
+
+// NewMemoryWaitResultIdempotency builds the default in-process store.
+func NewMemoryWaitResultIdempotency() WaitResultIdempotencyStore {
+	return &memoryWaitResultIdempotency{results: make(map[string]WaitResultOutput)}
+}
+
+func (m *memoryWaitResultIdempotency) Lookup(clientRequestID string) (WaitResultOutput, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out, ok := m.results[clientRequestID]
+	if !ok {
+		return WaitResultOutput{}, false
+	}
+	return cloneWaitResultOutput(out), true
+}
+
+func (m *memoryWaitResultIdempotency) Record(clientRequestID string, out WaitResultOutput) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.results[clientRequestID] = cloneWaitResultOutput(out)
+}
+
+// cloneWaitResultOutput copies the reference fields so the store owns its
+// result and each caller receives its own value. A caller mutating Checks or
+// PollAfterMs cannot change what a later repeat returns.
+func cloneWaitResultOutput(out WaitResultOutput) WaitResultOutput {
+	clone := out
+	if out.Checks != nil {
+		clone.Checks = make(map[string]domain.Check, len(out.Checks))
+		for name, check := range out.Checks {
+			clone.Checks[name] = check
+		}
+	}
+	if out.PollAfterMs != nil {
+		ms := *out.PollAfterMs
+		clone.PollAfterMs = &ms
+	}
+	return clone
 }
 
 // WaitVerdictUpdate is one verdict change delivered by a VerdictSource. It is
@@ -168,26 +235,38 @@ func (w *sqlWaitResultWriter) MarkRead(ctx context.Context, obligationID string,
 // the caller supplies the departure signals, the verdict subscription and the
 // transactional writer through ports.
 type WaitResultService struct {
-	store      waitResultStore
-	writer     WaitResultWriter
-	source     VerdictSource
-	clock      domain.Clock
-	after      func(time.Duration) <-chan time.Time
-	departures func(*mcpsdk.CallToolRequest) CallerExit
+	store       waitResultStore
+	writer      WaitResultWriter
+	source      VerdictSource
+	clock       domain.Clock
+	after       func(time.Duration) <-chan time.Time
+	departures  func(*mcpsdk.CallToolRequest) CallerExit
+	idempotency WaitResultIdempotencyStore
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
 // clock. Tests may replace after to drive or observe the timeout precisely.
+// The default idempotency store is in memory; use SetIdempotencyStore to swap
+// in a transactional one.
 func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source VerdictSource, clock domain.Clock) *WaitResultService {
 	if clock == nil {
 		clock = waitResultWallClock{}
 	}
 	return &WaitResultService{
-		store:  store,
-		writer: writer,
-		source: source,
-		clock:  clock,
-		after:  time.After,
+		store:       store,
+		writer:      writer,
+		source:      source,
+		clock:       clock,
+		after:       time.After,
+		idempotency: NewMemoryWaitResultIdempotency(),
+	}
+}
+
+// SetIdempotencyStore replaces the result store. A nil argument disables
+// idempotency, which is useful for a caller that manages keys itself.
+func (s *WaitResultService) SetIdempotencyStore(store WaitResultIdempotencyStore) {
+	if s != nil {
+		s.idempotency = store
 	}
 }
 
@@ -231,10 +310,29 @@ func isWaitResultVerdict(v domain.Verdict) bool {
 	}
 }
 
-// Wait runs the bounded long-poll. A result verdict writes readAt through the
+// Wait runs the bounded long-poll with clientRequestId idempotency. A non-empty
+// key whose result was already recorded returns that result immediately without
+// running the wait, so no obligation is marked read a second time (ADR 0028).
+// Only successful outcomes are recorded: a departure or an error leaves no key
+// behind, so a later retry can still run the wait and produce a result.
+func (s *WaitResultService) Wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit) (WaitResultOutput, error) {
+	if s == nil || in.ClientRequestID == "" || s.idempotency == nil {
+		return s.wait(ctx, subscriberID, in, exits)
+	}
+	if out, ok := s.idempotency.Lookup(in.ClientRequestID); ok {
+		return out, nil
+	}
+	out, err := s.wait(ctx, subscriberID, in, exits)
+	if err == nil {
+		s.idempotency.Record(in.ClientRequestID, out)
+	}
+	return out, err
+}
+
+// wait runs the bounded long-poll. A result verdict writes readAt through the
 // writer and returns; a timeout or any caller departure returns without a
 // write, so no obligation is created and no delivery is marked.
-func (s *WaitResultService) Wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit) (WaitResultOutput, error) {
+func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit) (WaitResultOutput, error) {
 	if in.WatchID == "" {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: watchID is required")
 	}
