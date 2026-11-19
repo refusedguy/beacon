@@ -384,6 +384,7 @@ func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 	newText = setCardField(newText, "Итог", oneLine(report.summary))
 	newText = setCardField(newText, "Доказательство", oneLine(report.evidence))
 	newText = setCardField(newText, "Состояние", "")
+	newText = setCardField(newText, "Вопрос", "")
 	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
 		return failTask(stderr, err)
 	}
