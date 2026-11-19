@@ -568,3 +568,179 @@ func (p *WebhookProcessor) Effects() int {
 	defer p.mu.Unlock()
 	return p.effects
 }
+
+// CI verdict in the events ref, ADR 0040 §3, T3.68.
+//
+// The daemon reads one events ref for every pending get_result call instead of
+// running one `gh pr checks --watch` per call. A verdict lives in the ref,
+// keyed by the id of the awaited call. When the source behind the ref is not
+// approved, the observer reports source degraded and never invents a check
+// status: an unknown verdict stays unknown both here and in get_result. The
+// ADR 0017 wake ladder and the ADR 0039 §2 observer budget are untouched.
+
+// EventsRef is the single ref that carries every CI verdict (ADR 0040 §3).
+const EventsRef = "refs/clarity/events"
+
+// VerdictUnknown is reported when no approved, authoritative verdict is known
+// for a key. It is never a fabricated success.
+const VerdictUnknown domain.Verdict = "unknown"
+
+// SourceStatus is the trust level of the events-ref reader.
+type SourceStatus string
+
+const (
+	SourceOK       SourceStatus = "ok"
+	SourceDegraded SourceStatus = "source degraded"
+)
+
+// EventsSource supplies the raw contents of the events ref. Read is called
+// only when Approved reports true. An exec-backed source is approved only
+// after a human has approved it; an unapproved source is degraded and is
+// never read.
+type EventsSource interface {
+	Approved() bool
+	Read(ctx context.Context, ref string) ([]byte, error)
+}
+
+// eventsVerdictEvent is one verdict record in the events ref.
+type eventsVerdictEvent struct {
+	Key     string         `json:"key"`
+	Verdict domain.Verdict `json:"verdict"`
+}
+
+// EventsVerdictResult is the observer's answer for one pending call. Known
+// separates a real verdict from an unknown one, so a caller cannot mistake
+// VerdictUnknown for a check result it should act on.
+type EventsVerdictResult struct {
+	Verdict domain.Verdict
+	Status  SourceStatus
+	Known   bool
+}
+
+func degradedVerdict() EventsVerdictResult {
+	return EventsVerdictResult{Verdict: VerdictUnknown, Status: SourceDegraded}
+}
+
+// knownVerdicts are the domain verdicts an events record may carry. Anything
+// else is unknown and is never promoted to a terminal or ready verdict.
+var knownVerdicts = map[domain.Verdict]bool{
+	domain.VerdictWatching:    true,
+	domain.VerdictReady:       true,
+	domain.VerdictRebase:      true,
+	domain.VerdictRetry:       true,
+	domain.VerdictKeepWorking: true,
+	domain.VerdictTimeout:     true,
+	domain.VerdictMerged:      true,
+	domain.VerdictClosed:      true,
+}
+
+// parseEventsRef parses the events ref at the boundary. It is pure over the
+// bytes the source returned. Unrecognized verdicts become VerdictUnknown so
+// an unknown state can never masquerade as a check result.
+func parseEventsRef(data []byte) (map[string]domain.Verdict, error) {
+	var doc struct {
+		Events []eventsVerdictEvent `json:"events"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("parse events ref: %w", err)
+	}
+	out := make(map[string]domain.Verdict, len(doc.Events))
+	for _, ev := range doc.Events {
+		if ev.Key == "" {
+			continue
+		}
+		v := ev.Verdict
+		if !knownVerdicts[v] {
+			v = VerdictUnknown
+		}
+		out[ev.Key] = v
+	}
+	return out, nil
+}
+
+// EventsVerdictObserver reads the events ref once per Refresh and serves every
+// pending call from the one cached snapshot. One observer is shared by all
+// waiting calls, so N get_result calls cost one ref read, not N watches.
+type EventsVerdictObserver struct {
+	mu       sync.Mutex
+	ref      string
+	source   EventsSource
+	verdicts map[string]domain.Verdict
+	status   SourceStatus
+	reads    int
+}
+
+// NewEventsVerdictObserver builds an observer over the events-ref source. An
+// unapproved or nil source starts degraded and reports no verdicts.
+func NewEventsVerdictObserver(source EventsSource) *EventsVerdictObserver {
+	return &EventsVerdictObserver{
+		ref:      EventsRef,
+		source:   source,
+		verdicts: make(map[string]domain.Verdict),
+		status:   SourceDegraded,
+	}
+}
+
+// Refresh is the single ref read for all pending calls. With no approved
+// source, a failed read or malformed ref it reports source degraded and clears
+// cached verdicts, so a stale reading can never fabricate a check status.
+func (o *EventsVerdictObserver) Refresh(ctx context.Context) SourceStatus {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.source == nil || !o.source.Approved() {
+		o.status = SourceDegraded
+		o.verdicts = make(map[string]domain.Verdict)
+		return o.status
+	}
+	o.reads++
+	data, err := o.source.Read(ctx, o.ref)
+	if err != nil {
+		o.status = SourceDegraded
+		o.verdicts = make(map[string]domain.Verdict)
+		return o.status
+	}
+	verdicts, err := parseEventsRef(data)
+	if err != nil {
+		o.status = SourceDegraded
+		o.verdicts = make(map[string]domain.Verdict)
+		return o.status
+	}
+	o.verdicts = verdicts
+	o.status = SourceOK
+	return o.status
+}
+
+// Verdict returns the authoritative verdict for key from the last refresh. It
+// is a cheap cached lookup: no ref read and no watch. An unknown key, an
+// unrecognized state or a degraded source returns VerdictUnknown with Known
+// false, so an unknown state stays unknown in the get_result answer.
+func (o *EventsVerdictObserver) Verdict(key string) EventsVerdictResult {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.status != SourceOK {
+		return degradedVerdict()
+	}
+	v, ok := o.verdicts[key]
+	if !ok || v == VerdictUnknown {
+		return EventsVerdictResult{Verdict: VerdictUnknown, Status: o.status}
+	}
+	return EventsVerdictResult{Verdict: v, Status: o.status, Known: true}
+}
+
+// Status reports the trust level of the last refresh.
+func (o *EventsVerdictObserver) Status() SourceStatus {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.status
+}
+
+// Reads returns how many times the ref source was actually read. One refresh
+// per tick keeps this at one even with many pending calls.
+func (o *EventsVerdictObserver) Reads() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.reads
+}
+
+// Ref returns the events ref this observer reads.
+func (o *EventsVerdictObserver) Ref() string { return o.ref }

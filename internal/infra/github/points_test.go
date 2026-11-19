@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -520,5 +521,225 @@ func TestWebhookEventKeySeparateFromClientRequestID(t *testing.T) {
 	}
 	if a, b := webhookEventKey("req-1"), domain.IdempotencyKey("client-request", "req-1"); a == b {
 		t.Fatalf("event.id key collides with clientRequestId key: %q", a)
+	}
+}
+
+// fakeEventsSource is an approved-or-not source of the events ref. It counts
+// reads so the tests can prove one reader replaces many polls.
+type fakeEventsSource struct {
+	approved bool
+	data     []byte
+	err      error
+	reads    atomic.Int64
+}
+
+func (f *fakeEventsSource) Approved() bool { return f.approved }
+
+func (f *fakeEventsSource) Read(ctx context.Context, ref string) ([]byte, error) {
+	f.reads.Add(1)
+	return f.data, f.err
+}
+
+func eventsRefJSON(events ...eventsVerdictEvent) []byte {
+	doc := struct {
+		Events []eventsVerdictEvent `json:"events"`
+	}{Events: events}
+	b, _ := json.Marshal(doc)
+	return b
+}
+
+// TestEventsVerdictFromRef covers the acceptance criterion of T3.68: a verdict
+// is served from the events ref, with a known result and an ok source.
+func TestEventsVerdictFromRef(t *testing.T) {
+	src := &fakeEventsSource{
+		approved: true,
+		data: eventsRefJSON(
+			eventsVerdictEvent{Key: "sha-1", Verdict: domain.VerdictReady},
+			eventsVerdictEvent{Key: "sha-2", Verdict: domain.VerdictKeepWorking},
+		),
+	}
+	o := NewEventsVerdictObserver(src)
+
+	if got := o.Ref(); got != EventsRef {
+		t.Fatalf("Ref = %q, want %q", got, EventsRef)
+	}
+	if got := o.Refresh(context.Background()); got != SourceOK {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceOK)
+	}
+	got := o.Verdict("sha-1")
+	if !got.Known || got.Verdict != domain.VerdictReady || got.Status != SourceOK {
+		t.Fatalf("Verdict(sha-1) = %+v, want ready/known/ok", got)
+	}
+	got = o.Verdict("sha-2")
+	if !got.Known || got.Verdict != domain.VerdictKeepWorking {
+		t.Fatalf("Verdict(sha-2) = %+v, want keep_working/known", got)
+	}
+}
+
+// TestEventsVerdictOneReaderForManyCalls proves ADR 0040 §3: one reader of the
+// ref updates all pending calls. Fifteen callers cost one ref read, not fifteen
+// `gh pr checks --watch` polls.
+func TestEventsVerdictOneReaderForManyCalls(t *testing.T) {
+	events := make([]eventsVerdictEvent, 0, 15)
+	for i := 0; i < 15; i++ {
+		events = append(events, eventsVerdictEvent{Key: fmt.Sprintf("sha-%d", i), Verdict: domain.VerdictWatching})
+	}
+	src := &fakeEventsSource{approved: true, data: eventsRefJSON(events...)}
+	o := NewEventsVerdictObserver(src)
+
+	if got := o.Refresh(context.Background()); got != SourceOK {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceOK)
+	}
+	for i := 0; i < 15; i++ {
+		got := o.Verdict(fmt.Sprintf("sha-%d", i))
+		if !got.Known || got.Verdict != domain.VerdictWatching {
+			t.Fatalf("Verdict(sha-%d) = %+v, want watching/known", i, got)
+		}
+	}
+	if got := o.Reads(); got != 1 {
+		t.Fatalf("ref reads = %d, want 1 for 15 pending calls", got)
+	}
+	if got := src.reads.Load(); got != 1 {
+		t.Fatalf("source reads = %d, want 1", got)
+	}
+}
+
+// TestEventsVerdictSourceDegradedWhenUnapproved covers the other half of the
+// acceptance criterion: without an approved source the observer reports source
+// degraded and does not fabricate a check status.
+func TestEventsVerdictSourceDegradedWhenUnapproved(t *testing.T) {
+	src := &fakeEventsSource{
+		approved: false,
+		data:     eventsRefJSON(eventsVerdictEvent{Key: "sha-1", Verdict: domain.VerdictReady}),
+	}
+	o := NewEventsVerdictObserver(src)
+
+	if got := o.Refresh(context.Background()); got != SourceDegraded {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceDegraded)
+	}
+	got := o.Verdict("sha-1")
+	if got.Known || got.Verdict != VerdictUnknown || got.Status != SourceDegraded {
+		t.Fatalf("Verdict = %+v, want unknown/degraded/not fabricated", got)
+	}
+	if got := o.Status(); got != SourceDegraded {
+		t.Fatalf("Status = %q, want %q", got, SourceDegraded)
+	}
+	if got := src.reads.Load(); got != 0 {
+		t.Fatalf("unapproved source was read %d times, want 0", got)
+	}
+	if got := o.Reads(); got != 0 {
+		t.Fatalf("ref reads = %d, want 0", got)
+	}
+}
+
+func TestEventsVerdictNilSourceDegraded(t *testing.T) {
+	o := NewEventsVerdictObserver(nil)
+
+	if got := o.Refresh(context.Background()); got != SourceDegraded {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceDegraded)
+	}
+	if got := o.Verdict("sha-1"); got.Known || got.Verdict != VerdictUnknown || got.Status != SourceDegraded {
+		t.Fatalf("Verdict = %+v, want unknown/degraded", got)
+	}
+}
+
+// TestEventsVerdictUnknownStaysUnknown pins the rule that unknown stays unknown
+// in both the ref and the get_result answer: a missing key and an unrecognized
+// state are never promoted to ready.
+func TestEventsVerdictUnknownStaysUnknown(t *testing.T) {
+	src := &fakeEventsSource{
+		approved: true,
+		data: eventsRefJSON(
+			eventsVerdictEvent{Key: "sha-1", Verdict: VerdictUnknown},
+			eventsVerdictEvent{Key: "sha-2", Verdict: "SUCCESS"},
+		),
+	}
+	o := NewEventsVerdictObserver(src)
+	if got := o.Refresh(context.Background()); got != SourceOK {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceOK)
+	}
+
+	for _, key := range []string{"sha-1", "sha-2", "missing"} {
+		got := o.Verdict(key)
+		if got.Known || got.Verdict != VerdictUnknown {
+			t.Fatalf("Verdict(%q) = %+v, want unknown/not fabricated", key, got)
+		}
+	}
+}
+
+// TestEventsVerdictRefreshUpdatesAllPendingCalls shows one reader moves every
+// waiting call forward on the next refresh, without any per-call polling.
+func TestEventsVerdictRefreshUpdatesAllPendingCalls(t *testing.T) {
+	src := &fakeEventsSource{
+		approved: true,
+		data:     eventsRefJSON(eventsVerdictEvent{Key: "sha-1", Verdict: domain.VerdictWatching}),
+	}
+	o := NewEventsVerdictObserver(src)
+
+	_ = o.Refresh(context.Background())
+	first := o.Verdict("sha-1")
+	if first.Verdict != domain.VerdictWatching {
+		t.Fatalf("first verdict = %q, want watching", first.Verdict)
+	}
+
+	src.data = eventsRefJSON(eventsVerdictEvent{Key: "sha-1", Verdict: domain.VerdictReady})
+	_ = o.Refresh(context.Background())
+	second := o.Verdict("sha-1")
+	if !second.Known || second.Verdict != domain.VerdictReady {
+		t.Fatalf("verdict after refresh = %+v, want ready/known", second)
+	}
+	if got := o.Reads(); got != 2 {
+		t.Fatalf("ref reads = %d, want 2 for two refreshes", got)
+	}
+}
+
+func TestEventsVerdictReadErrorDegraded(t *testing.T) {
+	src := &fakeEventsSource{
+		approved: true,
+		data:     eventsRefJSON(eventsVerdictEvent{Key: "sha-1", Verdict: domain.VerdictReady}),
+		err:      errors.New("exec denied"),
+	}
+	o := NewEventsVerdictObserver(src)
+
+	if got := o.Refresh(context.Background()); got != SourceDegraded {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceDegraded)
+	}
+	if got := o.Verdict("sha-1"); got.Known || got.Verdict != VerdictUnknown {
+		t.Fatalf("Verdict after read error = %+v, want unknown", got)
+	}
+}
+
+func TestEventsVerdictMalformedRefDegraded(t *testing.T) {
+	src := &fakeEventsSource{approved: true, data: []byte("not json")}
+	o := NewEventsVerdictObserver(src)
+
+	if got := o.Refresh(context.Background()); got != SourceDegraded {
+		t.Fatalf("Refresh status = %q, want %q", got, SourceDegraded)
+	}
+	if got := o.Verdict("sha-1"); got.Known || got.Verdict != VerdictUnknown {
+		t.Fatalf("Verdict on malformed ref = %+v, want unknown", got)
+	}
+}
+
+// TestEventsVerdictApprovalRecovery shows a degraded observer recovers once
+// the exec source is approved, without keeping a fabricated status in between.
+func TestEventsVerdictApprovalRecovery(t *testing.T) {
+	src := &fakeEventsSource{
+		approved: false,
+		data:     eventsRefJSON(eventsVerdictEvent{Key: "sha-1", Verdict: domain.VerdictMerged}),
+	}
+	o := NewEventsVerdictObserver(src)
+
+	_ = o.Refresh(context.Background())
+	if got := o.Verdict("sha-1"); got.Known || got.Status != SourceDegraded {
+		t.Fatalf("verdict before approval = %+v, want unknown/degraded", got)
+	}
+
+	src.approved = true
+	if got := o.Refresh(context.Background()); got != SourceOK {
+		t.Fatalf("Refresh after approval = %q, want %q", got, SourceOK)
+	}
+	if got := o.Verdict("sha-1"); !got.Known || got.Verdict != domain.VerdictMerged {
+		t.Fatalf("verdict after approval = %+v, want merged/known", got)
 	}
 }
