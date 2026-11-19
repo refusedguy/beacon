@@ -2000,3 +2000,186 @@ func (s *Service) PrecheckLog() ([]PrecheckLogEntry, error) {
 	}
 	return append([]PrecheckLogEntry(nil), st.Journal...), nil
 }
+
+// ---- ADR 0044 п4 / T3.99: bounded handoff journal с recovery на старте ----
+//
+// После каждого шага сервис атомарно дописывает факт в журнал handoff с жёстким
+// лимитом размера. Самые старые записи отбрасываются при переполнении, а на
+// старте процесс читает журнал и подставляет блок восстановления. Журнал хранит
+// только факты о пройденных шагах и не заменяет структурированную передачу
+// T3.25 с её пятью полями intent, evidence, patch_plan, verification_plan и
+// risk_notes, ни секции продолжения T3.107 must_not_redo, must_preserve и
+// working_set. Ограничение размера и блок восстановления это новое состояние
+// между передачами, которого в T3.25 нет.
+
+// HandoffJournalEntry — одна запись журнала: факт о пройденном шаге передачи.
+// Seq монотонен и не переиспользуется при отбрасывании старых записей.
+type HandoffJournalEntry struct {
+	Seq    uint64    `json:"seq"`
+	Time   time.Time `json:"time"`
+	TaskID string    `json:"taskId"`
+	Step   string    `json:"step"`
+	Note   string    `json:"note"`
+}
+
+// HandoffRecovery — блок восстановления, который процесс подставляет на старте,
+// прочитав журнал. Entries и Steps идут в порядке записи.
+type HandoffRecovery struct {
+	HasJournal bool                  `json:"hasJournal"`
+	Count      int                   `json:"count"`
+	LastSeq    uint64                `json:"lastSeq"`
+	Steps      []string              `json:"steps"`
+	Entries    []HandoffJournalEntry `json:"entries"`
+}
+
+// Жёсткие лимиты журнала. При переполнении отбрасываются самые старые записи,
+// пока не выполнены оба условия: число записей и суммарный размер в байтах.
+const (
+	MaxHandoffJournalEntries = 16
+	MaxHandoffJournalBytes   = 64 * 1024
+)
+
+type handoffJournalState struct {
+	Entries []HandoffJournalEntry `json:"entries"`
+}
+
+func (s *Service) handoffJournalPath() string {
+	return filepath.Join(s.Cfg.StateDir, "handoff-journal.json")
+}
+
+// Замок журнала отделён от общего замка карточек по той же причине, что и замки
+// healing и аренды: общий замок удаляет файл по эвристике stale и допускает
+// гонку между удалением и созданием. Flock держит блокировку на дескрипторе до
+// выхода, поэтому эвристики и гонки удаления не нужны.
+func (s *Service) lockHandoffJournal() (func(), error) {
+	path := filepath.Join(s.Cfg.StateDir, "handoff-journal.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, taskstore.Startupf("не открыт замок журнала handoff: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, taskstore.Startupf("не взят замок журнала handoff: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+func (s *Service) loadHandoffJournal() (handoffJournalState, error) {
+	data, err := os.ReadFile(s.handoffJournalPath())
+	if os.IsNotExist(err) {
+		return handoffJournalState{}, nil
+	}
+	if err != nil {
+		return handoffJournalState{}, taskstore.Startupf("не прочитан журнал handoff: %v", err)
+	}
+	var st handoffJournalState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return handoffJournalState{}, taskstore.Startupf("не разобран журнал handoff: %v", err)
+	}
+	return st, nil
+}
+
+func (s *Service) saveHandoffJournal(st handoffJournalState) error {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return taskstore.Startupf("не собран журнал handoff: %v", err)
+	}
+	return taskstore.AtomicWrite(s.handoffJournalPath(), append(data, '\n'), 0644)
+}
+
+func handoffJournalBytes(entries []HandoffJournalEntry) int {
+	data, err := json.Marshal(handoffJournalState{Entries: entries})
+	if err != nil {
+		return 0
+	}
+	return len(data)
+}
+
+// pruneHandoffJournal отбрасывает самые старые записи, пока не выполнены оба
+// лимита. Всегда остаётся хотя бы одна запись, чтобы новая запись не терялась
+// из-за собственного размера.
+func pruneHandoffJournal(entries []HandoffJournalEntry) []HandoffJournalEntry {
+	for len(entries) > MaxHandoffJournalEntries {
+		entries = entries[1:]
+	}
+	for len(entries) > 1 && handoffJournalBytes(entries) > MaxHandoffJournalBytes {
+		entries = entries[1:]
+	}
+	return entries
+}
+
+// AppendHandoffStep атомарно дописывает факт о пройденном шаге в журнал и
+// возвращает записанную запись. Seq растёт монотонно и не сбрасывается при
+// отбрасывании старых записей. Пустая задача или шаг отклоняется.
+func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (HandoffJournalEntry, error) {
+	taskID = strings.TrimSpace(taskID)
+	step = strings.TrimSpace(step)
+	if taskID == "" {
+		return HandoffJournalEntry{}, taskstore.Validationf("не задана задача журнала handoff")
+	}
+	if step == "" {
+		return HandoffJournalEntry{}, taskstore.Validationf("не задан шаг журнала handoff")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	unlock, err := s.lockHandoffJournal()
+	if err != nil {
+		return HandoffJournalEntry{}, err
+	}
+	defer unlock()
+
+	st, err := s.loadHandoffJournal()
+	if err != nil {
+		return HandoffJournalEntry{}, err
+	}
+	var seq uint64 = 1
+	if n := len(st.Entries); n > 0 {
+		seq = st.Entries[n-1].Seq + 1
+	}
+	entry := HandoffJournalEntry{
+		Seq: seq, Time: at.UTC(), TaskID: taskID, Step: step, Note: strings.TrimSpace(note),
+	}
+	st.Entries = append(st.Entries, entry)
+	st.Entries = pruneHandoffJournal(st.Entries)
+	if err := s.saveHandoffJournal(st); err != nil {
+		return HandoffJournalEntry{}, err
+	}
+	return entry, nil
+}
+
+// HandoffJournal возвращает записи журнала в порядке записи.
+func (s *Service) HandoffJournal() ([]HandoffJournalEntry, error) {
+	st, err := s.loadHandoffJournal()
+	if err != nil {
+		return nil, err
+	}
+	return append([]HandoffJournalEntry(nil), st.Entries...), nil
+}
+
+// RecoverHandoff читает журнал на старте и подставляет блок восстановления.
+// Пустой журнал даёт HasJournal=false, нулевой LastSeq и пустые срезы. Блок
+// несёт только факты о пройденных шагах; BuildHandoff остаётся отдельным
+// контрактом структурированной передачи из пяти полей.
+func (s *Service) RecoverHandoff() (HandoffRecovery, error) {
+	st, err := s.loadHandoffJournal()
+	if err != nil {
+		return HandoffRecovery{}, err
+	}
+	out := HandoffRecovery{
+		HasJournal: len(st.Entries) > 0,
+		Count:      len(st.Entries),
+		Steps:      make([]string, 0, len(st.Entries)),
+		Entries:    append([]HandoffJournalEntry(nil), st.Entries...),
+	}
+	if n := len(st.Entries); n > 0 {
+		out.LastSeq = st.Entries[n-1].Seq
+	}
+	for _, e := range st.Entries {
+		out.Steps = append(out.Steps, e.Step)
+	}
+	return out, nil
+}
