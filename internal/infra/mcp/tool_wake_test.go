@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2387,5 +2388,248 @@ func TestT3_110CancelledWaitIsRepairable(t *testing.T) {
 func TestT3_110NonAppErrorIsNotRepairable(t *testing.T) {
 	if _, ok := ToRepairableErrorShape(errors.New("plain failure")); ok {
 		t.Error("ToRepairableErrorShape accepted an error with no AppError")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3.121 / ADR 0051 p5: transactional confirmation of token and deadline.
+// ---------------------------------------------------------------------------
+
+// confirmationClock is a controllable clock for the deadline checks. Its lock
+// lets the concurrency test share it safely with the ledger.
+type confirmationClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *confirmationClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *confirmationClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+func newTestConfirmationLedger() (*ConfirmationLedger, *confirmationClock) {
+	ledger := NewConfirmationLedger()
+	clock := &confirmationClock{t: time.Unix(1_700_000_000, 0)}
+	ledger.now = clock.Now
+	return ledger, clock
+}
+
+// TestT3_121AckVerifiesTokenStateAndDeadline is the acceptance core: Ack
+// rejects a stale token, then verifies the pending state and the unexpired
+// deadline in one transaction before recording the ack.
+func TestT3_121AckVerifiesTokenStateAndDeadline(t *testing.T) {
+	ledger, clock := newTestConfirmationLedger()
+	token, err := ledger.Issue("task-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	if token == "" {
+		t.Fatal("Issue() returned an empty token")
+	}
+
+	stale := ledger.Ack("task-1", "old-worker-token")
+	if !IsConfirmationRejected(stale) {
+		t.Fatalf("Ack(stale token) error = %v, want a confirmation rejection", stale)
+	}
+	var rejection *ConfirmationError
+	if !errors.As(stale, &rejection) || rejection.Reason != confirmationReasonToken {
+		t.Errorf("stale rejection = %v, want reason %q", stale, confirmationReasonToken)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationPending {
+		t.Errorf("state after stale token = %q, want %q", state, ConfirmationPending)
+	}
+
+	clock.Advance(30 * time.Second)
+	if err := ledger.Ack("task-1", token); err != nil {
+		t.Fatalf("Ack(current token, inside deadline) error = %v, want nil", err)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationAcked {
+		t.Errorf("state after Ack = %q, want %q", state, ConfirmationAcked)
+	}
+
+	again := ledger.Ack("task-1", token)
+	if !errors.As(again, &rejection) || rejection.Reason != confirmationReasonState {
+		t.Errorf("second Ack = %v, want a non-pending rejection", again)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationAcked {
+		t.Errorf("state after second Ack = %q, want %q unchanged", state, ConfirmationAcked)
+	}
+
+	if err := ledger.Ack("missing", token); !IsConfirmationRejected(err) {
+		t.Errorf("Ack(unknown id) error = %v, want a rejection", err)
+	}
+}
+
+// TestT3_121FailVerifiesTokenStateAndDeadline gives Fail the same three checks
+// as Ack, so a stale worker cannot fail another worker's task either.
+func TestT3_121FailVerifiesTokenStateAndDeadline(t *testing.T) {
+	ledger, _ := newTestConfirmationLedger()
+	token, err := ledger.Issue("task-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	if err := ledger.Fail("task-1", "stale"); !IsConfirmationRejected(err) {
+		t.Errorf("Fail(stale token) error = %v, want a rejection", err)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationPending {
+		t.Errorf("state after stale Fail = %q, want %q", state, ConfirmationPending)
+	}
+
+	if err := ledger.Fail("task-1", token); err != nil {
+		t.Fatalf("Fail(current token) error = %v, want nil", err)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationFailed {
+		t.Errorf("state after Fail = %q, want %q", state, ConfirmationFailed)
+	}
+	if err := ledger.Ack("task-1", token); !IsConfirmationRejected(err) {
+		t.Errorf("Ack after Fail error = %v, want a rejection", err)
+	}
+}
+
+// TestT3_121ExpiredDeadlineRejectedWithoutReaper proves an expired deadline is
+// rejected and resolved by the confirmation itself. No goroutine runs to do it.
+func TestT3_121ExpiredDeadlineRejectedWithoutReaper(t *testing.T) {
+	ledger, clock := newTestConfirmationLedger()
+	token, err := ledger.Issue("task-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	clock.Advance(2 * time.Minute)
+	if state, _ := ledger.State("task-1"); state != ConfirmationPending {
+		t.Errorf("state before any confirmation = %q, want %q; a background reaper must not run", state, ConfirmationPending)
+	}
+
+	expired := ledger.Ack("task-1", token)
+	if !IsConfirmationExpired(expired) {
+		t.Fatalf("Ack(past deadline) error = %v, want the deadline rejection", expired)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationExpired {
+		t.Errorf("state after expired Ack = %q, want %q", state, ConfirmationExpired)
+	}
+
+	// Recovery reissues the id in place of a reaper sweep.
+	reissued, err := ledger.Issue("task-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() after expiry error = %v, want nil", err)
+	}
+	if reissued == token {
+		t.Error("reissued token equals the expired token, want a fresh random token")
+	}
+	if err := ledger.Ack("task-1", reissued); err != nil {
+		t.Fatalf("Ack(reissued token) error = %v, want nil", err)
+	}
+}
+
+// TestT3_121StaleTokenCannotConfirmAnotherTask is the ADR 0051 p5 guard: a
+// lagging worker cannot confirm a task it does not own. Tokens are random and
+// distinct, not the monotonic fencing tokens of T3.51.
+func TestT3_121StaleTokenCannotConfirmAnotherTask(t *testing.T) {
+	ledger, _ := newTestConfirmationLedger()
+	tokenA, err := ledger.Issue("task-A", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue(task-A) error = %v", err)
+	}
+	tokenB, err := ledger.Issue("task-B", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue(task-B) error = %v", err)
+	}
+	if tokenA == tokenB {
+		t.Fatal("two confirmations share a token, want independent random tokens")
+	}
+
+	if err := ledger.Ack("task-B", tokenA); !IsConfirmationRejected(err) {
+		t.Errorf("Ack(task-B, tokenA) error = %v, want a rejection", err)
+	}
+	for _, id := range []string{"task-A", "task-B"} {
+		if state, _ := ledger.State(id); state != ConfirmationPending {
+			t.Errorf("state of %s = %q, want %q unchanged", id, state, ConfirmationPending)
+		}
+	}
+}
+
+// TestT3_121PendingConfirmationNotReissued keeps the token a caller holds
+// authoritative until it is used, expired or failed.
+func TestT3_121PendingConfirmationNotReissued(t *testing.T) {
+	ledger, _ := newTestConfirmationLedger()
+	token, err := ledger.Issue("task-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+	if _, err := ledger.Issue("task-1", time.Minute); !IsConfirmationRejected(err) {
+		t.Errorf("second Issue() error = %v, want a rejection while pending", err)
+	}
+	if err := ledger.Ack("task-1", token); err != nil {
+		t.Fatalf("Ack(original token) error = %v, want the original token to stay valid", err)
+	}
+}
+
+// TestT3_121ConcurrentAckHasSingleWinner proves the write lock linearizes the
+// transaction: many racers with the same token produce exactly one ack.
+func TestT3_121ConcurrentAckHasSingleWinner(t *testing.T) {
+	ledger, _ := newTestConfirmationLedger()
+	token, err := ledger.Issue("task-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	const racers = 16
+	var wg sync.WaitGroup
+	results := make(chan error, racers)
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- ledger.Ack("task-1", token)
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	successes := 0
+	for err := range results {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Errorf("successful Acks = %d, want exactly 1 of %d", successes, racers)
+	}
+	if state, _ := ledger.State("task-1"); state != ConfirmationAcked {
+		t.Errorf("state = %q, want %q", state, ConfirmationAcked)
+	}
+}
+
+// TestT3_121WakeHandlerConfirmation wires the ledger into the wake handler. A
+// handler without one refuses an honest confirmation instead of guessing.
+func TestT3_121WakeHandlerConfirmation(t *testing.T) {
+	ledger, _ := newTestConfirmationLedger()
+	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).WithConfirmations(ledger)
+	token, err := ledger.Issue("wake-1", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue() error = %v", err)
+	}
+
+	if err := handler.ConfirmDelivery("wake-1", token); err != nil {
+		t.Fatalf("ConfirmDelivery() error = %v, want nil", err)
+	}
+	if state, _ := ledger.State("wake-1"); state != ConfirmationAcked {
+		t.Errorf("state = %q, want %q", state, ConfirmationAcked)
+	}
+	if err := handler.FailDelivery("wake-1", token); !IsConfirmationRejected(err) {
+		t.Errorf("FailDelivery() after ack error = %v, want a rejection", err)
+	}
+
+	without := NewWakeHandler(nil)
+	if err := without.ConfirmDelivery("wake-1", token); !IsConfirmationRejected(err) {
+		t.Errorf("ConfirmDelivery() without a ledger error = %v, want a rejection", err)
 	}
 }
