@@ -53,6 +53,13 @@ type Snapshot struct {
 	NoChecksSince    time.Time
 	NoChecksTimeout  time.Duration
 	SuitesValid      bool
+
+	// Ship carries the observed facts the compiled-in ship formula reads
+	// (ADR 0040 §2). Callers fill it from deterministic sources: Build and
+	// Audit from required CI checks, TDD and Trivial from explicit conditions
+	// in code. The zero value means no facts were observed, so Evaluate never
+	// grants the ready verdict on facts the caller did not supply.
+	Ship ShipFacts
 }
 
 // WakeKind distinguishes an ordinary pointer from the two adapter actions the
@@ -115,11 +122,15 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	}
 
 	// 7. Ready needs a clean success, a valid suite composition, no draft,
-	// no missing required check and no unresolved review request.
+	// no missing required check and no unresolved review request. The
+	// compiled-in ship formula (ADR 0040 §2) is the last gate: green checks
+	// alone do not make a change ready to ship. With no observed facts the
+	// formula fails and Evaluate falls through to the in-between verdicts.
 	if rollup == "SUCCESS" && strings.ToUpper(s.Mergeable) == "MERGEABLE" &&
 		canMergeStatus(status, p.RequireUpToDate) && !s.IsDraft &&
 		!s.MissingRequired && s.SuitesValid &&
-		(p.IgnoreReviews || strings.ToUpper(s.ReviewDecision) != "CHANGES_REQUESTED") {
+		(p.IgnoreReviews || strings.ToUpper(s.ReviewDecision) != "CHANGES_REQUESTED") &&
+		ShipAllowed(s.Ship) {
 		return VerdictReady, wakeOrchestrator(WakePointer)
 	}
 
