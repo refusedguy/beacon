@@ -915,3 +915,134 @@ func (d *DB) JournalStatus(ctx context.Context, taskID string) (JournalStatus, e
 	}
 	return s, err
 }
+
+// createWatchOutcomesSQL owns the worker-outcome table from ADR 0041 §4. As
+// with task_starts and the inbox, the table is created on first use because
+// T3.79 owns only db.go and adds no migration file. One row per worker key is
+// enough: the fact of completion and its result live in the file, so every
+// process that holds the file open can read them on its own.
+const createWatchOutcomesSQL = `
+CREATE TABLE IF NOT EXISTS watch_outcomes (
+  key        TEXT PRIMARY KEY,
+  revision   INTEGER NOT NULL,
+  payload    BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`
+
+// outcomePollInterval is the read cadence of a WatchOutcome watcher. sqliteq
+// polls the file about every 50 ms (ADR 0041 §4); the same cadence keeps
+// fan-out local to the file, without a broker.
+const outcomePollInterval = 50 * time.Millisecond
+
+// WatchOutcome is one completed worker result written to the shared state
+// file. Key is the worker key that selects which watchers are woken; Result is
+// the redacted result payload.
+type WatchOutcome struct {
+	Key       string
+	Revision  int64
+	Result    []byte
+	CreatedAt int64
+}
+
+// PublishOutcome writes one worker result into the state file. All writes go
+// through the single writer and commit in WAL, so every other process with the
+// file open sees the committed row on its next read (ADR 0041 §4).
+func (d *DB) PublishOutcome(o WatchOutcome) error {
+	if strings.TrimSpace(o.Key) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: outcome: empty worker key")
+	}
+	clean := Redact(o.Result)
+	at := o.CreatedAt
+	if at == 0 {
+		at = time.Now().UTC().UnixNano()
+	}
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createWatchOutcomesSQL); err != nil {
+			return fmt.Errorf("store: outcome: create table: %w", err)
+		}
+		_, err := tx.Exec(`
+			INSERT INTO watch_outcomes (key, revision, payload, created_at)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(key) DO UPDATE SET
+			  revision   = excluded.revision,
+			  payload    = excluded.payload,
+			  created_at = excluded.created_at`,
+			o.Key, o.Revision, clean, at)
+		return err
+	})
+}
+
+// WatchOutcome returns a channel that receives the result published for key
+// by any process writing the same state file. Each call watches through this
+// DB's own read pool: the poll after the writer's commit sees the row, with no
+// broker or cross-process channel. The channel yields one value and closes;
+// it also closes on ctx cancellation or on Close.
+func (d *DB) WatchOutcome(ctx context.Context, key string) (<-chan WatchOutcome, error) {
+	if strings.TrimSpace(key) == "" {
+		return nil, domain.NewAppError(domain.CodeInvalidInput, "store: outcome: empty worker key")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.mu.RLock()
+	closed := d.closed
+	d.mu.RUnlock()
+	if closed {
+		return nil, errClosed
+	}
+
+	out := make(chan WatchOutcome, 1)
+	go d.watchOutcome(ctx, key, out)
+	return out, nil
+}
+
+func (d *DB) watchOutcome(ctx context.Context, key string, out chan<- WatchOutcome) {
+	defer close(out)
+	ticker := time.NewTicker(outcomePollInterval)
+	defer ticker.Stop()
+	for {
+		o, found, err := readWatchOutcome(ctx, d.readDB, key)
+		if err != nil {
+			return
+		}
+		if found {
+			select {
+			case out <- o:
+			case <-ctx.Done():
+			case <-d.closing:
+			}
+			return
+		}
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return
+		case <-d.closing:
+			return
+		}
+	}
+}
+
+func readWatchOutcome(ctx context.Context, db *sql.DB, key string) (WatchOutcome, bool, error) {
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, "watch_outcomes",
+	).Scan(&n); err != nil {
+		return WatchOutcome{}, false, err
+	}
+	if n == 0 {
+		return WatchOutcome{}, false, nil
+	}
+	var o WatchOutcome
+	err := db.QueryRowContext(ctx,
+		`SELECT key, revision, payload, created_at FROM watch_outcomes WHERE key = ?`, key,
+	).Scan(&o.Key, &o.Revision, &o.Result, &o.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WatchOutcome{}, false, nil
+	}
+	if err != nil {
+		return WatchOutcome{}, false, err
+	}
+	return o, true, nil
+}
