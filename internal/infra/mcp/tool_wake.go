@@ -62,9 +62,13 @@ package mcp
 
 import (
 	"context"
+	crand "crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -537,6 +541,7 @@ type WakeHandler struct {
 	useFallback    bool
 	sleeper        WakeSleeper
 	point          func(time.Duration) time.Duration
+	confirmations  *ConfirmationLedger
 }
 
 // WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
@@ -963,6 +968,209 @@ func interruptedWake(in WakeInput) WakeOutput {
 		Reason:      reason,
 		Woke:        in.Woke,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0051 p5: transactional verification of token and deadline in the
+// confirmation of a wake delivery.
+//
+// A delivery carries a random confirmation token and a deadline. Ack and Fail
+// take a write lock and verify, in one critical section, that the stored token
+// matches, the confirmation is still pending, and the deadline has not passed.
+// A lagging worker holding an old token cannot confirm another task, and
+// recovery needs no reaper goroutine: an expired deadline is resolved inside
+// the same transaction. This is a confirmation-time check with a random token;
+// it is not the monotonic fencing token of T3.51 (tool_claim.go), which guards
+// lease reassignment at claim time.
+// ---------------------------------------------------------------------------
+
+// ConfirmationState is the lifecycle of one wake confirmation.
+type ConfirmationState string
+
+const (
+	ConfirmationPending ConfirmationState = "pending"
+	ConfirmationAcked   ConfirmationState = "acked"
+	ConfirmationFailed  ConfirmationState = "failed"
+	ConfirmationExpired ConfirmationState = "expired"
+)
+
+// Confirmation is the stored state of one wake delivery's confirmation. Token
+// comes from crypto/rand, so a lagging worker cannot guess or derive it. A zero
+// Deadline means the confirmation never expires.
+type Confirmation struct {
+	ID       string
+	Token    string
+	State    ConfirmationState
+	Deadline time.Time
+}
+
+// ConfirmationError is a transactional confirmation rejection. Reason names
+// which of the three checked facts failed: token, state or deadline.
+type ConfirmationError struct {
+	ID     string
+	Reason string
+}
+
+func (e *ConfirmationError) Error() string {
+	return "wake confirmation " + e.ID + ": " + e.Reason
+}
+
+// Fixed reasons make the rejection branch testable without parsing strings.
+const (
+	confirmationReasonNotFound = "unknown confirmation"
+	confirmationReasonToken    = "token mismatch, presented by a stale worker"
+	confirmationReasonState    = "confirmation is not pending"
+	confirmationReasonExpired  = "deadline expired"
+	confirmationReasonIssued   = "confirmation already pending"
+)
+
+// IsConfirmationRejected reports whether err is any transactional
+// confirmation rejection.
+func IsConfirmationRejected(err error) bool {
+	var rejection *ConfirmationError
+	return errors.As(err, &rejection)
+}
+
+// IsConfirmationExpired reports whether err is the deadline rejection. The
+// state is set to expired by the same transaction that returns this error.
+func IsConfirmationExpired(err error) bool {
+	var rejection *ConfirmationError
+	return errors.As(err, &rejection) && rejection.Reason == confirmationReasonExpired
+}
+
+// ConfirmationLedger holds wake confirmations. Every mutation holds one write
+// lock and does the token, state and deadline checks before touching state, so
+// the verification is linearizable and needs no background reaper.
+type ConfirmationLedger struct {
+	mu       sync.Mutex
+	records  map[string]Confirmation
+	now      func() time.Time
+	newToken func() (string, error)
+}
+
+// NewConfirmationLedger builds an empty ledger with a random token source and
+// the wall clock. Tests replace now and newToken on the same package instance.
+func NewConfirmationLedger() *ConfirmationLedger {
+	return &ConfirmationLedger{
+		records:  make(map[string]Confirmation),
+		now:      time.Now,
+		newToken: newConfirmationToken,
+	}
+}
+
+// newConfirmationToken is a random token, deliberately not a monotonic counter
+// like the T3.51 fencing token.
+func newConfirmationToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := crand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// Issue records a pending confirmation for id and returns its random token.
+// ttl <= 0 means no deadline. A still-pending, unexpired id is not reissued, so
+// a second call cannot silently replace the token a caller is holding. An
+// expired id may be reissued; that is the recovery path in place of a reaper.
+func (l *ConfirmationLedger) Issue(id string, ttl time.Duration) (string, error) {
+	if id == "" {
+		return "", &ConfirmationError{ID: id, Reason: confirmationReasonNotFound}
+	}
+	token, err := l.newToken()
+	if err != nil {
+		return "", fmt.Errorf("wake confirmation: generate token: %w", err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	now := l.now()
+	if rec, ok := l.records[id]; ok && rec.State == ConfirmationPending &&
+		(rec.Deadline.IsZero() || now.Before(rec.Deadline)) {
+		return "", &ConfirmationError{ID: id, Reason: confirmationReasonIssued}
+	}
+	rec := Confirmation{ID: id, Token: token, State: ConfirmationPending}
+	if ttl > 0 {
+		rec.Deadline = now.Add(ttl)
+	}
+	l.records[id] = rec
+	return token, nil
+}
+
+// decide is the single transaction shared by Ack and Fail. Token, pending
+// state and unexpired deadline are all checked under one write lock before any
+// state is written. An expired deadline is recorded inside that transaction,
+// so no reaper goroutine is needed to observe it.
+func (l *ConfirmationLedger) decide(id, token string, final ConfirmationState) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	rec, ok := l.records[id]
+	if !ok {
+		return &ConfirmationError{ID: id, Reason: confirmationReasonNotFound}
+	}
+	if !rec.Deadline.IsZero() && !l.now().Before(rec.Deadline) {
+		rec.State = ConfirmationExpired
+		l.records[id] = rec
+		return &ConfirmationError{ID: id, Reason: confirmationReasonExpired}
+	}
+	if rec.State != ConfirmationPending {
+		return &ConfirmationError{ID: id, Reason: confirmationReasonState}
+	}
+	if subtle.ConstantTimeCompare([]byte(rec.Token), []byte(token)) != 1 {
+		return &ConfirmationError{ID: id, Reason: confirmationReasonToken}
+	}
+	rec.State = final
+	l.records[id] = rec
+	return nil
+}
+
+// Ack confirms a delivery in one transaction. It rejects a stale token, a
+// confirmation that is no longer pending, and an expired deadline.
+func (l *ConfirmationLedger) Ack(id, token string) error {
+	return l.decide(id, token, ConfirmationAcked)
+}
+
+// Fail marks a delivery as failed under the same three checks as Ack.
+func (l *ConfirmationLedger) Fail(id, token string) error {
+	return l.decide(id, token, ConfirmationFailed)
+}
+
+// State reports the current state of a confirmation. It exists so a test can
+// observe the result of a transaction without reaching into the private map.
+func (l *ConfirmationLedger) State(id string) (ConfirmationState, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	rec, ok := l.records[id]
+	return rec.State, ok
+}
+
+// WithConfirmations attaches a transactional confirmation ledger to a wake
+// handler. A nil ledger disables confirmation, keeping every earlier caller
+// unchanged.
+func (h *WakeHandler) WithConfirmations(ledger *ConfirmationLedger) *WakeHandler {
+	if h != nil {
+		h.confirmations = ledger
+	}
+	return h
+}
+
+// ConfirmDelivery acks the named confirmation through the handler's ledger.
+// It returns a rejection error when no ledger is configured, mirroring an
+// honest refusal instead of pretending the delivery was confirmed.
+func (h *WakeHandler) ConfirmDelivery(id, token string) error {
+	if h == nil || h.confirmations == nil {
+		return &ConfirmationError{ID: id, Reason: confirmationReasonNotFound}
+	}
+	return h.confirmations.Ack(id, token)
+}
+
+// FailDelivery fails the named confirmation through the handler's ledger.
+func (h *WakeHandler) FailDelivery(id, token string) error {
+	if h == nil || h.confirmations == nil {
+		return &ConfirmationError{ID: id, Reason: confirmationReasonNotFound}
+	}
+	return h.confirmations.Fail(id, token)
 }
 
 // AttachWake registers the real wake tool on a server. NewServer keeps the
