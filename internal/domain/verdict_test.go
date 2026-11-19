@@ -105,7 +105,10 @@ func TestEvaluateDecisionTable(t *testing.T) {
 				s.Rollup = "ERROR"
 				s.Failures = []string{"ci-stable"}
 				s.Flaky = FlakyConfig{
-					Names:      []string{"ci-*"},
+					// "ci-stable" is not flaky, so row 5 cannot fire even
+					// though the budget is unused. A glob of "ci-*" here
+					// would match it and turn this into a retry.
+					Names:      []string{"ci-flaky"},
 					MaxRetries: 2,
 					Used:       map[string]int{},
 				}
