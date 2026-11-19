@@ -343,6 +343,127 @@ func TestNormalizeReturnsConflict(t *testing.T) {
 	}
 }
 
+// --- Current-run CI verdict (ADR 0048 §1, T3.112) ---
+
+// The adapter must reduce the raw check-runs list to the current attempt of
+// each named check. A green re-run wins over an old red result, and the most
+// recent attempt wins regardless of the order the provider listed the runs.
+func TestGitHubCurrentRunVerdict(t *testing.T) {
+	cases := []struct {
+		name       string
+		body       string
+		wantRollup string
+		wantFail   []string
+		wantStates []CheckState
+		wantURLs   []string
+	}{
+		{
+			name: "green re-run beats old red",
+			body: `{"check_runs":[
+				{"id":10,"name":"build","status":"completed","conclusion":"failure","html_url":"https://gh/old","started_at":"2026-11-20T10:00:00Z"},
+				{"id":11,"name":"build","status":"completed","conclusion":"success","html_url":"https://gh/new","started_at":"2026-11-20T11:00:00Z"}]}`,
+			wantRollup: "SUCCESS",
+			wantStates: []CheckState{CheckSuccess},
+			wantURLs:   []string{"https://gh/new"},
+		},
+		{
+			name: "newest run wins regardless of payload order",
+			body: `{"check_runs":[
+				{"name":"build","status":"completed","conclusion":"success","html_url":"https://gh/new","started_at":"2026-11-20T11:00:00Z"},
+				{"name":"build","status":"completed","conclusion":"failure","html_url":"https://gh/old","started_at":"2026-11-20T10:00:00Z"}]}`,
+			wantRollup: "SUCCESS",
+			wantStates: []CheckState{CheckSuccess},
+			wantURLs:   []string{"https://gh/new"},
+		},
+		{
+			name: "red re-run beats old green",
+			body: `{"check_runs":[
+				{"name":"build","status":"completed","conclusion":"success","started_at":"2026-11-20T10:00:00Z"},
+				{"name":"build","status":"completed","conclusion":"failure","started_at":"2026-11-20T11:00:00Z"}]}`,
+			wantRollup: "FAILURE",
+			wantFail:   []string{"build"},
+			wantStates: []CheckState{CheckFailure},
+		},
+		{
+			name: "id breaks tie when timestamps absent",
+			body: `{"check_runs":[
+				{"id":20,"name":"build","status":"completed","conclusion":"success"},
+				{"id":10,"name":"build","status":"completed","conclusion":"failure"}]}`,
+			wantRollup: "SUCCESS",
+			wantStates: []CheckState{CheckSuccess},
+		},
+		{
+			name: "current pending run wins over old green",
+			body: `{"check_runs":[
+				{"name":"build","status":"completed","conclusion":"success","started_at":"2026-11-20T10:00:00Z"},
+				{"name":"build","status":"in_progress","started_at":"2026-11-20T11:00:00Z"}]}`,
+			wantRollup: "PENDING",
+			wantStates: []CheckState{CheckPending},
+		},
+		{
+			name: "distinct checks all survive the reduction",
+			body: `{"check_runs":[
+				{"name":"build","status":"completed","conclusion":"success"},
+				{"name":"tests","status":"completed","conclusion":"failure"}]}`,
+			wantRollup: "FAILURE",
+			wantFail:   []string{"tests"},
+			wantStates: []CheckState{CheckSuccess, CheckFailure},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, appErr := NewStatusParser().Parse(ProviderGitHub, []byte(tc.body))
+			if appErr != nil {
+				t.Fatalf("Parse error = %+v, want none", appErr)
+			}
+			if res.Rollup != tc.wantRollup {
+				t.Fatalf("Rollup = %q, want %q", res.Rollup, tc.wantRollup)
+			}
+			if !reflect.DeepEqual(res.Failures, tc.wantFail) {
+				t.Fatalf("Failures = %v, want %v", res.Failures, tc.wantFail)
+			}
+			if len(res.Checks) != len(tc.wantStates) {
+				t.Fatalf("len(Checks) = %d, want %d (%+v)", len(res.Checks), len(tc.wantStates), res.Checks)
+			}
+			for i, c := range res.Checks {
+				if c.State != tc.wantStates[i] {
+					t.Errorf("Checks[%d].State = %q, want %q", i, c.State, tc.wantStates[i])
+				}
+				if i < len(tc.wantURLs) && c.DetailsURL != tc.wantURLs[i] {
+					t.Errorf("Checks[%d].DetailsURL = %q, want %q", i, c.DetailsURL, tc.wantURLs[i])
+				}
+			}
+		})
+	}
+}
+
+// The reduced rollup must reach the verdict engine: a green re-run of a
+// previously red check must make ready reachable through Apply.
+func TestCurrentRunReachesVerdict(t *testing.T) {
+	body := `{"check_runs":[
+		{"name":"build","status":"completed","conclusion":"failure","started_at":"2026-11-20T10:00:00Z"},
+		{"name":"build","status":"completed","conclusion":"success","started_at":"2026-11-20T11:00:00Z"},
+		{"name":"ci/audit","status":"completed","conclusion":"success"},
+		{"name":"tests","status":"completed","conclusion":"success"}]}`
+	res, appErr := NewStatusParser().Parse(ProviderGitHub, []byte(body))
+	if appErr != nil {
+		t.Fatalf("Parse error = %+v, want none", appErr)
+	}
+	s := readySnapshotForShip()
+	res.Apply(&s)
+	if s.Rollup != "SUCCESS" {
+		t.Fatalf("Snapshot.Rollup = %q, want SUCCESS", s.Rollup)
+	}
+	if want := (domain.ShipFacts{Build: true, Audit: true, TDD: true}); s.Ship != want {
+		t.Fatalf("Snapshot.Ship = %+v, want %+v", s.Ship, want)
+	}
+	got, _ := domain.Evaluate(s, domain.Policy{RequireUpToDate: true})
+	if got != domain.VerdictReady {
+		t.Fatalf("Evaluate = %q, want %q", got, domain.VerdictReady)
+	}
+}
+
 // --- Cross-platform CI status adapter tests (ADR 0039 §3, T3.62) ---
 
 type statusCase struct {

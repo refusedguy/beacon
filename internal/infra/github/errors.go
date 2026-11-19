@@ -460,7 +460,9 @@ func buildRollup(checks []Check) (string, []string) {
 
 // --- GitHub Actions ---
 
-// GitHubActionsAdapter parses a GitHub check-runs response.
+// GitHubActionsAdapter parses a GitHub check-runs response. Runs are reduced
+// to the current attempt of each named check before the rollup is built
+// (ADR 0048 §1).
 type GitHubActionsAdapter struct{}
 
 var _ StatusAdapter = GitHubActionsAdapter{}
@@ -470,14 +472,71 @@ func NewGitHubActionsAdapter() StatusAdapter { return GitHubActionsAdapter{} }
 func (GitHubActionsAdapter) Provider() Provider { return ProviderGitHub }
 
 type ghCheckRun struct {
-	Name       string `json:"name"`
-	Status     string `json:"status"`
-	Conclusion string `json:"conclusion"`
-	HTMLURL    string `json:"html_url"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	HTMLURL     string `json:"html_url"`
+	CreatedAt   string `json:"created_at"`
+	StartedAt   string `json:"started_at"`
+	CompletedAt string `json:"completed_at"`
 }
 
 type ghCheckRuns struct {
 	CheckRuns []ghCheckRun `json:"check_runs"`
+}
+
+// currentRuns reduces a raw check-runs list to the latest attempt of each
+// named check. A re-run reuses the check name and creates a fresh run with a
+// higher id and later timestamps, so the green re-run wins over an old red
+// result in the raw statusCheckRollup. The reduction lives in the adapter and
+// leaves the domain decision table, ADR 0004 batch order and response schema
+// untouched (ADR 0048 §1). Check names keep their order of first appearance,
+// which makes the result independent of how the provider ordered the runs.
+func currentRuns(runs []ghCheckRun) []ghCheckRun {
+	latest := make(map[string]int, len(runs))
+	order := make([]string, 0, len(runs))
+	for i, r := range runs {
+		j, seen := latest[r.Name]
+		if !seen {
+			latest[r.Name] = i
+			order = append(order, r.Name)
+			continue
+		}
+		if newerRun(r, runs[j]) {
+			latest[r.Name] = i
+		}
+	}
+	out := make([]ghCheckRun, 0, len(order))
+	for _, name := range order {
+		out = append(out, runs[latest[name]])
+	}
+	return out
+}
+
+// newerRun reports whether a is a later attempt than b. The most precise
+// available timestamp decides; id breaks ties and covers runs without a
+// timestamp.
+func newerRun(a, b ghCheckRun) bool {
+	ta, tb := runTime(a), runTime(b)
+	if !ta.Equal(tb) {
+		return ta.After(tb)
+	}
+	return a.ID > b.ID
+}
+
+// runTime returns the best timestamp a run carries, or the zero time when no
+// timestamp field parses. RFC3339 is GitHub's wire format.
+func runTime(r ghCheckRun) time.Time {
+	for _, s := range []string{r.StartedAt, r.CreatedAt, r.CompletedAt} {
+		if s == "" {
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
 }
 
 func (a GitHubActionsAdapter) Parse(body []byte) (StatusResult, *domain.AppError) {
@@ -488,8 +547,9 @@ func (a GitHubActionsAdapter) Parse(body []byte) (StatusResult, *domain.AppError
 	if doc.CheckRuns == nil {
 		return StatusResult{}, missingStatus(a.Provider())
 	}
-	checks := make([]Check, 0, len(doc.CheckRuns))
-	for _, run := range doc.CheckRuns {
+	runs := currentRuns(doc.CheckRuns)
+	checks := make([]Check, 0, len(runs))
+	for _, run := range runs {
 		state, ok := githubCheckState(run.Status, run.Conclusion)
 		if !ok {
 			return StatusResult{}, invalidStatus(a.Provider(), run.Status+"/"+run.Conclusion)
