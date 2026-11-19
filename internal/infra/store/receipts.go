@@ -891,3 +891,192 @@ func (d *DB) TaskFence(taskID string) (uint64, bool, error) {
 	}
 	return uint64(token), true, nil
 }
+
+// ADR 0058 §3, feature 3. Checking the agent's own claims against git, test
+// reports and CI. This is a different object from T3.98's external verdict in
+// internal/domain/verdict.go: T3.98 evaluates checks an external verifier ran
+// on the result, while here the thing under check is a statement the agent
+// made. The evidence is stored beside the claim and the verdict links to the
+// exact observation that decided it, so a client sees the basis, not the words.
+
+// ClaimSourceKind is the external source that can confirm or refute a claim.
+// The three kinds are the ones named by ADR 0058 §3: a test, a CI run or a git
+// fact. An agent's private log is deliberately not a source.
+type ClaimSourceKind string
+
+const (
+	ClaimSourceTest    ClaimSourceKind = "test"
+	ClaimSourceCIRun   ClaimSourceKind = "ci_run"
+	ClaimSourceGitFact ClaimSourceKind = "git_fact"
+)
+
+// ClaimEvidence is one recorded observation from an external source. An adapter
+// fills it from a real test report, CI run or git fact; the agent's own account
+// never enters these fields. Observed says the fact was actually captured and
+// Passed says it supports the claim: a green test or CI run, or a git fact that
+// holds. Ref names the concrete observation, for example the test name, the CI
+// run id or the commit sha, so the verdict can point at it.
+type ClaimEvidence struct {
+	Kind     ClaimSourceKind `json:"kind"`
+	Ref      string          `json:"ref"`
+	Observed bool            `json:"observed"`
+	Passed   bool            `json:"passed"`
+}
+
+// AgentClaim is a statement the agent made together with the evidence recorded
+// beside it. ID names the claim so a verdict can reference it.
+type AgentClaim struct {
+	ID       string          `json:"id"`
+	Text     string          `json:"text"`
+	Evidence []ClaimEvidence `json:"evidence"`
+}
+
+// ClaimVerdict is the result of checking one claim against its evidence.
+type ClaimVerdict string
+
+const (
+	// ClaimConfirmed means an observed source supports the claim.
+	ClaimConfirmed ClaimVerdict = "CONFIRMED"
+	// ClaimRefuted means an observed source contradicts the claim. A single
+	// failed observation refutes even when other observations pass.
+	ClaimRefuted ClaimVerdict = "REFUTED"
+	// ClaimUnverifiable means no usable observation was recorded. The gate
+	// fails closed: a claim without evidence is not a confirmed claim.
+	ClaimUnverifiable ClaimVerdict = "UNVERIFIABLE"
+)
+
+// ClaimResult is the verdict for one claim and the exact evidence that decided
+// it. Evidence is the zero value only for UNVERIFIABLE, where no usable
+// observation existed.
+type ClaimResult struct {
+	ClaimID  string        `json:"claim_id"`
+	Verdict  ClaimVerdict  `json:"verdict"`
+	Evidence ClaimEvidence `json:"evidence"`
+}
+
+// validClaimSource reports whether k is one of the three ADR 0058 §3 sources.
+// An unknown kind is not evidence and cannot move a verdict.
+func validClaimSource(k ClaimSourceKind) bool {
+	switch k {
+	case ClaimSourceTest, ClaimSourceCIRun, ClaimSourceGitFact:
+		return true
+	default:
+		return false
+	}
+}
+
+// CheckClaim checks one claim against the evidence recorded with it. It is a
+// pure function: it reads no clock, runs no process and mutates the claim.
+//
+// Rules, in order:
+//
+//  1. An observed, failed observation from a known source refutes the claim;
+//     that observation is the deciding evidence.
+//  2. Otherwise an observed, passing observation from a known source confirms
+//     the claim; the first such observation is the deciding evidence.
+//  3. With no usable observation the claim is unverifiable, fail closed.
+//
+// Only recorded observations decide. The claim text is carried for the client
+// but never affects the verdict, so an agent cannot argue its way to a pass.
+func CheckClaim(claim AgentClaim) ClaimResult {
+	result := ClaimResult{ClaimID: claim.ID}
+	for _, e := range claim.Evidence {
+		if e.Observed && validClaimSource(e.Kind) && !e.Passed {
+			result.Verdict = ClaimRefuted
+			result.Evidence = e
+			return result
+		}
+	}
+	for _, e := range claim.Evidence {
+		if e.Observed && validClaimSource(e.Kind) && e.Passed {
+			result.Verdict = ClaimConfirmed
+			result.Evidence = e
+			return result
+		}
+	}
+	result.Verdict = ClaimUnverifiable
+	return result
+}
+
+// CheckClaims checks a slice of claims and returns one verdict each, in the
+// input order. It is the pure counterpart of SaveClaims plus ClaimResults.
+func CheckClaims(claims []AgentClaim) []ClaimResult {
+	out := make([]ClaimResult, 0, len(claims))
+	for _, c := range claims {
+		out = append(out, CheckClaim(c))
+	}
+	return out
+}
+
+// createClaimsSQL owns the per-claim evidence table. Like receipts and the
+// other tables here, it is created on first use instead of in the migration
+// corpus. One row per claim id; the whole claim, text and evidence, is the
+// payload.
+const createClaimsSQL = `
+CREATE TABLE IF NOT EXISTS agent_claims (
+  id          TEXT PRIMARY KEY,
+  payload     BLOB NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+`
+
+// SaveClaims upserts claims by ID in one transaction. The payload stores the
+// text and the evidence together so a verdict is always recomputed from what
+// was recorded at save time. A missing ID is rejected at this boundary; the
+// payload passes through the one redaction filter before it reaches SQLite.
+func (d *DB) SaveClaims(claims []AgentClaim) error {
+	for _, c := range claims {
+		if strings.TrimSpace(c.ID) == "" {
+			return domain.NewAppError(domain.CodeInvalidInput,
+				"store: save claims: empty claim id")
+		}
+	}
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createClaimsSQL); err != nil {
+			return fmt.Errorf("store: claims: create table: %w", err)
+		}
+		for _, c := range claims {
+			payload, err := json.Marshal(c)
+			if err != nil {
+				return fmt.Errorf("store: claims: encode %s: %w", c.ID, err)
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO agent_claims (id, payload, created_at)
+				VALUES (?, ?, ?)
+				ON CONFLICT(id) DO UPDATE SET payload = excluded.payload`,
+				c.ID, Redact(payload), time.Now().UTC().UnixNano()); err != nil {
+				return fmt.Errorf("store: claims: save %s: %w", c.ID, err)
+			}
+		}
+		return nil
+	})
+}
+
+// ClaimResults returns one verdict per stored claim, ordered by id. Each is
+// recomputed by CheckClaim from the evidence on disk, so the result reflects
+// the recorded basis and never a verdict the agent wrote into its claim.
+func (d *DB) ClaimResults() ([]ClaimResult, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "agent_claims")
+	if err != nil || !ok {
+		return nil, err
+	}
+	rows, err := d.readDB.Query(`SELECT payload FROM agent_claims ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ClaimResult
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var claim AgentClaim
+		if err := json.Unmarshal(payload, &claim); err != nil {
+			return nil, fmt.Errorf("store: claims: decode: %w", err)
+		}
+		out = append(out, CheckClaim(claim))
+	}
+	return out, rows.Err()
+}
