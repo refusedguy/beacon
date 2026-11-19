@@ -92,10 +92,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -d tests/adapter ]; then
-            find tests/adapter -maxdepth 1 -name '*.test.js' -print0 | xargs -0 -r node --test
+          # Собираем все JS-тесты проекта: адаптеры, канонические тесты скиллов
+          # и тесты агентов. Раньше запускались только tests/adapter/*.test.js,
+          # поэтому SKILL_test.js из .opencode/skills не выполнялись в CI.
+          mapfile -t js_tests < <(
+            {
+              if [ -d tests/adapter ]; then
+                find tests/adapter -maxdepth 1 -type f -name '*.test.js' -print
+              fi
+              if [ -d .opencode/skills ]; then
+                find .opencode/skills -type f -name 'SKILL_test.js' -print
+              fi
+              if [ -d .opencode/agents ]; then
+                find .opencode/agents -type f -name '*_test.js' -print
+              fi
+            } | sort -u
+          )
+          if [ "${#js_tests[@]}" -eq 0 ]; then
+            printf 'no JS tests found, skipping\n'
           else
-            printf 'tests/adapter not present, skipping JS adapter tests\n'
+            printf 'running JS tests:\n'
+            printf '  %s\n' "${js_tests[@]}"
+            node --test "${js_tests[@]}"
           fi
 
   gates:
