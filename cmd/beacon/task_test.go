@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
@@ -528,5 +530,117 @@ func TestTaskCommandNeedsInputRequiresQuestion(t *testing.T) {
 	}
 	if string(after) != string(before) {
 		t.Errorf("карточка изменена при отказе: %q", after)
+	}
+}
+
+// ---- ADR 0056 п5 / T3.126: wait --after SEQ ----
+
+// seedWaitEvents пишет в журнал три события с телами alpha, beta, gamma.
+func seedWaitEvents(t *testing.T, stateDir string) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(stateDir, mcpStateDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rw, err := store.NewRedactingWriter(db, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range []string{"alpha", "beta", "gamma"} {
+		payload := fmt.Sprintf(`{"kind":"progress","message":%q}`, msg)
+		if err := rw.WriteEvent(context.Background(), "watch-A", []byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestTaskCommandWaitAfterSeq(t *testing.T) {
+	dir := t.TempDir()
+	seedWaitEvents(t, dir)
+	cfg := taskcli.Config{StateDir: dir, Root: dir}
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "wait", "--after", "1"}, &stdout, &stderr, cfg)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "alpha") {
+		t.Errorf("событие до SEQ возвращено: %q", out)
+	}
+	for _, want := range []string{"beta", "gamma"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("в выводе нет события %q: %q", want, out)
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("строк = %d, ждали 2: %q", len(lines), out)
+	}
+	if !strings.HasPrefix(lines[0], "2 ") || !strings.HasPrefix(lines[1], "3 ") {
+		t.Errorf("неверный порядок или позиции: %q", out)
+	}
+}
+
+func TestTaskCommandWaitResumesFromLastSeq(t *testing.T) {
+	dir := t.TempDir()
+	seedWaitEvents(t, dir)
+	cfg := taskcli.Config{StateDir: dir, Root: dir}
+	var stdout, stderr bytes.Buffer
+
+	// Повтор с последней позицией ничего не возвращает: опрос не нужен.
+	code := TaskCommandWithConfig([]string{"task", "wait", "--after", "3"}, &stdout, &stderr, cfg)
+	if code != 0 || stderr.Len() != 0 || stdout.Len() != 0 {
+		t.Fatalf("код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+
+	// Форма без префикса task и --after 0 возвращают все события.
+	stdout.Reset()
+	stderr.Reset()
+	code = TaskCommandWithConfig([]string{"wait", "--after", "0"}, &stdout, &stderr, cfg)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d stderr %q", code, stderr.String())
+	}
+	for _, want := range []string{"alpha", "beta", "gamma"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("в выводе нет %q: %q", want, stdout.String())
+		}
+	}
+}
+
+func TestTaskCommandWaitEmptyJournal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := taskcli.Config{StateDir: dir, Root: dir}
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "wait", "--after", "0"}, &stdout, &stderr, cfg)
+	if code != 0 || stderr.Len() != 0 || stdout.Len() != 0 {
+		t.Fatalf("код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestTaskCommandWaitValidation(t *testing.T) {
+	dir := t.TempDir()
+	seedWaitEvents(t, dir)
+	cfg := taskcli.Config{StateDir: dir, Root: dir}
+	cases := []struct {
+		name string
+		argv []string
+	}{
+		{"без --after", []string{"task", "wait"}},
+		{"не число", []string{"task", "wait", "--after", "seq"}},
+		{"отрицательное", []string{"task", "wait", "--after", "-1"}},
+		{"лишний аргумент", []string{"task", "wait", "--after", "1", "T1.1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := TaskCommandWithConfig(tc.argv, &stdout, &stderr, cfg)
+			if code != 1 {
+				t.Errorf("код = %d, ждали 1", code)
+			}
+			if stdout.Len() != 0 || stderr.Len() == 0 {
+				t.Errorf("stdout %q, stderr %q", stdout.String(), stderr.String())
+			}
+		})
 	}
 }

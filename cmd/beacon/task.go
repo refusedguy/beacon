@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
@@ -52,13 +53,15 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskNeedsInput(args[1:], stdout, stderr, cfg)
 	case "why":
 		return runTaskWhy(args[1:], stdout, stderr, cfg)
+	case "wait":
+		return runTaskWait(args[1:], stdout, stderr, cfg)
 	default:
 		fmt.Fprintf(stderr, "неизвестная подкоманда task %q\n%s", args[0], taskUsage)
 		return taskstore.ExitValidation
 	}
 }
 
-const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|--self-test [flags]"
+const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|--self-test [flags]"
 
 // whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
 var whyEdgeKinds = []string{
@@ -242,6 +245,49 @@ func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int
 		}
 		fmt.Fprintf(stdout, "  %d. %s через %s: держит %s (%s)\n",
 			i+1, step.id, step.edge, holder, step.status)
+	}
+	return taskstore.ExitOK
+}
+
+// ---- ADR 0056 п5 / T3.126: wait --after SEQ ----
+//
+// Команда wait возобновляет чтение журнала задач строго после позиции SEQ и
+// печатает только события с seq больше указанной. SEQ это аргумент CLI и
+// позиция в журнале задач Beacon, а не курсор протокола MCP из ADR 0025: там
+// курсор непрозрачен и отдаётся подписчику через протокол, здесь число задаёт
+// вызывающий и не требует опроса, потому что новая позиция берётся из журнала.
+func runTaskWait(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"after": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) > 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	raw := p.value("after")
+	if raw == "" {
+		return failTask(stderr, taskstore.Validationf("команда wait требует --after SEQ"))
+	}
+	after, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || after < 0 {
+		return failTask(stderr, taskstore.Validationf("неверная позиция --after %q: нужно неотрицательное число", raw))
+	}
+
+	db, err := store.Open(filepath.Join(cfg.StateDir, mcpStateDBName))
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	defer db.Close()
+
+	events, _, err := db.LoadEvents()
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	for _, e := range events {
+		if e.Seq <= after {
+			continue
+		}
+		fmt.Fprintf(stdout, "%d %s %s\n", e.Seq, e.WatchID, string(e.Payload))
 	}
 	return taskstore.ExitOK
 }
