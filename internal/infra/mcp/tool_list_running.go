@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -55,7 +56,43 @@ type SessionLiveness struct {
 	PID           int       `json:"pid"`
 	LastActivity  time.Time `json:"lastActivity"`
 	LastHeartbeat time.Time `json:"lastHeartbeat"`
+	// StartTime and BootID are the ADR 0047 §6 owner fields. They add pid-reuse
+	// and reboot detection to the T3.86 death signals. Zero values mean the
+	// signal is unknown and keep the T3.86 behavior unchanged.
+	StartTime uint64 `json:"startTime,omitempty"`
+	BootID    string `json:"bootId,omitempty"`
 }
+
+// OwnerVerdict is the worktree owner liveness verdict from ADR 0047 §6. It is a
+// separate type from domain.Verdict: a worktree owner is not a watch, and an
+// unverifiable owner must never be confused with a watch verdict.
+type OwnerVerdict string
+
+const (
+	OwnerVerdictLive         OwnerVerdict = "live"
+	OwnerVerdictDead         OwnerVerdict = "dead"
+	OwnerVerdictUnverifiable OwnerVerdict = "unverifiable"
+)
+
+// OwnerIdentity holds the three fields that describe a worktree slot owner
+// (ADR 0047 §6): pid, start time from field 22 of /proc/<pid>/stat, and boot id.
+// Boot id distinguishes a machine reboot from a pid reuse.
+type OwnerIdentity struct {
+	PID       int    `json:"pid"`
+	StartTime uint64 `json:"startTime"`
+	BootID    string `json:"bootId"`
+}
+
+// OwnerReclaimCode is the dedicated refusal code for a worktree slot reclaim
+// attempt (ADR 0047 §6). It is local to this package because the card does not
+// extend the domain error-code enum.
+type OwnerReclaimCode string
+
+const (
+	OwnerReclaimGranted        OwnerReclaimCode = "RECLAIM_GRANTED"
+	OwnerReclaimRefusedLive    OwnerReclaimCode = "RECLAIM_REFUSED_LIVE"
+	OwnerReclaimRefusedUnknown OwnerReclaimCode = "RECLAIM_REFUSED_UNVERIFIABLE"
+)
 
 // SnapshotReader is the single read-only state accessor used by
 // beacon_list_running and beacon_stats. The interface deliberately has no
@@ -165,6 +202,113 @@ var processAlive = func(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
+// parseProcStatStartTime extracts field 22 (starttime, in clock ticks) from the
+// contents of /proc/<pid>/stat. Field 2 (comm) is parenthesized and may itself
+// contain spaces or parentheses, so the parse starts after the final ')'.
+func parseProcStatStartTime(stat string) (uint64, bool) {
+	end := strings.LastIndexByte(stat, ')')
+	if end < 0 {
+		return 0, false
+	}
+	fields := strings.Fields(stat[end+1:])
+	// Field 22 is the 20th field after the parenthesized comm (field 2).
+	if len(fields) < 20 {
+		return 0, false
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return start, true
+}
+
+// readProcStartTime returns field 22 of /proc/<pid>/stat. It is a variable so
+// tests can substitute a fixed value; production reads the kernel table.
+var readProcStartTime = func(pid int) uint64 {
+	if pid <= 0 {
+		return 0
+	}
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return 0
+	}
+	start, ok := parseProcStatStartTime(string(data))
+	if !ok {
+		return 0
+	}
+	return start
+}
+
+// readBootID returns the machine boot id. It is a variable so tests can
+// substitute a fixed value; production reads the kernel's boot_id.
+var readBootID = func() string {
+	data, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// ownerVerdict compares a recorded owner identity with the observed one and
+// returns the ADR 0047 §6 liveness verdict. Incomplete data on either side
+// yields the separate unverifiable verdict. A boot id change means the machine
+// rebooted, so the recorded pid cannot still be the same process; a start time
+// change under the same boot means the pid was reused.
+func ownerVerdict(recorded, observed OwnerIdentity, pidAlive bool) OwnerVerdict {
+	if recorded.PID <= 0 || recorded.StartTime == 0 || recorded.BootID == "" {
+		return OwnerVerdictUnverifiable
+	}
+	if observed.StartTime == 0 || observed.BootID == "" {
+		return OwnerVerdictUnverifiable
+	}
+	if recorded.BootID != observed.BootID {
+		return OwnerVerdictDead
+	}
+	if !pidAlive {
+		return OwnerVerdictDead
+	}
+	if recorded.StartTime != observed.StartTime {
+		return OwnerVerdictDead
+	}
+	return OwnerVerdictLive
+}
+
+// ownerIsLive treats unverifiable as a live owner: the slot is not taken when
+// identity data is missing (ADR 0047 §6). Only a confirmed dead owner frees it.
+func ownerIsLive(v OwnerVerdict) bool {
+	return v != OwnerVerdictDead
+}
+
+// ownerReclaimCode maps an owner verdict to the reclaim outcome. Only a dead
+// owner frees the slot. An unverifiable owner gets its own refusal code so a
+// caller can tell "unknown" apart from "confirmed live" (ADR 0047 §6).
+func ownerReclaimCode(v OwnerVerdict) OwnerReclaimCode {
+	switch v {
+	case OwnerVerdictDead:
+		return OwnerReclaimGranted
+	case OwnerVerdictUnverifiable:
+		return OwnerReclaimRefusedUnknown
+	default:
+		return OwnerReclaimRefusedLive
+	}
+}
+
+// sessionOwnerVerdict evaluates a session's recorded owner identity against the
+// current machine. Without all three ADR 0047 §6 fields it returns
+// unverifiable, which callers treat as live, so T3.86 keeps its old behavior.
+func sessionOwnerVerdict(s SessionLiveness) OwnerVerdict {
+	if s.PID <= 0 || s.StartTime == 0 || s.BootID == "" {
+		return OwnerVerdictUnverifiable
+	}
+	recorded := OwnerIdentity{PID: s.PID, StartTime: s.StartTime, BootID: s.BootID}
+	observed := OwnerIdentity{
+		PID:       s.PID,
+		StartTime: readProcStartTime(s.PID),
+		BootID:    readBootID(),
+	}
+	return ownerVerdict(recorded, observed, processAlive(s.PID))
+}
+
 // artifactsPresent reports whether every expected artifact path is a regular
 // file on disk. An empty list adds no requirement.
 func artifactsPresent(paths []string) bool {
@@ -191,6 +335,12 @@ func sessionDead(s SessionLiveness) bool {
 		return false
 	}
 	if !processAlive(s.PID) {
+		return true
+	}
+	// ADR 0047 §6: the boot id and start time add reboot and pid-reuse
+	// detection to T3.86. An unverifiable owner is treated as live, so this
+	// only fires when all three identity fields are present and disagree.
+	if sessionOwnerVerdict(s) == OwnerVerdictDead {
 		return true
 	}
 	if s.LastActivity.IsZero() || s.LastHeartbeat.IsZero() {

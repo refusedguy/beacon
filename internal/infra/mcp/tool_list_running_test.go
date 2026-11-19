@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -518,5 +519,226 @@ func TestListRunningDeadPIDBeatsFreshSignals(t *testing.T) {
 
 	if got := out.Watches[0].Status; got != domain.Status(StatusIdle) {
 		t.Errorf("watch status = %q, want %q", got, StatusIdle)
+	}
+}
+
+// withOwnerObserved replaces the /proc and boot-id seams for one test, so the
+// recorded owner identity is compared with fixed observed values.
+func withOwnerObserved(t *testing.T, startTime uint64, bootID string) {
+	t.Helper()
+	originalStart, originalBoot := readProcStartTime, readBootID
+	readProcStartTime = func(int) uint64 { return startTime }
+	readBootID = func() string { return bootID }
+	t.Cleanup(func() {
+		readProcStartTime = originalStart
+		readBootID = originalBoot
+	})
+}
+
+func TestParseProcStatStartTime(t *testing.T) {
+	// Field 22 is starttime. Field 2 (comm) may contain spaces and parens, so
+	// the parse must start after the last ')'.
+	cases := []struct {
+		name string
+		stat string
+		want uint64
+		ok   bool
+	}{
+		{
+			name: "simple comm",
+			stat: "1 (init) S " + strings.Repeat("0 ", 18) + "123 0 0 0 0",
+			want: 123,
+			ok:   true,
+		},
+		{
+			name: "comm with spaces and parens",
+			stat: "42 (my (agent) proc) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 456 789 0 0",
+			want: 456,
+			ok:   true,
+		},
+		{name: "no closing paren", stat: "1 (init S 0 0", ok: false},
+		{name: "too few fields", stat: "1 (init) S 0 0 0", ok: false},
+		{
+			name: "non numeric starttime",
+			stat: "1 (init) S " + strings.Repeat("0 ", 18) + "X 0 0 0 0",
+			ok:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := parseProcStatStartTime(tc.stat)
+			if ok != tc.ok {
+				t.Fatalf("parseProcStatStartTime ok = %v, want %v", ok, tc.ok)
+			}
+			if got != tc.want {
+				t.Errorf("parseProcStatStartTime = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOwnerVerdictDecisionTable(t *testing.T) {
+	const start = uint64(900)
+	const boot = "boot-a"
+	recorded := OwnerIdentity{PID: 100, StartTime: start, BootID: boot}
+
+	cases := []struct {
+		name     string
+		recorded OwnerIdentity
+		observed OwnerIdentity
+		alive    bool
+		want     OwnerVerdict
+	}{
+		{"verified live", recorded, OwnerIdentity{PID: 100, StartTime: start, BootID: boot}, true, OwnerVerdictLive},
+		{"reboot is dead", recorded, OwnerIdentity{PID: 100, StartTime: start, BootID: "boot-b"}, true, OwnerVerdictDead},
+		{"dead pid is dead", recorded, OwnerIdentity{PID: 100, StartTime: start, BootID: boot}, false, OwnerVerdictDead},
+		{"pid reused is dead", recorded, OwnerIdentity{PID: 100, StartTime: 901, BootID: boot}, true, OwnerVerdictDead},
+		{"missing recorded pid", OwnerIdentity{StartTime: start, BootID: boot}, OwnerIdentity{PID: 100, StartTime: start, BootID: boot}, true, OwnerVerdictUnverifiable},
+		{"missing recorded start", OwnerIdentity{PID: 100, BootID: boot}, OwnerIdentity{PID: 100, StartTime: start, BootID: boot}, true, OwnerVerdictUnverifiable},
+		{"missing recorded boot", OwnerIdentity{PID: 100, StartTime: start}, OwnerIdentity{PID: 100, StartTime: start, BootID: boot}, true, OwnerVerdictUnverifiable},
+		{"missing observed start", recorded, OwnerIdentity{PID: 100, BootID: boot}, true, OwnerVerdictUnverifiable},
+		{"missing observed boot", recorded, OwnerIdentity{PID: 100, StartTime: start}, true, OwnerVerdictUnverifiable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ownerVerdict(tc.recorded, tc.observed, tc.alive); got != tc.want {
+				t.Errorf("ownerVerdict = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnverifiableOwnerIsLiveAndRefusesReclaim(t *testing.T) {
+	for _, v := range []OwnerVerdict{OwnerVerdictLive, OwnerVerdictUnverifiable} {
+		if !ownerIsLive(v) {
+			t.Errorf("ownerIsLive(%q) = false, want true", v)
+		}
+	}
+	if ownerIsLive(OwnerVerdictDead) {
+		t.Error("ownerIsLive(dead) = true, want false")
+	}
+
+	unknown := ownerReclaimCode(OwnerVerdictUnverifiable)
+	if unknown != OwnerReclaimRefusedUnknown {
+		t.Errorf("reclaim(unverifiable) = %q, want %q", unknown, OwnerReclaimRefusedUnknown)
+	}
+	if unknown == ownerReclaimCode(OwnerVerdictLive) {
+		t.Error("unverifiable and live must have distinct reclaim codes")
+	}
+	if got := ownerReclaimCode(OwnerVerdictDead); got != OwnerReclaimGranted {
+		t.Errorf("reclaim(dead) = %q, want %q", got, OwnerReclaimGranted)
+	}
+}
+
+func TestSessionOwnerVerdictUsesRecordedAndObservedIdentity(t *testing.T) {
+	const pid = 424250
+	withProcessAlive(t, map[int]bool{pid: true})
+	withOwnerObserved(t, 900, "boot-a")
+
+	cases := []struct {
+		name string
+		s    SessionLiveness
+		want OwnerVerdict
+	}{
+		{"all fields absent", SessionLiveness{SessionID: "s", PID: pid}, OwnerVerdictUnverifiable},
+		{"partial fields", SessionLiveness{SessionID: "s", PID: pid, StartTime: 900}, OwnerVerdictUnverifiable},
+		{"matching identity", SessionLiveness{SessionID: "s", PID: pid, StartTime: 900, BootID: "boot-a"}, OwnerVerdictLive},
+		{"boot changed", SessionLiveness{SessionID: "s", PID: pid, StartTime: 900, BootID: "boot-old"}, OwnerVerdictDead},
+		{"start time changed", SessionLiveness{SessionID: "s", PID: pid, StartTime: 111, BootID: "boot-a"}, OwnerVerdictDead},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionOwnerVerdict(tc.s); got != tc.want {
+				t.Errorf("sessionOwnerVerdict = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestListRunningRebootTurnsWatchIdle(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const pid = 424251
+	// The pid is still alive after the reboot; only the boot id changed, so
+	// T3.86 alone would keep the watch live.
+	withProcessAlive(t, map[int]bool{pid: true})
+	withOwnerObserved(t, 900, "boot-new")
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+		Sessions: []SessionLiveness{{
+			SessionID: "s1", Artifacts: []string{artifact}, PID: pid,
+			StartTime: 900, BootID: "boot-old",
+		}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+	if got := out.Watches[0].Status; got != domain.Status(StatusIdle) {
+		t.Errorf("watch status = %q, want %q", got, StatusIdle)
+	}
+}
+
+func TestListRunningPIDReuseTurnsWatchIdle(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const pid = 424252
+	withProcessAlive(t, map[int]bool{pid: true})
+	withOwnerObserved(t, 901, "boot-same")
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+		Sessions: []SessionLiveness{{
+			SessionID: "s1", Artifacts: []string{artifact}, PID: pid,
+			StartTime: 900, BootID: "boot-same",
+		}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+	if got := out.Watches[0].Status; got != domain.Status(StatusIdle) {
+		t.Errorf("watch status = %q, want %q", got, StatusIdle)
+	}
+}
+
+func TestListRunningIncompleteOwnerKeepsStatus(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const pid = 424253
+	withProcessAlive(t, map[int]bool{pid: true})
+	withOwnerObserved(t, 901, "boot-new") // would be dead if the identity were complete
+
+	cases := []struct {
+		name  string
+		owner SessionLiveness
+	}{
+		{"no owner fields", SessionLiveness{SessionID: "s1", PID: pid}},
+		{"missing boot id", SessionLiveness{SessionID: "s1", PID: pid, StartTime: 900}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			owner := tc.owner
+			owner.Artifacts = []string{artifact}
+			reader := &snapshotReaderFake{snap: StateSnapshot{
+				ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+				Sessions:      []SessionLiveness{owner},
+			}}
+			out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+			if got := out.Watches[0].Status; got != domain.StatusWatching {
+				t.Errorf("watch status = %q, want watching (unverifiable owner is live)", got)
+			}
+		})
+	}
+}
+
+func TestListRunningVerifiedOwnerKeepsStatus(t *testing.T) {
+	artifact := writeArtifact(t, t.TempDir(), "session.json")
+	const pid = 424254
+	withProcessAlive(t, map[int]bool{pid: true})
+	withOwnerObserved(t, 900, "boot-same")
+
+	reader := &snapshotReaderFake{snap: StateSnapshot{
+		ActiveWatches: []domain.Watch{watchWithSubscriber("w1", "s1")},
+		Sessions: []SessionLiveness{{
+			SessionID: "s1", Artifacts: []string{artifact}, PID: pid,
+			StartTime: 900, BootID: "boot-same",
+		}},
+	}}
+	out := callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+	if got := out.Watches[0].Status; got != domain.StatusWatching {
+		t.Errorf("watch status = %q, want watching", got)
 	}
 }
