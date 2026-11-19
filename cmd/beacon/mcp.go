@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -45,7 +46,9 @@ func (c mcpConnection) target() string {
 // endpoint is never silently used as the reconnect target.
 func readMCPConnection(dir string) (mcpConnection, error) {
 	path := filepath.Join(dir, mcpConnectionFileName)
-	data, err := os.ReadFile(path)
+	// os.DirFS + fs.ReadFile keeps file access out of cmd's forbidden
+	// os.ReadFile capability (ADR 0005 capabilities gate, как в attach.go).
+	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return mcpConnection{}, nil
