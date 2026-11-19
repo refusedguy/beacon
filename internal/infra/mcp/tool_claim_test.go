@@ -1115,3 +1115,325 @@ func TestHeartbeatInvalidInput(t *testing.T) {
 		})
 	}
 }
+
+// sameHolders compares holder lists in order without sharing the stored slice.
+func sameHolders(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// extendHolderLease is the holder-side call used by the ADR 0049 p6 tests.
+func extendHolderLease(t *testing.T, h *HolderLeaseHandler, resourceID, holderID string, ttl time.Duration) HolderLeaseExtendOutput {
+	t.Helper()
+	out, err := h.Extend(context.Background(), HolderLeaseExtendInput{
+		ResourceID: resourceID, HolderID: holderID, TTLSeconds: int64(ttl / time.Second),
+	})
+	if err != nil {
+		t.Fatalf("extend holder lease: %v", err)
+	}
+	return out
+}
+
+// TestHolderLeaseExtendNeverShortensDeadline is the core of ADR 0049 p6: a
+// short extend keeps the deadline already granted and reports that nothing moved.
+func TestHolderLeaseExtendNeverShortensDeadline(t *testing.T) {
+	start := time.Date(2026, 11, 20, 23, 0, 0, 0, time.UTC)
+	clock := &leaseTestClock{t: start}
+	h := NewHolderLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Install(ctx, HolderLeaseInput{
+		ResourceID: "agent-1", Holders: []string{"alice", "bob"}, TTLSeconds: 3600,
+	})
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	granted := start.Add(time.Hour)
+	if !lease.ExpiresAt.Equal(granted) {
+		t.Fatalf("expiresAt = %v, want %v", lease.ExpiresAt, granted)
+	}
+
+	// Now plus ten minutes is still earlier than the granted one-hour deadline.
+	clock.Advance(30 * time.Minute)
+	out := extendHolderLease(t, h, "agent-1", "alice", 10*time.Minute)
+	if out.Extended {
+		t.Fatal("short extend must not report that the deadline moved")
+	}
+	if !out.ExpiresAt.Equal(granted) {
+		t.Fatalf("deadline after short extend = %v, want %v", out.ExpiresAt, granted)
+	}
+	if !sameHolders(out.Holders, []string{"alice", "bob"}) {
+		t.Fatalf("holders after extend = %v, want [alice bob]", out.Holders)
+	}
+}
+
+// TestHolderLeaseExtendPushesDeadlineWhenLonger covers the other branch: a
+// longer request moves the deadline to now plus its lifetime.
+func TestHolderLeaseExtendPushesDeadlineWhenLonger(t *testing.T) {
+	start := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+	clock := &leaseTestClock{t: start}
+	h := NewHolderLeaseHandler(clock)
+
+	if _, err := h.Install(context.Background(), HolderLeaseInput{
+		ResourceID: "wt-1", Holders: []string{"alice"}, TTLSeconds: 3600,
+	}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	clock.Advance(30 * time.Minute)
+	out := extendHolderLease(t, h, "wt-1", "alice", 2*time.Hour)
+	if !out.Extended {
+		t.Fatal("longer extend must report that the deadline moved")
+	}
+	if want := start.Add(30*time.Minute + 2*time.Hour); !out.ExpiresAt.Equal(want) {
+		t.Fatalf("deadline = %v, want %v", out.ExpiresAt, want)
+	}
+}
+
+// TestHolderLeaseMonotonicAcrossShortExtends shows the rule over a run of
+// renewals: each short extend leaves the granted deadline untouched, and a
+// later long one moves it forward from the then-current time.
+func TestHolderLeaseMonotonicAcrossShortExtends(t *testing.T) {
+	start := time.Date(2026, 11, 21, 1, 0, 0, 0, time.UTC)
+	clock := &leaseTestClock{t: start}
+	h := NewHolderLeaseHandler(clock)
+
+	if _, err := h.Install(context.Background(), HolderLeaseInput{
+		ResourceID: "agent-race", Holders: []string{"alice", "bob"}, TTLSeconds: 3600,
+	}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	granted := start.Add(time.Hour)
+	for i := 0; i < 5; i++ {
+		clock.Advance(5 * time.Minute)
+		out := extendHolderLease(t, h, "agent-race", "alice", 10*time.Minute)
+		if out.Extended || !out.ExpiresAt.Equal(granted) {
+			t.Fatalf("short extend %d = %+v, want unchanged deadline %v", i, out, granted)
+		}
+	}
+
+	clock.Advance(30 * time.Minute)
+	long := extendHolderLease(t, h, "agent-race", "bob", 2*time.Hour)
+	if !long.Extended {
+		t.Fatal("longer extend after short ones must move the deadline")
+	}
+	if want := start.Add(55*time.Minute + 2*time.Hour); !long.ExpiresAt.Equal(want) {
+		t.Fatalf("deadline = %v, want %v", long.ExpiresAt, want)
+	}
+}
+
+// TestHolderLeaseHoldersPreservedAcrossExtends pins the holder list through
+// both kinds of extend and through the reclaim-facing Holders query. It also
+// checks that a caller mutating a returned slice cannot change the lease.
+func TestHolderLeaseHoldersPreservedAcrossExtends(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 21, 2, 0, 0, 0, time.UTC)}
+	h := NewHolderLeaseHandler(clock)
+	ctx := context.Background()
+	want := []string{"alice", "bob", "carol"}
+
+	if _, err := h.Install(ctx, HolderLeaseInput{
+		ResourceID: "wt-holders", Holders: want, TTLSeconds: 3600,
+	}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	short := extendHolderLease(t, h, "wt-holders", "bob", 10*time.Minute)
+	if !sameHolders(short.Holders, want) {
+		t.Fatalf("holders after short extend = %v, want %v", short.Holders, want)
+	}
+	long := extendHolderLease(t, h, "wt-holders", "carol", 2*time.Hour)
+	if !sameHolders(long.Holders, want) {
+		t.Fatalf("holders after long extend = %v, want %v", long.Holders, want)
+	}
+
+	long.Holders[0] = "mallory"
+	seen, err := h.Holders(ctx, HolderLeaseHoldersInput{ResourceID: "wt-holders"})
+	if err != nil {
+		t.Fatalf("holders query: %v", err)
+	}
+	if !sameHolders(seen.Holders, want) {
+		t.Fatalf("holders query = %v, want %v", seen.Holders, want)
+	}
+}
+
+// TestHolderLeaseExtendRequiresHolder enforces that only a listed holder can
+// extend, and that a rejected call leaves the granted deadline intact.
+func TestHolderLeaseExtendRequiresHolder(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 21, 3, 0, 0, 0, time.UTC)}
+	h := NewHolderLeaseHandler(clock)
+	ctx := context.Background()
+
+	if _, err := h.Install(ctx, HolderLeaseInput{
+		ResourceID: "agent-holder", Holders: []string{"alice", "bob"}, TTLSeconds: 3600,
+	}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	clock.Advance(30 * time.Minute)
+	_, err := h.Extend(ctx, HolderLeaseExtendInput{
+		ResourceID: "agent-holder", HolderID: "dave", TTLSeconds: 600,
+	})
+	if !IsHolderLeaseNotHolder(err) {
+		t.Fatalf("extend by non-holder: err = %v, want not-holder", err)
+	}
+	var notHolder *HolderLeaseNotHolderError
+	if !errors.As(err, &notHolder) || notHolder.ResourceID != "agent-holder" || notHolder.HolderID != "dave" {
+		t.Fatalf("not-holder error = %+v, want dave on agent-holder", notHolder)
+	}
+
+	// The state is untouched: a short extend by a real holder still sees the
+	// original one-hour deadline.
+	out := extendHolderLease(t, h, "agent-holder", "alice", 10*time.Minute)
+	granted := clock.t.Add(30 * time.Minute)
+	if out.Extended || !out.ExpiresAt.Equal(granted) {
+		t.Fatalf("deadline after rejected extend = %+v, want the original grant %v", out, granted)
+	}
+}
+
+// TestHolderLeaseExtendAfterExpiryOrMissing checks that an elapsed lease cannot
+// be extended and that a fresh install reclaims the resource with new holders.
+func TestHolderLeaseExtendAfterExpiryOrMissing(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 21, 4, 0, 0, 0, time.UTC)}
+	h := NewHolderLeaseHandler(clock)
+	ctx := context.Background()
+
+	if _, err := h.Install(ctx, HolderLeaseInput{
+		ResourceID: "agent-expired", Holders: []string{"alice"}, TTLSeconds: 60,
+	}); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	clock.Advance(2 * time.Minute)
+	_, err := h.Extend(ctx, HolderLeaseExtendInput{
+		ResourceID: "agent-expired", HolderID: "alice", TTLSeconds: 600,
+	})
+	if !IsHolderLeaseNotFound(err) {
+		t.Fatalf("extend after TTL: err = %v, want not-found", err)
+	}
+	if _, err := h.Holders(ctx, HolderLeaseHoldersInput{ResourceID: "agent-expired"}); !IsHolderLeaseNotFound(err) {
+		t.Fatalf("holders after TTL: err = %v, want not-found", err)
+	}
+	if _, err := h.Extend(ctx, HolderLeaseExtendInput{
+		ResourceID: "never-installed", HolderID: "alice", TTLSeconds: 600,
+	}); !IsHolderLeaseNotFound(err) {
+		t.Fatalf("extend of unknown resource: err = %v, want not-found", err)
+	}
+
+	// Reclaim installs a new lease; its holder can extend it immediately.
+	if _, err := h.Install(ctx, HolderLeaseInput{
+		ResourceID: "agent-expired", Holders: []string{"bob"}, TTLSeconds: 60,
+	}); err != nil {
+		t.Fatalf("reclaim install: %v", err)
+	}
+	out := extendHolderLease(t, h, "agent-expired", "bob", 10*time.Minute)
+	if !out.Extended || !sameHolders(out.Holders, []string{"bob"}) {
+		t.Fatalf("extend after reclaim = %+v, want bob with a moved deadline", out)
+	}
+}
+
+// TestHolderLeaseInvalidInput rejects incomplete calls at the boundary before
+// the store is touched.
+func TestHolderLeaseInvalidInput(t *testing.T) {
+	h := NewHolderLeaseHandler(nil)
+	ctx := context.Background()
+
+	assertInvalid := func(t *testing.T, err error) {
+		t.Helper()
+		var app *domain.AppError
+		if !errors.As(err, &app) || app.Code != domain.CodeInvalidInput {
+			t.Fatalf("err = %v, want INVALID_INPUT", err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   HolderLeaseInput
+	}{
+		{"no resource", HolderLeaseInput{Holders: []string{"alice"}, TTLSeconds: 60}},
+		{"no holders", HolderLeaseInput{ResourceID: "wt", TTLSeconds: 60}},
+		{"empty holder", HolderLeaseInput{ResourceID: "wt", Holders: []string{""}, TTLSeconds: 60}},
+		{"zero ttl", HolderLeaseInput{ResourceID: "wt", Holders: []string{"alice"}}},
+		{"negative ttl", HolderLeaseInput{ResourceID: "wt", Holders: []string{"alice"}, TTLSeconds: -1}},
+	} {
+		t.Run("install/"+tc.name, func(t *testing.T) {
+			_, err := h.Install(ctx, tc.in)
+			assertInvalid(t, err)
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		in   HolderLeaseExtendInput
+	}{
+		{"no resource", HolderLeaseExtendInput{HolderID: "alice", TTLSeconds: 60}},
+		{"no holder", HolderLeaseExtendInput{ResourceID: "wt", TTLSeconds: 60}},
+		{"zero ttl", HolderLeaseExtendInput{ResourceID: "wt", HolderID: "alice"}},
+		{"negative ttl", HolderLeaseExtendInput{ResourceID: "wt", HolderID: "alice", TTLSeconds: -1}},
+	} {
+		t.Run("extend/"+tc.name, func(t *testing.T) {
+			_, err := h.Extend(ctx, tc.in)
+			assertInvalid(t, err)
+		})
+	}
+	if _, err := h.Holders(ctx, HolderLeaseHoldersInput{}); err == nil {
+		t.Fatal("holders query without resource must fail")
+	} else {
+		assertInvalid(t, err)
+	}
+}
+
+// TestAttachExtendHolderLeaseRegistersToolOnce checks that the holder-side
+// tool is attached without changing the default NewServer set.
+func TestAttachExtendHolderLeaseRegistersToolOnce(t *testing.T) {
+	server := NewServer()
+	AttachHolderLease(server, NewHolderLeaseHandler(nil))
+	AttachHolderLease(server, NewHolderLeaseHandler(nil))
+
+	session := connectClaimServer(t, server)
+	count := 0
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == ExtendHolderLeaseToolName {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("%s registered %d times, want 1", ExtendHolderLeaseToolName, count)
+	}
+}
+
+// TestHolderLeaseSeparateFromWorktreeLease proves the holder lease does not
+// replace the T3.97 worktree lease: the two use independent state on the same
+// resource id, and extending one leaves the other's expiry and write authority
+// alone.
+func TestHolderLeaseSeparateFromWorktreeLease(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 21, 5, 0, 0, 0, time.UTC)}
+	wt := NewWorktreeLeaseHandler(clock)
+	holders := NewHolderLeaseHandler(clock)
+	ctx := context.Background()
+
+	wtLease, err := wt.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-shared", OwnerID: "alice", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("worktree lease: %v", err)
+	}
+	if _, err := holders.Install(ctx, HolderLeaseInput{
+		ResourceID: "wt-shared", Holders: []string{"bob"}, TTLSeconds: 60,
+	}); err != nil {
+		t.Fatalf("holder lease: %v", err)
+	}
+
+	clock.Advance(30 * time.Second)
+	out := extendHolderLease(t, holders, "wt-shared", "bob", 2*time.Minute)
+	if !out.Extended {
+		t.Fatal("holder lease extend must move its own deadline")
+	}
+	if _, err := wt.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-shared", OwnerID: "alice", FencingToken: wtLease.FencingToken,
+	}); err != nil {
+		t.Fatalf("worktree write after holder extend: %v", err)
+	}
+}
