@@ -64,3 +64,4 @@
 | 0050 | Шесть фич из отчёта AH-wave | accepted |
 | 0051 | Шесть фич из отчёта AI-wave | accepted |
 | 0052 | Шесть фич из отчёта AJ-wave | accepted |
+| 0053 | Шесть фич из отчёта AK-wave | accepted |
