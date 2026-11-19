@@ -22,6 +22,8 @@ package e2e_test
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -245,8 +247,8 @@ type apiResp struct {
 }
 
 type pluginInfo struct {
-	ID       string `json:"id"`
-	Source   struct {
+	ID     string `json:"id"`
+	Source struct {
 		Type string `json:"type"`
 		Path string `json:"path"`
 	} `json:"source"`
@@ -621,9 +623,142 @@ func tail(t *testing.T, path string) string {
 	return strings.Join(lines, "\n")
 }
 
+// --- frozen crash-test scenario set (ADR 0042 item 5, T3.89) -----------------
+//
+// The set of crash-test scenarios is hashed before any scenario code is run.
+// The hash below was recorded when this file was first written. At every run
+// the engine recomputes it from the registered scenarios and refuses to start
+// if the set changed. A scenario cannot be silently dropped, renamed or added
+// to make the suite greener: changing the set requires a reviewed update of
+// frozenScenarioHash. This is a rule about the stability of the scenario set,
+// not the "tests exist in every card" rule from ADR 0010.
+
+// frozenScenarioHash is sha256 of the sorted scenario names joined by "\n",
+// with no trailing newline. Recorded before the first run of this suite.
+const frozenScenarioHash = "ec28944e71a04357e310438abcb4544034734a9ef3c424644da811d2b31563d8"
+
+type e2eScenario struct {
+	name string
+	run  func(t *testing.T, binary string)
+}
+
+// e2eScenarios is the single source of truth for both the scenarios that run
+// and the frozen hash. Adding, removing or renaming an entry changes the hash.
+var e2eScenarios = []e2eScenario{
+	{"repo_plugin_skeleton", runRepoPluginSkeleton},
+	{"mcp_go_sdk_CommandTransport", testMCPWithGoSDK},
+	{"mcp_inspector_optional", testInspectorOptional},
+	{"opencode_wake_with_reference_plugin", runWakePositive},
+	{"negative_control_stub_handler_must_fail", runNegativeControl},
+}
+
+func scenarioSetHash(names []string) string {
+	names = slices.Clone(names)
+	slices.Sort(names)
+	h := sha256.Sum256([]byte(strings.Join(names, "\n")))
+	return hex.EncodeToString(h[:])
+}
+
+func registeredScenarioNames() []string {
+	names := make([]string, 0, len(e2eScenarios))
+	for _, s := range e2eScenarios {
+		names = append(names, s.name)
+	}
+	return names
+}
+
+// verifyFrozenScenarios is the engine gate. It returns an error when the live
+// scenario set no longer matches the hash fixed before the code was written.
+func verifyFrozenScenarios() error {
+	names := registeredScenarioNames()
+	if len(names) != len(slices.Compact(sorted(names))) {
+		return fmt.Errorf("дубликаты в наборе сценариев: %v", names)
+	}
+	got := scenarioSetHash(names)
+	if got != frozenScenarioHash {
+		return fmt.Errorf("набор crash-сценариев изменён без пересмотра решения: "+
+			"замороженный хеш=%s текущий хеш=%s сценарии=%v; "+
+			"пересмотри решение и явно обнови frozenScenarioHash в tests/e2e/e2e_test.go",
+			frozenScenarioHash, got, names)
+	}
+	return nil
+}
+
+func sorted(names []string) []string {
+	out := slices.Clone(names)
+	slices.Sort(out)
+	return out
+}
+
+// TestFrozenCrashTestScenarios runs in the e2e CI job without needing opencode
+// or a provider token. It is the check that the frozen set is intact.
+func TestFrozenCrashTestScenarios(t *testing.T) {
+	names := registeredScenarioNames()
+	t.Logf("замороженных сценариев: %d; хеш: %s; сценарии: %v",
+		len(names), scenarioSetHash(names), sorted(names))
+	if err := verifyFrozenScenarios(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// --- scenario bodies ---------------------------------------------------------
+
+func runRepoPluginSkeleton(t *testing.T, _ string) {
+	t.Helper()
+	source, err := os.ReadFile(filepath.Join(repoRoot, ".opencode", "plugins", "beacon-bridge.js"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasPrompt := strings.Contains(string(source), "session.prompt")
+	readsEvents := strings.Contains(string(source), "events.jsonl")
+	t.Logf("repo plugin: session.prompt=%v events.jsonl=%v", hasPrompt, readsEvents)
+	if hasPrompt && readsEvents {
+		t.Log("repo plugin уже содержит wake-логику; прогон всё равно использует эталон из fixtures")
+	} else {
+		t.Log("БЛОКЕР: repo plugin в main — наблюдатель без wake-логики; шаг (e) на нём не пройдёт")
+	}
+	// No assertion on skeleton state: this stays true after T3.6 lands.
+}
+
+func runWakePositive(t *testing.T, _ string) {
+	t.Helper()
+	facts, info := runWakeScenario(t, newBase(t, "positive"),
+		filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge.js"), "pos")
+	t.Logf("%s facts=%+v", info, facts)
+	if err := verifyWake(facts); err != nil {
+		t.Fatal(err)
+	}
+	if facts.SSEStarted {
+		t.Log("GET /api/event через opencode api: session.execution.started подтверждён")
+	} else {
+		t.Log("ОГРАНИЧЕНИЕ ИНСТРУМЕНТА: opencode api CLI не отдаёт тело SSE /api/event " +
+			"(0 строк); факт пробуждения подтверждён подпиской плагина внутри opencode и квитанцией")
+	}
+}
+
+func runNegativeControl(t *testing.T, _ string) {
+	t.Helper()
+	facts, info := runWakeScenario(t, newBase(t, "negative"),
+		filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge-stub.js"), "neg")
+	t.Logf("%s facts=%+v", info, facts)
+	if err := verifyWake(facts); err == nil {
+		t.Fatal("заглушка прошла проверку: негативный контроль сломан, тест не является e2e")
+	} else {
+		t.Logf("заглушка ожидаемо провалила проверку: %v", err)
+	}
+	if facts.Receipt || facts.Posted || facts.PromptOK {
+		t.Fatal("заглушка записала квитанцию или вызвала prompt")
+	}
+}
+
 // --- the suite ---------------------------------------------------------------
 
 func TestE2E(t *testing.T) {
+	// Engine gate: refuse to work at all if the scenario set changed.
+	if err := verifyFrozenScenarios(); err != nil {
+		t.Fatalf("замороженный crash-test отказался стартовать: %v", err)
+	}
+
 	version := strings.TrimSpace(string(mustRun(t, openBin, "--version")))
 	t.Logf("opencode: %s", version)
 	if os.Getenv("OPENCODE_SKIP_VERSION") == "" {
@@ -638,58 +773,10 @@ func TestE2E(t *testing.T) {
 	binary := filepath.Join(newBase(t, "shared"), "beacon")
 	buildBeacon(t, src, binary)
 
-	t.Run("repo_plugin_skeleton", func(t *testing.T) {
-		source, err := os.ReadFile(filepath.Join(repoRoot, ".opencode", "plugins", "beacon-bridge.js"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		hasPrompt := strings.Contains(string(source), "session.prompt")
-		readsEvents := strings.Contains(string(source), "events.jsonl")
-		t.Logf("repo plugin: session.prompt=%v events.jsonl=%v", hasPrompt, readsEvents)
-		if hasPrompt && readsEvents {
-			t.Log("repo plugin уже содержит wake-логику; прогон всё равно использует эталон из fixtures")
-		} else {
-			t.Log("БЛОКЕР: repo plugin в main — наблюдатель без wake-логики; шаг (e) на нём не пройдёт")
-		}
-		// No assertion on skeleton state: this stays true after T3.6 lands.
-	})
-
-	t.Run("mcp_go_sdk_CommandTransport", func(t *testing.T) {
-		testMCPWithGoSDK(t, binary)
-	})
-
-	t.Run("mcp_inspector_optional", func(t *testing.T) {
-		testInspectorOptional(t, binary)
-	})
-
-	t.Run("opencode_wake_with_reference_plugin", func(t *testing.T) {
-		facts, info := runWakeScenario(t, newBase(t, "positive"),
-			filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge.js"), "pos")
-		t.Logf("%s facts=%+v", info, facts)
-		if err := verifyWake(facts); err != nil {
-			t.Fatal(err)
-		}
-		if facts.SSEStarted {
-			t.Log("GET /api/event через opencode api: session.execution.started подтверждён")
-		} else {
-			t.Log("ОГРАНИЧЕНИЕ ИНСТРУМЕНТА: opencode api CLI не отдаёт тело SSE /api/event " +
-				"(0 строк); факт пробуждения подтверждён подпиской плагина внутри opencode и квитанцией")
-		}
-	})
-
-	t.Run("negative_control_stub_handler_must_fail", func(t *testing.T) {
-		facts, info := runWakeScenario(t, newBase(t, "negative"),
-			filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge-stub.js"), "neg")
-		t.Logf("%s facts=%+v", info, facts)
-		if err := verifyWake(facts); err == nil {
-			t.Fatal("заглушка прошла проверку: негативный контроль сломан, тест не является e2e")
-		} else {
-			t.Logf("заглушка ожидаемо провалила проверку: %v", err)
-		}
-		if facts.Receipt || facts.Posted || facts.PromptOK {
-			t.Fatal("заглушка записала квитанцию или вызвала prompt")
-		}
-	})
+	for _, s := range e2eScenarios {
+		s := s
+		t.Run(s.name, func(t *testing.T) { s.run(t, binary) })
+	}
 }
 
 func mustRun(t *testing.T, name string, args ...string) []byte {
