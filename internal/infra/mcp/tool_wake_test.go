@@ -6,8 +6,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // fakeWakeSender is an in-memory WakeSender. It records the call and returns a
@@ -1401,4 +1404,274 @@ func channelsOf(attempts []fallbackAttempt) []WakeChannel {
 		channels = append(channels, attempt.channel)
 	}
 	return channels
+}
+
+// recordingSleeper captures each wake point instead of sleeping, so a test can
+// observe staggered wake times without making CI wait.
+type recordingSleeper struct {
+	points []time.Duration
+	err    error
+}
+
+func (r *recordingSleeper) Sleep(_ context.Context, d time.Duration) error {
+	r.points = append(r.points, d)
+	return r.err
+}
+
+// TestWakeWithoutWindowDoesNotWait keeps every caller written before ADR 0041
+// on the immediate path. No window means the sleeper is never touched.
+func TestWakeWithoutWindowDoesNotWait(t *testing.T) {
+	for _, millis := range []int64{0, -1} {
+		sleeper := &recordingSleeper{}
+		sender := &fakeWakeSender{delivery: DeliverySteer}
+		handler := NewWakeHandler(sender).WithWakeSleeper(sleeper)
+
+		out, err := handler.Wake(context.Background(), WakeInput{
+			Target: "s", Text: "p", WakeBetweenMillis: millis,
+		})
+		if err != nil || !out.OK {
+			t.Fatalf("Wake(millis=%d) error=%v out=%+v, want a delivered wake", millis, err, out)
+		}
+		if len(sleeper.points) != 0 {
+			t.Errorf("Wake(millis=%d) sleeper points=%v, want no wait", millis, sleeper.points)
+		}
+	}
+}
+
+// TestWakeBetweenStaggersFifteenWaiters is the ADR 0041 p5 acceptance core:
+// fifteen agents waiting on one event must wake at spread points in the
+// window, not all at the same instant. The recording sleeper holds the point
+// in time each waiter chose.
+func TestWakeBetweenStaggersFifteenWaiters(t *testing.T) {
+	const waiters = 15
+	const windowMillis = int64(1500)
+	window := time.Duration(windowMillis) * time.Millisecond
+	sleeper := &recordingSleeper{}
+	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).WithWakeSleeper(sleeper)
+
+	for i := 0; i < waiters; i++ {
+		out, err := handler.Wake(context.Background(), WakeInput{
+			Target: "session-1", Text: "obligation-1@7", WakeBetweenMillis: windowMillis,
+		})
+		if err != nil || !out.OK {
+			t.Fatalf("waiter %d: error=%v out=%+v, want a delivered wake", i, err, out)
+		}
+	}
+
+	if len(sleeper.points) != waiters {
+		t.Fatalf("sleeper points=%d, want %d", len(sleeper.points), waiters)
+	}
+	seen := make(map[time.Duration]bool, waiters)
+	var min, max time.Duration
+	for i, point := range sleeper.points {
+		if point < 0 || point >= window {
+			t.Errorf("waiter %d point=%v, want inside [0,%v)", i, point, window)
+		}
+		if seen[point] {
+			t.Errorf("waiter %d point=%v repeats an earlier waiter: waiters woke at the same instant", i, point)
+		}
+		seen[point] = true
+		if i == 0 || point < min {
+			min = point
+		}
+		if i == 0 || point > max {
+			max = point
+		}
+	}
+	if max-min < window/4 {
+		t.Errorf("wake points span only %v inside a %v window, want a visible spread", max-min, window)
+	}
+}
+
+// TestRandomWakePointSpreadsAcrossWindow checks the real uniform picker with a
+// large sample. Loose bounds keep the test stable in CI while still failing a
+// picker that returns a constant or clusters in one part of the window.
+func TestRandomWakePointSpreadsAcrossWindow(t *testing.T) {
+	const samples = 400
+	window := 2 * time.Second
+	buckets := make([]int, 10)
+	seen := make(map[time.Duration]bool, samples)
+	for i := 0; i < samples; i++ {
+		point := randomWakePoint(window)
+		if point < 0 || point >= window {
+			t.Fatalf("point %v outside [0,%v)", point, window)
+		}
+		seen[point] = true
+		bucket := int(int64(point) * int64(len(buckets)) / int64(window))
+		buckets[bucket]++
+	}
+	unique := 0
+	for _, count := range buckets {
+		if count > 0 {
+			unique++
+		}
+	}
+	if unique != len(buckets) {
+		t.Errorf("picker covered %d of %d window slices, want all; buckets=%v", unique, len(buckets), buckets)
+	}
+	if len(seen) < samples/2 {
+		t.Errorf("picker returned only %d distinct points of %d samples", len(seen), samples)
+	}
+	if buckets[0] == 0 || buckets[len(buckets)-1] == 0 {
+		t.Errorf("picker never reached the window edges; buckets=%v", buckets)
+	}
+}
+
+// TestWakeBetweenUsesWindowFromContract proves the delay comes from the call's
+// window, with the chosen point handed to the sleeper before any delivery.
+func TestWakeBetweenUsesWindowFromContract(t *testing.T) {
+	window := 900 * time.Millisecond
+	sleeper := &recordingSleeper{}
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	handler := NewWakeHandler(sender).
+		WithWakeSleeper(sleeper).
+		WithWakePoint(func(got time.Duration) time.Duration {
+			if got != window {
+				t.Errorf("point picker window=%v, want %v from the wait contract", got, window)
+			}
+			return window / 3
+		})
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", WakeBetweenMillis: 900,
+	})
+	if err != nil || !out.OK {
+		t.Fatalf("Wake() error=%v out=%+v, want a delivered wake", err, out)
+	}
+	if len(sleeper.points) != 1 || sleeper.points[0] != window/3 {
+		t.Errorf("sleeper points=%v, want one point of %v", sleeper.points, window/3)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls=%d, want 1", sender.calls)
+	}
+}
+
+// TestWakeBetweenHumanFlagsWin keeps T2.24: a waiter that needs a human is
+// interrupted before it waits for a random point in the window.
+func TestWakeBetweenHumanFlagsWin(t *testing.T) {
+	sleeper := &recordingSleeper{}
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).WithWakeSleeper(sleeper).Wake(
+		context.Background(), WakeInput{
+			Target: "s", Text: "p", WakeBetweenMillis: 1500, HasPendingQuestion: true,
+		})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.Interrupted || out.OK {
+		t.Errorf("interrupted=%v ok=%v, want true/false", out.Interrupted, out.OK)
+	}
+	if len(sleeper.points) != 0 || sender.calls != 0 {
+		t.Errorf("sleeper points=%v sender calls=%d, want 0/0 on interruption", sleeper.points, sender.calls)
+	}
+}
+
+// TestWakeBetweenCancelledWaitDeliversNothing proves a cancelled wait is an
+// error, never a delivery after the caller has gone away.
+func TestWakeBetweenCancelledWaitDeliversNothing(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithWakeSleeper(&recordingSleeper{err: context.Canceled})
+
+	_, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", WakeBetweenMillis: 1500,
+	})
+	if err == nil {
+		t.Fatal("Wake() error = nil, want a cancellation error")
+	}
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) || appErr.Code != domain.CodeCancelled {
+		t.Errorf("error = %v, want an AppError with code %q", err, domain.CodeCancelled)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls=%d, want 0 on a cancelled wait", sender.calls)
+	}
+}
+
+// TestWakeBetweenFallbackStaggersOnce keeps T3.58: the fallback chain still
+// runs, and every channel of one waiter shares a single wake point.
+func TestWakeBetweenFallbackStaggersOnce(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	sleeper := &recordingSleeper{}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelQueue: true}}
+	handler := NewFallbackWakeHandler(sender, confirmer, &fakeTracer{}).WithWakeSleeper(sleeper)
+
+	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
+		Target: "s", Text: "p", WakeBetweenMillis: 900,
+	})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliveryQueue || !out.OK {
+		t.Errorf("delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
+	}
+	if len(sleeper.points) != 1 {
+		t.Errorf("sleeper points=%d, want one stagger for the whole chain", len(sleeper.points))
+	}
+	if got := channelsOf(sender.attempts); len(got) != 2 || got[0] != ChannelSteer || got[1] != ChannelQueue {
+		t.Errorf("attempt channels=%v, want [steer queue]", got)
+	}
+}
+
+// TestWakeSchemaHasWakeBetweenMillis proves an MCP client can send the wait
+// window that drives the stagger.
+func TestWakeSchemaHasWakeBetweenMillis(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "wakeBetweenMillis") {
+		t.Errorf("wake input schema missing wakeBetweenMillis: %s", inputSchema)
+	}
+}
+
+// TestWakeBetweenOverInMemoryTransport drives the window through a real MCP
+// client and server. It proves the field is decoded from the schema and the
+// waiter is staggered before delivery.
+func TestWakeBetweenOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	sleeper := &recordingSleeper{}
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithWakeSleeper(sleeper))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target: "session-1", Text: "obligation-1@7", WakeBetweenMillis: 900,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Delivery != DeliveryQueue || !out.OK {
+		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
+	}
+	if len(sleeper.points) != 1 || sleeper.points[0] < 0 || sleeper.points[0] >= 900*time.Millisecond {
+		t.Errorf("sleeper points=%v, want one point inside the 900ms window", sleeper.points)
+	}
 }
