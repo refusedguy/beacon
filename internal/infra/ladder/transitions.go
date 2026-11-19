@@ -52,11 +52,64 @@ const (
 	// StatusEscalated means the evidence window elapsed without claimed or
 	// read; the episode is handed to escalation (T3.10).
 	StatusEscalated Status = "escalated"
+	// StatusPaused means the episode is parked at a human gate. Timers are
+	// suspended until a human ack decides the next step.
+	StatusPaused Status = "paused"
+	// StatusApproved is terminal approval at the gate. It is distinct from
+	// stopped (read or claimed) and escalated so a human sign-off is never
+	// confused with a delivery outcome or a timeout (ADR 0025).
+	StatusApproved Status = "approved"
 )
 
-// ErrNotStaged reports a position request for an obligation that never went
-// through Stage.
-var ErrNotStaged = errors.New("ladder: obligation not staged")
+var (
+	// ErrNotStaged reports a position request for an obligation that never
+	// went through Stage.
+	ErrNotStaged = errors.New("ladder: obligation not staged")
+	// ErrGateNotPaused reports an ack applied to an obligation that is not
+	// currently parked at a gate.
+	ErrGateNotPaused = errors.New("ladder: obligation not paused at a gate")
+	// ErrInvalidAckOutcome reports an ack outcome outside the three defined by
+	// ADR 0031 section 6.
+	ErrInvalidAckOutcome = errors.New("ladder: invalid ack outcome")
+	// ErrInvalidGateStep reports a rework target outside the ladder's steps.
+	ErrInvalidGateStep = errors.New("ladder: invalid gate rework step")
+)
+
+// AckOutcome is the human decision at a gate. The three values are deliberately
+// distinct: approval ends the episode, context resumes it from the pause point,
+// and rework rewinds the ladder to a chosen step (ADR 0031 section 6).
+type AckOutcome string
+
+const (
+	// AckApprove is a human sign-off. It is terminal and triggers no rework.
+	AckApprove AckOutcome = "approve"
+	// AckContext records added context and resumes from where the gate paused.
+	AckContext AckOutcome = "context"
+	// AckRework sends the work back to TargetStep, an attempt in
+	// [1, MaxAttempts]. It is the "ack with rework" of ADR 0031.
+	AckRework AckOutcome = "rework"
+)
+
+// GateDecision is one human ack applied at a paused gate. TargetStep is used
+// only by AckRework; Context is recorded for every outcome and is required in
+// practice for AckContext. At is supplied by the caller so the package stays
+// deterministic.
+type GateDecision struct {
+	Outcome    AckOutcome
+	TargetStep int
+	Context    string
+	Reviewer   string
+	At         time.Time
+}
+
+// gateHold is the ladder position captured when a gate pauses an episode. An
+// "add context" ack restores it so the ladder continues from the exact point
+// the human interrupted instead of restarting.
+type gateHold struct {
+	Branch   domain.AttemptOutcome `json:"branch"`
+	Attempts int                   `json:"attempts"`
+	NextAt   time.Time             `json:"nextAt"`
+}
 
 // Marker is one persisted ladder position. Each transition appends a new
 // Marker; the last marker for an obligation is its current position.
@@ -70,6 +123,15 @@ type Marker struct {
 	NextAt       time.Time             `json:"nextAt"`
 	EvidenceAt   time.Time             `json:"evidenceAt"`
 	Verdict      domain.Verdict        `json:"verdict"`
+
+	// Gate state. It is appended to the marker so the persisted state, not
+	// process memory, is what distinguishes approval from rework. Old markers
+	// decode with zero values, so this is backward compatible.
+	AckOutcome  AckOutcome `json:"ackOutcome,omitempty"`
+	AckStep     int        `json:"ackStep,omitempty"`
+	AckContext  string     `json:"ackContext,omitempty"`
+	AckReviewer string     `json:"ackReviewer,omitempty"`
+	Held        *gateHold  `json:"held,omitempty"`
 }
 
 // Receipt is the fact produced by the adapter boundary (T3.6). The wire shape
@@ -333,7 +395,11 @@ func (l *Ladder) Record(ctx context.Context, r Receipt) error {
 		if err != nil {
 			return err
 		}
-		if m.Status == StatusStopped {
+		// A paused gate is authoritative: no delivery evidence is recorded
+		// while a human decides. Approval is terminal. Both extend the
+		// existing "read stops everything" rule without changing the
+		// ADR 0017 branches for active episodes.
+		if m.Status == StatusStopped || m.Status == StatusPaused || m.Status == StatusApproved {
 			return nil
 		}
 
@@ -540,6 +606,116 @@ func (l *Ladder) stop(ctx context.Context, id, kind string, at time.Time) error 
 		}
 		return appendMarker(tx, m, kind, at)
 	})
+}
+
+// Pause parks an active obligation at a human gate. Its timers are suspended:
+// Due stops returning it and Advance is a no-op until a human ack decides. The
+// position at pause is held so an "add context" ack can resume from it. Only an
+// active episode can be paused; any other status is a no-op, which keeps an
+// at-least-once caller from disturbing a stopped or escalated episode.
+func (l *Ladder) Pause(ctx context.Context, id string, at time.Time) error {
+	return l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureJournal(tx); err != nil {
+			return err
+		}
+		m, err := currentMarker(tx, id)
+		if err != nil {
+			return err
+		}
+		if m.Status != StatusActive {
+			return nil
+		}
+		m.Held = &gateHold{Branch: m.Branch, Attempts: m.Attempts, NextAt: m.NextAt}
+		m.Status = StatusPaused
+		m.NextAt = time.Time{}
+		// EvidenceAt is absolute from staged and is kept, so a resumed or
+		// reworked ladder still honours the 15-minute proof window (ADR 0017).
+		return appendMarker(tx, m, "gate-pause", at)
+	})
+}
+
+// Ack applies a human decision at a paused gate. The three outcomes differ in
+// the persisted marker and in the journal kind, so the ladder state records
+// which one happened:
+//
+//   - AckApprove is terminal (StatusApproved), cancels every timer and writes
+//     no rework.
+//   - AckContext keeps the context, clears the pause and resumes the ladder
+//     from the exact position captured at Pause.
+//   - AckRework rewinds the ladder to TargetStep, an attempt in
+//     [1, MaxAttempts]. It re-arms the retry branch so the pointer for that
+//     step is delivered again, then normal ADR 0017 timing continues.
+//
+// Ack requires a paused marker; otherwise it returns ErrGateNotPaused.
+func (l *Ladder) Ack(ctx context.Context, id string, d GateDecision) error {
+	switch d.Outcome {
+	case AckApprove, AckContext, AckRework:
+	default:
+		return ErrInvalidAckOutcome
+	}
+	if d.Outcome == AckRework && (d.TargetStep < 1 || d.TargetStep > MaxAttempts) {
+		return ErrInvalidGateStep
+	}
+	return l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureJournal(tx); err != nil {
+			return err
+		}
+		m, err := currentMarker(tx, id)
+		if err != nil {
+			return err
+		}
+		if m.Status != StatusPaused {
+			return ErrGateNotPaused
+		}
+
+		m.AckOutcome = d.Outcome
+		m.AckStep = d.TargetStep
+		m.AckContext = d.Context
+		m.AckReviewer = d.Reviewer
+
+		switch d.Outcome {
+		case AckApprove:
+			m.Status = StatusApproved
+			m.NextAt = time.Time{}
+			m.EvidenceAt = time.Time{}
+			m.Held = nil
+			return appendMarker(tx, m, "gate-approve", d.At)
+		case AckContext:
+			if m.Held != nil {
+				m.Status = StatusActive
+				m.Branch = m.Held.Branch
+				m.Attempts = m.Held.Attempts
+				m.NextAt = m.Held.NextAt
+				m.Held = nil
+			}
+			return appendMarker(tx, m, "gate-context", d.At)
+		case AckRework:
+			m.Status = StatusActive
+			// Re-delivery is a retry of the same pointer, so it re-enters the
+			// ADR 0017 retry branch. Attempts is one behind the target because
+			// Due and Advance report the next attempt as Attempts+1.
+			m.Branch = domain.OutcomeTransportFailed
+			m.Attempts = d.TargetStep - 1
+			m.NextAt = l.reworkTime(m, d.TargetStep, d.At)
+			m.Held = nil
+			return appendMarker(tx, m, "gate-rework", d.At)
+		}
+		return nil
+	})
+}
+
+// reworkTime is when the retry for step becomes due. Step 1 is the initial
+// pointer and is re-sent immediately; later steps use the ADR 0017 retry delay
+// for that attempt, measured from the original stage (as Record and Advance do).
+func (l *Ladder) reworkTime(m Marker, step int, at time.Time) time.Time {
+	if step <= 1 {
+		return at
+	}
+	idx := step - 2
+	if idx >= len(retryDelays) {
+		return m.EvidenceAt
+	}
+	return m.StagedAt.Add(retryDelays[idx] + l.jitter(step))
 }
 
 // Position returns the current marker for id, read from the journal.

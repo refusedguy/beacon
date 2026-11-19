@@ -2,6 +2,7 @@ package ladder
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -395,6 +396,285 @@ func TestTimeExpiryAloneDoesNotCloseWatch(t *testing.T) {
 	}
 	if m.Status != StatusEscalated {
 		t.Fatalf("status = %q, want escalated (handed to T3.10)", m.Status)
+	}
+}
+
+func TestGatePauseSuspendsLadder(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-pause", "watch-gate-pause")
+	stage(t, l, o)
+	// A transport failure arms a future retry, so there is real work to suspend.
+	if err := l.Record(ctx, Receipt{
+		ObligationID: o.ID, Attempt: 1,
+		Outcome: domain.OutcomeTransportFailed, At: base.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	before, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position before pause: %v", err)
+	}
+	armedAt := before.NextAt
+
+	if err := l.Pause(ctx, o.ID, base.Add(2*time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position after pause: %v", err)
+	}
+	if m.Status != StatusPaused {
+		t.Fatalf("status = %q, want paused", m.Status)
+	}
+	if !m.NextAt.IsZero() {
+		t.Fatalf("nextAt = %v, want cleared while paused", m.NextAt)
+	}
+	if m.Held == nil || !m.Held.NextAt.Equal(armedAt) ||
+		m.Held.Branch != domain.OutcomeTransportFailed || m.Held.Attempts != 1 {
+		t.Fatalf("held = %+v, want the armed retry position %v", m.Held, armedAt)
+	}
+
+	// No timer is due while a human reviews, and Advance does nothing.
+	due, err := l.Due(ctx, base.Add(60*time.Minute))
+	if err != nil {
+		t.Fatalf("Due while paused: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due while paused = %+v, want none", due)
+	}
+	a, err := l.Advance(ctx, o.ID, base.Add(60*time.Minute))
+	if err != nil {
+		t.Fatalf("Advance while paused: %v", err)
+	}
+	if a.Kind != "" {
+		t.Fatalf("action while paused = %+v, want no-op", a)
+	}
+}
+
+func TestGateApproveIsTerminal(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-approve", "watch-gate-approve")
+	stage(t, l, o)
+	if err := l.Pause(ctx, o.ID, base.Add(time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := l.Ack(ctx, o.ID, GateDecision{
+		Outcome: AckApprove, Reviewer: "human-1", At: base.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatalf("Ack(approve): %v", err)
+	}
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if m.Status != StatusApproved || m.AckOutcome != AckApprove {
+		t.Fatalf("marker = %+v, want approved", m)
+	}
+	if !m.NextAt.IsZero() || !m.EvidenceAt.IsZero() || m.Held != nil {
+		t.Fatalf("marker = %+v, want no timers and no held position", m)
+	}
+	if m.AckReviewer != "human-1" {
+		t.Fatalf("reviewer = %q, want human-1", m.AckReviewer)
+	}
+	due, err := l.Due(ctx, base.Add(60*time.Minute))
+	if err != nil {
+		t.Fatalf("Due: %v", err)
+	}
+	if len(due) != 0 {
+		t.Fatalf("due after approve = %+v, want none", due)
+	}
+}
+
+func TestGateContextResumesFromPausePoint(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-context", "watch-gate-context")
+	stage(t, l, o)
+	if err := l.Record(ctx, Receipt{
+		ObligationID: o.ID, Attempt: 1,
+		Outcome: domain.OutcomeTransportFailed, At: base.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	armed, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position before pause: %v", err)
+	}
+	if err := l.Pause(ctx, o.ID, base.Add(2*time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := l.Ack(ctx, o.ID, GateDecision{
+		Outcome: AckContext, Context: "proceed with the extra note",
+		Reviewer: "human-2", At: base.Add(3 * time.Second),
+	}); err != nil {
+		t.Fatalf("Ack(context): %v", err)
+	}
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if m.Status != StatusActive || m.AckOutcome != AckContext {
+		t.Fatalf("marker = %+v, want active with context ack", m)
+	}
+	if m.AckContext != "proceed with the extra note" || m.Held != nil {
+		t.Fatalf("marker = %+v, want recorded context and cleared hold", m)
+	}
+	if !m.NextAt.Equal(armed.NextAt) || m.Attempts != armed.Attempts || m.Branch != armed.Branch {
+		t.Fatalf("marker = %+v, want resumed at %v", m, armed.NextAt)
+	}
+
+	// The ladder continues at the exact point the gate interrupted: the armed
+	// retry is due again, with the same attempt number.
+	due, err := l.Due(ctx, base.Add(6*time.Minute))
+	if err != nil {
+		t.Fatalf("Due: %v", err)
+	}
+	if len(due) != 1 || due[0].Kind != ActionRetry || due[0].Attempt != 2 {
+		t.Fatalf("due = %+v, want one retry attempt 2", due)
+	}
+}
+
+func TestGateReworkReturnsToStep(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-rework", "watch-gate-rework")
+	stage(t, l, o)
+	if err := l.Pause(ctx, o.ID, base.Add(time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := l.Ack(ctx, o.ID, GateDecision{
+		Outcome: AckRework, TargetStep: 3, Context: "redo from attempt three",
+		Reviewer: "human-3", At: base.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatalf("Ack(rework): %v", err)
+	}
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if m.Status != StatusActive || m.AckOutcome != AckRework || m.AckStep != 3 {
+		t.Fatalf("marker = %+v, want active rework to step 3", m)
+	}
+	if m.Attempts != 2 || m.Branch != domain.OutcomeTransportFailed || m.Held != nil {
+		t.Fatalf("marker = %+v, want retry branch poised for attempt 3", m)
+	}
+	if !m.NextAt.Equal(base.Add(SecondRetryDelay)) {
+		t.Fatalf("nextAt = %v, want %v", m.NextAt, base.Add(SecondRetryDelay))
+	}
+
+	due, err := l.Due(ctx, base.Add(11*time.Minute))
+	if err != nil {
+		t.Fatalf("Due: %v", err)
+	}
+	if len(due) != 1 || due[0].Kind != ActionRetry || due[0].Attempt != 3 {
+		t.Fatalf("due = %+v, want one retry attempt 3", due)
+	}
+	a, err := l.Advance(ctx, o.ID, due[0].At)
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if a.Kind != ActionRetry || a.Attempt != 3 {
+		t.Fatalf("action = %+v, want retry attempt 3", a)
+	}
+}
+
+func TestGateReworkToFirstStep(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-rework-first", "watch-gate-rework-first")
+	stage(t, l, o)
+	if err := l.Pause(ctx, o.ID, base.Add(time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := l.Ack(ctx, o.ID, GateDecision{
+		Outcome: AckRework, TargetStep: 1, At: base.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatalf("Ack(rework step 1): %v", err)
+	}
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if m.Attempts != 0 || !m.NextAt.Equal(base.Add(2*time.Second)) {
+		t.Fatalf("marker = %+v, want initial pointer re-sent at ack time", m)
+	}
+	due, err := l.Due(ctx, base.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("Due: %v", err)
+	}
+	if len(due) != 1 || due[0].Attempt != 1 {
+		t.Fatalf("due = %+v, want one retry attempt 1", due)
+	}
+}
+
+func TestGateAckValidation(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-validate", "watch-gate-validate")
+	stage(t, l, o)
+	if err := l.Pause(ctx, o.ID, base.Add(time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := l.Ack(ctx, o.ID, GateDecision{Outcome: "bogus"}); !errors.Is(err, ErrInvalidAckOutcome) {
+		t.Fatalf("Ack(bogus) = %v, want ErrInvalidAckOutcome", err)
+	}
+	for _, step := range []int{0, -1, MaxAttempts + 1} {
+		if err := l.Ack(ctx, o.ID, GateDecision{Outcome: AckRework, TargetStep: step}); !errors.Is(err, ErrInvalidGateStep) {
+			t.Fatalf("Ack(rework step %d) = %v, want ErrInvalidGateStep", step, err)
+		}
+	}
+	// Invalid decisions must not move the marker out of the gate.
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if m.Status != StatusPaused {
+		t.Fatalf("status = %q, want still paused after invalid acks", m.Status)
+	}
+
+	// An ack against an obligation that never paused is rejected.
+	other := seedObligation(t, d, "obl-gate-notpaused", "watch-gate-notpaused")
+	stage(t, l, other)
+	if err := l.Ack(ctx, other.ID, GateDecision{Outcome: AckApprove}); !errors.Is(err, ErrGateNotPaused) {
+		t.Fatalf("Ack(not paused) = %v, want ErrGateNotPaused", err)
+	}
+}
+
+func TestGateReceiptIgnoredWhilePaused(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-gate-receipt", "watch-gate-receipt")
+	stage(t, l, o)
+	if err := l.Pause(ctx, o.ID, base.Add(time.Second)); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	if err := l.Record(ctx, Receipt{
+		ObligationID: o.ID, Attempt: 1,
+		Outcome: domain.OutcomePosted, At: base.Add(2 * time.Second),
+	}); err != nil {
+		t.Fatalf("Record while paused: %v", err)
+	}
+	got, err := d.Obligation(o.ID)
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if len(got.Attempts) != 0 {
+		t.Fatalf("attempts while paused = %+v, want none recorded", got.Attempts)
 	}
 }
 
