@@ -3,31 +3,19 @@ package ladder
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
-	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 var base = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 
-func newTestDB(t *testing.T) *store.DB {
-	t.Helper()
-	d, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
-
-func newTestLadder(d *store.DB) *Ladder {
+func newTestLadder(d *testDB) *Ladder {
 	return New(d, WithJitter(func(int) time.Duration { return 0 }))
 }
 
-func seedObligation(t *testing.T, d *store.DB, id, watchID string) domain.Obligation {
+func seedObligation(t *testing.T, d *testDB, id, watchID string) domain.Obligation {
 	t.Helper()
 	o := domain.Obligation{
 		ID:             id,
