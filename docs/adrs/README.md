@@ -49,3 +49,4 @@
 | 0035 | Пять фич из отчёта O-claude-code-mechanics для ночной смены | accepted |
 | 0036 | Шесть фич из отчёта S-more-competitors | accepted |
 | 0037 | Шесть фич из отчёта T-next-wave | accepted |
+| 0038 | Шесть фич из отчёта U-wave | accepted |
