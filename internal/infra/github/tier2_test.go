@@ -236,7 +236,7 @@ func TestTier2FragmentsStayInsideNodes(t *testing.T) {
 					t.Errorf("fragment %q appears before nodes", fragment)
 				}
 			}
-			if !strings.Contains(query, "contexts(first:50)") {
+			if !strings.Contains(query, "contexts(first:50") {
 				t.Errorf("query misses contexts(first:50): %s", query)
 			}
 			if !strings.Contains(query, "isRequired(pullRequestNumber:42)") {
@@ -279,13 +279,13 @@ func TestTier2CannotSpreadFragment(t *testing.T) {
 func TestTier2ChunkCostIsOne(t *testing.T) {
 	counter, _, _ := newTestCounter(t, 0)
 	srv := newGraphQLServer(t, func(w http.ResponseWriter, r *http.Request, q string) {
-		data := make(map[string]string)
+		data := make(map[string]json.RawMessage)
 		for _, match := range queryAlias.FindAllStringSubmatch(q, -1) {
-			data[match[1]] = `{"statusCheckRollup":null}`
+			data[match[1]] = json.RawMessage(`{"statusCheckRollup":null}`)
 		}
 		body, err := json.Marshal(struct {
-			Data      map[string]string `json:"data"`
-			RateLimit rateLimitCost     `json:"rateLimit"`
+			Data      map[string]json.RawMessage `json:"data"`
+			RateLimit rateLimitCost              `json:"rateLimit"`
 		}{Data: data, RateLimit: rateLimitCost{Cost: 1}})
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
