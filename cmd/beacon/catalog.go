@@ -18,12 +18,15 @@ type command struct {
 // catalog is the single source of truth for the command names, summaries and
 // usage strings. Both list and what read this slice.
 var catalog = []command{
+	{Name: "agents", Summary: "Показать агентов OpenCode в режиме subagent или all", Usage: "beacon agents [--format table|json]"},
+	{Name: "attach", Summary: "Подключиться к сессии через фоновый сервис OpenCode", Usage: "beacon attach <sessionID>"},
 	{Name: "build", Summary: "Собрать воспроизводимый бинарник beacon", Usage: "beacon build"},
 	{Name: "doctor", Summary: "Проверить версию Go, beacon-gates и каталог состояния", Usage: "beacon doctor"},
 	{Name: "gates", Summary: "Передать аргументы бинарнику beacon-gates", Usage: "beacon gates [gate] [flags]"},
 	{Name: "list", Summary: "Показать каталог команд", Usage: "beacon list [--format table|json]"},
 	{Name: "mcp", Summary: "Запустить MCP-сервер на stdio", Usage: "beacon mcp"},
 	{Name: "task", Summary: "Работа с карточками задач", Usage: "beacon task <list|new|take> [flags]"},
+	{Name: "watch", Summary: "Показать вотчи Beacon с вердиктами и сессиями OpenCode", Usage: "beacon watch [--interval 2s] [--format table|json]"},
 	{Name: "what", Summary: "Показать описание одной команды", Usage: "beacon what <command>"},
 }
 

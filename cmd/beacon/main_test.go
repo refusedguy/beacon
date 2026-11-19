@@ -83,7 +83,7 @@ func TestT06ListJSONCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"build", "doctor", "gates", "list", "mcp", "task", "what"}
+	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
 	}
@@ -137,7 +137,7 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 	if errOut.Len() != 0 {
 		t.Fatalf("stderr не пустой: %q", errOut.String())
 	}
-	for _, name := range []string{"build", "doctor", "gates", "list", "mcp", "task", "what"} {
+	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what"} {
 		if !strings.Contains(out.String(), name) {
 			t.Fatalf("таблица не содержит %s: %q", name, out.String())
 		}
@@ -376,4 +376,78 @@ func TestT06TaskDelegates(t *testing.T) {
 	if out.String() != "task:[list --format json]\n" || errOut.Len() != 0 {
 		t.Fatalf("аргументы не переданы: stdout %q stderr %q", out.String(), errOut.String())
 	}
+}
+
+func TestT17DispatchCallsRunners(t *testing.T) {
+	t.Run("agents", func(t *testing.T) {
+		previous := readServiceFile
+		t.Cleanup(func() { readServiceFile = previous })
+		readServiceFile = func(string) ([]byte, error) {
+			return []byte(`{"url":"http://127.0.0.1:4096","pid":1,"version":"1"}`), nil
+		}
+		c, _, errOut, calls := t06NewCLI(t, func(t06Call) runResult {
+			return runResult{stdout: []byte(`[{"id":"reviewer","name":"Reviewer","mode":"subagent"}]`)}
+		})
+
+		if code := c.Run([]string{"agents"}); code != 0 {
+			t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("вызовов %d, ожидался 1: %+v", len(*calls), *calls)
+		}
+		call := (*calls)[0]
+		if call.name != "opencode" || !reflect.DeepEqual(call.args, []string{"api", "app.agents"}) {
+			t.Fatalf("не тот вызов: %+v", call)
+		}
+	})
+
+	t.Run("watch", func(t *testing.T) {
+		previous := watchRunner
+		t.Cleanup(func() { watchRunner = previous })
+		var gotCLI *CLI
+		var gotArgs []string
+		RegisterWatch(func(c *CLI, args []string) int {
+			gotCLI, gotArgs = c, append([]string(nil), args...)
+			return 4
+		})
+		c, _, _, _ := t06NewCLI(t, t06NoChild(t))
+
+		if code := c.Run([]string{"watch", "--format", "json"}); code != 4 {
+			t.Fatalf("код выхода %d, ожидался 4", code)
+		}
+		if gotCLI != c {
+			t.Fatal("раннер watch получил другой CLI")
+		}
+		if !reflect.DeepEqual(gotArgs, []string{"--format", "json"}) {
+			t.Fatalf("аргументы %q, ожидались [--format json]", gotArgs)
+		}
+	})
+
+	t.Run("attach", func(t *testing.T) {
+		base := t.TempDir()
+		dir := filepath.Join(base, "opencode")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		registration := `{"url":"http://127.0.0.1:4096","pid":1,"version":"1"}`
+		if err := os.WriteFile(filepath.Join(dir, "service.json"), []byte(registration), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("XDG_STATE_HOME", base)
+		c, _, errOut, calls := t06NewCLI(t, func(t06Call) runResult {
+			return runResult{stdout: []byte("tui\n")}
+		})
+
+		if code := c.Run([]string{"attach", "sess-abc"}); code != 0 {
+			t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+		}
+		if len(*calls) != 1 {
+			t.Fatalf("вызовов %d, ожидался 1: %+v", len(*calls), *calls)
+		}
+		call := (*calls)[0]
+		wantArgs := []string{"--server", "http://127.0.0.1:4096", "--session", "sess-abc"}
+		if call.name != "opencode" || !reflect.DeepEqual(call.args, wantArgs) {
+			t.Fatalf("не тот вызов: %+v", call)
+		}
+	})
 }
