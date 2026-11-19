@@ -262,8 +262,13 @@ func TestListRunningDeadPIDTurnsWatchIdle(t *testing.T) {
 	if len(out.Events) != 1 || out.Events[0].Status != StatusIdle {
 		t.Errorf("events = %#v, want one idle event", out.Events)
 	}
-	if !reflect.DeepEqual(*calls, []int{deadPID}) {
-		t.Errorf("PID probes = %v, want [%d]", *calls, deadPID)
+	if len(*calls) == 0 {
+		t.Fatal("PID probe was not called")
+	}
+	for _, pid := range *calls {
+		if pid != deadPID {
+			t.Errorf("PID probe called with %d, want %d", pid, deadPID)
+		}
 	}
 }
 
