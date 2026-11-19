@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -141,6 +142,36 @@ type Pointer struct {
 	WatchID      string `json:"watchID"`
 	ObligationID string `json:"obligationID"`
 	Revision     uint64 `json:"revision"`
+}
+
+// Handoff is the structured transfer passed from one agent to a successor. It
+// carries the five mandatory fields from ADR 0032 §1 so the successor reads a
+// fixed contract instead of the whole chat history. Every field is required:
+// Validate reports the first one that is empty.
+type Handoff struct {
+	Intent           string `json:"intent"`
+	Evidence         string `json:"evidence"`
+	PatchPlan        string `json:"patch_plan"`
+	VerificationPlan string `json:"verification_plan"`
+	RiskNotes        string `json:"risk_notes"`
+}
+
+// Validate reports whether all five handoff fields are filled. It returns an
+// INVALID_INPUT AppError naming the first empty field, or nil when the handoff
+// is complete and the successor has everything it needs.
+func (h Handoff) Validate() error {
+	for _, field := range []struct{ name, value string }{
+		{"intent", h.Intent},
+		{"evidence", h.Evidence},
+		{"patch_plan", h.PatchPlan},
+		{"verification_plan", h.VerificationPlan},
+		{"risk_notes", h.RiskNotes},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return NewAppError(CodeInvalidInput, fmt.Sprintf("handoff: пустое поле %s", field.name))
+		}
+	}
+	return nil
 }
 
 // PRState is the normalized pull request snapshot returned by a CIProvider.
