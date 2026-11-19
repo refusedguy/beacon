@@ -1492,3 +1492,132 @@ func TestParseReviewerExitCodeDeterministic(t *testing.T) {
 		t.Fatalf("input mutated to %q", answer)
 	}
 }
+
+// TestEvaluateGreenBlockedDecisionTable covers the two conditions of ADR 0059
+// §3. Only a green PR with an open blocker becomes green-blocked and frees its
+// slot. Every other combination keeps the slot. Case names name the condition.
+func TestEvaluateGreenBlockedDecisionTable(t *testing.T) {
+	red := readySnapshot()
+	red.Rollup = "FAILURE"
+	red.Ship = ShipFacts{}
+	noCI := readySnapshot()
+	noCI.Ship = ShipFacts{}
+	draft := readySnapshot()
+	draft.IsDraft = true
+	cachedWrong := readySnapshot()
+	cachedWrong.SuitesValid = false
+
+	tests := []struct {
+		name        string
+		s           Snapshot
+		blockerOpen bool
+		want        GreenBlockedVerdict
+		wantFree    bool
+	}{
+		{"green and blocked frees the slot", readySnapshot(), true, GreenBlocked, true},
+		{"green without blocker keeps the slot", readySnapshot(), false, GreenBlockedNone, false},
+		{"red with blocker is not green blocked", red, true, GreenBlockedNone, false},
+		{"red without blocker", red, false, GreenBlockedNone, false},
+		{"no CI facts with blocker keeps the slot", noCI, true, GreenBlockedNone, false},
+		{"draft with blocker is not green", draft, true, GreenBlockedNone, false},
+		{"invalid suite with blocker is not green", cachedWrong, true, GreenBlockedNone, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EvaluateGreenBlocked(tt.s, Policy{}, tt.blockerOpen)
+			if got != tt.want {
+				t.Fatalf("EvaluateGreenBlocked = %q, want %q", got, tt.want)
+			}
+			if free := got.ReleasesSlot(); free != tt.wantFree {
+				t.Fatalf("ReleasesSlot() = %v, want %v for verdict %q", free, tt.wantFree, got)
+			}
+		})
+	}
+}
+
+// A green PR that becomes blocked frees its slot, and the slot is reclaimed as
+// soon as the blocker closes. The two conditions can toggle independently.
+func TestGreenBlockedSlotFollowsBlocker(t *testing.T) {
+	s := readySnapshot()
+	if got := EvaluateGreenBlocked(s, Policy{}, false); got.ReleasesSlot() {
+		t.Fatalf("ready PR without blocker already frees the slot: %q", got)
+	}
+	blocked := EvaluateGreenBlocked(s, Policy{}, true)
+	if blocked != GreenBlocked || !blocked.ReleasesSlot() {
+		t.Fatalf("ready PR with blocker = %q, want %q freeing the slot", blocked, GreenBlocked)
+	}
+	unblocked := EvaluateGreenBlocked(s, Policy{}, false)
+	if unblocked != GreenBlockedNone || unblocked.ReleasesSlot() {
+		t.Fatalf("closed blocker = %q, want %q keeping the slot", unblocked, GreenBlockedNone)
+	}
+}
+
+// The green-blocked verdict is a distinct scheduling status. It must not
+// collide with the CI verdict, the external verdict, a parked Watch, a BLOCKED
+// review verdict or a reviewer exit code, and its journal string must not be
+// the word BLOCKED that those concepts already use.
+func TestGreenBlockedIsNotParkOrBlocked(t *testing.T) {
+	if reflect.TypeOf(GreenBlocked) == reflect.TypeOf(VerdictWatching) ||
+		reflect.TypeOf(GreenBlocked) == reflect.TypeOf(ExternalPass) ||
+		reflect.TypeOf(GreenBlocked) == reflect.TypeOf(ReviewBlocked) ||
+		reflect.TypeOf(GreenBlocked) == reflect.TypeOf(ReviewerExitReject) {
+		t.Fatal("green-blocked verdict type must differ from other verdict types")
+	}
+	if string(GreenBlocked) == string(VerdictParked) ||
+		string(GreenBlocked) == string(ReviewBlocked) ||
+		string(GreenBlocked) == string(VerdictReady) ||
+		string(GreenBlocked) == string(ExternalPass) {
+		t.Fatalf("green-blocked string %q collides with an existing verdict", GreenBlocked)
+	}
+}
+
+// ReleasesSlot is true only for the green-blocked verdict. The zero value and
+// every other named status keep the slot.
+func TestGreenBlockedReleasesSlotOnlyForHeldVerdict(t *testing.T) {
+	if GreenBlockedNone.ReleasesSlot() {
+		t.Fatal("zero verdict must not free a slot")
+	}
+	if !GreenBlocked.ReleasesSlot() {
+		t.Fatal("green-blocked verdict must free a slot")
+	}
+	if GreenBlockedVerdict("something_else").ReleasesSlot() {
+		t.Fatal("unknown verdict must not free a slot")
+	}
+}
+
+// Green-blocked is a pure scheduling decision: it does not change the CI
+// verdict, does not set the ready verdict and does not let an agent-provided
+// flag manufacture a green PR. Green comes from Evaluate over CI facts only.
+func TestEvaluateGreenBlockedDoesNotChangeCIVerdict(t *testing.T) {
+	s := readySnapshot()
+	blocked := EvaluateGreenBlocked(s, Policy{}, true)
+	if string(blocked) == string(VerdictReady) {
+		t.Fatal("green-blocked must not become the ready verdict")
+	}
+	if got := Evaluate(s, Policy{}); got != VerdictReady {
+		t.Fatalf("Evaluate mutated by green-blocked check: %q, want ready", got)
+	}
+
+	before := s
+	before.Checks = make(map[string]Check, len(s.Checks))
+	for name, check := range s.Checks {
+		before.Checks[name] = check
+	}
+	before.Failures = append([]string(nil), s.Failures...)
+	_ = EvaluateGreenBlocked(s, Policy{}, true)
+	if !reflect.DeepEqual(s, before) {
+		t.Fatalf("EvaluateGreenBlocked mutated the snapshot: %+v, want %+v", s, before)
+	}
+}
+
+// The decision is deterministic: the same facts always yield the same verdict,
+// independent of how many times the engine is asked.
+func TestEvaluateGreenBlockedDeterministic(t *testing.T) {
+	s := readySnapshot()
+	want := EvaluateGreenBlocked(s, Policy{}, true)
+	for i := 0; i < 10; i++ {
+		if got := EvaluateGreenBlocked(s, Policy{}, true); got != want {
+			t.Fatalf("call %d = %q, want %q", i, got, want)
+		}
+	}
+}
