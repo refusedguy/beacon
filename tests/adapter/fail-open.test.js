@@ -301,9 +301,12 @@ test("после искусственных ошибок сессия отвеч
   assert.equal(adapter.cursor, 0)
 
   // Поломки устранены: следующий обычный цикл проходит без ошибок.
+  // Неудавшееся чтение не забрало событие из очереди: watch-t35-fail остался.
+  // Сбрасываем его, чтобы проверить ровно один обычный prompt после ошибки.
   adapter.cfg.failEventRead = false
   adapter.cfg.failPrompt = false
   adapter.log.length = 0
+  adapter.queue.length = 0
   adapter.queue.push({ watchID: "watch-t35-ok" })
   await adapter.processEvents()
 
