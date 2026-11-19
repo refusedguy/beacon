@@ -88,6 +88,60 @@ const (
 	DeliveryInterrupted Delivery = "interrupted"
 )
 
+// DeliveryState is where one follow-up message sits in its lifecycle
+// (ADR 0043 feature 4). It is a receipt state, not a delivery method: Delivery
+// from ADR 0026 answers how a message was sent (steer, queue, unsupported),
+// while DeliveryState answers at what point of its life the message is. The
+// eight states stay a closed set and never include steer, queue or unsupported.
+type DeliveryState string
+
+const (
+	// StateSpooled means the message is written to durable storage and not yet
+	// handed to a channel.
+	StateSpooled DeliveryState = "spooled"
+	// StatePending means the message waits to be sent.
+	StatePending DeliveryState = "pending"
+	// StateHeld means the message is on hold and no send was attempted, for
+	// example when a human interruption stopped the wait.
+	StateHeld DeliveryState = "held"
+	// StatePushed means the message was sent to a channel.
+	StatePushed DeliveryState = "pushed"
+	// StatePushUnreachable means the message was sent to a channel the
+	// recipient cannot reach.
+	StatePushUnreachable DeliveryState = "push-unreachable"
+	// StateRead means the recipient read the message.
+	StateRead DeliveryState = "read"
+	// StateRefused means the recipient refused the message. It is never read.
+	StateRefused DeliveryState = "refused"
+	// StateExpired means the message expired before it was read.
+	StateExpired DeliveryState = "expired"
+)
+
+// validDeliveryState reports whether state is one of the eight receipt states
+// from ADR 0043. Delivery values from ADR 0026 are deliberately not states.
+func validDeliveryState(state DeliveryState) bool {
+	switch state {
+	case StateSpooled, StatePending, StateHeld, StatePushed,
+		StatePushUnreachable, StateRead, StateRefused, StateExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsRead reports whether the recipient actually read the message. Only the
+// read state qualifies: a refused message is explicitly not read (ADR 0043).
+func (s DeliveryState) IsRead() bool {
+	return s == StateRead
+}
+
+// reachedRecipient reports whether the message reached the recipient. Pushed
+// and read are the two states that count; refused, push-unreachable and expired
+// do not, so a receipt in one of them is never a delivered follow-up.
+func (s DeliveryState) reachedRecipient() bool {
+	return s == StatePushed || s == StateRead
+}
+
 // WakeSource is where a follow-up message came from (ADR 0030 p6). SourceReview
 // is a diff comment: it is delivered through the steer channel of ADR 0026 and
 // differs from a manual nudge only in its source. SourceManual is the zero
@@ -183,6 +237,12 @@ type WakeInput struct {
 	// session in another worktree does not. An empty path keeps the explicit
 	// Target or capability path used by earlier callers.
 	TargetWorktree string `json:"targetWorktree,omitempty" jsonschema:"worktree path the notification is addressed to; resolves the recipient by worktree, stable across a session restart; empty keeps the explicit target or capability path"`
+	// State is the receipt state the environment reports for this message
+	// (ADR 0043 feature 4). It answers where in its life the message is, not
+	// how it is sent: steer, queue and unsupported stay in Delivery (ADR 0026).
+	// An empty value keeps earlier callers working; the core then derives a
+	// state from the delivery outcome. An unknown value is rejected here.
+	State DeliveryState `json:"state,omitempty" jsonschema:"receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired; empty derives one from the delivery outcome"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -212,6 +272,11 @@ type WakeOutput struct {
 	Woke        bool          `json:"woke,omitempty"`
 	Fallback    FallbackStage `json:"fallback,omitempty"`
 	Traced      bool          `json:"traced,omitempty"`
+	// State is the eight-valued receipt lifecycle state (ADR 0043 feature 4).
+	// It is independent of the ADR 0026 delivery method. A refused,
+	// push-unreachable or expired message keeps OK false even when a channel
+	// acknowledged the send, so a rejection is never read as a delivery.
+	State DeliveryState `json:"state"`
 }
 
 // Interruption reasons are fixed strings so tests and callers can rely on the
@@ -529,6 +594,9 @@ func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 	if !validSource(source) {
 		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown message source %q", string(in.Source)))}
 	}
+	if in.State != "" && !validDeliveryState(in.State) {
+		return wakeSetup{err: domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("wake: unknown receipt state %q", string(in.State)))}
+	}
 
 	hasCapabilities := len(in.RequiredCapabilities) > 0
 	hasWorktree := in.TargetWorktree != ""
@@ -588,6 +656,40 @@ func isSuccessDelivery(delivery Delivery) bool {
 	return delivery == DeliverySteer || delivery == DeliveryQueue
 }
 
+// defaultDeliveryState picks a receipt state for callers that do not report
+// one. It claims only what the delivery outcome proves: a delivered follow-up
+// was pushed, a traced message was spooled for later, and everything else was
+// held. An explicit State from the caller narrows this default.
+func defaultDeliveryState(out WakeOutput) DeliveryState {
+	switch {
+	case out.Delivery == DeliveryInterrupted:
+		return StateHeld
+	case out.Traced:
+		return StateSpooled
+	case out.OK:
+		return StatePushed
+	default:
+		return StateHeld
+	}
+}
+
+// withReceiptState attaches the receipt lifecycle state to a wake result. An
+// explicit State from the caller wins; otherwise the state follows the
+// delivery outcome. A state that does not reach the recipient forces OK false,
+// so a refused or expired message is never reported as a delivered follow-up.
+func withReceiptState(out WakeOutput, in WakeInput) WakeOutput {
+	state := in.State
+	if state == "" {
+		state = defaultDeliveryState(out)
+	}
+	out.State = state
+	if !state.reachedRecipient() && out.OK {
+		out.OK = false
+		out.Reason = "wake: receipt state " + string(state) + " did not reach the recipient"
+	}
+	return out
+}
+
 // Wake performs one delivery and returns an honest receipt. Input is validated
 // at this boundary; steer and queue are success, while unsupported and any
 // unknown delivery value are a refusal with a reason and OK=false (ADR 0026).
@@ -609,43 +711,43 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 		return WakeOutput{}, setup.err
 	}
 	if setup.refusal != nil {
-		return *setup.refusal, nil
+		return withReceiptState(*setup.refusal, in), nil
 	}
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
 	}
 
 	if h == nil || h.sender == nil {
-		return WakeOutput{
+		return withReceiptState(WakeOutput{
 			Delivery: DeliveryUnsupported,
 			OK:       false,
 			Source:   setup.source,
 			Executor: in.Executor,
 			Reason:   "wake: no delivery sender configured",
 			Woke:     in.Woke,
-		}, nil
+		}, in), nil
 	}
 
 	delivery, reason := h.sender.Deliver(ctx, setup.target, in.Text, setup.source)
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
-		return WakeOutput{Delivery: delivery, OK: true, Source: setup.source, Executor: in.Executor, Woke: in.Woke}, nil
+		return withReceiptState(WakeOutput{Delivery: delivery, OK: true, Source: setup.source, Executor: in.Executor, Woke: in.Woke}, in), nil
 	case DeliveryUnsupported:
 		if reason == "" {
 			reason = "wake: delivery to an open session is not supported"
 		}
-		return WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: setup.source, Executor: in.Executor, Reason: reason, Woke: in.Woke}, nil
+		return withReceiptState(WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: setup.source, Executor: in.Executor, Reason: reason, Woke: in.Woke}, in), nil
 	default:
 		// An unknown value is never promoted to success. Report it as an
 		// unsupported delivery with a reason so the caller can branch safely.
-		return WakeOutput{
+		return withReceiptState(WakeOutput{
 			Delivery: DeliveryUnsupported,
 			OK:       false,
 			Source:   setup.source,
 			Executor: in.Executor,
 			Reason:   fmt.Sprintf("wake: unknown delivery value %q", string(delivery)),
 			Woke:     in.Woke,
-		}, nil
+		}, in), nil
 	}
 }
 
@@ -662,12 +764,12 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 		return WakeOutput{}, setup.err
 	}
 	if setup.refusal != nil {
-		return *setup.refusal, nil
+		return withReceiptState(*setup.refusal, in), nil
 	}
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
 	}
-	return h.runFallback(ctx, in, setup.target, setup.source), nil
+	return withReceiptState(h.runFallback(ctx, in, setup.target, setup.source), in), nil
 }
 
 // fallbackStage maps a requested channel to the stage recorded on the receipt.
@@ -765,7 +867,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
