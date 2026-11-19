@@ -320,3 +320,109 @@ func TestPersistStatsOnEmptyStoreDoesNotCreateState(t *testing.T) {
 		t.Error("a read created persist_progress")
 	}
 }
+
+// TestRecordWakeKeepsSentAndWokeSeparate is the T3.26 acceptance core
+// (ADR 0032 p2): a dispatch and a start are different observable facts. A sent
+// wake stays woke=false; a start reported on its own stays sent=false; both
+// converge on one row when each is observed in turn.
+func TestRecordWakeKeepsSentAndWokeSeparate(t *testing.T) {
+	d := openObservabilityDB(t)
+	op := NewObservedPersist(d)
+
+	empty, err := d.WakeObservations()
+	if err != nil {
+		t.Fatalf("WakeObservations on fresh store: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("fresh wake observations = %+v, want empty", empty)
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "wake_observations")
+	if err != nil {
+		t.Fatalf("tableExists: %v", err)
+	}
+	if ok {
+		t.Error("a read created wake_observations")
+	}
+
+	if err := op.RecordWake(context.Background(), WakeObservation{ObligationID: "obl-1", Sent: true}); err != nil {
+		t.Fatalf("RecordWake sent: %v", err)
+	}
+	got, err := d.WakeObservations()
+	if err != nil {
+		t.Fatalf("WakeObservations after sent: %v", err)
+	}
+	if len(got) != 1 || got[0].ObligationID != "obl-1" || !got[0].Sent || got[0].Woke {
+		t.Fatalf("after sent = %+v, want one row sent=true woke=false (delivery is not a start)", got)
+	}
+
+	if err := op.RecordWake(context.Background(), WakeObservation{ObligationID: "obl-1", Woke: true}); err != nil {
+		t.Fatalf("RecordWake woke: %v", err)
+	}
+	if err := op.RecordWake(context.Background(), WakeObservation{ObligationID: "obl-2", Woke: true}); err != nil {
+		t.Fatalf("RecordWake woke only: %v", err)
+	}
+	got, err = d.WakeObservations()
+	if err != nil {
+		t.Fatalf("WakeObservations after woke: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("wake observations = %+v, want 2 rows", got)
+	}
+	if got[0].ObligationID != "obl-1" || !got[0].Sent || !got[0].Woke {
+		t.Errorf("obl-1 = %+v, want both facts merged", got[0])
+	}
+	if got[1].ObligationID != "obl-2" || got[1].Sent || !got[1].Woke {
+		t.Errorf("obl-2 = %+v, want woke without sent (start is not derived from delivery)", got[1])
+	}
+
+	// Repeating a fact is idempotent and does not create extra rows.
+	if err := op.RecordWake(context.Background(), WakeObservation{ObligationID: "obl-1", Woke: true}); err != nil {
+		t.Fatalf("RecordWake repeat: %v", err)
+	}
+	got, err = d.WakeObservations()
+	if err != nil {
+		t.Fatalf("WakeObservations after repeat: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("rows after repeat = %d, want 2", len(got))
+	}
+}
+
+// TestRecordWakeDoesNotAdvancePersistSeq keeps the new fact out of the persist
+// block: wake observations are their own observability surface, like streams.
+func TestRecordWakeDoesNotAdvancePersistSeq(t *testing.T) {
+	d := openObservabilityDB(t)
+	op := NewObservedPersist(d)
+
+	if err := op.RecordWake(context.Background(), WakeObservation{ObligationID: "obl-1", Sent: true, Woke: true}); err != nil {
+		t.Fatalf("RecordWake: %v", err)
+	}
+	viaWriter, err := op.WakeObservations()
+	if err != nil {
+		t.Fatalf("ObservedPersist.WakeObservations: %v", err)
+	}
+	viaDB, err := d.WakeObservations()
+	if err != nil {
+		t.Fatalf("DB.WakeObservations: %v", err)
+	}
+	if !reflect.DeepEqual(viaWriter, viaDB) {
+		t.Errorf("writer view = %+v, db view = %+v", viaWriter, viaDB)
+	}
+	state, err := d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState: %v", err)
+	}
+	if state.Seq != 0 || state.LastError != "" {
+		t.Errorf("persist state = %+v, want unchanged by RecordWake", state)
+	}
+}
+
+// TestRecordWakeRejectsEmptyObligation keeps the boundary honest: a fact with
+// no obligation cannot be attributed to a wake episode.
+func TestRecordWakeRejectsEmptyObligation(t *testing.T) {
+	d := openObservabilityDB(t)
+	op := NewObservedPersist(d)
+	if err := op.RecordWake(context.Background(), WakeObservation{Sent: true}); err == nil {
+		t.Fatal("RecordWake with empty obligation id: error = nil, want invalid input")
+	}
+}
