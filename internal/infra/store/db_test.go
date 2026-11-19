@@ -1996,3 +1996,380 @@ func TestNotifyCompletionRejectsInvalidInput(t *testing.T) {
 		t.Fatalf("CompletionNotificationCount after rejected input = %d, %v; want 0", n, err)
 	}
 }
+
+// TestTaskLogThreePartsAndActivityAreSeparate is the acceptance check for
+// T3.119 (ADR 0051 feature 2): request, outcome and report are three separate
+// records, and live activity is read from its own store, never mixed into the
+// three parts.
+func TestTaskLogThreePartsAndActivityAreSeparate(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	parts := []struct{ part, payload string }{
+		{LogPartRequest, `{"prompt":"build it"}`},
+		{LogPartOutcome, `{"result":"done"}`},
+		{LogPartReport, `{"summary":"shipped"}`},
+	}
+	for _, p := range parts {
+		if err := d.SetLogPart("task-1", p.part, []byte(p.payload)); err != nil {
+			t.Fatalf("SetLogPart(%s): %v", p.part, err)
+		}
+	}
+	if err := d.SetActivity("task-1", "compiling"); err != nil {
+		t.Fatalf("SetActivity: %v", err)
+	}
+
+	got, err := d.TaskLogParts("task-1")
+	if err != nil {
+		t.Fatalf("TaskLogParts: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("TaskLogParts = %d rows, want 3 separate records", len(got))
+	}
+	for i, want := range parts {
+		if got[i].Part != want.part || string(got[i].Payload) != want.payload {
+			t.Errorf("part %d = %+v, want %s/%s", i, got[i], want.part, want.payload)
+		}
+		if got[i].TaskID != "task-1" || got[i].CreatedAt == 0 {
+			t.Errorf("part %d missing metadata: %+v", i, got[i])
+		}
+	}
+
+	act, found, err := d.Activity("task-1")
+	if err != nil || !found {
+		t.Fatalf("Activity: found=%v err=%v; want found", found, err)
+	}
+	if act.Message != "compiling" {
+		t.Errorf("activity = %q, want compiling", act.Message)
+	}
+
+	// The three-part table must hold exactly the three parts and nothing else.
+	var count int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM task_log WHERE task_id = ?`, "task-1").Scan(&count); err != nil {
+		t.Fatalf("count task_log: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("task_log rows = %d, want 3 (activity must not be stored here)", count)
+	}
+	var activityRows int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM task_activity`).Scan(&activityRows); err != nil {
+		t.Fatalf("count task_activity: %v", err)
+	}
+	if activityRows != 1 {
+		t.Errorf("task_activity rows = %d, want 1", activityRows)
+	}
+}
+
+// TestTaskLogSetLogPartIsIdempotentPerPart proves a redelivery cannot overwrite
+// an already written part with a different payload.
+func TestTaskLogSetLogPartIsIdempotentPerPart(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.SetLogPart("task-2", LogPartRequest, []byte("first")); err != nil {
+		t.Fatalf("first SetLogPart: %v", err)
+	}
+	if err := d.SetLogPart("task-2", LogPartRequest, []byte("second")); err != nil {
+		t.Fatalf("repeat SetLogPart: %v", err)
+	}
+	parts, err := d.TaskLogParts("task-2")
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("TaskLogParts = %d, %v; want 1", len(parts), err)
+	}
+	if string(parts[0].Payload) != "first" {
+		t.Errorf("repeat overwrote part: %s, want first", parts[0].Payload)
+	}
+}
+
+// TestTaskLogActivityIsCurrentNotHistory checks that live activity holds only
+// the latest message, is cleared independently, and never enters the three
+// durable parts.
+func TestTaskLogActivityIsCurrentNotHistory(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.SetLogPart("task-3", LogPartRequest, []byte("ask")); err != nil {
+		t.Fatalf("SetLogPart: %v", err)
+	}
+	if err := d.SetActivity("task-3", "step one"); err != nil {
+		t.Fatalf("SetActivity #1: %v", err)
+	}
+	if err := d.SetActivity("task-3", "step two"); err != nil {
+		t.Fatalf("SetActivity #2: %v", err)
+	}
+	act, found, err := d.Activity("task-3")
+	if err != nil || !found || act.Message != "step two" {
+		t.Fatalf("Activity = %+v found=%v err=%v; want latest step two", act, found, err)
+	}
+	parts, err := d.TaskLogParts("task-3")
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("TaskLogParts after activity = %d, %v; want 1 (activity not a part)", len(parts), err)
+	}
+
+	if err := d.ClearActivity("task-3"); err != nil {
+		t.Fatalf("ClearActivity: %v", err)
+	}
+	if _, found, err := d.Activity("task-3"); err != nil || found {
+		t.Fatalf("Activity after clear: found=%v err=%v; want not found", found, err)
+	}
+	if err := d.ClearActivity("task-3"); err != nil {
+		t.Fatalf("second ClearActivity: %v", err)
+	}
+	parts, err = d.TaskLogParts("task-3")
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("TaskLogParts after clear = %d, %v; want 1", len(parts), err)
+	}
+}
+
+// TestTaskViewShowsRunningAndReadyAsDifferentStates checks the CLI-facing
+// states: work in progress until the report exists, then result ready. The
+// report flips the state; activity and the other parts stay separate.
+func TestTaskViewShowsRunningAndReadyAsDifferentStates(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	view, err := d.TaskView("task-4")
+	if err != nil {
+		t.Fatalf("TaskView on empty: %v", err)
+	}
+	if view.State != TaskStateRunning || len(view.Parts) != 0 || view.HasActivity {
+		t.Fatalf("empty view = %+v, want running with no parts or activity", view)
+	}
+
+	if err := d.SetLogPart("task-4", LogPartRequest, []byte("ask")); err != nil {
+		t.Fatalf("SetLogPart request: %v", err)
+	}
+	if err := d.SetActivity("task-4", "working"); err != nil {
+		t.Fatalf("SetActivity: %v", err)
+	}
+	view, err = d.TaskView("task-4")
+	if err != nil {
+		t.Fatalf("TaskView with request: %v", err)
+	}
+	if view.State != TaskStateRunning {
+		t.Errorf("state with request = %q, want running", view.State)
+	}
+	if !view.HasActivity || view.Activity.Message != "working" {
+		t.Errorf("view activity = %+v, want working", view.Activity)
+	}
+
+	if err := d.SetLogPart("task-4", LogPartOutcome, []byte("result")); err != nil {
+		t.Fatalf("SetLogPart outcome: %v", err)
+	}
+	view, err = d.TaskView("task-4")
+	if err != nil {
+		t.Fatalf("TaskView with outcome: %v", err)
+	}
+	if view.State != TaskStateRunning {
+		t.Errorf("state with outcome = %q, want running until report", view.State)
+	}
+
+	if err := d.SetLogPart("task-4", LogPartReport, []byte("summary")); err != nil {
+		t.Fatalf("SetLogPart report: %v", err)
+	}
+	if err := d.ClearActivity("task-4"); err != nil {
+		t.Fatalf("ClearActivity: %v", err)
+	}
+	view, err = d.TaskView("task-4")
+	if err != nil {
+		t.Fatalf("TaskView with report: %v", err)
+	}
+	if view.State != TaskStateReady {
+		t.Errorf("state with report = %q, want result_ready", view.State)
+	}
+	if len(view.Parts) != 3 {
+		t.Errorf("view parts = %d, want 3", len(view.Parts))
+	}
+	if view.HasActivity {
+		t.Errorf("view has activity after clear: %+v", view.Activity)
+	}
+}
+
+// TestTaskLogSurvivesRestart proves the three parts and the live activity are
+// durable in the file, readable by a new DB handle on the same path.
+func TestTaskLogSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	if err := first.SetLogPart("task-5", LogPartRequest, []byte("ask")); err != nil {
+		first.Close()
+		t.Fatalf("SetLogPart: %v", err)
+	}
+	if err := first.SetLogPart("task-5", LogPartReport, []byte("summary")); err != nil {
+		first.Close()
+		t.Fatalf("SetLogPart report: %v", err)
+	}
+	if err := first.SetActivity("task-5", "finalizing"); err != nil {
+		first.Close()
+		t.Fatalf("SetActivity: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	defer second.Close()
+
+	view, err := second.TaskView("task-5")
+	if err != nil {
+		t.Fatalf("TaskView after restart: %v", err)
+	}
+	if view.State != TaskStateReady || len(view.Parts) != 2 {
+		t.Fatalf("view after restart = %+v, want ready with 2 parts", view)
+	}
+	if !view.HasActivity || view.Activity.Message != "finalizing" {
+		t.Errorf("activity after restart = %+v, want finalizing", view.Activity)
+	}
+}
+
+// TestTaskLogRedactsPayloads applies ADR 0012 to log parts and live activity:
+// a secret never reaches the file, and a repeat returns the redacted copy.
+func TestTaskLogRedactsPayloads(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	if err := d.SetLogPart("task-6", LogPartReport, secret); err != nil {
+		t.Fatalf("SetLogPart: %v", err)
+	}
+	if err := d.SetActivity("task-6", string(secret)); err != nil {
+		t.Fatalf("SetActivity: %v", err)
+	}
+	parts, err := d.TaskLogParts("task-6")
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("TaskLogParts = %d, %v; want 1", len(parts), err)
+	}
+	if bytes.Contains(parts[0].Payload, []byte("ghp_")) {
+		t.Errorf("stored part kept a raw token: %s", parts[0].Payload)
+	}
+	act, found, err := d.Activity("task-6")
+	if err != nil || !found {
+		t.Fatalf("Activity: found=%v err=%v; want found", found, err)
+	}
+	if strings.Contains(act.Message, "ghp_") {
+		t.Errorf("stored activity kept a raw token: %q", act.Message)
+	}
+	if !bytes.Contains(secret, []byte("ghp_")) {
+		t.Fatal("test input lost its secret before the write")
+	}
+}
+
+func TestTaskLogRejectsInvalidInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	bad := []struct {
+		name   string
+		taskID string
+		part   string
+	}{
+		{"empty task id", "", LogPartRequest},
+		{"blank task id", "  ", LogPartRequest},
+		{"invalid part", "task-1", "status"},
+		{"empty part", "task-1", ""},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			err := d.SetLogPart(tc.taskID, tc.part, []byte("payload"))
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Fatalf("SetLogPart error = %v, want INVALID_INPUT", err)
+			}
+		})
+	}
+	if _, err := d.TaskLogParts("  "); err == nil {
+		t.Error("TaskLogParts(blank) must fail")
+	}
+	if err := d.SetActivity("", "x"); err == nil {
+		t.Error("SetActivity(empty) must fail")
+	}
+	if _, _, err := d.Activity("  "); err == nil {
+		t.Error("Activity(blank) must fail")
+	}
+	if err := d.ClearActivity("  "); err == nil {
+		t.Error("ClearActivity(blank) must fail")
+	}
+	if ok, err := tableExists(context.Background(), d.readDB, "task_log"); err != nil {
+		t.Fatalf("check task_log: %v", err)
+	} else if ok {
+		var count int
+		if err := d.readDB.QueryRow(`SELECT count(*) FROM task_log`).Scan(&count); err != nil {
+			t.Fatalf("count task_log: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("task_log rows after rejected input = %d, want 0", count)
+		}
+	}
+}
+
+// TestTaskLogDoesNotDuplicateAdr0025Status proves the new three-part log does
+// not reuse or disturb the ADR 0025 status/cursor journal. Reading and writing
+// task_log and task_activity leave task_journal and JournalStatus untouched.
+func TestTaskLogDoesNotDuplicateAdr0025Status(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	seq, err := d.AppendEvent(ctx, "task-7", "started", "go")
+	if err != nil {
+		t.Fatalf("AppendEvent: %v", err)
+	}
+	before, err := d.JournalStatus(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("JournalStatus before: %v", err)
+	}
+	if before.Status != "started" || before.Cursor != seq {
+		t.Fatalf("JournalStatus before = %+v, want started/cursor %d", before, seq)
+	}
+
+	if err := d.SetLogPart("task-7", LogPartRequest, []byte("ask")); err != nil {
+		t.Fatalf("SetLogPart: %v", err)
+	}
+	if err := d.SetLogPart("task-7", LogPartReport, []byte("summary")); err != nil {
+		t.Fatalf("SetLogPart report: %v", err)
+	}
+	if err := d.SetActivity("task-7", "running"); err != nil {
+		t.Fatalf("SetActivity: %v", err)
+	}
+	if _, err := d.TaskView("task-7"); err != nil {
+		t.Fatalf("TaskView: %v", err)
+	}
+
+	after, err := d.JournalStatus(ctx, "task-7")
+	if err != nil {
+		t.Fatalf("JournalStatus after: %v", err)
+	}
+	if after != before {
+		t.Errorf("JournalStatus changed: got %+v, want %+v", after, before)
+	}
+	rows, err := d.JournalRecords(ctx, "task-7")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("JournalRecords = %d, %v; want 1 (log writes must not append)", len(rows), err)
+	}
+}
