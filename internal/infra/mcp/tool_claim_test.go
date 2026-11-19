@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -601,6 +602,278 @@ func TestRecoverIsNotAClientTool(t *testing.T) {
 		}
 		if tool.Name == "beacon_recover" {
 			t.Fatal("beacon_recover must not be registered as a client tool")
+		}
+	}
+}
+
+// leaseTestClock is a local clock so the TTL contract can be tested without
+// sleeping. The file keeps its own clock helper instead of sharing one with
+// another tool's tests.
+type leaseTestClock struct {
+	t time.Time
+}
+
+func (c *leaseTestClock) Now() time.Time { return c.t }
+
+func (c *leaseTestClock) Advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// TestStaleWorktreeOwnerCannotWriteAfterTTL is the acceptance of ADR 0044 p2:
+// a live lease lets its owner write, the TTL end frees the worktree, and a
+// former owner with the old token cannot write into the re-leased directory.
+func TestStaleWorktreeOwnerCannotWriteAfterTTL(t *testing.T) {
+	start := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	clock := &leaseTestClock{t: start}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-1", OwnerID: "alice", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("alice lease: %v", err)
+	}
+	if lease.WorktreeID != "wt-1" || lease.OwnerID != "alice" {
+		t.Fatalf("lease = %+v, want wt-1 owned by alice", lease)
+	}
+	if lease.FencingToken == 0 {
+		t.Fatal("lease fencing token must be positive")
+	}
+	if !lease.ExpiresAt.Equal(start.Add(time.Hour)) {
+		t.Fatalf("expiresAt = %v, want %v", lease.ExpiresAt, start.Add(time.Hour))
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-1", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); err != nil {
+		t.Fatalf("alice write while lease live: %v", err)
+	}
+
+	// The TTL elapses without an explicit release.
+	clock.Advance(2 * time.Hour)
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-1", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); !IsWorktreeLeaseExpired(err) {
+		t.Fatalf("alice write after TTL: err = %v, want worktree lease expired", err)
+	}
+
+	bob, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-1", OwnerID: "bob", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("bob lease after TTL: %v", err)
+	}
+	if bob.FencingToken <= lease.FencingToken {
+		t.Fatalf("bob token = %d, want > %d", bob.FencingToken, lease.FencingToken)
+	}
+
+	_, err = h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-1", OwnerID: "alice", FencingToken: lease.FencingToken,
+	})
+	if !IsStaleWorktreeLease(err) {
+		t.Fatalf("alice write with old token after re-lease: err = %v, want stale worktree lease", err)
+	}
+	var stale *WorktreeLeaseStaleError
+	if !errors.As(err, &stale) || stale.Presented != lease.FencingToken || stale.Current != bob.FencingToken {
+		t.Fatalf("stale = %+v, want presented %d current %d", stale, lease.FencingToken, bob.FencingToken)
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-1", OwnerID: "bob", FencingToken: bob.FencingToken,
+	}); err != nil {
+		t.Fatalf("bob write with current token: %v", err)
+	}
+}
+
+// TestWorktreeLeaseIsWholeWorktreeExclusive checks that the lease unit is the
+// worktree, not a task: a second owner cannot take the same directory, and a
+// different worktree is independent.
+func TestWorktreeLeaseIsWholeWorktreeExclusive(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	alice, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-a", OwnerID: "alice", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("alice lease: %v", err)
+	}
+	_, err = h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-a", OwnerID: "bob", TTLSeconds: 3600})
+	if !IsWorktreeLeaseBusy(err) {
+		t.Fatalf("bob lease of a live worktree: err = %v, want busy", err)
+	}
+	var busy *WorktreeLeaseBusyError
+	if !errors.As(err, &busy) || busy.OwnerID != "alice" {
+		t.Fatalf("busy = %+v, want holder alice", busy)
+	}
+
+	if _, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-b", OwnerID: "bob", TTLSeconds: 3600}); err != nil {
+		t.Fatalf("bob lease of another worktree: %v", err)
+	}
+	_, err = h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-a", OwnerID: "bob", FencingToken: alice.FencingToken,
+	})
+	var wrongOwner *WorktreeLeaseOwnerError
+	if !errors.As(err, &wrongOwner) || wrongOwner.Holder != "alice" || wrongOwner.OwnerID != "bob" {
+		t.Fatalf("bob write into alice's worktree: err = %+v, want owner error for alice", err)
+	}
+}
+
+// TestWorktreeLeaseFencingTokenMonotonic checks that one store issues strictly
+// increasing tokens across different worktrees and across a TTL re-lease. This
+// is what makes a token kept by an old owner stale after the worktree is free.
+func TestWorktreeLeaseFencingTokenMonotonic(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	first, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-1", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("first lease: %v", err)
+	}
+	second, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-2", OwnerID: "bob", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("second lease: %v", err)
+	}
+	if second.FencingToken <= first.FencingToken {
+		t.Fatalf("second token = %d, want > %d", second.FencingToken, first.FencingToken)
+	}
+
+	clock.Advance(2 * time.Minute)
+	third, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-1", OwnerID: "carol", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("re-lease after TTL: %v", err)
+	}
+	if third.FencingToken <= second.FencingToken {
+		t.Fatalf("re-lease token = %d, want > %d", third.FencingToken, second.FencingToken)
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-1", OwnerID: "alice", FencingToken: first.FencingToken,
+	}); !IsStaleWorktreeLease(err) {
+		t.Fatalf("old token after re-lease: err = %v, want stale worktree lease", err)
+	}
+}
+
+// TestWorktreeLeaseRelease checks explicit release: only the owner with the
+// current token can free the lease, and the token stops authorizing writes
+// afterwards.
+func TestWorktreeLeaseRelease(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-r", OwnerID: "alice", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if _, err := h.Release(ctx, WorktreeReleaseInput{
+		WorktreeID: "wt-r", OwnerID: "alice", FencingToken: lease.FencingToken + 1,
+	}); !IsStaleWorktreeLease(err) {
+		t.Fatalf("release with wrong token: err = %v, want stale worktree lease", err)
+	}
+	var notOwner *WorktreeLeaseOwnerError
+	if _, err := h.Release(ctx, WorktreeReleaseInput{
+		WorktreeID: "wt-r", OwnerID: "bob", FencingToken: lease.FencingToken,
+	}); !errors.As(err, &notOwner) {
+		t.Fatalf("release by non-owner: err = %v, want owner error", err)
+	}
+	if _, err := h.Release(ctx, WorktreeReleaseInput{
+		WorktreeID: "wt-r", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); err != nil {
+		t.Fatalf("owner release: %v", err)
+	}
+	if _, err := h.Release(ctx, WorktreeReleaseInput{
+		WorktreeID: "wt-r", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); !IsWorktreeLeaseExpired(err) {
+		t.Fatalf("repeat release: err = %v, want worktree lease expired", err)
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-r", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); !IsWorktreeLeaseExpired(err) {
+		t.Fatalf("write after release: err = %v, want worktree lease expired", err)
+	}
+	next, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-r", OwnerID: "bob", TTLSeconds: 3600})
+	if err != nil {
+		t.Fatalf("re-lease after release: %v", err)
+	}
+	if next.FencingToken <= lease.FencingToken {
+		t.Fatalf("re-lease token = %d, want > %d", next.FencingToken, lease.FencingToken)
+	}
+}
+
+// TestWorktreeLeaseInvalidInput checks that missing fields and a non-positive
+// TTL are rejected at the boundary before the store is touched.
+func TestWorktreeLeaseInvalidInput(t *testing.T) {
+	h := NewWorktreeLeaseHandler(nil)
+	ctx := context.Background()
+
+	assertInvalid := func(t *testing.T, err error) {
+		t.Helper()
+		var app *domain.AppError
+		if !errors.As(err, &app) || app.Code != domain.CodeInvalidInput {
+			t.Fatalf("err = %v, want INVALID_INPUT", err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		in   WorktreeLeaseInput
+	}{
+		{"no worktree", WorktreeLeaseInput{OwnerID: "alice", TTLSeconds: 60}},
+		{"no owner", WorktreeLeaseInput{WorktreeID: "wt", TTLSeconds: 60}},
+		{"zero ttl", WorktreeLeaseInput{WorktreeID: "wt", OwnerID: "alice"}},
+		{"negative ttl", WorktreeLeaseInput{WorktreeID: "wt", OwnerID: "alice", TTLSeconds: -1}},
+	} {
+		t.Run("acquire/"+tc.name, func(t *testing.T) {
+			_, err := h.Acquire(ctx, tc.in)
+			assertInvalid(t, err)
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		in   WorktreeWriteInput
+	}{
+		{"no worktree", WorktreeWriteInput{OwnerID: "alice", FencingToken: 1}},
+		{"no owner", WorktreeWriteInput{WorktreeID: "wt", FencingToken: 1}},
+		{"no token", WorktreeWriteInput{WorktreeID: "wt", OwnerID: "alice"}},
+	} {
+		t.Run("write/"+tc.name, func(t *testing.T) {
+			_, err := h.Write(ctx, tc.in)
+			assertInvalid(t, err)
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		in   WorktreeReleaseInput
+	}{
+		{"no worktree", WorktreeReleaseInput{OwnerID: "alice", FencingToken: 1}},
+		{"no owner", WorktreeReleaseInput{WorktreeID: "wt", FencingToken: 1}},
+		{"no token", WorktreeReleaseInput{WorktreeID: "wt", OwnerID: "alice"}},
+	} {
+		t.Run("release/"+tc.name, func(t *testing.T) {
+			_, err := h.Release(ctx, tc.in)
+			assertInvalid(t, err)
+		})
+	}
+}
+
+// TestAttachWorktreeLeaseRegistersToolsOnce checks the integration hook without
+// changing the default NewServer contract. A repeated attach must not duplicate
+// any of the three tools.
+func TestAttachWorktreeLeaseRegistersToolsOnce(t *testing.T) {
+	server := NewServer()
+	AttachWorktreeLease(server, NewWorktreeLeaseHandler(nil))
+	AttachWorktreeLease(server, NewWorktreeLeaseHandler(nil))
+
+	session := connectClaimServer(t, server)
+	counts := map[string]int{
+		LeaseWorktreeToolName:   0,
+		WriteWorktreeToolName:   0,
+		ReleaseWorktreeToolName: 0,
+	}
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if _, tracked := counts[tool.Name]; tracked {
+			counts[tool.Name]++
+		}
+	}
+	for _, name := range []string{LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName} {
+		if counts[name] != 1 {
+			t.Errorf("%s registered %d times, want 1", name, counts[name])
 		}
 	}
 }

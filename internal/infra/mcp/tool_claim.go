@@ -26,11 +26,16 @@
 // before it can change the task again. The epoch is a separate fact from the
 // lease number: the token orders leases, the epoch marks a restored source.
 //
-// Ownership lives in an in-memory store guarded by one mutex. The whole
-// check-then-set runs under that lock, so concurrent claims of one task have a
-// single winner. Wiring this store to the durable task store is a separate
-// integration task; like wake, the tools are attached explicitly and are not
-// part of the default NewServer contract set.
+// ADR 0044 p2 adds a lease over a whole worktree. It is a different object from
+// the task lease of T3.51 and ADR 0037: that token protects a reassigned task,
+// this token protects the right to write into a directory until a TTL ends. The
+// lease keeps an owner, an expiry and one monotonic fencing token. After the TTL
+// passes, the worktree is free and the old token no longer authorizes a write,
+// even if the same owner takes a new lease.
+//
+// Both stores live in memory behind one mutex each. Wiring them to the durable
+// stores is a separate integration task; the tools are attached explicitly and
+// are not part of the default NewServer contract set.
 package mcp
 
 import (
@@ -39,6 +44,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -458,6 +464,378 @@ func AttachClaim(server *mcpsdk.Server, handler *ClaimHandler) {
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ReleaseToolName,
 		Description: "Explicitly release a task claim. Only the current owner can release; a fencingToken that is stale because the task was reassigned is refused, and a lease whose sourceEpoch was restored after a crash is refused even with a current token. Another owner may claim the task afterwards.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  false,
+		},
+	}, handler.HandleRelease)
+}
+
+// Worktree lease tool names. They stay out of ToolNames; registration is done
+// by AttachWorktreeLease and is not part of the default NewServer set.
+const (
+	LeaseWorktreeToolName   = "beacon_lease_worktree"
+	WriteWorktreeToolName   = "beacon_write_worktree"
+	ReleaseWorktreeToolName = "beacon_release_worktree"
+)
+
+// WorktreeLeaseInput is the argument object of beacon_lease_worktree. The
+// worktree is leased as a whole, so only its identifier and the owning agent
+// are named. TTLSeconds is the lifetime of the lease. When it elapses the
+// worktree is free without an explicit release.
+type WorktreeLeaseInput struct {
+	WorktreeID string `json:"worktreeID" jsonschema:"identifier of the worktree leased as a whole"`
+	OwnerID    string `json:"ownerID" jsonschema:"identifier of the agent that holds the whole worktree"`
+	TTLSeconds int64  `json:"ttlSeconds" jsonschema:"lease lifetime in seconds; the worktree is free once it elapses"`
+}
+
+// WorktreeLeaseOutput is the lease installed by acquire. FencingToken orders
+// leases taken on this store: every acquire takes a higher token. ExpiresAt is
+// the wall-clock instant at which the lease stops authorizing writes.
+type WorktreeLeaseOutput struct {
+	WorktreeID   string    `json:"worktreeID"`
+	OwnerID      string    `json:"ownerID"`
+	FencingToken uint64    `json:"fencingToken"`
+	ExpiresAt    time.Time `json:"expiresAt"`
+}
+
+// WorktreeWriteInput is the argument object of beacon_write_worktree. The call
+// records a write of the agent's result into the leased worktree. FencingToken
+// must be the one the worktree currently holds and the lease must still be
+// live, or the write is refused before any state changes.
+type WorktreeWriteInput struct {
+	WorktreeID   string `json:"worktreeID" jsonschema:"identifier of the worktree being written"`
+	OwnerID      string `json:"ownerID" jsonschema:"identifier of the agent writing into the worktree"`
+	FencingToken uint64 `json:"fencingToken" jsonschema:"fencing token from beacon_lease_worktree; a stale token is refused"`
+}
+
+// WorktreeWriteOutput confirms the write that was accepted.
+type WorktreeWriteOutput struct {
+	WorktreeID   string `json:"worktreeID"`
+	OwnerID      string `json:"ownerID"`
+	FencingToken uint64 `json:"fencingToken"`
+}
+
+// WorktreeReleaseInput is the argument object of beacon_release_worktree. It
+// frees the lease explicitly before its TTL ends. The caller must be the owner
+// and present the current token.
+type WorktreeReleaseInput struct {
+	WorktreeID   string `json:"worktreeID" jsonschema:"identifier of the worktree being released"`
+	OwnerID      string `json:"ownerID" jsonschema:"identifier of the owner releasing the worktree"`
+	FencingToken uint64 `json:"fencingToken" jsonschema:"fencing token from beacon_lease_worktree"`
+}
+
+// WorktreeReleaseOutput confirms which owner gave the worktree up.
+type WorktreeReleaseOutput struct {
+	WorktreeID string `json:"worktreeID"`
+	OwnerID    string `json:"ownerID"`
+}
+
+// WorktreeLeaseBusyError reports an acquire on a worktree whose lease is still
+// live. A whole worktree has one holder; the caller must wait for the TTL or
+// ask the current owner to release it.
+type WorktreeLeaseBusyError struct {
+	WorktreeID string
+	OwnerID    string
+	ExpiresAt  time.Time
+}
+
+func (e *WorktreeLeaseBusyError) Error() string {
+	return fmt.Sprintf("worktree lease: %q is held by %q until %s", e.WorktreeID, e.OwnerID, e.ExpiresAt.Format(time.RFC3339))
+}
+
+// IsWorktreeLeaseBusy reports whether err is a busy-worktree rejection.
+func IsWorktreeLeaseBusy(err error) bool {
+	var busy *WorktreeLeaseBusyError
+	return errors.As(err, &busy)
+}
+
+// WorktreeLeaseExpiredError reports a write or release with no live lease. An
+// expired lease and a never-leased worktree both leave no authority to write.
+type WorktreeLeaseExpiredError struct {
+	WorktreeID string
+}
+
+func (e *WorktreeLeaseExpiredError) Error() string {
+	return fmt.Sprintf("worktree lease: %q has no live lease; take a new lease before writing", e.WorktreeID)
+}
+
+// IsWorktreeLeaseExpired reports whether err is an expired-or-free rejection.
+func IsWorktreeLeaseExpired(err error) bool {
+	var expired *WorktreeLeaseExpiredError
+	return errors.As(err, &expired)
+}
+
+// WorktreeLeaseStaleError reports a write with a token that no longer matches
+// the worktree. A newer lease was taken since the caller acquired its token,
+// so the caller cannot write into the directory any more.
+type WorktreeLeaseStaleError struct {
+	Presented uint64
+	Current   uint64
+}
+
+func (e *WorktreeLeaseStaleError) Error() string {
+	return fmt.Sprintf("worktree lease: fencing token %d is stale, worktree is leased at token %d", e.Presented, e.Current)
+}
+
+// IsStaleWorktreeLease reports whether err is a stale worktree-token rejection.
+func IsStaleWorktreeLease(err error) bool {
+	var stale *WorktreeLeaseStaleError
+	return errors.As(err, &stale)
+}
+
+// WorktreeLeaseOwnerError reports a write or release by an agent that does not
+// hold the worktree.
+type WorktreeLeaseOwnerError struct {
+	WorktreeID string
+	OwnerID    string
+	Holder     string
+}
+
+func (e *WorktreeLeaseOwnerError) Error() string {
+	return fmt.Sprintf("worktree lease: %q is held by %q, not %q", e.WorktreeID, e.Holder, e.OwnerID)
+}
+
+// worktreeLeaseRecord is one held worktree. FencingToken is the store-wide
+// lease number, and ExpiresAt is the instant after which the record grants no
+// write right.
+type worktreeLeaseRecord struct {
+	worktreeID   string
+	ownerID      string
+	fencingToken uint64
+	expiresAt    time.Time
+}
+
+// worktreeLeaseStore holds one lease per worktree under a single lock. The
+// check-then-set of acquire and the token check of write run under that lock,
+// so two agents cannot hold one worktree and a stale token cannot slip through
+// a concurrent re-lease. nextToken is store-wide and strictly increasing; it
+// is separate from the task fencing counter of T3.51.
+type worktreeLeaseStore struct {
+	mu        sync.Mutex
+	byTree    map[string]worktreeLeaseRecord
+	nextToken uint64
+	clock     domain.Clock
+}
+
+func newWorktreeLeaseStore(clock domain.Clock) *worktreeLeaseStore {
+	if clock == nil {
+		clock = worktreeLeaseWallClock{}
+	}
+	return &worktreeLeaseStore{
+		byTree: make(map[string]worktreeLeaseRecord),
+		clock:  clock,
+	}
+}
+
+type worktreeLeaseWallClock struct{}
+
+func (worktreeLeaseWallClock) Now() time.Time { return time.Now() }
+
+// activeLease returns the live record for a worktree. An expired record is
+// removed on read, so an elapsed lease is treated as free. Callers hold the
+// store lock.
+func (s *worktreeLeaseStore) activeLease(worktreeID string) (worktreeLeaseRecord, error) {
+	rec, exists := s.byTree[worktreeID]
+	if !exists {
+		return rec, &WorktreeLeaseExpiredError{WorktreeID: worktreeID}
+	}
+	if !s.clock.Now().Before(rec.expiresAt) {
+		delete(s.byTree, worktreeID)
+		return rec, &WorktreeLeaseExpiredError{WorktreeID: worktreeID}
+	}
+	return rec, nil
+}
+
+// acquire leases a whole worktree to one owner for ttl. A live lease blocks a
+// second holder. An expired lease is replaced by a fresh one with a higher
+// token, so any token the previous owner kept becomes stale.
+func (s *worktreeLeaseStore) acquire(worktreeID, ownerID string, ttl time.Duration) (WorktreeLeaseOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := s.clock.Now()
+	if rec, exists := s.byTree[worktreeID]; exists && now.Before(rec.expiresAt) {
+		return WorktreeLeaseOutput{}, &WorktreeLeaseBusyError{
+			WorktreeID: worktreeID,
+			OwnerID:    rec.ownerID,
+			ExpiresAt:  rec.expiresAt,
+		}
+	}
+
+	s.nextToken++
+	rec := worktreeLeaseRecord{
+		worktreeID:   worktreeID,
+		ownerID:      ownerID,
+		fencingToken: s.nextToken,
+		expiresAt:    now.Add(ttl),
+	}
+	s.byTree[worktreeID] = rec
+	return WorktreeLeaseOutput{
+		WorktreeID:   rec.worktreeID,
+		OwnerID:      rec.ownerID,
+		FencingToken: rec.fencingToken,
+		ExpiresAt:    rec.expiresAt,
+	}, nil
+}
+
+// write accepts a result only while the caller's lease is live, its token is
+// the one the worktree holds, and its owner matches. An expired lease or a
+// stale token leaves every record the caller cannot change untouched.
+func (s *worktreeLeaseStore) write(worktreeID, ownerID string, token uint64) (WorktreeWriteOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.activeLease(worktreeID)
+	if err != nil {
+		return WorktreeWriteOutput{}, err
+	}
+	if token != rec.fencingToken {
+		return WorktreeWriteOutput{}, &WorktreeLeaseStaleError{Presented: token, Current: rec.fencingToken}
+	}
+	if ownerID != rec.ownerID {
+		return WorktreeWriteOutput{}, &WorktreeLeaseOwnerError{
+			WorktreeID: worktreeID,
+			OwnerID:    ownerID,
+			Holder:     rec.ownerID,
+		}
+	}
+	return WorktreeWriteOutput{WorktreeID: worktreeID, OwnerID: ownerID, FencingToken: token}, nil
+}
+
+// release frees a live lease held by the named owner with the current token.
+// A late release of an elapsed lease is refused because that lease is already
+// free.
+func (s *worktreeLeaseStore) release(worktreeID, ownerID string, token uint64) (WorktreeReleaseOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.activeLease(worktreeID)
+	if err != nil {
+		return WorktreeReleaseOutput{}, err
+	}
+	if token != rec.fencingToken {
+		return WorktreeReleaseOutput{}, &WorktreeLeaseStaleError{Presented: token, Current: rec.fencingToken}
+	}
+	if ownerID != rec.ownerID {
+		return WorktreeReleaseOutput{}, &WorktreeLeaseOwnerError{
+			WorktreeID: worktreeID,
+			OwnerID:    ownerID,
+			Holder:     rec.ownerID,
+		}
+	}
+	delete(s.byTree, worktreeID)
+	return WorktreeReleaseOutput{WorktreeID: worktreeID, OwnerID: ownerID}, nil
+}
+
+// WorktreeLeaseHandler serves the worktree lease tools over one lease store.
+// It performs no I/O of its own beyond the in-memory lock.
+type WorktreeLeaseHandler struct {
+	store *worktreeLeaseStore
+}
+
+// NewWorktreeLeaseHandler builds a handler with a fresh, empty lease store. A
+// nil clock falls back to wall time.
+func NewWorktreeLeaseHandler(clock domain.Clock) *WorktreeLeaseHandler {
+	return &WorktreeLeaseHandler{store: newWorktreeLeaseStore(clock)}
+}
+
+// HandleAcquire adapts Acquire to the go-sdk typed tool handler signature.
+func (h *WorktreeLeaseHandler) HandleAcquire(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeLeaseInput) (*mcpsdk.CallToolResult, WorktreeLeaseOutput, error) {
+	out, err := h.Acquire(ctx, in)
+	if err != nil {
+		return nil, WorktreeLeaseOutput{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// HandleWrite adapts Write to the go-sdk typed tool handler signature.
+func (h *WorktreeLeaseHandler) HandleWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeWriteInput) (*mcpsdk.CallToolResult, WorktreeWriteOutput, error) {
+	out, err := h.Write(ctx, in)
+	if err != nil {
+		return nil, WorktreeWriteOutput{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// HandleRelease adapts Release to the go-sdk typed tool handler signature.
+func (h *WorktreeLeaseHandler) HandleRelease(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeReleaseInput) (*mcpsdk.CallToolResult, WorktreeReleaseOutput, error) {
+	out, err := h.Release(ctx, in)
+	if err != nil {
+		return nil, WorktreeReleaseOutput{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// Acquire validates the request at the boundary, then leases the whole
+// worktree for the requested lifetime.
+func (h *WorktreeLeaseHandler) Acquire(_ context.Context, in WorktreeLeaseInput) (WorktreeLeaseOutput, error) {
+	if in.WorktreeID == "" || in.OwnerID == "" || in.TTLSeconds <= 0 {
+		return WorktreeLeaseOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"worktree lease: worktreeID, ownerID and a positive ttlSeconds are required")
+	}
+	if h == nil || h.store == nil {
+		return WorktreeLeaseOutput{}, domain.NewAppError(domain.CodePersistFailed, "worktree lease: no lease store configured")
+	}
+	return h.store.acquire(in.WorktreeID, in.OwnerID, time.Duration(in.TTLSeconds)*time.Second)
+}
+
+// Write validates the request at the boundary, then records a write only when
+// the lease is live and the caller presents its current token.
+func (h *WorktreeLeaseHandler) Write(_ context.Context, in WorktreeWriteInput) (WorktreeWriteOutput, error) {
+	if in.WorktreeID == "" || in.OwnerID == "" || in.FencingToken == 0 {
+		return WorktreeWriteOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"worktree lease: worktreeID, ownerID and fencingToken are required")
+	}
+	if h == nil || h.store == nil {
+		return WorktreeWriteOutput{}, domain.NewAppError(domain.CodePersistFailed, "worktree lease: no lease store configured")
+	}
+	return h.store.write(in.WorktreeID, in.OwnerID, in.FencingToken)
+}
+
+// Release validates the request at the boundary, then frees the lease held by
+// the named owner with the current token.
+func (h *WorktreeLeaseHandler) Release(_ context.Context, in WorktreeReleaseInput) (WorktreeReleaseOutput, error) {
+	if in.WorktreeID == "" || in.OwnerID == "" || in.FencingToken == 0 {
+		return WorktreeReleaseOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"worktree lease: worktreeID, ownerID and fencingToken are required")
+	}
+	if h == nil || h.store == nil {
+		return WorktreeReleaseOutput{}, domain.NewAppError(domain.CodePersistFailed, "worktree lease: no lease store configured")
+	}
+	return h.store.release(in.WorktreeID, in.OwnerID, in.FencingToken)
+}
+
+// AttachWorktreeLease registers the three lease tools on a server. NewServer
+// does not call it; repeating the attach leaves one of each tool.
+func AttachWorktreeLease(server *mcpsdk.Server, handler *WorktreeLeaseHandler) {
+	if server == nil || handler == nil {
+		return
+	}
+	no := false
+	server.RemoveTools(LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName)
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        LeaseWorktreeToolName,
+		Description: "Lease a whole worktree to one owner for a TTL in seconds. The lease returns a fencing token and an expiry. A second owner is refused until the TTL ends or the owner releases it.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  false,
+		},
+	}, handler.HandleAcquire)
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        WriteWorktreeToolName,
+		Description: "Record a result written into a leased worktree. The lease must still be live and the fencing token must be the one the worktree holds. A stale token from an expired or replaced lease is refused.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  false,
+		},
+	}, handler.HandleWrite)
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        ReleaseWorktreeToolName,
+		Description: "Explicitly release a live worktree lease before its TTL ends. Only the owner holding the current fencing token can release it.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
