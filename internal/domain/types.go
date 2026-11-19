@@ -144,21 +144,30 @@ type Pointer struct {
 	Revision     uint64 `json:"revision"`
 }
 
-// Handoff is the structured transfer passed from one agent to a successor. It
-// carries the five mandatory fields from ADR 0032 §1 so the successor reads a
-// fixed contract instead of the whole chat history. Every field is required:
-// Validate reports the first one that is empty.
+// Handoff is the structured transfer passed from one agent to a successor. The
+// five fields from ADR 0032 §1 (T3.25) stay mandatory so the successor reads a
+// fixed contract instead of the whole chat history. ADR 0046 §5 adds three
+// continuation sections: MustNotRedo names actions the successor must not
+// repeat, MustPreserve names state it must keep, and WorkingSet bounds the
+// files and facts needed to continue. The sections sit on top of the five
+// fields and never replace them.
 type Handoff struct {
 	Intent           string `json:"intent"`
 	Evidence         string `json:"evidence"`
 	PatchPlan        string `json:"patch_plan"`
 	VerificationPlan string `json:"verification_plan"`
 	RiskNotes        string `json:"risk_notes"`
+	MustNotRedo      string `json:"must_not_redo"`
+	MustPreserve     string `json:"must_preserve"`
+	WorkingSet       string `json:"working_set"`
 }
 
-// Validate reports whether all five handoff fields are filled. It returns an
-// INVALID_INPUT AppError naming the first empty field, or nil when the handoff
-// is complete and the successor has everything it needs.
+// Validate reports whether the handoff is complete. The five T3.25 fields are
+// always required. The three ADR 0046 §5 sections follow an all-or-nothing
+// rule: a legacy five-field packet declares none of them and stays valid, so
+// callers built before T3.107 keep working; a continuation packet that fills
+// at least one section must fill all three. Validate returns an INVALID_INPUT
+// AppError naming the first empty field.
 func (h Handoff) Validate() error {
 	for _, field := range []struct{ name, value string }{
 		{"intent", h.Intent},
@@ -169,6 +178,25 @@ func (h Handoff) Validate() error {
 	} {
 		if strings.TrimSpace(field.value) == "" {
 			return NewAppError(CodeInvalidInput, fmt.Sprintf("handoff: пустое поле %s", field.name))
+		}
+	}
+
+	sections := []struct{ name, value string }{
+		{"must_not_redo", h.MustNotRedo},
+		{"must_preserve", h.MustPreserve},
+		{"working_set", h.WorkingSet},
+	}
+	declared := 0
+	for _, section := range sections {
+		if strings.TrimSpace(section.value) != "" {
+			declared++
+		}
+	}
+	if declared > 0 && declared < len(sections) {
+		for _, section := range sections {
+			if strings.TrimSpace(section.value) == "" {
+				return NewAppError(CodeInvalidInput, fmt.Sprintf("handoff: пустое поле %s", section.name))
+			}
 		}
 	}
 	return nil
