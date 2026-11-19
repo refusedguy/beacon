@@ -22,6 +22,10 @@
 // journal. The long-poll timeout stays a private case and never cancels a tree.
 // Capability matching from T3.47 is unchanged.
 //
+// On entry to the long-poll a wait passes through the process-wide shared CI
+// gate (ADR 0037 p3). Callers waiting on the same repo/PR/headSHA run the
+// expensive CI wait once instead of starting one timer each.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -32,12 +36,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 const (
@@ -512,6 +518,7 @@ type WaitResultService struct {
 	departures  func(*mcpsdk.CallToolRequest) CallerExit
 	idempotency WaitResultIdempotencyStore
 	capability  func(*mcpsdk.CallToolRequest) *CapabilityContext
+	ciWait      store.SharedGateWait
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -529,8 +536,14 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		clock:       clock,
 		after:       time.After,
 		idempotency: NewMemoryWaitResultIdempotency(),
+		ciWait:      sharedCIWaitNoop,
 	}
 }
+
+// sharedCIWaitNoop is the default expensive CI wait. A caller with no shared
+// CI work keeps the original wait behaviour; a composition root supplies the
+// real operation through SetCIWait so the shared gate runs it once per CI.
+func sharedCIWaitNoop(context.Context) error { return nil }
 
 // SetIdempotencyStore replaces the result store. A nil argument disables
 // idempotency, which is useful for a caller that manages keys itself.
@@ -557,6 +570,27 @@ func (s *WaitResultService) SetCapabilityScope(fn func(*mcpsdk.CallToolRequest) 
 	if s != nil {
 		s.capability = fn
 	}
+}
+
+// SetCIWait replaces the expensive operation that wait runs through the shared
+// CI gate (ADR 0037 p3). The gate keys on the Watch's repo/PR/headSHA, so all
+// callers waiting on one CI perform the operation once. A nil argument
+// restores the no-op default.
+func (s *WaitResultService) SetCIWait(fn store.SharedGateWait) {
+	if s == nil {
+		return
+	}
+	if fn == nil {
+		fn = sharedCIWaitNoop
+	}
+	s.ciWait = fn
+}
+
+// sharedCIWaitKey is the gate key for one CI head. The subscriber's identity is
+// deliberately absent: renaming a session must not split one CI into several
+// gates (ADR 0037 p3).
+func sharedCIWaitKey(w domain.Watch) string {
+	return fmt.Sprintf("ci:%s/%d/%s", w.Repo, w.PR, w.HeadSHA)
 }
 
 type waitResultWallClock struct{}
@@ -683,6 +717,17 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 			return WaitResultOutput{}, domain.NewAppError(domain.CodeCancelled, "wait_result: watch was cancelled")
 		}
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeGone, "wait_result: watch is closed")
+	}
+
+	// ADR 0037 p3: the expensive CI wait runs once for every caller waiting on
+	// this repo/PR/headSHA. The gate shares the outcome, and each caller then
+	// runs its own long-poll loop and writes only its own obligation.
+	fn := s.ciWait
+	if fn == nil {
+		fn = sharedCIWaitNoop
+	}
+	if err := store.SharedCIWait(ctx, sharedCIWaitKey(w), fn); err != nil {
+		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, "wait_result: shared CI wait failed: "+err.Error())
 	}
 
 	var sub VerdictSubscription
