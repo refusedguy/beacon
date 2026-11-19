@@ -236,29 +236,3 @@ func countSubscriberWatches(watches []Watch, subscriberID string) int {
 	}
 	return n
 }
-
-// cloneWatch copies the mutable parts of a Watch. Only Subscribers are written
-// by Subscribe, but the maps are copied too so callers cannot mutate the store
-// through the returned value.
-func cloneWatch(w Watch) Watch {
-	c := w
-	if w.Subscribers != nil {
-		c.Subscribers = append([]Subscriber(nil), w.Subscribers...)
-	}
-	if w.Checks != nil {
-		c.Checks = make(map[string]Check, len(w.Checks))
-		for k, v := range w.Checks {
-			c.Checks[k] = v
-		}
-	}
-	if w.Flaky.Names != nil {
-		c.Flaky.Names = append([]string(nil), w.Flaky.Names...)
-	}
-	if w.Flaky.Used != nil {
-		c.Flaky.Used = make(map[string]int, len(w.Flaky.Used))
-		for k, v := range w.Flaky.Used {
-			c.Flaky.Used[k] = v
-		}
-	}
-	return c
-}
