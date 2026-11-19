@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -1423,6 +1424,28 @@ func (s *Service) ciHealingPath() string {
 	return filepath.Join(s.Cfg.StateDir, "ci-healing.json")
 }
 
+// Замок состояния healing отделён от общего замка карточек. Общий замок
+// удаляет файл по эвристике stale после чтения; между чтением и удалением
+// другой воркер успевает создать новый файл, и двое входят в критическую
+// секцию одновременно. Для потолка это даёт два одобренных запуска сверх
+// лимита. Flock держит блокировку на открытом дескрипторе, ядро снимает её
+// при завершении процесса, поэтому эвристики и гонки удаления не нужны.
+func (s *Service) lockHealing() (func(), error) {
+	path := filepath.Join(s.Cfg.StateDir, "ci-healing.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, taskstore.Startupf("не открыт замок healing: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, taskstore.Startupf("не взят замок healing: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
 func (s *Service) loadHealingState() (ciHealingState, error) {
 	data, err := os.ReadFile(s.ciHealingPath())
 	if os.IsNotExist(err) {
@@ -1508,11 +1531,11 @@ func (s *Service) DecideHealing(taskID string, f CheckFailure, now time.Time) (H
 	class := ClassifyCheck(f)
 	decision := HealingDecision{Class: class, CapLimit: HourlyLaunchCap}
 
-	lock, err := taskstore.AcquireLock(taskstore.LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
+	unlock, err := s.lockHealing()
 	if err != nil {
 		return HealingDecision{}, err
 	}
-	defer lock.Release()
+	defer unlock()
 
 	st, err := s.loadHealingState()
 	if err != nil {
