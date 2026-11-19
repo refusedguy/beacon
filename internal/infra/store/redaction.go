@@ -1,0 +1,223 @@
+// Package store: redaction and journal schema versioning.
+//
+// ADR 0012 asks that every write into state pass through one redaction filter
+// and that each journal row carry a schema version. ADR 0015 moves the journal
+// into SQLite. This file owns that single filter and the journal write path:
+// RedactingWriter wraps the one writer from T1.7, removes secrets from a
+// payload, stamps the current schema version and inserts one event row.
+// Reads select a decoder by the row version, so a row from an older corpus
+// fixture stays readable.
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"time"
+)
+
+// redacted is the marker written in place of a secret. It is deliberately
+// distinct from any real credential so tests can assert its presence.
+const redacted = "[REDACTED]"
+
+var (
+	// githubTokenRE matches classic tokens (ghp_, gho_, ghu_, ghs_, ghr_) and
+	// fine-grained personal access tokens (github_pat_).
+	githubTokenRE = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
+
+	// authHeaderRE matches an Authorization header and its credential, keeping
+	// the header name and dropping the scheme plus value.
+	authHeaderRE = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
+
+	// urlCredsRE matches the user:password part of a URL with a scheme, leaving
+	// the host and path intact.
+	urlCredsRE = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
+)
+
+// Redact removes GitHub tokens, Authorization credentials and URL credentials
+// from src. It never mutates src and is safe to call on arbitrary payload
+// bytes or on a log line before the line leaves the process.
+func Redact(src []byte) []byte {
+	if len(src) == 0 {
+		return append([]byte(nil), src...)
+	}
+	out := githubTokenRE.ReplaceAll(src, []byte(redacted))
+	out = authHeaderRE.ReplaceAll(out, []byte("${1}"+redacted))
+	out = urlCredsRE.ReplaceAll(out, []byte("${1}"+redacted+"@"))
+	return out
+}
+
+// Writer is the single writer owned by T1.7. The concrete *DB.Write method
+// satisfies it. RedactingWriter never opens its own connection: it delegates
+// every insert to this writer.
+type Writer interface {
+	Write(ctx context.Context, fn func(*sql.Tx) error) error
+}
+
+// RedactingWriter is the only path for journal writes. It redacts the payload
+// and stamps the schema version before handing the insert to the wrapped
+// writer, so no journal row can bypass the filter.
+type RedactingWriter struct {
+	writer  Writer
+	version int
+}
+
+// NewRedactingWriter wraps w and stamps rows with schemaVersion. It rejects a
+// nil writer or a non-positive version: a row without a valid version has no
+// decoder.
+func NewRedactingWriter(w Writer, schemaVersion int) (*RedactingWriter, error) {
+	if w == nil {
+		return nil, fmt.Errorf("store: redacting writer: nil writer")
+	}
+	if schemaVersion <= 0 {
+		return nil, fmt.Errorf("store: redacting writer: bad schema version %d", schemaVersion)
+	}
+	return &RedactingWriter{writer: w, version: schemaVersion}, nil
+}
+
+// Version returns the schema version stamped on new rows.
+func (rw *RedactingWriter) Version() int { return rw.version }
+
+// WriteEvent redacts payload, stamps the schema version and inserts one event
+// row through the single writer. ADR 0015 keeps the journal in SQLite, and the
+// events.schema_version column selects the decoder on read.
+func (rw *RedactingWriter) WriteEvent(ctx context.Context, watchID string, payload []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	clean := Redact(payload)
+	return rw.writer.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO events (watch_id, schema_version, payload, created_at)
+			VALUES (?, ?, ?, ?)`,
+			watchID, rw.version, clean, time.Now().UnixNano())
+		return err
+	})
+}
+
+// Event is one raw journal row. SchemaVersion is the version written at insert
+// time; it, not the current store version, selects the decoder.
+type Event struct {
+	Seq           int64  `json:"seq"`
+	WatchID       string `json:"watchID"`
+	SchemaVersion int    `json:"schemaVersion"`
+	Payload       []byte `json:"payload"`
+}
+
+// DecodedEvent is the normalized form returned to readers. Kind is empty for
+// legacy rows that carried no event type.
+type DecodedEvent struct {
+	Seq           int64
+	WatchID       string
+	SchemaVersion int
+	Kind          string
+	Message       string
+}
+
+// decodeHandler turns one raw row into the normalized form.
+type decodeHandler func(Event) (DecodedEvent, error)
+
+// handlerForVersion maps a row schema version to exactly one decoder. Version
+// 1 is the pre-migration corpus format: a bare JSON string or a
+// {"message": ...} map. Version 2 and later use the current
+// {"kind": ..., "message": ...} format. Unknown versions have no handler.
+func handlerForVersion(version int) decodeHandler {
+	switch {
+	case version == 1:
+		return decodeLegacyV1
+	case version >= 2:
+		return decodeCurrent
+	default:
+		return nil
+	}
+}
+
+// DecodeEvent selects the handler by the row schema version. The row version,
+// not the current store version, decides how the payload is read.
+func DecodeEvent(row Event) (DecodedEvent, error) {
+	handler := handlerForVersion(row.SchemaVersion)
+	if handler == nil {
+		return DecodedEvent{}, fmt.Errorf(
+			"store: no decoder for event schema version %d", row.SchemaVersion)
+	}
+	return handler(row)
+}
+
+func decodeCurrent(row Event) (DecodedEvent, error) {
+	var p struct {
+		Kind    string `json:"kind"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(row.Payload, &p); err != nil {
+		return DecodedEvent{}, fmt.Errorf("decode event v%d: %w", row.SchemaVersion, err)
+	}
+	return DecodedEvent{
+		Seq:           row.Seq,
+		WatchID:       row.WatchID,
+		SchemaVersion: row.SchemaVersion,
+		Kind:          p.Kind,
+		Message:       p.Message,
+	}, nil
+}
+
+func decodeLegacyV1(row Event) (DecodedEvent, error) {
+	out := DecodedEvent{
+		Seq:           row.Seq,
+		WatchID:       row.WatchID,
+		SchemaVersion: row.SchemaVersion,
+		Kind:          "legacy",
+	}
+	var message string
+	if err := json.Unmarshal(row.Payload, &message); err == nil {
+		out.Message = message
+		return out, nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(row.Payload, &m); err != nil {
+		return DecodedEvent{}, fmt.Errorf("decode legacy v1 event: %w", err)
+	}
+	for _, key := range []string{"message", "msg"} {
+		if raw, ok := m[key]; ok {
+			if err := json.Unmarshal(raw, &out.Message); err != nil {
+				return DecodedEvent{}, fmt.Errorf("decode legacy v1 field %s: %w", key, err)
+			}
+			break
+		}
+	}
+	return out, nil
+}
+
+// Querier is the read side used by ReadEvents. Both *sql.DB and *sql.Conn
+// satisfy it.
+type Querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// ReadEvents loads and decodes all journal rows for a watch, oldest first.
+// The row version, not the store version, decides how each row is decoded, so
+// a corpus of old fixtures reads next to current rows without error.
+func ReadEvents(ctx context.Context, q Querier, watchID string) ([]DecodedEvent, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT seq, watch_id, schema_version, payload FROM events
+		WHERE watch_id = ? ORDER BY seq`, watchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []DecodedEvent
+	for rows.Next() {
+		var row Event
+		if err := rows.Scan(&row.Seq, &row.WatchID, &row.SchemaVersion, &row.Payload); err != nil {
+			return nil, err
+		}
+		decoded, err := DecodeEvent(row)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, decoded)
+	}
+	return out, rows.Err()
+}
