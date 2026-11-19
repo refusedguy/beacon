@@ -70,3 +70,4 @@
 | 0056 | Шесть фич из отчёта AN-wave | accepted |
 | 0057 | Шесть фич из отчёта AO-wave | accepted |
 | 0058 | Шесть фич из отчёта AP-wave | accepted |
+| 0059 | Шесть фич из отчёта AQ-wave | accepted |
