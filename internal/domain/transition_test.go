@@ -205,7 +205,7 @@ func TestTransition(t *testing.T) {
 			if got.Revision != tc.wantRevision {
 				t.Errorf("revision: got %d, want %d", got.Revision, tc.wantRevision)
 			}
-			if got.CloseReason != tc.wantCloseReason {
+			if got.CloseReason != string(tc.wantCloseReason) {
 				t.Errorf("closeReason: got %q, want %q", got.CloseReason, tc.wantCloseReason)
 			}
 			if !got.ClosedAt.Equal(tc.wantClosedAt) {
@@ -265,7 +265,7 @@ func TestTransitionCancelNoEffects(t *testing.T) {
 		if len(effects) != 0 {
 			t.Errorf("cancel with verdict %q produced effects: %+v", v, effects)
 		}
-		if next.Status != StatusClosed || next.CloseReason != CloseReasonCancelled {
+		if next.Status != StatusClosed || next.CloseReason != string(CloseReasonCancelled) {
 			t.Errorf("cancel with verdict %q: status=%q reason=%q", v, next.Status, next.CloseReason)
 		}
 	}
