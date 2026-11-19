@@ -255,8 +255,8 @@ func TestImportReceiptsRejectsBadLines(t *testing.T) {
 	if result.Missing != 1 {
 		t.Errorf("missing = %d, want 1", result.Missing)
 	}
-	if result.Imported != 1 {
-		t.Errorf("imported = %d, want 1", result.Imported)
+	if result.Imported != 2 {
+		t.Errorf("imported = %d, want 2 (valid + missing obligation)", result.Imported)
 	}
 	count, err := d.ReceiptCount()
 	if err != nil {
