@@ -1,0 +1,283 @@
+package mcp
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/google/jsonschema-go/jsonschema"
+
+	"github.com/refusedguy/beacon/internal/domain"
+)
+
+func TestStatusForCode(t *testing.T) {
+	tests := []struct {
+		code   domain.ErrorCode
+		status int
+	}{
+		{domain.CodeInvalidInput, 400},
+		{domain.CodeWatchNotFound, 404},
+		{domain.CodeHeadSHAChanged, 409},
+		{domain.CodeRateLimited, 429},
+		{domain.CodeLimitExceeded, 429},
+		{domain.CodeCancelled, 410},
+		{domain.CodeGone, 410},
+		{domain.CodePersistFailed, 503},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.code), func(t *testing.T) {
+			if got := StatusForCode(tc.code); got != tc.status {
+				t.Errorf("StatusForCode(%s) = %d, want %d", tc.code, got, tc.status)
+			}
+		})
+	}
+	if got := StatusForCode(domain.ErrorCode("UNKNOWN")); got != 0 {
+		t.Errorf("StatusForCode(UNKNOWN) = %d, want 0", got)
+	}
+}
+
+func TestToErrorShapeAllCodes(t *testing.T) {
+	tests := []struct {
+		code   domain.ErrorCode
+		status int
+	}{
+		{domain.CodeInvalidInput, 400},
+		{domain.CodeWatchNotFound, 404},
+		{domain.CodeHeadSHAChanged, 409},
+		{domain.CodeRateLimited, 429},
+		{domain.CodeLimitExceeded, 429},
+		{domain.CodeCancelled, 410},
+		{domain.CodeGone, 410},
+		{domain.CodePersistFailed, 503},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.code), func(t *testing.T) {
+			shape, ok := ToErrorShape(domain.NewAppError(tc.code, "boom"))
+			if !ok {
+				t.Fatal("ToErrorShape returned false for an AppError")
+			}
+			if shape.OK {
+				t.Error("error shape must carry ok=false")
+			}
+			if shape.Code != tc.code {
+				t.Errorf("code = %q, want %q", shape.Code, tc.code)
+			}
+			if shape.Status != tc.status {
+				t.Errorf("status = %d, want %d", shape.Status, tc.status)
+			}
+			if shape.Message != "boom" {
+				t.Errorf("message = %q, want %q", shape.Message, "boom")
+			}
+		})
+	}
+}
+
+func TestToErrorShapeHeadSHAChangedCarriesNewWatchID(t *testing.T) {
+	appErr := &domain.AppError{
+		Code:       domain.CodeHeadSHAChanged,
+		Message:    "head moved",
+		Status:     409,
+		NewWatchID: "watch-new",
+	}
+	shape, ok := ToErrorShape(appErr)
+	if !ok {
+		t.Fatal("ToErrorShape returned false for an AppError")
+	}
+	if shape.NewWatchID != "watch-new" {
+		t.Errorf("newWatchID = %q, want %q", shape.NewWatchID, "watch-new")
+	}
+	if shape.Status != 409 {
+		t.Errorf("status = %d, want 409", shape.Status)
+	}
+}
+
+func TestToErrorShapeRateLimitedCarriesRetryAfterMs(t *testing.T) {
+	retry := int64(1500)
+	appErr := &domain.AppError{
+		Code:         domain.CodeRateLimited,
+		Message:      "secondary limit",
+		Status:       429,
+		RetryAfterMs: &retry,
+	}
+	shape, ok := ToErrorShape(appErr)
+	if !ok {
+		t.Fatal("ToErrorShape returned false for an AppError")
+	}
+	if shape.RetryAfterMs == nil || *shape.RetryAfterMs != retry {
+		t.Errorf("retryAfterMs = %v, want %d", shape.RetryAfterMs, retry)
+	}
+	if shape.Status != 429 {
+		t.Errorf("status = %d, want 429", shape.Status)
+	}
+}
+
+func TestToErrorShapeStatusComesFromCodeTable(t *testing.T) {
+	// The boundary table is authoritative even when an AppError carries a
+	// stale status field.
+	appErr := &domain.AppError{Code: domain.CodeGone, Message: "gone", Status: 500}
+	shape, ok := ToErrorShape(appErr)
+	if !ok {
+		t.Fatal("ToErrorShape returned false for an AppError")
+	}
+	if shape.Status != 410 {
+		t.Errorf("status = %d, want 410 from the code table", shape.Status)
+	}
+}
+
+func TestToErrorShapeWrappedAndPlainErrors(t *testing.T) {
+	wrapped := fmt.Errorf("tool boundary: %w", domain.NewAppError(domain.CodeInvalidInput, "bad input"))
+	shape, ok := ToErrorShape(wrapped)
+	if !ok || shape.Code != domain.CodeInvalidInput || shape.Status != 400 {
+		t.Fatalf("wrapped AppError = %+v, ok=%v", shape, ok)
+	}
+
+	if _, ok := ToErrorShape(errors.New("plain")); ok {
+		t.Error("plain error must not convert to an error shape")
+	}
+	if _, ok := ToErrorShape(nil); ok {
+		t.Error("nil error must not convert to an error shape")
+	}
+}
+
+func TestErrorShapeJSON(t *testing.T) {
+	retry := int64(250)
+	shape := ErrorShape{
+		OK:           false,
+		Code:         domain.CodeRateLimited,
+		Message:      "slow down",
+		Status:       429,
+		RetryAfterMs: &retry,
+		NewWatchID:   "watch-1",
+	}
+	data, err := json.Marshal(shape)
+	if err != nil {
+		t.Fatalf("marshal error shape: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("unmarshal error shape: %v", err)
+	}
+	want := []string{"ok", "code", "message", "status", "retryAfterMs", "newWatchID"}
+	if len(fields) != len(want) {
+		t.Errorf("field count = %d (%s), want %d", len(fields), string(data), len(want))
+	}
+	for _, key := range want {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("missing field %q in %s", key, data)
+		}
+	}
+	if fields["ok"] != false {
+		t.Errorf("ok = %v, want false", fields["ok"])
+	}
+
+	minimal, err := json.Marshal(ErrorShape{Code: domain.CodeGone, Message: "gone", Status: 410})
+	if err != nil {
+		t.Fatalf("marshal minimal error shape: %v", err)
+	}
+	var minimalFields map[string]any
+	if err := json.Unmarshal(minimal, &minimalFields); err != nil {
+		t.Fatalf("unmarshal minimal error shape: %v", err)
+	}
+	for _, key := range []string{"retryAfterMs", "newWatchID"} {
+		if _, ok := minimalFields[key]; ok {
+			t.Errorf("optional field %q must be omitted when empty: %s", key, minimal)
+		}
+	}
+}
+
+// jsonFieldNames reports the JSON property names of the exported fields of T.
+func jsonFieldNames[T any]() map[string]bool {
+	t := reflect.TypeFor[T]()
+	names := make(map[string]bool, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		name := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if name == "" {
+			name = t.Field(i).Name
+		}
+		if name != "-" {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+// assertSchemaFromType proves the schema was reflected from T: its properties
+// are exactly the JSON field names of T, and no literal JSON is involved.
+func assertSchemaFromType[T any](t *testing.T, schema *jsonschema.Schema) {
+	t.Helper()
+	if schema == nil {
+		t.Fatalf("nil schema for %T", *new(T))
+	}
+	if schema.Type != "object" {
+		t.Errorf("schema type = %q, want object for %T", schema.Type, *new(T))
+	}
+	want := jsonFieldNames[T]()
+	got := make(map[string]bool, len(schema.Properties))
+	for name := range schema.Properties {
+		got[name] = true
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("schema properties for %T = %v, want %v", *new(T), got, want)
+	}
+}
+
+func TestAllOutputSchemas(t *testing.T) {
+	schemas, err := AllOutputSchemas()
+	if err != nil {
+		t.Fatalf("AllOutputSchemas: %v", err)
+	}
+	wantTools := []string{
+		"beacon_watch_pr",
+		"beacon_wait_result",
+		"beacon_get_result",
+		"beacon_list_running",
+		"beacon_ack",
+		"beacon_cancel_watch",
+		"beacon_stats",
+	}
+	if len(schemas) != len(wantTools) {
+		t.Errorf("schema count = %d, want %d", len(schemas), len(wantTools))
+	}
+	for _, name := range wantTools {
+		if _, ok := schemas[name]; !ok {
+			t.Errorf("missing output schema for %s", name)
+		}
+	}
+
+	assertSchemaFromType[WatchPROutput](t, schemas["beacon_watch_pr"])
+	assertSchemaFromType[WaitResultOutput](t, schemas["beacon_wait_result"])
+	assertSchemaFromType[GetResultOutput](t, schemas["beacon_get_result"])
+	assertSchemaFromType[ListRunningOutput](t, schemas["beacon_list_running"])
+	assertSchemaFromType[OKOutput](t, schemas["beacon_ack"])
+	assertSchemaFromType[OKOutput](t, schemas["beacon_cancel_watch"])
+	assertSchemaFromType[StatsOutput](t, schemas["beacon_stats"])
+}
+
+func TestOutputSchemaHonorsJSONTags(t *testing.T) {
+	schema, err := OutputSchema[WaitResultOutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	required := make(map[string]bool, len(schema.Required))
+	for _, name := range schema.Required {
+		required[name] = true
+	}
+	for _, name := range []string{"status", "revision"} {
+		if !required[name] {
+			t.Errorf("%q must be a required property (no omitempty)", name)
+		}
+	}
+	for _, name := range []string{"verdict", "checks", "pollAfterMs"} {
+		if required[name] {
+			t.Errorf("%q must be optional (omitempty)", name)
+		}
+	}
+	for _, name := range []string{"status", "verdict", "revision", "checks", "pollAfterMs"} {
+		if _, ok := schema.Properties[name]; !ok {
+			t.Errorf("missing derived property %q", name)
+		}
+	}
+}
