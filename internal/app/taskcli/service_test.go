@@ -1229,3 +1229,224 @@ func TestDecideHealingConcurrentCapNeverExceeded(t *testing.T) {
 		t.Fatalf("итоговый расход=%d err=%v", spent, err)
 	}
 }
+
+func TestGlobMatchesReservationBoundaries(t *testing.T) {
+	cases := []struct {
+		glob, file string
+		want       bool
+	}{
+		{"internal/app/taskcli/service.go", "internal/app/taskcli/service.go", true},
+		{"internal/app/taskcli", "internal/app/taskcli/service.go", true},
+		{"internal/app/taskcli/", "internal/app/taskcli/service.go", true},
+		{"internal/app/taskcli/*.go", "internal/app/taskcli/service.go", true},
+		{"internal/app/taskcli/*.go", "internal/app/taskcli/sub/service.go", false},
+		{"internal/app/**/*.go", "internal/app/taskcli/service.go", true},
+		{"internal/app/**/*.go", "internal/app/service.go", true},
+		{"internal/app/**", "internal/app/taskcli/service.go", true},
+		{"*.md", "docs/tasks/T3.71.md", false},
+		{"docs/tasks/*.md", "docs/tasks/T3.71.md", true},
+		{"internal\\app\\taskcli\\*.go", "internal/app/taskcli/service.go", true},
+		{"internal/app/a.go", "internal/app/ab.go", false},
+	}
+	for _, tc := range cases {
+		if got := globMatches(tc.glob, tc.file); got != tc.want {
+			t.Errorf("globMatches(%q, %q)=%v, want %v", tc.glob, tc.file, got, tc.want)
+		}
+	}
+}
+
+func TestReserveFilesAndGuardBlocksOtherAgent(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := e.svc.ReserveFiles("agent-a", []string{"internal/app/taskcli/*.go"}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := e.svc.CheckCommit("agent-b", []string{"internal/app/taskcli/service.go"}, false, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Blocked || d.Allowed || d.Bypassed {
+		t.Fatalf("чужая аренда не заблокировала коммит: %+v", d)
+	}
+	if !reflect.DeepEqual(d.Files, []string{"internal/app/taskcli/service.go"}) || !reflect.DeepEqual(d.Owners, []string{"agent-a"}) {
+		t.Fatalf("неверные файлы или владельцы: %+v", d)
+	}
+
+	// Своя аренда коммит не блокирует.
+	d, err = e.svc.CheckCommit("agent-a", []string{"internal/app/taskcli/service.go"}, false, now)
+	if err != nil || d.Blocked || !d.Allowed {
+		t.Fatalf("своя аренда заблокировала коммит: %+v err=%v", d, err)
+	}
+
+	// Файл вне аренды не блокируется.
+	d, err = e.svc.CheckCommit("agent-b", []string{"internal/app/other/one.go"}, false, now)
+	if err != nil || d.Blocked || !d.Allowed {
+		t.Fatalf("посторонний файл заблокирован: %+v err=%v", d, err)
+	}
+
+	log, err := e.svc.ReservationLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) != 2 || log[0].Kind != ReservationAcquire || log[1].Kind != ReservationBlocked {
+		t.Fatalf("журнал аренды: %+v", log)
+	}
+	if log[1].Agent != "agent-b" || !reflect.DeepEqual(log[1].Owners, []string{"agent-a"}) {
+		t.Fatalf("запись блокировки: %+v", log[1])
+	}
+}
+
+func TestCheckCommitExplicitBypassIsLogged(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := e.svc.ReserveFiles("agent-a", []string{"docs/tasks/*.md"}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := e.svc.CheckCommit("agent-b", []string{"docs/tasks/T3.71.md"}, true, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Blocked || !d.Bypassed || !d.Allowed {
+		t.Fatalf("явный обход не пропустил коммит: %+v", d)
+	}
+	log, err := e.svc.ReservationLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) != 2 || log[1].Kind != ReservationBypass || log[1].Agent != "agent-b" {
+		t.Fatalf("обход не записан в журнал: %+v", log)
+	}
+	if !reflect.DeepEqual(log[1].Files, []string{"docs/tasks/T3.71.md"}) || !reflect.DeepEqual(log[1].Owners, []string{"agent-a"}) {
+		t.Fatalf("запись обхода: %+v", log[1])
+	}
+}
+
+func TestReleaseFilesRemovesReservationAndLogsIt(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	globs := []string{"internal/app/taskcli/*.go", "docs/tasks/*.md"}
+	if err := e.svc.ReserveFiles("agent-a", globs, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.ReleaseFiles("agent-a", now); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := e.svc.Reservations()
+	if err != nil || len(rs) != 0 {
+		t.Fatalf("аренда не снята: %+v err=%v", rs, err)
+	}
+	d, err := e.svc.CheckCommit("agent-b", []string{"internal/app/taskcli/service.go"}, false, now)
+	if err != nil || d.Blocked || !d.Allowed {
+		t.Fatalf("после снятия коммит заблокирован: %+v err=%v", d, err)
+	}
+	log, err := e.svc.ReservationLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) != 2 || log[1].Kind != ReservationRelease || log[1].Agent != "agent-a" {
+		t.Fatalf("снятие не записано: %+v", log)
+	}
+	if !reflect.DeepEqual(log[1].Globs, globs) {
+		t.Fatalf("в журнале сняты не те glob-ы: %+v", log[1])
+	}
+}
+
+func TestReservationsAreAdvisoryAndSharedAcrossServices(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := e.svc.ReserveFiles("agent-a", []string{"internal/app/one/*.go"}, now); err != nil {
+		t.Fatal(err)
+	}
+	// Вторая аренда того же агента заменяет первую, чужая остаётся.
+	if err := e.svc.ReserveFiles("agent-a", []string{"internal/app/two/*.go"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.ReserveFiles("agent-c", []string{"docs/adrs/*.md"}, now); err != nil {
+		t.Fatal(err)
+	}
+	other := NewService(e.cfg)
+	d, err := other.CheckCommit("agent-b", []string{"internal/app/one/service.go"}, false, now)
+	if err != nil || d.Blocked {
+		t.Fatalf("заменённая аренда всё ещё блокирует: %+v err=%v", d, err)
+	}
+	d, err = other.CheckCommit("agent-b", []string{"internal/app/two/service.go"}, false, now)
+	if err != nil || !d.Blocked || !reflect.DeepEqual(d.Owners, []string{"agent-a"}) {
+		t.Fatalf("общая аренда не видна второму сервису: %+v err=%v", d, err)
+	}
+	rs, err := other.Reservations()
+	if err != nil || len(rs) != 2 {
+		t.Fatalf("аренды: %+v err=%v", rs, err)
+	}
+}
+
+func TestReservationValidation(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	badReserve := []struct {
+		agent string
+		globs []string
+	}{
+		{"", []string{"internal/app/a.go"}},
+		{"agent-a", nil},
+		{"agent-a", []string{"  "}},
+		{"agent-a", []string{"internal/app/a.go", ""}},
+	}
+	for _, tc := range badReserve {
+		if err := e.svc.ReserveFiles(tc.agent, tc.globs, now); taskstore.Code(err) != 1 {
+			t.Errorf("ReserveFiles(%q, %v)=%v, ждали код 1", tc.agent, tc.globs, err)
+		}
+	}
+	if err := e.svc.ReserveFiles("agent-a", []string{"internal/app/a.go"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.ReleaseFiles("", now); taskstore.Code(err) != 1 {
+		t.Errorf("ReleaseFiles с пустым агентом=%v, ждали код 1", err)
+	}
+	if _, err := e.svc.CheckCommit("", []string{"internal/app/a.go"}, false, now); taskstore.Code(err) != 1 {
+		t.Errorf("CheckCommit с пустым агентом=%v, ждали код 1", err)
+	}
+	if _, err := e.svc.CheckCommit("agent-b", nil, false, now); taskstore.Code(err) != 1 {
+		t.Errorf("CheckCommit без файлов=%v, ждали код 1", err)
+	}
+	rs, err := e.svc.Reservations()
+	if err != nil || len(rs) != 1 {
+		t.Fatalf("неверные проверки изменили аренды: %+v err=%v", rs, err)
+	}
+}
+
+func TestConcurrentBypassesAreAllLogged(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := e.svc.ReserveFiles("agent-a", []string{"internal/app/one/*.go"}, now); err != nil {
+		t.Fatal(err)
+	}
+	const n = 12
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			_, err := e.svc.CheckCommit(fmt.Sprintf("agent-%d", i+2),
+				[]string{"internal/app/one/service.go"}, true, now)
+			errs <- err
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	log, err := e.svc.ReservationLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bypasses := 0
+	for _, entry := range log {
+		if entry.Kind == ReservationBypass {
+			bypasses++
+		}
+	}
+	if bypasses != n {
+		t.Fatalf("в журнале %d обходов, ждали %d", bypasses, n)
+	}
+}
