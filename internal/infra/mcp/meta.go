@@ -3,6 +3,7 @@ package mcp
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -170,4 +171,128 @@ func getStreamMeta(result *mcpsdk.CallToolResult, key string, out any) bool {
 		return false
 	}
 	return json.Unmarshal(b, out) == nil
+}
+
+// ---- ADR 0058 п1 / T3.128: двухуровневая шина сигнал и журнал ----
+
+// WakeSignal is the cheap level-1 notification. It carries only Head, the
+// journal position that changed, and never a message body. Its only job is to
+// wake a sleeping agent so it goes and reads the journal (ADR 0058 §1).
+type WakeSignal struct {
+	Head uint64 `json:"head"`
+}
+
+// JournalRecord is one level-2 entry. Seq is a gapless 1-based position, so it
+// is also the cursor value an agent saves and later presents on reconnect.
+// Payload is opaque to the bus: it is copied on write and on read, so neither
+// a producer nor a consumer can change a committed entry through a shared
+// slice.
+type JournalRecord struct {
+	Seq     uint64 `json:"seq"`
+	Payload []byte `json:"payload,omitempty"`
+}
+
+// DualLevelBus keeps the two levels of ADR 0058 §1 apart. Level 1 is the cheap
+// WakeSignal: it wakes an agent and carries a pointer only. Level 2 is the
+// append-only journal: it guarantees delivery. An agent saves the cursor of
+// the last record it processed and, after a reconnect, reads strictly after
+// that cursor, so a missed record is never lost and a committed record is
+// never delivered twice. The cursor lives with the journal, not in an MCP
+// status response as in ADR 0025: this is two levels with different roles, not
+// one status-and-cursor pair. The mutex serializes publish, read and cursor
+// commit so positions stay gapless and a cursor cannot move backwards under
+// concurrent calls in one process.
+type DualLevelBus struct {
+	mu      sync.Mutex
+	journal []JournalRecord
+	cursors map[string]uint64
+}
+
+// NewDualLevelBus builds an empty two-level bus.
+func NewDualLevelBus() *DualLevelBus {
+	return &DualLevelBus{cursors: make(map[string]uint64)}
+}
+
+// Publish appends payload to the journal and returns the cheap wake signal
+// carrying the new Head. The signal never contains payload: the message is
+// delivered only through ReadAfter.
+func (b *DualLevelBus) Publish(payload []byte) WakeSignal {
+	if b == nil {
+		return WakeSignal{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.journal = append(b.journal, JournalRecord{
+		Seq:     uint64(len(b.journal)) + 1,
+		Payload: append([]byte(nil), payload...),
+	})
+	return WakeSignal{Head: uint64(len(b.journal))}
+}
+
+// Head returns the newest committed journal position.
+func (b *DualLevelBus) Head() uint64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return uint64(len(b.journal))
+}
+
+// ReadAfter returns the journal records with Seq greater than cursor, in
+// ascending order. This is the level-2 delivery path: the caller passes the
+// cursor it saved before the disconnect. Records at or below the cursor are
+// never returned, so a reconnect cannot redeliver them; every record above it
+// is returned, so none is lost. Neither the journal nor any saved cursor is
+// changed by a read: the agent commits its cursor only after it processes the
+// records.
+func (b *DualLevelBus) ReadAfter(cursor uint64) []JournalRecord {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if cursor >= uint64(len(b.journal)) {
+		return nil
+	}
+	out := make([]JournalRecord, 0, uint64(len(b.journal))-cursor)
+	for _, rec := range b.journal[cursor:] {
+		out = append(out, JournalRecord{Seq: rec.Seq, Payload: append([]byte(nil), rec.Payload...)})
+	}
+	return out
+}
+
+// Cursor returns the cursor saved for subscriber. Zero means the subscriber
+// has not committed any record yet and will read the journal from its start.
+func (b *DualLevelBus) Cursor(subscriber string) uint64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cursors[subscriber]
+}
+
+// CommitCursor saves seq as the last record subscriber processed and returns
+// the effective saved cursor. It is monotonic: an older cursor cannot move the
+// position back and redeliver records, and a cursor past Head is clamped to
+// Head. Committing is what makes a delivered record stay delivered once across
+// a reconnect.
+func (b *DualLevelBus) CommitCursor(subscriber string, seq uint64) uint64 {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.cursors == nil {
+		b.cursors = make(map[string]uint64)
+	}
+	head := uint64(len(b.journal))
+	if seq > head {
+		seq = head
+	}
+	if seq > b.cursors[subscriber] {
+		b.cursors[subscriber] = seq
+	}
+	return b.cursors[subscriber]
 }
