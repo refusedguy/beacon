@@ -918,3 +918,306 @@ func AttachWorktreeLease(server *mcpsdk.Server, handler *WorktreeLeaseHandler) {
 		},
 	}, handler.HandleRelease)
 }
+
+// ADR 0049 p6 adds a holder lease over a reclaimable resource: an agent or a
+// worktree. Its two facts are the list of holders and the monotonic extension
+// rule. A short extend never moves the deadline earlier than the one already
+// granted, and the holder list survives every extend. It is a reclaim protocol,
+// not a second TTL-and-fencing lease: the worktree lease of T3.97 and its
+// fencing token are unchanged, and the holder lease has no write boundary of
+// its own. Install and Holders are daemon-side reclaim decisions; only Extend
+// is exposed as a tool, because an agent extends the lease it holds.
+
+// ExtendHolderLeaseToolName registers the holder-side extend call. It stays out
+// of ToolNames, like the other optional claim and lease tools.
+const ExtendHolderLeaseToolName = "beacon_extend_holder_lease"
+
+// HolderLeaseInput installs a holder lease on an agent or worktree resource.
+// Holders is the full list of agents that hold it. TTLSeconds is the deadline
+// granted at install; later extends may never shorten that grant.
+type HolderLeaseInput struct {
+	ResourceID string   `json:"resourceID" jsonschema:"identifier of the agent or worktree resource being leased"`
+	Holders    []string `json:"holders" jsonschema:"agents that hold the resource"`
+	TTLSeconds int64    `json:"ttlSeconds" jsonschema:"granted lifetime in seconds that later extends may not shorten"`
+}
+
+// HolderLeaseOutput is the lease installed. Holders is the stored list in its
+// original order and ExpiresAt is the deadline the extension rule protects.
+type HolderLeaseOutput struct {
+	ResourceID string    `json:"resourceID"`
+	Holders    []string  `json:"holders"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+}
+
+// HolderLeaseExtendInput asks to extend a live holder lease. HolderID must be
+// one of the lease's holders. TTLSeconds is the requested lifetime measured
+// from now; the new deadline is the later of the current one and now plus this
+// value, so a short request leaves the granted deadline intact.
+type HolderLeaseExtendInput struct {
+	ResourceID string `json:"resourceID" jsonschema:"identifier of the leased resource"`
+	HolderID   string `json:"holderID" jsonschema:"one of the holders asking for the extension"`
+	TTLSeconds int64  `json:"ttlSeconds" jsonschema:"requested lifetime in seconds; a short request never shortens the granted deadline"`
+}
+
+// HolderLeaseExtendOutput reports the deadline after the extension and whether
+// it moved. Holders is the unchanged holder list carried by the lease.
+type HolderLeaseExtendOutput struct {
+	ResourceID string    `json:"resourceID"`
+	Holders    []string  `json:"holders"`
+	ExpiresAt  time.Time `json:"expiresAt"`
+	Extended   bool      `json:"extended"`
+}
+
+// HolderLeaseHoldersInput names the resource whose holders are inspected for a
+// reclaim decision.
+type HolderLeaseHoldersInput struct {
+	ResourceID string `json:"resourceID" jsonschema:"identifier of the leased resource"`
+}
+
+// HolderLeaseHoldersOutput is the holder list of a live lease.
+type HolderLeaseHoldersOutput struct {
+	ResourceID string   `json:"resourceID"`
+	Holders    []string `json:"holders"`
+}
+
+// HolderLeaseNotFoundError reports an extend or inspection of a resource with
+// no live holder lease. An elapsed lease is no longer extendable: the resource
+// must be installed again for reclaim.
+type HolderLeaseNotFoundError struct {
+	ResourceID string
+}
+
+func (e *HolderLeaseNotFoundError) Error() string {
+	return fmt.Sprintf("holder lease: %q has no live lease", e.ResourceID)
+}
+
+// IsHolderLeaseNotFound reports whether err is a missing-or-expired lease.
+func IsHolderLeaseNotFound(err error) bool {
+	var missing *HolderLeaseNotFoundError
+	return errors.As(err, &missing)
+}
+
+// HolderLeaseNotHolderError reports an extension requested by an agent that is
+// not in the lease's holder list.
+type HolderLeaseNotHolderError struct {
+	ResourceID string
+	HolderID   string
+}
+
+func (e *HolderLeaseNotHolderError) Error() string {
+	return fmt.Sprintf("holder lease: %q is not a holder of %q", e.HolderID, e.ResourceID)
+}
+
+// IsHolderLeaseNotHolder reports whether err is a non-holder rejection.
+func IsHolderLeaseNotHolder(err error) bool {
+	var notHolder *HolderLeaseNotHolderError
+	return errors.As(err, &notHolder)
+}
+
+// holderLeaseRecord is one live holder lease. Holders is a private copy of the
+// installed list and ExpiresAt is the deadline the monotonic rule protects.
+type holderLeaseRecord struct {
+	holders   []string
+	expiresAt time.Time
+}
+
+// holderLeaseStore holds one holder lease per resource under a single lock. The
+// active read and the extend write share that lock, so two concurrent short
+// extends cannot race past each other and move the deadline backwards. It is
+// separate from the T3.97 worktree lease store: neither record nor token from
+// that lease appears here.
+type holderLeaseStore struct {
+	mu         sync.Mutex
+	byResource map[string]holderLeaseRecord
+	clock      domain.Clock
+}
+
+func newHolderLeaseStore(clock domain.Clock) *holderLeaseStore {
+	if clock == nil {
+		clock = worktreeLeaseWallClock{}
+	}
+	return &holderLeaseStore{
+		byResource: make(map[string]holderLeaseRecord),
+		clock:      clock,
+	}
+}
+
+// activeHolderLease returns the live record for a resource. An expired record
+// is removed on read, so an elapsed holder lease is reclaimable from scratch.
+// Callers hold the store lock.
+func (s *holderLeaseStore) activeHolderLease(resourceID string) (holderLeaseRecord, error) {
+	rec, exists := s.byResource[resourceID]
+	if !exists {
+		return rec, &HolderLeaseNotFoundError{ResourceID: resourceID}
+	}
+	if !s.clock.Now().Before(rec.expiresAt) {
+		delete(s.byResource, resourceID)
+		return rec, &HolderLeaseNotFoundError{ResourceID: resourceID}
+	}
+	return rec, nil
+}
+
+// isHolder reports whether holderID names one of the record's holders.
+func isHolder(holders []string, holderID string) bool {
+	for _, holder := range holders {
+		if holder == holderID {
+			return true
+		}
+	}
+	return false
+}
+
+// cloneHolders copies a holder list so callers cannot mutate the stored lease.
+func cloneHolders(holders []string) []string {
+	return append([]string(nil), holders...)
+}
+
+// install places a holder lease on a resource for ttl. The holders are copied
+// into the record and the deadline is fixed here; later extends can only keep
+// it or move it later, never earlier. A live lease is replaced so the resource
+// can be reclaimed with a fresh holder set.
+func (s *holderLeaseStore) install(resourceID string, holders []string, ttl time.Duration) HolderLeaseOutput {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec := holderLeaseRecord{
+		holders:   cloneHolders(holders),
+		expiresAt: s.clock.Now().Add(ttl),
+	}
+	s.byResource[resourceID] = rec
+	return HolderLeaseOutput{
+		ResourceID: resourceID,
+		Holders:    cloneHolders(rec.holders),
+		ExpiresAt:  rec.expiresAt,
+	}
+}
+
+// extend applies the ADR 0049 p6 monotonic rule. Only a listed holder may
+// extend. The candidate deadline is now plus ttl; the stored deadline becomes
+// the later of the candidate and the one already granted, so a short extension
+// cannot cut the term short. The holder list is never changed by an extend.
+func (s *holderLeaseStore) extend(resourceID, holderID string, ttl time.Duration) (HolderLeaseExtendOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.activeHolderLease(resourceID)
+	if err != nil {
+		return HolderLeaseExtendOutput{}, err
+	}
+	if !isHolder(rec.holders, holderID) {
+		return HolderLeaseExtendOutput{}, &HolderLeaseNotHolderError{ResourceID: resourceID, HolderID: holderID}
+	}
+
+	candidate := s.clock.Now().Add(ttl)
+	extended := candidate.After(rec.expiresAt)
+	if extended {
+		rec.expiresAt = candidate
+		s.byResource[resourceID] = rec
+	}
+	return HolderLeaseExtendOutput{
+		ResourceID: resourceID,
+		Holders:    cloneHolders(rec.holders),
+		ExpiresAt:  rec.expiresAt,
+		Extended:   extended,
+	}, nil
+}
+
+// holdersOf returns a copy of the holder list of a live lease. Reclaim uses it
+// to see who currently owns the resource before installing a fresh lease.
+func (s *holderLeaseStore) holdersOf(resourceID string) (HolderLeaseHoldersOutput, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, err := s.activeHolderLease(resourceID)
+	if err != nil {
+		return HolderLeaseHoldersOutput{}, err
+	}
+	return HolderLeaseHoldersOutput{ResourceID: resourceID, Holders: cloneHolders(rec.holders)}, nil
+}
+
+// HolderLeaseHandler serves the holder lease over one store. It performs no I/O
+// of its own beyond the in-memory lock.
+type HolderLeaseHandler struct {
+	store *holderLeaseStore
+}
+
+// NewHolderLeaseHandler builds a handler with a fresh, empty holder lease
+// store. A nil clock falls back to wall time.
+func NewHolderLeaseHandler(clock domain.Clock) *HolderLeaseHandler {
+	return &HolderLeaseHandler{store: newHolderLeaseStore(clock)}
+}
+
+// HandleExtend adapts Extend to the go-sdk typed tool handler signature.
+func (h *HolderLeaseHandler) HandleExtend(ctx context.Context, _ *mcpsdk.CallToolRequest, in HolderLeaseExtendInput) (*mcpsdk.CallToolResult, HolderLeaseExtendOutput, error) {
+	out, err := h.Extend(ctx, in)
+	if err != nil {
+		return nil, HolderLeaseExtendOutput{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// Install validates the request at the boundary, then installs a holder lease.
+// It is a daemon-side reclaim decision and is not registered as a client tool.
+func (h *HolderLeaseHandler) Install(_ context.Context, in HolderLeaseInput) (HolderLeaseOutput, error) {
+	if in.ResourceID == "" || len(in.Holders) == 0 || in.TTLSeconds <= 0 {
+		return HolderLeaseOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"holder lease: resourceID, at least one holder and a positive ttlSeconds are required")
+	}
+	for _, holder := range in.Holders {
+		if holder == "" {
+			return HolderLeaseOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+				"holder lease: holders must be non-empty identifiers")
+		}
+	}
+	if h == nil || h.store == nil {
+		return HolderLeaseOutput{}, domain.NewAppError(domain.CodePersistFailed, "holder lease: no lease store configured")
+	}
+	return h.store.install(in.ResourceID, in.Holders, time.Duration(in.TTLSeconds)*time.Second), nil
+}
+
+// Extend validates the request at the boundary, then applies the monotonic rule.
+// A short request is not an error: it is answered with the unchanged deadline
+// and Extended false. Only a holder can extend the lease it shares.
+func (h *HolderLeaseHandler) Extend(_ context.Context, in HolderLeaseExtendInput) (HolderLeaseExtendOutput, error) {
+	if in.ResourceID == "" || in.HolderID == "" || in.TTLSeconds <= 0 {
+		return HolderLeaseExtendOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"holder lease: resourceID, holderID and a positive ttlSeconds are required")
+	}
+	if h == nil || h.store == nil {
+		return HolderLeaseExtendOutput{}, domain.NewAppError(domain.CodePersistFailed, "holder lease: no lease store configured")
+	}
+	return h.store.extend(in.ResourceID, in.HolderID, time.Duration(in.TTLSeconds)*time.Second)
+}
+
+// Holders validates the request at the boundary, then returns the holder list
+// of a live lease. It is daemon-side and is not registered as a client tool.
+func (h *HolderLeaseHandler) Holders(_ context.Context, in HolderLeaseHoldersInput) (HolderLeaseHoldersOutput, error) {
+	if in.ResourceID == "" {
+		return HolderLeaseHoldersOutput{}, domain.NewAppError(domain.CodeInvalidInput,
+			"holder lease: resourceID is required")
+	}
+	if h == nil || h.store == nil {
+		return HolderLeaseHoldersOutput{}, domain.NewAppError(domain.CodePersistFailed, "holder lease: no lease store configured")
+	}
+	return h.store.holdersOf(in.ResourceID)
+}
+
+// AttachHolderLease registers the holder-side extend tool on a server. The
+// reclaim-side Install and Holders calls stay daemon-facing. NewServer does not
+// call this function; repeating the attach leaves one extend tool.
+func AttachHolderLease(server *mcpsdk.Server, handler *HolderLeaseHandler) {
+	if server == nil || handler == nil {
+		return
+	}
+	no := false
+	server.RemoveTools(ExtendHolderLeaseToolName)
+
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        ExtendHolderLeaseToolName,
+		Description: "Extend a holder lease on an agent or worktree. The caller must be one of the lease holders. A short request never shortens the deadline already granted: the lease keeps the later of its current expiry and now plus ttlSeconds. The holder list is unchanged by an extension.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  false,
+		},
+	}, handler.HandleExtend)
+}
