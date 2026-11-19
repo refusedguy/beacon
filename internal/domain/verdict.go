@@ -210,3 +210,49 @@ func wakeExecutor(kind WakeKind) []WakeTarget {
 func wakeOrchestrator(kind WakeKind) []WakeTarget {
 	return []WakeTarget{{Role: RoleOrchestrator, Kind: kind}}
 }
+
+// ConflictType is the machine-readable kind of a structured conflict. Callers
+// branch on this value instead of parsing an error message (ADR 0033 §2).
+type ConflictType string
+
+const (
+	// ConflictTypeMerge is a merge conflict reported by the CI provider.
+	ConflictTypeMerge ConflictType = "merge"
+	// ConflictTypeFileOwnership is a conflict between callers that claim the
+	// same file paths.
+	ConflictTypeFileOwnership ConflictType = "file_ownership"
+)
+
+// ConflictResult is the structured response for a conflict. Type and Paths
+// carry the detail that a plain error message would otherwise hide. Message
+// is optional human context and is never the only source of information.
+type ConflictResult struct {
+	Type    ConflictType `json:"type"`
+	Paths   []string     `json:"paths"`
+	Message string       `json:"message,omitempty"`
+}
+
+// NewConflictResult builds a ConflictResult. Paths are trimmed, empty entries
+// and duplicates are dropped while keeping the caller's order. The Paths
+// slice is always non-nil so an empty conflict serializes as [] rather than
+// null.
+func NewConflictResult(typ ConflictType, paths []string, message string) ConflictResult {
+	out := ConflictResult{Type: typ, Paths: []string{}}
+	seen := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out.Paths = append(out.Paths, p)
+	}
+	out.Message = message
+	return out
+}
+
+// Empty reports whether c carries no conflict detail. A zero ConflictResult is
+// not a valid conflict response.
+func (c ConflictResult) Empty() bool {
+	return c.Type == "" && len(c.Paths) == 0 && c.Message == ""
+}

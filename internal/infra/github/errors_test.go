@@ -2,6 +2,7 @@ package github
 
 import (
 	"net/http"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -217,5 +218,127 @@ func TestBackoffDoublesAndCaps(t *testing.T) {
 	}
 	if got := n.Backoff(8); got < maxBackoff {
 		t.Errorf("Backoff(8) = %v, want at least maxBackoff %v", got, maxBackoff)
+	}
+}
+
+// ParseConflict turns a GitHub response into a structured conflict with a type
+// and file paths. Plain errors stay unclassified.
+func TestParseConflict(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		body      string
+		wantOK    bool
+		wantType  domain.ConflictType
+		wantPaths []string
+	}{
+		{
+			name:      "409 merge conflict with files",
+			status:    http.StatusConflict,
+			body:      `{"message":"merge conflict","files":["src/a.go","docs/b.md"]}`,
+			wantOK:    true,
+			wantType:  domain.ConflictTypeMerge,
+			wantPaths: []string{"src/a.go", "docs/b.md"},
+		},
+		{
+			name:      "422 not mergeable with paths",
+			status:    http.StatusUnprocessableEntity,
+			body:      `{"message":"Pull Request is not mergeable","paths":["x/y.go"]}`,
+			wantOK:    true,
+			wantType:  domain.ConflictTypeMerge,
+			wantPaths: []string{"x/y.go"},
+		},
+		{
+			name:      "405 conflict error paths",
+			status:    http.StatusMethodNotAllowed,
+			body:      `{"message":"merge failed","errors":[{"code":"conflict","path":"a.go"},{"field":"internal/b.go"},{"field":"resource"}]}`,
+			wantOK:    true,
+			wantType:  domain.ConflictTypeMerge,
+			wantPaths: []string{"a.go", "internal/b.go"},
+		},
+		{
+			name:      "explicit file ownership type",
+			status:    http.StatusOK,
+			body:      `{"type":"file_ownership","message":"file ownership conflict","files":["shared.go"]}`,
+			wantOK:    true,
+			wantType:  domain.ConflictTypeFileOwnership,
+			wantPaths: []string{"shared.go"},
+		},
+		{
+			name:   "healthy 200 is not a conflict",
+			status: http.StatusOK,
+			body:   `{"data":{}}`,
+		},
+		{
+			name:   "403 without conflict signal",
+			status: http.StatusForbidden,
+			body:   `{"message":"Resource not accessible by integration"}`,
+		},
+		{
+			name:   "409 without conflict signal",
+			status: http.StatusConflict,
+			body:   `{"message":"Resource not accessible"}`,
+		},
+		{
+			name:      "409 with conflict word and no paths",
+			status:    http.StatusConflict,
+			body:      `{"message":"merge conflict"}`,
+			wantOK:    true,
+			wantType:  domain.ConflictTypeMerge,
+			wantPaths: []string{},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParseConflict(tc.status, []byte(tc.body))
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				if got != nil {
+					t.Fatalf("conflict = %#v, want nil", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatal("conflict = nil, want a result")
+			}
+			if got.Type != tc.wantType {
+				t.Fatalf("Type = %q, want %q", got.Type, tc.wantType)
+			}
+			if !reflect.DeepEqual(got.Paths, tc.wantPaths) {
+				t.Fatalf("Paths = %#v, want %#v", got.Paths, tc.wantPaths)
+			}
+		})
+	}
+}
+
+// Normalize exposes the parsed conflict on Result without setting Err/Retry.
+func TestNormalizeReturnsConflict(t *testing.T) {
+	n := testNormalizer(time.Now(), 0)
+	got := n.Normalize(http.StatusConflict, http.Header{},
+		[]byte(`{"message":"merge conflict","files":["src/a.go"]}`))
+	if got.Err != nil || got.Retry || got.Backoff != 0 {
+		t.Fatalf("unexpected retry/error side: %+v", got)
+	}
+	if got.Conflict == nil {
+		t.Fatal("Conflict = nil, want a structured result")
+	}
+	if got.Conflict.Type != domain.ConflictTypeMerge {
+		t.Fatalf("Type = %q, want %q", got.Conflict.Type, domain.ConflictTypeMerge)
+	}
+	if !reflect.DeepEqual(got.Conflict.Paths, []string{"src/a.go"}) {
+		t.Fatalf("Paths = %#v, want [src/a.go]", got.Conflict.Paths)
+	}
+
+	healthy := n.Normalize(http.StatusOK, http.Header{}, []byte(`{"data":{}}`))
+	if healthy.Conflict != nil {
+		t.Fatalf("healthy response has Conflict = %#v", healthy.Conflict)
+	}
+	plain := n.Normalize(http.StatusConflict, http.Header{},
+		[]byte(`{"message":"Resource not accessible"}`))
+	if plain.Conflict != nil {
+		t.Fatalf("plain 409 has Conflict = %#v", plain.Conflict)
 	}
 }

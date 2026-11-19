@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"encoding/json"
 	"reflect"
 	"testing"
 	"time"
@@ -411,5 +412,87 @@ func TestEvaluateDoesNotMutateSnapshot(t *testing.T) {
 	}
 	if s.Flaky.Used["ci-flaky"] != before {
 		t.Errorf("used = %d, want unchanged %d", s.Flaky.Used["ci-flaky"], before)
+	}
+}
+
+// A conflict result carries a machine type and a clean list of file paths.
+// The constructor normalizes the paths so callers can branch on them.
+func TestNewConflictResult(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     ConflictType
+		paths   []string
+		message string
+		want    ConflictResult
+	}{
+		{
+			name:    "merge conflict trims and dedups paths",
+			typ:     ConflictTypeMerge,
+			paths:   []string{" src/a.go ", "", "src/a.go", "docs/b.md"},
+			message: "merge conflict",
+			want: ConflictResult{
+				Type:    ConflictTypeMerge,
+				Paths:   []string{"src/a.go", "docs/b.md"},
+				Message: "merge conflict",
+			},
+		},
+		{
+			name:  "no paths still yields an empty slice",
+			typ:   ConflictTypeFileOwnership,
+			paths: nil,
+			want: ConflictResult{
+				Type:  ConflictTypeFileOwnership,
+				Paths: []string{},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := NewConflictResult(tt.typ, tt.paths, tt.message)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("NewConflictResult = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The JSON shape is part of the MCP response contract: type and paths are
+// always present and message is omitted when empty.
+func TestConflictResultJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ConflictResult
+		want string
+	}{
+		{
+			name: "merge with paths",
+			in:   NewConflictResult(ConflictTypeMerge, []string{"src/a.go", "docs/b.md"}, ""),
+			want: `{"type":"merge","paths":["src/a.go","docs/b.md"]}`,
+		},
+		{
+			name: "file ownership with message",
+			in:   NewConflictResult(ConflictTypeFileOwnership, []string{"shared.go"}, "two agents"),
+			want: `{"type":"file_ownership","paths":["shared.go"],"message":"two agents"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Fatalf("json = %s, want %s", b, tc.want)
+			}
+		})
+	}
+}
+
+func TestConflictResultEmpty(t *testing.T) {
+	if !(ConflictResult{}).Empty() {
+		t.Fatal("zero ConflictResult must be empty")
+	}
+	if NewConflictResult(ConflictTypeMerge, nil, "").Empty() {
+		t.Fatal("a result with a type is not empty")
 	}
 }

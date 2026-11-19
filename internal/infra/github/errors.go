@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -27,12 +28,14 @@ const (
 // Result is the normalized classification of a GitHub response.
 //
 // Exactly one side is set: Err for a RATE_LIMITED response the caller must
-// surface, or Retry/Backoff for a 502/504 the caller retries with backoff.
-// A healthy response leaves both unset.
+// surface, Conflict for a merge conflict returned as structured data (ADR 0033
+// §2), or Retry/Backoff for a 502/504 the caller retries with backoff. A
+// healthy response leaves every field unset.
 type Result struct {
-	Err     *domain.AppError
-	Retry   bool
-	Backoff time.Duration
+	Err      *domain.AppError
+	Conflict *domain.ConflictResult
+	Retry    bool
+	Backoff  time.Duration
 }
 
 // Normalizer classifies GitHub responses. Jitter spreads retries so a fleet
@@ -56,6 +59,11 @@ func (n *Normalizer) Normalize(status int, header http.Header, body []byte) Resu
 		return Result{Retry: true, Backoff: n.Backoff(1)}
 	case status == http.StatusTooManyRequests:
 		return n.rateLimited("GitHub REST 429", header, body)
+	case conflictStatus(status):
+		if c, ok := ParseConflict(status, body); ok {
+			return Result{Conflict: c}
+		}
+		return Result{}
 	case status == http.StatusForbidden:
 		if rateLimitSignaled(header, body) {
 			return n.rateLimited("GitHub REST 403", header, body)
@@ -72,6 +80,76 @@ func (n *Normalizer) Normalize(status int, header http.Header, body []byte) Resu
 	default:
 		return Result{}
 	}
+}
+
+// conflictPayload is the part of a GitHub error body that describes a
+// conflict. GitHub does not keep conflicting paths in one fixed field, so
+// files, paths and per-error path/field are all read.
+type conflictPayload struct {
+	Message string   `json:"message"`
+	Type    string   `json:"type"`
+	Files   []string `json:"files"`
+	Paths   []string `json:"paths"`
+	Errors  []struct {
+		Message  string `json:"message"`
+		Code     string `json:"code"`
+		Field    string `json:"field"`
+		Path     string `json:"path"`
+		Resource string `json:"resource"`
+	} `json:"errors"`
+}
+
+// conflictStatus reports whether status is one GitHub uses for a failed merge.
+func conflictStatus(status int) bool {
+	return status == http.StatusConflict ||
+		status == http.StatusUnprocessableEntity ||
+		status == http.StatusMethodNotAllowed
+}
+
+// ParseConflict maps a GitHub response to a domain.ConflictResult. It returns
+// ok=false when the body does not describe a conflict, so a plain 409 or 422
+// can still be handled by the caller. Paths are read from structured fields,
+// never from the message text (ADR 0033 §2).
+func ParseConflict(status int, body []byte) (*domain.ConflictResult, bool) {
+	var p conflictPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		return nil, false
+	}
+
+	paths := append([]string(nil), p.Files...)
+	paths = append(paths, p.Paths...)
+	hasSignal := conflictText(p.Message)
+	for _, e := range p.Errors {
+		if conflictText(e.Message) || conflictText(e.Code) || conflictText(e.Resource) {
+			hasSignal = true
+		}
+		switch {
+		case e.Path != "":
+			paths = append(paths, e.Path)
+		case strings.Contains(e.Field, "/"):
+			paths = append(paths, e.Field)
+		}
+	}
+	if len(paths) > 0 && conflictStatus(status) {
+		hasSignal = true
+	}
+	if !hasSignal {
+		return nil, false
+	}
+
+	typ := domain.ConflictTypeMerge
+	switch p.Type {
+	case string(domain.ConflictTypeMerge), string(domain.ConflictTypeFileOwnership):
+		typ = domain.ConflictType(p.Type)
+	}
+	c := domain.NewConflictResult(typ, paths, p.Message)
+	return &c, true
+}
+
+// conflictText reports whether s names a conflict in GitHub's wording.
+func conflictText(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "conflict") || strings.Contains(s, "not mergeable")
 }
 
 // Backoff returns the delay before the next attempt of a 502/504 response.
