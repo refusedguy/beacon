@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -456,5 +458,112 @@ func TestReadInitEventConfig(t *testing.T) {
 	cfg = readInitEventConfig()
 	if cfg.timeout != initEventTimeoutDefault {
 		t.Fatalf("битый таймаут дал %s, ожидался %s", cfg.timeout, initEventTimeoutDefault)
+	}
+}
+
+// TestMCPPrecheckReasonReachesWaitResultOverToolsCall is the T3.84 acceptance
+// test. A failed startup precheck installs its reason on the production
+// wait_result service, so a real MCP tools/call returns precheck_failure with
+// the reason instead of waiting silently (ADR 0041 §6).
+func TestMCPPrecheckReasonReachesWaitResultOverToolsCall(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv("BEACON_INIT_EVENT", "control-plane")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	t.Setenv("BEACON_INIT_EVENT_TIMEOUT", "")
+
+	previousServe := serveMCP
+	t.Cleanup(func() {
+		serveMCP = previousServe
+		setPrecheckFailureReason("")
+	})
+	serveMCP = func(context.Context, mcp.Dependencies) error { return nil }
+
+	errOut := new(bytes.Buffer)
+	if code := mcpRunner(errOut); code == 0 {
+		t.Fatalf("код выхода %d, ожидался не ноль; stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), mcpPrecheckFailure) {
+		t.Fatalf("в stderr нет precheck_failure: %q", errOut.String())
+	}
+
+	deps, closeStore, err := openMCPDependencies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closeStore() }()
+
+	serverTransport, clientTransport := mcpsdk.NewInMemoryTransports()
+	serverSession, err := newMCPServer(deps).Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "beacon-precheck-test", Version: "v0.0.1"}, nil)
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer func() {
+		_ = clientSession.Close()
+		_ = serverSession.Wait()
+	}()
+
+	result, err := clientSession.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_wait_result",
+		Arguments: mcp.WaitResultInput{WatchID: "precheck-watch"},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_wait_result: %v", err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out mcp.WaitResultOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Status != mcp.PrecheckFailureOutcome || out.Verdict != mcp.PrecheckFailureOutcome {
+		t.Fatalf("status/verdict = %q/%q, ожидалось %q", out.Status, out.Verdict, mcp.PrecheckFailureOutcome)
+	}
+	check, ok := out.Checks["precheck"]
+	if !ok {
+		t.Fatalf("в ответе нет проверки precheck: %+v", out)
+	}
+	if !strings.Contains(check.Conclusion, "bypass") {
+		t.Fatalf("в причине precheck нет bypass: %q", check.Conclusion)
+	}
+}
+
+// TestMCPSuccessfulRunClearsPrecheckReason keeps the normal wait path intact:
+// a run with a configured bypass clears the failure from an earlier run, so
+// wait_result no longer returns precheck_failure (T3.41, T3.81, T3.82).
+func TestMCPSuccessfulRunClearsPrecheckReason(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv("BEACON_INIT_EVENT", "")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+
+	previousServe := serveMCP
+	t.Cleanup(func() {
+		serveMCP = previousServe
+		setPrecheckFailureReason("")
+	})
+	serveMCP = func(context.Context, mcp.Dependencies) error { return nil }
+
+	setPrecheckFailureReason("устаревшая причина")
+	if code := mcpRunner(new(bytes.Buffer)); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0", code)
+	}
+
+	deps, closeStore, err := openMCPDependencies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closeStore() }()
+
+	_, err = newMCPWaitResult(deps).Wait(context.Background(), "sub-A", mcp.WaitResultInput{}, mcp.CallerExit{})
+	if err == nil || !strings.Contains(err.Error(), "watchID is required") {
+		t.Fatalf("ожидалась обычная проверка входа, получено %v", err)
 	}
 }
