@@ -1119,6 +1119,90 @@ func (g *coalescingCIWaiter) wait(ctx context.Context, key string, fn func(conte
 // Fifteen units waiting on one CI (same repo/PR/headSHA) run the expensive
 // shared wait once. Removing the gate call from wait makes the operation never
 // run and this test fails.
+// TestWaitResultPrecheckFailureReasonInOutputAndJournal proves ADR 0041 §6:
+// the T3.81 reason is delivered in the wait_result response and written to the
+// journal before any wait starts. stderr is no longer the only destination.
+func TestWaitResultPrecheckFailureReasonInOutputAndJournal(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	reason := "bypass mode не настроен для init event control-plane"
+	journal := &memoryPrecheckJournal{}
+	svc.SetPrecheckJournal(journal)
+	svc.SetPrecheckFailure(reason)
+
+	out, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if out.Status != PrecheckFailureOutcome || out.Verdict != PrecheckFailureOutcome {
+		t.Fatalf("status/verdict = %q/%q, want %q", out.Status, out.Verdict, PrecheckFailureOutcome)
+	}
+	check, ok := out.Checks[precheckCheckName]
+	if !ok || check.Conclusion != reason {
+		t.Fatalf("причина не доставлена в wait_result: %#v", out.Checks)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), reason) {
+		t.Fatalf("причины нет в JSON wait_result: %s", raw)
+	}
+	if store.reads != 0 || len(writer.reads) != 0 || len(source.subscribed) != 0 {
+		t.Fatalf(" precheck должен отказать до ожидания: reads=%d writes=%d subs=%v",
+			store.reads, len(writer.reads), source.subscribed)
+	}
+	records := journal.Records()
+	if len(records) != 1 {
+		t.Fatalf("записей журнала %d, ожидалась 1", len(records))
+	}
+	if records[0].Outcome != PrecheckFailureOutcome || records[0].Reason != reason {
+		t.Fatalf("запись журнала = %#v", records[0])
+	}
+}
+
+// TestWaitResultHandleDeliversPrecheckReason checks the same delivery through
+// the typed go-sdk handler the MCP client actually calls.
+func TestWaitResultHandleDeliversPrecheckReason(t *testing.T) {
+	svc, _, _, _, _ := newWaitTestService()
+	journal := &memoryPrecheckJournal{}
+	svc.SetPrecheckJournal(journal)
+	svc.SetPrecheckFailure("нет bypass")
+
+	result, out, err := svc.Handle(context.Background(), nil, WaitResultInput{WatchID: "watch-1"})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if result == nil || result.IsError {
+		t.Fatalf("wait_result вернул ошибку: %#v", result)
+	}
+	if out.Status != PrecheckFailureOutcome {
+		t.Fatalf("status = %q, want %q", out.Status, PrecheckFailureOutcome)
+	}
+	if got := out.Checks[precheckCheckName].Conclusion; got != "нет bypass" {
+		t.Fatalf("причина в wait_result = %q", got)
+	}
+	if records := journal.Records(); len(records) != 1 || records[0].Reason != "нет bypass" {
+		t.Fatalf("журнал = %#v", records)
+	}
+}
+
+// TestWaitResultPrecheckFailureCanBeCleared keeps the normal wait path intact
+// once the precheck reason is removed (T3.66 and T3.76 rely on that path).
+func TestWaitResultPrecheckFailureCanBeCleared(t *testing.T) {
+	svc, _, _, _, timeout := newWaitTestService()
+	svc.SetPrecheckFailure("временный отказ")
+	svc.SetPrecheckFailure("")
+	close(timeout)
+
+	out, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if out.Status != string(domain.StatusWatching) {
+		t.Fatalf("status = %q, want watching", out.Status)
+	}
+}
+
 func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 	const units = 15
 	var (

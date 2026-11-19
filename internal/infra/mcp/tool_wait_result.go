@@ -311,6 +311,60 @@ func (j *memoryCancelJournal) Records() []CancellationRecord {
 	return out
 }
 
+// ---- ADR 0041 §6 / T3.82: причина precheck в wait_result и журнале ----
+//
+// T3.81 останавливает run до входа в ожидание и печатает причину отказа в
+// stderr. ADR 0041 п6 требует, чтобы та же причина была видна в ответе
+// wait_result и в журнале. WaitResultService держит причину сконфигурированного
+// отказа precheck и пишет её в журнал через порт PrecheckJournal. Порт
+// реализован in-memory по умолчанию; слой app подставляет долговременный
+// журнал, не зависящий от этого пакета.
+
+// PrecheckFailureOutcome — исход run из ADR 0041 п6.
+const PrecheckFailureOutcome = "precheck_failure"
+
+// precheckCheckName — имя записи в Checks, которой доставляется причина.
+const precheckCheckName = "precheck"
+
+// PrecheckFailureRecord — одна запись журнала причин отказа precheck.
+type PrecheckFailureRecord struct {
+	Outcome string
+	Reason  string
+	At      time.Time
+}
+
+// PrecheckJournal — приёмник причин отказа precheck. Сигнатура на примитивах,
+// чтобы реализация в слое app не импортировала этот пакет.
+type PrecheckJournal interface {
+	RecordPrecheckFailure(reason string, at time.Time) error
+}
+
+// NewMemoryPrecheckJournal builds the in-process precheck reason journal.
+func NewMemoryPrecheckJournal() PrecheckJournal { return &memoryPrecheckJournal{} }
+
+type memoryPrecheckJournal struct {
+	mu      sync.Mutex
+	records []PrecheckFailureRecord
+}
+
+func (j *memoryPrecheckJournal) RecordPrecheckFailure(reason string, at time.Time) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.records = append(j.records, PrecheckFailureRecord{
+		Outcome: PrecheckFailureOutcome, Reason: reason, At: at,
+	})
+	return nil
+}
+
+// Records returns the journal in insertion order.
+func (j *memoryPrecheckJournal) Records() []PrecheckFailureRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]PrecheckFailureRecord, len(j.records))
+	copy(out, j.records)
+	return out
+}
+
 // capabilityTask is one node of the cancellation tree. reason is set when the
 // context is cancelled and is delivered to the node's wait.
 type capabilityTask struct {
@@ -526,16 +580,18 @@ func directCIWait(ctx context.Context, _ string, fn func(context.Context) error)
 // the caller supplies the departure signals, the verdict subscription and the
 // transactional writer through ports.
 type WaitResultService struct {
-	store       waitResultStore
-	writer      WaitResultWriter
-	source      VerdictSource
-	clock       domain.Clock
-	after       func(time.Duration) <-chan time.Time
-	departures  func(*mcpsdk.CallToolRequest) CallerExit
-	idempotency WaitResultIdempotencyStore
-	capability  func(*mcpsdk.CallToolRequest) *CapabilityContext
-	ciWait      func(context.Context) error
-	ciGate      SharedCIWaiter
+	store           waitResultStore
+	writer          WaitResultWriter
+	source          VerdictSource
+	clock           domain.Clock
+	after           func(time.Duration) <-chan time.Time
+	departures      func(*mcpsdk.CallToolRequest) CallerExit
+	idempotency     WaitResultIdempotencyStore
+	capability      func(*mcpsdk.CallToolRequest) *CapabilityContext
+	ciWait          func(context.Context) error
+	ciGate          SharedCIWaiter
+	precheckReason  string
+	precheckJournal PrecheckJournal
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -547,14 +603,15 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		clock = waitResultWallClock{}
 	}
 	return &WaitResultService{
-		store:       store,
-		writer:      writer,
-		source:      source,
-		clock:       clock,
-		after:       time.After,
-		idempotency: NewMemoryWaitResultIdempotency(),
-		ciWait:      sharedCIWaitNoop,
-		ciGate:      directCIWait,
+		store:           store,
+		writer:          writer,
+		source:          source,
+		clock:           clock,
+		after:           time.After,
+		idempotency:     NewMemoryWaitResultIdempotency(),
+		ciWait:          sharedCIWaitNoop,
+		ciGate:          directCIWait,
+		precheckJournal: NewMemoryPrecheckJournal(),
 	}
 }
 
@@ -613,6 +670,56 @@ func (s *WaitResultService) SetSharedCIWaiter(fn SharedCIWaiter) {
 		fn = directCIWait
 	}
 	s.ciGate = fn
+}
+
+// SetPrecheckFailure installs the reason of a failed startup precheck (ADR 0041
+// §6). With a reason set, wait_result returns precheck_failure immediately and
+// journals the reason instead of entering the wait loop. An empty reason clears
+// the failure and restores the normal wait.
+func (s *WaitResultService) SetPrecheckFailure(reason string) {
+	if s != nil {
+		s.precheckReason = reason
+	}
+}
+
+// SetPrecheckJournal installs the sink for precheck reasons. A nil argument
+// restores the in-memory journal. The app layer supplies the durable sink.
+func (s *WaitResultService) SetPrecheckJournal(j PrecheckJournal) {
+	if s == nil {
+		return
+	}
+	if j == nil {
+		j = NewMemoryPrecheckJournal()
+	}
+	s.precheckJournal = j
+}
+
+// PrecheckJournal returns the configured sink, mostly for callers that want to
+// read a memory journal back. It is never nil for a service built by
+// NewWaitResultService.
+func (s *WaitResultService) PrecheckJournal() PrecheckJournal {
+	if s == nil || s.precheckJournal == nil {
+		return NewMemoryPrecheckJournal()
+	}
+	return s.precheckJournal
+}
+
+// precheckFailureOutput is the wait_result response that carries the precheck
+// reason (ADR 0041 §6). The reason lives in Checks so the fixed field order of
+// WaitResultOutput from ADR 0036 §2 does not change.
+func precheckFailureOutput(reason string) WaitResultOutput {
+	return WaitResultOutput{
+		Status:  PrecheckFailureOutcome,
+		Verdict: PrecheckFailureOutcome,
+		Checks: map[string]domain.Check{
+			precheckCheckName: {State: "FAILED", Conclusion: reason, Required: true},
+		},
+	}
+}
+
+func (s *WaitResultService) recordPrecheckFailure(reason string) {
+	j := s.PrecheckJournal()
+	_ = j.RecordPrecheckFailure(reason, s.now())
 }
 
 // sharedCIWaitKey is the gate key for one CI head. The subscriber's identity is
@@ -711,6 +818,13 @@ func (s *WaitResultService) depart(capCtx *CapabilityContext, reason CancelReaso
 // set, a departure also cancels that context's entire task tree and journals
 // the reason (ADR 0040 §1).
 func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
+	// ADR 0041 §6: a failed startup precheck ends the run before the wait. The
+	// reason reaches the caller in the wait_result response and the journal,
+	// not only stderr. No store is read and no obligation is written.
+	if s != nil && s.precheckReason != "" {
+		s.recordPrecheckFailure(s.precheckReason)
+		return precheckFailureOutput(s.precheckReason), nil
+	}
 	if in.WatchID == "" {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: watchID is required")
 	}
