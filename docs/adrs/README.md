@@ -60,3 +60,4 @@
 | 0046 | Шесть фич из отчёта AC-wave | accepted |
 | 0047 | Шесть фич из отчёта AE-wave | accepted |
 | 0048 | Шесть фич из отчёта AF-wave | accepted |
+| 0049 | Шесть фич из отчёта AG-wave | accepted |
