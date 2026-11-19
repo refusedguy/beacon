@@ -556,3 +556,145 @@ func TestWaitResultClientRequestIDFailureIsNotCached(t *testing.T) {
 }
 
 func int64Ptr(v int64) *int64 { return &v }
+
+// TestWaitResultInputSchemaHasContinueOf keeps continueOf in the derived MCP
+// input schema so a client can resume a parked task after a human answer.
+func TestWaitResultInputSchemaHasContinueOf(t *testing.T) {
+	schema, err := jsonschema.For[WaitResultInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"continueOf"`)) {
+		t.Fatalf("input schema has no continueOf property: %s", raw)
+	}
+}
+
+// TestWaitResultNeedsInputParksWithoutRead covers a Watch already parked when
+// the wait starts: it returns early with needs_input and writes no readAt.
+func TestWaitResultNeedsInputParksWithoutRead(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	store.watch.Status = domain.StatusNeedsInput
+	store.watch.Verdict = domain.VerdictNeedsInput
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Status != string(domain.StatusNeedsInput) || got.Verdict != string(domain.VerdictNeedsInput) {
+		t.Errorf("status/verdict = %q/%q, want needs_input/needs_input", got.Status, got.Verdict)
+	}
+	if got.Revision != 7 || got.PollAfterMs == nil {
+		t.Errorf("parked result = %+v, want revision 7 with a poll hint", got)
+	}
+	if len(writer.reads) != 0 || store.obligationWrites != 0 {
+		t.Errorf("parking wrote %d readAt and %d obligations, want 0/0", len(writer.reads), store.obligationWrites)
+	}
+	if len(source.subscribed) != 0 {
+		t.Errorf("parking opened %d subscriptions, want 0", len(source.subscribed))
+	}
+}
+
+// TestWaitResultNeedsInputUpdateParks proves that a question arriving during
+// the long-poll stops the wait without delivering a verdict or marking readAt.
+func TestWaitResultNeedsInputUpdateParks(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	checks := map[string]domain.Check{"ci/test": {State: "COMPLETED"}}
+	source.publish(WaitVerdictUpdate{
+		WatchID:  "watch-1",
+		Status:   domain.StatusNeedsInput,
+		Verdict:  domain.VerdictNeedsInput,
+		Revision: 8,
+		Checks:   checks,
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Status != string(domain.StatusNeedsInput) || got.Revision != 8 {
+		t.Errorf("result = %+v, want needs_input at revision 8", got)
+	}
+	if len(writer.reads) != 0 || store.obligationWrites != 0 {
+		t.Errorf("question wrote %d readAt and %d obligations, want 0/0", len(writer.reads), store.obligationWrites)
+	}
+	if !source.sub.closed {
+		t.Error("subscription was not closed when the wait parked")
+	}
+}
+
+// TestWaitResultContinuesAfterAnswerOnSameWatch covers T3.21: after the human
+// answers through ack(continueOf), a wait with continueOf resumes the same
+// Watch and delivers its verdict. No new Watch is created and clientRequestId
+// idempotency still holds for both waits.
+func TestWaitResultContinuesAfterAnswerOnSameWatch(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusNeedsInput,
+		Verdict: domain.VerdictNeedsInput, Revision: 8,
+	})
+	parked, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", ClientRequestID: "req-park"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("parking Wait: %v", err)
+	}
+	if parked.Status != string(domain.StatusNeedsInput) {
+		t.Fatalf("parking result = %+v, want needs_input", parked)
+	}
+
+	// The answer resumed the same Watch: no successor Watch appears in the
+	// store and the next updates arrive on that Watch's revision.
+	store.watch.Status = domain.StatusWatching
+	store.watch.Verdict = domain.VerdictWatching
+	store.watch.Revision = 9
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, Revision: 9,
+	})
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed,
+		Verdict: domain.VerdictMerged, Revision: 10,
+		At: time.Date(2026, 11, 20, 5, 0, 0, 0, time.UTC),
+	})
+
+	in := WaitResultInput{WatchID: "watch-1", ContinueOf: "watch-1", ClientRequestID: "req-done"}
+	got, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("continued Wait: %v", err)
+	}
+	if got.Status != string(domain.StatusClosed) || got.Verdict != string(domain.VerdictMerged) || got.Revision != 10 {
+		t.Errorf("continued result = %+v, want closed/merged/10", got)
+	}
+	if store.watch.ID != "watch-1" || len(source.subscribed) != 2 {
+		t.Errorf("continuation changed the task: watch %q, %d subscriptions", store.watch.ID, len(source.subscribed))
+	}
+	if len(writer.reads) != 1 || writer.reads[0].id != domain.ObligationKey("watch-1", 10, "sub-A") {
+		t.Errorf("readAt writes = %+v, want one write at the continued revision", writer.reads)
+	}
+
+	// The clientRequestId contract from T2.22 still holds after a continuation.
+	repeat, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("repeat continued Wait: %v", err)
+	}
+	if !reflect.DeepEqual(repeat, got) || len(writer.reads) != 1 || len(source.subscribed) != 2 {
+		t.Errorf("repeat = %+v, writes %+v, subscriptions %d", repeat, writer.reads, len(source.subscribed))
+	}
+}
+
+// TestWaitResultContinueOfMismatchRejected keeps continueOf scoped to one
+// Watch: it cannot be used to wait on a different task.
+func TestWaitResultContinueOfMismatchRejected(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	_, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", ContinueOf: "other-watch"}, CallerExit{})
+	assertCode(t, err, domain.CodeInvalidInput)
+	if len(writer.reads) != 0 || store.obligationWrites != 0 || len(source.subscribed) != 0 {
+		t.Errorf("rejected continueOf had effects: reads %d writes %d subscriptions %d",
+			len(writer.reads), store.obligationWrites, len(source.subscribed))
+	}
+}
