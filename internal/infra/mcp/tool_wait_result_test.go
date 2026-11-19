@@ -455,7 +455,7 @@ func TestWaitResultInputSchemaHasClientRequestID(t *testing.T) {
 // repeat with the same clientRequestId after a broken connection returns the
 // first result, runs no second wait and marks no obligation read twice.
 func TestWaitResultClientRequestIDIdempotent(t *testing.T) {
-	svc, store, writer, source, _ := newWaitTestService()
+	svc, store, writer, source, timeout := newWaitTestService()
 	at := time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
 	checks := map[string]domain.Check{"ci/test": {State: "COMPLETED", Conclusion: "SUCCESS"}}
 	source.publish(WaitVerdictUpdate{
@@ -474,7 +474,9 @@ func TestWaitResultClientRequestIDIdempotent(t *testing.T) {
 	}
 
 	// The retry arrives after a broken connection with no new verdict on the
-	// subscription. It must still return the recorded result.
+	// subscription. Arm the timeout so a regression that re-runs the wait fails
+	// cleanly instead of hanging. It must still return the recorded result.
+	close(timeout)
 	second, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
 	if err != nil {
 		t.Fatalf("repeat Wait: %v", err)
