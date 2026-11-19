@@ -143,3 +143,188 @@ func TestMCPCompositionRootBuildsServerWithStore(t *testing.T) {
 		t.Fatalf("файл состояния не создан: %v", err)
 	}
 }
+
+// TestReadMCPConnection covers the connection-file contract from ADR 0036 §1.
+// A missing file is a valid local stdio mode; a present but invalid file must
+// not be used as a reconnect target.
+func TestReadMCPConnection(t *testing.T) {
+	dir := t.TempDir()
+
+	conn, err := readMCPConnection(dir)
+	if err != nil {
+		t.Fatalf("отсутствующий файл: %v", err)
+	}
+	if conn != (mcpConnection{}) {
+		t.Fatalf("отсутствующий файл дал соединение %+v", conn)
+	}
+	if conn.target() != "" {
+		t.Fatalf("пустое соединение дало target %q", conn.target())
+	}
+
+	want := mcpConnection{Host: "127.0.0.1", Port: 7432, Token: "secret"}
+	data, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, mcpConnectionFileName)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readMCPConnection(dir)
+	if err != nil {
+		t.Fatalf("корректный файл: %v", err)
+	}
+	if got != want {
+		t.Fatalf("соединение %+v, ожидалось %+v", got, want)
+	}
+	if got.target() != "127.0.0.1:7432" {
+		t.Fatalf("target %q", got.target())
+	}
+
+	cases := []struct {
+		name string
+		data string
+	}{
+		{"битый JSON", "{"},
+		{"пустой host", `{"host":"","port":7432}`},
+		{"порт ноль", `{"host":"127.0.0.1","port":0}`},
+		{"порт вне диапазона", `{"host":"127.0.0.1","port":70000}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(path, []byte(tc.data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readMCPConnection(dir); err == nil {
+				t.Fatalf("ожидалась ошибка для %q", tc.data)
+			}
+		})
+	}
+}
+
+// TestMCPReconnectsAfterAddressChange is the acceptance test for ADR 0036 §1.
+// The connection file changes between two `beacon mcp` runs. The client reads
+// the new address and port on the second start, and the watch registered on
+// the first run is still waiting in the persisted store.
+func TestMCPReconnectsAfterAddressChange(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	state := filepath.Join(base, "beacon")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	previousConnector := mcpConnector
+	previousServe := serveMCP
+	previousActive := activeMCPConnection
+	t.Cleanup(func() {
+		mcpConnector = previousConnector
+		serveMCP = previousServe
+		activeMCPConnection = previousActive
+	})
+
+	var connects []mcpConnection
+	mcpConnector = func(_ context.Context, conn mcpConnection) error {
+		connects = append(connects, conn)
+		return nil
+	}
+
+	const watchID = "reconnect-watch"
+	serveMCP = func(_ context.Context, deps mcp.Dependencies) error {
+		if _, err := deps.Store.Watch(watchID); err != nil {
+			w := domain.Watch{
+				ID:        watchID,
+				Repo:      "refusedguy/beacon",
+				PR:        42,
+				HeadSHA:   "reconnect-head",
+				Status:    domain.StatusWatching,
+				Verdict:   domain.VerdictWatching,
+				CreatedAt: time.Now(),
+			}
+			if err := deps.Store.SaveWatch(w); err != nil {
+				t.Fatalf("SaveWatch: %v", err)
+			}
+		}
+		return nil
+	}
+
+	writeConnection := func(host string, port int) {
+		data, err := json.Marshal(mcpConnection{Host: host, Port: port, Token: "token"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(state, mcpConnectionFileName), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First daemon instance.
+	writeConnection("10.0.0.1", 4001)
+	if code := mcpRunner(new(bytes.Buffer)); code != 0 {
+		t.Fatalf("первый запуск: код %d", code)
+	}
+	if activeMCPConnection.Host != "10.0.0.1" || activeMCPConnection.Port != 4001 {
+		t.Fatalf("первый запуск подключился к %+v", activeMCPConnection)
+	}
+
+	// The daemon moved to another address and port.
+	writeConnection("10.0.0.2", 4002)
+	if code := mcpRunner(new(bytes.Buffer)); code != 0 {
+		t.Fatalf("второй запуск: код %d", code)
+	}
+	if len(connects) != 2 {
+		t.Fatalf("connect вызван %d раз, ожидался 2", len(connects))
+	}
+	if connects[0].target() != "10.0.0.1:4001" || connects[1].target() != "10.0.0.2:4002" {
+		t.Fatalf("неверная цепочка подключений: %+v", connects)
+	}
+	if activeMCPConnection.Host != "10.0.0.2" || activeMCPConnection.Port != 4002 {
+		t.Fatalf("после рестарта активное соединение %+v", activeMCPConnection)
+	}
+
+	// The registered task survived the restart on the new endpoint.
+	deps, closeStore, err := openMCPDependencies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closeStore() }()
+	w, err := deps.Store.Watch(watchID)
+	if err != nil {
+		t.Fatalf("задача потеряна после рестарта: %v", err)
+	}
+	if w.Status != domain.StatusWatching {
+		t.Fatalf("задача не ждёт после рестарта: статус %s", w.Status)
+	}
+}
+
+// TestMCPConnectFailurePropagates checks that a failed reconnect is reported
+// through the runner exit code instead of silently serving a dead endpoint.
+func TestMCPConnectFailurePropagates(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	state := filepath.Join(base, "beacon")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(mcpConnection{Host: "127.0.0.1", Port: 4003})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, mcpConnectionFileName), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	previousConnector := mcpConnector
+	t.Cleanup(func() { mcpConnector = previousConnector })
+	mcpConnector = func(_ context.Context, _ mcpConnection) error {
+		return fmt.Errorf("master недоступен")
+	}
+
+	errOut := new(bytes.Buffer)
+	if code := mcpRunner(errOut); code == 0 {
+		t.Fatal("ошибка подключения не изменила код выхода")
+	}
+	if !strings.Contains(errOut.String(), "connect to 127.0.0.1:4003") {
+		t.Fatalf("в stderr нет адреса подключения: %q", errOut.String())
+	}
+}
