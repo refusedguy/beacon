@@ -1198,3 +1198,153 @@ func TestExternalCanonicalStrings(t *testing.T) {
 		t.Fatalf("verdict strings = %q, %q", ExternalPass, ExternalFail)
 	}
 }
+
+// The three strict codes of ADR 0047 feature 3 are pinned to 0, 3 and 4. A
+// shifted number would silently reinterpret every recorded reviewer verdict.
+func TestReviewerExitCodeValues(t *testing.T) {
+	if ReviewerExitApprove != 0 || ReviewerExitChangesRequested != 3 || ReviewerExitReject != 4 {
+		t.Fatalf("codes = %d, %d, %d, want 0, 3, 4",
+			ReviewerExitApprove, ReviewerExitChangesRequested, ReviewerExitReject)
+	}
+}
+
+// TestParseReviewerExitCodeDecisionTable covers each of the four parse rules
+// in priority order: block wins, contradiction is unclear, each clear signal,
+// and no signal. Case names name the rule so a failure points at the branch.
+func TestParseReviewerExitCodeDecisionTable(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want ReviewerExitCode
+	}{
+		// rule 1: a block always wins, even next to an approve.
+		{"approve", "APPROVE", ReviewerExitApprove},
+		{"approved with whitespace", "  approve\n", ReviewerExitApprove},
+		{"approved with punctuation", "Approved.", ReviewerExitApprove},
+		{"lgtm", "LGTM", ReviewerExitApprove},
+		{"ship it", "ship it", ReviewerExitApprove},
+		{"looks good to me", "looks good to me", ReviewerExitApprove},
+		// rule 3: clear changes requested.
+		{"changes requested", "changes requested", ReviewerExitChangesRequested},
+		{"request changes", "Please request changes here", ReviewerExitChangesRequested},
+		{"fix first", "fix first", ReviewerExitChangesRequested},
+		{"reject", "reject", ReviewerExitChangesRequested},
+		// rule 2: approve plus changes is contradictory, so unclear.
+		{"approve and changes is unclear", "I approve but changes requested", ReviewerExitReject},
+		// rule 4: no recognised signal fails closed.
+		{"empty answer", "", ReviewerExitReject},
+		{"whitespace only", "   \n\t ", ReviewerExitReject},
+		{"hedging", "maybe, could be ok, not sure", ReviewerExitReject},
+		{"unrelated text", "the weather is nice today", ReviewerExitReject},
+		// rule 1 again: every block marker outranks an approve.
+		{"approve with blocker", "I approve, but this is a blocker", ReviewerExitReject},
+		{"approve with blocked", "APPROVED, one issue blocked", ReviewerExitReject},
+		{"approve with veto", "approve / veto", ReviewerExitReject},
+		{"block alone", "block", ReviewerExitReject},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseReviewerExitCode(tt.in); got != tt.want {
+				t.Fatalf("ParseReviewerExitCode(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// Negated approve markers must not be read as an approve. "not approved" is
+// a rejection, not a pass, and a negated block is no block at all.
+func TestParseReviewerExitCodeNegation(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want ReviewerExitCode
+	}{
+		{"not approved is reject", "not approved", ReviewerExitReject},
+		{"cannot approve is reject", "cannot approve this", ReviewerExitReject},
+		{"cant approve is reject", "can't approve", ReviewerExitReject},
+		{"do not approve is reject", "do not approve", ReviewerExitReject},
+		{"negated block is not a block", "there is no block here, approved", ReviewerExitApprove},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ParseReviewerExitCode(tt.in); got != tt.want {
+				t.Fatalf("ParseReviewerExitCode(%q) = %d, want %d", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// A block wins over every other signal, including a clear changes request,
+// and it cannot be softened by hedging or an approve anywhere in the answer.
+func TestParseReviewerExitCodeBlockingAlwaysWins(t *testing.T) {
+	bases := []string{
+		"approve",
+		"changes requested",
+		"looks good to me",
+		"maybe",
+		"",
+	}
+	for _, base := range bases {
+		for _, marker := range []string{"block", "blocked", "blocker", "blocking", "veto"} {
+			answer := base + " but " + marker
+			if got := ParseReviewerExitCode(answer); got != ReviewerExitReject {
+				t.Errorf("ParseReviewerExitCode(%q) = %d, want block reject %d", answer, got, ReviewerExitReject)
+			}
+		}
+	}
+}
+
+// An unclear answer is a rejection, never a pass. No input may turn a missing
+// or unrecognised answer into code 0.
+func TestParseReviewerExitCodeUnclearIsReject(t *testing.T) {
+	for _, answer := range []string{"", " ", "?", "hmm", "I have no opinion", "seems fine to me"} {
+		if got := ParseReviewerExitCode(answer); got != ReviewerExitReject {
+			t.Errorf("unclear answer %q = %d, want reject %d", answer, got, ReviewerExitReject)
+		}
+	}
+}
+
+// This parser is not the indeterminate of T3.64 and not any other verdict
+// type. Its signature takes only the reviewer text and returns only a
+// ReviewerExitCode, so it cannot read a Watch, a check or a signed verdict.
+func TestParseReviewerExitCodeIndependentOfOtherVerdicts(t *testing.T) {
+	fn := reflect.TypeOf(ParseReviewerExitCode)
+	if fn.NumIn() != 1 || fn.In(0) != reflect.TypeOf("") {
+		t.Fatalf("input = %v, want exactly one string", fn)
+	}
+	if fn.NumOut() != 1 || fn.Out(0) != reflect.TypeOf(ReviewerExitApprove) {
+		t.Fatalf("output = %v, want exactly one ReviewerExitCode", fn)
+	}
+
+	otherVerdictTypes := []reflect.Type{
+		reflect.TypeOf(VerdictWatching),
+		reflect.TypeOf(ReviewShip),
+		reflect.TypeOf(ExternalPass),
+	}
+	if reflect.TypeOf(ReviewerExitApprove) == reflect.TypeOf(0) {
+		t.Fatal("ReviewerExitCode must be a distinct named type, not a bare int")
+	}
+	for _, typ := range otherVerdictTypes {
+		if fn.Out(0) == typ {
+			t.Errorf("parser must not return %v", typ)
+		}
+	}
+}
+
+// The parser is pure: the same answer always gives the same code, and the
+// input string is a value so it cannot be mutated through the call.
+func TestParseReviewerExitCodeDeterministic(t *testing.T) {
+	answer := "changes requested, but approved, blocked"
+	want := ParseReviewerExitCode(answer)
+	if want != ReviewerExitReject {
+		t.Fatalf("block answer = %d, want reject %d", want, ReviewerExitReject)
+	}
+	for i := 0; i < 10; i++ {
+		if got := ParseReviewerExitCode(answer); got != want {
+			t.Fatalf("call %d = %d, want %d", i, got, want)
+		}
+	}
+	if answer != "changes requested, but approved, blocked" {
+		t.Fatalf("input mutated to %q", answer)
+	}
+}
