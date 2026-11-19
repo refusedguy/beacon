@@ -1993,3 +1993,226 @@ func TestWakeBetweenOverInMemoryTransport(t *testing.T) {
 		t.Errorf("sleeper points=%v, want one point inside the 900ms window", sleeper.points)
 	}
 }
+
+// TestWakeReceiptStateIsClosedSet is the ADR 0043 feature 4 acceptance core:
+// a receipt carries one of eight distinct lifecycle states and the ADR 0026
+// delivery values are not among them. State answers where the message is;
+// delivery answers how it was sent.
+func TestWakeReceiptStateIsClosedSet(t *testing.T) {
+	states := []DeliveryState{
+		StateSpooled, StatePending, StateHeld, StatePushed,
+		StatePushUnreachable, StateRead, StateRefused, StateExpired,
+	}
+	if len(states) != 8 {
+		t.Fatalf("got %d receipt states, want 8", len(states))
+	}
+	seen := make(map[DeliveryState]bool, len(states))
+	for _, state := range states {
+		if !validDeliveryState(state) {
+			t.Errorf("state %q is not accepted by validDeliveryState", state)
+		}
+		if seen[state] {
+			t.Errorf("state %q is duplicated", state)
+		}
+		seen[state] = true
+	}
+	for _, delivery := range []Delivery{DeliverySteer, DeliveryQueue, DeliveryUnsupported} {
+		if validDeliveryState(DeliveryState(delivery)) {
+			t.Errorf("delivery %q must not be a receipt state", delivery)
+		}
+	}
+}
+
+// TestWakeUnknownReceiptStateRejected keeps the state field a closed set at the
+// boundary. An invented state is an invalid input and touches no sender.
+func TestWakeUnknownReceiptStateRejected(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", State: DeliveryState("bogus"),
+	})
+	if err == nil {
+		t.Fatal("Wake() error = nil, want an invalid-input error for an unknown receipt state")
+	}
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+		t.Errorf("error = %v, want an AppError with code %q", err, domain.CodeInvalidInput)
+	}
+	if out.State != "" {
+		t.Errorf("state = %q on a rejected call, want empty", out.State)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls = %d, want 0 for an unknown receipt state", sender.calls)
+	}
+}
+
+// TestWakeReportsCallerState proves every state reaches the receipt and that
+// states which do not reach the recipient force OK false. The ADR 0026
+// delivery value is left untouched in every case.
+func TestWakeReportsCallerState(t *testing.T) {
+	cases := []struct {
+		state  DeliveryState
+		wantOK bool
+	}{
+		{StateSpooled, false},
+		{StatePending, false},
+		{StateHeld, false},
+		{StatePushed, true},
+		{StatePushUnreachable, false},
+		{StateRead, true},
+		{StateRefused, false},
+		{StateExpired, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.state), func(t *testing.T) {
+			out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).Wake(
+				context.Background(), WakeInput{Target: "s", Text: "p", State: tc.state})
+			if err != nil {
+				t.Fatalf("Wake() error = %v", err)
+			}
+			if out.State != tc.state {
+				t.Errorf("state = %q, want %q", out.State, tc.state)
+			}
+			if out.OK != tc.wantOK {
+				t.Errorf("ok = %v, want %v for state %q", out.OK, tc.wantOK, tc.state)
+			}
+			if out.Delivery != DeliverySteer {
+				t.Errorf("delivery = %q, want %q; the receipt state must not rewrite delivery", out.Delivery, DeliverySteer)
+			}
+		})
+	}
+}
+
+// TestWakeRefusedIsNotRead is the ADR 0043 acceptance guard: a refused message
+// is never reported as read or as a delivered follow-up, even when a channel
+// acknowledged the send.
+func TestWakeRefusedIsNotRead(t *testing.T) {
+	for _, state := range []DeliveryState{StateRefused, StateExpired, StatePushUnreachable} {
+		if state.IsRead() {
+			t.Errorf("state %q reports IsRead=true, want false", state)
+		}
+	}
+	if !StateRead.IsRead() {
+		t.Error("StateRead reports IsRead=false, want true")
+	}
+
+	out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).Wake(
+		context.Background(), WakeInput{Target: "s", Text: "p", State: StateRefused})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if out.State != StateRefused || out.IsRead() {
+		t.Errorf("state=%q IsRead=%v, want refused/false", out.State, out.IsRead())
+	}
+	if out.OK {
+		t.Error("ok = true for a refused message, want false")
+	}
+	if !strings.Contains(out.Reason, "refused") {
+		t.Errorf("reason = %q, want it to explain the refused receipt", out.Reason)
+	}
+}
+
+// TestWakeDefaultsReceiptStateFromDelivery keeps older callers working: with
+// no State the core claims only what the delivery outcome proves, so a
+// delivered follow-up is pushed and every refusal or interruption is held.
+func TestWakeDefaultsReceiptStateFromDelivery(t *testing.T) {
+	cases := []struct {
+		name   string
+		in     WakeInput
+		sender Delivery
+		want   DeliveryState
+		wantOK bool
+	}{
+		{name: "steer", in: WakeInput{Target: "s", Text: "p"}, sender: DeliverySteer, want: StatePushed, wantOK: true},
+		{name: "queue", in: WakeInput{Target: "s", Text: "p"}, sender: DeliveryQueue, want: StatePushed, wantOK: true},
+		{name: "unsupported", in: WakeInput{Target: "s", Text: "p"}, sender: DeliveryUnsupported, want: StateHeld},
+		{name: "interrupted", in: WakeInput{Target: "s", Text: "p", HasPendingQuestion: true}, sender: DeliverySteer, want: StateHeld},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := NewWakeHandler(&fakeWakeSender{delivery: tc.sender}).Wake(context.Background(), tc.in)
+			if err != nil {
+				t.Fatalf("Wake() error = %v", err)
+			}
+			if out.State != tc.want {
+				t.Errorf("state = %q, want %q", out.State, tc.want)
+			}
+			if out.OK != tc.wantOK {
+				t.Errorf("ok = %v, want %v", out.OK, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestWakeFallbackTraceDefaultsToSpooled covers the fallback path: a message
+// written to the task trace for a later retry is spooled, not delivered.
+func TestWakeFallbackTraceDefaultsToSpooled(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+		ChannelQueue: {delivery: DeliveryQueue},
+	}}
+	out, err := NewFallbackWakeHandler(sender, &fakeConfirmer{}, &fakeTracer{}).WakeWithFallback(
+		context.Background(), WakeInput{Target: "s", Text: "p"})
+	if err != nil {
+		t.Fatalf("WakeWithFallback() error = %v", err)
+	}
+	if out.State != StateSpooled || !out.Traced || out.OK {
+		t.Errorf("state=%q traced=%v ok=%v, want spooled/true/false", out.State, out.Traced, out.OK)
+	}
+}
+
+// TestWakeStateOverInMemoryTransport drives the receipt state through a real
+// MCP client and server. It proves the state is decoded from the schema and
+// echoed on the receipt, not just handled in process.
+func TestWakeStateOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target: "session-1", Text: "obligation-1@7", State: StateRead,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.State != StateRead || !out.IsRead() || !out.OK {
+		t.Errorf("client saw state=%q IsRead=%v ok=%v, want read/true/true", out.State, out.IsRead(), out.OK)
+	}
+}
+
+// TestWakeSchemaHasState proves an MCP client can send the receipt state, so
+// the environment can report where in its life a message actually is.
+func TestWakeSchemaHasState(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "state") {
+		t.Errorf("wake input schema missing state: %s", inputSchema)
+	}
+}
