@@ -1548,3 +1548,329 @@ func TestWaitResultFilterAndStartKeyCompose(t *testing.T) {
 		t.Errorf("subscriptions = %d, want 1", len(source.subscribed))
 	}
 }
+
+// ---- ADR 0046 p3 / T3.106: причина останова wait ----
+
+// TestWaitStopReasonsContract locks the five distinct values, their exit codes
+// and the retry rule. Only an unknown submission is never resent.
+func TestWaitStopReasonsContract(t *testing.T) {
+	all := []WaitStopReason{
+		WaitStopTerminal, WaitStopInputRequired, WaitStopUnknownSubmission,
+		WaitStopTimeout, WaitStopInterrupted,
+	}
+	seen := make(map[WaitStopReason]bool, len(all))
+	for _, r := range all {
+		if !r.valid() {
+			t.Errorf("reason %q is not valid", r)
+		}
+		if seen[r] {
+			t.Errorf("duplicate reason %q", r)
+		}
+		seen[r] = true
+	}
+	if WaitStopReason("").valid() || WaitStopReason("bogus").valid() {
+		t.Error("empty or bogus reason accepted as valid")
+	}
+
+	cases := []struct {
+		reason   WaitStopReason
+		exitCode int
+		retry    bool
+	}{
+		{WaitStopTerminal, 0, true},
+		{WaitStopInputRequired, 0, true},
+		{WaitStopUnknownSubmission, 2, false},
+		{WaitStopTimeout, 143, true},
+		{WaitStopInterrupted, 130, true},
+	}
+	for _, tc := range cases {
+		if got := tc.reason.ExitCode(); got != tc.exitCode {
+			t.Errorf("%q exit code = %d, want %d", tc.reason, got, tc.exitCode)
+		}
+		if got := tc.reason.Retryable(); got != tc.retry {
+			t.Errorf("%q retryable = %v, want %v", tc.reason, got, tc.retry)
+		}
+	}
+}
+
+// TestWaitResultStopReasonTerminal proves a delivered verdict is named
+// terminal and the readAt write is unchanged.
+func TestWaitResultStopReasonTerminal(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: at,
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if reason := StopReasonOf(got); reason != WaitStopTerminal {
+		t.Fatalf("reason = %q, want terminal", reason)
+	}
+	if len(writer.reads) != 1 {
+		t.Errorf("readAt writes = %d, want 1", len(writer.reads))
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"reason":"terminal"`) {
+		t.Errorf("response has no reason field: %s", raw)
+	}
+}
+
+// TestWaitResultStopReasonInputRequired proves a parked watch names
+// input_required without marking the obligation read. The ADR 0037 approval
+// boundary is not moved by the reason.
+func TestWaitResultStopReasonInputRequired(t *testing.T) {
+	svc, store, writer, _, _ := newWaitTestService()
+	store.watch.Status = domain.StatusNeedsInput
+	store.watch.Verdict = domain.VerdictNeedsInput
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if reason := waitStopReasonOf(got); reason != WaitStopInputRequired {
+		t.Fatalf("reason = %q, want input_required", reason)
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("needs_input wrote readAt %d times, want 0", len(writer.reads))
+	}
+}
+
+// TestWaitResultStopReasonUnknownSubmission keeps the error code and names the
+// reason for a submission the store never registered. The reason is not
+// retryable, so a script does not resend it.
+func TestWaitResultStopReasonUnknownSubmission(t *testing.T) {
+	svc, store, _, _, _ := newWaitTestService()
+	store.err = errMissing
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	assertCode(t, err, domain.CodeWatchNotFound)
+	if reason := waitStopReasonOf(got); reason != WaitStopUnknownSubmission {
+		t.Fatalf("reason = %q, want unknown_submission", reason)
+	}
+	if reason := waitStopReasonOf(got); reason.Retryable() {
+		t.Errorf("unknown_submission is retryable: %q", reason)
+	}
+}
+
+// TestWaitResultStopReasonTimeout distinguishes an expired budget from a
+// terminal result. The watching body and the no-write rule stay intact.
+func TestWaitResultStopReasonTimeout(t *testing.T) {
+	svc, _, writer, _, timeout := newWaitTestService()
+	close(timeout)
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if reason := waitStopReasonOf(got); reason != WaitStopTimeout {
+		t.Fatalf("reason = %q, want timeout", reason)
+	}
+	if got.Status != string(domain.StatusWatching) || got.Verdict != string(domain.VerdictWatching) {
+		t.Errorf("status/verdict = %q/%q, want watching/watching", got.Status, got.Verdict)
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("timeout wrote readAt %d times, want 0", len(writer.reads))
+	}
+}
+
+// TestWaitResultStopReasonInterrupted covers the departure channels and an
+// already-cancelled capability tree. Every one keeps its original error code
+// and cancels no extra state through the reason.
+func TestWaitResultStopReasonInterrupted(t *testing.T) {
+	cases := []struct {
+		name      string
+		makeExits func(chan struct{}) CallerExit
+		wantCode  domain.ErrorCode
+	}{
+		{
+			name: "notifications/cancelled",
+			makeExits: func(ch chan struct{}) CallerExit {
+				return CallerExit{Cancelled: ch}
+			},
+			wantCode: domain.CodeCancelled,
+		},
+		{
+			name: "closed session",
+			makeExits: func(ch chan struct{}) CallerExit {
+				return CallerExit{SessionClosed: ch}
+			},
+			wantCode: domain.CodeGone,
+		},
+		{
+			name: "broken connection",
+			makeExits: func(ch chan struct{}) CallerExit {
+				return CallerExit{ConnectionBroken: ch}
+			},
+			wantCode: domain.CodeGone,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, _, _, _, _ := newWaitTestService()
+			ch := make(chan struct{})
+			close(ch)
+			got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, tc.makeExits(ch))
+			assertCode(t, err, tc.wantCode)
+			if reason := waitStopReasonOf(got); reason != WaitStopInterrupted {
+				t.Fatalf("reason = %q, want interrupted", reason)
+			}
+		})
+	}
+
+	t.Run("cancelled capability tree", func(t *testing.T) {
+		svc, _, _, _, _ := newWaitTestService()
+		ctx, journal := newTestCapabilityTree(t, "cap-agent", [2]string{"root", ""})
+		ctx.Cancel(CancelCallerCancelled)
+		got, err := svc.WaitInCapability(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{}, ctx)
+		assertCode(t, err, domain.CodeCancelled)
+		if reason := waitStopReasonOf(got); reason != WaitStopInterrupted {
+			t.Fatalf("reason = %q, want interrupted", reason)
+		}
+		if len(journal.Records()) != 1 {
+			t.Errorf("journal records = %d, want 1", len(journal.Records()))
+		}
+	})
+}
+
+// TestWaitResultEndedSourceHasNoReason proves a closed update channel is not
+// called a timeout. The reason names only the five ADR 0046 p3 cases.
+func TestWaitResultEndedSourceHasNoReason(t *testing.T) {
+	svc, _, _, source, _ := newWaitTestService()
+	sub := source.Subscribe("watch-1").(*waitTestSubscription)
+	close(sub.ch)
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if reason := waitStopReasonOf(got); reason != "" {
+		t.Errorf("reason = %q, want empty for an ended source", reason)
+	}
+}
+
+// TestWaitResultReasonFieldAppendsToFixedSchema locks the JSON: the five
+// ADR 0036 §2 fields keep their order, reason is last, and the reserved Checks
+// key is lifted out instead of leaking into checks.
+func TestWaitResultReasonFieldAppendsToFixedSchema(t *testing.T) {
+	ms := int64(waitResultPollAfterMs)
+	out := withWaitStopReason(WaitResultOutput{
+		Status:      string(domain.StatusClosed),
+		Verdict:     string(domain.VerdictMerged),
+		Revision:    8,
+		Checks:      map[string]domain.Check{"ci/test": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true}},
+		PollAfterMs: &ms,
+	}, WaitStopTerminal)
+	got, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"status":"closed","verdict":"merged","revision":8,"checks":{"ci/test":{"state":"COMPLETED","conclusion":"SUCCESS","required":true,"detailsUrl":""}},"pollAfterMs":5000,"reason":"terminal"}`
+	if string(got) != want {
+		t.Fatalf("reason bytes:\n got  %s\n want %s", got, want)
+	}
+	if strings.Contains(string(got), waitStopReasonCheckName) {
+		t.Errorf("reserved check leaked into the response: %s", got)
+	}
+	if _, ok := out.Checks[waitStopReasonCheckName]; !ok {
+		t.Error("reason is not carried in Checks")
+	}
+}
+
+// TestWaitReasonSurvivesStartKeyJoin proves the ADR 0045 p1 start key returns
+// the same reason to a repeat whose first response was lost (ADR 0046 p3).
+func TestWaitReasonSurvivesStartKeyJoin(t *testing.T) {
+	svc, _, _, _, timeout := newWaitTestService()
+	close(timeout)
+	in := WaitResultInput{WatchID: "watch-1", StartKey: "start-1"}
+
+	first, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+	second, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("repeat Wait: %v", err)
+	}
+	if reason := waitStopReasonOf(first); reason != WaitStopTimeout {
+		t.Fatalf("first reason = %q, want timeout", reason)
+	}
+	if reason := waitStopReasonOf(second); reason != WaitStopTimeout {
+		t.Fatalf("repeat reason = %q, want timeout", reason)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("results = %+v / %+v, want identical reasons", first, second)
+	}
+}
+
+// TestWaitResultFilterProgressHasNoReason proves the event filter still wakes
+// on progress without inventing a stop reason (ADR 0045 p1, ADR 0037).
+func TestWaitResultFilterProgressHasNoReason(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 13, 30, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventProgress, Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, Revision: 8, At: at,
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", EventKinds: []string{"progress"}}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if reason := waitStopReasonOf(got); reason != "" {
+		t.Errorf("reason = %q, want empty for a progress tick", reason)
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("progress wrote readAt %d times, want 0", len(writer.reads))
+	}
+}
+
+// TestWaitResultHandleExposesReason proves the typed handler returns the reason
+// as a field in its output type, so go-sdk derives a schema that admits it.
+func TestWaitResultHandleExposesReason(t *testing.T) {
+	svc, _, _, source, _ := newWaitTestService()
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC),
+	})
+
+	_, out, err := svc.Handle(context.Background(), nil, WaitResultInput{WatchID: "watch-1"})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if out.Reason != WaitStopTerminal {
+		t.Fatalf("Reason = %q, want terminal", out.Reason)
+	}
+	if _, ok := out.Checks[waitStopReasonCheckName]; ok {
+		t.Error("reserved check leaked into the handler output")
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"status":"closed","verdict":"merged","revision":8,"pollAfterMs":5000,"reason":"terminal"}`
+	if string(raw) != want {
+		t.Fatalf("handler bytes:\n got  %s\n want %s", raw, want)
+	}
+}
+
+// TestOutputSchemaWaitReasonOutputAdmitsReason proves the type returned by the
+// handler derives a schema that contains the reason field.
+func TestOutputSchemaWaitReasonOutputAdmitsReason(t *testing.T) {
+	schema, err := OutputSchema[WaitReasonOutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	for _, name := range []string{"status", "verdict", "revision", "checks", "pollAfterMs", "reason"} {
+		if _, ok := schema.Properties[name]; !ok {
+			t.Errorf("WaitReasonOutput schema missing property %q", name)
+		}
+	}
+}
