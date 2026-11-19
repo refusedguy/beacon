@@ -1,10 +1,13 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -60,6 +63,12 @@ func receiptLineWithSource(obligationID string, attempt int, outcome, source str
 
 func worktreeSourceJSON(file string) string {
 	return fmt.Sprintf(`{"kind":"worktree","worktreeFile":%q}`, file)
+}
+
+func receiptLineWithVersion(obligationID string, attempt int, outcome, version string) string {
+	return fmt.Sprintf(
+		`{"obligationID":%q,"attempt":%d,"outcome":%q,"at":%q,"source":%s,"version":%s}`,
+		obligationID, attempt, outcome, testReceiptAt, worktreeSourceJSON("result.json"), version)
 }
 
 func TestImportReceiptsIdempotent(t *testing.T) {
@@ -525,5 +534,174 @@ func TestRejectDuplicateReceiptRecordedOnRepeat(t *testing.T) {
 	}
 	if count, err := d.TaskStartCount(); err != nil || count != 1 {
 		t.Fatalf("TaskStartCount = %d, %v; want 1", count, err)
+	}
+}
+
+func TestReceiptAgentVersionPersisted(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "ver-1")
+
+	line := receiptLineWithVersion("ver-1", 1, "posted",
+		`{"model":"hy4-flash","prompt":"worker-v3","tools":["get_result","ack"]}`)
+	path := writeReceiptsFile(t, line+"\n")
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 1 || result.Malformed != 0 {
+		t.Fatalf("result = %+v, want 1 imported, no malformed", result)
+	}
+
+	got, err := d.Receipts("ver-1")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("stored receipts = %+v, want 1", got)
+	}
+	want := AgentVersion{Model: "hy4-flash", Prompt: "worker-v3", Tools: []string{"get_result", "ack"}}
+	if !reflect.DeepEqual(got[0].Version, want) {
+		t.Errorf("version = %+v, want %+v", got[0].Version, want)
+	}
+}
+
+func TestReceiptWithoutVersionStillImports(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "ver-old")
+
+	path := writeReceiptsFile(t, receiptLine("ver-old", 1, "posted")+"\n")
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 1 {
+		t.Fatalf("result = %+v, want 1 imported", result)
+	}
+	got, err := d.Receipts("ver-old")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("stored receipts = %+v, want 1", got)
+	}
+	if !reflect.DeepEqual(got[0].Version, AgentVersion{}) {
+		t.Errorf("version = %+v, want zero value for an old line without version", got[0].Version)
+	}
+}
+
+func TestReceiptMalformedVersionRejected(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "ver-bad")
+
+	lines := []string{
+		receiptLineWithVersion("ver-bad", 1, "posted", `{"tools":["ok",7]}`),
+		receiptLineWithVersion("ver-bad", 2, "posted", `{"model":"x"} garbage`),
+	}
+	path := writeReceiptsFile(t, strings.Join(lines, "\n")+"\n")
+	result, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if result.Imported != 0 || result.Malformed != len(lines) {
+		t.Fatalf("result = %+v, want 0 imported and %d malformed", result, len(lines))
+	}
+	count, err := d.ReceiptCount()
+	if err != nil {
+		t.Fatalf("ReceiptCount: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("receipt count = %d, want 0", count)
+	}
+}
+
+func TestReceiptVersionStableOnReimport(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "ver-repeat")
+
+	line := receiptLineWithVersion("ver-repeat", 1, "posted",
+		`{"model":"hy4-flash","prompt":"worker-v3","tools":["get_result"]}`)
+	path := writeReceiptsFile(t, line+"\n")
+	if _, err := d.ImportReceipts(path); err != nil {
+		t.Fatalf("first import: %v", err)
+	}
+	second, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if second.Imported != 0 || second.Duplicates != 1 {
+		t.Fatalf("second import = %+v, want 0 imported, 1 duplicate", second)
+	}
+	got, err := d.Receipts("ver-repeat")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 1 || got[0].Version.Model != "hy4-flash" || got[0].Version.Prompt != "worker-v3" {
+		t.Errorf("stored receipts = %+v, want one with the version unchanged", got)
+	}
+}
+
+func TestReceiptVersionColumnAddedToLegacyTable(t *testing.T) {
+	d := newReceiptDB(t)
+
+	// A receipts table made by a build before versions were recorded has no
+	// version column. Import must add it and still store the label.
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DROP TABLE IF EXISTS receipts`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			CREATE TABLE receipts (
+			  seq           INTEGER PRIMARY KEY,
+			  obligation_id TEXT NOT NULL,
+			  attempt       INTEGER NOT NULL,
+			  outcome       TEXT NOT NULL,
+			  at            INTEGER NOT NULL,
+			  raw           BLOB NOT NULL,
+			  imported_at   INTEGER NOT NULL,
+			  UNIQUE (obligation_id, attempt)
+			)`)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("create legacy table: %v", err)
+	}
+
+	seedReceiptObligation(t, d, "ver-legacy")
+	line := receiptLineWithVersion("ver-legacy", 1, "posted",
+		`{"model":"old-model","prompt":"old-prompt","tools":["ack"]}`)
+	path := writeReceiptsFile(t, line+"\n")
+	if _, err := d.ImportReceipts(path); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	got, err := d.Receipts("ver-legacy")
+	if err != nil {
+		t.Fatalf("Receipts: %v", err)
+	}
+	if len(got) != 1 || got[0].Version.Model != "old-model" || got[0].Version.Prompt != "old-prompt" {
+		t.Fatalf("stored receipts = %+v, want the version from a legacy table", got)
+	}
+
+	rows, err := d.readDB.Query(`PRAGMA table_info(receipts)`)
+	if err != nil {
+		t.Fatalf("table info: %v", err)
+	}
+	defer rows.Close()
+	hasVersion := false
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("scan column: %v", err)
+		}
+		if name == "version" {
+			hasVersion = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("column rows: %v", err)
+	}
+	if !hasVersion {
+		t.Error("legacy receipts table has no version column")
 	}
 }
