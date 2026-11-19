@@ -714,3 +714,180 @@ func (d *DB) ReceiptCount() (int, error) {
 	err = d.readDB.QueryRow(`SELECT count(*) FROM receipts`).Scan(&n)
 	return n, err
 }
+
+// ADR 0049 §3. The fence token, the enqueue and the task data change commit in
+// one transaction. The token is the one the T3.51 claim issued, carried in by
+// the worker. This file does not mint a new monotonic counter. The store keeps
+// the highest token it has seen for a task. A worker whose lease was taken
+// away presents an older token and the whole write is refused, so it cannot
+// publish a receipt or a queue row that belongs to a newer lease.
+
+// createTaskFencesSQL owns the per-task fence token. The table is created on
+// first use here, like receipts and the other tables in this package. task_id
+// is the primary key, so a task holds at most one token.
+const createTaskFencesSQL = `
+CREATE TABLE IF NOT EXISTS task_fences (
+  task_id       TEXT PRIMARY KEY,
+  fencing_token INTEGER NOT NULL,
+  owner_id      TEXT NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+`
+
+// FencedEnqueue is one atomic task mutation. FencingToken is the lease number
+// from the T3.51 claim. Receipt and Raw carry the task data change, Message is
+// the task put on the durable queue. All three are written in one transaction.
+type FencedEnqueue struct {
+	TaskID       string
+	OwnerID      string
+	FencingToken uint64
+	Receipt      Receipt
+	Raw          []byte
+	Message      InboxMessage
+}
+
+// FencedEnqueueResult reports what one EnqueueFenced committed. Enqueued and
+// Applied are false on an idempotent repeat with a token the task already has.
+type FencedEnqueueResult struct {
+	FencingToken uint64
+	Enqueued     bool
+	Applied      bool
+}
+
+// FenceTokenStaleError reports an enqueue whose token is older than the token
+// the task already holds. The worker lost its lease, so the store refuses the
+// write before changing a token, the task data or the queue.
+type FenceTokenStaleError struct {
+	Presented uint64
+	Current   uint64
+}
+
+func (e *FenceTokenStaleError) Error() string {
+	return fmt.Sprintf("store: fence token %d is stale, task holds token %d", e.Presented, e.Current)
+}
+
+// IsStaleFenceToken reports whether err is a stale token rejection.
+func IsStaleFenceToken(err error) bool {
+	var stale *FenceTokenStaleError
+	return errors.As(err, &stale)
+}
+
+// EnqueueFenced commits the fence token, the receipt data change and the queue
+// row in one transaction (ADR 0049 §3). A token lower than the task's current
+// one is refused. A token equal to the current one is an idempotent retry. It
+// inserts no second receipt and no second queue row. A higher token becomes the
+// task's new fence and the receipt and message are applied with it.
+func (d *DB) EnqueueFenced(e FencedEnqueue) (FencedEnqueueResult, error) {
+	if strings.TrimSpace(e.TaskID) == "" {
+		return FencedEnqueueResult{}, domain.NewAppError(domain.CodeInvalidInput,
+			"store: fenced enqueue: empty task id")
+	}
+	if strings.TrimSpace(e.OwnerID) == "" {
+		return FencedEnqueueResult{}, domain.NewAppError(domain.CodeInvalidInput,
+			"store: fenced enqueue: empty owner id")
+	}
+	if e.FencingToken == 0 {
+		return FencedEnqueueResult{}, domain.NewAppError(domain.CodeInvalidInput,
+			"store: fenced enqueue: fencing token is required")
+	}
+	if strings.TrimSpace(e.Message.WatchID) == "" || strings.TrimSpace(e.Message.SubscriberID) == "" ||
+		strings.TrimSpace(e.Message.PeerName) == "" {
+		return FencedEnqueueResult{}, domain.NewAppError(domain.CodeInvalidInput,
+			"store: fenced enqueue: message needs watch, subscriber and peer")
+	}
+
+	var result FencedEnqueueResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createTaskFencesSQL); err != nil {
+			return fmt.Errorf("store: fenced enqueue: create fence table: %w", err)
+		}
+
+		var current uint64
+		if err := tx.QueryRow(`SELECT fencing_token FROM task_fences WHERE task_id = ?`, e.TaskID).Scan(&current); err != nil {
+			if !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("store: fenced enqueue: read fence: %w", err)
+			}
+			current = 0
+		}
+		if e.FencingToken < current {
+			return &FenceTokenStaleError{Presented: e.FencingToken, Current: current}
+		}
+		result.FencingToken = e.FencingToken
+
+		if e.FencingToken > current {
+			if _, err := tx.Exec(`
+				INSERT INTO task_fences (task_id, fencing_token, owner_id, updated_at)
+				VALUES (?, ?, ?, ?)
+				ON CONFLICT(task_id) DO UPDATE SET
+				  fencing_token = excluded.fencing_token,
+				  owner_id      = excluded.owner_id,
+				  updated_at    = excluded.updated_at`,
+				e.TaskID, int64(e.FencingToken), e.OwnerID, time.Now().UTC().UnixNano()); err != nil {
+				return fmt.Errorf("store: fenced enqueue: write fence: %w", err)
+			}
+		}
+
+		if e.Receipt.Verified {
+			if _, err := tx.Exec(createReceiptsSQL); err != nil {
+				return fmt.Errorf("store: fenced enqueue: create receipts: %w", err)
+			}
+			for _, column := range []string{"source", "version"} {
+				if err := ensureReceiptColumn(tx, column); err != nil {
+					return err
+				}
+			}
+			inserted, err := insertReceipt(tx, e.Receipt, e.Raw)
+			if err != nil {
+				return err
+			}
+			if inserted {
+				applied, err := applyReceipt(tx, e.Receipt)
+				if err != nil {
+					return err
+				}
+				result.Applied = applied
+			}
+		}
+
+		if err := ensureInbox(tx); err != nil {
+			return err
+		}
+		key := InboxKey(e.Message.WatchID, e.Message.Revision, e.Message.SubscriberID)
+		res, err := tx.Exec(`
+			INSERT OR IGNORE INTO inbox_messages
+			  (key, watch_id, revision, subscriber_id, peer_name, payload, state, lease_until, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+			key, e.Message.WatchID, e.Message.Revision, e.Message.SubscriberID, e.Message.PeerName,
+			Redact(e.Message.Payload), inboxStatePending, time.Now().UTC().UnixNano())
+		if err != nil {
+			return fmt.Errorf("store: fenced enqueue: enqueue: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: fenced enqueue: rows affected: %w", err)
+		}
+		result.Enqueued = n == 1
+		return nil
+	})
+	if err != nil {
+		return FencedEnqueueResult{}, err
+	}
+	return result, nil
+}
+
+// TaskFence returns the fence token the task currently holds and whether a
+// fence was recorded. A task without a fence has never had a fenced enqueue.
+func (d *DB) TaskFence(taskID string) (uint64, bool, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "task_fences")
+	if err != nil || !ok {
+		return 0, false, err
+	}
+	var token int64
+	if err := d.readDB.QueryRow(`SELECT fencing_token FROM task_fences WHERE task_id = ?`, taskID).Scan(&token); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return uint64(token), true, nil
+}
