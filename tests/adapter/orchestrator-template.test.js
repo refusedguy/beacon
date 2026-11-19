@@ -31,7 +31,7 @@ const MARKERS = [
   },
   {
     name: "ключ идемпотентности (watchID, revision)",
-    pattern: /Ключ идемпотентности мержа это пара `\(watchID, revision\)`[\s\S]*?повторный prompt с тем же `\(watchID, revision\)` не создаёт второй мерж/,
+    pattern: /Ключ идемпотентности мержа это пара `\(watchID, revision\)`[\s\S]*?Повторный prompt с тем же `\(watchID, revision\)` не создаёт второй мерж/,
   },
   {
     name: "subagent-отчёт не вердикт",
