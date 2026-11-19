@@ -22,6 +22,29 @@ const StatusNeedsInput Status = "needs_input"
 // marks an obligation read.
 const VerdictNeedsInput Verdict = "needs_input"
 
+// StatusParked is the lifecycle state of a Watch whose execution step failed
+// with a limit, an exhausted budget, a crash or an external-step error
+// (ADR 0039 §1). Parking keeps the Watch and its full error text for a human.
+// It never schedules a blind retry. It is not a branch of the ADR 0017
+// delivery ladder: that ladder classifies notification outcomes, while parking
+// classifies the execution step and the external verdict.
+const StatusParked Status = "parked"
+
+// VerdictParked is the verdict carried while a Watch is parked after a failed
+// execution step. Like watching, it is not a result that marks an obligation read.
+const VerdictParked Verdict = "parked"
+
+// ParkReason is the machine-readable cause kept with a parked Watch in the
+// journal (ADR 0039 §1).
+type ParkReason string
+
+const (
+	ParkReasonLimit  ParkReason = "limit"
+	ParkReasonBudget ParkReason = "budget"
+	ParkReasonCrash  ParkReason = "crash"
+	ParkReasonError  ParkReason = "error"
+)
+
 // MaxContinueRounds is the ADR 0031 §3 cap on human-answer rounds for one
 // Watch. A fifth answer may resume the task; a sixth is refused.
 const MaxContinueRounds uint64 = 5
@@ -37,6 +60,9 @@ const (
 	EventNeedsInput EventKind = "needs_input"
 	// EventContinue resumes a parked Watch with a human answer.
 	EventContinue EventKind = "continue"
+	// EventPark parks a Watch after a failed execution step: a limit, an
+	// exhausted budget, a crash or an external-step error (ADR 0039 §1).
+	EventPark EventKind = "park"
 )
 
 // CloseReason is the machine-readable cause stored on a closed Watch.
@@ -60,6 +86,10 @@ type Event struct {
 	At         time.Time
 	ContinueOf string
 	Round      uint64
+	// ParkReason and ParkError are used only by EventPark. ParkError is the
+	// full error text and is never truncated by the domain.
+	ParkReason ParkReason
+	ParkError  string
 }
 
 // EffectKind identifies a side effect the caller must perform after Transition.
@@ -74,6 +104,9 @@ const (
 	// EffectContinueWatch resumes the same parked Watch after a human answer.
 	// It never carries a new Watch ID: the task identity is preserved.
 	EffectContinueWatch EffectKind = "continue_watch"
+	// EffectLogPark writes the full error text and the park reason into the
+	// journal. It is the only effect of parking, so no retry is ever staged.
+	EffectLogPark EffectKind = "log_park"
 )
 
 // Effect describes work deferred to the adapter layer. Transition only returns
@@ -85,6 +118,10 @@ type Effect struct {
 	Verdict     Verdict
 	HeadSHA     string
 	Subscribers []Subscriber
+	// ParkReason and ParkError are used only by EffectLogPark. They carry the
+	// reason and the full error text to the journal, which performs the I/O.
+	ParkReason ParkReason
+	ParkError  string
 }
 
 // Constructors keep callers from building malformed events by hand.
@@ -112,6 +149,13 @@ func ContinueEvent(continueOf string, round uint64, at time.Time) Event {
 	return Event{Kind: EventContinue, ContinueOf: continueOf, Round: round, At: at}
 }
 
+// ParkEvent parks a Watch after a failed execution step. reason is the cause
+// written to the journal and parkError is the full error text, carried through
+// unchanged to EffectLogPark.
+func ParkEvent(reason ParkReason, parkError string, at time.Time) Event {
+	return Event{Kind: EventPark, ParkReason: reason, ParkError: parkError, At: at}
+}
+
 // CanContinueRound reports whether round is a permitted human-answer round.
 // Rounds start at one and stop at MaxContinueRounds.
 func CanContinueRound(round uint64) bool {
@@ -134,12 +178,22 @@ func CanContinueRound(round uint64) bool {
 //	needs_input -> watching : human answer via ContinueEvent with a valid round
 //	needs_input -> closed   : cancel or head_changed
 //	needs_input -> needs_input: repeated question or out-of-range answer (no-op)
+//	watching  -> parked    : failed execution step (limit/budget/crash/error)
+//	notifying -> parked    : same failure after an actionable verdict
+//	needs_input -> parked   : same failure while waiting for a human answer
+//	parked    -> parked    : repeated failure or a verdict/answer/needs_input event (no-op)
+//	parked    -> closed    : cancel or head_changed
 //	closed    -> closed     : no-op (terminal)
 //
 // Forbidden transitions: anything leaving closed (closed -> watching,
-// closed -> notifying, closed -> needs_input). A cancelled Watch therefore
-// never becomes ready. A ContinueEvent whose ContinueOf is a different Watch
-// is also a no-op: an answer can never become a new task.
+// closed -> notifying, closed -> needs_input, closed -> parked). A cancelled
+// Watch therefore never becomes ready. A parked Watch never resumes from a
+// verdict, a ContinueEvent or a needs_input event: leaving park is a human
+// action that starts a new record, not a retry of the failed step. Head change
+// still closes a parked Watch and creates a successor, as it does for any live
+// Watch (ADR 0019); that is a new PR head, not a retry of the failure. A
+// ContinueEvent whose ContinueOf is a different Watch is also a no-op: an
+// answer can never become a new task.
 //
 // Revision grows only when the verdict changes, including a re-run downgrade
 // to watching at the same SHA. It never grows on watching -> watching. There
@@ -174,6 +228,8 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		return parkForInput(w, e)
 	case EventContinue:
 		return continueWatch(w, e)
+	case EventPark:
+		return parkOnFailure(w, e)
 	default:
 		return next, nil
 	}
@@ -184,13 +240,36 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 // subscribers, so a later answer resumes this task rather than creating one.
 func parkForInput(w Watch, e Event) (Watch, []Effect) {
 	next := cloneWatch(w)
-	if w.Status == StatusClosed || w.Status == StatusNeedsInput {
+	if w.Status == StatusClosed || w.Status == StatusNeedsInput || w.Status == StatusParked {
 		return next, nil
 	}
 	next.Status = StatusNeedsInput
 	next.Verdict = VerdictNeedsInput
 	next.Revision = bumpRevision(w.Revision)
 	return next, nil
+}
+
+// parkOnFailure parks a live Watch after a failed execution step (ADR 0039 §1).
+// It is idempotent: re-parking a parked Watch changes nothing and emits no
+// second journal entry. A closed Watch cannot be parked. The full error text
+// and reason travel in EffectLogPark, so the domain never truncates text or
+// performs I/O. No wake or continue effect is produced, so nothing retries the
+// failed step; a human clears the cause and starts a new record to resume work.
+func parkOnFailure(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed || w.Status == StatusParked {
+		return next, nil
+	}
+	next.Status = StatusParked
+	next.Verdict = VerdictParked
+	next.Revision = bumpRevision(w.Revision)
+	return next, []Effect{{
+		Kind:       EffectLogPark,
+		WatchID:    w.ID,
+		Revision:   next.Revision,
+		ParkReason: e.ParkReason,
+		ParkError:  e.ParkError,
+	}}
 }
 
 // continueWatch resumes a parked Watch on a human answer. It refuses an answer
@@ -213,7 +292,7 @@ func continueWatch(w Watch, e Event) (Watch, []Effect) {
 
 func transitionVerdict(w Watch, e Event) (Watch, []Effect) {
 	next := cloneWatch(w)
-	if w.Status == StatusClosed || !validVerdict(e.Verdict) {
+	if w.Status == StatusClosed || w.Status == StatusParked || !validVerdict(e.Verdict) {
 		return next, nil
 	}
 	v := e.Verdict
