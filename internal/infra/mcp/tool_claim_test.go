@@ -859,9 +859,10 @@ func TestAttachWorktreeLeaseRegistersToolsOnce(t *testing.T) {
 
 	session := connectClaimServer(t, server)
 	counts := map[string]int{
-		LeaseWorktreeToolName:   0,
-		WriteWorktreeToolName:   0,
-		ReleaseWorktreeToolName: 0,
+		LeaseWorktreeToolName:     0,
+		WriteWorktreeToolName:     0,
+		ReleaseWorktreeToolName:   0,
+		HeartbeatWorktreeToolName: 0,
 	}
 	for tool, err := range session.Tools(context.Background(), nil) {
 		if err != nil {
@@ -871,9 +872,246 @@ func TestAttachWorktreeLeaseRegistersToolsOnce(t *testing.T) {
 			counts[tool.Name]++
 		}
 	}
-	for _, name := range []string{LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName} {
+	for _, name := range []string{LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName, HeartbeatWorktreeToolName} {
 		if counts[name] != 1 {
 			t.Errorf("%s registered %d times, want 1", name, counts[name])
 		}
+	}
+}
+
+// beatLease is the worker-side heartbeat call used by the ADR 0046 p1 tests. A
+// lost lease is reported as a false result, so a heartbeat error here is a test
+// failure rather than an expected lease-lost outcome.
+func beatLease(t *testing.T, h *WorktreeLeaseHandler, worktreeID, ownerID string, token uint64) bool {
+	t.Helper()
+	out, err := h.Heartbeat(context.Background(), WorktreeHeartbeatInput{
+		WorktreeID: worktreeID, OwnerID: ownerID, FencingToken: token,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	return out.Alive
+}
+
+// TestHeartbeatTrueWhileLeaseLive is the base of ADR 0046 p1: while the lease
+// is held, the beat says the worker may continue.
+func TestHeartbeatTrueWhileLeaseLive(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 16, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-hb", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if !beatLease(t, h, "wt-hb", "alice", lease.FencingToken) {
+		t.Fatal("heartbeat on a live lease must be alive")
+	}
+
+	// The typed tool handler carries the same boolean to the MCP client.
+	_, out, err := h.HandleHeartbeat(ctx, nil, WorktreeHeartbeatInput{
+		WorktreeID: "wt-hb", OwnerID: "alice", FencingToken: lease.FencingToken,
+	})
+	if err != nil {
+		t.Fatalf("heartbeat handler: %v", err)
+	}
+	if !out.Alive {
+		t.Fatal("heartbeat handler on a live lease must report alive")
+	}
+}
+
+// TestHeartbeatFalseAfterTTL checks that a lease lost by time is discovered at
+// the next beat and is reported as false, not as an error.
+func TestHeartbeatFalseAfterTTL(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 17, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-ttl", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if !beatLease(t, h, "wt-ttl", "alice", lease.FencingToken) {
+		t.Fatal("heartbeat before TTL must be alive")
+	}
+
+	clock.Advance(2 * time.Minute)
+	if beatLease(t, h, "wt-ttl", "alice", lease.FencingToken) {
+		t.Fatal("heartbeat after TTL must be false")
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-ttl", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); !IsWorktreeLeaseExpired(err) {
+		t.Fatalf("write after TTL: err = %v, want worktree lease expired", err)
+	}
+}
+
+// TestHeartbeatDoesNotRenewLease fixes the cheap, read-only nature of the beat:
+// repeated beating must not extend the TTL decided at acquire.
+func TestHeartbeatDoesNotRenewLease(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 18, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-renew", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	clock.Advance(30 * time.Second)
+	for i := 0; i < 5; i++ {
+		if !beatLease(t, h, "wt-renew", "alice", lease.FencingToken) {
+			t.Fatalf("beat %d before TTL must be alive", i)
+		}
+	}
+	clock.Advance(31 * time.Second)
+	if beatLease(t, h, "wt-renew", "alice", lease.FencingToken) {
+		t.Fatal("repeated beats must not keep an expired lease alive")
+	}
+}
+
+// TestHeartbeatFalseAfterLeaseTaken is the ADR 0046 p1 reassignment case: a
+// slow owner keeps beating true until the worktree is taken, then the very next
+// beat from that owner is false while the new owner's beat is true.
+func TestHeartbeatFalseAfterLeaseTaken(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 19, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	alice, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-taken", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("alice lease: %v", err)
+	}
+	clock.Advance(30 * time.Second)
+	if !beatLease(t, h, "wt-taken", "alice", alice.FencingToken) {
+		t.Fatal("alice beat before the takeover must be alive")
+	}
+
+	clock.Advance(2 * time.Minute)
+	bob, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-taken", OwnerID: "bob", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("bob lease after TTL: %v", err)
+	}
+	if bob.FencingToken <= alice.FencingToken {
+		t.Fatalf("bob token = %d, want > %d", bob.FencingToken, alice.FencingToken)
+	}
+	if beatLease(t, h, "wt-taken", "alice", alice.FencingToken) {
+		t.Fatal("alice beat after takeover must be false")
+	}
+	if !beatLease(t, h, "wt-taken", "bob", bob.FencingToken) {
+		t.Fatal("bob beat on the taken lease must be alive")
+	}
+
+	// The beat is not a replacement for the T3.51 fencing token: a write with
+	// the old token is still refused after the false beat.
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-taken", OwnerID: "alice", FencingToken: alice.FencingToken,
+	}); !IsStaleWorktreeLease(err) {
+		t.Fatalf("alice write after takeover: err = %v, want stale worktree lease", err)
+	}
+}
+
+// TestHeartbeatFalseAfterRelease covers the other way a lease is given up.
+func TestHeartbeatFalseAfterRelease(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 20, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-rel", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if _, err := h.Release(ctx, WorktreeReleaseInput{
+		WorktreeID: "wt-rel", OwnerID: "alice", FencingToken: lease.FencingToken,
+	}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if beatLease(t, h, "wt-rel", "alice", lease.FencingToken) {
+		t.Fatal("heartbeat after release must be false")
+	}
+}
+
+// TestHeartbeatFalseOnOwnerMismatch checks that the worker identity is part of
+// the beat: a different agent cannot claim the lease is still its own.
+func TestHeartbeatFalseOnOwnerMismatch(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 21, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	lease, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-owner", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if beatLease(t, h, "wt-owner", "bob", lease.FencingToken) {
+		t.Fatal("heartbeat with another owner must be false")
+	}
+	if !beatLease(t, h, "wt-owner", "alice", lease.FencingToken) {
+		t.Fatal("heartbeat with the real owner must still be alive")
+	}
+}
+
+// TestWorkerStopsAfterHeartbeatFalse is the acceptance of T3.109: the worker
+// writes its result while the beat is true, loses the lease, reads false on the
+// next beat and stops. It never writes the result a second time, and the write
+// boundary would refuse the old token even if it tried.
+func TestWorkerStopsAfterHeartbeatFalse(t *testing.T) {
+	clock := &leaseTestClock{t: time.Date(2026, 11, 20, 22, 0, 0, 0, time.UTC)}
+	h := NewWorktreeLeaseHandler(clock)
+	ctx := context.Background()
+
+	alice, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-worker", OwnerID: "alice", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("alice lease: %v", err)
+	}
+	if !beatLease(t, h, "wt-worker", "alice", alice.FencingToken) {
+		t.Fatal("worker must continue while the beat is true")
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-worker", OwnerID: "alice", FencingToken: alice.FencingToken,
+	}); err != nil {
+		t.Fatalf("first result write: %v", err)
+	}
+
+	clock.Advance(2 * time.Minute)
+	bob, err := h.Acquire(ctx, WorktreeLeaseInput{WorktreeID: "wt-worker", OwnerID: "bob", TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("bob lease after takeover: %v", err)
+	}
+	if beatLease(t, h, "wt-worker", "alice", alice.FencingToken) {
+		t.Fatal("worker must see a false beat after the takeover")
+	}
+
+	// The worker stops here: no second Write call from alice. The check below
+	// proves the stop is not cosmetic; a stale write would be refused anyway.
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-worker", OwnerID: "alice", FencingToken: alice.FencingToken,
+	}); !IsStaleWorktreeLease(err) {
+		t.Fatalf("stale second write: err = %v, want stale worktree lease", err)
+	}
+	if _, err := h.Write(ctx, WorktreeWriteInput{
+		WorktreeID: "wt-worker", OwnerID: "bob", FencingToken: bob.FencingToken,
+	}); err != nil {
+		t.Fatalf("bob result write: %v", err)
+	}
+}
+
+// TestHeartbeatInvalidInput rejects incomplete beats at the boundary before
+// the store is touched, like the other worktree lease tools.
+func TestHeartbeatInvalidInput(t *testing.T) {
+	h := NewWorktreeLeaseHandler(nil)
+	for _, tc := range []struct {
+		name string
+		in   WorktreeHeartbeatInput
+	}{
+		{"no worktree", WorktreeHeartbeatInput{OwnerID: "alice", FencingToken: 1}},
+		{"no owner", WorktreeHeartbeatInput{WorktreeID: "wt", FencingToken: 1}},
+		{"no token", WorktreeHeartbeatInput{WorktreeID: "wt", OwnerID: "alice"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := h.Heartbeat(context.Background(), tc.in)
+			var app *domain.AppError
+			if !errors.As(err, &app) || app.Code != domain.CodeInvalidInput {
+				t.Fatalf("err = %v, want INVALID_INPUT", err)
+			}
+		})
 	}
 }
