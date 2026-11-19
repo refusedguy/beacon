@@ -359,8 +359,8 @@ func TestWaitTelemetryInStats(t *testing.T) {
 	out := callStats(t, NewStatsHandler(reader))
 
 	entry := waitTelemetryEntry(out)
-	if !strings.Contains(entry, "ci wait 40%") {
-		t.Errorf("wait telemetry = %q, want wait share 40%%", entry)
+	if !strings.Contains(entry, "ci wait 45%") {
+		t.Errorf("wait telemetry = %q, want wait share 45%%", entry)
 	}
 	if !strings.Contains(entry, "avg 1.5 workers") {
 		t.Errorf("wait telemetry = %q, want average 1.5 workers", entry)
