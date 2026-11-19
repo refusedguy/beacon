@@ -899,3 +899,313 @@ func (r *TaskRegistry) Get(handle string) (*BackgroundTask, bool) {
 	t, ok := r.tasks[handle]
 	return t, ok
 }
+
+// --- MCP protocol tasks/get contract with TTL and notifications (ADR 0056 f1) ---
+//
+// This section is the protocol-level contract of the io.modelcontextprotocol/
+// tasks extension (SEP-2663, schema/2026-07-28). It is deliberately NOT the
+// internal background-task handle above. T3.113's BackgroundTask and
+// TaskRegistry decide how Beacon stores and streams one Watch result; this
+// section fixes what a client sees on the wire:
+//
+//   - starting long work returns a task_id immediately, so the caller does not
+//     hold a connection open while the work runs (CreateTaskResult);
+//   - the caller retrieves status and result later with tasks/get;
+//   - every task carries a TTL after which it is gone;
+//   - progress and result changes are published as notifications/tasks.
+//
+// Names and status values are the schema's, with no local variants (ADR 0030 §1).
+// Beacon keeps its own storage, work queue and event delivery behind this
+// contract; only the wire shape lives here (ADR 0056 feature 1).
+
+// TasksGetMethod is the JSON-RPC method of the contract.
+const TasksGetMethod = "tasks/get"
+
+// taskStatusNotificationMethod is the notifications/tasks method of the
+// extension.
+const taskStatusNotificationMethod = "notifications/tasks"
+
+// taskResultTypeComplete is the tasks/get response discriminator. The create
+// discriminator reuses TaskResultType ("task") from schema.go.
+const taskResultTypeComplete = "complete"
+
+// TaskState is the status of a task. The five values are the schema values,
+// never local spellings (ADR 0030 §1).
+type TaskState string
+
+const (
+	TaskStateWorking       TaskState = "working"
+	TaskStateInputRequired TaskState = "input_required"
+	TaskStateCompleted     TaskState = "completed"
+	TaskStateFailed        TaskState = "failed"
+	TaskStateCancelled     TaskState = "cancelled"
+)
+
+// Terminal reports whether s is a final state. A terminal task is never
+// reopened: a later event cannot replace its result (ADR 0030 §3).
+func (s TaskState) Terminal() bool {
+	switch s {
+	case TaskStateCompleted, TaskStateFailed, TaskStateCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// validTaskState reports whether s is one of the schema's five statuses.
+func validTaskState(s TaskState) bool {
+	switch s {
+	case TaskStateWorking, TaskStateInputRequired, TaskStateCompleted, TaskStateFailed, TaskStateCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+// NotificationKind classifies a task status as a progress update or a final
+// result. It is derived from status; the wire notification has no local kind
+// field (ADR 0030 §1).
+type NotificationKind string
+
+const (
+	NotificationProgress NotificationKind = "progress"
+	NotificationResult   NotificationKind = "result"
+)
+
+func (s TaskState) NotificationKind() NotificationKind {
+	if s.Terminal() {
+		return NotificationResult
+	}
+	return NotificationProgress
+}
+
+// ProtocolTask is the Task object of the extension. Field names, timestamp
+// format and status values follow schema/2026-07-28 exactly. Only fields
+// allowed for the current status are populated: result for completed, error
+// for failed, inputRequests for input_required.
+type ProtocolTask struct {
+	TaskID         string          `json:"taskId"`
+	Status         TaskState       `json:"status"`
+	StatusMessage  string          `json:"statusMessage,omitempty"`
+	CreatedAt      string          `json:"createdAt"`
+	LastUpdatedAt  string          `json:"lastUpdatedAt"`
+	TTLMs          *int64          `json:"ttlMs"`
+	PollIntervalMs int64           `json:"pollIntervalMs,omitempty"`
+	Result         json.RawMessage `json:"result,omitempty"`
+	Error          json.RawMessage `json:"error,omitempty"`
+	InputRequests  json.RawMessage `json:"inputRequests,omitempty"`
+}
+
+// TaskResult is the flat wire envelope shared by CreateTaskResult
+// (resultType "task") and GetTaskResult (resultType "complete"). The embedded
+// Task fields are flattened into the object, as the schema requires.
+type TaskResult struct {
+	ProtocolTask
+	ResultType string `json:"resultType"`
+}
+
+func createTaskResult(t ProtocolTask) TaskResult {
+	return TaskResult{ProtocolTask: t, ResultType: TaskResultType}
+}
+
+func getTaskResult(t ProtocolTask) TaskResult {
+	return TaskResult{ProtocolTask: t, ResultType: taskResultTypeComplete}
+}
+
+// TaskStatusNotification is the notifications/tasks notification. Its params
+// carry the complete Task for the current status, so progress (working /
+// input_required) and result (completed / failed / cancelled) are told apart
+// by params.status rather than by an extra field.
+type TaskStatusNotification struct {
+	Method string       `json:"method"`
+	Params ProtocolTask `json:"params"`
+}
+
+// TaskPatch is the status change applied by ProtocolTaskStore.Update. Only
+// the field belonging to Status is stored; the others are ignored.
+type TaskPatch struct {
+	Status        TaskState
+	StatusMessage string
+	Result        json.RawMessage
+	Error         json.RawMessage
+	InputRequests json.RawMessage
+}
+
+// protocolTaskRecord keeps the wire task next to its creation time, so TTL can
+// be checked without reparsing the RFC3339 string on every read.
+type protocolTaskRecord struct {
+	task      ProtocolTask
+	createdAt time.Time
+}
+
+// ProtocolTaskStore is Beacon's own store for the protocol contract. A clock
+// drives creation timestamps, last-update timestamps and TTL expiry. The work
+// queue and event delivery stay outside this contract (ADR 0056 feature 1).
+type ProtocolTaskStore struct {
+	mu     sync.Mutex
+	clock  domain.Clock
+	tasks  map[string]protocolTaskRecord
+	notes  []TaskStatusNotification
+	nextID uint64
+}
+
+// NewProtocolTaskStore builds a store. A nil clock falls back to wall time.
+func NewProtocolTaskStore(clock domain.Clock) *ProtocolTaskStore {
+	if clock == nil {
+		clock = getResultWallClock{}
+	}
+	return &ProtocolTaskStore{clock: clock, tasks: map[string]protocolTaskRecord{}, nextID: 1}
+}
+
+// Start creates a task and returns its CreateTaskResult immediately. It does
+// not wait for completion, poll or hold a connection: the caller receives the
+// taskId at once and is free to disconnect. A non-positive ttlMs means an
+// unlimited task and is emitted as null, per schema.
+func (s *ProtocolTaskStore) Start(ttlMs, pollIntervalMs int64) (TaskResult, error) {
+	if s == nil {
+		return TaskResult{}, domain.NewAppError(domain.CodePersistFailed, "tasks: store is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := s.clock.Now().UTC()
+	var ttl *int64
+	if ttlMs > 0 {
+		v := ttlMs
+		ttl = &v
+	}
+	t := ProtocolTask{
+		TaskID:         fmt.Sprintf("task-%d", s.nextID),
+		Status:         TaskStateWorking,
+		CreatedAt:      now.Format(time.RFC3339Nano),
+		LastUpdatedAt:  now.Format(time.RFC3339Nano),
+		TTLMs:          ttl,
+		PollIntervalMs: pollIntervalMs,
+	}
+	s.nextID++
+	s.tasks[t.TaskID] = protocolTaskRecord{task: t, createdAt: now}
+	return createTaskResult(t), nil
+}
+
+// Get implements tasks/get. It returns the current DetailedTask for taskId
+// with resultType "complete". A task whose TTL elapsed is gone (CodeGone); an
+// id that was never issued is CodeWatchNotFound. Reading does not change the
+// task or publish a notification.
+func (s *ProtocolTaskStore) Get(taskID string) (TaskResult, error) {
+	if s == nil || s.clock == nil {
+		return TaskResult{}, domain.NewAppError(domain.CodePersistFailed, "tasks/get: store is nil")
+	}
+	if taskID == "" {
+		return TaskResult{}, domain.NewAppError(domain.CodeInvalidInput, "tasks/get: taskId is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.tasks[taskID]
+	if !ok {
+		return TaskResult{}, domain.NewAppError(domain.CodeWatchNotFound, "tasks/get: task not found")
+	}
+	if rec.task.TTLMs != nil {
+		expires := rec.createdAt.Add(time.Duration(*rec.task.TTLMs) * time.Millisecond)
+		if !s.clock.Now().Before(expires) {
+			return TaskResult{}, domain.NewAppError(domain.CodeGone, "tasks/get: task TTL elapsed")
+		}
+	}
+	return getTaskResult(rec.task), nil
+}
+
+// Update applies patch to a non-terminal task and publishes a
+// notifications/tasks notification. The new state (including its result) is
+// stored before the notification is recorded, so a late event can never
+// overwrite a terminal result (ADR 0030 §3). Updating a terminal task is
+// rejected instead of reopening it.
+func (s *ProtocolTaskStore) Update(taskID string, patch TaskPatch) (ProtocolTask, error) {
+	if s == nil || s.clock == nil {
+		return ProtocolTask{}, domain.NewAppError(domain.CodePersistFailed, "tasks: store is nil")
+	}
+	if taskID == "" || !validTaskState(patch.Status) {
+		return ProtocolTask{}, domain.NewAppError(domain.CodeInvalidInput, "tasks: taskId and a valid status are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.tasks[taskID]
+	if !ok {
+		return ProtocolTask{}, domain.NewAppError(domain.CodeWatchNotFound, "tasks: task not found")
+	}
+	if rec.task.Status.Terminal() {
+		return ProtocolTask{}, domain.NewAppError(domain.CodeInvalidInput, "tasks: terminal task cannot be updated")
+	}
+	t := rec.task
+	t.Status = patch.Status
+	t.StatusMessage = patch.StatusMessage
+	t.LastUpdatedAt = s.clock.Now().UTC().Format(time.RFC3339Nano)
+	t.Result = nil
+	t.Error = nil
+	t.InputRequests = nil
+	switch patch.Status {
+	case TaskStateCompleted:
+		t.Result = patch.Result
+	case TaskStateFailed:
+		t.Error = patch.Error
+	case TaskStateInputRequired:
+		t.InputRequests = patch.InputRequests
+	}
+	rec.task = t
+	s.tasks[taskID] = rec
+	s.publishLocked(t)
+	return t, nil
+}
+
+// Cancel cooperatively moves a task to the cancelled state with a reason. It
+// is a result notification, like any other terminal update.
+func (s *ProtocolTaskStore) Cancel(taskID, reason string) (ProtocolTask, error) {
+	return s.Update(taskID, TaskPatch{Status: TaskStateCancelled, StatusMessage: reason})
+}
+
+// publishLocked records a notification. Callers hold s.mu.
+func (s *ProtocolTaskStore) publishLocked(t ProtocolTask) {
+	s.notes = append(s.notes, TaskStatusNotification{Method: taskStatusNotificationMethod, Params: t})
+}
+
+// Notifications returns the published notifications in order. The slice is a
+// copy, so a caller cannot mutate the store's history.
+func (s *ProtocolTaskStore) Notifications() []TaskStatusNotification {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]TaskStatusNotification(nil), s.notes...)
+}
+
+// GetTaskInput is the argument object of the tasks/get tool.
+type GetTaskInput struct {
+	TaskID string `json:"taskId" jsonschema:"identifier of the task to query"`
+}
+
+// GetHandle adapts tasks/get to the go-sdk typed tool handler signature.
+// Domain errors are returned as-is for ToErrorShape to convert at the MCP
+// boundary.
+func (s *ProtocolTaskStore) GetHandle(ctx context.Context, req *mcpsdk.CallToolRequest, in GetTaskInput) (*mcpsdk.CallToolResult, TaskResult, error) {
+	_ = ctx
+	_ = req
+	out, err := s.Get(in.TaskID)
+	if err != nil {
+		return nil, TaskResult{}, err
+	}
+	return nil, out, nil
+}
+
+// AttachTasksGet registers tasks/get as an opt-in tool. Wiring it into
+// NewServer is a separate integration task, so this helper is not called
+// automatically.
+func AttachTasksGet(server *mcpsdk.Server, store *ProtocolTaskStore) {
+	if server == nil || store == nil {
+		return
+	}
+	server.RemoveTools(TasksGetMethod)
+	no := false
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        TasksGetMethod,
+		Description: "Query the state and result of an MCP task without holding a connection.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  true,
+		},
+	}, store.GetHandle)
+}

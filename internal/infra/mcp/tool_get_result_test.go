@@ -1026,3 +1026,305 @@ func TestTaskRegistry(t *testing.T) {
 		t.Fatal("Get returned a task for an unknown handle")
 	}
 }
+
+// --- MCP protocol tasks/get contract tests (ADR 0056 feature 1) ------------
+
+// TestTasksGetReturnsIDImmediately proves the create call hands back a taskId
+// at once: the result is already usable by tasks/get, the task is still
+// working (completion has not been waited for), and the clock did not move.
+func TestTasksGetReturnsIDImmediately(t *testing.T) {
+	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	clock := &stepClock{t: base}
+	store := NewProtocolTaskStore(clock)
+
+	created, err := store.Start(60_000, 5_000)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if created.ResultType != TaskResultType {
+		t.Fatalf("create resultType = %q, want %q", created.ResultType, TaskResultType)
+	}
+	if created.TaskID == "" {
+		t.Fatal("create returned an empty taskId")
+	}
+	if created.Status != TaskStateWorking {
+		t.Fatalf("create status = %q, want %q", created.Status, TaskStateWorking)
+	}
+	if created.TTLMs == nil || *created.TTLMs != 60_000 {
+		t.Fatalf("create ttlMs = %v, want 60000", created.TTLMs)
+	}
+	if created.PollIntervalMs != 5_000 {
+		t.Fatalf("pollIntervalMs = %d, want 5000", created.PollIntervalMs)
+	}
+	if !clock.t.Equal(base) {
+		t.Fatalf("Start advanced the clock to %v; it must not wait", clock.t)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, created.CreatedAt); err != nil {
+		t.Fatalf("createdAt is not RFC3339: %q: %v", created.CreatedAt, err)
+	}
+
+	got, err := store.Get(created.TaskID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.ResultType != taskResultTypeComplete || got.TaskID != created.TaskID || got.Status != TaskStateWorking {
+		t.Fatalf("get result = %+v, want complete/%s/working", got, created.TaskID)
+	}
+	if n := len(store.Notifications()); n != 0 {
+		t.Fatalf("Start published %d notifications; creation must be immediate", n)
+	}
+}
+
+// TestTasksGetReturnsResultLater shows the connection is not held for the
+// result: tasks/get first reports a working task, and only after a later
+// update does it carry the completed result.
+func TestTasksGetReturnsResultLater(t *testing.T) {
+	store := NewProtocolTaskStore(&stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)})
+	created, err := store.Start(0, 1_000)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	first, err := store.Get(created.TaskID)
+	if err != nil {
+		t.Fatalf("first Get: %v", err)
+	}
+	if first.Status != TaskStateWorking || len(first.Result) != 0 {
+		t.Fatalf("first get = %+v, want working with no result", first)
+	}
+
+	updated, err := store.Update(created.TaskID, TaskPatch{
+		Status:        TaskStateCompleted,
+		StatusMessage: "done",
+		Result:        json.RawMessage(`{"ok":true}`),
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if updated.Status != TaskStateCompleted || !updated.Status.Terminal() {
+		t.Fatalf("updated status = %q, want a terminal completed state", updated.Status)
+	}
+
+	last, err := store.Get(created.TaskID)
+	if err != nil {
+		t.Fatalf("last Get: %v", err)
+	}
+	if last.ResultType != taskResultTypeComplete || last.Status != TaskStateCompleted {
+		t.Fatalf("last get = %+v, want complete/completed", last)
+	}
+	if string(last.Result) != `{"ok":true}` {
+		t.Fatalf("result = %s, want %s", last.Result, `{"ok":true}`)
+	}
+}
+
+// TestTasksGetTTLExpiry enforces the contract TTL: the task is readable until
+// the deadline, then gone. Unknown and empty ids keep their own codes.
+func TestTasksGetTTLExpiry(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
+	store := NewProtocolTaskStore(clock)
+	created, err := store.Start(1_000, 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if _, err := store.Get(created.TaskID); err != nil {
+		t.Fatalf("Get at creation: %v", err)
+	}
+	clock.Advance(999 * time.Millisecond)
+	if _, err := store.Get(created.TaskID); err != nil {
+		t.Fatalf("Get before TTL: %v", err)
+	}
+	clock.Advance(time.Millisecond)
+	_, err = store.Get(created.TaskID)
+	assertCode(t, err, domain.CodeGone)
+
+	_, err = store.Get("never-issued")
+	assertCode(t, err, domain.CodeWatchNotFound)
+	_, err = store.Get("")
+	assertCode(t, err, domain.CodeInvalidInput)
+}
+
+// TestTasksGetTTLUnlimited covers the null case: ttlMs is emitted as null and
+// an unlimited task survives any clock advance.
+func TestTasksGetTTLUnlimited(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
+	store := NewProtocolTaskStore(clock)
+	created, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if created.TTLMs != nil {
+		t.Fatalf("ttlMs = %d, want null for unlimited", *created.TTLMs)
+	}
+	raw, err := json.Marshal(created)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"ttlMs":null`) {
+		t.Fatalf("ttlMs not emitted as null: %s", raw)
+	}
+	clock.Advance(24 * time.Hour)
+	if _, err := store.Get(created.TaskID); err != nil {
+		t.Fatalf("unlimited task expired: %v", err)
+	}
+}
+
+// TestTasksGetNotificationsProgressAndResult checks both notifications of the
+// contract: a working update is progress, a terminal update is a result, and
+// each carries the full task in notifications/tasks order.
+func TestTasksGetNotificationsProgressAndResult(t *testing.T) {
+	store := NewProtocolTaskStore(&stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)})
+	created, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := store.Update(created.TaskID, TaskPatch{Status: TaskStateWorking, StatusMessage: "halfway"}); err != nil {
+		t.Fatalf("progress Update: %v", err)
+	}
+	if _, err := store.Update(created.TaskID, TaskPatch{
+		Status: TaskStateCompleted,
+		Result: json.RawMessage(`{"v":1}`),
+	}); err != nil {
+		t.Fatalf("result Update: %v", err)
+	}
+
+	notes := store.Notifications()
+	if len(notes) != 2 {
+		t.Fatalf("notifications = %d, want 2", len(notes))
+	}
+	for i, n := range notes {
+		if n.Method != taskStatusNotificationMethod {
+			t.Errorf("notification %d method = %q, want %q", i, n.Method, taskStatusNotificationMethod)
+		}
+		if n.Params.TaskID != created.TaskID {
+			t.Errorf("notification %d taskId = %q, want %q", i, n.Params.TaskID, created.TaskID)
+		}
+	}
+	if kind := notes[0].Params.Status.NotificationKind(); kind != NotificationProgress {
+		t.Errorf("first notification kind = %q, want progress", kind)
+	}
+	if notes[0].Params.StatusMessage != "halfway" || len(notes[0].Params.Result) != 0 {
+		t.Errorf("progress notification = %+v, want message and no result", notes[0].Params)
+	}
+	if kind := notes[1].Params.Status.NotificationKind(); kind != NotificationResult {
+		t.Errorf("second notification kind = %q, want result", kind)
+	}
+	if string(notes[1].Params.Result) != `{"v":1}` {
+		t.Errorf("result notification result = %s, want %s", notes[1].Params.Result, `{"v":1}`)
+	}
+
+	notes[0].Params.Status = TaskStateFailed
+	if again := store.Notifications(); again[0].Params.Status != TaskStateWorking {
+		t.Fatal("Notifications returned a mutable slice of the store history")
+	}
+}
+
+// TestTasksGetTerminalIsFinal keeps a finished result stable and makes cancel
+// a result notification that cannot run twice.
+func TestTasksGetTerminalIsFinal(t *testing.T) {
+	store := NewProtocolTaskStore(&stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)})
+	created, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := store.Update(created.TaskID, TaskPatch{
+		Status: TaskStateCompleted,
+		Result: json.RawMessage(`{"n":1}`),
+	}); err != nil {
+		t.Fatalf("Update completed: %v", err)
+	}
+	if _, err := store.Update(created.TaskID, TaskPatch{Status: TaskStateWorking}); err == nil {
+		t.Fatal("a terminal task was reopened by a late event")
+	}
+	got, err := store.Get(created.TaskID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Status != TaskStateCompleted || string(got.Result) != `{"n":1}` {
+		t.Fatalf("late event changed the result: %+v", got)
+	}
+
+	second, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+	cancelled, err := store.Cancel(second.TaskID, "user stopped")
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if cancelled.Status != TaskStateCancelled || cancelled.StatusMessage != "user stopped" {
+		t.Fatalf("cancelled task = %+v", cancelled)
+	}
+	if _, err := store.Cancel(second.TaskID, "again"); err == nil {
+		t.Fatal("a cancelled task was cancelled twice")
+	}
+
+	results := 0
+	for _, n := range store.Notifications() {
+		if n.Params.Status.NotificationKind() == NotificationResult {
+			results++
+		}
+	}
+	if results != 2 {
+		t.Fatalf("result notifications = %d, want 2", results)
+	}
+}
+
+// TestTasksGetWireShapeMatchesSchema asserts the contract uses the schema's
+// field names and status values, with no local variant leaking onto the wire.
+func TestTasksGetWireShapeMatchesSchema(t *testing.T) {
+	store := NewProtocolTaskStore(&stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)})
+	created, err := store.Start(5_000, 2_000)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	raw, err := json.Marshal(created)
+	if err != nil {
+		t.Fatalf("marshal create: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+	for _, key := range []string{"taskId", "status", "createdAt", "lastUpdatedAt", "ttlMs", "pollIntervalMs", "resultType"} {
+		if _, ok := obj[key]; !ok {
+			t.Errorf("field %q missing from create result: %s", key, raw)
+		}
+	}
+	if _, ok := obj["taskStatus"]; ok {
+		t.Errorf("local variant taskStatus leaked into create result: %s", raw)
+	}
+
+	valid := map[TaskState]bool{
+		TaskStateWorking: true, TaskStateInputRequired: true, TaskStateCompleted: true,
+		TaskStateFailed: true, TaskStateCancelled: true,
+	}
+	if !valid[created.Status] {
+		t.Fatalf("status %q is not a schema value", created.Status)
+	}
+
+	if _, err := store.Update(created.TaskID, TaskPatch{
+		Status: TaskStateCompleted,
+		Result: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	got, err := store.Get(created.TaskID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	gotRaw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal get: %v", err)
+	}
+	var gotObj map[string]json.RawMessage
+	if err := json.Unmarshal(gotRaw, &gotObj); err != nil {
+		t.Fatalf("unmarshal get: %v", err)
+	}
+	if value := string(gotObj["resultType"]); value != `"complete"` {
+		t.Errorf("tasks/get resultType = %s, want %s", value, `"complete"`)
+	}
+	if _, ok := gotObj["result"]; !ok {
+		t.Errorf("completed tasks/get has no result field: %s", gotRaw)
+	}
+}
