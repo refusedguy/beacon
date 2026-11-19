@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 )
 
 // agentsServiceHint is printed when the background OpenCode service has not
@@ -20,9 +21,97 @@ const agentsServiceHint = "фоновый сервис не запущен: open
 
 // agentRow is one agent printed by beacon agents.
 type agentRow struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Mode string `json:"mode"`
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
+	Mode  string         `json:"mode"`
+	Stale []staleTaskRef `json:"stale,omitempty"`
+}
+
+// staleTask is a task in work (in_progress) whose lease has expired and has
+// not been invalidated or reclaimed. The STALE column only displays it: reading
+// this state never changes the lease, invalidates it or starts a capture
+// (ADR 0043 p5). Fencing T3.51 and the three-signal death detection of ADR 0042
+// p2 remain the only mechanisms that invalidate and reclaim leases.
+type staleTask struct {
+	TaskID    string    `json:"taskID"`
+	Agent     string    `json:"agent"`
+	ExpiredAt time.Time `json:"expiredAt"`
+}
+
+// staleTaskRef is the rendered form of one stale task in a row. AgeSeconds is
+// the time since the lease expired, not since the task was created.
+type staleTaskRef struct {
+	TaskID     string `json:"taskID"`
+	AgeSeconds int64  `json:"ageSeconds"`
+}
+
+// staleTasksReadFile is replaceable in tests. Beacon only reads the stale-task
+// snapshot from its own state; the STALE column has no write capability.
+var staleTasksReadFile = os.ReadFile
+
+const staleTasksFile = "stale-tasks.json"
+
+// staleTasksState is the on-disk snapshot of tasks in work without a live
+// lease. It is produced outside this command; agents only reads it.
+type staleTasksState struct {
+	Tasks []staleTask `json:"tasks"`
+}
+
+// readStaleTasks is replaceable in tests, like readServiceFile above. It
+// returns a snapshot of tasks whose lease expired and were not reclaimed. A
+// missing snapshot means no stale work.
+var readStaleTasks = func(now time.Time) ([]staleTask, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, staleTasksFile)
+	data, err := staleTasksReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: не удалось прочитать снимок мёртвых аренд: %v", path, err)
+	}
+	var st staleTasksState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("%s: неверный снимок мёртвых аренд: %v", path, err)
+	}
+	return st.Tasks, nil
+}
+
+// attachStaleTasks fills the read-only STALE column of each agent row. Stale
+// tasks are matched to an agent by its ID or name and sorted by task ID so the
+// output is stable. Nothing here mutates a lease.
+func attachStaleTasks(rows []agentRow, stales []staleTask, now time.Time) {
+	for i := range rows {
+		refs := make([]staleTaskRef, 0)
+		for _, s := range stales {
+			if s.Agent != rows[i].ID && s.Agent != rows[i].Name {
+				continue
+			}
+			age := now.Sub(s.ExpiredAt)
+			if age < 0 {
+				age = 0
+			}
+			refs = append(refs, staleTaskRef{TaskID: s.TaskID, AgeSeconds: int64(age / time.Second)})
+		}
+		sort.Slice(refs, func(a, b int) bool { return refs[a].TaskID < refs[b].TaskID })
+		if len(refs) > 0 {
+			rows[i].Stale = refs
+		}
+	}
+}
+
+// formatStaleAge renders an age since lease expiry for the table column.
+func formatStaleAge(seconds int64) string {
+	if seconds < 60 {
+		return fmt.Sprintf("%ds", seconds)
+	}
+	if seconds < 3600 {
+		return fmt.Sprintf("%dm", seconds/60)
+	}
+	return fmt.Sprintf("%dh%dm", seconds/3600, (seconds%3600)/60)
 }
 
 // subagentModes are the OpenCode modes that can run as child sessions. Only
@@ -106,6 +195,14 @@ func (c *CLI) runAgents(args []string) int {
 		return 2
 	}
 
+	now := time.Now()
+	stales, err := readStaleTasks(now)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: не удалось прочитать мёртвые аренды: %v\n", err)
+		return 2
+	}
+	attachStaleTasks(rows, stales, now)
+
 	return printAgentRows(*format, rows, c.out, c.errOut)
 }
 
@@ -173,9 +270,17 @@ func printAgentRows(format string, rows []agentRow, out, errOut io.Writer) int {
 		return 0
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tMODE")
+		fmt.Fprintln(w, "ID\tNAME\tMODE\tSTALE")
 		for _, r := range rows {
-			fmt.Fprintf(w, "%s\t%s\t%s\n", r.ID, r.Name, r.Mode)
+			cell := "-"
+			if len(r.Stale) > 0 {
+				parts := make([]string, 0, len(r.Stale))
+				for _, s := range r.Stale {
+					parts = append(parts, fmt.Sprintf("%s:%s", s.TaskID, formatStaleAge(s.AgeSeconds)))
+				}
+				cell = strings.Join(parts, ",")
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.ID, r.Name, r.Mode, cell)
 		}
 		if err := w.Flush(); err != nil {
 			fmt.Fprintf(errOut, "beacon agents: %v\n", err)
