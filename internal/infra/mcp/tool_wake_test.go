@@ -2100,8 +2100,8 @@ func TestWakeRefusedIsNotRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Wake() error = %v", err)
 	}
-	if out.State != StateRefused || out.IsRead() {
-		t.Errorf("state=%q IsRead=%v, want refused/false", out.State, out.IsRead())
+	if out.State != StateRefused || out.State.IsRead() {
+		t.Errorf("state=%q IsRead=%v, want refused/false", out.State, out.State.IsRead())
 	}
 	if out.OK {
 		t.Error("ok = true for a refused message, want false")
@@ -2185,8 +2185,8 @@ func TestWakeStateOverInMemoryTransport(t *testing.T) {
 	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatalf("unmarshal structured content: %v", err)
 	}
-	if out.State != StateRead || !out.IsRead() || !out.OK {
-		t.Errorf("client saw state=%q IsRead=%v ok=%v, want read/true/true", out.State, out.IsRead(), out.OK)
+	if out.State != StateRead || !out.State.IsRead() || !out.OK {
+		t.Errorf("client saw state=%q IsRead=%v ok=%v, want read/true/true", out.State, out.State.IsRead(), out.OK)
 	}
 }
 
