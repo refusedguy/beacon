@@ -15,9 +15,10 @@ import (
 	"testing"
 )
 
-// TestMain turns on verbose output because CI runs "go test ./..." without -v.
-// Without this, a passing test prints only "ok <package>" and its name never
-// reaches the CI log, so execution cannot be confirmed from the log alone.
+// TestMain sets the test binary's verbose flag. When a test fails, "go test"
+// streams the buffered output, so lines with test names reach the CI log.
+// A passing run still prints only "ok <package>": the go tool discards test
+// output unless it was invoked with -v, which CI does not pass.
 func TestMain(m *testing.M) {
 	if f := flag.Lookup("test.v"); f != nil {
 		_ = f.Value.Set("true")
