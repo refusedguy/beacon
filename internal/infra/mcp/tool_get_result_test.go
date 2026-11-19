@@ -1,0 +1,363 @@
+package mcp
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/refusedguy/beacon/internal/domain"
+)
+
+// recordingStamper is an in-memory ObligationStamper used by the tool tests.
+// It applies the same "write only when the fact is still zero" rule as the SQL
+// stamper and records how many times each fact was requested.
+type recordingStamper struct {
+	mu           sync.Mutex
+	obligations  map[string]domain.Obligation
+	readCalls    int
+	claimedCalls int
+}
+
+func newRecordingStamper() *recordingStamper {
+	return &recordingStamper{obligations: map[string]domain.Obligation{}}
+}
+
+func (s *recordingStamper) add(o domain.Obligation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.obligations[o.ID] = o
+}
+
+func (s *recordingStamper) snapshot(id string) (domain.Obligation, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.obligations[id]
+	return o, ok
+}
+
+func (s *recordingStamper) counts() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readCalls, s.claimedCalls
+}
+
+func (s *recordingStamper) StampRead(_ context.Context, id string, at time.Time) (domain.Obligation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readCalls++
+	o, ok := s.obligations[id]
+	if !ok {
+		return domain.Obligation{}, false, domain.NewAppError(domain.CodeWatchNotFound, "obligation not found")
+	}
+	if !o.ReadAt.IsZero() {
+		return o, false, nil
+	}
+	o.ReadAt = at
+	s.obligations[id] = o
+	return o, true, nil
+}
+
+func (s *recordingStamper) StampClaimed(_ context.Context, id string, at time.Time) (domain.Obligation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.claimedCalls++
+	o, ok := s.obligations[id]
+	if !ok {
+		return domain.Obligation{}, false, domain.NewAppError(domain.CodeWatchNotFound, "obligation not found")
+	}
+	if !o.ClaimedAt.IsZero() {
+		return o, false, nil
+	}
+	o.ClaimedAt = at
+	s.obligations[id] = o
+	return o, true, nil
+}
+
+// resultFixture builds a Watch with one non-flaky failure, one flaky failure,
+// one success and one skipped check. The flaky pattern is a glob so the test
+// also covers name/glob matching for flakyMatched.
+func resultFixture(verdict domain.Verdict) domain.Watch {
+	return domain.Watch{
+		ID:       "w-1",
+		Repo:     "o/r",
+		PR:       1,
+		HeadSHA:  "sha",
+		Status:   domain.StatusNotifying,
+		Verdict:  verdict,
+		Revision: 7,
+		Checks: map[string]domain.Check{
+			"ci/failure": {State: "FAILURE", Conclusion: "FAILURE", Required: true, DetailsURL: "https://ci/1"},
+			"ci/flaky":   {State: "FAILURE", Conclusion: "FAILURE", Required: false, DetailsURL: "https://ci/2"},
+			"ci/ok":      {State: "SUCCESS", Conclusion: "SUCCESS", Required: true, DetailsURL: "https://ci/3"},
+			"ci/skipped": {State: "SKIPPED", Conclusion: "SKIPPED", Required: false, DetailsURL: "https://ci/4"},
+		},
+		Merge: domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "DIRTY", ReviewDecision: "APPROVED"},
+		Flaky: domain.FlakyConfig{
+			Names:      []string{"ci/fl*"},
+			MaxRetries: 2,
+			Used:       map[string]int{"ci/flaky": 1},
+		},
+	}
+}
+
+func resultObligation(w domain.Watch, subscriber string) domain.Obligation {
+	return domain.Obligation{
+		ID:             domain.ObligationKey(w.ID, w.Revision, subscriber),
+		WatchID:        w.ID,
+		Revision:       w.Revision,
+		SubscriberID:   subscriber,
+		VerdictPointer: w.Verdict,
+		StagedAt:       time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC),
+	}
+}
+
+func sortedFailedChecks(in []FailedCheck) []FailedCheck {
+	out := append([]FailedCheck(nil), in...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// TestGetResultProjectsContractAndStampsRead covers both verdicts named in the
+// card. It checks the projected fields, the failed-check shape without logs,
+// the retry budget and the idempotent readAt stamp.
+func TestGetResultProjectsContractAndStampsRead(t *testing.T) {
+	for _, verdict := range []domain.Verdict{domain.VerdictReady, domain.VerdictKeepWorking} {
+		t.Run(string(verdict), func(t *testing.T) {
+			clock := &stepClock{t: time.Date(2026, 11, 19, 10, 5, 0, 0, time.UTC)}
+			w := resultFixture(verdict)
+			o := resultObligation(w, "session-G")
+			store := newMemStore()
+			if err := store.SaveWatch(w); err != nil {
+				t.Fatalf("SaveWatch: %v", err)
+			}
+			if err := store.SaveObligation(o); err != nil {
+				t.Fatalf("SaveObligation: %v", err)
+			}
+			stamper := newRecordingStamper()
+			stamper.add(o)
+			h := NewGetResultHandler(store, stamper, clock)
+
+			out, err := h.Result(context.Background(), sessionReq("session-G"), GetResultInput{WatchID: w.ID})
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			if out.Status != string(domain.StatusNotifying) || out.Verdict != string(verdict) {
+				t.Errorf("status/verdict = %q/%q", out.Status, out.Verdict)
+			}
+			if out.Revision != w.Revision {
+				t.Errorf("revision = %d, want %d", out.Revision, w.Revision)
+			}
+			if out.Merge.Mergeable != "MERGEABLE" || out.Merge.MergeStateStatus != "DIRTY" {
+				t.Errorf("merge = %+v", out.Merge)
+			}
+			if out.ObligationID != o.ID {
+				t.Errorf("obligationID = %q, want %q", out.ObligationID, o.ID)
+			}
+
+			want := []FailedCheck{
+				{Name: "ci/failure", Conclusion: "FAILURE", DetailsURL: "https://ci/1", Required: true, FlakyMatched: false},
+				{Name: "ci/flaky", Conclusion: "FAILURE", DetailsURL: "https://ci/2", Required: false, FlakyMatched: true},
+			}
+			got := sortedFailedChecks(out.FailedChecks)
+			if len(got) != len(want) {
+				t.Fatalf("failedChecks = %+v, want %+v", got, want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("failedChecks[%d] = %+v, want %+v", i, got[i], want[i])
+				}
+			}
+			if out.RetryBudget != 1 {
+				t.Errorf("retryBudget = %d, want 1", out.RetryBudget)
+			}
+
+			raw, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal output: %v", err)
+			}
+			if lowered := strings.ToLower(string(raw)); strings.Contains(lowered, "log") || strings.Contains(lowered, "output") {
+				t.Errorf("response carries check logs or output: %s", raw)
+			}
+
+			gotObligation, ok := stamper.snapshot(o.ID)
+			if !ok || !gotObligation.ReadAt.Equal(clock.t) {
+				t.Fatalf("readAt = %v, want %v", gotObligation.ReadAt, clock.t)
+			}
+
+			clock.Advance(time.Minute)
+			if _, err := h.Result(context.Background(), sessionReq("session-G"), GetResultInput{WatchID: w.ID}); err != nil {
+				t.Fatalf("repeat Result: %v", err)
+			}
+			repeat, _ := stamper.snapshot(o.ID)
+			if !repeat.ReadAt.Equal(clock.t.Add(-time.Minute)) {
+				t.Errorf("readAt was overwritten on repeat: %v", repeat.ReadAt)
+			}
+			reads, claims := stamper.counts()
+			if reads != 2 || claims != 0 {
+				t.Errorf("stamp calls = read %d claim %d, want 2 and 0", reads, claims)
+			}
+		})
+	}
+}
+
+// TestGetResultRetryBudgetWithoutFlakyFailure checks that a watch with no
+// flaky-matched failure reports no retry budget.
+func TestGetResultRetryBudgetWithoutFlakyFailure(t *testing.T) {
+	w := resultFixture(domain.VerdictKeepWorking)
+	w.Flaky = domain.FlakyConfig{}
+	o := resultObligation(w, "session-B")
+	store := newMemStore()
+	_ = store.SaveWatch(w)
+	_ = store.SaveObligation(o)
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+
+	out, err := h.Result(context.Background(), sessionReq("session-B"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if out.RetryBudget != 0 {
+		t.Errorf("retryBudget = %d, want 0", out.RetryBudget)
+	}
+	for _, fc := range out.FailedChecks {
+		if fc.FlakyMatched {
+			t.Errorf("check %q reported flakyMatched without a flaky config", fc.Name)
+		}
+	}
+}
+
+// TestGetResultValidation covers the input and not-found paths before a stamp.
+func TestGetResultValidation(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	o := resultObligation(w, "session-V")
+	store := newMemStore()
+	_ = store.SaveWatch(w)
+	_ = store.SaveObligation(o)
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+
+	_, err := h.Result(context.Background(), sessionReq("session-V"), GetResultInput{})
+	assertCode(t, err, domain.CodeInvalidInput)
+
+	_, err = h.Result(context.Background(), nil, GetResultInput{WatchID: w.ID})
+	assertCode(t, err, domain.CodeInvalidInput)
+
+	_, err = h.Result(context.Background(), sessionReq("session-V"), GetResultInput{WatchID: "missing"})
+	assertCode(t, err, domain.CodeWatchNotFound)
+
+	_, err = h.Result(context.Background(), sessionReq("other-session"), GetResultInput{WatchID: w.ID})
+	assertCode(t, err, domain.CodeWatchNotFound)
+
+	reads, claims := stamper.counts()
+	if reads != 0 || claims != 0 {
+		t.Errorf("a rejected call stamped the obligation: read %d claim %d", reads, claims)
+	}
+}
+
+// dbTxWriter is a minimal single-writer port over a real in-memory SQLite DB.
+type dbTxWriter struct{ db *sql.DB }
+
+func (w dbTxWriter) Write(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func newStampTestDB(t *testing.T, o domain.Obligation) (resultTxWriter, func() domain.Obligation) {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+
+	_, err = db.Exec(`
+		CREATE TABLE obligations (
+			seq INTEGER PRIMARY KEY,
+			id TEXT NOT NULL UNIQUE,
+			watch_id TEXT NOT NULL,
+			revision INTEGER NOT NULL,
+			subscriber_id TEXT NOT NULL,
+			verdict_pointer TEXT NOT NULL,
+			delivered_at INTEGER NOT NULL DEFAULT 0,
+			payload BLOB NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create obligations: %v", err)
+	}
+	payload, err := json.Marshal(o)
+	if err != nil {
+		t.Fatalf("marshal obligation: %v", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO obligations (id, watch_id, revision, subscriber_id, verdict_pointer, payload)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		o.ID, o.WatchID, o.Revision, o.SubscriberID, string(o.VerdictPointer), payload); err != nil {
+		t.Fatalf("insert obligation: %v", err)
+	}
+
+	load := func() domain.Obligation {
+		t.Helper()
+		var raw []byte
+		if err := db.QueryRow(`SELECT payload FROM obligations WHERE id = ?`, o.ID).Scan(&raw); err != nil {
+			t.Fatalf("read obligation payload: %v", err)
+		}
+		var got domain.Obligation
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("unmarshal obligation: %v", err)
+		}
+		return got
+	}
+	return dbTxWriter{db: db}, load
+}
+
+// TestSQLObligationStamperIdempotentRead proves the production stamper writes
+// readAt once through one transaction and leaves it untouched on a repeat.
+func TestSQLObligationStamperIdempotentRead(t *testing.T) {
+	o := resultObligation(resultFixture(domain.VerdictReady), "session-S")
+	writer, load := newStampTestDB(t, o)
+	stamper := NewSQLObligationStamper(writer)
+	first := time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)
+
+	got, applied, err := stamper.StampRead(context.Background(), o.ID, first)
+	if err != nil || !applied || !got.ReadAt.Equal(first) {
+		t.Fatalf("first StampRead = %+v applied %v err %v", got, applied, err)
+	}
+	stored := load()
+	if !stored.ReadAt.Equal(first) {
+		t.Errorf("persisted readAt = %v, want %v", stored.ReadAt, first)
+	}
+
+	_, applied, err = stamper.StampRead(context.Background(), o.ID, first.Add(time.Hour))
+	if err != nil || applied {
+		t.Fatalf("repeat StampRead applied %v err %v, want no write", applied, err)
+	}
+	if stored := load(); !stored.ReadAt.Equal(first) {
+		t.Errorf("readAt overwritten on repeat: %v", stored.ReadAt)
+	}
+}
+
+// TestSQLObligationStamperMissingObligation maps a missing row to the contract
+// error instead of a raw SQL error.
+func TestSQLObligationStamperMissingObligation(t *testing.T) {
+	writer, _ := newStampTestDB(t, resultObligation(resultFixture(domain.VerdictReady), "session-X"))
+	stamper := NewSQLObligationStamper(writer)
+	_, _, err := stamper.StampRead(context.Background(), "no-such-obligation", time.Now())
+	assertCode(t, err, domain.CodeWatchNotFound)
+}
