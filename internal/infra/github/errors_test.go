@@ -551,3 +551,72 @@ func TestStatusAdaptersViaInterfaceAndApply(t *testing.T) {
 		t.Fatalf("Snapshot.Failures = %v, want [build]", snap.Failures)
 	}
 }
+
+// readySnapshotForShip satisfies every ready row in the domain decision table
+// except Ship. Only the adapter under test fills Ship, so this reproduces the
+// production shape of the regression where Evaluate never saw any facts.
+func readySnapshotForShip() domain.Snapshot {
+	return domain.Snapshot{
+		State:            "OPEN",
+		HeadSHA:          "sha-ready",
+		WatchHeadSHA:     "sha-ready",
+		Rollup:           "SUCCESS",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		SuitesValid:      true,
+	}
+}
+
+// TestApplyFillsShipForReady proves ready is reachable through the real github
+// status path (T3.78). Green required checks must yield VerdictReady after
+// Apply; a failed required check must keep the verdict away from ready. If
+// Apply stops filling Ship, the first case fails because Evaluate sees zero
+// facts and falls through to watching.
+func TestApplyFillsShipForReady(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantFacts domain.ShipFacts
+		want      domain.Verdict
+	}{
+		{
+			name: "green build audit and test make ready reachable",
+			body: `{"check_runs":[
+				{"name":"build","status":"completed","conclusion":"success"},
+				{"name":"ci/audit","status":"completed","conclusion":"success"},
+				{"name":"tests","status":"completed","conclusion":"success"}]}`,
+			wantFacts: domain.ShipFacts{Build: true, Audit: true, TDD: true},
+			want:      domain.VerdictReady,
+		},
+		{
+			name: "a failed required build is not ready",
+			body: `{"check_runs":[
+				{"name":"build","status":"completed","conclusion":"failure"},
+				{"name":"ci/audit","status":"completed","conclusion":"success"},
+				{"name":"tests","status":"completed","conclusion":"success"}]}`,
+			wantFacts: domain.ShipFacts{Audit: true, TDD: true},
+			want:      domain.VerdictKeepWorking,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, appErr := NewStatusParser().Parse(ProviderGitHub, []byte(tc.body))
+			if appErr != nil {
+				t.Fatalf("Parse error = %+v, want none", appErr)
+			}
+			s := readySnapshotForShip()
+			res.Apply(&s)
+			if s.Ship != tc.wantFacts {
+				t.Fatalf("Snapshot.Ship = %+v, want %+v", s.Ship, tc.wantFacts)
+			}
+			got, wake := domain.Evaluate(s, domain.Policy{RequireUpToDate: true})
+			if got != tc.want {
+				t.Fatalf("Evaluate = %q, want %q (Ship %+v)", got, tc.want, s.Ship)
+			}
+			if tc.want == domain.VerdictReady && len(wake) == 0 {
+				t.Fatal("a ready verdict must wake the orchestrator")
+			}
+		})
+	}
+}
