@@ -348,6 +348,12 @@ const (
 	OutcomeMaxIterationsReached ResultOutcome = "max_iterations_reached"
 	OutcomeFailed               ResultOutcome = "failed"
 	OutcomeInterrupted          ResultOutcome = "interrupted"
+	// OutcomeIndeterminate is the honest task result when an external action
+	// was performed but its answer never came back (ADR 0039 §5). The effect
+	// may already exist, so the core claims neither success nor failure and
+	// starts no retry. It is the outcome of the task itself, not the delivery
+	// ladder branch of the same name in ADR 0017 (domain.OutcomeIndeterminate).
+	OutcomeIndeterminate ResultOutcome = "indeterminate"
 )
 
 // CriterionID names one verifiable criterion. Criteria are fixed before the
@@ -365,6 +371,10 @@ const (
 	// CriterionVerdictReady checks the derived verdict computed by the domain
 	// verdict engine, an observable fact rather than the agent's claim.
 	CriterionVerdictReady CriterionID = "verdict_ready"
+	// CriterionExternalActionResponse fails when an external action ran but
+	// its answer never returned (ADR 0039 §5). The effect is then unknown, so
+	// no other criterion can be claimed as proof of success or failure.
+	CriterionExternalActionResponse CriterionID = "external_action_response"
 )
 
 const (
@@ -412,6 +422,12 @@ type RubricEvaluation struct {
 	MaxIterations int                   `json:"maxIterations"`
 	Criteria      []CriterionEvaluation `json:"criteria"`
 	ReadyVerdict  domain.Verdict        `json:"readyVerdict,omitempty"`
+	// LeaseKey is the durable obligation key of the caller that owns an
+	// external action whose response was lost (ADR 0039 §5). It is set only for
+	// an indeterminate result so the caller can correlate the possible effect
+	// without starting a retry. Other outcomes leave it empty and keep their
+	// previous bytes.
+	LeaseKey string `json:"leaseKey,omitempty"`
 }
 
 // gradeResult grades w against rubric. It reads no clock, does no I/O and never
@@ -465,6 +481,41 @@ func gradeResult(w domain.Watch, rubric ResultRubric, iteration int, interrupted
 		ev.Outcome = OutcomeNeedsRevision
 	}
 	return ev
+}
+
+// gradeExternalAction grades a task whose execution touched the outside world.
+// performed says the action reached that world; responseLost says its answer
+// never returned. Only both together produce indeterminate: the effect may
+// already have happened, so the core cannot claim success or failure, cannot
+// set a ready verdict and cannot justify a retry (ADR 0039 §5). The durable lease
+// key travels with the outcome so the caller can correlate the unknown effect.
+// Every other combination falls through to the ordinary rubric grading.
+func gradeExternalAction(w domain.Watch, rubric ResultRubric, iteration int, performed, responseLost bool, leaseKey string) RubricEvaluation {
+	if !performed || !responseLost {
+		return gradeResult(w, rubric, iteration, false)
+	}
+
+	maxIterations := rubric.MaxIterations
+	if maxIterations <= 0 {
+		maxIterations = defaultOutcomeIterations
+	}
+	if maxIterations > maxOutcomeIterations {
+		maxIterations = maxOutcomeIterations
+	}
+	if iteration < 0 {
+		iteration = 0
+	}
+	return RubricEvaluation{
+		Outcome:       OutcomeIndeterminate,
+		Iteration:     iteration,
+		MaxIterations: maxIterations,
+		Criteria: []CriterionEvaluation{{
+			Criterion:   CriterionExternalActionResponse,
+			Passed:      false,
+			Explanation: "external action was performed but its response was lost; effect unknown",
+		}},
+		LeaseKey: leaseKey,
+	}
 }
 
 // evaluateCriterion turns Watch facts into one explained criterion result.
@@ -536,6 +587,27 @@ func (h *GetResultHandler) GradeResult(ctx context.Context, watchID string, rubr
 		return RubricEvaluation{}, mapResultReadError(err, "grade_result: watch")
 	}
 	return gradeResult(w, rubric, iteration, interrupted), nil
+}
+
+// GradeExternalAction is the ADR 0039 §5 entry point. It grades a task after an
+// external action and reports indeterminate when that action ran but its answer
+// was lost. leaseKey is the durable obligation key from get_result; it is
+// returned with the indeterminate outcome and nowhere else. Grading reads the
+// Watch only and stamps no delivery fact: a delivery-ladder indeterminate
+// attempt in ADR 0017 never turns into a task result here.
+func (h *GetResultHandler) GradeExternalAction(ctx context.Context, watchID string, rubric ResultRubric, iteration int, performed, responseLost bool, leaseKey string) (RubricEvaluation, error) {
+	_ = ctx
+	if watchID == "" {
+		return RubricEvaluation{}, domain.NewAppError(domain.CodeInvalidInput, "grade_external_action: watchID is required")
+	}
+	if h == nil || h.store == nil {
+		return RubricEvaluation{}, domain.NewAppError(domain.CodePersistFailed, "grade_external_action: store is nil")
+	}
+	w, err := h.store.Watch(watchID)
+	if err != nil {
+		return RubricEvaluation{}, mapResultReadError(err, "grade_external_action: watch")
+	}
+	return gradeExternalAction(w, rubric, iteration, performed, responseLost, leaseKey), nil
 }
 
 // AttachGetResult replaces the startup stub with the real tool. Wiring it into
