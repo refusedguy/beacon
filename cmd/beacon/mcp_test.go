@@ -2,11 +2,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // TestW43MCPDispatchesAndRuns proves that `beacon mcp` reaches the MCP runner,
@@ -75,5 +83,63 @@ func TestW43MCPInCatalog(t *testing.T) {
 	}
 	if !strings.Contains(whatOut.String(), "beacon mcp") {
 		t.Fatalf("what mcp не знает команду: %q", whatOut.String())
+	}
+}
+
+// TestMCPCompositionRootBuildsServerWithStore proves that `beacon mcp` opens a
+// real SQLite store and passes it, together with the other production ports,
+// into the server. The transport is replaced so the test does not block on
+// stdin; the store itself is real and is exercised through a save/read pair.
+func TestMCPCompositionRootBuildsServerWithStore(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+
+	previous := serveMCP
+	t.Cleanup(func() { serveMCP = previous })
+
+	called := false
+	serveMCP = func(_ context.Context, deps mcp.Dependencies) error {
+		called = true
+		if deps.Store == nil {
+			t.Fatal("composition root передал nil Store в сервер")
+		}
+		if _, ok := deps.Store.(*store.DB); !ok {
+			t.Fatalf("Store имеет тип %T, ожидался *store.DB", deps.Store)
+		}
+		if deps.Stamper == nil || deps.Writer == nil || deps.Events == nil || deps.Snapshot == nil {
+			t.Fatalf("не все SQL-порты подключены: %+v", deps)
+		}
+
+		w := domain.Watch{
+			ID:        "composition-root-smoke",
+			Repo:      "refusedguy/beacon",
+			PR:        42,
+			HeadSHA:   "composition-head",
+			Status:    domain.StatusWatching,
+			Verdict:   domain.VerdictWatching,
+			CreatedAt: time.Now(),
+		}
+		if err := deps.Store.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch через настоящий store: %v", err)
+		}
+		got, err := deps.Store.Watch(w.ID)
+		if err != nil {
+			t.Fatalf("Watch через настоящий store: %v", err)
+		}
+		if got.HeadSHA != w.HeadSHA || got.Repo != w.Repo {
+			t.Fatalf("watch не сохранился: %+v", got)
+		}
+		return nil
+	}
+
+	errOut := new(bytes.Buffer)
+	if code := mcpRunner(errOut); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, errOut.String())
+	}
+	if !called {
+		t.Fatal("сервер не был запущен с собранными зависимостями")
+	}
+	if _, err := os.Stat(filepath.Join(base, "beacon", mcpStateDBName)); err != nil {
+		t.Fatalf("файл состояния не создан: %v", err)
 	}
 }

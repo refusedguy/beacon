@@ -6,6 +6,8 @@ package mcp
 
 import (
 	"context"
+	"fmt"
+	"os"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -214,7 +216,28 @@ func emptySnapshotReader() SnapshotReader {
 	return SnapshotFunc(func() (StateSnapshot, error) { return StateSnapshot{}, nil })
 }
 
-// Run serves MCP over stdin/stdout until the client disconnects.
+// EnsureStateDir creates the Beacon state directory before the store opens its
+// SQLite file. The filesystem call lives in infra: ADR 0005 keeps file
+// capabilities out of cmd, so the composition root only passes a path.
+func EnsureStateDir(dir string) error {
+	if dir == "" {
+		return fmt.Errorf("mcp: empty state directory")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("mcp: state directory %s: %w", dir, err)
+	}
+	return nil
+}
+
+// RunWithDeps serves MCP over stdin/stdout with the supplied production ports.
+// The composition root builds them from the real store and calls this instead
+// of Run, so every tool receives a non-nil Store.
+func RunWithDeps(ctx context.Context, deps Dependencies) error {
+	return NewServerWithDeps(deps).Run(ctx, &mcpsdk.StdioTransport{})
+}
+
+// Run serves MCP over stdin/stdout with no injected ports. Kept for callers
+// that only need the zero-dependency server; `beacon mcp` uses RunWithDeps.
 func Run(ctx context.Context) error {
-	return NewServer().Run(ctx, &mcpsdk.StdioTransport{})
+	return RunWithDeps(ctx, Dependencies{})
 }
