@@ -567,3 +567,154 @@ func TestMCPSuccessfulRunClearsPrecheckReason(t *testing.T) {
 		t.Fatalf("ожидалась обычная проверка входа, получено %v", err)
 	}
 }
+
+// TestReadSyncCallConfig covers the unified sync-call threshold at the CLI
+// boundary (ADR 0045 §2): 30s by default, capped at 120s, with a fallback to the
+// default for a broken setting. The threshold is a time bound, not ADR 0026's
+// delivery field, so no delivery value is read here.
+func TestReadSyncCallConfig(t *testing.T) {
+	t.Setenv("BEACON_SYNC_CALL_TIMEOUT", "")
+	if got := readSyncCallConfig().after; got != syncCallTimeoutDefault {
+		t.Fatalf("порог по умолчанию %s, ожидался %s", got, syncCallTimeoutDefault)
+	}
+
+	t.Setenv("BEACON_SYNC_CALL_TIMEOUT", "45s")
+	if got := readSyncCallConfig().after; got != 45*time.Second {
+		t.Fatalf("настроенный порог %s, ожидался 45s", got)
+	}
+
+	t.Setenv("BEACON_SYNC_CALL_TIMEOUT", " 7s ")
+	if got := readSyncCallConfig().after; got != 7*time.Second {
+		t.Fatalf("порог с пробелами %s, ожидался 7s", got)
+	}
+
+	// A value above the ceiling is clamped, the exact ceiling is accepted.
+	t.Setenv("BEACON_SYNC_CALL_TIMEOUT", "10m")
+	if got := readSyncCallConfig().after; got != syncCallTimeoutMax {
+		t.Fatalf("порог 10m не ограничен максимумом: %s, ожидался %s", got, syncCallTimeoutMax)
+	}
+	t.Setenv("BEACON_SYNC_CALL_TIMEOUT", "120s")
+	if got := readSyncCallConfig().after; got != syncCallTimeoutMax {
+		t.Fatalf("порог ровно 120s дал %s, ожидался %s", got, syncCallTimeoutMax)
+	}
+
+	for _, raw := range []string{"not-a-duration", "0s", "-5s", "   "} {
+		t.Setenv("BEACON_SYNC_CALL_TIMEOUT", raw)
+		if got := readSyncCallConfig().after; got != syncCallTimeoutDefault {
+			t.Fatalf("значение %q дало %s, ожидался дефолт %s", raw, got, syncCallTimeoutDefault)
+		}
+	}
+}
+
+// TestSyncCallThresholdWiredIntoProductionDeps proves the card's link: the
+// composition root puts the single threshold into Dependencies.After, so the
+// production server applies it to its long synchronous calls. Previously After
+// stayed at zero, which disabled the ticket conversion entirely.
+func TestSyncCallThresholdWiredIntoProductionDeps(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{"по умолчанию", "", syncCallTimeoutDefault},
+		{"настроенный", "5s", 5 * time.Second},
+		{"ограничен максимумом", "1h", syncCallTimeoutMax},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BEACON_SYNC_CALL_TIMEOUT", tc.raw)
+			deps, closeStore, err := openMCPDependenciesInDir(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = closeStore() }()
+			if deps.After != tc.want {
+				t.Fatalf("Dependencies.After = %s, ожидался %s", deps.After, tc.want)
+			}
+		})
+	}
+}
+
+// TestSyncCallOverThresholdReturnsJobTicket is the acceptance test for ADR 0045
+// §2. With a tiny threshold the production composition root answers a long
+// synchronous beacon_get_result call with a ticket carrying a job id instead of
+// holding the connection. A plain client further waits by that job id. The call
+// is bounded by a context deadline so a hang fails the test rather than the CI.
+func TestSyncCallOverThresholdReturnsJobTicket(t *testing.T) {
+	t.Setenv("BEACON_SYNC_CALL_TIMEOUT", "1ns")
+
+	deps, closeStore, err := openMCPDependenciesInDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closeStore() }()
+
+	const caller = "sync-ticket-session"
+	w := domain.Watch{
+		ID:        "sync-ticket-watch",
+		Repo:      "refusedguy/beacon",
+		PR:        42,
+		HeadSHA:   "sync-ticket-head",
+		Revision:  1,
+		Status:    domain.StatusNotifying,
+		Verdict:   domain.VerdictReady,
+		CreatedAt: time.Now(),
+	}
+	if err := deps.Store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	obligationID := domain.ObligationKey(w.ID, w.Revision, caller)
+	if err := deps.Store.SaveObligation(domain.Obligation{
+		ID:             obligationID,
+		WatchID:        w.ID,
+		Revision:       w.Revision,
+		SubscriberID:   caller,
+		VerdictPointer: domain.VerdictReady,
+	}); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	serverTransport, clientTransport := mcpsdk.NewInMemoryTransports()
+	serverSession, err := newMCPServer(deps).Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "beacon-sync-ticket-test", Version: "v0.0.1"}, nil)
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer func() {
+		_ = clientSession.Close()
+		_ = serverSession.Wait()
+	}()
+
+	result, err := clientSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      "beacon_get_result",
+		Arguments: map[string]any{"watchID": w.ID},
+		Meta:      mcpsdk.Meta{"ai.opencode/sessionID": caller},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_get_result: %v", err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out mcp.GetResultOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+
+	if out.JobID != obligationID {
+		t.Fatalf("jobID = %q, ожидался %q", out.JobID, obligationID)
+	}
+	if out.Instructions == "" {
+		t.Fatalf("в тикете нет инструкций по ожиданию: %+v", out)
+	}
+	if out.ResultType != "" || out.TaskID != "" {
+		t.Fatalf("обычный клиент не должен получать task-форму: %+v", out)
+	}
+}
