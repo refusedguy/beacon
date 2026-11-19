@@ -335,6 +335,38 @@ func ShipAllowed(f ShipFacts) bool {
 	return f.Build && f.Audit && (f.TDD || f.Trivial)
 }
 
+// GateMetricFacts is the set of observed quantities of a gate check with a
+// measurable magnitude (ADR 0049 §5). MedianRatio is the observed median ratio
+// of the measurement; Threshold is the magnitude floor that ratio must reach.
+// PValue is the observed significance of the change; Alpha is the significance
+// ceiling it must fall below. The struct carries no configuration or policy, so
+// changing a fact cannot change the rule that consumes it.
+type GateMetricFacts struct {
+	MedianRatio float64
+	Threshold   float64
+	PValue      float64
+	Alpha       float64
+}
+
+// GateMetricFlag reports whether the flag is set for a gate check with a
+// measurable magnitude (ADR 0049 §5). Both conditions must hold at once:
+//
+//	median ratio >= threshold  AND  p-value < alpha
+//
+// A check that satisfies only one of the two never sets the flag, so magnitude
+// cannot replace significance and significance cannot replace magnitude. This
+// is a rule for gate metrics only. It is not the compiled-in ship formula of
+// T3.67 (ShipAllowed), it takes no policy to override it, and it does not feed
+// the §4.6 CI decision table of Evaluate.
+//
+// The function is pure over its facts: it reads no clock, config or mutable
+// state and gives the same answer on every call. An unobserved or malformed
+// quantity fails closed, because any comparison with NaN is false and zero
+// values cannot satisfy both conditions at once.
+func GateMetricFlag(f GateMetricFacts) bool {
+	return f.MedianRatio >= f.Threshold && f.PValue < f.Alpha
+}
+
 // Phase is one step of a task plan. Done records that the agent finished the
 // step. A done phase does not by itself close the task: under ADR 0042 §4 it
 // still owes proof before the completion gate allows the close.

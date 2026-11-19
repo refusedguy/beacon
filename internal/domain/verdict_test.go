@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"math"
 	"reflect"
 	"testing"
 	"time"
@@ -728,6 +729,149 @@ func TestEvaluateShipFactsDeterministic(t *testing.T) {
 		got, wake := Evaluate(s, Policy{})
 		if got != want || !reflect.DeepEqual(wake, wantWake) {
 			t.Fatalf("call %d = (%q, %#v), want (%q, %#v)", i, got, wake, want, wantWake)
+		}
+	}
+}
+
+// TestGateMetricFlagTruthTable pins the two-condition rule of ADR 0049 §5. The
+// flag is set only when the median ratio is not below the threshold AND the
+// p-value is below alpha. Either condition alone leaves it unset.
+func TestGateMetricFlagTruthTable(t *testing.T) {
+	const (
+		threshold = 2.0
+		alpha     = 0.05
+	)
+	cases := []struct {
+		name  string
+		facts GateMetricFacts
+		want  bool
+	}{
+		{
+			name:  "both conditions hold sets the flag",
+			facts: GateMetricFacts{MedianRatio: 2.07, Threshold: threshold, PValue: 0.0001, Alpha: alpha},
+			want:  true,
+		},
+		{
+			name:  "magnitude only leaves the flag unset",
+			facts: GateMetricFacts{MedianRatio: 2.07, Threshold: threshold, PValue: 0.2, Alpha: alpha},
+			want:  false,
+		},
+		{
+			name:  "significance only leaves the flag unset",
+			facts: GateMetricFacts{MedianRatio: 1.2, Threshold: threshold, PValue: 0.0001, Alpha: alpha},
+			want:  false,
+		},
+		{
+			name:  "neither condition holds leaves the flag unset",
+			facts: GateMetricFacts{MedianRatio: 1.2, Threshold: threshold, PValue: 0.2, Alpha: alpha},
+			want:  false,
+		},
+		{
+			name:  "ratio exactly at threshold counts as magnitude",
+			facts: GateMetricFacts{MedianRatio: threshold, Threshold: threshold, PValue: 0.01, Alpha: alpha},
+			want:  true,
+		},
+		{
+			name:  "ratio just below threshold fails magnitude",
+			facts: GateMetricFacts{MedianRatio: 1.999, Threshold: threshold, PValue: 0.01, Alpha: alpha},
+			want:  false,
+		},
+		{
+			name:  "p-value exactly at alpha fails significance",
+			facts: GateMetricFacts{MedianRatio: 3.0, Threshold: threshold, PValue: alpha, Alpha: alpha},
+			want:  false,
+		},
+		{
+			name:  "p-value just below alpha counts as significance",
+			facts: GateMetricFacts{MedianRatio: 3.0, Threshold: threshold, PValue: 0.049, Alpha: alpha},
+			want:  true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := GateMetricFlag(tc.facts); got != tc.want {
+				t.Fatalf("GateMetricFlag(%+v) = %v, want %v", tc.facts, got, tc.want)
+			}
+		})
+	}
+}
+
+// An unknown or unconfigured quantity must not set the flag. Comparisons with
+// NaN are always false, and a zero-value facts struct cannot satisfy both
+// conditions, so a missing observation fails closed.
+func TestGateMetricFlagFailsClosed(t *testing.T) {
+	cases := []struct {
+		name  string
+		facts GateMetricFacts
+	}{
+		{"zero facts", GateMetricFacts{}},
+		{"NaN ratio", GateMetricFacts{MedianRatio: math.NaN(), Threshold: 2.0, PValue: 0.01, Alpha: 0.05}},
+		{"NaN p-value", GateMetricFacts{MedianRatio: 3.0, Threshold: 2.0, PValue: math.NaN(), Alpha: 0.05}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if GateMetricFlag(tc.facts) {
+				t.Fatalf("GateMetricFlag(%+v) = true, want false", tc.facts)
+			}
+		})
+	}
+}
+
+// The rule is fixed: one facts struct in, one bool out, no policy parameter to
+// dispute it with, and the facts carry only measured quantities. It stays pure
+// across repeated calls.
+func TestGateMetricFlagHasNoConfigurationInput(t *testing.T) {
+	fn := reflect.TypeOf(GateMetricFlag)
+	if fn.NumIn() != 1 || fn.In(0) != reflect.TypeOf(GateMetricFacts{}) {
+		t.Fatalf("GateMetricFlag input = %v, want exactly one GateMetricFacts", fn)
+	}
+	if fn.NumOut() != 1 || fn.Out(0) != reflect.TypeOf(true) {
+		t.Fatalf("GateMetricFlag output = %v, want exactly one bool", fn)
+	}
+
+	facts := reflect.TypeOf(GateMetricFacts{})
+	if facts.NumField() != 4 {
+		t.Fatalf("GateMetricFacts has %d fields, want 4", facts.NumField())
+	}
+	for i := 0; i < facts.NumField(); i++ {
+		if facts.Field(i).Type != reflect.TypeOf(float64(0)) {
+			t.Errorf("GateMetricFacts.%s = %v, want float64", facts.Field(i).Name, facts.Field(i).Type)
+		}
+	}
+
+	in := GateMetricFacts{MedianRatio: 2.07, Threshold: 2.0, PValue: 0.0001, Alpha: 0.05}
+	want := GateMetricFlag(in)
+	for i := 0; i < 10; i++ {
+		if got := GateMetricFlag(in); got != want {
+			t.Fatalf("call %d = %v, want %v", i, got, want)
+		}
+	}
+	if !want {
+		t.Fatal("a ratio above threshold with a p-value below alpha must set the flag")
+	}
+}
+
+// The gate-metric rule is a separate gate from the ship formula of T3.67. The
+// two must not be conflated: each can be true while the other is false, and
+// adding gate-metric facts to a snapshot does not move the CI verdict.
+func TestGateMetricFlagIsDistinctFromShipFormula(t *testing.T) {
+	passingMetrics := GateMetricFacts{MedianRatio: 2.07, Threshold: 2.0, PValue: 0.0001, Alpha: 0.05}
+	failingMetrics := GateMetricFacts{MedianRatio: 1.2, Threshold: 2.0, PValue: 0.2, Alpha: 0.05}
+
+	if !GateMetricFlag(passingMetrics) || ShipAllowed(ShipFacts{}) {
+		t.Fatal("a passing gate metric must not imply a passing ship formula")
+	}
+	if GateMetricFlag(failingMetrics) || !ShipAllowed(ShipFacts{Build: true, Audit: true, TDD: true}) {
+		t.Fatal("a passing ship formula must not imply a passing gate metric")
+	}
+
+	// The gate-metric facts are not part of Snapshot, so Evaluate cannot read
+	// them and the §4.6 CI decision table stays untouched.
+	snapshotType := reflect.TypeOf(Snapshot{})
+	for i := 0; i < snapshotType.NumField(); i++ {
+		if snapshotType.Field(i).Type == reflect.TypeOf(GateMetricFacts{}) {
+			t.Fatalf("Snapshot.%s carries gate-metric facts; the CI rule must stay separate",
+				snapshotType.Field(i).Name)
 		}
 	}
 }
