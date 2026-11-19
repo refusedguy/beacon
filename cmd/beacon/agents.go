@@ -57,9 +57,10 @@ type staleTasksState struct {
 	Tasks []staleTask `json:"tasks"`
 }
 
-// readStaleTasks is replaceable in tests. It returns a snapshot of tasks whose
-// lease expired and were not reclaimed. A missing snapshot means no stale work.
-func readStaleTasks(now time.Time) ([]staleTask, error) {
+// readStaleTasks is replaceable in tests, like readServiceFile above. It
+// returns a snapshot of tasks whose lease expired and were not reclaimed. A
+// missing snapshot means no stale work.
+var readStaleTasks = func(now time.Time) ([]staleTask, error) {
 	dir, err := stateDir()
 	if err != nil {
 		return nil, err
