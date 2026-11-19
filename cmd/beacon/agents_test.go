@@ -828,3 +828,288 @@ func TestW168StaleTasksAreSortedByID(t *testing.T) {
 	}
 	t.Fatal("агент reviewer не найден")
 }
+
+// ---- ADR 0058 п6 / T3.133: маршрутизация внимания и handoff между сессиями ----
+
+// w133State points Beacon state at a fresh temporary directory and returns its
+// beacon subdirectory.
+func w133State(t *testing.T) string {
+	t.Helper()
+	xdg := filepath.Join(t.TempDir(), "state")
+	t.Setenv("XDG_STATE_HOME", xdg)
+	dir := filepath.Join(xdg, "beacon")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// w133Requests writes an attention-requests snapshot into Beacon state.
+func w133Requests(t *testing.T, dir string, reqs []attentionRequest) {
+	t.Helper()
+	data, err := json.Marshal(attentionState{Requests: reqs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, attentionRequestsFile)
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// w133Session saves a session for a task, the same way attach does.
+func w133Session(t *testing.T, taskID, sessionID string) {
+	t.Helper()
+	if err := rememberAttachSession(taskID, sessionID, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// w133AgentsCLI runs an agents command with a fixed app.agents response.
+func w133AgentsCLI(t *testing.T) (*CLI, *bytes.Buffer, *bytes.Buffer, *[]w68Call) {
+	t.Helper()
+	w68Service(t, []byte(w68Registration), nil)
+	return w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+}
+
+func TestW133RoutePicksAgentWithAttentionRequest(t *testing.T) {
+	dir := w133State(t)
+	w133Requests(t, dir, []attentionRequest{{
+		Agent: "reviewer", TaskID: "T3.9", Reason: "нужен разбор", RequestedAt: time.Now().Add(-time.Minute),
+	}})
+	w133Session(t, "T3.9", "session-reviewer")
+	c, out, errOut, _ := w133AgentsCLI(t)
+
+	if code := c.runAgents([]string{"--route"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var got attentionRoute
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout не JSON: %q: %v", out.String(), err)
+	}
+	want := attentionRoute{
+		Agent: "reviewer", Name: "Reviewer", TaskID: "T3.9",
+		SessionID: "session-reviewer", Reason: "нужен разбор",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("маршрут %+v, ожидался %+v", got, want)
+	}
+}
+
+func TestW133RouteWithoutRequestIsAnError(t *testing.T) {
+	w133State(t)
+	c, out, errOut, _ := w133AgentsCLI(t)
+
+	if code := c.runAgents([]string{"--route"}); code != 2 {
+		t.Fatalf("код выхода %d, ожидался 2", code)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout не пустой: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "нет агента с запросом внимания") {
+		t.Fatalf("нет понятной ошибки: %q", errOut.String())
+	}
+}
+
+func TestW133RouteIgnoresRequestsForUnknownAgents(t *testing.T) {
+	dir := w133State(t)
+	w133Requests(t, dir, []attentionRequest{{Agent: "ghost", TaskID: "T3.9"}})
+	c, out, errOut, _ := w133AgentsCLI(t)
+
+	if code := c.runAgents([]string{"--route"}); code != 2 {
+		t.Fatalf("код выхода %d, ожидался 2", code)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("неизвестный агент попал в маршрут: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "нет агента с запросом внимания") {
+		t.Fatalf("нет понятной ошибки: %q", errOut.String())
+	}
+}
+
+func TestW133RouteUsesEarliestRequestAndStableTieBreak(t *testing.T) {
+	dir := w133State(t)
+	now := time.Now()
+	w133Requests(t, dir, []attentionRequest{
+		{Agent: "general", TaskID: "T2", RequestedAt: now.Add(-time.Hour)},
+		{Agent: "reviewer", TaskID: "T1", RequestedAt: now.Add(-2 * time.Hour)},
+	})
+	c, out, errOut, _ := w133AgentsCLI(t)
+	if code := c.runAgents([]string{"--route"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var got attentionRoute
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Agent != "reviewer" {
+		t.Fatalf("выбран %q, ожидался reviewer с более ранним запросом", got.Agent)
+	}
+
+	// При равном времени запросов побеждает меньший ID агента.
+	w133Requests(t, dir, []attentionRequest{
+		{Agent: "general", TaskID: "T2", RequestedAt: now},
+		{Agent: "reviewer", TaskID: "T1", RequestedAt: now},
+	})
+	c, out, errOut, _ = w133AgentsCLI(t)
+	if code := c.runAgents([]string{"--route"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Agent != "general" {
+		t.Fatalf("выбран %q, ожидался general по tie-break", got.Agent)
+	}
+}
+
+func TestW133AttentionMarkedInTableAndJSON(t *testing.T) {
+	dir := w133State(t)
+	w133Requests(t, dir, []attentionRequest{{Agent: "reviewer", TaskID: "T3.9"}})
+
+	c, out, errOut, _ := w133AgentsCLI(t)
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "ATTENTION") {
+		t.Fatalf("в таблице нет колонки ATTENTION: %q", out.String())
+	}
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		if strings.HasPrefix(line, "reviewer") && !strings.HasSuffix(strings.TrimSpace(line), "+") {
+			t.Fatalf("reviewer не помечен в таблице: %q", line)
+		}
+		if strings.HasPrefix(line, "general") && strings.HasSuffix(strings.TrimSpace(line), "+") {
+			t.Fatalf("general помечен в таблице: %q", line)
+		}
+	}
+
+	c, out, errOut, _ = w133AgentsCLI(t)
+	if code := c.runAgents([]string{"--format", "json"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var rows []agentRow
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.ID == "reviewer" && !row.Attention {
+			t.Fatalf("reviewer не помечен в JSON: %+v", row)
+		}
+		if row.ID == "general" && row.Attention {
+			t.Fatalf("general помечен в JSON: %+v", row)
+		}
+	}
+}
+
+func TestW133HandoffRecordsTransferAndRoutingFollowsIt(t *testing.T) {
+	dir := w133State(t)
+	w133Session(t, "T3.9", "session-A")
+	c, out, errOut, _ := w68CLI(t, nil)
+
+	if code := c.runAgents([]string{"--handoff", "T3.9", "--to", "session-B"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var rec handoffRecord
+	if err := json.Unmarshal(out.Bytes(), &rec); err != nil {
+		t.Fatalf("stdout не JSON: %q: %v", out.String(), err)
+	}
+	if rec.TaskID != "T3.9" || rec.From != "session-A" || rec.To != "session-B" {
+		t.Fatalf("запись передачи %+v, ожидалась A -> B", rec)
+	}
+
+	w133Requests(t, dir, []attentionRequest{{Agent: "reviewer", TaskID: "T3.9"}})
+	c, out, errOut, _ = w133AgentsCLI(t)
+	if code := c.runAgents([]string{"--route"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var route attentionRoute
+	if err := json.Unmarshal(out.Bytes(), &route); err != nil {
+		t.Fatal(err)
+	}
+	if route.SessionID != "session-B" {
+		t.Fatalf("маршрут ведёт в сессию %q, ожидалась session-B после передачи", route.SessionID)
+	}
+}
+
+func TestW133HandoffIsIdempotent(t *testing.T) {
+	dir := w133State(t)
+	journal := func() handoffState {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, handoffsFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st handoffState
+		if err := json.Unmarshal(data, &st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	c, out, _, _ := w68CLI(t, nil)
+	if code := c.runAgents([]string{"--handoff", "T3.9", "--to", "session-B"}); code != 0 {
+		t.Fatalf("первый вызов: код %d", code)
+	}
+	first := out.String()
+	c, out, _, _ = w68CLI(t, nil)
+	if code := c.runAgents([]string{"--handoff", "T3.9", "--to", "session-B"}); code != 0 {
+		t.Fatalf("повторный вызов: код %d", code)
+	}
+	if out.String() != first {
+		t.Fatalf("повтор изменил запись: %q против %q", out.String(), first)
+	}
+	if st := journal(); len(st.Handoffs) != 1 {
+		t.Fatalf("передач %d, ожидалась 1", len(st.Handoffs))
+	}
+
+	c, _, _, _ = w68CLI(t, nil)
+	if code := c.runAgents([]string{"--handoff", "T3.9", "--to", "session-C"}); code != 0 {
+		t.Fatalf("передача в другую сессию: код %d", code)
+	}
+	if st := journal(); len(st.Handoffs) != 2 {
+		t.Fatalf("передач %d, ожидалось 2", len(st.Handoffs))
+	}
+}
+
+func TestW133HandoffRejectsMissingArgs(t *testing.T) {
+	w133State(t)
+	for _, args := range [][]string{
+		{"--handoff", "T3.9"},
+		{"--to", "session-B"},
+		{"--handoff", "  ", "--to", "session-B"},
+		{"--handoff", "T3.9", "--to", "  "},
+		{"--handoff", "T3.9", "--to", "session-B", "--route"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			c, out, errOut, _ := w68CLI(t, nil)
+			if code := c.runAgents(args); code != 2 {
+				t.Fatalf("код выхода %d, ожидался 2", code)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("stdout не пустой: %q", out.String())
+			}
+			if errOut.Len() == 0 {
+				t.Fatal("stderr пустой")
+			}
+		})
+	}
+}
+
+func TestW133RouteReportsMalformedAttentionState(t *testing.T) {
+	dir := w133State(t)
+	if err := os.WriteFile(filepath.Join(dir, attentionRequestsFile), []byte("{не json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, out, errOut, _ := w133AgentsCLI(t)
+	if code := c.runAgents([]string{"--route"}); code != 2 {
+		t.Fatalf("код выхода %d, ожидался 2", code)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("stdout не пустой: %q", out.String())
+	}
+	if !strings.Contains(errOut.String(), "запросы внимания") {
+		t.Fatalf("нет понятной ошибки: %q", errOut.String())
+	}
+}

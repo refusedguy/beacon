@@ -21,10 +21,11 @@ const agentsServiceHint = "фоновый сервис не запущен: open
 
 // agentRow is one agent printed by beacon agents.
 type agentRow struct {
-	ID    string         `json:"id"`
-	Name  string         `json:"name"`
-	Mode  string         `json:"mode"`
-	Stale []staleTaskRef `json:"stale,omitempty"`
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	Mode      string         `json:"mode"`
+	Stale     []staleTaskRef `json:"stale,omitempty"`
+	Attention bool           `json:"attention,omitempty"`
 }
 
 // staleTask is a task in work (in_progress) whose lease has expired and has
@@ -161,10 +162,14 @@ func readServiceRegistration() error {
 	return nil
 }
 
-// runAgents implements beacon agents [--format table|json].
+// runAgents implements beacon agents [--format table|json] [--route]
+// [--handoff task --to session]. ADR 0058 п6 / T3.133.
 func (c *CLI) runAgents(args []string) int {
 	fs := flag.NewFlagSet("agents", flag.ContinueOnError)
 	format := fs.String("format", "table", "формат вывода")
+	route := fs.Bool("route", false, "показать агента, просящего внимания")
+	handoff := fs.String("handoff", "", "передать задачу в другую сессию")
+	to := fs.String("to", "", "сессия-получатель для --handoff")
 	if !parseFlags("agents", args, c.errOut, fs) {
 		return 2
 	}
@@ -172,6 +177,13 @@ func (c *CLI) runAgents(args []string) int {
 		fmt.Fprintf(c.errOut, "beacon agents: неизвестный формат %q, ожидается table или json\n", *format)
 		writeUsage(c.errOut)
 		return 2
+	}
+	if *handoff != "" || *to != "" {
+		if *route {
+			fmt.Fprintln(c.errOut, "beacon agents: --handoff и --route несовместимы")
+			return 2
+		}
+		return c.runHandoff(*handoff, *to)
 	}
 
 	if err := readServiceRegistration(); err != nil {
@@ -193,6 +205,19 @@ func (c *CLI) runAgents(args []string) int {
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon agents: не удалось разобрать ответ opencode api: %v\n", err)
 		return 2
+	}
+
+	requests, err := readAttentionRequests()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: не удалось прочитать запросы внимания: %v\n", err)
+		return 2
+	}
+	if *route {
+		return c.routeAttention(rows, requests)
+	}
+	targetID, _, found := attentionTarget(rows, requests)
+	if found {
+		attachAttention(rows, targetID)
 	}
 
 	now := time.Now()
@@ -270,7 +295,7 @@ func printAgentRows(format string, rows []agentRow, out, errOut io.Writer) int {
 		return 0
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "ID\tNAME\tMODE\tSTALE")
+		fmt.Fprintln(w, "ID\tNAME\tMODE\tSTALE\tATTENTION")
 		for _, r := range rows {
 			cell := "-"
 			if len(r.Stale) > 0 {
@@ -280,7 +305,11 @@ func printAgentRows(format string, rows []agentRow, out, errOut io.Writer) int {
 				}
 				cell = strings.Join(parts, ",")
 			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.ID, r.Name, r.Mode, cell)
+			attention := "-"
+			if r.Attention {
+				attention = "+"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.ID, r.Name, r.Mode, cell, attention)
 		}
 		if err := w.Flush(); err != nil {
 			fmt.Fprintf(errOut, "beacon agents: %v\n", err)
@@ -515,4 +544,270 @@ func (c *CLI) portProcessKiller(port int) error {
 		msg = fmt.Sprintf("fuser завершился с кодом %d", res.code)
 	}
 	return fmt.Errorf("%s", msg)
+}
+
+// ---- ADR 0058 п6 / T3.133: маршрутизация внимания и handoff между сессиями ----
+//
+// T3.87 адресует wake к worktree. Здесь адресатом становится агент, который
+// просит внимания, а задача передаётся между сессиями. Ни один из этих
+// механизмов не меняет адресацию wake и не добавляет ступень в лестницу.
+
+// attentionRequest is an explicit signal that an agent needs the manager. It
+// is the input to the attention heuristic, not a wake addressed to a worktree.
+type attentionRequest struct {
+	Agent       string    `json:"agent"`
+	TaskID      string    `json:"taskID,omitempty"`
+	Reason      string    `json:"reason,omitempty"`
+	RequestedAt time.Time `json:"requestedAt"`
+}
+
+// attentionState is the on-disk list of open attention requests. It is
+// produced outside this command; agents only reads it.
+type attentionState struct {
+	Requests []attentionRequest `json:"requests"`
+}
+
+const attentionRequestsFile = "attention-requests.json"
+
+// attentionReadFile is replaceable in tests, like the other state seams.
+var attentionReadFile = os.ReadFile
+
+// readAttentionRequests returns the open attention requests from Beacon state.
+// A missing snapshot means no agent asks for attention.
+func readAttentionRequests() ([]attentionRequest, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, attentionRequestsFile)
+	data, err := attentionReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s: не удалось прочитать запросы внимания: %v", path, err)
+	}
+	var st attentionState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, fmt.Errorf("%s: неверный список запросов внимания: %v", path, err)
+	}
+	return st.Requests, nil
+}
+
+// attentionTarget applies the ADR 0058 п6 heuristic: among the agents listed
+// by app.agents, pick the one with a request for attention. Requests naming an
+// agent that is not in rows are ignored. The earliest request wins; ties break
+// by agent ID and then task ID, so the choice is stable across runs. It returns
+// the row ID of the chosen agent and the winning request.
+func attentionTarget(rows []agentRow, requests []attentionRequest) (string, attentionRequest, bool) {
+	known := make(map[string]string, len(rows)*2)
+	for _, r := range rows {
+		known[r.ID] = r.ID
+		if r.Name != "" {
+			known[r.Name] = r.ID
+		}
+	}
+
+	var best attentionRequest
+	var bestID string
+	found := false
+	for _, req := range requests {
+		agent := strings.TrimSpace(req.Agent)
+		id, ok := known[agent]
+		if !ok || strings.TrimSpace(id) == "" {
+			continue
+		}
+		if !found || req.RequestedAt.Before(best.RequestedAt) ||
+			(req.RequestedAt.Equal(best.RequestedAt) &&
+				(id < bestID || (id == bestID && req.TaskID < best.TaskID))) {
+			best, bestID, found = req, id, true
+		}
+	}
+	return bestID, best, found
+}
+
+// attachAttention marks the one row chosen by the heuristic.
+func attachAttention(rows []agentRow, id string) {
+	for i := range rows {
+		rows[i].Attention = rows[i].ID == id
+	}
+}
+
+// attentionRoute is the machine-readable transition target for the manager.
+type attentionRoute struct {
+	Agent     string `json:"agent"`
+	Name      string `json:"name"`
+	TaskID    string `json:"taskID,omitempty"`
+	SessionID string `json:"sessionID,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// routeAttention prints the agent to switch to and the session its task lives
+// in. A handoff moves that session, so routing follows the transfer.
+func (c *CLI) routeAttention(rows []agentRow, requests []attentionRequest) int {
+	id, req, ok := attentionTarget(rows, requests)
+	if !ok {
+		fmt.Fprintln(c.errOut, "beacon agents: нет агента с запросом внимания")
+		return 2
+	}
+	var name string
+	for _, r := range rows {
+		if r.ID == id {
+			name = r.Name
+			break
+		}
+	}
+	session, err := handoffSessionFor(req.TaskID)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: не удалось найти сессию задачи %s: %v\n", req.TaskID, err)
+		return 2
+	}
+	route := attentionRoute{Agent: id, Name: name, TaskID: req.TaskID, SessionID: session, Reason: req.Reason}
+	if err := json.NewEncoder(c.out).Encode(route); err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: %v\n", err)
+		return 2
+	}
+	return 0
+}
+
+// handoffRecord is one transfer of a task to another session. ADR 0058 п6.
+type handoffRecord struct {
+	TaskID      string    `json:"taskID"`
+	From        string    `json:"from,omitempty"`
+	To          string    `json:"to"`
+	HandedOffAt time.Time `json:"handedOffAt"`
+}
+
+// handoffState is the append-only journal of transfers in Beacon state.
+type handoffState struct {
+	Handoffs []handoffRecord `json:"handoffs"`
+}
+
+const handoffsFile = "handoffs.json"
+
+var (
+	handoffReadFile  = os.ReadFile
+	handoffWriteFile = os.WriteFile
+	handoffMkdirAll  = os.MkdirAll
+)
+
+func handoffsPath() (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, handoffsFile), nil
+}
+
+// loadHandoffs reads the journal. A missing file is an empty journal; a
+// corrupt one is an error, so a handoff never overwrites unknown transfers.
+func loadHandoffs() (handoffState, error) {
+	path, err := handoffsPath()
+	if err != nil {
+		return handoffState{}, err
+	}
+	data, err := handoffReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return handoffState{}, nil
+	}
+	if err != nil {
+		return handoffState{}, fmt.Errorf("%s: не удалось прочитать журнал передач: %v", path, err)
+	}
+	var st handoffState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return handoffState{}, fmt.Errorf("%s: неверный журнал передач: %v", path, err)
+	}
+	return st, nil
+}
+
+func saveHandoffs(st handoffState) error {
+	path, err := handoffsPath()
+	if err != nil {
+		return err
+	}
+	if err := handoffMkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("%s: не создан каталог состояния: %v", path, err)
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return handoffWriteFile(path, append(data, '\n'), 0o600)
+}
+
+// recordHandoff transfers taskID to session to. A repeated transfer of the
+// same task to the same session returns the existing record, so a retried
+// command cannot duplicate the handoff.
+func recordHandoff(taskID, from, to string, now time.Time) (handoffRecord, error) {
+	taskID = strings.TrimSpace(taskID)
+	to = strings.TrimSpace(to)
+	if taskID == "" {
+		return handoffRecord{}, fmt.Errorf("пустая задача")
+	}
+	if to == "" {
+		return handoffRecord{}, fmt.Errorf("пустая сессия получателя")
+	}
+	st, err := loadHandoffs()
+	if err != nil {
+		return handoffRecord{}, err
+	}
+	for _, h := range st.Handoffs {
+		if h.TaskID == taskID && h.To == to {
+			return h, nil
+		}
+	}
+	rec := handoffRecord{TaskID: taskID, From: from, To: to, HandedOffAt: now.UTC()}
+	st.Handoffs = append(st.Handoffs, rec)
+	if err := saveHandoffs(st); err != nil {
+		return handoffRecord{}, err
+	}
+	return rec, nil
+}
+
+// handoffSessionFor returns the session a task currently lives in. A recorded
+// handoff wins over the attach registry, so routing follows the transfer.
+func handoffSessionFor(taskID string) (string, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return "", nil
+	}
+	st, err := loadHandoffs()
+	if err != nil {
+		return "", err
+	}
+	var session string
+	for _, h := range st.Handoffs {
+		if h.TaskID == taskID {
+			session = h.To
+		}
+	}
+	if session != "" {
+		return session, nil
+	}
+	return savedAttachSession(taskID)
+}
+
+// runHandoff implements beacon agents --handoff <taskID> --to <sessionID>.
+// It records the transfer and prints the resulting record as JSON.
+func (c *CLI) runHandoff(taskID, to string) int {
+	taskID = strings.TrimSpace(taskID)
+	to = strings.TrimSpace(to)
+	if taskID == "" || to == "" {
+		fmt.Fprintln(c.errOut, "beacon agents: --handoff требует --handoff <taskID> и --to <sessionID>")
+		return 2
+	}
+	from, err := savedAttachSession(taskID)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: не удалось прочитать текущую сессию задачи %s: %v\n", taskID, err)
+		return 2
+	}
+	rec, err := recordHandoff(taskID, from, to, time.Now())
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: передача задачи %s не удалась: %v\n", taskID, err)
+		return 2
+	}
+	if err := json.NewEncoder(c.out).Encode(rec); err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: %v\n", err)
+		return 2
+	}
+	return 0
 }
