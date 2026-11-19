@@ -1,0 +1,11 @@
+{
+  "url": "https://api.github.com/repos/acme/widgets/branches/main/protection",
+  "required_status_checks": {
+    "strict": true,
+    "contexts": [
+      "build",
+      "test",
+      "lint"
+    ]
+  }
+}
