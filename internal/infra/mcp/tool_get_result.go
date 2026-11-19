@@ -13,7 +13,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path"
+	"sort"
+	"strings"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -324,6 +327,215 @@ func mapResultReadError(err error, what string) error {
 		return err
 	}
 	return domain.NewAppError(domain.CodeWatchNotFound, what+": "+err.Error())
+}
+
+// --- Result rubric, separate from run completion (ADR 0034 §1) -------------
+//
+// A Watch reaching StatusClosed only says the run ended. Anthropic reports that
+// a run can finish `completed` while the work on its streams failed, so run
+// completion and result grading are two different states. The grader below is
+// a pure function over Watch facts: it never sees the agent's own reasoning and
+// performs no delivery stamp. Its ReadyVerdict is the only verdict allowed to
+// mark a task done. The existing beacon_get_result projection is untouched.
+
+// ResultOutcome is the grader's verdict on the work. The five values mirror the
+// outcome-evaluation event from Anthropic, adopted in ADR 0034 §1.
+type ResultOutcome string
+
+const (
+	OutcomeSatisfied            ResultOutcome = "satisfied"
+	OutcomeNeedsRevision        ResultOutcome = "needs_revision"
+	OutcomeMaxIterationsReached ResultOutcome = "max_iterations_reached"
+	OutcomeFailed               ResultOutcome = "failed"
+	OutcomeInterrupted          ResultOutcome = "interrupted"
+)
+
+// CriterionID names one verifiable criterion. Criteria are fixed before the
+// run starts; forming them after the run would fit the rubric to the answer.
+type CriterionID string
+
+const (
+	// CriterionRunFinished is the run-lifecycle fact, not a proof of work done.
+	CriterionRunFinished CriterionID = "run_finished"
+	// CriterionRequiredChecksOK fails when a required check has a failed
+	// conclusion or failure state.
+	CriterionRequiredChecksOK CriterionID = "required_checks_ok"
+	// CriterionMergeReady fails on unresolved merge blockers.
+	CriterionMergeReady CriterionID = "merge_ready"
+	// CriterionVerdictReady checks the derived verdict computed by the domain
+	// verdict engine, an observable fact rather than the agent's claim.
+	CriterionVerdictReady CriterionID = "verdict_ready"
+)
+
+const (
+	defaultOutcomeIterations = 3
+	maxOutcomeIterations     = 20
+)
+
+// CriterionEvaluation is one criterion result with an explanation. Explanations
+// are returned on every outcome so the orchestrator can hand them to the agent
+// on the next iteration (ADR 0034 §1).
+type CriterionEvaluation struct {
+	Criterion   CriterionID `json:"criterion"`
+	Passed      bool        `json:"passed"`
+	Explanation string      `json:"explanation"`
+}
+
+// ResultRubric is the set of verifiable criteria fixed before the run and the
+// iteration budget. Criteria are IDs, never free-form claims, so the grader can
+// run in its own context over the same facts.
+type ResultRubric struct {
+	Criteria      []CriterionID `json:"criteria"`
+	MaxIterations int           `json:"maxIterations"`
+}
+
+// DefaultResultRubric returns the four built-in criteria and three iterations,
+// the default budget from ADR 0034 §1.
+func DefaultResultRubric() ResultRubric {
+	return ResultRubric{
+		Criteria: []CriterionID{
+			CriterionRunFinished,
+			CriterionRequiredChecksOK,
+			CriterionMergeReady,
+			CriterionVerdictReady,
+		},
+		MaxIterations: defaultOutcomeIterations,
+	}
+}
+
+// RubricEvaluation is the separate result record stored next to the terminal
+// verdict. ReadyVerdict is set only when Outcome is satisfied: a finished run
+// alone never makes a verdict ready.
+type RubricEvaluation struct {
+	Outcome       ResultOutcome         `json:"outcome"`
+	Iteration     int                   `json:"iteration"`
+	MaxIterations int                   `json:"maxIterations"`
+	Criteria      []CriterionEvaluation `json:"criteria"`
+	ReadyVerdict  domain.Verdict        `json:"readyVerdict,omitempty"`
+}
+
+// gradeResult grades w against rubric. It reads no clock, does no I/O and never
+// mutates its arguments, which makes the grader independent of the agent and
+// verifiable in CI. iteration is the number of evaluations already performed;
+// interrupted reports a caller-driven preemption, which the run cannot claim
+// as its own end_turn.
+func gradeResult(w domain.Watch, rubric ResultRubric, iteration int, interrupted bool) RubricEvaluation {
+	maxIterations := rubric.MaxIterations
+	if maxIterations <= 0 {
+		maxIterations = defaultOutcomeIterations
+	}
+	if maxIterations > maxOutcomeIterations {
+		maxIterations = maxOutcomeIterations
+	}
+	if iteration < 0 {
+		iteration = 0
+	}
+
+	ev := RubricEvaluation{
+		Iteration:     iteration,
+		MaxIterations: maxIterations,
+		Criteria:      make([]CriterionEvaluation, 0, len(rubric.Criteria)),
+	}
+	allPassed := len(rubric.Criteria) > 0
+	runFinished := false
+	for _, id := range rubric.Criteria {
+		ce := evaluateCriterion(w, id)
+		if id == CriterionRunFinished && ce.Passed {
+			runFinished = true
+		}
+		if !ce.Passed {
+			allPassed = false
+		}
+		ev.Criteria = append(ev.Criteria, ce)
+	}
+
+	switch {
+	case interrupted:
+		ev.Outcome = OutcomeInterrupted
+	case allPassed:
+		ev.Outcome = OutcomeSatisfied
+		ev.ReadyVerdict = w.Verdict
+	case iteration >= maxIterations:
+		ev.Outcome = OutcomeMaxIterationsReached
+	case runFinished:
+		// The run ended yet at least one criterion failed: completed is not
+		// the same as done, and there is no run left to revise.
+		ev.Outcome = OutcomeFailed
+	default:
+		ev.Outcome = OutcomeNeedsRevision
+	}
+	return ev
+}
+
+// evaluateCriterion turns Watch facts into one explained criterion result.
+func evaluateCriterion(w domain.Watch, id CriterionID) CriterionEvaluation {
+	switch id {
+	case CriterionRunFinished:
+		if w.Status == domain.StatusClosed || !w.ClosedAt.IsZero() {
+			return passedCriterion(id, "run reached a terminal state")
+		}
+		return CriterionEvaluation{Criterion: id, Passed: false,
+			Explanation: "run has not reached a terminal state; status=" + string(w.Status)}
+	case CriterionRequiredChecksOK:
+		failed := failedRequiredCheckNames(w)
+		if len(failed) == 0 {
+			return passedCriterion(id, "no required check failed")
+		}
+		return CriterionEvaluation{Criterion: id, Passed: false,
+			Explanation: "required checks failed: " + strings.Join(failed, ", ")}
+	case CriterionMergeReady:
+		status := strings.ToUpper(w.Merge.MergeStateStatus)
+		if strings.ToUpper(w.Merge.Mergeable) == "MERGEABLE" && status != "DIRTY" && status != "BEHIND" {
+			return passedCriterion(id, "merge is clean")
+		}
+		return CriterionEvaluation{Criterion: id, Passed: false,
+			Explanation: fmt.Sprintf("mergeable=%s mergeStateStatus=%s", w.Merge.Mergeable, w.Merge.MergeStateStatus)}
+	case CriterionVerdictReady:
+		if w.Verdict == domain.VerdictReady {
+			return passedCriterion(id, "verdict is ready")
+		}
+		return CriterionEvaluation{Criterion: id, Passed: false,
+			Explanation: "verdict=" + string(w.Verdict)}
+	default:
+		return CriterionEvaluation{Criterion: id, Passed: false,
+			Explanation: "unknown criterion"}
+	}
+}
+
+func passedCriterion(id CriterionID, why string) CriterionEvaluation {
+	return CriterionEvaluation{Criterion: id, Passed: true, Explanation: why}
+}
+
+// failedRequiredCheckNames lists, in stable order, the required checks whose
+// conclusion or state counts as a failure (WORKER-PROMPT §4.6).
+func failedRequiredCheckNames(w domain.Watch) []string {
+	names := make([]string, 0)
+	for name, check := range w.Checks {
+		if check.Required && isFailedCheck(check) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// GradeResult is the separate result check. It re-reads the Watch from the
+// store and grades it against rubric, so its verdict does not depend on how the
+// agent reported the run. Grading stamps no delivery fact: readAt/claimedAt
+// stay owned by the notification path (ADR 0014).
+func (h *GetResultHandler) GradeResult(ctx context.Context, watchID string, rubric ResultRubric, iteration int, interrupted bool) (RubricEvaluation, error) {
+	_ = ctx
+	if watchID == "" {
+		return RubricEvaluation{}, domain.NewAppError(domain.CodeInvalidInput, "grade_result: watchID is required")
+	}
+	if h == nil || h.store == nil {
+		return RubricEvaluation{}, domain.NewAppError(domain.CodePersistFailed, "grade_result: store is nil")
+	}
+	w, err := h.store.Watch(watchID)
+	if err != nil {
+		return RubricEvaluation{}, mapResultReadError(err, "grade_result: watch")
+	}
+	return gradeResult(w, rubric, iteration, interrupted), nil
 }
 
 // AttachGetResult replaces the startup stub with the real tool. Wiring it into
