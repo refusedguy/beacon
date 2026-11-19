@@ -53,3 +53,4 @@
 | 0039 | Шесть фич из отчёта V-wave | accepted |
 | 0040 | Шесть фич из отчёта W-wave | accepted |
 | 0041 | Шесть фич из отчёта X-wave | accepted |
+| 0042 | Шесть фич из отчёта Y-wave | accepted |
