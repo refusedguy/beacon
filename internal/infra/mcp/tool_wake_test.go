@@ -2633,3 +2633,362 @@ func TestT3_121WakeHandlerConfirmation(t *testing.T) {
 		t.Errorf("ConfirmDelivery() without a ledger error = %v, want a rejection", err)
 	}
 }
+
+// ---- ADR 0056 p3 / T3.124: active duplicate-prompt detection and operationId ----
+
+// TestT3_124PromptGetsInstantOperationID proves the id exists at entry, before
+// any delivery, and is echoed on a successful receipt.
+func TestT3_124PromptGetsInstantOperationID(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "session-1",
+		Text:   "obligation-1@7",
+		Prompt: "review the PR and merge",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.OperationID == "" {
+		t.Fatal("operationId is empty, want one issued at entry")
+	}
+	if !strings.HasPrefix(out.OperationID, operationIDPrefix) {
+		t.Errorf("operationId = %q, want prefix %q", out.OperationID, operationIDPrefix)
+	}
+	if out.Duplicate {
+		t.Error("duplicate = true on the first call, want false")
+	}
+	if !out.OK || out.Delivery != DeliverySteer {
+		t.Errorf("receipt = delivery %q ok %v, want steer/true", out.Delivery, out.OK)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1", sender.calls)
+	}
+}
+
+// TestT3_124EqualPromptReusesOperationIDAndStartsNoSecondTask is the acceptance
+// test: a repeated prompt returns the existing id and starts no second task.
+func TestT3_124EqualPromptReusesOperationIDAndStartsNoSecondTask(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	in := WakeInput{Target: "session-1", Text: "obligation-1@7", Prompt: "review the PR and merge"}
+
+	first, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	second, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+
+	if first.OperationID == "" || second.OperationID != first.OperationID {
+		t.Errorf("operationIds = %q then %q, want one non-empty id", first.OperationID, second.OperationID)
+	}
+	if first.Duplicate {
+		t.Error("first duplicate = true, want false")
+	}
+	if !second.Duplicate {
+		t.Error("second duplicate = false, want true")
+	}
+	if second.OK {
+		t.Error("duplicate ok = true, want false: no second follow-up was delivered")
+	}
+	if second.Delivery != DeliveryUnsupported {
+		t.Errorf("duplicate delivery = %q, want %q", second.Delivery, DeliveryUnsupported)
+	}
+	if second.Reason == "" {
+		t.Error("duplicate reason is empty, want the reason it was refused")
+	}
+	if second.State != StateHeld {
+		t.Errorf("duplicate state = %q, want %q", second.State, StateHeld)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1: a duplicate must not deliver again", sender.calls)
+	}
+}
+
+// TestT3_124TrimsSurroundingWhitespace keeps a trailing newline from starting
+// a second task while leaving the prompt content itself untouched.
+func TestT3_124TrimsSurroundingWhitespace(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+
+	first, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p", Prompt: "  build and test\n"})
+	if err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	second, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p", Prompt: "build and test"})
+	if err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+
+	if second.OperationID != first.OperationID || !second.Duplicate {
+		t.Errorf("second = id %q duplicate %v, want the first id %q and duplicate true", second.OperationID, second.Duplicate, first.OperationID)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1", sender.calls)
+	}
+}
+
+// TestT3_124DistinctPromptsStartDistinctTasks proves the index keys on prompt
+// content, not on a single global operation.
+func TestT3_124DistinctPromptsStartDistinctTasks(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+
+	first, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p1", Prompt: "build the API"})
+	if err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	second, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p2", Prompt: "review the docs"})
+	if err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+
+	if first.OperationID == "" || second.OperationID == "" || first.OperationID == second.OperationID {
+		t.Errorf("operationIds = %q and %q, want two distinct ids", first.OperationID, second.OperationID)
+	}
+	if first.Duplicate || second.Duplicate {
+		t.Error("duplicate = true for a distinct prompt, want false")
+	}
+	if sender.calls != 2 {
+		t.Errorf("sender calls = %d, want 2", sender.calls)
+	}
+}
+
+// TestT3_124DifferentTargetsSamePromptIsOneTask is the line against the
+// clientRequestId key of T2.22: dedup follows the prompt content even when the
+// delivery target changes between calls.
+func TestT3_124DifferentTargetsSamePromptIsOneTask(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+
+	first, err := handler.Wake(context.Background(), WakeInput{Target: "session-A", Text: "p", Prompt: "same job"})
+	if err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	second, err := handler.Wake(context.Background(), WakeInput{Target: "session-B", Text: "p", Prompt: "same job"})
+	if err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+
+	if second.OperationID != first.OperationID || !second.Duplicate {
+		t.Errorf("second = id %q duplicate %v, want the first id %q and duplicate true", second.OperationID, second.Duplicate, first.OperationID)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1", sender.calls)
+	}
+}
+
+// TestT3_124DuplicateSkipsFallbackChain proves a repeated prompt walks no
+// channel of the ADR 0038 chain and writes no task trace.
+func TestT3_124DuplicateSkipsFallbackChain(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
+	tracer := &fakeTracer{}
+	handler := NewFallbackWakeHandler(sender, confirmer, tracer).WithOperationRegistry(NewMemoryOperationRegistry())
+	in := WakeInput{Target: "s", Text: "p", Prompt: "long job"}
+
+	first, err := handler.WakeWithFallback(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first WakeWithFallback() error = %v", err)
+	}
+	second, err := handler.WakeWithFallback(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second WakeWithFallback() error = %v", err)
+	}
+
+	if first.OperationID == "" || second.OperationID != first.OperationID || !second.Duplicate {
+		t.Errorf("operationIds/duplicate = %q, %q, %v, want one id and a duplicate", first.OperationID, second.OperationID, second.Duplicate)
+	}
+	if len(sender.attempts) != 1 {
+		t.Errorf("fallback attempts = %d, want 1", len(sender.attempts))
+	}
+	if tracer.calls != 0 {
+		t.Errorf("trace calls = %d, want 0 for a duplicate", tracer.calls)
+	}
+}
+
+// TestT3_124DuplicateDoesNotWait keeps the "instant" promise: a duplicate is
+// refused at entry, before the ADR 0041 stagger sleeps.
+func TestT3_124DuplicateDoesNotWait(t *testing.T) {
+	sleeper := &recordingSleeper{}
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	handler := NewWakeHandler(sender).
+		WithOperationRegistry(NewMemoryOperationRegistry()).
+		WithWakeSleeper(sleeper).
+		WithWakePoint(func(time.Duration) time.Duration { return 0 })
+	in := WakeInput{Target: "s", Text: "p", Prompt: "long job", WakeBetweenMillis: 100}
+
+	if _, err := handler.Wake(context.Background(), in); err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	if _, err := handler.Wake(context.Background(), in); err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+	if len(sleeper.points) != 1 {
+		t.Errorf("sleeper calls = %d, want 1: a duplicate must not wait", len(sleeper.points))
+	}
+}
+
+// TestT3_124LegacyCallersKeepTheirOutput keeps an empty prompt and a missing
+// registry on the pre-feature path, as every earlier caller expects.
+func TestT3_124LegacyCallersKeepTheirOutput(t *testing.T) {
+	cases := []struct {
+		name    string
+		prompt  string
+		withReg bool
+	}{
+		{name: "no prompt", withReg: true},
+		{name: "no registry", prompt: "long job"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender := &fakeWakeSender{delivery: DeliverySteer}
+			handler := NewWakeHandler(sender)
+			if tc.withReg {
+				handler = handler.WithOperationRegistry(NewMemoryOperationRegistry())
+			}
+			in := WakeInput{Target: "s", Text: "p", Prompt: tc.prompt}
+
+			first, err := handler.Wake(context.Background(), in)
+			if err != nil {
+				t.Fatalf("first Wake() error = %v", err)
+			}
+			second, err := handler.Wake(context.Background(), in)
+			if err != nil {
+				t.Fatalf("second Wake() error = %v", err)
+			}
+			if first.OperationID != "" || second.OperationID != "" {
+				t.Errorf("operationId = %q then %q, want empty", first.OperationID, second.OperationID)
+			}
+			if first.Duplicate || second.Duplicate {
+				t.Error("duplicate = true on the legacy path, want false")
+			}
+			if sender.calls != 2 {
+				t.Errorf("sender calls = %d, want 2", sender.calls)
+			}
+		})
+	}
+}
+
+// TestT3_124ConcurrentEqualPromptsStartOneTask proves lookup and insert are
+// atomic: one winner starts the task, every other caller gets its id.
+func TestT3_124ConcurrentEqualPromptsStartOneTask(t *testing.T) {
+	const callers = 32
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	in := WakeInput{Target: "s", Text: "p", Prompt: "one job"}
+
+	type answer struct {
+		out WakeOutput
+		err error
+	}
+	results := make(chan answer, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			out, err := handler.Wake(context.Background(), in)
+			results <- answer{out: out, err: err}
+		}()
+	}
+
+	winners, id := 0, ""
+	for i := 0; i < callers; i++ {
+		res := <-results
+		if res.err != nil {
+			t.Fatalf("Wake() error = %v", res.err)
+		}
+		if res.out.OperationID == "" {
+			t.Fatal("operationId is empty")
+		}
+		if id == "" {
+			id = res.out.OperationID
+		}
+		if res.out.OperationID != id {
+			t.Errorf("operationId = %q, want %q", res.out.OperationID, id)
+		}
+		if !res.out.Duplicate {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Errorf("non-duplicate callers = %d, want 1", winners)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1", sender.calls)
+	}
+}
+
+// TestT3_124WakeSchemaHasPrompt proves the prompt field reaches the input
+// schema derived by go-sdk, so a real client can send it.
+func TestT3_124WakeSchemaHasPrompt(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "prompt") {
+		t.Errorf("wake input schema missing prompt: %s", inputSchema)
+	}
+}
+
+// TestT3_124OverInMemoryTransport drives two equal prompts through a real MCP
+// client and server session, so the schema and the output fields are checked
+// on the same path CI exercises.
+func TestT3_124OverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	AttachWake(server, NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry()))
+	session := connectWakeServer(t, server)
+
+	args := WakeInput{Target: "session-1", Text: "obligation-1@7", Prompt: "build and ship"}
+	decode := func() WakeOutput {
+		t.Helper()
+		result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+			Name:      WakeToolName,
+			Arguments: args,
+		})
+		if err != nil {
+			t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+		}
+		raw, err := json.Marshal(result.StructuredContent)
+		if err != nil {
+			t.Fatalf("marshal structured content: %v", err)
+		}
+		var out WakeOutput
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("unmarshal structured content: %v", err)
+		}
+		return out
+	}
+
+	first := decode()
+	second := decode()
+	if first.OperationID == "" || second.OperationID != first.OperationID {
+		t.Errorf("operationIds = %q then %q, want one non-empty id", first.OperationID, second.OperationID)
+	}
+	if first.Duplicate || !second.Duplicate {
+		t.Errorf("duplicate = %v then %v, want false then true", first.Duplicate, second.Duplicate)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1 over MCP", sender.calls)
+	}
+}

@@ -56,6 +56,13 @@
 // a session in another worktree does not receive it. The explicit Target path
 // of callers written before ADR 0042 is unchanged.
 //
+// ADR 0056 p3 (T3.124) adds active detection of a duplicate prompt and an
+// instant operationId at wake entry. A command that starts long work returns
+// an operationId immediately; an equal prompt already running returns that
+// existing id instead of starting a second task. This deduplicates by prompt
+// content, not by the clientRequestId request key of ADR 0028 and T2.22, and a
+// duplicate consumes no delivery and creates no second follow-up.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -68,6 +75,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -248,6 +256,15 @@ type WakeInput struct {
 	// An empty value keeps earlier callers working; the core then derives a
 	// state from the delivery outcome. An unknown value is rejected here.
 	State DeliveryState `json:"state,omitempty" jsonschema:"receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired; empty derives one from the delivery outcome"`
+	// Prompt is the content of the long-running job this wake starts (ADR 0056
+	// p3, T3.124). When an operation registry is attached, an equal prompt is
+	// detected at entry and returns the existing operationId instead of
+	// starting a second task. This is content deduplication, distinct from the
+	// clientRequestId request key of ADR 0028 and T2.22 that only collapses
+	// repeats of one MCP command after a broken connection. Surrounding
+	// whitespace is ignored when comparing prompts. An empty prompt keeps the
+	// pointer-only wake message of ADR 0017 unchanged.
+	Prompt string `json:"prompt,omitempty" jsonschema:"prompt content of the long-running job; an equal prompt returns the existing operationId and starts no second task"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -282,6 +299,15 @@ type WakeOutput struct {
 	// push-unreachable or expired message keeps OK false even when a channel
 	// acknowledged the send, so a rejection is never read as a delivery.
 	State DeliveryState `json:"state"`
+	// OperationID is issued at wake entry when a prompt is supplied and an
+	// operation registry is attached (ADR 0056 p3, T3.124). It names the
+	// long-running operation this follow-up starts. On a duplicate it carries
+	// the existing id. It stays empty when no prompt or no registry was given,
+	// so earlier callers keep their exact output.
+	OperationID string `json:"operationId,omitempty"`
+	// Duplicate is true when an equal prompt was already running: the existing
+	// OperationID is returned and no second task or delivery is started.
+	Duplicate bool `json:"duplicate,omitempty"`
 }
 
 // T3.110 (ADR 0046 feature 2) makes a wake error repairable. ADR 0009 fixes the
@@ -542,6 +568,7 @@ type WakeHandler struct {
 	sleeper        WakeSleeper
 	point          func(time.Duration) time.Duration
 	confirmations  *ConfirmationLedger
+	operations     OperationRegistry
 }
 
 // WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
@@ -818,7 +845,10 @@ func withReceiptState(out WakeOutput, in WakeInput) WakeOutput {
 // stable key: a restarted session in the same worktree is reached, and a
 // session in another worktree is not. When the wait contract names a window,
 // the wake is staggered to one random point inside it before any sender is
-// touched (ADR 0041 p5).
+// touched (ADR 0041 p5). With a prompt and an operation registry attached, the
+// entry check of ADR 0056 p3 issues the operationId before any delivery and a
+// repeated prompt returns the existing id with Duplicate=true and no sender
+// call.
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -827,41 +857,52 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 	if setup.refusal != nil {
 		return withReceiptState(*setup.refusal, in), nil
 	}
+	op, err := h.beginOperation(in)
+	if err != nil {
+		return WakeOutput{}, err
+	}
+	if op.Duplicate {
+		return withReceiptState(duplicateWake(in, op), in), nil
+	}
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
 	}
 
+	finish := func(out WakeOutput) WakeOutput {
+		return withReceiptState(withOperation(out, op), in)
+	}
+
 	if h == nil || h.sender == nil {
-		return withReceiptState(WakeOutput{
+		return finish(WakeOutput{
 			Delivery: DeliveryUnsupported,
 			OK:       false,
 			Source:   setup.source,
 			Executor: in.Executor,
 			Reason:   "wake: no delivery sender configured",
 			Woke:     in.Woke,
-		}, in), nil
+		}), nil
 	}
 
 	delivery, reason := h.sender.Deliver(ctx, setup.target, in.Text, setup.source)
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
-		return withReceiptState(WakeOutput{Delivery: delivery, OK: true, Source: setup.source, Executor: in.Executor, Woke: in.Woke}, in), nil
+		return finish(WakeOutput{Delivery: delivery, OK: true, Source: setup.source, Executor: in.Executor, Woke: in.Woke}), nil
 	case DeliveryUnsupported:
 		if reason == "" {
 			reason = "wake: delivery to an open session is not supported"
 		}
-		return withReceiptState(WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: setup.source, Executor: in.Executor, Reason: reason, Woke: in.Woke}, in), nil
+		return finish(WakeOutput{Delivery: DeliveryUnsupported, OK: false, Source: setup.source, Executor: in.Executor, Reason: reason, Woke: in.Woke}), nil
 	default:
 		// An unknown value is never promoted to success. Report it as an
 		// unsupported delivery with a reason so the caller can branch safely.
-		return withReceiptState(WakeOutput{
+		return finish(WakeOutput{
 			Delivery: DeliveryUnsupported,
 			OK:       false,
 			Source:   setup.source,
 			Executor: in.Executor,
 			Reason:   fmt.Sprintf("wake: unknown delivery value %q", string(delivery)),
 			Woke:     in.Woke,
-		}, in), nil
+		}), nil
 	}
 }
 
@@ -872,6 +913,8 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 // The ADR 0041 p5 stagger runs before the chain so all channels of one waiter
 // share the same wake point. A target worktree (ADR 0042 p3) is resolved once
 // by prepareWake, so every channel of the chain addresses the same session.
+// The duplicate-prompt entry check of ADR 0056 p3 runs before the chain, so a
+// repeated prompt never walks a channel or writes a trace.
 func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -880,10 +923,18 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 	if setup.refusal != nil {
 		return withReceiptState(*setup.refusal, in), nil
 	}
+	op, err := h.beginOperation(in)
+	if err != nil {
+		return WakeOutput{}, err
+	}
+	if op.Duplicate {
+		return withReceiptState(duplicateWake(in, op), in), nil
+	}
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
 	}
-	return withReceiptState(h.runFallback(ctx, in, setup.target, setup.source), in), nil
+	out := withOperation(h.runFallback(ctx, in, setup.target, setup.source), op)
+	return withReceiptState(out, in), nil
 }
 
 // fallbackStage maps a requested channel to the stage recorded on the receipt.
@@ -1173,6 +1224,139 @@ func (h *WakeHandler) FailDelivery(id, token string) error {
 	return h.confirmations.Fail(id, token)
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0056 p3 / T3.124: active duplicate-prompt detection and instant
+// operationId at wake entry.
+//
+// A command that starts long work must hand back an operationId immediately,
+// before it does any delivery. If an equal prompt is already running, the
+// command returns that existing id instead of starting a second task. This is
+// detection by prompt content. It is not the clientRequestId request key of
+// ADR 0028 and T2.22, which suppresses repeats of one MCP command after a
+// broken connection and never compares what the two commands asked for.
+// ---------------------------------------------------------------------------
+
+// operationIDPrefix marks an id issued at wake entry so a caller can tell it
+// apart from a session id or a clientRequestId.
+const operationIDPrefix = "op_"
+
+// newOperationID issues a fresh random id. It uses crypto/rand, like the wake
+// confirmation token of ADR 0051, so a caller cannot derive another operation's
+// id from this one.
+func newOperationID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := crand.Read(buf); err != nil {
+		return "", err
+	}
+	return operationIDPrefix + hex.EncodeToString(buf), nil
+}
+
+// normalizePrompt gives two prompts one comparison key. Only surrounding
+// whitespace is ignored; the content itself is compared byte for byte. This
+// keeps a trailing newline from starting a second task without guessing that
+// two different prompts mean the same thing.
+func normalizePrompt(prompt string) string {
+	return strings.TrimSpace(prompt)
+}
+
+// OperationRegistry is the dedup index of running long operations. Register
+// issues an operationId for prompt and reports whether an equal prompt was
+// already registered. The lookup and the insert happen in one call, so two
+// concurrent equal prompts cannot both start a task. A composition root can
+// replace the in-memory default with a scoped or durable implementation; the
+// registry owns when a finished operation leaves the "running" set.
+type OperationRegistry interface {
+	Register(prompt string) (operationID string, duplicate bool, err error)
+}
+
+// memoryOperationRegistry is the in-process default. It keeps one id per
+// normalized prompt for the lifetime of the registry and is safe for
+// concurrent use.
+type memoryOperationRegistry struct {
+	mu       sync.Mutex
+	byPrompt map[string]string
+}
+
+// NewMemoryOperationRegistry builds the default in-process registry.
+func NewMemoryOperationRegistry() OperationRegistry {
+	return &memoryOperationRegistry{byPrompt: make(map[string]string)}
+}
+
+func (r *memoryOperationRegistry) Register(prompt string) (string, bool, error) {
+	key := normalizePrompt(prompt)
+	if key == "" {
+		return "", false, domain.NewAppError(domain.CodeInvalidInput, "wake: prompt is required to register an operation")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id, ok := r.byPrompt[key]; ok {
+		return id, true, nil
+	}
+	id, err := newOperationID()
+	if err != nil {
+		return "", false, fmt.Errorf("wake: issue operation id: %w", err)
+	}
+	r.byPrompt[key] = id
+	return id, false, nil
+}
+
+// OperationResult is the instant outcome of the entry check: the id for this
+// prompt and whether the prompt was already running.
+type OperationResult struct {
+	OperationID string
+	Duplicate   bool
+}
+
+// WithOperationRegistry attaches the duplicate-prompt index to a handler. A
+// nil registry disables the feature, so callers written before ADR 0056 p3
+// keep their exact behaviour and output.
+func (h *WakeHandler) WithOperationRegistry(registry OperationRegistry) *WakeHandler {
+	if h != nil {
+		h.operations = registry
+	}
+	return h
+}
+
+// beginOperation runs the active entry check before any delivery. A missing
+// prompt or registry keeps the call on the pre-feature path. The id exists
+// before a sender, a window or a fallback chain is touched, which is what
+// makes it instant.
+func (h *WakeHandler) beginOperation(in WakeInput) (OperationResult, error) {
+	if h == nil || h.operations == nil || normalizePrompt(in.Prompt) == "" {
+		return OperationResult{}, nil
+	}
+	id, duplicate, err := h.operations.Register(in.Prompt)
+	if err != nil {
+		return OperationResult{}, err
+	}
+	return OperationResult{OperationID: id, Duplicate: duplicate}, nil
+}
+
+// duplicateWake is the honest receipt for a repeated prompt. No sender is
+// touched, so OK stays false and the receipt is a refusal with a reason. The
+// two useful facts ride in their own fields: the existing OperationID and
+// Duplicate. Delivery stays inside the ADR 0026 closed set; a duplicate is not
+// a new success mode and never reports steer or queue.
+func duplicateWake(in WakeInput, op OperationResult) WakeOutput {
+	return WakeOutput{
+		Delivery:    DeliveryUnsupported,
+		OK:          false,
+		Source:      normalizeSource(in.Source),
+		Executor:    in.Executor,
+		Reason:      "wake: prompt duplicates a running operation; existing operationId " + op.OperationID + " returned, no second task started",
+		Woke:        in.Woke,
+		OperationID: op.OperationID,
+		Duplicate:   true,
+	}
+}
+
+// withOperation stamps the entry result onto a delivery receipt.
+func withOperation(out WakeOutput, op OperationResult) WakeOutput {
+	out.OperationID = op.OperationID
+	out.Duplicate = op.Duplicate
+	return out
+}
+
 // AttachWake registers the real wake tool on a server. NewServer keeps the
 // contracted stub set and does not call this function; registration is a
 // separate integration task.
@@ -1184,7 +1368,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
