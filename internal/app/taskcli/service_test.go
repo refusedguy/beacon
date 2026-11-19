@@ -939,8 +939,8 @@ func TestSelectWorkerRequiresCapabilitiesAndMatch(t *testing.T) {
 
 func TestSelectWorkerRenamingDoesNotChangeChoice(t *testing.T) {
 	candidates := []WorkerCandidate{
-		{Key: "alpha", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 2, Samples: 1}},
-		{Key: "zeta", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 9, Samples: 1}},
+		{Key: "alpha", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 2, Failures: 8, Samples: 10}},
+		{Key: "zeta", Capabilities: []string{"review"}, Metrics: WorkerMetrics{Passes: 9, Failures: 1, Samples: 10}},
 	}
 	first, ok := SelectWorker(candidates, []string{"review"})
 	if !ok || first.Key != "zeta" {
