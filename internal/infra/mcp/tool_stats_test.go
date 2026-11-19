@@ -11,8 +11,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/google/jsonschema-go/jsonschema"
 )
 
 // waitTelemetryReaderFake is a SnapshotReader that also reports wait windows,
