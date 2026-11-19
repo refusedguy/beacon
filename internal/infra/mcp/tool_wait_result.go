@@ -22,6 +22,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -47,6 +48,63 @@ const (
 	// again. It is not a timeout or a deadline.
 	waitResultPollAfterMs int64 = 5000
 )
+
+// Top-level field names of a wait_result response. ADR 0036 §2 fixes the
+// field order with constants so the same state always serialises to the same
+// bytes and a prefix-cache keyed by the response prefix does not burn. The
+// canonical order is status, verdict, revision, checks, pollAfterMs; the
+// MarshalJSON method below is the single place that emits them.
+const (
+	waitResultFieldStatus      = "status"
+	waitResultFieldVerdict     = "verdict"
+	waitResultFieldRevision    = "revision"
+	waitResultFieldChecks      = "checks"
+	waitResultFieldPollAfterMs = "pollAfterMs"
+)
+
+// MarshalJSON writes a WaitResultOutput in the fixed order above. encoding/json
+// marshals struct fields in declaration order and map keys in sorted order,
+// but spelling the order out here keeps it a deliberate, testable contract
+// instead of an accident of the struct layout (ADR 0036 §2). Omitted fields
+// follow the same omitempty rules as the type in schema.go.
+func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
+	type field struct {
+		name  string
+		value any
+	}
+	fields := []field{{name: waitResultFieldStatus, value: o.Status}}
+	if o.Verdict != "" {
+		fields = append(fields, field{name: waitResultFieldVerdict, value: o.Verdict})
+	}
+	fields = append(fields, field{name: waitResultFieldRevision, value: o.Revision})
+	if len(o.Checks) > 0 {
+		fields = append(fields, field{name: waitResultFieldChecks, value: o.Checks})
+	}
+	if o.PollAfterMs != nil {
+		fields = append(fields, field{name: waitResultFieldPollAfterMs, value: o.PollAfterMs})
+	}
+
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, f := range fields {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		key, err := json.Marshal(f.name)
+		if err != nil {
+			return nil, err
+		}
+		value, err := json.Marshal(f.value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(key)
+		buf.WriteByte(':')
+		buf.Write(value)
+	}
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
+}
 
 // WaitResultInput is the argument object of beacon_wait_result. timeoutMs is
 // optional; the service applies the default and the nine-minute cap.

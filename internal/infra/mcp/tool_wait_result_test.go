@@ -698,3 +698,99 @@ func TestWaitResultContinueOfMismatchRejected(t *testing.T) {
 			len(writer.reads), store.obligationWrites, len(source.subscribed))
 	}
 }
+
+// TestWaitResultByteStable asserts ADR 0036 §2: two wait_result calls against
+// the same state marshal to identical bytes. The three cases cover a terminal
+// verdict with checks (T2.22/T2 deliver path), a parked needs_input (T3.21)
+// and a watching timeout, so a future field or map change cannot burn the
+// prefix-cache of all 15 agents unnoticed.
+func TestWaitResultByteStable(t *testing.T) {
+	at := time.Date(2026, 11, 20, 7, 0, 0, 0, time.UTC)
+	checks := map[string]domain.Check{
+		"ci/test":    {State: "COMPLETED", Conclusion: "SUCCESS", Required: true},
+		"deploy/stg": {State: "COMPLETED", Conclusion: "SUCCESS", DetailsURL: "https://example.invalid/run/1"},
+	}
+	cases := []struct {
+		name string
+		run  func(*testing.T) WaitResultOutput
+	}{
+		{
+			name: "terminal verdict",
+			run: func(t *testing.T) WaitResultOutput {
+				svc, _, _, source, _ := newWaitTestService()
+				source.publish(WaitVerdictUpdate{
+					WatchID: "watch-1", Status: domain.StatusClosed,
+					Verdict: domain.VerdictMerged, Revision: 8, Checks: checks, At: at,
+				})
+				out, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+				if err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				return out
+			},
+		},
+		{
+			name: "needs_input",
+			run: func(t *testing.T) WaitResultOutput {
+				svc, store, _, _, _ := newWaitTestService()
+				store.watch.Status = domain.StatusNeedsInput
+				store.watch.Verdict = domain.VerdictNeedsInput
+				out, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+				if err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				return out
+			},
+		},
+		{
+			name: "watching timeout",
+			run: func(t *testing.T) WaitResultOutput {
+				svc, _, _, _, timeout := newWaitTestService()
+				close(timeout)
+				out, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+				if err != nil {
+					t.Fatalf("Wait: %v", err)
+				}
+				return out
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			first, err := json.Marshal(tc.run(t))
+			if err != nil {
+				t.Fatalf("marshal first: %v", err)
+			}
+			second, err := json.Marshal(tc.run(t))
+			if err != nil {
+				t.Fatalf("marshal second: %v", err)
+			}
+			if !bytes.Equal(first, second) {
+				t.Fatalf("wait_result bytes are not stable:\nfirst  %s\nsecond %s", first, second)
+			}
+		})
+	}
+}
+
+// TestWaitResultFieldOrderIsCanonical locks the exact field order and the
+// omitempty rules into a byte string. A reorder or an added field fails here
+// even when two calls still happen to agree with each other.
+func TestWaitResultFieldOrderIsCanonical(t *testing.T) {
+	ms := int64(waitResultPollAfterMs)
+	out := WaitResultOutput{
+		Status:      string(domain.StatusClosed),
+		Verdict:     string(domain.VerdictMerged),
+		Revision:    8,
+		Checks:      map[string]domain.Check{"ci/test": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true}},
+		PollAfterMs: &ms,
+	}
+	got, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want := `{"status":"closed","verdict":"merged","revision":8,"checks":{"ci/test":{"state":"COMPLETED","conclusion":"SUCCESS","required":true,"detailsUrl":""}},"pollAfterMs":5000}`
+	if string(got) != want {
+		t.Fatalf("canonical wait_result bytes:\n got  %s\n want %s", got, want)
+	}
+}
