@@ -419,6 +419,9 @@ func TestSessionLiveUnknownSessionWithTimeSignalsIsLeftAlone(t *testing.T) {
 		LastActivity:  now.Add(-time.Hour),
 		LastHeartbeat: now.Add(-time.Hour),
 	}
+	if sessionDead(s) {
+		t.Error("sessionDead = true without a recorded PID, want false")
+	}
 	if !sessionLive(s) {
 		t.Error("sessionLive = false for a session with only time signals, want true")
 	}

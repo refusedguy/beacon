@@ -178,13 +178,19 @@ func artifactsPresent(paths []string) bool {
 }
 
 // sessionDead is the compound death detector from ADR 0042 §2. It reads all
-// three signals together. A dead recorded PID is the quick sign inherited from
-// T3.44. When the PID is live, a task that has both stalled activity and a
-// stale heartbeat is dead too: a live PID alone does not prove the task is
-// working (ADR 0042 §2). Unknown time signals never contribute a death vote,
-// so a snapshot without them keeps the T3.44 behavior.
+// three signals together and needs a recorded PID to run. A dead PID is the
+// quick sign inherited from T3.44. When the PID is live, a task that has both
+// stalled activity and a stale heartbeat is dead too: a live PID alone does
+// not prove the task is working (ADR 0042 §2). Unknown time signals never
+// contribute a death vote, so a snapshot without them keeps the T3.44
+// behavior.
 func sessionDead(s SessionLiveness) bool {
-	if s.PID != 0 && !processAlive(s.PID) {
+	// Without a recorded PID the compound detector has only two of its three
+	// signals, which is not enough to declare the task dead.
+	if s.PID == 0 {
+		return false
+	}
+	if !processAlive(s.PID) {
 		return true
 	}
 	if s.LastActivity.IsZero() || s.LastHeartbeat.IsZero() {
