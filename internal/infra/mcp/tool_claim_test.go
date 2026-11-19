@@ -80,7 +80,7 @@ func TestClaimSingleOwnerUntilRelease(t *testing.T) {
 // slots, and one raw key cannot claim two different tasks.
 func TestClaimKeyDoesNotCollideWithTaskStart(t *testing.T) {
 	h := NewClaimHandler()
-	_, claim, err := h.Claim(context.Background(), ClaimInput{
+	claim, err := h.Claim(context.Background(), ClaimInput{
 		TaskID: "T-2", OwnerID: "alice", IdempotencyKey: "shared",
 	})
 	if err != nil {
@@ -90,7 +90,7 @@ func TestClaimKeyDoesNotCollideWithTaskStart(t *testing.T) {
 		t.Fatalf("claim key %q collides with task-start key %q", claim.IdempotencyKey, want)
 	}
 
-	_, _, err = h.Claim(context.Background(), ClaimInput{
+	_, err = h.Claim(context.Background(), ClaimInput{
 		TaskID: "T-3", OwnerID: "alice", IdempotencyKey: "shared",
 	})
 	if !domain.IsRejectDuplicate(err) {
@@ -112,7 +112,7 @@ func TestClaimConcurrentSingleWinner(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			owner := fmt.Sprintf("owner-%02d", i)
-			_, out, err := h.Claim(ctx, ClaimInput{
+			out, err := h.Claim(ctx, ClaimInput{
 				TaskID: "T-race", OwnerID: owner, IdempotencyKey: fmt.Sprintf("k-%02d", i),
 			})
 			if err == nil {
