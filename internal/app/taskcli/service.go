@@ -640,6 +640,72 @@ func insertAfter(lines []string, prefix, line string) []string {
 	return append(out, lines[at+1:]...)
 }
 
+// ---- ADR 0032 §1 / T3.25: структурированная передача преемнику ----
+//
+// Handoff несёт пять обязательных полей вместо отсылки к полной истории чата.
+// Тип определён в слое app, а не в domain: матрица слоёв не разрешает ребро
+// internal/app -> internal/domain, поэтому app держит зеркало контракта с
+// теми же именами полей и JSON-ключами, что и domain.Handoff.
+
+// Handoff is the five-field structured transfer filled from a task card. The
+// successor reads these fields instead of the whole chat history.
+type Handoff struct {
+	Intent           string `json:"intent"`
+	Evidence         string `json:"evidence"`
+	PatchPlan        string `json:"patch_plan"`
+	VerificationPlan string `json:"verification_plan"`
+	RiskNotes        string `json:"risk_notes"`
+}
+
+// Validate reports whether all five handoff fields are filled, naming the
+// first empty one.
+func (h Handoff) Validate() error {
+	for _, field := range []struct{ name, value string }{
+		{"intent", h.Intent},
+		{"evidence", h.Evidence},
+		{"patch_plan", h.PatchPlan},
+		{"verification_plan", h.VerificationPlan},
+		{"risk_notes", h.RiskNotes},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return taskstore.Validationf("handoff: пустое поле %s", field.name)
+		}
+	}
+	return nil
+}
+
+// BuildHandoff читает карточку и заполняет пять полей передачи из её тела:
+// Цель -> intent, Контекст -> evidence, Шаги -> patch_plan,
+// Проверка -> verification_plan, Приёмка -> risk_notes. Преемник читает
+// полученную передачу вместо всей истории чата.
+func (s *Service) BuildHandoff(id string) (Handoff, error) {
+	id = strings.TrimSuffix(strings.TrimSpace(id), ".md")
+	if !taskstore.IsID(id) {
+		return Handoff{}, taskstore.Validationf("неверный ID карточки %q", id)
+	}
+	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	if err != nil {
+		return Handoff{}, err
+	}
+	for _, c := range cards {
+		if c.ID != id {
+			continue
+		}
+		h := Handoff{
+			Intent:           c.Goal,
+			Evidence:         c.Context,
+			PatchPlan:        c.Steps,
+			VerificationPlan: c.Check,
+			RiskNotes:        c.Acceptance,
+		}
+		if err := h.Validate(); err != nil {
+			return Handoff{}, err
+		}
+		return h, nil
+	}
+	return Handoff{}, taskstore.Validationf("карточка %s не найдена", id)
+}
+
 // SelfTest прогоняет кейсы из раздела 7 спецификации с посаженными нарушениями.
 func SelfTest(w io.Writer) error {
 	root, err := os.MkdirTemp("", "beacon-selftest-")

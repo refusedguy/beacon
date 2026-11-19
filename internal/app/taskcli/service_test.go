@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
@@ -529,6 +530,82 @@ func TestRouteRateLimitRejectsClosedCard(t *testing.T) {
 	e.card(t, "T3.22", "done", "task", "ADR 0001", "internal/app/x.go", ExecutorClaudeCode, "2026-11-19T14:03:21Z")
 	if _, err := e.svc.RouteRateLimit("T3.22", &RateLimited{}); taskstore.Code(err) != 1 {
 		t.Errorf("закрытая карточка дала %v, ждали код 1", err)
+	}
+}
+
+func TestBuildHandoffFromCard(t *testing.T) {
+	e := newEnv(t)
+	text := "# T3.25. Structured handoff\nСтатус: in_progress\nФаза: P3\nТип: task\n" +
+		"Владелец файлов: internal/domain/types.go\nЗависимости: T3.19\nСсылка: ADR 0032\n" +
+		"Агент: agent-1\nВремя: 2026-11-19T14:03:21Z\n" +
+		"Цель: цель-intent\nКонтекст: контекст-evidence\nШаги: шаги-patch\n" +
+		"Проверка: проверка-verify\nПриёмка: приёмка-risk\n"
+	if err := os.WriteFile(filepath.Join(e.tasksDir, "T3.25.md"), []byte(text), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	want := Handoff{
+		Intent:           "цель-intent",
+		Evidence:         "контекст-evidence",
+		PatchPlan:        "шаги-patch",
+		VerificationPlan: "проверка-verify",
+		RiskNotes:        "приёмка-risk",
+	}
+	got, err := e.svc.BuildHandoff("T3.25.md")
+	if err != nil || got != want {
+		t.Fatalf("BuildHandoff: %+v %v, ждали %+v", got, err, want)
+	}
+
+	// Пять ключей контракта и совместимость с domain.Handoff.
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(b, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if len(fields) != 5 {
+		t.Errorf("ключей %d, ждали пять: %s", len(fields), b)
+	}
+	for _, k := range []string{"intent", "evidence", "patch_plan", "verification_plan", "risk_notes"} {
+		if _, ok := fields[k]; !ok {
+			t.Errorf("нет ключа %s: %s", k, b)
+		}
+	}
+	var dh domain.Handoff
+	if err := json.Unmarshal(b, &dh); err != nil {
+		t.Fatalf("несовместимость с domain.Handoff: %v", err)
+	}
+	if err := dh.Validate(); err != nil {
+		t.Errorf("domain.Handoff не прошёл валидацию: %v", err)
+	}
+	if dh.Intent != want.Intent || dh.RiskNotes != want.RiskNotes {
+		t.Errorf("domain.Handoff = %+v, ждали поля из карточки", dh)
+	}
+}
+
+func TestBuildHandoffRejectsBadInputAndEmptyFields(t *testing.T) {
+	e := newEnv(t)
+	// Пустое тело карточки: обязательные поля присутствуют, но пусты.
+	e.card(t, "T3.26", "in_progress", "task", "ADR 0032", "internal/domain/types.go", "agent-1", "2026-11-19T14:03:21Z")
+	path := filepath.Join(e.tasksDir, "T3.26.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := strings.Replace(string(raw), "Проверка: п\n", "Проверка:\n", 1)
+	if err := os.WriteFile(path, []byte(empty), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.BuildHandoff("T3.26"); taskstore.Code(err) != 1 || !strings.Contains(err.Error(), "verification_plan") {
+		t.Errorf("пустое поле передачи дало %v, ждали код 1 с именем поля", err)
+	}
+
+	for _, id := range []string{"", "bad", "T9.9"} {
+		if _, err := e.svc.BuildHandoff(id); taskstore.Code(err) != 1 {
+			t.Errorf("BuildHandoff(%q) дал %v, ждали код 1", id, err)
+		}
 	}
 }
 

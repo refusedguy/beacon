@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -264,6 +265,75 @@ func TestStreamAssemblerGivesUpGapBeyondWindow(t *testing.T) {
 	}
 	if len(final.Events) != 2 || final.Events[0].Seq != 3 || final.Events[1].Seq != 4 {
 		t.Errorf("final events = %+v, want seq 3 and 4 in order", final.Events)
+	}
+}
+
+func fullHandoff() Handoff {
+	return Handoff{
+		Intent:           "перенести задачу преемнику",
+		Evidence:         "ADR 0032 §1",
+		PatchPlan:        "добавить тип, заполнение из карточки и тесты",
+		VerificationPlan: "go test ./internal/domain ./internal/app/taskcli",
+		RiskNotes:        "история чата не единственный источник",
+	}
+}
+
+func TestHandoffFiveFields(t *testing.T) {
+	want := fullHandoff()
+	b, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("marshal Handoff: %v", err)
+	}
+	assertJSONKeys(t, b, "intent", "evidence", "patch_plan", "verification_plan", "risk_notes")
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		t.Fatalf("decode Handoff keys: %v", err)
+	}
+	if len(fields) != 5 {
+		t.Errorf("полей %d, ждали ровно пять: %s", len(fields), b)
+	}
+
+	var got Handoff
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal Handoff: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Handoff round trip mismatch: got %+v, want %+v", got, want)
+	}
+}
+
+func TestHandoffValidate(t *testing.T) {
+	if err := fullHandoff().Validate(); err != nil {
+		t.Fatalf("полная передача не прошла валидацию: %v", err)
+	}
+
+	cases := []struct {
+		name  string
+		clear func(*Handoff)
+	}{
+		{"intent", func(h *Handoff) { h.Intent = "" }},
+		{"evidence", func(h *Handoff) { h.Evidence = "  " }},
+		{"patch_plan", func(h *Handoff) { h.PatchPlan = "" }},
+		{"verification_plan", func(h *Handoff) { h.VerificationPlan = "" }},
+		{"risk_notes", func(h *Handoff) { h.RiskNotes = "" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := fullHandoff()
+			tc.clear(&h)
+			err := h.Validate()
+			if err == nil {
+				t.Fatalf("пустое поле %s прошло валидацию", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.name) {
+				t.Errorf("в ошибке нет имени поля %s: %v", tc.name, err)
+			}
+			var appErr *AppError
+			if !errors.As(err, &appErr) || appErr.Code != CodeInvalidInput {
+				t.Errorf("ожидали INVALID_INPUT, получили %v", err)
+			}
+		})
 	}
 }
 
