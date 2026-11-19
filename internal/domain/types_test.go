@@ -275,23 +275,27 @@ func fullHandoff() Handoff {
 		PatchPlan:        "добавить тип, заполнение из карточки и тесты",
 		VerificationPlan: "go test ./internal/domain ./internal/app/taskcli",
 		RiskNotes:        "история чата не единственный источник",
+		MustNotRedo:      "не запускать go test локально, гейт только в CI",
+		MustPreserve:     "ветка feat/w192 и worktree w192",
+		WorkingSet:       "internal/domain/types.go, internal/domain/types_test.go",
 	}
 }
 
-func TestHandoffFiveFields(t *testing.T) {
+func TestHandoffContractFields(t *testing.T) {
 	want := fullHandoff()
 	b, err := json.Marshal(want)
 	if err != nil {
 		t.Fatalf("marshal Handoff: %v", err)
 	}
-	assertJSONKeys(t, b, "intent", "evidence", "patch_plan", "verification_plan", "risk_notes")
+	assertJSONKeys(t, b, "intent", "evidence", "patch_plan", "verification_plan", "risk_notes",
+		"must_not_redo", "must_preserve", "working_set")
 
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(b, &fields); err != nil {
 		t.Fatalf("decode Handoff keys: %v", err)
 	}
-	if len(fields) != 5 {
-		t.Errorf("полей %d, ждали ровно пять: %s", len(fields), b)
+	if len(fields) != 8 {
+		t.Errorf("полей %d, ждали восемь: %s", len(fields), b)
 	}
 
 	var got Handoff
@@ -317,6 +321,9 @@ func TestHandoffValidate(t *testing.T) {
 		{"patch_plan", func(h *Handoff) { h.PatchPlan = "" }},
 		{"verification_plan", func(h *Handoff) { h.VerificationPlan = "" }},
 		{"risk_notes", func(h *Handoff) { h.RiskNotes = "" }},
+		{"must_not_redo", func(h *Handoff) { h.MustNotRedo = "" }},
+		{"must_preserve", func(h *Handoff) { h.MustPreserve = "  " }},
+		{"working_set", func(h *Handoff) { h.WorkingSet = "" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -332,6 +339,79 @@ func TestHandoffValidate(t *testing.T) {
 			var appErr *AppError
 			if !errors.As(err, &appErr) || appErr.Code != CodeInvalidInput {
 				t.Errorf("ожидали INVALID_INPUT, получили %v", err)
+			}
+		})
+	}
+}
+
+// TestHandoffLegacyFiveFields keeps the T3.25 contract valid: a packet built
+// before T3.107 fills only the five original fields and declares no
+// continuation sections. The app layer still produces such packets.
+func TestHandoffLegacyFiveFields(t *testing.T) {
+	h := Handoff{
+		Intent:           "перенести задачу преемнику",
+		Evidence:         "ADR 0032 §1",
+		PatchPlan:        "добавить тип и тесты",
+		VerificationPlan: "go test ./internal/domain",
+		RiskNotes:        "история чата не единственный источник",
+	}
+	if err := h.Validate(); err != nil {
+		t.Fatalf("пятипольная передача T3.25 не прошла валидацию: %v", err)
+	}
+
+	b, err := json.Marshal(h)
+	if err != nil {
+		t.Fatalf("marshal legacy Handoff: %v", err)
+	}
+	assertJSONKeys(t, b, "intent", "evidence", "patch_plan", "verification_plan", "risk_notes",
+		"must_not_redo", "must_preserve", "working_set")
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(b, &fields); err != nil {
+		t.Fatalf("decode legacy Handoff keys: %v", err)
+	}
+	if len(fields) != 8 {
+		t.Errorf("полей %d, ждали восемь: %s", len(fields), b)
+	}
+	for _, name := range []string{"must_not_redo", "must_preserve", "working_set"} {
+		if string(fields[name]) != `""` {
+			t.Errorf("legacy-секция %s = %s, ждали пустую строку", name, fields[name])
+		}
+	}
+}
+
+// TestHandoffSectionsAllOrNothing pins the continuation rule: a packet that
+// declares one section must declare the other two as well, otherwise Validate
+// names the first empty one instead of silently dropping the restriction.
+func TestHandoffSectionsAllOrNothing(t *testing.T) {
+	cases := []struct {
+		name    string
+		clear   func(*Handoff)
+		wantErr string
+	}{
+		{"no sections", func(h *Handoff) {
+			h.MustNotRedo, h.MustPreserve, h.WorkingSet = "", "", ""
+		}, ""},
+		{"only must_not_redo", func(h *Handoff) {
+			h.MustPreserve, h.WorkingSet = "", ""
+		}, "must_preserve"},
+		{"only working_set", func(h *Handoff) {
+			h.MustNotRedo, h.MustPreserve = "", ""
+		}, "must_not_redo"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := fullHandoff()
+			tc.clear(&h)
+			err := h.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ожидали nil, получили %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("ожидали ошибку с полем %s, получили %v", tc.wantErr, err)
 			}
 		})
 	}
