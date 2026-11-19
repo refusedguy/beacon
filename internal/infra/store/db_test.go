@@ -1718,3 +1718,281 @@ func TestCheckpointWaitRedactsState(t *testing.T) {
 		t.Errorf("stored state kept a raw token: %s", stored.State)
 	}
 }
+
+// completionEmit records one delivery of a completion notice. The counter
+// observes the call and the durable row observes the committed effect inside
+// the same transaction as the notice (ADR 0044 feature 5).
+func completionEmit(emitted *int32) func(*sql.Tx) error {
+	return func(tx *sql.Tx) error {
+		atomic.AddInt32(emitted, 1)
+		if _, err := tx.Exec(`
+			CREATE TABLE IF NOT EXISTS completion_effects (
+			  seq INTEGER PRIMARY KEY AUTOINCREMENT)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO completion_effects (seq) VALUES (NULL)`)
+		return err
+	}
+}
+
+func completionEffectCount(t *testing.T, d *DB) int {
+	t.Helper()
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM completion_effects`).Scan(&n); err != nil {
+		t.Fatalf("count completion effects: %v", err)
+	}
+	return n
+}
+
+// TestNotifyCompletionRedeliveryEmitsOnce is the acceptance test for ADR 0044
+// feature 5: a background task's completion notice is emitted once, and a
+// re-delivery of the same stable event ID creates neither a second notice nor
+// a second effect.
+func TestNotifyCompletionRedeliveryEmitsOnce(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	const eventID = "evt-42"
+	firstPayload := []byte(`{"status":"done","task":"task-1"}`)
+	var emitted int32
+	first, err := d.NotifyCompletion(eventID, "task-1", firstPayload, completionEmit(&emitted))
+	if err != nil {
+		t.Fatalf("first NotifyCompletion: %v", err)
+	}
+	if !first.Created || first.Duplicate {
+		t.Fatalf("first notice = %+v, want created and not duplicate", first)
+	}
+	if !bytes.Equal(first.Notification.Payload, firstPayload) {
+		t.Errorf("first payload = %s, want %s", first.Notification.Payload, firstPayload)
+	}
+	if got := atomic.LoadInt32(&emitted); got != 1 {
+		t.Fatalf("emit calls after first delivery = %d, want 1", got)
+	}
+	if got := completionEffectCount(t, d); got != 1 {
+		t.Fatalf("committed effects after first delivery = %d, want 1", got)
+	}
+
+	// The producer retries after a crash with the same event ID and a
+	// different payload. The receiver must keep the first notice and emit
+	// nothing.
+	retryPayload := []byte(`{"status":"done","task":"task-1","retry":true}`)
+	second, err := d.NotifyCompletion(eventID, "task-1", retryPayload, completionEmit(&emitted))
+	if err != nil {
+		t.Fatalf("redelivered NotifyCompletion: %v", err)
+	}
+	if !second.Duplicate || second.Created {
+		t.Fatalf("redelivered notice = %+v, want duplicate and not created", second)
+	}
+	if !bytes.Equal(second.Notification.Payload, firstPayload) {
+		t.Errorf("redelivered payload = %s, want first %s", second.Notification.Payload, firstPayload)
+	}
+	if got := atomic.LoadInt32(&emitted); got != 1 {
+		t.Errorf("emit calls after redelivery = %d, want 1 (no second notification)", got)
+	}
+	if got := completionEffectCount(t, d); got != 1 {
+		t.Errorf("committed effects after redelivery = %d, want 1 (no second effect)", got)
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 1 {
+		t.Fatalf("CompletionNotificationCount = %d, %v; want 1", n, err)
+	}
+
+	stored, found, err := d.CompletionNotification(eventID)
+	if err != nil || !found {
+		t.Fatalf("CompletionNotification: found=%v err=%v; want found", found, err)
+	}
+	if stored.EventID != eventID || stored.TaskID != "task-1" || !bytes.Equal(stored.Payload, firstPayload) {
+		t.Errorf("stored notice = %+v, want event %q task-1 and first payload", stored, eventID)
+	}
+}
+
+// TestNotifyCompletionFailedEmitLeavesNoKey proves a failed delivery is not
+// cached: the key, the effect and the notice roll back together, so a retry
+// can still emit exactly once.
+func TestNotifyCompletionFailedEmitLeavesNoKey(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	boom := errors.New("boom")
+	var emitted int32
+	_, err = d.NotifyCompletion("evt-1", "task-1", []byte("notice"), func(tx *sql.Tx) error {
+		atomic.AddInt32(&emitted, 1)
+		return boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("NotifyCompletion with failing emit = %v, want boom", err)
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 0 {
+		t.Fatalf("CompletionNotificationCount after failure = %d, %v; want 0", n, err)
+	}
+	if _, found, err := d.CompletionNotification("evt-1"); err != nil || found {
+		t.Fatalf("CompletionNotification after failure: found=%v err=%v; want not found", found, err)
+	}
+
+	res, err := d.NotifyCompletion("evt-1", "task-1", []byte("notice"), completionEmit(&emitted))
+	if err != nil || !res.Created {
+		t.Fatalf("retry NotifyCompletion = %+v, %v; want created", res, err)
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 1 {
+		t.Fatalf("CompletionNotificationCount after retry = %d, %v; want 1", n, err)
+	}
+	if got := atomic.LoadInt32(&emitted); got != 2 {
+		t.Errorf("emit calls after retry = %d, want 2 (failed emit ran once, retry once)", got)
+	}
+	if got := completionEffectCount(t, d); got != 1 {
+		t.Errorf("committed effects after retry = %d, want 1", got)
+	}
+}
+
+// TestNotifyCompletionKeySeparateFromOtherOperations proves the completion
+// notice key does not reuse the keys of ADR 0028, 0031, 0042 or 0043, even
+// when every operation receives the same raw string.
+func TestNotifyCompletionKeySeparateFromOtherOperations(t *testing.T) {
+	const raw = "req-abc"
+	notice := CompletionNotificationKey(raw)
+	if notice == raw {
+		t.Fatalf("CompletionNotificationKey(%q) = raw request id", raw)
+	}
+	if want := domain.IdempotencyKey(completionNotificationNamespace, raw); notice != want {
+		t.Fatalf("CompletionNotificationKey(%q) = %q, want %q", raw, notice, want)
+	}
+	if notice == domain.IdempotencyKey(domain.StartNamespace, raw) ||
+		notice == ReplayKey(raw) || notice == WaitCheckpointKey(raw) {
+		t.Fatal("completion notice key collides with start, replay or checkpoint key")
+	}
+	if notice != CompletionNotificationKey(raw) {
+		t.Fatal("CompletionNotificationKey is not deterministic")
+	}
+
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	if _, err := d.StartTask(raw, "task-1", []byte("start")); err != nil {
+		t.Fatalf("StartTask: %v", err)
+	}
+	var run int32
+	if _, err := d.Replay(raw, replayScenarioSteps(t, &run), []byte("scenario")); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if _, err := d.CheckpointWait(raw, "task-1", 2, []byte(`{"step":2}`), nil); err != nil {
+		t.Fatalf("CheckpointWait: %v", err)
+	}
+	var emitted int32
+	if _, err := d.NotifyCompletion(raw, "task-1", []byte("done"), completionEmit(&emitted)); err != nil {
+		t.Fatalf("NotifyCompletion: %v", err)
+	}
+	if n, err := d.TaskStartCount(); err != nil || n != 1 {
+		t.Fatalf("TaskStartCount = %d, %v; want 1", n, err)
+	}
+	if n, err := d.ReplayCount(); err != nil || n != 1 {
+		t.Fatalf("ReplayCount = %d, %v; want 1", n, err)
+	}
+	if n, err := d.WaitCheckpointCount(); err != nil || n != 1 {
+		t.Fatalf("WaitCheckpointCount = %d, %v; want 1", n, err)
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 1 {
+		t.Fatalf("CompletionNotificationCount = %d, %v; want 1", n, err)
+	}
+}
+
+// TestNotifyCompletionDistinctEventsEmitSeparately scopes deduplication to one
+// event ID: a new event emits a new notice for the same task.
+func TestNotifyCompletionDistinctEventsEmitSeparately(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	var emitted int32
+	for _, eventID := range []string{"evt-1", "evt-2"} {
+		res, err := d.NotifyCompletion(eventID, "task-1", []byte(eventID), completionEmit(&emitted))
+		if err != nil {
+			t.Fatalf("NotifyCompletion(%s): %v", eventID, err)
+		}
+		if !res.Created || res.Duplicate {
+			t.Errorf("NotifyCompletion(%s) = %+v, want created", eventID, res)
+		}
+	}
+	if got := atomic.LoadInt32(&emitted); got != 2 {
+		t.Errorf("emit calls = %d, want 2", got)
+	}
+	if got := completionEffectCount(t, d); got != 2 {
+		t.Errorf("committed effects = %d, want 2", got)
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 2 {
+		t.Fatalf("CompletionNotificationCount = %d, %v; want 2", n, err)
+	}
+}
+
+// TestNotifyCompletionRedactsPayload applies ADR 0012 to notice payloads as it
+// does to inbox messages, outcomes and scenario results: a secret never
+// reaches the file and a repeat returns the redacted copy.
+func TestNotifyCompletionRedactsPayload(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte(`{"status":"done","token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`)
+	var emitted int32
+	res, err := d.NotifyCompletion("evt-secret", "task-1", secret, completionEmit(&emitted))
+	if err != nil {
+		t.Fatalf("NotifyCompletion: %v", err)
+	}
+	if bytes.Contains(res.Notification.Payload, []byte("ghp_")) {
+		t.Errorf("returned notice kept a raw token: %s", res.Notification.Payload)
+	}
+	if !bytes.Contains(secret, []byte("ghp_")) {
+		t.Fatal("test input lost its secret before the write")
+	}
+	stored, found, err := d.CompletionNotification("evt-secret")
+	if err != nil || !found {
+		t.Fatalf("CompletionNotification: found=%v err=%v; want found", found, err)
+	}
+	if bytes.Contains(stored.Payload, []byte("ghp_")) {
+		t.Errorf("stored notice kept a raw token: %s", stored.Payload)
+	}
+}
+
+func TestNotifyCompletionRejectsInvalidInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	bad := []struct {
+		name    string
+		eventID string
+		taskID  string
+		emit    func(*sql.Tx) error
+	}{
+		{"empty event id", "", "task-1", completionEmit(new(int32))},
+		{"blank event id", "  ", "task-1", completionEmit(new(int32))},
+		{"empty task id", "evt-1", "", completionEmit(new(int32))},
+		{"blank task id", "evt-1", "  ", completionEmit(new(int32))},
+		{"nil emit", "evt-1", "task-1", nil},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := d.NotifyCompletion(tc.eventID, tc.taskID, []byte("notice"), tc.emit)
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Fatalf("NotifyCompletion error = %v, want INVALID_INPUT", err)
+			}
+		})
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 0 {
+		t.Fatalf("CompletionNotificationCount after rejected input = %d, %v; want 0", n, err)
+	}
+}
