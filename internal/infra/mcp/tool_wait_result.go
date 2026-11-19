@@ -27,6 +27,13 @@
 // injects the concrete gate; with no gate wired, each caller runs its own
 // operation as before.
 //
+// ADR 0045 p1 adds an event filter and a start key (T3.102). With eventKinds
+// set, the wait returns on the first update of a listed kind. The filter adds
+// kind selection on top of the T3.48 event return; it does not replace it. A
+// startKey makes a repeat join the first wait, so a lost response cannot open
+// a second task. That key gauges the start of waiting, unlike clientRequestId
+// (ADR 0028), which deduplicates repeats of a command.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -132,6 +139,17 @@ type WaitResultInput struct {
 	// needs_input task (ADR 0031 §3). The wait keeps polling that Watch; it
 	// never creates a new task. An empty value keeps the original contract.
 	ContinueOf string `json:"continueOf,omitempty" jsonschema:"watchID of the same task this wait continues after a human answer; must equal watchID and creates no new task"`
+	// EventKinds selects which job events end this wait (ADR 0045 p1). Each
+	// value must be progress, checkpoint or completed. With a non-empty list,
+	// the first update whose kind is listed ends the wait, including when an
+	// unlisted kind carries a terminal verdict. An empty list keeps the T3.48
+	// behaviour: any terminal verdict ends the wait.
+	EventKinds []string `json:"eventKinds,omitempty" jsonschema:"event kinds that end the wait; each is progress, checkpoint or completed; empty keeps the terminal-verdict default"`
+	// StartKey is the idempotency key at the start of waiting (ADR 0045 p1).
+	// A repeat with the same key returns the first outcome and opens no second
+	// wait or task. It is distinct from clientRequestId, which deduplicates
+	// repeats of a command rather than the start of a wait.
+	StartKey string `json:"startKey,omitempty" jsonschema:"idempotency key at the start of waiting; a repeat with the same key returns the first outcome and creates no second task"`
 }
 
 // WaitResultIdempotencyStore records the outcome of an idempotent wait_result
@@ -191,9 +209,76 @@ func cloneWaitResultOutput(out WaitResultOutput) WaitResultOutput {
 	return clone
 }
 
+// waitStart is one registered start of a wait, keyed by StartKey (ADR 0045 p1).
+// The owner of the entry runs the wait and publishes the outcome; a repeat with
+// the same key waits on done and returns that outcome without running a second
+// wait. The index lives for the lifetime of the service, like the
+// clientRequestId index.
+type waitStart struct {
+	done chan struct{}
+	out  WaitResultOutput
+	err  error
+}
+
+// finish publishes the outcome and releases every caller joined on this start.
+func (e *waitStart) finish(out WaitResultOutput, err error) {
+	e.out = out
+	e.err = err
+	close(e.done)
+}
+
+// await returns the outcome of the first wait with this key. A caller whose own
+// context ends stops waiting without writing anything.
+func (e *waitStart) await(ctx context.Context) (WaitResultOutput, error) {
+	select {
+	case <-e.done:
+		return cloneWaitResultOutput(e.out), e.err
+	case <-ctx.Done():
+		return WaitResultOutput{}, domain.NewAppError(domain.CodeCancelled, "wait_result: wait start cancelled")
+	}
+}
+
+// waitStartRegistry maps a StartKey to the wait it first started. begin returns
+// the entry and true for the caller that must run the wait, false for a repeat
+// that only joins the existing one.
+type waitStartRegistry struct {
+	mu     sync.Mutex
+	starts map[string]*waitStart
+}
+
+func newWaitStartRegistry() *waitStartRegistry {
+	return &waitStartRegistry{starts: make(map[string]*waitStart)}
+}
+
+func (r *waitStartRegistry) begin(key string) (*waitStart, bool) {
+	if key == "" || r == nil {
+		return &waitStart{done: make(chan struct{})}, true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if existing, ok := r.starts[key]; ok {
+		return existing, false
+	}
+	entry := &waitStart{done: make(chan struct{})}
+	r.starts[key] = entry
+	return entry, true
+}
+
+// WaitEventKind is a job event kind selected by an event filter (ADR 0045 p1).
+// The three values are the only kinds a caller may put in EventKinds.
+type WaitEventKind string
+
+const (
+	WaitEventProgress   WaitEventKind = "progress"
+	WaitEventCheckpoint WaitEventKind = "checkpoint"
+	WaitEventCompleted  WaitEventKind = "completed"
+)
+
 // WaitVerdictUpdate is one verdict change delivered by a VerdictSource. It is
 // the input to the long-poll loop; a watching update carries the current
-// revision and checks but does not end the wait.
+// revision and checks but does not end the wait. Kind names the job event the
+// source observed. An empty Kind keeps the pre-filter behaviour, so existing
+// sources need no change.
 type WaitVerdictUpdate struct {
 	WatchID  string
 	Status   domain.Status
@@ -201,6 +286,27 @@ type WaitVerdictUpdate struct {
 	Revision uint64
 	Checks   map[string]domain.Check
 	At       time.Time
+	Kind     WaitEventKind
+}
+
+// parseWaitEventFilter validates EventKinds into a lookup set. A nil set means
+// no filter, which keeps the terminal-verdict return of T3.48. An unknown kind
+// is refused before the service subscribes or writes anything.
+func parseWaitEventFilter(kinds []string) (map[WaitEventKind]struct{}, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	set := make(map[WaitEventKind]struct{}, len(kinds))
+	for _, raw := range kinds {
+		kind := WaitEventKind(raw)
+		switch kind {
+		case WaitEventProgress, WaitEventCheckpoint, WaitEventCompleted:
+			set[kind] = struct{}{}
+		default:
+			return nil, domain.NewAppError(domain.CodeInvalidInput, "wait_result: unknown event kind: "+raw)
+		}
+	}
+	return set, nil
 }
 
 // VerdictSubscription is one caller's stream of verdict updates. Close always
@@ -587,6 +693,7 @@ type WaitResultService struct {
 	after           func(time.Duration) <-chan time.Time
 	departures      func(*mcpsdk.CallToolRequest) CallerExit
 	idempotency     WaitResultIdempotencyStore
+	starts          *waitStartRegistry
 	capability      func(*mcpsdk.CallToolRequest) *CapabilityContext
 	ciWait          func(context.Context) error
 	ciGate          SharedCIWaiter
@@ -609,6 +716,7 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		clock:           clock,
 		after:           time.After,
 		idempotency:     NewMemoryWaitResultIdempotency(),
+		starts:          newWaitStartRegistry(),
 		ciWait:          sharedCIWaitNoop,
 		ciGate:          directCIWait,
 		precheckJournal: NewMemoryPrecheckJournal(),
@@ -779,17 +887,37 @@ func (s *WaitResultService) WaitInCapability(ctx context.Context, subscriberID s
 
 // waitScoped applies clientRequestId idempotency around the long-poll. A
 // departure or an error leaves no key behind, including a capability timeout.
+// The start key is applied inside this scope so both keys can be present on one
+// call without either replacing the other (ADR 0028, ADR 0045 p1).
 func (s *WaitResultService) waitScoped(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
 	if s == nil || in.ClientRequestID == "" || s.idempotency == nil {
-		return s.wait(ctx, subscriberID, in, exits, capCtx)
+		return s.waitStarted(ctx, subscriberID, in, exits, capCtx)
 	}
 	if out, ok := s.idempotency.Lookup(in.ClientRequestID); ok {
 		return out, nil
 	}
-	out, err := s.wait(ctx, subscriberID, in, exits, capCtx)
+	out, err := s.waitStarted(ctx, subscriberID, in, exits, capCtx)
 	if err == nil {
 		s.idempotency.Record(in.ClientRequestID, out)
 	}
+	return out, err
+}
+
+// waitStarted applies the start-key idempotency of ADR 0045 p1. The first call
+// with a key owns the wait and publishes its outcome. A repeat with the same
+// key joins that entry: it opens no subscription and creates no second task,
+// even when the first response was lost. Unlike clientRequestId, a departure
+// does not clear the key, because the join must survive a broken connection.
+func (s *WaitResultService) waitStarted(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
+	if s == nil || in.StartKey == "" || s.starts == nil {
+		return s.wait(ctx, subscriberID, in, exits, capCtx)
+	}
+	entry, owner := s.starts.begin(in.StartKey)
+	if !owner {
+		return entry.await(ctx)
+	}
+	out, err := s.wait(ctx, subscriberID, in, exits, capCtx)
+	entry.finish(out, err)
 	return out, err
 }
 
@@ -830,6 +958,12 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	}
 	if in.ContinueOf != "" && in.ContinueOf != in.WatchID {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: continueOf must name the same Watch")
+	}
+	// ADR 0045 p1: refuse an unknown kind before any subscription, store read
+	// or obligation write. A nil filter keeps the T3.48 return unchanged.
+	filter, err := parseWaitEventFilter(in.EventKinds)
+	if err != nil {
+		return WaitResultOutput{}, err
 	}
 	if s == nil || s.store == nil {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, "wait_result: store is nil")
@@ -930,7 +1064,20 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 				// same Watch and the next wait carries on from its new revision.
 				return needsInputOutput(update.Revision, update.Checks), nil
 			}
-			if !isWaitResultVerdict(update.Verdict) {
+			if filter != nil {
+				// ADR 0045 p1: the filter, not the verdict, decides whether an
+				// update ends the wait. An unlisted kind is a state tick even
+				// when it carries a terminal verdict, so a progress report
+				// cannot be mistaken for a completed event.
+				if _, listed := filter[update.Kind]; !listed {
+					continue
+				}
+				if !isWaitResultVerdict(update.Verdict) {
+					// progress and checkpoint carry no terminal verdict. They
+					// wake the caller with the current state and mark no read.
+					return eventOutput(update.Status, update.Verdict, revision, checks), nil
+				}
+			} else if !isWaitResultVerdict(update.Verdict) {
 				// A watching tick moves no revision and wakes nobody.
 				continue
 			}
@@ -950,6 +1097,26 @@ func watchingOutput(revision uint64, checks map[string]domain.Check) WaitResultO
 	return WaitResultOutput{
 		Status:      string(domain.StatusWatching),
 		Verdict:     string(domain.VerdictWatching),
+		Revision:    revision,
+		Checks:      checks,
+		PollAfterMs: &ms,
+	}
+}
+
+// eventOutput is the side-effect-free response for a listed progress or
+// checkpoint event. It carries the state the event observed and a poll hint.
+// No obligation is marked read, because the job has not completed.
+func eventOutput(status domain.Status, verdict domain.Verdict, revision uint64, checks map[string]domain.Check) WaitResultOutput {
+	if status == "" {
+		status = domain.StatusNotifying
+	}
+	if verdict == "" {
+		verdict = domain.VerdictWatching
+	}
+	ms := waitResultPollAfterMs
+	return WaitResultOutput{
+		Status:      string(status),
+		Verdict:     string(verdict),
 		Revision:    revision,
 		Checks:      checks,
 		PollAfterMs: &ms,

@@ -1277,3 +1277,274 @@ func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 		}
 	}
 }
+
+// ---- ADR 0045 p1 / T3.102: фильтр событий и ключ на старте ожидания ----
+
+// TestWaitResultEventFilterReturnsOnFirstListedEvent проверяет, что ожидание
+// возвращается по первому событию из фильтра, а не по таймауту опроса.
+func TestWaitResultEventFilterReturnsOnFirstListedEvent(t *testing.T) {
+	svc, _, writer, source, timeout := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventProgress, Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, Revision: 8, At: at,
+	})
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventCheckpoint, Status: domain.StatusNotifying,
+		Verdict: domain.VerdictWatching, Revision: 9, At: at,
+	})
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventCompleted, Status: domain.StatusClosed,
+		Verdict: domain.VerdictMerged, Revision: 10, At: at,
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", EventKinds: []string{"checkpoint"}}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Revision != 9 {
+		t.Errorf("revision = %d, want 9 (checkpoint, not progress or completed)", got.Revision)
+	}
+	if got.Status != string(domain.StatusNotifying) {
+		t.Errorf("status = %q, want notifying", got.Status)
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("readAt writes = %d, want 0: checkpoint is not a terminal verdict", len(writer.reads))
+	}
+	select {
+	case <-timeout:
+		t.Fatal("poll timeout fired; the wait returned by timeout, not by the event")
+	default:
+	}
+	if len(source.subscribed) != 1 {
+		t.Errorf("subscriptions = %d, want 1", len(source.subscribed))
+	}
+}
+
+// TestWaitResultEventFilterCompletedDelivers проверяет, что несколько kinds в
+// фильтре работают: несписочный progress пропускается, а completed с
+// терминальным вердиктом пишет readAt.
+func TestWaitResultEventFilterCompletedDelivers(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 5, 0, 0, time.UTC)
+	checks := map[string]domain.Check{"ci/test": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true}}
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventProgress, Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, Revision: 8, At: at,
+	})
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventCompleted, Status: domain.StatusClosed,
+		Verdict: domain.VerdictMerged, Revision: 9, Checks: checks, At: at,
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", EventKinds: []string{"checkpoint", "completed"}}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Verdict != string(domain.VerdictMerged) || got.Revision != 9 {
+		t.Errorf("result = %+v, want merged/9", got)
+	}
+	if len(writer.reads) != 1 {
+		t.Errorf("readAt writes = %d, want 1", len(writer.reads))
+	}
+}
+
+// TestWaitResultEventFilterOverridesVerdict отличает T3.102 от T3.48: без
+// фильтра терминальный вердикт заканчивает ожидание, с фильтром его может
+// закончить только событие нужного вида.
+func TestWaitResultEventFilterOverridesVerdict(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 10, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventCompleted, Status: domain.StatusClosed,
+		Verdict: domain.VerdictMerged, Revision: 8, At: at,
+	})
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventProgress, Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, Revision: 9, At: at,
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", EventKinds: []string{"progress"}}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Revision != 9 || got.Verdict != string(domain.VerdictWatching) {
+		t.Errorf("result = %+v, want watching/9 from the progress event", got)
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("readAt writes = %d, want 0", len(writer.reads))
+	}
+}
+
+// TestWaitResultEventFilterRejectsUnknownKind проверяет, что неверный kind
+// отклоняется до подписки и до любой записи.
+func TestWaitResultEventFilterRejectsUnknownKind(t *testing.T) {
+	svc, _, _, source, _ := newWaitTestService()
+	_, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", EventKinds: []string{"bogus"}}, CallerExit{})
+	assertCode(t, err, domain.CodeInvalidInput)
+	if len(source.subscribed) != 0 {
+		t.Errorf("subscriptions = %d, want 0 for a rejected filter", len(source.subscribed))
+	}
+}
+
+// TestWaitResultInputSchemaHasEventFilterAndStartKey проверяет, что оба новых
+// поля видны MCP-клиенту в выведенной схеме.
+func TestWaitResultInputSchemaHasEventFilterAndStartKey(t *testing.T) {
+	schema, err := jsonschema.For[WaitResultInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	for _, field := range []string{"eventKinds", "startKey"} {
+		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Errorf("input schema has no %q property: %s", field, raw)
+		}
+	}
+}
+
+// TestWaitResultStartKeyJoinsFirstWait проверяет, что повторный старт с тем же
+// ключом не открывает вторую задачу и возвращает первый исход.
+func TestWaitResultStartKeyJoinsFirstWait(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 15, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: at,
+	})
+	in := WaitResultInput{WatchID: "watch-1", StartKey: "start-1"}
+	first, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+
+	// A lost response retries the start. Even a fresh update on the source must
+	// not open a second wait.
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictReady,
+		Revision: 9, At: at,
+	})
+	second, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("repeat Wait: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("repeat result = %+v, want %+v", second, first)
+	}
+	if second.Revision != 8 {
+		t.Errorf("repeat revision = %d, want 8", second.Revision)
+	}
+	if len(source.subscribed) != 1 {
+		t.Errorf("subscriptions = %d, want 1", len(source.subscribed))
+	}
+	if len(writer.reads) != 1 {
+		t.Errorf("readAt writes = %d, want 1", len(writer.reads))
+	}
+}
+
+// TestWaitResultDistinctStartKeysCreateDistinctTasks проверяет, что разные
+// ключи дают разные ожидания и разные результаты.
+func TestWaitResultDistinctStartKeysCreateDistinctTasks(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 20, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: at,
+	})
+	first, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", StartKey: "start-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictReady,
+		Revision: 9, At: at,
+	})
+	second, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", StartKey: "start-2"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("second Wait: %v", err)
+	}
+	if first.Verdict != string(domain.VerdictMerged) || second.Verdict != string(domain.VerdictReady) {
+		t.Errorf("verdicts = %q/%q, want merged/ready", first.Verdict, second.Verdict)
+	}
+	if len(source.subscribed) != 2 {
+		t.Errorf("subscriptions = %d, want 2", len(source.subscribed))
+	}
+	if len(writer.reads) != 2 {
+		t.Errorf("readAt writes = %d, want 2", len(writer.reads))
+	}
+}
+
+// TestWaitResultStartKeyDistinctFromClientRequestID показывает, что ключ
+// старта работает отдельно от ключа команды из ADR 0028.
+func TestWaitResultStartKeyDistinctFromClientRequestID(t *testing.T) {
+	svc, _, writer, source, _ := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 25, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Status: domain.StatusClosed, Verdict: domain.VerdictMerged,
+		Revision: 8, At: at,
+	})
+	first, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", StartKey: "start-1", ClientRequestID: "req-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+	second, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", StartKey: "start-1", ClientRequestID: "req-2"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("repeat Wait: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Errorf("repeat result = %+v, want %+v", second, first)
+	}
+	if len(source.subscribed) != 1 {
+		t.Errorf("subscriptions = %d, want 1", len(source.subscribed))
+	}
+	if len(writer.reads) != 1 {
+		t.Errorf("readAt writes = %d, want 1", len(writer.reads))
+	}
+}
+
+// TestWaitResultFilterAndStartKeyCompose проверяет фильтр и ключ старта вместе.
+func TestWaitResultFilterAndStartKeyCompose(t *testing.T) {
+	svc, _, writer, source, timeout := newWaitTestService()
+	at := time.Date(2026, 11, 20, 12, 30, 0, 0, time.UTC)
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventProgress, Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, Revision: 8, At: at,
+	})
+	source.publish(WaitVerdictUpdate{
+		WatchID: "watch-1", Kind: WaitEventCheckpoint, Status: domain.StatusNotifying,
+		Verdict: domain.VerdictWatching, Revision: 9, At: at,
+	})
+	in := WaitResultInput{WatchID: "watch-1", EventKinds: []string{"checkpoint"}, StartKey: "start-1"}
+	first, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("first Wait: %v", err)
+	}
+	second, err := svc.Wait(context.Background(), "sub-A", in, CallerExit{})
+	if err != nil {
+		t.Fatalf("repeat Wait: %v", err)
+	}
+	if first.Revision != 9 || !reflect.DeepEqual(first, second) {
+		t.Errorf("results = %+v / %+v, want checkpoint/9 in both", first, second)
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("readAt writes = %d, want 0", len(writer.reads))
+	}
+	select {
+	case <-timeout:
+		t.Fatal("poll timeout fired; the wait returned by timeout, not by the event")
+	default:
+	}
+	if len(source.subscribed) != 1 {
+		t.Errorf("subscriptions = %d, want 1", len(source.subscribed))
+	}
+}
