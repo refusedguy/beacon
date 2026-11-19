@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -149,6 +150,88 @@ func TestAckValidation(t *testing.T) {
 	_, claims := stamper.counts()
 	if claims != 0 {
 		t.Errorf("a rejected ack stamped the obligation %d times", claims)
+	}
+}
+
+// TestAckDoesNotChangeVerdict proves the ADR 0028 contract: an ack records a
+// written intention without producing a terminal verdict. For a live Watch and
+// for one that already has a verdict, ack writes claimedAt only. It leaves the
+// Watch verdict and status untouched and returns an ok-only response with no
+// verdict field. The verdict still has to be read from get_result or
+// wait_result.
+func TestAckDoesNotChangeVerdict(t *testing.T) {
+	for _, verdict := range []domain.Verdict{domain.VerdictWatching, domain.VerdictReady} {
+		t.Run(string(verdict), func(t *testing.T) {
+			clock := &stepClock{t: time.Date(2026, 11, 19, 14, 0, 0, 0, time.UTC)}
+			w := resultFixture(verdict)
+			o := resultObligation(w, "session-V")
+			store := newMemStore()
+			if err := store.SaveWatch(w); err != nil {
+				t.Fatalf("SaveWatch: %v", err)
+			}
+			if err := store.SaveObligation(o); err != nil {
+				t.Fatalf("SaveObligation: %v", err)
+			}
+			stamper := newRecordingStamper()
+			stamper.add(o)
+			h := NewAckHandler(store, stamper, clock)
+
+			_, out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
+			if err != nil {
+				t.Fatalf("ack: %v", err)
+			}
+			if !out.OK {
+				t.Fatal("ack did not return ok")
+			}
+
+			gotWatch, err := store.Watch(w.ID)
+			if err != nil {
+				t.Fatalf("read Watch after ack: %v", err)
+			}
+			if gotWatch.Verdict != verdict {
+				t.Errorf("ack changed Watch verdict: %q -> %q", verdict, gotWatch.Verdict)
+			}
+			if gotWatch.Status != w.Status {
+				t.Errorf("ack changed Watch status: %q -> %q", w.Status, gotWatch.Status)
+			}
+
+			gotObligation, err := store.Obligation(o.ID)
+			if err != nil {
+				t.Fatalf("read obligation after ack: %v", err)
+			}
+			if gotObligation.VerdictPointer != o.VerdictPointer {
+				t.Errorf("ack changed verdict pointer: %q -> %q", o.VerdictPointer, gotObligation.VerdictPointer)
+			}
+
+			stamped, ok := stamper.snapshot(o.ID)
+			if !ok {
+				t.Fatal("ack did not stamp the obligation")
+			}
+			if stamped.ClaimedAt.IsZero() {
+				t.Error("ack did not write claimedAt")
+			}
+			if stamped.VerdictPointer != o.VerdictPointer {
+				t.Errorf("stamp changed verdict pointer: %q -> %q", o.VerdictPointer, stamped.VerdictPointer)
+			}
+			if !stamped.ReadAt.IsZero() {
+				t.Errorf("ack stamped readAt %v, want zero", stamped.ReadAt)
+			}
+
+			body, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal ack response: %v", err)
+			}
+			var fields map[string]any
+			if err := json.Unmarshal(body, &fields); err != nil {
+				t.Fatalf("unmarshal ack response: %v", err)
+			}
+			if _, ok := fields["verdict"]; ok {
+				t.Errorf("ack response carries a verdict: %s", body)
+			}
+			if len(fields) != 1 || fields["ok"] != true {
+				t.Errorf("ack response = %s, want only ok:true", body)
+			}
+		})
 	}
 }
 
