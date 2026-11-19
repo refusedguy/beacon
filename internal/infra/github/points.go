@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // BudgetPerHour is the hard point budget shared by the REST and GraphQL clients.
@@ -310,4 +312,21 @@ func (c *Counter) AddCost(cost int) int { return c.Add(cost) }
 
 func (c *Counter) Record(resp *http.Response, bodyCost int) int {
 	return c.Observe(resp, bodyCost)
+}
+
+// Artifact verdict, ADR 0027. A closed or merged pull request is terminal and
+// needs no read of an agent's log, transcript or database. The typed artifact
+// locators are validated where receipts are imported; this helper is the
+// GitHub-side view of the same rule and stays pure over the observed state.
+
+// ClosedPRVerdict returns the domain verdict for an observed PR state. States
+// other than MERGED and CLOSED are not terminal.
+func ClosedPRVerdict(state string) domain.Verdict {
+	v, _ := domain.Evaluate(domain.Snapshot{State: state}, domain.Policy{})
+	return v
+}
+
+// IsTerminalArtifactVerdict reports whether v closes the Watch.
+func IsTerminalArtifactVerdict(v domain.Verdict) bool {
+	return v == domain.VerdictMerged || v == domain.VerdictClosed
 }
