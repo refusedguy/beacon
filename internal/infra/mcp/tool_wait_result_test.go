@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1070,5 +1071,125 @@ func TestWaitResultHandleSkipsWorkWhenTreeAlreadyCancelled(t *testing.T) {
 	}
 	if len(journal.Records()) != 1 {
 		t.Errorf("journal records = %d, want 1 (no duplicate cancel)", len(journal.Records()))
+	}
+}
+
+// coalescingCIWaiter is the test stand-in for the store gate: the first caller
+// runs the expensive operation, the rest join the active round and share its
+// end. It keeps the acceptance test inside mcp without importing a sibling
+// infra package (ADR 0005).
+type coalescingCIWaiter struct {
+	mu    sync.Mutex
+	calls map[string]*coalescingCIRound
+}
+
+type coalescingCIRound struct {
+	done chan struct{}
+}
+
+func newCoalescingCIWaiter() *coalescingCIWaiter {
+	return &coalescingCIWaiter{calls: make(map[string]*coalescingCIRound)}
+}
+
+func (g *coalescingCIWaiter) wait(ctx context.Context, key string, fn func(context.Context) error) error {
+	g.mu.Lock()
+	if round, ok := g.calls[key]; ok {
+		g.mu.Unlock()
+		select {
+		case <-round.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	round := &coalescingCIRound{done: make(chan struct{})}
+	g.calls[key] = round
+	g.mu.Unlock()
+
+	err := fn(ctx)
+
+	g.mu.Lock()
+	delete(g.calls, key)
+	close(round.done)
+	g.mu.Unlock()
+	return err
+}
+
+// TestWaitResultSharedCIWaitCoalescesOneCI is the T3.76 acceptance check.
+// Fifteen units waiting on one CI (same repo/PR/headSHA) run the expensive
+// shared wait once. Removing the gate call from wait makes the operation never
+// run and this test fails.
+func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
+	const units = 15
+	var (
+		runs          atomic.Int32
+		entered       atomic.Int32
+		leaderEntered = make(chan struct{})
+		release       = make(chan struct{})
+	)
+	op := func(context.Context) error {
+		if runs.Add(1) == 1 {
+			close(leaderEntered)
+		}
+		<-release
+		return nil
+	}
+
+	gate := newCoalescingCIWaiter()
+	start := make(chan struct{})
+	type result struct {
+		out WaitResultOutput
+		err error
+	}
+	results := make([]result, units)
+	timeouts := make([]chan time.Time, units)
+	var wg sync.WaitGroup
+	for i := 0; i < units; i++ {
+		svc, _, _, _, timeout := newWaitTestService()
+		svc.SetCIWait(op)
+		svc.SetSharedCIWaiter(gate.wait)
+		timeouts[i] = timeout
+		wg.Add(1)
+		go func(i int, svc *WaitResultService) {
+			defer wg.Done()
+			<-start
+			entered.Add(1)
+			results[i].out, results[i].err = svc.Wait(context.Background(), "sub-A",
+				WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+		}(i, svc)
+	}
+	close(start)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for entered.Load() < units && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-leaderEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no unit entered the shared CI wait")
+	}
+	// Let the other units join the active round before it is released.
+	time.Sleep(250 * time.Millisecond)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("expensive CI wait ran %d times before release, want 1", got)
+	}
+
+	for _, timeout := range timeouts {
+		close(timeout)
+	}
+	close(release)
+	wg.Wait()
+
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("expensive CI wait ran %d times, want 1 (one CI, one operation)", got)
+	}
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("unit %d: Wait = %v, want nil", i, r.err)
+		}
+		if r.out.Status != string(domain.StatusWatching) {
+			t.Errorf("unit %d: status = %q, want watching", i, r.out.Status)
+		}
 	}
 }
