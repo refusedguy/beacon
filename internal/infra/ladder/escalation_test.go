@@ -12,53 +12,45 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/store"
 	_ "modernc.org/sqlite"
 )
 
-// testDB adapts a raw SQLite handle to the escalator's persistence port. The
-// production adapter lives outside this package; the test drives the same SQL
-// contract with no external service.
-type testDB struct{ db *sql.DB }
+// testDB is the shared persistence double for both ladder test files. The
+// embedded *store.DB drives the same production code path as the transitions
+// tests; EscalatedCount adds the one read the escalator needs.
+type testDB struct {
+	*store.DB
+}
 
 func newTestDB(t *testing.T) *testDB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "beacon.db")
-	db, err := sql.Open("sqlite", "file:"+path)
+	d, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
+		t.Fatalf("Open: %v", err)
 	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() { db.Close() })
-	if _, err := db.Exec(`CREATE TABLE obligations (id TEXT PRIMARY KEY, payload BLOB NOT NULL)`); err != nil {
-		t.Fatalf("create obligations: %v", err)
-	}
-	return &testDB{db: db}
-}
-
-func (d *testDB) Write(ctx context.Context, fn func(*sql.Tx) error) error {
-	tx, err := d.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := fn(tx); err != nil {
-		return err
-	}
-	return tx.Commit()
+	t.Cleanup(func() { _ = d.Close() })
+	return &testDB{DB: d}
 }
 
 func (d *testDB) EscalatedCount(ctx context.Context) (int, error) {
-	if _, err := d.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS escalation_stats
-		  (id INTEGER PRIMARY KEY CHECK (id = 1),
-		   escalated INTEGER NOT NULL DEFAULT 0)`); err != nil {
+	if _, err := d.DB.Write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			CREATE TABLE IF NOT EXISTS escalation_stats
+			  (id INTEGER PRIMARY KEY CHECK (id = 1),
+			   escalated INTEGER NOT NULL DEFAULT 0)`)
+		return err
+	}); err != nil {
 		return 0, err
 	}
 	var n int
-	err := d.db.QueryRowContext(ctx, escalatedCountSQL).Scan(&n)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
+	err := d.DB.Write(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, escalatedCountSQL).Scan(&n)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
 	return n, err
 }
 
@@ -148,7 +140,15 @@ func newEpisode(t *testing.T, d *testDB, watchID string, staged time.Time, mutat
 	if err != nil {
 		t.Fatalf("marshal obligation: %v", err)
 	}
-	if _, err := d.db.Exec(`INSERT INTO obligations (id, payload) VALUES (?, ?)`, o.ID, payload); err != nil {
+	err = d.DB.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			INSERT INTO obligations
+			  (id, watch_id, revision, subscriber_id, verdict_pointer, payload)
+			VALUES (?, ?, ?, ?, ?, ?)`,
+			o.ID, o.WatchID, o.Revision, o.SubscriberID, string(o.VerdictPointer), payload)
+		return err
+	})
+	if err != nil {
 		t.Fatalf("insert obligation: %v", err)
 	}
 	w := domain.Watch{
@@ -167,7 +167,9 @@ func newEpisode(t *testing.T, d *testDB, watchID string, staged time.Time, mutat
 func storedObligation(t *testing.T, d *testDB, id string) domain.Obligation {
 	t.Helper()
 	var payload []byte
-	if err := d.db.QueryRow(`SELECT payload FROM obligations WHERE id = ?`, id).Scan(&payload); err != nil {
+	if err := d.DB.Write(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT payload FROM obligations WHERE id = ?`, id).Scan(&payload)
+	}); err != nil {
 		t.Fatalf("read obligation %s: %v", id, err)
 	}
 	var o domain.Obligation
