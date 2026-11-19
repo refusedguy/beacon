@@ -1,7 +1,10 @@
 package domain
 
 import (
+	"encoding/base64"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -177,5 +180,195 @@ func TestRejectDuplicateConflict(t *testing.T) {
 	}
 	if !IsRejectDuplicate(fmt.Errorf("wrapped: %w", err)) {
 		t.Error("IsRejectDuplicate must recognize a wrapped conflict")
+	}
+}
+
+func testHandleKey() []byte {
+	return []byte("test-signing-key-not-for-production")
+}
+
+func TestIssueTaskHandleFormatAndOpaque(t *testing.T) {
+	key := testHandleKey()
+	const taskID = "task-abc-123"
+	handle, err := IssueTaskHandle(key, taskID)
+	if err != nil {
+		t.Fatalf("IssueTaskHandle: %v", err)
+	}
+
+	parts := strings.Split(handle, ".")
+	if len(parts) != 3 {
+		t.Fatalf("handle %q has %d segments, want 3", handle, len(parts))
+	}
+	if parts[0] != HandleVersion {
+		t.Errorf("version = %q, want %q", parts[0], HandleVersion)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("payload is not base64url: %v", err)
+	}
+	if string(decoded) != taskID {
+		t.Errorf("payload = %q, want %q", decoded, taskID)
+	}
+	if strings.Contains(handle, taskID) {
+		t.Errorf("handle %q leaks the raw task id in plaintext", handle)
+	}
+}
+
+func TestIssueTaskHandleDeterministicAcrossProcesses(t *testing.T) {
+	key := testHandleKey()
+	const taskID = "task-abc-123"
+
+	// "Process A" issues the handle.
+	issuedA, err := IssueTaskHandle(key, taskID)
+	if err != nil {
+		t.Fatalf("issue in process A: %v", err)
+	}
+	// "Process B" issues again after a restart and parses A's handle using
+	// only the key, with no in-memory table.
+	issuedB, err := IssueTaskHandle(key, taskID)
+	if err != nil {
+		t.Fatalf("issue in process B: %v", err)
+	}
+	if issuedA != issuedB {
+		t.Fatalf("restart changed the handle: %q != %q", issuedA, issuedB)
+	}
+	got, err := ParseTaskHandle(key, issuedA)
+	if err != nil {
+		t.Fatalf("process B parse: %v", err)
+	}
+	if got != taskID {
+		t.Fatalf("parsed task id = %q, want %q", got, taskID)
+	}
+}
+
+func TestIssueTaskHandleDistinctPerTask(t *testing.T) {
+	key := testHandleKey()
+	a, err := IssueTaskHandle(key, "task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := IssueTaskHandle(key, "task-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatalf("different task ids share handle %q", a)
+	}
+}
+
+func TestIssueTaskHandleRejectsEmptyInputs(t *testing.T) {
+	if _, err := IssueTaskHandle(nil, "task-1"); !errors.Is(err, ErrEmptyHandleKey) {
+		t.Errorf("empty key: err = %v, want ErrEmptyHandleKey", err)
+	}
+	if _, err := IssueTaskHandle([]byte("key"), ""); !errors.Is(err, ErrEmptyTaskID) {
+		t.Errorf("empty task id: err = %v, want ErrEmptyTaskID", err)
+	}
+}
+
+func TestParseTaskHandleRejectsTampering(t *testing.T) {
+	key := testHandleKey()
+	handle, err := IssueTaskHandle(key, "task-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(handle, ".")
+
+	cases := []struct {
+		name   string
+		handle string
+	}{
+		{"tampered payload", parts[0] + "." + base64.RawURLEncoding.EncodeToString([]byte("task-xyz")) + "." + parts[2]},
+		{"tampered signature", parts[0] + "." + parts[1] + "." + base64.RawURLEncoding.EncodeToString([]byte("forged"))},
+		{"wrong key", handle},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			useKey := key
+			if tc.name == "wrong key" {
+				useKey = []byte("a-different-signing-key")
+			}
+			if _, err := ParseTaskHandle(useKey, tc.handle); !errors.Is(err, ErrInvalidHandleSignature) {
+				t.Fatalf("err = %v, want ErrInvalidHandleSignature", err)
+			}
+		})
+	}
+}
+
+func TestParseTaskHandleRejectsMalformed(t *testing.T) {
+	key := testHandleKey()
+	cases := []struct {
+		name   string
+		handle string
+	}{
+		{"too few segments", "v1.payload"},
+		{"too many segments", "v1.payload.sig.extra"},
+		{"unknown version", "v9.cGF5bG9hZA.sig"},
+		{"bad payload base64", "v1.!!!.c2ln"},
+		{"bad signature base64", "v1.cGF5bG9hZA.!!!"},
+		{"empty payload", "v1..c2ln"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseTaskHandle(key, tc.handle); !errors.Is(err, ErrInvalidHandle) {
+				t.Fatalf("err = %v, want ErrInvalidHandle", err)
+			}
+		})
+	}
+	if _, err := ParseTaskHandle(nil, "v1.cGF5bG9hZA.c2ln"); !errors.Is(err, ErrEmptyHandleKey) {
+		t.Errorf("empty key: err = %v, want ErrEmptyHandleKey", err)
+	}
+}
+
+func TestParseTaskHandleRejectsRelabelledVersion(t *testing.T) {
+	key := testHandleKey()
+	handle, err := IssueTaskHandle(key, "task-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(handle, ".")
+
+	// The version tag is part of the handle and is signed with it. A handle
+	// relabelled to a version this code does not know is refused before any
+	// authorization decision is made.
+	relabelled := "v2." + parts[1] + "." + parts[2]
+	if _, err := ParseTaskHandle(key, relabelled); !errors.Is(err, ErrInvalidHandle) {
+		t.Fatalf("relabelled version: err = %v, want ErrInvalidHandle", err)
+	}
+}
+
+func TestHandleIsNotAuthorizationAndNotOtherKeys(t *testing.T) {
+	key := testHandleKey()
+	const taskID = "task-abc"
+	handle, err := IssueTaskHandle(key, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseTaskHandle(key, handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed != taskID {
+		t.Fatalf("parsed = %q, want %q", parsed, taskID)
+	}
+
+	// The handle is not the raw task id, a T3.51 fencing token stand-in, or
+	// the ADR 0028/0031 idempotency key.
+	if handle == taskID {
+		t.Error("handle must not equal the raw task id")
+	}
+	if handle == IdempotencyKey(StartNamespace, taskID) {
+		t.Error("handle must not be an idempotency key")
+	}
+
+	// A verified handle alone never grants access: the owner is checked
+	// separately, and the handle plays no part in that decision.
+	if !AuthorizeTaskOwner("alice", "alice") {
+		t.Error("matching owner must be authorized")
+	}
+	if AuthorizeTaskOwner("bob", "alice") {
+		t.Error("a valid handle with the wrong owner must not be authorized")
+	}
+	if AuthorizeTaskOwner("", "alice") {
+		t.Error("an empty owner must not be authorized")
 	}
 }
