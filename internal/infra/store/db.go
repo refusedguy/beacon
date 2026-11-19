@@ -527,3 +527,169 @@ func (d *DB) TaskStartCount() (int, error) {
 	}
 	return n, nil
 }
+
+// createTaskJournalSQL owns the append-only task journal from ADR 0036 §3. As
+// with task_starts, the table is created on first use. The two triggers make
+// append-only a database rule rather than a convention: no caller, not even a
+// raw UPDATE or DELETE through Write, can change or remove a committed row. An
+// ack and a new event can only add records, so replaying the journal always
+// yields the same bytes (ADR 0012, ADR 0015).
+var createTaskJournalSQL = []string{
+	`CREATE TABLE IF NOT EXISTS task_journal (
+	   seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+	   task_id    TEXT NOT NULL,
+	   kind       TEXT NOT NULL,
+	   revision   INTEGER NOT NULL DEFAULT 0,
+	   payload    BLOB NOT NULL,
+	   created_at INTEGER NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS task_journal_by_task ON task_journal(task_id, seq)`,
+	`CREATE TRIGGER IF NOT EXISTS task_journal_no_update
+	 BEFORE UPDATE ON task_journal
+	 BEGIN SELECT RAISE(ABORT, 'store: task_journal is append-only'); END`,
+	`CREATE TRIGGER IF NOT EXISTS task_journal_no_delete
+	 BEFORE DELETE ON task_journal
+	 BEGIN SELECT RAISE(ABORT, 'store: task_journal is append-only'); END`,
+}
+
+// journalKindAck is the record kind written by AppendAck. It is a journal entry
+// like any other; an ack never edits the record it acknowledges.
+const journalKindAck = "ack"
+
+// JournalRecord is one committed row of the append-only task journal. Seq is
+// assigned by SQLite and never reused. Payload is the exact redacted bytes
+// stored at append time, so a reader can verify the row did not change.
+type JournalRecord struct {
+	Seq       int64
+	TaskID    string
+	Kind      string
+	Revision  int64
+	Payload   []byte
+	CreatedAt int64
+}
+
+// JournalStatus is the current status of a task, served separately from the
+// full history as required by ADR 0025. Cursor is the seq of the newest record
+// and doubles as the opaque Last-Event-ID for a subscriber that reconnects.
+type JournalStatus struct {
+	Status   string
+	Cursor   int64
+	Revision int64
+}
+
+// appendJournal inserts one row and returns its seq. This is the only write
+// path for the journal: it issues a single INSERT, never reads or rewrites an
+// existing row, and redacts the payload (ADR 0012) before storing it.
+func (d *DB) appendJournal(ctx context.Context, taskID, kind string, revision int64, payload []byte) (int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return 0, domain.NewAppError(domain.CodeInvalidInput, "store: empty journal task id")
+	}
+	if strings.TrimSpace(kind) == "" {
+		return 0, domain.NewAppError(domain.CodeInvalidInput, "store: empty journal kind")
+	}
+	clean := Redact(payload)
+	var seq int64
+	err := d.Write(ctx, func(tx *sql.Tx) error {
+		for _, stmt := range createTaskJournalSQL {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("store: journal: create table: %w", err)
+			}
+		}
+		res, err := tx.ExecContext(ctx, `
+			INSERT INTO task_journal (task_id, kind, revision, payload, created_at)
+			VALUES (?, ?, ?, ?, ?)`,
+			taskID, kind, revision, clean, time.Now().UTC().UnixNano())
+		if err != nil {
+			return fmt.Errorf("store: journal: insert: %w", err)
+		}
+		seq, err = res.LastInsertId()
+		if err != nil {
+			return fmt.Errorf("store: journal: last insert id: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return seq, nil
+}
+
+// AppendEvent appends one event record to the task journal and returns its
+// seq. It never rewrites an earlier record (ADR 0036 §3).
+func (d *DB) AppendEvent(ctx context.Context, taskID, kind, message string) (int64, error) {
+	payload, err := json.Marshal(struct {
+		Kind    string `json:"kind"`
+		Message string `json:"message"`
+	}{Kind: kind, Message: message})
+	if err != nil {
+		return 0, err
+	}
+	return d.appendJournal(ctx, taskID, kind, 0, payload)
+}
+
+// AppendAck appends an acknowledgement record to the task journal and returns
+// its seq. It records the revision the ack was given on but does not update the
+// acknowledged row: earlier event and ack rows stay byte-for-byte unchanged.
+func (d *DB) AppendAck(ctx context.Context, taskID string, revision int64) (int64, error) {
+	payload, err := json.Marshal(struct {
+		Kind     string `json:"kind"`
+		Revision int64  `json:"revision"`
+	}{Kind: journalKindAck, Revision: revision})
+	if err != nil {
+		return 0, err
+	}
+	return d.appendJournal(ctx, taskID, journalKindAck, revision, payload)
+}
+
+// JournalRecords returns every committed journal row for taskID, oldest first.
+// Payload is the exact stored bytes, so a caller can compare rows before and
+// after later appends to prove the old ones were not rewritten.
+func (d *DB) JournalRecords(ctx context.Context, taskID string) ([]JournalRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ok, err := tableExists(ctx, d.readDB, "task_journal")
+	if err != nil || !ok {
+		return nil, err
+	}
+	rows, err := d.readDB.QueryContext(ctx, `
+		SELECT seq, task_id, kind, revision, payload, created_at
+		FROM task_journal WHERE task_id = ? ORDER BY seq`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []JournalRecord
+	for rows.Next() {
+		var r JournalRecord
+		if err := rows.Scan(&r.Seq, &r.TaskID, &r.Kind, &r.Revision, &r.Payload, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// JournalStatus returns the current status of taskID without replaying or
+// rewriting the journal (ADR 0025). Status and Cursor come from the newest
+// record only; an unknown task yields a zero JournalStatus.
+func (d *DB) JournalStatus(ctx context.Context, taskID string) (JournalStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ok, err := tableExists(ctx, d.readDB, "task_journal")
+	if err != nil || !ok {
+		return JournalStatus{}, err
+	}
+	var s JournalStatus
+	err = d.readDB.QueryRowContext(ctx, `
+		SELECT kind, seq, revision FROM task_journal
+		WHERE task_id = ? ORDER BY seq DESC LIMIT 1`, taskID,
+	).Scan(&s.Status, &s.Cursor, &s.Revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return JournalStatus{}, nil
+	}
+	return s, err
+}
