@@ -550,3 +550,31 @@ func (g *SharedGate) ActiveWaiters(key string) int {
 	}
 	return 0
 }
+
+// Shared CI wait (ADR 0037 p3, T3.73).
+//
+// SharedGate on its own is only a mechanism. The process-wide gate below is
+// the point a wait path calls. It is package level, not per caller, so units
+// in one daemon coalesce even when they hold different store handles.
+
+var (
+	sharedCIWaitOnce sync.Once
+	sharedCIWaitGate *SharedGate
+)
+
+// sharedCIWait returns the process-wide gate for expensive CI waits.
+func sharedCIWait() *SharedGate {
+	sharedCIWaitOnce.Do(func() { sharedCIWaitGate = NewSharedGate() })
+	return sharedCIWaitGate
+}
+
+// SharedCIWait runs fn once for the active wait round on key. Callers that
+// arrive while the round is active join it and receive the same result instead
+// of starting a second wait on the same CI. A second distinct unit on the key
+// makes the gate print its WARNING (ADR 0037 p3).
+//
+// Callers re-read the state they care about after the wait returns; the gate
+// only guarantees that the wait happened once. A nil ctx becomes Background.
+func SharedCIWait(ctx context.Context, key string, fn SharedGateWait) error {
+	return sharedCIWait().Wait(ctx, key, fn)
+}
