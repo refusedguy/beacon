@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   raw           BLOB NOT NULL,
   imported_at   INTEGER NOT NULL,
   source        TEXT NOT NULL DEFAULT '',
+  version       TEXT NOT NULL DEFAULT '',
   UNIQUE (obligation_id, attempt)
 );
 CREATE INDEX IF NOT EXISTS receipts_by_obligation ON receipts(obligation_id, seq);
@@ -57,6 +58,51 @@ type Receipt struct {
 	// no private agent log path can enter the receipts table. Older lines
 	// without a source keep the zero value and still import.
 	Source ArtifactSource `json:"source"`
+
+	// Version is the label of the agent that saved the receipt (ADR 0034 §3).
+	// It travels with the receipt so a long-pending approval is read with the
+	// configuration that produced it, not with today's configuration. Older
+	// lines without a version keep the zero value and still import.
+	Version AgentVersion `json:"version"`
+}
+
+// AgentVersion is the version label of the agent that saved a receipt. It
+// fixes the model, prompt and tool set at save time so a snapshot behind a
+// long-pending approval can be read after the model, prompt or tools change
+// (ADR 0034 §3). An empty label marks a receipt saved before versions were
+// recorded. It describes the agent, not the corpus version of ADR 0012.
+type AgentVersion struct {
+	Model  string   `json:"model"`
+	Prompt string   `json:"prompt"`
+	Tools  []string `json:"tools,omitempty"`
+}
+
+// UnmarshalJSON decodes a version label at the boundary. It rejects trailing
+// data and trims the strings, so whitespace cannot make two equal labels
+// differ. It is deliberately permissive about which fields are present: older
+// and future agents may carry fewer or more details than this build knows.
+func (v *AgentVersion) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Model  string   `json:"model"`
+		Prompt string   `json:"prompt"`
+		Tools  []string `json:"tools"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&wire); err != nil {
+		return fmt.Errorf("agent version: decode: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("agent version: trailing data")
+	}
+	*v = AgentVersion{Model: strings.TrimSpace(wire.Model), Prompt: strings.TrimSpace(wire.Prompt)}
+	for _, tool := range wire.Tools {
+		if tool = strings.TrimSpace(tool); tool != "" {
+			v.Tools = append(v.Tools, tool)
+		}
+	}
+	return nil
 }
 
 // Artifact source, ADR 0027. A result is read from a git branch, a pull
@@ -212,6 +258,7 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 		Outcome      string          `json:"outcome"`
 		At           json.RawMessage `json:"at"`
 		Source       json.RawMessage `json:"source"`
+		Version      json.RawMessage `json:"version"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -251,6 +298,11 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 	if len(wire.Source) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Source), []byte("null")) {
 		if err := json.Unmarshal(wire.Source, &r.Source); err != nil {
 			return fmt.Errorf("receipt: bad source: %w", err)
+		}
+	}
+	if len(wire.Version) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Version), []byte("null")) {
+		if err := json.Unmarshal(wire.Version, &r.Version); err != nil {
+			return fmt.Errorf("receipt: bad version: %w", err)
 		}
 	}
 	return nil
@@ -337,8 +389,10 @@ func (d *DB) ImportReceipts(path string) (ImportReceiptsResult, error) {
 		if _, err := tx.Exec(createReceiptsSQL); err != nil {
 			return fmt.Errorf("store: receipts: create table: %w", err)
 		}
-		if err := ensureReceiptSourceColumn(tx); err != nil {
-			return err
+		for _, column := range []string{"source", "version"} {
+			if err := ensureReceiptColumn(tx, column); err != nil {
+				return err
+			}
 		}
 		for _, e := range entries {
 			inserted, err := insertReceipt(tx, e.receipt, e.raw)
@@ -393,10 +447,11 @@ func splitCompleteLines(data []byte) ([][]byte, bool) {
 	return lines, partial
 }
 
-// ensureReceiptSourceColumn adds the source column to a receipts table made
-// by an earlier build. The table is created on first use here, so its additive
-// upgrade belongs here too instead of in the migration corpus.
-func ensureReceiptSourceColumn(tx *sql.Tx) error {
+// ensureReceiptColumn adds column to a receipts table made by an earlier
+// build. The table is created on first use here, so additive upgrades belong
+// here too instead of in the migration corpus. column is one of our own fixed
+// names ("source", "version"), never external input.
+func ensureReceiptColumn(tx *sql.Tx, column string) error {
 	rows, err := tx.Query(`PRAGMA table_info(receipts)`)
 	if err != nil {
 		return fmt.Errorf("store: receipts: table info: %w", err)
@@ -414,7 +469,7 @@ func ensureReceiptSourceColumn(tx *sql.Tx) error {
 		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultV, &primary); err != nil {
 			return fmt.Errorf("store: receipts: scan table info: %w", err)
 		}
-		if strings.EqualFold(name, "source") {
+		if strings.EqualFold(name, column) {
 			return nil
 		}
 	}
@@ -424,8 +479,8 @@ func ensureReceiptSourceColumn(tx *sql.Tx) error {
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("store: receipts: close table info: %w", err)
 	}
-	if _, err := tx.Exec(`ALTER TABLE receipts ADD COLUMN source TEXT NOT NULL DEFAULT ''`); err != nil {
-		return fmt.Errorf("store: receipts: add source column: %w", err)
+	if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE receipts ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, column)); err != nil {
+		return fmt.Errorf("store: receipts: add %s column: %w", column, err)
 	}
 	return nil
 }
@@ -443,8 +498,10 @@ func recordRejectDuplicate(tx *sql.Tx, namespacedKey, taskID string) error {
 	if _, err := tx.Exec(createReceiptsSQL); err != nil {
 		return fmt.Errorf("store: receipts: create table: %w", err)
 	}
-	if err := ensureReceiptSourceColumn(tx); err != nil {
-		return err
+	for _, column := range []string{"source", "version"} {
+		if err := ensureReceiptColumn(tx, column); err != nil {
+			return err
+		}
 	}
 	raw, err := json.Marshal(struct {
 		IdempotencyKey string `json:"idempotencyKey"`
@@ -477,6 +534,20 @@ func (d *DB) RejectDuplicateCount() (int, error) {
 	return n, err
 }
 
+// encodeReceiptVersion returns the stored form of an agent version label.
+// An empty label is stored as "", so receipts saved before versions were
+// recorded keep the column empty and need no backfill (ADR 0034 §3).
+func encodeReceiptVersion(v AgentVersion) (string, error) {
+	if v.Model == "" && v.Prompt == "" && len(v.Tools) == 0 {
+		return "", nil
+	}
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("store: receipts: encode version: %w", err)
+	}
+	return string(encoded), nil
+}
+
 // insertReceipt stores a receipt only when the idempotency pair is new. The
 // RowsAffected result decides whether the obligation gets a second effect.
 // Only a validated artifact source is stored; no agent log path reaches here.
@@ -489,12 +560,16 @@ func insertReceipt(tx *sql.Tx, r Receipt, raw []byte) (bool, error) {
 		}
 		source = string(encoded)
 	}
+	version, err := encodeReceiptVersion(r.Version)
+	if err != nil {
+		return false, err
+	}
 	res, err := tx.Exec(`
 		INSERT OR IGNORE INTO receipts
-		  (obligation_id, attempt, outcome, at, raw, imported_at, source)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		  (obligation_id, attempt, outcome, at, raw, imported_at, source, version)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ObligationID, r.Attempt, string(r.Outcome), r.At.UnixNano(),
-		Redact(raw), time.Now().UTC().UnixNano(), source)
+		Redact(raw), time.Now().UTC().UnixNano(), source, version)
 	if err != nil {
 		return false, fmt.Errorf("store: receipts: insert: %w", err)
 	}
@@ -563,7 +638,7 @@ func (d *DB) Receipts(obligationID string) ([]Receipt, error) {
 		return nil, err
 	}
 	rows, err := d.readDB.Query(`
-		SELECT obligation_id, attempt, outcome, at, source FROM receipts
+		SELECT obligation_id, attempt, outcome, at, source, version FROM receipts
 		WHERE obligation_id = ? ORDER BY seq`, obligationID)
 	if err != nil {
 		return nil, err
@@ -573,17 +648,23 @@ func (d *DB) Receipts(obligationID string) ([]Receipt, error) {
 	var out []Receipt
 	for rows.Next() {
 		var (
-			r      Receipt
-			atNano int64
-			source string
+			r       Receipt
+			atNano  int64
+			source  string
+			version string
 		)
-		if err := rows.Scan(&r.ObligationID, &r.Attempt, &r.Outcome, &atNano, &source); err != nil {
+		if err := rows.Scan(&r.ObligationID, &r.Attempt, &r.Outcome, &atNano, &source, &version); err != nil {
 			return nil, err
 		}
 		r.At = time.Unix(0, atNano).UTC()
 		if source != "" {
 			if err := json.Unmarshal([]byte(source), &r.Source); err != nil {
 				return nil, fmt.Errorf("store: receipts: decode source: %w", err)
+			}
+		}
+		if version != "" {
+			if err := json.Unmarshal([]byte(version), &r.Version); err != nil {
+				return nil, fmt.Errorf("store: receipts: decode version: %w", err)
 			}
 		}
 		out = append(out, r)
