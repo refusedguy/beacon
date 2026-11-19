@@ -51,3 +51,4 @@
 | 0037 | Шесть фич из отчёта T-next-wave | accepted |
 | 0038 | Шесть фич из отчёта U-wave | accepted |
 | 0039 | Шесть фич из отчёта V-wave | accepted |
+| 0040 | Шесть фич из отчёта W-wave | accepted |
