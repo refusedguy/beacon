@@ -3,12 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -453,5 +455,88 @@ func TestToolsCallWithRealStore(t *testing.T) {
 	obligationID := domain.ObligationKey(out.WatchID, out.Revision, "w44-session")
 	if _, err := db.Obligation(obligationID); err != nil {
 		t.Fatalf("stored obligation %q: %v", obligationID, err)
+	}
+}
+
+// TestSchemaErrorKeepsRealHandlers proves T3.59: a broken output schema must
+// never leave the server silently running on the startup stubs. One schema
+// factory is forced to fail, so AllOutputSchemas returns an error. Every tool
+// must still run its real domain handler and return a domain-shaped response,
+// not the stub's {"ok":true}.
+func TestSchemaErrorKeepsRealHandlers(t *testing.T) {
+	const broken = "beacon_stats"
+	original := outputSchemaFactories[broken]
+	outputSchemaFactories[broken] = func() (*jsonschema.Schema, error) {
+		return nil, fmt.Errorf("injected schema failure")
+	}
+	t.Cleanup(func() { outputSchemaFactories[broken] = original })
+
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	deps := Dependencies{
+		Store:   db,
+		Stamper: NewSQLObligationStamper(db),
+		Writer:  NewSQLWaitResultWriter(db),
+		Events:  NewSQLCancelEventLog(db),
+		Snapshot: SnapshotFunc(func() (StateSnapshot, error) {
+			watches, err := db.ActiveWatches()
+			if err != nil {
+				return StateSnapshot{}, err
+			}
+			return StateSnapshot{ActiveWatches: watches, Version: ServerVersion}, nil
+		}),
+	}
+	session := connectTestSession(t, deps)
+	ctx := context.Background()
+
+	// stats: the real projection emits loadErrors; a stub only emits {"ok":true}.
+	stats, err := session.CallTool(ctx, &mcpsdk.CallToolParams{Name: "beacon_stats"})
+	if err != nil {
+		t.Fatalf("tools/call beacon_stats with broken schema: %v", err)
+	}
+	if stats.IsError {
+		t.Fatalf("beacon_stats returned isError: %v", stats.Content)
+	}
+	statsOut := decodeStructured[StatsOutput](t, stats)
+	if statsOut.LoadErrors == nil {
+		t.Fatalf("beacon_stats ran the stub, not the real handler: %+v", statsOut)
+	}
+
+	// list_running: the real projection emits counts and watches; a stub does not.
+	listing, err := session.CallTool(ctx, &mcpsdk.CallToolParams{Name: "beacon_list_running"})
+	if err != nil {
+		t.Fatalf("tools/call beacon_list_running with broken schema: %v", err)
+	}
+	if listing.IsError {
+		t.Fatalf("beacon_list_running returned isError: %v", listing.Content)
+	}
+	listOut := decodeStructured[ListRunningOutput](t, listing)
+	if listOut.Watches == nil || listOut.Counts.ByVerdict == nil {
+		t.Fatalf("beacon_list_running ran the stub, not the real handler: %+v", listOut)
+	}
+
+	// watch_pr: a write handler must also be registered when schema derivation fails.
+	watch, err := session.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "beacon_watch_pr",
+		Arguments: map[string]any{
+			"repo":    "refusedguy/beacon",
+			"pr":      42,
+			"headSHA": "t359-head",
+			"role":    string(domain.RoleExecutor),
+			"notify":  map[string]any{"adapter": "opencode", "target": "t359-session"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_watch_pr with broken schema: %v", err)
+	}
+	if watch.IsError {
+		t.Fatalf("beacon_watch_pr returned isError: %v", watch.Content)
+	}
+	watchOut := decodeStructured[WatchPROutput](t, watch)
+	if watchOut.WatchID == "" || watchOut.Status != string(domain.StatusWatching) {
+		t.Fatalf("beacon_watch_pr ran the stub, not the real handler: %+v", watchOut)
 	}
 }
