@@ -340,7 +340,7 @@ func TestSubscribeClosedWatchDoesNotBlockAlias(t *testing.T) {
 }
 
 func TestSubscribeDerivesIDAndFillsDefaults(t *testing.T) {
-	f, store := newTestFanout(t)
+	f, _ := newTestFanout(t)
 
 	res, err := f.Subscribe(
 		Watch{Repo: "org/repo", PR: 7, HeadSHA: "sha1"},
