@@ -21,6 +21,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon test
   beacon gates [gate] [flags]
   beacon task <list|new|take> [flags]
+  beacon mcp
 
 Каталог команд для агентов: beacon list --format json
 `
@@ -88,6 +89,8 @@ func (c *CLI) Run(args []string) int {
 		return c.runGates(args[1:])
 	case "task":
 		return taskRunner(args[1:], c.out, c.errOut)
+	case "mcp":
+		return mcpRunner(c.errOut)
 	default:
 		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)

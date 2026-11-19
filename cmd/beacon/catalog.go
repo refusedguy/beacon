@@ -22,6 +22,7 @@ var catalog = []command{
 	{Name: "doctor", Summary: "Проверить версию Go, beacon-gates и каталог состояния", Usage: "beacon doctor"},
 	{Name: "gates", Summary: "Передать аргументы бинарнику beacon-gates", Usage: "beacon gates [gate] [flags]"},
 	{Name: "list", Summary: "Показать каталог команд", Usage: "beacon list [--format table|json]"},
+	{Name: "mcp", Summary: "Запустить MCP-сервер на stdio", Usage: "beacon mcp"},
 	{Name: "task", Summary: "Работа с карточками задач", Usage: "beacon task <list|new|take> [flags]"},
 	{Name: "what", Summary: "Показать описание одной команды", Usage: "beacon what <command>"},
 }
