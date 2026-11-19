@@ -184,6 +184,14 @@ var serveMCP = func(ctx context.Context, deps mcp.Dependencies) error {
 	return mcp.RunWithDeps(ctx, deps)
 }
 
+// sharedCIWaiter adapts the store gate to the port declared in mcp. The store
+// names its callback type SharedGateWait, which is not assignable to the
+// unnamed callback in mcp.SharedCIWaiter, so the conversion lives here in the
+// composition root that owns both packages (ADR 0005).
+func sharedCIWaiter(ctx context.Context, key string, fn func(context.Context) error) error {
+	return store.SharedCIWait(ctx, key, store.SharedGateWait(fn))
+}
+
 // openMCPDependencies opens the real state store and builds the production
 // ports for the seven MCP tools. The returned closer belongs to the caller.
 //
@@ -216,10 +224,11 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 	}
 
 	deps := mcp.Dependencies{
-		Store:   db,
-		Stamper: mcp.NewSQLObligationStamper(db),
-		Writer:  mcp.NewSQLWaitResultWriter(db),
-		Events:  mcp.NewSQLCancelEventLog(db),
+		Store:          db,
+		Stamper:        mcp.NewSQLObligationStamper(db),
+		Writer:         mcp.NewSQLWaitResultWriter(db),
+		Events:         mcp.NewSQLCancelEventLog(db),
+		SharedCIWaiter: sharedCIWaiter,
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
 			watches, err := db.ActiveWatches()
 			if err != nil {

@@ -181,6 +181,12 @@ type Dependencies struct {
 	Snapshot SnapshotReader
 	Clock    domain.Clock
 
+	// SharedCIWaiter is the gate for the expensive CI wait at the long-poll
+	// entry (ADR 0037 p3). The composition root supplies it so this package
+	// keeps only the port and never imports the store implementation
+	// (ADR 0005). A nil value keeps the direct, non-coalescing default.
+	SharedCIWaiter SharedCIWaiter
+
 	// After is the MCP-boundary threshold that switches a slow response into
 	// the client's task dialect form. Zero disables the switch. It belongs to
 	// the boundary, never to the domain (ADR 0031 §2).
@@ -230,7 +236,9 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	}
 
 	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
-	AttachWaitResult(s, NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock))
+	waitResult := NewWaitResultService(deps.Store, deps.Writer, deps.Source, deps.Clock)
+	waitResult.SetSharedCIWaiter(deps.SharedCIWaiter)
+	AttachWaitResult(s, waitResult)
 	getResult := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
 	getResult.SetAfter(deps.After)
 	AttachGetResult(s, getResult)

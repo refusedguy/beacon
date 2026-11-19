@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -538,5 +539,67 @@ func TestSchemaErrorKeepsRealHandlers(t *testing.T) {
 	watchOut := decodeStructured[WatchPROutput](t, watch)
 	if watchOut.WatchID == "" || watchOut.Status != string(domain.StatusWatching) {
 		t.Fatalf("beacon_watch_pr ran the stub, not the real handler: %+v", watchOut)
+	}
+}
+
+// TestNewServerWithDepsWiresSharedCIWaiter is the T3.83 acceptance check. It
+// drives the real beacon_wait_result tool through NewServerWithDeps with a
+// counting gate in Dependencies. The gate must be the one the tool uses at the
+// long-poll entry; without the SetSharedCIWaiter call the direct default runs
+// and the call count stays at zero.
+func TestNewServerWithDepsWiresSharedCIWaiter(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	w := domain.Watch{
+		ID:        "watch-gate",
+		Repo:      "org/repo",
+		PR:        7,
+		HeadSHA:   "abc123",
+		Status:    domain.StatusWatching,
+		Verdict:   domain.VerdictWatching,
+		Revision:  7,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("save watch: %v", err)
+	}
+
+	var calls atomic.Int32
+	var gotKey string
+	gate := func(ctx context.Context, key string, fn func(context.Context) error) error {
+		calls.Add(1)
+		gotKey = key
+		return fn(ctx)
+	}
+	deps := Dependencies{
+		Store:          db,
+		Writer:         NewSQLWaitResultWriter(db),
+		Source:         &waitTestSource{},
+		SharedCIWaiter: gate,
+	}
+	session := connectTestSession(t, deps)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: "beacon_wait_result",
+		Arguments: map[string]any{
+			"watchID":   w.ID,
+			"timeoutMs": 200,
+		},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_wait_result: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("beacon_wait_result returned isError: %v", result.Content)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("shared CI gate called %d times, want 1", got)
+	}
+	if want := "ci:org/repo/7/abc123"; gotKey != want {
+		t.Fatalf("shared CI gate key = %q, want %q", gotKey, want)
 	}
 }
