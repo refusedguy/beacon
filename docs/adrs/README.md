@@ -68,3 +68,4 @@
 | 0054 | Шесть фич из отчёта AL-wave | accepted |
 | 0055 | Шесть фич из отчёта AM-wave | accepted |
 | 0056 | Шесть фич из отчёта AN-wave | accepted |
+| 0057 | Шесть фич из отчёта AO-wave | accepted |
