@@ -2373,3 +2373,203 @@ func TestTaskLogDoesNotDuplicateAdr0025Status(t *testing.T) {
 		t.Fatalf("JournalRecords = %d, %v; want 1 (log writes must not append)", len(rows), err)
 	}
 }
+
+// TestAcceptTaskWALBeforeAcceptedReply is the core of T3.123. The "accepted"
+// reply callback runs only after the task state is committed to the WAL, so a
+// fresh connection polling the issued id at reply time already finds it.
+func TestAcceptTaskWALBeforeAcceptedReply(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	const id = "task-wal-1"
+	state := []byte(`{"phase":"running"}`)
+
+	// Before acceptance the issued id is not on disk.
+	if _, found, err := d.AcceptedTask(id); err != nil || found {
+		t.Fatalf("AcceptedTask before accept: found=%v err=%v", found, err)
+	}
+
+	var (
+		replyCalls     int
+		foundAtReply   bool
+		payloadAtReply []byte
+	)
+	reply := func() error {
+		replyCalls++
+		// A fresh connection models a restarted process polling the id. It is
+		// opened at the reply point, after AcceptTask's write has committed.
+		reader, err := openPool(path, 1)
+		if err != nil {
+			return err
+		}
+		defer reader.Close()
+		s, found, err := acceptedTask(ctx, reader, id)
+		if err != nil {
+			return err
+		}
+		foundAtReply = found
+		payloadAtReply = s.Payload
+		return nil
+	}
+
+	if err := d.AcceptTask(ctx, id, state, reply); err != nil {
+		t.Fatalf("AcceptTask: %v", err)
+	}
+	if replyCalls != 1 {
+		t.Errorf("reply calls = %d, want 1", replyCalls)
+	}
+	if !foundAtReply {
+		t.Error("issued task id was not on disk at the accepted reply")
+	}
+	if string(payloadAtReply) != string(state) {
+		t.Errorf("payload at reply = %q, want %q", payloadAtReply, state)
+	}
+}
+
+// TestAcceptTaskFoundAfterRestart proves the ADR acceptance check: after the
+// process restarts, polling the issued id finds the state that was committed
+// before the reply.
+func TestAcceptTaskFoundAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	state := []byte(`{"phase":"running","n":1}`)
+	if err := first.AcceptTask(ctx, "task-wal-2", state, func() error { return nil }); err != nil {
+		first.Close()
+		t.Fatalf("AcceptTask: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	s, found, err := second.AcceptedTask("task-wal-2")
+	if err != nil {
+		t.Fatalf("AcceptedTask after restart: %v", err)
+	}
+	if !found {
+		t.Fatal("issued task id not found after restart")
+	}
+	if string(s.Payload) != string(state) {
+		t.Errorf("payload after restart = %q, want %q", s.Payload, state)
+	}
+}
+
+// TestAcceptTaskNoReplyWhenWriteFails proves the ordering holds in the failure
+// direction too: if the WAL write cannot commit, no accepted reply is emitted.
+func TestAcceptTaskNoReplyWhenWriteFails(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	replied := false
+	err = d.AcceptTask(ctx, "task-wal-3", []byte("state"), func() error {
+		replied = true
+		return nil
+	})
+	if err == nil {
+		t.Fatal("AcceptTask on a closed store must fail")
+	}
+	if replied {
+		t.Error("accepted reply was emitted despite a failed WAL write")
+	}
+}
+
+// TestAcceptTaskRepeatDoesNotDuplicate keeps acceptance keyed by the issued id:
+// a repeat updates the stored state but never creates a second task.
+func TestAcceptTaskRepeatDoesNotDuplicate(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	replies := 0
+	reply := func() error { replies++; return nil }
+	if err := d.AcceptTask(ctx, "same", []byte("v1"), reply); err != nil {
+		t.Fatalf("first AcceptTask: %v", err)
+	}
+	if err := d.AcceptTask(ctx, "same", []byte("v2"), reply); err != nil {
+		t.Fatalf("second AcceptTask: %v", err)
+	}
+	if replies != 2 {
+		t.Errorf("reply calls = %d, want 2 (one per call)", replies)
+	}
+	if n, err := d.AcceptedTaskCount(); err != nil || n != 1 {
+		t.Errorf("AcceptedTaskCount = %d, %v; want 1", n, err)
+	}
+	s, found, err := d.AcceptedTask("same")
+	if err != nil || !found {
+		t.Fatalf("AcceptedTask: found=%v err=%v; want found", found, err)
+	}
+	if string(s.Payload) != "v2" {
+		t.Errorf("payload after repeat = %q, want v2", s.Payload)
+	}
+}
+
+func TestAcceptTaskRejectsInvalidInput(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	noReply := func() error { return nil }
+	if err := d.AcceptTask(ctx, "", []byte("s"), noReply); err == nil {
+		t.Error("empty task id must be rejected")
+	}
+	if err := d.AcceptTask(ctx, "  ", []byte("s"), noReply); err == nil {
+		t.Error("blank task id must be rejected")
+	}
+	if err := d.AcceptTask(ctx, "task", []byte("s"), nil); err == nil {
+		t.Error("nil reply must be rejected")
+	}
+	if _, _, err := d.AcceptedTask(" "); err == nil {
+		t.Error("AcceptedTask(blank) must fail")
+	}
+	if n, err := d.AcceptedTaskCount(); err != nil || n != 0 {
+		t.Errorf("AcceptedTaskCount after rejected input = %d, %v; want 0", n, err)
+	}
+}
+
+// TestAcceptTaskRedactsState applies ADR 0012 to the WAL payload: a secret
+// must not reach the file, and a poll returns the redacted copy.
+func TestAcceptTaskRedactsState(t *testing.T) {
+	ctx := context.Background()
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	if err := d.AcceptTask(ctx, "task-wal-4", secret, func() error { return nil }); err != nil {
+		t.Fatalf("AcceptTask: %v", err)
+	}
+	s, found, err := d.AcceptedTask("task-wal-4")
+	if err != nil || !found {
+		t.Fatalf("AcceptedTask: found=%v err=%v; want found", found, err)
+	}
+	if bytes.Contains(s.Payload, []byte("ghp_")) {
+		t.Errorf("stored state kept a raw token: %s", s.Payload)
+	}
+}

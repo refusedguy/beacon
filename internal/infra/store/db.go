@@ -1738,3 +1738,128 @@ func (d *DB) TaskView(taskID string) (TaskView, error) {
 	view.HasActivity = found
 	return view, nil
 }
+
+// ---- WAL before the "accepted" reply (ADR 0056 feature 2, T3.123) ----
+//
+// T1.8 (CommitVerdict) makes the verdict, its obligation and the wake intent a
+// single atomic commit and checks the three components on the same DB after
+// CommitVerdict returns. T3.123 is a different guarantee: it orders the durable
+// write of a task's state against the moment the CLI tells the client
+// "accepted". The reply is a callback this store invokes only after the write
+// has committed to the WAL, never inside the transaction and never before the
+// commit. A client that polls the issued task id on a fresh connection after a
+// restart therefore always finds the state on disk.
+
+// createAcceptedTasksSQL owns the WAL-before-reply task state table. As with
+// the other on-first-use tables in this file, the card adds no migration file;
+// the table is created inside the same write transaction as the first state.
+// One row per task id is enough: the current state and the fact that the task
+// was accepted live in the file, so a poll after restart finds it by id.
+const createAcceptedTasksSQL = `
+CREATE TABLE IF NOT EXISTS accepted_tasks (
+  task_id    TEXT PRIMARY KEY,
+  payload    BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`
+
+// AcceptTask writes taskID's state to the WAL, then invokes reply exactly once.
+// reply is the "accepted" response the CLI sends to the client. It runs after
+// d.Write has committed and returned, so the committed row is already visible
+// to any other connection, including a restarted process polling the issued
+// id, before the client is told the task was accepted. reply is never called
+// inside the write transaction and is not called at all when the write fails.
+// A repeat with the same task id updates the row in place and never creates a
+// second task. Payload is redacted before it reaches the file (ADR 0012).
+func (d *DB) AcceptTask(ctx context.Context, taskID string, state []byte, reply func() error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if strings.TrimSpace(taskID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: accept: empty task id")
+	}
+	if reply == nil {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: accept: nil reply")
+	}
+	clean := Redact(state)
+	if err := d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, createAcceptedTasksSQL); err != nil {
+			return fmt.Errorf("store: accept: create table: %w", err)
+		}
+		now := time.Now().UTC().UnixNano()
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO accepted_tasks (task_id, payload, created_at, updated_at)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(task_id) DO UPDATE SET
+			  payload    = excluded.payload,
+			  updated_at = excluded.updated_at`,
+			taskID, clean, now, now)
+		if err != nil {
+			return fmt.Errorf("store: accept: write state: %w", err)
+		}
+		return nil
+	}); err != nil {
+		// The WAL did not commit. No "accepted" reply may reach the client.
+		return err
+	}
+	// WAL committed. Only now may the client be told the task was accepted.
+	return reply()
+}
+
+// AcceptedState is one committed task state read from the WAL. Payload is the
+// redacted bytes stored by AcceptTask; UpdatedAt is the last commit time.
+type AcceptedState struct {
+	TaskID    string
+	Payload   []byte
+	CreatedAt int64
+	UpdatedAt int64
+}
+
+// AcceptedTask reads a task's state by the id issued to the client. It uses
+// the separate read pool, so a restarted process finds the committed state
+// without waiting on the writer (ADR 0041 §4). found=false means the id is not
+// on disk, so the client must not treat the task as accepted.
+func (d *DB) AcceptedTask(taskID string) (AcceptedState, bool, error) {
+	return acceptedTask(context.Background(), d.readDB, taskID)
+}
+
+// acceptedTask reads through an arbitrary connection. Tests pass a fresh pool
+// on the same file to model a restart without opening a second full DB.
+func acceptedTask(ctx context.Context, db *sql.DB, taskID string) (AcceptedState, bool, error) {
+	if strings.TrimSpace(taskID) == "" {
+		return AcceptedState{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: accept: empty task id")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ok, err := tableExists(ctx, db, "accepted_tasks")
+	if err != nil || !ok {
+		return AcceptedState{}, false, err
+	}
+	var s AcceptedState
+	err = db.QueryRowContext(ctx, `
+		SELECT task_id, payload, created_at, updated_at FROM accepted_tasks WHERE task_id = ?`, taskID,
+	).Scan(&s.TaskID, &s.Payload, &s.CreatedAt, &s.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AcceptedState{}, false, nil
+	}
+	if err != nil {
+		return AcceptedState{}, false, err
+	}
+	return s, true, nil
+}
+
+// AcceptedTaskCount returns the number of committed accepted tasks. A repeat
+// of the same id must not increase it.
+func (d *DB) AcceptedTaskCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "accepted_tasks")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM accepted_tasks`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
