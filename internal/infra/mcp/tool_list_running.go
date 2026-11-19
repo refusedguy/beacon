@@ -3,7 +3,10 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"strconv"
+	"sync"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -57,15 +60,24 @@ func (f *ListRunningFilters) matches(w domain.Watch) bool {
 	return true
 }
 
-// ListRunningInput is the input of beacon_list_running. Filters are optional.
+// ListRunningInput is the input of beacon_list_running. Filters and Cursor are
+// optional: an empty Cursor selects every current event (ADR 0025).
 type ListRunningInput struct {
 	Filters *ListRunningFilters `json:"filters,omitempty" jsonschema:"optional filter on running watches"`
+	Cursor  string              `json:"cursor,omitempty" jsonschema:"opaque cursor from a previous response"`
 }
 
 // ListRunningHandler implements beacon_list_running over the read-only
-// snapshot port. It holds no writer, so the handler cannot mutate state.
+// snapshot port. It holds no writer, so the handler cannot mutate Beacon state.
+// Alongside the reader it keeps only an event cursor and the terminal verdict
+// (ADR 0025): no stream history is retained.
 type ListRunningHandler struct {
 	reader SnapshotReader
+
+	mu              sync.Mutex
+	cursor          uint64
+	terminalStatus  string
+	terminalVerdict string
 }
 
 // NewListRunningHandler builds the handler. Pass handler.Handle to
@@ -74,10 +86,55 @@ func NewListRunningHandler(reader SnapshotReader) *ListRunningHandler {
 	return &ListRunningHandler{reader: reader}
 }
 
-// Handle reads a snapshot and projects it onto counts and a watch array. Every
-// counter is derived from the returned array, so counts stay consistent with
-// watches for any filter.
+// encodeEventCursor turns a monotonic event position into an opaque string
+// suitable for Last-Event-ID. Clients never have to interpret it.
+func encodeEventCursor(seq uint64) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatUint(seq, 10)))
+}
+
+// decodeEventCursor reverses encodeEventCursor. An empty cursor means "from
+// the beginning" and decodes to zero; a malformed value is an input error.
+func decodeEventCursor(s string) (uint64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid cursor: %w", err)
+	}
+	seq, err := strconv.ParseUint(string(raw), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid cursor: %w", err)
+	}
+	return seq, nil
+}
+
+// aggregateStatus returns the lifecycle status implied by the observed events.
+// A terminal watch wins over notifying, which wins over watching.
+func aggregateStatus(events []WatchEvent) string {
+	status := string(domain.StatusWatching)
+	for _, ev := range events {
+		if ev.Status == string(domain.StatusClosed) {
+			return ev.Status
+		}
+		if ev.Status == string(domain.StatusNotifying) {
+			status = ev.Status
+		}
+	}
+	return status
+}
+
+// Handle reads a snapshot and projects it onto counts, a watch array and a
+// cursor-delimited event stream. Every counter is derived from the returned
+// array, so counts stay consistent with watches for any filter. With an empty
+// input cursor the read is stateless and returns every current event; with a
+// cursor it returns only events newer than that position (ADR 0025).
 func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, in ListRunningInput) (*mcpsdk.CallToolResult, ListRunningOutput, error) {
+	from, err := decodeEventCursor(in.Cursor)
+	if err != nil {
+		return nil, ListRunningOutput{}, domain.NewAppError(domain.CodeInvalidInput, err.Error())
+	}
+
 	snap, err := h.reader.Snapshot()
 	if err != nil {
 		return nil, ListRunningOutput{}, fmt.Errorf("beacon_list_running: %w", err)
@@ -98,6 +155,55 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 		subscribers += len(w.Subscribers)
 	}
 
+	// Events are a position-indexed view over the snapshot. Seq is the 1-based
+	// position, so a cursor stays opaque to clients yet stable within one
+	// stream. No event history is stored between calls.
+	events := make([]WatchEvent, 0, len(snap.ActiveWatches))
+	terminalStatus, terminalVerdict := "", ""
+	for i, w := range snap.ActiveWatches {
+		ev := WatchEvent{
+			Seq:     uint64(i + 1),
+			WatchID: w.ID,
+			Status:  string(w.Status),
+			Verdict: string(w.Verdict),
+		}
+		events = append(events, ev)
+		if terminalVerdict == "" && w.Status == domain.StatusClosed {
+			terminalStatus = string(w.Status)
+			terminalVerdict = string(w.Verdict)
+		}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Remember only the cursor and the terminal verdict, never the history.
+	if terminalVerdict != "" {
+		h.terminalStatus = terminalStatus
+		h.terminalVerdict = terminalVerdict
+	}
+
+	newEvents := make([]WatchEvent, 0, len(events))
+	if in.Cursor == "" {
+		// Stateless full read: every current event, no cursor state consumed.
+		newEvents = append(newEvents, events...)
+	} else {
+		// A cursor call returns only events past the client cursor and past the
+		// last delivered position, so a reconnect never replays old events.
+		floor := from
+		if h.cursor > floor {
+			floor = h.cursor
+		}
+		for _, ev := range events {
+			if ev.Seq > floor {
+				newEvents = append(newEvents, ev)
+			}
+		}
+		if uint64(len(events)) > h.cursor {
+			h.cursor = uint64(len(events))
+		}
+	}
+
 	out := ListRunningOutput{
 		Counts: WatchCounts{
 			Watches:     len(watches),
@@ -105,6 +211,16 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 			Subscribers: subscribers,
 		},
 		Watches: watches,
+		Status:  aggregateStatus(events),
+		Cursor:  encodeEventCursor(uint64(len(events))),
+		Events:  newEvents,
 	}
+
+	if h.terminalVerdict != "" {
+		out.Status = h.terminalStatus
+		out.Verdict = h.terminalVerdict
+		out.Events = nil
+	}
+
 	return &mcpsdk.CallToolResult{}, out, nil
 }

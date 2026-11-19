@@ -68,10 +68,29 @@ type WatchCounts struct {
 	Subscribers int            `json:"subscribers"`
 }
 
-// ListRunningOutput is the response of beacon_list_running.
+// WatchEvent is one item in a cursor-delivered event stream. Seq is a
+// monotonic, opaque position the client passes back as the cursor. The event
+// carries only identifiers and the latest status and verdict, never the full
+// check history (ADR 0025).
+type WatchEvent struct {
+	Seq     uint64 `json:"seq"`
+	WatchID string `json:"watchID"`
+	Status  string `json:"status"`
+	Verdict string `json:"verdict"`
+}
+
+// ListRunningOutput is the response of beacon_list_running. Status and Cursor
+// replace a replayed history: a subscriber that lost its connection continues
+// from Cursor and receives only WatchEvent values newer than it. Once Status
+// is terminal, Verdict is set and Events is empty, so the verdict is obtained
+// without replaying old events (ADR 0025).
 type ListRunningOutput struct {
 	Counts  WatchCounts    `json:"counts"`
 	Watches []domain.Watch `json:"watches"`
+	Status  string         `json:"status"`
+	Cursor  string         `json:"cursor"`
+	Events  []WatchEvent   `json:"events,omitempty"`
+	Verdict string         `json:"verdict,omitempty"`
 }
 
 // OKOutput is the response of beacon_ack and beacon_cancel_watch.
