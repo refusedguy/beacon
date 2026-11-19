@@ -544,3 +544,137 @@ func TestGradeResultIsSeparateFromDelivery(t *testing.T) {
 	_, err = h.GradeResult(context.Background(), "missing", DefaultResultRubric(), 0, false)
 	assertCode(t, err, domain.CodeWatchNotFound)
 }
+
+// TestGradeExternalActionLostResponseIsIndeterminate is the ADR 0039 §5
+// acceptance: a performed external action whose answer was lost is
+// indeterminate even when every rubric criterion would otherwise pass. The
+// outcome carries the durable lease key and never a ready verdict.
+func TestGradeExternalActionLostResponseIsIndeterminate(t *testing.T) {
+	w := greenWatch()
+	lease := domain.ObligationKey(w.ID, w.Revision, "session-L")
+
+	lost := gradeExternalAction(w, DefaultResultRubric(), 0, true, true, lease)
+	if lost.Outcome != OutcomeIndeterminate {
+		t.Fatalf("outcome = %q, want %q", lost.Outcome, OutcomeIndeterminate)
+	}
+	if lost.ReadyVerdict != "" {
+		t.Errorf("readyVerdict = %q, want empty for an unknown effect", lost.ReadyVerdict)
+	}
+	if lost.LeaseKey != lease {
+		t.Errorf("leaseKey = %q, want %q", lost.LeaseKey, lease)
+	}
+	if len(lost.Criteria) != 1 || lost.Criteria[0].Criterion != CriterionExternalActionResponse || lost.Criteria[0].Passed {
+		t.Fatalf("criteria = %+v, want one failing external_action_response", lost.Criteria)
+	}
+
+	// The same watch with the answer received is still honestly satisfied and
+	// ready. The two outcomes must not collapse into each other.
+	answered := gradeExternalAction(w, DefaultResultRubric(), 0, true, false, lease)
+	if answered.Outcome != OutcomeSatisfied || answered.ReadyVerdict != domain.VerdictReady {
+		t.Fatalf("answered outcome = %q verdict = %q, want satisfied/ready", answered.Outcome, answered.ReadyVerdict)
+	}
+	if answered.LeaseKey != "" {
+		t.Errorf("answered leaseKey = %q, want empty", answered.LeaseKey)
+	}
+}
+
+// TestGradeExternalActionLostResponseNeverRetries proves a lost answer is not
+// laundered into a retry or a failure when the iteration budget is spent, and
+// that an action which never reached the outside world is not indeterminate.
+func TestGradeExternalActionLostResponseNeverRetries(t *testing.T) {
+	w := greenWatch()
+	rubric := DefaultResultRubric()
+
+	lost := gradeExternalAction(w, rubric, maxOutcomeIterations+5, true, true, "lease-1")
+	if lost.Outcome != OutcomeIndeterminate {
+		t.Fatalf("outcome = %q, want %q at any iteration", lost.Outcome, OutcomeIndeterminate)
+	}
+	if lost.Outcome == OutcomeMaxIterationsReached || lost.Outcome == OutcomeFailed || lost.Outcome == OutcomeNeedsRevision {
+		t.Errorf("lost answer turned into a retry or failure: %q", lost.Outcome)
+	}
+
+	notPerformed := gradeExternalAction(w, rubric, 0, false, true, "lease-1")
+	if notPerformed.Outcome == OutcomeIndeterminate {
+		t.Errorf("no external action gave indeterminate: %q", notPerformed.Outcome)
+	}
+}
+
+// TestDeliveryIndeterminateIsNotTaskIndeterminate guards the ADR 0017 boundary.
+// An obligation carrying a delivery-ladder indeterminate attempt does not make
+// the task result indeterminate; only a lost response after a performed action
+// does that.
+func TestDeliveryIndeterminateIsNotTaskIndeterminate(t *testing.T) {
+	w := greenWatch()
+	o := resultObligation(w, "session-D")
+	o.Attempts = []domain.Attempt{{N: 1, Outcome: domain.OutcomeIndeterminate, At: time.Now()}}
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	h := NewGetResultHandler(store, newRecordingStamper(), &stepClock{t: time.Now()})
+
+	deliveryOnly, err := h.GradeExternalAction(context.Background(), w.ID, DefaultResultRubric(), 0, true, false, o.ID)
+	if err != nil {
+		t.Fatalf("GradeExternalAction: %v", err)
+	}
+	if deliveryOnly.Outcome != OutcomeSatisfied || deliveryOnly.ReadyVerdict != domain.VerdictReady {
+		t.Fatalf("delivery indeterminate changed the task outcome: %+v", deliveryOnly)
+	}
+
+	lost, err := h.GradeExternalAction(context.Background(), w.ID, DefaultResultRubric(), 0, true, true, o.ID)
+	if err != nil {
+		t.Fatalf("GradeExternalAction lost: %v", err)
+	}
+	if lost.Outcome != OutcomeIndeterminate || lost.LeaseKey != o.ID {
+		t.Fatalf("lost outcome = %+v, want indeterminate with lease %q", lost, o.ID)
+	}
+
+	if _, err := h.GradeExternalAction(context.Background(), "", DefaultResultRubric(), 0, true, true, o.ID); err == nil {
+		t.Error("empty watchID was accepted")
+	}
+	if _, err := h.GradeExternalAction(context.Background(), "missing", DefaultResultRubric(), 0, true, true, o.ID); err == nil {
+		t.Error("missing watch was accepted")
+	}
+}
+
+// TestGetResultKeepsLeaseKeyAndFieldOrder proves ADR 0036 §2 is untouched: the
+// new outcome value adds no field and reorders none of the get_result response.
+func TestGetResultKeepsLeaseKeyAndFieldOrder(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	o := resultObligation(w, "session-K")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+
+	out, err := h.Result(context.Background(), sessionReq("session-K"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if out.ObligationID != domain.ObligationKey(w.ID, w.Revision, "session-K") {
+		t.Errorf("obligationID = %q, want the durable lease key", out.ObligationID)
+	}
+
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal output: %v", err)
+	}
+	wantOrder := []string{"status", "verdict", "revision", "merge", "failedChecks", "obligationID", "retryBudget"}
+	last := -1
+	for _, field := range wantOrder {
+		at := strings.Index(string(raw), `"`+field+`":`)
+		if at <= last {
+			t.Fatalf("field %q missing or out of order in %s", field, raw)
+		}
+		last = at
+	}
+}
