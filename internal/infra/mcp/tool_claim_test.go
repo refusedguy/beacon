@@ -370,3 +370,237 @@ func TestFencingTokenFutureRejected(t *testing.T) {
 		t.Fatalf("release with future token: err = %v, want stale fencing token", err)
 	}
 }
+
+// TestLeaseInvalidatedAfterSourceRestored is the acceptance of ADR 0038 p1 and
+// T3.53: after the source is restored, the old lease cannot continue the task
+// even when the same owner returns with a still-current fencing token. Only a
+// new lease can change the task again.
+func TestLeaseInvalidatedAfterSourceRestored(t *testing.T) {
+	h := NewClaimHandler()
+	ctx := context.Background()
+
+	lease, err := h.Claim(ctx, ClaimInput{TaskID: "T-r", OwnerID: "alice", IdempotencyKey: "r1"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if lease.SourceEpoch == 0 {
+		t.Fatal("claim source epoch must be positive")
+	}
+
+	recovered, err := h.Recover(ctx)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if recovered.SourceEpoch <= lease.SourceEpoch {
+		t.Fatalf("recovered epoch = %d, want > %d", recovered.SourceEpoch, lease.SourceEpoch)
+	}
+
+	_, err = h.Release(ctx, ReleaseInput{
+		TaskID:       "T-r",
+		OwnerID:      "alice",
+		FencingToken: lease.FencingToken,
+		SourceEpoch:  lease.SourceEpoch,
+	})
+	if !IsLeaseInvalidated(err) {
+		t.Fatalf("stale lease release: err = %v, want lease invalidated", err)
+	}
+	if IsStaleFencingToken(err) {
+		t.Fatalf("stale lease release: err = %v, must not be a fencing-token error", err)
+	}
+	var invalid *LeaseInvalidatedError
+	if !errors.As(err, &invalid) {
+		t.Fatalf("err = %v, want *LeaseInvalidatedError", err)
+	}
+	if invalid.LeaseEpoch != lease.SourceEpoch || invalid.SourceEpoch != recovered.SourceEpoch {
+		t.Fatalf("invalidated = %+v, want lease epoch %d source epoch %d", invalid, lease.SourceEpoch, recovered.SourceEpoch)
+	}
+
+	// The refused call left the state untouched: the stale lease still owns it.
+	if _, err := h.Claim(ctx, ClaimInput{TaskID: "T-r", OwnerID: "bob", IdempotencyKey: "r2"}); !domain.IsRejectDuplicate(err) {
+		t.Fatalf("bob claim after stale release: err = %v, want reject duplicate (state unchanged)", err)
+	}
+
+	// A fresh lease at the restored epoch works; the old one never does.
+	fresh, err := h.Reassign(ctx, ClaimInput{TaskID: "T-r", OwnerID: "alice", IdempotencyKey: "r1"})
+	if err != nil {
+		t.Fatalf("reassign after recovery: %v", err)
+	}
+	if fresh.SourceEpoch != recovered.SourceEpoch {
+		t.Fatalf("fresh epoch = %d, want %d", fresh.SourceEpoch, recovered.SourceEpoch)
+	}
+	if fresh.FencingToken <= lease.FencingToken {
+		t.Fatalf("fresh token = %d, want > %d", fresh.FencingToken, lease.FencingToken)
+	}
+	if _, err := h.Release(ctx, ReleaseInput{
+		TaskID:       "T-r",
+		OwnerID:      "alice",
+		FencingToken: fresh.FencingToken,
+		SourceEpoch:  fresh.SourceEpoch,
+	}); err != nil {
+		t.Fatalf("release with fresh lease: %v", err)
+	}
+}
+
+// TestStaleLeaseInvalidWithCurrentFencingToken checks that invalidation is
+// detected at the store even when the caller pins no source epoch. The fencing
+// token is still the task's current one, so only the crash fact rejects the
+// release.
+func TestStaleLeaseInvalidWithCurrentFencingToken(t *testing.T) {
+	h := NewClaimHandler()
+	ctx := context.Background()
+
+	lease, err := h.Claim(ctx, ClaimInput{TaskID: "T-i", OwnerID: "alice", IdempotencyKey: "i1"})
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if _, err := h.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	_, err = h.Release(ctx, ReleaseInput{TaskID: "T-i", OwnerID: "alice", FencingToken: lease.FencingToken})
+	if !IsLeaseInvalidated(err) {
+		t.Fatalf("release with current token after crash: err = %v, want lease invalidated", err)
+	}
+	if IsStaleFencingToken(err) {
+		t.Fatalf("release with current token after crash: err = %v, must not be a fencing-token error", err)
+	}
+}
+
+// TestClaimAfterRecoveryTakesNewLease shows the remedy: the returning owner
+// takes a new lease, idempotent retries keep that new lease, and the old token
+// then fails under the T3.51 fencing check inside the new epoch.
+func TestClaimAfterRecoveryTakesNewLease(t *testing.T) {
+	h := NewClaimHandler()
+	ctx := context.Background()
+
+	first, err := h.Claim(ctx, ClaimInput{TaskID: "T-a", OwnerID: "alice", IdempotencyKey: "a1"})
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if _, err := h.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+
+	second, err := h.Claim(ctx, ClaimInput{TaskID: "T-a", OwnerID: "alice", IdempotencyKey: "a1"})
+	if err != nil {
+		t.Fatalf("re-claim after recovery: %v", err)
+	}
+	if second.SourceEpoch <= first.SourceEpoch {
+		t.Fatalf("new epoch = %d, want > %d", second.SourceEpoch, first.SourceEpoch)
+	}
+	if second.FencingToken <= first.FencingToken {
+		t.Fatalf("new token = %d, want > %d", second.FencingToken, first.FencingToken)
+	}
+
+	again, err := h.Claim(ctx, ClaimInput{TaskID: "T-a", OwnerID: "alice", IdempotencyKey: "a1"})
+	if err != nil {
+		t.Fatalf("retry at new epoch: %v", err)
+	}
+	if again != second {
+		t.Fatalf("retry = %+v, want new lease %+v", again, second)
+	}
+
+	if _, err := h.Release(ctx, ReleaseInput{
+		TaskID: "T-a", OwnerID: "alice", FencingToken: first.FencingToken,
+	}); !IsStaleFencingToken(err) {
+		t.Fatalf("old token after new lease: err = %v, want stale fencing token", err)
+	}
+	if _, err := h.Release(ctx, ReleaseInput{
+		TaskID:       "T-a",
+		OwnerID:      "alice",
+		FencingToken: second.FencingToken,
+		SourceEpoch:  second.SourceEpoch,
+	}); err != nil {
+		t.Fatalf("release with new lease: %v", err)
+	}
+}
+
+// TestRecoveryAdvancesEpochMonotonically checks that each recovery installs a
+// strictly higher source epoch, so leases from every earlier generation are
+// invalidated in order.
+func TestRecoveryAdvancesEpochMonotonically(t *testing.T) {
+	h := NewClaimHandler()
+	ctx := context.Background()
+
+	first, err := h.Recover(ctx)
+	if err != nil {
+		t.Fatalf("first recover: %v", err)
+	}
+	second, err := h.Recover(ctx)
+	if err != nil {
+		t.Fatalf("second recover: %v", err)
+	}
+	if second.SourceEpoch <= first.SourceEpoch {
+		t.Fatalf("second epoch = %d, want > %d", second.SourceEpoch, first.SourceEpoch)
+	}
+}
+
+// TestFencingTokenAndSourceEpochCoexist checks that invalidation is a separate
+// fact from the lease number: a reassignment still produces a stale-token
+// rejection inside one epoch, while recovery produces a lease-invalidation
+// rejection for a token that is otherwise current.
+func TestFencingTokenAndSourceEpochCoexist(t *testing.T) {
+	h := NewClaimHandler()
+	ctx := context.Background()
+
+	alice, err := h.Claim(ctx, ClaimInput{TaskID: "T-c", OwnerID: "alice", IdempotencyKey: "c1"})
+	if err != nil {
+		t.Fatalf("alice claim: %v", err)
+	}
+	bob, err := h.Reassign(ctx, ClaimInput{TaskID: "T-c", OwnerID: "bob", IdempotencyKey: "c2"})
+	if err != nil {
+		t.Fatalf("reassign to bob: %v", err)
+	}
+	if _, err := h.Release(ctx, ReleaseInput{
+		TaskID: "T-c", OwnerID: "alice", FencingToken: alice.FencingToken,
+	}); !IsStaleFencingToken(err) {
+		t.Fatalf("lagging alice after reassign: err = %v, want stale fencing token", err)
+	}
+
+	if _, err := h.Recover(ctx); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	carol, err := h.Reassign(ctx, ClaimInput{TaskID: "T-c", OwnerID: "carol", IdempotencyKey: "c3"})
+	if err != nil {
+		t.Fatalf("reassign to carol after recovery: %v", err)
+	}
+	if carol.SourceEpoch <= bob.SourceEpoch {
+		t.Fatalf("carol epoch = %d, want > %d", carol.SourceEpoch, bob.SourceEpoch)
+	}
+	if carol.FencingToken <= bob.FencingToken {
+		t.Fatalf("carol token = %d, want > %d", carol.FencingToken, bob.FencingToken)
+	}
+
+	if _, err := h.Release(ctx, ReleaseInput{
+		TaskID:       "T-c",
+		OwnerID:      "bob",
+		FencingToken: bob.FencingToken,
+		SourceEpoch:  bob.SourceEpoch,
+	}); !IsLeaseInvalidated(err) {
+		t.Fatalf("bob after recovery: err = %v, want lease invalidated", err)
+	}
+	if _, err := h.Release(ctx, ReleaseInput{
+		TaskID:       "T-c",
+		OwnerID:      "carol",
+		FencingToken: carol.FencingToken,
+		SourceEpoch:  carol.SourceEpoch,
+	}); err != nil {
+		t.Fatalf("carol release with fresh lease: %v", err)
+	}
+}
+
+// TestRecoverIsNotAClientTool keeps recovery a kernel decision: it must not be
+// registered as an MCP tool, so the client-facing tool set stays unchanged.
+func TestRecoverIsNotAClientTool(t *testing.T) {
+	server := NewServer()
+	AttachClaim(server, NewClaimHandler())
+	session := connectClaimServer(t, server)
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == "beacon_recover" {
+			t.Fatal("beacon_recover must not be registered as a client tool")
+		}
+	}
+}
