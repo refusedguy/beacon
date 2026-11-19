@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/github"
 )
 
 const createReceiptsSQL = `
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   at            INTEGER NOT NULL,
   raw           BLOB NOT NULL,
   imported_at   INTEGER NOT NULL,
+  source        TEXT NOT NULL DEFAULT '',
   UNIQUE (obligation_id, attempt)
 );
 CREATE INDEX IF NOT EXISTS receipts_by_obligation ON receipts(obligation_id, seq);
@@ -50,6 +52,12 @@ type Receipt struct {
 	Attempt      int                   `json:"attempt"`
 	Outcome      domain.AttemptOutcome `json:"outcome"`
 	At           time.Time             `json:"at"`
+
+	// Source is the explicit, typed place the result was read from: a branch,
+	// a PR or a file in a worktree (ADR 0027). It is validated on import, so
+	// no private agent log path can enter the receipts table. Older lines
+	// without a source keep the zero value and still import.
+	Source github.ArtifactSource `json:"source"`
 }
 
 // UnmarshalJSON parses and validates one receipt line. An unrecognized
@@ -61,6 +69,7 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 		Attempt      json.Number     `json:"attempt"`
 		Outcome      string          `json:"outcome"`
 		At           json.RawMessage `json:"at"`
+		Source       json.RawMessage `json:"source"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -96,6 +105,11 @@ func (r *Receipt) UnmarshalJSON(data []byte) error {
 	r.At, err = parseReceiptTime(wire.At)
 	if err != nil {
 		return err
+	}
+	if len(wire.Source) > 0 && !bytes.Equal(bytes.TrimSpace(wire.Source), []byte("null")) {
+		if err := json.Unmarshal(wire.Source, &r.Source); err != nil {
+			return fmt.Errorf("receipt: bad source: %w", err)
+		}
 	}
 	return nil
 }
@@ -181,6 +195,9 @@ func (d *DB) ImportReceipts(path string) (ImportReceiptsResult, error) {
 		if _, err := tx.Exec(createReceiptsSQL); err != nil {
 			return fmt.Errorf("store: receipts: create table: %w", err)
 		}
+		if err := ensureReceiptSourceColumn(tx); err != nil {
+			return err
+		}
 		for _, e := range entries {
 			inserted, err := insertReceipt(tx, e.receipt, e.raw)
 			if err != nil {
@@ -234,15 +251,61 @@ func splitCompleteLines(data []byte) ([][]byte, bool) {
 	return lines, partial
 }
 
+// ensureReceiptSourceColumn adds the source column to a receipts table made
+// by an earlier build. The table is created on first use here, so its additive
+// upgrade belongs here too instead of in the migration corpus.
+func ensureReceiptSourceColumn(tx *sql.Tx) error {
+	rows, err := tx.Query(`PRAGMA table_info(receipts)`)
+	if err != nil {
+		return fmt.Errorf("store: receipts: table info: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid      int
+			name     string
+			typ      string
+			notNull  int
+			defaultV any
+			primary  int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultV, &primary); err != nil {
+			return fmt.Errorf("store: receipts: scan table info: %w", err)
+		}
+		if strings.EqualFold(name, "source") {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: receipts: table info rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: receipts: close table info: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE receipts ADD COLUMN source TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("store: receipts: add source column: %w", err)
+	}
+	return nil
+}
+
 // insertReceipt stores a receipt only when the idempotency pair is new. The
 // RowsAffected result decides whether the obligation gets a second effect.
+// Only a validated artifact source is stored; no agent log path reaches here.
 func insertReceipt(tx *sql.Tx, r Receipt, raw []byte) (bool, error) {
+	source := ""
+	if r.Source.Kind != "" {
+		encoded, err := json.Marshal(r.Source)
+		if err != nil {
+			return false, fmt.Errorf("store: receipts: encode source: %w", err)
+		}
+		source = string(encoded)
+	}
 	res, err := tx.Exec(`
 		INSERT OR IGNORE INTO receipts
-		  (obligation_id, attempt, outcome, at, raw, imported_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
+		  (obligation_id, attempt, outcome, at, raw, imported_at, source)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		r.ObligationID, r.Attempt, string(r.Outcome), r.At.UnixNano(),
-		Redact(raw), time.Now().UTC().UnixNano())
+		Redact(raw), time.Now().UTC().UnixNano(), source)
 	if err != nil {
 		return false, fmt.Errorf("store: receipts: insert: %w", err)
 	}
@@ -311,7 +374,7 @@ func (d *DB) Receipts(obligationID string) ([]Receipt, error) {
 		return nil, err
 	}
 	rows, err := d.readDB.Query(`
-		SELECT obligation_id, attempt, outcome, at FROM receipts
+		SELECT obligation_id, attempt, outcome, at, source FROM receipts
 		WHERE obligation_id = ? ORDER BY seq`, obligationID)
 	if err != nil {
 		return nil, err
@@ -323,11 +386,17 @@ func (d *DB) Receipts(obligationID string) ([]Receipt, error) {
 		var (
 			r      Receipt
 			atNano int64
+			source string
 		)
-		if err := rows.Scan(&r.ObligationID, &r.Attempt, &r.Outcome, &atNano); err != nil {
+		if err := rows.Scan(&r.ObligationID, &r.Attempt, &r.Outcome, &atNano, &source); err != nil {
 			return nil, err
 		}
 		r.At = time.Unix(0, atNano).UTC()
+		if source != "" {
+			if err := json.Unmarshal([]byte(source), &r.Source); err != nil {
+				return nil, fmt.Errorf("store: receipts: decode source: %w", err)
+			}
+		}
 		out = append(out, r)
 	}
 	return out, rows.Err()
