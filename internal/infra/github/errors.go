@@ -11,8 +11,8 @@
 // (ADR 0039 §3, T3.62). Three providers expose different payloads; each
 // adapter keeps its format inside Parse and returns one provider-neutral
 // StatusResult or a structured domain.AppError. Nothing there evaluates a
-// verdict: StatusResult only prepares the Rollup and Failures that the domain
-// verdict engine already reads (T2.15).
+// verdict: StatusResult only prepares the Rollup, Failures and Ship facts that
+// the domain verdict engine already reads (T2.15, ADR 0040 §2).
 package github
 
 import (
@@ -316,20 +316,47 @@ type Check struct {
 	DetailsURL string     `json:"detailsUrl,omitempty"`
 }
 
-// StatusResult is the provider-neutral observation of a CI status. Rollup and
-// Failures are the fields the verdict engine reads from domain.Snapshot;
-// Apply copies them without computing or changing the verdict.
+// StatusResult is the provider-neutral observation of a CI status. Rollup,
+// Failures and Ship are the fields the verdict engine reads from
+// domain.Snapshot; Apply copies them without computing or changing the verdict.
 type StatusResult struct {
 	Rollup   string   `json:"rollup"`
 	Checks   []Check  `json:"checks"`
 	Failures []string `json:"failures"`
 }
 
-// Apply stores the parsed observation in s. It sets only the status-derived
-// fields and leaves verdict evaluation to the domain package.
+// Apply stores the parsed observation in s. It fills the status-derived fields,
+// including the ship facts the ready gate reads (ADR 0040 §2), and leaves the
+// verdict evaluation to the domain package.
 func (r StatusResult) Apply(s *domain.Snapshot) {
 	s.Rollup = r.Rollup
 	s.Failures = append([]string(nil), r.Failures...)
+	s.Ship = shipFactsFromChecks(r.Checks)
+}
+
+// shipFactsFromChecks derives the ship facts from the observed CI checks
+// (ADR 0040 §2, T3.78). It mirrors mcp.shipFactsFromWatch: a fact turns on only
+// for a green check whose name carries the matching role. A failing or missing
+// check leaves its fact false, and Trivial stays false because a status payload
+// carries no explicit triviality signal.
+func shipFactsFromChecks(checks []Check) domain.ShipFacts {
+	var facts domain.ShipFacts
+	for _, c := range checks {
+		if c.State != CheckSuccess {
+			continue
+		}
+		name := strings.ToLower(c.Name)
+		if strings.Contains(name, "build") {
+			facts.Build = true
+		}
+		if strings.Contains(name, "audit") {
+			facts.Audit = true
+		}
+		if strings.Contains(name, "test") {
+			facts.TDD = true
+		}
+	}
+	return facts
 }
 
 // Structured error codes for status parsing. They travel as domain.AppError
