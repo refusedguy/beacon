@@ -578,3 +578,102 @@ func TestReviewVerdictJSON(t *testing.T) {
 		t.Fatalf("json = %s, want %q", b, `"BLOCKED"`)
 	}
 }
+
+// TestShipAllowedTruthTable pins all sixteen combinations of the compiled-in
+// formula ship ⇒ build ∧ audit ∧ (tdd ∨ trivial). The want column is written
+// from the formula by hand so a change to ShipAllowed cannot silently pass.
+func TestShipAllowedTruthTable(t *testing.T) {
+	cases := []struct {
+		name  string
+		facts ShipFacts
+		want  bool
+	}{
+		{"no facts", ShipFacts{}, false},
+		{"trivial alone", ShipFacts{Trivial: true}, false},
+		{"tdd alone", ShipFacts{TDD: true}, false},
+		{"tdd and trivial without gates", ShipFacts{TDD: true, Trivial: true}, false},
+		{"build only", ShipFacts{Build: true}, false},
+		{"build and trivial without audit", ShipFacts{Build: true, Trivial: true}, false},
+		{"build and tdd without audit", ShipFacts{Build: true, TDD: true}, false},
+		{"build tdd trivial without audit", ShipFacts{Build: true, TDD: true, Trivial: true}, false},
+		{"audit only", ShipFacts{Audit: true}, false},
+		{"audit and trivial without build", ShipFacts{Audit: true, Trivial: true}, false},
+		{"audit and tdd without build", ShipFacts{Audit: true, TDD: true}, false},
+		{"audit tdd trivial without build", ShipFacts{Audit: true, TDD: true, Trivial: true}, false},
+		{"build and audit without alt", ShipFacts{Build: true, Audit: true}, false},
+		{"build audit trivial", ShipFacts{Build: true, Audit: true, Trivial: true}, true},
+		{"build audit tdd", ShipFacts{Build: true, Audit: true, TDD: true}, true},
+		{"all facts", ShipFacts{Build: true, Audit: true, TDD: true, Trivial: true}, true},
+	}
+	if len(cases) != 16 {
+		t.Fatalf("truth table must have 16 rows, got %d", len(cases))
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ShipAllowed(tc.facts); got != tc.want {
+				t.Fatalf("ShipAllowed(%+v) = %v, want %v", tc.facts, got, tc.want)
+			}
+		})
+	}
+}
+
+// The rule is a pure function: the same facts give the same verdict on every
+// call, with no external state that could be tuned between calls.
+func TestShipAllowedDeterministic(t *testing.T) {
+	facts := ShipFacts{Build: true, Audit: true, TDD: true}
+	want := ShipAllowed(facts)
+	for i := 0; i < 10; i++ {
+		if got := ShipAllowed(facts); got != want {
+			t.Fatalf("call %d = %v, want %v", i, got, want)
+		}
+	}
+	if !want {
+		t.Fatal("a change with build, audit and tdd must ship")
+	}
+}
+
+// Trivial is an explicit condition in code, not a free opinion that can
+// override a failed gate. It substitutes for TDD only, never for build or
+// audit.
+func TestShipAllowedTrivialDoesNotOverrideGates(t *testing.T) {
+	cases := []struct {
+		name  string
+		facts ShipFacts
+		want  bool
+	}{
+		{"trivial cannot replace build", ShipFacts{Audit: true, Trivial: true}, false},
+		{"trivial cannot replace audit", ShipFacts{Build: true, Trivial: true}, false},
+		{"trivial replaces tdd only", ShipFacts{Build: true, Audit: true, Trivial: true}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ShipAllowed(tc.facts); got != tc.want {
+				t.Fatalf("ShipAllowed(%+v) = %v, want %v", tc.facts, got, tc.want)
+			}
+		})
+	}
+}
+
+// The formula cannot be configured: its only input is ShipFacts of four bool
+// facts and it returns a single bool. There is no policy, config or prompt
+// parameter to dispute the rule with, and ShipFacts carries no config field.
+func TestShipAllowedHasNoConfigurationInput(t *testing.T) {
+	fn := reflect.TypeOf(ShipAllowed)
+	if fn.NumIn() != 1 || fn.In(0) != reflect.TypeOf(ShipFacts{}) {
+		t.Fatalf("ShipAllowed input = %v, want exactly one ShipFacts", fn)
+	}
+	if fn.NumOut() != 1 || fn.Out(0) != reflect.TypeOf(true) {
+		t.Fatalf("ShipAllowed output = %v, want exactly one bool", fn)
+	}
+
+	facts := reflect.TypeOf(ShipFacts{})
+	if facts.NumField() != 4 {
+		t.Fatalf("ShipFacts has %d fields, want 4", facts.NumField())
+	}
+	boolType := reflect.TypeOf(true)
+	for i := 0; i < facts.NumField(); i++ {
+		if facts.Field(i).Type != boolType {
+			t.Errorf("ShipFacts.%s = %v, want bool", facts.Field(i).Name, facts.Field(i).Type)
+		}
+	}
+}
