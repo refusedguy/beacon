@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
@@ -731,5 +733,142 @@ func TestPlanLaunchBadInput(t *testing.T) {
 	}
 	if err := e.svc.PlanLaunch(); err != nil {
 		t.Errorf("PlanLaunch без карточек дал %v", err)
+	}
+}
+
+// ---- ADR 0037 п2 / T3.48: возврат по событию, не по таймауту опроса ----
+
+func TestAwaitResultReturnsOnResultNotTick(t *testing.T) {
+	events := make(chan WaitEvent, 3)
+	events <- WaitEvent{Kind: WaitEventTick, WatchID: "watch-1", Revision: 7, Status: "watching", Verdict: "watching"}
+	events <- WaitEvent{Kind: WaitEventTick, WatchID: "watch-1", Revision: 8, Status: "watching", Verdict: "watching"}
+	events <- WaitEvent{Kind: WaitEventResult, WatchID: "watch-1", Revision: 9, Status: "notifying", Verdict: "ready"}
+	close(events)
+
+	out := AwaitResult(events, 5000)
+	if out.Cause != WaitEventResult {
+		t.Fatalf("причина возврата = %q, ждали result", out.Cause)
+	}
+	if out.Revision != 9 || out.Verdict != "ready" || out.Status != "notifying" || out.WatchID != "watch-1" {
+		t.Fatalf("исход не несёт завершающее событие: %+v", out)
+	}
+	if out.PollAfterMs != 5000 {
+		t.Fatalf("pollAfterMs = %d, ждали 5000", out.PollAfterMs)
+	}
+}
+
+func TestAwaitResultReturnsAtApprovalBoundary(t *testing.T) {
+	events := make(chan WaitEvent, 3)
+	events <- WaitEvent{Kind: WaitEventTick, WatchID: "watch-1", Revision: 4, Status: "watching", Verdict: "watching"}
+	events <- WaitEvent{Kind: WaitEventWatch, WatchID: "watch-1", Revision: 5, Status: "notifying", Verdict: "watching"}
+	events <- WaitEvent{Kind: WaitEventApproval, WatchID: "watch-1", Revision: 6, Status: "needs_input", Verdict: "needs_input"}
+	close(events)
+
+	out := AwaitResult(events, 5000)
+	if out.Cause != WaitEventApproval {
+		t.Fatalf("причина возврата = %q, ждали approval", out.Cause)
+	}
+	if out.Revision != 6 || out.Status != "needs_input" {
+		t.Fatalf("исход не несёт границу одобрения: %+v", out)
+	}
+}
+
+func TestWaitStateConsumeTickDoesNotEndWait(t *testing.T) {
+	var st WaitState
+	if out, done := st.Consume(WaitEvent{Kind: WaitEventTick, WatchID: "watch-1", Revision: 7, Status: "watching", Verdict: "watching"}); done {
+		t.Fatalf("тик закончил ожидание: %+v", out)
+	}
+	if out, done := st.Consume(WaitEvent{Kind: WaitEventWatch, WatchID: "watch-1", Revision: 8, Status: "notifying", Verdict: "watching"}); done {
+		t.Fatalf("рабочее обновление закончило ожидание: %+v", out)
+	}
+	if st.Revision != 8 {
+		t.Fatalf("наблюдаемая ревизия = %d, ждали 8", st.Revision)
+	}
+
+	out, done := st.Consume(WaitEvent{Kind: WaitEventResult, WatchID: "watch-1", Revision: 9, Status: "notifying", Verdict: "ready"})
+	if !done || out.Cause != WaitEventResult {
+		t.Fatalf("результат не закончил ожидание: done=%v out=%+v", done, out)
+	}
+	if out.Revision != 9 {
+		t.Fatalf("исход несёт ревизию %d, ждали 9", out.Revision)
+	}
+}
+
+func TestAwaitResultSourceEndedIsNotPollTimeout(t *testing.T) {
+	events := make(chan WaitEvent, 1)
+	events <- WaitEvent{Kind: WaitEventTick, WatchID: "watch-1", Revision: 7, Status: "watching", Verdict: "watching"}
+	close(events)
+
+	out := AwaitResult(events, 5000)
+	if out.Cause != WaitEventSourceEnded {
+		t.Fatalf("причина = %q, ждали source-ended", out.Cause)
+	}
+	if out.Cause == WaitEventTick {
+		t.Fatal("тик опроса не должен быть причиной возврата")
+	}
+}
+
+func TestAwaitWithLadderPreservesMarkers(t *testing.T) {
+	evidence := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	pos := WaitLadderPosition{
+		Outcome:    "transport-failed",
+		Attempts:   2,
+		EvidenceAt: evidence,
+		Stopped:    false,
+	}
+	before := pos
+
+	events := make(chan WaitEvent, 2)
+	events <- WaitEvent{Kind: WaitEventTick, WatchID: "watch-1", Revision: 7, Status: "watching", Verdict: "watching"}
+	events <- WaitEvent{Kind: WaitEventApproval, WatchID: "watch-1", Revision: 8, Status: "needs_input", Verdict: "needs_input"}
+	close(events)
+
+	out, got := AwaitWithLadder(events, pos, 5000)
+	if out.Cause != WaitEventApproval {
+		t.Fatalf("причина = %q, ждали approval", out.Cause)
+	}
+	if !reflect.DeepEqual(got, before) {
+		t.Fatalf("возврат изменил маркеры лестницы: до %+v, после %+v", before, got)
+	}
+	if got.Stopped || got.Attempts != 2 || !got.EvidenceAt.Equal(evidence) {
+		t.Fatalf("лестница сломана: %+v", got)
+	}
+	if !LadderRetries(got.Outcome) {
+		t.Fatal("transport-failed обязан сохранить повтор по ADR 0017")
+	}
+}
+
+func TestLadderRetriesBranches(t *testing.T) {
+	cases := map[string]bool{
+		"posted":           false,
+		"transport-failed": true,
+		"indeterminate":    false,
+	}
+	for outcome, want := range cases {
+		if got := LadderRetries(outcome); got != want {
+			t.Errorf("LadderRetries(%q) = %v, ждали %v", outcome, got, want)
+		}
+	}
+}
+
+func TestWaitOutcomeByteStable(t *testing.T) {
+	out := WaitOutcome{
+		WatchID: "watch-1", Cause: WaitEventResult, Revision: 9,
+		Status: "notifying", Verdict: "ready", PollAfterMs: 5000,
+	}
+	a, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(a) != string(b) {
+		t.Fatalf("байты нестабильны: %s и %s", a, b)
+	}
+	want := `{"watchID":"watch-1","cause":"result","revision":9,"status":"notifying","verdict":"ready","pollAfterMs":5000}`
+	if string(a) != want {
+		t.Fatalf("порядок полей изменился: %s", a)
 	}
 }
