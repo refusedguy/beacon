@@ -39,6 +39,14 @@
 // fact. A trace is never a delivery into the running turn, and falling back
 // never promotes unsupported into success. The ADR 0017 ladder is unchanged.
 //
+// ADR 0041 p5 adds wake_between: when the wait contract names a window, this
+// tool staggers each waiter to a random point inside it before any delivery is
+// attempted. Fifteen agents waiting on one event then wake at spread points
+// instead of all at once. The window comes from the call, not from a per-agent
+// setting; an absent window keeps the immediate wake of earlier callers. This
+// is the wake-up point of a waiter, not the redelivery jitter of ADR 0017 and
+// not the backpressure quota of ADR 0038 p2.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -46,6 +54,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -149,6 +159,13 @@ type WakeInput struct {
 	// AgentDirectory instead of using a name from the call. An empty list keeps
 	// the explicit Target path used by earlier callers.
 	RequiredCapabilities []Capability `json:"requiredCapabilities,omitempty" jsonschema:"capabilities the recipient session must declare; selection is by capability, not by session name"`
+	// WakeBetweenMillis is the wait window, in milliseconds, from the wait
+	// contract (ADR 0041 p5). When positive, this waiter wakes at one random
+	// point inside the window instead of at the same instant as every other
+	// waiter on the same event. Zero or negative keeps the immediate wake of
+	// callers written before ADR 0041. The window is a property of the wait,
+	// never a per-agent setting.
+	WakeBetweenMillis int64 `json:"wakeBetweenMillis,omitempty" jsonschema:"wait window in milliseconds; wake at one random point inside it to spread waiters on the same event; zero means wake immediately"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -246,6 +263,43 @@ type AgentDirectory interface {
 	CandidateAgents(ctx context.Context) []CandidateAgent
 }
 
+// WakeSleeper waits until a chosen point inside the wake window (ADR 0041 p5).
+// It is the narrow seam that lets a test observe the chosen wake points without
+// sleeping. The real implementation uses a timer that honors context
+// cancellation.
+type WakeSleeper interface {
+	Sleep(ctx context.Context, d time.Duration) error
+}
+
+// timerSleeper is the production WakeSleeper. time.NewTimer stops early when
+// the caller's context is cancelled, so a cancelled wait never delivers after
+// the caller has gone away.
+type timerSleeper struct{}
+
+func (timerSleeper) Sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// randomWakePoint picks one uniform point in [0, window) for a waiter. Each
+// call is independent, so fifteen waiters on one event land at spread points.
+// It is the real point picker; tests may call it directly to check the spread.
+func randomWakePoint(window time.Duration) time.Duration {
+	if window <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(window)))
+}
+
 // declaresAll reports whether declared covers every required capability. A
 // session may declare more capabilities than the caller needs.
 func declaresAll(declared, required []Capability) bool {
@@ -290,6 +344,54 @@ type WakeHandler struct {
 	confirmer      ReceiptConfirmer
 	tracer         TaskTracer
 	useFallback    bool
+	sleeper        WakeSleeper
+	point          func(time.Duration) time.Duration
+}
+
+// WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
+// p5). A test injects a recorder to observe the points without sleeping; a nil
+// argument restores the real timer. It does not change delivery ports.
+func (h *WakeHandler) WithWakeSleeper(s WakeSleeper) *WakeHandler {
+	if h != nil {
+		h.sleeper = s
+	}
+	return h
+}
+
+// WithWakePoint replaces the random point picker. A nil argument restores the
+// uniform picker. It exists so a test can pin the point while checking that a
+// handler passes the window's point to the sleeper.
+func (h *WakeHandler) WithWakePoint(fn func(time.Duration) time.Duration) *WakeHandler {
+	if h != nil {
+		h.point = fn
+	}
+	return h
+}
+
+// applyWakeWindow staggers this waiter to a random point inside the window
+// named by the wait contract (ADR 0041 p5). It runs after the boundary checks,
+// so a human interruption or an invalid call never waits. A missing window
+// keeps the immediate wake used by callers before ADR 0041. A cancelled wait
+// returns an error and no delivery is attempted.
+func (h *WakeHandler) applyWakeWindow(ctx context.Context, in WakeInput) error {
+	if in.WakeBetweenMillis <= 0 {
+		return nil
+	}
+	window := time.Duration(in.WakeBetweenMillis) * time.Millisecond
+	pick := randomWakePoint
+	sleeper := WakeSleeper(timerSleeper{})
+	if h != nil {
+		if h.point != nil {
+			pick = h.point
+		}
+		if h.sleeper != nil {
+			sleeper = h.sleeper
+		}
+	}
+	if err := sleeper.Sleep(ctx, pick(window)); err != nil {
+		return domain.NewAppError(domain.CodeCancelled, "wake: waiting inside wake window was cancelled: "+err.Error())
+	}
+	return nil
 }
 
 // NewWakeHandler builds a handler over sender. A nil sender is allowed here and
@@ -419,7 +521,9 @@ func isSuccessDelivery(delivery Delivery) bool {
 // a review (diff comment) can be traced onto its ADR 0014 receipt. Woke is
 // only echoed from the input; no delivery outcome sets it (ADR 0032 p2).
 // Required capabilities are resolved through the directory into a delivery
-// target (ADR 0037 p1); without them the explicit Target still applies.
+// target (ADR 0037 p1); without them the explicit Target still applies. When
+// the wait contract names a window, the wake is staggered to one random point
+// inside it before any sender is touched (ADR 0041 p5).
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -427,6 +531,9 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 	}
 	if setup.refusal != nil {
 		return *setup.refusal, nil
+	}
+	if err := h.applyWakeWindow(ctx, in); err != nil {
+		return WakeOutput{}, err
 	}
 
 	if h == nil || h.sender == nil {
@@ -467,6 +574,8 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 // Wake. The first confirmed channel wins. When no channel is confirmed the
 // message is written to the task trace and the honest delivery stays
 // unsupported; a trace is never reported as a delivery into the running turn.
+// The ADR 0041 p5 stagger runs before the chain so all channels of one waiter
+// share the same wake point.
 func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -474,6 +583,9 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 	}
 	if setup.refusal != nil {
 		return *setup.refusal, nil
+	}
+	if err := h.applyWakeWindow(ctx, in); err != nil {
+		return WakeOutput{}, err
 	}
 	return h.runFallback(ctx, in, setup.target, setup.source), nil
 }
@@ -573,7 +685,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
