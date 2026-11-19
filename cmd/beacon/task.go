@@ -319,7 +319,8 @@ func whyKnownEdge(kind string) bool {
 // проверяли. Это не completion gate с proof из T3.88: здесь нет плана фаз и
 // одобренных proof-объектов, а есть обязательный текстовый ответ воркера на
 // вопрос «что проверяли». Итог не подменяет доказательство, потому что это
-// разные флаги и разные поля карточки.
+// разные флаги и разные поля карточки. Попытка закрыться без доказательства
+// не закрывает карточку, а переводит её в needs_input.
 
 // completionFields это два входа команды завершения.
 type completionFields struct {
@@ -327,21 +328,9 @@ type completionFields struct {
 	evidence string
 }
 
-// validateCompletion отклоняет отчёт без итога или без доказательства. Проверка
-// идёт до захвата замка и до чтения карточки, поэтому отказ не меняет файлы.
-func validateCompletion(f completionFields) error {
-	if strings.TrimSpace(f.evidence) == "" {
-		return taskstore.Validationf("завершение без доказательства отклонено: задайте --evidence")
-	}
-	if strings.TrimSpace(f.summary) == "" {
-		return taskstore.Validationf("завершение без итога отклонено: задайте --summary")
-	}
-	return nil
-}
-
 // runTaskDone завершает карточку только при наличии отдельного поля
-// --evidence. Итог и доказательство пишутся в карточку, маркер needs_input
-// снимается.
+// --evidence. Без доказательства карточка не закрывается: она уходит в
+// needs_input с вопросом, который нужно закрыть перед повторной попыткой.
 func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
 	p, err := parseTaskArgs(argv, map[string]bool{"summary": true, "evidence": true}, nil)
 	if err != nil {
@@ -351,8 +340,9 @@ func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки вида T<g>.<n>"))
 	}
 	report := completionFields{summary: p.value("summary"), evidence: p.value("evidence")}
-	if err := validateCompletion(report); err != nil {
-		return failTask(stderr, err)
+	hasEvidence := strings.TrimSpace(report.evidence) != ""
+	if hasEvidence && strings.TrimSpace(report.summary) == "" {
+		return failTask(stderr, taskstore.Validationf("завершение без итога отклонено: задайте --summary"))
 	}
 	id := p.pos[0]
 
@@ -378,6 +368,15 @@ func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 	}
 	if !taskActive(target.Status) {
 		return failTask(stderr, taskstore.Validationf("карточка %s в статусе %s, завершение неприменимо", id, target.Status))
+	}
+
+	if !hasEvidence {
+		reason := "завершение без доказательства: задайте --evidence"
+		newText := needsInputText(target.Raw, reason)
+		if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+			return failTask(stderr, err)
+		}
+		return failTask(stderr, taskstore.Validationf("завершение без доказательства отклонено: карточка %s переведена в needs_input, задайте --evidence", id))
 	}
 
 	newText := setCardField(target.Raw, "Статус", "done")
@@ -433,9 +432,7 @@ func runTaskNeedsInput(argv []string, stdout, stderr io.Writer, cfg taskcli.Conf
 		return failTask(stderr, taskstore.Validationf("карточка %s в статусе %s, needs_input неприменимо", id, target.Status))
 	}
 
-	newText := setCardField(target.Raw, "Статус", "in_progress")
-	newText = setCardField(newText, "Состояние", "needs_input")
-	newText = setCardField(newText, "Вопрос", question)
+	newText := needsInputText(target.Raw, question)
 	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
 		return failTask(stderr, err)
 	}
@@ -445,6 +442,16 @@ func runTaskNeedsInput(argv []string, stdout, stderr io.Writer, cfg taskcli.Conf
 
 func taskActive(status string) bool {
 	return status == "todo" || status == "in_progress"
+}
+
+// needsInputText переводит карточку в состояние ожидания ввода. Статус
+// остаётся в допустимом множестве ParseCard, поэтому карточка не ломает list
+// и take. Причина пишется отдельным полем Вопрос.
+func needsInputText(raw, reason string) string {
+	newText := setCardField(raw, "Статус", "in_progress")
+	newText = setCardField(newText, "Состояние", "needs_input")
+	newText = setCardField(newText, "Вопрос", reason)
+	return newText
 }
 
 // setCardField меняет значение одного поля карточки. Пустое значение удаляет

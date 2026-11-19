@@ -80,8 +80,6 @@ func TestTaskCommandExitCodesAndStreams(t *testing.T) {
 		{"take без агента", []string{"task", "take", "T2.1"}, 1},
 		{"take без ID", []string{"task", "take"}, 1},
 		{"take с двумя ID", []string{"task", "take", "T2.1", "T2.2"}, 1},
-		{"done без доказательства", []string{"task", "done", "T0.1", "--summary", "готово"}, 1},
-		{"needs-input без вопроса", []string{"task", "needs-input", "T0.1"}, 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -333,24 +331,25 @@ func writeCompletionCard(t *testing.T, dir, id, status string) string {
 }
 
 func TestTaskCommandDoneRejectsMissingEvidence(t *testing.T) {
-	dir := t.TempDir()
-	path := writeCompletionCard(t, dir, "T5.1", "in_progress")
-	before, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
-		name string
-		argv []string
-		want string
+		name   string
+		argv   []string
+		want   string
+		parked bool
 	}{
-		{"без полей", []string{"task", "done", "T5.1"}, "доказательства"},
-		{"только итог", []string{"task", "done", "T5.1", "--summary", "готово"}, "доказательства"},
-		{"пустое доказательство", []string{"task", "done", "T5.1", "--summary", "готово", "--evidence", "   "}, "доказательства"},
-		{"только доказательство", []string{"task", "done", "T5.1", "--evidence", "go test"}, "итога"},
+		{"без полей", []string{"task", "done", "T5.1"}, "доказательства", true},
+		{"только итог", []string{"task", "done", "T5.1", "--summary", "готово"}, "доказательства", true},
+		{"пустое доказательство", []string{"task", "done", "T5.1", "--summary", "готово", "--evidence", "   "}, "доказательства", true},
+		{"только доказательство", []string{"task", "done", "T5.1", "--evidence", "go test"}, "итога", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := writeCompletionCard(t, dir, "T5.1", "in_progress")
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var stdout, stderr bytes.Buffer
 			code := TaskCommandWithConfig(tc.argv, &stdout, &stderr, whyConfig(dir))
 			if code != 1 {
@@ -366,8 +365,28 @@ func TestTaskCommandDoneRejectsMissingEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(after) != string(before) {
-				t.Errorf("карточка изменена при отказе: %q", after)
+			if !tc.parked {
+				if string(after) != string(before) {
+					t.Errorf("карточка изменена при отказе: %q", after)
+				}
+				return
+			}
+			// Отказ без доказательства не закрывает задачу и оставляет её в needs_input.
+			body := string(after)
+			if strings.Contains(body, "Статус: done") {
+				t.Errorf("задача закрыта без доказательства: %q", body)
+			}
+			for _, want := range []string{"Статус: in_progress", "Состояние: needs_input", "--evidence"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("в карточке нет %q: %q", want, body)
+				}
+			}
+			cards, err := taskstore.LoadCards(dir)
+			if err != nil {
+				t.Fatalf("карточка в needs_input не разбирается: %v", err)
+			}
+			if len(cards) != 1 || cards[0].Status != "in_progress" {
+				t.Fatalf("карточки после отказа: %+v", cards)
 			}
 		})
 	}
@@ -416,7 +435,28 @@ func TestTaskCommandNeedsInput(t *testing.T) {
 	dir := t.TempDir()
 	path := writeCompletionCard(t, dir, "T5.3", "todo")
 	var stdout, stderr bytes.Buffer
-	code := TaskCommandWithConfig([]string{"task", "needs-input", "T5.3",
+
+	// Завершение без доказательства не закрывает карточку и ставит needs_input.
+	parkPath := writeCompletionCard(t, dir, "T5.5", "in_progress")
+	stdout.Reset()
+	stderr.Reset()
+	code := TaskCommandWithConfig([]string{"task", "done", "T5.5", "--summary", "готово"},
+		&stdout, &stderr, whyConfig(dir))
+	if code != 1 || stdout.Len() != 0 {
+		t.Fatalf("done без доказательства: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	parked, err := os.ReadFile(parkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(parked), "Статус: done") ||
+		!strings.Contains(string(parked), "Состояние: needs_input") {
+		t.Fatalf("карточка без доказательства не переведена в needs_input: %q", parked)
+	}
+	stdout.Reset()
+	stderr.Reset()
+
+	code = TaskCommandWithConfig([]string{"task", "needs-input", "T5.3",
 		"--question", "нужен доступ к PR?"}, &stdout, &stderr, whyConfig(dir))
 	if code != 0 || stderr.Len() != 0 {
 		t.Fatalf("needs-input: код %d stderr %q", code, stderr.String())
@@ -437,8 +477,17 @@ func TestTaskCommandNeedsInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("карточка с needs_input не разбирается: %v", err)
 	}
-	if len(cards) != 1 || cards[0].Status != "in_progress" {
-		t.Fatalf("карточки с needs_input: %+v", cards)
+	found := false
+	for _, c := range cards {
+		if c.ID == "T5.3" {
+			found = true
+			if c.Status != "in_progress" {
+				t.Fatalf("статус T5.3 = %q, ждали in_progress", c.Status)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("карточка T5.3 не найдена: %+v", cards)
 	}
 
 	// Завершение после ответа снимает маркер needs_input и требует доказательство.
