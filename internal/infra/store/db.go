@@ -1363,3 +1363,123 @@ func (d *DB) WaitCheckpointCount() (int, error) {
 	}
 	return n, nil
 }
+
+// createCompletionNotificationsSQL owns the exactly-once completion
+// notification table from ADR 0044 §5. An end-of-task notification carries a
+// stable event id; the primary key on that id is what turns a redelivery after
+// a crash into a no-op instead of a second notification. As with task_starts,
+// the inbox and watch_outcomes, the table is created on first use because this
+// card owns only db.go and adds no migration file.
+const createCompletionNotificationsSQL = `
+CREATE TABLE IF NOT EXISTS completion_notifications (
+  key        TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL,
+  payload    BLOB NOT NULL,
+  created_at INTEGER NOT NULL
+);
+`
+
+// completionEventNamespace scopes a completion event id so it never shares a
+// storage slot with a task-start idempotency key (ADR 0031), a clientRequestId
+// (ADR 0028) or a scenario replay key (ADR 0042), even when the raw strings are
+// identical. This is a notification id, not a client command key (ADR 0028).
+const completionEventNamespace = "completion-event"
+
+// CompletionEventKey builds the durable, stable key for one end-of-task
+// notification. The same event id always yields the same key across restarts,
+// which is what lets a receiver tell a redelivery from a new event (ADR 0044 §5).
+func CompletionEventKey(eventID string) string {
+	return domain.IdempotencyKey(completionEventNamespace, eventID)
+}
+
+// CompletionNotification is one end-of-task notification. EventID is the
+// stable identifier the receiver deduplicates on; TaskID names the task that
+// finished; Payload is the redacted notification body.
+type CompletionNotification struct {
+	EventID string
+	TaskID  string
+	Payload []byte
+}
+
+// CompletionNotificationResult is the outcome of recording one notification.
+// Created is true when the event id was seen for the first time. Duplicate is
+// true on a redelivery: nothing new was written, and the first payload is
+// returned so the caller can answer the repeat without a second effect.
+type CompletionNotificationResult struct {
+	EventID   string
+	TaskID    string
+	Payload   []byte
+	Created   bool
+	Duplicate bool
+}
+
+// RecordCompletionNotification records a completion notification exactly once.
+// A repeat with the same EventID inserts no second row (INSERT OR IGNORE): the
+// stored payload is returned with Duplicate=true, so a redelivery after a crash
+// does not double the effect at the receiver (ADR 0044 §5). Payload is redacted
+// before it is written because notification bodies are untrusted input (T3.4).
+func (d *DB) RecordCompletionNotification(n CompletionNotification) (CompletionNotificationResult, error) {
+	if strings.TrimSpace(n.EventID) == "" {
+		return CompletionNotificationResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: completion: empty event id")
+	}
+	if strings.TrimSpace(n.TaskID) == "" {
+		return CompletionNotificationResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: completion: empty task id")
+	}
+	key := CompletionEventKey(n.EventID)
+	clean := Redact(n.Payload)
+	var result CompletionNotificationResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createCompletionNotificationsSQL); err != nil {
+			return fmt.Errorf("store: completion: create table: %w", err)
+		}
+		res, err := tx.Exec(`
+			INSERT OR IGNORE INTO completion_notifications
+			  (key, task_id, payload, created_at)
+			VALUES (?, ?, ?, ?)`,
+			key, n.TaskID, clean, time.Now().UTC().UnixNano())
+		if err != nil {
+			return fmt.Errorf("store: completion: insert: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: completion: rows affected: %w", err)
+		}
+		if affected == 1 {
+			result = CompletionNotificationResult{
+				EventID: n.EventID, TaskID: n.TaskID,
+				Payload: append([]byte(nil), clean...), Created: true,
+			}
+			return nil
+		}
+		var storedTaskID string
+		var storedPayload []byte
+		if err := tx.QueryRow(`
+			SELECT task_id, payload FROM completion_notifications WHERE key = ?`, key,
+		).Scan(&storedTaskID, &storedPayload); err != nil {
+			return fmt.Errorf("store: completion: load existing: %w", err)
+		}
+		result = CompletionNotificationResult{
+			EventID: n.EventID, TaskID: storedTaskID,
+			Payload: append([]byte(nil), storedPayload...), Duplicate: true,
+		}
+		return nil
+	})
+	if err != nil {
+		return CompletionNotificationResult{}, err
+	}
+	return result, nil
+}
+
+// CompletionNotificationCount returns the number of stored completion
+// notifications. A redelivery of one event id must not increase it.
+func (d *DB) CompletionNotificationCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "completion_notifications")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM completion_notifications`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}

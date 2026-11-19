@@ -1718,3 +1718,156 @@ func TestCheckpointWaitRedactsState(t *testing.T) {
 		t.Errorf("stored state kept a raw token: %s", stored.State)
 	}
 }
+
+// TestCompletionNotificationRedeliveryCreatesNoSecondNotification is the
+// T3.101 acceptance check. A redelivery of the same stable event id, including
+// one after a restart, must not create a second end-of-task notification
+// (ADR 0044 §5).
+func TestCompletionNotificationRedeliveryCreatesNoSecondNotification(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	first, err := d.RecordCompletionNotification(CompletionNotification{
+		EventID: "evt-1", TaskID: "task-1", Payload: []byte(`{"verdict":"merged"}`),
+	})
+	if err != nil {
+		t.Fatalf("first RecordCompletionNotification: %v", err)
+	}
+	if !first.Created || first.Duplicate {
+		t.Fatalf("first notification = %+v, want created with no duplicate", first)
+	}
+
+	second, err := d.RecordCompletionNotification(CompletionNotification{
+		EventID: "evt-1", TaskID: "task-1", Payload: []byte(`{"verdict":"closed"}`),
+	})
+	if err != nil {
+		t.Fatalf("redelivery RecordCompletionNotification: %v", err)
+	}
+	if second.Created || !second.Duplicate {
+		t.Fatalf("redelivery = %+v, want duplicate with no new notification", second)
+	}
+	if string(second.Payload) != string(first.Payload) {
+		t.Errorf("redelivery payload = %q, want stored %q", second.Payload, first.Payload)
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 1 {
+		t.Fatalf("CompletionNotificationCount after redelivery = %d, %v; want 1", n, err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A crash and restart keeps the dedup key on disk, not in memory.
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	third, err := reopened.RecordCompletionNotification(CompletionNotification{
+		EventID: "evt-1", TaskID: "task-1", Payload: []byte(`{"verdict":"merged"}`),
+	})
+	if err != nil {
+		t.Fatalf("post-restart redelivery RecordCompletionNotification: %v", err)
+	}
+	if third.Created || !third.Duplicate {
+		t.Fatalf("post-restart redelivery = %+v, want duplicate", third)
+	}
+	if n, err := reopened.CompletionNotificationCount(); err != nil || n != 1 {
+		t.Fatalf("CompletionNotificationCount after restart = %d, %v; want 1", n, err)
+	}
+}
+
+func TestCompletionNotificationDistinctEventsCreateDistinctRows(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, id := range []string{"evt-1", "evt-2"} {
+		res, err := d.RecordCompletionNotification(CompletionNotification{
+			EventID: id, TaskID: "task-1", Payload: []byte(id),
+		})
+		if err != nil {
+			t.Fatalf("RecordCompletionNotification(%s): %v", id, err)
+		}
+		if !res.Created || res.Duplicate {
+			t.Errorf("RecordCompletionNotification(%s) = %+v, want created", id, res)
+		}
+	}
+	if n, err := d.CompletionNotificationCount(); err != nil || n != 2 {
+		t.Fatalf("CompletionNotificationCount = %d, %v; want 2", n, err)
+	}
+}
+
+func TestCompletionNotificationKeySeparateFromOtherNamespaces(t *testing.T) {
+	raw := "evt-1"
+	if got, want := CompletionEventKey(raw), domain.IdempotencyKey(completionEventNamespace, raw); got != want {
+		t.Fatalf("CompletionEventKey = %q, want %q", got, want)
+	}
+	if CompletionEventKey(raw) == domain.IdempotencyKey(domain.StartNamespace, raw) {
+		t.Errorf("completion key collided with a task-start key")
+	}
+	if CompletionEventKey(raw) == domain.IdempotencyKey(replayNamespace, raw) {
+		t.Errorf("completion key collided with a scenario replay key")
+	}
+}
+
+func TestCompletionNotificationRejectsEmptyInput(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, tc := range []struct{ eventID, taskID string }{
+		{"", "task-1"},
+		{"evt-1", ""},
+	} {
+		_, err := d.RecordCompletionNotification(CompletionNotification{
+			EventID: tc.eventID, TaskID: tc.taskID, Payload: []byte("done"),
+		})
+		if err == nil {
+			t.Fatalf("RecordCompletionNotification(%q, %q) must fail", tc.eventID, tc.taskID)
+		}
+		var appErr *domain.AppError
+		if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+			t.Errorf("RecordCompletionNotification(%q, %q) error = %v, want INVALID_INPUT", tc.eventID, tc.taskID, err)
+		}
+	}
+}
+
+// TestCompletionNotificationRedactsPayload applies ADR 0012 to notification
+// bodies as it does to inbox messages and scenario results.
+func TestCompletionNotificationRedactsPayload(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	res, err := d.RecordCompletionNotification(CompletionNotification{
+		EventID: "evt-secret", TaskID: "task-1", Payload: secret,
+	})
+	if err != nil {
+		t.Fatalf("RecordCompletionNotification: %v", err)
+	}
+	if bytes.Contains(res.Payload, []byte("ghp_")) {
+		t.Errorf("first result kept a raw token: %s", res.Payload)
+	}
+	if !bytes.Contains(secret, []byte("ghp_")) {
+		t.Fatal("test input lost its secret before the write")
+	}
+	dup, err := d.RecordCompletionNotification(CompletionNotification{
+		EventID: "evt-secret", TaskID: "task-1", Payload: secret,
+	})
+	if err != nil {
+		t.Fatalf("redelivery RecordCompletionNotification: %v", err)
+	}
+	if bytes.Contains(dup.Payload, []byte("ghp_")) {
+		t.Errorf("redelivery result kept a raw token: %s", dup.Payload)
+	}
+}
