@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 type w68Call struct {
@@ -609,4 +610,221 @@ func TestW132ReleasePortDoesNotPersistOnKillFailure(t *testing.T) {
 	if got, ok := reloaded.Used["task"]; !ok || got != port {
 		t.Fatalf("порт потерян в состоянии при ошибке снятия: %d, presence %v", got, ok)
 	}
+}
+
+// w168Stale replaces the read-only stale-task source and restores it after the
+// test, like the other capability seams in this package.
+func w168Stale(t *testing.T, fn func(time.Time) ([]staleTask, error)) {
+	t.Helper()
+	prev := readStaleTasks
+	readStaleTasks = fn
+	t.Cleanup(func() { readStaleTasks = prev })
+}
+
+func TestW168StaleColumnShowsTaskWithoutLiveLease(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	expired := time.Now().Add(-5 * time.Minute)
+	w168Stale(t, func(time.Time) ([]staleTask, error) {
+		return []staleTask{{TaskID: "T3.94", Agent: "reviewer", ExpiredAt: expired}}, nil
+	})
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("stderr не пустой: %q", errOut.String())
+	}
+	for _, want := range []string{"STALE", "T3.94", "5m"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("в таблице нет %q: %q", want, out.String())
+		}
+	}
+}
+
+func TestW168StaleAgeIsSinceLeaseExpiry(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	expired := time.Now().Add(-2*time.Hour - 5*time.Minute)
+	w168Stale(t, func(time.Time) ([]staleTask, error) {
+		return []staleTask{{TaskID: "T3.94", Agent: "reviewer", ExpiredAt: expired}}, nil
+	})
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "2h5m") {
+		t.Fatalf("возраст от истечения аренды не показан: %q", out.String())
+	}
+}
+
+func TestW168StaleJSONHasTaskAndAge(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	expired := time.Now().Add(-5 * time.Minute)
+	w168Stale(t, func(time.Time) ([]staleTask, error) {
+		return []staleTask{{TaskID: "T3.94", Agent: "reviewer", ExpiredAt: expired}}, nil
+	})
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+
+	if code := c.runAgents([]string{"--format", "json"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var got []agentRow
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("строк %d, ожидалось 2", len(got))
+	}
+	var found bool
+	for _, row := range got {
+		if row.ID != "reviewer" {
+			if len(row.Stale) != 0 {
+				t.Fatalf("чужой STALE у %s: %+v", row.ID, row.Stale)
+			}
+			continue
+		}
+		found = true
+		if len(row.Stale) != 1 {
+			t.Fatalf("STALE агентов reviewer: %d, ожидался 1", len(row.Stale))
+		}
+		s := row.Stale[0]
+		if s.TaskID != "T3.94" {
+			t.Fatalf("задача в STALE: %q, ожидалась T3.94", s.TaskID)
+		}
+		if s.AgeSeconds < 295 || s.AgeSeconds > 310 {
+			t.Fatalf("возраст %d с, ожидался около 300", s.AgeSeconds)
+		}
+	}
+	if !found {
+		t.Fatal("агент reviewer не найден в JSON")
+	}
+}
+
+func TestW168StaleColumnOnlyReadsState(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	tasks := []staleTask{{TaskID: "T3.94", Agent: "reviewer", ExpiredAt: time.Now().Add(-time.Minute)}}
+	before := fmt.Sprintf("%+v", tasks)
+	calls := 0
+	w168Stale(t, func(time.Time) ([]staleTask, error) {
+		calls++
+		return tasks, nil
+	})
+	c, _, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if calls != 1 {
+		t.Fatalf("источник аренд прочитан %d раз, ожидался 1", calls)
+	}
+	if got := fmt.Sprintf("%+v", tasks); got != before {
+		t.Fatalf("снимок аренд изменён колонкой: было %s, стало %s", before, got)
+	}
+}
+
+func TestW168NoStaleTasksShowsDashAndOmitsJSONField(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	w168Stale(t, func(time.Time) ([]staleTask, error) { return nil, nil })
+
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "STALE") || !strings.Contains(out.String(), "-") {
+		t.Fatalf("пустая колонка не показана: %q", out.String())
+	}
+
+	c, out, errOut, _ = w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+	if code := c.runAgents([]string{"--format", "json"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if strings.Contains(out.String(), "\"stale\"") {
+		t.Fatalf("пустой STALE попал в JSON: %q", out.String())
+	}
+}
+
+func TestW168StaleReadsSnapshotFromStateAndLeavesItUntouched(t *testing.T) {
+	xdg := filepath.Join(t.TempDir(), "state")
+	t.Setenv("XDG_STATE_HOME", xdg)
+	dir := filepath.Join(xdg, "beacon")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	expired := time.Now().Add(-3 * time.Minute).UTC().Format(time.RFC3339)
+	snapshot := fmt.Sprintf(`{"tasks":[{"taskID":"T3.94","agent":"reviewer","expiredAt":%q}]}`, expired)
+	path := filepath.Join(dir, staleTasksFile)
+	if err := os.WriteFile(path, []byte(snapshot), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w68Service(t, []byte(w68Registration), nil)
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	for _, want := range []string{"STALE", "T3.94", "3m"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("в таблице нет %q: %q", want, out.String())
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != snapshot {
+		t.Fatalf("снимок аренд изменён: %q", data)
+	}
+}
+
+func TestW168StaleTasksAreSortedByID(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	now := time.Now()
+	w168Stale(t, func(time.Time) ([]staleTask, error) {
+		return []staleTask{
+			{TaskID: "T3.99", Agent: "reviewer", ExpiredAt: now.Add(-time.Minute)},
+			{TaskID: "T3.01", Agent: "reviewer", ExpiredAt: now.Add(-time.Minute)},
+		}, nil
+	})
+	c, out, errOut, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{stdout: []byte(w68AgentList)}
+	})
+
+	if code := c.runAgents([]string{"--format", "json"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	var got []agentRow
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range got {
+		if row.ID != "reviewer" {
+			continue
+		}
+		if len(row.Stale) != 2 || row.Stale[0].TaskID != "T3.01" || row.Stale[1].TaskID != "T3.99" {
+			t.Fatalf("порядок STALE: %+v", row.Stale)
+		}
+		return
+	}
+	t.Fatal("агент reviewer не найден")
 }
