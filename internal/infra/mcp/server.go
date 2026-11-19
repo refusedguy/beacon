@@ -212,16 +212,21 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: name, Annotations: &annotations}, stubHandler)
 	}
 
-	// The real read tools carry an explicit output schema. go-sdk infers one by
-	// reflection from the handler's Go type, but that inferred schema rejects
-	// the null a fresh Watch emits for its nil maps (ADR 0003, ADR 0009).
-	// AllOutputSchemas relaxes exactly those fields. A derivation failure is a
-	// broken contract type: log it, but still register every real handler. The
-	// schema is optional; the tool is not. Returning here would leave all seven
-	// tools on the startup stub, so real handlers always win (T3.59).
+	// The real read tools carry an explicit output schema. go-sdk cannot infer
+	// one for these types and panics on a nil OutputSchema, so the schema comes
+	// from AllOutputSchemas, which relaxes the null a fresh Watch emits for its
+	// nil maps (ADR 0003, ADR 0009). A derivation failure is a broken contract
+	// type: log it and fall back to a permissive object schema so every real
+	// handler is still registered. The precise schema is optional; the real
+	// tool is not. Returning here would leave all seven tools on startup stubs
+	// (T3.59).
 	schemas, err := AllOutputSchemas()
 	if err != nil {
-		log.Printf("mcp: output schemas: %v; read tools use inferred schemas", err)
+		log.Printf("mcp: output schemas: %v; read tools use permissive schemas", err)
+		schemas = map[string]*jsonschema.Schema{
+			"beacon_list_running": {Type: "object"},
+			"beacon_stats":        {Type: "object"},
+		}
 	}
 
 	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
