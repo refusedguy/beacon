@@ -203,8 +203,19 @@ func TestDecodeEventRejectsUnknownVersion(t *testing.T) {
 	if _, err := DecodeEvent(Event{SchemaVersion: 99, Payload: []byte(`{}`)}); err == nil {
 		t.Error("unknown version must have no decoder")
 	}
+	if _, err := DecodeEvent(Event{SchemaVersion: currentEventSchemaVersion + 1, Payload: []byte(`{}`)}); err == nil {
+		t.Error("a version newer than the store must have no decoder")
+	}
 	if _, err := DecodeEvent(Event{SchemaVersion: 2, Payload: []byte(`not json`)}); err == nil {
 		t.Error("malformed current payload must fail to decode")
+	}
+	if decoded, err := DecodeEvent(Event{
+		SchemaVersion: currentEventSchemaVersion,
+		Payload:       []byte(`{"kind":"verdict","message":"all checks passed"}`),
+	}); err != nil {
+		t.Errorf("current version %d must decode: %v", currentEventSchemaVersion, err)
+	} else if decoded.Kind != "verdict" || decoded.Message != "all checks passed" {
+		t.Errorf("current version decoded = %+v", decoded)
 	}
 }
 

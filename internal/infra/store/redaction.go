@@ -119,15 +119,23 @@ type DecodedEvent struct {
 // decodeHandler turns one raw row into the normalized form.
 type decodeHandler func(Event) (DecodedEvent, error)
 
+// currentEventSchemaVersion is the newest journal row version this build can
+// decode. It matches the user_version of migration 0004_events.sql, the schema
+// version stamped on new rows by RedactingWriter. A row carrying a higher
+// version was written by a newer store and must not be guessed at: it has no
+// handler until a decoder for that version is added.
+const currentEventSchemaVersion = 4
+
 // handlerForVersion maps a row schema version to exactly one decoder. Version
 // 1 is the pre-migration corpus format: a bare JSON string or a
-// {"message": ...} map. Version 2 and later use the current
-// {"kind": ..., "message": ...} format. Unknown versions have no handler.
+// {"message": ...} map. Versions 2 through currentEventSchemaVersion use the
+// current {"kind": ..., "message": ...} format. Any other version, including
+// one from a newer store, has no handler and fails closed.
 func handlerForVersion(version int) decodeHandler {
 	switch {
 	case version == 1:
 		return decodeLegacyV1
-	case version >= 2:
+	case version >= 2 && version <= currentEventSchemaVersion:
 		return decodeCurrent
 	default:
 		return nil
