@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -279,5 +280,116 @@ func TestOutputSchemaHonorsJSONTags(t *testing.T) {
 		if _, ok := schema.Properties[name]; !ok {
 			t.Errorf("missing derived property %q", name)
 		}
+	}
+}
+
+// cursorSnapshotReader serves a snapshot that a test can replace between
+// calls, so a second call can observe events that appeared after the first.
+type cursorSnapshotReader struct {
+	snap StateSnapshot
+}
+
+func (f *cursorSnapshotReader) Snapshot() (StateSnapshot, error) { return f.snap, nil }
+
+func callListRunningCursor(t *testing.T, handler *ListRunningHandler, in ListRunningInput) ListRunningOutput {
+	t.Helper()
+	result, out, err := handler.Handle(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("beacon_list_running: %v", err)
+	}
+	if result == nil || result.IsError {
+		t.Fatalf("beacon_list_running returned an error result: %#v", result)
+	}
+	return out
+}
+
+// TestListRunningOutputSchemaHasStatusAndCursor proves the MCP response schema
+// carries status and cursor, plus the event and terminal-verdict fields ADR
+// 0025 requires.
+func TestListRunningOutputSchemaHasStatusAndCursor(t *testing.T) {
+	schema, err := OutputSchema[ListRunningOutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	for _, name := range []string{"status", "cursor", "events", "verdict"} {
+		if _, ok := schema.Properties[name]; !ok {
+			t.Errorf("list_running output schema missing property %q", name)
+		}
+	}
+}
+
+// TestListRunningCursorReturnsOnlyNewEvents is the two-sequential-calls check
+// from ADR 0025: the first call returns every event and a cursor; the second
+// call, given that cursor, returns only events that appeared in between.
+func TestListRunningCursorReturnsOnlyNewEvents(t *testing.T) {
+	reader := &cursorSnapshotReader{snap: StateSnapshot{ActiveWatches: []domain.Watch{
+		{ID: "w1", Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1},
+	}}}
+	handler := NewListRunningHandler(reader)
+
+	first := callListRunningCursor(t, handler, ListRunningInput{})
+	if first.Cursor == "" {
+		t.Fatal("first response must carry a non-empty cursor")
+	}
+	if first.Status != string(domain.StatusWatching) {
+		t.Errorf("first status = %q, want watching", first.Status)
+	}
+	if len(first.Events) != 1 || first.Events[0].WatchID != "w1" {
+		t.Fatalf("first events = %+v, want only w1", first.Events)
+	}
+
+	reader.snap = StateSnapshot{ActiveWatches: []domain.Watch{
+		{ID: "w1", Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1},
+		{ID: "w2", Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 2},
+	}}
+	second := callListRunningCursor(t, handler, ListRunningInput{Cursor: first.Cursor})
+
+	if len(second.Events) != 1 {
+		t.Fatalf("second events = %+v, want exactly one new event", second.Events)
+	}
+	if second.Events[0].WatchID != "w2" {
+		t.Errorf("new event watchID = %q, want w2", second.Events[0].WatchID)
+	}
+	for _, ev := range second.Events {
+		if ev.WatchID == "w1" {
+			t.Error("second call replayed old event w1")
+		}
+	}
+}
+
+// TestListRunningTerminalVerdictWithoutOldEvents proves that once a watch is
+// terminal, a cursor call returns the verdict and status without replaying the
+// earlier events (ADR 0025 acceptance).
+func TestListRunningTerminalVerdictWithoutOldEvents(t *testing.T) {
+	reader := &cursorSnapshotReader{snap: StateSnapshot{ActiveWatches: []domain.Watch{
+		{ID: "w1", Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1},
+	}}}
+	handler := NewListRunningHandler(reader)
+	first := callListRunningCursor(t, handler, ListRunningInput{})
+
+	reader.snap = StateSnapshot{ActiveWatches: []domain.Watch{
+		{ID: "w1", Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1},
+		{ID: "w2", Status: domain.StatusClosed, Verdict: domain.VerdictMerged, Revision: 2},
+	}}
+	second := callListRunningCursor(t, handler, ListRunningInput{Cursor: first.Cursor})
+
+	if second.Status != string(domain.StatusClosed) {
+		t.Errorf("terminal status = %q, want closed", second.Status)
+	}
+	if second.Verdict != string(domain.VerdictMerged) {
+		t.Errorf("terminal verdict = %q, want merged", second.Verdict)
+	}
+	if len(second.Events) != 0 {
+		t.Errorf("terminal response replayed old events: %+v", second.Events)
+	}
+}
+
+// TestListRunningRejectsMalformedCursor keeps the opaque cursor a strict input:
+// a client cannot pass arbitrary bytes and silently get a full replay.
+func TestListRunningRejectsMalformedCursor(t *testing.T) {
+	handler := NewListRunningHandler(&cursorSnapshotReader{snap: sampleSnapshot()})
+	_, _, err := handler.Handle(context.Background(), nil, ListRunningInput{Cursor: "!!!not-a-cursor!!!"})
+	if err == nil {
+		t.Fatal("malformed cursor must be rejected")
 	}
 }
