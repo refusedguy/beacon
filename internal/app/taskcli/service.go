@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -1307,4 +1308,274 @@ func (s *Service) SelectWorkerByHistory(candidates []WorkerCandidate, required [
 	}
 	sel, ok := SelectWorker(withHistory, required)
 	return sel, ok, nil
+}
+
+// ---- ADR 0039 п2 / T3.61: CI healing с общим почасовым потолком ----
+//
+// Один наблюдатель на сервис классифицирует упавшие проверки и решает,
+// запускать ли ещё одну починку. Слепой ретрай запрещён пунктом 1 ADR 0039:
+// только класс transient получает ограниченное число попыток. Почасовой
+// потолок считается на весь сервис, а не на каждого из агентов, поэтому
+// запуски лежат в одном файле состояния под общим замком. Исчерпание попыток
+// или потолка возвращает action park с полным текстом ошибки, а не новый круг
+// починок.
+
+// CheckClass — класс упавшей проверки. Починка разрешена только transient.
+type CheckClass string
+
+const (
+	CheckClassTransient     CheckClass = "transient"
+	CheckClassDeterministic CheckClass = "deterministic"
+	CheckClassUnknown       CheckClass = "unknown"
+)
+
+// CheckFailure — одна упавшая проверка. Output сохраняется целиком, чтобы
+// парковка по пункту 1 ADR 0039 получила полный текст ошибки.
+type CheckFailure struct {
+	Name   string `json:"name"`
+	Output string `json:"output"`
+}
+
+// Healable сообщает, имеет ли класс смысл чинить ретраем.
+func (c CheckClass) Healable() bool { return c == CheckClassTransient }
+
+var (
+	transientSignals = []string{
+		"timeout", "timed out", "etimedout", "connection reset", "econnreset",
+		"socket hang up", "rate limit", "429", "502", "503", "504",
+		"service unavailable", "temporarily unavailable", "connection refused",
+	}
+	deterministicSignals = []string{
+		"compilation error", "build failed", "test failed", "tests failed",
+		"--- fail", "assertion", "expected", "lint error", "type error",
+		"typecheck", "panic:", "syntax error",
+	}
+)
+
+func containsSignal(output string, signals []string) bool {
+	lower := strings.ToLower(output)
+	for _, s := range signals {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClassifyCheck относит проверку к классу по её выводу. Временные ошибки
+// инфраструктуры дают transient, ошибки кода и тестов дают deterministic,
+// всё остальное остаётся unknown и не ретраится.
+func ClassifyCheck(f CheckFailure) CheckClass {
+	if containsSignal(f.Output, transientSignals) {
+		return CheckClassTransient
+	}
+	if containsSignal(f.Output, deterministicSignals) {
+		return CheckClassDeterministic
+	}
+	return CheckClassUnknown
+}
+
+// HealingAction — решение наблюдателя: запустить починку или запарковать.
+type HealingAction string
+
+const (
+	HealingRetry HealingAction = "retry"
+	HealingPark  HealingAction = "park"
+)
+
+// Ограничения сервиса, а не отдельного агента. Cap считается по всем задачам.
+const (
+	MaxHealingAttempts = 2
+	HourlyLaunchCap    = 20
+)
+
+// HealingDecision — наблюдаемое решение одной проверки.
+type HealingDecision struct {
+	Action   HealingAction `json:"action"`
+	Class    CheckClass    `json:"class"`
+	Attempt  int           `json:"attempt"`
+	Reason   string        `json:"reason"`
+	CapSpent int           `json:"capSpent"`
+	CapLimit int           `json:"capLimit"`
+}
+
+// HealingLogEntry — одна запись журнала. Класс, номер попытки и расход
+// потолка пишутся по каждому решению, включая парковку.
+type HealingLogEntry struct {
+	Time     time.Time     `json:"time"`
+	TaskID   string        `json:"taskId"`
+	Check    string        `json:"check"`
+	Class    CheckClass    `json:"class"`
+	Attempt  int           `json:"attempt"`
+	Action   HealingAction `json:"action"`
+	CapSpent int           `json:"capSpent"`
+	Reason   string        `json:"reason"`
+	Output   string        `json:"output"`
+}
+
+// ciHealingState — общее состояние наблюдателя в каталоге состояния репозитория.
+type ciHealingState struct {
+	Launches []time.Time       `json:"launches"`
+	Attempts map[string]int    `json:"attempts"`
+	Journal  []HealingLogEntry `json:"journal"`
+}
+
+func (s *Service) ciHealingPath() string {
+	return filepath.Join(s.Cfg.StateDir, "ci-healing.json")
+}
+
+// Замок состояния healing отделён от общего замка карточек. Общий замок
+// удаляет файл по эвристике stale после чтения; между чтением и удалением
+// другой воркер успевает создать новый файл, и двое входят в критическую
+// секцию одновременно. Для потолка это даёт два одобренных запуска сверх
+// лимита. Flock держит блокировку на открытом дескрипторе, ядро снимает её
+// при завершении процесса, поэтому эвристики и гонки удаления не нужны.
+func (s *Service) lockHealing() (func(), error) {
+	path := filepath.Join(s.Cfg.StateDir, "ci-healing.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, taskstore.Startupf("не открыт замок healing: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, taskstore.Startupf("не взят замок healing: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+func (s *Service) loadHealingState() (ciHealingState, error) {
+	data, err := os.ReadFile(s.ciHealingPath())
+	if os.IsNotExist(err) {
+		return ciHealingState{Attempts: map[string]int{}}, nil
+	}
+	if err != nil {
+		return ciHealingState{}, taskstore.Startupf("не прочитано состояние healing: %v", err)
+	}
+	var st ciHealingState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return ciHealingState{}, taskstore.Startupf("не разобрано состояние healing: %v", err)
+	}
+	if st.Attempts == nil {
+		st.Attempts = map[string]int{}
+	}
+	return st, nil
+}
+
+func (s *Service) saveHealingState(st ciHealingState) error {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return taskstore.Startupf("не собрано состояние healing: %v", err)
+	}
+	return taskstore.AtomicWrite(s.ciHealingPath(), append(data, '\n'), 0644)
+}
+
+func pruneLaunches(st *ciHealingState, now time.Time) {
+	cutoff := now.Add(-time.Hour)
+	kept := st.Launches[:0]
+	for _, t := range st.Launches {
+		if !t.Before(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	st.Launches = kept
+}
+
+func healingKey(taskID, check string) string { return taskID + "\x00" + check }
+
+// HealingLog возвращает журнал решений в порядке записи.
+func (s *Service) HealingLog() ([]HealingLogEntry, error) {
+	st, err := s.loadHealingState()
+	if err != nil {
+		return nil, err
+	}
+	return append([]HealingLogEntry(nil), st.Journal...), nil
+}
+
+// CapSpent возвращает число запусков агента за последний час по всему сервису.
+func (s *Service) CapSpent(now time.Time) (int, error) {
+	st, err := s.loadHealingState()
+	if err != nil {
+		return 0, err
+	}
+	pruneLaunches(&st, now)
+	return len(st.Launches), nil
+}
+
+// HealingAttempts возвращает число попыток, уже использованных парой задача/проверка.
+func (s *Service) HealingAttempts(taskID, check string) (int, error) {
+	st, err := s.loadHealingState()
+	if err != nil {
+		return 0, err
+	}
+	return st.Attempts[healingKey(taskID, check)], nil
+}
+
+// DecideHealing классифицирует упавшую проверку и под общим замком решает,
+// запускать ли починку. now приходит извне, чтобы потолок был проверяемым;
+// нулевое время означает текущее. Ретрай получает только transient, не более
+// MaxHealingAttempts попыток на пару задача/проверка и не более
+// HourlyLaunchCap запусков на сервис за час. Исчерпание любого предела даёт
+// action park с полным текстом ошибки в журнале, а не новый круг починок.
+func (s *Service) DecideHealing(taskID string, f CheckFailure, now time.Time) (HealingDecision, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return HealingDecision{}, taskstore.Validationf("не задана задача healing")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	class := ClassifyCheck(f)
+	decision := HealingDecision{Class: class, CapLimit: HourlyLaunchCap}
+
+	unlock, err := s.lockHealing()
+	if err != nil {
+		return HealingDecision{}, err
+	}
+	defer unlock()
+
+	st, err := s.loadHealingState()
+	if err != nil {
+		return HealingDecision{}, err
+	}
+	pruneLaunches(&st, now)
+
+	key := healingKey(taskID, f.Name)
+	attempts := st.Attempts[key]
+	decision.CapSpent = len(st.Launches)
+
+	switch {
+	case !class.Healable():
+		decision.Action = HealingPark
+		decision.Attempt = attempts
+		decision.Reason = fmt.Sprintf("проверка %s класса %s не чинится ретраем", f.Name, class)
+	case attempts >= MaxHealingAttempts:
+		decision.Action = HealingPark
+		decision.Attempt = attempts
+		decision.Reason = fmt.Sprintf("истощены попытки починки %s: %d из %d", f.Name, attempts, MaxHealingAttempts)
+	case decision.CapSpent >= HourlyLaunchCap:
+		decision.Action = HealingPark
+		decision.Attempt = attempts
+		decision.Reason = fmt.Sprintf("истощён почасовой потолок запусков сервиса: %d из %d", decision.CapSpent, HourlyLaunchCap)
+	default:
+		decision.Action = HealingRetry
+		decision.Attempt = attempts + 1
+		decision.Reason = fmt.Sprintf("запуск починки %s, попытка %d из %d", f.Name, decision.Attempt, MaxHealingAttempts)
+		st.Attempts[key] = decision.Attempt
+		st.Launches = append(st.Launches, now)
+		decision.CapSpent = len(st.Launches)
+	}
+
+	st.Journal = append(st.Journal, HealingLogEntry{
+		Time: now.UTC(), TaskID: taskID, Check: f.Name, Class: class,
+		Attempt: decision.Attempt, Action: decision.Action,
+		CapSpent: decision.CapSpent, Reason: decision.Reason, Output: f.Output,
+	})
+	if err := s.saveHealingState(st); err != nil {
+		return HealingDecision{}, err
+	}
+	return decision, nil
 }

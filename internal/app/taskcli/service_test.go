@@ -1009,3 +1009,223 @@ func TestRecordWorkerOutcomeRejectsBadInput(t *testing.T) {
 		t.Fatalf("отрицательная стоимость: код %d, want 1", got)
 	}
 }
+
+// ---- ADR 0039 п2 / T3.61: классификация, bounded retry и общий потолок ----
+
+func TestClassifyCheck(t *testing.T) {
+	cases := []struct {
+		name string
+		f    CheckFailure
+		want CheckClass
+		heal bool
+	}{
+		{"timeout", CheckFailure{Name: "unit", Output: "HTTP call timed out after 30s"}, CheckClassTransient, true},
+		{"429", CheckFailure{Name: "deploy", Output: "error 429 Too Many Requests"}, CheckClassTransient, true},
+		{"reset", CheckFailure{Name: "e2e", Output: "ECONNRESET socket hang up"}, CheckClassTransient, true},
+		{"assertion", CheckFailure{Name: "unit", Output: "--- FAIL: TestX assertion failed"}, CheckClassDeterministic, false},
+		{"compile", CheckFailure{Name: "build", Output: "compilation error: undefined symbol"}, CheckClassDeterministic, false},
+		{"unknown", CheckFailure{Name: "custom", Output: "непонятный вывод проверки"}, CheckClassUnknown, false},
+	}
+	for _, tc := range cases {
+		got := ClassifyCheck(tc.f)
+		if got != tc.want {
+			t.Errorf("%s: class=%q, want %q", tc.name, got, tc.want)
+		}
+		if got.Healable() != tc.heal {
+			t.Errorf("%s: healable=%v, want %v", tc.name, got.Healable(), tc.heal)
+		}
+	}
+}
+
+func TestDecideHealingRetriesThenParksOnAttemptLimit(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	f := CheckFailure{Name: "unit", Output: "connection reset by peer"}
+	for i := 1; i <= MaxHealingAttempts; i++ {
+		d, err := e.svc.DecideHealing("T3.61", f, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Action != HealingRetry || d.Attempt != i || d.Class != CheckClassTransient {
+			t.Fatalf("попытка %d: решение %+v", i, d)
+		}
+		if d.CapSpent != i || d.CapLimit != HourlyLaunchCap {
+			t.Fatalf("попытка %d: расход %+v", i, d)
+		}
+	}
+	d, err := e.svc.DecideHealing("T3.61", f, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Action != HealingPark || !strings.Contains(d.Reason, "попытки") {
+		t.Fatalf("исчерпание попыток: решение %+v", d)
+	}
+	if d.CapSpent != MaxHealingAttempts {
+		t.Fatalf("парковка увеличила расход: %+v", d)
+	}
+	att, err := e.svc.HealingAttempts("T3.61", "unit")
+	if err != nil || att != MaxHealingAttempts {
+		t.Fatalf("attempts=%d err=%v", att, err)
+	}
+	log, err := e.svc.HealingLog()
+	if err != nil || len(log) != MaxHealingAttempts+1 {
+		t.Fatalf("log len=%d err=%v", len(log), err)
+	}
+	last := log[len(log)-1]
+	if last.Class != CheckClassTransient || last.Action != HealingPark || last.Output != f.Output ||
+		last.Attempt != MaxHealingAttempts || last.CapSpent != MaxHealingAttempts {
+		t.Fatalf("последняя запись журнала: %+v", last)
+	}
+	spent, err := e.svc.CapSpent(now)
+	if err != nil || spent != MaxHealingAttempts {
+		t.Fatalf("cap spent=%d err=%v", spent, err)
+	}
+}
+
+func TestDecideHealingHourlyCapIsServiceWide(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	f := CheckFailure{Name: "lint", Output: "service temporarily unavailable"}
+	for i := 0; i < HourlyLaunchCap; i++ {
+		d, err := e.svc.DecideHealing(fmt.Sprintf("T9.%d", i+1), f, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Action != HealingRetry || d.CapSpent != i+1 {
+			t.Fatalf("запуск %d: решение %+v", i+1, d)
+		}
+	}
+	spent, err := e.svc.CapSpent(now)
+	if err != nil || spent != HourlyLaunchCap {
+		t.Fatalf("cap spent=%d err=%v", spent, err)
+	}
+	d, err := e.svc.DecideHealing("T9.99", f, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Action != HealingPark || !strings.Contains(d.Reason, "потолок") {
+		t.Fatalf("исчерпание потолка: решение %+v", d)
+	}
+	if d.CapSpent != HourlyLaunchCap || d.CapLimit != HourlyLaunchCap {
+		t.Fatalf("расход потолка: решение %+v", d)
+	}
+	spent, err = e.svc.CapSpent(now)
+	if err != nil || spent != HourlyLaunchCap {
+		t.Fatalf("парковка увеличила расход: spent=%d err=%v", spent, err)
+	}
+}
+
+func TestDecideHealingHourlyWindowPrunesOldLaunches(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-2 * time.Hour)
+	f := CheckFailure{Name: "e2e", Output: "429 rate limit"}
+	for i := 0; i < HourlyLaunchCap; i++ {
+		if _, err := e.svc.DecideHealing(fmt.Sprintf("T8.%d", i+1), f, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d, err := e.svc.DecideHealing("T8.99", f, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Action != HealingRetry || d.CapSpent != 1 {
+		t.Fatalf("окно часа: решение %+v", d)
+	}
+}
+
+func TestDecideHealingNonHealableParksWithoutSpendingCap(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name, output string
+		class        CheckClass
+	}{
+		{"unit", "--- FAIL: TestX assertion failed", CheckClassDeterministic},
+		{"custom", "непонятный вывод проверки", CheckClassUnknown},
+	}
+	for _, tc := range cases {
+		d, err := e.svc.DecideHealing("T7.1", CheckFailure{Name: tc.name, Output: tc.output}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d.Action != HealingPark || d.Class != tc.class || d.CapSpent != 0 || d.Attempt != 0 {
+			t.Fatalf("%s: решение %+v", tc.name, d)
+		}
+	}
+	spent, err := e.svc.CapSpent(now)
+	if err != nil || spent != 0 {
+		t.Fatalf("нелечимые проверки потратили потолок: spent=%d err=%v", spent, err)
+	}
+	log, err := e.svc.HealingLog()
+	if err != nil || len(log) != 2 || log[0].Output != cases[0].output || log[1].Output != cases[1].output {
+		t.Fatalf("журнал не сохранил полный текст: log=%+v err=%v", log, err)
+	}
+}
+
+func TestDecideHealingPersistsAcrossServicesAndValidates(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	_, err := e.svc.DecideHealing("  ", CheckFailure{Name: "unit", Output: "timeout"}, now)
+	if taskstore.Code(err) != 1 {
+		t.Fatalf("пустая задача: код %d, err=%v", taskstore.Code(err), err)
+	}
+	f := CheckFailure{Name: "unit", Output: "timeout"}
+	if _, err := e.svc.DecideHealing("T6.1", f, now); err != nil {
+		t.Fatal(err)
+	}
+	svc2 := NewService(e.cfg)
+	spent, err := svc2.CapSpent(now)
+	if err != nil || spent != 1 {
+		t.Fatalf("новый сервис не видит расход: spent=%d err=%v", spent, err)
+	}
+	d, err := svc2.DecideHealing("T6.2", f, now)
+	if err != nil || d.Action != HealingRetry || d.CapSpent != 2 {
+		t.Fatalf("новый сервис: решение %+v err=%v", d, err)
+	}
+}
+
+func TestDecideHealingConcurrentCapNeverExceeded(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	f := CheckFailure{Name: "e2e", Output: "429 rate limit"}
+	const n = HourlyLaunchCap + 4
+	results := make(chan HealingDecision, n)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			d, err := e.svc.DecideHealing(fmt.Sprintf("T5.%d", i+1), f, now)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- d
+		}(i)
+	}
+	retries := 0
+	for i := 0; i < n; i++ {
+		select {
+		case err := <-errs:
+			t.Fatal(err)
+		case d := <-results:
+			if d.CapSpent > HourlyLaunchCap {
+				t.Fatalf("потолок превышен: %+v", d)
+			}
+			switch d.Action {
+			case HealingRetry:
+				retries++
+			case HealingPark:
+				if !strings.Contains(d.Reason, "потолок") {
+					t.Fatalf("парковка не по потолку: %+v", d)
+				}
+			}
+		}
+	}
+	if retries != HourlyLaunchCap {
+		t.Fatalf("ретраев %d, want %d", retries, HourlyLaunchCap)
+	}
+	spent, err := e.svc.CapSpent(now)
+	if err != nil || spent != HourlyLaunchCap {
+		t.Fatalf("итоговый расход=%d err=%v", spent, err)
+	}
+}
