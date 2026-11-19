@@ -535,3 +535,157 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 	evidence.Verdict = ExternalPass
 	return evidence
 }
+
+// ReviewerExitCode is the strict exit code of a parsed external reviewer
+// verdict (ADR 0047, feature 3). It is deliberately a distinct type from the
+// Verdict of T3.67, the ReviewVerdict of ADR 0038 §4 and the ExternalVerdict
+// of T3.98. None of those parses reviewer prose into a fail-closed code: this
+// one does, and only this one. In particular it is not the indeterminate of
+// T3.64, which names an action that ran but whose answer was lost; here an
+// unclear answer is a rejection, not an honest "unknown".
+type ReviewerExitCode int
+
+const (
+	// ReviewerExitApprove is code 0: the reviewer clearly approved.
+	ReviewerExitApprove ReviewerExitCode = 0
+	// ReviewerExitChangesRequested is code 3: the reviewer clearly asked for
+	// changes, so the change may not ship as is.
+	ReviewerExitChangesRequested ReviewerExitCode = 3
+	// ReviewerExitReject is code 4: the fail-closed rejection. An unclear
+	// answer lands here, and so does any blocking review, because a block
+	// cannot be softened to an approve by any other signal in the answer.
+	ReviewerExitReject ReviewerExitCode = 4
+)
+
+// reviewerNegation marks a token that cancels the marker right after it, so
+// "not approved" and "no block" do not read as an approve and a block.
+// Contractions are de-apostrophized by reviewerTokens: can't becomes cant.
+var reviewerNegation = map[string]bool{
+	"not": true, "no": true, "never": true, "none": true,
+	"cannot": true, "cant": true, "dont": true, "wont": true,
+	"without": true, "withhold": true, "withholding": true,
+	"neither": true, "nor": true,
+}
+
+// reviewerTokens lowercases text and splits it into ASCII word tokens. An
+// apostrophe is dropped so contractions normalise (can't -> cant); every
+// other non-alphanumeric rune becomes a separator. Reviewer verdict markers
+// are English words, so punctuation never changes which marker is seen.
+func reviewerTokens(text string) []string {
+	s := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			return r
+		case r == '\'':
+			return -1
+		default:
+			return ' '
+		}
+	}, strings.ToLower(text))
+	return strings.Fields(s)
+}
+
+// reviewerHas reports whether phrase occurs as a run of tokens and is not
+// immediately preceded by a negation token. Matching is by whole tokens, so
+// "approved" does not hide inside "unapproved" and "block" does not match a
+// substring of another word.
+func reviewerHas(tokens []string, phrase ...string) bool {
+	if len(phrase) == 0 || len(phrase) > len(tokens) {
+		return false
+	}
+	for i := 0; i+len(phrase) <= len(tokens); i++ {
+		matched := true
+		for j, word := range phrase {
+			if tokens[i+j] != word {
+				matched = false
+				break
+			}
+		}
+		if !matched || (i > 0 && reviewerNegation[tokens[i-1]]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// reviewerApproved reports a clear approve signal in the answer.
+func reviewerApproved(tokens []string) bool {
+	for _, word := range []string{"approve", "approved", "approves", "approval", "lgtm"} {
+		if reviewerHas(tokens, word) {
+			return true
+		}
+	}
+	for _, phrase := range [][]string{{"ship", "it"}, {"looks", "good", "to", "me"}} {
+		if reviewerHas(tokens, phrase...) {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewerChanged reports a clear request-for-changes signal in the answer.
+func reviewerChanged(tokens []string) bool {
+	for _, word := range []string{"reject", "rejected", "rejects", "nack"} {
+		if reviewerHas(tokens, word) {
+			return true
+		}
+	}
+	for _, phrase := range [][]string{
+		{"changes", "requested"}, {"request", "changes"},
+		{"requested", "changes"}, {"change", "requested"},
+		{"fix", "first"}, {"needs", "changes"},
+		{"changes", "required"}, {"must", "fix"},
+	} {
+		if reviewerHas(tokens, phrase...) {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewerBlocked reports a blocking signal in the answer. The block family
+// is checked before every other signal by ParseReviewerExitCode, so a block
+// always wins and is never softened by an approve elsewhere in the text.
+func reviewerBlocked(tokens []string) bool {
+	for _, word := range []string{
+		"block", "blocks", "blocked", "blocker", "blockers", "blocking",
+		"veto", "vetoed", "vetoes",
+	} {
+		if reviewerHas(tokens, word) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseReviewerExitCode turns an external reviewer's free-form answer into one
+// of the three strict codes of ADR 0047 feature 3. The function is pure: it
+// reads only the text, runs no I/O and never mutates its input. The rules are
+// applied in this fixed priority order:
+//
+//  1. Any blocking signal returns code 4. A block wins over every other
+//     signal and cannot be softened to an approve.
+//  2. Both an approve and a changes signal in one answer are contradictory,
+//     so the answer is unclear and returns code 4.
+//  3. A clear changes signal returns code 3; a clear approve returns code 0.
+//  4. No recognised signal, empty text, whitespace or hedging returns code 4.
+//     An unclear answer is a rejection, never a pass.
+//
+// Only the canonical markers above count. A reviewer who writes anything
+// else has not produced an approve, so the gate fails closed.
+func ParseReviewerExitCode(answer string) ReviewerExitCode {
+	tokens := reviewerTokens(answer)
+	switch {
+	case reviewerBlocked(tokens):
+		return ReviewerExitReject
+	case reviewerApproved(tokens) && reviewerChanged(tokens):
+		return ReviewerExitReject
+	case reviewerChanged(tokens):
+		return ReviewerExitChangesRequested
+	case reviewerApproved(tokens):
+		return ReviewerExitApprove
+	default:
+		return ReviewerExitReject
+	}
+}
