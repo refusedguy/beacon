@@ -18,6 +18,8 @@ package mcp
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -38,6 +40,40 @@ type AckInput struct {
 	// resumes that task and never creates a new one. Empty keeps the plain ack
 	// contract from ADR 0028.
 	ContinueOf string `json:"continueOf,omitempty" jsonschema:"watchID of the same parked task whose human answer resumes it; must equal watchID and creates no new task"`
+	// Revision is the task revision carried by the event being acknowledged
+	// (ADR 0036 §5). It is the Watch revision, not the event.id used to dedupe
+	// webhook deliveries in ADR 0034 §4. Zero means the caller did not pin a
+	// revision, so no staleness check is made. A revision older than the one
+	// the Watch has committed is discarded before any write.
+	Revision uint64 `json:"revision,omitempty" jsonschema:"Watch revision this ack was given at; an older revision is discarded; not the webhook event.id"`
+}
+
+// StaleRevisionError reports an event whose task revision is older than the
+// revision the ack committed. The event is discarded: no claimedAt is stamped,
+// no Watch is resumed and no continuation round is consumed. ADR 0036 §5
+// applies the task revision after the delivery dedup of ADR 0034 §4; the two
+// keys are distinct.
+type StaleRevisionError struct {
+	Event     uint64
+	Committed uint64
+}
+
+func (e *StaleRevisionError) Error() string {
+	return fmt.Sprintf("ack: event revision %d is older than committed revision %d", e.Event, e.Committed)
+}
+
+// IsStaleRevision reports whether err is a discarded stale-revision event.
+func IsStaleRevision(err error) bool {
+	var stale *StaleRevisionError
+	return errors.As(err, &stale)
+}
+
+// AckReceipt is the revision an ack was given at. ADR 0036 §5: the ack fixes
+// the task revision, and a later event carrying an older revision is dropped.
+// It reports the Watch revision, never the event.id of ADR 0034 §4.
+type AckReceipt struct {
+	OK       bool   `json:"ok"`
+	Revision uint64 `json:"revision"`
 }
 
 // ContinuationRegistry counts human-answer rounds per Watch. A round is
@@ -130,12 +166,16 @@ func (ackWallClock) Now() time.Time { return time.Now() }
 
 // Handle adapts Ack to the go-sdk typed tool handler signature and returns the
 // shared ok-only response. The response carries no verdict: a caller still has
-// to call beacon_get_result or beacon_wait_result to read one (ADR 0028).
+// to call beacon_get_result or beacon_wait_result to read one (ADR 0028). A
+// stale-revision event (ADR 0036 §5) is discarded with ok:false and no error;
+// the fixed revision itself is available from AckReceipt. The ok-only shape is
+// unchanged for ordinary acks.
 func (h *AckHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in AckInput) (*mcpsdk.CallToolResult, OKOutput, error) {
-	if err := h.Ack(ctx, in); err != nil {
+	receipt, err := h.AckReceipt(ctx, in)
+	if err != nil && !IsStaleRevision(err) {
 		return nil, OKOutput{}, err
 	}
-	return nil, OKOutput{OK: true}, nil
+	return nil, OKOutput{OK: receipt.OK}, nil
 }
 
 // Ack validates that the obligation belongs to the Watch, then stamps
@@ -148,47 +188,65 @@ func (h *AckHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in A
 // the next answer round. It must equal WatchID, so the human answer goes back
 // into the same task and no new Watch is created (ADR 0031 §3). A plain ack
 // without ContinueOf never changes the Watch verdict or status.
+//
+// AckReceipt returns the Watch revision the ack was given at (ADR 0036 §5).
+// An event whose Revision is older than that committed revision is discarded
+// before any stamp or transition. Use IsStaleRevision to recognise a discard.
 func (h *AckHandler) Ack(ctx context.Context, in AckInput) error {
+	_, err := h.AckReceipt(ctx, in)
+	return err
+}
+
+// AckReceipt performs the ack and reports the committed revision it observed.
+// The revision is captured before a continueOf transition, so the receipt names
+// the version the ack actually acknowledged, not the successor it resumes.
+func (h *AckHandler) AckReceipt(ctx context.Context, in AckInput) (AckReceipt, error) {
 	if in.WatchID == "" || in.ObligationID == "" {
-		return domain.NewAppError(domain.CodeInvalidInput, "ack: watchID and obligationID are required")
+		return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: watchID and obligationID are required")
 	}
 	if h == nil || h.store == nil || h.stamper == nil {
-		return domain.NewAppError(domain.CodePersistFailed, "ack: store or stamper is nil")
+		return AckReceipt{}, domain.NewAppError(domain.CodePersistFailed, "ack: store or stamper is nil")
 	}
 
 	o, err := h.store.Obligation(in.ObligationID)
 	if err != nil {
-		return mapResultReadError(err, "ack: obligation")
+		return AckReceipt{}, mapResultReadError(err, "ack: obligation")
 	}
 	if o.WatchID != in.WatchID {
-		return domain.NewAppError(domain.CodeInvalidInput, "ack: obligation does not belong to the Watch")
+		return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: obligation does not belong to the Watch")
 	}
+
+	w, err := h.store.Watch(in.WatchID)
+	if err != nil {
+		return AckReceipt{}, mapResultReadError(err, "ack: watch")
+	}
+	committed := w.Revision
+	if in.Revision != 0 && in.Revision < committed {
+		return AckReceipt{Revision: committed}, &StaleRevisionError{Event: in.Revision, Committed: committed}
+	}
+
 	if in.ContinueOf != "" {
-		if err := h.continueWatch(in); err != nil {
-			return err
+		if err := h.continueWatch(in, w); err != nil {
+			return AckReceipt{}, err
 		}
 	}
 	if _, _, err := h.stamper.StampClaimed(ctx, in.ObligationID, h.clock.Now()); err != nil {
-		return err
+		return AckReceipt{}, err
 	}
-	return nil
+	return AckReceipt{OK: true, Revision: committed}, nil
 }
 
 // continueWatch applies the domain continue transition to the same Watch. It
 // consumes one answer round before touching the Watch, so a refused round
 // leaves both the Watch and the obligation unchanged. The domain transition
 // never emits EffectCreateWatch; that invariant is checked here as well.
-func (h *AckHandler) continueWatch(in AckInput) error {
+func (h *AckHandler) continueWatch(in AckInput, w domain.Watch) error {
 	if in.ContinueOf != in.WatchID {
 		return domain.NewAppError(domain.CodeInvalidInput, "ack: continueOf must name the same Watch")
 	}
 	round, err := h.continuations.Next(in.WatchID)
 	if err != nil {
 		return err
-	}
-	w, err := h.store.Watch(in.WatchID)
-	if err != nil {
-		return mapResultReadError(err, "ack: watch")
 	}
 	next, effects := domain.Transition(w, domain.ContinueEvent(in.ContinueOf, round, h.clock.Now()))
 	if next.Status != domain.StatusWatching || next.Revision == w.Revision {

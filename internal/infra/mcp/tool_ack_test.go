@@ -401,6 +401,194 @@ func TestAckContinueOfMustNameSameWatch(t *testing.T) {
 
 // TestSQLObligationStamperClaimedAtIdempotent proves the production stamper
 // persists claimedAt in one transaction and keeps it on a repeat.
+// TestAckInputSchemaHasRevision keeps the task revision in the derived MCP
+// input schema, so a client can pin the version its event was made against.
+func TestAckInputSchemaHasRevision(t *testing.T) {
+	schema, err := jsonschema.For[AckInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"revision"`)) {
+		t.Fatalf("input schema has no revision property: %s", raw)
+	}
+}
+
+// TestAckReceiptReturnsCommittedRevision proves ADR 0036 §5: the ack reports
+// the Watch revision it was given at, not the webhook event.id of ADR 0034 §4.
+// The ordinary MCP response stays ok-only as T2.23 requires.
+func TestAckReceiptReturnsCommittedRevision(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	w.Revision = 7
+	o := resultObligation(w, "session-revision")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
+
+	receipt, err := h.AckReceipt(context.Background(), AckInput{WatchID: w.ID, ObligationID: o.ID})
+	if err != nil {
+		t.Fatalf("AckReceipt: %v", err)
+	}
+	if !receipt.OK {
+		t.Fatal("ack receipt is not ok")
+	}
+	if receipt.Revision != w.Revision {
+		t.Errorf("receipt revision = %d, want committed Watch revision %d", receipt.Revision, w.Revision)
+	}
+
+	_, out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
+	if err != nil || !out.OK {
+		t.Fatalf("ordinary ack Handle: out %+v err %v", out, err)
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal ack response: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("unmarshal ack response: %v", err)
+	}
+	if len(fields) != 1 || fields["ok"] != true {
+		t.Errorf("ack response = %s, want only ok:true", body)
+	}
+}
+
+// TestAckDiscardsStaleEventRevision covers the acceptance criterion: once the
+// Watch has moved to a newer revision, an event carrying the older revision is
+// discarded. It stamps nothing, changes no Watch and reports the committed
+// revision so the caller can retry against it.
+func TestAckDiscardsStaleEventRevision(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 19, 16, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictReady)
+	w.Revision = 7
+	o := resultObligation(w, "session-stale")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+
+	first, err := h.AckReceipt(context.Background(), AckInput{WatchID: w.ID, ObligationID: o.ID, Revision: 7})
+	if err != nil || first.Revision != 7 {
+		t.Fatalf("first ack: receipt %+v err %v", first, err)
+	}
+
+	advanced := w
+	advanced.Revision = 8
+	if err := store.SaveWatch(advanced); err != nil {
+		t.Fatalf("advance Watch: %v", err)
+	}
+	_, claimsBefore := stamper.counts()
+
+	receipt, err := h.AckReceipt(context.Background(), AckInput{WatchID: w.ID, ObligationID: o.ID, Revision: 7})
+	if !IsStaleRevision(err) {
+		t.Fatalf("stale event was not discarded: receipt %+v err %v", receipt, err)
+	}
+	if receipt.OK {
+		t.Error("stale event returned an ok receipt")
+	}
+	if receipt.Revision != 8 {
+		t.Errorf("stale receipt revision = %d, want committed 8", receipt.Revision)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Revision != 8 {
+		t.Fatalf("stale event changed the Watch: %+v err %v", got, err)
+	}
+	_, claimsAfter := stamper.counts()
+	if claimsAfter != claimsBefore {
+		t.Errorf("stale event stamped the obligation: %d -> %d", claimsBefore, claimsAfter)
+	}
+	stamped, ok := stamper.snapshot(o.ID)
+	if !ok || !stamped.ClaimedAt.Equal(clock.t) {
+		t.Errorf("stale event changed claimedAt: %+v", stamped)
+	}
+
+	_, out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID, Revision: 7})
+	if err != nil {
+		t.Fatalf("stale Handle returned an error: %v", err)
+	}
+	if out.OK {
+		t.Error("stale Handle returned ok:true")
+	}
+}
+
+// TestAckAcceptsCurrentAndFutureRevision keeps an ack whose event matches or
+// leads the committed revision working, so only an older revision is dropped.
+func TestAckAcceptsCurrentAndFutureRevision(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	w.Revision = 7
+	o := resultObligation(w, "session-current")
+	store := newMemStore()
+	_ = store.SaveWatch(w)
+	_ = store.SaveObligation(o)
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
+
+	for _, revision := range []uint64{7, 9} {
+		receipt, err := h.AckReceipt(context.Background(), AckInput{WatchID: w.ID, ObligationID: o.ID, Revision: revision})
+		if err != nil {
+			t.Fatalf("revision %d: %v", revision, err)
+		}
+		if !receipt.OK || receipt.Revision != 7 {
+			t.Errorf("revision %d: receipt %+v, want ok with committed 7", revision, receipt)
+		}
+	}
+}
+
+// TestAckStaleEventDoesNotResumeParkedWatch applies the same revision guard to
+// an answer: a stale continueOf consumes no round and leaves the Watch parked.
+func TestAckStaleEventDoesNotResumeParkedWatch(t *testing.T) {
+	w := parkedAckWatch()
+	w.Revision = 4
+	o := resultObligation(w, "session-stale-answer")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
+
+	receipt, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID, Revision: 3,
+	})
+	if !IsStaleRevision(err) {
+		t.Fatalf("stale answer was not discarded: receipt %+v err %v", receipt, err)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Status != domain.StatusNeedsInput || got.Revision != w.Revision {
+		t.Errorf("stale answer changed the Watch: %+v err %v", got, err)
+	}
+	if rounds := h.continuations.Rounds(w.ID); rounds != 0 {
+		t.Errorf("stale answer consumed %d rounds, want 0", rounds)
+	}
+	_, claims := stamper.counts()
+	if claims != 0 {
+		t.Errorf("stale answer stamped the obligation %d times", claims)
+	}
+}
+
 func TestSQLObligationStamperClaimedAtIdempotent(t *testing.T) {
 	o := resultObligation(resultFixture(domain.VerdictReady), "session-C")
 	writer, load := newStampTestDB(t, o)
