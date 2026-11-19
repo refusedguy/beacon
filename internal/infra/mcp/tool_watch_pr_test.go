@@ -3,6 +3,9 @@ package mcp
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -515,17 +518,79 @@ func TestBridgePortSixOperations(t *testing.T) {
 	}
 }
 
-// externalAgentNames lists concrete agent products that belong in bridges,
-// not in the Go core (ADR 0024). OpenCode is excluded on purpose: its
-// "ai.opencode/sessionID" key is Beacon's own MCP _meta protocol field from
-// ADR 0006, not an external product that a bridge translates to.
-var externalAgentNames = []string{
-	"cursor", "claude", "copilot", "codex", "gemini",
+// unambiguousAgentNames are concrete products or harnesses whose presence in
+// a Go identifier or import path is a core binding to one agent (ADR 0024).
+var unambiguousAgentNames = []string{
+	"opencode", "claude", "goose", "copilot", "gemini", "codex",
 	"windsurf", "aider", "replit", "tabnine", "sourcery",
 }
 
-// TestCoreHasNoAgentNames greps every production Go file in the mcp package
-// for concrete agent product names. Test doubles are bridge side and excluded.
+// ambiguousAgentNames need context: ADR 0025 adds an event Cursor field to the
+// core, so the bare word cursor is protocol data and not an agent binding.
+var ambiguousAgentNames = []string{"cursor"}
+
+// agentContextWords turn an ambiguous name into an agent reference, as in
+// cursorAPI or cursorAgent.
+var agentContextWords = []string{"api", "agent", "sdk", "cli", "cloud"}
+
+// agentFindings scans Go identifiers and import paths for agent bindings. It
+// ignores comments and string literals: the ADR 0025 event cursor and the
+// "ai.opencode/sessionID" _meta key are protocol data, not agent bindings.
+func agentFindings(src string) []string {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "core.go", src, 0)
+	if err != nil {
+		return []string{"parse: " + err.Error()}
+	}
+
+	var tokens []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch v := n.(type) {
+		case *ast.Ident:
+			tokens = append(tokens, v.Name)
+		case *ast.ImportSpec:
+			path := strings.Trim(v.Path.Value, `"`)
+			tokens = append(tokens, path)
+			tokens = append(tokens, strings.FieldsFunc(path, func(r rune) bool {
+				return r == '/' || r == '.' || r == '-' || r == '_'
+			})...)
+		}
+		return true
+	})
+
+	seen := map[string]bool{}
+	var findings []string
+	add := func(name string) {
+		if !seen[name] {
+			seen[name] = true
+			findings = append(findings, name)
+		}
+	}
+	for _, token := range tokens {
+		lower := strings.ToLower(token)
+		for _, agent := range unambiguousAgentNames {
+			if strings.Contains(lower, agent) {
+				add(agent)
+			}
+		}
+		for _, agent := range ambiguousAgentNames {
+			if !strings.Contains(lower, agent) {
+				continue
+			}
+			for _, ctx := range agentContextWords {
+				if strings.Contains(lower, ctx) {
+					add(agent)
+					break
+				}
+			}
+		}
+	}
+	return findings
+}
+
+// TestCoreHasNoAgentNames checks that production Go code in the mcp package
+// binds no concrete agent (ADR 0024). Test doubles live on the bridge side and
+// are excluded.
 func TestCoreHasNoAgentNames(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -541,15 +606,61 @@ func TestCoreHasNoAgentNames(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ReadFile %s: %v", name, err)
 		}
-		lower := strings.ToLower(string(data))
-		for _, agent := range externalAgentNames {
-			if strings.Contains(lower, agent) {
-				t.Errorf("core file %s names agent product %q; ADR 0024 requires a bridge instead", name, agent)
-			}
+		for _, agent := range agentFindings(string(data)) {
+			t.Errorf("core file %s binds agent %q; ADR 0024 requires a bridge instead", name, agent)
 		}
 		scanned++
 	}
 	if scanned == 0 {
 		t.Fatal("no production Go files scanned")
+	}
+}
+
+// TestAgentFindingsPrecision proves the detector catches real agent bindings
+// and ignores the ADR 0025 event cursor and the _meta protocol key.
+func TestAgentFindingsPrecision(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want []string
+	}{
+		{
+			name: "ADR 0025 event cursor is not an agent",
+			src: "package mcp\n" +
+				"// ADR 0025: Status and Cursor replace the event history.\n" +
+				"type ListRunningOutput struct { Cursor string }\n" +
+				"func decodeEventCursor(s string) uint64 { return 0 }",
+			want: nil,
+		},
+		{
+			name: "meta protocol key is not an agent",
+			src:  "package mcp\nconst sessionIDMetaKey = \"ai.opencode/sessionID\"",
+			want: nil,
+		},
+		{
+			name: "import path binds an agent",
+			src:  "package mcp\nimport \"github.com/anthropic/claude-sdk\"",
+			want: []string{"claude"},
+		},
+		{
+			name: "cursor with agent context binds an agent",
+			src: "package mcp\n" +
+				"type cursorAPI struct{}\n" +
+				"var cursorAgent = cursorAPI{}",
+			want: []string{"cursor"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentFindings(tc.src)
+			if len(got) != len(tc.want) {
+				t.Fatalf("findings = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("finding %d = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
 	}
 }
