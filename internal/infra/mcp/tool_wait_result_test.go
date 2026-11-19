@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -792,5 +794,281 @@ func TestWaitResultFieldOrderIsCanonical(t *testing.T) {
 	want := `{"status":"closed","verdict":"merged","revision":8,"checks":{"ci/test":{"state":"COMPLETED","conclusion":"SUCCESS","required":true,"detailsUrl":""}},"pollAfterMs":5000}`
 	if string(got) != want {
 		t.Fatalf("canonical wait_result bytes:\n got  %s\n want %s", got, want)
+	}
+}
+
+// newTestCapabilityTree builds a capability context with a tree of tasks. Each
+// pair is {taskID, parentID}; an empty parent registers a root.
+func newTestCapabilityTree(t *testing.T, owner CapabilityID, pairs ...[2]string) (*CapabilityContext, *memoryCancelJournal) {
+	t.Helper()
+	journal := &memoryCancelJournal{}
+	ctx := NewCapabilityContext(owner, journal, waitTestClock{at: time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)})
+	for _, pair := range pairs {
+		if err := ctx.AddTask(pair[0], pair[1]); err != nil {
+			t.Fatalf("AddTask(%q, %q): %v", pair[0], pair[1], err)
+		}
+	}
+	return ctx, journal
+}
+
+// signalSource opens one subscription and signals when it is ready, so a test
+// can cancel a capability context after the wait has reached its select loop.
+type signalSource struct {
+	updates    chan WaitVerdictUpdate
+	subscribed chan struct{}
+	once       sync.Once
+}
+
+func (s *signalSource) Subscribe(string) VerdictSubscription {
+	s.once.Do(func() { close(s.subscribed) })
+	return &waitTestSubscription{ch: s.updates}
+}
+
+// TestCapabilityContextCancelTearsDownTree proves ADR 0040 §1 on the context
+// itself: Cancel delivers one reason to every node of the tree, journals each
+// one, closes Done, refuses new work and is idempotent.
+func TestCapabilityContextCancelTearsDownTree(t *testing.T) {
+	ctx, journal := newTestCapabilityTree(t, "cap-review",
+		[2]string{"root", ""},
+		[2]string{"child-a", "root"},
+		[2]string{"child-b", "root"},
+		[2]string{"grandchild", "child-a"},
+	)
+
+	ctx.Cancel(CancelCallerCancelled)
+
+	if !ctx.IsCancelled() {
+		t.Fatal("context not cancelled")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("Done not closed")
+	}
+	if got := ctx.Reason(); got != CancelCallerCancelled {
+		t.Fatalf("reason = %q, want %q", got, CancelCallerCancelled)
+	}
+
+	wantIDs := []string{"root", "child-a", "child-b", "grandchild"}
+	tasks := ctx.CancelledTasks()
+	if len(tasks) != len(wantIDs) {
+		t.Fatalf("cancelled tasks = %d, want %d", len(tasks), len(wantIDs))
+	}
+	for i, got := range tasks {
+		if got.TaskID != wantIDs[i] || got.Reason != CancelCallerCancelled {
+			t.Errorf("task[%d] = %+v, want %q/%q", i, got, wantIDs[i], CancelCallerCancelled)
+		}
+	}
+
+	records := journal.Records()
+	if len(records) != len(wantIDs) {
+		t.Fatalf("journal records = %d, want %d", len(records), len(wantIDs))
+	}
+	for i, r := range records {
+		if r.Owner != "cap-review" || r.TaskID != wantIDs[i] || r.Reason != CancelCallerCancelled || r.At.IsZero() {
+			t.Errorf("record[%d] = %+v", i, r)
+		}
+	}
+
+	assertCode(t, ctx.AddTask("late", "root"), domain.CodeCancelled)
+	ctx.Cancel(CancelSessionClosed)
+	if got := ctx.Reason(); got != CancelCallerCancelled {
+		t.Errorf("reason changed on repeat cancel: %q", got)
+	}
+	if n := len(journal.Records()); n != len(wantIDs) {
+		t.Errorf("repeat cancel wrote %d extra records", n-len(wantIDs))
+	}
+}
+
+// TestWaitResultDepartureCancelsCapabilityTree drives each departure channel
+// on a wait bound to a tree. Every departure tears down the whole tree with the
+// matching reason and still writes no readAt and no obligation (T2.5).
+func TestWaitResultDepartureCancelsCapabilityTree(t *testing.T) {
+	cases := []struct {
+		name      string
+		makeExits func(chan struct{}) CallerExit
+		reason    CancelReason
+		code      domain.ErrorCode
+	}{
+		{"cancelled", func(ch chan struct{}) CallerExit { return CallerExit{Cancelled: ch} }, CancelCallerCancelled, domain.CodeCancelled},
+		{"session closed", func(ch chan struct{}) CallerExit { return CallerExit{SessionClosed: ch} }, CancelSessionClosed, domain.CodeGone},
+		{"connection broken", func(ch chan struct{}) CallerExit { return CallerExit{ConnectionBroken: ch} }, CancelConnectionBroken, domain.CodeGone},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc, store, writer, _, _ := newWaitTestService()
+			ctx, journal := newTestCapabilityTree(t, "cap-agent",
+				[2]string{"root", ""},
+				[2]string{"child-a", "root"},
+				[2]string{"child-b", "root"},
+			)
+			ch := make(chan struct{})
+			close(ch)
+
+			_, err := svc.WaitInCapability(context.Background(), "sub-A",
+				WaitResultInput{WatchID: "watch-1"}, tc.makeExits(ch), ctx)
+			assertCode(t, err, tc.code)
+			if !ctx.IsCancelled() || ctx.Reason() != tc.reason {
+				t.Fatalf("cancelled=%v reason=%q, want true/%q", ctx.IsCancelled(), ctx.Reason(), tc.reason)
+			}
+			for _, got := range ctx.CancelledTasks() {
+				if got.Reason != tc.reason {
+					t.Errorf("task %q reason = %q, want %q", got.TaskID, got.Reason, tc.reason)
+				}
+			}
+			records := journal.Records()
+			if len(records) != 3 {
+				t.Fatalf("journal records = %d, want 3", len(records))
+			}
+			for _, r := range records {
+				if r.Reason != tc.reason || r.Owner != "cap-agent" {
+					t.Errorf("record = %+v, want cap-agent/%q", r, tc.reason)
+				}
+			}
+			if len(writer.reads) != 0 || store.obligationWrites != 0 {
+				t.Errorf("departure wrote %d readAt and %d obligations, want 0/0", len(writer.reads), store.obligationWrites)
+			}
+		})
+	}
+}
+
+// TestWaitResultExternalCapabilityCancelStopsWait proves that a descendant
+// already blocked in the long-poll stops when the context is cancelled from
+// outside, without any departure channel of its own.
+func TestWaitResultExternalCapabilityCancelStopsWait(t *testing.T) {
+	svc, _, writer, _, _ := newWaitTestService()
+	src := &signalSource{updates: make(chan WaitVerdictUpdate, 1), subscribed: make(chan struct{})}
+	svc.source = src
+	ctx, journal := newTestCapabilityTree(t, "cap-agent",
+		[2]string{"root", ""},
+		[2]string{"child", "root"},
+	)
+
+	type result struct {
+		out WaitResultOutput
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := svc.WaitInCapability(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{}, ctx)
+		done <- result{out: out, err: err}
+	}()
+
+	<-src.subscribed
+	ctx.Cancel(CancelSessionClosed)
+
+	select {
+	case got := <-done:
+		assertCode(t, got.err, domain.CodeGone)
+		if !strings.Contains(got.err.Error(), string(CancelSessionClosed)) {
+			t.Errorf("error %q does not carry the cancellation reason %q", got.err, CancelSessionClosed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not stop after the capability context was cancelled")
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("capability cancel wrote %d readAt, want 0", len(writer.reads))
+	}
+	if len(journal.Records()) != 2 {
+		t.Errorf("journal records = %d, want 2", len(journal.Records()))
+	}
+}
+
+// TestWaitResultContextEndCancelsTree covers the fourth reason: the go-sdk
+// cancelling the handler context also tears down the tree with its own reason.
+func TestWaitResultContextEndCancelsTree(t *testing.T) {
+	svc, _, _, _, _ := newWaitTestService()
+	ctx, journal := newTestCapabilityTree(t, "cap-agent", [2]string{"root", ""})
+	callCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := svc.WaitInCapability(callCtx, "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{}, ctx)
+	assertCode(t, err, domain.CodeCancelled)
+	if ctx.Reason() != CancelContextEnded {
+		t.Errorf("reason = %q, want %q", ctx.Reason(), CancelContextEnded)
+	}
+	if len(journal.Records()) != 1 {
+		t.Errorf("journal records = %d, want 1", len(journal.Records()))
+	}
+}
+
+// TestWaitResultTimeoutDoesNotCancelCapabilityTree keeps the timeout a private
+// case (ADR 0040 §1): it returns watching and leaves the whole tree untouched.
+func TestWaitResultTimeoutDoesNotCancelCapabilityTree(t *testing.T) {
+	svc, _, writer, _, timeout := newWaitTestService()
+	ctx, journal := newTestCapabilityTree(t, "cap-agent",
+		[2]string{"root", ""},
+		[2]string{"child", "root"},
+	)
+	close(timeout)
+
+	out, err := svc.WaitInCapability(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{}, ctx)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if out.Status != string(domain.StatusWatching) || out.Verdict != string(domain.VerdictWatching) {
+		t.Errorf("status/verdict = %q/%q, want watching/watching", out.Status, out.Verdict)
+	}
+	if ctx.IsCancelled() {
+		t.Error("timeout cancelled the capability tree")
+	}
+	if len(journal.Records()) != 0 {
+		t.Errorf("timeout wrote %d cancellation records, want 0", len(journal.Records()))
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("timeout wrote %d readAt, want 0", len(writer.reads))
+	}
+}
+
+// TestWaitResultHandleCancelsTreeOnDeparture proves the handler wires the
+// capability scope: a departure seen through Handle tears down the bound tree.
+func TestWaitResultHandleCancelsTreeOnDeparture(t *testing.T) {
+	svc, _, writer, _, _ := newWaitTestService()
+	closed := make(chan struct{})
+	close(closed)
+	svc.SetDepartureProvider(func(*mcpsdk.CallToolRequest) CallerExit {
+		return CallerExit{Cancelled: closed}
+	})
+	ctx, journal := newTestCapabilityTree(t, "cap-agent",
+		[2]string{"root", ""},
+		[2]string{"child", "root"},
+	)
+	svc.SetCapabilityScope(func(*mcpsdk.CallToolRequest) *CapabilityContext { return ctx })
+
+	req := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Meta: mcpsdk.Meta{sessionIDMetaKey: "session-X"},
+	}}
+	_, _, err := svc.Handle(context.Background(), req, WaitResultInput{WatchID: "watch-1"})
+	assertCode(t, err, domain.CodeCancelled)
+	if !ctx.IsCancelled() || ctx.Reason() != CancelCallerCancelled {
+		t.Fatalf("cancelled=%v reason=%q, want true/%q", ctx.IsCancelled(), ctx.Reason(), CancelCallerCancelled)
+	}
+	if len(journal.Records()) != 2 {
+		t.Errorf("journal records = %d, want 2", len(journal.Records()))
+	}
+	if len(writer.reads) != 0 {
+		t.Errorf("departure wrote %d readAt, want 0", len(writer.reads))
+	}
+}
+
+// TestWaitResultHandleSkipsWorkWhenTreeAlreadyCancelled proves a descendant
+// arriving after the initiator disappeared does no work at all.
+func TestWaitResultHandleSkipsWorkWhenTreeAlreadyCancelled(t *testing.T) {
+	svc, store, writer, _, _ := newWaitTestService()
+	svc.SetDepartureProvider(func(*mcpsdk.CallToolRequest) CallerExit { return CallerExit{} })
+	ctx, journal := newTestCapabilityTree(t, "cap-agent", [2]string{"root", ""})
+	ctx.Cancel(CancelConnectionBroken)
+	svc.SetCapabilityScope(func(*mcpsdk.CallToolRequest) *CapabilityContext { return ctx })
+
+	req := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Meta: mcpsdk.Meta{sessionIDMetaKey: "session-X"},
+	}}
+	_, _, err := svc.Handle(context.Background(), req, WaitResultInput{WatchID: "watch-1"})
+	assertCode(t, err, domain.CodeGone)
+	if store.reads != 0 || len(writer.reads) != 0 {
+		t.Errorf("cancelled tree did work: store reads %d, readAt writes %d", store.reads, len(writer.reads))
+	}
+	if len(journal.Records()) != 1 {
+		t.Errorf("journal records = %d, want 1 (no duplicate cancel)", len(journal.Records()))
 	}
 }
