@@ -1,23 +1,35 @@
-// Package testdata holds recorded GitHub GraphQL and REST responses for the
-// verdict edge cases required by T2.16. This test is self-contained: its
-// structs mirror the T2.11 GraphQL response contract, and the verdict table is
-// reimplemented locally so the test never imports symbols from other files.
+// Package github holds the GitHub adapter for Beacon.
 //
-// The directory is named testdata, so "go test ./..." skips it. Run this test
-// explicitly with: go test ./internal/infra/github/testdata
-package testdata
+// This file runs the T2.16 fixture contract from the parent package, so
+// "go test ./..." actually executes it. The recorded responses stay in
+// testdata/. All parse structs and the verdict table are local to this file:
+// no symbol is imported from graphql.go, rest.go, tier2.go or another test.
+package github
 
 import (
 	"encoding/json"
+	"flag"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 )
 
-// graphQLResponse mirrors the T2.11 body: data keyed by alias, optional errors
-// and rateLimit.cost. Every fixture must parse into this shape with cost >= 1.
-type graphQLResponse struct {
+// TestMain turns on verbose output because CI runs "go test ./..." without -v.
+// Without this, a passing test prints only "ok <package>" and its name never
+// reaches the CI log, so execution cannot be confirmed from the log alone.
+func TestMain(m *testing.M) {
+	if f := flag.Lookup("test.v"); f != nil {
+		_ = f.Value.Set("true")
+	}
+	os.Exit(m.Run())
+}
+
+// fixtureGraphQLResponse mirrors the T2.11 body: data keyed by alias, optional
+// errors and rateLimit.cost. Every fixture must parse into this shape with a
+// cost of at least one point.
+type fixtureGraphQLResponse struct {
 	Data      map[string]json.RawMessage `json:"data"`
 	Errors    []json.RawMessage          `json:"errors"`
 	RateLimit struct {
@@ -25,8 +37,8 @@ type graphQLResponse struct {
 	} `json:"rateLimit"`
 }
 
-// tier1PR mirrors the tier-1 pullRequest fields from WORKER-PROMPT 4.6.
-type tier1PR struct {
+// fixtureTier1PR mirrors the tier-1 pullRequest fields from WORKER-PROMPT 4.6.
+type fixtureTier1PR struct {
 	State            string `json:"state"`
 	IsDraft          bool   `json:"isDraft"`
 	HeadRefOID       string `json:"headRefOid"`
@@ -45,9 +57,9 @@ type tier1PR struct {
 	} `json:"commits"`
 }
 
-// tier2PR mirrors the tier-2 statusCheckRollup.contexts nodes, including
+// fixtureTier2PR mirrors tier-2 statusCheckRollup.contexts nodes, including
 // isRequired and the CheckRun / StatusContext fragments.
-type tier2PR struct {
+type fixtureTier2PR struct {
 	StatusCheckRollup struct {
 		Contexts struct {
 			Nodes []struct {
@@ -67,24 +79,24 @@ type tier2PR struct {
 	} `json:"statusCheckRollup"`
 }
 
-type restWorkflowRun struct {
+type fixtureWorkflowRun struct {
 	HeadSHA      string            `json:"head_sha"`
 	PullRequests []json.RawMessage `json:"pull_requests"`
 }
 
-type restBranchProtection struct {
+type fixtureBranchProtection struct {
 	RequiredStatusChecks struct {
 		Strict   bool     `json:"strict"`
 		Contexts []string `json:"contexts"`
 	} `json:"required_status_checks"`
 }
 
-type restRef struct {
+type fixtureRESTRef struct {
 	Path string `json:"path"`
 	Kind string `json:"kind"`
 }
 
-type caseDef struct {
+type fixtureCaseDef struct {
 	ID          string `json:"id"`
 	Case        string `json:"case"`
 	Description string `json:"description"`
@@ -98,9 +110,9 @@ type caseDef struct {
 		IgnoreReviews   bool `json:"ignoreReviews"`
 	} `json:"policy"`
 	Responses struct {
-		Tier1 string    `json:"tier1"`
-		Tier2 string    `json:"tier2"`
-		REST  []restRef `json:"rest"`
+		Tier1 string           `json:"tier1"`
+		Tier2 string           `json:"tier2"`
+		REST  []fixtureRESTRef `json:"rest"`
 	} `json:"responses"`
 	Expected struct {
 		Verdict string `json:"verdict"`
@@ -109,32 +121,43 @@ type caseDef struct {
 	} `json:"expected"`
 }
 
-type manifest struct {
-	Cases []caseDef `json:"cases"`
+type fixtureManifest struct {
+	Cases []fixtureCaseDef `json:"cases"`
 }
 
-func loadManifest(t *testing.T) manifest {
-	t.Helper()
-	b, err := os.ReadFile("cases.json")
-	if err != nil {
-		t.Fatalf("read cases.json: %v", err)
+// fixturePath resolves a manifest path. Paths in cases.json are relative to
+// the testdata directory; this test runs one level above it.
+func fixturePath(rel string) string {
+	if rel == "" {
+		return ""
 	}
-	var m manifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		t.Fatalf("decode cases.json: %v", err)
-	}
-	return m
+	return filepath.Join("testdata", rel)
 }
 
-// loadPR reads a recorded GraphQL response, checks it against the T2.11 body
-// contract, and decodes data.p0 into out.
-func loadPR(t *testing.T, path string, out any) {
+func loadFixtureManifest(t *testing.T) fixtureManifest {
 	t.Helper()
+	path := fixturePath("cases.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
-	var resp graphQLResponse
+	var m fixtureManifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+	return m
+}
+
+// loadFixturePR reads a recorded GraphQL response, checks it against the
+// T2.11 body contract, and decodes data.p0 into out.
+func loadFixturePR(t *testing.T, rel string, out any) {
+	t.Helper()
+	path := fixturePath(rel)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var resp fixtureGraphQLResponse
 	if err := json.Unmarshal(b, &resp); err != nil {
 		t.Fatalf("decode %s: %v", path, err)
 	}
@@ -153,21 +176,22 @@ func loadPR(t *testing.T, path string, out any) {
 	}
 }
 
-func loadREST(t *testing.T, path, kind string) (*restWorkflowRun, *restBranchProtection) {
+func loadFixtureREST(t *testing.T, rel, kind string) (*fixtureWorkflowRun, *fixtureBranchProtection) {
 	t.Helper()
+	path := fixturePath(rel)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	switch kind {
 	case "workflow_run":
-		var r restWorkflowRun
+		var r fixtureWorkflowRun
 		if err := json.Unmarshal(b, &r); err != nil {
 			t.Fatalf("decode %s: %v", path, err)
 		}
 		return &r, nil
 	case "branch_protection":
-		var r restBranchProtection
+		var r fixtureBranchProtection
 		if err := json.Unmarshal(b, &r); err != nil {
 			t.Fatalf("decode %s: %v", path, err)
 		}
@@ -178,40 +202,40 @@ func loadREST(t *testing.T, path, kind string) (*restWorkflowRun, *restBranchPro
 	}
 }
 
-type decision struct {
+type fixtureDecision struct {
 	verdict string
 	reason  string
 }
 
-// decide is a local reference implementation of the WORKER-PROMPT 4.6 verdict
-// table, limited to the branches these fixtures exercise.
-func decide(c caseDef, t1 tier1PR, t2 *tier2PR, bp *restBranchProtection) decision {
+// fixtureDecide is a local reference implementation of the WORKER-PROMPT 4.6
+// verdict table, limited to the branches these fixtures exercise.
+func fixtureDecide(c fixtureCaseDef, t1 fixtureTier1PR, t2 *fixtureTier2PR, bp *fixtureBranchProtection) fixtureDecision {
 	if t1.State == "MERGED" {
-		return decision{"merged", ""}
+		return fixtureDecision{"merged", ""}
 	}
 	if t1.State == "CLOSED" {
-		return decision{"closed", ""}
+		return fixtureDecision{"closed", ""}
 	}
 	if t1.HeadRefOID != c.Watch.HeadSHA {
-		return decision{"head_changed", "head sha changed"}
+		return fixtureDecision{"head_changed", "head sha changed"}
 	}
 	if t1.MergeStateStatus == "DIRTY" {
-		return decision{"rebase", "merge conflict"}
+		return fixtureDecision{"rebase", "merge conflict"}
 	}
 	if t1.MergeStateStatus == "BEHIND" && c.Policy.RequireUpToDate {
-		return decision{"rebase", "behind and requireUpToDate"}
+		return fixtureDecision{"rebase", "behind and requireUpToDate"}
 	}
 	if t2 != nil {
 		if t2.StatusCheckRollup.Contexts.PageInfo.HasNextPage {
-			return decision{"watching", "contexts paginated"}
+			return fixtureDecision{"watching", "contexts paginated"}
 		}
-		if pendingReasons(t2) {
-			return decision{"watching", "checks pending"}
+		if fixturePendingReasons(t2) {
+			return fixtureDecision{"watching", "checks pending"}
 		}
 	}
 	if bp != nil && t2 != nil {
-		if missing := missingRequired(t2, bp); len(missing) > 0 {
-			return decision{"timeout", "required checks not created: " + strings.Join(missing, ",")}
+		if missing := fixtureMissingRequired(t2, bp); len(missing) > 0 {
+			return fixtureDecision{"timeout", "required checks not created: " + strings.Join(missing, ",")}
 		}
 	}
 	rollup := ""
@@ -219,26 +243,26 @@ func decide(c caseDef, t1 tier1PR, t2 *tier2PR, bp *restBranchProtection) decisi
 		rollup = t1.Commits.Nodes[0].Commit.StatusCheckRollup.State
 	}
 	if rollup == "FAILURE" || rollup == "ERROR" {
-		return decision{"keep_working", "checks failed"}
+		return fixtureDecision{"keep_working", "checks failed"}
 	}
 	if rollup == "SUCCESS" && t1.Mergeable == "MERGEABLE" &&
 		(t1.MergeStateStatus == "CLEAN" || t1.MergeStateStatus == "HAS_HOOKS" ||
 			(t1.MergeStateStatus == "BEHIND" && !c.Policy.RequireUpToDate)) &&
 		!t1.IsDraft && (c.Policy.IgnoreReviews || t1.ReviewDecision != "CHANGES_REQUESTED") {
-		return decision{"ready", ""}
+		return fixtureDecision{"ready", ""}
 	}
 	if t1.IsDraft {
-		return decision{"watching", "draft"}
+		return fixtureDecision{"watching", "draft"}
 	}
 	if t1.Mergeable == "UNKNOWN" {
-		return decision{"watching", "mergeable unknown"}
+		return fixtureDecision{"watching", "mergeable unknown"}
 	}
-	return decision{"watching", "watching"}
+	return fixtureDecision{"watching", "watching"}
 }
 
-// pendingReasons reports ACTION_REQUIRED, WAITING, QUEUED, IN_PROGRESS and
-// pending StatusContext states. SKIPPED and NEUTRAL are not pending.
-func pendingReasons(t2 *tier2PR) bool {
+// fixturePendingReasons reports ACTION_REQUIRED, WAITING, QUEUED, IN_PROGRESS
+// and pending StatusContext states. SKIPPED and NEUTRAL are not pending.
+func fixturePendingReasons(t2 *fixtureTier2PR) bool {
 	for _, n := range t2.StatusCheckRollup.Contexts.Nodes {
 		switch {
 		case n.Typename == "CheckRun" && n.Status == "QUEUED",
@@ -252,9 +276,9 @@ func pendingReasons(t2 *tier2PR) bool {
 	return false
 }
 
-// missingRequired returns required contexts from branch protection that are
-// not present in the recorded rollup contexts.
-func missingRequired(t2 *tier2PR, bp *restBranchProtection) []string {
+// fixtureMissingRequired returns required contexts from branch protection
+// that are absent from the recorded rollup contexts.
+func fixtureMissingRequired(t2 *fixtureTier2PR, bp *fixtureBranchProtection) []string {
 	present := make(map[string]bool)
 	for _, n := range t2.StatusCheckRollup.Contexts.Nodes {
 		if !n.IsRequired {
@@ -277,21 +301,21 @@ func missingRequired(t2 *tier2PR, bp *restBranchProtection) []string {
 	return missing
 }
 
-func findCase(t *testing.T, id string) caseDef {
+func findFixtureCase(t *testing.T, id string) fixtureCaseDef {
 	t.Helper()
-	for _, c := range loadManifest(t).Cases {
+	for _, c := range loadFixtureManifest(t).Cases {
 		if c.ID == id {
 			return c
 		}
 	}
 	t.Fatalf("no fixture with id %q", id)
-	return caseDef{}
+	return fixtureCaseDef{}
 }
 
-func casesOf(t *testing.T, name string) []caseDef {
+func fixtureCasesOf(t *testing.T, name string) []fixtureCaseDef {
 	t.Helper()
-	var out []caseDef
-	for _, c := range loadManifest(t).Cases {
+	var out []fixtureCaseDef
+	for _, c := range loadFixtureManifest(t).Cases {
 		if c.Case == name {
 			out = append(out, c)
 		}
@@ -302,10 +326,10 @@ func casesOf(t *testing.T, name string) []caseDef {
 	return out
 }
 
-// TestAllCasesPresent enforces the eight cases from the T2.16 card. BEHIND is
-// one case recorded twice, once for each requireUpToDate policy.
-func TestAllCasesPresent(t *testing.T) {
-	m := loadManifest(t)
+// TestFixtureAllCasesPresent enforces the eight cases from the T2.16 card.
+// BEHIND is one case recorded twice, once per requireUpToDate policy.
+func TestFixtureAllCasesPresent(t *testing.T) {
+	m := loadFixtureManifest(t)
 	want := []string{"fork", "missing-required", "skipped-neutral", "pending-states", "draft", "behind", "merged", "closed"}
 	have := make(map[string]bool, len(m.Cases))
 	for _, c := range m.Cases {
@@ -321,31 +345,31 @@ func TestAllCasesPresent(t *testing.T) {
 	}
 }
 
-// TestFixtures loads every fixture, validates the recorded responses against
-// the T2.11 parse contract, and compares the expected verdict with the local
-// reference verdict table.
-func TestFixtures(t *testing.T) {
-	m := loadManifest(t)
+// TestFixturesProduceExpectedVerdicts loads every fixture, validates the
+// recorded responses against the T2.11 parse contract, and compares the
+// expected verdict with the local reference verdict table.
+func TestFixturesProduceExpectedVerdicts(t *testing.T) {
+	m := loadFixtureManifest(t)
 	if len(m.Cases) != 9 {
 		t.Fatalf("fixture count = %d, want 9 (8 cases, BEHIND twice)", len(m.Cases))
 	}
 	for _, c := range m.Cases {
 		t.Run(c.ID, func(t *testing.T) {
-			var t1 tier1PR
-			loadPR(t, c.Responses.Tier1, &t1)
-			var t2 *tier2PR
+			var t1 fixtureTier1PR
+			loadFixturePR(t, c.Responses.Tier1, &t1)
+			var t2 *fixtureTier2PR
 			if c.Responses.Tier2 != "" {
-				t2 = &tier2PR{}
-				loadPR(t, c.Responses.Tier2, t2)
+				t2 = &fixtureTier2PR{}
+				loadFixturePR(t, c.Responses.Tier2, t2)
 			}
-			var bp *restBranchProtection
+			var bp *fixtureBranchProtection
 			for _, r := range c.Responses.REST {
-				_, parsed := loadREST(t, r.Path, r.Kind)
+				_, parsed := loadFixtureREST(t, r.Path, r.Kind)
 				if parsed != nil {
 					bp = parsed
 				}
 			}
-			got := decide(c, t1, t2, bp)
+			got := fixtureDecide(c, t1, t2, bp)
 			if got.verdict != c.Expected.Verdict {
 				t.Errorf("verdict = %q, want %q", got.verdict, c.Expected.Verdict)
 			}
@@ -356,19 +380,20 @@ func TestFixtures(t *testing.T) {
 	}
 }
 
-// TestForkBindsByHeadSHA proves the fork fixture needs no PR number: its REST
-// pull_requests is empty, and the GraphQL headRefOid matches the watch SHA.
-func TestForkBindsByHeadSHA(t *testing.T) {
-	c := findCase(t, "fork")
-	var t1 tier1PR
-	loadPR(t, c.Responses.Tier1, &t1)
+// TestForkFixtureBindsByHeadSHA proves the fork fixture needs no PR number:
+// its REST pull_requests is empty and the GraphQL headRefOid matches the
+// watch SHA.
+func TestForkFixtureBindsByHeadSHA(t *testing.T) {
+	c := findFixtureCase(t, "fork")
+	var t1 fixtureTier1PR
+	loadFixturePR(t, c.Responses.Tier1, &t1)
 	if t1.HeadRefOID != c.Watch.HeadSHA {
 		t.Fatalf("fork headRefOid = %s, watch headSHA = %s", t1.HeadRefOID, c.Watch.HeadSHA)
 	}
 	if len(c.Responses.REST) != 1 {
 		t.Fatalf("fork REST responses = %d, want 1", len(c.Responses.REST))
 	}
-	wr, _ := loadREST(t, c.Responses.REST[0].Path, c.Responses.REST[0].Kind)
+	wr, _ := loadFixtureREST(t, c.Responses.REST[0].Path, c.Responses.REST[0].Kind)
 	if wr == nil {
 		t.Fatal("fork REST response is not a workflow run")
 	}
@@ -386,10 +411,11 @@ func TestForkBindsByHeadSHA(t *testing.T) {
 	}
 }
 
-// TestBehindBothPolicies proves BEHIND is checked with both policy values.
-func TestBehindBothPolicies(t *testing.T) {
+// TestBehindFixtureChecksBothPolicies proves BEHIND is checked with both
+// requireUpToDate values.
+func TestBehindFixtureChecksBothPolicies(t *testing.T) {
 	got := make(map[bool]string)
-	for _, c := range casesOf(t, "behind") {
+	for _, c := range fixtureCasesOf(t, "behind") {
 		got[c.Policy.RequireUpToDate] = c.Expected.Verdict
 	}
 	if got[true] != "rebase" {
