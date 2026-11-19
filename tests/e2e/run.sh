@@ -7,4 +7,4 @@ GO="${GO_BIN:-/tmp/opencode/go126/bin/go}"
 if [[ ! -x "$GO" ]]; then
   GO="$(command -v go)"
 fi
-exec "$GO" test ./tests/e2e -count=1 -v "$@"
+exec "$GO" test -tags=e2e ./tests/e2e -count=1 -v "$@"

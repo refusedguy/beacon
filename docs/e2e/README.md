@@ -9,8 +9,10 @@ bash tests/e2e/run.sh
 Эквивалентно:
 
 ```bash
-/tmp/opencode/go126/bin/go test ./tests/e2e -count=1 -v
+/tmp/opencode/go126/bin/go test -tags=e2e ./tests/e2e -count=1 -v
 ```
+
+Файл `e2e_test.go` имеет build tag `//go:build e2e`. Обычный `go test ./...` пропускает его, поэтому в CI без opencode корневой тест не падает.
 
 Токен GitHub не нужен: тест не делает запросов к GitHub. Владелец запускает локально; в CI вызывается та же команда.
 
@@ -39,7 +41,7 @@ bash tests/e2e/run.sh
 
 1. **Плагин из `fixtures` — эталон, не плагин репозитория.** `tests/e2e/fixtures/beacon-bridge.js` скопирован из рабочего спайка `tmp/p0-wake/proj/.opencode/plugins/beacon-bridge.js` (T0.3). Файл `.opencode/plugins/beacon-bridge.js` в репозитории не менялся. Прогон доказывает, что реальный opencode грузит плагин и будит сессию, но **не доказывает**, что репозиторийский плагин уже умеет будить. Сейчас он каркас: подписан на `session.execution.started` и не вызывает `ctx.session.prompt`. Тест `repo_plugin_skeleton` печатает этот факт как диагностику. Это блокер для проверки шага (e) на продакшн-плагине.
 2. **Семь инструментов — контракт, не поведение.** `NewServer` в `internal/infra/mcp/server.go` регистрирует `stubHandler` для всех семи инструментов. `tools/call beacon_list_running` проверяет только протокольный round trip. Реальные обработчики (`AttachWatchPR` и др.) нигде не собираются в точку входа.
-3. **`beacon mcp` пока не в main.** PR #40 с `feat/w43` открыт. Тест ищет `cmd/beacon/mcp.go` по `BEACON_MCP_SRC`, затем в `worktrees/w43` соседнего checkout, затем в корне репозитория. Если нигде нет, падает с явным сообщением. Сборка из main без подкоманды не выдаётся за e2e.
+3. **`beacon mcp` сейчас уже в main** (PR #40 влит). Тест собирает бинарник из корня репозитория и объясняет это в логе. Переменная `BEACON_MCP_SRC` позволяет указать другой checkout. Если `cmd/beacon/mcp.go` нигде нет, тест падает с явным сообщением.
 4. **`opencode api` не умеет читать SSE.** Проверено на живом сервере 2.3.0: `opencode api GET /api/event` за 7 с вернул 0 байт, тогда как прямой поток отдавал `server.connected` и heartbeat. Заглушки здесь нет: тест запускает CLI, фиксирует отсутствие кадров отдельной строкой лога и не считает SSE доказанным. Факт пробуждения доказывается подпиской плагина, квитанцией и `prompt.ok`.
 
 ## Переменные окружения

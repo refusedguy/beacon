@@ -1,3 +1,5 @@
+//go:build e2e
+
 // Package e2e drives real processes only. There is no fake host, fake session
 // or in-memory MCP transport here. Facts come from three tools:
 //
@@ -83,10 +85,8 @@ func resolveMcpSource(t *testing.T) string {
 	t.Helper()
 	candidates := []string{
 		os.Getenv("BEACON_MCP_SRC"),
-		filepath.Join(repoRoot, "worktrees", "w43"),
-		filepath.Join(filepath.Dir(repoRoot), "w43"),
-		filepath.Join(filepath.Dir(filepath.Dir(repoRoot)), "worktrees", "w43"),
 		repoRoot,
+		filepath.Join(filepath.Dir(repoRoot), "w43"),
 	}
 	for _, dir := range candidates {
 		if dir == "" {
@@ -96,8 +96,8 @@ func resolveMcpSource(t *testing.T) string {
 			return dir
 		}
 	}
-	t.Fatal("beacon mcp недоступен: PR #40 (feat/w43) ещё не влит в main, " +
-		"а в main нет cmd/beacon/mcp.go. Укажи BEACON_MCP_SRC=<checkout с mcp.go> или дождись merge")
+	t.Fatal("beacon mcp недоступен: нет cmd/beacon/mcp.go ни в корне репозитория, " +
+		"ни по BEACON_MCP_SRC. Укажи BEACON_MCP_SRC=<checkout с mcp.go>")
 	return ""
 }
 
