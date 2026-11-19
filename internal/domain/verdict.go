@@ -294,3 +294,32 @@ func ParseReviewVerdict(s string) (ReviewVerdict, bool) {
 	}
 	return v, true
 }
+
+// ShipFacts is the set of observed facts the compiled-in ship formula reads.
+// Every field is produced by code from a deterministic source, never by a
+// free-form model opinion. Build and Audit come from the required CI checks;
+// TDD records that the change was produced test-first; Trivial records that
+// the change matched a triviality condition declared explicitly in code.
+// The struct carries no configuration, so changing a fact cannot change the
+// rule that consumes it.
+type ShipFacts struct {
+	Build   bool
+	Audit   bool
+	TDD     bool
+	Trivial bool
+}
+
+// ShipAllowed is the compiled-in ship formula from ADR 0040 §2:
+//
+//	ship ⇒ build ∧ audit ∧ (tdd ∨ trivial)
+//
+// It is a pure function over facts: the same facts always give the same
+// answer, and the function reads no clock, config, prompt or mutable state.
+// The rule itself lives in code and takes no policy to override it, so a
+// model cannot reconfigure or argue around it. Changing the rule requires a
+// code change and a review, never a setting. This is immutability of the rule,
+// not a replacement of the ADR 0001 verdict service: that service applies the
+// formula to observed facts but cannot alter it.
+func ShipAllowed(f ShipFacts) bool {
+	return f.Build && f.Audit && (f.TDD || f.Trivial)
+}
