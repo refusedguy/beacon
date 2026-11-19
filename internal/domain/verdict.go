@@ -426,3 +426,112 @@ func proofForPhase(proofs []Proof, phaseID string) (Proof, bool) {
 	}
 	return Proof{}, false
 }
+
+// ExternalCheck is the observed result of one check that Beacon declared and
+// an external verifier ran outside the agent. ExitCode is the process exit
+// code: 0 means pass, any other value means fail. The agent's own account of
+// its work is never an input, so it cannot supply or change the exit code.
+type ExternalCheck struct {
+	Name     string
+	ExitCode int
+}
+
+// ExternalVerdict is the decision of the external verification gate. It is a
+// separate concept from Verdict (T3.67, one CI observation of a Watch) and
+// ReviewVerdict (ADR 0038 §4, a reviewer's SHIP/FIX-FIRST/BLOCKED decision):
+// this verdict is computed only from exit codes of checks Beacon declared and
+// ran outside the agent (ADR 0044 §3).
+type ExternalVerdict string
+
+const (
+	// ExternalPass means every declared check was observed with exit code 0.
+	ExternalPass ExternalVerdict = "PASS"
+	// ExternalFail means a declared check failed or was not observed. An empty
+	// declaration also fails closed.
+	ExternalFail ExternalVerdict = "FAIL"
+)
+
+// CheckOutcome is one declared check in the on-disk evidence. Observed is
+// false when the external verifier produced no exit code for the check, so a
+// missing run stays visible on disk and never passes. Passed is true only for
+// an observed check with exit code 0.
+type CheckOutcome struct {
+	Name     string `json:"name"`
+	ExitCode int    `json:"exit_code"`
+	Observed bool   `json:"observed"`
+	Passed   bool   `json:"passed"`
+}
+
+// ExternalEvidence is the record an adapter writes to disk after the external
+// checks ran. It carries the verdict and every declared check with the exit
+// code behind it so a reviewer can re-check the decision from the on-disk
+// facts alone. Nothing the agent reported is part of the record: the verdict
+// is an external check of the result, not the agent's proof (T3.88) and not
+// the compiled-in ship formula (T3.67).
+type ExternalEvidence struct {
+	Verdict ExternalVerdict `json:"verdict"`
+	Checks  []CheckOutcome  `json:"checks"`
+}
+
+// EvaluateExternal computes the external verdict and its evidence from the
+// checks Beacon declared and the exit codes an external verifier observed. It
+// is pure: it runs no process, reads no clock and writes no file. An adapter
+// runs the declared checks and persists the returned evidence; this function
+// only decides and records.
+//
+// The gate fails closed. An empty declaration never passes, because an empty
+// panel is not a clean run. Every declared check must have an observed exit
+// code of 0; a missing observation or any non-zero exit code fails the gate.
+// Only declared names and observed exit codes enter the decision, so an
+// agent's own claim about its work cannot move the verdict. Evidence keeps
+// the declaration order and drops duplicate names; when a check is observed
+// more than once the first exit code wins, and observations for checks that
+// were not declared are ignored.
+func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvidence {
+	evidence := ExternalEvidence{
+		Verdict: ExternalFail,
+		Checks:  []CheckOutcome{},
+	}
+	if len(declared) == 0 {
+		return evidence
+	}
+
+	exitBy := make(map[string]int, len(observed))
+	for _, c := range observed {
+		if _, ok := exitBy[c.Name]; !ok {
+			exitBy[c.Name] = c.ExitCode
+		}
+	}
+
+	seen := make(map[string]bool, len(declared))
+	allPass := true
+	for _, name := range declared {
+		if name == "" {
+			// A malformed declaration cannot name a real check, so it
+			// fails the gate instead of being silently dropped.
+			allPass = false
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		exit, ok := exitBy[name]
+		outcome := CheckOutcome{
+			Name:     name,
+			ExitCode: exit,
+			Observed: ok,
+			Passed:   ok && exit == 0,
+		}
+		evidence.Checks = append(evidence.Checks, outcome)
+		if !outcome.Passed {
+			allPass = false
+		}
+	}
+
+	if len(evidence.Checks) == 0 || !allPass {
+		return evidence
+	}
+	evidence.Verdict = ExternalPass
+	return evidence
+}

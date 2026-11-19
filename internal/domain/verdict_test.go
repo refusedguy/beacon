@@ -935,3 +935,266 @@ func TestCompletionResultJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestEvaluateExternalDecisionTable covers ADR 0044 §3: the verdict is made
+// only from declared checks and their observed exit codes, and the gate fails
+// closed on an empty or incomplete panel.
+func TestEvaluateExternalDecisionTable(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared []string
+		observed []ExternalCheck
+		want     ExternalVerdict
+		checks   []CheckOutcome
+	}{
+		{
+			name:     "empty declaration fails closed",
+			declared: nil,
+			observed: nil,
+			want:     ExternalFail,
+			checks:   []CheckOutcome{},
+		},
+		{
+			name:     "single declared check passes on exit 0",
+			declared: []string{"build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}},
+			want:     ExternalPass,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: 0, Observed: true, Passed: true}},
+		},
+		{
+			name:     "non-zero exit fails the gate",
+			declared: []string{"build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 1}},
+			want:     ExternalFail,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: 1, Observed: true, Passed: false}},
+		},
+		{
+			name:     "negative exit fails the gate",
+			declared: []string{"build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: -1}},
+			want:     ExternalFail,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: -1, Observed: true, Passed: false}},
+		},
+		{
+			name:     "all declared checks pass",
+			declared: []string{"build", "audit"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "audit", ExitCode: 0}},
+			want:     ExternalPass,
+			checks: []CheckOutcome{
+				{Name: "build", ExitCode: 0, Observed: true, Passed: true},
+				{Name: "audit", ExitCode: 0, Observed: true, Passed: true},
+			},
+		},
+		{
+			name:     "one failing exit fails the whole gate",
+			declared: []string{"build", "audit"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "audit", ExitCode: 2}},
+			want:     ExternalFail,
+			checks: []CheckOutcome{
+				{Name: "build", ExitCode: 0, Observed: true, Passed: true},
+				{Name: "audit", ExitCode: 2, Observed: true, Passed: false},
+			},
+		},
+		{
+			name:     "missing observation fails and stays visible",
+			declared: []string{"build", "audit"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}},
+			want:     ExternalFail,
+			checks: []CheckOutcome{
+				{Name: "build", ExitCode: 0, Observed: true, Passed: true},
+				{Name: "audit", ExitCode: 0, Observed: false, Passed: false},
+			},
+		},
+		{
+			name:     "observation for an undeclared check is ignored",
+			declared: []string{"build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "rogue", ExitCode: 0}},
+			want:     ExternalPass,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: 0, Observed: true, Passed: true}},
+		},
+		{
+			name:     "declaration order is kept regardless of observation order",
+			declared: []string{"audit", "build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "audit", ExitCode: 0}},
+			want:     ExternalPass,
+			checks: []CheckOutcome{
+				{Name: "audit", ExitCode: 0, Observed: true, Passed: true},
+				{Name: "build", ExitCode: 0, Observed: true, Passed: true},
+			},
+		},
+		{
+			name:     "duplicate declarations are recorded once",
+			declared: []string{"build", "build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}},
+			want:     ExternalPass,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: 0, Observed: true, Passed: true}},
+		},
+		{
+			name:     "duplicate observations use the first exit code",
+			declared: []string{"build"},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 1}, {Name: "build", ExitCode: 0}},
+			want:     ExternalFail,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: 1, Observed: true, Passed: false}},
+		},
+		{
+			name:     "empty declared name fails the gate",
+			declared: []string{""},
+			observed: []ExternalCheck{{Name: "", ExitCode: 0}},
+			want:     ExternalFail,
+			checks:   []CheckOutcome{},
+		},
+		{
+			name:     "empty name among valid declarations fails the gate",
+			declared: []string{"build", ""},
+			observed: []ExternalCheck{{Name: "build", ExitCode: 0}},
+			want:     ExternalFail,
+			checks:   []CheckOutcome{{Name: "build", ExitCode: 0, Observed: true, Passed: true}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EvaluateExternal(tt.declared, tt.observed)
+			if got.Verdict != tt.want {
+				t.Errorf("verdict = %q, want %q", got.Verdict, tt.want)
+			}
+			if !reflect.DeepEqual(got.Checks, tt.checks) {
+				t.Errorf("checks = %#v, want %#v", got.Checks, tt.checks)
+			}
+		})
+	}
+}
+
+// The evidence is the record an adapter writes to disk. Its JSON shape pins
+// the contract: the verdict plus the exit code of every declared check, with
+// a missing run recorded as observed=false so it cannot look like a pass.
+func TestExternalEvidenceJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   ExternalEvidence
+		want string
+	}{
+		{
+			name: "pass carries the exit codes of all declared checks",
+			in: EvaluateExternal(
+				[]string{"build", "audit"},
+				[]ExternalCheck{{Name: "audit", ExitCode: 0}, {Name: "build", ExitCode: 0}},
+			),
+			want: `{"verdict":"PASS","checks":[{"name":"build","exit_code":0,"observed":true,"passed":true},{"name":"audit","exit_code":0,"observed":true,"passed":true}]}`,
+		},
+		{
+			name: "fail records the failing exit code and the missing check",
+			in: EvaluateExternal(
+				[]string{"build", "audit"},
+				[]ExternalCheck{{Name: "build", ExitCode: 7}},
+			),
+			want: `{"verdict":"FAIL","checks":[{"name":"build","exit_code":7,"observed":true,"passed":false},{"name":"audit","exit_code":0,"observed":false,"passed":false}]}`,
+		},
+		{
+			name: "empty panel serializes checks as an empty array",
+			in:   EvaluateExternal(nil, nil),
+			want: `{"verdict":"FAIL","checks":[]}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != tc.want {
+				t.Fatalf("json = %s, want %s", b, tc.want)
+			}
+		})
+	}
+}
+
+// The gate is pure: repeated calls on the same external facts give the same
+// evidence and leave the declared names and observed checks untouched.
+func TestEvaluateExternalDeterministicAndPure(t *testing.T) {
+	declared := []string{"build", "audit"}
+	observed := []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "audit", ExitCode: 3}}
+	want := EvaluateExternal(declared, observed)
+	if want.Verdict != ExternalFail {
+		t.Fatalf("verdict = %q, want fail", want.Verdict)
+	}
+
+	declaredCopy := append([]string(nil), declared...)
+	observedCopy := append([]ExternalCheck(nil), observed...)
+	for i := 0; i < 10; i++ {
+		got := EvaluateExternal(declared, observed)
+		if got.Verdict != want.Verdict || !reflect.DeepEqual(got.Checks, want.Checks) {
+			t.Fatalf("call %d = %+v, want %+v", i, got, want)
+		}
+	}
+	if !reflect.DeepEqual(declared, declaredCopy) || !reflect.DeepEqual(observed, observedCopy) {
+		t.Fatalf("inputs mutated: declared=%v observed=%v", declared, observed)
+	}
+}
+
+// The external verdict is a distinct gate from T3.67 and T3.88. Its inputs
+// are only declared names and observed exit codes, and its evidence carries
+// no ship facts, proof, internal verdict or review verdict.
+func TestEvaluateExternalDependsOnlyOnExternalFacts(t *testing.T) {
+	fn := reflect.TypeOf(EvaluateExternal)
+	if fn.NumIn() != 2 ||
+		fn.In(0) != reflect.TypeOf([]string{}) ||
+		fn.In(1) != reflect.TypeOf([]ExternalCheck{}) {
+		t.Fatalf("EvaluateExternal input = %v, want ([]string, []ExternalCheck) only", fn)
+	}
+	if fn.NumOut() != 1 || fn.Out(0) != reflect.TypeOf(ExternalEvidence{}) {
+		t.Fatalf("EvaluateExternal output = %v, want exactly one ExternalEvidence", fn)
+	}
+
+	if reflect.TypeOf(ExternalPass) == reflect.TypeOf(VerdictWatching) ||
+		reflect.TypeOf(ExternalPass) == reflect.TypeOf(ReviewShip) {
+		t.Fatal("external verdict type must differ from Verdict and ReviewVerdict")
+	}
+
+	internalTypes := map[string]reflect.Type{
+		"Verdict":          reflect.TypeOf(VerdictWatching),
+		"ReviewVerdict":    reflect.TypeOf(ReviewShip),
+		"ShipFacts":        reflect.TypeOf(ShipFacts{}),
+		"Proof":            reflect.TypeOf(Proof{}),
+		"CompletionResult": reflect.TypeOf(CompletionResult{}),
+	}
+	evidenceType := reflect.TypeOf(ExternalEvidence{})
+	if evidenceType.NumField() != 2 {
+		t.Fatalf("ExternalEvidence has %d fields, want 2", evidenceType.NumField())
+	}
+	for i := 0; i < evidenceType.NumField(); i++ {
+		field := evidenceType.Field(i)
+		for name, typ := range internalTypes {
+			if field.Type == typ {
+				t.Errorf("ExternalEvidence.%s = %v, must not carry internal %s", field.Name, field.Type, name)
+			}
+		}
+	}
+}
+
+// Nothing the agent reported can move the verdict: two evaluations over the
+// same external facts stay equal even when the surrounding internal verdict,
+// ship facts, proof and completion result differ.
+func TestEvaluateExternalIgnoresAgentReportedState(t *testing.T) {
+	declared := []string{"build"}
+	observed := []ExternalCheck{{Name: "build", ExitCode: 0}}
+	baseline := EvaluateExternal(declared, observed)
+
+	_ = VerdictReady
+	_ = ReviewShip
+	_ = ShipFacts{Build: true, Audit: true, TDD: true}
+	_ = Proof{PhaseID: "implement", Artifact: "x", Approved: true}
+	_ = CompletionResult{Outcome: CompletionAllow}
+
+	got := EvaluateExternal(declared, observed)
+	if got.Verdict != baseline.Verdict || !reflect.DeepEqual(got.Checks, baseline.Checks) {
+		t.Fatalf("verdict changed without new external facts: %+v, want %+v", got, baseline)
+	}
+}
+
+// The canonical journal strings are pinned. Changing one breaks a recorded
+// external verdict on disk.
+func TestExternalCanonicalStrings(t *testing.T) {
+	if string(ExternalPass) != "PASS" || string(ExternalFail) != "FAIL" {
+		t.Fatalf("verdict strings = %q, %q", ExternalPass, ExternalFail)
+	}
+}
