@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
-	"github.com/refusedguy/beacon/internal/infra/github"
 )
 
 const createReceiptsSQL = `
@@ -57,7 +56,150 @@ type Receipt struct {
 	// a PR or a file in a worktree (ADR 0027). It is validated on import, so
 	// no private agent log path can enter the receipts table. Older lines
 	// without a source keep the zero value and still import.
-	Source github.ArtifactSource `json:"source"`
+	Source ArtifactSource `json:"source"`
+}
+
+// Artifact source, ADR 0027. A result is read from a git branch, a pull
+// request or a file in an isolated worktree. There is deliberately no kind for
+// an agent's private state: logs, transcripts and databases are not a public
+// contract and are never a Beacon artifact source.
+
+// ArtifactKind is the explicit kind of an artifact source.
+type ArtifactKind string
+
+const (
+	ArtifactBranch   ArtifactKind = "branch"
+	ArtifactPR       ArtifactKind = "pr"
+	ArtifactWorktree ArtifactKind = "worktree"
+)
+
+// ArtifactSource is a validated, typed locator of a result. Branch and PR
+// carry no filesystem path. A worktree file is a slash-separated path relative
+// to the worktree root; absolute paths, home-relative paths, parent traversal
+// and hidden path segments are rejected so no private agent state can be
+// passed as an artifact.
+type ArtifactSource struct {
+	Kind         ArtifactKind `json:"kind"`
+	Branch       string       `json:"branch,omitempty"`
+	Repo         string       `json:"repo,omitempty"`
+	PR           int          `json:"pr,omitempty"`
+	State        string       `json:"state,omitempty"`
+	WorktreeFile string       `json:"worktreeFile,omitempty"`
+}
+
+// UnmarshalJSON validates the source at the boundary. An unknown kind, a
+// missing locator or a path outside a worktree is an error rather than a
+// guess, so a private agent log can never become a public artifact source.
+func (s *ArtifactSource) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Kind         string `json:"kind"`
+		Branch       string `json:"branch"`
+		Repo         string `json:"repo"`
+		PR           int    `json:"pr"`
+		State        string `json:"state"`
+		WorktreeFile string `json:"worktreeFile"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&wire); err != nil {
+		return fmt.Errorf("artifact source: decode: %w", err)
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return errors.New("artifact source: trailing data")
+	}
+
+	kind := ArtifactKind(strings.ToLower(strings.TrimSpace(wire.Kind)))
+	*s = ArtifactSource{Kind: kind, State: strings.ToUpper(strings.TrimSpace(wire.State))}
+	switch kind {
+	case ArtifactBranch:
+		if wire.Repo != "" || wire.PR != 0 || wire.WorktreeFile != "" || wire.State != "" {
+			return errors.New("artifact source: branch carries only a branch name")
+		}
+		branch := strings.TrimSpace(wire.Branch)
+		if !validArtifactName(branch) {
+			return fmt.Errorf("artifact source: bad branch %q", wire.Branch)
+		}
+		s.Branch = branch
+	case ArtifactPR:
+		if wire.Branch != "" || wire.WorktreeFile != "" {
+			return errors.New("artifact source: pr carries only repo, pr and state")
+		}
+		repo := strings.TrimSpace(wire.Repo)
+		if wire.PR <= 0 || !validArtifactRepo(repo) {
+			return fmt.Errorf("artifact source: bad pr locator repo=%q pr=%d", wire.Repo, wire.PR)
+		}
+		s.Repo, s.PR = repo, wire.PR
+	case ArtifactWorktree:
+		if wire.Branch != "" || wire.Repo != "" || wire.PR != 0 || wire.State != "" {
+			return errors.New("artifact source: worktree carries only a worktree file")
+		}
+		file := strings.TrimSpace(wire.WorktreeFile)
+		if !validWorktreeFile(file) {
+			return fmt.Errorf("artifact source: bad worktree file %q", wire.WorktreeFile)
+		}
+		s.WorktreeFile = file
+	default:
+		return fmt.Errorf("artifact source: unknown kind %q", wire.Kind)
+	}
+	return nil
+}
+
+// Verdict returns the domain verdict implied by the source. Only a PR source
+// carries an observed state. A closed or merged PR is terminal, as ADR 0027
+// requires, and the result comes from that state alone: no log, transcript or
+// database is read.
+func (s ArtifactSource) Verdict() domain.Verdict {
+	if s.Kind != ArtifactPR {
+		return domain.VerdictWatching
+	}
+	v, _ := domain.Evaluate(domain.Snapshot{State: s.State}, domain.Policy{})
+	return v
+}
+
+func validArtifactName(v string) bool {
+	if v == "" || strings.ContainsAny(v, " \t\r\n\\~") || strings.HasPrefix(v, "-") {
+		return false
+	}
+	for _, seg := range strings.Split(v, "/") {
+		if !validSegment(seg) {
+			return false
+		}
+	}
+	return true
+}
+
+func validArtifactRepo(v string) bool {
+	parts := strings.Split(v, "/")
+	if len(parts) != 2 {
+		return false
+	}
+	for _, part := range parts {
+		if !validSegment(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func validWorktreeFile(v string) bool {
+	if v == "" || strings.HasPrefix(v, "/") || strings.ContainsAny(v, "\\\x00") {
+		return false
+	}
+	for _, seg := range strings.Split(v, "/") {
+		if !validSegment(seg) {
+			return false
+		}
+	}
+	return true
+}
+
+// validSegment rejects hidden, parent and home-relative path pieces. A hidden
+// segment is where agent products keep their private session state, so no
+// artifact locator may use one.
+func validSegment(seg string) bool {
+	return seg != "" && seg != "." && seg != ".." && !strings.HasPrefix(seg, ".") &&
+		!strings.ContainsAny(seg, " \t\r\n\\~")
 }
 
 // UnmarshalJSON parses and validates one receipt line. An unrecognized

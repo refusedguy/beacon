@@ -338,10 +338,10 @@ func TestArtifactSourceKindsPersisted(t *testing.T) {
 		t.Fatalf("result = %+v, want 3 imported, no malformed", result)
 	}
 
-	wantKind := map[string]github.ArtifactKind{
-		"src-branch":   github.ArtifactBranch,
-		"src-pr":       github.ArtifactPR,
-		"src-worktree": github.ArtifactWorktree,
+	wantKind := map[string]ArtifactKind{
+		"src-branch":   ArtifactBranch,
+		"src-pr":       ArtifactPR,
+		"src-worktree": ArtifactWorktree,
 	}
 	for id, kind := range wantKind {
 		got, err := d.Receipts(id)
@@ -416,15 +416,18 @@ func TestArtifactSourceRejectsPrivateStatePaths(t *testing.T) {
 }
 
 func TestClosedPRSourceTerminalVerdict(t *testing.T) {
-	var closed github.ArtifactSource
+	var closed ArtifactSource
 	if err := json.Unmarshal([]byte(`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"CLOSED"}`), &closed); err != nil {
 		t.Fatalf("unmarshal closed PR source: %v", err)
 	}
-	if v := closed.Verdict(); v != domain.VerdictClosed || !github.IsTerminalArtifactVerdict(v) {
+	if v := github.ClosedPRVerdict(closed.State); v != domain.VerdictClosed || !github.IsTerminalArtifactVerdict(v) {
 		t.Errorf("closed PR verdict = %q, want terminal %q", v, domain.VerdictClosed)
 	}
+	if v := closed.Verdict(); v != github.ClosedPRVerdict(closed.State) {
+		t.Errorf("source verdict = %q, want %q", v, github.ClosedPRVerdict(closed.State))
+	}
 
-	var merged github.ArtifactSource
+	var merged ArtifactSource
 	if err := json.Unmarshal([]byte(`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"MERGED"}`), &merged); err != nil {
 		t.Fatalf("unmarshal merged PR source: %v", err)
 	}
@@ -432,7 +435,7 @@ func TestClosedPRSourceTerminalVerdict(t *testing.T) {
 		t.Errorf("merged PR verdict = %q, want terminal %q", v, domain.VerdictMerged)
 	}
 
-	var open github.ArtifactSource
+	var open ArtifactSource
 	if err := json.Unmarshal([]byte(`{"kind":"pr","repo":"refusedguy/beacon","pr":48,"state":"OPEN"}`), &open); err != nil {
 		t.Fatalf("unmarshal open PR source: %v", err)
 	}
