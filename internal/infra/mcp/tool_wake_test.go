@@ -18,12 +18,14 @@ type fakeWakeSender struct {
 	calls      int
 	lastTarget string
 	lastText   string
+	lastSource WakeSource
 }
 
-func (f *fakeWakeSender) Deliver(_ context.Context, target, text string) (Delivery, string) {
+func (f *fakeWakeSender) Deliver(_ context.Context, target, text string, source WakeSource) (Delivery, string) {
 	f.calls++
 	f.lastTarget = target
 	f.lastText = text
+	f.lastSource = source
 	return f.delivery, f.reason
 }
 
@@ -407,5 +409,149 @@ func TestWakeInterruptionOverInMemoryTransport(t *testing.T) {
 	}
 	if !strings.Contains(out.Reason, "approval") {
 		t.Errorf("client saw reason = %q, want it to mention approval", out.Reason)
+	}
+}
+
+// TestWakeReviewSourceIsSteer is the T3.16 acceptance core (ADR 0030 p6): a
+// diff comment has source review, travels through the steer channel and carries
+// the source onto the output so the plugin can put it on the receipt.
+func TestWakeReviewSourceIsSteer(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Target: "session-1",
+		Text:   "obligation-1@7",
+		Source: SourceReview,
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Delivery != DeliverySteer || !out.OK {
+		t.Errorf("got delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
+	}
+	if out.Source != SourceReview {
+		t.Errorf("source = %q, want %q", out.Source, SourceReview)
+	}
+	if sender.lastSource != SourceReview {
+		t.Errorf("sender got source=%q, want %q", sender.lastSource, SourceReview)
+	}
+	if sender.lastText != "obligation-1@7" {
+		t.Errorf("sender got text=%q, want the pointer unchanged", sender.lastText)
+	}
+}
+
+// TestWakeSourceDefaultsToManual keeps callers written before ADR 0030 p6
+// working: an omitted source is reported as manual, not as an error or review.
+func TestWakeSourceDefaultsToManual(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.Source != SourceManual || sender.lastSource != SourceManual {
+		t.Errorf("got output source=%q sender source=%q, want both %q", out.Source, sender.lastSource, SourceManual)
+	}
+}
+
+// TestWakeUnknownSourceIsRejected keeps the source field a closed set at the
+// boundary. No delivery is attempted for a value nobody defined.
+func TestWakeUnknownSourceIsRejected(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	if _, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Target: "s",
+		Text:   "p",
+		Source: WakeSource("bogus"),
+	}); err == nil {
+		t.Fatal("Wake() error = nil, want an invalid-input error for an unknown source")
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls = %d, want 0 for an unknown source", sender.calls)
+	}
+}
+
+// TestWakeReviewSourceDoesNotBreakInterruption proves the T2.24 flags still win
+// over a review source: a human question interrupts before any delivery.
+func TestWakeReviewSourceDoesNotBreakInterruption(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+		Target:             "session-1",
+		Text:               "obligation-1@7",
+		Source:             SourceReview,
+		HasPendingQuestion: true,
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.Interrupted || out.Delivery != DeliveryInterrupted || out.OK {
+		t.Errorf("got interrupted=%v delivery=%q ok=%v, want true/%q/false", out.Interrupted, out.Delivery, out.OK, DeliveryInterrupted)
+	}
+	if out.Source != SourceReview {
+		t.Errorf("source = %q, want the review source on the interruption too", out.Source)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls = %d, want 0 on interruption", sender.calls)
+	}
+}
+
+// TestWakeSchemaHasSource proves an MCP client can send the message source,
+// so a caller can mark a diff comment as review in the tool call.
+func TestWakeSchemaHasSource(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	if !strings.Contains(string(inputSchema), "source") {
+		t.Errorf("wake input schema missing source: %s", inputSchema)
+	}
+}
+
+// TestWakeReviewOverInMemoryTransport drives a review-source diff comment
+// through a real MCP client and server. It proves both the steer delivery and
+// the source reach the client, not just the in-process handler.
+func TestWakeReviewOverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	AttachWake(server, NewWakeHandler(sender))
+	session := connectWakeServer(t, server)
+
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target: "session-1",
+			Text:   "obligation-1@7",
+			Source: SourceReview,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Delivery != DeliverySteer || !out.OK || out.Source != SourceReview {
+		t.Errorf("client saw delivery=%q ok=%v source=%q, want steer/true/review", out.Delivery, out.OK, out.Source)
+	}
+	if sender.lastSource != SourceReview {
+		t.Errorf("sender got source=%q, want %q", sender.lastSource, SourceReview)
 	}
 }
