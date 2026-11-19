@@ -70,62 +70,6 @@ executor-task:ttl -->
 
 ## Самопроверка шаблона
 
-Тест ниже разбирает разметку этого файла и проверяет четыре условия карточки: `ready` и `watching` не будят, `keep_working`, `rebase` и `retry` будят, текст `waiting, watchID` присутствует, у Beacon нет команды от имени агента. Дополнительно проверяется, что re-run принадлежит агенту и TTL отсутствует.
+Тест шаблона лежит в `tests/adapter/executor-template.test.js` и читает этот файл через `node:fs`. Он разбирает маркеры и проверяет четыре условия карточки: `ready` и `watching` не будят, `keep_working`, `rebase` и `retry` будят, текст `waiting, watchID` присутствует, у Beacon нет команды от имени агента. Дополнительно проверяется, что re-run принадлежит агенту и TTL отсутствует.
 
-Чтобы запустить, сохранить блок между маркерами `js-test:start` и `js-test:end` в файл `executor-task.test.js` рядом с этим шаблоном и выполнить `node --test docs/templates/executor-task.test.js`. Тест использует только встроенные модули Node.
-
-<!-- js-test:start
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const test = require("node:test");
-
-const templatePath = path.join(__dirname, "executor-task.md");
-const text = fs.readFileSync(templatePath, "utf8");
-
-function block(name) {
-  const m = text.match(
-    new RegExp(
-      `<!--\\s*executor-task:${name}\\s*\\n([\\s\\S]*?)\\n\\s*executor-task:${name}\\s*-->`
-    )
-  );
-  assert.ok(m, `missing block ${name}`);
-  return m[1].trim();
-}
-
-function verdictSet(line) {
-  return new Set(
-    line.split(":")[1].split(",").map((v) => v.trim()).filter(Boolean)
-  );
-}
-
-test("шаблон: три вердикта будят, остальные нет", () => {
-  const b = block("verdicts");
-  const wake = verdictSet(b.split("\n").find((l) => l.startsWith("wake:")));
-  const nowake = verdictSet(b.split("\n").find((l) => l.startsWith("nowake:")));
-
-  assert.deepEqual([...wake].sort(), ["keep_working", "rebase", "retry"]);
-  for (const v of ["ready", "watching", "merged", "closed", "timeout"]) {
-    assert.equal(wake.has(v), false, `${v} must not wake`);
-    assert.equal(nowake.has(v), true, `${v} must be listed as nowake`);
-  }
-  for (const v of ["keep_working", "rebase", "retry"]) {
-    assert.equal(nowake.has(v), false, `${v} must not be listed as nowake`);
-  }
-});
-
-test("шаблон: отчёт содержит waiting, watchID", () => {
-  assert.equal(block("report"), "waiting, watchID");
-});
-
-test("шаблон: re-run делает агент, у Beacon нет команды от его имени", () => {
-  assert.equal(block("rerun-owner"), "agent");
-  assert.match(text, /gh run rerun --failed/);
-  const forbidden = new RegExp("beacon[^\\n]*" + "gh run" + " rerun --failed", "i");
-  assert.equal(forbidden.test(text), false);
-});
-
-test("шаблон: TTL не является причиной выхода из цикла", () => {
-  assert.equal(block("ttl"), "none");
-});
-js-test:end -->
+CI подхватывает тест шагом `Test JS adapters` в `.github/workflows/ci.yml`: `find tests/adapter -maxdepth 1 -name '*.test.js' | xargs node --test`. Тест использует только встроенные модули Node.
