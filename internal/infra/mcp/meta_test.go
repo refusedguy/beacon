@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -129,5 +130,148 @@ func TestSessionIDFromRequestAbsentMetaDoesNotBreak(t *testing.T) {
 				t.Errorf("SessionIDFromRequest() = %q, want nil", *got)
 			}
 		})
+	}
+}
+
+// memPendingApprovalStore is the authoritative pending list the server holds.
+// calls records how many times the core read it, so a test can prove the read
+// happens on every authentication instead of trusting a cached value.
+type memPendingApprovalStore struct {
+	pending []PendingApproval
+	err     error
+	calls   int
+}
+
+func (s *memPendingApprovalStore) PendingApprovals() ([]PendingApproval, error) {
+	s.calls++
+	return s.pending, s.err
+}
+
+func requestFromSession(sessionID string) *mcpsdk.CallToolRequest {
+	return requestWithMeta(mcpsdk.Meta{sessionIDMetaKey: sessionID})
+}
+
+// TestAuthenticateApprovalAcceptsAuthorizedReviewer proves that the matching
+// reviewer and decision ID return the pending record, including its RunID.
+func TestAuthenticateApprovalAcceptsAuthorizedReviewer(t *testing.T) {
+	store := &memPendingApprovalStore{pending: []PendingApproval{
+		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
+		{DecisionID: "d2", ReviewerSessionID: "bob", RunID: "run-2"},
+	}}
+	auth := NewApprovalAuthenticator(store)
+
+	got, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{})
+	if err != nil {
+		t.Fatalf("Authenticate() error = %v", err)
+	}
+	if got.DecisionID != "d1" || got.ReviewerSessionID != "alice" || got.RunID != "run-1" {
+		t.Errorf("Authenticate() = %+v, want the pending record for d1", got)
+	}
+	if store.calls != 1 {
+		t.Errorf("store reads = %d, want 1", store.calls)
+	}
+}
+
+// TestAuthenticateApprovalRejectsForeignReviewer is the acceptance test: an
+// approval from a session that is not authorized for the decision is rejected
+// and no pending approval is returned.
+func TestAuthenticateApprovalRejectsForeignReviewer(t *testing.T) {
+	store := &memPendingApprovalStore{pending: []PendingApproval{
+		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
+	}}
+	auth := NewApprovalAuthenticator(store)
+
+	got, err := auth.Authenticate(requestFromSession("mallory"), "d1", ApprovalSnapshot{})
+	if err == nil {
+		t.Fatalf("foreign approval was accepted: %+v", got)
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+	if got != (PendingApproval{}) {
+		t.Errorf("foreign approval returned a pending record: %+v", got)
+	}
+}
+
+// TestAuthenticateApprovalRejectsUnknownDecisionID proves the decision ID is
+// checked against the pending list, not taken from the client at face value.
+func TestAuthenticateApprovalRejectsUnknownDecisionID(t *testing.T) {
+	store := &memPendingApprovalStore{pending: []PendingApproval{
+		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
+	}}
+	auth := NewApprovalAuthenticator(store)
+
+	if _, err := auth.Authenticate(requestFromSession("alice"), "d-forbidden", ApprovalSnapshot{}); err == nil {
+		t.Error("an unknown decisionID was accepted")
+	} else {
+		assertCode(t, err, domain.CodeInvalidInput)
+	}
+}
+
+// TestAuthenticateApprovalIgnoresClientSnapshot proves the untrusted snapshot
+// cannot grant an approval. It forges the authorized reviewer and a pending
+// decision, yet the real request session is foreign, so the approval is
+// rejected. The authoritative reviewer comes from the request _meta.
+func TestAuthenticateApprovalIgnoresClientSnapshot(t *testing.T) {
+	store := &memPendingApprovalStore{pending: []PendingApproval{
+		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
+	}}
+	auth := NewApprovalAuthenticator(store)
+	forged := ApprovalSnapshot{ReviewerSessionID: "alice", DecisionID: "d1", RunID: "run-1"}
+
+	if _, err := auth.Authenticate(requestFromSession("mallory"), "d1", forged); err == nil {
+		t.Error("a forged client snapshot granted an approval")
+	} else {
+		assertCode(t, err, domain.CodeInvalidInput)
+	}
+}
+
+// TestAuthenticateApprovalRequiresReviewerAndDecisionID covers missing
+// authoritative inputs before any pending lookup can succeed.
+func TestAuthenticateApprovalRequiresReviewerAndDecisionID(t *testing.T) {
+	store := &memPendingApprovalStore{pending: []PendingApproval{
+		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
+	}}
+	auth := NewApprovalAuthenticator(store)
+
+	if _, err := auth.Authenticate(nil, "d1", ApprovalSnapshot{}); err == nil {
+		t.Error("an approval with no reviewer sessionID was accepted")
+	} else {
+		assertCode(t, err, domain.CodeInvalidInput)
+	}
+	if _, err := auth.Authenticate(requestFromSession("alice"), "", ApprovalSnapshot{}); err == nil {
+		t.Error("an approval with no decisionID was accepted")
+	} else {
+		assertCode(t, err, domain.CodeInvalidInput)
+	}
+}
+
+// TestAuthenticateApprovalStoreError proves a failed pending read is surfaced
+// instead of being mistaken for an absent decision.
+func TestAuthenticateApprovalStoreError(t *testing.T) {
+	want := errors.New("store unavailable")
+	auth := NewApprovalAuthenticator(&memPendingApprovalStore{err: want})
+
+	if _, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{}); !errors.Is(err, want) {
+		t.Errorf("Authenticate() error = %v, want the store error", err)
+	}
+}
+
+// TestAuthenticateApprovalReadsPendingOnEveryCall proves the pending list is
+// read from the store each time, so a decision removed since the last call is
+// no longer approvable.
+func TestAuthenticateApprovalReadsPendingOnEveryCall(t *testing.T) {
+	store := &memPendingApprovalStore{pending: []PendingApproval{
+		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
+	}}
+	auth := NewApprovalAuthenticator(store)
+
+	if _, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{}); err != nil {
+		t.Fatalf("first Authenticate() error = %v", err)
+	}
+	store.pending = nil
+	if _, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{}); err == nil {
+		t.Error("a decision removed from the pending list was still approvable")
+	}
+	if store.calls != 2 {
+		t.Errorf("store reads = %d, want 2", store.calls)
 	}
 }

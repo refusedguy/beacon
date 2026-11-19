@@ -44,6 +44,76 @@ func SessionIDFromRequest(req *mcpsdk.CallToolRequest) *string {
 	return &value
 }
 
+// PendingApproval is one decision the server is waiting on. It comes from the
+// server's own store, never from a client snapshot. DecisionID is the ID a
+// reviewer must present to approve it, ReviewerSessionID is the opaque session
+// authorized to decide it and RunID ties the decision to one orchestration run
+// (ADR 0034 §2).
+type PendingApproval struct {
+	DecisionID        string
+	ReviewerSessionID string
+	RunID             string
+}
+
+// PendingApprovalStore is the narrow read port for the authoritative pending
+// list. The core reads it fresh on every authentication, so a client cannot
+// approve against a stale or fabricated snapshot (ADR 0034 §2).
+type PendingApprovalStore interface {
+	PendingApprovals() ([]PendingApproval, error)
+}
+
+// ApprovalSnapshot is application state a client sends alongside an approval.
+// It is untrusted saved data: neither its reviewer nor its decision ID can
+// authorize an approval. Authenticate deliberately ignores it (ADR 0034 §2).
+type ApprovalSnapshot struct {
+	ReviewerSessionID string
+	DecisionID        string
+	RunID             string
+}
+
+// ApprovalAuthenticator authenticates an approval before it is applied. It
+// verifies the reviewer through the session ID carried in the request _meta
+// and checks the decision ID against the server's pending list. It never uses
+// a client snapshot as a source of truth (ADR 0034 §2).
+type ApprovalAuthenticator struct {
+	store PendingApprovalStore
+}
+
+// NewApprovalAuthenticator builds an authenticator over the server's pending
+// approval store.
+func NewApprovalAuthenticator(store PendingApprovalStore) *ApprovalAuthenticator {
+	return &ApprovalAuthenticator{store: store}
+}
+
+// Authenticate verifies the reviewer and the decision ID against the server's
+// pending decisions and returns the matching record. The reviewer is the
+// session ID from req's _meta, not the one in snapshot; the pending list comes
+// from the store, not from snapshot. A foreign reviewer or a decision ID that
+// is not pending is rejected. The snapshot argument is accepted so the
+// untrusted data is explicit at the boundary, but it is never read.
+func (a *ApprovalAuthenticator) Authenticate(req *mcpsdk.CallToolRequest, decisionID string, _ ApprovalSnapshot) (PendingApproval, error) {
+	if a == nil || a.store == nil {
+		return PendingApproval{}, domain.NewAppError(domain.CodePersistFailed, "ack: pending approval store is nil")
+	}
+	sessionID := SessionIDFromRequest(req)
+	if sessionID == nil {
+		return PendingApproval{}, domain.NewAppError(domain.CodeInvalidInput, "ack: approval carries no reviewer sessionID")
+	}
+	if decisionID == "" {
+		return PendingApproval{}, domain.NewAppError(domain.CodeInvalidInput, "ack: approval carries no decisionID")
+	}
+	pending, err := a.store.PendingApprovals()
+	if err != nil {
+		return PendingApproval{}, err
+	}
+	for _, p := range pending {
+		if p.DecisionID == decisionID && p.ReviewerSessionID == *sessionID {
+			return p, nil
+		}
+	}
+	return PendingApproval{}, domain.NewAppError(domain.CodeInvalidInput, "ack: approval rejected: reviewer is not authorized or decisionID is not pending")
+}
+
 // SetChunkMeta attaches one numbered stream chunk to result's _meta so a
 // client can restore order by seq and spot gaps without parsing the body.
 func SetChunkMeta(result *mcpsdk.CallToolResult, ev domain.StreamEvent) error {
