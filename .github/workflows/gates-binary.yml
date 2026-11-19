@@ -1,0 +1,56 @@
+name: Gates binary
+
+# Закоммиченный tools/beacon-gates/beacon-gates обязан совпадать со сборкой
+# из исходников. Пересобираем теми же флагами и сравниваем байты.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates-binary:
+    name: gates-binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Rebuild gates from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/beacon-gates
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags="-buildid= -s -w" \
+            -o "$RUNNER_TEMP/beacon-gates-built" .
+
+      - name: Compare committed and rebuilt bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          committed=tools/beacon-gates/beacon-gates
+          rebuilt="$RUNNER_TEMP/beacon-gates-built"
+          if [ ! -f "$committed" ]; then
+            printf 'missing committed gates binary: %s\n' "$committed" >&2
+            exit 1
+          fi
+          printf 'sha256 committed=%s\n' "$(sha256sum "$committed" | cut -d' ' -f1)"
+          printf 'sha256 rebuilt=%s\n' "$(sha256sum "$rebuilt" | cut -d' ' -f1)"
+          if cmp -s "$committed" "$rebuilt"; then
+            printf 'gates binary matches source\n'
+          else
+            printf 'gates binary differs from source\n' >&2
+            printf 'rebuild: cd tools/beacon-gates && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-buildid= -s -w" -o beacon-gates .\n' >&2
+            exit 1
+          fi

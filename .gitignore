@@ -8,7 +8,6 @@ tmp/
 beacon.sock
 *.lock
 
-# Бинарники.
+# Бинарники. Гейты коммитим намеренно, по Harbor и ADR 0016.
 /beacon
-/beacon-gates
 bin/

@@ -1,0 +1,108 @@
+name: CI
+
+# Компиляция, тесты и гейты Beacon. Общая проверка для push в main и pull request.
+# Внешние секреты и токен GitHub не нужны: только чтение репозитория и локальный Go.
+# Версия Go берётся из go.mod через go-version-file.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build beacon
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags="-buildid= -s -w" \
+            -o beacon ./cmd/beacon
+          printf 'build ok binary=beacon\n'
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test root module
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+
+      - name: Test gates module
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./...
+
+  gates:
+    name: gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check committed gates binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=tools/beacon-gates/beacon-gates
+          if [ ! -x "$bin" ]; then
+            printf 'missing committed gates binary: %s\n' "$bin" >&2
+            exit 2
+          fi
+          printf 'gates binary present path=%s\n' "$bin"
+
+      - name: Self-test every gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=tools/beacon-gates/beacon-gates
+          "$bin" --list
+          for gate in capabilities layers-ast layers-list; do
+            printf 'self-test gate=%s\n' "$gate"
+            "$bin" "$gate" --self-test
+          done
+
+      - name: Run gates on tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=tools/beacon-gates/beacon-gates
+          for gate in capabilities layers-ast layers-list; do
+            printf 'gate gate=%s\n' "$gate"
+            "$bin" "$gate"
+          done
