@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -42,13 +43,18 @@ type StateSnapshot struct {
 const StatusIdle = "idle"
 
 // SessionLiveness holds the disk signals used to decide whether an agent
-// session is still live (ADR 0036 §4). SessionID matches a subscriber's Target.
-// Artifacts are paths Beacon expects on disk while the session is active. PID
-// is the process recorded when the session started.
+// session is still live (ADR 0036 §4) and whether its task has died (ADR 0042
+// §2). SessionID matches a subscriber's Target. Artifacts are paths Beacon
+// expects on disk while the session is active. PID is the process recorded
+// when the session started. LastActivity and LastHeartbeat are the two signals
+// added by ADR 0042 §2; the wiring layer fills them from persisted state, and
+// a zero value means the signal is unknown.
 type SessionLiveness struct {
-	SessionID string   `json:"sessionID"`
-	Artifacts []string `json:"artifacts"`
-	PID       int      `json:"pid"`
+	SessionID     string    `json:"sessionID"`
+	Artifacts     []string  `json:"artifacts"`
+	PID           int       `json:"pid"`
+	LastActivity  time.Time `json:"lastActivity"`
+	LastHeartbeat time.Time `json:"lastHeartbeat"`
 }
 
 // SnapshotReader is the single read-only state accessor used by
@@ -132,6 +138,20 @@ func decodeEventCursor(s string) (uint64, error) {
 	return seq, nil
 }
 
+const (
+	// activityStaleAfter is how old the last recorded activity may be before
+	// the activity signal indicates a stalled task (ADR 0042 §2).
+	activityStaleAfter = 5 * time.Minute
+	// heartbeatStaleAfter is how old the last heartbeat may be before the
+	// heartbeat signal indicates a stalled task (ADR 0042 §2). A heartbeat is
+	// expected more often than real activity, hence the shorter bound.
+	heartbeatStaleAfter = 2 * time.Minute
+)
+
+// currentTime is the clock used to age the activity and heartbeat signals.
+// It is a variable so tests can freeze time; production uses time.Now.
+var currentTime = time.Now
+
 // processAlive checks one recorded PID with signal 0. The kernel reports
 // whether the process exists without delivering a signal, so this neither
 // enumerates processes nor starts ps (ADR 0036 §4). EPERM still means the
@@ -157,15 +177,40 @@ func artifactsPresent(paths []string) bool {
 	return true
 }
 
-// sessionLive combines the two liveness signals from ADR 0036 §4. A dead
-// recorded PID makes the session idle at once. With a live or unknown PID the
-// artifact files decide. A session with neither signal is unknown and is left
-// alone, so callers that supply no liveness data keep the previous behavior.
-func sessionLive(s SessionLiveness) bool {
-	if s.PID == 0 && len(s.Artifacts) == 0 {
+// sessionDead is the compound death detector from ADR 0042 §2. It reads all
+// three signals together and needs a recorded PID to run. A dead PID is the
+// quick sign inherited from T3.44. When the PID is live, a task that has both
+// stalled activity and a stale heartbeat is dead too: a live PID alone does
+// not prove the task is working (ADR 0042 §2). Unknown time signals never
+// contribute a death vote, so a snapshot without them keeps the T3.44
+// behavior.
+func sessionDead(s SessionLiveness) bool {
+	// Without a recorded PID the compound detector has only two of its three
+	// signals, which is not enough to declare the task dead.
+	if s.PID == 0 {
+		return false
+	}
+	if !processAlive(s.PID) {
 		return true
 	}
-	if s.PID != 0 && !processAlive(s.PID) {
+	if s.LastActivity.IsZero() || s.LastHeartbeat.IsZero() {
+		return false
+	}
+	now := currentTime()
+	return now.Sub(s.LastActivity) > activityStaleAfter &&
+		now.Sub(s.LastHeartbeat) > heartbeatStaleAfter
+}
+
+// sessionLive combines the liveness signals from ADR 0036 §4 and the compound
+// death detector from ADR 0042 §2. A session the detector calls dead is idle at
+// once. Otherwise the artifact files decide. A session with no signals at all
+// is unknown and is left alone, so callers that supply no liveness data keep
+// the previous behavior.
+func sessionLive(s SessionLiveness) bool {
+	if s.PID == 0 && len(s.Artifacts) == 0 && s.LastActivity.IsZero() && s.LastHeartbeat.IsZero() {
+		return true
+	}
+	if sessionDead(s) {
 		return false
 	}
 	return artifactsPresent(s.Artifacts)
@@ -173,7 +218,8 @@ func sessionLive(s SessionLiveness) bool {
 
 // effectiveStatus projects a stored watch status into the status Beacon
 // reports. A closed watch stays closed. Otherwise, if any subscriber belongs
-// to a session that is no longer live, the watch is idle (ADR 0036 §4).
+// to a session that is no longer live, the watch is idle (ADR 0036 §4, ADR
+// 0042 §2).
 func effectiveStatus(w domain.Watch, sessions map[string]SessionLiveness) domain.Status {
 	if w.Status == domain.StatusClosed {
 		return w.Status
