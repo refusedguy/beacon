@@ -3,6 +3,9 @@ package mcp
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -378,5 +381,175 @@ func assertCode(t *testing.T, err error, want domain.ErrorCode) {
 	}
 	if appErr.Code != want {
 		t.Errorf("error code = %q, want %q", appErr.Code, want)
+	}
+}
+
+// bridgeCall is one recorded invocation of a bridge operation.
+type bridgeCall struct {
+	op  string
+	req BridgeRequest
+}
+
+// recordingBridge is a test double for the Bridge port (ADR 0024). It records
+// every operation and never names a concrete agent. Two instances stand for
+// two different agents driven by the same watch_pr call.
+type recordingBridge struct {
+	name  string
+	mu    sync.Mutex
+	calls []bridgeCall
+}
+
+func (b *recordingBridge) record(op string, req BridgeRequest) (BridgeReply, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.calls = append(b.calls, bridgeCall{op: op, req: req})
+	return BridgeReply{Handle: b.name + "-" + op}, nil
+}
+
+func (b *recordingBridge) Start(_ context.Context, req BridgeRequest) (BridgeReply, error) {
+	return b.record("start", req)
+}
+
+func (b *recordingBridge) Status(_ context.Context, req BridgeRequest) (BridgeReply, error) {
+	return b.record("status", req)
+}
+
+func (b *recordingBridge) Events(_ context.Context, req BridgeRequest) (BridgeReply, error) {
+	return b.record("events", req)
+}
+
+func (b *recordingBridge) Wake(_ context.Context, req BridgeRequest) (BridgeReply, error) {
+	return b.record("wake", req)
+}
+
+func (b *recordingBridge) Cancel(_ context.Context, req BridgeRequest) (BridgeReply, error) {
+	return b.record("cancel", req)
+}
+
+func (b *recordingBridge) Artifacts(_ context.Context, req BridgeRequest) (BridgeReply, error) {
+	return b.record("artifacts", req)
+}
+
+func (b *recordingBridge) snapshot() []bridgeCall {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]bridgeCall(nil), b.calls...)
+}
+
+// TestWatchPRDrivesTwoBridges runs a single watch_pr through two independent
+// bridges. Both receive the same neutral Start request with no core edit
+// between them (ADR 0024).
+func TestWatchPRDrivesTwoBridges(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)}
+	store := newMemStore()
+	alpha := &recordingBridge{name: "alpha"}
+	beta := &recordingBridge{name: "beta"}
+	h := NewWatchPRHandler(store, nil, clock).WithBridges(alpha, beta)
+
+	out, err := h.Register(context.Background(), sessionReq("session-2bridges"), watchPRTestInput("bridge-sha", domain.RoleExecutor))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if out.WatchID == "" {
+		t.Fatal("watchID must be populated")
+	}
+
+	for _, b := range []*recordingBridge{alpha, beta} {
+		calls := b.snapshot()
+		if len(calls) != 1 {
+			t.Fatalf("bridge %s: got %d operations, want 1", b.name, len(calls))
+		}
+		if calls[0].op != "start" {
+			t.Errorf("bridge %s: operation = %q, want start", b.name, calls[0].op)
+		}
+		req := calls[0].req
+		if req.WatchID != out.WatchID {
+			t.Errorf("bridge %s: watchID = %q, want %q", b.name, req.WatchID, out.WatchID)
+		}
+		if req.Repo != "refusedguy/beacon" || req.PR != 7 || req.HeadSHA != "bridge-sha" {
+			t.Errorf("bridge %s: unexpected request %+v", b.name, req)
+		}
+		if req.SubscriberID != "session-2bridges" {
+			t.Errorf("bridge %s: subscriberID = %q, want session-2bridges", b.name, req.SubscriberID)
+		}
+	}
+}
+
+// TestBridgePortSixOperations exercises all six operations on both bridges.
+// It proves the port is a six-operation contract that two agents can satisfy.
+func TestBridgePortSixOperations(t *testing.T) {
+	ops := []string{"start", "status", "events", "wake", "cancel", "artifacts"}
+	req := BridgeRequest{WatchID: "w1", Repo: "o/r", PR: 1, HeadSHA: "sha", SubscriberID: "s1"}
+	bridges := []*recordingBridge{{name: "alpha"}, {name: "beta"}}
+
+	for _, b := range bridges {
+		for _, op := range ops {
+			var err error
+			switch op {
+			case "start":
+				_, err = b.Start(context.Background(), req)
+			case "status":
+				_, err = b.Status(context.Background(), req)
+			case "events":
+				_, err = b.Events(context.Background(), req)
+			case "wake":
+				_, err = b.Wake(context.Background(), req)
+			case "cancel":
+				_, err = b.Cancel(context.Background(), req)
+			case "artifacts":
+				_, err = b.Artifacts(context.Background(), req)
+			}
+			if err != nil {
+				t.Fatalf("bridge %s %s: %v", b.name, op, err)
+			}
+		}
+		calls := b.snapshot()
+		if len(calls) != len(ops) {
+			t.Fatalf("bridge %s: got %d calls, want %d", b.name, len(calls), len(ops))
+		}
+		for i, want := range ops {
+			if calls[i].op != want {
+				t.Errorf("bridge %s call %d = %q, want %q", b.name, i, calls[i].op, want)
+			}
+		}
+	}
+}
+
+// externalAgentNames lists concrete agent products that belong in bridges,
+// not in the Go core (ADR 0024). OpenCode is excluded on purpose: its
+// "ai.opencode/sessionID" key is Beacon's own MCP _meta protocol field from
+// ADR 0006, not an external product that a bridge translates to.
+var externalAgentNames = []string{
+	"cursor", "claude", "copilot", "codex", "gemini",
+	"windsurf", "aider", "replit", "tabnine", "sourcery",
+}
+
+// TestCoreHasNoAgentNames greps every production Go file in the mcp package
+// for concrete agent product names. Test doubles are bridge side and excluded.
+func TestCoreHasNoAgentNames(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	scanned := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(".", name))
+		if err != nil {
+			t.Fatalf("ReadFile %s: %v", name, err)
+		}
+		lower := strings.ToLower(string(data))
+		for _, agent := range externalAgentNames {
+			if strings.Contains(lower, agent) {
+				t.Errorf("core file %s names agent product %q; ADR 0024 requires a bridge instead", name, agent)
+			}
+		}
+		scanned++
+	}
+	if scanned == 0 {
+		t.Fatal("no production Go files scanned")
 	}
 }

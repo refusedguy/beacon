@@ -52,6 +52,40 @@ var ToolNames = []string{
 	"beacon_stats",
 }
 
+// Bridge is the six-operation port between Beacon's MCP core and one external
+// agent (ADR 0024). The core speaks only MCP; a bridge translates these six
+// operations into the agent's CLI, HTTP API or ACP. The core never names an
+// agent: bridges are injected, so adding a second agent needs no core edit.
+//
+// The six operations are the uniform meaning shared by live agent environments:
+// start work, read status, read events, wake a waiting turn, cancel work and
+// collect artifacts. Differences in where those operations live belong to the
+// bridge, not to this interface.
+type Bridge interface {
+	Start(ctx context.Context, req BridgeRequest) (BridgeReply, error)
+	Status(ctx context.Context, req BridgeRequest) (BridgeReply, error)
+	Events(ctx context.Context, req BridgeRequest) (BridgeReply, error)
+	Wake(ctx context.Context, req BridgeRequest) (BridgeReply, error)
+	Cancel(ctx context.Context, req BridgeRequest) (BridgeReply, error)
+	Artifacts(ctx context.Context, req BridgeRequest) (BridgeReply, error)
+}
+
+// BridgeRequest is the agent-neutral payload of one bridge operation. It
+// carries MCP-level identifiers only; interpretation belongs to the bridge.
+type BridgeRequest struct {
+	WatchID      string `json:"watchID"`
+	Repo         string `json:"repo"`
+	PR           int    `json:"pr"`
+	HeadSHA      string `json:"headSHA"`
+	SubscriberID string `json:"subscriberID"`
+}
+
+// BridgeReply is the agent-neutral result of one bridge operation. Handle is
+// an opaque token the bridge uses to correlate follow-up operations.
+type BridgeReply struct {
+	Handle string `json:"handle,omitempty"`
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // toolAnnotations records the honest annotation class of each contracted tool
