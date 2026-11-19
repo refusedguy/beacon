@@ -589,6 +589,304 @@ func TestAckStaleEventDoesNotResumeParkedWatch(t *testing.T) {
 	}
 }
 
+// ackDecisionFixture wires a parked Watch and its obligation for a decision
+// test. The Watch is stopped waiting for a human, which is the only state a
+// decision can resume (ADR 0058 §4).
+func ackDecisionFixture(t *testing.T) (*memStore, *recordingStamper, *AckHandler, domain.Watch, domain.Obligation, *stepClock) {
+	t.Helper()
+	clock := &stepClock{t: time.Date(2026, 11, 20, 6, 0, 0, 0, time.UTC)}
+	w := parkedAckWatch()
+	o := resultObligation(w, "session-decision")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+	return store, stamper, h, w, o, clock
+}
+
+// TestDecisionValidSet keeps approve and reject the only accepted decisions.
+func TestDecisionValidSet(t *testing.T) {
+	if !DecisionApprove.Valid() || !DecisionReject.Valid() {
+		t.Fatal("approve and reject must be valid decisions")
+	}
+	for _, bad := range []Decision{"", "maybe", "APPROVE", "approve "} {
+		if bad.Valid() {
+			t.Errorf("decision %q must not be valid", bad)
+		}
+	}
+}
+
+// TestAckInputSchemaHasDecision keeps the decision fields in the derived MCP
+// input schema, so a client can send approve or reject through beacon_ack.
+func TestAckInputSchemaHasDecision(t *testing.T) {
+	schema, err := jsonschema.For[AckInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	for _, field := range []string{"decision", "decisionID"} {
+		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Fatalf("input schema has no %s property: %s", field, raw)
+		}
+	}
+}
+
+// TestAckDecisionResumesStoppedAgent is the acceptance test for ADR 0058 §4:
+// approve or reject resumes the stopped agent in the same Watch. Both values
+// resume; the decision is recorded so the client can prove which answer was
+// applied. No second Watch is created and the plain ack still stamps claimedAt
+// without a verdict pointer.
+func TestAckDecisionResumesStoppedAgent(t *testing.T) {
+	for _, decision := range []Decision{DecisionApprove, DecisionReject} {
+		t.Run(string(decision), func(t *testing.T) {
+			store, stamper, h, w, o, clock := ackDecisionFixture(t)
+
+			receipt, err := h.Decide(context.Background(), AckInput{
+				WatchID: w.ID, ObligationID: o.ID,
+			}, decision, "decision-1")
+			if err != nil {
+				t.Fatalf("decide: %v", err)
+			}
+			if !receipt.OK {
+				t.Fatal("decision receipt is not ok")
+			}
+			if receipt.Decision != decision || receipt.DecisionID != "decision-1" {
+				t.Errorf("receipt decision = %+v, want %q/%q", receipt, decision, "decision-1")
+			}
+			if !receipt.Resumed {
+				t.Error("decision did not resume the agent")
+			}
+			if receipt.Revision != w.Revision {
+				t.Errorf("receipt revision = %d, want committed %d", receipt.Revision, w.Revision)
+			}
+			if receipt.ResumeRevision != w.Revision+1 {
+				t.Errorf("resume revision = %d, want %d", receipt.ResumeRevision, w.Revision+1)
+			}
+
+			got, err := store.Watch(w.ID)
+			if err != nil {
+				t.Fatalf("read Watch after decision: %v", err)
+			}
+			if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+				t.Errorf("decision did not resume the Watch: status %q verdict %q", got.Status, got.Verdict)
+			}
+			if got.Revision != w.Revision+1 {
+				t.Errorf("revision = %d, want %d", got.Revision, w.Revision+1)
+			}
+			if len(store.watches) != 1 {
+				t.Errorf("decision created %d Watches, want 1", len(store.watches))
+			}
+
+			rec, ok := h.decisions.Lookup(w.ID)
+			if !ok {
+				t.Fatal("decision was not recorded")
+			}
+			if rec.Decision != decision || rec.DecisionID != "decision-1" {
+				t.Errorf("recorded decision = %+v, want %q/%q", rec, decision, "decision-1")
+			}
+			if !rec.ResumedAt.Equal(clock.t) {
+				t.Errorf("resumedAt = %v, want %v", rec.ResumedAt, clock.t)
+			}
+
+			stamped, ok := stamper.snapshot(o.ID)
+			if !ok || stamped.ClaimedAt.IsZero() {
+				t.Error("decision ack did not record the intention with claimedAt")
+			}
+			if stamped.VerdictPointer != o.VerdictPointer {
+				t.Errorf("decision changed the verdict pointer: %q -> %q", o.VerdictPointer, stamped.VerdictPointer)
+			}
+		})
+	}
+}
+
+// TestAckDecisionIdempotent proves a repeated decision resumes at most once.
+// The second identical decision is a no-op: it does not advance the Watch, does
+// not overwrite claimedAt and reports Resumed=false. The stamper is still
+// called again, as with any repeated ack; its write stays idempotent.
+func TestAckDecisionIdempotent(t *testing.T) {
+	store, stamper, h, w, o, clock := ackDecisionFixture(t)
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionApprove), DecisionID: "decision-1"}
+
+	first, err := h.AckReceipt(context.Background(), in)
+	if err != nil || !first.Resumed {
+		t.Fatalf("first decision: receipt %+v err %v", first, err)
+	}
+	stampedFirst, ok := stamper.snapshot(o.ID)
+	if !ok {
+		t.Fatal("first decision did not stamp claimedAt")
+	}
+	clock.Advance(time.Hour)
+
+	second, err := h.AckReceipt(context.Background(), in)
+	if err != nil {
+		t.Fatalf("repeat decision: %v", err)
+	}
+	if !second.OK || second.Decision != DecisionApprove || second.Resumed {
+		t.Errorf("repeat decision = %+v, want ok approve without resume", second)
+	}
+	if second.ResumeRevision != first.ResumeRevision {
+		t.Errorf("repeat resume revision = %d, want %d", second.ResumeRevision, first.ResumeRevision)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Revision != w.Revision+1 || got.Status != domain.StatusWatching {
+		t.Errorf("repeat decision changed the Watch: %+v err %v", got, err)
+	}
+	stampedSecond, ok := stamper.snapshot(o.ID)
+	if !ok || !stampedSecond.ClaimedAt.Equal(stampedFirst.ClaimedAt) {
+		t.Errorf("repeat decision changed claimedAt: %v -> %v", stampedFirst.ClaimedAt, stampedSecond.ClaimedAt)
+	}
+}
+
+// TestAckDecisionConflictRejected refuses a second, different decision for a
+// Watch that was already answered. The first decision stays authoritative.
+func TestAckDecisionConflictRejected(t *testing.T) {
+	store, _, h, w, o, _ := ackDecisionFixture(t)
+	if _, err := h.Decide(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+	}, DecisionApprove, "decision-1"); err != nil {
+		t.Fatalf("first decision: %v", err)
+	}
+
+	_, err := h.Decide(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+	}, DecisionReject, "decision-2")
+	if err == nil {
+		t.Fatal("a conflicting second decision was accepted")
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Revision != w.Revision+1 {
+		t.Errorf("conflicting decision changed the Watch: %+v err %v", got, err)
+	}
+	rec, ok := h.decisions.Lookup(w.ID)
+	if !ok || rec.Decision != DecisionApprove {
+		t.Errorf("conflicting decision overwrote the first: %+v ok %v", rec, ok)
+	}
+}
+
+// TestAckDecisionRequiresStoppedWatch keeps a decision scoped to an agent that
+// actually stopped. A live Watch cannot be resumed and is left untouched.
+func TestAckDecisionRequiresStoppedWatch(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	o := resultObligation(w, "session-live")
+	store := newMemStore()
+	_ = store.SaveWatch(w)
+	_ = store.SaveObligation(o)
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
+
+	_, err := h.Decide(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+	}, DecisionApprove, "decision-live")
+	if err == nil {
+		t.Fatal("decision on a live Watch was accepted")
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+
+	got, _ := store.Watch(w.ID)
+	if got.Status != w.Status || got.Revision != w.Revision {
+		t.Errorf("decision changed a live Watch: %+v", got)
+	}
+	_, claims := stamper.counts()
+	if claims != 0 {
+		t.Errorf("rejected decision stamped the obligation %d times", claims)
+	}
+}
+
+// TestAckDecisionRejectsInvalidValue confines decisions to the closed set.
+func TestAckDecisionRejectsInvalidValue(t *testing.T) {
+	_, _, h, w, o, _ := ackDecisionFixture(t)
+	_, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: "maybe",
+	})
+	if err == nil {
+		t.Fatal("an unknown decision was accepted")
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+}
+
+// TestAckDecisionCannotCombineWithContinueOf keeps the two additive ack modes
+// separate: a human answer round and an approve/reject decision are not mixed.
+func TestAckDecisionCannotCombineWithContinueOf(t *testing.T) {
+	store, _, h, w, o, _ := ackDecisionFixture(t)
+	_, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionApprove), ContinueOf: w.ID,
+	})
+	if err == nil {
+		t.Fatal("decision combined with continueOf was accepted")
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+	got, _ := store.Watch(w.ID)
+	if got.Status != domain.StatusNeedsInput {
+		t.Errorf("rejected combination changed the Watch: %+v", got)
+	}
+}
+
+// TestAckDecisionStaleRevisionDiscarded applies the ADR 0036 §5 guard to a
+// decision: a stale event resumes nothing, records no decision and stamps no
+// claimedAt.
+func TestAckDecisionStaleRevisionDiscarded(t *testing.T) {
+	store, stamper, h, w, o, _ := ackDecisionFixture(t)
+	in := AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-stale", Revision: w.Revision - 1,
+	}
+	receipt, err := h.AckReceipt(context.Background(), in)
+	if !IsStaleRevision(err) {
+		t.Fatalf("stale decision was not discarded: receipt %+v err %v", receipt, err)
+	}
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Status != domain.StatusNeedsInput || got.Revision != w.Revision {
+		t.Errorf("stale decision changed the Watch: %+v err %v", got, err)
+	}
+	if _, ok := h.decisions.Lookup(w.ID); ok {
+		t.Error("stale decision was recorded")
+	}
+	_, claims := stamper.counts()
+	if claims != 0 {
+		t.Errorf("stale decision stamped the obligation %d times", claims)
+	}
+}
+
+// TestAckDecisionHandleStaysOkOnly proves the decision keeps the ADR 0028
+// response contract: the MCP tool still returns ok-only with no verdict. The
+// decision detail is read from the receipt, not from the tool response.
+func TestAckDecisionHandleStaysOkOnly(t *testing.T) {
+	_, _, h, w, o, _ := ackDecisionFixture(t)
+	_, out, err := h.Handle(context.Background(), nil, AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionApprove), DecisionID: "decision-1",
+	})
+	if err != nil {
+		t.Fatalf("Handle with decision: %v", err)
+	}
+	if !out.OK {
+		t.Fatal("Handle with decision did not return ok")
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(fields) != 1 || fields["ok"] != true {
+		t.Errorf("decision ack response = %s, want only ok:true", body)
+	}
+}
+
 func TestSQLObligationStamperClaimedAtIdempotent(t *testing.T) {
 	o := resultObligation(resultFixture(domain.VerdictReady), "session-C")
 	writer, load := newStampTestDB(t, o)
