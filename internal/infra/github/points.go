@@ -296,18 +296,6 @@ func parseRateLimitBody(data []byte) (observation, error) {
 	return o, nil
 }
 
-// Compatibility names used by the REST, GraphQL and tier-1 clients.
-type PointCounter = Counter
-type PointsCounter = Counter
-
-func NewPointCounter(ctx context.Context, client *http.Client, baseURL string) (*Counter, error) {
-	return NewCounter(ctx, client, baseURL)
-}
-
-func NewPointsCounter(ctx context.Context, client *http.Client, baseURL string) (*Counter, error) {
-	return NewCounter(ctx, client, baseURL)
-}
-
 func (c *Counter) AddCost(cost int) int { return c.Add(cost) }
 
 func (c *Counter) Record(resp *http.Response, bodyCost int) int {
