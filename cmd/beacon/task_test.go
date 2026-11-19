@@ -221,9 +221,9 @@ func TestTaskCommandWhyEdgeKinds(t *testing.T) {
 	for i, e := range edges {
 		deps := "нет"
 		status := "in_progress"
-		agent := "holder-" + e.to
+		agent := "holder-" + e.from
 		if i == 0 {
-			status, agent = "todo", ""
+			status = "todo"
 		}
 		deps = e.kind + ":" + e.to
 		writeWhyCard(t, dir, e.from, status, agent, deps, "цепочка")
