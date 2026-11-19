@@ -1193,3 +1193,153 @@ func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 		}
 	}
 }
+
+// ---- ADR 0041 §6 / T3.82: причина precheck в wait_result и журнале ----
+
+// TestWaitResultPrecheckFailureCarriesReason proves that a failed precheck
+// ends the wait before any store, subscription or obligation is touched. The
+// same reason is visible in the wait_result response and in the journal.
+func TestWaitResultPrecheckFailureCarriesReason(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	reason := "bypass mode не настроен для init event control-plane"
+	svc.SetPrecheck(func(context.Context) error {
+		return &PrecheckFailure{Reason: reason}
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Status != waitResultPrecheckFailure {
+		t.Errorf("status = %q, want %q", got.Status, waitResultPrecheckFailure)
+	}
+	if got.Verdict != reason {
+		t.Errorf("verdict = %q, want the precheck reason %q", got.Verdict, reason)
+	}
+	if store.reads != 0 || len(source.subscribed) != 0 || len(writer.reads) != 0 {
+		t.Errorf("failed precheck touched the wait: reads=%d subscriptions=%d writes=%d",
+			store.reads, len(source.subscribed), len(writer.reads))
+	}
+
+	journal, ok := svc.journal.(*memoryPrecheckJournal)
+	if !ok {
+		t.Fatalf("journal type = %T, want *memoryPrecheckJournal", svc.journal)
+	}
+	records := journal.Records()
+	if len(records) != 1 {
+		t.Fatalf("journal records = %d, want 1", len(records))
+	}
+	if records[0].Reason != reason || records[0].At.IsZero() {
+		t.Errorf("journal record = %+v, want reason %q and a timestamp", records[0], reason)
+	}
+
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), waitResultPrecheckFailure) || !strings.Contains(string(data), reason) {
+		t.Errorf("wait_result JSON hides the reason: %s", data)
+	}
+}
+
+// TestWaitResultPrecheckFailureFromPlainError keeps an untyped precheck error
+// explainable: the run still ends with precheck_failure and the error text is
+// the reason in both the response and the journal.
+func TestWaitResultPrecheckFailureFromPlainError(t *testing.T) {
+	svc, _, _, _, _ := newWaitTestService()
+	svc.SetPrecheck(func(context.Context) error { return errors.New("нет bypass") })
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Status != waitResultPrecheckFailure || got.Verdict != "нет bypass" {
+		t.Errorf("result = %+v, want precheck_failure with the error text", got)
+	}
+	records := svc.journal.(*memoryPrecheckJournal).Records()
+	if len(records) != 1 || records[0].Reason != "нет bypass" {
+		t.Errorf("journal records = %+v, want one reason нет bypass", records)
+	}
+}
+
+// TestPrecheckFailureReasonRejectsOtherErrors guards the type branch: only a
+// real PrecheckFailure supplies a reason, so an unrelated error is not
+// mislabelled as this run outcome.
+func TestPrecheckFailureReasonRejectsOtherErrors(t *testing.T) {
+	if reason, ok := PrecheckFailureReason(nil); ok || reason != "" {
+		t.Errorf("nil: reason=%q ok=%v", reason, ok)
+	}
+	if reason, ok := PrecheckFailureReason(errors.New("other")); ok || reason != "" {
+		t.Errorf("other error: reason=%q ok=%v", reason, ok)
+	}
+	if reason, ok := PrecheckFailureReason(&PrecheckFailure{Reason: "bypass"}); !ok || reason != "bypass" {
+		t.Errorf("precheck failure: reason=%q ok=%v", reason, ok)
+	}
+}
+
+// TestWaitResultPrecheckPassStartsWait proves the port leaves the normal path
+// unchanged: a passing check runs once and the long-poll still starts.
+func TestWaitResultPrecheckPassStartsWait(t *testing.T) {
+	svc, _, _, source, timeout := newWaitTestService()
+	calls := 0
+	svc.SetPrecheck(func(context.Context) error { calls++; return nil })
+	close(timeout)
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("precheck calls = %d, want 1", calls)
+	}
+	if got.Status != string(domain.StatusWatching) {
+		t.Errorf("status = %q, want watching", got.Status)
+	}
+	if len(source.subscribed) != 1 {
+		t.Errorf("subscriptions = %d, want 1", len(source.subscribed))
+	}
+	if records := svc.journal.(*memoryPrecheckJournal).Records(); len(records) != 0 {
+		t.Errorf("passing precheck wrote %d journal records, want 0", len(records))
+	}
+}
+
+// TestWaitResultHandleReturnsPrecheckFailure covers the MCP boundary: the
+// tool's structured output is the precheck_failure response with its reason.
+func TestWaitResultHandleReturnsPrecheckFailure(t *testing.T) {
+	svc, _, _, _, _ := newWaitTestService()
+	svc.SetPrecheck(func(context.Context) error {
+		return &PrecheckFailure{Reason: "bypass не настроен"}
+	})
+	req := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Meta: mcpsdk.Meta{sessionIDMetaKey: "session-X"},
+	}}
+
+	result, out, err := svc.Handle(context.Background(), req, WaitResultInput{WatchID: "watch-1"})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if result == nil {
+		t.Fatal("Handle returned no tool result")
+	}
+	if out.Status != waitResultPrecheckFailure || out.Verdict != "bypass не настроен" {
+		t.Errorf("structured output = %+v, want precheck_failure with the reason", out)
+	}
+}
+
+// TestWaitResultPrecheckFailureWithoutJournal proves a nil sink disables the
+// write without turning the refusal into a protocol error.
+func TestWaitResultPrecheckFailureWithoutJournal(t *testing.T) {
+	svc, _, _, _, _ := newWaitTestService()
+	svc.SetPrecheckJournal(nil)
+	svc.SetPrecheck(func(context.Context) error {
+		return &PrecheckFailure{Reason: "без журнала"}
+	})
+
+	got, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got.Status != waitResultPrecheckFailure || got.Verdict != "без журнала" {
+		t.Errorf("result = %+v, want precheck_failure with the reason", got)
+	}
+}

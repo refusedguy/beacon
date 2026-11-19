@@ -27,6 +27,12 @@
 // injects the concrete gate; with no gate wired, each caller runs its own
 // operation as before.
 //
+// A run whose startup precheck fails (ADR 0041 §6) never enters the long-poll.
+// The service returns a precheck_failure response carrying the reason and
+// writes the same reason to the precheck journal. The check is a port so the
+// composition root supplies the real configuration check; with no port wired
+// the wait is unchanged.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -37,6 +43,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -65,7 +72,9 @@ const (
 // field order with constants so the same state always serialises to the same
 // bytes and a prefix-cache keyed by the response prefix does not burn. The
 // canonical order is status, verdict, revision, checks, pollAfterMs; the
-// MarshalJSON method below is the single place that emits them.
+// MarshalJSON method below is the single place that emits them. A
+// precheck_failure response reuses the optional verdict field for its reason,
+// so the canonical field set and prefix stay unchanged.
 const (
 	waitResultFieldStatus      = "status"
 	waitResultFieldVerdict     = "verdict"
@@ -116,6 +125,43 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 	}
 	buf.WriteByte('}')
 	return buf.Bytes(), nil
+}
+
+// waitResultPrecheckFailure is the run outcome from ADR 0041 §6. A run whose
+// init-event bypass is not configured ends with this outcome before it starts
+// waiting. It is a status, not a Verdict: no CI evaluation produced it.
+const waitResultPrecheckFailure = "precheck_failure"
+
+// PrecheckFailure is the failed startup precheck of ADR 0041 §6. Reason is the
+// human-readable cause, for example a missing bypass for the expected init
+// event. It travels with the error so callers branch on the type and the
+// reason reaches wait_result and the journal instead of only stderr.
+type PrecheckFailure struct {
+	Reason string
+}
+
+func (f *PrecheckFailure) Error() string {
+	return "mcp: " + waitResultPrecheckFailure + ": " + f.Reason
+}
+
+// PrecheckFailureReason returns the reason of a failed precheck. ok is false
+// when err is not a precheck failure, so an unrelated error is never reported
+// as one.
+func PrecheckFailureReason(err error) (reason string, ok bool) {
+	var failure *PrecheckFailure
+	if !errors.As(err, &failure) {
+		return "", false
+	}
+	return failure.Reason, true
+}
+
+// PrecheckFailureOutput builds the wait_result response for a failed precheck.
+// status is precheck_failure and the optional verdict field carries the reason:
+// there is no CI verdict for a run that ended before the wait began, and this
+// keeps the response inside the existing schema (ADR 0041 §6, ADR 0036 §2).
+// The same reason is written to the precheck journal by the service.
+func PrecheckFailureOutput(reason string) WaitResultOutput {
+	return WaitResultOutput{Status: waitResultPrecheckFailure, Verdict: reason}
 }
 
 // WaitResultInput is the argument object of beacon_wait_result. timeoutMs is
@@ -307,6 +353,46 @@ func (j *memoryCancelJournal) Records() []CancellationRecord {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	out := make([]CancellationRecord, len(j.records))
+	copy(out, j.records)
+	return out
+}
+
+// PrecheckRecord is one journal line for a failed startup precheck (ADR 0041
+// §6). It holds the same reason the wait_result response carries, so the
+// refusal is visible after the run has ended.
+type PrecheckRecord struct {
+	Reason string
+	At     time.Time
+}
+
+// PrecheckJournal is the sink for precheck failure reasons. The composition
+// root supplies a durable sink; the in-memory default keeps the reason so a
+// service with no injected journal still has somewhere to write it.
+type PrecheckJournal interface {
+	RecordPrecheckFailure(PrecheckRecord)
+}
+
+type memoryPrecheckJournal struct {
+	mu      sync.Mutex
+	records []PrecheckRecord
+}
+
+// NewMemoryPrecheckJournal builds the in-process precheck journal.
+func NewMemoryPrecheckJournal() PrecheckJournal { return &memoryPrecheckJournal{} }
+
+func (j *memoryPrecheckJournal) RecordPrecheckFailure(r PrecheckRecord) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.records = append(j.records, r)
+}
+
+// Records returns a snapshot of the precheck journal in insertion order. It is
+// on the concrete type so tests and callers can read the recorded reasons
+// without widening the port.
+func (j *memoryPrecheckJournal) Records() []PrecheckRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]PrecheckRecord, len(j.records))
 	copy(out, j.records)
 	return out
 }
@@ -536,6 +622,8 @@ type WaitResultService struct {
 	capability  func(*mcpsdk.CallToolRequest) *CapabilityContext
 	ciWait      func(context.Context) error
 	ciGate      SharedCIWaiter
+	precheck    func(context.Context) error
+	journal     PrecheckJournal
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -555,6 +643,7 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		idempotency: NewMemoryWaitResultIdempotency(),
 		ciWait:      sharedCIWaitNoop,
 		ciGate:      directCIWait,
+		journal:     NewMemoryPrecheckJournal(),
 	}
 }
 
@@ -615,6 +704,27 @@ func (s *WaitResultService) SetSharedCIWaiter(fn SharedCIWaiter) {
 	s.ciGate = fn
 }
 
+// SetPrecheck installs the startup check that runs before a wait begins. A
+// failed check ends the wait immediately with a precheck_failure response that
+// carries its reason (ADR 0041 §6). A nil argument disables the check; a
+// service with no check wired keeps the original wait behaviour. The real
+// init-event configuration check is supplied by the composition root, which
+// owns the CLI boundary.
+func (s *WaitResultService) SetPrecheck(fn func(context.Context) error) {
+	if s != nil {
+		s.precheck = fn
+	}
+}
+
+// SetPrecheckJournal replaces the sink that records failed prechecks. A nil
+// argument disables the write; the default in-memory journal keeps the reason
+// available to callers that do not inject a durable sink.
+func (s *WaitResultService) SetPrecheckJournal(j PrecheckJournal) {
+	if s != nil {
+		s.journal = j
+	}
+}
+
 // sharedCIWaitKey is the gate key for one CI head. The subscriber's identity is
 // deliberately absent: renaming a session must not split one CI into several
 // gates (ADR 0037 p3).
@@ -673,6 +783,22 @@ func (s *WaitResultService) WaitInCapability(ctx context.Context, subscriberID s
 // waitScoped applies clientRequestId idempotency around the long-poll. A
 // departure or an error leaves no key behind, including a capability timeout.
 func (s *WaitResultService) waitScoped(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
+	// ADR 0041 §6: the precheck runs before the wait, so a run with no bypass
+	// ends with a reason instead of silently waiting. The reason goes to both
+	// the response and the journal; no store, subscription or obligation is
+	// touched on this path.
+	if s != nil && s.precheck != nil {
+		if err := s.precheck(ctx); err != nil {
+			reason, ok := PrecheckFailureReason(err)
+			if !ok || reason == "" {
+				reason = err.Error()
+			}
+			if s.journal != nil {
+				s.journal.RecordPrecheckFailure(PrecheckRecord{Reason: reason, At: s.now()})
+			}
+			return PrecheckFailureOutput(reason), nil
+		}
+	}
 	if s == nil || in.ClientRequestID == "" || s.idempotency == nil {
 		return s.wait(ctx, subscriberID, in, exits, capCtx)
 	}
