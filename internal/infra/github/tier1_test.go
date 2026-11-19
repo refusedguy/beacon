@@ -43,6 +43,27 @@ func tier1PRJSON(rollup, mergeable, mergeState string) json.RawMessage {
 	return raw
 }
 
+// tier1PRJSONWithSHA builds one aliased PR payload that carries a headRefOid.
+func tier1PRJSONWithSHA(rollup, mergeable, mergeState, headSHA string) json.RawMessage {
+	raw, err := json.Marshal(map[string]any{
+		"state":            "OPEN",
+		"headRefOid":       headSHA,
+		"mergeable":        mergeable,
+		"mergeStateStatus": mergeState,
+		"commits": map[string]any{
+			"nodes": []any{map[string]any{
+				"commit": map[string]any{
+					"statusCheckRollup": map[string]any{"state": rollup},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
 // tier1Reply answers a recorded GraphQL query with one tier-1 PR per alias.
 func tier1Reply(w http.ResponseWriter, query string) {
 	data := make(map[string]any)
@@ -280,6 +301,75 @@ func TestTier2CalledOnlyOnChangeOrUnknown(t *testing.T) {
 
 	if fetcher.calls != 7 {
 		t.Fatalf("tier-1 fetches = %d, want 7", fetcher.calls)
+	}
+}
+
+// TestTier2DedupByHeadSHA checks ADR 0033 §1: within one batch each head SHA
+// reaches tier-2 once, and a later batch carrying the same SHA reuses that
+// answer instead of making a second request.
+func TestTier2DedupByHeadSHA(t *testing.T) {
+	ws := watches(3)
+	const shared = "aaa111"
+	const other = "bbb222"
+	fetcher := &stubTier1Fetcher{data: map[string]json.RawMessage{
+		"p0": tier1PRJSONWithSHA("UNKNOWN", "MERGEABLE", "CLEAN", shared),
+		"p1": tier1PRJSONWithSHA("UNKNOWN", "MERGEABLE", "CLEAN", shared), // same SHA as p0
+		"p2": tier1PRJSONWithSHA("UNKNOWN", "MERGEABLE", "CLEAN", other),
+	}}
+	var batches [][]domain.Watch
+	p := NewPoller(fetcher, nil, func(_ context.Context, changed []domain.Watch) error {
+		batches = append(batches, append([]domain.Watch(nil), changed...))
+		return nil
+	})
+	ctx := context.Background()
+
+	// First batch: p0 and p1 share a SHA, so only one of them is escalated;
+	// p2 has a distinct SHA and is escalated too.
+	if _, err := p.Tick(ctx, ws); err != nil {
+		t.Fatalf("first Tick: %v", err)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("tier-2 batches = %d after first tick, want 1", len(batches))
+	}
+	first := batches[0]
+	if len(first) != 2 {
+		t.Fatalf("first tier-2 watches = %v, want 2 (one per unique SHA)", first)
+	}
+	ids := map[string]bool{}
+	for _, w := range first {
+		ids[w.ID] = true
+	}
+	if !ids[ws[0].ID] || !ids[ws[2].ID] || ids[ws[1].ID] {
+		t.Fatalf("first tier-2 watches = %v, want %s and %s but not %s", first, ws[0].ID, ws[2].ID, ws[1].ID)
+	}
+
+	// Second batch carries the same SHAs; neither should be queried again.
+	if _, err := p.Tick(ctx, ws); err != nil {
+		t.Fatalf("second Tick: %v", err)
+	}
+	if len(batches) != 1 {
+		t.Fatalf("tier-2 batches = %d after repeated SHA, want 1 (no second request)", len(batches))
+	}
+}
+
+// TestTier2WithoutHeadSHANotDeduplicated keeps the old behaviour for payloads
+// that have no headRefOid: every changed watch is still escalated.
+func TestTier2WithoutHeadSHANotDeduplicated(t *testing.T) {
+	ws := watches(2)
+	fetcher := &stubTier1Fetcher{data: map[string]json.RawMessage{
+		"p0": tier1PRJSON("UNKNOWN", "MERGEABLE", "CLEAN"),
+		"p1": tier1PRJSON("UNKNOWN", "MERGEABLE", "CLEAN"),
+	}}
+	var escalated int
+	p := NewPoller(fetcher, nil, func(_ context.Context, changed []domain.Watch) error {
+		escalated += len(changed)
+		return nil
+	})
+	if _, err := p.Tick(context.Background(), ws); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if escalated != 2 {
+		t.Fatalf("escalated watches = %d, want 2 when no head SHA is present", escalated)
 	}
 }
 

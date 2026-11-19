@@ -140,6 +140,7 @@ type Poller struct {
 	mu           sync.Mutex
 	prev         map[string]Tier1Observation
 	lastActivity time.Time
+	seenSHA      map[string]bool // head SHAs already escalated to tier-2 (ADR 0033 §1)
 }
 
 // NewPoller builds a tier-1 poller. counter supplies the shared budget flag
@@ -206,6 +207,7 @@ func (p *Poller) Tick(ctx context.Context, watches []domain.Watch) (time.Duratio
 	if active {
 		p.lastActivity = p.now()
 	}
+	changed = p.dedupBySHA(current, changed)
 	p.mu.Unlock()
 
 	if len(changed) > 0 && p.fetchTier2 != nil {
@@ -214,6 +216,30 @@ func (p *Poller) Tick(ctx context.Context, watches []domain.Watch) (time.Duratio
 		}
 	}
 	return p.Interval(), nil
+}
+
+// dedupBySHA keeps at most one watch per head SHA for the tier-2 escalation.
+// A head commit is immutable, so once one PR carrying a SHA has been fetched
+// from tier-2, a second PR with the same SHA in this batch (or a later one)
+// reuses that answer instead of issuing a redundant query (ADR 0033 §1).
+// Watches without a head SHA are left untouched because they cannot be
+// deduplicated. The caller must hold p.mu.
+func (p *Poller) dedupBySHA(current map[string]Tier1Observation, changed []domain.Watch) []domain.Watch {
+	if p.seenSHA == nil {
+		p.seenSHA = make(map[string]bool)
+	}
+	out := make([]domain.Watch, 0, len(changed))
+	for _, w := range changed {
+		sha := current[w.ID].HeadSHA
+		if sha != "" {
+			if p.seenSHA[sha] {
+				continue
+			}
+			p.seenSHA[sha] = true
+		}
+		out = append(out, w)
+	}
+	return out
 }
 
 // Run polls watches from the supplier until ctx is done, sleeping the
