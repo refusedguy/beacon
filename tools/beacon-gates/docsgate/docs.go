@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -24,7 +25,7 @@ func loadDocsConfig(path string) (docsConfig, error) {
 	if path == "" {
 		return docsConfig{}, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := fs.ReadFile(os.DirFS("."), filepath.ToSlash(path))
 	if err != nil {
 		return docsConfig{}, fmt.Errorf("read docs baseline: %w", err)
 	}
@@ -64,20 +65,17 @@ type docsFile struct {
 
 // readDocsFiles loads every *.md directly under dir, sorted by relative path.
 func readDocsFiles(root, dir string) ([]docsFile, error) {
-	pattern := filepath.Join(root, filepath.FromSlash(dir), "*.md")
-	matches, err := filepath.Glob(pattern)
+	fsys := os.DirFS(root)
+	pattern := filepath.ToSlash(filepath.Join(dir, "*.md"))
+	matches, err := fs.Glob(fsys, pattern)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]docsFile, 0, len(matches))
-	for _, path := range matches {
-		b, err := os.ReadFile(path)
+	for _, rel := range matches {
+		b, err := fs.ReadFile(fsys, rel)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", dir, err)
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return nil, err
 		}
 		out = append(out, docsFile{
 			path:  filepath.ToSlash(rel),
