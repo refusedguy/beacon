@@ -27,7 +27,23 @@ const (
 	CheckVerdictWatching Verdict = "watching"
 	CheckVerdictReady    Verdict = "ready"
 	CheckVerdictRetry    Verdict = "retry"
+
+	// wakeSessionPrefix is the prefix OpenCode uses for session ids. The wake
+	// adapter rejects any other id before calling the prompt API, so a service
+	// name registered as a notify target produces "wake: error" instead of a
+	// delivered pointer.
+	wakeSessionPrefix = "ses_"
 )
+
+// ValidateWakeTarget checks that a notify target can address an OpenCode
+// session. The orchestrator subscriber of a Watch is the wake recipient, so a
+// target without a session id cannot receive a verdict pointer.
+func ValidateWakeTarget(target string) error {
+	if !strings.HasPrefix(target, wakeSessionPrefix) || len(target) == len(wakeSessionPrefix) {
+		return fmt.Errorf("checkall: неверный wake target %q: нужен sessionID OpenCode с префиксом %s", target, wakeSessionPrefix)
+	}
+	return nil
+}
 
 // Config is the project configuration hook. The schema will come from the
 // research card (another agent); this stub keeps the call site stable today.
