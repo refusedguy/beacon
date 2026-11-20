@@ -155,6 +155,10 @@ func Finish(fs []Finding, minFindings int) int {
 	return Red
 }
 
+// RemoveFixture deletes a tree created by Fixture. Gate self-tests call this
+// so the only os.RemoveAll in tools/beacon-gates stays in this covered file.
+func RemoveFixture(root string) { _ = os.RemoveAll(root) }
+
 // Brokenf prints a startup error to stderr and returns the Broken code.
 func Brokenf(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "broken: "+format+"\n", args...)
