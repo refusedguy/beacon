@@ -842,7 +842,7 @@ func runSchedulePut(argv []string, stdout, stderr io.Writer, cfg taskcli.Config)
 		return failTask(stderr, taskstore.Validationf("нужен --expr"))
 	}
 	got, err := svc.Schedule(ctx, server.ScheduleCreate{
-		TaskID: taskID, Kind: kind, Expr: expr, Timezone: p.value("timezone"),
+		ID: p.value("id"), TaskID: taskID, Kind: kind, Expr: expr, Timezone: p.value("timezone"),
 	})
 	if err != nil {
 		return failSchedule(stderr, err)
