@@ -20,6 +20,9 @@ MCP-сервер Beacon подключён в `/mnt/projects/beacon-handoff/open
 ## Самоиспользование инструментов
 
 - Карточки создаются только через `go run ./cmd/batch-apply --dir <json> --check`, затем тем же вызовом без `--check`. Ручной `cat` для карточек не используется.
+- Закрытие карточек тоже делается тулзой: подготовь JSON с `card_closures: [{id, pr, merged_at}]` и запусти `go run ./cmd/batch-apply --dir <папка> --dry-run`, затем без `--dry-run`. Не редактируй `docs/tasks/*.md` вручную.
+- Любой сабагент, который видит незакрытую карточку с уже замерженным PR, обязан закрыть её через batch-apply, а не просто сообщить об этом.
+- Research-агенты пишут структурированный JSON в `/home/nbook/Projects/tmp/beacon-research/batch/`, а не сырые отчёты в чат. Оркестратор применяет его одной командой batch-apply.
 - Оркестратор регистрирует Watch через `tools.beacon.beacon_watch_pr` и читает вердикт через `beacon_get_result`. `gh pr checks` вручную не вызывается.
 - Wake доставляется через opencode API `POST /api/session/{id}/prompt` с `delivery=steer`. В тексте настоящие `watchID` и `obligationID`, а не заглушки.
 - Форматирование и проверки выполняет CI, локальный `gofmt` не запускается.
