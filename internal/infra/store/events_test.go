@@ -22,7 +22,7 @@ func openEventStore(t *testing.T) *DB {
 // events table its replay columns and index. No Append call is needed first.
 func TestEventLogPreparedAtInit(t *testing.T) {
 	d := openEventStore(t)
-	cols, err := eventLogColumns(context.Background(), d.writeDB)
+	cols, err := eventLogColumns(context.Background(), d.readDB)
 	if err != nil {
 		t.Fatalf("eventLogColumns: %v", err)
 	}
