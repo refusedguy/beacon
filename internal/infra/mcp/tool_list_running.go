@@ -18,6 +18,27 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// RegistryEntry is one read-only row of the agent registry carried by a
+// StateSnapshot. It exposes the three axes named by T5.29: the subscriber role,
+// the declared capabilities and the configuration id. ID is the opaque
+// executor identifier, never an agent name (ADR 0086). Status is the lifecycle
+// state from ADR 0090. No field is sourced from a write path.
+type RegistryEntry struct {
+	ID           string              `json:"id"`
+	Role         domain.Role         `json:"role"`
+	Capabilities []domain.Capability `json:"capabilities"`
+	Config       string              `json:"config"`
+	Status       string              `json:"status,omitempty"`
+}
+
+// Registry lifecycle states from ADR 0090. They are local strings because a
+// snapshot is a read-only projection: the store owns every transition.
+const (
+	RegistryActive  = "active"
+	RegistryStale   = "stale"
+	RegistryStopped = "stopped"
+)
+
 // StateSnapshot is the read-only view of Beacon state shared by the two
 // observability tools. A SnapshotReader produces it. No field is sourced from
 // a write path, so the tools only project what was already persisted.
@@ -36,6 +57,54 @@ type StateSnapshot struct {
 	LadderPending   int
 	LadderEscalated int
 	Version         string
+	// Registry is the read-only agent registry projection shared by both
+	// observability tools (T5.29, ADR 0094). The wiring layer fills it when
+	// registry state is available. A snapshot without entries keeps the exact
+	// previous output of both tools.
+	Registry []RegistryEntry
+}
+
+// RegisteredAgents returns the number of registry rows in the snapshot.
+func (s StateSnapshot) RegisteredAgents() int { return len(s.Registry) }
+
+// StaleAgents counts rows whose lifecycle state is stale. Stale is a registry
+// state and never rewrites a Watch verdict (ADR 0090).
+func (s StateSnapshot) StaleAgents() int {
+	n := 0
+	for _, entry := range s.Registry {
+		if entry.Status == RegistryStale {
+			n++
+		}
+	}
+	return n
+}
+
+// RegistryConfig returns the configuration id shared by every registry row.
+// Rows from different configurations yield an empty string: reporting one id
+// for a mixed snapshot would hide a config change (ADR 0087). An empty
+// registry has no config and also yields an empty string.
+func (s StateSnapshot) RegistryConfig() string {
+	if len(s.Registry) == 0 {
+		return ""
+	}
+	config := s.Registry[0].Config
+	for _, entry := range s.Registry[1:] {
+		if entry.Config != config {
+			return ""
+		}
+	}
+	return config
+}
+
+// FindRegistryEntry looks up one row by its opaque executor id. The bool
+// reports whether the row exists.
+func (s StateSnapshot) FindRegistryEntry(id string) (RegistryEntry, bool) {
+	for _, entry := range s.Registry {
+		if entry.ID == id {
+			return entry, true
+		}
+	}
+	return RegistryEntry{}, false
 }
 
 // StatusIdle is the status beacon_list_running reports for a watch whose agent
