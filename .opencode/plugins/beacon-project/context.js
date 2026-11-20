@@ -20,6 +20,7 @@ export const SURVIVAL_RULES = [
   '7) Информационные проверки (required: false, continue-on-error: true) НЕ блокеры. По ним не вызывай blocked:not_mine и не спавни FIX-агента.',
   '8) Если часть фичи осталась неподключённой, сразу вызови beacon_defer_wiring и добавь возвращённую карточку WIRING-<PR> в свой PR.',
   '9) Прозу пиши по скиллу unslop: без em dashes, простые слова, активный залог, без filler и rule of three.',
+  '10) Если main красный по required-проверке, НЕ спавни новых сабентов. Дождись FIX-агента и зелёного main. Информационные проверки main не ломают.',
 ].join("\n")
 
 export function agentsFileURI(root) {
