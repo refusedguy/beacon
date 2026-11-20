@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"strings"
@@ -61,23 +60,20 @@ func spawnPrompt(taskID, title string) string {
 // prints the new sessionID. No server is started and no TUI is opened here:
 // both stay the job of the adapter and of beacon attach (ADR 0060 п3 and п5).
 func (c *CLI) runSpawn(args []string) int {
-	fs := flag.NewFlagSet("spawn", flag.ContinueOnError)
-	fs.SetOutput(c.errOut)
-	fs.Usage = func() {}
-	agent := fs.String("agent", "", "идентификатор агента opencode")
-	title := fs.String("title", "", "заголовок новой сессии")
-	// parseFlags rejects positional arguments, while spawn needs exactly one
-	// taskID. Parse here directly and apply the same one-argument rule by hand.
-	if err := fs.Parse(args); err != nil {
-		writeUsage(c.errOut)
+	// parseFlags rejects positional arguments and the flag package stops at the
+	// first one, while spawn accepts flags both before and after the taskID.
+	// parseTaskArgs is the existing parser with that shape (cmd/beacon/task.go).
+	p, err := parseTaskArgs(args, map[string]bool{"agent": true, "title": true}, nil)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon spawn: %v\n", err)
 		return 2
 	}
-	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
+	if len(p.pos) != 1 || strings.TrimSpace(p.pos[0]) == "" {
 		fmt.Fprintln(c.errOut, "beacon spawn: нужна одна команда: beacon spawn <taskID> [--agent id] [--title ...]")
 		return 2
 	}
 
-	taskID := strings.TrimSpace(fs.Arg(0))
+	taskID := strings.TrimSpace(p.pos[0])
 	parentID := strings.TrimSpace(os.Getenv(spawnParentEnv))
 	if parentID == "" {
 		fmt.Fprintf(c.errOut, "beacon spawn: не задан parentID оркестратора (%s)\n", spawnParentEnv)
@@ -89,8 +85,8 @@ func (c *CLI) runSpawn(args []string) int {
 		return 2
 	}
 
-	agentID := strings.TrimSpace(*agent)
-	sessionTitle := strings.TrimSpace(*title)
+	agentID := strings.TrimSpace(p.value("agent"))
+	sessionTitle := strings.TrimSpace(p.value("title"))
 	metadata := map[string]string{spawnMetaTaskID: taskID}
 	if sessionTitle != "" {
 		metadata[spawnMetaTitle] = sessionTitle
