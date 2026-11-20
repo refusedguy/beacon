@@ -1,5 +1,6 @@
 # BS.24. Интервал, фиксированное время и webhook триггер
 Статус: done
+Обоснование: функциональность уже в main (commit c29094d, PR #449; internal/app/scheduler/schedule.go реализует Interval, FixedTime и Webhook, NextRun/cronNext обрабатывают DST и пропуск интервалов), карта уже в статусе done. Дубля в OwnerFiles нет, код не писался.
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/scheduler/schedule.go
