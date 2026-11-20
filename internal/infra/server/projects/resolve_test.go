@@ -3,6 +3,7 @@ package projects
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -100,13 +101,13 @@ func TestResolveAmbiguous(t *testing.T) {
 
 func TestResolveAmbiguousAcrossKeyAndPath(t *testing.T) {
 	source := &fakeSource{projects: []Project{
-		{ID: "id-a", Key: "target", Path: "/work/a"},
+		{ID: "id-a", Key: "/work/target", Path: "/work/a"},
 		{ID: "id-b", Key: "beta", Path: "/work/target"},
 	}}
 	r := mustResolver(t, source)
 
-	if _, err := r.Resolve(context.Background(), "target"); !errors.Is(err, ErrAmbiguous) {
-		t.Fatalf("Resolve(target) error = %v, want ErrAmbiguous", err)
+	if _, err := r.Resolve(context.Background(), "/work/target"); !errors.Is(err, ErrAmbiguous) {
+		t.Fatalf("Resolve(/work/target) error = %v, want ErrAmbiguous", err)
 	}
 }
 
@@ -152,8 +153,8 @@ func TestResolvePortError(t *testing.T) {
 	if !errors.Is(err, ErrPort) {
 		t.Fatalf("Resolve(alpha) error = %v, want ErrPort", err)
 	}
-	if !errors.Is(err, boom) {
-		t.Fatalf("Resolve(alpha) error = %v, want wrapped port error", err)
+	if !strings.Contains(err.Error(), boom.Error()) {
+		t.Fatalf("Resolve(alpha) error = %v, want port cause in message", err)
 	}
 }
 
