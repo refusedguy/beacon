@@ -1349,7 +1349,7 @@ func TestNextStepForVerdicts(t *testing.T) {
 		t.Run(string(tc.verdict), func(t *testing.T) {
 			action, command, hint := nextStepFor(tc.verdict)
 			if action != tc.action || command != tc.command {
-				t.Errorf("nextStepFor(%s) = %q/%q, want %q/%q", tc.verdict, action, command, tc.command)
+				t.Errorf("nextStepFor(%s) = %q/%q, want %q/%q", tc.verdict, action, command, tc.action, tc.command)
 			}
 			if strings.TrimSpace(hint) == "" {
 				t.Error("nextStepFor returned an empty hint")
