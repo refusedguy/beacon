@@ -100,6 +100,19 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 			}
 			for _, w := range watches {
 				if w.Repo == pr.Repo && w.PR == pr.Number && w.HeadSHA == pr.HeadSHA {
+					// A Watch left by an older release can name a service instead
+					// of a session (beacon-ci-checkall, beacon-daemon-checkall).
+					// Treat it as stale and let checkall register a fresh Watch
+					// with the validated --wake-target session.
+					subs := make([]orchestrator.DaemonSubscriber, 0, len(w.Subscribers))
+					for _, s := range w.Subscribers {
+						subs = append(subs, orchestrator.DaemonSubscriber{
+							ID: s.ID, Role: string(s.Role), Adapter: s.Adapter, Target: s.Target,
+						})
+					}
+					if _, err := orchestrator.DaemonWakeSubscriber(subs); err != nil {
+						continue
+					}
 					return orchestrator.WatchRef{
 						ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA, Revision: w.Revision,
 					}, true, nil
@@ -164,18 +177,19 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 				return orchestrator.DaemonWatch{}, err
 			}
 			view := orchestrator.DaemonWatch{ID: w.ID, PR: w.PR}
+			subs := make([]orchestrator.DaemonSubscriber, 0, len(w.Subscribers))
 			for _, s := range w.Subscribers {
-				if string(s.Role) == "executor" {
-					view.Adapter, view.SubscriberID = s.Adapter, s.ID
-					break
-				}
+				subs = append(subs, orchestrator.DaemonSubscriber{
+					ID: s.ID, Role: string(s.Role), Adapter: s.Adapter, Target: s.Target,
+				})
 			}
-			if view.SubscriberID == "" {
-				for _, s := range w.Subscribers {
-					view.Adapter, view.SubscriberID = s.Adapter, s.ID
-					break
-				}
+			sub, err := orchestrator.DaemonWakeSubscriber(subs)
+			if err != nil {
+				// Leave SubscriberID empty: Wake logs the refusal once and
+				// returns a clear error instead of calling the prompt API.
+				return view, nil
 			}
+			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
 		}),
 	}, cleanup, nil

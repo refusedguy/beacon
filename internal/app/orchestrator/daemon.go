@@ -101,6 +101,42 @@ type DaemonWatch struct {
 // DaemonWatchLookup resolves one Watch into the primitive projection.
 type DaemonWatchLookup func(watchID string) (DaemonWatch, error)
 
+// DaemonSubscriber is one subscriber of a Watch, projected into primitive
+// fields so cmd can supply it without naming a domain type (ADR 0005).
+type DaemonSubscriber struct {
+	ID      string
+	Role    string
+	Adapter string
+	Target  string
+}
+
+// DaemonWakeSubscriber picks the subscriber a daemon wake may address. It
+// keeps the historical executor-first order, but skips any subscriber whose ID
+// or target is not an OpenCode sessionID: old Watches carry service names such
+// as beacon-ci-checkall, and steering one returns HTTP 400 instead of a wake.
+// When every subscriber is stale the caller must not deliver at all.
+func DaemonWakeSubscriber(subs []DaemonSubscriber) (DaemonSubscriber, error) {
+	var fallback DaemonSubscriber
+	for _, sub := range subs {
+		if ValidateWakeTarget(sub.ID) != nil {
+			continue
+		}
+		if sub.Target != "" && ValidateWakeTarget(sub.Target) != nil {
+			continue
+		}
+		if sub.Role == RoleExecutor {
+			return sub, nil
+		}
+		if fallback.ID == "" {
+			fallback = sub
+		}
+	}
+	if fallback.ID != "" {
+		return fallback, nil
+	}
+	return DaemonSubscriber{}, errors.New("daemon: no subscriber with a valid OpenCode sessionID (ses_) to wake")
+}
+
 // NewDaemonWaker builds the Waker the daemon passes to the orchestrator. The
 // adapter registry in internal/infra/wake selects a deliverer by the
 // subscriber's own adapter name; no harness name is hard-coded here.
@@ -129,7 +165,15 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		return fmt.Errorf("daemon: watch %s: %w", watchID, err)
 	}
 	if watch.SubscriberID == "" {
-		return fmt.Errorf("daemon: watch %s has no subscriber to wake", watchID)
+		log.Printf("daemon: skip wake for watch %s: no subscriber with a valid OpenCode sessionID (ses_)", watchID)
+		return fmt.Errorf("daemon: watch %s has no subscriber with a valid OpenCode sessionID (ses_) to wake", watchID)
+	}
+	// The projection may come from an old Watch whose executor is a service
+	// name. Refuse it here so no HTTP prompt is attempted and the reason is
+	// logged exactly once, before any adapter is consulted.
+	if err := ValidateWakeTarget(watch.SubscriberID); err != nil {
+		log.Printf("daemon: skip wake for watch %s: %v", watchID, err)
+		return fmt.Errorf("daemon: watch %s: %w", watchID, err)
 	}
 	adapter := watch.Adapter
 	if adapter == "" {
@@ -182,6 +226,12 @@ type daemonWakeAdapter struct {
 
 func (a *daemonWakeAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
 	if err := wake.ValidateT210Target(p); err != nil {
+		log.Printf("daemon: skip wake bind for %s: %v", p.ObligationID, err)
+		return "", false
+	}
+	// Defence in depth: the opencode deliverer only accepts sessions. A stale
+	// subscriber must never reach Deliver even if a caller bypasses Wake.
+	if err := ValidateWakeTarget(p.Target); err != nil {
 		log.Printf("daemon: skip wake bind for %s: %v", p.ObligationID, err)
 		return "", false
 	}

@@ -1,13 +1,17 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // daemonCheckAll is the fake CI pass. It counts calls and can fail or cancel
@@ -215,5 +219,149 @@ func TestDaemonLoopStopsOnCancel(t *testing.T) {
 func TestDaemonRunRequiresPorts(t *testing.T) {
 	if err := DaemonRun(context.Background(), DaemonPorts{}, time.Millisecond, true); err == nil {
 		t.Fatal("daemon must reject a port-less configuration")
+	}
+}
+
+// daemonRecordingAdapter counts deliveries at the same T210 boundary the real
+// daemon adapter uses, so a stale target cannot slip past the test unnoticed.
+type daemonRecordingAdapter struct {
+	calls   int
+	targets []string
+}
+
+func (a *daemonRecordingAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
+	if err := wake.ValidateT210Target(p); err != nil {
+		return "", false
+	}
+	return wake.T210Target(p.Target), true
+}
+
+func (a *daemonRecordingAdapter) Deliver(p wake.T210WakePointer, target wake.T210Target) (wake.T210Receipt, error) {
+	a.calls++
+	a.targets = append(a.targets, string(target))
+	return wake.T210Receipt{
+		ObligationID: p.ObligationID,
+		Attempt:      p.Attempt,
+		Delivery:     p.Delivery,
+		Outcome:      wake.T210Delivered,
+	}, nil
+}
+
+func daemonTestWaker(watch DaemonWatch, adapter *daemonRecordingAdapter) *daemonWaker {
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	return &daemonWaker{
+		lookup:   func(string) (DaemonWatch, error) { return watch, nil },
+		adapters: adapters,
+	}
+}
+
+// daemonLogs runs fn with the package logger redirected, so the "log once"
+// contract is checked without reaching for a global assertion after the call.
+func daemonLogs(fn func()) string {
+	var buf bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(previous)
+	fn()
+	return buf.String()
+}
+
+func TestDaemonWakerSkipsLegacySubscriber(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	w := daemonTestWaker(DaemonWatch{
+		ID: "w1", PR: 42, Adapter: wake.AdapterOpenCode,
+		SubscriberID: "beacon-ci-checkall",
+	}, adapter)
+
+	var wakeErr error
+	logs := daemonLogs(func() {
+		wakeErr = w.Wake(context.Background(), "w1", 3, VerdictRetry)
+	})
+	if wakeErr == nil {
+		t.Fatal("a stale service subscriber must not produce a wake")
+	}
+	if !strings.Contains(wakeErr.Error(), "ses_") {
+		t.Fatalf("error %q does not explain that a sessionID is required", wakeErr)
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("Deliver called %d times for a stale subscriber, want 0", adapter.calls)
+	}
+	if lines := strings.Count(logs, "\n"); lines != 1 {
+		t.Fatalf("logs = %q, want exactly one line", logs)
+	}
+}
+
+func TestDaemonWakerDeliversToSessionSubscriber(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	w := daemonTestWaker(DaemonWatch{
+		ID: "w2", PR: 7, Adapter: wake.AdapterOpenCode,
+		SubscriberID: "ses_abc123",
+	}, adapter)
+
+	if err := w.Wake(context.Background(), "w2", 4, VerdictRetry); err != nil {
+		t.Fatalf("valid subscriber must be delivered: %v", err)
+	}
+	if adapter.calls != 1 || !reflect.DeepEqual(adapter.targets, []string{"ses_abc123"}) {
+		t.Fatalf("Deliver calls = %d, targets = %q, want one ses_abc123", adapter.calls, adapter.targets)
+	}
+}
+
+func TestDaemonWakerWithoutSubscriberIsError(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	w := daemonTestWaker(DaemonWatch{ID: "w3", PR: 8, Adapter: wake.AdapterOpenCode}, adapter)
+
+	var wakeErr error
+	logs := daemonLogs(func() {
+		wakeErr = w.Wake(context.Background(), "w3", 5, VerdictRetry)
+	})
+	if wakeErr == nil {
+		t.Fatal("a Watch without a subscriber must return an error")
+	}
+	if !strings.Contains(wakeErr.Error(), "ses_") {
+		t.Fatalf("error %q does not explain that a sessionID is required", wakeErr)
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("Deliver called %d times without a subscriber, want 0", adapter.calls)
+	}
+	if lines := strings.Count(logs, "\n"); lines != 1 {
+		t.Fatalf("logs = %q, want exactly one line", logs)
+	}
+}
+
+func TestDaemonWakeSubscriberSelection(t *testing.T) {
+	legacy := DaemonSubscriber{
+		ID: "beacon-ci-checkall", Role: RoleExecutor, Adapter: wake.AdapterOpenCode,
+		Target: "beacon-ci-checkall",
+	}
+	orchestratorSub := DaemonSubscriber{
+		ID: "ses_orch", Role: RoleOrchestrator, Adapter: wake.AdapterOpenCode,
+		Target: "ses_orch",
+	}
+	executorSub := DaemonSubscriber{
+		ID: "ses_exec", Role: RoleExecutor, Adapter: wake.AdapterOpenCode,
+		Target: "ses_exec",
+	}
+
+	got, err := DaemonWakeSubscriber([]DaemonSubscriber{legacy, orchestratorSub})
+	if err != nil || got.ID != "ses_orch" {
+		t.Fatalf("legacy executor must be skipped: got %+v, err %v", got, err)
+	}
+	got, err = DaemonWakeSubscriber([]DaemonSubscriber{orchestratorSub, executorSub})
+	if err != nil || got.ID != "ses_exec" {
+		t.Fatalf("executor must win among valid subscribers: got %+v, err %v", got, err)
+	}
+	got, err = DaemonWakeSubscriber([]DaemonSubscriber{
+		legacy,
+		{ID: "beacon-daemon-checkall", Role: RoleOrchestrator, Target: "beacon-daemon-checkall"},
+	})
+	if err == nil || got.ID != "" {
+		t.Fatalf("all-stale subscribers must be refused: got %+v, err %v", got, err)
+	}
+	got, err = DaemonWakeSubscriber([]DaemonSubscriber{
+		{ID: "ses_ok", Target: "beacon-ci-checkall"},
+	})
+	if err == nil || got.ID != "" {
+		t.Fatalf("a stale target must be refused too: got %+v, err %v", got, err)
 	}
 }
