@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 type t06Call struct {
@@ -83,7 +86,7 @@ func TestT06ListJSONCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what", "why"}
+	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "spawn", "task", "watch", "what", "why"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
 	}
@@ -137,7 +140,7 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 	if errOut.Len() != 0 {
 		t.Fatalf("stderr не пустой: %q", errOut.String())
 	}
-	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "task", "watch", "what", "why"} {
+	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "spawn", "task", "watch", "what", "why"} {
 		if !strings.Contains(out.String(), name) {
 			t.Fatalf("таблица не содержит %s: %q", name, out.String())
 		}
@@ -467,4 +470,218 @@ func TestT17DispatchCallsRunners(t *testing.T) {
 			t.Fatalf("не тот вызов: %+v", call)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// T3.145 / ADR 0060: dispatch, usage and wiring of the CLI manager.
+// ---------------------------------------------------------------------------
+
+// t3145Port is a stand-in for the T3.144 thin client. It records the SSE
+// subscription types and yields a fixed set of results, so the adapter can be
+// tested without a server or net/http in cmd/beacon.
+type t3145Port struct {
+	sessions   []opencode.Session
+	sessionErr error
+	results    []opencode.EventResult
+	gotTypes   []string
+}
+
+func (p *t3145Port) ListAgents(context.Context) ([]opencode.Agent, error) { return nil, nil }
+func (p *t3145Port) Sessions(context.Context) ([]opencode.Session, error) {
+	return p.sessions, p.sessionErr
+}
+func (p *t3145Port) Config(context.Context) (json.RawMessage, error) { return nil, nil }
+func (p *t3145Port) EventStream(_ context.Context, types []string) <-chan opencode.EventResult {
+	p.gotTypes = append([]string(nil), types...)
+	out := make(chan opencode.EventResult, len(p.results))
+	for _, result := range p.results {
+		out <- result
+	}
+	close(out)
+	return out
+}
+
+// t3145BothPort also carries the spawn port. It proves the type assertion in
+// installOpenCodePorts starts installing spawn as soon as a client has POST
+// routes, without pretending the current T3.144 reader has them.
+type t3145BothPort struct {
+	*t3145Port
+	created []t3142CreateCall
+}
+
+func (p *t3145BothPort) CreateSession(parentID, agent, title string, metadata map[string]string) (string, error) {
+	p.created = append(p.created, t3142CreateCall{parentID, agent, title, metadata})
+	return "sess-wired", nil
+}
+func (p *t3145BothPort) Prompt(string, string) error { return nil }
+
+func t3145RestorePorts(t *testing.T) {
+	t.Helper()
+	previousLive, previousSpawn := watchLiveSource, spawnSessionSpawner
+	t.Cleanup(func() {
+		SetLiveSource(previousLive)
+		SetSessionSpawner(previousSpawn)
+	})
+}
+
+func TestT3145DispatchSpawn(t *testing.T) {
+	spawner := &t3142Spawner{id: "sess-dispatch"}
+	t3142Install(t, spawner)
+	t.Setenv(spawnParentEnv, "parent-dispatch")
+	c, out, errOut, _ := t06NewCLI(t, t06NoChild(t))
+
+	if code := c.Run([]string{"spawn", "T3.145", "--agent", "builder"}); code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+	}
+	if len(spawner.creates) != 1 || spawner.creates[0].agent != "builder" {
+		t.Fatalf("creates = %#v, want one call with agent builder", spawner.creates)
+	}
+	if got := out.String(); got != "sess-dispatch\n" {
+		t.Fatalf("stdout = %q, want session id", got)
+	}
+}
+
+func TestT3145DispatchWatchLiveFlags(t *testing.T) {
+	previous := watchRunner
+	t.Cleanup(func() { watchRunner = previous })
+	var gotArgs []string
+	RegisterWatch(func(_ *CLI, args []string) int {
+		gotArgs = append([]string(nil), args...)
+		return 0
+	})
+	c, _, _, _ := t06NewCLI(t, t06NoChild(t))
+
+	args := []string{"watch", "--live", "--interval", "15ms", "--format", "json"}
+	if code := c.Run(args); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	want := []string{"--live", "--interval", "15ms", "--format", "json"}
+	if !reflect.DeepEqual(gotArgs, want) {
+		t.Fatalf("watch args = %q, want %q", gotArgs, want)
+	}
+}
+
+func TestT3145UsageAndCatalogListSpawn(t *testing.T) {
+	c, out, errOut, _ := t06NewCLI(t, t06NoChild(t))
+	if code := c.Run([]string{"--help"}); code != 0 {
+		t.Fatalf("help exit = %d", code)
+	}
+	for _, line := range []string{
+		"beacon spawn <taskID> [--agent id] [--title ...]",
+		"beacon watch [--live] [--interval 2s] [--format table|json]",
+	} {
+		if !strings.Contains(out.String(), line) {
+			t.Fatalf("usage не содержит %q: %q", line, out.String())
+		}
+	}
+
+	out.Reset()
+	if code := c.Run([]string{"list", "--format", "json"}); code != 0 || errOut.Len() != 0 {
+		t.Fatalf("list exit = %d, stderr = %q", code, errOut.String())
+	}
+	var parsed []command
+	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, cmd := range parsed {
+		if cmd.Name == "spawn" {
+			found = true
+			if cmd.Usage != spawnCatalogEntry.Usage || cmd.Summary != spawnCatalogEntry.Summary {
+				t.Fatalf("catalog spawn = %+v", cmd)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("в каталоге нет spawn: %q", out.String())
+	}
+}
+
+func TestT3145LiveOpencodeSourceSessionList(t *testing.T) {
+	session := opencode.Session{ID: "sess-live", Agent: "builder"}
+	port := &t3145Port{sessions: []opencode.Session{session}}
+	src := newLiveOpencodeSource(port)
+
+	got, err := src.SessionList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []opencodeSession{{ID: "sess-live", Agent: "builder"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("sessions = %#v, want %#v", got, want)
+	}
+}
+
+func TestT3145LiveOpencodeSourceEvents(t *testing.T) {
+	port := &t3145Port{results: []opencode.EventResult{
+		{Event: opencode.Event{Type: "session.status"}},
+		{Err: fmt.Errorf("stream break")},
+		{Event: opencode.Event{Type: "session.execution.started"}},
+	}}
+	src := newLiveOpencodeSource(port)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var got []string
+	for ev := range src.Events(ctx) {
+		got = append(got, ev.Type)
+		if !json.Valid(ev.Data) {
+			t.Fatalf("event data не JSON: %q", ev.Data)
+		}
+	}
+	// The transport error closes the channel, which makes runWatchLive
+	// resubscribe and re-read the snapshot instead of replaying history.
+	want := []string{"session.status"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("events = %q, want %q", got, want)
+	}
+	if !reflect.DeepEqual(port.gotTypes, liveEventTypes) {
+		t.Fatalf("subscription types = %q, want %q", port.gotTypes, liveEventTypes)
+	}
+}
+
+func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
+	t3145RestorePorts(t)
+	port := &t3145BothPort{t3145Port: &t3145Port{}}
+
+	installOpenCodePorts(port)
+
+	if src, ok := watchLiveSource.(*liveOpencodeSource); !ok || src.port != port.t3145Port {
+		t.Fatalf("live source = %#v, want adapter over the client", watchLiveSource)
+	}
+	if spawnSessionSpawner != port {
+		t.Fatalf("spawn port = %#v, want the client itself", spawnSessionSpawner)
+	}
+}
+
+func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
+	t3145RestorePorts(t)
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	SetLiveSource(nil)
+	SetSessionSpawner(nil)
+
+	wireOpenCodePorts()
+	if watchLiveSource != nil || spawnSessionSpawner != nil {
+		t.Fatalf("без service.json порты не должны ставиться: live=%v spawn=%v", watchLiveSource, spawnSessionSpawner)
+	}
+
+	dir := filepath.Join(base, "opencode")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	registration := `{"url":"http://127.0.0.1:4096","password":"pw"}`
+	if err := os.WriteFile(filepath.Join(dir, "service.json"), []byte(registration), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	wireOpenCodePorts()
+	if _, ok := watchLiveSource.(*liveOpencodeSource); !ok {
+		t.Fatalf("live source = %#v, want adapter over T3.144 client", watchLiveSource)
+	}
+	// The T3.144 client has only GET routes, so spawn stays uninstalled.
+	// This is the honest blocker for production spawn until POST routes land.
+	if spawnSessionSpawner != nil {
+		t.Fatalf("spawn port = %#v, want nil until the client implements it", spawnSessionSpawner)
+	}
 }
