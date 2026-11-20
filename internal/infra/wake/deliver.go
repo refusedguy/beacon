@@ -35,6 +35,17 @@ import (
 type OpenCodeDeliverer struct {
 	// Runner is replaceable in tests. Nil means exec.CommandContext.
 	Runner func(ctx context.Context, args ...string) ([]byte, error)
+
+	mu   sync.Mutex
+	seen map[wakeDeliveryKey]struct{}
+}
+
+// wakeDeliveryKey is the pointer a wake carries. A repeated pointer must not
+// start a second prompt in the same session (ADR 0028, T4.1).
+type wakeDeliveryKey struct {
+	watchID      string
+	obligationID string
+	revision     uint64
 }
 
 var _ domain.WakeDeliverer = (*OpenCodeDeliverer)(nil)
@@ -45,6 +56,24 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	if !strings.HasPrefix(sessionID, "ses_") {
 		return fmt.Errorf("wake: invalid session id %q", sessionID)
 	}
+	// The obligation id is domain.ObligationKey(watchID, revision,
+	// subscriberID), and the subscriber id is the session that registered the
+	// watch. A pointer addressed to another subscriber must never wake this
+	// session, even when the caller knows a valid session id.
+	if want := domain.ObligationKey(p.WatchID, p.Revision, sessionID); p.ObligationID != want {
+		return fmt.Errorf("wake: session %q is not the subscriber of obligation %q", sessionID, p.ObligationID)
+	}
+	key := wakeDeliveryKey{watchID: p.WatchID, obligationID: p.ObligationID, revision: p.Revision}
+	d.mu.Lock()
+	if d.seen == nil {
+		d.seen = make(map[wakeDeliveryKey]struct{})
+	}
+	if _, duplicate := d.seen[key]; duplicate {
+		d.mu.Unlock()
+		return nil
+	}
+	d.mu.Unlock()
+
 	body := map[string]any{
 		"text":     Envelope(p),
 		"delivery": "steer",
@@ -63,7 +92,13 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	if err != nil {
 		return fmt.Errorf("wake: opencode api: %w", err)
 	}
-	return verifyAck(out)
+	if err := verifyAck(out); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.seen[key] = struct{}{}
+	d.mu.Unlock()
+	return nil
 }
 
 // Envelope renders the pointer into the host's wake text. Every field is

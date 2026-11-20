@@ -41,7 +41,7 @@ func TestOpenCodeDelivererPostsSteerPrompt(t *testing.T) {
 		return []byte(`{"data":{"id":"msg_1","sessionID":"ses_test"}}`), nil
 	}}
 	err := d.Deliver(context.Background(), "ses_test", domain.WakePayload{
-		WatchID: "watch-1", ObligationID: "obl-1", Revision: 1, Verdict: "ready",
+		WatchID: "watch-1", ObligationID: domain.ObligationKey("watch-1", 1, "ses_test"), Revision: 1, Verdict: "ready",
 	})
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
@@ -74,8 +74,76 @@ func TestOpenCodeDelivererRejectsBadSessionAndMissingAck(t *testing.T) {
 	if err := d.Deliver(context.Background(), "not-a-session", domain.WakePayload{}); err == nil {
 		t.Fatal("invalid session id must be rejected")
 	}
-	if err := d.Deliver(context.Background(), "ses_test", domain.WakePayload{}); err == nil {
+	p := domain.WakePayload{WatchID: "watch-2", ObligationID: domain.ObligationKey("watch-2", 1, "ses_test"), Revision: 1}
+	if err := d.Deliver(context.Background(), "ses_test", p); err == nil {
 		t.Fatal("ack without message id must be rejected")
+	}
+}
+
+// A pointer names an obligation of one subscriber. Deliver must not steer a
+// different session even when that session id is otherwise well formed.
+func TestOpenCodeDelivererRejectsForeignSession(t *testing.T) {
+	var prompts int
+	d := &OpenCodeDeliverer{Runner: func(_ context.Context, args ...string) ([]byte, error) {
+		prompts++
+		return []byte(`{"data":{"id":"msg_1"}}`), nil
+	}}
+	const owner = "ses_owner"
+	p := domain.WakePayload{
+		WatchID:      "watch-3",
+		ObligationID: domain.ObligationKey("watch-3", 4, owner),
+		Revision:     4,
+		Verdict:      "ready",
+	}
+	if err := d.Deliver(context.Background(), "ses_other", p); err == nil {
+		t.Fatal("Deliver accepted a session that is not the obligation subscriber")
+	}
+	if prompts != 0 {
+		t.Fatalf("prompt calls = %d, want 0 for a foreign session", prompts)
+	}
+	if err := d.Deliver(context.Background(), owner, p); err != nil {
+		t.Fatalf("Deliver for the owner: %v", err)
+	}
+	if prompts != 1 {
+		t.Fatalf("prompt calls = %d, want 1 for the owner", prompts)
+	}
+}
+
+// A repeated wake with the same pointer must be a no-op. A new revision of the
+// same obligation is a new wake and gets its own prompt.
+func TestOpenCodeDelivererRepeatedPointerPostsOnePrompt(t *testing.T) {
+	var prompts int
+	d := &OpenCodeDeliverer{Runner: func(_ context.Context, args ...string) ([]byte, error) {
+		prompts++
+		return []byte(`{"data":{"id":"msg_1"}}`), nil
+	}}
+	const sessionID = "ses_test"
+	p := domain.WakePayload{
+		WatchID:      "watch-4",
+		ObligationID: domain.ObligationKey("watch-4", 7, sessionID),
+		Revision:     7,
+		Verdict:      "ready",
+	}
+	for i := 0; i < 3; i++ {
+		if err := d.Deliver(context.Background(), sessionID, p); err != nil {
+			t.Fatalf("Deliver #%d: %v", i+1, err)
+		}
+	}
+	if prompts != 1 {
+		t.Fatalf("prompt calls = %d, want 1 after repeated wakes", prompts)
+	}
+
+	next := domain.WakePayload{
+		WatchID:      p.WatchID,
+		ObligationID: domain.ObligationKey(p.WatchID, p.Revision+1, sessionID),
+		Revision:     p.Revision + 1,
+		Verdict:      "ready",
+	}
+	if err := d.Deliver(context.Background(), sessionID, next); err != nil {
+		t.Fatalf("Deliver on new revision: %v", err)
+	}
+	if prompts != 2 {
+		t.Fatalf("prompt calls = %d, want 2 after a new revision", prompts)
 	}
 }
 
