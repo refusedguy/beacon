@@ -265,6 +265,18 @@ func decodeList[T any](resp *http.Response) (list[T], error) {
 	return out, nil
 }
 
+// decodeObject unwraps the single-object envelope {"data":{...}} used by the
+// POST /api/session route in opencode v2.3.0. It is decodeList for one object.
+func decodeObject[T any](resp *http.Response) (T, error) {
+	defer resp.Body.Close()
+	var envelope list[T]
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&envelope); err != nil {
+		var zero T
+		return zero, err
+	}
+	return envelope.Data, nil
+}
+
 // ListAgents reads GET /api/agent.
 func (c *Client) ListAgents(ctx context.Context) ([]Agent, error) {
 	resp, err := c.get(ctx, "/api/agent")
@@ -326,9 +338,8 @@ func (c *Client) CreateSession(ctx context.Context, parentID, agent, title strin
 	if err != nil {
 		return Session{}, err
 	}
-	defer resp.Body.Close()
-	var session Session
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&session); err != nil {
+	session, err := decodeObject[Session](resp)
+	if err != nil {
 		return Session{}, fmt.Errorf("opencode POST /api/session: %v", err)
 	}
 	return session, nil

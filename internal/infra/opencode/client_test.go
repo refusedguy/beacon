@@ -398,7 +398,7 @@ func TestCreateSessionSendsPostWithAgent(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		const out = `{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}`
+		const out = `{"data":{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}}`
 		return fakeResponse(out, http.StatusOK), nil
 	}}
 	c := newTestClient(t, doer)
@@ -444,6 +444,24 @@ func TestCreateSessionSendsPostWithAgent(t *testing.T) {
 	meta, ok := payload["metadata"].(map[string]any)
 	if !ok || meta["watchID"] != "w1" || meta["obligationID"] != "o1" {
 		t.Fatalf("неверный metadata: %v", payload["metadata"])
+	}
+}
+
+// Т3.W256: живой opencode v2.3.0 оборачивает ответ POST /api/session в
+// {"data":{...}}. Без распаковки sessionID остаётся пустым.
+func TestCreateSessionUnwrapsDataEnvelope(t *testing.T) {
+	const out = `{"location":{"directory":"/w"},"data":{"id":"ses_abc123","parentID":"root","agent":"build","title":"task"}}`
+	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+		return fakeResponse(out, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	session, err := c.CreateSession(context.Background(), "root", "build", "task", nil)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if session.ID != "ses_abc123" || session.Agent != "build" || session.Title != "task" {
+		t.Fatalf("неверная сессия: %+v", session)
 	}
 }
 
