@@ -164,11 +164,11 @@ func TestRegistryListReaderError(t *testing.T) {
 func TestRegistryListUnwiredReaderRefuses(t *testing.T) {
 	var out, errOut bytes.Buffer
 	c := &CLI{out: &out, errOut: &errOut}
-	if code := runRegistryList(c); code == 0 {
+	if code := runRegistryList(c, nil); code == 0 {
 		t.Fatal("unwired command exited 0, want non-zero")
 	}
-	if !strings.Contains(errOut, "not connected") {
-		t.Fatalf("unwired error should say the reader is not connected: %q", errOut)
+	if !strings.Contains(errOut.String(), "not connected") {
+		t.Fatalf("unwired error should say the reader is not connected: %q", errOut.String())
 	}
 }
 
