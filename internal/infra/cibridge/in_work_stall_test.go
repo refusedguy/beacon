@@ -291,7 +291,7 @@ func TestInWorkStallHeadChangeClosesWatchInstead(t *testing.T) {
 		Checks:     map[string]domain.Check{"build": {Conclusion: "PENDING", Required: true}},
 	}}, fixedClock{at: now}, time.Second).
 		WithWaker(waker).
-		WithEscalationWriter(func(line string) { *lines = append(*lines, line) })
+		WithEscalationWriter(func(line string) { lines = append(lines, line) })
 	b.WithInWorkTimeout(time.Minute).WithOrchestratorIDSource(func() string { return "ses_orch" })
 	b.Refresh(context.Background())
 
