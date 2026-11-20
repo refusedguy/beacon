@@ -212,3 +212,85 @@ func TestConcurrentRecording(t *testing.T) {
 		t.Errorf("число серий после параллельных вызовов = %d, ожидалось %d", got, SeriesCount())
 	}
 }
+
+func TestRSSGaugeFormat(t *testing.T) {
+	m := NewMetrics()
+	value := uint64(101 * 1024 * 1024)
+	m.SetRSS(value)
+
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		"# HELP beacon_rss_bytes Resident set size of the process in bytes.",
+		"# TYPE beacon_rss_bytes gauge",
+		fmt.Sprintf("beacon_rss_bytes %d", value),
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus-выводе нет %q:\n%s", want, text)
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "beacon_rss_bytes ") && strings.Contains(line, "{") {
+			t.Errorf("rss_bytes не должен нести метки: %s", line)
+		}
+	}
+
+	var decoded metricsJSON
+	if err := json.Unmarshal(m.JSON(), &decoded); err != nil {
+		t.Fatalf("невалидный JSON метрик: %v", err)
+	}
+	if decoded.RSSBytes != value {
+		t.Errorf("rssBytes в JSON = %d, ожидалось %d", decoded.RSSBytes, value)
+	}
+
+	m.Reset()
+	if m.RSSBytes() != 0 {
+		t.Errorf("Reset не обнулил rss_bytes: %d", m.RSSBytes())
+	}
+}
+
+func TestFootprintCheckAtFifteenWatches(t *testing.T) {
+	m := NewMetrics()
+	var warnings []string
+	warn := func(format string, args ...any) {
+		warnings = append(warnings, fmt.Sprintf(format, args...))
+	}
+	over := func() (uint64, bool) { return uint64(FootprintLimitBytes) + 1, true }
+	under := func() (uint64, bool) { return uint64(FootprintLimitBytes) - 1, true }
+
+	if !FootprintCheck(m, FootprintWatchThreshold, over, warn) {
+		t.Fatal("15 вотчей выше лимита должны предупреждать")
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "WARNING") {
+		t.Fatalf("предупреждения = %v", warnings)
+	}
+	if !strings.Contains(warnings[0], fmt.Sprintf("%d", FootprintLimitBytes)) {
+		t.Errorf("в предупреждении нет лимита: %s", warnings[0])
+	}
+	if got := m.RSSBytes(); got != uint64(FootprintLimitBytes)+1 {
+		t.Errorf("rss_bytes = %d, ожидалось %d", got, uint64(FootprintLimitBytes)+1)
+	}
+
+	warnings = nil
+	if FootprintCheck(m, FootprintWatchThreshold, under, warn) {
+		t.Fatal("RSS ниже лимита не должен предупреждать")
+	}
+	if len(warnings) != 0 {
+		t.Errorf("ниже лимита получены предупреждения: %v", warnings)
+	}
+
+	warnings = nil
+	if FootprintCheck(m, FootprintWatchThreshold-1, over, warn) {
+		t.Fatal("меньше 15 вотчей не должны предупреждать")
+	}
+	if len(warnings) != 0 {
+		t.Errorf("при 14 вотчах получены предупреждения: %v", warnings)
+	}
+
+	warnings = nil
+	if FootprintCheck(m, FootprintWatchThreshold, func() (uint64, bool) { return 0, false }, warn) {
+		t.Fatal("неизвестный RSS не должен предупреждать")
+	}
+	if len(warnings) != 0 {
+		t.Errorf("при неизвестном RSS получены предупреждения: %v", warnings)
+	}
+}
