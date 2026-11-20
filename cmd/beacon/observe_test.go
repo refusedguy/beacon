@@ -127,6 +127,97 @@ func TestRunMetricsExportsAllCounters(t *testing.T) {
 	}
 }
 
+func TestRunMetricsPrometheusIncludesGauges(t *testing.T) {
+	metrics := observe.NewMetrics()
+	observe.SetDefault(observe.NewRecorder(nil, metrics))
+	defer observe.SetDefault(nil)
+	observe.ActiveWatches(6)
+	observe.OutboxDepth(11)
+
+	var stdout, stderr bytes.Buffer
+	code := runMetrics(&CLI{out: &stdout, errOut: &stderr}, []string{"--format", "prometheus"})
+	if code != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	for _, want := range []string{
+		"# TYPE beacon_active_watches gauge",
+		"beacon_active_watches 6",
+		"beacon_outbox_depth 11",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("в Prometheus-выводе нет %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestSetupObserveStartsMetricsEndpointForServerCommand(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", state)
+	t.Setenv(observe.MetricsPortEnv, "9099")
+
+	previousSink := observe.Default()
+	previousOutput := log.Writer()
+	previousStart := metricsServerStart
+	defer func() {
+		metricsServerStart = previousStart
+		observe.SetDefault(previousSink)
+		log.SetOutput(previousOutput)
+	}()
+
+	starts, stops := 0, 0
+	var installed *observe.Metrics
+	metricsServerStart = func(port string, m *observe.Metrics) (func(), error) {
+		starts++
+		installed = m
+		if port != "9099" {
+			t.Fatalf("порт = %q, ожидался 9099", port)
+		}
+		return func() { stops++ }, nil
+	}
+
+	cleanup := setupObserve("mcp")
+	if starts != 1 || installed == nil {
+		t.Fatalf("endpoint не запущен: starts=%d", starts)
+	}
+	observe.ActiveWatches(4)
+	observe.OutboxDepth(2)
+	if installed.Gauge(observe.GaugeActiveWatches) != 4 || installed.Gauge(observe.GaugeOutboxDepth) != 2 {
+		t.Fatalf("gauges = %d, %d, ожидалось 4, 2",
+			installed.Gauge(observe.GaugeActiveWatches), installed.Gauge(observe.GaugeOutboxDepth))
+	}
+	cleanup()
+	if stops != 1 {
+		t.Fatalf("endpoint не остановлен: stops=%d", stops)
+	}
+}
+
+func TestSetupObserveSkipsMetricsEndpointForShortCommand(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", state)
+	t.Setenv(observe.MetricsPortEnv, "9099")
+
+	previousSink := observe.Default()
+	previousOutput := log.Writer()
+	previousStart := metricsServerStart
+	defer func() {
+		metricsServerStart = previousStart
+		observe.SetDefault(previousSink)
+		log.SetOutput(previousOutput)
+	}()
+
+	starts := 0
+	metricsServerStart = func(string, *observe.Metrics) (func(), error) {
+		starts++
+		return func() {}, nil
+	}
+
+	cleanup := setupObserve("inspect")
+	cleanup()
+	if starts != 0 {
+		t.Fatalf("короткая команда открыла endpoint: starts=%d", starts)
+	}
+}
+
 func TestIsServerCommandOnlySelectsLongLivedProcesses(t *testing.T) {
 	for _, name := range []string{"mcp", "daemon", " mcp "} {
 		if !isServerCommand(name) {

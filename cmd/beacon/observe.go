@@ -52,6 +52,37 @@ const beaconLogFormatEnv = "BEACON_LOG_FORMAT"
 // beaconLogLevelEnv selects the minimum level: debug, info, warn or error.
 const beaconLogLevelEnv = "BEACON_LOG_LEVEL"
 
+// metricsServerStart is the seam that opens the optional /metrics endpoint.
+// Tests replace it so setupObserve never binds a real port. Only a port is
+// injected; cmd/beacon never names net/http.
+var metricsServerStart = func(port string, m *observe.Metrics) (func(), error) {
+	srv, err := observe.StartMetricsServer(port, m)
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = srv.Close() }, nil
+}
+
+// startMetricsEndpoint serves the process metrics at /metrics on loopback for
+// a long-lived command when BEACON_METRICS_PORT is set. An unset port leaves
+// the command socket-free, and a bad port is reported but never fatal.
+func startMetricsEndpoint(m *observe.Metrics, args []string) func() {
+	noop := func() {}
+	if len(args) == 0 || !isServerCommand(args[0]) {
+		return noop
+	}
+	port := strings.TrimSpace(os.Getenv(observe.MetricsPortEnv))
+	if port == "" {
+		return noop
+	}
+	stop, err := metricsServerStart(port, m)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "beacon: /metrics: %v\n", err)
+		return noop
+	}
+	return stop
+}
+
 // metricsRunner is the dispatch seam for `beacon metrics`, mirroring the other
 // commands so tests can replace it.
 var metricsRunner = func(c *CLI, args []string) int { return runMetrics(c, args) }
@@ -102,9 +133,12 @@ func setupObserve(args ...string) func() {
 	previousLogOutput := log.Writer()
 	install := func(w io.Writer) func() {
 		logger := observe.NewLogger(format, level, w)
-		observe.SetDefault(observe.NewRecorder(logger, observe.NewMetrics()))
+		metrics := observe.NewMetrics()
+		observe.SetDefault(observe.NewRecorder(logger, metrics))
 		log.SetOutput(observe.NewLogWriter(logger))
+		stopMetrics := startMetricsEndpoint(metrics, args)
 		return func() {
+			stopMetrics()
 			observe.FlushCycle()
 			log.SetOutput(previousLogOutput)
 			observe.SetDefault(nil)

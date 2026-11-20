@@ -2,6 +2,8 @@ package observe
 
 import (
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -89,5 +91,129 @@ func TestMetricsHandlerSetsPrometheusContentType(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "beacon_rebase_requests_total 1") {
 		t.Errorf("в теле нет счётчика:\n%s", rec.Body.String())
+	}
+}
+
+func TestMetricsGaugesFormatAndValues(t *testing.T) {
+	m := NewMetrics()
+	m.SetGauge(GaugeActiveWatches, 4)
+	m.SetGauge(GaugeOutboxDepth, 7)
+	m.SetGauge("unknown_gauge", 99)
+
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		"# HELP beacon_active_watches Beacon gauge active_watches.",
+		"# TYPE beacon_active_watches gauge",
+		"beacon_active_watches 4",
+		"# TYPE beacon_outbox_depth gauge",
+		"beacon_outbox_depth 7",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus-выводе нет %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "beacon_unknown_gauge") {
+		t.Errorf("неизвестный gauge попал в вывод:\n%s", text)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(m.JSON(), &got); err != nil {
+		t.Fatalf("невалидный JSON метрик: %v", err)
+	}
+	if got[GaugeActiveWatches] != float64(4) || got[GaugeOutboxDepth] != float64(7) {
+		t.Errorf("gauges в JSON = %v, %v", got[GaugeActiveWatches], got[GaugeOutboxDepth])
+	}
+	if _, ok := got["unknown_gauge"]; ok {
+		t.Errorf("неизвестный gauge попал в JSON: %v", got)
+	}
+
+	m.Reset()
+	if m.Gauge(GaugeActiveWatches) != 0 || m.Gauge(GaugeOutboxDepth) != 0 {
+		t.Errorf("Reset не обнулил gauges: %d, %d", m.Gauge(GaugeActiveWatches), m.Gauge(GaugeOutboxDepth))
+	}
+}
+
+func TestPackageGaugeHelpersUseInstalledRecorder(t *testing.T) {
+	previous := Default()
+	defer SetDefault(previous)
+
+	m := NewMetrics()
+	SetDefault(NewRecorder(nil, m))
+	ActiveWatches(3)
+	OutboxDepth(5)
+	if m.Gauge(GaugeActiveWatches) != 3 || m.Gauge(GaugeOutboxDepth) != 5 {
+		t.Errorf("gauges = %d, %d, ожидалось 3, 5", m.Gauge(GaugeActiveWatches), m.Gauge(GaugeOutboxDepth))
+	}
+
+	SetDefault(nil)
+	ActiveWatches(9)
+	if m.Gauge(GaugeActiveWatches) != 3 {
+		t.Errorf("без sink gauge изменился: %d", m.Gauge(GaugeActiveWatches))
+	}
+}
+
+func TestStartMetricsServerServesPrometheusOnLoopback(t *testing.T) {
+	m := NewMetrics()
+	m.SetGauge(GaugeActiveWatches, 2)
+	m.SetGauge(GaugeOutboxDepth, 9)
+
+	srv, err := StartMetricsServer("0", m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	host, port, err := net.SplitHostPort(srv.Addr())
+	if err != nil {
+		t.Fatalf("адрес %q: %v", srv.Addr(), err)
+	}
+	if host != "127.0.0.1" || port == "0" || srv.Port() == 0 {
+		t.Fatalf("сервер слушает не на свободном loopback-порту: %s", srv.Addr())
+	}
+
+	resp, err := http.Get("http://" + srv.Addr() + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("статус /metrics = %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"beacon_active_watches 2", "beacon_outbox_depth 9"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("в scrape нет %q:\n%s", want, body)
+		}
+	}
+
+	other, err := http.Get("http://" + srv.Addr() + "/nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Body.Close()
+	if other.StatusCode != http.StatusNotFound {
+		t.Errorf("чужой путь = %d, ожидался 404", other.StatusCode)
+	}
+}
+
+func TestStartMetricsServerDisabledAndInvalidPort(t *testing.T) {
+	s, err := StartMetricsServer("", NewMetrics())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Addr() != "" || s.Port() != 0 {
+		t.Errorf("отключённый сервер имеет адрес %q и порт %d", s.Addr(), s.Port())
+	}
+	if err := s.Close(); err != nil {
+		t.Errorf("Close отключённого сервера: %v", err)
+	}
+	if _, err := StartMetricsServer("не-порт", NewMetrics()); err == nil {
+		t.Error("невалидный порт должен отклоняться")
 	}
 }
