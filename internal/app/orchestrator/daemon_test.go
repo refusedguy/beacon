@@ -1072,3 +1072,66 @@ func TestValidateFindingsKeepsEvidenceOnlyFinding(t *testing.T) {
 		t.Fatalf("evidence-only finding: kept=%+v dropped=%+v", v.Kept, v.Dropped)
 	}
 }
+
+// TestDaemonWakerWithRouteUsesHook: an injected route receives the verdict
+// pointer and keeps the dedup guarantee of the built-in delivery path.
+func TestDaemonWakerWithRouteUsesHook(t *testing.T) {
+	watch := DaemonWatch{ID: "w-route", PR: 9, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_route"}
+	type call struct {
+		watchID  string
+		revision uint64
+		verdict  string
+		text     string
+	}
+	var calls []call
+	route := func(_ context.Context, w DaemonWatch, rev uint64, verdict, text string) error {
+		calls = append(calls, call{w.ID, rev, verdict, text})
+		return nil
+	}
+	w := NewDaemonWakerWithRoute(func(string) (DaemonWatch, error) { return watch, nil }, route)
+
+	if err := w.Wake(context.Background(), watch.ID, 4, VerdictRetry); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("route calls = %d, want 1", len(calls))
+	}
+	got := calls[0]
+	if got.watchID != watch.ID || got.revision != 4 || got.verdict != VerdictRetry {
+		t.Fatalf("route call = %+v", got)
+	}
+	if !strings.Contains(got.text, watch.ID) || !strings.Contains(got.text, VerdictRetry) {
+		t.Fatalf("route text = %q, want watch and verdict identifiers", got.text)
+	}
+
+	// An unchanged revision must not reach the route a second time.
+	if err := w.Wake(context.Background(), watch.ID, 4, VerdictRetry); err != nil {
+		t.Fatalf("repeat Wake: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("route calls = %d after repeat, want 1", len(calls))
+	}
+}
+
+// TestDaemonWakerWithRouteErrorStaysRetryable: a route error is returned and
+// does not record a delivery, so the next pass may try again.
+func TestDaemonWakerWithRouteErrorStaysRetryable(t *testing.T) {
+	watch := DaemonWatch{ID: "w-err", PR: 3, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_err"}
+	boom := errors.New("route refused")
+	calls := 0
+	route := func(context.Context, DaemonWatch, uint64, string, string) error {
+		calls++
+		return boom
+	}
+	w := NewDaemonWakerWithRoute(func(string) (DaemonWatch, error) { return watch, nil }, route)
+
+	if err := w.Wake(context.Background(), watch.ID, 1, VerdictRetry); !errors.Is(err, boom) {
+		t.Fatalf("Wake error = %v, want %v", err, boom)
+	}
+	if err := w.Wake(context.Background(), watch.ID, 1, VerdictRetry); !errors.Is(err, boom) {
+		t.Fatalf("repeat Wake error = %v, want %v", err, boom)
+	}
+	if calls != 2 {
+		t.Fatalf("route calls = %d, want 2 (a failed route is not delivered)", calls)
+	}
+}
