@@ -683,6 +683,60 @@ func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
 	}
 }
 
+// t3152FullPort is a stand-in for the client after T3.150 and T3.151 merge:
+// the reader port plus the POST routes plus the fallback server starter.
+type t3152FullPort struct {
+	*t3145BothPort
+	config       opencode.Config
+	ensurerCalls int
+}
+
+func (p *t3152FullPort) EnsureServer(context.Context) (opencode.Config, error) {
+	p.ensurerCalls++
+	return p.config, nil
+}
+
+func TestT3152InstallOpenCodePortsInstallsPostAndFallbackPorts(t *testing.T) {
+	t3145RestorePorts(t)
+	t.Cleanup(func() { SetServerEnsurer(nil) })
+	port := &t3152FullPort{
+		t3145BothPort: &t3145BothPort{t3145Port: &t3145Port{}},
+		config:        opencode.Config{URL: "http://127.0.0.1:64000"},
+	}
+
+	installOpenCodePorts(port)
+
+	if spawnSessionSpawner != port {
+		t.Fatalf("spawn port = %#v, want the full stand-in", spawnSessionSpawner)
+	}
+	if deliverTarget != port {
+		t.Fatalf("delivery port = %#v, want the full stand-in", deliverTarget)
+	}
+	if installedServerEnsurer != port {
+		t.Fatalf("fallback port = %#v, want the full stand-in", installedServerEnsurer)
+	}
+	if _, err := resolveOpencodeConfig(context.Background()); err != nil {
+		t.Fatalf("resolveOpencodeConfig: %v", err)
+	}
+	if port.ensurerCalls != 1 {
+		t.Fatalf("EnsureServer вызовов %d, ожидался 1", port.ensurerCalls)
+	}
+}
+
+func TestT3152InstallOpenCodePortsLeavesReaderClientUnwired(t *testing.T) {
+	t3145RestorePorts(t)
+	t.Cleanup(func() { SetServerEnsurer(nil) })
+	SetServerEnsurer(nil)
+	port := &t3145Port{}
+
+	installOpenCodePorts(port)
+
+	if spawnSessionSpawner != nil || deliverTarget != nil || installedServerEnsurer != nil {
+		t.Fatalf("порты POST не должны ставиться без T3.150/151: spawn=%v deliver=%v ensurer=%v",
+			spawnSessionSpawner, deliverTarget, installedServerEnsurer)
+	}
+}
+
 func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	t3145RestorePorts(t)
 	base := t.TempDir()
