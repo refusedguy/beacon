@@ -198,21 +198,29 @@ func TestLifecycleStopIsIdempotent(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	addr := lc.Addr()
+	if addr == "" || addr == "127.0.0.1:0" {
+		t.Fatalf("addr not resolved after start: %q", addr)
+	}
 
 	if err := lc.Stop(); err != nil {
 		t.Fatalf("first stop: %v", err)
 	}
 	if got := lc.State(); got != StateStopped {
-		t.Fatalf("state after stop = %s, want stopped", got)
+		t.Fatalf("state after first stop = %s, want stopped", got)
 	}
+	if got := lc.Addr(); got != addr {
+		t.Fatalf("addr changed after stop = %q, want %q", got, addr)
+	}
+
+	// A second Stop must return the same nil result and leave the state
+	// untouched. The old dial check is gone: once the listener closes, the OS
+	// can give the freed ephemeral port to another test, so a successful
+	// connect would say nothing about this lifecycle.
 	if err := lc.Stop(); err != nil {
 		t.Fatalf("second stop: %v", err)
 	}
-
-	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
-	if err == nil {
-		_ = conn.Close()
-		t.Fatalf("listener still accepting on %s after stop", addr)
+	if got := lc.State(); got != StateStopped {
+		t.Fatalf("state after second stop = %s, want stopped", got)
 	}
 }
 
