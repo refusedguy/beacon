@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -247,7 +248,88 @@ type WorkerRuntime interface {
 	Prompt(ctx context.Context, sessionID, text string) error
 	Cancel(ctx context.Context, sessionID string) error
 	Updates() <-chan WorkerUpdate
+	// Done closes when the worker process exits. A spawn command uses it to
+	// return without waiting for a signal when the runner has finished.
+	Done() <-chan struct{}
 	Close() error
+}
+
+// ===== ACP-раннеры (W10-A) =====
+// ACPRuntimeCommand is the executable plus arguments that launch one ACP
+// runner. The wire protocol is identical for every runner; only the command
+// line changes.
+type ACPRuntimeCommand struct {
+	Command string
+	Args    []string
+}
+
+// acpRuntimes are the default command lines for the runners Beacon can start.
+// They are defaults, not hard-coded choices: cfg.Command and cfg.Args replace
+// them so a harness can wrap a runner without changing Beacon.
+var acpRuntimes = map[string]ACPRuntimeCommand{
+	"opencode": {Command: "opencode", Args: []string{"acp"}},
+	"claude":   {Command: "claude", Args: []string{"--acp"}},
+	"codex":    {Command: "codex", Args: []string{"acp"}},
+	"pi":       {Command: "pi", Args: []string{"--acp"}},
+}
+
+// ACPRuntimeConfig selects a runner and optionally overrides its command line.
+type ACPRuntimeConfig struct {
+	Runtime string   // logical runner name: opencode, claude, codex, pi
+	Command string   // explicit executable; overrides Runtime when set
+	Args    []string // explicit args; overrides the runner defaults when set
+	Dir     string
+	Env     []string
+}
+
+// SupportedACPRuntimes returns the configured runner names in stable order.
+func SupportedACPRuntimes() []string {
+	names := make([]string, 0, len(acpRuntimes))
+	for name := range acpRuntimes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ResolveACPRuntimeCommand returns the command line for cfg. An explicit
+// Command wins over the runner name; Args replace the runner defaults only
+// when the caller supplied them.
+func ResolveACPRuntimeCommand(cfg ACPRuntimeConfig) (string, []string, error) {
+	if command := strings.TrimSpace(cfg.Command); command != "" {
+		return command, append([]string(nil), cfg.Args...), nil
+	}
+	name := strings.ToLower(strings.TrimSpace(cfg.Runtime))
+	if name == "" {
+		return "", nil, fmt.Errorf("wake: acp runtime: empty runtime and command")
+	}
+	built, ok := acpRuntimes[name]
+	if !ok {
+		return "", nil, fmt.Errorf("wake: acp runtime: unsupported %q (supported: %s)",
+			cfg.Runtime, strings.Join(SupportedACPRuntimes(), ", "))
+	}
+	args := built.Args
+	if len(cfg.Args) > 0 {
+		args = cfg.Args
+	}
+	return built.Command, append([]string(nil), args...), nil
+}
+
+// NewWorkerRuntime builds a WorkerRuntime for cfg and starts the runner, so a
+// caller can invoke Initialize immediately. The returned runtime owns the
+// process and must be closed by the caller.
+func NewWorkerRuntime(cfg ACPRuntimeConfig) (WorkerRuntime, error) {
+	command, args, err := ResolveACPRuntimeCommand(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client := NewPersistentACPClient(command, args...)
+	client.Dir = cfg.Dir
+	client.Env = cfg.Env
+	if err := client.Start(); err != nil {
+		return nil, fmt.Errorf("wake: acp runtime %q: %w", cfg.Runtime, err)
+	}
+	return client, nil
 }
 
 type acpRPCReply struct {
@@ -305,6 +387,9 @@ func newPersistentACPClient() *PersistentACPClient {
 func (c *PersistentACPClient) Start() error {
 	if c == nil {
 		return fmt.Errorf("wake: acp client: nil")
+	}
+	if c.started {
+		return nil
 	}
 	if c.stdin != nil && c.stdout != nil {
 		c.started = true
@@ -469,6 +554,12 @@ func (c *PersistentACPClient) signalDone() {
 
 // Initialize performs the ACP handshake on the shared connection.
 func (c *PersistentACPClient) Initialize(ctx context.Context) error {
+	if c == nil {
+		return fmt.Errorf("wake: acp client: nil")
+	}
+	if err := c.Start(); err != nil {
+		return err
+	}
 	_, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion":    persistentACPProtocolVersion,
 		"clientCapabilities": map[string]any{},
@@ -522,6 +613,10 @@ func (c *PersistentACPClient) Cancel(ctx context.Context, sessionID string) erro
 
 // Updates is the stream of inbound session/update notifications.
 func (c *PersistentACPClient) Updates() <-chan WorkerUpdate { return c.updates }
+
+// Done closes when the reader sees the worker connection close. A spawn
+// command waits on it instead of on a signal when the runner exits on its own.
+func (c *PersistentACPClient) Done() <-chan struct{} { return c.done }
 
 // Close stops the worker and unblocks every waiting caller. It is idempotent.
 func (c *PersistentACPClient) Close() error {
