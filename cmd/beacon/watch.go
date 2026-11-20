@@ -82,6 +82,13 @@ type watchRow struct {
 	Subscriber    string `json:"subscriberSession,omitempty"`
 	Agent         string `json:"agent,omitempty"`
 	OpenCodeState string `json:"opencodeState,omitempty"`
+	// Role, Capabilities and Config are the ADR 0094 JOIN axes. They come
+	// from the read-only registry projection, never from a write path.
+	// Empty means the subscriber has no registry row; the live table marks
+	// those cells with a dash (T5.58).
+	Role         string   `json:"role,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	Config       string   `json:"config,omitempty"`
 	// Attention is the ADR 0058 п6 column. "+" marks the row the manager
 	// should look at now; "-" means no signal. It is advisory only and never
 	// changes the Beacon verdict (ADR 0017 and ADR 0026).
@@ -118,6 +125,13 @@ func joinWatches(snap mcp.StateSnapshot, sessions []opencodeSession) []watchRow 
 	for _, s := range sessions {
 		byID[s.ID] = s
 	}
+	// The registry is keyed by the opaque executor id, which is the same
+	// sessionID carried by the subscriber target in _meta (ADR 0086/0094).
+	// A snapshot without registry entries keeps the previous row shape.
+	byRegistry := make(map[string]mcp.RegistryEntry, len(snap.Registry))
+	for _, entry := range snap.Registry {
+		byRegistry[entry.ID] = entry
+	}
 
 	rows := make([]watchRow, 0)
 	for _, w := range snap.ActiveWatches {
@@ -141,6 +155,15 @@ func joinWatches(snap mcp.StateSnapshot, sessions []opencodeSession) []watchRow 
 			if session, ok := byID[sub.Target]; ok {
 				row.Agent = session.Agent
 				row.OpenCodeState = session.state()
+			}
+			if entry, ok := byRegistry[sub.Target]; ok {
+				row.Role = string(entry.Role)
+				row.Config = entry.Config
+				caps := make([]string, 0, len(entry.Capabilities))
+				for _, cap := range entry.Capabilities {
+					caps = append(caps, string(cap))
+				}
+				row.Capabilities = caps
 			}
 			rows = append(rows, row)
 		}
@@ -171,15 +194,17 @@ func renderWatchJSON(w io.Writer, rows []watchRow) error {
 }
 
 // renderLiveTable is the ADR 0060 JOIN table: one line per subscriber with the
-// seven columns printed by beacon watch --live. The header says SESSION rather
-// than SUBSCRIBER SESSION to match the ADR. No TUI is involved.
+// ADR 0060 columns followed by the ADR 0094 registry axes ROLE, CAPS and CONFIG
+// (T5.58). The header says SESSION rather than SUBSCRIBER SESSION to match the
+// ADR. No TUI is involved.
 func renderLiveTable(w io.Writer, rows []watchRow) {
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "WATCH\tVERDICT\tREVISION\tSESSION\tAGENT\tOPENCODE STATE\tATTENTION")
+	fmt.Fprintln(tw, "WATCH\tVERDICT\tREVISION\tSESSION\tAGENT\tOPENCODE STATE\tATTENTION\tROLE\tCAPS\tCONFIG")
 	for _, r := range rows {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			r.Watch, r.Verdict, r.Revision,
-			dash(r.Subscriber), dash(r.Agent), dash(r.OpenCodeState), dash(r.Attention))
+			dash(r.Subscriber), dash(r.Agent), dash(r.OpenCodeState), dash(r.Attention),
+			dash(r.Role), dash(strings.Join(r.Capabilities, ",")), dash(r.Config))
 	}
 	_ = tw.Flush()
 }
