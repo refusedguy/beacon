@@ -953,10 +953,17 @@ func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, 
 			observe.WakeSkipped(p.Adapter, p.WatchID, "adapter outcome: "+r.Outcome)
 		}
 	}
-	// The bound target is the opaque executor id. Let the receipt name the
-	// registry entry that admitted this wake (T5.45).
+	// The bound target is the opaque executor id. An adapter may return an
+	// empty target, so fall back to the session registry that mapped the
+	// pointer to its session (T5.45).
+	agentID := string(target)
+	if agentID == "" {
+		if sessionID, ok := sessions.Lookup(p.Adapter, p.Target); ok {
+			agentID = sessionID
+		}
+	}
 	if r.AgentID == "" {
-		r.AgentID = string(target)
+		r.AgentID = agentID
 	}
 	T210settle(src, p, deliveries, r, adapter)
 	return r, true
