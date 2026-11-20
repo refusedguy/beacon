@@ -557,7 +557,10 @@ func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, 
 		observe.FieldRevision: w.Revision, observe.FieldVerdict: verdict,
 		observe.FieldReason: reason,
 	})
-	if verdict != VerdictWait {
+	// Only a rebase verdict asks for a rebase. A retry wake carries its own
+	// verdict in wake_requested, so calling RebaseRequested here would report
+	// a rebase that nobody asked for (T3.395).
+	if verdict == VerdictRebase {
 		observe.RebaseRequested(w.ID, w.PR)
 	}
 	var wakeErr error

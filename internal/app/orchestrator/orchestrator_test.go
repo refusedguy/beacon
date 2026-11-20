@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -808,6 +809,41 @@ func assertOrchCounter(t *testing.T, metrics *observe.Metrics, name string, want
 	v, ok := got[name].(float64)
 	if !ok || int(v) != want {
 		t.Errorf("%s = %v, want %d", name, got[name], want)
+	}
+}
+
+// TestWakeOneNamesOnlyRebaseAsRebase checks the log and metric an operator
+// reads after a wake. A retry wake must say retry in wake_requested and must
+// not raise rebase_requests_total. Only a rebase verdict raises that counter.
+func TestWakeOneNamesOnlyRebaseAsRebase(t *testing.T) {
+	for _, tc := range []struct {
+		verdict    string
+		wantRebase int
+	}{
+		{VerdictRetry, 0},
+		{VerdictRebase, 1},
+	} {
+		t.Run(tc.verdict, func(t *testing.T) {
+			var buf bytes.Buffer
+			metrics := observe.NewMetrics()
+			observe.SetDefault(observe.NewRecorder(observe.NewLogger("json", observe.LevelInfo, &buf), metrics))
+			t.Cleanup(func() { observe.SetDefault(nil) })
+
+			waker := &fakeWaker{}
+			out := &Result{}
+			var errs []error
+			w := Watch{ID: "w1", PR: 7, Revision: 3, Verdict: tc.verdict}
+			wakeOne(context.Background(), waker, w, tc.verdict, "reason", out, &errs)
+
+			assertOrchCounter(t, metrics, observe.CounterRebaseRequests, tc.wantRebase)
+			if len(waker.calls) != 1 {
+				t.Fatalf("waker calls = %d, want 1", len(waker.calls))
+			}
+			if !strings.Contains(buf.String(), `"event":"wake_requested"`) ||
+				!strings.Contains(buf.String(), `"verdict":"`+tc.verdict+`"`) {
+				t.Errorf("no wake_requested for %s: %s", tc.verdict, buf.String())
+			}
+		})
 	}
 }
 
