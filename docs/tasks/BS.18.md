@@ -1,5 +1,6 @@
 # BS.18. Снимки и pruned-through sequence
 Статус: done
+Обоснование: функциональность снимков уже в main (commit bf25462, internal/infra/store/snapshots.go), карта закрыта в #533. Дубля в OwnerFiles нет, код не писался.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/snapshots.go
