@@ -226,7 +226,7 @@ func TestRegistryAndLibrary(t *testing.T) {
 		t.Fatal("empty registry returned a scenario")
 	}
 	zero.Add(s)
-	if r, ok := zero.Get(s.Name); !ok || r.Fingerprint() != got.Fingerprint() {
+	if r, ok := zero.Get(s.Name); !ok || Run(r).Fingerprint() != got.Fingerprint() {
 		t.Fatal("zero-value registry did not accept a scenario")
 	}
 }
