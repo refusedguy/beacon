@@ -829,12 +829,24 @@ type T210WakePointer struct {
 	Resume       *bool  `json:"resume,omitempty"`
 }
 
-// T210Receipt records one delivery attempt.
+// T210Receipt records one delivery attempt. AgentID and ConfigID carry the
+// registry identity of the executor that admitted the wake, so a reader can
+// resolve the receipt to its registry entry (T5.45). Both are optional: an
+// older receipt has neither field and still decodes to empty strings.
 type T210Receipt struct {
 	ObligationID string `json:"obligationID"`
 	Attempt      int    `json:"attempt"`
 	Delivery     string `json:"delivery"`
 	Outcome      string `json:"outcome"`
+	AgentID      string `json:"agent_id,omitempty"`
+	ConfigID     string `json:"config_id,omitempty"`
+}
+
+// RegistryKey returns the pair that identifies the registry entry behind this
+// delivery. The wake layer cannot import the store, so it carries the key and
+// leaves resolution to the layer that owns the registry.
+func (r T210Receipt) RegistryKey() (agentID, configID string) {
+	return r.AgentID, r.ConfigID
 }
 
 const (
@@ -941,11 +953,22 @@ func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, 
 			observe.WakeSkipped(p.Adapter, p.WatchID, "adapter outcome: "+r.Outcome)
 		}
 	}
+	// The bound target is the opaque executor id. Let the receipt name the
+	// registry entry that admitted this wake (T5.45).
+	if r.AgentID == "" {
+		r.AgentID = string(target)
+	}
 	T210settle(src, p, deliveries, r, adapter)
 	return r, true
 }
 
 func T210settle(src T210PointerSource, p T210WakePointer, deliveries *T211DeliveryRegistry, r T210Receipt, adapter T210WakeAdapter) {
+	// A ses_ target is the opaque executor id from _meta (ADR 0086/0094). Copy
+	// it into the receipt when no adapter supplied one, so the receipt names
+	// the registry entry that admitted the wake (T5.45).
+	if r.AgentID == "" && strings.HasPrefix(p.Target, "ses_") {
+		r.AgentID = p.Target
+	}
 	if adapter != nil {
 		if obs, ok := adapter.(T210ObservingAdapter); ok {
 			_ = obs.Observe(p, r)
