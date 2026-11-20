@@ -11,6 +11,7 @@ package main
 // T5.52 owns the uncertain-stop outcome and T5.56 owns the CLI registration.
 
 import (
+	"flag"
 	"fmt"
 	"strconv"
 	"strings"
@@ -175,4 +176,99 @@ func (s registryStopDBStore) ActiveObligations(sessionID string) (int, error) {
 		}
 	}
 	return active, nil
+}
+
+// ---------------------------------------------------------------------------
+// T5.56: the checked stop in the CLI (ADR 0091).
+//
+// This file owns the stop subcommand and its dispatch. The command only runs
+// the precondition check and prints the verdict: the terminal kill and the
+// state write belong to T5.52 and live outside this file, so printing success
+// here would claim a stop that has not happened.
+// ---------------------------------------------------------------------------
+
+// registryRunner holds the registry command implementation so the CLI
+// dispatch can call it without depending on the stop check details.
+var registryRunner = func(c *CLI, args []string) int { return runRegistry(c, args) }
+
+// RegisterRegistry installs the registry command implementation, mirroring
+// RegisterWatch and RegisterTask in main.go.
+func RegisterRegistry(fn func(*CLI, []string) int) { registryRunner = fn }
+
+// registryStopOpenStore opens the read-only store of a checked stop. It is a
+// seam so tests can replace the database with a stand-in (ADR 0091).
+var registryStopOpenStore = func() (registryStopStore, func() error, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := openProcessStore(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return registryStopDBStore{db: db}, func() error { return db.Close() }, nil
+}
+
+// runRegistry dispatches the registry subcommands. T5.56 owns stop; the check
+// and sync seams stay in their own cards until their dispatch is wired.
+func runRegistry(c *CLI, args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintf(c.errOut, "beacon registry: нужна подкоманда (stop)\n")
+		writeUsage(c.errOut)
+		return 2
+	}
+	switch args[0] {
+	case "stop":
+		return runRegistryStop(c, args[1:])
+	default:
+		fmt.Fprintf(c.errOut, "beacon registry: неизвестная подкоманда %q\n", args[0])
+		writeUsage(c.errOut)
+		return 2
+	}
+}
+
+// runRegistryStop checks the expected selection before a stop may proceed.
+// The four expectation flags are mandatory: validateStopSelection rejects a
+// missing watchID, revision, sessionID or token before any store is opened.
+// The command prints the verdict of the precondition only, never a claim that
+// an executor was stopped.
+func runRegistryStop(c *CLI, args []string) int {
+	fs := flag.NewFlagSet("registry stop", flag.ContinueOnError)
+	watchID := fs.String("watch", "", "expected watchID")
+	revision := fs.Uint64("revision", 0, "expected revision")
+	sessionID := fs.String("session", "", "expected executor sessionID")
+	token := fs.String("token", "", "expected fencing token")
+	if !parseFlags("registry stop", args, c.errOut, fs) {
+		return 2
+	}
+
+	want := registryStopSelection{
+		WatchID:   *watchID,
+		Revision:  *revision,
+		SessionID: *sessionID,
+		Token:     *token,
+	}
+	if err := validateStopSelection(want); err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry stop: %v\n", err)
+		return 2
+	}
+
+	port, closeStore, err := registryStopOpenStore()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry stop: store: %v\n", err)
+		return 2
+	}
+	defer func() { _ = closeStore() }()
+
+	verdict, err := checkRegistryStop(port, want)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry stop: %v\n", err)
+		return 2
+	}
+	if !verdict.Allowed {
+		fmt.Fprintf(c.out, "stop_refused reason=%s detail=%s\n", verdict.Reason, verdict.Detail)
+		return 1
+	}
+	fmt.Fprintf(c.out, "stop_allowed watch=%s revision=%d session=%s\n", want.WatchID, want.Revision, want.SessionID)
+	return 0
 }
