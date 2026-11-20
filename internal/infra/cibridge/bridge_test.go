@@ -647,3 +647,287 @@ func TestBridgeBlockedWakeFailureIsRetried(t *testing.T) {
 		t.Fatalf("deliveries after retry = %d, want 2 attempts", got)
 	}
 }
+
+// fixerStore carries the fixFor link next to a real store. It stands in for
+// the domain.Watch.FixFor field until the fixer-role change reaches main;
+// cibridge reads the link through the optional fixForSource capability.
+type fixerStore struct {
+	*store.DB
+	links map[string]string
+}
+
+func (s *fixerStore) FixForOf(watchID string) string {
+	return s.links[watchID]
+}
+
+// perPRCI answers with a different PR state per number, so a fixer PR can be
+// MERGED while the source Watch keeps reporting a normal CI state.
+type perPRCI struct {
+	states map[int]domain.PRState
+	calls  map[int]int
+}
+
+func (c *perPRCI) PRState(_ context.Context, _ string, pr int) (domain.PRState, error) {
+	if c.calls != nil {
+		c.calls[pr]++
+	}
+	return c.states[pr], nil
+}
+
+// fixerTestWatch builds a live Watch on the fix PR. It is the Watch that
+// carries fixFor and whose PR the bridge observes as MERGED.
+func fixerTestWatch(id string, pr int) domain.Watch {
+	return domain.Watch{
+		ID:      id,
+		Repo:    "refusedguy/beacon",
+		PR:      pr,
+		HeadSHA: "fix",
+		Status:  domain.StatusWatching,
+		Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{
+			ID: "ses_fixer", Role: domain.RoleExecutor, Adapter: "opencode",
+		}},
+	}
+}
+
+// TestBridgeUnblocksSourceOnFixerMerge proves that a merged fixer PR releases
+// the blocked Watch named by fixFor: status and verdict return to watching,
+// the block details are cleared, and the next tick polls CI for the source.
+func TestBridgeUnblocksSourceOnFixerMerge(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const sourceID = "watch:refusedguy/beacon:60:abc"
+	const fixerID = "watch:refusedguy/beacon:70:fix"
+
+	source := blockedTestWatch(sourceID, 60,
+		domain.Subscriber{ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(source); err != nil {
+		t.Fatalf("SaveWatch(source): %v", err)
+	}
+	if err := db.SaveWatch(fixerTestWatch(fixerID, 70)); err != nil {
+		t.Fatalf("SaveWatch(fixer): %v", err)
+	}
+
+	fs := &fixerStore{DB: db, links: map[string]string{fixerID: sourceID}}
+	ci := &perPRCI{
+		states: map[int]domain.PRState{
+			70: {State: "MERGED", HeadRefOid: "fix"},
+			60: {HeadRefOid: "abc", Checks: map[string]domain.Check{
+				"build": {Conclusion: "SUCCESS", Required: true},
+			}},
+		},
+		calls: map[int]int{},
+	}
+	b := New(fs, ci, fixedClock{at: time.Unix(4, 0)}, time.Second)
+	ctx := context.Background()
+
+	if got := b.Refresh(ctx); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1 (the merged fixer)", got)
+	}
+
+	got, err := db.Watch(sourceID)
+	if err != nil {
+		t.Fatalf("Watch(source): %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+		t.Fatalf("source status/verdict = %q/%q, want watching/watching", got.Status, got.Verdict)
+	}
+	if got.Blocked != nil {
+		t.Fatalf("source kept block details: %+v", got.Blocked)
+	}
+	if got.Revision != source.Revision+1 {
+		t.Fatalf("source revision = %d, want %d", got.Revision, source.Revision+1)
+	}
+	if ci.calls[60] != 0 {
+		t.Fatalf("source CI polled %d times in the merge tick, want 0", ci.calls[60])
+	}
+	fixed, err := db.Watch(fixerID)
+	if err != nil {
+		t.Fatalf("Watch(fixer): %v", err)
+	}
+	if fixed.Status != domain.StatusClosed || fixed.Verdict != domain.VerdictMerged {
+		t.Fatalf("fixer status/verdict = %q/%q, want closed/merged", fixed.Status, fixed.Verdict)
+	}
+
+	// Back in the normal loop: the source is polled and reaches ready.
+	if got := b.Refresh(ctx); got != 1 {
+		t.Fatalf("second Refresh updated %d watches, want 1", got)
+	}
+	if ci.calls[60] != 1 {
+		t.Fatalf("source CI polled %d times after unblock, want 1", ci.calls[60])
+	}
+	got, err = db.Watch(sourceID)
+	if err != nil {
+		t.Fatalf("Watch(source) after poll: %v", err)
+	}
+	if got.Verdict != domain.VerdictReady {
+		t.Fatalf("source verdict after poll = %q, want ready", got.Verdict)
+	}
+}
+
+// TestBridgeMergeLeavesNonBlockedSourceAlone proves fixFor only resumes a
+// blocked Watch; a source that is already live is not changed or re-polled
+// with a merged verdict by the fixer's merge.
+func TestBridgeMergeLeavesNonBlockedSourceAlone(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const sourceID = "watch:refusedguy/beacon:60:abc"
+	const fixerID = "watch:refusedguy/beacon:71:fix"
+
+	source := domain.Watch{
+		ID: sourceID, Repo: "refusedguy/beacon", PR: 60, HeadSHA: "abc",
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 7,
+		Subscribers: []domain.Subscriber{{ID: "ses_executor", Role: domain.RoleExecutor}},
+	}
+	if err := db.SaveWatch(source); err != nil {
+		t.Fatalf("SaveWatch(source): %v", err)
+	}
+	if err := db.SaveWatch(fixerTestWatch(fixerID, 71)); err != nil {
+		t.Fatalf("SaveWatch(fixer): %v", err)
+	}
+
+	fs := &fixerStore{DB: db, links: map[string]string{fixerID: sourceID}}
+	ci := &perPRCI{
+		states: map[int]domain.PRState{
+			71: {State: "MERGED", HeadRefOid: "fix"},
+			60: {HeadRefOid: "abc", Checks: map[string]domain.Check{
+				"build": {Conclusion: "PENDING", Required: true},
+			}},
+		},
+		calls: map[int]int{},
+	}
+	b := New(fs, ci, fixedClock{at: time.Unix(4, 0)}, time.Second)
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+
+	got, err := db.Watch(sourceID)
+	if err != nil {
+		t.Fatalf("Watch(source): %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+		t.Fatalf("source status/verdict = %q/%q, want watching/watching", got.Status, got.Verdict)
+	}
+	if got.Revision != source.Revision || got.Blocked != nil {
+		t.Fatalf("non-blocked source changed: revision=%d blocked=%+v, want %d/nil", got.Revision, got.Blocked, source.Revision)
+	}
+}
+
+// TestBridgeRepeatedMergeUnblocksOnce proves one MERGE produces one unblock:
+// the fixer Watch is closed by its own verdict, and a later tick cannot bump
+// the source revision again even though the fixer PR still reports MERGED.
+func TestBridgeRepeatedMergeUnblocksOnce(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const sourceID = "watch:refusedguy/beacon:60:abc"
+	const fixerID = "watch:refusedguy/beacon:72:fix"
+
+	source := blockedTestWatch(sourceID, 60,
+		domain.Subscriber{ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(source); err != nil {
+		t.Fatalf("SaveWatch(source): %v", err)
+	}
+	if err := db.SaveWatch(fixerTestWatch(fixerID, 72)); err != nil {
+		t.Fatalf("SaveWatch(fixer): %v", err)
+	}
+
+	fs := &fixerStore{DB: db, links: map[string]string{fixerID: sourceID}}
+	ci := &perPRCI{
+		states: map[int]domain.PRState{
+			72: {State: "MERGED", HeadRefOid: "fix"},
+			60: {HeadRefOid: "abc", Checks: map[string]domain.Check{
+				"build": {Conclusion: "PENDING", Required: true},
+			}},
+		},
+		calls: map[int]int{},
+	}
+	b := New(fs, ci, fixedClock{at: time.Unix(4, 0)}, time.Second)
+	ctx := context.Background()
+
+	if got := b.Refresh(ctx); got != 1 {
+		t.Fatalf("first Refresh updated %d watches, want 1", got)
+	}
+	afterFirst, err := db.Watch(sourceID)
+	if err != nil {
+		t.Fatalf("Watch(source): %v", err)
+	}
+	if afterFirst.Revision != source.Revision+1 {
+		t.Fatalf("source revision after merge = %d, want %d", afterFirst.Revision, source.Revision+1)
+	}
+
+	for i := 0; i < 3; i++ {
+		if got := b.Refresh(ctx); got != 0 {
+			t.Fatalf("Refresh %d updated %d watches, want 0", i+2, got)
+		}
+	}
+	again, err := db.Watch(sourceID)
+	if err != nil {
+		t.Fatalf("Watch(source) after repeats: %v", err)
+	}
+	if again.Revision != afterFirst.Revision {
+		t.Fatalf("source revision after repeated MERGE = %d, want %d", again.Revision, afterFirst.Revision)
+	}
+}
+
+// TestBridgeMergeWithoutFixForDoesNothing proves a merged PR with no fixFor
+// link never touches any other Watch.
+func TestBridgeMergeWithoutFixForDoesNothing(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const sourceID = "watch:refusedguy/beacon:60:abc"
+	const fixerID = "watch:refusedguy/beacon:73:fix"
+
+	source := blockedTestWatch(sourceID, 60,
+		domain.Subscriber{ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(source); err != nil {
+		t.Fatalf("SaveWatch(source): %v", err)
+	}
+	if err := db.SaveWatch(fixerTestWatch(fixerID, 73)); err != nil {
+		t.Fatalf("SaveWatch(fixer): %v", err)
+	}
+
+	fs := &fixerStore{DB: db, links: map[string]string{}}
+	ci := &perPRCI{
+		states: map[int]domain.PRState{
+			73: {State: "MERGED", HeadRefOid: "fix"},
+			60: {HeadRefOid: "abc", Checks: map[string]domain.Check{
+				"build": {Conclusion: "PENDING", Required: true},
+			}},
+		},
+		calls: map[int]int{},
+	}
+	b := New(fs, ci, fixedClock{at: time.Unix(4, 0)}, time.Second)
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+
+	got, err := db.Watch(sourceID)
+	if err != nil {
+		t.Fatalf("Watch(source): %v", err)
+	}
+	if got.Status != domain.StatusBlocked || got.Verdict != domain.VerdictBlocked {
+		t.Fatalf("source status/verdict = %q/%q, want blocked/blocked", got.Status, got.Verdict)
+	}
+	if got.Revision != source.Revision || got.Blocked == nil {
+		t.Fatalf("source changed without fixFor: revision=%d blocked=%+v", got.Revision, got.Blocked)
+	}
+}

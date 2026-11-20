@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -180,6 +181,10 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			skipped++
 			continue
 		}
+		if verdict == domain.VerdictMerged {
+			// A merged fixer PR releases the Watch it was assigned to clear.
+			b.unblockFixed(w)
+		}
 		n, err := b.publish(ctx, w, state, verdict)
 		if err != nil {
 			observe.ActorError("cibridge-publish", w.ID, err)
@@ -312,6 +317,85 @@ func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
 		b.blockedNotified[id] = struct{}{}
 		b.mu.Unlock()
 	}
+}
+
+// fixForSource is an optional capability a Store may implement to expose the
+// fixer link of a Watch. The fixer-role work adds FixFor to domain.Watch; until
+// that field exists in the domain type this seam lets cibridge read the link
+// without naming a field that would not compile. watchFixFor reads the field
+// by name first, so once it lands production needs no extra wiring.
+type fixForSource interface {
+	FixForOf(watchID string) string
+}
+
+// watchFixFor returns the id of the Watch a fixer Watch is assigned to clear.
+// It prefers the domain field (read by name so this package compiles against a
+// Watch that predates the fixer role) and falls back to the optional Store
+// capability for callers that carry the link outside the domain type.
+func (b *Bridge) watchFixFor(w domain.Watch) string {
+	if f := reflect.ValueOf(w).FieldByName("FixFor"); f.IsValid() && f.Kind() == reflect.String {
+		if s := strings.TrimSpace(f.String()); s != "" {
+			return s
+		}
+	}
+	if b.store != nil {
+		if src, ok := b.store.(fixForSource); ok {
+			return strings.TrimSpace(src.FixForOf(w.ID))
+		}
+	}
+	return ""
+}
+
+// unblockFixed resumes the Watch a merged fixer Watch points at. The fixer
+// link lives on the fixer Watch as fixFor and names a blocked Watch. The
+// domain EventUnblock clears the block details, returns the target to watching
+// and bumps its revision, so the next Refresh polls CI again. A target that is
+// not blocked is left untouched, and the revision guard makes a repeated MERGE
+// observation a no-op: one merge produces one unblock.
+func (b *Bridge) unblockFixed(merged domain.Watch) {
+	fixer := merged
+	if b.watchFixFor(fixer) == "" {
+		// The merged Watch is normally the fixer itself. A second Watch on the
+		// same PR may also carry the link, so look for one before giving up.
+		watches, err := b.store.AllWatches()
+		if err != nil {
+			observe.ActorError("cibridge-unblock", merged.ID, err)
+			log.Printf("cibridge: unblock lookup %s#%d: %v", merged.Repo, merged.PR, err)
+			return
+		}
+		for _, w := range watches {
+			if w.Repo != merged.Repo || w.PR != merged.PR || w.Status == domain.StatusClosed {
+				continue
+			}
+			if b.watchFixFor(w) != "" {
+				fixer = w
+				break
+			}
+		}
+	}
+	fixFor := b.watchFixFor(fixer)
+	if fixFor == "" || fixFor == fixer.ID {
+		return
+	}
+	target, err := b.store.Watch(fixFor)
+	if err != nil {
+		observe.ActorError("cibridge-unblock", fixer.ID, err)
+		log.Printf("cibridge: unblock target %s: %v", fixFor, err)
+		return
+	}
+	if target.Status != domain.StatusBlocked || target.Blocked == nil {
+		return
+	}
+	next, _ := domain.Transition(target, domain.UnblockEvent(b.clock.Now()))
+	if next.Revision == target.Revision || next.Status != domain.StatusWatching {
+		return
+	}
+	if err := b.store.SaveWatch(next); err != nil {
+		observe.ActorError("cibridge-unblock", target.ID, err)
+		log.Printf("cibridge: unblock save %s: %v", target.ID, err)
+		return
+	}
+	log.Printf("cibridge: %s unblocked by %s#%d revision=%d", target.ID, fixer.Repo, fixer.PR, next.Revision)
 }
 
 // verdictFromChecks turns observed checks into a verdict. A pending check
