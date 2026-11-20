@@ -33,8 +33,10 @@ var _ mcp.PrecheckJournal = (*taskcli.Service)(nil)
 // (ADR 0011, ADR 0015).
 const mcpStateDBName = "beacon.db"
 
-// ciBridgeInterval bounds how often Beacon observes CI for active Watches.
-const ciBridgeInterval = 5 * time.Second
+// The CI bridge cadence is owned by cibridge: DefaultPollInterval is 30s and
+// BEACON_CI_POLL_INTERVAL overrides it (cibridge.PollInterval). The old 5s tick
+// made twelve Watches issue about 288 gh calls a minute, which exhausted the
+// local CLI's connection budget and stopped verdicts from being published.
 
 // mcpDaemonPorts and mcpDaemonRun are the seams through which `beacon mcp`
 // hosts the full daemon cycle. Tests replace them to observe the loop without
@@ -451,20 +453,21 @@ func runMCP(ctx context.Context) error {
 	runCtx, stopLoops := context.WithCancel(ctx)
 	defer stopLoops()
 
-	// The CI bridge keeps verdicts fresh every five seconds: it observes the
-	// hosting service for active Watches and persists ready/retry, so the
-	// orchestrator reads a verdict from get_result instead of polling CI.
-	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, ciBridgeInterval)
+	// The CI bridge observes the hosting service for active Watches and persists
+	// ready/retry, so the orchestrator reads a verdict from get_result instead
+	// of polling CI. It runs on the configured cadence (30s by default); each
+	// provider call is additionally cached and paced by ghci.Provider.
+	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, cibridge.PollInterval())
 	ciBridge.WithWaker(wake.NewRegistry())
 	go ciBridge.Run(runCtx)
 
 	// A full daemon cycle runs in this process as well. Starting `beacon mcp`
 	// is now enough: checkall, orchestrate and close-merged are no longer a
-	// separate `beacon daemon` process. The bridge above stays because it is
-	// the fast verdict observer (5s), while the daemon owns the slower full
-	// cycle (3m by default). CloseMerged's bridge.Refresh is an idempotent
-	// refresh of terminal PR states, so the two loops complement each other
-	// instead of publishing competing verdicts.
+	// separate `beacon daemon` process. The bridge above stays as the verdict
+	// observer (30s by default), while the daemon owns the slower full cycle
+	// (3m by default). CloseMerged's bridge.Refresh is an idempotent refresh of
+	// terminal PR states, so the two loops complement each other instead of
+	// publishing competing verdicts.
 	stopDaemon, err := startMCPDaemon(runCtx, newDefaultCLI())
 	if err != nil {
 		return fmt.Errorf("mcp: daemon: %w", err)

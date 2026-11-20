@@ -7,27 +7,160 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
-// ghCIProvider adapts the authenticated `gh` CLI to domain.CIProvider. The
+const (
+	// defaultCacheTTL keeps one pair of gh calls per PR across several bridge
+	// ticks. It is shorter than the bridge's 30s default cadence, so a normal
+	// refresh still observes fresh CI while a hot loop is absorbed by the cache.
+	defaultCacheTTL = 20 * time.Second
+	// defaultMinInterval is the floor between two real gh calls for the same
+	// PR. It also covers a cache miss right after a successful call.
+	defaultMinInterval = 2 * time.Second
+	// defaultBackoff is the wait after the first transient failure; each
+	// further failure doubles it up to maxBackoff.
+	defaultBackoff = 5 * time.Second
+	maxBackoff     = 60 * time.Second
+)
+
+// Runner is the only external dependency of Provider: the authenticated gh
+// CLI. The seam lets tests count calls and return the TLS timeouts and exit
+// status 1 failures that motivated the pacing.
+type Runner func(ctx context.Context, args ...string) ([]byte, error)
+
+// Config tunes Provider. Zero fields get the defaults above, so
+// &ghci.Provider{} and ghci.New(ghci.Config{}) behave the same in production.
+type Config struct {
+	CacheTTL    time.Duration
+	MinInterval time.Duration
+	Backoff     time.Duration
+	MaxBackoff  time.Duration
+	Now         func() time.Time
+	Run         Runner
+}
+
+// prEntry is the per-PR state kept by Provider for the lifetime of the process.
+type prEntry struct {
+	cached            domain.PRState
+	cachedAt          time.Time
+	nextAllowed       time.Time
+	inFlight          bool
+	consecutiveErrors int
+	backoff           time.Duration
+}
+
+// Provider adapts the authenticated `gh` CLI to domain.CIProvider. The
 // project already has a richer GitHub adapter under internal/infra/github;
 // this one is the small composition-root bridge used by the local MCP server
 // to turn observed checks into verdicts without a second credential store.
-type Provider struct{}
+//
+// PRState makes two gh calls per uncached PR (view plus checks). The provider
+// caches the result briefly, keeps a minimum interval between calls for the
+// same PR and backs off exponentially after transient failures. Without this,
+// twelve Watches on a five-second tick produced about 288 gh calls a minute
+// and GitHub answers with TLS handshake timeouts and exit status 1.
+type Provider struct {
+	mu      sync.Mutex
+	entries map[string]*prEntry
+
+	cacheTTL    time.Duration
+	minInterval time.Duration
+	backoff     time.Duration
+	maxBackoff  time.Duration
+	now         func() time.Time
+	run         Runner
+}
 
 var _ domain.CIProvider = (*Provider)(nil)
 
-func (Provider) PRState(ctx context.Context, repo string, pr int) (state domain.PRState, err error) {
-	started := time.Now()
+// New builds a Provider with the given pacing. Zero-value configuration uses
+// the production defaults.
+func New(cfg Config) *Provider {
+	return &Provider{
+		cacheTTL:    cfg.CacheTTL,
+		minInterval: cfg.MinInterval,
+		backoff:     cfg.Backoff,
+		maxBackoff:  cfg.MaxBackoff,
+		now:         cfg.Now,
+		run:         cfg.Run,
+	}
+}
+
+// defaults fills in the zero fields once, under the same mutex that guards
+// entries, so a bare &Provider{} needs no constructor.
+func (p *Provider) defaults() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.entries == nil {
+		p.entries = make(map[string]*prEntry)
+	}
+	if p.cacheTTL <= 0 {
+		p.cacheTTL = defaultCacheTTL
+	}
+	if p.minInterval <= 0 {
+		p.minInterval = defaultMinInterval
+	}
+	if p.backoff <= 0 {
+		p.backoff = defaultBackoff
+	}
+	if p.maxBackoff <= 0 {
+		p.maxBackoff = maxBackoff
+	}
+	if p.maxBackoff < p.backoff {
+		p.maxBackoff = p.backoff
+	}
+	if p.now == nil {
+		p.now = time.Now
+	}
+	if p.run == nil {
+		p.run = runGH
+	}
+}
+
+func runGH(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "gh", args...).Output()
+}
+
+// throttleError is returned while a PR is in backoff. It deliberately reaches
+// cibridge as an error: publishing a verdict from a stale observation while gh
+// is failing could merge a PR whose checks changed.
+type throttleError struct {
+	repo  string
+	pr    int
+	fails int
+	wait  time.Duration
+}
+
+func (e throttleError) Error() string {
+	if e.wait < 0 {
+		e.wait = 0
+	}
+	return fmt.Sprintf("ghci: %s#%d: %d consecutive errors, next call in %s",
+		e.repo, e.pr, e.fails, e.wait)
+}
+
+// PRState returns the current PR state, served from the short-lived cache when
+// possible. A call that would be too soon for the same PR is skipped: while in
+// backoff it reports a throttle error, otherwise it returns the cached state.
+// The provider_call log carries consecutive_errors, so a rising count shows
+// degradation before verdicts start disappearing.
+func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state domain.PRState, err error) {
+	p.defaults()
+	started := p.now()
+	key := fmt.Sprintf("%s#%d", repo, pr)
+
+	consecutive := 0
 	defer func() {
 		level := observe.LevelDebug
 		fields := observe.Fields{
 			observe.FieldAdapter: "ghci", "method": "PRState", "repo": repo,
-			observe.FieldPR: pr, observe.FieldDuration: time.Since(started).String(),
+			observe.FieldPR: pr, observe.FieldDuration: p.now().Sub(started).String(),
+			"consecutive_errors": consecutive,
 		}
 		if err != nil {
 			level = observe.LevelWarn
@@ -35,9 +168,74 @@ func (Provider) PRState(ctx context.Context, repo string, pr int) (state domain.
 		}
 		observe.Event(level, "provider_call", fields)
 	}()
+
+	now := p.now()
+	p.mu.Lock()
+	e := p.entries[key]
+	if e == nil {
+		e = &prEntry{}
+		p.entries[key] = e
+	}
+	consecutive = e.consecutiveErrors
+
+	// One fresh observation serves every Watch on this PR and several ticks.
+	// This is the batch optimisation: no gh process is started on a cache hit.
+	if !e.inFlight && consecutive == 0 && !e.cachedAt.IsZero() && now.Sub(e.cachedAt) < p.cacheTTL {
+		cached := e.cached
+		p.mu.Unlock()
+		return cached, nil
+	}
+	// A concurrent caller already owns this PR, or the minimum interval or
+	// backoff has not elapsed. Do not start a second gh process.
+	if e.inFlight || now.Before(e.nextAllowed) {
+		fails, next, cached := e.consecutiveErrors, e.nextAllowed, e.cached
+		p.mu.Unlock()
+		if fails > 0 {
+			return domain.PRState{}, throttleError{repo: repo, pr: pr, fails: fails, wait: next.Sub(now)}
+		}
+		return cached, nil
+	}
+	e.inFlight = true
+	p.mu.Unlock()
+
+	fetched, callErr := p.fetch(ctx, repo, pr)
+
+	p.mu.Lock()
+	e = p.entries[key]
+	e.inFlight = false
+	now = p.now()
+	if callErr != nil {
+		// TLS handshake timeouts and `gh ...: exit status 1` are transient.
+		// One failure doubles the wait up to the cap; a success clears it.
+		e.consecutiveErrors++
+		if e.backoff <= 0 {
+			e.backoff = p.backoff
+		} else if e.backoff < p.maxBackoff {
+			e.backoff *= 2
+			if e.backoff > p.maxBackoff {
+				e.backoff = p.maxBackoff
+			}
+		}
+		e.nextAllowed = now.Add(e.backoff)
+		consecutive = e.consecutiveErrors
+		p.mu.Unlock()
+		return domain.PRState{}, callErr
+	}
+	e.consecutiveErrors = 0
+	e.backoff = 0
+	e.cached = fetched
+	e.cachedAt = now
+	e.nextAllowed = now.Add(p.minInterval)
+	consecutive = 0
+	p.mu.Unlock()
+	return fetched, nil
+}
+
+// fetch performs the two gh calls behind one cached PR observation.
+func (p *Provider) fetch(ctx context.Context, repo string, pr int) (domain.PRState, error) {
 	prArg := strconv.Itoa(pr)
-	view, err := exec.CommandContext(ctx, "gh", "pr", "view", prArg, "--repo", repo, "--json",
-		"headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision").Output()
+	view, err := p.run(ctx, "pr", "view", prArg, "--repo", repo, "--json",
+		"headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision")
 	if err != nil {
 		return domain.PRState{}, fmt.Errorf("gh pr view: %w", err)
 	}
@@ -54,8 +252,8 @@ func (Provider) PRState(ctx context.Context, repo string, pr int) (state domain.
 		return domain.PRState{}, fmt.Errorf("gh pr view decode: %w", err)
 	}
 
-	checksOut, err := exec.CommandContext(ctx, "gh", "pr", "checks", prArg, "--repo", repo, "--json",
-		"name,state,link").Output()
+	checksOut, err := p.run(ctx, "pr", "checks", prArg, "--repo", repo, "--json",
+		"name,state,link")
 	if err != nil {
 		// No checks yet is an honest pending state, not an error.
 		if ee, ok := err.(*exec.ExitError); ok && strings.Contains(string(ee.Stderr), "no checks reported") {

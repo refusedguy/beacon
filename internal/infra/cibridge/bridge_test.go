@@ -7,10 +7,13 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/ghci"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -929,5 +932,194 @@ func TestBridgeMergeWithoutFixForDoesNothing(t *testing.T) {
 	}
 	if got.Revision != source.Revision || got.Blocked == nil {
 		t.Fatalf("source changed without fixFor: revision=%d blocked=%+v", got.Revision, got.Blocked)
+	}
+}
+
+// TestPollIntervalFromEnv holds the new cadence contract: 30s by default and
+// BEACON_CI_POLL_INTERVAL as an explicit override.
+func TestPollIntervalFromEnv(t *testing.T) {
+	t.Setenv(ciPollIntervalEnv, "")
+	if got := PollInterval(); got != DefaultPollInterval {
+		t.Fatalf("default poll interval = %s, want %s", got, DefaultPollInterval)
+	}
+	t.Setenv(ciPollIntervalEnv, "45s")
+	if got := PollInterval(); got != 45*time.Second {
+		t.Fatalf("configured poll interval = %s, want 45s", got)
+	}
+	for _, bad := range []string{"nonsense", "0s", "-5s"} {
+		t.Setenv(ciPollIntervalEnv, bad)
+		if got := PollInterval(); got != DefaultPollInterval {
+			t.Errorf("poll interval for %q = %s, want %s", bad, got, DefaultPollInterval)
+		}
+	}
+	if b := New(nil, nil, nil, 0); b.interval != DefaultPollInterval {
+		t.Fatalf("New interval = %s, want %s", b.interval, DefaultPollInterval)
+	}
+}
+
+const (
+	ghViewJSON   = `{"headRefOid":"abc","baseRefName":"main","state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED"}`
+	ghChecksJSON = `[{"name":"build","state":"PASS","link":"https://example.test/build"}]`
+)
+
+// ghRunner counts gh invocations and routes view and checks to their payloads.
+// fail toggles a transient checks failure without rebuilding the provider.
+func ghRunner(calls *int, fail *bool) ghci.Runner {
+	return func(_ context.Context, args ...string) ([]byte, error) {
+		*calls = *calls + 1
+		if len(args) >= 2 && args[1] == "view" {
+			return []byte(ghViewJSON), nil
+		}
+		if *fail {
+			return nil, errors.New("exit status 1")
+		}
+		return []byte(ghChecksJSON), nil
+	}
+}
+
+// TestProviderCacheTTL proves that repeated PRState calls inside the TTL make
+// no gh calls, and that the pair of calls resumes once the TTL expires.
+func TestProviderCacheTTL(t *testing.T) {
+	now := time.Unix(100, 0)
+	calls, fail := 0, false
+	p := ghci.New(ghci.Config{Now: func() time.Time { return now }, Run: ghRunner(&calls, &fail)})
+	ctx := context.Background()
+
+	first, err := p.PRState(ctx, "o/r", 7)
+	if err != nil {
+		t.Fatalf("first PRState: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("first PRState made %d gh calls, want 2", calls)
+	}
+	second, err := p.PRState(ctx, "o/r", 7)
+	if err != nil {
+		t.Fatalf("cached PRState: %v", err)
+	}
+	if calls != 2 || second.HeadRefOid != first.HeadRefOid {
+		t.Fatalf("cached PRState made %d gh calls and state %+v, want 2 and %+v", calls, second, first)
+	}
+
+	now = now.Add(19 * time.Second)
+	if _, err := p.PRState(ctx, "o/r", 7); err != nil || calls != 2 {
+		t.Fatalf("PRState at TTL-1: err=%v ghCalls=%d, want nil/2", err, calls)
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := p.PRState(ctx, "o/r", 7); err != nil || calls != 4 {
+		t.Fatalf("PRState after TTL: err=%v ghCalls=%d, want nil/4", err, calls)
+	}
+}
+
+// TestProviderMinimumInterval proves an expired cache does not let the same PR
+// be polled again immediately. The cached observation is served until the
+// minimum interval elapses.
+func TestProviderMinimumInterval(t *testing.T) {
+	now := time.Unix(200, 0)
+	calls, fail := 0, false
+	p := ghci.New(ghci.Config{
+		CacheTTL: time.Nanosecond, MinInterval: 5 * time.Second,
+		Now: func() time.Time { return now }, Run: ghRunner(&calls, &fail),
+	})
+	ctx := context.Background()
+	if _, err := p.PRState(ctx, "o/r", 8); err != nil || calls != 2 {
+		t.Fatalf("first PRState: err=%v ghCalls=%d, want nil/2", err, calls)
+	}
+	now = now.Add(time.Second)
+	if _, err := p.PRState(ctx, "o/r", 8); err != nil || calls != 2 {
+		t.Fatalf("PRState inside min interval: err=%v ghCalls=%d, want nil/2", err, calls)
+	}
+	now = now.Add(4 * time.Second)
+	if _, err := p.PRState(ctx, "o/r", 8); err != nil || calls != 4 {
+		t.Fatalf("PRState after min interval: err=%v ghCalls=%d, want nil/4", err, calls)
+	}
+}
+
+type capturedEvent struct {
+	name   string
+	fields observe.Fields
+}
+
+// captureSink records provider_call fields so the test can see consecutive_errors
+// grow during a transient outage instead of only observing missing verdicts.
+type captureSink struct {
+	mu     sync.Mutex
+	events []capturedEvent
+}
+
+func (s *captureSink) Log(_ observe.Level, event string, fields observe.Fields) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := make(observe.Fields, len(fields))
+	for k, v := range fields {
+		snapshot[k] = v
+	}
+	s.events = append(s.events, capturedEvent{name: event, fields: snapshot})
+}
+
+func (s *captureSink) Inc(string, string) {}
+
+func (s *captureSink) providerCalls() []capturedEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []capturedEvent
+	for _, e := range s.events {
+		if e.name == "provider_call" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestProviderBackoffAfterError covers the reported failure mode: gh answers
+// exit status 1, the provider waits before retrying, the wait doubles on the
+// next failure and a success clears both the backoff and the error count.
+func TestProviderBackoffAfterError(t *testing.T) {
+	now := time.Unix(300, 0)
+	calls, fail := 0, true
+	sink := &captureSink{}
+	observe.SetDefault(sink)
+	defer observe.SetDefault(nil)
+	p := ghci.New(ghci.Config{
+		Backoff: 5 * time.Second, MaxBackoff: 20 * time.Second,
+		Now: func() time.Time { return now }, Run: ghRunner(&calls, &fail),
+	})
+	ctx := context.Background()
+
+	if _, err := p.PRState(ctx, "o/r", 9); err == nil || calls != 2 {
+		t.Fatalf("first failing PRState: err=%v ghCalls=%d, want error/2", err, calls)
+	}
+	for _, step := range []time.Duration{0, 4 * time.Second} {
+		now = now.Add(step)
+		if _, err := p.PRState(ctx, "o/r", 9); err == nil || calls != 2 {
+			t.Fatalf("PRState inside backoff (+%s): err=%v ghCalls=%d, want error/2", step, err, calls)
+		}
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := p.PRState(ctx, "o/r", 9); err == nil || calls != 4 {
+		t.Fatalf("PRState after first backoff: err=%v ghCalls=%d, want error/4", err, calls)
+	}
+	if _, err := p.PRState(ctx, "o/r", 9); err == nil || calls != 4 {
+		t.Fatalf("PRState inside doubled backoff: err=%v ghCalls=%d, want error/4", err, calls)
+	}
+
+	fail = false
+	now = now.Add(11 * time.Second)
+	state, err := p.PRState(ctx, "o/r", 9)
+	if err != nil || calls != 6 || len(state.Checks) != 1 {
+		t.Fatalf("PRState after recovery: err=%v ghCalls=%d checks=%d, want nil/6/1", err, calls, len(state.Checks))
+	}
+	if _, err := p.PRState(ctx, "o/r", 9); err != nil || calls != 6 {
+		t.Fatalf("PRState after recovery hit: err=%v ghCalls=%d, want nil/6", err, calls)
+	}
+
+	events := sink.providerCalls()
+	want := []int{1, 1, 1, 2, 2, 0, 0}
+	if len(events) != len(want) {
+		t.Fatalf("provider_call events = %d, want %d", len(events), len(want))
+	}
+	for i, w := range want {
+		if got := events[i].fields["consecutive_errors"]; got != w {
+			t.Errorf("provider_call[%d].consecutive_errors = %v, want %d", i, got, w)
+		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,6 +17,32 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
+
+// DefaultPollInterval is the cadence used when BEACON_CI_POLL_INTERVAL is
+// absent, malformed or non-positive. The old five-second tick called gh twice
+// for every live Watch: twelve Watches produced about 288 gh calls a minute
+// and ran into TLS timeouts and exit status 1. Thirty seconds is slow enough
+// to keep the same fleet under fifty calls a minute while verdicts stay fresh.
+const DefaultPollInterval = 30 * time.Second
+
+// ciPollIntervalEnv is the operator override for the bridge cadence.
+const ciPollIntervalEnv = "BEACON_CI_POLL_INTERVAL"
+
+// PollInterval reads BEACON_CI_POLL_INTERVAL. An invalid or non-positive value
+// falls back to DefaultPollInterval so a bad setting cannot restore the hot
+// polling loop. The caller passes the result to New; the bridge itself does
+// not read the environment.
+func PollInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(ciPollIntervalEnv))
+	if raw == "" {
+		return DefaultPollInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return DefaultPollInterval
+	}
+	return d
+}
 
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider
 // and one Store, so a refresh is a plain read followed by a conditional write.
@@ -101,10 +128,11 @@ func (b *Bridge) WithAdapterWaker(w domain.AdapterWakeDeliverer) *Bridge {
 	return b
 }
 
-// New builds a Bridge. An empty interval falls back to five seconds.
+// New builds a Bridge. An empty interval falls back to DefaultPollInterval;
+// composition roots that read BEACON_CI_POLL_INTERVAL pass PollInterval().
 func New(store domain.Store, ci domain.CIProvider, clock domain.Clock, interval time.Duration) *Bridge {
 	if interval <= 0 {
-		interval = 5 * time.Second
+		interval = DefaultPollInterval
 	}
 	if clock == nil {
 		clock = wallClock{}
