@@ -266,6 +266,73 @@ func (m *Metrics) JSON() []byte {
 	return append(raw, '\n')
 }
 
+// SnapshotJSON serialises the live counters and histograms as one JSON object.
+// The MCP server writes these bytes to runtime_stats so that `beacon metrics`
+// and `beacon inspect` report the counters of the running process instead of
+// their own zeros. The format is the same as JSON, including the histograms
+// object, and is always terminated by a newline.
+func (m *Metrics) SnapshotJSON() []byte {
+	return m.JSON()
+}
+
+// MetricsFromSnapshotJSON restores counters and histograms from bytes written
+// by SnapshotJSON. Unknown names are ignored; malformed or empty input yields
+// an empty metric set so a broken snapshot never blocks a CLI command. The
+// returned set is ready to be rendered with JSON or Prometheus.
+func MetricsFromSnapshotJSON(raw []byte) *Metrics {
+	m := NewMetrics()
+	if len(raw) == 0 {
+		return m
+	}
+	var decoded map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return m
+	}
+
+	for name, value := range decoded {
+		if name == "histograms" {
+			continue
+		}
+		var scalar uint64
+		if err := json.Unmarshal(value, &scalar); err == nil {
+			m.values[name] = scalar
+			continue
+		}
+		var byLabel map[string]uint64
+		if err := json.Unmarshal(value, &byLabel); err == nil {
+			m.labelled[name] = byLabel
+		}
+	}
+
+	if histRaw, ok := decoded["histograms"]; ok {
+		var histograms map[string]struct {
+			Count   uint64            `json:"count"`
+			Sum     float64           `json:"sum"`
+			Buckets map[string]uint64 `json:"buckets"`
+		}
+		if err := json.Unmarshal(histRaw, &histograms); err == nil {
+			for name, h := range histograms {
+				target := m.histograms[name]
+				if target == nil {
+					target = newHistogram()
+					m.histograms[name] = target
+				}
+				target.mu.Lock()
+				target.count = h.Count
+				target.sum = h.Sum
+				for i, upper := range histogramBounds {
+					key := strconv.FormatFloat(upper, 'f', -1, 64)
+					if v, ok := h.Buckets[key]; ok {
+						target.buckets[i] = v
+					}
+				}
+				target.mu.Unlock()
+			}
+		}
+	}
+	return m
+}
+
 // Prometheus renders the metrics in the Prometheus text exposition format.
 // Names carry the beacon_ prefix so they cannot collide with process metrics.
 func (m *Metrics) Prometheus() []byte {
