@@ -241,7 +241,8 @@ type LadderInfo struct {
 	Escalated int `json:"escalated"`
 }
 
-// StatsOutput is the response of beacon_stats.
+// StatsOutput is the response of beacon_stats. The seven original fields keep
+// their names and types; the registry counters are additive (T5.60).
 type StatsOutput struct {
 	PointsThisHour int         `json:"pointsThisHour"`
 	Budget         int         `json:"budget"`
@@ -250,6 +251,11 @@ type StatsOutput struct {
 	LoadErrors     []string    `json:"loadErrors"`
 	Ladder         LadderInfo  `json:"ladder"`
 	Version        string      `json:"version"`
+	// T5.60: registry counters. A handler without a RegistryStatsReader reports
+	// zero and an empty config id, so the pre-T5.60 contract is unchanged.
+	RegisteredAgents int    `json:"registeredAgents"`
+	StaleAgents      int    `json:"staleAgents"`
+	ConfigID         string `json:"configId"`
 }
 
 // OutputSchema derives the JSON schema for T from its Go type. This is the
