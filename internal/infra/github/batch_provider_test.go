@@ -715,3 +715,41 @@ func TestMergePRWithStateHoldsWhenPingCannotResolve(t *testing.T) {
 		t.Fatalf("merge writes = %d, want 0 for an unresolved PR", writes.Load())
 	}
 }
+
+// TestBatchProviderFailureExcerptDelegates pins the W11-B port on the batch
+// provider: it reaches the same REST annotations path and is a no-op when no
+// REST client was configured.
+func TestBatchProviderFailureExcerptDelegates(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/o/r/commits/sha/check-runs":
+			fmt.Fprint(w, `{"check_runs":[{"id":7,"name":"ci/failure","conclusion":"timed_out"}]}`)
+		case "/repos/o/r/check-runs/7/annotations":
+			fmt.Fprint(w, `[{"path":"a.go","start_line":1,"message":"timeout"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	provider := NewBatchProvider(nil, newRESTTestClient(t, srv, counter, "test-token"), counter)
+	got, err := provider.FailureExcerpt(context.Background(), "o/r", "sha", "ci/failure")
+	if err != nil {
+		t.Fatalf("FailureExcerpt: %v", err)
+	}
+	if !strings.Contains(got, "a.go:1") || !strings.Contains(got, "timeout") {
+		t.Errorf("excerpt = %q", got)
+	}
+	if len(paths) != 2 {
+		t.Errorf("REST calls = %v, want two", paths)
+	}
+
+	noREST := NewBatchProvider(nil, nil, counter)
+	if got, err := noREST.FailureExcerpt(context.Background(), "o/r", "sha", "ci/failure"); err != nil || got != "" {
+		t.Errorf("no-rest excerpt = %q, %v; want empty and nil", got, err)
+	}
+}

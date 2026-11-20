@@ -4,11 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -1362,5 +1366,300 @@ func TestNextStepForVerdicts(t *testing.T) {
 	}
 	if RetryCommand != "gh run rerun --failed" {
 		t.Errorf("retry command = %q", RetryCommand)
+	}
+}
+
+// --- W11-B: failure excerpts ------------------------------------------------
+
+// fakeExcerptSource returns a canned excerpt and counts calls per check name.
+type fakeExcerptSource struct {
+	mu     sync.Mutex
+	byName map[string]string
+	calls  map[string]int
+}
+
+func newFakeExcerptSource(answers map[string]string) *fakeExcerptSource {
+	return &fakeExcerptSource{
+		byName: answers,
+		calls:  map[string]int{},
+	}
+}
+
+func (s *fakeExcerptSource) FailureExcerpt(_ context.Context, _, _, checkName string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls[checkName]++
+	return s.byName[checkName], nil
+}
+
+func (s *fakeExcerptSource) callCount(checkName string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls[checkName]
+}
+
+// countingExcerptCache is an in-memory failureExcerptCache that records how
+// many Get and Put calls it saw, so a repeat read can prove the source was not
+// called again.
+type countingExcerptCache struct {
+	mu   sync.Mutex
+	data map[string]string
+	gets int
+	puts int
+}
+
+func newCountingExcerptCache() *countingExcerptCache {
+	return &countingExcerptCache{data: map[string]string{}}
+}
+
+func (c *countingExcerptCache) Get(_ context.Context, watchID, headSHA, checkName string) (string, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.gets++
+	v, ok := c.data[watchID+"\x00"+headSHA+"\x00"+checkName]
+	return v, ok, nil
+}
+
+func (c *countingExcerptCache) Put(_ context.Context, watchID, headSHA, checkName, excerpt string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.puts++
+	c.data[watchID+"\x00"+headSHA+"\x00"+checkName] = excerpt
+	return nil
+}
+
+func (c *countingExcerptCache) counts() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gets, c.puts
+}
+
+func excerptTestHandler(t *testing.T, src FailureExcerptSource, cache failureExcerptCache) (*GetResultHandler, domain.Watch) {
+	t.Helper()
+	w := resultFixture(domain.VerdictKeepWorking)
+	o := resultObligation(w, "session-E")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+	h.SetFailureExcerptSource(src)
+	if cache != nil {
+		h.SetFailureExcerptCache(cache)
+	}
+	return h, w
+}
+
+// TestFailureExcerptAnnotatedFailure proves an annotation reaches both the
+// per-check field and the aggregate, while green and skipped checks stay out.
+func TestFailureExcerptAnnotatedFailure(t *testing.T) {
+	src := newFakeExcerptSource(map[string]string{
+		"ci/failure": "main.go:17: nil deref in handle()",
+	})
+	h, w := excerptTestHandler(t, src, nil)
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if !strings.Contains(out.FailureExcerpt, "main.go:17") {
+		t.Errorf("aggregate excerpt = %q", out.FailureExcerpt)
+	}
+	for _, fc := range out.FailedChecks {
+		if fc.Name == "ci/failure" && fc.FailureExcerpt != "main.go:17: nil deref in handle()" {
+			t.Errorf("ci/failure excerpt = %q", fc.FailureExcerpt)
+		}
+	}
+	if got := src.callCount("ci/failure"); got != 1 {
+		t.Errorf("source calls = %d, want 1", got)
+	}
+}
+
+// TestFailureExcerptRedaction proves a token in an annotation never reaches
+// the response, and that XML/JSON metacharacters are escaped.
+func TestFailureExcerptRedaction(t *testing.T) {
+	raw := `auth ghp_abcdefghijklmnopqrstuvwxyz0123456789 <script>alert("x")</script> & 'q'`
+	src := newFakeExcerptSource(map[string]string{"ci/failure": raw})
+	h, w := excerptTestHandler(t, src, nil)
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if strings.Contains(out.FailureExcerpt, "ghp_abcdefghijklmnopqrstuvwxyz0123456789") {
+		t.Errorf("token leaked into excerpt: %q", out.FailureExcerpt)
+	}
+	if !strings.Contains(out.FailureExcerpt, "[REDACTED]") {
+		t.Errorf("redaction marker missing: %q", out.FailureExcerpt)
+	}
+	for _, bad := range []string{"<script>", `alert("x")`, " & ", "'q'"} {
+		if strings.Contains(out.FailureExcerpt, bad) {
+			t.Errorf("unescaped %q in excerpt %q", bad, out.FailureExcerpt)
+		}
+	}
+	if !strings.Contains(out.FailureExcerpt, "&lt;script&gt;") {
+		t.Errorf("markup not escaped: %q", out.FailureExcerpt)
+	}
+}
+
+// TestFailureExcerptTruncation pins the 2 KB ceiling on both the aggregate and
+// each per-check excerpt, including a rune boundary.
+func TestFailureExcerptTruncation(t *testing.T) {
+	src := newFakeExcerptSource(map[string]string{
+		"ci/failure": strings.Repeat("a", 4096) + "€",
+		"ci/flaky":   strings.Repeat("b", 4096),
+	})
+	h, w := excerptTestHandler(t, src, nil)
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if len(out.FailureExcerpt) > failureExcerptLimit {
+		t.Errorf("aggregate length = %d, want <= %d", len(out.FailureExcerpt), failureExcerptLimit)
+	}
+	if !utf8.ValidString(out.FailureExcerpt) {
+		t.Error("aggregate excerpt is not valid UTF-8 after truncation")
+	}
+	for _, fc := range out.FailedChecks {
+		if len(fc.FailureExcerpt) > failureExcerptLimit {
+			t.Errorf("%s excerpt length = %d, want <= %d", fc.Name, len(fc.FailureExcerpt), failureExcerptLimit)
+		}
+		if !utf8.ValidString(fc.FailureExcerpt) {
+			t.Errorf("%s excerpt is not valid UTF-8 after truncation", fc.Name)
+		}
+	}
+}
+
+// TestFailureExcerptCacheAvoidsSecondFetch proves one fetch per triple: a
+// second Result on the same Watch reads the cache instead of calling GitHub.
+func TestFailureExcerptCacheAvoidsSecondFetch(t *testing.T) {
+	src := newFakeExcerptSource(map[string]string{"ci/failure": "cached reason"})
+	cache := newCountingExcerptCache()
+	h, w := excerptTestHandler(t, src, cache)
+	req := sessionReq("session-E")
+	for i := 0; i < 2; i++ {
+		if _, err := h.Result(context.Background(), req, GetResultInput{WatchID: w.ID}); err != nil {
+			t.Fatalf("Result %d: %v", i, err)
+		}
+	}
+	if got := src.callCount("ci/failure"); got != 1 {
+		t.Errorf("source calls after two reads = %d, want 1", got)
+	}
+	gets, puts := cache.counts()
+	if puts != 2 || gets != 4 {
+		t.Errorf("cache gets/puts = %d/%d, want 4/2 (two checks per read)", gets, puts)
+	}
+}
+
+// TestFailureExcerptOptionalKeepsStableSchema pins the W9-C contract: the new
+// field is present in the derived schema but not required, and a response from
+// a server with no source omits it entirely.
+func TestFailureExcerptOptionalKeepsStableSchema(t *testing.T) {
+	schema, err := OutputSchema[GetResultOutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	if _, ok := schema.Properties["failureExcerpt"]; !ok {
+		t.Fatal("get_result schema is missing failureExcerpt")
+	}
+	for _, required := range schema.Required {
+		if required == "failureExcerpt" {
+			t.Fatal("failureExcerpt must be optional, not required")
+		}
+	}
+
+	h, w := excerptTestHandler(t, nil, nil)
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if out.FailureExcerpt != "" {
+		t.Errorf("no-source excerpt = %q, want empty", out.FailureExcerpt)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"failureExcerpt"`) {
+		t.Errorf("optional field present without a source: %s", raw)
+	}
+}
+
+// TestEscapeUntrusted pins the escaping table used for every excerpt.
+func TestEscapeUntrusted(t *testing.T) {
+	in := `<a href="x">& 'y'` + "\n\t\x00"
+	want := `&lt;a href=&quot;x&quot;&gt;&amp; &#39;y&#39;\u000a\u0009\u0000`
+	if got := escapeUntrusted(in); got != want {
+		t.Errorf("escapeUntrusted(%q) = %q, want %q", in, got, want)
+	}
+}
+
+// TestEnvFailureExcerptSource exercises the zero-wiring REST path against a
+// local server, including the failed-conclusion filter and the 2 KB boundary.
+func TestEnvFailureExcerptSource(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Header.Get("Authorization") == "" {
+			t.Error("request carried no Authorization header")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/o/r/commits/sha/check-runs":
+			fmt.Fprint(w, `{"check_runs":[{"id":42,"name":"ci/failure","conclusion":"failure"},{"id":43,"name":"ci/ok","conclusion":"success"}]}`)
+		case "/repos/o/r/check-runs/42/annotations":
+			fmt.Fprint(w, `[{"path":"main.go","start_line":9,"title":"boom","message":"bad东西"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("BEACON_GITHUB_TOKEN", "test-token")
+	t.Setenv("BEACON_GITHUB_API", srv.URL)
+	src := newEnvFailureExcerptSource()
+	if src == nil {
+		t.Fatal("env source is nil with a token set")
+	}
+	got, err := src.FailureExcerpt(context.Background(), "o/r", "sha", "ci/failure")
+	if err != nil {
+		t.Fatalf("FailureExcerpt: %v", err)
+	}
+	if !strings.Contains(got, "main.go:9") || !strings.Contains(got, "boom") {
+		t.Errorf("excerpt = %q", got)
+	}
+	if len(paths) != 2 {
+		t.Errorf("REST paths = %v, want two calls", paths)
+	}
+}
+
+// TestSQLFailureExcerptCachePersists exercises the real SQLite cache: a miss
+// before Put, a hit after Put, and a stable value on a repeat Put. The key is
+// the (watchID, headSHA, checkName) triple, so changing the SHA misses.
+func TestSQLFailureExcerptCachePersists(t *testing.T) {
+	o := resultObligation(resultFixture(domain.VerdictKeepWorking), "session-C")
+	writer, _ := newStampTestDB(t, o)
+	cache := newSQLFailureExcerptCache(writer)
+
+	if got, ok, err := cache.Get(context.Background(), "w-1", "sha", "ci/failure"); err != nil || ok || got != "" {
+		t.Fatalf("cold Get = %q, %v, %v; want empty miss", got, ok, err)
+	}
+	if err := cache.Put(context.Background(), "w-1", "sha", "ci/failure", "first"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got, ok, err := cache.Get(context.Background(), "w-1", "sha", "ci/failure"); err != nil || !ok || got != "first" {
+		t.Fatalf("warm Get = %q, %v, %v; want first", got, ok, err)
+	}
+	if err := cache.Put(context.Background(), "w-1", "sha", "ci/failure", "second"); err != nil {
+		t.Fatalf("repeat Put: %v", err)
+	}
+	if got, _, _ := cache.Get(context.Background(), "w-1", "sha", "ci/failure"); got != "first" {
+		t.Errorf("repeat Put overwrote cache: %q", got)
+	}
+	if _, ok, _ := cache.Get(context.Background(), "w-1", "new-sha", "ci/failure"); ok {
+		t.Error("a new head SHA must miss the cache")
 	}
 }

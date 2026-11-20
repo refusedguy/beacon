@@ -65,6 +65,10 @@ type FailedCheck struct {
 	DetailsURL   string `json:"detailsUrl"`
 	Required     bool   `json:"required"`
 	FlakyMatched bool   `json:"flakyMatched"`
+	// FailureExcerpt is a short, redacted annotation excerpt for this check.
+	// It is optional so a response from a caller without an excerpt source
+	// keeps its previous wire shape (W11-B).
+	FailureExcerpt string `json:"failureExcerpt,omitempty"`
 }
 
 // MergeSnapshot is the merge block of beacon_get_result.
@@ -121,6 +125,12 @@ type GetResultOutput struct {
 	NextAction  string `json:"nextAction,omitempty"`
 	NextCommand string `json:"nextCommand,omitempty"`
 	NextHint    string `json:"nextHint,omitempty"`
+
+	// FailureExcerpt is the aggregate of the per-check excerpts, capped at
+	// 2 KB. It is optional: a Watch whose checks have no annotations, or a
+	// server without an excerpt source, omits it and keeps the stable schema
+	// (W11-B).
+	FailureExcerpt string `json:"failureExcerpt,omitempty"`
 }
 
 // TaskDialect is the application-level response form a client can consume.

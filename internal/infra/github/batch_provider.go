@@ -145,6 +145,18 @@ func (b *BatchProvider) PointStats() (used int, budget int) {
 	return b.counter.Used(), b.counter.Budget()
 }
 
+// FailureExcerpt makes BatchProvider implement the MCP failure-excerpt source
+// port (W11-B). It delegates to the REST client and is safe to call even when
+// no REST client was configured: the answer is then simply empty. Caching is
+// owned by beacon_get_result, so repeated polls do not reach this method once
+// the (watchID, headSHA, checkName) triple has been answered.
+func (b *BatchProvider) FailureExcerpt(ctx context.Context, repo, headSHA, checkName string) (string, error) {
+	if b == nil || b.rest == nil {
+		return "", nil
+	}
+	return b.rest.FailureExcerpt(ctx, repo, headSHA, checkName)
+}
+
 // FetchBatch returns one snapshot per active Watch, keyed by Watch.ID. Closed
 // Watches are skipped. All active PRs and all distinct base refs are fetched in
 // one batched GraphQL operation, split into measured chunks by the client.

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,12 @@ const (
 	restTimeout     = 30 * time.Second
 	restUserAgent   = "beacon"
 	restRequestCost = 1
+
+	// failureExcerptAnnotations bounds the annotations read per failed check.
+	failureExcerptAnnotations = 8
+	// failureExcerptLimit is the 2 KB ceiling applied by this adapter as well
+	// as by the MCP boundary, so a caller cannot receive a huge blob.
+	failureExcerptLimit = 2048
 )
 
 // tokenEnvChain is the token lookup order from WORKER-PROMPT §2.
@@ -256,4 +263,108 @@ func (c *RestClient) MergePullRequest(ctx context.Context, owner, repo string, n
 		return MergeResult{Reason: "merge_not_confirmed"}, nil
 	}
 	return MergeResult{Merged: true, SHA: result.GetSHA()}, nil
+}
+
+// FailureExcerpt is the W11-B read path. It finds the failed CheckRun for the
+// Watch's head SHA by name, then reads its annotations and formats them into a
+// short text block. The MCP boundary applies Redact and escapeUntrusted and
+// enforces the 2 KB ceiling, so this method returns raw CI output.
+//
+// A repo without an owner/name pair, or a head SHA with no matching failed
+// run, yields an empty excerpt and a nil error: no annotations is a normal
+// outcome, not a transport failure.
+func (c *RestClient) FailureExcerpt(ctx context.Context, repo, headSHA, checkName string) (string, error) {
+	if c == nil || c.gh == nil {
+		return "", nil
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || headSHA == "" || checkName == "" {
+		return "", nil
+	}
+	status := "completed"
+	opts := &gh.ListCheckRunsOptions{
+		CheckName:   &checkName,
+		Status:      &status,
+		ListOptions: gh.ListOptions{PerPage: 100},
+	}
+	runs, resp, err := c.gh.Checks.ListCheckRunsForRef(ctx, owner, name, headSHA, opts)
+	if resp != nil && c.counter != nil {
+		c.counter.Observe(resp.Response, restRequestCost)
+	}
+	if err != nil {
+		return "", fmt.Errorf("check-runs %s@%s: %w", repo, headSHA, err)
+	}
+	var id int64
+	if runs != nil {
+		for _, run := range runs.CheckRuns {
+			if run == nil || !failedCheckRunConclusion(run.GetConclusion()) {
+				continue
+			}
+			id = run.GetID()
+			break
+		}
+	}
+	if id == 0 {
+		return "", nil
+	}
+	annotations, resp, err := c.gh.Checks.ListCheckRunAnnotations(ctx, owner, name, id,
+		&gh.ListOptions{PerPage: failureExcerptAnnotations})
+	if resp != nil && c.counter != nil {
+		c.counter.Observe(resp.Response, restRequestCost)
+	}
+	if err != nil {
+		return "", fmt.Errorf("check-run %d annotations: %w", id, err)
+	}
+	return formatCheckRunAnnotations(annotations), nil
+}
+
+func failedCheckRunConclusion(conclusion string) bool {
+	switch strings.ToUpper(conclusion) {
+	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "CANCELLED", "CANCELED":
+		return true
+	}
+	return false
+}
+
+// formatCheckRunAnnotations renders "path:line: title: message" lines in the
+// order GitHub returned them. Empty fields are skipped, and the byte budget is
+// enforced here as a second line of defence behind the MCP boundary.
+func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
+	var b strings.Builder
+	for i, a := range annotations {
+		if i >= failureExcerptAnnotations || a == nil {
+			continue
+		}
+		message := strings.TrimSpace(a.GetMessage())
+		title := strings.TrimSpace(a.GetTitle())
+		if message == "" && title == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		if p := strings.TrimSpace(a.GetPath()); p != "" {
+			b.WriteString(p)
+			if line := a.GetStartLine(); line > 0 {
+				b.WriteByte(':')
+				b.WriteString(strconv.Itoa(line))
+			}
+			b.WriteString(": ")
+		}
+		if title != "" {
+			b.WriteString(title)
+			if message != "" {
+				b.WriteString(": ")
+			}
+		}
+		b.WriteString(message)
+		if b.Len() >= failureExcerptLimit {
+			break
+		}
+	}
+	out := b.String()
+	if len(out) > failureExcerptLimit {
+		out = out[:failureExcerptLimit]
+	}
+	return out
 }
