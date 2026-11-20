@@ -68,9 +68,9 @@ func TestNormalizeRateLimitSources(t *testing.T) {
 			wantRetryAfter: (45 * time.Second).Milliseconds() + jitter.Milliseconds(),
 		},
 		{
-			name:           "secondary 200 with x-ratelimit-reset",
+			name:           "200 with remaining 0 and x-ratelimit-reset",
 			status:         http.StatusOK,
-			header:         header("x-ratelimit-reset", resetIn(20*time.Second)),
+			header:         header("x-ratelimit-remaining", "0", "x-ratelimit-reset", resetIn(20*time.Second)),
 			wantRetryAfter: (20 * time.Second).Milliseconds() + jitter.Milliseconds(),
 		},
 		{
@@ -78,6 +78,18 @@ func TestNormalizeRateLimitSources(t *testing.T) {
 			status:         http.StatusTooManyRequests,
 			body:           `{"retry_after":10}`,
 			wantRetryAfter: (10 * time.Second).Milliseconds() + jitter.Milliseconds(),
+		},
+		{
+			name:           "200 with body retryAfterMs",
+			status:         http.StatusOK,
+			body:           `{"data":{},"retryAfterMs":1500}`,
+			wantRetryAfter: 1500 + jitter.Milliseconds(),
+		},
+		{
+			name:           "403 with remaining 0 and x-ratelimit-reset",
+			status:         http.StatusForbidden,
+			header:         header("x-ratelimit-remaining", "0", "x-ratelimit-reset", resetIn(30*time.Second)),
+			wantRetryAfter: (30 * time.Second).Milliseconds() + jitter.Milliseconds(),
 		},
 	}
 
@@ -101,6 +113,66 @@ func TestNormalizeRateLimitSources(t *testing.T) {
 			}
 			if *got.Err.RetryAfterMs != tc.wantRetryAfter {
 				t.Fatalf("RetryAfterMs = %d, want %d", *got.Err.RetryAfterMs, tc.wantRetryAfter)
+			}
+		})
+	}
+}
+
+// x-ratelimit-reset is the hourly window reset GitHub sends on every response,
+// not a rate-limit signal. Treating it as one made every successful GraphQL
+// call RATE_LIMITED while gh api rate_limit still showed a full quota.
+func TestNormalizeIgnoresWindowResetWithoutExhaustion(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	n := testNormalizer(now, 0)
+	reset := strconv.FormatInt(now.Add(time.Hour).Unix(), 10)
+
+	cases := []struct {
+		name   string
+		status int
+		header http.Header
+		body   string
+	}{
+		{
+			name:   "200 with future reset and remaining 4999",
+			status: http.StatusOK,
+			header: header("x-ratelimit-reset", reset, "x-ratelimit-remaining", "4999"),
+			body:   `{"data":{"viewer":{"login":"octocat"}}}`,
+		},
+		{
+			name:   "200 with future reset and no remaining header",
+			status: http.StatusOK,
+			header: header("x-ratelimit-reset", reset),
+			body:   `{"data":{}}`,
+		},
+		{
+			name:   "200 with bare body reset",
+			status: http.StatusOK,
+			body:   `{"data":{},"reset":` + reset + `}`,
+		},
+		{
+			name:   "200 with graphql errors but remaining 4999",
+			status: http.StatusOK,
+			header: header("x-ratelimit-reset", reset, "x-ratelimit-remaining", "4999"),
+			body:   `{"errors":[{"message":"bad query"}]}`,
+		},
+		{
+			name:   "403 with future reset and remaining 4999",
+			status: http.StatusForbidden,
+			header: header("x-ratelimit-reset", reset, "x-ratelimit-remaining", "4999"),
+			body:   `{"message":"Resource not accessible by integration"}`,
+		},
+		{
+			name:   "403 with bare body reset",
+			status: http.StatusForbidden,
+			body:   `{"reset":` + reset + `}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := n.Normalize(tc.status, tc.header, []byte(tc.body))
+			if !reflect.DeepEqual(got, Result{}) {
+				t.Fatalf("Normalize = %+v, want empty Result", got)
 			}
 		})
 	}
@@ -166,10 +238,10 @@ func TestNormalizeHeaderOverridesBody(t *testing.T) {
 			wantRetryAfter: (90 * time.Second).Milliseconds() + jitter.Milliseconds(),
 		},
 		{
-			name:           "x-ratelimit-reset header beats body reset",
+			name:           "x-ratelimit-reset header beats body retry hint",
 			status:         http.StatusOK,
-			header:         header("x-ratelimit-reset", strconv.FormatInt(now.Add(90*time.Second).Unix(), 10)),
-			body:           `{"reset":` + strconv.FormatInt(now.Add(5*time.Second).Unix(), 10) + `}`,
+			header:         header("x-ratelimit-remaining", "0", "x-ratelimit-reset", strconv.FormatInt(now.Add(90*time.Second).Unix(), 10)),
+			body:           `{"retry_after":5}`,
 			wantRetryAfter: (90 * time.Second).Milliseconds() + jitter.Milliseconds(),
 		},
 	}

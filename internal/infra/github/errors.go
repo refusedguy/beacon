@@ -1,11 +1,12 @@
 // Package github holds the GitHub adapter for Beacon.
 //
 // This file normalizes GitHub error responses into the shared domain.AppError
-// shape. Three sources funnel into RATE_LIMITED: GraphQL 200-with-errors with
-// x-ratelimit-remaining:0, REST 403/429, and the secondary limit carried by
-// retry-after or x-ratelimit-reset. Server timeouts (502/504) are a retry
-// decision with backoff, not an AppError. Header values are authoritative
-// over hints in the response body.
+// shape. Three sources produce RATE_LIMITED: GraphQL 200-with-errors with
+// x-ratelimit-remaining:0, REST 403/429 with an explicit retry signal, and the
+// secondary limit carried by retry-after. x-ratelimit-reset is the hourly
+// window reset GitHub sends on every response. It applies only with
+// x-ratelimit-remaining:0. Server timeouts (502/504) are a retry decision with
+// backoff, not an AppError. Header values are authoritative over body hints.
 //
 // The second half of the file is the cross-platform CI status adapter
 // (ADR 0039 §3, T3.62). Three providers expose different payloads; each
@@ -198,20 +199,24 @@ func (n *Normalizer) retryAfterMs(base time.Duration) *int64 {
 	return &ms
 }
 
-// delay returns the wait before retrying. x-ratelimit-* and retry-after
-// headers take priority over hints in the body, matching ADR 0013.
+// delay returns the wait before retrying. Explicit retry signals take priority
+// over body hints, matching ADR 0013. A bare x-ratelimit-reset is the window
+// reset GitHub sends on every response, not a rate-limit signal.
 func (n *Normalizer) delay(header http.Header, body []byte) time.Duration {
 	if d := headerDelay(header, n.nowOr()()); d > 0 {
 		return d
 	}
-	return bodyDelay(body, n.nowOr()())
+	return bodyDelay(body)
 }
 
+// rateLimitSignaled reports whether a 403 carries a real rate-limit signal.
+// x-ratelimit-reset is present on every GitHub response, so it never signals a
+// limit on its own; a plain 403 stays unclassified without retry-after,
+// remaining:0 or an explicit body hint.
 func rateLimitSignaled(header http.Header, body []byte) bool {
 	return headerValue(header, "retry-after") != "" ||
-		headerValue(header, "x-ratelimit-reset") != "" ||
 		remainingIsZero(header) ||
-		bodyDelay(body, time.Now()) > 0
+		bodyDelay(body) > 0
 }
 
 func remainingIsZero(header http.Header) bool {
@@ -228,13 +233,16 @@ func hasGraphQLErrors(body []byte) bool {
 	return len(doc.Errors) > 0
 }
 
+// headerDelay reads the wait from response headers. retry-after is an explicit
+// secondary-limit signal. x-ratelimit-reset is only the end of the current
+// window, so it is used only when x-ratelimit-remaining is 0.
 func headerDelay(h http.Header, now time.Time) time.Duration {
 	if v := headerValue(h, "retry-after"); v != "" {
 		if sec, err := strconv.Atoi(v); err == nil && sec > 0 {
 			return time.Duration(sec) * time.Second
 		}
 	}
-	if v := headerValue(h, "x-ratelimit-reset"); v != "" {
+	if v := headerValue(h, "x-ratelimit-reset"); v != "" && remainingIsZero(h) {
 		if sec, err := strconv.ParseInt(v, 10, 64); err == nil {
 			if d := time.Unix(sec, 0).Sub(now); d > 0 {
 				return d
@@ -244,11 +252,13 @@ func headerDelay(h http.Header, now time.Time) time.Duration {
 	return 0
 }
 
-func bodyDelay(body []byte, now time.Time) time.Duration {
+// bodyDelay reads only explicit retry hints from the body. A bare reset is the
+// window reset time and carries no sign of exhaustion, so it is ignored here.
+// headerDelay handles reset once x-ratelimit-remaining is 0.
+func bodyDelay(body []byte) time.Duration {
 	var doc struct {
 		RetryAfter   *float64 `json:"retry_after"`
 		RetryAfterMs *int64   `json:"retryAfterMs"`
-		Reset        int64    `json:"reset"`
 	}
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return 0
@@ -258,11 +268,6 @@ func bodyDelay(body []byte, now time.Time) time.Duration {
 	}
 	if doc.RetryAfterMs != nil && *doc.RetryAfterMs > 0 {
 		return time.Duration(*doc.RetryAfterMs) * time.Millisecond
-	}
-	if doc.Reset > 0 {
-		if d := time.Unix(doc.Reset, 0).Sub(now); d > 0 {
-			return d
-		}
 	}
 	return 0
 }
