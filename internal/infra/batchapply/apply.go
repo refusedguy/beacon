@@ -75,6 +75,9 @@ const (
 	renumberReportFormat = "перенумеровать ADR %d в %d\n"
 	skipReportFormat     = "пропуск %s\n"
 	warnReportFormat     = "предупреждение: не найдена цель закрытия %s\n"
+	// HD-088 (ADR 0313): a number with no source has no owner and breaks the
+	// card. The line is Russian prose, so it keeps the interface scope.
+	factProblemFormat = "число без владельца: %s\n"
 )
 
 // Options mirrors the command line of cmd/batch-apply.
@@ -85,6 +88,7 @@ type Options struct {
 	MergePlan bool
 	Quiet     bool
 	Commit    bool
+	Facts     bool
 }
 
 type batch struct {
@@ -92,6 +96,7 @@ type batch struct {
 	ADRs           []adr           `json:"adrs"`
 	Cards          []card          `json:"cards"`
 	Evals          []evalCase      `json:"evals"`
+	Facts          []fact          `json:"facts"`
 	MergeDecisions []mergeDecision `json:"merge_decisions"`
 	CardClosures   []cardClosure   `json:"card_closures"`
 }
@@ -144,6 +149,13 @@ type cardClosure struct {
 	Reason   string `json:"reason"`
 }
 
+// fact is a number declared by a research batch together with the path that
+// owns it. A fact without a source has no owner and fails the check (HD-088).
+type fact struct {
+	Value  string `json:"value"`
+	Source string `json:"source"`
+}
+
 type ghCheck struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
@@ -154,6 +166,13 @@ type ghCheck struct {
 type artifactEntry struct {
 	path    string
 	content string
+}
+
+// factEntry pairs a number with the artifact that owns it. Two artifacts that
+// print the same number produce two rows, so a copy can point at a source.
+type factEntry struct {
+	value string
+	owner string
 }
 
 // iterationHash returns the SHA-256 of the artifact set produced by one
@@ -172,7 +191,71 @@ func iterationHash(entries []artifactEntry) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-var nonSlug = regexp.MustCompile(`[^a-z0-9]+`)
+var (
+	nonSlug    = regexp.MustCompile(`[^a-z0-9]+`)
+	factNumber = regexp.MustCompile(`\b[0-9]+(?:\.[0-9]+)?\b`)
+)
+
+// declaredFactProblems returns the values of facts that carry no source. The
+// acceptance rule for HD-088 is that a number without an owner fails the card.
+func declaredFactProblems(facts []fact) []string {
+	var bad []string
+	for _, f := range facts {
+		if f.Value == "" || f.Source == "" {
+			bad = append(bad, f.Value)
+		}
+	}
+	return bad
+}
+
+// collectFacts maps every number in the iteration artifacts to the path that
+// owns it, then adds numbers declared by the batches. Sorting by value and
+// path makes the index reproducible, so the same inputs give the same hash.
+func collectFacts(entries []artifactEntry, declared []fact) []factEntry {
+	seen := map[factEntry]bool{}
+	var facts []factEntry
+	add := func(value, owner string) {
+		if value == "" || owner == "" {
+			return
+		}
+		f := factEntry{value: value, owner: filepath.ToSlash(owner)}
+		if seen[f] {
+			return
+		}
+		seen[f] = true
+		facts = append(facts, f)
+	}
+	for _, e := range entries {
+		for _, value := range factNumber.FindAllString(e.content, -1) {
+			add(value, e.path)
+		}
+	}
+	for _, f := range declared {
+		add(f.Value, f.Source)
+	}
+	sort.Slice(facts, func(i, j int) bool {
+		if facts[i].value != facts[j].value {
+			return facts[i].value < facts[j].value
+		}
+		return facts[i].owner < facts[j].owner
+	})
+	return facts
+}
+
+// renderFacts builds docs/FACTS.md. Each row links a number to the file that
+// owns it, so a copy in another document can name its source. Artifacts and
+// prose stay in Russian; paths and numbers are technical tokens.
+func renderFacts(facts []factEntry) string {
+	var b strings.Builder
+	b.WriteString("# Факты\n\n")
+	b.WriteString("Владелец числа - файл, где оно напечатано. Копия числа ссылается на этого владельца.\n\n")
+	b.WriteString("| Число | Владелец |\n| --- | --- |\n")
+	for _, f := range facts {
+		link := strings.TrimPrefix(f.owner, "docs/")
+		b.WriteString("| " + f.value + " | [" + f.owner + "](" + link + ") |\n")
+	}
+	return b.String()
+}
 
 // runner keeps the output streams and options together so the pure rendering
 // helpers stay free of I/O state.
@@ -459,6 +542,17 @@ func Run(opts Options, out, errOut io.Writer) int {
 		return 1
 	}
 	batches, problems := loadBatches(opts.Dir)
+	var declaredFacts []fact
+	for _, b := range batches {
+		declaredFacts = append(declaredFacts, b.Facts...)
+	}
+	badFacts := declaredFactProblems(declaredFacts)
+	if len(badFacts) > 0 {
+		for _, value := range badFacts {
+			r.errf(factProblemFormat, value)
+		}
+		return 1
+	}
 	if opts.MergePlan {
 		var decisions []mergeDecision
 		for _, b := range batches {
@@ -569,6 +663,17 @@ func Run(opts Options, out, errOut io.Writer) int {
 		})
 	}
 
+	facts := collectFacts(entries, declaredFacts)
+	factsDoc := renderFacts(facts)
+	if opts.Facts {
+		r.printf("%s", factsDoc)
+		return 0
+	}
+	entries = append(entries, artifactEntry{
+		path:    filepath.Join("docs", "FACTS.md"),
+		content: factsDoc,
+	})
+
 	r.printf(summaryReportFormat,
 		len(batches), len(adrs), len(cards), len(evals), len(closures))
 	r.printf(hashReportFormat, iterationHash(entries))
@@ -584,7 +689,7 @@ func Run(opts Options, out, errOut io.Writer) int {
 	}
 
 	if opts.Commit && !opts.DryRun {
-		cmd := exec.Command("git", "add", "docs/adrs", "docs/tasks", "docs/evals")
+		cmd := exec.Command("git", "add", "docs/adrs", "docs/tasks", "docs/evals", "docs/FACTS.md")
 		cmd.Dir = root
 		if err := cmd.Run(); err != nil {
 			r.errf("%v\n", err)
