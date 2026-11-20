@@ -44,31 +44,32 @@ func ParseLevel(raw string) (Level, bool) {
 // Field names of one event. Keeping the keys here avoids typos in what an
 // operator greps for.
 const (
-	FieldEvent     = "event"
-	FieldWatchID   = "watchID"
-	FieldPR        = "pr"
-	FieldVerdict   = "verdict"
-	FieldAdapter   = "adapter"
-	FieldDuration  = "duration"
-	FieldError     = "error"
-	FieldRevision  = "revision"
-	FieldActor     = "actor"
-	FieldReason    = "reason"
-	FieldStatus    = "status"
-	FieldCommand   = "command"
-	FieldWatches   = "watches"
-	FieldReady     = "ready"
-	FieldRetry     = "retry"
-	FieldMerges    = "merges"
-	FieldWakes     = "wakes"
-	FieldRefs      = "refs"
-	FieldCount     = "count"
-	FieldUpdated   = "updated"
-	FieldSkipped   = "skipped"
-	FieldCycleID   = "cycleID"
-	FieldBlockerID = "blockerID"
-	FieldPoints    = "points"
-	FieldRole      = "role"
+	FieldEvent        = "event"
+	FieldWatchID      = "watchID"
+	FieldPR           = "pr"
+	FieldVerdict      = "verdict"
+	FieldAdapter      = "adapter"
+	FieldDuration     = "duration"
+	FieldError        = "error"
+	FieldRevision     = "revision"
+	FieldActor        = "actor"
+	FieldReason       = "reason"
+	FieldStatus       = "status"
+	FieldCommand      = "command"
+	FieldWatches      = "watches"
+	FieldReady        = "ready"
+	FieldRetry        = "retry"
+	FieldMerges       = "merges"
+	FieldWakes        = "wakes"
+	FieldRefs         = "refs"
+	FieldCount        = "count"
+	FieldUpdated      = "updated"
+	FieldSkipped      = "skipped"
+	FieldCycleID      = "cycleID"
+	FieldBlockerID    = "blockerID"
+	FieldPoints       = "points"
+	FieldRole         = "role"
+	FieldFailedChecks = "failedChecks"
 )
 
 // Event names of the blocker and auto-merge transitions reported by the
@@ -354,6 +355,19 @@ func Cycle(s CycleStats) {
 
 // VerdictPublished records a verdict the bridge published to the store.
 func VerdictPublished(verdict, watchID string, pr int, revision ...uint64) {
+	var rev uint64
+	if len(revision) != 0 {
+		rev = revision[0]
+	}
+	VerdictPublishedWithChecks(verdict, watchID, pr, rev, nil)
+}
+
+// VerdictPublishedWithChecks records a verdict together with the names of the
+// checks that failed it. The names are sorted so one set of failures always
+// produces the same log line, which makes an incident readable without a grep
+// across the bridge's own diagnostics. An empty list omits the field, so callers
+// without failed checks keep the exact previous event shape.
+func VerdictPublishedWithChecks(verdict, watchID string, pr int, revision uint64, failed []string) {
 	s := Default()
 	s.Inc(CounterVerdictPublished, verdict)
 	cycles.note(func(c *cycleTracker) {
@@ -364,8 +378,13 @@ func VerdictPublished(verdict, watchID string, pr int, revision ...uint64) {
 		}
 	})
 	fields := Fields{FieldVerdict: verdict, FieldWatchID: watchID, FieldPR: pr}
-	if len(revision) != 0 {
-		fields[FieldRevision] = revision[0]
+	if revision != 0 {
+		fields[FieldRevision] = revision
+	}
+	if len(failed) != 0 {
+		names := append([]string(nil), failed...)
+		sort.Strings(names)
+		fields[FieldFailedChecks] = names
 	}
 	s.Log(LevelInfo, "verdict_published", fields)
 }

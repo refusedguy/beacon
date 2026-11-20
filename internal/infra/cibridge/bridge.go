@@ -807,7 +807,7 @@ func (b *Bridge) publishActionable(ctx context.Context, w domain.Watch, obs ciOb
 		}
 		b.wakeOne(ctx, next, sub, text, now, cycleID, true)
 	}
-	observe.VerdictPublished(string(verdict), next.ID, next.PR, next.Revision)
+	observe.VerdictPublishedWithChecks(string(verdict), next.ID, next.PR, next.Revision, realFailedNames(obs.pr.Checks))
 	b.cycleEvent(cycleID, "verdict", observe.Fields{
 		"watchID": next.ID, "verdict": string(verdict), "revision": next.Revision,
 	})
@@ -1117,7 +1117,7 @@ func (b *Bridge) applyBlocked(ctx context.Context, w domain.Watch, obs ciObserva
 		}
 	}
 	if b.notifyBlocked(ctx, next, dedup, now, cycleID) {
-		observe.VerdictPublished(string(domain.VerdictBlocked), next.ID, next.PR, next.Revision)
+		observe.VerdictPublishedWithChecks(string(domain.VerdictBlocked), next.ID, next.PR, next.Revision, failed)
 	}
 	b.cycleEvent(cycleID, "block", observe.Fields{
 		"watchID": next.ID, "blockerID": next.BlockerID, "failedChecks": failed,
