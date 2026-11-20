@@ -20,6 +20,12 @@ import (
 // port. Tests replace it to exercise the command without a real state dir.
 var serverLease server.Acquirer = server.NewManager()
 
+// serverReadiness gates the health endpoint for the beacon server process.
+// It starts not-ready so /healthz answers 503 during startup and only flips
+// to 200 once the single-instance lease and channel boundary are in place
+// (BS.3, E01).
+var serverReadiness = &server.Readiness{}
+
 const (
 	// channelEnabledEnv is the opt-in for inbound channel commands. An unset
 	// or false value leaves the ingress silent, so a stock server accepts no
@@ -148,5 +154,11 @@ func serverRunner(errOut io.Writer) int {
 	if cfg.Enabled {
 		fmt.Fprintf(errOut, "beacon server: channel ingress enabled senders=%d\n", len(cfg.Senders))
 	}
+
+	// BS.3: startup is complete, so a mounted /healthz switches from 503 to
+	// 200. Until this point the readiness gate keeps answering 503, so a
+	// caller polling during startup cannot mistake this process for ready.
+	serverReadiness.MarkReady()
+
 	return mcpRunner(errOut)
 }
