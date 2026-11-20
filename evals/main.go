@@ -81,7 +81,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 15)
+	results := make([]evalResult, 0, 20)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -544,6 +544,33 @@ func run() int {
 		identityAckOK
 	record("15_real_store_wake_identity", identityExpected, identityActual, identityPass)
 
+	// eval W14-W18: исполняемый контракт авто-мерж-цикла из ADR 0072.
+	// Модель, негативные контроли и причины описаны в evals/README.md.
+	w14Actual, w14Pass := evalW14DefaultAutoMerge()
+	record("W14_default_auto_merge",
+		"пустая политика мержит по ready; явный autoMerge=false и не-ready не мержат",
+		w14Actual, w14Pass)
+
+	w15Actual, w15Pass := evalW15RequireApproval()
+	record("W15_require_approval",
+		"requireApproval без одобрения блокирует; с одобрением и без политики мержит",
+		w15Actual, w15Pass)
+
+	w16Actual, w16Pass := evalW16WaitConditions()
+	record("W16_wait_conditions",
+		"waitFor и waitForMain блокируют, пока зависимости и сам PR не в main",
+		w16Actual, w16Pass)
+
+	w17Actual, w17Pass := evalW17MergeIdempotency()
+	record("W17_merge_idempotency",
+		"повтор пары watchID:revision не мержит; новая ревизия или watchID мержат",
+		w17Actual, w17Pass)
+
+	w18Actual, w18Pass := evalW18RebaseConflictWake()
+	record("W18_rebase_conflict_wake",
+		"конфликт ребейза шлёт wake подписавшемуся через adapter, мержа нет",
+		w18Actual, w18Pass)
+
 	printTable(results)
 	passed, failed := 0, 0
 	for _, r := range results {
@@ -578,6 +605,289 @@ func shipReadySnapshot(ship domain.ShipFacts) domain.Snapshot {
 		SuitesValid: true,
 		Ship:        ship,
 	}
+}
+
+// ---- ADR 0072: исполняемый контракт авто-мерж-цикла ----
+//
+// Модель ниже фиксирует решение ADR 0072 в виде чистых функций.
+// Производственного кода для мержа ещё нет, поэтому eval проверяет контракт
+// на эталонной модели, а не подменяет реализацию заглушкой с верным ответом.
+// Карточки T3.231, T3.232 и T3.233 переносят проверку на реальный код,
+// сохраняя названия кейсов и негативные контроли.
+
+// mergePolicy повторяет политику Watch из ADR 0072. Nil AutoMerge это дефолт.
+type mergePolicy struct {
+	AutoMerge       *bool
+	RequireApproval bool
+	WaitFor         []string
+	WaitForMain     bool
+}
+
+// mergeRequest фиксирует факты, по которым тулза решает мерж по verdict=ready.
+type mergeRequest struct {
+	WatchID        string
+	Revision       uint64
+	Verdict        domain.Verdict
+	Approved       bool
+	InMain         map[string]bool
+	RebaseConflict bool
+	IsWatchPR      bool
+	Subscribers    []mergeSubscriber
+}
+
+// mergeSubscriber это подписавшийся Watch, который получит wake при ребейзе.
+type mergeSubscriber struct {
+	Adapter string
+	Target  string
+}
+
+type mergeAction string
+
+const (
+	mergeActionMerge mergeAction = "merge"
+	mergeActionNoop  mergeAction = "noop"
+	mergeActionBlock mergeAction = "blocked"
+	mergeActionWake  mergeAction = "wake"
+	mergeActionHold  mergeAction = "hold"
+)
+
+type mergeOutcome struct {
+	Action mergeAction
+	Reason string
+	Target string
+}
+
+// mergeLedger хранит уже выполненные мержи по ключу watchID:revision.
+type mergeLedger struct {
+	Merged map[string]uint64
+}
+
+func newMergeRequest(watchID string) mergeRequest {
+	return mergeRequest{
+		WatchID:     watchID,
+		Revision:    3,
+		Verdict:     domain.VerdictReady,
+		IsWatchPR:   true,
+		Subscribers: []mergeSubscriber{{Adapter: "opencode", Target: "T3.232"}},
+	}
+}
+
+func newMergeLedger() *mergeLedger {
+	return &mergeLedger{Merged: map[string]uint64{}}
+}
+
+func (l *mergeLedger) key(watchID string, revision uint64) string {
+	return fmt.Sprintf("%s:%d", watchID, revision)
+}
+
+func (l *mergeLedger) Count() int {
+	return len(l.Merged)
+}
+
+func autoMergeEnabled(p mergePolicy) bool {
+	return p.AutoMerge == nil || *p.AutoMerge
+}
+
+// decideMerge это эталонная реализация решения ADR 0072. Он не меняет req и
+// пишет в ledger только при фактическом мерже.
+func decideMerge(p mergePolicy, req mergeRequest, ledger *mergeLedger, registry map[string]func(string)) mergeOutcome {
+	if req.Verdict == domain.VerdictRebase {
+		if !req.IsWatchPR {
+			return mergeOutcome{Action: mergeActionHold, Reason: "rebase_not_watch_pr"}
+		}
+		if len(req.Subscribers) == 0 {
+			return mergeOutcome{Action: mergeActionWake, Reason: "no_subscriber"}
+		}
+		sub := req.Subscribers[0]
+		reason := "rebase_verdict"
+		if req.RebaseConflict {
+			reason = "rebase_conflict"
+		}
+		target := sub.Adapter + ":" + sub.Target
+		deliver, ok := registry[sub.Adapter]
+		if !ok || deliver == nil {
+			return mergeOutcome{Action: mergeActionWake, Reason: "adapter_unavailable", Target: target}
+		}
+		deliver(sub.Target)
+		return mergeOutcome{Action: mergeActionWake, Reason: reason, Target: target}
+	}
+	if req.Verdict != domain.VerdictReady {
+		return mergeOutcome{Action: mergeActionHold, Reason: "verdict=" + string(req.Verdict)}
+	}
+	if !autoMergeEnabled(p) {
+		return mergeOutcome{Action: mergeActionBlock, Reason: "auto_merge_disabled"}
+	}
+	if p.RequireApproval && !req.Approved {
+		return mergeOutcome{Action: mergeActionBlock, Reason: "require_approval"}
+	}
+	for _, dep := range p.WaitFor {
+		if !req.InMain[dep] {
+			return mergeOutcome{Action: mergeActionBlock, Reason: "wait_for:" + dep}
+		}
+	}
+	if p.WaitForMain && !req.InMain[req.WatchID] {
+		return mergeOutcome{Action: mergeActionBlock, Reason: "wait_for_main"}
+	}
+	key := ledger.key(req.WatchID, req.Revision)
+	if _, ok := ledger.Merged[key]; ok {
+		return mergeOutcome{Action: mergeActionNoop, Reason: "already_merged"}
+	}
+	ledger.Merged[key] = req.Revision
+	return mergeOutcome{Action: mergeActionMerge, Reason: "ready"}
+}
+
+func mergeActionText(o mergeOutcome) string {
+	return string(o.Action) + ":" + o.Reason
+}
+
+// evalW14DefaultAutoMerge проверяет дефолт: пустая политика мержит по ready.
+// Негативный контроль задаёт autoMerge=false и возвращает не-ready вердикт.
+func evalW14DefaultAutoMerge() (string, bool) {
+	req := newMergeRequest("watch:W14")
+	ledger := newMergeLedger()
+	got := decideMerge(mergePolicy{}, req, ledger, nil)
+
+	off := false
+	offReq := newMergeRequest("watch:W14-off")
+	offLedger := newMergeLedger()
+	blocked := decideMerge(mergePolicy{AutoMerge: &off}, offReq, offLedger, nil)
+
+	holdReq := newMergeRequest("watch:W14-hold")
+	holdReq.Verdict = domain.VerdictWatching
+	holdLedger := newMergeLedger()
+	held := decideMerge(mergePolicy{}, holdReq, holdLedger, nil)
+
+	actual := fmt.Sprintf("default=%s ledger=%d, off=%s ledger=%d, watching=%s ledger=%d",
+		mergeActionText(got), ledger.Count(), mergeActionText(blocked), offLedger.Count(),
+		mergeActionText(held), holdLedger.Count())
+	pass := got.Action == mergeActionMerge && ledger.Count() == 1 &&
+		blocked.Action == mergeActionBlock && blocked.Reason == "auto_merge_disabled" && offLedger.Count() == 0 &&
+		held.Action == mergeActionHold && holdLedger.Count() == 0
+	return actual, pass
+}
+
+// evalW15RequireApproval проверяет, что одобрение блокирует мерж только когда
+// политика его требует. Без требования та же заявка без одобрения мержит.
+func evalW15RequireApproval() (string, bool) {
+	pol := mergePolicy{RequireApproval: true}
+
+	req := newMergeRequest("watch:W15")
+	blockedLedger := newMergeLedger()
+	blocked := decideMerge(pol, req, blockedLedger, nil)
+
+	approvedReq := newMergeRequest("watch:W15-approved")
+	approvedReq.Approved = true
+	approvedLedger := newMergeLedger()
+	approved := decideMerge(pol, approvedReq, approvedLedger, nil)
+
+	noPolReq := newMergeRequest("watch:W15-no-policy")
+	noPolLedger := newMergeLedger()
+	noPol := decideMerge(mergePolicy{}, noPolReq, noPolLedger, nil)
+
+	actual := fmt.Sprintf("without-approval=%s ledger=%d, approved=%s ledger=%d, no-policy=%s ledger=%d",
+		mergeActionText(blocked), blockedLedger.Count(), mergeActionText(approved), approvedLedger.Count(),
+		mergeActionText(noPol), noPolLedger.Count())
+	pass := blocked.Action == mergeActionBlock && blocked.Reason == "require_approval" && blockedLedger.Count() == 0 &&
+		approved.Action == mergeActionMerge && approvedLedger.Count() == 1 &&
+		noPol.Action == mergeActionMerge && noPolLedger.Count() == 1
+	return actual, pass
+}
+
+// evalW16WaitConditions проверяет граф waitFor и условие «в main» waitForMain.
+// Негативный контроль убирает оба условия при том же пустом наборе InMain.
+func evalW16WaitConditions() (string, bool) {
+	const dep = "watch:W16-dep"
+	pol := mergePolicy{WaitFor: []string{dep}, WaitForMain: true}
+
+	req := newMergeRequest("watch:W16")
+	req.InMain = map[string]bool{}
+	depLedger := newMergeLedger()
+	waitFor := decideMerge(pol, req, depLedger, nil)
+
+	req.InMain[dep] = true
+	mainLedger := newMergeLedger()
+	waitMain := decideMerge(pol, req, mainLedger, nil)
+
+	req.InMain[req.WatchID] = true
+	readyLedger := newMergeLedger()
+	ready := decideMerge(pol, req, readyLedger, nil)
+
+	noWaitReq := newMergeRequest("watch:W16-no-wait")
+	noWaitReq.InMain = map[string]bool{}
+	noWaitLedger := newMergeLedger()
+	noWait := decideMerge(mergePolicy{}, noWaitReq, noWaitLedger, nil)
+
+	actual := fmt.Sprintf("waitFor=%s, waitForMain=%s, both-in-main=%s ledger=%d, no-gates=%s ledger=%d",
+		mergeActionText(waitFor), mergeActionText(waitMain), mergeActionText(ready), readyLedger.Count(),
+		mergeActionText(noWait), noWaitLedger.Count())
+	pass := waitFor.Action == mergeActionBlock && waitFor.Reason == "wait_for:"+dep && depLedger.Count() == 0 &&
+		waitMain.Action == mergeActionBlock && waitMain.Reason == "wait_for_main" && mainLedger.Count() == 0 &&
+		ready.Action == mergeActionMerge && readyLedger.Count() == 1 &&
+		noWait.Action == mergeActionMerge && noWaitLedger.Count() == 1
+	return actual, pass
+}
+
+// evalW17MergeIdempotency проверяет ключ watchID:revision. Повтор не пишет
+// вторую запись, а новая ревизия и другой watchID создают новые записи.
+func evalW17MergeIdempotency() (string, bool) {
+	req := newMergeRequest("watch:W17")
+	ledger := newMergeLedger()
+	first := decideMerge(mergePolicy{}, req, ledger, nil)
+	repeat := decideMerge(mergePolicy{}, req, ledger, nil)
+
+	nextReq := req
+	nextReq.Revision = req.Revision + 1
+	next := decideMerge(mergePolicy{}, nextReq, ledger, nil)
+
+	otherReq := newMergeRequest("watch:W17-other")
+	other := decideMerge(mergePolicy{}, otherReq, ledger, nil)
+
+	actual := fmt.Sprintf("first=%s, repeat=%s, rev+1=%s, other-watch=%s, ledger=%d",
+		mergeActionText(first), mergeActionText(repeat), mergeActionText(next),
+		mergeActionText(other), ledger.Count())
+	pass := first.Action == mergeActionMerge &&
+		repeat.Action == mergeActionNoop && repeat.Reason == "already_merged" &&
+		next.Action == mergeActionMerge && other.Action == mergeActionMerge && ledger.Count() == 3
+	return actual, pass
+}
+
+// evalW18RebaseConflictWake проверяет, что конфликт ребейза не разрешается
+// тулзой: она шлёт wake подписавшемуся через реестр adapter и не мержит.
+// Негативные контроли покрывают неизвестный adapter, не-watch PR и ready.
+func evalW18RebaseConflictWake() (string, bool) {
+	calls := make([]string, 0, 1)
+	registry := map[string]func(string){
+		"opencode": func(target string) { calls = append(calls, target) },
+	}
+
+	req := newMergeRequest("watch:W18")
+	req.Verdict = domain.VerdictRebase
+	req.RebaseConflict = true
+	ledger := newMergeLedger()
+	got := decideMerge(mergePolicy{}, req, ledger, registry)
+
+	badRegistry := map[string]func(string){"other": func(string) {}}
+	badLedger := newMergeLedger()
+	bad := decideMerge(mergePolicy{}, req, badLedger, badRegistry)
+
+	notWatchReq := req
+	notWatchReq.IsWatchPR = false
+	notWatchLedger := newMergeLedger()
+	notWatch := decideMerge(mergePolicy{}, notWatchReq, notWatchLedger, registry)
+
+	readyReq := newMergeRequest("watch:W18-ready")
+	readyLedger := newMergeLedger()
+	ready := decideMerge(mergePolicy{}, readyReq, readyLedger, registry)
+
+	actual := fmt.Sprintf("rebase=%s target=%s calls=%v ledger=%d, unknown=%s ledger=%d, not-watch-pr=%s, ready=%s ledger=%d",
+		mergeActionText(got), orNone(got.Target), calls, ledger.Count(), mergeActionText(bad), badLedger.Count(),
+		mergeActionText(notWatch), mergeActionText(ready), readyLedger.Count())
+	pass := got.Action == mergeActionWake && got.Reason == "rebase_conflict" &&
+		got.Target == "opencode:T3.232" && len(calls) == 1 && calls[0] == "T3.232" && ledger.Count() == 0 &&
+		bad.Action == mergeActionWake && bad.Reason == "adapter_unavailable" && badLedger.Count() == 0 &&
+		notWatch.Action == mergeActionHold && notWatch.Reason == "rebase_not_watch_pr" && notWatchLedger.Count() == 0 &&
+		ready.Action == mergeActionMerge && readyLedger.Count() == 1
+	return actual, pass
 }
 
 // verdictBaselineCase — один канонический сценарий для измерения регрессии.
