@@ -119,6 +119,7 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	}
 	if _, duplicate := d.seen[key]; duplicate {
 		d.mu.Unlock()
+		observe.WakeDuplicate(p.WatchID, p.Revision)
 		return nil
 	}
 	d.mu.Unlock()
@@ -142,6 +143,7 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 		o, err := d.Obligations.Obligation(p.ObligationID)
 		if err == nil && !o.DeliveredAt.IsZero() {
 			d.remember(key)
+			observe.WakeDuplicate(p.WatchID, p.Revision)
 			return nil
 		}
 		if err != nil && !isObligationMissing(err) {
