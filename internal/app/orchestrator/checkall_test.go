@@ -111,10 +111,32 @@ func TestBuildChecksQueryHasOneAliasPerPR(t *testing.T) {
 		`p0: repository(owner:"refusedguy", name:"beacon")`,
 		`p1: repository(owner:"refusedguy", name:"beacon")`,
 		"pullRequest(number:3)", "pullRequest(number:7)",
-		"statusCheckRollup", "... on CheckRun", "... on StatusContext",
+		"statusCheckRollup",
+		"... on CheckRun { name conclusion status }",
+		"... on StatusContext { context state }",
 	} {
 		if !strings.Contains(q, want) {
 			t.Fatalf("query missing %q:\n%s", want, q)
+		}
+	}
+	if strings.Contains(q, "conclusion state") {
+		t.Fatalf("CheckRun fragment asks for nonexistent state field:\n%s", q)
+	}
+}
+
+func TestCheckFromNodeUsesStatusForCheckRun(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want Check
+	}{
+		{`{"__typename":"CheckRun","name":"build","conclusion":"SUCCESS","status":"COMPLETED"}`, Check{Name: "build", Conclusion: "SUCCESS"}},
+		{`{"__typename":"CheckRun","name":"build","status":"IN_PROGRESS"}`, Check{Name: "build", Conclusion: "PENDING"}},
+		{`{"__typename":"StatusContext","context":"lint","state":"FAILURE"}`, Check{Name: "lint", Conclusion: "FAILURE"}},
+	}
+	for _, tc := range cases {
+		got, ok := checkFromNode([]byte(tc.raw))
+		if !ok || got != tc.want {
+			t.Fatalf("checkFromNode(%s) = %+v, %v, want %+v", tc.raw, got, ok, tc.want)
 		}
 	}
 }
