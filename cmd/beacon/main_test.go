@@ -646,7 +646,7 @@ func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
 
 	installOpenCodePorts(port)
 
-	if src, ok := watchLiveSource.(*liveOpencodeSource); !ok || src.port != port.t3145Port {
+	if src, ok := watchLiveSource.(*liveOpencodeSource); !ok || src.port != port {
 		t.Fatalf("live source = %#v, want adapter over the client", watchLiveSource)
 	}
 	if spawnSessionSpawner != port {
