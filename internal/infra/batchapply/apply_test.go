@@ -187,8 +187,10 @@ func TestApplyClosuresWritesAndIsIdempotent(t *testing.T) {
 }
 
 // TestReportFormatContract pins the exact report lines batch-apply prints
-// (HD-039). Each line carries only fields in a fixed order. A label prefix,
-// trailing prose or an arrow for a word adds extra words and breaks the style.
+// (HD-039 for style, HD-053 for language). Structured lines carry English keys
+// in a fixed order. Prose lines address the operator in Russian. A label
+// prefix, trailing prose or an arrow for a word adds extra words and breaks the
+// style.
 func TestReportFormatContract(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -199,9 +201,9 @@ func TestReportFormatContract(t *testing.T) {
 		{"check", checkReportFormat, []any{3, 1}, "valid=3 invalid=1\n"},
 		{"summary", summaryReportFormat, []any{2, 3, 4, 5, 6}, "batches=2 adrs=3 cards=4 evals=5 closures=6\n"},
 		{"merge", mergeReportFormat, []any{2, 1}, "merged=2 held=1\n"},
-		{"renumber", renumberReportFormat, []any{7, 265}, "renumber ADR 7 to 265\n"},
-		{"skip", skipReportFormat, []any{"bad.json: invalid JSON"}, "skip bad.json: invalid JSON\n"},
-		{"warn", warnReportFormat, []any{"docs/tasks/W5-42.md"}, "warn closure target missing: docs/tasks/W5-42.md\n"},
+		{"renumber", renumberReportFormat, []any{7, 265}, "перенумеровать ADR 7 в 265\n"},
+		{"skip", skipReportFormat, []any{"bad.json: неверный JSON"}, "пропуск bad.json: неверный JSON\n"},
+		{"warn", warnReportFormat, []any{"docs/tasks/W5-42.md"}, "предупреждение: не найдена цель закрытия docs/tasks/W5-42.md\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -260,7 +262,123 @@ func TestCheckReportOutput(t *testing.T) {
 	if got, want := out.String(), "valid=1 invalid=1\n"; got != want {
 		t.Fatalf("stdout = %q, want %q", got, want)
 	}
-	if got := errOut.String(); !strings.HasPrefix(got, "skip bad.json: invalid JSON") {
-		t.Fatalf("stderr = %q, want a concise skip line", got)
+	if got := errOut.String(); !strings.HasPrefix(got, "пропуск bad.json: неверный JSON") {
+		t.Fatalf("stderr = %q, want a concise Russian skip line", got)
 	}
+}
+
+// TestLanguagePolicy pins the declared languages and checks that report lines
+// use the language of their scope. Interface prose is Russian. Report keys and
+// technical tokens stay English.
+func TestLanguagePolicy(t *testing.T) {
+	for _, tc := range []struct {
+		scope languageScope
+		want  string
+	}{
+		{scopeInterface, "ru"},
+		{scopeArtifacts, "ru"},
+		{scopeTechnical, "en"},
+		{"unknown", ""},
+	} {
+		if got := languageFor(tc.scope); got != tc.want {
+			t.Fatalf("languageFor(%q) = %q, want %q", tc.scope, got, tc.want)
+		}
+	}
+
+	prose := []string{
+		fmt.Sprintf(renumberReportFormat, 7, 265),
+		fmt.Sprintf(skipReportFormat, "bad.json: неверный JSON"),
+		fmt.Sprintf(warnReportFormat, "docs/tasks/W5-42.md"),
+	}
+	for _, line := range prose {
+		if !hasCyrillic(line) {
+			t.Fatalf("interface report line has no Russian prose: %q", line)
+		}
+	}
+
+	structured := []string{
+		fmt.Sprintf(checkReportFormat, 3, 1),
+		fmt.Sprintf(summaryReportFormat, 2, 3, 4, 5, 6),
+		fmt.Sprintf(mergeReportFormat, 2, 1),
+	}
+	for _, line := range structured {
+		if hasCyrillic(line) {
+			t.Fatalf("technical report key line was translated: %q", line)
+		}
+	}
+}
+
+// TestArtifactLanguagePolicy checks that generated documents use Russian
+// headings and labels while identifiers and status values keep their English
+// spelling. A wrong-language heading is the mixing the card rejects.
+func TestArtifactLanguagePolicy(t *testing.T) {
+	adrs := renderADR(adr{
+		Number: 7, Title: "Решение", Context: "контекст",
+		Decision: "выбор", Consequences: "последствие",
+	})
+	cardDoc := renderCard(card{ID: "HD-999", Title: "Пример", Status: "todo", Goal: "цель"})
+	evalDoc := renderEval(evalCase{
+		Name: "E1", Scenario: "сценарий",
+		Assertions: []string{"проверка"}, NegativeControl: "контроль",
+	})
+
+	cases := []struct {
+		name      string
+		got       string
+		russian   []string
+		english   []string
+		technical []string
+	}{
+		{
+			name:      "adr",
+			got:       adrs,
+			russian:   []string{"Статус:", "## Контекст", "## Решение", "## Последствия"},
+			english:   []string{"Status:", "## Context", "## Decision", "## Consequences"},
+			technical: []string{"ADR 7", "accepted"},
+		},
+		{
+			name:      "card",
+			got:       cardDoc,
+			russian:   []string{"Статус:", "Фаза:", "Тип:", "Владелец файлов:", "Цель:", "Приёмка:"},
+			english:   []string{"Status:", "Phase:", "Type:", "Owner files:", "Goal:", "Acceptance:"},
+			technical: []string{"HD-999", "todo", "P3", "task"},
+		},
+		{
+			name:      "eval",
+			got:       evalDoc,
+			russian:   []string{"## Сценарий", "## Проверки", "## Негативный контроль"},
+			english:   []string{"## Scenario", "## Checks", "## Negative control"},
+			technical: []string{"E1"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, needle := range tc.russian {
+				if !strings.Contains(tc.got, needle) {
+					t.Fatalf("%s missing Russian label %q:\n%s", tc.name, needle, tc.got)
+				}
+			}
+			for _, needle := range tc.english {
+				if strings.Contains(tc.got, needle) {
+					t.Fatalf("%s uses English prose label %q:\n%s", tc.name, needle, tc.got)
+				}
+			}
+			for _, needle := range tc.technical {
+				if !strings.Contains(tc.got, needle) {
+					t.Fatalf("%s lost technical token %q:\n%s", tc.name, needle, tc.got)
+				}
+			}
+		})
+	}
+}
+
+// hasCyrillic reports whether s contains a Russian letter. It keeps the
+// language tests independent of any specific report wording.
+func hasCyrillic(s string) bool {
+	for _, r := range s {
+		if (r >= 'а' && r <= 'я') || (r >= 'А' && r <= 'Я') || r == 'ё' || r == 'Ё' {
+			return true
+		}
+	}
+	return false
 }

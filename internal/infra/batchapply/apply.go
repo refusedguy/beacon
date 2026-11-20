@@ -15,16 +15,60 @@ import (
 	"strings"
 )
 
-// Report lines use a concise style (HD-039): space-separated fields, no label
-// prefix, no filler words, and words instead of arrows. Keeping the formats
-// here lets tests pin the exact output a caller sees.
+// Language policy (HD-053, ADR 0304). Every string this tool emits belongs to
+// one scope, and each scope has one language:
+//
+//   - interface: Russian. Flag help and human-readable report prose address
+//     the operator in Russian.
+//   - artifacts: Russian. Generated ADR, card and eval documents use Russian
+//     headings and labels.
+//   - technical terms: English. Identifiers, flag names, status values, report
+//     keys and token names stay English so code and scripts can rely on them.
+//
+// A scope keeps its language. A Russian sentence with English identifiers
+// follows the rule. Prose in two languages in one string has no rule and is a
+// defect.
+type languageScope string
+
+const (
+	scopeInterface languageScope = "interface"
+	scopeArtifacts languageScope = "artifacts"
+	scopeTechnical languageScope = "technical"
+)
+
+const (
+	languageInterface = "ru"
+	languageArtifacts = "ru"
+	languageTechnical = "en"
+)
+
+// languageFor returns the language declared for a scope. An unknown scope has
+// no declared language and returns an empty string.
+func languageFor(scope languageScope) string {
+	switch scope {
+	case scopeInterface:
+		return languageInterface
+	case scopeArtifacts:
+		return languageArtifacts
+	case scopeTechnical:
+		return languageTechnical
+	default:
+		return ""
+	}
+}
+
+// Report lines keep the concise style from HD-039: space-separated fields, no
+// label prefix, no filler words, and words instead of arrows. The language of
+// each line follows the policy above. Structured lines use English keys as
+// technical terms; prose lines are Russian. Keeping the formats here lets
+// tests pin the exact output a caller sees.
 const (
 	checkReportFormat    = "valid=%d invalid=%d\n"
 	summaryReportFormat  = "batches=%d adrs=%d cards=%d evals=%d closures=%d\n"
 	mergeReportFormat    = "merged=%d held=%d\n"
-	renumberReportFormat = "renumber ADR %d to %d\n"
-	skipReportFormat     = "skip %s\n"
-	warnReportFormat     = "warn closure target missing: %s\n"
+	renumberReportFormat = "перенумеровать ADR %d в %d\n"
+	skipReportFormat     = "пропуск %s\n"
+	warnReportFormat     = "предупреждение: не найдена цель закрытия %s\n"
 )
 
 // Options mirrors the command line of cmd/batch-apply.
@@ -157,7 +201,7 @@ func loadBatches(dir string) ([]batch, []string) {
 		}
 		var b batch
 		if err := json.Unmarshal(raw, &b); err != nil {
-			problems = append(problems, fmt.Sprintf("%s: invalid JSON (%v)", filepath.Base(p), err))
+			problems = append(problems, fmt.Sprintf("%s: неверный JSON (%v)", filepath.Base(p), err))
 			continue
 		}
 		out = append(out, b)
@@ -331,14 +375,14 @@ func (r *runner) applyMergePlan(decisions []mergeDecision) {
 			if ee, ok := err.(*exec.ExitError); ok && strings.Contains(string(ee.Stderr), "no checks reported") {
 				raw = []byte("[]") // doc-only PR under paths-ignore
 			} else {
-				r.printf("PR %d: hold (checks unavailable: %v)\n", d.PR, err)
+				r.printf("PR %d: удержан, проверки недоступны: %v\n", d.PR, err)
 				held++
 				continue
 			}
 		}
 		var checks []ghCheck
 		if err := json.Unmarshal(raw, &checks); err != nil {
-			r.printf("PR %d: hold (bad checks JSON)\n", d.PR)
+			r.printf("PR %d: удержан, неверный JSON проверок\n", d.PR)
 			held++
 			continue
 		}
@@ -356,13 +400,13 @@ func (r *runner) applyMergePlan(decisions []mergeDecision) {
 			}
 		}
 		if blocked || (len(checks) > 0 && green < len(required)) {
-			r.printf("PR %d: hold (required checks not green)\n", d.PR)
+			r.printf("PR %d: удержан, обязательные проверки не зелёные\n", d.PR)
 			held++
 			continue
 		}
 		mergeCmd := exec.Command("gh", "pr", "merge", fmt.Sprint(d.PR), "--squash", "--delete-branch")
 		if out, err := mergeCmd.CombinedOutput(); err != nil {
-			r.printf("PR %d: merge failed: %s\n", d.PR, strings.TrimSpace(string(out)))
+			r.printf("PR %d: слияние не удалось: %s\n", d.PR, strings.TrimSpace(string(out)))
 			held++
 			continue
 		}
@@ -377,7 +421,7 @@ func (r *runner) applyMergePlan(decisions []mergeDecision) {
 func Run(opts Options, out, errOut io.Writer) int {
 	r := &runner{opts: opts, out: out, err: errOut}
 	if opts.Dir == "" {
-		r.errf("--dir is required\n")
+		r.errf("--dir обязателен\n")
 		return 2
 	}
 	root, err := rootDir()

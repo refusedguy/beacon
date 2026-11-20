@@ -3,22 +3,35 @@
 // research agents only produce JSON, the orchestrator never reads raw reports.
 // Flag parsing is the only work done here: file and subprocess access lives in
 // internal/infra/batchapply.
+//
+// Language policy (HD-053, ADR 0304): the interface and generated artifacts
+// are Russian. Identifiers, flags and status values stay English so scripts
+// and code can rely on them. internal/infra/batchapply declares the same policy
+// as constants and pins the output with tests.
 package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 
 	"github.com/refusedguy/beacon/internal/infra/batchapply"
 )
 
 func main() {
-	dir := flag.String("dir", "", "batch directory with JSON files")
-	dryRun := flag.Bool("dry-run", false, "print files without writing")
-	check := flag.Bool("check", false, "validate JSON only, print a compact summary")
-	mergePlan := flag.Bool("merge-plan", false, "merge PRs listed in merge_decisions after verifying checks")
-	quiet := flag.Bool("quiet", false, "do not list every generated file")
-	commit := flag.Bool("commit", false, "git add and commit generated docs")
+	flag.Usage = func() {
+		w := flag.CommandLine.Output()
+		fmt.Fprintln(w, "batch-apply: языковая политика (HD-053, ADR 0304)")
+		fmt.Fprintln(w, "  интерфейс и артефакты: русский")
+		fmt.Fprintln(w, "  технические имена, флаги и статусы: английский")
+		flag.PrintDefaults()
+	}
+	dir := flag.String("dir", "", "каталог с JSON-файлами пакета")
+	dryRun := flag.Bool("dry-run", false, "печатать файлы без записи")
+	check := flag.Bool("check", false, "только проверить JSON и напечатать краткую сводку")
+	mergePlan := flag.Bool("merge-plan", false, "слить PR из merge_decisions после проверки CI")
+	quiet := flag.Bool("quiet", false, "не печатать каждый созданный файл")
+	commit := flag.Bool("commit", false, "git add и commit созданных docs")
 	flag.Parse()
 	os.Exit(batchapply.Run(batchapply.Options{
 		Dir:       *dir,
