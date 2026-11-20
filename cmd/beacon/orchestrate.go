@@ -8,7 +8,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -599,4 +601,135 @@ func planWave(items []giantWork) wavePlan {
 		})
 	}
 	return plan
+}
+
+// ---------------------------------------------------------------------------
+// Skills lock (HD-071)
+// ---------------------------------------------------------------------------
+
+const (
+	skillsLockVersion = 1
+	skillsLockFile    = "skills-lock.json"
+	skillsLockDir     = ".opencode/skills"
+)
+
+// skillsLockReadFile is the file capability seam. Holding os.ReadFile in a
+// variable keeps a direct os call out of cmd/beacon, which the capabilities
+// gate forbids (ADR 0005).
+var skillsLockReadFile = os.ReadFile
+
+// skillsLock is the on-disk format of skills-lock.json. computedHash covers
+// every file of one skill, so adding, removing or editing a file changes it.
+type skillsLock struct {
+	Version int               `json:"version"`
+	Skills  []skillsLockEntry `json:"skills"`
+}
+
+type skillsLockEntry struct {
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	ComputedHash string `json:"computedHash"`
+}
+
+// skillsLockFinding is one reason the lock cannot be trusted.
+type skillsLockFinding struct {
+	Name    string
+	Problem string
+}
+
+// hashSkillDir pins one skill directory. The digest is taken over the sorted
+// relative file names paired with each file's sha256, so the result does not
+// depend on filesystem walk order.
+func hashSkillDir(root, rel string) (string, error) {
+	abs := filepath.Join(root, filepath.FromSlash(rel))
+	var lines []string
+	err := filepath.Walk(abs, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		data, err := skillsLockReadFile(path)
+		if err != nil {
+			return err
+		}
+		name, err := filepath.Rel(abs, path)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		lines = append(lines, fmt.Sprintf("%s %x", filepath.ToSlash(name), sum))
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	sort.Strings(lines)
+	total := sha256.Sum256([]byte(strings.Join(lines, "\n") + "\n"))
+	return hex.EncodeToString(total[:]), nil
+}
+
+// verifySkillsLock recomputes every pinned hash and checks that no skill in
+// the checkout is left unpinned. It returns findings rather than failing the
+// process so the daemon can report a stale lock on every pass.
+func verifySkillsLock(root string) ([]skillsLockFinding, error) {
+	data, err := skillsLockReadFile(filepath.Join(root, skillsLockFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []skillsLockFinding{{Name: skillsLockFile, Problem: "файл отсутствует"}}, nil
+		}
+		return nil, err
+	}
+	var lock skillsLock
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return []skillsLockFinding{{Name: skillsLockFile, Problem: "некорректный JSON: " + err.Error()}}, nil
+	}
+
+	var findings []skillsLockFinding
+	if lock.Version != skillsLockVersion {
+		findings = append(findings, skillsLockFinding{
+			Name:    skillsLockFile,
+			Problem: fmt.Sprintf("version = %d, ожидается %d", lock.Version, skillsLockVersion),
+		})
+	}
+
+	pinned := make(map[string]bool, len(lock.Skills))
+	for _, entry := range lock.Skills {
+		rel := filepath.ToSlash(entry.Path)
+		if entry.Name == "" || rel == "" {
+			findings = append(findings, skillsLockFinding{Name: skillsLockFile, Problem: "запись без имени или пути"})
+			continue
+		}
+		pinned[rel] = true
+		actual, err := hashSkillDir(root, rel)
+		if err != nil {
+			findings = append(findings, skillsLockFinding{Name: entry.Name, Problem: "хеш не вычислен: " + err.Error()})
+			continue
+		}
+		if actual != strings.ToLower(strings.TrimSpace(entry.ComputedHash)) {
+			findings = append(findings, skillsLockFinding{
+				Name:    entry.Name,
+				Problem: fmt.Sprintf("computedHash расходится: в lock %s, на диске %s", entry.ComputedHash, actual),
+			})
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(skillsLockDir)))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		return findings, nil
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		rel := skillsLockDir + "/" + entry.Name()
+		if !pinned[rel] {
+			findings = append(findings, skillsLockFinding{Name: entry.Name(), Problem: "скилл не зафиксирован в skills-lock.json"})
+		}
+	}
+	return findings, nil
 }
