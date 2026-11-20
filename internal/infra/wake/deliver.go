@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1348,4 +1349,121 @@ func (d *CursorDeliverer) DeliverSteer(ctx context.Context, deliveryID string, s
 	j.byID[deliveryID] = rec
 	j.mu.Unlock()
 	return T206DeliveryResult{DeliveryID: deliveryID, Status: status}, nil
+}
+
+// ===== T3.250: history search with an explicit backend =====
+
+// HistorySearchBackend names the program that answered a history query. It
+// travels with the result so a caller can show which backend ran (T3.250).
+type HistorySearchBackend string
+
+const (
+	HistorySearchRipgrep HistorySearchBackend = "rg"
+	HistorySearchGrep    HistorySearchBackend = "grep -E"
+)
+
+// HistorySearchRunner runs one search command. Tests inject a fake, so a
+// missing rg is reproduced without changing anything on the host.
+type HistorySearchRunner func(ctx context.Context, name string, args ...string) ([]byte, error)
+
+// HistorySearchResult is the bounded answer to a history query. Matches hold
+// ANSI-free lines with line numbers. Truncated reports that a limit dropped
+// content.
+type HistorySearchResult struct {
+	Backend   HistorySearchBackend
+	Matches   []string
+	Truncated bool
+}
+
+const (
+	historySearchMaxLines = 200
+	historySearchMaxBytes = 16 * 1024
+)
+
+// historyANSI matches SGR color codes and OSC sequences that a transcript
+// recorder writes into a terminal capture.
+var historyANSI = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)
+
+func defaultHistorySearchRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).Output()
+}
+
+// runHistorySearch runs one backend. Exit code 1 means no matches for both rg
+// and grep, so it maps to an empty result rather than an error.
+func runHistorySearch(ctx context.Context, runner HistorySearchRunner, backend HistorySearchBackend, pattern, path string) ([]byte, error) {
+	var name string
+	var args []string
+	switch backend {
+	case HistorySearchRipgrep:
+		name = "rg"
+		args = []string{"--color=never", "--line-number", "--", pattern, path}
+	case HistorySearchGrep:
+		name = "grep"
+		args = []string{"-E", "-n", "--color=never", "--", pattern, path}
+	default:
+		return nil, fmt.Errorf("wake: unknown history backend %q", backend)
+	}
+	out, err := runner(ctx, name, args...)
+	if err == nil {
+		return out, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return nil, nil
+	}
+	return nil, err
+}
+
+// HistorySearch looks for pattern in path with rg, then falls back to grep -E
+// when rg is missing. It strips ANSI escapes and caps the number of lines and
+// total bytes, so an agent finds fragments without reading the whole file.
+func HistorySearch(ctx context.Context, path, pattern string, runner HistorySearchRunner, maxLines, maxBytes int) (HistorySearchResult, error) {
+	if pattern == "" {
+		return HistorySearchResult{}, errors.New("wake: history search: empty pattern")
+	}
+	if runner == nil {
+		runner = defaultHistorySearchRunner
+	}
+	if maxLines <= 0 {
+		maxLines = historySearchMaxLines
+	}
+	if maxBytes <= 0 {
+		maxBytes = historySearchMaxBytes
+	}
+
+	backend := HistorySearchRipgrep
+	out, err := runHistorySearch(ctx, runner, backend, pattern, path)
+	if errors.Is(err, exec.ErrNotFound) {
+		backend = HistorySearchGrep
+		out, err = runHistorySearch(ctx, runner, backend, pattern, path)
+	}
+	if err != nil {
+		return HistorySearchResult{}, fmt.Errorf("wake: history search: %w", err)
+	}
+
+	lines, truncated := clampHistoryOutput(historyANSI.ReplaceAllString(string(out), ""), maxLines, maxBytes)
+	return HistorySearchResult{Backend: backend, Matches: lines, Truncated: truncated}, nil
+}
+
+// clampHistoryOutput keeps at most maxLines lines and maxBytes bytes. It
+// reports truncation when either limit drops content.
+func clampHistoryOutput(s string, maxLines, maxBytes int) ([]string, bool) {
+	if s == "" {
+		return nil, false
+	}
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	truncated := len(lines) > maxLines
+	if truncated {
+		lines = lines[:maxLines]
+	}
+	kept := make([]string, 0, len(lines))
+	used := 0
+	for _, line := range lines {
+		if used+len(line) > maxBytes {
+			return kept, true
+		}
+		used += len(line)
+		kept = append(kept, line)
+	}
+	return kept, truncated
 }
