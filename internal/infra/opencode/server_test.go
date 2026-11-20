@@ -21,6 +21,7 @@ import (
 type fakeProcess struct {
 	done     chan struct{}
 	killed   chan struct{}
+	doneOnce sync.Once
 	killOnce sync.Once
 }
 
@@ -30,11 +31,14 @@ func newFakeProcess() *fakeProcess {
 
 func (p *fakeProcess) Done() <-chan struct{} { return p.done }
 
+// exit simulates the child ending on its own.
+func (p *fakeProcess) exit() {
+	p.doneOnce.Do(func() { close(p.done) })
+}
+
 func (p *fakeProcess) Kill() error {
-	p.killOnce.Do(func() {
-		close(p.killed)
-		close(p.done)
-	})
+	p.killOnce.Do(func() { close(p.killed) })
+	p.exit()
 	return nil
 }
 
@@ -146,7 +150,7 @@ func TestEnsureServerFailsWhenProcessExits(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
 	proc := newFakeProcess()
-	close(proc.done)
+	proc.exit()
 	installStartServer(t, func(spawnRequest) (spawnedProcess, error) {
 		return proc, nil
 	})
