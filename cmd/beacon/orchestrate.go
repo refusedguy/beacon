@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -358,4 +360,19 @@ func verifyIssueEvidence(ev issueEvidence, code currentCode) evidenceVerdict {
 // reference clears a claim; the agent must surface the other two first.
 func clearsForWork(v evidenceVerdict) bool {
 	return v.Status == EvidenceCurrent
+}
+
+// --- HD-041: stable finding id (ADR 0301) -----------------------------------
+
+// generateFindingID derives a permanent identifier for one finding from the
+// fields that name the defect: the cited file, its line and the rule that
+// fired. The same defect gets the same id on every run, so a blocker can carry
+// an id that stays valid across CI passes. The fields are length-prefixed
+// before hashing so two different (file, line, rule) triples cannot produce
+// the same byte stream by concatenation, and the digest is hex-encoded so the
+// id is safe to print and to embed in JSON.
+func generateFindingID(file string, line int, rule string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s;%d;%d:%s;", len(file), file, line, len(rule), rule)
+	return "finding-" + hex.EncodeToString(h.Sum(nil)[:8])
 }
