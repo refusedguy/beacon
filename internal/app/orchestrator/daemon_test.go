@@ -299,7 +299,7 @@ func TestDaemonPassStepOrder(t *testing.T) {
 // close-merged: the pass keeps all of its actions.
 func TestDaemonSubscribeErrorDoesNotStopPass(t *testing.T) {
 	var order []string
-	ports, sub, summary := daemonOrderPorts(&order)
+	ports, sub, _ := daemonOrderPorts(&order)
 	sub.err = errors.New("subscribe boom")
 
 	var logs []string
