@@ -48,6 +48,13 @@ func ObligationKey(watchID string, revision uint64, subscriberID string) string 
 // same raw string for both.
 const StartNamespace = "task-start"
 
+// GitHubDeliveryNamespace scopes an idempotency_key that identifies one
+// GitHub webhook delivery (ADR 0150). X-GitHub-Delivery is a GUID unique to an
+// event and is repeated byte-for-byte on manual redelivery. The namespace
+// keeps a delivery key separate from a task start (ADR 0031), a clientRequestId
+// (ADR 0028) and a completion notice (ADR 0044), even when the raw values match.
+const GitHubDeliveryNamespace = "github-delivery"
+
 // CodeRejectDuplicate is the conflict returned when a task start repeats an
 // idempotency_key that already produced a task (ADR 0031 §5). It mirrors the
 // RejectDuplicate policy of durable-mcp: a repeat is rejected as a duplicate
