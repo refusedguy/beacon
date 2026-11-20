@@ -201,9 +201,20 @@ func verdictFromState(state domain.PRState) domain.Verdict {
 		return domain.VerdictMerged
 	case "CLOSED":
 		return domain.VerdictClosed
-	default:
-		return verdictFromChecks(state.Checks)
 	}
+	checksVerdict := verdictFromChecks(state.Checks)
+	if checksVerdict != domain.VerdictWatching {
+		return checksVerdict
+	}
+	// A doc-only PR has no checks at all (paths-ignore in CI). Such a PR is
+	// ready as soon as GitHub says it is clean and mergeable. Without this,
+	// no-check Watches stay watching forever and never reach the orchestrator.
+	if len(state.Checks) == 0 && !state.IsDraft &&
+		strings.EqualFold(state.Mergeable, "MERGEABLE") &&
+		strings.EqualFold(state.MergeStateStatus, "CLEAN") {
+		return domain.VerdictReady
+	}
+	return domain.VerdictWatching
 }
 
 func isTerminalVerdict(v domain.Verdict) bool {

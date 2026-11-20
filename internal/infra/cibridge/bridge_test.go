@@ -62,6 +62,25 @@ func (r *recordingAdapterWaker) forSession(id string) []adapterDelivery {
 	return out
 }
 
+func TestVerdictFromStateNoChecksCleanMergeable(t *testing.T) {
+	state := domain.PRState{
+		State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN",
+	}
+	if got := verdictFromState(state); got != domain.VerdictReady {
+		t.Fatalf("doc-only clean PR verdict = %q, want ready", got)
+	}
+	dirty := state
+	dirty.MergeStateStatus = "DIRTY"
+	if got := verdictFromState(dirty); got != domain.VerdictWatching {
+		t.Fatalf("dirty no-check PR verdict = %q, want watching", got)
+	}
+	draft := state
+	draft.IsDraft = true
+	if got := verdictFromState(draft); got != domain.VerdictWatching {
+		t.Fatalf("draft no-check PR verdict = %q, want watching", got)
+	}
+}
+
 func TestVerdictFromChecks(t *testing.T) {
 	check := func(conclusion string) map[string]domain.Check {
 		return map[string]domain.Check{"build": {Conclusion: conclusion, Required: true}}
