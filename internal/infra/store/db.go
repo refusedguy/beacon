@@ -2237,3 +2237,311 @@ func (d *DB) QueueTasks(queue string) ([]QueueTask, error) {
 	}
 	return out, rows.Err()
 }
+
+// ---- FIFO with pause, resume, cancel and crash-safe resume (ADR 0059 feature 5, T3.138) ----
+//
+// This is ONE FIFO queue in the same state file, not T3.132's named queues.
+// T3.132 mints fencing tokens, leases by name and enqueues a continuation in
+// the completing transaction. Here the contract is order and control commands:
+// tasks are claimed strictly in enqueue order, the whole queue can be paused
+// and resumed, any task can be cancelled, and after a process restart the
+// queue continues from the file. An item claimed by a process that died stays
+// inflight in the file; FIFORecover puts every inflight item back at its
+// original FIFO position, so the next claim resumes where the crash left off.
+// No fencing token or lease TTL is used: recovery is one durable transition.
+
+const (
+	fifoStatePending  = "pending"
+	fifoStateInflight = "inflight"
+)
+
+// createFIFOQueueSQL owns the single FIFO queue and its control row. As with
+// the other tables in this file, this card owns no migration file, so they are
+// created on first use inside the caller's Write transaction. fifo_queue keeps
+// enqueue order in seq; fifo_control keeps the pause command as one durable
+// flag. Both live in the state file, so a restart reads the same order and the
+// same commands back.
+var createFIFOQueueSQL = []string{
+	`CREATE TABLE IF NOT EXISTS fifo_queue (
+	   seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+	   id          TEXT NOT NULL UNIQUE,
+	   payload     BLOB NOT NULL,
+	   state       TEXT NOT NULL,
+	   enqueued_at INTEGER NOT NULL)`,
+	`CREATE INDEX IF NOT EXISTS fifo_queue_by_state ON fifo_queue(state, seq)`,
+	`CREATE TABLE IF NOT EXISTS fifo_control (
+	   id         INTEGER PRIMARY KEY CHECK (id = 1),
+	   paused     INTEGER NOT NULL DEFAULT 0,
+	   updated_at INTEGER NOT NULL)`,
+}
+
+func ensureFIFOQueue(tx *sql.Tx) error {
+	for _, stmt := range createFIFOQueueSQL {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("store: fifo: create table: %w", err)
+		}
+	}
+	return nil
+}
+
+// fifoEnsureControl makes the single control row exist so pause state can be
+// read and written. It is called inside a Write transaction.
+func fifoEnsureControl(tx *sql.Tx) error {
+	_, err := tx.Exec(`INSERT OR IGNORE INTO fifo_control (id, paused, updated_at) VALUES (1, 0, 0)`)
+	return err
+}
+
+func fifoPaused(tx *sql.Tx) (bool, error) {
+	if err := fifoEnsureControl(tx); err != nil {
+		return false, err
+	}
+	var paused int
+	if err := tx.QueryRow(`SELECT paused FROM fifo_control WHERE id = 1`).Scan(&paused); err != nil {
+		return false, err
+	}
+	return paused != 0, nil
+}
+
+func setFIFOPaused(tx *sql.Tx, paused bool) error {
+	if err := fifoEnsureControl(tx); err != nil {
+		return err
+	}
+	v := 0
+	if paused {
+		v = 1
+	}
+	_, err := tx.Exec(`
+		UPDATE fifo_control SET paused = ?, updated_at = ? WHERE id = 1`,
+		v, time.Now().UTC().UnixNano())
+	return err
+}
+
+// FIFOItem is one task in the single FIFO queue. Seq is the enqueue order
+// assigned by SQLite and never reused, so a recovered item keeps its position.
+// State is pending while waiting to be claimed and inflight while a process
+// holds it.
+type FIFOItem struct {
+	ID         string
+	Payload    []byte
+	State      string
+	Seq        int64
+	EnqueuedAt int64
+}
+
+// FIFOState is the whole queue as stored in the file: the pause flag and the
+// items in FIFO order. Used by tests and diagnostics.
+type FIFOState struct {
+	Paused bool
+	Items  []FIFOItem
+}
+
+func scanFIFOItem(scanner interface{ Scan(...any) error }) (FIFOItem, error) {
+	var it FIFOItem
+	err := scanner.Scan(&it.Seq, &it.ID, &it.Payload, &it.State, &it.EnqueuedAt)
+	return it, err
+}
+
+// FIFOEnqueue appends a task to the tail of the single FIFO queue in pending
+// state. A repeat with the same id inserts nothing, so a redelivered enqueue
+// cannot put the same task twice. Payload is redacted before it reaches the
+// file (ADR 0012).
+func (d *DB) FIFOEnqueue(id string, payload []byte) error {
+	if strings.TrimSpace(id) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: fifo: empty task id")
+	}
+	clean := Redact(payload)
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			INSERT OR IGNORE INTO fifo_queue (id, payload, state, enqueued_at)
+			VALUES (?, ?, ?, ?)`, id, clean, fifoStatePending, time.Now().UTC().UnixNano())
+		return err
+	})
+}
+
+// FIFOClaim hands the oldest pending task to the caller and marks it inflight.
+// A paused queue hands out nothing; the pause flag is read in the same
+// transaction as the claim, so a pause cannot race with a dispatch. found=false
+// means either the queue is paused or no task is pending. An inflight item is
+// not deleted, so a crash can put it back with FIFORecover.
+func (d *DB) FIFOClaim() (FIFOItem, bool, error) {
+	var out FIFOItem
+	found := false
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		paused, err := fifoPaused(tx)
+		if err != nil {
+			return err
+		}
+		if paused {
+			return nil
+		}
+		it, err := scanFIFOItem(tx.QueryRow(`
+			SELECT seq, id, payload, state, enqueued_at FROM fifo_queue
+			WHERE state = ? ORDER BY seq LIMIT 1`, fifoStatePending))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("store: fifo: select pending: %w", err)
+		}
+		if _, err := tx.Exec(`UPDATE fifo_queue SET state = ? WHERE seq = ?`, fifoStateInflight, it.Seq); err != nil {
+			return fmt.Errorf("store: fifo: mark inflight: %w", err)
+		}
+		it.State = fifoStateInflight
+		out = it
+		found = true
+		return nil
+	})
+	if err != nil {
+		return FIFOItem{}, false, err
+	}
+	return out, found, nil
+}
+
+// FIFOPause stops the queue from handing out new tasks. The command is stored
+// in the file, so a process that restarts while paused stays paused until an
+// explicit FIFOResume. Repeated calls are safe.
+func (d *DB) FIFOPause() error {
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		return setFIFOPaused(tx, true)
+	})
+}
+
+// FIFOResume restarts dispatch. It only clears the pause flag; it does not
+// touch inflight items, so a worker that survived a restart keeps its task.
+// FIFORecover is the separate hook for items left by a dead worker.
+func (d *DB) FIFOResume() error {
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		return setFIFOPaused(tx, false)
+	})
+}
+
+// FIFOCancel removes a task from the queue whether it is pending or inflight.
+// It reports whether a row was removed, so a repeated cancel is not an error.
+func (d *DB) FIFOCancel(id string) (bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return false, domain.NewAppError(domain.CodeInvalidInput, "store: fifo: empty task id")
+	}
+	removed := false
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM fifo_queue WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		removed = n > 0
+		return err
+	})
+	return removed, err
+}
+
+// FIFOComplete finishes an inflight task and removes it from the queue. A task
+// that is still pending cannot be completed, and a repeated complete reports
+// false without changing anything.
+func (d *DB) FIFOComplete(id string) (bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return false, domain.NewAppError(domain.CodeInvalidInput, "store: fifo: empty task id")
+	}
+	removed := false
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM fifo_queue WHERE id = ? AND state = ?`, id, fifoStateInflight)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		removed = n > 0
+		return err
+	})
+	return removed, err
+}
+
+// FIFORecover is the crash-safe resume hook. Every inflight item is put back
+// to pending in one transaction, keeping its original seq so the next claim
+// hands tasks out in the same order as before the crash. It returns the number
+// of items recovered. Call it once after reopening the state file.
+func (d *DB) FIFORecover() (int, error) {
+	var n int64
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`
+			UPDATE fifo_queue SET state = ? WHERE state = ?`,
+			fifoStatePending, fifoStateInflight)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	return int(n), err
+}
+
+// FIFOState returns the pause flag and every queued item in FIFO order. Reads
+// use the separate pool, so a restarted process sees the same order and
+// commands the previous process committed.
+func (d *DB) FIFOState() (FIFOState, error) {
+	ctx := context.Background()
+	ok, err := tableExists(ctx, d.readDB, "fifo_queue")
+	if err != nil || !ok {
+		return FIFOState{}, err
+	}
+	var state FIFOState
+	okCtrl, err := tableExists(ctx, d.readDB, "fifo_control")
+	if err != nil {
+		return FIFOState{}, err
+	}
+	if okCtrl {
+		var paused int
+		err := d.readDB.QueryRow(`SELECT paused FROM fifo_control WHERE id = 1`).Scan(&paused)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return FIFOState{}, err
+		}
+		state.Paused = paused != 0
+	}
+	rows, err := d.readDB.Query(`
+		SELECT seq, id, payload, state, enqueued_at FROM fifo_queue ORDER BY seq`)
+	if err != nil {
+		return FIFOState{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		it, err := scanFIFOItem(rows)
+		if err != nil {
+			return FIFOState{}, err
+		}
+		state.Items = append(state.Items, it)
+	}
+	return state, rows.Err()
+}
+
+// FIFOPaused reports the persisted pause command. A fresh file is not paused.
+func (d *DB) FIFOPaused() (bool, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "fifo_control")
+	if err != nil || !ok {
+		return false, err
+	}
+	var paused int
+	err = d.readDB.QueryRow(`SELECT paused FROM fifo_control WHERE id = 1`).Scan(&paused)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return paused != 0, err
+}

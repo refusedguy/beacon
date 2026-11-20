@@ -3019,3 +3019,211 @@ func TestAcceptTaskRedactsState(t *testing.T) {
 		t.Errorf("stored state kept a raw token: %s", s.Payload)
 	}
 }
+
+// TestFIFOPauseResumeCancel is the acceptance check for ADR 0059 feature 5:
+// tasks leave the queue in FIFO order, pause stops dispatch, resume restarts
+// it and cancel drops a task from anywhere in the queue.
+func TestFIFOPauseResumeCancel(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, id := range []string{"job-1", "job-2", "job-3"} {
+		if err := d.FIFOEnqueue(id, []byte("payload "+id)); err != nil {
+			t.Fatalf("FIFOEnqueue %s: %v", id, err)
+		}
+	}
+	first, found, err := d.FIFOClaim()
+	if err != nil || !found || first.ID != "job-1" {
+		t.Fatalf("first claim = %+v, found=%v, err=%v; want job-1", first, found, err)
+	}
+	if first.State != fifoStateInflight || string(first.Payload) != "payload job-1" {
+		t.Errorf("first claim = %+v; want inflight job-1 payload", first)
+	}
+
+	if err := d.FIFOPause(); err != nil {
+		t.Fatalf("FIFOPause: %v", err)
+	}
+	paused, err := d.FIFOPaused()
+	if err != nil || !paused {
+		t.Fatalf("FIFOPaused = %v, %v; want true", paused, err)
+	}
+	if _, found, err := d.FIFOClaim(); err != nil || found {
+		t.Fatalf("claim while paused found=%v err=%v; want no dispatch", found, err)
+	}
+
+	removed, err := d.FIFOCancel("job-3")
+	if err != nil || !removed {
+		t.Fatalf("FIFOCancel job-3 = %v, %v; want removed", removed, err)
+	}
+	removed, err = d.FIFOCancel("job-3")
+	if err != nil || removed {
+		t.Fatalf("repeat FIFOCancel = %v, %v; want false", removed, err)
+	}
+
+	if err := d.FIFOResume(); err != nil {
+		t.Fatalf("FIFOResume: %v", err)
+	}
+	paused, err = d.FIFOPaused()
+	if err != nil || paused {
+		t.Fatalf("FIFOPaused after resume = %v, %v; want false", paused, err)
+	}
+	second, found, err := d.FIFOClaim()
+	if err != nil || !found || second.ID != "job-2" {
+		t.Fatalf("second claim = %+v, found=%v, err=%v; want job-2", second, found, err)
+	}
+	if _, found, err := d.FIFOClaim(); err != nil || found {
+		t.Fatalf("claim after queue drained found=%v err=%v; want no task", found, err)
+	}
+
+	for _, id := range []string{"job-1", "job-2"} {
+		done, err := d.FIFOComplete(id)
+		if err != nil || !done {
+			t.Fatalf("FIFOComplete %s = %v, %v; want true", id, done, err)
+		}
+	}
+	done, err := d.FIFOComplete("job-2")
+	if err != nil || done {
+		t.Fatalf("repeat FIFOComplete = %v, %v; want false", done, err)
+	}
+	state, err := d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState: %v", err)
+	}
+	if state.Paused || len(state.Items) != 0 {
+		t.Fatalf("final FIFOState = %+v; want empty and running", state)
+	}
+}
+
+// TestFIFOCrashSafeResume proves the queue continues from the state file after
+// a process restart: order, the pause command and inflight items all survive,
+// and FIFORecover returns claimed items to their original FIFO positions.
+func TestFIFOCrashSafeResume(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if err := first.FIFOEnqueue(id, []byte("payload "+id)); err != nil {
+			first.Close()
+			t.Fatalf("FIFOEnqueue %s: %v", id, err)
+		}
+	}
+	for _, want := range []string{"a", "b"} {
+		it, found, err := first.FIFOClaim()
+		if err != nil || !found || it.ID != want {
+			first.Close()
+			t.Fatalf("claim #%s = %+v, found=%v, err=%v", want, it, found, err)
+		}
+	}
+	// The process dies holding a and b; c is still pending. The pause command
+	// and both inflight rows are committed to the one state file.
+	if err := first.FIFOPause(); err != nil {
+		first.Close()
+		t.Fatalf("FIFOPause: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+
+	paused, err := second.FIFOPaused()
+	if err != nil || !paused {
+		t.Fatalf("pause after restart = %v, %v; want true", paused, err)
+	}
+	state, err := second.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState after restart: %v", err)
+	}
+	if len(state.Items) != 3 {
+		t.Fatalf("items after restart = %d, want 3", len(state.Items))
+	}
+	for i, want := range []struct {
+		id    string
+		state string
+	}{
+		{"a", fifoStateInflight},
+		{"b", fifoStateInflight},
+		{"c", fifoStatePending},
+	} {
+		got := state.Items[i]
+		if got.ID != want.id || got.State != want.state {
+			t.Errorf("item %d = %+v, want %s in %s", i, got, want.id, want.state)
+		}
+	}
+	if _, found, err := second.FIFOClaim(); err != nil || found {
+		t.Fatalf("claim while restarted-paused found=%v err=%v; want no dispatch", found, err)
+	}
+
+	if err := second.FIFOResume(); err != nil {
+		t.Fatalf("FIFOResume: %v", err)
+	}
+	n, err := second.FIFORecover()
+	if err != nil || n != 2 {
+		t.Fatalf("FIFORecover = %d, %v; want 2", n, err)
+	}
+	n, err = second.FIFORecover()
+	if err != nil || n != 0 {
+		t.Fatalf("repeat FIFORecover = %d, %v; want 0", n, err)
+	}
+
+	for _, want := range []string{"a", "b", "c"} {
+		it, found, err := second.FIFOClaim()
+		if err != nil || !found || it.ID != want {
+			t.Fatalf("recovered claim = %+v, found=%v, err=%v; want %s", it, found, err, want)
+		}
+		if it.State != fifoStateInflight {
+			t.Errorf("recovered claim %s state = %q, want inflight", it.ID, it.State)
+		}
+	}
+	if _, found, err := second.FIFOClaim(); err != nil || found {
+		t.Fatalf("claim after recovery drained found=%v err=%v; want no task", found, err)
+	}
+}
+
+// TestFIFOEnqueueIdempotentAndRedaction keeps a repeated enqueue from adding a
+// second row and keeps secrets out of the state file. It also checks that
+// blank ids are rejected by each command.
+func TestFIFOEnqueueIdempotentAndRedaction(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	if err := d.FIFOEnqueue("task", secret); err != nil {
+		t.Fatalf("FIFOEnqueue: %v", err)
+	}
+	if err := d.FIFOEnqueue("task", []byte("second write ignored")); err != nil {
+		t.Fatalf("repeat FIFOEnqueue: %v", err)
+	}
+	state, err := d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState: %v", err)
+	}
+	if len(state.Items) != 1 || state.Items[0].ID != "task" {
+		t.Fatalf("FIFOState items = %+v; want one task", state.Items)
+	}
+	if bytes.Contains(state.Items[0].Payload, []byte("ghp_")) {
+		t.Errorf("stored payload kept a raw token: %s", state.Items[0].Payload)
+	}
+
+	if err := d.FIFOEnqueue(" ", nil); err == nil {
+		t.Error("FIFOEnqueue with blank id must fail")
+	}
+	if _, err := d.FIFOCancel(" "); err == nil {
+		t.Error("FIFOCancel with blank id must fail")
+	}
+	if _, err := d.FIFOComplete(" "); err == nil {
+		t.Error("FIFOComplete with blank id must fail")
+	}
+}
