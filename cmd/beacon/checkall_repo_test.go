@@ -41,7 +41,7 @@ func TestCICheckUsesRepoFlag(t *testing.T) {
 	if code := runCI(cli, []string{"check", "--all", "--repo", "cli/flag"}); code != 0 {
 		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
 	}
-	if len(runner.queries) != 1 || !strings.Contains(runner.queries[0], "repository(owner:cli, name:flag)") {
+	if len(runner.queries) != 1 || !strings.Contains(runner.queries[0], `repository(owner:"cli", name:"flag")`) {
 		t.Fatalf("queries = %v, want owner cli and name flag", runner.queries)
 	}
 }
@@ -66,7 +66,7 @@ func TestCICheckUsesRepoFromProjectConfig(t *testing.T) {
 	if code := runCI(cli, []string{"check", "--all"}); code != 0 {
 		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
 	}
-	if len(runner.queries) != 1 || !strings.Contains(runner.queries[0], "repository(owner:acme, name:widgets)") {
+	if len(runner.queries) != 1 || !strings.Contains(runner.queries[0], `repository(owner:"acme", name:"widgets")`) {
 		t.Fatalf("queries = %v, want owner acme and name widgets", runner.queries)
 	}
 }
