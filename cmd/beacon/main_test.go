@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
@@ -517,10 +519,11 @@ func (p *t3145BothPort) Prompt(string, string) error { return nil }
 
 func t3145RestorePorts(t *testing.T) {
 	t.Helper()
-	previousLive, previousSpawn := watchLiveSource, spawnSessionSpawner
+	previousLive, previousSpawn, previousDeliver := watchLiveSource, spawnSessionSpawner, deliverTarget
 	t.Cleanup(func() {
 		SetLiveSource(previousLive)
 		SetSessionSpawner(previousSpawn)
+		SetDeliveryTarget(previousDeliver)
 	})
 }
 
@@ -538,6 +541,26 @@ func TestT3145DispatchSpawn(t *testing.T) {
 	}
 	if got := out.String(); got != "sess-dispatch\n" {
 		t.Fatalf("stdout = %q, want session id", got)
+	}
+}
+
+func TestT3149DispatchDeliver(t *testing.T) {
+	snap := mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+		deliverWatch("w-dispatch", domain.VerdictReady,
+			deliverSub(domain.RoleOrchestrator, "orch-dispatch")),
+	}}
+	tgt := &scriptTarget{}
+	withDeliverDeps(t, snap, nil, tgt, nil)
+	c, out, errOut, _ := t06NewCLI(t, t06NoChild(t))
+
+	if code := c.Run([]string{"deliver", "w-dispatch"}); code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+	}
+	if len(tgt.calls) != 1 || tgt.calls[0].sessionID != "orch-dispatch" {
+		t.Fatalf("calls = %+v, want one write to orch-dispatch", tgt.calls)
+	}
+	if !strings.Contains(out.String(), "watch=w-dispatch") || !strings.Contains(out.String(), "delivery=steer") {
+		t.Fatalf("stdout = %q, want watch and delivery=steer", out.String())
 	}
 }
 
@@ -569,6 +592,7 @@ func TestT3145UsageAndCatalogListSpawn(t *testing.T) {
 	for _, line := range []string{
 		"beacon spawn <taskID> [--agent id] [--title ...]",
 		"beacon watch [--live] [--interval 2s] [--format table|json]",
+		"beacon deliver <watchID>",
 	} {
 		if !strings.Contains(out.String(), line) {
 			t.Fatalf("usage не содержит %q: %q", line, out.String())
@@ -652,6 +676,11 @@ func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
 	if spawnSessionSpawner != port {
 		t.Fatalf("spawn port = %#v, want the client itself", spawnSessionSpawner)
 	}
+	// A client that can spawn also has Prompt, so it satisfies deliveryTarget
+	// and must be installed as the live delivery target.
+	if deliverTarget != port {
+		t.Fatalf("delivery target = %#v, want the client itself", deliverTarget)
+	}
 }
 
 func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
@@ -660,10 +689,11 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", base)
 	SetLiveSource(nil)
 	SetSessionSpawner(nil)
+	SetDeliveryTarget(nil)
 
 	wireOpenCodePorts()
-	if watchLiveSource != nil || spawnSessionSpawner != nil {
-		t.Fatalf("без service.json порты не должны ставиться: live=%v spawn=%v", watchLiveSource, spawnSessionSpawner)
+	if watchLiveSource != nil || spawnSessionSpawner != nil || deliverTarget != nil {
+		t.Fatalf("без service.json порты не должны ставиться: live=%v spawn=%v deliver=%v", watchLiveSource, spawnSessionSpawner, deliverTarget)
 	}
 
 	dir := filepath.Join(base, "opencode")
@@ -679,9 +709,13 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	if _, ok := watchLiveSource.(*liveOpencodeSource); !ok {
 		t.Fatalf("live source = %#v, want adapter over T3.144 client", watchLiveSource)
 	}
-	// The T3.144 client has only GET routes, so spawn stays uninstalled.
-	// This is the honest blocker for production spawn until POST routes land.
+	// The T3.144 client has only GET routes, so spawn and delivery stay
+	// uninstalled. This is the honest blocker for production writes until
+	// POST routes land.
 	if spawnSessionSpawner != nil {
 		t.Fatalf("spawn port = %#v, want nil until the client implements it", spawnSessionSpawner)
+	}
+	if deliverTarget != nil {
+		t.Fatalf("delivery target = %#v, want nil until the client implements Prompt", deliverTarget)
 	}
 }

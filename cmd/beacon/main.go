@@ -30,6 +30,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon watch [--live] [--interval 2s] [--format table|json]
   beacon spawn <taskID> [--agent id] [--title ...]
   beacon attach <sessionID>
+  beacon deliver <watchID>
 
 Каталог команд для агентов: beacon list --format json
 `
@@ -99,14 +100,17 @@ func wireOpenCodePorts() {
 }
 
 // installOpenCodePorts adapts one client to every command port it can serve.
-// The live source is always installed. The spawn port is installed only when
-// the client also implements sessionSpawner; the T3.144 reader currently has
-// no POST routes, so the assertion is how main.go stays ready for that card
-// without faking a transport here.
+// The live source is always installed. The spawn and delivery ports are
+// installed only when the client also implements the corresponding narrow
+// interface; the T3.144 reader currently has no POST routes, so the type
+// assertions keep both commands honestly unwired until those routes land.
 func installOpenCodePorts(port opencodePort) {
 	SetLiveSource(newLiveOpencodeSource(port))
 	if spawner, ok := port.(sessionSpawner); ok {
 		SetSessionSpawner(spawner)
+	}
+	if target, ok := port.(deliveryTarget); ok {
+		SetDeliveryTarget(target)
 	}
 }
 
@@ -212,6 +216,8 @@ func (c *CLI) Run(args []string) int {
 		return c.runSpawn(args[1:])
 	case "attach":
 		return c.runAttach(args[1:])
+	case "deliver":
+		return deliverRunner(c, args[1:])
 	default:
 		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)
