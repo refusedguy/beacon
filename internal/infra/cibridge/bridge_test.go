@@ -13,6 +13,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/ghci"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -1121,5 +1122,114 @@ func TestProviderBackoffAfterError(t *testing.T) {
 		if got := events[i].fields["consecutive_errors"]; got != w {
 			t.Errorf("provider_call[%d].consecutive_errors = %v, want %d", i, got, w)
 		}
+	}
+}
+// ===== T3.225 сквозной прогон (#320) =====
+
+type chainWaker struct {
+	calls    int
+	sessions []string
+	payloads []domain.WakePayload
+}
+
+func (w *chainWaker) Deliver(_ context.Context, sessionID string, p domain.WakePayload) error {
+	w.calls++
+	w.sessions = append(w.sessions, sessionID)
+	w.payloads = append(w.payloads, p)
+	return nil
+}
+
+// TestChainWatchCIPointerWakeRead drives watch -> CI verdict -> pointer ->
+// wake -> readAt through one real store. Every assertion reads a fact back
+// from the store or from the recorded wake call, never from a test fixture
+// masquerading as the result.
+func TestChainWatchCIPointerWakeRead(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "chain.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	sub := domain.Subscriber{ID: "ses_chain", Role: domain.RoleExecutor, Adapter: "opencode", Target: "ses_chain"}
+	w := domain.Watch{
+		ID:          "watch:refusedguy/beacon:42:chain",
+		Repo:        "refusedguy/beacon",
+		PR:          42,
+		HeadSHA:     "chain-sha",
+		Status:      domain.StatusWatching,
+		Verdict:     domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{sub},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	at := time.Unix(100, 0).UTC()
+	ci := fakeCI{state: domain.PRState{
+		HeadRefOid: "chain-sha",
+		Mergeable:  "MERGEABLE",
+		Checks:     map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
+	}}
+	waker := &chainWaker{}
+	b := New(db, ci, fixedClock{at: at}, time.Second).WithWaker(waker)
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+
+	watch, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if watch.Verdict != domain.VerdictReady || watch.Revision != w.Revision+1 {
+		t.Fatalf("verdict=%q revision=%d, want ready and %d", watch.Verdict, watch.Revision, w.Revision+1)
+	}
+	obligationID := domain.ObligationKey(w.ID, watch.Revision, sub.ID)
+	o, err := db.Obligation(obligationID)
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if o.VerdictPointer != domain.VerdictReady || !o.StagedAt.Equal(at) {
+		t.Fatalf("pointer=%q stagedAt=%v, want ready and %v", o.VerdictPointer, o.StagedAt, at)
+	}
+	if waker.calls != 1 || waker.sessions[0] != sub.Target {
+		t.Fatalf("wake calls=%d sessions=%v, want one to %q", waker.calls, waker.sessions, sub.Target)
+	}
+	if waker.payloads[0].WatchID != w.ID || waker.payloads[0].ObligationID != obligationID {
+		t.Fatalf("wake payload = %+v, want the watch and obligation ids", waker.payloads[0])
+	}
+
+	// beacon_get_result stamps readAt through the production SQL stamper.
+	// Using it instead of a hand-written update keeps this an external fact.
+	stamper := mcp.NewSQLObligationStamper(db)
+	stamped, applied, err := stamper.StampRead(context.Background(), obligationID, at)
+	if err != nil || !applied || stamped.ReadAt.IsZero() {
+		t.Fatalf("StampRead = %+v, applied=%v, %v; want a stamped readAt", stamped, applied, err)
+	}
+
+	facts, err := b.ConfirmRead(w.ID, obligationID)
+	if err != nil {
+		t.Fatalf("ConfirmRead: %v", err)
+	}
+	if facts.WatchID != w.ID || facts.ObligationID != obligationID || facts.Revision != watch.Revision {
+		t.Fatalf("facts = %+v, want the stored watch, obligation and revision", facts)
+	}
+	if facts.Verdict != domain.VerdictReady || facts.WakeTarget != sub.Target {
+		t.Fatalf("facts verdict=%q target=%q, want ready and %q", facts.Verdict, facts.WakeTarget, sub.Target)
+	}
+	if !facts.ReadAt.Equal(at) {
+		t.Fatalf("readAt = %v, want %v", facts.ReadAt, at)
+	}
+	read, err := db.Obligation(obligationID)
+	if err != nil || read.ReadAt.IsZero() || !read.ReadAt.Equal(at) {
+		t.Fatalf("stored readAt = %v, %v; want %v", read.ReadAt, err, at)
+	}
+
+	b.clock = fixedClock{at: at.Add(time.Hour)}
+	again, err := b.ConfirmRead(w.ID, obligationID)
+	if err != nil {
+		t.Fatalf("repeat ConfirmRead: %v", err)
+	}
+	if !again.ReadAt.Equal(at) {
+		t.Fatalf("repeat readAt = %v, want the first read unchanged", again.ReadAt)
 	}
 }

@@ -3289,3 +3289,219 @@ func TestT220ImportSQLiteIsInsertOrIgnoreT220(t *testing.T) {
 	}
 }
 
+// ===== T3.222 канонический ключ _meta для сессии (#320) =====
+
+func TestSessionIDFromMetaPrefersNeutralKey(t *testing.T) {
+	cases := []struct {
+		name string
+		meta map[string]any
+		want string
+	}{
+		{"neutral", map[string]any{SessionIDMetaKey: "ses_neutral"}, "ses_neutral"},
+		{"legacy", map[string]any{LegacySessionIDMetaKey: "ses_legacy"}, "ses_legacy"},
+		{"neutral wins", map[string]any{SessionIDMetaKey: "ses_neutral", LegacySessionIDMetaKey: "ses_legacy"}, "ses_neutral"},
+		{"wrong type", map[string]any{SessionIDMetaKey: 42}, ""},
+		{"empty", map[string]any{SessionIDMetaKey: ""}, ""},
+		{"none", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := SessionIDFromMeta(tc.meta); got != tc.want {
+				t.Fatalf("SessionIDFromMeta = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveSessionTargetSkipsWithoutMetaOrNotify(t *testing.T) {
+	if _, ok := ResolveSessionTarget(nil, ""); ok {
+		t.Fatal("no _meta and no notify.target must resolve to skip")
+	}
+	if _, ok := ResolveSessionTarget(nil, "   "); ok {
+		t.Fatal("blank notify.target must resolve to skip")
+	}
+	if got, ok := ResolveSessionTarget(nil, "notify-target"); !ok || got != "notify-target" {
+		t.Fatalf("notify target = %q, %v; want notify-target, true", got, ok)
+	}
+	got, ok := ResolveSessionTarget(map[string]any{SessionIDMetaKey: "ses_1"}, "notify-target")
+	if !ok || got != "ses_1" {
+		t.Fatalf("target = %q, %v; want the _meta session id", got, ok)
+	}
+}
+
+func TestSessionRegistryBindsWatchToTarget(t *testing.T) {
+	r := NewSessionRegistry()
+	if target, err := r.BindWatch("watch-1", "sub-1", map[string]any{LegacySessionIDMetaKey: "ses_old"}, ""); err != nil || target != "ses_old" {
+		t.Fatalf("BindWatch = %q, %v; want ses_old, nil", target, err)
+	}
+	if target, ok := r.Target("watch-1", "sub-1"); !ok || target != "ses_old" {
+		t.Fatalf("Target = %q, %v; want ses_old, true", target, ok)
+	}
+	if rows := r.Rows(); rows["watch-1"] != "ses_old" {
+		t.Fatalf("Rows = %v, want a watch-1 -> ses_old row", rows)
+	}
+	if _, err := r.BindWatch("watch-2", "sub-2", nil, ""); !errors.Is(err, ErrNoTarget) {
+		t.Fatalf("BindWatch without a source = %v, want ErrNoTarget", err)
+	}
+	if _, ok := r.Rows()["watch-2"]; ok {
+		t.Fatal("a skipped watch must not create a SessionRegistry row")
+	}
+}
+
+type boundDelivererStub struct {
+	calls    int
+	sessions []string
+}
+
+func (s *boundDelivererStub) Deliver(_ context.Context, sessionID string, _ domain.WakePayload) error {
+	s.calls++
+	s.sessions = append(s.sessions, sessionID)
+	return nil
+}
+
+func TestBoundDelivererSkipsUnboundWatch(t *testing.T) {
+	inner := &boundDelivererStub{}
+	d := &BoundDeliverer{Registry: NewSessionRegistry(), Inner: inner}
+	p := domain.WakePayload{WatchID: "watch-1", ObligationID: "obl-1"}
+
+	if err := d.Deliver(context.Background(), "ses_ghost", p); !errors.Is(err, ErrNoTarget) {
+		t.Fatalf("Deliver without binding = %v, want ErrNoTarget", err)
+	}
+	if inner.calls != 0 {
+		t.Fatalf("inner deliverer called %d times on a skipped watch", inner.calls)
+	}
+
+	if _, err := d.Registry.BindWatch("watch-1", "sub-1", map[string]any{SessionIDMetaKey: "ses_1"}, ""); err != nil {
+		t.Fatalf("BindWatch: %v", err)
+	}
+	if err := d.Deliver(context.Background(), "ses_1", p); err != nil {
+		t.Fatalf("Deliver after binding: %v", err)
+	}
+	if inner.calls != 1 || inner.sessions[0] != "ses_1" {
+		t.Fatalf("inner got %+v, want one delivery to ses_1", inner)
+	}
+	if err := d.Deliver(context.Background(), "ses_other", p); !errors.Is(err, ErrNoTarget) {
+		t.Fatalf("Deliver to an unbound session = %v, want ErrNoTarget", err)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("inner called %d times, want 1: no prompt for an unbound session", inner.calls)
+	}
+}
+
+// ===== T3.223 живучесть локации OpenCode (#320) =====
+
+func TestValidateLocationLiveness(t *testing.T) {
+	cfg := LocationConfig{Mitigation: LocationMitigationFalse, IdleTimeout: "false"}
+	good := LocationObservation{
+		Mitigation:   LocationMitigationFalse,
+		IdleFor:      W12LocationFacts.HeldWithMitigation,
+		PluginActive: true,
+	}
+	if err := ValidateLocationLiveness(cfg, good); err != nil {
+		t.Fatalf("ValidateLocationLiveness(good): %v", err)
+	}
+	short := good
+	short.IdleFor = W12LocationFacts.UnloadedAfter
+	if err := ValidateLocationLiveness(cfg, short); err == nil {
+		t.Fatal("a 2m47s observation must not prove a 3 minute hold")
+	}
+	gone := good
+	gone.PluginActive = false
+	if err := ValidateLocationLiveness(cfg, gone); err == nil {
+		t.Fatal("a vanished plugin must not prove liveness")
+	}
+	other := good
+	other.Mitigation = LocationMitigationKeepalive
+	if err := ValidateLocationLiveness(cfg, other); err == nil {
+		t.Fatal("an observation of a different mitigation must not prove this one")
+	}
+}
+
+func TestW12LocationFactsRecordMeasuredResult(t *testing.T) {
+	if W12LocationFacts.UnloadedAfter >= locationHoldFloor {
+		t.Fatalf("recorded unload %s should be below the 3 minute floor", W12LocationFacts.UnloadedAfter)
+	}
+	if W12LocationFacts.HeldWithMitigation <= locationHoldFloor {
+		t.Fatalf("recorded hold %s should exceed the 3 minute floor", W12LocationFacts.HeldWithMitigation)
+	}
+	if W12LocationFacts.ChosenMitigation != LocationMitigationFalse {
+		t.Fatalf("chosen mitigation = %q, want %q", W12LocationFacts.ChosenMitigation, LocationMitigationFalse)
+	}
+}
+
+// ===== T3.224 дедупликация доставки в Cursor Cloud Agents (#320) =====
+
+func TestCursorDelivererCoalescesDuplicate(t *testing.T) {
+	calls := 0
+	d := &CursorDeliverer{
+		Journal: NewCursorDeliveryJournal(),
+		Transport: func(_ context.Context, _ CursorSteer) (T206DeliveryStatus, error) {
+			calls++
+			return T206StatusDelivered, nil
+		},
+	}
+	steer := NewCursorSteer("wake", "steer")
+	first, err := d.DeliverSteer(context.Background(), "dlv-1", steer)
+	if err != nil || first.Status != T206StatusDelivered {
+		t.Fatalf("first = %+v, %v; want delivered", first, err)
+	}
+	second, err := d.DeliverSteer(context.Background(), "dlv-1", steer)
+	if err != nil || second.Status != T206StatusDuplicate || !second.Coalesced {
+		t.Fatalf("repeat = %+v, %v; want coalesced duplicate", second, err)
+	}
+	if calls != 1 {
+		t.Fatalf("transport called %d times, want 1", calls)
+	}
+}
+
+func TestCursorDelivererRejectsReusedIDWithDifferentBody(t *testing.T) {
+	d := &CursorDeliverer{
+		Journal: NewCursorDeliveryJournal(),
+		Transport: func(_ context.Context, _ CursorSteer) (T206DeliveryStatus, error) {
+			return T206StatusDelivered, nil
+		},
+	}
+	if _, err := d.DeliverSteer(context.Background(), "dlv-1", NewCursorSteer("first", "steer")); err != nil {
+		t.Fatalf("first delivery: %v", err)
+	}
+	_, err := d.DeliverSteer(context.Background(), "dlv-1", NewCursorSteer("second", "steer"))
+	if !errors.Is(err, T206ErrDeliveryIDReuse) {
+		t.Fatalf("reused id with a new body = %v, want T206ErrDeliveryIDReuse", err)
+	}
+}
+
+func TestCursorDelivererRetryAfterNetworkErrorIsDuplicate(t *testing.T) {
+	calls := 0
+	d := &CursorDeliverer{
+		Journal: NewCursorDeliveryJournal(),
+		Transport: func(_ context.Context, _ CursorSteer) (T206DeliveryStatus, error) {
+			calls++
+			if calls == 1 {
+				return "", errors.New("network error: the steer may have arrived")
+			}
+			return T206StatusDelivered, nil
+		},
+	}
+	steer := NewCursorSteer("wake", "steer")
+	if _, err := d.DeliverSteer(context.Background(), "dlv-1", steer); err == nil {
+		t.Fatal("first transport error should be reported")
+	}
+	retry, err := d.DeliverSteer(context.Background(), "dlv-1", steer)
+	if err != nil || retry.Status != T206StatusDuplicate {
+		t.Fatalf("retry = %+v, %v; want a coalesced duplicate", retry, err)
+	}
+	if calls != 1 {
+		t.Fatalf("transport called %d times after a retry, want 1", calls)
+	}
+}
+
+func TestCursorSteerBodyHasNoDeliveryID(t *testing.T) {
+	body, err := json.Marshal(NewCursorSteer("wake", "steer"))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(body), "deliveryId") {
+		t.Fatalf("Cursor steer body = %s, want only prompt and delivery", body)
+	}
+}
+
