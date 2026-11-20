@@ -399,3 +399,106 @@ func TestTaskEventTxRepeatIsNoOp(t *testing.T) {
 	}
 	assertPaired(t, tx.Path)
 }
+
+func TestCheckLinkageLinked(t *testing.T) {
+	got := CheckLinkage(Linkage{
+		Subject: "fix(store): close merged watches",
+		ADRRef:  "ADR 0295",
+		CardRef: "HD-022",
+	}, LinkagePorts{})
+	if got != LinkageLinked {
+		t.Fatalf("CheckLinkage = %q, ждали %q", got, LinkageLinked)
+	}
+}
+
+func TestCheckLinkageExempted(t *testing.T) {
+	got := CheckLinkage(Linkage{
+		Subject:       "feat: temporary hook",
+		Justification: "внешний инструмент без карточки",
+	}, LinkagePorts{})
+	if got != LinkageExempted {
+		t.Fatalf("CheckLinkage = %q, ждали %q", got, LinkageExempted)
+	}
+}
+
+func TestCheckLinkageMissing(t *testing.T) {
+	got := CheckLinkage(Linkage{Subject: "fix: no linkage here"}, LinkagePorts{})
+	if got != LinkageMissing {
+		t.Fatalf("CheckLinkage = %q, ждали %q", got, LinkageMissing)
+	}
+}
+
+func TestCheckLinkageEmpty(t *testing.T) {
+	if got := CheckLinkage(Linkage{}, LinkagePorts{}); got != LinkageEmpty {
+		t.Fatalf("CheckLinkage = %q, ждали %q", got, LinkageEmpty)
+	}
+}
+
+func TestCheckLinkageRequiresBothRefs(t *testing.T) {
+	cases := []struct {
+		name string
+		l    Linkage
+		want LinkageVerdict
+	}{
+		{"только ADR", Linkage{Subject: "fix: x", ADRRef: "ADR 0295"}, LinkageMissing},
+		{"только карточка", Linkage{Subject: "fix: x", CardRef: "HD-022"}, LinkageMissing},
+		{"обе ссылки", Linkage{Subject: "fix: x", ADRRef: "ADR 0295", CardRef: "HD-022"}, LinkageLinked},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := CheckLinkage(c.l, LinkagePorts{}); got != c.want {
+				t.Errorf("CheckLinkage = %q, ждали %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestCheckLinkagePorts(t *testing.T) {
+	ports := LinkagePorts{
+		ValidADR:  func(ref string) bool { return ref == "ADR 0295" },
+		ValidCard: func(ref string) bool { return ref == "HD-022" },
+	}
+	bad := CheckLinkage(Linkage{Subject: "fix: x", ADRRef: "ADR 0001", CardRef: "HD-022"}, ports)
+	if bad != LinkageMissing {
+		t.Errorf("недействительный ADR дал %q, ждали %q", bad, LinkageMissing)
+	}
+	good := CheckLinkage(Linkage{Subject: "fix: x", ADRRef: "ADR 0295", CardRef: "HD-022"}, ports)
+	if good != LinkageLinked {
+		t.Errorf("действительные ссылки дали %q, ждали %q", good, LinkageLinked)
+	}
+}
+
+func TestParseLinkage(t *testing.T) {
+	msg := "fix(store): close merged watches (HD-022)\n\nСсылка на ADR 0295.\nОбоснование: внешний инструмент без карточки"
+	l := ParseLinkage(msg)
+	checks := map[string]bool{
+		"subject":       l.Subject == "fix(store): close merged watches (HD-022)",
+		"adr":           l.ADRRef == "ADR 0295",
+		"card":          l.CardRef == "HD-022",
+		"justification": l.Justification == "внешний инструмент без карточки",
+	}
+	for name, ok := range checks {
+		if !ok {
+			t.Errorf("поле %s разобрано неверно: %+v", name, l)
+		}
+	}
+}
+
+func TestRequiresLinkage(t *testing.T) {
+	cases := []struct {
+		subject string
+		want    bool
+	}{
+		{"feat(store): add x", true},
+		{"fix: repair y", true},
+		{"feat!: break z", true},
+		{"docs: update readme", false},
+		{"no type here", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := RequiresLinkage(c.subject); got != c.want {
+			t.Errorf("RequiresLinkage(%q) = %v, ждали %v", c.subject, got, c.want)
+		}
+	}
+}

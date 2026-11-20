@@ -2651,3 +2651,19 @@ func (s *Service) HandoffStatus(taskID string) (HandoffStatus, error) {
 	out.Completed = out.Answer == HandoffContinued
 	return out, nil
 }
+
+// ---- HD-022 / ADR 0295: связь feat/fix с milestone ----
+//
+// Проверка связи живёт в taskstore и остаётся чистой. Этот метод только
+// разбирает текст коммита и подставляет порты. Для коммитов вне feat/fix
+// связь не требуется, поэтому исход LinkageEmpty.
+
+// CheckCommitLinkage разбирает текст коммита и проверяет связь с milestone.
+// Порты передаёт вызывающий, чтобы проверка не делала I/O.
+func (s *Service) CheckCommitLinkage(message string, ports taskstore.LinkagePorts) taskstore.LinkageVerdict {
+	l := taskstore.ParseLinkage(message)
+	if !taskstore.RequiresLinkage(l.Subject) {
+		return taskstore.LinkageEmpty
+	}
+	return taskstore.CheckLinkage(l, ports)
+}
