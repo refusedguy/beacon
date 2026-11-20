@@ -673,3 +673,137 @@ func TestValidateStrictJSONRejectsNonStrictBodies(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildDocsIndexIsDerivedFromSources proves the index is generated from
+// markdown files, keeps current docs grouped by section, and ignores the
+// backlog subtrees that have their own gates.
+func TestBuildDocsIndexIsDerivedFromSources(t *testing.T) {
+	root := t.TempDir()
+	docs := filepath.Join(root, "docs")
+	files := map[string]string{
+		"README.md":              "# Beacon\n\nIntro.\n",
+		"design/ARCH.md":         "# Architecture\n",
+		"design/deep.md":         "no heading here\n",
+		"tasks/HD-089.md":        "# HD-089. Index\n",
+		"adrs/0001-example.md":   "# ADR 1\n",
+		"INDEX.md":               "stale index that must be ignored\n",
+		"gates/[brackets].md":    "# Gate [special]\n",
+		"gates/not-markdown.txt": "ignored\n",
+	}
+	for rel, body := range files {
+		path := filepath.Join(docs, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := BuildDocsIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		docsIndexMarker,
+		"# Documentation index",
+		"## Root",
+		"- [Beacon](README.md)",
+		"## design",
+		"- [Architecture](design/ARCH.md)",
+		"- [deep](design/deep.md)",
+		"## gates",
+		"- [Gate \\[special\\]](gates/[brackets].md)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("generated index missing %q:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{
+		"tasks/HD-089.md",
+		"adrs/0001-example.md",
+		"not-markdown.txt",
+		"stale index that must be ignored",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("generated index contains %q:\n%s", unwanted, got)
+		}
+	}
+
+	again, err := BuildDocsIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != got {
+		t.Fatal("BuildDocsIndex is not deterministic")
+	}
+}
+
+// TestCheckDocsIndexCatchesStaleAndManualIndex is the negative control for
+// HD-089: a generated index passes, a hand edit or a missing file fails.
+func TestCheckDocsIndexCatchesStaleAndManualIndex(t *testing.T) {
+	root := t.TempDir()
+	docs := filepath.Join(root, "docs")
+	if err := os.MkdirAll(filepath.Join(docs, "design"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(docs, "design", "ARCH.md")
+	if err := os.WriteFile(source, []byte("# Architecture\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	index := filepath.Join(docs, docsIndexFile)
+
+	generated, err := BuildDocsIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(index, []byte(generated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDocsIndex(root); err != nil {
+		t.Fatalf("generated index failed check: %v", err)
+	}
+
+	// A manual index fails even when it looks plausible.
+	if err := os.WriteFile(index, []byte("# Documentation index\n\n- [Hand written](design/ARCH.md)\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDocsIndex(root); err == nil {
+		t.Fatal("CheckDocsIndex accepted a hand-edited index")
+	}
+
+	// A source change makes the once-current index stale.
+	if err := os.WriteFile(index, []byte(generated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte("# Architecture v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDocsIndex(root); err == nil {
+		t.Fatal("CheckDocsIndex accepted a stale index")
+	}
+
+	// A missing index fails as well.
+	if err := os.Remove(index); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckDocsIndex(root); err == nil {
+		t.Fatal("CheckDocsIndex accepted a missing index")
+	}
+}
+
+// TestBuildDocsIndexEmptyTree keeps the generated marker even when there is
+// nothing to list, so an empty index is never mistaken for a hand-written one.
+func TestBuildDocsIndexEmptyTree(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := BuildDocsIndex(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, docsIndexMarker) || !strings.Contains(got, "_No documentation files._") {
+		t.Fatalf("empty index lost its marker or placeholder:\n%s", got)
+	}
+}
