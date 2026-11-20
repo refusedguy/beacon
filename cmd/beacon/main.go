@@ -101,9 +101,10 @@ func wireOpenCodePorts() {
 
 // installOpenCodePorts adapts one client to every command port it can serve.
 // The live source is always installed. The spawn and delivery ports are
-// installed only when the client also implements the corresponding narrow
-// interface; the T3.144 reader currently has no POST routes, so the type
-// assertions keep both commands honestly unwired until those routes land.
+// installed by type assertion against the narrow interfaces in spawn.go,
+// deliver.go and opencode.go; the T3.144 reader has no POST routes and no
+// fallback starter, so those ports stay honestly unwired until T3.150 and
+// T3.151 merge. No call to a method that does not exist yet is compiled here.
 func installOpenCodePorts(port opencodePort) {
 	SetLiveSource(newLiveOpencodeSource(port))
 	if spawner, ok := port.(sessionSpawner); ok {
@@ -111,6 +112,12 @@ func installOpenCodePorts(port opencodePort) {
 	}
 	if target, ok := port.(deliveryTarget); ok {
 		SetDeliveryTarget(target)
+	}
+	if creator, ok := port.(sessionCreator); ok {
+		SetSessionCreator(creator)
+	}
+	if ensurer, ok := port.(serverEnsurer); ok {
+		SetServerEnsurer(ensurer)
 	}
 }
 
