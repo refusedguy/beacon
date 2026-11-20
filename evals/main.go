@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -59,12 +60,20 @@ type evalResult struct {
 	pass     bool
 }
 
+// reFrozenConst вытаскивает значение константы frozenScenarioHash из e2e_test.go.
+// reFrozenReadme вытаскивает 64 hex-символа из tests/e2e/README.md.
+var (
+	reFrozenConst  = regexp.MustCompile(`const\s+frozenScenarioHash\s*=\s*"([0-9a-f]{64})"`)
+	reFrozenReadme = regexp.MustCompile(`[0-9a-f]{64}`)
+	reE2EJob       = regexp.MustCompile(`(?m)^  e2e:\s*$`)
+)
+
 func main() {
 	os.Exit(run())
 }
 
 func run() int {
-	results := make([]evalResult, 0, 9)
+	results := make([]evalResult, 0, 10)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -338,6 +347,13 @@ func run() int {
 	shipActual := fmt.Sprintf("с Ship: %s (wake=%d); без Ship: %s", verdictWith, len(wakeWith), verdictWithout)
 	record("09_ship_verdict", "с ShipFacts ready, без ShipFacts не ready", shipActual, shipPass)
 
+	// eval 10: двухфазный локальный CI-гейт. Не запускает tests/e2e/run.sh изнутри,
+	// чтобы не получить рекурсию. Проверяет инварианты приёмки: девять базовых
+	// eval зелёные, замороженный хеш совпадает в e2e_test.go и README и непустой,
+	// e2e-скрипт существует и исполняемый, в ci.yml есть джоба e2e.
+	gateActual, gatePass := checkTwoPhaseLocalCIGate(repoRoot, results)
+	record("10_two_phase_local_ci_gate", "9/9 eval PASS; хеш совпадает; run.sh исполняемый; джоба e2e есть", gateActual, gatePass)
+
 	printTable(results)
 	passed, failed := 0, 0
 	for _, r := range results {
@@ -372,6 +388,109 @@ func shipReadySnapshot(ship domain.ShipFacts) domain.Snapshot {
 		SuitesValid: true,
 		Ship:        ship,
 	}
+}
+
+// checkTwoPhaseLocalCIGate проверяет инварианты приёмки, не запуская e2e-скрипт.
+// prior — уже выполненные девять базовых eval. Негативный контроль: если
+// frozenScenarioHash в e2e_test.go изменить, не обновив README, хеши расходятся
+// и гейт красный. То же происходит при пустом хеше, неисполняемом run.sh или
+// отсутствии джобы e2e в ci.yml.
+func checkTwoPhaseLocalCIGate(repoRoot string, prior []evalResult) (string, bool) {
+	// findRepoRoot находит evals/go.mod, потому что run.sh делает cd в evals/.
+	// Инварианты живут в корне git-ворктри, поэтому поднимаемся наверх.
+	gateRoot := findGateRoot(repoRoot)
+	var failures []string
+
+	if len(prior) != 9 {
+		failures = append(failures, fmt.Sprintf("ожидалось 9 базовых eval, получено %d", len(prior)))
+	} else {
+		for _, r := range prior {
+			if !r.pass {
+				failures = append(failures, r.name+"=FAIL")
+			}
+		}
+	}
+
+	goHash, mdHash, problems := readFrozenHashes(gateRoot)
+	failures = append(failures, problems...)
+	if goHash != "" && mdHash != "" && goHash != mdHash {
+		failures = append(failures, fmt.Sprintf("хеш расходится: e2e_test.go=%s, README=%s", goHash, mdHash))
+	}
+
+	script := filepath.Join(gateRoot, "tests", "e2e", "run.sh")
+	info, err := os.Stat(script)
+	switch {
+	case err != nil:
+		failures = append(failures, "tests/e2e/run.sh: "+err.Error())
+	case info.IsDir():
+		failures = append(failures, "tests/e2e/run.sh — каталог, не файл")
+	case info.Mode().Perm()&0o111 == 0:
+		failures = append(failures, "tests/e2e/run.sh не исполняемый")
+	}
+
+	ci, err := os.ReadFile(filepath.Join(gateRoot, ".github", "workflows", "ci.yml"))
+	if err != nil {
+		failures = append(failures, "ci.yml: "+err.Error())
+	} else if !reE2EJob.Match(ci) {
+		failures = append(failures, "в ci.yml нет джобы e2e")
+	}
+
+	if len(failures) > 0 {
+		return strings.Join(failures, "; "), false
+	}
+	return fmt.Sprintf("9/9 eval PASS; хеш %s… совпадает; run.sh исполняемый; джоба e2e есть", goHash[:12]), true
+}
+
+// findGateRoot поднимается от каталога модуля evals до каталога, где лежат
+// e2e-тесты и workflow CI. Если такого нет, возвращает start, чтобы сообщение
+// об ошибке содержало конкретный путь.
+func findGateRoot(start string) string {
+	dir := start
+	for {
+		if isFile(filepath.Join(dir, "tests", "e2e", "e2e_test.go")) &&
+			isFile(filepath.Join(dir, ".github", "workflows", "ci.yml")) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return start
+		}
+		dir = parent
+	}
+}
+
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// readFrozenHashes читает замороженный хеш из исходника e2e и из tests/e2e/README.md.
+func readFrozenHashes(repoRoot string) (string, string, []string) {
+	var problems []string
+	goData, err := os.ReadFile(filepath.Join(repoRoot, "tests", "e2e", "e2e_test.go"))
+	if err != nil {
+		problems = append(problems, "e2e_test.go: "+err.Error())
+	}
+	mdData, err := os.ReadFile(filepath.Join(repoRoot, "tests", "e2e", "README.md"))
+	if err != nil {
+		problems = append(problems, "tests/e2e/README.md: "+err.Error())
+	}
+
+	goHash, mdHash := "", ""
+	if m := reFrozenConst.FindSubmatch(goData); m != nil {
+		goHash = string(m[1])
+	} else {
+		problems = append(problems, "в e2e_test.go нет константы frozenScenarioHash")
+	}
+	if m := reFrozenReadme.Find(mdData); m != nil {
+		mdHash = string(m)
+	} else {
+		problems = append(problems, "в tests/e2e/README.md нет 64-символьного хеша")
+	}
+	if goHash == "" || mdHash == "" {
+		problems = append(problems, "замороженный хеш пустой")
+	}
+	return goHash, mdHash, problems
 }
 
 // callTool добавляет непрозрачный sessionID в _meta: обработчики get_result и

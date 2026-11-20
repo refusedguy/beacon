@@ -2,7 +2,7 @@
 
 Набор локальных проверок в стиле Harbor. Раннер печатает таблицу с ожидаемым
 результатом, фактическим результатом и вердиктом `PASS`/`FAIL`. В конце выводится
-строка вида `9 passed, 0 failed`. При наличии `FAIL` код выхода равен 1.
+строка вида `10 passed, 0 failed`. При наличии `FAIL` код выхода равен 1.
 
 ## Запуск
 
@@ -61,6 +61,13 @@ eval-специфичную точку входа `evals/cmd/evalserver`: она
 | `07_ack` | Вызывает `beacon_ack` с `watchID` и `obligationID` | `ok=true` |
 | `08_cancel` | Вызывает `beacon_cancel_watch` с `watchID` | `ok=true` |
 | `09_ship_verdict` | Собирает `domain.Snapshot` с зелёными обязательными проверками и `ShipFacts{Build, Audit, TDD}` и вызывает `domain.Evaluate` | с `ShipFacts` вердикт `ready`; без `ShipFacts` вердикт не `ready` |
+| `10_two_phase_local_ci_gate` | Сверяет инварианты приёмки, не запуская `tests/e2e/run.sh` изнутри | девять базовых eval PASS; `frozenScenarioHash` непустой и совпадает в `e2e_test.go` и `tests/e2e/README.md`; `tests/e2e/run.sh` существует и исполняемый; джоба `e2e` есть в `.github/workflows/ci.yml` |
+
+`10_two_phase_local_ci_gate` читает файлы, но не выполняет e2e-скрипт: вызов
+`tests/e2e/run.sh` из набора дал бы рекурсию. Негативный контроль: правка
+`frozenScenarioHash` в `e2e_test.go` без обновления `tests/e2e/README.md`
+расходится с хешем в README и роняет eval. Если расходятся девять базовых eval,
+гейт тоже красный.
 
 `09_ship_verdict` работает в процессе раннера, без MCP-сервера. Он импортирует
 чистую функцию `domain.Evaluate` из родительского модуля. Позитивный контроль
