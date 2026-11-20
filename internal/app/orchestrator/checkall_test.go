@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"testing/fstest"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -671,5 +673,102 @@ func TestValidateStrictJSONRejectsNonStrictBodies(t *testing.T) {
 				t.Fatalf("ValidateStrictJSON accepted %q", tc.body)
 			}
 		})
+	}
+}
+
+// ---- generated documentation index (HD-089) -----------------------------
+
+// TestBuildDocsIndexIsDeterministic: the same document set renders the same
+// bytes regardless of input order, duplicates or "./" decoration.
+func TestBuildDocsIndexIsDeterministic(t *testing.T) {
+	paths := []string{"docs/b.md", "./docs/a.md", "docs/sub/c.md", "docs/b.md"}
+	want := docsIndexPreamble +
+		"- [docs/a.md](docs/a.md)\n" +
+		"- [docs/b.md](docs/b.md)\n" +
+		"- [docs/sub/c.md](docs/sub/c.md)\n"
+	got := BuildDocsIndex(paths)
+	if got != want {
+		t.Fatalf("BuildDocsIndex = %q, want %q", got, want)
+	}
+	if again := BuildDocsIndex([]string{"docs/sub/c.md", "docs/b.md", "docs/a.md"}); again != got {
+		t.Fatalf("input order changed the index:\n%q\n%q", got, again)
+	}
+}
+
+// TestBuildDocsIndexEmptyDoesNotExpand: an empty document set renders an empty
+// index; discovery is never widened silently to make a check pass.
+func TestBuildDocsIndexEmptyDoesNotExpand(t *testing.T) {
+	if got := BuildDocsIndex(nil); got != docsIndexPreamble {
+		t.Fatalf("empty index = %q, want only the preamble", got)
+	}
+}
+
+// TestBuildDocsIndexSkipsSelfAndOutsidePaths: the generated file never links
+// to itself and paths outside the repository are ignored.
+func TestBuildDocsIndexSkipsSelfAndOutsidePaths(t *testing.T) {
+	got := BuildDocsIndex([]string{"docs/INDEX.md", "/etc/passwd", "../secret.md", "docs/ok.md"})
+	if want := docsIndexPreamble + "- [docs/ok.md](docs/ok.md)\n"; got != want {
+		t.Fatalf("BuildDocsIndex = %q, want %q", got, want)
+	}
+}
+
+// TestGenerateDocsIndexWritesGeneratedBytes: the emitter writes exactly what
+// the pure builder renders and rejects a nil writer.
+func TestGenerateDocsIndexWritesGeneratedBytes(t *testing.T) {
+	paths := []string{"docs/z.md", "docs/a.md"}
+	var buf bytes.Buffer
+	if err := GenerateDocsIndex(&buf, paths); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := buf.String(), BuildDocsIndex(paths); got != want {
+		t.Fatalf("generated = %q, want %q", got, want)
+	}
+	if err := GenerateDocsIndex(nil, paths); err == nil {
+		t.Fatal("GenerateDocsIndex accepted a nil writer")
+	}
+}
+
+// TestCheckDocsIndexDetectsStaleAndManual: --check passes the generated file
+// and fails both a stale list and a hand-written index.
+func TestCheckDocsIndexDetectsStaleAndManual(t *testing.T) {
+	paths := []string{"docs/a.md", "docs/b.md"}
+	if err := CheckDocsIndex(BuildDocsIndex(paths), paths); err != nil {
+		t.Fatalf("CheckDocsIndex(generated) = %v, want nil", err)
+	}
+	stale := BuildDocsIndex([]string{"docs/a.md"})
+	if err := CheckDocsIndex(stale, paths); err == nil {
+		t.Fatal("CheckDocsIndex accepted a stale index")
+	}
+	manual := "# Documentation index\n\n- docs/a.md\n- docs/b.md\n"
+	if err := CheckDocsIndex(manual, paths); err == nil {
+		t.Fatal("CheckDocsIndex accepted a hand-written index")
+	}
+}
+
+// TestDocsIndexPathsDiscoversOnlyMarkdown: discovery returns sorted markdown
+// paths, skips the generated index and never silently widens the result.
+func TestDocsIndexPathsDiscoversOnlyMarkdown(t *testing.T) {
+	fsys := fstest.MapFS{
+		"docs/b.md":       &fstest.MapFile{Data: []byte("b")},
+		"docs/a.md":       &fstest.MapFile{Data: []byte("a")},
+		"docs/INDEX.md":   &fstest.MapFile{Data: []byte("index")},
+		"docs/notes.txt":  &fstest.MapFile{Data: []byte("notes")},
+		"docs/sub/c.md":   &fstest.MapFile{Data: []byte("c")},
+		"external/out.md": &fstest.MapFile{Data: []byte("out")},
+	}
+	got, err := DocsIndexPaths(fsys, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"docs/a.md", "docs/b.md", "docs/sub/c.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DocsIndexPaths = %v, want %v", got, want)
+	}
+	empty, err := DocsIndexPaths(fstest.MapFS{}, "docs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty discovery = %v, want none", empty)
 	}
 }
