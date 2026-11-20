@@ -101,14 +101,18 @@ func DefaultMergePolicy() MergePolicy {
 	return MergePolicy{AutoMerge: true}
 }
 
-// Subscriber is one party waiting for a Watch result.
+// Subscriber is one party waiting for a Watch result. OrchestratorID is the
+// optional parent session carried by an executor at registration. It is stored
+// as opaque caller data and never selects a wake recipient: blocked wakes keep
+// following the subscriber with role orchestrator.
 type Subscriber struct {
-	ID           string    `json:"id"`
-	Role         Role      `json:"role"`
-	Adapter      string    `json:"adapter"`
-	Target       string    `json:"target"`
-	AddedAt      time.Time `json:"addedAt"`
-	LastActivity time.Time `json:"lastActivity"`
+	ID             string    `json:"id"`
+	Role           Role      `json:"role"`
+	Adapter        string    `json:"adapter"`
+	Target         string    `json:"target"`
+	OrchestratorID string    `json:"orchestratorID,omitempty"`
+	AddedAt        time.Time `json:"addedAt"`
+	LastActivity   time.Time `json:"lastActivity"`
 }
 
 // BlockedInfo records why a Watch is blocked, which checks failed, when the
@@ -123,28 +127,32 @@ type BlockedInfo struct {
 }
 
 // Watch is the unit of work. Optional fields use the Go zero value when absent.
+// OrchestratorID records the parent session supplied at registration. It is
+// persisted and rebindable, but it is not a wake address: routing still uses
+// the subscriber with role orchestrator.
 type Watch struct {
-	ID            string           `json:"id"`
-	Repo          string           `json:"repo"`
-	PR            int              `json:"pr"`
-	HeadSHA       string           `json:"headSHA"`
-	BaseRef       string           `json:"baseRef"`
-	Issue         string           `json:"issue"`
-	Status        Status           `json:"status"`
-	Verdict       Verdict          `json:"verdict"`
-	Blocked       *BlockedInfo     `json:"blocked,omitempty"`
-	Revision      uint64           `json:"revision"`
-	Checks        map[string]Check `json:"checks"`
-	Merge         MergeInfo        `json:"merge"`
-	Flaky         FlakyConfig      `json:"flaky"`
-	Policy        Policy           `json:"policy"`
-	MergePolicy   MergePolicy      `json:"mergePolicy"`
-	Subscribers   []Subscriber     `json:"subscribers"`
-	DeadlineAt    time.Time        `json:"deadlineAt"`
-	NoChecksSince time.Time        `json:"noChecksSince"`
-	CreatedAt     time.Time        `json:"createdAt"`
-	ClosedAt      time.Time        `json:"closedAt"`
-	CloseReason   string           `json:"closeReason"`
+	ID             string           `json:"id"`
+	Repo           string           `json:"repo"`
+	PR             int              `json:"pr"`
+	HeadSHA        string           `json:"headSHA"`
+	BaseRef        string           `json:"baseRef"`
+	Issue          string           `json:"issue"`
+	Status         Status           `json:"status"`
+	Verdict        Verdict          `json:"verdict"`
+	Blocked        *BlockedInfo     `json:"blocked,omitempty"`
+	Revision       uint64           `json:"revision"`
+	Checks         map[string]Check `json:"checks"`
+	Merge          MergeInfo        `json:"merge"`
+	Flaky          FlakyConfig      `json:"flaky"`
+	Policy         Policy           `json:"policy"`
+	MergePolicy    MergePolicy      `json:"mergePolicy"`
+	Subscribers    []Subscriber     `json:"subscribers"`
+	OrchestratorID string           `json:"orchestratorID,omitempty"`
+	DeadlineAt     time.Time        `json:"deadlineAt"`
+	NoChecksSince  time.Time        `json:"noChecksSince"`
+	CreatedAt      time.Time        `json:"createdAt"`
+	ClosedAt       time.Time        `json:"closedAt"`
+	CloseReason    string           `json:"closeReason"`
 }
 
 // Attempt is one recorded delivery try for an Obligation.

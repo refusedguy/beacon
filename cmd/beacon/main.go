@@ -29,6 +29,8 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon task <list|new|take> [flags]
   beacon why <task>
   beacon mcp
+  beacon orchestrate [--dry-run] [--format table|json]
+  beacon orchestrator rebind --from <old> --to <new> [--dry-run]
   beacon agents [--format table|json]
   beacon watch [--live] [--interval 2s] [--format table|json]
   beacon spawn <taskID> [--agent id] [--title ...]
@@ -241,6 +243,8 @@ func (c *CLI) dispatch(args []string) int {
 		return mcpRunner(c.errOut)
 	case "orchestrate":
 		return orchestratorRunner(c, args[1:])
+	case "orchestrator":
+		return orchestratorCommandRunner(c, args[1:])
 	case "agents":
 		return c.runAgents(args[1:])
 	case "watch":

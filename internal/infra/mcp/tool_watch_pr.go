@@ -33,16 +33,17 @@ const (
 // WatchPRInput is the argument shape of beacon_watch_pr (WORKER-PROMPT §4.1).
 // All fields except repo, pr and role are optional in the contract.
 type WatchPRInput struct {
-	Repo       string           `json:"repo" jsonschema:"repository slug, for example owner/name"`
-	PR         int              `json:"pr" jsonschema:"pull request number, must be positive"`
-	HeadSHA    string           `json:"headSHA,omitempty" jsonschema:"head commit SHA; resolved from the CI provider when omitted"`
-	Issue      string           `json:"issue,omitempty"`
-	Role       domain.Role      `json:"role" jsonschema:"subscriber role: executor or orchestrator"`
-	Notify     *WatchPRNotify   `json:"notify,omitempty"`
-	Executor   *WatchPRExecutor `json:"executor,omitempty"`
-	Flaky      *WatchPRFlaky    `json:"flaky,omitempty"`
-	Policy     *WatchPRPolicy   `json:"policy,omitempty"`
-	DeadlineMs *int64           `json:"deadlineMs,omitempty" jsonschema:"watch deadline in milliseconds from now"`
+	Repo           string           `json:"repo" jsonschema:"repository slug, for example owner/name"`
+	PR             int              `json:"pr" jsonschema:"pull request number, must be positive"`
+	HeadSHA        string           `json:"headSHA,omitempty" jsonschema:"head commit SHA; resolved from the CI provider when omitted"`
+	Issue          string           `json:"issue,omitempty"`
+	Role           domain.Role      `json:"role" jsonschema:"subscriber role: executor or orchestrator"`
+	Notify         *WatchPRNotify   `json:"notify,omitempty"`
+	Executor       *WatchPRExecutor `json:"executor,omitempty"`
+	Flaky          *WatchPRFlaky    `json:"flaky,omitempty"`
+	Policy         *WatchPRPolicy   `json:"policy,omitempty"`
+	DeadlineMs     *int64           `json:"deadlineMs,omitempty" jsonschema:"watch deadline in milliseconds from now"`
+	OrchestratorID string           `json:"orchestratorID,omitempty" jsonschema:"opaque parent session id of the orchestrator; stored on the Watch, never used for wake routing"`
 }
 
 // WatchPRNotify is the optional delivery endpoint of the registering party.
@@ -162,6 +163,10 @@ func (h *WatchPRHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest
 // An optional in.Executor descriptor is accepted as opaque caller data. The
 // core never interprets its agent name and never uses the descriptor to change
 // subscriber identity, routing or the persisted Watch (T5.31, ADR 0088).
+//
+// An optional in.OrchestratorID is likewise opaque: it is stored on the Watch
+// and on the registering Subscriber for a later rebind, but it never selects a
+// wake recipient. Blocked wakes keep following the orchestrator subscriber.
 func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolRequest, in WatchPRInput) (WatchPROutput, error) {
 	if in.Repo == "" || in.PR <= 0 {
 		return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput, "watch_pr: repo and a positive pr are required")
@@ -193,15 +198,16 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 
 	w := domain.Watch{
-		Repo:        in.Repo,
-		PR:          in.PR,
-		HeadSHA:     headSHA,
-		BaseRef:     baseRef,
-		Issue:       in.Issue,
-		Status:      domain.StatusWatching,
-		Verdict:     domain.VerdictWatching,
-		Subscribers: carried,
-		CreatedAt:   now,
+		Repo:           in.Repo,
+		PR:             in.PR,
+		HeadSHA:        headSHA,
+		BaseRef:        baseRef,
+		Issue:          in.Issue,
+		Status:         domain.StatusWatching,
+		Verdict:        domain.VerdictWatching,
+		Subscribers:    carried,
+		OrchestratorID: in.OrchestratorID,
+		CreatedAt:      now,
 	}
 	if in.Flaky != nil {
 		w.Flaky = domain.FlakyConfig{
@@ -224,10 +230,11 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 
 	s := domain.Subscriber{
-		ID:      subscriberID,
-		Role:    in.Role,
-		Adapter: adapter,
-		Target:  target,
+		ID:             subscriberID,
+		Role:           in.Role,
+		Adapter:        adapter,
+		Target:         target,
+		OrchestratorID: in.OrchestratorID,
 	}
 
 	sub, err := h.fanout.Subscribe(w, s)
@@ -236,6 +243,30 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		return WatchPROutput{}, err
 	}
 	observe.WatchRegistered(sub.Watch.ID, in.PR, sub.Watch.Revision, adapter)
+
+	// Fanout rebuilds its target from the stored Watch when the (repo, pr,
+	// headSHA) alias already exists, so the new field would be dropped on a
+	// renewal. Apply it in place to the Watch Fanout just persisted. No
+	// subscriber is added or removed here, so wake routing is unchanged.
+	if in.OrchestratorID != "" {
+		updated := sub.Watch
+		changed := updated.OrchestratorID != in.OrchestratorID
+		updated.OrchestratorID = in.OrchestratorID
+		for i := range updated.Subscribers {
+			if updated.Subscribers[i].ID == subscriberID &&
+				updated.Subscribers[i].OrchestratorID != in.OrchestratorID {
+				updated.Subscribers[i].OrchestratorID = in.OrchestratorID
+				changed = true
+			}
+		}
+		if changed {
+			if err := h.store.SaveWatch(updated); err != nil {
+				observe.ActorError("watch_pr-orchestrator", "", err)
+				return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			}
+			sub.Watch = updated
+		}
+	}
 
 	// One watch_pr call reaches every injected bridge through the same
 	// six-operation port. Each bridge decides whether the work applies to its

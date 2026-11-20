@@ -1073,3 +1073,123 @@ func TestRegisterAndBindFailsOnRegistryError(t *testing.T) {
 	_, err = RegisterAndBind(context.Background(), nil, NewWatchSessionRegistry(), sessionReq("session-X"), in)
 	assertCode(t, err, domain.CodePersistFailed)
 }
+
+// TestWatchPRInputSchemaHasOrchestratorID keeps the optional parent session in
+// the derived MCP input schema and out of the required list. A caller written
+// before this field existed still sends a valid watch_pr call.
+func TestWatchPRInputSchemaHasOrchestratorID(t *testing.T) {
+	schema, err := jsonschema.For[WatchPRInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	if _, ok := schema.Properties["orchestratorID"]; !ok {
+		t.Fatal("input schema has no orchestratorID property")
+	}
+	for _, name := range schema.Required {
+		if name == "orchestratorID" {
+			t.Fatal("orchestratorID must stay optional")
+		}
+	}
+}
+
+// TestRegisterStoresOrchestratorID proves the parent session is persisted on
+// both the Watch and the registering Subscriber.
+func TestRegisterStoresOrchestratorID(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("orchestrator-id-sha", domain.RoleExecutor)
+	in.OrchestratorID = "ses_parent_1"
+
+	out, err := h.Register(context.Background(), sessionReq("ses_executor_1"), in)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("stored Watch: %v", err)
+	}
+	if w.OrchestratorID != in.OrchestratorID {
+		t.Errorf("Watch.OrchestratorID = %q, want %q", w.OrchestratorID, in.OrchestratorID)
+	}
+	var found bool
+	for _, sub := range w.Subscribers {
+		if sub.ID == "ses_executor_1" {
+			found = true
+			if sub.OrchestratorID != in.OrchestratorID {
+				t.Errorf("Subscriber.OrchestratorID = %q, want %q", sub.OrchestratorID, in.OrchestratorID)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("executor subscriber not stored")
+	}
+}
+
+// TestRegisterOrchestratorIDIsNotAWakeAddress proves the field never becomes
+// a routing subscriber: blocked wakes still follow the orchestrator role.
+func TestRegisterOrchestratorIDIsNotAWakeAddress(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("no-route-sha", domain.RoleExecutor)
+	in.OrchestratorID = "ses_parent_2"
+
+	out, err := h.Register(context.Background(), sessionReq("ses_executor_2"), in)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("stored Watch: %v", err)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.Role == domain.RoleOrchestrator {
+			t.Fatalf("orchestratorID created a routing subscriber: %+v", sub)
+		}
+	}
+
+	// The reverse inference is also absent: an orchestrator subscriber alone
+	// does not populate the stored field.
+	h2 := NewWatchPRHandler(newMemStore(), nil, &stepClock{t: time.Now()})
+	in2 := watchPRTestInput("role-only-sha", domain.RoleOrchestrator)
+	out2, err := h2.Register(context.Background(), sessionReq("ses_orchestrator_2"), in2)
+	if err != nil {
+		t.Fatalf("Register role only: %v", err)
+	}
+	w2, err := h2.store.Watch(out2.WatchID)
+	if err != nil {
+		t.Fatalf("stored Watch: %v", err)
+	}
+	if w2.OrchestratorID != "" {
+		t.Errorf("orchestratorID = %q, want empty when not supplied", w2.OrchestratorID)
+	}
+}
+
+// TestRegisterOrchestratorIDOnRenew covers the alias-reuse path, where Fanout
+// rebuilds the target from the stored Watch and would otherwise drop the new
+// field.
+func TestRegisterOrchestratorIDOnRenew(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("renew-orchestrator-sha", domain.RoleExecutor)
+
+	out, err := h.Register(context.Background(), sessionReq("ses_executor_3"), in)
+	if err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	in.OrchestratorID = "ses_parent_3"
+	if _, err := h.Register(context.Background(), sessionReq("ses_executor_3"), in); err != nil {
+		t.Fatalf("renew Register: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("stored Watch: %v", err)
+	}
+	if w.OrchestratorID != "ses_parent_3" {
+		t.Errorf("Watch.OrchestratorID after renew = %q, want ses_parent_3", w.OrchestratorID)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.ID == "ses_executor_3" && sub.OrchestratorID != "ses_parent_3" {
+			t.Errorf("Subscriber.OrchestratorID after renew = %q, want ses_parent_3", sub.OrchestratorID)
+		}
+	}
+}
