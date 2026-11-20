@@ -92,6 +92,18 @@ func TestTransition(t *testing.T) {
 			wantStatus: StatusClosed, wantVerdict: VerdictClosed, wantRevision: 5,
 			wantCloseReason: CloseReasonClosed, wantClosedAt: at,
 		},
+		// ADR 0059 §6: only a successful acceptance command closes the Watch.
+		{
+			name: "successful acceptance closes with reason accepted", status: StatusNotifying, verdict: VerdictReady, headSHA: oldSHA, revision: 4,
+			event:      AcceptEvent(true, at),
+			wantStatus: StatusClosed, wantVerdict: VerdictAccepted, wantRevision: 5,
+			wantCloseReason: CloseReasonAccepted, wantClosedAt: at,
+		},
+		{
+			name: "failed acceptance leaves the Watch open", status: StatusWatching, verdict: VerdictWatching, headSHA: oldSHA, revision: 4,
+			event:      AcceptEvent(false, at),
+			wantStatus: StatusWatching, wantVerdict: VerdictWatching, wantRevision: 4,
+		},
 		// notifying -> notifying.
 		{
 			name: "notifying to notifying on repeated actionable verdict", status: StatusNotifying, verdict: VerdictReady, headSHA: oldSHA, revision: 4,
@@ -590,5 +602,145 @@ func TestTransitionParkedTerminalEvents(t *testing.T) {
 	}
 	if parked.Status != StatusParked || parked.Revision != 4 {
 		t.Errorf("Transition mutated its input: %+v", parked)
+	}
+}
+
+// TestTransitionAcceptClosesOnSuccess covers T3.139: a successful explicit
+// acceptance command is the close. The Watch keeps its identity and subscribers,
+// carries the accepted verdict and reason, and stages no effect.
+func TestTransitionAcceptClosesOnSuccess(t *testing.T) {
+	at := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusNotifying, VerdictReady, "sha", 7)
+	before := cloneWatch(w)
+
+	next, effects := Transition(w, AcceptEvent(true, at))
+
+	if next.Status != StatusClosed {
+		t.Errorf("status = %q, want %q", next.Status, StatusClosed)
+	}
+	if next.CloseReason != string(CloseReasonAccepted) {
+		t.Errorf("closeReason = %q, want %q", next.CloseReason, CloseReasonAccepted)
+	}
+	if next.Verdict != VerdictAccepted {
+		t.Errorf("verdict = %q, want %q", next.Verdict, VerdictAccepted)
+	}
+	if next.Revision != 8 {
+		t.Errorf("revision = %d, want 8", next.Revision)
+	}
+	if !next.ClosedAt.Equal(at) {
+		t.Errorf("closedAt = %v, want %v", next.ClosedAt, at)
+	}
+	if next.ID != w.ID || !reflect.DeepEqual(next.Subscribers, w.Subscribers) {
+		t.Errorf("acceptance changed task identity: %+v", next)
+	}
+	if len(effects) != 0 {
+		t.Errorf("acceptance staged effects %+v, want none", effects)
+	}
+	if !reflect.DeepEqual(w, before) {
+		t.Errorf("Transition mutated its input: %+v", w)
+	}
+}
+
+// TestTransitionAcceptFromEveryLiveStatus proves acceptance closes a task from
+// each live status, including needs_input and parked. It is an explicit human
+// command, not a retry of a failed step or a resumption of a parked question.
+func TestTransitionAcceptFromEveryLiveStatus(t *testing.T) {
+	at := time.Date(2026, 11, 20, 11, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		status  Status
+		verdict Verdict
+	}{
+		{StatusWatching, VerdictWatching},
+		{StatusNotifying, VerdictReady},
+		{StatusNeedsInput, VerdictNeedsInput},
+		{StatusParked, VerdictParked},
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			w := transitionWatch(tc.status, tc.verdict, "sha", 3)
+			next, effects := Transition(w, AcceptEvent(true, at))
+			if next.Status != StatusClosed || next.CloseReason != string(CloseReasonAccepted) || next.Verdict != VerdictAccepted {
+				t.Errorf("acceptance from %s: next = %+v", tc.status, next)
+			}
+			if next.Revision != 4 || !next.ClosedAt.Equal(at) {
+				t.Errorf("acceptance from %s: revision = %d closedAt = %v", tc.status, next.Revision, next.ClosedAt)
+			}
+			if len(effects) != 0 {
+				t.Errorf("acceptance from %s staged effects %+v", tc.status, effects)
+			}
+		})
+	}
+}
+
+// TestTransitionAcceptFailureLeavesWatchOpen proves a failed acceptance command
+// is a no-op: the task stays live and no receipt or revision is produced.
+func TestTransitionAcceptFailureLeavesWatchOpen(t *testing.T) {
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		status  Status
+		verdict Verdict
+	}{
+		{StatusWatching, VerdictWatching},
+		{StatusNotifying, VerdictReady},
+		{StatusNeedsInput, VerdictNeedsInput},
+		{StatusParked, VerdictParked},
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			w := transitionWatch(tc.status, tc.verdict, "sha", 3)
+			before := cloneWatch(w)
+			next, effects := Transition(w, AcceptEvent(false, at))
+			if !reflect.DeepEqual(next, before) || len(effects) != 0 {
+				t.Errorf("failed acceptance changed the Watch: %+v, effects %+v", next, effects)
+			}
+		})
+	}
+}
+
+// TestTransitionAcceptIsTerminal proves a closed Watch is never reopened or
+// re-accepted: neither a second acceptance nor one on a differently closed
+// Watch changes status, close reason or revision.
+func TestTransitionAcceptIsTerminal(t *testing.T) {
+	at := time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 3)
+	accepted, _ := Transition(w, AcceptEvent(true, at))
+
+	again, effects := Transition(accepted, AcceptEvent(true, at.Add(time.Minute)))
+	if !reflect.DeepEqual(again, accepted) || len(effects) != 0 {
+		t.Errorf("second acceptance changed the Watch: %+v, effects %+v", again, effects)
+	}
+
+	closed := transitionWatch(StatusClosed, VerdictMerged, "sha", 5)
+	closed.CloseReason = string(CloseReasonMerged)
+	closed.ClosedAt = at
+	next, effects := Transition(closed, AcceptEvent(true, at.Add(time.Minute)))
+	if !reflect.DeepEqual(next, closed) || len(effects) != 0 {
+		t.Errorf("acceptance reopened a closed Watch: %+v, effects %+v", next, effects)
+	}
+
+	failedWatch, failedEffects := Transition(closed, AcceptEvent(false, at))
+	if !reflect.DeepEqual(failedWatch, closed) || len(failedEffects) != 0 {
+		t.Errorf("failed acceptance changed a closed Watch: %+v, effects %+v", failedWatch, failedEffects)
+	}
+}
+
+// TestTransitionDoneFlagAndExitDoNotClose is the ADR 0059 §6 guard: a done flag
+// and a bare agent process exit are not the acceptance command. The verdict
+// engine never emits VerdictAccepted, so a verdict event with that value is a
+// no-op; an unknown exit event is a no-op too. Only AcceptEvent(true) closes.
+func TestTransitionDoneFlagAndExitDoNotClose(t *testing.T) {
+	at := time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 3)
+
+	if validVerdict(VerdictAccepted) {
+		t.Error("VerdictAccepted is a valid verdict: a done flag could close a Watch")
+	}
+
+	for _, e := range []Event{
+		VerdictEvent(VerdictAccepted, at),
+		Event{Kind: EventKind("agent_exit"), At: at},
+	} {
+		next, effects := Transition(w, e)
+		if !reflect.DeepEqual(next, w) || len(effects) != 0 {
+			t.Errorf("event %+v closed the Watch: %+v, effects %+v", e, next, effects)
+		}
 	}
 }

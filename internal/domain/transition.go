@@ -34,6 +34,11 @@ const StatusParked Status = "parked"
 // execution step. Like watching, it is not a result that marks an obligation read.
 const VerdictParked Verdict = "parked"
 
+// VerdictAccepted is the verdict on a Watch closed by a successful explicit
+// acceptance command (ADR 0059 §6). The verdict engine never produces it:
+// validVerdict rejects it, so a verdict event cannot stand in for the command.
+const VerdictAccepted Verdict = "accepted"
+
 // ParkReason is the machine-readable cause kept with a parked Watch in the
 // journal (ADR 0039 §1).
 type ParkReason string
@@ -63,6 +68,9 @@ const (
 	// EventPark parks a Watch after a failed execution step: a limit, an
 	// exhausted budget, a crash or an external-step error (ADR 0039 §1).
 	EventPark EventKind = "park"
+	// EventAccept reports the result of the explicit acceptance command. Only a
+	// successful run closes a Watch (ADR 0059 §6).
+	EventAccept EventKind = "accept"
 )
 
 // CloseReason is the machine-readable cause stored on a closed Watch.
@@ -73,6 +81,9 @@ const (
 	CloseReasonCancelled   CloseReason = "cancelled"
 	CloseReasonMerged      CloseReason = "merged"
 	CloseReasonClosed      CloseReason = "closed"
+	// CloseReasonAccepted marks a Watch closed by a successful explicit
+	// acceptance command (ADR 0059 §6), not by an agent exit or a done flag.
+	CloseReasonAccepted CloseReason = "accepted"
 )
 
 // Event is one input to Transition. Only the fields relevant to Kind are set;
@@ -90,6 +101,9 @@ type Event struct {
 	// full error text and is never truncated by the domain.
 	ParkReason ParkReason
 	ParkError  string
+	// AcceptOK is used only by EventAccept. It reports whether the explicit
+	// acceptance command ran successfully. False never closes the Watch.
+	AcceptOK bool
 }
 
 // EffectKind identifies a side effect the caller must perform after Transition.
@@ -156,6 +170,12 @@ func ParkEvent(reason ParkReason, parkError string, at time.Time) Event {
 	return Event{Kind: EventPark, ParkReason: reason, ParkError: parkError, At: at}
 }
 
+// AcceptEvent reports the result of the explicit acceptance command. ok=false
+// leaves the Watch open: a failed command is not a completed task (ADR 0059 §6).
+func AcceptEvent(ok bool, at time.Time) Event {
+	return Event{Kind: EventAccept, AcceptOK: ok, At: at}
+}
+
 // CanContinueRound reports whether round is a permitted human-answer round.
 // Rounds start at one and stop at MaxContinueRounds.
 func CanContinueRound(round uint64) bool {
@@ -169,21 +189,27 @@ func CanContinueRound(round uint64) bool {
 //
 //	watching  -> watching   : verdict watching repeated (no revision, no effect)
 //	watching  -> notifying  : actionable verdict (ready/rebase/retry/keep_working/timeout)
-//	watching  -> closed     : terminal verdict, cancel or head_changed
+//	watching  -> closed     : terminal verdict, cancel, head_changed or successful acceptance
 //	notifying -> notifying  : same actionable verdict repeated (idempotent) or a new actionable verdict
 //	notifying -> watching   : re-run downgrade to watching (ready/keep_working -> watching)
-//	notifying -> closed     : terminal verdict, cancel or head_changed
+//	notifying -> closed     : terminal verdict, cancel, head_changed or successful acceptance
 //	watching  -> needs_input: the agent asked a human a question (ADR 0031 §3)
 //	notifying -> needs_input: same question after an actionable verdict
 //	needs_input -> watching : human answer via ContinueEvent with a valid round
-//	needs_input -> closed   : cancel or head_changed
+//	needs_input -> closed   : cancel, head_changed or successful acceptance
 //	needs_input -> needs_input: repeated question or out-of-range answer (no-op)
 //	watching  -> parked    : failed execution step (limit/budget/crash/error)
 //	notifying -> parked    : same failure after an actionable verdict
 //	needs_input -> parked   : same failure while waiting for a human answer
 //	parked    -> parked    : repeated failure or a verdict/answer/needs_input event (no-op)
-//	parked    -> closed    : cancel or head_changed
+//	parked    -> closed    : cancel, head_changed or a successful acceptance command
 //	closed    -> closed     : no-op (terminal)
+//
+// A successful EventAccept closes a live Watch from any status with
+// CloseReasonAccepted and VerdictAccepted (ADR 0059 §6). That command is the
+// only way the acceptance path closes a Watch: a failed command, a done-flag
+// verdict and a bare agent process exit all leave the Watch open. The adapter
+// that ran the command owns the receipt, so acceptance stages no effect.
 //
 // Forbidden transitions: anything leaving closed (closed -> watching,
 // closed -> notifying, closed -> needs_input, closed -> parked). A cancelled
@@ -230,6 +256,8 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		return continueWatch(w, e)
 	case EventPark:
 		return parkOnFailure(w, e)
+	case EventAccept:
+		return acceptWatch(w, e)
 	default:
 		return next, nil
 	}
@@ -270,6 +298,24 @@ func parkOnFailure(w Watch, e Event) (Watch, []Effect) {
 		ParkReason: e.ParkReason,
 		ParkError:  e.ParkError,
 	}}
+}
+
+// acceptWatch closes a live Watch only after the explicit acceptance command
+// succeeded (ADR 0059 §6). A failed command changes nothing, so neither an agent
+// process exit nor a done flag can end the task. The closed Watch keeps its ID
+// and subscribers; the acceptance is recorded as its close reason and verdict.
+// The adapter that ran the command owns the receipt, so no effect is staged.
+func acceptWatch(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed || !e.AcceptOK {
+		return next, nil
+	}
+	next.Status = StatusClosed
+	next.Verdict = VerdictAccepted
+	next.Revision = bumpRevision(w.Revision)
+	next.CloseReason = string(CloseReasonAccepted)
+	next.ClosedAt = e.At
+	return next, nil
 }
 
 // continueWatch resumes a parked Watch on a human answer. It refuses an answer
