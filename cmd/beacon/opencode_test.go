@@ -274,7 +274,7 @@ func TestW254ClientSessionCreatorPostsAndReturnsID(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Status:     "200 OK",
-				Body:       io.NopCloser(strings.NewReader(`{"id":"sess-created","agent":"general"}`)),
+				Body:       io.NopCloser(strings.NewReader(`{"data":{"id":"sess-created","agent":"general"}}`)),
 				Header:     http.Header{},
 			}, nil
 		}
@@ -333,7 +333,7 @@ func TestW254NewOpencodePortInstallsClientPorts(t *testing.T) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Status:     "200 OK",
-			Body:       io.NopCloser(strings.NewReader(`{"id":"sess-live"}`)),
+			Body:       io.NopCloser(strings.NewReader(`{"data":{"id":"sess-live"}}`)),
 			Header:     http.Header{},
 		}, nil
 	}}
