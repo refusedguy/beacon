@@ -1,5 +1,6 @@
 # WIRING-486. Подключить channel ingress к серверу и обработчику команд
-Статус: todo
+Статус: done
+Обоснование: проводка уже в main, commit 28e3494 (PR #529) добавил buildChannelIngress и channelSenderResolver в cmd/beacon/server.go, upChannelIngress в cmd/beacon/up.go и ChannelSink в internal/app/command/processor.go. Дубля в OwnerFiles нет, код не писался.
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/server.go, cmd/beacon/up.go, internal/app/command/processor.go
