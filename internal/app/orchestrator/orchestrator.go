@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -161,6 +162,26 @@ type Merger interface {
 	Merge(ctx context.Context, repo string, pr int) error
 }
 
+// MergeOutcome is the result of a checked merge. Merged is true only after the
+// hosting service confirmed state=MERGED, so it is the sole permission to write
+// the ledger and close the Watch. Pending means the merge command succeeded but
+// the state is not observable yet: the Watch stays active and no ledger row is
+// written. Reason is a short diagnostic for a PR the gate refused to merge.
+type MergeOutcome struct {
+	Merged  bool
+	Pending bool
+	Reason  string
+}
+
+// CheckedMerger is an optional extension of Merger for adapters that own the
+// gh gate and confirmation. A checked adapter reads PR state before deciding to
+// merge and after the merge command returns, then reports one of the three
+// outcomes above. This keeps the race fix on the daemon's existing Merger seam
+// without changing the ports every caller must satisfy.
+type CheckedMerger interface {
+	MergeChecked(ctx context.Context, repo string, pr int) (MergeOutcome, error)
+}
+
 // Store is the surface the loop needs from Beacon state: active Watches, the
 // durable (watchID, revision) merge ledger and Watch cancellation.
 type Store interface {
@@ -289,7 +310,9 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 	return out, errors.Join(errs...)
 }
 
-// mergeOne performs the idempotent merge branch for one ready Watch.
+// mergeOne performs the idempotent merge branch for one ready Watch. A merger
+// that implements CheckedMerger owns the gh mergeability gate and the post-merge
+// state confirmation; a plain Merger is trusted on its success return.
 func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watch, out *Result, errs *[]error) {
 	done, err := st.WasMerged(ctx, w.ID, w.Revision)
 	if err != nil {
@@ -305,7 +328,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		return
 	}
 
-	command := fmt.Sprintf("gh pr merge %d --auto --squash --delete-branch", w.PR)
+	command := fmt.Sprintf("gh pr merge %d --squash --delete-branch", w.PR)
 	if opts.DryRun {
 		out.Actions = append(out.Actions, Action{
 			Action: ActionDryRun, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -318,6 +341,10 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		return
 	}
 	observe.MergeAttempt(w.ID, w.PR)
+	if checked, ok := merger.(CheckedMerger); ok {
+		mergeCheckedOne(ctx, st, checked, w, command, out, errs)
+		return
+	}
 	if err := merger.Merge(ctx, w.Repo, w.PR); err != nil {
 		out.Actions = append(out.Actions, Action{
 			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -326,6 +353,49 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
 		return
 	}
+	confirmMerge(ctx, st, w, command, out, errs)
+}
+
+// mergeCheckedOne turns one checked outcome into state changes. Only a
+// confirmed MERGE closes the Watch; a held or pending PR is reported without
+// an error so a dirty PR does not produce a multi-line gh hint on every pass.
+func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watch, command string, out *Result, errs *[]error) {
+	outcome, err := merger.MergeChecked(ctx, w.Repo, w.PR)
+	if err != nil {
+		log.Printf("orchestrator: merge PR %d: %v", w.PR, err)
+		out.Actions = append(out.Actions, Action{
+			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+			Command: command, Message: err.Error(),
+		})
+		*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
+		return
+	}
+	switch {
+	case outcome.Merged:
+		confirmMerge(ctx, st, w, command, out, errs)
+	case outcome.Pending:
+		log.Printf("orchestrator: PR %d: merge command reported success, waiting for MERGE state", w.PR)
+		out.Actions = append(out.Actions, Action{
+			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+			Command: command, Message: "waiting for MERGE state",
+		})
+	default:
+		reason := outcome.Reason
+		if reason == "" {
+			reason = "merge gate held the PR"
+		}
+		log.Printf("orchestrator: PR %d: merge held: %s", w.PR, reason)
+		out.Skipped = append(out.Skipped, w.PR)
+		out.Actions = append(out.Actions, Action{
+			Action: ActionSkip, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+			Message: reason,
+		})
+	}
+}
+
+// confirmMerge writes the ledger and closes the Watch for a PR the hosting
+// service reported as MERGED. It is shared by checked and plain mergers.
+func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *Result, errs *[]error) {
 	observe.MergeSuccess(w.ID, w.PR)
 	if err := st.RecordMerge(ctx, w.ID, w.Revision); err != nil {
 		*errs = append(*errs, fmt.Errorf("orchestrator: record merge %s@%d: %w", w.ID, w.Revision, err))

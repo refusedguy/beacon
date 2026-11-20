@@ -62,6 +62,31 @@ func (m *fakeMerger) Merge(_ context.Context, repo string, pr int) error {
 	return m.err
 }
 
+// fakeCheckedMerger models the gh gate and confirmation behind one call. Each
+// call consumes the next outcome; mergeCalls counts only the inner `gh pr merge`.
+type fakeCheckedMerger struct {
+	outcomes   []MergeOutcome
+	err        error
+	checks     int
+	mergeCalls int
+}
+
+func (m *fakeCheckedMerger) Merge(_ context.Context, _ string, _ int) error {
+	m.mergeCalls++
+	return nil
+}
+
+func (m *fakeCheckedMerger) MergeChecked(ctx context.Context, repo string, pr int) (MergeOutcome, error) {
+	m.checks++
+	if m.err != nil {
+		return MergeOutcome{}, m.err
+	}
+	if m.checks <= len(m.outcomes) {
+		return m.outcomes[m.checks-1], nil
+	}
+	return MergeOutcome{}, nil
+}
+
 type wakeCall struct {
 	watchID  string
 	revision uint64
@@ -241,7 +266,7 @@ func TestRunDryRunDoesNotMergeRecordOrClose(t *testing.T) {
 	if len(st.merged) != 0 || len(st.closed) != 0 {
 		t.Fatalf("dry run must not write state: merged=%v closed=%q", st.merged, st.closed)
 	}
-	if !result.DryRun || len(result.Actions) != 1 || result.Actions[0].Command != "gh pr merge 42 --auto --squash --delete-branch" {
+	if !result.DryRun || len(result.Actions) != 1 || result.Actions[0].Command != "gh pr merge 42 --squash --delete-branch" {
 		t.Fatalf("dry run actions = %+v", result.Actions)
 	}
 }
@@ -594,5 +619,115 @@ func TestRunWaitWakeCarriesReasonToReasonWaker(t *testing.T) {
 	want := []reasonWakeCall{{"w1", 3, VerdictWait, "wait_for:T3.100"}}
 	if !reflect.DeepEqual(waker.calls, want) {
 		t.Fatalf("reason wakes = %+v, want %+v", waker.calls, want)
+	}
+}
+
+// ---- CheckedMerger: gh gate + post-merge confirmation ----
+
+func TestRunCheckedMergePendingKeepsWatchOpen(t *testing.T) {
+	st := newFakeStore(readyWatch("w1", 312, 3))
+	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Pending: true}}}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merger.mergeCalls != 0 {
+		t.Fatalf("pending merge must not issue gh pr merge: %d", merger.mergeCalls)
+	}
+	if len(st.closed) != 0 || len(st.merged) != 0 {
+		t.Fatalf("pending merge must not close or record: closed=%q merged=%v", st.closed, st.merged)
+	}
+	if len(result.Merged) != 0 {
+		t.Fatalf("merged = %v, want empty until state=MERGED", result.Merged)
+	}
+	found := false
+	for _, a := range result.Actions {
+		if a.Action == ActionMerge && a.Message == "waiting for MERGE state" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("waiting action missing: %+v", result.Actions)
+	}
+}
+
+func TestRunCheckedMergeConfirmedClosesWatch(t *testing.T) {
+	st := newFakeStore(readyWatch("w1", 312, 3))
+	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Merged: true}}}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merger.checks != 1 {
+		t.Fatalf("merge checks = %d, want 1", merger.checks)
+	}
+	if !st.merged[mergeKey("w1", 3)] {
+		t.Fatal("confirmed MERGE must be recorded in the ledger")
+	}
+	if !reflect.DeepEqual(st.closed, []string{"w1"}) {
+		t.Fatalf("closed = %q, want [w1]", st.closed)
+	}
+	if !reflect.DeepEqual(result.Merged, []int{312}) {
+		t.Fatalf("merged = %v, want [312]", result.Merged)
+	}
+}
+
+func TestRunCheckedMergeHeldByGateDoesNotMerge(t *testing.T) {
+	const reason = "mergeable=MERGEABLE mergeStateStatus=DIRTY"
+	st := newFakeStore(readyWatch("w1", 312, 3))
+	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Reason: reason}}}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{})
+
+	if err != nil {
+		t.Fatalf("a held PR is a diagnostic, not an error: %v", err)
+	}
+	if merger.mergeCalls != 0 {
+		t.Fatalf("gate must block gh pr merge: %d", merger.mergeCalls)
+	}
+	if len(st.closed) != 0 || len(st.merged) != 0 {
+		t.Fatalf("held PR must not close or record: closed=%q merged=%v", st.closed, st.merged)
+	}
+	if !reflect.DeepEqual(result.Skipped, []int{312}) {
+		t.Fatalf("skipped = %v, want [312]", result.Skipped)
+	}
+	found := false
+	for _, a := range result.Actions {
+		if a.Action == ActionSkip && a.Message == reason {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("gate action with reason %q missing: %+v", reason, result.Actions)
+	}
+}
+
+func TestRunCheckedMergeRepeatedPassDoesNotRemerge(t *testing.T) {
+	st := newFakeStore(readyWatch("w1", 312, 3))
+	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Pending: true}, {Merged: true}}}
+
+	first, err := Run(context.Background(), st, merger, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.closed) != 0 || len(st.merged) != 0 {
+		t.Fatalf("first pass must only arm: closed=%q merged=%v", st.closed, st.merged)
+	}
+	second, err := Run(context.Background(), st, merger, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merger.mergeCalls != 0 {
+		t.Fatalf("no gh pr merge on either pass: %d", merger.mergeCalls)
+	}
+	if !reflect.DeepEqual(st.closed, []string{"w1"}) || !st.merged[mergeKey("w1", 3)] {
+		t.Fatalf("second pass must confirm and close: closed=%q merged=%v", st.closed, st.merged)
+	}
+	if !reflect.DeepEqual(first.Merged, []int{}) || !reflect.DeepEqual(second.Merged, []int{312}) {
+		t.Fatalf("merged = %v then %v", first.Merged, second.Merged)
 	}
 }

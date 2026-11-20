@@ -47,30 +47,111 @@ func SetOrchestratorDeps(fn orchestratorDepsFactory) {
 }
 
 // ghMerger is the production Merger. It runs exactly
-// `gh pr merge <pr> --auto --squash --delete-branch` through the CLI runner, so
-// the call is injectable in tests and no HTTP or shell is hidden here. The
-// --auto flag queues the merge until GitHub's own requirements are met;
-// without it gh refuses a PR that Beacon already sees as ready and prints a
-// long "add the --auto flag" hint on every daemon pass.
+// `gh pr merge <pr> --squash --delete-branch` through the CLI runner, so the
+// call is injectable in tests and no HTTP or shell is hidden here. Auto-merge
+// is not used: this repository has enablePullRequestAutoMerge off, so --auto
+// fails with a GraphQL error instead of queuing anything.
 type ghMerger struct {
 	c *CLI
 }
 
-func (m ghMerger) Merge(ctx context.Context, repo string, pr int) error {
-	res := m.c.run(m.c.root, "gh", []string{
-		"pr", "merge", strconv.Itoa(pr), "--auto", "--squash", "--delete-branch",
-	}, nil)
-	if res.code == 0 {
-		return nil
+var _ orchestrator.CheckedMerger = ghMerger{}
+
+// firstLine keeps only gh's first diagnostic line. The following lines are
+// CLI hints that would otherwise be logged by the daemon every three minutes.
+func firstLine(s string) string {
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		s = s[:i]
 	}
-	reason := strings.TrimSpace(string(res.stderr))
+	return oneLine(s)
+}
+
+// ghError builds a single-line error from a failed child process. oneLine is
+// the package helper in task.go; firstLine drops the multi-line gh hints.
+func ghError(what string, res runResult) error {
+	reason := firstLine(string(res.stderr))
 	if reason == "" {
-		reason = strings.TrimSpace(string(res.stdout))
+		reason = firstLine(string(res.stdout))
 	}
 	if reason == "" {
 		reason = fmt.Sprintf("exit %d", res.code)
 	}
-	return fmt.Errorf("gh pr merge %d: %s", pr, reason)
+	return fmt.Errorf("%s: %s", what, reason)
+}
+
+// prViewFields are the only fields the merge gate and the confirmation read.
+type prViewFields struct {
+	Mergeable        string `json:"mergeable"`
+	MergeStateStatus string `json:"mergeStateStatus"`
+	State            string `json:"state"`
+}
+
+// prView runs one read-only gh call. fields is either the full gate tuple or
+// just "state" for the post-merge confirmation.
+func (m ghMerger) prView(pr int, fields string) (prViewFields, error) {
+	res := m.c.run(m.c.root, "gh", []string{
+		"pr", "view", strconv.Itoa(pr), "--json", fields,
+	}, nil)
+	if res.code != 0 {
+		return prViewFields{}, ghError(fmt.Sprintf("gh pr view %d", pr), res)
+	}
+	var out prViewFields
+	if err := json.Unmarshal(res.stdout, &out); err != nil {
+		return prViewFields{}, fmt.Errorf("gh pr view %d decode: %w", pr, err)
+	}
+	return out, nil
+}
+
+// MergeChecked gates the merge on GitHub's own view of the PR. A PR whose
+// mergeStateStatus is not CLEAN (for example a dirty/conflicted PR) is refused
+// before `gh pr merge` runs, with a one-line diagnostic instead of gh's long
+// "add the --auto flag" hint. After a plain merge succeeds, the PR state is
+// confirmed before the orchestrator writes its ledger or closes the Watch.
+func (m ghMerger) MergeChecked(ctx context.Context, repo string, pr int) (orchestrator.MergeOutcome, error) {
+	_ = ctx
+	before, err := m.prView(pr, "mergeable,mergeStateStatus,state")
+	if err != nil {
+		return orchestrator.MergeOutcome{}, err
+	}
+	if strings.EqualFold(strings.TrimSpace(before.State), "MERGED") {
+		return orchestrator.MergeOutcome{Merged: true}, nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(before.Mergeable), "MERGEABLE") ||
+		!strings.EqualFold(strings.TrimSpace(before.MergeStateStatus), "CLEAN") {
+		mergeable := before.Mergeable
+		if strings.TrimSpace(mergeable) == "" {
+			mergeable = "UNKNOWN"
+		}
+		status := before.MergeStateStatus
+		if strings.TrimSpace(status) == "" {
+			status = "UNKNOWN"
+		}
+		return orchestrator.MergeOutcome{
+			Reason: fmt.Sprintf("mergeable=%s mergeStateStatus=%s", mergeable, status),
+		}, nil
+	}
+	if err := m.Merge(ctx, repo, pr); err != nil {
+		return orchestrator.MergeOutcome{}, err
+	}
+	after, err := m.prView(pr, "state")
+	if err != nil {
+		return orchestrator.MergeOutcome{}, err
+	}
+	if strings.EqualFold(strings.TrimSpace(after.State), "MERGED") {
+		return orchestrator.MergeOutcome{Merged: true}, nil
+	}
+	return orchestrator.MergeOutcome{Pending: true}, nil
+}
+
+func (m ghMerger) Merge(ctx context.Context, repo string, pr int) error {
+	_ = ctx
+	res := m.c.run(m.c.root, "gh", []string{
+		"pr", "merge", strconv.Itoa(pr), "--squash", "--delete-branch",
+	}, nil)
+	if res.code == 0 {
+		return nil
+	}
+	return ghError(fmt.Sprintf("gh pr merge %d", pr), res)
 }
 
 // orchWatchReaderFunc adapts a function to the orchestrator's WatchReader

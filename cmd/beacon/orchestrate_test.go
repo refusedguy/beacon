@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -77,20 +78,129 @@ func TestOrchestrateDispatch(t *testing.T) {
 	}
 }
 
-func TestGhMergerRunsSquashDeleteBranch(t *testing.T) {
-	c, _, _, calls := t06NewCLI(t, func(call t06Call) runResult { return runResult{} })
+func ghViewArgs(pr int, fields string) []string {
+	return []string{"pr", "view", strconv.Itoa(pr), "--json", fields}
+}
+
+func ghMergeArgs(pr int) []string {
+	return []string{"pr", "merge", strconv.Itoa(pr), "--squash", "--delete-branch"}
+}
+
+func TestGhMergerRunsSquashDeleteBranchAfterCleanGate(t *testing.T) {
+	c, _, _, calls := t06NewCLI(t, func(call t06Call) runResult {
+		if call.name != "gh" {
+			t.Fatalf("unexpected process: %+v", call)
+		}
+		switch {
+		case reflect.DeepEqual(call.args, ghViewArgs(42, "mergeable,mergeStateStatus,state")):
+			return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}`)}
+		case reflect.DeepEqual(call.args, ghMergeArgs(42)):
+			return runResult{}
+		case reflect.DeepEqual(call.args, ghViewArgs(42, "state")):
+			return runResult{stdout: []byte(`{"state":"MERGED"}`)}
+		default:
+			t.Fatalf("unexpected gh call: %+v", call)
+			return runResult{}
+		}
+	})
 	m := ghMerger{c: c}
 
-	if err := m.Merge(context.Background(), "refusedguy/beacon", 42); err != nil {
+	outcome, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 42)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("calls = %+v, want one", *calls)
+	if !outcome.Merged || outcome.Pending || outcome.Reason != "" {
+		t.Fatalf("outcome = %+v, want confirmed MERGE", outcome)
 	}
-	call := (*calls)[0]
-	if call.name != "gh" || !reflect.DeepEqual(call.args,
-		[]string{"pr", "merge", "42", "--auto", "--squash", "--delete-branch"}) {
-		t.Fatalf("gh call = %+v", call)
+	want := [][]string{ghViewArgs(42, "mergeable,mergeStateStatus,state"), ghMergeArgs(42), ghViewArgs(42, "state")}
+	if len(*calls) != len(want) {
+		t.Fatalf("calls = %+v, want %d", *calls, len(want))
+	}
+	for i, args := range want {
+		if (*calls)[i].name != "gh" || !reflect.DeepEqual((*calls)[i].args, args) {
+			t.Fatalf("call %d = %+v, want gh %v", i, (*calls)[i], args)
+		}
+	}
+}
+
+func TestGhMergerDirtyPRIsRefusedBeforeMerge(t *testing.T) {
+	c, _, _, calls := t06NewCLI(t, func(call t06Call) runResult {
+		if call.name != "gh" || !reflect.DeepEqual(call.args, ghViewArgs(312, "mergeable,mergeStateStatus,state")) {
+			t.Fatalf("unexpected call: %+v", call)
+		}
+		return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"DIRTY","state":"OPEN"}`)}
+	})
+	m := ghMerger{c: c}
+
+	outcome, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 312)
+	if err != nil {
+		t.Fatalf("dirty PR is a diagnostic, not an error: %v", err)
+	}
+	if outcome.Merged || outcome.Pending {
+		t.Fatalf("outcome = %+v, want a held PR", outcome)
+	}
+	if !strings.Contains(outcome.Reason, "mergeStateStatus=DIRTY") {
+		t.Fatalf("reason = %q, want DIRTY", outcome.Reason)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("gh pr merge must not run for a dirty PR: %+v", *calls)
+	}
+}
+
+func TestGhMergerMergeErrorStaysOneLine(t *testing.T) {
+	const hint = "GraphQL: Auto merge is not allowed (enablePullRequestAutoMerge)\n" +
+		"\nFor more information see: https://cli.github.com/manual/gh_pr_merge\n" +
+		"Use 'gh pr merge --squash' instead."
+	c, _, _, _ := t06NewCLI(t, func(call t06Call) runResult {
+		switch {
+		case reflect.DeepEqual(call.args, ghViewArgs(42, "mergeable,mergeStateStatus,state")):
+			return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}`)}
+		case reflect.DeepEqual(call.args, ghMergeArgs(42)):
+			return runResult{code: 1, stderr: []byte(hint)}
+		default:
+			t.Fatalf("unexpected call: %+v", call)
+			return runResult{}
+		}
+	})
+	m := ghMerger{c: c}
+
+	_, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 42)
+	if err == nil {
+		t.Fatal("expected a merge failure")
+	}
+	if strings.Contains(err.Error(), "\n") || strings.Contains(err.Error(), "\r") {
+		t.Fatalf("multi-line gh stderr leaked into the error: %q", err.Error())
+	}
+	if strings.Contains(err.Error(), "https://cli.github.com") {
+		t.Fatalf("gh hint leaked into the error: %q", err.Error())
+	}
+	if !strings.HasPrefix(err.Error(), "gh pr merge 42: GraphQL:") {
+		t.Fatalf("error = %q", err.Error())
+	}
+}
+
+func TestGhMergerPendingStateKeepsWatchOpen(t *testing.T) {
+	c, _, _, _ := t06NewCLI(t, func(call t06Call) runResult {
+		switch {
+		case reflect.DeepEqual(call.args, ghViewArgs(42, "mergeable,mergeStateStatus,state")):
+			return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}`)}
+		case reflect.DeepEqual(call.args, ghMergeArgs(42)):
+			return runResult{}
+		case reflect.DeepEqual(call.args, ghViewArgs(42, "state")):
+			return runResult{stdout: []byte(`{"state":"OPEN"}`)}
+		default:
+			t.Fatalf("unexpected call: %+v", call)
+			return runResult{}
+		}
+	})
+	m := ghMerger{c: c}
+
+	outcome, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Pending || outcome.Merged {
+		t.Fatalf("outcome = %+v, want pending", outcome)
 	}
 }
 
@@ -111,7 +221,7 @@ func TestOrchestrateDryRunPrintsActionsWithoutMerge(t *testing.T) {
 	if len(st.closed) != 0 {
 		t.Fatalf("dry run must not close watches: %q", st.closed)
 	}
-	if !strings.Contains(out.String(), "gh pr merge 42 --auto --squash --delete-branch") {
+	if !strings.Contains(out.String(), "gh pr merge 42 --squash --delete-branch") {
 		t.Fatalf("stdout = %q, want the planned gh command", out.String())
 	}
 }
