@@ -721,3 +721,52 @@ func ParseReviewerExitCode(answer string) ReviewerExitCode {
 		return ReviewerExitReject
 	}
 }
+
+// GreenBlockedVerdict is the separate "green but blocked" verdict of ADR 0059
+// §3: a pull request whose CI is green and ready to ship, but which an open
+// blocking task holds. A task in this verdict suspends its run and frees its
+// execution slot, so the scheduler can start another task while it waits.
+//
+// This is a scheduling status, not another CI verdict. It never replaces the
+// Verdict of T3.67, the ExternalVerdict of T3.98, a parked Watch (T3.21/T3.60)
+// or a BLOCKED review verdict (ADR 0038). None of those frees a slot on its
+// own, so none of them is duplicated here.
+type GreenBlockedVerdict string
+
+const (
+	// GreenBlockedNone means the PR is not green-but-blocked, so its task keeps
+	// its execution slot. This is the zero value.
+	GreenBlockedNone GreenBlockedVerdict = ""
+	// GreenBlocked means the PR is green and ready but an open blocker holds
+	// the run, so the task frees its execution slot.
+	GreenBlocked GreenBlockedVerdict = "green_blocked"
+)
+
+// ReleasesSlot reports whether a task carrying verdict v frees its execution
+// slot. Only the green-but-blocked verdict does. A green PR without a blocker,
+// a red PR, a parked Watch and a BLOCKED review all keep their slot until they
+// are handled by their own machinery.
+func (v GreenBlockedVerdict) ReleasesSlot() bool {
+	return v == GreenBlocked
+}
+
+// EvaluateGreenBlocked computes the green-but-blocked verdict for one CI
+// observation s under policy p, plus the observed state of the blocking task.
+// The verdict applies only when BOTH conditions hold: Evaluate classifies s as
+// VerdictReady (row 7 of §4.6: green CI, mergeable, valid suites, ship formula
+// satisfied) and the blocker is open. "Green" is therefore the verdict engine's
+// own ready decision over caller-supplied CI facts, not a flag the agent can
+// set, so this verdict does not lift the CI-only verification boundary of
+// ADR 0022. A green PR with no blocker keeps its slot; a red PR with a blocker
+// is not this verdict and keeps its slot too. When the blocker closes, the
+// verdict returns to GreenBlockedNone and the task takes a slot again.
+//
+// The function is pure: it runs no check, reads no clock or config, and mutates
+// neither s nor p. The same facts always give the same verdict.
+func EvaluateGreenBlocked(s Snapshot, p Policy, blockerOpen bool) GreenBlockedVerdict {
+	verdict, _ := Evaluate(s, p)
+	if blockerOpen && verdict == VerdictReady {
+		return GreenBlocked
+	}
+	return GreenBlockedNone
+}
