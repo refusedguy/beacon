@@ -32,6 +32,7 @@ func main() {
 	mergePlan := flag.Bool("merge-plan", false, "слить PR из merge_decisions после проверки CI")
 	quiet := flag.Bool("quiet", false, "не печатать каждый созданный файл")
 	commit := flag.Bool("commit", false, "git add и commit созданных docs")
+	facts := flag.Bool("facts", false, "печатать индекс чисел и их владельцев")
 	flag.Parse()
 	os.Exit(batchapply.Run(batchapply.Options{
 		Dir:       *dir,
@@ -40,5 +41,6 @@ func main() {
 		MergePlan: *mergePlan,
 		Quiet:     *quiet,
 		Commit:    *commit,
+		Facts:     *facts,
 	}, os.Stdout, os.Stderr))
 }
