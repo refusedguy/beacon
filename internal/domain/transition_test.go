@@ -194,6 +194,44 @@ func TestTransition(t *testing.T) {
 			wantStatus:       StatusClosed, wantVerdict: VerdictMerged, wantRevision: 5,
 			wantCloseReason: CloseReasonMerged,
 		},
+		// blocked: a block keeps the Watch open and wakes nobody; only an explicit
+		// unblock returns it to watching.
+		{
+			name: "watching to blocked on block", status: StatusWatching, verdict: VerdictWatching, headSHA: oldSHA, revision: 3,
+			event:      BlockEvent(BlockedInfo{Reason: "checks failed"}, at),
+			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 4,
+		},
+		{
+			name: "notifying to blocked on block", status: StatusNotifying, verdict: VerdictReady, headSHA: oldSHA, revision: 4,
+			event:      BlockEvent(BlockedInfo{Reason: "checks failed"}, at),
+			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 5,
+		},
+		{
+			name: "blocked stays blocked on repeated block", status: StatusBlocked, verdict: VerdictBlocked, headSHA: oldSHA, revision: 4,
+			event:      BlockEvent(BlockedInfo{Reason: "again"}, at),
+			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 4,
+		},
+		{
+			name: "blocked ignores a verdict", status: StatusBlocked, verdict: VerdictBlocked, headSHA: oldSHA, revision: 4,
+			event:      VerdictEvent(VerdictReady, at),
+			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 4,
+		},
+		{
+			name: "blocked to watching on unblock", status: StatusBlocked, verdict: VerdictBlocked, headSHA: oldSHA, revision: 4,
+			event:      UnblockEvent(at),
+			wantStatus: StatusWatching, wantVerdict: VerdictWatching, wantRevision: 5,
+		},
+		{
+			name: "unblock on non-blocked watch is a no-op", status: StatusWatching, verdict: VerdictWatching, headSHA: oldSHA, revision: 3,
+			event:      UnblockEvent(at),
+			wantStatus: StatusWatching, wantVerdict: VerdictWatching, wantRevision: 3,
+		},
+		{
+			name: "cancel from blocked has no effects", status: StatusBlocked, verdict: VerdictBlocked, headSHA: oldSHA, revision: 4,
+			event:            CancelEvent(at),
+			wantStatus:       StatusClosed, wantVerdict: VerdictBlocked, wantRevision: 4,
+			wantCloseReason: CloseReasonCancelled, wantClosedAt: at,
+		},
 		// Invalid input and unknown events are total no-ops.
 		{
 			name: "unknown verdict is a no-op", status: StatusWatching, verdict: VerdictWatching, headSHA: oldSHA, revision: 3,
@@ -305,6 +343,85 @@ func TestTransitionDoesNotMutateInput(t *testing.T) {
 
 	if !reflect.DeepEqual(w, before) {
 		t.Fatalf("input Watch was mutated:\n got %+v\nwant %+v", w, before)
+	}
+}
+
+// TestTransitionBlockDetails covers the block info carried on a Watch whose
+// required checks fail and need outside action. Blocking wakes no subscriber,
+// keeps its own copy of the details, is idempotent and is cleared on unblock.
+func TestTransitionBlockDetails(t *testing.T) {
+	at := time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 7)
+	before := cloneWatch(w)
+	info := BlockedInfo{
+		Reason:       "two required checks failed",
+		FailedChecks: []string{"ci/test", "gates"},
+		Since:        at,
+		BlockedBy:    "ci-bridge",
+	}
+
+	blocked, effects := Transition(w, BlockEvent(info, at))
+	if blocked.Status != StatusBlocked || blocked.Verdict != VerdictBlocked {
+		t.Fatalf("block status/verdict = %q/%q, want %q/%q", blocked.Status, blocked.Verdict, StatusBlocked, VerdictBlocked)
+	}
+	if len(effects) != 0 {
+		t.Fatalf("block staged effects (subscribers woken): %+v", effects)
+	}
+	if blocked.Blocked == nil {
+		t.Fatal("block info is nil")
+	}
+	if !reflect.DeepEqual(*blocked.Blocked, info) {
+		t.Errorf("block info = %+v, want %+v", *blocked.Blocked, info)
+	}
+	if blocked.Revision != w.Revision+1 {
+		t.Errorf("block revision = %d, want %d", blocked.Revision, w.Revision+1)
+	}
+	if !reflect.DeepEqual(w, before) {
+		t.Errorf("block mutated input Watch: got %+v, want %+v", w, before)
+	}
+
+	// The details are copied from the event. Mutating the caller's slice must
+	// not change the Watch or the input.
+	info.FailedChecks[0] = "mutated"
+	if blocked.Blocked.FailedChecks[0] != "ci/test" {
+		t.Errorf("block shares FailedChecks with the event: %+v", blocked.Blocked.FailedChecks)
+	}
+	blocked.Blocked.FailedChecks[1] = "mutated"
+	if !reflect.DeepEqual(w, before) {
+		t.Errorf("mutating block info changed the input Watch: %+v", w)
+	}
+
+	// A repeated block is idempotent and keeps the original details.
+	again, effects := Transition(blocked, BlockEvent(BlockedInfo{Reason: "second block"}, at))
+	if again.Revision != blocked.Revision {
+		t.Errorf("repeated block changed revision: %d -> %d", blocked.Revision, again.Revision)
+	}
+	if again.Blocked == nil || again.Blocked.Reason != "two required checks failed" {
+		t.Errorf("repeated block replaced details: %+v", again.Blocked)
+	}
+	if len(effects) != 0 {
+		t.Errorf("repeated block staged effects: %+v", effects)
+	}
+
+	// A block without details is ignored.
+	if got, eff := Transition(w, Event{Kind: EventBlock, At: at}); got.Blocked != nil || got.Revision != w.Revision || len(eff) != 0 {
+		t.Errorf("block without details changed the Watch: %+v, %+v", got, eff)
+	}
+
+	// Unblock resumes watching, clears the details, bumps the revision and
+	// wakes nobody.
+	resumed, effects := Transition(blocked, UnblockEvent(at))
+	if resumed.Status != StatusWatching || resumed.Verdict != VerdictWatching {
+		t.Errorf("unblock status/verdict = %q/%q, want watching/watching", resumed.Status, resumed.Verdict)
+	}
+	if resumed.Blocked != nil {
+		t.Errorf("unblock kept block details: %+v", resumed.Blocked)
+	}
+	if resumed.Revision != blocked.Revision+1 {
+		t.Errorf("unblock revision = %d, want %d", resumed.Revision, blocked.Revision+1)
+	}
+	if len(effects) != 0 {
+		t.Errorf("unblock staged effects: %+v", effects)
 	}
 }
 

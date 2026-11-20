@@ -71,6 +71,11 @@ const (
 	// EventAccept reports the result of the explicit acceptance command. Only a
 	// successful run closes a Watch (ADR 0059 §6).
 	EventAccept EventKind = "accept"
+	// EventBlock blocks a live Watch when required checks fail in a way the
+	// executor cannot clear on its own. The Watch stays open and wakes nobody.
+	EventBlock EventKind = "block"
+	// EventUnblock resumes a blocked Watch to watching, clearing the block.
+	EventUnblock EventKind = "unblock"
 )
 
 // CloseReason is the machine-readable cause stored on a closed Watch.
@@ -104,6 +109,9 @@ type Event struct {
 	// AcceptOK is used only by EventAccept. It reports whether the explicit
 	// acceptance command ran successfully. False never closes the Watch.
 	AcceptOK bool
+	// Blocked is used only by EventBlock and carries the block details. It is
+	// copied into the Watch so later caller mutation cannot change the Watch.
+	Blocked *BlockedInfo
 }
 
 // EffectKind identifies a side effect the caller must perform after Transition.
@@ -176,6 +184,18 @@ func AcceptEvent(ok bool, at time.Time) Event {
 	return Event{Kind: EventAccept, AcceptOK: ok, At: at}
 }
 
+// BlockEvent blocks a live Watch with the supplied reason. The BlockedInfo is
+// copied so a caller cannot mutate the Watch through the original value.
+func BlockEvent(info BlockedInfo, at time.Time) Event {
+	return Event{Kind: EventBlock, Blocked: &info, At: at}
+}
+
+// UnblockEvent resumes a blocked Watch. It is a no-op on a Watch that is not
+// blocked.
+func UnblockEvent(at time.Time) Event {
+	return Event{Kind: EventUnblock, At: at}
+}
+
 // CanContinueRound reports whether round is a permitted human-answer round.
 // Rounds start at one and stop at MaxContinueRounds.
 func CanContinueRound(round uint64) bool {
@@ -203,6 +223,11 @@ func CanContinueRound(round uint64) bool {
 //	needs_input -> parked   : same failure while waiting for a human answer
 //	parked    -> parked    : repeated failure or a verdict/answer/needs_input event (no-op)
 //	parked    -> closed    : cancel, head_changed or a successful acceptance command
+//	watching  -> blocked   : required checks fail and need outside action (no wake)
+//	notifying -> blocked   : same block after an actionable verdict (no wake)
+//	blocked   -> blocked   : repeated block (no-op)
+//	blocked   -> watching  : explicit unblock; block details are cleared (no wake)
+//	blocked   -> closed    : cancel, head_changed or a successful acceptance command
 //	closed    -> closed     : no-op (terminal)
 //
 // A successful EventAccept closes a live Watch from any status with
@@ -219,7 +244,9 @@ func CanContinueRound(round uint64) bool {
 // still closes a parked Watch and creates a successor, as it does for any live
 // Watch (ADR 0019); that is a new PR head, not a retry of the failure. A
 // ContinueEvent whose ContinueOf is a different Watch is also a no-op: an
-// answer can never become a new task.
+// answer can never become a new task. A blocked Watch ignores verdicts like a
+// parked one: only an explicit unblock resumes it, so a CI refresh cannot wake
+// subscribers of a Watch that is waiting on outside action.
 //
 // Revision grows only when the verdict changes, including a re-run downgrade
 // to watching at the same SHA. It never grows on watching -> watching. There
@@ -258,6 +285,10 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		return parkOnFailure(w, e)
 	case EventAccept:
 		return acceptWatch(w, e)
+	case EventBlock:
+		return blockWatch(w, e)
+	case EventUnblock:
+		return unblockWatch(w, e)
 	default:
 		return next, nil
 	}
@@ -300,6 +331,38 @@ func parkOnFailure(w Watch, e Event) (Watch, []Effect) {
 	}}
 }
 
+// blockWatch moves a live Watch to blocked. It is idempotent: a second block
+// changes nothing, including the original BlockedInfo. Blocking keeps the ID
+// and subscribers, clears no obligation and stages no effect, so no subscriber
+// is woken. A closed Watch cannot be blocked, and a block without details is
+// ignored.
+func blockWatch(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed || w.Status == StatusBlocked || e.Blocked == nil {
+		return next, nil
+	}
+	next.Status = StatusBlocked
+	next.Verdict = VerdictBlocked
+	next.Blocked = cloneBlockedInfo(e.Blocked)
+	next.Revision = bumpRevision(w.Revision)
+	return next, nil
+}
+
+// unblockWatch resumes a blocked Watch to watching. It is a no-op on a Watch
+// that is not blocked. The block details are cleared and the revision grows so
+// consumers can see the resume; no effect is staged, so nobody is woken.
+func unblockWatch(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status != StatusBlocked {
+		return next, nil
+	}
+	next.Status = StatusWatching
+	next.Verdict = VerdictWatching
+	next.Blocked = nil
+	next.Revision = bumpRevision(w.Revision)
+	return next, nil
+}
+
 // acceptWatch closes a live Watch only after the explicit acceptance command
 // succeeded (ADR 0059 §6). A failed command changes nothing, so neither an agent
 // process exit nor a done flag can end the task. The closed Watch keeps its ID
@@ -338,7 +401,7 @@ func continueWatch(w Watch, e Event) (Watch, []Effect) {
 
 func transitionVerdict(w Watch, e Event) (Watch, []Effect) {
 	next := cloneWatch(w)
-	if w.Status == StatusClosed || w.Status == StatusParked || !validVerdict(e.Verdict) {
+	if w.Status == StatusClosed || w.Status == StatusParked || w.Status == StatusBlocked || !validVerdict(e.Verdict) {
 		return next, nil
 	}
 	v := e.Verdict
@@ -402,6 +465,7 @@ func cloneWatch(w Watch) Watch {
 		}
 	}
 	out.Subscribers = cloneSubscribers(w.Subscribers)
+	out.Blocked = cloneBlockedInfo(w.Blocked)
 	if w.Flaky.Names != nil {
 		out.Flaky.Names = append([]string(nil), w.Flaky.Names...)
 	}
@@ -419,4 +483,17 @@ func cloneSubscribers(s []Subscriber) []Subscriber {
 		return nil
 	}
 	return append([]Subscriber(nil), s...)
+}
+
+// cloneBlockedInfo copies the block details, including the FailedChecks slice,
+// so a transition never shares mutable state with its input or its event.
+func cloneBlockedInfo(b *BlockedInfo) *BlockedInfo {
+	if b == nil {
+		return nil
+	}
+	out := *b
+	if b.FailedChecks != nil {
+		out.FailedChecks = append([]string(nil), b.FailedChecks...)
+	}
+	return &out
 }

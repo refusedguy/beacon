@@ -345,6 +345,83 @@ func TestStorePortAndIdempotency(t *testing.T) {
 	}
 }
 
+// TestStoreBlockedWatchSurvivesReopen checks that the block details live in
+// the Watch JSON payload and survive a close/reopen without a migration.
+func TestStoreBlockedWatchSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	since := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	want := domain.Watch{
+		ID:       "w-blocked",
+		Repo:     "org/repo",
+		PR:       12,
+		HeadSHA:  "abc",
+		Status:   domain.StatusBlocked,
+		Verdict:  domain.VerdictBlocked,
+		Revision: 4,
+		Blocked: &domain.BlockedInfo{
+			Reason:       "two required checks failed",
+			FailedChecks: []string{"ci/test", "gates"},
+			Since:        since,
+			BlockedBy:    "ci-bridge",
+		},
+	}
+
+	check := func(tag string, d *DB) {
+		t.Helper()
+		got, err := d.Watch(want.ID)
+		if err != nil {
+			t.Fatalf("%s Watch: %v", tag, err)
+		}
+		if got.Status != domain.StatusBlocked || got.Verdict != domain.VerdictBlocked {
+			t.Errorf("%s status/verdict = %q/%q, want blocked/blocked", tag, got.Status, got.Verdict)
+		}
+		if got.Blocked == nil {
+			t.Fatalf("%s blocked info is nil", tag)
+		}
+		if got.Blocked.Reason != want.Blocked.Reason || got.Blocked.BlockedBy != want.Blocked.BlockedBy ||
+			!got.Blocked.Since.Equal(want.Blocked.Since) ||
+			len(got.Blocked.FailedChecks) != 2 || got.Blocked.FailedChecks[0] != "ci/test" || got.Blocked.FailedChecks[1] != "gates" {
+			t.Errorf("%s blocked info = %+v, want %+v", tag, got.Blocked, want.Blocked)
+		}
+	}
+
+	first, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #1: %v", err)
+	}
+	if err := first.SaveWatch(want); err != nil {
+		first.Close()
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	check("before reopen", first)
+	if err := first.Close(); err != nil {
+		t.Fatalf("Close #1: %v", err)
+	}
+
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open #2: %v", err)
+	}
+	defer second.Close()
+	check("after reopen", second)
+}
+
+// TestStoreLegacyWatchWithoutBlocked checks that a payload written before the
+// Blocked field existed still decodes: the absent key becomes nil, not an error.
+func TestStoreLegacyWatchWithoutBlocked(t *testing.T) {
+	legacy := []byte(`{"id":"w1","status":"watching","verdict":"watching","revision":1}`)
+	got, err := decodeWatch(legacy)
+	if err != nil {
+		t.Fatalf("decodeWatch(legacy): %v", err)
+	}
+	if got.Blocked != nil {
+		t.Errorf("legacy payload decoded with blocked info: %+v", got.Blocked)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching || got.Revision != 1 {
+		t.Errorf("legacy payload decoded wrong: %+v", got)
+	}
+}
+
 func TestStartTaskIdempotentRepeatReturnsOriginal(t *testing.T) {
 	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

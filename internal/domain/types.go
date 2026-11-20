@@ -16,6 +16,7 @@ type Status string
 const (
 	StatusWatching  Status = "watching"
 	StatusNotifying Status = "notifying"
+	StatusBlocked   Status = "blocked"
 	StatusClosed    Status = "closed"
 )
 
@@ -31,6 +32,10 @@ const (
 	VerdictTimeout     Verdict = "timeout"
 	VerdictMerged      Verdict = "merged"
 	VerdictClosed      Verdict = "closed"
+	// VerdictBlocked is carried while a Watch is blocked by failed checks that
+	// need outside action. Like needs_input and parked it is not produced by the
+	// verdict engine; only a block event sets it.
+	VerdictBlocked Verdict = "blocked"
 )
 
 // Role is the subscriber role on a Watch.
@@ -106,6 +111,17 @@ type Subscriber struct {
 	LastActivity time.Time `json:"lastActivity"`
 }
 
+// BlockedInfo records why a Watch is blocked, which checks failed, when the
+// block started and which actor or rule set it. It is stored as JSON on the
+// Watch, so a legacy payload without the field decodes to nil and needs no
+// schema migration.
+type BlockedInfo struct {
+	Reason       string    `json:"reason"`
+	FailedChecks []string  `json:"failedChecks,omitempty"`
+	Since        time.Time `json:"since"`
+	BlockedBy    string    `json:"blockedBy"`
+}
+
 // Watch is the unit of work. Optional fields use the Go zero value when absent.
 type Watch struct {
 	ID            string           `json:"id"`
@@ -116,6 +132,7 @@ type Watch struct {
 	Issue         string           `json:"issue"`
 	Status        Status           `json:"status"`
 	Verdict       Verdict          `json:"verdict"`
+	Blocked       *BlockedInfo     `json:"blocked,omitempty"`
 	Revision      uint64           `json:"revision"`
 	Checks        map[string]Check `json:"checks"`
 	Merge         MergeInfo        `json:"merge"`
