@@ -3227,3 +3227,215 @@ func TestFIFOEnqueueIdempotentAndRedaction(t *testing.T) {
 		t.Error("FIFOComplete with blank id must fail")
 	}
 }
+
+// installFIFOBatchPoison adds a trigger that aborts the insert of one id. It is
+// the fault injected into a batch to prove all inserts share one transaction:
+// the failing insert makes FIFOEnqueueBatch return an error, so the caller's
+// Write rolls the whole batch back instead of leaving earlier rows committed.
+func installFIFOBatchPoison(t *testing.T, d *DB) {
+	t.Helper()
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			CREATE TRIGGER fifo_batch_poison BEFORE INSERT ON fifo_queue
+			WHEN NEW.id = 'poison'
+			BEGIN SELECT RAISE(ABORT, 'poison rejected'); END`)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("install poison trigger: %v", err)
+	}
+}
+
+// TestFIFOEnqueueBatchOneTransaction is the acceptance check for T3.155. A
+// failing insert in the middle of a batch rolls back the whole batch, which
+// only happens when every insert is in ONE transaction. With one Write per
+// task the earlier rows would already be committed. The good batch then proves
+// order is preserved and FIFOClaim still serves the batch (T3.138).
+func TestFIFOEnqueueBatchOneTransaction(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	installFIFOBatchPoison(t, d)
+	poisoned := []FIFOItem{
+		{ID: "good-1", Payload: []byte("one")},
+		{ID: "poison", Payload: []byte("bad")},
+		{ID: "good-2", Payload: []byte("two")},
+	}
+	if _, err := d.FIFOEnqueueBatch(poisoned); err == nil {
+		t.Fatal("batch with an aborting insert must fail")
+	}
+	state, err := d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState after failed batch: %v", err)
+	}
+	if len(state.Items) != 0 {
+		t.Fatalf("items after failed batch = %d, want 0 (whole batch must roll back)", len(state.Items))
+	}
+
+	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DROP TRIGGER fifo_batch_poison`)
+		return err
+	}); err != nil {
+		t.Fatalf("drop poison trigger: %v", err)
+	}
+
+	good := []FIFOItem{
+		{ID: "a", Payload: []byte("one")},
+		{ID: "b", Payload: []byte("two")},
+		{ID: "c", Payload: []byte("three")},
+	}
+	res, err := d.FIFOEnqueueBatch(good)
+	if err != nil {
+		t.Fatalf("FIFOEnqueueBatch: %v", err)
+	}
+	if res.Inserted != 3 || res.Ignored != 0 {
+		t.Fatalf("batch result = %+v, want 3 inserted and 0 ignored", res)
+	}
+	state, err = d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState after batch: %v", err)
+	}
+	if len(state.Items) != 3 {
+		t.Fatalf("items after batch = %d, want 3", len(state.Items))
+	}
+	for i, want := range []string{"a", "b", "c"} {
+		if state.Items[i].ID != want || state.Items[i].State != fifoStatePending {
+			t.Errorf("item %d = %+v, want %s pending", i, state.Items[i], want)
+		}
+	}
+	for _, want := range []string{"a", "b", "c"} {
+		it, found, err := d.FIFOClaim()
+		if err != nil || !found || it.ID != want {
+			t.Fatalf("claim = %+v, found=%v, err=%v; want %s in enqueue order", it, found, err, want)
+		}
+	}
+}
+
+// TestFIFOEnqueueBatchIdempotentAndRedacted keeps the batch under the same
+// rules as a single enqueue: a repeated id inserts nothing and keeps the first
+// payload, secrets are redacted, and a blank id rejects the whole batch before
+// any row is written.
+func TestFIFOEnqueueBatchIdempotentAndRedacted(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+	first := []FIFOItem{
+		{ID: "x", Payload: secret},
+		{ID: "y", Payload: []byte("two")},
+		{ID: "z", Payload: []byte("three")},
+	}
+	res, err := d.FIFOEnqueueBatch(first)
+	if err != nil {
+		t.Fatalf("first batch: %v", err)
+	}
+	if res.Inserted != 3 || res.Ignored != 0 {
+		t.Fatalf("first batch = %+v, want 3 inserted", res)
+	}
+
+	repeat := []FIFOItem{
+		{ID: "x", Payload: []byte("overwrite")},
+		{ID: "y", Payload: []byte("overwrite")},
+		{ID: "z", Payload: []byte("overwrite")},
+	}
+	res, err = d.FIFOEnqueueBatch(repeat)
+	if err != nil {
+		t.Fatalf("repeat batch: %v", err)
+	}
+	if res.Inserted != 0 || res.Ignored != 3 {
+		t.Fatalf("repeat batch = %+v, want 0 inserted and 3 ignored", res)
+	}
+
+	state, err := d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState: %v", err)
+	}
+	if len(state.Items) != 3 {
+		t.Fatalf("items after repeat = %d, want 3", len(state.Items))
+	}
+	if bytes.Contains(state.Items[0].Payload, []byte("ghp_")) {
+		t.Errorf("stored payload kept a raw token: %s", state.Items[0].Payload)
+	}
+	if string(state.Items[0].Payload) == "overwrite" {
+		t.Error("repeat overwrote the first payload")
+	}
+	if !bytes.Contains(secret, []byte("ghp_")) {
+		t.Fatal("test input lost its secret before the write")
+	}
+
+	_, err = d.FIFOEnqueueBatch([]FIFOItem{{ID: "ok"}, {ID: " "}})
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+		t.Fatalf("batch with blank id error = %v, want INVALID_INPUT", err)
+	}
+	state, err = d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState after rejected batch: %v", err)
+	}
+	if len(state.Items) != 3 {
+		t.Fatalf("items after rejected batch = %d, want 3 (nothing committed)", len(state.Items))
+	}
+}
+
+// TestFIFOEnqueueBatchEmptyAndMixedWithSingle keeps an empty batch a no-op and
+// proves batched and single enqueues share one FIFO. A task enqueued by
+// FIFOEnqueue and tasks enqueued by FIFOEnqueueBatch are claimed in the order
+// they were written, and FIFOComplete still removes them (T3.138).
+func TestFIFOEnqueueBatchEmptyAndMixedWithSingle(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	for _, empty := range [][]FIFOItem{nil, {}} {
+		res, err := d.FIFOEnqueueBatch(empty)
+		if err != nil || res.Inserted != 0 || res.Ignored != 0 {
+			t.Fatalf("empty batch = %+v, %v; want a zero no-op", res, err)
+		}
+	}
+	state, err := d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState after empty batch: %v", err)
+	}
+	if len(state.Items) != 0 {
+		t.Fatalf("items after empty batch = %d, want 0", len(state.Items))
+	}
+
+	if err := d.FIFOEnqueue("single", []byte("s")); err != nil {
+		t.Fatalf("FIFOEnqueue: %v", err)
+	}
+	batch := []FIFOItem{
+		{ID: "batch-1", Payload: []byte("b1")},
+		{ID: "batch-2", Payload: []byte("b2")},
+	}
+	if _, err := d.FIFOEnqueueBatch(batch); err != nil {
+		t.Fatalf("FIFOEnqueueBatch: %v", err)
+	}
+	for _, want := range []string{"single", "batch-1", "batch-2"} {
+		it, found, err := d.FIFOClaim()
+		if err != nil || !found || it.ID != want {
+			t.Fatalf("claim = %+v, found=%v, err=%v; want %s", it, found, err, want)
+		}
+		done, err := d.FIFOComplete(it.ID)
+		if err != nil || !done {
+			t.Fatalf("FIFOComplete %s = %v, %v; want true", it.ID, done, err)
+		}
+	}
+	state, err = d.FIFOState()
+	if err != nil {
+		t.Fatalf("FIFOState after completion: %v", err)
+	}
+	if len(state.Items) != 0 {
+		t.Fatalf("items after completion = %d, want 0", len(state.Items))
+	}
+}
