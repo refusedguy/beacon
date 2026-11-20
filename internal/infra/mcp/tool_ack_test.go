@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -884,6 +885,172 @@ func TestAckDecisionHandleStaysOkOnly(t *testing.T) {
 	}
 	if len(fields) != 1 || fields["ok"] != true {
 		t.Errorf("decision ack response = %s, want only ok:true", body)
+	}
+}
+
+// TestAckBlockedNotMine proves that a blocked:not_mine decision blocks the
+// Watch in place. The block carries the failed checks from the Watch, the ack
+// time and the session ID from _meta. No new Watch is created and the ack still
+// records the claim. The MCP response stays ok-only.
+func TestAckBlockedNotMine(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictRetry)
+	w.Status = domain.StatusWatching
+	o := resultObligation(w, "session-blocked")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+
+	_, out, err := h.Handle(context.Background(), sessionReq("session-blocker"), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine),
+	})
+	if err != nil || !out.OK {
+		t.Fatalf("blocked ack: out %+v err %v", out, err)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read Watch after block: %v", err)
+	}
+	if got.Status != blockedWatchStatus || got.Verdict != blockedWatchVerdict {
+		t.Errorf("block did not change Watch: status %q verdict %q", got.Status, got.Verdict)
+	}
+	if got.Revision != w.Revision+1 {
+		t.Errorf("revision = %d, want %d", got.Revision, w.Revision+1)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("block created %d Watches, want 1", len(store.watches))
+	}
+
+	rec, ok := h.blocked.Lookup(w.ID)
+	if !ok {
+		t.Fatal("block was not recorded")
+	}
+	if rec.WatchID != w.ID || rec.Reason != "not_mine" {
+		t.Errorf("block record = %+v, want watch %q reason not_mine", rec, w.ID)
+	}
+	if !rec.Since.Equal(clock.t) {
+		t.Errorf("block since = %v, want %v", rec.Since, clock.t)
+	}
+	if rec.BlockedBy != "session-blocker" {
+		t.Errorf("blockedBy = %q, want session-blocker", rec.BlockedBy)
+	}
+	want := sortedFailedChecks(collectFailedChecks(w))
+	if got := sortedFailedChecks(rec.FailedChecks); !reflect.DeepEqual(got, want) {
+		t.Errorf("block failedChecks = %+v, want %+v", got, want)
+	}
+
+	stamped, ok := stamper.snapshot(o.ID)
+	if !ok || stamped.ClaimedAt.IsZero() {
+		t.Error("blocked ack did not record the intention with claimedAt")
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(fields) != 1 || fields["ok"] != true {
+		t.Errorf("blocked ack response = %s, want only ok:true", body)
+	}
+}
+
+// TestAckBlockedUnknownDecisionDoesNotBlock keeps the blocked family closed.
+// An unknown blocked: reason and an unknown decision are both refused before a
+// block, a Watch write or a claim happens.
+func TestAckBlockedUnknownDecisionDoesNotBlock(t *testing.T) {
+	for _, decision := range []string{"blocked:other", "maybe", "blocked:"} {
+		t.Run(decision, func(t *testing.T) {
+			clock := &stepClock{t: time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)}
+			w := resultFixture(domain.VerdictRetry)
+			o := resultObligation(w, "session-unknown")
+			store := newMemStore()
+			if err := store.SaveWatch(w); err != nil {
+				t.Fatalf("SaveWatch: %v", err)
+			}
+			if err := store.SaveObligation(o); err != nil {
+				t.Fatalf("SaveObligation: %v", err)
+			}
+			stamper := newRecordingStamper()
+			stamper.add(o)
+			h := NewAckHandler(store, stamper, clock)
+
+			_, _, err := h.Handle(context.Background(), sessionReq("session-blocker"), AckInput{
+				WatchID: w.ID, ObligationID: o.ID, Decision: decision,
+			})
+			if err == nil {
+				t.Fatalf("unknown decision %q was accepted", decision)
+			}
+			assertCode(t, err, domain.CodeInvalidInput)
+
+			got, err := store.Watch(w.ID)
+			if err != nil || got.Status != w.Status || got.Revision != w.Revision {
+				t.Errorf("unknown decision changed the Watch: %+v err %v", got, err)
+			}
+			if _, ok := h.blocked.Lookup(w.ID); ok {
+				t.Error("unknown decision recorded a block")
+			}
+			_, claims := stamper.counts()
+			if claims != 0 {
+				t.Errorf("unknown decision stamped the obligation %d times", claims)
+			}
+		})
+	}
+}
+
+// TestAckBlockedNotMineIdempotent proves a repeat block cannot move the clock
+// or rename the blocker. The first record wins and the Watch is written once.
+func TestAckBlockedNotMineIdempotent(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictRetry)
+	o := resultObligation(w, "session-repeat")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine)}
+
+	// AckReceipt has no _meta; the block needs a session, so use the path the
+	// MCP handler takes with the caller's session ID.
+	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first")
+	if err != nil || !first.Blocked {
+		t.Fatalf("first block with session: receipt %+v err %v", first, err)
+	}
+	clock.Advance(time.Hour)
+
+	second, err := h.ackReceiptWithSession(context.Background(), in, "session-second")
+	if err != nil {
+		t.Fatalf("repeat block: %v", err)
+	}
+	if !second.OK || second.Blocked || second.Decision != DecisionBlockedNotMine {
+		t.Errorf("repeat block receipt = %+v, want ok without a new block", second)
+	}
+	rec, ok := h.blocked.Lookup(w.ID)
+	if !ok {
+		t.Fatal("block was not recorded")
+	}
+	if rec.BlockedBy != "session-first" || !rec.Since.Equal(clock.t.Add(-time.Hour)) {
+		t.Errorf("repeat block changed the record: %+v", rec)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Status != blockedWatchStatus || got.Revision != w.Revision+1 {
+		t.Errorf("repeat block changed the Watch: %+v err %v", got, err)
 	}
 }
 
