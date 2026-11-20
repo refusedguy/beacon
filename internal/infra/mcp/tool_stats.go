@@ -10,6 +10,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
@@ -33,6 +34,10 @@ const (
 	// activeWatchWarningPrefix marks the active-watch limit warning inside
 	// loadErrors, so a reader can tell it from a state load failure (T5.64).
 	activeWatchWarningPrefix = "active watch limit warning: "
+	// blockedWatchPrefix marks the blocked-watch count inside loadErrors. The
+	// derived beacon_stats schema forbids extra properties, so the count rides
+	// in the diagnostic array like the plan-limit and wait metrics (T3.440).
+	blockedWatchPrefix = "blocked watches: "
 	// activeWatchLimit is the global active-watch cap from ADR 0093
 	// (maxActiveWatchesGlobal) and T1.4. T5.64 warns at 75% and 90% of it.
 	activeWatchLimit = 200
@@ -300,9 +305,22 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		return nil, StatsOutput{}, fmt.Errorf("beacon_stats: %w", err)
 	}
 
-	activeWatches := len(snap.RadarWatches())
+	radar := snap.RadarWatches()
+	activeWatches := len(radar)
 	loadErrors := make([]string, len(snap.LoadErrors))
 	copy(loadErrors, snap.LoadErrors)
+	// T3.440: show blocked watches in stats. Count the watches that carry a
+	// blocked status or a block record. Append the count only when it is
+	// non-zero, so a snapshot without blocked watches keeps the old response.
+	blockedWatches := 0
+	for _, w := range radar {
+		if w.Status == domain.StatusBlocked || w.Blocked != nil {
+			blockedWatches++
+		}
+	}
+	if blockedWatches > 0 {
+		loadErrors = append(loadErrors, fmt.Sprintf("%s%d", blockedWatchPrefix, blockedWatches))
+	}
 	if entry := planLimitInfo(snap.PointsThisHour, snap.Budget).warningEntry(); entry != "" {
 		loadErrors = append(loadErrors, entry)
 	}
@@ -393,4 +411,16 @@ func activeWatchWarnings(out StatsOutput) []string {
 		}
 	}
 	return warnings
+}
+
+// blockedWatchCount returns the blocked-watch entry in a stats response, if
+// any. Like the other helpers it keeps the caller independent of the entry's
+// position in loadErrors.
+func blockedWatchCount(out StatsOutput) string {
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, blockedWatchPrefix) {
+			return entry
+		}
+	}
+	return ""
 }
