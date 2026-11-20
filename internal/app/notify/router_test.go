@@ -134,7 +134,7 @@ func TestRouteResolverErrorStopsDelivery(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("error = %v, want %v", err, boom)
 	}
-	if report != (Report{}) {
+	if report.Delivered != 0 || report.NoRoute || len(report.Failures) != 0 {
 		t.Fatalf("report = %+v, want zero", report)
 	}
 	if len(deliverer.calls) != 0 {
