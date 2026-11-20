@@ -242,6 +242,12 @@ func (c mcpConnection) target() string {
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
+// remoteEndpoint converts the connection file record into the port the thin
+// MCP client takes. No field is interpreted here beyond the endpoint itself.
+func (c mcpConnection) remoteEndpoint() mcp.RemoteEndpoint {
+	return mcp.RemoteEndpoint{Host: c.Host, Port: c.Port, Token: c.Token}
+}
+
 // readMCPConnection reads and validates the connection file in dir. A missing
 // file is not an error: local stdio mode has no master to dial and keeps using
 // the persisted store. A present but invalid file is an error so a corrupted
@@ -366,6 +372,32 @@ func newMCPServer(deps mcp.Dependencies) *mcpsdk.Server {
 // composed dependencies without blocking on stdin.
 var serveMCP = func(ctx context.Context, deps mcp.Dependencies) error {
 	return newMCPServer(deps).Run(ctx, &mcpsdk.StdioTransport{})
+}
+
+// mcpRemoteEnv opts `beacon mcp` into the thin HTTP client of BS.42. The server
+// endpoint /mcp arrives with BS.43, so remote mode is explicit until then: the
+// default keeps the seven local tools and their cycle instructions unchanged.
+// The address still comes from connection.json, never from this setting.
+const mcpRemoteEnv = "BEACON_MCP_REMOTE"
+
+func remoteToolsEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(mcpRemoteEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// serveMCPRemote serves the same stdio transport with every contracted tool
+// forwarded to the server. This branch opens no store, starts no reconciler and
+// owns no verdict poller, so the MCP process holds no Beacon state. Tests
+// replace the seam to inspect the client built from connection.json.
+var serveMCPRemote = func(ctx context.Context, client *mcp.RemoteClient) error {
+	s := mcp.NewServer()
+	if err := mcp.AttachRemoteTools(s, client); err != nil {
+		return err
+	}
+	return s.Run(ctx, &mcpsdk.StdioTransport{})
 }
 
 // sharedCIWaiter adapts the store gate to the port declared in mcp. The store
@@ -932,6 +964,21 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		return fmt.Errorf("mcp: connect to %s: %w", conn.target(), err)
 	}
 	activeMCPConnection = conn
+
+	// BS.42: in remote mode the stdio process is a thin client. Every tool call
+	// goes to the server over HTTP, so a stopped server is reported as an
+	// honest error instead of being answered from a stale local store. No DB
+	// handle, reconciler or poller is created on this path.
+	if remoteToolsEnabled() {
+		if conn.target() == "" {
+			return fmt.Errorf("mcp: %s требует connection.json", mcpRemoteEnv)
+		}
+		client, err := mcp.NewRemoteClient(conn.remoteEndpoint(), nil)
+		if err != nil {
+			return fmt.Errorf("mcp: remote client: %w", err)
+		}
+		return serveMCPRemote(ctx, client)
+	}
 
 	// One DB handle for the whole process. The same pointer backs the MCP
 	// tools, the cibridge control plane, the stats snapshot and the metrics
