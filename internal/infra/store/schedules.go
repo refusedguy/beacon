@@ -93,7 +93,7 @@ func (d *DB) SaveSchedule(s Schedule) error {
 			  target_card = excluded.target_card,
 			  next_run = excluded.next_run,
 			  enabled = excluded.enabled`,
-			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), boolToInt(s.Enabled))
+			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), scheduleBoolToInt(s.Enabled))
 		if err != nil {
 			return fmt.Errorf("store: schedules: save: %w", err)
 		}
@@ -205,7 +205,7 @@ func (d *DB) DisableSchedule(id string) error {
 	})
 }
 
-func boolToInt(b bool) int {
+func scheduleBoolToInt(b bool) int {
 	if b {
 		return 1
 	}
