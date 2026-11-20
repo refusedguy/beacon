@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -43,19 +42,6 @@ func (c *CLI) runTest(args []string) int {
 	res := c.run(c.root, "go", []string{"test", "./..."}, nil)
 	emit(res, c.out, c.errOut)
 	return res.code
-}
-
-// rulesCatalogEntry registers the read-only rules gate with beacon list and
-// beacon what. The gate itself is dispatched from runGates below.
-var rulesCatalogEntry = command{
-	Name:    "rules",
-	Summary: "Проверить правила Beacon в режиме только для чтения",
-	Usage:   "beacon gates rules [--root <dir>]",
-}
-
-func init() {
-	catalog = append(catalog, rulesCatalogEntry)
-	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
 
 // runRules is the separate read-only rules gate. It checks the canonical rule
