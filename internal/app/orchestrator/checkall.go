@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -934,4 +935,100 @@ func ValidateStrictJSON(body string) error {
 		return fmt.Errorf("aif-gate-result: strict JSON: %w", err)
 	}
 	return nil
+}
+
+// ---- generated documentation index (HD-089, ADR 0313) -------------------
+
+// docsIndexPreamble marks the file as generated. A hand-written index does not
+// carry this marker, so --check rejects it together with a stale document list.
+const docsIndexPreamble = "<!-- generated: beacon docs index. Do not edit by hand. -->\n\n# Documentation index\n\n"
+
+// BuildDocsIndex renders docs/INDEX.md from a set of documentation paths.
+// Paths are normalized to slash-separated, cleaned, de-duplicated and sorted,
+// so the same document set always produces the same bytes. The generated file
+// never links to itself and paths outside the repository are ignored rather
+// than guessed.
+func BuildDocsIndex(paths []string) string {
+	seen := make(map[string]bool, len(paths))
+	unique := make([]string, 0, len(paths))
+	for _, p := range paths {
+		norm := filepath.ToSlash(filepath.Clean(strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))))
+		if norm == "" || norm == "." || strings.HasPrefix(norm, "/") || strings.HasPrefix(norm, "../") {
+			continue
+		}
+		if strings.EqualFold(filepath.Base(norm), "INDEX.md") {
+			continue
+		}
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		unique = append(unique, norm)
+	}
+	sort.Strings(unique)
+
+	var b strings.Builder
+	b.WriteString(docsIndexPreamble)
+	for _, p := range unique {
+		fmt.Fprintf(&b, "- [%s](%s)\n", p, p)
+	}
+	return b.String()
+}
+
+// GenerateDocsIndex writes the generated index to w. The caller owns the
+// writer: this layer never opens a file itself (ADR 0005).
+func GenerateDocsIndex(w io.Writer, paths []string) error {
+	if w == nil {
+		return fmt.Errorf("docs index: writer is nil")
+	}
+	_, err := io.WriteString(w, BuildDocsIndex(paths))
+	return err
+}
+
+// CheckDocsIndex is the --check half of the generator. It fails when the
+// committed index differs from the bytes the current document set produces,
+// so a stale list or a hand-edited file is never accepted as current state.
+func CheckDocsIndex(current string, paths []string) error {
+	want := BuildDocsIndex(paths)
+	if current != want {
+		return fmt.Errorf("docs index stale: regenerate docs/INDEX.md (want %d bytes, got %d)", len(want), len(current))
+	}
+	return nil
+}
+
+// DocsIndexPaths discovers markdown files under dir in fsys. It skips the
+// generated index itself, returns sorted slash-separated paths, and returns an
+// empty slice when there is nothing to index: discovery never widens its input
+// silently (hd52-empty-index).
+func DocsIndexPaths(fsys fs.FS, dir string) ([]string, error) {
+	if fsys == nil {
+		return nil, fmt.Errorf("docs index: fs is nil")
+	}
+	root := strings.TrimSpace(strings.ReplaceAll(dir, "\\", "/"))
+	if root == "" {
+		root = "."
+	}
+	var paths []string
+	err := fs.WalkDir(fsys, root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.EqualFold(filepath.Ext(p), ".md") {
+			return nil
+		}
+		norm := filepath.ToSlash(filepath.Clean(p))
+		if strings.EqualFold(filepath.Base(norm), "INDEX.md") {
+			return nil
+		}
+		paths = append(paths, norm)
+		return nil
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil // no docs directory means nothing to index, not a discovery error
+	}
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(paths)
+	return paths, nil
 }
