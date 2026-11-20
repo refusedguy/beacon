@@ -19,6 +19,18 @@ type Bridge struct {
 	ci       domain.CIProvider
 	clock    domain.Clock
 	interval time.Duration
+	waker    domain.WakeDeliverer
+}
+
+// WithWaker binds a wake adapter. A terminal verdict then steers each
+// subscriber's session through the host harness. Without one the verdict is
+// still persisted, so a caller that reads get_result is unaffected.
+func (b *Bridge) WithWaker(w domain.WakeDeliverer) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.waker = w
+	return b
 }
 
 // New builds a Bridge. An empty interval falls back to five seconds.
@@ -85,7 +97,7 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		if verdict == domain.VerdictWatching {
 			continue
 		}
-		n, err := b.publish(w, state, verdict)
+		n, err := b.publish(ctx, w, state, verdict)
 		if err != nil {
 			log.Printf("cibridge: publish %s: %v", w.ID, err)
 			continue
@@ -120,7 +132,7 @@ func verdictFromChecks(checks map[string]domain.Check) domain.Verdict {
 	return domain.VerdictWatching
 }
 
-func (b *Bridge) publish(w domain.Watch, state domain.PRState, verdict domain.Verdict) (int, error) {
+func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRState, verdict domain.Verdict) (int, error) {
 	now := b.clock.Now()
 
 	// Re-read under the single-writer assumption: another refresh may have
@@ -151,18 +163,30 @@ func (b *Bridge) publish(w domain.Watch, state domain.PRState, verdict domain.Ve
 	// get_result cannot project a verdict for them.
 	for _, sub := range next.Subscribers {
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err == nil {
+		if _, err := b.store.Obligation(id); err != nil {
+			if err := b.store.SaveObligation(domain.Obligation{
+				ID:             id,
+				WatchID:        next.ID,
+				Revision:       next.Revision,
+				SubscriberID:   sub.ID,
+				VerdictPointer: verdict,
+				StagedAt:       now,
+			}); err != nil {
+				return 0, err
+			}
+		}
+		if b.waker == nil {
 			continue
 		}
-		if err := b.store.SaveObligation(domain.Obligation{
-			ID:             id,
-			WatchID:        next.ID,
-			Revision:       next.Revision,
-			SubscriberID:   sub.ID,
-			VerdictPointer: verdict,
-			StagedAt:       now,
+		// A subscriber registered from an MCP call carries its opaque host
+		// session id. Only those are wakeable; a plain notify target is not.
+		if err := b.waker.Deliver(ctx, sub.ID, domain.WakePayload{
+			WatchID:      next.ID,
+			ObligationID: id,
+			Revision:     next.Revision,
+			Verdict:      string(verdict),
 		}); err != nil {
-			return 0, err
+			log.Printf("cibridge: wake %s: %v", sub.ID, err)
 		}
 	}
 	log.Printf("cibridge: %s#%d -> %s revision=%d", next.Repo, next.PR, verdict, next.Revision)

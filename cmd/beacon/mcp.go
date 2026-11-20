@@ -20,6 +20,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/ghci"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // The app service writes precheck reasons under the same state directory as
@@ -402,6 +403,7 @@ func runMCP(ctx context.Context) error {
 	// hosting service for active Watches and persists ready/retry, so the
 	// orchestrator reads a verdict from get_result instead of polling CI.
 	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, ciBridgeInterval)
+	ciBridge.WithWaker(&wake.OpenCodeDeliverer{})
 	go ciBridge.Run(ctx)
 
 	return serveMCP(ctx, deps)

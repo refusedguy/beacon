@@ -214,6 +214,22 @@ type PRState struct {
 	Checks           map[string]Check `json:"checks"`
 }
 
+// WakePayload is the minimal pointer payload a verdict source hands to a wake
+// adapter. It carries identifiers only, never check bodies or PR text.
+// The name differs from the WakePointer kind value in verdict.go.
+type WakePayload struct {
+	WatchID      string `json:"watchID"`
+	ObligationID string `json:"obligationID"`
+	Revision     uint64 `json:"revision"`
+	Verdict      string `json:"verdict"`
+}
+
+// WakeDeliverer is the port a thin harness adapter implements to steer a
+// session after a terminal verdict. The core never names a concrete harness.
+type WakeDeliverer interface {
+	Deliver(ctx context.Context, sessionID string, p WakePayload) error
+}
+
 // Clock supplies time to the domain. Adapters implement it in infra.
 type Clock interface {
 	Now() time.Time
