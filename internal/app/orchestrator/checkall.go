@@ -463,6 +463,95 @@ func FailedChecks(checks []Check) []string {
 	return out
 }
 
+// ---- artifact categories ------------------------------------------------
+
+// ArtifactCategory is one of the three Beacon artifact categories. Unknown is
+// the bucket for paths that belong to no category, so every path lands in
+// exactly one place.
+type ArtifactCategory string
+
+const (
+	// ArtifactWorkflow covers flat workflow files under .github/workflows.
+	ArtifactWorkflow ArtifactCategory = "workflow"
+	// ArtifactKnowledge covers the skill directories under .opencode/skills.
+	ArtifactKnowledge ArtifactCategory = "knowledge"
+	// ArtifactRules covers always-active rule files and anything in a rules dir.
+	ArtifactRules   ArtifactCategory = "rules"
+	ArtifactUnknown ArtifactCategory = "unknown"
+)
+
+// ArtifactClassification groups paths by category. The four buckets never
+// overlap: a path appears in exactly one of them.
+type ArtifactClassification struct {
+	Workflow  []string
+	Knowledge []string
+	Rules     []string
+	Unknown   []string
+}
+
+// ClassifyArtifacts sorts repo-relative paths into the three Beacon artifact
+// categories. A nil or empty list yields an empty classification. Paths that
+// match no category go to Unknown.
+func ClassifyArtifacts(paths []string) ArtifactClassification {
+	var out ArtifactClassification
+	for _, path := range paths {
+		switch classifyArtifactPath(path) {
+		case ArtifactWorkflow:
+			out.Workflow = append(out.Workflow, path)
+		case ArtifactKnowledge:
+			out.Knowledge = append(out.Knowledge, path)
+		case ArtifactRules:
+			out.Rules = append(out.Rules, path)
+		default:
+			out.Unknown = append(out.Unknown, path)
+		}
+	}
+	return out
+}
+
+// classifyArtifactPath maps one repo-relative path to its single category.
+// Workflows are flat files directly under .github/workflows. Knowledge is any
+// path inside a skill directory under .opencode/skills. Rules are always-active
+// files or anything under a rules directory. Everything else is unknown.
+func classifyArtifactPath(path string) ArtifactCategory {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return ArtifactUnknown
+	}
+	p = filepath.ToSlash(filepath.Clean(strings.ReplaceAll(p, "\\", "/")))
+	if p == "." || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "../") {
+		return ArtifactUnknown
+	}
+	parts := strings.Split(p, "/")
+
+	if len(parts) >= 3 && parts[0] == ".opencode" && parts[1] == "skills" {
+		return ArtifactKnowledge
+	}
+	if len(parts) == 3 && parts[0] == ".github" && parts[1] == "workflows" {
+		return ArtifactWorkflow
+	}
+	if isAlwaysActiveRuleName(parts[len(parts)-1]) {
+		return ArtifactRules
+	}
+	for _, dir := range parts[:len(parts)-1] {
+		if dir == "rules" {
+			return ArtifactRules
+		}
+	}
+	return ArtifactUnknown
+}
+
+// isAlwaysActiveRuleName reports whether the file name is a rule file that
+// applies to every task, such as AGENTS.md or .cursorrules.
+func isAlwaysActiveRuleName(base string) bool {
+	switch strings.ToLower(base) {
+	case "agents.md", "claude.md", ".cursorrules":
+		return true
+	default:
+		return false
+	}
+}
+
 // ---- gh adapter ---------------------------------------------------------
 
 // GHSource turns gh output into the pass's input. OpenPRs makes exactly one

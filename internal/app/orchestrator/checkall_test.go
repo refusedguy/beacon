@@ -497,6 +497,85 @@ func TestCheckAllKeepsGoingAfterPerPRFailures(t *testing.T) {
 	}
 }
 
+func TestClassifyArtifactPath(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+		want ArtifactCategory
+	}{
+		{"workflow flat file", ".github/workflows/ci.yml", ArtifactWorkflow},
+		{"workflow docs gate", ".github/workflows/docs.yml", ArtifactWorkflow},
+		{"skill root file", ".opencode/skills/night-shift/SKILL.md", ArtifactKnowledge},
+		{"skill nested reference", ".opencode/skills/night-shift/references/comment-rules.md", ArtifactKnowledge},
+		{"skill directory", ".opencode/skills/night-shift", ArtifactKnowledge},
+		{"root agents rules", "AGENTS.md", ArtifactRules},
+		{"root claude rules", "CLAUDE.md", ArtifactRules},
+		{"cursor rules", ".cursorrules", ArtifactRules},
+		{"cursor rules dir", ".cursor/rules/general.mdc", ArtifactRules},
+		{"docs rules dir", "docs/rules/conventions.md", ArtifactRules},
+		{"unknown source", "internal/app/orchestrator/checkall.go", ArtifactUnknown},
+		{"unknown adr", "docs/adrs/0001-example.md", ArtifactUnknown},
+		{"unknown readme", "README.md", ArtifactUnknown},
+		{"empty", "", ArtifactUnknown},
+		{"absolute path", "/etc/passwd", ArtifactUnknown},
+		{"nested workflow is not flat", ".github/workflows/sub/ci.yml", ArtifactUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyArtifactPath(tc.path); got != tc.want {
+				t.Fatalf("classifyArtifactPath(%q) = %q, want %q", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyArtifactsGroupsWithoutOverlap(t *testing.T) {
+	paths := []string{
+		".github/workflows/ci.yml",
+		".opencode/skills/night-shift/SKILL.md",
+		"AGENTS.md",
+		"internal/app/orchestrator/checkall.go",
+	}
+	got := ClassifyArtifacts(paths)
+	if !reflect.DeepEqual(got.Workflow, []string{".github/workflows/ci.yml"}) {
+		t.Fatalf("workflow = %v", got.Workflow)
+	}
+	if !reflect.DeepEqual(got.Knowledge, []string{".opencode/skills/night-shift/SKILL.md"}) {
+		t.Fatalf("knowledge = %v", got.Knowledge)
+	}
+	if !reflect.DeepEqual(got.Rules, []string{"AGENTS.md"}) {
+		t.Fatalf("rules = %v", got.Rules)
+	}
+	if !reflect.DeepEqual(got.Unknown, []string{"internal/app/orchestrator/checkall.go"}) {
+		t.Fatalf("unknown = %v", got.Unknown)
+	}
+
+	counts := map[string]int{}
+	for _, bucket := range [][]string{got.Workflow, got.Knowledge, got.Rules, got.Unknown} {
+		for _, p := range bucket {
+			counts[p]++
+		}
+	}
+	if len(counts) != len(paths) {
+		t.Fatalf("distinct paths = %d, want %d: %v", len(counts), len(paths), counts)
+	}
+	for p, n := range counts {
+		if n != 1 {
+			t.Fatalf("path %q appears in %d buckets", p, n)
+		}
+	}
+}
+
+func TestClassifyArtifactsEmptyList(t *testing.T) {
+	for name, paths := range map[string][]string{"nil": nil, "empty": {}} {
+		t.Run(name, func(t *testing.T) {
+			if got := ClassifyArtifacts(paths); !reflect.DeepEqual(got, ArtifactClassification{}) {
+				t.Fatalf("classification = %+v, want empty", got)
+			}
+		})
+	}
+}
+
 func TestSQLVerdictWriterPublishesAndStagesObligations(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "beacon.db"))
 	if err != nil {
