@@ -1023,6 +1023,9 @@ func DocsIndexPaths(fsys fs.FS, dir string) ([]string, error) {
 		paths = append(paths, norm)
 		return nil
 	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil // no docs directory means nothing to index, not a discovery error
+	}
 	if err != nil {
 		return nil, err
 	}
