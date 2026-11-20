@@ -1,5 +1,5 @@
 # BS.8. Config resolver и env overlay
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/config.go
@@ -12,3 +12,6 @@
 Шаги: Глобальный конфиг, проектный overlay, env, отказ от fallback.
 Проверка: Недоступный target не падает в другой проект.
 Приёмка: Конфиг валидируется при старте.
+
+## Подтверждение
+- PR #388 MERGED: 2026-11-20 (squash).

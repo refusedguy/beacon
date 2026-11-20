@@ -1,5 +1,5 @@
 # BS.62. Конфиг merge.driver
-Статус: todo
+Статус: dropped
 Фаза: P5
 Тип: task
 Владелец файлов: internal/infra/registry/config.go, internal/app/orchestrator/orchestrate.go
@@ -12,3 +12,6 @@
 Шаги: Значения beacon и github-auto-merge, ошибка конфига при waitFor с auto-merge.
 Проверка: При waitFor драйвер принудительно beacon.
 Приёмка: requireApproval и requireUpToDate совпадают с branch protection.
+
+## Подтверждение
+- PR #394 DROPPED: Configurable merge.driver (Beacon vs GitHub auto-merge) removed by new contract: Beacon auto-merge only (ADR 0072); waitFor/waitForMain are policy exceptions, not a driver choice.

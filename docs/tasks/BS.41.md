@@ -1,5 +1,5 @@
 # BS.41. Контракт семи инструментов без изменений
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/mcp/contract_test.go, internal/infra/mcp/server.go
@@ -12,3 +12,6 @@
 Шаги: Оставить ToolNames, annotations и CycleInstructions прежними; новые возможности REST.
 Проверка: contract_test проходит без правки ожидаемых имён.
 Приёмка: Любое новое имя инструмента требует отдельного ADR.
+
+## Подтверждение
+- PR #391 MERGED: 2026-11-20 (squash).

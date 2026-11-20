@@ -1,5 +1,5 @@
 # BS.30. Polling fallback для вебхуков
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/cibridge/bridge.go
@@ -12,3 +12,6 @@
 Шаги: Оставляем тикер cibridge, absent webhook не считаем провалом.
 Проверка: При отсутствии webhook вердикт приходит из polling.
 Приёмка: Интервал polling настраивается.
+
+## Подтверждение
+- PR #390 MERGED: 2026-11-20 (squash).

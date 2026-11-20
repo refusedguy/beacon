@@ -1,5 +1,5 @@
 # BS.47. OTel спаны по opt-in
-Статус: todo
+Статус: done
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/otel/traces.go
@@ -12,3 +12,6 @@
 Шаги: Спаны JSON-RPC, ci.refresh, daemon.tick, orchestrator.merge, wake.deliver.
 Проверка: Без endpoint нет экспорта и лишних зависимостей.
 Приёмка: Kill switch OTEL_SDK_DISABLED работает по спецификации.
+
+## Подтверждение
+- PR #394 MERGED: 2026-11-20 (squash).

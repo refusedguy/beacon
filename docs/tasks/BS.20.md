@@ -1,5 +1,5 @@
 # BS.20. Capability scope и каналы ухода
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/server.go
@@ -12,3 +12,6 @@
 Шаги: Per-session scope, journal reasons, Depart по reason.
 Проверка: Depart закрывает нужный канал и не трогает чужие.
 Приёмка: go-sdk cancellation остаётся независимым select case.
+
+## Подтверждение
+- PR #391 MERGED: 2026-11-20 (squash).

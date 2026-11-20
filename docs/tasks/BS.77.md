@@ -1,5 +1,5 @@
 # BS.77. Безопасность loopback, токенов и payload
-Статус: todo
+Статус: done
 Фаза: P6
 Тип: task
 Владелец файлов: internal/infra/server/auth.go, internal/infra/channel/ingress.go
@@ -12,3 +12,6 @@
 Шаги: Loopback по умолчанию, bearer token, скасирование, только идентификаторы в meta.
 Проверка: Внешний запрос без токена отклонён.
 Приёмка: Сырой токен не пишется в состояние.
+
+## Подтверждение
+- PR #392 MERGED: 2026-11-20 (squash).
