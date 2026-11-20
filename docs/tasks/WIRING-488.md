@@ -1,5 +1,7 @@
 # WIRING-488. Подключить реестр сессий к приложению
-Статус: todo
+Premise: проверено 2026-11-21 по origin/main (ee67c1fa). Проводка уже применена тремя влитыми PR, и каждый несёт WIRING-488 в заголовке. PR #531 подключил запись сессии при старте через SaveSession. PR #545 подключил чтение сессии при resume через GetSession. PR #552 подключил heartbeat демона через Touch. Вызовы лежат в cmd/beacon, чужие OwnerFiles и .beacon/ не тронуты. Правка только текстовая. Статус изменён с todo на done.
+Статус: done
+baseline: `git rev-parse --short origin/main` = ee67c1fa; `gh pr view 531 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:19:51Z; #545 = MERGED 2026-11-20T17:36:14Z; #552 = MERGED 2026-11-20T17:40:39Z; `git grep -n -E 'reg\.Start|reg\.Resume|hb\.Heartbeat' origin/main -- cmd/beacon` = spawn.go:103, attach.go:208, daemon.go:128.
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/session/, cmd/beacon/
@@ -35,3 +37,6 @@ PR: 488
 ## Приёмка
 
 Проводка применена, CI зелёный.
+
+## Подтверждение
+- Premise проверен 2026-11-21 по origin/main (ee67c1fa). Дубль подтверждён влитыми PR #531, #545 и #552: app-порт SessionStore подключён к старту сессии, к resume и к heartbeat демона. Код не писал, gofmt не применял, чужие файлы и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done.
