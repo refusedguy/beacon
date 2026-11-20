@@ -6,8 +6,12 @@ package command
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+
+	"github.com/refusedguy/beacon/internal/infra/channel"
 )
 
 // Effect is both the intent the processor commits and the effect handed to
@@ -41,9 +45,10 @@ type Result struct {
 }
 
 var (
-	ErrEmptyKey  = errors.New("command: empty idempotency key")
-	ErrEmptyKind = errors.New("command: empty effect kind")
-	ErrNilOutbox = errors.New("command: nil outbox")
+	ErrEmptyKey     = errors.New("command: empty idempotency key")
+	ErrEmptyKind    = errors.New("command: empty effect kind")
+	ErrNilOutbox    = errors.New("command: nil outbox")
+	ErrNilProcessor = errors.New("command: nil processor")
 )
 
 // Processor commits command intent and outbox through Outbox, then runs the
@@ -91,4 +96,64 @@ func validate(in Effect) error {
 		return ErrEmptyKind
 	}
 	return nil
+}
+
+// ChannelCommandKind labels the durable effect recorded for one channel
+// command. The processor's sink receives the same label, so a drainer can
+// route the effect without decoding the payload twice.
+const ChannelCommandKind = "channel_command"
+
+// ChannelSink adapts a normalized channel command to the durable processor.
+// It implements channel.CommandSink: the ingress hands it a Command, and the
+// processor records the intent and outbox entry before the caller's sink runs
+// the effect (BS.60, WIRING-486).
+type ChannelSink struct {
+	processor *Processor
+}
+
+// NewChannelSink builds a sink over processor.
+func NewChannelSink(processor *Processor) *ChannelSink {
+	return &ChannelSink{processor: processor}
+}
+
+// Accept records cmd as an Effect and runs the processor's effect sink. A
+// repeated request id replays the original effect instead of writing another
+// row, so a channel that resends a delivery cannot apply a decision twice.
+func (s *ChannelSink) Accept(ctx context.Context, cmd channel.Command) error {
+	if s == nil || s.processor == nil {
+		return ErrNilProcessor
+	}
+	payload, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("command: encode channel command: %w", err)
+	}
+	effect := Effect{
+		Key:     channelEffectKey(cmd),
+		Kind:    ChannelCommandKind,
+		Payload: payload,
+	}
+	_, err = s.processor.Process(ctx, effect)
+	return err
+}
+
+// channelEffectKey builds the idempotency key for one channel command. A
+// channel request id wins when present. Without one the key uses the actor,
+// verb and target, which are the fields that decide what the command does;
+// the note is deliberately excluded so a reworded note does not make a second
+// effect. The escape makes the composite unambiguous when a value contains a
+// ':' or a backslash.
+func channelEffectKey(cmd channel.Command) string {
+	if cmd.RequestID != "" {
+		return ChannelCommandKind + ":" + escapeChannelKey(cmd.RequestID)
+	}
+	parts := []string{string(cmd.Actor), cmd.Verb, cmd.Target}
+	for i, part := range parts {
+		parts[i] = escapeChannelKey(part)
+	}
+	return ChannelCommandKind + ":" + strings.Join(parts, ":")
+}
+
+func escapeChannelKey(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, ":", `\:`)
 }
