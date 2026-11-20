@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -236,13 +238,65 @@ func findGates(root string) (string, error) {
 	return path, nil
 }
 
+// beaconStateDirEnv overrides the whole state directory. It is the explicit
+// knob for callers that manage project scoping themselves, and for tests that
+// need an isolated store without changing the working directory.
+const beaconStateDirEnv = "BEACON_STATE_DIR"
+
+// stateDir returns the state directory of the project the caller runs in.
+//
+// When the working directory is a project root (it contains .git, as a file in
+// a worktree or a directory in the main checkout) the state is scoped to that
+// project under <base>/beacon/projects/<name>-<hash>. Different projects then
+// keep separate watches, obligations and open tasks. Outside a project root the
+// legacy <base>/beacon path is kept, so tools run from a subdirectory or a
+// temporary directory still share one store.
 func stateDir() (string, error) {
-	if base := os.Getenv("XDG_STATE_HOME"); base != "" {
+	if override := os.Getenv(beaconStateDirEnv); override != "" {
+		return override, nil
+	}
+	base, err := stateBaseDir()
+	if err != nil {
+		return "", err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
 		return filepath.Join(base, "beacon"), nil
+	}
+	if _, statErr := os.Stat(filepath.Join(cwd, ".git")); statErr != nil {
+		return filepath.Join(base, "beacon"), nil
+	}
+	key, err := projectStateKey(cwd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "beacon", "projects", key), nil
+}
+
+// stateBaseDir resolves XDG_STATE_HOME or the user's home state directory.
+func stateBaseDir() (string, error) {
+	if base := os.Getenv("XDG_STATE_HOME"); base != "" {
+		return base, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("не удалось определить домашний каталог: %w", err)
 	}
-	return filepath.Join(home, ".local", "state", "beacon"), nil
+	return filepath.Join(home, ".local", "state"), nil
+}
+
+// projectStateKey builds a stable, readable directory key for a project root.
+// The hash of the absolute path separates projects with the same folder name;
+// the name keeps the state directory recognizable on disk.
+func projectStateKey(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("не удалось получить абсолютный путь проекта: %w", err)
+	}
+	sum := sha256.Sum256([]byte(abs))
+	name := filepath.Base(abs)
+	if name == "" || name == "." || name == string(filepath.Separator) {
+		name = "project"
+	}
+	return fmt.Sprintf("%s-%s", name, hex.EncodeToString(sum[:8])), nil
 }
