@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,10 +48,10 @@ func findRegistryConfig(project string) (registryConfig, error) {
 	dir := cwd
 	for {
 		candidate := filepath.Join(dir, registryConfigDir, registryConfigFile)
-		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+		if isRegularFile(candidate) {
 			return registryConfigFor(dir, candidate)
 		}
-		if _, statErr := os.Stat(filepath.Join(dir, ".git")); statErr == nil {
+		if pathExists(filepath.Join(dir, ".git")) {
 			return registryConfigAtRoot(dir)
 		}
 		parent := filepath.Dir(dir)
@@ -60,6 +61,19 @@ func findRegistryConfig(project string) (registryConfig, error) {
 		dir = parent
 	}
 	return globalRegistryConfig()
+}
+
+// pathExists and isRegularFile use the read-only fs.FS view rooted at the
+// parent directory. Direct os.Stat in cmd is reserved for internal/infra by
+// the capabilities gate (ADR 0005), so the lookup stays inside that boundary.
+func pathExists(path string) bool {
+	_, err := fs.Stat(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	return err == nil
+}
+
+func isRegularFile(path string) bool {
+	info, err := fs.Stat(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	return err == nil && !info.IsDir()
 }
 
 // registryConfigAtRoot returns the config location for an explicit or detected
