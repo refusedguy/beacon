@@ -160,6 +160,7 @@ type DaemonWatch struct {
 	BaseRef      string
 	Adapter      string
 	SubscriberID string
+	MainHeadSHA  string
 }
 
 // DaemonWatchLookup resolves one Watch into the primitive projection.
@@ -320,6 +321,9 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	}
 	text := fmt.Sprintf("%s: verdict=%s watchID=%s pr=%d headSHA=%s baseRef=%s revision=%d",
 		daemonWakeInstruction(verdict), verdict, watchID, watch.PR, watch.HeadSHA, watch.BaseRef, revision)
+	if sha := strings.TrimSpace(watch.MainHeadSHA); sha != "" {
+		text += " mainHeadSHA=" + sha
+	}
 	pointer := wake.T210WakePointer{
 		Adapter:      adapter,
 		Target:       watch.SubscriberID,

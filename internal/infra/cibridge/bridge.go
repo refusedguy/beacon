@@ -1696,20 +1696,23 @@ func (b *Bridge) markInWorkStalled(ctx context.Context, w domain.Watch, sub doma
 
 // wakeText builds the self-teaching instruction carried in a wake pointer.
 // Each verdict names the concrete next action so a receiver cannot answer with
-// an empty rebase or a blind re-run.
+// an empty rebase or a blind re-run. The observed main head is appended so two
+// checks with different upstream heads produce different wakes (ADR 0155).
 func wakeText(verdict domain.Verdict, obs ciObservation, targets []domain.WakeTarget, mergeErr string) string {
 	failed := realFailedNames(obs.pr.Checks)
+	var text string
 	switch verdict {
 	case domain.VerdictKeepWorking:
-		if len(failed) > 0 {
-			return "keep_working: чини конкретные failedChecks: " + strings.Join(failed, ", ") + "; не делай пустой ребейз"
+		switch {
+		case len(failed) > 0:
+			text = "keep_working: чини конкретные failedChecks: " + strings.Join(failed, ", ") + "; не делай пустой ребейз"
+		case mergeErr != "":
+			text = "keep_working: ошибка мержа: " + mergeErr + "; не делай пустой ребейз"
+		default:
+			text = "keep_working: чини конкретные failedChecks, не делай пустой ребейз"
 		}
-		if mergeErr != "" {
-			return "keep_working: ошибка мержа: " + mergeErr + "; не делай пустой ребейз"
-		}
-		return "keep_working: чини конкретные failedChecks, не делай пустой ребейз"
 	case domain.VerdictRebase:
-		return "rebase: git fetch origin main && git rebase origin/main && git push --force-with-lease"
+		text = "rebase: git fetch origin main && git rebase origin/main && git push --force-with-lease"
 	case domain.VerdictRetry:
 		checks := make([]string, 0)
 		for _, t := range targets {
@@ -1719,14 +1722,27 @@ func wakeText(verdict domain.Verdict, obs ciObservation, targets []domain.WakeTa
 			checks = failed
 		}
 		if len(checks) > 0 {
-			return "retry: gh run rerun --failed (" + strings.Join(checks, ", ") + ")"
+			text = "retry: gh run rerun --failed (" + strings.Join(checks, ", ") + ")"
+		} else {
+			text = "retry: gh run rerun --failed"
 		}
-		return "retry: gh run rerun --failed"
 	case domain.VerdictBlocked, domain.VerdictTimeout:
-		return "остановись и жди разблокировки"
+		text = "остановись и жди разблокировки"
 	default:
-		return string(verdict)
+		text = string(verdict)
 	}
+	return text + mainHeadMarker(obs.base.HeadSHA)
+}
+
+// mainHeadMarker appends the main branch head observed for a Watch to the wake
+// text. A subscriber reads it to tell an upstream move from its own error. An
+// empty observation contributes nothing, so existing wake text is unchanged.
+func mainHeadMarker(headSHA string) string {
+	sha := strings.TrimSpace(headSHA)
+	if sha == "" {
+		return ""
+	}
+	return "; mainHeadSHA=" + sha
 }
 
 func errText(err error) string {
