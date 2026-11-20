@@ -118,6 +118,38 @@ func Envelope(p domain.WakePayload) string {
 	return "<beacon-event>" + strings.TrimSpace(buf.String()) + "</beacon-event>"
 }
 
+// WatchTarget resolves the orchestrator session that owns a wake pointer. The
+// watchID must name the very Watch the pointer came from: a substituted id
+// never resolves, and neither does a Watch without an orchestrator subscriber.
+func WatchTarget(w domain.Watch, watchID string) (string, error) {
+	if watchID == "" || w.ID != watchID {
+		return "", fmt.Errorf("wake: watchID %q does not name watch %q", watchID, w.ID)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.Role == domain.RoleOrchestrator && strings.HasPrefix(sub.ID, "ses_") {
+			return sub.ID, nil
+		}
+	}
+	return "", fmt.Errorf("wake: no orchestrator session on watch %s", watchID)
+}
+
+// DeliverToWatch wakes the orchestrator of w through d. The target is read from
+// the Watch, not from a stub, and the obligation must belong to that target.
+// It returns an error without calling d when either check fails.
+func DeliverToWatch(ctx context.Context, d domain.WakeDeliverer, w domain.Watch, p domain.WakePayload) error {
+	if d == nil {
+		return fmt.Errorf("wake: deliver to watch: deliverer is nil")
+	}
+	target, err := WatchTarget(w, p.WatchID)
+	if err != nil {
+		return err
+	}
+	if want := domain.ObligationKey(p.WatchID, p.Revision, target); p.ObligationID != want {
+		return fmt.Errorf("wake: obligation %q does not belong to orchestrator %q of watch %s", p.ObligationID, target, p.WatchID)
+	}
+	return d.Deliver(ctx, target, p)
+}
+
 // verifyAck checks that the API admitted the prompt. An error response from
 // opencode api is already an exec error; this covers a 2xx with an unexpected
 // shape so a silently dropped wake is not reported as delivered.

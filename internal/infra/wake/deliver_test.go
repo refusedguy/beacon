@@ -150,6 +150,98 @@ func TestOpenCodeDelivererRepeatedPointerPostsOnePrompt(t *testing.T) {
 	}
 }
 
+// T3.230: the wake target is the orchestrator session of a real Watch. A
+// substituted watchID or an obligation of another subscriber must not wake it.
+func TestDeliverToWatchUsesRealWatchTarget(t *testing.T) {
+	const (
+		watchID = "watch:refusedguy/beacon:286:177bf240"
+		owner   = "ses_orchestrator"
+	)
+	w := domain.Watch{
+		ID: watchID,
+		Subscribers: []domain.Subscriber{
+			{ID: "ses_executor", Role: domain.RoleExecutor},
+			{ID: owner, Role: domain.RoleOrchestrator, Adapter: "opencode"},
+		},
+	}
+	p := domain.WakePayload{
+		WatchID:      watchID,
+		ObligationID: domain.ObligationKey(watchID, 1, owner),
+		Revision:     1,
+		Verdict:      "ready",
+	}
+
+	var targets []string
+	d := &recordingWakeDeliverer{fn: func(_ context.Context, sessionID string, _ domain.WakePayload) error {
+		targets = append(targets, sessionID)
+		return nil
+	}}
+	if err := DeliverToWatch(context.Background(), d, w, p); err != nil {
+		t.Fatalf("DeliverToWatch: %v", err)
+	}
+	if !reflect.DeepEqual(targets, []string{owner}) {
+		t.Fatalf("targets = %v, want [%s]", targets, owner)
+	}
+
+	stubbed := p
+	stubbed.WatchID = "watch:stubbed"
+	if err := DeliverToWatch(context.Background(), d, w, stubbed); err == nil {
+		t.Fatal("a substituted watchID must not deliver a wake")
+	}
+	foreign := p
+	foreign.ObligationID = domain.ObligationKey(watchID, 1, "ses_executor")
+	if err := DeliverToWatch(context.Background(), d, w, foreign); err == nil {
+		t.Fatal("an obligation of another subscriber must not wake the orchestrator")
+	}
+	if len(targets) != 1 {
+		t.Fatalf("prompt targets = %v, want exactly one", targets)
+	}
+}
+
+func TestDeliverToWatchPostsSteerAndReadsMessageID(t *testing.T) {
+	const (
+		watchID = "watch:refusedguy/beacon:286:177bf240"
+		owner   = "ses_orchestrator"
+	)
+	w := domain.Watch{ID: watchID, Subscribers: []domain.Subscriber{
+		{ID: owner, Role: domain.RoleOrchestrator},
+	}}
+	p := domain.WakePayload{
+		WatchID:      watchID,
+		ObligationID: domain.ObligationKey(watchID, 3, owner),
+		Revision:     3,
+		Verdict:      "ready",
+	}
+	var gotArgs []string
+	d := &OpenCodeDeliverer{Runner: func(_ context.Context, args ...string) ([]byte, error) {
+		gotArgs = args
+		return []byte(`{"data":{"id":"msg_1f72fc9f","delivery":"steer"}}`), nil
+	}}
+	if err := DeliverToWatch(context.Background(), d, w, p); err != nil {
+		t.Fatalf("DeliverToWatch: %v", err)
+	}
+	if len(gotArgs) < 5 || gotArgs[2] != "/api/session/"+owner+"/prompt" {
+		t.Fatalf("api call = %v", gotArgs)
+	}
+	var body struct {
+		Delivery string `json:"delivery"`
+	}
+	if err := json.Unmarshal([]byte(gotArgs[4]), &body); err != nil {
+		t.Fatalf("decode --data: %v", err)
+	}
+	if body.Delivery != "steer" {
+		t.Fatalf("delivery = %q, want steer", body.Delivery)
+	}
+}
+
+type recordingWakeDeliverer struct {
+	fn func(context.Context, string, domain.WakePayload) error
+}
+
+func (r *recordingWakeDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	return r.fn(ctx, sessionID, p)
+}
+
 // ===== T3.200 прямой POST session.prompt (#286) =====
 
 // T200recordedRequest is the part of an outgoing request a test cares about.
