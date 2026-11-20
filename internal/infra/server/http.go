@@ -5,14 +5,12 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,11 +30,6 @@ const (
 	loopbackAddr = "127.0.0.1:0"
 
 	tokenBytes = 32
-
-	// VersionPath and StatusPath are the read-only projections served by this
-	// server. They never write state, so both accept GET only (BS.4).
-	VersionPath = "/version"
-	StatusPath  = "/status"
 )
 
 var (
@@ -44,15 +37,6 @@ var (
 	ErrEmptyToken = errors.New("server: empty bearer token")
 	// ErrTokenPerm reports a token file readable by group or world.
 	ErrTokenPerm = errors.New("server: bearer token file must be 0600")
-
-	// BinaryVersion is the version reported by /version and /status. A build
-	// can set it with -ldflags "-X ...server.BinaryVersion=v1.2.3"; the default
-	// falls back to the Go module version and finally to "dev".
-	BinaryVersion = ""
-
-	// processStart anchors the uptime reported by /status. It is set once when
-	// the process starts, so uptime is a pure read of the clock.
-	processStart = time.Now()
 )
 
 // TokenPath returns the path of the bearer token file in stateDir.
@@ -181,11 +165,9 @@ type HTTPServer struct {
 }
 
 // Serve loads (or creates) the token in stateDir, binds 127.0.0.1 on a random
-// port and serves handler behind bearer authentication. The read-only /version
-// and /status projections are installed in front of handler. An optional
-// StatusReader supplies the dynamic /status values; without one they stay at
-// stable zero values. The caller owns the returned server and must Close it.
-func Serve(stateDir string, handler http.Handler, readers ...StatusReader) (*HTTPServer, error) {
+// port and serves handler behind bearer authentication. The caller owns the
+// returned server and must Close it.
+func Serve(stateDir string, handler http.Handler) (*HTTPServer, error) {
 	token, err := LoadOrCreateToken(stateDir)
 	if err != nil {
 		return nil, err
@@ -194,13 +176,9 @@ func Serve(stateDir string, handler http.Handler, readers ...StatusReader) (*HTT
 	if err != nil {
 		return nil, err
 	}
-	var reader StatusReader
-	if len(readers) > 0 {
-		reader = readers[0]
-	}
 	srv := &HTTPServer{listener: listener, addr: listener.Addr().String()}
 	srv.httpServer = &http.Server{
-		Handler:           Bearer(token)(NewStatusProjection(handler, reader).Handler()),
+		Handler:           Bearer(token)(handler),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -268,126 +246,4 @@ func (r *Readiness) Health() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
-}
-
-// VersionResponse is the stable payload served by GET /version. It is a
-// transport-owned shape so adding fields cannot change the wire contract for
-// an older client.
-type VersionResponse struct {
-	Version string `json:"version"`
-}
-
-// StatusResponse is the stable read-only payload served by GET /status. Every
-// field is either a constant, a clock read or a value from a StatusReader; no
-// field is computed by writing to the store.
-type StatusResponse struct {
-	Version       string `json:"version"`
-	UptimeSeconds int64  `json:"uptimeSeconds"`
-	ActiveWatches int    `json:"activeWatches"`
-	Lease         string `json:"lease"`
-}
-
-// StatusReader is the read-only port for the two dynamic /status values. A
-// nil reader is allowed: the projection then reports zero watches and an
-// "unknown" lease, so a server without a store still answers /status without
-// a write.
-type StatusReader interface {
-	ActiveWatches(ctx context.Context) (int, error)
-	LeaseState(ctx context.Context) (string, error)
-}
-
-// StatusProjection installs the /version and /status read-only routes in front of
-// next. Every other path is delegated to next unchanged. Both routes accept
-// GET only and answer 405 with an Allow header for any other method, so they
-// can never be used to change state.
-type StatusProjection struct {
-	next   http.Handler
-	reader StatusReader
-	start  time.Time
-}
-
-// NewStatusProjection builds a projection. A nil next leaves unknown paths to the
-// mux's 404; a nil reader yields stable zero values for the dynamic fields.
-func NewStatusProjection(next http.Handler, reader StatusReader) *StatusProjection {
-	return &StatusProjection{next: next, reader: reader, start: processStart}
-}
-
-// Handler returns the read-only HTTP handler for both projection routes.
-func (p *StatusProjection) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc(VersionPath, p.handleVersion)
-	mux.HandleFunc(StatusPath, p.handleStatus)
-	if p.next != nil {
-		mux.Handle("/", p.next)
-	}
-	return mux
-}
-
-func (p *StatusProjection) handleVersion(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		writeProjectionError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "only GET is supported")
-		return
-	}
-	writeProjectionJSON(w, http.StatusOK, VersionResponse{Version: p.version()})
-}
-
-func (p *StatusProjection) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		writeProjectionError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "only GET is supported")
-		return
-	}
-
-	watches, lease := 0, "unknown"
-	if p.reader != nil {
-		if n, err := p.reader.ActiveWatches(r.Context()); err == nil && n >= 0 {
-			watches = n
-		}
-		if state, err := p.reader.LeaseState(r.Context()); err == nil && strings.TrimSpace(state) != "" {
-			lease = state
-		}
-	}
-
-	uptime := int64(0)
-	if p.start.Before(time.Now()) {
-		uptime = int64(time.Since(p.start).Seconds())
-	}
-	writeProjectionJSON(w, http.StatusOK, StatusResponse{
-		Version:       p.version(),
-		UptimeSeconds: uptime,
-		ActiveWatches: watches,
-		Lease:         lease,
-	})
-}
-
-// version resolves the binary version without a store read. An explicit
-// BinaryVersion wins; otherwise the Go module version is used; "dev" is the
-// stable fallback for local builds.
-func (p *StatusProjection) version() string {
-	if v := strings.TrimSpace(BinaryVersion); v != "" {
-		return v
-	}
-	if info, ok := debug.ReadBuildInfo(); ok {
-		if v := strings.TrimSpace(info.Main.Version); v != "" && v != "(devel)" {
-			return v
-		}
-	}
-	return "dev"
-}
-
-func writeProjectionJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-type projectionErrorBody struct {
-	OK      bool   `json:"ok"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-func writeProjectionError(w http.ResponseWriter, status int, code, message string) {
-	writeProjectionJSON(w, status, projectionErrorBody{Code: code, Message: message})
 }
