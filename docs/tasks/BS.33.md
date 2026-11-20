@@ -1,5 +1,6 @@
 # BS.33. Персистентность расписаний
 Статус: done
+Premise: проверено 2026-11-20, дубль. Функциональность уже в main: internal/infra/store/schedules.go хранит расписания в таблице schedules с колонками next_run и enabled, next_run в Unix-наносекундах. SaveSchedule пишет или обновляет строку, DueSchedules выдаёт просроченные расписания, MarkTriggered сдвигает next_run вперёд, поэтому просрочка выполняется один раз за период. Тесты TestSchedulesPersistAcrossReopen и TestMarkTriggeredShiftsNextRun в internal/infra/store/schedules_test.go покрывают проверку и приёмку карточки. Код не писал, OwnerFiles не менял, дубль не создан.
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/store/schedules.go
