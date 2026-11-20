@@ -152,6 +152,13 @@ func loadBatches(dir string) ([]batch, []string) {
 }
 
 func (r *runner) writeFile(root, rel, content string) error {
+	return r.writeFileMode(root, rel, content, false)
+}
+
+// writeFileMode writes a generated file. overwrite is true only for card
+// closures, which update an existing card in place. New cards keep the
+// never-overwrite rule.
+func (r *runner) writeFileMode(root, rel, content string, overwrite bool) error {
 	path := filepath.Join(root, rel)
 	if !r.opts.Quiet {
 		fmt.Fprintln(r.out, " ", path)
@@ -162,8 +169,10 @@ func (r *runner) writeFile(root, rel, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	if _, err := os.Stat(path); err == nil {
-		return nil // never overwrite an existing card
+	if !overwrite {
+		if _, err := os.Stat(path); err == nil {
+			return nil // never overwrite an existing card
+		}
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
 }
@@ -255,7 +264,7 @@ func (r *runner) applyClosures(root string, closures map[string]cardClosure) err
 		}
 		text = strings.Replace(text, "Статус: todo", "Статус: done", 1)
 		text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n", c.PR, c.MergedAt)
-		if err := r.writeFile(root, rel, text); err != nil {
+		if err := r.writeFileMode(root, rel, text, true); err != nil {
 			return err
 		}
 	}
