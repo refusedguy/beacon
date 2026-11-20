@@ -9,6 +9,7 @@ package opencode
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -139,14 +140,50 @@ type Agent struct {
 	Mode string `json:"mode"`
 }
 
+// modelID is the model field of a GET /api/session row. opencode v2 reports it
+// as an object {"id","providerID","variant"}; earlier versions and the test
+// stand-in report a plain string. UnmarshalJSON accepts both and keeps the id,
+// so callers always read a model id as a string (ADR 0060, T3.148).
+type modelID string
+
+func (m *modelID) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
+		return nil
+	}
+	switch data[0] {
+	case '{':
+		// v2 object form: take the id and ignore providerID/variant.
+		var obj struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		*m = modelID(obj.ID)
+	case '"':
+		// Legacy plain-string form, kept for backward compatibility.
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*m = modelID(s)
+	case 'n': // null
+		*m = ""
+	default:
+		return fmt.Errorf("model: ожидалась строка или объект с id, получено %s", data)
+	}
+	return nil
+}
+
 // Session is one entry of GET /api/session. Fields follow the v2 response
 // shape recorded in ADR 0060.
 type Session struct {
-	ID       string `json:"id"`
-	ParentID string `json:"parentID"`
-	Agent    string `json:"agent"`
-	ModelID  string `json:"model"`
-	Title    string `json:"title"`
+	ID       string  `json:"id"`
+	ParentID string  `json:"parentID"`
+	Agent    string  `json:"agent"`
+	ModelID  modelID `json:"model"`
+	Title    string  `json:"title"`
 	Time     struct {
 		Busy    int64  `json:"busy"`
 		Idle    int64  `json:"idle"`
