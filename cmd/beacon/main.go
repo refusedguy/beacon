@@ -215,6 +215,8 @@ func (c *CLI) Run(args []string) int {
 		return taskRunner(append([]string{"why"}, args[1:]...), c.out, c.errOut)
 	case "mcp":
 		return mcpRunner(c.errOut)
+	case "orchestrate":
+		return orchestratorRunner(c, args[1:])
 	case "agents":
 		return c.runAgents(args[1:])
 	case "watch":
