@@ -234,6 +234,54 @@ func TestGetResultRetryBudgetWithoutFlakyFailure(t *testing.T) {
 	}
 }
 
+// TestGetResultCancelledCheckIsFailed verifies that a CANCELLED conclusion is
+// projected as a failed check (T3.401). The cancelled check has no failure state,
+// so the conclusion is what makes it fail.
+func TestGetResultCancelledCheckIsFailed(t *testing.T) {
+	w := domain.Watch{
+		ID:       "w-cancel",
+		Repo:     "o/r",
+		PR:       2,
+		HeadSHA:  "sha",
+		Status:   domain.StatusNotifying,
+		Verdict:  domain.VerdictKeepWorking,
+		Revision: 1,
+		Checks: map[string]domain.Check{
+			"ci/cancelled": {Conclusion: "CANCELLED", Required: true, DetailsURL: "https://ci/cancel"},
+			"ci/ok":        {State: "SUCCESS", Conclusion: "SUCCESS", Required: true, DetailsURL: "https://ci/ok"},
+		},
+		Merge: domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
+	}
+	o := resultObligation(w, "session-C")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+
+	out, err := h.Result(context.Background(), sessionReq("session-C"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	want := []FailedCheck{
+		{Name: "ci/cancelled", Conclusion: "CANCELLED", DetailsURL: "https://ci/cancel", Required: true},
+	}
+	got := sortedFailedChecks(out.FailedChecks)
+	if len(got) != len(want) {
+		t.Fatalf("failedChecks = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("failedChecks[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
 // TestGetResultValidation covers the input and not-found paths before a stamp.
 func TestGetResultValidation(t *testing.T) {
 	w := resultFixture(domain.VerdictReady)

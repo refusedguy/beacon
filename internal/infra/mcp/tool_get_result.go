@@ -37,11 +37,13 @@ type GetResultInput struct {
 // failureConclusions are the check-level conclusions that make a check a failed
 // check. SKIPPED, NEUTRAL and the pending states (WAITING, QUEUED,
 // ACTION_REQUIRED) are deliberately absent: WORKER-PROMPT §4.6 allows them.
+// CANCELLED is a failure too: an aborted check is not a passing check (T3.401).
 var failureConclusions = map[string]bool{
 	"FAILURE":         true,
 	"ERROR":           true,
 	"TIMED_OUT":       true,
 	"STARTUP_FAILURE": true,
+	"CANCELLED":       true,
 }
 
 // resultStoreReader is the narrow read port used by beacon_get_result and
