@@ -44,24 +44,207 @@ type Config struct {
 	PollInterval time.Duration
 }
 
+// ParentNotice is the server's projection of a child thread's question into
+// the parent chat. It has the same wire shape as app/session.ParentNotice. The
+// server cannot import app (ADR 0005), so the type lives here and the
+// composition root adapts the model's notice when it binds the notifier.
+type ParentNotice struct {
+	ParentID  string `json:"parentID"`
+	ChildID   string `json:"childID"`
+	ChildName string `json:"childName"`
+	Question  string `json:"question"`
+}
+
+// ParentNotifier delivers a notice to a parent chat. It owns no store and no
+// chat client. The composition root binds the real adapter; a server without
+// one builds the notice but does not deliver it.
+type ParentNotifier interface {
+	Notify(ctx context.Context, notice ParentNotice) error
+}
+
+// ParentNotifierFunc adapts a function to ParentNotifier.
+type ParentNotifierFunc func(ctx context.Context, notice ParentNotice) error
+
+// Notify calls f with notice.
+func (f ParentNotifierFunc) Notify(ctx context.Context, notice ParentNotice) error {
+	return f(ctx, notice)
+}
+
+// Errors returned by ChildThreads. Callers use errors.Is to branch on them.
+var (
+	ErrInvalidThread   = errors.New("server: invalid thread")
+	ErrDuplicateThread = errors.New("server: duplicate thread")
+	ErrUnknownThread   = errors.New("server: unknown thread")
+	ErrUnknownParent   = errors.New("server: unknown parent")
+	ErrNoParent        = errors.New("server: thread has no parent")
+	ErrEmptyQuestion   = errors.New("server: empty question")
+)
+
+// childThread is one stored thread reference. A root has an empty parentID.
+type childThread struct {
+	name     string
+	parentID string
+}
+
+// ChildThreads holds the thread references the server owns. It records each
+// child's parent and name, then projects a child's question into a notice for
+// the parent chat. It reads no clock, store or network. The only I/O is the
+// notifier passed to Ask. A value is ready to use and is safe for concurrent
+// callers.
+type ChildThreads struct {
+	mu      sync.RWMutex
+	threads map[string]childThread
+}
+
+// NewChildThreads builds an empty reference store.
+func NewChildThreads() *ChildThreads { return &ChildThreads{threads: make(map[string]childThread)} }
+
+func (c *ChildThreads) init() {
+	if c.threads == nil {
+		c.threads = make(map[string]childThread)
+	}
+}
+
+// Root records a thread with no parent. An empty id returns ErrInvalidThread
+// and an id already in use returns ErrDuplicateThread.
+func (c *ChildThreads) Root(id, name string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ErrInvalidThread
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.init()
+	if _, exists := c.threads[id]; exists {
+		return ErrDuplicateThread
+	}
+	c.threads[id] = childThread{name: strings.TrimSpace(name)}
+	return nil
+}
+
+// Spawn records a child under parent. The parent must already exist. Empty
+// identifiers or an empty name return ErrInvalidThread.
+func (c *ChildThreads) Spawn(parentID, childID, name string) error {
+	parentID, childID = strings.TrimSpace(parentID), strings.TrimSpace(childID)
+	if parentID == "" || childID == "" || strings.TrimSpace(name) == "" {
+		return ErrInvalidThread
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.init()
+	if _, ok := c.threads[parentID]; !ok {
+		return ErrUnknownParent
+	}
+	if _, exists := c.threads[childID]; exists {
+		return ErrDuplicateThread
+	}
+	c.threads[childID] = childThread{name: strings.TrimSpace(name), parentID: parentID}
+	return nil
+}
+
+// Get returns the name and parent of id. A root has an empty parent.
+func (c *ChildThreads) Get(id string) (name, parentID string, ok bool) {
+	if c == nil {
+		return "", "", false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.threads[id]
+	return t.name, t.parentID, ok
+}
+
+// Ask builds a notice for a child's question and delivers it through notifier.
+// A nil notifier builds the notice without delivering it. An unknown child, an
+// empty question or a root question returns an error and no delivery. A
+// notifier error is returned with the notice so the caller can retry.
+func (c *ChildThreads) Ask(ctx context.Context, notifier ParentNotifier, childID, question string) (ParentNotice, error) {
+	if c == nil {
+		return ParentNotice{}, ErrUnknownThread
+	}
+	question = strings.TrimSpace(question)
+	if question == "" {
+		return ParentNotice{}, ErrEmptyQuestion
+	}
+	c.mu.RLock()
+	t, ok := c.threads[childID]
+	c.mu.RUnlock()
+	if !ok {
+		return ParentNotice{}, ErrUnknownThread
+	}
+	if t.parentID == "" {
+		return ParentNotice{}, ErrNoParent
+	}
+	notice := ParentNotice{
+		ParentID:  t.parentID,
+		ChildID:   childID,
+		ChildName: t.name,
+		Question:  question,
+	}
+	if notifier == nil {
+		return notice, nil
+	}
+	if err := notifier.Notify(ctx, notice); err != nil {
+		return notice, err
+	}
+	return notice, nil
+}
+
+// Len reports the number of stored references.
+func (c *ChildThreads) Len() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.threads)
+}
+
 // WebSocket is an HTTP handler that upgrades a request to a WebSocket and
 // streams events from an EventReader. Replay starts at the cursor resolved
 // from Last-Event-ID or ?replay, and a client can resume in place by sending a
-// {"type":"resume","seq":N} text frame.
+// {"type":"resume","seq":N} text frame. A {"type":"question"} frame carries a
+// child thread's question to its parent chat through the bound notifier.
 type WebSocket struct {
 	cfg        Config
 	projection *Projection
 	poll       time.Duration
+	threads    *ChildThreads
+	notifier   ParentNotifier
 }
 
 // NewWebSocket builds a WebSocket transport over reader. A nil reader is
-// tolerated at construction and reported per request by the projection.
+// tolerated at construction and reported per request by the projection. The
+// transport starts with an empty thread reference store and no notifier.
 func NewWebSocket(reader EventReader, cfg Config) *WebSocket {
+	return NewWebSocketWithLineage(reader, cfg, NewChildThreads(), nil)
+}
+
+// NewWebSocketWithLineage builds a transport with a caller-supplied reference
+// store and parent-chat notifier. Both may be nil: a nil store gets a fresh
+// one, and a nil notifier makes question frames build a notice without
+// delivering it.
+func NewWebSocketWithLineage(reader EventReader, cfg Config, threads *ChildThreads, notifier ParentNotifier) *WebSocket {
 	poll := cfg.PollInterval
 	if poll <= 0 {
 		poll = defaultWSPoll
 	}
-	return &WebSocket{cfg: cfg, projection: NewProjection(reader), poll: poll}
+	if threads == nil {
+		threads = NewChildThreads()
+	}
+	return &WebSocket{
+		cfg: cfg, projection: NewProjection(reader), poll: poll,
+		threads: threads, notifier: notifier,
+	}
+}
+
+// Threads returns the reference store the transport uses. A composition root
+// calls Root and Spawn here to create child thread references.
+func (ws *WebSocket) Threads() *ChildThreads { return ws.threads }
+
+// Ask routes a child question through the reference store and notifier bound
+// to this transport.
+func (ws *WebSocket) Ask(ctx context.Context, childID, question string) (ParentNotice, error) {
+	return ws.threads.Ask(ctx, ws.notifier, childID, question)
 }
 
 // ServeHTTP upgrades a valid handshake and serves the event stream. When the
@@ -115,7 +298,7 @@ func (ws *WebSocket) serve(conn frameConn, cursor uint64, parent context.Context
 	}
 
 	resumes := make(chan uint64, 8)
-	go ws.readClient(conn, cancel, resumes)
+	go ws.readClient(ctx, conn, cancel, resumes)
 
 	ticker := time.NewTicker(ws.poll)
 	defer ticker.Stop()
@@ -150,8 +333,10 @@ func (ws *WebSocket) serve(conn frameConn, cursor uint64, parent context.Context
 }
 
 // readClient consumes client frames. A close frame or read error cancels the
-// stream; a ping is answered with a pong; a resume text frame moves the cursor.
-func (ws *WebSocket) readClient(conn frameConn, cancel context.CancelFunc, resumes chan<- uint64) {
+// stream; a ping is answered with a pong. A resume text frame moves the
+// cursor. A question text frame routes a child's question to the parent chat
+// through the bound notifier.
+func (ws *WebSocket) readClient(ctx context.Context, conn frameConn, cancel context.CancelFunc, resumes chan<- uint64) {
 	for {
 		opcode, payload, err := conn.ReadFrame()
 		if err != nil {
@@ -166,11 +351,17 @@ func (ws *WebSocket) readClient(conn frameConn, cancel context.CancelFunc, resum
 			_ = conn.WriteFrame(wsOpcodePong, payload)
 		case wsOpcodeText:
 			var m clientMessage
-			if json.Unmarshal(payload, &m) == nil && m.Type == "resume" {
+			if json.Unmarshal(payload, &m) != nil {
+				continue
+			}
+			switch m.Type {
+			case "resume":
 				select {
 				case resumes <- m.Seq:
 				default:
 				}
+			case "question":
+				_, _ = ws.Ask(ctx, m.ChildID, m.Question)
 			}
 		}
 	}
@@ -222,9 +413,12 @@ func (c *wsConn) ReadFrame() (byte, []byte, error) {
 func (c *wsConn) Close() error { return c.netConn.Close() }
 
 // clientMessage is the small control envelope a client sends on a text frame.
+// ChildID and Question are set on a "question" frame.
 type clientMessage struct {
-	Type string `json:"type"`
-	Seq  uint64 `json:"seq"`
+	Type     string `json:"type"`
+	Seq      uint64 `json:"seq"`
+	ChildID  string `json:"childID"`
+	Question string `json:"question"`
 }
 
 func connectedMessage(cursor uint64) []byte {

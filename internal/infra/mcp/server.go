@@ -7,9 +7,11 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -185,6 +187,60 @@ func stubHandler(_ context.Context, _ *mcpsdk.CallToolRequest, _ stubInput) (*mc
 	return &mcpsdk.CallToolResult{}, stubOutput{OK: true}, nil
 }
 
+// ParentNotice is the projection of a child thread's question into the parent
+// chat. It has the same wire shape as the server transport's notice, so one
+// adapter at the composition root can serve both layers.
+type ParentNotice struct {
+	ParentID  string `json:"parentID"`
+	ChildID   string `json:"childID"`
+	ChildName string `json:"childName"`
+	Question  string `json:"question"`
+}
+
+// ParentNotifier delivers a notice to a parent chat. It owns no chat client
+// and no store. The composition root binds the real adapter.
+type ParentNotifier interface {
+	Notify(ctx context.Context, notice ParentNotice) error
+}
+
+// ChildThreadResolver resolves a child thread to its parent id and name. The
+// server transport owns the reference store; this port lets the MCP layer use
+// it without importing another infra package (ADR 0005).
+type ChildThreadResolver interface {
+	Resolve(childID string) (parentID, childName string, ok bool)
+}
+
+// ErrNoLineage reports that AskChildQuestion has no reference store to resolve
+// the child, or that the question cannot be projected.
+var ErrNoLineage = errors.New("mcp: child-thread lineage is not wired")
+
+// AskChildQuestion projects a child's question into a parent notice and
+// delivers it through the ports in deps. It is the MCP-side entry for a child
+// agent's question and adds no tool, so the eight-tool contract stands. A nil
+// notifier builds the notice without delivering it.
+func (d Dependencies) AskChildQuestion(ctx context.Context, childID, question string) (ParentNotice, error) {
+	if d.ChildThreads == nil {
+		return ParentNotice{}, ErrNoLineage
+	}
+	parentID, childName, ok := d.ChildThreads.Resolve(childID)
+	if !ok || strings.TrimSpace(question) == "" {
+		return ParentNotice{}, ErrNoLineage
+	}
+	notice := ParentNotice{
+		ParentID:  parentID,
+		ChildID:   childID,
+		ChildName: childName,
+		Question:  strings.TrimSpace(question),
+	}
+	if d.ParentNotifier == nil {
+		return notice, nil
+	}
+	if err := d.ParentNotifier.Notify(ctx, notice); err != nil {
+		return notice, err
+	}
+	return notice, nil
+}
+
 // Dependencies groups the ports the eight real handlers need. NewServer's
 // zero-dependency form still registers every real handler; handlers that lack a
 // backing port report a domain error instead of pretending to succeed. A
@@ -252,6 +308,14 @@ type Dependencies struct {
 	// nil value keeps the tool registered but it reports PERSIST_FAILED until a
 	// composition root supplies the store port from W12-A.
 	DeferWiring DeferWriter
+
+	// ChildThreads and ParentNotifier carry the child-thread lineage wiring at
+	// the MCP boundary. Adding a ninth tool would break the contracted set, so
+	// the question route is a port pair instead. The composition root supplies
+	// both from the server's reference store and the chat adapter. A nil
+	// resolver keeps AskChildQuestion honest about the missing wiring.
+	ChildThreads   ChildThreadResolver
+	ParentNotifier ParentNotifier
 }
 
 // CapabilityScopeRegistry owns one cancellation scope per calling agent
