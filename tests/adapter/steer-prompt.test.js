@@ -16,7 +16,12 @@ const SELF = fileURLToPath(import.meta.url)
 const REPO_ROOT = resolve(dirname(SELF), "..", "..")
 const PLUGIN_PATH = resolve(REPO_ROOT, ".opencode", "plugins", "beacon-bridge.js")
 
-const { default: plugin, adapterPaths } = await import(pathToFileURL(PLUGIN_PATH).href)
+const {
+  default: plugin,
+  adapterPaths,
+  FETCH_BEFORE_WORKTREE_RULE,
+  checkFetchBeforeWorktree,
+} = await import(pathToFileURL(PLUGIN_PATH).href)
 
 const TEST_SESSION = "ses_t33_wake"
 const CONTROL_SESSION = "ses_t33_control"
@@ -190,4 +195,29 @@ test("контроль resume:false: delivered есть, execution.started не�
   assert.equal(h.apiEventFeed("session.execution.started").length, 0)
 
   stop()
+})
+
+// HD-011 (ADR 0292): порядок создания рабочей копии зафиксирован правилом
+// плагина. fetch идёт первым, worktree создаётся только после fetch.
+test("HD-011: правило fetch -> worktree зафиксировано в плагине", () => {
+  assert.equal(typeof FETCH_BEFORE_WORKTREE_RULE, "string")
+  assert.match(FETCH_BEFORE_WORKTREE_RULE, /fetch/i)
+  assert.match(FETCH_BEFORE_WORKTREE_RULE, /worktree/i)
+})
+
+test("HD-011: worktree до fetch проваливает проверку порядка", () => {
+  // Правильный порядок проходит: fetch затем worktree.
+  assert.equal(checkFetchBeforeWorktree(["fetch", "worktree"]).ok, true)
+  assert.equal(checkFetchBeforeWorktree([
+    "git fetch origin main", "git worktree add -b fix/hd011 x origin/main",
+  ]).ok, true)
+  assert.equal(checkFetchBeforeWorktree([{ op: "fetch" }, { op: "worktree" }]).ok, true)
+
+  // Нарушенный порядок проваливает карточку.
+  const violated = checkFetchBeforeWorktree(["worktree", "fetch"])
+  assert.equal(violated.ok, false)
+  assert.equal(violated.reason, "worktree before fetch")
+  assert.equal(checkFetchBeforeWorktree(["worktree"]).ok, false)
+  // Нет worktree — нарушать нечего.
+  assert.equal(checkFetchBeforeWorktree([]).ok, true)
 })
