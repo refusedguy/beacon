@@ -695,6 +695,14 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DECISION_FAILED", err.Error())
 		return
 	}
+	// The response always echoes the accepted request. A sink is free to
+	// return only its own fields, so the transport fills the identity here.
+	if result.Command == "" {
+		result.Command = d.Command
+	}
+	if result.WatchID == "" {
+		result.WatchID = d.WatchID
+	}
 	result.OK = true
 	result.Applied = true
 	if result.DecisionID == "" {
