@@ -398,7 +398,7 @@ func TestCreateSessionSendsPostWithAgent(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		const out = `{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}`
+		const out = `{"data":{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}}`
 		return fakeResponse(out, http.StatusOK), nil
 	}}
 	c := newTestClient(t, doer)
@@ -444,6 +444,27 @@ func TestCreateSessionSendsPostWithAgent(t *testing.T) {
 	meta, ok := payload["metadata"].(map[string]any)
 	if !ok || meta["watchID"] != "w1" || meta["obligationID"] != "o1" {
 		t.Fatalf("неверный metadata: %v", payload["metadata"])
+	}
+}
+
+// T3.999: v2.3.0 wraps POST /api/session in {"data":{...}}. Without unwrapping
+// the envelope the adapter gets a zero session and reports an empty sessionID.
+func TestCreateSessionUnwrapsDataEnvelope(t *testing.T) {
+	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+		const out = `{"data":{"id":"ses_abc123","parentID":"ses_parent","agent":"general","title":"T3.999","location":{"directory":"/w"}},"location":{"directory":"/w"}}`
+		return fakeResponse(out, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	session, err := c.CreateSession(context.Background(), "ses_parent", "general", "T3.999", nil)
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if session.ID != "ses_abc123" {
+		t.Fatalf("ID из envelope data = %q, хочется ses_abc123", session.ID)
+	}
+	if session.ParentID != "ses_parent" || session.Agent != "general" || session.Title != "T3.999" {
+		t.Fatalf("неверная сессия из envelope: %+v", session)
 	}
 }
 

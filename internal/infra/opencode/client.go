@@ -265,6 +265,38 @@ func decodeList[T any](resp *http.Response) (list[T], error) {
 	return out, nil
 }
 
+// decodeSingle reads one object from the {"data":{...}} envelope used by the
+// session routes. It also accepts a bare object so a handler that omits the
+// envelope still works. The body is closed here, like in decodeList.
+func decodeSingle[T any](resp *http.Response) (T, error) {
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		var zero T
+		return zero, err
+	}
+	var out T
+	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
+		if err := json.Unmarshal(envelope.Data, &out); err != nil {
+			var zero T
+			return zero, err
+		}
+		return out, nil
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		var zero T
+		return zero, err
+	}
+	return out, nil
+}
+
 // ListAgents reads GET /api/agent.
 func (c *Client) ListAgents(ctx context.Context) ([]Agent, error) {
 	resp, err := c.get(ctx, "/api/agent")
@@ -326,9 +358,10 @@ func (c *Client) CreateSession(ctx context.Context, parentID, agent, title strin
 	if err != nil {
 		return Session{}, err
 	}
-	defer resp.Body.Close()
-	var session Session
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&session); err != nil {
+	// POST /api/session answers with the {"data":{...}} envelope. decodeSingle
+	// also accepts a bare object for handlers that omit the envelope.
+	session, err := decodeSingle[Session](resp)
+	if err != nil {
 		return Session{}, fmt.Errorf("opencode POST /api/session: %v", err)
 	}
 	return session, nil
