@@ -10,12 +10,8 @@ import (
 	"text/tabwriter"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/infra/github"
 )
-
-// defaultCIRepo is used when --repo is absent. The project config hook will
-// supply this value once the research card defines its schema; until then the
-// flag and this constant are the only sources.
-const defaultCIRepo = "refusedguy/beacon"
 
 // ciRunner holds the command so dispatch stays a one-line wiring change and
 // tests can replace the whole implementation, as with watch and task.
@@ -33,7 +29,7 @@ func runCI(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("ci check", flag.ContinueOnError)
 	all := fs.Bool("all", false, "проверить все открытые PR")
 	dryRun := fs.Bool("dry-run", false, "только показать план, не менять Watch")
-	repo := fs.String("repo", defaultCIRepo, "slug репозитория для Watch")
+	repoFlag := fs.String("repo", "", "slug репозитория; по умолчанию из .beacon/config.yaml или git remote origin")
 	format := fs.String("format", "table", "формат вывода: table или json")
 	if !parseFlags("ci check", args[1:], c.errOut, fs) {
 		return 2
@@ -46,6 +42,16 @@ func runCI(c *CLI, args []string) int {
 	if *format != "table" && *format != "json" {
 		fmt.Fprintf(c.errOut, "beacon ci check: неизвестный формат %q, ожидается table или json\n", *format)
 		writeUsage(c.errOut)
+		return 2
+	}
+	// --repo wins over the project config, which wins over the git remote.
+	// Detection lives in infra so this command never spawns a process itself.
+	repo := github.DetectRepoSlugWithOverride(projectRootForConfig(), *repoFlag)
+	if repo == "" {
+		repo = defaultCIRepo
+	}
+	if repo == "" {
+		fmt.Fprintf(c.errOut, "beacon ci check: не удалось определить репозиторий; укажите --repo owner/name\n")
 		return 2
 	}
 	deps, closeStore, err := openMCPDependencies()
@@ -95,7 +101,7 @@ func runCI(c *CLI, args []string) int {
 	}
 
 	summary, err := orchestrator.CheckAll(context.Background(), orchestrator.Deps{
-		Source:    orchestrator.NewGHSource(*repo, runGH),
+		Source:    orchestrator.NewGHSource(repo, runGH),
 		Watches:   registry,
 		Writer:    orchestrator.NewSQLVerdictWriter(txWriter),
 		ConfigDir: c.root,

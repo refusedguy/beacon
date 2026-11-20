@@ -8,11 +8,16 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	"gopkg.in/yaml.v3"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -35,7 +40,152 @@ const (
 	// and fixers must be wakeable: a card id such as "<BS.42>" or an empty
 	// target is not an address, so those registrations are refused.
 	sessionIDPrefix = "ses_"
+
+	// watchConfigDirName and the two file names are the project-level inputs a
+	// registration reads when the caller omits flaky or policy limits.
+	watchConfigDirName     = ".beacon"
+	watchConfigFileName    = "config.yaml"
+	watchFlakyFileName     = "flaky.json"
+	watchConfigPathEnv     = "BEACON_CONFIG"
+	watchDefaultMaxRebases = 3
+	watchMaxMaxRebases     = 10
 )
+
+// WatchDefaults are the layered values a registration uses when the caller
+// omits them. The global config file is read first and the project file
+// overrides only the keys it sets, so a project needs no copy of shared values.
+type WatchDefaults struct {
+	MaxRebases       int
+	MaxWakesPerWatch int
+	Flaky            *WatchPRFlaky
+}
+
+// watchPRDefaultsLoader is the process seam for loading the layered config.
+// Tests replace it to keep registration independent of the developer's home
+// directory.
+var watchPRDefaultsLoader = loadWatchDefaults
+
+// loadWatchDefaults merges the built-in values, the global YAML file and the
+// project YAML file, then reads the project's flaky.json. A missing or broken
+// file leaves the earlier layer intact: registration never fails because an
+// optional config file is malformed.
+func loadWatchDefaults(projectRoot string) WatchDefaults {
+	defaults := WatchDefaults{
+		MaxRebases:       watchDefaultMaxRebases,
+		MaxWakesPerWatch: domain.DefaultMaxWakesPerWatch,
+	}
+	for _, path := range watchConfigPaths(projectRoot) {
+		if path != "" {
+			applyWatchConfigFile(&defaults, path)
+		}
+	}
+	defaults.Flaky = loadWatchFlaky(projectRoot)
+	return defaults
+}
+
+// watchConfigPaths returns the global layer followed by the project layer, so
+// applying them in order gives the project the last word.
+func watchConfigPaths(projectRoot string) []string {
+	paths := []string{globalWatchConfigPath()}
+	if root := strings.TrimSpace(projectRoot); root != "" {
+		paths = append(paths, filepath.Join(root, watchConfigDirName, watchConfigFileName))
+	}
+	return paths
+}
+
+// globalWatchConfigPath resolves the shared layer. BEACON_CONFIG names a file;
+// otherwise the file lives under ~/.config/beacon.
+func globalWatchConfigPath() string {
+	if path := strings.TrimSpace(os.Getenv(watchConfigPathEnv)); path != "" {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "beacon", watchConfigFileName)
+}
+
+// applyWatchConfigFile overlays the known limits from one YAML file. Keys are
+// normalized so maxRebases, max_rebases and MAX-REBASES all name the same
+// setting. Unknown keys are ignored: the other config consumers own them.
+func applyWatchConfigFile(defaults *WatchDefaults, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return
+	}
+	for key, raw := range doc {
+		switch normalizeWatchConfigKey(key) {
+		case "maxrebases":
+			if n, ok := watchInt(raw); ok && n > 0 && n <= watchMaxMaxRebases {
+				defaults.MaxRebases = n
+			}
+		case "maxwakesperwatch":
+			if n, ok := watchInt(raw); ok && n > 0 {
+				defaults.MaxWakesPerWatch = n
+			}
+		}
+	}
+}
+
+func normalizeWatchConfigKey(key string) string {
+	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(
+		strings.ToLower(strings.TrimSpace(key)))
+}
+
+// watchInt accepts a YAML integer or a quoted integer string. Anything else
+// keeps the previous layer's value.
+func watchInt(raw any) (int, bool) {
+	switch v := raw.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case uint64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// loadWatchFlaky reads <root>/.beacon/flaky.json. The file uses `checks` in
+// the original contract and `names` in the current input shape; both are
+// accepted. A missing file means no project flaky set.
+func loadWatchFlaky(projectRoot string) *WatchPRFlaky {
+	if strings.TrimSpace(projectRoot) == "" {
+		return nil
+	}
+	path := filepath.Join(projectRoot, watchConfigDirName, watchFlakyFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var doc struct {
+		Checks     []string `json:"checks"`
+		Names      []string `json:"names"`
+		MaxRetries int      `json:"maxRetries"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	names := doc.Names
+	if len(names) == 0 {
+		names = doc.Checks
+	}
+	if len(names) == 0 && doc.MaxRetries == 0 {
+		return nil
+	}
+	return &WatchPRFlaky{Names: names, MaxRetries: doc.MaxRetries}
+}
 
 // WatchPRInput is the argument shape of beacon_watch_pr (WORKER-PROMPT §4.1).
 // All fields except repo, pr and role are optional in the contract.
@@ -89,6 +239,10 @@ type WatchPRPolicy struct {
 	RequireUpToDate bool                `json:"requireUpToDate"`
 	IgnoreReviews   bool                `json:"ignoreReviews"`
 	Merge           *WatchPRMergePolicy `json:"merge,omitempty"`
+	// MaxRebases and MaxWakesPerWatch override the layered config when set.
+	// Zero means "use the project default".
+	MaxRebases       int `json:"maxRebases,omitempty" jsonschema:"rebase budget override; zero uses the project config"`
+	MaxWakesPerWatch int `json:"maxWakesPerWatch,omitempty" jsonschema:"wake budget override; zero uses the project config"`
 }
 
 // WatchPRMergePolicy is the input form of domain.MergePolicy. AutoMerge is a
@@ -129,6 +283,12 @@ type WatchPRHandler struct {
 	fanout   *domain.Fanout
 	bridges  []Bridge
 	blockers BlockerControl
+
+	// projectRoot and defaultsLoader carry the layered config into a Watch.
+	// The composition root sets the root; tests replace the loader to run
+	// without touching the host's config directory.
+	projectRoot    string
+	defaultsLoader func(string) WatchDefaults
 }
 
 // NewWatchPRHandler builds a handler. A nil clock falls back to the wall
@@ -136,11 +296,28 @@ type WatchPRHandler struct {
 // always supply headSHA.
 func NewWatchPRHandler(store domain.Store, ci domain.CIProvider, clock domain.Clock) *WatchPRHandler {
 	return &WatchPRHandler{
-		store:  store,
-		ci:     ci,
-		clock:  clock,
-		fanout: domain.NewFanout(store, clock),
+		store:          store,
+		ci:             ci,
+		clock:          clock,
+		fanout:         domain.NewFanout(store, clock),
+		defaultsLoader: watchPRDefaultsLoader,
 	}
+}
+
+// SetProjectRoot binds the root used to read .beacon/config.yaml and
+// .beacon/flaky.json. An empty root keeps the built-in defaults.
+func (h *WatchPRHandler) SetProjectRoot(root string) {
+	if h != nil {
+		h.projectRoot = root
+	}
+}
+
+// watchDefaults resolves the layered config through the handler's seam.
+func (h *WatchPRHandler) watchDefaults() WatchDefaults {
+	if h == nil || h.defaultsLoader == nil {
+		return loadWatchDefaults("")
+	}
+	return h.defaultsLoader(h.projectRoot)
 }
 
 // SetBlockerControl injects the durable blocker port. A nil argument keeps the
@@ -197,6 +374,10 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	if in.Role != domain.RoleExecutor && in.Role != domain.RoleOrchestrator && in.Role != domain.RoleFixer {
 		return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput, "watch_pr: role must be executor, orchestrator or fixer")
 	}
+	// A registration carries the project's own limits and flaky set when the
+	// caller says nothing. Every project gets its values without copying a
+	// shared slug or flaky list into this file.
+	defaults := h.watchDefaults()
 	// Validate the fix target before any write. A fixer that cannot name a real
 	// blocked Watch must not create or renew its own Watch.
 	blockerID, err := h.validateFixFor(in)
@@ -247,18 +428,30 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		FixBlockerID:   blockerID,
 		CreatedAt:      now,
 	}
-	if in.Flaky != nil {
+	flaky := in.Flaky
+	if flaky == nil {
+		flaky = defaults.Flaky
+	}
+	if flaky != nil {
 		w.Flaky = domain.FlakyConfig{
-			Names:      in.Flaky.Names,
-			MaxRetries: in.Flaky.MaxRetries,
+			Names:      append([]string(nil), flaky.Names...),
+			MaxRetries: flaky.MaxRetries,
 			Used:       map[string]int{},
 		}
 	}
-	if in.Policy != nil {
-		w.Policy = domain.Policy{
-			RequireUpToDate: in.Policy.RequireUpToDate,
-			IgnoreReviews:   in.Policy.IgnoreReviews,
-		}
+	maxWakes := defaults.MaxWakesPerWatch
+	if in.Policy != nil && in.Policy.MaxWakesPerWatch > 0 {
+		maxWakes = in.Policy.MaxWakesPerWatch
+	}
+	maxRebases := defaults.MaxRebases
+	if in.Policy != nil && in.Policy.MaxRebases > 0 {
+		maxRebases = in.Policy.MaxRebases
+	}
+	w.Policy = domain.Policy{
+		RequireUpToDate:  in.Policy != nil && in.Policy.RequireUpToDate,
+		IgnoreReviews:    in.Policy != nil && in.Policy.IgnoreReviews,
+		MaxWakesPerWatch: maxWakes,
+		MaxRebases:       maxRebases,
 	}
 	// Always materialise a concrete policy, so an absent policy.merge leaves a
 	// stored Watch with auto-merge on and empty conditions.
@@ -561,4 +754,19 @@ func AttachWatchPR(server *mcpsdk.Server, handler *WatchPRHandler) {
 			IdempotentHint:  true,
 		},
 	}, handler.Handle)
+}
+
+// AttachWatchPRWithConfig installs the real watch_pr handler bound to the
+// project's layered config. The composition root calls it after
+// NewServerWithDeps so a registration uses this project's flaky set and limits
+// instead of the built-in values. Re-registering the tool is safe: the
+// NewServerWithDeps instance has no bridges or extra wiring to preserve.
+func AttachWatchPRWithConfig(server *mcpsdk.Server, deps Dependencies, projectRoot string) {
+	if server == nil {
+		return
+	}
+	handler := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
+	handler.SetBlockerControl(deps.Blockers)
+	handler.SetProjectRoot(projectRoot)
+	AttachWatchPR(server, handler)
 }
