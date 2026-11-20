@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -140,6 +141,75 @@ func TestRebindOrchestratorDryRunWritesNothing(t *testing.T) {
 		if sub.Role == domain.RoleOrchestrator && sub.ID != "ses_old" {
 			t.Errorf("dry run changed the subscriber to %+v", sub)
 		}
+	}
+}
+
+func TestRebindOrchestratorIncludesBlockedWatches(t *testing.T) {
+	d := openRebindTestDB(t)
+	blocked := rebindFixtureWatch("blocked", "ses_old", domain.StatusBlocked, true)
+	if err := d.SaveWatch(blocked); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	targets, err := d.RebindOrchestrator("ses_old", "ses_new", false)
+	if err != nil {
+		t.Fatalf("RebindOrchestrator: %v", err)
+	}
+	if len(targets) != 1 || targets[0].WatchID != "blocked" {
+		t.Fatalf("targets = %+v, want the blocked watch", targets)
+	}
+	w, err := d.Watch("blocked")
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if w.OrchestratorID != "ses_new" {
+		t.Errorf("OrchestratorID = %q, want ses_new", w.OrchestratorID)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.Role == domain.RoleOrchestrator && sub.ID != "ses_new" {
+			t.Errorf("orchestrator subscriber = %+v, want ses_new", sub)
+		}
+	}
+}
+
+func TestBindOrchestratorAndRebind(t *testing.T) {
+	d := openRebindTestDB(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := d.BindOrchestrator("project", "ses_old", "opencode", now); err != nil {
+		t.Fatalf("BindOrchestrator: %v", err)
+	}
+	w := rebindFixtureWatch("w1", "ses_old", domain.StatusBlocked, true)
+	if err := d.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	targets, err := d.BindOrchestratorAndRebind("project", "ses_new")
+	if err != nil {
+		t.Fatalf("BindOrchestratorAndRebind: %v", err)
+	}
+	if len(targets) != 1 || targets[0].WatchID != "w1" {
+		t.Fatalf("targets = %+v, want w1", targets)
+	}
+	binding, bound, err := d.BoundOrchestrator("project")
+	if err != nil || !bound {
+		t.Fatalf("BoundOrchestrator: %v, %v", bound, err)
+	}
+	if binding.SessionID != "ses_new" || binding.Adapter != "opencode" {
+		t.Errorf("binding = %+v, want ses_new/opencode", binding)
+	}
+	stored, err := d.Watch("w1")
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if stored.OrchestratorID != "ses_new" {
+		t.Errorf("OrchestratorID = %q, want ses_new", stored.OrchestratorID)
+	}
+
+	if _, err := d.BindOrchestratorAndRebind("project", "ses_new"); err != nil {
+		t.Errorf("same-session rebind: %v", err)
+	}
+	if _, err := d.BindOrchestratorAndRebind("unknown", "ses_new"); err == nil {
+		t.Error("unbound project rebind accepted")
 	}
 }
 
