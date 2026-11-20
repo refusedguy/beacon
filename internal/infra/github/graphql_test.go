@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -305,6 +306,28 @@ func TestGraphQLPrimaryLimitBecomesRateLimited(t *testing.T) {
 	}
 	if appErr.Code != domain.CodeRateLimited {
 		t.Fatalf("Code = %s, want %s", appErr.Code, domain.CodeRateLimited)
+	}
+}
+
+// Real GitHub replies carry x-ratelimit-reset on every response. With quota
+// left, the client must accept the answer instead of surfacing RATE_LIMITED on
+// every cycle. This guards that production regression.
+func TestGraphQLWindowResetIsNotRateLimited(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	reset := strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)
+	srv := newGraphQLServer(t, func(w http.ResponseWriter, r *http.Request, query string) {
+		w.Header().Set("x-ratelimit-reset", reset)
+		w.Header().Set("x-ratelimit-remaining", "4999")
+		healthyReply(w, r, query)
+	})
+
+	client := NewClient(srv.URL, "", srv.Client(), counter)
+	data, err := client.Do(context.Background(), Tier1, AliasesFromWatches(watches(2)))
+	if err != nil {
+		t.Fatalf("Do failed on a healthy response with a window reset: %v", err)
+	}
+	if data == nil {
+		t.Fatal("Do returned nil data")
 	}
 }
 
