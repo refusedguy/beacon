@@ -1,13 +1,17 @@
 package observe
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // counterLabels maps a counter to the label key it is broken down by. An empty
@@ -37,6 +41,47 @@ const (
 )
 
 var extendedCounterNames = []string{CounterFixersSpawned, CounterBlocksEscalated}
+
+// Gauges are point-in-time values, not monotonic totals. A scrape sees them as
+// beacon_active_watches and beacon_outbox_depth. They carry no labels, so
+// cardinality stays fixed no matter how many Watches or sessions exist.
+const (
+	GaugeActiveWatches = "active_watches"
+	GaugeOutboxDepth   = "outbox_depth"
+)
+
+// GaugeNames returns the known gauge names in stable order.
+func GaugeNames() []string {
+	return []string{GaugeActiveWatches, GaugeOutboxDepth}
+}
+
+var knownGauges = map[string]bool{GaugeActiveWatches: true, GaugeOutboxDepth: true}
+
+// gaugeSink is implemented by *Recorder. Gauge writes go through the installed
+// sink, the same seam counters use, so call sites never reach into a Metrics.
+type gaugeSink interface {
+	setGauge(name string, value uint64)
+}
+
+func (r *Recorder) setGauge(name string, value uint64) {
+	if r != nil && r.metrics != nil {
+		r.metrics.SetGauge(name, value)
+	}
+}
+
+// SetGauge publishes an absolute value through the installed sink. Before the
+// composition root installs a Recorder this is a no-op.
+func SetGauge(name string, value uint64) {
+	if s, ok := Default().(gaugeSink); ok {
+		s.setGauge(name, value)
+	}
+}
+
+// ActiveWatches publishes the number of live Watches.
+func ActiveWatches(n uint64) { SetGauge(GaugeActiveWatches, n) }
+
+// OutboxDepth publishes the number of entries waiting in the outbox.
+func OutboxDepth(n uint64) { SetGauge(GaugeOutboxDepth, n) }
 
 // FixerSpawned records a fixer agent spawned to clear a blocked Watch.
 func FixerSpawned(watchID string) {
@@ -115,6 +160,7 @@ type Metrics struct {
 	values     map[string]uint64
 	labelled   map[string]map[string]uint64
 	histograms map[string]*Histogram
+	gauges     map[string]uint64
 }
 
 // NewMetrics builds an empty metric set with all known names present at zero.
@@ -123,6 +169,7 @@ func NewMetrics() *Metrics {
 		values:     make(map[string]uint64),
 		labelled:   make(map[string]map[string]uint64),
 		histograms: make(map[string]*Histogram),
+		gauges:     make(map[string]uint64),
 	}
 	for name, label := range counterLabels {
 		m.values[name] = 0
@@ -132,6 +179,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, name := range extendedCounterNames {
 		m.values[name] = 0
+	}
+	for _, name := range GaugeNames() {
+		m.gauges[name] = 0
 	}
 	for _, name := range HistogramNames() {
 		m.histograms[name] = newHistogram()
@@ -160,6 +210,30 @@ func (m *Metrics) Inc(name, labelValue string) {
 	}
 }
 
+// SetGauge writes an absolute value for a known gauge. Unknown names are
+// ignored, so a caller cannot grow the exported series without limit.
+func (m *Metrics) SetGauge(name string, value uint64) {
+	if m == nil || !knownGauges[name] {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.gauges == nil {
+		m.gauges = make(map[string]uint64)
+	}
+	m.gauges[name] = value
+}
+
+// Gauge returns the current value of a known gauge.
+func (m *Metrics) Gauge(name string) uint64 {
+	if m == nil || !knownGauges[name] {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.gauges[name]
+}
+
 // Observe records one duration in seconds in the named histogram.
 func (m *Metrics) Observe(name string, seconds float64) {
 	if m == nil || seconds < 0 {
@@ -186,6 +260,9 @@ func (m *Metrics) Reset() {
 	}
 	for name := range m.labelled {
 		m.labelled[name] = make(map[string]uint64)
+	}
+	for name := range m.gauges {
+		m.gauges[name] = 0
 	}
 	histograms := make([]*Histogram, 0, len(m.histograms))
 	for _, h := range m.histograms {
@@ -240,6 +317,9 @@ func (m *Metrics) JSON() []byte {
 		for _, name := range extendedCounterNames {
 			out[name] = m.values[name]
 		}
+		for _, name := range GaugeNames() {
+			out[name] = m.gauges[name]
+		}
 		names := make([]string, 0, len(m.histograms))
 		for name := range m.histograms {
 			names = append(names, name)
@@ -290,7 +370,7 @@ func MetricsFromSnapshotJSON(raw []byte) *Metrics {
 	}
 
 	for name, value := range decoded {
-		if name == "histograms" {
+		if name == "histograms" || knownGauges[name] {
 			continue
 		}
 		var scalar uint64
@@ -301,6 +381,16 @@ func MetricsFromSnapshotJSON(raw []byte) *Metrics {
 		var byLabel map[string]uint64
 		if err := json.Unmarshal(value, &byLabel); err == nil {
 			m.labelled[name] = byLabel
+		}
+	}
+	for _, name := range GaugeNames() {
+		raw, ok := decoded[name]
+		if !ok {
+			continue
+		}
+		var value uint64
+		if err := json.Unmarshal(raw, &value); err == nil {
+			m.gauges[name] = value
 		}
 	}
 
@@ -364,6 +454,11 @@ func (m *Metrics) Prometheus() []byte {
 		fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", name)
 		fmt.Fprintf(&buf, "beacon_%s %d\n", name, m.values[name])
 	}
+	for _, name := range GaugeNames() {
+		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon gauge %s.\n", name, name)
+		fmt.Fprintf(&buf, "# TYPE beacon_%s gauge\n", name)
+		fmt.Fprintf(&buf, "beacon_%s %d\n", name, m.gauges[name])
+	}
 	names := make([]string, 0, len(m.histograms))
 	for name := range m.histograms {
 		names = append(names, name)
@@ -385,13 +480,102 @@ func (m *Metrics) Prometheus() []byte {
 	return []byte(buf.String())
 }
 
-// Handler serves the Prometheus text format over HTTP. It is optional: the
-// CLI exports the same text with `beacon metrics --format prometheus`.
+// Handler serves the Prometheus text format over HTTP. The CLI exports the
+// same text with `beacon metrics --format prometheus`. A MetricsServer mounts
+// this handler on /metrics.
 func (m *Metrics) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = w.Write(m.Prometheus())
 	})
+}
+
+// MetricsPortEnv overrides the port of the metrics server. The host is always
+// loopback, so a bad setting cannot expose metrics publicly. An empty value
+// leaves the endpoint off; "0" lets the OS pick a free port.
+const MetricsPortEnv = "BEACON_METRICS_PORT"
+
+// MetricsServer owns a loopback HTTP listener that serves /metrics from a
+// metric set. Call Close to stop it. A zero value is inert and is used when
+// the caller disables the exporter by passing an empty port.
+type MetricsServer struct {
+	addr      string
+	server    *http.Server
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// StartMetricsServer opens a loopback listener on port and serves /metrics
+// from m. An empty port disables the exporter and returns an inert server.
+// Passing "0" reserves a free port, and Addr reports the one the OS chose.
+// Only the port is injected: the address always binds 127.0.0.1.
+func StartMetricsServer(port string, m *Metrics) (*MetricsServer, error) {
+	port = strings.TrimSpace(port)
+	s := &MetricsServer{}
+	if port == "" {
+		return s, nil
+	}
+	if _, err := strconv.Atoi(port); err != nil {
+		return nil, fmt.Errorf("observe: bad metrics port %q: %w", port, err)
+	}
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
+	if err != nil {
+		return nil, fmt.Errorf("observe: listen metrics port %s: %w", port, err)
+	}
+	s.addr = listener.Addr().String()
+	if m == nil {
+		m = NewMetrics()
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", m.Handler())
+	s.server = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		if err := s.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			ActorError("metrics-serve", "", err)
+		}
+	}()
+	return s, nil
+}
+
+// Addr reports the loopback address of the listener, or an empty string when
+// the server is disabled.
+func (s *MetricsServer) Addr() string {
+	if s == nil {
+		return ""
+	}
+	return s.addr
+}
+
+// Port reports the bound port, or zero when the server is disabled.
+func (s *MetricsServer) Port() int {
+	if s == nil {
+		return 0
+	}
+	_, port, err := net.SplitHostPort(s.addr)
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(port)
+	return n
+}
+
+// Close stops the listener. It is safe to call more than once.
+func (s *MetricsServer) Close() error {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		if err := s.server.Shutdown(ctx); err != nil {
+			s.closeErr = err
+			_ = s.server.Close()
+		}
+	})
+	return s.closeErr
 }
 
 func escapeLabel(s string) string {
