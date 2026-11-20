@@ -18,9 +18,9 @@ const (
 	ReplyTool = "channel_reply"
 )
 
-// Message is the channel message that opened a model turn. Target is the user
-// or group identifier and becomes the reply target_param.
-type Message struct {
+// TurnMessage is the channel message that opened a model turn. Target is the
+// user or group identifier and becomes the reply target_param.
+type TurnMessage struct {
 	Kind   TargetKind
 	Target string
 }
@@ -55,7 +55,7 @@ func DefaultConfig() Config {
 
 // Turn is the observable state after a model turn for one channel message.
 type Turn struct {
-	Message     Message
+	Message     TurnMessage
 	ToolsCalled []string
 }
 

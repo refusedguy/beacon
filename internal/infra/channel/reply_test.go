@@ -6,7 +6,7 @@ import "testing"
 // user, with the user target parameter set.
 func TestPlanRoutesToUser(t *testing.T) {
 	out := Plan(DefaultConfig(), Turn{
-		Message: Message{Kind: TargetUser, Target: "U-42"},
+		Message: TurnMessage{Kind: TargetUser, Target: "U-42"},
 	})
 	if !out.Send {
 		t.Fatalf("direct message must produce a reply, got %+v", out)
@@ -26,7 +26,7 @@ func TestPlanRoutesToUser(t *testing.T) {
 // group, with the group target parameter set.
 func TestPlanRoutesToGroup(t *testing.T) {
 	out := Plan(DefaultConfig(), Turn{
-		Message: Message{Kind: TargetGroup, Target: "G-7"},
+		Message: TurnMessage{Kind: TargetGroup, Target: "G-7"},
 	})
 	if !out.Send {
 		t.Fatalf("group message must produce a reply, got %+v", out)
@@ -46,7 +46,7 @@ func TestPlanRoutesToGroup(t *testing.T) {
 // dropped once the model called the reply tool during its turn.
 func TestPlanSuppressesWhenModelAlreadyReplied(t *testing.T) {
 	out := Plan(DefaultConfig(), Turn{
-		Message:     Message{Kind: TargetGroup, Target: "G-7"},
+		Message:     TurnMessage{Kind: TargetGroup, Target: "G-7"},
 		ToolsCalled: []string{"search", ReplyTool, "search"},
 	})
 	if out.Send {
@@ -62,7 +62,7 @@ func TestPlanSuppressesWhenModelAlreadyReplied(t *testing.T) {
 func TestPlanUsesTargetParam(t *testing.T) {
 	const target = "user:ops@example.test"
 	out := Plan(Config{SuppressTools: []string{ReplyTool}}, Turn{
-		Message:     Message{Kind: TargetUser, Target: target},
+		Message:     TurnMessage{Kind: TargetUser, Target: target},
 		ToolsCalled: []string{"search"},
 	})
 	if !out.Send {
@@ -94,10 +94,10 @@ func TestPlanEmptyState(t *testing.T) {
 func TestPlanRejectsInvalidTarget(t *testing.T) {
 	cases := []struct {
 		name    string
-		message Message
+		message TurnMessage
 	}{
-		{"empty target", Message{Kind: TargetUser}},
-		{"unknown kind", Message{Kind: TargetKind("email"), Target: "a@b.test"}},
+		{"empty target", TurnMessage{Kind: TargetUser}},
+		{"unknown kind", TurnMessage{Kind: TargetKind("email"), Target: "a@b.test"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,7 +116,7 @@ func TestPlanRejectsInvalidTarget(t *testing.T) {
 // membership, not on the order of tool calls.
 func TestPlanSuppressionIsOrderIndependent(t *testing.T) {
 	turn := Turn{
-		Message:     Message{Kind: TargetUser, Target: "U-1"},
+		Message:     TurnMessage{Kind: TargetUser, Target: "U-1"},
 		ToolsCalled: []string{ReplyTool, "search"},
 	}
 	first := Plan(DefaultConfig(), turn)
