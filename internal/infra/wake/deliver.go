@@ -723,7 +723,10 @@ func (a *T202API) Prompt(ctx context.Context, sessionID, text string, mode T202D
 	if !strings.HasPrefix(sessionID, "ses_") {
 		return "", fmt.Errorf("wake: invalid session id %q", sessionID)
 	}
-	body := map[string]any{"text": text, "delivery": string(mode)}
+	// A subscriber may already have finished its turn (outcome succeeded) when
+	// the verdict arrives. The prompt route accepts resume to continue such a
+	// session, so a wake prompt sets it explicitly (OpenAPI prompt.resume).
+	body := map[string]any{"text": text, "delivery": string(mode), "resume": true}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return "", err
