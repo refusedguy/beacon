@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -14,34 +15,85 @@ import (
 var counterLabels = map[string]string{
 	CounterPollCycles:       "",
 	CounterVerdictPublished: LabelVerdict,
-	CounterMergeAttempt:     "",
+	CounterMergeAttempts:    "",
 	CounterMergeSuccess:     "",
+	CounterMergeFailures:    "",
 	CounterWakeDelivered:    LabelAdapter,
-	CounterWakeFailed:       "",
-	CounterRebaseRequested:  "",
+	CounterWakeErrors:       LabelAdapter,
+	CounterWakeSkipped:      "",
+	CounterRebaseRequests:   "",
+	CounterDependencyWaits:  "",
+	CounterBlocks:           "",
+	CounterActorErrors:      "",
 }
 
-// Metrics is a set of in-memory counters. Every method is safe for concurrent
-// use. Counters are per process: a daemon keeps its own totals for its own
-// lifetime, and a short-lived command sees the counters it touched.
+// histogramBounds are the upper bounds of the duration histograms, in seconds.
+// They cover a sub-millisecond provider call up to a five-minute daemon pass.
+var histogramBounds = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30, 300}
+
+// Histogram is a cumulative duration histogram. Every method is safe for
+// concurrent use.
+type Histogram struct {
+	mu      sync.Mutex
+	count   uint64
+	sum     float64
+	buckets []uint64
+}
+
+func newHistogram() *Histogram {
+	return &Histogram{buckets: make([]uint64, len(histogramBounds))}
+}
+
+func (h *Histogram) observe(seconds float64) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.count++
+	h.sum += seconds
+	for i, upper := range histogramBounds {
+		if seconds <= upper {
+			h.buckets[i]++
+		}
+	}
+}
+
+func (h *Histogram) snapshot() (uint64, float64, []uint64) {
+	if h == nil {
+		return 0, 0, nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	buckets := append([]uint64(nil), h.buckets...)
+	return h.count, h.sum, buckets
+}
+
+// Metrics is a set of in-memory counters and histograms. Every method is safe
+// for concurrent use. Values are per process: a daemon keeps its own totals
+// for its own lifetime, and a short-lived command sees what it touched.
 type Metrics struct {
-	mu       sync.Mutex
-	values   map[string]uint64
-	labelled map[string]map[string]uint64
+	mu         sync.Mutex
+	values     map[string]uint64
+	labelled   map[string]map[string]uint64
+	histograms map[string]*Histogram
 }
 
-// NewMetrics builds an empty counter set with all known counters present at
-// zero.
+// NewMetrics builds an empty metric set with all known names present at zero.
 func NewMetrics() *Metrics {
 	m := &Metrics{
-		values:   make(map[string]uint64),
-		labelled: make(map[string]map[string]uint64),
+		values:     make(map[string]uint64),
+		labelled:   make(map[string]map[string]uint64),
+		histograms: make(map[string]*Histogram),
 	}
 	for name, label := range counterLabels {
 		m.values[name] = 0
 		if label != "" {
 			m.labelled[name] = make(map[string]uint64)
 		}
+	}
+	for _, name := range HistogramNames() {
+		m.histograms[name] = newHistogram()
 	}
 	return m
 }
@@ -67,18 +119,46 @@ func (m *Metrics) Inc(name, labelValue string) {
 	}
 }
 
-// Reset returns the counter set to zero. Tests use it between cases.
+// Observe records one duration in seconds in the named histogram.
+func (m *Metrics) Observe(name string, seconds float64) {
+	if m == nil || seconds < 0 {
+		return
+	}
+	m.mu.Lock()
+	h, ok := m.histograms[name]
+	if !ok {
+		h = newHistogram()
+		m.histograms[name] = h
+	}
+	m.mu.Unlock()
+	h.observe(seconds)
+}
+
+// Reset returns the metric set to zero. Tests use it between cases.
 func (m *Metrics) Reset() {
 	if m == nil {
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for name := range m.values {
 		m.values[name] = 0
 	}
 	for name := range m.labelled {
 		m.labelled[name] = make(map[string]uint64)
+	}
+	histograms := make([]*Histogram, 0, len(m.histograms))
+	for _, h := range m.histograms {
+		histograms = append(histograms, h)
+	}
+	m.mu.Unlock()
+	for _, h := range histograms {
+		h.mu.Lock()
+		h.count = 0
+		h.sum = 0
+		for i := range h.buckets {
+			h.buckets[i] = 0
+		}
+		h.mu.Unlock()
 	}
 }
 
@@ -92,27 +172,49 @@ func CounterNames() []string {
 	return names
 }
 
-// JSON renders every counter as a JSON object. An unlabeled counter is a
-// number; a labelled counter is an object from label value to count.
+// HistogramNames returns the known histogram names in stable order.
+func HistogramNames() []string {
+	return []string{HistogramMerge, HistogramPollCycle, HistogramRun, HistogramWake}
+}
+
+// JSON renders every metric as a JSON object. An unlabeled counter is a
+// number, a labelled counter is an object from label value to count, and a
+// histogram is an object with count, sum and cumulative buckets.
 func (m *Metrics) JSON() []byte {
 	out := make(map[string]any)
-	if m == nil {
-		raw, _ := json.MarshalIndent(out, "", "  ")
-		return append(raw, '\n')
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, name := range CounterNames() {
-		if counterLabels[name] == "" {
-			out[name] = m.values[name]
-			continue
+	histograms := make(map[string]any)
+	if m != nil {
+		m.mu.Lock()
+		for _, name := range CounterNames() {
+			if counterLabels[name] == "" {
+				out[name] = m.values[name]
+				continue
+			}
+			byValue := make(map[string]uint64)
+			for k, v := range m.labelled[name] {
+				byValue[k] = v
+			}
+			out[name] = byValue
 		}
-		byValue := make(map[string]uint64)
-		for k, v := range m.labelled[name] {
-			byValue[k] = v
+		names := make([]string, 0, len(m.histograms))
+		for name := range m.histograms {
+			names = append(names, name)
 		}
-		out[name] = byValue
+		sort.Strings(names)
+		for _, name := range names {
+			count, sum, buckets := m.histograms[name].snapshot()
+			byBound := make(map[string]uint64, len(buckets)+1)
+			for i, upper := range histogramBounds {
+				byBound[strconv.FormatFloat(upper, 'f', -1, 64)] = buckets[i]
+			}
+			byBound["+Inf"] = count
+			histograms[name] = map[string]any{
+				"count": count, "sum": sum, "buckets": byBound,
+			}
+		}
+		m.mu.Unlock()
 	}
+	out["histograms"] = histograms
 	raw, err := json.MarshalIndent(out, "", "  ")
 	if err != nil {
 		return []byte("{}\n")
@@ -120,16 +222,14 @@ func (m *Metrics) JSON() []byte {
 	return append(raw, '\n')
 }
 
-// Prometheus renders the counters in the Prometheus text exposition format.
-// Counter names carry the beacon_ prefix so they cannot collide with process
-// metrics.
+// Prometheus renders the metrics in the Prometheus text exposition format.
+// Names carry the beacon_ prefix so they cannot collide with process metrics.
 func (m *Metrics) Prometheus() []byte {
 	var buf strings.Builder
 	if m == nil {
 		return []byte{}
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, name := range CounterNames() {
 		label := counterLabels[name]
 		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)
@@ -148,6 +248,24 @@ func (m *Metrics) Prometheus() []byte {
 			fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, label, escapeLabel(k), values[k])
 		}
 	}
+	names := make([]string, 0, len(m.histograms))
+	for name := range m.histograms {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		count, sum, buckets := m.histograms[name].snapshot()
+		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon duration histogram %s.\n", name, name)
+		fmt.Fprintf(&buf, "# TYPE beacon_%s histogram\n", name)
+		for i, upper := range histogramBounds {
+			le := strconv.FormatFloat(upper, 'f', -1, 64)
+			fmt.Fprintf(&buf, "beacon_%s_bucket{le=\"%s\"} %d\n", name, le, buckets[i])
+		}
+		fmt.Fprintf(&buf, "beacon_%s_bucket{le=\"+Inf\"} %d\n", name, count)
+		fmt.Fprintf(&buf, "beacon_%s_sum %g\n", name, sum)
+		fmt.Fprintf(&buf, "beacon_%s_count %d\n", name, count)
+	}
+	m.mu.Unlock()
 	return []byte(buf.String())
 }
 

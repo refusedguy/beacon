@@ -1,8 +1,8 @@
-// Package observe provides the small amount of logging and counting the Beacon
-// cycle needs right now. Logging goes through the standard library log/slog,
-// with no heavy dependency. The package imports no domain or adapter package,
-// so a call site in any layer can use it without an import cycle. The heavy
-// OpenTelemetry path stays in research.
+// Package observe is the single logging and counting seam of Beacon. It has no
+// dependency on domain or adapter packages, so any layer can report a fact
+// without an import cycle. Every record is a structured slog event with an
+// event field; counters and histograms are process-local and exported by
+// `beacon metrics`.
 package observe
 
 import (
@@ -51,30 +51,56 @@ const (
 	FieldAdapter  = "adapter"
 	FieldDuration = "duration"
 	FieldError    = "error"
+	FieldRevision = "revision"
+	FieldActor    = "actor"
+	FieldReason   = "reason"
+	FieldStatus   = "status"
+	FieldCommand  = "command"
+	FieldWatches  = "watches"
+	FieldReady    = "ready"
+	FieldRetry    = "retry"
+	FieldMerges   = "merges"
+	FieldWakes    = "wakes"
+	FieldRefs     = "refs"
+	FieldCount    = "count"
+	FieldUpdated  = "updated"
+	FieldSkipped  = "skipped"
 )
 
 // Fields are the structured values of one event.
 type Fields map[string]any
 
-// Sink is the thin port the Beacon cycle calls. Log writes one structured
-// record through slog, Inc adds one to a named counter with an optional label
-// value. The global default is a no-op until the composition root installs a
-// Recorder, so a call site never needs a nil check and existing tests keep
-// working.
-type Sink interface {
-	Log(level Level, event string, fields Fields)
-	Inc(name, labelValue string)
-}
-
-// Counter names exported by Metrics.
+// Counter names exported by Metrics. The _total suffix is the Prometheus
+// convention for counters and is part of the exported name.
 const (
-	CounterPollCycles       = "poll_cycles"
-	CounterVerdictPublished = "verdict_published"
-	CounterMergeAttempt     = "merge_attempt"
-	CounterMergeSuccess     = "merge_success"
-	CounterWakeDelivered    = "wake_delivered"
-	CounterWakeFailed       = "wake_failed"
-	CounterRebaseRequested  = "rebase_requested"
+	CounterPollCycles       = "poll_cycles_total"
+	CounterVerdictPublished = "verdict_published_total"
+	CounterMergeAttempts    = "merge_attempts_total"
+	CounterMergeSuccess     = "merge_success_total"
+	CounterMergeFailures    = "merge_failures_total"
+	CounterWakeDelivered    = "wake_delivered_total"
+	CounterWakeErrors       = "wake_errors_total"
+	CounterWakeSkipped      = "wake_skipped_total"
+	CounterRebaseRequests   = "rebase_requests_total"
+	CounterDependencyWaits  = "dependency_waits_total"
+	CounterBlocks           = "blocks_total"
+	CounterActorErrors      = "actor_errors_total"
+)
+
+// Older names kept as aliases so call sites written against the first version
+// of the package continue to count the same thing.
+const (
+	CounterMergeAttempt    = CounterMergeAttempts
+	CounterWakeFailed      = CounterWakeErrors
+	CounterRebaseRequested = CounterRebaseRequests
+)
+
+// Histogram names for the durations an operator cares about.
+const (
+	HistogramPollCycle = "poll_cycle_duration_seconds"
+	HistogramMerge     = "merge_duration_seconds"
+	HistogramWake      = "wake_duration_seconds"
+	HistogramRun       = "run_duration_seconds"
 )
 
 // Label keys of the labelled counters.
@@ -82,6 +108,20 @@ const (
 	LabelVerdict = "verdict"
 	LabelAdapter = "adapter"
 )
+
+// Sink is the thin port the Beacon cycle calls. Log writes one structured
+// record through slog, Inc adds one to a named counter. The global default is
+// a no-op until the composition root installs a Recorder, so a call site never
+// needs a nil check and existing tests keep working.
+type Sink interface {
+	Log(level Level, event string, fields Fields)
+	Inc(name, labelValue string)
+}
+
+// histogramSink is optional: a Recorder implements it, a no-op sink does not.
+type histogramSink interface {
+	observeHistogram(name string, seconds float64)
+}
 
 var (
 	defaultMu   sync.RWMutex
@@ -109,8 +149,9 @@ func SetDefault(s Sink) {
 // nopSink drops every record and count.
 type nopSink struct{}
 
-func (nopSink) Log(Level, string, Fields) {}
-func (nopSink) Inc(string, string)       {}
+func (nopSink) Log(Level, string, Fields)   {}
+func (nopSink) Inc(string, string)          {}
+func (nopSink) observeHistogram(string, float64) {}
 
 // Recorder combines a slog logger and a metric set into one Sink. A nil field
 // is safe: the recorder simply skips that half.
@@ -157,6 +198,13 @@ func (r *Recorder) Inc(name, labelValue string) {
 	r.metrics.Inc(name, labelValue)
 }
 
+func (r *Recorder) observeHistogram(name string, seconds float64) {
+	if r == nil || r.metrics == nil {
+		return
+	}
+	r.metrics.Observe(name, seconds)
+}
+
 // eventAttrs flattens a field set into slog attributes in sorted key order.
 // Sorting makes text output stable enough to read and to assert in tests.
 func eventAttrs(event string, fields Fields) []any {
@@ -182,13 +230,69 @@ func MetricsOf(s Sink) *Metrics {
 	return nil
 }
 
-// PollCycle records one CI poll.
+// Event writes one structured record through the installed sink. Call sites
+// use it for transitions that have no dedicated helper.
+func Event(level Level, event string, fields Fields) {
+	Default().Log(level, event, fields)
+}
+
+// LogEvent is the older spelling of Event, kept for existing call sites.
+func LogEvent(event string, level Level, fields Fields) { Event(level, event, fields) }
+
+// Count adds one to a named counter through the installed sink.
+func Count(name, labelValue string) { Default().Inc(name, labelValue) }
+
+// Observe records one duration in seconds in a histogram.
+func Observe(name string, seconds float64) {
+	if s, ok := Default().(histogramSink); ok {
+		s.observeHistogram(name, seconds)
+	}
+}
+
+// PollCycle records the start of one CI poll and its number of Watches.
 func PollCycle() { Default().Inc(CounterPollCycles, "") }
+
+// PollCycleStart logs the beginning of a poll. The counter is incremented by
+// PollCycle so that a caller which only counts still gets a correct total.
+func PollCycleStart(watches int) {
+	Default().Inc(CounterPollCycles, "")
+	Event(LevelDebug, "poll_cycle_start", Fields{FieldWatches: watches})
+}
+
+// PollCycleEnd logs the end of a poll: how many Watches were updated or
+// skipped, and how long the cycle took.
+func PollCycleEnd(updated, skipped int, d time.Duration) {
+	Event(LevelDebug, "poll_cycle_end", Fields{
+		FieldUpdated: updated, FieldSkipped: skipped, FieldDuration: d.String(),
+	})
+	Observe(HistogramPollCycle, d.Seconds())
+}
 
 // PollCycleDuration logs how long one CI poll took. It does not change the
 // counter; PollCycle already did that.
 func PollCycleDuration(d time.Duration) {
-	Default().Log(LevelDebug, "poll_cycle", Fields{FieldDuration: d.String()})
+	Event(LevelDebug, "poll_cycle", Fields{FieldDuration: d.String()})
+	Observe(HistogramPollCycle, d.Seconds())
+}
+
+// CycleStats is the compact summary of one daemon pass.
+type CycleStats struct {
+	Watches, Ready, Retry, Merges, Wakes int
+	Duration                             time.Duration
+}
+
+// Cycle logs one INFO line per daemon cycle. The fields are the numbers an
+// operator needs to answer "did the loop do anything?" without reading every
+// event of the pass.
+func Cycle(s CycleStats) {
+	Event(LevelInfo, "cycle", Fields{
+		FieldWatches:  s.Watches,
+		FieldReady:    s.Ready,
+		FieldRetry:    s.Retry,
+		FieldMerges:   s.Merges,
+		FieldWakes:    s.Wakes,
+		FieldDuration: s.Duration.String(),
+	})
 }
 
 // VerdictPublished records a verdict the bridge published to the store.
@@ -196,16 +300,14 @@ func VerdictPublished(verdict, watchID string, pr int) {
 	s := Default()
 	s.Inc(CounterVerdictPublished, verdict)
 	s.Log(LevelInfo, "verdict_published", Fields{
-		FieldVerdict: verdict,
-		FieldWatchID: watchID,
-		FieldPR:      pr,
+		FieldVerdict: verdict, FieldWatchID: watchID, FieldPR: pr,
 	})
 }
 
 // MergeAttempt records an attempted automatic merge.
 func MergeAttempt(watchID string, pr int) {
 	s := Default()
-	s.Inc(CounterMergeAttempt, "")
+	s.Inc(CounterMergeAttempts, "")
 	s.Log(LevelInfo, "merge_attempt", Fields{FieldWatchID: watchID, FieldPR: pr})
 }
 
@@ -216,6 +318,23 @@ func MergeSuccess(watchID string, pr int) {
 	s.Log(LevelInfo, "merge_success", Fields{FieldWatchID: watchID, FieldPR: pr})
 }
 
+// MergeFailure records a merge the hosting service refused.
+func MergeFailure(watchID string, pr int, err error) {
+	s := Default()
+	s.Inc(CounterMergeFailures, "")
+	fields := Fields{FieldWatchID: watchID, FieldPR: pr}
+	if err != nil {
+		fields[FieldError] = err.Error()
+	}
+	s.Log(LevelWarn, "merge_fail", fields)
+}
+
+// MergeDuration records how long one merge took.
+func MergeDuration(d time.Duration) {
+	Observe(HistogramMerge, d.Seconds())
+	Event(LevelDebug, "merge_duration", Fields{FieldDuration: d.String()})
+}
+
 // WakeDelivered records one wake the host admitted.
 func WakeDelivered(adapter, watchID string) {
 	s := Default()
@@ -223,10 +342,29 @@ func WakeDelivered(adapter, watchID string) {
 	s.Log(LevelInfo, "wake_delivered", Fields{FieldAdapter: adapter, FieldWatchID: watchID})
 }
 
+// WakeDuration records how long one wake delivery took.
+func WakeDuration(adapter string, d time.Duration) {
+	Observe(HistogramWake, d.Seconds())
+	Event(LevelDebug, "wake_duration", Fields{FieldAdapter: adapter, FieldDuration: d.String()})
+}
+
+// WakeSkipped records a wake that was deliberately not delivered, with the
+// reason for the skip. It is a first-class event because "wake не дошёл" is the
+// question an operator asks most often.
+func WakeSkipped(adapter, watchID, reason string) {
+	s := Default()
+	s.Inc(CounterWakeSkipped, "")
+	fields := Fields{FieldWatchID: watchID, FieldReason: reason}
+	if adapter != "" {
+		fields[FieldAdapter] = adapter
+	}
+	s.Log(LevelInfo, "wake_skipped", fields)
+}
+
 // WakeFailed records one wake the host refused or that failed in transport.
 func WakeFailed(adapter, watchID string, err error) {
 	s := Default()
-	s.Inc(CounterWakeFailed, "")
+	s.Inc(CounterWakeErrors, adapter)
 	fields := Fields{FieldWatchID: watchID}
 	if adapter != "" {
 		fields[FieldAdapter] = adapter
@@ -234,20 +372,115 @@ func WakeFailed(adapter, watchID string, err error) {
 	if err != nil {
 		fields[FieldError] = err.Error()
 	}
-	s.Log(LevelWarn, "wake_failed", fields)
+	s.Log(LevelWarn, "wake_error", fields)
 }
 
 // RebaseRequested records a pointer asking a subscriber to rebase itself.
 func RebaseRequested(watchID string, pr int) {
 	s := Default()
-	s.Inc(CounterRebaseRequested, "")
+	s.Inc(CounterRebaseRequests, "")
 	s.Log(LevelInfo, "rebase_requested", Fields{FieldWatchID: watchID, FieldPR: pr})
 }
 
-// DaemonPass records one pass of the daemon loop.
-func DaemonPass() { Default().Log(LevelDebug, "daemon_pass", nil) }
-
-// LogEvent writes an unstructured call site's event through the installed sink.
-func LogEvent(event string, level Level, fields Fields) {
-	Default().Log(level, event, fields)
+// DependenciesResolved records that every waitFor reference of a Watch is
+// satisfied and the merge may proceed.
+func DependenciesResolved(watchID string, pr int, refs []string) {
+	fields := Fields{FieldWatchID: watchID, FieldPR: pr, FieldRefs: refs}
+	Default().Log(LevelDebug, "deps_resolved", fields)
 }
+
+// DependencyWait records a Watch held back by an unsatisfied reference.
+func DependencyWait(watchID string, pr int, reason string) {
+	s := Default()
+	s.Inc(CounterDependencyWaits, "")
+	s.Log(LevelInfo, "dependency_wait", Fields{
+		FieldWatchID: watchID, FieldPR: pr, FieldReason: reason,
+	})
+}
+
+// BlockDetected records a Watch that waits on outside action.
+func BlockDetected(watchID string, pr int, reason string) {
+	s := Default()
+	s.Inc(CounterBlocks, "")
+	fields := Fields{FieldWatchID: watchID, FieldPR: pr}
+	if reason != "" {
+		fields[FieldReason] = reason
+	}
+	s.Log(LevelInfo, "blocked_detected", fields)
+}
+
+// ActorError records a failure of one named actor in the daemon or a handler.
+func ActorError(actor, watchID string, err error) {
+	s := Default()
+	s.Inc(CounterActorErrors, "")
+	fields := Fields{FieldActor: actor}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	if err != nil {
+		fields[FieldError] = err.Error()
+	}
+	s.Log(LevelWarn, "actor_error", fields)
+}
+
+// RunStart and RunEnd bracket one orchestrator pass.
+func RunStart(watches int) {
+	Event(LevelInfo, "run_start", Fields{FieldWatches: watches})
+}
+
+// RunEnd records the outcome of one orchestrator pass.
+func RunEnd(stats CycleStats, err error) {
+	fields := Fields{
+		FieldWatches: stats.Watches, FieldMerges: stats.Merges,
+		FieldWakes: stats.Wakes, FieldDuration: stats.Duration.String(),
+	}
+	level := LevelInfo
+	if err != nil {
+		level = LevelWarn
+		fields[FieldError] = err.Error()
+	}
+	Event(level, "run_end", fields)
+	Observe(HistogramRun, stats.Duration.Seconds())
+}
+
+// WatchRegistered records a new Watch accepted by a tool handler.
+func WatchRegistered(watchID string, pr int, revision uint64, adapter string) {
+	fields := Fields{FieldWatchID: watchID, FieldPR: pr, FieldRevision: revision}
+	if adapter != "" {
+		fields[FieldAdapter] = adapter
+	}
+	Default().Log(LevelInfo, "watch_registered", fields)
+}
+
+// ResultRead records a verdict read back from the store.
+func ResultRead(watchID, verdict string, revision uint64) {
+	Default().Log(LevelInfo, "result_read", Fields{
+		FieldWatchID: watchID, FieldVerdict: verdict, FieldRevision: revision,
+	})
+}
+
+// Command records one command dispatch in the CLI.
+func Command(name string, args []string) {
+	Default().Log(LevelDebug, "command_dispatch", Fields{
+		FieldCommand: name, "args": args,
+	})
+}
+
+// ProviderCall records one CI provider call and its outcome.
+func ProviderCall(adapter, method, watchID string, err error, d time.Duration) {
+	fields := Fields{
+		FieldAdapter: adapter, "method": method, FieldWatchID: watchID,
+		FieldDuration: d.String(),
+	}
+	level := LevelDebug
+	if err != nil {
+		level = LevelWarn
+		fields[FieldError] = err.Error()
+		ActorError(adapter, watchID, err)
+	}
+	Default().Log(level, "provider_call", fields)
+}
+
+// DaemonPass records one pass of the daemon loop. Cycle carries the useful
+// summary; this event remains for callers that only need a marker.
+func DaemonPass() { Event(LevelDebug, "daemon_pass", nil) }

@@ -45,13 +45,14 @@ func TestMetricsIncrementUnlabeledAndLabelledCounters(t *testing.T) {
 
 func TestMetricsReset(t *testing.T) {
 	m := NewMetrics()
-	m.Inc(CounterWakeFailed, "")
-	m.Inc(CounterWakeFailed, "")
+	m.Inc(CounterWakeErrors, "opencode")
+	m.Inc(CounterWakeErrors, "opencode")
 	m.Reset()
 	var got map[string]any
 	_ = json.Unmarshal(m.JSON(), &got)
-	if v, ok := got[CounterWakeFailed].(float64); !ok || int(v) != 0 {
-		t.Errorf("после Reset wake_failed = %v", got[CounterWakeFailed])
+	byAdapter, ok := got[CounterWakeErrors].(map[string]any)
+	if !ok || len(byAdapter) != 0 {
+		t.Errorf("после Reset wake_errors = %v", got[CounterWakeErrors])
 	}
 }
 
@@ -63,17 +64,17 @@ func TestMetricsPrometheusFormat(t *testing.T) {
 
 	text := string(m.Prometheus())
 	for _, want := range []string{
-		"# HELP beacon_merge_attempt Beacon counter merge_attempt.",
-		"# TYPE beacon_merge_attempt counter",
-		"beacon_merge_attempt 1",
-		"beacon_merge_success 1",
-		`beacon_wake_delivered{adapter="weird\"adapter"} 1`,
+		"# HELP beacon_merge_attempts_total Beacon counter merge_attempts_total.",
+		"# TYPE beacon_merge_attempts_total counter",
+		"beacon_merge_attempts_total 1",
+		"beacon_merge_success_total 1",
+		`beacon_wake_delivered_total{adapter="weird\"adapter"} 1`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("в Prometheus-выводе нет %q:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "beacon_verdict_published{") {
+	if strings.Contains(text, "beacon_verdict_published_total{") {
 		t.Errorf("пустой счётчик с меткой не должен давать sample:\n%s", text)
 	}
 }
@@ -86,7 +87,7 @@ func TestMetricsHandlerSetsPrometheusContentType(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
 		t.Errorf("Content-Type = %q", ct)
 	}
-	if !strings.Contains(rec.Body.String(), "beacon_rebase_requested 1") {
+	if !strings.Contains(rec.Body.String(), "beacon_rebase_requests_total 1") {
 		t.Errorf("в теле нет счётчика:\n%s", rec.Body.String())
 	}
 }

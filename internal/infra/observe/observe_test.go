@@ -70,8 +70,8 @@ func TestHelpersEmitEventsAndIncrementCounters(t *testing.T) {
 		t.Errorf("событие poll_cycle = %+v", got)
 	}
 	failed := sink.events[5]
-	if failed.name != "wake_failed" || failed.level != LevelWarn || failed.fields[FieldError] != "refused" {
-		t.Errorf("событие wake_failed = %+v", failed)
+	if failed.name != "wake_error" || failed.level != LevelWarn || failed.fields[FieldError] != "refused" {
+		t.Errorf("событие wake_error = %+v", failed)
 	}
 }
 
