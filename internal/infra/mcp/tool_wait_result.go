@@ -1400,3 +1400,261 @@ func AttachWaitResult(server *mcpsdk.Server, svc *WaitResultService) {
 		},
 	}, svc.Handle)
 }
+
+// ---- ADR 0059 feature 1 / T3.134: agent_acp_wait вместо polling ----
+//
+// ADR 0037 and ADR 0045 make beacon_wait_result return on a Watch event and
+// let a caller filter those events. That tool still owns a bounded long-poll
+// and hands a client pollAfterMs on a timeout. This section adds a different
+// tool on a different object: the protocol task of T3.122 (ADR 0056). There is
+// no Watch, no verdict, no eventKinds filter and no timeout here. agent_acp_wait
+// holds the connection until the task itself settles: a terminal state or a
+// request for confirmation. It then returns the task handle with the settled
+// task. A caller no longer loops over tasks/get to watch progress.
+//
+// The only wakeups are the task event and the caller's context ending. There
+// is no timer and no repeated read of the task state, so a wait cannot mistake
+// an expired budget for a result (ADR 0046 p3 stays with beacon_wait_result).
+
+// ACPWaitMethod is the tool name of the ACP-style blocking wait.
+const ACPWaitMethod = "agent_acp_wait"
+
+// ACPWaitOutcome names the task event that released a blocked wait. A wait ends
+// only on an event in the task, never on a timer, so there is no timeout value.
+type ACPWaitOutcome string
+
+const (
+	ACPWaitCompleted     ACPWaitOutcome = "completed"
+	ACPWaitInputRequired ACPWaitOutcome = "input_required"
+	ACPWaitFailed        ACPWaitOutcome = "failed"
+	ACPWaitCancelled     ACPWaitOutcome = "cancelled"
+)
+
+// acpWaitOutcome maps a settled task state to the return reason. A working
+// task has no outcome and keeps the caller blocked.
+func acpWaitOutcome(state TaskState) ACPWaitOutcome {
+	switch state {
+	case TaskStateCompleted:
+		return ACPWaitCompleted
+	case TaskStateInputRequired:
+		return ACPWaitInputRequired
+	case TaskStateFailed:
+		return ACPWaitFailed
+	case TaskStateCancelled:
+		return ACPWaitCancelled
+	default:
+		return ""
+	}
+}
+
+// ACPWaitInput is the argument object of agent_acp_wait. TaskID is the handle
+// returned when the long task started (CreateTaskResult / tasks/get of T3.122).
+type ACPWaitInput struct {
+	TaskID string `json:"taskId" jsonschema:"task handle returned when the long MCP task started"`
+}
+
+// ACPWaitResult is the response of agent_acp_wait. TaskHandle is returned on
+// every path, so a client whose connection dropped can reconnect with
+// tasks/get. Task is the settled protocol task and Outcome names the event
+// that released the connection. The tool stamps no obligation: delivery and
+// readAt stay with beacon_get_result and beacon_wait_result (ADR 0014).
+type ACPWaitResult struct {
+	TaskHandle string         `json:"taskHandle"`
+	Outcome    ACPWaitOutcome `json:"outcome"`
+	Task       TaskResult     `json:"task"`
+}
+
+// acpTaskStore is the slice of the T3.122 ProtocolTaskStore that the wait
+// needs. The narrow port keeps the blocking behaviour testable without a real
+// store (ADR 0005); *ProtocolTaskStore satisfies it unchanged.
+type acpTaskStore interface {
+	Start(ttlMs, pollIntervalMs int64) (TaskResult, error)
+	Get(taskID string) (TaskResult, error)
+	Update(taskID string, patch TaskPatch) (ProtocolTask, error)
+}
+
+// acpTaskWaiters is one caller's wakeup point. The service closes release when
+// the task settles. Once guards a concurrent second signal; T3.122 already
+// refuses to reopen a terminal task.
+type acpTaskWaiters struct {
+	release chan struct{}
+	once    sync.Once
+}
+
+// ACPWaitService blocks callers on protocol task events. It owns no timer and
+// starts no polling goroutine: a wait parks on a channel that the service
+// closes for that caller when the task settles. Each caller has its own
+// channel, so one caller leaving cannot strand another on the same handle.
+type ACPWaitService struct {
+	tasks   acpTaskStore
+	mu      sync.Mutex
+	waiters map[string][]*acpTaskWaiters
+}
+
+// NewACPWaitService builds a blocking wait over the T3.122 task store. A nil
+// store falls back to a fresh in-memory ProtocolTaskStore.
+func NewACPWaitService(tasks acpTaskStore) *ACPWaitService {
+	if tasks == nil {
+		tasks = NewProtocolTaskStore(nil)
+	}
+	return &ACPWaitService{tasks: tasks, waiters: make(map[string][]*acpTaskWaiters)}
+}
+
+// Start begins a long task and returns its handle at once. The caller does not
+// hold a connection while the work runs. This is the T3.122 start contract;
+// the wait is a separate call made later with the returned handle.
+func (s *ACPWaitService) Start(ttlMs, pollIntervalMs int64) (TaskResult, error) {
+	if s == nil || s.tasks == nil {
+		return TaskResult{}, domain.NewAppError(domain.CodePersistFailed, "acp_wait: task store is nil")
+	}
+	return s.tasks.Start(ttlMs, pollIntervalMs)
+}
+
+// Update applies a status change through T3.122 and releases every wait bound
+// to the task once the new state settles it. A working tick publishes a
+// notification in the store but leaves blocked callers parked.
+func (s *ACPWaitService) Update(taskID string, patch TaskPatch) (ProtocolTask, error) {
+	if s == nil || s.tasks == nil {
+		return ProtocolTask{}, domain.NewAppError(domain.CodePersistFailed, "acp_wait: task store is nil")
+	}
+	task, err := s.tasks.Update(taskID, patch)
+	if err != nil {
+		return task, err
+	}
+	if acpWaitOutcome(task.Status) != "" {
+		s.releaseWaiters(taskID)
+	}
+	return task, nil
+}
+
+// Complete settles a task with a result. It is the terminal event a wait
+// releases on.
+func (s *ACPWaitService) Complete(taskID string, result json.RawMessage) (ProtocolTask, error) {
+	return s.Update(taskID, TaskPatch{Status: TaskStateCompleted, Result: result})
+}
+
+// AskInput settles a task with a confirmation request. Unlike the ADR 0028
+// interruption of beacon_wait_result, this does not abandon the wait: it is an
+// event in the task and releases the wait with the handle and input request.
+func (s *ACPWaitService) AskInput(taskID string, requests json.RawMessage) (ProtocolTask, error) {
+	return s.Update(taskID, TaskPatch{Status: TaskStateInputRequired, InputRequests: requests})
+}
+
+// Wait blocks until the named task settles or ctx ends. It reads the task
+// state only at entry, again after registering the waiter, and once more after
+// the event. It never reads on a clock, so a slow task costs no reads.
+func (s *ACPWaitService) Wait(ctx context.Context, taskID string) (ACPWaitResult, error) {
+	if s == nil || s.tasks == nil {
+		return ACPWaitResult{}, domain.NewAppError(domain.CodePersistFailed, "acp_wait: task store is nil")
+	}
+	if taskID == "" {
+		return ACPWaitResult{}, domain.NewAppError(domain.CodeInvalidInput, "acp_wait: taskId is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// An event that landed before the call settles the wait without parking.
+	if out, done, err := s.settledResult(taskID); err != nil || done {
+		return out, err
+	}
+
+	waiters := s.registerWaiter(taskID)
+	defer s.unregisterWaiter(taskID, waiters)
+
+	// Re-read after registering so an event between the first read and the
+	// registration cannot be missed. Still no timer and no loop.
+	if out, done, err := s.settledResult(taskID); err != nil || done {
+		return out, err
+	}
+
+	select {
+	case <-waiters.release:
+		out, _, err := s.settledResult(taskID)
+		return out, err
+	case <-ctx.Done():
+		err := ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
+		return ACPWaitResult{}, domain.NewAppError(domain.CodeCancelled, "acp_wait: caller context ended: "+err.Error())
+	}
+}
+
+// settledResult returns the response and true when the task is in a state that
+// ends a wait. A working task returns false with no response.
+func (s *ACPWaitService) settledResult(taskID string) (ACPWaitResult, bool, error) {
+	task, err := s.tasks.Get(taskID)
+	if err != nil {
+		return ACPWaitResult{}, false, err
+	}
+	outcome := acpWaitOutcome(task.Status)
+	if outcome == "" {
+		return ACPWaitResult{}, false, nil
+	}
+	return ACPWaitResult{TaskHandle: taskID, Outcome: outcome, Task: task}, true, nil
+}
+
+func (s *ACPWaitService) registerWaiter(taskID string) *acpTaskWaiters {
+	waiters := &acpTaskWaiters{release: make(chan struct{})}
+	s.mu.Lock()
+	s.waiters[taskID] = append(s.waiters[taskID], waiters)
+	s.mu.Unlock()
+	return waiters
+}
+
+func (s *ACPWaitService) releaseWaiters(taskID string) {
+	s.mu.Lock()
+	waiters := s.waiters[taskID]
+	delete(s.waiters, taskID)
+	s.mu.Unlock()
+	// Each caller owns its channel. Closing them outside the lock keeps a
+	// slow caller from holding the service lock; the map no longer carries
+	// these waiters, so a later caller uses the settled entry read instead.
+	for _, w := range waiters {
+		w.once.Do(func() { close(w.release) })
+	}
+}
+
+func (s *ACPWaitService) unregisterWaiter(taskID string, waiters *acpTaskWaiters) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := s.waiters[taskID]
+	for i, current := range active {
+		if current == waiters {
+			s.waiters[taskID] = append(active[:i], active[i+1:]...)
+			break
+		}
+	}
+	if len(s.waiters[taskID]) == 0 {
+		delete(s.waiters, taskID)
+	}
+}
+
+// Handle adapts the blocking wait to the go-sdk typed tool handler signature.
+func (s *ACPWaitService) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in ACPWaitInput) (*mcpsdk.CallToolResult, ACPWaitResult, error) {
+	out, err := s.Wait(ctx, in.TaskID)
+	if err != nil {
+		return nil, ACPWaitResult{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// AttachACPWait registers agent_acp_wait as an opt-in tool. NewServer does not
+// call it automatically; integration chooses when to attach, as with the other
+// task tools in this package.
+func AttachACPWait(server *mcpsdk.Server, svc *ACPWaitService) {
+	if server == nil || svc == nil {
+		return
+	}
+	server.RemoveTools(ACPWaitMethod)
+	no := false
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        ACPWaitMethod,
+		Description: "Block until a long MCP task completes or asks for confirmation, then return its task handle.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  true,
+		},
+	}, svc.Handle)
+}
