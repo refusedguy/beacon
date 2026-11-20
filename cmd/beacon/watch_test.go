@@ -767,6 +767,8 @@ func w3141Start(t *testing.T, src *w3141Source, args ...string) *w3141Harness {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	c, out, errOut, calls := w69CLI(t, nil)
 	prevSnap, prevSrc, prevCtx, prevDelay := watchSnapshot, watchLiveSource, watchLiveContext, watchReconnectDelay
+	prevLiveRunner := watchLiveRunner
+	watchLiveRunner = runWatchLive
 	watchReconnectDelay = 0
 
 	rendered := make(chan struct{}, 64)
@@ -791,6 +793,7 @@ func w3141Start(t *testing.T, src *w3141Source, args ...string) *w3141Harness {
 	t.Cleanup(func() {
 		cancel()
 		SetLiveSource(prevSrc)
+		watchLiveRunner = prevLiveRunner
 		watchLiveContext = prevCtx
 		watchSnapshot = prevSnap
 		watchReconnectDelay = prevDelay
@@ -953,9 +956,10 @@ func TestW3141LiveReconnectRereadsSnapshotWithoutReplay(t *testing.T) {
 }
 
 func TestW3141LiveNoSourceFailsClosed(t *testing.T) {
-	prev := watchLiveSource
+	prev, prevRunner := watchLiveSource, watchLiveRunner
 	SetLiveSource(nil)
-	t.Cleanup(func() { SetLiveSource(prev) })
+	watchLiveRunner = runWatchLive
+	t.Cleanup(func() { SetLiveSource(prev); watchLiveRunner = prevRunner })
 	c, out, errOut, _ := w69CLI(t, nil)
 
 	if code := runWatch(c, []string{"--live"}); code != 2 {
@@ -970,9 +974,10 @@ func TestW3141LiveSnapshotFailureFailsClosed(t *testing.T) {
 	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
 		return mcp.StateSnapshot{}, errSnapshot
 	})
-	prev := watchLiveSource
-	t.Cleanup(func() { SetLiveSource(prev) })
+	prev, prevRunner := watchLiveSource, watchLiveRunner
+	t.Cleanup(func() { SetLiveSource(prev); watchLiveRunner = prevRunner })
 	SetLiveSource(&w3141Source{})
+	watchLiveRunner = runWatchLive
 	c, out, errOut, _ := w69CLI(t, nil)
 
 	if code := runWatch(c, []string{"--live"}); code != 2 {

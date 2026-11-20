@@ -44,6 +44,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon pr create [--title ...] [--body ...] [--card T3.xxx] [--dry-run]
   beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--json]
   beacon inspect [<pr|watchID>] [--json]
+  beacon human <approve|reject|rework|unblock|pause|resume|cancel> <watchID|blockerID> [--note "..."]
   beacon reset --yes
 
 Каталог команд для агентов: beacon list --format json
@@ -274,6 +275,8 @@ func (c *CLI) dispatch(args []string) int {
 		return logsRunner(c, args[1:])
 	case "inspect":
 		return inspectRunner(c, args[1:])
+	case "human":
+		return humanRunner(c, args[1:])
 	case "reset":
 		return resetRunner(c, args[1:])
 	default:
