@@ -21,6 +21,7 @@ var catalog = []command{
 	{Name: "agents", Summary: "Показать агентов OpenCode в режиме subagent или all", Usage: "beacon agents [--format table|json]"},
 	{Name: "attach", Summary: "Подключиться к сессии через фоновый сервис OpenCode", Usage: "beacon attach <sessionID>"},
 	{Name: "build", Summary: "Собрать воспроизводимый бинарник beacon", Usage: "beacon build"},
+	{Name: "deferred", Summary: "Показать отложенные wiring-карточки", Usage: "beacon deferred [--format table|json]"},
 	{Name: "doctor", Summary: "Проверить версию Go, beacon-gates и каталог состояния", Usage: "beacon doctor"},
 	{Name: "gates", Summary: "Передать аргументы бинарнику beacon-gates", Usage: "beacon gates [gate] [flags]"},
 	{Name: "inspect", Summary: "Показать состояние вотч, блокеров и привязки оркестратора", Usage: "beacon inspect [<pr|watchID>] [--json]"},

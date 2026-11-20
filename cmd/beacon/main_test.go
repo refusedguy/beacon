@@ -88,7 +88,7 @@ func TestT06ListJSONCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "human", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "up", "watch", "what", "why"}
+	wantNames := []string{"agents", "attach", "build", "deferred", "doctor", "gates", "human", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "up", "watch", "what", "why"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
 	}
@@ -142,7 +142,7 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 	if errOut.Len() != 0 {
 		t.Fatalf("stderr не пустой: %q", errOut.String())
 	}
-	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "watch", "what", "why"} {
+	for _, name := range []string{"agents", "attach", "build", "deferred", "doctor", "gates", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "watch", "what", "why"} {
 		if !strings.Contains(out.String(), name) {
 			t.Fatalf("таблица не содержит %s: %q", name, out.String())
 		}
@@ -439,6 +439,28 @@ func TestT17DispatchCallsRunners(t *testing.T) {
 		}
 		if gotCLI != c {
 			t.Fatal("раннер watch получил другой CLI")
+		}
+		if !reflect.DeepEqual(gotArgs, []string{"--format", "json"}) {
+			t.Fatalf("аргументы %q, ожидались [--format json]", gotArgs)
+		}
+	})
+
+	t.Run("deferred", func(t *testing.T) {
+		previous := deferredRunner
+		t.Cleanup(func() { deferredRunner = previous })
+		var gotCLI *CLI
+		var gotArgs []string
+		RegisterDeferred(func(c *CLI, args []string) int {
+			gotCLI, gotArgs = c, append([]string(nil), args...)
+			return 5
+		})
+		c, _, _, _ := t06NewCLI(t, t06NoChild(t))
+
+		if code := c.Run([]string{"deferred", "--format", "json"}); code != 5 {
+			t.Fatalf("код выхода %d, ожидался 5", code)
+		}
+		if gotCLI != c {
+			t.Fatal("раннер deferred получил другой CLI")
 		}
 		if !reflect.DeepEqual(gotArgs, []string{"--format", "json"}) {
 			t.Fatalf("аргументы %q, ожидались [--format json]", gotArgs)

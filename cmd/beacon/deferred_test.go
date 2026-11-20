@@ -233,3 +233,43 @@ func TestDeferredCLIPortReadsDurableStore(t *testing.T) {
 		t.Fatalf("карточка = %+v", cards[0])
 	}
 }
+
+// TestDeferredDispatchJSON proves `beacon deferred --format json` works through
+// the real CLI dispatch, with no runner replacement and the durable store.
+func TestDeferredDispatchJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(beaconStateDirEnv, dir)
+	db, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.DeferWiring(store.DeferredWiring{
+		WatchID:    "ses_dispatch_watch",
+		PR:         77,
+		Title:      "dispatch card",
+		Reason:     "needs wiring",
+		OwnerFiles: []string{"cmd/beacon/main.go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, errOut := new(bytes.Buffer), new(bytes.Buffer)
+	c := &CLI{out: out, errOut: errOut}
+	if code := c.Run([]string{"deferred", "--format", "json"}); code != 0 {
+		t.Fatalf("beacon deferred code = %d, stderr = %q", code, errOut.String())
+	}
+
+	var cards []mcp.DeferredWiringCard
+	if err := json.Unmarshal(out.Bytes(), &cards); err != nil {
+		t.Fatalf("JSON output: %v (%q)", err, out.String())
+	}
+	if len(cards) != 1 {
+		t.Fatalf("карточек в JSON: %d, ожидалась 1", len(cards))
+	}
+	if cards[0].CardID != "WIRING-77" || cards[0].WatchID != "ses_dispatch_watch" ||
+		cards[0].Status != store.DeferredStatusTodo {
+		t.Fatalf("карточка = %+v", cards[0])
+	}
+}
