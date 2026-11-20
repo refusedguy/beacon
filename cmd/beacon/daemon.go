@@ -9,6 +9,8 @@ import (
 	"syscall"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // daemonIntervalEnv overrides the default pass interval without a flag. It is
@@ -140,6 +142,10 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 		return orchestrator.DaemonPorts{}, nil, err
 	}
 
+	// Subscribe and Summary share one WorkloadStore built over the same db
+	// handle the other ports use. No second SQLite handle is opened.
+	workload := daemonWorkloadStore(db)
+
 	return orchestrator.DaemonPorts{
 		CheckAll: func(ctx context.Context) error {
 			_, err := orchestrator.CheckAll(ctx, orchestrator.Deps{
@@ -150,9 +156,25 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			})
 			return err
 		},
+		// Subscribe enrolls the orchestrator on every active Watch before the
+		// merge pass. RunWorkload is idempotent by role: a Watch that already
+		// carries an orchestrator subscriber is left untouched.
+		Subscribe: func(ctx context.Context) error {
+			_, err := orchestrator.RunWorkload(ctx, workload)
+			return err
+		},
 		Orchestrate: func(ctx context.Context, waker orchestrator.Waker) error {
 			_, err := orchestrator.Run(ctx, orchDeps.Store, orchDeps.Merger, waker, orchestrator.Options{})
 			return err
+		},
+		// Summary reads a fresh snapshot after orchestration and hands the
+		// report to DaemonRun, which logs the same counters as `beacon workload`.
+		Summary: func(ctx context.Context) (orchestrator.Workload, error) {
+			watches, err := workload.ActiveWorkloadWatches(ctx)
+			if err != nil {
+				return orchestrator.Workload{}, err
+			}
+			return orchestrator.BuildWorkload(watches), nil
 		},
 		// The single reconciler owns terminal-state refreshes now.
 		CloseMerged: func(context.Context) error { return nil },
@@ -176,6 +198,54 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			return view, nil
 		}),
 	}, db.Close, nil
+}
+
+// daemonWorkloadStore adapts the daemon's already-open store handle to the
+// WorkloadStore port. It reuses the db passed in, so a daemon pass never opens
+// a second handle to the same SQLite file or starts a verdict-source poller.
+// The projection from a stored Watch stays here in the composition root;
+// neither cmd nor the app package names a domain type (ADR 0005 layer matrix).
+func daemonWorkloadStore(db *store.DB) orchestrator.WorkloadStore {
+	// A nil clock falls back to the wall clock in domain.NewFanout, and a nil
+	// CI provider is allowed because RunWorkload always supplies headSHA.
+	handler := mcp.NewWatchPRHandler(db, nil, nil)
+	return &workloadStore{
+		activeFn: func(context.Context) ([]orchestrator.WorkloadWatch, error) {
+			all, err := db.ActiveWatches()
+			if err != nil {
+				return nil, err
+			}
+			out := make([]orchestrator.WorkloadWatch, 0, len(all))
+			for _, w := range all {
+				view := orchestrator.WorkloadWatch{
+					ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA,
+					Project: w.Repo, Verdict: string(w.Verdict),
+				}
+				for _, s := range w.Subscribers {
+					view.Subscribers = append(view.Subscribers, orchestrator.WorkloadSubscriber{
+						ID: s.ID, Role: string(s.Role),
+					})
+				}
+				out = append(out, view)
+			}
+			return out, nil
+		},
+		register: func(ctx context.Context, w orchestrator.WorkloadWatch, sub orchestrator.WorkloadSubscriber) error {
+			// RunWorkload only ever enrolls the orchestrator, so the role is a
+			// constant here and cmd needs no domain import (layer matrix).
+			if sub.Role != orchestrator.RoleOrchestrator {
+				return fmt.Errorf("beacon daemon: unsupported subscriber role %q", sub.Role)
+			}
+			_, err := handler.Register(ctx, nil, mcp.WatchPRInput{
+				Repo:    w.Repo,
+				PR:      w.PR,
+				HeadSHA: w.HeadSHA,
+				Role:    "orchestrator",
+				Notify:  &mcp.WatchPRNotify{Adapter: "opencode", Target: sub.ID},
+			})
+			return err
+		},
+	}
 }
 
 // hasOrchestratorSession reports whether subs carry an explicit orchestrator
