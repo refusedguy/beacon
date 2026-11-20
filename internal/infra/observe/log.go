@@ -1,6 +1,7 @@
 package observe
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +31,33 @@ func NewLogger(format string, level Level, w io.Writer) *slog.Logger {
 		handler = slog.NewTextHandler(w, opts)
 	}
 	return slog.New(handler)
+}
+
+// LogWriter adapts the standard logger to the same slog stream. Legacy
+// log.Printf calls reach the file as structured records instead of raw text,
+// so a JSON log stays parseable line by line.
+type LogWriter struct {
+	log *slog.Logger
+}
+
+// NewLogWriter builds a writer that forwards each standard-log line to logger.
+func NewLogWriter(logger *slog.Logger) *LogWriter {
+	return &LogWriter{log: logger}
+}
+
+// Write implements io.Writer. A trailing newline is removed; an empty write is
+// ignored so the file never gains blank records.
+func (w *LogWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if w == nil || w.log == nil {
+		return n, nil
+	}
+	message := strings.TrimRight(string(p), "\r\n")
+	if message == "" {
+		return n, nil
+	}
+	w.log.Log(context.Background(), LevelInfo, "", FieldEvent, "legacy_log", "message", message)
+	return n, nil
 }
 
 // RunLog is the log file of one process run. Path is the name an operator

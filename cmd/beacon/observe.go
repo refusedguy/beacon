@@ -100,8 +100,9 @@ func setupObserve() func() {
 	// in the daemon writes to stderr: a restart keeps all records on disk.
 	previousLogOutput := log.Writer()
 	install := func(w io.Writer) func() {
-		observe.SetDefault(observe.NewRecorder(observe.NewLogger(format, level, w), observe.NewMetrics()))
-		log.SetOutput(w)
+		logger := observe.NewLogger(format, level, w)
+		observe.SetDefault(observe.NewRecorder(logger, observe.NewMetrics()))
+		log.SetOutput(observe.NewLogWriter(logger))
 		return func() {
 			observe.FlushCycle()
 			log.SetOutput(previousLogOutput)

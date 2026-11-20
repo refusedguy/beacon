@@ -92,6 +92,25 @@ func TestHandlerFiltersBelowMinimumLevel(t *testing.T) {
 	}
 }
 
+func TestLogWriterTurnsLegacyLineIntoStructuredRecord(t *testing.T) {
+	buf := new(bytes.Buffer)
+	logger := NewLogger("json", LevelInfo, buf)
+	writer := NewLogWriter(logger)
+	if n, err := writer.Write([]byte("cibridge: verdict published\n")); err != nil || n != len("cibridge: verdict published\n") {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("невалидный JSON %q: %v", buf.String(), err)
+	}
+	if got[FieldEvent] != "legacy_log" || got["message"] != "cibridge: verdict published" {
+		t.Errorf("запись = %v", got)
+	}
+	if _, err := writer.Write(nil); err != nil {
+		t.Errorf("пустая запись не должна ошибку: %v", err)
+	}
+}
+
 func TestOpenRunLogCreatesUniqueFileEachInitialization(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 11, 20, 12, 34, 56, 123456789, time.UTC)
