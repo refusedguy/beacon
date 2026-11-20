@@ -500,6 +500,26 @@ func TestDaemonWakerTextMatchesVerdict(t *testing.T) {
 	}
 }
 
+// daemonWakeAlreadyExists is the daemon's search-before-create check (HD-006):
+// it must report a miss on an empty or nil ledger, a hit for a recorded
+// obligation, and a miss for an unrelated one.
+func TestDaemonWakeAlreadyExistsSearchesLedger(t *testing.T) {
+	if daemonWakeAlreadyExists(nil, "k") {
+		t.Fatal("a nil waker has no ledger and must report no existing wake")
+	}
+	w := &daemonWaker{}
+	if daemonWakeAlreadyExists(w, "k") {
+		t.Fatal("an uninitialised ledger must report no existing wake")
+	}
+	w.deliveredKeys = map[string]struct{}{"k": {}}
+	if !daemonWakeAlreadyExists(w, "k") {
+		t.Fatal("a recorded obligation must be found")
+	}
+	if daemonWakeAlreadyExists(w, "other") {
+		t.Fatal("an unrelated obligation must not be found")
+	}
+}
+
 // A Watch whose verdict did not change keeps its revision. Six daemon passes
 // over the same retry Watch must steer the executor once, not six times.
 func TestDaemonWakerDeliversSameObligationOnce(t *testing.T) {

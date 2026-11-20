@@ -25,14 +25,16 @@ const DaemonInterval = 3 * time.Minute
 
 // DaemonPorts are the actions of one daemon pass.
 //
-// CheckAll lists open PRs, finds or registers their Watches and publishes the
-// verdict. Subscribe enrolls the orchestrator on every active Watch before the
-// orchestrator pass. Orchestrate merges ready Watches and hands retry/fail
-// Watches to the Waker. Summary returns the workload snapshot the pass prints
-// after orchestration. CloseMerged closes Watches whose PR is already merged or
-// closed. CheckAll, Orchestrate and CloseMerged are required. Subscribe and
-// Summary are optional: a nil port skips that step, which keeps older callers
-// working. A nil Waker is allowed and simply suppresses wakes.
+// CheckAll lists open PRs, searches for an existing Watch for each one before
+// registering a new one, and publishes the verdict. This is the daemon's
+// "search before create" step: an open PR must reuse its Watch instead of
+// producing a duplicate. Subscribe enrolls the orchestrator on every active
+// Watch before the orchestrator pass. Orchestrate merges ready Watches and
+// hands retry/fail Watches to the Waker. Summary returns the workload snapshot
+// the pass prints after orchestration. CloseMerged closes Watches whose PR is
+// already merged or closed. CheckAll, Orchestrate and CloseMerged are required.
+// Subscribe and Summary are optional: a nil port skips that step, which keeps
+// older callers working. A nil Waker is allowed and simply suppresses wakes.
 type DaemonPorts struct {
 	CheckAll    func(ctx context.Context) error
 	Subscribe   func(ctx context.Context) error
@@ -203,6 +205,21 @@ func daemonWakeIsDelivered(outcome string) bool {
 	}
 }
 
+// daemonWakeAlreadyExists is the daemon's "search before create" check for
+// wakes. Before a repeated pass steers an executor again, it searches the
+// in-memory ledger for an admission already recorded for the same obligation.
+// A miss means no wake was created yet for this (watchID, revision,
+// subscriber), so the caller may go on and deliver one. Only successful
+// receipts are recorded, so an error or a skip stays eligible for the next
+// pass (see Wake).
+func daemonWakeAlreadyExists(w *daemonWaker, obligationID string) bool {
+	if w == nil || w.deliveredKeys == nil {
+		return false
+	}
+	_, seen := w.deliveredKeys[obligationID]
+	return seen
+}
+
 var _ Waker = (*daemonWaker)(nil)
 
 // daemonWakeInstruction maps a verdict to the action the subscriber must take.
@@ -275,7 +292,9 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if w.deliveredKeys == nil {
 		w.deliveredKeys = make(map[string]struct{})
 	}
-	if _, seen := w.deliveredKeys[pointer.ObligationID]; seen {
+	// Search for an existing admission before creating a new wake. A repeated
+	// daemon pass over an unchanged Watch must not steer the executor twice.
+	if daemonWakeAlreadyExists(w, pointer.ObligationID) {
 		return nil
 	}
 	receipt, ok := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
