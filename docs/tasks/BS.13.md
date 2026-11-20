@@ -12,3 +12,6 @@
 Шаги: UNIQUE(client_request_id), receipt_json, intent_committed и effect_status отдельно.
 Проверка: Два одинаковых вызова создают один command.
 Приёмка: Receipt не означает завершение эффекта.
+
+## Подтверждение
+- Функциональность уже в main, код писать не нужно. В internal/infra/store/receipts.go есть таблица client_receipts с UNIQUE(client_request_id) и отдельными колонками receipt_json, intent_committed и effect_status. RecordClientReceipt пишет через INSERT OR IGNORE, повтор не создаёт вторую запись (BS.13/ADR 0103).
