@@ -220,7 +220,7 @@ func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) 
 		}
 		prs[prLookupKey(a.Owner, a.Repo, a.PR)] = state
 
-		obs := observationFor(state, suites)
+		obs := batchObservationFor(state, suites)
 		if b.cache != nil && obs.HeadSHA != "" && !seenObs[keyFor(obs)] {
 			seenObs[keyFor(obs)] = true
 			if obs.Rerequest || obs.SuiteReset {
@@ -556,7 +556,7 @@ func parseBaseRefState(alias Alias, raw json.RawMessage) domain.BaseBranchState 
 	return state
 }
 
-func observationFor(pr domain.PRState, suites []ContextSuite) Observation {
+func batchObservationFor(pr domain.PRState, suites []ContextSuite) Observation {
 	contexts := make([]SuiteContext, 0, len(suites))
 	for _, s := range suites {
 		contexts = append(contexts, SuiteContext{Name: s.Name, SuiteID: s.SuiteID})
