@@ -36,6 +36,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon watch [--live] [--interval 2s] [--format table|json]
   beacon spawn <taskID> [--agent id] [--title ...]
   beacon attach <sessionID>
+  beacon registry stop --watch <id> --revision <n> --session <id> --token <t>
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
   beacon daemon [--interval 10s|30s] [--once]
@@ -260,6 +261,8 @@ func (c *CLI) dispatch(args []string) int {
 		return c.runSpawn(args[1:])
 	case "attach":
 		return c.runAttach(args[1:])
+	case "registry":
+		return registryRunner(c, args[1:])
 	case "deliver":
 		return deliverRunner(c, args[1:])
 	case "ci":
