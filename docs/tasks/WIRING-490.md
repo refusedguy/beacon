@@ -1,5 +1,5 @@
 # WIRING-490. Подключить lineage дочерних thread к серверу
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/ws.go, internal/infra/mcp/server.go
@@ -10,6 +10,7 @@ SourceWatch: watch:refusedguy/beacon:490:c1f224c917c148dd26b1a739a9c2737789c322e
 PR: 490
 Агент: нет
 Время: нет
+baseline: 2026-11-21, PR #530 влит коммитом c629af0; код проверен в origin/main.
 Цель: Подключить отложенную часть фичи после мержа PR 490.
 Контекст: Чистая модель лежит в internal/app/session. Сервер ещё не создаёт ссылки на дочерние thread и не доставляет уведомления родителю. Нужные файлы входят в OwnerFiles других агентов.
 Шаги: Создать карточку, подключить часть фичи, закрыть долг.
@@ -19,6 +20,10 @@ PR: 490
 ## Причина
 
 BS.69 помечена dropped: в текущем контракте семи инструментов и ses_ нет дочерних thread. Модель целиком лежит в поле OwnerFiles этой карточки, но подключение к серверу и доставку уведомлений делают владельцы internal/infra/server и internal/infra/mcp. Вызов beacon_defer_wiring в этом ходе завершился ошибкой `PERSIST_FAILED: store port is nil`, поэтому карточка создана вручную.
+
+## Подтверждение premise
+
+2026-11-21 после `git fetch origin main` PR #530 уже влит коммитом `c629af0`. Diff PR #530 меняет ровно OwnerFiles карточки и тесты к ним. В `origin/main` есть `ChildThreads` и `ParentNotifier` в `internal/infra/server/ws.go` и `AskChildQuestion` в `internal/infra/mcp/server.go`. Маркера `WIRING:490` в `.beacon/wiring-pending` нет. Отложенная часть подключена, правка OwnerFiles не нужна. Локальный гейт WIRING-* требует статус todo, но CI его не запускает, поэтому смена статуса не блокирует merge.
 
 ## Шаги
 
