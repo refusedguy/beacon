@@ -39,7 +39,10 @@ func NewService(cfg Config) *Service { return &Service{Cfg: cfg} }
 
 var (
 	adrRefRE  = regexp.MustCompile(`^ADR ([0-9]{4})$`)
-	idrRE     = regexp.MustCompile(`^T[0-9]+\.[0-9]+$`)
+	// Cards come from several waves: T3.226, T5.1, S1.001 and UI-31. All of
+	// them are valid identifiers, so the lister must not reject a new wave
+	// just because its prefix differs from the original T<n>.<n> form.
+	idrRE = regexp.MustCompile(`^[A-Za-z]+[0-9]*[.-][0-9]+$`)
 	adrStatRE = regexp.MustCompile(`(?m)^Статус:[ \t]*(.*)$`)
 )
 

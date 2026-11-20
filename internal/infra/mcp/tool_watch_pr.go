@@ -18,7 +18,10 @@ import (
 const (
 	// watchPRPollAfterMs is the suggested delay before a client reads the
 	// result again. It is a hint, not a timeout or a deadline.
-	watchPRPollAfterMs int64 = 5000
+	// Polling is a hint for a client that chose to poll, not a heartbeat.
+	// Five seconds produced a storm of calls without adding information, so
+	// the default is three minutes.
+	watchPRPollAfterMs int64 = 180000
 
 	// watchPRSessionIDMetaKey is the opaque session identifier key that T2.3
 	// reads from _meta. The value is passed through without parsing; it is

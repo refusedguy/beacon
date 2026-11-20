@@ -60,8 +60,17 @@ func TestTaskCommandListRealCards(t *testing.T) {
 	if len(rows) < 52 {
 		t.Fatalf("ожидались все карточки, получено %d", len(rows))
 	}
-	if rows[0]["id"] != "T0.1" {
-		t.Fatalf("первая карточка %v, ждали T0.1", rows[0]["id"])
+	// New waves add S1.001 and UI-01 cards, which sort before T0.1. The
+	// contract is that every disk card is listed, not a fixed first id.
+	found := false
+	for _, row := range rows {
+		if row["id"] == "T0.1" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("карточка T0.1 отсутствует в выводе")
 	}
 }
 

@@ -81,9 +81,12 @@ type Card struct {
 }
 
 var (
-	idRE       = regexp.MustCompile(`^T([0-9]+)\.([0-9]+)`)
-	exactIDRE  = regexp.MustCompile(`^T[0-9]+\.[0-9]+$`)
-	titleRE    = regexp.MustCompile(`^#\s+T[0-9]+\.[0-9]+\.\s*(.*)$`)
+	// Several waves produce valid card ids: T3.226, T5.1, S1.001 and UI-31.
+	// Parse the common shapes and keep the exact filename as the card id.
+	idRE       = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)[.]([0-9]+)(?:-.*)?$`)
+	dashIDRE   = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([0-9]+)$`)
+	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+$`)
+	titleRE    = regexp.MustCompile(`^#\s+[A-Za-z][A-Za-z0-9_.-]*\.\s*(.*)$`)
 	headerRE   = regexp.MustCompile(`^#\s+(.*)$`)
 	fieldRE    = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
 	statusLine = regexp.MustCompile(`^(Статус|Агент|Время):[ \t]*(.*?)[ \t]*$`)
@@ -106,19 +109,31 @@ var knownFields = func() map[string]bool {
 func ParseCard(filePath string, data []byte) (Card, error) {
 	var card Card
 	name := filepath.Base(filePath)
-	m := idRE.FindStringSubmatch(name)
-	if m == nil {
-		return card, Validationf("%s: имя файла не содержит ID вида T<g>.<n>", name)
+	id := strings.TrimSuffix(name, ".md")
+	m := idRE.FindStringSubmatch(id)
+	var group, number int
+	var err error
+	switch {
+	case m != nil:
+		group, err = strconv.Atoi(m[2])
+		if err != nil {
+			return card, Validationf("%s: неверный номер фазы в ID", name)
+		}
+		number, err = strconv.Atoi(m[3])
+	case dashIDRE.MatchString(id):
+		d := dashIDRE.FindStringSubmatch(id)
+		number, err = strconv.Atoi(d[2])
+	default:
+		return card, Validationf("%s: имя файла не содержит поддерживаемый ID карточки", name)
 	}
-	group, err := strconv.Atoi(m[1])
-	if err != nil {
-		return card, Validationf("%s: неверный номер фазы в ID", name)
-	}
-	number, err := strconv.Atoi(m[2])
 	if err != nil {
 		return card, Validationf("%s: неверный номер задачи в ID", name)
 	}
-	card.ID = fmt.Sprintf("T%d.%d", group, number)
+	if m != nil {
+		card.ID = fmt.Sprintf("%s%s.%s", m[1], m[2], m[3])
+	} else {
+		card.ID = id
+	}
 	card.Group, card.Number = group, number
 	card.Path = filePath
 	card.Raw = string(data)
@@ -173,13 +188,13 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	card.Check = fields["Проверка"]
 	card.Acceptance = fields["Приёмка"]
 
-	if !oneOf(card.Type, "task", "epic") {
+	if !oneOf(card.Type, "task", "epic", "adr") {
 		return card, Validationf("%s: поле Тип имеет неизвестное значение %q", name, card.Type)
 	}
 	if !oneOf(card.Status, "todo", "in_progress", "done", "dropped") {
 		return card, Validationf("%s: поле Статус имеет неизвестное значение %q", name, card.Status)
 	}
-	if !oneOf(card.Phase, "P0", "P1", "P2", "P3", "P4") {
+	if !oneOf(card.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6") {
 		return card, Validationf("%s: поле Фаза имеет неизвестное значение %q", name, card.Phase)
 	}
 	for key, value := range fields {

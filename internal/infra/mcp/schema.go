@@ -96,7 +96,9 @@ const (
 	// TaskStatusWorking is the seed status of a task handle.
 	TaskStatusWorking = "working"
 	// DefaultTaskPollIntervalMs is the suggested client polling interval.
-	DefaultTaskPollIntervalMs int64 = 5000
+	// DefaultTaskPollIntervalMs bounds task-dialect clients. The old 5s
+	// default made agents spam tools; a terminal verdict still wakes them.
+	DefaultTaskPollIntervalMs int64 = 180000
 	// PlainJobInstructions tells a client without Tasks how to collect its job.
 	PlainJobInstructions = "use beacon_get_result and beacon_wait_result with the jobID; cancel with beacon_cancel_watch"
 )
