@@ -2471,3 +2471,149 @@ func (s *Service) FixChecksForWorktree(worktree string) ([]FixChecksTask, error)
 	}
 	return out, nil
 }
+
+// ---- ADR 0063 фича 5 / T3.157: подтверждение continued после handoff ----
+//
+// Передача сессии считается состоявшейся только после проверки факта: получатель
+// продолжил диалог. Возможны три ответа: continued, inconclusive, not-continued.
+// Отправка самой заметки (BuildHandoff, AppendHandoffStep) handoff не завершает:
+// пока нет ответа continued, передача остаётся неподтверждённой. Ответы
+// inconclusive и not-continued не отбрасываются: они остаются в журнале и видны
+// через HandoffStatus. Это проверка факта, а не resume по чекпоинту ADR 0062 и не
+// курсор ADR 0025.
+
+// HandoffAnswer — ответ проверки факта продолжения сессии после handoff.
+type HandoffAnswer string
+
+const (
+	HandoffContinued    HandoffAnswer = "continued"
+	HandoffInconclusive HandoffAnswer = "inconclusive"
+	HandoffNotContinued HandoffAnswer = "not-continued"
+)
+
+func (a HandoffAnswer) valid() bool {
+	switch a {
+	case HandoffContinued, HandoffInconclusive, HandoffNotContinued:
+		return true
+	}
+	return false
+}
+
+// HandoffConfirmation — один записанный ответ проверки продолжения передачи.
+type HandoffConfirmation struct {
+	TaskID string        `json:"taskId"`
+	Answer HandoffAnswer `json:"answer"`
+	At     time.Time     `json:"at"`
+}
+
+// HandoffStatus — наблюдаемое состояние подтверждения одной передачи. Answer
+// это последний записанный ответ, Completed true только когда он continued.
+// Answers хранит все ответы в порядке записи, поэтому inconclusive и
+// not-continued не скрываются.
+type HandoffStatus struct {
+	TaskID    string                `json:"taskId"`
+	Answer    HandoffAnswer         `json:"answer"`
+	Completed bool                  `json:"completed"`
+	Answers   []HandoffConfirmation `json:"answers"`
+}
+
+type handoffConfirmationState struct {
+	Entries []HandoffConfirmation `json:"entries"`
+}
+
+func (s *Service) handoffConfirmationPath() string {
+	return filepath.Join(s.Cfg.StateDir, "handoff-confirmations.json")
+}
+
+func (s *Service) lockHandoffConfirmations() (func(), error) {
+	path := filepath.Join(s.Cfg.StateDir, "handoff-confirmations.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, taskstore.Startupf("не открыт замок подтверждений handoff: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, taskstore.Startupf("не взят замок подтверждений handoff: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+func (s *Service) loadHandoffConfirmations() (handoffConfirmationState, error) {
+	data, err := os.ReadFile(s.handoffConfirmationPath())
+	if os.IsNotExist(err) {
+		return handoffConfirmationState{}, nil
+	}
+	if err != nil {
+		return handoffConfirmationState{}, taskstore.Startupf("не прочитаны подтверждения handoff: %v", err)
+	}
+	var st handoffConfirmationState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return handoffConfirmationState{}, taskstore.Startupf("не разобраны подтверждения handoff: %v", err)
+	}
+	return st, nil
+}
+
+func (s *Service) saveHandoffConfirmations(st handoffConfirmationState) error {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return taskstore.Startupf("не собраны подтверждения handoff: %v", err)
+	}
+	return taskstore.AtomicWrite(s.handoffConfirmationPath(), append(data, '\n'), 0644)
+}
+
+// RecordHandoffAnswer записывает ответ проверки факта продолжения. Допустимы
+// только три ответа ADR 0063; неизвестный ответ и пустая задача отклоняются.
+func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at time.Time) (HandoffConfirmation, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return HandoffConfirmation{}, taskstore.Validationf("не задана задача подтверждения handoff")
+	}
+	if !answer.valid() {
+		return HandoffConfirmation{}, taskstore.Validationf("неизвестный ответ подтверждения handoff %q", answer)
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	unlock, err := s.lockHandoffConfirmations()
+	if err != nil {
+		return HandoffConfirmation{}, err
+	}
+	defer unlock()
+	st, err := s.loadHandoffConfirmations()
+	if err != nil {
+		return HandoffConfirmation{}, err
+	}
+	entry := HandoffConfirmation{TaskID: taskID, Answer: answer, At: at.UTC()}
+	st.Entries = append(st.Entries, entry)
+	if err := s.saveHandoffConfirmations(st); err != nil {
+		return HandoffConfirmation{}, err
+	}
+	return entry, nil
+}
+
+// HandoffStatus возвращает состояние подтверждения задачи. Completed true только
+// при последнем ответе continued; без ответов Completed false. Все ответы видны
+// в Answers, включая inconclusive и not-continued.
+func (s *Service) HandoffStatus(taskID string) (HandoffStatus, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return HandoffStatus{}, taskstore.Validationf("не задана задача подтверждения handoff")
+	}
+	st, err := s.loadHandoffConfirmations()
+	if err != nil {
+		return HandoffStatus{}, err
+	}
+	out := HandoffStatus{TaskID: taskID, Answers: make([]HandoffConfirmation, 0)}
+	for _, e := range st.Entries {
+		if e.TaskID != taskID {
+			continue
+		}
+		out.Answers = append(out.Answers, e)
+		out.Answer = e.Answer
+	}
+	out.Completed = out.Answer == HandoffContinued
+	return out, nil
+}

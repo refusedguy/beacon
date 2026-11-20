@@ -1944,3 +1944,129 @@ func TestConcurrentFixChecksRequestsKeepOneTask(t *testing.T) {
 		t.Fatalf("задач %d, ждали 1", len(tasks))
 	}
 }
+
+// ---- ADR 0063 фича 5 / T3.157: подтверждение continued после handoff ----
+
+func TestHandoffCompletedOnlyAfterContinued(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.157", "in_progress", "task", "ADR 0063", "internal/app/taskcli/service.go", "agent-1", "2026-11-20T10:00:00Z")
+
+	// Отправка заметки сама по себе handoff не завершает.
+	if _, err := e.svc.BuildHandoff("T3.157"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.AppendHandoffStep("T3.157", "send-note", "", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := e.svc.HandoffStatus("T3.157")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Completed || st.Answer != "" || len(st.Answers) != 0 {
+		t.Fatalf("отправка заметки завершила handoff: %+v", st)
+	}
+
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := e.svc.RecordHandoffAnswer("T3.157", HandoffInconclusive, at); err != nil {
+		t.Fatal(err)
+	}
+	st, err = e.svc.HandoffStatus("T3.157")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Completed || st.Answer != HandoffInconclusive || len(st.Answers) != 1 {
+		t.Fatalf("inconclusive завершил handoff: %+v", st)
+	}
+	if _, err := e.svc.RecordHandoffAnswer("T3.157", HandoffNotContinued, at.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	st, err = e.svc.HandoffStatus("T3.157")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Completed || st.Answer != HandoffNotContinued || len(st.Answers) != 2 {
+		t.Fatalf("not-continued завершил handoff: %+v", st)
+	}
+
+	if _, err := e.svc.RecordHandoffAnswer("T3.157", HandoffContinued, at.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	st, err = e.svc.HandoffStatus("T3.157")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Completed || st.Answer != HandoffContinued {
+		t.Fatalf("continued не завершил handoff: %+v", st)
+	}
+	// inconclusive и not-continued не скрыты: все три ответа в журнале.
+	want := []HandoffAnswer{HandoffInconclusive, HandoffNotContinued, HandoffContinued}
+	if len(st.Answers) != len(want) {
+		t.Fatalf("ответов %d, ждали %d: %+v", len(st.Answers), len(want), st.Answers)
+	}
+	for i, a := range want {
+		if st.Answers[i].Answer != a {
+			t.Fatalf("ответ %d = %q, ждали %q", i, st.Answers[i].Answer, a)
+		}
+	}
+}
+
+func TestRecordHandoffAnswerValidatesAndIsolatesTasks(t *testing.T) {
+	e := newEnv(t)
+	for _, a := range []HandoffAnswer{"", "maybe", "CONTINUED", "continued "} {
+		if _, err := e.svc.RecordHandoffAnswer("T3.157", a, time.Time{}); taskstore.Code(err) != 1 {
+			t.Errorf("ответ %q: код %d, ждали 1", a, taskstore.Code(err))
+		}
+	}
+	if _, err := e.svc.RecordHandoffAnswer("  ", HandoffContinued, time.Time{}); taskstore.Code(err) != 1 {
+		t.Fatalf("пустая задача: код %d, ждали 1", taskstore.Code(err))
+	}
+	if _, err := e.svc.HandoffStatus("  "); taskstore.Code(err) != 1 {
+		t.Fatalf("HandoffStatus с пустой задачей: %v", err)
+	}
+	st, err := e.svc.HandoffStatus("T3.157")
+	if err != nil || len(st.Answers) != 0 {
+		t.Fatalf("неверные ответы записаны: %+v err=%v", st, err)
+	}
+
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := e.svc.RecordHandoffAnswer("T3.157", HandoffContinued, at); err != nil {
+		t.Fatal(err)
+	}
+	other, err := e.svc.HandoffStatus("T3.158")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Completed || len(other.Answers) != 0 {
+		t.Fatalf("ответ по другой задаче виден: %+v", other)
+	}
+	fresh := NewService(e.cfg)
+	got, err := fresh.HandoffStatus("T3.157")
+	if err != nil || !got.Completed || len(got.Answers) != 1 {
+		t.Fatalf("новый сервис: %+v err=%v", got, err)
+	}
+}
+
+func TestConcurrentHandoffAnswersAreAllKept(t *testing.T) {
+	e := newEnv(t)
+	const n = 12
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			_, err := e.svc.RecordHandoffAnswer("T3.157", HandoffInconclusive,
+				time.Date(2026, 11, 20, 12, 0, i, 0, time.UTC))
+			errs <- err
+		}(i)
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := e.svc.HandoffStatus("T3.157")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Answers) != n {
+		t.Fatalf("записано %d ответов, ждали %d", len(st.Answers), n)
+	}
+}
