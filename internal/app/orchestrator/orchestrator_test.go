@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -73,6 +76,27 @@ type fakeWaker struct {
 func (w *fakeWaker) Wake(_ context.Context, watchID string, revision uint64, verdict string) error {
 	w.calls = append(w.calls, wakeCall{watchID, revision, verdict})
 	return w.err
+}
+
+type reasonWakeCall struct {
+	watchID  string
+	revision uint64
+	verdict  string
+	reason   string
+}
+
+type fakeReasonWaker struct {
+	calls []reasonWakeCall
+}
+
+func (w *fakeReasonWaker) Wake(_ context.Context, watchID string, revision uint64, verdict string) error {
+	w.calls = append(w.calls, reasonWakeCall{watchID, revision, verdict, ""})
+	return nil
+}
+
+func (w *fakeReasonWaker) WakeWithReason(_ context.Context, watchID string, revision uint64, verdict, reason string) error {
+	w.calls = append(w.calls, reasonWakeCall{watchID, revision, verdict, reason})
+	return nil
 }
 
 func readyWatch(id string, pr int, revision uint64) Watch {
@@ -248,5 +272,327 @@ func TestPolicyAllows(t *testing.T) {
 	}
 	if (AutoMergePolicy{RequireApproval: true}).Allows() {
 		t.Fatal("requireApproval must block auto-merge")
+	}
+}
+
+// ---- DependencyResolver: граф waitFor/waitForMain разрешает мерж ----
+
+type fakeResolver struct {
+	ok    map[string]bool
+	err   map[string]error
+	calls []string
+}
+
+func (r *fakeResolver) Satisfied(_ context.Context, ref string) (bool, error) {
+	r.calls = append(r.calls, ref)
+	if err := r.err[ref]; err != nil {
+		return false, err
+	}
+	return r.ok[ref], nil
+}
+
+// noisyResolver возвращает true вместе с ошибкой: ошибка резолвера не должна
+// давать ложное разрешение мержа.
+type noisyResolver struct {
+	value bool
+	err   error
+	calls []string
+}
+
+func (r *noisyResolver) Satisfied(_ context.Context, ref string) (bool, error) {
+	r.calls = append(r.calls, ref)
+	return r.value, r.err
+}
+
+type runnerCall struct {
+	name string
+	args []string
+}
+
+type fakeRunner struct {
+	calls []runnerCall
+	out   map[string][]byte
+	err   map[string]error
+}
+
+func runnerKey(name string, args ...string) string {
+	return name + " " + strings.Join(args, " ")
+}
+
+func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	r.calls = append(r.calls, runnerCall{name, append([]string(nil), args...)})
+	key := runnerKey(name, args...)
+	return r.out[key], r.err[key]
+}
+
+func writeCard(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolverSatisfiesDoneCardOnly(t *testing.T) {
+	dir := t.TempDir()
+	writeCard(t, dir, "T3.100.md", "# T3.100\nСтатус: done\n")
+	writeCard(t, dir, "T3.101.md", "# T3.101\nСтатус: todo\n")
+	writeCard(t, dir, "T3.102.md", "---\nstatus: done\n---\n")
+	r := &FileDependencyResolver{DocsDir: dir, Runner: &fakeRunner{}}
+
+	for _, tc := range []struct {
+		ref  string
+		want bool
+	}{
+		{"T3.100", true},
+		{" T3.100 ", true},
+		{"T3.101", false},
+		{"T3.102", true},
+		{"T3.999", false},
+	} {
+		got, err := r.Satisfied(context.Background(), tc.ref)
+		if err != nil {
+			t.Fatalf("Satisfied(%q): %v", tc.ref, err)
+		}
+		if got != tc.want {
+			t.Fatalf("Satisfied(%q) = %t, want %t", tc.ref, got, tc.want)
+		}
+	}
+}
+
+func TestResolverSatisfiesMergedPR(t *testing.T) {
+	runner := &fakeRunner{out: map[string][]byte{
+		runnerKey("gh", "pr", "view", "77", "--json", "state"): []byte(`{"state":"MERGED"}`),
+	}}
+	r := NewDependencyResolver(runner)
+
+	for _, ref := range []string{"#77", "PR#77", "pr/77"} {
+		ok, err := r.Satisfied(context.Background(), ref)
+		if err != nil || !ok {
+			t.Fatalf("Satisfied(%q) = %t, %v, want true", ref, ok, err)
+		}
+	}
+	if len(runner.calls) != 3 {
+		t.Fatalf("gh calls = %d, want 3: %+v", len(runner.calls), runner.calls)
+	}
+	want := runnerCall{"gh", []string{"pr", "view", "77", "--json", "state"}}
+	if !reflect.DeepEqual(runner.calls[0], want) {
+		t.Fatalf("gh call = %+v, want %+v", runner.calls[0], want)
+	}
+
+	closed := &fakeRunner{out: map[string][]byte{
+		runnerKey("gh", "pr", "view", "78", "--json", "state"): []byte(`{"state":"CLOSED"}`),
+	}}
+	ok, err := (&FileDependencyResolver{Runner: closed}).Satisfied(context.Background(), "#78")
+	if err != nil || ok {
+		t.Fatalf("closed PR satisfied = %t, %v, want false", ok, err)
+	}
+
+	failing := &fakeRunner{err: map[string]error{
+		runnerKey("gh", "pr", "view", "79", "--json", "state"): errors.New("gh: auth"),
+	}}
+	if _, err := (&FileDependencyResolver{Runner: failing}).Satisfied(context.Background(), "#79"); err == nil {
+		t.Fatal("gh failure must be a resolver error, not an unsatisfied flag")
+	}
+}
+
+func TestResolverUsesGitShowForArbitraryRef(t *testing.T) {
+	const present = "docs/tasks/T3.100.md"
+	const absent = "docs/tasks/nope.md"
+	const broken = "docs/tasks/broken.md"
+	runner := &fakeRunner{
+		out: map[string][]byte{runnerKey("git", "show", "main:"+present): []byte("card")},
+		err: map[string]error{
+			runnerKey("git", "show", "main:"+absent): ErrRefMissing,
+			runnerKey("git", "show", "main:"+broken): errors.New("git: broken object"),
+		},
+	}
+	r := NewDependencyResolver(runner)
+
+	ok, err := r.Satisfied(context.Background(), present)
+	if err != nil || !ok {
+		t.Fatalf("present file = %t, %v, want true", ok, err)
+	}
+	ok, err = r.Satisfied(context.Background(), "./"+present)
+	if err != nil || !ok {
+		t.Fatalf("normalized file = %t, %v, want true", ok, err)
+	}
+	wantCall := runnerCall{"git", []string{"show", "main:" + present}}
+	if !reflect.DeepEqual(runner.calls[0], wantCall) {
+		t.Fatalf("git call = %+v, want %+v", runner.calls[0], wantCall)
+	}
+	ok, err = r.Satisfied(context.Background(), absent)
+	if err != nil || ok {
+		t.Fatalf("missing file = %t, %v, want false without error", ok, err)
+	}
+	if _, err := r.Satisfied(context.Background(), broken); err == nil {
+		t.Fatal("git failure must be a resolver error")
+	}
+}
+
+func TestCanAutoMergeResolvesEveryDependency(t *testing.T) {
+	r := &fakeResolver{ok: map[string]bool{"T3.100": true, "#77": true}}
+	w := readyWatch("w1", 42, 3)
+	policy := AutoMergePolicy{WaitFor: []string{"T3.100"}, WaitForMain: []string{"#77"}}
+	w.Policy = &policy
+
+	verdict, reason, err := w.canAutoMerge(context.Background(), r)
+	if err != nil || verdict != VerdictReady || reason != "" {
+		t.Fatalf("canAutoMerge = %q, %q, %v, want ready", verdict, reason, err)
+	}
+	if !reflect.DeepEqual(r.calls, []string{"T3.100", "#77"}) {
+		t.Fatalf("resolved refs = %v", r.calls)
+	}
+}
+
+func TestRunMergesWhenAllDependenciesAreSatisfied(t *testing.T) {
+	w := readyWatch("w1", 42, 3)
+	policy := AutoMergePolicy{WaitFor: []string{"T3.100"}, WaitForMain: []string{"#77"}}
+	w.Policy = &policy
+	st := newFakeStore(w)
+	merger := &fakeMerger{}
+	r := &fakeResolver{ok: map[string]bool{"T3.100": true, "#77": true}}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{Resolver: r})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merger.calls) != 1 || merger.calls[0] != (mergeCall{"refusedguy/beacon", 42}) {
+		t.Fatalf("merger calls = %+v", merger.calls)
+	}
+	if !reflect.DeepEqual(result.Merged, []int{42}) {
+		t.Fatalf("merged = %v, want [42]", result.Merged)
+	}
+	if len(result.Waiting) != 0 {
+		t.Fatalf("waiting = %v, want empty", result.Waiting)
+	}
+}
+
+func TestRunUnsatisfiedDependencyWaitsWithReasonAndWakes(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy AutoMergePolicy
+		ok     map[string]bool
+		reason string
+	}{
+		{
+			name:   "waitFor",
+			policy: AutoMergePolicy{WaitFor: []string{"T3.100", "T3.101"}},
+			ok:     map[string]bool{"T3.100": true, "T3.101": false},
+			reason: "wait_for:T3.101",
+		},
+		{
+			name:   "waitForMain",
+			policy: AutoMergePolicy{WaitForMain: []string{"#77"}},
+			ok:     map[string]bool{"#77": false},
+			reason: "wait_for_main:#77",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := readyWatch("w1", 42, 3)
+			policy := tc.policy
+			w.Policy = &policy
+			st := newFakeStore(w)
+			merger := &fakeMerger{}
+			waker := &fakeWaker{}
+			r := &fakeResolver{ok: tc.ok}
+
+			result, err := RunWithResolver(context.Background(), st, merger, waker, r, Options{})
+
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(merger.calls) != 0 || len(result.Merged) != 0 {
+				t.Fatalf("unsatisfied dependency must block the merge: calls=%+v merged=%v", merger.calls, result.Merged)
+			}
+			if !reflect.DeepEqual(result.Waiting, []int{42}) {
+				t.Fatalf("waiting = %v, want [42]", result.Waiting)
+			}
+			foundWait := false
+			for _, a := range result.Actions {
+				if a.Action == ActionWait && a.Message == tc.reason {
+					foundWait = true
+				}
+			}
+			if !foundWait {
+				t.Fatalf("wait action with reason %q missing: %+v", tc.reason, result.Actions)
+			}
+			wantWakes := []wakeCall{{"w1", 3, VerdictWait}}
+			if !reflect.DeepEqual(waker.calls, wantWakes) {
+				t.Fatalf("wakes = %+v, want %+v", waker.calls, wantWakes)
+			}
+		})
+	}
+}
+
+func TestRunResolverErrorNeverAllowsMerge(t *testing.T) {
+	w := readyWatch("w1", 42, 3)
+	policy := AutoMergePolicy{WaitFor: []string{"T3.100"}}
+	w.Policy = &policy
+	st := newFakeStore(w)
+	merger := &fakeMerger{}
+	waker := &fakeWaker{}
+	r := &noisyResolver{value: true, err: errors.New("card store unavailable")}
+
+	result, err := Run(context.Background(), st, merger, waker, Options{Resolver: r})
+
+	if err == nil {
+		t.Fatal("resolver error must be reported")
+	}
+	if len(merger.calls) != 0 || len(result.Merged) != 0 {
+		t.Fatalf("resolver error must block the merge: %+v", merger.calls)
+	}
+	if len(waker.calls) != 0 {
+		t.Fatalf("a resolver failure is not a subscriber wake: %+v", waker.calls)
+	}
+	if !reflect.DeepEqual(r.calls, []string{"T3.100"}) {
+		t.Fatalf("resolved refs = %v", r.calls)
+	}
+}
+
+func TestRunWithoutResolverWaitsForDependencies(t *testing.T) {
+	w := readyWatch("w1", 42, 3)
+	policy := AutoMergePolicy{WaitFor: []string{"T3.100"}}
+	w.Policy = &policy
+	st := newFakeStore(w)
+	merger := &fakeMerger{}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merger.calls) != 0 {
+		t.Fatalf("no resolver must not allow a merge: %+v", merger.calls)
+	}
+	if !reflect.DeepEqual(result.Waiting, []int{42}) {
+		t.Fatalf("waiting = %v, want [42]", result.Waiting)
+	}
+	found := false
+	for _, a := range result.Actions {
+		if a.Action == ActionWait && a.Message == "resolver_unavailable" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("wait action with resolver_unavailable missing: %+v", result.Actions)
+	}
+}
+
+func TestRunWaitWakeCarriesReasonToReasonWaker(t *testing.T) {
+	w := readyWatch("w1", 42, 3)
+	policy := AutoMergePolicy{WaitFor: []string{"T3.100"}}
+	w.Policy = &policy
+	st := newFakeStore(w)
+	waker := &fakeReasonWaker{}
+	r := &fakeResolver{ok: map[string]bool{"T3.100": false}}
+
+	if _, err := Run(context.Background(), st, &fakeMerger{}, waker, Options{Resolver: r}); err != nil {
+		t.Fatal(err)
+	}
+	want := []reasonWakeCall{{"w1", 3, VerdictWait, "wait_for:T3.100"}}
+	if !reflect.DeepEqual(waker.calls, want) {
+		t.Fatalf("reason wakes = %+v, want %+v", waker.calls, want)
 	}
 }
