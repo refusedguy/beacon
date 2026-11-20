@@ -207,15 +207,17 @@ func connectContractClient(t *testing.T) *sdkmcp.ClientSession {
 	return clientSession
 }
 
-// isClosedObject reports whether s is the {"not":{}} schema that jsonschema.For
-// emits for a Go struct. Only that shape is relaxed below; a map's value schema
-// is a real schema and stays in force.
+// isClosedObject reports whether s is the false schema that jsonschema.For
+// emits for a Go struct's additionalProperties. MarshalJSON renders that shape
+// as the JSON literal false, so matching the rendered form is stable across
+// wire round trips. Only that shape is relaxed below; a map's value schema is a
+// real schema and stays in force.
 func isClosedObject(s *jsonschema.Schema) bool {
 	if s == nil || s.Not == nil {
 		return false
 	}
-	raw, err := json.Marshal(s.Not)
-	return err == nil && string(raw) == "{}"
+	raw, err := json.Marshal(s)
+	return err == nil && string(raw) == "false"
 }
 
 // relaxSchema walks a schema tree and opens struct-style additionalProperties.
