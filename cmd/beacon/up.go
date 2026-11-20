@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/channel"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/observe"
+	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
@@ -60,6 +62,17 @@ var (
 		return wake.NewTelegramNotifySink(wake.TelegramConfigFromEnv(nil))
 	}
 )
+
+// channelMessagePort is the narrow view of the channel ingress the loop uses.
+// *channel.Ingress satisfies it; tests install a fake to exercise the route.
+type channelMessagePort interface {
+	Accept(ctx context.Context, msg channel.Message) (channel.Command, error)
+}
+
+// upChannelIngress is nil until the up command opts in. The loop installs the
+// boundary before it starts ticking and clears it on exit, so a plain chat
+// message keeps the old behaviour on a server without channels enabled.
+var upChannelIngress channelMessagePort
 
 // upDecisionAdapter prefers the HTTP human-decide port and falls back to the
 // local SQLite port. The fallback also covers a server that answers with a
@@ -117,11 +130,18 @@ func installUpNotifications(sink *wake.TelegramNotifySink) func() {
 // status on every tick and serves bot commands from Telegram. There is no
 // OpenCode session in the loop: the terminal process is the whole runtime.
 func runUp(c *CLI, args []string) int {
+	channelsCfg, err := channelConfigFromEnv(nil)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon up: channel config: %v\n", err)
+		return 2
+	}
+
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(c.errOut)
 	fs.Usage = func() {}
 	interval := fs.Duration("interval", 2*time.Second, "интервал опроса Telegram и вывода статуса")
 	once := fs.Bool("once", false, "один проход ReconcilePass и выход")
+	channels := fs.Bool("channels", channelsCfg.Enabled, "принимать команды из внешнего канала")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		writeUsage(c.errOut)
 		return 2
@@ -130,6 +150,7 @@ func runUp(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon up: интервал должен быть положительным\n")
 		return 2
 	}
+	channelsCfg.Enabled = *channels
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -164,6 +185,16 @@ func runUp(c *CLI, args []string) int {
 	decisions := upDecisionsFor(dir)
 	status := upStatusPort(db)
 
+	if channelsCfg.Enabled {
+		ingress, err := buildChannelIngress(channelsCfg, store.NewOutboxStore(db), channelApplySink(decisions))
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon up: channel ingress: %v\n", err)
+			return 2
+		}
+		upChannelIngress = ingress
+		defer func() { upChannelIngress = nil }()
+	}
+
 	stopLoop, err := runReconciler(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon up: poller: %v\n", err)
@@ -177,7 +208,8 @@ func runUp(c *CLI, args []string) int {
 		return 0
 	}
 
-	fmt.Fprintf(c.out, "beacon up: telegram=%s interval=%s\n", upNotifyState(tg), *interval)
+	fmt.Fprintf(c.out, "beacon up: telegram=%s channels=%s interval=%s\n",
+		upNotifyState(tg), upChannelState(), *interval)
 	fmt.Fprint(c.out, renderUpStatus(ctx, status))
 
 	ticker := time.NewTicker(*interval)
@@ -195,6 +227,13 @@ func runUp(c *CLI, args []string) int {
 
 func upNotifyState(tg *wake.TelegramNotifySink) string {
 	if tg != nil && tg.Configured() {
+		return "on"
+	}
+	return "off"
+}
+
+func upChannelState() string {
+	if upChannelIngress != nil {
 		return "on"
 	}
 	return "off"
@@ -221,8 +260,14 @@ func upHandleTick(ctx context.Context, c *CLI, tg *wake.TelegramNotifySink, stat
 // handleUpCommand parses one chat message and answers through the messenger.
 // Read-only commands render the store projection; write commands go through the
 // human-decide port so the same idempotency and journal rules apply as to
-// `beacon human`.
+// `beacon human`. With channels enabled, a plain-text command first goes
+// through the channel ingress; a slash command keeps the existing route.
 func handleUpCommand(ctx context.Context, messenger upMessenger, chatID, text string, status upStatusPort, decisions upDecisionPort, out io.Writer) {
+	if ingress := upChannelIngress; ingress != nil && !strings.HasPrefix(strings.TrimSpace(text), "/") {
+		if acceptUpChannelMessage(ctx, messenger, chatID, text, ingress, out) {
+			return
+		}
+	}
 	cmd, ok := wake.ParseBotCommand(text)
 	if !ok {
 		return
@@ -264,6 +309,30 @@ func handleUpCommand(ctx context.Context, messenger upMessenger, chatID, text st
 	if out != nil {
 		fmt.Fprintf(out, "beacon up: %s -> %s\n", cmd.Command, chatID)
 	}
+}
+
+// acceptUpChannelMessage sends one plain chat message through the channel
+// boundary. It reports true only when the ingress delivered a command, so a
+// message the boundary refuses falls through to the slash-command handler.
+func acceptUpChannelMessage(ctx context.Context, messenger upMessenger, chatID, text string, ingress channelMessagePort, out io.Writer) bool {
+	cmd, err := ingress.Accept(ctx, channel.Message{
+		Channel: channelTelegram,
+		Sender:  chatID,
+		Text:    text,
+	})
+	if err != nil {
+		return false
+	}
+	reply := fmt.Sprintf("%s %s: ok", cmd.Verb, cmd.Target)
+	if messenger != nil {
+		if err := messenger.SendText(ctx, chatID, reply); err != nil {
+			observe.ActorError("channel-reply", string(cmd.Actor), err)
+		}
+	}
+	if out != nil {
+		fmt.Fprintf(out, "beacon up: channel %s -> %s\n", cmd.Verb, chatID)
+	}
+	return true
 }
 
 // renderUpStatus is the compact terminal line printed each tick and the reply
