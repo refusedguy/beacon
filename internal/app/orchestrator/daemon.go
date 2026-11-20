@@ -156,6 +156,8 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 type DaemonWatch struct {
 	ID           string
 	PR           int
+	HeadSHA      string
+	BaseRef      string
 	Adapter      string
 	SubscriberID string
 }
@@ -316,8 +318,8 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if adapter == "" {
 		adapter = wake.AdapterOpenCode
 	}
-	text := fmt.Sprintf("%s: verdict=%s watchID=%s pr=%d revision=%d",
-		daemonWakeInstruction(verdict), verdict, watchID, watch.PR, revision)
+	text := fmt.Sprintf("%s: verdict=%s watchID=%s pr=%d headSHA=%s baseRef=%s revision=%d",
+		daemonWakeInstruction(verdict), verdict, watchID, watch.PR, watch.HeadSHA, watch.BaseRef, revision)
 	pointer := wake.T210WakePointer{
 		Adapter:      adapter,
 		Target:       watch.SubscriberID,

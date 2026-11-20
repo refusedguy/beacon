@@ -597,6 +597,32 @@ func TestDaemonWakerTextMatchesVerdict(t *testing.T) {
 	}
 }
 
+// The wake pointer must carry both diff coordinates so the subscriber can run
+// git diff baseRef..HEAD against its own branch without a second lookup.
+func TestDaemonWakerTextCarriesDiffCoordinates(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	watchID := "w-diff"
+	const head = "abc123def456"
+	const base = "main"
+	w := daemonTestWaker(DaemonWatch{
+		ID: watchID, PR: 12, HeadSHA: head, BaseRef: base,
+		Adapter: wake.AdapterOpenCode, SubscriberID: "ses_diff",
+	}, adapter)
+	if err := w.Wake(context.Background(), watchID, 2, VerdictRetry); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if len(adapter.texts) != 1 {
+		t.Fatalf("wake texts = %q, want exactly one", adapter.texts)
+	}
+	text := adapter.texts[0]
+	if !strings.Contains(text, "headSHA="+head) {
+		t.Fatalf("wake text %q does not contain headSHA=%s", text, head)
+	}
+	if !strings.Contains(text, "baseRef="+base) {
+		t.Fatalf("wake text %q does not contain baseRef=%s", text, base)
+	}
+}
+
 // daemonWakeAlreadyExists is the daemon's search-before-create check (HD-006):
 // it must report a miss on an empty or nil ledger, a hit for a recorded
 // obligation, and a miss for an unrelated one.
