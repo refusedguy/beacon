@@ -192,16 +192,18 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 		return VerdictRebase, wakeExecutor(WakePointer)
 	}
 
-	// 5. Real failures, with SKIPPED and NEUTRAL results excluded. A failure
-	// already present on the base branch takes priority over the retry budget:
-	// re-running a check on main can never make it green.
+	// 5. A failure already present on the base branch takes priority over both
+	// the retry budget and the rollup: re-running a check on main can never make
+	// it green. Read the raw report before harmless-result filtering, so a base
+	// failure cannot be softened into a retry or a ready verdict by a stale
+	// SUCCESS conclusion on the caller's snapshot.
+	for _, name := range s.Failures {
+		if s.BaseFailedChecks[name] {
+			return VerdictBlocked, wakeOrchestrator(WakePointer)
+		}
+	}
 	failed := realFailures(s)
 	if rollup == "FAILURE" || rollup == "ERROR" || len(failed) > 0 {
-		for _, name := range failed {
-			if s.BaseFailedChecks[name] {
-				return VerdictBlocked, wakeOrchestrator(WakePointer)
-			}
-		}
 		retry := s
 		retry.Failures = failed
 		if rerun := flakyRetryChecks(retry); len(rerun) > 0 {
@@ -234,6 +236,24 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	return VerdictWatching, nil
 }
 
+// NormalizeConclusion maps a raw check conclusion or status to one of four
+// canonical states: SUCCESS, FAILURE, CANCELLED and PENDING. Adapters that feed
+// Snapshot.Checks use this single mapping, so the verdict engine never has to
+// re-decide whether PASS, SUCCESSFUL or NEUTRAL mean a passing check. SKIPPED
+// and NEUTRAL are allowed results and normalize to SUCCESS, not to a blocker.
+func NormalizeConclusion(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "PASS", "SUCCESS", "SUCCESSFUL", "SKIPPED", "NEUTRAL":
+		return "SUCCESS"
+	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+		return "FAILURE"
+	case "CANCELLED", "CANCELED":
+		return "CANCELLED"
+	default:
+		return "PENDING"
+	}
+}
+
 // realFailures returns the failure names that represent an actual failed check.
 // SKIPPED and NEUTRAL conclusions are passes for this decision table even when
 // a caller included them in Failures, so they never trigger a block or retry.
@@ -245,8 +265,7 @@ func realFailures(s Snapshot) []string {
 			continue
 		}
 		seen[name] = true
-		switch strings.ToUpper(name) {
-		case "SKIPPED", "NEUTRAL":
+		if NormalizeConclusion(name) == "SUCCESS" {
 			continue
 		}
 		if harmlessConclusion(s.Checks[name]) {
@@ -257,19 +276,12 @@ func realFailures(s Snapshot) []string {
 	return out
 }
 
-// harmlessConclusion reports whether a listed check was skipped or explicitly
-// neutral. A check absent from Snapshot.Checks has no conclusion to soften the
-// caller's failure report, so it stays a failure.
+// harmlessConclusion reports whether a listed check actually passed, including
+// the SKIPPED and NEUTRAL aliases. A check absent from Snapshot.Checks has no
+// conclusion to soften the caller's failure report, so it stays a failure.
 func harmlessConclusion(c Check) bool {
-	switch strings.ToUpper(c.Conclusion) {
-	case "SKIPPED", "NEUTRAL":
-		return true
-	}
-	switch strings.ToUpper(c.State) {
-	case "SKIPPED", "NEUTRAL":
-		return true
-	}
-	return false
+	return NormalizeConclusion(c.Conclusion) == "SUCCESS" ||
+		NormalizeConclusion(c.State) == "SUCCESS"
 }
 
 // reviewOK applies the review gate. IgnoreReviews lets a Watch proceed without

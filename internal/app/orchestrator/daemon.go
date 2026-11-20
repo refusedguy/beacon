@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +229,7 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		Adapter:      adapter,
 		Target:       watch.SubscriberID,
 		WatchID:      watchID,
-		ObligationID: daemonObligationKey(watchID, revision, watch.SubscriberID),
+		ObligationID: obligationKey(watchID, revision, watch.SubscriberID),
 		Revision:     revision,
 		VerdictRef:   text,
 		Attempt:      1,
@@ -265,16 +264,6 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		w.deliveredKeys[pointer.ObligationID] = struct{}{}
 	}
 	return nil
-}
-
-// daemonKeyEscaper mirrors the domain obligation-key encoding. It is local
-// because this layer may not import internal/domain.
-var daemonKeyEscaper = strings.NewReplacer("\\", "\\\\", ":", "\\:")
-
-func daemonObligationKey(watchID string, revision uint64, subscriberID string) string {
-	return daemonKeyEscaper.Replace(watchID) + ":" +
-		strconv.FormatUint(revision, 10) + ":" +
-		daemonKeyEscaper.Replace(subscriberID)
 }
 
 // daemonWakeAdapter is the one built-in deliverer the daemon registers. It
