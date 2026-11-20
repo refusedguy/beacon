@@ -40,6 +40,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon daemon [--interval 3m] [--once]
   beacon workload [--format table|json]
   beacon metrics [--format json|prometheus]
+  beacon pr create [--title ...] [--body ...] [--card T3.xxx] [--dry-run]
 
 Каталог команд для агентов: beacon list --format json
 `
@@ -263,6 +264,8 @@ func (c *CLI) dispatch(args []string) int {
 		return workloadRunner(c, args[1:])
 	case "metrics":
 		return metricsRunner(c, args[1:])
+	case "pr":
+		return prcreateRunner(c, args[1:])
 	default:
 		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)
