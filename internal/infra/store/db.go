@@ -57,6 +57,13 @@ type DB struct {
 	closeOnce sync.Once
 
 	version int
+
+	// progress is non-nil only on a DB opened with OpenProduction. It makes
+	// every call to Write go through ObservedPersist, so each committed write
+	// advances persist_progress.seq and each failure records last_error.
+	// Plain Open leaves it nil to keep the existing test fixtures' writer
+	// behavior unchanged.
+	progress *ObservedPersist
 }
 
 type writeJob struct {
@@ -69,13 +76,29 @@ var _ domain.Store = (*DB)(nil)
 
 // Open opens path, enables WAL, applies pending migrations and starts the
 // single writer. PRAGMAs are set in the DSN so modernc applies them to every
-// new connection; busy_timeout comes first (report G §3).
+// new connection; busy_timeout comes first (report G §3). Writes reach the
+// file directly, as before; use OpenProduction for a store whose writes are
+// redacted and observed.
 func Open(path string) (*DB, error) {
-	writeDB, err := openPool(path, 1)
+	return open(path, driverName, false)
+}
+
+// OpenProduction opens path with the production wrappers: every bound string
+// or byte-slice parameter passes through Redact before it reaches SQLite, and
+// every Write goes through ObservedPersist so persist_progress.seq, last_error
+// and failed_since stay honest. The redaction filter lives in the SQL driver,
+// so callers cannot bypass it by writing with a different statement or by
+// using a helper in another package.
+func OpenProduction(path string) (*DB, error) {
+	return open(path, redactingDriverName, true)
+}
+
+func open(path, drv string, production bool) (*DB, error) {
+	writeDB, err := openPool(path, 1, drv)
 	if err != nil {
 		return nil, err
 	}
-	readDB, err := openPool(path, 4)
+	readDB, err := openPool(path, 4, drv)
 	if err != nil {
 		writeDB.Close()
 		return nil, err
@@ -117,12 +140,17 @@ func Open(path string) (*DB, error) {
 		done:      make(chan struct{}),
 		version:   version,
 	}
+	if production {
+		// The wrapped writer is the raw one, so recording progress does not
+		// re-enter the observation layer and bump seq twice.
+		d.progress = NewObservedPersistWithWriter(d, writeFunc(d.rawWrite))
+	}
 	go d.writeLoop()
 	return d, nil
 }
 
-func openPool(path string, maxConns int) (*sql.DB, error) {
-	db, err := sql.Open(driverName, dsn(path))
+func openPool(path string, maxConns int, drv string) (*sql.DB, error) {
+	db, err := sql.Open(drv, dsn(path))
 	if err != nil {
 		return nil, err
 	}
@@ -171,9 +199,21 @@ func (d *DB) Close() error {
 	return err
 }
 
-// Write runs fn in one transaction on the single writer. This is the only
-// path that mutates the database, so a redacting wrapper can wrap it later.
+// Write runs fn in one transaction on the single writer. On a production DB
+// the call goes through ObservedPersist: a committed write advances
+// persist_progress.seq, a failed one records last_error and failed_since. On a
+// plain DB the write goes straight to the file.
 func (d *DB) Write(ctx context.Context, fn func(*sql.Tx) error) error {
+	if d.progress != nil {
+		return d.progress.Write(ctx, fn)
+	}
+	return d.rawWrite(ctx, fn)
+}
+
+// rawWrite is the unobserved single-writer path. ObservedPersist uses it for
+// both the wrapped data write and its own progress rows, which keeps the
+// progress bookkeeping out of the seq it counts.
+func (d *DB) rawWrite(ctx context.Context, fn func(*sql.Tx) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}

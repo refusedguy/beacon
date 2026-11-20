@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -72,6 +73,40 @@ func serverHandlerOptions(level Level) *slog.HandlerOptions {
 		return a
 	}
 	return opts
+}
+
+// Secret patterns shared with store.Redact. observe cannot import store: both
+// are infrastructure packages, so the filter is duplicated here and applied
+// to the bytes before they reach beacon.mcp.jsonl.
+var (
+	githubTokenRE = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
+	authHeaderRE  = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
+	urlCredsRE    = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
+)
+
+// Redact removes GitHub tokens, Authorization credentials and URL credentials
+// from a log line. It is deliberately byte-based so it catches a secret in a
+// structured field, in a message and in a legacy log.Printf line alike.
+func Redact(src []byte) []byte {
+	if len(src) == 0 {
+		return append([]byte(nil), src...)
+	}
+	out := githubTokenRE.ReplaceAll(src, []byte("[REDACTED]"))
+	out = authHeaderRE.ReplaceAll(out, []byte("${1}[REDACTED]"))
+	out = urlCredsRE.ReplaceAll(out, []byte("${1}[REDACTED]@"))
+	return out
+}
+
+// redactingWriter applies Redact to every write before handing it to the
+// rotating file. It reports the original length so slog's writer contract is
+// satisfied even though the redacted bytes can be shorter.
+type redactingWriter struct{ w io.Writer }
+
+func (w *redactingWriter) Write(p []byte) (int, error) {
+	if _, err := w.w.Write(Redact(p)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // LogWriter adapts the standard logger to the same slog stream. Legacy
@@ -196,11 +231,12 @@ func OpenServerLog(dir string) (*RunLog, error) {
 			level = parsed
 		}
 	}
+	filtered := &redactingWriter{w: rotating}
 	return &RunLog{
 		Path:   path,
-		out:    rotating,
+		out:    filtered,
 		close:  rotating.Close,
-		logger: slog.New(slog.NewJSONHandler(rotating, serverHandlerOptions(level))),
+		logger: slog.New(slog.NewJSONHandler(filtered, serverHandlerOptions(level))),
 	}, nil
 }
 

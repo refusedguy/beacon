@@ -156,6 +156,66 @@ func TestObservedPersistSeqOnlyAfterCommittedWrites(t *testing.T) {
 	}
 }
 
+// TestOpenProductionExposesHonestPersistToStats covers the production wiring:
+// every d.Write is observed, a failure is recorded without moving seq, and
+// PersistStats is the read path beacon_stats.persist uses.
+func TestOpenProductionExposesHonestPersistToStats(t *testing.T) {
+	d, err := OpenProduction(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("OpenProduction: %v", err)
+	}
+	defer d.Close()
+	ctx := context.Background()
+
+	write := func(fn func(*sql.Tx) error) error { return d.Write(ctx, fn) }
+	noop := func(*sql.Tx) error { return nil }
+	if err := write(noop); err != nil {
+		t.Fatalf("successful write: %v", err)
+	}
+
+	before, err := d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState before failure: %v", err)
+	}
+	if before.Seq != 1 {
+		t.Fatalf("seq = %d, want 1", before.Seq)
+	}
+
+	persistFailed(t, write(func(*sql.Tx) error { return errors.New("disk full") }))
+	state, err := d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState after failure: %v", err)
+	}
+	if state.Seq != before.Seq {
+		t.Errorf("seq = %d, want it unchanged after failure", state.Seq)
+	}
+	if !strings.Contains(state.LastError, "disk full") || state.FailedSince.IsZero() {
+		t.Errorf("state = %+v, want lastError and failedSince recorded", state)
+	}
+
+	stats, loadErrors, err := d.PersistStats()
+	if err != nil {
+		t.Fatalf("PersistStats: %v", err)
+	}
+	if stats != state {
+		t.Errorf("PersistStats state = %+v, want %+v", stats, state)
+	}
+	if len(loadErrors) != 0 {
+		t.Errorf("loadErrors = %+v, want none", loadErrors)
+	}
+
+	if err := write(noop); err != nil {
+		t.Fatalf("recovery write: %v", err)
+	}
+	state, err = d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState after recovery: %v", err)
+	}
+	if state.Seq != 2 || state.LastError != "" || !state.FailedSince.IsZero() {
+		t.Errorf("state after recovery = %+v, want seq 2 and a cleared error", state)
+	}
+}
+
 func TestLoadEventsSkipsCorruptedRowsWithoutStopping(t *testing.T) {
 	d := openObservabilityDB(t)
 	insertRawEvent(t, d, "good-1", []byte(`{"kind":"wake-intent","obligationID":"w1:1:s1"}`))

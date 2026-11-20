@@ -106,7 +106,7 @@ func TestMigrateFromCorpusFixture(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "state.db")
 
-	old, err := openPool(path, 1)
+	old, err := openPool(path, 1, driverName)
 	if err != nil {
 		t.Fatalf("open fixture db: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestMigrateFromCorpusFixture(t *testing.T) {
 
 func TestFailedMigrationDoesNotAdvanceVersion(t *testing.T) {
 	ctx := context.Background()
-	db, err := openPool(filepath.Join(t.TempDir(), "state.db"), 1)
+	db, err := openPool(filepath.Join(t.TempDir(), "state.db"), 1, driverName)
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
@@ -2480,7 +2480,7 @@ func TestAcceptTaskWALBeforeAcceptedReply(t *testing.T) {
 		replyCalls++
 		// A fresh connection models a restarted process polling the id. It is
 		// opened at the reply point, after AcceptTask's write has committed.
-		reader, err := openPool(path, 1)
+		reader, err := openPool(path, 1, driverName)
 		if err != nil {
 			return err
 		}

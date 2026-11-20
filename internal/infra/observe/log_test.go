@@ -10,6 +10,69 @@ import (
 	"time"
 )
 
+func TestRedactCoversLogSecretPatterns(t *testing.T) {
+	in := []byte(`token ghp_abcdefghijklmnopqrstuvwxyz0123456789 ` +
+		`auth="Authorization: Bearer supersecretvalue123" ` +
+		`url=https://alice:hunter2@github.com/org/repo.git`)
+	out := string(Redact(in))
+	for _, secret := range []string{
+		"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"supersecretvalue123",
+		"alice:hunter2",
+	} {
+		if strings.Contains(out, secret) {
+			t.Errorf("secret %q survived log redaction: %q", secret, out)
+		}
+	}
+	for _, keep := range []string{"Authorization", "https://", "github.com/org/repo.git"} {
+		if !strings.Contains(out, keep) {
+			t.Errorf("missing %q in redacted line: %q", keep, out)
+		}
+	}
+}
+
+// TestServerLogRedactsSecrets proves no credential reaches beacon.mcp.jsonl:
+// the JSONL logger's writer applies the same filter as the store.
+func TestServerLogRedactsSecrets(t *testing.T) {
+	t.Setenv(LogLevelEnv, "info")
+	run, err := OpenServerLog(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenServerLog: %v", err)
+	}
+	logger := run.Logger()
+	if logger == nil {
+		t.Fatal("server log has no preconfigured logger")
+	}
+	logger.Info("published",
+		"token", "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"auth", "Authorization: Bearer supersecretvalue123",
+		"url", "https://alice:hunter2@github.com/org/repo.git")
+	if err := run.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	data, err := os.ReadFile(run.Path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	for _, secret := range []string{
+		"ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+		"supersecretvalue123",
+		"alice:hunter2",
+	} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Errorf("secret %q reached %s: %s", secret, run.Path, data)
+		}
+	}
+	if !bytes.Contains(data, []byte("[REDACTED]")) {
+		t.Errorf("no redaction marker in log: %s", data)
+	}
+	var record map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &record); err != nil {
+		t.Errorf("redacted log line is not valid JSON: %v (%s)", err, data)
+	}
+}
+
 func TestTextHandlerIsReadableAndKeepsAttributes(t *testing.T) {
 	buf := new(bytes.Buffer)
 	rec := NewRecorder(NewLogger("text", LevelInfo, buf), NewMetrics())
