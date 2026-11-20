@@ -44,6 +44,7 @@ func runDaemon(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	interval := fs.Duration("interval", defaultInterval, "интервал прохода (по умолчанию 3m)")
 	once := fs.Bool("once", false, "выполнить один проход и выйти")
+	wakeTargetFlag := fs.String("wake-target", "", "sessionID OpenCode оркестратора для wake")
 	if !parseFlags("daemon", args, c.errOut, fs) {
 		return 2
 	}
@@ -51,8 +52,13 @@ func runDaemon(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon daemon: интервал должен быть положительным\n")
 		return 2
 	}
+	wakeTarget, err := ciWakeTarget(*wakeTargetFlag)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
+		return 2
+	}
 
-	ports, closePorts, err := makeDaemonPorts(c)
+	ports, closePorts, err := makeDaemonPorts(c, wakeTarget)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
 		return 2
@@ -72,7 +78,7 @@ func runDaemon(c *CLI, args []string) int {
 // makeDaemonPorts builds the three pass actions from the real state store.
 // The checkall and cibridge ports share one store handle; the orchestrator
 // factory opens its own handle, so both are closed on shutdown.
-func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
+func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func() error, error) {
 	deps, closeStore, err := openMCPDependencies()
 	if err != nil {
 		return orchestrator.DaemonPorts{}, nil, err
@@ -107,7 +113,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 				PR:      pr.Number,
 				HeadSHA: pr.HeadSHA,
 				Role:    "orchestrator",
-				Notify:  &mcp.WatchPRNotify{Adapter: "opencode", Target: "beacon-daemon-checkall"},
+				Notify:  &mcp.WatchPRNotify{Adapter: "opencode", Target: wakeTarget},
 			})
 			if err != nil {
 				return orchestrator.WatchRef{}, err
