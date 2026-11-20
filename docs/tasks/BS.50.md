@@ -1,5 +1,6 @@
 # BS.50. Аудит через API
 Статус: done
+Premise: проверено 2026-11-20, дубль. Функциональность уже влита в main: коммит 30eb554 (PR #480) добавил GET /api/v1/audit в OwnerFiles internal/infra/server/api_audit.go (+ api_audit_test.go) через порт AuditReader. Фильтры по актору, ingress и включительным временным границам задаются в AuditQueryFromRequest; пагинация непрозрачным курсором с лимитом MaxAuditPageSize (encodeAuditCursor/decodeAuditCursor); маскирование токенов, Authorization и URL-креденшелов в redactAuditString перед выдачей. Приёмка «экспорт без токенов» выполнена. Сторовая часть ListAudit живёт в internal/infra/store/audit.go; тесты api_audit_test.go покрывают фильтры, пагинацию, пустое состояние, маскирование и ошибки ридера. Дубль не создан.
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/server/api_audit.go
