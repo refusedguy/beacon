@@ -403,7 +403,7 @@ func runMCP(ctx context.Context) error {
 	// hosting service for active Watches and persists ready/retry, so the
 	// orchestrator reads a verdict from get_result instead of polling CI.
 	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, ciBridgeInterval)
-	ciBridge.WithWaker(&wake.OpenCodeDeliverer{})
+	ciBridge.WithWaker(wake.NewRegistry())
 	go ciBridge.Run(ctx)
 
 	return serveMCP(ctx, deps)
