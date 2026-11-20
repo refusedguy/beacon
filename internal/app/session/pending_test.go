@@ -195,7 +195,7 @@ func TestPopOnEmptyQueue(t *testing.T) {
 	if ok {
 		t.Fatalf("Pop on empty queue returned %+v", got)
 	}
-	if got != (Pending{}) {
+	if got.ClientRequestID != "" || got.Kind != "" || got.Payload != nil {
 		t.Fatalf("Pop on empty queue = %+v, want zero", got)
 	}
 	if got := q.Len("ses-a"); got != 0 {
