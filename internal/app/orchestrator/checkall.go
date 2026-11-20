@@ -917,3 +917,21 @@ func obligationKey(watchID string, revision uint64, subscriberID string) string 
 		strconv.FormatUint(revision, 10) + ":" +
 		obligationKeyEscaper.Replace(subscriberID)
 }
+
+// ---- strict gate-result JSON (HD-046, ADR 0301) --------------------------
+
+// ValidateStrictJSON enforces the gate-result fence contract. The body between
+// the fence markers must be exactly one JSON value and nothing else. Harbor
+// accepts JSON only, so the check rejects comments, trailing commas, prose
+// around the value and an empty fence. encoding/json rejects all four, so no
+// permissive decoder is needed and the function stays pure.
+func ValidateStrictJSON(body string) error {
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("aif-gate-result: пустой fence")
+	}
+	var value any
+	if err := json.Unmarshal([]byte(body), &value); err != nil {
+		return fmt.Errorf("aif-gate-result: strict JSON: %w", err)
+	}
+	return nil
+}

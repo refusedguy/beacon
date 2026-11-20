@@ -633,3 +633,43 @@ func TestSQLVerdictWriterPublishesAndStagesObligations(t *testing.T) {
 		t.Fatalf("repeat changed watch = %+v", again)
 	}
 }
+
+// TestValidateStrictJSONAcceptsValidJSON: a well-formed fence body passes.
+// Surrounding whitespace is allowed because fences add newlines around JSON.
+func TestValidateStrictJSONAcceptsValidJSON(t *testing.T) {
+	for _, body := range []string{
+		`{"schema_version":1,"gate":"rules","status":"pass","blocking":false}`,
+		"  {\n  \"status\": \"warn\",\n  \"blockers\": []\n}\n ",
+		`[1, 2, 3]`,
+	} {
+		if err := ValidateStrictJSON(body); err != nil {
+			t.Errorf("ValidateStrictJSON(%q) = %v, want nil", body, err)
+		}
+	}
+}
+
+// TestValidateStrictJSONRejectsNonStrictBodies: a comment, a trailing comma,
+// decoration around the value, trailing garbage and an empty fence all fail.
+func TestValidateStrictJSONRejectsNonStrictBodies(t *testing.T) {
+	cases := []struct {
+		name, body string
+	}{
+		{"line comment", "{\n  // note\n  \"status\": \"pass\"\n}"},
+		{"block comment", `{"status":"pass" /* ok */}`},
+		{"trailing comma object", `{"status":"pass",}`},
+		{"trailing comma array", `[1, 2,]`},
+		{"prose before", "Here is the result:\n{\"status\":\"pass\"}"},
+		{"prose after", "{\"status\":\"pass\"}\nThat is all."},
+		{"trailing garbage", `{"status":"pass"} {}`},
+		{"empty fence", ""},
+		{"whitespace only fence", " \n\t "},
+		{"fence markers kept", "```aif-gate-result\n{\"status\":\"pass\"}\n```"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := ValidateStrictJSON(tc.body); err == nil {
+				t.Fatalf("ValidateStrictJSON accepted %q", tc.body)
+			}
+		})
+	}
+}
