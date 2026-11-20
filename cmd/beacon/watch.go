@@ -484,7 +484,7 @@ type watchHTTPPort interface {
 }
 
 var (
-	watchHTTPStateDir = stateDir
+	watchHTTPStateDir = func() (string, error) { return stateDir() }
 	watchHTTPClient   = func(conn httpapi.ClientConn) (watchHTTPPort, error) {
 		return httpapi.NewProjectionClient(conn, nil)
 	}

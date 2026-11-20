@@ -57,7 +57,7 @@ type humanDecisionStore interface {
 }
 
 var (
-	humanStateDir   = stateDir
+	humanStateDir   = func() (string, error) { return stateDir() }
 	humanDeciderFor = func(conn httpapi.ClientConn) (humanDecider, error) { return httpapi.NewProjectionClient(conn, nil) }
 	humanStoreFor   = func(dir string) humanDecisionStore { return sqliteHumanStore{dir: dir} }
 )

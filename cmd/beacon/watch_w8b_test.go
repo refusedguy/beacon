@@ -104,7 +104,7 @@ type w8bPort struct {
 func (p *w8bPort) Snapshot(context.Context) (httpapi.ClientSnapshot, error) {
 	p.calls++
 	select {
-	case p.rendered <- struct{}:
+	case p.rendered <- struct{}{}:
 	default:
 	}
 	return p.snap, p.err
