@@ -398,3 +398,70 @@ func decisionHoldReason(verdict string, p *AutoMergePolicy) string {
 	}
 	return "verdict="
 }
+
+// ---- HD-019 / ADR 0295: task completion audit ----
+
+// TaskClosure answers whether one task named in a plan has been closed. It is
+// the only way AuditCompletion learns the result, so the audit itself performs
+// no I/O. An implementation must return an error instead of true when the fact
+// cannot be verified. An unverifiable task must never count as closed.
+type TaskClosure interface {
+	Closed(ctx context.Context, id string) (bool, error)
+}
+
+// TaskClosureFunc adapts a function to the TaskClosure contract. A nil
+// function reports every task as open, so an unwired audit fails closed.
+type TaskClosureFunc func(ctx context.Context, id string) (bool, error)
+
+// Closed calls f. A nil function reports the task as open.
+func (f TaskClosureFunc) Closed(ctx context.Context, id string) (bool, error) {
+	if f == nil {
+		return false, nil
+	}
+	return f(ctx, id)
+}
+
+// CompletionAudit is the outcome of reconciling a plan with its task result.
+// Complete is true only when every task in the plan is closed and the closure
+// port reported no error. Missing lists the plan tasks that are still open or
+// could not be verified, in plan order. Partial completion is never complete.
+type CompletionAudit struct {
+	Complete bool     `json:"complete"`
+	Missing  []string `json:"missing,omitempty"`
+}
+
+// AuditCompletion reconciles a plan with the result by task list. It is pure:
+// the closure port is the sole source of task state, so the audit opens no
+// files, reads no cards and contacts no hosting service by itself. Plan
+// entries are trimmed and deduplicated in first-seen order; an empty plan is
+// complete. A nil closure treats every task as open. A closure error is
+// returned with an incomplete audit: a task whose state cannot be verified
+// must never unblock a card.
+func AuditCompletion(ctx context.Context, plan []string, closure TaskClosure) (CompletionAudit, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out := CompletionAudit{Missing: []string{}}
+	seen := make(map[string]bool, len(plan))
+	for _, raw := range plan {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		closed := false
+		if closure != nil {
+			var err error
+			closed, err = closure.Closed(ctx, id)
+			if err != nil {
+				out.Missing = append(out.Missing, id)
+				return out, fmt.Errorf("orchestrator: task closure %q: %w", id, err)
+			}
+		}
+		if !closed {
+			out.Missing = append(out.Missing, id)
+		}
+	}
+	out.Complete = len(out.Missing) == 0
+	return out, nil
+}
