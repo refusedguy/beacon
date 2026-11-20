@@ -66,12 +66,30 @@ type WatchReader interface {
 	Watch(id string) (domain.Watch, error)
 }
 
-// OrchestratorNotifier holds the two ports NotifyOrchestrator uses. The
-// deliverer steers a host session; the reader resolves the watch and its
-// subscribers.
+// ConfigOrchestrator is the project-level fallback session id for a Watch that
+// names no orchestrator of its own. The config file belongs to the app layer,
+// so wake receives the value through this port instead of importing it.
+type ConfigOrchestrator func() string
+
+// OrchestratorNotifier holds the ports NotifyOrchestrator uses. The deliverer
+// steers a host session; the reader resolves the Watch and its subscribers.
+// ConfigOrchestrator is consulted only when the Watch itself names no
+// orchestrator: neither a subscriber with role orchestrator nor the persisted
+// OrchestratorID field.
 type OrchestratorNotifier struct {
-	Deliverer domain.WakeDeliverer
-	Watches   WatchReader
+	Deliverer          domain.WakeDeliverer
+	Watches            WatchReader
+	ConfigOrchestrator ConfigOrchestrator
+}
+
+// WithConfigOrchestrator binds the project-level fallback. A nil argument
+// leaves the notifier without one, so a Watch that names no orchestrator is
+// refused instead of steering an arbitrary session.
+func (n *OrchestratorNotifier) WithConfigOrchestrator(fn ConfigOrchestrator) *OrchestratorNotifier {
+	if n != nil {
+		n.ConfigOrchestrator = fn
+	}
+	return n
 }
 
 type notifierKey struct{}
@@ -82,13 +100,43 @@ func WithOrchestratorNotifier(ctx context.Context, n *OrchestratorNotifier) cont
 	return context.WithValue(ctx, notifierKey{}, n)
 }
 
-// OrchestratorSession returns the session id of the orchestrator subscriber on
-// w. Subscriber.ID is the opaque host session id, the same value cibridge
-// passes to a WakeDeliverer. An empty string means there is no such subscriber.
+// OrchestratorSession returns the session id of the orchestrator on w. It
+// prefers the subscriber with role orchestrator and then the persisted
+// OrchestratorID field. Subscriber.ID and OrchestratorID are opaque host
+// session ids, the same value a WakeDeliverer accepts. An empty result means w
+// names no orchestrator; a caller with a config fallback may then use it. An
+// executor subscriber never qualifies, even when it is the only subscriber.
 func OrchestratorSession(w domain.Watch) string {
 	for _, sub := range w.Subscribers {
-		if sub.Role == domain.RoleOrchestrator {
-			return sub.ID
+		if sub.Role == domain.RoleOrchestrator && strings.TrimSpace(sub.ID) != "" {
+			return strings.TrimSpace(sub.ID)
+		}
+	}
+	return strings.TrimSpace(w.OrchestratorID)
+}
+
+// isExecutorSession reports whether id belongs to an executor subscriber of w.
+// It guards against a stale or wrong OrchestratorID that would otherwise steer
+// the blocked notice back to the executor that reported the failed checks.
+func isExecutorSession(w domain.Watch, id string) bool {
+	for _, sub := range w.Subscribers {
+		if sub.Role == domain.RoleExecutor && sub.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveOrchestratorSession returns the one session to steer for w. The order
+// is the orchestrator subscriber, the Watch's OrchestratorID, then the
+// configured fallback. A candidate that also names an executor is skipped.
+func (n *OrchestratorNotifier) ResolveOrchestratorSession(w domain.Watch) string {
+	if id := OrchestratorSession(w); id != "" && !isExecutorSession(w, id) {
+		return id
+	}
+	if n != nil && n.ConfigOrchestrator != nil {
+		if id := strings.TrimSpace(n.ConfigOrchestrator()); id != "" && !isExecutorSession(w, id) {
+			return id
 		}
 	}
 	return ""
@@ -97,8 +145,9 @@ func OrchestratorSession(w domain.Watch) string {
 // NotifyOrchestrator sends reason to the orchestrator of the watch named in p.
 // The reason is trimmed and carried in the verdict field of the identifier-only
 // payload, so the host sees why the executor stopped without any check body.
-// The notifier and both ports must be present in ctx, and the watch must have
-// an orchestrator subscriber.
+// The notifier and both ports must be present in ctx. The target is resolved
+// from the orchestrator subscriber, Watch.OrchestratorID or the configured
+// fallback, in that order.
 func NotifyOrchestrator(ctx context.Context, reason string, p domain.WakePayload) error {
 	n, ok := ctx.Value(notifierKey{}).(*OrchestratorNotifier)
 	if !ok || n == nil {
@@ -115,9 +164,9 @@ func NotifyOrchestrator(ctx context.Context, reason string, p domain.WakePayload
 	if err != nil {
 		return fmt.Errorf("wake: NotifyOrchestrator: watch %s: %w", p.WatchID, err)
 	}
-	sessionID := OrchestratorSession(w)
+	sessionID := n.ResolveOrchestratorSession(w)
 	if sessionID == "" {
-		return fmt.Errorf("wake: NotifyOrchestrator: no orchestrator subscriber on watch %s", p.WatchID)
+		return fmt.Errorf("wake: NotifyOrchestrator: no orchestrator subscriber, Watch.OrchestratorID or configured orchestrator on watch %s", p.WatchID)
 	}
 	msg := p
 	msg.Verdict = text

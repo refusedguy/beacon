@@ -27,6 +27,10 @@ type Bridge struct {
 	waker        domain.WakeDeliverer
 	adapterWaker domain.AdapterWakeDeliverer
 	reader       ReadStamper
+	// orchestratorID is the project-level fallback for a blocked Watch that
+	// carries neither an orchestrator subscriber nor an OrchestratorID field.
+	// It is a port so this package never imports the app config layer.
+	orchestratorID OrchestratorIDSource
 
 	// blockedNotified remembers the obligations whose block wake was already
 	// delivered. A blocked Watch is observed on every tick, so without this
@@ -41,6 +45,21 @@ type Bridge struct {
 // orchestrator confirm that a verdict was actually read, not just observed.
 type ReadStamper interface {
 	StampRead(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error)
+}
+
+// OrchestratorIDSource returns the project-configured orchestrator session.
+// The app layer owns the config file, so Bridge takes the value through this
+// port and stays independent of it.
+type OrchestratorIDSource func() string
+
+// WithOrchestratorIDSource binds the config fallback used by blocked wakes.
+// It is consulted only when a Watch names no orchestrator itself. A nil source
+// leaves such a Watch unsent rather than guessing a recipient.
+func (b *Bridge) WithOrchestratorIDSource(fn OrchestratorIDSource) *Bridge {
+	if b != nil {
+		b.orchestratorID = fn
+	}
+	return b
 }
 
 // WithReader binds the read stamper. It is optional: without one ReadVerdict
@@ -142,7 +161,15 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	observe.PollCycleStart(len(watches))
 	for i := range watches {
 		w := watches[i]
-		if w.Status == domain.StatusClosed || len(w.Subscribers) == 0 {
+		if w.Status == domain.StatusClosed {
+			skipped++
+			continue
+		}
+		// A blocked Watch may carry no subscribers at all and still have an
+		// orchestrator address in its OrchestratorID field or in config. Let
+		// handleBlocked decide; only a live, unblocked Watch with no subscribers
+		// has nobody to wake.
+		if len(w.Subscribers) == 0 && w.Blocked == nil {
 			skipped++
 			continue
 		}
@@ -240,12 +267,64 @@ func blockedNotice(w domain.Watch) string {
 		w.Repo, w.PR, info.Reason, checks, w.ID)
 }
 
+// blockedDefaultAdapter is used when the resolved orchestrator address is not
+// a subscriber on the Watch, so no subscriber record carries an adapter. The
+// host session in OrchestratorID or in config belongs to the same harness.
+const blockedDefaultAdapter = "opencode"
+
+// blockedOrchestrator resolves the one session allowed to receive a blocked
+// notice: the orchestrator subscriber first, then the Watch's persisted
+// OrchestratorID, then the configured fallback. A candidate that also names an
+// executor subscriber is skipped, so a block never steers the executor that
+// reported the failed checks.
+func (b *Bridge) blockedOrchestrator(w domain.Watch) string {
+	candidates := make([]string, 0, 2+len(w.Subscribers))
+	for _, sub := range w.Subscribers {
+		if sub.Role == domain.RoleOrchestrator {
+			candidates = append(candidates, strings.TrimSpace(sub.ID))
+		}
+	}
+	candidates = append(candidates, strings.TrimSpace(w.OrchestratorID))
+	if b != nil && b.orchestratorID != nil {
+		candidates = append(candidates, strings.TrimSpace(b.orchestratorID()))
+	}
+	for _, id := range candidates {
+		if id == "" {
+			continue
+		}
+		isExecutor := false
+		for _, sub := range w.Subscribers {
+			if sub.Role == domain.RoleExecutor && sub.ID == id {
+				isExecutor = true
+				break
+			}
+		}
+		if !isExecutor {
+			return id
+		}
+	}
+	return ""
+}
+
+// blockedAdapter returns the adapter recorded on the resolved session when it
+// is a subscriber of w. The other resolution sources fall back to the default
+// adapter, since they carry only an opaque session id.
+func (b *Bridge) blockedAdapter(w domain.Watch, sessionID string) string {
+	for _, sub := range w.Subscribers {
+		if sub.ID == sessionID && sub.Adapter != "" {
+			return sub.Adapter
+		}
+	}
+	return blockedDefaultAdapter
+}
+
 // handleBlocked observes a blocked Watch. It stages the subscriber obligations
 // at the block revision so get_result can still project a verdict, then steers
-// only the orchestrator subscribers so a FIX agent can be assigned. The
-// executor is deliberately not woken: a blocked Watch is not a retry. The wake
-// is delivered once per block revision; a later unblock clears the Watch and a
-// new block gets a new revision and a new wake.
+// exactly one orchestrator session so a FIX agent can be assigned. The target
+// comes from the orchestrator subscriber, Watch.OrchestratorID or the injected
+// config fallback, in that order. The executor is deliberately not woken: a
+// blocked Watch is not a retry. One notice is delivered per block revision; a
+// later unblock clears the Watch and a new block gets a new revision.
 func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
 	if w.Blocked == nil {
 		return
@@ -264,6 +343,8 @@ func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
 	}
 	w = current
 
+	// Stage one blocked obligation per real subscriber. Delivery does not
+	// happen in this loop, so an executor subscriber is never a wake target.
 	for _, sub := range w.Subscribers {
 		id := domain.ObligationKey(w.ID, w.Revision, sub.ID)
 		if _, err := b.store.Obligation(id); err != nil {
@@ -279,44 +360,70 @@ func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
 				return
 			}
 		}
-		if sub.Role != domain.RoleOrchestrator || (b.waker == nil && b.adapterWaker == nil) {
-			continue
-		}
-
-		b.mu.Lock()
-		if b.blockedNotified == nil {
-			b.blockedNotified = make(map[string]struct{})
-		}
-		_, notified := b.blockedNotified[id]
-		b.mu.Unlock()
-		if notified {
-			observe.WakeSkipped(sub.Adapter, w.ID, "block notice already delivered for this revision")
-			continue
-		}
-
-		p := domain.WakePayload{
-			WatchID:      w.ID,
-			ObligationID: id,
-			Revision:     w.Revision,
-			Verdict:      blockedNotice(w),
-		}
-		var err error
-		if b.adapterWaker != nil {
-			err = b.adapterWaker.Deliver(ctx, sub.Adapter, sub.ID, p)
-		} else {
-			err = b.waker.Deliver(ctx, sub.ID, p)
-		}
-		if err != nil {
-			observe.WakeFailed(sub.Adapter, w.ID, err, w.Revision)
-			observe.ActorError("wake-blocked", w.ID, err)
-			log.Printf("cibridge: blocked wake %s: %v", sub.ID, err)
-			continue
-		}
-		observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
-		b.mu.Lock()
-		b.blockedNotified[id] = struct{}{}
-		b.mu.Unlock()
 	}
+
+	sessionID := b.blockedOrchestrator(w)
+	if sessionID == "" {
+		observe.WakeSkipped("", w.ID, "blocked Watch has no orchestrator address")
+		return
+	}
+	if b.waker == nil && b.adapterWaker == nil {
+		return
+	}
+
+	// The guard is per revision, not per subscriber: a blocked Watch must
+	// steer its orchestrator at most once even when the address was resolved
+	// from a different source on a later tick.
+	noticeKey := fmt.Sprintf("blocked:%s:%d", w.ID, w.Revision)
+	b.mu.Lock()
+	if b.blockedNotified == nil {
+		b.blockedNotified = make(map[string]struct{})
+	}
+	_, notified := b.blockedNotified[noticeKey]
+	b.mu.Unlock()
+	if notified {
+		observe.WakeSkipped("", w.ID, "block notice already delivered for this revision")
+		return
+	}
+
+	obligationID := domain.ObligationKey(w.ID, w.Revision, sessionID)
+	if _, err := b.store.Obligation(obligationID); err != nil {
+		if err := b.store.SaveObligation(domain.Obligation{
+			ID:             obligationID,
+			WatchID:        w.ID,
+			Revision:       w.Revision,
+			SubscriberID:   sessionID,
+			VerdictPointer: domain.VerdictBlocked,
+			StagedAt:       now,
+		}); err != nil {
+			log.Printf("cibridge: blocked obligation %s: %v", obligationID, err)
+			return
+		}
+	}
+
+	adapter := b.blockedAdapter(w, sessionID)
+	p := domain.WakePayload{
+		WatchID:      w.ID,
+		ObligationID: obligationID,
+		Revision:     w.Revision,
+		Verdict:      blockedNotice(w),
+	}
+	var deliverErr error
+	if b.adapterWaker != nil {
+		deliverErr = b.adapterWaker.Deliver(ctx, adapter, sessionID, p)
+	} else {
+		deliverErr = b.waker.Deliver(ctx, sessionID, p)
+	}
+	if deliverErr != nil {
+		observe.WakeFailed(adapter, w.ID, deliverErr, w.Revision)
+		observe.ActorError("wake-blocked", w.ID, deliverErr)
+		log.Printf("cibridge: blocked wake %s: %v", sessionID, deliverErr)
+		return
+	}
+	observe.WakeDelivered(adapter, w.ID, w.Revision)
+	b.mu.Lock()
+	b.blockedNotified[noticeKey] = struct{}{}
+	b.mu.Unlock()
 }
 
 // fixForSource is an optional capability a Store may implement to expose the

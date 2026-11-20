@@ -238,13 +238,16 @@ const (
 // BlockedWatch is the block record written by a blocked:not_mine ack. Reason is
 // the machine-readable verdict class, FailedChecks comes from the Watch at the
 // moment of the ack, Since is the ack time and BlockedBy is the opaque session
-// ID from _meta. The record is never rebuilt from client supplied data.
+// ID from _meta. OrchestratorID is the parent session already persisted on the
+// Watch; cibridge uses it to steer the blocked notice when the Watch has no
+// orchestrator subscriber. The record is never rebuilt from client data.
 type BlockedWatch struct {
-	WatchID      string        `json:"watchID"`
-	Reason       string        `json:"reason"`
-	FailedChecks []FailedCheck `json:"failedChecks"`
-	Since        time.Time     `json:"since"`
-	BlockedBy    string        `json:"blockedBy"`
+	WatchID        string        `json:"watchID"`
+	Reason         string        `json:"reason"`
+	FailedChecks   []FailedCheck `json:"failedChecks"`
+	Since          time.Time     `json:"since"`
+	BlockedBy      string        `json:"blockedBy"`
+	OrchestratorID string        `json:"orchestratorID,omitempty"`
 }
 
 // BlockedRegistry keeps one block record per Watch. The first block wins: a
@@ -572,11 +575,12 @@ func (h *AckHandler) applyBlockedDecision(in AckInput, w domain.Watch, reason, s
 		return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: blocked registry is nil")
 	}
 	rec := BlockedWatch{
-		WatchID:      in.WatchID,
-		Reason:       reason,
-		FailedChecks: collectFailedChecks(w),
-		Since:        h.clock.Now(),
-		BlockedBy:    sessionID,
+		WatchID:        in.WatchID,
+		Reason:         reason,
+		FailedChecks:   collectFailedChecks(w),
+		Since:          h.clock.Now(),
+		BlockedBy:      sessionID,
+		OrchestratorID: w.OrchestratorID,
 	}
 	rec, applied := h.blocked.Block(in.WatchID, rec)
 	if !applied {
