@@ -72,6 +72,10 @@ Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Искл�
 - `internal/app` не импортирует `internal/domain`.
 - `cmd/beacon`: без `os.ReadFile`, `os.WriteFile`, `net/http`, `os/exec`.
 
+## Аналоги скиллов Harbor
+
+`aif-review` соответствует локальным `code-review` и `pr`. `aif-fix` соответствует `diagnosing-bugs` и `tdd`. Таблица со статусами лежит в `README.md` в разделе «Функциональные аналоги Harbor-скиллов». Точных совпадений имён нет (ADR 0253), поэтому ищи аналог по обязанности, а не по названию.
+
 ## После сжатия
 
 Плагин держит ключ `beacon/survival-rules` в instructions. Ключ стабильный, перезаписывается на старте и на хуке `compaction`. Правила выпали из контекста, читай ключ, а не гадай.
