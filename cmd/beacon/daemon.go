@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app/notify"
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
@@ -97,6 +101,74 @@ func daemonWakeRoute(deliver wake.TargetDeliverer) orchestrator.WakeRoute {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Session heartbeat (WIRING-488)
+// ---------------------------------------------------------------------------
+
+// sessionHeartbeater is the slice of the durable session registry the daemon
+// uses. The app-layer *session.SessionRegistry satisfies it; tests install a
+// recorder to assert the Touch call without a real store.
+type sessionHeartbeater interface {
+	Heartbeat(id string) error
+}
+
+// daemonHeartbeatInterval is how often a running daemon marks its session
+// alive in the durable registry. It is a variable so a test can shorten it.
+var daemonHeartbeatInterval = 30 * time.Second
+
+// daemonHeartbeat marks one session alive. This is the single call that binds
+// the daemon cycle to the durable session registry: Heartbeat moves last_seen
+// through the store's Touch. An empty id or a missing port is skipped, so a
+// daemon without a bound orchestrator session simply does nothing here.
+func daemonHeartbeat(hb sessionHeartbeater, sessionID string) error {
+	id := strings.TrimSpace(sessionID)
+	if hb == nil || id == "" {
+		return nil
+	}
+	return hb.Heartbeat(id)
+}
+
+// newDaemonSessionRegistry adapts the daemon's already-open store handle to
+// the session registry. It opens no second connection and owns no schema.
+func newDaemonSessionRegistry(db *store.DB) *session.SessionRegistry {
+	return session.NewSessionRegistry(db)
+}
+
+// ensureDaemonSession records the daemon's own session in the durable registry
+// so the periodic Heartbeat has a row to touch. An existing row is left alone,
+// so a session started elsewhere keeps its metadata and status.
+func ensureDaemonSession(reg *session.SessionRegistry, sessionID string) error {
+	id := strings.TrimSpace(sessionID)
+	if reg == nil || id == "" {
+		return nil
+	}
+	if _, found, err := reg.Resume(id); err != nil || found {
+		return err
+	}
+	return reg.Start(id, store.SessionStatusActive, nil)
+}
+
+// runDaemonHeartbeat ticks until ctx is done and calls daemonHeartbeat on each
+// tick. A registry failure is logged and never stops the daemon cycle. An
+// interval that is not positive falls back to daemonHeartbeatInterval.
+func runDaemonHeartbeat(ctx context.Context, hb sessionHeartbeater, sessionID string, interval time.Duration) {
+	if interval <= 0 {
+		interval = daemonHeartbeatInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := daemonHeartbeat(hb, sessionID); err != nil {
+				observe.ActorError("session-heartbeat", "", err)
+			}
+		}
+	}
+}
+
 // runDaemon implements `beacon daemon [--interval 3m] [--once]`. It runs the
 // same single cibridge cycle `beacon mcp` uses, under the same non-blocking
 // poller lock, so starting both processes cannot produce duplicate wakes.
@@ -127,6 +199,15 @@ func runDaemon(c *CLI, args []string) int {
 	}
 	defer func() { _ = db.Close() }()
 
+	// The daemon marks its bound orchestrator session alive in the durable
+	// registry while it runs (WIRING-488). It reuses the store handle opened
+	// above, so no second connection is created.
+	sessionID := strings.TrimSpace(os.Getenv(sessionIDEnv))
+	hb := newDaemonSessionRegistry(db)
+	if err := ensureDaemonSession(hb, sessionID); err != nil {
+		fmt.Fprintf(c.errOut, "beacon daemon: session registry: %v\n", err)
+	}
+
 	ghBatch := newGitHubBatch(ctx, c)
 	deps := buildMCPDependencies(db, dir, ghBatch.provider.PointStats)
 	cfg := reconcileConfig{
@@ -141,6 +222,9 @@ func runDaemon(c *CLI, args []string) int {
 	}
 
 	if *once {
+		if err := daemonHeartbeat(hb, sessionID); err != nil {
+			fmt.Fprintf(c.errOut, "beacon daemon: heartbeat: %v\n", err)
+		}
 		ReconcilePass(ctx, cfg)
 		return 0
 	}
@@ -151,6 +235,14 @@ func runDaemon(c *CLI, args []string) int {
 		return 2
 	}
 	defer stopLoop()
+
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		runDaemonHeartbeat(ctx, hb, sessionID, daemonHeartbeatInterval)
+	}()
+	defer func() { <-hbDone }()
+
 	<-ctx.Done()
 	return 0
 }
