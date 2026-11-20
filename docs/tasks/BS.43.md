@@ -1,5 +1,5 @@
 # BS.43. MCP HTTP endpoint /mcp
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/server/mcp.go

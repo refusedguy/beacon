@@ -1,5 +1,5 @@
 # BS.63. Сценарий ночной смены как воркер
-Статус: todo
+Статус: done
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/tasks/night_shift.go

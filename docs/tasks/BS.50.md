@@ -1,5 +1,5 @@
 # BS.50. Аудит через API
-Статус: todo
+Статус: done
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/server/api_audit.go

@@ -1,5 +1,5 @@
 # BS.12. Outbox в транзакции команды
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/command/processor.go, internal/infra/store/outbox.go

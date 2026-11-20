@@ -1,5 +1,5 @@
 # BS.1. Single-instance lease и pidfile
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/server.go, internal/infra/server/lifecycle.go

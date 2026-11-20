@@ -1,5 +1,5 @@
 # BS.40. WS gateway как альтернатива SSE
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/server/ws.go

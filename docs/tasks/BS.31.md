@@ -1,5 +1,5 @@
 # BS.31. Cron-проверки карточек и дедлайнов
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/scheduler/card_check.go

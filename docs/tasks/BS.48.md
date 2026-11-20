@@ -1,5 +1,5 @@
 # BS.48. Локальный NDJSON trace file
-Статус: todo
+Статус: done
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/otel/local.go

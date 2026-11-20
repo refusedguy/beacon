@@ -1,5 +1,5 @@
 # BS.2. HTTP listener loopback плюс bearer token
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/http.go

@@ -1,5 +1,5 @@
 # BS.35. /api/v1 задачи и карточки
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/server/api_tasks.go

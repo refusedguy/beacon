@@ -1,5 +1,5 @@
 # BS.49. Атрибуты метрик низкой кардинальности
-Статус: todo
+Статус: done
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/server/metrics.go

@@ -1,5 +1,5 @@
 # BS.52. Docs guard чисел архитектуры
-Статус: todo
+Статус: done
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/server/docsguard.go

@@ -1,5 +1,5 @@
 # BS.29. Привязка фоновой задачи к чату
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/scheduler/binding.go

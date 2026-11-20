@@ -1,5 +1,5 @@
 # BS.17. SSE реплей без разрыва
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/server/events.go

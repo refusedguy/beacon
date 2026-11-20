@@ -1,5 +1,5 @@
 # BS.18. Снимки и pruned-through sequence
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/snapshots.go

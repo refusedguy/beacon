@@ -1,5 +1,5 @@
 # BS.34. /api/v1 проекции вотчей
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/server/api_watches.go

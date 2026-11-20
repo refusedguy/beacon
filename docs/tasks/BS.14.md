@@ -1,5 +1,5 @@
 # BS.14. Пул EffectWorker с lease и heartbeat
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/worker/effect.go, internal/infra/store/outbox.go

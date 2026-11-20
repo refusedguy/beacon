@@ -1,5 +1,5 @@
 # BS.51. Контроль footprint меньше 100 MB
-Статус: todo
+Статус: done
 Фаза: P4
 Тип: task
 Владелец файлов: internal/infra/server/metrics.go, internal/infra/store/observability.go

@@ -1,5 +1,5 @@
 # BS.37. /api/v1 wake и вопросы
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/server/api_wake.go

@@ -1,5 +1,5 @@
 # BS.42. MCP stdio как тонкий клиент сервера
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: cmd/beacon/mcp.go, internal/infra/mcp/client.go
