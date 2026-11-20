@@ -1,6 +1,6 @@
 # BS.4. /version и /status проекции
 Статус: done
-Обоснование: функциональность уже в main. GET /api/v1/health в internal/infra/httpapi/server.go отдаёт version, uptimeSec, isPollerOwner (состояние lease), pid и projectKey; GET /api/v1/snapshot отдаёт LiveWatches (число активных вотчей) и метрики. Оба маршрута объявлены GET в docs/api/openapi.yaml и не пишут в БД, приёмка «только для чтения» выполнена. beacon_stats в internal/infra/mcp/tool_stats.go читает Version и ActiveWatches без записи. Дубля в OwnerFiles internal/infra/server/http.go нет, код не писался.
+Обоснование: функциональность уже в main (PR #615, commit 7994bcc; карточка переведена в done этим же PR). GET /api/v1/health в internal/infra/httpapi/server.go отдаёт version, uptimeSec, isPollerOwner (состояние lease), pid и projectKey; GET /api/v1/snapshot отдаёт LiveWatches (число активных вотчей) и метрики. Оба маршрута объявлены GET в docs/api/openapi.yaml и не пишут в БД, приёмка «только для чтения» выполнена. beacon_stats в internal/infra/mcp/tool_stats.go читает Version и ActiveWatches без записи. Дубля в OwnerFiles internal/infra/server/http.go нет, код не писался.
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/http.go
