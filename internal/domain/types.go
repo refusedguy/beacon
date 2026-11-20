@@ -118,12 +118,15 @@ type Subscriber struct {
 // BlockedInfo records why a Watch is blocked, which checks failed, when the
 // block started and which actor or rule set it. It is stored as JSON on the
 // Watch, so a legacy payload without the field decodes to nil and needs no
-// schema migration.
+// schema migration. FixAttempts counts the FIX agents already spawned for this
+// block. It lives on the block record, so an unblock that clears Blocked also
+// resets the budget and the next block starts from zero.
 type BlockedInfo struct {
 	Reason       string    `json:"reason"`
 	FailedChecks []string  `json:"failedChecks,omitempty"`
 	Since        time.Time `json:"since"`
 	BlockedBy    string    `json:"blockedBy"`
+	FixAttempts  int       `json:"fixAttempts,omitempty"`
 }
 
 // Watch is the unit of work. Optional fields use the Go zero value when absent.
@@ -153,6 +156,22 @@ type Watch struct {
 	CreatedAt      time.Time        `json:"createdAt"`
 	ClosedAt       time.Time        `json:"closedAt"`
 	CloseReason    string           `json:"closeReason"`
+}
+
+// RecordFixAttempt returns a copy of w with one more FIX agent recorded for
+// the current block. A fixer is only spawned for a blocked Watch, so the call
+// is a no-op when w has no Blocked record. The caller persists the returned
+// Watch. The copy shares no BlockedInfo with w, so later caller mutation of
+// the original cannot change the recorded count.
+func (w Watch) RecordFixAttempt() Watch {
+	if w.Blocked == nil {
+		return w
+	}
+	next := w
+	blocked := *w.Blocked
+	blocked.FixAttempts++
+	next.Blocked = &blocked
+	return next
 }
 
 // Attempt is one recorded delivery try for an Obligation.

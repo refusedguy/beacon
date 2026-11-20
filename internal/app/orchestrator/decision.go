@@ -27,12 +27,26 @@ const (
 	DecisionNotifyOrchestrator DecisionKind = "NOTIFY_ORCHESTRATOR"
 )
 
+const (
+	// MaxFixAttempts caps how many FIX agents may be spawned for one blocked
+	// Watch. The cap is per block: an unblock clears the block record and the
+	// next block starts from zero.
+	MaxFixAttempts = 3
+	// ReasonEscalateHuman is the NOTIFY_ORCHESTRATOR reason returned once the
+	// fix-attempt cap is reached. The orchestrator gets an escalation ping
+	// instead of a request to spawn another FIX agent.
+	ReasonEscalateHuman = "escalate_human"
+)
+
 // BlockedInfo is why an executor blocked a Watch. It mirrors the domain block
 // details without importing domain types into this package (ADR 0005).
+// FixAttempts counts FIX agents already spawned for this block. It is stored
+// on the block record so clearing the block on unblock also resets it.
 type BlockedInfo struct {
 	Reason       string   `json:"reason"`
 	FailedChecks []string `json:"failedChecks,omitempty"`
 	BlockedBy    string   `json:"blockedBy,omitempty"`
+	FixAttempts  int      `json:"fixAttempts,omitempty"`
 }
 
 // DependencyResolverFunc adapts a function to the DependencyResolver contract
@@ -74,8 +88,10 @@ type Decision struct {
 // one Decision. It has no side effects: the caller owns the merge ledger and
 // the wake delivery. Priority is fixed and does not depend on field order:
 //
-//  1. a blocked Watch always goes to the FIX agent, even if its verdict still
-//     reads ready or a dependency is outstanding;
+//  1. a blocked Watch goes to the FIX agent, even if its verdict still reads
+//     ready or a dependency is outstanding. Once MaxFixAttempts FIX agents
+//     have been spawned for that block, the Watch is escalated to a human
+//     with NOTIFY_ORCHESTRATOR instead of asking for another FIX agent;
 //  2. unsatisfied waitFor/waitForMain refs hold the merge and list the refs;
 //  3. ready plus auto-merge merges;
 //  4. retry goes back to the executor;
@@ -84,10 +100,15 @@ func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 	d := Decision{WatchID: w.ID, PR: w.PR, Revision: w.Revision}
 
 	if w.Blocked != nil {
-		d.Kind = DecisionBlockedFixAgent
-		d.Reason = w.Blocked.Reason
 		d.BlockedBy = w.Blocked.BlockedBy
 		d.FailedChecks = append([]string(nil), w.Blocked.FailedChecks...)
+		if w.Blocked.FixAttempts >= MaxFixAttempts {
+			d.Kind = DecisionNotifyOrchestrator
+			d.Reason = ReasonEscalateHuman
+			return d
+		}
+		d.Kind = DecisionBlockedFixAgent
+		d.Reason = w.Blocked.Reason
 		return d
 	}
 

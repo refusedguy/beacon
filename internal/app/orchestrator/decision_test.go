@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -277,5 +278,87 @@ func TestDecideDoesNotMutateInputs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(policy.WaitFor, []string{"dep:a"}) {
 		t.Fatalf("policy mutated: %+v", policy)
+	}
+}
+
+// TestDecideFixAttemptCap proves the loop breaker: the first three fix attempts
+// still ask for a FIX agent, the next request escalates to a human.
+func TestDecideFixAttemptCap(t *testing.T) {
+	for _, attempts := range []int{0, 1, 2, 3, 4} {
+		t.Run(fmt.Sprintf("attempts=%d", attempts), func(t *testing.T) {
+			w := decisionWatch(nil)
+			w.Blocked = &BlockedInfo{
+				Reason:       "чужой тест",
+				FailedChecks: []string{"ci-build"},
+				BlockedBy:    "executor",
+				FixAttempts:  attempts,
+			}
+
+			got := Decide(w, nil, CIState{})
+
+			if got.WatchID != w.ID || got.PR != w.PR || got.Revision != w.Revision {
+				t.Fatalf("identity = %q/%d/%d", got.WatchID, got.PR, got.Revision)
+			}
+			if attempts < MaxFixAttempts {
+				if got.Kind != DecisionBlockedFixAgent {
+					t.Fatalf("attempts=%d: kind = %q, want %q", attempts, got.Kind, DecisionBlockedFixAgent)
+				}
+				if got.Reason != "чужой тест" {
+					t.Fatalf("attempts=%d: reason = %q, want block reason", attempts, got.Reason)
+				}
+				return
+			}
+			if got.Kind != DecisionNotifyOrchestrator {
+				t.Fatalf("attempts=%d: kind = %q, want %q", attempts, got.Kind, DecisionNotifyOrchestrator)
+			}
+			if got.Reason != ReasonEscalateHuman {
+				t.Fatalf("attempts=%d: reason = %q, want %q", attempts, got.Reason, ReasonEscalateHuman)
+			}
+			if got.BlockedBy != "executor" || !reflect.DeepEqual(got.FailedChecks, []string{"ci-build"}) {
+				t.Fatalf("escalation lost block context: %+v", got)
+			}
+		})
+	}
+}
+
+// TestDecideFixAttemptsArePerWatch proves the cap is not shared state: an
+// escalated Watch never changes the decision for a different Watch.
+func TestDecideFixAttemptsArePerWatch(t *testing.T) {
+	exhausted := decisionWatch(nil)
+	exhausted.ID = "watch:exhausted"
+	exhausted.Blocked = &BlockedInfo{Reason: "чужой тест", FixAttempts: MaxFixAttempts}
+	fresh := decisionWatch(nil)
+	fresh.ID = "watch:fresh"
+	fresh.Blocked = &BlockedInfo{Reason: "чужой тест"}
+
+	first := Decide(exhausted, nil, CIState{})
+	second := Decide(fresh, nil, CIState{})
+	again := Decide(exhausted, nil, CIState{})
+
+	if first.Kind != DecisionNotifyOrchestrator || first.Reason != ReasonEscalateHuman {
+		t.Fatalf("exhausted watch = %+v", first)
+	}
+	if second.Kind != DecisionBlockedFixAgent {
+		t.Fatalf("fresh watch = %+v", second)
+	}
+	if again.Kind != DecisionNotifyOrchestrator || again.Reason != ReasonEscalateHuman {
+		t.Fatalf("repeated decision changed: %+v", again)
+	}
+}
+
+// TestDecideUnblockedWatchNeverEscalates models the post-unblock Watch: the
+// block record is cleared, so no fix-attempt budget is consulted and the Watch
+// follows the normal ready path again.
+func TestDecideUnblockedWatchNeverEscalates(t *testing.T) {
+	w := decisionWatch(nil)
+	w.Blocked = nil
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionMerge {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionMerge)
+	}
+	if got.Reason == ReasonEscalateHuman {
+		t.Fatalf("unblocked Watch escalated: %+v", got)
 	}
 }
