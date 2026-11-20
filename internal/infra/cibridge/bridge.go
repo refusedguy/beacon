@@ -1570,7 +1570,7 @@ func (b *Bridge) markInWorkStalled(ctx context.Context, w domain.Watch, sub doma
 		now.UTC().Format(time.RFC3339), w.ID, sub.ID, b.inWorkTimeout, w.Revision)
 	b.appendEscalation(line)
 	observe.Event(observe.LevelInfo, observe.OrphanEscalated, observe.Fields{
-		FieldWatchID: w.ID, "subscriberID": sub.ID, "sessionID": sessionID, FieldReason: "in_work_stall",
+		observe.FieldWatchID: w.ID, "subscriberID": sub.ID, "sessionID": sessionID, observe.FieldReason: "in_work_stall",
 	})
 	b.cycleEvent(cycleID, "in_work_stall", observe.Fields{
 		"watchID": w.ID, "subscriberID": sub.ID, "sessionID": sessionID, "revision": w.Revision,
