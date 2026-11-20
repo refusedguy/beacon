@@ -465,6 +465,109 @@ func TestCloseKeepsForeignConnectionFile(t *testing.T) {
 	_ = os.Remove(path)
 }
 
+type historyProvider struct {
+	stubProvider
+	history SnapshotHistory
+	err     error
+}
+
+func (p historyProvider) SnapshotHistory(context.Context) (SnapshotHistory, error) {
+	return p.history, p.err
+}
+
+func getSnapshotBody(t *testing.T, srv *Server) (int, []byte) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/snapshot", nil)))
+	return w.Code, w.Body.Bytes()
+}
+
+func TestSnapshotIncludesOptionalHistory(t *testing.T) {
+	closedAt := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	history := SnapshotHistory{
+		RecentWatches: []WatchHistory{
+			{ID: "w1", Repo: "refusedguy/beacon", PR: 7, HeadSHA: "abc", Outcome: OutcomeMerged, ClosedAt: closedAt},
+			{ID: "w2", Repo: "refusedguy/beacon", PR: 8, HeadSHA: "def", Outcome: OutcomeEscalated, ClosedAt: closedAt.Add(-time.Hour), CloseReason: "timeout"},
+		},
+		HourlyStats: HourlyStats{Points: 12, Merges: 3, Blockers: 1},
+	}
+	srv := newTestServer(t, historyProvider{history: history}, &stubSink{}, NewEventBus(0))
+
+	status, body := getSnapshotBody(t, srv)
+	if status != http.StatusOK {
+		t.Fatalf("snapshot status = %d, body %s", status, body)
+	}
+	var snap Snapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.RecentWatches) != 2 || snap.RecentWatches[0].Outcome != OutcomeMerged || snap.RecentWatches[1].Outcome != OutcomeEscalated {
+		t.Fatalf("recentWatches = %+v", snap.RecentWatches)
+	}
+	if snap.HourlyStats == nil || *snap.HourlyStats != history.HourlyStats {
+		t.Fatalf("hourlyStats = %+v", snap.HourlyStats)
+	}
+}
+
+func TestSnapshotCapsHistoryAtThirty(t *testing.T) {
+	watches := make([]WatchHistory, maxRecentWatches+5)
+	for i := range watches {
+		watches[i] = WatchHistory{ID: fmt.Sprintf("w%d", i), Outcome: OutcomeClosed}
+	}
+	srv := newTestServer(t, historyProvider{history: SnapshotHistory{RecentWatches: watches}}, &stubSink{}, NewEventBus(0))
+
+	_, body := getSnapshotBody(t, srv)
+	var snap Snapshot
+	if err := json.Unmarshal(body, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.RecentWatches) != maxRecentWatches {
+		t.Fatalf("recentWatches length = %d, want %d", len(snap.RecentWatches), maxRecentWatches)
+	}
+	if snap.RecentWatches[0].ID != "w0" || snap.RecentWatches[maxRecentWatches-1].ID != fmt.Sprintf("w%d", maxRecentWatches-1) {
+		t.Fatalf("history was not truncated from the front: %+v", snap.RecentWatches)
+	}
+}
+
+func TestSnapshotHistoryFailureBecomesLoadError(t *testing.T) {
+	srv := newTestServer(t, historyProvider{err: errors.New("store locked")}, &stubSink{}, NewEventBus(0))
+
+	status, body := getSnapshotBody(t, srv)
+	if status != http.StatusOK {
+		t.Fatalf("snapshot status = %d, body %s", status, body)
+	}
+	var snap struct {
+		RecentWatches []WatchHistory `json:"recentWatches"`
+		HourlyStats   *HourlyStats   `json:"hourlyStats"`
+		LoadErrors    []string       `json:"loadErrors"`
+	}
+	if err := json.Unmarshal(body, &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.LoadErrors) != 1 || !strings.Contains(snap.LoadErrors[0], "history: store locked") {
+		t.Fatalf("loadErrors = %v", snap.LoadErrors)
+	}
+	if snap.RecentWatches != nil || snap.HourlyStats != nil {
+		t.Fatalf("history fields present after failure: %+v / %+v", snap.RecentWatches, snap.HourlyStats)
+	}
+}
+
+func TestSnapshotWithoutHistoryKeepsOldShape(t *testing.T) {
+	srv := newTestServer(t, stubProvider{}, &stubSink{}, NewEventBus(0))
+
+	_, body := getSnapshotBody(t, srv)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["recentWatches"]; ok {
+		t.Fatal("recentWatches present without a history provider")
+	}
+	if _, ok := raw["hourlyStats"]; ok {
+		t.Fatal("hourlyStats present without a history provider")
+	}
+}
+
 func TestStartGeneratesRandomToken(t *testing.T) {
 	firstDir, secondDir := t.TempDir(), t.TempDir()
 	first, err := Start(Config{StateDir: firstDir, Provider: stubProvider{}, Sink: &stubSink{}})
