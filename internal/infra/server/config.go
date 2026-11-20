@@ -33,10 +33,10 @@ const (
 	beaconStateName = "beacon"
 )
 
-// Config holds the resolved server settings. Timeouts use time.Duration so a
+// ServerConfig holds the resolved server settings. Timeouts use time.Duration so a
 // caller can pass them to http.Server and the shutdown context without parsing
 // strings again.
-type Config struct {
+type ServerConfig struct {
 	Addr              string        `json:"addr" yaml:"addr"`
 	StateDir          string        `json:"stateDir" yaml:"stateDir"`
 	ReadHeaderTimeout time.Duration `json:"readHeaderTimeout" yaml:"readHeaderTimeout"`
@@ -59,12 +59,12 @@ func DefaultStateDir() (string, error) {
 }
 
 // DefaultConfig returns the built-in settings without reading a file.
-func DefaultConfig() (Config, error) {
+func DefaultConfig() (ServerConfig, error) {
 	dir, err := DefaultStateDir()
 	if err != nil {
-		return Config{}, err
+		return ServerConfig{}, err
 	}
-	return Config{
+	return ServerConfig{
 		Addr:              DefaultAddr,
 		StateDir:          dir,
 		ReadHeaderTimeout: DefaultReadHeaderTimeout,
@@ -79,25 +79,25 @@ func DefaultConfig() (Config, error) {
 // empty file does the same. An empty path skips the file layer. A file with an
 // unknown key, a malformed line, a bad duration, an invalid address or an empty
 // state dir is an error. Load validates the merged result before returning it.
-func Load(path string) (Config, error) {
+func Load(path string) (ServerConfig, error) {
 	cfg, err := DefaultConfig()
 	if err != nil {
-		return Config{}, err
+		return ServerConfig{}, err
 	}
 	if strings.TrimSpace(path) != "" {
 		if err := applyFile(&cfg, path); err != nil {
-			return Config{}, err
+			return ServerConfig{}, err
 		}
 	}
 	if err := cfg.Validate(); err != nil {
-		return Config{}, err
+		return ServerConfig{}, err
 	}
 	return cfg, nil
 }
 
 // Validate checks the effective settings. Load calls it, and a caller that
-// builds a Config by hand can call it too.
-func (c Config) Validate() error {
+// builds a ServerConfig by hand can call it too.
+func (c ServerConfig) Validate() error {
 	if err := validateAddr(c.Addr); err != nil {
 		return fmt.Errorf("server config: %w", err)
 	}
@@ -120,7 +120,7 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func applyFile(cfg *Config, path string) error {
+func applyFile(cfg *ServerConfig, path string) error {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -192,7 +192,7 @@ func normalizeKey(key string) string {
 	return replacer.Replace(strings.ToLower(strings.TrimSpace(key)))
 }
 
-func applyKey(cfg *Config, path string, line int, key, value string) error {
+func applyKey(cfg *ServerConfig, path string, line int, key, value string) error {
 	switch normalizeKey(key) {
 	case "addr":
 		if err := validateAddr(value); err != nil {

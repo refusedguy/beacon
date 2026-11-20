@@ -17,7 +17,7 @@ func writeConfigFile(t *testing.T, body string) string {
 	return path
 }
 
-func wantDefaultConfig(t *testing.T) Config {
+func wantDefaultConfig(t *testing.T) ServerConfig {
 	t.Helper()
 	cfg, err := DefaultConfig()
 	if err != nil {
@@ -78,7 +78,7 @@ func TestLoadExplicitValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q): %v", path, err)
 	}
-	want := Config{
+	want := ServerConfig{
 		Addr:              "127.0.0.1:9090",
 		StateDir:          state,
 		ReadHeaderTimeout: 2 * time.Second,
@@ -159,7 +159,7 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 }
 
 func TestValidateRejectsZeroDuration(t *testing.T) {
-	cfg := Config{
+	cfg := ServerConfig{
 		Addr:              DefaultAddr,
 		StateDir:          filepath.Join(t.TempDir(), "state"),
 		ReadHeaderTimeout: time.Second,
