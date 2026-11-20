@@ -12,6 +12,27 @@
 | watchID | ответ `beacon_watch_pr` | ключ ожидания и отчёта |
 | verdict | `beacon_get_result` | решение о пробуждении |
 
+## Единый конфиг путей артефактов
+
+Исполнитель берёт пути артефактов из одного источника. Это `.beacon/config.yaml`, секция `paths`. Harbor делает так же в `.ai-factory/config.yaml`: там заданы `paths` и `language`. Путь, записанный в двух местах, проваливает карточку HD-052. Исполнитель не придумывает путь и не копирует его из другой карточки. Он читает значение из конфига.
+
+Схема beacon-struct config для путей:
+
+| Ключ | Дефолт | Назначение |
+| --- | --- | --- |
+| `paths.docs` | `docs` | документация и ADR |
+| `paths.tasks` | `docs/tasks` | карточки задач |
+| `paths.evals` | `evals` | eval-артефакты |
+
+Конфиг содержит структуру `paths` с этими тремя полями. Неизвестный ключ или пустое значение даёт ошибку. Если файл отсутствует, действуют дефолты из таблицы. Языковые ключи `language.ui`, `language.artifacts` и `language.technical_terms` лежат в том же конфиге рядом с `paths` и описаны в HD-053.
+
+<!-- executor-task:artifact-paths
+source: .beacon/config.yaml
+section: paths
+keys: docs, tasks, evals
+scattered-paths: fail
+executor-task:artifact-paths -->
+
 ## Цикл: register, push PR, finish turn
 
 1. **register.** Вызвать `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"` или `"fixer"` и `notify: { adapter: "opencode", target: "<ses_...>" }`. В `target` идёт РЕАЛЬНЫЙ идентификатор сессии из `_meta["ai.opencode/sessionID"]` или явно переданный `ses_...`. Значение `<cardID>` в `target` запрещено: wake будет доставлен не туда. Повторный вызов с теми же параметрами идемпотентен. Один агент может держать несколько Watch.
