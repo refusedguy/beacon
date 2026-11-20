@@ -246,6 +246,7 @@ type scopeTokenRecord struct {
 	issuedAt  time.Time
 	expiresAt time.Time
 	lastUsed  time.Time
+	idleTTL   time.Duration
 }
 
 // scopeWallClock adapts the wall clock to domain.Clock.
@@ -314,6 +315,7 @@ func (s *ScopeTokenStore) Issue(in ScopeTokenIssue) (string, error) {
 		issuedAt:  now,
 		expiresAt: now.Add(ttl),
 		lastUsed:  now,
+		idleTTL:   idleTTL,
 	}
 	if s.bySession[in.Binding.Session] == nil {
 		s.bySession[in.Binding.Session] = make(map[string]struct{})
@@ -339,7 +341,7 @@ func (s *ScopeTokenStore) Authorize(raw string, scope domain.Scope, session stri
 		s.dropLocked(digest)
 		return ScopeBinding{}, ErrScopeTokenExpired
 	}
-	if now.Sub(rec.lastUsed) >= s.idleTTL {
+	if now.Sub(rec.lastUsed) >= rec.idleTTL {
 		s.dropLocked(digest)
 		return ScopeBinding{}, ErrScopeTokenIdle
 	}
