@@ -66,11 +66,78 @@ var contractTools = []string{
 	"beacon_stats",
 }
 
+// evalStatus задаёт трёхзначный статус проверки (ADR 0301). WARN и FAIL не равны:
+// WARN не удерживает прогон от зелёного выхода, FAIL удерживает.
+type evalStatus string
+
+const (
+	statusPass evalStatus = "pass"
+	statusWarn evalStatus = "warn"
+	statusFail evalStatus = "fail"
+)
+
+// statusOf сводит проверку с двумя исходами к PASS или FAIL. Проверки с принятым
+// пропуском или неблокирующим замечанием задают WARN явно через recordStatus.
+func statusOf(ok bool) evalStatus {
+	if ok {
+		return statusPass
+	}
+	return statusFail
+}
+
+// blocks сообщает, удерживает ли статус прогон от успешного выхода. PASS и WARN
+// не блокируют, FAIL и неизвестное значение блокируют.
+func (s evalStatus) blocks() bool {
+	return s != statusPass && s != statusWarn
+}
+
+// label возвращает подпись статуса для колонки STATUS таблицы.
+func (s evalStatus) label() string {
+	switch s {
+	case statusPass:
+		return "PASS"
+	case statusWarn:
+		return "WARN"
+	case statusFail:
+		return "FAIL"
+	default:
+		return "FAIL"
+	}
+}
+
 type evalResult struct {
 	name     string
 	expected string
 	actual   string
-	pass     bool
+	status   evalStatus
+}
+
+// evalSummary считает итог по трём статусам. Используется и печатью сводки,
+// и решением о коде выхода: WARN в failed не попадает.
+type evalSummary struct {
+	passed int
+	warned int
+	failed int
+}
+
+func summarize(results []evalResult) evalSummary {
+	var s evalSummary
+	for _, r := range results {
+		switch {
+		case r.status == statusPass:
+			s.passed++
+		case r.status == statusWarn:
+			s.warned++
+		default:
+			s.failed++
+		}
+	}
+	return s
+}
+
+// blocks сообщает, должен ли прогон завершиться кодом 1. WARN не блокирует.
+func (s evalSummary) blocks() bool {
+	return s.failed > 0
 }
 
 // reFrozenConst вытаскивает значение константы frozenScenarioHash из e2e_test.go.
@@ -90,8 +157,11 @@ func main() {
 
 func run() int {
 	results := make([]evalResult, 0, 38)
-	record := func(name, expected, actual string, pass bool) {
-		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
+	record := func(name, expected, actual string, ok bool) {
+		results = append(results, evalResult{name: name, expected: expected, actual: actual, status: statusOf(ok)})
+	}
+	recordStatus := func(name, expected, actual string, status evalStatus) {
+		results = append(results, evalResult{name: name, expected: expected, actual: actual, status: status})
 	}
 
 	repoRoot, err := findRepoRoot()
@@ -695,17 +765,19 @@ func run() int {
 	kiloActual, kiloPass := checkAdapterHonesty(wake.AdapterKilo)
 	record("22_w06_kilo_honest_unsupported", "kilo не выдаёт ложный ok; после Register одна доставка", kiloActual, kiloPass)
 
+	// eval R01: принятый пропуск. headSHA задан заглушкой, чтобы раннер не
+	// ходил в GitHub, поэтому разрешение SHA через CIProvider здесь не
+	// проверяется. Это неблокирующее замечание (ADR 0301): WARN не удерживает
+	// прогон от зелёного выхода, в отличие от FAIL.
+	recordStatus("R01_accepted_skip",
+		"замечание: сетевой CIProvider не опрашивается, headSHA заглушка",
+		fmt.Sprintf("headSHA=%s… (stub), сеть не используется", evalHeadSHA[:12]),
+		statusWarn)
+
 	printTable(results)
-	passed, failed := 0, 0
-	for _, r := range results {
-		if r.pass {
-			passed++
-		} else {
-			failed++
-		}
-	}
-	fmt.Printf("\n%d passed, %d failed\n", passed, failed)
-	if failed > 0 {
+	summary := summarize(results)
+	fmt.Printf("\n%d passed, %d warning, %d failed\n", summary.passed, summary.warned, summary.failed)
+	if summary.blocks() {
 		return 1
 	}
 	return 0
@@ -1756,8 +1828,8 @@ func checkTwoPhaseLocalCIGate(repoRoot string, prior []evalResult) (string, bool
 		failures = append(failures, fmt.Sprintf("ожидалось 9 базовых eval, получено %d", len(prior)))
 	} else {
 		for _, r := range prior {
-			if !r.pass {
-				failures = append(failures, r.name+"=FAIL")
+			if r.status.blocks() {
+				failures = append(failures, r.name+"="+r.status.label())
 			}
 		}
 	}
@@ -2280,13 +2352,13 @@ type bridgeReceipts struct {
 }
 
 type bridgeCloudPointer struct {
-	Received        bool `json:"received"`
+	Received         bool `json:"received"`
 	ProjectPreserved bool `json:"projectPreserved"`
-	NoLocalSpool    bool `json:"noLocalSpool"`
+	NoLocalSpool     bool `json:"noLocalSpool"`
 }
 
 type bridgeLocation struct {
-	Stable           bool `json:"stable"`
+	Stable            bool `json:"stable"`
 	FallbackDifferent bool `json:"fallbackDifferent"`
 }
 
@@ -2444,13 +2516,13 @@ func resultText(result *mcpsdk.CallToolResult) string {
 }
 
 func printTable(results []evalResult) {
-	headers := []string{"NAME", "EXPECTED", "ACTUAL", "PASS/FAIL"}
+	headers := []string{"NAME", "EXPECTED", "ACTUAL", "STATUS"}
 	widths := make([]int, len(headers))
 	for i, h := range headers {
 		widths[i] = len(h)
 	}
 	for _, r := range results {
-		row := []string{r.name, r.expected, clip(r.actual, 96), passLabel(r.pass)}
+		row := []string{r.name, r.expected, clip(r.actual, 96), r.status.label()}
 		for i, cell := range row {
 			if len(cell) > widths[i] {
 				widths[i] = len(cell)
@@ -2464,7 +2536,7 @@ func printTable(results []evalResult) {
 	}
 	printRow(separator, widths)
 	for _, r := range results {
-		printRow([]string{r.name, r.expected, clip(r.actual, 96), passLabel(r.pass)}, widths)
+		printRow([]string{r.name, r.expected, clip(r.actual, 96), r.status.label()}, widths)
 	}
 }
 
@@ -2474,13 +2546,6 @@ func printRow(cells []string, widths []int) {
 		parts[i] = fmt.Sprintf("%-*s", widths[i], cell)
 	}
 	fmt.Println(strings.Join(parts, " | "))
-}
-
-func passLabel(pass bool) string {
-	if pass {
-		return "PASS"
-	}
-	return "FAIL"
 }
 
 // clip ограничивает длину ячейки, чтобы таблица оставалась читаемой.
@@ -2722,86 +2787,86 @@ func wakeScenarios() []wakeScenario {
 		{
 			ID: "W01", Name: "opencode_plugin_wake",
 			Expect: "плагин доставил steer и появилось session.execution.started",
-			Event: "session.execution.started", SessionID: "ses_eval_wake",
-			File: "wake/opencode-prompt.json",
+			Event:  "session.execution.started", SessionID: "ses_eval_wake",
+			File:     "wake/opencode-prompt.json",
 			Contains: []string{"\"delivery\":\"steer\"", "<beacon-event>"},
 		},
 		{
 			ID: "W02", Name: "opencode_negative_control",
 			Expect: "без доставки нет session.execution.started и квитанции wake",
-			Event: "session.execution.started", Negative: true,
-			File: "wake/opencode-negative.json",
+			Event:  "session.execution.started", Negative: true,
+			File:     "wake/opencode-negative.json",
 			Contains: []string{"\"wakeObserved\":false"},
 		},
 		{
 			ID: "W03", Name: "opencode_location_survives",
-			Expect: "location_idle_timeout=false, плагин жив дольше 3m39s",
-			File: "wake/location.json",
+			Expect:   "location_idle_timeout=false, плагин жив дольше 3m39s",
+			File:     "wake/location.json",
 			Contains: []string{"\"locationIdleTimeout\":false", "\"aliveAfterMs\":219000"},
 		},
 		{
 			ID: "W04", Name: "opencode_fs_watch_registered",
-			Expect: "файл событий зарегистрирован через POST /api/experimental/fs/watch",
-			File: "wake/fs-watch.json",
+			Expect:   "файл событий зарегистрирован через POST /api/experimental/fs/watch",
+			File:     "wake/fs-watch.json",
 			Contains: []string{"POST /api/experimental/fs/watch", ".opencode/events.jsonl"},
 		},
 		{
 			ID: "W05", Name: "pi_rpc_state_transition",
-			Expect: "get_state показывает idle -> processing в песочнице Pi",
+			Expect:   "get_state показывает idle -> processing в песочнице Pi",
 			TokenEnv: wakePiTokenEnv, Event: "pi.state.changed",
-			File: "wake/pi-state.json",
+			File:     "wake/pi-state.json",
 			Contains: []string{"\"before\":\"idle\"", "\"after\":\"processing\""},
 		},
 		{
 			ID: "W06", Name: "pi_followup_default_queue",
-			Expect: "доставка по умолчанию queue через followUp",
+			Expect:   "доставка по умолчанию queue через followUp",
 			TokenEnv: wakePiTokenEnv,
-			File: "wake/pi-delivery.json",
+			File:     "wake/pi-delivery.json",
 			Contains: []string{"\"command\":\"followUp\"", "\"delivery\":\"queue\""},
 		},
 		{
 			ID: "W07", Name: "pi_guard_does_not_block_rpc",
-			Expect: "guard extension присутствует, RPC-доставка всё равно прошла, steer отделён от followUp",
+			Expect:   "guard extension присутствует, RPC-доставка всё равно прошла, steer отделён от followUp",
 			TokenEnv: wakePiTokenEnv,
-			File: "wake/pi-guard.json",
+			File:     "wake/pi-guard.json",
 			Contains: []string{"\"guardPresent\":true", "\"delivered\":true", "\"steer\":\"distinct\""},
 		},
 		{
 			ID: "W08", Name: "kilo_local_queue_not_steer",
-			Expect: "непроверенный локальный адаптер возвращает queue, а не steer",
-			File: "wake/kilo-local.json",
+			Expect:   "непроверенный локальный адаптер возвращает queue, а не steer",
+			File:     "wake/kilo-local.json",
 			Contains: []string{"\"delivery\":\"queue\""},
-			Absent: []string{"\"delivery\":\"steer\""},
+			Absent:   []string{"\"delivery\":\"steer\""},
 		},
 		{
 			ID: "W09", Name: "kilo_cloud_ttl",
-			Expect: "облачное сообщение ограничено 15 минутами, успех не имитируется",
-			File: "wake/kilo-cloud.json",
+			Expect:   "облачное сообщение ограничено 15 минутами, успех не имитируется",
+			File:     "wake/kilo-cloud.json",
 			Contains: []string{"\"ttlMinutes\":15"},
-			Absent: []string{"\"fakeSuccess\":true"},
+			Absent:   []string{"\"fakeSuccess\":true"},
 		},
 		{
 			ID: "W10", Name: "cursor_steer_body_whitelist",
-			Expect: "тело steer содержит только prompt и delivery",
+			Expect:   "тело steer содержит только prompt и delivery",
 			TokenEnv: wakeCursorTokenEnv,
-			File: "wake/cursor-steer.json",
+			File:     "wake/cursor-steer.json",
 			Contains: []string{"\"fields\":[\"prompt\",\"delivery\"]"},
 		},
 		{
 			ID: "W11", Name: "cursor_webhook_raw_signature",
-			Expect: "подпись проверена на сыром теле каждой доставки",
+			Expect:   "подпись проверена на сыром теле каждой доставки",
 			TokenEnv: wakeCursorTokenEnv, Check: wakeCheckCursorSignature,
 		},
 		{
 			ID: "W12", Name: "cursor_agent_busy_no_wake",
-			Expect: "409 agent_busy не будит, в квитанции указана причина",
+			Expect:   "409 agent_busy не будит, в квитанции указана причина",
 			TokenEnv: wakeCursorTokenEnv,
-			File: "wake/cursor-busy.json",
+			File:     "wake/cursor-busy.json",
 			Contains: []string{"\"status\":\"agent_busy\"", "\"wakeHappened\":false"},
 		},
 		{
 			ID: "W13", Name: "cursor_repeat_and_sse_expiry",
-			Expect: "повтор deliveryId не создаёт второй wake, 410 обработан пересписком",
+			Expect:   "повтор deliveryId не создаёт второй wake, 410 обработан пересписком",
 			TokenEnv: wakeCursorTokenEnv, Check: wakeCheckCursorRepeat,
 		},
 	}
