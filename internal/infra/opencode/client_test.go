@@ -398,7 +398,7 @@ func TestCreateSessionSendsPostWithAgent(t *testing.T) {
 		if err != nil {
 			return nil, err
 		}
-		const out = `{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}`
+		const out = `{"data":{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}}`
 		return fakeResponse(out, http.StatusOK), nil
 	}}
 	c := newTestClient(t, doer)

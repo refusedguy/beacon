@@ -739,6 +739,7 @@ func TestT3152InstallOpenCodePortsLeavesReaderClientUnwired(t *testing.T) {
 
 func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	t3145RestorePorts(t)
+	t.Cleanup(func() { SetServerEnsurer(nil) })
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
 	SetLiveSource(nil)
@@ -763,13 +764,16 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	if _, ok := watchLiveSource.(*liveOpencodeSource); !ok {
 		t.Fatalf("live source = %#v, want adapter over T3.144 client", watchLiveSource)
 	}
-	// The T3.144 client has only GET routes, so spawn and delivery stay
-	// uninstalled. This is the honest blocker for production writes until
-	// POST routes land.
-	if spawnSessionSpawner != nil {
-		t.Fatalf("spawn port = %#v, want nil until the client implements it", spawnSessionSpawner)
+	// T3.150/151 landed and newOpencodePort now returns a clientSessionCreator
+	// that satisfies the POST and fallback ports, so wireOpenCodePorts installs
+	// all of them through installOpenCodePorts.
+	if spawnSessionSpawner == nil {
+		t.Fatalf("spawn port = nil, want the live client's sessionCreator adapter")
 	}
-	if deliverTarget != nil {
-		t.Fatalf("delivery target = %#v, want nil until the client implements Prompt", deliverTarget)
+	if deliverTarget == nil {
+		t.Fatalf("delivery target = nil, want the live client's adapter")
+	}
+	if installedServerEnsurer == nil {
+		t.Fatalf("fallback port = nil, want the live client's ensurer adapter")
 	}
 }

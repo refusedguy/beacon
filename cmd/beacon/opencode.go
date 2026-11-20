@@ -49,6 +49,43 @@ func (f serverEnsurerFunc) EnsureServer(ctx context.Context) (opencode.Config, e
 	return f(ctx)
 }
 
+// clientSessionCreator adapts the live *opencode.Client to the no-context POST
+// ports used by spawn and deliver. The client takes a context and returns a
+// Session; the CLI ports take no context and return the session id. Without
+// this adapter every type assertion in installOpenCodePorts is false against a
+// real client, so spawn honestly reports an unconnected port even though the
+// server is live (ADR 0060 п3/п4).
+type clientSessionCreator struct {
+	*opencode.Client
+}
+
+func (c *clientSessionCreator) CreateSession(parentID, agent, title string, metadata map[string]string) (string, error) {
+	session, err := c.Client.CreateSession(context.Background(), parentID, agent, title, metadata)
+	if err != nil {
+		return "", err
+	}
+	return session.ID, nil
+}
+
+func (c *clientSessionCreator) Prompt(sessionID, text string) error {
+	return c.Client.Prompt(context.Background(), sessionID, text)
+}
+
+// EnsureServer bridges the package-level T3.151 fallback to the serverEnsurer
+// port. The client has no such method, so a type assertion could never install
+// the fallback before this adapter existed.
+func (c *clientSessionCreator) EnsureServer(ctx context.Context) (opencode.Config, error) {
+	return opencode.EnsureServer(ctx)
+}
+
+var (
+	_ opencodePort   = (*clientSessionCreator)(nil)
+	_ sessionSpawner = (*clientSessionCreator)(nil)
+	_ deliveryTarget = (*clientSessionCreator)(nil)
+	_ sessionCreator = (*clientSessionCreator)(nil)
+	_ serverEnsurer  = (*clientSessionCreator)(nil)
+)
+
 // installedServerEnsurer is the fallback server starter. Nil means the CLI
 // still reads service.json only. wireOpenCodePorts installs one by type
 // assertion when the client exposes the port.
@@ -86,13 +123,19 @@ func resolveOpencodeConfig(ctx context.Context) (opencode.Config, error) {
 var opencodeHTTPDoer opencode.Doer
 
 // newOpencodePort resolves the service registration and returns a live client
-// for its address. The client never hardcodes a port (ADR 0029, ADR 0060 п3).
-// Until T3.151 lands, resolution is service.json only; a client with the
-// serverEnsurer port installs the fallback path through SetServerEnsurer.
+// for its address, wrapped so it satisfies every narrow write port as well as
+// the read port. installOpenCodePorts then installs it through the existing
+// SetSessionCreator and SetServerEnsurer setters by type assertion, with no
+// change to the composition root in main.go. The client never hardcodes a port
+// (ADR 0029, ADR 0060 п3).
 func newOpencodePort() (opencodePort, error) {
 	cfg, err := resolveOpencodeConfig(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return opencode.New(cfg, opencodeHTTPDoer)
+	client, err := opencode.New(cfg, opencodeHTTPDoer)
+	if err != nil {
+		return nil, err
+	}
+	return &clientSessionCreator{Client: client}, nil
 }

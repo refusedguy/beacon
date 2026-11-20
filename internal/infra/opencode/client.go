@@ -327,11 +327,17 @@ func (c *Client) CreateSession(ctx context.Context, parentID, agent, title strin
 		return Session{}, err
 	}
 	defer resp.Body.Close()
-	var session Session
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&session); err != nil {
+	// POST /api/session answers with the same {"data": ...} envelope as the
+	// list routes on opencode v2.3.0. Decoding a bare Session silently yielded
+	// an empty id, which made beacon spawn report a created session with no
+	// identifier. Keep the shape check here where the transport is owned.
+	var envelope struct {
+		Data Session `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&envelope); err != nil {
 		return Session{}, fmt.Errorf("opencode POST /api/session: %v", err)
 	}
-	return session, nil
+	return envelope.Data, nil
 }
 
 // Prompt posts POST /api/session/:sessionID/prompt. It sends only the text:
