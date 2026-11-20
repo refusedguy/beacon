@@ -89,7 +89,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 34)
+	results := make([]evalResult, 0, 38)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -630,6 +630,29 @@ func run() int {
 	record("OW03_project_boundary",
 		"чужой проект не входит в сводку и не получает подписку по ошибке; повтор не дублирует подписку",
 		ow03Actual, ow03Pass)
+
+	// D01-D04: единое решение оркестратора, объединяющее blocked, waitFor и
+	// ready. Модель и негативные контроли описаны в
+	// docs/evals/orchestrator-decision.md.
+	d01Actual, d01Pass := evalD01ReadyAllDepsMerge()
+	record("D01_ready_all_deps_merge",
+		"verdict ready и все waitFor-зависимости в main дают MERGE с одной записью",
+		d01Actual, d01Pass)
+
+	d02Actual, d02Pass := evalD02UnmetWaitFor()
+	record("D02_unmet_wait_for",
+		"невыполненный waitFor даёт WAIT_DEPENDENCY и не вызывает мерж; после выполнения зависимости MERGE",
+		d02Actual, d02Pass)
+
+	d03Actual, d03Pass := evalD03BlockedFixAgent()
+	record("D03_blocked_fix_agent",
+		"blocked Watch даёт BLOCKED_FIX_AGENT и wake оркестратору с причиной; без blocked wake нет",
+		d03Actual, d03Pass)
+
+	d04Actual, d04Pass := evalD04NegativeControls()
+	record("D04_negative_controls",
+		"ошибка DependencyResolver и blocked не дают MERGE; blocked имеет приоритет над ready",
+		d04Actual, d04Pass)
 
 	// T3.227/T3.228: eval-покрытие живых сценариев. Наблюдатель читает файлы
 	// каталога состояния и ответы фейк-хоста, а не внутренние массивы плагина.
@@ -1382,6 +1405,218 @@ func evalOW03ProjectBoundary() (string, bool) {
 		own.ByVerdict["blocked"] == 0 &&
 		foreign.Total == 2 && foreign.ByVerdict["ready"] == 1 && foreign.ByVerdict["blocked"] == 1 &&
 		addedFirst == 2 && addedRepeat == 0 && ownSubs == 0 && foreignSubs == 2
+	return actual, pass
+}
+
+// ---- D01-D04: единое решение оркестратора ----
+//
+// Одна точка решения объединяет три факта Watch: blocked, граф waitFor и verdict.
+// Порядок проверок фиксирует приоритет. Blocked выключает мерж раньше всех,
+// затем обязателен verdict=ready, затем каждая зависимость waitFor должна
+// оказаться в main. Ошибка DependencyResolver приравнивается к «не в main» и
+// мерж не вызывается. Production-код единого решения в eval не подключён,
+// поэтому контракт живёт в исполняемой модели, как W14-W18 и B01-B04.
+// Подробности в docs/evals/orchestrator-decision.md.
+
+// orchAction — решение, которое оркестратор принимает по одному Watch.
+type orchAction string
+
+const (
+	orchMerge          orchAction = "MERGE"
+	orchWaitDependency orchAction = "WAIT_DEPENDENCY"
+	orchBlockedFix     orchAction = "BLOCKED_FIX_AGENT"
+	orchHold           orchAction = "HOLD"
+)
+
+// dependencyResolver отвечает, оказалась ли зависимость waitFor в main.
+// Ошибка означает, что факт получить не удалось; в этом случае мерж не вызывается.
+type dependencyResolver func(dep string) (bool, error)
+
+// orchWatch — факты Watch, которые оркестратор видит в момент решения.
+type orchWatch struct {
+	ID           string
+	Repo         string
+	PR           int
+	Verdict      domain.Verdict
+	Blocked      bool
+	Reason       string
+	FailedChecks []string
+	WaitFor      []string
+}
+
+// orchLedger хранит побочные эффекты, которые оркестратор реально выполнил.
+type orchLedger struct {
+	Merges []string
+	Wakes  []blockedWake
+}
+
+// orchOutcome — наблюдаемое решение и причина.
+type orchOutcome struct {
+	Action orchAction
+	Reason string
+}
+
+// decideOrchestrator — эталонное единое решение. Побочные эффекты пишутся в
+// ledger только на своей ветке: MERGE добавляет запись в Merges,
+// BLOCKED_FIX_AGENT добавляет wake в Wakes. Остальные ветки мерж не вызывают.
+func decideOrchestrator(w orchWatch, resolve dependencyResolver, ledger *orchLedger) orchOutcome {
+	// blocked имеет приоритет над ready: причину видит оркестратор, мерж не вызывается.
+	if w.Blocked {
+		checks := append([]string(nil), w.FailedChecks...)
+		sort.Strings(checks)
+		bk := blockedWake{
+			WatchID:      w.ID,
+			PR:           fmt.Sprintf("%s#%d", w.Repo, w.PR),
+			Reason:       w.Reason,
+			FailedChecks: checks,
+		}
+		if ledger != nil {
+			ledger.Wakes = append(ledger.Wakes, bk)
+		}
+		return orchOutcome{Action: orchBlockedFix, Reason: "blocked:" + w.Reason}
+	}
+	if w.Verdict != domain.VerdictReady {
+		return orchOutcome{Action: orchHold, Reason: "verdict=" + string(w.Verdict)}
+	}
+	for _, dep := range w.WaitFor {
+		if resolve == nil {
+			return orchOutcome{Action: orchWaitDependency, Reason: "resolver_error:" + dep}
+		}
+		inMain, err := resolve(dep)
+		if err != nil {
+			return orchOutcome{Action: orchWaitDependency, Reason: "resolver_error:" + dep}
+		}
+		if !inMain {
+			return orchOutcome{Action: orchWaitDependency, Reason: "wait_for:" + dep}
+		}
+	}
+	if ledger != nil {
+		ledger.Merges = append(ledger.Merges, w.ID)
+	}
+	return orchOutcome{Action: orchMerge, Reason: "ready"}
+}
+
+func newOrchWatch(id string) orchWatch {
+	return orchWatch{
+		ID:           id,
+		Repo:         "refusedguy/beacon",
+		PR:           300,
+		Verdict:      domain.VerdictReady,
+		FailedChecks: []string{"ci-build", "ci-audit"},
+	}
+}
+
+func orchActionText(o orchOutcome) string {
+	return string(o.Action) + ":" + o.Reason
+}
+
+// evalD01ReadyAllDepsMerge проверяет главный путь: verdict ready и все waitFor
+// в main дают MERGE с единственной записью в журнале. Негативный контроль: тот
+// же Watch с verdict watching мерж не даёт.
+func evalD01ReadyAllDepsMerge() (string, bool) {
+	w := newOrchWatch("watch:D01")
+	w.WaitFor = []string{"watch:D01-a", "watch:D01-b"}
+	resolve := func(string) (bool, error) { return true, nil }
+	ledger := &orchLedger{}
+	got := decideOrchestrator(w, resolve, ledger)
+
+	watching := newOrchWatch("watch:D01-watching")
+	watching.Verdict = domain.VerdictWatching
+	watchingLedger := &orchLedger{}
+	held := decideOrchestrator(watching, resolve, watchingLedger)
+
+	actual := fmt.Sprintf("ready=%s merges=%d wakes=%d, watching=%s merges=%d",
+		orchActionText(got), len(ledger.Merges), len(ledger.Wakes),
+		orchActionText(held), len(watchingLedger.Merges))
+	pass := got.Action == orchMerge && got.Reason == "ready" &&
+		len(ledger.Merges) == 1 && ledger.Merges[0] == "watch:D01" && len(ledger.Wakes) == 0 &&
+		held.Action == orchHold && held.Reason == "verdict=watching" && len(watchingLedger.Merges) == 0
+	return actual, pass
+}
+
+// evalD02UnmetWaitFor проверяет, что невыполненный waitFor даёт
+// WAIT_DEPENDENCY и не вызывает мерж. Контроль: после перевода зависимости в
+// main тот же Watch даёт MERGE.
+func evalD02UnmetWaitFor() (string, bool) {
+	const dep = "watch:D02-dep"
+	w := newOrchWatch("watch:D02")
+	w.WaitFor = []string{dep}
+
+	inMain := map[string]bool{}
+	resolve := func(d string) (bool, error) { return inMain[d], nil }
+	pendingLedger := &orchLedger{}
+	wait := decideOrchestrator(w, resolve, pendingLedger)
+
+	inMain[dep] = true
+	readyLedger := &orchLedger{}
+	ready := decideOrchestrator(w, resolve, readyLedger)
+
+	actual := fmt.Sprintf("unmet=%s merges=%d, in-main=%s merges=%d",
+		orchActionText(wait), len(pendingLedger.Merges),
+		orchActionText(ready), len(readyLedger.Merges))
+	pass := wait.Action == orchWaitDependency && wait.Reason == "wait_for:"+dep && len(pendingLedger.Merges) == 0 &&
+		ready.Action == orchMerge && len(readyLedger.Merges) == 1
+	return actual, pass
+}
+
+// evalD03BlockedFixAgent проверяет, что blocked Watch даёт BLOCKED_FIX_AGENT
+// и wake оркестратору с причиной, PR и отсортированными failedChecks.
+// Негативный контроль: незаблокированный Watch wake не шлёт, а мержит.
+func evalD03BlockedFixAgent() (string, bool) {
+	w := newOrchWatch("watch:D03")
+	w.Blocked = true
+	w.Reason = "не моя вина, проверил diff"
+	ledger := &orchLedger{}
+	got := decideOrchestrator(w, nil, ledger)
+
+	actual := "нет wake"
+	if len(ledger.Wakes) == 1 {
+		bk := ledger.Wakes[0]
+		actual = fmt.Sprintf("decision=%s merges=%d wakes=%d wake: watch=%s pr=%s reason=%s checks=%v",
+			orchActionText(got), len(ledger.Merges), len(ledger.Wakes),
+			bk.WatchID, bk.PR, bk.Reason, bk.FailedChecks)
+	}
+	notBlocked := newOrchWatch("watch:D03-ok")
+	notBlockedLedger := &orchLedger{}
+	clean := decideOrchestrator(notBlocked, nil, notBlockedLedger)
+	actual += fmt.Sprintf("; ok=%s wakes=%d merges=%d",
+		orchActionText(clean), len(notBlockedLedger.Wakes), len(notBlockedLedger.Merges))
+	pass := got.Action == orchBlockedFix && len(ledger.Merges) == 0 && len(ledger.Wakes) == 1 &&
+		ledger.Wakes[0].WatchID == w.ID &&
+		ledger.Wakes[0].PR == "refusedguy/beacon#300" &&
+		ledger.Wakes[0].Reason == "не моя вина, проверил diff" &&
+		slices.Equal(ledger.Wakes[0].FailedChecks, []string{"ci-audit", "ci-build"}) &&
+		clean.Action == orchMerge && len(notBlockedLedger.Wakes) == 0 && len(notBlockedLedger.Merges) == 1
+	return actual, pass
+}
+
+// evalD04NegativeControls проверяет два негативных контроля единого решения.
+// Ошибка DependencyResolver не даёт MERGE. Blocked имеет приоритет над ready:
+// даже при готовом вердикте и падающем резолвере решение BLOCKED_FIX_AGENT,
+// а не MERGE.
+func evalD04NegativeControls() (string, bool) {
+	const dep = "watch:D04-dep"
+
+	broken := newOrchWatch("watch:D04-error")
+	broken.WaitFor = []string{dep}
+	resolveErr := func(string) (bool, error) { return false, errors.New("resolver down") }
+	errLedger := &orchLedger{}
+	errored := decideOrchestrator(broken, resolveErr, errLedger)
+
+	blockedReady := newOrchWatch("watch:D04-blocked")
+	blockedReady.Blocked = true
+	blockedReady.Reason = "проверки не мои"
+	blockedReady.WaitFor = []string{dep}
+	blockedLedger := &orchLedger{}
+	blocked := decideOrchestrator(blockedReady, resolveErr, blockedLedger)
+
+	actual := fmt.Sprintf("resolver-error=%s merges=%d; blocked-ready=%s merges=%d wakes=%d",
+		orchActionText(errored), len(errLedger.Merges),
+		orchActionText(blocked), len(blockedLedger.Merges), len(blockedLedger.Wakes))
+	pass := errored.Action == orchWaitDependency && errored.Reason == "resolver_error:"+dep &&
+		len(errLedger.Merges) == 0 &&
+		blocked.Action == orchBlockedFix && len(blockedLedger.Merges) == 0 &&
+		len(blockedLedger.Wakes) == 1
 	return actual, pass
 }
 
