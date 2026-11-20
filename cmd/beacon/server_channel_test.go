@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/refusedguy/beacon/internal/app/command"
+	appcommand "github.com/refusedguy/beacon/internal/app/command"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/channel"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
@@ -86,7 +86,7 @@ func TestBuildChannelIngressDeliversThroughCommandProcessor(t *testing.T) {
 	}
 	outbox := &channelFakeOutbox{created: true}
 	var applied []channel.Command
-	ingress, err := buildChannelIngress(cfg, outbox, func(_ context.Context, effect command.Effect) error {
+	ingress, err := buildChannelIngress(cfg, outbox, func(_ context.Context, effect appcommand.Effect) error {
 		var got channel.Command
 		if err := json.Unmarshal(effect.Payload, &got); err != nil {
 			return err
@@ -108,8 +108,8 @@ func TestBuildChannelIngressDeliversThroughCommandProcessor(t *testing.T) {
 	if cmd != want {
 		t.Fatalf("command = %+v, want %+v", cmd, want)
 	}
-	if outbox.calls != 1 || outbox.kind != command.ChannelCommandKind {
-		t.Fatalf("outbox calls = %d, kind = %q, want one %s effect", outbox.calls, outbox.kind, command.ChannelCommandKind)
+	if outbox.calls != 1 || outbox.kind != appcommand.ChannelCommandKind {
+		t.Fatalf("outbox calls = %d, kind = %q, want one %s effect", outbox.calls, outbox.kind, appcommand.ChannelCommandKind)
 	}
 	if len(applied) != 1 || applied[0] != want {
 		t.Fatalf("applied = %+v, want one %+v", applied, want)
@@ -120,7 +120,7 @@ func TestBuildChannelIngressDisabledIsSilent(t *testing.T) {
 	cfg := channelConfig{Senders: map[string]domain.ActorID{"u-1": "ses_alice"}}
 	outbox := &channelFakeOutbox{created: true}
 	applied := 0
-	ingress, err := buildChannelIngress(cfg, outbox, func(context.Context, command.Effect) error {
+	ingress, err := buildChannelIngress(cfg, outbox, func(context.Context, appcommand.Effect) error {
 		applied++
 		return nil
 	})
@@ -168,8 +168,8 @@ func TestChannelApplySinkPassesCommandToDecisionPort(t *testing.T) {
 	}
 
 	apply := channelApplySink(decisions)
-	if err := apply(context.Background(), command.Effect{
-		Key: "channel:req-1", Kind: command.ChannelCommandKind, Payload: payload,
+	if err := apply(context.Background(), appcommand.Effect{
+		Key: "channel:req-1", Kind: appcommand.ChannelCommandKind, Payload: payload,
 	}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}

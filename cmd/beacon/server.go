@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/refusedguy/beacon/internal/app/command"
+	appcommand "github.com/refusedguy/beacon/internal/app/command"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/channel"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
@@ -97,18 +97,18 @@ func (r channelSenderResolver) Resolve(_ context.Context, _ string, sender strin
 // the known-sender resolver and a durable command processor. apply runs only
 // after the processor commits, so a failed delivery cannot leave an applied
 // decision without its intent row.
-func buildChannelIngress(cfg channelConfig, outbox command.Outbox, apply command.Sink) (*channel.Ingress, error) {
+func buildChannelIngress(cfg channelConfig, outbox appcommand.Outbox, apply appcommand.Sink) (*channel.Ingress, error) {
 	resolver := channelSenderResolver{senders: cfg.Senders}
-	processor := command.New(outbox, apply)
-	return channel.New(cfg.Enabled, resolver, command.NewChannelSink(processor))
+	processor := appcommand.New(outbox, apply)
+	return channel.New(cfg.Enabled, resolver, appcommand.NewChannelSink(processor))
 }
 
 // channelApplySink is the effect the processor runs after it commits. It
 // decodes the stored channel command and sends the decision through the same
 // port `beacon human` uses, so channel and human decisions share the journal
 // and idempotency rules.
-func channelApplySink(decisions upDecisionPort) command.Sink {
-	return func(ctx context.Context, effect command.Effect) error {
+func channelApplySink(decisions upDecisionPort) appcommand.Sink {
+	return func(ctx context.Context, effect appcommand.Effect) error {
 		var cmd channel.Command
 		if err := json.Unmarshal(effect.Payload, &cmd); err != nil {
 			return fmt.Errorf("beacon channel: decode %s: %w", effect.Key, err)
