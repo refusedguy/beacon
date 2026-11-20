@@ -1,5 +1,6 @@
 # BS.19. Долгий вызов как тикет с job id
-Статус: todo
+Статус: done
+Premise: проверено 2026-11-20, дубль. ADR 0094 фиксирует контракт ровно на восьми инструментах, девятый требует отдельного ADR. Тикет с job id и task dialect уже реализованы в main: ApplyTaskForm и поля JobID, ResultType, TaskID в GetResultOutput (internal/infra/mcp/schema.go), единый порог 30 с с потолком 120 с в syncCallConfig и передача его в Dependencies.After (cmd/beacon/mcp.go), переключение медленного ответа в task form (internal/infra/mcp/server.go). Это разрешено ADR 0031 §2 и ADR 0045 фича 2. Поле delivery из ADR 0026 не меняется. Новых инструментов и полей сверх восьми не требуется, дубль не создан.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/server.go, cmd/beacon/mcp.go
