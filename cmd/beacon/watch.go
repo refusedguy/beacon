@@ -15,6 +15,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
@@ -202,7 +203,7 @@ func runWatch(c *CLI, args []string) int {
 		return 2
 	}
 	if *live {
-		return runWatchLive(c, *interval, *format, *wake)
+		return watchLiveRunner(c, *interval, *format, *wake)
 	}
 
 	snap, err := watchSnapshot()
@@ -450,6 +451,192 @@ func runWatchLive(c *CLI, interval time.Duration, format string, wake bool) int 
 				_ = watchRender(c, src, format, wake)
 			case <-ticks:
 				_ = watchRender(c, src, format, wake)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(watchReconnectDelay):
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W8-B: beacon watch --live reads Beacon's own HTTP projection.
+//
+// The old SSE loop above stays as a legacy path for tests of the OpenCode
+// client. The installed default reads <stateDir>/connection.json, then GETs
+// /api/v1/snapshot and GETs /api/v1/events. No service.json and no
+// `opencode api session.list` are involved in the live branch (ADR 0191).
+// ---------------------------------------------------------------------------
+
+// watchLiveRunner is the --live entry point. It is a seam so the legacy loop
+// remains testable; production uses the HTTP projection.
+var watchLiveRunner = func(c *CLI, interval time.Duration, format string, wake bool) int {
+	return runWatchLiveHTTP(c, interval, format, wake)
+}
+
+// watchHTTPPort is the whole live dependency: one snapshot and one SSE stream.
+// httpapi.ProjectionClient implements it; tests substitute a stand-in.
+type watchHTTPPort interface {
+	Snapshot(context.Context) (httpapi.ClientSnapshot, error)
+	Events(context.Context) <-chan httpapi.ClientEventResult
+}
+
+var (
+	watchHTTPStateDir = func() (string, error) { return stateDir() }
+	watchHTTPClient   = func(conn httpapi.ClientConn) (watchHTTPPort, error) {
+		return httpapi.NewProjectionClient(conn, nil)
+	}
+)
+
+// joinDash separates non-empty items and prints a dash for an empty list.
+func joinDash(values []string) string {
+	kept := make([]string, 0, len(values))
+	for _, v := range values {
+		if trimmed := strings.TrimSpace(v); trimmed != "" {
+			kept = append(kept, trimmed)
+		}
+	}
+	if len(kept) == 0 {
+		return "-"
+	}
+	return strings.Join(kept, "; ")
+}
+
+// statusWithBlocker folds the optional blocker into STATUS(BLOCKER).
+func statusWithBlocker(status, blocker string) string {
+	if blocker == "" {
+		return status
+	}
+	if status == "" {
+		return "blocked(" + blocker + ")"
+	}
+	return status + "(" + blocker + ")"
+}
+
+// subscriberWithPhase folds the optional phase into SUBSCRIBER(PHASE).
+func subscriberWithPhase(subscriber, phase string) string {
+	if phase == "" {
+		return subscriber
+	}
+	if subscriber == "" {
+		return "(" + phase + ")"
+	}
+	return subscriber + "(" + phase + ")"
+}
+
+// renderHTTPSnapshot prints one snapshot: a header, the joined watch table and
+// the attention/escalation lines. json stays machine readable and bypasses the
+// human layout.
+func renderHTTPSnapshot(w io.Writer, snap httpapi.ClientSnapshot, format string) error {
+	if format == "json" {
+		return json.NewEncoder(w).Encode(snap)
+	}
+
+	project := dash(strings.TrimSpace(snap.Project))
+	points := snap.Points
+	if points.Limit <= 0 {
+		points.Limit = 500
+	}
+	cycle := dash(strings.TrimSpace(snap.Cycle.ID))
+	if strings.TrimSpace(snap.Cycle.Duration) != "" {
+		cycle += " (" + snap.Cycle.Duration + ")"
+	}
+	orchestrator := "offline"
+	if snap.Orchestrator.Live {
+		orchestrator = "live"
+		if snap.Orchestrator.Session != "" {
+			orchestrator += " " + snap.Orchestrator.Session
+		}
+	}
+	fmt.Fprintf(w, "PROJECT: %s\tPOINTS: %d/%d\tCYCLE: %s\tORCHESTRATOR: %s\n",
+		project, points.Used, points.Limit, cycle, orchestrator)
+
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "PR\tWATCH\tVERDICT\tSTATUS(BLOCKER)\tSUBSCRIBER(PHASE)\tFIX+WAKE ATTEMPTS\tUPDATED")
+	for _, row := range snap.Watches {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d+%d\t%s\n",
+			dash(row.PR), dash(row.Watch), dash(row.Verdict),
+			dash(statusWithBlocker(row.Status, row.Blocker)),
+			dash(subscriberWithPhase(row.Subscriber, row.Phase)),
+			row.FixAttempts, row.WakeAttempts, dash(row.Updated))
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "ATTENTION: %s\n", joinDash(snap.Attention))
+	fmt.Fprintf(w, "ESCALATIONS: %s\n", joinDash(snap.Escalations))
+	return nil
+}
+
+// watchHTTPRender is one refresh from the HTTP projection.
+func watchHTTPRender(ctx context.Context, c *CLI, port watchHTTPPort, format string) int {
+	snap, err := port.Snapshot(ctx)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: snapshot: %v\n", err)
+		return 2
+	}
+	if err := renderHTTPSnapshot(c.out, snap, format); err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: %v\n", err)
+		return 2
+	}
+	return 0
+}
+
+// runWatchLiveHTTP is the event-driven loop over /api/v1/events. Each
+// subscription starts from a fresh snapshot; every frame, reconnect or
+// interval tick prints a new one. The SSE stream carries no history, so missed
+// events are never replayed (ADR 0025).
+func runWatchLiveHTTP(c *CLI, interval time.Duration, format string, wake bool) int {
+	dir, err := watchHTTPStateDir()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: --live: state dir: %v\n", err)
+		return 2
+	}
+	conn, err := httpapi.LoadClientConn(dir)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: --live: connection.json: %v\n", err)
+		return 2
+	}
+	port, err := watchHTTPClient(conn)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: --live: http client: %v\n", err)
+		return 2
+	}
+
+	ctx, cancel := watchLiveContext()
+	defer cancel()
+
+	var ticks <-chan time.Time
+	if interval > 0 {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+
+	_ = wake // batching belongs to the legacy wake path, not this projection.
+	for {
+		if ctx.Err() != nil {
+			return 0
+		}
+		events := port.Events(ctx)
+		if code := watchHTTPRender(ctx, c, port, format); code != 0 {
+			return code
+		}
+		disconnected := false
+		for !disconnected {
+			select {
+			case <-ctx.Done():
+				return 0
+			case _, ok := <-events:
+				if !ok {
+					disconnected = true
+					continue
+				}
+				_ = watchHTTPRender(ctx, c, port, format)
+			case <-ticks:
+				_ = watchHTTPRender(ctx, c, port, format)
 			}
 		}
 		select {
