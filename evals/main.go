@@ -728,6 +728,18 @@ func run() int {
 		"ошибка DependencyResolver и blocked не дают MERGE; blocked имеет приоритет над ready",
 		d04Actual, d04Pass)
 
+	// EC01-EC02: явное подтверждение критериев и лимита до старта итераций
+	// (HD-064, ADR 0243). Старт без подтверждения проваливает карточку.
+	ec01Actual, ec01Pass := evalEC01ConfirmationBeforeStart()
+	record("EC01_confirmation_before_start",
+		"критерии и лимит подтверждены до старта; подтверждение на шаге старта не разрешает старт",
+		ec01Actual, ec01Pass)
+
+	ec02Actual, ec02Pass := evalEC02StartWithoutConfirmationFails()
+	record("EC02_start_without_confirmation_fails",
+		"старт без подтверждения, без лимита и с другими критериями или лимитом запрещён",
+		ec02Actual, ec02Pass)
+
 	// N01-N04: соглашение по именам артефактов из HD-055 (ADR 0304). Harbor
 	// называет workflow, скилл и правило aif-action.md, {skill}/SKILL.md и
 	// aif-rule.md. Beacon держит те же три роли на своих путях. Схема, негативные
@@ -1310,6 +1322,85 @@ func evalB04UnknownDecisionAndUnblock() (string, bool) {
 		alien.Status == blockStatusWatching &&
 		unblockOut.Action == "unblocked" && unblocked.Status == blockStatusWatching &&
 		unblocked.Reason == "" && resumedEffects.Polls == 1 && resumedEffects.Retries == 1
+	return actual, pass
+}
+
+// ---- EC01-EC02: явное подтверждение критериев и лимита до старта (HD-064) ----
+//
+// Контракт ADR 0243: цикл не начинает итерации без явного подтверждения
+// критериев успеха и максимального числа итераций. Подтверждение фиксируется
+// до старта и совпадает с конфигурацией прогона. Старт без подтверждения
+// проваливает карточку.
+
+// loopConfig задаёт критерии успеха и предел итераций прогона.
+type loopConfig struct {
+	criteria      string
+	maxIterations int
+}
+
+// loopConfirmation фиксирует явное подтверждение на шаге atStep.
+type loopConfirmation struct {
+	criteria      string
+	maxIterations int
+	atStep        int
+}
+
+// loopStart решает, можно ли начать итерации. Старт разрешён только когда
+// подтверждены те же критерии и тот же лимит, что в конфигурации, и
+// подтверждение зафиксировано раньше шага старта.
+func loopStart(cfg loopConfig, conf loopConfirmation, startStep int) (bool, string) {
+	switch {
+	case cfg.maxIterations <= 0:
+		return false, "no_limit"
+	case conf.criteria == "":
+		return false, "no_criteria_confirmation"
+	case conf.criteria != cfg.criteria:
+		return false, "criteria_mismatch"
+	case conf.maxIterations <= 0:
+		return false, "no_limit_confirmation"
+	case conf.maxIterations != cfg.maxIterations:
+		return false, "max_iterations_mismatch"
+	case conf.atStep >= startStep:
+		return false, "confirmation_after_start"
+	default:
+		return true, "confirmed_before_start"
+	}
+}
+
+// evalEC01ConfirmationBeforeStart проверяет, что подтверждение критериев и
+// лимита зафиксировано до старта. Негативный контроль: подтверждение на шаге
+// старта не разрешает старт.
+func evalEC01ConfirmationBeforeStart() (string, bool) {
+	cfg := loopConfig{criteria: "A=0.8,B=0.9", maxIterations: 4}
+	confirmed := loopConfirmation{criteria: cfg.criteria, maxIterations: cfg.maxIterations, atStep: 2}
+	start, startReason := loopStart(cfg, confirmed, 5)
+	late := loopConfirmation{criteria: cfg.criteria, maxIterations: cfg.maxIterations, atStep: 5}
+	lateStart, lateReason := loopStart(cfg, late, 5)
+	actual := fmt.Sprintf("before: started=%t reason=%s; at_start: started=%t reason=%s",
+		start, startReason, lateStart, lateReason)
+	pass := start && startReason == "confirmed_before_start" &&
+		!lateStart && lateReason == "confirmation_after_start"
+	return actual, pass
+}
+
+// evalEC02StartWithoutConfirmationFails проверяет приёмку: старт без
+// подтверждения, с неполным подтверждением и с другими критериями или лимитом
+// запрещён.
+func evalEC02StartWithoutConfirmationFails() (string, bool) {
+	cfg := loopConfig{criteria: "A=0.8,B=0.9", maxIterations: 4}
+	none, noneReason := loopStart(cfg, loopConfirmation{}, 5)
+	criteriaOnly, criteriaOnlyReason := loopStart(cfg,
+		loopConfirmation{criteria: cfg.criteria, atStep: 2}, 5)
+	wrongLimit, wrongLimitReason := loopStart(cfg,
+		loopConfirmation{criteria: cfg.criteria, maxIterations: 3, atStep: 2}, 5)
+	wrongCriteria, wrongCriteriaReason := loopStart(cfg,
+		loopConfirmation{criteria: "A=0.5,B=0.6", maxIterations: 4, atStep: 2}, 5)
+	actual := fmt.Sprintf("none=%s criteria_only=%s wrong_limit=%s wrong_criteria=%s",
+		noneReason, criteriaOnlyReason, wrongLimitReason, wrongCriteriaReason)
+	pass := !none && noneReason == "no_criteria_confirmation" &&
+		!criteriaOnly && criteriaOnlyReason == "no_limit_confirmation" &&
+		!wrongLimit && wrongLimitReason == "max_iterations_mismatch" &&
+		!wrongCriteria && wrongCriteriaReason == "criteria_mismatch"
 	return actual, pass
 }
 
