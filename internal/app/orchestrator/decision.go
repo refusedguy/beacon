@@ -1,6 +1,9 @@
 package orchestrator
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 // DecisionKind is one of the mutually exclusive outcomes of the orchestrator's
 // merge decision. The kinds are spelled out so callers cannot confuse a held
@@ -32,22 +35,17 @@ type BlockedInfo struct {
 	BlockedBy    string   `json:"blockedBy,omitempty"`
 }
 
-// DependencyResolver answers whether an opaque waitFor ref has landed in main.
-// An error or an unknown ref means "not yet": the decision holds the merge
-// instead of guessing that a dependency is satisfied.
-type DependencyResolver interface {
-	InMain(ref string) (bool, error)
-}
+// DependencyResolverFunc adapts a function to the DependencyResolver contract
+// declared in orchestrator.go. Decide shares that contract with canAutoMerge,
+// so one resolver serves both paths.
+type DependencyResolverFunc func(ctx context.Context, ref string) (bool, error)
 
-// DependencyResolverFunc adapts a function to DependencyResolver.
-type DependencyResolverFunc func(ref string) (bool, error)
-
-// InMain calls f. A nil function reports the ref as unsatisfied.
-func (f DependencyResolverFunc) InMain(ref string) (bool, error) {
+// Satisfied calls f. A nil function reports the ref as unsatisfied.
+func (f DependencyResolverFunc) Satisfied(ctx context.Context, ref string) (bool, error) {
 	if f == nil {
 		return false, nil
 	}
-	return f(ref)
+	return f(ctx, ref)
 }
 
 // CIState is the CI view that accompanies a Watch. Verdict is consulted only
@@ -129,11 +127,11 @@ func unsatisfiedRefs(w Watch, deps DependencyResolver) []string {
 				continue
 			}
 			seen[ref] = true
-			inMain := false
+			satisfied := false
 			if deps != nil {
-				inMain, _ = deps.InMain(ref)
+				satisfied, _ = deps.Satisfied(context.Background(), ref)
 			}
-			if !inMain {
+			if !satisfied {
 				out = append(out, ref)
 			}
 		}

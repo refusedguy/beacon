@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
@@ -12,7 +13,7 @@ type decisionDeps struct {
 	calls  []string
 }
 
-func (d *decisionDeps) InMain(ref string) (bool, error) {
+func (d *decisionDeps) Satisfied(_ context.Context, ref string) (bool, error) {
 	d.calls = append(d.calls, ref)
 	if err := d.err[ref]; err != nil {
 		return false, err
