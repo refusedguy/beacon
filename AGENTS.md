@@ -57,6 +57,16 @@ Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Искл�
 
 Плагин держит ключ `beacon/survival-rules` в instructions. Ключ стабильный, перезаписывается на старте и на хуке `compaction`. Правила выпали из контекста, читай ключ, а не гадай.
 
+## Перезапуск после смерти
+
+Агент оборвался, а его работа осталась в worktree и ветке. Новая сессия продолжает её, а не начинает с нуля.
+
+1. Прочитай `git status --short --branch` в своём worktree. Ветка и незакоммиченные правки показывают, где остановился агент.
+2. Прочитай ключ `beacon/survival-rules` и continue-prompt. Продолжи с шага, на котором работа оборвалась.
+3. Не создавай новый worktree и не повторяй уже сделанный коммит.
+
+Работа в worktree не теряется. Перезапуск с нуля проваливает карточку.
+
 ## MCP
 
 Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Восемь инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`, `beacon_defer_wiring`.
