@@ -2,21 +2,18 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
-	"time"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
-	"github.com/refusedguy/beacon/internal/infra/cibridge"
-	"github.com/refusedguy/beacon/internal/infra/ghci"
 )
 
-// daemonIntervalEnv overrides the default pass interval without a flag.
+// daemonIntervalEnv overrides the default pass interval without a flag. It is
+// kept for the deprecated in-process daemon seam; the unified loop uses the
+// adaptive github.Interval unless --interval is given explicitly.
 const daemonIntervalEnv = "BEACON_DAEMON_INTERVAL"
 
 // daemonRunner holds the command implementation so dispatch stays a one-line
@@ -26,90 +23,98 @@ var daemonRunner = func(c *CLI, args []string) int { return runDaemon(c, args) }
 // RegisterDaemon installs the daemon command implementation.
 func RegisterDaemon(fn func(*CLI, []string) int) { daemonRunner = fn }
 
-// runDaemon implements `beacon daemon [--interval 3m] [--once]`. The primary
-// host of the cycle is now `beacon mcp`, which starts it as a goroutine of the
-// same process. This command stays for manual and one-shot runs only.
+// runDaemon implements `beacon daemon [--interval 3m] [--once]`. It runs the
+// same single cibridge cycle `beacon mcp` uses, under the same non-blocking
+// poller lock, so starting both processes cannot produce duplicate wakes.
 func runDaemon(c *CLI, args []string) int {
-	defaultInterval := orchestrator.DaemonInterval
-	if raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv)); raw != "" {
-		parsed, err := time.ParseDuration(raw)
-		if err != nil || parsed <= 0 {
-			fmt.Fprintf(c.errOut, "beacon daemon: неверный %s=%q\n", daemonIntervalEnv, raw)
-			return 2
-		}
-		defaultInterval = parsed
-	}
-
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
-	interval := fs.Duration("interval", defaultInterval, "интервал прохода (по умолчанию 3m)")
+	interval := fs.Duration("interval", 0, "интервал прохода (0 = адаптивный 10s/30s)")
 	once := fs.Bool("once", false, "выполнить один проход и выйти")
 	if !parseFlags("daemon", args, c.errOut, fs) {
 		return 2
 	}
-	if *interval <= 0 {
-		fmt.Fprintf(c.errOut, "beacon daemon: интервал должен быть положительным\n")
+	if *interval < 0 {
+		fmt.Fprintf(c.errOut, "beacon daemon: интервал не может быть отрицательным\n")
 		return 2
 	}
-
-	ports, closePorts, err := makeDaemonPorts(c)
-	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
-		return 2
-	}
-	defer func() { _ = closePorts() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := orchestrator.DaemonRun(ctx, ports, *interval, *once); err != nil {
+	dir, err := stateDir()
+	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
 		return 2
 	}
+	db, err := openProcessStore(dir)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
+		return 2
+	}
+	defer func() { _ = db.Close() }()
+
+	ghBatch := newGitHubBatch(ctx, c)
+	deps := buildMCPDependencies(db, dir, ghBatch.provider.PointStats)
+	cfg := reconcileConfig{
+		dir:              dir,
+		db:               db,
+		deps:             deps,
+		batch:            ghBatch.provider,
+		counter:          ghBatch.counter,
+		projectKey:       orchestratorProjectKey(),
+		root:             projectRootForConfig(),
+		intervalOverride: *interval,
+	}
+
+	if *once {
+		ReconcilePass(ctx, cfg)
+		return 0
+	}
+
+	stopLoop, err := runReconciler(ctx, cfg)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
+		return 2
+	}
+	defer stopLoop()
+	<-ctx.Done()
 	return 0
 }
 
-// makeDaemonPorts builds the three pass actions from the real state store.
-// The checkall and cibridge ports share one store handle; the orchestrator
-// factory opens its own handle, so both are closed on shutdown.
+// makeDaemonPorts builds the legacy orchestrator pass ports from one store
+// handle. It is kept as a compatibility seam for callers that still assemble
+// the older daemon cycle; the production daemon command now uses the unified
+// ReconcileLoop and never calls CloseMerged's bridge refresh.
 func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
-	deps, closeStore, err := openMCPDependencies()
+	dir, err := stateDir()
 	if err != nil {
 		return orchestrator.DaemonPorts{}, nil, err
 	}
-	cleanup := func() error { return closeStore() }
+	db, err := openProcessStore(dir)
+	if err != nil {
+		return orchestrator.DaemonPorts{}, nil, err
+	}
 
-	txWriter, ok := deps.Store.(orchestrator.TxWriter)
+	txWriter, ok := any(db).(orchestrator.TxWriter)
 	if !ok {
-		_ = closeStore()
+		_ = db.Close()
 		return orchestrator.DaemonPorts{}, nil, fmt.Errorf("store does not support verdict writes")
 	}
 
 	registry := orchestrator.FuncRegistry{
 		FindFn: func(_ context.Context, pr orchestrator.PR) (orchestrator.WatchRef, bool, error) {
-			watches, err := deps.Store.ActiveWatches()
+			watches, err := db.LiveWatches()
 			if err != nil {
 				return orchestrator.WatchRef{}, false, err
 			}
 			for _, w := range watches {
 				if w.Repo == pr.Repo && w.PR == pr.Number && w.HeadSHA == pr.HeadSHA {
-					// A Watch left by an older release can name a service instead
-					// of a session (beacon-ci-checkall, beacon-daemon-checkall).
-					// Such a subscriber cannot receive a daemon wake, so skip the
-					// Watch. A fresh one must be created by the agent itself
-					// through beacon_watch_pr, not by the daemon.
 					subs := make([]orchestrator.DaemonSubscriber, 0, len(w.Subscribers))
 					for _, s := range w.Subscribers {
 						subs = append(subs, orchestrator.DaemonSubscriber{
 							ID: s.ID, Role: string(s.Role), Adapter: s.Adapter, Target: s.Target,
 						})
 					}
-					// The daemon wake path addresses only the executor. An
-					// executor subscribes asynchronously, so at registration time
-					// the Watch carries just the orchestrator session. Keep such
-					// an explicit orchestrator-only Watch valid here or checkall
-					// would register a duplicate on every pass. It still cannot
-					// receive a retry: that wake is refused downstream. Blocked
-					// escalations use the separate NotifyOrchestrator path.
 					if _, err := orchestrator.DaemonWakeSubscriber(subs); err != nil && !hasOrchestratorSession(subs) {
 						continue
 					}
@@ -122,29 +127,18 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 		},
 		// A Watch belongs to the subscriber that created it through
 		// beacon_watch_pr. The daemon only refreshes verdicts of existing
-		// Watches. Registering one here would attach an orchestrator subscriber
-		// and steer retry/ready into the orchestrator's own session.
+		// Watches and never registers one on its own.
 		RegisterFn: func(_ context.Context, pr orchestrator.PR) (orchestrator.WatchRef, error) {
 			return orchestrator.WatchRef{}, fmt.Errorf(
 				"daemon: Watch для PR %d должен создаваться агентом через beacon_watch_pr", pr.Number)
 		},
 	}
 
-	orchDeps, closeOrch, err := makeOrchestratorDeps(c)
+	orchDeps, err := orchestratorDepsFromDB(c, db)
 	if err != nil {
-		_ = closeStore()
+		_ = db.Close()
 		return orchestrator.DaemonPorts{}, nil, err
 	}
-	cleanup = func() error {
-		orchErr := closeOrch()
-		storeErr := closeStore()
-		return errors.Join(orchErr, storeErr)
-	}
-
-	// cibridge owns the merged/closed PR rule from #338. Refresh publishes a
-	// terminal state for those Watches, which closes them through the domain
-	// transition; it leaves ordinary ready/retry Watches to the other ports.
-	bridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, 0)
 
 	return orchestrator.DaemonPorts{
 		CheckAll: func(ctx context.Context) error {
@@ -160,12 +154,10 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			_, err := orchestrator.Run(ctx, orchDeps.Store, orchDeps.Merger, waker, orchestrator.Options{})
 			return err
 		},
-		CloseMerged: func(ctx context.Context) error {
-			bridge.Refresh(ctx)
-			return nil
-		},
+		// The single reconciler owns terminal-state refreshes now.
+		CloseMerged: func(context.Context) error { return nil },
 		Waker: orchestrator.NewDaemonWaker(func(id string) (orchestrator.DaemonWatch, error) {
-			w, err := deps.Store.Watch(id)
+			w, err := db.Watch(id)
 			if err != nil {
 				return orchestrator.DaemonWatch{}, err
 			}
@@ -178,21 +170,16 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			}
 			sub, err := orchestrator.DaemonWakeSubscriber(subs)
 			if err != nil {
-				// Leave SubscriberID empty: Wake logs the refusal once and
-				// returns a clear error instead of calling the prompt API.
 				return view, nil
 			}
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
 		}),
-	}, cleanup, nil
+	}, db.Close, nil
 }
 
 // hasOrchestratorSession reports whether subs carry an explicit orchestrator
-// session that can receive a blocked escalation. FindFn uses it to keep an
-// orchestrator-only Watch visible to checkall while its executor is still
-// subscribing; the daemon wake path itself never selects this subscriber
-// (see DaemonWakeSubscriber).
+// session that can receive a blocked escalation.
 func hasOrchestratorSession(subs []orchestrator.DaemonSubscriber) bool {
 	for _, s := range subs {
 		if s.Role != orchestrator.RoleOrchestrator {
@@ -209,21 +196,17 @@ func hasOrchestratorSession(subs []orchestrator.DaemonSubscriber) bool {
 	return false
 }
 
-// daemonGHRunner is the single gh seam used by the daemon's checkall pass.
+// daemonGHRunner is the single gh seam used by the legacy checkall pass.
 func daemonGHRunner(c *CLI) orchestrator.GHRunner {
 	return func(args ...string) ([]byte, error) {
 		res := c.run(c.root, "gh", args, nil)
 		if res.code == 0 {
 			return res.stdout, nil
 		}
-		reason := strings.TrimSpace(string(res.stderr))
+		reason := string(res.stderr)
 		if reason == "" {
-			reason = strings.TrimSpace(string(res.stdout))
+			reason = string(res.stdout)
 		}
-		return nil, fmt.Errorf("gh %s: %s", strings.Join(args, " "), reason)
+		return nil, ghError("gh", runResult{stderr: []byte(reason), code: res.code})
 	}
 }
-
-// The daemon's Waker lives in internal/app/orchestrator. cmd only projects the
-// Watch into primitive fields, because the ADR 0005 layer matrix forbids a
-// direct cmd -> internal/domain import.

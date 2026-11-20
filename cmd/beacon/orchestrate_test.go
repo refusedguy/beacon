@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -116,32 +115,6 @@ func TestProjectWatchCopiesBlocked(t *testing.T) {
 	}
 }
 
-// TestProjectActiveWatchesIncludesBlocked proves the orchestrator actually
-// sees a blocked Watch: domain ActiveWatches omits it, so the projection must
-// read all Watches and keep the blocked status explicitly.
-func TestProjectActiveWatchesIncludesBlocked(t *testing.T) {
-	all := []domain.Watch{
-		{ID: "watching", Status: domain.StatusWatching},
-		{ID: "notifying", Status: domain.StatusNotifying},
-		{ID: "blocked", Status: domain.StatusBlocked, Blocked: &domain.BlockedInfo{Reason: "чужой тест", FixAttempts: 1}},
-		{ID: "closed", Status: domain.StatusClosed},
-		{ID: "parked", Status: domain.StatusParked},
-	}
-
-	got := projectActiveWatches(all)
-
-	ids := make([]string, 0, len(got))
-	for _, w := range got {
-		ids = append(ids, w.ID)
-	}
-	if !reflect.DeepEqual(ids, []string{"watching", "notifying", "blocked"}) {
-		t.Fatalf("projected IDs = %q, want watching/notifying/blocked", ids)
-	}
-	if got[2].Blocked == nil || got[2].Blocked.FixAttempts != 1 {
-		t.Fatalf("blocked projection lost FixAttempts: %+v", got[2])
-	}
-}
-
 func TestOrchestrateDispatch(t *testing.T) {
 	previous := orchestratorRunner
 	t.Cleanup(func() { orchestratorRunner = previous })
@@ -157,132 +130,6 @@ func TestOrchestrateDispatch(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotArgs, []string{"--dry-run"}) {
 		t.Fatalf("args = %q, want [--dry-run]", gotArgs)
-	}
-}
-
-func ghViewArgs(pr int, fields string) []string {
-	return []string{"pr", "view", strconv.Itoa(pr), "--json", fields, "--repo", "refusedguy/beacon"}
-}
-
-func ghMergeArgs(pr int) []string {
-	return []string{"pr", "merge", strconv.Itoa(pr), "--squash", "--delete-branch"}
-}
-
-func TestGhMergerRunsSquashDeleteBranchAfterCleanGate(t *testing.T) {
-	c, _, _, calls := t06NewCLI(t, func(call t06Call) runResult {
-		if call.name != "gh" {
-			t.Fatalf("unexpected process: %+v", call)
-		}
-		switch {
-		case reflect.DeepEqual(call.args, ghViewArgs(42, "mergeable,mergeStateStatus,state")):
-			return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}`)}
-		case reflect.DeepEqual(call.args, ghMergeArgs(42)):
-			return runResult{}
-		case reflect.DeepEqual(call.args, ghViewArgs(42, "state")):
-			return runResult{stdout: []byte(`{"state":"MERGED"}`)}
-		default:
-			t.Fatalf("unexpected gh call: %+v", call)
-			return runResult{}
-		}
-	})
-	m := ghMerger{c: c}
-
-	outcome, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 42)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !outcome.Merged || outcome.Pending || outcome.Reason != "" {
-		t.Fatalf("outcome = %+v, want confirmed MERGE", outcome)
-	}
-	want := [][]string{ghViewArgs(42, "mergeable,mergeStateStatus,state"), ghMergeArgs(42), ghViewArgs(42, "state")}
-	if len(*calls) != len(want) {
-		t.Fatalf("calls = %+v, want %d", *calls, len(want))
-	}
-	for i, args := range want {
-		if (*calls)[i].name != "gh" || !reflect.DeepEqual((*calls)[i].args, args) {
-			t.Fatalf("call %d = %+v, want gh %v", i, (*calls)[i], args)
-		}
-	}
-}
-
-func TestGhMergerDirtyPRIsRefusedBeforeMerge(t *testing.T) {
-	c, _, _, calls := t06NewCLI(t, func(call t06Call) runResult {
-		if call.name != "gh" || !reflect.DeepEqual(call.args, ghViewArgs(312, "mergeable,mergeStateStatus,state")) {
-			t.Fatalf("unexpected call: %+v", call)
-		}
-		return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"DIRTY","state":"OPEN"}`)}
-	})
-	m := ghMerger{c: c}
-
-	outcome, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 312)
-	if err != nil {
-		t.Fatalf("dirty PR is a diagnostic, not an error: %v", err)
-	}
-	if outcome.Merged || outcome.Pending {
-		t.Fatalf("outcome = %+v, want a held PR", outcome)
-	}
-	if !strings.Contains(outcome.Reason, "mergeStateStatus=DIRTY") {
-		t.Fatalf("reason = %q, want DIRTY", outcome.Reason)
-	}
-	if len(*calls) != 1 {
-		t.Fatalf("gh pr merge must not run for a dirty PR: %+v", *calls)
-	}
-}
-
-func TestGhMergerMergeErrorStaysOneLine(t *testing.T) {
-	const hint = "GraphQL: Auto merge is not allowed (enablePullRequestAutoMerge)\n" +
-		"\nFor more information see: https://cli.github.com/manual/gh_pr_merge\n" +
-		"Use 'gh pr merge --squash' instead."
-	c, _, _, _ := t06NewCLI(t, func(call t06Call) runResult {
-		switch {
-		case reflect.DeepEqual(call.args, ghViewArgs(42, "mergeable,mergeStateStatus,state")):
-			return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}`)}
-		case reflect.DeepEqual(call.args, ghMergeArgs(42)):
-			return runResult{code: 1, stderr: []byte(hint)}
-		default:
-			t.Fatalf("unexpected call: %+v", call)
-			return runResult{}
-		}
-	})
-	m := ghMerger{c: c}
-
-	_, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 42)
-	if err == nil {
-		t.Fatal("expected a merge failure")
-	}
-	if strings.Contains(err.Error(), "\n") || strings.Contains(err.Error(), "\r") {
-		t.Fatalf("multi-line gh stderr leaked into the error: %q", err.Error())
-	}
-	if strings.Contains(err.Error(), "https://cli.github.com") {
-		t.Fatalf("gh hint leaked into the error: %q", err.Error())
-	}
-	if !strings.HasPrefix(err.Error(), "gh pr merge 42: GraphQL:") {
-		t.Fatalf("error = %q", err.Error())
-	}
-}
-
-func TestGhMergerPendingStateKeepsWatchOpen(t *testing.T) {
-	c, _, _, _ := t06NewCLI(t, func(call t06Call) runResult {
-		switch {
-		case reflect.DeepEqual(call.args, ghViewArgs(42, "mergeable,mergeStateStatus,state")):
-			return runResult{stdout: []byte(`{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","state":"OPEN"}`)}
-		case reflect.DeepEqual(call.args, ghMergeArgs(42)):
-			return runResult{}
-		case reflect.DeepEqual(call.args, ghViewArgs(42, "state")):
-			return runResult{stdout: []byte(`{"state":"OPEN"}`)}
-		default:
-			t.Fatalf("unexpected call: %+v", call)
-			return runResult{}
-		}
-	})
-	m := ghMerger{c: c}
-
-	outcome, err := m.MergeChecked(context.Background(), "refusedguy/beacon", 42)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !outcome.Pending || outcome.Merged {
-		t.Fatalf("outcome = %+v, want pending", outcome)
 	}
 }
 
@@ -348,5 +195,32 @@ func TestOrchestrateBadFormat(t *testing.T) {
 	}
 	if out.Len() != 0 || !strings.Contains(errOut.String(), "неизвестный формат") {
 		t.Fatalf("stdout %q stderr %q", out.String(), errOut.String())
+	}
+}
+
+// recordingDomainMerger records the explicit repo argument and returns a
+// scripted outcome, so the adapter can be checked without a network or gh.
+type recordingDomainMerger struct {
+	repo   string
+	pr     int
+	merged bool
+	held   bool
+	reason string
+	err    error
+}
+
+func (m *recordingDomainMerger) Merge(_ context.Context, repo string, pr int) (bool, bool, string, error) {
+	m.repo, m.pr = repo, pr
+	return m.merged, m.held, m.reason, m.err
+}
+
+func TestDomainMergeAdapterPassesRepoAndReportsHold(t *testing.T) {
+	fake := &recordingDomainMerger{held: true, reason: "conflict"}
+	err := (domainMergeAdapter{merger: fake}).Merge(context.Background(), "owner/name", 42)
+	if err == nil || !strings.Contains(err.Error(), "conflict") {
+		t.Fatalf("error = %v, want a hold with the provider reason", err)
+	}
+	if fake.repo != "owner/name" || fake.pr != 42 {
+		t.Fatalf("merge called with %s#%d, want owner/name#42", fake.repo, fake.pr)
 	}
 }
