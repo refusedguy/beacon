@@ -89,7 +89,7 @@ func TestGhMergerRunsSquashDeleteBranch(t *testing.T) {
 	}
 	call := (*calls)[0]
 	if call.name != "gh" || !reflect.DeepEqual(call.args,
-		[]string{"pr", "merge", "42", "--squash", "--delete-branch"}) {
+		[]string{"pr", "merge", "42", "--auto", "--squash", "--delete-branch"}) {
 		t.Fatalf("gh call = %+v", call)
 	}
 }
@@ -111,7 +111,7 @@ func TestOrchestrateDryRunPrintsActionsWithoutMerge(t *testing.T) {
 	if len(st.closed) != 0 {
 		t.Fatalf("dry run must not close watches: %q", st.closed)
 	}
-	if !strings.Contains(out.String(), "gh pr merge 42 --squash --delete-branch") {
+	if !strings.Contains(out.String(), "gh pr merge 42 --auto --squash --delete-branch") {
 		t.Fatalf("stdout = %q, want the planned gh command", out.String())
 	}
 }

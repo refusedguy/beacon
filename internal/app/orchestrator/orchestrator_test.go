@@ -241,7 +241,7 @@ func TestRunDryRunDoesNotMergeRecordOrClose(t *testing.T) {
 	if len(st.merged) != 0 || len(st.closed) != 0 {
 		t.Fatalf("dry run must not write state: merged=%v closed=%q", st.merged, st.closed)
 	}
-	if !result.DryRun || len(result.Actions) != 1 || result.Actions[0].Command != "gh pr merge 42 --squash --delete-branch" {
+	if !result.DryRun || len(result.Actions) != 1 || result.Actions[0].Command != "gh pr merge 42 --auto --squash --delete-branch" {
 		t.Fatalf("dry run actions = %+v", result.Actions)
 	}
 }

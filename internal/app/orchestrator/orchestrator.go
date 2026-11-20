@@ -303,7 +303,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		return
 	}
 
-	command := fmt.Sprintf("gh pr merge %d --squash --delete-branch", w.PR)
+	command := fmt.Sprintf("gh pr merge %d --auto --squash --delete-branch", w.PR)
 	if opts.DryRun {
 		out.Actions = append(out.Actions, Action{
 			Action: ActionDryRun, WatchID: w.ID, PR: w.PR, Revision: w.Revision,

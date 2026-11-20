@@ -47,15 +47,18 @@ func SetOrchestratorDeps(fn orchestratorDepsFactory) {
 }
 
 // ghMerger is the production Merger. It runs exactly
-// `gh pr merge <pr> --squash --delete-branch` through the CLI runner, so the
-// call is injectable in tests and no HTTP or shell is hidden here.
+// `gh pr merge <pr> --auto --squash --delete-branch` through the CLI runner, so
+// the call is injectable in tests and no HTTP or shell is hidden here. The
+// --auto flag queues the merge until GitHub's own requirements are met;
+// without it gh refuses a PR that Beacon already sees as ready and prints a
+// long "add the --auto flag" hint on every daemon pass.
 type ghMerger struct {
 	c *CLI
 }
 
 func (m ghMerger) Merge(ctx context.Context, repo string, pr int) error {
 	res := m.c.run(m.c.root, "gh", []string{
-		"pr", "merge", strconv.Itoa(pr), "--squash", "--delete-branch",
+		"pr", "merge", strconv.Itoa(pr), "--auto", "--squash", "--delete-branch",
 	}, nil)
 	if res.code == 0 {
 		return nil
