@@ -3,12 +3,15 @@
 package wake
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -2434,4 +2437,318 @@ func TestConcurrentClaimGrantsOneLeaseT209(t *testing.T) {
 		t.Fatalf("granted %d leases, want exactly 1", granted)
 	}
 }
+
+// ===== T3.210-T3.215 =====
+
+type t210FakeAdapter struct {
+	binds    int
+	delivers int
+	observes int
+	target   T210Target
+}
+
+func (a *t210FakeAdapter) Bind(p T210WakePointer, sessions *T211SessionRegistry) (T210Target, bool) {
+	a.binds++
+	if a.target != "" {
+		return a.target, true
+	}
+	_, ok := sessions.Lookup(p.Adapter, p.Target)
+	return "", ok
+}
+
+func (a *t210FakeAdapter) Deliver(p T210WakePointer, _ T210Target) (T210Receipt, error) {
+	a.delivers++
+	return T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Delivered}, nil
+}
+
+func (a *t210FakeAdapter) Observe(_ T210WakePointer, _ T210Receipt) error {
+	a.observes++
+	return nil
+}
+
+func TestT210BindThroughRegistryAndSkipUnknown(t *testing.T) {
+	sessions := T211NewSessionRegistry()
+	adapters := T211NewAdapterRegistry()
+	deliveries := T211NewDeliveryRegistry()
+	a := &t210FakeAdapter{}
+	adapters.Register("bridge-a", a)
+
+	unknown := T210WakePointer{Adapter: "bridge-b", ObligationID: "o-0"}
+	if _, ok := T210Deliver(context.Background(), unknown, nil, sessions, adapters, deliveries); ok {
+		t.Fatal("unknown adapter was delivered")
+	}
+	missing := T210WakePointer{Adapter: "bridge-a", Target: "t-missing", ObligationID: "o-1"}
+	if _, ok := T210Deliver(context.Background(), missing, nil, sessions, adapters, deliveries); ok {
+		t.Fatal("unregistered target was delivered")
+	}
+	if a.delivers != 0 {
+		t.Fatalf("adapter delivered %d times before a registry match", a.delivers)
+	}
+
+	sessions.Add("bridge-a", "t-1", "ses_1")
+	p := T210WakePointer{Adapter: "bridge-a", Target: "t-1", ObligationID: "o-2", Attempt: 3, Delivery: "steer"}
+	r, ok := T210Deliver(context.Background(), p, nil, sessions, adapters, deliveries)
+	if !ok || r.Outcome != T210Delivered || r.ObligationID != "o-2" {
+		t.Fatalf("delivery = %+v, ok = %v", r, ok)
+	}
+	if a.delivers != 1 || a.observes != 2 {
+		t.Fatalf("delivers = %d, observes = %d, want 1 and 2", a.delivers, a.observes)
+	}
+}
+
+func TestT211RegistriesKeepTargetsOpaqueAndImportReceipts(t *testing.T) {
+	sessions := T211NewSessionRegistry()
+	if !sessions.AddFromMeta("bridge-a", map[string]string{"ai.opencode/sessionID": "ses_meta"}, "t-ignored") {
+		t.Fatal("AddFromMeta rejected a valid _meta")
+	}
+	if sid, ok := sessions.Lookup("bridge-a", "ses_meta"); !ok || sid != "ses_meta" {
+		t.Fatalf("_meta lookup = %q, %v", sid, ok)
+	}
+	if !sessions.AddFromMeta("bridge-a", map[string]string{}, "notify-target") {
+		t.Fatal("AddFromMeta rejected notify.target")
+	}
+	if sid, ok := sessions.Lookup("bridge-a", "notify-target"); !ok || sid != "notify-target" {
+		t.Fatalf("notify lookup = %q, %v", sid, ok)
+	}
+
+	adapters := T211NewAdapterRegistry()
+	adapters.Register("bridge-a", &t210FakeAdapter{})
+	adapters.Register("bridge-b", &t210FakeAdapter{})
+	if _, ok := adapters.Get("bridge-a"); !ok {
+		t.Fatal("registered adapter missing")
+	}
+	if _, ok := adapters.Get("bridge-c"); ok {
+		t.Fatal("unknown adapter found")
+	}
+
+	d := T211NewDeliveryRegistry()
+	batch := []T210Receipt{
+		{ObligationID: "o-1", Attempt: 1, Outcome: T210Delivered},
+		{ObligationID: "o-1", Attempt: 1, Outcome: T210Delivered},
+		{ObligationID: "o-1", Attempt: 2, Outcome: T210Queued},
+	}
+	if got := d.ImportReceipts(batch); got != 2 {
+		t.Fatalf("ImportReceipts added %d, want 2", got)
+	}
+	if !d.Has("o-1", 2) || d.Has("o-1", 3) {
+		t.Fatal("delivery registry has wrong keys")
+	}
+	if r, ok := d.Get("o-1", 1); !ok || r.Outcome != T210Delivered {
+		t.Fatalf("stored receipt = %+v, %v", r, ok)
+	}
+}
+
+func TestT212PromptTextHasIdentifiersOnly(t *testing.T) {
+	p := T210WakePointer{
+		WatchID:      `watch<&>"'` + "\n\x00",
+		ObligationID: "obl-9",
+		Revision:     42,
+		VerdictRef:   "watch-9/revision/42",
+	}
+	text := T212buildPromptText(p)
+	if !strings.HasPrefix(text, "<beacon-event>") || !strings.HasSuffix(text, "</beacon-event>") {
+		t.Fatalf("bad envelope: %q", text)
+	}
+	if len(text) > 512 {
+		t.Fatalf("prompt is %d bytes, want at most 512", len(text))
+	}
+	for _, forbidden := range []string{"checkName", "prTitle", "branch", "<watch", "\n"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("prompt contains %q: %s", forbidden, text)
+		}
+	}
+	for _, want := range []string{`"watchID"`, `"obligationID"`, `"revision"`, `"verdictRef"`, `"obl-9"`, "42"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("prompt missing %q: %s", want, text)
+		}
+	}
+	if !strings.Contains(text, `\u0026lt;`) || !strings.Contains(text, `\\u0000`) {
+		t.Fatalf("escapeUntrusted did not escape markup and control chars: %q", text)
+	}
+	long := p
+	long.WatchID = strings.Repeat("w", 5000)
+	if got := len(T212buildPromptText(long)); got > 512 {
+		t.Fatalf("long prompt is %d bytes, want at most 512", got)
+	}
+}
+
+func TestT213SpoolSourceDedupeAndCursor(t *testing.T) {
+	dir := t.TempDir()
+	src := T213NewSpoolSource(dir)
+	event := func(id string) string {
+		return `{"adapter":"bridge-a","target":"t-1","watchID":"w-1","obligationID":"` + id + `","attempt":1,"version":"v"}`
+	}
+	lines := strings.Join([]string{
+		event("o-1"),
+		`{broken json`,
+		event("o-1"),
+		event("o-2"),
+	}, "\n") // no trailing newline: the last line is unfinished
+	if err := os.WriteFile(src.Path, []byte(lines), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p, ok := src.Next()
+	if !ok || p.ObligationID != "o-1" {
+		t.Fatalf("first pointer = %+v, %v", p, ok)
+	}
+	if err := src.Commit(p); err != nil {
+		t.Fatal(err)
+	}
+	receipt := filepath.Join(src.ReceiptsDir, "o-1-1.wrote")
+	info, err := os.Stat(receipt)
+	if err != nil {
+		t.Fatalf("receipt missing: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("receipt mode = %v, want 0600", info.Mode().Perm())
+	}
+	c := src.Cursor()
+	if c.Offset == 0 || c.Epoch == "" {
+		t.Fatalf("cursor = %+v, want a read prefix and hash", c)
+	}
+
+	if next, ok := src.Next(); ok {
+		t.Fatalf("duplicate and unfinished lines produced a pointer: %+v", next)
+	}
+	// A later complete line is still delivered after the broken ones.
+	f, err := os.OpenFile(src.Path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(f, "\n"+event("o-3")+"\n")
+	_ = f.Close()
+	if next, ok := src.Next(); !ok || next.ObligationID != "o-2" {
+		t.Fatalf("completed line pointer = %+v, %v", next, ok)
+	}
+	if err := src.Commit(T210WakePointer{ObligationID: "o-2", Attempt: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if next, ok := src.Next(); !ok || next.ObligationID != "o-3" {
+		t.Fatalf("appended pointer = %+v, %v", next, ok)
+	}
+}
+
+func TestT214McpPullSourceUsesTwoMCPTools(t *testing.T) {
+	var calls []string
+	var claimArgs, receiptArgs map[string]any
+	src := &T214McpPullSource{
+		Adapter: "bridge-a",
+		Target:  "t-mcp",
+		Call: func(_ context.Context, tool string, args map[string]any) ([]byte, error) {
+			calls = append(calls, tool)
+			switch tool {
+			case "beacon_wake_claim":
+				claimArgs = args
+				return []byte(`{"adapter":"bridge-a","target":"t-mcp","obligationID":"o-mcp","attempt":2,"delivery":"steer","resume":false}`), nil
+			case "beacon_wake_receipt":
+				receiptArgs = args
+				return []byte(`{"ok":true}`), nil
+			default:
+				return nil, fmt.Errorf("unexpected tool %q", tool)
+			}
+		},
+	}
+	p, ok := src.Next()
+	if !ok || p.ObligationID != "o-mcp" {
+		t.Fatalf("claim pointer = %+v, %v", p, ok)
+	}
+	if err := src.Commit(p); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(calls, []string{"beacon_wake_claim", "beacon_wake_receipt"}) {
+		t.Fatalf("tools = %v", calls)
+	}
+	if claimArgs["adapter"] != "bridge-a" || claimArgs["target"] != "t-mcp" {
+		t.Fatalf("claim args = %v", claimArgs)
+	}
+	if receiptArgs["obligationID"] != "o-mcp" || receiptArgs["attempt"] != 2 {
+		t.Fatalf("receipt args = %v", receiptArgs)
+	}
+	if receiptArgs["outcome"] != T210Enqueued {
+		t.Fatalf("receipt outcome = %v, want %q", receiptArgs["outcome"], T210Enqueued)
+	}
+	if _, ok := src.Next(); ok {
+		t.Fatal("second claim returned a pointer")
+	}
+}
+
+type t215Doer struct {
+	status int
+	body   []byte
+	calls  int
+}
+
+func (d *t215Doer) Do(req *http.Request) (*http.Response, error) {
+	d.calls++
+	d.body, _ = io.ReadAll(req.Body)
+	return &http.Response{
+		StatusCode: d.status,
+		Body:       io.NopCloser(bytes.NewReader(nil)),
+	}, nil
+}
+
+func TestT215SteerQueueAndResumeFalse(t *testing.T) {
+	sessions := T211NewSessionRegistry()
+	sessions.Add("bridge-a", "t-1", "ses_1")
+	steerEvents := []T215Event{
+		{Type: "session.inbox.enqueued", SessionID: "ses_1"},
+		{Type: "session.inbox.delivered", SessionID: "ses_1"},
+		{Type: "session.execution.started", SessionID: "ses_1"},
+	}
+	enqueuedEvents := []T215Event{{Type: "session.inbox.enqueued", SessionID: "ses_1"}}
+	cases := []struct {
+		name       string
+		delivery   string
+		resume     *bool
+		events     []T215Event
+		wantResult string
+		wantResume bool
+	}{
+		{name: "steer", delivery: "steer", events: steerEvents, wantResult: T210Delivered},
+		{name: "queue", delivery: "queue", events: enqueuedEvents, wantResult: T210Queued},
+		{name: "resume false", delivery: "steer", resume: boolPtr(false), events: enqueuedEvents, wantResult: T210Enqueued, wantResume: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doer := &t215Doer{status: http.StatusOK}
+			a := &T215Adapter{BaseURL: "http://127.0.0.1:1", Doer: doer, Events: func(context.Context) ([]T215Event, error) {
+				return tc.events, nil
+			}}
+			target, ok := a.Bind(T210WakePointer{Adapter: "bridge-a", Target: "t-1"}, sessions)
+			if !ok || target != "ses_1" {
+				t.Fatalf("bind = %q, %v", target, ok)
+			}
+			p := T210WakePointer{Adapter: "bridge-a", Target: "t-1", ObligationID: "o-1", Delivery: tc.delivery, Resume: tc.resume}
+			r, err := a.Deliver(p, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.Outcome != tc.wantResult {
+				t.Fatalf("outcome = %q, want %q", r.Outcome, tc.wantResult)
+			}
+			if doer.calls != 1 {
+				t.Fatalf("HTTP calls = %d, want 1", doer.calls)
+			}
+			var sent map[string]any
+			if err := json.Unmarshal(doer.body, &sent); err != nil {
+				t.Fatal(err)
+			}
+			if sent["delivery"] != tc.delivery {
+				t.Fatalf("body delivery = %v", sent["delivery"])
+			}
+			if _, has := sent["resume"]; has != tc.wantResume {
+				t.Fatalf("body resume presence = %v, want %v", has, tc.wantResume)
+			}
+			if _, has := sent["text"]; !has {
+				t.Fatal("body has no prompt text")
+			}
+		})
+	}
+	if T215classify([]T215Event{{Type: "session.inbox.enqueued", SessionID: "ses_1"}}, "ses_1", "steer", true) != T210Enqueued {
+		t.Fatal("resume:false path reported delivered without delivered/started events")
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }
 

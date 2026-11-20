@@ -14,7 +14,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2376,5 +2378,582 @@ func (m *T209Manager) Reasons() []T209Reason {
 	defer m.mu.Unlock()
 
 	return append([]T209Reason(nil), m.reasons...)
+}
+
+// ===== T3.210-T3.215: universal wake bridge (ADR 0069, 0071, 0072, 0075) =====
+
+// T210Target is an opaque session handle. Only the adapter that produced it
+// may interpret it. The core never parses it and never guesses a session.
+type T210Target string
+
+// T210WakePointer carries identifiers only. Check names, PR titles and branch
+// names never enter the bridge.
+type T210WakePointer struct {
+	Adapter      string `json:"adapter,omitempty"`
+	Target       string `json:"target,omitempty"`
+	WatchID      string `json:"watchID,omitempty"`
+	ObligationID string `json:"obligationID,omitempty"`
+	Revision     uint64 `json:"revision,omitempty"`
+	VerdictRef   string `json:"verdictRef,omitempty"`
+	Attempt      int    `json:"attempt,omitempty"`
+	Delivery     string `json:"delivery,omitempty"`
+	Resume       *bool  `json:"resume,omitempty"`
+}
+
+// T210Receipt records one delivery attempt.
+type T210Receipt struct {
+	ObligationID string `json:"obligationID"`
+	Attempt      int    `json:"attempt"`
+	Delivery     string `json:"delivery"`
+	Outcome      string `json:"outcome"`
+}
+
+const (
+	T210Delivered = "delivered"
+	T210Queued    = "queued"
+	T210Enqueued  = "enqueued"
+	T210Skipped   = "skipped"
+	T210Errored   = "error"
+)
+
+// T210WakeAdapter is the minimal contract shared by every environment.
+// Observe and Dispose stay optional so an adapter with only bind and deliver
+// is a valid implementation.
+type T210WakeAdapter interface {
+	Bind(p T210WakePointer, sessions *T211SessionRegistry) (T210Target, bool)
+	Deliver(p T210WakePointer, target T210Target) (T210Receipt, error)
+}
+
+type T210ObservingAdapter interface {
+	Observe(p T210WakePointer, r T210Receipt) error
+}
+
+type T210DisposingAdapter interface {
+	Dispose(p T210WakePointer) error
+}
+
+// T210PointerSource yields pointers and commits progress after delivery.
+type T210PointerSource interface {
+	Next() (T210WakePointer, bool)
+	Commit(p T210WakePointer) error
+}
+
+// T210Deliver is the central path. It binds through the registry only. A
+// pointer with no exact match is skipped, never routed to a guessed session.
+func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, sessions *T211SessionRegistry, adapters *T211AdapterRegistry, deliveries *T211DeliveryRegistry) (T210Receipt, bool) {
+	adapter, ok := adapters.Get(p.Adapter)
+	if !ok {
+		T210settle(src, p, deliveries, T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Outcome: T210Skipped}, nil)
+		return T210Receipt{}, false
+	}
+	target, ok := adapter.Bind(p, sessions)
+	if !ok {
+		r := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}
+		T210settle(src, p, deliveries, r, adapter)
+		return r, false
+	}
+	r, err := adapter.Deliver(p, target)
+	if err != nil {
+		r = T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Errored}
+	}
+	T210settle(src, p, deliveries, r, adapter)
+	return r, true
+}
+
+func T210settle(src T210PointerSource, p T210WakePointer, deliveries *T211DeliveryRegistry, r T210Receipt, adapter T210WakeAdapter) {
+	if adapter != nil {
+		if obs, ok := adapter.(T210ObservingAdapter); ok {
+			_ = obs.Observe(p, r)
+		}
+		if d, ok := adapter.(T210DisposingAdapter); ok {
+			_ = d.Dispose(p)
+		}
+	}
+	if deliveries != nil {
+		deliveries.ImportReceipts([]T210Receipt{r})
+	}
+	if src != nil {
+		_ = src.Commit(p)
+	}
+}
+
+// ===== T3.211: three explicit registries =====
+
+type T211SessionKey struct {
+	Adapter string
+	Target  string
+}
+
+// T211SessionRegistry maps an opaque adapter/target pair to a session ID.
+type T211SessionRegistry struct {
+	mu    sync.RWMutex
+	byKey map[T211SessionKey]string
+}
+
+func T211NewSessionRegistry() *T211SessionRegistry {
+	return &T211SessionRegistry{byKey: make(map[T211SessionKey]string)}
+}
+
+func (r *T211SessionRegistry) Add(adapter, target, sessionID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byKey == nil {
+		r.byKey = make(map[T211SessionKey]string)
+	}
+	r.byKey[T211SessionKey{Adapter: adapter, Target: target}] = sessionID
+}
+
+func (r *T211SessionRegistry) Lookup(adapter, target string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.byKey[T211SessionKey{Adapter: adapter, Target: target}]
+	return s, ok
+}
+
+// AddFromMeta fills the registry from the MCP caller's _meta and notify.target.
+// The values stay opaque strings here, so no environment name reaches the core.
+func (r *T211SessionRegistry) AddFromMeta(adapter string, meta map[string]string, notifyTarget string) bool {
+	target := meta["ai.opencode/sessionID"]
+	if target == "" {
+		target = meta["beacon/sessionID"]
+	}
+	if target == "" {
+		target = notifyTarget
+	}
+	if target == "" {
+		return false
+	}
+	sessionID := meta["beacon/sessionID"]
+	if sessionID == "" {
+		sessionID = target
+	}
+	r.Add(adapter, target, sessionID)
+	return true
+}
+
+// T211AdapterRegistry keeps adapter names opaque; the core does not switch on
+// them and one beacon_watch_pr can be served by two bridges at once.
+type T211AdapterRegistry struct {
+	mu       sync.RWMutex
+	adapters map[string]T210WakeAdapter
+}
+
+func T211NewAdapterRegistry() *T211AdapterRegistry {
+	return &T211AdapterRegistry{adapters: make(map[string]T210WakeAdapter)}
+}
+
+func (r *T211AdapterRegistry) Register(name string, a T210WakeAdapter) {
+	if r == nil || a == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.adapters == nil {
+		r.adapters = make(map[string]T210WakeAdapter)
+	}
+	r.adapters[name] = a
+}
+
+func (r *T211AdapterRegistry) Get(name string) (T210WakeAdapter, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	a, ok := r.adapters[name]
+	return a, ok
+}
+
+type T211DeliveryKey struct {
+	ObligationID string
+	Attempt      int
+}
+
+// T211DeliveryRegistry imports receipts from files into one in-memory view.
+type T211DeliveryRegistry struct {
+	mu       sync.RWMutex
+	receipts map[T211DeliveryKey]T210Receipt
+}
+
+func T211NewDeliveryRegistry() *T211DeliveryRegistry {
+	return &T211DeliveryRegistry{receipts: make(map[T211DeliveryKey]T210Receipt)}
+}
+
+// ImportReceipts stores unseen (obligationID, attempt) pairs and returns the
+// number of newly imported receipts.
+func (r *T211DeliveryRegistry) ImportReceipts(in []T210Receipt) int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.receipts == nil {
+		r.receipts = make(map[T211DeliveryKey]T210Receipt)
+	}
+	added := 0
+	for _, receipt := range in {
+		k := T211DeliveryKey{ObligationID: receipt.ObligationID, Attempt: receipt.Attempt}
+		if _, ok := r.receipts[k]; ok {
+			continue
+		}
+		r.receipts[k] = receipt
+		added++
+	}
+	return added
+}
+
+func (r *T211DeliveryRegistry) Has(obligationID string, attempt int) bool {
+	_, ok := r.Get(obligationID, attempt)
+	return ok
+}
+
+func (r *T211DeliveryRegistry) Get(obligationID string, attempt int) (T210Receipt, bool) {
+	if r == nil {
+		return T210Receipt{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	receipt, ok := r.receipts[T211DeliveryKey{ObligationID: obligationID, Attempt: attempt}]
+	return receipt, ok
+}
+
+// ===== T3.212: prompt text with identifiers only =====
+
+// T212escapeUntrusted escapes every character that could turn an identifier
+// into markup, a JSON string delimiter or a control sequence.
+func T212escapeUntrusted(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '&':
+			b.WriteString("&amp;")
+		case '"':
+			b.WriteString("&quot;")
+		case '\'':
+			b.WriteString("&#39;")
+		default:
+			if r < 0x20 || r == 0x7f {
+				b.WriteString(fmt.Sprintf("\\u%04x", r))
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+func T212clamp(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
+}
+
+type T212PromptData struct {
+	WatchID      string `json:"watchID"`
+	ObligationID string `json:"obligationID"`
+	Revision     uint64 `json:"revision"`
+	VerdictRef   string `json:"verdictRef"`
+}
+
+// T212buildPromptText returns the <beacon-event> envelope. It has no check
+// name, PR title or branch, and never exceeds 512 bytes.
+func T212buildPromptText(p T210WakePointer) string {
+	data := T212PromptData{
+		WatchID:      T212clamp(T212escapeUntrusted(p.WatchID), 96),
+		ObligationID: T212clamp(T212escapeUntrusted(p.ObligationID), 96),
+		Revision:     p.Revision,
+		VerdictRef:   T212clamp(T212escapeUntrusted(p.VerdictRef), 96),
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		raw = []byte(`{}`)
+	}
+	const limit = 512
+	text := "<beacon-event>" + string(raw) + "</beacon-event>"
+	if len(text) > limit {
+		keep := limit - len("</beacon-event>")
+		text = text[:keep] + "</beacon-event>"
+	}
+	return text
+}
+
+// ===== T3.213: SpoolSource for local plugins =====
+
+type T213Cursor struct {
+	Offset int64  `json:"offset"`
+	Epoch  string `json:"epoch"`
+}
+
+// T213SpoolSource reads events.jsonl with a {offset, epoch} cursor and a
+// write-once receipt per (obligationID, attempt).
+type T213SpoolSource struct {
+	Path        string
+	ReceiptsDir string
+
+	mu      sync.Mutex
+	offset  int64
+	epoch   string
+	pending *T210WakePointer
+}
+
+func T213NewSpoolSource(stateDir string) *T213SpoolSource {
+	return &T213SpoolSource{
+		Path:        filepath.Join(stateDir, "events.jsonl"),
+		ReceiptsDir: filepath.Join(stateDir, "receipts"),
+	}
+}
+
+func (s *T213SpoolSource) Next() (T210WakePointer, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		if s.pending != nil {
+			p := *s.pending
+			return p, true
+		}
+		data, err := os.ReadFile(s.Path)
+		if err != nil || s.offset >= int64(len(data)) {
+			return T210WakePointer{}, false
+		}
+		chunk := data[s.offset:]
+		nl := bytes.IndexByte(chunk, '\n')
+		if nl < 0 {
+			return T210WakePointer{}, false // unfinished line
+		}
+		line := chunk[:nl]
+		s.offset += int64(nl + 1)
+		s.epoch = T213prefixHash(data[:s.offset])
+		var p T210WakePointer
+		if err := json.Unmarshal(bytes.TrimSpace(line), &p); err != nil || p.ObligationID == "" {
+			continue // a broken line must not break later events
+		}
+		fresh, err := s.claim(p)
+		if err != nil || !fresh {
+			continue // EEXIST means this pair was already delivered
+		}
+		s.pending = &p
+		return p, true
+	}
+}
+
+// claim creates receipts/<id>.wrote with "wx" semantics (O_CREATE|O_EXCL).
+func (s *T213SpoolSource) claim(p T210WakePointer) (bool, error) {
+	if err := os.MkdirAll(s.ReceiptsDir, 0o700); err != nil {
+		return false, err
+	}
+	name := p.ObligationID + "-" + strconv.Itoa(p.Attempt) + ".wrote"
+	name = strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(name)
+	f, err := os.OpenFile(filepath.Join(s.ReceiptsDir, name), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	_, _ = io.WriteString(f, p.Target+"\n")
+	return true, nil
+}
+
+func (s *T213SpoolSource) Commit(_ T210WakePointer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		return nil
+	}
+	s.pending = nil
+	raw, err := json.Marshal(T213Cursor{Offset: s.offset, Epoch: s.epoch})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(filepath.Dir(s.Path), "wake-cursor.json"), raw, 0o600)
+}
+
+func (s *T213SpoolSource) Cursor() T213Cursor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return T213Cursor{Offset: s.offset, Epoch: s.epoch}
+}
+
+func T213prefixHash(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// ===== T3.214: McpPullSource for processes without a local spool =====
+
+type T214MCPCall func(ctx context.Context, tool string, args map[string]any) ([]byte, error)
+
+// T214McpPullSource is an MCP client. It pulls a pointer with
+// beacon_wake_claim and records the result with beacon_wake_receipt. It never
+// touches events.jsonl or a receipt directory.
+type T214McpPullSource struct {
+	Adapter string
+	Target  string
+	Call    T214MCPCall
+
+	mu      sync.Mutex
+	fetched bool
+}
+
+func (s *T214McpPullSource) Next() (T210WakePointer, bool) {
+	if s == nil || s.Call == nil || s.fetched {
+		return T210WakePointer{}, false
+	}
+	raw, err := s.Call(context.Background(), "beacon_wake_claim", map[string]any{
+		"adapter": s.Adapter,
+		"target":  s.Target,
+	})
+	if err != nil || len(raw) == 0 {
+		return T210WakePointer{}, false
+	}
+	var p T210WakePointer
+	if err := json.Unmarshal(raw, &p); err != nil || p.ObligationID == "" {
+		return T210WakePointer{}, false
+	}
+	s.mu.Lock()
+	s.fetched = true
+	s.mu.Unlock()
+	return p, true
+}
+
+func (s *T214McpPullSource) Commit(p T210WakePointer) error {
+	if s == nil || s.Call == nil {
+		return nil
+	}
+	_, err := s.Call(context.Background(), "beacon_wake_receipt", map[string]any{
+		"obligationID": p.ObligationID,
+		"attempt":      p.Attempt,
+		"delivery":     p.Delivery,
+		"outcome":      p.Outcome(),
+	})
+	return err
+}
+
+// Outcome keeps the receipt outcome explicit without adding a field to the
+// pointer contract.
+func (p T210WakePointer) Outcome() string {
+	if p.Delivery == "queue" {
+		return T210Queued
+	}
+	if p.Resume != nil && !*p.Resume {
+		return T210Enqueued
+	}
+	return T210Delivered
+}
+
+// ===== T3.215: OpenCode HTTP adapter =====
+
+type T215Doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type T215Event struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionID"`
+}
+
+// T215Adapter posts a steer prompt through the native HTTP API and confirms
+// delivery from the event stream. It needs no plugin and no local spool.
+type T215Adapter struct {
+	BaseURL string
+	Doer    T215Doer
+	Events  func(ctx context.Context) ([]T215Event, error)
+}
+
+func (a *T215Adapter) Bind(p T210WakePointer, sessions *T211SessionRegistry) (T210Target, bool) {
+	sessionID, ok := sessions.Lookup(p.Adapter, p.Target)
+	if !ok || !strings.HasPrefix(sessionID, "ses_") {
+		return "", false
+	}
+	return T210Target(sessionID), true
+}
+
+func (a *T215Adapter) Deliver(p T210WakePointer, target T210Target) (T210Receipt, error) {
+	delivery := p.Delivery
+	if delivery == "" {
+		delivery = "steer"
+	}
+	body := map[string]any{"text": T212buildPromptText(p), "delivery": delivery}
+	if p.Resume != nil {
+		body["resume"] = *p.Resume
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return T210Receipt{}, err
+	}
+	endpoint := strings.TrimRight(a.BaseURL, "/") + "/api/session/" + url.PathEscape(string(target)) + "/prompt"
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(raw))
+	if err != nil {
+		return T210Receipt{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	doer := a.Doer
+	if doer == nil {
+		doer = http.DefaultClient
+	}
+	resp, err := doer.Do(req)
+	if err != nil {
+		return T210Receipt{}, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	receipt := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: delivery}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		receipt.Outcome = T210Errored
+		return receipt, fmt.Errorf("wake: prompt status %d", resp.StatusCode)
+	}
+	var events []T215Event
+	if a.Events != nil {
+		events, err = a.Events(context.Background())
+		if err != nil {
+			receipt.Outcome = T210Errored
+			return receipt, err
+		}
+	}
+	resumeFalse := p.Resume != nil && !*p.Resume
+	receipt.Outcome = T215classify(events, string(target), delivery, resumeFalse)
+	return receipt, nil
+}
+
+// T215classify requires session.inbox.delivered and session.execution.started
+// before it reports a steer delivery. Queue and resume:false never claim an
+// execution started, even when the stream carries a stray started event.
+func T215classify(events []T215Event, sessionID, delivery string, resumeFalse bool) string {
+	delivered, started := false, false
+	for _, e := range events {
+		if e.SessionID != sessionID {
+			continue
+		}
+		switch e.Type {
+		case "session.inbox.delivered":
+			delivered = true
+		case "session.execution.started":
+			started = true
+		}
+	}
+	wantExecution := delivery == "steer" && !resumeFalse
+	if wantExecution {
+		if delivered && started {
+			return T210Delivered
+		}
+		return T210Enqueued
+	}
+	if delivery == "queue" {
+		return T210Queued
+	}
+	return T210Enqueued
 }
 
