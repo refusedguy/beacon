@@ -45,12 +45,14 @@ var (
 )
 
 type card struct {
-	id       string
-	path     string
-	status   string
-	priority string
-	resolved string
-	merged   bool
+	id          string
+	path        string
+	status      string
+	priority    string
+	resolved    string
+	merged      bool
+	ownerKey    string
+	duplicateOf string
 }
 
 type gitScan struct {
@@ -235,6 +237,58 @@ func resolveStatus(current string, merged bool) string {
 	}
 }
 
+// normalizeOwnerFiles turns the "Владелец файлов" value into a stable key.
+// Paths are split on commas, stripped of whitespace and common markdown
+// decoration, then sorted. Two cards that own the same files compare equal
+// even when the files are listed in a different order. An empty value yields
+// an empty key, which the duplicate pass leaves untouched.
+func normalizeOwnerFiles(value string) string {
+	var files []string
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r'
+	})
+	for _, part := range parts {
+		file := strings.TrimSpace(part)
+		file = strings.Trim(file, "`\"'")
+		file = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(file, "- "), "* "))
+		if file != "" {
+			files = append(files, file)
+		}
+	}
+	if len(files) == 0 {
+		return ""
+	}
+	sort.Strings(files)
+	return strings.Join(files, "\n")
+}
+
+// resolveDuplicateCards promotes todo cards that own exactly the same files as
+// a card already resolved as done. This catches cards merged under a different
+// ID: the commit subject names the other card, but the OwnerFiles set proves
+// the work shipped. Dropped cards and cards without OwnerFiles are left alone,
+// and a dropped card cannot seed the done map. Cards with no OwnerFiles never
+// participate, so unrelated todo cards are not collapsed by accident.
+func resolveDuplicateCards(cards []card) {
+	doneByOwner := map[string]string{}
+	for _, c := range cards {
+		if c.resolved == statusDone && c.ownerKey != "" {
+			if _, ok := doneByOwner[c.ownerKey]; !ok {
+				doneByOwner[c.ownerKey] = c.id
+			}
+		}
+	}
+	for i := range cards {
+		c := &cards[i]
+		if c.resolved != statusTodo || c.ownerKey == "" {
+			continue
+		}
+		if id, ok := doneByOwner[c.ownerKey]; ok {
+			c.resolved = statusDone
+			c.duplicateOf = id
+		}
+	}
+}
+
 func readCards(repo string, mergedIDs map[string]bool) ([]card, error) {
 	paths, err := filepath.Glob(filepath.Join(repo, "docs", "tasks", "*.md"))
 	if err != nil {
@@ -261,6 +315,7 @@ func readCards(repo string, mergedIDs map[string]bool) ([]card, error) {
 			path:     path,
 			status:   fieldValue(string(data), "Статус"),
 			priority: fieldValue(string(data), "Фаза"),
+			ownerKey: normalizeOwnerFiles(fieldValue(string(data), "Владелец файлов")),
 		}
 		if c.status != statusDropped && c.status != statusDone {
 			c.status = statusTodo
@@ -270,6 +325,7 @@ func readCards(repo string, mergedIDs map[string]bool) ([]card, error) {
 		cards = append(cards, c)
 	}
 	sort.Slice(cards, func(i, j int) bool { return cards[i].id < cards[j].id })
+	resolveDuplicateCards(cards)
 	return cards, nil
 }
 
@@ -305,7 +361,11 @@ func applyStatuses(repo string, cards []card, write bool) ([]string, error) {
 		if err != nil {
 			rel = c.path
 		}
-		changes = append(changes, fmt.Sprintf("%s: %s -> %s", filepath.ToSlash(rel), c.status, c.resolved))
+		line := fmt.Sprintf("%s: %s -> %s", filepath.ToSlash(rel), c.status, c.resolved)
+		if c.duplicateOf != "" {
+			line += fmt.Sprintf(" (duplicate of %s by OwnerFiles)", c.duplicateOf)
+		}
+		changes = append(changes, line)
 		if !write {
 			continue
 		}
