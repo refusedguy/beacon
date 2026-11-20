@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -287,6 +288,169 @@ func TestReconnectWithLastEventID(t *testing.T) {
 		}
 	}
 	s2.closeAndWait(t)
+}
+
+// recordingParentNotifier captures notices delivered through the parent-chat
+// port. A channel, when set, lets a test wait for a delivery from the reader
+// goroutine without sleeping.
+type recordingParentNotifier struct {
+	mu      sync.Mutex
+	notices []ParentNotice
+	err     error
+	ch      chan ParentNotice
+}
+
+func (n *recordingParentNotifier) Notify(_ context.Context, notice ParentNotice) error {
+	n.mu.Lock()
+	n.notices = append(n.notices, notice)
+	n.mu.Unlock()
+	if n.ch != nil {
+		n.ch <- notice
+	}
+	return n.err
+}
+
+func (n *recordingParentNotifier) delivered() []ParentNotice {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]ParentNotice(nil), n.notices...)
+}
+
+func newLineageTree(t *testing.T) (*ChildThreads, *recordingParentNotifier) {
+	t.Helper()
+	threads := NewChildThreads()
+	if err := threads.Root("root", "Root chat"); err != nil {
+		t.Fatal(err)
+	}
+	if err := threads.Spawn("root", "child", "Builder"); err != nil {
+		t.Fatal(err)
+	}
+	return threads, &recordingParentNotifier{}
+}
+
+func TestChildThreadsRoutesQuestionToParent(t *testing.T) {
+	threads, notifier := newLineageTree(t)
+
+	notice, err := threads.Ask(context.Background(), notifier, "child", "  which branch?  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ParentNotice{
+		ParentID: "root", ChildID: "child", ChildName: "Builder", Question: "which branch?",
+	}
+	if notice != want {
+		t.Fatalf("notice = %+v, want %+v", notice, want)
+	}
+	if got := notifier.delivered(); len(got) != 1 || got[0] != want {
+		t.Fatalf("delivered = %+v, want [%+v]", got, want)
+	}
+
+	name, parent, ok := threads.Get("child")
+	if !ok || name != "Builder" || parent != "root" {
+		t.Fatalf("Get(child) = %q, %q, %v", name, parent, ok)
+	}
+	if threads.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", threads.Len())
+	}
+}
+
+func TestChildThreadsQuestionWithoutNotifier(t *testing.T) {
+	threads, _ := newLineageTree(t)
+	notice, err := threads.Ask(context.Background(), nil, "child", "second question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notice.Question != "second question" || notice.ChildName != "Builder" {
+		t.Fatalf("built notice = %+v", notice)
+	}
+}
+
+func TestChildThreadsRejectsBadQuestions(t *testing.T) {
+	threads, notifier := newLineageTree(t)
+	cases := []struct {
+		name     string
+		childID  string
+		question string
+		want     error
+	}{
+		{name: "unknown child", childID: "missing", question: "why", want: ErrUnknownThread},
+		{name: "empty question", childID: "child", question: "   ", want: ErrEmptyQuestion},
+		{name: "root question", childID: "root", question: "why", want: ErrNoParent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := threads.Ask(context.Background(), notifier, tc.childID, tc.question); !errors.Is(err, tc.want) {
+				t.Fatalf("Ask error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	if got := notifier.delivered(); len(got) != 0 {
+		t.Fatalf("failed Ask delivered notices: %+v", got)
+	}
+}
+
+func TestChildThreadsDeliveryError(t *testing.T) {
+	threads, notifier := newLineageTree(t)
+	boom := errors.New("delivery failed")
+	notifier.err = boom
+	notice, err := threads.Ask(context.Background(), notifier, "child", "retry me")
+	if !errors.Is(err, boom) {
+		t.Fatalf("Ask error = %v, want boom", err)
+	}
+	if notice.Question != "retry me" {
+		t.Fatalf("notice = %+v, want question retry me", notice)
+	}
+}
+
+func TestChildThreadsReferenceErrors(t *testing.T) {
+	threads := NewChildThreads()
+	if err := threads.Root(" ", "Blank"); !errors.Is(err, ErrInvalidThread) {
+		t.Fatalf("Root blank error = %v, want ErrInvalidThread", err)
+	}
+	if err := threads.Spawn("root", "child", "Builder"); !errors.Is(err, ErrUnknownParent) {
+		t.Fatalf("Spawn under missing parent error = %v, want ErrUnknownParent", err)
+	}
+	if err := threads.Root("root", "Root chat"); err != nil {
+		t.Fatal(err)
+	}
+	if err := threads.Spawn("root", "child", "Builder"); err != nil {
+		t.Fatal(err)
+	}
+	if err := threads.Spawn("root", "child", "Again"); !errors.Is(err, ErrDuplicateThread) {
+		t.Fatalf("duplicate Spawn error = %v, want ErrDuplicateThread", err)
+	}
+	if err := threads.Spawn("root", "blank", "  "); !errors.Is(err, ErrInvalidThread) {
+		t.Fatalf("blank name error = %v, want ErrInvalidThread", err)
+	}
+}
+
+func TestWebSocketQuestionFrameNotifiesParent(t *testing.T) {
+	threads, notifier := newLineageTree(t)
+	notifier.ch = make(chan ParentNotice, 1)
+	ws := NewWebSocketWithLineage(&mockEventReader{}, Config{Enabled: true, PollInterval: time.Millisecond}, threads, notifier)
+
+	s := startSession(t, ws, 0)
+	defer s.client.Close()
+	if o := s.next(t); o.Type != "connected" {
+		t.Fatalf("hello = %+v, want connected", o)
+	}
+
+	mask := [4]byte{1, 2, 3, 4}
+	frame := []byte(`{"type":"question","childID":"child","question":"which branch?"}`)
+	if err := writeFrame(s.client, wsOpcodeText, frame, &mask); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case notice := <-notifier.ch:
+		want := ParentNotice{ParentID: "root", ChildID: "child", ChildName: "Builder", Question: "which branch?"}
+		if notice != want {
+			t.Fatalf("notice = %+v, want %+v", notice, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("question frame did not reach the parent chat")
+	}
+	s.closeAndWait(t)
 }
 
 func TestEmptyStream(t *testing.T) {

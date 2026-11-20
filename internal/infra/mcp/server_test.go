@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -988,4 +989,113 @@ func TestToolsCallOptionalPortsKeepRealDefaults(t *testing.T) {
 			t.Fatal("default continuation registry did not acknowledge the answer")
 		}
 	})
+}
+
+// mockChildThreadResolver is a mock port for the server's child-thread
+// reference store. It keeps the MCP test free of any store import.
+type mockChildThreadResolver struct {
+	parentID string
+	name     string
+	ok       bool
+}
+
+func (r mockChildThreadResolver) Resolve(string) (string, string, bool) {
+	return r.parentID, r.name, r.ok
+}
+
+// mockParentNotifier records the notices sent to a parent chat.
+type mockParentNotifier struct {
+	mu      sync.Mutex
+	notices []ParentNotice
+	err     error
+}
+
+func (n *mockParentNotifier) Notify(_ context.Context, notice ParentNotice) error {
+	n.mu.Lock()
+	n.notices = append(n.notices, notice)
+	n.mu.Unlock()
+	return n.err
+}
+
+func (n *mockParentNotifier) delivered() []ParentNotice {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]ParentNotice(nil), n.notices...)
+}
+
+// TestAskChildQuestionKeepsEightTools proves WIRING-490 at the MCP boundary:
+// a child question reaches the parent chat through the injected ports, and the
+// contracted set of eight tools is unchanged by the new wiring.
+func TestAskChildQuestionKeepsEightTools(t *testing.T) {
+	notifier := &mockParentNotifier{}
+	deps := Dependencies{
+		ChildThreads:   mockChildThreadResolver{parentID: "root", name: "Builder", ok: true},
+		ParentNotifier: notifier,
+	}
+
+	notice, err := deps.AskChildQuestion(context.Background(), "child", "  which branch?  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ParentNotice{
+		ParentID: "root", ChildID: "child", ChildName: "Builder", Question: "which branch?",
+	}
+	if notice != want {
+		t.Fatalf("notice = %+v, want %+v", notice, want)
+	}
+	if got := notifier.delivered(); len(got) != 1 || got[0] != want {
+		t.Fatalf("delivered = %+v, want [%+v]", got, want)
+	}
+
+	session := connectTestSession(t, deps)
+	var names []string
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		names = append(names, tool.Name)
+	}
+	if len(names) != 8 {
+		t.Fatalf("tools/list returned %d tools (%v), want 8", len(names), names)
+	}
+}
+
+func TestAskChildQuestionWithoutWiring(t *testing.T) {
+	if _, err := (Dependencies{}).AskChildQuestion(context.Background(), "child", "why"); !errors.Is(err, ErrNoLineage) {
+		t.Fatalf("unwired AskChildQuestion error = %v, want ErrNoLineage", err)
+	}
+
+	deps := Dependencies{ChildThreads: mockChildThreadResolver{ok: false}}
+	if _, err := deps.AskChildQuestion(context.Background(), "child", "why"); !errors.Is(err, ErrNoLineage) {
+		t.Fatalf("unresolved child error = %v, want ErrNoLineage", err)
+	}
+
+	deps = Dependencies{ChildThreads: mockChildThreadResolver{parentID: "root", name: "Builder", ok: true}}
+	if _, err := deps.AskChildQuestion(context.Background(), "child", "   "); !errors.Is(err, ErrNoLineage) {
+		t.Fatalf("empty question error = %v, want ErrNoLineage", err)
+	}
+
+	notice, err := deps.AskChildQuestion(context.Background(), "child", "plain question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if notice.Question != "plain question" {
+		t.Fatalf("notice = %+v, want a built notice without delivery", notice)
+	}
+}
+
+func TestAskChildQuestionDeliveryError(t *testing.T) {
+	boom := errors.New("chat unavailable")
+	notifier := &mockParentNotifier{err: boom}
+	deps := Dependencies{
+		ChildThreads:   mockChildThreadResolver{parentID: "root", name: "Builder", ok: true},
+		ParentNotifier: notifier,
+	}
+	notice, err := deps.AskChildQuestion(context.Background(), "child", "why")
+	if !errors.Is(err, boom) {
+		t.Fatalf("AskChildQuestion error = %v, want boom", err)
+	}
+	if notice.Question != "why" {
+		t.Fatalf("notice = %+v, want question why", notice)
+	}
 }
