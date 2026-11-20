@@ -8,7 +8,7 @@ import (
 )
 
 func TestRoleDictionary(t *testing.T) {
-	for _, r := range []Role{RoleExecutor, RoleOrchestrator} {
+	for _, r := range []Role{RoleExecutor, RoleOrchestrator, RoleFixer} {
 		if !r.Valid() {
 			t.Errorf("canonical role %q is not valid", r)
 		}
@@ -29,9 +29,12 @@ func TestRoleDictionary(t *testing.T) {
 	if got, ok := ParseRole("  executor\n"); !ok || got != RoleExecutor {
 		t.Errorf("ParseRole must trim whitespace, got %q, %v", got, ok)
 	}
+	if got, ok := ParseRole("fixer"); !ok || got != RoleFixer {
+		t.Errorf("ParseRole(fixer) = %q, %v; want fixer, true", got, ok)
+	}
 
 	roles := ValidRoles()
-	if !reflect.DeepEqual(roles, []Role{RoleExecutor, RoleOrchestrator}) {
+	if !reflect.DeepEqual(roles, []Role{RoleExecutor, RoleOrchestrator, RoleFixer}) {
 		t.Fatalf("ValidRoles() = %v", roles)
 	}
 	roles[0] = Role("mutated")

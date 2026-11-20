@@ -54,6 +54,15 @@ type Snapshot struct {
 	NoChecksTimeout  time.Duration
 	SuitesValid      bool
 
+	// BaseFailedChecks maps check names to their observed failure on the base
+	// branch. EvaluatePR uses it to separate a failure introduced by the PR from
+	// one already present on main; a nil or empty map means no base failure was
+	// observed.
+	BaseFailedChecks map[string]bool
+	// MergeError is the last merge attempt error reported by the provider. It is
+	// carried for diagnostics; it does not enter the verdict rules.
+	MergeError string
+
 	// Ship carries the observed facts the compiled-in ship formula reads
 	// (ADR 0040 §2). Callers fill it from deterministic sources: Build and
 	// Audit from required CI checks, TDD and Trivial from explicit conditions
@@ -70,6 +79,9 @@ const (
 	WakePointer     WakeKind = ""             // deliver a pointer to the subscriber
 	WakeHeadChanged WakeKind = "head_changed" // close the old Watch, create a new one
 	WakeRestPin     WakeKind = "rest_pin"     // ping lazy mergeable=UNKNOWN via REST
+	// RerunChecks names the re-run action for a bounded flaky retry. The target
+	// also carries the check names in WakeTarget.RerunChecks.
+	RerunChecks WakeKind = "rerun_checks"
 )
 
 // WakeTarget is one action the caller must perform after Evaluate. Role is the
@@ -147,6 +159,123 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	// 10. Pending checks (ACTION_REQUIRED/WAITING/QUEUED) and all other
 	// in-between states are plain watching with nobody to wake.
 	return VerdictWatching, nil
+}
+
+// EvaluatePR computes the verdict for the real CI cycle. It deliberately differs
+// from Evaluate in two places: a terminal MERGED/CLOSED wakes nobody (the caller
+// closes all subscribers as finished), and a failure already present on the base
+// branch is blocked immediately so the orchestrator can fix main instead of
+// asking several executors to rebase the same broken base. The rules are pure
+// and applied in strict priority order; the first match wins.
+func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
+	// 1-2. Terminal states close every subscriber without waking anyone.
+	switch strings.ToUpper(s.State) {
+	case "MERGED":
+		return VerdictMerged, nil
+	case "CLOSED":
+		return VerdictClosed, nil
+	}
+
+	// 3. A moved head invalidates the Watch and creates a successor for the
+	// executor. The orchestrator is not waked for a pure head change.
+	if s.HeadSHA != "" && s.WatchHeadSHA != "" && s.HeadSHA != s.WatchHeadSHA {
+		return VerdictWatching, []WakeTarget{{Role: RoleExecutor, Kind: WakeHeadChanged}}
+	}
+
+	status := strings.ToUpper(s.MergeStateStatus)
+	mergeable := strings.ToUpper(s.Mergeable)
+	rollup := strings.ToUpper(s.Rollup)
+
+	// 4. Merge-state blockers route to the executor for a rebase. A fixer may
+	// perform the same repair, so the caller is free to route to either role.
+	if status == "DIRTY" || (status == "BEHIND" && p.RequireUpToDate) {
+		return VerdictRebase, wakeExecutor(WakePointer)
+	}
+
+	// 5. Real failures, with SKIPPED and NEUTRAL results excluded. A failure
+	// already present on the base branch takes priority over the retry budget:
+	// re-running a check on main can never make it green.
+	failed := realFailures(s)
+	if rollup == "FAILURE" || rollup == "ERROR" || len(failed) > 0 {
+		for _, name := range failed {
+			if s.BaseFailedChecks[name] {
+				return VerdictBlocked, wakeOrchestrator(WakePointer)
+			}
+		}
+		retry := s
+		retry.Failures = failed
+		if rerun := flakyRetryChecks(retry); len(rerun) > 0 {
+			return VerdictRetry, []WakeTarget{{Role: RoleExecutor, RerunChecks: rerun}}
+		}
+		return VerdictKeepWorking, wakeExecutor(WakePointer)
+	}
+
+	// 6. A clean rollup or a doc-only PR with no checks is ready only after the
+	// merge gates and the review gate pass. The ship formula is not part of this
+	// cycle: the caller has already verified the change before asking for CI.
+	docOnly := len(s.Checks) == 0 && status == "CLEAN" && mergeable == "MERGEABLE"
+	if (rollup == "SUCCESS" || docOnly) && mergeable == "MERGEABLE" &&
+		canMergeStatus(status, p.RequireUpToDate) && !s.IsDraft &&
+		!s.MissingRequired && s.SuitesValid && reviewOK(s, p) {
+		return VerdictReady, wakeOrchestrator(WakePointer)
+	}
+
+	// 7. A lazy UNKNOWN mergeable needs a REST pin, not a subscriber wake.
+	if mergeable == "UNKNOWN" {
+		return VerdictWatching, []WakeTarget{{Kind: WakeRestPin}}
+	}
+
+	// 8. Deadline or no-checks timeout escalates through the orchestrator.
+	if timedOut(s) {
+		return VerdictTimeout, wakeOrchestrator(WakePointer)
+	}
+
+	// 9. Pending and in-between states watch silently.
+	return VerdictWatching, nil
+}
+
+// realFailures returns the failure names that represent an actual failed check.
+// SKIPPED and NEUTRAL conclusions are passes for this decision table even when
+// a caller included them in Failures, so they never trigger a block or retry.
+func realFailures(s Snapshot) []string {
+	out := make([]string, 0, len(s.Failures))
+	seen := make(map[string]bool, len(s.Failures))
+	for _, name := range s.Failures {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		switch strings.ToUpper(name) {
+		case "SKIPPED", "NEUTRAL":
+			continue
+		}
+		if harmlessConclusion(s.Checks[name]) {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
+// harmlessConclusion reports whether a listed check was skipped or explicitly
+// neutral. A check absent from Snapshot.Checks has no conclusion to soften the
+// caller's failure report, so it stays a failure.
+func harmlessConclusion(c Check) bool {
+	switch strings.ToUpper(c.Conclusion) {
+	case "SKIPPED", "NEUTRAL":
+		return true
+	}
+	switch strings.ToUpper(c.State) {
+	case "SKIPPED", "NEUTRAL":
+		return true
+	}
+	return false
+}
+
+// reviewOK applies the review gate. IgnoreReviews lets a Watch proceed without
+// an approval; otherwise a CHANGES_REQUESTED decision holds it back.
+func reviewOK(s Snapshot, p Policy) bool {
+	return p.IgnoreReviews || strings.ToUpper(s.ReviewDecision) != "CHANGES_REQUESTED"
 }
 
 // canMergeStatus implements the mergeStateStatus part of row 7. BEHIND is

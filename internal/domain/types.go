@@ -33,8 +33,8 @@ const (
 	VerdictMerged      Verdict = "merged"
 	VerdictClosed      Verdict = "closed"
 	// VerdictBlocked is carried while a Watch is blocked by failed checks that
-	// need outside action. Like needs_input and parked it is not produced by the
-	// verdict engine; only a block event sets it.
+	// need outside action. The CI-cycle engine produces it when a failure is
+	// already present on the base branch; a block event can also set it.
 	VerdictBlocked Verdict = "blocked"
 )
 
@@ -49,6 +49,36 @@ const (
 	RoleOrchestrator Role = "orchestrator"
 	RoleFixer        Role = "fixer"
 )
+
+// WorkerPhase is the lifecycle phase of a worker bound to a Watch. It is used
+// by the orchestrator to tell a still-live worker from one that needs a new
+// wake, and is stored on the subscriber so it survives a process restart.
+type WorkerPhase string
+
+const (
+	// WorkerPhaseWaiting means the worker has no in-flight obligation.
+	WorkerPhaseWaiting WorkerPhase = "waiting"
+	// WorkerPhaseInWork means the worker accepted work and is running it.
+	WorkerPhaseInWork WorkerPhase = "in_work"
+	// WorkerPhaseBlocked means the worker cannot proceed without outside help.
+	WorkerPhaseBlocked WorkerPhase = "blocked"
+	// WorkerPhaseOrphaned means the worker lost its session and must be replaced.
+	WorkerPhaseOrphaned WorkerPhase = "orphaned"
+	// WorkerPhaseFinished means the worker completed its task.
+	WorkerPhaseFinished WorkerPhase = "finished"
+)
+
+// Valid reports whether p is one of the defined worker phases. The zero value
+// fails closed, so an uninitialized subscriber is never treated as live work.
+func (p WorkerPhase) Valid() bool {
+	switch p {
+	case WorkerPhaseWaiting, WorkerPhaseInWork, WorkerPhaseBlocked,
+		WorkerPhaseOrphaned, WorkerPhaseFinished:
+		return true
+	default:
+		return false
+	}
+}
 
 // AttemptOutcome is the observed outcome of one delivery attempt.
 type AttemptOutcome string
@@ -112,14 +142,17 @@ func DefaultMergePolicy() MergePolicy {
 // Watch a fixer repairs. It is stored on the subscriber so the fix can be
 // attributed to a specific block. It is empty for every other role.
 type Subscriber struct {
-	ID             string    `json:"id"`
-	Role           Role      `json:"role"`
-	Adapter        string    `json:"adapter"`
-	Target         string    `json:"target"`
-	OrchestratorID string    `json:"orchestratorID,omitempty"`
-	FixFor         string    `json:"fixFor,omitempty"`
-	AddedAt        time.Time `json:"addedAt"`
-	LastActivity   time.Time `json:"lastActivity"`
+	ID             string      `json:"id"`
+	Role           Role        `json:"role"`
+	Adapter        string      `json:"adapter"`
+	Target         string      `json:"target"`
+	OrchestratorID string      `json:"orchestratorID,omitempty"`
+	FixFor         string      `json:"fixFor,omitempty"`
+	Phase          WorkerPhase `json:"phase,omitempty"`
+	LastWakeAt     time.Time   `json:"lastWakeAt,omitempty"`
+	LastError      string      `json:"lastError,omitempty"`
+	AddedAt        time.Time   `json:"addedAt"`
+	LastActivity   time.Time   `json:"lastActivity"`
 }
 
 // BlockedInfo records why a Watch is blocked, which checks failed, when the
@@ -134,6 +167,43 @@ type BlockedInfo struct {
 	Since        time.Time `json:"since"`
 	BlockedBy    string    `json:"blockedBy"`
 	FixAttempts  int       `json:"fixAttempts,omitempty"`
+}
+
+// BlockerIncident is one control-plane record for a failed check on the base
+// branch. Several Watches can be blocked by the same signature; the incident
+// lets the orchestrator fix main once instead of rebasing each Watch in turn.
+// FixAttempts and MaxFixAttempts bound the repair attempts for that incident.
+// Status is one of BlockerStatusOpen or BlockerStatusResolved.
+type BlockerIncident struct {
+	ID              string    `json:"id"`
+	Repo            string    `json:"repo"`
+	BaseRef         string    `json:"baseRef"`
+	Signature       string    `json:"signature"`
+	FailedChecks    []string  `json:"failedChecks"`
+	BlockedWatchIDs []string  `json:"blockedWatchIDs"`
+	FixerWatchID    string    `json:"fixerWatchID,omitempty"`
+	FixAttempts     int       `json:"fixAttempts"`
+	MaxFixAttempts  int       `json:"maxFixAttempts"`
+	Status          string    `json:"status"`
+	CreatedAt       time.Time `json:"createdAt"`
+	ResolvedAt      time.Time `json:"resolvedAt"`
+}
+
+const (
+	// BlockerStatusOpen marks an incident that still needs a fix.
+	BlockerStatusOpen = "open"
+	// BlockerStatusResolved marks an incident whose base branch is green again.
+	BlockerStatusResolved = "resolved"
+)
+
+// OrchestratorBinding records which session currently owns the orchestrator
+// role for one project. ProjectKey is stable across process restarts, so a
+// daemon can find the session to wake without guessing from Watch state.
+type OrchestratorBinding struct {
+	ProjectKey string    `json:"projectKey"`
+	SessionID  string    `json:"sessionID"`
+	Adapter    string    `json:"adapter"`
+	BoundAt    time.Time `json:"boundAt"`
 }
 
 // Watch is the unit of work. Optional fields use the Go zero value when absent.
@@ -160,6 +230,8 @@ type Watch struct {
 	Subscribers    []Subscriber     `json:"subscribers"`
 	OrchestratorID string           `json:"orchestratorID,omitempty"`
 	FixFor         string           `json:"fixFor,omitempty"`
+	BlockerID      string           `json:"blockerID,omitempty"`
+	FixBlockerID   string           `json:"fixBlockerID,omitempty"`
 	DeadlineAt     time.Time        `json:"deadlineAt"`
 	NoChecksSince  time.Time        `json:"noChecksSince"`
 	CreatedAt      time.Time        `json:"createdAt"`
@@ -330,6 +402,62 @@ type Store interface {
 type CIProvider interface {
 	PRState(ctx context.Context, repo string, pr int) (PRState, error)
 }
+
+// BaseBranchState is the CI state of the base branch a Watch targets. It is
+// read separately from the PR so a failure already present on main can be
+// attributed to the base and not to the change under review. ChecksKnown
+// reports whether FailedChecks is an observation rather than an unknown state.
+type BaseBranchState struct {
+	BaseRef      string          `json:"baseRef"`
+	HeadSHA      string          `json:"headSHA"`
+	FailedChecks map[string]bool `json:"failedChecks"`
+	ChecksKnown  bool            `json:"checksKnown"`
+}
+
+// PRSnapshot is one batched CI observation: the PR state plus the state of its
+// base branch. Keeping both in one value lets EvaluatePR detect mixed blame in
+// a single pass.
+type PRSnapshot struct {
+	PR   PRState         `json:"pr"`
+	Base BaseBranchState `json:"base"`
+}
+
+// BatchCIProvider reads many Watches in one call. The returned map is keyed by
+// Watch.ID; a missing key means that Watch had no snapshot. PointStats reports
+// the point budget used so far and the total budget, so a caller can decide
+// whether another pinpoint read is affordable.
+type BatchCIProvider interface {
+	FetchBatch(ctx context.Context, watches []Watch) (map[string]PRSnapshot, error)
+	PointStats() (used int, budget int)
+}
+
+// Merger merges one pull request. merged reports a confirmed merge, held
+// reports that the merge was intentionally withheld and reason carries the
+// machine-readable cause when either happened. An error reports a transport or
+// provider failure, not a policy decision.
+type Merger interface {
+	Merge(ctx context.Context, repo string, pr int) (merged bool, held bool, reason string, err error)
+}
+
+// BlockerStore persists blocker incidents and orchestrator bindings. FindBlocker
+// matches an open incident by repo, base ref and signature; the boolean reports
+// whether one was found. ResolveBlocker stamps ResolvedAt with at and is
+// idempotent. Binding and BindingBySession report false when no binding exists.
+type BlockerStore interface {
+	SaveBlocker(incident BlockerIncident) error
+	Blocker(id string) (BlockerIncident, error)
+	FindBlocker(repo, baseRef, signature string) (BlockerIncident, bool, error)
+	OpenBlockers() ([]BlockerIncident, error)
+	ResolveBlocker(id string, at time.Time) error
+	SaveBinding(binding OrchestratorBinding) error
+	Binding(projectKey string) (OrchestratorBinding, bool, error)
+	BindingBySession(sessionID string) (OrchestratorBinding, bool, error)
+}
+
+// ControlPlaneStore is the alternate name for BlockerStore. It exists so callers
+// that think of incidents and bindings as one control-plane concern can name
+// the same port.
+type ControlPlaneStore = BlockerStore
 
 // Notifier delivers a wake pointer to a subscriber.
 type Notifier interface {
