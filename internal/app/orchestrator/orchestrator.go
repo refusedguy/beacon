@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 const (
@@ -315,6 +317,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		*errs = append(*errs, fmt.Errorf("orchestrator: merger is nil for PR %d", w.PR))
 		return
 	}
+	observe.MergeAttempt(w.ID, w.PR)
 	if err := merger.Merge(ctx, w.Repo, w.PR); err != nil {
 		out.Actions = append(out.Actions, Action{
 			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -323,6 +326,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
 		return
 	}
+	observe.MergeSuccess(w.ID, w.PR)
 	if err := st.RecordMerge(ctx, w.ID, w.Revision); err != nil {
 		*errs = append(*errs, fmt.Errorf("orchestrator: record merge %s@%d: %w", w.ID, w.Revision, err))
 	}
@@ -344,12 +348,18 @@ func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, 
 	if waker == nil {
 		return
 	}
+	if verdict != VerdictWait {
+		observe.RebaseRequested(w.ID, w.PR)
+	}
+	var wakeErr error
 	if reasonWaker, ok := waker.(ReasonWaker); ok {
-		if err := reasonWaker.WakeWithReason(ctx, w.ID, w.Revision, verdict, reason); err != nil {
-			*errs = append(*errs, fmt.Errorf("orchestrator: wake %s: %w", w.ID, err))
-		}
-	} else if err := waker.Wake(ctx, w.ID, w.Revision, verdict); err != nil {
-		*errs = append(*errs, fmt.Errorf("orchestrator: wake %s: %w", w.ID, err))
+		wakeErr = reasonWaker.WakeWithReason(ctx, w.ID, w.Revision, verdict, reason)
+	} else {
+		wakeErr = waker.Wake(ctx, w.ID, w.Revision, verdict)
+	}
+	if wakeErr != nil {
+		observe.WakeFailed("", w.ID, wakeErr)
+		*errs = append(*errs, fmt.Errorf("orchestrator: wake %s: %w", w.ID, wakeErr))
 	}
 	out.Actions = append(out.Actions, Action{
 		Action: ActionWake, WatchID: w.ID, PR: w.PR, Revision: w.Revision,

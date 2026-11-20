@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
@@ -57,6 +58,7 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 	}
 
 	pass := func() {
+		observe.DaemonPass()
 		if err := ports.CheckAll(ctx); err != nil {
 			logf("daemon: checkall: %v", err)
 		}

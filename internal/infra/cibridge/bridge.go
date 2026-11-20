@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider
@@ -128,6 +129,9 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	if b == nil || b.store == nil || b.ci == nil {
 		return 0
 	}
+	start := time.Now()
+	defer func() { observe.PollCycleDuration(time.Since(start)) }()
+	observe.PollCycle()
 	watches, err := b.store.AllWatches()
 	if err != nil {
 		log.Printf("cibridge: live watches: %v", err)
@@ -414,9 +418,13 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 			deliverErr = b.waker.Deliver(ctx, addressee, p)
 		}
 		if deliverErr != nil {
+			observe.WakeFailed(sub.Adapter, next.ID, deliverErr)
 			log.Printf("cibridge: wake %s: %v", target, deliverErr)
+		} else {
+			observe.WakeDelivered(sub.Adapter, next.ID)
 		}
 	}
+	observe.VerdictPublished(string(verdict), next.ID, next.PR)
 	log.Printf("cibridge: %s#%d -> %s revision=%d", next.Repo, next.PR, verdict, next.Revision)
 	return 1, nil
 }

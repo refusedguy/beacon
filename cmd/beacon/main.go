@@ -34,6 +34,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
   beacon daemon [--interval 3m] [--once]
   beacon workload [--format table|json]
+  beacon metrics [--format json|prometheus]
 
 Каталог команд для агентов: beacon list --format json
 `
@@ -86,6 +87,7 @@ func main() {
 	// Composition root of the CLI manager: one place where the thin HTTP
 	// client becomes the live source and the spawn port. No agent names or
 	// domain types cross this boundary (ADR 0005, ADR 0060 п1).
+	setupObserve()
 	wireOpenCodePorts()
 	os.Exit(newDefaultCLI().Run(os.Args[1:]))
 }
@@ -114,7 +116,7 @@ func installOpenCodePorts(port opencodePort) {
 		SetSessionSpawner(spawner)
 	}
 	if target, ok := port.(deliveryTarget); ok {
-		SetDeliveryTarget(target)
+		SetDeliveryTarget(observingDeliveryTarget{next: target})
 	}
 	if creator, ok := port.(sessionCreator); ok {
 		SetSessionCreator(creator)
@@ -236,6 +238,8 @@ func (c *CLI) Run(args []string) int {
 		return daemonRunner(c, args[1:])
 	case "workload":
 		return workloadRunner(c, args[1:])
+	case "metrics":
+		return metricsRunner(c, args[1:])
 	default:
 		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)
