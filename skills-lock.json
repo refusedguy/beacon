@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "night-shift",
+      "path": ".opencode/skills/night-shift",
+      "computedHash": "4b430a9b70a32631c75780c6dc2bdca933ec53ec1cd6708e0b3594507f6a52bc"
+    },
+    {
+      "name": "red-verdict-triage",
+      "path": ".opencode/skills/red-verdict-triage",
+      "computedHash": "4d103845fb2e1d843752b9d11f8326527e05133257f82693851657e26dbac1ab"
+    }
+  ]
+}

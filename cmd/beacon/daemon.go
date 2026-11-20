@@ -192,6 +192,20 @@ func runDaemon(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
 		return 2
 	}
+
+	// HD-071: a stale or unpinned skill hash is reported on every pass. The
+	// finding goes to stderr and to the actor metric, so a changed skill is
+	// visible in the gate instead of passing as a silent config change.
+	findings, lockErr := verifySkillsLock(projectRootForConfig())
+	if lockErr != nil {
+		observe.ActorError("skills-lock", "", lockErr)
+		fmt.Fprintf(c.errOut, "beacon daemon: skills lock: %v\n", lockErr)
+	}
+	for _, finding := range findings {
+		observe.ActorError("skills-lock", "", fmt.Errorf("%s: %s", finding.Name, finding.Problem))
+		fmt.Fprintf(c.errOut, "beacon daemon: skills lock: %s: %s\n", finding.Name, finding.Problem)
+	}
+
 	db, err := openProcessStore(dir)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
