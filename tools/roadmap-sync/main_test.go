@@ -82,8 +82,9 @@ func newFixture(t *testing.T) (repo, logPath string) {
 
 // newDuplicateFixture builds cards whose OwnerFiles sets exercise the second
 // pass. T3.103 is merged by commit; BS.25 lists the same two files in the
-// opposite order and is not named in the commit. The remaining cards guard the
-// dropped, empty and different-OwnerFiles cases.
+// opposite order and is not named in the commit. BS.24 owns only one of those
+// files. The remaining cards guard the dropped, empty and different-OwnerFiles
+// cases.
 func newDuplicateFixture(t *testing.T) (repo, logPath string) {
 	t.Helper()
 	repo = t.TempDir()
@@ -93,6 +94,7 @@ func newDuplicateFixture(t *testing.T) (repo, logPath string) {
 	cards := map[string]string{
 		"T3.103.md": "# T3.103\nСтатус: todo\nФаза: P1\nВладелец файлов: internal/infra/webhook/receiver.go, internal/infra/webhook/receiver_test.go\n",
 		"BS.25.md":  "# BS.25\nСтатус: todo\nФаза: P2\nВладелец файлов: internal/infra/webhook/receiver_test.go, internal/infra/webhook/receiver.go\n",
+		"BS.24.md":  "# BS.24\nСтатус: todo\nФаза: P1\nВладелец файлов: internal/infra/webhook/receiver.go\n",
 		"BS.19.md":  "# BS.19\nСтатус: dropped\nФаза: P1\nВладелец файлов: internal/infra/webhook/receiver.go, internal/infra/webhook/receiver_test.go\n",
 		"BS.23.md":  "# BS.23\nСтатус: todo\nФаза: P1\nВладелец файлов:\n",
 		"BS.26.md":  "# BS.26\nСтатус: todo\nФаза: P3\nВладелец файлов: internal/infra/store/webhook_events.go\n",
@@ -151,6 +153,18 @@ func TestResolveDuplicateCardsByOwnerFiles(t *testing.T) {
 	if got := byID["BS.25"].duplicateOf; got != "T3.103" {
 		t.Errorf("BS.25 duplicateOf = %q, want T3.103", got)
 	}
+	if byID["BS.25"].duplicateSubset {
+		t.Error("BS.25 is an exact match and must not be reported as a subset")
+	}
+	if got := byID["BS.24"].resolved; got != statusDone {
+		t.Errorf("subset BS.24 resolved = %q, want done", got)
+	}
+	if got := byID["BS.24"].duplicateOf; got != "T3.103" {
+		t.Errorf("BS.24 duplicateOf = %q, want T3.103", got)
+	}
+	if !byID["BS.24"].duplicateSubset {
+		t.Error("BS.24 must be reported as a subset duplicate")
+	}
 	if got := byID["BS.19"].resolved; got != statusDropped {
 		t.Errorf("dropped BS.19 resolved = %q, want dropped", got)
 	}
@@ -173,6 +187,7 @@ func TestRunDryRunReportsResolvedDuplicates(t *testing.T) {
 	for _, line := range []string{
 		"docs/tasks/T3.103.md: todo -> done",
 		"docs/tasks/BS.25.md: todo -> done (duplicate of T3.103 by OwnerFiles)",
+		"docs/tasks/BS.24.md: todo -> done (duplicate of T3.103 by OwnerFiles subset)",
 	} {
 		if !strings.Contains(out, line) {
 			t.Errorf("output missing %q:\n%s", line, out)
@@ -207,6 +222,53 @@ func TestResolveDuplicateCardsWithSeveralDoneOwners(t *testing.T) {
 		if c.duplicateOf != "" && c.duplicateOf != "BS.32" && c.duplicateOf != "T3.99" {
 			t.Errorf("%s duplicateOf = %q, want a done owner", c.id, c.duplicateOf)
 		}
+	}
+}
+
+func TestResolveDuplicateCardsByOwnerFilesSubset(t *testing.T) {
+	repo := t.TempDir()
+	cards := map[string]string{
+		"T3.103.md": "# T3.103\nСтатус: done\nВладелец файлов: a.go, b.go\n",
+		"T3.104.md": "# T3.104\nСтатус: done\nВладелец файлов: x.go\n",
+		"BS.19.md":  "# BS.19\nСтатус: todo\nВладелец файлов: a.go, q.go\n",
+		"BS.23.md":  "# BS.23\nСтатус: todo\nВладелец файлов: a.go\n",
+		"BS.25.md":  "# BS.25\nСтатус: todo\nВладелец файлов: x.go, y.go\n",
+		"BS.26.md":  "# BS.26\nСтатус: todo\nВладелец файлов: z.go\n",
+		"BS.27.md":  "# BS.27\nСтатус: dropped\nВладелец файлов: a.go\n",
+		"BS.28.md":  "# BS.28\nСтатус: todo\nВладелец файлов:\n",
+	}
+	for name, content := range cards {
+		writeFixtureFile(t, filepath.Join(repo, "docs", "tasks", name), content)
+	}
+	got, err := readCards(repo, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]card{}
+	for _, c := range got {
+		byID[c.id] = c
+	}
+
+	// The todo set is contained in the done set.
+	if g := byID["BS.23"]; g.resolved != statusDone || g.duplicateOf != "T3.103" || !g.duplicateSubset {
+		t.Errorf("BS.23 = %+v, want done as subset of T3.103", g)
+	}
+	// The done set is contained in the todo set.
+	if g := byID["BS.25"]; g.resolved != statusDone || g.duplicateOf != "T3.104" || !g.duplicateSubset {
+		t.Errorf("BS.25 = %+v, want done as superset of T3.104", g)
+	}
+	// A shared file alone is not enough without containment.
+	if g := byID["BS.19"]; g.resolved != statusTodo {
+		t.Errorf("BS.19 = %+v, want todo when sets only intersect", g)
+	}
+	if g := byID["BS.26"]; g.resolved != statusTodo {
+		t.Errorf("BS.26 = %+v, want todo with disjoint OwnerFiles", g)
+	}
+	if g := byID["BS.27"]; g.resolved != statusDropped {
+		t.Errorf("BS.27 = %+v, want dropped card untouched", g)
+	}
+	if g := byID["BS.28"]; g.resolved != statusTodo {
+		t.Errorf("BS.28 = %+v, want todo with empty OwnerFiles", g)
 	}
 }
 
