@@ -65,6 +65,37 @@ func mcpDaemonInterval() time.Duration {
 	return d
 }
 
+// defaultVerdictPollInterval is the cadence of the single DB-backed verdict
+// poller that feeds beacon_wait_result. It is far shorter than the reconciler's
+// 10s/30s cycle so a waiter sees a verdict shortly after the bridge writes it.
+const defaultVerdictPollInterval = 750 * time.Millisecond
+
+// verdictPollIntervalEnv overrides the poller cadence at the CLI boundary, the
+// same way BEACON_DAEMON_INTERVAL overrides the daemon cycle. A broken value
+// falls back to the default so a bad setting cannot stall waiting callers.
+const verdictPollIntervalEnv = "BEACON_VERDICT_POLL_INTERVAL"
+
+func verdictPollInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(verdictPollIntervalEnv))
+	if raw == "" {
+		return defaultVerdictPollInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return defaultVerdictPollInterval
+	}
+	return d
+}
+
+// stopVerdictSource releases the one poller created by buildMCPDependencies
+// before its store handle closes. The source is optional so a dependencies
+// value assembled by a test still closes cleanly.
+func stopVerdictSource(source mcp.VerdictSource) {
+	if s, ok := source.(interface{ Stop() }); ok {
+		s.Stop()
+	}
+}
+
 // startMCPDaemon builds the full daemon cycle in this process and starts it as
 // a goroutine. The returned stop cancels the loop, waits for it to exit and
 // closes the ports it used. Callers must invoke stop before closing any store
@@ -350,9 +381,9 @@ func sharedCIWaiter(ctx context.Context, key string, fn func(context.Context) er
 // use the same single-writer connection, so a tool's write is visible to the
 // next tool immediately.
 //
-// CI and Source have no production adapter in this tree. A watch_pr call must
-// therefore supply headSHA; a wait on a still-watching Watch reports that no
-// verdict source is configured. Neither affects the store-backed handlers.
+// CI still has no production adapter in this tree, so a watch_pr call must
+// supply headSHA. Source is now backed by the single DB verdict poller, so a
+// wait on a watching Watch can observe the verdict the reconciler persists.
 func openMCPDependencies() (mcp.Dependencies, func() error, error) {
 	dir, err := stateDir()
 	if err != nil {
@@ -369,7 +400,11 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 	if err != nil {
 		return mcp.Dependencies{}, nil, err
 	}
-	return buildMCPDependencies(db, dir, nil), db.Close, nil
+	deps := buildMCPDependencies(db, dir, nil)
+	return deps, func() error {
+		stopVerdictSource(deps.Source)
+		return db.Close()
+	}, nil
 }
 
 // openProcessStore opens the single SQLite handle a long-lived process shares
@@ -391,10 +426,14 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 	// the read/claim decorators, the bridge wake path and the stats projection.
 	lad := ladder.New(db)
 	return mcp.Dependencies{
-		Store:           db,
-		Stamper:         ladderStamper{ObligationStamper: mcp.NewSQLObligationStamper(db), ladder: lad},
-		Writer:          ladderWaitWriter{WaitResultWriter: mcp.NewSQLWaitResultWriter(db), ladder: lad},
-		Events:          mcp.NewSQLCancelEventLog(db),
+		Store:   db,
+		Stamper: ladderStamper{ObligationStamper: mcp.NewSQLObligationStamper(db), ladder: lad},
+		Writer:  ladderWaitWriter{WaitResultWriter: mcp.NewSQLWaitResultWriter(db), ladder: lad},
+		Events:  mcp.NewSQLCancelEventLog(db),
+		// One source for the whole process. It polls the same DB handle the
+		// reconciler writes, so a verdict written by the bridge reaches every
+		// caller waiting on that Watch (ADR 0005: the port stays in mcp).
+		Source:          mcp.NewDBVerdictSource(db, verdictPollInterval()),
 		SharedCIWaiter:  sharedCIWaiter,
 		PrecheckJournal: taskcli.NewService(taskcli.Config{StateDir: dir}),
 		CallScopes:      mcp.NewCapabilityScopeRegistry(nil, nil),
@@ -608,6 +647,7 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 
 	ghBatch := newGitHubBatch(ctx, c)
 	deps := buildMCPDependencies(db, dir, ghBatch.provider.PointStats)
+	defer stopVerdictSource(deps.Source)
 
 	cfg := reconcileConfig{
 		dir:        dir,
