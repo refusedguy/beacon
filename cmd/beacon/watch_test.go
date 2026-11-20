@@ -1043,3 +1043,131 @@ func TestW3141LiveJSONIncludesAttention(t *testing.T) {
 		t.Fatalf("неверная строка: %+v", rows)
 	}
 }
+
+// T5.58: the live JOIN carries the ADR 0094 registry axes.
+
+func TestT558JoinWatchesCarriesRegistryAxes(t *testing.T) {
+	snap := mcp.StateSnapshot{
+		ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictReady, 7, "ses-1", "ses-unknown"),
+		},
+		Registry: []mcp.RegistryEntry{
+			{
+				ID:           "ses-1",
+				Role:         domain.RoleExecutor,
+				Capabilities: []domain.Capability{"watch", "ci-retry"},
+				Config:       "cfg-1",
+				Status:       mcp.RegistryActive,
+			},
+		},
+	}
+
+	rows := joinWatches(snap, nil)
+	if len(rows) != 2 {
+		t.Fatalf("строк %d, ожидалось 2", len(rows))
+	}
+	if rows[0].Role != string(domain.RoleExecutor) ||
+		strings.Join(rows[0].Capabilities, ",") != "watch,ci-retry" ||
+		rows[0].Config != "cfg-1" {
+		t.Fatalf("строка с реестром = %+v", rows[0])
+	}
+	// A subscriber without a registry row stays visible with empty axes.
+	if rows[1].Role != "" || len(rows[1].Capabilities) != 0 || rows[1].Config != "" {
+		t.Fatalf("строка без реестра = %+v", rows[1])
+	}
+}
+
+func TestT558JoinWatchesWithoutRegistryKeepsPreviousShape(t *testing.T) {
+	snap := mcp.StateSnapshot{ActiveWatches: []domain.Watch{w69Watch(domain.VerdictReady, 7, "ses-1")}}
+	rows := joinWatches(snap, nil)
+	if len(rows) != 1 || rows[0].Role != "" || len(rows[0].Capabilities) != 0 || rows[0].Config != "" {
+		t.Fatalf("снимок без реестра дал строки %+v", rows)
+	}
+}
+
+func TestT558LiveTableShowsRegistryColumns(t *testing.T) {
+	rows := []watchRow{
+		{
+			Watch: "watch-1", Verdict: "ready", Revision: 7, Subscriber: "ses-1",
+			Role: string(domain.RoleExecutor), Capabilities: []string{"watch", "ci-retry"}, Config: "cfg-1",
+		},
+		{Watch: "watch-2", Verdict: "ready", Revision: 3, Subscriber: "ses-2"},
+	}
+	var out bytes.Buffer
+	renderLiveTable(&out, rows)
+	text := out.String()
+
+	for _, column := range []string{"ROLE", "CAPS", "CONFIG"} {
+		if !strings.Contains(text, column) {
+			t.Fatalf("нет колонки %s: %q", column, text)
+		}
+	}
+	matched := w69LineContaining(text, "watch-1")
+	if !strings.Contains(matched, string(domain.RoleExecutor)) ||
+		!strings.Contains(matched, "watch,ci-retry") || !strings.Contains(matched, "cfg-1") {
+		t.Fatalf("строка с реестром = %q", matched)
+	}
+	unmatched := strings.Fields(w69LineContaining(text, "watch-2"))
+	if len(unmatched) != 10 {
+		t.Fatalf("строка без реестра имеет %d полей, ожидалось 10: %v", len(unmatched), unmatched)
+	}
+	for i := 7; i < 10; i++ {
+		if unmatched[i] != "-" {
+			t.Fatalf("поле %d строки без реестра = %q, ожидался dash: %v", i, unmatched[i], unmatched)
+		}
+	}
+}
+
+func TestT558JSONCarriesRegistryAxes(t *testing.T) {
+	rows := []watchRow{{
+		Watch: "watch-1", Verdict: "ready", Revision: 7, Subscriber: "ses-1",
+		Role: string(domain.RoleExecutor), Capabilities: []string{"watch"}, Config: "cfg-1",
+	}}
+	var out bytes.Buffer
+	if err := renderWatchJSON(&out, rows); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	var decoded []watchRow
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded) != 1 || decoded[0].Role != string(domain.RoleExecutor) ||
+		strings.Join(decoded[0].Capabilities, ",") != "watch" || decoded[0].Config != "cfg-1" {
+		t.Fatalf("decoded = %+v", decoded)
+	}
+}
+
+func TestT558LiveReconnectRereadsRegistryColumns(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{
+			ActiveWatches: []domain.Watch{w69Watch(domain.VerdictReady, 7, "ses-1")},
+			Registry: []mcp.RegistryEntry{{
+				ID: "ses-1", Role: domain.RoleExecutor,
+				Capabilities: []domain.Capability{"watch"}, Config: "cfg-1",
+			}},
+		}, nil
+	})
+	events := make(chan liveEvent, 1)
+	events <- liveEvent{Type: "session.status"}
+	close(events)
+	src := &w3141Source{
+		sessions: []opencodeSession{w3141Session("ses-1", "developer", "idle")},
+		channels: []chan liveEvent{events},
+	}
+	h := w3141Start(t, src)
+
+	// Подключение, событие и reconnect после обрыва SSE: три перечитывания.
+	h.w3141Renders(t, 3)
+	if code := h.w3141Stop(t); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, h.errOut.String())
+	}
+	text := h.out.String()
+	for _, column := range []string{"ROLE", "CAPS", "CONFIG", string(domain.RoleExecutor), "watch", "cfg-1"} {
+		if !strings.Contains(text, column) {
+			t.Fatalf("нет %s после reconnect: %q", column, text)
+		}
+	}
+	if strings.Count(text, "cfg-1") < 2 {
+		t.Fatalf("таблица не перечитана после обрыва SSE: %q", text)
+	}
+}
