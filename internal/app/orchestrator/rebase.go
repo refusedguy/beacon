@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // GitRunner runs one git command. An empty dir means the process working
@@ -83,6 +84,12 @@ type RebaseMerger interface {
 // here instead.
 const VerdictRebase = "rebase"
 
+// mergeQueueSerializeWindow is the time after a merge during which the next
+// ready PR is held so its branch can be rebased onto the new main first. Two
+// PRs that are each green against an old main can break main when merged
+// back-to-back; the window gives the second PR a chance to catch up.
+const mergeQueueSerializeWindow = 2 * time.Minute
+
 // conflictReasonPrefix makes the file list in a wake reason unambiguous.
 const conflictReasonPrefix = "rebase conflict files: "
 
@@ -140,6 +147,30 @@ type Rebaser struct {
 	// is false RebaseAll changes nothing: no fetch, no rebase, no push and no
 	// wake. Set it from the project config to enable the automatic path.
 	AutoRebaseCleanBehind bool
+	// MergeQueueSerialize turns on the merge-queue serialization gate. It is
+	// false by default, so an unconfigured Rebaser never holds a ready PR.
+	// When on, ShouldSerialize reports whether a ready PR must be held after a
+	// recent merge. The clock and the previous merge time come from the caller:
+	// this package owns neither. Wiring prevMergedAt from cibridge and persisting
+	// the wait_dependency/rebase verdict lands in a follow-up PR (after W11-C).
+	MergeQueueSerialize bool
+}
+
+// ShouldSerialize reports whether the serialization gate must hold a ready PR.
+// With MergeQueueSerialize off (the default) it never holds. With it on, a PR
+// is held when another PR merged within mergeQueueSerializeWindow before now,
+// so the PR can be rebased onto the new main before it merges. A caller that
+// gets true marks the Watch wait_dependency/rebase and requires a rebase on the
+// new main. The time inputs are supplied by the caller; a zero time means there
+// is no previous merge to serialize against.
+func (r *Rebaser) ShouldSerialize(prevMergedAt, now time.Time) bool {
+	if r == nil || !r.MergeQueueSerialize {
+		return false
+	}
+	if prevMergedAt.IsZero() || now.IsZero() {
+		return false
+	}
+	return now.Sub(prevMergedAt) < mergeQueueSerializeWindow
 }
 
 // RebaseAll rebases every active, unmerged watch branch. It returns one
