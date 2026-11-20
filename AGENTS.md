@@ -1,0 +1,32 @@
+# Правила агента в репозитории beacon
+
+## Beacon MCP обязателен для цикла
+
+MCP-сервер Beacon подключён в `/mnt/projects/beacon-handoff/opencode.json`. Инструменты доступны через инструмент `execute` (Code Mode): сначала `search({ query: "beacon", namespace: "beacon" })`, затем вызовы `tools.beacon.beacon_watch_pr({...})` и остальные шесть инструментов. Не писать самописный JSON-RPC-клиент.
+
+До начала работы прочитать шаблон своего цикла:
+
+- исполнитель: `docs/templates/executor-task.md`
+- оркестратор: `docs/templates/orchestrator-task.md`
+
+Исполнитель после открытия PR:
+
+1. Берёт `headSHA` командой `git rev-parse HEAD` в своём worktree.
+2. Вызывает `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"`, `notify: { adapter: "opencode", target: "<cardID>" }`.
+3. Завершает ход ровно фразой `waiting, <watchID>`. Не опрашивает `gh pr checks` в цикле и не ждёт вручную.
+
+Оркестратор подписывается на тот же PR с `role: "orchestrator"`. Вердикт читается только через `beacon_get_result`. `<subagent>`-отчёт со словом `waiting` вердиктом не является. Мерж только после зелёных проверок и читаного `verdict=ready`.
+
+## Честное состояние локального MCP
+
+Локальный MCP не имеет CI- и Source-адаптера. `beacon_watch_pr` требует `headSHA`. `beacon_wait_result` на Watch без вердикта сообщает, что источник вердикта не сконфигурирован. Это не повод polling-ить GitHub в цикле. Проверки CI смотреть одним вызовом `gh pr checks` и мержить только при всех `SUCCESS`.
+
+Если `beacon_watch_pr` отвечает `PERSIST_FAILED: watch_pr: store is nil`, бинарник собран до коммита с подключённым store. Пересобрать из корня репо:
+
+```
+go build -o .opencode/bin/beacon ./cmd/beacon
+```
+
+## Коммиты и локальные проверки
+
+Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки. Локальный гейт это `gofmt`. `go test` и `go build` локально как гейт не используются, но точечные прогоны допустимы как доказательство для владельца.
