@@ -98,8 +98,9 @@ Self-teaching next action: beacon_get_result returns nextAction, nextCommand and
 
 Verdicts: watching, ready, rebase, retry, keep_working, timeout, merged, closed. A watching-to-watching tick changes no revision and wakes nobody.`
 
-// ToolNames is the exact set of seven tool names in the registry
-// (WORKER-PROMPT §4.1). T2.1 registers stubs; behaviour arrives in later tasks.
+// ToolNames is the exact set of eight tool names in the registry: the seven
+// contracted tools (WORKER-PROMPT §4.1) plus beacon_defer_wiring (W12-B). T2.1
+// registers stubs; each real handler replaces its stub when wired.
 var ToolNames = []string{
 	"beacon_watch_pr",
 	"beacon_wait_result",
@@ -108,6 +109,7 @@ var ToolNames = []string{
 	"beacon_ack",
 	"beacon_cancel_watch",
 	"beacon_stats",
+	"beacon_defer_wiring",
 }
 
 // Bridge is the six-operation port between Beacon's MCP core and one external
@@ -158,6 +160,7 @@ var toolAnnotations = map[string]mcpsdk.ToolAnnotations{
 	"beacon_ack":          {DestructiveHint: boolPtr(false), IdempotentHint: true},
 	"beacon_cancel_watch": {DestructiveHint: boolPtr(true)},
 	"beacon_stats":        {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
+	"beacon_defer_wiring": {DestructiveHint: boolPtr(false), IdempotentHint: true},
 }
 
 // BlockerControl is the narrow control-plane port the two writing tools need.
@@ -182,7 +185,7 @@ func stubHandler(_ context.Context, _ *mcpsdk.CallToolRequest, _ stubInput) (*mc
 	return &mcpsdk.CallToolResult{}, stubOutput{OK: true}, nil
 }
 
-// Dependencies groups the ports the seven real handlers need. NewServer's
+// Dependencies groups the ports the eight real handlers need. NewServer's
 // zero-dependency form still registers every real handler; handlers that lack a
 // backing port report a domain error instead of pretending to succeed. A
 // composition root supplies the real ports through NewServerWithDeps.
@@ -244,6 +247,11 @@ type Dependencies struct {
 	// Continuations shares ack's answer-round counter when another tool needs
 	// to observe it. Nil keeps the handler's own real counter (ADR 0031 §3).
 	Continuations *ContinuationRegistry
+
+	// DeferWiring is the durable write side of beacon_defer_wiring (W12-B). A
+	// nil value keeps the tool registered but it reports PERSIST_FAILED until a
+	// composition root supplies the store port from W12-A.
+	DeferWiring DeferWriter
 }
 
 // CapabilityScopeRegistry owns one cancellation scope per calling agent
@@ -392,7 +400,7 @@ func NewWaitResultServiceFromDeps(deps Dependencies) *WaitResultService {
 	return svc
 }
 
-// NewServer builds the Beacon MCP server with all seven real tools registered
+// NewServer builds the Beacon MCP server with all eight real tools registered
 // and the cycle protocol attached to the handshake. With no dependencies it
 // still exercises the real handlers; inject Dependencies with NewServerWithDeps
 // to give them a persistent store and the other production ports.
@@ -423,7 +431,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	// nil maps (ADR 0003, ADR 0009). A derivation failure is a broken contract
 	// type: log it and fall back to a permissive object schema so every real
 	// handler is still registered. The precise schema is optional; the real
-	// tool is not. Returning here would leave all seven tools on startup stubs
+	// tool is not. Returning here would leave all eight tools on startup stubs
 	// (T3.59).
 	schemas, err := AllOutputSchemas()
 	if err != nil {
@@ -450,6 +458,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	AttachAck(s, ack)
 	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
 	attachStats(s, deps.Snapshot, schemas["beacon_stats"])
+	AttachDeferWiring(s, NewDeferWiringHandler(deps.DeferWiring))
 	return s
 }
 

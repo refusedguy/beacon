@@ -14,9 +14,9 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
-// Output types for the seven tools (WORKER-PROMPT §4.1). Every schema shown to
-// a client is derived from one of these structs by reflection, never by a
-// hand-written JSON literal.
+// Output types for the eight tools (WORKER-PROMPT §4.1 plus W12-B). Every
+// schema shown to a client is derived from one of these structs by reflection,
+// never by a hand-written JSON literal.
 
 // WatchPROutput is the response of beacon_watch_pr. The five leading fields
 // are the original contract (ADR 0094); Executor extends the notify metadata
@@ -239,6 +239,16 @@ type OKOutput struct {
 	OK bool `json:"ok"`
 }
 
+// DeferWiringOutput is the response of beacon_defer_wiring (W12-B). Created is
+// false for an idempotent repeat of the same (watchID, reason). CardMarkdown
+// is the ready-to-commit content of docs/tasks/WIRING-<pr>.md.
+type DeferWiringOutput struct {
+	CardID       string `json:"cardID"`
+	Created      bool   `json:"created"`
+	Status       string `json:"status"`
+	CardMarkdown string `json:"cardMarkdown"`
+}
+
 // PersistInfo is the persistence block of beacon_stats.
 type PersistInfo struct {
 	Seq       uint64 `json:"seq"`
@@ -276,7 +286,7 @@ func OutputSchema[T any]() (*jsonschema.Schema, error) {
 }
 
 // outputSchemaFactories pairs each tool name with its output type. Keys are
-// tool names from WORKER-PROMPT §4.1.
+// tool names from WORKER-PROMPT §4.1 plus beacon_defer_wiring (W12-B).
 var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_watch_pr":     func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
 	"beacon_wait_result":  func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
@@ -285,6 +295,7 @@ var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_ack":          func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 	"beacon_stats":        func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
+	"beacon_defer_wiring": func() (*jsonschema.Schema, error) { return OutputSchema[DeferWiringOutput]() },
 }
 
 // nullableMap relaxes a reflected map schema to accept JSON null. A nil Go map
