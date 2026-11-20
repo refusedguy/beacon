@@ -42,6 +42,12 @@ const (
 	maxReplay            = 1000
 	maxRequestBody       = 1 << 20
 	shutdownTimeout      = 3 * time.Second
+
+	// maxRecentWatches bounds the history block on the snapshot. A provider may
+	// keep more completed Watches in SQLite; the transport publishes the newest
+	// maxRecentWatches of them so a busy project cannot grow the response without
+	// limit.
+	maxRecentWatches = 30
 )
 
 // heartbeatInterval is a variable so a test can shorten it without waiting a
@@ -72,6 +78,60 @@ type Snapshot struct {
 	Metrics           json.RawMessage             `json:"metrics"`
 	LastCycle         LastCycle                   `json:"lastCycle"`
 	LoadErrors        []string                    `json:"loadErrors"`
+
+	// RecentWatches and HourlyStats are optional. A provider that does not
+	// implement HistorySource leaves both fields out of the JSON response, so
+	// an older client sees the same shape as before they were added.
+	RecentWatches []WatchHistory `json:"recentWatches,omitempty"`
+	HourlyStats   *HourlyStats   `json:"hourlyStats,omitempty"`
+}
+
+// WatchOutcome groups a completed Watch for the history list. It stays a string
+// so the OpenAPI enum does not change when the domain gains new verdicts.
+type WatchOutcome string
+
+const (
+	OutcomeMerged    WatchOutcome = "merged"
+	OutcomeClosed    WatchOutcome = "closed"
+	OutcomeEscalated WatchOutcome = "escalated"
+)
+
+// WatchHistory is one completed Watch projected for a future UI. It is a
+// transport-owned shape and never a live domain.Watch, so the wire contract
+// stays stable when the domain struct grows.
+type WatchHistory struct {
+	ID          string       `json:"id"`
+	Repo        string       `json:"repo"`
+	PR          int          `json:"pr"`
+	HeadSHA     string       `json:"headSHA"`
+	Outcome     WatchOutcome `json:"outcome"`
+	ClosedAt    time.Time    `json:"closedAt"`
+	CloseReason string       `json:"closeReason,omitempty"`
+}
+
+// HourlyStats is the last hour's activity. Points come from the CI provider's
+// budget, merges from completed Watches and blockers from the active incidents.
+type HourlyStats struct {
+	Points   int `json:"points"`
+	Merges   int `json:"merges"`
+	Blockers int `json:"blockers"`
+}
+
+// SnapshotHistory is the optional history block added to a Snapshot.
+type SnapshotHistory struct {
+	RecentWatches []WatchHistory `json:"recentWatches"`
+	HourlyStats   HourlyStats    `json:"hourlyStats"`
+}
+
+// HistorySource is an optional port layered on StateProvider. The transport
+// never opens SQLite itself. The composition root decides whether history is
+// available and implements this method on the value it passes as Provider.
+// RecentWatches must be newest first by ClosedAt; the transport keeps the first
+// maxRecentWatches entries. A failed read becomes a LoadErrors entry and the
+// snapshot still returns 200, so a UI that does not understand history keeps
+// working.
+type HistorySource interface {
+	SnapshotHistory(ctx context.Context) (SnapshotHistory, error)
 }
 
 // StateProvider supplies the projection. The transport only calls Snapshot.
@@ -563,6 +623,28 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	if snap.LoadErrors == nil {
 		snap.LoadErrors = []string{}
+	}
+	if history, ok := s.cfg.Provider.(HistorySource); ok {
+		h, err := history.SnapshotHistory(r.Context())
+		if err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "history: "+err.Error())
+		} else {
+			// A provider may already have filled either field from its own
+			// store read. Keep that value and use the port only for the gaps.
+			if snap.RecentWatches == nil {
+				snap.RecentWatches = h.RecentWatches
+				if snap.RecentWatches == nil {
+					snap.RecentWatches = []WatchHistory{}
+				}
+			}
+			if snap.HourlyStats == nil {
+				stats := h.HourlyStats
+				snap.HourlyStats = &stats
+			}
+		}
+	}
+	if len(snap.RecentWatches) > maxRecentWatches {
+		snap.RecentWatches = snap.RecentWatches[:maxRecentWatches]
 	}
 	writeJSON(w, http.StatusOK, snap)
 }
