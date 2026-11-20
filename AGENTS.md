@@ -31,6 +31,15 @@
 4. `git push -u origin <ветка>`, `gh pr create --base main --head <ветка>`.
 5. Отчёт: PR, headSHA, файлы.
 
+## Режимы плана
+
+Перед фазой plan прочитай поле `Режим плана` в карточке. Значение `fast` или `full`. Пустое поле означает `fast`.
+
+- `fast`: исполнитель не создаёт ветку и пишет `PLAN.md` в текущем дереве.
+- `full`: исполнитель создаёт ветку или worktree и пишет тот же `PLAN.md`.
+
+Оба режима создают проверяемый артефакт. План без `PLAN.md` проваливает карточку по правилу `no-artifact: fail`.
+
 ## beacon_watch_pr
 
 - `repo: "refusedguy/beacon"`, `pr`, `headSHA`, role: "executor" или role: "fixer".
