@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/server"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
@@ -60,6 +63,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskCheckLaunch(args[1:], stdout, stderr, cfg)
 	case "lease":
 		return runTaskLease(args[1:], stdout, stderr, cfg)
+	case "schedule":
+		return runTaskSchedule(args[1:], stdout, stderr, cfg)
 	default:
 		fmt.Fprintf(stderr, "неизвестная подкоманда task %q\n%s", args[0], taskUsage)
 		return taskstore.ExitValidation
@@ -67,7 +72,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 }
 
 const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
-	"               beacon task lease acquire|release|check [flags]"
+	"               beacon task lease acquire|release|check [flags]\n" +
+	"               beacon task schedule [create|list|delete] [flags]"
 
 // whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
 var whyEdgeKinds = []string{
@@ -727,4 +733,182 @@ func findProjectRoot() string {
 	}
 	cwd, _ := os.Getwd()
 	return cwd
+}
+
+// ---- ADR 0189 / ADR 0192 / BS.32: управление расписаниями ----
+//
+// CLI не открывает SQLite. Он говорит с внутренним API через порт
+// ScheduleStore; пока BS.33 не влит, порт реализован JSON-файлом в state dir.
+// Тесты подменяют эту точку входа моковым стором.
+
+var scheduleStoreFor = func(cfg taskcli.Config) (server.ScheduleStore, error) {
+	return server.NewFileScheduleStore(filepath.Join(cfg.StateDir, "schedules.json"))
+}
+
+func scheduleService(cfg taskcli.Config) (*server.ScheduleService, error) {
+	store, err := scheduleStoreFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return server.NewScheduleService(store)
+}
+
+// failSchedule maps a validation error from the internal API to exit code 1.
+// Store and configuration failures keep the generic startup code.
+func failSchedule(stderr io.Writer, err error) int {
+	if server.IsValidation(err) {
+		return failTask(stderr, taskstore.Validationf("%s", err.Error()))
+	}
+	return failTask(stderr, err)
+}
+
+const scheduleUsage = "использование: beacon task schedule [--id S] [--task-id T --kind interval|cron|mark --expr E] [--timezone Z]\n" +
+	"               beacon task schedule list [--format json]\n" +
+	"               beacon task schedule delete (--id S | S)\n" +
+	"               пауза: beacon task schedule --id S --enabled=false; возобновление: --enabled=true"
+
+func runTaskSchedule(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	if len(argv) == 0 {
+		fmt.Fprintln(stderr, scheduleUsage)
+		return taskstore.ExitValidation
+	}
+	switch argv[0] {
+	case "list":
+		return runScheduleList(argv[1:], stdout, stderr, cfg)
+	case "delete":
+		return runScheduleDelete(argv[1:], stdout, stderr, cfg)
+	default:
+		return runSchedulePut(argv, stdout, stderr, cfg)
+	}
+}
+
+// runSchedulePut создаёт расписание или меняет его состояние. Наличие --id
+// означает обновление: --enabled=false ставит задачу на паузу, не удаляя её.
+func runSchedulePut(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv,
+		map[string]bool{"id": true, "task-id": true, "kind": true, "expr": true, "timezone": true},
+		map[string]bool{"enabled": true})
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	forceCreate := false
+	if len(p.pos) > 0 {
+		switch p.pos[0] {
+		case "create", "add":
+			forceCreate = true
+		case "pause", "resume":
+			// Ключевое слово-псевдоним обновления, дальше всё задано флагами.
+		default:
+			return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+		}
+	}
+	svc, err := scheduleService(cfg)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	ctx := context.Background()
+
+	if id := strings.TrimSpace(p.value("id")); id != "" && !forceCreate {
+		enabled := false
+		if v, set := p.bools["enabled"]; set {
+			enabled = v
+		}
+		if enabled {
+			got, err := svc.Resume(ctx, id)
+			if err != nil {
+				return failSchedule(stderr, err)
+			}
+			fmt.Fprintf(stdout, "%s resumed\n", got.ID)
+			return taskstore.ExitOK
+		}
+		got, err := svc.Pause(ctx, id)
+		if err != nil {
+			return failSchedule(stderr, err)
+		}
+		fmt.Fprintf(stdout, "%s paused\n", got.ID)
+		return taskstore.ExitOK
+	}
+
+	taskID := strings.TrimSpace(p.value("task-id"))
+	if taskID == "" {
+		return failTask(stderr, taskstore.Validationf("нужен --task-id"))
+	}
+	kind := server.Kind(strings.TrimSpace(p.value("kind")))
+	if kind == "" {
+		return failTask(stderr, taskstore.Validationf("нужен --kind: interval, cron или mark"))
+	}
+	expr := strings.TrimSpace(p.value("expr"))
+	if expr == "" {
+		return failTask(stderr, taskstore.Validationf("нужен --expr"))
+	}
+	got, err := svc.Schedule(ctx, server.ScheduleCreate{
+		ID: p.value("id"), TaskID: taskID, Kind: kind, Expr: expr, Timezone: p.value("timezone"),
+	})
+	if err != nil {
+		return failSchedule(stderr, err)
+	}
+	fmt.Fprintf(stdout, "%s scheduled\n", got.ID)
+	return taskstore.ExitOK
+}
+
+func runScheduleList(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"format": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) > 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	format := p.value("format")
+	if format != "" && format != "table" && format != "json" {
+		return failTask(stderr, taskstore.Validationf("неизвестный формат %q", format))
+	}
+	svc, err := scheduleService(cfg)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	items, err := svc.List(context.Background())
+	if err != nil {
+		return failSchedule(stderr, err)
+	}
+	if format == "json" {
+		b, err := json.MarshalIndent(items, "", "  ")
+		if err != nil {
+			return failTask(stderr, taskstore.Startupf("не собран JSON расписаний: %v", err))
+		}
+		fmt.Fprintln(stdout, string(b))
+		return taskstore.ExitOK
+	}
+	fmt.Fprintln(stdout, "ID\tЗАДАЧА\tВИД\tВЫРАЖЕНИЕ\tВКЛЮЧЕНО\tПОЯС")
+	for _, s := range items {
+		fmt.Fprintf(stdout, "%s\t%s\t%s\t%s\t%t\t%s\n",
+			s.ID, s.TaskID, s.Kind, s.Expr, s.Enabled, s.Timezone)
+	}
+	return taskstore.ExitOK
+}
+
+func runScheduleDelete(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"id": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	id := strings.TrimSpace(p.value("id"))
+	if id == "" && len(p.pos) == 1 {
+		id = strings.TrimSpace(p.pos[0])
+	}
+	if id == "" {
+		return failTask(stderr, taskstore.Validationf("нужен --id или позиционный ID расписания"))
+	}
+	if len(p.pos) > 0 && strings.TrimSpace(p.pos[0]) != id {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	svc, err := scheduleService(cfg)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if err := svc.Delete(context.Background(), id); err != nil {
+		return failSchedule(stderr, err)
+	}
+	fmt.Fprintf(stdout, "%s deleted\n", id)
+	return taskstore.ExitOK
 }
