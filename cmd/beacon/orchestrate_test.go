@@ -395,3 +395,111 @@ func TestVerifyIssueEvidenceReportsActual(t *testing.T) {
 		t.Fatalf("actual = %q, want the current line", got.Actual)
 	}
 }
+
+// TestGenerateFindingIDDeterministic proves HD-041: the same defect keeps the
+// same id on every call, so an id derived now still names the finding on a
+// later CI pass. A random or time-based id would fail this test.
+func TestGenerateFindingIDDeterministic(t *testing.T) {
+	const file, rule = "cmd/beacon/orchestrate.go", "LAYER-FORBIDDEN-EDGE"
+	const line = 41
+	want := generateFindingID(file, line, rule)
+	for i := 0; i < 128; i++ {
+		if got := generateFindingID(file, line, rule); got != want {
+			t.Fatalf("call %d: id = %q, want stable %q", i, got, want)
+		}
+	}
+}
+
+// TestGenerateFindingIDDistinctFindings proves each identity field matters and
+// that no two findings in the set share an id. Length-prefixing the fields is
+// what keeps, for example, "a.go"/1/"RULE-B" apart from "a.go"/11/"RULE-A" and
+// keeps different rules at the same location distinct.
+func TestGenerateFindingIDDistinctFindings(t *testing.T) {
+	base := generateFindingID("a.go", 10, "RULE-A")
+	other := []struct {
+		name string
+		file string
+		line int
+		rule string
+	}{
+		{name: "different file", file: "b.go", line: 10, rule: "RULE-A"},
+		{name: "different line", file: "a.go", line: 11, rule: "RULE-A"},
+		{name: "different rule", file: "a.go", line: 10, rule: "RULE-B"},
+		{name: "adjacent line different rule", file: "a.go", line: 11, rule: "RULE-B"},
+	}
+	seen := map[string]bool{base: true}
+	for _, tc := range other {
+		t.Run(tc.name, func(t *testing.T) {
+			got := generateFindingID(tc.file, tc.line, tc.rule)
+			if got == base {
+				t.Fatalf("distinct finding got the base id %q", got)
+			}
+			if seen[got] {
+				t.Fatalf("duplicate id %q across distinct findings", got)
+			}
+			seen[got] = true
+		})
+	}
+	if len(seen) != len(other)+1 {
+		t.Fatalf("got %d unique ids, want %d", len(seen), len(other)+1)
+	}
+}
+
+// TestGenerateFindingIDEmptyFields proves a finding with no file, line or rule
+// still gets a non-empty, well-formed and stable id instead of an empty or
+// random one. It must also differ from any populated finding.
+func TestGenerateFindingIDEmptyFields(t *testing.T) {
+	id := generateFindingID("", 0, "")
+	if id == "" {
+		t.Fatal("empty finding produced an empty id")
+	}
+	if !strings.HasPrefix(id, "finding-") {
+		t.Fatalf("id = %q, want the finding- prefix", id)
+	}
+	if len(id) != len("finding-")+16 {
+		t.Fatalf("id = %q, want a 16-hex-character suffix", id)
+	}
+	for _, c := range id[len("finding-"):] {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			t.Fatalf("id = %q, want lowercase hex suffix", id)
+		}
+	}
+	if again := generateFindingID("", 0, ""); again != id {
+		t.Fatalf("empty finding id is unstable: %q then %q", id, again)
+	}
+	if populated := generateFindingID("a.go", 1, "RULE"); populated == id {
+		t.Fatalf("empty finding collided with populated id %q", id)
+	}
+	// Whitespace-only fields are still just fields, and still deterministic.
+	ws := generateFindingID("  ", 0, "  ")
+	if ws == id || ws == "" {
+		t.Fatalf("whitespace finding id = %q, want a distinct non-empty id", ws)
+	}
+}
+
+// TestGenerateFindingIDStableAcrossCallOrder proves the id depends only on the
+// finding, not on when or in what order it is computed. A per-process counter
+// or map iteration order would break this.
+func TestGenerateFindingIDStableAcrossCallOrder(t *testing.T) {
+	type finding struct {
+		file string
+		line int
+		rule string
+	}
+	items := []finding{
+		{"cmd/beacon/daemon.go", 90, "LAYER-FORBIDDEN-EDGE"},
+		{"internal/infra/observe/trace.go", 12, "OBSERVE"},
+		{"", 0, ""},
+		{"cmd/beacon/orchestrate.go", 41, "LAYER-FORBIDDEN-EDGE"},
+	}
+	first := make(map[finding]string, len(items))
+	for _, f := range items {
+		first[f] = generateFindingID(f.file, f.line, f.rule)
+	}
+	for i := len(items) - 1; i >= 0; i-- {
+		f := items[i]
+		if got := generateFindingID(f.file, f.line, f.rule); got != first[f] {
+			t.Fatalf("recomputing %+v: id = %q, want %q", f, got, first[f])
+		}
+	}
+}
