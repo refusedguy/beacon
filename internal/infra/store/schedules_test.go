@@ -184,7 +184,7 @@ func TestSaveScheduleUpsert(t *testing.T) {
 		t.Fatalf("second SaveSchedule: %v", err)
 	}
 
-	due, err := d.DueSchedules(now)
+	due, err := d.DueSchedules(updated.NextRun)
 	if err != nil || len(due) != 1 {
 		t.Fatalf("upsert left %d rows: %+v, err=%v", len(due), due, err)
 	}
