@@ -87,7 +87,7 @@ func (u *testUpdater) SetRebase(_ context.Context, id string, files []string) er
 	return u.err
 }
 
-type wakeCall struct {
+type rebaseWakeCall struct {
 	id       string
 	revision uint64
 	verdict  string
@@ -95,24 +95,24 @@ type wakeCall struct {
 }
 
 type testWaker struct {
-	calls []wakeCall
+	calls []rebaseWakeCall
 	err   error
 }
 
 func (w *testWaker) Wake(_ context.Context, id string, revision uint64, verdict string) error {
-	w.calls = append(w.calls, wakeCall{id: id, revision: revision, verdict: verdict})
+	w.calls = append(w.calls, rebaseWakeCall{id: id, revision: revision, verdict: verdict})
 	return w.err
 }
 
 func (w *testWaker) WakeWithReason(_ context.Context, id string, revision uint64, verdict, reason string) error {
-	w.calls = append(w.calls, wakeCall{id: id, revision: revision, verdict: verdict, reason: reason})
+	w.calls = append(w.calls, rebaseWakeCall{id: id, revision: revision, verdict: verdict, reason: reason})
 	return w.err
 }
 
-type plainWaker struct{ calls []wakeCall }
+type plainWaker struct{ calls []rebaseWakeCall }
 
 func (w *plainWaker) Wake(_ context.Context, id string, revision uint64, verdict string) error {
-	w.calls = append(w.calls, wakeCall{id: id, revision: revision, verdict: verdict})
+	w.calls = append(w.calls, rebaseWakeCall{id: id, revision: revision, verdict: verdict})
 	return nil
 }
 
