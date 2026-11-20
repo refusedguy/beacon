@@ -227,6 +227,35 @@ func (c *Client) get(ctx context.Context, path string) (*http.Response, error) {
 	return resp, nil
 }
 
+// post performs one authenticated JSON POST. As with get, the caller owns
+// resp.Body on success; on a non-2xx status the body is closed here.
+func (c *Client) post(ctx context.Context, path string, payload any) (*http.Response, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("opencode POST %s: %v", path, err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(authUser, c.password)
+	resp, err := c.doer.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return nil, fmt.Errorf("opencode POST %s: %s: %s", path, resp.Status, msg)
+	}
+	return resp, nil
+}
+
 func decodeList[T any](resp *http.Response) (list[T], error) {
 	defer resp.Body.Close()
 	var out list[T]
@@ -276,6 +305,49 @@ func (c *Client) Sessions(ctx context.Context) ([]Session, error) {
 		c.mu.Unlock()
 	}
 	return decoded.Data, nil
+}
+
+// CreateSession posts POST /api/session and returns the created session. The
+// agent is set here because the v2 prompt route has no agent field (ADR 0060
+// п3/п4).
+func (c *Client) CreateSession(ctx context.Context, parentID, agent, title string, metadata map[string]string) (Session, error) {
+	payload := struct {
+		ParentID string            `json:"parentID"`
+		Agent    string            `json:"agent"`
+		Title    string            `json:"title"`
+		Metadata map[string]string `json:"metadata"`
+	}{
+		ParentID: parentID,
+		Agent:    agent,
+		Title:    title,
+		Metadata: metadata,
+	}
+	resp, err := c.post(ctx, "/api/session", payload)
+	if err != nil {
+		return Session{}, err
+	}
+	defer resp.Body.Close()
+	var session Session
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&session); err != nil {
+		return Session{}, fmt.Errorf("opencode POST /api/session: %v", err)
+	}
+	return session, nil
+}
+
+// Prompt posts POST /api/session/:sessionID/prompt. It sends only the text:
+// the v2 route has no agent field, so the agent comes from the session created
+// by CreateSession (ADR 0060 п3/п4).
+func (c *Client) Prompt(ctx context.Context, sessionID, text string) error {
+	payload := struct {
+		Text string `json:"text"`
+	}{Text: text}
+	path := "/api/session/" + url.PathEscape(sessionID) + "/prompt"
+	resp, err := c.post(ctx, path, payload)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
 }
 
 // Config reads the raw body of GET /api/config. The config shape belongs to

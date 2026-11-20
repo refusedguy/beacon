@@ -390,6 +390,177 @@ func TestEventStreamGracefulCancel(t *testing.T) {
 	waitClosed(t, ch)
 }
 
+func TestCreateSessionSendsPostWithAgent(t *testing.T) {
+	var body []byte
+	doer := &fakeDoer{fn: func(req *http.Request) (*http.Response, error) {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		const out = `{"id":"s2","parentID":"root","agent":"build","title":"task","location":{"directory":"/w"}}`
+		return fakeResponse(out, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	session, err := c.CreateSession(context.Background(), "root", "build", "task",
+		map[string]string{"watchID": "w1", "obligationID": "o1"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if session.ID != "s2" || session.ParentID != "root" || session.Agent != "build" || session.Title != "task" {
+		t.Fatalf("неверная сессия: %+v", session)
+	}
+	if session.Location.Directory != "/w" {
+		t.Fatalf("неверная location: %+v", session.Location)
+	}
+
+	reqs := doer.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("ожидался 1 запрос, получено %d", len(reqs))
+	}
+	req := reqs[0]
+	if req.Method != http.MethodPost || req.URL.Path != "/api/session" {
+		t.Fatalf("неверный запрос: %s %s", req.Method, req.URL.Path)
+	}
+	if ct := req.Header.Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("неверный Content-Type: %q", ct)
+	}
+	user, pass, ok := req.BasicAuth()
+	if !ok || user != "opencode" || pass != "pw" {
+		t.Fatalf("неверный basic auth: user=%q pass=%q ok=%v", user, pass, ok)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("неверный JSON тела: %v (%s)", err, body)
+	}
+	if payload["agent"] != "build" {
+		t.Fatalf("agent в теле: %v", payload["agent"])
+	}
+	if payload["parentID"] != "root" || payload["title"] != "task" {
+		t.Fatalf("неверные поля тела: %v", payload)
+	}
+	meta, ok := payload["metadata"].(map[string]any)
+	if !ok || meta["watchID"] != "w1" || meta["obligationID"] != "o1" {
+		t.Fatalf("неверный metadata: %v", payload["metadata"])
+	}
+}
+
+func TestCreateSessionErrors(t *testing.T) {
+	t.Run("non-2xx", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			return fakeResponse(`{"error":"bad request"}`, http.StatusBadRequest), nil
+		}}
+		c := newTestClient(t, doer)
+		if _, err := c.CreateSession(context.Background(), "", "build", "", nil); err == nil {
+			t.Fatal("ожидалась ошибка для 400")
+		} else if !strings.Contains(err.Error(), "400") {
+			t.Fatalf("в ошибке нет кода: %v", err)
+		}
+	})
+
+	t.Run("transport", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connect refused")
+		}}
+		c := newTestClient(t, doer)
+		if _, err := c.CreateSession(context.Background(), "", "build", "", nil); err == nil {
+			t.Fatal("ожидалась ошибка транспорта")
+		}
+	})
+
+	t.Run("bad json", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			return fakeResponse(`not json`, http.StatusOK), nil
+		}}
+		c := newTestClient(t, doer)
+		if _, err := c.CreateSession(context.Background(), "", "build", "", nil); err == nil {
+			t.Fatal("ожидалась ошибка разбора ответа")
+		}
+	})
+}
+
+func TestPromptSendsPostWithoutAgent(t *testing.T) {
+	var body []byte
+	doer := &fakeDoer{fn: func(req *http.Request) (*http.Response, error) {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		return fakeResponse(`{}`, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	if err := c.Prompt(context.Background(), "s2", "hello"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	reqs := doer.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("ожидался 1 запрос, получено %d", len(reqs))
+	}
+	req := reqs[0]
+	if req.Method != http.MethodPost || req.URL.Path != "/api/session/s2/prompt" {
+		t.Fatalf("неверный запрос: %s %s", req.Method, req.URL.Path)
+	}
+	user, pass, ok := req.BasicAuth()
+	if !ok || user != "opencode" || pass != "pw" {
+		t.Fatalf("неверный basic auth: user=%q pass=%q ok=%v", user, pass, ok)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("неверный JSON тела: %v (%s)", err, body)
+	}
+	if payload["text"] != "hello" {
+		t.Fatalf("неверный text: %v", payload["text"])
+	}
+	if _, present := payload["agent"]; present {
+		t.Fatalf("agent не должен присутствовать в теле prompt: %s", body)
+	}
+}
+
+func TestPromptEscapesSessionID(t *testing.T) {
+	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+		return fakeResponse(`{}`, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	if err := c.Prompt(context.Background(), "s/1", "hello"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	reqs := doer.snapshot()
+	if len(reqs) != 1 || !strings.Contains(reqs[0].URL.EscapedPath(), "%2F") {
+		t.Fatalf("sessionID не экранирован: %+v", reqs)
+	}
+}
+
+func TestPromptErrors(t *testing.T) {
+	t.Run("non-2xx", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			return fakeResponse(`{"error":"unauthorized"}`, http.StatusUnauthorized), nil
+		}}
+		c := newTestClient(t, doer)
+		if err := c.Prompt(context.Background(), "s2", "hello"); err == nil {
+			t.Fatal("ожидалась ошибка для 401")
+		} else if !strings.Contains(err.Error(), "401") {
+			t.Fatalf("в ошибке нет кода: %v", err)
+		}
+	})
+
+	t.Run("transport", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("connect refused")
+		}}
+		c := newTestClient(t, doer)
+		if err := c.Prompt(context.Background(), "s2", "hello"); err == nil {
+			t.Fatal("ожидалась ошибка транспорта")
+		}
+	})
+}
+
 func waitClosed(t *testing.T, ch <-chan EventResult) {
 	t.Helper()
 	for {
