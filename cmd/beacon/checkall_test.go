@@ -7,49 +7,13 @@ import (
 	"strings"
 	"testing"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
-
-func TestCIWakeTargetResolution(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		flag     string
-		target   string
-		parent   string
-		want     string
-		wantErr  bool
-		errPart  string
-	}{
-		{name: "flag wins", flag: "ses_flag", target: "ses_env", parent: "ses_parent", want: "ses_flag"},
-		{name: "explicit env", target: "ses_env", parent: "ses_parent", want: "ses_env"},
-		{name: "orchestrator parent session", parent: "ses_parent", want: "ses_parent"},
-		{name: "service name rejected", flag: "beacon-ci-checkall", wantErr: true, errPart: "ses_"},
-		{name: "missing target rejected", wantErr: true, errPart: "BEACON_WAKE_TARGET"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv(ciWakeTargetEnv, tc.target)
-			t.Setenv(ciParentSessionEnv, tc.parent)
-			got, err := ciWakeTarget(tc.flag)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("ciWakeTarget(%q) accepted an invalid target", tc.flag)
-				}
-				if !strings.Contains(err.Error(), tc.errPart) {
-					t.Fatalf("error %q must contain %q", err, tc.errPart)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got != tc.want {
-				t.Fatalf("ciWakeTarget = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
 
 // ciFakeGH answers the two gh calls the checkall pass makes. An empty GraphQL
 // body keeps the Watch watching, so this test isolates registration.
@@ -66,83 +30,237 @@ func ciFakeGH(_, name string, args, _ []string) runResult {
 	return runResult{code: 2, stderr: []byte("unexpected gh call: " + strings.Join(args, " "))}
 }
 
-func TestCICheckAllRegistersOrchestratorSessionAndWakesIt(t *testing.T) {
-	stateDir := t.TempDir()
-	t.Setenv("BEACON_STATE_DIR", stateDir)
-	t.Setenv(ciWakeTargetEnv, "")
-	t.Setenv(ciParentSessionEnv, "")
-
-	const session = "ses_orch_1"
-	var out, errOut bytes.Buffer
-	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGH, root: t.TempDir()}
-	if code := runCI(cli, []string{"check", "--all", "--wake-target", session}); code != 0 {
-		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
+// ciFakeGHReady answers with one green check so an existing Watch gets a
+// terminal verdict.
+func ciFakeGHReady(_, name string, args, _ []string) runResult {
+	if name != "gh" {
+		return runResult{code: 2, stderr: []byte("unexpected command " + name)}
 	}
+	if len(args) >= 2 && args[0] == "pr" && args[1] == "list" {
+		return runResult{stdout: []byte(`[{"number":7,"headRefOid":"sha7"}]`)}
+	}
+	if len(args) >= 2 && args[0] == "api" && args[1] == "graphql" {
+		return runResult{stdout: []byte(`{"data":{"p0":{"pullRequest":{"statusCheckRollup":{"contexts":{"nodes":[{"__typename":"CheckRun","name":"build","conclusion":"SUCCESS"}]}}}}}}`)}
+	}
+	return runResult{code: 2, stderr: []byte("unexpected gh call: " + strings.Join(args, " "))}
+}
 
+// ciSessionRequest is the shape an MCP caller sends: the sessionID lives in
+// _meta, so watch_pr derives the subscriber from the caller itself.
+func ciSessionRequest(session string) *mcpsdk.CallToolRequest {
+	return &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Meta: mcpsdk.Meta{"ai.opencode/sessionID": session},
+	}}
+}
+
+// ciRegisterWatch models the agent or orchestrator creating a Watch through
+// beacon_watch_pr. The daemon and ci check --all never do this.
+func ciRegisterWatch(t *testing.T, db *store.DB, role domain.Role, session string) mcp.WatchPROutput {
+	t.Helper()
+	out, err := mcp.NewWatchPRHandler(db, nil, nil).Register(context.Background(),
+		ciSessionRequest(session), mcp.WatchPRInput{
+			Repo: "refusedguy/beacon", PR: 7, HeadSHA: "sha7", Role: role,
+		})
+	if err != nil {
+		t.Fatalf("watch_pr register: %v", err)
+	}
+	return out
+}
+
+func ciOpenState(t *testing.T, stateDir string) *store.DB {
+	t.Helper()
 	db, err := store.Open(filepath.Join(stateDir, mcpStateDBName))
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func TestDaemonWithoutWakeTargetDoesNotRegisterWatch(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", stateDir)
+	t.Setenv("BEACON_DAEMON_INTERVAL", "")
+	// Values that used to supply the orchestrator session. They must be
+	// ignored: the daemon has no wake target and no orchestrator subscriber.
+	t.Setenv("BEACON_WAKE_TARGET", "ses_ignored_env")
+	t.Setenv("BEACON_PARENT_SESSION", "ses_ignored_parent")
+
+	var out, errOut bytes.Buffer
+	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGH, root: t.TempDir()}
+	if code := runDaemon(cli, []string{"--once"}); code != 0 {
+		t.Fatalf("runDaemon code = %d, stderr = %s", code, errOut.String())
+	}
+
+	db := ciOpenState(t, stateDir)
+	defer db.Close()
+	watches, err := db.ActiveWatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(watches) != 0 {
+		t.Fatalf("daemon created %d watches, want 0", len(watches))
+	}
+}
+
+func TestDaemonRejectsWakeTargetFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGH, root: t.TempDir()}
+	code := runDaemon(cli, []string{"--once", "--wake-target", "ses_x"})
+	if code != 2 {
+		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "flag provided but not defined") {
+		t.Fatalf("stderr must reject the removed flag: %s", errOut.String())
+	}
+}
+
+func TestCICheckAllWithoutWakeTargetDoesNotRegisterWatch(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", stateDir)
+	t.Setenv("BEACON_WAKE_TARGET", "ses_ignored_env")
+	t.Setenv("BEACON_PARENT_SESSION", "ses_ignored_parent")
+
+	var out, errOut bytes.Buffer
+	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGH, root: t.TempDir()}
+	if code := runCI(cli, []string{"check", "--all"}); code != 0 {
+		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
+	}
+
+	db := ciOpenState(t, stateDir)
+	defer db.Close()
+	watches, err := db.ActiveWatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(watches) != 0 {
+		t.Fatalf("ci check created %d watches, want 0", len(watches))
+	}
+	if !strings.Contains(out.String(), "зарегистрировано 0") || !strings.Contains(out.String(), "beacon_watch_pr") {
+		t.Fatalf("summary must report the refused registration: %q", out.String())
+	}
+}
+
+func TestCICheckAllRejectsWakeTargetFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGH, root: t.TempDir()}
+	code := runCI(cli, []string{"check", "--all", "--wake-target", "ses_x"})
+	if code != 2 {
+		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "flag provided but not defined") {
+		t.Fatalf("stderr must reject the removed flag: %s", errOut.String())
+	}
+}
+
+func TestCICheckAllUpdatesExistingWatchWithoutWakeTarget(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", stateDir)
+	t.Setenv("BEACON_WAKE_TARGET", "ses_ignored_env")
+	t.Setenv("BEACON_PARENT_SESSION", "ses_ignored_parent")
+
+	db := ciOpenState(t, stateDir)
+	registered := ciRegisterWatch(t, db, domain.RoleExecutor, "ses_exec_1")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGHReady, root: t.TempDir()}
+	if code := runCI(cli, []string{"check", "--all"}); code != 0 {
+		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
+	}
+
+	db = ciOpenState(t, stateDir)
+	defer db.Close()
+	w, err := db.Watch(registered.WatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Verdict != domain.VerdictReady || w.Status != domain.StatusNotifying || w.Revision != 1 {
+		t.Fatalf("watch = %+v, want ready/notifying/revision 1", w)
+	}
+	o, err := db.Obligation(domain.ObligationKey(registered.WatchID, 1, "ses_exec_1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.VerdictPointer != domain.VerdictReady || o.SubscriberID != "ses_exec_1" {
+		t.Fatalf("obligation = %+v", o)
+	}
 	watches, err := db.ActiveWatches()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(watches) != 1 {
-		t.Fatalf("active watches = %d, want 1", len(watches))
-	}
-	w := watches[0]
-	var subscriberID, subscriberTarget, adapter string
-	for _, s := range w.Subscribers {
-		if string(s.Role) == "orchestrator" {
-			subscriberID, subscriberTarget, adapter = s.ID, s.Target, s.Adapter
-		}
-	}
-	if subscriberID != session || subscriberTarget != session || adapter != "opencode" {
-		t.Fatalf("orchestrator subscriber = (id %q, target %q, adapter %q), want (%s, %s, opencode)",
-			subscriberID, subscriberTarget, adapter, session, session)
-	}
-
-	// The wake path resolves the recipient from the persisted Watch. A service
-	// name fails here and would otherwise reach the prompt API as a bad path.
-	target, err := wake.WatchTarget(w, w.ID)
-	if err != nil {
-		t.Fatalf("WatchTarget: %v", err)
-	}
-	if target != session {
-		t.Fatalf("wake target = %q, want %q", target, session)
-	}
-
-	var promptArgs []string
-	deliverer := &wake.OpenCodeDeliverer{Runner: func(_ context.Context, args ...string) ([]byte, error) {
-		promptArgs = append([]string(nil), args...)
-		return []byte(`{"data":{"id":"msg_1"}}`), nil
-	}}
-	payload := domain.WakePayload{
-		WatchID:      w.ID,
-		Revision:     w.Revision,
-		ObligationID: domain.ObligationKey(w.ID, w.Revision, target),
-		Verdict:      string(domain.VerdictReady),
-	}
-	if err := deliverer.Deliver(context.Background(), target, payload); err != nil {
-		t.Fatalf("wake delivery: %v", err)
-	}
-	wantPath := "/api/session/" + session + "/prompt"
-	if len(promptArgs) < 3 || promptArgs[1] != "POST" || promptArgs[2] != wantPath {
-		t.Fatalf("prompt args = %v, want POST %s", promptArgs, wantPath)
+		t.Fatalf("active watches = %d, want 1 (no duplicate from ci check)", len(watches))
 	}
 }
 
-func TestCICheckAllRejectsInvalidWakeTarget(t *testing.T) {
-	t.Setenv(ciWakeTargetEnv, "")
-	t.Setenv(ciParentSessionEnv, "")
+type ciRecordingDeliverer struct {
+	sessionID string
+	payload   domain.WakePayload
+}
+
+func (d *ciRecordingDeliverer) Deliver(_ context.Context, sessionID string, p domain.WakePayload) error {
+	d.sessionID = sessionID
+	d.payload = p
+	return nil
+}
+
+func TestBlockedWakeStillFindsAgentCreatedOrchestratorSubscriber(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", stateDir)
+
+	db := ciOpenState(t, stateDir)
+	registered := ciRegisterWatch(t, db, domain.RoleOrchestrator, "ses_orch_agent")
+	w, err := db.Watch(registered.WatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wake.OrchestratorSession(w); got != "ses_orch_agent" {
+		t.Fatalf("orchestrator subscriber = %q, want ses_orch_agent", got)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// ci check must not replace the agent-created Watch with one of its own.
 	var out, errOut bytes.Buffer
 	cli := &CLI{out: &out, errOut: &errOut, run: ciFakeGH, root: t.TempDir()}
-	code := runCI(cli, []string{"check", "--all", "--wake-target", "beacon-ci-checkall"})
-	if code != 2 {
-		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	if code := runCI(cli, []string{"check", "--all"}); code != 0 {
+		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "ses_") || !strings.Contains(errOut.String(), "--wake-target") {
-		t.Fatalf("error must name the prefix and the flag: %s", errOut.String())
+
+	db = ciOpenState(t, stateDir)
+	defer db.Close()
+	watches, err := db.ActiveWatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(watches) != 1 {
+		t.Fatalf("active watches = %d, want 1 (ci check must not register another)", len(watches))
+	}
+	w, err = db.Watch(registered.WatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wake.OrchestratorSession(w); got != "ses_orch_agent" {
+		t.Fatalf("orchestrator subscriber after ci check = %q, want ses_orch_agent", got)
+	}
+
+	// The blocked path resolves the orchestrator from this Watch, not from a
+	// daemon registration, and still steers to its session.
+	deliverer := &ciRecordingDeliverer{}
+	ctx := wake.WithOrchestratorNotifier(context.Background(), &wake.OrchestratorNotifier{
+		Deliverer: deliverer,
+		Watches:   db,
+	})
+	if err := wake.NotifyOrchestrator(ctx, wake.ReasonMyFault, domain.WakePayload{WatchID: registered.WatchID}); err != nil {
+		t.Fatalf("NotifyOrchestrator: %v", err)
+	}
+	if deliverer.sessionID != "ses_orch_agent" {
+		t.Fatalf("wake target = %q, want ses_orch_agent", deliverer.sessionID)
+	}
+	if deliverer.payload.Verdict != wake.ReasonMyFault {
+		t.Fatalf("reason = %q, want %q", deliverer.payload.Verdict, wake.ReasonMyFault)
 	}
 }

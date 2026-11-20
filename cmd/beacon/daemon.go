@@ -14,7 +14,6 @@ import (
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/ghci"
-	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
 // daemonIntervalEnv overrides the default pass interval without a flag.
@@ -44,7 +43,6 @@ func runDaemon(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	interval := fs.Duration("interval", defaultInterval, "интервал прохода (по умолчанию 3m)")
 	once := fs.Bool("once", false, "выполнить один проход и выйти")
-	wakeTargetFlag := fs.String("wake-target", "", "sessionID OpenCode оркестратора для wake")
 	if !parseFlags("daemon", args, c.errOut, fs) {
 		return 2
 	}
@@ -52,13 +50,8 @@ func runDaemon(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon daemon: интервал должен быть положительным\n")
 		return 2
 	}
-	wakeTarget, err := ciWakeTarget(*wakeTargetFlag)
-	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
-		return 2
-	}
 
-	ports, closePorts, err := makeDaemonPorts(c, wakeTarget)
+	ports, closePorts, err := makeDaemonPorts(c)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon daemon: %v\n", err)
 		return 2
@@ -78,7 +71,7 @@ func runDaemon(c *CLI, args []string) int {
 // makeDaemonPorts builds the three pass actions from the real state store.
 // The checkall and cibridge ports share one store handle; the orchestrator
 // factory opens its own handle, so both are closed on shutdown.
-func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func() error, error) {
+func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 	deps, closeStore, err := openMCPDependencies()
 	if err != nil {
 		return orchestrator.DaemonPorts{}, nil, err
@@ -91,7 +84,6 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 		return orchestrator.DaemonPorts{}, nil, fmt.Errorf("store does not support verdict writes")
 	}
 
-	watchHandler := mcp.NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
 	registry := orchestrator.FuncRegistry{
 		FindFn: func(_ context.Context, pr orchestrator.PR) (orchestrator.WatchRef, bool, error) {
 			watches, err := deps.Store.ActiveWatches()
@@ -102,8 +94,9 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 				if w.Repo == pr.Repo && w.PR == pr.Number && w.HeadSHA == pr.HeadSHA {
 					// A Watch left by an older release can name a service instead
 					// of a session (beacon-ci-checkall, beacon-daemon-checkall).
-					// Treat it as stale and let checkall register a fresh Watch
-					// with the validated --wake-target session.
+					// Such a subscriber cannot receive a daemon wake, so skip the
+					// Watch. A fresh one must be created by the agent itself
+					// through beacon_watch_pr, not by the daemon.
 					subs := make([]orchestrator.DaemonSubscriber, 0, len(w.Subscribers))
 					for _, s := range w.Subscribers {
 						subs = append(subs, orchestrator.DaemonSubscriber{
@@ -127,20 +120,13 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 			}
 			return orchestrator.WatchRef{}, false, nil
 		},
-		RegisterFn: func(ctx context.Context, pr orchestrator.PR) (orchestrator.WatchRef, error) {
-			out, err := watchHandler.Register(ctx, nil, mcp.WatchPRInput{
-				Repo:    pr.Repo,
-				PR:      pr.Number,
-				HeadSHA: pr.HeadSHA,
-				Role:    "orchestrator",
-				Notify:  &mcp.WatchPRNotify{Adapter: "opencode", Target: wakeTarget},
-			})
-			if err != nil {
-				return orchestrator.WatchRef{}, err
-			}
-			return orchestrator.WatchRef{
-				ID: out.WatchID, Repo: pr.Repo, PR: pr.Number, HeadSHA: pr.HeadSHA, Revision: out.Revision,
-			}, nil
+		// A Watch belongs to the subscriber that created it through
+		// beacon_watch_pr. The daemon only refreshes verdicts of existing
+		// Watches. Registering one here would attach an orchestrator subscriber
+		// and steer retry/ready into the orchestrator's own session.
+		RegisterFn: func(_ context.Context, pr orchestrator.PR) (orchestrator.WatchRef, error) {
+			return orchestrator.WatchRef{}, fmt.Errorf(
+				"daemon: Watch для PR %d должен создаваться агентом через beacon_watch_pr", pr.Number)
 		},
 	}
 
@@ -203,9 +189,10 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 }
 
 // hasOrchestratorSession reports whether subs carry an explicit orchestrator
-// session that can receive a blocked escalation. FindFn uses it to keep a Watch
-// registered while its executor is still subscribing; the daemon wake path
-// itself never selects this subscriber (see DaemonWakeSubscriber).
+// session that can receive a blocked escalation. FindFn uses it to keep an
+// orchestrator-only Watch visible to checkall while its executor is still
+// subscribing; the daemon wake path itself never selects this subscriber
+// (see DaemonWakeSubscriber).
 func hasOrchestratorSession(subs []orchestrator.DaemonSubscriber) bool {
 	for _, s := range subs {
 		if s.Role != orchestrator.RoleOrchestrator {
