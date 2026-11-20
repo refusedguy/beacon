@@ -114,6 +114,14 @@ type blockerControl interface {
 // replace it so a parked Watch does not touch the working tree.
 type escalationWriter func(line string)
 
+// stateMerger is an optional refinement of domain.Merger. A provider that
+// already holds a fresh PRState from the batch can merge with it directly,
+// skipping a second GraphQL read whose lazy mergeable field may report UNKNOWN.
+// Mergers that only implement domain.Merger keep working through the fallback.
+type stateMerger interface {
+	MergePRWithState(ctx context.Context, repo string, pr int, state domain.PRState) (bool, bool, string, error)
+}
+
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider,
 // one Store and the optional control-plane ports, so a refresh is a batched
 // read followed by ordered writes.
@@ -706,7 +714,17 @@ func rolesFromTargets(targets []domain.WakeTarget) map[string]bool {
 func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservation, now time.Time, cycleID string) int {
 	observe.MergeAttempt(w.ID, w.PR)
 	start := time.Now()
-	merged, held, reason, err := b.merger.Merge(ctx, w.Repo, w.PR)
+	var merged, held bool
+	var reason string
+	var err error
+	if sm, ok := b.merger.(stateMerger); ok {
+		// obs.pr came from the same batch cycle that produced the ready verdict.
+		// Reusing it avoids a fresh GraphQL read that can report UNKNOWN for a
+		// PR the batch already resolved to MERGEABLE/CLEAN.
+		merged, held, reason, err = sm.MergePRWithState(ctx, w.Repo, w.PR, obs.pr)
+	} else {
+		merged, held, reason, err = b.merger.Merge(ctx, w.Repo, w.PR)
+	}
 	observe.MergeDuration(time.Since(start))
 	if merged {
 		observe.MergeSuccess(w.ID, w.PR)

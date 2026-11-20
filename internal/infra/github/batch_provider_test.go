@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -418,5 +419,253 @@ func TestMergePRRestConflictIsHeld(t *testing.T) {
 	}
 	if got := puts.Load(); got != 1 {
 		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+}
+
+// TestMergePRResolvesUnknownAfterPing304 reproduces the auto-merge stall: the
+// batch resolved MERGEABLE/CLEAN, but a fresh GraphQL read reports UNKNOWN and
+// the cached ETag makes the conditional ping answer 304. The merge must still
+// go through after an unconditional re-read.
+func TestMergePRResolvesUnknownAfterPing304(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	const etag = `"pr-42-unknown"`
+	var graphCalls, gets, puts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/graphql":
+			var req struct {
+				Query string `json:"query"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode query: %v", err)
+				http.Error(w, "bad query", http.StatusBadRequest)
+				return
+			}
+			state, mergeable := "OPEN", "UNKNOWN"
+			if graphCalls.Add(1) > 1 {
+				state, mergeable = "MERGED", "MERGEABLE"
+			}
+			batchReply(t, w, req.Query, prStateJSON(state, mergeable, "CLEAN"), `{}`, 1)
+		case r.URL.Path == "/repos/refusedguy/beacon/pulls/42" && r.Method == http.MethodGet:
+			n := gets.Add(1)
+			if r.Header.Get("If-None-Match") == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			w.Header().Set("ETag", etag)
+			w.Header().Set("Content-Type", "application/json")
+			if n == 1 {
+				fmt.Fprint(w, `{"number":42,"mergeable":null,"mergeable_state":"unknown"}`)
+			} else {
+				fmt.Fprint(w, `{"number":42,"mergeable":true,"mergeable_state":"clean"}`)
+			}
+		case r.URL.Path == "/repos/refusedguy/beacon/pulls/42/merge" && r.Method == http.MethodPut:
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"merged":true,"sha":"abc123"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	graph := NewClient(srv.URL+"/graphql", "", srv.Client(), counter)
+	rest := newRESTTestClient(t, srv, counter, "test-token")
+	provider := NewBatchProvider(graph, rest, counter)
+
+	// The batch ping cached an ETag while mergeable was still UNKNOWN.
+	seed, notModified, err := rest.PingMergeable(context.Background(), "refusedguy", "beacon", 42)
+	if err != nil || notModified || !seed.Unknown() {
+		t.Fatalf("seed ping = (%+v,%v,%v), want UNKNOWN/200", seed, notModified, err)
+	}
+
+	merged, held, reason, err := provider.MergePR(context.Background(), "refusedguy/beacon", 42)
+	if err != nil {
+		t.Fatalf("MergePR: %v", err)
+	}
+	if !merged || held || reason != "" {
+		t.Fatalf("MergePR = (%v,%v,%q), want confirmed merge", merged, held, reason)
+	}
+	if puts.Load() != 1 {
+		t.Fatalf("merge writes = %d, want 1", puts.Load())
+	}
+	if graphCalls.Load() != 2 {
+		t.Fatalf("GraphQL reads = %d, want 2 (read + confirm)", graphCalls.Load())
+	}
+	if gets.Load() != 3 {
+		t.Fatalf("REST ping GETs = %d, want 3 (seed + 304 + forced)", gets.Load())
+	}
+}
+
+// TestMergePRWithStateUsesProvidedState proves a fresh batch snapshot skips the
+// second GraphQL read and the mergeability ping entirely.
+func TestMergePRWithStateUsesProvidedState(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	var graphCalls, getCalls, puts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/graphql":
+			var req struct {
+				Query string `json:"query"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode query: %v", err)
+				http.Error(w, "bad query", http.StatusBadRequest)
+				return
+			}
+			graphCalls.Add(1)
+			batchReply(t, w, req.Query, prStateJSON("MERGED", "MERGEABLE", "CLEAN"), `{}`, 1)
+		case r.URL.Path == "/repos/refusedguy/beacon/pulls/42/merge" && r.Method == http.MethodPut:
+			puts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"merged":true,"sha":"abc"}`)
+		case r.URL.Path == "/repos/refusedguy/beacon/pulls/42" && r.Method == http.MethodGet:
+			getCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"number":42,"mergeable":true,"mergeable_state":"clean"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	provider := NewBatchProvider(
+		NewClient(srv.URL+"/graphql", "", srv.Client(), counter),
+		newRESTTestClient(t, srv, counter, "test-token"), counter)
+
+	fresh := domain.PRState{State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"}
+	merged, held, reason, err := provider.MergePRWithState(context.Background(), "refusedguy/beacon", 42, fresh)
+	if err != nil {
+		t.Fatalf("MergePRWithState: %v", err)
+	}
+	if !merged || held || reason != "" {
+		t.Fatalf("MergePRWithState = (%v,%v,%q), want confirmed merge", merged, held, reason)
+	}
+	if puts.Load() != 1 {
+		t.Fatalf("merge writes = %d, want 1", puts.Load())
+	}
+	if getCalls.Load() != 0 {
+		t.Fatalf("REST ping GETs = %d, want 0 when state is already fresh", getCalls.Load())
+	}
+	if graphCalls.Load() != 1 {
+		t.Fatalf("GraphQL reads = %d, want 1 (confirm only)", graphCalls.Load())
+	}
+}
+
+// TestPingMergeableConcurrentCallersShareResolvedState checks that a second
+// caller joining an in-flight ping still gets its own state updated. The old
+// closure mutated only the leader's pointer and left the follower UNKNOWN.
+func TestPingMergeableConcurrentCallersShareResolvedState(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	entered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var gets atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gets.Add(1)
+		once.Do(func() { close(entered) })
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"number":7,"mergeable":true,"mergeable_state":"clean"}`)
+	}))
+	defer srv.Close()
+
+	provider := NewBatchProvider(nil, newRESTTestClient(t, srv, counter, "test-token"), counter)
+	ctx := context.Background()
+	stateA := domain.PRState{Mergeable: "UNKNOWN"}
+	stateB := domain.PRState{Mergeable: "UNKNOWN"}
+	done := make(chan struct{}, 2)
+
+	go func() {
+		provider.pingMergeable(ctx, "owner", "repo", 7, &stateA)
+		done <- struct{}{}
+	}()
+	<-entered
+	go func() {
+		close(secondEntered)
+		provider.pingMergeable(ctx, "owner", "repo", 7, &stateB)
+		done <- struct{}{}
+	}()
+	<-secondEntered
+	// Give the second caller time to join the in-flight singleflight before the
+	// REST reply is released.
+	for i := 0; i < 8; i++ {
+		runtime.Gosched()
+	}
+	close(release)
+	<-done
+	<-done
+
+	if stateA.Mergeable != "MERGEABLE" || stateA.MergeStateStatus != "CLEAN" {
+		t.Fatalf("leader state = %+v, want MERGEABLE/CLEAN", stateA)
+	}
+	if stateB.Mergeable != "MERGEABLE" || stateB.MergeStateStatus != "CLEAN" {
+		t.Fatalf("follower state = %+v, want MERGEABLE/CLEAN", stateB)
+	}
+	if gets.Load() != 1 {
+		t.Fatalf("REST ping GETs = %d, want one shared request", gets.Load())
+	}
+}
+
+func TestMergePRWithStateHoldsOnlyForRealConflicts(t *testing.T) {
+	cases := []struct {
+		name       string
+		state      domain.PRState
+		wantReason string
+	}{
+		{"conflict", domain.PRState{State: "OPEN", Mergeable: "CONFLICTING", MergeStateStatus: "CLEAN"}, MergeHeldConflict},
+		{"dirty", domain.PRState{State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "DIRTY"}, MergeHeldDirty},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, _, _ := newTestCounter(t, 0)
+			var writes atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				writes.Add(1)
+				http.Error(w, "unexpected merge write", http.StatusInternalServerError)
+			}))
+			defer srv.Close()
+
+			provider := NewBatchProvider(nil, newRESTTestClient(t, srv, counter, "test-token"), counter)
+			merged, held, reason, err := provider.MergePRWithState(context.Background(), "refusedguy/beacon", 42, tc.state)
+			if err != nil {
+				t.Fatalf("MergePRWithState: %v", err)
+			}
+			if merged || !held || reason != tc.wantReason {
+				t.Fatalf("MergePRWithState = (%v,%v,%q), want held %q", merged, held, reason, tc.wantReason)
+			}
+			if writes.Load() != 0 {
+				t.Fatalf("unexpected writes = %d, want 0", writes.Load())
+			}
+		})
+	}
+}
+
+// TestMergePRWithStateHoldsWhenPingCannotResolve keeps mergeable_unknown as a
+// real hold when the REST endpoint still has no computed value.
+func TestMergePRWithStateHoldsWhenPingCannotResolve(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	var writes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			writes.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"number":42,"mergeable":null,"mergeable_state":"unknown"}`)
+	}))
+	defer srv.Close()
+
+	provider := NewBatchProvider(nil, newRESTTestClient(t, srv, counter, "test-token"), counter)
+	stale := domain.PRState{State: "OPEN", Mergeable: "UNKNOWN", MergeStateStatus: "CLEAN"}
+	merged, held, reason, err := provider.MergePRWithState(context.Background(), "refusedguy/beacon", 42, stale)
+	if err != nil {
+		t.Fatalf("MergePRWithState: %v", err)
+	}
+	if merged || !held || reason != MergeHeldMergeable {
+		t.Fatalf("MergePRWithState = (%v,%v,%q), want mergeable_unknown hold", merged, held, reason)
+	}
+	if writes.Load() != 0 {
+		t.Fatalf("merge writes = %d, want 0 for an unresolved PR", writes.Load())
 	}
 }

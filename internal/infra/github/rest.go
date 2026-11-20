@@ -147,6 +147,50 @@ func (c *RestClient) setETag(path, etag string) {
 	c.etags[path] = etag
 }
 
+// GetUnconditional performs a plain GET on a REST path, ignoring any cached
+// ETag. The server cannot answer 304 without If-None-Match, so a successful
+// call always decodes a fresh body into out. It is used to resolve a lazy field
+// such as mergeable when a conditional GET returned 304 but the caller still
+// lacks a concrete value. The response ETag refreshes the cache so later
+// conditional reads stay cheap.
+func (c *RestClient) GetUnconditional(ctx context.Context, path string, out any) error {
+	req, err := c.gh.NewRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return fmt.Errorf("REST GET %s: %w", path, err)
+	}
+	resp, err := c.gh.Do(req, out)
+	if resp == nil {
+		if err == nil {
+			err = errors.New("no response")
+		}
+		return fmt.Errorf("REST GET %s: %w", path, err)
+	}
+	if c.counter != nil {
+		c.counter.Observe(resp.Response, restRequestCost)
+	}
+	if err != nil {
+		return fmt.Errorf("REST GET %s: status %d: %w", path, resp.StatusCode, err)
+	}
+	c.setETag(path, resp.Header.Get("ETag"))
+	return nil
+}
+
+// PingMergeableForce reads /repos/{owner}/{repo}/pulls/{number} without a
+// conditional header. Use it when PingMergeable returned notModified=true but
+// the caller still needs a concrete mergeable value: GitHub computes that
+// field lazily and a cached ETag can hide the UNKNOWN -> MERGEABLE transition.
+func (c *RestClient) PingMergeableForce(ctx context.Context, owner, repo string, number int) (MergeState, error) {
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	var pr gh.PullRequest
+	if err := c.GetUnconditional(ctx, path, &pr); err != nil {
+		return MergeState{}, err
+	}
+	return MergeState{
+		Mergeable:      pr.Mergeable,
+		MergeableState: pr.GetMergeableState(),
+	}, nil
+}
+
 // MergeState is the mergeability snapshot read by a ping.
 type MergeState struct {
 	Mergeable      *bool

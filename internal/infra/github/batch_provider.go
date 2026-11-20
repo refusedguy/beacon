@@ -320,6 +320,27 @@ func (b *BatchProvider) MergePR(ctx context.Context, repo string, pr int) (bool,
 	if err != nil {
 		return false, false, "", err
 	}
+	return b.mergePRWithState(ctx, owner, name, repo, pr, state)
+}
+
+// MergePRWithState merges with a PRState the caller already read, such as the
+// snapshot returned by FetchBatch. It avoids a second GraphQL read whose lazy
+// mergeable field can report UNKNOWN even when the batch resolved it. An
+// UNKNOWN supplied state is still pinged through pingMergeable before a merge
+// is attempted, so a stale snapshot cannot bypass the mergeability guard.
+func (b *BatchProvider) MergePRWithState(ctx context.Context, repo string, pr int, state domain.PRState) (bool, bool, string, error) {
+	owner, name := splitRepo(repo)
+	if owner == "" || name == "" {
+		return false, true, MergeHeldInvalidRepo,
+			fmt.Errorf("merge: repo %q must be owner/repo", repo)
+	}
+	return b.mergePRWithState(ctx, owner, name, repo, pr, state)
+}
+
+// mergePRWithState holds or merges after the mergeability guards pass. The
+// state may come from a fresh PRState read or from a batch snapshot; both paths
+// share the same policy checks, write and confirmation.
+func (b *BatchProvider) mergePRWithState(ctx context.Context, owner, name, repo string, pr int, state domain.PRState) (bool, bool, string, error) {
 	switch strings.ToUpper(state.State) {
 	case "MERGED":
 		return true, false, "", nil
@@ -399,33 +420,71 @@ func (b *BatchProvider) confirmMerge(ctx context.Context, repo string, pr int) (
 	return false, true, MergeHeldPending, nil
 }
 
-// pingMergeable performs one REST read of the lazy mergeable field. A failure
-// or a 304 leaves the GraphQL state untouched, so an UNKNOWN stays UNKNOWN.
+// mergePatch is the part of a PRState that a mergeability ping can resolve.
+// The singleflight result carries a patch rather than mutating a caller-owned
+// state, so every caller applies the same answer to its own state.
+type mergePatch struct {
+	mergeable        string
+	mergeStateStatus string
+}
+
+func patchFromMergeState(merged MergeState) mergePatch {
+	p := mergePatch{}
+	if merged.Mergeable != nil {
+		if *merged.Mergeable {
+			p.mergeable = "MERGEABLE"
+		} else {
+			p.mergeable = "CONFLICTING"
+		}
+	}
+	if merged.MergeableState != "" {
+		p.mergeStateStatus = strings.ToUpper(merged.MergeableState)
+	}
+	return p
+}
+
+func (p mergePatch) apply(state *domain.PRState) {
+	if p.mergeable != "" {
+		state.Mergeable = p.mergeable
+	}
+	if p.mergeStateStatus != "" {
+		state.MergeStateStatus = p.mergeStateStatus
+	}
+}
+
+// pingMergeable resolves GitHub's lazy mergeable field through one REST read
+// and applies the answer to state. The singleflight result is shared, so each
+// caller applies the patch to its own state instead of hoping the leader
+// closure captured its pointer. A 304, or a reply that still leaves mergeable
+// unset, is retried without If-None-Match: a cached ETag can hide the
+// UNKNOWN -> MERGEABLE transition that makes an otherwise green PR mergeable.
 func (b *BatchProvider) pingMergeable(ctx context.Context, owner, repo string, pr int, state *domain.PRState) {
-	if b.rest == nil {
+	if b.rest == nil || state == nil {
 		return
 	}
 	key := "ping:" + prLookupKey(owner, repo, pr)
-	_, _, _ = b.prSF.Do(key, func() (any, error) {
+	v, _, _ := b.prSF.Do(key, func() (any, error) {
 		if err := b.limiter.Wait(ctx); err != nil {
 			return nil, err
 		}
 		merged, notModified, err := b.rest.PingMergeable(ctx, owner, repo, pr)
-		if err != nil || notModified {
+		if err != nil {
 			return nil, err
 		}
-		if merged.Mergeable != nil {
-			if *merged.Mergeable {
-				state.Mergeable = "MERGEABLE"
-			} else {
-				state.Mergeable = "CONFLICTING"
+		if notModified || merged.Mergeable == nil {
+			// The conditional reply is not definitive. Re-read without the
+			// cached ETag so the computed value is visible to this cycle.
+			fresh, err := b.rest.PingMergeableForce(ctx, owner, repo, pr)
+			if err != nil {
+				return nil, err
 			}
+			merged = fresh
 		}
-		if merged.MergeableState != "" {
-			state.MergeStateStatus = strings.ToUpper(merged.MergeableState)
-		}
-		return nil, nil
+		return patchFromMergeState(merged), nil
 	})
+	if patch, ok := v.(mergePatch); ok {
+		patch.apply(state)
+	}
 }
 
 // parsePRAlias maps one TierBatch PR payload into a PRState. It follows
