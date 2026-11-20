@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
@@ -375,4 +376,120 @@ func generateFindingID(file string, line int, rule string) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "%d:%s;%d;%d:%s;", len(file), file, line, len(rule), rule)
 	return "finding-" + hex.EncodeToString(h.Sum(nil)[:8])
+}
+
+// --- HD-054: config fallback (ADR 0304) ------------------------------------
+
+// fallbackConfig is the effective set of workflow limits after config
+// resolution. The numbers match ADR 0259: a project with no config file gets
+// the same values as a project that ships the default file.
+type fallbackConfig struct {
+	MaxRebases int
+	SlotsTotal int
+}
+
+const (
+	fallbackDefaultMaxRebases = 3
+	fallbackDefaultSlotsTotal = 4
+	fallbackMaxRebasesCeiling = 10
+)
+
+// configOrigin says where resolved values came from. A caller can report it
+// when it needs to explain a limit; it never changes control flow.
+type configOrigin string
+
+const (
+	configFromDefaults configOrigin = "defaults"
+	configFromFile     configOrigin = "file"
+)
+
+// resolvedConfig pairs the effective values with their origin.
+type resolvedConfig struct {
+	Config fallbackConfig
+	Origin configOrigin
+}
+
+// fallbackConfigDefaults returns the built-in layer without reading a file.
+func fallbackConfigDefaults() fallbackConfig {
+	return fallbackConfig{
+		MaxRebases: fallbackDefaultMaxRebases,
+		SlotsTotal: fallbackDefaultSlotsTotal,
+	}
+}
+
+// resolveFallbackConfig resolves config values from optional file bytes. The
+// function is pure: the caller owns file access, so the same input gives the
+// same result in a test and in a workflow pass. Four inputs matter. An empty
+// path skips the file layer. Missing data means no file was found. Malformed
+// content means the file cannot be trusted. Each of those three cases returns
+// the built-in defaults. Valid content overlays only the limits it sets.
+func resolveFallbackConfig(path string, data []byte) resolvedConfig {
+	fallback := resolvedConfig{Config: fallbackConfigDefaults(), Origin: configFromDefaults}
+	if strings.TrimSpace(path) == "" || data == nil {
+		return fallback
+	}
+	cfg, err := applyFallbackLines(fallback.Config, string(data))
+	if err != nil {
+		return fallback
+	}
+	return resolvedConfig{Config: cfg, Origin: configFromFile}
+}
+
+// applyFallbackLines overlays the numeric limits from one flat key: value
+// document. Blank lines, comments and unknown keys are ignored because other
+// config consumers own them. A line without a colon, a non-integer value or a
+// value outside the accepted range makes the whole file unusable, so the caller
+// keeps the defaults.
+func applyFallbackLines(base fallbackConfig, content string) (fallbackConfig, error) {
+	cfg := base
+	for i, raw := range strings.Split(content, "\n") {
+		text := strings.TrimSpace(strings.TrimSuffix(raw, "\r"))
+		if text == "" || strings.HasPrefix(text, "#") {
+			continue
+		}
+		idx := strings.Index(text, ":")
+		if idx < 0 {
+			return fallbackConfig{}, fmt.Errorf("line %d: expected key: value", i+1)
+		}
+		key := normalizeFallbackKey(text[:idx])
+		value := trimFallbackValue(text[idx+1:])
+		switch key {
+		case "maxrebases":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 1 || n > fallbackMaxRebasesCeiling {
+				return fallbackConfig{}, fmt.Errorf("line %d: maxRebases=%q", i+1, value)
+			}
+			cfg.MaxRebases = n
+		case "slotstotal":
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return fallbackConfig{}, fmt.Errorf("line %d: slotsTotal=%q", i+1, value)
+			}
+			cfg.SlotsTotal = n
+		}
+	}
+	return cfg, nil
+}
+
+// normalizeFallbackKey lets maxRebases, max_rebases and MAX-REBASES name the
+// same setting, matching the other config loaders in the repository.
+func normalizeFallbackKey(key string) string {
+	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(
+		strings.ToLower(strings.TrimSpace(key)))
+}
+
+// trimFallbackValue removes surrounding quotes and a trailing inline comment
+// from one config value.
+func trimFallbackValue(raw string) string {
+	value := strings.TrimSpace(raw)
+	if idx := strings.Index(value, " #"); idx >= 0 {
+		value = strings.TrimSpace(value[:idx])
+	}
+	if len(value) >= 2 {
+		first, last := value[0], value[len(value)-1]
+		if (first == '"' && last == '"') || (first == '\'' && last == '\'') {
+			return value[1 : len(value)-1]
+		}
+	}
+	return value
 }
