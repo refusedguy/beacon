@@ -68,6 +68,7 @@ const (
 	FieldCycleID   = "cycleID"
 	FieldBlockerID = "blockerID"
 	FieldPoints    = "points"
+	FieldRole      = "role"
 )
 
 // Event names of the blocker and auto-merge transitions reported by the
@@ -98,7 +99,16 @@ const (
 	CounterDependencyWaits  = "dependency_waits_total"
 	CounterBlocks           = "blocks_total"
 	CounterActorErrors      = "actor_errors_total"
+	CounterFixTotal         = "fix_total"
 )
+
+// The fix counter belongs to the fixer path. Registering it here keeps the
+// fixer code in one file. It uses the same labelled registry as the other
+// counters, so JSON, Prometheus and snapshot export pick it up without a
+// second code path.
+func init() {
+	counterLabels[CounterFixTotal] = LabelRole
+}
 
 // Older names kept as aliases so call sites written against the first version
 // of the package continue to count the same thing.
@@ -120,6 +130,7 @@ const (
 const (
 	LabelVerdict = "verdict"
 	LabelAdapter = "adapter"
+	LabelRole    = "role"
 )
 
 // Sink is the thin port the Beacon cycle calls. Log writes one structured
@@ -401,6 +412,19 @@ func WakeDelivered(adapter, watchID string, revision ...uint64) {
 		fields[FieldRevision] = revision[0]
 	}
 	s.Log(LevelInfo, "wake_delivered", fields)
+}
+
+// FixDelivered records one wake delivered to a fixer subscriber. Only the
+// fixer delivery path calls this helper. An executor retry calls WakeDelivered
+// instead, so it never increases the fix counter.
+func FixDelivered(watchID string) {
+	s := Default()
+	s.Inc(CounterFixTotal, "fixer")
+	fields := Fields{FieldRole: "fixer"}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	s.Log(LevelInfo, "fix_delivered", fields)
 }
 
 // WakeDuration records how long one wake delivery took.
