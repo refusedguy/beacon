@@ -17,9 +17,14 @@ MCP-сервер Beacon подключён в `/mnt/projects/beacon-handoff/open
 
 Оркестратор подписывается на тот же PR с `role: "orchestrator"`. Вердикт читается только через `beacon_get_result`. `<subagent>`-отчёт со словом `waiting` вердиктом не является. Мерж только после зелёных проверок и читаного `verdict=ready`.
 
-## Честное состояние локального MCP
+## Самоиспользование инструментов
 
-Локальный MCP не имеет CI- и Source-адаптера. `beacon_watch_pr` требует `headSHA`. `beacon_wait_result` на Watch без вердикта сообщает, что источник вердикта не сконфигурирован. Это не повод polling-ить GitHub в цикле. Проверки CI смотреть одним вызовом `gh pr checks` и мержить только при всех `SUCCESS`.
+- Карточки создаются только через `go run ./cmd/batch-apply --dir <json> --check`, затем тем же вызовом без `--check`. Ручной `cat` для карточек не используется.
+- Оркестратор регистрирует Watch через `tools.beacon.beacon_watch_pr` и читает вердикт через `beacon_get_result`. `gh pr checks` вручную не вызывается.
+- Wake доставляется через opencode API `POST /api/session/{id}/prompt` с `delivery=steer`. В тексте настоящие `watchID` и `obligationID`, а не заглушки.
+- Форматирование и проверки выполняет CI, локальный `gofmt` не запускается.
+
+## Пересборка MCP-бинарника
 
 Если `beacon_watch_pr` отвечает `PERSIST_FAILED: watch_pr: store is nil`, бинарник собран до коммита с подключённым store. Пересобрать из корня репо:
 
@@ -29,7 +34,7 @@ go build -o .opencode/bin/beacon ./cmd/beacon
 
 ## Коммиты и локальные проверки
 
-Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки. Локальный гейт это `gofmt`. `go test` и `go build` локально как гейт не используются, но точечные прогоны допустимы как доказательство для владельца.
+Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки. Локальные проверки не являются гейтом: `gofmt`, `go test` и `go build` выполняет CI.
 
 ## Project scope и вердикты
 
