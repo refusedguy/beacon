@@ -1371,6 +1371,7 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithLadder(bridgeLadder{l: ladder.New(cfg.db)}).
 		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
 		WithMerger(cfg.batch).
+		WithAutoRebase(cfg.batch).
 		WithBlockerControl(cfg.db)
 	updated := bridge.Refresh(ctx)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {

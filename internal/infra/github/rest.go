@@ -265,6 +265,38 @@ func (c *RestClient) MergePullRequest(ctx context.Context, owner, repo string, n
 	return MergeResult{Merged: true, SHA: result.GetSHA()}, nil
 }
 
+// RebasePullRequest updates a PR branch onto its base and returns the new head
+// SHA. It sends PUT /repos/{owner}/{repo}/pulls/{number}/update-branch through
+// go-github, then re-reads the PR without a conditional header so a cached ETag
+// cannot hide the new head. GitHub answers the PUT with 202 while it schedules
+// the update in the background, so an AcceptedError counts as success.
+func (c *RestClient) RebasePullRequest(ctx context.Context, owner, repo string, number int) (string, error) {
+	if owner == "" || repo == "" {
+		return "", fmt.Errorf("rebase: owner and repo are required, got %q/%q", owner, repo)
+	}
+	_, resp, err := c.gh.PullRequests.UpdateBranch(ctx, owner, repo, number, gh.UpdatePullRequestBranchRequest{})
+	if resp != nil && c.counter != nil {
+		c.counter.Observe(resp.Response, restRequestCost)
+	}
+	if err != nil {
+		var accepted *gh.AcceptedError
+		if !errors.As(err, &accepted) {
+			return "", fmt.Errorf("REST rebase %s/%s#%d: %w", owner, repo, number, err)
+		}
+	}
+
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", owner, repo, number)
+	var pr gh.PullRequest
+	if err := c.GetUnconditional(ctx, path, &pr); err != nil {
+		return "", fmt.Errorf("REST rebase reread %s/%s#%d: %w", owner, repo, number, err)
+	}
+	sha := pr.GetHead().GetSHA()
+	if sha == "" {
+		return "", fmt.Errorf("REST rebase %s/%s#%d: PR has no head SHA", owner, repo, number)
+	}
+	return sha, nil
+}
+
 // FailureExcerpt is the W11-B read path. It finds the failed CheckRun for the
 // Watch's head SHA by name, then reads its annotations and formats them into a
 // short text block. The MCP boundary applies Redact and escapeUntrusted and

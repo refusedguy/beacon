@@ -312,6 +312,26 @@ func (b *BatchProvider) PRState(ctx context.Context, repo string, pr int) (domai
 	return state, nil
 }
 
+// Rebase updates a stale PR branch onto its base and returns the new head SHA.
+// It satisfies the cibridge.Rebaser port used by Bridge.WithAutoRebase; the
+// port is not imported here because infra packages must not depend on siblings.
+// A missing REST client or a malformed repo is an error, so the Bridge can keep
+// its legacy wake-the-executor behaviour instead of claiming a rebase it did
+// not perform.
+func (b *BatchProvider) Rebase(ctx context.Context, repo string, pr int) (string, error) {
+	owner, name := splitRepo(repo)
+	if owner == "" || name == "" {
+		return "", fmt.Errorf("rebase: repo %q must be owner/repo", repo)
+	}
+	if b == nil || b.rest == nil {
+		return "", fmt.Errorf("%s", MergeHeldNoRestClient)
+	}
+	if err := b.limiter.Wait(ctx); err != nil {
+		return "", err
+	}
+	return b.rest.RebasePullRequest(ctx, owner, name, pr)
+}
+
 // Merge implements domain.Merger. It is an alias for MergePR so the same
 // adapter satisfies both the explicit W1-C contract and the domain port.
 func (b *BatchProvider) Merge(ctx context.Context, repo string, pr int) (bool, bool, string, error) {
