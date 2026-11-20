@@ -17,6 +17,9 @@ export const SURVIVAL_RULES = [
   '4) Запрещено gh pr checks --watch или sleep в цикле.',
   '5) После gh pr create вызываешь beacon_watch_pr с role: "executor" и своим реальным ses_..., завершаешь ход фразой waiting, <watchID>.',
   '6) При пробуждении читаешь beacon_get_result, чинишь ТОЛЬКО перечисленные failedChecks; если падение из-за main, вызываешь beacon_ack с decision="blocked:not_mine".',
+  '7) Информационные проверки (required: false, continue-on-error: true) НЕ блокеры. По ним не вызывай blocked:not_mine и не спавни FIX-агента.',
+  '8) Если часть фичи осталась неподключённой, сразу вызови beacon_defer_wiring и добавь возвращённую карточку WIRING-<PR> в свой PR.',
+  '9) Прозу пиши по скиллу unslop: без em dashes, простые слова, активный залог, без filler и rule of three.',
 ].join("\n")
 
 export function agentsFileURI(root) {

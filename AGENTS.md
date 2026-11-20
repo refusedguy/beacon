@@ -59,9 +59,25 @@ Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Искл�
 
 ## MCP
 
-Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Семь инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`.
+Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Восемь инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`, `beacon_defer_wiring`.
+
+`beacon_defer_wiring` вызывай сразу, как только понял, что часть фичи осталась неподключённой (OwnerFiles другого агента). Он возвращает готовую карточку `WIRING-<PR>`, которую надо добавить в свой PR. Не откладывай wiring на «потом»: без карточки работа теряется.
 
 Шаблоны: `docs/templates/executor-task.md`, `docs/templates/orchestrator-task.md`.
+
+## Оркестратору: заполнение слотов
+
+Каждое `<beacon-event>` с `nextAction: report_to_orchestrator` (`wave item done`) означает один свободный слот. В том же ходе, без пинка владельца, запусти одного нового сабента. Один сигнал равен одному spawn. Не отвечай «тихо продолжаю» и не оставляй слот пустым.
+
+Источник задач по приоритету: сначала `beacon deferred --format json` (отложенное wiring), затем `docs/ROADMAP_STATUS.md` KEEP_TODO и аудиты. Перед запуском проверь непересечение OwnerFiles через `beacon task check-launch` / `PlanLaunch`.
+
+Тихий режим: на терминальный сигнал делай действие и не печатай в чат статусную строку «PR X влит». Пиши в чат только новую информацию: решение владельца, измерение, блокер, результат выборки.
+
+Информационные проверки с `required: false` или `continue-on-error: true` не являются блокерами. По ним не вызывай `beacon_ack decision="blocked:not_mine"` и не спавни FIX-агента.
+
+## Прозу пиши по unslop
+
+Все тексты, которые ты пишешь (ответы, docs, README, PR body, commit messages, комментарии), пропускай через правила скилла `unslop`: без em dashes, простые слова, активный залог, одна мысль на предложение, без заполняющих фраз и без «rule of three». Загрузи скилл `unslop` перед написанием любой прозы.
 
 ## Коммиты
 
