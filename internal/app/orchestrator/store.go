@@ -4,7 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/mcp"
@@ -142,4 +147,123 @@ func PolicyFromPayload(raw []byte) *AutoMergePolicy {
 		WaitFor:         m.WaitFor,
 		WaitForMain:     m.WaitForMain,
 	}
+}
+
+// CommandRunner is the seam the dependency resolver uses for `gh` and `git`.
+// The app layer must not import os/exec (ADR 0005), so the composition root
+// supplies the real runner and tests supply a fake. A runner error is never
+// reported as a satisfied dependency.
+type CommandRunner interface {
+	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+// ErrRefMissing is the runner signal that `git show main:<ref>` found no such
+// path. Other errors are propagation failures and must reach the caller.
+var ErrRefMissing = errors.New("orchestrator: dependency ref missing on main")
+
+var (
+	dependencyPRRef   = regexp.MustCompile(`(?i)^(?:pr\s*#|pr/|pr-|#)(\d+)$`)
+	dependencyCardRef = regexp.MustCompile(`(?i)^t\d+\.\d+$`)
+)
+
+// FileDependencyResolver resolves free-form refs from the task card files and
+// from the hosting CLI / git. Card refs (T3.123) are satisfied when the card
+// file documents "Статус: done". PR refs (#12, PR#12, pr/12) are satisfied
+// when gh reports state MERGED. Every other string is a path that must exist
+// on main, checked with `git show main:<ref>`.
+type FileDependencyResolver struct {
+	// DocsDir holds task cards. The empty value means "docs/tasks".
+	DocsDir string
+	// Runner supplies gh and git. A nil Runner yields an error, never a true.
+	Runner CommandRunner
+}
+
+var _ DependencyResolver = (*FileDependencyResolver)(nil)
+
+// NewDependencyResolver builds the resolver with the conventional docs dir.
+func NewDependencyResolver(runner CommandRunner) *FileDependencyResolver {
+	return &FileDependencyResolver{DocsDir: "docs/tasks", Runner: runner}
+}
+
+// Satisfied resolves one dependency reference. An empty ref is unsatisfied,
+// and any failure to verify a fact is an error rather than a false positive.
+func (r *FileDependencyResolver) Satisfied(ctx context.Context, ref string) (bool, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return false, nil
+	}
+	if m := dependencyPRRef.FindStringSubmatch(ref); m != nil {
+		return r.prMerged(ctx, m[1])
+	}
+	if dependencyCardRef.MatchString(ref) {
+		return r.cardDone(ref)
+	}
+	return r.existsOnMain(ctx, ref)
+}
+
+// cardDone reads a task card through an fs.FS so the app layer uses no
+// os.ReadFile (ADR 0005). A missing card is simply not done; a read failure
+// is an error. The status line is accepted in Russian and English.
+func (r *FileDependencyResolver) cardDone(ref string) (bool, error) {
+	dir := r.DocsDir
+	if dir == "" {
+		dir = "docs/tasks"
+	}
+	raw, err := fs.ReadFile(os.DirFS(dir), ref+".md")
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: read card %s: %w", ref, err)
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		if !strings.HasPrefix(lower, "статус:") && !strings.HasPrefix(lower, "status:") {
+			continue
+		}
+		value := strings.TrimSpace(line[strings.Index(line, ":")+1:])
+		return strings.EqualFold(strings.Trim(value, "*` "), "done"), nil
+	}
+	return false, nil
+}
+
+// prMerged asks gh for the PR state. Only MERGED satisfies the dependency;
+// OPEN, CLOSED and an unverifiable state all hold the merge back.
+func (r *FileDependencyResolver) prMerged(ctx context.Context, pr string) (bool, error) {
+	if r == nil || r.Runner == nil {
+		return false, errors.New("orchestrator: dependency runner is nil")
+	}
+	out, err := r.Runner.Run(ctx, "gh", "pr", "view", pr, "--json", "state")
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: gh pr view %s: %w", pr, err)
+	}
+	var payload struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return false, fmt.Errorf("orchestrator: gh pr view %s decode: %w", pr, err)
+	}
+	return strings.EqualFold(strings.TrimSpace(payload.State), "MERGED"), nil
+}
+
+// existsOnMain probes the ref with `git show main:<ref>`. A path that is not
+// on main is unsatisfied, not an error. A runner failure that is not the
+// explicit ErrRefMissing signal is propagated so it cannot look like success.
+func (r *FileDependencyResolver) existsOnMain(ctx context.Context, ref string) (bool, error) {
+	if r == nil || r.Runner == nil {
+		return false, errors.New("orchestrator: dependency runner is nil")
+	}
+	path := strings.TrimPrefix(strings.TrimPrefix(ref, "./"), "/")
+	if path == "" {
+		return false, nil
+	}
+	_, err := r.Runner.Run(ctx, "git", "show", "main:"+path)
+	if errors.Is(err, ErrRefMissing) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: git show %s: %w", ref, err)
+	}
+	return true, nil
 }
