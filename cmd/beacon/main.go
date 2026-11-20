@@ -61,16 +61,8 @@ var spawnCatalogEntry = command{
 	Usage:   "beacon spawn <taskID> [--agent id] [--title ...]",
 }
 
-// registryCatalogEntry is registered here instead of catalog.go because
-// catalog.go is outside the T5.56 file ownership, as with spawnCatalogEntry.
-var registryCatalogEntry = command{
-	Name:    "registry",
-	Summary: "Проверенная остановка исполнителя registry",
-	Usage:   "beacon registry stop --watch <id> --revision <n> --session <id> --token <t>",
-}
-
 func init() {
-	catalog = append(catalog, spawnCatalogEntry, registryCatalogEntry)
+	catalog = append(catalog, spawnCatalogEntry)
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
 
