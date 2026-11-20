@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -267,4 +268,119 @@ func TestRedactKeepsJSONValid(t *testing.T) {
 func outStr(v any) string {
 	s, _ := v.(string)
 	return s
+}
+
+// TestOpenProductionRedactsEveryStoredTable is the W6-A acceptance core: a raw
+// write to any of the five state tables cannot smuggle a secret past Redact,
+// and each committed write is counted exactly once in persist_progress.seq.
+func TestOpenProductionRedactsEveryStoredTable(t *testing.T) {
+	d, err := OpenProduction(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("OpenProduction: %v", err)
+	}
+	defer d.Close()
+
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	payload := []byte(`{"message":"token ` + secret + `"}`)
+	ctx := context.Background()
+	now := time.Now().UTC().UnixNano()
+
+	writes := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{"events", `INSERT INTO events (watch_id, schema_version, payload, created_at) VALUES (?, ?, ?, ?)`,
+			[]any{"w1", 2, payload, now}},
+		{"watches", `INSERT INTO watches (id, repo, pr, head_sha, status, revision, payload) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			[]any{"w1", "org/repo", 1, "sha", "watching", 1, payload}},
+		{"obligations", `INSERT INTO obligations (id, watch_id, revision, subscriber_id, verdict_pointer, delivered_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			[]any{"o1", "w1", 1, "s1", "ready", 0, payload}},
+		{"blocker_incidents", `INSERT INTO blocker_incidents (id, repo, base_ref, signature, status, fixer_watch_id, fix_attempts, max_fix_attempts, payload, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			[]any{"b1", "org/repo", "main", "check " + secret, "open", "", 0, 3, payload, now, 0}},
+		{"runtime_stats", `INSERT INTO runtime_stats (id, payload, updated_at) VALUES (?, ?, ?)`,
+			[]any{1, payload, now}},
+	}
+	for _, w := range writes {
+		if err := d.Write(ctx, func(tx *sql.Tx) error {
+			_, err := tx.Exec(w.sql, w.args...)
+			return err
+		}); err != nil {
+			t.Fatalf("write %s: %v", w.name, err)
+		}
+	}
+
+	checks := []struct {
+		name  string
+		query string
+	}{
+		{"events", `SELECT payload FROM events`},
+		{"watches", `SELECT payload FROM watches`},
+		{"obligations", `SELECT payload FROM obligations`},
+		{"blocker_incidents", `SELECT payload FROM blocker_incidents`},
+		{"runtime_stats", `SELECT payload FROM runtime_stats`},
+	}
+	for _, c := range checks {
+		var stored []byte
+		if err := d.readDB.QueryRow(c.query).Scan(&stored); err != nil {
+			t.Fatalf("read %s: %v", c.name, err)
+		}
+		if bytes.Contains(stored, []byte(secret)) {
+			t.Errorf("%s kept the token: %s", c.name, stored)
+		}
+		if !bytes.Contains(stored, []byte("[REDACTED]")) {
+			t.Errorf("%s has no redaction marker: %s", c.name, stored)
+		}
+	}
+	var signature string
+	if err := d.readDB.QueryRow(`SELECT signature FROM blocker_incidents`).Scan(&signature); err != nil {
+		t.Fatalf("read blocker signature: %v", err)
+	}
+	if strings.Contains(signature, secret) || !strings.Contains(signature, "[REDACTED]") {
+		t.Errorf("blocker signature was not redacted: %q", signature)
+	}
+
+	state, err := d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState: %v", err)
+	}
+	if state.Seq != uint64(len(writes)) {
+		t.Errorf("seq = %d, want %d", state.Seq, len(writes))
+	}
+	if state.LastError != "" || !state.FailedSince.IsZero() {
+		t.Errorf("state = %+v, want a clean progress row after successful writes", state)
+	}
+}
+
+// TestPlainOpenKeepsRawWrites documents why the filter is opt-in: legacy
+// corpus fixtures insert bytes verbatim through Open and must stay unchanged.
+func TestPlainOpenKeepsRawWrites(t *testing.T) {
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	const payload = `{"message":"token ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`
+	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO events (watch_id, schema_version, payload, created_at) VALUES (?, ?, ?, ?)`,
+			"legacy", 1, []byte(payload), time.Now().UnixNano())
+		return err
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	var stored []byte
+	if err := d.readDB.QueryRow(`SELECT payload FROM events`).Scan(&stored); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(stored) != payload {
+		t.Errorf("plain Open changed a raw payload: %s", stored)
+	}
+	state, err := d.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState: %v", err)
+	}
+	if state.Seq != 0 {
+		t.Errorf("plain Open counted a write: seq = %d", state.Seq)
+	}
 }

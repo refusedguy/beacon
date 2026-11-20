@@ -108,9 +108,18 @@ type SingleWriter interface {
 	Write(ctx context.Context, fn func(*sql.Tx) error) error
 }
 
+// writeFunc adapts a function to SingleWriter. OpenProduction uses it to wrap
+// the DB's raw writer so recorded progress does not re-enter the observer.
+type writeFunc func(ctx context.Context, fn func(*sql.Tx) error) error
+
+func (f writeFunc) Write(ctx context.Context, fn func(*sql.Tx) error) error {
+	return f(ctx, fn)
+}
+
 var (
 	_ SingleWriter = (*DB)(nil)
 	_ SingleWriter = (*ObservedPersist)(nil)
+	_ SingleWriter = writeFunc(nil)
 )
 
 // ObservedPersist wraps a single writer and keeps persist_progress honest.
@@ -161,7 +170,7 @@ func (p *ObservedPersist) Write(ctx context.Context, fn func(*sql.Tx) error) err
 }
 
 func (p *ObservedPersist) recordFailure(ctx context.Context, cause error) error {
-	return p.db.Write(ctx, func(tx *sql.Tx) error {
+	return p.db.rawWrite(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createPersistProgressSQL); err != nil {
 			return fmt.Errorf("store: persist progress: create table: %w", err)
 		}
@@ -174,7 +183,7 @@ func (p *ObservedPersist) recordFailure(ctx context.Context, cause error) error 
 }
 
 func (p *ObservedPersist) recordSuccess(ctx context.Context) error {
-	return p.db.Write(ctx, func(tx *sql.Tx) error {
+	return p.db.rawWrite(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createPersistProgressSQL); err != nil {
 			return fmt.Errorf("store: persist progress: create table: %w", err)
 		}
@@ -204,7 +213,7 @@ func (p *ObservedPersist) RecordStream(ctx context.Context, final domain.StreamF
 	if err != nil {
 		return domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
-	err = p.db.Write(ctx, func(tx *sql.Tx) error {
+	err = p.db.rawWrite(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createStreamHealthSQL); err != nil {
 			return fmt.Errorf("store: stream health: create table: %w", err)
 		}
@@ -274,7 +283,7 @@ func (p *ObservedPersist) RecordWake(ctx context.Context, obs WakeObservation) e
 	if obs.Woke {
 		woke = 1
 	}
-	err := p.db.Write(ctx, func(tx *sql.Tx) error {
+	err := p.db.rawWrite(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createWakeObservationsSQL); err != nil {
 			return fmt.Errorf("store: wake observations: create table: %w", err)
 		}
