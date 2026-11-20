@@ -137,7 +137,7 @@ func (e *Escalator) Run(ctx context.Context) (int, error) {
 	now := e.clock.Now()
 	committed := 0
 	for _, ep := range episodes {
-		if ladderStopped(ep) {
+		if ladderStopped(ep) || episodeActive(ep, now) {
 			continue
 		}
 		age := now.Sub(ep.Obligation.StagedAt)
@@ -185,6 +185,19 @@ func (e *Escalator) EscalatedCount(ctx context.Context) (int, error) {
 // ladderStopped reports whether claimed or read already stopped the timers.
 func ladderStopped(ep Episode) bool {
 	return !ep.Obligation.ClaimedAt.IsZero() || !ep.Obligation.ReadAt.IsZero()
+}
+
+// episodeActive reports whether a subscriber showed fresh activity inside the
+// evidence window. Claimed and read are the hard proofs; fresh activity is the
+// third signal checked at 15 minutes. An episode with any of the three is
+// engaged, so neither rung fires (ADR 0017, WORKER-PROMPT §4.5).
+func episodeActive(ep Episode, now time.Time) bool {
+	for _, s := range ep.Watch.Subscribers {
+		if !s.LastActivity.IsZero() && s.LastActivity.After(now.Add(-Rung1After)) {
+			return true
+		}
+	}
+	return false
 }
 
 // rung1Target prefers the orchestrator subscriber. The configured target is
@@ -318,6 +331,127 @@ func markObligationEscalated(tx *sql.Tx, ep Episode, at time.Time) error {
 		return fmt.Errorf("escalation: write obligation: %w", err)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Production adapters over the single-writer store port.
+//
+// The escalation core above depends on narrow ports only. These adapters bind
+// those ports to the same Writer the transitions use, so a process needs one
+// *store.DB handle for the whole ladder. The adapters issue SQL through Writer
+// and decode the domain payloads themselves; this package still imports no
+// sibling infra package.
+// ---------------------------------------------------------------------------
+
+// EscalationStore adapts a Writer to EscalationDB. EscalatedCount reads the
+// same escalation_stats row the rung 2 transaction increments, through the
+// single writer, so no second connection or process-local counter is needed.
+type EscalationStore struct {
+	writer Writer
+}
+
+// NewEscalationStore builds an EscalationDB over w.
+func NewEscalationStore(w Writer) *EscalationStore {
+	return &EscalationStore{writer: w}
+}
+
+// Write delegates to the shared single writer.
+func (s *EscalationStore) Write(ctx context.Context, fn func(*sql.Tx) error) error {
+	if s == nil || s.writer == nil {
+		return errors.New("escalation: escalation store writer is nil")
+	}
+	return s.writer.Write(ctx, fn)
+}
+
+// EscalatedCount returns stats.escalated without writing a new marker.
+func (s *EscalationStore) EscalatedCount(ctx context.Context) (int, error) {
+	if s == nil || s.writer == nil {
+		return 0, errors.New("escalation: escalation store writer is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	n := 0
+	err := s.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureEscalationTables(tx); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, escalatedCountSQL).Scan(&n)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("escalation: read escalated count: %w", err)
+	}
+	return n, nil
+}
+
+// StagedEpisodeStore adapts a Writer to EpisodeReader. It reads staged
+// obligations and their Watches through the shared writer, using the latest
+// ladder marker as the definition of "still staged". The configured target is
+// the project orchestrator fallback used when a Watch has no orchestrator
+// subscriber (rung 1).
+type StagedEpisodeStore struct {
+	writer           Writer
+	configuredTarget func() string
+}
+
+// NewStagedEpisodeStore builds an EpisodeReader over w. configuredTarget may
+// be nil, in which case rung 1 has no fallback target.
+func NewStagedEpisodeStore(w Writer, configuredTarget func() string) *StagedEpisodeStore {
+	return &StagedEpisodeStore{writer: w, configuredTarget: configuredTarget}
+}
+
+// StagedEpisodes lists obligations whose latest ladder marker is active or
+// escalated. Closed Watches are excluded: a terminal verdict has no live
+// episode to escalate (ADR 0019).
+func (s *StagedEpisodeStore) StagedEpisodes() ([]Episode, error) {
+	if s == nil || s.writer == nil {
+		return nil, errors.New("escalation: episode store writer is nil")
+	}
+	var episodes []Episode
+	err := s.writer.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureJournal(tx); err != nil {
+			return err
+		}
+		rows, err := tx.Query(`
+			SELECT o.payload, w.payload FROM obligations o
+			JOIN watches w ON w.id = o.watch_id
+			JOIN ladder_journal j ON j.obligation_id = o.id
+			JOIN (
+			  SELECT obligation_id, MAX(seq) AS seq FROM ladder_journal
+			  GROUP BY obligation_id
+			) latest ON j.seq = latest.seq
+			WHERE j.status IN (?, ?) AND w.status != ?
+			ORDER BY o.id`,
+			string(StatusActive), string(StatusEscalated), string(domain.StatusClosed))
+		if err != nil {
+			return fmt.Errorf("escalation: staged episodes query: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var obligationPayload, watchPayload []byte
+			if err := rows.Scan(&obligationPayload, &watchPayload); err != nil {
+				return fmt.Errorf("escalation: staged episodes scan: %w", err)
+			}
+			var o domain.Obligation
+			if err := json.Unmarshal(obligationPayload, &o); err != nil {
+				return fmt.Errorf("escalation: decode obligation: %w", err)
+			}
+			var w domain.Watch
+			if err := json.Unmarshal(watchPayload, &w); err != nil {
+				return fmt.Errorf("escalation: decode watch: %w", err)
+			}
+			ep := Episode{Watch: w, Obligation: o}
+			if s.configuredTarget != nil {
+				ep.ConfiguredTarget = s.configuredTarget()
+			}
+			episodes = append(episodes, ep)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return episodes, nil
 }
 
 // appendEscalationLineOnce appends line unless a line for key is already in
