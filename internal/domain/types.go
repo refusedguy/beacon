@@ -78,6 +78,24 @@ type Policy struct {
 	IgnoreReviews   bool `json:"ignoreReviews"`
 }
 
+// MergePolicy holds the auto-merge settings of a Watch. WaitFor and WaitForMain
+// carry opaque condition identifiers (a PR, an issue or a task); the domain
+// stores them without resolving them.
+type MergePolicy struct {
+	AutoMerge       bool     `json:"autoMerge"`
+	RequireApproval bool     `json:"requireApproval"`
+	WaitFor         []string `json:"waitFor"`
+	WaitForMain     []string `json:"waitForMain"`
+}
+
+// DefaultMergePolicy returns the policy used when a caller supplies no merge
+// settings: auto-merge is on and every condition is empty. Callers that build a
+// Watch directly should start from this value instead of the Go zero value,
+// because a plain bool cannot express "on" as its zero state.
+func DefaultMergePolicy() MergePolicy {
+	return MergePolicy{AutoMerge: true}
+}
+
 // Subscriber is one party waiting for a Watch result.
 type Subscriber struct {
 	ID           string    `json:"id"`
@@ -103,6 +121,7 @@ type Watch struct {
 	Merge         MergeInfo        `json:"merge"`
 	Flaky         FlakyConfig      `json:"flaky"`
 	Policy        Policy           `json:"policy"`
+	MergePolicy   MergePolicy      `json:"mergePolicy"`
 	Subscribers   []Subscriber     `json:"subscribers"`
 	DeadlineAt    time.Time        `json:"deadlineAt"`
 	NoChecksSince time.Time        `json:"noChecksSince"`

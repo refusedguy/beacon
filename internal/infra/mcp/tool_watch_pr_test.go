@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -336,6 +337,117 @@ func TestWatchPRResolvesHeadSHA(t *testing.T) {
 	}
 	if w.HeadSHA != "resolved-sha" || w.BaseRef != "main" {
 		t.Errorf("resolved Watch = %+v", w)
+	}
+}
+
+// TestWatchPRMergePolicyDefault proves that a caller who says nothing about
+// merging still gets a stored Watch with auto-merge on and empty conditions.
+func TestWatchPRMergePolicyDefault(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+
+	out, err := h.Register(context.Background(), sessionReq("merge-default"), watchPRTestInput("merge-default-sha", domain.RoleExecutor))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	want := domain.DefaultMergePolicy()
+	if !reflect.DeepEqual(w.MergePolicy, want) {
+		t.Fatalf("stored MergePolicy = %+v, want default %+v", w.MergePolicy, want)
+	}
+}
+
+// TestWatchPRPolicyWithoutMergeKeepsDefault covers existing callers: a policy
+// that sets only the old verification fields must still leave auto-merge on.
+func TestWatchPRPolicyWithoutMergeKeepsDefault(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("policy-no-merge-sha", domain.RoleExecutor)
+	in.Policy = &WatchPRPolicy{RequireUpToDate: true, IgnoreReviews: true}
+
+	out, err := h.Register(context.Background(), sessionReq("policy-no-merge"), in)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if !w.Policy.RequireUpToDate || !w.Policy.IgnoreReviews {
+		t.Fatalf("old policy fields lost: %+v", w.Policy)
+	}
+	if want := domain.DefaultMergePolicy(); !reflect.DeepEqual(w.MergePolicy, want) {
+		t.Fatalf("stored MergePolicy = %+v, want default %+v", w.MergePolicy, want)
+	}
+}
+
+// TestWatchPRMergePolicyConditions checks every condition independently and
+// together. An omitted autoMerge stays enabled; an explicit false disables it.
+func TestWatchPRMergePolicyConditions(t *testing.T) {
+	cases := []struct {
+		name  string
+		merge *WatchPRMergePolicy
+		want  domain.MergePolicy
+	}{
+		{"auto merge disabled", &WatchPRMergePolicy{AutoMerge: boolPtr(false)}, domain.MergePolicy{}},
+		{"require approval", &WatchPRMergePolicy{RequireApproval: true}, domain.MergePolicy{AutoMerge: true, RequireApproval: true}},
+		{"wait for", &WatchPRMergePolicy{WaitFor: []string{"pr/42", "issue/7", "task/alpha"}}, domain.MergePolicy{AutoMerge: true, WaitFor: []string{"pr/42", "issue/7", "task/alpha"}}},
+		{"wait for main", &WatchPRMergePolicy{WaitForMain: []string{"pr/99", "task/main"}}, domain.MergePolicy{AutoMerge: true, WaitForMain: []string{"pr/99", "task/main"}}},
+		{"all conditions", &WatchPRMergePolicy{
+			AutoMerge: boolPtr(false), RequireApproval: true,
+			WaitFor: []string{"pr/1"}, WaitForMain: []string{"issue/2"},
+		}, domain.MergePolicy{
+			AutoMerge: false, RequireApproval: true,
+			WaitFor: []string{"pr/1"}, WaitForMain: []string{"issue/2"},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemStore()
+			h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+			in := watchPRTestInput("merge-conditions-sha", domain.RoleExecutor)
+			in.Policy = &WatchPRPolicy{Merge: tc.merge}
+
+			out, err := h.Register(context.Background(), sessionReq("merge-conditions"), in)
+			if err != nil {
+				t.Fatalf("Register: %v", err)
+			}
+			w, err := store.Watch(out.WatchID)
+			if err != nil {
+				t.Fatalf("Watch: %v", err)
+			}
+			if !reflect.DeepEqual(w.MergePolicy, tc.want) {
+				t.Fatalf("stored MergePolicy = %+v, want %+v", w.MergePolicy, tc.want)
+			}
+		})
+	}
+}
+
+// TestWatchPRMergePolicyCopiesInput proves the stored Watch owns its condition
+// lists: mutating the caller's input after Register cannot change the policy.
+func TestWatchPRMergePolicyCopiesInput(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("copy-sha", domain.RoleExecutor)
+	merge := &WatchPRMergePolicy{WaitFor: []string{"pr/1"}, WaitForMain: []string{"task/main"}}
+	in.Policy = &WatchPRPolicy{Merge: merge}
+
+	out, err := h.Register(context.Background(), sessionReq("merge-copy"), in)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	merge.WaitFor[0] = "pr/mutated"
+	merge.WaitForMain[0] = "task/mutated"
+
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if w.MergePolicy.WaitFor[0] != "pr/1" || w.MergePolicy.WaitForMain[0] != "task/main" {
+		t.Fatalf("stored policy aliases input: %+v", w.MergePolicy)
 	}
 }
 
