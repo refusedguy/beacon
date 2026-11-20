@@ -2183,3 +2183,291 @@ func (s *Service) RecoverHandoff() (HandoffRecovery, error) {
 	}
 	return out, nil
 }
+
+// ---- ADR 0059 п4 / T3.137: /fix-checks как отдельная задача на том же worktree ----
+//
+// После красной проверки агенту ставится отдельная задача «починить красные
+// проверки» в уже существующем worktree. Worktree не пересоздаётся, агент не
+// перезапускается: сервис только регистрирует задачу и сохраняет того же
+// исполнителя и то же рабочее пространство. Это продолжение работы в той же
+// изоляции ADR 0021, а не новая аренда и не новый worktree.
+
+// FixChecksStatus — состояние задачи починки проверок.
+type FixChecksStatus string
+
+const (
+	FixChecksPending FixChecksStatus = "pending"
+	FixChecksDone    FixChecksStatus = "done"
+)
+
+// FixChecksTask — отдельная задача «починить красные проверки». Key это ключ
+// идемпотентности: повторный запрос с тем же источником, worktree, агентом и
+// набором проверок возвращает эту задачу, а не создаёт вторую.
+type FixChecksTask struct {
+	ID           string          `json:"id"`
+	Key          string          `json:"key"`
+	SourceTaskID string          `json:"sourceTaskId"`
+	Worktree     string          `json:"worktree"`
+	Agent        string          `json:"agent"`
+	Checks       []string        `json:"checks"`
+	Status       FixChecksStatus `json:"status"`
+	CreatedAt    time.Time       `json:"createdAt"`
+}
+
+// FixChecksRequest задаёт исходную задачу, существующий worktree, того же
+// исполнителя и список упавших проверок. Now приходит извне, чтобы время было
+// проверяемым; нулевое время означает текущее.
+type FixChecksRequest struct {
+	SourceTaskID string
+	Worktree     string
+	Agent        string
+	Checks       []string
+	Now          time.Time
+}
+
+// FixChecksResult — наблюдаемый исход постановки задачи. Created=false означает,
+// что задача уже была создана ранее и возвращена без дубликата.
+type FixChecksResult struct {
+	Task    FixChecksTask `json:"task"`
+	Created bool          `json:"created"`
+	Reason  string        `json:"reason"`
+}
+
+// fixChecksState хранит отдельные задачи починки в каталоге состояния репозитория.
+type fixChecksState struct {
+	Sequence int             `json:"sequence"`
+	Tasks    []FixChecksTask `json:"tasks"`
+}
+
+func (s *Service) fixChecksPath() string {
+	return filepath.Join(s.Cfg.StateDir, "fix-checks.json")
+}
+
+// Замок fix-checks отделён от общего замка карточек и от замков healing, аренды
+// и handoff: каждый поток пишет свой файл, и общий замок с эвристикой stale
+// не должен связывать независимые состояния.
+func (s *Service) lockFixChecks() (func(), error) {
+	path := filepath.Join(s.Cfg.StateDir, "fix-checks.lock")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, taskstore.Startupf("не открыт замок fix-checks: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		return nil, taskstore.Startupf("не взят замок fix-checks: %v", err)
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, nil
+}
+
+func (s *Service) loadFixChecks() (fixChecksState, error) {
+	data, err := os.ReadFile(s.fixChecksPath())
+	if os.IsNotExist(err) {
+		return fixChecksState{}, nil
+	}
+	if err != nil {
+		return fixChecksState{}, taskstore.Startupf("не прочитано состояние fix-checks: %v", err)
+	}
+	var st fixChecksState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return fixChecksState{}, taskstore.Startupf("не разобрано состояние fix-checks: %v", err)
+	}
+	return st, nil
+}
+
+func (s *Service) saveFixChecks(st fixChecksState) error {
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return taskstore.Startupf("не собрано состояние fix-checks: %v", err)
+	}
+	return taskstore.AtomicWrite(s.fixChecksPath(), append(data, '\n'), 0644)
+}
+
+// normalizeFixChecks убирает пустые и повторные проверки и сортирует список,
+// чтобы порядок перечисления не создавал вторую задачу.
+func normalizeFixChecks(checks []string) ([]string, error) {
+	out := make([]string, 0, len(checks))
+	seen := make(map[string]bool, len(checks))
+	for _, raw := range checks {
+		c := strings.TrimSpace(raw)
+		if c == "" {
+			return nil, taskstore.Validationf("пустая проверка fix-checks")
+		}
+		if !seen[c] {
+			seen[c] = true
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return nil, taskstore.Validationf("не заданы проверки fix-checks")
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func fixChecksKey(source, worktree, agent string, checks []string) string {
+	return strings.Join([]string{source, worktree, agent, strings.Join(checks, "\x00")}, "\x00")
+}
+
+// RequestFixChecks ставит отдельную задачу починки в уже существующем worktree.
+// Повтор того же запроса возвращает прежнюю задачу без дубликата. Активная
+// задача другого агента в том же worktree отклоняется: продолжение не должно
+// перезапускать исполнителя. Новый worktree сервис не создаёт.
+func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) {
+	source := strings.TrimSpace(r.SourceTaskID)
+	if source == "" {
+		return FixChecksResult{}, taskstore.Validationf("не задана исходная задача fix-checks")
+	}
+	agent := strings.TrimSpace(r.Agent)
+	if agent == "" {
+		return FixChecksResult{}, taskstore.Validationf("не задан агент fix-checks")
+	}
+	worktree := filepath.Clean(strings.TrimSpace(r.Worktree))
+	if worktree == "" || worktree == "." {
+		return FixChecksResult{}, taskstore.Validationf("не задан worktree fix-checks")
+	}
+	info, err := os.Stat(worktree)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return FixChecksResult{}, taskstore.Validationf("worktree %s не существует", worktree)
+		}
+		return FixChecksResult{}, taskstore.Startupf("не прочитан worktree %s: %v", worktree, err)
+	}
+	if !info.IsDir() {
+		return FixChecksResult{}, taskstore.Validationf("worktree %s не является каталогом", worktree)
+	}
+	checks, err := normalizeFixChecks(r.Checks)
+	if err != nil {
+		return FixChecksResult{}, err
+	}
+	if r.Now.IsZero() {
+		r.Now = time.Now().UTC()
+	}
+
+	unlock, err := s.lockFixChecks()
+	if err != nil {
+		return FixChecksResult{}, err
+	}
+	defer unlock()
+
+	st, err := s.loadFixChecks()
+	if err != nil {
+		return FixChecksResult{}, err
+	}
+	key := fixChecksKey(source, worktree, agent, checks)
+	for _, t := range st.Tasks {
+		if t.Key == key {
+			return FixChecksResult{Task: t, Created: false,
+				Reason: fmt.Sprintf("задача %s уже поставлена в worktree %s", t.ID, t.Worktree)}, nil
+		}
+	}
+	for _, t := range st.Tasks {
+		if t.Worktree == worktree && t.Status == FixChecksPending && t.Agent != agent {
+			return FixChecksResult{}, taskstore.Validationf(
+				"в worktree %s уже работает агент %s по задаче %s; перезапуск агента запрещён",
+				worktree, t.Agent, t.ID)
+		}
+	}
+
+	st.Sequence++
+	task := FixChecksTask{
+		ID:           fmt.Sprintf("fix-%d", st.Sequence),
+		Key:          key,
+		SourceTaskID: source,
+		Worktree:     worktree,
+		Agent:        agent,
+		Checks:       checks,
+		Status:       FixChecksPending,
+		CreatedAt:    r.Now.UTC(),
+	}
+	st.Tasks = append(st.Tasks, task)
+	if err := s.saveFixChecks(st); err != nil {
+		return FixChecksResult{}, err
+	}
+	return FixChecksResult{Task: task, Created: true,
+		Reason: fmt.Sprintf("задача %s поставлена агенту %s в worktree %s", task.ID, agent, worktree)}, nil
+}
+
+// CompleteFixChecks помечает задачу починки выполненной. Повторный вызов для
+// уже завершённой задачи возвращает её без изменений.
+func (s *Service) CompleteFixChecks(id string, now time.Time) (FixChecksTask, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return FixChecksTask{}, taskstore.Validationf("не задана задача fix-checks")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	unlock, err := s.lockFixChecks()
+	if err != nil {
+		return FixChecksTask{}, err
+	}
+	defer unlock()
+
+	st, err := s.loadFixChecks()
+	if err != nil {
+		return FixChecksTask{}, err
+	}
+	for i := range st.Tasks {
+		if st.Tasks[i].ID != id {
+			continue
+		}
+		if st.Tasks[i].Status != FixChecksDone {
+			st.Tasks[i].Status = FixChecksDone
+			if err := s.saveFixChecks(st); err != nil {
+				return FixChecksTask{}, err
+			}
+		}
+		return st.Tasks[i], nil
+	}
+	return FixChecksTask{}, taskstore.Validationf("задача fix-checks %s не найдена", id)
+}
+
+// FixChecksTask читает одну задачу починки по ID.
+func (s *Service) FixChecksTask(id string) (FixChecksTask, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return FixChecksTask{}, taskstore.Validationf("не задана задача fix-checks")
+	}
+	st, err := s.loadFixChecks()
+	if err != nil {
+		return FixChecksTask{}, err
+	}
+	for _, t := range st.Tasks {
+		if t.ID == id {
+			return t, nil
+		}
+	}
+	return FixChecksTask{}, taskstore.Validationf("задача fix-checks %s не найдена", id)
+}
+
+// FixChecksTasks возвращает все задачи починки в порядке постановки.
+func (s *Service) FixChecksTasks() ([]FixChecksTask, error) {
+	st, err := s.loadFixChecks()
+	if err != nil {
+		return nil, err
+	}
+	return append([]FixChecksTask(nil), st.Tasks...), nil
+}
+
+// FixChecksForWorktree возвращает задачи конкретного worktree. Пустой путь это
+// ошибка: задача всегда привязана к существующему рабочему пространству.
+func (s *Service) FixChecksForWorktree(worktree string) ([]FixChecksTask, error) {
+	worktree = filepath.Clean(strings.TrimSpace(worktree))
+	if worktree == "" || worktree == "." {
+		return nil, taskstore.Validationf("не задан worktree fix-checks")
+	}
+	st, err := s.loadFixChecks()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FixChecksTask, 0, len(st.Tasks))
+	for _, t := range st.Tasks {
+		if t.Worktree == worktree {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}

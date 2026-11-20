@@ -1644,3 +1644,303 @@ func TestHandoffJournalDoesNotReplaceStructuredHandoff(t *testing.T) {
 		t.Fatalf("журнал изменил структурированную передачу: %+v против %+v", after, h)
 	}
 }
+
+func (e *env) worktree(t *testing.T, name string) string {
+	t.Helper()
+	p := filepath.Join(e.cfg.Root, "worktrees", name)
+	if err := os.MkdirAll(p, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestRequestFixChecksReusesExistingWorktreeAndAgent(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T3.50", "in_progress", "task", "ADR 0001", "internal/app/w/x.go", "agent-1", "2026-11-20T10:00:00Z")
+	wt := e.worktree(t, "w237")
+	before, err := os.ReadDir(e.tasksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	res, err := e.svc.RequestFixChecks(FixChecksRequest{
+		SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1",
+		Checks: []string{"go test ./internal/app/taskcli", "gofmt -l ."}, Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Created {
+		t.Fatalf("Created=false, ждалиtrue: %+v", res)
+	}
+	if res.Task.ID == "" || res.Task.Key == "" {
+		t.Fatalf("пустые ID или ключ: %+v", res.Task)
+	}
+	if res.Task.SourceTaskID != "T3.50" || res.Task.Worktree != wt || res.Task.Agent != "agent-1" {
+		t.Fatalf("задача не привязана к источнику, worktree и агенту: %+v", res.Task)
+	}
+	if res.Task.Status != FixChecksPending || !res.Task.CreatedAt.Equal(now) {
+		t.Fatalf("статус или время задачи: %+v", res.Task)
+	}
+	wantChecks := []string{"go test ./internal/app/taskcli", "gofmt -l ."}
+	if !reflect.DeepEqual(res.Task.Checks, wantChecks) {
+		t.Fatalf("проверки = %v, ждали %v", res.Task.Checks, wantChecks)
+	}
+	after, err := os.ReadDir(e.tasksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("появилась новая карточка: было %d, стало %d", len(before), len(after))
+	}
+	raw, err := os.ReadFile(filepath.Join(e.tasksDir, "T3.50.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "Агент: agent-1") {
+		t.Fatalf("агент исходной карточки изменился: %s", raw)
+	}
+	if info, err := os.Stat(wt); err != nil || !info.IsDir() {
+		t.Fatalf("worktree не остался на месте: %v", err)
+	}
+	tasks, err := e.svc.FixChecksForWorktree(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != res.Task.ID {
+		t.Fatalf("задачи worktree: %+v", tasks)
+	}
+	byID, err := e.svc.FixChecksTask(res.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byID.ID != res.Task.ID || byID.Key != res.Task.Key || !byID.CreatedAt.Equal(now) {
+		t.Fatalf("чтение по ID: %+v", byID)
+	}
+}
+
+func TestRequestFixChecksIsIdempotentAndNormalizesChecks(t *testing.T) {
+	e := newEnv(t)
+	wt := e.worktree(t, "w237")
+	req := FixChecksRequest{
+		SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1",
+		Checks: []string{"b", "a", "a"}, Now: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC),
+	}
+	first, err := e.svc.RequestFixChecks(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := req
+	again.Checks = []string{"a", "b"}
+	second, err := e.svc.RequestFixChecks(again)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Created || second.Created {
+		t.Fatalf("Created: первый %v, второй %v", first.Created, second.Created)
+	}
+	if first.Task.ID != second.Task.ID || first.Task.Key != second.Task.Key {
+		t.Fatalf("дубликат задачи: %+v и %+v", first.Task, second.Task)
+	}
+	if !reflect.DeepEqual(first.Task.Checks, []string{"a", "b"}) {
+		t.Fatalf("проверки не нормализованы: %v", first.Task.Checks)
+	}
+	tasks, err := e.svc.FixChecksTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("задач %d, ждали 1", len(tasks))
+	}
+}
+
+func TestRequestFixChecksSeparatesDifferentChecks(t *testing.T) {
+	e := newEnv(t)
+	wt := e.worktree(t, "w237")
+	base := FixChecksRequest{SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1"}
+	a := base
+	a.Checks = []string{"go test ./..."}
+	b := base
+	b.Checks = []string{"go vet ./..."}
+	ra, err := e.svc.RequestFixChecks(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rb, err := e.svc.RequestFixChecks(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ra.Created || !rb.Created || ra.Task.ID == rb.Task.ID {
+		t.Fatalf("разные проверки дали одну задачу: %+v и %+v", ra.Task, rb.Task)
+	}
+	tasks, err := e.svc.FixChecksForWorktree(wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("задач в worktree %d, ждали 2", len(tasks))
+	}
+}
+
+func TestRequestFixChecksRejectsMissingWorktree(t *testing.T) {
+	e := newEnv(t)
+	missing := filepath.Join(e.cfg.Root, "worktrees", "w999")
+	req := FixChecksRequest{SourceTaskID: "T3.50", Worktree: missing, Agent: "agent-1", Checks: []string{"go test"}}
+	if _, err := e.svc.RequestFixChecks(req); taskstore.Code(err) != 1 {
+		t.Fatalf("несуществующий worktree: код %d, ждали 1", taskstore.Code(err))
+	}
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Fatalf("сервис создал worktree: %v", err)
+	}
+	file := filepath.Join(e.cfg.Root, "not-a-dir")
+	if err := os.WriteFile(file, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	req.Worktree = file
+	if _, err := e.svc.RequestFixChecks(req); taskstore.Code(err) != 1 {
+		t.Fatalf("файл вместо worktree: код %d, ждали 1", taskstore.Code(err))
+	}
+	tasks, err := e.svc.FixChecksTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("задачи записаны при плохом worktree: %+v", tasks)
+	}
+}
+
+func TestRequestFixChecksRejectsBadInput(t *testing.T) {
+	e := newEnv(t)
+	wt := e.worktree(t, "w237")
+	base := FixChecksRequest{SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1", Checks: []string{"go test"}}
+	cases := []FixChecksRequest{
+		func() FixChecksRequest { r := base; r.SourceTaskID = "  "; return r }(),
+		func() FixChecksRequest { r := base; r.Agent = "  "; return r }(),
+		func() FixChecksRequest { r := base; r.Worktree = "  "; return r }(),
+		func() FixChecksRequest { r := base; r.Checks = nil; return r }(),
+		func() FixChecksRequest { r := base; r.Checks = []string{"go test", " "}; return r }(),
+	}
+	for i, r := range cases {
+		if _, err := e.svc.RequestFixChecks(r); taskstore.Code(err) != 1 {
+			t.Fatalf("кейс %d: код %d, ждали 1", i, taskstore.Code(err))
+		}
+	}
+	tasks, err := e.svc.FixChecksTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("плохие запросы записаны: %+v", tasks)
+	}
+}
+
+func TestRequestFixChecksRejectsAgentRestartInSameWorktree(t *testing.T) {
+	e := newEnv(t)
+	wt := e.worktree(t, "w237")
+	req := FixChecksRequest{SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1", Checks: []string{"go test"}}
+	first, err := e.svc.RequestFixChecks(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restart := req
+	restart.Agent = "agent-2"
+	if _, err := e.svc.RequestFixChecks(restart); taskstore.Code(err) != 1 {
+		t.Fatalf("перезапуск агента: код %d, ждали 1", taskstore.Code(err))
+	}
+	tasks, err := e.svc.FixChecksTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Agent != "agent-1" {
+		t.Fatalf("агент заменён: %+v", tasks)
+	}
+	if _, err := e.svc.CompleteFixChecks(first.Task.ID, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	after, err := e.svc.RequestFixChecks(restart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.Created || after.Task.ID == first.Task.ID || after.Task.Agent != "agent-2" {
+		t.Fatalf("задача после завершения: %+v", after)
+	}
+}
+
+func TestCompleteFixChecksAndPersistence(t *testing.T) {
+	e := newEnv(t)
+	wt := e.worktree(t, "w237")
+	res, err := e.svc.RequestFixChecks(FixChecksRequest{
+		SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1", Checks: []string{"go test"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)
+	done, err := e.svc.CompleteFixChecks(res.Task.ID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.Status != FixChecksDone {
+		t.Fatalf("статус после Complete: %s", done.Status)
+	}
+	again, err := e.svc.CompleteFixChecks(res.Task.ID, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status != FixChecksDone {
+		t.Fatalf("повторный Complete изменил статус: %s", again.Status)
+	}
+	if _, err := e.svc.CompleteFixChecks("  ", time.Time{}); taskstore.Code(err) != 1 {
+		t.Fatalf("пустой ID: код %d, ждали 1", taskstore.Code(err))
+	}
+	if _, err := e.svc.CompleteFixChecks("fix-99", time.Time{}); taskstore.Code(err) != 1 {
+		t.Fatalf("неизвестный ID: код %d, ждали 1", taskstore.Code(err))
+	}
+	other := NewService(e.cfg)
+	tasks, err := other.FixChecksTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].ID != res.Task.ID || tasks[0].Status != FixChecksDone {
+		t.Fatalf("состояние не пережило новый сервис: %+v", tasks)
+	}
+}
+
+func TestConcurrentFixChecksRequestsKeepOneTask(t *testing.T) {
+	e := newEnv(t)
+	wt := e.worktree(t, "w237")
+	req := FixChecksRequest{SourceTaskID: "T3.50", Worktree: wt, Agent: "agent-1", Checks: []string{"go test"}}
+	const n = 12
+	type outcome struct {
+		res FixChecksResult
+		err error
+	}
+	outcomes := make(chan outcome, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			res, err := e.svc.RequestFixChecks(req)
+			outcomes <- outcome{res: res, err: err}
+		}()
+	}
+	created, ids := 0, make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		o := <-outcomes
+		if o.err != nil {
+			t.Fatal(o.err)
+		}
+		if o.res.Created {
+			created++
+		}
+		ids[o.res.Task.ID] = true
+	}
+	if created != 1 || len(ids) != 1 {
+		t.Fatalf("создано %d, уникальных ID %d", created, len(ids))
+	}
+	tasks, err := e.svc.FixChecksTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("задач %d, ждали 1", len(tasks))
+	}
+}
