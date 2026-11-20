@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -62,6 +63,41 @@ type inspectView struct {
 	Escalations  []string                    `json:"escalations"`
 }
 
+// inspectStore is the slice of the state store the inspect command needs. The
+// concrete *store.DB implements it; tests install a fake with a fixed binding.
+type inspectStore interface {
+	LiveWatches() ([]domain.Watch, error)
+	ActiveBlockers() ([]domain.BlockerIncident, error)
+	BoundOrchestrator(projectKey string) (domain.OrchestratorBinding, bool, error)
+	LoadRuntimeStats() ([]byte, bool, error)
+}
+
+type inspectStoreFactory func(*CLI) (inspectStore, func() error, error)
+
+var makeInspectStore inspectStoreFactory = defaultInspectStore
+
+// SetInspectStore replaces the inspect store factory. Passing nil restores the
+// production store.
+func SetInspectStore(fn inspectStoreFactory) {
+	if fn == nil {
+		fn = defaultInspectStore
+	}
+	makeInspectStore = fn
+}
+
+func defaultInspectStore(*CLI) (inspectStore, func() error, error) {
+	deps, closeStore, err := openMCPDependencies()
+	if err != nil {
+		return nil, nil, err
+	}
+	db, ok := deps.Store.(*store.DB)
+	if !ok {
+		_ = closeStore()
+		return nil, nil, errors.New("store is not *store.DB")
+	}
+	return db, closeStore, nil
+}
+
 // runInspect implements `beacon inspect [<pr|watchID>] [--json]`. A numeric
 // selector matches the PR number; any other selector matches a Watch id.
 func runInspect(c *CLI, args []string) int {
@@ -85,20 +121,15 @@ func runInspect(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon inspect: %v\n", err)
 		return 2
 	}
-	deps, closeStore, err := openMCPDependencies()
+	s, closeStore, err := makeInspectStore(c)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: %v\n", err)
 		return 2
 	}
 	defer func() { _ = closeStore() }()
-	db, ok := deps.Store.(*store.DB)
-	if !ok {
-		fmt.Fprintln(c.errOut, "beacon inspect: store is not *store.DB")
-		return 2
-	}
 
 	view := inspectView{Query: query, Watches: []domain.Watch{}, Escalations: []string{}}
-	live, err := db.LiveWatches()
+	live, err := s.LiveWatches()
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: live watches: %v\n", err)
 		return 2
@@ -108,18 +139,18 @@ func runInspect(c *CLI, args []string) int {
 			view.Watches = append(view.Watches, w)
 		}
 	}
-	view.Blockers, err = db.ActiveBlockers()
+	view.Blockers, err = s.ActiveBlockers()
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: blockers: %v\n", err)
 		return 2
 	}
-	if binding, bound, err := db.BoundOrchestrator(orchestratorProjectKey()); err != nil {
+	if binding, bound, err := s.BoundOrchestrator(orchestratorProjectKey()); err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: orchestrator: %v\n", err)
 		return 2
 	} else if bound {
 		view.Orchestrator = &binding
 	}
-	if raw, ok, err := db.LoadRuntimeStats(); err != nil {
+	if raw, ok, err := s.LoadRuntimeStats(); err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: runtime_stats: %v\n", err)
 		return 2
 	} else if ok && json.Valid(raw) {
@@ -170,8 +201,12 @@ func renderInspectTable(w io.Writer, view inspectView) {
 			b.ID, b.Repo, b.Status, strings.Join(b.FailedChecks, ","), b.FixAttempts)
 	}
 	if view.Orchestrator != nil {
-		fmt.Fprintf(w, "ORCHESTRATOR project=%s session=%s adapter=%s\n",
-			view.Orchestrator.ProjectKey, view.Orchestrator.SessionID, view.Orchestrator.Adapter)
+		fmt.Fprintf(w, "Orchestrator: %s (%s, %s)\n",
+			view.Orchestrator.SessionID,
+			view.Orchestrator.Adapter,
+			view.Orchestrator.BoundAt.Format(time.RFC3339))
+	} else {
+		fmt.Fprintln(w, "WARNING: orchestrator not bound; run beacon orchestrator bind --session <ses_>")
 	}
 	if len(view.RuntimeStats) > 0 {
 		fmt.Fprintf(w, "RUNTIME_STATS %s\n", string(view.RuntimeStats))
