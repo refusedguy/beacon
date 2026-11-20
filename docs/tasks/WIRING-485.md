@@ -1,5 +1,6 @@
 # WIRING-485. Подключить notify router к доставке событий
-Статус: todo
+Статус: done
+- PR #532 (commit 930ccb1): premise проверен, notify.Router подключён к доставке verdict в рабочем пути. newDaemonNotifyRouter/routeDaemonEvent/daemonWakeRoute в cmd/beacon/daemon.go передают Router через orchestrator.WakeRoute (NewDaemonWakerWithRoute в internal/app/orchestrator/daemon.go) в вызов Router.Route; wake.TargetDeliverer/PromptTargetDeliverer в internal/infra/wake/deliver.go. Дубль не создан.
 Фаза: P5
 Тип: task
 Владелец файлов: internal/infra/wake/deliver.go, internal/app/orchestrator/daemon.go, cmd/beacon/daemon.go
