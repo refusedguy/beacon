@@ -307,6 +307,167 @@ func TestDaemonWakerDeliversToSessionSubscriber(t *testing.T) {
 	}
 }
 
+// A Watch whose verdict did not change keeps its revision. Six daemon passes
+// over the same retry Watch must steer the executor once, not six times.
+func TestDaemonWakerDeliversSameObligationOnce(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	w := daemonTestWaker(DaemonWatch{
+		ID: "w-repeat", PR: 42, Adapter: wake.AdapterOpenCode,
+		SubscriberID: "ses_repeat",
+	}, adapter)
+
+	for i := 0; i < 6; i++ {
+		if err := w.Wake(context.Background(), "w-repeat", 1, VerdictRetry); err != nil {
+			t.Fatalf("Wake #%d: %v", i+1, err)
+		}
+	}
+	if adapter.calls != 1 {
+		t.Fatalf("Deliver calls = %d, want exactly 1 for the same (watchID, revision, subscriber)", adapter.calls)
+	}
+}
+
+// A new revision is a new obligation and must wake the same subscriber again.
+func TestDaemonWakerDeliversOnNewRevision(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	w := daemonTestWaker(DaemonWatch{
+		ID: "w-rev", PR: 7, Adapter: wake.AdapterOpenCode,
+		SubscriberID: "ses_rev",
+	}, adapter)
+
+	for _, revision := range []uint64{1, 2} {
+		if err := w.Wake(context.Background(), "w-rev", revision, VerdictRetry); err != nil {
+			t.Fatalf("Wake(revision=%d): %v", revision, err)
+		}
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("Deliver calls = %d, want 2 for two revisions", adapter.calls)
+	}
+}
+
+// The obligation key includes the subscriber. Changing the executor at the
+// same revision must reach the new session and be deduped there on its own.
+func TestDaemonWakerDeliversForAnotherSubscriber(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	view := DaemonWatch{ID: "w-sub", PR: 5, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_first"}
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	w := &daemonWaker{
+		lookup:   func(string) (DaemonWatch, error) { return view, nil },
+		adapters: adapters,
+	}
+
+	if err := w.Wake(context.Background(), "w-sub", 1, VerdictRetry); err != nil {
+		t.Fatalf("Wake for ses_first: %v", err)
+	}
+	view.SubscriberID = "ses_second"
+	for i := 0; i < 2; i++ {
+		if err := w.Wake(context.Background(), "w-sub", 1, VerdictRetry); err != nil {
+			t.Fatalf("Wake #%d for ses_second: %v", i+1, err)
+		}
+	}
+	want := []string{"ses_first", "ses_second"}
+	if !reflect.DeepEqual(adapter.targets, want) {
+		t.Fatalf("Deliver targets = %q, want %q", adapter.targets, want)
+	}
+}
+
+// The watch id is part of the obligation key. Two Watches at the same revision
+// and subscriber each get one delivery.
+func TestDaemonWakerDeliversForAnotherWatch(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	view := DaemonWatch{ID: "w-one", PR: 1, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_same"}
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	w := &daemonWaker{
+		lookup:   func(id string) (DaemonWatch, error) {
+			view.ID = id
+			return view, nil
+		},
+		adapters: adapters,
+	}
+
+	for _, id := range []string{"w-one", "w-two", "w-one"} {
+		if err := w.Wake(context.Background(), id, 1, VerdictRetry); err != nil {
+			t.Fatalf("Wake(%s): %v", id, err)
+		}
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("Deliver calls = %d, want 2 for two watch ids", adapter.calls)
+	}
+}
+
+// A blocked escalation uses the orchestrator route, not this executor ledger.
+// A refused wake is not recorded, so a valid executor appearing later at the
+// same revision still gets exactly one delivery.
+func TestDaemonWakerRefusalDoesNotConsumeLedgerKey(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	view := DaemonWatch{ID: "w-block", PR: 9, Adapter: wake.AdapterOpenCode}
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	w := &daemonWaker{
+		lookup:   func(string) (DaemonWatch, error) { return view, nil },
+		adapters: adapters,
+	}
+
+	if err := w.Wake(context.Background(), "w-block", 1, VerdictRetry); err == nil {
+		t.Fatal("a Watch without an executor subscriber must be refused")
+	}
+	if adapter.calls != 0 {
+		t.Fatalf("Deliver called %d times for a refused wake, want 0", adapter.calls)
+	}
+	view.SubscriberID = "ses_exec"
+	for i := 0; i < 3; i++ {
+		if err := w.Wake(context.Background(), "w-block", 1, VerdictRetry); err != nil {
+			t.Fatalf("Wake #%d for ses_exec: %v", i+1, err)
+		}
+	}
+	if adapter.calls != 1 || !reflect.DeepEqual(adapter.targets, []string{"ses_exec"}) {
+		t.Fatalf("Deliver calls = %d, targets = %q, want one ses_exec", adapter.calls, adapter.targets)
+	}
+}
+
+// Only a successful receipt suppresses a repeat. An errored delivery stays
+// eligible so the next daemon pass can retry it.
+func TestDaemonWakerRetriesAfterError(t *testing.T) {
+	adapter := &flakyDaemonAdapter{}
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	w := &daemonWaker{
+		lookup:   func(string) (DaemonWatch, error) {
+			return DaemonWatch{ID: "w-err", PR: 3, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_err"}, nil
+		},
+		adapters: adapters,
+	}
+
+	if err := w.Wake(context.Background(), "w-err", 1, VerdictRetry); err == nil {
+		t.Fatal("an errored delivery must surface as an error")
+	}
+	if err := w.Wake(context.Background(), "w-err", 1, VerdictRetry); err != nil {
+		t.Fatalf("retry after an error: %v", err)
+	}
+	if err := w.Wake(context.Background(), "w-err", 1, VerdictRetry); err != nil {
+		t.Fatalf("repeat after a successful retry: %v", err)
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("Deliver calls = %d, want 2 (error then success)", adapter.calls)
+	}
+}
+
+// flakyDaemonAdapter errors once, then reports a normal delivery.
+type flakyDaemonAdapter struct{ calls int }
+
+func (a *flakyDaemonAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
+	return wake.T210Target(p.Target), true
+}
+
+func (a *flakyDaemonAdapter) Deliver(p wake.T210WakePointer, _ wake.T210Target) (wake.T210Receipt, error) {
+	a.calls++
+	if a.calls == 1 {
+		return wake.T210Receipt{ObligationID: p.ObligationID, Outcome: wake.T210Errored}, errors.New("transport down")
+	}
+	return wake.T210Receipt{ObligationID: p.ObligationID, Outcome: wake.T210Delivered}, nil
+}
+
 func TestDaemonWakerWithoutSubscriberIsError(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
 	w := daemonTestWaker(DaemonWatch{ID: "w3", PR: 8, Adapter: wake.AdapterOpenCode}, adapter)

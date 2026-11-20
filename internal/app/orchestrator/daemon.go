@@ -12,6 +12,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -141,12 +142,39 @@ func DaemonWakeSubscriber(subs []DaemonSubscriber) (DaemonSubscriber, error) {
 func NewDaemonWaker(lookup DaemonWatchLookup) Waker {
 	adapters := wake.T211NewAdapterRegistry()
 	adapters.Register(wake.AdapterOpenCode, &daemonWakeAdapter{api: &wake.T202API{}})
-	return &daemonWaker{lookup: lookup, adapters: adapters}
+	return &daemonWaker{
+		lookup:        lookup,
+		adapters:      adapters,
+		deliveredKeys: make(map[string]struct{}),
+	}
 }
 
 type daemonWaker struct {
 	lookup   DaemonWatchLookup
 	adapters *wake.T211AdapterRegistry
+
+	// mu guards deliveredKeys and the check-deliver-record sequence, so two
+	// concurrent passes cannot steer the same obligation twice. deliveredKeys
+	// holds obligation keys already admitted to a subscriber in this process.
+	// The ledger is in-memory only: a daemon restart starts with an empty map
+	// and may deliver the same (watchID, revision, subscriber) again. The host
+	// prompt API keeps its own admission id, so the duplicate is admitted as a
+	// new task. Surviving a restart needs a durable receipt store, which is out
+	// of scope for this fix.
+	mu            sync.Mutex
+	deliveredKeys map[string]struct{}
+}
+
+// daemonWakeIsDelivered reports whether an adapter receipt counts as a
+// delivered wake. Only these outcomes suppress a repeat: an error or a skip
+// leaves the obligation eligible for the next daemon pass.
+func daemonWakeIsDelivered(outcome string) bool {
+	switch outcome {
+	case wake.T210Delivered, wake.T210Queued, wake.T210Enqueued:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ Waker = (*daemonWaker)(nil)
@@ -195,12 +223,27 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		log.Printf("daemon: skip wake for watch %s: %v", watchID, err)
 		return fmt.Errorf("daemon: watch %s: %w", watchID, err)
 	}
-	receipt, delivered := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
-	if !delivered {
+	// A Watch whose verdict did not change keeps its revision, so every daemon
+	// pass builds the same pointer. The obligation key folds watchID, revision
+	// and subscriber into one string, which is exactly the unit that must be
+	// delivered once. Check and record under the same lock as the delivery.
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.deliveredKeys == nil {
+		w.deliveredKeys = make(map[string]struct{})
+	}
+	if _, seen := w.deliveredKeys[pointer.ObligationID]; seen {
+		return nil
+	}
+	receipt, ok := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
+	if !ok {
 		return fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
 	}
 	if receipt.Outcome == wake.T210Errored {
 		return fmt.Errorf("daemon: wake %s: %s", watchID, receipt.Outcome)
+	}
+	if daemonWakeIsDelivered(receipt.Outcome) {
+		w.deliveredKeys[pointer.ObligationID] = struct{}{}
 	}
 	return nil
 }
