@@ -30,3 +30,9 @@ go build -o .opencode/bin/beacon ./cmd/beacon
 ## Коммиты и локальные проверки
 
 Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки. Локальный гейт это `gofmt`. `go test` и `go build` локально как гейт не используются, но точечные прогоны допустимы как доказательство для владельца.
+
+## Project scope и вердикты
+
+Состояние Beacon привязано к проекту: state лежит в `<XDG_STATE_HOME>/beacon/projects/<name>-<hash>/beacon.db`, когда cwd содержит `.git`. MCP поднимается с `cwd` текущего проекта из `opencode.json`. Переход в другую папку проекта даёт другой state. Явный override: `BEACON_STATE_DIR`.
+
+Локальный MCP поднимает CI-мост: он читает проверки PR через `gh` и переводит Watch в `ready` (все зелёные) или `retry` (FAILURE/CANCELLED). Оркестратор мержит только после `beacon_get_result` с `verdict=ready`; ручной `gh pr checks` в цикле запрещён.
