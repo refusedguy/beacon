@@ -122,7 +122,7 @@ func TestMigration0005AppliesToExistingDB(t *testing.T) {
 		t.Fatalf("Open v4 db: %v", err)
 	}
 	defer d.Close()
-	if got := d.Version(); got != 5 {
+	if got := d.Version(); got != 6 {
 		t.Fatalf("Version() = %d, want 6", got)
 	}
 
@@ -171,7 +171,7 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if got := first.Version(); got != 5 {
+	if got := first.Version(); got != 6 {
 		t.Fatalf("first Version() = %d, want 6", got)
 	}
 	db := rawDB(t, path)
@@ -186,7 +186,7 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 		t.Fatalf("second Open: %v", err)
 	}
 	defer second.Close()
-	if got := second.Version(); got != 5 {
+	if got := second.Version(); got != 6 {
 		t.Fatalf("second Version() = %d, want 6", got)
 	}
 	checkSchema0005(t, db)
