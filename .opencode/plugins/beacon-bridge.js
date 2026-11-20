@@ -111,6 +111,45 @@ const POLL_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 2000
 })()
 
+// HD-011 (ADR 0292): порядок создания рабочей копии. Harbor требует fetch
+// ПЕРЕД worktree. Ветка, срезанная до fetch, параметризуется stale ref, и агент
+// работает с устаревшим main. Нарушенный порядок проваливает карточку.
+export const FETCH_BEFORE_WORKTREE_RULE =
+  "fetch FIRST, then worktree: создавай worktree только после fetch origin"
+
+const OP_FETCH = "fetch"
+const OP_WORKTREE = "worktree"
+
+// Нормализует имя операции: "git fetch origin main" и { op: "fetch" } дают "fetch".
+function setupOpName(raw) {
+  const value = typeof raw === "string" ? raw : raw?.op
+  if (typeof value !== "string") return ""
+  const name = value.trim().toLowerCase().replace(/^git\s+/, "")
+  const space = name.search(/\s/)
+  return space > 0 ? name.slice(0, space) : name
+}
+
+// Проверяет упорядоченную последовательность операций настройки рабочей копии.
+// worktree допустим только если до него была хотя бы одна fetch. Возвращает
+// { ok, fetchIndex, worktreeIndex, reason }; нарушение даёт ok:false.
+export function checkFetchBeforeWorktree(ops) {
+  const list = Array.isArray(ops) ? ops : []
+  let fetchIndex = -1
+  let worktreeIndex = -1
+  for (let i = 0; i < list.length; i++) {
+    const name = setupOpName(list[i])
+    if (name === OP_FETCH && fetchIndex < 0) fetchIndex = i
+    if (name === OP_WORKTREE && worktreeIndex < 0) worktreeIndex = i
+  }
+  if (worktreeIndex < 0) {
+    return { ok: true, fetchIndex, worktreeIndex, reason: "no worktree" }
+  }
+  if (fetchIndex < 0 || fetchIndex > worktreeIndex) {
+    return { ok: false, fetchIndex, worktreeIndex, reason: "worktree before fetch" }
+  }
+  return { ok: true, fetchIndex, worktreeIndex, reason: "fetch before worktree" }
+}
+
 // ADR 0016: недоверенный текст из события не становится инструкцией.
 export function escapeUntrusted(value, maxLength = MAX_FIELD_LENGTH) {
   return String(value)
@@ -1127,6 +1166,28 @@ const adapterCases = [
       assert.equal(lines.some((line) => line.obligationID === "obl-w6c-go" &&
         line.attempt === 5 && line.outcome === "posted" &&
         line.via === "execution-started"), true)
+    },
+  },
+  {
+    // HD-011 (ADR 0292): worktree создаётся только после fetch. Нарушение
+    // порядка проваливает проверку (ok:false и reason "worktree before fetch").
+    name: "HD-011: нарушение порядка fetch -> worktree проваливает проверку",
+    check(assert) {
+      assert.equal(typeof FETCH_BEFORE_WORKTREE_RULE, "string")
+      assert.ok(FETCH_BEFORE_WORKTREE_RULE.length > 0)
+      // Правильный порядок: fetch затем worktree.
+      assert.equal(checkFetchBeforeWorktree(["fetch", "worktree"]).ok, true)
+      assert.equal(checkFetchBeforeWorktree([
+        "git fetch origin main", "git worktree add -b fix/hd011 x origin/main",
+      ]).ok, true)
+      assert.equal(checkFetchBeforeWorktree([{ op: "fetch" }, { op: "worktree" }]).ok, true)
+      // Нарушенный порядок проваливает карточку.
+      const bad = checkFetchBeforeWorktree(["worktree", "fetch"])
+      assert.equal(bad.ok, false)
+      assert.equal(bad.reason, "worktree before fetch")
+      assert.equal(checkFetchBeforeWorktree(["worktree"]).ok, false)
+      // Нет worktree — порядок нарушать нечем.
+      assert.equal(checkFetchBeforeWorktree([]).ok, true)
     },
   },
 ]
