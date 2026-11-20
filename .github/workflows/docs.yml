@@ -1,0 +1,45 @@
+name: Docs
+
+# Отдельный markdown/docs gate. Пока гейт informational: continue-on-error
+# не даёт ему блокировать merge, пока в baseline разбираются дублирующие
+# редакции ADR. Проверяет статус, структуру карточек и дубли номеров ADR.
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '**.md'
+      - '.github/workflows/docs.yml'
+      - 'tools/beacon-gates/gate/**'
+      - 'tools/beacon-gates/docsgate/**'
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Self-test docs gate on planted bad input
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./docsgate --self-test
+
+      - name: Check docs status, structure and revisions
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./docsgate -root ../.. -baseline gate/config/docs-baseline.json
