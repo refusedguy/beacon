@@ -101,6 +101,11 @@ type Watch struct {
 	// Blocked carries the reason the executor blocked this Watch. Decide reads
 	// it first so a stale ready verdict can never turn into a merge.
 	Blocked *BlockedInfo
+	// ChangedFiles lists repo-relative paths touched by the PR diff. The gate
+	// adapter fills it from the PR; Decide checks it against
+	// DefaultGeneratedFilePatterns so a hand-edited generated artifact can
+	// never reach the merge path. A nil or empty list means no diff is known.
+	ChangedFiles []string
 }
 
 func (w Watch) autoMergeAllowed() bool {

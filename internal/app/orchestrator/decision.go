@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"path"
 	"strings"
 )
 
@@ -25,6 +26,9 @@ const (
 	// DecisionNotifyOrchestrator covers everything else: no merge, no retry
 	// and no dependency to wait for. A human or the orchestrator decides.
 	DecisionNotifyOrchestrator DecisionKind = "NOTIFY_ORCHESTRATOR"
+	// DecisionRejectGeneratedEdit refuses a Watch whose diff edits a generated
+	// artifact. The gate fails the card: no merge, no retry and no wake.
+	DecisionRejectGeneratedEdit DecisionKind = "REJECT_GENERATED_EDIT"
 )
 
 const (
@@ -36,7 +40,32 @@ const (
 	// fix-attempt cap is reached. The orchestrator gets an escalation ping
 	// instead of a request to spawn another FIX agent.
 	ReasonEscalateHuman = "escalate_human"
+	// ReasonGeneratedFileEdited is the REJECT_GENERATED_EDIT reason. It names
+	// the invariant, not the file; the offending paths are in Decision.GeneratedFiles.
+	ReasonGeneratedFileEdited = "generated_file_edited"
 )
+
+// DefaultGeneratedFilePatterns lists the Beacon artifacts that tooling owns.
+// These are the Beacon analogues of Harbor's generated demo GIF and golden
+// baseline (ADR 0228): a workflow regenerates them, and nobody hand-edits them
+// to turn a red test green.
+//
+//   - docs/ROADMAP_STATUS.md is rendered from task-card state;
+//   - docs/tasks/*.md cards are written by batch-apply from the queue;
+//   - evals/reports/* reports are emitted by the eval runner.
+//
+// Decide always uses this list, so a caller cannot silently opt out. A gate
+// that needs its own list can pass one to GeneratedFileEdits instead.
+//
+// Gate contract (W12-C owns the gate adapter): read the PR's changed paths,
+// call GeneratedFileEdits(files, DefaultGeneratedFilePatterns), and fail the
+// card with REJECT_GENERATED_EDIT when the result is non-empty. Regenerate the
+// artifact from its source instead of editing it by hand.
+var DefaultGeneratedFilePatterns = []string{
+	"docs/ROADMAP_STATUS.md",
+	"docs/tasks/*.md",
+	"evals/reports/*",
+}
 
 // BlockedInfo is why an executor blocked a Watch. It mirrors the domain block
 // details without importing domain types into this package (ADR 0005).
@@ -82,6 +111,9 @@ type Decision struct {
 	Reason       string       `json:"reason,omitempty"`
 	BlockedBy    string       `json:"blockedBy,omitempty"`
 	FailedChecks []string     `json:"failedChecks,omitempty"`
+	// GeneratedFiles lists the changed paths that matched a generated-file
+	// pattern. It is set only on DecisionRejectGeneratedEdit.
+	GeneratedFiles []string `json:"generatedFiles,omitempty"`
 }
 
 // Decide reduces a Watch, its dependency resolver and the CI view to exactly
@@ -92,10 +124,12 @@ type Decision struct {
 //     ready or a dependency is outstanding. Once MaxFixAttempts FIX agents
 //     have been spawned for that block, the Watch is escalated to a human
 //     with NOTIFY_ORCHESTRATOR instead of asking for another FIX agent;
-//  2. unsatisfied waitFor/waitForMain refs hold the merge and list the refs;
-//  3. ready plus auto-merge merges;
-//  4. retry goes back to the executor;
-//  5. anything else is escalated, never merged.
+//  2. a diff that edits a generated artifact is rejected before any dependency
+//     is resolved, so a manual edit can never reach the merge path;
+//  3. unsatisfied waitFor/waitForMain refs hold the merge and list the refs;
+//  4. ready plus auto-merge merges;
+//  5. retry goes back to the executor;
+//  6. anything else is escalated, never merged.
 func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 	d := Decision{WatchID: w.ID, PR: w.PR, Revision: w.Revision}
 
@@ -109,6 +143,13 @@ func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 		}
 		d.Kind = DecisionBlockedFixAgent
 		d.Reason = w.Blocked.Reason
+		return d
+	}
+
+	if edited := GeneratedFileEdits(w.ChangedFiles, DefaultGeneratedFilePatterns); len(edited) > 0 {
+		d.Kind = DecisionRejectGeneratedEdit
+		d.Reason = ReasonGeneratedFileEdited
+		d.GeneratedFiles = edited
 		return d
 	}
 
@@ -131,6 +172,60 @@ func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 		d.Reason = decisionHoldReason(verdict, w.Policy)
 	}
 	return d
+}
+
+// GeneratedFileEdits returns the changed paths that match one of patterns,
+// in first-seen order. It is pure: inputs are never mutated and the result is
+// a fresh slice, so the caller can attach it to a Decision or a gate failure
+// without aliasing the diff. An empty result means the diff is safe to hand to
+// the gate; an empty changedFiles list is always safe.
+//
+// A pattern is a repo-relative path with optional `*` wildcards. Exact paths
+// match themselves; `docs/tasks/*.md` covers the cards in that directory and
+// a trailing `/*` also covers nested paths (for example `evals/reports/2026/x.md`
+// matches `evals/reports/*`). Backslashes are normalised to `/` and a leading
+// `./` is dropped so the gate can pass paths from either OS.
+func GeneratedFileEdits(changedFiles, patterns []string) []string {
+	var out []string
+	seen := make(map[string]bool, len(changedFiles))
+	for _, raw := range changedFiles {
+		file := normalizeGeneratedPath(raw)
+		if file == "" || seen[file] {
+			continue
+		}
+		for _, rawPattern := range patterns {
+			pattern := normalizeGeneratedPath(rawPattern)
+			if pattern != "" && matchesGeneratedPath(pattern, file) {
+				seen[file] = true
+				out = append(out, file)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func normalizeGeneratedPath(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	p = strings.TrimPrefix(p, "./")
+	p = strings.TrimPrefix(p, "/")
+	return strings.TrimSuffix(p, "/")
+}
+
+func matchesGeneratedPath(pattern, file string) bool {
+	if pattern == file {
+		return true
+	}
+	if ok, err := path.Match(pattern, file); err == nil && ok {
+		return true
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		dir := strings.TrimSuffix(pattern, "/*")
+		if dir != "" && strings.HasPrefix(file, dir+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // unsatisfiedRefs resolves waitFor first and waitForMain second, preserving

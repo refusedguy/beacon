@@ -362,3 +362,145 @@ func TestDecideUnblockedWatchNeverEscalates(t *testing.T) {
 		t.Fatalf("unblocked Watch escalated: %+v", got)
 	}
 }
+
+func TestGeneratedFileEdits(t *testing.T) {
+	tests := []struct {
+		name         string
+		changedFiles []string
+		patterns     []string
+		want         []string
+	}{
+		{
+			name:         "generated roadmap status matches",
+			changedFiles: []string{"docs/ROADMAP_STATUS.md", "internal/app/orchestrator/decision.go"},
+			patterns:     DefaultGeneratedFilePatterns,
+			want:         []string{"docs/ROADMAP_STATUS.md"},
+		},
+		{
+			name:         "batch-apply task card matches",
+			changedFiles: []string{"docs/tasks/HD-007.md"},
+			patterns:     DefaultGeneratedFilePatterns,
+			want:         []string{"docs/tasks/HD-007.md"},
+		},
+		{
+			name:         "eval report matches",
+			changedFiles: []string{"evals/reports/hd06-generated-files.md"},
+			patterns:     DefaultGeneratedFilePatterns,
+			want:         []string{"evals/reports/hd06-generated-files.md"},
+		},
+		{
+			name:         "nested eval report matches directory pattern",
+			changedFiles: []string{"evals/reports/2026/run.md"},
+			patterns:     DefaultGeneratedFilePatterns,
+			want:         []string{"evals/reports/2026/run.md"},
+		},
+		{
+			name:         "ordinary file is allowed",
+			changedFiles: []string{"internal/app/orchestrator/decision.go", "go.mod"},
+			patterns:     DefaultGeneratedFilePatterns,
+		},
+		{
+			name:     "empty changed files list is allowed",
+			patterns: DefaultGeneratedFilePatterns,
+		},
+		{
+			name:         "paths are normalised and deduped",
+			changedFiles: []string{" ./docs/tasks/HD-007.md ", "docs/tasks/HD-007.md", "docs\\ROADMAP_STATUS.md"},
+			patterns:     DefaultGeneratedFilePatterns,
+			want:         []string{"docs/tasks/HD-007.md", "docs/ROADMAP_STATUS.md"},
+		},
+		{
+			name:         "custom patterns replace the defaults",
+			changedFiles: []string{"generated/x.go", "docs/ROADMAP_STATUS.md"},
+			patterns:     []string{"generated/*.go"},
+			want:         []string{"generated/x.go"},
+		},
+		{
+			name:         "empty patterns allow everything",
+			changedFiles: []string{"docs/ROADMAP_STATUS.md"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filesBefore := append([]string(nil), tt.changedFiles...)
+			patternsBefore := append([]string(nil), tt.patterns...)
+
+			got := GeneratedFileEdits(tt.changedFiles, tt.patterns)
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("edits = %q, want %q", got, tt.want)
+			}
+			if !reflect.DeepEqual(tt.changedFiles, filesBefore) {
+				t.Fatalf("changedFiles mutated: %q", tt.changedFiles)
+			}
+			if !reflect.DeepEqual(tt.patterns, patternsBefore) {
+				t.Fatalf("patterns mutated: %q", tt.patterns)
+			}
+		})
+	}
+}
+
+// TestDecideRejectsManualEditOfGeneratedFile proves the rejection wins over a
+// ready verdict and over an outstanding dependency: a hand-edited artifact
+// must never reach the merge path.
+func TestDecideRejectsManualEditOfGeneratedFile(t *testing.T) {
+	w := decisionWatch(&AutoMergePolicy{WaitFor: []string{"dep:a"}})
+	w.ChangedFiles = []string{"internal/app/orchestrator/decision.go", "evals/reports/hd06-generated-files.md"}
+	deps := &decisionDeps{inMain: map[string]bool{}}
+
+	got := Decide(w, deps, CIState{})
+
+	if got.Kind != DecisionRejectGeneratedEdit {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionRejectGeneratedEdit)
+	}
+	if got.Reason != ReasonGeneratedFileEdited {
+		t.Fatalf("reason = %q, want %q", got.Reason, ReasonGeneratedFileEdited)
+	}
+	if !reflect.DeepEqual(got.GeneratedFiles, []string{"evals/reports/hd06-generated-files.md"}) {
+		t.Fatalf("generatedFiles = %q", got.GeneratedFiles)
+	}
+	if len(deps.calls) != 0 {
+		t.Fatalf("rejection must short-circuit dependency resolution: %v", deps.calls)
+	}
+	if got.WatchID != w.ID || got.PR != w.PR || got.Revision != w.Revision {
+		t.Fatalf("identity = %q/%d/%d", got.WatchID, got.PR, got.Revision)
+	}
+}
+
+func TestDecideAcceptsOrdinaryChangedFile(t *testing.T) {
+	w := decisionWatch(nil)
+	w.ChangedFiles = []string{"internal/app/orchestrator/decision.go", "README.md", "docs/tasks/HD-007.md.tmpl"}
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionMerge {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionMerge)
+	}
+	if len(got.GeneratedFiles) != 0 {
+		t.Fatalf("generatedFiles on merge = %q", got.GeneratedFiles)
+	}
+}
+
+func TestDecideAllowsEmptyChangedFiles(t *testing.T) {
+	w := decisionWatch(nil)
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionMerge {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionMerge)
+	}
+}
+
+// TestDecideBlockedWinsOverGeneratedEdit documents the priority: a blocked
+// Watch keeps its FIX/escalation path, which never merges either.
+func TestDecideBlockedWinsOverGeneratedEdit(t *testing.T) {
+	w := decisionWatch(nil)
+	w.Blocked = &BlockedInfo{Reason: "чужой тест"}
+	w.ChangedFiles = []string{"docs/ROADMAP_STATUS.md"}
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionBlockedFixAgent {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionBlockedFixAgent)
+	}
+}
