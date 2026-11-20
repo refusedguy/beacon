@@ -12,9 +12,14 @@
 // Honesty notes (also in docs/e2e/README.md):
 //  * The wake plugin used in the positive check is a copy of the working T0.3
 //    spike. It is NOT .opencode/plugins/beacon-bridge.js in this repository.
-//  * Seven tools prove the protocol and the contract. The handlers registered
-//    by mcp.NewServer are stubs, so no tool behaviour is claimed.
-//  * The negative check installs a no-op handler and requires the positive
+//  * mcp_go_sdk_CommandTransport proves the protocol and the seven-tool
+//    contract only. live_opencode_full_mcp_cycle calls the real handlers of
+//    `beacon mcp` and reads watchID, revision and verdict from their answers.
+//  * There is no CI poll daemon in this tree. The verdict in the full cycle is
+//    written into the durable store by an external driver, the way a daemon
+//    would; the verdict read back comes from the real wait_result/get_result
+//    handlers over CommandTransport, never from a value invented in this test.
+//  * Negative checks install no-op handlers and require the positive
 //    verification to fail. A harness that stays green with a stub is not e2e.
 
 package e2e_test
@@ -39,6 +44,10 @@ import (
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/refusedguy/beacon/internal/domain"
+	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 var (
@@ -529,22 +538,22 @@ func waitFacts(t *testing.T, stateDir, id, sessionID string, sse *sseCollector, 
 	}
 }
 
-// runWakeScenario starts opencode with the given plugin, writes one pointer to
-// events.jsonl and returns the facts that external observers recorded.
-func runWakeScenario(t *testing.T, base, pluginPath, tag string) (wakeFacts, string) {
+// newSession creates a session on a live server and returns its real id.
+func newSession(t *testing.T, srv *server) apiSession {
 	t.Helper()
-	srv := startServer(t, base, pluginPath)
-	defer stopServer(srv)
-
-	sessionResp := srv.api(t, "POST", "/api/session", "{}")
+	resp := srv.api(t, "POST", "/api/session", "{}")
 	var session apiSession
-	if err := json.Unmarshal(sessionResp.Data, &session); err != nil || session.ID == "" {
-		t.Fatalf("POST /api/session: %s (%v)", sessionResp.Data, err)
+	if err := json.Unmarshal(resp.Data, &session); err != nil || session.ID == "" {
+		t.Fatalf("POST /api/session: %s (%v)", resp.Data, err)
 	}
 	t.Logf("сессия: %s", session.ID)
+	return session
+}
 
-	// The plugin is loaded lazily; poll /api/plugin until it shows up.
-	var active pluginInfo
+// waitPluginActive polls /api/plugin until the real server reports the loaded
+// plugin. The plugin is loaded lazily, so a session must exist first.
+func waitPluginActive(t *testing.T, srv *server) pluginInfo {
+	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		listResp := srv.api(t, "GET", "/api/plugin", "")
@@ -554,24 +563,26 @@ func runWakeScenario(t *testing.T, base, pluginPath, tag string) (wakeFacts, str
 		}
 		for _, p := range plugins {
 			if p.ID == "beacon-bridge" {
-				active = p
-				break
+				t.Logf("/api/plugin beacon-bridge: source=%q path=%q status=%q server=%v",
+					p.Source.Type, p.Source.Path, p.State.Status, p.Features.Server)
+				if p.Source.Type == "local" && p.State.Status == "active" && p.Features.Server {
+					return p
+				}
 			}
-		}
-		if active.ID != "" {
-			break
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Logf("/api/plugin beacon-bridge: source=%q path=%q status=%q server=%v",
-		active.Source.Type, active.Source.Path, active.State.Status, active.Features.Server)
+	t.Fatal("плагин beacon-bridge не появился активным в /api/plugin за 20s")
+	return pluginInfo{}
+}
 
-	sse := startSSE(t, srv, session.ID)
-	defer sse.stop()
-
+// postWakePointer writes one event to events.jsonl. The loaded plugin polls
+// that file; this is a driver of an external event, not a fake handler.
+func postWakePointer(t *testing.T, base, tag, sessionID, text string) (string, string) {
+	t.Helper()
 	stateDir := filepath.Join(base, "state", "beacon")
 	id := "beacon-e2e-" + tag + "-" + fmt.Sprint(time.Now().UnixNano())
-	pointer := fmt.Sprintf(`{"id":%q,"sessionID":%q,"text":"beacon-e2e wake"}`+"\n", id, session.ID)
+	pointer := fmt.Sprintf(`{"id":%q,"sessionID":%q,"text":%q}`+"\n", id, sessionID, text)
 	f, err := os.OpenFile(filepath.Join(stateDir, "events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -580,9 +591,30 @@ func runWakeScenario(t *testing.T, base, pluginPath, tag string) (wakeFacts, str
 		t.Fatal(err)
 	}
 	_ = f.Close()
+	return id, fmt.Sprintf("id=%s session=%s", id, sessionID)
+}
 
-	facts := waitFacts(t, stateDir, id, session.ID, sse, 15*time.Second)
-	return facts, fmt.Sprintf("id=%s session=%s sse_lines=%d", id, session.ID, sse.count())
+// runWakeScenario starts opencode with the given plugin, writes one pointer to
+// events.jsonl and returns the facts that external observers recorded.
+func runWakeScenario(t *testing.T, base, pluginPath, tag string) (wakeFacts, string) {
+	return runWakeScenarioWithTimeout(t, base, pluginPath, tag, 15*time.Second)
+}
+
+func runWakeScenarioWithTimeout(t *testing.T, base, pluginPath, tag string, timeout time.Duration) (wakeFacts, string) {
+	t.Helper()
+	srv := startServer(t, base, pluginPath)
+	defer stopServer(srv)
+
+	session := newSession(t, srv)
+	waitPluginActive(t, srv)
+
+	sse := startSSE(t, srv, session.ID)
+	defer sse.stop()
+
+	stateDir := filepath.Join(base, "state", "beacon")
+	id, info := postWakePointer(t, base, tag, session.ID, "beacon-e2e wake")
+	facts := waitFacts(t, stateDir, id, session.ID, sse, timeout)
+	return facts, fmt.Sprintf("%s sse_lines=%d", info, sse.count())
 }
 
 // --- helpers ----------------------------------------------------------------
@@ -635,7 +667,7 @@ func tail(t *testing.T, path string) string {
 
 // frozenScenarioHash is sha256 of the sorted scenario names joined by "\n",
 // with no trailing newline. Recorded before the first run of this suite.
-const frozenScenarioHash = "ec28944e71a04357e310438abcb4544034734a9ef3c424644da811d2b31563d8"
+const frozenScenarioHash = "10243acbe29965cac6288c2cd06464a511d4ae9701468bd0c9dd7987e30002b3"
 
 type e2eScenario struct {
 	name string
@@ -649,6 +681,7 @@ var e2eScenarios = []e2eScenario{
 	{"mcp_go_sdk_CommandTransport", testMCPWithGoSDK},
 	{"mcp_inspector_optional", testInspectorOptional},
 	{"opencode_wake_with_reference_plugin", runWakePositive},
+	{"live_opencode_full_mcp_cycle", runLiveMCPCycle},
 	{"negative_control_stub_handler_must_fail", runNegativeControl},
 }
 
@@ -748,6 +781,246 @@ func runNegativeControl(t *testing.T, _ string) {
 	}
 	if facts.Receipt || facts.Posted || facts.PromptOK {
 		t.Fatal("заглушка записала квитанцию или вызвала prompt")
+	}
+}
+
+// --- T3.146: full cycle on a live opencode ----------------------------------
+
+// callE2ETool calls one tool over the official go-sdk session and decodes its
+// structured output. A stub answers {"ok":true}, which cannot decode into any
+// of the real contract shapes below, so a stub also fails on this boundary.
+func callE2ETool[T any](t *testing.T, ctx context.Context, session *mcpsdk.ClientSession,
+	name string, args any, meta mcpsdk.Meta) T {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: name, Arguments: args, Meta: meta,
+	})
+	if err != nil {
+		t.Fatalf("tools/call %s: %v", name, err)
+	}
+	if result.IsError {
+		t.Fatalf("tools/call %s: isError=true: %v", name, result.Content)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("tools/call %s: marshal structured content: %v", name, err)
+	}
+	var out T
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("tools/call %s: decode %T: %v (%s)", name, out, err, raw)
+	}
+	return out
+}
+
+// driveReadyVerdict is the external verdict driver. This tree has no CI poll
+// daemon, so the test plays the daemon's role at the file boundary: it applies
+// the domain verdict transition to the Watch that watch_pr persisted and
+// stages the obligation at the next revision. It never replaces a tool
+// handler. wait_result and get_result read the verdict back from the durable
+// store through their real implementations.
+func driveReadyVerdict(t *testing.T, stateDir, watchID, subscriberID string) (uint64, string) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(stateDir, "beacon.db"))
+	if err != nil {
+		t.Fatalf("open store for verdict driver: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	w, err := db.Watch(watchID)
+	if err != nil {
+		t.Fatalf("watch for verdict driver: %v", err)
+	}
+	now := time.Now().UTC()
+	next, effects := domain.Transition(w, domain.VerdictEvent(domain.VerdictReady, now))
+	if next.Verdict != domain.VerdictReady || next.Status != domain.StatusNotifying ||
+		next.Revision <= w.Revision || len(effects) == 0 {
+		t.Fatalf("вердикт не перевёл Watch: до %+v после %+v effects=%v", w, next, effects)
+	}
+	obligationID := domain.ObligationKey(next.ID, next.Revision, subscriberID)
+	err = db.SaveObligation(domain.Obligation{
+		ID: obligationID, WatchID: next.ID, Revision: next.Revision,
+		SubscriberID: subscriberID, VerdictPointer: next.Verdict, StagedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("stage obligation for verdict driver: %v", err)
+	}
+	if err := db.SaveWatch(next); err != nil {
+		t.Fatalf("save verdict: %v", err)
+	}
+	t.Logf("внешний драйвер вердикта: watch=%s revision %d→%d verdict=%s obligation=%s",
+		watchID, w.Revision, next.Revision, next.Verdict, obligationID)
+	return next.Revision, obligationID
+}
+
+// storedObligation reads the delivery facts from the durable store after the
+// cycle. This is an external file fact, not a value returned by a tool.
+func storedObligation(t *testing.T, stateDir, obligationID string) domain.Obligation {
+	t.Helper()
+	db, err := store.Open(filepath.Join(stateDir, "beacon.db"))
+	if err != nil {
+		t.Fatalf("open store for obligation check: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	o, err := db.Obligation(obligationID)
+	if err != nil {
+		t.Fatalf("stored obligation %s: %v", obligationID, err)
+	}
+	return o
+}
+
+func runLiveMCPCycle(t *testing.T, binary string) {
+	t.Helper()
+	base := newBase(t, "cycle")
+	stateDir := filepath.Join(base, "state", "beacon")
+
+	// A real opencode process with the real reference plugin. The session id
+	// comes from opencode api and is passed as the opaque _meta sessionID.
+	srv := startServer(t, base, filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge.js"))
+	defer stopServer(srv)
+	session := newSession(t, srv)
+	waitPluginActive(t, srv)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cmd := exec.Command(binary, "mcp")
+	cmd.Env = append(os.Environ(),
+		"XDG_STATE_HOME="+filepath.Join(base, "state"),
+		"BEACON_INIT_BYPASS=1",
+	)
+	transport := &mcpsdk.CommandTransport{Command: cmd, TerminateDuration: 2 * time.Second}
+	client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "beacon-e2e-cycle", Version: "1"}, nil)
+	mcpSession, err := client.Connect(ctx, transport, &mcpsdk.ClientSessionOptions{
+		ProtocolVersion: "2025-06-18",
+	})
+	if err != nil {
+		t.Fatalf("CommandTransport connect: %v", err)
+	}
+	defer func() { _ = mcpSession.Close() }()
+
+	// initialize: the cycle protocol is part of the handshake, not a tool.
+	init := mcpSession.InitializeResult()
+	if init == nil || init.ServerInfo == nil || init.ServerInfo.Name != beaconmcp.ServerName {
+		t.Fatalf("initialize: %+v", init)
+	}
+	if init.Instructions != beaconmcp.CycleInstructions {
+		t.Fatalf("initialize instructions != CycleInstructions: %q", init.Instructions)
+	}
+	for _, token := range []string{
+		"Beacon cycle protocol", "beacon_watch_pr", "beacon_wait_result",
+		"beacon_get_result", "beacon_ack", "waiting, watchID", "ready",
+	} {
+		if !strings.Contains(init.Instructions, token) {
+			t.Fatalf("в CycleInstructions нет %q", token)
+		}
+	}
+	t.Logf("initialize: %s %s protocol=%s cycle=%d байт", init.ServerInfo.Name,
+		init.ServerInfo.Version, init.ProtocolVersion, len(init.Instructions))
+
+	// tools/list: exactly the seven contracted names, no eighth summary tool.
+	tools, err := mcpSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	names := make([]string, 0, len(tools.Tools))
+	for _, tool := range tools.Tools {
+		names = append(names, tool.Name)
+	}
+	slices.Sort(names)
+	want := slices.Clone(beaconmcp.ToolNames)
+	slices.Sort(want)
+	if !slices.Equal(names, want) {
+		t.Fatalf("tools/list: получено %v, ожидалось %v", names, want)
+	}
+	t.Logf("tools/list: ровно %d инструментов: %v", len(names), names)
+
+	meta := mcpsdk.Meta{"ai.opencode/sessionID": session.ID}
+	watch := callE2ETool[beaconmcp.WatchPROutput](t, ctx, mcpSession, "beacon_watch_pr", map[string]any{
+		"repo": "refusedguy/beacon", "pr": 141,
+		"headSHA": "beacon-e2e-t3146-head", "role": string(domain.RoleExecutor),
+		"notify": map[string]any{"adapter": "opencode", "target": session.ID},
+	}, meta)
+	// A freshly registered Watch starts at revision 0; the first verdict
+	// transition bumps it. A stub would have no watchID at all.
+	if watch.WatchID == "" ||
+		watch.Status != string(domain.StatusWatching) || watch.Verdict != string(domain.VerdictWatching) {
+		t.Fatalf("beacon_watch_pr не записал Watch: %+v", watch)
+	}
+	t.Logf("beacon_watch_pr: watchID=%s revision=%d status=%s verdict=%s",
+		watch.WatchID, watch.Revision, watch.Status, watch.Verdict)
+
+	// The agent's turn report from CycleInstructions step 2 goes to a real
+	// opencode session through the loaded plugin, not through a test double.
+	report := "waiting, " + watch.WatchID
+	sse := startSSE(t, srv, session.ID)
+	defer sse.stop()
+	id, info := postWakePointer(t, base, "cycle", session.ID, report)
+	facts := waitFacts(t, stateDir, id, session.ID, sse, 15*time.Second)
+	if err := verifyWake(facts); err != nil {
+		t.Fatalf("плагин не доставил отчёт в живую сессию: %v", err)
+	}
+	t.Logf("отчёт по CycleInstructions доставлен в живую сессию: %q; %s facts=%+v", report, info, facts)
+
+	// External event driver, then the real handlers read the verdict back.
+	revision, obligationID := driveReadyVerdict(t, stateDir, watch.WatchID, session.ID)
+	wait := callE2ETool[beaconmcp.WaitReasonOutput](t, ctx, mcpSession, "beacon_wait_result", map[string]any{
+		"watchID": watch.WatchID, "timeoutMs": 5000, "clientRequestId": "t3146-" + watch.WatchID,
+	}, meta)
+	if wait.Verdict != string(domain.VerdictReady) || wait.Revision != revision ||
+		wait.Status != string(domain.StatusNotifying) {
+		t.Fatalf("beacon_wait_result: %+v, ждали verdict=ready revision=%d", wait, revision)
+	}
+	t.Logf("beacon_wait_result: verdict=%s revision=%d reason=%s", wait.Verdict, wait.Revision, wait.Reason)
+
+	result := callE2ETool[beaconmcp.GetResultOutput](t, ctx, mcpSession, "beacon_get_result", map[string]any{
+		"watchID": watch.WatchID,
+	}, meta)
+	if result.Verdict != string(domain.VerdictReady) || result.Revision != revision ||
+		result.ObligationID != obligationID {
+		t.Fatalf("beacon_get_result: %+v, ждали verdict=ready revision=%d obligation=%s",
+			result, revision, obligationID)
+	}
+	t.Logf("beacon_get_result: verdict=%s revision=%d obligation=%s", result.Verdict, result.Revision, result.ObligationID)
+
+	ack := callE2ETool[beaconmcp.OKOutput](t, ctx, mcpSession, "beacon_ack", map[string]any{
+		"watchID": watch.WatchID, "obligationID": result.ObligationID, "revision": result.Revision,
+	}, meta)
+	if !ack.OK {
+		t.Fatal("beacon_ack: ok=false")
+	}
+	o := storedObligation(t, stateDir, obligationID)
+	if o.ReadAt.IsZero() || o.ClaimedAt.IsZero() {
+		t.Fatalf("в store нет фактов доставки: readAt=%v claimedAt=%v", o.ReadAt, o.ClaimedAt)
+	}
+	t.Logf("beacon_ack: ok=true readAt=%s claimedAt=%s", o.ReadAt.Format(time.RFC3339), o.ClaimedAt.Format(time.RFC3339))
+
+	finalReport := fmt.Sprintf("ready, %s, revision %d", watch.WatchID, result.Revision)
+	if !strings.Contains(finalReport, watch.WatchID) || !strings.Contains(finalReport, result.Verdict) {
+		t.Fatalf("итоговый отчёт не собран из ответов обработчиков: %q", finalReport)
+	}
+	t.Logf("итоговый отчёт по CycleInstructions: %q", finalReport)
+
+	// Negative control 1: a stub handler answers ok:true even for invalid
+	// input and never writes a Watch. A real handler must refuse this call.
+	bad, badErr := mcpSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name:      "beacon_watch_pr",
+		Arguments: map[string]any{"repo": "", "pr": 141, "role": string(domain.RoleExecutor)},
+		Meta:      meta,
+	})
+	if badErr == nil && !bad.IsError {
+		t.Fatal("негативный контроль обработчика: заглушка ответила ok:true на пустой repo")
+	}
+	t.Logf("негативный контроль обработчика: пустой repo отклонён (%v)", badErr)
+
+	// Negative control 2: the same wake verification with a no-op plugin must
+	// fail, otherwise the loaded-plugin fact above proves nothing.
+	negFacts, negInfo := runWakeScenarioWithTimeout(t,
+		newBase(t, "cycle-negative"),
+		filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge-stub.js"),
+		"cycle-neg", 5*time.Second)
+	if err := verifyWake(negFacts); err == nil {
+		t.Fatal("негативный контроль плагина: заглушка прошла проверку пробуждения")
+	} else {
+		t.Logf("негативный контроль плагина: %s заглушка ожидаемо провалилась: %v", negInfo, err)
 	}
 }
 

@@ -19,14 +19,15 @@
 sha256(sort(names).join("\n"))
 ```
 
-Замороженное значение лежит в константе `frozenScenarioHash` и записано до
-первого прогона:
+Замороженное значение лежит в константе `frozenScenarioHash`. Оно пересмотрено
+20 ноября 2026 в карточке T3.146 (ADR 0061) после явного изменения набора:
 
 ```
-ec28944e71a04357e310438abcb4544034734a9ef3c424644da811d2b31563d8
+10243acbe29965cac6288c2cd06464a511d4ae9701468bd0c9dd7987e30002b3
 ```
 
-На момент записи в наборе пять сценариев:
+Хеш пересмотрен в карточке T3.146 (ADR 0061): в набор добавлен сценарий
+полного MCP-цикла на живом opencode. На момент записи в наборе шесть сценариев:
 
 | Имя | Что делает |
 | --- | --- |
@@ -34,7 +35,30 @@ ec28944e71a04357e310438abcb4544034734a9ef3c424644da811d2b31563d8
 | `mcp_go_sdk_CommandTransport` | MCP `initialize`, `tools/list`, `tools/call` через go-sdk |
 | `mcp_inspector_optional` | опциональный MCP Inspector |
 | `opencode_wake_with_reference_plugin` | пробуждение сессии эталонным плагином из `fixtures` |
+| `live_opencode_full_mcp_cycle` | полный цикл `initialize` → `tools/list` (7) → `watch_pr` → `wait_result` → `get_result` → `ack` → отчёт по `CycleInstructions` на живом opencode с эталонным плагином; реальные обработчики поверх go-sdk `CommandTransport` |
 | `negative_control_stub_handler_must_fail` | заглушка обязана провалить ту же проверку |
+
+### Полный цикл (T3.146)
+
+Сценарий поднимает отдельный `opencode serve` с эталонным плагином из
+`fixtures`, создаёт сессию через `opencode api POST /api/session` и 확인ляет
+плагин через `opencode api GET /api/plugin`. `watchID` берётся из ответа
+реального `beacon_watch_pr`, а `sessionID` живой сессии передаётся в `_meta`.
+Отчёт `waiting, watchID` из `CycleInstructions` пишется в `events.jsonl`, и
+загруженный плагин доставляет его в ту же сессию: факт доставки подтверждается
+`prompt.ok`, подпиской плагина и квитанцией.
+
+Демона опроса CI в этом дереве нет, поэтому вердикт в хранилище записывает
+внешний драйвер сценария через доменный переход `domain.Transition`. Он не
+подменяет обработчик: `beacon_wait_result` и `beacon_get_result` читают вердикт
+из постоянного store через реальные реализации и возвращают его по
+`CommandTransport`. `beacon_ack` оставляет `readAt` и `claimedAt` в obligation;
+оба факта читаются из store снаружи после цикла.
+
+Негативный контроль сценария двойной: пустой `repo` в `beacon_watch_pr`
+обязан дать ошибку (заглушка ответила бы `ok: true`), а та же проверка
+пробуждения с `fixtures/beacon-bridge-stub.js` обязана провалиться. Восьмого
+инструмента `summary` нет: отчёт это строка завершения обхода, а не вызов MCP.
 
 ## Проверка и отказ
 
