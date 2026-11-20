@@ -117,11 +117,14 @@ type FlakyConfig struct {
 const DefaultMaxWakesPerWatch = 6
 
 // Policy holds per-watch verification settings. MaxWakesPerWatch uses zero as
-// the unset value; WakeCap resolves it to DefaultMaxWakesPerWatch.
+// the unset value; WakeCap resolves it to DefaultMaxWakesPerWatch. MaxRebases
+// carries the project's rebase budget onto the Watch at registration; zero
+// means the project did not set one.
 type Policy struct {
 	RequireUpToDate  bool `json:"requireUpToDate"`
 	IgnoreReviews    bool `json:"ignoreReviews"`
 	MaxWakesPerWatch int  `json:"maxWakesPerWatch"`
+	MaxRebases       int  `json:"maxRebases,omitempty"`
 }
 
 // WakeCap returns the effective wake limit for a Watch. A zero or negative

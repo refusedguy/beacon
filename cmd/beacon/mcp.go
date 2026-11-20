@@ -320,6 +320,9 @@ func newMCPWaitResult(deps mcp.Dependencies) *mcp.WaitResultService {
 func newMCPServer(deps mcp.Dependencies) *mcpsdk.Server {
 	s := mcp.NewServerWithDeps(deps)
 	mcp.AttachWaitResult(s, newMCPWaitResult(deps))
+	// The generic server knows no project root. Bind watch_pr here so every
+	// Watch inherits this project's flaky set and layered limits.
+	mcp.AttachWatchPRWithConfig(s, deps, projectRootForConfig())
 	return s
 }
 
@@ -592,6 +595,12 @@ var newGitHubBatch = func(ctx context.Context, c *CLI) githubBatch {
 	}
 	return githubBatch{provider: github.NewBatchProvider(graph, rest, counter, opts...), counter: counter}
 }
+
+// defaultCIRepo keeps the identifier older callers read, but it no longer
+// carries a hardcoded owner/name. It resolves from the project config or the
+// git remote once at startup; a caller with an explicit --repo passes its own
+// value straight to the source.
+var defaultCIRepo = github.DetectRepoSlug(projectRootForConfig())
 
 // projectRootForConfig resolves the absolute project root used by the config
 // fallback of the orchestrator-id source.

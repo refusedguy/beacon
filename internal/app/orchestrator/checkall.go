@@ -73,6 +73,7 @@ const (
 // layers are merged.
 type Config struct {
 	MaxRebases     int         `json:"maxRebases" yaml:"maxRebases"`
+	Repo           string      `json:"repo,omitempty" yaml:"repo,omitempty"`
 	OrchestratorID string      `json:"orchestratorID" yaml:"orchestratorID"`
 	SlotsTotal     int         `json:"slotsTotal" yaml:"slotsTotal"`
 	WakeTarget     string      `json:"wakeTarget" yaml:"wakeTarget"`
@@ -183,6 +184,12 @@ func applyConfigFile(cfg *Config, path string) error {
 				return err
 			}
 			cfg.MaxRebases = n
+		case "repo":
+			s, err := configString(path, key, raw)
+			if err != nil {
+				return err
+			}
+			cfg.Repo = s
 		case "slotstotal":
 			n, err := configInt(path, key, raw)
 			if err != nil {
