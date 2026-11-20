@@ -85,6 +85,9 @@ type Watch struct {
 	Verdict  string
 	Revision uint64
 	Policy   *AutoMergePolicy
+	// Blocked carries the reason the executor blocked this Watch. Decide reads
+	// it first so a stale ready verdict can never turn into a merge.
+	Blocked *BlockedInfo
 }
 
 func (w Watch) autoMergeAllowed() bool {
