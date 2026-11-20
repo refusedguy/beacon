@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 type gitCall struct {
@@ -569,6 +570,31 @@ func TestRebaseAllNeedsUpdaterBeforePush(t *testing.T) {
 	}
 	if pushes := git.callsFor("push --force-with-lease origin feat/w311"); len(pushes) != 0 {
 		t.Errorf("branch was pushed without an updater: %+v", pushes)
+	}
+}
+
+func TestShouldSerialize(t *testing.T) {
+	now := time.Date(2026, time.November, 20, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name    string
+		enabled bool
+		merged  time.Time
+		want    bool
+	}{
+		{"disabled", false, now.Add(-30 * time.Second), false},
+		{"fresh merge", true, now.Add(-30 * time.Second), true},
+		{"old merge", true, now.Add(-10 * time.Minute), false},
+		{"just inside window", true, now.Add(-mergeQueueSerializeWindow + time.Second), true},
+		{"window boundary", true, now.Add(-mergeQueueSerializeWindow), false},
+		{"no previous merge", true, time.Time{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Rebaser{MergeQueueSerialize: tt.enabled}
+			if got := r.ShouldSerialize(tt.merged, now); got != tt.want {
+				t.Errorf("ShouldSerialize = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
