@@ -4,13 +4,13 @@
 
 - Закрыто done: **110**
 - Переведено dropped: **340**
-- Осталось реальных todo: **198**
+- Осталось реальных todo: **206**
 
 ## Приоритеты
 
-- P1: 16
-- P2: 68
-- P3: 114
+- P1: 17
+- P2: 71
+- P3: 118
 
 ## Реестр оставшихся todo
 
@@ -32,6 +32,7 @@
 | T3.235 | P1 | internal/infra/opencode/server.go, internal/domain/capabilities.go |
 | T3.237 | P1 | internal/app/orchestrator/daemon.go, internal/infra/store/db.go |
 | T5.55 | P1 | cmd/beacon/registry_sync.go, cmd/beacon/registry_sync_test.go |
+| S2.005 | P1 | internal/infra/httpapi/server.go, internal/infra/httpapi/client.go |
 | BS.1 | P2 | cmd/beacon/daemon.go, internal/infra/store/db.go |
 | BS.2 | P2 | cmd/beacon/daemon.go, internal/infra/observe/metrics.go |
 | BS.23 | P2 | cmd/beacon/task.go, internal/app/orchestrator/workload.go |
@@ -50,6 +51,7 @@
 | HD-009 | P2 | docs/templates/executor-task.md, .opencode/skills/red-verdict-triage/SKILL.md |
 | HD-011 | P2 | AGENTS.md, tools/worktree/ |
 | HD-018 | P2 | docs/templates/executor-task.md, AGENTS.md |
+| HD-023 | P2 | cmd/beacon/commands.go, tools/beacon-gates/gate/gate.go |
 | HD-029 | P2 | AGENTS.md, docs/templates/executor-task.md |
 | HD-037 | P2 | tools/beacon-gates/gate/gate.go, evals/main.go |
 | HD-057 | P2 | tools/beacon-gates/gate/gate.go, AGENTS.md |
@@ -65,6 +67,8 @@
 | HD-105 | P2 | docs/SKILL-MAP.md, docs/adrs/0253-harbor-beacon.md |
 | HD-107 | P2 | .opencode/skills/gate-result/SKILL.md, tools/beacon-gates/gate/gate.go, docs/templates/executor-task.md |
 | HD-119 | P2 | tools/beacon-gates/gate/gate.go, tools/beacon-gates/gate/gate_test.go, docs/AGENT-RULES.md |
+| S3.005 | P2 | internal/infra/wake/acp.go, internal/infra/wake/acp_test.go |
+| S6.008 | P2 | internal/infra/httpapi/server.go, internal/infra/httpapi/server_test.go |
 | T3.234 | P2 | internal/infra/mcp/server.go, internal/infra/mcp/tool_wait_result.go |
 | T3.236 | P2 | internal/infra/mcp/server.go, internal/infra/mcp/tool_get_result.go |
 | T3.238 | P2 | internal/infra/mcp/tool_wake.go, internal/domain/types.go |
@@ -109,6 +113,7 @@
 | BS.38 | P3 | cmd/beacon/watch.go, cmd/beacon/attach.go |
 | BS.39 | P3 | cmd/beacon/watch.go, internal/infra/mcp/tool_ack.go |
 | BS.4 | P3 | cmd/beacon/main.go, internal/infra/mcp/tool_stats.go |
+| BS.6 | P3 | cmd/beacon/mcp.go, internal/infra/httpapi/client.go |
 | BS.40 | P3 | internal/infra/mcp/server.go, internal/infra/observe/query.go |
 | BS.42 | P3 | cmd/beacon/mcp.go, internal/infra/mcp/server.go |
 | BS.43 | P3 | internal/infra/mcp/server.go, cmd/beacon/mcp.go |
@@ -170,6 +175,7 @@
 | HD-106 | P3 | docs/SKILL-MAP.md, AGENTS.md |
 | HD-120 | P3 | AGENTS.md, docs/templates/executor-task.md |
 | HD-121 | P3 | AGENTS.md |
+| T3.217 | P3 | internal/infra/wake/registry.go, cmd/beacon/deliver.go, docs/evals/w05-pi-rpc-wake.md |
 | T3.240 | P3 | docs/design/, docs/adrs/ |
 | T3.243 | P3 | .opencode/plugins/beacon-bridge.js, internal/infra/wake/notify.go |
 | T3.244 | P3 | .opencode/plugins/beacon-bridge.js, internal/infra/wake/notify.go |
@@ -179,9 +185,11 @@
 | T3.249 | P3 | internal/infra/observe/log.go, internal/infra/observe/query.go |
 | T3.250 | P3 | cmd/beacon/logs.go, internal/infra/observe/query.go |
 | T3.279 | P3 | internal/infra/wake/acp.go, internal/infra/wake/acp_test.go |
+| T3.284 | P3 | internal/infra/httpapi/server.go, internal/infra/httpapi/client.go |
 | T3.285 | P3 | internal/infra/wake/acp.go, internal/infra/wake/acp_test.go |
 | T3.342 | P3 | tests/chaos/, tests/e2e/ |
 | T3.350 | P3 | evals/main.go, evals/README.md |
+| T3.360 | P3 | internal/infra/store/redaction.go, internal/infra/observe/log.go |
 | T3.378 | P3 | internal/infra/webhook/workflow_run.go, internal/infra/webhook/workflow_run_test.go |
 | T3.393 | P3 | internal/infra/observe/otel.go, cmd/beacon/observe.go |
 | T3.394 | P3 | internal/app/orchestrator/daemon.go, internal/infra/cibridge/bridge.go, internal/infra/wake/deliver.go |
