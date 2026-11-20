@@ -1,5 +1,6 @@
 # BS.28. Signature, filters и dedupe вебхука
 Статус: done
+Обоснование: функциональность уже в main. PR #461 (commit c3ca04b) добавил internal/infra/webhook/filters.go ровно в OwnerFiles карточки. Filter фильтрует по событию, ветке и автору через FilterConfig, дедуплицирует по delivery ID и head SHA, возвращает (Decision, reason) для аудита; Decision.Publish() истинно только на DecisionAccept, поэтому отфильтрованное событие не порождает outbox. Дубля в OwnerFiles нет, код не писался.
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/webhook/filters.go
