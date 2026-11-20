@@ -3,6 +3,7 @@ package opencode
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,7 +14,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 const (
@@ -189,4 +193,254 @@ func EnsureServer(ctx context.Context) (Config, error) {
 		return Config{}, err
 	}
 	return Config{URL: baseURL, Password: password}, nil
+}
+
+// Scope-token store (T3.235). A token is a bearer credential bound to one
+// environment, parent thread, provider instance and provider session. It has a
+// privilege ceiling (the domain.ScopeMask it may never exceed), an absolute
+// TTL and an idle TTL. The store keeps only a SHA-256 digest of the raw token:
+// the raw value is returned by Issue once and never written to state or shown
+// in diagnostics.
+
+const (
+	defaultScopeTTL     = 30 * time.Minute
+	defaultScopeIdleTTL = 10 * time.Minute
+)
+
+// Scope-token validation errors. They are sentinels so a handler can map a
+// failure to a status without parsing a message.
+var (
+	ErrScopeTokenUnknown    = errors.New("scope token: неизвестный токен")
+	ErrScopeTokenExpired    = errors.New("scope token: истёк срок действия")
+	ErrScopeTokenIdle       = errors.New("scope token: истёк срок неактивности")
+	ErrScopeSessionMismatch = errors.New("scope token: сессия не совпадает")
+	ErrScopeDenied          = errors.New("scope token: право не выдано")
+	ErrScopeInvalidIssue    = errors.New("scope token: неверные параметры выдачи")
+)
+
+// ScopeBinding is the identity a token is bound to. All four dimensions are
+// recorded at issue time and returned by a successful check. Session is also
+// the revocation key.
+type ScopeBinding struct {
+	Environment  string
+	ParentThread string
+	Provider     string
+	Session      string
+}
+
+// ScopeTokenIssue describes the token to issue. Ceiling is the maximal set of
+// rights the token may ever exercise; zero or negative TTL and IdleTTL fall
+// back to the store defaults.
+type ScopeTokenIssue struct {
+	Binding ScopeBinding
+	Ceiling domain.ScopeMask
+	TTL     time.Duration
+	IdleTTL time.Duration
+}
+
+// scopeTokenRecord is the only per-token state the store keeps. The raw token
+// is absent by design; the map key is its digest.
+type scopeTokenRecord struct {
+	binding   ScopeBinding
+	ceiling   domain.ScopeMask
+	issuedAt  time.Time
+	expiresAt time.Time
+	lastUsed  time.Time
+	idleTTL   time.Duration
+}
+
+// scopeWallClock adapts the wall clock to domain.Clock.
+type scopeWallClock struct{}
+
+func (scopeWallClock) Now() time.Time { return time.Now().UTC() }
+
+// ScopeTokenStore issues, validates and revokes scope tokens. It is safe for
+// concurrent use by handlers.
+type ScopeTokenStore struct {
+	mu        sync.Mutex
+	clock     domain.Clock
+	ttl       time.Duration
+	idleTTL   time.Duration
+	tokens    map[string]*scopeTokenRecord
+	bySession map[string]map[string]struct{}
+}
+
+// NewScopeTokenStore builds an empty store. A nil clock uses the wall clock;
+// non-positive durations use the package defaults. Tests inject a clock and
+// short durations so TTL and idle expiry are deterministic.
+func NewScopeTokenStore(clock domain.Clock, ttl, idleTTL time.Duration) *ScopeTokenStore {
+	if clock == nil {
+		clock = scopeWallClock{}
+	}
+	if ttl <= 0 {
+		ttl = defaultScopeTTL
+	}
+	if idleTTL <= 0 {
+		idleTTL = defaultScopeIdleTTL
+	}
+	return &ScopeTokenStore{
+		clock:     clock,
+		ttl:       ttl,
+		idleTTL:   idleTTL,
+		tokens:    make(map[string]*scopeTokenRecord),
+		bySession: make(map[string]map[string]struct{}),
+	}
+}
+
+// Issue creates a token for in.Binding and returns its raw value once. Only
+// the digest is stored. A non-empty Session and a mask containing only known
+// scope bits are required; a zero ceiling is valid but grants no right.
+func (s *ScopeTokenStore) Issue(in ScopeTokenIssue) (string, error) {
+	if strings.TrimSpace(in.Binding.Session) == "" || !in.Ceiling.Valid() {
+		return "", ErrScopeInvalidIssue
+	}
+	ttl, idleTTL := s.ttl, s.idleTTL
+	if in.TTL > 0 {
+		ttl = in.TTL
+	}
+	if in.IdleTTL > 0 {
+		idleTTL = in.IdleTTL
+	}
+	raw, err := randomPassword()
+	if err != nil {
+		return "", err
+	}
+	digest := scopeTokenDigest(raw)
+	now := s.clock.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokens[digest] = &scopeTokenRecord{
+		binding:   in.Binding,
+		ceiling:   in.Ceiling,
+		issuedAt:  now,
+		expiresAt: now.Add(ttl),
+		lastUsed:  now,
+		idleTTL:   idleTTL,
+	}
+	if s.bySession[in.Binding.Session] == nil {
+		s.bySession[in.Binding.Session] = make(map[string]struct{})
+	}
+	s.bySession[in.Binding.Session][digest] = struct{}{}
+	return raw, nil
+}
+
+// Authorize validates raw for the requested scope and session. On success it
+// refreshes the idle window and returns the binding. Absolute expiry, idle
+// expiry, a session mismatch or a right outside the ceiling all fail closed;
+// an expired or idle token is also removed so it cannot linger in state.
+func (s *ScopeTokenStore) Authorize(raw string, scope domain.Scope, session string) (ScopeBinding, error) {
+	digest := scopeTokenDigest(raw)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec := s.tokens[digest]
+	if rec == nil {
+		return ScopeBinding{}, ErrScopeTokenUnknown
+	}
+	now := s.clock.Now().UTC()
+	if !now.Before(rec.expiresAt) {
+		s.dropLocked(digest)
+		return ScopeBinding{}, ErrScopeTokenExpired
+	}
+	if now.Sub(rec.lastUsed) >= rec.idleTTL {
+		s.dropLocked(digest)
+		return ScopeBinding{}, ErrScopeTokenIdle
+	}
+	if rec.binding.Session != session {
+		return ScopeBinding{}, ErrScopeSessionMismatch
+	}
+	if !rec.ceiling.Allows(scope) {
+		return ScopeBinding{}, ErrScopeDenied
+	}
+	rec.lastUsed = now
+	return rec.binding, nil
+}
+
+// AuthorizeWake, AuthorizeRead and AuthorizeStop are the handler-facing checks.
+// They differ only in the right they require, which is what keeps wake, status
+// reads and stop separate.
+func (s *ScopeTokenStore) AuthorizeWake(raw, session string) (ScopeBinding, error) {
+	return s.Authorize(raw, domain.ScopeWake, session)
+}
+
+func (s *ScopeTokenStore) AuthorizeRead(raw, session string) (ScopeBinding, error) {
+	return s.Authorize(raw, domain.ScopeRead, session)
+}
+
+func (s *ScopeTokenStore) AuthorizeStop(raw, session string) (ScopeBinding, error) {
+	return s.Authorize(raw, domain.ScopeStop, session)
+}
+
+// RevokeSession removes every token bound to session and returns how many
+// were removed. It is idempotent: an unknown session revokes nothing.
+func (s *ScopeTokenStore) RevokeSession(session string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	set := s.bySession[session]
+	n := len(set)
+	for digest := range set {
+		delete(s.tokens, digest)
+	}
+	delete(s.bySession, session)
+	return n
+}
+
+// ScopeTokenDiagnostic is a sanitized view of one stored token. It carries no
+// raw token and no digest, so it is safe to log.
+type ScopeTokenDiagnostic struct {
+	Environment  string
+	ParentThread string
+	Provider     string
+	Session      string
+	Scopes       []domain.Scope
+	IssuedAt     time.Time
+	ExpiresAt    time.Time
+	LastUsed     time.Time
+}
+
+// Diagnostics returns one sanitized entry per live token. The raw token is
+// held only by the caller that received it from Issue, never by the store.
+func (s *ScopeTokenStore) Diagnostics() []ScopeTokenDiagnostic {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ScopeTokenDiagnostic, 0, len(s.tokens))
+	for _, rec := range s.tokens {
+		scopes := make([]domain.Scope, 0, 3)
+		for _, sc := range domain.ValidScopes() {
+			if rec.ceiling.Allows(sc) {
+				scopes = append(scopes, sc)
+			}
+		}
+		out = append(out, ScopeTokenDiagnostic{
+			Environment:  rec.binding.Environment,
+			ParentThread: rec.binding.ParentThread,
+			Provider:     rec.binding.Provider,
+			Session:      rec.binding.Session,
+			Scopes:       scopes,
+			IssuedAt:     rec.issuedAt,
+			ExpiresAt:    rec.expiresAt,
+			LastUsed:     rec.lastUsed,
+		})
+	}
+	return out
+}
+
+// dropLocked removes a record by digest. The caller must hold s.mu.
+func (s *ScopeTokenStore) dropLocked(digest string) {
+	rec := s.tokens[digest]
+	if rec == nil {
+		return
+	}
+	delete(s.tokens, digest)
+	if set := s.bySession[rec.binding.Session]; set != nil {
+		delete(set, digest)
+		if len(set) == 0 {
+			delete(s.bySession, rec.binding.Session)
+		}
+	}
+}
+
+// scopeTokenDigest hashes a raw token so state never holds a usable bearer.
+func scopeTokenDigest(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
 }

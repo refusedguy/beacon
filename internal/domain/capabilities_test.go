@@ -169,3 +169,124 @@ func TestParseCapabilities(t *testing.T) {
 		}
 	})
 }
+
+func TestScopeDictionary(t *testing.T) {
+	canonical := []Scope{ScopeWake, ScopeRead, ScopeStop}
+	for _, sc := range canonical {
+		if !sc.Valid() {
+			t.Errorf("canonical scope %q is not valid", sc)
+		}
+		if got, ok := ParseScope(string(sc)); !ok || got != sc {
+			t.Errorf("ParseScope(%q) = %q, %v; want %q, true", sc, got, ok, sc)
+		}
+	}
+
+	for _, raw := range []string{"", "  ", "WAKE", "executor", "stop,wake", "delete"} {
+		if Scope(raw).Valid() {
+			t.Errorf("unknown scope %q is valid", raw)
+		}
+		if got, ok := ParseScope(raw); ok || got != "" {
+			t.Errorf("ParseScope(%q) = %q, %v; want empty, false", raw, got, ok)
+		}
+	}
+
+	if got, ok := ParseScope("  read\n"); !ok || got != ScopeRead {
+		t.Errorf("ParseScope must trim whitespace, got %q, %v", got, ok)
+	}
+
+	scopes := ValidScopes()
+	if !reflect.DeepEqual(scopes, canonical) {
+		t.Fatalf("ValidScopes() = %v", scopes)
+	}
+	scopes[0] = Scope("mutated")
+	if ValidScopes()[0] != ScopeWake {
+		t.Fatal("ValidScopes returned a shared slice")
+	}
+}
+
+func TestScopeMaskCeiling(t *testing.T) {
+	ceiling := ScopeWake.Flag() | ScopeRead.Flag()
+	for _, sc := range []Scope{ScopeWake, ScopeRead} {
+		if !ceiling.Allows(sc) {
+			t.Errorf("ceiling %08b must allow %q", ceiling, sc)
+		}
+	}
+	if ceiling.Allows(ScopeStop) {
+		t.Fatal("ceiling without stop granted stop")
+	}
+	if ceiling.Allows(Scope("delete")) {
+		t.Fatal("unknown scope was granted")
+	}
+
+	var none ScopeMask
+	if none.Allows(ScopeWake) || none.Allows(ScopeRead) || none.Allows(ScopeStop) {
+		t.Fatal("zero ceiling granted a right")
+	}
+	if !none.Valid() {
+		t.Fatal("zero ceiling must be valid")
+	}
+	if (ScopeMask(0xff)).Valid() {
+		t.Fatal("ceiling with unknown bits reported valid")
+	}
+
+	all := ScopeFlagWake | ScopeFlagRead | ScopeFlagStop
+	for _, sc := range ValidScopes() {
+		if !all.Allows(sc) {
+			t.Errorf("full ceiling must allow %q", sc)
+		}
+	}
+}
+
+func TestParseScopes(t *testing.T) {
+	t.Run("set semantics and order", func(t *testing.T) {
+		got, err := ParseScopes([]string{"stop", " wake ", "read", "wake"})
+		if err != nil {
+			t.Fatalf("ParseScopes: %v", err)
+		}
+		want := ScopeWake.Flag() | ScopeRead.Flag() | ScopeStop.Flag()
+		if got != want {
+			t.Fatalf("ParseScopes() = %08b, want %08b", got, want)
+		}
+	})
+
+	t.Run("empty list grants nothing", func(t *testing.T) {
+		got, err := ParseScopes(nil)
+		if err != nil {
+			t.Fatalf("ParseScopes(nil): %v", err)
+		}
+		if got != 0 {
+			t.Fatalf("ParseScopes(nil) = %08b, want zero", got)
+		}
+	})
+
+	t.Run("rejects unknown and names it", func(t *testing.T) {
+		got, err := ParseScopes([]string{"wake", "teleport"})
+		if err == nil {
+			t.Fatal("unknown scope was accepted")
+		}
+		if got != 0 {
+			t.Fatalf("failed parse returned %08b, want zero", got)
+		}
+		var app *AppError
+		if !errors.As(err, &app) || app.Code != CodeInvalidInput {
+			t.Fatalf("error = %v, want INVALID_INPUT AppError", err)
+		}
+		if !strings.Contains(app.Message, "teleport") {
+			t.Fatalf("error message does not name the unknown scope: %q", app.Message)
+		}
+	})
+}
+
+// TestScopeTokensDoNotAlterRoles guards the constraint that adding scope rights
+// does not widen the existing role dictionary.
+func TestScopeTokensDoNotAlterRoles(t *testing.T) {
+	want := []Role{RoleExecutor, RoleOrchestrator, RoleFixer}
+	if got := ValidRoles(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ValidRoles() = %v, want %v", got, want)
+	}
+	for _, r := range want {
+		if got, ok := ParseRole(string(r)); !ok || got != r {
+			t.Errorf("ParseRole(%q) = %q, %v; want %q, true", r, got, ok, r)
+		}
+	}
+}
