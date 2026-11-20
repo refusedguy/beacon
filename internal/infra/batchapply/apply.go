@@ -26,39 +26,39 @@ type Options struct {
 }
 
 type batch struct {
-	SourceReports  []string       `json:"source_reports"`
-	ADRs           []adr          `json:"adrs"`
-	Cards          []card         `json:"cards"`
-	Evals          []evalCase     `json:"evals"`
+	SourceReports  []string        `json:"source_reports"`
+	ADRs           []adr           `json:"adrs"`
+	Cards          []card          `json:"cards"`
+	Evals          []evalCase      `json:"evals"`
 	MergeDecisions []mergeDecision `json:"merge_decisions"`
-	CardClosures   []cardClosure  `json:"card_closures"`
+	CardClosures   []cardClosure   `json:"card_closures"`
 }
 
 type adr struct {
-	Number      int    `json:"number"`
-	Title       string `json:"title"`
-	Status      string `json:"status"`
-	Context     string `json:"context"`
-	Decision    string `json:"decision"`
+	Number       int    `json:"number"`
+	Title        string `json:"title"`
+	Status       string `json:"status"`
+	Context      string `json:"context"`
+	Decision     string `json:"decision"`
 	Consequences string `json:"consequences"`
 }
 
 type card struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Status      string   `json:"status"`
-	Phase       string   `json:"phase"`
-	Type        string   `json:"type"`
-	OwnerFiles  []string `json:"owner_files"`
-	Deps        []string `json:"deps"`
-	ADR         string   `json:"adr"`
-	Agent       string   `json:"agent"`
-	Time        string   `json:"time"`
-	Goal        string   `json:"goal"`
-	Context     string   `json:"context"`
-	Steps       string   `json:"steps"`
-	Check       string   `json:"check"`
-	Acceptance  string   `json:"acceptance"`
+	ID         string   `json:"id"`
+	Title      string   `json:"title"`
+	Status     string   `json:"status"`
+	Phase      string   `json:"phase"`
+	Type       string   `json:"type"`
+	OwnerFiles []string `json:"owner_files"`
+	Deps       []string `json:"deps"`
+	ADR        string   `json:"adr"`
+	Agent      string   `json:"agent"`
+	Time       string   `json:"time"`
+	Goal       string   `json:"goal"`
+	Context    string   `json:"context"`
+	Steps      string   `json:"steps"`
+	Check      string   `json:"check"`
+	Acceptance string   `json:"acceptance"`
 }
 
 type evalCase struct {
@@ -78,6 +78,8 @@ type cardClosure struct {
 	ID       string `json:"id"`
 	PR       int    `json:"pr"`
 	MergedAt string `json:"merged_at"`
+	Status   string `json:"status"`
+	Reason   string `json:"reason"`
 }
 
 type ghCheck struct {
@@ -249,6 +251,36 @@ func renderEval(e evalCase) string {
 	return b.String()
 }
 
+// closureConfirmation renders the body of the "## Подтверждение" section.
+// A dropped card records why it was closed so the decision stays auditable;
+// the done variant is byte-for-byte the original MERGED line.
+func closureConfirmation(c cardClosure, status string) string {
+	if status == "dropped" {
+		line := fmt.Sprintf("- PR #%d DROPPED", c.PR)
+		if reason := strings.TrimRight(strings.TrimSpace(c.Reason), "."); reason != "" {
+			line += ": " + reason
+		}
+		return line + ".\n"
+	}
+	return fmt.Sprintf("- PR #%d MERGED: %s (squash).\n", c.PR, c.MergedAt)
+}
+
+// applyClosureToCard rewrites one card for a closure. Only "dropped" changes
+// the status line; every other value keeps the original "done" behaviour.
+// The function is idempotent: a card that already has a confirmation section
+// is returned unchanged, so reapplying a batch never duplicates a reason.
+func applyClosureToCard(text string, c cardClosure) string {
+	if strings.Contains(text, "## Подтверждение") {
+		return text
+	}
+	status := c.Status
+	if status != "dropped" {
+		status = "done"
+	}
+	text = strings.Replace(text, "Статус: todo", "Статус: "+status, 1)
+	return text + "\n## Подтверждение\n" + closureConfirmation(c, status)
+}
+
 func (r *runner) applyClosures(root string, closures map[string]cardClosure) error {
 	for id, c := range closures {
 		rel := filepath.Join("docs", "tasks", id+".md")
@@ -258,12 +290,11 @@ func (r *runner) applyClosures(root string, closures map[string]cardClosure) err
 			r.errf("WARN closure target missing: %s\n", rel)
 			continue
 		}
-		text := string(raw)
-		if strings.Contains(text, "## Подтверждение") {
+		original := string(raw)
+		text := applyClosureToCard(original, c)
+		if text == original {
 			continue
 		}
-		text = strings.Replace(text, "Статус: todo", "Статус: done", 1)
-		text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n", c.PR, c.MergedAt)
 		if err := r.writeFileMode(root, rel, text, true); err != nil {
 			return err
 		}
