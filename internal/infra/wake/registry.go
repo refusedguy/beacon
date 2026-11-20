@@ -93,6 +93,27 @@ func (r *Registry) Register(adapter string, d domain.WakeDeliverer) {
 	r.deliverers[adapter] = d
 }
 
+// DeliverToSubscriber dispatches a wake to one subscriber of w. The address
+// and the obligation are both checked against that subscriber before an
+// adapter is chosen, so no other party's session can receive the pointer.
+func (r *Registry) DeliverToSubscriber(ctx context.Context, w domain.Watch, p domain.WakePayload, subscriberID string) error {
+	target, err := SubscriberTarget(w, p.WatchID, subscriberID)
+	if err != nil {
+		return err
+	}
+	if want := domain.ObligationKey(p.WatchID, p.Revision, target); p.ObligationID != want {
+		return fmt.Errorf("wake: obligation %q does not belong to subscriber %q of watch %s", p.ObligationID, target, p.WatchID)
+	}
+	adapter := ""
+	for _, sub := range w.Subscribers {
+		if sub.ID == target {
+			adapter = sub.Adapter
+			break
+		}
+	}
+	return r.Deliver(ctx, adapter, target, p)
+}
+
 // Deliver resolves adapter to a deliverer and hands it the wake pointer. An
 // empty or unknown name falls back to opencode; a registered stub returns an
 // ErrUnsupported error and never reports a false success.

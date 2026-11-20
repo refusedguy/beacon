@@ -145,6 +145,12 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		Attempt:      1,
 		Delivery:     string(wake.T202DeliverySteer),
 	}
+	// The address and the obligation must name the same subscriber. A lookup
+	// that substitutes the current caller's session is refused before delivery.
+	if err := wake.ValidateT210Target(pointer); err != nil {
+		log.Printf("daemon: skip wake for watch %s: %v", watchID, err)
+		return fmt.Errorf("daemon: watch %s: %w", watchID, err)
+	}
 	receipt, delivered := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
 	if !delivered {
 		return fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
@@ -173,7 +179,8 @@ type daemonWakeAdapter struct {
 }
 
 func (a *daemonWakeAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
-	if p.Target == "" {
+	if err := wake.ValidateT210Target(p); err != nil {
+		log.Printf("daemon: skip wake bind for %s: %v", p.ObligationID, err)
 		return "", false
 	}
 	return wake.T210Target(p.Target), true
@@ -184,6 +191,12 @@ func (a *daemonWakeAdapter) Deliver(p wake.T210WakePointer, target wake.T210Targ
 		ObligationID: p.ObligationID,
 		Attempt:      p.Attempt,
 		Delivery:     string(wake.T202DeliverySteer),
+	}
+	// No session substitution at the adapter boundary either.
+	if string(target) != p.Target {
+		err := fmt.Errorf("daemon: target %q is not subscriber %q", target, p.Target)
+		receipt.Outcome = wake.T210Errored
+		return receipt, err
 	}
 	if a == nil || a.api == nil {
 		receipt.Outcome = wake.T210Errored
