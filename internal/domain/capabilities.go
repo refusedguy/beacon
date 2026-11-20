@@ -14,12 +14,13 @@ import (
 	"strings"
 )
 
-// Role is the subscriber role on a Watch. The two canonical values and their
+// Role is the subscriber role on a Watch. The canonical values and their
 // constants live in types.go; this dictionary adds validation so an author
-// file cannot declare an unknown role.
+// file cannot declare an unknown role. RoleFixer is a first-class role: a
+// fixer repairs a blocked Watch and is a valid wake addressee.
 func (r Role) Valid() bool {
 	switch r {
-	case RoleExecutor, RoleOrchestrator:
+	case RoleExecutor, RoleOrchestrator, RoleFixer:
 		return true
 	default:
 		return false
@@ -37,7 +38,7 @@ func ParseRole(s string) (Role, bool) {
 	return r, true
 }
 
-var roleValues = []Role{RoleExecutor, RoleOrchestrator}
+var roleValues = []Role{RoleExecutor, RoleOrchestrator, RoleFixer}
 
 // ValidRoles returns the canonical roles in declaration order. The returned
 // slice is a copy, so a caller cannot mutate the dictionary.
