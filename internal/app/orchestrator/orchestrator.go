@@ -338,12 +338,13 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 
 // handleBlocked turns one blocked Watch into exactly one decision per pass.
 // Decide owns the FIX-attempt cap: below the cap the Watch asks for another FIX
-// agent and the pass records one attempt; at the cap the Watch is escalated to
-// a human. There is no direct fixer spawn in this process, so one
-// BLOCKED_FIX_AGENT decision is one fixer attempt. The switch in RunWithResolver
-// calls this once per Watch, which keeps a single decision from incrementing
-// the counter twice or emitting the metric twice.
-func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyResolver, opts Options, out *Result, errs *[]error) {
+// agent; at the cap the Watch is escalated to a human. There is no direct fixer
+// spawn in this process, so one BLOCKED_FIX_AGENT decision is one reported
+// attempt. The pass never persists an attempt: a three-minute tick would charge
+// one per tick without a fixer actually running. The switch in RunWithResolver
+// calls this once per Watch, which keeps a single decision from emitting the
+// metric twice.
+func handleBlocked(_ context.Context, _ Store, w Watch, resolver DependencyResolver, opts Options, out *Result, _ *[]error) {
 	d := Decide(w, resolver, CIState{})
 	if d.Kind == DecisionNotifyOrchestrator && d.Reason == ReasonEscalateHuman {
 		observe.BlockEscalated(w.ID, ReasonEscalateHuman)
@@ -363,13 +364,8 @@ func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyRe
 	if opts.DryRun {
 		return
 	}
-	if err := st.RecordFixAttempt(ctx, w.ID); err != nil {
-		observe.ActorError("fix-attempt-store", w.ID, err)
-		*errs = append(*errs, fmt.Errorf("orchestrator: record fix attempt %s: %w", w.ID, err))
-		return
-	}
-	// The metric follows a persisted attempt, so a failed write cannot look
-	// like a spawned fixer.
+	// The metric records the decision, not a persisted counter increment.
+	// Persisting belongs to the path that actually spawns a fixer.
 	observe.FixerSpawned(w.ID)
 }
 

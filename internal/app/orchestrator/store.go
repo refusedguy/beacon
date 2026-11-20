@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -120,16 +119,26 @@ func (s *DBStore) RecordFixAttempt(ctx context.Context, watchID string) error {
 	return s.db.SaveWatch(next)
 }
 
-// CloseWatch closes the Watch for every subscriber using the same operation
-// as beacon_cancel_watch with scope=all: a domain transition, a persisted
-// Watch and one append-only audit event. A nil clock keeps the wall-clock
-// default of the cancel handler.
+// CloseWatch marks a Watch closed as merged. The periodic pass must not route
+// through mcp.NewCancelWatcher: that records closeReason="cancelled" for a PR
+// the hosting service actually merged. Setting the three fields directly keeps
+// the audit reason honest; a Watch that is already closed is left untouched.
 func (s *DBStore) CloseWatch(ctx context.Context, watchID string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("orchestrator: watch store is nil")
 	}
-	canceller := mcp.NewCancelWatcher(s.db, mcp.NewSQLCancelEventLog(s.db), nil)
-	return canceller.Cancel(ctx, watchID, mcp.CancelScopeAll, "")
+	_ = ctx
+	w, err := s.db.Watch(watchID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: load watch %s for close: %w", watchID, err)
+	}
+	if w.Status == "closed" {
+		return nil
+	}
+	w.Status = "closed"
+	w.Verdict = "merged"
+	w.CloseReason = "merged"
+	return s.db.SaveWatch(w)
 }
 
 // mergeFields mirrors the domain MergePolicy persisted under "mergePolicy".
