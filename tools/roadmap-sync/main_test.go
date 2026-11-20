@@ -80,6 +80,136 @@ func newFixture(t *testing.T) (repo, logPath string) {
 	return repo, logPath
 }
 
+// newDuplicateFixture builds cards whose OwnerFiles sets exercise the second
+// pass. T3.103 is merged by commit; BS.25 lists the same two files in the
+// opposite order and is not named in the commit. The remaining cards guard the
+// dropped, empty and different-OwnerFiles cases.
+func newDuplicateFixture(t *testing.T) (repo, logPath string) {
+	t.Helper()
+	repo = t.TempDir()
+	logPath = filepath.Join(repo, "git-log.txt")
+	writeFixtureFile(t, logPath, "feat: webhook receiver (T3.103) (#201)\n")
+
+	cards := map[string]string{
+		"T3.103.md": "# T3.103\nСтатус: todo\nФаза: P1\nВладелец файлов: internal/infra/webhook/receiver.go, internal/infra/webhook/receiver_test.go\n",
+		"BS.25.md":  "# BS.25\nСтатус: todo\nФаза: P2\nВладелец файлов: internal/infra/webhook/receiver_test.go, internal/infra/webhook/receiver.go\n",
+		"BS.19.md":  "# BS.19\nСтатус: dropped\nФаза: P1\nВладелец файлов: internal/infra/webhook/receiver.go, internal/infra/webhook/receiver_test.go\n",
+		"BS.23.md":  "# BS.23\nСтатус: todo\nФаза: P1\nВладелец файлов:\n",
+		"BS.26.md":  "# BS.26\nСтатус: todo\nФаза: P3\nВладелец файлов: internal/infra/store/webhook_events.go\n",
+	}
+	for name, content := range cards {
+		writeFixtureFile(t, filepath.Join(repo, "docs", "tasks", name), content)
+	}
+	writeFixtureFile(t, filepath.Join(repo, "docs", "ROADMAP_STATUS.md"), `# Beacon roadmap status
+
+- Закрыто done: **0**
+- Переведено dropped: **0**
+- Осталось реальных todo: **0**
+
+## Приоритеты
+`)
+	return repo, logPath
+}
+
+func TestNormalizeOwnerFilesIgnoresOrderAndDecoration(t *testing.T) {
+	want := normalizeOwnerFiles("a.go, b.go")
+	for _, value := range []string{
+		"a.go, b.go",
+		"b.go, a.go",
+		" b.go , `a.go` ",
+		"- b.go\n- a.go",
+	} {
+		if got := normalizeOwnerFiles(value); got != want {
+			t.Errorf("normalizeOwnerFiles(%q) = %q, want %q", value, got, want)
+		}
+	}
+	for _, value := range []string{"", "   ", ", ,"} {
+		if got := normalizeOwnerFiles(value); got != "" {
+			t.Errorf("normalizeOwnerFiles(%q) = %q, want empty", value, got)
+		}
+	}
+}
+
+func TestResolveDuplicateCardsByOwnerFiles(t *testing.T) {
+	repo, logPath := newDuplicateFixture(t)
+	ids := scanGitLog(strings.Split(strings.TrimSpace(readFixtureFile(t, logPath)), "\n")).ids
+	cards, err := readCards(repo, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]card{}
+	for _, c := range cards {
+		byID[c.id] = c
+	}
+
+	if got := byID["T3.103"].resolved; got != statusDone {
+		t.Errorf("merged card T3.103 resolved = %q, want done", got)
+	}
+	if got := byID["BS.25"].resolved; got != statusDone {
+		t.Errorf("duplicate BS.25 resolved = %q, want done", got)
+	}
+	if got := byID["BS.25"].duplicateOf; got != "T3.103" {
+		t.Errorf("BS.25 duplicateOf = %q, want T3.103", got)
+	}
+	if got := byID["BS.19"].resolved; got != statusDropped {
+		t.Errorf("dropped BS.19 resolved = %q, want dropped", got)
+	}
+	if got := byID["BS.23"].resolved; got != statusTodo {
+		t.Errorf("empty OwnerFiles BS.23 resolved = %q, want todo", got)
+	}
+	if got := byID["BS.26"].resolved; got != statusTodo {
+		t.Errorf("different OwnerFiles BS.26 resolved = %q, want todo", got)
+	}
+}
+
+func TestRunDryRunReportsResolvedDuplicates(t *testing.T) {
+	repo, logPath := newDuplicateFixture(t)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-repo", repo, "-git-log", logPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	for _, line := range []string{
+		"docs/tasks/T3.103.md: todo -> done",
+		"docs/tasks/BS.25.md: todo -> done (duplicate of T3.103 by OwnerFiles)",
+	} {
+		if !strings.Contains(out, line) {
+			t.Errorf("output missing %q:\n%s", line, out)
+		}
+	}
+	for _, id := range []string{"BS.19.md", "BS.23.md", "BS.26.md"} {
+		if strings.Contains(out, id) {
+			t.Errorf("dry run reported unchanged card %s:\n%s", id, out)
+		}
+	}
+}
+
+func TestResolveDuplicateCardsWithSeveralDoneOwners(t *testing.T) {
+	repo := t.TempDir()
+	cards := map[string]string{
+		"BS.32.md": "# BS.32\nСтатус: done\nВладелец файлов: a.go, b.go\n",
+		"T3.99.md": "# T3.99\nСтатус: done\nВладелец файлов: b.go, a.go\n",
+		"BS.23.md": "# BS.23\nСтатус: todo\nВладелец файлов: b.go, a.go\n",
+		"BS.25.md": "# BS.25\nСтатус: todo\nВладелец файлов: a.go, b.go\n",
+	}
+	for name, content := range cards {
+		writeFixtureFile(t, filepath.Join(repo, "docs", "tasks", name), content)
+	}
+	got, err := readCards(repo, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range got {
+		if c.resolved != statusDone {
+			t.Errorf("%s resolved = %q, want done", c.id, c.resolved)
+		}
+		if c.duplicateOf != "" && c.duplicateOf != "BS.32" && c.duplicateOf != "T3.99" {
+			t.Errorf("%s duplicateOf = %q, want a done owner", c.id, c.duplicateOf)
+		}
+	}
+}
+
 func TestScanGitLogExtractsOnlyMergedCards(t *testing.T) {
 	scan := scanGitLog(strings.Split(strings.TrimSpace(mockGitLog), "\n"))
 	if scan.commits != 5 {
