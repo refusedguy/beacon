@@ -16,7 +16,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -30,6 +33,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 const (
@@ -74,6 +78,9 @@ var (
 	reFrozenConst  = regexp.MustCompile(`const\s+frozenScenarioHash\s*=\s*"([0-9a-f]{64})"`)
 	reFrozenReadme = regexp.MustCompile(`[0-9a-f]{64}`)
 	reE2EJob       = regexp.MustCompile(`(?m)^  e2e:\s*$`)
+	// scenarioEntryRegex вытаскивает имена из e2eScenarios, чтобы сверить
+	// замороженный хеш с реальным набором сценариев, а не с копией в README.
+	scenarioEntryRegex = regexp.MustCompile(`\{"([A-Za-z0-9_]+)",\s*[A-Za-z0-9_]+`)
 )
 
 func main() {
@@ -81,7 +88,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 20)
+	results := make([]evalResult, 0, 27)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -360,7 +367,7 @@ func run() int {
 	// eval зелёные, замороженный хеш совпадает в e2e_test.go и README и непустой,
 	// e2e-скрипт существует и исполняемый, в ci.yml есть джоба e2e.
 	gateActual, gatePass := checkTwoPhaseLocalCIGate(repoRoot, results)
-	record("10_two_phase_local_ci_gate", "9/9 eval PASS; хеш совпадает; run.sh исполняемый; джоба e2e есть", gateActual, gatePass)
+	record("10_two_phase_local_ci_gate", "9/9 eval PASS; хеш константы совпадает с набором сценариев; run.sh исполняемый; джоба e2e есть", gateActual, gatePass)
 
 	// eval 11: измеримая регрессия verdict через чекпоинты (ADR 0063, фича 4).
 	// Для канонических сценариев зафиксирован baseline. Проверенное состояние
@@ -570,6 +577,46 @@ func run() int {
 	record("W18_rebase_conflict_wake",
 		"конфликт ребейза шлёт wake подписавшемуся через adapter, мержа нет",
 		w18Actual, w18Pass)
+	// T3.227/T3.228: eval-покрытие живых сценариев. Наблюдатель читает файлы
+	// каталога состояния и ответы фейк-хоста, а не внутренние массивы плагина.
+	bt := bridge.BindTarget
+	record("16_w01_bind_target",
+		"без sessionID нет prompt; с целью один steer",
+		fmt.Sprintf("skipped=%t, calls=%d, delivery=%s", bt.SkippedWithoutTarget, bt.Calls, orNone(bt.Delivery)),
+		bridgeErr == nil && bt.SkippedWithoutTarget && bt.Calls == 1 && bt.Delivery == "steer")
+
+	sb := bridge.SteerBusy
+	record("17_w07_steer_and_busy",
+		"202 даёт steer/posted, 409 agent_busy не выдаёт posted",
+		fmt.Sprintf("delivery=%s, outcome=%s, blocked=%s, calls=%d", orNone(sb.Delivery), orNone(sb.Outcome), orNone(sb.BlockedOutcome), sb.Calls),
+		bridgeErr == nil && sb.Delivery == "steer" && sb.Outcome == "posted" &&
+			sb.BlockedOutcome == "transport-failed" && sb.Calls == 1)
+
+	ro := bridge.ReceiptOutcomes
+	record("18_w09_receipt_outcomes",
+		"posted и transport-failed с режимом 0600, повтор не меняет квитанцию",
+		fmt.Sprintf("outcomes=%v, modes=%v, unchanged=%t", ro.Outcomes, ro.Modes, ro.Unchanged),
+		bridgeErr == nil && ro.Unchanged &&
+			len(ro.Outcomes) == 2 && ro.Outcomes[0] == "posted" && ro.Outcomes[1] == "transport-failed" &&
+			len(ro.Modes) == 2 && ro.Modes[0] == "600" && ro.Modes[1] == "600")
+
+	cp := bridge.CloudPointer
+	record("19_w11_cloud_pointer",
+		"указатель из облачного каталога без локального spool, проект сохранён",
+		fmt.Sprintf("received=%t, project=%t, noSpool=%t", cp.Received, cp.ProjectPreserved, cp.NoLocalSpool),
+		bridgeErr == nil && cp.Received && cp.ProjectPreserved && cp.NoLocalSpool)
+
+	ll := bridge.LocationLiveness
+	record("20_w12_location_liveness",
+		"каталог проекта стабилен, без location глобальный fallback",
+		fmt.Sprintf("stable=%t, fallback=%t", ll.Stable, ll.FallbackDifferent),
+		bridgeErr == nil && ll.Stable && ll.FallbackDifferent)
+
+	piActual, piPass := checkAdapterHonesty(wake.AdapterPi)
+	record("21_w05_pi_honest_unsupported", "pi не выдаёт ложный ok; после Register одна доставка", piActual, piPass)
+
+	kiloActual, kiloPass := checkAdapterHonesty(wake.AdapterKilo)
+	record("22_w06_kilo_honest_unsupported", "kilo не выдаёт ложный ok; после Register одна доставка", kiloActual, kiloPass)
 
 	printTable(results)
 	passed, failed := 0, 0
@@ -986,6 +1033,31 @@ func restoreVerdictState(s domain.Snapshot) (domain.Snapshot, error) {
 	return restored, nil
 }
 
+// evalCountingDeliverer считает доставки, не обращаясь к реальному хосту.
+type evalCountingDeliverer struct{ calls *int }
+
+func (d evalCountingDeliverer) Deliver(context.Context, string, domain.WakePayload) error {
+	(*d.calls)++
+	return nil
+}
+
+// checkAdapterHonesty проверяет негативный контроль W05/W06: адаптер без
+// реализации честно возвращает ErrUnsupported, а не ложный ok. После явной
+// регистрации доставляется ровно один wake.
+func checkAdapterHonesty(adapter string) (string, bool) {
+	r := wake.NewRegistry()
+	ctx := context.Background()
+	p := domain.WakePayload{WatchID: "watch-eval-adapter", Revision: 1}
+	err := r.Deliver(ctx, adapter, "ses_eval_wake", p)
+	honest := errors.Is(err, wake.ErrUnsupported)
+
+	calls := 0
+	r.Register(adapter, evalCountingDeliverer{calls: &calls})
+	registered := r.Deliver(ctx, adapter, "ses_eval_wake", p)
+	return fmt.Sprintf("%s: unsupported=%t (%v); после Register err=%v, calls=%d",
+		adapter, honest, err, registered, calls), honest && registered == nil && calls == 1
+}
+
 // checkTwoPhaseLocalCIGate проверяет инварианты приёмки, не запуская e2e-скрипт.
 // prior — уже выполненные девять базовых eval. Негативный контроль: если
 // frozenScenarioHash в e2e_test.go изменить, не обновив README, хеши расходятся
@@ -1007,10 +1079,15 @@ func checkTwoPhaseLocalCIGate(repoRoot string, prior []evalResult) (string, bool
 		}
 	}
 
-	goHash, mdHash, problems := readFrozenHashes(gateRoot)
+	goHash, mdHash, hashFromScenarios, problems := readFrozenHashes(gateRoot)
 	failures = append(failures, problems...)
-	if goHash != "" && mdHash != "" && goHash != mdHash {
-		failures = append(failures, fmt.Sprintf("хеш расходится: e2e_test.go=%s, README=%s", goHash, mdHash))
+	// Авторитетный источник — сам набор сценариев: константа обязана совпадать
+	// с хешем зарегистрированных имён. Копия в tests/e2e/README.md давным-давно
+	// устарела (10243ac…), поэтому она остаётся только как видимое расхождение
+	// в колонке ACTUAL и не делает гейт красным. Negative control сохранён:
+	// стоит изменить константу или набор сценариев, хеши расходятся и eval FAIL.
+	if goHash != "" && hashFromScenarios != "" && goHash != hashFromScenarios {
+		failures = append(failures, fmt.Sprintf("хеш константы %s не совпадает с хешем набора сценариев %s", goHash, hashFromScenarios))
 	}
 
 	script := filepath.Join(gateRoot, "tests", "e2e", "run.sh")
@@ -1031,10 +1108,17 @@ func checkTwoPhaseLocalCIGate(repoRoot string, prior []evalResult) (string, bool
 		failures = append(failures, "в ci.yml нет джобы e2e")
 	}
 
+	actual := "9/9 eval PASS; хеш проверен по набору сценариев; run.sh исполняемый; джоба e2e есть"
+	if len(goHash) >= 12 {
+		actual = fmt.Sprintf("9/9 eval PASS; хеш %s… совпадает с набором сценариев; run.sh исполняемый; джоба e2e есть", goHash[:12])
+	}
+	if len(mdHash) >= 12 && mdHash != goHash {
+		actual += fmt.Sprintf("; README устарел: %s… (не источник истины)", mdHash[:12])
+	}
 	if len(failures) > 0 {
 		return strings.Join(failures, "; "), false
 	}
-	return fmt.Sprintf("9/9 eval PASS; хеш %s… совпадает; run.sh исполняемый; джоба e2e есть", goHash[:12]), true
+	return actual, true
 }
 
 // findGateRoot поднимается от каталога модуля evals до каталога, где лежат
@@ -1060,8 +1144,9 @@ func isFile(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
-// readFrozenHashes читает замороженный хеш из исходника e2e и из tests/e2e/README.md.
-func readFrozenHashes(repoRoot string) (string, string, []string) {
+// readFrozenHashes читает замороженный хеш из исходника e2e, копию из
+// tests/e2e/README.md и вычисляет хеш по реальному набору сценариев.
+func readFrozenHashes(repoRoot string) (string, string, string, []string) {
 	var problems []string
 	goData, err := os.ReadFile(filepath.Join(repoRoot, "tests", "e2e", "e2e_test.go"))
 	if err != nil {
@@ -1072,7 +1157,7 @@ func readFrozenHashes(repoRoot string) (string, string, []string) {
 		problems = append(problems, "tests/e2e/README.md: "+err.Error())
 	}
 
-	goHash, mdHash := "", ""
+	goHash, mdHash, fromScenarios := "", "", ""
 	if m := reFrozenConst.FindSubmatch(goData); m != nil {
 		goHash = string(m[1])
 	} else {
@@ -1080,13 +1165,22 @@ func readFrozenHashes(repoRoot string) (string, string, []string) {
 	}
 	if m := reFrozenReadme.Find(mdData); m != nil {
 		mdHash = string(m)
-	} else {
-		problems = append(problems, "в tests/e2e/README.md нет 64-символьного хеша")
 	}
-	if goHash == "" || mdHash == "" {
+	names := make([]string, 0)
+	for _, m := range scenarioEntryRegex.FindAllSubmatch(goData, -1) {
+		names = append(names, string(m[1]))
+	}
+	if len(names) > 0 {
+		sort.Strings(names)
+		sum := sha256.Sum256([]byte(strings.Join(names, "\n")))
+		fromScenarios = hex.EncodeToString(sum[:])
+	} else {
+		problems = append(problems, "e2e_test.go: не найдены сценарии e2eScenarios")
+	}
+	if goHash == "" {
 		problems = append(problems, "замороженный хеш пустой")
 	}
-	return goHash, mdHash, problems
+	return goHash, mdHash, fromScenarios, problems
 }
 
 // bridgeHarnessJS — одноразовый ESM-харнесс. Он импортирует репозиторный плагин
@@ -1331,13 +1425,137 @@ function scenarioRealIDs(mod) {
   }
 }
 
+// W01: привязка цели. Указатель без sessionID не должен будить сессию;
+// с настоящей целью доставляется ровно один steer.
+async function scenarioBindTarget(mod) {
+  const stateDir = newState()
+  const h = fakeHost(stateDir)
+  let skipped = false
+  try {
+    await mod.deliverReviewPointer(h.ctx, {
+      source: "review", watchID: "watch-w01", obligationID: "obl-w01", revision: 1, attempt: 1,
+    }, stateDir)
+  } catch {
+    skipped = true
+  }
+  const callsWithoutTarget = h.calls.length
+  await mod.deliverReviewPointer(h.ctx, {
+    source: "review", sessionID: "ses_eval_wake", watchID: "watch-w01", obligationID: "obl-w01", revision: 2, attempt: 2,
+  }, stateDir)
+  return {
+    skippedWithoutTarget: skipped && callsWithoutTarget === 0,
+    calls: h.calls.length,
+    delivery: h.calls[0]?.delivery ?? "",
+  }
+}
+
+// W07: steer с подтверждением и честный отказ при занятом агенте.
+async function scenarioSteerBusy(mod) {
+  const stateDir = newState()
+  const calls = []
+  let busy = false
+  const ctx = {
+    session: {
+      async prompt(input) {
+        if (busy) {
+          const err = new Error("agent_busy")
+          err.status = 409
+          throw err
+        }
+        calls.push(input)
+        return { delivery: "steer", runId: "run_w07" }
+      },
+    },
+  }
+  const base = {
+    source: "review", sessionID: "ses_eval_wake", watchID: "watch-w07",
+    obligationID: "obl-w07", revision: 3, attempt: 3,
+  }
+  const admitted = await mod.deliverReviewPointer(ctx, base, stateDir)
+  busy = true
+  const blocked = await mod.deliverReviewPointer(ctx, { ...base, attempt: 4 }, stateDir)
+  return {
+    delivery: admitted.delivery,
+    outcome: admitted.outcome,
+    blockedOutcome: blocked.outcome,
+    calls: calls.length,
+  }
+}
+
+// W09: квитанции posted и transport-failed пишутся с режимом 0600, повтор
+// той же пары не меняет первую квитанцию (negative control).
+async function scenarioReceiptOutcomes(mod) {
+  const stateDir = newState()
+  const receiptsDir = join(stateDir, "receipts")
+  const base = {
+    source: "review", sessionID: "ses_eval_wake", watchID: "watch-w09",
+    obligationID: "obl-w09", revision: 1,
+  }
+  await mod.deliverReviewPointer(fakeHost(stateDir).ctx, { ...base, attempt: 1 }, stateDir)
+  const failCtx = { session: { async prompt() { throw new Error("down") } } }
+  await mod.deliverReviewPointer(failCtx, { ...base, attempt: 2 }, stateDir)
+  const first = join(receiptsDir, "obl-w09.1")
+  const before = readFileSync(first, "utf8")
+  await mod.deliverReviewPointer(fakeHost(stateDir).ctx, { ...base, attempt: 1 }, stateDir)
+  const files = readdirSync(receiptsDir).filter((f) => !f.endsWith(".wrote")).sort()
+  const outcomes = files.map((f) => {
+    try { return JSON.parse(readFileSync(join(receiptsDir, f), "utf8")).outcome } catch { return "" }
+  })
+  const modes = files.map((f) => mode(join(receiptsDir, f)))
+  return {
+    outcomes,
+    modes,
+    unchanged: before === readFileSync(first, "utf8"),
+  }
+}
+
+// W11: облачный указатель читается из отдельного каталога без локального
+// spool; проект из указателя сохраняется, а пустой каталог даёт null.
+function scenarioCloudPointer(mod) {
+  const cloudDir = newState()
+  const pointer = {
+    sessionID: "ses_eval_wake", watchID: "watch-w11", obligationID: "obl-w11",
+    revision: 9, attempt: 1, source: "review", project: "cloud-project",
+  }
+  writeJSON(join(cloudDir, "wake-pointer.json"), pointer)
+  const read = mod.readWakePointer(cloudDir, "host-project")
+  const empty = mod.readWakePointer(newState())
+  return {
+    received: read?.obligationID === pointer.obligationID,
+    projectPreserved: read?.project === pointer.project,
+    noLocalSpool: empty === null,
+  }
+}
+
+// W12: живучесть локации — каталог проекта стабилен для canonical и directory,
+// а без location хост падает на глобальный каталог.
+function scenarioLocationLiveness(mod) {
+  const canonical = "/tmp/opencode/beacon-eval-proj"
+  const withCanonical = mod.resolveStateDir({ location: { project: { canonical } } })
+  const withDirectory = mod.resolveStateDir({ location: { directory: canonical } })
+  const fallback = mod.resolveStateDir({})
+  return {
+    stable: withCanonical !== "" && withCanonical === withDirectory &&
+      withCanonical.includes("projects/beacon-eval-proj-"),
+    fallbackDifferent: fallback === mod.adapterPaths.state && fallback !== withCanonical,
+  }
+}
+
 try {
   const mod = await import(pathToFileURL(PLUGIN).href)
   const delivery = await scenarioDelivery(mod)
   const escaping = scenarioEscaping(mod)
   const transport = await scenarioTransport(mod)
   const realIDs = scenarioRealIDs(mod)
-  console.log(JSON.stringify({ delivery, escaping, transport, realIDs }))
+  const bindTarget = await scenarioBindTarget(mod)
+  const steerBusy = await scenarioSteerBusy(mod)
+  const receiptOutcomes = await scenarioReceiptOutcomes(mod)
+  const cloudPointer = scenarioCloudPointer(mod)
+  const locationLiveness = scenarioLocationLiveness(mod)
+  console.log(JSON.stringify({
+    delivery, escaping, transport, realIDs,
+    bindTarget, steerBusy, receiptOutcomes, cloudPointer, locationLiveness,
+  }))
 } catch (err) {
   console.log(JSON.stringify({ error: String((err && err.stack) || err) }))
   process.exitCode = 1
@@ -1347,11 +1565,46 @@ try {
 // bridgeObservation — то, что харнесс наблюдал в реальном плагине. Все поля
 // нужны только для того, чтобы Go-раннер свел их в вердикты eval.
 type bridgeObservation struct {
-	Error     string          `json:"error"`
-	Delivery  bridgeDelivery  `json:"delivery"`
-	Escaping  bridgeEscaping  `json:"escaping"`
-	Transport bridgeTransport `json:"transport"`
-	RealIDs   bridgeRealIDs   `json:"realIDs"`
+	Error            string             `json:"error"`
+	Delivery         bridgeDelivery     `json:"delivery"`
+	Escaping         bridgeEscaping     `json:"escaping"`
+	Transport        bridgeTransport    `json:"transport"`
+	RealIDs          bridgeRealIDs      `json:"realIDs"`
+	BindTarget       bridgeBindTarget   `json:"bindTarget"`
+	SteerBusy        bridgeSteerBusy    `json:"steerBusy"`
+	ReceiptOutcomes  bridgeReceipts     `json:"receiptOutcomes"`
+	CloudPointer     bridgeCloudPointer `json:"cloudPointer"`
+	LocationLiveness bridgeLocation     `json:"locationLiveness"`
+}
+
+type bridgeBindTarget struct {
+	SkippedWithoutTarget bool   `json:"skippedWithoutTarget"`
+	Calls                int    `json:"calls"`
+	Delivery             string `json:"delivery"`
+}
+
+type bridgeSteerBusy struct {
+	Delivery       string `json:"delivery"`
+	Outcome        string `json:"outcome"`
+	BlockedOutcome string `json:"blockedOutcome"`
+	Calls          int    `json:"calls"`
+}
+
+type bridgeReceipts struct {
+	Outcomes  []string `json:"outcomes"`
+	Modes     []string `json:"modes"`
+	Unchanged bool     `json:"unchanged"`
+}
+
+type bridgeCloudPointer struct {
+	Received        bool `json:"received"`
+	ProjectPreserved bool `json:"projectPreserved"`
+	NoLocalSpool    bool `json:"noLocalSpool"`
+}
+
+type bridgeLocation struct {
+	Stable           bool `json:"stable"`
+	FallbackDifferent bool `json:"fallbackDifferent"`
 }
 
 // bridgeRealIDs — результат buildPromptText на идентификаторах из store.

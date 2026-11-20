@@ -2,6 +2,8 @@ package cibridge
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -126,6 +128,111 @@ func TestBridgeIgnoresStaleHeadAndKeepsPending(t *testing.T) {
 	if got.Verdict != domain.VerdictWatching {
 		t.Fatalf("stale head verdict = %q", got.Verdict)
 	}
+}
+
+// T3.229: the orchestrator's own Watch is registered, the CI bridge moves it
+// to ready at revision 1, and reading that verdict stamps readAt in the store.
+func TestSelfWatchChainReadsReadyVerdictAndStampsReadAt(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const cardID = "T3.229"
+	b := New(db, fakeCI{state: domain.PRState{
+		HeadRefOid: "177bf240abc",
+		Checks: map[string]domain.Check{
+			"build": {Conclusion: "SUCCESS", Required: true},
+		},
+	}}, fixedClock{at: time.Unix(1, 0)}, time.Second)
+	b.WithReader(dbReadStamper{db: db})
+
+	w, err := b.RegisterSelfWatch(cardID, "refusedguy/beacon", 286, "177bf240abc")
+	if err != nil {
+		t.Fatalf("RegisterSelfWatch: %v", err)
+	}
+	if got := len(w.Subscribers); got != 1 || w.Subscribers[0].Role != domain.RoleOrchestrator {
+		t.Fatalf("subscribers = %+v, want one orchestrator", w.Subscribers)
+	}
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+
+	ctx := context.Background()
+	res, err := b.ReadVerdict(ctx, w.ID, cardID)
+	if err != nil {
+		t.Fatalf("ReadVerdict: %v", err)
+	}
+	if res.Verdict != domain.VerdictReady || res.Revision != 1 {
+		t.Fatalf("verdict = %q revision = %d, want ready/1", res.Verdict, res.Revision)
+	}
+	if res.ReadAt.IsZero() {
+		t.Fatal("readAt was not stamped")
+	}
+	o, err := db.Obligation(res.ObligationID)
+	if err != nil {
+		t.Fatalf("Obligation: %v", err)
+	}
+	if !o.ReadAt.Equal(res.ReadAt) {
+		t.Fatalf("stored readAt = %v, want %v", o.ReadAt, res.ReadAt)
+	}
+
+	again, err := b.ReadVerdict(ctx, w.ID, cardID)
+	if err != nil {
+		t.Fatalf("second ReadVerdict: %v", err)
+	}
+	if !again.ReadAt.Equal(res.ReadAt) {
+		t.Fatalf("second read changed readAt: %v -> %v", res.ReadAt, again.ReadAt)
+	}
+
+	// A repeated registration must not reset the revision or the verdict.
+	repeated, err := b.RegisterSelfWatch(cardID, "refusedguy/beacon", 286, "177bf240abc")
+	if err != nil {
+		t.Fatalf("repeated RegisterSelfWatch: %v", err)
+	}
+	if repeated.Revision != res.Revision || repeated.Verdict != domain.VerdictReady {
+		t.Fatalf("repeated registration changed the watch: %+v", repeated)
+	}
+
+	// A substituted subscriber has no obligation and cannot confirm a read.
+	if _, err := b.ReadVerdict(ctx, w.ID, "stubbed-card"); err == nil {
+		t.Fatal("ReadVerdict accepted a subscriber without an obligation")
+	}
+}
+
+// dbReadStamper is the same narrow port the MCP stamper exposes, backed by the
+// real store writer so the test can read readAt back from disk.
+type dbReadStamper struct{ db *store.DB }
+
+func (s dbReadStamper) StampRead(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error) {
+	var out domain.Obligation
+	applied := false
+	err := s.db.Write(ctx, func(tx *sql.Tx) error {
+		var payload []byte
+		if err := tx.QueryRow(`SELECT payload FROM obligations WHERE id = ?`, id).Scan(&payload); err != nil {
+			return err
+		}
+		var o domain.Obligation
+		if err := json.Unmarshal(payload, &o); err != nil {
+			return err
+		}
+		if !o.ReadAt.IsZero() {
+			out = o
+			return nil
+		}
+		o.ReadAt = at
+		next, err := json.Marshal(o)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE obligations SET payload = ? WHERE id = ?`, next, id); err != nil {
+			return err
+		}
+		out, applied = o, true
+		return nil
+	})
+	return out, applied, err
 }
 
 type fixedClock struct{ at time.Time }

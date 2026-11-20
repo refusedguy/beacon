@@ -6,6 +6,7 @@ package cibridge
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -20,6 +21,24 @@ type Bridge struct {
 	clock    domain.Clock
 	interval time.Duration
 	waker    domain.WakeDeliverer
+	reader   ReadStamper
+}
+
+// ReadStamper stamps a durable read on an obligation. The MCP tool owns the
+// production implementation; Bridge only needs this narrow port to let the
+// orchestrator confirm that a verdict was actually read, not just observed.
+type ReadStamper interface {
+	StampRead(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error)
+}
+
+// WithReader binds the read stamper. It is optional: without one ReadVerdict
+// still reports the verdict, but cannot prove the read in the store.
+func (b *Bridge) WithReader(s ReadStamper) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.reader = s
+	return b
 }
 
 // WithWaker binds a wake adapter. A terminal verdict then steers each
@@ -191,4 +210,86 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 	}
 	log.Printf("cibridge: %s#%d -> %s revision=%d", next.Repo, next.PR, verdict, next.Revision)
 	return 1, nil
+}
+
+// WatchResult is the orchestrator's own Watch as read back from the store.
+// ReadAt is stamped by the first read and stays the same on later reads, so
+// "verdict was read" is a durable fact rather than a claim in a chat report.
+type WatchResult struct {
+	WatchID      string
+	Verdict      domain.Verdict
+	Revision     uint64
+	ObligationID string
+	ReadAt       time.Time
+}
+
+// RegisterSelfWatch creates the orchestrator's Watch on its own PR. The card id
+// is the subscriber: it is the same target beacon_watch_pr receives as
+// notify.target, so the CI bridge wakes the session that owns the card. The
+// registration is idempotent by watch id and never resets an existing verdict.
+func (b *Bridge) RegisterSelfWatch(cardID, repo string, pr int, headSHA string) (domain.Watch, error) {
+	if b == nil || b.store == nil {
+		return domain.Watch{}, fmt.Errorf("cibridge: register self watch: store is nil")
+	}
+	if cardID == "" || repo == "" || headSHA == "" || pr <= 0 {
+		return domain.Watch{}, fmt.Errorf("cibridge: register self watch: cardID, repo, pr and headSHA are required")
+	}
+	id := fmt.Sprintf("watch:%s:%d:%s", repo, pr, headSHA)
+	if existing, err := b.store.Watch(id); err == nil {
+		return existing, nil
+	}
+	now := b.clock.Now()
+	w := domain.Watch{
+		ID:      id,
+		Repo:    repo,
+		PR:      pr,
+		HeadSHA: headSHA,
+		Status:  domain.StatusWatching,
+		Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{
+			ID:           cardID,
+			Role:         domain.RoleOrchestrator,
+			Adapter:      "opencode",
+			Target:       cardID,
+			AddedAt:      now,
+			LastActivity: now,
+		}},
+		CreatedAt: now,
+	}
+	if err := b.store.SaveWatch(w); err != nil {
+		return domain.Watch{}, fmt.Errorf("cibridge: save self watch: %w", err)
+	}
+	return w, nil
+}
+
+// ReadVerdict reads the verdict of a Watch together with the subscriber's
+// obligation and stamps readAt on the first read. A stubbed watch id or a
+// subscriber that does not own an obligation is an error: there is nothing in
+// the store to confirm. A Watch still in watching is reported as watching.
+func (b *Bridge) ReadVerdict(ctx context.Context, watchID, subscriberID string) (WatchResult, error) {
+	if b == nil || b.store == nil {
+		return WatchResult{}, fmt.Errorf("cibridge: read verdict: store is nil")
+	}
+	w, err := b.store.Watch(watchID)
+	if err != nil {
+		return WatchResult{}, fmt.Errorf("cibridge: watch %s: %w", watchID, err)
+	}
+	id := domain.ObligationKey(watchID, w.Revision, subscriberID)
+	o, err := b.store.Obligation(id)
+	if err != nil {
+		return WatchResult{}, fmt.Errorf("cibridge: obligation %s: %w", id, err)
+	}
+	if b.reader != nil {
+		o, _, err = b.reader.StampRead(ctx, id, b.clock.Now())
+		if err != nil {
+			return WatchResult{}, fmt.Errorf("cibridge: stamp readAt: %w", err)
+		}
+	}
+	return WatchResult{
+		WatchID:      w.ID,
+		Verdict:      w.Verdict,
+		Revision:     w.Revision,
+		ObligationID: o.ID,
+		ReadAt:       o.ReadAt,
+	}, nil
 }
