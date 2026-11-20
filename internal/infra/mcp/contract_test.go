@@ -14,13 +14,14 @@ import (
 
 // toolsListByteBudget is the ceiling for the serialized tools/list result.
 // The budget counts real bytes (method Tirith), not the presence of fields.
-// 16 KiB still fits seven detailed input/output schemas while catching runaway
+// 16 KiB still fits eight detailed input/output schemas while catching runaway
 // growth in descriptions and schemas. CI logs the measured size next to the
 // ceiling so drift is visible before it becomes a failure.
 const toolsListByteBudget = 16 * 1024
 
-// expectedToolNames is the complete tool contract from WORKER-PROMPT 4.1.
-// The order is not part of the contract, so the test compares sorted slices.
+// expectedToolNames is the complete tool contract: the seven tools from
+// WORKER-PROMPT 4.1 plus beacon_defer_wiring (W12-B). The order is not part of
+// the contract, so the test compares sorted slices.
 var expectedToolNames = []string{
 	"beacon_watch_pr",
 	"beacon_wait_result",
@@ -29,6 +30,7 @@ var expectedToolNames = []string{
 	"beacon_ack",
 	"beacon_cancel_watch",
 	"beacon_stats",
+	"beacon_defer_wiring",
 }
 
 // toolKind is the annotation class assigned to a tool in WORKER-PROMPT 4.1.
@@ -51,11 +53,12 @@ var expectedToolKinds = map[string]toolKind{
 	"beacon_ack":          kindAdditive,
 	"beacon_cancel_watch": kindDestructive,
 	"beacon_stats":        kindRead,
+	"beacon_defer_wiring": kindAdditive,
 }
 
 // listAllTools walks every tools/list page and returns the tools together with
 // the number of bytes produced by serializing each response. Counting every
-// page keeps the "exactly seven" check honest if the server paginates.
+// page keeps the "exactly eight, no ninth" check honest if the server paginates.
 func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, int) {
 	t.Helper()
 

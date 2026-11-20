@@ -12,7 +12,7 @@
 // Honesty notes (also in docs/e2e/README.md):
 //  * The wake plugin used in the positive check is a copy of the working T0.3
 //    spike. It is NOT .opencode/plugins/beacon-bridge.js in this repository.
-//  * mcp_go_sdk_CommandTransport proves the protocol and the seven-tool
+//  * mcp_go_sdk_CommandTransport proves the protocol and the eight-tool
 //    contract only. live_opencode_full_mcp_cycle calls the real handlers of
 //    `beacon mcp` and reads watchID, revision and verdict from their answers.
 //  * There is no CI poll daemon in this tree. The verdict in the full cycle is
@@ -57,6 +57,7 @@ var (
 	expectedSet = []string{
 		"beacon_watch_pr", "beacon_wait_result", "beacon_get_result",
 		"beacon_list_running", "beacon_ack", "beacon_cancel_watch", "beacon_stats",
+		"beacon_defer_wiring",
 	}
 )
 
@@ -181,13 +182,13 @@ func testMCPWithGoSDK(t *testing.T, binary string) {
 	slices.Sort(names)
 	want := slices.Clone(expectedSet)
 	slices.Sort(want)
-	if len(names) != 7 {
+	if len(names) != 8 {
 		t.Fatalf("tools/list вернул %d инструментов: %v", len(names), names)
 	}
 	if !slices.Equal(names, want) {
 		t.Fatalf("tools/list: получено %v, ожидалось %v", names, want)
 	}
-	t.Logf("tools/list: ровно 7 инструментов: %v", names)
+	t.Logf("tools/list: ровно 8 инструментов: %v", names)
 
 	// tools/call goes through the same CommandTransport session. The tool is a
 	// read-only stub in main; we only assert the protocol round trip here.
@@ -1076,7 +1077,7 @@ func runLiveMCPCycle(t *testing.T, binary string) {
 	t.Logf("initialize: %s %s protocol=%s cycle=%d байт", init.ServerInfo.Name,
 		init.ServerInfo.Version, init.ProtocolVersion, len(init.Instructions))
 
-	// tools/list: exactly the seven contracted names, no eighth summary tool.
+	// tools/list: exactly the eight contracted names, no ninth summary tool.
 	tools, err := mcpSession.ListTools(ctx, nil)
 	if err != nil {
 		t.Fatalf("tools/list: %v", err)
