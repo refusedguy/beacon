@@ -31,15 +31,18 @@ const DaemonInterval = 3 * time.Minute
 // producing a duplicate. Subscribe enrolls the orchestrator on every active
 // Watch before the orchestrator pass. Orchestrate merges ready Watches and
 // hands retry/fail Watches to the Waker. Summary returns the workload snapshot
-// the pass prints after orchestration. CloseMerged closes Watches whose PR is
-// already merged or closed. CheckAll, Orchestrate and CloseMerged are required.
-// Subscribe and Summary are optional: a nil port skips that step, which keeps
-// older callers working. A nil Waker is allowed and simply suppresses wakes.
+// the pass prints after orchestration. Verify reports whether the conditions
+// required to close a card are met. CloseMerged closes Watches whose PR is
+// already merged or closed, but only after Verify passes. CheckAll, Orchestrate
+// and CloseMerged are required. Subscribe, Summary and Verify are optional: a
+// nil port skips that step, and a nil Verify keeps the original close behaviour
+// for older callers. A nil Waker is allowed and simply suppresses wakes.
 type DaemonPorts struct {
 	CheckAll    func(ctx context.Context) error
 	Subscribe   func(ctx context.Context) error
 	Orchestrate func(ctx context.Context, waker Waker) error
 	Summary     func(ctx context.Context) (Workload, error)
+	Verify      func(ctx context.Context) (bool, error)
 	CloseMerged func(ctx context.Context) error
 	Waker       Waker
 	Log         func(format string, args ...any)
@@ -49,9 +52,11 @@ type DaemonPorts struct {
 // ctx is cancelled. With once it stops after the first pass, which is what the
 // tests and one-shot invocations use.
 //
-// One pass runs checkall, subscribe, orchestrate, summary and close-merged in
-// that order. An error from any port is logged and swallowed: one failing step
-// must never bring the daemon down or hide the remaining actions.
+// One pass runs checkall, subscribe, orchestrate, summary, verify and
+// close-merged in that order. Verify gates close-merged: a card whose required
+// checks did not pass stays open. An error from any port is logged and
+// swallowed: one failing step must never bring the daemon down or hide the
+// remaining actions.
 func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, once bool) error {
 	if ports.CheckAll == nil || ports.Orchestrate == nil || ports.CloseMerged == nil {
 		return errors.New("daemon: checkall, orchestrate and close-merged ports are required")
@@ -92,8 +97,26 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 					report.Total, report.Ready, report.NeedsAttention, report.Watching, report.Registered)
 			}
 		}
-		if err := ports.CloseMerged(ctx); err != nil {
-			logf("daemon: close merged: %v", err)
+		// Verify is the gate before the final transition. A card closes only
+		// when its required checks pass. An error or a false result leaves
+		// every card open and logs the reason. A nil Verify keeps the older
+		// pass, which closes without a gate.
+		verified := ports.Verify == nil
+		if ports.Verify != nil {
+			ok, err := ports.Verify(ctx)
+			switch {
+			case err != nil:
+				logf("daemon: verify: %v", err)
+			case !ok:
+				logf("daemon: verify: required checks did not pass, skipping close")
+			default:
+				verified = true
+			}
+		}
+		if verified {
+			if err := ports.CloseMerged(ctx); err != nil {
+				logf("daemon: close merged: %v", err)
+			}
 		}
 	}
 

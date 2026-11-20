@@ -91,6 +91,7 @@ func daemonPorts(check *daemonCheckAll, orch *daemonOrchestrator, closer *daemon
 	return DaemonPorts{
 		CheckAll:    check.run,
 		Orchestrate: orch.run,
+		Verify:      (&daemonVerifier{ok: true}).run,
 		CloseMerged: closer.run,
 		Waker:       waker,
 		Log:         logf,
@@ -131,11 +132,29 @@ func (d *daemonSummaryPort) run(context.Context) (Workload, error) {
 	return d.report, d.err
 }
 
+// daemonVerifier is a mock of the Verify port. ok reports whether the required
+// checks passed, err makes the verification itself fail.
+type daemonVerifier struct {
+	ok    bool
+	err   error
+	calls int
+	order *[]string
+}
+
+func (d *daemonVerifier) run(context.Context) (bool, error) {
+	d.calls++
+	if d.order != nil {
+		*d.order = append(*d.order, "verify")
+	}
+	return d.ok, d.err
+}
+
 // daemonOrderPorts builds ports whose mocks record the order of every step.
 func daemonOrderPorts(order *[]string) (DaemonPorts, *daemonSubscribe, *daemonSummaryPort) {
 	check := &daemonCheckAll{hook: func() { *order = append(*order, "checkall") }}
 	sub := &daemonSubscribe{order: order}
 	summary := &daemonSummaryPort{order: order}
+	verifier := &daemonVerifier{ok: true, order: order}
 	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error {
 		*order = append(*order, "orchestrate")
 		return nil
@@ -144,6 +163,7 @@ func daemonOrderPorts(order *[]string) (DaemonPorts, *daemonSubscribe, *daemonSu
 	ports := daemonPorts(check, orch, closer, nil, nil)
 	ports.Subscribe = sub.run
 	ports.Summary = summary.run
+	ports.Verify = verifier.run
 	return ports, sub, summary
 }
 
@@ -277,8 +297,8 @@ func TestDaemonRunRequiresPorts(t *testing.T) {
 }
 
 // TestDaemonPassStepOrder pins the extension of the daemon pass: subscribe
-// runs between checkall and orchestrate, and the summary is printed after
-// orchestrate but before close-merged.
+// runs between checkall and orchestrate, the summary is printed after
+// orchestrate, and verify runs before the final close-merged step.
 func TestDaemonPassStepOrder(t *testing.T) {
 	var order []string
 	ports, sub, summary := daemonOrderPorts(&order)
@@ -286,7 +306,7 @@ func TestDaemonPassStepOrder(t *testing.T) {
 	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"checkall", "subscribe", "orchestrate", "summary", "close-merged"}
+	want := []string{"checkall", "subscribe", "orchestrate", "summary", "verify", "close-merged"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("step order = %q, want %q", order, want)
 	}
@@ -295,8 +315,8 @@ func TestDaemonPassStepOrder(t *testing.T) {
 	}
 }
 
-// A failing subscribe is logged but does not stop orchestrate, summary or
-// close-merged: the pass keeps all of its actions.
+// A failing subscribe is logged but does not stop orchestrate, summary, verify
+// or close-merged: the pass keeps all of its actions.
 func TestDaemonSubscribeErrorDoesNotStopPass(t *testing.T) {
 	var order []string
 	ports, sub, _ := daemonOrderPorts(&order)
@@ -310,7 +330,7 @@ func TestDaemonSubscribeErrorDoesNotStopPass(t *testing.T) {
 	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
 		t.Fatalf("daemon must not fall on a subscribe error: %v", err)
 	}
-	want := []string{"checkall", "subscribe", "orchestrate", "summary", "close-merged"}
+	want := []string{"checkall", "subscribe", "orchestrate", "summary", "verify", "close-merged"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("step order = %q, want %q", order, want)
 	}
@@ -362,14 +382,15 @@ func TestDaemonSummaryErrorIsLogged(t *testing.T) {
 	if !strings.Contains(joined, "daemon: summary: summary boom") {
 		t.Fatalf("summary error not logged: %q", logs)
 	}
-	want := []string{"checkall", "subscribe", "orchestrate", "summary", "close-merged"}
+	want := []string{"checkall", "subscribe", "orchestrate", "summary", "verify", "close-merged"}
 	if !reflect.DeepEqual(order, want) {
 		t.Fatalf("step order = %q, want %q", order, want)
 	}
 }
 
-// Older callers that do not set the two new ports keep the original three-step
-// pass. The existing daemonPorts helper intentionally leaves them nil.
+// Older callers that do not set Subscribe or Summary keep the original pass.
+// The daemonPorts helper leaves those two nil and supplies a passing Verify,
+// so close-merged still runs.
 func TestDaemonWithoutSubscribeAndSummaryStillRuns(t *testing.T) {
 	check := &daemonCheckAll{}
 	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
@@ -380,6 +401,82 @@ func TestDaemonWithoutSubscribeAndSummaryStillRuns(t *testing.T) {
 	}
 	if check.calls != 1 || orch.calls != 1 || closer.calls != 1 {
 		t.Fatalf("calls = %d/%d/%d, want 1/1/1", check.calls, orch.calls, closer.calls)
+	}
+}
+
+// A passing verify is the gate that allows the final close.
+func TestDaemonVerifyPassedCloses(t *testing.T) {
+	check := &daemonCheckAll{}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	closer := &daemonCloser{}
+	verifier := &daemonVerifier{ok: true}
+
+	ports := daemonPorts(check, orch, closer, nil, nil)
+	ports.Verify = verifier.run
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if verifier.calls != 1 {
+		t.Fatalf("verify calls = %d, want 1", verifier.calls)
+	}
+	if closer.calls != 1 {
+		t.Fatalf("close-merged calls = %d, want 1 after a passing verify", closer.calls)
+	}
+}
+
+// A verify that ran but did not pass keeps a merged card open.
+func TestDaemonVerifyNotPassedDoesNotClose(t *testing.T) {
+	st := newFakeStore(Watch{
+		ID: "w-verify", Repo: "refusedguy/beacon", PR: 9,
+		Verdict: "merged", Revision: 2,
+	})
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	closer := &daemonCloser{store: st}
+	verifier := &daemonVerifier{ok: false}
+
+	ports := daemonPorts(&daemonCheckAll{}, orch, closer, nil, nil)
+	ports.Verify = verifier.run
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if verifier.calls != 1 {
+		t.Fatalf("verify calls = %d, want 1", verifier.calls)
+	}
+	if closer.calls != 0 {
+		t.Fatalf("close-merged calls = %d, want 0 when verify did not pass", closer.calls)
+	}
+	if len(st.closed) != 0 {
+		t.Fatalf("closed = %q, want no watches closed when verify did not pass", st.closed)
+	}
+}
+
+// An error from verify keeps the card open and logs the reason.
+func TestDaemonVerifyErrorDoesNotClose(t *testing.T) {
+	check := &daemonCheckAll{}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	closer := &daemonCloser{}
+	verifier := &daemonVerifier{err: errors.New("verify boom")}
+
+	var logs []string
+	ports := daemonPorts(check, orch, closer, nil, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	ports.Verify = verifier.run
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if verifier.calls != 1 {
+		t.Fatalf("verify calls = %d, want 1", verifier.calls)
+	}
+	if closer.calls != 0 {
+		t.Fatalf("close-merged calls = %d, want 0 on a verify error", closer.calls)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "daemon: verify: verify boom") {
+		t.Fatalf("verify error not logged: %q", logs)
 	}
 }
 
