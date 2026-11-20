@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -27,10 +28,48 @@ func (f GitRunnerFunc) Run(ctx context.Context, dir string, args ...string) (str
 	return f(ctx, dir, args...)
 }
 
-// RebaseStore is the minimal store port the rebaser needs. Active Watches
+// HeadRefResolver supplies the real head branch of a PR from the GraphQL PR
+// snapshot (headRefName). The composition root owns the GraphQL client, so this
+// package only names the port and never imports domain or infra (ADR 0005).
+type HeadRefResolver interface {
+	HeadRefName(ctx context.Context, repo string, pr int) (string, error)
+}
+
+// HeadRefResolverFunc adapts a function to HeadRefResolver.
+type HeadRefResolverFunc func(ctx context.Context, repo string, pr int) (string, error)
+
+func (f HeadRefResolverFunc) HeadRefName(ctx context.Context, repo string, pr int) (string, error) {
+	return f(ctx, repo, pr)
+}
+
+// WatchUpdater persists the two state changes a rebase produces. The
+// composition root implements it over the Beacon store: a clean rebase writes
+// the new head SHA, a conflict writes verdict=rebase with the exact unmerged
+// files for the subscriber wake.
+type WatchUpdater interface {
+	SetHeadSHA(ctx context.Context, watchID, sha string) error
+	SetRebase(ctx context.Context, watchID string, files []string) error
+}
+
+// WatchUpdaterFunc adapts two functions to WatchUpdater so the composition
+// root can wire store writes without declaring a named type.
+type WatchUpdaterFunc struct {
+	SetHeadSHAFunc func(ctx context.Context, watchID, sha string) error
+	SetRebaseFunc  func(ctx context.Context, watchID string, files []string) error
+}
+
+func (f WatchUpdaterFunc) SetHeadSHA(ctx context.Context, watchID, sha string) error {
+	return f.SetHeadSHAFunc(ctx, watchID, sha)
+}
+
+func (f WatchUpdaterFunc) SetRebase(ctx context.Context, watchID string, files []string) error {
+	return f.SetRebaseFunc(ctx, watchID, files)
+}
+
+// RebaseStore is the minimal store port the rebaser needs. ActiveWatches
 // already excludes closed Watches, so each returned Watch is a candidate.
 type RebaseStore interface {
-	ActiveWatches() ([]Watch, error)
+	ActiveWatches(ctx context.Context) ([]Watch, error)
 }
 
 // RebaseMerger reports which PRs the composition root has already merged. The
@@ -39,9 +78,17 @@ type RebaseMerger interface {
 	IsMerged(ctx context.Context, repo string, pr int) (bool, error)
 }
 
+// VerdictRebase is the app-layer mirror of the domain rebase verdict. The app
+// layer may not import internal/domain (ADR 0005), so the wire value is named
+// here instead.
+const VerdictRebase = "rebase"
+
+// conflictReasonPrefix makes the file list in a wake reason unambiguous.
+const conflictReasonPrefix = "rebase conflict files: "
+
 // ConflictError reports the paths git could not rebase. The subscriber wake
-// carries this shape so an executor sees the conflicting files without anyone
-// resolving them automatically.
+// carries the same list so an executor sees the conflicting files without
+// anyone resolving them automatically.
 type ConflictError struct {
 	PR       int      `json:"pr"`
 	WatchID  string   `json:"watchID,omitempty"`
@@ -79,19 +126,33 @@ type Rebaser struct {
 	Git    GitRunner
 	Store  RebaseStore
 	Merger RebaseMerger
-	// BranchForPR maps a PR number to its local branch name. The default is
-	// feat/w<pr>, the naming used by the worktrees in this project.
-	BranchForPR func(int) string
+	// Updater persists the new head SHA after a clean rebase and the rebase
+	// verdict with conflicting files after a failed one. Without it the Watch
+	// stays stale and an agent spends tokens redoing work that already landed.
+	Updater WatchUpdater
+	// Waker is called only for conflicts. A successful automatic rebase never
+	// wakes an agent.
+	Waker Waker
+	// HeadRefs reads headRefName from the GraphQL PR snapshot. When it is nil
+	// or reports no name, the branch is resolved from the worktree listing.
+	HeadRefs HeadRefResolver
+	// AutoRebaseCleanBehind mirrors the config flag of the same name. While it
+	// is false RebaseAll changes nothing: no fetch, no rebase, no push and no
+	// wake. Set it from the project config to enable the automatic path.
+	AutoRebaseCleanBehind bool
 }
 
-// RebaseAll rebases every active, unmerged watch branch. It returns one RebaseResult
-// per watch and joins per-watch failures into the returned error, so a caller
-// can use errors.As to pull a ConflictError out of that error.
+// RebaseAll rebases every active, unmerged watch branch. It returns one
+// RebaseResult per watch and joins per-watch failures into the returned error,
+// so a caller can use errors.As to pull a ConflictError out of that error.
 func (r *Rebaser) RebaseAll(ctx context.Context) ([]RebaseResult, error) {
 	if r == nil || r.Git == nil || r.Store == nil {
 		return nil, fmt.Errorf("orchestrator: rebaser needs git and store")
 	}
-	watches, err := r.Store.ActiveWatches()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	watches, err := r.Store.ActiveWatches(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: active watches: %w", err)
 	}
@@ -113,8 +174,8 @@ func (r *Rebaser) RebaseAll(ctx context.Context) ([]RebaseResult, error) {
 	return results, errors.Join(errs...)
 }
 
-func (r *Rebaser) rebaseWatch(ctx context.Context, w Watch, worktrees map[string]string) (RebaseResult, error) {
-	res := RebaseResult{PR: w.PR, WatchID: w.ID, OldSHA: w.HeadSHA, Branch: r.branchForPR(w.PR)}
+func (r *Rebaser) rebaseWatch(ctx context.Context, w Watch, worktrees []worktreeInfo) (RebaseResult, error) {
+	res := RebaseResult{PR: w.PR, WatchID: w.ID, OldSHA: w.HeadSHA}
 	if r.Merger != nil {
 		merged, err := r.Merger.IsMerged(ctx, w.Repo, w.PR)
 		if err != nil {
@@ -125,12 +186,32 @@ func (r *Rebaser) rebaseWatch(ctx context.Context, w Watch, worktrees map[string
 			return r.skip(res, w.HeadSHA, "merged"), nil
 		}
 	}
-	dir, ok := worktrees[res.Branch]
+	if !r.AutoRebaseCleanBehind {
+		return r.skip(res, w.HeadSHA, "auto-rebase disabled"), nil
+	}
+	branch, err := r.headRefName(ctx, w, worktrees)
+	if err != nil {
+		res.Err = err
+		return res, err
+	}
+	if branch == "" {
+		return r.skip(res, w.HeadSHA, "no head ref"), nil
+	}
+	res.Branch = branch
+	dir, ok := worktreeDir(worktrees, branch)
 	if !ok {
 		return r.skip(res, w.HeadSHA, "no worktree"), nil
 	}
 	res.Worktree = dir
 
+	status, err := r.Git.Run(ctx, dir, "status", "--porcelain")
+	if err != nil {
+		res.Err = fmt.Errorf("orchestrator: PR %d worktree status: %w", w.PR, err)
+		return res, res.Err
+	}
+	if strings.TrimSpace(status) != "" {
+		return r.skip(res, w.HeadSHA, "dirty worktree"), nil
+	}
 	if _, err := r.Git.Run(ctx, dir, "fetch", "origin", "main"); err != nil {
 		res.Err = fmt.Errorf("orchestrator: PR %d fetch: %w", w.PR, err)
 		return res, res.Err
@@ -160,11 +241,21 @@ func (r *Rebaser) rebaseWatch(ctx context.Context, w Watch, worktrees map[string
 	if head == w.HeadSHA {
 		return r.skip(res, head, "head unchanged"), nil
 	}
-	if _, err := r.Git.Run(ctx, dir, "push", "--force-with-lease", "origin", res.Branch); err != nil {
+	// Refuse to rewrite a branch we cannot record. Otherwise the Watch keeps
+	// the old head and an agent spends tokens on a rebase that already ran.
+	if r.Updater == nil {
+		res.Err = fmt.Errorf("orchestrator: PR %d has no watch updater", w.PR)
+		return res, res.Err
+	}
+	if _, err := r.Git.Run(ctx, dir, "push", "--force-with-lease", "origin", branch); err != nil {
 		res.Err = fmt.Errorf("orchestrator: PR %d force push: %w", w.PR, err)
 		return res, res.Err
 	}
 	res.Pushed = true
+	if err := r.Updater.SetHeadSHA(ctx, w.ID, head); err != nil {
+		res.Err = fmt.Errorf("orchestrator: PR %d update head SHA: %w", w.PR, err)
+		return res, res.Err
+	}
 	return res, nil
 }
 
@@ -205,49 +296,164 @@ func (r *Rebaser) headSHA(ctx context.Context, dir string) (string, error) {
 	return sha, nil
 }
 
-// conflict never resolves the rebase. It collects unmerged paths, aborts the
-// rebase and returns a ConflictError the caller can route to the subscriber.
-func (r *Rebaser) conflict(ctx context.Context, w Watch, res RebaseResult) (RebaseResult, error) {
-	diffOut, _ := r.Git.Run(ctx, res.Worktree, "diff", "--name-only", "--diff-filter=U")
-	var files []string
-	for _, line := range strings.Split(diffOut, "\n") {
-		if name := strings.TrimSpace(line); name != "" {
-			files = append(files, name)
+// headRefName takes the branch from the GraphQL snapshot when the resolver is
+// installed. Otherwise it matches the Watch head SHA against the HEAD line of
+// `git worktree list --porcelain`. There is no feat/w%d fallback: a branch we
+// cannot name is skipped, never guessed.
+func (r *Rebaser) headRefName(ctx context.Context, w Watch, worktrees []worktreeInfo) (string, error) {
+	if r.HeadRefs != nil {
+		name, err := r.HeadRefs.HeadRefName(ctx, w.Repo, w.PR)
+		if err != nil {
+			return "", fmt.Errorf("orchestrator: PR %d head ref: %w", w.PR, err)
+		}
+		if name = normalizeRef(name); name != "" {
+			return name, nil
 		}
 	}
-	abortErr := ""
+	if w.HeadSHA == "" {
+		return "", nil
+	}
+	for _, wt := range worktrees {
+		if wt.branch == "" || wt.head == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(w.HeadSHA), strings.ToLower(wt.head)) ||
+			strings.HasPrefix(strings.ToLower(wt.head), strings.ToLower(w.HeadSHA)) {
+			return wt.branch, nil
+		}
+	}
+	return "", nil
+}
+
+// conflict never resolves the rebase. It collects unmerged paths, aborts the
+// rebase, writes verdict=rebase with those paths and wakes the executor. The
+// same paths travel in ConflictError and in the wake reason.
+func (r *Rebaser) conflict(ctx context.Context, w Watch, res RebaseResult) (RebaseResult, error) {
+	files := r.unmergedFiles(ctx, res.Worktree)
+	var errs []error
+	conflictErr := &ConflictError{PR: w.PR, WatchID: w.ID, Files: files}
 	if _, err := r.Git.Run(ctx, res.Worktree, "rebase", "--abort"); err != nil {
-		abortErr = err.Error()
+		conflictErr.AbortErr = err.Error()
 	}
-	res.Err = &ConflictError{PR: w.PR, WatchID: w.ID, Files: files, AbortErr: abortErr}
-	return res, res.Err
+	res.Err = conflictErr
+	errs = append(errs, conflictErr)
+
+	if r.Updater == nil {
+		errs = append(errs, fmt.Errorf("orchestrator: PR %d has no watch updater for conflict", w.PR))
+	} else if err := r.Updater.SetRebase(ctx, w.ID, files); err != nil {
+		errs = append(errs, fmt.Errorf("orchestrator: PR %d mark rebase: %w", w.PR, err))
+	}
+	if r.Waker != nil {
+		reason := conflictReason(files)
+		var wakeErr error
+		if reasonWaker, ok := r.Waker.(ReasonWaker); ok {
+			wakeErr = reasonWaker.WakeWithReason(ctx, w.ID, w.Revision, VerdictRebase, reason)
+		} else {
+			wakeErr = r.Waker.Wake(ctx, w.ID, w.Revision, VerdictRebase)
+		}
+		if wakeErr != nil {
+			errs = append(errs, fmt.Errorf("orchestrator: PR %d wake executor: %w", w.PR, wakeErr))
+		}
+	}
+	return res, errors.Join(errs...)
 }
 
-func (r *Rebaser) branchForPR(pr int) string {
-	if r.BranchForPR != nil {
-		return r.BranchForPR(pr)
-	}
-	return fmt.Sprintf("feat/w%d", pr)
-}
-
-// parseWorktrees maps an attached branch ref to its worktree directory using
-// the porcelain format of git worktree list. Detached worktrees have no branch
-// line and are skipped.
-func parseWorktrees(listing string) map[string]string {
-	out := make(map[string]string)
-	dir := ""
-	for _, line := range strings.Split(listing, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "worktree "):
-			dir = strings.TrimPrefix(line, "worktree ")
-		case strings.HasPrefix(line, "branch "):
-			if dir != "" {
-				branch := strings.TrimPrefix(line, "branch ")
-				branch = strings.TrimPrefix(branch, "refs/heads/")
-				out[branch] = dir
+// unmergedFiles unions the unmerged paths reported by git diff and by git
+// status. The diff catches content conflicts; the status codes catch add/add
+// and delete/modify conflicts that can be missed by a bare diff filter.
+func (r *Rebaser) unmergedFiles(ctx context.Context, dir string) []string {
+	set := make(map[string]bool)
+	if out, err := r.Git.Run(ctx, dir, "diff", "--name-only", "--diff-filter=U"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if name := cleanPath(line); name != "" {
+				set[name] = true
 			}
 		}
 	}
+	if out, err := r.Git.Run(ctx, dir, "status", "--porcelain"); err == nil {
+		for _, line := range strings.Split(out, "\n") {
+			if len(line) < 3 || !isUnmergedCode(line[0], line[1]) {
+				continue
+			}
+			if name := cleanPath(line[2:]); name != "" {
+				set[name] = true
+			}
+		}
+	}
+	files := make([]string, 0, len(set))
+	for name := range set {
+		files = append(files, name)
+	}
+	sort.Strings(files)
+	return files
+}
+
+func conflictReason(files []string) string {
+	if len(files) == 0 {
+		return "rebase conflict; git reported no unmerged paths"
+	}
+	return conflictReasonPrefix + strings.Join(files, ", ")
+}
+
+func cleanPath(s string) string {
+	s = strings.TrimSpace(s)
+	if unquoted, err := strconv.Unquote(s); err == nil {
+		s = unquoted
+	}
+	return strings.TrimSpace(s)
+}
+
+func isUnmergedCode(x, y byte) bool {
+	return x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D')
+}
+
+func normalizeRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	ref = strings.TrimPrefix(ref, "refs/heads/")
+	return strings.TrimSpace(ref)
+}
+
+// worktreeInfo is one attached worktree parsed from `git worktree list
+// --porcelain`. Detached worktrees have a HEAD but no branch and are skipped.
+type worktreeInfo struct {
+	dir    string
+	head   string
+	branch string
+}
+
+func worktreeDir(worktrees []worktreeInfo, branch string) (string, bool) {
+	for _, wt := range worktrees {
+		if wt.branch == branch {
+			return wt.dir, true
+		}
+	}
+	return "", false
+}
+
+// parseWorktrees maps porcelain blocks to their directory, HEAD and branch.
+func parseWorktrees(listing string) []worktreeInfo {
+	var out []worktreeInfo
+	var cur worktreeInfo
+	flush := func() {
+		if cur.dir != "" {
+			out = append(out, cur)
+		}
+		cur = worktreeInfo{}
+	}
+	for _, raw := range strings.Split(listing, "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case line == "":
+			flush()
+		case strings.HasPrefix(line, "worktree "):
+			flush()
+			cur.dir = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		case strings.HasPrefix(line, "HEAD "):
+			cur.head = strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
+		case strings.HasPrefix(line, "branch "):
+			cur.branch = normalizeRef(strings.TrimPrefix(line, "branch "))
+		}
+	}
+	flush()
 	return out
 }
