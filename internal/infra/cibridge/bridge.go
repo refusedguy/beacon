@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -87,8 +88,9 @@ func (b *Bridge) Run(ctx context.Context) {
 }
 
 // Refresh reads every active Watch once and updates those whose CI reached a
-// terminal verdict. Only Watches with subscribers are considered: a Watch
-// without a subscriber has nobody to notify.
+// verdict. Only Watches with subscribers are considered: a Watch without a
+// subscriber has nobody to notify. A terminal PR state closes the Watch even
+// when its verdict already moved to ready or retry.
 func (b *Bridge) Refresh(ctx context.Context) int {
 	if b == nil || b.store == nil || b.ci == nil {
 		return 0
@@ -101,7 +103,7 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	updated := 0
 	for i := range watches {
 		w := watches[i]
-		if w.Verdict != domain.VerdictWatching || len(w.Subscribers) == 0 {
+		if len(w.Subscribers) == 0 {
 			continue
 		}
 		state, err := b.ci.PRState(ctx, w.Repo, w.PR)
@@ -109,10 +111,18 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			log.Printf("cibridge: %s#%d: %v", w.Repo, w.PR, err)
 			continue
 		}
-		if state.HeadRefOid != "" && state.HeadRefOid != w.HeadSHA {
-			continue
+		verdict := verdictFromState(state)
+		if !isTerminalVerdict(verdict) {
+			// A non-terminal refresh re-evaluates only the current verdict at
+			// the same head. Terminal PR states outrank both guards: a merged
+			// or closed PR closes the Watch from any live verdict.
+			if w.Verdict != domain.VerdictWatching {
+				continue
+			}
+			if state.HeadRefOid != "" && state.HeadRefOid != w.HeadSHA {
+				continue
+			}
 		}
-		verdict := verdictFromChecks(state.Checks)
 		if verdict == domain.VerdictWatching {
 			continue
 		}
@@ -124,6 +134,24 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		updated += n
 	}
 	return updated
+}
+
+// verdictFromState derives a verdict from one CI observation. A terminal PR
+// state wins over checks: a merged or closed PR closes its Watch even when its
+// checks are green or absent.
+func verdictFromState(state domain.PRState) domain.Verdict {
+	switch strings.ToUpper(strings.TrimSpace(state.State)) {
+	case "MERGED":
+		return domain.VerdictMerged
+	case "CLOSED":
+		return domain.VerdictClosed
+	default:
+		return verdictFromChecks(state.Checks)
+	}
+}
+
+func isTerminalVerdict(v domain.Verdict) bool {
+	return v == domain.VerdictMerged || v == domain.VerdictClosed
 }
 
 // verdictFromChecks turns observed checks into a verdict. A pending check
@@ -160,7 +188,10 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 	if err != nil {
 		return 0, err
 	}
-	if current.Verdict != domain.VerdictWatching || current.HeadSHA != w.HeadSHA {
+	if current.Status == domain.StatusClosed || current.HeadSHA != w.HeadSHA {
+		return 0, nil
+	}
+	if !isTerminalVerdict(verdict) && current.Verdict != domain.VerdictWatching {
 		return 0, nil
 	}
 
@@ -194,7 +225,9 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 				return 0, err
 			}
 		}
-		if b.waker == nil {
+		// A terminal verdict closes the Watch without steering a session:
+		// there is no further work for a subscriber to do.
+		if b.waker == nil || isTerminalVerdict(verdict) {
 			continue
 		}
 		// A subscriber registered from an MCP call carries its opaque host
