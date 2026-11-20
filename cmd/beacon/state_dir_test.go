@@ -11,6 +11,7 @@ func TestStateDirLegacyOutsideProject(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
 	t.Setenv(beaconStateDirEnv, "")
+	t.Setenv(beaconProjectRootEnv, "")
 	cwd := t.TempDir()
 	t.Chdir(cwd)
 
@@ -28,6 +29,7 @@ func TestStateDirScopedToProject(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
 	t.Setenv(beaconStateDirEnv, "")
+	t.Setenv(beaconProjectRootEnv, "")
 	project := t.TempDir()
 	if err := os.Mkdir(filepath.Join(project, ".git"), 0o755); err != nil {
 		t.Fatalf("mk .git: %v", err)
@@ -69,6 +71,7 @@ func TestStateDirScopedToProject(t *testing.T) {
 func TestStateDirExplicitOverride(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv(beaconProjectRootEnv, "")
 	override := filepath.Join(t.TempDir(), "custom-state")
 	t.Setenv(beaconStateDirEnv, override)
 
@@ -106,5 +109,98 @@ func TestProjectStateKeyStableAndDistinct(t *testing.T) {
 	}
 	if keyA == keyB {
 		t.Fatalf("different absolute paths share key %q", keyA)
+	}
+}
+
+func TestStateDirExplicitRootBeatsCwd(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv(beaconStateDirEnv, "")
+	t.Setenv(beaconProjectRootEnv, "")
+	// Каталог процесса не является проектом: без явного корня был бы legacy-путь.
+	t.Chdir(t.TempDir())
+	canonical := t.TempDir()
+
+	got, err := stateDir(canonical)
+	if err != nil {
+		t.Fatalf("stateDir(root): %v", err)
+	}
+	key, err := projectStateKey(canonical)
+	if err != nil {
+		t.Fatalf("projectStateKey: %v", err)
+	}
+	want := filepath.Join(base, "beacon", "projects", key)
+	if got != want {
+		t.Fatalf("stateDir(root) = %q, want %q", got, want)
+	}
+}
+
+func TestStateDirRootEnvFromPlugin(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv(beaconStateDirEnv, "")
+	t.Chdir(t.TempDir())
+	canonical := t.TempDir()
+	t.Setenv(beaconProjectRootEnv, canonical)
+
+	fromEnv, err := stateDir()
+	if err != nil {
+		t.Fatalf("stateDir with root env: %v", err)
+	}
+	key, err := projectStateKey(canonical)
+	if err != nil {
+		t.Fatalf("projectStateKey: %v", err)
+	}
+	want := filepath.Join(base, "beacon", "projects", key)
+	if fromEnv != want {
+		t.Fatalf("stateDir = %q, want root env path %q", fromEnv, want)
+	}
+
+	// Явный аргумент имеет приоритет перед переменной окружения плагина.
+	other := t.TempDir()
+	fromArg, err := stateDir(other)
+	if err != nil {
+		t.Fatalf("stateDir(other): %v", err)
+	}
+	otherKey, err := projectStateKey(other)
+	if err != nil {
+		t.Fatalf("projectStateKey other: %v", err)
+	}
+	wantOther := filepath.Join(base, "beacon", "projects", otherKey)
+	if fromArg != wantOther {
+		t.Fatalf("stateDir(other) = %q, want %q", fromArg, wantOther)
+	}
+}
+
+func TestStateDirExplicitRootFromWorktree(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", base)
+	t.Setenv(beaconStateDirEnv, "")
+	t.Setenv(beaconProjectRootEnv, "")
+	canonical := t.TempDir()
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: somewhere\n"), 0o644); err != nil {
+		t.Fatalf("write worktree .git: %v", err)
+	}
+	t.Chdir(worktree)
+
+	got, err := stateDir(canonical)
+	if err != nil {
+		t.Fatalf("stateDir(canonical): %v", err)
+	}
+	key, err := projectStateKey(canonical)
+	if err != nil {
+		t.Fatalf("projectStateKey: %v", err)
+	}
+	want := filepath.Join(base, "beacon", "projects", key)
+	if got != want {
+		t.Fatalf("stateDir from worktree = %q, want canonical %q", got, want)
+	}
+	wtKey, err := projectStateKey(worktree)
+	if err != nil {
+		t.Fatalf("projectStateKey worktree: %v", err)
+	}
+	if want == filepath.Join(base, "beacon", "projects", wtKey) {
+		t.Fatal("canonical and worktree keys must differ")
 	}
 }

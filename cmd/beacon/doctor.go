@@ -243,21 +243,42 @@ func findGates(root string) (string, error) {
 // need an isolated store without changing the working directory.
 const beaconStateDirEnv = "BEACON_STATE_DIR"
 
+// beaconProjectRootEnv carries the canonical project root from the OpenCode
+// plugin to the MCP process. It is the explicit input that replaces the old
+// os.Getwd() guess for a plugin instance loaded from a worktree (ADR 0069).
+const beaconProjectRootEnv = "BEACON_PROJECT_ROOT"
+
 // stateDir returns the state directory of the project the caller runs in.
 //
-// When the working directory is a project root (it contains .git, as a file in
-// a worktree or a directory in the main checkout) the state is scoped to that
-// project under <base>/beacon/projects/<name>-<hash>. Different projects then
-// keep separate watches, obligations and open tasks. Outside a project root the
-// legacy <base>/beacon path is kept, so tools run from a subdirectory or a
-// temporary directory still share one store.
-func stateDir() (string, error) {
+// An explicit project root passed by the caller wins over the root in
+// BEACON_PROJECT_ROOT, which the OpenCode plugin sets for its MCP server. Both
+// beat the legacy detection from the working directory. With neither input the
+// old rules stay: a working directory containing .git gets a project-scoped
+// store under <base>/beacon/projects/<name>-<hash>, anything else keeps the
+// legacy <base>/beacon path (ADR 0011).
+//
+// The variadic form keeps the many existing no-argument call sites unchanged.
+func stateDir(root ...string) (string, error) {
 	if override := os.Getenv(beaconStateDirEnv); override != "" {
 		return override, nil
 	}
 	base, err := stateBaseDir()
 	if err != nil {
 		return "", err
+	}
+	projectRoot := strings.TrimSpace(os.Getenv(beaconProjectRootEnv))
+	for _, candidate := range root {
+		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
+			projectRoot = trimmed
+			break
+		}
+	}
+	if projectRoot != "" {
+		key, err := projectStateKey(projectRoot)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Join(base, "beacon", "projects", key), nil
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
