@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,16 +10,20 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 type fakeStore struct {
 	watches      []Watch
 	merged       map[string]bool
 	closed       []string
+	fixAttempts  []string
 	activeErr    error
 	wasMergedErr error
 	recordErr    error
 	closeErr     error
+	fixErr       error
 }
 
 func newFakeStore(watches ...Watch) *fakeStore {
@@ -45,6 +50,11 @@ func (s *fakeStore) RecordMerge(_ context.Context, watchID string, revision uint
 func (s *fakeStore) CloseWatch(_ context.Context, watchID string) error {
 	s.closed = append(s.closed, watchID)
 	return s.closeErr
+}
+
+func (s *fakeStore) RecordFixAttempt(_ context.Context, watchID string) error {
+	s.fixAttempts = append(s.fixAttempts, watchID)
+	return s.fixErr
 }
 
 type mergeCall struct {
@@ -729,5 +739,179 @@ func TestRunCheckedMergeRepeatedPassDoesNotRemerge(t *testing.T) {
 	}
 	if !reflect.DeepEqual(first.Merged, []int{}) || !reflect.DeepEqual(second.Merged, []int{312}) {
 		t.Fatalf("merged = %v then %v", first.Merged, second.Merged)
+	}
+}
+
+func blockedWatch(id string, pr int, revision uint64, attempts int) Watch {
+	return Watch{
+		ID: id, Repo: "refusedguy/beacon", PR: pr, Revision: revision,
+		// A delayed CI poll can leave a stale ready verdict on a blocked Watch.
+		Verdict: VerdictReady,
+		Blocked: &BlockedInfo{
+			Reason:       "чужой тест",
+			FailedChecks: []string{"ci-build"},
+			BlockedBy:    "executor",
+			FixAttempts:  attempts,
+		},
+	}
+}
+
+func installOrchMetrics(t *testing.T) *observe.Metrics {
+	t.Helper()
+	metrics := observe.NewMetrics()
+	observe.SetDefault(observe.NewRecorder(nil, metrics))
+	t.Cleanup(func() { observe.SetDefault(nil) })
+	return metrics
+}
+
+func assertOrchCounter(t *testing.T, metrics *observe.Metrics, name string, want int) {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(metrics.JSON(), &got); err != nil {
+		t.Fatalf("metrics JSON: %v", err)
+	}
+	v, ok := got[name].(float64)
+	if !ok || int(v) != want {
+		t.Errorf("%s = %v, want %d", name, got[name], want)
+	}
+}
+
+func countActions(actions []Action, kind string) int {
+	n := 0
+	for _, a := range actions {
+		if a.Action == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRunBlockedWatchSpawnsFixerOnce proves the blocked branch wins over a
+// stale ready verdict, records exactly one fix attempt and emits the fixer
+// metric. The Watch is never merged or closed on this path.
+func TestRunBlockedWatchSpawnsFixerOnce(t *testing.T) {
+	metrics := installOrchMetrics(t)
+	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
+	merger := &fakeMerger{}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(st.fixAttempts, []string{"w1"}) {
+		t.Fatalf("fix attempts = %q, want [w1]", st.fixAttempts)
+	}
+	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 1)
+	assertOrchCounter(t, metrics, observe.CounterBlocksEscalated, 0)
+	if len(merger.calls) != 0 || len(st.closed) != 0 || len(result.Merged) != 0 {
+		t.Fatalf("blocked Watch merged: calls=%v closed=%q merged=%v", merger.calls, st.closed, result.Merged)
+	}
+	if n := countActions(result.Actions, ActionBlockedFixAgent); n != 1 {
+		t.Fatalf("blocked-fix-agent actions = %d, want 1: %+v", n, result.Actions)
+	}
+	for _, a := range result.Actions {
+		if a.Action == ActionBlockedFixAgent && a.Message != "чужой тест" {
+			t.Fatalf("fix agent message = %q, want block reason", a.Message)
+		}
+	}
+}
+
+// TestRunBlockedWatchEscalatesAtCap proves the third exhausted decision sends
+// the escalation metric and spends no fix-attempt budget.
+func TestRunBlockedWatchEscalatesAtCap(t *testing.T) {
+	metrics := installOrchMetrics(t)
+	st := newFakeStore(blockedWatch("w1", 42, 3, MaxFixAttempts))
+	merger := &fakeMerger{}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOrchCounter(t, metrics, observe.CounterBlocksEscalated, 1)
+	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 0)
+	if len(st.fixAttempts) != 0 {
+		t.Fatalf("escalation must not record a fix attempt: %q", st.fixAttempts)
+	}
+	if n := countActions(result.Actions, ActionBlockEscalated); n != 1 {
+		t.Fatalf("block-escalated actions = %d, want 1: %+v", n, result.Actions)
+	}
+	for _, a := range result.Actions {
+		if a.Action == ActionBlockEscalated && a.Message != ReasonEscalateHuman {
+			t.Fatalf("escalation message = %q, want %q", a.Message, ReasonEscalateHuman)
+		}
+	}
+}
+
+// TestRunBlockedWatchDoesNotDoubleIncrement proves one decision per pass: two
+// passes over the same block spend exactly one attempt each, and no pass adds
+// a second increment or a second metric.
+func TestRunBlockedWatchDoesNotDoubleIncrement(t *testing.T) {
+	metrics := installOrchMetrics(t)
+	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
+	merger := &fakeMerger{}
+
+	first, err := Run(context.Background(), st, merger, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countActions(first.Actions, ActionBlockedFixAgent); n != 1 {
+		t.Fatalf("first pass fix-agent actions = %d, want 1", n)
+	}
+	if !reflect.DeepEqual(st.fixAttempts, []string{"w1"}) {
+		t.Fatalf("first pass fix attempts = %q, want [w1]", st.fixAttempts)
+	}
+
+	// The store persisted 0 -> 1. The next pass sees the new block record.
+	st.watches[0].Blocked.FixAttempts = 1
+	second, err := Run(context.Background(), st, merger, nil, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countActions(second.Actions, ActionBlockedFixAgent); n != 1 {
+		t.Fatalf("second pass fix-agent actions = %d, want 1", n)
+	}
+	if !reflect.DeepEqual(st.fixAttempts, []string{"w1", "w1"}) {
+		t.Fatalf("fix attempts = %q, want [w1 w1]", st.fixAttempts)
+	}
+	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 2)
+	assertOrchCounter(t, metrics, observe.CounterBlocksEscalated, 0)
+}
+
+// TestRunBlockedFixAttemptWriteFailureIsReported proves a failed persist is an
+// error and does not emit the fixer metric.
+func TestRunBlockedFixAttemptWriteFailureIsReported(t *testing.T) {
+	metrics := installOrchMetrics(t)
+	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
+	st.fixErr = errors.New("store down")
+
+	_, err := Run(context.Background(), st, nil, nil, Options{})
+
+	if err == nil || !strings.Contains(err.Error(), "record fix attempt w1") {
+		t.Fatalf("error = %v, want the fix-attempt write error", err)
+	}
+	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 0)
+	if !reflect.DeepEqual(st.fixAttempts, []string{"w1"}) {
+		t.Fatalf("fix attempts = %q, want one attempted write", st.fixAttempts)
+	}
+}
+
+// TestRunBlockedDryRunHasNoSideEffects keeps the merge dry-run contract: the
+// action is reported, but no attempt is persisted and no fixer is announced.
+func TestRunBlockedDryRunHasNoSideEffects(t *testing.T) {
+	metrics := installOrchMetrics(t)
+	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
+
+	result, err := Run(context.Background(), st, nil, nil, Options{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.fixAttempts) != 0 {
+		t.Fatalf("dry run persisted fix attempts: %q", st.fixAttempts)
+	}
+	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 0)
+	if n := countActions(result.Actions, ActionBlockedFixAgent); n != 1 {
+		t.Fatalf("dry run fix-agent actions = %d, want 1", n)
 	}
 }

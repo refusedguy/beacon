@@ -764,6 +764,8 @@ func (emptyOrchestratorStore) RecordMerge(context.Context, string, uint64) error
 
 func (emptyOrchestratorStore) CloseWatch(context.Context, string) error { return nil }
 
+func (emptyOrchestratorStore) RecordFixAttempt(context.Context, string) error { return nil }
+
 // TestMCPStartsDaemonCycle proves that `beacon mcp` starts the full daemon
 // cycle inside its own process. The ports and the loop are replaced by seams;
 // the test observes the interval, the continuous (once=false) mode, the stop

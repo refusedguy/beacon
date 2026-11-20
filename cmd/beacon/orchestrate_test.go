@@ -8,14 +8,17 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 type orchFakeStore struct {
-	watches []orchestrator.Watch
-	merged  map[string]bool
-	closed  []string
+	watches     []orchestrator.Watch
+	merged      map[string]bool
+	closed      []string
+	fixAttempts []string
 }
 
 func newOrchFakeStore(watches ...orchestrator.Watch) *orchFakeStore {
@@ -44,6 +47,11 @@ func (s *orchFakeStore) CloseWatch(_ context.Context, watchID string) error {
 	return nil
 }
 
+func (s *orchFakeStore) RecordFixAttempt(_ context.Context, watchID string) error {
+	s.fixAttempts = append(s.fixAttempts, watchID)
+	return nil
+}
+
 type orchFakeMerger struct{ calls []int }
 
 func (m *orchFakeMerger) Merge(_ context.Context, _ string, pr int) error {
@@ -58,6 +66,80 @@ func withOrchDeps(t *testing.T, st orchestrator.Store, merger orchestrator.Merge
 	SetOrchestratorDeps(func(*CLI) (orchestratorDeps, func() error, error) {
 		return orchestratorDeps{Store: st, Merger: merger, Waker: waker}, func() error { return nil }, nil
 	})
+}
+
+// TestProjectWatchCopiesBlocked proves the composition-root projection carries
+// the block details, including FIXAttempts, into the orchestrator's decision
+// shape. FailedChecks is copied so later mutation of the domain Watch cannot
+// change a decision already made.
+func TestProjectWatchCopiesBlocked(t *testing.T) {
+	checks := []string{"ci-build", "gates"}
+	w := domain.Watch{
+		ID: "w1", Repo: "refusedguy/beacon", PR: 42, HeadSHA: "abc123",
+		Verdict: domain.VerdictBlocked, Revision: 7,
+		Blocked: &domain.BlockedInfo{
+			Reason:       "чужой тест",
+			FailedChecks: checks,
+			Since:        time.Unix(1, 0),
+			BlockedBy:    "executor",
+			FixAttempts:  2,
+		},
+	}
+
+	got := projectWatch(w)
+
+	if got.Blocked == nil {
+		t.Fatal("projection dropped Watch.Blocked")
+	}
+	if got.Blocked.Reason != "чужой тест" || got.Blocked.BlockedBy != "executor" {
+		t.Fatalf("block context = %+v", got.Blocked)
+	}
+	if got.Blocked.FixAttempts != 2 {
+		t.Fatalf("FixAttempts = %d, want 2", got.Blocked.FixAttempts)
+	}
+	if !reflect.DeepEqual(got.Blocked.FailedChecks, []string{"ci-build", "gates"}) {
+		t.Fatalf("FailedChecks = %v", got.Blocked.FailedChecks)
+	}
+	if got.ID != w.ID || got.PR != w.PR || got.HeadSHA != w.HeadSHA ||
+		got.Revision != w.Revision || got.Verdict != string(w.Verdict) {
+		t.Fatalf("identity fields = %+v", got)
+	}
+
+	w.Blocked.FailedChecks[0] = "mutated"
+	w.Blocked.FixAttempts = 99
+	if got.Blocked.FailedChecks[0] != "ci-build" || got.Blocked.FixAttempts != 2 {
+		t.Fatalf("projection shares block state with the domain Watch: %+v", got.Blocked)
+	}
+
+	if nilBlocked := projectWatch(domain.Watch{ID: "w2"}).Blocked; nilBlocked != nil {
+		t.Fatalf("unblocked Watch projected with block info: %+v", nilBlocked)
+	}
+}
+
+// TestProjectActiveWatchesIncludesBlocked proves the orchestrator actually
+// sees a blocked Watch: domain ActiveWatches omits it, so the projection must
+// read all Watches and keep the blocked status explicitly.
+func TestProjectActiveWatchesIncludesBlocked(t *testing.T) {
+	all := []domain.Watch{
+		{ID: "watching", Status: domain.StatusWatching},
+		{ID: "notifying", Status: domain.StatusNotifying},
+		{ID: "blocked", Status: domain.StatusBlocked, Blocked: &domain.BlockedInfo{Reason: "чужой тест", FixAttempts: 1}},
+		{ID: "closed", Status: domain.StatusClosed},
+		{ID: "parked", Status: domain.StatusParked},
+	}
+
+	got := projectActiveWatches(all)
+
+	ids := make([]string, 0, len(got))
+	for _, w := range got {
+		ids = append(ids, w.ID)
+	}
+	if !reflect.DeepEqual(ids, []string{"watching", "notifying", "blocked"}) {
+		t.Fatalf("projected IDs = %q, want watching/notifying/blocked", ids)
+	}
+	if got[2].Blocked == nil || got[2].Blocked.FixAttempts != 1 {
+		t.Fatalf("blocked projection lost FixAttempts: %+v", got[2])
+	}
 }
 
 func TestOrchestrateDispatch(t *testing.T) {

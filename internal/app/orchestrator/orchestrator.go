@@ -37,6 +37,10 @@ const (
 	ActionNeedsRebase = "needs-rebase"
 	ActionWake        = "wake"
 	ActionWait        = "wait"
+	// ActionBlockedFixAgent records one FIX agent request for a blocked Watch.
+	ActionBlockedFixAgent = "blocked-fix-agent"
+	// ActionBlockEscalated records a blocked Watch that exhausted its FIX budget.
+	ActionBlockEscalated = "block-escalated"
 )
 
 // AutoMergePolicy is the autor-merge policy of one Watch. AutoMerge is a
@@ -190,6 +194,9 @@ type Store interface {
 	WasMerged(ctx context.Context, watchID string, revision uint64) (bool, error)
 	RecordMerge(ctx context.Context, watchID string, revision uint64) error
 	CloseWatch(ctx context.Context, watchID string) error
+	// RecordFixAttempt persists one more FIX agent attempt on the Watch's
+	// block record. The counter belongs to the block, so an unblock resets it.
+	RecordFixAttempt(ctx context.Context, watchID string) error
 }
 
 // Waker asks a subscriber to act on a retry/fail/wait Watch. Wake delivery
@@ -242,9 +249,10 @@ type Options struct {
 // Run walks the active Watches once. Ready Watches with autor-merge enabled
 // are merged at most once per (watchID, revision), then closed. Watches held
 // by dependencies produce a wait with a reason and wake their subscriber.
-// Retry/fail Watches are reported and handed to the Waker, never repaired
-// here. Errors from individual Watches are collected so one bad Watch cannot
-// hide the rest; the returned Result still describes everything that happened.
+// Blocked Watches ask for one FIX agent per pass and escalate once the cap is
+// reached. Retry/fail Watches are reported and handed to the Waker, never
+// repaired here. Errors from individual Watches are collected so one bad Watch
+// cannot hide the rest; the returned Result still describes everything.
 func Run(ctx context.Context, st Store, merger Merger, waker Waker, opts Options) (Result, error) {
 	return RunWithResolver(ctx, st, merger, waker, opts.Resolver, opts)
 }
@@ -284,6 +292,10 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 
 	for _, w := range watches {
 		switch {
+		case w.Blocked != nil:
+			// Blocked wins over a stale ready verdict and over retry. Decide
+			// reads the block first, so a blocked Watch can never merge here.
+			handleBlocked(ctx, st, w, resolver, opts, &out, &errs)
 		case w.isReady():
 			verdict, reason, err := w.canAutoMerge(ctx, resolver)
 			if err != nil {
@@ -322,6 +334,43 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 		}
 	}
 	return out, errors.Join(errs...)
+}
+
+// handleBlocked turns one blocked Watch into exactly one decision per pass.
+// Decide owns the FIX-attempt cap: below the cap the Watch asks for another FIX
+// agent and the pass records one attempt; at the cap the Watch is escalated to
+// a human. There is no direct fixer spawn in this process, so one
+// BLOCKED_FIX_AGENT decision is one fixer attempt. The switch in RunWithResolver
+// calls this once per Watch, which keeps a single decision from incrementing
+// the counter twice or emitting the metric twice.
+func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyResolver, opts Options, out *Result, errs *[]error) {
+	d := Decide(w, resolver, CIState{})
+	if d.Kind == DecisionNotifyOrchestrator && d.Reason == ReasonEscalateHuman {
+		observe.BlockEscalated(w.ID, ReasonEscalateHuman)
+		out.Actions = append(out.Actions, Action{
+			Action: ActionBlockEscalated, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+			Message: ReasonEscalateHuman,
+		})
+		return
+	}
+	if d.Kind != DecisionBlockedFixAgent {
+		return
+	}
+	out.Actions = append(out.Actions, Action{
+		Action: ActionBlockedFixAgent, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+		Message: d.Reason,
+	})
+	if opts.DryRun {
+		return
+	}
+	if err := st.RecordFixAttempt(ctx, w.ID); err != nil {
+		observe.ActorError("fix-attempt-store", w.ID, err)
+		*errs = append(*errs, fmt.Errorf("orchestrator: record fix attempt %s: %w", w.ID, err))
+		return
+	}
+	// The metric follows a persisted attempt, so a failed write cannot look
+	// like a spawned fixer.
+	observe.FixerSpawned(w.ID)
 }
 
 // mergeOne performs the idempotent merge branch for one ready Watch. A merger

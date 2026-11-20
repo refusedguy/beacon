@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -158,11 +159,63 @@ func (m ghMerger) Merge(ctx context.Context, repo string, pr int) error {
 
 // orchWatchReaderFunc adapts a function to the orchestrator's WatchReader
 // port. The projection from the domain store happens here in the composition
-// root, so neither cmd nor the app package needs to name domain types.
+// root, so the orchestrator app package never needs to name domain types.
 type orchWatchReaderFunc func(context.Context) ([]orchestrator.Watch, error)
 
 func (f orchWatchReaderFunc) ActiveWatches(ctx context.Context) ([]orchestrator.Watch, error) {
 	return f(ctx)
+}
+
+// projectBlocked copies the domain block record into the orchestrator's view.
+// FailedChecks is copied so later mutation of the domain Watch cannot reach the
+// decision. Since is deliberately absent: the orchestrator only needs the
+// reason, the checks, the blocker and the FIX-attempt budget.
+func projectBlocked(b *domain.BlockedInfo) *orchestrator.BlockedInfo {
+	if b == nil {
+		return nil
+	}
+	return &orchestrator.BlockedInfo{
+		Reason:       b.Reason,
+		FailedChecks: append([]string(nil), b.FailedChecks...),
+		BlockedBy:    b.BlockedBy,
+		FixAttempts:  b.FixAttempts,
+	}
+}
+
+// projectWatch maps one domain Watch onto the orchestrator's decision shape.
+// The block record travels with it, so Decide sees a block even when the
+// verdict still reads ready.
+func projectWatch(w domain.Watch) orchestrator.Watch {
+	var policy *orchestrator.AutoMergePolicy
+	if raw, err := json.Marshal(w); err == nil {
+		policy = orchestrator.PolicyFromPayload(raw)
+	}
+	return orchestrator.Watch{
+		ID:       w.ID,
+		Repo:     w.Repo,
+		PR:       w.PR,
+		HeadSHA:  w.HeadSHA,
+		Verdict:  string(w.Verdict),
+		Revision: w.Revision,
+		Policy:   policy,
+		Blocked:  projectBlocked(w.Blocked),
+	}
+}
+
+// projectActiveWatches keeps the statuses the orchestrator decides on. A
+// blocked Watch is not part of domain ActiveWatches, so it is included here
+// explicitly; closed, parked and needs_input Watches stay out.
+func projectActiveWatches(all []domain.Watch) []orchestrator.Watch {
+	out := make([]orchestrator.Watch, 0, len(all))
+	for _, w := range all {
+		switch w.Status {
+		case domain.StatusWatching, domain.StatusNotifying, domain.StatusBlocked:
+		default:
+			continue
+		}
+		out = append(out, projectWatch(w))
+	}
+	return out
 }
 
 // defaultOrchestratorDeps opens the real state store from the same directory
@@ -179,27 +232,14 @@ func defaultOrchestratorDeps(c *CLI) (orchestratorDeps, func() error, error) {
 		return orchestratorDeps{}, nil, fmt.Errorf("beacon orchestrate: store is not *store.DB")
 	}
 	reader := orchWatchReaderFunc(func(_ context.Context) ([]orchestrator.Watch, error) {
-		all, err := deps.Store.ActiveWatches()
+		// A blocked Watch is absent from ActiveWatches (status=blocked). Read
+		// every Watch and keep the active ones plus the blocked ones, so the
+		// orchestrator can see the block and spend the FIX-attempt budget.
+		all, err := deps.Store.AllWatches()
 		if err != nil {
 			return nil, err
 		}
-		out := make([]orchestrator.Watch, 0, len(all))
-		for _, w := range all {
-			var policy *orchestrator.AutoMergePolicy
-			if raw, err := json.Marshal(w); err == nil {
-				policy = orchestrator.PolicyFromPayload(raw)
-			}
-			out = append(out, orchestrator.Watch{
-				ID:       w.ID,
-				Repo:     w.Repo,
-				PR:       w.PR,
-				HeadSHA:  w.HeadSHA,
-				Verdict:  string(w.Verdict),
-				Revision: w.Revision,
-				Policy:   policy,
-			})
-		}
-		return out, nil
+		return projectActiveWatches(all), nil
 	})
 	return orchestratorDeps{
 		Store:  orchestrator.NewDBStore(reader, db),

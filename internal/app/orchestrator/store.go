@@ -100,6 +100,26 @@ func (s *DBStore) RecordMerge(ctx context.Context, watchID string, revision uint
 	})
 }
 
+// RecordFixAttempt persists one FIX agent attempt for a blocked Watch. The
+// domain method is the pure copy that owns the increment, so the counter lives
+// on the block record and an unblock clears it with the rest of the record.
+// A Watch that was unblocked between projection and this call is left alone.
+func (s *DBStore) RecordFixAttempt(ctx context.Context, watchID string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("orchestrator: fix attempt store is nil")
+	}
+	_ = ctx
+	w, err := s.db.Watch(watchID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: load watch %s for fix attempt: %w", watchID, err)
+	}
+	next := w.RecordFixAttempt()
+	if next.Blocked == nil {
+		return nil
+	}
+	return s.db.SaveWatch(next)
+}
+
 // CloseWatch closes the Watch for every subscriber using the same operation
 // as beacon_cancel_watch with scope=all: a domain transition, a persisted
 // Watch and one append-only audit event. A nil clock keeps the wall-clock
