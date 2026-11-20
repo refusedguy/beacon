@@ -1091,6 +1091,197 @@ func TestAckBlockedNotMineIdempotent(t *testing.T) {
 	}
 }
 
+// blockedAckFixture wires a Watch blocked by a not_mine ack, a fixer
+// subscriber and the obligation the ack claims. The fixFor link models the fix
+// that cleared the block: unblock changes lifecycle fields only and leaves the
+// link and its subscriber in the Watch history.
+func blockedAckFixture(t *testing.T, clock *stepClock) (*memStore, *recordingStamper, *AckHandler, domain.Watch, domain.Obligation) {
+	t.Helper()
+	w := resultFixture(domain.VerdictRetry)
+	w.Status = domain.StatusWatching
+	w.FixFor = "watch-fix-source"
+	w.Subscribers = []domain.Subscriber{{
+		ID:      "ses_fixer",
+		Role:    domain.RoleFixer,
+		Adapter: "opencode",
+		Target:  "ses_fixer",
+		FixFor:  "watch-fix-source",
+		AddedAt: clock.t,
+	}}
+	blocked, _ := domain.Transition(w, domain.BlockEvent(domain.BlockedInfo{
+		Reason:    blockedReasonNotMine,
+		Since:     clock.t,
+		BlockedBy: "session-blocker",
+	}, clock.t))
+	if blocked.Status != domain.StatusBlocked {
+		t.Fatalf("fixture Watch is not blocked: %+v", blocked)
+	}
+	o := resultObligation(blocked, "ses_fixer")
+	store := newMemStore()
+	if err := store.SaveWatch(blocked); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+	return store, stamper, h, blocked, o
+}
+
+// TestAckBlockedResolvedUnblocksWatch proves blocked:resolved clears a block in
+// place. The Watch returns to watching at a fresh revision with Blocked nil, no
+// successor is created and the ack still records the claim.
+func TestAckBlockedResolvedUnblocksWatch(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
+	store, stamper, h, w, o := blockedAckFixture(t, clock)
+
+	receipt, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved),
+	})
+	if err != nil {
+		t.Fatalf("resolved ack: %v", err)
+	}
+	if !receipt.OK || !receipt.Unblocked || receipt.Blocked {
+		t.Errorf("resolved receipt = %+v, want ok and unblocked without a block", receipt)
+	}
+	if receipt.Decision != DecisionBlockedResolved {
+		t.Errorf("receipt decision = %q, want %q", receipt.Decision, DecisionBlockedResolved)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read Watch after resolve: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+		t.Errorf("resolve did not resume the Watch: status %q verdict %q", got.Status, got.Verdict)
+	}
+	if got.Blocked != nil {
+		t.Errorf("resolve left Blocked set: %+v", got.Blocked)
+	}
+	if got.Revision != w.Revision+1 {
+		t.Errorf("revision = %d, want %d", got.Revision, w.Revision+1)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("resolve created %d Watches, want 1", len(store.watches))
+	}
+	stamped, ok := stamper.snapshot(o.ID)
+	if !ok || stamped.ClaimedAt.IsZero() {
+		t.Error("resolved ack did not record the intention with claimedAt")
+	}
+}
+
+// TestAckBlockedResolvedIdempotent proves one ack unblocks once. A repeat
+// resolve on the watching Watch is a no-op: the receipt reports no unblock, the
+// clock does not move the revision and the MCP response stays ok-only.
+func TestAckBlockedResolvedIdempotent(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)}
+	store, _, h, w, o := blockedAckFixture(t, clock)
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved)}
+
+	first, err := h.AckReceipt(context.Background(), in)
+	if err != nil || !first.Unblocked {
+		t.Fatalf("first resolve: receipt %+v err %v", first, err)
+	}
+	clock.Advance(time.Hour)
+
+	second, err := h.AckReceipt(context.Background(), in)
+	if err != nil {
+		t.Fatalf("repeat resolve: %v", err)
+	}
+	if !second.OK || second.Unblocked || second.Blocked {
+		t.Errorf("repeat resolve receipt = %+v, want ok without a new unblock", second)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Status != domain.StatusWatching || got.Blocked != nil || got.Revision != w.Revision+1 {
+		t.Errorf("repeat resolve changed the Watch: %+v err %v", got, err)
+	}
+
+	_, out, err := h.Handle(context.Background(), sessionReq("ses_fixer"), in)
+	if err != nil || !out.OK {
+		t.Fatalf("Handle with resolve: out %+v err %v", out, err)
+	}
+	body, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(body, &fields); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(fields) != 1 || fields["ok"] != true {
+		t.Errorf("resolve ack response = %s, want only ok:true", body)
+	}
+}
+
+// TestAckBlockedResolvedRequiresBlockedWatch keeps a resolve from moving a
+// Watch that was never blocked. The ack is refused with a clear invalid-input
+// error and neither the Watch nor the obligation changes.
+func TestAckBlockedResolvedRequiresBlockedWatch(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictReady)
+	o := resultObligation(w, "session-live")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+
+	_, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved),
+	})
+	if err == nil {
+		t.Fatal("resolve on a Watch that was never blocked was accepted")
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+
+	got, _ := store.Watch(w.ID)
+	if got.Status != w.Status || got.Revision != w.Revision || got.Blocked != nil {
+		t.Errorf("resolve changed a live Watch: %+v", got)
+	}
+	_, claims := stamper.counts()
+	if claims != 0 {
+		t.Errorf("refused resolve stamped the obligation %d times", claims)
+	}
+}
+
+// TestAckBlockedResolvedKeepsFixFor proves the fixFor link is repair history,
+// not state to clear: both the Watch field and the fixer subscriber survive the
+// unblock unchanged.
+func TestAckBlockedResolvedKeepsFixFor(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)}
+	store, _, h, w, o := blockedAckFixture(t, clock)
+	if w.FixFor == "" || len(w.Subscribers) != 1 {
+		t.Fatalf("fixture has no fixFor history: %+v", w)
+	}
+
+	if _, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved),
+	}); err != nil {
+		t.Fatalf("resolved ack: %v", err)
+	}
+	got, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read Watch after resolve: %v", err)
+	}
+	if got.FixFor != w.FixFor {
+		t.Errorf("Watch.FixFor = %q, want %q", got.FixFor, w.FixFor)
+	}
+	if len(got.Subscribers) != 1 {
+		t.Fatalf("resolve changed subscribers: %+v", got.Subscribers)
+	}
+	if sub := got.Subscribers[0]; sub.Role != domain.RoleFixer || sub.FixFor != w.Subscribers[0].FixFor {
+		t.Errorf("fixer subscriber changed: %+v", sub)
+	}
+}
+
 // TestAckBlockedEscalationMetric proves a successful block escalates once and
 // an idempotent repeat does not increment the counter again. It also checks
 // that the fixer counter is exported as a plain total.

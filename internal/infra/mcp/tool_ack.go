@@ -24,10 +24,14 @@
 // acks and continueOf acks behave exactly as before when no decision is set.
 //
 // A decision carrying the blocked: prefix classifies a red verdict instead of
-// resuming an agent. Only blocked:not_mine is accepted: the executor marks the
-// Watch blocked, records the failed checks from the Watch, the time of the ack
-// and the session ID from _meta as the blocker, then stops. A repeat is a
-// no-op, so one Watch can carry only one block. No MCP tool is added for this:
+// resuming an agent. blocked:not_mine marks the Watch blocked, recording the
+// failed checks from the Watch, the time of the ack and the session ID from
+// _meta as the blocker. blocked:resolved clears that block after a fix is
+// confirmed: it applies the domain UnblockEvent and returns the Watch to
+// watching. Both are idempotent: a repeat block cannot move the first block,
+// and a repeat resolve on a Watch that is no longer blocked is a no-op. The
+// fixFor link on the Watch and its subscribers stays in place, so the history
+// of which fixer repaired the block survives. No MCP tool is added for this:
 // the contract stays at exactly seven tools.
 package mcp
 
@@ -62,15 +66,26 @@ const (
 	// Watch and records why. The blocked family is handled separately from
 	// Valid so the closed approve/reject set stays unchanged.
 	DecisionBlockedNotMine Decision = "blocked:not_mine"
+	// DecisionBlockedResolved is the blocked:resolved classification. It clears
+	// the block on the Watch named by the ack once a fix is confirmed. Like the
+	// not_mine reason it is handled outside Valid and never resumes an agent.
+	DecisionBlockedResolved Decision = "blocked:resolved"
 )
 
 // decisionBlockedPrefix marks the blocked decision family. A decision with this
 // prefix is classified by blockedDecisionReason, never by Decision.Valid.
 const decisionBlockedPrefix = "blocked:"
 
+// The blocked family is closed: only these reasons are dispatched by the ack
+// path. Any other reason is refused before a Watch or an obligation is written.
+const (
+	blockedReasonNotMine  = "not_mine"
+	blockedReasonResolved = "resolved"
+)
+
 // blockedDecisionReason returns the reason carried by a blocked: decision. The
 // bool is false when d belongs to another decision family. An unknown reason is
-// rejected by applyBlockedDecision, so it never blocks a Watch.
+// rejected by the ack path's switch, so it never moves a Watch.
 func blockedDecisionReason(d string) (string, bool) {
 	if !strings.HasPrefix(d, decisionBlockedPrefix) {
 		return "", false
@@ -103,11 +118,12 @@ type AckInput struct {
 	// the Watch has committed is discarded before any write.
 	Revision uint64 `json:"revision,omitempty" jsonschema:"Watch revision this ack was given at; an older revision is discarded; not the webhook event.id"`
 	// Decision, when set, is an approve or reject answer that resumes a stopped
-	// agent (ADR 0058 §4), or blocked:not_mine, which blocks the Watch with the
-	// failed checks, the ack time and the calling session as blocker. It is
+	// agent (ADR 0058 §4), blocked:not_mine, which blocks the Watch with the
+	// failed checks, the ack time and the calling session as blocker, or
+	// blocked:resolved, which clears the block after a fix is confirmed. It is
 	// additive to the plain ack contract: an empty value keeps ADR 0028
 	// unchanged. No decision can be combined with continueOf.
-	Decision string `json:"decision,omitempty" jsonschema:"approve or reject answer that resumes the stopped agent, or blocked:not_mine to block the Watch; empty keeps the plain ack contract"`
+	Decision string `json:"decision,omitempty" jsonschema:"approve or reject answer that resumes the stopped agent, blocked:not_mine to block the Watch, or blocked:resolved to clear a confirmed block; empty keeps the plain ack contract"`
 	// DecisionID correlates the answer with the pending approval that raised
 	// the notification (ADR 0058 §4). It is recorded with the decision so a
 	// client can name which request was answered. It is optional for a plain
@@ -159,6 +175,10 @@ type AckReceipt struct {
 	Blocked bool `json:"blocked,omitempty"`
 	// Block is the block record applied by this ack, when any.
 	Block *BlockedWatch `json:"block,omitempty"`
+	// Unblocked is true when this ack applied a blocked:resolved decision to a
+	// blocked Watch. A repeat leaves it false because a Watch unblocks at most
+	// once.
+	Unblocked bool `json:"unblocked,omitempty"`
 }
 
 // DecisionRecord is one decision applied to a stopped Watch. ResumedAt is the
@@ -418,7 +438,8 @@ func (ackWallClock) Now() time.Time { return time.Now() }
 // unchanged for ordinary acks and for acks that carry a decision: the decision
 // receipt, including whether the agent resumed, is available from Decide or
 // AckReceipt. A blocked:not_mine decision takes the session ID from req's _meta
-// and names it as the blocker in the block record.
+// and names it as the blocker in the block record. A blocked:resolved decision
+// needs no session: it clears the block on the Watch named by the ack.
 func (h *AckHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in AckInput) (*mcpsdk.CallToolResult, OKOutput, error) {
 	var sessionID string
 	if id := SessionIDFromRequest(req); id != nil {
@@ -461,7 +482,7 @@ func (h *AckHandler) AckReceipt(ctx context.Context, in AckInput) (AckReceipt, e
 
 // ackReceiptWithSession is the ack path with the caller's opaque session ID from
 // _meta. The session is used only by a blocked:not_mine decision, as BlockedBy;
-// plain acks and approve/reject decisions ignore it.
+// plain acks, approve/reject decisions and blocked:resolved ignore it.
 func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, sessionID string) (AckReceipt, error) {
 	if in.WatchID == "" || in.ObligationID == "" {
 		return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: watchID and obligationID are required")
@@ -493,16 +514,31 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 
 	var receipt AckReceipt
 	if reason, isBlocked := blockedDecisionReason(in.Decision); isBlocked {
-		rec, applied, err := h.applyBlockedDecision(in, w, reason, sessionID)
-		if err != nil {
-			return AckReceipt{}, err
-		}
-		block := rec
-		receipt = AckReceipt{
-			Decision:   Decision(in.Decision),
-			DecisionID: in.DecisionID,
-			Blocked:    applied,
-			Block:      &block,
+		switch reason {
+		case blockedReasonNotMine:
+			rec, applied, err := h.applyBlockedNotMine(in, w, sessionID)
+			if err != nil {
+				return AckReceipt{}, err
+			}
+			block := rec
+			receipt = AckReceipt{
+				Decision:   Decision(in.Decision),
+				DecisionID: in.DecisionID,
+				Blocked:    applied,
+				Block:      &block,
+			}
+		case blockedReasonResolved:
+			applied, err := h.applyBlockedResolved(w)
+			if err != nil {
+				return AckReceipt{}, err
+			}
+			receipt = AckReceipt{
+				Decision:   Decision(in.Decision),
+				DecisionID: in.DecisionID,
+				Unblocked:  applied,
+			}
+		default:
+			return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: unknown blocked decision reason: "+reason)
 		}
 	} else if in.Decision != "" {
 		var rec DecisionRecord
@@ -564,16 +600,12 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 	})
 }
 
-// applyBlockedDecision records a blocked:not_mine classification and blocks the
-// Watch once. Only the not_mine reason is supported: another blocked: reason is
-// refused before anything is written. The session ID comes from the request
-// _meta and is never taken from the client supplied input. A repeat is an
-// idempotent no-op even when the Watch is already blocked, so neither the block
-// record nor the Watch changes on a second call.
-func (h *AckHandler) applyBlockedDecision(in AckInput, w domain.Watch, reason, sessionID string) (BlockedWatch, bool, error) {
-	if reason != "not_mine" {
-		return BlockedWatch{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: unknown blocked decision reason: "+reason)
-	}
+// applyBlockedNotMine records a blocked:not_mine classification and blocks the
+// Watch once. The session ID comes from the request _meta and is never taken
+// from the client supplied input. A repeat is an idempotent no-op even when the
+// Watch is already blocked, so neither the block record nor the Watch changes
+// on a second call.
+func (h *AckHandler) applyBlockedNotMine(in AckInput, w domain.Watch, sessionID string) (BlockedWatch, bool, error) {
 	if sessionID == "" {
 		return BlockedWatch{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: blocked decision requires sessionID from _meta")
 	}
@@ -583,7 +615,7 @@ func (h *AckHandler) applyBlockedDecision(in AckInput, w domain.Watch, reason, s
 	failed := collectFailedChecks(w)
 	rec := BlockedWatch{
 		WatchID:        in.WatchID,
-		Reason:         reason,
+		Reason:         blockedReasonNotMine,
 		FailedChecks:   failed,
 		Since:          h.clock.Now(),
 		BlockedBy:      sessionID,
@@ -605,8 +637,36 @@ func (h *AckHandler) applyBlockedDecision(in AckInput, w domain.Watch, reason, s
 	if err := h.blockWatch(w, info); err != nil {
 		return BlockedWatch{}, false, err
 	}
-	observe.BlockEscalated(in.WatchID, reason)
+	observe.BlockEscalated(in.WatchID, blockedReasonNotMine)
 	return rec, true, nil
+}
+
+// applyBlockedResolved clears the block on a Watch whose fix was confirmed. It
+// applies the domain UnblockEvent so the Watch returns to watching with a fresh
+// revision and no Blocked info. A Watch that is not blocked is left alone: the
+// domain transition is a no-op for it, so a repeat resolve changes nothing.
+// Unblock touches only lifecycle fields; the fixFor link on the Watch and its
+// subscribers stays in the payload as the history of the repair.
+func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
+	next, effects := domain.Transition(w, domain.UnblockEvent(h.clock.Now()))
+	if next.Status != domain.StatusWatching || next.Verdict != domain.VerdictWatching || next.Blocked != nil {
+		return false, domain.NewAppError(domain.CodeInvalidInput, "ack: unblock requires a blocked Watch")
+	}
+	if next.Revision == w.Revision {
+		// The domain transition was a no-op: the Watch was not blocked.
+		return false, nil
+	}
+	for _, effect := range effects {
+		if effect.Kind == domain.EffectCreateWatch {
+			return false, domain.NewAppError(domain.CodeInvalidInput, "ack: unblock must not create a new Watch")
+		}
+	}
+	if writer, ok := h.store.(ackWatchWriter); ok {
+		if err := writer.SaveWatch(next); err != nil {
+			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
+	}
+	return true, nil
 }
 
 // blockWatch applies the domain block transition to the Watch and persists it.
@@ -718,7 +778,7 @@ func AttachAck(server *mcpsdk.Server, handler *AckHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_ack",
-		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker.",
+		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  true,
