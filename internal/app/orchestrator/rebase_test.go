@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-
-	"github.com/refusedguy/beacon/internal/domain"
 )
 
 type gitCall struct {
@@ -44,9 +42,9 @@ func (f *fakeGit) callsFor(key string) []gitCall {
 	return out
 }
 
-type testStore struct{ watches []domain.Watch }
+type testStore struct{ watches []Watch }
 
-func (s testStore) ActiveWatches() ([]domain.Watch, error) { return s.watches, nil }
+func (s testStore) ActiveWatches() ([]Watch, error) { return s.watches, nil }
 
 type testMerger struct{ merged map[int]bool }
 
@@ -54,13 +52,13 @@ func (m testMerger) IsMerged(_ context.Context, _ string, pr int) (bool, error) 
 	return m.merged[pr], nil
 }
 
-func testWatch(pr int, sha string) domain.Watch {
-	return domain.Watch{
+func testWatch(pr int, sha string) Watch {
+	return Watch{
 		ID:      fmt.Sprintf("watch-%d", pr),
 		Repo:    "refusedguy/beacon",
 		PR:      pr,
 		HeadSHA: sha,
-		Status:  domain.StatusWatching,
+		Verdict: "watching",
 	}
 }
 
@@ -101,7 +99,7 @@ func TestRebaseAllSuccess(t *testing.T) {
 	}
 	r := &Rebaser{
 		Git:    git,
-		Store:  testStore{watches: []domain.Watch{testWatch(311, "oldsha")}},
+		Store:  testStore{watches: []Watch{testWatch(311, "oldsha")}},
 		Merger: testMerger{},
 	}
 
@@ -150,7 +148,7 @@ func TestRebaseAllConflict(t *testing.T) {
 	}
 	r := &Rebaser{
 		Git:    git,
-		Store:  testStore{watches: []domain.Watch{testWatch(311, "oldsha")}},
+		Store:  testStore{watches: []Watch{testWatch(311, "oldsha")}},
 		Merger: testMerger{},
 	}
 
@@ -204,7 +202,7 @@ func TestRebaseAllIdempotent(t *testing.T) {
 	}
 	r := &Rebaser{
 		Git:    git,
-		Store:  testStore{watches: []domain.Watch{testWatch(311, "oldsha")}},
+		Store:  testStore{watches: []Watch{testWatch(311, "oldsha")}},
 		Merger: testMerger{},
 	}
 
@@ -254,7 +252,7 @@ func TestRebaseAllSkipsMergedAndMissingWorktrees(t *testing.T) {
 	}
 	r := &Rebaser{
 		Git: git,
-		Store: testStore{watches: []domain.Watch{
+		Store: testStore{watches: []Watch{
 			testWatch(311, "oldsha"),
 			testWatch(312, "sha312"),
 			testWatch(313, "sha313"),

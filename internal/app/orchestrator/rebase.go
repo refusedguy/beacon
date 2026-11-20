@@ -8,11 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
-
-	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // GitRunner runs one git command. An empty dir means the process working
@@ -22,33 +19,23 @@ type GitRunner interface {
 	Run(ctx context.Context, dir string, args ...string) (string, error)
 }
 
-// OSGitRunner runs git through os/exec.
-type OSGitRunner struct{}
+// GitRunnerFunc adapts a function to GitRunner. The process boundary stays in
+// the composition root: this package cannot import os/exec under ADR 0005.
+type GitRunnerFunc func(ctx context.Context, dir string, args ...string) (string, error)
 
-var _ GitRunner = OSGitRunner{}
-
-func (OSGitRunner) Run(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, "git", args...)
-	if dir != "" {
-		cmd.Dir = dir
-	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
-	}
-	return string(out), nil
+func (f GitRunnerFunc) Run(ctx context.Context, dir string, args ...string) (string, error) {
+	return f(ctx, dir, args...)
 }
 
-// Store is the minimal orchestrator store port the rebaser needs. The store's
-// ActiveWatches already excludes closed watches, so each returned watch is a
-// rebase candidate.
-type Store interface {
-	ActiveWatches() ([]domain.Watch, error)
+// RebaseStore is the minimal store port the rebaser needs. Active Watches
+// already excludes closed Watches, so each returned Watch is a candidate.
+type RebaseStore interface {
+	ActiveWatches() ([]Watch, error)
 }
 
-// Merger reports which PRs the composition root has already merged. The
+// RebaseMerger reports which PRs the composition root has already merged. The
 // rebaser skips those PRs so a finished branch never receives a force push.
-type Merger interface {
+type RebaseMerger interface {
 	IsMerged(ctx context.Context, repo string, pr int) (bool, error)
 }
 
@@ -73,8 +60,8 @@ func (e *ConflictError) Error() string {
 	return msg
 }
 
-// Result is the observable outcome for one watch.
-type Result struct {
+// RebaseResult is the observable outcome for one Watch.
+type RebaseResult struct {
 	PR       int    `json:"pr"`
 	WatchID  string `json:"watchID"`
 	Branch   string `json:"branch"`
@@ -90,17 +77,17 @@ type Result struct {
 // Rebaser rebases active watch branches onto origin/main after an auto-merge.
 type Rebaser struct {
 	Git    GitRunner
-	Store  Store
-	Merger Merger
+	Store  RebaseStore
+	Merger RebaseMerger
 	// BranchForPR maps a PR number to its local branch name. The default is
 	// feat/w<pr>, the naming used by the worktrees in this project.
 	BranchForPR func(int) string
 }
 
-// RebaseAll rebases every active, unmerged watch branch. It returns one Result
+// RebaseAll rebases every active, unmerged watch branch. It returns one RebaseResult
 // per watch and joins per-watch failures into the returned error, so a caller
 // can use errors.As to pull a ConflictError out of that error.
-func (r *Rebaser) RebaseAll(ctx context.Context) ([]Result, error) {
+func (r *Rebaser) RebaseAll(ctx context.Context) ([]RebaseResult, error) {
 	if r == nil || r.Git == nil || r.Store == nil {
 		return nil, fmt.Errorf("orchestrator: rebaser needs git and store")
 	}
@@ -114,7 +101,7 @@ func (r *Rebaser) RebaseAll(ctx context.Context) ([]Result, error) {
 	}
 	worktrees := parseWorktrees(listing)
 
-	results := make([]Result, 0, len(watches))
+	results := make([]RebaseResult, 0, len(watches))
 	var errs []error
 	for _, w := range watches {
 		res, rebaseErr := r.rebaseWatch(ctx, w, worktrees)
@@ -126,8 +113,8 @@ func (r *Rebaser) RebaseAll(ctx context.Context) ([]Result, error) {
 	return results, errors.Join(errs...)
 }
 
-func (r *Rebaser) rebaseWatch(ctx context.Context, w domain.Watch, worktrees map[string]string) (Result, error) {
-	res := Result{PR: w.PR, WatchID: w.ID, OldSHA: w.HeadSHA, Branch: r.branchForPR(w.PR)}
+func (r *Rebaser) rebaseWatch(ctx context.Context, w Watch, worktrees map[string]string) (RebaseResult, error) {
+	res := RebaseResult{PR: w.PR, WatchID: w.ID, OldSHA: w.HeadSHA, Branch: r.branchForPR(w.PR)}
 	if r.Merger != nil {
 		merged, err := r.Merger.IsMerged(ctx, w.Repo, w.PR)
 		if err != nil {
@@ -181,7 +168,7 @@ func (r *Rebaser) rebaseWatch(ctx context.Context, w domain.Watch, worktrees map
 	return res, nil
 }
 
-func (r *Rebaser) skip(res Result, sha, reason string) Result {
+func (r *Rebaser) skip(res RebaseResult, sha, reason string) RebaseResult {
 	res.Skipped = true
 	res.Reason = reason
 	res.NewSHA = sha
@@ -220,7 +207,7 @@ func (r *Rebaser) headSHA(ctx context.Context, dir string) (string, error) {
 
 // conflict never resolves the rebase. It collects unmerged paths, aborts the
 // rebase and returns a ConflictError the caller can route to the subscriber.
-func (r *Rebaser) conflict(ctx context.Context, w domain.Watch, res Result) (Result, error) {
+func (r *Rebaser) conflict(ctx context.Context, w Watch, res RebaseResult) (RebaseResult, error) {
 	diffOut, _ := r.Git.Run(ctx, res.Worktree, "diff", "--name-only", "--diff-filter=U")
 	var files []string
 	for _, line := range strings.Split(diffOut, "\n") {
