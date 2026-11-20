@@ -90,7 +90,9 @@ func TestRedactingWriterStoresRedactedVersionedEvents(t *testing.T) {
 	}
 	defer d.Close()
 
-	wantVersion := d.Version()
+	// Версия строки журнала задаётся форматом события, а не версией всех
+	// таблиц базы: migration 0005 поднимает user_version, формат events не менялся.
+	wantVersion := currentEventSchemaVersion
 	rw, err := NewRedactingWriter(d, wantVersion)
 	if err != nil {
 		t.Fatalf("NewRedactingWriter: %v", err)
