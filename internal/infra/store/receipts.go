@@ -1080,3 +1080,280 @@ func (d *DB) ClaimResults() ([]ClaimResult, error) {
 	}
 	return out, rows.Err()
 }
+
+// BS.13 / ADR 0103. A receipt records a committed intent, not a finished
+// effect. The client_receipts table keeps the two apart: intent_committed says
+// the command was accepted and stored, while effect_status tracks the separate
+// progress of the effect. clientRequestId (ADR 0028) is the idempotency key, so
+// two calls with the same key write one row and the repeat returns the first
+// result. The table lives beside the existing receipts table and is created on
+// first use, as with the other tables in this package, so no existing call is
+// changed and no migration file is needed.
+
+// createClientReceiptsSQL owns the per-clientRequestId receipt store. The
+// client_request_id column is UNIQUE, so a repeat cannot create a second row.
+// receipt_json, intent_committed and effect_status are separate columns: the
+// receipt body and the intent are fixed on first write, the effect status is
+// free to advance independently (ADR 0103).
+const createClientReceiptsSQL = `
+CREATE TABLE IF NOT EXISTS client_receipts (
+  seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_request_id TEXT NOT NULL,
+  receipt_json      BLOB NOT NULL DEFAULT '',
+  intent_committed  INTEGER NOT NULL DEFAULT 0,
+  effect_status     TEXT NOT NULL DEFAULT '',
+  created_at        INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (client_request_id)
+);
+`
+
+// Effect status values kept in the separate effect_status column. A receipt is
+// recorded with intent_committed=true while its effect is still pending; none
+// of these states is derived from the presence of the receipt itself.
+const (
+	EffectStatusPending    = "pending"
+	EffectStatusInProgress = "in_progress"
+	EffectStatusComplete   = "complete"
+	EffectStatusFailed     = "failed"
+)
+
+// clientReceiptColumns is the minimal additive schema a partially created
+// client_receipts table is extended with. Keys are lowercase to match
+// PRAGMA table_info; values are column definitions for ALTER TABLE. column is
+// one of our fixed names, never external input.
+var clientReceiptColumns = map[string]string{
+	"client_request_id": "TEXT NOT NULL DEFAULT ''",
+	"receipt_json":      "BLOB NOT NULL DEFAULT ''",
+	"intent_committed":  "INTEGER NOT NULL DEFAULT 0",
+	"effect_status":     "TEXT NOT NULL DEFAULT ''",
+	"created_at":        "INTEGER NOT NULL DEFAULT 0",
+}
+
+// ensureClientReceipts creates the table on first use and extends a table made
+// by an earlier build with any missing column. It runs inside the caller's
+// transaction, so the insert that follows cannot see a half-upgraded schema.
+func ensureClientReceipts(tx *sql.Tx) error {
+	if _, err := tx.Exec(createClientReceiptsSQL); err != nil {
+		return fmt.Errorf("store: client receipts: create table: %w", err)
+	}
+	rows, err := tx.Query(`PRAGMA table_info(client_receipts)`)
+	if err != nil {
+		return fmt.Errorf("store: client receipts: table info: %w", err)
+	}
+	present := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			typ     string
+			notNull int
+			def     any
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: client receipts: scan table info: %w", err)
+		}
+		present[strings.ToLower(name)] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("store: client receipts: table info rows: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: client receipts: close table info: %w", err)
+	}
+	for column, def := range clientReceiptColumns {
+		if present[column] {
+			continue
+		}
+		if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE client_receipts ADD COLUMN %s %s", column, def)); err != nil {
+			return fmt.Errorf("store: client receipts: add %s: %w", column, err)
+		}
+	}
+	// A partial table may lack the UNIQUE constraint. The named index makes
+	// clientRequestId unique either way, so the idempotency key holds.
+	if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS client_receipts_by_request ON client_receipts(client_request_id)`); err != nil {
+		return fmt.Errorf("store: client receipts: unique index: %w", err)
+	}
+	return nil
+}
+
+// ClientReceipt is the stored receipt for one clientRequestId. IntentCommitted
+// reports that the command was stored; EffectStatus tracks the effect on its
+// own timeline and is not implied by the receipt (ADR 0103).
+type ClientReceipt struct {
+	ClientRequestID string
+	ReceiptJSON     []byte
+	IntentCommitted bool
+	EffectStatus    string
+	CreatedAt       int64
+}
+
+// RecordClientReceiptResult reports what one RecordClientReceipt call did.
+// Created marks the first write. Duplicate marks a repeat: nothing was written
+// and the first row is returned. Conflict marks a repeat whose receipt body or
+// intent differs from the first; the stored row still wins, so a repeat cannot
+// roll the recorded intent back. A different effect_status alone is not a
+// conflict, because the effect advances independently of the receipt.
+type RecordClientReceiptResult struct {
+	Receipt   ClientReceipt
+	Created   bool
+	Duplicate bool
+	Conflict  bool
+}
+
+// loadClientReceipt reads one row by clientRequestId. q is satisfied by both
+// *sql.DB and *sql.Tx, so the same scan serves the writer and the read pool.
+func loadClientReceipt(q rowQuerier, clientRequestID string) (ClientReceipt, error) {
+	var r ClientReceipt
+	var intent int
+	err := q.QueryRow(`
+		SELECT client_request_id, receipt_json, intent_committed, effect_status, created_at
+		FROM client_receipts WHERE client_request_id = ?`, clientRequestID,
+	).Scan(&r.ClientRequestID, &r.ReceiptJSON, &intent, &r.EffectStatus, &r.CreatedAt)
+	r.IntentCommitted = intent == 1
+	return r, err
+}
+
+// RecordClientReceipt stores one receipt per clientRequestId at most once. An
+// empty key is rejected at this boundary. The insert, the schema setup and the
+// repeat lookup share one transaction (ADR 0015), so two concurrent calls with
+// the same key cannot both create a row. An empty effect status defaults to
+// pending: recording the receipt never claims the effect is done. The payload
+// passes through Redact before it reaches SQLite.
+func (d *DB) RecordClientReceipt(in ClientReceipt) (RecordClientReceiptResult, error) {
+	if strings.TrimSpace(in.ClientRequestID) == "" {
+		return RecordClientReceiptResult{}, domain.NewAppError(domain.CodeInvalidInput,
+			"store: client receipt: empty clientRequestId")
+	}
+	if in.EffectStatus == "" {
+		in.EffectStatus = EffectStatusPending
+	}
+	clean := Redact(in.ReceiptJSON)
+	at := in.CreatedAt
+	if at == 0 {
+		at = time.Now().UTC().UnixNano()
+	}
+	intent := 0
+	if in.IntentCommitted {
+		intent = 1
+	}
+	var out RecordClientReceiptResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureClientReceipts(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`
+			INSERT OR IGNORE INTO client_receipts
+			  (client_request_id, receipt_json, intent_committed, effect_status, created_at)
+			VALUES (?, ?, ?, ?, ?)`,
+			in.ClientRequestID, clean, intent, in.EffectStatus, at)
+		if err != nil {
+			return fmt.Errorf("store: client receipt: insert: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: client receipt: rows affected: %w", err)
+		}
+		if n == 1 {
+			out = RecordClientReceiptResult{
+				Receipt: ClientReceipt{
+					ClientRequestID: in.ClientRequestID,
+					ReceiptJSON:     append([]byte(nil), clean...),
+					IntentCommitted: in.IntentCommitted,
+					EffectStatus:    in.EffectStatus,
+					CreatedAt:       at,
+				},
+				Created: true,
+			}
+			return nil
+		}
+		stored, err := loadClientReceipt(tx, in.ClientRequestID)
+		if err != nil {
+			return fmt.Errorf("store: client receipt: load existing: %w", err)
+		}
+		out = RecordClientReceiptResult{
+			Receipt:   stored,
+			Duplicate: true,
+			Conflict: string(stored.ReceiptJSON) != string(clean) ||
+				stored.IntentCommitted != in.IntentCommitted,
+		}
+		return nil
+	})
+	if err != nil {
+		return RecordClientReceiptResult{}, err
+	}
+	return out, nil
+}
+
+// ClientReceipt returns the stored receipt for clientRequestId and whether one
+// exists. Reads use the separate pool, so a process that reopens the same file
+// sees the first result without waiting on the writer. An empty file has no
+// phantom row.
+func (d *DB) ClientReceipt(clientRequestID string) (ClientReceipt, bool, error) {
+	if strings.TrimSpace(clientRequestID) == "" {
+		return ClientReceipt{}, false, domain.NewAppError(domain.CodeInvalidInput,
+			"store: client receipt: empty clientRequestId")
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "client_receipts")
+	if err != nil || !ok {
+		return ClientReceipt{}, false, err
+	}
+	r, err := loadClientReceipt(d.readDB, clientRequestID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ClientReceipt{}, false, nil
+	}
+	if err != nil {
+		return ClientReceipt{}, false, err
+	}
+	return r, true, nil
+}
+
+// SetEffectStatus advances the effect of a recorded receipt without touching
+// its intent or receipt body. It returns false when no receipt has that key.
+// This is the only state a receipt's effect can change: the receipt itself
+// never claims the effect finished (ADR 0103).
+func (d *DB) SetEffectStatus(clientRequestID, status string) (bool, error) {
+	if strings.TrimSpace(clientRequestID) == "" {
+		return false, domain.NewAppError(domain.CodeInvalidInput,
+			"store: client receipt: empty clientRequestId")
+	}
+	if strings.TrimSpace(status) == "" {
+		return false, domain.NewAppError(domain.CodeInvalidInput,
+			"store: client receipt: empty effect status")
+	}
+	var updated bool
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureClientReceipts(tx); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`
+			UPDATE client_receipts SET effect_status = ? WHERE client_request_id = ?`,
+			status, clientRequestID)
+		if err != nil {
+			return fmt.Errorf("store: client receipt: set effect status: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: client receipt: rows affected: %w", err)
+		}
+		updated = n == 1
+		return nil
+	})
+	return updated, err
+}
+
+// ClientReceiptCount returns the number of stored client receipts. A repeated
+// clientRequestId must not increase it, and an empty file has count zero.
+func (d *DB) ClientReceiptCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "client_receipts")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM client_receipts`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
