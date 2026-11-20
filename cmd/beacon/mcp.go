@@ -16,6 +16,8 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/cibridge"
+	"github.com/refusedguy/beacon/internal/infra/ghci"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -28,6 +30,9 @@ var _ mcp.PrecheckJournal = (*taskcli.Service)(nil)
 // mcpStateDBName is the SQLite file inside the Beacon state directory
 // (ADR 0011, ADR 0015).
 const mcpStateDBName = "beacon.db"
+
+// ciBridgeInterval bounds how often Beacon observes CI for active Watches.
+const ciBridgeInterval = 5 * time.Second
 
 // mcpConnectionFileName is the connection file read on every `beacon mcp`
 // startup. It sits next to beacon.db in the state directory (ADR 0036 §1).
@@ -392,6 +397,13 @@ func runMCP(ctx context.Context) error {
 		return err
 	}
 	defer func() { _ = closeStore() }()
+
+	// The CI bridge is the missing production verdict source. It observes the
+	// hosting service for active Watches and persists ready/retry, so the
+	// orchestrator reads a verdict from get_result instead of polling CI.
+	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, ciBridgeInterval)
+	go ciBridge.Run(ctx)
+
 	return serveMCP(ctx, deps)
 }
 
