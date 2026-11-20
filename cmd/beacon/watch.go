@@ -15,7 +15,6 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
@@ -321,7 +320,7 @@ func markAttention(rows []watchRow, requests []attentionRequest) {
 	}
 	for i := range rows {
 		r := &rows[i]
-		if r.Verdict == string(domain.VerdictNeedsInput) {
+		if r.Verdict == verdictNeedsInput {
 			r.Attention = attentionYes
 			continue
 		}
@@ -353,6 +352,10 @@ func earlierAttention(candidate, current attentionRequest) bool {
 	}
 	return candidate.TaskID < current.TaskID
 }
+
+// verdictNeedsInput is the Beacon verdict for a task parked for a human. It is
+// a string here because cmd/beacon must not import internal/domain (layers gate).
+const verdictNeedsInput = "needs_input"
 
 const attentionYes = "+"
 
