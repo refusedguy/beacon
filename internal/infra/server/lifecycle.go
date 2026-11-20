@@ -1,17 +1,24 @@
-// The server lifecycle owns the machine-wide single-instance lease: the file
-// lock, its pidfile and the liveness check that makes a stale pidfile harmless
-// after a crash. All lease file I/O lives here; the command layer only calls
-// the Acquirer port (BS.1).
+// This file owns the server's two lifecycle pieces. The single-instance lease
+// keeps one process alive: the file lock, its pidfile and the liveness check
+// that makes a stale pidfile harmless after a crash (BS.1). The Lifecycle type
+// binds one listener and drains it on command or context cancellation (S1.001).
+// All lease file I/O lives here; the command layer only calls the Acquirer
+// port.
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 )
 
 const (
@@ -154,4 +161,212 @@ func processAlive(pid int) bool {
 	}
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+const (
+	// HealthPath is the liveness endpoint served by a background server.
+	HealthPath = "/healthz"
+
+	// defaultDrainTimeout bounds a graceful stop. In-flight requests get this
+	// long to finish before the listener is closed.
+	defaultDrainTimeout = 5 * time.Second
+)
+
+var (
+	// ErrAlreadyStarted reports a second Start on a Lifecycle that is already
+	// running or stopping.
+	ErrAlreadyStarted = errors.New("server: lifecycle already started")
+
+	// ErrListen reports a failed bind, for example a port already in use.
+	ErrListen = errors.New("server: listen failed")
+)
+
+// State is the observable state of a Lifecycle.
+type State int
+
+const (
+	// StateNew means Start has not succeeded yet.
+	StateNew State = iota
+	// StateRunning means the listener is bound and serving.
+	StateRunning
+	// StateDraining means Stop is waiting for in-flight requests.
+	StateDraining
+	// StateStopped means the server has stopped. The state is terminal.
+	StateStopped
+)
+
+func (s State) String() string {
+	switch s {
+	case StateNew:
+		return "new"
+	case StateRunning:
+		return "running"
+	case StateDraining:
+		return "draining"
+	case StateStopped:
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+// HealthHandler answers GET /healthz with 200 while the process is alive. It
+// has no dependency on the lease, the token or the journal, so a caller can
+// mount it alone in tests and in a minimal bootstrap.
+func HealthHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != HealthPath {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
+}
+
+// Lifecycle owns one background HTTP listener and its shutdown. Start binds
+// the address, Stop drains in-flight work, and Run ties both to a context.
+// All methods are safe for concurrent use and Stop is idempotent.
+type Lifecycle struct {
+	addr    string
+	handler http.Handler
+	drain   time.Duration
+
+	mu       sync.Mutex
+	state    State
+	listener net.Listener
+	httpSrv  *http.Server
+	done     chan struct{}
+	serveErr error
+	stopErr  error
+	stopOnce sync.Once
+}
+
+// NewLifecycle builds a Lifecycle that binds addr on Start. A nil handler
+// serves only the health endpoint. Addr may use port 0 to let the OS choose.
+func NewLifecycle(addr string, handler http.Handler) *Lifecycle {
+	if handler == nil {
+		handler = HealthHandler()
+	}
+	return &Lifecycle{addr: addr, handler: handler, drain: defaultDrainTimeout}
+}
+
+// Addr returns the bound address. Before Start it returns the configured
+// address; after Start it returns the resolved address, which matters when the
+// configured port is 0.
+func (l *Lifecycle) Addr() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.listener == nil {
+		return l.addr
+	}
+	return l.listener.Addr().String()
+}
+
+// State returns the current lifecycle state.
+func (l *Lifecycle) State() State {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.state
+}
+
+// Start binds the listener and begins serving. A second Start fails with
+// ErrAlreadyStarted. A bind failure, such as a busy port, fails with ErrListen
+// and leaves the state at StateNew so the caller can retry on another port.
+func (l *Lifecycle) Start() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.state != StateNew {
+		return fmt.Errorf("%w: state %s", ErrAlreadyStarted, l.state)
+	}
+
+	listener, err := net.Listen("tcp", l.addr)
+	if err != nil {
+		return fmt.Errorf("%w on %s: %w", ErrListen, l.addr, err)
+	}
+	srv := &http.Server{
+		Handler:           l.handler,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	l.listener = listener
+	l.httpSrv = srv
+	l.done = make(chan struct{})
+	l.state = StateRunning
+
+	go func() {
+		err := srv.Serve(listener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			l.mu.Lock()
+			l.serveErr = err
+			l.mu.Unlock()
+		}
+		close(l.done)
+	}()
+	return nil
+}
+
+// Stop drains in-flight requests and closes the listener. Repeated calls
+// return the same result without doing the work twice. Stop before Start is a
+// no-op and leaves the lifecycle startable.
+func (l *Lifecycle) Stop() error {
+	l.mu.Lock()
+	state := l.state
+	l.mu.Unlock()
+	if state == StateNew {
+		return nil
+	}
+
+	l.stopOnce.Do(func() {
+		l.mu.Lock()
+		if l.state == StateStopped {
+			l.mu.Unlock()
+			return
+		}
+		srv := l.httpSrv
+		l.state = StateDraining
+		l.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), l.drain)
+		defer cancel()
+		err := srv.Shutdown(ctx)
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = srv.Close()
+		}
+
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.state = StateStopped
+		if err == nil {
+			err = l.serveErr
+		}
+		l.stopErr = err
+	})
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.stopErr
+}
+
+// Run starts the lifecycle, serves until ctx is cancelled, then drains.
+// A serve error also ends Run. The return value is the stop result.
+func (l *Lifecycle) Run(ctx context.Context) error {
+	if err := l.Start(); err != nil {
+		return err
+	}
+	l.mu.Lock()
+	done := l.done
+	l.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return l.Stop()
+	case <-done:
+		return l.Stop()
+	}
 }
