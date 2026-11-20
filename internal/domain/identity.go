@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // maxRevision is the largest revision a uint64 can hold. Once current reaches
@@ -190,4 +191,139 @@ func ParseTaskHandle(key []byte, handle string) (string, error) {
 // here, so a signed handle alone never grants access.
 func AuthorizeTaskOwner(owner, expectedOwner string) bool {
 	return owner != "" && owner == expectedOwner
+}
+
+// ---------------------------------------------------------------------------
+// Validated identity keys (BS.21, ADR 0193/0196).
+//
+// The brand types below carry already-validated identity values. Keeping them
+// as distinct types means a client request id cannot be passed where an actor
+// id is expected. The exported IdempotencyKey function above stays as the
+// deterministic key builder: it scopes a raw value to a namespace, so keys for
+// different operations never share a storage slot (ADR 0193).
+// ---------------------------------------------------------------------------
+
+const (
+	// CommandNamespace scopes keys for client commands identified by a
+	// ClientRequestID (ADR 0028).
+	CommandNamespace = "client-command"
+
+	// ObligationNamespace scopes keys for wake obligations identified by a
+	// watch, revision and subscriber (ADR 0088).
+	ObligationNamespace = "obligation"
+)
+
+// maxIdentityLen caps identity values so a hostile client cannot grow a key
+// without bound. Every identifier Beacon issues is far shorter than this.
+const maxIdentityLen = 256
+
+var (
+	// ErrInvalidClientRequestID reports a client request id that is empty,
+	// whitespace-only, contains whitespace or control characters, or is too
+	// long.
+	ErrInvalidClientRequestID = errors.New("domain: invalid client request id")
+	// ErrInvalidActorID reports an actor id with the same defects.
+	ErrInvalidActorID = errors.New("domain: invalid actor id")
+	// ErrInvalidIdempotencyValue reports a raw idempotency value with the same
+	// defects.
+	ErrInvalidIdempotencyValue = errors.New("domain: invalid idempotency value")
+)
+
+// validIdentityValue reports whether raw is usable as an identity component.
+// It rejects empty values, whitespace, control characters and over-long
+// values. Everything else, including separators such as ':' and '.', is
+// accepted so existing identifiers keep working.
+func validIdentityValue(raw string) bool {
+	if raw == "" || len(raw) > maxIdentityLen {
+		return false
+	}
+	for _, r := range raw {
+		if unicode.IsSpace(r) || r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// ClientRequestID is a validated identifier for one client command (ADR 0028).
+// The zero value is invalid; build one with NewClientRequestID.
+type ClientRequestID string
+
+// NewClientRequestID validates raw as a client request id.
+func NewClientRequestID(raw string) (ClientRequestID, error) {
+	if !validIdentityValue(raw) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidClientRequestID, raw)
+	}
+	return ClientRequestID(raw), nil
+}
+
+// String returns the raw identifier.
+func (id ClientRequestID) String() string { return string(id) }
+
+// Valid reports whether the value satisfies the identity format.
+func (id ClientRequestID) Valid() bool { return validIdentityValue(string(id)) }
+
+// ActorID is a validated identifier for the actor that issued a command
+// (BS.22). It may name a session, an agent or an ingress label. The zero value
+// is invalid; build one with NewActorID.
+type ActorID string
+
+// NewActorID validates raw as an actor id.
+func NewActorID(raw string) (ActorID, error) {
+	if !validIdentityValue(raw) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidActorID, raw)
+	}
+	return ActorID(raw), nil
+}
+
+// String returns the raw identifier.
+func (id ActorID) String() string { return string(id) }
+
+// Valid reports whether the value satisfies the identity format.
+func (id ActorID) Valid() bool { return validIdentityValue(string(id)) }
+
+// IdempotencyValue is a validated raw value for one idempotent operation. The
+// namespaced key is built by the exported IdempotencyKey function, which keeps
+// its name for existing callers. The zero value is invalid; build one with
+// NewIdempotencyValue.
+type IdempotencyValue string
+
+// NewIdempotencyValue validates raw as an idempotency value.
+func NewIdempotencyValue(raw string) (IdempotencyValue, error) {
+	if !validIdentityValue(raw) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidIdempotencyValue, raw)
+	}
+	return IdempotencyValue(raw), nil
+}
+
+// String returns the raw value.
+func (v IdempotencyValue) String() string { return string(v) }
+
+// Valid reports whether the value satisfies the identity format.
+func (v IdempotencyValue) Valid() bool { return validIdentityValue(string(v)) }
+
+// EscapeKeyComponent escapes one component of a composite key. Use it when a
+// caller assembles a key outside IdempotencyKey or ObligationKey so a ':'
+// or '\' inside a component cannot change the meaning of the key. Escaping
+// backslash first keeps the encoding reversible.
+func EscapeKeyComponent(component string) string {
+	return obligationKeyEscaper.Replace(component)
+}
+
+// CommandKey returns the deterministic idempotency key for one client command.
+// The same ClientRequestID always yields the same key.
+func CommandKey(id ClientRequestID) string {
+	return IdempotencyKey(CommandNamespace, id.String())
+}
+
+// DeliveryKey returns the deterministic idempotency key for one webhook
+// delivery. It shares a namespace with the store's delivery journal.
+func DeliveryKey(deliveryID IdempotencyValue) string {
+	return IdempotencyKey(GitHubDeliveryNamespace, deliveryID.String())
+}
+
+// ScopedKey returns the deterministic idempotency key for a validated value
+// under an explicit namespace. Different namespaces never share a key.
+func ScopedKey(namespace string, value IdempotencyValue) string {
+	return IdempotencyKey(namespace, value.String())
 }
