@@ -97,6 +97,7 @@ const (
 	CounterWakeDelivered    = "wake_delivered_total"
 	CounterWakeErrors       = "wake_errors_total"
 	CounterWakeSkipped      = "wake_skipped_total"
+	CounterWakeDuplicate    = "wake_duplicate_total"
 	CounterRebaseRequests   = "rebase_requests_total"
 	CounterDependencyWaits  = "dependency_waits_total"
 	CounterBlocks           = "blocks_total"
@@ -465,6 +466,19 @@ func WakeSkipped(adapter, watchID, reason string) {
 		fields[FieldAdapter] = adapter
 	}
 	s.Log(LevelInfo, "wake_skipped", fields)
+}
+
+// WakeDuplicate records a wake pointer that the deliverer suppressed because
+// the same watchID, obligationID and revision was already delivered. It makes
+// repeated pointers visible without changing the suppression itself.
+func WakeDuplicate(watchID string, revision ...uint64) {
+	s := Default()
+	s.Inc(CounterWakeDuplicate, "")
+	fields := Fields{FieldWatchID: watchID}
+	if len(revision) != 0 {
+		fields[FieldRevision] = revision[0]
+	}
+	s.Log(LevelInfo, "wake_duplicate", fields)
 }
 
 // WakeFailed records one wake the host refused or that failed in transport.
