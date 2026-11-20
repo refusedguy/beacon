@@ -93,6 +93,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1751,4 +1752,236 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 			IdempotentHint:  false,
 		},
 	}, handler.Handle)
+}
+
+// ---------------------------------------------------------------------------
+// ADR 0063 feature 1 / T3.153: addressed wake by @mention with NOTIFY to host.
+//
+// A long-lived agent registers in presence and blocks in a wait. Beacon does
+// not poll it every N seconds. The wait returns only when a message @mentions
+// that concrete agent; a message for another agent or with no mention releases
+// nobody. A released wait hands the host the fixed string NOTIFY, which the
+// host uses to raise the agent's runtime. This replaces polling with an
+// addressed wake: it is not a new step of the ADR 0017 ladder and not the
+// subscription of ADR 0050 feature 1. The ADR 0058 p2 doorbell (T3.129) and the
+// ADR 0056 p3 operation entry check (T3.124) are untouched; this service adds
+// no field to WakeInput or WakeOutput and no new Delivery value.
+// ---------------------------------------------------------------------------
+
+// MentionNotifySignal is the string a released wait returns to the host. The
+// host uses it to raise the agent's runtime; it is not a delivery value and
+// never widens the ADR 0026 closed set.
+const MentionNotifySignal = "NOTIFY"
+
+// MentionWaitMethod is the tool name of the addressed @mention wait. It is
+// distinct from agent_acp_wait of T3.134, which blocks on protocol task events.
+const MentionWaitMethod = "agent_mention_wait"
+
+// MentionMessage is one event that may @mention registered agents. Text is
+// pointer-only content (ADR 0017): the wait wakes on the mention, it does not
+// carry event contents that could change an agent's instructions or gates.
+// Mentions are the normalized @handles the event targets, in first-seen order.
+type MentionMessage struct {
+	Text     string   `json:"text"`
+	Mentions []string `json:"mentions"`
+}
+
+// MentionWaitResult is what a released wait returns to the host. Signal is
+// always MentionNotifySignal on the released path. Handle is the registered
+// @mention that was targeted; Message is the event that carried the mention.
+type MentionWaitResult struct {
+	Signal  string         `json:"signal"`
+	Handle  string         `json:"handle"`
+	Message MentionMessage `json:"message"`
+}
+
+// MentionWaitInput is the argument object of the addressed wait. Handle is the
+// agent's @mention handle registered in presence. The wait returns only when a
+// posted message mentions this handle.
+type MentionWaitInput struct {
+	Handle string `json:"handle" jsonschema:"the agent's @mention handle; the wait returns NOTIFY only when a posted message mentions this handle"`
+}
+
+// normalizeMention gives an @handle one comparison key. A valid handle starts
+// with '@' and has at least one character after it; comparison is
+// case-insensitive and ignores surrounding whitespace. An invalid handle
+// normalizes to the empty string so callers can reject it at the boundary.
+func normalizeMention(handle string) string {
+	h := strings.TrimSpace(handle)
+	if len(h) < 2 || h[0] != '@' {
+		return ""
+	}
+	return strings.ToLower(h)
+}
+
+// ParseMentions extracts the normalized @handles named in a piece of text.
+// It ignores tokens that are not mentions, drops trailing punctuation and
+// deduplicates in first-seen order. The environment uses it to turn a raw
+// message into the targeted mentions a wait matches on.
+func ParseMentions(text string) []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, token := range strings.Fields(text) {
+		token = strings.TrimRight(token, ".,;:!?)\"'>]}")
+		h := normalizeMention(token)
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		out = append(out, h)
+	}
+	return out
+}
+
+// mentionWaiter is one agent's parked wait. Each caller owns its channel, so a
+// released or cancelled waiter cannot strand another waiter on the same handle.
+type mentionWaiter struct {
+	handle  string
+	release chan MentionMessage
+	once    sync.Once
+}
+
+// MentionWaitService is the addressed @mention switchboard. An agent registers
+// in presence by calling Wait with its handle; the call parks on a channel and
+// holds no timer. Post releases only the waiters whose handle is named in the
+// message. Every wait that returns does so with the NOTIFY signal; the only
+// other exit is the caller's context ending. It owns no polling goroutine.
+type MentionWaitService struct {
+	mu      sync.Mutex
+	waiters map[string][]*mentionWaiter
+}
+
+// NewMentionWaitService builds an empty presence switchboard.
+func NewMentionWaitService() *MentionWaitService {
+	return &MentionWaitService{waiters: make(map[string][]*mentionWaiter)}
+}
+
+// Wait registers handle in presence and blocks until a posted message mentions
+// it. A message for another handle or with no mention never releases this
+// wait. There is no timer: the wait ends only on a targeted mention or on ctx
+// ending. An invalid handle is rejected at the boundary.
+func (s *MentionWaitService) Wait(ctx context.Context, handle string) (MentionWaitResult, error) {
+	h := normalizeMention(handle)
+	if h == "" {
+		return MentionWaitResult{}, domain.NewAppError(domain.CodeInvalidInput, "mention_wait: a valid @mention handle is required")
+	}
+	if s == nil {
+		return MentionWaitResult{}, domain.NewAppError(domain.CodePersistFailed, "mention_wait: wait service is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	w := &mentionWaiter{handle: h, release: make(chan MentionMessage, 1)}
+	s.mu.Lock()
+	s.waiters[h] = append(s.waiters[h], w)
+	s.mu.Unlock()
+	defer s.unregister(h, w)
+
+	select {
+	case msg := <-w.release:
+		return MentionWaitResult{Signal: MentionNotifySignal, Handle: h, Message: msg}, nil
+	case <-ctx.Done():
+		err := ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
+		return MentionWaitResult{}, domain.NewAppError(domain.CodeCancelled, "mention_wait: caller context ended: "+err.Error())
+	}
+}
+
+// Post deposits msg and releases the waiters of each handle it mentions. A
+// message with no mentions releases nobody; a mention of one agent never
+// releases a waiter registered under another handle. It returns the number of
+// waiters released so a caller can tell whether the mention was targeted at an
+// agent that was actually waiting.
+func (s *MentionWaitService) Post(msg MentionMessage) int {
+	if s == nil {
+		return 0
+	}
+	seen := make(map[string]struct{})
+	released := 0
+	for _, raw := range msg.Mentions {
+		h := normalizeMention(raw)
+		if h == "" {
+			continue
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		s.mu.Lock()
+		waiters := s.waiters[h]
+		delete(s.waiters, h)
+		s.mu.Unlock()
+		for _, w := range waiters {
+			w.once.Do(func() { w.release <- msg })
+			released++
+		}
+	}
+	return released
+}
+
+// unregister removes a waiter that left its wait without a mention, for
+// example on context cancellation. It is safe even after Post already removed
+// the handle from the map.
+func (s *MentionWaitService) unregister(handle string, waiter *mentionWaiter) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	active := s.waiters[handle]
+	for i, current := range active {
+		if current == waiter {
+			s.waiters[handle] = append(active[:i], active[i+1:]...)
+			break
+		}
+	}
+	if len(s.waiters[handle]) == 0 {
+		delete(s.waiters, handle)
+	}
+}
+
+// Presence lists the handles with an active waiter, sorted for a stable view.
+// It names who is registered in presence; it is not a polling read of any
+// task or agent state.
+func (s *MentionWaitService) Presence() []string {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.waiters))
+	for handle := range s.waiters {
+		out = append(out, handle)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Handle adapts the addressed wait to the go-sdk typed tool handler signature.
+func (s *MentionWaitService) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in MentionWaitInput) (*mcpsdk.CallToolResult, MentionWaitResult, error) {
+	out, err := s.Wait(ctx, in.Handle)
+	if err != nil {
+		return nil, MentionWaitResult{}, err
+	}
+	return &mcpsdk.CallToolResult{}, out, nil
+}
+
+// AttachMentionWait registers the addressed @mention wait as an opt-in tool.
+// NewServer does not call it; integration chooses when to attach.
+func AttachMentionWait(server *mcpsdk.Server, svc *MentionWaitService) {
+	if server == nil || svc == nil {
+		return
+	}
+	server.RemoveTools(MentionWaitMethod)
+	no := false
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:        MentionWaitMethod,
+		Description: "Block until a message @mentions this agent's handle, then return NOTIFY for the host to raise the agent's runtime. No polling and no timer: a message for another agent or with no mention releases nobody.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  true,
+		},
+	}, svc.Handle)
 }

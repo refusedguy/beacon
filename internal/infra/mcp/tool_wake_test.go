@@ -3677,3 +3677,301 @@ func TestT3_135OverInMemoryTransport(t *testing.T) {
 		t.Errorf("structured receipt = ok %v delivery %q, want true/queue", out.OK, out.Delivery)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0063 feature 1 / T3.153: addressed wake by @mention with NOTIFY to host.
+// ---------------------------------------------------------------------------
+
+type mentionWaitResult struct {
+	out MentionWaitResult
+	err error
+}
+
+func startMentionWait(ctx context.Context, svc *MentionWaitService, handle string) <-chan mentionWaitResult {
+	ch := make(chan mentionWaitResult, 1)
+	go func() {
+		out, err := svc.Wait(ctx, handle)
+		ch <- mentionWaitResult{out: out, err: err}
+	}()
+	return ch
+}
+
+func awaitMentionWait(t *testing.T, ch <-chan mentionWaitResult) mentionWaitResult {
+	t.Helper()
+	select {
+	case res := <-ch:
+		return res
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for an addressed mention wake")
+		return mentionWaitResult{}
+	}
+}
+
+func assertMentionWaitQuiet(t *testing.T, ch <-chan mentionWaitResult) {
+	t.Helper()
+	select {
+	case res := <-ch:
+		t.Fatalf("wait woke unexpectedly: out=%+v err=%v", res.out, res.err)
+	default:
+	}
+}
+
+func awaitMentionPresence(t *testing.T, svc *MentionWaitService, handle string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, h := range svc.Presence() {
+			if h == handle {
+				return
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("handle %q never registered in presence", handle)
+}
+
+// TestT3_153TargetedMentionReturnsNotify is the acceptance test: a wait
+// registered under an @handle returns the NOTIFY string only when a message
+// @mentions that agent. Case and surrounding whitespace in the handle are
+// normalized, so the registration key is stable.
+func TestT3_153TargetedMentionReturnsNotify(t *testing.T) {
+	svc := NewMentionWaitService()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startMentionWait(ctx, svc, "@Alice")
+	awaitMentionPresence(t, svc, "@alice")
+
+	msg := MentionMessage{Text: "please review @alice", Mentions: []string{"@alice"}}
+	if got := svc.Post(msg); got != 1 {
+		t.Fatalf("Post released %d waiters, want 1", got)
+	}
+	res := awaitMentionWait(t, ch)
+	if res.err != nil {
+		t.Fatalf("wait error = %v, want nil", res.err)
+	}
+	if res.out.Signal != MentionNotifySignal || res.out.Signal != "NOTIFY" {
+		t.Errorf("signal = %q, want NOTIFY", res.out.Signal)
+	}
+	if res.out.Handle != "@alice" {
+		t.Errorf("handle = %q, want @alice", res.out.Handle)
+	}
+	if res.out.Message.Text != msg.Text || len(res.out.Message.Mentions) != 1 || res.out.Message.Mentions[0] != "@alice" {
+		t.Errorf("message = %+v, want the targeted mention %+v", res.out.Message, msg)
+	}
+}
+
+// TestT3_153MentionOfOtherAgentDoesNotRelease proves address isolation: a
+// mention of another agent never releases this wait, and a later targeted
+// mention does.
+func TestT3_153MentionOfOtherAgentDoesNotRelease(t *testing.T) {
+	svc := NewMentionWaitService()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startMentionWait(ctx, svc, "@alice")
+	awaitMentionPresence(t, svc, "@alice")
+
+	if got := svc.Post(MentionMessage{Mentions: []string{"@bob"}}); got != 0 {
+		t.Errorf("Post(@bob) released %d waiters, want 0", got)
+	}
+	assertMentionWaitQuiet(t, ch)
+
+	if got := svc.Post(MentionMessage{Mentions: []string{"@alice"}}); got != 1 {
+		t.Errorf("Post(@alice) released %d waiters, want 1", got)
+	}
+	res := awaitMentionWait(t, ch)
+	if res.err != nil || res.out.Signal != MentionNotifySignal {
+		t.Errorf("wait = %+v, want NOTIFY with no error", res)
+	}
+}
+
+// TestT3_153UnaddressedMessageDoesNotRelease proves there is no timer and no
+// broadcast release: a message with no mentions releases nobody, and the wait
+// ends only when the caller's context is cancelled.
+func TestT3_153UnaddressedMessageDoesNotRelease(t *testing.T) {
+	svc := NewMentionWaitService()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := startMentionWait(ctx, svc, "@alice")
+	awaitMentionPresence(t, svc, "@alice")
+
+	if got := svc.Post(MentionMessage{Text: "nobody mentioned", Mentions: []string{}}); got != 0 {
+		t.Errorf("unaddressed Post released %d waiters, want 0", got)
+	}
+	assertMentionWaitQuiet(t, ch)
+
+	cancel()
+	res := awaitMentionWait(t, ch)
+	assertCode(t, res.err, domain.CodeCancelled)
+}
+
+// TestT3_153ParseMentions checks the boundary parser: it keeps @handles,
+// strips trailing punctuation, lowercases, deduplicates and keeps first-seen
+// order, while ignoring tokens that are not mentions.
+func TestT3_153ParseMentions(t *testing.T) {
+	got := ParseMentions("hey @Alice, @bob: look at @ALICE and plain words")
+	want := []string{"@alice", "@bob"}
+	if len(got) != len(want) {
+		t.Fatalf("ParseMentions = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ParseMentions = %q, want %q", got, want)
+		}
+	}
+	if got := ParseMentions("no mentions here"); len(got) != 0 {
+		t.Errorf("ParseMentions of plain text = %q, want empty", got)
+	}
+}
+
+// TestT3_153InvalidHandleRejected checks the boundary: a handle without a
+// leading @ or with no characters after it is refused, not silently matched.
+func TestT3_153InvalidHandleRejected(t *testing.T) {
+	svc := NewMentionWaitService()
+	for _, handle := range []string{"", "alice", "@", "   "} {
+		_, err := svc.Wait(context.Background(), handle)
+		assertCode(t, err, domain.CodeInvalidInput)
+	}
+}
+
+// TestT3_153PresenceRegistration proves a waiting agent is registered in
+// presence and is removed when its wait ends without a mention.
+func TestT3_153PresenceRegistration(t *testing.T) {
+	svc := NewMentionWaitService()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := startMentionWait(ctx, svc, "@alice")
+	awaitMentionPresence(t, svc, "@alice")
+	cancel()
+	awaitMentionWait(t, ch)
+	// Give the deferred unregister a moment; it runs in the waiter goroutine.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && len(svc.Presence()) != 0 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := svc.Presence(); len(got) != 0 {
+		t.Errorf("presence after cancel = %q, want empty", got)
+	}
+}
+
+// TestT3_153ConcurrentWaitsAllWake proves each caller owns its own wait: one
+// targeted mention releases every waiter registered under that handle.
+func TestT3_153ConcurrentWaitsAllWake(t *testing.T) {
+	svc := NewMentionWaitService()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := startMentionWait(ctx, svc, "@alice")
+	b := startMentionWait(ctx, svc, "@bob")
+	c := startMentionWait(ctx, svc, "@alice")
+	awaitMentionPresence(t, svc, "@alice")
+	awaitMentionPresence(t, svc, "@bob")
+
+	if got := svc.Post(MentionMessage{Mentions: []string{"@alice"}}); got != 2 {
+		t.Errorf("Post released %d waiters, want 2", got)
+	}
+	for _, ch := range []<-chan mentionWaitResult{a, c} {
+		res := awaitMentionWait(t, ch)
+		if res.err != nil || res.out.Signal != MentionNotifySignal {
+			t.Errorf("alice wait = %+v, want NOTIFY", res)
+		}
+	}
+	assertMentionWaitQuiet(t, b)
+}
+
+// TestT3_153ExistingWakeFeaturesIntact is a regression guard for T2.20, T2.24,
+// T3.124 and T3.129: adding the addressed wait changes no existing wake path.
+func TestT3_153ExistingWakeFeaturesIntact(t *testing.T) {
+	bell := &recordingDoorbell{}
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).WithDoorbell(bell).WithOperationRegistry(NewMemoryOperationRegistry())
+	in := WakeInput{Target: "session-1", Text: "p", Mailbox: "mailbox-A", Prompt: "long job"}
+
+	first, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first Wake() error = %v", err)
+	}
+	if first.Delivery != DeliverySteer || !first.OK || first.OperationID == "" || !first.DoorbellRang {
+		t.Errorf("first receipt = %+v, want steer/ok/operationId/doorbell", first)
+	}
+	second, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second Wake() error = %v", err)
+	}
+	if !second.Duplicate || second.DoorbellRang {
+		t.Errorf("duplicate receipt = %+v, want duplicate with no doorbell", second)
+	}
+	interrupted, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p", HasPendingQuestion: true})
+	if err != nil {
+		t.Fatalf("interrupted Wake() error = %v", err)
+	}
+	if !interrupted.Interrupted || interrupted.Delivery != DeliveryInterrupted {
+		t.Errorf("interrupted receipt = %+v, want interrupted", interrupted)
+	}
+}
+
+// TestT3_153OverInMemoryTransport drives the addressed wait through a real MCP
+// client and server session, checking the schema and the NOTIFY string CI sees.
+func TestT3_153OverInMemoryTransport(t *testing.T) {
+	svc := NewMentionWaitService()
+	server := NewServer()
+	AttachMentionWait(server, svc)
+	session := connectWakeServer(t, server)
+
+	found := false
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == MentionWaitMethod {
+			found = true
+			schema, err := json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal schema: %v", err)
+			}
+			if !strings.Contains(string(schema), "handle") {
+				t.Errorf("wait input schema missing handle: %s", schema)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("agent_mention_wait tool not registered")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type callResult struct {
+		result *mcpsdk.CallToolResult
+		err    error
+	}
+	calls := make(chan callResult, 1)
+	go func() {
+		res, err := session.CallTool(ctx, &mcpsdk.CallToolParams{
+			Name:      MentionWaitMethod,
+			Arguments: MentionWaitInput{Handle: "@alice"},
+		})
+		calls <- callResult{result: res, err: err}
+	}()
+	awaitMentionPresence(t, svc, "@alice")
+	if got := svc.Post(MentionMessage{Text: "review", Mentions: []string{"@alice"}}); got != 1 {
+		t.Fatalf("Post released %d waiters, want 1", got)
+	}
+
+	var cr callResult
+	select {
+	case cr = <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("CallTool did not return after the targeted mention")
+	}
+	if cr.err != nil {
+		t.Fatalf("CallTool(%s): %v", MentionWaitMethod, cr.err)
+	}
+	raw, err := json.Marshal(cr.result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out MentionWaitResult
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if out.Signal != MentionNotifySignal || out.Handle != "@alice" {
+		t.Errorf("structured output = %+v, want NOTIFY/@alice", out)
+	}
+}
