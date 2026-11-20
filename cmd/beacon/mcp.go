@@ -478,6 +478,9 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 		// delivery field.
 		After:    readSyncCallConfig().after,
 		Blockers: db,
+		// The deferred-wiring port was left nil here, so beacon_defer_wiring
+		// answered PERSIST_FAILED. The durable adapter shares this DB handle.
+		DeferWiring: newDurableDeferredStore(db),
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
 			live, err := db.LiveWatches()
 			if err != nil {

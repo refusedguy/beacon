@@ -4,9 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"sync"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // deferredRunner is the dispatch seam, like the other command runners. A
@@ -37,54 +38,87 @@ func SetDeferredDeps(fn deferredDepsFactory) {
 	makeDeferredDeps = fn
 }
 
-// memoryDeferredStore is the minimal adapter used until W12-A lands a durable
-// store implementation. It honours the same idempotency key as the MCP tool,
-// (watchID, reason), so a repeat does not replace the first card. Once W12-A
-// is available the composition root can hand its store-backed DeferWriter to
-// deferredDeps without touching runDeferred.
-type memoryDeferredStore struct {
-	mu    sync.Mutex
-	cards map[string]mcp.DeferredWiringCard
+// deferredStoreDB is the part of *store.DB the adapter uses. Keeping it as an
+// interface lets tests drive the adapter with a fake and check the errors it
+// returns to callers.
+type deferredStoreDB interface {
+	DeferWiring(in store.DeferredWiring) (store.DeferredWiring, error)
+	ListDeferred(status string) ([]store.DeferredWiring, error)
 }
 
-var _ mcp.DeferWriter = (*memoryDeferredStore)(nil)
-
-func newMemoryDeferredStore() *memoryDeferredStore {
-	return &memoryDeferredStore{cards: make(map[string]mcp.DeferredWiringCard)}
+// durableDeferredStore adapts the deferred queue in store.DB to mcp.DeferWriter.
+// The write maps an mcp card onto a store row and reads that row back to decide
+// whether this call created it. The read maps stored rows back to cards.
+type durableDeferredStore struct {
+	db deferredStoreDB
 }
 
-func (s *memoryDeferredStore) DeferWiring(_ context.Context, card mcp.DeferredWiringCard) (bool, error) {
-	if s == nil {
+var _ mcp.DeferWriter = (*durableDeferredStore)(nil)
+
+func newDurableDeferredStore(db deferredStoreDB) *durableDeferredStore {
+	return &durableDeferredStore{db: db}
+}
+
+// DeferWiring stores one card. The store keeps the first row for a (watchID,
+// reason) key. A stored timestamp equal to the one sent here means this call
+// inserted the row. Any other timestamp means an earlier call won.
+func (s *durableDeferredStore) DeferWiring(_ context.Context, card mcp.DeferredWiringCard) (bool, error) {
+	if s == nil || s.db == nil {
 		return false, fmt.Errorf("beacon deferred: store is nil")
 	}
-	key := card.WatchID + "\x00" + card.Reason
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cards == nil {
-		s.cards = make(map[string]mcp.DeferredWiringCard)
+	at := time.Now().UTC().UnixNano()
+	stored, err := s.db.DeferWiring(store.DeferredWiring{
+		WatchID:    card.WatchID,
+		PR:         card.PR,
+		Title:      card.Title,
+		Reason:     card.Reason,
+		OwnerFiles: append([]string(nil), card.OwnerFiles...),
+		CreatedAt:  at,
+	})
+	if err != nil {
+		return false, err
 	}
-	if _, ok := s.cards[key]; ok {
-		return false, nil
-	}
-	s.cards[key] = card
-	return true, nil
+	return stored.CreatedAt == at, nil
 }
 
-func (s *memoryDeferredStore) DeferredWirings(_ context.Context) ([]mcp.DeferredWiringCard, error) {
-	if s == nil {
+// DeferredWirings returns every stored row as an mcp card. A store row carries
+// the lifecycle status (todo, claimed or done), so the CLI shows that status
+// rather than the presentation status a card gets when it is first created.
+func (s *durableDeferredStore) DeferredWirings(_ context.Context) ([]mcp.DeferredWiringCard, error) {
+	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("beacon deferred: store is nil")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]mcp.DeferredWiringCard, 0, len(s.cards))
-	for _, c := range s.cards {
-		out = append(out, c)
+	rows, err := s.db.ListDeferred("")
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	cards := make([]mcp.DeferredWiringCard, 0, len(rows))
+	for _, row := range rows {
+		cards = append(cards, mcp.DeferredWiringCard{
+			CardID:     fmt.Sprintf("WIRING-%d", row.PR),
+			WatchID:    row.WatchID,
+			PR:         row.PR,
+			Title:      row.Title,
+			Reason:     row.Reason,
+			OwnerFiles: append([]string(nil), row.OwnerFiles...),
+			Status:     row.Status,
+		})
+	}
+	return cards, nil
 }
 
+// defaultDeferredDeps opens the same state store the MCP process uses, so the
+// CLI reads the cards beacon_defer_wiring writes. The caller owns the closer.
 func defaultDeferredDeps(_ *CLI) (deferredDeps, func() error, error) {
-	return deferredDeps{Writer: newMemoryDeferredStore()}, func() error { return nil }, nil
+	dir, err := stateDir()
+	if err != nil {
+		return deferredDeps{}, nil, err
+	}
+	db, err := openProcessStore(dir)
+	if err != nil {
+		return deferredDeps{}, nil, err
+	}
+	return deferredDeps{Writer: newDurableDeferredStore(db)}, func() error { return db.Close() }, nil
 }
 
 // runDeferred implements `beacon deferred [--format table|json]`. It reads the
