@@ -493,3 +493,110 @@ func trimFallbackValue(raw string) string {
 	}
 	return value
 }
+
+// --- HD-079: sequential structural giants (ADR 0310) -----------------------
+
+// giantLoCThreshold is the change size at which a work item becomes a
+// structural giant. The strict comparison leaves 1000 changed lines on the
+// ordinary side and puts 1001 on the giant side.
+const giantLoCThreshold = 1000
+
+// giantWork is one proposed work item in a wave. Files is the seam it owns:
+// the paths the item may change. Two items that list the same path do not have
+// disjoint seams.
+type giantWork struct {
+	Card  string
+	LoC   int
+	Files []string
+}
+
+// giantStep is one phase of the execution order. A sequential step holds one
+// structural giant and no other work.
+type giantStep struct {
+	Cards      []string
+	Sequential bool
+}
+
+// wavePlan is the admission result for one proposed wave. Valid stays true
+// while every giant can be isolated. Reason names the shared seam when a giant
+// cannot be separated from parallel work.
+type wavePlan struct {
+	Valid  bool
+	Steps  []giantStep
+	Reason string
+}
+
+// isGiant reports whether the change size crosses the structural threshold.
+func isGiant(w giantWork) bool {
+	return w.LoC > giantLoCThreshold
+}
+
+// sharedSeamFile returns the first path both items own. An empty result means
+// their seams are disjoint.
+func sharedSeamFile(a, b giantWork) string {
+	for _, f := range a.Files {
+		for _, g := range b.Files {
+			if f == g {
+				return f
+			}
+		}
+	}
+	return ""
+}
+
+// disjointSeam reports whether item i owns no path that another item in the
+// wave also owns. A giant needs this property before it can leave the parallel
+// group and run on its own.
+func disjointSeam(i int, items []giantWork) (string, bool) {
+	for j, other := range items {
+		if j == i {
+			continue
+		}
+		if f := sharedSeamFile(items[i], other); f != "" {
+			return f, false
+		}
+	}
+	return "", true
+}
+
+// planWave admits one proposed wave and returns the order in which its items
+// may run. Ordinary items share one parallel step. Each giant gets a step of
+// its own, so a large change runs alone. A giant with a seam that overlaps
+// another item has no way to be isolated and is rejected; such a giant would
+// have to run in parallel with work on the same files, and that fails the card.
+func planWave(items []giantWork) wavePlan {
+	plan := wavePlan{Valid: true}
+	var parallel []string
+	var giants []int
+	for i, w := range items {
+		if isGiant(w) {
+			giants = append(giants, i)
+			continue
+		}
+		parallel = append(parallel, w.Card)
+	}
+	if len(giants) == 0 {
+		if len(parallel) > 0 {
+			plan.Steps = []giantStep{{Cards: parallel}}
+		}
+		return plan
+	}
+	for _, i := range giants {
+		if f, ok := disjointSeam(i, items); !ok {
+			return wavePlan{
+				Reason: fmt.Sprintf("parallel giant %s: seam file %q is shared; large change needs a disjoint seam",
+					items[i].Card, f),
+			}
+		}
+	}
+	if len(parallel) > 0 {
+		plan.Steps = append(plan.Steps, giantStep{Cards: parallel})
+	}
+	for _, i := range giants {
+		plan.Steps = append(plan.Steps, giantStep{
+			Cards:      []string{items[i].Card},
+			Sequential: true,
+		})
+	}
+	return plan
+}
