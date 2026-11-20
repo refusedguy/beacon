@@ -45,14 +45,15 @@ var (
 )
 
 type card struct {
-	id          string
-	path        string
-	status      string
-	priority    string
-	resolved    string
-	merged      bool
-	ownerKey    string
-	duplicateOf string
+	id              string
+	path            string
+	status          string
+	priority        string
+	resolved        string
+	merged          bool
+	ownerKey        string
+	duplicateOf     string
+	duplicateSubset bool
 }
 
 type gitScan struct {
@@ -262,19 +263,57 @@ func normalizeOwnerFiles(value string) string {
 	return strings.Join(files, "\n")
 }
 
-// resolveDuplicateCards promotes todo cards that own exactly the same files as
-// a card already resolved as done. This catches cards merged under a different
-// ID: the commit subject names the other card, but the OwnerFiles set proves
-// the work shipped. Dropped cards and cards without OwnerFiles are left alone,
-// and a dropped card cannot seed the done map. Cards with no OwnerFiles never
-// participate, so unrelated todo cards are not collapsed by accident.
+// ownerFileSet splits a normalized OwnerFiles key back into a set.
+func ownerFileSet(key string) map[string]bool {
+	set := map[string]bool{}
+	for _, file := range strings.Split(key, "\n") {
+		if file != "" {
+			set[file] = true
+		}
+	}
+	return set
+}
+
+func isSubset(a, b map[string]bool) bool {
+	for file := range a {
+		if !b[file] {
+			return false
+		}
+	}
+	return true
+}
+
+func intersects(a, b map[string]bool) bool {
+	for file := range a {
+		if b[file] {
+			return true
+		}
+	}
+	return false
+}
+
+type doneOwner struct {
+	id    string
+	key   string
+	files map[string]bool
+}
+
+// resolveDuplicateCards promotes todo cards that own the same files as a card
+// already resolved as done, or a subset of them with a non-empty intersection.
+// This catches cards merged under a different ID: the commit subject names the other
+// card, but the OwnerFiles set proves the work shipped. Both subset directions
+// count, so a todo card that owns more files than the done card is a duplicate
+// too when the smaller set is fully contained in the larger one.
+//
+// Dropped cards and cards without OwnerFiles never take part, and a dropped
+// card cannot seed the done list. The done list is built before any promotion,
+// so a card promoted here cannot promote another card in the same pass. Exact
+// matches win over subset matches; ties go to the first card in ID order.
 func resolveDuplicateCards(cards []card) {
-	doneByOwner := map[string]string{}
+	var done []doneOwner
 	for _, c := range cards {
 		if c.resolved == statusDone && c.ownerKey != "" {
-			if _, ok := doneByOwner[c.ownerKey]; !ok {
-				doneByOwner[c.ownerKey] = c.id
-			}
+			done = append(done, doneOwner{id: c.id, key: c.ownerKey, files: ownerFileSet(c.ownerKey)})
 		}
 	}
 	for i := range cards {
@@ -282,9 +321,27 @@ func resolveDuplicateCards(cards []card) {
 		if c.resolved != statusTodo || c.ownerKey == "" {
 			continue
 		}
-		if id, ok := doneByOwner[c.ownerKey]; ok {
-			c.resolved = statusDone
-			c.duplicateOf = id
+		files := ownerFileSet(c.ownerKey)
+		for _, d := range done {
+			if d.key == c.ownerKey {
+				c.resolved = statusDone
+				c.duplicateOf = d.id
+				break
+			}
+		}
+		if c.resolved == statusDone {
+			continue
+		}
+		for _, d := range done {
+			if !intersects(files, d.files) {
+				continue
+			}
+			if isSubset(files, d.files) || isSubset(d.files, files) {
+				c.resolved = statusDone
+				c.duplicateOf = d.id
+				c.duplicateSubset = true
+				break
+			}
 		}
 	}
 }
@@ -363,7 +420,11 @@ func applyStatuses(repo string, cards []card, write bool) ([]string, error) {
 		}
 		line := fmt.Sprintf("%s: %s -> %s", filepath.ToSlash(rel), c.status, c.resolved)
 		if c.duplicateOf != "" {
-			line += fmt.Sprintf(" (duplicate of %s by OwnerFiles)", c.duplicateOf)
+			reason := "by OwnerFiles"
+			if c.duplicateSubset {
+				reason = "by OwnerFiles subset"
+			}
+			line += fmt.Sprintf(" (duplicate of %s %s)", c.duplicateOf, reason)
 		}
 		changes = append(changes, line)
 		if !write {
