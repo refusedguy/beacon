@@ -5,15 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
-// beaconLogFileEnv overrides the path of the structured log. Without it the
-// log lives next to the project's state database.
-const beaconLogFileEnv = "BEACON_LOG_FILE"
+// beaconLogFormatEnv selects the slog handler: json or the default text.
+const beaconLogFormatEnv = "BEACON_LOG_FORMAT"
 
 // beaconLogLevelEnv selects the minimum level: debug, info, warn or error.
 const beaconLogLevelEnv = "BEACON_LOG_LEVEL"
@@ -50,31 +48,38 @@ func runMetrics(c *CLI, args []string) int {
 	return 0
 }
 
-// setupObserve installs the process-wide recorder: structured JSON to stderr
-// and to BEACON_LOG_FILE (or the project state directory), plus in-memory
-// counters. The returned function closes the log file. A file that cannot be
-// opened is not fatal, stderr still receives every event.
+// setupObserve installs a slog logger and the in-memory counters. Each process
+// gets its own file under <project-state>/logs, and beacon.latest.log points at
+// it. stderr is reserved for setup failures: normal records go only to the
+// file, so an operator never sees the same line twice.
 func setupObserve() func() {
-	min := observe.LevelInfo
-	if strings.EqualFold(strings.TrimSpace(os.Getenv(beaconLogLevelEnv)), "debug") {
-		min = observe.LevelDebug
+	rawLevel := os.Getenv(beaconLogLevelEnv)
+	level, ok := observe.ParseLevel(rawLevel)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "beacon: неверный %s=%q, используется info\n", beaconLogLevelEnv, rawLevel)
 	}
-	path := strings.TrimSpace(os.Getenv(beaconLogFileEnv))
-	if path == "" {
-		if dir, err := stateDir(); err == nil && dir != "" {
-			path = filepath.Join(dir, "beacon.log")
-		}
+	format := os.Getenv(beaconLogFormatEnv)
+
+	install := func(w io.Writer) func() {
+		observe.SetDefault(observe.NewRecorder(observe.NewLogger(format, level, w), observe.NewMetrics()))
+		return func() {}
 	}
 
-	outputs := []io.Writer{os.Stderr}
-	if path != "" {
-		if f, err := observe.OpenLogFile(path); err == nil {
-			outputs = append(outputs, f)
-		}
+	dir, err := stateDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "beacon: каталог состояния: %v\n", err)
+		return install(io.Discard)
 	}
-	log := observe.NewLogger(min, outputs...)
-	observe.SetDefault(observe.NewRecorder(log, observe.NewMetrics()))
-	return func() { _ = log.Close() }
+	runLog, err := observe.OpenRunLog(dir, time.Now(), os.Getpid())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "beacon: лог: %v\n", err)
+		return install(io.Discard)
+	}
+	cleanup := install(runLog.Writer())
+	return func() {
+		cleanup()
+		_ = runLog.Close()
+	}
 }
 
 // observingDeliveryTarget wraps the live delivery port so every wake the CLI

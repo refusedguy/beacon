@@ -7,92 +7,145 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestLoggerWritesValidJSONToEveryOutput(t *testing.T) {
-	first, second := new(bytes.Buffer), new(bytes.Buffer)
-	log := NewLogger(LevelInfo, first, second)
+func TestTextHandlerIsReadableAndKeepsAttributes(t *testing.T) {
+	buf := new(bytes.Buffer)
+	rec := NewRecorder(NewLogger("text", LevelInfo, buf), NewMetrics())
 
-	log.Write(Event{Level: LevelInfo, Fields: Fields{
-		FieldEvent:   "verdict_published",
+	rec.Log(LevelInfo, "verdict_published", Fields{
 		FieldWatchID: "watch:1",
 		FieldPR:      12,
 		FieldVerdict: "ready",
 		FieldAdapter: "opencode",
 		FieldError:   "boom",
-	}})
+	})
 
-	for name, buf := range map[string]*bytes.Buffer{"first": first, "second": second} {
-		line := buf.String()
-		if !strings.HasSuffix(line, "\n") {
-			t.Fatalf("%s: нет перевода строки: %q", name, line)
+	line := buf.String()
+	for _, want := range []string{
+		"level=INFO",
+		"event=verdict_published",
+		"watchID=watch:1",
+		"pr=12",
+		"verdict=ready",
+		"adapter=opencode",
+		"error=boom",
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("в текстовом логе нет %q: %q", want, line)
 		}
-		var got map[string]any
-		if err := json.Unmarshal([]byte(line), &got); err != nil {
-			t.Fatalf("%s: невалидный JSON %q: %v", name, line, err)
-		}
-		for key, want := range map[string]any{
-			FieldEvent:   "verdict_published",
-			FieldWatchID: "watch:1",
-			FieldVerdict: "ready",
-			FieldAdapter: "opencode",
-			FieldError:   "boom",
-		} {
-			if got[key] != want {
-				t.Errorf("%s: поле %s = %v, ожидалось %v", name, key, got[key], want)
-			}
-		}
-		if pr, ok := got[FieldPR].(float64); !ok || int(pr) != 12 {
-			t.Errorf("%s: поле pr = %v, ожидалось 12", name, got[FieldPR])
-		}
-		if _, ok := got["time"].(string); !ok {
-			t.Errorf("%s: нет поля time", name)
-		}
+	}
+	if strings.Contains(line, "msg=") {
+		t.Errorf("пустое сообщение slog не должно попадать в лог: %q", line)
 	}
 }
 
-func TestLoggerFiltersBelowMinimumLevel(t *testing.T) {
+func TestJSONHandlerEmitsValidJSONWithAttributes(t *testing.T) {
 	buf := new(bytes.Buffer)
-	log := NewLogger(LevelWarn, buf)
+	rec := NewRecorder(NewLogger("json", LevelInfo, buf), NewMetrics())
 
-	log.Write(Event{Level: LevelDebug, Fields: Fields{FieldEvent: "debug"}})
-	log.Write(Event{Level: LevelInfo, Fields: Fields{FieldEvent: "info"}})
-	if buf.Len() != 0 {
-		t.Fatalf("debug и info не должны попасть в лог: %q", buf.String())
+	rec.Log(LevelInfo, "verdict_published", Fields{
+		FieldWatchID: "watch:1",
+		FieldPR:      12,
+		FieldVerdict: "ready",
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("невалидный JSON %q: %v", buf.String(), err)
 	}
-	log.Write(Event{Level: LevelError, Fields: Fields{FieldEvent: "error"}})
-	if !strings.Contains(buf.String(), "error") {
-		t.Fatalf("error должен попасть в лог: %q", buf.String())
+	for key, want := range map[string]any{
+		FieldEvent:   "verdict_published",
+		FieldWatchID: "watch:1",
+		FieldVerdict: "ready",
+		"level":      "INFO",
+	} {
+		if got[key] != want {
+			t.Errorf("поле %s = %v, ожидалось %v", key, got[key], want)
+		}
+	}
+	if pr, ok := got[FieldPR].(float64); !ok || int(pr) != 12 {
+		t.Errorf("поле pr = %v, ожидалось 12", got[FieldPR])
+	}
+	if _, ok := got["time"].(string); !ok {
+		t.Error("нет поля time")
 	}
 }
 
-func TestOpenLogFileAppendsToRequestedPath(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "beacon.log")
-	f, err := OpenLogFile(path)
+func TestHandlerFiltersBelowMinimumLevel(t *testing.T) {
+	for _, format := range []string{"text", "json"} {
+		buf := new(bytes.Buffer)
+		rec := NewRecorder(NewLogger(format, LevelWarn, buf), NewMetrics())
+		rec.Log(LevelDebug, "debug", nil)
+		rec.Log(LevelInfo, "info", nil)
+		if buf.Len() != 0 {
+			t.Errorf("%s: debug и info не должны попасть в лог: %q", format, buf.String())
+		}
+		rec.Log(LevelError, "error", nil)
+		if strings.Contains(buf.String(), "debug") || strings.Contains(buf.String(), "info") {
+			t.Errorf("%s: в логе есть отфильтрованные уровни: %q", format, buf.String())
+		}
+		if !strings.Contains(buf.String(), "event=error") && !strings.Contains(buf.String(), `"event":"error"`) {
+			t.Errorf("%s: error должен попасть в лог: %q", format, buf.String())
+		}
+	}
+}
+
+func TestOpenRunLogCreatesUniqueFileEachInitialization(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 11, 20, 12, 34, 56, 123456789, time.UTC)
+
+	first, err := OpenRunLog(dir, now, 4242)
 	if err != nil {
 		t.Fatal(err)
 	}
-	log := NewLogger(LevelInfo, f)
-	log.Write(Event{Level: LevelInfo, Fields: Fields{FieldEvent: "first"}})
-	if err := log.Close(); err != nil {
+	if _, err := first.Writer().Write([]byte("first\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	f, err = OpenLogFile(path)
+	second, err := OpenRunLog(dir, now, 4242)
 	if err != nil {
 		t.Fatal(err)
 	}
-	log = NewLogger(LevelInfo, f)
-	log.Write(Event{Level: LevelInfo, Fields: Fields{FieldEvent: "second"}})
-	if err := log.Close(); err != nil {
+	defer func() { _ = second.Close() }()
+	if _, err := second.Writer().Write([]byte("second\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	raw, err := os.ReadFile(path)
+	if first.Path == second.Path {
+		t.Fatalf("две инициализации получили один файл: %s", first.Path)
+	}
+	wantPrefix := "beacon-20261120T123456.123456789Z-4242"
+	for _, path := range []string{first.Path, second.Path} {
+		if filepath.Dir(path) != filepath.Join(dir, "logs") {
+			t.Errorf("файл не в logs: %s", path)
+		}
+		if !strings.HasPrefix(filepath.Base(path), wantPrefix) || !strings.HasSuffix(path, ".log") {
+			t.Errorf("имя файла %s не начинается с %s", path, wantPrefix)
+		}
+	}
+
+	latest := filepath.Join(dir, "logs", "beacon.latest.log")
+	target, err := os.Readlink(latest)
+	if err != nil {
+		t.Fatalf("beacon.latest.log не symlink: %v", err)
+	}
+	if target != filepath.Base(second.Path) {
+		t.Errorf("symlink указывает на %q, ожидалось %q", target, filepath.Base(second.Path))
+	}
+
+	raw, err := os.ReadFile(first.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), `"event":"first"`) || !strings.Contains(string(raw), `"event":"second"`) {
-		t.Fatalf("в файле нет обеих записей: %q", raw)
+	if string(raw) != "first\n" {
+		t.Errorf("в первом файле %q, ожидалось только \"first\\n\"", raw)
 	}
 }

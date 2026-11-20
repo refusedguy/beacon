@@ -3,6 +3,7 @@ package observe
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -10,7 +11,7 @@ import (
 
 type capturedEvent struct {
 	name   string
-	level  Level
+	level  slog.Level
 	fields Fields
 }
 
@@ -24,7 +25,7 @@ func newCaptureSink() *captureSink {
 	return &captureSink{counts: make(map[string]uint64), labels: make(map[string]string)}
 }
 
-func (s *captureSink) Emit(event string, level Level, fields Fields) {
+func (s *captureSink) Log(level Level, event string, fields Fields) {
 	s.events = append(s.events, capturedEvent{name: event, level: level, fields: fields})
 }
 
@@ -84,19 +85,31 @@ func TestDefaultSinkIsNoOpWithoutWiring(t *testing.T) {
 	}
 }
 
+func TestParseLevel(t *testing.T) {
+	for raw, want := range map[string]Level{
+		"debug": LevelDebug, "INFO": LevelInfo, " warn ": LevelWarn,
+		"error": LevelError, "": LevelInfo,
+	} {
+		got, ok := ParseLevel(raw)
+		if !ok || got != want {
+			t.Errorf("ParseLevel(%q) = %v, %v", raw, got, ok)
+		}
+	}
+	if _, ok := ParseLevel("trace"); ok {
+		t.Error("trace не должен распознаваться")
+	}
+}
+
 func TestRecorderRoutesToLoggerAndMetrics(t *testing.T) {
 	buf := &strings.Builder{}
 	metrics := NewMetrics()
-	rec := NewRecorder(NewLogger(LevelDebug, buf), metrics)
+	rec := NewRecorder(NewLogger("json", LevelDebug, buf), metrics)
 	SetDefault(rec)
 	defer SetDefault(nil)
 
 	VerdictPublished("retry", "watch:2", 9)
 	if MetricsOf(Default()) != metrics {
 		t.Fatal("MetricsOf не вернул установленный счётчик")
-	}
-	if metrics == nil || len(buf.String()) == 0 {
-		t.Fatal("Recorder не направил событие в логгер")
 	}
 	var got map[string]any
 	if err := json.Unmarshal([]byte(buf.String()), &got); err != nil {
