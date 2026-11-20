@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -184,6 +185,53 @@ func TestSessionsTTL(t *testing.T) {
 	}
 	if calls != 2 {
 		t.Fatalf("ожидался повторный HTTP-запрос после TTL, получено %d", calls)
+	}
+}
+
+// T3.148: GET /api/session reports model either as a v2 object or as a legacy
+// string. Both must parse into the same model id through the real Sessions path.
+func TestSessionsModelObjectAndString(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		model string // raw JSON value of the "model" field
+		want  string
+	}{
+		{
+			name:  "v2 object",
+			model: `{"id":"hy4-flash-free","providerID":"opencode","variant":"default"}`,
+			want:  "hy4-flash-free",
+		},
+		{
+			name:  "legacy string",
+			model: `"hy4-flash-free"`,
+			want:  "hy4-flash-free",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"data":[{"id":"s1","agent":"build","model":%s}]}`, tc.model)
+			doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+				return fakeResponse(body, http.StatusOK), nil
+			}}
+			c := newTestClient(t, doer)
+			c.sessionTTL = 0
+
+			sessions, err := c.Sessions(context.Background())
+			if err != nil {
+				t.Fatalf("Sessions: %v", err)
+			}
+			if len(sessions) != 1 || string(sessions[0].ModelID) != tc.want {
+				t.Fatalf("неверные сессии: %+v (ожидали model=%q)", sessions, tc.want)
+			}
+		})
+	}
+}
+
+func TestModelIDUnmarshalRejectsOtherTypes(t *testing.T) {
+	for _, raw := range []string{`123`, `true`, `[]`} {
+		var m modelID
+		if err := json.Unmarshal([]byte(raw), &m); err == nil {
+			t.Fatalf("ожидалась ошибка для %s", raw)
+		}
 	}
 }
 
