@@ -20,6 +20,31 @@ type opencodePort interface {
 
 var _ opencodePort = (*opencode.Client)(nil)
 
+// clientSessionCreator adapts the context-aware POST client of T3.150 to the
+// narrow ports used by beacon spawn and deliver. The client takes a context and
+// returns a Session, so *opencode.Client does not satisfy sessionCreator by
+// itself; installOpenCodePorts needs this adapter to wire the live client
+// (ADR 0060 п3/п4).
+type clientSessionCreator struct {
+	client *opencode.Client
+}
+
+var _ sessionCreator = (*clientSessionCreator)(nil)
+
+// CreateSession posts the session and returns its opaque id.
+func (a *clientSessionCreator) CreateSession(parentID, agent, title string, metadata map[string]string) (string, error) {
+	session, err := a.client.CreateSession(context.Background(), parentID, agent, title, metadata)
+	if err != nil {
+		return "", err
+	}
+	return session.ID, nil
+}
+
+// Prompt posts one message into an existing session.
+func (a *clientSessionCreator) Prompt(sessionID, text string) error {
+	return a.client.Prompt(context.Background(), sessionID, text)
+}
+
 // sessionCreator is the narrow POST port shared by beacon spawn and deliver.
 // Both commands write one message into a live session, so the same two methods
 // serve both. Defining the port here lets the composition root install one
@@ -87,12 +112,19 @@ var opencodeHTTPDoer opencode.Doer
 
 // newOpencodePort resolves the service registration and returns a live client
 // for its address. The client never hardcodes a port (ADR 0029, ADR 0060 п3).
-// Until T3.151 lands, resolution is service.json only; a client with the
-// serverEnsurer port installs the fallback path through SetServerEnsurer.
+// It also installs the POST and fallback ports here: the client's methods take
+// a context, so installOpenCodePorts cannot match them by type assertion
+// without these adapters.
 func newOpencodePort() (opencodePort, error) {
 	cfg, err := resolveOpencodeConfig(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return opencode.New(cfg, opencodeHTTPDoer)
+	client, err := opencode.New(cfg, opencodeHTTPDoer)
+	if err != nil {
+		return nil, err
+	}
+	SetSessionCreator(&clientSessionCreator{client: client})
+	SetServerEnsurer(serverEnsurerFunc(opencode.EnsureServer))
+	return client, nil
 }

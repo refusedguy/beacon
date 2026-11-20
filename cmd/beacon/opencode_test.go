@@ -43,7 +43,9 @@ func writeServiceFile(t *testing.T, body string) {
 }
 
 func TestNewOpencodePortMissingService(t *testing.T) {
+	t3152RestorePorts(t)
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	SetServerEnsurer(nil)
 	old := opencodeHTTPDoer
 	t.Cleanup(func() { opencodeHTTPDoer = old })
 	opencodeHTTPDoer = &adapterDoer{}
@@ -54,6 +56,7 @@ func TestNewOpencodePortMissingService(t *testing.T) {
 }
 
 func TestNewOpencodePortUsesPasswordFromServiceFile(t *testing.T) {
+	t3152RestorePorts(t)
 	writeServiceFile(t, `{"url":"http://127.0.0.1:49374/","pid":1,"version":"2.3.0","password":"secret"}`)
 
 	doer := &adapterDoer{fn: func(*http.Request) (*http.Response, error) {
@@ -245,5 +248,125 @@ func TestT3152NewOpencodePortUsesInstalledEnsurer(t *testing.T) {
 	}
 	if got := doer.requests[0].URL.String(); got != "http://127.0.0.1:63000/api/agent" {
 		t.Fatalf("адрес запроса = %q, ожидался адрес от ensurer", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T3.153: the real client has context-aware POST methods, so the CLI ports are
+// installed through clientSessionCreator instead of a type assertion.
+// ---------------------------------------------------------------------------
+
+type recordedPost struct {
+	method string
+	path   string
+	body   string
+}
+
+func TestW254ClientSessionCreatorPostsAndReturnsID(t *testing.T) {
+	var posts []recordedPost
+	doer := &adapterDoer{fn: func(req *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		posts = append(posts, recordedPost{req.Method, req.URL.Path, string(body)})
+		if req.URL.Path == "/api/session" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(`{"id":"sess-created","agent":"general"}`)),
+				Header:     http.Header{},
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(`{}`)),
+			Header:     http.Header{},
+		}, nil
+	}}
+	client, err := opencode.New(opencode.Config{URL: "http://127.0.0.1:64000", Password: "pw"}, doer)
+	if err != nil {
+		t.Fatalf("opencode.New: %v", err)
+	}
+	creator := &clientSessionCreator{client: client}
+
+	id, err := creator.CreateSession("parent", "general", "T3.999", map[string]string{"task": "T3.999"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if id != "sess-created" {
+		t.Fatalf("id = %q, ожидался sess-created", id)
+	}
+	if err := creator.Prompt("sess-created", "pointer"); err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+
+	if len(posts) != 2 {
+		t.Fatalf("POST-запросов %d, ожидалось 2", len(posts))
+	}
+	if posts[0].method != http.MethodPost || posts[0].path != "/api/session" {
+		t.Fatalf("первый запрос = %+v", posts[0])
+	}
+	for _, field := range []string{`"parentID":"parent"`, `"agent":"general"`, `"title":"T3.999"`, `"task":"T3.999"`} {
+		if !strings.Contains(posts[0].body, field) {
+			t.Fatalf("в теле CreateSession нет %s: %s", field, posts[0].body)
+		}
+	}
+	if posts[1].method != http.MethodPost || posts[1].path != "/api/session/sess-created/prompt" {
+		t.Fatalf("второй запрос = %+v", posts[1])
+	}
+	if !strings.Contains(posts[1].body, `"text":"pointer"`) {
+		t.Fatalf("в теле Prompt нет text: %s", posts[1].body)
+	}
+}
+
+func TestW254NewOpencodePortInstallsClientPorts(t *testing.T) {
+	t3152RestorePorts(t)
+	writeServiceFile(t, `{"url":"http://127.0.0.1:65000/","password":"pw"}`)
+	SetServerEnsurer(nil)
+	SetSessionSpawner(nil)
+	SetDeliveryTarget(nil)
+	oldDoer := opencodeHTTPDoer
+	t.Cleanup(func() { opencodeHTTPDoer = oldDoer })
+	doer := &adapterDoer{fn: func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader(`{"id":"sess-live"}`)),
+			Header:     http.Header{},
+		}, nil
+	}}
+	opencodeHTTPDoer = doer
+
+	port, err := newOpencodePort()
+	if err != nil {
+		t.Fatalf("newOpencodePort: %v", err)
+	}
+	if _, ok := port.(sessionCreator); ok {
+		t.Fatal("сырой клиент не должен удовлетворять sessionCreator")
+	}
+	if spawnSessionSpawner == nil || deliverTarget == nil {
+		t.Fatalf("порты не установлены: spawn=%v deliver=%v", spawnSessionSpawner, deliverTarget)
+	}
+	if installedServerEnsurer == nil {
+		t.Fatal("порт EnsureServer не установлен")
+	}
+	id, err := spawnSessionSpawner.CreateSession("parent", "general", "T3.999", nil)
+	if err != nil || id != "sess-live" {
+		t.Fatalf("CreateSession через установленный порт = %q, %v", id, err)
+	}
+	if err := deliverTarget.Prompt("sess-live", "pointer"); err != nil {
+		t.Fatalf("Prompt через установленный порт: %v", err)
+	}
+	if len(doer.requests) != 2 {
+		t.Fatalf("запросов %d, ожидалось 2", len(doer.requests))
+	}
+	if got := doer.requests[0].Method + " " + doer.requests[0].URL.String(); got != "POST http://127.0.0.1:65000/api/session" {
+		t.Fatalf("первый запрос = %q", got)
+	}
+	cfg, err := installedServerEnsurer.EnsureServer(context.Background())
+	if err != nil || cfg.URL != "http://127.0.0.1:65000/" {
+		t.Fatalf("EnsureServer через адаптер = %+v, %v", cfg, err)
 	}
 }
