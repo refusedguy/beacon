@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/server"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
@@ -773,5 +775,139 @@ func TestTaskLeaseValidation(t *testing.T) {
 		if code != 1 {
 			t.Errorf("%v: код %d, ждали 1", argv, code)
 		}
+	}
+}
+
+// ---- BS.32: CLI управления расписаниями через порт ScheduleStore ----
+
+type failingScheduleStore struct{}
+
+func (failingScheduleStore) Create(context.Context, server.Schedule) error {
+	return errors.New("store down")
+}
+func (failingScheduleStore) Get(context.Context, string) (server.Schedule, error) {
+	return server.Schedule{}, errors.New("store down")
+}
+func (failingScheduleStore) List(context.Context) ([]server.Schedule, error) {
+	return nil, errors.New("store down")
+}
+func (failingScheduleStore) Update(context.Context, server.Schedule) error {
+	return errors.New("store down")
+}
+func (failingScheduleStore) Delete(context.Context, string) error {
+	return errors.New("store down")
+}
+
+func withScheduleStore(t *testing.T, store server.ScheduleStore, fn func(taskcli.Config)) {
+	t.Helper()
+	orig := scheduleStoreFor
+	defer func() { scheduleStoreFor = orig }()
+	scheduleStoreFor = func(taskcli.Config) (server.ScheduleStore, error) { return store, nil }
+	dir := t.TempDir()
+	fn(taskcli.Config{StateDir: dir, Root: dir})
+}
+
+func TestTaskScheduleCreateListPauseDelete(t *testing.T) {
+	withScheduleStore(t, server.NewMemoryScheduleStore(), func(cfg taskcli.Config) {
+		run := func(argv ...string) (int, string, string) {
+			var out, errOut bytes.Buffer
+			code := TaskCommandWithConfig(argv, &out, &errOut, cfg)
+			return code, out.String(), errOut.String()
+		}
+
+		code, out, errOut := run("task", "schedule", "create", "--id", "s1",
+			"--task-id", "BS.32", "--kind", "interval", "--expr", "15m", "--timezone", "UTC")
+		if code != 0 || !strings.Contains(out, "s1 scheduled") {
+			t.Fatalf("create: код %d stdout %q stderr %q", code, out, errOut)
+		}
+
+		code, out, errOut = run("task", "schedule", "list")
+		if code != 0 || !strings.Contains(out, "s1") || !strings.Contains(out, "BS.32") || !strings.Contains(out, "true") {
+			t.Fatalf("list: код %d stdout %q stderr %q", code, out, errOut)
+		}
+
+		// Пауза сохраняет задачу и выключает её, не удаляя.
+		code, out, errOut = run("task", "schedule", "--id", "s1", "--enabled=false")
+		if code != 0 || !strings.Contains(out, "s1 paused") {
+			t.Fatalf("pause: код %d stdout %q stderr %q", code, out, errOut)
+		}
+		code, out, errOut = run("task", "schedule", "list", "--format", "json")
+		if code != 0 {
+			t.Fatalf("list json: код %d stderr %q", code, errOut)
+		}
+		var rows []server.Schedule
+		if err := json.Unmarshal([]byte(out), &rows); err != nil {
+			t.Fatalf("неверный JSON: %v, вывод %q", err, out)
+		}
+		if len(rows) != 1 || rows[0].ID != "s1" || rows[0].Enabled || rows[0].TaskID != "BS.32" {
+			t.Fatalf("после паузы: %+v", rows)
+		}
+
+		code, out, errOut = run("task", "schedule", "resume", "--id", "s1", "--enabled=true")
+		if code != 0 || !strings.Contains(out, "s1 resumed") {
+			t.Fatalf("resume: код %d stdout %q stderr %q", code, out, errOut)
+		}
+
+		code, out, errOut = run("task", "schedule", "delete", "--id", "s1")
+		if code != 0 || !strings.Contains(out, "s1 deleted") {
+			t.Fatalf("delete: код %d stdout %q stderr %q", code, out, errOut)
+		}
+		code, out, errOut = run("task", "schedule", "list")
+		if code != 0 || strings.Contains(out, "s1") {
+			t.Fatalf("задача пережила удаление: код %d stdout %q stderr %q", code, out, errOut)
+		}
+	})
+}
+
+func TestTaskScheduleStoreErrorAndValidation(t *testing.T) {
+	withScheduleStore(t, failingScheduleStore{}, func(cfg taskcli.Config) {
+		var out, errOut bytes.Buffer
+		code := TaskCommandWithConfig([]string{"task", "schedule", "list"}, &out, &errOut, cfg)
+		if code != taskstore.ExitStartup || !strings.Contains(errOut.String(), "store down") {
+			t.Fatalf("ошибка стора: код %d stderr %q", code, errOut.String())
+		}
+	})
+
+	withScheduleStore(t, server.NewMemoryScheduleStore(), func(cfg taskcli.Config) {
+		for _, argv := range [][]string{
+			{"task", "schedule"},
+			{"task", "schedule", "--task-id", "T"},
+			{"task", "schedule", "--task-id", "T", "--kind", "bogus", "--expr", "x"},
+			{"task", "schedule", "list", "--format", "yaml"},
+			{"task", "schedule", "delete"},
+		} {
+			var out, errOut bytes.Buffer
+			code := TaskCommandWithConfig(argv, &out, &errOut, cfg)
+			if code != taskstore.ExitValidation || out.Len() != 0 {
+				t.Errorf("%v: код %d stdout %q stderr %q", argv, code, out.String(), errOut.String())
+			}
+		}
+	})
+}
+
+// Порт реализован JSON-файлом, поэтому расписания переживают новый процесс CLI.
+func TestFileScheduleStorePersists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state", "schedules.json")
+	storeA, err := server.NewFileScheduleStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svcA, err := server.NewScheduleService(storeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svcA.Schedule(context.Background(), server.ScheduleCreate{
+		ID: "s1", TaskID: "BS.32", Kind: server.KindMark, Expr: "deploy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	storeB, err := server.NewFileScheduleStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := storeB.Get(context.Background(), "s1")
+	if err != nil || got.ID != "s1" || got.TaskID != "BS.32" || !got.Enabled {
+		t.Fatalf("после перезапуска: %+v, %v", got, err)
 	}
 }
