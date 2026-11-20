@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -55,13 +56,18 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskWhy(args[1:], stdout, stderr, cfg)
 	case "wait":
 		return runTaskWait(args[1:], stdout, stderr, cfg)
+	case "check-launch":
+		return runTaskCheckLaunch(args[1:], stdout, stderr, cfg)
+	case "lease":
+		return runTaskLease(args[1:], stdout, stderr, cfg)
 	default:
 		fmt.Fprintf(stderr, "неизвестная подкоманда task %q\n%s", args[0], taskUsage)
 		return taskstore.ExitValidation
 	}
 }
 
-const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|--self-test [flags]"
+const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
+	"               beacon task lease acquire|release|check [flags]"
 
 // whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
 var whyEdgeKinds = []string{
@@ -543,6 +549,145 @@ func relativePath(root, filePath string) string {
 		return filePath
 	}
 	return filepath.ToSlash(rel)
+}
+
+// runTaskCheckLaunch — быстрая проверка до запуска волны сабентов. Команда не
+// трогает карточки и не запускает агентов: она только читает OwnerFiles и
+// отклоняет план, если границы двух задач пересекаются. Глобы в OwnerFiles
+// сравниваются тем же кодом, что и аренды, через doublestar в слое app.
+func runTaskCheckLaunch(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, nil, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) == 0 {
+		return failTask(stderr, taskstore.Validationf("нужны ID карточек: beacon task check-launch T1 T2 T3"))
+	}
+	svc := taskcli.NewService(cfg)
+	if err := svc.PlanLaunch(p.pos...); err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintf(stdout, "запуск разрешён: %d карточек без пересечений по файлам\n", len(p.pos))
+	return taskstore.ExitOK
+}
+
+// leaseExitBlocked отделяет отказ guard от ошибок стора. Хук пропускает любой
+// код, кроме этого: отсутствующий стор или сбой бинарника не должны мешать
+// коммиту.
+const leaseExitBlocked = 3
+
+const leaseUsage = "использование: beacon task lease acquire --agent A (--glob G | --worktree W)...\n" +
+	"               beacon task lease release --agent A\n" +
+	"               beacon task lease check --agent A (--file F | --worktree W)... [--bypass]"
+
+// runTaskLease — advisory-аренды файлов и ворктри. Команда живёт внутри task,
+// потому что каталог и dispatch верхнего уровня не входят в OwnerFiles волны.
+func runTaskLease(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	if len(argv) == 0 {
+		fmt.Fprintln(stderr, leaseUsage)
+		return taskstore.ExitValidation
+	}
+	switch argv[0] {
+	case "acquire":
+		return runTaskLeaseAcquire(argv[1:], stdout, stderr, cfg)
+	case "release":
+		return runTaskLeaseRelease(argv[1:], stdout, stderr, cfg)
+	case "check":
+		return runTaskLeaseCheck(argv[1:], stdout, stderr, cfg)
+	default:
+		fmt.Fprintf(stderr, "неизвестная подкоманда lease %q\n%s\n", argv[0], leaseUsage)
+		return taskstore.ExitValidation
+	}
+}
+
+func leaseAgent(stderr io.Writer, p *parsedArgs) (string, bool) {
+	agent := strings.TrimSpace(p.value("agent"))
+	if agent == "" {
+		fmt.Fprintln(stderr, "нужен --agent")
+		return "", false
+	}
+	return agent, true
+}
+
+func runTaskLeaseAcquire(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{
+		"agent": true, "glob": true, "worktree": true,
+	}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	agent, ok := leaseAgent(stderr, p)
+	if !ok {
+		return taskstore.ExitValidation
+	}
+	globs, worktrees := p.vals["glob"], p.vals["worktree"]
+	if len(globs) == 0 && len(worktrees) == 0 {
+		fmt.Fprintln(stderr, "нужен хотя бы один --glob или --worktree")
+		return taskstore.ExitValidation
+	}
+	svc := taskcli.NewService(cfg)
+	if err := svc.ReserveLeases(agent, globs, worktrees, time.Time{}); err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintf(stdout, "аренда установлена: агент=%s glob-ов=%d ворктри=%d\n",
+		agent, len(globs), len(worktrees))
+	return taskstore.ExitOK
+}
+
+func runTaskLeaseRelease(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"agent": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	agent, ok := leaseAgent(stderr, p)
+	if !ok {
+		return taskstore.ExitValidation
+	}
+	svc := taskcli.NewService(cfg)
+	if err := svc.ReleaseFiles(agent, time.Time{}); err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintf(stdout, "аренда снята: агент=%s\n", agent)
+	return taskstore.ExitOK
+}
+
+func runTaskLeaseCheck(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{
+		"agent": true, "file": true, "worktree": true,
+	}, map[string]bool{"bypass": true})
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	agent, ok := leaseAgent(stderr, p)
+	if !ok {
+		return taskstore.ExitValidation
+	}
+	files := append([]string(nil), p.vals["file"]...)
+	files = append(files, p.vals["worktree"]...)
+	if len(files) == 0 {
+		fmt.Fprintln(stderr, "нужен хотя бы один --file или --worktree")
+		return taskstore.ExitValidation
+	}
+	svc := taskcli.NewService(cfg)
+	decision, err := svc.CheckCommit(agent, files, p.bools["bypass"], time.Time{})
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if decision.Blocked {
+		fmt.Fprintln(stdout, decision.Reason)
+		return leaseExitBlocked
+	}
+	fmt.Fprintf(stdout, "аренда проверена: агент=%s файлов=%d, блокировок нет\n", agent, len(files))
+	return taskstore.ExitOK
 }
 
 func defaultTaskConfig() (taskcli.Config, error) {

@@ -322,16 +322,27 @@ type LaunchAssignment struct {
 
 // IntersectingFiles статически сравнивает границы файлов двух назначений и
 // возвращает первую пересекающуюся пару. Третий результат false, если файлы
-// не пересекаются. Каталог пересекает любой путь внутри него.
+// не пересекаются. Каталог пересекает любой путь внутри него, а glob через
+// doublestar пересекает всё, что ему соответствует. Один и тот же файл может
+// быть записан точным путём в одной карточке и шаблоном в другой, поэтому
+// сравнение симметрично.
 func IntersectingFiles(a, b LaunchAssignment) (string, string, bool) {
 	for _, fa := range a.Files {
 		for _, fb := range b.Files {
-			if taskstore.PathsConflict(fa, fb) {
+			if patternsConflict(fa, fb) {
 				return fa, fb, true
 			}
 		}
 	}
 	return "", "", false
+}
+
+// patternsConflict сравнивает две границы как glob-ы в обе стороны. Точный путь
+// не содержит метасимволов, поэтому для пары «файл и шаблон» срабатывает вызов,
+// где шаблон стоит первым. Для двух шаблонов проверка консервативна: совпадение
+// одного шаблона с буквальным видом другого считается пересечением.
+func patternsConflict(a, b string) bool {
+	return globMatches(a, b) || globMatches(b, a)
 }
 
 // CheckLaunch — проверка до запуска. Она анализирует назначения, пока агенты
@@ -1846,7 +1857,7 @@ func (s *Service) CheckCommit(agent string, files []string, bypass bool, now tim
 			continue
 		}
 		for _, r := range st.Reservations {
-			if r.Agent == agent {
+			if r.Agent == agent || now.Sub(r.Time) > LeaseTTL {
 				continue
 			}
 			for _, g := range r.Globs {
@@ -1899,6 +1910,38 @@ func (s *Service) ReservationLog() ([]ReservationLogEntry, error) {
 		return nil, err
 	}
 	return append([]ReservationLogEntry(nil), st.Journal...), nil
+}
+
+// LeaseTTL — срок жизни аренды без подтверждения. Аренда старше этого срока
+// считается оставленной: агент мог закончить или упасть, и его glob не должен
+// блокировать коммиты навсегда. Проверка времени живёт на границе чтения,
+// журнал аренды при этом сохраняется целиком.
+const LeaseTTL = 30 * time.Minute
+
+// WorktreeGlob возвращает glob, покрывающий всё дерево ворктри. Путь может
+// быть относительным; разделители приводятся к прямому слешу для doublestar.
+func WorktreeGlob(worktree string) string {
+	p := strings.ReplaceAll(strings.TrimSpace(worktree), "\\", "/")
+	p = strings.TrimSuffix(p, "/")
+	if p == "" {
+		return ""
+	}
+	return p + "/**"
+}
+
+// ReserveLeases регистрирует под одной арендой файловые glob-ы и целые ворктри.
+// Повторная аренда того же агента заменяет предыдущий набор, как в ReserveFiles.
+func (s *Service) ReserveLeases(agent string, globs, worktrees []string, now time.Time) error {
+	all := make([]string, 0, len(globs)+len(worktrees))
+	all = append(all, globs...)
+	for _, worktree := range worktrees {
+		g := WorktreeGlob(worktree)
+		if g == "" {
+			return taskstore.Validationf("пустой путь ворктри аренды")
+		}
+		all = append(all, g)
+	}
+	return s.ReserveFiles(agent, all, now)
 }
 
 // ---- ADR 0041 п6 / T3.82: журнал причин отказа precheck ----
