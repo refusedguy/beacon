@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
-	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider
@@ -199,6 +198,29 @@ func verdictFromChecks(checks map[string]domain.Check) domain.Verdict {
 	return domain.VerdictWatching
 }
 
+// wakeAddressee resolves the one session a wake may address on w. The address
+// must be subscriber.ID on this very Watch with role executor or orchestrator.
+// No caller session, _meta value, notify target or role-wide broadcast replaces
+// it. The check stays local so cibridge does not import another infra package.
+func wakeAddressee(w domain.Watch, watchID, addressee string) (string, error) {
+	if watchID == "" || w.ID != watchID {
+		return "", fmt.Errorf("cibridge: watchID %q does not name watch %q", watchID, w.ID)
+	}
+	if !strings.HasPrefix(addressee, "ses_") || len(addressee) == len("ses_") {
+		return "", fmt.Errorf("cibridge: subscriber %q is not a session", addressee)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.ID != addressee {
+			continue
+		}
+		if sub.Role != domain.RoleExecutor && sub.Role != domain.RoleOrchestrator {
+			return "", fmt.Errorf("cibridge: subscriber %q has role %q", sub.ID, sub.Role)
+		}
+		return sub.ID, nil
+	}
+	return "", fmt.Errorf("cibridge: session %q is not a subscriber of watch %s", addressee, watchID)
+}
+
 func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRState, verdict domain.Verdict) (int, error) {
 	now := b.clock.Now()
 
@@ -264,8 +286,9 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 		// agree with the obligation and with the resolved Watch target; a
 		// caller session or _meta value never substitutes for it.
 		addressee := sub.ID
-		target, err := wake.SubscriberTarget(next, p.WatchID, addressee)
-		if err != nil || target != addressee || o.SubscriberID != addressee {
+		target, err := wakeAddressee(next, p.WatchID, addressee)
+		if err != nil || target != addressee || o.SubscriberID != addressee ||
+			domain.ObligationKey(p.WatchID, p.Revision, addressee) != p.ObligationID {
 			log.Printf("cibridge: skip wake for watch %s: obligation %s addresses %q, subscriber %q, target %q (%v)",
 				next.ID, id, o.SubscriberID, addressee, target, err)
 			continue
@@ -278,7 +301,7 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 		} else if b.adapterWaker != nil {
 			deliverErr = b.adapterWaker.Deliver(ctx, sub.Adapter, target, p)
 		} else {
-			deliverErr = wake.DeliverToSubscriber(ctx, b.waker, next, p, addressee)
+			deliverErr = b.waker.Deliver(ctx, addressee, p)
 		}
 		if deliverErr != nil {
 			log.Printf("cibridge: wake %s: %v", target, deliverErr)

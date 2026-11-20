@@ -2545,7 +2545,8 @@ func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, 
 	}
 	// An adapter must not substitute a different session for an explicit
 	// subscriber address, even when its own registry maps that address.
-	if string(target) != p.Target {
+	// Opaque non-session targets stay under the adapter's own registry.
+	if strings.HasPrefix(p.Target, "ses_") && string(target) != p.Target {
 		log.Printf("wake: skip pointer %s: adapter bound %q, subscriber %q", p.ObligationID, target, p.Target)
 		r := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}
 		T210settle(src, p, deliveries, r, adapter)
