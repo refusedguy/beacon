@@ -20,6 +20,10 @@ PR: 489
 
 Адаптер порта ReminderPorts читает задачи из store, а периодический вызов Notify живёт в daemon. Оба файла входят в OwnerFiles других агентов и выходят за скоуп BS.65. В PR 489 вошла только чистая логика, порт и тесты.
 
+## Блокер
+
+- 2026-11-21, проверка premise: PR 489 влит коммитом `9d1a480`, но после `git fetch origin/main` ветка осталась на `6e8f1fd` и не содержит OwnerFiles; вызовов `tasks.NewNotifier` вне тестов нет. Адаптер в `internal/infra/taskstore/reminders.go` требует импорта `internal/app/tasks`, а матрица `tools/beacon-gates/gate/config/layers.json` запрещает ребро `internal/infra` -> `internal/app`. Запуск периодического цикла живёт в `cmd/beacon/daemon.go`. Матрица и daemon находятся вне OwnerFiles. В `taskstore.Card` нет поля дедлайна, канал доставки напоминаний не задан, а дедлайн Watch уже обрабатывает `internal/domain/verdict.go:312`. Статус остаётся todo до решения владельца о расширении OwnerFiles.
+
 ## Шаги
 
 1. Дождаться мержа PR 489.
