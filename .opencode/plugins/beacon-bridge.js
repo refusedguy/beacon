@@ -3,21 +3,26 @@
 // T3.16 добавляет доставку review-указателя каналом steer и квитанцию по ADR 0014.
 // T3.18 добавляет рабочий канал S2: polling events.jsonl, курсор offset+epoch,
 // доставку события в сессию из item.sessionID и atomic claim квитанций.
+// W274 привязывает состояние тонкого адаптера к проекту из ctx.location.
+// Общий MCP-сервер Beacon не трогается: wake по-прежнему доставляется через
+// ctx.session.prompt с delivery steer.
 // Все пути идут от adapterPaths; абсолютных путей из спайка в адаптере нет.
 import {
   appendFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs"
 import { mkdir, open } from "node:fs/promises"
 import { createHash } from "node:crypto"
 import { homedir, tmpdir } from "node:os"
-import { dirname, join, resolve, sep } from "node:path"
+import { basename, dirname, join, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const ID = "beacon-bridge"
@@ -45,6 +50,41 @@ function statePaths(stateDir) {
 }
 
 export const adapterPaths = Object.freeze(statePaths(STATE_DIR))
+
+// Ключ проекта повторяет схему Go из cmd/beacon/doctor.go (projectStateKey):
+// имя папки и первые восемь hex-символов sha256 абсолютного пути.
+// abs берётся без resolve символических ссылок, как filepath.Abs в Go.
+export function projectKey(directory) {
+  if (typeof directory !== "string" || directory.trim() === "") return null
+  const abs = resolve(directory)
+  const name = basename(abs) || "project"
+  const hash = createHash("sha256").update(abs).digest("hex").slice(0, 8)
+  return `${name}-${hash}`
+}
+
+// Каталог состояния проекта: <base>/beacon/projects/<key>.
+export function projectStateDir(directory) {
+  const key = projectKey(directory)
+  return key ? join(STATE_DIR, "projects", key) : null
+}
+
+// Старый хост может не давать ctx.location. Тогда ключа нет и адаптер работает
+// с глобальным каталогом, как до W274.
+export function locationDirectory(ctx) {
+  return ctx?.location?.project?.canonical || ctx?.location?.directory || null
+}
+
+// Явный каталог хоста/теста > BEACON_STATE_DIR (тот же движок, что в Go)
+// > каталог проекта > глобальный каталог. Fail-open: без location работает
+// прежний путь, никаких исключений.
+export function resolveStateDir(ctx) {
+  const explicit =
+    typeof ctx?.beaconStateDir === "string" && ctx.beaconStateDir
+      ? ctx.beaconStateDir
+      : (process.env.BEACON_STATE_DIR || "").trim()
+  if (explicit) return explicit
+  return projectStateDir(locationDirectory(ctx)) ?? adapterPaths.state
+}
 
 const REVIEW_SOURCE = "review"
 const STEER_DELIVERY = "steer"
@@ -94,6 +134,11 @@ export function buildPromptText(event) {
       branch: escapeUntrusted(event.branch ?? ""),
     },
   }
+  // W274: ключ проекта сообщает агенту, откуда пришло wake. Поле экранируется так же,
+  // как остальные данные: имя папки приходит из файловой системы.
+  if (typeof event.project === "string" && event.project) {
+    pointer.project = escapeUntrusted(event.project)
+  }
   const budget = MAX_PROMPT_LENGTH - WRAPPER_OPEN.length - WRAPPER_CLOSE.length
   const body = JSON.stringify(pointer).slice(0, Math.max(0, budget))
   return `${WRAPPER_OPEN}${body}${WRAPPER_CLOSE}`
@@ -117,7 +162,7 @@ function emitEvidence(paths, obj) {
 
 // Читает review-указатель, который адаптер со стороны Beacon оставляет в
 // каталоге состояния. Отсутствие файла — не ошибка: это состояние покоя.
-export function readWakePointer(stateDir = adapterPaths.state) {
+export function readWakePointer(stateDir = adapterPaths.state, project = null) {
   const path = join(stateDir, POINTER_FILE)
   let raw
   try {
@@ -131,7 +176,7 @@ export function readWakePointer(stateDir = adapterPaths.state) {
     throw new Error("wake pointer: expected an object")
   }
   // Белый список полей: лишние ключи не попадают ни в prompt, ни в квитанцию.
-  return {
+  const result = {
     sessionID: parsed.sessionID,
     watchID: parsed.watchID,
     obligationID: parsed.obligationID,
@@ -139,6 +184,17 @@ export function readWakePointer(stateDir = adapterPaths.state) {
     attempt: parsed.attempt,
     source: parsed.source,
   }
+  // W274: указатель от ядра может нести project; если его нет, адаптер
+  // подставляет ключ своего проекта. Поле добавляется только когда оно есть,
+  // поэтому старые указатели сохраняют прежний набор полей.
+  const projectValue =
+    typeof parsed.project === "string" && parsed.project
+      ? parsed.project
+      : typeof project === "string" && project
+        ? project
+        : null
+  if (projectValue) result.project = projectValue
+  return result
 }
 
 // Квитанция ADR 0014: одна строка на событие и попытку, запись через wx,
@@ -194,13 +250,16 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
   if (!pointer.sessionID || !pointer.obligationID || !Number.isInteger(pointer.attempt)) {
     throw new Error("wake pointer is missing sessionID, obligationID or attempt")
   }
-  const text =
-    `<beacon-event>${JSON.stringify({
-      watchID: escapeUntrusted(pointer.watchID ?? ""),
-      obligationID: escapeUntrusted(pointer.obligationID ?? ""),
-      revision: Number.isInteger(pointer.revision) ? pointer.revision : 0,
-      source: pointer.source,
-    })}</beacon-event>`
+  const payload = {
+    watchID: escapeUntrusted(pointer.watchID ?? ""),
+    obligationID: escapeUntrusted(pointer.obligationID ?? ""),
+    revision: Number.isInteger(pointer.revision) ? pointer.revision : 0,
+    source: pointer.source,
+  }
+  if (typeof pointer.project === "string" && pointer.project) {
+    payload.project = escapeUntrusted(pointer.project)
+  }
+  const text = `<beacon-event>${JSON.stringify(payload)}</beacon-event>`
   let outcome = "posted"
   try {
     await ctx.session.prompt({
@@ -218,14 +277,20 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
 // S2 deliver: sessionID берётся из события, а не из файла сессии спайка.
 // Квитанции posted/transport-failed пишутся в receipts.jsonl, atomic claim
 // лежит в receipts/<id>.wrote. Любая ошибка гасится вызывающим poller.
-async function deliverEvent(ctx, item, paths) {
+async function deliverEvent(ctx, item, paths, project = null) {
   const id = item.id ?? `auto-${Date.now()}`
   const sessionID = item.sessionID
   if (!sessionID) {
     log(paths, `deliver.skip id=${id} no sessionID in event`)
     return { id, outcome: "skipped" }
   }
-  const text = buildPromptText(item)
+  // W274: событие из events.jsonl может не нести проект; адаптер подставляет
+  // ключ из ctx.location, чтобы агент видел источник wake в обоих каналах.
+  const event =
+    project && !(typeof item.project === "string" && item.project)
+      ? { ...item, project }
+      : item
+  const text = buildPromptText(event)
   log(paths, `deliver.begin id=${id} session=${sessionID}`)
   let c
   try {
@@ -267,7 +332,7 @@ async function deliverEvent(ctx, item, paths) {
 // S2 polling из спайка T0.3. Курсор offset+epoch: epoch это sha256 прочитанного
 // префикса, поэтому пересоздание файла не теряет и не дублирует события,
 // даже если CI переиспользует inode.
-function startS2Poller(ctx, ac, stateDir) {
+function startS2Poller(ctx, ac, stateDir, project = null) {
   const paths = statePaths(stateDir)
   void (async () => {
     let cursor = { offset: 0, epoch: "" }
@@ -315,7 +380,7 @@ function startS2Poller(ctx, ac, stateDir) {
           }
           if (!item || typeof item !== "object") continue
           try {
-            await deliverEvent(ctx, item, paths)
+            await deliverEvent(ctx, item, paths, project)
           } catch (err) {
             log(paths, `deliver.error ${err.code ?? ""} ${err.message}`)
           }
@@ -335,7 +400,10 @@ const plugin = {
 
   setup(ctx) {
     const ac = new AbortController()
-    const stateDir = ctx.beaconStateDir ?? adapterPaths.state
+    // W274: корень проекта из ctx.location. Старый хост без location остаётся
+    // на глобальном каталоге состояния. MCP-сервер здесь не настраивается.
+    const project = projectKey(locationDirectory(ctx))
+    const stateDir = resolveStateDir(ctx)
     const paths = statePaths(stateDir)
 
     // Одна подписка на события хоста: факт пробуждения пишется в свидетельства
@@ -354,9 +422,10 @@ const plugin = {
             kind: "ctx-event",
             type: event.type,
             sessionID: d.sessionID ?? null,
+            project,
           })
           if (event.type !== "beacon.review.comment") continue
-          const pointer = readWakePointer(stateDir)
+          const pointer = readWakePointer(stateDir, project)
           if (!pointer || pointer.source !== REVIEW_SOURCE) continue
           await deliverReviewPointer(ctx, pointer, stateDir)
         } catch {
@@ -367,7 +436,7 @@ const plugin = {
       // fail-open: ошибка адаптера не ломает сессию (ADR 0006).
     })
 
-    startS2Poller(ctx, ac, stateDir)
+    startS2Poller(ctx, ac, stateDir, project)
 
     return () => ac.abort()
   },
@@ -705,6 +774,125 @@ const adapterCases = [
         item.sessionID === sessionID), true)
       // Курсор живёт внутри каталога состояния.
       assert.equal(existsSync(join(stateDir, "cursor.json")), true)
+    },
+  },
+  {
+    name: "W274: project key повторяет схему Go, а без ctx.location есть fallback",
+    check(assert) {
+      const first = join(tmpdir(), "beacon-w274-a", "same-name")
+      const second = join(tmpdir(), "beacon-w274-b", "same-name")
+      const expected = createHash("sha256").update(resolve(first)).digest("hex").slice(0, 8)
+      assert.equal(projectKey(first), `same-name-${expected}`)
+      // Одинаковые имена папок в разных путях дают разные ключи.
+      assert.notEqual(projectKey(first), projectKey(second))
+      assert.equal(projectStateDir(first), join(STATE_DIR, "projects", projectKey(first)))
+      assert.equal(projectKey(""), null)
+      assert.equal(projectKey(null), null)
+      assert.equal(locationDirectory({}), null)
+      assert.equal(resolveStateDir({}), adapterPaths.state)
+      const explicit = join(tmpdir(), "beacon-w274-explicit")
+      assert.equal(resolveStateDir({ beaconStateDir: explicit }), explicit)
+    },
+  },
+  {
+    name: "W274: wake из обоих каналов несёт project, MCP-сервер не трогается",
+    async check(assert) {
+      const canonical = mkdtempSync(join(tmpdir(), "beacon-w274-proj-"))
+      const key = projectKey(canonical)
+      const stateDir = projectStateDir(canonical)
+      let stop = null
+      try {
+        mkdirSync(stateDir, { recursive: true })
+        await writeJSON(join(stateDir, "wake-pointer.json"), {
+          ...reviewPointer(),
+          project: key,
+        })
+        appendFileSync(join(stateDir, "events.jsonl"),
+          JSON.stringify({ id: "w274-s2", sessionID: "ses_w274", obligationID: "obl_w274_s2" }) + "\n")
+
+        const prompts = []
+        const mcpCalls = []
+        const subscriptions = []
+        const queue = []
+        const ctx = {
+          location: {
+            directory: join(canonical, ".worktree"),
+            project: { id: "p_w274", directory: canonical, canonical },
+          },
+          session: {
+            async prompt(input) {
+              prompts.push(input)
+              return { sessionID: input.sessionID, delivery: input.delivery }
+            },
+          },
+          event: {
+            subscribe(options = {}) {
+              const sub = { types: options.types, signal: options.signal, queue }
+              subscriptions.push(sub)
+              return {
+                async *[Symbol.asyncIterator]() {
+                  while (!sub.signal?.aborted) {
+                    if (sub.queue.length > 0) {
+                      yield sub.queue.shift()
+                      continue
+                    }
+                    await new Promise((tick) => setTimeout(tick, 2))
+                  }
+                },
+              }
+            },
+          },
+          mcp: {
+            transform() { mcpCalls.push("transform"); throw new Error("MCP transform forbidden") },
+            update() { mcpCalls.push("update"); throw new Error("MCP update forbidden") },
+            set() { mcpCalls.push("set"); throw new Error("MCP set forbidden") },
+            reload() { mcpCalls.push("reload"); throw new Error("MCP reload forbidden") },
+          },
+        }
+
+        stop = plugin.setup(ctx)
+        assert.ok(subscriptions.some((sub) => (sub.types ?? []).includes("beacon.review.comment")))
+        queue.push({ type: "beacon.review.comment" })
+        const deadline = Date.now() + POLL_MS + 3000
+        while (Date.now() < deadline && prompts.length < 2) {
+          await new Promise((tick) => setTimeout(tick, 25))
+        }
+        await new Promise((tick) => setTimeout(tick, 50))
+
+        assert.deepEqual(mcpCalls, [])
+        assert.equal(prompts.length, 2)
+        assert.equal(prompts.every((item) => item.delivery === "steer"), true)
+        assert.equal(prompts.every((item) => item.text.includes(`"project":"${key}"`)), true)
+        assert.equal(prompts.some((item) => item.text.includes('"source":"review"')), true)
+        assert.equal(prompts.some((item) => item.text.includes(reviewPointer().checkBody)), false)
+        assert.equal(existsSync(join(stateDir, "cursor.json")), true)
+
+        const evidence = readFileSync(join(stateDir, "plugin-events.jsonl"), "utf8")
+          .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        assert.equal(evidence.some((item) => item.kind === "ctx-event" && item.project === key), true)
+      } finally {
+        if (stop) stop()
+        rmSync(stateDir, { recursive: true, force: true })
+        rmSync(canonical, { recursive: true, force: true })
+      }
+    },
+  },
+  {
+    // Иглы собраны из частей: сама проверка не добавляет запрещённые подстроки.
+    name: "W274: в плагине нет вызовов MCP transform, editor.set и запуска MCP-процесса",
+    check(assert) {
+      const source = readFileSync(SELF_PATH, "utf8")
+      const needles = [
+        ["ctx", ".mcp"].join(""),
+        ["editor", ".set("].join(""),
+        ["editor", ".update("].join(""),
+        ["beacon", " mcp"].join(""),
+        ["spawn", "("].join(""),
+        ["child", "_process"].join(""),
+      ]
+      for (const needle of needles) {
+        assert.equal(source.includes(needle), false, needle)
+      }
     },
   },
 ]
