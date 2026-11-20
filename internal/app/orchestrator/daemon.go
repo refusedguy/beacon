@@ -110,31 +110,29 @@ type DaemonSubscriber struct {
 	Target  string
 }
 
-// DaemonWakeSubscriber picks the subscriber a daemon wake may address. It
-// keeps the historical executor-first order, but skips any subscriber whose ID
-// or target is not an OpenCode sessionID: old Watches carry service names such
-// as beacon-ci-checkall, and steering one returns HTTP 400 instead of a wake.
-// When every subscriber is stale the caller must not deliver at all.
+// DaemonWakeSubscriber picks the executor a daemon wake may address. A daemon
+// wake is a retry/rebase pointer for the executor that owns the Watch; it is
+// never addressed to the orchestrator. Orchestrator wakes travel a separate
+// route (blocked -> NotifyOrchestrator) and do not use this function.
+//
+// Subscribers whose ID or target is not an OpenCode sessionID are stale service
+// names from old Watches (beacon-ci-checkall, beacon-daemon-checkall) and are
+// skipped: steering one returns HTTP 400 instead of a wake. Only the executor
+// role qualifies. Without a valid executor the caller must not deliver at all.
 func DaemonWakeSubscriber(subs []DaemonSubscriber) (DaemonSubscriber, error) {
-	var fallback DaemonSubscriber
 	for _, sub := range subs {
+		if sub.Role != RoleExecutor {
+			continue
+		}
 		if ValidateWakeTarget(sub.ID) != nil {
 			continue
 		}
 		if sub.Target != "" && ValidateWakeTarget(sub.Target) != nil {
 			continue
 		}
-		if sub.Role == RoleExecutor {
-			return sub, nil
-		}
-		if fallback.ID == "" {
-			fallback = sub
-		}
+		return sub, nil
 	}
-	if fallback.ID != "" {
-		return fallback, nil
-	}
-	return DaemonSubscriber{}, errors.New("daemon: no subscriber with a valid OpenCode sessionID (ses_) to wake")
+	return DaemonSubscriber{}, errors.New("daemon: no executor subscriber with a valid OpenCode sessionID (ses_) to wake")
 }
 
 // NewDaemonWaker builds the Waker the daemon passes to the orchestrator. The

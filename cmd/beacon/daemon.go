@@ -110,7 +110,14 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 							ID: s.ID, Role: string(s.Role), Adapter: s.Adapter, Target: s.Target,
 						})
 					}
-					if _, err := orchestrator.DaemonWakeSubscriber(subs); err != nil {
+					// The daemon wake path addresses only the executor. An
+					// executor subscribes asynchronously, so at registration time
+					// the Watch carries just the orchestrator session. Keep such
+					// an explicit orchestrator-only Watch valid here or checkall
+					// would register a duplicate on every pass. It still cannot
+					// receive a retry: that wake is refused downstream. Blocked
+					// escalations use the separate NotifyOrchestrator path.
+					if _, err := orchestrator.DaemonWakeSubscriber(subs); err != nil && !hasOrchestratorSession(subs) {
 						continue
 					}
 					return orchestrator.WatchRef{
@@ -193,6 +200,26 @@ func makeDaemonPorts(c *CLI, wakeTarget string) (orchestrator.DaemonPorts, func(
 			return view, nil
 		}),
 	}, cleanup, nil
+}
+
+// hasOrchestratorSession reports whether subs carry an explicit orchestrator
+// session that can receive a blocked escalation. FindFn uses it to keep a Watch
+// registered while its executor is still subscribing; the daemon wake path
+// itself never selects this subscriber (see DaemonWakeSubscriber).
+func hasOrchestratorSession(subs []orchestrator.DaemonSubscriber) bool {
+	for _, s := range subs {
+		if s.Role != orchestrator.RoleOrchestrator {
+			continue
+		}
+		if orchestrator.ValidateWakeTarget(s.ID) != nil {
+			continue
+		}
+		if s.Target != "" && orchestrator.ValidateWakeTarget(s.Target) != nil {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // daemonGHRunner is the single gh seam used by the daemon's checkall pass.

@@ -342,26 +342,107 @@ func TestDaemonWakeSubscriberSelection(t *testing.T) {
 		ID: "ses_exec", Role: RoleExecutor, Adapter: wake.AdapterOpenCode,
 		Target: "ses_exec",
 	}
+	staleOrchestrator := DaemonSubscriber{
+		ID: "beacon-daemon-checkall", Role: RoleOrchestrator,
+		Target: "beacon-daemon-checkall",
+	}
 
-	got, err := DaemonWakeSubscriber([]DaemonSubscriber{legacy, orchestratorSub})
-	if err != nil || got.ID != "ses_orch" {
-		t.Fatalf("legacy executor must be skipped: got %+v, err %v", got, err)
+	tests := []struct {
+		name    string
+		subs    []DaemonSubscriber
+		wantID  string
+		wantErr bool
+	}{
+		{
+			name:    "only orchestrator is never a wake target",
+			subs:    []DaemonSubscriber{orchestratorSub},
+			wantErr: true,
+		},
+		{
+			name:   "executor wins among orchestrator and executor",
+			subs:   []DaemonSubscriber{orchestratorSub, executorSub},
+			wantID: "ses_exec",
+		},
+		{
+			name:   "only executor is selected",
+			subs:   []DaemonSubscriber{executorSub},
+			wantID: "ses_exec",
+		},
+		{
+			name:    "stale service subscribers are refused",
+			subs:    []DaemonSubscriber{legacy, staleOrchestrator},
+			wantErr: true,
+		},
+		{
+			name:    "legacy executor plus orchestrator has no fallback",
+			subs:    []DaemonSubscriber{legacy, orchestratorSub},
+			wantErr: true,
+		},
+		{
+			name:    "executor with a stale target is refused",
+			subs:    []DaemonSubscriber{{ID: "ses_ok", Role: RoleExecutor, Target: "beacon-ci-checkall"}},
+			wantErr: true,
+		},
 	}
-	got, err = DaemonWakeSubscriber([]DaemonSubscriber{orchestratorSub, executorSub})
-	if err != nil || got.ID != "ses_exec" {
-		t.Fatalf("executor must win among valid subscribers: got %+v, err %v", got, err)
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := DaemonWakeSubscriber(tc.subs)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got %+v", got)
+				}
+				if got.ID != "" {
+					t.Fatalf("refused selection must be empty, got %+v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.ID != tc.wantID {
+				t.Fatalf("selected %q, want %q", got.ID, tc.wantID)
+			}
+		})
 	}
-	got, err = DaemonWakeSubscriber([]DaemonSubscriber{
-		legacy,
-		{ID: "beacon-daemon-checkall", Role: RoleOrchestrator, Target: "beacon-daemon-checkall"},
+}
+
+// TestDaemonWakerNeverDeliversToOrchestrator builds the same lookup the
+// composition root uses: no SubscriberID reaches the waker when the Watch has
+// no valid executor. The retry pointer must not reach the orchestrator's
+// session through Deliver.
+func TestDaemonWakerNeverDeliversToOrchestrator(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	w := &daemonWaker{
+		lookup: func(id string) (DaemonWatch, error) {
+			view := DaemonWatch{ID: id, PR: 7}
+			subs := []DaemonSubscriber{{
+				ID: "ses_orch", Role: RoleOrchestrator,
+				Adapter: wake.AdapterOpenCode, Target: "ses_orch",
+			}}
+			sub, err := DaemonWakeSubscriber(subs)
+			if err != nil {
+				return view, nil
+			}
+			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
+			return view, nil
+		},
+		adapters: adapters,
+	}
+
+	var wakeErr error
+	logs := daemonLogs(func() {
+		wakeErr = w.Wake(context.Background(), "w7", 2, VerdictRetry)
 	})
-	if err == nil || got.ID != "" {
-		t.Fatalf("all-stale subscribers must be refused: got %+v, err %v", got, err)
+	if wakeErr == nil {
+		t.Fatal("an orchestrator-only Watch must not produce a wake")
 	}
-	got, err = DaemonWakeSubscriber([]DaemonSubscriber{
-		{ID: "ses_ok", Target: "beacon-ci-checkall"},
-	})
-	if err == nil || got.ID != "" {
-		t.Fatalf("a stale target must be refused too: got %+v, err %v", got, err)
+	if adapter.calls != 0 {
+		t.Fatalf("Deliver called %d times for an orchestrator-only Watch, want 0", adapter.calls)
+	}
+	if lines := strings.Count(logs, "\n"); lines != 1 {
+		t.Fatalf("logs = %q, want exactly one line", logs)
 	}
 }
