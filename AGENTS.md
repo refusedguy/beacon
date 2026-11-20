@@ -1,46 +1,68 @@
-# Правила агента в репозитории beacon
+# beacon: правила агента
 
-## Beacon MCP обязателен для цикла
+Коротко. Этот файл важнее старых карточек и ADR.
 
-MCP-сервер Beacon подключён в `/mnt/projects/beacon-handoff/opencode.json`. Инструменты доступны через инструмент `execute` (Code Mode): сначала `search({ query: "beacon", namespace: "beacon" })`, затем вызовы `tools.beacon.beacon_watch_pr({...})` и остальные шесть инструментов. Не писать самописный JSON-RPC-клиент.
+## Запреты
 
-До начала работы прочитать шаблон своего цикла:
+| Нельзя | Вместо этого |
+| --- | --- |
+| Коммитить или пушить в main | Ветка от origin/main, worktree, PR |
+| `go test ./...`, `go build ./...`, `beacon gates` локально | GitHub Actions CI на PR; локально только `gofmt -w` на свои .go |
+| `gh pr checks --watch`, `sleep` в цикле | `waiting, <watchID>` и сон |
+| Трогать чужие OwnerFiles, `docs/tasks/` | Только своё поле «Владелец файлов» |
+| `batch-apply` без команды владельца | Ждать команды владельца |
+| Закрывать чужие карточки в чужом PR | Не трогать |
+| `notify.target: "<cardID>"` | Реальный `ses_...` |
 
-- исполнитель: `docs/templates/executor-task.md`
-- оркестратор: `docs/templates/orchestrator-task.md`
+## Диагностика
 
-Исполнитель после открытия PR:
+Не грепать логи и не ждать в bash.
 
-1. Берёт `headSHA` командой `git rev-parse HEAD` в своём worktree.
-2. Вызывает `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"`, `notify: { adapter: "opencode", target: "<cardID>" }`.
-3. Завершает ход ровно фразой `waiting, <watchID>`. Не опрашивает `gh pr checks` в цикле и не ждёт вручную.
+- `beacon_list_running`
+- `beacon_stats`
+- `beacon inspect`
+- `beacon logs --tail 40 --errors`
 
-Оркестратор подписывается на тот же PR с `role: "orchestrator"`. Вердикт читается только через `beacon_get_result`. `<subagent>`-отчёт со словом `waiting` вердиктом не является. Мерж только после зелёных проверок и читаного `verdict=ready`.
+## Своя ветка и PR
 
-## Самоиспользование инструментов
+1. Ветка от `origin/main`, worktree.
+2. Только свои OwnerFiles.
+3. `git diff --stat` перед `gh pr create`.
+4. `git push -u origin <ветка>`, `gh pr create --base main --head <ветка>`.
+5. Отчёт: PR, headSHA, файлы.
 
-- Карточки создаются только через `go run ./cmd/batch-apply --dir <json> --check`, затем тем же вызовом без `--check`. Ручной `cat` для карточек не используется.
-- Закрытие карточек тоже делается тулзой: подготовь JSON с `card_closures: [{id, pr, merged_at}]` и запусти `go run ./cmd/batch-apply --dir <папка> --dry-run`, затем без `--dry-run`. Не редактируй `docs/tasks/*.md` вручную.
-- Любой сабагент, который видит незакрытую карточку с уже замерженным PR, обязан закрыть её через batch-apply, а не просто сообщить об этом.
-- Research-агенты пишут структурированный JSON в `/home/nbook/Projects/tmp/beacon-research/batch/`, а не сырые отчёты в чат. Оркестратор применяет его одной командой batch-apply.
-- Оркестратор регистрирует Watch через `tools.beacon.beacon_watch_pr` и читает вердикт через `beacon_get_result`. `gh pr checks` вручную не вызывается.
-- Wake доставляется через opencode API `POST /api/session/{id}/prompt` с `delivery=steer`. В тексте настоящие `watchID` и `obligationID`, а не заглушки.
-- Форматирование и проверки выполняет CI, локальный `gofmt` не запускается.
+## beacon_watch_pr
 
-## Пересборка MCP-бинарника
+- `repo: "refusedguy/beacon"`, `pr`, `headSHA`, role: "executor" или role: "fixer".
+- `notify.target`: `ses_...` из `_meta["ai.opencode/sessionID"]` или явный `ses_...`. Никогда `<cardID>`.
+- Ход заканчивается фразой `waiting, <watchID>`.
+- Оркестратор: role: "orchestrator". Вердикт только из `beacon_get_result`.
 
-Если `beacon_watch_pr` отвечает `PERSIST_FAILED: watch_pr: store is nil`, бинарник собран до коммита с подключённым store. Пересобрать из корня репо:
+## Авто-мерж
 
-```
-go build -o .opencode/bin/beacon ./cmd/beacon
-```
+Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Исключения политики: `requireApproval`, `waitFor`, `waitForMain`. Исполнитель просыпается на `keep_working`, `rebase`, `retry` или ошибке мержа. При `ready` не вызывает `gh pr merge`.
 
-## Коммиты и локальные проверки
+## Блокеры main
 
-Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки. Локальные проверки не являются гейтом: `gofmt`, `go test` и `go build` выполняет CI.
+Красная проверка на `main`: Beacon ставит `blocked`, пишет `BlockerIncident`. Исполнитель видит внешнюю поломку на `origin/main`: `beacon_ack` с `decision="blocked:not_mine"` и причиной. Оркестратор спавнит FIX-агента. main не чиним.
 
-## Project scope и вердикты
+## Слои
 
-Состояние Beacon привязано к проекту: state лежит в `<XDG_STATE_HOME>/beacon/projects/<name>-<hash>/beacon.db`, когда cwd содержит `.git`. MCP поднимается с `cwd` текущего проекта из `opencode.json`. Переход в другую папку проекта даёт другой state. Явный override: `BEACON_STATE_DIR`.
+- `internal/domain`: только stdlib.
+- infra не импортирует соседние infra, app, cmd.
+- `internal/app` не импортирует `internal/domain`.
+- `cmd/beacon`: без `os.ReadFile`, `os.WriteFile`, `net/http`, `os/exec`.
 
-Локальный MCP поднимает CI-мост: он читает проверки PR через `gh` и переводит Watch в `ready` (все зелёные) или `retry` (FAILURE/CANCELLED). Оркестратор мержит только после `beacon_get_result` с `verdict=ready`; ручной `gh pr checks` в цикле запрещён.
+## После сжатия
+
+Плагин держит ключ `beacon/survival-rules` в instructions. Ключ стабильный, перезаписывается на старте и на хуке `compaction`. Правила выпали из контекста, читай ключ, а не гадай.
+
+## MCP
+
+Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Семь инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`.
+
+Шаблоны: `docs/templates/executor-task.md`, `docs/templates/orchestrator-task.md`.
+
+## Коммиты
+
+`refusedguy <refusedguy@users.noreply.github.com>`, без `-c`, без `git add .`. Только свои файлы.
