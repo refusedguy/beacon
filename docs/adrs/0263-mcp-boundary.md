@@ -1,4 +1,4 @@
-# ADR 189: Граница MCP ровно семь инструментов
+# ADR 263: Граница MCP ровно семь инструментов
 
 Статус: accepted
 
@@ -8,7 +8,7 @@
 
 ## Решение
 
-MCP это проекция состояния сервера, а не его владелец (ADR 0188). Контракт содержит ровно семь имён: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`. Порядок не является частью контракта, тест сравнивает отсортированные списки. Цикл агента живёт в `CycleInstructions` при handshake в `internal/infra/mcp/server.go`, а не в отдельном инструменте.
+MCP это проекция состояния сервера, а не его владелец (ADR 262). Контракт содержит ровно семь имён: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`. Порядок не является частью контракта, тест сравнивает отсортированные списки. Цикл агента живёт в `CycleInstructions` при handshake в `internal/infra/mcp/server.go`, а не в отдельном инструменте.
 
 Схемы ответов выводятся из Go-типов в `internal/infra/mcp/schema.go`, а не пишутся вручную. Аннотации честные: `beacon_list_running` и `beacon_stats` read-only, `beacon_cancel_watch` единственный destructive, остальные additive, потому что пишут `readAt`, `claimedAt` или намерение. `beacon_get_result` выдаёт имена проверок, заключения, ссылки и машиночитаемое `nextAction`, но не логи и не полный вывод проверок. `beacon_ack` пишет только намерение и не возвращает вердикт. Оба факта, прочтение и принятие обязательства, идут через `ObligationStamper` (`internal/infra/mcp/tool_get_result.go`, `internal/infra/mcp/tool_ack.go`).
 
