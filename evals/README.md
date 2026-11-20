@@ -103,6 +103,10 @@ eval-специфичную точку входа `evals/cmd/evalserver`: она
 | `D02_unmet_wait_for` | Оставляет одну зависимость `waitFor` невыполненной, затем переводит её в main | до выполнения WAIT_DEPENDENCY без мержа; после выполнения MERGE |
 | `D03_blocked_fix_agent` | Блокирует Watch с причиной; контроль с незаблокированным Watch | BLOCKED_FIX_AGENT и wake оркестратору с причиной, PR и failedChecks; без blocked wake нет |
 | `D04_negative_controls` | Поднимает ошибку DependencyResolver и заблокированный Watch при `verdict=ready` | оба не дают MERGE; blocked имеет приоритет над ready |
+| `N01_workflow_artifact_name` | Проверяет имя workflow-артефакта | плоский `.github/workflows/<slug>.yml` проходит, вложенный путь и чужой регистр нет |
+| `N02_skill_artifact_name` | Проверяет имя скилла | `<slug>/SKILL.md` и вложенные файлы проходят, невалидный slug нет |
+| `N03_rule_artifact_name` | Проверяет имя правила | всегда активный файл или путь под `rules/` проходит, обычный `.md` нет |
+| `N04_arbitrary_name_rejected` | Отвергает произвольные и Harbor-имена | `README.md`, `aif-action.md`, `aif-rule.md`, абсолютные и родительские пути не проходят |
 | `R01_accepted_skip` | Фиксирует принятый пропуск: `headSHA` задан заглушкой, поэтому сетевой `CIProvider` не опрашивается | `WARN` без блока; строка видна в таблице и в сводке, код выхода не меняет |
 
 `11_verdict_regression` делает регрессию вердикта измеримой (ADR 0063, фича 4).
@@ -399,6 +403,44 @@ DependencyResolver приравнивается к «не в main» и мерж 
 «девять базовых eval» в `10_two_phase_local_ci_gate` не меняется. Когда
 production-код единого решения появится, eval переведёт те же четыре проверки
 на настоящий вызов, сохранив имена кейсов и негативные контроли.
+
+## Соглашение по именам артефактов: N01-N04
+
+HD-055 (ADR 0304) фиксирует имена трёх видов артефактов. В Harbor они называются
+`aif-action.md` для workflow, `{skill}/SKILL.md` для скилла и `aif-rule.md` для
+правила. Beacon держит те же три роли на своих путях:
+
+| Роль Harbor | Имя в Beacon | Пример |
+| --- | --- | --- |
+| `aif-action.md` | `.github/workflows/<slug>.yml` | `.github/workflows/ci.yml` |
+| `{skill}/SKILL.md` | `.opencode/skills/<slug>/SKILL.md` | `.opencode/skills/night-shift/SKILL.md` |
+| `aif-rule.md` | всегда активный файл правила или путь под `rules/` | `AGENTS.md`, `docs/rules/conventions.md` |
+
+Переменная часть `<slug>` это kebab-case из строчных букв и цифр: имя начинается
+с буквы, части разделены одним дефисом (`night-shift`, `red-verdict-triage`).
+Файлы скилла внутри каталога под `SKILL.md` тоже считаются артефактом скилла:
+`references/`, `scripts/` и вложенные `SKILL.md` по ADR 0035.
+
+Модель лежит в `evals/main.go`: `validBeaconSlug` задаёт грамматику, а
+`checkArtifactName` возвращает вид артефакта и признак соответствия. Произвольное
+имя видно как пустой вид и `false`.
+
+- `N01_workflow_artifact_name`: плоский `.github/workflows/<slug>.yml` проходит.
+  Вложенный путь, другой регистр и расширение `.md` не проходят.
+- `N02_skill_artifact_name`: каталог с валидным slug и `SKILL.md` проходит, как и
+  вложенные файлы. Верхний регистр, подчёркивание и другое имя корневого файла
+  не проходят.
+- `N03_rule_artifact_name`: `AGENTS.md`, `CLAUDE.md`, `.cursorrules` и путь под
+  `rules/` проходят. Обычный файл документации не проходит.
+- `N04_arbitrary_name_rejected`: `README.md`, Harbor-имена `aif-action.md` и
+  `aif-rule.md`, исходники и абсолютные или родительские пути не проходят.
+
+Каждый кейс показывает счётчик совпадений, а при расхождении печатает конкретное
+имя и полученный результат. Если ослабить грамматику slug, принять вложенный
+workflow или вместо Beacon-пути принять Harbor-имя, кейс красный. Кейсы идут
+после D04 и до живых сценариев W01-W12, поэтому счётчик «девять базовых eval» в
+`10_two_phase_local_ci_gate` не меняется. Юнит-тесты модели лежат в
+`evals/naming_test.go`.
 
 ## Проверка реального пути вне eval-раннера
 

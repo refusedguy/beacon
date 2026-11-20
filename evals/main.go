@@ -149,6 +149,10 @@ var (
 	// scenarioEntryRegex вытаскивает имена из e2eScenarios, чтобы сверить
 	// замороженный хеш с реальным набором сценариев, а не с копией в README.
 	scenarioEntryRegex = regexp.MustCompile(`\{"([A-Za-z0-9_]+)",\s*[A-Za-z0-9_]+`)
+	// reBeaconSlug задаёт грамматику переменной части имени артефакта: строчные
+	// латинские буквы, цифры и одиночные дефисы между частями. Имя начинается
+	// с буквы. Один slug годится и для каталога скилла, и для имени workflow.
+	reBeaconSlug = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
 )
 
 func main() {
@@ -156,7 +160,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 38)
+	results := make([]evalResult, 0, 42)
 	record := func(name, expected, actual string, ok bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, status: statusOf(ok)})
 	}
@@ -723,6 +727,30 @@ func run() int {
 	record("D04_negative_controls",
 		"ошибка DependencyResolver и blocked не дают MERGE; blocked имеет приоритет над ready",
 		d04Actual, d04Pass)
+
+	// N01-N04: соглашение по именам артефактов из HD-055 (ADR 0304). Harbor
+	// называет workflow, скилл и правило aif-action.md, {skill}/SKILL.md и
+	// aif-rule.md. Beacon держит те же три роли на своих путях. Схема, негативные
+	// контроли и отображение описаны в evals/README.md.
+	n01Actual, n01Pass := evalN01WorkflowArtifactName()
+	record("N01_workflow_artifact_name",
+		"workflow это плоский .github/workflows/<slug>.yml; вложенный путь и чужой регистр не проходят",
+		n01Actual, n01Pass)
+
+	n02Actual, n02Pass := evalN02SkillArtifactName()
+	record("N02_skill_artifact_name",
+		"скилл это .opencode/skills/<slug>/SKILL.md и вложенные файлы; невалидный slug не проходит",
+		n02Actual, n02Pass)
+
+	n03Actual, n03Pass := evalN03RuleArtifactName()
+	record("N03_rule_artifact_name",
+		"правило это всегда активный файл или путь под rules/; обычный .md не проходит",
+		n03Actual, n03Pass)
+
+	n04Actual, n04Pass := evalN04ArbitraryNameRejected()
+	record("N04_arbitrary_name_rejected",
+		"произвольное имя и Harbor-имена aif-action.md и aif-rule.md не проходят",
+		n04Actual, n04Pass)
 
 	// T3.227/T3.228: eval-покрытие живых сценариев. Наблюдатель читает файлы
 	// каталога состояния и ответы фейк-хоста, а не внутренние массивы плагина.
@@ -1690,6 +1718,145 @@ func evalD04NegativeControls() (string, bool) {
 		blocked.Action == orchBlockedFix && len(blockedLedger.Merges) == 0 &&
 		len(blockedLedger.Wakes) == 1
 	return actual, pass
+}
+
+// ---- HD-055 (ADR 0304): соглашение по именам артефактов ----
+//
+// Harbor называет три вида артефактов: aif-action.md для workflow,
+// {skill}/SKILL.md для скилла и aif-rule.md для правила. Beacon берёт те же три
+// роли, но свои пути. Схема ниже фиксирует имена в исполняемой форме. eval
+// проверяет её на валидных и враждебных именах: произвольное имя не проходит.
+// Отображение на Harbor и примеры лежат в evals/README.md.
+
+// artifactKind — один из трёх видов артефакта Beacon. Пустой вид означает, что
+// имя ни к одному виду не относится.
+type artifactKind string
+
+const (
+	artifactWorkflow  artifactKind = "workflow"
+	artifactKnowledge artifactKind = "knowledge"
+	artifactRules     artifactKind = "rules"
+)
+
+// validBeaconSlug проверяет грамматику переменной части имени. Допустимы
+// строчные буквы, цифры и одиночные дефисы между частями.
+func validBeaconSlug(s string) bool {
+	return reBeaconSlug.MatchString(s)
+}
+
+// checkArtifactName относит имя к одному виду артефактов и сообщает, следует
+// ли оно соглашению. Второй результат false для произвольного имени.
+func checkArtifactName(name string) (artifactKind, bool) {
+	p := strings.TrimSpace(name)
+	if p == "" {
+		return "", false
+	}
+	p = filepath.ToSlash(filepath.Clean(strings.ReplaceAll(p, "\\", "/")))
+	if p == "." || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "../") {
+		return "", false
+	}
+	parts := strings.Split(p, "/")
+
+	// Скилл: .opencode/skills/<slug>/SKILL.md и файлы под этим каталогом.
+	if len(parts) >= 3 && parts[0] == ".opencode" && parts[1] == "skills" {
+		if !validBeaconSlug(parts[2]) {
+			return artifactKnowledge, false
+		}
+		if len(parts) == 4 {
+			return artifactKnowledge, parts[3] == "SKILL.md"
+		}
+		if len(parts) > 4 {
+			return artifactKnowledge, true
+		}
+		return artifactKnowledge, false
+	}
+
+	// Workflow: плоский файл .github/workflows/<slug>.yml.
+	if len(parts) == 3 && parts[0] == ".github" && parts[1] == "workflows" {
+		if !strings.HasSuffix(parts[2], ".yml") {
+			return artifactWorkflow, false
+		}
+		return artifactWorkflow, validBeaconSlug(strings.TrimSuffix(parts[2], ".yml"))
+	}
+
+	// Правило: всегда активный файл или любой путь под каталогом rules.
+	switch strings.ToLower(parts[len(parts)-1]) {
+	case "agents.md", "claude.md", ".cursorrules":
+		return artifactRules, true
+	}
+	for _, dir := range parts[:len(parts)-1] {
+		if dir == "rules" {
+			return artifactRules, true
+		}
+	}
+	return "", false
+}
+
+// artifactNameCase — одно ожидание для проверки имени.
+type artifactNameCase struct {
+	name string
+	kind artifactKind
+	ok   bool
+}
+
+// checkArtifactNames прогоняет набор имён через checkArtifactName. При
+// расхождении в ACTUAL видно конкретное имя и полученный результат.
+func checkArtifactNames(cases []artifactNameCase) (string, bool) {
+	var bad []string
+	for _, tc := range cases {
+		kind, ok := checkArtifactName(tc.name)
+		if kind != tc.kind || ok != tc.ok {
+			bad = append(bad, fmt.Sprintf("%s=%s/%t", tc.name, kind, ok))
+		}
+	}
+	if len(bad) > 0 {
+		return "mismatch: " + strings.Join(bad, ", "), false
+	}
+	return fmt.Sprintf("matched=%d/%d", len(cases), len(cases)), true
+}
+
+func evalN01WorkflowArtifactName() (string, bool) {
+	return checkArtifactNames([]artifactNameCase{
+		{".github/workflows/ci.yml", artifactWorkflow, true},
+		{".github/workflows/gates-binary.yml", artifactWorkflow, true},
+		{".github/workflows/CI.yml", artifactWorkflow, false},
+		{".github/workflows/notes.md", artifactWorkflow, false},
+		{".github/workflows/sub/ci.yml", "", false},
+	})
+}
+
+func evalN02SkillArtifactName() (string, bool) {
+	return checkArtifactNames([]artifactNameCase{
+		{".opencode/skills/night-shift/SKILL.md", artifactKnowledge, true},
+		{".opencode/skills/red-verdict-triage/SKILL.md", artifactKnowledge, true},
+		{".opencode/skills/night-shift/references/comment-rules.md", artifactKnowledge, true},
+		{".opencode/skills/night-shift/manual/SKILL.md", artifactKnowledge, true},
+		{".opencode/skills/Night-Shift/SKILL.md", artifactKnowledge, false},
+		{".opencode/skills/night_shift/SKILL.md", artifactKnowledge, false},
+		{".opencode/skills/night-shift/README.md", artifactKnowledge, false},
+	})
+}
+
+func evalN03RuleArtifactName() (string, bool) {
+	return checkArtifactNames([]artifactNameCase{
+		{"AGENTS.md", artifactRules, true},
+		{"CLAUDE.md", artifactRules, true},
+		{".cursorrules", artifactRules, true},
+		{"docs/rules/conventions.md", artifactRules, true},
+		{"docs/notes.md", "", false},
+	})
+}
+
+func evalN04ArbitraryNameRejected() (string, bool) {
+	return checkArtifactNames([]artifactNameCase{
+		{"README.md", "", false},
+		{"aif-action.md", "", false},
+		{"aif-rule.md", "", false},
+		{"notes.txt", "", false},
+		{"internal/app/orchestrator/checkall.go", "", false},
+		{"/etc/passwd", "", false},
+		{"../.github/workflows/ci.yml", "", false},
+	})
 }
 
 // verdictBaselineCase — один канонический сценарий для измерения регрессии.
