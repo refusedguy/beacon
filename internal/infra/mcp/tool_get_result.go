@@ -204,6 +204,33 @@ func (h *GetResultHandler) Handle(ctx context.Context, req *mcpsdk.CallToolReque
 	return nil, out, nil
 }
 
+// nextStepFor maps a verdict to the one action the subscriber should take. The
+// mapping is a pure function of the verdict so the same result always teaches
+// the same next step, and a client never has to parse a sentence to branch.
+func nextStepFor(verdict domain.Verdict) (action, command, hint string) {
+	switch verdict {
+	case domain.VerdictKeepWorking:
+		return NextActionKeepWorking, "",
+			"do not rebase an unchanged head; fix only the failedChecks returned above"
+	case domain.VerdictRebase:
+		return NextActionRebase, RebaseCommand,
+			"origin/main moved; rebase and push with lease before waiting again"
+	case domain.VerdictRetry:
+		return NextActionRetry, RetryCommand,
+			"the failure is flaky or cancelled; rerun only the failed jobs"
+	case domain.VerdictBlocked:
+		return NextActionBlocked, "",
+			"the failure is on main; stop and wait for the blocker to be resolved, do not fix main"
+	case domain.VerdictReady:
+		return NextActionWait, "",
+			"checks are green; the orchestrator merges, no command is needed here"
+	case domain.VerdictMerged, domain.VerdictClosed, domain.VerdictTimeout:
+		return NextActionWait, "", "the Watch is finished; there is no next step"
+	default:
+		return NextActionWait, "", "no verdict yet; finish the turn with waiting, watchID"
+	}
+}
+
 // Result reads the Watch, finds the caller's obligation at the current
 // revision, stamps readAt, and projects the contract fields. It works for any
 // verdict, including ready (WORKER-PROMPT §4.1). The caller is identified by its
@@ -238,6 +265,7 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 
 	observe.ResultRead(w.ID, string(w.Verdict), w.Revision)
 	failed := collectFailedChecks(w)
+	action, command, hint := nextStepFor(w.Verdict)
 	return GetResultOutput{
 		Status:       string(w.Status),
 		Verdict:      string(w.Verdict),
@@ -246,6 +274,9 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 		FailedChecks: failed,
 		ObligationID: obligationID,
 		RetryBudget:  remainingRetryBudget(w, failed),
+		NextAction:   action,
+		NextCommand:  command,
+		NextHint:     hint,
 	}, nil
 }
 

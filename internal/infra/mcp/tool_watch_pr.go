@@ -8,6 +8,7 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -29,6 +30,11 @@ const (
 	// reads from _meta. The value is passed through without parsing; it is
 	// never treated as authorization (WORKER-PROMPT §2, invariant 6).
 	watchPRSessionIDMetaKey = "ai.opencode/sessionID"
+
+	// sessionIDPrefix is the shape of a real opencode session id. Executors
+	// and fixers must be wakeable: a card id such as "<BS.42>" or an empty
+	// target is not an address, so those registrations are refused.
+	sessionIDPrefix = "ses_"
 )
 
 // WatchPRInput is the argument shape of beacon_watch_pr (WORKER-PROMPT §4.1).
@@ -46,6 +52,7 @@ type WatchPRInput struct {
 	DeadlineMs     *int64           `json:"deadlineMs,omitempty" jsonschema:"watch deadline in milliseconds from now"`
 	OrchestratorID string           `json:"orchestratorID,omitempty" jsonschema:"opaque parent session id of the orchestrator; stored on the Watch, never used for wake routing"`
 	FixFor         string           `json:"fixFor,omitempty" jsonschema:"watchID of the blocked Watch a fixer repairs; required with role fixer, empty for every other role"`
+	FixBlockerID   string           `json:"fixBlockerID,omitempty" jsonschema:"blocker incident id this fixer repairs; derived from fixFor when omitted"`
 }
 
 // WatchPRNotify is the optional delivery endpoint of the registering party.
@@ -116,11 +123,12 @@ func watchPRMergePolicy(in *WatchPRPolicy) domain.MergePolicy {
 // owns a Fanout, which serializes the check-then-act sequence inside one
 // process; cross-process exclusion remains the daemon's job (ADR 0021).
 type WatchPRHandler struct {
-	store   domain.Store
-	ci      domain.CIProvider
-	clock   domain.Clock
-	fanout  *domain.Fanout
-	bridges []Bridge
+	store    domain.Store
+	ci       domain.CIProvider
+	clock    domain.Clock
+	fanout   *domain.Fanout
+	bridges  []Bridge
+	blockers BlockerControl
 }
 
 // NewWatchPRHandler builds a handler. A nil clock falls back to the wall
@@ -132,6 +140,14 @@ func NewWatchPRHandler(store domain.Store, ci domain.CIProvider, clock domain.Cl
 		ci:     ci,
 		clock:  clock,
 		fanout: domain.NewFanout(store, clock),
+	}
+}
+
+// SetBlockerControl injects the durable blocker port. A nil argument keeps the
+// handler's local-only behaviour, which is how unit tests run without SQLite.
+func (h *WatchPRHandler) SetBlockerControl(b BlockerControl) {
+	if h != nil {
+		h.blockers = b
 	}
 }
 
@@ -183,13 +199,21 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 	// Validate the fix target before any write. A fixer that cannot name a real
 	// blocked Watch must not create or renew its own Watch.
-	if err := h.validateFixFor(in); err != nil {
+	blockerID, err := h.validateFixFor(in)
+	if err != nil {
 		return WatchPROutput{}, err
 	}
 
 	subscriberID, adapter, target, err := watchPRSubscriber(req, in)
 	if err != nil {
 		return WatchPROutput{}, err
+	}
+	if in.Role == domain.RoleExecutor || in.Role == domain.RoleFixer {
+		if !strings.HasPrefix(subscriberID, sessionIDPrefix) {
+			return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput,
+				fmt.Sprintf("watch_pr: %s registration needs a real session id starting with %q from _meta[%q] or notify.target, got %q (a card id is not a session)",
+					in.Role, sessionIDPrefix, watchPRSessionIDMetaKey, subscriberID))
+		}
 	}
 
 	headSHA, baseRef, err := h.resolveHead(ctx, in)
@@ -220,6 +244,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		Subscribers:    carried,
 		OrchestratorID: in.OrchestratorID,
 		FixFor:         in.FixFor,
+		FixBlockerID:   blockerID,
 		CreatedAt:      now,
 	}
 	if in.Flaky != nil {
@@ -249,6 +274,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		Target:         target,
 		OrchestratorID: in.OrchestratorID,
 		FixFor:         in.FixFor,
+		Phase:          domain.WorkerPhaseWaiting,
 	}
 
 	sub, err := h.fanout.Subscribe(w, s)
@@ -259,41 +285,71 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	observe.WatchRegistered(sub.Watch.ID, in.PR, sub.Watch.Revision, adapter)
 
 	// Fanout rebuilds its target from the stored Watch when the (repo, pr,
-	// headSHA) alias already exists, so the new fields would be dropped on a
+	// headSHA) alias already exists, so new fields would be dropped on a
 	// renewal. Apply them in place to the Watch Fanout just persisted. No
 	// subscriber is added or removed here, so wake routing is unchanged.
-	if in.OrchestratorID != "" || in.FixFor != "" {
-		updated := sub.Watch
-		changed := false
-		if in.OrchestratorID != "" && updated.OrchestratorID != in.OrchestratorID {
-			updated.OrchestratorID = in.OrchestratorID
+	updated := sub.Watch
+	changed := false
+	if in.OrchestratorID != "" && updated.OrchestratorID != in.OrchestratorID {
+		updated.OrchestratorID = in.OrchestratorID
+		changed = true
+	}
+	if in.FixFor != "" && updated.FixFor != in.FixFor {
+		updated.FixFor = in.FixFor
+		changed = true
+	}
+	if blockerID != "" && updated.FixBlockerID != blockerID {
+		updated.FixBlockerID = blockerID
+		changed = true
+	}
+	for i := range updated.Subscribers {
+		if updated.Subscribers[i].ID != subscriberID {
+			continue
+		}
+		if in.OrchestratorID != "" && updated.Subscribers[i].OrchestratorID != in.OrchestratorID {
+			updated.Subscribers[i].OrchestratorID = in.OrchestratorID
 			changed = true
 		}
-		if in.FixFor != "" && updated.FixFor != in.FixFor {
-			updated.FixFor = in.FixFor
+		if in.FixFor != "" && updated.Subscribers[i].FixFor != in.FixFor {
+			updated.Subscribers[i].FixFor = in.FixFor
 			changed = true
 		}
-		for i := range updated.Subscribers {
-			if updated.Subscribers[i].ID != subscriberID {
-				continue
-			}
-			if in.OrchestratorID != "" && updated.Subscribers[i].OrchestratorID != in.OrchestratorID {
-				updated.Subscribers[i].OrchestratorID = in.OrchestratorID
-				changed = true
-			}
-			if in.FixFor != "" && updated.Subscribers[i].FixFor != in.FixFor {
-				updated.Subscribers[i].FixFor = in.FixFor
-				changed = true
-			}
-		}
-		if changed {
-			if err := h.store.SaveWatch(updated); err != nil {
-				observe.ActorError("watch_pr-fields", "", err)
-				return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
-			}
-			sub.Watch = updated
+		// A repeated registration resets the worker to waiting. Fanout already
+		// refreshed LastActivity on the renew path.
+		if updated.Subscribers[i].Phase != domain.WorkerPhaseWaiting {
+			updated.Subscribers[i].Phase = domain.WorkerPhaseWaiting
+			changed = true
 		}
 	}
+	if changed {
+		if err := h.store.SaveWatch(updated); err != nil {
+			observe.ActorError("watch_pr-fields", "", err)
+			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
+		sub.Watch = updated
+	}
+
+	// Binding a fixer to its incident and spending one fix attempt happens
+	// here and only here. A renewal keeps the attempt count: re-registering the
+	// same agent must not drain the fixer budget or fake a new repair.
+	if in.Role == domain.RoleFixer && blockerID != "" && h.blockers != nil && !sub.Renewed {
+		incident, err := h.blockers.AssignFixer(blockerID, sub.Watch.ID)
+		if err != nil {
+			observe.ActorError("watch_pr-assign-fixer", sub.Watch.ID, err)
+			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
+		observe.Event(observe.LevelInfo, "blocker_fixer_assigned", observe.Fields{
+			"blockerID": incident.ID, "watchID": sub.Watch.ID, "fixAttempts": incident.FixAttempts,
+		})
+	}
+
+	// The registration parameters are logged at the boundary, not inferred
+	// from the persisted Watch later: an operator needs to see what the caller
+	// asked for, including fields that are intentionally not wake addresses.
+	observe.Event(observe.LevelInfo, "watch_pr_registered", observe.Fields{
+		"watchID": sub.Watch.ID, "pr": in.PR, "role": string(in.Role),
+		"subscriberID": subscriberID, "orchestratorID": in.OrchestratorID, "fixFor": in.FixFor,
+	})
 
 	// One watch_pr call reaches every injected bridge through the same
 	// six-operation port. Each bridge decides whether the work applies to its
@@ -311,34 +367,63 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	}, nil
 }
 
-// validateFixFor checks the fixer target before registration writes anything.
-// A fixer without fixFor has nothing to repair; a fixFor that names no Watch is
-// a dangling reference; a Watch that is not blocked has nothing to fix. All
-// three are hard errors: a fix count must always point at a real block. A
-// fixFor on any other role is rejected so FixFor always implies RoleFixer.
-// The orchestrator re-reads verdict and revision before spawning a fixer, so a
-// block clearing in that window makes the spawn fail here and get retried.
-func (h *WatchPRHandler) validateFixFor(in WatchPRInput) error {
+// validateFixFor checks the fixer target before registration writes anything
+// and returns the incident id the fix will be charged to. A fixer without
+// fixFor has nothing to repair; a fixFor that names no Watch is a dangling
+// reference; a Watch that is not blocked has nothing to fix. All three are hard
+// errors: a fix count must always point at a real block. fixBlockerID can pin
+// the incident explicitly, otherwise the blocked Watch carries it in
+// BlockerID. With a blocker port installed the incident must exist and be open.
+func (h *WatchPRHandler) validateFixFor(in WatchPRInput) (string, error) {
 	if in.Role != domain.RoleFixer && in.FixFor != "" {
-		return domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixFor is only valid with role fixer")
+		return "", domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixFor is only valid with role fixer")
 	}
 	if in.Role != domain.RoleFixer {
-		return nil
+		if in.FixBlockerID != "" {
+			return "", domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixBlockerID is only valid with role fixer")
+		}
+		return "", nil
 	}
 	if strings.TrimSpace(in.FixFor) == "" {
-		return domain.NewAppError(domain.CodeInvalidInput, "watch_pr: role fixer requires fixFor")
+		return "", domain.NewAppError(domain.CodeInvalidInput, "watch_pr: role fixer requires fixFor")
 	}
 	if h.store == nil {
-		return domain.NewAppError(domain.CodePersistFailed, "watch_pr: store is nil")
+		return "", domain.NewAppError(domain.CodePersistFailed, "watch_pr: store is nil")
 	}
 	target, err := h.store.Watch(in.FixFor)
 	if err != nil {
-		return domain.NewAppError(domain.CodeWatchNotFound, "watch_pr: fixFor watch not found: "+in.FixFor)
+		return "", domain.NewAppError(domain.CodeWatchNotFound, "watch_pr: fixFor watch not found: "+in.FixFor)
 	}
 	if target.Status != domain.StatusBlocked {
-		return domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixFor watch is not blocked: "+in.FixFor)
+		return "", domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixFor watch is not blocked: "+in.FixFor)
 	}
-	return nil
+
+	blockerID := in.FixBlockerID
+	if blockerID == "" {
+		blockerID = target.BlockerID
+	}
+	if h.blockers != nil {
+		if blockerID == "" {
+			return "", domain.NewAppError(domain.CodeInvalidInput,
+				"watch_pr: fixer needs fixBlockerID or a blocked Watch with blockerID")
+		}
+		active, err := h.blockers.ActiveBlockers()
+		if err != nil {
+			return "", domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
+		found := false
+		for _, incident := range active {
+			if incident.ID == blockerID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", domain.NewAppError(domain.CodeInvalidInput,
+				"watch_pr: fixBlockerID is not an open blocker incident: "+blockerID)
+		}
+	}
+	return blockerID, nil
 }
 
 // watchPRSubscriber derives the subscriber identity and delivery endpoint.

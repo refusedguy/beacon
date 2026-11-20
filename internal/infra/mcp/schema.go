@@ -73,11 +73,32 @@ type MergeSnapshot struct {
 	MergeStateStatus string `json:"mergeStateStatus"`
 }
 
+// Machine-readable next actions attached to a result. An agent branches on
+// nextAction, not on prose: the four wake verdicts map one-to-one, and every
+// other verdict reports "wait" with an explanatory hint.
+const (
+	NextActionKeepWorking = "keep_working"
+	NextActionRebase      = "rebase"
+	NextActionRetry       = "retry"
+	NextActionBlocked     = "blocked"
+	NextActionWait        = "wait"
+)
+
+// Commands paired with an action. They are literal shell lines so a client can
+// run them without reconstructing a command from a description.
+const (
+	RebaseCommand = "git fetch origin main && git rebase origin/main && git push --force-with-lease"
+	RetryCommand  = "gh run rerun --failed"
+)
+
 // GetResultOutput is the response of beacon_get_result. The five trailing
 // fields describe the MCP task dialect form and are absent for a plain client
 // whose call finishes before --after. They are chosen at the MCP boundary,
 // never by the domain: ADR 0031 §2 and ADR 0003 keep protocol versions out of
 // the core, and LegacyProtocolVersions still excludes 2026-07-28.
+//
+// nextAction, nextCommand and nextHint are the self-teaching part of the
+// response: the tool tells the caller the one step that follows this verdict.
 type GetResultOutput struct {
 	Status       string        `json:"status"`
 	Verdict      string        `json:"verdict"`
@@ -93,6 +114,13 @@ type GetResultOutput struct {
 	TaskStatus     string `json:"taskStatus,omitempty"`
 	PollIntervalMs int64  `json:"pollIntervalMs,omitempty"`
 	Instructions   string `json:"instructions,omitempty"`
+
+	// NextAction is one of the NextAction* values. NextCommand is the exact
+	// command to run when the action prescribes one. NextHint explains the
+	// decision in one sentence and is always present.
+	NextAction  string `json:"nextAction,omitempty"`
+	NextCommand string `json:"nextCommand,omitempty"`
+	NextHint    string `json:"nextHint,omitempty"`
 }
 
 // TaskDialect is the application-level response form a client can consume.
@@ -173,6 +201,13 @@ type WatchEvent struct {
 	WatchID string `json:"watchID"`
 	Status  string `json:"status"`
 	Verdict string `json:"verdict"`
+	// BlockerID and Blocked make a blocked Watch visible in the compact event
+	// stream, so a client that reads only Events still sees the whole radar.
+	BlockerID string `json:"blockerID,omitempty"`
+	Blocked   bool   `json:"blocked,omitempty"`
+	// Phases maps subscriberID to its worker phase: waiting, in_work,
+	// blocked, orphaned or finished.
+	Phases map[string]string `json:"phases,omitempty"`
 }
 
 // ListRunningOutput is the response of beacon_list_running. Status and Cursor

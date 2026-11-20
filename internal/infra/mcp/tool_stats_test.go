@@ -124,10 +124,10 @@ func TestStatsDoesNotWriteState(t *testing.T) {
 	if !beforeMod.Equal(afterMod) {
 		t.Errorf("state file mtime changed: %v -> %v", beforeMod, afterMod)
 	}
-	// Both calls land inside the ten-minute refresh window, so the counter is
-	// read once and the second call is served from the cache (ADR 0037 §6).
-	if reader.calls != 1 {
-		t.Errorf("snapshot reads = %d, want 1 within the %s refresh window", reader.calls, planLimitReadInterval)
+	// Every call reads the store again: a cached counter can hide a budget
+	// spike from the orchestrator.
+	if reader.calls != 2 {
+		t.Errorf("snapshot reads = %d, want 2 fresh reads", reader.calls)
 	}
 }
 
@@ -245,10 +245,9 @@ func TestStatsPlanLimitWarningIsVisibleInJSON(t *testing.T) {
 	}
 }
 
-func TestStatsCounterReadEveryTenMinutes(t *testing.T) {
+func TestStatsReadsFreshCountersEveryCall(t *testing.T) {
 	reader := &snapshotReaderFake{snap: sampleSnapshot()}
-	clock := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
-	handler := &StatsHandler{reader: reader, now: func() time.Time { return clock }}
+	handler := NewStatsHandler(reader)
 
 	first := callStats(t, handler)
 	if reader.calls != 1 {
@@ -258,18 +257,13 @@ func TestStatsCounterReadEveryTenMinutes(t *testing.T) {
 		t.Fatalf("pointsThisHour = %d, want 42 before refresh", first.PointsThisHour)
 	}
 
-	clock = clock.Add(5 * time.Minute)
-	callStats(t, handler)
-	if reader.calls != 1 {
-		t.Fatalf("snapshot reads = %d, want 1 within the %s window", reader.calls, planLimitReadInterval)
-	}
-
-	clock = clock.Add(6 * time.Minute)
+	// The same instant, a changed counter: the second call must still hit the
+	// store and report the new value with its warning.
 	reader.snap.PointsThisHour = 380 // 76% of 500
 	reader.snap.Budget = 500
 	second := callStats(t, handler)
 	if reader.calls != 2 {
-		t.Fatalf("snapshot reads = %d, want 2 after %s elapsed", reader.calls, planLimitReadInterval)
+		t.Fatalf("snapshot reads = %d, want 2 on the second call", reader.calls)
 	}
 	if second.PointsThisHour != 380 {
 		t.Errorf("pointsThisHour = %d, want 380 after refresh", second.PointsThisHour)

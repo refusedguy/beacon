@@ -5,10 +5,11 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 const (
@@ -18,10 +19,6 @@ const (
 	// planLimitRedPercent is the ADR 0037 §6 threshold that turns the plan
 	// limit warning red.
 	planLimitRedPercent = 90
-	// planLimitReadInterval is how often the limit counters are refreshed.
-	// The counters come from a local state snapshot, so a refresh never calls
-	// a model (ADR 0037 §6).
-	planLimitReadInterval = 10 * time.Minute
 	// planLimitWarningPrefix marks the plan-limit entry inside loadErrors so a
 	// reader can tell a warning from a state load failure.
 	planLimitWarningPrefix = "plan limit warning: "
@@ -79,23 +76,18 @@ type WaitTelemetryReader interface {
 // StatsInput is the empty input of beacon_stats. The tool takes no arguments.
 type StatsInput struct{}
 
-// StatsHandler implements beacon_stats over the read-only snapshot port.
-// It holds no writer and takes no argument. The snapshot is refreshed at most
-// once every ten minutes so the limit counters are read on that cadence.
+// StatsHandler implements beacon_stats over the read-only snapshot port. It
+// holds no writer and takes no argument. Every call reads a fresh snapshot: a
+// cached counter can hide a budget spike or a growing watch list from the
+// orchestrator, so the tool reports what the store says right now.
 type StatsHandler struct {
 	reader SnapshotReader
-	now    func() time.Time
-
-	mu       sync.Mutex
-	cached   StateSnapshot
-	cachedAt time.Time
-	hasCache bool
 }
 
 // NewStatsHandler builds the handler. Pass handler.Handle to mcpsdk.AddTool
 // when wiring the tool into a server.
 func NewStatsHandler(reader SnapshotReader) *StatsHandler {
-	return &StatsHandler{reader: reader, now: time.Now}
+	return &StatsHandler{reader: reader}
 }
 
 // planLimitInfo computes the warning from used and budget. A missing or
@@ -180,30 +172,6 @@ func (i WaitTelemetryInfo) entry() string {
 		waitTelemetryPrefix, i.WaitPercent, i.AvgWorkers, i.Windows)
 }
 
-// snapshot returns the cached snapshot until the ten-minute refresh window
-// passes. The reader is the only dependency, so no model call can happen here.
-func (h *StatsHandler) snapshot() (StateSnapshot, error) {
-	now := h.now
-	if now == nil {
-		now = time.Now
-	}
-	t := now()
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.hasCache && t.Sub(h.cachedAt) < planLimitReadInterval {
-		return h.cached, nil
-	}
-	snap, err := h.reader.Snapshot()
-	if err != nil {
-		return StateSnapshot{}, err
-	}
-	h.cached = snap
-	h.cachedAt = t
-	h.hasCache = true
-	return snap, nil
-}
-
 // Handle copies the values already present in a state snapshot into the stats
 // response. It appends a plan-limit warning to loadErrors when a threshold is
 // crossed and, when the reader also exposes wait samples, an idle metric with
@@ -211,8 +179,9 @@ func (h *StatsHandler) snapshot() (StateSnapshot, error) {
 // and no model request. Slices are allocated even when empty so the response
 // always carries an array, never JSON null.
 func (h *StatsHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, _ StatsInput) (*mcpsdk.CallToolResult, StatsOutput, error) {
-	snap, err := h.snapshot()
+	snap, err := h.reader.Snapshot()
 	if err != nil {
+		observe.ActorError("beacon_stats", "", err)
 		return nil, StatsOutput{}, fmt.Errorf("beacon_stats: %w", err)
 	}
 
@@ -230,7 +199,7 @@ func (h *StatsHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, _ St
 	out := StatsOutput{
 		PointsThisHour: snap.PointsThisHour,
 		Budget:         snap.Budget,
-		ActiveWatches:  len(snap.ActiveWatches),
+		ActiveWatches:  len(snap.RadarWatches()),
 		Persist: PersistInfo{
 			Seq:       snap.PersistSeq,
 			LastError: snap.LastPersistErr,

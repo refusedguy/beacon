@@ -89,6 +89,13 @@ const CycleInstructions = `Beacon cycle protocol:
 5. The orchestrator merges only after beacon_get_result returns verdict=ready, idempotently by (watchID, revision). An idle child report is not done.
 6. Close a finished or superseded watch with beacon_cancel_watch. beacon_list_running and beacon_stats are read-only.
 
+Self-teaching next action: beacon_get_result returns nextAction, nextCommand and nextHint. Branch on nextAction, not on prose.
+  keep_working - do not rebase an unchanged head; fix only the failedChecks returned by beacon_get_result.
+  rebase       - run nextCommand exactly: git fetch origin main && git rebase origin/main && git push --force-with-lease.
+  retry        - run nextCommand exactly: gh run rerun --failed.
+  blocked      - stop and wait for the blocker to be resolved; do not fix main yourself.
+  wait         - no action yet; finish the turn with "waiting, <watchID>".
+
 Verdicts: watching, ready, rebase, retry, keep_working, timeout, merged, closed. A watching-to-watching tick changes no revision and wakes nobody.`
 
 // ToolNames is the exact set of seven tool names in the registry
@@ -153,6 +160,18 @@ var toolAnnotations = map[string]mcpsdk.ToolAnnotations{
 	"beacon_stats":        {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
 }
 
+// BlockerControl is the narrow control-plane port the two writing tools need.
+// watch_pr uses AssignFixer to bind a fixer to an incident, ack uses
+// GetOrCreateOpenBlocker and ResolveBlocker to open and close an incident. The
+// SQLite adapter in cmd/beacon implements this interface, so this layer never
+// imports internal/infra/store (ADR 0005).
+type BlockerControl interface {
+	GetOrCreateOpenBlocker(repo, baseRef string, failedChecks []string, watchID string, now time.Time) (domain.BlockerIncident, bool, error)
+	AssignFixer(blockerID, fixerWatchID string) (domain.BlockerIncident, error)
+	ResolveBlocker(blockerID string, now time.Time) ([]domain.Watch, error)
+	ActiveBlockers() ([]domain.BlockerIncident, error)
+}
+
 type stubInput struct{}
 
 type stubOutput struct {
@@ -173,14 +192,21 @@ func stubHandler(_ context.Context, _ *mcpsdk.CallToolRequest, _ stubInput) (*mc
 // builds them from store/github and passes them in; this package never imports
 // a sibling infra package.
 type Dependencies struct {
-	Store    domain.Store
-	CI       domain.CIProvider
-	Stamper  ObligationStamper
-	Writer   WaitResultWriter
-	Events   CancelEventLog
-	Source   VerdictSource
+	Store   domain.Store
+	CI      domain.CIProvider
+	Stamper ObligationStamper
+	Writer  WaitResultWriter
+	Events  CancelEventLog
+	Source  VerdictSource
+	// Snapshot should fill StateSnapshot.LiveWatches, not only ActiveWatches,
+	// so blocked Watches stay visible in beacon_list_running and beacon_stats.
 	Snapshot SnapshotReader
 	Clock    domain.Clock
+
+	// Blockers is the durable control plane for failed-base-branch incidents.
+	// A nil value keeps the legacy in-memory behaviour for callers that have
+	// not wired the SQLite adapter yet.
+	Blockers BlockerControl
 
 	// SharedCIWaiter is the gate for the expensive CI wait at the long-poll
 	// entry (ADR 0037 p3). The composition root supplies it so this package
@@ -408,13 +434,16 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 		}
 	}
 
-	AttachWatchPR(s, NewWatchPRHandler(deps.Store, deps.CI, deps.Clock))
+	watchPR := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
+	watchPR.SetBlockerControl(deps.Blockers)
+	AttachWatchPR(s, watchPR)
 	AttachWaitResult(s, NewWaitResultServiceFromDeps(deps))
 	getResult := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
 	getResult.SetAfter(deps.After)
 	AttachGetResult(s, getResult)
 	attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"])
 	ack := NewAckHandler(deps.Store, deps.Stamper, deps.Clock)
+	ack.SetBlockerControl(deps.Blockers)
 	if deps.Continuations != nil {
 		ack.SetContinuationRegistry(deps.Continuations)
 	}
