@@ -174,3 +174,42 @@ func (c *RestClient) PingMergeable(ctx context.Context, owner, repo string, numb
 		MergeableState: pr.GetMergeableState(),
 	}, false, nil
 }
+
+// MergeResult is the outcome of a merge attempt through the REST API. A refused
+// merge is not a transport failure: Reason is set and err is nil, so the caller
+// can hold the Watch instead of retrying blindly.
+type MergeResult struct {
+	Merged bool
+	Reason string
+	SHA    string
+}
+
+// MergePullRequest sends PUT /repos/{owner}/{repo}/pulls/{number}/merge with an
+// explicit method. owner and repo always come from the Watch, never from the
+// process working directory. A 405 (not mergeable) or 409 (conflict) maps to a
+// held result; other statuses are returned as errors.
+func (c *RestClient) MergePullRequest(ctx context.Context, owner, repo string, number int, method string) (MergeResult, error) {
+	if owner == "" || repo == "" {
+		return MergeResult{}, fmt.Errorf("merge: owner and repo are required, got %q/%q", owner, repo)
+	}
+	if method == "" {
+		method = "squash"
+	}
+	result, resp, err := c.gh.PullRequests.Merge(ctx, owner, repo, number, "", &gh.PullRequestOptions{MergeMethod: method})
+	if resp != nil && c.counter != nil {
+		c.counter.Observe(resp.Response, restRequestCost)
+	}
+	if err != nil {
+		var ghErr *gh.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response != nil &&
+			(ghErr.Response.StatusCode == http.StatusMethodNotAllowed ||
+				ghErr.Response.StatusCode == http.StatusConflict) {
+			return MergeResult{Reason: "merge_refused"}, nil
+		}
+		return MergeResult{}, fmt.Errorf("REST merge %s/%s#%d: %w", owner, repo, number, err)
+	}
+	if result == nil || !result.GetMerged() {
+		return MergeResult{Reason: "merge_not_confirmed"}, nil
+	}
+	return MergeResult{Merged: true, SHA: result.GetSHA()}, nil
+}

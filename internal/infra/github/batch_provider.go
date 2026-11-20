@@ -1,0 +1,614 @@
+// Package github holds the GitHub adapter for Beacon.
+//
+// BatchProvider is the real CI provider for the W1 cycle. It reads every active
+// Watch in one GraphQL batch, adds one alias per distinct (repo, baseRef) so a
+// failure already on main can be attributed to the base, and merges only after
+// a fresh mergeability read. The existing GraphQL client, REST client, point
+// counter and suite cache are reused; singleflight and a token bucket keep
+// concurrent callers from duplicating one PR or one batch.
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+	"golang.org/x/time/rate"
+
+	"github.com/refusedguy/beacon/internal/domain"
+)
+
+const (
+	// defaultBaseRef is used when a Watch was registered without a base ref.
+	defaultBaseRef = "main"
+
+	// batchRate and batchBurst pace the client beyond the two-request semaphore
+	// held by the GraphQL client. One batch, one ping and one merge each take a
+	// token.
+	batchRate  = rate.Limit(2)
+	batchBurst = 4
+
+	// Hold reasons returned by MergePR. They are machine readable so the caller
+	// can decide whether to wake the executor or report an error.
+	MergeHeldConflict     = "conflict"
+	MergeHeldDirty        = "dirty"
+	MergeHeldMergeable    = "mergeable_unknown"
+	MergeHeldMergeState   = "merge_state_unknown"
+	MergeHeldClosed       = "closed"
+	MergeHeldRefused      = "merge_refused"
+	MergeHeldPending      = "merge_pending"
+	MergeHeldNotMergeable = "not_mergeable"
+	MergeHeldInvalidRepo  = "invalid_repo"
+	MergeHeldNoGraphQL    = "no_graphql_client"
+	MergeHeldNoRestClient = "no_rest_client"
+)
+
+// Runner executes a local command. The default runs gh through os/exec; tests
+// inject a recorder so the explicit --repo argument can be asserted without a
+// network or a gh installation.
+type Runner interface {
+	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+type execRunner struct{}
+
+func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+// BatchOption configures a BatchProvider.
+type BatchOption func(*BatchProvider)
+
+// WithRunner switches merges from the REST API to `gh pr merge` through the
+// supplied runner. The command always carries `--repo owner/repo`.
+func WithRunner(r Runner) BatchOption {
+	return func(b *BatchProvider) { b.runner = r }
+}
+
+// WithBatchLimiter replaces the default token bucket.
+func WithBatchLimiter(l *rate.Limiter) BatchOption {
+	return func(b *BatchProvider) { b.limiter = l }
+}
+
+// WithMergeMethod selects the REST merge method. It defaults to squash.
+func WithMergeMethod(method string) BatchOption {
+	return func(b *BatchProvider) {
+		if method != "" {
+			b.mergeMethod = method
+		}
+	}
+}
+
+// WithBatchCache replaces the suite cache. A nil cache disables caching.
+func WithBatchCache(c *Cache) BatchOption {
+	return func(b *BatchProvider) { b.cache = c }
+}
+
+// BatchProvider implements domain.BatchCIProvider, domain.CIProvider and
+// domain.Merger against GitHub. It is safe for concurrent use.
+type BatchProvider struct {
+	graph       *Client
+	rest        *RestClient
+	counter     *Counter
+	cache       *Cache
+	runner      Runner
+	limiter     *rate.Limiter
+	mergeMethod string
+
+	batchSF singleflight.Group
+	prSF    singleflight.Group
+}
+
+var (
+	_ domain.BatchCIProvider = (*BatchProvider)(nil)
+	_ domain.CIProvider      = (*BatchProvider)(nil)
+	_ domain.Merger          = (*BatchProvider)(nil)
+)
+
+// NewBatchProvider wires the existing GraphQL and REST adapters into one
+// provider. A nil counter falls back to the GraphQL client's counter, so the
+// point budget is shared by every read and write path.
+func NewBatchProvider(graph *Client, rest *RestClient, counter *Counter, opts ...BatchOption) *BatchProvider {
+	if counter == nil {
+		if graph != nil {
+			counter = graph.counterOr()
+		} else {
+			counter = &Counter{now: time.Now}
+		}
+	}
+	b := &BatchProvider{
+		graph:       graph,
+		rest:        rest,
+		counter:     counter,
+		cache:       NewCache(),
+		limiter:     rate.NewLimiter(batchRate, batchBurst),
+		mergeMethod: "squash",
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
+}
+
+// PointStats reports the points spent so far and the hourly budget. It is the
+// caller's signal for whether another pinpoint read is affordable.
+func (b *BatchProvider) PointStats() (used int, budget int) {
+	if b.counter == nil {
+		return 0, BudgetPerHour
+	}
+	return b.counter.Used(), b.counter.Budget()
+}
+
+// FetchBatch returns one snapshot per active Watch, keyed by Watch.ID. Closed
+// Watches are skipped. All active PRs and all distinct base refs are fetched in
+// one batched GraphQL operation, split into measured chunks by the client.
+func (b *BatchProvider) FetchBatch(ctx context.Context, watches []domain.Watch) (map[string]domain.PRSnapshot, error) {
+	key := "batch:" + batchSignature(watches)
+	v, err, _ := b.batchSF.Do(key, func() (any, error) {
+		return b.fetchBatch(ctx, watches)
+	})
+	if err != nil {
+		return nil, err
+	}
+	shared, ok := v.(map[string]domain.PRSnapshot)
+	if !ok {
+		return nil, fmt.Errorf("batch: unexpected singleflight result %T", v)
+	}
+	out := make(map[string]domain.PRSnapshot, len(shared))
+	for id, snap := range shared {
+		out[id] = snap
+	}
+	return out, nil
+}
+
+func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) (map[string]domain.PRSnapshot, error) {
+	out := make(map[string]domain.PRSnapshot)
+	active := make([]domain.Watch, 0, len(watches))
+	for _, w := range watches {
+		if w.Status != domain.StatusClosed {
+			active = append(active, w)
+		}
+	}
+	if len(active) == 0 || b.graph == nil {
+		return out, nil
+	}
+
+	prAliases, err := withUniqueNames(AliasesFromWatches(active))
+	if err != nil {
+		return nil, err
+	}
+	baseAliases, _ := baseAliasesFromWatches(active)
+	all := make([]Alias, 0, len(prAliases)+len(baseAliases))
+	all = append(all, prAliases...)
+	all = append(all, baseAliases...)
+
+	if err := b.limiter.Wait(ctx); err != nil {
+		return nil, err
+	}
+	result, err := b.graph.Do(ctx, TierBatch, all)
+	if err != nil {
+		return nil, err
+	}
+
+	bases := make(map[string]domain.BaseBranchState, len(baseAliases))
+	for _, a := range baseAliases {
+		bases[baseLookupKey(a.Owner, a.Repo, a.BaseRef)] = parseBaseRefState(a, result.Data[a.Name])
+	}
+
+	// pings bounds the lazy mergeable REST call to once per PR per cycle.
+	pings := make(map[string]bool)
+	prs := make(map[string]domain.PRState, len(prAliases))
+	seenObs := make(map[cacheKey]bool)
+	for _, a := range prAliases {
+		state, suites, err := b.parsePRAlias(ctx, a, result.Data[a.Name])
+		if err != nil {
+			return nil, err
+		}
+		mergeable := strings.ToUpper(state.Mergeable)
+		if mergeable == "UNKNOWN" || mergeable == "" {
+			pingKey := prLookupKey(a.Owner, a.Repo, a.PR)
+			if !pings[pingKey] {
+				pings[pingKey] = true
+				b.pingMergeable(ctx, a.Owner, a.Repo, a.PR, &state)
+			}
+		}
+		prs[prLookupKey(a.Owner, a.Repo, a.PR)] = state
+
+		obs := batchObservationFor(state, suites)
+		if b.cache != nil && obs.HeadSHA != "" && !seenObs[keyFor(obs)] {
+			seenObs[keyFor(obs)] = true
+			if obs.Rerequest || obs.SuiteReset {
+				b.cache.Invalidate(obs.HeadSHA)
+			}
+			if _, ok := b.cache.Lookup(obs); !ok {
+				b.cache.Store(obs, domain.VerdictWatching)
+			}
+		}
+	}
+
+	for _, w := range active {
+		owner, repo := splitRepo(w.Repo)
+		pr, ok := prs[prLookupKey(owner, repo, w.PR)]
+		if !ok {
+			continue
+		}
+		ref := w.BaseRef
+		if ref == "" {
+			ref = defaultBaseRef
+		}
+		base, ok := bases[baseLookupKey(owner, repo, ref)]
+		if !ok {
+			base = domain.BaseBranchState{BaseRef: ref, FailedChecks: map[string]bool{}}
+		}
+		// Each Watch owns its maps: two Watches on one PR share the fetched
+		// values but not the mutable containers.
+		checks := make(map[string]domain.Check, len(pr.Checks))
+		for name, check := range pr.Checks {
+			checks[name] = check
+		}
+		pr.Checks = checks
+		failed := make(map[string]bool, len(base.FailedChecks))
+		for name, isFailed := range base.FailedChecks {
+			failed[name] = isFailed
+		}
+		base.FailedChecks = failed
+		out[w.ID] = domain.PRSnapshot{PR: pr, Base: base}
+	}
+	return out, nil
+}
+
+// PRState reads one PR through the same batched document. Concurrent callers
+// asking for the same PR share one request.
+func (b *BatchProvider) PRState(ctx context.Context, repo string, pr int) (domain.PRState, error) {
+	if b.graph == nil {
+		return domain.PRState{}, fmt.Errorf("%s", MergeHeldNoGraphQL)
+	}
+	owner, name := splitRepo(repo)
+	key := "pr:" + prLookupKey(owner, name, pr)
+	v, err, _ := b.prSF.Do(key, func() (any, error) {
+		aliases := []Alias{{Name: "p0", Owner: owner, Repo: name, PR: pr}}
+		if err := b.limiter.Wait(ctx); err != nil {
+			return domain.PRState{}, err
+		}
+		result, err := b.graph.Do(ctx, TierBatch, aliases)
+		if err != nil {
+			return domain.PRState{}, err
+		}
+		state, _, err := b.parsePRAlias(ctx, aliases[0], result.Data["p0"])
+		if err != nil {
+			return domain.PRState{}, err
+		}
+		mergeable := strings.ToUpper(state.Mergeable)
+		if mergeable == "UNKNOWN" || mergeable == "" {
+			b.pingMergeable(ctx, owner, name, pr, &state)
+		}
+		return state, nil
+	})
+	if err != nil {
+		return domain.PRState{}, err
+	}
+	state, ok := v.(domain.PRState)
+	if !ok {
+		return domain.PRState{}, fmt.Errorf("batch: unexpected PR singleflight result %T", v)
+	}
+	return state, nil
+}
+
+// Merge implements domain.Merger. It is an alias for MergePR so the same
+// adapter satisfies both the explicit W1-C contract and the domain port.
+func (b *BatchProvider) Merge(ctx context.Context, repo string, pr int) (bool, bool, string, error) {
+	return b.MergePR(ctx, repo, pr)
+}
+
+// MergePR reads fresh merge state, refuses a dirty or conflicting PR without
+// an error, and only then issues a merge. A successful command is confirmed by
+// a second read; an unconfirmed merge is held, never reported as merged.
+func (b *BatchProvider) MergePR(ctx context.Context, repo string, pr int) (bool, bool, string, error) {
+	owner, name := splitRepo(repo)
+	if owner == "" || name == "" {
+		return false, true, MergeHeldInvalidRepo,
+			fmt.Errorf("merge: repo %q must be owner/repo", repo)
+	}
+
+	state, err := b.PRState(ctx, repo, pr)
+	if err != nil {
+		return false, false, "", err
+	}
+	switch strings.ToUpper(state.State) {
+	case "MERGED":
+		return true, false, "", nil
+	case "CLOSED":
+		return false, true, MergeHeldClosed, nil
+	}
+
+	mergeable := strings.ToUpper(state.Mergeable)
+	if mergeable == "UNKNOWN" || mergeable == "" {
+		b.pingMergeable(ctx, owner, name, pr, &state)
+		mergeable = strings.ToUpper(state.Mergeable)
+	}
+	switch mergeable {
+	case "MERGEABLE":
+	case "UNKNOWN", "":
+		return false, true, MergeHeldMergeable, nil
+	case "CONFLICTING":
+		return false, true, MergeHeldConflict, nil
+	default:
+		return false, true, MergeHeldNotMergeable, nil
+	}
+
+	switch strings.ToUpper(state.MergeStateStatus) {
+	case "CLEAN", "HAS_HOOKS", "BEHIND":
+	case "DIRTY", "BLOCKED":
+		return false, true, MergeHeldDirty, nil
+	case "UNKNOWN", "":
+		return false, true, MergeHeldMergeState, nil
+	default:
+		return false, true, strings.ToLower(state.MergeStateStatus), nil
+	}
+
+	if err := b.limiter.Wait(ctx); err != nil {
+		return false, false, "", err
+	}
+	if b.runner != nil {
+		return b.mergeWithRunner(ctx, owner, name, pr)
+	}
+	if b.rest == nil {
+		return false, true, MergeHeldNoRestClient, nil
+	}
+
+	result, err := b.rest.MergePullRequest(ctx, owner, name, pr, b.mergeMethod)
+	if err != nil {
+		return false, false, "", err
+	}
+	if !result.Merged {
+		return false, true, result.Reason, nil
+	}
+	return b.confirmMerge(ctx, repo, pr)
+}
+
+func (b *BatchProvider) mergeWithRunner(ctx context.Context, owner, repo string, pr int) (bool, bool, string, error) {
+	// --repo is mandatory: the working directory must never select the target.
+	args := []string{"pr", "merge", strconv.Itoa(pr), "--repo", owner + "/" + repo,
+		"--squash", "--delete-branch"}
+	out, err := b.runner.Run(ctx, "gh", args...)
+	if err != nil {
+		hint := strings.ToLower(string(out) + " " + err.Error())
+		if strings.Contains(hint, "not mergeable") || strings.Contains(hint, "conflict") ||
+			strings.Contains(hint, "failed to merge") || strings.Contains(hint, "head branch was modified") {
+			return false, true, MergeHeldRefused, nil
+		}
+		return false, false, "", fmt.Errorf("gh merge %s/%s#%d: %w", owner, repo, pr, err)
+	}
+	return b.confirmMerge(ctx, owner+"/"+repo, pr)
+}
+
+func (b *BatchProvider) confirmMerge(ctx context.Context, repo string, pr int) (bool, bool, string, error) {
+	after, err := b.PRState(ctx, repo, pr)
+	if err != nil {
+		return false, false, "", err
+	}
+	if strings.EqualFold(after.State, "MERGED") {
+		return true, false, "", nil
+	}
+	return false, true, MergeHeldPending, nil
+}
+
+// pingMergeable performs one REST read of the lazy mergeable field. A failure
+// or a 304 leaves the GraphQL state untouched, so an UNKNOWN stays UNKNOWN.
+func (b *BatchProvider) pingMergeable(ctx context.Context, owner, repo string, pr int, state *domain.PRState) {
+	if b.rest == nil {
+		return
+	}
+	key := "ping:" + prLookupKey(owner, repo, pr)
+	_, _, _ = b.prSF.Do(key, func() (any, error) {
+		if err := b.limiter.Wait(ctx); err != nil {
+			return nil, err
+		}
+		merged, notModified, err := b.rest.PingMergeable(ctx, owner, repo, pr)
+		if err != nil || notModified {
+			return nil, err
+		}
+		if merged.Mergeable != nil {
+			if *merged.Mergeable {
+				state.Mergeable = "MERGEABLE"
+			} else {
+				state.Mergeable = "CONFLICTING"
+			}
+		}
+		if merged.MergeableState != "" {
+			state.MergeStateStatus = strings.ToUpper(merged.MergeableState)
+		}
+		return nil, nil
+	})
+}
+
+// parsePRAlias maps one TierBatch PR payload into a PRState. It follows
+// pageInfo so a PR with more than 50 contexts is not silently truncated.
+func (b *BatchProvider) parsePRAlias(ctx context.Context, alias Alias, raw json.RawMessage) (domain.PRState, []ContextSuite, error) {
+	var pr tier1PR
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return domain.PRState{}, nil, fmt.Errorf("batch %s: decode PR: %w", alias.Name, err)
+	}
+	checks, suites, page, err := parseTier2Payload(raw)
+	if err != nil {
+		return domain.PRState{}, nil, fmt.Errorf("batch %s: %w", alias.Name, err)
+	}
+	for pages := 1; page.HasNextPage; pages++ {
+		if page.EndCursor == "" {
+			return domain.PRState{}, nil, fmt.Errorf("batch %s: hasNextPage without endCursor", alias.Name)
+		}
+		if pages >= maxTier2Pages {
+			return domain.PRState{}, nil, fmt.Errorf("batch %s: exceeded %d pages", alias.Name, maxTier2Pages)
+		}
+		next, err := b.graph.postTier2Query(ctx, BuildTier2PageQuery(alias, page.EndCursor))
+		if err != nil {
+			return domain.PRState{}, nil, err
+		}
+		nextChecks, nextSuites, nextPage, err := parseTier2Payload(next.Data[alias.Name])
+		if err != nil {
+			return domain.PRState{}, nil, fmt.Errorf("batch %s next page: %w", alias.Name, err)
+		}
+		for name, check := range nextChecks {
+			checks[name] = check
+		}
+		suites = append(suites, nextSuites...)
+		page = nextPage
+	}
+
+	normalized := make(map[string]domain.Check, len(checks))
+	for name, check := range checks {
+		mapped := normalizeGitHubCheck(check.Conclusion, check.State)
+		mapped.Required = check.Required
+		mapped.DetailsURL = check.DetailsURL
+		normalized[name] = mapped
+	}
+	state := domain.PRState{
+		State:            pr.State,
+		IsDraft:          pr.IsDraft,
+		HeadRefOid:       pr.HeadRefOid,
+		BaseRefName:      pr.BaseRefName,
+		Mergeable:        pr.Mergeable,
+		MergeStateStatus: pr.MergeStateStatus,
+		ReviewDecision:   pr.ReviewDecision,
+		Checks:           normalized,
+	}
+	return state, suites, nil
+}
+
+// normalizeGitHubCheck maps the raw GitHub fields into the three states the
+// verdict engine reads. CheckRun contributes conclusion, StatusContext
+// contributes state; when both are present conclusion wins. SKIPPED and NEUTRAL
+// are non-blocking successes, never CANCELLED or FAILURE.
+func normalizeGitHubCheck(conclusion, state string) domain.Check {
+	raw := conclusion
+	if raw == "" {
+		raw = state
+	}
+	fromRun := conclusion != ""
+	switch strings.ToUpper(raw) {
+	case "SUCCESS", "SKIPPED", "NEUTRAL":
+		if fromRun {
+			return domain.Check{State: "COMPLETED", Conclusion: "SUCCESS"}
+		}
+		return domain.Check{State: "SUCCESS", Conclusion: "SUCCESS"}
+	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "CANCELLED", "CANCELED":
+		if fromRun {
+			return domain.Check{State: "COMPLETED", Conclusion: "FAILURE"}
+		}
+		return domain.Check{State: "FAILURE", Conclusion: "FAILURE"}
+	default:
+		// QUEUED, IN_PROGRESS, WAITING, REQUESTED, PENDING and ACTION_REQUIRED
+		// are all pending. An unknown value also stays pending rather than
+		// being promoted to a failure that would block an unrelated PR.
+		return domain.Check{State: "PENDING"}
+	}
+}
+
+// baseRefPayload mirrors the ref(qualifiedName) selection in baseRefFields.
+type baseRefPayload struct {
+	Ref *struct {
+		Target *struct {
+			OID               string       `json:"oid"`
+			StatusCheckRollup *tier2Rollup `json:"statusCheckRollup"`
+		} `json:"target"`
+	} `json:"ref"`
+}
+
+// parseBaseRefState reads the failed checks of a base branch. An absent ref or
+// rollup leaves ChecksKnown false, so the caller cannot claim main is green.
+func parseBaseRefState(alias Alias, raw json.RawMessage) domain.BaseBranchState {
+	state := domain.BaseBranchState{
+		BaseRef:      alias.BaseRef,
+		FailedChecks: map[string]bool{},
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return state
+	}
+	var doc baseRefPayload
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return state
+	}
+	if doc.Ref == nil || doc.Ref.Target == nil {
+		return state
+	}
+	state.HeadSHA = doc.Ref.Target.OID
+	rollup := doc.Ref.Target.StatusCheckRollup
+	if rollup == nil || rollup.Contexts == nil {
+		return state
+	}
+	state.ChecksKnown = true
+	for _, node := range rollup.Contexts.Nodes {
+		name, check, ok := mapTier2Node(node)
+		if !ok {
+			continue
+		}
+		mapped := normalizeGitHubCheck(check.Conclusion, check.State)
+		if mapped.Conclusion == "FAILURE" || mapped.State == "FAILURE" {
+			state.FailedChecks[name] = true
+		}
+	}
+	return state
+}
+
+func batchObservationFor(pr domain.PRState, suites []ContextSuite) Observation {
+	contexts := make([]SuiteContext, 0, len(suites))
+	for _, s := range suites {
+		contexts = append(contexts, SuiteContext{Name: s.Name, SuiteID: s.SuiteID})
+	}
+	return Observation{
+		HeadSHA:     pr.HeadRefOid,
+		Contexts:    contexts,
+		SuitesValid: true,
+	}
+}
+
+// baseAliasesFromWatches emits one alias per distinct repository/base-ref pair.
+func baseAliasesFromWatches(watches []domain.Watch) ([]Alias, map[string]Alias) {
+	seen := make(map[string]Alias)
+	for _, w := range watches {
+		owner, repo := splitRepo(w.Repo)
+		ref := w.BaseRef
+		if ref == "" {
+			ref = defaultBaseRef
+		}
+		key := baseLookupKey(owner, repo, ref)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = Alias{
+			Name:    "b" + strconv.Itoa(len(seen)),
+			Owner:   owner,
+			Repo:    repo,
+			BaseRef: ref,
+		}
+	}
+	out := make([]Alias, 0, len(seen))
+	for _, a := range seen {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, seen
+}
+
+func batchSignature(watches []domain.Watch) string {
+	ids := make([]string, 0, len(watches))
+	for _, w := range watches {
+		ids = append(ids, w.ID+":"+w.Repo+"#"+strconv.Itoa(w.PR)+":"+w.HeadSHA+":"+w.BaseRef)
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, "|")
+}
+
+func prLookupKey(owner, repo string, pr int) string {
+	return owner + "/" + repo + "#" + strconv.Itoa(pr)
+}
+
+func baseLookupKey(owner, repo, ref string) string {
+	return owner + "/" + repo + "\x00" + ref
+}

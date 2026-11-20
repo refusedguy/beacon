@@ -80,6 +80,7 @@ type tier1PR struct {
 	State            string `json:"state"`
 	IsDraft          bool   `json:"isDraft"`
 	HeadRefOid       string `json:"headRefOid"`
+	BaseRefName      string `json:"baseRefName"`
 	Mergeable        string `json:"mergeable"`
 	MergeStateStatus string `json:"mergeStateStatus"`
 	ReviewDecision   string `json:"reviewDecision"`
