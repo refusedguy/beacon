@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -10,6 +11,40 @@ import (
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
+
+// The tracing wrappers sit on the command seams that already exist for tests.
+// They are pure wiring: with BEACON_OTEL_ENABLED unset the tracer is a no-op
+// and a command behaves exactly as before. Deeper per-tick spans need hooks
+// inside the daemon, cibridge and wake packages, outside this file's scope.
+func init() {
+	daemon := daemonRunner
+	RegisterDaemon(func(c *CLI, args []string) int {
+		return tracedCommand("beacon.daemon.tick", "daemon", func() int { return daemon(c, args) })
+	})
+
+	orchestrate := orchestratorRunner
+	RegisterOrchestrator(func(c *CLI, args []string) int {
+		return tracedCommand("beacon.orchestrator.pass", "orchestrator", func() int { return orchestrate(c, args) })
+	})
+
+	ci := ciRunner
+	RegisterCI(func(c *CLI, args []string) int {
+		return tracedCommand("beacon.ci.refresh", "cibridge", func() int { return ci(c, args) })
+	})
+
+	deliver := deliverRunner
+	RegisterDeliver(func(c *CLI, args []string) int {
+		return tracedCommand("beacon.wake.deliver", "wake", func() int { return deliver(c, args) })
+	})
+}
+
+func tracedCommand(name, component string, fn func() int) int {
+	_, end := observe.Current().Start(context.Background(), name,
+		observe.String("process.executable.name", "beacon"),
+		observe.String("beacon.component", component))
+	defer end()
+	return fn()
+}
 
 // beaconLogFormatEnv selects the slog handler: json or the default text.
 const beaconLogFormatEnv = "BEACON_LOG_FORMAT"
