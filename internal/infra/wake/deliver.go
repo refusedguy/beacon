@@ -934,7 +934,7 @@ func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, 
 	} else {
 		switch r.Outcome {
 		case T210Delivered, T210Queued, T210Enqueued:
-			observe.WakeDelivered(p.Adapter, p.WatchID, p.Revision)
+			observe.WakeDeliveredSource(p.Adapter, p.WatchID, observe.WakeSourceDaemon, p.Revision)
 		case T210Errored:
 			observe.WakeFailed(p.Adapter, p.WatchID, errors.New(r.Outcome), p.Revision)
 		default:
