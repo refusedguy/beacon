@@ -7,7 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
-	"time"
+	"strings"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
@@ -84,11 +84,12 @@ func runMetrics(c *CLI, args []string) int {
 	return 0
 }
 
-// setupObserve installs a slog logger and the in-memory counters. Each process
-// gets its own file under <project-state>/logs, and beacon.latest.log points at
-// it. stderr is reserved for setup failures: normal records go only to the
-// file, so an operator never sees the same line twice.
-func setupObserve() func() {
+// setupObserve installs a slog logger and the in-memory counters. A long-lived
+// server command (mcp or daemon) opens the rotating JSONL server log and moves
+// both latest links to it. Every other command opens a fresh timestamped CLI
+// log and leaves those links alone, so a one-shot command cannot hide the
+// server log from an operator following beacon.mcp.latest.log.
+func setupObserve(args ...string) func() {
 	rawLevel := os.Getenv(beaconLogLevelEnv)
 	level, ok := observe.ParseLevel(rawLevel)
 	if !ok {
@@ -115,7 +116,12 @@ func setupObserve() func() {
 		fmt.Fprintf(os.Stderr, "beacon: каталог состояния: %v\n", err)
 		return install(io.Discard)
 	}
-	runLog, err := observe.OpenRunLog(dir, time.Now(), os.Getpid())
+	var runLog *observe.RunLog
+	if len(args) > 0 && isServerCommand(args[0]) {
+		runLog, err = observe.OpenServerLog(dir)
+	} else {
+		runLog, err = observe.OpenCLILog(dir)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "beacon: лог: %v\n", err)
 		return install(io.Discard)
@@ -124,6 +130,17 @@ func setupObserve() func() {
 	return func() {
 		cleanup()
 		_ = runLog.Close()
+	}
+}
+
+// isServerCommand reports whether a command owns the long-lived server log.
+// Only mcp and daemon move the latest links; short commands never do.
+func isServerCommand(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "mcp", "daemon":
+		return true
+	default:
+		return false
 	}
 }
 

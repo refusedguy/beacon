@@ -30,17 +30,21 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon why <task>
   beacon mcp
   beacon orchestrate [--dry-run] [--format table|json]
-  beacon orchestrator rebind --from <old> --to <new> [--dry-run]
+  beacon orchestrator bind [--session <id>] [--dry-run]
+  beacon orchestrator rebind --from <old> --to <new> [--dry-run]  (устарело)
   beacon agents [--format table|json]
   beacon watch [--live] [--interval 2s] [--format table|json]
   beacon spawn <taskID> [--agent id] [--title ...]
   beacon attach <sessionID>
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
-  beacon daemon [--interval 3m] [--once]
+  beacon daemon [--interval 10s|30s] [--once]
   beacon workload [--format table|json]
   beacon metrics [--format json|prometheus]
   beacon pr create [--title ...] [--body ...] [--card T3.xxx] [--dry-run]
+  beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--json]
+  beacon inspect [<pr|watchID>] [--json]
+  beacon reset --yes
 
 Каталог команд для агентов: beacon list --format json
 `
@@ -93,7 +97,7 @@ func main() {
 	// Composition root of the CLI manager: one place where the thin HTTP
 	// client becomes the live source and the spawn port. No agent names or
 	// domain types cross this boundary (ADR 0005, ADR 0060 п1).
-	cleanupObserve := setupObserve()
+	cleanupObserve := setupObserve(os.Args[1:]...)
 	wireOpenCodePorts()
 	code := newDefaultCLI().Run(os.Args[1:])
 	cleanupObserve()
@@ -266,6 +270,12 @@ func (c *CLI) dispatch(args []string) int {
 		return metricsRunner(c, args[1:])
 	case "pr":
 		return prcreateRunner(c, args[1:])
+	case "logs":
+		return logsRunner(c, args[1:])
+	case "inspect":
+		return inspectRunner(c, args[1:])
+	case "reset":
+		return resetRunner(c, args[1:])
 	default:
 		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)

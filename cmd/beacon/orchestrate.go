@@ -6,11 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/github"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -47,17 +47,6 @@ func SetOrchestratorDeps(fn orchestratorDepsFactory) {
 	makeOrchestratorDeps = fn
 }
 
-// ghMerger is the production Merger. It runs exactly
-// `gh pr merge <pr> --squash --delete-branch` through the CLI runner, so the
-// call is injectable in tests and no HTTP or shell is hidden here. Auto-merge
-// is not used: this repository has enablePullRequestAutoMerge off, so --auto
-// fails with a GraphQL error instead of queuing anything.
-type ghMerger struct {
-	c *CLI
-}
-
-var _ orchestrator.CheckedMerger = ghMerger{}
-
 // firstLine keeps only gh's first diagnostic line. The following lines are
 // CLI hints that would otherwise be logged by the daemon every three minutes.
 func firstLine(s string) string {
@@ -80,81 +69,51 @@ func ghError(what string, res runResult) error {
 	return fmt.Errorf("%s: %s", what, reason)
 }
 
-// prViewFields are the only fields the merge gate and the confirmation read.
-type prViewFields struct {
-	Mergeable        string `json:"mergeable"`
-	MergeStateStatus string `json:"mergeStateStatus"`
-	State            string `json:"state"`
-}
+// cliRunner adapts the CLI child-process seam to the Runner port of the
+// GitHub adapter. github.BatchProvider always passes --repo on a merge, so the
+// merge target no longer depends on the process working directory.
+type cliRunner struct{ c *CLI }
 
-// prView runs one read-only gh call. fields is either the full gate tuple or
-// just "state" for the post-merge confirmation.
-func (m ghMerger) prView(repo string, pr int, fields string) (prViewFields, error) {
-	args := []string{"pr", "view", strconv.Itoa(pr), "--json", fields}
-	if strings.TrimSpace(repo) != "" {
-		args = append(args, "--repo", repo)
-	}
-	res := m.c.run(m.c.root, "gh", args, nil)
-	if res.code != 0 {
-		return prViewFields{}, ghError(fmt.Sprintf("gh pr view %d", pr), res)
-	}
-	var out prViewFields
-	if err := json.Unmarshal(res.stdout, &out); err != nil {
-		return prViewFields{}, fmt.Errorf("gh pr view %d decode: %w", pr, err)
-	}
-	return out, nil
-}
+var _ github.Runner = cliRunner{}
 
-// MergeChecked gates the merge on GitHub's own view of the PR. A PR whose
-// mergeStateStatus is not CLEAN (for example a dirty/conflicted PR) is refused
-// before `gh pr merge` runs, with a one-line diagnostic instead of gh's long
-// "add the --auto flag" hint. After a plain merge succeeds, the PR state is
-// confirmed before the orchestrator writes its ledger or closes the Watch.
-func (m ghMerger) MergeChecked(ctx context.Context, repo string, pr int) (orchestrator.MergeOutcome, error) {
-	_ = ctx
-	before, err := m.prView(repo, pr, "mergeable,mergeStateStatus,state")
-	if err != nil {
-		return orchestrator.MergeOutcome{}, err
+func (r cliRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if r.c == nil || r.c.run == nil {
+		return nil, fmt.Errorf("runner is not configured")
 	}
-	if strings.EqualFold(strings.TrimSpace(before.State), "MERGED") {
-		return orchestrator.MergeOutcome{Merged: true}, nil
-	}
-	if !strings.EqualFold(strings.TrimSpace(before.Mergeable), "MERGEABLE") ||
-		!strings.EqualFold(strings.TrimSpace(before.MergeStateStatus), "CLEAN") {
-		mergeable := before.Mergeable
-		if strings.TrimSpace(mergeable) == "" {
-			mergeable = "UNKNOWN"
-		}
-		status := before.MergeStateStatus
-		if strings.TrimSpace(status) == "" {
-			status = "UNKNOWN"
-		}
-		return orchestrator.MergeOutcome{
-			Reason: fmt.Sprintf("mergeable=%s mergeStateStatus=%s", mergeable, status),
-		}, nil
-	}
-	if err := m.Merge(ctx, repo, pr); err != nil {
-		return orchestrator.MergeOutcome{}, err
-	}
-	after, err := m.prView(repo, pr, "state")
-	if err != nil {
-		return orchestrator.MergeOutcome{}, err
-	}
-	if strings.EqualFold(strings.TrimSpace(after.State), "MERGED") {
-		return orchestrator.MergeOutcome{Merged: true}, nil
-	}
-	return orchestrator.MergeOutcome{Pending: true}, nil
-}
-
-func (m ghMerger) Merge(ctx context.Context, repo string, pr int) error {
-	_ = ctx
-	res := m.c.run(m.c.root, "gh", []string{
-		"pr", "merge", strconv.Itoa(pr), "--squash", "--delete-branch",
-	}, nil)
+	res := r.c.run(r.c.root, name, args, nil)
 	if res.code == 0 {
+		return res.stdout, nil
+	}
+	return res.stdout, ghError(fmt.Sprintf("%s %s", name, strings.Join(args, " ")), res)
+}
+
+// domainMergeAdapter bridges the domain merger to the orchestrator's
+// single-error Merger port. github.BatchProvider.MergePR returns the richer
+// (merged, held, reason, err) tuple; the adapter treats a hold as an honest
+// error so the orchestrator keeps the Watch open and reports the reason.
+type domainMergeAdapter struct{ merger domain.Merger }
+
+var _ orchestrator.Merger = domainMergeAdapter{}
+
+func (a domainMergeAdapter) Merge(ctx context.Context, repo string, pr int) error {
+	if a.merger == nil {
+		return fmt.Errorf("orchestrate: merger is not configured")
+	}
+	merged, held, reason, err := a.merger.Merge(ctx, repo, pr)
+	if err != nil {
+		return err
+	}
+	if merged {
 		return nil
 	}
-	return ghError(fmt.Sprintf("gh pr merge %d", pr), res)
+	if reason == "" {
+		if held {
+			reason = "merge held by policy"
+		} else {
+			reason = "merge was not confirmed"
+		}
+	}
+	return fmt.Errorf("merge %s#%d: %s", repo, pr, reason)
 }
 
 // orchWatchReaderFunc adapts a function to the orchestrator's WatchReader
@@ -183,8 +142,8 @@ func projectBlocked(b *domain.BlockedInfo) *orchestrator.BlockedInfo {
 }
 
 // projectWatch maps one domain Watch onto the orchestrator's decision shape.
-// The block record travels with it, so Decide sees a block even when the
-// verdict still reads ready.
+// The verdict was derived by domain.EvaluatePR in the single cibridge loop and
+// persisted on the Watch; this function only reshapes persisted facts.
 func projectWatch(w domain.Watch) orchestrator.Watch {
 	var policy *orchestrator.AutoMergePolicy
 	if raw, err := json.Marshal(w); err == nil {
@@ -202,53 +161,50 @@ func projectWatch(w domain.Watch) orchestrator.Watch {
 	}
 }
 
-// projectActiveWatches keeps the statuses the orchestrator decides on. A
-// blocked Watch is not part of domain ActiveWatches, so it is included here
-// explicitly; closed, parked and needs_input Watches stay out.
-func projectActiveWatches(all []domain.Watch) []orchestrator.Watch {
-	out := make([]orchestrator.Watch, 0, len(all))
-	for _, w := range all {
-		switch w.Status {
-		case domain.StatusWatching, domain.StatusNotifying, domain.StatusBlocked:
-		default:
-			continue
-		}
-		out = append(out, projectWatch(w))
-	}
-	return out
-}
-
-// defaultOrchestratorDeps opens the real state store from the same directory
-// the MCP server uses and combines it with the gh merger. The concrete *store.DB
-// is needed for the merge ledger and for beacon_cancel_watch's event log.
-func defaultOrchestratorDeps(c *CLI) (orchestratorDeps, func() error, error) {
-	deps, closeStore, err := openMCPDependencies()
-	if err != nil {
-		return orchestratorDeps{}, nil, err
-	}
-	db, ok := deps.Store.(*store.DB)
-	if !ok {
-		_ = closeStore()
-		return orchestratorDeps{}, nil, fmt.Errorf("beacon orchestrate: store is not *store.DB")
-	}
+// orchestratorDepsFromDB builds the orchestrator ports from one already-open
+// store handle. Watches come from LiveWatches, which includes blocked Watches
+// and excludes closed ones, so no second status filter is needed here.
+func orchestratorDepsFromDB(c *CLI, db *store.DB) (orchestratorDeps, error) {
+	ghBatch := newGitHubBatch(context.Background(), c)
 	reader := orchWatchReaderFunc(func(_ context.Context) ([]orchestrator.Watch, error) {
-		// A blocked Watch is absent from ActiveWatches (status=blocked). Read
-		// every Watch and keep the active ones plus the blocked ones, so the
-		// orchestrator can see the block and spend the FIX-attempt budget.
-		all, err := deps.Store.AllWatches()
+		live, err := db.LiveWatches()
 		if err != nil {
 			return nil, err
 		}
-		return projectActiveWatches(all), nil
+		out := make([]orchestrator.Watch, 0, len(live))
+		for _, w := range live {
+			out = append(out, projectWatch(w))
+		}
+		return out, nil
 	})
 	return orchestratorDeps{
 		Store:  orchestrator.NewDBStore(reader, db),
-		Merger: ghMerger{c: c},
-	}, closeStore, nil
+		Merger: domainMergeAdapter{merger: ghBatch.provider},
+	}, nil
+}
+
+// defaultOrchestratorDeps opens the real state store from the same directory
+// the MCP server uses and combines it with the adapter over the batch merger.
+// The concrete *store.DB is needed for the merge ledger and the event log.
+func defaultOrchestratorDeps(c *CLI) (orchestratorDeps, func() error, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return orchestratorDeps{}, nil, err
+	}
+	db, err := openProcessStore(dir)
+	if err != nil {
+		return orchestratorDeps{}, nil, err
+	}
+	deps, err := orchestratorDepsFromDB(c, db)
+	if err != nil {
+		_ = db.Close()
+		return orchestratorDeps{}, nil, err
+	}
+	return deps, db.Close, nil
 }
 
 // runOrchestrate implements `beacon orchestrate [--dry-run] [--format table|json]`.
-// It makes one pass over active Watches, prints the actions and returns the
+// It makes one pass over live Watches, prints the actions and returns the
 // PRs that need a rebase in the NeedsRebase field of the report.
 func runOrchestrate(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("orchestrate", flag.ContinueOnError)

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -18,8 +19,10 @@ import (
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/app/taskcli"
 	"github.com/refusedguy/beacon/internal/infra/cibridge"
-	"github.com/refusedguy/beacon/internal/infra/ghci"
+	"github.com/refusedguy/beacon/internal/infra/github"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/observe"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
@@ -33,14 +36,12 @@ var _ mcp.PrecheckJournal = (*taskcli.Service)(nil)
 // (ADR 0011, ADR 0015).
 const mcpStateDBName = "beacon.db"
 
-// The CI bridge cadence is owned by cibridge: DefaultPollInterval is 30s and
-// BEACON_CI_POLL_INTERVAL overrides it (cibridge.PollInterval). The old 5s tick
-// made twelve Watches issue about 288 gh calls a minute, which exhausted the
-// local CLI's connection budget and stopped verdicts from being published.
+// The single reconciler uses github.Interval: 10s while a Watch changed
+// recently, 30s when quiet, stretched when the point budget is spent.
 
-// mcpDaemonPorts and mcpDaemonRun are the seams through which `beacon mcp`
-// hosts the full daemon cycle. Tests replace them to observe the loop without
-// opening real stores or calling gh.
+// mcpDaemonPorts and mcpDaemonRun are compatibility seams kept for callers
+// that still assemble the older daemon cycle. The production MCP server and
+// daemon command both use ReconcileLoop instead, so no competing bridge runs.
 var (
 	mcpDaemonPorts = makeDaemonPorts
 	mcpDaemonRun   = orchestrator.DaemonRun
@@ -279,7 +280,7 @@ func runMCPPrecheck(ctx context.Context, cfg initEventConfig) error {
 
 // mcpRunner serves MCP over stdio. RegisterMCP replaces it, for example in tests.
 var mcpRunner = func(errOut io.Writer) int {
-	if err := runMCP(context.Background()); err != nil {
+	if err := runMCP(context.Background(), newDefaultCLI()); err != nil {
 		fmt.Fprintf(errOut, "beacon mcp: %v\n", err)
 		return 1
 	}
@@ -359,28 +360,29 @@ func openMCPDependencies() (mcp.Dependencies, func() error, error) {
 // runMCP already resolved the state directory to read the connection file, so
 // it reuses that path here instead of resolving it a second time.
 func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error) {
-	if err := mcp.EnsureStateDir(dir); err != nil {
-		return mcp.Dependencies{}, nil, err
-	}
-	db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+	db, err := openProcessStore(dir)
 	if err != nil {
 		return mcp.Dependencies{}, nil, err
 	}
+	return buildMCPDependencies(db, dir, nil), db.Close, nil
+}
 
-	// T3.91: the ports below are the real production implementations. The
-	// app service persists precheck reasons under this state directory, and
-	// the capability registry binds waits to the calling agent from _meta.
-	//
-	// The remaining setters are deliberately left at their real defaults.
-	// CIWait is a no-op until a CI adapter is bound to one Watch; the shared
-	// gate is still wired, so it coalesces callers honestly. The in-memory
-	// idempotency index lives as long as the process, which is the current
-	// store lifetime; a durable one would need the same transaction as the
-	// obligation write and does not exist yet. Only beacon_ack consumes the
-	// continuation counter, so its own counter is sufficient. store.SharedGate
-	// keeps its log.Printf warning sink in production; tests replace it to
-	// capture warnings without touching the global logger (SetWarningSink).
-	deps := mcp.Dependencies{
+// openProcessStore opens the single SQLite handle a long-lived process shares
+// between the MCP tools, the reconciler and the stats snapshot.
+func openProcessStore(dir string) (*store.DB, error) {
+	if err := mcp.EnsureStateDir(dir); err != nil {
+		return nil, err
+	}
+	return store.Open(filepath.Join(dir, mcpStateDBName))
+}
+
+// buildMCPDependencies wires the seven real MCP tool ports around one DB
+// handle. The optional points reader comes from the process' GitHub batch
+// provider, so beacon_stats reports the real hourly budget instead of a
+// process-local zero. The snapshot reads LiveWatches, which includes blocked
+// Watches, and surfaces the last saved runtime-stats payload as diagnostics.
+func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mcp.Dependencies {
+	return mcp.Dependencies{
 		Store:           db,
 		Stamper:         mcp.NewSQLObligationStamper(db),
 		Writer:          mcp.NewSQLWaitResultWriter(db),
@@ -392,16 +394,42 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 		// it the server answers with a ticket carrying a job id rather than
 		// holding the connection open. This is a time bound, not ADR 0026's
 		// delivery field.
-		After: readSyncCallConfig().after,
+		After:    readSyncCallConfig().after,
+		Blockers: db,
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
-			watches, err := db.ActiveWatches()
+			live, err := db.LiveWatches()
 			if err != nil {
 				return mcp.StateSnapshot{}, err
 			}
-			return mcp.StateSnapshot{ActiveWatches: watches, Version: mcp.ServerVersion}, nil
+			pointsUsed, pointBudget := pointsValue(points)
+			snap := mcp.StateSnapshot{
+				ActiveWatches:  live,
+				LiveWatches:    live,
+				PointsThisHour: pointsUsed,
+				Budget:         pointBudget,
+				Version:        mcp.ServerVersion,
+			}
+			if raw, ok, err := db.LoadRuntimeStats(); err != nil {
+				snap.LoadErrors = append(snap.LoadErrors, "runtime_stats: "+err.Error())
+			} else if ok && len(raw) > 0 {
+				snap.LoadErrors = append(snap.LoadErrors, fmt.Sprintf("runtime_stats: %d bytes", len(raw)))
+			}
+			return snap, nil
 		}),
 	}
-	return deps, db.Close, nil
+}
+
+// pointsValue is a nil-safe read of the GitHub point counters. A missing
+// reader reports zero used and the shared default budget.
+func pointsValue(points func() (int, int)) (int, int) {
+	if points == nil {
+		return 0, github.BudgetPerHour
+	}
+	used, budget := points()
+	if budget <= 0 {
+		budget = github.BudgetPerHour
+	}
+	return used, budget
 }
 
 // runMCP reads the connection file on every startup, applies the endpoint and
@@ -409,7 +437,15 @@ func openMCPDependenciesInDir(dir string) (mcp.Dependencies, func() error, error
 // Re-reading the file is the reconnect: a daemon that moved to another address,
 // port or token is observed on the next start, while the watches stay in the
 // on-disk store and continue to wait.
-func runMCP(ctx context.Context) error {
+//
+// The optional CLI argument exists so tests can inject a child runner without
+// changing the two-argument mcpRunner seam.
+func runMCP(ctx context.Context, cli ...*CLI) error {
+	c := newDefaultCLI()
+	if len(cli) > 0 && cli[0] != nil {
+		c = cli[0]
+	}
+
 	// A run starts from a clean precheck state. A failure from an earlier run
 	// in the same process must not leak into this server's wait_result tool.
 	setPrecheckFailureReason("")
@@ -442,39 +478,285 @@ func runMCP(ctx context.Context) error {
 	}
 	activeMCPConnection = conn
 
-	deps, closeStore, err := openMCPDependenciesInDir(dir)
+	// One DB handle for the whole process. The same pointer backs the MCP
+	// tools, the cibridge control plane, the stats snapshot and the metrics
+	// writer, so a verdict written by the loop is visible to the next tool.
+	db, err := openProcessStore(dir)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = closeStore() }()
+	defer func() { _ = db.Close() }()
 
-	// Both background loops belong to this MCP run and are cancelled when it
-	// ends. A reconnect starts a fresh pair in the new process.
+	ghBatch := newGitHubBatch(ctx, c)
+	deps := buildMCPDependencies(db, dir, ghBatch.provider.PointStats)
+
+	cfg := reconcileConfig{
+		dir:        dir,
+		db:         db,
+		deps:       deps,
+		batch:      ghBatch.provider,
+		counter:    ghBatch.counter,
+		projectKey: orchestratorProjectKey(),
+		root:       projectRootForConfig(),
+	}
+
+	// Only the owner of the non-blocking poller lock starts the single
+	// background cycle. A second MCP process serves tools but stays silent.
 	runCtx, stopLoops := context.WithCancel(ctx)
 	defer stopLoops()
-
-	// The CI bridge observes the hosting service for active Watches and persists
-	// ready/retry, so the orchestrator reads a verdict from get_result instead
-	// of polling CI. It runs on the configured cadence (30s by default); each
-	// provider call is additionally cached and paced by ghci.Provider.
-	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, cibridge.PollInterval())
-	ciBridge.WithWaker(wake.NewRegistry())
-	go ciBridge.Run(runCtx)
-
-	// A full daemon cycle runs in this process as well. Starting `beacon mcp`
-	// is now enough: checkall, orchestrate and close-merged are no longer a
-	// separate `beacon daemon` process. The bridge above stays as the verdict
-	// observer (30s by default), while the daemon owns the slower full cycle
-	// (3m by default). CloseMerged's bridge.Refresh is an idempotent refresh of
-	// terminal PR states, so the two loops complement each other instead of
-	// publishing competing verdicts.
-	stopDaemon, err := startMCPDaemon(runCtx, newDefaultCLI())
+	stop, err := runReconciler(runCtx, cfg)
 	if err != nil {
-		return fmt.Errorf("mcp: daemon: %w", err)
+		return fmt.Errorf("mcp: poller: %w", err)
 	}
-	defer stopDaemon()
+	defer stop()
 
 	return serveMCP(ctx, deps)
+}
+
+// pollerLockName is the non-blocking flock file that elects one background
+// poller per state directory.
+const pollerLockName = "beacon-poller.lock"
+
+// pollerLockOpen is the capabilities-gate seam for opening the lock file. The
+// call goes through the variable, so cmd/beacon never names os.OpenFile
+// directly (ADR 0005).
+var pollerLockOpen = os.OpenFile
+
+// acquirePollerLock takes LOCK_EX|LOCK_NB on <dir>/beacon-poller.lock. A false
+// owned flag means another live process already runs the poller; this process
+// must not start a second loop. The returned function releases the lock.
+func acquirePollerLock(dir string) (func(), bool, error) {
+	path := filepath.Join(dir, pollerLockName)
+	f, err := pollerLockOpen(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}, true, nil
+}
+
+// reconcileConfig bundles the one store handle and the ports the single
+// background cycle needs. An intervalOverride above zero replaces the adaptive
+// 10s/30s interval, which the daemon command uses for its explicit flag.
+type reconcileConfig struct {
+	dir              string
+	db               *store.DB
+	deps             mcp.Dependencies
+	batch            *github.BatchProvider
+	counter          *github.Counter
+	projectKey       string
+	root             string
+	intervalOverride time.Duration
+}
+
+// githubBatch is the real CI provider plus the shared point counter.
+type githubBatch struct {
+	provider *github.BatchProvider
+	counter  *github.Counter
+}
+
+// githubAPIURL is the REST base used to seed the shared point counter.
+const githubAPIURL = "https://api.github.com"
+
+// newGitHubBatch builds the batch provider behind a seam so tests never need
+// a token or a network. Every merge it performs carries --repo through the
+// CLI runner, so the target never depends on the working directory.
+var newGitHubBatch = func(ctx context.Context, c *CLI) githubBatch {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	counter, err := github.NewCounter(ctx, nil, githubAPIURL)
+	if err != nil {
+		counter = nil
+	}
+	token, err := github.ResolveToken(ctx)
+	if err != nil {
+		token = ""
+	}
+	graph := github.NewClient("", token, nil, counter)
+	rest, err := github.NewRestClient(ctx, counter)
+	if err != nil {
+		rest = nil
+	}
+	var opts []github.BatchOption
+	if c != nil && c.run != nil {
+		opts = append(opts, github.WithRunner(cliRunner{c: c}))
+	}
+	return githubBatch{provider: github.NewBatchProvider(graph, rest, counter, opts...), counter: counter}
+}
+
+// projectRootForConfig resolves the absolute project root used by the config
+// fallback of the orchestrator-id source.
+func projectRootForConfig() string {
+	root := strings.TrimSpace(os.Getenv(beaconProjectRootEnv))
+	if root != "" {
+		return root
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return ""
+	}
+	return cwd
+}
+
+// orchestratorProjectKey returns the stable project key used by the SQLite
+// orchestrator binding.
+func orchestratorProjectKey() string {
+	root := projectRootForConfig()
+	if root == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return ""
+	}
+	key, err := projectStateKey(abs)
+	if err != nil {
+		return ""
+	}
+	return key
+}
+
+// orchestratorIDSource reads the bound orchestrator from SQLite first and
+// falls back to the project config. An empty result leaves a blocked Watch
+// unsent rather than guessing a session.
+func orchestratorIDSource(db *store.DB, projectKey, root string) cibridge.OrchestratorIDSource {
+	return cibridge.OrchestratorIDSource(func() string {
+		if binding, ok, err := db.BoundOrchestrator(projectKey); err == nil && ok {
+			if id := strings.TrimSpace(binding.SessionID); id != "" {
+				return id
+			}
+		}
+		cfg, err := orchestrator.LoadProjectConfig(root)
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(cfg.OrchestratorID)
+	})
+}
+
+// opencodeWakePorts adapts the live opencode client to the HTTP ports of the
+// wake deliverer. A missing service registration yields nil ports, so the
+// deliverer falls back to its own CLI path instead of faking delivery.
+func opencodeWakePorts() (wake.PromptFunc, wake.SessionActiveFunc) {
+	port, err := newOpencodePort()
+	if err != nil || port == nil {
+		return nil, nil
+	}
+	client, ok := port.(*opencode.Client)
+	if !ok {
+		return nil, nil
+	}
+	prompt := func(ctx context.Context, sessionID, text, delivery string) error {
+		return client.Prompt(ctx, sessionID, text)
+	}
+	active := func(ctx context.Context, sessionID string) (bool, bool, error) {
+		sessions, err := client.Sessions(ctx)
+		if err != nil {
+			return false, false, err
+		}
+		for _, s := range sessions {
+			if s.ID != sessionID {
+				continue
+			}
+			return s.Time.Busy > 0 && s.Time.Idle == 0, true, nil
+		}
+		return false, false, fmt.Errorf("opencode: session %s: %w", sessionID, wake.ErrSessionDead)
+	}
+	return prompt, active
+}
+
+// reconcileWaker installs the HTTP-backed OpenCode deliverer as the opencode
+// adapter of one registry. The registry stays the adapter-aware port cibridge
+// expects; no subscriber name is interpreted here.
+func reconcileWaker(db *store.DB) *wake.Registry {
+	registry := wake.NewRegistry()
+	prompt, active := opencodeWakePorts()
+	registry.Register(wake.AdapterOpenCode, &wake.OpenCodeDeliverer{
+		PromptFunc:        prompt,
+		SessionActiveFunc: active,
+		Obligations:       db,
+	})
+	return registry
+}
+
+// ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
+// with domain.EvaluatePR, merges and wakes through the wired ports, then the
+// in-process counters are saved to runtime_stats. It returns the number of
+// watches the bridge updated.
+func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
+	if cfg.db == nil || cfg.batch == nil {
+		return 0
+	}
+	bridge := cibridge.New(cfg.db, cfg.batch, cfg.deps.Clock, 0)
+	bridge.WithWaker(reconcileWaker(cfg.db)).
+		WithReader(cfg.deps.Stamper).
+		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
+		WithMerger(cfg.batch).
+		WithBlockerControl(cfg.db)
+	updated := bridge.Refresh(ctx)
+	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
+		if err := cfg.db.SaveRuntimeStats(metrics.SnapshotJSON(), time.Now()); err != nil {
+			observe.ActorError("runtime_stats", "", err)
+		}
+	}
+	return updated
+}
+
+// ReconcileLoop is the single background cycle of the process. The next
+// interval comes from github.Interval: 10s while a Watch changed recently,
+// 30s once it is quiet, stretched threefold when the point budget is spent.
+func ReconcileLoop(ctx context.Context, cfg reconcileConfig) {
+	var lastChange time.Time
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if n := ReconcilePass(ctx, cfg); n > 0 {
+			lastChange = time.Now()
+		}
+		limit := cfg.counter != nil && cfg.counter.LimitReached()
+		wait := github.Interval(time.Now(), lastChange, limit)
+		if cfg.intervalOverride > 0 {
+			wait = cfg.intervalOverride
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+	}
+}
+
+// runReconciler starts the loop only when this process owns the poller lock.
+// The returned function cancels and waits for the loop and releases the lock.
+func runReconciler(ctx context.Context, cfg reconcileConfig) (func(), error) {
+	release, owned, err := acquirePollerLock(cfg.dir)
+	if err != nil {
+		return nil, err
+	}
+	if !owned {
+		return func() {}, nil
+	}
+	loopCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ReconcileLoop(loopCtx, cfg)
+	}()
+	return func() {
+		cancel()
+		<-done
+		release()
+	}, nil
 }
 
 // RegisterMCP installs the mcp command implementation.

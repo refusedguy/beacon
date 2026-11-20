@@ -12,7 +12,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
-func TestSetupObserveWritesStructuredRecordsToUniqueFiles(t *testing.T) {
+func TestSetupObserveWritesStructuredRecordsToServerLog(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("BEACON_STATE_DIR", state)
 	t.Setenv("BEACON_LOG_FORMAT", "json")
@@ -25,45 +25,78 @@ func TestSetupObserveWritesStructuredRecordsToUniqueFiles(t *testing.T) {
 		log.SetOutput(previousOutput)
 	}()
 
-	var files []string
-	for run := 0; run < 2; run++ {
-		cleanup := setupObserve()
-		observe.VerdictPublished("ready", "watch:1", 7)
-		observe.WakeDelivered("opencode", "watch:1")
-		log.Printf("legacy line %d", run)
-		cleanup()
+	// A server command owns the rotating log and both latest links.
+	cleanup := setupObserve("mcp")
+	observe.VerdictPublished("ready", "watch:1", 7)
+	observe.WakeDelivered("opencode", "watch:1")
+	log.Printf("legacy line")
+	cleanup()
 
-		latest := filepath.Join(state, "logs", "beacon.latest.log")
-		target, err := os.Readlink(latest)
+	for _, link := range []string{"beacon.latest.log", "beacon.mcp.latest.log"} {
+		target, err := os.Readlink(filepath.Join(state, "logs", link))
 		if err != nil {
-			t.Fatalf("beacon.latest.log не symlink: %v", err)
+			t.Fatalf("%s не symlink: %v", link, err)
 		}
-		path := filepath.Join(state, "logs", target)
-		if len(files) != 0 && files[len(files)-1] == path {
-			t.Fatal("перезапуск перезаписал тот же файл")
+		if target != "beacon.mcp.jsonl" {
+			t.Fatalf("%s -> %q, ожидался beacon.mcp.jsonl", link, target)
 		}
-		files = append(files, path)
+	}
 
-		raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(filepath.Join(state, "logs", "beacon.mcp.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("невалидная JSON-строка лога %q: %v", line, err)
+		}
+		event, ok := record[observe.FieldEvent].(string)
+		if !ok {
+			t.Fatalf("в записи нет поля event: %q", line)
+		}
+		events[event] = true
+	}
+	for _, want := range []string{"verdict_published", "wake_delivered", "legacy_log", "cycle"} {
+		if !events[want] {
+			t.Errorf("в логе нет события %s: %q", want, raw)
+		}
+	}
+}
+
+func TestSetupObserveCLILogLeavesServerLinksAlone(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", state)
+	t.Setenv("BEACON_LOG_FORMAT", "json")
+	previousSink := observe.Default()
+	previousOutput := log.Writer()
+	defer func() {
+		observe.SetDefault(previousSink)
+		log.SetOutput(previousOutput)
+	}()
+
+	cleanup := setupObserve("mcp")
+	observe.Count("beacon_poll_cycles", "")
+	cleanup()
+
+	links := make(map[string]string)
+	for _, name := range []string{"beacon.latest.log", "beacon.mcp.latest.log"} {
+		target, err := os.Readlink(filepath.Join(state, "logs", name))
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s не symlink: %v", name, err)
 		}
-		events := make(map[string]bool)
-		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-			var record map[string]any
-			if err := json.Unmarshal([]byte(line), &record); err != nil {
-				t.Fatalf("невалидная JSON-строка лога %q: %v", line, err)
-			}
-			event, ok := record[observe.FieldEvent].(string)
-			if !ok {
-				t.Fatalf("в записи нет поля event: %q", line)
-			}
-			events[event] = true
-		}
-		for _, want := range []string{"verdict_published", "wake_delivered", "legacy_log", "cycle"} {
-			if !events[want] {
-				t.Errorf("в логе нет события %s: %q", want, raw)
-			}
+		links[name] = target
+	}
+
+	cleanup = setupObserve("list")
+	observe.Count("beacon_poll_cycles", "")
+	cleanup()
+
+	for name, want := range links {
+		got, err := os.Readlink(filepath.Join(state, "logs", name))
+		if err != nil || got != want {
+			t.Fatalf("короткая команда изменила %s: %q, ожидалось %q", name, got, want)
 		}
 	}
 }
@@ -90,6 +123,19 @@ func TestRunMetricsExportsAllCounters(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("в метриках нет %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestIsServerCommandOnlySelectsLongLivedProcesses(t *testing.T) {
+	for _, name := range []string{"mcp", "daemon", " mcp "} {
+		if !isServerCommand(name) {
+			t.Errorf("%q should use the server log", name)
+		}
+	}
+	for _, name := range []string{"logs", "inspect", "reset", "list", ""} {
+		if isServerCommand(name) {
+			t.Errorf("%q must not move the server latest link", name)
 		}
 	}
 }
