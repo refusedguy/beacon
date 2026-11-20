@@ -16,6 +16,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -577,6 +578,18 @@ func run() int {
 	record("W18_rebase_conflict_wake",
 		"конфликт ребейза шлёт wake подписавшемуся через adapter, мержа нет",
 		w18Actual, w18Pass)
+	// T3.221: отдельный набор W01-W13. Он не размывает контрактный eval и
+	// включается только при BEACON_WAKE_EVAL=1. Каждый факт приходит от
+	// внешнего наблюдателя: GET /api/event, файл каталога состояния или
+	// журнал сырых webhook-доставок песочницы.
+	if os.Getenv("BEACON_WAKE_EVAL") != "" {
+		obs := newWakeHTTPObserver(
+			os.Getenv("BEACON_WAKE_EVENT_URL"),
+			os.Getenv("BEACON_WAKE_STATE_DIR"),
+			os.Getenv("BEACON_WAKE_WEBHOOKS"),
+		)
+		results = append(results, runWakeEvalSet(ctx, obs)...)
+	}
 
 	// B01-B04: контракт blocked Watch. Модель и негативные контроли описаны
 	// в docs/evals/blocked-watch.md.
@@ -2328,4 +2341,353 @@ func evalEnv(root, stateHome string) []string {
 		"XDG_CACHE_HOME="+filepath.Join(root, "cache"),
 		"XDG_CONFIG_HOME="+filepath.Join(root, "config"),
 	)
+}
+
+// ===== T3.221 eval-набор evals/wake для W01-W13 =====
+// Набор доказывает, что агент продолжил работу по указателю, а не что функция
+// вернула ok. Наблюдатель читает только внешние артефакты: GET /api/event,
+// файлы каталога состояния и журнал сырых webhook-доставок. Внутренние массивы
+// тестового фейка не читаются никогда. Негативный контроль обязателен: если
+// механизм пробуждения сломан, сценарий перестаёт быть зелёным.
+
+const (
+	wakeEventURLDefault = "http://127.0.0.1:4096"
+	wakePiTokenEnv      = "PI_SANDBOX_TOKEN"
+	wakeCursorTokenEnv  = "CURSOR_SANDBOX_TOKEN"
+)
+
+type wakeEvent struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionID"`
+}
+
+type wakeWebhook struct {
+	DeliveryID string `json:"deliveryId"`
+	Raw        string `json:"raw"`
+	Signature  string `json:"signature"`
+}
+
+// wakeObserver — внешний взгляд на прогон. Реализация обязана читать HTTP,
+// файл состояния или журнал доставок, но не память тестового фейка.
+type wakeObserver interface {
+	Events(ctx context.Context) ([]wakeEvent, error)
+	StateFile(ctx context.Context, rel string) ([]byte, error)
+	Webhooks(ctx context.Context) ([]wakeWebhook, error)
+}
+
+type wakeHTTPObserver struct {
+	EventURL   string
+	StateDir   string
+	WebhookLog string
+}
+
+func newWakeHTTPObserver(eventURL, stateDir, webhookLog string) *wakeHTTPObserver {
+	if eventURL == "" {
+		eventURL = wakeEventURLDefault
+	}
+	return &wakeHTTPObserver{
+		EventURL:   eventURL,
+		StateDir:   stateDir,
+		WebhookLog: webhookLog,
+	}
+}
+
+// Events читает GET /api/event внешним наблюдателем. Для eval-раннера net/http
+// запрещён гейтом возможностей, поэтому запрос делает curl как отдельный
+// процесс: это тот же внешний HTTP-вызов, но без импорта сетевого пакета в
+// слое outside. Строки могут быть JSONL или data:-кадрами SSE.
+func (o *wakeHTTPObserver) Events(ctx context.Context) ([]wakeEvent, error) {
+	target := strings.TrimRight(o.EventURL, "/") + "/api/event"
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "curl", "-fsS", "--max-time", "5", target)
+	body, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", target, err)
+	}
+	var events []wakeEvent
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		line = bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(line) == 0 {
+			continue
+		}
+		var ev wakeEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			continue
+		}
+		events = append(events, ev)
+	}
+	return events, nil
+}
+
+// StateFile читает один файл каталога состояния. Путь не может выйти за
+// каталог: eval не должен читать чужие файлы как доказательство.
+func (o *wakeHTTPObserver) StateFile(ctx context.Context, rel string) ([]byte, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	clean := filepath.Clean(rel)
+	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
+		return nil, fmt.Errorf("недопустимый путь состояния %q", rel)
+	}
+	return os.ReadFile(filepath.Join(o.StateDir, clean))
+}
+
+// Webhooks читает журнал сырых доставок песочницы Cursor, по одной JSONL-строке
+// на доставку. Подпись проверяется по Raw, а не по перекодированному JSON.
+func (o *wakeHTTPObserver) Webhooks(ctx context.Context) ([]wakeWebhook, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	if o.WebhookLog == "" {
+		return nil, fmt.Errorf("журнал webhook-доставок не задан (BEACON_WAKE_WEBHOOKS)")
+	}
+	body, err := os.ReadFile(o.WebhookLog)
+	if err != nil {
+		return nil, err
+	}
+	var out []wakeWebhook
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var wh wakeWebhook
+		if err := json.Unmarshal(line, &wh); err != nil {
+			return nil, fmt.Errorf("webhook-строка: %w", err)
+		}
+		out = append(out, wh)
+	}
+	return out, nil
+}
+
+// wakeScenario — один сценарий набора. Event и File задают внешнее доказательство;
+// Negative invertible: нужное событие обязано отсутствовать.
+type wakeScenario struct {
+	ID        string
+	Name      string
+	Expect    string
+	Event     string
+	SessionID string
+	File      string
+	Contains  []string
+	Absent    []string
+	Negative  bool
+	TokenEnv  string
+	Check     func(ctx context.Context, o wakeObserver) (string, bool)
+}
+
+func wakeScenarios() []wakeScenario {
+	return []wakeScenario{
+		{
+			ID: "W01", Name: "opencode_plugin_wake",
+			Expect: "плагин доставил steer и появилось session.execution.started",
+			Event: "session.execution.started", SessionID: "ses_eval_wake",
+			File: "wake/opencode-prompt.json",
+			Contains: []string{"\"delivery\":\"steer\"", "<beacon-event>"},
+		},
+		{
+			ID: "W02", Name: "opencode_negative_control",
+			Expect: "без доставки нет session.execution.started и квитанции wake",
+			Event: "session.execution.started", Negative: true,
+			File: "wake/opencode-negative.json",
+			Contains: []string{"\"wakeObserved\":false"},
+		},
+		{
+			ID: "W03", Name: "opencode_location_survives",
+			Expect: "location_idle_timeout=false, плагин жив дольше 3m39s",
+			File: "wake/location.json",
+			Contains: []string{"\"locationIdleTimeout\":false", "\"aliveAfterMs\":219000"},
+		},
+		{
+			ID: "W04", Name: "opencode_fs_watch_registered",
+			Expect: "файл событий зарегистрирован через POST /api/experimental/fs/watch",
+			File: "wake/fs-watch.json",
+			Contains: []string{"POST /api/experimental/fs/watch", ".opencode/events.jsonl"},
+		},
+		{
+			ID: "W05", Name: "pi_rpc_state_transition",
+			Expect: "get_state показывает idle -> processing в песочнице Pi",
+			TokenEnv: wakePiTokenEnv, Event: "pi.state.changed",
+			File: "wake/pi-state.json",
+			Contains: []string{"\"before\":\"idle\"", "\"after\":\"processing\""},
+		},
+		{
+			ID: "W06", Name: "pi_followup_default_queue",
+			Expect: "доставка по умолчанию queue через followUp",
+			TokenEnv: wakePiTokenEnv,
+			File: "wake/pi-delivery.json",
+			Contains: []string{"\"command\":\"followUp\"", "\"delivery\":\"queue\""},
+		},
+		{
+			ID: "W07", Name: "pi_guard_does_not_block_rpc",
+			Expect: "guard extension присутствует, RPC-доставка всё равно прошла, steer отделён от followUp",
+			TokenEnv: wakePiTokenEnv,
+			File: "wake/pi-guard.json",
+			Contains: []string{"\"guardPresent\":true", "\"delivered\":true", "\"steer\":\"distinct\""},
+		},
+		{
+			ID: "W08", Name: "kilo_local_queue_not_steer",
+			Expect: "непроверенный локальный адаптер возвращает queue, а не steer",
+			File: "wake/kilo-local.json",
+			Contains: []string{"\"delivery\":\"queue\""},
+			Absent: []string{"\"delivery\":\"steer\""},
+		},
+		{
+			ID: "W09", Name: "kilo_cloud_ttl",
+			Expect: "облачное сообщение ограничено 15 минутами, успех не имитируется",
+			File: "wake/kilo-cloud.json",
+			Contains: []string{"\"ttlMinutes\":15"},
+			Absent: []string{"\"fakeSuccess\":true"},
+		},
+		{
+			ID: "W10", Name: "cursor_steer_body_whitelist",
+			Expect: "тело steer содержит только prompt и delivery",
+			TokenEnv: wakeCursorTokenEnv,
+			File: "wake/cursor-steer.json",
+			Contains: []string{"\"fields\":[\"prompt\",\"delivery\"]"},
+		},
+		{
+			ID: "W11", Name: "cursor_webhook_raw_signature",
+			Expect: "подпись проверена на сыром теле каждой доставки",
+			TokenEnv: wakeCursorTokenEnv, Check: wakeCheckCursorSignature,
+		},
+		{
+			ID: "W12", Name: "cursor_agent_busy_no_wake",
+			Expect: "409 agent_busy не будит, в квитанции указана причина",
+			TokenEnv: wakeCursorTokenEnv,
+			File: "wake/cursor-busy.json",
+			Contains: []string{"\"status\":\"agent_busy\"", "\"wakeHappened\":false"},
+		},
+		{
+			ID: "W13", Name: "cursor_repeat_and_sse_expiry",
+			Expect: "повтор deliveryId не создаёт второй wake, 410 обработан пересписком",
+			TokenEnv: wakeCursorTokenEnv, Check: wakeCheckCursorRepeat,
+		},
+	}
+}
+
+func runWakeEvalSet(ctx context.Context, o wakeObserver) []evalResult {
+	scenarios := wakeScenarios()
+	results := make([]evalResult, 0, len(scenarios))
+	for _, s := range scenarios {
+		actual, pass := runWakeScenario(ctx, o, s)
+		results = append(results, evalResult{
+			name:     "wake/" + s.ID + "_" + s.Name,
+			expected: s.Expect,
+			actual:   actual,
+			pass:     pass,
+		})
+	}
+	return results
+}
+
+func runWakeScenario(ctx context.Context, o wakeObserver, s wakeScenario) (string, bool) {
+	if o == nil {
+		return "нет наблюдателя", false
+	}
+	if s.TokenEnv != "" && os.Getenv(s.TokenEnv) == "" {
+		return "нет токена " + s.TokenEnv + ": канал не проверен", false
+	}
+	if s.Check != nil {
+		return s.Check(ctx, o)
+	}
+
+	events, err := o.Events(ctx)
+	if err != nil {
+		return "events: " + err.Error(), false
+	}
+	matched := 0
+	for _, ev := range events {
+		if ev.Type != s.Event {
+			continue
+		}
+		if s.SessionID != "" && ev.SessionID != s.SessionID {
+			continue
+		}
+		matched++
+	}
+
+	file := ""
+	if s.File != "" {
+		raw, err := o.StateFile(ctx, s.File)
+		if err != nil {
+			return "file " + s.File + ": " + err.Error(), false
+		}
+		file = string(raw)
+	}
+	containsOK := true
+	for _, want := range s.Contains {
+		if !strings.Contains(file, want) {
+			containsOK = false
+		}
+	}
+	absentFound := false
+	for _, bad := range s.Absent {
+		if strings.Contains(file, bad) {
+			absentFound = true
+		}
+	}
+	pass := containsOK && !absentFound
+	if s.Negative {
+		pass = pass && matched == 0
+	} else if s.Event != "" {
+		pass = pass && matched > 0
+	}
+	return fmt.Sprintf("events=%d, matched=%d, file=%s, contains=%t, absent=%t",
+		len(events), matched, orNone(clip(strings.TrimSpace(file), 120)), containsOK, absentFound), pass
+}
+
+func wakeCheckCursorSignature(ctx context.Context, o wakeObserver) (string, bool) {
+	secret := os.Getenv("CURSOR_WEBHOOK_SECRET")
+	if secret == "" {
+		return "нет CURSOR_WEBHOOK_SECRET: подпись не проверена", false
+	}
+	deliveries, err := o.Webhooks(ctx)
+	if err != nil {
+		return "webhooks: " + err.Error(), false
+	}
+	valid := 0
+	for _, d := range deliveries {
+		mac := hmac.New(sha256.New, []byte(secret))
+		_, _ = mac.Write([]byte(d.Raw))
+		if hmac.Equal([]byte(hex.EncodeToString(mac.Sum(nil))), []byte(d.Signature)) {
+			valid++
+		}
+	}
+	return fmt.Sprintf("deliveries=%d, validSignatures=%d", len(deliveries), valid),
+		len(deliveries) > 0 && valid == len(deliveries)
+}
+
+func wakeCheckCursorRepeat(ctx context.Context, o wakeObserver) (string, bool) {
+	deliveries, err := o.Webhooks(ctx)
+	if err != nil {
+		return "webhooks: " + err.Error(), false
+	}
+	byID := make(map[string]int)
+	for _, d := range deliveries {
+		if d.DeliveryID != "" {
+			byID[d.DeliveryID]++
+		}
+	}
+	repeated := 0
+	for _, n := range byID {
+		if n > 1 {
+			repeated++
+		}
+	}
+	raw, err := o.StateFile(ctx, "wake/cursor-repeat.json")
+	if err != nil {
+		return "file wake/cursor-repeat.json: " + err.Error(), false
+	}
+	text := string(raw)
+	oneWake := strings.Contains(text, "\"wakeCount\":1")
+	relist := strings.Contains(text, "\"sseHandled\":\"relist\"")
+	return fmt.Sprintf("deliveries=%d, repeatedIDs=%d, oneWake=%t, relist=%t",
+		len(deliveries), repeated, oneWake, relist), repeated > 0 && oneWake && relist
 }

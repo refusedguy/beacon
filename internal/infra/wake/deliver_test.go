@@ -5,6 +5,10 @@ package wake
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2896,4 +2900,392 @@ func TestT215SteerQueueAndResumeFalse(t *testing.T) {
 }
 
 func boolPtr(v bool) *bool { return &v }
+// ===== T3.216 =====
+
+func TestT216MitigationMatchesMeasuredEvidenceT216(t *testing.T) {
+	m := T216ChosenMitigation()
+	e := T216MeasuredLocationEvidence()
+	if !m.Verified(e) {
+		t.Fatal("documented mitigation is not supported by the measured spike")
+	}
+	if (T216Mitigation{}).Verified(e) {
+		t.Fatal("a mitigation without the idle-timeout fix must not be verified")
+	}
+	if e.DefaultSurvived <= e.DefaultTimeout || e.DisabledSurvived <= e.DefaultSurvived {
+		t.Fatalf("unexpected evidence: %+v", e)
+	}
+}
+
+func TestT216BridgeSubscribesBeforePromptT216(t *testing.T) {
+	var order []string
+	var got T216Prompt
+	b := &T216Bridge{
+		Subscribe: func(_ context.Context, eventType string) error {
+			order = append(order, "subscribe:"+eventType)
+			return nil
+		},
+		Prompt: func(_ context.Context, p T216Prompt) error {
+			order = append(order, "prompt")
+			got = p
+			return nil
+		},
+	}
+	p := domain.WakePayload{WatchID: "watch-1", ObligationID: "obl-1", Revision: 3, Verdict: "ready"}
+	if err := b.Deliver(context.Background(), "ses_1", p); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if len(order) != 2 || order[0] != "subscribe:"+T216ExecutionStarted || order[1] != "prompt" {
+		t.Fatalf("order = %q, want subscribe then prompt", order)
+	}
+	if got.SessionID != "ses_1" || got.Delivery != "steer" || got.Text != Envelope(p) {
+		t.Fatalf("prompt = %+v", got)
+	}
+
+	failed := &T216Bridge{
+		Subscribe: func(context.Context, string) error { return errors.New("no subscribe") },
+		Prompt:    func(context.Context, T216Prompt) error { t.Fatal("prompt must not run"); return nil },
+	}
+	if err := failed.Deliver(context.Background(), "ses_1", p); err == nil {
+		t.Fatal("subscribe failure must stop delivery")
+	}
+}
+
+func TestT216PollObserverRegistersWatchAndSeesWakeT216(t *testing.T) {
+	var route, path string
+	data := []byte(`{"type":"` + T216FilesystemChanged + `"}
+{"type":"` + T216ExecutionStarted + `","sessionID":"ses_1"}
+{"type":"other.event"}`)
+	o := &T216PollObserver{
+		Read: func(_ context.Context, from int64) ([]byte, int64, error) {
+			if from != 0 {
+				return nil, from, nil
+			}
+			return data, int64(len(data)), nil
+		},
+		RegisterWatch: func(_ context.Context, r, p string) error { route, path = r, p; return nil },
+	}
+	if err := o.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if route != T216FSWatchRoute || path != T216EventsPath {
+		t.Fatalf("registered %q %q", route, path)
+	}
+	n, err := o.Poll(context.Background())
+	if err != nil || n != 1 {
+		t.Fatalf("Poll = %d, %v; want 1 wake", n, err)
+	}
+	n, err = o.Poll(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("second Poll = %d, %v; want 0", n, err)
+	}
+	wakes, registered := o.Observations()
+	if wakes != 1 || !registered {
+		t.Fatalf("observations = %d, %t", wakes, registered)
+	}
+}
+
+// ===== T3.217 =====
+
+func TestT217DeliverDefaultsToQueueFollowUpT217(t *testing.T) {
+	var calls []T217Call
+	state := T217StateIdle
+	d := &T217Deliverer{
+		Mode:           T217ModeRPC,
+		RPCActive:      true,
+		GuardExtension: true,
+		Transport: func(_ context.Context, call T217Call) (string, error) {
+			calls = append(calls, call)
+			if call.Command == T217CmdFollowUp {
+				state = T217StateProcessing
+			}
+			return state, nil
+		},
+	}
+	report, err := d.DeliverWithReport(context.Background(), "ses_1", domain.WakePayload{WatchID: "w"}, T217CmdFollowUp, T217DeliveryQueue)
+	if err != nil {
+		t.Fatalf("DeliverWithReport: %v", err)
+	}
+	if report.Command != T217CmdFollowUp || report.Delivery != T217DeliveryQueue || !report.WakeObserved || !report.GuardPresent {
+		t.Fatalf("report = %+v", report)
+	}
+	if len(calls) != 3 || calls[0].Command != T217CmdGetState || calls[1].Command != T217CmdFollowUp || calls[2].Command != T217CmdGetState {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if err := d.Deliver(context.Background(), "ses_1", domain.WakePayload{}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+}
+
+func TestT217SteerDistinctAndNoRPCT217(t *testing.T) {
+	d := &T217Deliverer{
+		Mode:      T217ModeJSON,
+		RPCActive: true,
+		Transport: func(context.Context, T217Call) (string, error) { return T217StateProcessing, nil },
+	}
+	report, err := d.DeliverSteer(context.Background(), "ses_1", domain.WakePayload{})
+	if err != nil {
+		t.Fatalf("DeliverSteer: %v", err)
+	}
+	if report.Command != T217CmdSteer || report.Delivery != T217DeliverySteer {
+		t.Fatalf("steer report = %+v", report)
+	}
+
+	idle := &T217Deliverer{RPCActive: true, Transport: func(context.Context, T217Call) (string, error) { return T217StateIdle, nil }}
+	if report, err := idle.DeliverSteer(context.Background(), "ses_1", domain.WakePayload{}); err != nil || report.WakeObserved {
+		t.Fatalf("idle after steer = %+v, %v", report, err)
+	}
+	offline := &T217Deliverer{Transport: func(context.Context, T217Call) (string, error) { return "", nil }}
+	if err := offline.Deliver(context.Background(), "ses_1", domain.WakePayload{}); !errors.Is(err, T217ErrNoRPCProcess) {
+		t.Fatalf("offline Deliver = %v", err)
+	}
+	if !T217JSONLEvidence(4, 5) || T217JSONLEvidence(5, 5) {
+		t.Fatal("JSONL evidence must require growth")
+	}
+}
+
+// ===== T3.218 =====
+
+func TestT218UnverifiedLocalParksQueueT218(t *testing.T) {
+	called := false
+	a := &T218Adapter{
+		Mode: T218ModeACP,
+		Send: func(context.Context, T218Request) (T218Status, error) { called = true; return T218Posted, nil },
+	}
+	res, err := a.DeliverWithResult(context.Background(), "ses_1", domain.WakePayload{})
+	if err != nil || res.Status != T218Queue {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	if called {
+		t.Fatal("unverified kilo route must not call a transport")
+	}
+	if err := a.Deliver(context.Background(), "ses_1", domain.WakePayload{}); err != nil {
+		t.Fatalf("queue is an honest outcome, not an error: %v", err)
+	}
+}
+
+func TestT218CloudUnsupportedAndTTLimitsT218(t *testing.T) {
+	a := &T218Adapter{Mode: T218ModeCloud}
+	if err := a.Deliver(context.Background(), "ses_1", domain.WakePayload{}); !errors.Is(err, ErrUnsupported) {
+		t.Fatalf("unverified cloud = %v, want ErrUnsupported", err)
+	}
+
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	verified := &T218Adapter{
+		Mode:     T218ModeCloud,
+		Verified: true,
+		Now:      func() time.Time { return now },
+		Send:     func(context.Context, T218Request) (T218Status, error) { return T218Posted, nil },
+	}
+	res, err := verified.DeliverWithResult(context.Background(), "ses_1", domain.WakePayload{})
+	if err != nil || res.Status != T218Posted {
+		t.Fatalf("fresh cloud = %+v, %v", res, err)
+	}
+	old := &T218Adapter{
+		Mode:      T218ModeCloud,
+		Verified:  true,
+		Now:       func() time.Time { return now.Add(T218CloudMessageTTL + time.Minute) },
+		MessageAt: now,
+		Send:      func(context.Context, T218Request) (T218Status, error) { return T218Posted, nil },
+	}
+	res, err = old.DeliverWithResult(context.Background(), "ses_1", domain.WakePayload{})
+	if err != nil || res.Status != T218Unsupported {
+		t.Fatalf("stale cloud = %+v, %v", res, err)
+	}
+}
+
+// ===== T3.219 =====
+
+type t219doer func(*http.Request) (*http.Response, error)
+
+func (f t219doer) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+func t219response(code int) *http.Response {
+	return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader("{}"))}
+}
+
+func TestT219SteerBodyWhitelistsFieldsT219(t *testing.T) {
+	raw, err := T219SteerBody(domain.WakePayload{WatchID: "w", ObligationID: "o", Revision: 1})
+	if err != nil {
+		t.Fatalf("T219SteerBody: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(fields) != 2 || fields["delivery"] != T219DeliverySteer || !strings.Contains(fields["prompt"].(string), "<beacon-event>") {
+		t.Fatalf("body = %s", raw)
+	}
+}
+
+func TestT219BusyWithoutWakeT219(t *testing.T) {
+	d := &T219Deliverer{
+		AgentID: "agent-1",
+		BaseURL: "https://example.test",
+		Doer: t219doer(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/v1/agents/agent-1/runs" || r.Header.Get(T219HeaderWebhookID) == "" {
+				t.Errorf("bad request: %s %q", r.URL.Path, r.Header.Get(T219HeaderWebhookID))
+			}
+			return t219response(T219StatusBusy), nil
+		}),
+	}
+	res, err := d.Steer(context.Background(), domain.WakePayload{ObligationID: "obl-1"})
+	if err != nil || res.Status != T219Busy || res.WakeHappened || res.ReceiptReason == "" {
+		t.Fatalf("busy = %+v, %v", res, err)
+	}
+	if err := d.Deliver(context.Background(), "ses_1", domain.WakePayload{ObligationID: "obl-1"}); err == nil {
+		t.Fatal("agent_busy must not be reported as a delivered wake")
+	}
+}
+
+func TestT219IndeterminateOnNetworkErrorT219(t *testing.T) {
+	d := &T219Deliverer{
+		AgentID: "agent-1",
+		Doer: t219doer(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("dial failed")
+		}),
+	}
+	res, err := d.Steer(context.Background(), domain.WakePayload{ObligationID: "obl-1"})
+	if err != nil || res.Status != T219Indeterminate || res.DeliveryID != "obl-1" || res.WakeHappened {
+		t.Fatalf("network error = %+v, %v", res, err)
+	}
+	gone := &T219Deliverer{
+		AgentID: "agent-1",
+		Doer:    t219doer(func(*http.Request) (*http.Response, error) { return t219response(T219StatusGone), nil }),
+	}
+	res, err = gone.Steer(context.Background(), domain.WakePayload{ObligationID: "obl-2"})
+	if err != nil || res.Status != T219Gone || res.WakeHappened {
+		t.Fatalf("stream expired = %+v, %v", res, err)
+	}
+}
+
+func TestT219VerifyWebhookAndRepeatT219(t *testing.T) {
+	raw := []byte(`{"deliveryId":"d1","type":"message.received"}`)
+	mac := hmac.New(sha256.New, []byte("secret"))
+	_, _ = mac.Write(raw)
+	sig := hex.EncodeToString(mac.Sum(nil))
+	if !T219VerifyWebhook("secret", raw, sig) {
+		t.Fatal("valid raw-body signature rejected")
+	}
+	if T219VerifyWebhook("secret", append(raw, ' '), sig) || T219VerifyWebhook("other", raw, sig) {
+		t.Fatal("signature must cover the exact bytes and the right secret")
+	}
+	if !T219IsRepeat([]string{"d0", "d1"}, "d1") || T219IsRepeat([]string{"d0"}, "d1") {
+		t.Fatal("repeat detection failed")
+	}
+}
+
+// ===== T3.220 =====
+
+func TestT220LedgerStoresAllOutcomesIdempotentlyT220(t *testing.T) {
+	l := T220NewLedger()
+	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	rows := []T220Receipt{
+		{ObligationID: "obl-1", Attempt: 1, Outcome: T220Steer, At: base},
+		{ObligationID: "obl-2", Attempt: 1, Outcome: T220Queue, At: base},
+		{ObligationID: "obl-3", Attempt: 1, Outcome: T220Unsupported, At: base},
+		{ObligationID: "obl-4", Attempt: 1, Outcome: T220TransportFailed, At: base},
+	}
+	for _, r := range rows {
+		if err := l.Import(r); err != nil {
+			t.Fatalf("Import %s: %v", r.Outcome, err)
+		}
+	}
+	if err := l.Import(rows[0]); err != nil {
+		t.Fatalf("repeat Import: %v", err)
+	}
+	if len(l.All()) != 4 {
+		t.Fatalf("stored %d receipts, want 4", len(l.All()))
+	}
+	if err := l.Import(T220Receipt{Attempt: 1}); !errors.Is(err, T220ErrBadReceipt) {
+		t.Fatalf("bad receipt = %v", err)
+	}
+}
+
+func TestT220RetryOnlyTransportFailedT220(t *testing.T) {
+	l := T220NewLedger()
+	t0 := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	p := domain.WakePayload{WatchID: "w", ObligationID: "obl-1", Revision: 2}
+	if err := l.Import(T220Receipt{ObligationID: "obl-1", Attempt: 1, Outcome: T220TransportFailed, Pointer: p, At: t0}); err != nil {
+		t.Fatal(err)
+	}
+	retry, ok := l.RetryAt("obl-1", t0.Add(T220RetryFirst))
+	if !ok || retry.Delay != T220RetryFirst || retry.Attempt != 2 || retry.Pointer != p {
+		t.Fatalf("first retry = %+v, %t", retry, ok)
+	}
+	if _, ok := l.RetryAt("obl-1", t0.Add(T220EvidenceWindow+time.Second)); ok {
+		t.Fatal("retry after the 15-minute window must stop")
+	}
+
+	terminal := T220NewLedger()
+	_ = terminal.Import(T220Receipt{ObligationID: "obl-2", Attempt: 1, Outcome: T220Posted, At: t0})
+	_ = terminal.Import(T220Receipt{ObligationID: "obl-3", Attempt: 1, Outcome: T220Indeterminate, At: t0})
+	for _, id := range []string{"obl-2", "obl-3"} {
+		if _, ok := terminal.RetryAt(id, t0.Add(time.Minute)); ok {
+			t.Fatalf("%s must not be retried", id)
+		}
+	}
+
+	third := T220NewLedger()
+	_ = third.Import(T220Receipt{ObligationID: "obl-4", Attempt: 2, Outcome: T220TransportFailed, At: t0})
+	retry, ok = third.RetryAt("obl-4", t0.Add(T220RetrySecond))
+	if !ok || retry.Delay != T220RetrySecond || retry.Attempt != 3 {
+		t.Fatalf("second retry = %+v, %t", retry, ok)
+	}
+	_ = third.Import(T220Receipt{ObligationID: "obl-4", Attempt: 3, Outcome: T220TransportFailed, At: t0.Add(T220RetrySecond)})
+	if _, ok := third.RetryAt("obl-4", t0.Add(time.Hour)); ok {
+		t.Fatal("three attempts is the cap")
+	}
+}
+
+func TestT220SignalsDoNotReplaceObligationStatesT220(t *testing.T) {
+	e := T220Evidence{}
+	var err error
+	for _, step := range []T220Step{T220StepReceipt, T220StepAck, T220StepGetResult} {
+		e, err = T220Advance(e, step)
+		if err != nil {
+			t.Fatalf("Advance %s: %v", step, err)
+		}
+	}
+	if !e.DeliveredByReceipt || !e.ClaimedByAck || !e.ReadByGetResult {
+		t.Fatalf("evidence = %+v", e)
+	}
+	for _, step := range []T220Step{T220StepExecutionStarted, T220StepNudgeDelivered} {
+		if _, err := T220Advance(e, step); !errors.Is(err, T220ErrSignalIsNotState) {
+			t.Fatalf("Advance %s = %v, want signal error", step, err)
+		}
+	}
+}
+
+type t220fakeResult struct{ affected int64 }
+
+func (r t220fakeResult) LastInsertId() (int64, error) { return 0, nil }
+func (r t220fakeResult) RowsAffected() (int64, error) { return r.affected, nil }
+
+type t220fakeSink struct {
+	queries []string
+	rows    int64
+}
+
+func (s *t220fakeSink) ExecContext(_ context.Context, query string, _ ...any) (sql.Result, error) {
+	s.queries = append(s.queries, query)
+	return t220fakeResult{affected: s.rows}, nil
+}
+
+func TestT220ImportSQLiteIsInsertOrIgnoreT220(t *testing.T) {
+	if !strings.Contains(T220CreateReceiptsSQL, "UNIQUE (obligation_id, attempt)") ||
+		!strings.Contains(T220InsertReceiptSQL, "INSERT OR IGNORE") {
+		t.Fatal("SQLite schema must deduplicate by obligation and attempt")
+	}
+	sink := &t220fakeSink{rows: 1}
+	rows := []T220Receipt{{ObligationID: "obl-1", Attempt: 1, Outcome: T220Steer, At: time.Now()}}
+	n, err := T220ImportSQLite(context.Background(), sink, rows)
+	if err != nil || n != 1 || len(sink.queries) != 1 {
+		t.Fatalf("import = %d, %v, queries %d", n, err, len(sink.queries))
+	}
+	sink.rows = 0
+	n, err = T220ImportSQLite(context.Background(), sink, rows)
+	if err != nil || n != 0 {
+		t.Fatalf("re-import = %d, %v, want no new rows", n, err)
+	}
+}
 

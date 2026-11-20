@@ -228,6 +228,50 @@ subprocess через `CommandTransport`, временный XDG-каталог 
 через `go:embed`, поэтому бинарник `tools/beacon-gates/beacon-gates`
 пересобран теми же флагами, что использует workflow `gates-binary.yml`.
 
+## Набор evals/wake для W01-W13 (T3.221)
+
+Контрактные eval 01-15 проверяют протокол и состояние. Они не доказывают, что
+агент продолжил работу по указателю. Для этого в `evals/main.go` есть отдельный
+набор из 13 сценариев `W01-W13`. Он не меняет счётчик базовых кейсов и не
+запускается по умолчанию. Включение:
+
+```bash
+BEACON_WAKE_EVAL=1 \
+BEACON_WAKE_EVENT_URL=http://127.0.0.1:4096 \
+BEACON_WAKE_STATE_DIR=/path/to/state \
+BEACON_WAKE_WEBHOOKS=/path/to/webhooks.jsonl \
+PI_SANDBOX_TOKEN=... CURSOR_SANDBOX_TOKEN=... CURSOR_WEBHOOK_SECRET=... \
+bash evals/run.sh
+```
+
+Наблюдатель читает только внешние артефакты: `GET /api/event`, файлы каталога
+состояния `wake/*.json` и журнал сырых webhook-доставок. Внутренние массивы
+тестового фейка не читаются. Подпись Cursor проверяется на сыром теле, до
+разбора JSON. Если механизма пробуждения нет, сценарий красный: ожидается
+событие `session.execution.started` или запись в файле состояния, а не `ok`
+от функции.
+
+| Сценарий | Наблюдаемое доказательство |
+| --- | --- |
+| `W01` | OpenCode: prompt `steer` с обёрткой и `session.execution.started` |
+| `W02` | Негативный контроль: без доставки нет события и квитанции wake |
+| `W03` | `location_idle_timeout=false`, плагин жив дольше 3m39s |
+| `W04` | Файл событий зарегистрирован через `POST /api/experimental/fs/watch` |
+| `W05` | Pi: `get_state` показывает `idle` → `processing` |
+| `W06` | Pi: доставка по умолчанию `queue` через `followUp` |
+| `W07` | Pi: guard extension не блокирует RPC, `steer` отделён от `followUp` |
+| `W08` | Kilo локальный: непроверенный маршрут возвращает `queue`, не `steer` |
+| `W09` | Kilo облако: лимит 15 минут, успех не имитируется |
+| `W10` | Cursor: тело `steer` содержит только `prompt` и `delivery` |
+| `W11` | Cursor: подпись проверена на сыром теле каждой доставки |
+| `W12` | Cursor: `409 agent_busy` не будит, причина есть в квитанции |
+| `W13` | Cursor: повтор `deliveryId` не создаёт второй wake, `410` обработан пересписком |
+
+Для Pi и Cursor нужны отдельные песочные окружения с токенами. Без
+`PI_SANDBOX_TOKEN` и `CURSOR_SANDBOX_TOKEN` сценарии `W05-W07` и `W10-W13`
+остаются красными с явной причиной, а не зелёными по умолчанию. Для `W11`
+дополнительно нужен `CURSOR_WEBHOOK_SECRET`.
+
 ## Ограничения честно
 
 Эти evals проверяют реальные обработчики, реальный SQLite-store и реальный

@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -3058,5 +3060,732 @@ func T215classify(events []T215Event, sessionID, delivery string, resumeFalse bo
 		return T210Queued
 	}
 	return T210Enqueued
+}
+
+// ===== T3.216 плагин OpenCode и живучесть локации (ADR 0065) =====
+// The plugin is one JS file, .opencode/plugins/beacon-bridge.js, and loads
+// without package.json. Go owns the contract the plugin is held to: subscribe
+// to session.execution.started, prompt with the whitelisted envelope, and treat
+// the unload of a parked location as a fact to mitigate, not as a verdict.
+
+const (
+	T216PluginPath        = ".opencode/plugins/beacon-bridge.js"
+	T216EventsPath        = ".opencode/events.jsonl"
+	T216PollInterval      = 2 * time.Second
+	T216ExecutionStarted  = "session.execution.started"
+	T216FilesystemChanged = "filesystem.changed"
+	T216FSWatchRoute      = "/api/experimental/fs/watch"
+)
+
+// T216LocationEvidence are the two measured facts of the spike. With the
+// default two-minute idle timeout the plugin was unloaded at about 2m47s;
+// with location_idle_timeout false it was still live past 3m39s.
+type T216LocationEvidence struct {
+	DefaultTimeout   time.Duration
+	DefaultSurvived  time.Duration
+	DisabledSurvived time.Duration
+}
+
+func T216MeasuredLocationEvidence() T216LocationEvidence {
+	return T216LocationEvidence{
+		DefaultTimeout:   2 * time.Minute,
+		DefaultSurvived:  2*time.Minute + 47*time.Second,
+		DisabledSurvived: 3*time.Minute + 39*time.Second,
+	}
+}
+
+// T216Mitigation is the documented answer to the unload. The alarm lives
+// outside OpenCode because a timer inside a parked location dies with it.
+type T216Mitigation struct {
+	LocationIdleTimeoutDisabled bool
+	ExternalKeepalive           bool
+	ExternalAlarm               bool
+}
+
+func T216ChosenMitigation() T216Mitigation {
+	return T216Mitigation{
+		LocationIdleTimeoutDisabled: true,
+		ExternalKeepalive:           true,
+		ExternalAlarm:               true,
+	}
+}
+
+// Verified reports whether the measured facts support the chosen mitigation.
+func (m T216Mitigation) Verified(e T216LocationEvidence) bool {
+	return m.LocationIdleTimeoutDisabled &&
+		e.DefaultSurvived > e.DefaultTimeout &&
+		e.DisabledSurvived > e.DefaultSurvived
+}
+
+// T216EventLine is one whole line of events.jsonl. Unknown fields are ignored:
+// a foreign line is never a wake.
+type T216EventLine struct {
+	Type      string `json:"type"`
+	SessionID string `json:"sessionID,omitempty"`
+}
+
+// T216ReadEvents returns new bytes from a byte offset and the next offset. It
+// is injected so the polling loop is testable without a live file.
+type T216ReadEvents func(ctx context.Context, from int64) ([]byte, int64, error)
+
+// T216PollObserver polls events.jsonl every two seconds. filesystem.changed
+// does not arrive on its own, so Start registers the file with the host first.
+type T216PollObserver struct {
+	Read          T216ReadEvents
+	RegisterWatch func(ctx context.Context, route, path string) error
+	OnEvent       func(ctx context.Context, ev T216EventLine)
+
+	mu         sync.Mutex
+	offset     int64
+	registered bool
+	wakes      int
+}
+
+func (o *T216PollObserver) Start(ctx context.Context) error {
+	if o == nil || o.Read == nil || o.RegisterWatch == nil {
+		return errors.New("wake: t216 observer needs a reader and a watch registrar")
+	}
+	if err := o.RegisterWatch(ctx, T216FSWatchRoute, T216EventsPath); err != nil {
+		return fmt.Errorf("wake: register fs watch: %w", err)
+	}
+	o.mu.Lock()
+	o.registered = true
+	o.mu.Unlock()
+	return nil
+}
+
+// Poll reads one batch and returns the number of session.execution.started
+// events in it. The reader owns partial-line handling between batches.
+func (o *T216PollObserver) Poll(ctx context.Context) (int, error) {
+	if o == nil || o.Read == nil {
+		return 0, errors.New("wake: t216 observer has no reader")
+	}
+	o.mu.Lock()
+	from := o.offset
+	o.mu.Unlock()
+
+	data, next, err := o.Read(ctx, from)
+	if err != nil {
+		return 0, fmt.Errorf("wake: poll events: %w", err)
+	}
+	found := 0
+	for _, line := range bytes.Split(data, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var ev T216EventLine
+		if err := json.Unmarshal(line, &ev); err != nil {
+			continue
+		}
+		if ev.Type == T216ExecutionStarted {
+			found++
+		}
+		if o.OnEvent != nil {
+			o.OnEvent(ctx, ev)
+		}
+	}
+	o.mu.Lock()
+	o.offset = next
+	o.wakes += found
+	o.mu.Unlock()
+	return found, nil
+}
+
+// Observations reports the wake count and whether the fs watch was registered.
+func (o *T216PollObserver) Observations() (wakes int, registered bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.wakes, o.registered
+}
+
+// T216Prompt is what ctx.session.prompt receives. Delivery is explicit so the
+// plugin never has to guess steer from the text.
+type T216Prompt struct {
+	SessionID string
+	Text      string
+	Delivery  string
+}
+
+// T216Bridge is the Go side of the plugin contract. The host supplies
+// ctx.event.subscribe and ctx.session.prompt. Subscription happens before the
+// prompt so the wake fact cannot be missed.
+type T216Bridge struct {
+	Subscribe func(ctx context.Context, eventType string) error
+	Prompt    func(ctx context.Context, p T216Prompt) error
+}
+
+var _ domain.WakeDeliverer = (*T216Bridge)(nil)
+
+func (b *T216Bridge) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	if b == nil || b.Subscribe == nil || b.Prompt == nil {
+		return errors.New("wake: t216 bridge needs subscribe and prompt callbacks")
+	}
+	if sessionID == "" {
+		return errors.New("wake: t216 bridge needs a session id")
+	}
+	if err := b.Subscribe(ctx, T216ExecutionStarted); err != nil {
+		return fmt.Errorf("wake: subscribe execution started: %w", err)
+	}
+	return b.Prompt(ctx, T216Prompt{SessionID: sessionID, Text: Envelope(p), Delivery: "steer"})
+}
+
+// ===== T3.217 адаптер Pi RPC (ADR 0065) =====
+// Pi has no proven live wake in our reports: RPC connect() is still unwired in
+// Overstory. This adapter is honest about that. It needs an active rpc/json/sdk
+// process and proves a wake with idle -> processing from get_state.
+
+const (
+	T217ModeRPC  = "rpc"
+	T217ModeJSON = "json"
+	T217ModeSDK  = "sdk"
+
+	T217StateIdle       = "idle"
+	T217StateProcessing = "processing"
+
+	T217DeliverySteer = "steer"
+	T217DeliveryQueue = "queue"
+)
+
+var (
+	T217ErrNoRPCProcess = errors.New("wake: pi rpc process is not active")
+	T217ErrNoGetState   = errors.New("wake: pi get_state is unavailable")
+)
+
+// T217Command is one RPC command. prompt, steer, followUp and abort write;
+// get_state and waitForIdle observe. followUp starts the next run, steer joins
+// the current one after the tool round.
+type T217Command string
+
+const (
+	T217CmdPrompt      T217Command = "prompt"
+	T217CmdSteer       T217Command = "steer"
+	T217CmdFollowUp    T217Command = "followUp"
+	T217CmdAbort       T217Command = "abort"
+	T217CmdGetState    T217Command = "get_state"
+	T217CmdWaitForIdle T217Command = "waitForIdle"
+)
+
+type T217Call struct {
+	Command   T217Command
+	SessionID string
+	Text      string
+}
+
+// T217Transport executes one command and returns the state when the command
+// has one (get_state), otherwise an empty string.
+type T217Transport func(ctx context.Context, call T217Call) (string, error)
+
+type T217Deliverer struct {
+	Mode           string
+	RPCActive      bool
+	GuardExtension bool
+	Transport      T217Transport
+}
+
+// T217Report keeps steer and followUp distinct. GuardPresent is reported, not
+// enforced: a guard extension must not block RPC delivery.
+type T217Report struct {
+	Command      T217Command
+	Delivery     string
+	StateBefore  string
+	StateAfter   string
+	WakeObserved bool
+	GuardPresent bool
+}
+
+var _ domain.WakeDeliverer = (*T217Deliverer)(nil)
+
+// Deliver uses the default queue via followUp. It never claims a live wake
+// that get_state did not confirm.
+func (d *T217Deliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	_, err := d.DeliverWithReport(ctx, sessionID, p, T217CmdFollowUp, T217DeliveryQueue)
+	return err
+}
+
+func (d *T217Deliverer) DeliverSteer(ctx context.Context, sessionID string, p domain.WakePayload) (T217Report, error) {
+	return d.DeliverWithReport(ctx, sessionID, p, T217CmdSteer, T217DeliverySteer)
+}
+
+func (d *T217Deliverer) DeliverWithReport(ctx context.Context, sessionID string, p domain.WakePayload, cmd T217Command, delivery string) (T217Report, error) {
+	if d == nil || !d.RPCActive || d.Transport == nil {
+		return T217Report{}, T217ErrNoRPCProcess
+	}
+	switch d.Mode {
+	case "", T217ModeRPC, T217ModeJSON, T217ModeSDK:
+	default:
+		return T217Report{}, fmt.Errorf("%w: mode %q", T217ErrNoRPCProcess, d.Mode)
+	}
+	before, err := d.Transport(ctx, T217Call{Command: T217CmdGetState, SessionID: sessionID})
+	if err != nil {
+		return T217Report{}, fmt.Errorf("%w: %v", T217ErrNoGetState, err)
+	}
+	if _, err := d.Transport(ctx, T217Call{Command: cmd, SessionID: sessionID, Text: Envelope(p)}); err != nil {
+		return T217Report{}, err
+	}
+	after, err := d.Transport(ctx, T217Call{Command: T217CmdGetState, SessionID: sessionID})
+	if err != nil {
+		return T217Report{}, fmt.Errorf("%w: after command: %v", T217ErrNoGetState, err)
+	}
+	return T217Report{
+		Command:      cmd,
+		Delivery:     delivery,
+		StateBefore:  before,
+		StateAfter:   after,
+		WakeObserved: T217Evidence(before, after),
+		GuardPresent: d.GuardExtension,
+	}, nil
+}
+
+// T217Evidence is the get_state proof of a wake. A JSONL observer can use
+// T217JSONLEvidence instead when a build cannot expose get_state.
+func T217Evidence(before, after string) bool {
+	return before == T217StateIdle && after == T217StateProcessing
+}
+
+func T217JSONLEvidence(before, after int64) bool {
+	return after > before
+}
+
+// ===== T3.218 адаптер Kilo локальный и облачный (ADR 0065) =====
+// The compatibility of kilo serve HTTP routes with OpenCode V2 is not proven.
+// Until it is, a local adapter parks with queue instead of pretending a steer
+// succeeded. A standalone kilo run is incompatible with --continue.
+
+const (
+	T218ModeACP   = "acp"
+	T218ModeServe = "serve"
+	T218ModeCloud = "cloud"
+
+	T218CloudMessageTTL  = 15 * time.Minute
+	T218IncompatibleFlag = "kilo run --continue"
+)
+
+type T218Status string
+
+const (
+	T218Queue       T218Status = "queue"
+	T218Unsupported T218Status = "unsupported"
+	T218Posted      T218Status = "posted"
+)
+
+type T218Request struct {
+	Mode      string
+	SessionID string
+	Text      string
+	At        time.Time
+}
+
+type T218Send func(ctx context.Context, req T218Request) (T218Status, error)
+
+type T218Adapter struct {
+	Mode     string
+	Verified bool
+	Send     T218Send
+	Now      func() time.Time
+	// MessageAt is when the outbound cloud message was created. Zero means
+	// "just now". A cloud message older than 15 minutes is not delivered.
+	MessageAt time.Time
+}
+
+type T218Result struct {
+	Status T218Status
+	Detail string
+}
+
+var _ domain.WakeDeliverer = (*T218Adapter)(nil)
+
+// Deliver reports unsupported as an error. Queue is returned as an honest
+// "parked" outcome, never as a fake delivery.
+func (a *T218Adapter) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	res, err := a.DeliverWithResult(ctx, sessionID, p)
+	if err != nil {
+		return err
+	}
+	if res.Status == T218Unsupported {
+		return fmt.Errorf("%w: kilo: %s", ErrUnsupported, res.Detail)
+	}
+	return nil
+}
+
+func (a *T218Adapter) DeliverWithResult(ctx context.Context, sessionID string, p domain.WakePayload) (T218Result, error) {
+	if a == nil {
+		return T218Result{}, fmt.Errorf("%w: kilo: no adapter", ErrUnsupported)
+	}
+	now := time.Now
+	if a.Now != nil {
+		now = a.Now
+	}
+	mode := a.Mode
+	if mode == "" {
+		mode = T218ModeACP
+	}
+	at := a.MessageAt
+	if at.IsZero() {
+		at = now()
+	}
+	req := T218Request{Mode: mode, SessionID: sessionID, Text: Envelope(p), At: at}
+
+	switch mode {
+	case T218ModeACP, T218ModeServe:
+		if !a.Verified || a.Send == nil {
+			return T218Result{Status: T218Queue, Detail: "kilo ACP/serve route is not verified; parked with queue, not steer"}, nil
+		}
+	case T218ModeCloud:
+		if !a.Verified || a.Send == nil {
+			return T218Result{Status: T218Unsupported, Detail: "kilo cloud send is not verified"}, nil
+		}
+		if now().Sub(req.At) > T218CloudMessageTTL {
+			return T218Result{Status: T218Unsupported, Detail: "kilo cloud message is older than 15 minutes"}, nil
+		}
+	default:
+		return T218Result{Status: T218Unsupported, Detail: "unknown kilo mode " + mode}, nil
+	}
+
+	status, err := a.Send(ctx, req)
+	if err != nil {
+		return T218Result{}, err
+	}
+	if status == T218Queue || status == T218Posted {
+		return T218Result{Status: status}, nil
+	}
+	return T218Result{Status: T218Unsupported, Detail: "kilo transport reported an unverified status " + string(status)}, nil
+}
+
+// ===== T3.219 адаптер Cursor cloud (ADR 0065) =====
+// A steer carries only prompt and delivery; every other field yields 400.
+// A follow-up on an active run yields 409 agent_busy, on a subagent 400. A
+// steer lost to a network error may still have reached the agent, so a retry
+// must reuse the deliveryId instead of starting a second run.
+
+const (
+	T219RunsPathFmt     = "/v1/agents/%s/runs"
+	T219DeliverySteer   = "steer"
+	T219StatusBusy      = 409
+	T219StatusGone      = 410
+	T219HeaderWebhookID = "X-Webhook-ID"
+)
+
+type T219Status string
+
+const (
+	T219Steered       T219Status = "steered"
+	T219Busy          T219Status = "agent_busy"
+	T219Indeterminate T219Status = "indeterminate"
+	T219Gone          T219Status = "stream_expired"
+)
+
+type T219Result struct {
+	Status        T219Status
+	DeliveryID    string
+	ReceiptReason string
+	WakeHappened  bool
+}
+
+type T219Doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+type T219Deliverer struct {
+	AgentID string
+	BaseURL string
+	Doer    T219Doer
+}
+
+var _ domain.WakeDeliverer = (*T219Deliverer)(nil)
+
+// T219SteerBody whitelists the two fields the endpoint accepts.
+func T219SteerBody(p domain.WakePayload) ([]byte, error) {
+	return json.Marshal(map[string]string{
+		"prompt":   Envelope(p),
+		"delivery": T219DeliverySteer,
+	})
+}
+
+func (d *T219Deliverer) Steer(ctx context.Context, p domain.WakePayload) (T219Result, error) {
+	if d == nil || d.AgentID == "" || d.Doer == nil {
+		return T219Result{}, errors.New("wake: cursor deliverer needs an agent id and a doer")
+	}
+	body, err := T219SteerBody(p)
+	if err != nil {
+		return T219Result{}, err
+	}
+	target := strings.TrimRight(d.BaseURL, "/") + fmt.Sprintf(T219RunsPathFmt, d.AgentID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return T219Result{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(T219HeaderWebhookID, p.ObligationID)
+
+	resp, err := d.Doer.Do(req)
+	if err != nil {
+		return T219Result{
+			Status:        T219Indeterminate,
+			DeliveryID:    p.ObligationID,
+			ReceiptReason: "network error: the prompt may have arrived; retry only with the same deliveryId",
+		}, nil
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted:
+		return T219Result{Status: T219Steered, DeliveryID: p.ObligationID, WakeHappened: true}, nil
+	case T219StatusBusy:
+		return T219Result{Status: T219Busy, DeliveryID: p.ObligationID, ReceiptReason: "409 agent_busy: no wake, the active run keeps the turn"}, nil
+	case T219StatusGone:
+		return T219Result{Status: T219Gone, DeliveryID: p.ObligationID, ReceiptReason: "410 stream_expired: re-list the state, do not claim delivery"}, nil
+	default:
+		return T219Result{Status: T219Indeterminate, DeliveryID: p.ObligationID, ReceiptReason: fmt.Sprintf("unexpected status %d", resp.StatusCode)}, nil
+	}
+}
+
+func (d *T219Deliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	res, err := d.Steer(ctx, p)
+	if err != nil {
+		return err
+	}
+	if res.Status != T219Steered {
+		return fmt.Errorf("wake: cursor steer %s: %s", res.Status, res.ReceiptReason)
+	}
+	return nil
+}
+
+// T219VerifyWebhook checks HMAC-SHA256 over the raw body, before parsing. A
+// signature checked after JSON re-encoding can be valid for different bytes.
+func T219VerifyWebhook(secret string, raw []byte, signature string) bool {
+	if secret == "" || len(raw) == 0 || signature == "" {
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(raw)
+	return hmac.Equal([]byte(hex.EncodeToString(mac.Sum(nil))), []byte(signature))
+}
+
+// T219IsRepeat reports whether a deliveryId has already been handled. A
+// repeated steer after a network error is a duplicate, never a second wake.
+func T219IsRepeat(seen []string, deliveryID string) bool {
+	if deliveryID == "" {
+		return false
+	}
+	for _, id := range seen {
+		if id == deliveryID {
+			return true
+		}
+	}
+	return false
+}
+
+// ===== T3.220 квитанции и лестница ADR 0017 (ADR 0065) =====
+// Four adapter outcomes are stored: steer, queue, unsupported and
+// transport-failed. posted means only that the call was accepted;
+// indeterminate means the adapter created a claim and died before the
+// receipt. Neither is retried. Only transport-failed is retried, at 5 and 10
+// minutes, at most three attempts, with the same obligationID and pointer.
+
+type T220Outcome string
+
+const (
+	T220Steer           T220Outcome = "steer"
+	T220Queue           T220Outcome = "queue"
+	T220Unsupported     T220Outcome = "unsupported"
+	T220TransportFailed T220Outcome = "transport-failed"
+	T220Posted          T220Outcome = "posted"
+	T220Indeterminate   T220Outcome = "indeterminate"
+)
+
+const (
+	T220RetryFirst     = 5 * time.Minute
+	T220RetrySecond    = 10 * time.Minute
+	T220EvidenceWindow = 15 * time.Minute
+	T220MaxAttempts    = 3
+)
+
+var (
+	T220ErrBadReceipt       = errors.New("wake: receipt needs an obligation id and a positive attempt")
+	T220ErrSignalIsNotState = errors.New("wake: a wake signal is evidence, not an obligation state")
+)
+
+type T220Receipt struct {
+	ObligationID string            `json:"obligationID"`
+	Attempt      int               `json:"attempt"`
+	Outcome      T220Outcome       `json:"outcome"`
+	Pointer      domain.WakePayload `json:"pointer"`
+	At           time.Time         `json:"at"`
+}
+
+type T220Ledger struct {
+	mu    sync.Mutex
+	rows  map[string]T220Receipt
+	order []T220Receipt
+}
+
+func T220NewLedger() *T220Ledger {
+	return &T220Ledger{rows: make(map[string]T220Receipt)}
+}
+
+func t220ReceiptKey(obligationID string, attempt int) string {
+	return fmt.Sprintf("%s#%d", obligationID, attempt)
+}
+
+// Import stores one whole receipt. Re-importing the same obligation and
+// attempt is a no-op, so a repeated webhook cannot start a second job.
+func (l *T220Ledger) Import(r T220Receipt) error {
+	if l == nil || r.ObligationID == "" || r.Attempt < 1 {
+		return T220ErrBadReceipt
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := t220ReceiptKey(r.ObligationID, r.Attempt)
+	if _, exists := l.rows[key]; exists {
+		return nil
+	}
+	l.rows[key] = r
+	l.order = append(l.order, r)
+	return nil
+}
+
+func (l *T220Ledger) Get(obligationID string, attempt int) (T220Receipt, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	r, ok := l.rows[t220ReceiptKey(obligationID, attempt)]
+	return r, ok
+}
+
+// All returns the imported receipts in import order.
+func (l *T220Ledger) All() []T220Receipt {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]T220Receipt(nil), l.order...)
+}
+
+// T220Retry is the next attempt for a transport failure. Pointer is the
+// original wake pointer, unchanged, so the obligation id stays the same.
+type T220Retry struct {
+	Pointer domain.WakePayload
+	Delay   time.Duration
+	Attempt int
+}
+
+// RetryAt returns the next attempt only for a transport-failed receipt inside
+// the 15-minute evidence window and below the three-attempt cap.
+func (l *T220Ledger) RetryAt(obligationID string, now time.Time) (T220Retry, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var latest T220Receipt
+	found := false
+	count := 0
+	for _, r := range l.order {
+		if r.ObligationID != obligationID {
+			continue
+		}
+		count++
+		if !found || r.Attempt > latest.Attempt || (r.Attempt == latest.Attempt && r.At.After(latest.At)) {
+			latest, found = r, true
+		}
+	}
+	if !found || latest.Outcome != T220TransportFailed {
+		return T220Retry{}, false
+	}
+	if count >= T220MaxAttempts || now.Sub(latest.At) > T220EvidenceWindow || now.Before(latest.At) {
+		return T220Retry{}, false
+	}
+	var delay time.Duration
+	switch latest.Attempt {
+	case 1:
+		delay = T220RetryFirst
+	case 2:
+		delay = T220RetrySecond
+	default:
+		return T220Retry{}, false
+	}
+	return T220Retry{Pointer: latest.Pointer, Delay: delay, Attempt: latest.Attempt + 1}, true
+}
+
+// T220CreateReceiptsSQL is the SQLite shape of the ledger. The unique key is
+// (obligation_id, attempt), the same key Import uses.
+const T220CreateReceiptsSQL = `CREATE TABLE IF NOT EXISTS wake_receipts (
+  obligation_id TEXT NOT NULL,
+  attempt       INTEGER NOT NULL,
+  outcome       TEXT NOT NULL,
+  at            INTEGER NOT NULL,
+  raw           BLOB NOT NULL,
+  UNIQUE (obligation_id, attempt)
+)`
+
+const T220InsertReceiptSQL = `INSERT OR IGNORE INTO wake_receipts
+  (obligation_id, attempt, outcome, at, raw) VALUES (?, ?, ?, ?, ?)`
+
+// T220SQLSink is the SQLite boundary. A *sql.DB satisfies it; tests can use a
+// recorder without importing a driver.
+type T220SQLSink interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// T220ImportSQLite writes receipts to SQLite and returns how many rows were
+// inserted. A repeated import inserts no rows.
+func T220ImportSQLite(ctx context.Context, sink T220SQLSink, rows []T220Receipt) (int, error) {
+	if sink == nil {
+		return 0, errors.New("wake: t220 sqlite import needs a sink")
+	}
+	inserted := 0
+	for _, r := range rows {
+		raw, err := json.Marshal(r)
+		if err != nil {
+			return inserted, err
+		}
+		res, err := sink.ExecContext(ctx, T220InsertReceiptSQL,
+			r.ObligationID, r.Attempt, string(r.Outcome), r.At.Unix(), raw)
+		if err != nil {
+			return inserted, err
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return inserted, err
+		}
+		inserted += int(affected)
+	}
+	return inserted, nil
+}
+
+// T220Step is one way to try to move the ADR 0017 ladder. The first three are
+// the obligation states; the last two are observation signals.
+type T220Step string
+
+const (
+	T220StepReceipt          T220Step = "receipt"
+	T220StepAck              T220Step = "ack"
+	T220StepGetResult        T220Step = "get_result"
+	T220StepExecutionStarted T220Step = "session.execution.started"
+	T220StepNudgeDelivered   T220Step = "nudge.delivered"
+)
+
+// T220Evidence records the three obligation states. It never lets a wake
+// signal stand in for claimed, delivered or read.
+type T220Evidence struct {
+	DeliveredByReceipt bool
+	ClaimedByAck       bool
+	ReadByGetResult    bool
+}
+
+// T220Advance annotates evidence and returns the ladder untouched. A wake
+// signal such as session.execution.started or nudge.delivered is refused: it
+// is an observation, not a state transition.
+func T220Advance(e T220Evidence, step T220Step) (T220Evidence, error) {
+	switch step {
+	case T220StepReceipt:
+		e.DeliveredByReceipt = true
+	case T220StepAck:
+		e.ClaimedByAck = true
+	case T220StepGetResult:
+		e.ReadByGetResult = true
+	case T220StepExecutionStarted, T220StepNudgeDelivered:
+		return e, fmt.Errorf("%w: %s", T220ErrSignalIsNotState, step)
+	default:
+		return e, fmt.Errorf("wake: unknown ladder step %q", step)
+	}
+	return e, nil
 }
 
