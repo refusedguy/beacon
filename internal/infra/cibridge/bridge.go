@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -24,6 +25,13 @@ type Bridge struct {
 	waker        domain.WakeDeliverer
 	adapterWaker domain.AdapterWakeDeliverer
 	reader       ReadStamper
+
+	// blockedNotified remembers the obligations whose block wake was already
+	// delivered. A blocked Watch is observed on every tick, so without this
+	// guard the orchestrator would be steered again and again for the same
+	// block. A new block revision opens a fresh key and wakes again.
+	mu              sync.Mutex
+	blockedNotified map[string]struct{}
 }
 
 // ReadStamper stamps a durable read on an obligation. The MCP tool owns the
@@ -106,23 +114,36 @@ func (b *Bridge) Run(ctx context.Context) {
 	}
 }
 
-// Refresh reads every active Watch once and updates those whose CI reached a
+// Refresh reads every live Watch once and updates those whose CI reached a
 // verdict. Only Watches with subscribers are considered: a Watch without a
 // subscriber has nobody to notify. A terminal PR state closes the Watch even
 // when its verdict already moved to ready or retry.
+//
+// The source is AllWatches rather than ActiveWatches because a blocked Watch
+// carries StatusBlocked and is therefore absent from ActiveWatches. The bridge
+// still has to observe it, first to keep CI from being polled and the executor
+// from being woken, and second to steer the orchestrator. Closed Watches are
+// skipped here; publish re-reads and skips them too as a second guard.
 func (b *Bridge) Refresh(ctx context.Context) int {
 	if b == nil || b.store == nil || b.ci == nil {
 		return 0
 	}
-	watches, err := b.store.ActiveWatches()
+	watches, err := b.store.AllWatches()
 	if err != nil {
-		log.Printf("cibridge: active watches: %v", err)
+		log.Printf("cibridge: live watches: %v", err)
 		return 0
 	}
 	updated := 0
 	for i := range watches {
 		w := watches[i]
-		if len(w.Subscribers) == 0 {
+		if w.Status == domain.StatusClosed || len(w.Subscribers) == 0 {
+			continue
+		}
+		if w.Blocked != nil {
+			// A blocked Watch waits on outside action. Do not poll CI and do
+			// not publish a retry verdict for it; only steer the orchestrator
+			// so it can assign a FIX agent. Polling resumes after unblock.
+			b.handleBlocked(ctx, w)
 			continue
 		}
 		state, err := b.ci.PRState(ctx, w.Repo, w.PR)
@@ -171,6 +192,95 @@ func verdictFromState(state domain.PRState) domain.Verdict {
 
 func isTerminalVerdict(v domain.Verdict) bool {
 	return v == domain.VerdictMerged || v == domain.VerdictClosed
+}
+
+// blockedNotice builds the orchestrator's wake text for a blocked Watch. It
+// carries the PR, the block reason, the failed checks and the watch id, and
+// nothing from check bodies. The text rides in the verdict field of the wake
+// pointer, the same free-text slot wake.NotifyOrchestrator uses for a reason.
+func blockedNotice(w domain.Watch) string {
+	info := w.Blocked
+	checks := strings.Join(info.FailedChecks, ", ")
+	if checks == "" {
+		checks = "нет"
+	}
+	return fmt.Sprintf("нужен FIX-агент: PR %s#%d, причина: %s, failedChecks: %s, watchID: %s",
+		w.Repo, w.PR, info.Reason, checks, w.ID)
+}
+
+// handleBlocked observes a blocked Watch. It stages the subscriber obligations
+// at the block revision so get_result can still project a verdict, then steers
+// only the orchestrator subscribers so a FIX agent can be assigned. The
+// executor is deliberately not woken: a blocked Watch is not a retry. The wake
+// is delivered once per block revision; a later unblock clears the Watch and a
+// new block gets a new revision and a new wake.
+func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
+	if w.Blocked == nil {
+		return
+	}
+	now := b.clock.Now()
+
+	// Re-read under the single-writer assumption, as publish does, so a Watch
+	// unblocked between the live-watch scan and here is not woken.
+	current, err := b.store.Watch(w.ID)
+	if err != nil {
+		log.Printf("cibridge: blocked watch %s: %v", w.ID, err)
+		return
+	}
+	if current.Status == domain.StatusClosed || current.Blocked == nil {
+		return
+	}
+	w = current
+
+	for _, sub := range w.Subscribers {
+		id := domain.ObligationKey(w.ID, w.Revision, sub.ID)
+		if _, err := b.store.Obligation(id); err != nil {
+			if err := b.store.SaveObligation(domain.Obligation{
+				ID:             id,
+				WatchID:        w.ID,
+				Revision:       w.Revision,
+				SubscriberID:   sub.ID,
+				VerdictPointer: domain.VerdictBlocked,
+				StagedAt:       now,
+			}); err != nil {
+				log.Printf("cibridge: blocked obligation %s: %v", id, err)
+				return
+			}
+		}
+		if sub.Role != domain.RoleOrchestrator || (b.waker == nil && b.adapterWaker == nil) {
+			continue
+		}
+
+		b.mu.Lock()
+		if b.blockedNotified == nil {
+			b.blockedNotified = make(map[string]struct{})
+		}
+		_, notified := b.blockedNotified[id]
+		b.mu.Unlock()
+		if notified {
+			continue
+		}
+
+		p := domain.WakePayload{
+			WatchID:      w.ID,
+			ObligationID: id,
+			Revision:     w.Revision,
+			Verdict:      blockedNotice(w),
+		}
+		var err error
+		if b.adapterWaker != nil {
+			err = b.adapterWaker.Deliver(ctx, sub.Adapter, sub.ID, p)
+		} else {
+			err = b.waker.Deliver(ctx, sub.ID, p)
+		}
+		if err != nil {
+			log.Printf("cibridge: blocked wake %s: %v", sub.ID, err)
+			continue
+		}
+		b.mu.Lock()
+		b.blockedNotified[id] = struct{}{}
+		b.mu.Unlock()
+	}
 }
 
 // verdictFromChecks turns observed checks into a verdict. A pending check

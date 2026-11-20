@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,46 @@ type fakeCI struct {
 
 func (f fakeCI) PRState(context.Context, string, int) (domain.PRState, error) {
 	return f.state, nil
+}
+
+// countingCI proves that a blocked Watch is never polled: each call is counted.
+type countingCI struct {
+	calls int
+	state domain.PRState
+}
+
+func (f *countingCI) PRState(context.Context, string, int) (domain.PRState, error) {
+	f.calls++
+	return f.state, nil
+}
+
+// adapterDelivery records one adapter-aware wake delivery in tests.
+type adapterDelivery struct {
+	adapter string
+	session string
+	payload domain.WakePayload
+}
+
+// recordingAdapterWaker stands in for the wake registry. It records every
+// delivery per subscriber so tests can prove who was steered and with what.
+type recordingAdapterWaker struct {
+	deliveries []adapterDelivery
+	err        error
+}
+
+func (r *recordingAdapterWaker) Deliver(_ context.Context, adapter, sessionID string, p domain.WakePayload) error {
+	r.deliveries = append(r.deliveries, adapterDelivery{adapter: adapter, session: sessionID, payload: p})
+	return r.err
+}
+
+func (r *recordingAdapterWaker) forSession(id string) []adapterDelivery {
+	var out []adapterDelivery
+	for _, d := range r.deliveries {
+		if d.session == id {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 func TestVerdictFromChecks(t *testing.T) {
@@ -359,5 +401,230 @@ func TestBridgeClosesReadyWatchOnMerge(t *testing.T) {
 	}
 	if len(waker.deliveries) != 0 {
 		t.Fatalf("wake delivered %d times, want 0", len(waker.deliveries))
+	}
+}
+
+// blockedTestWatch builds a Watch already in the blocked state with the given
+// subscribers. It mirrors the payload written by domain.BlockEvent.
+func blockedTestWatch(id string, pr int, subscribers ...domain.Subscriber) domain.Watch {
+	return domain.Watch{
+		ID:      id,
+		Repo:    "refusedguy/beacon",
+		PR:      pr,
+		HeadSHA: "abc",
+		Status:  domain.StatusBlocked,
+		Verdict: domain.VerdictBlocked,
+		Revision: 3,
+		Blocked: &domain.BlockedInfo{
+			Reason:       "two required checks failed outside executor's diff",
+			FailedChecks: []string{"ci/test", "gates"},
+			Since:        time.Unix(1, 0),
+			BlockedBy:    "ci-bridge",
+		},
+		Subscribers: subscribers,
+	}
+}
+
+// TestBridgeSkipsBlockedWatch proves that Refresh neither polls CI nor
+// publishes a retry for a blocked Watch, so the executor is never woken with a
+// false retry. The Watch must be read from the real store, whose ActiveWatches
+// excludes StatusBlocked: the bridge has to observe it anyway.
+func TestBridgeSkipsBlockedWatch(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	w := blockedTestWatch("watch:refusedguy/beacon:60:abc", 60,
+		domain.Subscriber{ID: "ses_executor", Role: domain.RoleExecutor, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	ci := &countingCI{state: domain.PRState{
+		HeadRefOid: "abc",
+		Checks:     map[string]domain.Check{"build": {Conclusion: "FAILURE", Required: true}},
+	}}
+	waker := &recordingAdapterWaker{}
+	b := New(db, ci, fixedClock{at: time.Unix(2, 0)}, time.Second).WithWaker(waker)
+	if got := b.Refresh(context.Background()); got != 0 {
+		t.Fatalf("Refresh updated %d watches, want 0 for a blocked Watch", got)
+	}
+	if ci.calls != 0 {
+		t.Fatalf("CI polled %d times for a blocked Watch, want 0", ci.calls)
+	}
+	if got := len(waker.deliveries); got != 0 {
+		t.Fatalf("executor received %d wakes, want 0", got)
+	}
+	got, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if got.Verdict != domain.VerdictBlocked || got.Revision != w.Revision {
+		t.Fatalf("blocked Watch changed: verdict=%q revision=%d, want blocked/%d", got.Verdict, got.Revision, w.Revision)
+	}
+}
+
+// TestBridgeWakesOrchestratorOnBlockedWatch proves the orchestrator receives a
+// single FIX-agent wake through the adapter-aware registry with the PR, reason,
+// failed checks and watch id, while the executor receives none. It also proves
+// the wake is idempotent across ticks and stages a blocked obligation.
+func TestBridgeWakesOrchestratorOnBlockedWatch(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	w := blockedTestWatch("watch:refusedguy/beacon:61:abc", 61,
+		domain.Subscriber{ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode"},
+		domain.Subscriber{ID: "ses_executor", Role: domain.RoleExecutor, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	waker := &recordingAdapterWaker{}
+	b := New(db, &countingCI{}, fixedClock{at: time.Unix(2, 0)}, time.Second).WithWaker(waker)
+	ctx := context.Background()
+	if got := b.Refresh(ctx); got != 0 {
+		t.Fatalf("Refresh updated %d watches, want 0", got)
+	}
+
+	orch := waker.forSession("ses_orchestrator")
+	if len(orch) != 1 {
+		t.Fatalf("orchestrator wakes = %d, want 1: %+v", len(orch), waker.deliveries)
+	}
+	if got := waker.forSession("ses_executor"); len(got) != 0 {
+		t.Fatalf("executor wakes = %d, want 0", len(got))
+	}
+	d := orch[0]
+	if d.adapter != "opencode" {
+		t.Fatalf("delivery adapter = %q, want opencode", d.adapter)
+	}
+	msg := d.payload.Verdict
+	for _, want := range []string{
+		"нужен FIX-агент",
+		"refusedguy/beacon#61",
+		"two required checks failed outside executor's diff",
+		"ci/test",
+		"gates",
+		w.ID,
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("wake message %q missing %q", msg, want)
+		}
+	}
+	if want := domain.ObligationKey(w.ID, w.Revision, "ses_orchestrator"); d.payload.ObligationID != want {
+		t.Fatalf("obligation = %q, want %q", d.payload.ObligationID, want)
+	}
+	if d.payload.WatchID != w.ID || d.payload.Revision != w.Revision {
+		t.Fatalf("payload identifiers = %q/%d, want %q/%d", d.payload.WatchID, d.payload.Revision, w.ID, w.Revision)
+	}
+	o, err := db.Obligation(d.payload.ObligationID)
+	if err != nil {
+		t.Fatalf("blocked obligation missing: %v", err)
+	}
+	if o.VerdictPointer != domain.VerdictBlocked {
+		t.Fatalf("obligation verdict = %q, want blocked", o.VerdictPointer)
+	}
+
+	// A second tick over the same block must not steer the orchestrator again.
+	if got := b.Refresh(ctx); got != 0 {
+		t.Fatalf("second Refresh updated %d watches, want 0", got)
+	}
+	if got := len(waker.forSession("ses_orchestrator")); got != 1 {
+		t.Fatalf("orchestrator wakes after second tick = %d, want 1", got)
+	}
+}
+
+// TestBridgeResumesPollingAfterUnblock proves that once the block is cleared
+// the bridge polls CI again and publishes the verdict. The unblock goes through
+// the domain transition so the Watch shape matches production.
+func TestBridgeResumesPollingAfterUnblock(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	w := blockedTestWatch("watch:refusedguy/beacon:62:abc", 62,
+		domain.Subscriber{ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	ci := &countingCI{state: domain.PRState{
+		HeadRefOid: "abc",
+		Checks:     map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
+	}}
+	waker := &recordingAdapterWaker{}
+	b := New(db, ci, fixedClock{at: time.Unix(2, 0)}, time.Second).WithWaker(waker)
+	ctx := context.Background()
+
+	if got := b.Refresh(ctx); got != 0 || ci.calls != 0 {
+		t.Fatalf("blocked tick: updated=%d ciCalls=%d, want 0/0", got, ci.calls)
+	}
+
+	current, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	unblocked, _ := domain.Transition(current, domain.UnblockEvent(time.Unix(3, 0)))
+	if unblocked.Blocked != nil || unblocked.Status != domain.StatusWatching || unblocked.Verdict != domain.VerdictWatching {
+		t.Fatalf("unblock transition produced %+v, want watching without block", unblocked)
+	}
+	if err := db.SaveWatch(unblocked); err != nil {
+		t.Fatalf("SaveWatch(unblocked): %v", err)
+	}
+
+	if got := b.Refresh(ctx); got != 1 {
+		t.Fatalf("Refresh after unblock updated %d watches, want 1", got)
+	}
+	if ci.calls != 1 {
+		t.Fatalf("CI polled %d times after unblock, want 1", ci.calls)
+	}
+	got, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch after unblock: %v", err)
+	}
+	if got.Verdict != domain.VerdictReady {
+		t.Fatalf("verdict after unblock = %q, want ready", got.Verdict)
+	}
+	if got.Revision != unblocked.Revision+1 {
+		t.Fatalf("revision after unblock = %d, want %d", got.Revision, unblocked.Revision+1)
+	}
+}
+
+// TestBridgeBlockedWakeFailureIsRetried proves a failed delivery is not marked
+// as notified, so the next tick can deliver the FIX-agent wake again.
+func TestBridgeBlockedWakeFailureIsRetried(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	w := blockedTestWatch("watch:refusedguy/beacon:63:abc", 63,
+		domain.Subscriber{ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode"},
+	)
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+
+	waker := &recordingAdapterWaker{err: errors.New("transport down")}
+	b := New(db, &countingCI{}, fixedClock{at: time.Unix(2, 0)}, time.Second).WithWaker(waker)
+	ctx := context.Background()
+	b.Refresh(ctx)
+	if got := len(waker.deliveries); got != 1 {
+		t.Fatalf("deliveries after failed wake = %d, want 1 attempt", got)
+	}
+	waker.err = nil
+	b.Refresh(ctx)
+	if got := len(waker.deliveries); got != 2 {
+		t.Fatalf("deliveries after retry = %d, want 2 attempts", got)
 	}
 }
