@@ -34,7 +34,7 @@ func TestOpenCodeDelivererPostsSteerPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
-	if len(gotArgs) < 6 {
+	if len(gotArgs) < 5 {
 		t.Fatalf("args = %q", gotArgs)
 	}
 	if gotArgs[0] != "api" || gotArgs[1] != "POST" || gotArgs[2] != "/api/session/ses_test/prompt" {
@@ -44,7 +44,7 @@ func TestOpenCodeDelivererPostsSteerPrompt(t *testing.T) {
 		Text     string `json:"text"`
 		Delivery string `json:"delivery"`
 	}
-	if err := json.Unmarshal([]byte(gotArgs[5]), &sent); err != nil {
+	if err := json.Unmarshal([]byte(gotArgs[4]), &sent); err != nil {
 		t.Fatalf("decode --data: %v", err)
 	}
 	if sent.Delivery != "steer" {

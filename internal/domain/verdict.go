@@ -67,9 +67,9 @@ type Snapshot struct {
 type WakeKind string
 
 const (
-	WakePointer     WakeKind = ""             // deliver a pointer to the subscriber
-	WakeHeadChanged WakeKind = "head_changed" // close the old Watch, create a new one
-	WakeRestPin     WakeKind = "rest_pin"     // ping lazy mergeable=UNKNOWN via REST
+	WakePlainPointer WakeKind = ""             // deliver a pointer to the subscriber
+	WakeHeadChanged  WakeKind = "head_changed" // close the old Watch, create a new one
+	WakeRestPin      WakeKind = "rest_pin"     // ping lazy mergeable=UNKNOWN via REST
 )
 
 // WakeTarget is one action the caller must perform after Evaluate. Role is the
@@ -89,9 +89,9 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	// 1. MERGED/CLOSED is terminal: close the Watch and wake everyone.
 	switch strings.ToUpper(s.State) {
 	case "MERGED":
-		return VerdictMerged, wakeAll(WakePointer)
+		return VerdictMerged, wakeAll(WakePlainPointer)
 	case "CLOSED":
-		return VerdictClosed, wakeAll(WakePointer)
+		return VerdictClosed, wakeAll(WakePlainPointer)
 	}
 
 	// 2. headRefOid moved: the old Watch is closed and a replacement is
@@ -105,7 +105,7 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	// 3-4. Merge-state blockers route to the executor for a rebase.
 	status := strings.ToUpper(s.MergeStateStatus)
 	if status == "DIRTY" || (status == "BEHIND" && p.RequireUpToDate) {
-		return VerdictRebase, wakeExecutor(WakePointer)
+		return VerdictRebase, wakeExecutor(WakePlainPointer)
 	}
 
 	// 5-6. A failed rollup is either a bounded flaky retry or keep_working.
@@ -118,7 +118,7 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 				{Role: RoleOrchestrator},
 			}
 		}
-		return VerdictKeepWorking, wakeExecutor(WakePointer)
+		return VerdictKeepWorking, wakeExecutor(WakePlainPointer)
 	}
 
 	// 7. Ready needs a clean success, a valid suite composition, no draft,
@@ -131,7 +131,7 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 		!s.MissingRequired && s.SuitesValid &&
 		(p.IgnoreReviews || strings.ToUpper(s.ReviewDecision) != "CHANGES_REQUESTED") &&
 		ShipAllowed(s.Ship) {
-		return VerdictReady, wakeOrchestrator(WakePointer)
+		return VerdictReady, wakeOrchestrator(WakePlainPointer)
 	}
 
 	// 8. A lazy UNKNOWN mergeable needs a REST pin, not a subscriber wake.
@@ -141,7 +141,7 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 
 	// 9. Deadline or no-checks timeout escalates through the orchestrator.
 	if timedOut(s) {
-		return VerdictTimeout, wakeOrchestrator(WakePointer)
+		return VerdictTimeout, wakeOrchestrator(WakePlainPointer)
 	}
 
 	// 10. Pending checks (ACTION_REQUIRED/WAITING/QUEUED) and all other

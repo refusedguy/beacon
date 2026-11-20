@@ -64,7 +64,7 @@ func TestEvaluateDecisionTable(t *testing.T) {
 		{
 			row: 1, name: "MERGED is terminal",
 			s:    func() Snapshot { s := readySnapshot(); s.State = "MERGED"; return s }(),
-			want: VerdictMerged, wake: allTargets(WakePointer),
+			want: VerdictMerged, wake: allTargets(WakePlainPointer),
 		},
 		{
 			row: 2, name: "head changed creates a successor watch",
@@ -74,13 +74,13 @@ func TestEvaluateDecisionTable(t *testing.T) {
 		{
 			row: 3, name: "DIRTY forces rebase",
 			s:    func() Snapshot { s := readySnapshot(); s.MergeStateStatus = "DIRTY"; return s }(),
-			want: VerdictRebase, wake: targets(WakePointer, RoleExecutor),
+			want: VerdictRebase, wake: targets(WakePlainPointer, RoleExecutor),
 		},
 		{
 			row: 4, name: "BEHIND with requireUpToDate forces rebase",
 			s:    func() Snapshot { s := readySnapshot(); s.MergeStateStatus = "BEHIND"; return s }(),
 			p:    Policy{RequireUpToDate: true},
-			want: VerdictRebase, wake: targets(WakePointer, RoleExecutor),
+			want: VerdictRebase, wake: targets(WakePlainPointer, RoleExecutor),
 		},
 		{
 			row: 5, name: "flaky failure under budget retries",
@@ -117,12 +117,12 @@ func TestEvaluateDecisionTable(t *testing.T) {
 				}
 				return s
 			}(),
-			want: VerdictKeepWorking, wake: targets(WakePointer, RoleExecutor),
+			want: VerdictKeepWorking, wake: targets(WakePlainPointer, RoleExecutor),
 		},
 		{
 			row: 7, name: "clean success is ready",
 			s:    readySnapshot(),
-			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictReady, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			row: 8, name: "UNKNOWN mergeable pings REST even past deadline",
@@ -144,7 +144,7 @@ func TestEvaluateDecisionTable(t *testing.T) {
 				s.DeadlineAt = testDeadline
 				return s
 			}(),
-			want: VerdictTimeout, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictTimeout, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			row: 10, name: "anything else watches silently",
@@ -246,7 +246,7 @@ func TestEvaluateFlakyRetryBudgetIsFinite(t *testing.T) {
 		if got != VerdictKeepWorking {
 			t.Fatalf("iteration %d: verdict = %q, want keep_working", i, got)
 		}
-		if !reflect.DeepEqual(wake, targets(WakePointer, RoleExecutor)) {
+		if !reflect.DeepEqual(wake, targets(WakePlainPointer, RoleExecutor)) {
 			t.Fatalf("iteration %d: wake = %#v, want executor only", i, wake)
 		}
 	}
@@ -266,7 +266,7 @@ func TestEvaluateFixtures(t *testing.T) {
 		{
 			name: "fork PR keyed by head SHA",
 			s:    readySnapshot(),
-			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictReady, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			name: "missing required check times out",
@@ -277,7 +277,7 @@ func TestEvaluateFixtures(t *testing.T) {
 				s.DeadlineAt = testDeadline
 				return s
 			}(),
-			want: VerdictTimeout, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictTimeout, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			name: "SKIPPED and NEUTRAL conclusions are allowed",
@@ -287,7 +287,7 @@ func TestEvaluateFixtures(t *testing.T) {
 				s.Checks["ci-legacy"] = Check{State: "COMPLETED", Conclusion: "NEUTRAL"}
 				return s
 			}(),
-			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictReady, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			name: "ACTION_REQUIRED is pending",
@@ -333,7 +333,7 @@ func TestEvaluateFixtures(t *testing.T) {
 				return s
 			}(),
 			p:    Policy{RequireUpToDate: true},
-			want: VerdictRebase, wake: targets(WakePointer, RoleExecutor),
+			want: VerdictRebase, wake: targets(WakePlainPointer, RoleExecutor),
 		},
 		{
 			name: "BEHIND without requireUpToDate is ready",
@@ -342,7 +342,7 @@ func TestEvaluateFixtures(t *testing.T) {
 				s.MergeStateStatus = "BEHIND"
 				return s
 			}(),
-			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictReady, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			name: "CLOSED is terminal",
@@ -351,7 +351,7 @@ func TestEvaluateFixtures(t *testing.T) {
 				s.State = "CLOSED"
 				return s
 			}(),
-			want: VerdictClosed, wake: allTargets(WakePointer),
+			want: VerdictClosed, wake: allTargets(WakePlainPointer),
 		},
 		{
 			name: "rerequested suites reset to watching",
@@ -371,7 +371,7 @@ func TestEvaluateFixtures(t *testing.T) {
 				return s
 			}(),
 			p:    Policy{IgnoreReviews: true},
-			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+			want: VerdictReady, wake: targets(WakePlainPointer, RoleOrchestrator),
 		},
 		{
 			name: "CHANGES_REQUESTED blocks ready",
