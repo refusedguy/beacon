@@ -347,10 +347,8 @@ func TestDaemonSummaryIsLogged(t *testing.T) {
 // A failing summary is logged and the pass still closes merged Watches.
 func TestDaemonSummaryErrorIsLogged(t *testing.T) {
 	var order []string
-	ports, _, _ := daemonOrderPorts(&order)
-	ports.Summary = func(context.Context) (Workload, error) {
-		return Workload{}, errors.New("summary boom")
-	}
+	ports, _, summary := daemonOrderPorts(&order)
+	summary.err = errors.New("summary boom")
 
 	var logs []string
 	ports.Log = func(format string, args ...any) {
