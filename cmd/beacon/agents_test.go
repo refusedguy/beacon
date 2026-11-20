@@ -259,6 +259,59 @@ func TestW68AgentsEmptyListIsValidJSON(t *testing.T) {
 	}
 }
 
+// w236SessionList is the `opencode api session.list` envelope from ADR 0060.
+// The same agent appears twice to check that rows are deduplicated.
+const w236SessionList = `{
+  "data": [
+    {"id":"ses-1","parentID":"ses-0","agent":"reviewer","title":"rev"},
+    {"id":"ses-2","parentID":"ses-0","agent":"general","title":"gen"},
+    {"id":"ses-3","parentID":"ses-0","agent":"reviewer","title":"rev again"}
+  ]
+}`
+
+func TestW236AgentsRowsFromSessionListAgents(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "state"))
+	w68Service(t, []byte(w68Registration), nil)
+	respond := func(call w68Call) runResult {
+		if call.name == "opencode" && len(call.args) == 2 && call.args[1] == "app.agents" {
+			return runResult{code: 1, stderr: []byte("Operation not found: app.agents\n")}
+		}
+		return runResult{stdout: []byte(w236SessionList)}
+	}
+
+	c, out, errOut, calls := w68CLI(t, respond)
+	if code := c.runAgents([]string{"--format", "json"}); code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0; stderr %q", code, errOut.String())
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("вызовов раннера %d, ожидалось 2: %+v", len(*calls), *calls)
+	}
+	if (*calls)[0].args[1] != "app.agents" || (*calls)[1].args[1] != "session.list" {
+		t.Fatalf("источники агентов: %+v", *calls)
+	}
+	var got []agentRow
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []agentRow{
+		{ID: "general", Name: "general"},
+		{ID: "reviewer", Name: "reviewer"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("строки %+v, ожидались %+v", got, want)
+	}
+
+	c, out, errOut, _ = w68CLI(t, respond)
+	if code := c.runAgents(nil); code != 0 {
+		t.Fatalf("таблица: код выхода %d, stderr %q", code, errOut.String())
+	}
+	for _, needle := range []string{"ID", "NAME", "MODE", "STALE", "ATTENTION", "general", "reviewer"} {
+		if !strings.Contains(out.String(), needle) {
+			t.Fatalf("в таблице нет %q: %q", needle, out.String())
+		}
+	}
+}
+
 func TestW92SandboxCloneArgsUsesReference(t *testing.T) {
 	got := sandboxCloneArgs("/srv/beacon.git", "/work/agents/a1")
 	want := []string{"clone", "--reference", "/srv/beacon.git", "/srv/beacon.git", "/work/agents/a1"}

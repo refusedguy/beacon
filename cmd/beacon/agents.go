@@ -192,19 +192,25 @@ func (c *CLI) runAgents(args []string) int {
 		return 2
 	}
 
+	// opencode v2.3.0 не знает app.agents и возвращает Operation not found
+	// (ADR 0060). Вызов сохраняется для совместимости со старыми версиями, но
+	// рабочим источником становится поле agent ответа session.list.
 	res := c.run(c.root, "opencode", []string{"api", "app.agents"}, nil)
-	if res.code != 0 {
-		fmt.Fprintln(c.errOut, "beacon agents: не удалось получить список агентов через opencode api")
-		if msg := strings.TrimSpace(string(res.stderr)); msg != "" {
-			fmt.Fprintf(c.errOut, "  %s\n", msg)
-		}
-		return 2
-	}
-
 	rows, err := parseAgentRows(res.stdout)
-	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon agents: не удалось разобрать ответ opencode api: %v\n", err)
-		return 2
+	if res.code != 0 || err != nil || len(rows) == 0 {
+		res = c.run(c.root, "opencode", []string{"api", "session.list"}, nil)
+		if res.code != 0 {
+			fmt.Fprintln(c.errOut, "beacon agents: не удалось получить список агентов через opencode api session.list")
+			if msg := strings.TrimSpace(string(res.stderr)); msg != "" {
+				fmt.Fprintf(c.errOut, "  %s\n", msg)
+			}
+			return 2
+		}
+		rows, err = parseAgentRowsFromSessions(res.stdout)
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon agents: не удалось разобрать ответ opencode api: %v\n", err)
+			return 2
+		}
 	}
 
 	requests, err := readAttentionRequests()
@@ -278,6 +284,31 @@ func parseAgentRows(data []byte) ([]agentRow, error) {
 		}
 		rows = append(rows, agentRow{ID: a.ID, Name: a.Name, Mode: a.Mode})
 	}
+	return rows, nil
+}
+
+// parseAgentRowsFromSessions builds agent rows from `opencode api session.list`
+// (ADR 0060). parseSessions handles both the {"data": [...]} envelope and a
+// bare array. Every distinct non-empty `agent` value becomes one row; the agent
+// string is the ID and the name so attention requests and stale tasks keep
+// matching the same agent as they did with app.agents. Rows are sorted by ID
+// for stable output, with one row per agent even if several sessions use it.
+func parseAgentRowsFromSessions(raw []byte) ([]agentRow, error) {
+	sessions, err := parseSessions(raw)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(sessions))
+	rows := make([]agentRow, 0, len(sessions))
+	for _, s := range sessions {
+		agent := strings.TrimSpace(s.Agent)
+		if agent == "" || seen[agent] {
+			continue
+		}
+		seen[agent] = true
+		rows = append(rows, agentRow{ID: agent, Name: agent})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows, nil
 }
 
