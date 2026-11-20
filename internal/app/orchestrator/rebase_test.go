@@ -44,12 +44,76 @@ func (f *fakeGit) callsFor(key string) []gitCall {
 
 type testStore struct{ watches []Watch }
 
-func (s testStore) ActiveWatches() ([]Watch, error) { return s.watches, nil }
+func (s testStore) ActiveWatches(context.Context) ([]Watch, error) { return s.watches, nil }
 
 type testMerger struct{ merged map[int]bool }
 
 func (m testMerger) IsMerged(_ context.Context, _ string, pr int) (bool, error) {
 	return m.merged[pr], nil
+}
+
+type testHeadRefs struct {
+	byPR map[int]string
+	err  error
+}
+
+func (h *testHeadRefs) HeadRefName(_ context.Context, _ string, pr int) (string, error) {
+	if h.err != nil {
+		return "", h.err
+	}
+	return h.byPR[pr], nil
+}
+
+type shaUpdate struct{ id, sha string }
+
+type rebaseUpdate struct {
+	id    string
+	files []string
+}
+
+type testUpdater struct {
+	heads   []shaUpdate
+	rebases []rebaseUpdate
+	err     error
+}
+
+func (u *testUpdater) SetHeadSHA(_ context.Context, id, sha string) error {
+	u.heads = append(u.heads, shaUpdate{id: id, sha: sha})
+	return u.err
+}
+
+func (u *testUpdater) SetRebase(_ context.Context, id string, files []string) error {
+	u.rebases = append(u.rebases, rebaseUpdate{id: id, files: append([]string(nil), files...)})
+	return u.err
+}
+
+type rebaseWakeCall struct {
+	id       string
+	revision uint64
+	verdict  string
+	reason   string
+}
+
+type testWaker struct {
+	calls []rebaseWakeCall
+	err   error
+}
+
+func (w *testWaker) Wake(_ context.Context, id string, revision uint64, verdict string) error {
+	w.calls = append(w.calls, rebaseWakeCall{id: id, revision: revision, verdict: verdict})
+	return w.err
+}
+
+func (w *testWaker) WakeWithReason(_ context.Context, id string, revision uint64, verdict, reason string) error {
+	w.calls = append(w.calls, rebaseWakeCall{id: id, revision: revision, verdict: verdict, reason: reason})
+	return w.err
+}
+
+type plainWaker struct{ calls []rebaseWakeCall }
+
+func (w *plainWaker) Wake(_ context.Context, id string, revision uint64, verdict string) error {
+	w.calls = append(w.calls, rebaseWakeCall{id: id, revision: revision, verdict: verdict})
+	return nil
 }
 
 func testWatch(pr int, sha string) Watch {
@@ -71,67 +135,119 @@ HEAD mainsha
 branch refs/heads/main
 `
 
-func TestRebaseAllSuccess(t *testing.T) {
+const renamedListing = `worktree /wt/fix
+HEAD oldsha
+branch refs/heads/fix/arbitrary-name
+
+worktree /wt/main
+HEAD mainsha
+branch refs/heads/main
+`
+
+const graphQLListing = `worktree /wt/w7b
+HEAD oldsha
+branch refs/heads/fix/w7-b
+
+worktree /wt/main
+HEAD mainsha
+branch refs/heads/main
+`
+
+// successGit answers the full clean-behind path for one branch.
+func successGit(listing, branch string) *fakeGit {
 	git := &fakeGit{}
 	git.respond = func(c gitCall) (string, error) {
 		switch c.key() {
 		case "worktree list --porcelain":
-			return worktreeListing, nil
+			return listing, nil
+		case "status --porcelain":
+			return "", nil
 		case "fetch origin main":
-			if c.dir != "/wt/w311" {
-				t.Errorf("fetch dir = %q, want /wt/w311", c.dir)
-			}
 			return "", nil
 		case "rev-list --left-right --count origin/main...HEAD":
 			return "2\t0\n", nil
 		case "rebase origin/main":
-			if c.dir != "/wt/w311" {
-				t.Errorf("rebase dir = %q, want /wt/w311", c.dir)
-			}
 			return "", nil
 		case "rev-parse HEAD":
 			return "newsha\n", nil
-		case "push --force-with-lease origin feat/w311":
+		case "push --force-with-lease origin " + branch:
 			return "", nil
 		default:
 			return "", fmt.Errorf("unexpected git %s", c.key())
 		}
 	}
+	return git
+}
+
+func TestRebaseAllUsesGraphQLHeadRef(t *testing.T) {
+	git := successGit(graphQLListing, "fix/w7-b")
+	updater, waker := &testUpdater{}, &testWaker{}
 	r := &Rebaser{
-		Git:    git,
-		Store:  testStore{watches: []Watch{testWatch(311, "oldsha")}},
-		Merger: testMerger{},
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Merger:                testMerger{},
+		Updater:               updater,
+		Waker:                 waker,
+		HeadRefs:              &testHeadRefs{byPR: map[int]string{311: "refs/heads/fix/w7-b"}},
+		AutoRebaseCleanBehind: true,
 	}
 
 	results, err := r.RebaseAll(context.Background())
 	if err != nil {
 		t.Fatalf("RebaseAll: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("results = %d, want 1", len(results))
+	if len(results) != 1 || !results[0].Pushed || results[0].Branch != "fix/w7-b" {
+		t.Fatalf("results = %+v, want one push on fix/w7-b", results)
 	}
-	got := results[0]
-	if got.NewSHA != "newsha" || got.OldSHA != "oldsha" {
-		t.Errorf("SHA old/new = %q/%q, want oldsha/newsha", got.OldSHA, got.NewSHA)
+	pushes := git.callsFor("push --force-with-lease origin fix/w7-b")
+	if len(pushes) != 1 || pushes[0].dir != "/wt/w7b" {
+		t.Fatalf("pushes = %+v, want one in /wt/w7b", pushes)
 	}
-	if !got.Pushed || got.Skipped {
-		t.Errorf("pushed/skipped = %t/%t, want true/false", got.Pushed, got.Skipped)
+	if len(updater.heads) != 1 || updater.heads[0] != (shaUpdate{id: "watch-311", sha: "newsha"}) {
+		t.Errorf("head updates = %+v, want watch-311 -> newsha", updater.heads)
 	}
-	if got.Worktree != "/wt/w311" {
-		t.Errorf("worktree = %q, want /wt/w311", got.Worktree)
-	}
-	pushes := git.callsFor("push --force-with-lease origin feat/w311")
-	if len(pushes) != 1 || pushes[0].dir != "/wt/w311" {
-		t.Errorf("force pushes = %+v, want one in /wt/w311", pushes)
+	if len(waker.calls) != 0 {
+		t.Errorf("successful auto-rebase woke an agent: %+v", waker.calls)
 	}
 }
 
-func TestRebaseAllConflict(t *testing.T) {
+func TestRebaseAllUsesWorktreeHeadRefWithoutHardcodedBranch(t *testing.T) {
+	git := successGit(renamedListing, "fix/arbitrary-name")
+	r := &Rebaser{
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Merger:                testMerger{},
+		Updater:               &testUpdater{},
+		AutoRebaseCleanBehind: true,
+	}
+
+	results, err := r.RebaseAll(context.Background())
+	if err != nil {
+		t.Fatalf("RebaseAll: %v", err)
+	}
+	if len(results) != 1 || !results[0].Pushed || results[0].Branch != "fix/arbitrary-name" {
+		t.Fatalf("results = %+v, want one push on fix/arbitrary-name", results)
+	}
+	for _, c := range git.calls {
+		if strings.Contains(c.key(), "feat/w") {
+			t.Errorf("git call used a guessed branch: %s", c.key())
+		}
+	}
+}
+
+func TestRebaseAllConflictAbortsAndWakesWithFiles(t *testing.T) {
 	git := &fakeGit{}
+	statusCalls := 0
 	git.respond = func(c gitCall) (string, error) {
 		switch c.key() {
 		case "worktree list --porcelain":
 			return worktreeListing, nil
+		case "status --porcelain":
+			statusCalls++
+			if statusCalls == 1 {
+				return "", nil
+			}
+			return "UU a.go\nAA c.go\n?? notes.txt\n", nil
 		case "fetch origin main":
 			return "", nil
 		case "rev-list --left-right --count origin/main...HEAD":
@@ -146,10 +262,14 @@ func TestRebaseAllConflict(t *testing.T) {
 			return "", fmt.Errorf("unexpected git %s", c.key())
 		}
 	}
+	updater, waker := &testUpdater{}, &testWaker{}
 	r := &Rebaser{
-		Git:    git,
-		Store:  testStore{watches: []Watch{testWatch(311, "oldsha")}},
-		Merger: testMerger{},
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Merger:                testMerger{},
+		Updater:               updater,
+		Waker:                 waker,
+		AutoRebaseCleanBehind: true,
 	}
 
 	results, err := r.RebaseAll(context.Background())
@@ -157,11 +277,9 @@ func TestRebaseAllConflict(t *testing.T) {
 	if !errors.As(err, &conflict) {
 		t.Fatalf("error = %v, want *ConflictError", err)
 	}
-	if conflict.PR != 311 || strings.Join(conflict.Files, ",") != "a.go,b.go" {
-		t.Errorf("conflict = %+v, want PR 311 and files a.go,b.go", conflict)
-	}
-	if len(results) != 1 || results[0].Pushed {
-		t.Fatalf("results = %+v, want one result and no push", results)
+	wantFiles := []string{"a.go", "b.go", "c.go"}
+	if strings.Join(conflict.Files, ",") != strings.Join(wantFiles, ",") {
+		t.Errorf("conflict files = %v, want %v", conflict.Files, wantFiles)
 	}
 	if !errors.As(results[0].Err, new(*ConflictError)) {
 		t.Errorf("result error = %v, want *ConflictError", results[0].Err)
@@ -173,6 +291,128 @@ func TestRebaseAllConflict(t *testing.T) {
 	if len(aborts) != 1 || aborts[0].dir != "/wt/w311" {
 		t.Errorf("aborts = %+v, want one in /wt/w311", aborts)
 	}
+	if len(updater.rebases) != 1 || updater.rebases[0].id != "watch-311" ||
+		strings.Join(updater.rebases[0].files, ",") != strings.Join(wantFiles, ",") {
+		t.Errorf("rebase updates = %+v, want watch-311 with %v", updater.rebases, wantFiles)
+	}
+	if len(updater.heads) != 0 {
+		t.Errorf("conflict wrote a new head SHA: %+v", updater.heads)
+	}
+	if len(waker.calls) != 1 {
+		t.Fatalf("wake calls = %+v, want one", waker.calls)
+	}
+	call := waker.calls[0]
+	if call.verdict != VerdictRebase || call.id != "watch-311" {
+		t.Errorf("wake = %+v, want verdict rebase for watch-311", call)
+	}
+	for _, name := range wantFiles {
+		if !strings.Contains(call.reason, name) {
+			t.Errorf("wake reason %q misses %s", call.reason, name)
+		}
+	}
+}
+
+func TestRebaseAllConflictWithPlainWaker(t *testing.T) {
+	git := &fakeGit{}
+	git.respond = func(c gitCall) (string, error) {
+		switch c.key() {
+		case "worktree list --porcelain":
+			return worktreeListing, nil
+		case "status --porcelain":
+			return "", nil
+		case "fetch origin main":
+			return "", nil
+		case "rev-list --left-right --count origin/main...HEAD":
+			return "2\t0\n", nil
+		case "rebase origin/main":
+			return "", errors.New("rebase failed")
+		case "diff --name-only --diff-filter=U":
+			return "conflict.go\n", nil
+		case "rebase --abort":
+			return "", nil
+		default:
+			return "", fmt.Errorf("unexpected git %s", c.key())
+		}
+	}
+	waker := &plainWaker{}
+	r := &Rebaser{
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Updater:               &testUpdater{},
+		Waker:                 waker,
+		AutoRebaseCleanBehind: true,
+	}
+	if _, err := r.RebaseAll(context.Background()); err == nil {
+		t.Fatal("RebaseAll: want conflict error")
+	}
+	if len(waker.calls) != 1 || waker.calls[0].verdict != VerdictRebase {
+		t.Errorf("wake calls = %+v, want one rebase verdict", waker.calls)
+	}
+}
+
+func TestRebaseAllSkipsWhenFlagOff(t *testing.T) {
+	git := &fakeGit{}
+	git.respond = func(c gitCall) (string, error) {
+		if c.key() == "worktree list --porcelain" {
+			return worktreeListing, nil
+		}
+		return "", fmt.Errorf("unexpected git %s", c.key())
+	}
+	updater, waker := &testUpdater{}, &testWaker{}
+	r := &Rebaser{
+		Git:     git,
+		Store:   testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Updater: updater,
+		Waker:   waker,
+	}
+
+	results, err := r.RebaseAll(context.Background())
+	if err != nil {
+		t.Fatalf("RebaseAll: %v", err)
+	}
+	if len(results) != 1 || !results[0].Skipped || results[0].Reason != "auto-rebase disabled" {
+		t.Fatalf("results = %+v, want skipped auto-rebase disabled", results)
+	}
+	if len(git.calls) != 1 {
+		t.Errorf("git calls = %+v, want only the worktree listing", git.calls)
+	}
+	if len(updater.heads)+len(updater.rebases)+len(waker.calls) != 0 {
+		t.Error("disabled rebaser changed Watch state or woke an agent")
+	}
+}
+
+func TestRebaseAllSkipsDirtyWorktree(t *testing.T) {
+	git := &fakeGit{}
+	git.respond = func(c gitCall) (string, error) {
+		switch c.key() {
+		case "worktree list --porcelain":
+			return worktreeListing, nil
+		case "status --porcelain":
+			return " M dirty.go\n", nil
+		default:
+			return "", fmt.Errorf("unexpected git %s", c.key())
+		}
+	}
+	r := &Rebaser{
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Updater:               &testUpdater{},
+		AutoRebaseCleanBehind: true,
+	}
+
+	results, err := r.RebaseAll(context.Background())
+	if err != nil {
+		t.Fatalf("RebaseAll: %v", err)
+	}
+	if len(results) != 1 || !results[0].Skipped || results[0].Reason != "dirty worktree" {
+		t.Fatalf("results = %+v, want skipped dirty worktree", results)
+	}
+	for _, call := range git.calls {
+		if call.key() == "fetch origin main" || call.key() == "rebase origin/main" ||
+			strings.HasPrefix(call.key(), "push ") {
+			t.Errorf("dirty worktree was mutated by %s", call.key())
+		}
+	}
 }
 
 func TestRebaseAllIdempotent(t *testing.T) {
@@ -182,6 +422,8 @@ func TestRebaseAllIdempotent(t *testing.T) {
 		switch c.key() {
 		case "worktree list --porcelain":
 			return worktreeListing, nil
+		case "status --porcelain":
+			return "", nil
 		case "fetch origin main":
 			return "", nil
 		case "rev-list --left-right --count origin/main...HEAD":
@@ -200,10 +442,12 @@ func TestRebaseAllIdempotent(t *testing.T) {
 			return "", fmt.Errorf("unexpected git %s", c.key())
 		}
 	}
+	updater := &testUpdater{}
 	r := &Rebaser{
-		Git:    git,
-		Store:  testStore{watches: []Watch{testWatch(311, "oldsha")}},
-		Merger: testMerger{},
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Updater:               updater,
+		AutoRebaseCleanBehind: true,
 	}
 
 	first, err := r.RebaseAll(context.Background())
@@ -223,8 +467,8 @@ func TestRebaseAllIdempotent(t *testing.T) {
 	if pushes := git.callsFor("push --force-with-lease origin feat/w311"); len(pushes) != 1 {
 		t.Errorf("force pushes = %d, want 1", len(pushes))
 	}
-	if rebases := git.callsFor("rebase origin/main"); len(rebases) != 1 {
-		t.Errorf("rebases = %d, want 1", len(rebases))
+	if len(updater.heads) != 1 {
+		t.Errorf("head updates = %+v, want 1", updater.heads)
 	}
 }
 
@@ -234,14 +478,10 @@ func TestRebaseAllSkipsMergedAndMissingWorktrees(t *testing.T) {
 		switch c.key() {
 		case "worktree list --porcelain":
 			return worktreeListing, nil
-		case "fetch origin main", "rev-list --left-right --count origin/main...HEAD", "rebase origin/main":
-			if c.dir != "/wt/w311" {
-				t.Errorf("command %s ran in %q, want only /wt/w311", c.key(), c.dir)
-			}
-			if c.key() == "rev-list --left-right --count origin/main...HEAD" {
-				return "2\t0\n", nil
-			}
+		case "status --porcelain", "fetch origin main", "rebase origin/main":
 			return "", nil
+		case "rev-list --left-right --count origin/main...HEAD":
+			return "2\t0\n", nil
 		case "rev-parse HEAD":
 			return "newsha\n", nil
 		case "push --force-with-lease origin feat/w311":
@@ -257,7 +497,10 @@ func TestRebaseAllSkipsMergedAndMissingWorktrees(t *testing.T) {
 			testWatch(312, "sha312"),
 			testWatch(313, "sha313"),
 		}},
-		Merger: testMerger{merged: map[int]bool{312: true}},
+		Merger:                testMerger{merged: map[int]bool{312: true}},
+		Updater:               &testUpdater{},
+		HeadRefs:              &testHeadRefs{byPR: map[int]string{313: "fix/no-worktree"}},
+		AutoRebaseCleanBehind: true,
 	}
 
 	results, err := r.RebaseAll(context.Background())
@@ -275,5 +518,80 @@ func TestRebaseAllSkipsMergedAndMissingWorktrees(t *testing.T) {
 	}
 	if !results[2].Skipped || results[2].Reason != "no worktree" {
 		t.Errorf("PR 313 result = %+v, want skipped no worktree", results[2])
+	}
+}
+
+func TestRebaseAllHeadRefResolverError(t *testing.T) {
+	git := &fakeGit{}
+	git.respond = func(c gitCall) (string, error) {
+		if c.key() == "worktree list --porcelain" {
+			return worktreeListing, nil
+		}
+		return "", fmt.Errorf("unexpected git %s", c.key())
+	}
+	wantErr := errors.New("graphql snapshot unavailable")
+	r := &Rebaser{
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		Updater:               &testUpdater{},
+		HeadRefs:              &testHeadRefs{err: wantErr},
+		AutoRebaseCleanBehind: true,
+	}
+
+	results, err := r.RebaseAll(context.Background())
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if !errors.Is(results[0].Err, wantErr) || results[0].Pushed {
+		t.Errorf("result = %+v, want resolver error and no push", results[0])
+	}
+	for _, call := range git.calls {
+		if call.key() != "worktree list --porcelain" {
+			t.Errorf("git ran %s after a head ref error", call.key())
+		}
+	}
+}
+
+func TestRebaseAllNeedsUpdaterBeforePush(t *testing.T) {
+	git := successGit(worktreeListing, "feat/w311")
+	r := &Rebaser{
+		Git:                   git,
+		Store:                 testStore{watches: []Watch{testWatch(311, "oldsha")}},
+		AutoRebaseCleanBehind: true,
+	}
+
+	results, err := r.RebaseAll(context.Background())
+	if err == nil {
+		t.Fatal("RebaseAll: want an error when no updater is installed")
+	}
+	if results[0].Pushed || results[0].Err == nil {
+		t.Errorf("result = %+v, want no push and an error", results[0])
+	}
+	if pushes := git.callsFor("push --force-with-lease origin feat/w311"); len(pushes) != 0 {
+		t.Errorf("branch was pushed without an updater: %+v", pushes)
+	}
+}
+
+func TestParseWorktreesSkipsDetached(t *testing.T) {
+	listing := `worktree /wt/attached
+HEAD oldsha
+branch refs/heads/feat/w311
+
+worktree /wt/detached
+HEAD detachedsha
+
+worktree /wt/main
+HEAD mainsha
+branch refs/heads/main
+`
+	got := parseWorktrees(listing)
+	if len(got) != 2 {
+		t.Fatalf("worktrees = %+v, want two attached entries", got)
+	}
+	if got[0].dir != "/wt/attached" || got[0].branch != "feat/w311" || got[0].head != "oldsha" {
+		t.Errorf("first worktree = %+v, want /wt/attached feat/w311 oldsha", got[0])
+	}
+	if got[1].dir != "/wt/main" || got[1].branch != "main" {
+		t.Errorf("second worktree = %+v, want /wt/main main", got[1])
 	}
 }
