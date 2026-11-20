@@ -382,6 +382,30 @@ func (srv *server) api(t *testing.T, method, path, data string) apiResp {
 	return resp
 }
 
+// apiAttempt runs the same `opencode api` CLI as api, but reports a non-zero
+// exit instead of failing the test. Negative controls need the CLI error body
+// as a fact: a stubbed or overly permissive API would answer 200 here.
+func (srv *server) apiAttempt(t *testing.T, method, path, data string) (apiResp, string, error) {
+	t.Helper()
+	args := []string{"api", "--server", srv.url}
+	if data != "" {
+		args = append(args, "-d", data)
+	}
+	args = append(args, method, path)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, openBin, args...)
+	cmd.Env = append(os.Environ(), "OPENCODE_PASSWORD="+srv.password)
+	out, err := cmd.CombinedOutput()
+	var resp apiResp
+	if json.Unmarshal(out, &resp) != nil {
+		// Error bodies are not apiResp JSON (they carry a _tag and an HTTP
+		// status line). An empty Data is the fact that no wake was created.
+		resp = apiResp{}
+	}
+	return resp, string(out), err
+}
+
 type sseCollector struct {
 	cmd       *exec.Cmd
 	cancel    context.CancelFunc
@@ -550,6 +574,70 @@ func newSession(t *testing.T, srv *server) apiSession {
 	return session
 }
 
+// apiMessage is the part of Session.Message.Info that the live wake check
+// reads: type, text, id and creation time. The schema is a union, so unknown
+// fields are ignored on purpose.
+type apiMessage struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	Text string `json:"text"`
+	Time struct {
+		Created   int64 `json:"created"`
+		Completed int64 `json:"completed"`
+	} `json:"time"`
+	Finish string `json:"finish"`
+}
+
+// waitWakeMessages polls the real /api/session/{id}/message endpoint until the
+// session both received the wake (a user message with the exact token) and
+// continued the turn (an assistant message created at or after that user
+// message). It never invents either fact: both must come from the API.
+func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeout time.Duration) (apiMessage, apiMessage, []apiMessage) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var seen []apiMessage
+	var user, assistant apiMessage
+	for {
+		resp := srv.api(t, "GET", "/api/session/"+sessionID+"/message", "")
+		// srv.api already unwrapped the envelope's `data` field, so resp.Data
+		// is the array of Session.Message.Info values itself.
+		var list []apiMessage
+		if err := json.Unmarshal(resp.Data, &list); err != nil {
+			t.Fatalf("GET /api/session/%s/message: не JSON: %s (%v)", sessionID, resp.Data, err)
+		}
+		seen = list
+		user, assistant = apiMessage{}, apiMessage{}
+		for _, m := range list {
+			if m.Type == "user" && strings.Contains(m.Text, token) {
+				user = m
+				break
+			}
+		}
+		if user.ID != "" {
+			for _, m := range list {
+				if m.Type == "assistant" && m.Time.Created >= user.Time.Created {
+					assistant = m
+					break
+				}
+			}
+		}
+		if user.ID != "" && assistant.ID != "" {
+			return user, assistant, seen
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	summary := make([]string, 0, len(seen))
+	for _, m := range seen {
+		summary = append(summary, fmt.Sprintf("%s:%s", m.Type, m.ID))
+	}
+	t.Fatalf("сессия %s не подтвердила wake за %s: user(token=%q)=%v assistant=%v сообщения=%v",
+		sessionID, timeout, token, user.ID != "", assistant.ID != "", summary)
+	return apiMessage{}, apiMessage{}, seen
+}
+
 // waitPluginActive polls /api/plugin until the real server reports the loaded
 // plugin. The plugin is loaded lazily, so a session must exist first.
 func waitPluginActive(t *testing.T, srv *server) pluginInfo {
@@ -666,8 +754,10 @@ func tail(t *testing.T, path string) string {
 // not the "tests exist in every card" rule from ADR 0010.
 
 // frozenScenarioHash is sha256 of the sorted scenario names joined by "\n",
-// with no trailing newline. Recorded before the first run of this suite.
-const frozenScenarioHash = "10243acbe29965cac6288c2cd06464a511d4ae9701468bd0c9dd7987e30002b3"
+// with no trailing newline. Revised when live_wake_via_opencode_api was added:
+// the wake is now also verified on the direct POST /prompt HTTP path, not only
+// through the plugin's events.jsonl poller.
+const frozenScenarioHash = "85303c45e4ba658331746a10d0a6c492bc387daa6a56c730d5bb9bf22af58d01"
 
 type e2eScenario struct {
 	name string
@@ -681,6 +771,7 @@ var e2eScenarios = []e2eScenario{
 	{"mcp_go_sdk_CommandTransport", testMCPWithGoSDK},
 	{"mcp_inspector_optional", testInspectorOptional},
 	{"opencode_wake_with_reference_plugin", runWakePositive},
+	{"live_wake_via_opencode_api", runLiveWakeViaAPI},
 	{"live_opencode_full_mcp_cycle", runLiveMCPCycle},
 	{"negative_control_stub_handler_must_fail", runNegativeControl},
 }
@@ -782,6 +873,75 @@ func runNegativeControl(t *testing.T, _ string) {
 	if facts.Receipt || facts.Posted || facts.PromptOK {
 		t.Fatal("заглушка записала квитанцию или вызвала prompt")
 	}
+}
+
+// --- wake straight through the OpenCode HTTP API -----------------------------
+
+// runLiveWakeViaAPI proves that a beacon wake pointer posted directly to
+// POST /api/session/{sessionID}/prompt with delivery=steer is received by a
+// real opencode session and continues its turn. This path does not go through
+// the plugin: the official HTTP endpoint is the wake transport. Only the
+// `opencode api` CLI is used, the same tool as the other live scenarios; no
+// hand-written JSON-RPC client is involved.
+func runLiveWakeViaAPI(t *testing.T, _ string) {
+	t.Helper()
+	base := newBase(t, "wake-api")
+	srv := startServer(t, base, "")
+	defer stopServer(srv)
+
+	session := newSession(t, srv)
+
+	token := "BEACON-WAKE-" + fmt.Sprint(time.Now().UnixNano())
+	watchID := "watch-wake-e2e-" + fmt.Sprint(time.Now().UnixNano())
+	wakeText := fmt.Sprintf(`{"kind":"verdict","verdict":"keep_working","watchID":%q,"target":"wake-e2e","token":%q}`, watchID, token)
+	body := fmt.Sprintf(`{"text":%q,"delivery":"steer"}`, wakeText)
+
+	resp := srv.api(t, "POST", "/api/session/"+session.ID+"/prompt", body)
+	var ack struct {
+		ID        string `json:"id"`
+		SessionID string `json:"sessionID"`
+		Type      string `json:"type"`
+		Delivery  string `json:"delivery"`
+		Payload   struct {
+			Text string `json:"text"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(resp.Data, &ack); err != nil {
+		t.Fatalf("POST prompt: не JSON: %s (%v)", resp.Data, err)
+	}
+	if ack.ID == "" || ack.Type != "user" || ack.Delivery != "steer" ||
+		ack.SessionID != session.ID || ack.Payload.Text != wakeText {
+		t.Fatalf("prompt ack не подтверждает steer-доставку: %+v", ack)
+	}
+	t.Logf("POST /api/session/%s/prompt: ack id=%s type=%s delivery=%s text=%q",
+		session.ID, ack.ID, ack.Type, ack.Delivery, ack.Payload.Text)
+
+	user, assistant, all := waitWakeMessages(t, srv, session.ID, token, 30*time.Second)
+	t.Logf("сессия получила wake: user=%s created=%d; агент продолжил: assistant=%s created=%d; всего сообщений=%d",
+		user.ID, user.Time.Created, assistant.ID, assistant.Time.Created, len(all))
+	// Honesty: the configured model may be unavailable in a given environment.
+	// opencode still records the assistant turn; whether it ended in content or
+	// in a provider error is a fact we log, not a success we claim.
+	t.Logf("результат хода: finish=%q", assistant.Finish)
+
+	// Negative control: a bogus sessionID must not create a false wake.
+	bogusID := "ses_wake_e2e_missing_" + fmt.Sprint(time.Now().UnixNano())
+	badBody := fmt.Sprintf(`{"text":%q,"delivery":"steer"}`, "beacon wake NO-WAKE")
+	badResp, badOut, badErr := srv.apiAttempt(t, "POST", "/api/session/"+bogusID+"/prompt", badBody)
+	if badErr == nil {
+		t.Fatalf("негативный контроль: невалидный sessionID принят: %+v", badResp)
+	}
+	if len(badResp.Data) != 0 {
+		t.Fatalf("негативный контроль: получен wake-ack для невалидной сессии: %s", badResp.Data)
+	}
+	if !strings.Contains(badOut, "SessionNotFoundError") && !strings.Contains(badOut, "404") {
+		t.Fatalf("негативный контроль: нет ошибки 404/SessionNotFoundError: %s", badOut)
+	}
+	// Prove nothing was created for the bogus id either.
+	if _, missingOut, missingErr := srv.apiAttempt(t, "GET", "/api/session/"+bogusID+"/message", ""); missingErr == nil {
+		t.Fatalf("негативный контроль: невалидная сессия была создана: %s", missingOut)
+	}
+	t.Logf("негативный контроль: POST в несуществующую сессию отклонён (%s); сессия не создана", strings.TrimSpace(badOut))
 }
 
 // --- T3.146: full cycle on a live opencode ----------------------------------
