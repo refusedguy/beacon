@@ -840,6 +840,59 @@ func TestPromptSendsExplicitDeliveryModeT202(t *testing.T) {
 	}
 }
 
+// A wake usually reaches a subscriber whose last turn already succeeded. The
+// prompt must ask the host to resume that session, not only steer a new turn.
+func TestPromptResumesCompletedSessionT202(t *testing.T) {
+	var got []string
+	api := &T202API{T202Runner: func(_ context.Context, args ...string) ([]byte, error) {
+		got = append([]string(nil), args...)
+		return []byte(`{"data":{"id":"msg_resumed","sessionID":"ses_done"}}`), nil
+	}}
+	const text = `<beacon-event>{"watchID":"w","obligationID":"o","revision":1,"verdict":"ready"}</beacon-event>`
+	id, err := api.Prompt(context.Background(), "ses_done", text, T202DeliverySteer)
+	if err != nil {
+		t.Fatalf("Prompt: %v", err)
+	}
+	if id != "msg_resumed" {
+		t.Fatalf("id = %q, want msg_resumed", id)
+	}
+	if len(got) != 5 || got[0] != "api" || got[1] != "POST" ||
+		got[2] != "/api/session/ses_done/prompt" || got[3] != "--data" {
+		t.Fatalf("api call = %q", got)
+	}
+	var sent struct {
+		Text     string `json:"text"`
+		Delivery string `json:"delivery"`
+		Resume   *bool  `json:"resume"`
+	}
+	if err := json.Unmarshal([]byte(got[4]), &sent); err != nil {
+		t.Fatalf("decode --data: %v", err)
+	}
+	if sent.Resume == nil || !*sent.Resume {
+		t.Fatalf("resume = %v, want true in %s", sent.Resume, got[4])
+	}
+	if sent.Delivery != "steer" {
+		t.Fatalf("delivery = %q, want steer", sent.Delivery)
+	}
+	if sent.Text != text {
+		t.Fatalf("text = %q, want %q", sent.Text, text)
+	}
+}
+
+func TestPromptRejectsInvalidSessionIDWithoutRunnerT202(t *testing.T) {
+	called := false
+	api := &T202API{T202Runner: func(context.Context, ...string) ([]byte, error) {
+		called = true
+		return []byte(`{"data":{"id":"msg_1"}}`), nil
+	}}
+	if _, err := api.Prompt(context.Background(), "not-a-session", "wake", T202DeliverySteer); err == nil {
+		t.Fatal("invalid session id must be rejected")
+	}
+	if called {
+		t.Fatal("runner must not be called for an invalid session id")
+	}
+}
+
 func TestParkSendsQueueDeliveryT202(t *testing.T) {
 	api, got := T202captureAPI(t, `{"data":{"id":"msg_parked"}}`)
 	id, err := api.Park(context.Background(), "ses_test", "park")
