@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -170,6 +171,9 @@ func (c *CLI) runAgents(args []string) int {
 	route := fs.Bool("route", false, "показать агента, просящего внимания")
 	handoff := fs.String("handoff", "", "передать задачу в другую сессию")
 	to := fs.String("to", "", "сессия-получатель для --handoff")
+	task := fs.String("task", "", "задача для привязки репозитория (T3.158)")
+	repo := fs.String("repo", "", "репозиторий мультирепо-задачи (T3.158)")
+	worktree := fs.String("worktree", "", "путь отдельного worktree (T3.158)")
 	if !parseFlags("agents", args, c.errOut, fs) {
 		return 2
 	}
@@ -184,6 +188,17 @@ func (c *CLI) runAgents(args []string) int {
 			return 2
 		}
 		return c.runHandoff(*handoff, *to)
+	}
+	if *task != "" || *repo != "" || *worktree != "" {
+		if *route {
+			fmt.Fprintln(c.errOut, "beacon agents: привязка репозитория и --route несовместимы")
+			return 2
+		}
+		if *task == "" || *repo == "" {
+			fmt.Fprintln(c.errOut, "beacon agents: привязка репозитория требует --task <taskID> и --repo <путь>")
+			return 2
+		}
+		return c.runBindRepo(*task, *repo, *worktree)
 	}
 
 	if err := readServiceRegistration(); err != nil {
@@ -837,6 +852,256 @@ func (c *CLI) runHandoff(taskID, to string) int {
 		return 2
 	}
 	if err := json.NewEncoder(c.out).Encode(rec); err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: %v\n", err)
+		return 2
+	}
+	return 0
+}
+
+// ---- ADR 0063 фича 6 / T3.158: мультирепо-задача с отдельным worktree ----
+//
+// Одна задача может изменять несколько репозиториев. Для каждого репозитория
+// Beacon выделяет отдельный git-worktree со своей веткой и хранит состояние PR.
+// Привязка идемпотентна: повторный вызов для той же пары задача/репозиторий
+// возвращает существующий worktree и не дёргает git.
+
+// repoWorktree is one repository bound to a task with its own isolated
+// worktree and branch. PR is zero until one is opened; Reviewed records the
+// review gate that must pass before the PR is sent (ADR 0063, фича 6).
+type repoWorktree struct {
+	TaskID   string    `json:"taskID"`
+	Repo     string    `json:"repo"`
+	Worktree string    `json:"worktree"`
+	Branch   string    `json:"branch"`
+	PR       int       `json:"pr,omitempty"`
+	Reviewed bool      `json:"reviewed,omitempty"`
+	BoundAt  time.Time `json:"boundAt"`
+}
+
+// repoWorktreeState is the on-disk registry of task/repo bindings. It lives in
+// Beacon state so a binding survives a restart of the CLI.
+type repoWorktreeState struct {
+	Bindings []repoWorktree `json:"bindings"`
+}
+
+const (
+	repoWorktreesFile = "repo-worktrees.json"
+	repoWorktreesDir  = "worktrees"
+)
+
+var (
+	repoWorktreeReadFile  = os.ReadFile
+	repoWorktreeWriteFile = os.WriteFile
+	repoWorktreeMkdirAll  = os.MkdirAll
+)
+
+func repoWorktreesPath() (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, repoWorktreesFile), nil
+}
+
+// repoWorktreeKey derives a short, deterministic, filesystem-safe key from a
+// task/repo pair. It keeps worktrees and branches distinct across tasks and
+// repositories without leaking path characters into branch names.
+func repoWorktreeKey(taskID, repo string) string {
+	sum := sha256.Sum256([]byte(taskID + "\x00" + repo))
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+// taskWorktreeBranch is the branch created for a task/repo binding.
+func taskWorktreeBranch(taskID, repo string) string {
+	return "beacon/" + repoWorktreeKey(taskID, repo)
+}
+
+// defaultRepoWorktreePath is the isolated checkout path used when a caller
+// does not pass one explicitly.
+func defaultRepoWorktreePath(taskID, repo string) (string, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, repoWorktreesDir, repoWorktreeKey(taskID, repo)), nil
+}
+
+// loadRepoWorktrees reads the registry. A missing file is an empty registry.
+// Two bindings with the same task and repo, or the same worktree path, are
+// corrupt and rejected rather than handed out again.
+func loadRepoWorktrees() (repoWorktreeState, error) {
+	path, err := repoWorktreesPath()
+	if err != nil {
+		return repoWorktreeState{}, err
+	}
+	data, err := repoWorktreeReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return repoWorktreeState{}, nil
+	}
+	if err != nil {
+		return repoWorktreeState{}, fmt.Errorf("%s: не удалось прочитать реестр worktree: %v", path, err)
+	}
+	var st repoWorktreeState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return repoWorktreeState{}, fmt.Errorf("%s: неверный реестр worktree: %v", path, err)
+	}
+	seenPair := map[string]bool{}
+	seenPath := map[string]string{}
+	for _, b := range st.Bindings {
+		pair := b.TaskID + "\x00" + b.Repo
+		if seenPair[pair] {
+			return repoWorktreeState{}, fmt.Errorf("%s: задача %s и репозиторий %s привязаны дважды", path, b.TaskID, b.Repo)
+		}
+		seenPair[pair] = true
+		if b.Worktree != "" {
+			if prev, ok := seenPath[b.Worktree]; ok {
+				return repoWorktreeState{}, fmt.Errorf("%s: worktree %s общий для %s и %s", path, b.Worktree, prev, pair)
+			}
+			seenPath[b.Worktree] = pair
+		}
+	}
+	return st, nil
+}
+
+func saveRepoWorktrees(st repoWorktreeState) error {
+	path, err := repoWorktreesPath()
+	if err != nil {
+		return err
+	}
+	if err := repoWorktreeMkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("%s: не создан каталог состояния: %v", path, err)
+	}
+	data, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return repoWorktreeWriteFile(path, append(data, '\n'), 0o600)
+}
+
+// findRepoWorktree returns the binding for a task/repo pair, if any.
+func findRepoWorktree(st repoWorktreeState, taskID, repo string) (repoWorktree, bool) {
+	for _, b := range st.Bindings {
+		if b.TaskID == taskID && b.Repo == repo {
+			return b, true
+		}
+	}
+	return repoWorktree{}, false
+}
+
+// worktreeAddArgs builds the git arguments for an isolated worktree with its
+// own branch. Beacon drives git only through the injected runner (ADR 0005).
+func worktreeAddArgs(branch, worktree string) []string {
+	return []string{"worktree", "add", "-b", branch, worktree}
+}
+
+// bindRepoWorktree binds taskID to repo and allocates a separate worktree with
+// its own branch. An existing binding is returned unchanged, so a retry cannot
+// create a second checkout. An explicit worktree path lets callers place the
+// checkout; an empty path uses the deterministic default under Beacon state.
+func (c *CLI) bindRepoWorktree(taskID, repo, worktree string) (repoWorktree, error) {
+	taskID = strings.TrimSpace(taskID)
+	repo = strings.TrimSpace(repo)
+	if taskID == "" {
+		return repoWorktree{}, fmt.Errorf("пустая задача")
+	}
+	if repo == "" {
+		return repoWorktree{}, fmt.Errorf("пустой репозиторий")
+	}
+
+	st, err := loadRepoWorktrees()
+	if err != nil {
+		return repoWorktree{}, err
+	}
+	if b, ok := findRepoWorktree(st, taskID, repo); ok {
+		return b, nil
+	}
+
+	if strings.TrimSpace(worktree) == "" {
+		worktree, err = defaultRepoWorktreePath(taskID, repo)
+		if err != nil {
+			return repoWorktree{}, err
+		}
+	}
+	for _, b := range st.Bindings {
+		if b.Worktree == worktree {
+			return repoWorktree{}, fmt.Errorf("worktree %s уже занят задачей %s", worktree, b.TaskID)
+		}
+	}
+
+	branch := taskWorktreeBranch(taskID, repo)
+	res := c.run(repo, "git", worktreeAddArgs(branch, worktree), nil)
+	if res.code != 0 {
+		msg := strings.TrimSpace(string(res.stderr))
+		if msg == "" {
+			msg = fmt.Sprintf("git завершился с кодом %d", res.code)
+		}
+		return repoWorktree{}, fmt.Errorf("git worktree add не удался: %s", msg)
+	}
+
+	b := repoWorktree{TaskID: taskID, Repo: repo, Worktree: worktree, Branch: branch, BoundAt: time.Now().UTC()}
+	st.Bindings = append(st.Bindings, b)
+	if err := saveRepoWorktrees(st); err != nil {
+		return repoWorktree{}, err
+	}
+	return b, nil
+}
+
+// updateRepoWorktree mutates and persists one binding. It fails when the
+// task/repo pair is unknown, so a review gate or PR never attaches to the
+// wrong worktree.
+func updateRepoWorktree(taskID, repo string, fn func(*repoWorktree) error) (repoWorktree, error) {
+	st, err := loadRepoWorktrees()
+	if err != nil {
+		return repoWorktree{}, err
+	}
+	for i := range st.Bindings {
+		if st.Bindings[i].TaskID == taskID && st.Bindings[i].Repo == repo {
+			if err := fn(&st.Bindings[i]); err != nil {
+				return repoWorktree{}, err
+			}
+			if err := saveRepoWorktrees(st); err != nil {
+				return repoWorktree{}, err
+			}
+			return st.Bindings[i], nil
+		}
+	}
+	return repoWorktree{}, fmt.Errorf("связка задачи %s и репозитория %s не найдена", taskID, repo)
+}
+
+// markRepoReviewed passes the review gate for a task/repo binding. A PR may be
+// recorded only after this call (ADR 0063, фича 6).
+func markRepoReviewed(taskID, repo string) (repoWorktree, error) {
+	return updateRepoWorktree(taskID, repo, func(b *repoWorktree) error {
+		b.Reviewed = true
+		return nil
+	})
+}
+
+// recordRepoPR stores the PR number for a reviewed binding. Recording a PR on
+// an unreviewed binding is rejected: the review gate runs before the PR is
+// sent.
+func recordRepoPR(taskID, repo string, pr int) (repoWorktree, error) {
+	if pr <= 0 {
+		return repoWorktree{}, fmt.Errorf("неверный номер PR %d", pr)
+	}
+	return updateRepoWorktree(taskID, repo, func(b *repoWorktree) error {
+		if !b.Reviewed {
+			return fmt.Errorf("PR задачи %s и репозитория %s до review-гейта", taskID, repo)
+		}
+		b.PR = pr
+		return nil
+	})
+}
+
+// runBindRepo implements beacon agents --task <id> --repo <path> [--worktree <path>].
+// It allocates the isolated worktree and prints the binding as JSON.
+func (c *CLI) runBindRepo(taskID, repo, worktree string) int {
+	b, err := c.bindRepoWorktree(taskID, repo, worktree)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon agents: не удалось выделить worktree: %v\n", err)
+		return 2
+	}
+	if err := json.NewEncoder(c.out).Encode(b); err != nil {
 		fmt.Fprintf(c.errOut, "beacon agents: %v\n", err)
 		return 2
 	}
