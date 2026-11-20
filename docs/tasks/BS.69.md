@@ -1,5 +1,5 @@
 # BS.69. Lineage дочерних thread
-Статус: todo
+Статус: dropped
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/session/delegation.go
@@ -12,3 +12,6 @@
 Шаги: parent_id, lineage, transfer контекста, уведомление родителю при вопросе.
 Проверка: Вопрос ребёнка появляется в родительском чате с именем ребёнка.
 Приёмка: Ссылки на thread создаёт сервер.
+
+## Подтверждение
+- PR #394 DROPPED: Child-thread lineage/context transfer from old T3 architecture; no child threads in the 7-tool/ses_ contract.

@@ -1,5 +1,5 @@
 # BS.58. Rebase pointer через daemon waker
-Статус: todo
+Статус: done
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/orchestrator/daemon.go
@@ -12,3 +12,6 @@
 Шаги: Переиспользовать wake registry, не трогать ветку сервером.
 Проверка: Один revision даёт один wake.
 Приёмка: Неизвестный адаптер падает на opencode.
+
+## Подтверждение
+- PR #389 MERGED: 2026-11-20 (squash).

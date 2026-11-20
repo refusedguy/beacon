@@ -1,5 +1,5 @@
 # BS.55. Синхронизация backlog
-Статус: todo
+Статус: dropped
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/tasks/backlog_sync.go
@@ -12,3 +12,6 @@
 Шаги: Чтение issue, сверка с карточками, создание карточек через batch-apply.
 Проверка: Повтор синхронизации не создаёт дубликаты.
 Приёмка: Конфликт статусов пишется в аудит.
+
+## Подтверждение
+- PR #394 DROPPED: Automated creation of cards via batch-apply contradicts AGENTS.md ('batch-apply без команды владельца'); issue triage is covered by .opencode/skills/night-shift.

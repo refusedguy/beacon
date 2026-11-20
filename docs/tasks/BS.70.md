@@ -1,5 +1,5 @@
 # BS.70. Архивация событий и квитанций
-Статус: todo
+Статус: done
 Фаза: P5
 Тип: task
 Владелец файлов: internal/infra/store/snapshots.go, internal/infra/store/receipts.go
@@ -12,3 +12,6 @@
 Шаги: Retention join, сохранение high-water marks и prompt anchors.
 Проверка: Старый курсор получает snapshot_required.
 Приёмка: Повтор старой команды всё ещё дедуплицируется.
+
+## Подтверждение
+- PR #385 MERGED: 2026-11-20 (squash).

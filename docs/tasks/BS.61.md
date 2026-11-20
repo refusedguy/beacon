@@ -1,5 +1,5 @@
 # BS.61. Детерминированный channel reply
-Статус: todo
+Статус: dropped
 Фаза: P5
 Тип: task
 Владелец файлов: internal/infra/channel/reply.go
@@ -12,3 +12,6 @@
 Шаги: Маршруты user/group, target_param, подавление дублей.
 Проверка: Если модель уже ответила, автоматический reply пропущен.
 Приёмка: Локальные turn не затрагиваются.
+
+## Подтверждение
+- PR #394 DROPPED: Deterministic channel reply (user/group/suppress_tools) has no channel layer in main; conflicts with the seven-tool MCP contract.

@@ -1,5 +1,5 @@
 # BS.5. SQLite WAL, один writer, read pool
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/store/db.go
@@ -12,3 +12,6 @@
 Шаги: PRAGMA journal_mode=WAL, foreign_keys=ON, migrate, отдельный writer mutex.
 Проверка: Параллельные чтения не блокируют writer.
 Приёмка: Схема имеет version и путь миграции из старого состояния.
+
+## Подтверждение
+- PR #385 MERGED: 2026-11-20 (squash).

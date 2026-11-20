@@ -1,5 +1,5 @@
 # BS.9. Project scope по resolved cwd и git root
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/project.go, cmd/beacon/doctor.go
@@ -12,3 +12,6 @@
 Шаги: Вычислять project id из cwd и git root, хранить worktree id и branch.
 Проверка: Два проекта дают две разные БД.
 Приёмка: Клиент не может выбрать чужой проект явно.
+
+## Подтверждение
+- PR #392 MERGED: 2026-11-20 (squash).
