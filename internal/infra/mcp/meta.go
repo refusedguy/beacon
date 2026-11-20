@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -441,4 +442,145 @@ func BuildWakeContext(ref TaskRef, _ *UntrustedBody) (WakeContext, error) {
 		},
 		Gates: map[string]bool{"requireReview": true, "bodyTrusted": false},
 	}, nil
+}
+
+// ---- ADR 0090 / T5.33: привязка Watch к сеансу через registry ----
+
+// SessionBinding is one executor registry entry. It ties a Watch revision to
+// the opaque session that waits on it. The entry carries no agent name: its
+// identity is the session ID, so two sessions never collapse into one row even
+// when they report the same agent (ADR 0090, T5.33).
+type SessionBinding struct {
+	SessionID string
+	WatchID   string
+	Revision  uint64
+	Adapter   string
+	Target    string
+	Role      string
+}
+
+// WatchSessionRegistry is the MCP-side executor registry. Entries are keyed by
+// the opaque session ID from _meta["ai.opencode/sessionID"]. A request without
+// that key falls back to notify.target, so a client that sends no session
+// metadata can still register (T5.33). The registry never interprets the key
+// and never uses an agent name as a key (ADR 0090).
+type WatchSessionRegistry struct {
+	mu      sync.Mutex
+	entries map[string]SessionBinding
+}
+
+// NewWatchSessionRegistry builds an empty registry.
+func NewWatchSessionRegistry() *WatchSessionRegistry {
+	return &WatchSessionRegistry{entries: make(map[string]SessionBinding)}
+}
+
+// RegistrySessionID returns the identity used to key a registry entry. The
+// session ID from _meta wins; a caller without it falls back to the target it
+// supplied. The value is passed through verbatim: no parsing, no validation,
+// no access decision (WORKER-PROMPT §2).
+func RegistrySessionID(req *mcpsdk.CallToolRequest, fallback string) string {
+	if id := SessionIDFromRequest(req); id != nil && *id != "" {
+		return *id
+	}
+	return fallback
+}
+
+// BindWatchPR derives the session key from req and records the Watch and its
+// revision from out under that key. A repeat with the same session, Watch and
+// revision is a no-op and reports created=false. A new revision under the same
+// session replaces the earlier binding, so a delayed write cannot wake an old
+// revision (T5.35, T5.37).
+func (r *WatchSessionRegistry) BindWatchPR(req *mcpsdk.CallToolRequest, in WatchPRInput, out WatchPROutput) (SessionBinding, bool, error) {
+	if r == nil {
+		return SessionBinding{}, false, domain.NewAppError(domain.CodePersistFailed, "registry: session registry is nil")
+	}
+
+	adapter, target := "", ""
+	if in.Notify != nil {
+		adapter, target = in.Notify.Adapter, in.Notify.Target
+	}
+	sessionID := RegistrySessionID(req, target)
+	if sessionID == "" {
+		return SessionBinding{}, false, domain.NewAppError(domain.CodeInvalidInput,
+			"registry: no sessionID in _meta and no notify.target")
+	}
+	if out.WatchID == "" {
+		return SessionBinding{}, false, domain.NewAppError(domain.CodeInvalidInput,
+			"registry: watch_pr response carries no watchID")
+	}
+
+	binding := SessionBinding{
+		SessionID: sessionID,
+		WatchID:   out.WatchID,
+		Revision:  out.Revision,
+		Adapter:   adapter,
+		Target:    target,
+		Role:      string(in.Role),
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.entries == nil {
+		r.entries = make(map[string]SessionBinding)
+	}
+	if old, ok := r.entries[sessionID]; ok && old == binding {
+		return old, false, nil
+	}
+	r.entries[sessionID] = binding
+	return binding, true, nil
+}
+
+// Lookup returns the binding stored for sessionID. Two different sessions
+// always resolve to different bindings because the key is the session ID.
+func (r *WatchSessionRegistry) Lookup(sessionID string) (SessionBinding, bool) {
+	if r == nil {
+		return SessionBinding{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.entries[sessionID]
+	return b, ok
+}
+
+// Len reports how many session entries the registry holds.
+func (r *WatchSessionRegistry) Len() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.entries)
+}
+
+// Snapshot copies every entry keyed by session ID, so a caller cannot mutate
+// the registry through the returned map.
+func (r *WatchSessionRegistry) Snapshot() map[string]SessionBinding {
+	out := make(map[string]SessionBinding)
+	if r == nil {
+		return out
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for k, v := range r.entries {
+		out[k] = v
+	}
+	return out
+}
+
+// RegisterAndBind registers a Watch through h and writes its session binding
+// before returning. A binding that cannot be written fails the whole call, so
+// an executor can only report "waiting, watchID" once the registry already
+// knows which session to wake (T5.34).
+func RegisterAndBind(ctx context.Context, h *WatchPRHandler, reg *WatchSessionRegistry, req *mcpsdk.CallToolRequest, in WatchPRInput) (WatchPROutput, error) {
+	if h == nil {
+		return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, "registry: watch_pr handler is nil")
+	}
+	out, err := h.Register(ctx, req, in)
+	if err != nil {
+		return WatchPROutput{}, err
+	}
+	if _, _, err := reg.BindWatchPR(req, in, out); err != nil {
+		return WatchPROutput{}, err
+	}
+	return out, nil
 }

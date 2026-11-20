@@ -776,3 +776,179 @@ func TestAgentFindingsPrecision(t *testing.T) {
 		})
 	}
 }
+
+// ---- T5.33: the session ID from _meta keys the registry entry ----
+
+func TestRegistrySessionIDUsesMetaThenTarget(t *testing.T) {
+	cases := []struct {
+		name     string
+		req      *mcpsdk.CallToolRequest
+		fallback string
+		want     string
+	}{
+		{"meta wins over target", sessionReq("session-A"), "target-A", "session-A"},
+		{"no meta falls back to target", nil, "target-B", "target-B"},
+		{"empty meta value falls back", sessionReq(""), "target-C", "target-C"},
+		{"no meta and no target", nil, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RegistrySessionID(tc.req, tc.fallback); got != tc.want {
+				t.Errorf("RegistrySessionID = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Two calls from different sessions must produce two entries, even when the
+// notify pair and the Watch revision are identical. The adapter name is never
+// a key: only the opaque session ID is (ADR 0090, T5.33).
+func TestWatchSessionRegistryDifferentSessions(t *testing.T) {
+	reg := NewWatchSessionRegistry()
+	in := watchPRTestInput("bind-sha", domain.RoleExecutor)
+	out := WatchPROutput{WatchID: "watch-1", Revision: 1}
+
+	first, created, err := reg.BindWatchPR(sessionReq("session-A"), in, out)
+	if err != nil || !created {
+		t.Fatalf("first BindWatchPR: created=%v err=%v", created, err)
+	}
+	second, created, err := reg.BindWatchPR(sessionReq("session-B"), in, out)
+	if err != nil || !created {
+		t.Fatalf("second BindWatchPR: created=%v err=%v", created, err)
+	}
+
+	if reg.Len() != 2 {
+		t.Fatalf("registry entries = %d, want 2", reg.Len())
+	}
+	if first.SessionID != "session-A" || second.SessionID != "session-B" {
+		t.Fatalf("session IDs = %q, %q; want session-A, session-B", first.SessionID, second.SessionID)
+	}
+	snap := reg.Snapshot()
+	if _, ok := snap["session-A"]; !ok {
+		t.Error("no entry keyed by session-A")
+	}
+	if _, ok := snap["session-B"]; !ok {
+		t.Error("no entry keyed by session-B")
+	}
+	if _, ok := snap[in.Notify.Adapter]; ok {
+		t.Error("adapter name used as a registry key")
+	}
+	if _, ok := snap[in.Notify.Target]; ok {
+		t.Error("notify target used as a key while _meta carried a session ID")
+	}
+}
+
+// A request without _meta still registers under notify.target.
+func TestWatchSessionRegistryMissingMetaDoesNotBreak(t *testing.T) {
+	reg := NewWatchSessionRegistry()
+	in := watchPRTestInput("fallback-sha", domain.RoleExecutor)
+	out := WatchPROutput{WatchID: "watch-1", Revision: 1}
+
+	got, created, err := reg.BindWatchPR(nil, in, out)
+	if err != nil {
+		t.Fatalf("BindWatchPR without _meta: %v", err)
+	}
+	if !created {
+		t.Fatal("first binding reported created=false")
+	}
+	if got.SessionID != in.Notify.Target {
+		t.Errorf("binding session ID = %q, want %q", got.SessionID, in.Notify.Target)
+	}
+	if _, ok := reg.Lookup(in.Notify.Target); !ok {
+		t.Error("no entry keyed by notify.target")
+	}
+}
+
+func TestWatchSessionRegistryIdempotentAndRebinding(t *testing.T) {
+	reg := NewWatchSessionRegistry()
+	in := watchPRTestInput("rebind-sha", domain.RoleExecutor)
+
+	first, created, err := reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 1})
+	if err != nil || !created {
+		t.Fatalf("first BindWatchPR: created=%v err=%v", created, err)
+	}
+	again, created, err := reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 1})
+	if err != nil {
+		t.Fatalf("repeat BindWatchPR: %v", err)
+	}
+	if created {
+		t.Error("repeat of the same binding reported created=true")
+	}
+	if again != first {
+		t.Errorf("repeat changed the binding: %+v -> %+v", first, again)
+	}
+	if reg.Len() != 1 {
+		t.Fatalf("entries after repeat = %d, want 1", reg.Len())
+	}
+
+	next, created, err := reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 2})
+	if err != nil || !created {
+		t.Fatalf("rebind: created=%v err=%v", created, err)
+	}
+	if next.Revision != 2 || reg.Len() != 1 {
+		t.Fatalf("rebind gave revision=%d entries=%d; want 2, 1", next.Revision, reg.Len())
+	}
+	if stored, ok := reg.Lookup("session-A"); !ok || stored.Revision != 2 {
+		t.Errorf("stored binding after rebind = %+v, ok=%v", stored, ok)
+	}
+}
+
+func TestWatchSessionRegistryRejectsMissingAddress(t *testing.T) {
+	reg := NewWatchSessionRegistry()
+	in := watchPRTestInput("reject-sha", domain.RoleExecutor)
+	in.Notify = nil
+
+	_, _, err := reg.BindWatchPR(nil, in, WatchPROutput{WatchID: "watch-1", Revision: 1})
+	assertCode(t, err, domain.CodeInvalidInput)
+	if reg.Len() != 0 {
+		t.Errorf("failed bind wrote %d entries, want 0", reg.Len())
+	}
+
+	_, _, err = reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{})
+	assertCode(t, err, domain.CodeInvalidInput)
+	if reg.Len() != 0 {
+		t.Errorf("empty watchID wrote %d entries, want 0", reg.Len())
+	}
+}
+
+// RegisterAndBind makes the registry entry exist before the caller can report
+// "waiting, watchID". A missing _meta still registers under notify.target.
+func TestRegisterAndBindLinksWatchToSession(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		req  *mcpsdk.CallToolRequest
+		key  string
+	}{
+		{"with session meta", sessionReq("session-X"), "session-X"},
+		{"without session meta", nil, "delivery-target"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := NewWatchSessionRegistry()
+			h := NewWatchPRHandler(newMemStore(), nil, &stepClock{t: time.Now()})
+			in := watchPRTestInput("link-sha", domain.RoleExecutor)
+
+			out, err := RegisterAndBind(context.Background(), h, reg, tc.req, in)
+			if err != nil {
+				t.Fatalf("RegisterAndBind: %v", err)
+			}
+			b, ok := reg.Lookup(tc.key)
+			if !ok {
+				t.Fatalf("no registry entry keyed by %q", tc.key)
+			}
+			if b.WatchID != out.WatchID || b.Revision != out.Revision {
+				t.Errorf("binding = %+v, want watchID=%q revision=%d", b, out.WatchID, out.Revision)
+			}
+		})
+	}
+}
+
+func TestRegisterAndBindFailsOnRegistryError(t *testing.T) {
+	h := NewWatchPRHandler(newMemStore(), nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("fail-sha", domain.RoleExecutor)
+	in.Notify = nil
+	_, err := RegisterAndBind(context.Background(), h, nil, sessionReq("session-X"), in)
+	assertCode(t, err, domain.CodePersistFailed)
+
+	_, err = RegisterAndBind(context.Background(), nil, NewWatchSessionRegistry(), sessionReq("session-X"), in)
+	assertCode(t, err, domain.CodePersistFailed)
+}
