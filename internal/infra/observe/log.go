@@ -2,6 +2,7 @@ package observe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -300,4 +301,106 @@ func (l *RunLog) Close() error {
 		return nil
 	}
 	return l.close()
+}
+
+// GateResultFence is the info string of the machine-readable fence at the end
+// of a gate report (ADR 0235, ADR 0236). Fences that appear earlier in a report
+// are illustrative and are never the gate result (HD-048).
+const GateResultFence = "aif-gate-result"
+
+// fencedBlock is one closed fenced code block of a report. info is the text on
+// the opening fence line after the marker. body is the lines up to the closing
+// fence.
+type fencedBlock struct {
+	info string
+	body string
+}
+
+// fenceMarker reports the marker run and the info string of an opening fence
+// line. A fence opens with at least three backticks or tildes after optional
+// indentation. marker is empty when the line does not open a fence.
+func fenceMarker(line string) (marker, info string) {
+	s := strings.TrimLeft(line, " \t")
+	if len(s) < 3 || (s[0] != '`' && s[0] != '~') {
+		return "", ""
+	}
+	n := 0
+	for n < len(s) && s[n] == s[0] {
+		n++
+	}
+	if n < 3 {
+		return "", ""
+	}
+	if s[0] == '`' && strings.ContainsRune(s[n:], '`') {
+		return "", ""
+	}
+	return s[:n], strings.TrimSpace(s[n:])
+}
+
+// closesFence reports whether line closes a fence opened with marker. A closing
+// fence holds only the same marker character, at least as many times as the
+// opener, and may be indented.
+func closesFence(line, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	s := strings.TrimSpace(line)
+	if len(s) < len(marker) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != marker[0] {
+			return false
+		}
+	}
+	return true
+}
+
+// lastFencedBlock returns the last closed fenced block in out. An unclosed
+// fence takes the rest of the output, so no block after it can be returned.
+func lastFencedBlock(out string) (fencedBlock, bool) {
+	lines := strings.Split(out, "\n")
+	var last fencedBlock
+	found := false
+	for i := 0; i < len(lines); i++ {
+		marker, info := fenceMarker(lines[i])
+		if marker == "" {
+			continue
+		}
+		body := make([]string, 0, len(lines)-i-1)
+		closed := false
+		for j := i + 1; j < len(lines); j++ {
+			if closesFence(lines[j], marker) {
+				closed = true
+				i = j
+				break
+			}
+			body = append(body, lines[j])
+		}
+		if !closed {
+			break
+		}
+		last = fencedBlock{info: info, body: strings.Join(body, "\n")}
+		found = true
+	}
+	return last, found
+}
+
+// LastGateResult returns the JSON body of the final fenced code block of out
+// when that block is a gate result. The block qualifies when its info string
+// is GateResultFence and its body is a JSON object. Only the final block can
+// qualify: an earlier fence is illustrative, so the function ignores it even
+// when it carries a gate result marker and valid JSON. The boolean is false
+// for empty output, an unclosed fence, a wrong marker and malformed JSON.
+func LastGateResult(out string) (string, bool) {
+	block, ok := lastFencedBlock(out)
+	if !ok || !strings.EqualFold(block.info, GateResultFence) {
+		return "", false
+	}
+	body := strings.TrimSpace(block.body)
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &obj); err != nil || obj == nil {
+		return "", false
+	}
+	return body, true
 }
