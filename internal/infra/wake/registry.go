@@ -57,6 +57,10 @@ func builtinDeliverer(adapter string) domain.WakeDeliverer {
 	}
 }
 
+// Registry satisfies the adapter-aware wake port, so a verdict source such as
+// cibridge can pass each subscriber's adapter straight into Deliver.
+var _ domain.AdapterWakeDeliverer = (*Registry)(nil)
+
 // Registry maps an adapter name to a domain.WakeDeliverer. The zero value is
 // usable: Deliver falls back to the built-in deliverers when nothing is
 // registered. Register is safe to call concurrently with Deliver.

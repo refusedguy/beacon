@@ -20,9 +20,10 @@ type Bridge struct {
 	store    domain.Store
 	ci       domain.CIProvider
 	clock    domain.Clock
-	interval time.Duration
-	waker    domain.WakeDeliverer
-	reader   ReadStamper
+	interval     time.Duration
+	waker        domain.WakeDeliverer
+	adapterWaker domain.AdapterWakeDeliverer
+	reader       ReadStamper
 }
 
 // ReadStamper stamps a durable read on an obligation. The MCP tool owns the
@@ -42,14 +43,32 @@ func (b *Bridge) WithReader(s ReadStamper) *Bridge {
 	return b
 }
 
-// WithWaker binds a wake adapter. A terminal verdict then steers each
-// subscriber's session through the host harness. Without one the verdict is
-// still persisted, so a caller that reads get_result is unaffected.
-func (b *Bridge) WithWaker(w domain.WakeDeliverer) *Bridge {
+// WithWaker binds a wake adapter. A non-terminal verdict then steers each
+// subscriber's session through the host harness. It accepts both the legacy
+// WakeDeliverer, which has no adapter, and the adapter-aware
+// AdapterWakeDeliverer, so a registry can be wired in without changing callers.
+// Without a waker the verdict is still persisted, so a caller that reads
+// get_result is unaffected.
+func (b *Bridge) WithWaker(w any) *Bridge {
 	if b == nil {
 		return nil
 	}
-	b.waker = w
+	switch v := w.(type) {
+	case domain.AdapterWakeDeliverer:
+		b.adapterWaker = v
+	case domain.WakeDeliverer:
+		b.waker = v
+	}
+	return b
+}
+
+// WithAdapterWaker binds an adapter-aware wake deliverer explicitly. The
+// subscriber's adapter is passed on every delivery so a registry can dispatch.
+func (b *Bridge) WithAdapterWaker(w domain.AdapterWakeDeliverer) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.adapterWaker = w
 	return b
 }
 
@@ -227,17 +246,26 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 		}
 		// A terminal verdict closes the Watch without steering a session:
 		// there is no further work for a subscriber to do.
-		if b.waker == nil || isTerminalVerdict(verdict) {
+		if isTerminalVerdict(verdict) || (b.waker == nil && b.adapterWaker == nil) {
 			continue
 		}
 		// A subscriber registered from an MCP call carries its opaque host
 		// session id. Only those are wakeable; a plain notify target is not.
-		if err := b.waker.Deliver(ctx, sub.ID, domain.WakePayload{
+		// The adapter-aware path passes sub.Adapter so a registry can select
+		// the right harness; the legacy path keeps the old deliverer shape.
+		p := domain.WakePayload{
 			WatchID:      next.ID,
 			ObligationID: id,
 			Revision:     next.Revision,
 			Verdict:      string(verdict),
-		}); err != nil {
+		}
+		var err error
+		if b.adapterWaker != nil {
+			err = b.adapterWaker.Deliver(ctx, sub.Adapter, sub.ID, p)
+		} else {
+			err = b.waker.Deliver(ctx, sub.ID, p)
+		}
+		if err != nil {
 			log.Printf("cibridge: wake %s: %v", sub.ID, err)
 		}
 	}

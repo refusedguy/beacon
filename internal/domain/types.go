@@ -249,6 +249,14 @@ type WakeDeliverer interface {
 	Deliver(ctx context.Context, sessionID string, p WakePayload) error
 }
 
+// AdapterWakeDeliverer is the adapter-aware variant of WakeDeliverer. It carries
+// the subscriber's adapter name on every call, so a registry can dispatch by
+// it. The adapter is an opaque string owned by the subscriber; the domain still
+// never names a concrete harness.
+type AdapterWakeDeliverer interface {
+	Deliver(ctx context.Context, adapter, sessionID string, p WakePayload) error
+}
+
 // Clock supplies time to the domain. Adapters implement it in infra.
 type Clock interface {
 	Now() time.Time
