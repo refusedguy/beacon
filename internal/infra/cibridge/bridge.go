@@ -835,7 +835,96 @@ func (b *Bridge) closeWatch(ctx context.Context, w domain.Watch, verdict domain.
 	b.cycleEvent(cycleID, "watch_closed", observe.Fields{
 		"watchID": next.ID, "verdict": string(verdict), "revision": next.Revision,
 	})
+	// A terminal verdict used to be silent: every subscriber went to finished
+	// and nobody learned the wave item ended. Push one durable confirmation to
+	// the bound project orchestrator so it can start the next wave. Executors
+	// stay finished and receive no wake.
+	b.notifyOrchestratorTerminal(ctx, next, verdict, now, cycleID)
 	return 1
+}
+
+// terminalNotice builds the orchestrator's wake text for a terminal verdict.
+// Every field is machine-readable so the receiver can branch on it without
+// parsing prose. The structured WakePayload fields are duplicated here on
+// purpose: the wake text is the envelope the orchestrator actually reads.
+func terminalNotice(w domain.Watch, verdict domain.Verdict, revision uint64) string {
+	return fmt.Sprintf(
+		"terminal_ack: watchID=%s, pr=%s#%d, verdict=%s, closeReason=%s, revision=%d, nextAction: report_to_orchestrator, nextHint: wave item done; proceed to next wave",
+		w.ID, w.Repo, w.PR, verdict, w.CloseReason, revision,
+	)
+}
+
+// notifyOrchestratorTerminal sends exactly one confirmation to the project's
+// bound orchestrator after a Watch closes on a terminal verdict. The address
+// comes from OrchestratorIDSource (BoundOrchestrator(projectKey)); an unbound
+// project sends nothing and never panics. Delivery is remembered on the
+// obligation keyed by (watchID, revision, orchestratorSession), so a repeated
+// Refresh cannot steer the same wave item twice, even after a restart. There
+// is no in-memory flag: SQLite is the only deduplication state.
+func (b *Bridge) notifyOrchestratorTerminal(ctx context.Context, w domain.Watch, verdict domain.Verdict, now time.Time, cycleID string) {
+	if b == nil {
+		return
+	}
+	var session string
+	if b.orchestratorID != nil {
+		session = strings.TrimSpace(b.orchestratorID())
+	}
+	if session == "" {
+		observe.WakeSkipped("", w.ID, "terminal verdict: no bound orchestrator")
+		return
+	}
+	if b.waker == nil && b.adapterWaker == nil {
+		return
+	}
+
+	obligationID := domain.ObligationKey(w.ID, w.Revision, session)
+	o, err := b.store.Obligation(obligationID)
+	if err == nil && !o.DeliveredAt.IsZero() {
+		observe.WakeSkipped("", w.ID, "terminal confirmation already delivered for this revision")
+		return
+	}
+	if err != nil {
+		o = domain.Obligation{
+			ID: obligationID, WatchID: w.ID, Revision: w.Revision,
+			SubscriberID: session, VerdictPointer: verdict, StagedAt: now,
+		}
+		if err := b.store.SaveObligation(o); err != nil {
+			observe.ActorError("cibridge-terminal-obligation", w.ID, err)
+			return
+		}
+	}
+	// Arm the ladder at delivery, as wakeOne does. A subscriber that only owns
+	// a readable pointer never gets here because no wake is addressed to it.
+	b.stage(ctx, o, verdict, now)
+
+	p := domain.WakePayload{
+		WatchID: w.ID, ObligationID: obligationID,
+		Revision: w.Revision, Verdict: terminalNotice(w, verdict, w.Revision),
+	}
+	adapter := b.blockedAdapter(w, session)
+	var deliverErr error
+	if b.adapterWaker != nil {
+		deliverErr = b.adapterWaker.Deliver(ctx, adapter, session, p)
+	} else {
+		deliverErr = b.waker.Deliver(ctx, session, p)
+	}
+	if deliverErr != nil {
+		outcome := domain.OutcomeTransportFailed
+		if isDeadSessionErr(deliverErr) {
+			outcome = domain.OutcomeIndeterminate
+		}
+		b.recordDelivery(ctx, obligationID, 1, outcome, now)
+		observe.WakeFailed(adapter, w.ID, deliverErr, w.Revision)
+		observe.ActorError("wake-terminal", w.ID, deliverErr)
+		log.Printf("cibridge: terminal confirmation %s: %v", session, deliverErr)
+		return
+	}
+	observe.WakeDelivered(adapter, w.ID, w.Revision)
+	b.recordDelivery(ctx, obligationID, 1, domain.OutcomePosted, now)
+	b.markDelivered(obligationID, now, 1, "")
+	b.cycleEvent(cycleID, "terminal_confirmation", observe.Fields{
+		"watchID": w.ID, "sessionID": session, "verdict": string(verdict),
+	})
 }
 
 // applyBlocked records a failure already present on the base branch. It moves
