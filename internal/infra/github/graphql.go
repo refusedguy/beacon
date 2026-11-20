@@ -33,6 +33,10 @@ const (
 	// aliases and the measured jump at 80 (WORKER-PROMPT 4.6, T0.2).
 	ChunkSizeTier2 = 50
 
+	// ChunkSizeBatch is the safe chunk for the combined batch: PR aliases carry
+	// contexts(first:50), so the tier-2 cap applies to base aliases as well.
+	ChunkSizeBatch = 50
+
 	// MaxParallel is the cap on concurrent requests to GitHub.
 	MaxParallel = 2
 
@@ -47,16 +51,24 @@ const (
 	Tier1 Tier = 1
 	// Tier2 reads statusCheckRollup contexts(first:50).
 	Tier2 Tier = 2
+	// TierBatch reads PR state, PR contexts and base-ref contexts in one
+	// document. It is the tier used by BatchProvider.FetchBatch.
+	TierBatch Tier = 3
 )
 
-// Alias is one repository/pullRequest binding inside a GraphQL batch.
-// Name is the unique GraphQL alias, for example "p0".
+// Alias is one repository binding inside a GraphQL batch. Name is the unique
+// GraphQL alias, for example "p0". A PR alias sets PR; a base alias sets
+// BaseRef instead and reads ref(qualifiedName) on the same repository.
 type Alias struct {
-	Name  string
-	Owner string
-	Repo  string
-	PR    int
+	Name    string
+	Owner   string
+	Repo    string
+	PR      int
+	BaseRef string
 }
+
+// IsBase reports whether the alias reads a base branch instead of a PR.
+func (a Alias) IsBase() bool { return a.BaseRef != "" }
 
 // AliasesFromWatches builds deduplicated, uniquely named aliases from active
 // watches. Closed watches are skipped. Two watches for the same PR collapse
@@ -87,7 +99,7 @@ func AliasesFromWatches(watches []domain.Watch) []Alias {
 // ChunkSize returns the measured chunk size for a tier. Unknown tiers use the
 // conservative tier-1 size.
 func ChunkSize(tier Tier) int {
-	if tier == Tier2 {
+	if tier == Tier2 || tier == TierBatch {
 		return ChunkSizeTier2
 	}
 	return ChunkSizeTier1
@@ -111,19 +123,30 @@ func Chunk(aliases []Alias, tier Tier) [][]Alias {
 	return chunks
 }
 
-// BuildQuery renders one GraphQL document for a chunk of aliases.
+// BuildQuery renders one GraphQL document for a chunk of aliases. A TierBatch
+// document may mix PR aliases and base-ref aliases, so a broken main can be
+// attributed in the same round trip as the PRs it blocks.
 func BuildQuery(tier Tier, aliases []Alias) string {
 	var b strings.Builder
 	b.WriteString("query {\n")
 	for _, a := range aliases {
 		fmt.Fprintf(&b, "  %s: repository(owner:%s, name:%s) {\n", a.Name, strconv.Quote(a.Owner), strconv.Quote(a.Repo))
-		fmt.Fprintf(&b, "    pullRequest(number:%d) {\n", a.PR)
-		if tier == Tier2 {
-			b.WriteString(tier2Fields(a.PR))
+		if tier == TierBatch && a.IsBase() {
+			b.WriteString(baseRefFields(a.BaseRef))
 		} else {
-			b.WriteString(tier1Fields)
+			fmt.Fprintf(&b, "    pullRequest(number:%d) {\n", a.PR)
+			switch tier {
+			case Tier2:
+				b.WriteString(tier2Fields(a.PR))
+			case TierBatch:
+				b.WriteString(tier1Fields)
+				b.WriteString(tier2Fields(a.PR))
+			default:
+				b.WriteString(tier1Fields)
+			}
+			b.WriteString("    }\n")
 		}
-		b.WriteString("    }\n  }\n")
+		b.WriteString("  }\n")
 	}
 	b.WriteString("}\n")
 	return b.String()
@@ -178,6 +201,46 @@ func tier2Fields(pr int) string {
           }
         }
       }
+`
+}
+
+// baseRefFields reads the rollup contexts of a branch tip. The fragments stay
+// inside contexts.nodes, as in tier2Fields, and there is no isRequired field
+// because a base branch is not attached to a pull request. The oid identifies
+// which main commit produced a failure, so a later green run can clear it.
+func baseRefFields(baseRef string) string {
+	return `    ref(qualifiedName:` + strconv.Quote("refs/heads/"+baseRef) + `) {
+      target {
+        ... on Commit {
+          oid
+          statusCheckRollup {
+            contexts(first:50) {
+              nodes {
+                __typename
+                ... on CheckRun {
+                  name
+                  status
+                  conclusion
+                  detailsUrl
+                  checkSuite {
+                    id
+                  }
+                }
+                ... on StatusContext {
+                  context
+                  state
+                  targetUrl
+                }
+              }
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+        }
+      }
+    }
 `
 }
 
