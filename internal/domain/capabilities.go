@@ -170,3 +170,107 @@ func ParseCapabilities(values []string) ([]Capability, error) {
 	}
 	return out, nil
 }
+
+// Scope is one independent right a scope token may carry (T3.235). The three
+// rights are deliberately separate: a token that can read status cannot wake a
+// worker or stop an obligation unless that right was granted at issue time.
+// Scopes extend neither Role nor Capability; those dictionaries stay closed.
+type Scope string
+
+const (
+	// ScopeWake lets a holder wake a worker or accept an obligation.
+	ScopeWake Scope = "wake"
+	// ScopeRead lets a holder read status and verdicts.
+	ScopeRead Scope = "read"
+	// ScopeStop lets a holder stop or revoke an obligation.
+	ScopeStop Scope = "stop"
+)
+
+var scopeValues = []Scope{ScopeWake, ScopeRead, ScopeStop}
+
+// Valid reports whether s is one of the canonical scopes. The zero value and
+// any unknown string fail closed.
+func (s Scope) Valid() bool {
+	for _, known := range scopeValues {
+		if s == known {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseScope converts an external scope string into a Scope. Whitespace is
+// trimmed; an unknown value is rejected so a misspelled right cannot silently
+// become an empty grant.
+func ParseScope(s string) (Scope, bool) {
+	sc := Scope(strings.TrimSpace(s))
+	if !sc.Valid() {
+		return "", false
+	}
+	return sc, true
+}
+
+// ValidScopes returns the canonical scopes in declaration order as a copy.
+func ValidScopes() []Scope {
+	out := make([]Scope, len(scopeValues))
+	copy(out, scopeValues)
+	return out
+}
+
+// ScopeMask is a set of Scope rights encoded as bits. It is the privilege
+// ceiling of a scope token: the mask records the maximum rights the token may
+// ever exercise, and an authorization check can only test membership in that
+// set, never widen it. The zero value grants nothing.
+type ScopeMask uint8
+
+const (
+	ScopeFlagWake ScopeMask = 1 << iota
+	ScopeFlagRead
+	ScopeFlagStop
+
+	scopeFlagAll = ScopeFlagWake | ScopeFlagRead | ScopeFlagStop
+)
+
+// Flag returns the single bit representing s. An unknown scope has no bit and
+// is therefore never granted.
+func (s Scope) Flag() ScopeMask {
+	switch s {
+	case ScopeWake:
+		return ScopeFlagWake
+	case ScopeRead:
+		return ScopeFlagRead
+	case ScopeStop:
+		return ScopeFlagStop
+	default:
+		return 0
+	}
+}
+
+// Allows reports whether the ceiling m grants scope s. Unknown scopes are
+// never granted, so a typo in a handler cannot widen access.
+func (m ScopeMask) Allows(s Scope) bool {
+	flag := s.Flag()
+	return flag != 0 && m&flag == flag
+}
+
+// Valid reports whether m contains only known scope bits.
+func (m ScopeMask) Valid() bool {
+	return m&^scopeFlagAll == 0
+}
+
+// ParseScopes builds a ceiling mask from a list of external scope strings. It
+// treats the list as a set, so order and duplicates do not matter, trims each
+// entry and returns an INVALID_INPUT AppError naming the first unknown value.
+// An empty list yields the zero mask that grants nothing.
+func ParseScopes(values []string) (ScopeMask, error) {
+	var m ScopeMask
+	for _, raw := range values {
+		s, ok := ParseScope(raw)
+		if !ok {
+			return 0, NewAppError(CodeInvalidInput,
+				fmt.Sprintf("scope: неизвестное право %q", raw))
+		}
+		m |= s.Flag()
+	}
+	return m, nil
+}
