@@ -206,10 +206,69 @@ func applyClosures(root string, closures map[string]cardClosure, dryRun bool) er
 	return nil
 }
 
+type ghCheck struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+
+// applyMergePlan merges only PRs whose required checks are all PASS. A PR
+// with no checks is doc-only by the repository's paths-ignore rule. The plan
+// itself comes from a research agent; this function re-verifies every gate
+// with gh before acting.
+func applyMergePlan(decisions []mergeDecision) {
+	merged, held := 0, 0
+	for _, d := range decisions {
+		if d.Action != "merge" {
+			fmt.Printf("PR %d: %s (%s)\n", d.PR, d.Action, d.Reason)
+			continue
+		}
+		raw, err := exec.Command("gh", "pr", "checks", fmt.Sprint(d.PR), "--json", "name,state").Output()
+		if err != nil {
+			fmt.Printf("PR %d: hold (checks unavailable: %v)\n", d.PR, err)
+			held++
+			continue
+		}
+		var checks []ghCheck
+		if err := json.Unmarshal(raw, &checks); err != nil {
+			fmt.Printf("PR %d: hold (bad checks JSON)\n", d.PR)
+			held++
+			continue
+		}
+		required := map[string]bool{"build": true, "test": true, "gates": true, "gates-binary": true}
+		green := 0
+		blocked := false
+		for _, c := range checks {
+			if !required[c.Name] {
+				continue
+			}
+			if strings.EqualFold(c.State, "PASS") || strings.EqualFold(c.State, "SUCCESS") {
+				green++
+			} else {
+				blocked = true
+			}
+		}
+		if blocked || (len(checks) > 0 && green < len(required)) {
+			fmt.Printf("PR %d: hold (required checks not green)\n", d.PR)
+			held++
+			continue
+		}
+		cmd := exec.Command("gh", "pr", "merge", fmt.Sprint(d.PR), "--squash", "--delete-branch")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fmt.Printf("PR %d: merge failed: %s\n", d.PR, strings.TrimSpace(string(out)))
+			held++
+			continue
+		}
+		fmt.Printf("PR %d: MERGED\n", d.PR)
+		merged++
+	}
+	fmt.Printf("merge-plan: merged=%d held=%d\n", merged, held)
+}
+
 func main() {
 	dir := flag.String("dir", "", "batch directory with JSON files")
 	dryRun := flag.Bool("dry-run", false, "print files without writing")
 	check := flag.Bool("check", false, "validate JSON only, print a compact summary")
+	mergePlan := flag.Bool("merge-plan", false, "merge PRs listed in merge_decisions after verifying checks")
 	quietFlag := flag.Bool("quiet", false, "do not list every generated file")
 	commit := flag.Bool("commit", false, "git add and commit generated docs")
 	flag.Parse()
@@ -224,6 +283,14 @@ func main() {
 		os.Exit(1)
 	}
 	batches, problems := loadBatches(*dir)
+	if *mergePlan {
+		var decisions []mergeDecision
+		for _, b := range batches {
+			decisions = append(decisions, b.MergeDecisions...)
+		}
+		applyMergePlan(decisions)
+		return
+	}
 	for _, p := range problems {
 		fmt.Fprintf(os.Stderr, "SKIP %s\n", p)
 	}
