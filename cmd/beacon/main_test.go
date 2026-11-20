@@ -763,13 +763,15 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	if _, ok := watchLiveSource.(*liveOpencodeSource); !ok {
 		t.Fatalf("live source = %#v, want adapter over T3.144 client", watchLiveSource)
 	}
-	// The T3.144 client has only GET routes, so spawn and delivery stay
-	// uninstalled. This is the honest blocker for production writes until
-	// POST routes land.
-	if spawnSessionSpawner != nil {
-		t.Fatalf("spawn port = %#v, want nil until the client implements it", spawnSessionSpawner)
+	// T3.153 adapts the context-aware POST client to both write ports, so a
+	// resolved registration must install the same adapter for spawn and deliver.
+	// Without it the commands keep reporting an unwired port.
+	spawnCreator, ok := spawnSessionSpawner.(*clientSessionCreator)
+	if !ok || spawnCreator == nil {
+		t.Fatalf("spawn port = %#v, want *clientSessionCreator over the live client", spawnSessionSpawner)
 	}
-	if deliverTarget != nil {
-		t.Fatalf("delivery target = %#v, want nil until the client implements Prompt", deliverTarget)
+	deliverCreator, ok := deliverTarget.(*clientSessionCreator)
+	if !ok || deliverCreator != spawnCreator {
+		t.Fatalf("delivery port = %#v, want the same *clientSessionCreator as spawn", deliverTarget)
 	}
 }
