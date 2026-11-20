@@ -3,6 +3,7 @@ package cibridge
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,10 +23,10 @@ func (w *w381Waker) Deliver(_ context.Context, sessionID string, p domain.WakePa
 	return nil
 }
 
-// A Watch with two wakeable subscribers and one non-session subscriber gets
-// exactly two wakes. Each one carries the obligation of the session it was
-// sent to, and neither session receives the other's pointer.
-func TestW381BridgeWakesEachSubscriberOnlyItsObligation(t *testing.T) {
+// A failing check yields keep_working, whose only wake target is the executor.
+// The orchestrator subscriber and the non-session subscriber get no wake, and
+// the one delivery carries the executor's own obligation at the new revision.
+func TestW381BridgeWakesTargetRoleOnlyItsObligation(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -33,11 +34,11 @@ func TestW381BridgeWakesEachSubscriberOnlyItsObligation(t *testing.T) {
 	defer db.Close()
 
 	const (
-		watchID   = "watch:refusedguy/beacon:360:c35188e350120913bc3b4d7b05f1aace2c22142d"
-		headSHA   = "c35188e350120913bc3b4d7b05f1aace2c22142d"
-		executor  = "ses_e08778bafffegfXW4z5bgnTLHP"
-		orchestr  = "ses_e08f34cffffeQD2vSh7CXI3gqU"
-		notASess  = "notify-only"
+		watchID  = "watch:refusedguy/beacon:360:c35188e350120913bc3b4d7b05f1aace2c22142d"
+		headSHA  = "c35188e350120913bc3b4d7b05f1aace2c22142d"
+		executor = "ses_e08778bafffegfXW4z5bgnTLHP"
+		orchestr = "ses_e08f34cffffeQD2vSh7CXI3gqU"
+		notASess = "notify-only"
 	)
 	w := domain.Watch{
 		ID:      watchID,
@@ -56,7 +57,6 @@ func TestW381BridgeWakesEachSubscriberOnlyItsObligation(t *testing.T) {
 		t.Fatalf("SaveWatch: %v", err)
 	}
 
-	// A failing check yields a retry, a non-terminal verdict that must wake.
 	state := domain.PRState{
 		HeadRefOid: headSHA,
 		Checks: map[string]domain.Check{
@@ -69,40 +69,28 @@ func TestW381BridgeWakesEachSubscriberOnlyItsObligation(t *testing.T) {
 		t.Fatalf("Refresh updated %d watches, want 1", got)
 	}
 
-	if len(waker.calls) != 2 {
-		t.Fatalf("wakes = %d, want 2: %+v", len(waker.calls), waker.calls)
+	if len(waker.calls) != 1 {
+		t.Fatalf("wakes = %d, want 1: %+v", len(waker.calls), waker.calls)
 	}
-	want := map[string]string{
-		executor: domain.ObligationKey(watchID, 1, executor),
-		orchestr: domain.ObligationKey(watchID, 1, orchestr),
+	call := waker.calls[0]
+	if call.session != executor {
+		t.Fatalf("wake went to %q, want executor %q", call.session, executor)
 	}
-	seen := make(map[string]bool)
-	for _, call := range waker.calls {
-		obligation, ok := want[call.session]
-		if !ok {
-			t.Fatalf("wake went to unexpected session %q", call.session)
-		}
-		if seen[call.session] {
-			t.Fatalf("session %q received two wakes", call.session)
-		}
-		seen[call.session] = true
-		if call.payload.ObligationID != obligation {
-			t.Fatalf("%s got obligation %q, want %q", call.session, call.payload.ObligationID, obligation)
-		}
-		if call.payload.WatchID != watchID || call.payload.Revision != 1 {
-			t.Fatalf("%s got pointer %+v", call.session, call.payload)
-		}
-		o, err := db.Obligation(obligation)
-		if err != nil {
-			t.Fatalf("Obligation(%s): %v", obligation, err)
-		}
-		if o.SubscriberID != call.session {
-			t.Fatalf("obligation addresses %q but wake went to %q", o.SubscriberID, call.session)
-		}
+	wantObligation := domain.ObligationKey(watchID, 1, executor)
+	if call.payload.ObligationID != wantObligation {
+		t.Fatalf("obligation = %q, want %q", call.payload.ObligationID, wantObligation)
 	}
-	for session := range want {
-		if !seen[session] {
-			t.Fatalf("subscriber %q received no wake", session)
-		}
+	if call.payload.WatchID != watchID || call.payload.Revision != 1 {
+		t.Fatalf("pointer = %+v", call.payload)
+	}
+	if !strings.Contains(call.payload.Verdict, "keep_working") || !strings.Contains(call.payload.Verdict, "build") {
+		t.Fatalf("wake text = %q, want keep_working with the failed check", call.payload.Verdict)
+	}
+	o, err := db.Obligation(wantObligation)
+	if err != nil {
+		t.Fatalf("Obligation(%s): %v", wantObligation, err)
+	}
+	if o.SubscriberID != executor {
+		t.Fatalf("obligation addresses %q but wake went to %q", o.SubscriberID, executor)
 	}
 }
