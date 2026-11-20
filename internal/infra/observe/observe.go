@@ -44,27 +44,40 @@ func ParseLevel(raw string) (Level, bool) {
 // Field names of one event. Keeping the keys here avoids typos in what an
 // operator greps for.
 const (
-	FieldEvent    = "event"
-	FieldWatchID  = "watchID"
-	FieldPR       = "pr"
-	FieldVerdict  = "verdict"
-	FieldAdapter  = "adapter"
-	FieldDuration = "duration"
-	FieldError    = "error"
-	FieldRevision = "revision"
-	FieldActor    = "actor"
-	FieldReason   = "reason"
-	FieldStatus   = "status"
-	FieldCommand  = "command"
-	FieldWatches  = "watches"
-	FieldReady    = "ready"
-	FieldRetry    = "retry"
-	FieldMerges   = "merges"
-	FieldWakes    = "wakes"
-	FieldRefs     = "refs"
-	FieldCount    = "count"
-	FieldUpdated  = "updated"
-	FieldSkipped  = "skipped"
+	FieldEvent     = "event"
+	FieldWatchID   = "watchID"
+	FieldPR        = "pr"
+	FieldVerdict   = "verdict"
+	FieldAdapter   = "adapter"
+	FieldDuration  = "duration"
+	FieldError     = "error"
+	FieldRevision  = "revision"
+	FieldActor     = "actor"
+	FieldReason    = "reason"
+	FieldStatus    = "status"
+	FieldCommand   = "command"
+	FieldWatches   = "watches"
+	FieldReady     = "ready"
+	FieldRetry     = "retry"
+	FieldMerges    = "merges"
+	FieldWakes     = "wakes"
+	FieldRefs      = "refs"
+	FieldCount     = "count"
+	FieldUpdated   = "updated"
+	FieldSkipped   = "skipped"
+	FieldCycleID   = "cycleID"
+	FieldBlockerID = "blockerID"
+	FieldPoints    = "points"
+)
+
+// Event names of the blocker and auto-merge transitions reported by the
+// orchestrator. Keeping the literals here lets callers log a fact without
+// agreeing on a string in every package.
+const (
+	BlockerOpened   = "blocker_opened"
+	BlockerResolved = "blocker_resolved"
+	OrphanEscalated = "orphan_escalated"
+	AutoMergeHeld   = "auto_merge_held"
 )
 
 // Fields are the structured values of one event.
@@ -149,8 +162,8 @@ func SetDefault(s Sink) {
 // nopSink drops every record and count.
 type nopSink struct{}
 
-func (nopSink) Log(Level, string, Fields)   {}
-func (nopSink) Inc(string, string)          {}
+func (nopSink) Log(Level, string, Fields)        {}
+func (nopSink) Inc(string, string)               {}
 func (nopSink) observeHistogram(string, float64) {}
 
 // Recorder combines a slog logger and a metric set into one Sink. A nil field
@@ -253,10 +266,10 @@ func Observe(name string, seconds float64) {
 // DaemonPass at the start of a pass and the CLI calls FlushCycle on exit, so
 // the summary is emitted without the loop needing to know about counters.
 type cycleTracker struct {
-	mu                                    sync.Mutex
-	start                                 time.Time
-	started                               bool
-	watches, ready, retry, merges, wakes  int
+	mu                                   sync.Mutex
+	start                                time.Time
+	started                              bool
+	watches, ready, retry, merges, wakes int
 }
 
 var cycles = &cycleTracker{start: time.Now()}
