@@ -56,10 +56,14 @@ type daemonCloser struct {
 	calls int
 	ids   []string
 	err   error
+	order *[]string
 }
 
 func (d *daemonCloser) run(ctx context.Context) error {
 	d.calls++
+	if d.order != nil {
+		*d.order = append(*d.order, "close-merged")
+	}
 	if d.err != nil {
 		return d.err
 	}
@@ -91,6 +95,56 @@ func daemonPorts(check *daemonCheckAll, orch *daemonOrchestrator, closer *daemon
 		Waker:       waker,
 		Log:         logf,
 	}
+}
+
+// daemonSubscribe is a mock of the Subscribe port. It counts calls and can
+// fail, so a pass can prove that orchestration still runs after a subscribe
+// error.
+type daemonSubscribe struct {
+	calls int
+	err   error
+	order *[]string
+}
+
+func (d *daemonSubscribe) run(context.Context) error {
+	d.calls++
+	if d.order != nil {
+		*d.order = append(*d.order, "subscribe")
+	}
+	return d.err
+}
+
+// daemonSummaryPort is a mock of the Summary port. It returns a fixed workload
+// report, so the daemon's log line can be checked against known counters.
+type daemonSummaryPort struct {
+	calls  int
+	report Workload
+	err    error
+	order  *[]string
+}
+
+func (d *daemonSummaryPort) run(context.Context) (Workload, error) {
+	d.calls++
+	if d.order != nil {
+		*d.order = append(*d.order, "summary")
+	}
+	return d.report, d.err
+}
+
+// daemonOrderPorts builds ports whose mocks record the order of every step.
+func daemonOrderPorts(order *[]string) (DaemonPorts, *daemonSubscribe, *daemonSummaryPort) {
+	check := &daemonCheckAll{hook: func() { *order = append(*order, "checkall") }}
+	sub := &daemonSubscribe{order: order}
+	summary := &daemonSummaryPort{order: order}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error {
+		*order = append(*order, "orchestrate")
+		return nil
+	}}
+	closer := &daemonCloser{order: order}
+	ports := daemonPorts(check, orch, closer, nil, nil)
+	ports.Subscribe = sub.run
+	ports.Summary = summary.run
+	return ports, sub, summary
 }
 
 func TestDaemonOnceRunsOnePass(t *testing.T) {
@@ -219,6 +273,113 @@ func TestDaemonLoopStopsOnCancel(t *testing.T) {
 func TestDaemonRunRequiresPorts(t *testing.T) {
 	if err := DaemonRun(context.Background(), DaemonPorts{}, time.Millisecond, true); err == nil {
 		t.Fatal("daemon must reject a port-less configuration")
+	}
+}
+
+// TestDaemonPassStepOrder pins the extension of the daemon pass: subscribe
+// runs between checkall and orchestrate, and the summary is printed after
+// orchestrate but before close-merged.
+func TestDaemonPassStepOrder(t *testing.T) {
+	var order []string
+	ports, sub, summary := daemonOrderPorts(&order)
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"checkall", "subscribe", "orchestrate", "summary", "close-merged"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("step order = %q, want %q", order, want)
+	}
+	if sub.calls != 1 || summary.calls != 1 {
+		t.Fatalf("subscribe/summary calls = %d/%d, want 1/1", sub.calls, summary.calls)
+	}
+}
+
+// A failing subscribe is logged but does not stop orchestrate, summary or
+// close-merged: the pass keeps all of its actions.
+func TestDaemonSubscribeErrorDoesNotStopPass(t *testing.T) {
+	var order []string
+	ports, sub, _ := daemonOrderPorts(&order)
+	sub.err = errors.New("subscribe boom")
+
+	var logs []string
+	ports.Log = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatalf("daemon must not fall on a subscribe error: %v", err)
+	}
+	want := []string{"checkall", "subscribe", "orchestrate", "summary", "close-merged"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("step order = %q, want %q", order, want)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "daemon: subscribe: subscribe boom") {
+		t.Fatalf("subscribe error not logged: %q", logs)
+	}
+}
+
+// The summary log line carries the same four headline counters as the workload
+// report, so a daemon pass can be compared with `beacon workload --format json`.
+func TestDaemonSummaryIsLogged(t *testing.T) {
+	ports, _, summary := daemonOrderPorts(new([]string))
+	summary.report = Workload{Total: 7, Ready: 2, NeedsAttention: 3, Watching: 4, Registered: 1}
+
+	var logs []string
+	ports.Log = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, fragment := range []string{
+		"total=7", "ready=2", "needsAttention=3", "watching=4", "registered=1",
+	} {
+		if !strings.Contains(joined, fragment) {
+			t.Fatalf("summary log %q is missing %q", logs, fragment)
+		}
+	}
+}
+
+// A failing summary is logged and the pass still closes merged Watches.
+func TestDaemonSummaryErrorIsLogged(t *testing.T) {
+	var order []string
+	ports, _, summary := daemonOrderPorts(&order)
+	summary.err = errors.New("summary boom")
+
+	var logs []string
+	ports.Log = func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	}
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatalf("daemon must not fall on a summary error: %v", err)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "daemon: summary: summary boom") {
+		t.Fatalf("summary error not logged: %q", logs)
+	}
+	want := []string{"checkall", "subscribe", "orchestrate", "summary", "close-merged"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("step order = %q, want %q", order, want)
+	}
+}
+
+// Older callers that do not set the two new ports keep the original three-step
+// pass. The existing daemonPorts helper intentionally leaves them nil.
+func TestDaemonWithoutSubscribeAndSummaryStillRuns(t *testing.T) {
+	check := &daemonCheckAll{}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	closer := &daemonCloser{}
+
+	if err := DaemonRun(context.Background(), daemonPorts(check, orch, closer, nil, nil), time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if check.calls != 1 || orch.calls != 1 || closer.calls != 1 {
+		t.Fatalf("calls = %d/%d/%d, want 1/1/1", check.calls, orch.calls, closer.calls)
 	}
 }
 

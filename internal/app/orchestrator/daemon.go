@@ -1,8 +1,9 @@
 // Package orchestrator implements the background daemon that drives one
-// automatic pass over Beacon Watches: check CI, merge what is ready, leave a
-// rebase pointer for the subscriber and close Watches whose PR is finished.
-// The loop owns no adapters. The composition root supplies the three actions
-// as narrow ports so tests can replace each one with a fake.
+// automatic pass over Beacon Watches: check CI, enroll the orchestrator on
+// active Watches, merge what is ready, print the workload summary and close
+// Watches whose PR is finished. The loop owns no adapters. The composition
+// root supplies the actions as narrow ports so tests can replace each one
+// with a fake.
 package orchestrator
 
 import (
@@ -22,15 +23,21 @@ import (
 // environment asks for a different value.
 const DaemonInterval = 3 * time.Minute
 
-// DaemonPorts are the three actions of one daemon pass.
+// DaemonPorts are the actions of one daemon pass.
 //
 // CheckAll lists open PRs, finds or registers their Watches and publishes the
-// verdict. Orchestrate merges ready Watches and hands retry/fail Watches to the
-// Waker. CloseMerged closes Watches whose PR is already merged or closed.
-// Every port is required; a nil Waker is allowed and simply suppresses wakes.
+// verdict. Subscribe enrolls the orchestrator on every active Watch before the
+// orchestrator pass. Orchestrate merges ready Watches and hands retry/fail
+// Watches to the Waker. Summary returns the workload snapshot the pass prints
+// after orchestration. CloseMerged closes Watches whose PR is already merged or
+// closed. CheckAll, Orchestrate and CloseMerged are required. Subscribe and
+// Summary are optional: a nil port skips that step, which keeps older callers
+// working. A nil Waker is allowed and simply suppresses wakes.
 type DaemonPorts struct {
 	CheckAll    func(ctx context.Context) error
+	Subscribe   func(ctx context.Context) error
 	Orchestrate func(ctx context.Context, waker Waker) error
+	Summary     func(ctx context.Context) (Workload, error)
 	CloseMerged func(ctx context.Context) error
 	Waker       Waker
 	Log         func(format string, args ...any)
@@ -40,8 +47,9 @@ type DaemonPorts struct {
 // ctx is cancelled. With once it stops after the first pass, which is what the
 // tests and one-shot invocations use.
 //
-// An error from any port is logged and swallowed: one failing pass must never
-// bring the daemon down or hide the other two actions.
+// One pass runs checkall, subscribe, orchestrate, summary and close-merged in
+// that order. An error from any port is logged and swallowed: one failing step
+// must never bring the daemon down or hide the remaining actions.
 func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, once bool) error {
 	if ports.CheckAll == nil || ports.Orchestrate == nil || ports.CloseMerged == nil {
 		return errors.New("daemon: checkall, orchestrate and close-merged ports are required")
@@ -62,8 +70,25 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 		if err := ports.CheckAll(ctx); err != nil {
 			logf("daemon: checkall: %v", err)
 		}
+		if ports.Subscribe != nil {
+			if err := ports.Subscribe(ctx); err != nil {
+				logf("daemon: subscribe: %v", err)
+			}
+		}
 		if err := ports.Orchestrate(ctx, ports.Waker); err != nil {
 			logf("daemon: orchestrate: %v", err)
+		}
+		if ports.Summary != nil {
+			report, err := ports.Summary(ctx)
+			if err != nil {
+				logf("daemon: summary: %v", err)
+			} else {
+				// The four headline counters use the same keys as
+				// `beacon workload --format json`, so one log line is
+				// comparable with the CLI report.
+				logf("daemon: summary: total=%d ready=%d needsAttention=%d watching=%d registered=%d",
+					report.Total, report.Ready, report.NeedsAttention, report.Watching, report.Registered)
+			}
 		}
 		if err := ports.CloseMerged(ctx); err != nil {
 			logf("daemon: close merged: %v", err)
