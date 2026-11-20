@@ -15,10 +15,17 @@ on:
 permissions:
   contents: read
 
+# В PR новый push отменяет устаревший прогон. На main отмены нет: каждый
+# коммит должен дойти до вердикта, иначе required check останется без результата.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +42,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.sum') }}-build-v2
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Build beacon
         shell: bash
@@ -51,6 +60,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,7 +77,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.sum') }}-test-v2
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Download modules
         shell: bash
@@ -87,6 +99,14 @@ jobs:
         run: |
           set -euo pipefail
           go test ./...
+
+  # Node предустановлен на ubuntu-latest, отдельный setup-node не нужен.
+  js-test:
+    name: js-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Test JS adapters
         shell: bash
@@ -119,6 +139,7 @@ jobs:
   gates:
     name: gates
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -135,7 +156,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.sum') }}-gates-v2
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
       - name: Check committed gates binary
         shell: bash
@@ -175,6 +198,7 @@ jobs:
   e2e:
     name: e2e
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     continue-on-error: true
     steps:
       - name: Checkout
