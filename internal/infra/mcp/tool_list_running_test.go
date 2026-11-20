@@ -742,3 +742,132 @@ func TestListRunningVerifiedOwnerKeepsStatus(t *testing.T) {
 		t.Errorf("watch status = %q, want watching", got)
 	}
 }
+
+// sampleRegistry is one consistent configuration with two registered agents.
+// One is stale so a reader can tell registry state from a Watch verdict.
+func sampleRegistry() []RegistryEntry {
+	return []RegistryEntry{
+		{
+			ID:           "exec-1",
+			Role:         domain.RoleExecutor,
+			Capabilities: []domain.Capability{domain.CapabilityWatch, domain.CapabilityAck},
+			Config:       "ci=stub,gpt=codex",
+			Status:       RegistryActive,
+		},
+		{
+			ID:           "orch-1",
+			Role:         domain.RoleOrchestrator,
+			Capabilities: []domain.Capability{domain.CapabilityReadVerdict, domain.CapabilityMerge},
+			Config:       "ci=stub,gpt=codex",
+			Status:       RegistryStale,
+		},
+	}
+}
+
+func TestSnapshotCarriesRegistryProjection(t *testing.T) {
+	snap := sampleSnapshot()
+	snap.Registry = sampleRegistry()
+
+	if got := snap.RegisteredAgents(); got != 2 {
+		t.Errorf("registered agents = %d, want 2", got)
+	}
+	if got := snap.StaleAgents(); got != 1 {
+		t.Errorf("stale agents = %d, want 1", got)
+	}
+	if got := snap.RegistryConfig(); got != "ci=stub,gpt=codex" {
+		t.Errorf("registry config = %q, want ci=stub,gpt=codex", got)
+	}
+
+	entry, ok := snap.FindRegistryEntry("exec-1")
+	if !ok {
+		t.Fatal("exec-1 not found in registry")
+	}
+	if entry.Role != domain.RoleExecutor {
+		t.Errorf("role = %q, want executor", entry.Role)
+	}
+	wantCaps := []domain.Capability{domain.CapabilityWatch, domain.CapabilityAck}
+	if !reflect.DeepEqual(entry.Capabilities, wantCaps) {
+		t.Errorf("capabilities = %v, want %v", entry.Capabilities, wantCaps)
+	}
+	if entry.Config != "ci=stub,gpt=codex" {
+		t.Errorf("config = %q, want ci=stub,gpt=codex", entry.Config)
+	}
+	if entry.Status != RegistryActive {
+		t.Errorf("status = %q, want active", entry.Status)
+	}
+	if _, ok := snap.FindRegistryEntry("missing"); ok {
+		t.Error("unknown executor was found in registry")
+	}
+}
+
+func TestRegistryConfigRejectsMixedConfigurations(t *testing.T) {
+	snap := sampleSnapshot()
+	if got := snap.RegistryConfig(); got != "" {
+		t.Errorf("empty registry config = %q, want empty", got)
+	}
+	snap.Registry = sampleRegistry()
+	snap.Registry[1].Config = "other=config"
+	if got := snap.RegistryConfig(); got != "" {
+		t.Errorf("mixed registry config = %q, want empty", got)
+	}
+}
+
+func TestListRunningRegistryFieldsDoNotChangeOutput(t *testing.T) {
+	plain := sampleSnapshot()
+	withRegistry := sampleSnapshot()
+	withRegistry.Registry = sampleRegistry()
+
+	plainOut := callListRunning(t, NewListRunningHandler(&snapshotReaderFake{snap: plain}), ListRunningInput{})
+	regOut := callListRunning(t, NewListRunningHandler(&snapshotReaderFake{snap: withRegistry}), ListRunningInput{})
+
+	if !reflect.DeepEqual(plainOut, regOut) {
+		t.Errorf("registry fields changed the list_running output:\n%#v\n%#v", plainOut, regOut)
+	}
+	if regOut.Counts.Watches != 3 || regOut.Counts.Subscribers != 3 {
+		t.Errorf("existing counts changed: %#v", regOut.Counts)
+	}
+	if regOut.Status != string(domain.StatusWatching) {
+		t.Errorf("existing status = %q, want watching", regOut.Status)
+	}
+	if len(regOut.Watches) != 3 || len(regOut.Events) != 3 {
+		t.Errorf("existing arrays changed: watches=%d events=%d", len(regOut.Watches), len(regOut.Events))
+	}
+}
+
+func TestListRunningDoesNotMutateRegistry(t *testing.T) {
+	snap := sampleSnapshot()
+	snap.Registry = sampleRegistry()
+	reader := &snapshotReaderFake{snap: snap}
+	before := append([]RegistryEntry(nil), reader.snap.Registry...)
+
+	callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+	callListRunning(t, NewListRunningHandler(reader), ListRunningInput{})
+
+	if !reflect.DeepEqual(reader.snap.Registry, before) {
+		t.Errorf("registry was mutated: %#v -> %#v", before, reader.snap.Registry)
+	}
+}
+
+func callStatsFromSnapshot(t *testing.T, snap StateSnapshot) StatsOutput {
+	t.Helper()
+	result, out, err := NewStatsHandler(&snapshotReaderFake{snap: snap}).Handle(context.Background(), nil, StatsInput{})
+	if err != nil {
+		t.Fatalf("beacon_stats: %v", err)
+	}
+	if result == nil || result.IsError {
+		t.Fatalf("beacon_stats returned an error result: %#v", result)
+	}
+	return out
+}
+
+func TestStatsRegistryFieldsDoNotChangeOutput(t *testing.T) {
+	plain := sampleSnapshot()
+	withRegistry := sampleSnapshot()
+	withRegistry.Registry = sampleRegistry()
+
+	plainOut := callStatsFromSnapshot(t, plain)
+	regOut := callStatsFromSnapshot(t, withRegistry)
+	if !reflect.DeepEqual(plainOut, regOut) {
+		t.Errorf("registry fields changed the stats output:\n%#v\n%#v", plainOut, regOut)
+	}
+}
