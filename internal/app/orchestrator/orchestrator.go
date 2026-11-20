@@ -552,11 +552,17 @@ func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, 
 		observe.WakeSkipped("", w.ID, "no waker installed")
 		return
 	}
-	observe.Event(observe.LevelInfo, "wake_requested", observe.Fields{
+	fields := observe.Fields{
 		observe.FieldWatchID: w.ID, observe.FieldPR: w.PR,
 		observe.FieldRevision: w.Revision, observe.FieldVerdict: verdict,
 		observe.FieldReason: reason,
-	})
+	}
+	// Failed checks explain why the Watch came back as a retry. Writing the
+	// hint only when checks exist keeps wakes without a block record unchanged.
+	if w.Blocked != nil && len(w.Blocked.FailedChecks) != 0 {
+		fields[observe.FieldDecisionHint] = strings.Join(w.Blocked.FailedChecks, ",")
+	}
+	observe.Event(observe.LevelInfo, "wake_requested", fields)
 	// Only a rebase verdict asks for a rebase. A retry wake carries its own
 	// verdict in wake_requested, so calling RebaseRequested here would report
 	// a rebase that nobody asked for (T3.395).

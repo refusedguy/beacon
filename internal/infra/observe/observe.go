@@ -54,6 +54,7 @@ const (
 	FieldRevision     = "revision"
 	FieldActor        = "actor"
 	FieldReason       = "reason"
+	FieldDecisionHint = "decisionHint"
 	FieldStatus       = "status"
 	FieldCommand      = "command"
 	FieldWatches      = "watches"
