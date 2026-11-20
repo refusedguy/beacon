@@ -18,13 +18,35 @@ import (
 // a client is derived from one of these structs by reflection, never by a
 // hand-written JSON literal.
 
-// WatchPROutput is the response of beacon_watch_pr.
+// WatchPROutput is the response of beacon_watch_pr. The five leading fields
+// are the original contract (ADR 0094); Executor extends the notify metadata
+// with the descriptor supplied at registration (T5.32).
 type WatchPROutput struct {
 	WatchID     string `json:"watchID"`
 	Revision    uint64 `json:"revision"`
 	Status      string `json:"status"`
 	Verdict     string `json:"verdict"`
 	PollAfterMs int64  `json:"pollAfterMs"`
+
+	// Executor echoes the executor descriptor carried in notify. It is a
+	// pointer with omitempty so a response from a caller that omitted the
+	// descriptor keeps its previous shape and still validates against the
+	// derived schema. The core carries these opaque values through without
+	// interpreting agent names (ADR 0088).
+	Executor *ExecutorMetadata `json:"executor,omitempty"`
+}
+
+// ExecutorMetadata is the notify-metadata descriptor of the registered
+// executor as reflected into the watch_pr output schema. Every field is
+// optional: a descriptor may be partially supplied, and a response without
+// executor stays valid (T5.32).
+type ExecutorMetadata struct {
+	ID           string   `json:"id,omitempty"`
+	Role         string   `json:"role,omitempty"`
+	Runtime      string   `json:"runtime,omitempty"`
+	Agent        string   `json:"agent,omitempty"`
+	Capabilities []string `json:"capabilities,omitempty"`
+	ConfigID     string   `json:"configId,omitempty"`
 }
 
 // WaitResultOutput is the response of beacon_wait_result.

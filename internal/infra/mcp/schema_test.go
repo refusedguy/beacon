@@ -258,6 +258,105 @@ func TestAllOutputSchemas(t *testing.T) {
 	assertSchemaFromType[StatsOutput](t, schemas["beacon_stats"])
 }
 
+// TestWatchPRSchemaExecutorMetadata proves the notify-metadata executor is
+// reflected into the watch_pr output schema while the original five fields
+// keep their names and required status (T5.32, ADR 0094).
+func TestWatchPRSchemaExecutorMetadata(t *testing.T) {
+	schemas, err := AllOutputSchemas()
+	if err != nil {
+		t.Fatalf("AllOutputSchemas: %v", err)
+	}
+	schema := schemas["beacon_watch_pr"]
+	if schema == nil {
+		t.Fatal("missing watch_pr output schema")
+	}
+
+	original := []string{"watchID", "revision", "status", "verdict", "pollAfterMs"}
+	for _, name := range original {
+		if _, ok := schema.Properties[name]; !ok {
+			t.Errorf("watch_pr schema lost original field %q", name)
+		}
+	}
+	executor, ok := schema.Properties["executor"]
+	if !ok {
+		t.Fatal("watch_pr schema missing executor")
+	}
+
+	required := make(map[string]bool, len(schema.Required))
+	for _, name := range schema.Required {
+		required[name] = true
+	}
+	for _, name := range original {
+		if !required[name] {
+			t.Errorf("original field %q is no longer required", name)
+		}
+	}
+	if required["executor"] {
+		t.Error("executor must be optional so a response without it stays valid")
+	}
+	if len(schema.Required) != len(original) {
+		t.Errorf("required fields = %v, want exactly the original five", schema.Required)
+	}
+
+	for _, name := range []string{"id", "role", "runtime", "agent", "capabilities", "configId"} {
+		if _, ok := executor.Properties[name]; !ok {
+			t.Errorf("executor schema missing %q", name)
+		}
+	}
+}
+
+// TestWatchPROutputExecutorValidation drives the derived schema against two
+// marshaled responses: one from a caller that omitted the descriptor and one
+// that supplied it. Both must validate (T5.32 acceptance).
+func TestWatchPROutputExecutorValidation(t *testing.T) {
+	schema, err := OutputSchema[WatchPROutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve watch_pr schema: %v", err)
+	}
+
+	base := WatchPROutput{
+		WatchID:     "w-1",
+		Revision:    1,
+		Status:      "watching",
+		Verdict:     "watching",
+		PollAfterMs: 180000,
+	}
+	check := func(name string, out WatchPROutput, wantExecutor bool) {
+		t.Helper()
+		raw, err := json.Marshal(out)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", name, err)
+		}
+		var instance map[string]any
+		if err := json.Unmarshal(raw, &instance); err != nil {
+			t.Fatalf("unmarshal %s: %v", name, err)
+		}
+		if err := resolved.Validate(instance); err != nil {
+			t.Fatalf("%s does not validate against derived schema: %v", name, err)
+		}
+		_, got := instance["executor"]
+		if got != wantExecutor {
+			t.Errorf("%s executor presence = %v, want %v: %s", name, got, wantExecutor, raw)
+		}
+	}
+	check("legacy response", base, false)
+
+	withExecutor := base
+	withExecutor.Executor = &ExecutorMetadata{
+		ID:           "ses_1",
+		Role:         "executor",
+		Runtime:      "subagent",
+		Agent:        "hermes",
+		Capabilities: []string{"watch"},
+		ConfigID:     "cfg-1",
+	}
+	check("extended response", withExecutor, true)
+}
+
 // TestGetResultSchemaDerivesTaskFields proves the dialect fields come from the
 // Go output type, so the resultType discriminator is part of the advertised
 // schema and can never drift from the response struct (ADR 0003).
