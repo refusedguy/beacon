@@ -72,6 +72,15 @@
 // The doorbell is attached as a narrow port, so callers written before this
 // feature keep their exact behaviour.
 //
+// ADR 0059 p2 (T3.135) adds the guarded heartbeat. An agent wakes only when the
+// observed state changed since the last heartbeat or the quota gate is open;
+// a timer tick on its own never releases a wake. The guard is checked as a
+// precondition before a wake is sent, so a held heartbeat registers no
+// operation, rings no doorbell and touches no delivery channel. It is a wake
+// precondition, not a new Delivery value and not a step of the ADR 0017 ladder.
+// The guard is attached as a narrow port, so callers written before this
+// feature keep their exact behaviour.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -284,6 +293,18 @@ type WakeInput struct {
 	// broadcast message is addressed to no single mailbox: it rings no doorbell
 	// and releases no listener, even when Mailbox names one.
 	Broadcast bool `json:"broadcast,omitempty" jsonschema:"broadcast follow-up; reaches no single mailbox and never rings a doorbell"`
+	// HeartbeatState is the environment's opaque state fingerprint observed at
+	// this heartbeat (ADR 0059 p2, T3.135). The guard releases a wake when this
+	// differs from the state seen at the previous guarded wake. An empty value
+	// is a valid observation; it only compares equal to another empty value.
+	HeartbeatState string `json:"heartbeatState,omitempty" jsonschema:"opaque state fingerprint observed at this heartbeat; a change since the last guarded wake releases the wake"`
+	// QuotaShouldRun is the open state of the quota gate (ADR 0059 p2). When
+	// true the gate is open and a wake is released even without a state change.
+	QuotaShouldRun bool `json:"quotaShouldRun,omitempty" jsonschema:"quota should-run gate is open; releases the wake even when the state is unchanged"`
+	// HeartbeatTick marks this wake attempt as a timer heartbeat tick (ADR 0059
+	// p2). A tick on its own never releases a wake; it is recorded so the
+	// decision can name the held tick. It does not change the guard rule.
+	HeartbeatTick bool `json:"heartbeatTick,omitempty" jsonschema:"this attempt is a timer heartbeat tick; a tick alone never wakes, only state change or an open quota gate does"`
 }
 
 // WakeOutput is the response of the wake tool. Delivery is mandatory and is
@@ -333,6 +354,22 @@ type WakeOutput struct {
 	// step. It stays false for a broadcast message, an empty Mailbox, and when
 	// no doorbell is attached.
 	DoorbellRang bool `json:"doorbellRang,omitempty"`
+	// Guarded reports that a heartbeat guard was attached and evaluated this
+	// wake (ADR 0059 p2, T3.135). It is false for callers with no guard, which
+	// keep their exact output.
+	Guarded bool `json:"guarded,omitempty"`
+	// GuardReason names why the guard released or held the wake. A held reason
+	// states that a timer tick alone does not wake.
+	GuardReason string `json:"guardReason,omitempty"`
+	// HeartbeatChanged reports that the observed state changed since the last
+	// guarded wake. It is one of the two facts that release a wake.
+	HeartbeatChanged bool `json:"heartbeatChanged,omitempty"`
+	// QuotaGateOpen reports that the quota should-run gate was open. It is the
+	// other fact that releases a wake.
+	QuotaGateOpen bool `json:"quotaGateOpen,omitempty"`
+	// HeartbeatTick echoes whether this attempt was a timer tick. It stays a
+	// separate fact and never by itself makes Guarded or Delivery succeed.
+	HeartbeatTick bool `json:"heartbeatTick,omitempty"`
 }
 
 // T3.110 (ADR 0046 feature 2) makes a wake error repairable. ADR 0009 fixes the
@@ -595,6 +632,7 @@ type WakeHandler struct {
 	confirmations  *ConfirmationLedger
 	operations     OperationRegistry
 	doorbell       DoorbellPort
+	guard          *HeartbeatGuard
 }
 
 // WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
@@ -876,7 +914,10 @@ func withReceiptState(out WakeOutput, in WakeInput) WakeOutput {
 // repeated prompt returns the existing id with Duplicate=true and no sender
 // call. When a mailbox is named, ADR 0058 p2 rings that addressed doorbell
 // after the entry check, so a duplicate prompt rings nothing and a broadcast
-// message rings no mailbox.
+// message rings no mailbox. When a guard is attached, ADR 0059 p2 checks it
+// before any of that work: a tick with no state change and a closed quota gate
+// returns a held receipt with OK=false and touches no operation, window,
+// doorbell or delivery channel.
 func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -885,12 +926,19 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 	if setup.refusal != nil {
 		return withReceiptState(*setup.refusal, in), nil
 	}
+	// ADR 0059 p2: the guard is a precondition before any wake is sent. A held
+	// heartbeat registers no operation, sleeps no window, rings no doorbell and
+	// touches no delivery channel.
+	decision, guarded := h.evaluateHeartbeat(in)
+	if guarded && !decision.Wake {
+		return withReceiptState(guardedWake(in, decision), in), nil
+	}
 	op, err := h.beginOperation(in)
 	if err != nil {
 		return WakeOutput{}, err
 	}
 	if op.Duplicate {
-		return withReceiptState(duplicateWake(in, op), in), nil
+		return withReceiptState(withGuard(duplicateWake(in, op), decision, guarded), in), nil
 	}
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
@@ -899,7 +947,7 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 
 	finish := func(out WakeOutput) WakeOutput {
 		out.DoorbellRang = rang
-		return withReceiptState(withOperation(out, op), in)
+		return withReceiptState(withOperation(withGuard(out, decision, guarded), op), in)
 	}
 
 	if h == nil || h.sender == nil {
@@ -946,7 +994,9 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 // The duplicate-prompt entry check of ADR 0056 p3 runs before the chain, so a
 // repeated prompt never walks a channel or writes a trace. A named mailbox
 // rings its addressed doorbell (ADR 0058 p2) as a separate trigger fact; it
-// does not change the honest delivery the chain reports.
+// does not change the honest delivery the chain reports. The ADR 0059 p2 guard
+// is checked before the chain, so a held heartbeat walks no channel and writes
+// no trace.
 func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
 	setup := h.prepareWake(ctx, in)
 	if setup.err != nil {
@@ -955,12 +1005,17 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 	if setup.refusal != nil {
 		return withReceiptState(*setup.refusal, in), nil
 	}
+	// ADR 0059 p2: the same guard precondition runs before the fallback chain.
+	decision, guarded := h.evaluateHeartbeat(in)
+	if guarded && !decision.Wake {
+		return withReceiptState(guardedWake(in, decision), in), nil
+	}
 	op, err := h.beginOperation(in)
 	if err != nil {
 		return WakeOutput{}, err
 	}
 	if op.Duplicate {
-		return withReceiptState(duplicateWake(in, op), in), nil
+		return withReceiptState(withGuard(duplicateWake(in, op), decision, guarded), in), nil
 	}
 	if err := h.applyWakeWindow(ctx, in); err != nil {
 		return WakeOutput{}, err
@@ -968,6 +1023,7 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 	rang := h.ringDoorbell(in)
 	out := withOperation(h.runFallback(ctx, in, setup.target, setup.source), op)
 	out.DoorbellRang = rang
+	out = withGuard(out, decision, guarded)
 	return withReceiptState(out, in), nil
 }
 
@@ -1537,6 +1593,147 @@ func (h *WakeHandler) ringDoorbell(in WakeInput) bool {
 	return h.doorbell.Ring(DoorbellMessage{Address: in.Mailbox, Text: in.Text, Broadcast: in.Broadcast})
 }
 
+// ---------------------------------------------------------------------------
+// ADR 0059 p2 / T3.135: guarded heartbeat.
+//
+// A timer tick is not a reason to wake. An agent wakes only when the observed
+// state changed since the last guarded wake or the quota should-run gate is
+// open. The guard runs as a precondition before a wake is sent: a held tick
+// registers no operation, rings no doorbell and reaches no delivery channel.
+// This is a wake precondition, not a new Delivery value and not a step of the
+// ADR 0017 ladder.
+// ---------------------------------------------------------------------------
+
+// HeartbeatObservation is the environment's report at one heartbeat. State is
+// an opaque fingerprint of the observed state; the core never interprets it.
+// QuotaShouldRun is the open state of the quota gate. Tick says this attempt
+// is a timer tick and is recorded only so a held decision can name it; a tick
+// never by itself releases a wake.
+type HeartbeatObservation struct {
+	State          string `json:"state"`
+	QuotaShouldRun bool   `json:"quotaShouldRun"`
+	Tick           bool   `json:"tick"`
+}
+
+// HeartbeatDecision is the result of evaluating one observation against the
+// guard. Wake is released only by Changed or GateOpen. Reason names which
+// facts fired. Changed and GateOpen are separate facts, not delivery modes.
+type HeartbeatDecision struct {
+	Wake     bool
+	Changed  bool
+	GateOpen bool
+	Tick     bool
+	Reason   string
+}
+
+// Fixed guard reasons name the decision branch so tests and callers do not
+// parse strings. The held reasons state that a tick alone does not wake.
+const (
+	guardReasonHeld           = "wake: guarded heartbeat held; no state change and quota gate closed"
+	guardReasonTickHeld       = "wake: guarded heartbeat held; a timer tick alone does not wake"
+	guardReasonChanged        = "wake: guarded heartbeat released; state changed"
+	guardReasonGate           = "wake: guarded heartbeat released; quota should-run gate is open"
+	guardReasonChangedAndGate = "wake: guarded heartbeat released; state changed and quota should-run gate is open"
+)
+
+// HeartbeatGuard remembers the last observed state so a change is measured
+// against the most recent guarded wake. The first observation establishes the
+// baseline and is not itself a change: a fresh agent does not wake just from
+// having an initial state. Every observation updates the baseline, including a
+// held one, so the next change is relative to the latest heartbeat.
+type HeartbeatGuard struct {
+	mu        sync.Mutex
+	lastState string
+	seen      bool
+}
+
+// NewHeartbeatGuard builds an empty guard with no baseline state.
+func NewHeartbeatGuard() *HeartbeatGuard {
+	return &HeartbeatGuard{}
+}
+
+// Evaluate decides one observation under one lock. The lock makes the compare
+// and the baseline update a single step, so concurrent heartbeats cannot both
+// read an old baseline and both fire on the same change. A timer tick is never
+// a trigger: Wake is set only by a state change or an open quota gate.
+func (g *HeartbeatGuard) Evaluate(obs HeartbeatObservation) HeartbeatDecision {
+	if g == nil {
+		return HeartbeatDecision{Reason: guardReasonHeld, Tick: obs.Tick}
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	changed := g.seen && obs.State != g.lastState
+	gate := obs.QuotaShouldRun
+	g.lastState = obs.State
+	g.seen = true
+
+	d := HeartbeatDecision{Changed: changed, GateOpen: gate, Tick: obs.Tick}
+	switch {
+	case changed && gate:
+		d.Wake, d.Reason = true, guardReasonChangedAndGate
+	case changed:
+		d.Wake, d.Reason = true, guardReasonChanged
+	case gate:
+		d.Wake, d.Reason = true, guardReasonGate
+	case obs.Tick:
+		d.Reason = guardReasonTickHeld
+	default:
+		d.Reason = guardReasonHeld
+	}
+	return d
+}
+
+// WithHeartbeatGuard attaches the guarded-heartbeat precondition to a wake
+// handler. A nil guard disables the feature, so callers written before ADR 0059
+// p2 keep their exact behaviour.
+func (h *WakeHandler) WithHeartbeatGuard(g *HeartbeatGuard) *WakeHandler {
+	if h != nil {
+		h.guard = g
+	}
+	return h
+}
+
+// evaluateHeartbeat runs the guard when one is attached. The bool reports
+// whether a guard evaluated this wake, so callers with no guard keep the
+// pre-feature path and emit no guard facts on their receipt.
+func (h *WakeHandler) evaluateHeartbeat(in WakeInput) (HeartbeatDecision, bool) {
+	if h == nil || h.guard == nil {
+		return HeartbeatDecision{}, false
+	}
+	return h.guard.Evaluate(HeartbeatObservation{
+		State:          in.HeartbeatState,
+		QuotaShouldRun: in.QuotaShouldRun,
+		Tick:           in.HeartbeatTick,
+	}), true
+}
+
+// withGuard stamps guard facts on a receipt when a guard evaluated the wake.
+func withGuard(out WakeOutput, d HeartbeatDecision, guarded bool) WakeOutput {
+	if !guarded {
+		return out
+	}
+	out.Guarded = true
+	out.GuardReason = d.Reason
+	out.HeartbeatChanged = d.Changed
+	out.QuotaGateOpen = d.GateOpen
+	out.HeartbeatTick = d.Tick
+	return out
+}
+
+// guardedWake is the honest receipt for a held heartbeat. No sender, operation,
+// window or doorbell is touched, so OK stays false and Delivery stays inside
+// the ADR 0026 closed set. A held wake is not a new success mode.
+func guardedWake(in WakeInput, d HeartbeatDecision) WakeOutput {
+	return withGuard(WakeOutput{
+		Delivery: DeliveryUnsupported,
+		OK:       false,
+		Source:   normalizeSource(in.Source),
+		Executor: in.Executor,
+		Reason:   d.Reason,
+		Woke:     in.Woke,
+	}, d, true)
+}
+
 // AttachWake registers the real wake tool on a server. NewServer keeps the
 // contracted stub set and does not call this function; registration is a
 // separate integration task.
@@ -1548,7 +1745,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task. mailbox names the recipient's private doorbell: a message addressed to it rings the bell so a long-poll listener on that address wakes, and doorbellRang reports it. A broadcast message reaches no single mailbox and rings nothing; the doorbell is a wake trigger, not a new delivery value or a ladder step.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task. mailbox names the recipient's private doorbell: a message addressed to it rings the bell so a long-poll listener on that address wakes, and doorbellRang reports it. A broadcast message reaches no single mailbox and rings nothing; the doorbell is a wake trigger, not a new delivery value or a ladder step. heartbeatState, quotaShouldRun and heartbeatTick feed the guarded heartbeat: when a guard is attached the wake is released only if the state changed or the quota gate is open, so a timer tick alone holds the wake with ok=false and guarded=true. The guard is a precondition checked before any delivery, not a new delivery value or a ladder step.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,

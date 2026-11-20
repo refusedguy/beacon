@@ -3361,3 +3361,319 @@ func TestT3_129OverInMemoryTransport(t *testing.T) {
 		t.Errorf("listener = %+v, want the message addressed to mailbox-MCP", res)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// ADR 0059 p2 / T3.135: guarded heartbeat.
+// ---------------------------------------------------------------------------
+
+// TestT3_135GuardDecision proves the guard rule directly: the first
+// observation establishes a baseline, a later state change or an open quota
+// gate releases a wake, and a timer tick on its own never does.
+func TestT3_135GuardDecision(t *testing.T) {
+	g := NewHeartbeatGuard()
+
+	// First observation is the baseline: no previous state to compare, so no
+	// change and the gate is closed.
+	d := g.Evaluate(HeartbeatObservation{State: "s1", Tick: true})
+	if d.Wake || d.Changed || d.GateOpen {
+		t.Errorf("baseline decision = %+v, want wake/change/gate all false", d)
+	}
+	if d.Reason != guardReasonTickHeld {
+		t.Errorf("baseline reason = %q, want the tick-held reason", d.Reason)
+	}
+
+	// Same state again: no change, no gate, still held even on a tick.
+	d = g.Evaluate(HeartbeatObservation{State: "s1", Tick: true})
+	if d.Wake || d.Changed || d.GateOpen || !d.Tick {
+		t.Errorf("unchanged decision = %+v, want held tick", d)
+	}
+
+	// State changed: released by change alone.
+	d = g.Evaluate(HeartbeatObservation{State: "s2", Tick: true})
+	if !d.Wake || !d.Changed || d.GateOpen || d.Reason != guardReasonChanged {
+		t.Errorf("changed decision = %+v, want released by change", d)
+	}
+
+	// Back to a stable state: held again, baseline advanced to s2.
+	d = g.Evaluate(HeartbeatObservation{State: "s2"})
+	if d.Wake || d.Changed || d.Reason != guardReasonHeld {
+		t.Errorf("settled decision = %+v, want held", d)
+	}
+
+	// Open gate with unchanged state: released by the gate alone.
+	d = g.Evaluate(HeartbeatObservation{State: "s2", QuotaShouldRun: true})
+	if !d.Wake || d.Changed || !d.GateOpen || d.Reason != guardReasonGate {
+		t.Errorf("gate decision = %+v, want released by quota gate", d)
+	}
+
+	// Change and gate together name both facts.
+	d = g.Evaluate(HeartbeatObservation{State: "s3", QuotaShouldRun: true, Tick: true})
+	if !d.Wake || !d.Changed || !d.GateOpen || d.Reason != guardReasonChangedAndGate {
+		t.Errorf("both decision = %+v, want released by change and gate", d)
+	}
+}
+
+// TestT3_135TimerTickAloneNeverWakes is the acceptance test at the handler:
+// repeated timer ticks with no state change and a closed gate produce no
+// delivery, no doorbell ring and a held receipt; only a real state change
+// releases the wake.
+func TestT3_135TimerTickAloneNeverWakes(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	bell := &recordingDoorbell{}
+	handler := NewWakeHandler(sender).WithDoorbell(bell).WithHeartbeatGuard(NewHeartbeatGuard())
+
+	for i := 0; i < 3; i++ {
+		out, err := handler.Wake(context.Background(), WakeInput{
+			Target: "session-1", Text: "pointer-only", Mailbox: "mailbox-A",
+			HeartbeatState: "stable", HeartbeatTick: true,
+		})
+		if err != nil {
+			t.Fatalf("held Wake() error = %v", err)
+		}
+		if out.OK || out.Delivery != DeliveryUnsupported {
+			t.Errorf("held receipt = ok %v delivery %q, want false/unsupported", out.OK, out.Delivery)
+		}
+		if !out.Guarded || !out.HeartbeatTick || out.HeartbeatChanged || out.QuotaGateOpen {
+			t.Errorf("held guard facts = %+v, want guarded tick, no change, no gate", out)
+		}
+		if out.GuardReason != guardReasonTickHeld {
+			t.Errorf("held reason = %q, want the tick-held reason", out.GuardReason)
+		}
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls = %d after three held ticks, want 0", sender.calls)
+	}
+	if bell.calls != 0 {
+		t.Errorf("doorbell calls = %d after three held ticks, want 0", bell.calls)
+	}
+
+	// A changed state releases the wake with a normal delivery receipt.
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "session-1", Text: "pointer-only", Mailbox: "mailbox-A", HeartbeatState: "changed",
+	})
+	if err != nil {
+		t.Fatalf("released Wake() error = %v", err)
+	}
+	if !out.OK || out.Delivery != DeliverySteer {
+		t.Errorf("released receipt = ok %v delivery %q, want true/steer", out.OK, out.Delivery)
+	}
+	if !out.Guarded || !out.HeartbeatChanged || out.GuardReason != guardReasonChanged {
+		t.Errorf("released guard facts = %+v, want guarded change", out)
+	}
+	if sender.calls != 1 || bell.calls != 1 {
+		t.Errorf("sender/doorbell calls = %d/%d after release, want 1/1", sender.calls, bell.calls)
+	}
+}
+
+// TestT3_135QuotaGateReleasesWake proves the gate is an independent trigger:
+// an unchanged state still wakes when quota should-run is open.
+func TestT3_135QuotaGateReleasesWake(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	handler := NewWakeHandler(sender).WithHeartbeatGuard(NewHeartbeatGuard())
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", HeartbeatState: "same", QuotaShouldRun: true,
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if !out.OK || out.Delivery != DeliveryQueue {
+		t.Errorf("receipt = ok %v delivery %q, want true/queue", out.OK, out.Delivery)
+	}
+	if !out.Guarded || !out.QuotaGateOpen || out.HeartbeatChanged || out.GuardReason != guardReasonGate {
+		t.Errorf("guard facts = %+v, want guarded open gate with no change", out)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1", sender.calls)
+	}
+}
+
+// TestT3_135HeldTickRegistersNoOperation proves the guard is a precondition
+// before the entry check: a held tick issues no operationId, so a later
+// released wake with the same prompt starts the first operation rather than
+// being treated as a duplicate.
+func TestT3_135HeldTickRegistersNoOperation(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender).
+		WithOperationRegistry(NewMemoryOperationRegistry()).
+		WithHeartbeatGuard(NewHeartbeatGuard())
+
+	in := WakeInput{Target: "s", Text: "p", Prompt: "long job", HeartbeatState: "s1", HeartbeatTick: true}
+	held, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("held Wake() error = %v", err)
+	}
+	if held.OperationID != "" {
+		t.Errorf("held operationId = %q, want empty (no operation registered)", held.OperationID)
+	}
+
+	in.HeartbeatState = "s2"
+	in.HeartbeatTick = false
+	first, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("first released Wake() error = %v", err)
+	}
+	if first.OperationID == "" || first.Duplicate {
+		t.Errorf("first released = id %q duplicate %v, want a fresh operation", first.OperationID, first.Duplicate)
+	}
+
+	in.HeartbeatState = "s3"
+	second, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("second released Wake() error = %v", err)
+	}
+	if !second.Duplicate || second.OperationID != first.OperationID {
+		t.Errorf("second released = id %q duplicate %v, want the existing operation", second.OperationID, second.Duplicate)
+	}
+	if !second.Guarded || second.GuardReason != guardReasonChanged {
+		t.Errorf("duplicate guard facts = %+v, want guarded change", second)
+	}
+}
+
+// TestT3_135LegacyCallerWithoutGuard keeps callers written before ADR 0059 p2
+// unchanged: heartbeat fields alone do nothing when no guard is attached, and
+// no guard facts appear on the receipt.
+func TestT3_135LegacyCallerWithoutGuard(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	handler := NewWakeHandler(sender)
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "s", Text: "p", HeartbeatState: "stable", HeartbeatTick: true,
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v", err)
+	}
+	if !out.OK || out.Delivery != DeliverySteer {
+		t.Errorf("receipt = ok %v delivery %q, want true/steer", out.OK, out.Delivery)
+	}
+	if out.Guarded || out.HeartbeatTick || out.HeartbeatChanged || out.QuotaGateOpen || out.GuardReason != "" {
+		t.Errorf("guard facts = %+v, want all empty with no guard attached", out)
+	}
+	if sender.calls != 1 {
+		t.Errorf("sender calls = %d, want 1", sender.calls)
+	}
+}
+
+// TestT3_135FallbackRespectsGuard proves the fallback path holds a tick before
+// walking any channel, then releases through the chain on a real change.
+func TestT3_135FallbackRespectsGuard(t *testing.T) {
+	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
+		ChannelSteer: {delivery: DeliverySteer},
+	}}
+	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
+	handler := NewFallbackWakeHandler(sender, confirmer, &fakeTracer{}).
+		WithHeartbeatGuard(NewHeartbeatGuard())
+
+	held, err := handler.WakeWithFallback(context.Background(), WakeInput{
+		Target: "s", Text: "p", HeartbeatState: "stable", HeartbeatTick: true,
+	})
+	if err != nil {
+		t.Fatalf("held WakeWithFallback() error = %v", err)
+	}
+	if held.OK || !held.Guarded || held.GuardReason != guardReasonTickHeld {
+		t.Errorf("held receipt = %+v, want held guarded tick", held)
+	}
+	if len(sender.attempts) != 0 {
+		t.Errorf("fallback sender attempts = %d after held tick, want 0", len(sender.attempts))
+	}
+
+	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
+		Target: "s", Text: "p", HeartbeatState: "changed",
+	})
+	if err != nil {
+		t.Fatalf("released WakeWithFallback() error = %v", err)
+	}
+	if !out.OK || out.Delivery != DeliverySteer || !out.Guarded || !out.HeartbeatChanged {
+		t.Errorf("released receipt = %+v, want confirmed guarded delivery", out)
+	}
+}
+
+// TestT3_135ConcurrentGuardEvaluations guards the lock: concurrent
+// heartbeats see one baseline, so only one wake is released for a single
+// state change.
+func TestT3_135ConcurrentGuardEvaluations(t *testing.T) {
+	g := NewHeartbeatGuard()
+	g.Evaluate(HeartbeatObservation{State: "baseline"})
+
+	const n = 20
+	start := make(chan struct{})
+	results := make(chan HeartbeatDecision, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- g.Evaluate(HeartbeatObservation{State: "changed", Tick: true})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	released := 0
+	for d := range results {
+		if d.Wake {
+			released++
+		}
+	}
+	if released != 1 {
+		t.Errorf("released wakes = %d, want exactly 1 for one state change", released)
+	}
+}
+
+// TestT3_135OverInMemoryTransport drives the guarded heartbeat through a real
+// MCP client and server session, checking the schema and the structured output
+// CI sees.
+func TestT3_135OverInMemoryTransport(t *testing.T) {
+	server := NewServer()
+	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithHeartbeatGuard(NewHeartbeatGuard()))
+	session := connectWakeServer(t, server)
+
+	var inputSchema []byte
+	for tool, err := range session.Tools(context.Background(), nil) {
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		if tool.Name == WakeToolName {
+			inputSchema, err = json.Marshal(tool.InputSchema)
+			if err != nil {
+				t.Fatalf("marshal wake input schema: %v", err)
+			}
+		}
+	}
+	if len(inputSchema) == 0 {
+		t.Fatal("wake tool input schema is empty")
+	}
+	for _, field := range []string{"heartbeatState", "quotaShouldRun", "heartbeatTick"} {
+		if !strings.Contains(string(inputSchema), field) {
+			t.Errorf("wake input schema missing %q: %s", field, inputSchema)
+		}
+	}
+
+	// An open gate releases the wake on the first observation; structured
+	// output must carry the guard facts over MCP.
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name: WakeToolName,
+		Arguments: WakeInput{
+			Target: "session-1", Text: "obligation-1@7", QuotaShouldRun: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
+	}
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	if !out.Guarded || !out.QuotaGateOpen || out.GuardReason != guardReasonGate {
+		t.Errorf("structured guard facts = %+v, want guarded open gate", out)
+	}
+	if !out.OK || out.Delivery != DeliveryQueue {
+		t.Errorf("structured receipt = ok %v delivery %q, want true/queue", out.OK, out.Delivery)
+	}
+}
