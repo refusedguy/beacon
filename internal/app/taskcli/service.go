@@ -18,6 +18,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
@@ -38,11 +39,11 @@ type Service struct {
 func NewService(cfg Config) *Service { return &Service{Cfg: cfg} }
 
 var (
-	adrRefRE  = regexp.MustCompile(`^ADR ([0-9]{4})$`)
+	adrRefRE = regexp.MustCompile(`^ADR ([0-9]{4})$`)
 	// Cards come from several waves: T3.226, T5.1, S1.001 and UI-31. All of
 	// them are valid identifiers, so the lister must not reject a new wave
 	// just because its prefix differs from the original T<n>.<n> form.
-	idrRE = regexp.MustCompile(`^[A-Za-z]+[0-9]*[.-][0-9]+$`)
+	idrRE     = regexp.MustCompile(`^[A-Za-z]+[0-9]*[.-][0-9]+$`)
 	adrStatRE = regexp.MustCompile(`(?m)^Статус:[ \t]*(.*)$`)
 )
 
@@ -1688,20 +1689,10 @@ func (s *Service) saveReservations(st fileReservationState) error {
 	return taskstore.AtomicWrite(s.reservationPath(), append(data, '\n'), 0644)
 }
 
-// compileGlob переводит glob аренды в регулярное выражение. '*' и '?' не
-// переходят границу сегмента, '**' переходит, форма '**/' означает ноль или
-// несколько целых сегментов.
-func compileGlob(glob string) (*regexp.Regexp, error) {
-	q := regexp.QuoteMeta(glob)
-	q = strings.ReplaceAll(q, `\*\*/`, `(?:.*/)?`)
-	q = strings.ReplaceAll(q, `\*\*`, `.*`)
-	q = strings.ReplaceAll(q, `\*`, `[^/]*`)
-	q = strings.ReplaceAll(q, `\?`, `[^/]`)
-	return regexp.Compile("^" + q + "$")
-}
-
-// globMatches сообщает, задевает ли файл glob аренды. Прямой путь и каталог
-// сравниваются по сегментам, шаблон сравнивается как glob.
+// globMatches сообщает, задевает ли файл glob аренды. Нормализация путей и
+// прямой конфликт каталога остаются здесь, а синтаксис glob задаёт doublestar:
+// '*' и '?' не переходят границу сегмента, '**' переходит, а '**/' означает
+// ноль или несколько целых сегментов.
 func globMatches(glob, file string) bool {
 	g := strings.ReplaceAll(strings.TrimSpace(glob), "\\", "/")
 	f := strings.ReplaceAll(strings.TrimSpace(file), "\\", "/")
@@ -1712,11 +1703,8 @@ func globMatches(glob, file string) bool {
 	if taskstore.PathsConflict(g, f) {
 		return true
 	}
-	re, err := compileGlob(g)
-	if err != nil {
-		return false
-	}
-	return re.MatchString(f)
+	ok, err := doublestar.Match(g, f)
+	return err == nil && ok
 }
 
 func validateReservationGlobs(globs []string) ([]string, error) {
@@ -1728,8 +1716,8 @@ func validateReservationGlobs(globs []string) ([]string, error) {
 		if g == "" {
 			return nil, taskstore.Validationf("пустой glob аренды")
 		}
-		if _, err := compileGlob(g); err != nil {
-			return nil, taskstore.Validationf("неверный glob аренды %q: %v", raw, err)
+		if !doublestar.ValidatePattern(g) {
+			return nil, taskstore.Validationf("неверный glob аренды %q", raw)
 		}
 		if !seen[g] {
 			seen[g] = true

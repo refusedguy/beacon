@@ -1622,3 +1622,31 @@ func TestEvaluateGreenBlockedDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// The verdict engine reads one canonical conclusion vocabulary. Adapters and
+// the engine must agree on aliases such as PASS, SUCCESSFUL and CANCELED.
+func TestNormalizeConclusionUsesOneVocabulary(t *testing.T) {
+	cases := []struct {
+		raw, want string
+	}{
+		{"success", "SUCCESS"},
+		{"  PASS  ", "SUCCESS"},
+		{"SUCCESSFUL", "SUCCESS"},
+		{"skipped", "SUCCESS"},
+		{"Neutral", "SUCCESS"},
+		{"FAIL", "FAILURE"},
+		{"failure", "FAILURE"},
+		{"ERROR", "FAILURE"},
+		{"timed_out", "FAILURE"},
+		{"ACTION_REQUIRED", "FAILURE"},
+		{"canceled", "CANCELLED"},
+		{"CANCELLED", "CANCELLED"},
+		{"", "PENDING"},
+		{"WAITING", "PENDING"},
+	}
+	for _, tc := range cases {
+		if got := NormalizeConclusion(tc.raw); got != tc.want {
+			t.Errorf("NormalizeConclusion(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}

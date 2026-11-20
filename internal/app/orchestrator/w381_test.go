@@ -73,7 +73,7 @@ func TestW381DaemonAdapterRefusesForeignObligation(t *testing.T) {
 		Adapter:      wake.AdapterOpenCode,
 		Target:       w381OtherSub,
 		WatchID:      w381WatchID,
-		ObligationID: daemonObligationKey(w381WatchID, 1, w381Sub),
+		ObligationID: obligationKey(w381WatchID, 1, w381Sub),
 		Revision:     1,
 	}
 	if _, ok := a.Bind(p, nil); ok {

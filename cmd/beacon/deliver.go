@@ -15,18 +15,18 @@ package main
 // unsupported environment are never retried.
 //
 // This file reads the snapshot through mcp.StateSnapshot and projects the few
-// fields it needs into local types. It does not import internal/domain: the
-// ADR 0005 layer matrix allows cmd -> internal/infra but forbids cmd ->
-// internal/domain, and the gate enforces that edge.
+// fields it needs into local types. The ADR 0005 layer matrix allows the shared
+// cmd -> internal/domain edge, so the obligation key uses the single canonical
+// domain.ObligationKey encoder instead of a local copy.
 
 import (
 	"errors"
 	"flag"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
@@ -119,17 +119,6 @@ func deliverViews(snap mcp.StateSnapshot) []deliverWatchView {
 		views = append(views, v)
 	}
 	return views
-}
-
-// deliverKeyEscaper mirrors the domain obligation-key encoding so the pointer
-// names the real obligation. It is local because cmd/beacon may not import
-// internal/domain under the ADR 0005 layer matrix.
-var deliverKeyEscaper = strings.NewReplacer("\\", "\\\\", ":", "\\:")
-
-func deliverObligationID(watchID string, revision uint64, subscriberID string) string {
-	return deliverKeyEscaper.Replace(watchID) + ":" +
-		strconv.FormatUint(revision, 10) + ":" +
-		deliverKeyEscaper.Replace(subscriberID)
 }
 
 // deliveryKind is the honest ADR 0026 outcome printed by the command.
@@ -298,7 +287,7 @@ func deliverySubscriber(w deliverWatchView) (deliverSubView, bool) {
 // watch identifier and the obligation key, never check contents, so a retry
 // repeats the same pointer with the same obligationID (ADR 0017).
 func deliverText(w deliverWatchView, sessionID string) string {
-	obligationID := deliverObligationID(w.id, w.revision, sessionID)
+	obligationID := domain.ObligationKey(w.id, w.revision, sessionID)
 	return fmt.Sprintf("beacon deliver watch=%s revision=%d verdict=%s obligation=%s",
 		w.id, w.revision, w.verdict, obligationID)
 }
