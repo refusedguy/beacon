@@ -220,6 +220,162 @@ func (t *ACPHTTPTransport) Call(ctx context.Context, req ACPRequest) ([]byte, er
 	return body, nil
 }
 
+// ===== ACP capability negotiation (S3.005) =====
+// An ACP agent declares optional features in the agentCapabilities object of
+// its initialize result. Beacon treats every feature as optional: a feature
+// the agent did not declare changes how a wake is delivered, never whether it
+// is delivered. The adapter lives in wake, so the eight MCP core tools
+// (ADR 0086/0094) are left untouched.
+
+// ACPCapability is one named optional feature of an ACP agent. The dictionary
+// is closed so a typo cannot silently disable a delivery mode.
+type ACPCapability string
+
+const (
+	ACPCapSessionLoad  ACPCapability = "loadSession"
+	ACPCapFork         ACPCapability = "fork"
+	ACPCapModels       ACPCapability = "models"
+	ACPCapModes        ACPCapability = "modes"
+	ACPCapMCPTransport ACPCapability = "mcp"
+)
+
+// ACPCapabilities is the feature set negotiated with one agent. The zero
+// value means "nothing declared", so callers must pick the most conservative
+// mode. It is stored on the client after initialize.
+type ACPCapabilities struct {
+	SessionLoad  bool
+	Fork         bool
+	Models       bool
+	Modes        bool
+	MCPTransport bool
+}
+
+// Has reports whether which was negotiated. Unknown capabilities are absent.
+func (c ACPCapabilities) Has(which ACPCapability) bool {
+	switch which {
+	case ACPCapSessionLoad:
+		return c.SessionLoad
+	case ACPCapFork:
+		return c.Fork
+	case ACPCapModels:
+		return c.Models
+	case ACPCapModes:
+		return c.Modes
+	case ACPCapMCPTransport:
+		return c.MCPTransport
+	default:
+		return false
+	}
+}
+
+// capabilityEnabled reads one declared flag. A boolean is used as-is; a
+// structured value means the feature is advertised; an explicit false, null
+// or a missing key means it is not.
+func capabilityEnabled(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return false
+	}
+	var flag bool
+	if err := json.Unmarshal(trimmed, &flag); err == nil {
+		return flag
+	}
+	return trimmed[0] == '{' || trimmed[0] == '['
+}
+
+// parseACPCapabilities decodes agentCapabilities (or the serverCapabilities
+// alias some harnesses use) from an initialize result. This is a boundary
+// parse: a missing, malformed or partial object is not an error, it yields the
+// zero value so a wake degrades instead of failing the handshake.
+func parseACPCapabilities(result json.RawMessage) ACPCapabilities {
+	var envelope struct {
+		AgentCapabilities  map[string]json.RawMessage `json:"agentCapabilities"`
+		ServerCapabilities map[string]json.RawMessage `json:"serverCapabilities"`
+	}
+	if err := json.Unmarshal(result, &envelope); err != nil {
+		return ACPCapabilities{}
+	}
+	declared := envelope.AgentCapabilities
+	if declared == nil {
+		declared = envelope.ServerCapabilities
+	}
+	var caps ACPCapabilities
+	for name, raw := range declared {
+		if !capabilityEnabled(raw) {
+			continue
+		}
+		switch ACPCapability(name) {
+		case ACPCapSessionLoad:
+			caps.SessionLoad = true
+		case ACPCapFork:
+			caps.Fork = true
+		case ACPCapModels:
+			caps.Models = true
+		case ACPCapModes:
+			caps.Modes = true
+		case ACPCapMCPTransport, "mcpServers":
+			caps.MCPTransport = true
+		}
+	}
+	return caps
+}
+
+// beaconClientCapabilities is the non-empty declaration Beacon sends at
+// initialize. Beacon can carry MCP server definitions and drive session
+// resume, so it advertises those; an agent may ignore any it does not use.
+func beaconClientCapabilities() map[string]any {
+	return map[string]any{
+		string(ACPCapSessionLoad):  true,
+		string(ACPCapMCPTransport): true,
+	}
+}
+
+// ACPDeliveryMode is how Beacon inserts a wake once capabilities are known.
+type ACPDeliveryMode string
+
+const (
+	// ACPDeliveryResume reuses an existing session through session/load.
+	ACPDeliveryResume ACPDeliveryMode = "resume"
+	// ACPDeliveryNewRun starts a fresh session through session/new. It is the
+	// degraded mode used whenever the agent cannot resume.
+	ACPDeliveryNewRun ACPDeliveryMode = "newRun"
+)
+
+// ACPDeliveryPlan is the concrete set of choices for one wake. Every optional
+// field is dropped unless the agent advertised it, so a thin agent never gets
+// a request field it cannot handle.
+type ACPDeliveryPlan struct {
+	Mode       ACPDeliveryMode
+	UseFork    bool
+	SendModels bool
+	SendModes  bool
+	SendMCP    bool
+}
+
+// ACPDeliveryPolicy turns negotiated capabilities into a delivery plan.
+// PreferResume asks to reuse an existing session; when session/load was not
+// declared the plan degrades to a new run instead of failing. That downgrade
+// is the acceptance rule of S3.005: a missing capability changes the mode, it
+// does not crash the wake.
+type ACPDeliveryPolicy struct {
+	PreferResume bool
+}
+
+// Plan is pure: the same policy and capabilities always yield the same plan.
+func (p ACPDeliveryPolicy) Plan(caps ACPCapabilities) ACPDeliveryPlan {
+	mode := ACPDeliveryNewRun
+	if p.PreferResume && caps.SessionLoad {
+		mode = ACPDeliveryResume
+	}
+	return ACPDeliveryPlan{
+		Mode:       mode,
+		UseFork:    p.PreferResume && caps.Fork && caps.SessionLoad,
+		SendModels: caps.Models,
+		SendModes:  caps.Modes,
+		SendMCP:    caps.MCPTransport,
+	}
+}
+
 // ===== постоянный ACP-клиент (W2-B) =====
 // ACPStdioTransport above starts one process per request and is kept for the
 // older tests. A real worker stays alive across prompts, so this section adds
@@ -361,6 +517,7 @@ type PersistentACPClient struct {
 	doneOnce  sync.Once
 	closeOnce sync.Once
 	started   bool
+	caps      ACPCapabilities // negotiated at initialize; guarded by mu
 }
 
 var _ WorkerRuntime = (*PersistentACPClient)(nil)
@@ -560,12 +717,62 @@ func (c *PersistentACPClient) Initialize(ctx context.Context) error {
 	if err := c.Start(); err != nil {
 		return err
 	}
-	_, err := c.call(ctx, "initialize", map[string]any{
+	raw, err := c.call(ctx, "initialize", map[string]any{
 		"protocolVersion":    persistentACPProtocolVersion,
-		"clientCapabilities": map[string]any{},
+		"clientCapabilities": beaconClientCapabilities(),
 		"clientInfo":         map[string]any{"name": "beacon", "version": "0.0.0"},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.caps = parseACPCapabilities(raw)
+	c.mu.Unlock()
+	return nil
+}
+
+// Capabilities returns the feature set negotiated at initialize. Before
+// Initialize it is the zero value, which selects the most conservative mode.
+func (c *PersistentACPClient) Capabilities() ACPCapabilities {
+	if c == nil {
+		return ACPCapabilities{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.caps
+}
+
+// DeliveryPlan resolves a policy against the negotiated capabilities. Callers
+// use it before deciding whether to resume or start a new session.
+func (c *PersistentACPClient) DeliveryPlan(policy ACPDeliveryPolicy) ACPDeliveryPlan {
+	return policy.Plan(c.Capabilities())
+}
+
+// DeliverWake inserts text into a session using the negotiated plan. It
+// resumes sessionID when the agent declared session/load, and otherwise starts
+// a fresh session. A missing capability never fails the call: it only changes
+// the delivery mode. The new session id is returned so callers can track the
+// session even after a downgrade.
+func (c *PersistentACPClient) DeliverWake(ctx context.Context, sessionID, cwd, text string, policy ACPDeliveryPolicy) (string, error) {
+	if c == nil {
+		return "", fmt.Errorf("wake: acp client: nil")
+	}
+	target := sessionID
+	if c.DeliveryPlan(policy).Mode == ACPDeliveryResume {
+		if err := c.LoadSession(ctx, target, cwd); err != nil {
+			return "", err
+		}
+	} else {
+		newID, err := c.NewSession(ctx, cwd)
+		if err != nil {
+			return "", err
+		}
+		target = newID
+	}
+	if err := c.Prompt(ctx, target, text); err != nil {
+		return "", err
+	}
+	return target, nil
 }
 
 // NewSession creates a worker session and returns its opaque id.
