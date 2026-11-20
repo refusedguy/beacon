@@ -25,7 +25,7 @@ var _ domain.WakeDeliverer = (*OpenCodeDeliverer)(nil)
 
 // Deliver emits a <beacon-event> envelope with only identifiers. The host's
 // prompt admission treats the text as untrusted input, never as a command.
-func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePointer) error {
+func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
 	if !strings.HasPrefix(sessionID, "ses_") {
 		return fmt.Errorf("wake: invalid session id %q", sessionID)
 	}
@@ -52,7 +52,7 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 
 // Envelope renders the pointer into the host's wake text. Every field is
 // whitelisted: no check body or PR title is included.
-func Envelope(p domain.WakePointer) string {
+func Envelope(p domain.WakePayload) string {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)

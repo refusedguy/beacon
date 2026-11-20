@@ -10,7 +10,7 @@ import (
 )
 
 func TestEnvelopeWhitelistsFields(t *testing.T) {
-	p := domain.WakePointer{WatchID: "watch-1", ObligationID: "obl-1", Revision: 7, Verdict: "ready"}
+	p := domain.WakePayload{WatchID: "watch-1", ObligationID: "obl-1", Revision: 7, Verdict: "ready"}
 	env := Envelope(p)
 	if !strings.HasPrefix(env, "<beacon-event>") || !strings.HasSuffix(env, "</beacon-event>") {
 		t.Fatalf("bad envelope: %q", env)
@@ -28,13 +28,13 @@ func TestOpenCodeDelivererPostsSteerPrompt(t *testing.T) {
 		gotArgs = args
 		return []byte(`{"data":{"id":"msg_1","sessionID":"ses_test"}}`), nil
 	}}
-	err := d.Deliver(context.Background(), "ses_test", domain.WakePointer{
+	err := d.Deliver(context.Background(), "ses_test", domain.WakePayload{
 		WatchID: "watch-1", ObligationID: "obl-1", Revision: 1, Verdict: "ready",
 	})
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
-	if len(gotArgs) < 6 {
+	if len(gotArgs) < 5 {
 		t.Fatalf("args = %q", gotArgs)
 	}
 	if gotArgs[0] != "api" || gotArgs[1] != "POST" || gotArgs[2] != "/api/session/ses_test/prompt" {
@@ -44,7 +44,7 @@ func TestOpenCodeDelivererPostsSteerPrompt(t *testing.T) {
 		Text     string `json:"text"`
 		Delivery string `json:"delivery"`
 	}
-	if err := json.Unmarshal([]byte(gotArgs[5]), &sent); err != nil {
+	if err := json.Unmarshal([]byte(gotArgs[4]), &sent); err != nil {
 		t.Fatalf("decode --data: %v", err)
 	}
 	if sent.Delivery != "steer" {
@@ -59,10 +59,10 @@ func TestOpenCodeDelivererRejectsBadSessionAndMissingAck(t *testing.T) {
 	d := &OpenCodeDeliverer{Runner: func(context.Context, ...string) ([]byte, error) {
 		return []byte(`{"data":{}}`), nil
 	}}
-	if err := d.Deliver(context.Background(), "not-a-session", domain.WakePointer{}); err == nil {
+	if err := d.Deliver(context.Background(), "not-a-session", domain.WakePayload{}); err == nil {
 		t.Fatal("invalid session id must be rejected")
 	}
-	if err := d.Deliver(context.Background(), "ses_test", domain.WakePointer{}); err == nil {
+	if err := d.Deliver(context.Background(), "ses_test", domain.WakePayload{}); err == nil {
 		t.Fatal("ack without message id must be rejected")
 	}
 }

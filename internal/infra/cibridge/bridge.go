@@ -180,7 +180,7 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 		}
 		// A subscriber registered from an MCP call carries its opaque host
 		// session id. Only those are wakeable; a plain notify target is not.
-		if err := b.waker.Deliver(ctx, sub.ID, domain.WakePointer{
+		if err := b.waker.Deliver(ctx, sub.ID, domain.WakePayload{
 			WatchID:      next.ID,
 			ObligationID: id,
 			Revision:     next.Revision,
