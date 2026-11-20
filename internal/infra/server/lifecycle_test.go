@@ -1,13 +1,17 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // pidFile reads the pidfile written by the holder of the lease.
@@ -158,5 +162,135 @@ func TestProcessAlive(t *testing.T) {
 	}
 	if processAlive(0) {
 		t.Fatal("non-positive pid reported as alive")
+	}
+}
+
+func TestLifecycleStartServesHealth(t *testing.T) {
+	lc := NewLifecycle("127.0.0.1:0", nil)
+	if got := lc.State(); got != StateNew {
+		t.Fatalf("state before start = %s, want new", got)
+	}
+	if err := lc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = lc.Stop() }()
+	if got := lc.State(); got != StateRunning {
+		t.Fatalf("state after start = %s, want running", got)
+	}
+
+	addr := lc.Addr()
+	if addr == "" || addr == "127.0.0.1:0" {
+		t.Fatalf("addr not resolved after start: %q", addr)
+	}
+	resp, err := http.Get("http://" + addr + HealthPath)
+	if err != nil {
+		t.Fatalf("GET healthz: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestLifecycleStopIsIdempotent(t *testing.T) {
+	lc := NewLifecycle("127.0.0.1:0", nil)
+	if err := lc.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	addr := lc.Addr()
+
+	if err := lc.Stop(); err != nil {
+		t.Fatalf("first stop: %v", err)
+	}
+	if got := lc.State(); got != StateStopped {
+		t.Fatalf("state after stop = %s, want stopped", got)
+	}
+	if err := lc.Stop(); err != nil {
+		t.Fatalf("second stop: %v", err)
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+	if err == nil {
+		_ = conn.Close()
+		t.Fatalf("listener still accepting on %s after stop", addr)
+	}
+}
+
+func TestLifecycleStopBeforeStartIsNoop(t *testing.T) {
+	lc := NewLifecycle("127.0.0.1:0", nil)
+	if err := lc.Stop(); err != nil {
+		t.Fatalf("stop before start: %v", err)
+	}
+	if got := lc.State(); got != StateNew {
+		t.Fatalf("state after early stop = %s, want new", got)
+	}
+	if err := lc.Start(); err != nil {
+		t.Fatalf("start after early stop: %v", err)
+	}
+	defer func() { _ = lc.Stop() }()
+}
+
+func TestLifecycleSecondStartRefused(t *testing.T) {
+	lc := NewLifecycle("127.0.0.1:0", nil)
+	if err := lc.Start(); err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	defer func() { _ = lc.Stop() }()
+
+	err := lc.Start()
+	if !errors.Is(err, ErrAlreadyStarted) {
+		t.Fatalf("second start error = %v, want ErrAlreadyStarted", err)
+	}
+}
+
+func TestLifecycleOccupiedPortFails(t *testing.T) {
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blocking listener: %v", err)
+	}
+	addr := blocker.Addr().String()
+
+	lc := NewLifecycle(addr, nil)
+	if err := lc.Start(); !errors.Is(err, ErrListen) {
+		t.Fatalf("start on occupied port error = %v, want ErrListen", err)
+	}
+	if got := lc.State(); got != StateNew {
+		t.Fatalf("state after failed start = %s, want new", got)
+	}
+
+	// A failed bind leaves the lifecycle usable: retry on the freed port.
+	_ = blocker.Close()
+	if err := lc.Start(); err != nil {
+		t.Fatalf("retry after port freed: %v", err)
+	}
+	defer func() { _ = lc.Stop() }()
+}
+
+func TestLifecycleRunStopsOnContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	lc := NewLifecycle("127.0.0.1:0", nil)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- lc.Run(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for lc.State() != StateRunning {
+		if time.Now().After(deadline) {
+			t.Fatal("server did not reach running state")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after context cancellation")
+	}
+	if got := lc.State(); got != StateStopped {
+		t.Fatalf("state after cancel = %s, want stopped", got)
 	}
 }
