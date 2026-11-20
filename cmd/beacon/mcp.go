@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/github"
+	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/ladder"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -483,6 +485,259 @@ func pointsValue(points func() (int, int)) (int, int) {
 }
 
 // ---------------------------------------------------------------------------
+// Loopback HTTP and SSE (W8-A).
+//
+// The transport lives in infra/httpapi. This file only assembles its ports
+// around the same store handle and wake registry the MCP tools use, so both
+// transports observe the same state and the same effects.
+// ---------------------------------------------------------------------------
+
+// Both adapters satisfy the transport-owned ports. The assertions keep the
+// wiring honest if either interface changes.
+var (
+	_ httpapi.StateProvider = httpStateProvider{}
+	_ httpapi.DecisionSink  = humanDecisionSink{}
+)
+
+// httpStateProvider projects the MCP snapshot plus the control-plane rows the
+// HTTP view needs. It reads only; every write goes through humanDecisionSink.
+type httpStateProvider struct {
+	db         *store.DB
+	dir        string
+	projectKey string
+	deps       mcp.Dependencies
+}
+
+func (p httpStateProvider) Snapshot(ctx context.Context) (httpapi.Snapshot, error) {
+	snap := httpapi.Snapshot{
+		LiveWatches:      []domain.Watch{},
+		BlockerIncidents: []domain.BlockerIncident{},
+		Escalations:      []string{},
+		LoadErrors:       []string{},
+	}
+	if p.deps.Snapshot != nil {
+		base, err := p.deps.Snapshot.Snapshot()
+		if err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "snapshot: "+err.Error())
+		} else {
+			snap.LiveWatches = base.RadarWatches()
+			snap.PointStats = httpapi.PointStats{Used: base.PointsThisHour, Budget: base.Budget}
+			snap.LoadErrors = append(snap.LoadErrors, cleanLoadErrors(base.LoadErrors)...)
+		}
+	}
+	if p.db != nil {
+		blockers, err := p.db.ActiveBlockers()
+		if err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "blockers: "+err.Error())
+		} else {
+			snap.BlockerIncidents = blockers
+		}
+		if binding, bound, err := p.db.BoundOrchestrator(p.projectKey); err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "orchestrator: "+err.Error())
+		} else if bound {
+			snap.BoundOrchestrator = &binding
+		}
+		if raw, ok, err := p.db.LoadRuntimeStats(); err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "runtime_stats: "+err.Error())
+		} else if ok && json.Valid(raw) {
+			snap.Metrics = json.RawMessage(raw)
+		}
+	}
+	// The escalation journal is read through the same filesystem seam the
+	// `inspect` command uses, so both views show the same rung 2 entries.
+	if p.dir != "" {
+		lines, err := readEscalations(p.dir)
+		if err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "escalations: "+err.Error())
+		} else {
+			snap.Escalations = lines
+		}
+	}
+	snap.LastCycle = lastCycleInfo()
+	return snap, nil
+}
+
+// cleanLoadErrors drops the successful runtime_stats byte-count note the MCP
+// snapshot adds. It is a size, not a load failure.
+func cleanLoadErrors(errs []string) []string {
+	out := make([]string, 0, len(errs))
+	for _, e := range errs {
+		if strings.HasPrefix(e, "runtime_stats: ") && strings.HasSuffix(e, " bytes") {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// humanDecisionSink journals each command and applies its effect. The HTTP
+// layer handles idempotency, so one accepted request produces one journal row.
+type humanDecisionSink struct {
+	db       *store.DB
+	registry *wake.Registry
+	events   *httpapi.EventBus
+}
+
+func (s humanDecisionSink) Apply(ctx context.Context, d httpapi.Decision) (httpapi.DecisionResult, error) {
+	result := httpapi.DecisionResult{Command: d.Command, WatchID: d.WatchID}
+	if s.db == nil {
+		return result, errors.New("httpapi: store недоступен")
+	}
+	w, err := s.db.Watch(d.WatchID)
+	if err != nil {
+		return result, err
+	}
+	now := time.Now().UTC()
+	seq, err := s.db.AppendEvent(ctx, d.WatchID, "human_decide", fmt.Sprintf(
+		"command=%s obligation=%s actor=%s note=%s", d.Command, d.ObligationID, d.Actor, d.Note,
+	))
+	if err != nil {
+		return result, err
+	}
+	result.DecisionID = strconv.FormatInt(seq, 10)
+
+	switch d.Command {
+	case "cancel":
+		w.Status = domain.StatusClosed
+		w.Verdict = domain.VerdictClosed
+		w.CloseReason = strings.TrimSpace("human: " + d.Command + " " + d.Note)
+		w.ClosedAt = now
+		if err := s.db.SaveWatch(w); err != nil {
+			return result, err
+		}
+	case "unblock":
+		if w.BlockerID != "" {
+			if _, err := s.db.ResolveBlocker(w.BlockerID, now); err != nil {
+				return result, err
+			}
+			w, err = s.db.Watch(d.WatchID)
+			if err != nil {
+				return result, err
+			}
+		} else if w.Blocked != nil {
+			w.Status = domain.StatusWatching
+			w.Verdict = domain.VerdictWatching
+			w.Blocked = nil
+			w.Revision++
+			if err := s.db.SaveWatch(w); err != nil {
+				return result, err
+			}
+		}
+	case "pause", "resume":
+		phase := domain.WorkerPhaseWaiting
+		if d.Command == "pause" {
+			phase = domain.WorkerPhaseBlocked
+		}
+		for i := range w.Subscribers {
+			w.Subscribers[i].Phase = phase
+		}
+		if err := s.db.SaveWatch(w); err != nil {
+			return result, err
+		}
+	}
+	result.Status = string(w.Status) + "/" + string(w.Verdict)
+
+	if d.Command != "cancel" {
+		s.wake(ctx, w, d)
+	}
+	payload, _ := json.Marshal(result)
+	if s.events != nil {
+		s.events.Publish(httpapi.Event{
+			Type: "human.decide", WatchID: w.ID, Payload: payload,
+		})
+	}
+	return result, nil
+}
+
+// wake steers the executor and orchestrator subscribers of the affected Watch.
+// The obligation id comes from the request when present, otherwise from the
+// first pending obligation of that Watch.
+func (s humanDecisionSink) wake(ctx context.Context, w domain.Watch, d httpapi.Decision) {
+	if s.registry == nil {
+		return
+	}
+	obligationID := d.ObligationID
+	if obligationID == "" && s.db != nil {
+		if pending, err := s.db.PendingObligations(); err == nil {
+			for _, o := range pending {
+				if o.WatchID == w.ID {
+					obligationID = o.ID
+					break
+				}
+			}
+		}
+	}
+	p := domain.WakePayload{
+		WatchID: w.ID, ObligationID: obligationID, Revision: w.Revision,
+		Verdict: "human:" + d.Command,
+	}
+	for _, sub := range w.Subscribers {
+		if sub.Role != domain.RoleExecutor && sub.Role != domain.RoleOrchestrator {
+			continue
+		}
+		target := sub.Target
+		if target == "" {
+			target = sub.ID
+		}
+		if target == "" {
+			continue
+		}
+		if err := s.registry.Deliver(ctx, sub.Adapter, target, p); err != nil {
+			observe.ActorError("human-decide-wake", w.ID, err)
+		}
+	}
+}
+
+// cycleMu guards the last completed reconciler pass reported by the HTTP view.
+var (
+	cycleMu   sync.Mutex
+	cycleInfo httpapi.LastCycle
+)
+
+func recordCycle(started time.Time, updated int) {
+	cycleMu.Lock()
+	cycleInfo = httpapi.LastCycle{
+		At: started.UTC(), WatchesUpdated: updated,
+		DurationMs: time.Since(started).Milliseconds(),
+	}
+	cycleMu.Unlock()
+}
+
+func lastCycleInfo() httpapi.LastCycle {
+	cycleMu.Lock()
+	defer cycleMu.Unlock()
+	return cycleInfo
+}
+
+// startHTTPAPI is called only by the process that owns the poller lock. The
+// returned function stops the server and removes its connection file.
+func startHTTPAPI(_ context.Context, cfg reconcileConfig, bus *httpapi.EventBus) (func(), error) {
+	srv, err := httpapi.Start(httpapi.Config{
+		Addr:          strings.TrimSpace(os.Getenv(httpapi.AddrEnv)),
+		StateDir:      cfg.dir,
+		Version:       mcp.ServerVersion,
+		ProjectKey:    cfg.projectKey,
+		IsPollerOwner: true,
+		StartedAt:     time.Now(),
+		Provider: httpStateProvider{
+			db: cfg.db, dir: cfg.dir, projectKey: cfg.projectKey, deps: cfg.deps,
+		},
+		Sink: humanDecisionSink{
+			db: cfg.db, registry: reconcileWaker(cfg.db), events: bus,
+		},
+		Events: bus,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		if err := srv.Close(); err != nil {
+			observe.ActorError("httpapi-close", "", err)
+		}
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Wake ladder wiring (ADR 0017).
 //
 // The ladder core lives in internal/infra/ladder and depends on narrow ports.
@@ -649,6 +904,7 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 	deps := buildMCPDependencies(db, dir, ghBatch.provider.PointStats)
 	defer stopVerdictSource(deps.Source)
 
+	events := httpapi.NewEventBus(0)
 	cfg := reconcileConfig{
 		dir:        dir,
 		db:         db,
@@ -657,10 +913,19 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		counter:    ghBatch.counter,
 		projectKey: orchestratorProjectKey(),
 		root:       projectRootForConfig(),
+		events:     events,
 	}
 
 	// Only the owner of the non-blocking poller lock starts the single
-	// background cycle. A second MCP process serves tools but stays silent.
+	// background cycle and the loopback HTTP API. A second MCP process serves
+	// tools but stays silent and owns no connection file.
+	var (
+		stopHTTP func()
+		httpErr  error
+	)
+	cfg.onPollerOwner = func(c context.Context) {
+		stopHTTP, httpErr = startHTTPAPI(c, cfg, events)
+	}
 	runCtx, stopLoops := context.WithCancel(ctx)
 	defer stopLoops()
 	stop, err := runReconciler(runCtx, cfg)
@@ -668,6 +933,12 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		return fmt.Errorf("mcp: poller: %w", err)
 	}
 	defer stop()
+	if httpErr != nil {
+		// An optional API must never take down the stdio MCP transport.
+		observe.ActorError("httpapi", "", httpErr)
+	} else if stopHTTP != nil {
+		defer stopHTTP()
+	}
 
 	return serveMCP(ctx, deps)
 }
@@ -715,6 +986,12 @@ type reconcileConfig struct {
 	projectKey       string
 	root             string
 	intervalOverride time.Duration
+	// events carries live cycle and decision frames to SSE subscribers. A
+	// config assembled by `beacon daemon` leaves it nil.
+	events *httpapi.EventBus
+	// onPollerOwner runs once when this process wins the poller lock. runMCP
+	// uses it to start the loopback API only on the owning process.
+	onPollerOwner func(context.Context)
 }
 
 // githubBatch is the real CI provider plus the shared point counter.
@@ -980,8 +1257,10 @@ func runLadderPass(ctx context.Context, cfg reconcileConfig) {
 // counters are saved to runtime_stats. It returns the number of watches the
 // bridge updated.
 func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
+	started := time.Now()
 	runLadderPass(ctx, cfg)
 	if cfg.db == nil || cfg.batch == nil {
+		recordCycle(started, 0)
 		return 0
 	}
 	bridge := cibridge.New(cfg.db, cfg.batch, cfg.deps.Clock, 0)
@@ -996,6 +1275,14 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		if err := cfg.db.SaveRuntimeStats(metrics.SnapshotJSON(), time.Now()); err != nil {
 			observe.ActorError("runtime_stats", "", err)
 		}
+	}
+	recordCycle(started, updated)
+	if cfg.events != nil {
+		payload, _ := json.Marshal(httpapi.LastCycle{
+			At: started.UTC(), WatchesUpdated: updated,
+			DurationMs: time.Since(started).Milliseconds(),
+		})
+		cfg.events.Publish(httpapi.Event{Type: "cycle", Payload: payload})
 	}
 	return updated
 }
@@ -1034,6 +1321,9 @@ func runReconciler(ctx context.Context, cfg reconcileConfig) (func(), error) {
 	}
 	if !owned {
 		return func() {}, nil
+	}
+	if cfg.onPollerOwner != nil {
+		cfg.onPollerOwner(ctx)
 	}
 	loopCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
