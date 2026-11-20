@@ -32,6 +32,18 @@ func (r *repoQueryRunner) run(_, name string, args, _ []string) runResult {
 	return runResult{code: 2, stderr: []byte("unexpected gh call: " + strings.Join(args, " "))}
 }
 
+// hasRepositoryQuery accepts any number of GraphQL documents, since the CI
+// source may add aliases. The owner and name must match exactly in one of them.
+func hasRepositoryQuery(queries []string, owner, name string) bool {
+	want := `repository(owner:"` + owner + `", name:"` + name + `")`
+	for _, query := range queries {
+		if strings.Contains(query, want) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCICheckUsesRepoFlag(t *testing.T) {
 	t.Setenv("BEACON_STATE_DIR", t.TempDir())
 	t.Setenv("BEACON_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
@@ -41,7 +53,7 @@ func TestCICheckUsesRepoFlag(t *testing.T) {
 	if code := runCI(cli, []string{"check", "--all", "--repo", "cli/flag"}); code != 0 {
 		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
 	}
-	if len(runner.queries) != 1 || !strings.Contains(runner.queries[0], `repository(owner:"cli", name:"flag")`) {
+	if !hasRepositoryQuery(runner.queries, "cli", "flag") {
 		t.Fatalf("queries = %v, want owner cli and name flag", runner.queries)
 	}
 }
@@ -66,7 +78,7 @@ func TestCICheckUsesRepoFromProjectConfig(t *testing.T) {
 	if code := runCI(cli, []string{"check", "--all"}); code != 0 {
 		t.Fatalf("runCI code = %d, stderr = %s", code, errOut.String())
 	}
-	if len(runner.queries) != 1 || !strings.Contains(runner.queries[0], `repository(owner:"acme", name:"widgets")`) {
+	if !hasRepositoryQuery(runner.queries, "acme", "widgets") {
 		t.Fatalf("queries = %v, want owner acme and name widgets", runner.queries)
 	}
 }
