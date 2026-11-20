@@ -84,7 +84,7 @@ func (m *mockStore) Delete(_ context.Context, id string) error {
 	return nil
 }
 
-func newService(t *testing.T, store *mockStore) *server.ScheduleService {
+func newService(t *testing.T, store server.ScheduleStore) *server.ScheduleService {
 	t.Helper()
 	svc, err := server.NewScheduleService(store)
 	if err != nil {
