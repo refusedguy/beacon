@@ -19,7 +19,7 @@ func run(args []string) int {
 		a := args[i]
 		switch {
 		case a == "--self-test" || a == "-self-test":
-			return gate.DocsSelfTestRun()
+			return docsSelfTestRun()
 		case a == "-baseline" || a == "--baseline":
 			if i+1 >= len(args) {
 				return gate.Brokenf("missing value for %s", a)
@@ -37,11 +37,11 @@ func run(args []string) int {
 	if err != nil {
 		return gate.Brokenf("%v", err)
 	}
-	cfg, err := gate.LoadDocsConfig(baseline)
+	cfg, err := loadDocsConfig(baseline)
 	if err != nil {
 		return gate.Brokenf("%v", err)
 	}
-	fs, err := gate.CheckDocs(opts.Root, cfg)
+	fs, err := checkDocs(opts.Root, cfg)
 	if err != nil {
 		return gate.Brokenf("%v", err)
 	}
