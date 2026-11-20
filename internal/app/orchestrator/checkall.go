@@ -12,7 +12,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,16 +49,188 @@ func ValidateWakeTarget(target string) error {
 	return nil
 }
 
-// Config is the project configuration hook. The schema will come from the
-// research card (another agent); this stub keeps the call site stable today.
-type Config struct{}
+// Project configuration. The global layer lives in ~/.config/beacon/config.yaml
+// (or at the path in BEACON_CONFIG) and the project layer in
+// <repo>/.beacon/config.yaml. A project key overrides a global key; a missing
+// file is not an error.
+const (
+	defaultMaxRebases = 3
+	minMaxRebases     = 1
+	maxMaxRebases     = 10
 
-// LoadProjectConfig loads project configuration from dir. It is a stub: no
-// file is read and no rule is applied until the research card defines the
-// schema. dir is accepted so callers can be wired now without a later edit.
+	// defaultSlotsTotal mirrors domain.DefaultSlotsTotal. The app layer may not
+	// import internal/domain (ADR 0005), so the number is mirrored here.
+	defaultSlotsTotal = 4
+
+	configDirName  = ".beacon"
+	configFileName = "config.yaml"
+	configPathEnv  = "BEACON_CONFIG"
+)
+
+// Config is the effective project configuration after the global and project
+// layers are merged.
+type Config struct {
+	MaxRebases     int    `json:"maxRebases"`
+	OrchestratorID string `json:"orchestratorID"`
+	SlotsTotal     int    `json:"slotsTotal"`
+	WakeTarget     string `json:"wakeTarget"`
+}
+
+// DefaultConfig returns the built-in layer, before either YAML file is read.
+func DefaultConfig() Config {
+	return Config{MaxRebases: defaultMaxRebases, SlotsTotal: defaultSlotsTotal}
+}
+
+// Validate checks the effective configuration. A zero SlotsTotal is valid and
+// means no capacity, matching domain.NewOrchestrator.
+func (c Config) Validate() error {
+	if c.MaxRebases < minMaxRebases || c.MaxRebases > maxMaxRebases {
+		return fmt.Errorf("config: maxRebases=%d вне диапазона %d..%d", c.MaxRebases, minMaxRebases, maxMaxRebases)
+	}
+	if c.SlotsTotal < 0 {
+		return fmt.Errorf("config: slotsTotal=%d не может быть отрицательным", c.SlotsTotal)
+	}
+	if c.OrchestratorID != "" {
+		if err := ValidateWakeTarget(c.OrchestratorID); err != nil {
+			return fmt.Errorf("config: orchestratorID: %w", err)
+		}
+	}
+	if c.WakeTarget != "" {
+		if err := ValidateWakeTarget(c.WakeTarget); err != nil {
+			return fmt.Errorf("config: wakeTarget: %w", err)
+		}
+	}
+	return nil
+}
+
+// configKeys maps the normalized YAML key to the field it fills. Normalizing
+// lowercases the key and drops separators, so maxRebases, max_rebases and
+// MAX-REBASES all name the same field.
+var configKeys = map[string]string{
+	"maxrebases":     "maxRebases",
+	"orchestratorid": "orchestratorID",
+	"slotstotal":     "slotsTotal",
+	"waketarget":     "wakeTarget",
+}
+
+// normalizeConfigKey is the lookup form shared by the parser and the merger.
+func normalizeConfigKey(key string) string {
+	replacer := strings.NewReplacer("_", "", "-", "", " ", "")
+	return replacer.Replace(strings.ToLower(strings.TrimSpace(key)))
+}
+
+// LoadProjectConfig merges the built-in defaults, the global file and the
+// project file in that order. Missing files leave the previous layer intact;
+// a malformed or invalid file is an error.
 func LoadProjectConfig(dir string) (Config, error) {
-	_ = dir
-	return Config{}, nil
+	cfg := DefaultConfig()
+
+	globalPath, err := globalConfigPath()
+	if err != nil {
+		return Config{}, err
+	}
+	if err := applyConfigFile(&cfg, globalPath); err != nil {
+		return Config{}, err
+	}
+	if root := strings.TrimSpace(dir); root != "" {
+		if err := applyConfigFile(&cfg, filepath.Join(root, configDirName, configFileName)); err != nil {
+			return Config{}, err
+		}
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// globalConfigPath resolves the global layer. BEACON_CONFIG names a file path;
+// without it the file lives under ~/.config/beacon.
+func globalConfigPath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv(configPathEnv)); path != "" {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("config: домашний каталог: %w", err)
+	}
+	return filepath.Join(home, ".config", "beacon", configFileName), nil
+}
+
+// applyConfigFile reads one flat YAML file and overlays the keys it contains.
+// fs.ReadFile over os.DirFS keeps file access inside the capabilities gate's
+// infra capability boundary (ADR 0005), the same seam registry_config.go uses.
+func applyConfigFile(cfg *Config, path string) error {
+	values, err := readConfigFile(path)
+	if err != nil {
+		return err
+	}
+	for _, key := range []string{"maxRebases", "orchestratorID", "slotsTotal", "wakeTarget"} {
+		raw, found := values[key]
+		if !found {
+			continue
+		}
+		switch key {
+		case "maxRebases", "slotsTotal":
+			n, err := strconv.Atoi(raw)
+			if err != nil {
+				return fmt.Errorf("config: %s: %s: неверное целое %q", path, key, raw)
+			}
+			if key == "maxRebases" {
+				cfg.MaxRebases = n
+			} else {
+				cfg.SlotsTotal = n
+			}
+		case "orchestratorID":
+			cfg.OrchestratorID = raw
+		case "wakeTarget":
+			cfg.WakeTarget = raw
+		}
+	}
+	return nil
+}
+
+// readConfigFile parses flat `key: value` lines. It accepts comments and
+// quoted strings, and returns an empty map for a file that does not exist.
+func readConfigFile(path string) (map[string]string, error) {
+	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
+
+	values := make(map[string]string)
+	for i, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		field, raw, found := strings.Cut(trimmed, ":")
+		if !found {
+			return nil, fmt.Errorf("config: %s:%d: ожидается key: value", path, i+1)
+		}
+		key, known := configKeys[normalizeConfigKey(field)]
+		if !known {
+			return nil, fmt.Errorf("config: %s:%d: неизвестный ключ %q", path, i+1, strings.TrimSpace(field))
+		}
+		value := strings.TrimSpace(stripConfigComment(raw))
+		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
+			value = value[1 : len(value)-1]
+		}
+		values[key] = value
+	}
+	return values, nil
+}
+
+// stripConfigComment removes a trailing comment only when # starts a token.
+func stripConfigComment(value string) string {
+	for i, r := range value {
+		if r == '#' && (i == 0 || value[i-1] == ' ' || value[i-1] == '\t') {
+			return value[:i]
+		}
+	}
+	return value
 }
 
 // PR is one open pull request reported by gh. Repo is the slug used as the

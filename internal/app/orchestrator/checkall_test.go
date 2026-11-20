@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -165,17 +166,111 @@ func TestVerdictFromChecks(t *testing.T) {
 	}
 }
 
-func TestLoadProjectConfigIsAStub(t *testing.T) {
-	a, err := LoadProjectConfig("/one")
+// isolateConfig points the global layer at a path with no file, so a test
+// never depends on the developer's ~/.config/beacon/config.yaml.
+func isolateConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv(configPathEnv, filepath.Join(t.TempDir(), "no-global.yaml"))
+}
+
+func writeConfigFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLoadProjectConfigDefaultsWithoutFiles(t *testing.T) {
+	isolateConfig(t)
+	got, err := LoadProjectConfig(filepath.Join(t.TempDir(), "missing-project"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := LoadProjectConfig("/two")
+	if want := (Config{MaxRebases: 3, SlotsTotal: 4}); got != want {
+		t.Fatalf("config = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadProjectConfigProjectOverridesGlobal(t *testing.T) {
+	isolateConfig(t)
+	global := filepath.Join(t.TempDir(), "global.yaml")
+	writeConfigFile(t, global, `# global layer
+maxRebases: 5
+orchestratorID: ses_global
+slotsTotal: 2
+wakeTarget: 'ses_global_wake'
+`)
+	t.Setenv(configPathEnv, global)
+
+	project := t.TempDir()
+	writeConfigFile(t, filepath.Join(project, configDirName, configFileName),
+		"max_rebases: 7\nwakeTarget: \"ses_project_wake\"\n")
+
+	got, err := LoadProjectConfig(project)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(a, b) || !reflect.DeepEqual(a, Config{}) {
-		t.Fatalf("config = %+v / %+v, want empty", a, b)
+	want := Config{MaxRebases: 7, OrchestratorID: "ses_global", SlotsTotal: 2, WakeTarget: "ses_project_wake"}
+	if got != want {
+		t.Fatalf("config = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadProjectConfigUsesGlobalWhenProjectAbsent(t *testing.T) {
+	isolateConfig(t)
+	global := filepath.Join(t.TempDir(), "global.yaml")
+	writeConfigFile(t, global, "maxRebases: 6\nslotsTotal: 0\n")
+	t.Setenv(configPathEnv, global)
+
+	got, err := LoadProjectConfig(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Config{MaxRebases: 6, SlotsTotal: 0}
+	if got != want {
+		t.Fatalf("config = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadProjectConfigRejectsInvalidValues(t *testing.T) {
+	cases := []struct {
+		name, body, wantErr string
+	}{
+		{"above range", "maxRebases: 11\n", "maxRebases"},
+		{"below range", "maxRebases: 0\n", "maxRebases"},
+		{"negative slots", "slotsTotal: -1\n", "slotsTotal"},
+		{"not an integer", "maxRebases: many\n", "неверное целое"},
+		{"malformed line", "maxRebases 4\n", "key: value"},
+		{"unknown key", "maxRebase: 4\n", "неизвестный ключ"},
+		{"invalid wake target", "wakeTarget: beacon-ci\n", "ses_"},
+		{"invalid orchestrator id", "orchestratorID: beacon-ci\n", "ses_"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			project := t.TempDir()
+			writeConfigFile(t, filepath.Join(project, configDirName, configFileName), tc.body)
+			_, err := LoadProjectConfig(project)
+			if err == nil {
+				t.Fatalf("LoadProjectConfig accepted %q", tc.body)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q must contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheckAllRejectsInvalidProjectConfig(t *testing.T) {
+	isolateConfig(t)
+	project := t.TempDir()
+	writeConfigFile(t, filepath.Join(project, configDirName, configFileName), "maxRebases: 99\n")
+	_, err := CheckAll(context.Background(), Deps{ConfigDir: project})
+	if err == nil || !strings.Contains(err.Error(), "maxRebases") {
+		t.Fatalf("CheckAll error = %v, want maxRebases", err)
 	}
 }
 
