@@ -507,6 +507,10 @@ func TestDaemonWakeSubscriberSelection(t *testing.T) {
 		ID: "beacon-daemon-checkall", Role: RoleOrchestrator,
 		Target: "beacon-daemon-checkall",
 	}
+	fixerSub := DaemonSubscriber{
+		ID: "ses_fix", Role: RoleFixer, Adapter: wake.AdapterOpenCode,
+		Target: "ses_fix",
+	}
 
 	tests := []struct {
 		name    string
@@ -544,6 +548,21 @@ func TestDaemonWakeSubscriberSelection(t *testing.T) {
 			subs:    []DaemonSubscriber{{ID: "ses_ok", Role: RoleExecutor, Target: "beacon-ci-checkall"}},
 			wantErr: true,
 		},
+		{
+			name:   "only fixer is selected",
+			subs:   []DaemonSubscriber{fixerSub},
+			wantID: "ses_fix",
+		},
+		{
+			name:   "fixer wins among orchestrator and fixer",
+			subs:   []DaemonSubscriber{orchestratorSub, fixerSub},
+			wantID: "ses_fix",
+		},
+		{
+			name:    "fixer with a stale target is refused",
+			subs:    []DaemonSubscriber{{ID: "ses_ok", Role: RoleFixer, Target: "beacon-ci-checkall"}},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -565,6 +584,34 @@ func TestDaemonWakeSubscriberSelection(t *testing.T) {
 				t.Fatalf("selected %q, want %q", got.ID, tc.wantID)
 			}
 		})
+	}
+}
+
+// A fixer receives the same retry pointer an executor receives. The pointer
+// reaches the fixer's own session at the adapter boundary.
+func TestDaemonWakerDeliversToFixer(t *testing.T) {
+	adapter := &daemonRecordingAdapter{}
+	adapters := wake.T211NewAdapterRegistry()
+	adapters.Register(wake.AdapterOpenCode, adapter)
+	subs := []DaemonSubscriber{{
+		ID: "ses_fix", Role: RoleFixer, Adapter: wake.AdapterOpenCode, Target: "ses_fix",
+	}}
+	w := &daemonWaker{
+		lookup: func(id string) (DaemonWatch, error) {
+			view := DaemonWatch{ID: id, PR: 7}
+			if sub, err := DaemonWakeSubscriber(subs); err == nil {
+				view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
+			}
+			return view, nil
+		},
+		adapters: adapters,
+	}
+
+	if err := w.Wake(context.Background(), "w-fix", 2, VerdictRetry); err != nil {
+		t.Fatalf("Wake fixer: %v", err)
+	}
+	if adapter.calls != 1 || !reflect.DeepEqual(adapter.targets, []string{"ses_fix"}) {
+		t.Fatalf("Deliver calls = %d, targets = %q, want one delivery to ses_fix", adapter.calls, adapter.targets)
 	}
 }
 

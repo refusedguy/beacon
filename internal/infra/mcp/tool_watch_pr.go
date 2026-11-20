@@ -8,6 +8,7 @@ package mcp
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -37,13 +38,14 @@ type WatchPRInput struct {
 	PR             int              `json:"pr" jsonschema:"pull request number, must be positive"`
 	HeadSHA        string           `json:"headSHA,omitempty" jsonschema:"head commit SHA; resolved from the CI provider when omitted"`
 	Issue          string           `json:"issue,omitempty"`
-	Role           domain.Role      `json:"role" jsonschema:"subscriber role: executor or orchestrator"`
+	Role           domain.Role      `json:"role" jsonschema:"subscriber role: executor, orchestrator or fixer"`
 	Notify         *WatchPRNotify   `json:"notify,omitempty"`
 	Executor       *WatchPRExecutor `json:"executor,omitempty"`
 	Flaky          *WatchPRFlaky    `json:"flaky,omitempty"`
 	Policy         *WatchPRPolicy   `json:"policy,omitempty"`
 	DeadlineMs     *int64           `json:"deadlineMs,omitempty" jsonschema:"watch deadline in milliseconds from now"`
 	OrchestratorID string           `json:"orchestratorID,omitempty" jsonschema:"opaque parent session id of the orchestrator; stored on the Watch, never used for wake routing"`
+	FixFor         string           `json:"fixFor,omitempty" jsonschema:"watchID of the blocked Watch a fixer repairs; required with role fixer, empty for every other role"`
 }
 
 // WatchPRNotify is the optional delivery endpoint of the registering party.
@@ -167,12 +169,22 @@ func (h *WatchPRHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest
 // An optional in.OrchestratorID is likewise opaque: it is stored on the Watch
 // and on the registering Subscriber for a later rebind, but it never selects a
 // wake recipient. Blocked wakes keep following the orchestrator subscriber.
+//
+// Role fixer behaves like an executor for wake routing and requires in.FixFor,
+// the ID of a Watch in status blocked. validateFixFor rejects a missing or
+// stale target before any write. FixFor is stored on both the Watch and the
+// registering Subscriber so a fix can be attributed to its block.
 func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolRequest, in WatchPRInput) (WatchPROutput, error) {
 	if in.Repo == "" || in.PR <= 0 {
 		return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput, "watch_pr: repo and a positive pr are required")
 	}
-	if in.Role != domain.RoleExecutor && in.Role != domain.RoleOrchestrator {
-		return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput, "watch_pr: role must be executor or orchestrator")
+	if in.Role != domain.RoleExecutor && in.Role != domain.RoleOrchestrator && in.Role != domain.RoleFixer {
+		return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput, "watch_pr: role must be executor, orchestrator or fixer")
+	}
+	// Validate the fix target before any write. A fixer that cannot name a real
+	// blocked Watch must not create or renew its own Watch.
+	if err := h.validateFixFor(in); err != nil {
+		return WatchPROutput{}, err
 	}
 
 	subscriberID, adapter, target, err := watchPRSubscriber(req, in)
@@ -207,6 +219,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		Verdict:        domain.VerdictWatching,
 		Subscribers:    carried,
 		OrchestratorID: in.OrchestratorID,
+		FixFor:         in.FixFor,
 		CreatedAt:      now,
 	}
 	if in.Flaky != nil {
@@ -235,6 +248,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		Adapter:        adapter,
 		Target:         target,
 		OrchestratorID: in.OrchestratorID,
+		FixFor:         in.FixFor,
 	}
 
 	sub, err := h.fanout.Subscribe(w, s)
@@ -245,23 +259,36 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	observe.WatchRegistered(sub.Watch.ID, in.PR, sub.Watch.Revision, adapter)
 
 	// Fanout rebuilds its target from the stored Watch when the (repo, pr,
-	// headSHA) alias already exists, so the new field would be dropped on a
-	// renewal. Apply it in place to the Watch Fanout just persisted. No
+	// headSHA) alias already exists, so the new fields would be dropped on a
+	// renewal. Apply them in place to the Watch Fanout just persisted. No
 	// subscriber is added or removed here, so wake routing is unchanged.
-	if in.OrchestratorID != "" {
+	if in.OrchestratorID != "" || in.FixFor != "" {
 		updated := sub.Watch
-		changed := updated.OrchestratorID != in.OrchestratorID
-		updated.OrchestratorID = in.OrchestratorID
+		changed := false
+		if in.OrchestratorID != "" && updated.OrchestratorID != in.OrchestratorID {
+			updated.OrchestratorID = in.OrchestratorID
+			changed = true
+		}
+		if in.FixFor != "" && updated.FixFor != in.FixFor {
+			updated.FixFor = in.FixFor
+			changed = true
+		}
 		for i := range updated.Subscribers {
-			if updated.Subscribers[i].ID == subscriberID &&
-				updated.Subscribers[i].OrchestratorID != in.OrchestratorID {
+			if updated.Subscribers[i].ID != subscriberID {
+				continue
+			}
+			if in.OrchestratorID != "" && updated.Subscribers[i].OrchestratorID != in.OrchestratorID {
 				updated.Subscribers[i].OrchestratorID = in.OrchestratorID
+				changed = true
+			}
+			if in.FixFor != "" && updated.Subscribers[i].FixFor != in.FixFor {
+				updated.Subscribers[i].FixFor = in.FixFor
 				changed = true
 			}
 		}
 		if changed {
 			if err := h.store.SaveWatch(updated); err != nil {
-				observe.ActorError("watch_pr-orchestrator", "", err)
+				observe.ActorError("watch_pr-fields", "", err)
 				return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 			}
 			sub.Watch = updated
@@ -282,6 +309,36 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		Verdict:     string(sub.Watch.Verdict),
 		PollAfterMs: watchPRPollAfterMs,
 	}, nil
+}
+
+// validateFixFor checks the fixer target before registration writes anything.
+// A fixer without fixFor has nothing to repair; a fixFor that names no Watch is
+// a dangling reference; a Watch that is not blocked has nothing to fix. All
+// three are hard errors: a fix count must always point at a real block. A
+// fixFor on any other role is rejected so FixFor always implies RoleFixer.
+// The orchestrator re-reads verdict and revision before spawning a fixer, so a
+// block clearing in that window makes the spawn fail here and get retried.
+func (h *WatchPRHandler) validateFixFor(in WatchPRInput) error {
+	if in.Role != domain.RoleFixer && in.FixFor != "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixFor is only valid with role fixer")
+	}
+	if in.Role != domain.RoleFixer {
+		return nil
+	}
+	if strings.TrimSpace(in.FixFor) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "watch_pr: role fixer requires fixFor")
+	}
+	if h.store == nil {
+		return domain.NewAppError(domain.CodePersistFailed, "watch_pr: store is nil")
+	}
+	target, err := h.store.Watch(in.FixFor)
+	if err != nil {
+		return domain.NewAppError(domain.CodeWatchNotFound, "watch_pr: fixFor watch not found: "+in.FixFor)
+	}
+	if target.Status != domain.StatusBlocked {
+		return domain.NewAppError(domain.CodeInvalidInput, "watch_pr: fixFor watch is not blocked: "+in.FixFor)
+	}
+	return nil
 }
 
 // watchPRSubscriber derives the subscriber identity and delivery endpoint.

@@ -41,9 +41,13 @@ const (
 // Role is the subscriber role on a Watch.
 type Role string
 
+// RoleFixer repairs a blocked Watch, wakes like an executor and adds FixFor,
+// the ID of the Watch being repaired. Keeping it separate from RoleExecutor
+// lets a fix be counted on its own.
 const (
 	RoleExecutor     Role = "executor"
 	RoleOrchestrator Role = "orchestrator"
+	RoleFixer        Role = "fixer"
 )
 
 // AttemptOutcome is the observed outcome of one delivery attempt.
@@ -104,13 +108,16 @@ func DefaultMergePolicy() MergePolicy {
 // Subscriber is one party waiting for a Watch result. OrchestratorID is the
 // optional parent session carried by an executor at registration. It is stored
 // as opaque caller data and never selects a wake recipient: blocked wakes keep
-// following the subscriber with role orchestrator.
+// following the subscriber with role orchestrator. FixFor names the blocked
+// Watch a fixer repairs. It is stored on the subscriber so the fix can be
+// attributed to a specific block. It is empty for every other role.
 type Subscriber struct {
 	ID             string    `json:"id"`
 	Role           Role      `json:"role"`
 	Adapter        string    `json:"adapter"`
 	Target         string    `json:"target"`
 	OrchestratorID string    `json:"orchestratorID,omitempty"`
+	FixFor         string    `json:"fixFor,omitempty"`
 	AddedAt        time.Time `json:"addedAt"`
 	LastActivity   time.Time `json:"lastActivity"`
 }
@@ -132,7 +139,8 @@ type BlockedInfo struct {
 // Watch is the unit of work. Optional fields use the Go zero value when absent.
 // OrchestratorID records the parent session supplied at registration. It is
 // persisted and rebindable, but it is not a wake address: routing still uses
-// the subscriber with role orchestrator.
+// the subscriber with role orchestrator. FixFor records the blocked Watch a
+// registering fixer repairs; it is empty on a Watch with no fixer subscriber.
 type Watch struct {
 	ID             string           `json:"id"`
 	Repo           string           `json:"repo"`
@@ -151,6 +159,7 @@ type Watch struct {
 	MergePolicy    MergePolicy      `json:"mergePolicy"`
 	Subscribers    []Subscriber     `json:"subscribers"`
 	OrchestratorID string           `json:"orchestratorID,omitempty"`
+	FixFor         string           `json:"fixFor,omitempty"`
 	DeadlineAt     time.Time        `json:"deadlineAt"`
 	NoChecksSince  time.Time        `json:"noChecksSince"`
 	CreatedAt      time.Time        `json:"createdAt"`

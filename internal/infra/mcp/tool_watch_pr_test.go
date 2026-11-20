@@ -1193,3 +1193,180 @@ func TestRegisterOrchestratorIDOnRenew(t *testing.T) {
 		}
 	}
 }
+
+// ---- role fixer ----
+
+// seedBlockedWatch stores the Watch a fixer will repair. The fixer registers a
+// separate Watch for its own PR head.
+func seedBlockedWatch(t *testing.T, store *memStore, id string) domain.Watch {
+	t.Helper()
+	w := domain.Watch{
+		ID:      id,
+		Repo:    "refusedguy/beacon",
+		PR:      41,
+		HeadSHA: "blocked-" + id,
+		Status:  domain.StatusBlocked,
+		Verdict: domain.VerdictBlocked,
+		Blocked: &domain.BlockedInfo{Reason: "чужой тест", Since: time.Now()},
+	}
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("seed blocked watch: %v", err)
+	}
+	return w
+}
+
+func assertNoWatchSaved(t *testing.T, store *memStore) {
+	t.Helper()
+	watches, err := store.AllWatches()
+	if err != nil {
+		t.Fatalf("AllWatches: %v", err)
+	}
+	if len(watches) != 0 {
+		t.Fatalf("rejected registration wrote %d Watches, want 0", len(watches))
+	}
+}
+
+// A fixer keeps the ID of the blocked Watch it repairs on both the Watch and
+// its own subscriber, so a fix can be attributed later.
+func TestRegisterFixerStoresFixFor(t *testing.T) {
+	store := newMemStore()
+	seedBlockedWatch(t, store, "watch-blocked-1")
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("fixer-sha-1", domain.RoleFixer)
+	in.FixFor = "watch-blocked-1"
+
+	out, err := h.Register(context.Background(), sessionReq("ses_fixer_1"), in)
+	if err != nil {
+		t.Fatalf("Register fixer: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("stored Watch: %v", err)
+	}
+	if w.FixFor != in.FixFor {
+		t.Errorf("Watch.FixFor = %q, want %q", w.FixFor, in.FixFor)
+	}
+	var found bool
+	for _, sub := range w.Subscribers {
+		if sub.ID != "ses_fixer_1" {
+			continue
+		}
+		found = true
+		if sub.Role != domain.RoleFixer {
+			t.Errorf("Subscriber.Role = %q, want fixer", sub.Role)
+		}
+		if sub.FixFor != in.FixFor {
+			t.Errorf("Subscriber.FixFor = %q, want %q", sub.FixFor, in.FixFor)
+		}
+	}
+	if !found {
+		t.Fatal("fixer subscriber not stored")
+	}
+}
+
+func TestRegisterFixerRequiresFixFor(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("fixer-sha-2", domain.RoleFixer)
+
+	_, err := h.Register(context.Background(), sessionReq("ses_fixer_2"), in)
+	assertCode(t, err, domain.CodeInvalidInput)
+	assertNoWatchSaved(t, store)
+}
+
+func TestRegisterFixerRejectsUnknownFixFor(t *testing.T) {
+	store := newMemStore()
+	seedBlockedWatch(t, store, "watch-blocked-3")
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("fixer-sha-3", domain.RoleFixer)
+	in.FixFor = "watch-that-does-not-exist"
+
+	_, err := h.Register(context.Background(), sessionReq("ses_fixer_3"), in)
+	assertCode(t, err, domain.CodeWatchNotFound)
+	// Only the seeded Watch remains: the fixer created nothing.
+	watches, err := store.AllWatches()
+	if err != nil || len(watches) != 1 {
+		t.Fatalf("Watches after refusal = %d, err=%v; want only the seeded Watch", len(watches), err)
+	}
+}
+
+func TestRegisterFixerRejectsNonBlockedFixFor(t *testing.T) {
+	store := newMemStore()
+	active := domain.Watch{ID: "watch-active-4", Repo: "refusedguy/beacon", PR: 42,
+		HeadSHA: "active-sha", Status: domain.StatusWatching, Verdict: domain.VerdictWatching}
+	if err := store.SaveWatch(active); err != nil {
+		t.Fatalf("seed active watch: %v", err)
+	}
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("fixer-sha-4", domain.RoleFixer)
+	in.FixFor = active.ID
+
+	_, err := h.Register(context.Background(), sessionReq("ses_fixer_4"), in)
+	assertCode(t, err, domain.CodeInvalidInput)
+	watches, err := store.AllWatches()
+	if err != nil || len(watches) != 1 {
+		t.Fatalf("Watches after refusal = %d, err=%v; want only the seeded Watch", len(watches), err)
+	}
+}
+
+func TestRegisterRejectsFixForWithoutFixerRole(t *testing.T) {
+	store := newMemStore()
+	seedBlockedWatch(t, store, "watch-blocked-5")
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("executor-fixfor-sha", domain.RoleExecutor)
+	in.FixFor = "watch-blocked-5"
+
+	_, err := h.Register(context.Background(), sessionReq("ses_executor_5"), in)
+	assertCode(t, err, domain.CodeInvalidInput)
+	watches, err := store.AllWatches()
+	if err != nil || len(watches) != 1 {
+		t.Fatalf("Watches after refusal = %d, err=%v; want only the seeded Watch", len(watches), err)
+	}
+}
+
+// Fanout clones the stored Watch on a same-head renewal, so a changed fixFor
+// has to be written back to both the Watch and the existing subscriber.
+func TestRegisterFixerFixForOnRenew(t *testing.T) {
+	store := newMemStore()
+	seedBlockedWatch(t, store, "watch-blocked-6a")
+	seedBlockedWatch(t, store, "watch-blocked-6b")
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("fixer-sha-6", domain.RoleFixer)
+	in.FixFor = "watch-blocked-6a"
+
+	out, err := h.Register(context.Background(), sessionReq("ses_fixer_6"), in)
+	if err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	in.FixFor = "watch-blocked-6b"
+	if _, err := h.Register(context.Background(), sessionReq("ses_fixer_6"), in); err != nil {
+		t.Fatalf("renew Register: %v", err)
+	}
+	w, err := store.Watch(out.WatchID)
+	if err != nil {
+		t.Fatalf("stored Watch: %v", err)
+	}
+	if w.FixFor != "watch-blocked-6b" {
+		t.Errorf("Watch.FixFor after renew = %q, want watch-blocked-6b", w.FixFor)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.ID == "ses_fixer_6" && sub.FixFor != "watch-blocked-6b" {
+			t.Errorf("Subscriber.FixFor after renew = %q, want watch-blocked-6b", sub.FixFor)
+		}
+	}
+}
+
+func TestWatchPRInputSchemaHasFixFor(t *testing.T) {
+	schema, err := jsonschema.For[WatchPRInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	if _, ok := schema.Properties["fixFor"]; !ok {
+		t.Fatal("input schema has no fixFor property")
+	}
+	for _, name := range schema.Required {
+		if name == "fixFor" {
+			t.Fatal("fixFor must stay optional in the schema; role fixer enforces it")
+		}
+	}
+}

@@ -18,10 +18,11 @@ import (
 const OrchestratorSubscriberID = "beacon-workload"
 
 // Subscriber roles mirrored as plain strings so the app layer names no domain
-// type. The values match domain.RoleExecutor and domain.RoleOrchestrator.
+// type. The values match the domain Role constants, including RoleFixer.
 const (
 	RoleExecutor     = "executor"
 	RoleOrchestrator = "orchestrator"
+	RoleFixer        = "fixer"
 )
 
 // Verdicts that need a human or a rebase, beyond VerdictRetry already declared
