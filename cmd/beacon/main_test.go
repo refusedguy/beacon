@@ -676,8 +676,14 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	}
 
 	wireOpenCodePorts()
-	if _, ok := watchLiveSource.(*liveOpencodeSource); !ok {
+	live, ok := watchLiveSource.(*liveOpencodeSource)
+	if !ok {
 		t.Fatalf("live source = %#v, want adapter over T3.144 client", watchLiveSource)
+	}
+	// Production --live must go through the real T3.144 HTTP client, not a
+	// stand-in installed by another test.
+	if _, ok := live.port.(*opencode.Client); !ok {
+		t.Fatalf("live adapter wraps %T, want *opencode.Client", live.port)
 	}
 	// The T3.144 client has only GET routes, so spawn stays uninstalled.
 	// This is the honest blocker for production spawn until POST routes land.
