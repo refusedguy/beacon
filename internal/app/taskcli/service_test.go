@@ -647,6 +647,42 @@ func TestIntersectingFiles(t *testing.T) {
 	}
 }
 
+func TestIntersectingFilesWithGlobs(t *testing.T) {
+	cases := []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"glob покрывает файл", []string{"internal/app/taskcli/*.go"}, []string{"internal/app/taskcli/service.go"}, true},
+		{"файл и glob в обратном порядке", []string{"internal/app/taskcli/service.go"}, []string{"internal/app/taskcli/*.go"}, true},
+		{"два пересекающихся glob", []string{"internal/app/**/*.go"}, []string{"internal/app/taskcli/*.go"}, true},
+		{"разные каталоги", []string{"internal/app/taskcli/*.go"}, []string{"internal/infra/mcp/*.go"}, false},
+		{"glob не переходит сегмент", []string{"internal/app/*.go"}, []string{"internal/app/sub/service.go"}, false},
+		{"разные расширения", []string{"docs/tasks/*.md"}, []string{"docs/tasks/*.go"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fa, fb, got := IntersectingFiles(
+				LaunchAssignment{Name: "A", Files: tc.a},
+				LaunchAssignment{Name: "B", Files: tc.b})
+			if got != tc.want {
+				t.Fatalf("IntersectingFiles = %v, ждали %v", got, tc.want)
+			}
+			if got && (fa == "" || fb == "") {
+				t.Errorf("пересечение без имён файлов: %q, %q", fa, fb)
+			}
+		})
+	}
+
+	err := CheckLaunch(
+		LaunchAssignment{Name: "A", Files: []string{"internal/app/taskcli/*.go"}},
+		LaunchAssignment{Name: "B", Files: []string{"internal/app/taskcli/service.go"}},
+	)
+	if taskstore.Code(err) != 1 || !strings.Contains(err.Error(), "A") || !strings.Contains(err.Error(), "B") {
+		t.Fatalf("пересечение glob и файла не остановило запуск: %v", err)
+	}
+}
+
 func TestCheckLaunchPreStartGate(t *testing.T) {
 	disjoint := []LaunchAssignment{
 		{Name: "A", Files: []string{"internal/app/a.go"}},
@@ -733,6 +769,49 @@ func TestPlanLaunchBadInput(t *testing.T) {
 	}
 	if err := e.svc.PlanLaunch(); err != nil {
 		t.Errorf("PlanLaunch без карточек дал %v", err)
+	}
+}
+
+func TestPlanLaunchDetectsGlobOverlapBetweenCards(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T7.1", "todo", "task", "ADR 0001", "internal/app/taskcli/service.go", "нет", "нет")
+	e.card(t, "T7.2", "todo", "task", "ADR 0001", "internal/app/taskcli/*.go", "нет", "нет")
+	e.card(t, "T7.3", "todo", "task", "ADR 0001", "internal/infra/mcp/*.go", "нет", "нет")
+
+	if err := e.svc.PlanLaunch("T7.1", "T7.3"); err != nil {
+		t.Fatalf("разные каталоги дали %v, ждали запуск", err)
+	}
+	err := e.svc.PlanLaunch("T7.1", "T7.2")
+	if taskstore.Code(err) != 1 || !strings.Contains(err.Error(), "T7.2") {
+		t.Fatalf("пересечение по glob не остановило запуск: %v", err)
+	}
+}
+
+func TestReserveLeasesWorktreeAndTTL(t *testing.T) {
+	e := newEnv(t)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := e.svc.ReserveLeases("agent-a",
+		[]string{"internal/app/*.go"}, []string{"worktrees/w7-c"}, now); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := e.svc.Reservations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs) != 1 || !reflect.DeepEqual(rs[0].Globs,
+		[]string{"internal/app/*.go", "worktrees/w7-c/**"}) {
+		t.Fatalf("аренда ворктри не записана: %+v", rs)
+	}
+
+	d, err := e.svc.CheckCommit("agent-b", []string{"worktrees/w7-c/task.go"}, false, now)
+	if err != nil || !d.Blocked || !reflect.DeepEqual(d.Owners, []string{"agent-a"}) {
+		t.Fatalf("чужая аренда ворктри не заблокировала: %+v err=%v", d, err)
+	}
+
+	later := now.Add(LeaseTTL + time.Minute)
+	d, err = e.svc.CheckCommit("agent-b", []string{"worktrees/w7-c/task.go"}, false, later)
+	if err != nil || d.Blocked {
+		t.Fatalf("просроченная аренда заблокировала коммит: %+v err=%v", d, err)
 	}
 }
 

@@ -653,3 +653,125 @@ func TestTaskCommandWaitValidation(t *testing.T) {
 		})
 	}
 }
+
+func writeLaunchCardForTest(t *testing.T, dir, id, status, owners string) {
+	t.Helper()
+	text := fmt.Sprintf("# %s. Тест\nСтатус: %s\nФаза: P2\nТип: task\n"+
+		"Владелец файлов: %s\nЗависимости: нет\nСсылка: ADR 0001\nАгент: нет\nВремя: нет\n"+
+		"Цель: ц\nКонтекст: к\nШаги: ш\nПроверка: п\nПриёмка: пр\n",
+		id, status, owners)
+	if err := os.WriteFile(filepath.Join(dir, id+".md"), []byte(text), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTaskCheckLaunchCommand(t *testing.T) {
+	root := t.TempDir()
+	tasks := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(tasks, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(root)
+	writeLaunchCardForTest(t, tasks, "T7.1", "todo", "internal/app/a.go")
+	writeLaunchCardForTest(t, tasks, "T7.2", "todo", "internal/infra/*.go")
+	writeLaunchCardForTest(t, tasks, "T7.3", "todo", "internal/app/*.go")
+
+	var stdout, stderr bytes.Buffer
+	if code := TaskCommandWithConfig([]string{"task", "check-launch", "T7.1", "T7.2"}, &stdout, &stderr, cfg); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("разрешённый план: код %d stderr %q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "разрешён") {
+		t.Errorf("нет подтверждения запуска: %q", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := TaskCommandWithConfig([]string{"task", "check-launch", "T7.1", "T7.3"}, &stdout, &stderr, cfg); code != 1 {
+		t.Fatalf("пересечение по glob: код %d stderr %q", code, stderr.String())
+	}
+	for _, want := range []string{"T7.1", "T7.3", "отменён"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("в отказе нет %q: %q", want, stderr.String())
+		}
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout не пустой при отказе: %q", stdout.String())
+	}
+
+	for _, argv := range [][]string{
+		{"task", "check-launch"},
+		{"task", "check-launch", "T9.9"},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		if code := TaskCommandWithConfig(argv, &stdout, &stderr, cfg); code != 1 {
+			t.Errorf("%v: код %d, ждали 1", argv, code)
+		}
+	}
+}
+
+func TestTaskLeaseAcquireReleaseAndCheck(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(root)
+	if err := os.MkdirAll(cfg.StateDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	acquire := []string{"task", "lease", "acquire", "--agent", "agent-a",
+		"--glob", "internal/app/*.go", "--worktree", "worktrees/w7-c"}
+	if code := TaskCommandWithConfig(acquire, &stdout, &stderr, cfg); code != 0 {
+		t.Fatalf("acquire: код %d stderr %q", code, stderr.String())
+	}
+
+	run := func(argv []string) (int, string) {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+		code := TaskCommandWithConfig(argv, &stdout, &stderr, cfg)
+		return code, stdout.String() + stderr.String()
+	}
+
+	code, out := run([]string{"task", "lease", "check", "--agent", "agent-b", "--file", "internal/app/service.go"})
+	if code != leaseExitBlocked || !strings.Contains(out, "agent-a") {
+		t.Fatalf("чужой файл: код %d вывод %q", code, out)
+	}
+	code, out = run([]string{"task", "lease", "check", "--agent", "agent-b", "--worktree", "worktrees/w7-c/task.go"})
+	if code != leaseExitBlocked || !strings.Contains(out, "agent-a") {
+		t.Fatalf("чужой ворктри: код %d вывод %q", code, out)
+	}
+	code, out = run([]string{"task", "lease", "check", "--agent", "agent-a", "--file", "internal/app/service.go"})
+	if code != 0 {
+		t.Fatalf("своя аренда заблокировала: код %d вывод %q", code, out)
+	}
+
+	if code, out = run([]string{"task", "lease", "release", "--agent", "agent-a"}); code != 0 {
+		t.Fatalf("release: код %d вывод %q", code, out)
+	}
+	code, out = run([]string{"task", "lease", "check", "--agent", "agent-b", "--file", "internal/app/service.go"})
+	if code != 0 {
+		t.Fatalf("после снятия аренда блокирует: код %d вывод %q", code, out)
+	}
+}
+
+func TestTaskLeaseValidation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := taskcli.Config{StateDir: dir, Root: dir}
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, argv := range [][]string{
+		{"task", "lease"},
+		{"task", "lease", "acquire", "--glob", "a.go"},
+		{"task", "lease", "acquire", "--agent", "agent-a"},
+		{"task", "lease", "check", "--agent", "agent-b"},
+		{"task", "lease", "check", "--agent", "agent-b", "--file", "a.go", "--bogus"},
+		{"task", "lease", "frobnicate"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := TaskCommandWithConfig(argv, &stdout, &stderr, cfg)
+		if code != 1 {
+			t.Errorf("%v: код %d, ждали 1", argv, code)
+		}
+	}
+}
