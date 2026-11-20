@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"syscall"
@@ -78,6 +81,10 @@ type watchRow struct {
 	Subscriber    string `json:"subscriberSession,omitempty"`
 	Agent         string `json:"agent,omitempty"`
 	OpenCodeState string `json:"opencodeState,omitempty"`
+	// Attention is the ADR 0058 п6 column. "+" marks the row the manager
+	// should look at now; "-" means no signal. It is advisory only and never
+	// changes the Beacon verdict (ADR 0017 and ADR 0026).
+	Attention string `json:"attention,omitempty"`
 }
 
 // parseSessions reads the output of `opencode api session.list`. The CLI wraps
@@ -162,23 +169,40 @@ func renderWatchJSON(w io.Writer, rows []watchRow) error {
 	return json.NewEncoder(w).Encode(rows)
 }
 
-// runWatch is the beacon watch command. It takes exactly one Beacon snapshot
-// and one `opencode api session.list` call, joins subscribers to sessions and
-// prints the result. The --interval flag is accepted for compatibility with
-// the documented CLI shape but does not start a loop (T3.12: one snapshot).
+// renderLiveTable is the ADR 0060 JOIN table: one line per subscriber with the
+// seven columns printed by beacon watch --live. The header says SESSION rather
+// than SUBSCRIBER SESSION to match the ADR. No TUI is involved.
+func renderLiveTable(w io.Writer, rows []watchRow) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "WATCH\tVERDICT\tREVISION\tSESSION\tAGENT\tOPENCODE STATE\tATTENTION")
+	for _, r := range rows {
+		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n",
+			r.Watch, r.Verdict, r.Revision,
+			dash(r.Subscriber), dash(r.Agent), dash(r.OpenCodeState), dash(r.Attention))
+	}
+	_ = tw.Flush()
+}
+
+// runWatch is the beacon watch command. Without --live it takes exactly one
+// Beacon snapshot and one `opencode api session.list` call (T3.12). With --live
+// it becomes a long-running, event-driven loop over the SSE subscription
+// (T3.141 / ADR 0060).
 func runWatch(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	interval := fs.Duration("interval", 2*time.Second, "интервал обновления (зарезервировано, один снимок)")
+	interval := fs.Duration("interval", 2*time.Second, "период предохранительного перечитывания снимка в живом контуре")
+	live := fs.Bool("live", false, "жить по событиям SSE /api/event вместо одного снимка")
 	format := fs.String("format", "table", "формат вывода: table или json")
 	wake := fs.Bool("wake", false, "батч событий за 200мс в одно пробуждение сессии")
 	if !parseFlags("watch", args, c.errOut, fs) {
 		return 2
 	}
-	_ = interval
 	if *format != "table" && *format != "json" {
 		fmt.Fprintf(c.errOut, "beacon watch: неизвестный формат %q, ожидается table или json\n", *format)
 		writeUsage(c.errOut)
 		return 2
+	}
+	if *live {
+		return runWatchLive(c, *interval, *format, *wake)
 	}
 
 	snap, err := watchSnapshot()
@@ -227,6 +251,213 @@ func runWatch(c *CLI, args []string) int {
 	}
 	renderWatchTable(c.out, rows)
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// T3.141 / ADR 0060 p2: beacon watch --live.
+//
+// The command is a presentation layer. It owns no HTTP client and no SSE
+// parser: T3.144 supplies the opencode client and T3.145 wires it into
+// dispatch. This card fixes only the narrow port the loop consumes, so the two
+// branches can merge without a conflict.
+// ---------------------------------------------------------------------------
+
+// liveEvent is one notification delivered by the SSE subscription. The body
+// stays opaque: on every event the loop re-reads Beacon and the session list
+// instead of interpreting the event payload (ADR 0060 p2).
+type liveEvent struct {
+	Type string `json:"type"`
+	Data []byte `json:"data,omitempty"`
+}
+
+// liveSource is the whole live dependency of beacon watch: a session list and
+// an SSE event stream. Events must yield only events received after the call;
+// closing the channel means the SSE connection dropped and the loop must
+// resubscribe by calling Events again. The stream carries no history (ADR 0025).
+type liveSource interface {
+	SessionList() ([]opencodeSession, error)
+	Events(ctx context.Context) <-chan liveEvent
+}
+
+// watchLiveSource is the installed live source. It is nil until dispatch wires
+// a real client (T3.145), so --live fails closed instead of reaching for a
+// transport this card must not create.
+var watchLiveSource liveSource
+
+// SetLiveSource installs the source used by beacon watch --live. Passing nil
+// clears it. Tests use this to substitute a stand-in; dispatch uses it after
+// the opencode client lands.
+func SetLiveSource(src liveSource) {
+	watchLiveSource = src
+}
+
+// watchLiveContext returns the lifetime of the live loop. Production stops on
+// SIGINT or SIGTERM; tests replace it with a cancellable context.
+var watchLiveContext = func() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+}
+
+// watchReconnectDelay keeps a source that immediately closes its channel from
+// spinning the loop. It is short enough to be invisible in tests and is
+// interruptible by the lifetime context.
+var watchReconnectDelay = 50 * time.Millisecond
+
+// markAttention fills the ADR 0058 п6 column. A row asks for attention when its
+// Beacon verdict is needs_input (a task parked for a human) or when an open
+// attention request names its agent or its watch. The earliest request wins and
+// ties break by agent then task, so the result is stable across reads. Nothing
+// here touches readiness: the verdict still comes from Beacon.
+func markAttention(rows []watchRow, requests []attentionRequest) {
+	byAgent := make(map[string]attentionRequest)
+	byTask := make(map[string]attentionRequest)
+	for _, req := range requests {
+		if agent := strings.TrimSpace(req.Agent); agent != "" && earlierAttention(req, byAgent[agent]) {
+			byAgent[agent] = req
+		}
+		if task := strings.TrimSpace(req.TaskID); task != "" && earlierAttention(req, byTask[task]) {
+			byTask[task] = req
+		}
+	}
+	for i := range rows {
+		r := &rows[i]
+		if r.Verdict == verdictNeedsInput {
+			r.Attention = attentionYes
+			continue
+		}
+		var req attentionRequest
+		var ok bool
+		if r.Agent != "" {
+			req, ok = byAgent[r.Agent]
+		}
+		if !ok && r.Watch != "" {
+			req, ok = byTask[r.Watch]
+		}
+		if ok && (req.Agent != "" || req.TaskID != "") {
+			r.Attention = attentionYes
+		}
+	}
+}
+
+// earlierAttention reports whether candidate should replace current. A zero
+// current means the key is new, so any real request wins.
+func earlierAttention(candidate, current attentionRequest) bool {
+	if current.RequestedAt.IsZero() {
+		return true
+	}
+	if !candidate.RequestedAt.Equal(current.RequestedAt) {
+		return candidate.RequestedAt.Before(current.RequestedAt)
+	}
+	if candidate.Agent != current.Agent {
+		return candidate.Agent < current.Agent
+	}
+	return candidate.TaskID < current.TaskID
+}
+
+// verdictNeedsInput is the Beacon verdict for a task parked for a human. It is
+// a string here because cmd/beacon must not import internal/domain (layers gate).
+const verdictNeedsInput = "needs_input"
+
+const attentionYes = "+"
+
+// watchRender is one refresh: a fresh Beacon snapshot, a fresh session list,
+// the JOIN and one printed table. Every event, reconnect and interval tick
+// calls it, so the table always reflects current state rather than event data.
+func watchRender(c *CLI, src liveSource, format string, wake bool) int {
+	snap, err := watchSnapshot()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: snapshot: %v\n", err)
+		return 2
+	}
+	sessions, err := src.SessionList()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: session.list: %v\n", err)
+		return 2
+	}
+	rows := joinWatches(snap, sessions)
+	// Attention is advisory. A missing or broken request file must not blank
+	// the whole table, so the error is dropped here.
+	if requests, err := readAttentionRequests(); err == nil {
+		markAttention(rows, requests)
+	}
+	if wake {
+		wakeOut := c.out
+		if format == "json" {
+			wakeOut = c.errOut
+		}
+		send := func(target, text string) error {
+			fmt.Fprintf(wakeOut, "wake session=%s %s\n", target, text)
+			return nil
+		}
+		if err := runWatchBatchedWake(rows, time.Now(), send); err != nil {
+			fmt.Fprintf(c.errOut, "beacon watch: wake: %v\n", err)
+			return 2
+		}
+	}
+	if format == "json" {
+		if err := renderWatchJSON(c.out, rows); err != nil {
+			fmt.Fprintf(c.errOut, "beacon watch: %v\n", err)
+			return 2
+		}
+		return 0
+	}
+	renderLiveTable(c.out, rows)
+	return 0
+}
+
+// runWatchLive is the event-driven loop. Each subscription starts with a fresh
+// snapshot; each event and each interval tick re-reads state and prints. When
+// the event channel closes, the loop waits briefly, resubscribes and re-reads
+// the snapshot without replaying missed events (ADR 0025). ctx cancels the
+// whole loop for graceful shutdown.
+func runWatchLive(c *CLI, interval time.Duration, format string, wake bool) int {
+	src := watchLiveSource
+	if src == nil {
+		fmt.Fprintf(c.errOut, "beacon watch: --live: источник событий не подключён\n")
+		return 2
+	}
+	ctx, cancel := watchLiveContext()
+	defer cancel()
+
+	var ticks <-chan time.Time
+	if interval > 0 {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		ticks = ticker.C
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return 0
+		}
+		events := src.Events(ctx)
+		// (Re)connect always starts from a fresh snapshot. The SSE stream has
+		// no history, so dropped events are never replayed (ADR 0025).
+		if code := watchRender(c, src, format, wake); code != 0 {
+			return code
+		}
+		disconnected := false
+		for !disconnected {
+			select {
+			case <-ctx.Done():
+				return 0
+			case _, ok := <-events:
+				if !ok {
+					disconnected = true
+					continue
+				}
+				// A later refresh failure is a warning on stderr, not a
+				// reason to kill a long-lived watch.
+				_ = watchRender(c, src, format, wake)
+			case <-ticks:
+				_ = watchRender(c, src, format, wake)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(watchReconnectDelay):
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
