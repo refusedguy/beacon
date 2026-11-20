@@ -249,6 +249,35 @@ func Observe(name string, seconds float64) {
 	}
 }
 
+// cycleTracker accumulates the numbers of one daemon pass. The daemon calls
+// DaemonPass at the start of a pass and the CLI calls FlushCycle on exit, so
+// the summary is emitted without the loop needing to know about counters.
+type cycleTracker struct {
+	mu                                       sync.Mutex
+	start                                    time.Time
+	watches, ready, retry, merges, wakes     int
+}
+
+var cycles = &cycleTracker{start: time.Now()}
+
+func (c *cycleTracker) note(fn func(*cycleTracker)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fn(c)
+}
+
+func (c *cycleTracker) flush(now time.Time) CycleStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := CycleStats{
+		Watches: c.watches, Ready: c.ready, Retry: c.retry,
+		Merges: c.merges, Wakes: c.wakes, Duration: now.Sub(c.start),
+	}
+	c.watches, c.ready, c.retry, c.merges, c.wakes = 0, 0, 0, 0, 0
+	c.start = now
+	return s
+}
+
 // PollCycle records the start of one CI poll and its number of Watches.
 func PollCycle() { Default().Inc(CounterPollCycles, "") }
 
@@ -256,6 +285,7 @@ func PollCycle() { Default().Inc(CounterPollCycles, "") }
 // PollCycle so that a caller which only counts still gets a correct total.
 func PollCycleStart(watches int) {
 	Default().Inc(CounterPollCycles, "")
+	cycles.note(func(c *cycleTracker) { c.watches = watches })
 	Event(LevelDebug, "poll_cycle_start", Fields{FieldWatches: watches})
 }
 
@@ -299,6 +329,13 @@ func Cycle(s CycleStats) {
 func VerdictPublished(verdict, watchID string, pr int) {
 	s := Default()
 	s.Inc(CounterVerdictPublished, verdict)
+	cycles.note(func(c *cycleTracker) {
+		if verdict == "ready" {
+			c.ready++
+		} else {
+			c.retry++
+		}
+	})
 	s.Log(LevelInfo, "verdict_published", Fields{
 		FieldVerdict: verdict, FieldWatchID: watchID, FieldPR: pr,
 	})
@@ -315,6 +352,7 @@ func MergeAttempt(watchID string, pr int) {
 func MergeSuccess(watchID string, pr int) {
 	s := Default()
 	s.Inc(CounterMergeSuccess, "")
+	cycles.note(func(c *cycleTracker) { c.merges++ })
 	s.Log(LevelInfo, "merge_success", Fields{FieldWatchID: watchID, FieldPR: pr})
 }
 
@@ -339,6 +377,7 @@ func MergeDuration(d time.Duration) {
 func WakeDelivered(adapter, watchID string) {
 	s := Default()
 	s.Inc(CounterWakeDelivered, adapter)
+	cycles.note(func(c *cycleTracker) { c.wakes++ })
 	s.Log(LevelInfo, "wake_delivered", Fields{FieldAdapter: adapter, FieldWatchID: watchID})
 }
 
@@ -354,6 +393,7 @@ func WakeDuration(adapter string, d time.Duration) {
 func WakeSkipped(adapter, watchID, reason string) {
 	s := Default()
 	s.Inc(CounterWakeSkipped, "")
+	cycles.note(func(c *cycleTracker) { c.wakes++ })
 	fields := Fields{FieldWatchID: watchID, FieldReason: reason}
 	if adapter != "" {
 		fields[FieldAdapter] = adapter
@@ -365,6 +405,7 @@ func WakeSkipped(adapter, watchID, reason string) {
 func WakeFailed(adapter, watchID string, err error) {
 	s := Default()
 	s.Inc(CounterWakeErrors, adapter)
+	cycles.note(func(c *cycleTracker) { c.wakes++ })
 	fields := Fields{FieldWatchID: watchID}
 	if adapter != "" {
 		fields[FieldAdapter] = adapter
@@ -481,6 +522,16 @@ func ProviderCall(adapter, method, watchID string, err error, d time.Duration) {
 	Default().Log(level, "provider_call", fields)
 }
 
-// DaemonPass records one pass of the daemon loop. Cycle carries the useful
-// summary; this event remains for callers that only need a marker.
-func DaemonPass() { Event(LevelDebug, "daemon_pass", nil) }
+// FlushCycle logs the compact INFO summary of the pass collected so far and
+// starts a new one. An idle pass produces no summary line. The CLI calls it on
+// exit so a one-shot daemon still reports its pass.
+func FlushCycle() {
+	stats := cycles.flush(time.Now())
+	if stats.Watches != 0 || stats.Ready != 0 || stats.Retry != 0 || stats.Merges != 0 || stats.Wakes != 0 {
+		Cycle(stats)
+	}
+}
+
+// DaemonPass marks the start of a daemon pass. It flushes the previous pass,
+// then leaves the tracker ready for the new one.
+func DaemonPass() { FlushCycle() }

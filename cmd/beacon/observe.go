@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"time"
 
@@ -60,9 +61,17 @@ func setupObserve() func() {
 	}
 	format := os.Getenv(beaconLogFormatEnv)
 
+	// Every legacy log.Printf call in the cycle goes to the same file. Nothing
+	// in the daemon writes to stderr: a restart keeps all records on disk.
+	previousLogOutput := log.Writer()
 	install := func(w io.Writer) func() {
 		observe.SetDefault(observe.NewRecorder(observe.NewLogger(format, level, w), observe.NewMetrics()))
-		return func() {}
+		log.SetOutput(w)
+		return func() {
+			observe.FlushCycle()
+			log.SetOutput(previousLogOutput)
+			observe.SetDefault(nil)
+		}
 	}
 
 	dir, err := stateDir()

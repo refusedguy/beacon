@@ -12,6 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 const usageText = `beacon — команды сборки и проверки Beacon
@@ -87,9 +90,11 @@ func main() {
 	// Composition root of the CLI manager: one place where the thin HTTP
 	// client becomes the live source and the spawn port. No agent names or
 	// domain types cross this boundary (ADR 0005, ADR 0060 п1).
-	setupObserve()
+	cleanupObserve := setupObserve()
 	wireOpenCodePorts()
-	os.Exit(newDefaultCLI().Run(os.Args[1:]))
+	code := newDefaultCLI().Run(os.Args[1:])
+	cleanupObserve()
+	os.Exit(code)
 }
 
 // wireOpenCodePorts reads the opencode registration file and installs the
@@ -191,13 +196,27 @@ func newDefaultCLI() *CLI {
 	return &CLI{out: os.Stdout, errOut: os.Stderr, run: realRunner, root: findModuleRoot()}
 }
 
-// Run dispatches a command and returns its exit code.
+// Run dispatches a command and returns its exit code. The dispatch is logged in
+// the same file as the cycle events, so a failed command is never invisible.
 func (c *CLI) Run(args []string) int {
 	if len(args) == 0 {
 		writeUsage(c.errOut)
 		return 2
 	}
+	start := time.Now()
+	code := c.dispatch(args)
+	observe.Command(args[0], args[1:])
+	level := observe.LevelInfo
+	if code != 0 {
+		level = observe.LevelWarn
+	}
+	observe.Event(level, "command_done", observe.Fields{
+		observe.FieldCommand: args[0], "code": code, observe.FieldDuration: time.Since(start).String(),
+	})
+	return code
+}
 
+func (c *CLI) dispatch(args []string) int {
 	switch args[0] {
 	case "-h", "--help", "help":
 		writeUsage(c.out)

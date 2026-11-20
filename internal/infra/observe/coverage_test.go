@@ -138,6 +138,62 @@ func TestCycleSummaryIsOneCompactEvent(t *testing.T) {
 	}
 }
 
+func TestDaemonCycleSummaryAggregatesTransitions(t *testing.T) {
+	SetDefault(nil)
+	FlushCycle() // reset any state left by another test without emitting into the buffer
+	buf := &bytes.Buffer{}
+	SetDefault(NewRecorder(NewLogger("json", LevelInfo, buf), NewMetrics()))
+	defer SetDefault(nil)
+
+	PollCycleStart(5)
+	VerdictPublished("ready", "w1", 1)
+	VerdictPublished("retry", "w2", 2)
+	MergeSuccess("w1", 1)
+	WakeDelivered("opencode", "w2")
+	WakeSkipped("", "w3", "нет подписчика")
+	FlushCycle()
+
+	lines := cycleLines(t, buf.String())
+	if len(lines) != 1 {
+		t.Fatalf("ожидалась одна строка цикла, получено %d: %q", len(lines), buf.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("невалидный JSON: %v", err)
+	}
+	for key, want := range map[string]any{
+		FieldEvent: "cycle", FieldWatches: float64(5), FieldReady: float64(1),
+		FieldRetry: float64(1), FieldMerges: float64(1), FieldWakes: float64(2),
+	} {
+		if got[key] != want {
+			t.Errorf("поле %s = %v, ожидалось %v", key, got[key], want)
+		}
+	}
+
+	FlushCycle() // after a flush an empty pass must stay silent
+	if got := cycleLines(t, buf.String()); len(got) != 1 {
+		t.Errorf("пустой цикл не должен логироваться: %q", buf.String())
+	}
+}
+
+func cycleLines(t *testing.T, raw string) []string {
+	t.Helper()
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("невалидная строка лога %q: %v", line, err)
+		}
+		if event[FieldEvent] == "cycle" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 func TestHistogramRecordsDurationsAndExportsThem(t *testing.T) {
 	m := NewMetrics()
 	m.Observe(HistogramPollCycle, 0.002)
