@@ -1,4 +1,4 @@
-# ADR 150: Журнал webhook-доставок с ключом event_id
+# ADR 261: Журнал webhook-доставок с ключом event_id
 
 Статус: accepted
 
