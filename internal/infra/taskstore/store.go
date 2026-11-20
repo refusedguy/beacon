@@ -85,6 +85,10 @@ var (
 	// Parse the common shapes and keep the exact filename as the card id.
 	idRE       = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)[.]([0-9]+)(?:-.*)?$`)
 	dashIDRE   = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([0-9]+)$`)
+	// dotIDRE accepts an alphabetic prefix followed directly by a dot and a
+	// number, for example BS.1. The idRE above requires a digit before the dot
+	// (T3.123), so families like BS need their own form.
+	dotIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
 	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+$`)
 	titleRE    = regexp.MustCompile(`^#\s+[A-Za-z][A-Za-z0-9_.-]*\.\s*(.*)$`)
 	headerRE   = regexp.MustCompile(`^#\s+(.*)$`)
@@ -122,6 +126,9 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 		number, err = strconv.Atoi(m[3])
 	case dashIDRE.MatchString(id):
 		d := dashIDRE.FindStringSubmatch(id)
+		number, err = strconv.Atoi(d[2])
+	case dotIDRE.MatchString(id):
+		d := dotIDRE.FindStringSubmatch(id)
 		number, err = strconv.Atoi(d[2])
 	default:
 		return card, Validationf("%s: имя файла не содержит поддерживаемый ID карточки", name)
@@ -188,13 +195,13 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	card.Check = fields["Проверка"]
 	card.Acceptance = fields["Приёмка"]
 
-	if !oneOf(card.Type, "task", "epic", "adr") {
+	if !oneOf(card.Type, "task", "epic", "adr", "doc", "eval") {
 		return card, Validationf("%s: поле Тип имеет неизвестное значение %q", name, card.Type)
 	}
 	if !oneOf(card.Status, "todo", "in_progress", "done", "dropped") {
 		return card, Validationf("%s: поле Статус имеет неизвестное значение %q", name, card.Status)
 	}
-	if !oneOf(card.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6") {
+	if !oneOf(card.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
 		return card, Validationf("%s: поле Фаза имеет неизвестное значение %q", name, card.Phase)
 	}
 	for key, value := range fields {
