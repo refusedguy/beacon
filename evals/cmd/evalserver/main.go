@@ -28,6 +28,8 @@ func main() {
 			os.Exit(runDriftCheck())
 		case "--severity-map-check", "severity-map-check":
 			os.Exit(runSeverityMapCheck())
+		case "--report-check", "report-check":
+			os.Exit(runReportCheck())
 		}
 	}
 	if err := serve(); err != nil {
@@ -188,6 +190,130 @@ func runSeverityMapCheck() int {
 	fmt.Println()
 	if !ok {
 		fmt.Println("Результат: FAIL. Мапирование severity не соблюдено")
+		return 1
+	}
+	fmt.Println("Результат: PASS")
+	return 0
+}
+
+// HD-084 (ADR 0310). Отчёт ночной смены формируется по слотам и решениям.
+// Множество категорий фиксировано в docs/evals/hd40-weekly-report.md: пропуск
+// любой категории проваливает проверку.
+type shiftCategory string
+
+const (
+	shiftMerged        shiftCategory = "merged"
+	shiftGreenUnmerged shiftCategory = "green_unmerged"
+	shiftRedAgented    shiftCategory = "red_agented"
+	shiftRespawned     shiftCategory = "respawned"
+	shiftQueueLogic    shiftCategory = "queue_logic"
+	shiftOwnerDecision shiftCategory = "owner_decisions"
+)
+
+var allShiftCategories = []shiftCategory{
+	shiftMerged, shiftGreenUnmerged, shiftRedAgented,
+	shiftRespawned, shiftQueueLogic, shiftOwnerDecision,
+}
+
+// shiftReport — шаблон отчёта смены. Каждая категория присутствует слотом,
+// даже если слот пока пуст. Отчёт по слотам и решениям заполняет слоты строками.
+type shiftReport struct {
+	slots map[shiftCategory][]string
+}
+
+// newShiftReportTemplate возвращает шаблон со всеми обязательными категориями.
+func newShiftReportTemplate() *shiftReport {
+	r := &shiftReport{slots: make(map[shiftCategory][]string, len(allShiftCategories))}
+	for _, c := range allShiftCategories {
+		r.slots[c] = nil
+	}
+	return r
+}
+
+func (r *shiftReport) add(c shiftCategory, line string) {
+	r.slots[c] = append(r.slots[c], line)
+}
+
+// missingCategories возвращает категории, отсутствующие в отчёте.
+func (r *shiftReport) missingCategories() []shiftCategory {
+	missing := make([]shiftCategory, 0)
+	for _, c := range allShiftCategories {
+		if _, ok := r.slots[c]; !ok {
+			missing = append(missing, c)
+		}
+	}
+	return missing
+}
+
+// filledShiftReport — эталон: все слоты заполнены, пропущенных категорий нет.
+func filledShiftReport() *shiftReport {
+	r := newShiftReportTemplate()
+	for _, c := range allShiftCategories {
+		r.add(c, "sample")
+	}
+	return r
+}
+
+// runReportCheck делает шаблон отчёта смены исполняемой проверкой. Позитивный
+// контроль требует все категории в шаблоне и в заполненном отчёте. Негативный
+// контроль проваливает отчёт с пропущенной категорией.
+func runReportCheck() int {
+	fmt.Println("HD-084 (ADR 0310): отчёт ночной смены по слотам и решениям")
+	fmt.Println()
+	fmt.Println("Категории: merged, green_unmerged, red_agented, respawned, queue_logic, owner_decisions")
+	fmt.Println()
+
+	type check struct {
+		name string
+		run  func() (string, bool)
+	}
+	checks := []check{
+		{"template lists all categories", func() (string, bool) {
+			missing := newShiftReportTemplate().missingCategories()
+			return fmt.Sprintf("missing=%v", missing), len(missing) == 0
+		}},
+		{"required categories present", func() (string, bool) {
+			want := []string{"merged", "green_unmerged", "red_agented", "respawned", "queue_logic", "owner_decisions"}
+			have := make(map[string]bool, len(allShiftCategories))
+			for _, c := range allShiftCategories {
+				have[string(c)] = true
+			}
+			for _, w := range want {
+				if !have[w] {
+					return fmt.Sprintf("missing=%s", w), false
+				}
+			}
+			return fmt.Sprintf("categories=%d", len(have)), true
+		}},
+		{"filled report has all categories", func() (string, bool) {
+			missing := filledShiftReport().missingCategories()
+			return fmt.Sprintf("missing=%v", missing), len(missing) == 0
+		}},
+		{"omitted category fails", func() (string, bool) {
+			for _, omitted := range allShiftCategories {
+				r := filledShiftReport()
+				delete(r.slots, omitted)
+				missing := r.missingCategories()
+				if len(missing) != 1 || missing[0] != omitted {
+					return fmt.Sprintf("omitted=%s missing=%v", omitted, missing), false
+				}
+			}
+			return "every omitted category rejected", true
+		}},
+	}
+
+	ok := true
+	for _, c := range checks {
+		actual, pass := c.run()
+		status := "PASS"
+		if !pass {
+			status, ok = "FAIL", false
+		}
+		fmt.Printf("  %s %s: %s\n", status, c.name, actual)
+	}
+	fmt.Println()
+	if !ok {
+		fmt.Println("Результат: FAIL. Отчёт смены без категорий не проходит")
 		return 1
 	}
 	fmt.Println("Результат: PASS")

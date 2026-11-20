@@ -28,6 +28,11 @@ unset XDG_STATE_HOME || true
 echo "==> severity mapping check (HD-047, ADR 0301)"
 GOPROXY=off "$GO" run -tags=eval ./cmd/evalserver --severity-map-check
 
+# HD-084 (ADR 0310): отчёт смены содержит все категории. Негативный контроль
+# на пропущенную категорию проваливает прогон до остальных eval.
+echo "==> night-shift report categories check (HD-084, ADR 0310)"
+GOPROXY=off "$GO" run -tags=eval ./cmd/evalserver --report-check
+
 # Зависимости уже лежат в module cache, сеть не нужна.
 echo "==> MCP eval suite"
 GOPROXY=off exec "$GO" run -tags=eval .
