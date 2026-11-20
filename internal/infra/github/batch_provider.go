@@ -490,6 +490,9 @@ func (b *BatchProvider) pingMergeable(ctx context.Context, owner, repo string, p
 // parsePRAlias maps one TierBatch PR payload into a PRState. It follows
 // pageInfo so a PR with more than 50 contexts is not silently truncated.
 func (b *BatchProvider) parsePRAlias(ctx context.Context, alias Alias, raw json.RawMessage) (domain.PRState, []ContextSuite, error) {
+	// The alias resolves to a repository object, so the PR fields sit one
+	// level deeper under pullRequest (see unwrapPullRequestAlias).
+	raw = unwrapPullRequestAlias(raw)
 	var pr tier1PR
 	if err := json.Unmarshal(raw, &pr); err != nil {
 		return domain.PRState{}, nil, fmt.Errorf("batch %s: decode PR: %w", alias.Name, err)
@@ -509,7 +512,7 @@ func (b *BatchProvider) parsePRAlias(ctx context.Context, alias Alias, raw json.
 		if err != nil {
 			return domain.PRState{}, nil, err
 		}
-		nextChecks, nextSuites, nextPage, err := parseTier2Payload(next.Data[alias.Name])
+		nextChecks, nextSuites, nextPage, err := parseTier2Payload(unwrapPullRequestAlias(next.Data[alias.Name]))
 		if err != nil {
 			return domain.PRState{}, nil, fmt.Errorf("batch %s next page: %w", alias.Name, err)
 		}
