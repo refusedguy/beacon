@@ -90,6 +90,13 @@ func WithBatchCache(c *Cache) BatchOption {
 	return func(b *BatchProvider) { b.cache = c }
 }
 
+// batchGroup is the slice of singleflight.Group that FetchBatch uses. Keeping
+// the dependency as an interface lets a test substitute a wrapper that observes
+// when every caller has joined the group for a key.
+type batchGroup interface {
+	Do(key string, fn func() (any, error)) (v any, err error, shared bool)
+}
+
 // BatchProvider implements domain.BatchCIProvider, domain.CIProvider and
 // domain.Merger against GitHub. It is safe for concurrent use.
 type BatchProvider struct {
@@ -101,7 +108,7 @@ type BatchProvider struct {
 	limiter     *rate.Limiter
 	mergeMethod string
 
-	batchSF singleflight.Group
+	batchSF batchGroup
 	prSF    singleflight.Group
 }
 
@@ -129,6 +136,7 @@ func NewBatchProvider(graph *Client, rest *RestClient, counter *Counter, opts ..
 		cache:       NewCache(),
 		limiter:     rate.NewLimiter(batchRate, batchBurst),
 		mergeMethod: "squash",
+		batchSF:     &singleflight.Group{},
 	}
 	for _, opt := range opts {
 		opt(b)

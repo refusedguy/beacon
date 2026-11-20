@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
@@ -203,6 +205,36 @@ func TestFetchBatchBrokenBaseIsSeparateFromPRChecks(t *testing.T) {
 	}
 }
 
+// joiningBatchGroup wraps singleflight.Group so a test can wait until every
+// caller is registered for a key before it releases the leader's work.
+// DoChan registers a caller under the group mutex before it returns, so closing
+// all after want callers proves they all joined the group. Without this, the
+// leader can finish before a slow follower calls Do, and that follower starts a
+// second request.
+type joiningBatchGroup struct {
+	inner  singleflight.Group
+	want   int
+	mu     sync.Mutex
+	joined int
+	all    chan struct{}
+}
+
+func newJoiningBatchGroup(want int) *joiningBatchGroup {
+	return &joiningBatchGroup{want: want, all: make(chan struct{})}
+}
+
+func (g *joiningBatchGroup) Do(key string, fn func() (any, error)) (any, error, bool) {
+	ch := g.inner.DoChan(key, fn)
+	g.mu.Lock()
+	g.joined++
+	if g.joined == g.want {
+		close(g.all)
+	}
+	g.mu.Unlock()
+	r := <-ch
+	return r.Val, r.Err, r.Shared
+}
+
 func TestFetchBatchSingleflightSharesOneRequest(t *testing.T) {
 	counter, _, _ := newTestCounter(t, 0)
 	entered := make(chan struct{})
@@ -225,8 +257,10 @@ func TestFetchBatchSingleflightSharesOneRequest(t *testing.T) {
 	defer srv.Close()
 
 	provider := NewBatchProvider(NewClient(srv.URL, "", srv.Client(), counter), nil, counter)
-	watches := batchTestWatches(10)
 	const n = 8
+	group := newJoiningBatchGroup(n)
+	provider.batchSF = group
+	watches := batchTestWatches(10)
 	done := make(chan error, n)
 	for i := 0; i < n; i++ {
 		go func() {
@@ -234,6 +268,9 @@ func TestFetchBatchSingleflightSharesOneRequest(t *testing.T) {
 			done <- err
 		}()
 	}
+	// Wait for all callers to join the group while the leader is still blocked
+	// in the server. Releasing earlier lets a late caller start a new request.
+	<-group.all
 	<-entered
 	close(release)
 	for i := 0; i < n; i++ {
