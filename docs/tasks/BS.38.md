@@ -1,5 +1,5 @@
 # BS.38. TUI как тонкий HTTP-клиент
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/tui/client.go, internal/tui/app.go

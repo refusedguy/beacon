@@ -1,5 +1,5 @@
 # BS.21. Доменные ключи идемпотентности
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/domain/identity.go

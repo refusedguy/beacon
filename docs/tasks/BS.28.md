@@ -1,5 +1,5 @@
 # BS.28. Signature, filters и dedupe вебхука
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/webhook/filters.go

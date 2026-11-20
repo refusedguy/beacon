@@ -1,5 +1,5 @@
 # BS.11. Event log с монотонным seq
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/events.go, internal/infra/store/db.go

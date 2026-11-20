@@ -1,5 +1,5 @@
 # BS.32. schedule_task/list/delete через внутренний API
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/server/scheduler.go, cmd/beacon/task.go

@@ -1,5 +1,5 @@
 # BS.15. Retirement эффектов потерянного исполнителя
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/worker/retire.go

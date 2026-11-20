@@ -1,5 +1,5 @@
 # BS.73. Scenario harness с stub-исполнителями
-Статус: todo
+Статус: done
 Фаза: P6
 Тип: task
 Владелец файлов: internal/testsystem/harness.go

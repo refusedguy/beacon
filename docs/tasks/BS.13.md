@@ -1,5 +1,5 @@
 # BS.13. Receipt store по clientRequestId
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/receipts.go

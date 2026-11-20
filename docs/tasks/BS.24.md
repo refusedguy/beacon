@@ -1,5 +1,5 @@
 # BS.24. Интервал, фиксированное время и webhook триггер
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/scheduler/schedule.go

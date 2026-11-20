@@ -1,5 +1,5 @@
 # BS.16. EventBus с доставкой после коммита
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/event/bus.go

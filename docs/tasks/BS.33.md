@@ -1,5 +1,5 @@
 # BS.33. Персистентность расписаний
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/store/schedules.go

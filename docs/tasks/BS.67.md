@@ -1,5 +1,5 @@
 # BS.67. Реестр исполнителей с capabilities
-Статус: todo
+Статус: done
 Фаза: P5
 Тип: task
 Владелец файлов: internal/infra/store/executors.go

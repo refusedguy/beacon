@@ -1,5 +1,5 @@
 # BS.10. ADR 0262-0264 документация ядра
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: doc
 Владелец файлов: docs/adrs/0262-server-owner.md, docs/adrs/0263-mcp-boundary.md, docs/adrs/0264-transaction.md

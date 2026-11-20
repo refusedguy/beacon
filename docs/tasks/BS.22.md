@@ -1,5 +1,5 @@
 # BS.22. Audit log актора и ingress
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/audit.go
