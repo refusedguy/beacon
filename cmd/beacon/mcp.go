@@ -29,6 +29,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
+	"github.com/refusedguy/beacon/internal/infra/webhook"
 )
 
 // The app service writes precheck reasons under the same state directory as
@@ -738,6 +739,47 @@ func startHTTPAPI(_ context.Context, cfg reconcileConfig, bus *httpapi.EventBus)
 }
 
 // ---------------------------------------------------------------------------
+// Signed webhook receiver (T3.376).
+//
+// The transport lives in infra/webhook and binds 127.0.0.1 only. This file
+// supplies the journal adapter so the receiver depends on a port, not on the
+// durable store table that T3.375 has not landed yet.
+// ---------------------------------------------------------------------------
+
+// webhookDeliveryRecorder adapts a process-local delivery journal to the
+// receiver's minimal port. T3.375 swaps the journal for the store-backed
+// RecordDelivery implementation without touching the receiver.
+type webhookDeliveryRecorder struct {
+	journal *webhook.MemoryDeliveryJournal
+}
+
+func (r webhookDeliveryRecorder) Record(ctx context.Context, d webhook.Delivery) (bool, error) {
+	if r.journal == nil {
+		return false, errors.New("webhook: nil delivery journal")
+	}
+	return r.journal.ClaimDelivery(ctx, webhook.DeliveryKey(d.ID), d.At)
+}
+
+// startWebhookReceiver loads the 0600 secret from the state directory and
+// starts the loopback listener. A missing secret or a bad address is logged and
+// skipped: an optional receiver must never take down the stdio MCP transport.
+func startWebhookReceiver(cfg reconcileConfig) (func(), error) {
+	srv, err := webhook.Start(webhook.Config{
+		Addr:       os.Getenv(webhook.WebhookAddrEnv),
+		SecretPath: filepath.Join(cfg.dir, webhook.SecretFileName),
+		Recorder:   webhookDeliveryRecorder{journal: webhook.NewMemoryDeliveryJournal()},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		if err := srv.Close(); err != nil {
+			observe.ActorError("webhook-close", "", err)
+		}
+	}, nil
+}
+
+// ---------------------------------------------------------------------------
 // Wake ladder wiring (ADR 0017).
 //
 // The ladder core lives in internal/infra/ladder and depends on narrow ports.
@@ -920,11 +962,14 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 	// background cycle and the loopback HTTP API. A second MCP process serves
 	// tools but stays silent and owns no connection file.
 	var (
-		stopHTTP func()
-		httpErr  error
+		stopHTTP    func()
+		httpErr     error
+		stopWebhook func()
+		webhookErr  error
 	)
 	cfg.onPollerOwner = func(c context.Context) {
 		stopHTTP, httpErr = startHTTPAPI(c, cfg, events)
+		stopWebhook, webhookErr = startWebhookReceiver(cfg)
 	}
 	runCtx, stopLoops := context.WithCancel(ctx)
 	defer stopLoops()
@@ -938,6 +983,13 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		observe.ActorError("httpapi", "", httpErr)
 	} else if stopHTTP != nil {
 		defer stopHTTP()
+	}
+	if webhookErr != nil {
+		// A receiver without a valid secret cannot serve. Log the config
+		// error and keep the MCP transport alive.
+		observe.ActorError("webhook", "", webhookErr)
+	} else if stopWebhook != nil {
+		defer stopWebhook()
 	}
 
 	return serveMCP(ctx, deps)
