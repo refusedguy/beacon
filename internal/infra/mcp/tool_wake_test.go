@@ -3749,7 +3749,7 @@ func TestT3_153TargetedMentionReturnsNotify(t *testing.T) {
 	if res.err != nil {
 		t.Fatalf("wait error = %v, want nil", res.err)
 	}
-	if res.out.Signal != MentionNotifySignal || res.out.Signal != "NOTIFY" {
+	if res.out.Signal != MentionNotifySignal {
 		t.Errorf("signal = %q, want NOTIFY", res.out.Signal)
 	}
 	if res.out.Handle != "@alice" {
