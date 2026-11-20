@@ -47,7 +47,7 @@ func connectTestSession(t *testing.T, deps ...Dependencies) *mcpsdk.ClientSessio
 	return clientSession
 }
 
-func TestToolsListReturnsExactlySevenTools(t *testing.T) {
+func TestToolsListReturnsExactlyEightTools(t *testing.T) {
 	session := connectTestSession(t)
 
 	var got []string
@@ -57,8 +57,8 @@ func TestToolsListReturnsExactlySevenTools(t *testing.T) {
 		}
 		got = append(got, tool.Name)
 	}
-	if len(got) != 7 {
-		t.Fatalf("tools/list returned %d tools (%v), want 7", len(got), got)
+	if len(got) != 8 {
+		t.Fatalf("tools/list returned %d tools (%v), want 8", len(got), got)
 	}
 
 	want := slices.Clone(ToolNames)
