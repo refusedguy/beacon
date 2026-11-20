@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -3806,3 +3807,347 @@ func T220Advance(e T220Evidence, step T220Step) (T220Evidence, error) {
 	return e, nil
 }
 
+// ===== T3.222 канонический ключ _meta для сессии (#320) =====
+// A subscriber target is an opaque string. The neutral key beacon/sessionID is
+// canonical; ai.opencode/sessionID stays readable for callers that still send
+// it. A watch with neither _meta nor an explicit notify.target is skipped: no
+// prompt and no receipt, which is the W01 negative control.
+
+const (
+	SessionIDMetaKey       = "beacon/sessionID"
+	LegacySessionIDMetaKey = "ai.opencode/sessionID"
+)
+
+// ErrNoTarget is the skip outcome for a watch with no deliverable target. It is
+// not a transport failure: no prompt is sent and no receipt is written.
+var ErrNoTarget = errors.New("wake: skip: no session target for watch")
+
+// SessionIDFromMeta reads the caller's opaque session id from _meta. The
+// neutral key wins; the legacy key is accepted for compatibility. A non-string
+// or empty value is absent, and the value is never parsed or validated.
+func SessionIDFromMeta(meta map[string]any) string {
+	for _, key := range []string{SessionIDMetaKey, LegacySessionIDMetaKey} {
+		if raw, ok := meta[key]; ok {
+			if s, ok := raw.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// ResolveSessionTarget chooses one target for a watch. An explicit
+// notify.target is the fallback when neither _meta key is present. With no
+// source at all the watch must be skipped, not guessed.
+func ResolveSessionTarget(meta map[string]any, notifyTarget string) (string, bool) {
+	if id := SessionIDFromMeta(meta); id != "" {
+		return id, true
+	}
+	if target := strings.TrimSpace(notifyTarget); target != "" {
+		return target, true
+	}
+	return "", false
+}
+
+// SessionRegistry records the watchID -> target binding used by W01. Targets
+// are opaque strings; the registry never interprets a session id or a harness
+// name, and it never invents a binding for a watch with no target.
+type SessionRegistry struct {
+	mu      sync.RWMutex
+	targets map[string]map[string]string
+}
+
+// NewSessionRegistry builds an empty binding registry.
+func NewSessionRegistry() *SessionRegistry {
+	return &SessionRegistry{targets: make(map[string]map[string]string)}
+}
+
+// Bind records target for one subscriber of a watch. Empty identifiers and
+// empty targets are ignored so a missing _meta cannot create a row.
+func (r *SessionRegistry) Bind(watchID, subscriberID, target string) bool {
+	if r == nil || watchID == "" || target == "" {
+		return false
+	}
+	if subscriberID == "" {
+		subscriberID = "*"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.targets == nil {
+		r.targets = make(map[string]map[string]string)
+	}
+	rows := r.targets[watchID]
+	if rows == nil {
+		rows = make(map[string]string)
+		r.targets[watchID] = rows
+	}
+	rows[subscriberID] = target
+	return true
+}
+
+// BindWatch resolves the target from _meta or notify.target and binds it. A
+// watch with no source returns ErrNoTarget and leaves no row behind.
+func (r *SessionRegistry) BindWatch(watchID, subscriberID string, meta map[string]any, notifyTarget string) (string, error) {
+	target, ok := ResolveSessionTarget(meta, notifyTarget)
+	if !ok {
+		return "", ErrNoTarget
+	}
+	if !r.Bind(watchID, subscriberID, target) {
+		return "", ErrNoTarget
+	}
+	return target, nil
+}
+
+// Target returns the binding for one subscriber, or false when none exists.
+func (r *SessionRegistry) Target(watchID, subscriberID string) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	target, ok := r.targets[watchID][subscriberID]
+	return target, ok
+}
+
+// Bound reports whether target is registered for watchID by any subscriber.
+func (r *SessionRegistry) Bound(watchID, target string) bool {
+	if r == nil || target == "" {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, bound := range r.targets[watchID] {
+		if bound == target {
+			return true
+		}
+	}
+	return false
+}
+
+// Rows returns one watchID -> target row per bound watch, sorted by watchID.
+func (r *SessionRegistry) Rows() map[string]string {
+	out := make(map[string]string)
+	if r == nil {
+		return out
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for watchID, rows := range r.targets {
+		if len(rows) == 0 {
+			continue
+		}
+		keys := make([]string, 0, len(rows))
+		for sub := range rows {
+			keys = append(keys, sub)
+		}
+		sort.Strings(keys)
+		out[watchID] = rows[keys[0]]
+	}
+	return out
+}
+
+// BoundDeliverer refuses to send a pointer to a session that was never bound
+// to the watch. Without a binding it returns ErrNoTarget before the inner
+// deliverer runs, so W01 produces neither a prompt nor a receipt.
+type BoundDeliverer struct {
+	Registry *SessionRegistry
+	Inner    domain.WakeDeliverer
+}
+
+var _ domain.WakeDeliverer = (*BoundDeliverer)(nil)
+
+// Deliver checks the binding before handing the pointer to the inner adapter.
+func (d *BoundDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	if d == nil || d.Registry == nil || d.Inner == nil {
+		return ErrNoTarget
+	}
+	if !d.Registry.Bound(p.WatchID, sessionID) {
+		return ErrNoTarget
+	}
+	return d.Inner.Deliver(ctx, sessionID, p)
+}
+
+// ===== T3.223 живучесть локации OpenCode (#320) =====
+// An idle OpenCode location is unloaded, which takes the plugin out of
+// /api/plugin and stops wake polling. The chosen mitigation is to disable the
+// idle timeout. W12 records an observed fact instead of trusting an idle
+// report: the spike unloaded at about 2m47s with 2 minutes and held the plugin
+// for more than 3m39s with the timeout disabled.
+
+type LocationMitigation string
+
+const (
+	LocationMitigationFalse     LocationMitigation = "location_idle_timeout=false"
+	LocationMitigationKeepalive LocationMitigation = "external_keepalive"
+	LocationMitigationAlarm     LocationMitigation = "external_alarm"
+)
+
+// locationHoldFloor is the minimum idle period W12 must observe.
+const locationHoldFloor = 3 * time.Minute
+
+// LocationConfig records the mitigation chosen for a host. IdleTimeout is the
+// configured value as written, so "false" and "2 minutes" are both valid.
+type LocationConfig struct {
+	Mitigation  LocationMitigation
+	IdleTimeout string
+}
+
+// LocationObservation is an external fact: how long the host was idle and
+// whether the adapter was still in /api/plugin at the end of that period.
+type LocationObservation struct {
+	Mitigation   LocationMitigation
+	IdleFor      time.Duration
+	PluginActive bool
+}
+
+// ValidateLocationLiveness proves that the chosen mitigation survived an idle
+// period longer than three minutes. A short observation, a different
+// mitigation or a vanished plugin is not proof, even if the host reported
+// itself idle.
+func ValidateLocationLiveness(cfg LocationConfig, obs LocationObservation) error {
+	if cfg.Mitigation == "" {
+		return errors.New("wake: location: no mitigation chosen")
+	}
+	if obs.Mitigation != cfg.Mitigation {
+		return fmt.Errorf("wake: location: observation used %q, want %q", obs.Mitigation, cfg.Mitigation)
+	}
+	if obs.IdleFor <= locationHoldFloor {
+		return fmt.Errorf("wake: location: idle %s does not exceed %s", obs.IdleFor, locationHoldFloor)
+	}
+	if !obs.PluginActive {
+		return errors.New("wake: location: adapter disappeared from /api/plugin")
+	}
+	return nil
+}
+
+// W12LocationFacts are the measured spike results recorded with the card. They
+// are observations, not a promise: a fresh observation still has to pass
+// ValidateLocationLiveness for a new host.
+var W12LocationFacts = struct {
+	ShortTimeout       string
+	UnloadedAfter      time.Duration
+	ChosenMitigation   LocationMitigation
+	HeldWithMitigation time.Duration
+}{
+	ShortTimeout:       "2 minutes",
+	UnloadedAfter:      2*time.Minute + 47*time.Second,
+	ChosenMitigation:   LocationMitigationFalse,
+	HeldWithMitigation: 3*time.Minute + 39*time.Second,
+}
+
+// ===== T3.224 дедупликация доставки в Cursor Cloud Agents (#320) =====
+// Cursor's steer body only accepts prompt and delivery; deliveryId is not a
+// field the API will echo back. A steer retried after a network error can
+// therefore reach the agent twice. The adapter owns the deliveryId and
+// coalesces the repeat before the transport runs.
+
+// CursorSteer is the entire accepted steer body. DeliveryID is deliberately
+// absent: adding it returns 400 from the Cursor v1 API.
+type CursorSteer struct {
+	Prompt   string `json:"prompt"`
+	Delivery string `json:"delivery"`
+}
+
+// NewCursorSteer builds the minimal body for a Cursor steer.
+func NewCursorSteer(text, delivery string) CursorSteer {
+	return CursorSteer{Prompt: text, Delivery: delivery}
+}
+
+// CursorTransport performs the external steer call.
+type CursorTransport func(ctx context.Context, steer CursorSteer) (T206DeliveryStatus, error)
+
+// CursorDeliveryRecord is the adapter-side memory of one admitted delivery.
+type CursorDeliveryRecord struct {
+	DeliveryID string
+	BodyHash   string
+	Status     T206DeliveryStatus
+}
+
+// CursorDeliveryJournal keeps one body hash per deliveryId. A staged entry
+// survives a transport error, so a retry is a duplicate rather than a second
+// job even when the first call may have reached the agent.
+type CursorDeliveryJournal struct {
+	mu   sync.Mutex
+	byID map[string]CursorDeliveryRecord
+}
+
+// NewCursorDeliveryJournal builds an empty delivery journal.
+func NewCursorDeliveryJournal() *CursorDeliveryJournal {
+	return &CursorDeliveryJournal{byID: make(map[string]CursorDeliveryRecord)}
+}
+
+// Get reports the journaled outcome for a deliveryId without calling the
+// transport. It is the read side used by observability and by tests.
+func (j *CursorDeliveryJournal) Get(deliveryID string) (T206DeliveryResult, bool) {
+	if j == nil {
+		return T206DeliveryResult{}, false
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	rec, ok := j.byID[deliveryID]
+	if !ok {
+		return T206DeliveryResult{}, false
+	}
+	return T206DeliveryResult{DeliveryID: rec.DeliveryID, Status: rec.Status}, true
+}
+
+// CursorDeliverer is the adapter-side dedup for Cursor cloud agents.
+type CursorDeliverer struct {
+	Journal   *CursorDeliveryJournal
+	Transport CursorTransport
+}
+
+var _ domain.WakeDeliverer = (*CursorDeliverer)(nil)
+
+// Deliver sends one pointer under its obligationID. The obligationID is fixed
+// before the call, so a retry of the same obligation cannot start a second
+// wake.
+func (d *CursorDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	text := fmt.Sprintf("WAKE watchID=%s obligationID=%s revision=%d verdict=%s", p.WatchID, p.ObligationID, p.Revision, p.Verdict)
+	_, err := d.DeliverSteer(ctx, p.ObligationID, NewCursorSteer(text, "steer"))
+	return err
+}
+
+// DeliverSteer admits one steer by deliveryId. A repeat with the same body is
+// coalesced without calling the transport again; a repeat with a different
+// body is rejected, the same rule Cursor applies to a reused Idempotency-Key.
+func (d *CursorDeliverer) DeliverSteer(ctx context.Context, deliveryID string, steer CursorSteer) (T206DeliveryResult, error) {
+	if d == nil || d.Journal == nil {
+		return T206DeliveryResult{}, errors.New("wake: cursor deliverer has no journal")
+	}
+	if strings.TrimSpace(deliveryID) == "" {
+		return T206DeliveryResult{}, T206ErrDeliveryIDRequired
+	}
+	if d.Transport == nil {
+		return T206DeliveryResult{}, errors.New("wake: cursor deliverer has no transport")
+	}
+	body, err := json.Marshal(steer)
+	if err != nil {
+		return T206DeliveryResult{}, err
+	}
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+
+	j := d.Journal
+	j.mu.Lock()
+	if rec, ok := j.byID[deliveryID]; ok {
+		j.mu.Unlock()
+		if rec.BodyHash != hash {
+			return T206DeliveryResult{}, fmt.Errorf("%w: %s", T206ErrDeliveryIDReuse, deliveryID)
+		}
+		return T206DeliveryResult{DeliveryID: deliveryID, Status: T206StatusDuplicate, Coalesced: true}, nil
+	}
+	j.byID[deliveryID] = CursorDeliveryRecord{DeliveryID: deliveryID, BodyHash: hash, Status: T206StatusQueued}
+	j.mu.Unlock()
+
+	status, err := d.Transport(ctx, steer)
+	if err != nil {
+		return T206DeliveryResult{DeliveryID: deliveryID}, err
+	}
+	j.mu.Lock()
+	rec := j.byID[deliveryID]
+	rec.Status = status
+	j.byID[deliveryID] = rec
+	j.mu.Unlock()
+	return T206DeliveryResult{DeliveryID: deliveryID, Status: status}, nil
+}

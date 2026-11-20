@@ -6,6 +6,7 @@ package cibridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -757,6 +758,59 @@ func (b *Bridge) ReadVerdict(ctx context.Context, watchID, subscriberID string) 
 		Verdict:      w.Verdict,
 		Revision:     w.Revision,
 		ObligationID: o.ID,
+		ReadAt:       o.ReadAt,
+	}, nil
+}
+
+// ===== T3.225 сквозной прогон watch, CI, указатель, wake, прочтение (#320) =====
+
+// ChainFacts is the external evidence of one full run. Each field comes from
+// the store or from the CI provider; none of it is an in-memory test array.
+type ChainFacts struct {
+	WatchID      string
+	Revision     uint64
+	Verdict      domain.Verdict
+	ObligationID string
+	WakeTarget   string
+	ReadAt       time.Time
+}
+
+// ConfirmRead verifies the read side of the chain. beacon_get_result stamps
+// readAt on the obligation through the store writer and beacon_ack keeps that
+// stamp; this method reads the fact back from the same store and projects it
+// with the watch verdict and the wake target. A missing readAt means the chain
+// stopped before the result was read and is reported as incomplete.
+func (b *Bridge) ConfirmRead(watchID, obligationID string) (ChainFacts, error) {
+	if b == nil || b.store == nil {
+		return ChainFacts{}, errors.New("cibridge: no store")
+	}
+	o, err := b.store.Obligation(obligationID)
+	if err != nil {
+		return ChainFacts{}, err
+	}
+	if o.WatchID != watchID {
+		return ChainFacts{}, fmt.Errorf("cibridge: obligation %s belongs to %s, not %s", obligationID, o.WatchID, watchID)
+	}
+	if o.ReadAt.IsZero() {
+		return ChainFacts{}, fmt.Errorf("cibridge: obligation %s has no readAt: chain incomplete", obligationID)
+	}
+	w, err := b.store.Watch(watchID)
+	if err != nil {
+		return ChainFacts{}, err
+	}
+	target := ""
+	for _, sub := range w.Subscribers {
+		if sub.ID == o.SubscriberID {
+			target = sub.Target
+			break
+		}
+	}
+	return ChainFacts{
+		WatchID:      watchID,
+		Revision:     o.Revision,
+		Verdict:      o.VerdictPointer,
+		ObligationID: obligationID,
+		WakeTarget:   target,
 		ReadAt:       o.ReadAt,
 	}, nil
 }
