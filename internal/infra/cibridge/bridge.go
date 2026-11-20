@@ -29,6 +29,11 @@ import (
 // to keep the same fleet under fifty calls a minute while verdicts stay fresh.
 const DefaultPollInterval = 30 * time.Second
 
+// DefaultInWorkTimeout is the quiet window an in_work subscriber gets before
+// the watchdog treats it as stalled. A subscriber that shows no new head, MCP
+// claim/read or commit inside the window is replaced instead of woken again.
+const DefaultInWorkTimeout = 20 * time.Minute
+
 // ciPollIntervalEnv is the operator override for the bridge cadence.
 const ciPollIntervalEnv = "BEACON_CI_POLL_INTERVAL"
 
@@ -99,6 +104,13 @@ type liveWatchSource interface {
 	LiveWatches() ([]domain.Watch, error)
 }
 
+// activitySource exposes the obligation history used by the in_work watchdog
+// to see MCP claim and read stamps. The store adapter implements it; a store
+// without it still works through the current-revision obligation.
+type activitySource interface {
+	WatchObligations(watchID string) ([]domain.Obligation, error)
+}
+
 // blockerControl is the control-plane subset of the store adapter. It is a
 // domain-shaped port declared here so cibridge does not import internal/infra/store.
 // A store that does not implement it still gets the legacy fixFor unblock path.
@@ -139,6 +151,7 @@ type Bridge struct {
 	ladder         WakeLadder
 	escalate       escalationWriter
 	orchestratorID OrchestratorIDSource
+	inWorkTimeout  time.Duration
 }
 
 // WithOrchestratorIDSource binds the config fallback used by blocked wakes.
@@ -147,6 +160,19 @@ type Bridge struct {
 func (b *Bridge) WithOrchestratorIDSource(fn OrchestratorIDSource) *Bridge {
 	if b != nil {
 		b.orchestratorID = fn
+	}
+	return b
+}
+
+// WithInWorkTimeout sets the quiet window of the in_work stall watchdog. A
+// non-positive value keeps DefaultInWorkTimeout, so an omitted or malformed
+// setting cannot silently turn the watchdog off.
+func (b *Bridge) WithInWorkTimeout(d time.Duration) *Bridge {
+	if b == nil {
+		return nil
+	}
+	if d > 0 {
+		b.inWorkTimeout = d
 	}
 	return b
 }
@@ -278,7 +304,10 @@ func New(store domain.Store, ci domain.CIProvider, clock domain.Clock, interval 
 	if clock == nil {
 		clock = wallClock{}
 	}
-	b := &Bridge{store: store, ci: ci, clock: clock, interval: interval}
+	b := &Bridge{
+		store: store, ci: ci, clock: clock, interval: interval,
+		inWorkTimeout: DefaultInWorkTimeout,
+	}
 	if p, ok := ci.(domain.BatchCIProvider); ok {
 		b.batch = p
 	}
@@ -455,6 +484,14 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		// the same subscribers and OrchestratorID is created for the new SHA.
 		if head := strings.TrimSpace(obs.pr.HeadRefOid); head != "" && head != w.HeadSHA && !isTerminalState(obs.pr.State) {
 			b.handleHeadChanged(w, head, now, cycleID)
+			skipped++
+			continue
+		}
+
+		// A quiet in_work subscriber is replaced, not woken again. The head
+		// check above runs first, so a new head or commit closes this Watch
+		// instead of counting as a stall.
+		if b.escalateInWorkStall(ctx, w, now, cycleID) {
 			skipped++
 			continue
 		}
@@ -1400,6 +1437,145 @@ func (b *Bridge) markOrphaned(ctx context.Context, w domain.Watch, sub domain.Su
 	b.cycleEvent(cycleID, "executor_orphaned", observe.Fields{
 		"watchID": current.ID, "subscriberID": sub.ID, "sessionID": sessionID,
 	})
+}
+
+// inWorkLastActivity is the newest of the subscriber's own activity stamp and
+// the MCP claim/read stamps on its obligations. A legacy subscriber with no
+// own stamp can still be shown alive by a fresh claim or read.
+func (b *Bridge) inWorkLastActivity(w domain.Watch, sub domain.Subscriber) time.Time {
+	last := sub.LastActivity
+	consider := func(o domain.Obligation) {
+		if o.SubscriberID != sub.ID {
+			return
+		}
+		for _, at := range []time.Time{o.ClaimedAt, o.ReadAt} {
+			if at.After(last) {
+				last = at
+			}
+		}
+	}
+	if src, ok := b.store.(activitySource); ok {
+		if obligations, err := src.WatchObligations(w.ID); err == nil {
+			for _, o := range obligations {
+				consider(o)
+			}
+			return last
+		}
+	}
+	if o, err := b.store.Obligation(domain.ObligationKey(w.ID, w.Revision, sub.ID)); err == nil {
+		consider(o)
+	}
+	return last
+}
+
+// escalateInWorkStall scans one Watch for in_work subscribers that have been
+// quiet longer than inWorkTimeout. It returns true when at least one was
+// replaced, so Refresh leaves the Watch alone for the rest of this cycle.
+func (b *Bridge) escalateInWorkStall(ctx context.Context, w domain.Watch, now time.Time, cycleID string) bool {
+	if b == nil || b.inWorkTimeout <= 0 {
+		return false
+	}
+	current, err := b.store.Watch(w.ID)
+	if err != nil || isTerminalState(string(current.Status)) || current.Status == domain.StatusParked || current.Status == domain.StatusBlocked {
+		return false
+	}
+	escalated := false
+	for _, sub := range current.Subscribers {
+		if sub.Phase != domain.WorkerPhaseInWork {
+			continue
+		}
+		last := b.inWorkLastActivity(current, sub)
+		if last.IsZero() || !now.After(last.Add(b.inWorkTimeout)) {
+			continue
+		}
+		if b.markInWorkStalled(ctx, current, sub, now, cycleID) {
+			escalated = true
+		}
+	}
+	return escalated
+}
+
+// markInWorkStalled replaces one stale in_work subscriber and escalates to the
+// project orchestrator exactly once per (watch, subscriber, revision). The
+// dedup record is an obligation in the store, so a restart or a repeated tick
+// cannot append a second ESCALATIONS.md line or steer the session again.
+func (b *Bridge) markInWorkStalled(ctx context.Context, w domain.Watch, sub domain.Subscriber, now time.Time, cycleID string) bool {
+	sessionID := b.blockedOrchestrator(w)
+	if sessionID == "" {
+		observe.WakeSkipped(sub.Adapter, w.ID, "stalled in_work Watch has no orchestrator address")
+		return false
+	}
+	if b.waker == nil && b.adapterWaker == nil {
+		return false
+	}
+	id := domain.ObligationKey("inwork-stall:"+w.ID, w.Revision, sub.ID)
+	o, err := b.store.Obligation(id)
+	if err == nil {
+		if !o.DeliveredAt.IsZero() {
+			return false
+		}
+	} else {
+		o = domain.Obligation{
+			ID: id, WatchID: w.ID, Revision: w.Revision,
+			SubscriberID: sub.ID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
+		}
+		if err := b.store.SaveObligation(o); err != nil {
+			observe.ActorError("cibridge-stall-obligation", w.ID, err)
+			return false
+		}
+		b.stage(ctx, o, domain.VerdictBlocked, now)
+	}
+	text := fmt.Sprintf("in_work_stalled: subscriber %s (%s) on watch %s revision %d had no head, MCP or commit activity for %s; replacement required",
+		sub.ID, sub.Role, w.ID, w.Revision, b.inWorkTimeout)
+	p := domain.WakePayload{WatchID: w.ID, ObligationID: id, Revision: w.Revision, Verdict: text}
+	var deliverErr error
+	if b.adapterWaker != nil {
+		deliverErr = b.adapterWaker.Deliver(ctx, b.blockedAdapter(w, sessionID), sessionID, p)
+	} else {
+		deliverErr = b.waker.Deliver(ctx, sessionID, p)
+	}
+	if deliverErr != nil {
+		outcome := domain.OutcomeTransportFailed
+		if isDeadSessionErr(deliverErr) {
+			outcome = domain.OutcomeIndeterminate
+		}
+		b.recordDelivery(ctx, id, 1, outcome, now)
+		observe.WakeFailed("", w.ID, deliverErr, w.Revision)
+		observe.ActorError("wake-in-work-stall", w.ID, deliverErr)
+		return false
+	}
+
+	updated, err := b.store.Watch(w.ID)
+	if err == nil {
+		found := false
+		for i := range updated.Subscribers {
+			if updated.Subscribers[i].ID != sub.ID {
+				continue
+			}
+			updated.Subscribers[i].Phase = domain.WorkerPhaseOrphaned
+			updated.Subscribers[i].LastError = "in_work stall: no activity for " + b.inWorkTimeout.String()
+			found = true
+			break
+		}
+		if found {
+			if err := b.store.SaveWatch(updated); err != nil {
+				observe.ActorError("cibridge-in-work-stall", updated.ID, err)
+				return false
+			}
+		}
+	}
+	b.recordDelivery(ctx, id, 1, domain.OutcomePosted, now)
+	b.markDelivered(id, now, 1, "")
+	line := fmt.Sprintf("%s: watch %s subscriber %s stalled in_work after %s (revision %d)",
+		now.UTC().Format(time.RFC3339), w.ID, sub.ID, b.inWorkTimeout, w.Revision)
+	b.appendEscalation(line)
+	observe.Event(observe.LevelInfo, observe.OrphanEscalated, observe.Fields{
+		observe.FieldWatchID: w.ID, "subscriberID": sub.ID, "sessionID": sessionID, observe.FieldReason: "in_work_stall",
+	})
+	b.cycleEvent(cycleID, "in_work_stall", observe.Fields{
+		"watchID": w.ID, "subscriberID": sub.ID, "sessionID": sessionID, "revision": w.Revision,
+	})
+	return true
 }
 
 // wakeText builds the self-teaching instruction carried in a wake pointer.
