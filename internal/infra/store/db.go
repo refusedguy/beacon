@@ -36,6 +36,8 @@ const (
 var (
 	errClosed = errors.New("store: closed")
 
+	// The glob picks up every migration file, including 0006_control_plane.sql.
+	// migrate applies each version once and skips versions already present.
 	//go:embed migrations/*.sql
 	migrationFS embed.FS
 )
@@ -314,23 +316,8 @@ func migrationVersion(name string) (int, error) {
 
 // SaveWatch upserts a Watch. All writes go through the single writer.
 func (d *DB) SaveWatch(w domain.Watch) error {
-	payload, err := json.Marshal(w)
-	if err != nil {
-		return err
-	}
 	return d.Write(context.Background(), func(tx *sql.Tx) error {
-		_, err := tx.Exec(`
-			INSERT INTO watches (id, repo, pr, head_sha, status, revision, payload)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-			  repo     = excluded.repo,
-			  pr       = excluded.pr,
-			  head_sha = excluded.head_sha,
-			  status   = excluded.status,
-			  revision = excluded.revision,
-			  payload  = excluded.payload`,
-			w.ID, w.Repo, w.PR, w.HeadSHA, string(w.Status), w.Revision, payload)
-		return err
+		return saveWatchTx(tx, w)
 	})
 }
 
@@ -347,11 +334,23 @@ func (d *DB) Watch(id string) (domain.Watch, error) {
 	return decodeWatch(payload)
 }
 
-// ActiveWatches returns watches in watching or notifying status.
+// ActiveWatches returns watches in watching or notifying status. Blocked
+// watches are excluded here to keep the existing port contract unchanged;
+// control-plane callers that need them use LiveWatches.
 func (d *DB) ActiveWatches() ([]domain.Watch, error) {
 	return d.queryWatches(`
 		SELECT payload FROM watches WHERE status IN (?, ?) ORDER BY id`,
 		string(domain.StatusWatching), string(domain.StatusNotifying))
+}
+
+// LiveWatches returns every Watch still in the control loop: watching,
+// notifying and blocked. Rebind and other control-plane operations must see
+// blocked watches, which ActiveWatches intentionally omits.
+func (d *DB) LiveWatches() ([]domain.Watch, error) {
+	return d.queryWatches(`
+		SELECT payload FROM watches WHERE status IN (?, ?, ?) ORDER BY id`,
+		string(domain.StatusWatching), string(domain.StatusNotifying),
+		string(domain.StatusBlocked))
 }
 
 // AllWatches returns every Watch, including closed ones.

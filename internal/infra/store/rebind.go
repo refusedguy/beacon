@@ -8,6 +8,7 @@ package store
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -28,7 +29,7 @@ type RebindTarget struct {
 }
 
 // RebindOrchestrator replaces every occurrence of from with to in the
-// orchestrator identity of active Watches: the Watch.OrchestratorID field and,
+// orchestrator identity of live Watches, including blocked ones: the Watch.OrchestratorID field and,
 // when the old session was the routing subscriber, that subscriber's id and
 // target. Watches are saved under the same id, so no Watch is created or
 // closed. With dryRun set, the same targets are reported and nothing is
@@ -41,7 +42,9 @@ func (d *DB) RebindOrchestrator(from, to string, dryRun bool) ([]RebindTarget, e
 	if strings.TrimSpace(from) == "" || strings.TrimSpace(to) == "" || from == to {
 		return nil, fmt.Errorf("store: rebind: from and to must be non-empty and different")
 	}
-	watches, err := d.ActiveWatches()
+	// Blocked Watches still carry the orchestrator identity and must follow
+	// the new session too. ActiveWatches deliberately omits them.
+	watches, err := d.LiveWatches()
 	if err != nil {
 		return nil, err
 	}
@@ -91,6 +94,37 @@ func (d *DB) RebindOrchestrator(from, to string, dryRun bool) ([]RebindTarget, e
 		}
 	}
 	return out, nil
+}
+
+// BindOrchestratorAndRebind moves every live Watch off the session currently
+// bound to projectKey, then points the project binding at to. The adapter is
+// preserved. The binding changes only after the rebind succeeds, so a failure
+// leaves both the Watches and the binding on the old session.
+func (d *DB) BindOrchestratorAndRebind(projectKey, to string) ([]RebindTarget, error) {
+	projectKey = strings.TrimSpace(projectKey)
+	to = strings.TrimSpace(to)
+	if projectKey == "" || to == "" {
+		return nil, fmt.Errorf("store: rebind: project key and to must be non-empty")
+	}
+	binding, bound, err := d.BoundOrchestrator(projectKey)
+	if err != nil {
+		return nil, err
+	}
+	if !bound {
+		return nil, fmt.Errorf("store: rebind: no orchestrator bound for project %s", projectKey)
+	}
+	if binding.SessionID == to {
+		return nil, nil
+	}
+
+	targets, err := d.RebindOrchestrator(binding.SessionID, to, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.BindOrchestrator(projectKey, to, binding.Adapter, time.Now().UTC()); err != nil {
+		return nil, err
+	}
+	return targets, nil
 }
 
 // hasOrchestratorSubscriber reports whether from is the id of the subscriber
