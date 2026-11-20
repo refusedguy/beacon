@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +44,11 @@ const (
 	evalSessionID    = "beacon-evals-session"
 	// evalWakeSessionID — сессия, которую будит wake-указатель в eval 12.
 	evalWakeSessionID = "ses_eval_wake"
+	// eval 15 поднимает отдельный Watch, идентификаторы которого выдаёт
+	// реальный store. PR и SHA не важны: ветка изолирована и сети нет.
+	evalRealWakePR     = 298
+	evalRealWakeSHA    = "fedcba9876543210fedcba9876543210fedcba98"
+	evalRealWakeTarget = "real-wake-proof"
 )
 
 var contractTools = []string{
@@ -75,7 +81,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 14)
+	results := make([]evalResult, 0, 15)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -364,11 +370,97 @@ func run() int {
 	regressionActual, regressionPass := checkVerdictRegression()
 	record("11_verdict_regression", "verdict после чекпоинтов равен замороженному baseline во всех сценариях", regressionActual, regressionPass)
 
+	// Подготовка eval 15. Watch создаётся в том же реальном store, что и в
+	// eval 04, но не отменяется eval 08. Идентификаторы читаются из ответов
+	// watch_pr и get_result и передаются в плагин: так проверяется цепочка
+	// store → wake-указатель → обязательство без синтетических подстановок.
+	identityWatchResult, identityWatchErr := callTool(ctx, session, "beacon_watch_pr", map[string]any{
+		"repo":    "refusedguy/beacon",
+		"pr":      evalRealWakePR,
+		"role":    "orchestrator",
+		"headSHA": evalRealWakeSHA,
+		"notify":  map[string]any{"adapter": "opencode", "target": evalRealWakeTarget},
+	})
+	identityWatchID, identityRevision := "", uint64(0)
+	identityWatchActual := "нет ответа"
+	switch {
+	case identityWatchErr != nil:
+		identityWatchActual = "rpc: " + identityWatchErr.Error()
+	case identityWatchResult.IsError:
+		identityWatchActual = "isError=true: " + resultText(identityWatchResult)
+	default:
+		var w struct {
+			WatchID  string `json:"watchID"`
+			Revision uint64 `json:"revision"`
+		}
+		if err := decodeStructured(identityWatchResult, &w); err != nil {
+			identityWatchActual = "структурное содержимое не разобрано: " + err.Error()
+		} else {
+			identityWatchID, identityRevision = w.WatchID, w.Revision
+			identityWatchActual = fmt.Sprintf("watchID=%s, revision=%d", identityWatchID, identityRevision)
+		}
+	}
+
+	identityObligationID := ""
+	identityGetActual := "нет ответа"
+	switch {
+	case identityWatchID == "":
+		identityGetActual = "нет watchID из watch_pr"
+	default:
+		getIdentityResult, getIdentityErr := callTool(ctx, session, "beacon_get_result", map[string]any{"watchID": identityWatchID})
+		switch {
+		case getIdentityErr != nil:
+			identityGetActual = "rpc: " + getIdentityErr.Error()
+		case getIdentityResult.IsError:
+			identityGetActual = "isError=true: " + resultText(getIdentityResult)
+		default:
+			var g struct {
+				ObligationID string `json:"obligationID"`
+				Revision     uint64 `json:"revision"`
+			}
+			if err := decodeStructured(getIdentityResult, &g); err != nil {
+				identityGetActual = "структурное содержимое не разобрано: " + err.Error()
+			} else {
+				identityObligationID, identityRevision = g.ObligationID, g.Revision
+				identityGetActual = fmt.Sprintf("obligationID=%s, revision=%d", identityObligationID, identityRevision)
+			}
+		}
+	}
+
+	identityAckOK := false
+	identityAckActual := "нет ответа"
+	switch {
+	case identityWatchID == "" || identityObligationID == "":
+		identityAckActual = "нет watchID или obligationID из store"
+	default:
+		ackIdentityResult, ackIdentityErr := callTool(ctx, session, "beacon_ack", map[string]any{
+			"watchID":      identityWatchID,
+			"obligationID": identityObligationID,
+			"revision":     identityRevision,
+		})
+		switch {
+		case ackIdentityErr != nil:
+			identityAckActual = "rpc: " + ackIdentityErr.Error()
+		case ackIdentityResult.IsError:
+			identityAckActual = "isError=true: " + resultText(ackIdentityResult)
+		default:
+			var o struct {
+				OK bool `json:"ok"`
+			}
+			if err := decodeStructured(ackIdentityResult, &o); err != nil {
+				identityAckActual = "структурное содержимое не разобрано: " + err.Error()
+			} else {
+				identityAckOK = o.OK
+				identityAckActual = fmt.Sprintf("ok=%t", o.OK)
+			}
+		}
+	}
+
 	// eval 12-14: доставка wake-указателя из Beacon в сессию. Харнесс на node
 	// импортирует репозиторный плагин .opencode/plugins/beacon-bridge.js и
 	// вызывает его реальные экспорты. Ни свой JSON-RPC-клиент, ни подмена кода
 	// плагина здесь не используются: проверяются наблюдаемые факты.
-	bridge, bridgeErr := checkBridgeWakeDelivery(repoRoot, stateRoot)
+	bridge, bridgeErr := checkBridgeWakeDelivery(repoRoot, stateRoot, identityWatchID, identityObligationID, identityRevision)
 
 	// eval 12: валидный указатель доставляется steer, квитанция wx 0600, повтор
 	// той же пары не перезаписывает и не дублирует квитанцию.
@@ -431,6 +523,26 @@ func run() int {
 		t.ReceiptMode == "600" &&
 		!t.PostedReceipt
 	record("14_transport_failed", transportExpected, transportActual, transportPass)
+
+	// eval 15: wake-указатель несёт идентификаторы из реального store, а не
+	// синтетические значения eval 12. Харнесс передаёт в buildPromptText те же
+	// watchID, obligationID и revision, что вернули watch_pr и get_result,
+	// затем разбирает обёртку и сравнивает значения с escapeUntrusted от
+	// плагина: его лимит в 64 символа обрезает настоящие ID, длины видны в
+	// колонке ACTUAL. Ack с теми же ID подтверждает цепочку store → указатель
+	// → обязательство.
+	identity := bridge.RealIDs
+	identityExpected := "watchID, obligationID и revision в указателе выведены из store; ack ok=true"
+	identityActual := fmt.Sprintf("%s; %s; prompt: watch=%t (%d→%d), obl=%t (%d→%d), rev=%t; ack=%s",
+		identityWatchActual, identityGetActual,
+		identity.WatchIDFromStore, identity.WatchIDLen, identity.PromptWatchIDLen,
+		identity.ObligationIDFromStore, identity.ObligationIDLen, identity.PromptObligationIDLen,
+		identity.RevisionEqual, identityAckActual)
+	identityPass := bridgeErr == nil &&
+		identityWatchID != "" && identityObligationID != "" &&
+		identity.WatchIDFromStore && identity.ObligationIDFromStore && identity.RevisionEqual &&
+		identityAckOK
+	record("15_real_store_wake_identity", identityExpected, identityActual, identityPass)
 
 	printTable(results)
 	passed, failed := 0, 0
@@ -881,12 +993,41 @@ async function scenarioTransport(mod) {
   }
 }
 
+// Сценарий 4: идентификаторы в wake-указателе выведены из реального store.
+// Обёртку разбираем и сравниваем значения, а не ищем подстроку: obligationID
+// содержит обратные слеши, которые JSON.stringify удваивает. Плагин ограничивает
+// поле 64 символами, поэтому сравниваем с тем, что возвращает его же
+// escapeUntrusted, и отдельно сообщаем длины: это честное описание ограничения.
+function scenarioRealIDs(mod) {
+  const watchID = process.env.BEACON_REAL_WATCH_ID || ""
+  const obligationID = process.env.BEACON_REAL_OBLIGATION_ID || ""
+  const revision = Number(process.env.BEACON_REAL_REVISION || "0")
+  const text = mod.buildPromptText({ watchID, obligationID, revision })
+  let parsed = null
+  try {
+    parsed = JSON.parse(text.slice("<beacon-event>".length, -"</beacon-event>".length))
+  } catch (err) {
+    parsed = null
+  }
+  return {
+    text,
+    watchIDFromStore: Boolean(watchID) && parsed?.watchID === mod.escapeUntrusted(watchID),
+    obligationIDFromStore: Boolean(obligationID) && parsed?.obligationID === mod.escapeUntrusted(obligationID),
+    revisionEqual: parsed?.revision === revision,
+    watchIDLen: watchID.length,
+    obligationIDLen: obligationID.length,
+    promptWatchIDLen: (parsed?.watchID || "").length,
+    promptObligationIDLen: (parsed?.obligationID || "").length,
+  }
+}
+
 try {
   const mod = await import(pathToFileURL(PLUGIN).href)
   const delivery = await scenarioDelivery(mod)
   const escaping = scenarioEscaping(mod)
   const transport = await scenarioTransport(mod)
-  console.log(JSON.stringify({ delivery, escaping, transport }))
+  const realIDs = scenarioRealIDs(mod)
+  console.log(JSON.stringify({ delivery, escaping, transport, realIDs }))
 } catch (err) {
   console.log(JSON.stringify({ error: String((err && err.stack) || err) }))
   process.exitCode = 1
@@ -894,12 +1035,25 @@ try {
 `
 
 // bridgeObservation — то, что харнесс наблюдал в реальном плагине. Все поля
-// нужны только для того, чтобы Go-раннер свел их в три вердикта eval.
+// нужны только для того, чтобы Go-раннер свел их в вердикты eval.
 type bridgeObservation struct {
 	Error     string          `json:"error"`
 	Delivery  bridgeDelivery  `json:"delivery"`
 	Escaping  bridgeEscaping  `json:"escaping"`
 	Transport bridgeTransport `json:"transport"`
+	RealIDs   bridgeRealIDs   `json:"realIDs"`
+}
+
+// bridgeRealIDs — результат buildPromptText на идентификаторах из store.
+type bridgeRealIDs struct {
+	Text                  string `json:"text"`
+	WatchIDFromStore      bool   `json:"watchIDFromStore"`
+	ObligationIDFromStore bool   `json:"obligationIDFromStore"`
+	RevisionEqual         bool   `json:"revisionEqual"`
+	WatchIDLen            int    `json:"watchIDLen"`
+	ObligationIDLen       int    `json:"obligationIDLen"`
+	PromptWatchIDLen      int    `json:"promptWatchIDLen"`
+	PromptObligationIDLen int    `json:"promptObligationIDLen"`
 }
 
 type bridgeDelivery struct {
@@ -942,7 +1096,9 @@ type bridgeTransport struct {
 
 // checkBridgeWakeDelivery прогоняет харнесс против репозиторного плагина. Node
 // нужен только как среда исполнения плагина; свой JSON-RPC-клиент не пишется.
-func checkBridgeWakeDelivery(repoRoot, stateRoot string) (bridgeObservation, error) {
+// watchID, obligationID и revision приходят из реального store и нужны
+// сценарию 4; остальные сценарии их не используют.
+func checkBridgeWakeDelivery(repoRoot, stateRoot, watchID, obligationID string, revision uint64) (bridgeObservation, error) {
 	var obs bridgeObservation
 	nodeBin, err := exec.LookPath("node")
 	if err != nil {
@@ -965,6 +1121,9 @@ func checkBridgeWakeDelivery(repoRoot, stateRoot string) (bridgeObservation, err
 	cmd.Env = append(os.Environ(),
 		"BEACON_EVAL_PLUGIN="+pluginPath,
 		"BEACON_EVAL_TMP="+stateRoot,
+		"BEACON_REAL_WATCH_ID="+watchID,
+		"BEACON_REAL_OBLIGATION_ID="+obligationID,
+		"BEACON_REAL_REVISION="+strconv.FormatUint(revision, 10),
 		"XDG_STATE_HOME="+filepath.Join(stateRoot, "bridge-xdg"),
 	)
 	var stdout, stderr bytes.Buffer

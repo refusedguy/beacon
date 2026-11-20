@@ -2,7 +2,7 @@
 
 Набор локальных проверок в стиле Harbor. Раннер печатает таблицу с ожидаемым
 результатом, фактическим результатом и вердиктом `PASS`/`FAIL`. В конце выводится
-строка вида `14 passed, 0 failed`. При наличии `FAIL` код выхода равен 1.
+строка вида `15 passed, 0 failed`. При наличии `FAIL` код выхода равен 1.
 
 ## Запуск
 
@@ -66,6 +66,7 @@ eval-специфичную точку входа `evals/cmd/evalserver`: она
 | `12_wake_pointer_delivery` | Импортирует репозиторный плагин, публикует `beacon.review.comment` и читает квитанцию | один `session.prompt` с `delivery=steer`, обёртка и идентификаторы в тексте, след пробуждения, квитанция `wx` с режимом `0600` и `outcome=posted`; повтор события не меняет файл квитанции |
 | `13_untrusted_escaping` | Вызывает `buildPromptText` плагина на событии с враждебными полями | обёртка и идентификаторы на месте, сырых `<script>` и фразы-инструкции нет, экранированные формы есть, длина не больше 512 |
 | `14_transport_failed` | Заставляет `session.prompt` бросить ошибку и читает квитанцию | `outcome=transport-failed`, режим `0600`, `delivery=steer`; квитанции с `outcome=posted` нет |
+| `15_real_store_wake_identity` | Поднимает отдельный Watch, читает `watchID` и `obligationID` из `get_result`, передаёт их в `buildPromptText` плагина и вызывает `ack` с теми же ID | поля указателя равны `escapeUntrusted` от реальных значений store, revision совпадает, `ack ok=true`; длины до/после обрезки видны в `ACTUAL` |
 
 `11_verdict_regression` делает регрессию вердикта измеримой (ADR 0063, фича 4).
 Baseline зафиксирован строками в `evals/main.go`: `ready`, `merged`, `rebase`,
@@ -132,10 +133,57 @@ event bus и публикует `beacon.review.comment`. Проверяется,
 что `deliverReviewPointer` вернул `transport-failed`, записал тот же исход в
 квитанцию режимом `0600` и не оставил квитанции с `outcome=posted`.
 
-Три новых кейса идут после `10_two_phase_local_ci_gate`, поэтому счётчик
+Четыре новых кейса идут после `10_two_phase_local_ci_gate`, поэтому счётчик
 «девять базовых eval» в гейте не меняется. Для харнесса нужен `node` в `PATH`;
-если его нет, все три кейса красные с явной причиной. Временные каталоги
+если его нет, все четыре кейса красные с явной причиной. Временные каталоги
 состояния удаляются вместе с общим корнем прогона.
+
+## Идентификаторы из store, а не синтетические
+
+`15_real_store_wake_identity` закрывает пробел между eval 06/07 и eval 12.
+Первые читают `obligationID` из store и подтверждают его, но не проверяют, что
+тот же идентификатор попадает в wake-указатель. Двенадцатый проверяет указатель,
+но с синтетическими `watch-eval-wake` и `obl-eval-wake`.
+
+Новый кейс поднимает отдельный Watch через `beacon_watch_pr` с ролью
+`orchestrator` и `notify.target=real-wake-proof`, читает `watchID` и
+`obligationID` из `beacon_get_result`, затем передаёт эти значения в настоящий
+`buildPromptText` плагина через переменные окружения харнесса. Харнесс
+разбирает обёртку `<beacon-event>` как JSON и сравнивает поля с результатом
+`escapeUntrusted` на тех же строках. Последний шаг вызывает `beacon_ack` с ID из
+store и ждёт `ok=true`.
+
+Сравнение идёт с `escapeUntrusted`, а не с исходной строкой, потому что плагин
+ограничивает поле 64 символами. Настоящий `watchID` из store имеет длину 68, а
+`obligationID` около 94. В колонке `ACTUAL` видны обе длины до и после обрезки,
+например `watch=true (68→64), obl=true (94→64)`. Это ограничение плагина, а не
+store: идентификатор, придуманный в eval, несовпадения не показал бы.
+
+## Живой proof на реальной сессии
+
+Кроме детерминированного eval, цепочка проверена вручную на живом экземпляре.
+Факты 20 ноября 2026:
+
+- `beacon_watch_pr` зарегистрировал Watch
+  `watch:refusedguy/beacon:281:ee909b8867da6bacef63e41526095df93f9a1639`
+  с ролью `orchestrator` и `notify.target=real-wake-proof`. `headSHA` взят из
+  `gh pr view 281`.
+- `beacon_get_result` вернул `obligationID`
+  `watch\:refusedguy/beacon\:281\:ee909b8867da6bacef63e41526095df93f9a1639:0:ses_e08d24d2dffe1KDYQlBLQ5PEAw`
+  и `revision=0`.
+- `opencode api POST /api/session/ses_e08d24d2dffe1KDYQlBLQ5PEAw/prompt` с телом
+  `{"text":"<beacon-event>{...}</beacon-event>","delivery":"steer"}` ответил
+  HTTP 200, `data.id=msg_1f72f45e6001itUmmMyvttLrjS` и `data.delivery=steer`.
+  Событие с настоящими ID появилось в этой же сессии.
+- `beacon_ack` с этим `obligationID` вернул `ok=true`. Следующий
+  `beacon_get_result` показал `verdict=ready`, `revision=1` и новый
+  `obligationID` с суффиксом `:1:`.
+
+Живой конверт собран вызывающей стороной с полными идентификаторами: плагинный
+`buildPromptText` в этом пути не участвует и его лимит 64 символа не применяется.
+В сессию также пришёл посторонний beacon-event для Watch PR 286, адресованный
+сессии `ses_e0cf50d54ffeyUjn4rIwocpnBH`. Он не подтверждался: обязательство
+другого Watch не входит в этот proof.
 
 ## Почему правилась схема
 
@@ -165,8 +213,9 @@ subprocess через `CommandTransport`, временный XDG-каталог 
 в ней `Store` не подключён. Инструмент `beacon_wait_result` в набор не входит:
 ему нужен `VerdictSource`, и подменять его фейком в eval не стали.
 
-Три новых кейса проверяют реальный код плагина, но запускают его с фейковым
+Четыре новых кейса проверяют реальный код плагина, но запускают его с фейковым
 хостом: event bus и `session.prompt` реализованы в харнессе. Это доказывает, что
 плагин вызывает steer и пишет квитанции, но не доказывает, что конкретный
 OpenCode принял bridging-плагин в своей сессии. Для проверки живого хоста
-остаётся `tests/e2e`.
+остаётся `tests/e2e`. Живой proof выше сделан вручную через `opencode api`, а не
+в детерминированном прогоне.
