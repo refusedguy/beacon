@@ -5,9 +5,11 @@ name: Gates binary
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
+    paths: ['tools/beacon-gates/**', 'go.mod', '.github/workflows/gates-binary.yml']
   pull_request:
-    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
+    paths: ['tools/beacon-gates/**', 'go.mod', '.github/workflows/gates-binary.yml']
+  # Ручной обход path-фильтра: запускает проверку независимо от изменённых файлов.
+  workflow_dispatch:
 
 permissions:
   contents: read
