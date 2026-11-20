@@ -71,6 +71,7 @@ const (
 	FieldPoints       = "points"
 	FieldRole         = "role"
 	FieldFailedChecks = "failedChecks"
+	FieldSource       = "source"
 )
 
 // Event names of the blocker and auto-merge transitions reported by the
@@ -423,12 +424,28 @@ func MergeDuration(d time.Duration) {
 	Event(LevelDebug, "merge_duration", Fields{FieldDuration: d.String()})
 }
 
-// WakeDelivered records one wake the host admitted.
+// Source values of the wake_delivered event (T3.417). The adapter cannot
+// separate the two paths because both use "opencode".
+const (
+	WakeSourceMCP    = "mcp"
+	WakeSourceDaemon = "daemon"
+)
+
+// WakeDelivered records one wake the host admitted. Callers that do not name
+// their path get the MCP source. The delivery loop uses WakeDeliveredSource
+// so its wakes show "daemon" in the log (T3.417).
 func WakeDelivered(adapter, watchID string, revision ...uint64) {
+	WakeDeliveredSource(adapter, watchID, WakeSourceMCP, revision...)
+}
+
+// WakeDeliveredSource records one wake together with the path that admitted
+// it. The source is a log field only, so metric labels and existing callers
+// keep their current behavior (T3.417).
+func WakeDeliveredSource(adapter, watchID, source string, revision ...uint64) {
 	s := Default()
 	s.Inc(CounterWakeDelivered, adapter)
 	cycles.note(func(c *cycleTracker) { c.wakes++ })
-	fields := Fields{FieldAdapter: adapter, FieldWatchID: watchID}
+	fields := Fields{FieldAdapter: adapter, FieldWatchID: watchID, FieldSource: source}
 	if len(revision) != 0 {
 		fields[FieldRevision] = revision[0]
 	}
