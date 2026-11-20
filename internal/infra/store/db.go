@@ -2545,3 +2545,74 @@ func (d *DB) FIFOPaused() (bool, error) {
 	}
 	return paused != 0, err
 }
+
+// ---- Batched enqueue of the durable FIFO queue (ADR 0063 фича 3, T3.155) ----
+//
+// FIFOEnqueue opens one write transaction per task, so a burst of enqueues
+// pays for one SQLite commit per task against the single writer. A batch is
+// one Write: a single prepared INSERT executed N times inside ONE transaction,
+// so the burst costs one commit. This batches only the enqueue path. Ordering,
+// pause, resume, cancel, claim, completion and crash recovery stay with
+// T3.138 and are not duplicated here.
+
+// FIFOEnqueueBatchResult reports what one batched enqueue committed. Inserted
+// counts new rows; Ignored counts ids already in the queue, whose stored
+// payload was left untouched.
+type FIFOEnqueueBatchResult struct {
+	Inserted int
+	Ignored  int
+}
+
+// FIFOEnqueueBatch appends several tasks to the tail of the single FIFO queue
+// in one transaction. All inserts share one commit, so enqueueing N tasks does
+// not serialize N writers (ADR 0063 фича 3). Tasks receive their seq in the
+// order given, so FIFOClaim still hands them out in that order. A repeat with
+// an existing id inserts nothing and keeps the first payload (INSERT OR
+// IGNORE, the same rule as FIFOEnqueue). Every payload is redacted before it
+// reaches the file (ADR 0012). Only ID and Payload of an item are used; Seq,
+// State and EnqueuedAt are assigned by the queue. Ids are validated before the
+// transaction, so a batch holding a blank id commits nothing.
+func (d *DB) FIFOEnqueueBatch(items []FIFOItem) (FIFOEnqueueBatchResult, error) {
+	for i, it := range items {
+		if strings.TrimSpace(it.ID) == "" {
+			return FIFOEnqueueBatchResult{}, domain.NewAppError(domain.CodeInvalidInput,
+				fmt.Sprintf("store: fifo: batch item %d: empty task id", i))
+		}
+	}
+	if len(items) == 0 {
+		return FIFOEnqueueBatchResult{}, nil
+	}
+
+	now := time.Now().UTC().UnixNano()
+	var out FIFOEnqueueBatchResult
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureFIFOQueue(tx); err != nil {
+			return err
+		}
+		stmt, err := tx.Prepare(`
+			INSERT OR IGNORE INTO fifo_queue (id, payload, state, enqueued_at)
+			VALUES (?, ?, ?, ?)`)
+		if err != nil {
+			return fmt.Errorf("store: fifo: batch prepare: %w", err)
+		}
+		defer stmt.Close()
+		inserted := 0
+		for _, it := range items {
+			res, err := stmt.Exec(it.ID, Redact(it.Payload), fifoStatePending, now)
+			if err != nil {
+				return fmt.Errorf("store: fifo: batch insert %s: %w", it.ID, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("store: fifo: batch rows affected %s: %w", it.ID, err)
+			}
+			inserted += int(n)
+		}
+		out = FIFOEnqueueBatchResult{Inserted: inserted, Ignored: len(items) - inserted}
+		return nil
+	})
+	if err != nil {
+		return FIFOEnqueueBatchResult{}, err
+	}
+	return out, nil
+}
