@@ -1356,3 +1356,211 @@ func TestImportReceiptsPluginWireShape(t *testing.T) {
 		t.Fatalf("ReceiptCount = %d, %v; want 2", count, err)
 	}
 }
+
+// BS.13 / ADR 0103. The clientRequestId receipt store is idempotent and keeps
+// the committed intent separate from the effect that still has to run.
+
+func TestRecordClientReceiptRepeatReturnsFirstResult(t *testing.T) {
+	d := newReceiptDB(t)
+	in := ClientReceipt{
+		ClientRequestID: "req-repeat",
+		ReceiptJSON:     []byte(`{"kind":"ack","task":"task-1"}`),
+		IntentCommitted: true,
+		EffectStatus:    EffectStatusPending,
+	}
+
+	first, err := d.RecordClientReceipt(in)
+	if err != nil {
+		t.Fatalf("first RecordClientReceipt: %v", err)
+	}
+	if !first.Created || first.Duplicate || first.Conflict {
+		t.Fatalf("first result = %+v, want created with no duplicate or conflict", first)
+	}
+
+	second, err := d.RecordClientReceipt(in)
+	if err != nil {
+		t.Fatalf("second RecordClientReceipt: %v", err)
+	}
+	if !second.Duplicate || second.Created || second.Conflict {
+		t.Fatalf("second result = %+v, want duplicate with no conflict", second)
+	}
+	if second.Receipt.ClientRequestID != in.ClientRequestID {
+		t.Errorf("repeat id = %q, want %q", second.Receipt.ClientRequestID, in.ClientRequestID)
+	}
+	if string(second.Receipt.ReceiptJSON) != string(in.ReceiptJSON) {
+		t.Errorf("repeat receipt_json = %q, want %q", second.Receipt.ReceiptJSON, in.ReceiptJSON)
+	}
+	if !second.Receipt.IntentCommitted {
+		t.Error("repeat lost intent_committed")
+	}
+
+	count, err := d.ClientReceiptCount()
+	if err != nil {
+		t.Fatalf("ClientReceiptCount: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("client receipt count = %d, want 1", count)
+	}
+}
+
+func TestRecordClientReceiptConflictKeepsFirstRow(t *testing.T) {
+	d := newReceiptDB(t)
+	first, err := d.RecordClientReceipt(ClientReceipt{
+		ClientRequestID: "req-conflict",
+		ReceiptJSON:     []byte(`{"result":"first"}`),
+		IntentCommitted: true,
+		EffectStatus:    EffectStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("first RecordClientReceipt: %v", err)
+	}
+	if !first.Created {
+		t.Fatalf("first result = %+v, want created", first)
+	}
+
+	second, err := d.RecordClientReceipt(ClientReceipt{
+		ClientRequestID: "req-conflict",
+		ReceiptJSON:     []byte(`{"result":"second"}`),
+		IntentCommitted: true,
+		EffectStatus:    EffectStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("second RecordClientReceipt: %v", err)
+	}
+	if !second.Duplicate || !second.Conflict || second.Created {
+		t.Fatalf("second result = %+v, want duplicate conflict", second)
+	}
+	if string(second.Receipt.ReceiptJSON) != string(first.Receipt.ReceiptJSON) {
+		t.Errorf("conflicting repeat changed receipt_json: got %q, want %q",
+			second.Receipt.ReceiptJSON, first.Receipt.ReceiptJSON)
+	}
+
+	stored, ok, err := d.ClientReceipt("req-conflict")
+	if err != nil || !ok {
+		t.Fatalf("ClientReceipt = %+v, %v, %v; want found", stored, ok, err)
+	}
+	if string(stored.ReceiptJSON) != `{"result":"first"}` {
+		t.Errorf("stored receipt_json = %q, want the first body", stored.ReceiptJSON)
+	}
+	count, err := d.ClientReceiptCount()
+	if err != nil || count != 1 {
+		t.Fatalf("ClientReceiptCount = %d, %v; want 1", count, err)
+	}
+}
+
+func TestClientReceiptIntentSeparateFromEffect(t *testing.T) {
+	d := newReceiptDB(t)
+	got, err := d.RecordClientReceipt(ClientReceipt{
+		ClientRequestID: "req-intent",
+		ReceiptJSON:     []byte(`{"kind":"ack"}`),
+		IntentCommitted: true,
+		EffectStatus:    EffectStatusPending,
+	})
+	if err != nil {
+		t.Fatalf("RecordClientReceipt: %v", err)
+	}
+	if !got.Created || !got.Receipt.IntentCommitted {
+		t.Fatalf("result = %+v, want created with intent committed", got)
+	}
+	// The receipt exists and the intent is committed, but the effect is still
+	// pending. Receipt does not mean effect completion (ADR 0103).
+	if got.Receipt.EffectStatus == EffectStatusComplete {
+		t.Errorf("recording a receipt marked the effect complete: %q", got.Receipt.EffectStatus)
+	}
+	if got.Receipt.EffectStatus != EffectStatusPending {
+		t.Errorf("effect status = %q, want %q", got.Receipt.EffectStatus, EffectStatusPending)
+	}
+
+	updated, err := d.SetEffectStatus("req-intent", EffectStatusComplete)
+	if err != nil || !updated {
+		t.Fatalf("SetEffectStatus = %v, %v; want true", updated, err)
+	}
+	stored, ok, err := d.ClientReceipt("req-intent")
+	if err != nil || !ok {
+		t.Fatalf("ClientReceipt = %+v, %v, %v; want found", stored, ok, err)
+	}
+	if !stored.IntentCommitted {
+		t.Error("advancing the effect cleared intent_committed")
+	}
+	if string(stored.ReceiptJSON) != `{"kind":"ack"}` {
+		t.Errorf("advancing the effect changed receipt_json: %q", stored.ReceiptJSON)
+	}
+	if stored.EffectStatus != EffectStatusComplete {
+		t.Errorf("effect status = %q, want %q", stored.EffectStatus, EffectStatusComplete)
+	}
+}
+
+func TestClientReceiptEmptyDB(t *testing.T) {
+	d := newReceiptDB(t)
+	r, ok, err := d.ClientReceipt("req-absent")
+	if err != nil || ok {
+		t.Fatalf("ClientReceipt on empty DB = %+v, %v, %v; want not found", r, ok, err)
+	}
+	if r.ClientRequestID != "" || r.ReceiptJSON != nil || r.IntentCommitted ||
+		r.EffectStatus != "" || r.CreatedAt != 0 {
+		t.Errorf("ClientReceipt on empty DB = %+v, want zero value", r)
+	}
+	count, err := d.ClientReceiptCount()
+	if err != nil || count != 0 {
+		t.Fatalf("ClientReceiptCount on empty DB = %d, %v; want 0", count, err)
+	}
+	updated, err := d.SetEffectStatus("req-absent", EffectStatusComplete)
+	if err != nil || updated {
+		t.Fatalf("SetEffectStatus on empty DB = %v, %v; want false", updated, err)
+	}
+}
+
+func TestClientReceiptDefaultsEffectStatusToPending(t *testing.T) {
+	d := newReceiptDB(t)
+	got, err := d.RecordClientReceipt(ClientReceipt{
+		ClientRequestID: "req-default",
+		ReceiptJSON:     []byte(`{"kind":"ack"}`),
+		IntentCommitted: true,
+	})
+	if err != nil {
+		t.Fatalf("RecordClientReceipt: %v", err)
+	}
+	if got.Receipt.EffectStatus != EffectStatusPending {
+		t.Errorf("default effect status = %q, want %q", got.Receipt.EffectStatus, EffectStatusPending)
+	}
+}
+
+func TestRecordClientReceiptRejectsEmptyKey(t *testing.T) {
+	d := newReceiptDB(t)
+	for _, key := range []string{"", "   "} {
+		if _, err := d.RecordClientReceipt(ClientReceipt{ClientRequestID: key}); err == nil {
+			t.Errorf("RecordClientReceipt(%q) succeeded, want validation error", key)
+		}
+	}
+	count, err := d.ClientReceiptCount()
+	if err != nil || count != 0 {
+		t.Fatalf("ClientReceiptCount = %d, %v; want 0 after rejected keys", count, err)
+	}
+}
+
+// The client receipt store lives beside the existing receipts table. Importing
+// ordinary adapter receipts and recording a client receipt in the same store
+// must not change either count: existing calls stay intact.
+func TestClientReceiptsCoexistWithImportedReceipts(t *testing.T) {
+	d := newReceiptDB(t)
+	seedReceiptObligation(t, d, "coexist")
+	path := writeReceiptsFile(t, receiptLine("coexist", 1, "posted")+"\n")
+	if _, err := d.ImportReceipts(path); err != nil {
+		t.Fatalf("ImportReceipts: %v", err)
+	}
+	if _, err := d.RecordClientReceipt(ClientReceipt{
+		ClientRequestID: "req-coexist",
+		ReceiptJSON:     []byte(`{"kind":"ack"}`),
+		IntentCommitted: true,
+	}); err != nil {
+		t.Fatalf("RecordClientReceipt: %v", err)
+	}
+	receipts, err := d.ReceiptCount()
+	if err != nil || receipts != 1 {
+		t.Fatalf("ReceiptCount = %d, %v; want 1", receipts, err)
+	}
+	clientReceipts, err := d.ClientReceiptCount()
+	if err != nil || clientReceipts != 1 {
+		t.Fatalf("ClientReceiptCount = %d, %v; want 1", clientReceipts, err)
+	}
+}
