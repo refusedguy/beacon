@@ -776,8 +776,10 @@ func isFailedCheck(c domain.Check) bool {
 	if failureConclusions[c.Conclusion] {
 		return true
 	}
+	// A cancelled check has no passing conclusion. The verdict side treats both
+	// spellings as failures, so get_result must report them too (T3.402).
 	switch c.State {
-	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE":
+	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "CANCELLED", "CANCELED":
 		return true
 	}
 	return false
