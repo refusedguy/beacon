@@ -1874,3 +1874,400 @@ func TestOutputSchemaWaitReasonOutputAdmitsReason(t *testing.T) {
 		}
 	}
 }
+
+// ---- ADR 0059 feature 1 / T3.134: agent_acp_wait вместо polling ----
+
+// acpWaitAnswer is the reply of one goroutine running a blocking wait.
+type acpWaitAnswer struct {
+	out ACPWaitResult
+	err error
+}
+
+// acpWaitTestStore is a counting acpTaskStore over the real T3.122 store. The
+// counter proves that a blocked wait reads task state only at entry and after
+// the event, never on a timer.
+type acpWaitTestStore struct {
+	real      *ProtocolTaskStore
+	gets      atomic.Int64
+	getCalled chan struct{}
+}
+
+func newACPWaitTestStore() *acpWaitTestStore {
+	return &acpWaitTestStore{
+		real:      NewProtocolTaskStore(waitTestClock{at: time.Date(2026, 11, 20, 15, 0, 0, 0, time.UTC)}),
+		getCalled: make(chan struct{}, 32),
+	}
+}
+
+func (s *acpWaitTestStore) Start(ttlMs, pollIntervalMs int64) (TaskResult, error) {
+	return s.real.Start(ttlMs, pollIntervalMs)
+}
+
+func (s *acpWaitTestStore) Get(taskID string) (TaskResult, error) {
+	s.gets.Add(1)
+	select {
+	case s.getCalled <- struct{}{}:
+	default:
+	}
+	return s.real.Get(taskID)
+}
+
+func (s *acpWaitTestStore) Update(taskID string, patch TaskPatch) (ProtocolTask, error) {
+	return s.real.Update(taskID, patch)
+}
+
+// startACPWaitTask starts a working task and returns its handle.
+func startACPWaitTask(t *testing.T, store *acpWaitTestStore) string {
+	t.Helper()
+	started, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if started.ResultType != TaskResultType || started.TaskID == "" {
+		t.Fatalf("start result = %+v, want a task handle", started)
+	}
+	return started.TaskID
+}
+
+// awaitEntryReads consumes the two state reads a parked wait performs at entry.
+func awaitEntryReads(t *testing.T, store *acpWaitTestStore) {
+	t.Helper()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-store.getCalled:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("wait did not perform entry read %d", i+1)
+		}
+	}
+}
+
+// TestACPWaitBlocksUntilCompleted is the core ADR 0059 feature 1 check. The
+// wait parks on the task, publishes no periodic read, and returns the handle
+// only after the task completes. There is no timeout on this path.
+func TestACPWaitBlocksUntilCompleted(t *testing.T) {
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+
+	done := make(chan acpWaitAnswer, 1)
+	go func() {
+		out, err := svc.Wait(context.Background(), taskID)
+		done <- acpWaitAnswer{out, err}
+	}()
+
+	awaitEntryReads(t, store)
+	before := store.gets.Load()
+	select {
+	case got := <-done:
+		t.Fatalf("wait returned before the task settled: %+v", got)
+	case <-time.After(80 * time.Millisecond):
+	}
+	if after := store.gets.Load(); after != before {
+		t.Fatalf("blocked wait read task state %d more times, want 0 (no polling)", after-before)
+	}
+
+	result := json.RawMessage(`{"status":"merged"}`)
+	if _, err := svc.Complete(taskID, result); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Wait: %v", got.err)
+		}
+		if got.out.TaskHandle != taskID {
+			t.Errorf("taskHandle = %q, want %q", got.out.TaskHandle, taskID)
+		}
+		if got.out.Outcome != ACPWaitCompleted {
+			t.Errorf("outcome = %q, want completed", got.out.Outcome)
+		}
+		if got.out.Task.Status != TaskStateCompleted || got.out.Task.ResultType != taskResultTypeComplete {
+			t.Errorf("task = %+v, want completed protocol task", got.out.Task)
+		}
+		if string(got.out.Task.Result) != string(result) {
+			t.Errorf("result = %s, want %s", got.out.Task.Result, result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not return after the task completed")
+	}
+	if after := store.gets.Load(); after != before+1 {
+		t.Errorf("reads after the event = %d, want one final read", after-before)
+	}
+}
+
+// TestACPWaitBlocksUntilInputRequired proves a confirmation request is the
+// other event that releases a wait. The input request reaches the caller on
+// the settled task with the same handle.
+func TestACPWaitBlocksUntilInputRequired(t *testing.T) {
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+
+	done := make(chan acpWaitAnswer, 1)
+	go func() {
+		out, err := svc.Wait(context.Background(), taskID)
+		done <- acpWaitAnswer{out, err}
+	}()
+	awaitEntryReads(t, store)
+
+	requests := json.RawMessage(`[{"id":"q1","question":"approve?"}]`)
+	if _, err := svc.AskInput(taskID, requests); err != nil {
+		t.Fatalf("AskInput: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Wait: %v", got.err)
+		}
+		if got.out.TaskHandle != taskID || got.out.Outcome != ACPWaitInputRequired {
+			t.Fatalf("result = %+v, want handle/%s", got.out, ACPWaitInputRequired)
+		}
+		if got.out.Task.Status != TaskStateInputRequired {
+			t.Errorf("status = %q, want input_required", got.out.Task.Status)
+		}
+		if string(got.out.Task.InputRequests) != string(requests) {
+			t.Errorf("inputRequests = %s, want %s", got.out.Task.InputRequests, requests)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not return after the confirmation request")
+	}
+}
+
+// TestACPWaitWorkingUpdateDoesNotRelease proves a mere progress notification
+// is not a task event that ends the wait. T3.102 event filters are not part of
+// this tool: only the task's settled state releases it.
+func TestACPWaitWorkingUpdateDoesNotRelease(t *testing.T) {
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+
+	done := make(chan acpWaitAnswer, 1)
+	go func() {
+		out, err := svc.Wait(context.Background(), taskID)
+		done <- acpWaitAnswer{out, err}
+	}()
+	awaitEntryReads(t, store)
+
+	if _, err := svc.Update(taskID, TaskPatch{Status: TaskStateWorking, StatusMessage: "half done"}); err != nil {
+		t.Fatalf("Update working: %v", err)
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("working tick released the wait: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if _, err := svc.Complete(taskID, json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil || got.out.Outcome != ACPWaitCompleted {
+			t.Fatalf("result = %+v, err = %v, want completed", got.out, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not return after completion")
+	}
+}
+
+// TestACPWaitAlreadySettledReturnsWithoutParking proves an event that landed
+// before the call is delivered on the entry read, with no subscription.
+func TestACPWaitAlreadySettledReturnsWithoutParking(t *testing.T) {
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+	if _, err := svc.Complete(taskID, json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	out, err := svc.Wait(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if out.TaskHandle != taskID || out.Outcome != ACPWaitCompleted || out.Task.Status != TaskStateCompleted {
+		t.Errorf("result = %+v, want handle/completed", out)
+	}
+	if got := store.gets.Load(); got != 1 {
+		t.Errorf("entry reads = %d, want 1 with no parking", got)
+	}
+}
+
+// TestACPWaitBroadcastsToAllWaiters proves one task event releases every
+// caller blocked on the same handle, each with its own copy of the response.
+func TestACPWaitBroadcastsToAllWaiters(t *testing.T) {
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+
+	const waiters = 3
+	done := make(chan acpWaitAnswer, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			out, err := svc.Wait(context.Background(), taskID)
+			done <- acpWaitAnswer{out, err}
+		}()
+	}
+	awaitEntryReads(t, store)
+	// Every waiter registers on the same broadcast point; they need not each
+	// perform their entry reads at the same instant.
+	deadline := time.Now().Add(2 * time.Second)
+	for store.gets.Load() < 2*waiters && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+
+	if _, err := svc.Complete(taskID, json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < waiters; i++ {
+		select {
+		case got := <-done:
+			if got.err != nil || got.out.TaskHandle != taskID || got.out.Outcome != ACPWaitCompleted {
+				t.Errorf("waiter %d = %+v, err = %v", i, got.out, got.err)
+			}
+			seen[got.out.Task.TaskID] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d waiters returned", i, waiters)
+		}
+	}
+	if len(seen) != 1 || !seen[taskID] {
+		t.Errorf("waiters saw task ids %v, want only %q", seen, taskID)
+	}
+}
+
+// TestACPWaitContextEndReleasesWithoutEvent proves the caller's context is the
+// only other wakeup. The wait ends with CodeCancelled and leaves the task
+// working, so a later event has nothing to release.
+func TestACPWaitContextEndReleasesWithoutEvent(t *testing.T) {
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan acpWaitAnswer, 1)
+	go func() {
+		out, err := svc.Wait(ctx, taskID)
+		done <- acpWaitAnswer{out, err}
+	}()
+	awaitEntryReads(t, store)
+	cancel()
+
+	select {
+	case got := <-done:
+		assertCode(t, got.err, domain.CodeCancelled)
+		if !strings.Contains(got.err.Error(), "context canceled") {
+			t.Errorf("error %q does not carry the context cause", got.err)
+		}
+		if got.out.TaskHandle != "" || got.out.Outcome != "" {
+			t.Errorf("cancelled wait returned a result: %+v", got.out)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("context cancellation did not release the wait")
+	}
+	before := store.gets.Load()
+	time.Sleep(30 * time.Millisecond)
+	if after := store.gets.Load(); after != before {
+		t.Errorf("cancelled wait read task state %d more times", after-before)
+	}
+}
+
+// TestACPWaitFailedAndCancelledReportOutcome covers the two remaining terminal
+// states. They settle a task just like completion and carry no result payload.
+func TestACPWaitFailedAndCancelledReportOutcome(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  TaskState
+		outcome ACPWaitOutcome
+	}{
+		{"failed", TaskStateFailed, ACPWaitFailed},
+		{"cancelled", TaskStateCancelled, ACPWaitCancelled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newACPWaitTestStore()
+			taskID := startACPWaitTask(t, store)
+			svc := NewACPWaitService(store)
+			if _, err := svc.Update(taskID, TaskPatch{Status: tc.status, StatusMessage: tc.name}); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+			out, err := svc.Wait(context.Background(), taskID)
+			if err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+			if out.Outcome != tc.outcome || out.Task.Status != tc.status || out.TaskHandle != taskID {
+				t.Errorf("result = %+v, want handle/%s", out, tc.outcome)
+			}
+		})
+	}
+}
+
+// TestACPWaitUnknownHandleRejected keeps an unissued handle an error. The wait
+// reads the task once and never registers a waiter for it.
+func TestACPWaitUnknownHandleRejected(t *testing.T) {
+	store := newACPWaitTestStore()
+	svc := NewACPWaitService(store)
+	_, err := svc.Wait(context.Background(), "task-never-issued")
+	assertCode(t, err, domain.CodeWatchNotFound)
+	if got := store.gets.Load(); got != 1 {
+		t.Errorf("reads = %d, want 1 for an unknown handle", got)
+	}
+	if _, err := svc.Wait(context.Background(), ""); err == nil {
+		t.Error("empty task handle was accepted")
+	}
+}
+
+// TestACPWaitHandleAdaptsToMCP proves the typed handler returns the task handle
+// and the derived schemas admit the new fields. The tool name is fixed so a
+// client can call agent_acp_wait.
+func TestACPWaitHandleAdaptsToMCP(t *testing.T) {
+	if ACPWaitMethod != "agent_acp_wait" {
+		t.Fatalf("tool name = %q, want agent_acp_wait", ACPWaitMethod)
+	}
+	store := newACPWaitTestStore()
+	taskID := startACPWaitTask(t, store)
+	svc := NewACPWaitService(store)
+	if _, err := svc.Complete(taskID, json.RawMessage(`{"ok":true}`)); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	result, out, err := svc.Handle(context.Background(), nil, ACPWaitInput{TaskID: taskID})
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if result == nil || result.IsError {
+		t.Fatalf("agent_acp_wait returned an error result: %#v", result)
+	}
+	if out.TaskHandle != taskID || out.Outcome != ACPWaitCompleted {
+		t.Fatalf("handler result = %+v", out)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, field := range []string{"taskHandle", "outcome", "task"} {
+		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Errorf("response has no %q field: %s", field, raw)
+		}
+	}
+
+	inSchema, err := jsonschema.For[ACPWaitInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	inRaw, err := json.Marshal(inSchema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	if !bytes.Contains(inRaw, []byte(`"taskId"`)) {
+		t.Errorf("input schema has no taskId property: %s", inRaw)
+	}
+	outSchema, err := OutputSchema[ACPWaitResult]()
+	if err != nil {
+		t.Fatalf("output schema: %v", err)
+	}
+	for _, name := range []string{"taskHandle", "outcome", "task"} {
+		if _, ok := outSchema.Properties[name]; !ok {
+			t.Errorf("ACPWaitResult schema missing property %q", name)
+		}
+	}
+}
