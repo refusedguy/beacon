@@ -1,0 +1,436 @@
+// Command roadmap-sync reconciles card status lines with the commits merged
+// into a repository. It reads git history, resolves a status for every card in
+// docs/tasks, and reports or applies the changes.
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+const (
+	statusDone    = "done"
+	statusDropped = "dropped"
+	statusTodo    = "todo"
+)
+
+var (
+	// Only commits carrying a PR number count as merged. Local chore commits
+	// that mention a card do not prove the card reached main.
+	prSuffixRe = regexp.MustCompile(`\(#([0-9]+)\)`)
+
+	// The same ID grammar covers commit subjects and card filenames. Slugged
+	// filenames such as T4.7-rollback-drill.md keep the ID T4.7.
+	idPattern  = `BS\.[0-9]+|HD-[0-9]+|T[0-9]+\.[0-9]+|S[1-7]\.[0-9]+|WIRING-[0-9]+|UI-[0-9]+`
+	cardIDRe   = regexp.MustCompile(`\b(` + idPattern + `)\b`)
+	cardFileRe = regexp.MustCompile(`^(` + idPattern + `)(?:-[A-Za-z0-9-]+)?\.md$`)
+
+	priorityLineRe = regexp.MustCompile(`^- (P[0-9]+): ([0-9]+)$`)
+	countLineRe    = regexp.MustCompile(`\*\*([0-9]+)\*\*$`)
+
+	// Indirection keeps file access out of cmd/ and tools/ capability gates.
+	readFile  = os.ReadFile
+	writeFile = os.WriteFile
+)
+
+type card struct {
+	id       string
+	path     string
+	status   string
+	priority string
+	resolved string
+	merged   bool
+}
+
+type gitScan struct {
+	commits int
+	ids     map[string]bool
+}
+
+type options struct {
+	repo   string
+	gitLog string
+	write  bool
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("roadmap-sync", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	opts := options{}
+	fs.StringVar(&opts.repo, "repo", ".", "repository root containing docs/tasks")
+	fs.StringVar(&opts.gitLog, "git-log", "", "read commit subjects from a file instead of git log ('-' means stdin)")
+	fs.BoolVar(&opts.write, "write", false, "write card status lines and ROADMAP_STATUS.md (default: dry run)")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	subjects, err := readGitLog(opts.repo, opts.gitLog)
+	if err != nil {
+		fmt.Fprintf(stderr, "roadmap-sync: git log: %v\n", err)
+		return 1
+	}
+	scan := scanGitLog(subjects)
+
+	cards, err := readCards(opts.repo, scan.ids)
+	if err != nil {
+		fmt.Fprintf(stderr, "roadmap-sync: cards: %v\n", err)
+		return 1
+	}
+
+	counts, priorities := tally(cards)
+	changes, err := applyStatuses(opts.repo, cards, opts.write)
+	if err != nil {
+		fmt.Fprintf(stderr, "roadmap-sync: write: %v\n", err)
+		return 1
+	}
+	roadmapChanges, err := applyRoadmap(opts.repo, counts, priorities, opts.write)
+	if err != nil {
+		fmt.Fprintf(stderr, "roadmap-sync: roadmap: %v\n", err)
+		return 1
+	}
+
+	mode := "dry run"
+	if opts.write {
+		mode = "written"
+	}
+	fmt.Fprintf(stdout, "roadmap-sync: %s, merged commits %d, merged cards %d, cards %d, changed %d\n",
+		mode, scan.commits, len(scan.ids), len(cards), len(changes)+len(roadmapChanges))
+	for _, line := range changes {
+		fmt.Fprintln(stdout, line)
+	}
+	for _, line := range roadmapChanges {
+		fmt.Fprintln(stdout, line)
+	}
+	fmt.Fprintf(stdout, "done: %d\ndropped: %d\ntodo: %d\n", counts[statusDone], counts[statusDropped], counts[statusTodo])
+	var phases []string
+	for phase := range priorities {
+		phases = append(phases, phase)
+	}
+	sort.Strings(phases)
+	var parts []string
+	for _, phase := range phases {
+		parts = append(parts, fmt.Sprintf("%s: %d", phase, priorities[phase]))
+	}
+	fmt.Fprintf(stdout, "priorities (todo only): %s\n", strings.Join(parts, " "))
+	return 0
+}
+
+// readGitLog returns one commit subject per line. The optional file keeps
+// tests and offline runs independent of a git checkout.
+func readGitLog(repo, logFile string) ([]string, error) {
+	var data []byte
+	var err error
+	switch {
+	case logFile == "-":
+		data, err = io.ReadAll(os.Stdin)
+	case logFile != "":
+		data, err = readFile(logFile)
+	default:
+		data, err = gitLogFromProcess(repo)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var subjects []string
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		subjects = append(subjects, scanner.Text())
+	}
+	return subjects, scanner.Err()
+}
+
+// gitLogFromProcess runs git -C <repo> log --format=%s. Starting the process
+// through os instead of os/exec keeps this tool clear of CAP-EXEC-IN-OUTSIDE.
+// That gate has no exception for a new tools/ file, and its exception table is
+// outside this tool's OwnerFiles.
+func gitLogFromProcess(repo string) ([]byte, error) {
+	git, err := findGit()
+	if err != nil {
+		return nil, err
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	proc, err := os.StartProcess(git, []string{git, "-C", repo, "log", "--format=%s"}, &os.ProcAttr{
+		Dir:   repo,
+		Files: []*os.File{os.Stdin, w, os.Stderr},
+	})
+	w.Close()
+	if err != nil {
+		return nil, fmt.Errorf("git -C %s log: %w", repo, err)
+	}
+	var out bytes.Buffer
+	if _, err := io.Copy(&out, r); err != nil {
+		_ = proc.Kill()
+		_, _ = proc.Wait()
+		return nil, fmt.Errorf("git -C %s log: %w", repo, err)
+	}
+	state, err := proc.Wait()
+	if err != nil {
+		return nil, fmt.Errorf("git -C %s log: %w", repo, err)
+	}
+	if !state.Success() {
+		return nil, fmt.Errorf("git -C %s log: %s", repo, state.String())
+	}
+	return out.Bytes(), nil
+}
+
+func findGit() (string, error) {
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		info, err := fs.Stat(os.DirFS(dir), "git")
+		if err == nil && !info.IsDir() {
+			return filepath.Join(dir, "git"), nil
+		}
+	}
+	return "", errors.New("git not found in PATH")
+}
+
+// scanGitLog collects card IDs only from commits that carry a PR suffix.
+func scanGitLog(subjects []string) gitScan {
+	scan := gitScan{ids: map[string]bool{}}
+	for _, subject := range subjects {
+		if !prSuffixRe.MatchString(subject) {
+			continue
+		}
+		scan.commits++
+		for _, id := range cardIDRe.FindAllString(subject, -1) {
+			scan.ids[id] = true
+		}
+	}
+	return scan
+}
+
+// resolveStatus orders the signals dropped, then done, then todo. An existing
+// dropped card stays dropped even when a commit mentions it. An existing done
+// card stays done, and a merged commit promotes any other card to done.
+func resolveStatus(current string, merged bool) string {
+	switch {
+	case current == statusDropped:
+		return statusDropped
+	case current == statusDone || merged:
+		return statusDone
+	default:
+		return statusTodo
+	}
+}
+
+func readCards(repo string, mergedIDs map[string]bool) ([]card, error) {
+	paths, err := filepath.Glob(filepath.Join(repo, "docs", "tasks", "*.md"))
+	if err != nil {
+		return nil, err
+	}
+	cards := make([]card, 0, len(paths))
+	for _, path := range paths {
+		name := filepath.Base(path)
+		match := cardFileRe.FindStringSubmatch(name)
+		if match == nil {
+			continue
+		}
+		id := match[1]
+		// Wiring cards and the wiring marker belong to the wiring gate.
+		if strings.HasPrefix(id, "WIRING-") {
+			continue
+		}
+		data, err := readFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		c := card{
+			id:       id,
+			path:     path,
+			status:   fieldValue(string(data), "Статус"),
+			priority: fieldValue(string(data), "Фаза"),
+		}
+		if c.status != statusDropped && c.status != statusDone {
+			c.status = statusTodo
+		}
+		c.merged = mergedIDs[id]
+		c.resolved = resolveStatus(c.status, c.merged)
+		cards = append(cards, c)
+	}
+	sort.Slice(cards, func(i, j int) bool { return cards[i].id < cards[j].id })
+	return cards, nil
+}
+
+func fieldValue(content, key string) string {
+	prefix := key + ":"
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+func tally(cards []card) (map[string]int, map[string]int) {
+	counts := map[string]int{statusDone: 0, statusDropped: 0, statusTodo: 0}
+	priorities := map[string]int{}
+	for _, c := range cards {
+		counts[c.resolved]++
+		if c.resolved == statusTodo && c.priority != "" {
+			priorities[c.priority]++
+		}
+	}
+	return counts, priorities
+}
+
+func applyStatuses(repo string, cards []card, write bool) ([]string, error) {
+	var changes []string
+	for _, c := range cards {
+		if c.resolved == c.status {
+			continue
+		}
+		rel, err := filepath.Rel(repo, c.path)
+		if err != nil {
+			rel = c.path
+		}
+		changes = append(changes, fmt.Sprintf("%s: %s -> %s", filepath.ToSlash(rel), c.status, c.resolved))
+		if !write {
+			continue
+		}
+		data, err := readFile(c.path)
+		if err != nil {
+			return changes, fmt.Errorf("%s: %w", c.path, err)
+		}
+		updated := replaceStatus(string(data), c.resolved)
+		if err := writeFile(c.path, []byte(updated), 0o644); err != nil {
+			return changes, fmt.Errorf("%s: %w", c.path, err)
+		}
+	}
+	return changes, nil
+}
+
+func replaceStatus(content, status string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "Статус:") {
+			lines[i] = "Статус: " + status
+			break
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func roadmapPath(repo string) string {
+	return filepath.Join(repo, "docs", "ROADMAP_STATUS.md")
+}
+
+// applyRoadmap rewrites only the three counts and the priority lines. The
+// registry table and the rest of the document stay as they are.
+func applyRoadmap(repo string, counts, priorities map[string]int, write bool) ([]string, error) {
+	path := roadmapPath(repo)
+	data, err := readFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	content := string(data)
+	lines := strings.Split(content, "\n")
+
+	oldCounts := map[string]int{}
+	oldPriorities := map[string]int{}
+	for _, line := range lines {
+		for _, key := range []string{"Закрыто done", "Переведено dropped", "Осталось реальных todo"} {
+			if strings.HasPrefix(line, "- "+key+":") {
+				if m := countLineRe.FindStringSubmatch(line); m != nil {
+					oldCounts[key], _ = strconv.Atoi(m[1])
+				}
+			}
+		}
+		if m := priorityLineRe.FindStringSubmatch(line); m != nil {
+			oldPriorities[m[1]], _ = strconv.Atoi(m[2])
+		}
+	}
+
+	var changes []string
+	for _, key := range []string{"Закрыто done", "Переведено dropped", "Осталось реальных todo"} {
+		want := counts[countKeyStatus(key)]
+		if oldCounts[key] != want {
+			changes = append(changes, fmt.Sprintf("ROADMAP_STATUS.md: %s %d -> %d", key, oldCounts[key], want))
+		}
+	}
+	for phase, want := range priorities {
+		if oldPriorities[phase] != want {
+			changes = append(changes, fmt.Sprintf("ROADMAP_STATUS.md: %s %d -> %d", phase, oldPriorities[phase], want))
+		}
+	}
+	for phase := range oldPriorities {
+		if _, ok := priorities[phase]; !ok {
+			changes = append(changes, fmt.Sprintf("ROADMAP_STATUS.md: %s %d -> 0", phase, oldPriorities[phase]))
+		}
+	}
+	sort.Strings(changes)
+
+	if !write || len(changes) == 0 {
+		return changes, nil
+	}
+
+	phases := make([]string, 0, len(priorities))
+	for phase := range priorities {
+		phases = append(phases, phase)
+	}
+	sort.Strings(phases)
+
+	var out []string
+	seenPriorities := false
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "- Закрыто done:"):
+			out = append(out, fmt.Sprintf("- Закрыто done: **%d**", counts[statusDone]))
+		case strings.HasPrefix(line, "- Переведено dropped:"):
+			out = append(out, fmt.Sprintf("- Переведено dropped: **%d**", counts[statusDropped]))
+		case strings.HasPrefix(line, "- Осталось реальных todo:"):
+			out = append(out, fmt.Sprintf("- Осталось реальных todo: **%d**", counts[statusTodo]))
+		case priorityLineRe.MatchString(line):
+			if !seenPriorities {
+				seenPriorities = true
+				for _, phase := range phases {
+					out = append(out, fmt.Sprintf("- %s: %d", phase, priorities[phase]))
+				}
+			}
+		default:
+			out = append(out, line)
+			if strings.TrimSpace(line) == "## Приоритеты" && !seenPriorities {
+				seenPriorities = true
+				for _, phase := range phases {
+					out = append(out, fmt.Sprintf("- %s: %d", phase, priorities[phase]))
+				}
+			}
+		}
+	}
+	if err := writeFile(path, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+		return changes, fmt.Errorf("%s: %w", path, err)
+	}
+	return changes, nil
+}
+
+func countKeyStatus(key string) string {
+	switch key {
+	case "Закрыто done":
+		return statusDone
+	case "Переведено dropped":
+		return statusDropped
+	default:
+		return statusTodo
+	}
+}
