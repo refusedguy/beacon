@@ -1,10 +1,10 @@
-# BS.10. ADR 0188-0190 документация ядра
+# BS.10. ADR 0262-0264 документация ядра
 Статус: todo
 Фаза: P0
 Тип: doc
-Владелец файлов: docs/adrs/0188-server-owner.md, docs/adrs/0189-mcp-boundary.md, docs/adrs/0190-transaction.md
+Владелец файлов: docs/adrs/0262-server-owner.md, docs/adrs/0263-mcp-boundary.md, docs/adrs/0264-transaction.md
 Зависимости: 
-Ссылка: ADR 0188
+Ссылка: ADR 262
 Агент: нет
 Время: нет
 Цель: Зафиксировать три базовых решения.
