@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
@@ -41,6 +42,67 @@ var spawnSessionSpawner sessionSpawner
 // dereferencing nil. T3.145 calls this with the T3.144 HTTP client.
 func SetSessionSpawner(s sessionSpawner) {
 	spawnSessionSpawner = s
+}
+
+// spawnSessionRegistry is the durable session registry used by beacon spawn.
+// It stays nil until the composition root or a test installs one. A session is
+// recorded when it starts, through the app layer's SessionStore port, so cmd
+// never opens a database connection for sessions on its own.
+var spawnSessionRegistry *session.SessionRegistry
+
+// SetSessionRegistry installs the session registry used by beacon spawn. A nil
+// value clears it. Tests pass a registry backed by a mock store to assert the
+// SaveSession call at session start.
+func SetSessionRegistry(r *session.SessionRegistry) { spawnSessionRegistry = r }
+
+var (
+	spawnSessionOnce sync.Once
+	spawnSessionDB   *session.SessionRegistry
+)
+
+// defaultSessionRegistry opens the same state file the runtime_stats sink
+// uses and adapts the store to the app port. The lazy open keeps a plain
+// `beacon spawn` connected without a change to main.go, and a failed open
+// leaves the registry nil so the command still starts its session.
+func defaultSessionRegistry() *session.SessionRegistry {
+	spawnSessionOnce.Do(func() {
+		dir, err := stateDir()
+		if err != nil {
+			return
+		}
+		db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+		if err == nil {
+			spawnSessionDB = session.NewSessionRegistry(db)
+		}
+	})
+	return spawnSessionDB
+}
+
+// sessionRegistryForSpawn returns the installed registry, or the lazy default
+// when none was installed.
+func sessionRegistryForSpawn() *session.SessionRegistry {
+	if spawnSessionRegistry != nil {
+		return spawnSessionRegistry
+	}
+	return defaultSessionRegistry()
+}
+
+// recordSpawnSession writes the new session to the durable registry. A failed
+// write is reported on stderr and does not fail the command: the session is
+// already alive, so returning an error here would suggest the spawn did not
+// happen. The next spawn can repair the registry entry.
+func recordSpawnSession(c *CLI, id, taskID, title string) {
+	reg := sessionRegistryForSpawn()
+	if reg == nil {
+		return
+	}
+	metadata := map[string]string{spawnMetaTaskID: taskID}
+	if title != "" {
+		metadata[spawnMetaTitle] = title
+	}
+	if err := reg.Start(id, store.SessionStatusActive, metadata); err != nil {
+		fmt.Fprintf(c.errOut, "beacon spawn: сессия %s не записана в реестр: %v\n", id, err)
+	}
 }
 
 // Metadata keys on the created session. beacon watch already joins a session
@@ -132,6 +194,8 @@ func (c *CLI) runSpawn(args []string) int {
 		fmt.Fprintf(c.errOut, "beacon spawn: сессия %s создана, но промпт не отправлен: %v\n", sessionID, err)
 		return 2
 	}
+
+	recordSpawnSession(c, sessionID, taskID, sessionTitle)
 
 	fmt.Fprintln(c.out, sessionID)
 	return 0
@@ -317,6 +381,9 @@ func (c *CLI) runSpawnACP(taskID, title, runner string) int {
 		fmt.Fprintln(c.errOut, "beacon spawn: ACP session/new вернул пустой sessionID")
 		return 2
 	}
+
+	recordSpawnSession(c, sessionID, taskID, title)
+
 	fmt.Fprintln(c.out, sessionID)
 
 	streamDone := make(chan struct{})
