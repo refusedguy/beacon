@@ -179,6 +179,37 @@ func TestLoadProjectConfigIsAStub(t *testing.T) {
 	}
 }
 
+func TestValidateWakeTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		target  string
+		wantErr bool
+	}{
+		{name: "session id", target: "ses_abc123"},
+		{name: "explicit configured session", target: "ses_orchestrator_1"},
+		{name: "service name is not a session", target: "beacon-ci-checkall", wantErr: true},
+		{name: "empty", target: "", wantErr: true},
+		{name: "prefix only", target: "ses_", wantErr: true},
+		{name: "wrong prefix", target: "ses-abc123", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateWakeTarget(tc.target)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ValidateWakeTarget(%q) accepted an invalid target", tc.target)
+				}
+				if !strings.Contains(err.Error(), "ses_") {
+					t.Fatalf("error %q must name the required prefix", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateWakeTarget(%q) = %v, want nil", tc.target, err)
+			}
+		})
+	}
+}
+
 type publishCall struct {
 	ref     WatchRef
 	verdict Verdict

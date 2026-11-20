@@ -6,11 +6,26 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"text/tabwriter"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+)
+
+const (
+	// ciWakeTargetEnv is the explicit session for a daemon that has no MCP
+	// caller metadata. It wins over ciParentSessionEnv.
+	ciWakeTargetEnv = "BEACON_WAKE_TARGET"
+	// ciParentSessionEnv carries the orchestrator session id injected by
+	// `beacon spawn` into child processes.
+	ciParentSessionEnv = "BEACON_PARENT_SESSION"
+	// ciSessionMetaKey is the wire key watch_pr reads to derive the subscriber
+	// id. Synthesizing it keeps the CLI on the same path as an MCP caller.
+	ciSessionMetaKey = "ai.opencode/sessionID"
 )
 
 // defaultCIRepo is used when --repo is absent. The project config hook will
@@ -36,6 +51,7 @@ func runCI(c *CLI, args []string) int {
 	dryRun := fs.Bool("dry-run", false, "только показать план, не менять Watch")
 	repo := fs.String("repo", defaultCIRepo, "slug репозитория для Watch")
 	format := fs.String("format", "table", "формат вывода: table или json")
+	wakeTargetFlag := fs.String("wake-target", "", "sessionID OpenCode для wake оркестратора")
 	if !parseFlags("ci check", args[1:], c.errOut, fs) {
 		return 2
 	}
@@ -47,6 +63,11 @@ func runCI(c *CLI, args []string) int {
 	if *format != "table" && *format != "json" {
 		fmt.Fprintf(c.errOut, "beacon ci check: неизвестный формат %q, ожидается table или json\n", *format)
 		writeUsage(c.errOut)
+		return 2
+	}
+	wakeTarget, err := ciWakeTarget(*wakeTargetFlag)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "%v\n", err)
 		return 2
 	}
 
@@ -72,40 +93,24 @@ func runCI(c *CLI, args []string) int {
 	}
 
 	// The MCP watch_pr handler owns domain.Fanout. Reusing its Register keeps
-	// the alias, obligation and subscriber invariants when a Watch is missing;
-	// this command only passes the orchestrator role and a stable notify target.
+	// the alias, obligation and subscriber invariants when a Watch is missing.
+	// The wake target is a real OpenCode session, so the subscriber the handler
+	// derives can receive a wake without an HTTP 400.
 	watchHandler := mcp.NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
-	registry := orchestrator.FuncRegistry{
-		FindFn: func(_ context.Context, pr orchestrator.PR) (orchestrator.WatchRef, bool, error) {
-			watches, err := deps.Store.ActiveWatches()
-			if err != nil {
-				return orchestrator.WatchRef{}, false, err
+	registry := ciWatchRegistry(func(_ context.Context, pr orchestrator.PR) (orchestrator.WatchRef, bool, error) {
+		watches, err := deps.Store.ActiveWatches()
+		if err != nil {
+			return orchestrator.WatchRef{}, false, err
+		}
+		for _, w := range watches {
+			if w.Repo == pr.Repo && w.PR == pr.Number && w.HeadSHA == pr.HeadSHA {
+				return orchestrator.WatchRef{
+					ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA, Revision: w.Revision,
+				}, true, nil
 			}
-			for _, w := range watches {
-				if w.Repo == pr.Repo && w.PR == pr.Number && w.HeadSHA == pr.HeadSHA {
-					return orchestrator.WatchRef{
-						ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA, Revision: w.Revision,
-					}, true, nil
-				}
-			}
-			return orchestrator.WatchRef{}, false, nil
-		},
-		RegisterFn: func(ctx context.Context, pr orchestrator.PR) (orchestrator.WatchRef, error) {
-			out, err := watchHandler.Register(ctx, nil, mcp.WatchPRInput{
-				Repo:    pr.Repo,
-				PR:      pr.Number,
-				HeadSHA: pr.HeadSHA,
-				Role:    "orchestrator",
-				Notify:  &mcp.WatchPRNotify{Adapter: "opencode", Target: "beacon-ci-checkall"},
-			})
-			if err != nil {
-				return orchestrator.WatchRef{}, err
-			}
-			return orchestrator.WatchRef{
-				ID: out.WatchID, Repo: pr.Repo, PR: pr.Number, HeadSHA: pr.HeadSHA, Revision: out.Revision,
-			}, nil
-		},
-	}
+		}
+		return orchestrator.WatchRef{}, false, nil
+	}, watchHandler, wakeTarget)
 
 	txWriter, ok := deps.Store.(orchestrator.TxWriter)
 	if !ok {
@@ -134,6 +139,57 @@ func runCI(c *CLI, args []string) int {
 	}
 	renderCITable(c.out, summary)
 	return 0
+}
+
+// ciWakeTarget resolves the orchestrator session that receives wakes. A CLI
+// call has no MCP _meta, so an explicit flag or an environment value supplies
+// the same session id an MCP caller would send in the request metadata.
+func ciWakeTarget(explicit string) (string, error) {
+	target := strings.TrimSpace(explicit)
+	if target == "" {
+		target = strings.TrimSpace(os.Getenv(ciWakeTargetEnv))
+	}
+	if target == "" {
+		target = strings.TrimSpace(os.Getenv(ciParentSessionEnv))
+	}
+	if err := orchestrator.ValidateWakeTarget(target); err != nil {
+		return "", fmt.Errorf("beacon ci check: %v; укажите --wake-target или %s", err, ciWakeTargetEnv)
+	}
+	return target, nil
+}
+
+// ciWatchRegistrar is the watch_pr registration surface used by the registry.
+// *mcp.WatchPRHandler satisfies it.
+type ciWatchRegistrar interface {
+	Register(context.Context, *mcpsdk.CallToolRequest, mcp.WatchPRInput) (mcp.WatchPROutput, error)
+}
+
+// ciWatchRegistry wires the checkall registry to watch_pr. It passes the wake
+// target both as the synthesized _meta session and as notify.target, so the
+// handler derives the subscriber id from a real session and persists the same
+// address for wake delivery.
+func ciWatchRegistry(find func(context.Context, orchestrator.PR) (orchestrator.WatchRef, bool, error), register ciWatchRegistrar, wakeTarget string) orchestrator.FuncRegistry {
+	return orchestrator.FuncRegistry{
+		FindFn: find,
+		RegisterFn: func(ctx context.Context, pr orchestrator.PR) (orchestrator.WatchRef, error) {
+			req := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+				Meta: mcpsdk.Meta{ciSessionMetaKey: wakeTarget},
+			}}
+			out, err := register.Register(ctx, req, mcp.WatchPRInput{
+				Repo:    pr.Repo,
+				PR:      pr.Number,
+				HeadSHA: pr.HeadSHA,
+				Role:    "orchestrator",
+				Notify:  &mcp.WatchPRNotify{Adapter: "opencode", Target: wakeTarget},
+			})
+			if err != nil {
+				return orchestrator.WatchRef{}, err
+			}
+			return orchestrator.WatchRef{
+				ID: out.WatchID, Repo: pr.Repo, PR: pr.Number, HeadSHA: pr.HeadSHA, Revision: out.Revision,
+			}, nil
+		},
+	}
 }
 
 func renderCITable(w io.Writer, summary orchestrator.Summary) {
