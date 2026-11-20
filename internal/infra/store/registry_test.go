@@ -93,6 +93,48 @@ func TestUpsertExecutorIdempotent(t *testing.T) {
 	}
 }
 
+func TestExecutorRuntimeRoundTrip(t *testing.T) {
+	d := newRegistryTestDB(t)
+	e := registryExecutor("project-a", "session-1")
+	e.Runtime = "subagent"
+	if _, err := d.UpsertExecutor(e); err != nil {
+		t.Fatalf("UpsertExecutor with runtime: %v", err)
+	}
+	stored, found, err := d.Executor("project-a", "session-1")
+	if err != nil {
+		t.Fatalf("Executor: %v", err)
+	}
+	if !found || stored.Runtime != "subagent" {
+		t.Fatalf("runtime = %q, found=%v, want %q", stored.Runtime, found, "subagent")
+	}
+
+	// A repeat upsert refreshes the runtime along with the other mutable fields.
+	e.Runtime = "opencode"
+	if _, err := d.UpsertExecutor(e); err != nil {
+		t.Fatalf("repeat UpsertExecutor: %v", err)
+	}
+	stored, found, err = d.Executor("project-a", "session-1")
+	if err != nil {
+		t.Fatalf("Executor after repeat: %v", err)
+	}
+	if !found || stored.Runtime != "opencode" {
+		t.Fatalf("runtime after repeat = %q, found=%v, want %q", stored.Runtime, found, "opencode")
+	}
+
+	// An omitted runtime is valid and reads back as the empty string.
+	e.Runtime = ""
+	if _, err := d.UpsertExecutor(e); err != nil {
+		t.Fatalf("UpsertExecutor with empty runtime: %v", err)
+	}
+	stored, found, err = d.Executor("project-a", "session-1")
+	if err != nil {
+		t.Fatalf("Executor after empty runtime: %v", err)
+	}
+	if !found || stored.Runtime != "" {
+		t.Fatalf("empty runtime = %q, found=%v", stored.Runtime, found)
+	}
+}
+
 func TestUpsertExecutorSeparateKeys(t *testing.T) {
 	d := newRegistryTestDB(t)
 
