@@ -15,6 +15,18 @@ import (
 	"strings"
 )
 
+// Report lines use a concise style (HD-039): space-separated fields, no label
+// prefix, no filler words, and words instead of arrows. Keeping the formats
+// here lets tests pin the exact output a caller sees.
+const (
+	checkReportFormat    = "valid=%d invalid=%d\n"
+	summaryReportFormat  = "batches=%d adrs=%d cards=%d evals=%d closures=%d\n"
+	mergeReportFormat    = "merged=%d held=%d\n"
+	renumberReportFormat = "renumber ADR %d to %d\n"
+	skipReportFormat     = "skip %s\n"
+	warnReportFormat     = "warn closure target missing: %s\n"
+)
+
 // Options mirrors the command line of cmd/batch-apply.
 type Options struct {
 	Dir       string
@@ -287,7 +299,7 @@ func (r *runner) applyClosures(root string, closures map[string]cardClosure) err
 		path := filepath.Join(root, rel)
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			r.errf("WARN closure target missing: %s\n", rel)
+			r.errf(warnReportFormat, rel)
 			continue
 		}
 		original := string(raw)
@@ -357,7 +369,7 @@ func (r *runner) applyMergePlan(decisions []mergeDecision) {
 		r.printf("PR %d: MERGED\n", d.PR)
 		merged++
 	}
-	r.printf("merge-plan: merged=%d held=%d\n", merged, held)
+	r.printf(mergeReportFormat, merged, held)
 }
 
 // Run executes the batch apply and returns the process exit code. All file
@@ -383,10 +395,10 @@ func Run(opts Options, out, errOut io.Writer) int {
 		return 0
 	}
 	for _, p := range problems {
-		r.errf("SKIP %s\n", p)
+		r.errf(skipReportFormat, p)
 	}
 	if opts.Check {
-		r.printf("check: valid=%d invalid=%d\n", len(batches), len(problems))
+		r.printf(checkReportFormat, len(batches), len(problems))
 		if len(problems) > 0 {
 			return 1
 		}
@@ -438,7 +450,7 @@ func Run(opts Options, out, errOut io.Writer) int {
 			nextFree++
 		}
 		if a.Number != nextFree && !r.opts.Quiet {
-			r.printf("renumber ADR %d -> %d\n", a.Number, nextFree)
+			r.printf(renumberReportFormat, a.Number, nextFree)
 		}
 		a.Number = nextFree
 		used[nextFree] = true
@@ -463,7 +475,7 @@ func Run(opts Options, out, errOut io.Writer) int {
 	}
 	sort.Strings(names)
 
-	r.printf("batches=%d adrs=%d cards=%d evals=%d closures=%d\n",
+	r.printf(summaryReportFormat,
 		len(batches), len(adrs), len(cards), len(evals), len(closures))
 	for _, n := range nums {
 		a := adrs[n]

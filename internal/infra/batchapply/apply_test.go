@@ -1,6 +1,7 @@
 package batchapply
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -182,5 +183,84 @@ func TestApplyClosuresWritesAndIsIdempotent(t *testing.T) {
 				t.Fatalf("reason appears %d times, want %d:\n%s", n, wantReasons, second)
 			}
 		})
+	}
+}
+
+// TestReportFormatContract pins the exact report lines batch-apply prints
+// (HD-039). Each line carries only fields in a fixed order. A label prefix,
+// trailing prose or an arrow for a word adds extra words and breaks the style.
+func TestReportFormatContract(t *testing.T) {
+	cases := []struct {
+		name   string
+		format string
+		args   []any
+		want   string
+	}{
+		{"check", checkReportFormat, []any{3, 1}, "valid=3 invalid=1\n"},
+		{"summary", summaryReportFormat, []any{2, 3, 4, 5, 6}, "batches=2 adrs=3 cards=4 evals=5 closures=6\n"},
+		{"merge", mergeReportFormat, []any{2, 1}, "merged=2 held=1\n"},
+		{"renumber", renumberReportFormat, []any{7, 265}, "renumber ADR 7 to 265\n"},
+		{"skip", skipReportFormat, []any{"bad.json: invalid JSON"}, "skip bad.json: invalid JSON\n"},
+		{"warn", warnReportFormat, []any{"docs/tasks/W5-42.md"}, "warn closure target missing: docs/tasks/W5-42.md\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := fmt.Sprintf(tc.format, tc.args...)
+			if got != tc.want {
+				t.Fatalf("report format changed: got %q, want %q", got, tc.want)
+			}
+			if verboseReport(got) {
+				t.Fatalf("report adds extra words: %q", got)
+			}
+		})
+	}
+
+	// Negative control: the old verbose lines carry labels, filler and an
+	// arrow. The style check must reject every one of them.
+	for _, old := range []string{
+		"check: valid=3 invalid=1 (1 skipped)\n",
+		"merge-plan: merged=2 held=1\n",
+		"renumber ADR 7 -> 265\n",
+		"SKIP bad.json: invalid JSON\n",
+		"WARN closure target missing: docs/tasks/W5-42.md\n",
+	} {
+		if !verboseReport(old) {
+			t.Fatalf("verbose report was not rejected: %q", old)
+		}
+	}
+}
+
+// verboseReport reports whether a line breaks the concise style from HD-039:
+// a label prefix, an arrow in place of a word, or prose in parentheses.
+func verboseReport(line string) bool {
+	line = strings.TrimSuffix(line, "\n")
+	for _, prefix := range []string{"check:", "merge-plan:", "SKIP ", "WARN "} {
+		if strings.HasPrefix(line, prefix) {
+			return true
+		}
+	}
+	return strings.Contains(line, "->") || strings.Contains(line, " (")
+}
+
+// TestCheckReportOutput proves the real Run path prints the concise report:
+// counts on stdout, the skipped file on stderr, and exit code 1 on bad input.
+func TestCheckReportOutput(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "good.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte(`{`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut strings.Builder
+	code := Run(Options{Dir: dir, Check: true}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if got, want := out.String(), "valid=1 invalid=1\n"; got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+	if got := errOut.String(); !strings.HasPrefix(got, "skip bad.json: invalid JSON") {
+		t.Fatalf("stderr = %q, want a concise skip line", got)
 	}
 }
