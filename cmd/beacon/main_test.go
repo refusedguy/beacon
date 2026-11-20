@@ -88,7 +88,7 @@ func TestT06ListJSONCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "spawn", "task", "watch", "what", "why"}
+	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "watch", "what", "why"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
 	}
@@ -142,7 +142,7 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 	if errOut.Len() != 0 {
 		t.Fatalf("stderr не пустой: %q", errOut.String())
 	}
-	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "list", "mcp", "spawn", "task", "watch", "what", "why"} {
+	for _, name := range []string{"agents", "attach", "build", "doctor", "gates", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "watch", "what", "why"} {
 		if !strings.Contains(out.String(), name) {
 			t.Fatalf("таблица не содержит %s: %q", name, out.String())
 		}
