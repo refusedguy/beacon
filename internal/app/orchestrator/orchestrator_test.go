@@ -19,11 +19,17 @@ type fakeStore struct {
 	merged       map[string]bool
 	closed       []string
 	fixAttempts  []string
+	holds        []holdCall
 	activeErr    error
 	wasMergedErr error
 	recordErr    error
 	closeErr     error
 	fixErr       error
+}
+
+type holdCall struct {
+	watchID string
+	verdict string
 }
 
 func newFakeStore(watches ...Watch) *fakeStore {
@@ -55,6 +61,11 @@ func (s *fakeStore) CloseWatch(_ context.Context, watchID string) error {
 func (s *fakeStore) RecordFixAttempt(_ context.Context, watchID string) error {
 	s.fixAttempts = append(s.fixAttempts, watchID)
 	return s.fixErr
+}
+
+func (s *fakeStore) HoldWatch(_ context.Context, watchID, verdict string) error {
+	s.holds = append(s.holds, holdCall{watchID, verdict})
+	return nil
 }
 
 type mergeCall struct {
@@ -394,11 +405,10 @@ func TestResolverSatisfiesDoneCardOnly(t *testing.T) {
 	}
 }
 
-func TestResolverSatisfiesMergedPR(t *testing.T) {
-	runner := &fakeRunner{out: map[string][]byte{
-		runnerKey("gh", "pr", "view", "77", "--json", "state"): []byte(`{"state":"MERGED"}`),
-	}}
-	r := NewDependencyResolver(runner)
+func TestResolverSatisfiesMergedPRWithoutGh(t *testing.T) {
+	runner := &fakeRunner{}
+	r := NewStoreDependencyResolver("docs/tasks", runner, MergedPRReaderFunc(
+		func(_ context.Context, pr int) (bool, error) { return pr == 77, nil }))
 
 	for _, ref := range []string{"#77", "PR#77", "pr/77"} {
 		ok, err := r.Satisfied(context.Background(), ref)
@@ -406,27 +416,22 @@ func TestResolverSatisfiesMergedPR(t *testing.T) {
 			t.Fatalf("Satisfied(%q) = %t, %v, want true", ref, ok, err)
 		}
 	}
-	if len(runner.calls) != 3 {
-		t.Fatalf("gh calls = %d, want 3: %+v", len(runner.calls), runner.calls)
-	}
-	want := runnerCall{"gh", []string{"pr", "view", "77", "--json", "state"}}
-	if !reflect.DeepEqual(runner.calls[0], want) {
-		t.Fatalf("gh call = %+v, want %+v", runner.calls[0], want)
-	}
-
-	closed := &fakeRunner{out: map[string][]byte{
-		runnerKey("gh", "pr", "view", "78", "--json", "state"): []byte(`{"state":"CLOSED"}`),
-	}}
-	ok, err := (&FileDependencyResolver{Runner: closed}).Satisfied(context.Background(), "#78")
+	ok, err := r.Satisfied(context.Background(), "#78")
 	if err != nil || ok {
-		t.Fatalf("closed PR satisfied = %t, %v, want false", ok, err)
+		t.Fatalf("open PR satisfied = %t, %v, want false", ok, err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("PR refs must not start a process: %+v", runner.calls)
 	}
 
-	failing := &fakeRunner{err: map[string]error{
-		runnerKey("gh", "pr", "view", "79", "--json", "state"): errors.New("gh: auth"),
-	}}
-	if _, err := (&FileDependencyResolver{Runner: failing}).Satisfied(context.Background(), "#79"); err == nil {
-		t.Fatal("gh failure must be a resolver error, not an unsatisfied flag")
+	failing := &FileDependencyResolver{MergedPR: MergedPRReaderFunc(
+		func(context.Context, int) (bool, error) { return false, errors.New("store unavailable") })}
+	if _, err := failing.Satisfied(context.Background(), "#79"); err == nil {
+		t.Fatal("reader failure must be a resolver error, not an unsatisfied flag")
+	}
+	noReader := &FileDependencyResolver{Runner: runner}
+	if _, err := noReader.Satisfied(context.Background(), "#77"); err == nil {
+		t.Fatal("a PR ref without a merged-PR reader must fail closed")
 	}
 }
 
@@ -503,7 +508,7 @@ func TestRunMergesWhenAllDependenciesAreSatisfied(t *testing.T) {
 	}
 }
 
-func TestRunUnsatisfiedDependencyWaitsWithReasonAndWakes(t *testing.T) {
+func TestRunUnsatisfiedDependencyHoldsWithoutWakingAnyone(t *testing.T) {
 	cases := []struct {
 		name   string
 		policy AutoMergePolicy
@@ -553,9 +558,12 @@ func TestRunUnsatisfiedDependencyWaitsWithReasonAndWakes(t *testing.T) {
 			if !foundWait {
 				t.Fatalf("wait action with reason %q missing: %+v", tc.reason, result.Actions)
 			}
-			wantWakes := []wakeCall{{"w1", 3, VerdictWait}}
-			if !reflect.DeepEqual(waker.calls, wantWakes) {
-				t.Fatalf("wakes = %+v, want %+v", waker.calls, wantWakes)
+			if len(waker.calls) != 0 {
+				t.Fatalf("an unsatisfied dependency wakes nobody: %+v", waker.calls)
+			}
+			wantHolds := []holdCall{{"w1", WaitDependencyVerdict(tc.reason)}}
+			if !reflect.DeepEqual(st.holds, wantHolds) {
+				t.Fatalf("holds = %+v, want %+v", st.holds, wantHolds)
 			}
 		})
 	}
@@ -615,7 +623,7 @@ func TestRunWithoutResolverWaitsForDependencies(t *testing.T) {
 	}
 }
 
-func TestRunWaitWakeCarriesReasonToReasonWaker(t *testing.T) {
+func TestRunWaitNeverWakesAReasonWaker(t *testing.T) {
 	w := readyWatch("w1", 42, 3)
 	policy := AutoMergePolicy{WaitFor: []string{"T3.100"}}
 	w.Policy = &policy
@@ -626,9 +634,36 @@ func TestRunWaitWakeCarriesReasonToReasonWaker(t *testing.T) {
 	if _, err := Run(context.Background(), st, &fakeMerger{}, waker, Options{Resolver: r}); err != nil {
 		t.Fatal(err)
 	}
-	want := []reasonWakeCall{{"w1", 3, VerdictWait, "wait_for:T3.100"}}
-	if !reflect.DeepEqual(waker.calls, want) {
-		t.Fatalf("reason wakes = %+v, want %+v", waker.calls, want)
+	if len(waker.calls) != 0 {
+		t.Fatalf("a dependency hold must not wake even a ReasonWaker: %+v", waker.calls)
+	}
+}
+
+// TestRunHeldWatchMergesOnNextTick proves the persisted wait_dependency verdict
+// re-enters the same gate: once the ref is satisfied the Watch merges without
+// a fresh ready verdict from CI.
+func TestRunHeldWatchMergesOnNextTick(t *testing.T) {
+	w := readyWatch("w1", 42, 3)
+	w.Verdict = WaitDependencyVerdict("wait_for:#77")
+	policy := AutoMergePolicy{WaitFor: []string{"#77"}}
+	w.Policy = &policy
+	st := newFakeStore(w)
+	merger := &fakeMerger{}
+
+	result, err := Run(context.Background(), st, merger, nil, Options{
+		Resolver: &fakeResolver{ok: map[string]bool{"#77": true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(result.Merged, []int{42}) {
+		t.Fatalf("merged = %v, want [42]", result.Merged)
+	}
+	if len(merger.calls) != 1 {
+		t.Fatalf("merge calls = %+v, want one", merger.calls)
+	}
+	if !isWaitDependency(w.Verdict) {
+		t.Fatal("hold verdict must be recognized as a dependency wait")
 	}
 }
 
