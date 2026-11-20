@@ -192,16 +192,18 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 		return VerdictRebase, wakeExecutor(WakePointer)
 	}
 
-	// 5. Real failures, with SKIPPED and NEUTRAL results excluded. A failure
-	// already present on the base branch takes priority over the retry budget:
-	// re-running a check on main can never make it green.
+	// 5. A failure already present on the base branch takes priority over both
+	// the retry budget and the rollup: re-running a check on main can never make
+	// it green. Read the raw report before harmless-result filtering, so a base
+	// failure cannot be softened into a retry or a ready verdict by a stale
+	// SUCCESS conclusion on the caller's snapshot.
+	for _, name := range s.Failures {
+		if s.BaseFailedChecks[name] {
+			return VerdictBlocked, wakeOrchestrator(WakePointer)
+		}
+	}
 	failed := realFailures(s)
 	if rollup == "FAILURE" || rollup == "ERROR" || len(failed) > 0 {
-		for _, name := range failed {
-			if s.BaseFailedChecks[name] {
-				return VerdictBlocked, wakeOrchestrator(WakePointer)
-			}
-		}
 		retry := s
 		retry.Failures = failed
 		if rerun := flakyRetryChecks(retry); len(rerun) > 0 {

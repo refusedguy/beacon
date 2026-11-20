@@ -1650,3 +1650,28 @@ func TestNormalizeConclusionUsesOneVocabulary(t *testing.T) {
 		}
 	}
 }
+
+// Base blame is a raw-report rule. A failure listed on the base branch wins
+// before harmless-result filtering, the rollup or the flaky retry budget are
+// considered, even when the caller's check says SUCCESS.
+func TestEvaluatePRBaseBlamePrecedesConclusionFiltering(t *testing.T) {
+	s := Snapshot{
+		State:            "OPEN",
+		Rollup:           "SUCCESS",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		Checks: map[string]Check{
+			"ci-build": {State: "COMPLETED", Conclusion: "SUCCESS"},
+		},
+		Failures:         []string{"ci-build", "ci-flaky"},
+		BaseFailedChecks: map[string]bool{"ci-build": true},
+		Flaky:            FlakyConfig{Names: []string{"*"}, MaxRetries: 3},
+		SuitesValid:      true,
+	}
+	got, wakes := EvaluatePR(s, Policy{})
+	want := []WakeTarget{{Role: RoleOrchestrator, Kind: WakePointer}}
+	if got != VerdictBlocked || !reflect.DeepEqual(wakes, want) {
+		t.Fatalf("EvaluatePR = %q, %+v; want %q, %+v", got, wakes, VerdictBlocked, want)
+	}
+}
