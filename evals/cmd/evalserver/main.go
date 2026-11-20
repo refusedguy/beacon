@@ -20,10 +20,15 @@ import (
 )
 
 func main() {
-	// Отдельный режим проверки дрейфа плана и кода (Harbor Step 3.1/3.2).
-	// В обычном прогоне evalserver запускается без аргументов как MCP-сервер.
-	if len(os.Args) > 1 && (os.Args[1] == "--drift-check" || os.Args[1] == "drift-check") {
-		os.Exit(runDriftCheck())
+	// Отдельные режимы проверок. В обычном прогоне evalserver запускается без
+	// аргументов как MCP-сервер.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--drift-check", "drift-check":
+			os.Exit(runDriftCheck())
+		case "--severity-map-check", "severity-map-check":
+			os.Exit(runSeverityMapCheck())
+		}
 	}
 	if err := serve(); err != nil {
 		fmt.Fprintf(os.Stderr, "evalserver: %v\n", err)
@@ -41,6 +46,153 @@ func drvWriteFile(path string, data []byte, perm os.FileMode) error {
 	return os.WriteFile(path, data, perm)
 }
 func drvRemoveAll(path string) error { return os.RemoveAll(path) }
+
+// HD-047 (ADR 0301). Шкала security-находки из gate result (ADR 0237) не
+// является шкалой уровня gate. Мапирование идёт в одну сторону:
+//
+//	critical, high → error   блокирующая находка
+//	medium,  low   → warning неблокирующая по умолчанию
+//
+// Уровень gate всегда error или warning. Своя шкала, где critical/high/medium/low
+// подаются как уровень, в gate result не проходит. Блокируемость warning
+// определяет политика: по умолчанию она выключена, поэтому medium/low не
+// блокируют. Уровень от политики не зависит, меняется только blocking.
+type securitySeverity string
+
+const (
+	severityCritical securitySeverity = "critical"
+	severityHigh     securitySeverity = "high"
+	severityMedium   securitySeverity = "medium"
+	severityLow      securitySeverity = "low"
+)
+
+var allSeverities = []securitySeverity{
+	severityCritical, severityHigh, severityMedium, severityLow,
+}
+
+type gateLevel string
+
+const (
+	levelError   gateLevel = "error"
+	levelWarning gateLevel = "warning"
+)
+
+type severityPolicy struct {
+	warnBlocking bool
+}
+
+type mappedSeverity struct {
+	severity securitySeverity
+	level    gateLevel
+	blocking bool
+}
+
+func mapSecuritySeverity(severity securitySeverity, policy severityPolicy) (mappedSeverity, error) {
+	switch severity {
+	case severityCritical, severityHigh:
+		return mappedSeverity{severity: severity, level: levelError, blocking: true}, nil
+	case severityMedium, severityLow:
+		return mappedSeverity{severity: severity, level: levelWarning, blocking: policy.warnBlocking}, nil
+	default:
+		return mappedSeverity{}, fmt.Errorf("неизвестный security severity %q: своя шкала без мапирования не допускается", severity)
+	}
+}
+
+// runSeverityMapCheck делает шкалу HD-047 исполняемой проверкой. Каждый
+// негативный контроль проваливает прогон, если мапирование ослабить: вернуть
+// сырую шкалу как уровень, сделать medium/low блокирующими по умолчанию,
+// принять неизвестный severity или нарушить стабильность результата.
+func runSeverityMapCheck() int {
+	fmt.Println("HD-047 (ADR 0301): мапирование security severity в уровень gate result")
+	fmt.Println()
+	fmt.Println("Шкала: critical/high -> error (blocking), medium/low -> warning (неблокирующая по умолчанию)")
+	fmt.Println()
+
+	type check struct {
+		name string
+		run  func() (string, bool)
+	}
+	checks := []check{
+		{"critical->error", func() (string, bool) {
+			m, err := mapSecuritySeverity(severityCritical, severityPolicy{})
+			return fmt.Sprintf("level=%s blocking=%t", m.level, m.blocking),
+				err == nil && m.level == levelError && m.blocking
+		}},
+		{"high->error", func() (string, bool) {
+			m, err := mapSecuritySeverity(severityHigh, severityPolicy{})
+			return fmt.Sprintf("level=%s blocking=%t", m.level, m.blocking),
+				err == nil && m.level == levelError && m.blocking
+		}},
+		{"medium->warning", func() (string, bool) {
+			m, err := mapSecuritySeverity(severityMedium, severityPolicy{})
+			return fmt.Sprintf("level=%s blocking=%t", m.level, m.blocking),
+				err == nil && m.level == levelWarning && !m.blocking
+		}},
+		{"low->warning", func() (string, bool) {
+			m, err := mapSecuritySeverity(severityLow, severityPolicy{})
+			return fmt.Sprintf("level=%s blocking=%t", m.level, m.blocking),
+				err == nil && m.level == levelWarning && !m.blocking
+		}},
+		{"unknown rejected", func() (string, bool) {
+			m, err := mapSecuritySeverity(securitySeverity("info"), severityPolicy{})
+			return fmt.Sprintf("error=%t zero=%t", err != nil, m == (mappedSeverity{})),
+				err != nil && m == (mappedSeverity{})
+		}},
+		{"no raw security scale as level", func() (string, bool) {
+			leaked := make([]string, 0)
+			for _, s := range allSeverities {
+				m, err := mapSecuritySeverity(s, severityPolicy{})
+				if err != nil || m.level == gateLevel(s) {
+					leaked = append(leaked, string(s))
+				}
+			}
+			return fmt.Sprintf("leaked=%v", leaked), len(leaked) == 0
+		}},
+		{"policy changes only blocking", func() (string, bool) {
+			ok, detail := true, ""
+			for _, s := range []securitySeverity{severityMedium, severityLow} {
+				plain, errPlain := mapSecuritySeverity(s, severityPolicy{})
+				escalated, errEscalated := mapSecuritySeverity(s, severityPolicy{warnBlocking: true})
+				detail += fmt.Sprintf("%s:%t->%t ", s, plain.blocking, escalated.blocking)
+				if errPlain != nil || errEscalated != nil ||
+					plain.level != levelWarning || escalated.level != plain.level ||
+					plain.blocking || !escalated.blocking {
+					ok = false
+				}
+			}
+			return detail, ok
+		}},
+		{"deterministic for same inputs", func() (string, bool) {
+			for _, s := range allSeverities {
+				for _, p := range []severityPolicy{{}, {warnBlocking: true}} {
+					first, errFirst := mapSecuritySeverity(s, p)
+					second, errSecond := mapSecuritySeverity(s, p)
+					if errFirst != errSecond || first != second {
+						return fmt.Sprintf("severity=%s warnBlocking=%t", s, p.warnBlocking), false
+					}
+				}
+			}
+			return "all severities and policies stable", true
+		}},
+	}
+
+	ok := true
+	for _, c := range checks {
+		actual, pass := c.run()
+		status := "PASS"
+		if !pass {
+			status, ok = "FAIL", false
+		}
+		fmt.Printf("  %s %s: %s\n", status, c.name, actual)
+	}
+	fmt.Println()
+	if !ok {
+		fmt.Println("Результат: FAIL. Мапирование severity не соблюдено")
+		return 1
+	}
+	fmt.Println("Результат: PASS")
+	return 0
+}
 
 func serve() error {
 	stateHome := os.Getenv("XDG_STATE_HOME")
