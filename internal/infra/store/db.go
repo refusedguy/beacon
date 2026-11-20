@@ -1558,6 +1558,27 @@ func (d *DB) CompletionNotificationCount() (int, error) {
 	return n, nil
 }
 
+// createWebhookEventsSQL owns the webhook delivery journal from ADR 0150. As
+// with task_starts and completion_notifications, the table is created on first
+// use because this card adds no migration file. delivery_id stores the
+// namespaced idempotency key, so one GitHub delivery maps to exactly one row
+// and a redelivery cannot insert a second one (ADR 0015).
+const createWebhookEventsSQL = `
+CREATE TABLE IF NOT EXISTS webhook_events (
+  delivery_id  TEXT PRIMARY KEY,
+  event        TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  repo         TEXT NOT NULL,
+  pr           INTEGER NOT NULL,
+  head_sha     TEXT NOT NULL,
+  watch_id     TEXT NOT NULL,
+  revision     INTEGER NOT NULL,
+  status       TEXT NOT NULL,
+  received_at  INTEGER NOT NULL,
+  outcome      TEXT NOT NULL
+);
+`
+
 // createTaskLogSQL owns the three-part task log from ADR 0051 feature 2. As
 // with task_starts and the other on-first-use tables, it is created on first
 // write because this card owns only db.go and adds no migration file. One row
