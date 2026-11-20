@@ -8,9 +8,11 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/refusedguy/beacon/internal/app/notify"
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // daemonIntervalEnv overrides the default pass interval without a flag. It is
@@ -24,6 +26,76 @@ var daemonRunner = func(c *CLI, args []string) int { return runDaemon(c, args) }
 
 // RegisterDaemon installs the daemon command implementation.
 func RegisterDaemon(fn func(*CLI, []string) int) { daemonRunner = fn }
+
+// ---------------------------------------------------------------------------
+// Notify routing for daemon verdict delivery (WIRING-485)
+// ---------------------------------------------------------------------------
+
+// daemonNotifyResolver is a concrete notify.Resolver for one Watch. It maps a
+// verdict event to the single session that owns the Watch. A recipient that is
+// not that session, or is not a session id, has no route and delivers nothing.
+type daemonNotifyResolver struct {
+	subscriberID string
+}
+
+func (r daemonNotifyResolver) Resolve(_ context.Context, key notify.Key) ([]notify.Target, error) {
+	if r.subscriberID == "" || key.Recipient != r.subscriberID {
+		return nil, nil
+	}
+	if orchestrator.ValidateWakeTarget(key.Recipient) != nil {
+		return nil, nil
+	}
+	return []notify.Target{notify.Target(key.Recipient)}, nil
+}
+
+// daemonNotifyDeliverer adapts the wake target port to notify.Deliverer. The
+// payload is the identifier-only verdict text; the wake package owns transport.
+type daemonNotifyDeliverer struct {
+	deliver wake.TargetDeliverer
+}
+
+func (d daemonNotifyDeliverer) Deliver(ctx context.Context, n notify.Notification) error {
+	return d.deliver(ctx, string(n.Target), string(n.Payload))
+}
+
+// newDaemonNotifyRouter builds the Router used by the daemon delivery path.
+// Both ports are concrete: the resolver reads the Watch projection and the
+// deliverer uses the wake prompt port.
+func newDaemonNotifyRouter(subscriberID string, deliver wake.TargetDeliverer) *notify.Router {
+	return notify.New(
+		daemonNotifyResolver{subscriberID: subscriberID},
+		daemonNotifyDeliverer{deliver: deliver},
+	)
+}
+
+// routeDaemonEvent is the event subscriber. It hands one verdict event to the
+// router and reports a delivery failure as an error. A Watch without a route
+// delivers nothing.
+func routeDaemonEvent(ctx context.Context, router *notify.Router, verdict, recipient, text string) error {
+	report, err := router.Route(ctx, notify.Event{
+		Type:      verdict,
+		Recipient: recipient,
+		Payload:   []byte(text),
+	})
+	if err != nil {
+		return fmt.Errorf("beacon daemon: notify route: %w", err)
+	}
+	if len(report.Failures) > 0 {
+		return fmt.Errorf("beacon daemon: notify delivery to %s: %w",
+			report.Failures[0].Target, report.Failures[0].Err)
+	}
+	return nil
+}
+
+// daemonWakeRoute is the WakeRoute handed to the orchestrator. It builds one
+// Router per Watch so the resolver and the deliverer see the current
+// subscriber.
+func daemonWakeRoute(deliver wake.TargetDeliverer) orchestrator.WakeRoute {
+	return func(ctx context.Context, w orchestrator.DaemonWatch, _ uint64, verdict, text string) error {
+		router := newDaemonNotifyRouter(w.SubscriberID, deliver)
+		return routeDaemonEvent(ctx, router, verdict, w.SubscriberID, text)
+	}
+}
 
 // runDaemon implements `beacon daemon [--interval 3m] [--once]`. It runs the
 // same single cibridge cycle `beacon mcp` uses, under the same non-blocking
@@ -178,7 +250,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 		},
 		// The single reconciler owns terminal-state refreshes now.
 		CloseMerged: func(context.Context) error { return nil },
-		Waker: orchestrator.NewDaemonWaker(func(id string) (orchestrator.DaemonWatch, error) {
+		Waker: orchestrator.NewDaemonWakerWithRoute(func(id string) (orchestrator.DaemonWatch, error) {
 			w, err := db.Watch(id)
 			if err != nil {
 				return orchestrator.DaemonWatch{}, err
@@ -196,7 +268,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			}
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
-		}),
+		}, daemonWakeRoute(wake.PromptTargetDeliverer(&wake.T202API{}))),
 	}, db.Close, nil
 }
 

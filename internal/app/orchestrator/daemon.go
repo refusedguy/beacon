@@ -200,9 +200,25 @@ func NewDaemonWaker(lookup DaemonWatchLookup) Waker {
 	}
 }
 
+// WakeRoute is the verdict-delivery hook supplied by the composition root.
+// cmd owns the notify router and passes a route here, so this package never
+// imports the notify package in the same app layer (ADR 0005). The hook gets
+// the projected Watch, the revision and the identifier-only text.
+type WakeRoute func(ctx context.Context, watch DaemonWatch, revision uint64, verdict, text string) error
+
+// NewDaemonWakerWithRoute builds a Waker that hands verdict delivery to route.
+// A nil route keeps the built-in adapter registry used by NewDaemonWaker and
+// by the tests. Validation and dedup run in Wake for both forms.
+func NewDaemonWakerWithRoute(lookup DaemonWatchLookup, route WakeRoute) Waker {
+	w := NewDaemonWaker(lookup).(*daemonWaker)
+	w.route = route
+	return w
+}
+
 type daemonWaker struct {
 	lookup   DaemonWatchLookup
 	adapters *wake.T211AdapterRegistry
+	route    WakeRoute
 
 	// mu guards deliveredKeys and the check-deliver-record sequence, so two
 	// concurrent passes cannot steer the same obligation twice. deliveredKeys
@@ -320,16 +336,23 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if daemonWakeAlreadyExists(w, pointer.ObligationID) {
 		return nil
 	}
-	receipt, ok := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
-	if !ok {
-		return fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
+	if w.route != nil {
+		if err := w.route(ctx, watch, revision, verdict, text); err != nil {
+			return err
+		}
+	} else {
+		receipt, ok := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
+		if !ok {
+			return fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
+		}
+		if receipt.Outcome == wake.T210Errored {
+			return fmt.Errorf("daemon: wake %s: %s", watchID, receipt.Outcome)
+		}
+		if !daemonWakeIsDelivered(receipt.Outcome) {
+			return nil
+		}
 	}
-	if receipt.Outcome == wake.T210Errored {
-		return fmt.Errorf("daemon: wake %s: %s", watchID, receipt.Outcome)
-	}
-	if daemonWakeIsDelivered(receipt.Outcome) {
-		w.deliveredKeys[pointer.ObligationID] = struct{}{}
-	}
+	w.deliveredKeys[pointer.ObligationID] = struct{}{}
 	return nil
 }
 

@@ -330,6 +330,28 @@ func DeliverToWatch(ctx context.Context, d domain.WakeDeliverer, w domain.Watch,
 	return DeliverToSubscriber(ctx, d, w, p, target)
 }
 
+// TargetDeliverer sends one identifier-only payload to one opaque wake target.
+// Notification routing resolves an event to targets outside this package and
+// calls this port for each one. Keeping the transport half here means a route
+// never steers a target the wake rules refuse (ADR 0072).
+type TargetDeliverer func(ctx context.Context, target, payload string) error
+
+// PromptTargetDeliverer builds a TargetDeliverer over the HTTP prompt port. A
+// target that is not a session id has no delivery and makes no transport call.
+// The payload is the verdict text the host already treats as untrusted input.
+func PromptTargetDeliverer(api *T202API) TargetDeliverer {
+	return func(ctx context.Context, target, payload string) error {
+		if !strings.HasPrefix(target, "ses_") || len(target) == len("ses_") {
+			return fmt.Errorf("wake: invalid notify target %q", target)
+		}
+		if api == nil {
+			return errors.New("wake: prompt target deliverer has no api")
+		}
+		_, err := api.Prompt(ctx, target, payload, T202DeliverySteer)
+		return err
+	}
+}
+
 // verifyAck checks that the API admitted the prompt. An error response from
 // opencode api is already an exec error; this covers a 2xx with an unexpected
 // shape so a silently dropped wake is not reported as delivered.
