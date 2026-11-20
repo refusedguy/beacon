@@ -14,7 +14,7 @@
     {"rule": "CAP-FILE-IN-OUTSIDE", "path": "tools/beacon-gates/gate/exceptions.go", "reason": "гейты проверяют принадлежность исключения к сканируемому дереву через os.Stat"},
     {"rule": "CAP-FILE-IN-OUTSIDE", "path": "tools/beacon-gates/gate/gate.go", "reason": "сами гейты читают исходники и управляют временными фикстурами"},
     {"rule": "CAP-EXEC-IN-OUTSIDE", "path": "tools/beacon-gates/gate/layers.go", "reason": "гейты вызывают go list для независимого прохода по импортам"},
-    {"rule": "CAP-NETHTTP-IN-OUTSIDE", "path": "internal/tui/client.go", "reason": "тонкий TUI-клиент читает /api/v1 проекции по loopback HTTP и не открывает beacon.db"),
+    {"rule": "CAP-NETHTTP-IN-OUTSIDE", "path": "internal/tui/client.go", "reason": "тонкий TUI-клиент читает /api/v1 проекции по loopback HTTP и не открывает beacon.db"},
     {"rule": "CAP-FILE-IN-OUTSIDE", "path": "tools/beacon-gates/gate/layers.go", "reason": "гейты читают go.mod и исходники для поиска строк импорта"},
     {"rule": "CAP-FILE-IN-OUTSIDE", "path": "tools/beacon-gates/layers-ast/selftest.go", "reason": "сами гейты управляют временными фикстурами self-test"},
     {"rule": "CAP-FILE-IN-OUTSIDE", "path": "tools/beacon-gates/layers-list/selftest.go", "reason": "сами гейты управляют временными фикстурами self-test"}
