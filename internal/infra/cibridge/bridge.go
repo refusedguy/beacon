@@ -604,10 +604,11 @@ func (b *Bridge) publishActionable(ctx context.Context, w domain.Watch, obs ciOb
 		roles[string(domain.RoleFixer)] = true
 	}
 	text := wakeText(verdict, obs, targets, mergeErr)
+	// Every subscriber owns an obligation on the new revision, otherwise
+	// get_result cannot project a verdict for them. Wake routing is separate
+	// from obligation staging: a ready verdict targets the orchestrator, but
+	// the executor still needs a readable pointer.
 	for _, sub := range next.Subscribers {
-		if !roles[string(sub.Role)] {
-			continue
-		}
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
 		if _, err := b.store.Obligation(id); err != nil {
 			o := domain.Obligation{
@@ -618,6 +619,9 @@ func (b *Bridge) publishActionable(ctx context.Context, w domain.Watch, obs ciOb
 				observe.ActorError("cibridge-obligation", next.ID, err)
 				continue
 			}
+		}
+		if !roles[string(sub.Role)] {
+			continue
 		}
 		b.wakeOne(ctx, next, sub, text, now, cycleID, true)
 	}
@@ -694,8 +698,14 @@ func (b *Bridge) applyMerged(ctx context.Context, w domain.Watch, obs ciObservat
 				observe.ActorError("cibridge-resolve", w.ID, err)
 			}
 		}
-		if _, err := b.control.ResolveBlockersByBaseGreen(w.Repo, baseRefOf(w), obs.base.FailedChecks, now); err != nil {
-			observe.ActorError("cibridge-base-green", w.ID, err)
+		// Resolve by base green only when the provider actually observed the
+		// base checks. An empty FailedChecks map from a single-PR provider means
+		// "unknown", not "green": treating it as green would close incidents that
+		// a different Watch is still waiting on.
+		if obs.base.ChecksKnown {
+			if _, err := b.control.ResolveBlockersByBaseGreen(w.Repo, baseRefOf(w), obs.base.FailedChecks, now); err != nil {
+				observe.ActorError("cibridge-base-green", w.ID, err)
+			}
 		}
 	} else {
 		b.unblockFixed(w)

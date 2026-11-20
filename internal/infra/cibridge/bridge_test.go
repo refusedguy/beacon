@@ -1162,7 +1162,9 @@ func TestChainWatchCIPointerWakeRead(t *testing.T) {
 	}
 	defer db.Close()
 
-	sub := domain.Subscriber{ID: "ses_chain", Role: domain.RoleExecutor, Adapter: "opencode", Target: "ses_chain"}
+	// EvaluatePR routes a ready verdict to the orchestrator, so the chain's
+	// subscriber must carry that role to receive the wake.
+	sub := domain.Subscriber{ID: "ses_chain", Role: domain.RoleOrchestrator, Adapter: "opencode", Target: "ses_chain"}
 	w := domain.Watch{
 		ID:          "watch:refusedguy/beacon:42:chain",
 		Repo:        "refusedguy/beacon",
