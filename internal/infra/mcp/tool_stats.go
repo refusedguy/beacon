@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -29,6 +30,12 @@ const (
 	// registryStatsErrorPrefix marks a failed registry read inside loadErrors.
 	// It is a diagnostic, not a plan-limit warning (T5.60).
 	registryStatsErrorPrefix = "registry: "
+	// activeWatchWarningPrefix marks the active-watch limit warning inside
+	// loadErrors, so a reader can tell it from a state load failure (T5.64).
+	activeWatchWarningPrefix = "active watch limit warning: "
+	// activeWatchLimit is the global active-watch cap from ADR 0093
+	// (maxActiveWatchesGlobal) and T1.4. T5.64 warns at 75% and 90% of it.
+	activeWatchLimit = 200
 )
 
 // Plan limit levels reported in the stats response. A zero PlanLimitInfo uses
@@ -46,6 +53,54 @@ type PlanLimitInfo struct {
 	UsedPercent int
 	Level       string
 	Warning     string
+}
+
+// watchLimitLatch tracks the 75% and 90% active-watch warning thresholds.
+// A threshold fires once on the rising edge and clears when usage drops below
+// it, so repeated stats ticks at the same level do not repeat the warning.
+// The latch is safe for concurrent Handle calls.
+type watchLimitLatch struct {
+	mu    sync.Mutex
+	fired map[int]bool
+	fires int
+}
+
+// observe records one active-watch usage sample. It returns one warning entry
+// per threshold currently crossed, in ascending order, and counts each rising
+// crossing once. A zero or negative limit reports no usage and no warnings.
+func (l *watchLimitLatch) observe(active, limit int) []string {
+	pct := 0
+	if limit > 0 {
+		pct = int(int64(active) * 100 / int64(limit))
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.fired == nil {
+		l.fired = make(map[int]bool)
+	}
+	var entries []string
+	for _, threshold := range []int{planLimitYellowPercent, planLimitRedPercent} {
+		if pct < threshold {
+			delete(l.fired, threshold)
+			continue
+		}
+		if !l.fired[threshold] {
+			l.fired[threshold] = true
+			l.fires++
+		}
+		entries = append(entries, fmt.Sprintf("%s%d%% of active-watch limit used (threshold %d%%)",
+			activeWatchWarningPrefix, pct, threshold))
+	}
+	return entries
+}
+
+// FireCount reports how many rising threshold crossings have happened since
+// the latch was created. Dropping below a threshold clears its flag and arms
+// the next crossing, but does not lower this cumulative count.
+func (l *watchLimitLatch) FireCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fires
 }
 
 // WaitSample is one observation window of the wait telemetry (ADR 0056 p6).
@@ -129,15 +184,16 @@ type StatsInput struct{}
 // cached counter can hide a budget spike or a growing watch list from the
 // orchestrator, so the tool reports what the store says right now.
 type StatsHandler struct {
-	reader   SnapshotReader
-	registry RegistryStatsReader
+	reader     SnapshotReader
+	registry   RegistryStatsReader
+	watchLimit *watchLimitLatch
 }
 
 // NewStatsHandler builds the handler. Pass handler.Handle to mcpsdk.AddTool
 // when wiring the tool into a server. The registry port is optional and is set
 // with SetRegistryStatsReader by a composition root that has one.
 func NewStatsHandler(reader SnapshotReader) *StatsHandler {
-	return &StatsHandler{reader: reader}
+	return &StatsHandler{reader: reader, watchLimit: &watchLimitLatch{}}
 }
 
 // SetRegistryStatsReader binds the optional registry counter port. Passing nil
@@ -230,9 +286,10 @@ func (i WaitTelemetryInfo) entry() string {
 
 // Handle copies the values already present in a state snapshot into the stats
 // response. It appends a plan-limit warning to loadErrors when a threshold is
-// crossed and, when the reader also exposes wait samples, an idle metric with
-// the wait share and the mean worker count (ADR 0056 p6). If a registry port is
-// bound, the three T5.60 counters come from it; a failed read is recorded in
+// crossed, an active-watch limit warning once per 75%/90% crossing (T5.64),
+// and, when the reader also exposes wait samples, an idle metric with the wait
+// share and the mean worker count (ADR 0056 p6). If a registry port is bound,
+// the three T5.60 counters come from it; a failed read is recorded in
 // loadErrors instead of producing invented counters. It performs no write and
 // no model request. Slices are allocated even when empty so the response always
 // carries an array, never JSON null.
@@ -243,11 +300,16 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		return nil, StatsOutput{}, fmt.Errorf("beacon_stats: %w", err)
 	}
 
+	activeWatches := len(snap.RadarWatches())
 	loadErrors := make([]string, len(snap.LoadErrors))
 	copy(loadErrors, snap.LoadErrors)
 	if entry := planLimitInfo(snap.PointsThisHour, snap.Budget).warningEntry(); entry != "" {
 		loadErrors = append(loadErrors, entry)
 	}
+	// T5.64: warn once per threshold on the rising edge of active-watch usage.
+	// The entries ride in loadErrors, the journal diagnostic array, so the
+	// derived beacon_stats schema needs no new field. No write or model call.
+	loadErrors = append(loadErrors, h.watchLimit.observe(activeWatches, activeWatchLimit)...)
 	if reader, ok := h.reader.(WaitTelemetryReader); ok {
 		if entry := waitTelemetry(reader.WaitSamples()).entry(); entry != "" {
 			loadErrors = append(loadErrors, entry)
@@ -267,7 +329,7 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 	out := StatsOutput{
 		PointsThisHour: snap.PointsThisHour,
 		Budget:         snap.Budget,
-		ActiveWatches:  len(snap.RadarWatches()),
+		ActiveWatches:  activeWatches,
 		Persist: PersistInfo{
 			Seq:       snap.PersistSeq,
 			LastError: snap.LastPersistErr,
@@ -318,4 +380,17 @@ func registryStatsError(out StatsOutput) string {
 		}
 	}
 	return ""
+}
+
+// activeWatchWarnings returns the active-watch limit entries in a stats
+// response. A helper for callers and tests that must not depend on their
+// position in loadErrors.
+func activeWatchWarnings(out StatsOutput) []string {
+	var warnings []string
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, activeWatchWarningPrefix) {
+			warnings = append(warnings, entry)
+		}
+	}
+	return warnings
 }

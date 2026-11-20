@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // waitTelemetryReaderFake is a SnapshotReader that also reports wait windows,
@@ -622,6 +625,169 @@ func TestStatsRegistryCountersInDerivedSchema(t *testing.T) {
 		}
 	}
 	for key := range fields {
+		if _, ok := statsSchema.Properties[key]; !ok {
+			t.Errorf("stats output has field %q not in the derived schema", key)
+		}
+	}
+}
+
+// watchCountSnapshot returns a sample snapshot with exactly n active watches.
+// The active-watch limit is 200, so n drives the warning percentage directly.
+func watchCountSnapshot(n int) StateSnapshot {
+	snap := sampleSnapshot()
+	watches := make([]domain.Watch, n)
+	for i := range watches {
+		watches[i] = sampleWatch(fmt.Sprintf("w%d", i), domain.VerdictWatching, 0)
+	}
+	snap.ActiveWatches = watches
+	return snap
+}
+
+func TestActiveWatchLimitThresholds(t *testing.T) {
+	cases := []struct {
+		name     string
+		watches  int
+		pct      int
+		warnings int
+	}{
+		{"below yellow", 148, 74, 0},
+		{"at yellow", 150, 75, 1},
+		{"between thresholds", 178, 89, 1},
+		{"at red", 180, 90, 2},
+		{"over limit", 200, 100, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &snapshotReaderFake{snap: watchCountSnapshot(tc.watches)}
+			out := callStats(t, NewStatsHandler(reader))
+			warnings := activeWatchWarnings(out)
+			if len(warnings) != tc.warnings {
+				t.Fatalf("warnings = %v, want %d entries", warnings, tc.warnings)
+			}
+			for _, w := range warnings {
+				if !strings.HasPrefix(w, activeWatchWarningPrefix) {
+					t.Errorf("warning %q missing prefix %q", w, activeWatchWarningPrefix)
+				}
+				if want := fmt.Sprintf("%d%%", tc.pct); !strings.Contains(w, want) {
+					t.Errorf("warning %q missing percent %q", w, want)
+				}
+			}
+			if out.ActiveWatches != tc.watches {
+				t.Errorf("activeWatches = %d, want %d", out.ActiveWatches, tc.watches)
+			}
+		})
+	}
+}
+
+func TestActiveWatchWarningFiresOncePerCrossingAndResets(t *testing.T) {
+	reader := &snapshotReaderFake{snap: watchCountSnapshot(148)}
+	handler := NewStatsHandler(reader)
+
+	check := func(wantWarnings, wantFires int, label string) {
+		t.Helper()
+		out := callStats(t, handler)
+		if got := activeWatchWarnings(out); len(got) != wantWarnings {
+			t.Errorf("%s: warnings = %v, want %d", label, got, wantWarnings)
+		}
+		if got := handler.watchLimit.FireCount(); got != wantFires {
+			t.Errorf("%s: fires = %d, want %d", label, got, wantFires)
+		}
+	}
+
+	check(0, 0, "74%")
+	reader.snap = watchCountSnapshot(150)
+	check(1, 1, "75%")
+	reader.snap = watchCountSnapshot(180)
+	check(2, 2, "90%")
+	// A second tick at the same level adds no duplicate and no new fire.
+	check(2, 2, "90% repeat")
+	// Dropping below both thresholds clears the flags.
+	reader.snap = watchCountSnapshot(148)
+	check(0, 2, "74% after drop")
+	// Rising again fires both thresholds anew.
+	reader.snap = watchCountSnapshot(180)
+	check(2, 4, "90% again")
+}
+
+func TestActiveWatchWarningDoesNotChangeVerdictOrOtherFields(t *testing.T) {
+	lowOut := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: watchCountSnapshot(148)}))
+	highOut := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: watchCountSnapshot(180)}))
+
+	if got := activeWatchWarnings(lowOut); len(got) != 0 {
+		t.Fatalf("low snapshot warnings = %v, want none", got)
+	}
+	if got := activeWatchWarnings(highOut); len(got) != 2 {
+		t.Fatalf("high snapshot warnings = %v, want 2", got)
+	}
+	if highOut.PointsThisHour != lowOut.PointsThisHour ||
+		highOut.Budget != lowOut.Budget ||
+		highOut.Persist != lowOut.Persist ||
+		highOut.Ladder != lowOut.Ladder ||
+		highOut.Version != lowOut.Version ||
+		highOut.RegisteredAgents != lowOut.RegisteredAgents ||
+		highOut.StaleAgents != lowOut.StaleAgents ||
+		highOut.ConfigID != lowOut.ConfigID {
+		t.Errorf("warning changed non-watch fields: low=%+v high=%+v", lowOut, highOut)
+	}
+	if got, want := planLimitWarning(highOut), planLimitWarning(lowOut); got != want {
+		t.Errorf("plan-limit warning changed: %q, want %q", got, want)
+	}
+}
+
+func TestWatchLimitLatchZeroLimit(t *testing.T) {
+	latch := &watchLimitLatch{}
+	if got := latch.observe(180, 0); len(got) != 0 {
+		t.Errorf("zero-limit warnings = %v, want none", got)
+	}
+	if got := latch.FireCount(); got != 0 {
+		t.Errorf("zero-limit fires = %d, want 0", got)
+	}
+}
+
+func TestActiveWatchWarningInJSONAndSchema(t *testing.T) {
+	schemas, err := AllOutputSchemas()
+	if err != nil {
+		t.Fatalf("AllOutputSchemas: %v", err)
+	}
+	statsSchema := schemas["beacon_stats"]
+	resolved, err := statsSchema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve stats schema: %v", err)
+	}
+
+	out := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: watchCountSnapshot(180)}))
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal stats output: %v", err)
+	}
+	var fields struct {
+		LoadErrors []string `json:"loadErrors"`
+	}
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal stats output: %v", err)
+	}
+	var found int
+	for _, entry := range fields.LoadErrors {
+		if strings.HasPrefix(entry, activeWatchWarningPrefix) {
+			found++
+		}
+	}
+	if found != 2 {
+		t.Errorf("serialized stats has %d active-watch warnings, want 2: %s", found, raw)
+	}
+
+	var instance map[string]any
+	if err := json.Unmarshal(raw, &instance); err != nil {
+		t.Fatalf("unmarshal stats instance: %v", err)
+	}
+	if err := resolved.Validate(instance); err != nil {
+		t.Fatalf("stats output with active-watch warnings fails derived schema: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &top); err != nil {
+		t.Fatalf("unmarshal stats fields: %v", err)
+	}
+	for key := range top {
 		if _, ok := statsSchema.Properties[key]; !ok {
 			t.Errorf("stats output has field %q not in the derived schema", key)
 		}
