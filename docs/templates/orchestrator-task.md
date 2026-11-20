@@ -28,6 +28,24 @@
 
 Если проверка красная и проблема на `main`, Beacon сам поставит Watch `blocked` и запишет `BlockerIncident`. Оркестратор просыпается по `blocked:not_mine`, читает причину через `beacon_get_result` и запускает FIX-агента через `beacon task new` и `beacon spawn`. Оркестратор не берётся чинить main сам.
 
+## Информационные проверки не порождают FIX-агента
+
+Проверка с `required: false` в `beacon_list_running` или с `continue-on-error: true` в workflow информационна. Гейт `docs` из `.github/workflows/docs.yml` именно такой: он сообщает о дублях ADR, но не блокирует merge.
+
+Оркестратор отличает `verdict=blocked`, пришедший из информационного гейта, от блокера main. Если `failedCheck` принадлежит проверке с `required: false`, оркестратор НЕ запускает FIX-агента и НЕ объявляет `blocked.main`. Блокер main объявляется только по required-проверке с реальной ошибкой в коде main, которая ломает сборку или тесты. Информационный `docs`-гейт с дублями ADR к таким не относится.
+
+Основание: в PR #434 (HD-045) и #437 (BS.10) исполнители вызвали `beacon_ack decision=blocked:not_mine` по `FAILURE` информационного `docs`-гейта. Оркестратор, получивший такой сигнал, не должен запускать FIX-агента: проверка необязательна и её Status в `beacon_list_running` равен `required: false`.
+
+<!-- orchestrator-task:informational-checks
+required:false -> no FIX agent
+continue-on-error:true -> no FIX agent
+verdict=blocked from informational docs gate -> ignore as main blocker
+orchestrator-task:informational-checks -->
+
+## Волна и отложенная проводка
+
+На каждой волне оркестратор читает `beacon deferred --format json` до запуска новых агентов. Запись содержит `watchID`, `pr`, `title`, `reason`, `ownerFiles` и `status`. Wiring-карточки со `status: todo` ставятся в очередь ПЕРВЫМИ, до остальных задач волны: проводка закрывает долг предыдущего Watch и дешевле новой фичи. Карточка берётся из `docs/tasks/WIRING-<pr>.md` по шаблону `docs/templates/wiring-card.md` и проходит обычный чек из четырёх пунктов.
+
 ## Чек перед ручным мержем
 
 Мерж разрешён только после вызова `beacon_get_result` с `verdict=ready`. Ни idle-отчёт, ни фраза в чате, ни зелёный CI сами по себе не дают права на мерж. Инструмент возвращает снимок с полями status, verdict, revision, merge{mergeable, mergeStateStatus}, failedChecks, obligationID, retryBudget. Вызов additive и пишет readAt, поэтому прочтение результата останавливает лестницу пробуждения.

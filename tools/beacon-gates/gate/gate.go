@@ -63,6 +63,31 @@ func HasRuleAt(fs []Finding, rule, path string, line int) bool {
 	return false
 }
 
+// FieldValue returns the trimmed value and 1-based line of the first
+// "Key: value" line in lines, or ("", 0) when the key is absent. The wiring
+// gate and the docs gate use the same field grammar so a card validated by one
+// reads the same way in the other.
+func FieldValue(lines []string, key string) (string, int) {
+	prefix := key + ":"
+	for i, line := range lines {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix)), i + 1
+		}
+	}
+	return "", 0
+}
+
+// HasSection reports whether lines contain a trimmed markdown heading equal
+// to heading, for example "## Причина".
+func HasSection(lines []string, heading string) bool {
+	for _, line := range lines {
+		if strings.TrimSpace(line) == heading {
+			return true
+		}
+	}
+	return false
+}
+
 // Fixture creates a temp tree from relative-path-to-content pairs.
 // The caller owns the tree and must remove it.
 func Fixture(files map[string]string) (string, error) {
