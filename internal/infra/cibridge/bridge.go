@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider
@@ -232,41 +233,55 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 	// get_result cannot project a verdict for them.
 	for _, sub := range next.Subscribers {
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			if err := b.store.SaveObligation(domain.Obligation{
+		o, err := b.store.Obligation(id)
+		if err != nil {
+			o = domain.Obligation{
 				ID:             id,
 				WatchID:        next.ID,
 				Revision:       next.Revision,
 				SubscriberID:   sub.ID,
 				VerdictPointer: verdict,
 				StagedAt:       now,
-			}); err != nil {
+			}
+			if err := b.store.SaveObligation(o); err != nil {
 				return 0, err
 			}
 		}
+
 		// A terminal verdict closes the Watch without steering a session:
 		// there is no further work for a subscriber to do.
 		if isTerminalVerdict(verdict) || (b.waker == nil && b.adapterWaker == nil) {
 			continue
 		}
-		// A subscriber registered from an MCP call carries its opaque host
-		// session id. Only those are wakeable; a plain notify target is not.
-		// The adapter-aware path passes sub.Adapter so a registry can select
-		// the right harness; the legacy path keeps the old deliverer shape.
+
 		p := domain.WakePayload{
 			WatchID:      next.ID,
 			ObligationID: id,
 			Revision:     next.Revision,
 			Verdict:      string(verdict),
 		}
-		var err error
-		if b.adapterWaker != nil {
-			err = b.adapterWaker.Deliver(ctx, sub.Adapter, sub.ID, p)
-		} else {
-			err = b.waker.Deliver(ctx, sub.ID, p)
+		// The only delivery address is subscriber.ID from this Watch. It must
+		// agree with the obligation and with the resolved Watch target; a
+		// caller session or _meta value never substitutes for it.
+		addressee := sub.ID
+		target, err := wake.SubscriberTarget(next, p.WatchID, addressee)
+		if err != nil || target != addressee || o.SubscriberID != addressee {
+			log.Printf("cibridge: skip wake for watch %s: obligation %s addresses %q, subscriber %q, target %q (%v)",
+				next.ID, id, o.SubscriberID, addressee, target, err)
+			continue
 		}
-		if err != nil {
-			log.Printf("cibridge: wake %s: %v", sub.ID, err)
+		var deliverErr error
+		if sw, ok := b.adapterWaker.(interface {
+			DeliverToSubscriber(context.Context, domain.Watch, domain.WakePayload, string) error
+		}); ok {
+			deliverErr = sw.DeliverToSubscriber(ctx, next, p, addressee)
+		} else if b.adapterWaker != nil {
+			deliverErr = b.adapterWaker.Deliver(ctx, sub.Adapter, target, p)
+		} else {
+			deliverErr = wake.DeliverToSubscriber(ctx, b.waker, next, p, addressee)
+		}
+		if deliverErr != nil {
+			log.Printf("cibridge: wake %s: %v", target, deliverErr)
 		}
 	}
 	log.Printf("cibridge: %s#%d -> %s revision=%d", next.Repo, next.PR, verdict, next.Revision)

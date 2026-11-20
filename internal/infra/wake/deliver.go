@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -133,21 +134,55 @@ func WatchTarget(w domain.Watch, watchID string) (string, error) {
 	return "", fmt.Errorf("wake: no orchestrator session on watch %s", watchID)
 }
 
-// DeliverToWatch wakes the orchestrator of w through d. The target is read from
-// the Watch, not from a stub, and the obligation must belong to that target.
-// It returns an error without calling d when either check fails.
-func DeliverToWatch(ctx context.Context, d domain.WakeDeliverer, w domain.Watch, p domain.WakePayload) error {
-	if d == nil {
-		return fmt.Errorf("wake: deliver to watch: deliverer is nil")
+// SubscriberTarget resolves the one session a wake may address on w. The
+// addressee must be subscriber.ID on the very Watch the pointer names, with
+// role executor or orchestrator. No caller session, _meta value, notify target
+// or role-wide broadcast can stand in for that id.
+func SubscriberTarget(w domain.Watch, watchID, addressee string) (string, error) {
+	if watchID == "" || w.ID != watchID {
+		return "", fmt.Errorf("wake: watchID %q does not name watch %q", watchID, w.ID)
 	}
-	target, err := WatchTarget(w, p.WatchID)
+	if addressee == "" || !strings.HasPrefix(addressee, "ses_") {
+		return "", fmt.Errorf("wake: subscriber %q on watch %s is not a session", addressee, watchID)
+	}
+	for _, sub := range w.Subscribers {
+		if sub.ID != addressee {
+			continue
+		}
+		if sub.Role != domain.RoleExecutor && sub.Role != domain.RoleOrchestrator {
+			return "", fmt.Errorf("wake: subscriber %q has role %q on watch %s", sub.ID, sub.Role, watchID)
+		}
+		return sub.ID, nil
+	}
+	return "", fmt.Errorf("wake: session %q is not a subscriber of watch %s", addressee, watchID)
+}
+
+// DeliverToSubscriber wakes exactly one subscriber of w. Both the address and
+// the obligation come from the same subscriber.ID, so a wake for one party can
+// never be steered into another party's session.
+func DeliverToSubscriber(ctx context.Context, d domain.WakeDeliverer, w domain.Watch, p domain.WakePayload, subscriberID string) error {
+	if d == nil {
+		return fmt.Errorf("wake: deliver to subscriber: deliverer is nil")
+	}
+	target, err := SubscriberTarget(w, p.WatchID, subscriberID)
 	if err != nil {
 		return err
 	}
 	if want := domain.ObligationKey(p.WatchID, p.Revision, target); p.ObligationID != want {
-		return fmt.Errorf("wake: obligation %q does not belong to orchestrator %q of watch %s", p.ObligationID, target, p.WatchID)
+		return fmt.Errorf("wake: obligation %q does not belong to subscriber %q of watch %s", p.ObligationID, target, p.WatchID)
 	}
 	return d.Deliver(ctx, target, p)
+}
+
+// DeliverToWatch wakes the orchestrator of w through d. It is the legacy
+// single-target form: DeliverToSubscriber is the watch-aware path used when a
+// verdict names its subscriber explicitly.
+func DeliverToWatch(ctx context.Context, d domain.WakeDeliverer, w domain.Watch, p domain.WakePayload) error {
+	target, err := WatchTarget(w, p.WatchID)
+	if err != nil {
+		return err
+	}
+	return DeliverToSubscriber(ctx, d, w, p, target)
 }
 
 // verifyAck checks that the API admitted the prompt. An error response from
@@ -2470,9 +2505,33 @@ type T210PointerSource interface {
 	Commit(p T210WakePointer) error
 }
 
+// ValidateT210Target checks that an explicit subscriber address and its
+// obligation name the same party. A pointer whose target was replaced by the
+// current caller's session or by _meta fails here, before any adapter binds.
+// Opaque non-session targets are left to the adapter's own registry.
+func ValidateT210Target(p T210WakePointer) error {
+	if p.Target == "" {
+		return fmt.Errorf("wake: empty subscriber target")
+	}
+	if !strings.HasPrefix(p.Target, "ses_") || len(p.Target) == len("ses_") {
+		return nil
+	}
+	if strings.Contains(p.ObligationID, ":") {
+		if want := domain.ObligationKey(p.WatchID, p.Revision, p.Target); p.ObligationID != want {
+			return fmt.Errorf("wake: subscriber %q does not own obligation %q", p.Target, p.ObligationID)
+		}
+	}
+	return nil
+}
+
 // T210Deliver is the central path. It binds through the registry only. A
 // pointer with no exact match is skipped, never routed to a guessed session.
 func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, sessions *T211SessionRegistry, adapters *T211AdapterRegistry, deliveries *T211DeliveryRegistry) (T210Receipt, bool) {
+	if err := ValidateT210Target(p); err != nil {
+		log.Printf("wake: skip pointer %s: %v", p.ObligationID, err)
+		T210settle(src, p, deliveries, T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}, nil)
+		return T210Receipt{}, false
+	}
 	adapter, ok := adapters.Get(p.Adapter)
 	if !ok {
 		T210settle(src, p, deliveries, T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Outcome: T210Skipped}, nil)
@@ -2480,6 +2539,14 @@ func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, 
 	}
 	target, ok := adapter.Bind(p, sessions)
 	if !ok {
+		r := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}
+		T210settle(src, p, deliveries, r, adapter)
+		return r, false
+	}
+	// An adapter must not substitute a different session for an explicit
+	// subscriber address, even when its own registry maps that address.
+	if string(target) != p.Target {
+		log.Printf("wake: skip pointer %s: adapter bound %q, subscriber %q", p.ObligationID, target, p.Target)
 		r := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}
 		T210settle(src, p, deliveries, r, adapter)
 		return r, false
