@@ -31,6 +31,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon spawn <taskID> [--agent id] [--title ...]
   beacon attach <sessionID>
   beacon deliver <watchID>
+  beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
 
 Каталог команд для агентов: beacon list --format json
 `
@@ -227,6 +228,8 @@ func (c *CLI) Run(args []string) int {
 		return c.runAttach(args[1:])
 	case "deliver":
 		return deliverRunner(c, args[1:])
+	case "ci":
+		return ciRunner(c, args[1:])
 	default:
 		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)
