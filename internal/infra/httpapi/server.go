@@ -48,6 +48,14 @@ const (
 	// maxRecentWatches of them so a busy project cannot grow the response without
 	// limit.
 	maxRecentWatches = 30
+
+	// maxAuditRecords bounds the in-process audit list exposed by /api/v1/audit.
+	maxAuditRecords = 200
+
+	// ingressHTTPAPI marks commands recorded by this transport in the audit
+	// projection. The other ingresses (mcp, tui, webhook) belong to other
+	// transports and are not visible here.
+	ingressHTTPAPI = "httpapi"
 )
 
 // heartbeatInterval is a variable so a test can shorten it without waiting a
@@ -65,6 +73,48 @@ type LastCycle struct {
 	At             time.Time `json:"at,omitempty"`
 	WatchesUpdated int       `json:"watchesUpdated"`
 	DurationMs     int64     `json:"durationMs"`
+}
+
+// VersionInfo is the response of GET /api/v1/version. It reports the same
+// build facts as /api/v1/health without requiring a provider read.
+type VersionInfo struct {
+	OK         bool      `json:"ok"`
+	Version    string    `json:"version"`
+	PID        int       `json:"pid"`
+	ProjectKey string    `json:"projectKey"`
+	StartedAt  time.Time `json:"startedAt"`
+	UptimeSec  int64     `json:"uptimeSec"`
+}
+
+// OpsMetrics is the response of GET /api/v1/metrics. ActiveTasks is the number
+// of unfinished runs (live Watches) read from the state provider; the wake
+// fields summarise wakes observed through ObserveWake since process start.
+type OpsMetrics struct {
+	OK                bool    `json:"ok"`
+	ActiveTasks       int     `json:"active_tasks"`
+	WakesTotal        uint64  `json:"wakes_total"`
+	WakeLatencyMs     float64 `json:"wake_latency_ms"`
+	WakeLatencyMaxMs  float64 `json:"wake_latency_max_ms"`
+	WakeLatencyLastMs float64 `json:"wake_latency_last_ms"`
+	UptimeSec         int64   `json:"uptime_sec"`
+}
+
+// AuditRecord is one privileged command recorded by this transport and
+// exposed by GET /api/v1/audit. Actor and Ingress are always present so an
+// operator can tell who acted and where the command arrived.
+type AuditRecord struct {
+	Actor      string    `json:"actor"`
+	Ingress    string    `json:"ingress"`
+	Command    string    `json:"command"`
+	WatchID    string    `json:"watchID"`
+	DecisionID string    `json:"decisionID"`
+	At         time.Time `json:"at"`
+}
+
+// AuditPage is the response of GET /api/v1/audit. Entries are oldest first.
+type AuditPage struct {
+	Entries []AuditRecord `json:"entries"`
+	Total   int           `json:"total"`
 }
 
 // Snapshot is the read-only projection served by /api/v1/snapshot. It is a
@@ -314,6 +364,75 @@ func (b *EventBus) close() {
 	}
 }
 
+// opsState holds the in-process counters behind /version, /metrics and
+// /audit. Scrapes and decisions arrive on different goroutines, so every
+// field is guarded by mu.
+type opsState struct {
+	mu              sync.Mutex
+	wakesTotal      uint64
+	wakeLatencySum  float64
+	wakeLatencyMax  float64
+	wakeLatencyLast float64
+	audit           []AuditRecord
+}
+
+// observeWake records one wake latency in milliseconds. A negative duration
+// is clamped to zero so a broken clock cannot produce a negative metric.
+func (o *opsState) observeWake(latency time.Duration) {
+	ms := float64(latency) / float64(time.Millisecond)
+	if ms < 0 {
+		ms = 0
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.wakesTotal++
+	o.wakeLatencySum += ms
+	if ms > o.wakeLatencyMax {
+		o.wakeLatencyMax = ms
+	}
+	o.wakeLatencyLast = ms
+}
+
+// metricsView returns a copy of the counters safe to encode while new wakes
+// keep arriving.
+func (o *opsState) metricsView() OpsMetrics {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	m := OpsMetrics{
+		WakesTotal:        o.wakesTotal,
+		WakeLatencyMaxMs:  o.wakeLatencyMax,
+		WakeLatencyLastMs: o.wakeLatencyLast,
+	}
+	if o.wakesTotal > 0 {
+		m.WakeLatencyMs = o.wakeLatencySum / float64(o.wakesTotal)
+	}
+	return m
+}
+
+// recordAudit appends one command to the bounded audit list.
+func (o *opsState) recordAudit(rec AuditRecord) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.audit = append(o.audit, rec)
+	if len(o.audit) > maxAuditRecords {
+		o.audit = append([]AuditRecord(nil), o.audit[len(o.audit)-maxAuditRecords:]...)
+	}
+}
+
+// auditView returns the recorded commands, optionally filtered by actor.
+func (o *opsState) auditView(actor string) AuditPage {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	entries := make([]AuditRecord, 0, len(o.audit))
+	for _, rec := range o.audit {
+		if actor != "" && rec.Actor != actor {
+			continue
+		}
+		entries = append(entries, rec)
+	}
+	return AuditPage{Entries: entries, Total: len(entries)}
+}
+
 // Server owns the listener, the bearer token and the connection file. Close
 // shuts the listener down and removes the connection file only when it still
 // carries this process' pid.
@@ -326,6 +445,7 @@ type Server struct {
 	listener   net.Listener
 	httpServer *http.Server
 	events     *EventBus
+	ops        opsState
 
 	decisions map[string]DecisionResult
 	decMu     sync.Mutex
@@ -416,6 +536,31 @@ func newServer(cfg Config, token, host string, port int, events *EventBus) *Serv
 	}
 }
 
+// ObserveWake records the latency of one delivered wake. The composition root
+// calls this when a wake reaches a subscriber; GET /api/v1/metrics reports the
+// running summary. It is safe to call concurrently with scrapes.
+func (s *Server) ObserveWake(latency time.Duration) {
+	s.ops.observeWake(latency)
+}
+
+// startedAt returns the configured start time, falling back to now when the
+// caller leaves it unset.
+func (s *Server) startedAt() time.Time {
+	if s.cfg.StartedAt.IsZero() {
+		return time.Now()
+	}
+	return s.cfg.StartedAt
+}
+
+// uptimeSec is whole seconds since start, never negative.
+func (s *Server) uptimeSec() int64 {
+	uptime := int64(time.Since(s.startedAt()).Seconds())
+	if uptime < 0 {
+		return 0
+	}
+	return uptime
+}
+
 // loopbackListenAddr keeps the port from addr but always binds 127.0.0.1.
 func loopbackListenAddr(addr string) (string, error) {
 	_, port, err := net.SplitHostPort(addr)
@@ -504,6 +649,9 @@ func (s *Server) removeConnectionIfMine() {
 func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", s.handleHealth)
+	mux.HandleFunc("GET /api/v1/version", s.handleVersion)
+	mux.HandleFunc("GET /api/v1/metrics", s.handleMetrics)
+	mux.HandleFunc("GET /api/v1/audit", s.handleAudit)
 	mux.HandleFunc("GET /api/v1/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	mux.Handle("POST /api/v1/human/decide", s.sameOriginJSON(http.HandlerFunc(s.handleDecide)))
@@ -575,14 +723,7 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	started := s.cfg.StartedAt
-	if started.IsZero() {
-		started = time.Now()
-	}
-	uptime := int64(time.Since(started).Seconds())
-	if uptime < 0 {
-		uptime = 0
-	}
+	uptime := s.uptimeSec()
 	body := struct {
 		OK            bool     `json:"ok"`
 		Version       string   `json:"version"`
@@ -604,6 +745,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		body.LoadErrors = append(body.LoadErrors, snap.LoadErrors...)
 	}
 	writeJSON(w, http.StatusOK, body)
+}
+
+// handleVersion serves build facts without touching the provider, so it keeps
+// answering even when the store read that backs /health is failing.
+func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, VersionInfo{
+		OK: true, Version: s.cfg.Version, PID: s.pid, ProjectKey: s.cfg.ProjectKey,
+		StartedAt: s.startedAt(), UptimeSec: s.uptimeSec(),
+	})
+}
+
+// handleMetrics serves operational counters. ActiveTasks is derived from the
+// live Watches in the snapshot so it always matches the number of unfinished
+// runs at scrape time.
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	snap, err := s.cfg.Provider.Snapshot(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "METRICS_FAILED", err.Error())
+		return
+	}
+	m := s.ops.metricsView()
+	m.OK = true
+	m.ActiveTasks = len(snap.LiveWatches)
+	m.UptimeSec = s.uptimeSec()
+	writeJSON(w, http.StatusOK, m)
+}
+
+// handleAudit serves the commands recorded by this transport. An optional
+// actor query parameter narrows the list; actor and ingress are always present
+// on every entry.
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	actor := ""
+	if r.URL != nil {
+		actor = strings.TrimSpace(r.URL.Query().Get("actor"))
+	}
+	writeJSON(w, http.StatusOK, s.ops.auditView(actor))
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -792,5 +969,9 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	}
 	s.decisions[key] = result
 	s.decMu.Unlock()
+	s.ops.recordAudit(AuditRecord{
+		Actor: d.Actor, Ingress: ingressHTTPAPI, Command: result.Command,
+		WatchID: result.WatchID, DecisionID: result.DecisionID, At: time.Now().UTC(),
+	})
 	writeJSON(w, http.StatusOK, result)
 }
