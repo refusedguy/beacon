@@ -73,7 +73,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 10)
+	results := make([]evalResult, 0, 11)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -354,6 +354,14 @@ func run() int {
 	gateActual, gatePass := checkTwoPhaseLocalCIGate(repoRoot, results)
 	record("10_two_phase_local_ci_gate", "9/9 eval PASS; хеш совпадает; run.sh исполняемый; джоба e2e есть", gateActual, gatePass)
 
+	// eval 11: измеримая регрессия verdict через чекпоинты (ADR 0063, фича 4).
+	// Для канонических сценариев зафиксирован baseline. Проверенное состояние
+	// сохраняется в чекпоинт и восстанавливается в новом контексте, после чего
+	// вердикт считается снова. Расхождение с baseline или между шагами это
+	// регрессия: eval красный, значит гейт провален.
+	regressionActual, regressionPass := checkVerdictRegression()
+	record("11_verdict_regression", "verdict после чекпоинтов равен замороженному baseline во всех сценариях", regressionActual, regressionPass)
+
 	printTable(results)
 	passed, failed := 0, 0
 	for _, r := range results {
@@ -388,6 +396,102 @@ func shipReadySnapshot(ship domain.ShipFacts) domain.Snapshot {
 		SuitesValid: true,
 		Ship:        ship,
 	}
+}
+
+// verdictBaselineCase — один канонический сценарий для измерения регрессии.
+// Baseline заморожен в исходнике eval: если движок вердиктов на тех же фактах
+// начнёт выдавать другое значение, eval упадёт даже без чекпоинтов.
+type verdictBaselineCase struct {
+	name     string
+	mutate   func(*domain.Snapshot)
+	baseline domain.Verdict
+}
+
+// regressionAt фиксирует часы для сценария таймаута: движок не читает системное
+// время, поэтому прогоны на разных машинах дают одинаковый вердикт.
+var regressionAt = time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+// verdictBaselineCases покрывает разные ветки таблицы решений, чтобы регрессия
+// была видна не только на ready. Каждый mutate меняет ровно один признак
+// канонического зелёного снимка.
+func verdictBaselineCases() []verdictBaselineCase {
+	return []verdictBaselineCase{
+		{name: "ready", baseline: domain.VerdictReady},
+		{name: "merged", mutate: func(s *domain.Snapshot) { s.State = "MERGED" }, baseline: domain.VerdictMerged},
+		{name: "rebase", mutate: func(s *domain.Snapshot) { s.MergeStateStatus = "DIRTY" }, baseline: domain.VerdictRebase},
+		{name: "retry", mutate: func(s *domain.Snapshot) {
+			s.Rollup = "FAILURE"
+			s.Failures = []string{"ci-flaky"}
+			s.Flaky = domain.FlakyConfig{
+				Names:      []string{"ci-*"},
+				MaxRetries: 2,
+				Used:       map[string]int{"ci-flaky": 0},
+			}
+		}, baseline: domain.VerdictRetry},
+		{name: "keep_working", mutate: func(s *domain.Snapshot) {
+			s.Rollup = "ERROR"
+			s.Failures = []string{"ci-stable"}
+			s.Flaky = domain.FlakyConfig{
+				Names:      []string{"ci-flaky"},
+				MaxRetries: 2,
+				Used:       map[string]int{},
+			}
+		}, baseline: domain.VerdictKeepWorking},
+		{name: "timeout", mutate: func(s *domain.Snapshot) {
+			s.Rollup = "PENDING"
+			s.At = regressionAt
+			s.DeadlineAt = regressionAt.Add(-time.Minute)
+		}, baseline: domain.VerdictTimeout},
+		{name: "watching", mutate: func(s *domain.Snapshot) { s.Rollup = "PENDING" }, baseline: domain.VerdictWatching},
+	}
+}
+
+// checkVerdictRegression считает вердикт до чекпоинта и после него для каждого
+// сценария и сравнивает оба значения с замороженным baseline. Сравниваются
+// наблюдаемые строки вердикта, а не внутренние поля снимка.
+func checkVerdictRegression() (string, bool) {
+	cases := verdictBaselineCases()
+	regressions := make([]string, 0)
+	observed := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		snapshot := shipReadySnapshot(domain.ShipFacts{Build: true, Audit: true, TDD: true})
+		if tc.mutate != nil {
+			tc.mutate(&snapshot)
+		}
+		before, _ := domain.Evaluate(snapshot, domain.Policy{})
+		restored, err := restoreVerdictState(snapshot)
+		if err != nil {
+			regressions = append(regressions, fmt.Sprintf("%s: чекпоинт не восстановлен: %v", tc.name, err))
+			continue
+		}
+		after, _ := domain.Evaluate(restored, domain.Policy{})
+		observed = append(observed, fmt.Sprintf("%s=%s", tc.name, after))
+		switch {
+		case before != tc.baseline:
+			regressions = append(regressions, fmt.Sprintf("%s: baseline=%s, до чекпоинта=%s", tc.name, tc.baseline, before))
+		case after != before:
+			regressions = append(regressions, fmt.Sprintf("%s: регрессия %s → %s после чекпоинта", tc.name, before, after))
+		}
+	}
+	if len(regressions) > 0 {
+		return fmt.Sprintf("%d/%d регрессий: %s", len(regressions), len(cases), strings.Join(regressions, "; ")), false
+	}
+	return fmt.Sprintf("%d/%d verdict совпали: %s", len(cases), len(cases), strings.Join(observed, ", ")), true
+}
+
+// restoreVerdictState сохраняет проверенное состояние в непрозрачный чекпоинт
+// и строит из него новый Snapshot. Шаг после чекпоинта работает со свежим
+// контекстом, но с теми же проверенными фактами: модель и бэкенд не меняются.
+func restoreVerdictState(s domain.Snapshot) (domain.Snapshot, error) {
+	checkpoint, err := json.Marshal(s)
+	if err != nil {
+		return domain.Snapshot{}, err
+	}
+	var restored domain.Snapshot
+	if err := json.Unmarshal(checkpoint, &restored); err != nil {
+		return domain.Snapshot{}, err
+	}
+	return restored, nil
 }
 
 // checkTwoPhaseLocalCIGate проверяет инварианты приёмки, не запуская e2e-скрипт.
