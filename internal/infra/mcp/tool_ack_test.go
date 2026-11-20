@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"sort"
 	"testing"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // TestAckSetsClaimedAtOnce repeats ack at a later time and checks that the
@@ -888,6 +890,20 @@ func TestAckDecisionHandleStaysOkOnly(t *testing.T) {
 	}
 }
 
+// sortedCheckNames and sortedCheckNamesFromInfo turn the two failed-check
+// projections into comparable slices for the block payload assertions.
+func sortedCheckNames(in []FailedCheck) []string {
+	out := failedCheckNames(in)
+	sort.Strings(out)
+	return out
+}
+
+func sortedCheckNamesFromInfo(in []string) []string {
+	out := append([]string(nil), in...)
+	sort.Strings(out)
+	return out
+}
+
 // TestAckBlockedNotMine proves that a blocked:not_mine decision blocks the
 // Watch in place. The block carries the failed checks from the Watch, the ack
 // time and the session ID from _meta. No new Watch is created and the ack still
@@ -919,7 +935,7 @@ func TestAckBlockedNotMine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Watch after block: %v", err)
 	}
-	if got.Status != blockedWatchStatus || got.Verdict != blockedWatchVerdict {
+	if got.Status != domain.StatusBlocked || got.Verdict != domain.VerdictBlocked {
 		t.Errorf("block did not change Watch: status %q verdict %q", got.Status, got.Verdict)
 	}
 	if got.Revision != w.Revision+1 {
@@ -927,6 +943,24 @@ func TestAckBlockedNotMine(t *testing.T) {
 	}
 	if len(store.watches) != 1 {
 		t.Errorf("block created %d Watches, want 1", len(store.watches))
+	}
+	// The payload bug: status and verdict moved but Blocked stayed nil. Every
+	// reader of the Watch must now see the block details, not just the registry.
+	if got.Blocked == nil {
+		t.Fatal("block did not populate Watch.Blocked")
+	}
+	if got.Blocked.Reason != "not_mine" {
+		t.Errorf("Watch.Blocked.Reason = %q, want not_mine", got.Blocked.Reason)
+	}
+	if !got.Blocked.Since.Equal(clock.t) {
+		t.Errorf("Watch.Blocked.Since = %v, want %v", got.Blocked.Since, clock.t)
+	}
+	if got.Blocked.BlockedBy != "session-blocker" {
+		t.Errorf("Watch.Blocked.BlockedBy = %q, want session-blocker", got.Blocked.BlockedBy)
+	}
+	wantNames := sortedCheckNames(collectFailedChecks(w))
+	if gotNames := sortedCheckNamesFromInfo(got.Blocked.FailedChecks); !reflect.DeepEqual(gotNames, wantNames) {
+		t.Errorf("Watch.Blocked.FailedChecks = %v, want %v", gotNames, wantNames)
 	}
 
 	rec, ok := h.blocked.Lookup(w.ID)
@@ -1049,8 +1083,65 @@ func TestAckBlockedNotMineIdempotent(t *testing.T) {
 	}
 
 	got, err := store.Watch(w.ID)
-	if err != nil || got.Status != blockedWatchStatus || got.Revision != w.Revision+1 {
+	if err != nil || got.Status != domain.StatusBlocked || got.Verdict != domain.VerdictBlocked || got.Revision != w.Revision+1 {
 		t.Errorf("repeat block changed the Watch: %+v err %v", got, err)
+	}
+	if got.Blocked == nil || !got.Blocked.Since.Equal(clock.t.Add(-time.Hour)) || got.Blocked.BlockedBy != "session-first" {
+		t.Errorf("repeat block changed Watch.Blocked: %+v", got.Blocked)
+	}
+}
+
+// TestAckBlockedEscalationMetric proves a successful block escalates once and
+// an idempotent repeat does not increment the counter again. It also checks
+// that the fixer counter is exported as a plain total.
+func TestAckBlockedEscalationMetric(t *testing.T) {
+	metrics := observe.NewMetrics()
+	recorder := observe.NewRecorder(nil, metrics)
+	observe.SetDefault(recorder)
+	defer observe.SetDefault(nil)
+
+	clock := &stepClock{t: time.Date(2026, 11, 20, 11, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictRetry)
+	o := resultObligation(w, "session-metric")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine)}
+
+	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first")
+	if err != nil || !first.Blocked {
+		t.Fatalf("first block with session: receipt %+v err %v", first, err)
+	}
+	assertCounter(t, metrics, observe.CounterBlocksEscalated, 1)
+
+	clock.Advance(time.Hour)
+	if _, err := h.ackReceiptWithSession(context.Background(), in, "session-second"); err != nil {
+		t.Fatalf("repeat block: %v", err)
+	}
+	assertCounter(t, metrics, observe.CounterBlocksEscalated, 1)
+
+	// The fixer spawn path lives in the orchestrator; the counter is exported
+	// and increments through the shared helper that path will call.
+	observe.FixerSpawned(w.ID)
+	assertCounter(t, metrics, observe.CounterFixersSpawned, 1)
+}
+
+func assertCounter(t *testing.T, metrics *observe.Metrics, name string, want int) {
+	t.Helper()
+	var got map[string]any
+	if err := json.Unmarshal(metrics.JSON(), &got); err != nil {
+		t.Fatalf("metrics JSON: %v", err)
+	}
+	v, ok := got[name].(float64)
+	if !ok || int(v) != want {
+		t.Errorf("%s = %v, want %d", name, got[name], want)
 	}
 }
 

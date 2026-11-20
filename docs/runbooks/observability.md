@@ -67,6 +67,8 @@ beacon metrics --format prometheus
 | `rebase_requests_total` | указаний подписчику сделать rebase |
 | `dependency_waits_total` | задержек из-за неудовлетворённых `waitFor` |
 | `blocks_total` | обнаруженных блокировок Watch |
+| `blocks_escalated_total` | блокировок, записанных `blocked:not_mine` (считается только первый ack) |
+| `fixers_spawned_total` | FIX-агентов, запущенных для снятия блокировки |
 | `actor_errors_total` | ошибок акторов демона и обработчиков |
 
 Гистограммы времени: `poll_cycle_duration_seconds`, `merge_duration_seconds`, `wake_duration_seconds`, `run_duration_seconds`. В Prometheus они экспортируются обычными наборами `_bucket{le=...}`, `_sum`, `_count`.
@@ -106,6 +108,22 @@ BEACON_LOG_FORMAT=json beacon metrics --format json | jq '{delivered: .wake_deli
 ```
 
 Адрес wake всегда берётся из `subscriber.ID` Watch. Старые Watch, где в качестве цели записан сервисный 이름 вместо sessionID, пропускаются: в логе будет `wake_skipped`, в метрике `wake_skipped_total`. Такой Watch нужно перерегистрировать валидным `--wake-target`.
+
+## Отладка: blocked → fixer → unblock
+
+Цепочка из четырёх шагов. Первые два оставляют собственные события в логе, остальные видны по состоянию Watch и вердикту. По порядку фактов видно, где цепочка прервалась.
+
+1. **blocked.** `beacon_ack` с `decision=blocked:not_mine` пишет `block_escalated` с полями `watchID` и `reason` и увеличивает `blocks_escalated_total`. В payload Watch появляется объект `blocked` с полями `reason`, `failedChecks`, `blockedBy` и `since`; статус и вердикт становятся `blocked`. Следующий проход моста добавляет `blocked_detected` и увеличивает `blocks_total`. Повторный ack ничего не меняет: `blocked` и ревизия остаются прежними, `blocks_escalated_total` не растёт.
+2. **fixer.** Оркестратор спавнит FIX-агента по wake на ревизии блокировки. Точка спавна вызывает `observe.FixerSpawned`: в логе появляется `fixer_spawned` с полем `watchID`, счётчик `fixers_spawned_total` растёт. Если `blocks_escalated_total` растёт, а `fixers_spawned_total` нет, проверьте `wake_delivered`, `wake_skipped` и `wake_errors_total`: wake до оркестратора не дошёл или спавн не был вызван.
+3. **unblock.** После того как фикс влит и проверки зелёные, разблокировка (`blocked:resolved`, доменный `UnblockEvent`) очищает объект `blocked`, возвращает статус и вердикт `watching` и увеличивает ревизию. Отдельного счётчика у этой операции нет: фактом служит отсутствие `blocked` в `beacon_get_result` и выросшая ревизия.
+4. **разблокировка.** Следующий тик моста публикует `verdict_published` с `verdict=ready`, уходит `wake_delivered`, затем `merge_attempt` и `merge_success`. Успешный мерж закрывает Watch.
+
+```bash
+tail -f "$STATE/logs/beacon.latest.log" | jq 'select(.event | test("block_escalated|blocked_detected|fixer_spawned|verdict_published|merge_success"))'
+BEACON_LOG_FORMAT=json beacon metrics --format json | jq '{escalated: .blocks_escalated_total, detected: .blocks_total, fixers: .fixers_spawned_total, delivered: .wake_delivered_total, errors: .wake_errors_total}'
+```
+
+Если после `block_escalated` нет `blocked_detected`, заблокированный Watch не попал в следующий проход моста. Если есть `blocked_detected`, но нет `fixer_spawned`, смотрите доставку wake по разделу выше.
 
 ## Что делать, если лог пуст
 

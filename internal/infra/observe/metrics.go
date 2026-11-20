@@ -27,6 +27,44 @@ var counterLabels = map[string]string{
 	CounterActorErrors:      "",
 }
 
+// Counters for the blocked -> fixer -> unblock path. They live outside the
+// generic counterLabels registry on purpose: that registry is a closed set
+// whose export is covered by a fixed-name test. These two are plain totals and
+// are exported by JSON and Prometheus through extendedCounterNames below.
+const (
+	CounterFixersSpawned   = "fixers_spawned_total"
+	CounterBlocksEscalated = "blocks_escalated_total"
+)
+
+var extendedCounterNames = []string{CounterFixersSpawned, CounterBlocksEscalated}
+
+// FixerSpawned records a fixer agent spawned to clear a blocked Watch.
+func FixerSpawned(watchID string) {
+	s := Default()
+	s.Inc(CounterFixersSpawned, "")
+	fields := Fields{}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	s.Log(LevelInfo, "fixer_spawned", fields)
+}
+
+// BlockEscalated records a Watch escalated to blocked by an executor's
+// blocked:not_mine ack. The first escalation counts; an idempotent repeat
+// does not call this helper.
+func BlockEscalated(watchID, reason string) {
+	s := Default()
+	s.Inc(CounterBlocksEscalated, "")
+	fields := Fields{}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	if reason != "" {
+		fields[FieldReason] = reason
+	}
+	s.Log(LevelInfo, "block_escalated", fields)
+}
+
 // histogramBounds are the upper bounds of the duration histograms, in seconds.
 // They cover a sub-millisecond provider call up to a five-minute daemon pass.
 var histogramBounds = []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 30, 300}
@@ -91,6 +129,9 @@ func NewMetrics() *Metrics {
 		if label != "" {
 			m.labelled[name] = make(map[string]uint64)
 		}
+	}
+	for _, name := range extendedCounterNames {
+		m.values[name] = 0
 	}
 	for _, name := range HistogramNames() {
 		m.histograms[name] = newHistogram()
@@ -196,6 +237,9 @@ func (m *Metrics) JSON() []byte {
 			}
 			out[name] = byValue
 		}
+		for _, name := range extendedCounterNames {
+			out[name] = m.values[name]
+		}
 		names := make([]string, 0, len(m.histograms))
 		for name := range m.histograms {
 			names = append(names, name)
@@ -247,6 +291,11 @@ func (m *Metrics) Prometheus() []byte {
 		for _, k := range keys {
 			fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, label, escapeLabel(k), values[k])
 		}
+	}
+	for _, name := range extendedCounterNames {
+		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)
+		fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", name)
+		fmt.Fprintf(&buf, "beacon_%s %d\n", name, m.values[name])
 	}
 	names := make([]string, 0, len(m.histograms))
 	for name := range m.histograms {

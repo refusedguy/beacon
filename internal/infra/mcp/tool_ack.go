@@ -42,6 +42,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // Decision is the human's answer to a stopped agent's request for attention
@@ -226,14 +227,19 @@ func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume fun
 	return rec, true, nil
 }
 
-// TODO(T3.379, ADR 0155): заменить этот локальный порт на domain API
-// блокировки Watch (StatusBlocked, VerdictBlocked, BlockInfo, BlockEvent),
-// когда соседняя карточка будет в main. Пока domain не знает о blocked, порт
-// живёт здесь и пишет blocked-статус через уже существующий ackWatchWriter.
-const (
-	blockedWatchStatus  domain.Status  = "blocked"
-	blockedWatchVerdict domain.Verdict = "blocked"
-)
+// failedCheckNames projects the failed checks of an ack onto the string slice
+// the domain BlockedInfo carries. It reuses the same failure filter as
+// beacon_get_result, so the block cannot invent a passing check.
+func failedCheckNames(in []FailedCheck) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	for _, c := range in {
+		out = append(out, c.Name)
+	}
+	return out
+}
 
 // BlockedWatch is the block record written by a blocked:not_mine ack. Reason is
 // the machine-readable verdict class, FailedChecks comes from the Watch at the
@@ -574,10 +580,11 @@ func (h *AckHandler) applyBlockedDecision(in AckInput, w domain.Watch, reason, s
 	if h.blocked == nil {
 		return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: blocked registry is nil")
 	}
+	failed := collectFailedChecks(w)
 	rec := BlockedWatch{
 		WatchID:        in.WatchID,
 		Reason:         reason,
-		FailedChecks:   collectFailedChecks(w),
+		FailedChecks:   failed,
 		Since:          h.clock.Now(),
 		BlockedBy:      sessionID,
 		OrchestratorID: w.OrchestratorID,
@@ -586,21 +593,41 @@ func (h *AckHandler) applyBlockedDecision(in AckInput, w domain.Watch, reason, s
 	if !applied {
 		return rec, false, nil
 	}
-	if err := h.blockWatch(w); err != nil {
+	// The domain BlockInfo is the authoritative payload: it is persisted on the
+	// Watch so every reader sees the reason, the failed checks, the blocker and
+	// the block time. The in-memory BlockedWatch above only guards idempotency.
+	info := domain.BlockedInfo{
+		Reason:       rec.Reason,
+		FailedChecks: failedCheckNames(failed),
+		Since:        rec.Since,
+		BlockedBy:    rec.BlockedBy,
+	}
+	if err := h.blockWatch(w, info); err != nil {
 		return BlockedWatch{}, false, err
 	}
+	observe.BlockEscalated(in.WatchID, reason)
 	return rec, true, nil
 }
 
-// blockWatch writes the local blocked port onto the Watch. It keeps the Watch
-// identity and never emits a create effect: blocking is a state change on the
-// same task, not a retry or a successor. TODO(T3.379, ADR 0155): replace this
-// with the domain BlockEvent transition once that card is in main.
-func (h *AckHandler) blockWatch(w domain.Watch) error {
-	next := w
-	next.Status = blockedWatchStatus
-	next.Verdict = blockedWatchVerdict
-	next.Revision = w.Revision + 1
+// blockWatch applies the domain block transition to the Watch and persists it.
+// Transition fills StatusBlocked, VerdictBlocked and the Blocked info while
+// keeping the Watch identity: blocking changes one task, it never retries or
+// creates a successor. A Watch that is already blocked is a no-op, so neither
+// the revision nor the original block details move.
+func (h *AckHandler) blockWatch(w domain.Watch, info domain.BlockedInfo) error {
+	next, effects := domain.Transition(w, domain.BlockEvent(info, info.Since))
+	if next.Status != domain.StatusBlocked || next.Verdict != domain.VerdictBlocked || next.Blocked == nil {
+		return domain.NewAppError(domain.CodeInvalidInput, "ack: Watch is not live for a block")
+	}
+	if next.Revision == w.Revision {
+		// Already blocked: the domain transition is a no-op, nothing to persist.
+		return nil
+	}
+	for _, effect := range effects {
+		if effect.Kind == domain.EffectCreateWatch {
+			return domain.NewAppError(domain.CodeInvalidInput, "ack: block must not create a new Watch")
+		}
+	}
 	writer, ok := h.store.(ackWatchWriter)
 	if !ok {
 		return nil
