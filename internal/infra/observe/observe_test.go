@@ -75,6 +75,34 @@ func TestHelpersEmitEventsAndIncrementCounters(t *testing.T) {
 	}
 }
 
+func TestFixDeliveredCountsOnlyFixerPath(t *testing.T) {
+	sink := newCaptureSink()
+	SetDefault(sink)
+	defer SetDefault(nil)
+
+	WakeDelivered("opencode", "watch:exec")
+	FixDelivered("watch:fix")
+
+	if sink.counts[CounterFixTotal] != 1 {
+		t.Errorf("счётчик %s = %d, ожидалось 1", CounterFixTotal, sink.counts[CounterFixTotal])
+	}
+	if sink.labels[CounterFixTotal] != "fixer" {
+		t.Errorf("метка role = %q", sink.labels[CounterFixTotal])
+	}
+	if sink.counts[CounterWakeDelivered] != 1 {
+		t.Errorf("счётчик %s = %d, ожидалось 1", CounterWakeDelivered, sink.counts[CounterWakeDelivered])
+	}
+	delivered := false
+	for _, e := range sink.events {
+		if e.name == "fix_delivered" && e.fields[FieldRole] == "fixer" && e.fields[FieldWatchID] == "watch:fix" {
+			delivered = true
+		}
+	}
+	if !delivered {
+		t.Errorf("событие fix_delivered не найдено: %+v", sink.events)
+	}
+}
+
 func TestDefaultSinkIsNoOpWithoutWiring(t *testing.T) {
 	SetDefault(nil)
 	PollCycle()

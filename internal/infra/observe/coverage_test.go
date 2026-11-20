@@ -22,6 +22,7 @@ func TestEveryCounterIsExportedAndIncrements(t *testing.T) {
 		CounterVerdictPublished: LabelVerdict,
 		CounterWakeDelivered:    LabelAdapter,
 		CounterWakeErrors:       LabelAdapter,
+		CounterFixTotal:         LabelRole,
 	}
 	for _, name := range CounterNames() {
 		if label, ok := labelled[name]; ok {
@@ -40,6 +41,7 @@ func TestEveryCounterIsExportedAndIncrements(t *testing.T) {
 		"merge_success_total", "merge_failures_total", "wake_delivered_total",
 		"wake_errors_total", "wake_skipped_total", "rebase_requests_total",
 		"dependency_waits_total", "blocks_total", "actor_errors_total",
+		"fix_total",
 	}
 	if len(want) != len(CounterNames()) {
 		t.Fatalf(" счётчиков %d, ожидалось %d", len(CounterNames()), len(want))
