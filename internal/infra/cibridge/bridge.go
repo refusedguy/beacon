@@ -165,6 +165,26 @@ type Bridge struct {
 	rebaser        Rebaser
 	rebaseMu       sync.Mutex
 	rebased        map[string]bool
+	tracer         observe.Tracer
+}
+
+// WithTracer binds the tracer used for the per-refresh span. It is optional:
+// a nil tracer falls back to observe.Current, so a Bridge built without it
+// keeps the process tracer and its no-op default (T3.394).
+func (b *Bridge) WithTracer(t observe.Tracer) *Bridge {
+	if b != nil {
+		b.tracer = t
+	}
+	return b
+}
+
+// spanTracer resolves the tracer once per call. Callers that inject a tracer
+// get their own recorder; the rest share the process-wide one.
+func (b *Bridge) spanTracer() observe.Tracer {
+	if b != nil && b.tracer != nil {
+		return b.tracer
+	}
+	return observe.Current()
 }
 
 // WithOrchestratorIDSource binds the config fallback used by blocked wakes.
@@ -484,6 +504,11 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	if b == nil || b.store == nil || b.ci == nil {
 		return 0
 	}
+	// One span covers the whole refresh, not one per Watch: fifteen Watches
+	// produce a single beacon.ci.refresh span. The child context lets any
+	// deeper wake hook nest under it (T3.394).
+	ctx, end := b.spanTracer().Start(ctx, "beacon.ci.refresh")
+	defer end()
 	cycleID := newCycleID(b.clock.Now())
 	start := time.Now()
 	updated, skipped := 0, 0

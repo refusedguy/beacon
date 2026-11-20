@@ -887,6 +887,13 @@ func ValidateT210Target(p T210WakePointer) error {
 // T210Deliver is the central path. It binds through the registry only. A
 // pointer with no exact match is skipped, never routed to a guessed session.
 func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, sessions *T211SessionRegistry, adapters *T211AdapterRegistry, deliveries *T211DeliveryRegistry) (T210Receipt, bool) {
+	// One span per delivery attempt, on every exit path. Only identifiers
+	// ride on it: the wake envelope and its prompt text never enter a span.
+	// The process tracer is a no-op unless a caller installed one (T3.394).
+	_, end := observe.Current().Start(ctx, "beacon.wake.deliver",
+		observe.String("watchID", p.WatchID),
+		observe.String("obligation_id", p.ObligationID))
+	defer end()
 	started := time.Now()
 	if err := ValidateT210Target(p); err != nil {
 		observe.WakeSkipped(p.Adapter, p.WatchID, "invalid wake target: "+err.Error())
