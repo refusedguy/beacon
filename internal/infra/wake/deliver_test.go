@@ -8,7 +8,9 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -138,6 +140,141 @@ func TestOpenCodeDelivererRepeatedPointerPostsOnePrompt(t *testing.T) {
 	}
 	if prompts != 2 {
 		t.Fatalf("prompt calls = %d, want 2 after a new revision", prompts)
+	}
+}
+
+// ===== T3.242: per-target delivery lease =====
+
+func TestDeliveryLeaseGuardOwnerAndRestore(t *testing.T) {
+	g := NewDeliveryLeaseGuard(time.Minute)
+	acquired, err := g.Acquire("ses_a", "obl-1")
+	if err != nil || !acquired {
+		t.Fatalf("first acquire = %v, %v", acquired, err)
+	}
+	acquired, err = g.Acquire("ses_a", "obl-1")
+	if err != nil || acquired {
+		t.Fatalf("same owner acquire = %v, %v; want duplicate", acquired, err)
+	}
+	acquired, err = g.Acquire("ses_a", "obl-2")
+	if !errors.Is(err, ErrTargetBusy) || acquired {
+		t.Fatalf("foreign owner acquire = %v, %v; want ErrTargetBusy", acquired, err)
+	}
+	acquired, err = g.Acquire("ses_b", "obl-2")
+	if err != nil || !acquired {
+		t.Fatalf("other target acquire = %v, %v", acquired, err)
+	}
+
+	rows := g.Snapshot()
+	if len(rows) != 2 || rows[0].Target != "ses_a" || rows[1].Target != "ses_b" {
+		t.Fatalf("snapshot = %+v, want ses_a and ses_b in order", rows)
+	}
+	fresh := NewDeliveryLeaseGuard(time.Minute)
+	fresh.Restore(rows)
+	if acquired, err := fresh.Acquire("ses_a", "obl-3"); !errors.Is(err, ErrTargetBusy) || acquired {
+		t.Fatalf("restored lease acquire = %v, %v; want ErrTargetBusy", acquired, err)
+	}
+}
+
+func TestDeliveryLeaseGuardExpiresAndFencedRelease(t *testing.T) {
+	now := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+	g := NewDeliveryLeaseGuard(time.Second)
+	g.SetClock(func() time.Time { return now })
+	if acquired, err := g.Acquire("ses_a", "old"); err != nil || !acquired {
+		t.Fatalf("first acquire = %v, %v", acquired, err)
+	}
+
+	now = now.Add(2 * time.Second)
+	if acquired, err := g.Acquire("ses_a", "new"); err != nil || !acquired {
+		t.Fatalf("acquire after expiry = %v, %v", acquired, err)
+	}
+	g.Release("ses_a", "old")
+	if acquired, err := g.Acquire("ses_a", "third"); !errors.Is(err, ErrTargetBusy) || acquired {
+		t.Fatalf("stale release freed a live lease: %v, %v", acquired, err)
+	}
+	g.Release("ses_a", "new")
+	if acquired, err := g.Acquire("ses_a", "third"); err != nil || !acquired {
+		t.Fatalf("acquire after real release = %v, %v", acquired, err)
+	}
+}
+
+func TestOpenCodeDelivererSerializesConcurrentWakesToSameTarget(t *testing.T) {
+	const sessionID = "ses_concurrent"
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var prompts int
+	d := &OpenCodeDeliverer{
+		PromptFunc: func(context.Context, string, string, string) error {
+			mu.Lock()
+			prompts++
+			mu.Unlock()
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	}
+	first := domain.WakePayload{
+		WatchID: "watch", ObligationID: domain.ObligationKey("watch", 1, sessionID), Revision: 1,
+	}
+	second := domain.WakePayload{
+		WatchID: "watch", ObligationID: domain.ObligationKey("watch", 2, sessionID), Revision: 2,
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- d.Deliver(context.Background(), sessionID, first) }()
+	<-started
+	go func() { errs <- d.Deliver(context.Background(), sessionID, second) }()
+	if err := <-errs; !errors.Is(err, ErrTargetBusy) {
+		t.Fatalf("second wake error = %v, want ErrTargetBusy", err)
+	}
+	close(release)
+	if err := <-errs; err != nil {
+		t.Fatalf("first wake: %v", err)
+	}
+	mu.Lock()
+	got := prompts
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("prompt calls = %d, want 1", got)
+	}
+}
+
+func TestOpenCodeDelivererCoalescesConcurrentDuplicateWake(t *testing.T) {
+	const sessionID = "ses_dup"
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var prompts int
+	d := &OpenCodeDeliverer{
+		PromptFunc: func(context.Context, string, string, string) error {
+			mu.Lock()
+			prompts++
+			mu.Unlock()
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	}
+	p := domain.WakePayload{
+		WatchID: "watch", ObligationID: domain.ObligationKey("watch", 1, sessionID), Revision: 1,
+	}
+
+	errs := make(chan error, 2)
+	go func() { errs <- d.Deliver(context.Background(), sessionID, p) }()
+	<-started
+	go func() { errs <- d.Deliver(context.Background(), sessionID, p) }()
+	if err := <-errs; err != nil {
+		t.Fatalf("duplicate wake error = %v, want nil", err)
+	}
+	close(release)
+	if err := <-errs; err != nil {
+		t.Fatalf("first wake: %v", err)
+	}
+	mu.Lock()
+	got := prompts
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("prompt calls = %d, want 1", got)
 	}
 }
 
