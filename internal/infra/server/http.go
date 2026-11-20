@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -202,4 +203,47 @@ func (s *HTTPServer) Close() error {
 		}
 	})
 	return s.closeErr
+}
+
+// Readiness gates the health endpoint on completed initialization. A process
+// that has not yet opened its database, applied migrations and started its
+// workers must not answer 200 on /healthz: a caller would otherwise treat a
+// half-booted instance as ready for traffic. Until MarkReady is called the
+// gate answers 503 (BS.3, E01).
+type Readiness struct {
+	ready atomic.Bool
+}
+
+// MarkReady records that initialization finished. It is safe to call more
+// than once and safe under concurrent use.
+func (r *Readiness) MarkReady() { r.ready.Store(true) }
+
+// IsReady reports whether MarkReady has been called.
+func (r *Readiness) IsReady() bool { return r.ready.Load() }
+
+// Health returns the readiness-gated /healthz handler. Before MarkReady a
+// valid request gets 503; afterwards it gets 200. Other paths get 404 and
+// non-GET methods 405, matching the liveness handler this gates. The path is
+// HealthPath so the gate drops into the existing listener without a route
+// change.
+func (r *Readiness) Health() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != HealthPath {
+			http.NotFound(w, req)
+			return
+		}
+		if req.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !r.IsReady() {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			http.Error(w, "not ready\n", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
+	})
 }
