@@ -18,8 +18,10 @@ import (
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/github"
+	"github.com/refusedguy/beacon/internal/infra/ladder"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
@@ -385,10 +387,13 @@ func openProcessStore(dir string) (*store.DB, error) {
 // process-local zero. The snapshot reads LiveWatches, which includes blocked
 // Watches, and surfaces the last saved runtime-stats payload as diagnostics.
 func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mcp.Dependencies {
+	// One stateless Ladder over the one store handle. The same instance backs
+	// the read/claim decorators, the bridge wake path and the stats projection.
+	lad := ladder.New(db)
 	return mcp.Dependencies{
 		Store:           db,
-		Stamper:         mcp.NewSQLObligationStamper(db),
-		Writer:          mcp.NewSQLWaitResultWriter(db),
+		Stamper:         ladderStamper{ObligationStamper: mcp.NewSQLObligationStamper(db), ladder: lad},
+		Writer:          ladderWaitWriter{WaitResultWriter: mcp.NewSQLWaitResultWriter(db), ladder: lad},
 		Events:          mcp.NewSQLCancelEventLog(db),
 		SharedCIWaiter:  sharedCIWaiter,
 		PrecheckJournal: taskcli.NewService(taskcli.Config{StateDir: dir}),
@@ -405,12 +410,15 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 				return mcp.StateSnapshot{}, err
 			}
 			pointsUsed, pointBudget := pointsValue(points)
+			pending, escalated := ladderCounts(db)
 			snap := mcp.StateSnapshot{
-				ActiveWatches:  live,
-				LiveWatches:    live,
-				PointsThisHour: pointsUsed,
-				Budget:         pointBudget,
-				Version:        mcp.ServerVersion,
+				ActiveWatches:   live,
+				LiveWatches:     live,
+				PointsThisHour:  pointsUsed,
+				Budget:          pointBudget,
+				LadderPending:   pending,
+				LadderEscalated: escalated,
+				Version:         mcp.ServerVersion,
 			}
 			if raw, ok, err := db.LoadRuntimeStats(); err != nil {
 				snap.LoadErrors = append(snap.LoadErrors, "runtime_stats: "+err.Error())
@@ -433,6 +441,114 @@ func pointsValue(points func() (int, int)) (int, int) {
 		budget = github.BudgetPerHour
 	}
 	return used, budget
+}
+
+// ---------------------------------------------------------------------------
+// Wake ladder wiring (ADR 0017).
+//
+// The ladder core lives in internal/infra/ladder and depends on narrow ports.
+// This composition root binds those ports to the single *store.DB handle, the
+// wake registry and the project orchestrator source. No file operation lives
+// here: rung 2's ESCALATIONS.md append is done by the ladder package.
+// ---------------------------------------------------------------------------
+
+// ladderWallClock is the real clock handed to the escalator. The transitions
+// themselves take time from the caller and read no clock.
+type ladderWallClock struct{}
+
+func (ladderWallClock) Now() time.Time { return time.Now() }
+
+// ladderStamper stops every ladder timer as soon as a read or claim is stamped.
+// beacon_get_result and beacon_ack both go through ObligationStamper, so
+// decorating it keeps the tools and the bridge read path in sync without the
+// mcp package importing the ladder (ADR 0005).
+type ladderStamper struct {
+	mcp.ObligationStamper
+	ladder *ladder.Ladder
+}
+
+func (s ladderStamper) StampRead(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error) {
+	o, applied, err := s.ObligationStamper.StampRead(ctx, id, at)
+	if err != nil || !applied {
+		return o, applied, err
+	}
+	stopLadder(s.ladder, ctx, id, at, true)
+	return o, applied, nil
+}
+
+func (s ladderStamper) StampClaimed(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error) {
+	o, applied, err := s.ObligationStamper.StampClaimed(ctx, id, at)
+	if err != nil || !applied {
+		return o, applied, err
+	}
+	stopLadder(s.ladder, ctx, id, at, false)
+	return o, applied, nil
+}
+
+// ladderWaitWriter decorates beacon_wait_result's writer. A waiting caller that
+// receives a verdict has read it, so all ladder timers stop with the stamp.
+type ladderWaitWriter struct {
+	mcp.WaitResultWriter
+	ladder *ladder.Ladder
+}
+
+func (w ladderWaitWriter) MarkRead(ctx context.Context, obligationID string, at time.Time) error {
+	if err := w.WaitResultWriter.MarkRead(ctx, obligationID, at); err != nil {
+		return err
+	}
+	stopLadder(w.ladder, ctx, obligationID, at, true)
+	return nil
+}
+
+// stopLadder cancels the timers of an obligation that was just read or claimed.
+// An obligation that was never staged has no ladder to stop, which is the
+// normal case for legacy obligations, so ErrNotStaged is not a tool failure.
+func stopLadder(l *ladder.Ladder, ctx context.Context, id string, at time.Time, read bool) {
+	if l == nil {
+		return
+	}
+	var err error
+	if read {
+		err = l.MarkRead(ctx, id, at)
+	} else {
+		err = l.MarkClaimed(ctx, id, at)
+	}
+	if err != nil && !errors.Is(err, ladder.ErrNotStaged) {
+		observe.ActorError("ladder-stop", id, err)
+	}
+}
+
+// bridgeLadder adapts *ladder.Ladder to the domain-shaped port cibridge takes.
+// Only the Record signature differs; Stage already matches exactly.
+type bridgeLadder struct{ l *ladder.Ladder }
+
+func (b bridgeLadder) Stage(ctx context.Context, o domain.Obligation, verdict domain.Verdict, at time.Time) error {
+	return b.l.Stage(ctx, o, verdict, at)
+}
+
+func (b bridgeLadder) Record(ctx context.Context, obligationID string, attempt int, outcome domain.AttemptOutcome, at time.Time) error {
+	return b.l.Record(ctx, ladder.Receipt{
+		ObligationID: obligationID, Attempt: attempt, Outcome: outcome, At: at,
+	})
+}
+
+// ladderCounts reads the pending and escalated counters of beacon_stats.ladder
+// through the single writer the ladder uses. A failed read logs and reports
+// zero, so a broken counter never fails the observability tool.
+func ladderCounts(db *store.DB) (int, int) {
+	if db == nil {
+		return 0, 0
+	}
+	l := ladder.New(db)
+	pending, err := l.PendingCount(context.Background())
+	if err != nil {
+		observe.ActorError("ladder-pending", "", err)
+	}
+	escalated, err := ladder.NewEscalationStore(db).EscalatedCount(context.Background())
+	if err != nil {
+		observe.ActorError("ladder-escalated", "", err)
+	}
+	return pending, escalated
 }
 
 // runMCP reads the connection file on every startup, applies the endpoint and
@@ -697,17 +813,141 @@ func reconcileWaker(db *store.DB) *wake.Registry {
 	return registry
 }
 
+// ladderPointerSender delivers rung 1 pings through the same wake registry the
+// bridge uses. The payload carries identifiers only, never result content
+// (ADR 0017). An empty registry is a no-op so an unconfigured host cannot fake
+// a delivery.
+type ladderPointerSender struct {
+	registry *wake.Registry
+}
+
+func (s ladderPointerSender) Send(ctx context.Context, target string, p domain.Pointer) error {
+	if s.registry == nil || target == "" {
+		return nil
+	}
+	return s.registry.Deliver(ctx, wake.AdapterOpenCode, target, domain.WakePayload{
+		WatchID:      p.WatchID,
+		ObligationID: p.ObligationID,
+		Revision:     p.Revision,
+		Verdict:      "ladder rung 1: снимите результат через beacon_get_result",
+	})
+}
+
+// makeEscalator binds the escalation core to the process' single store handle,
+// the wake registry and the project orchestrator source. The ESCALATIONS.md
+// path stays in the state directory next to the store (ADR 0017, T3.10).
+func makeEscalator(cfg reconcileConfig) *ladder.Escalator {
+	orchestratorID := orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)
+	return ladder.NewEscalator(
+		ladder.NewStagedEpisodeStore(cfg.db, orchestratorID),
+		ladder.NewEscalationStore(cfg.db),
+		ladderPointerSender{registry: reconcileWaker(cfg.db)},
+		ladderWallClock{},
+		filepath.Join(cfg.dir, "ESCALATIONS.md"),
+	)
+}
+
+// resendLadderPointer repeats the same obligationID and revision for a
+// transport-failed attempt. It records a posted receipt on success so the
+// branch switches to the no-retry evidence wait; a delivery failure leaves the
+// transport-failed branch armed for the next retry.
+func resendLadderPointer(ctx context.Context, cfg reconcileConfig, waker *wake.Registry, l *ladder.Ladder, action ladder.Action, now time.Time) error {
+	o, err := cfg.db.Obligation(action.ObligationID)
+	if err != nil {
+		return err
+	}
+	w, err := cfg.db.Watch(o.WatchID)
+	if err != nil {
+		return err
+	}
+	var target, adapter string
+	for _, sub := range w.Subscribers {
+		if sub.ID != o.SubscriberID {
+			continue
+		}
+		target = sub.Target
+		if target == "" {
+			target = sub.ID
+		}
+		adapter = sub.Adapter
+		break
+	}
+	if target == "" {
+		return nil
+	}
+	if adapter == "" {
+		adapter = wake.AdapterOpenCode
+	}
+	p := domain.WakePayload{
+		WatchID:      o.WatchID,
+		ObligationID: action.ObligationID,
+		Revision:     o.Revision,
+		Verdict:      "ladder retry: снимите результат через beacon_get_result",
+	}
+	if err := waker.Deliver(ctx, adapter, target, p); err != nil {
+		return err
+	}
+	return l.Record(ctx, ladder.Receipt{
+		ObligationID: action.ObligationID,
+		Attempt:      action.Attempt,
+		Outcome:      domain.OutcomePosted,
+		At:           now,
+	})
+}
+
+// runLadderPass advances the due ADR 0017 timers and runs the escalation rungs
+// in the same cycle as the CI bridge. The ladder marker is the only clock, so
+// a process restart resumes at the last persisted position.
+func runLadderPass(ctx context.Context, cfg reconcileConfig) {
+	if cfg.db == nil {
+		return
+	}
+	l := ladder.New(cfg.db)
+	now := time.Now()
+	due, err := l.Due(ctx, now)
+	if err != nil {
+		observe.ActorError("ladder-due", "", err)
+		return
+	}
+	var waker *wake.Registry
+	for _, d := range due {
+		action, err := l.Advance(ctx, d.ObligationID, d.At)
+		if err != nil {
+			observe.ActorError("ladder-advance", d.ObligationID, err)
+			continue
+		}
+		switch action.Kind {
+		case ladder.ActionRetry:
+			if waker == nil {
+				waker = reconcileWaker(cfg.db)
+			}
+			if err := resendLadderPointer(ctx, cfg, waker, l, action, now); err != nil {
+				observe.ActorError("ladder-retry", action.ObligationID, err)
+			}
+		case ladder.ActionEvidence:
+			// Claimed and read already stopped the marker. A quiet episode is
+			// handed to the escalation rungs below.
+		}
+	}
+	if _, err := makeEscalator(cfg).Run(ctx); err != nil {
+		observe.ActorError("ladder-escalation", "", err)
+	}
+}
+
 // ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
-// with domain.EvaluatePR, merges and wakes through the wired ports, then the
-// in-process counters are saved to runtime_stats. It returns the number of
-// watches the bridge updated.
+// with domain.EvaluatePR, merges and wakes through the wired ports, the wake
+// ladder advances its due timers and escalation rungs, then the in-process
+// counters are saved to runtime_stats. It returns the number of watches the
+// bridge updated.
 func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
+	runLadderPass(ctx, cfg)
 	if cfg.db == nil || cfg.batch == nil {
 		return 0
 	}
 	bridge := cibridge.New(cfg.db, cfg.batch, cfg.deps.Clock, 0)
 	bridge.WithWaker(reconcileWaker(cfg.db)).
 		WithReader(cfg.deps.Stamper).
+		WithLadder(bridgeLadder{l: ladder.New(cfg.db)}).
 		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
 		WithMerger(cfg.batch).
 		WithBlockerControl(cfg.db)

@@ -505,6 +505,32 @@ func (l *Ladder) Due(ctx context.Context, now time.Time) ([]Due, error) {
 	return out, err
 }
 
+// PendingCount returns the number of obligations whose latest ladder marker is
+// still active, i.e. waiting for a retry or the evidence check. It is the
+// pending half of beacon_stats.ladder and reads no process-local state.
+func (l *Ladder) PendingCount(ctx context.Context) (int, error) {
+	n := 0
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureJournal(tx); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM ladder_journal j
+			JOIN (
+			  SELECT obligation_id, MAX(seq) AS seq FROM ladder_journal
+			  GROUP BY obligation_id
+			) latest ON j.seq = latest.seq
+			WHERE j.status = ?`, string(StatusActive)).Scan(&n)
+	})
+	if err != nil {
+		return 0, fmt.Errorf("ladder: pending count: %w", err)
+	}
+	return n, nil
+}
+
 // Advance consumes the timer that fired for id at at. It appends the new
 // position to the journal and returns the action the caller should perform.
 // A call before the next timer, on a stopped marker, or on a marker with no

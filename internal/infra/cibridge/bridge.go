@@ -73,6 +73,20 @@ type ReadStamper interface {
 	StampRead(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error)
 }
 
+// WakeLadder drives the ADR 0017 delivery lifecycle of an obligation. The
+// production implementation is ladder.Ladder, bound by the composition root.
+// The port uses domain types only, so Bridge stays independent of sibling
+// infra packages (ADR 0005).
+//
+// Stage arms the ladder when a wake goes out, for the obligation that carries
+// that pointer. Record consumes the delivery outcome: posted means no retries,
+// transport-failed repeats the same pointer, indeterminate (no receipt, dead
+// session) is never retried.
+type WakeLadder interface {
+	Stage(ctx context.Context, o domain.Obligation, verdict domain.Verdict, at time.Time) error
+	Record(ctx context.Context, obligationID string, attempt int, outcome domain.AttemptOutcome, at time.Time) error
+}
+
 // OrchestratorIDSource returns the project-configured orchestrator session.
 // The app layer owns the config file, so Bridge takes the value through this
 // port and stays independent of it.
@@ -114,6 +128,7 @@ type Bridge struct {
 	waker          domain.WakeDeliverer
 	adapterWaker   domain.AdapterWakeDeliverer
 	reader         ReadStamper
+	ladder         WakeLadder
 	escalate       escalationWriter
 	orchestratorID OrchestratorIDSource
 }
@@ -136,6 +151,44 @@ func (b *Bridge) WithReader(s ReadStamper) *Bridge {
 	}
 	b.reader = s
 	return b
+}
+
+// WithLadder binds the wake ladder. Without one the bridge still stages and
+// delivers obligations, but no ADR 0017 timers are armed and no delivery
+// outcome is recorded for retries or escalation.
+func (b *Bridge) WithLadder(l WakeLadder) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.ladder = l
+	return b
+}
+
+// stage arms the ladder for the obligation behind a wake. The call is
+// idempotent in the ladder, so an at-least-once refresh cannot reset a position
+// that is already running.
+func (b *Bridge) stage(ctx context.Context, o domain.Obligation, verdict domain.Verdict, at time.Time) {
+	if b == nil || b.ladder == nil || o.ID == "" {
+		return
+	}
+	if verdict == "" {
+		verdict = o.VerdictPointer
+	}
+	if err := b.ladder.Stage(ctx, o, verdict, at); err != nil {
+		observe.ActorError("ladder-stage", o.ID, err)
+	}
+}
+
+// recordDelivery hands one delivery outcome to the ladder. Posted means no
+// retries; a dead session is indeterminate and is never retried; any other
+// delivery error is a transport failure that repeats the same pointer.
+func (b *Bridge) recordDelivery(ctx context.Context, obligationID string, attempt int, outcome domain.AttemptOutcome, at time.Time) {
+	if b == nil || b.ladder == nil || obligationID == "" {
+		return
+	}
+	if err := b.ladder.Record(ctx, obligationID, attempt, outcome, at); err != nil {
+		observe.ActorError("ladder-record", obligationID, err)
+	}
 }
 
 // WithWaker binds a wake adapter. A non-terminal verdict then steers each
@@ -905,13 +958,15 @@ func (b *Bridge) notifyBlocked(ctx context.Context, w domain.Watch, dedup string
 
 	obligationID := domain.ObligationKey(w.ID, w.Revision, sessionID)
 	if _, err := b.store.Obligation(obligationID); err != nil {
-		if err := b.store.SaveObligation(domain.Obligation{
+		o := domain.Obligation{
 			ID: obligationID, WatchID: w.ID, Revision: w.Revision,
 			SubscriberID: sessionID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
-		}); err != nil {
+		}
+		if err := b.store.SaveObligation(o); err != nil {
 			log.Printf("cibridge: blocked obligation %s: %v", obligationID, err)
 			return false
 		}
+		b.stage(ctx, o, domain.VerdictBlocked, now)
 	}
 	p := domain.WakePayload{
 		WatchID: w.ID, ObligationID: obligationID,
@@ -925,12 +980,18 @@ func (b *Bridge) notifyBlocked(ctx context.Context, w domain.Watch, dedup string
 		deliverErr = b.waker.Deliver(ctx, sessionID, p)
 	}
 	if deliverErr != nil {
+		outcome := domain.OutcomeTransportFailed
+		if isDeadSessionErr(deliverErr) {
+			outcome = domain.OutcomeIndeterminate
+		}
+		b.recordDelivery(ctx, obligationID, 1, outcome, now)
 		observe.WakeFailed(adapter, w.ID, deliverErr, w.Revision)
 		observe.ActorError("wake-blocked", w.ID, deliverErr)
 		log.Printf("cibridge: blocked wake %s: %v", sessionID, deliverErr)
 		return false
 	}
 	observe.WakeDelivered(adapter, w.ID, w.Revision)
+	b.recordDelivery(ctx, obligationID, 1, domain.OutcomePosted, now)
 	b.markDelivered(dedup, now, 1, "")
 	b.markDelivered(obligationID, now, 1, "")
 	b.cycleEvent(cycleID, "block_escalation", observe.Fields{
@@ -1055,7 +1116,13 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 		Revision:     w.Revision,
 		Verdict:      text,
 	}
+	// Arm the ladder at delivery, not at obligation creation. Subscribers that
+	// only own a readable pointer are not woken and must not escalate.
+	if o, err := b.store.Obligation(p.ObligationID); err == nil {
+		b.stage(ctx, o, "", now)
+	}
 	start := time.Now()
+	attempt := b.wakeCount(w) + 1
 	var deliverErr error
 	if sw, ok := b.adapterWaker.(interface {
 		DeliverToSubscriber(context.Context, domain.Watch, domain.WakePayload, string) error
@@ -1067,6 +1134,13 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 		deliverErr = b.waker.Deliver(ctx, target, p)
 	}
 	if deliverErr != nil {
+		outcome := domain.OutcomeTransportFailed
+		if isDeadSessionErr(deliverErr) {
+			// A dead session can never send a receipt. It is indeterminate,
+			// which the ladder never retries (ADR 0017).
+			outcome = domain.OutcomeIndeterminate
+		}
+		b.recordDelivery(ctx, p.ObligationID, attempt, outcome, now)
 		observe.WakeFailed(sub.Adapter, w.ID, deliverErr, w.Revision)
 		observe.ActorError("wake", w.ID, deliverErr)
 		log.Printf("cibridge: wake %s: %v", target, deliverErr)
@@ -1077,7 +1151,7 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 	}
 	observe.WakeDuration(sub.Adapter, time.Since(start))
 	observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
-	attempt := b.wakeCount(w) + 1
+	b.recordDelivery(ctx, p.ObligationID, attempt, domain.OutcomePosted, now)
 	b.recordWake(w, now, attempt)
 	b.markDelivered(p.ObligationID, now, attempt, "")
 	b.cycleEvent(cycleID, "wake", observe.Fields{
@@ -1178,12 +1252,14 @@ func (b *Bridge) markOrphaned(ctx context.Context, w domain.Watch, sub domain.Su
 	if o, err := b.store.Obligation(id); err == nil && !o.DeliveredAt.IsZero() {
 		return
 	} else if err != nil {
-		if err := b.store.SaveObligation(domain.Obligation{
+		o := domain.Obligation{
 			ID: id, WatchID: current.ID, Revision: current.Revision,
 			SubscriberID: sessionID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
-		}); err != nil {
+		}
+		if err := b.store.SaveObligation(o); err != nil {
 			return
 		}
+		b.stage(ctx, o, domain.VerdictBlocked, now)
 	}
 	p := domain.WakePayload{
 		WatchID: current.ID, ObligationID: id, Revision: current.Revision,
@@ -1196,9 +1272,15 @@ func (b *Bridge) markOrphaned(ctx context.Context, w domain.Watch, sub domain.Su
 		deliverErr = b.waker.Deliver(ctx, sessionID, p)
 	}
 	if deliverErr != nil {
+		outcome := domain.OutcomeTransportFailed
+		if isDeadSessionErr(deliverErr) {
+			outcome = domain.OutcomeIndeterminate
+		}
+		b.recordDelivery(ctx, id, 1, outcome, now)
 		observe.WakeFailed("", current.ID, deliverErr, current.Revision)
 		return
 	}
+	b.recordDelivery(ctx, id, 1, domain.OutcomePosted, now)
 	b.markDelivered(id, now, 1, "")
 	b.cycleEvent(cycleID, "executor_orphaned", observe.Fields{
 		"watchID": current.ID, "subscriberID": sub.ID, "sessionID": sessionID,
