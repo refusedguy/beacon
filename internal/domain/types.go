@@ -111,10 +111,34 @@ type FlakyConfig struct {
 	Used       map[string]int `json:"used"`
 }
 
-// Policy holds per-watch verification settings.
+// DefaultMaxWakesPerWatch bounds the wake attempts for one Watch. After this
+// many wakes without green CI, the orchestrator parks the Watch instead of
+// spending more wake budget on it.
+const DefaultMaxWakesPerWatch = 6
+
+// Policy holds per-watch verification settings. MaxWakesPerWatch uses zero as
+// the unset value; WakeCap resolves it to DefaultMaxWakesPerWatch.
 type Policy struct {
-	RequireUpToDate bool `json:"requireUpToDate"`
-	IgnoreReviews   bool `json:"ignoreReviews"`
+	RequireUpToDate  bool `json:"requireUpToDate"`
+	IgnoreReviews    bool `json:"ignoreReviews"`
+	MaxWakesPerWatch int  `json:"maxWakesPerWatch"`
+}
+
+// WakeCap returns the effective wake limit for a Watch. A zero or negative
+// setting selects the default, so a legacy policy without the new field gets
+// the same limit as a fresh one.
+func (p Policy) WakeCap() int {
+	if p.MaxWakesPerWatch <= 0 {
+		return DefaultMaxWakesPerWatch
+	}
+	return p.MaxWakesPerWatch
+}
+
+// DefaultPolicy returns the verification settings used when a caller supplies
+// none. The wake limit is stated explicitly so it cannot drift from the
+// constant.
+func DefaultPolicy() Policy {
+	return Policy{MaxWakesPerWatch: DefaultMaxWakesPerWatch}
 }
 
 // MergePolicy holds the auto-merge settings of a Watch. WaitFor and WaitForMain

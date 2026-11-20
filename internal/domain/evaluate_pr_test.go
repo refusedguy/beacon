@@ -225,6 +225,28 @@ func TestRoleFixerIsValidWakeRole(t *testing.T) {
 	}
 }
 
+func TestPolicyWakeCap(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		p    Policy
+		want int
+	}{
+		{name: "zero uses the default", p: Policy{}, want: 6},
+		{name: "negative uses the default", p: Policy{MaxWakesPerWatch: -1}, want: 6},
+		{name: "positive value wins", p: Policy{MaxWakesPerWatch: 3}, want: 3},
+		{name: "default policy is explicit", p: DefaultPolicy(), want: DefaultMaxWakesPerWatch},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.p.WakeCap(); got != tt.want {
+				t.Errorf("WakeCap() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+	if DefaultMaxWakesPerWatch != 6 {
+		t.Fatalf("DefaultMaxWakesPerWatch = %d, want 6", DefaultMaxWakesPerWatch)
+	}
+}
+
 // The legacy Evaluate keeps its ship-formula gate: a snapshot that is ready for
 // EvaluatePR must still be watched when no ship facts were observed.
 func TestEvaluatePRDoesNotChangeEvaluate(t *testing.T) {
