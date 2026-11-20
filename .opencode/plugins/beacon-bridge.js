@@ -160,6 +160,80 @@ function emitEvidence(paths, obj) {
   }
 }
 
+// W6-C: честная квитанция в receipts.jsonl. Это файловая граница с Go:
+// ImportReceipts читает только целые строки и ключует их по
+// (obligationID, attempt). Плагин пишет ровно тот исход, который наблюдал,
+// поэтому posted не выдаётся за успех, если доставить не удалось. Поля source
+// и version здесь намеренно отсутствуют: у доставки нет публичного артефакта,
+// а выдуманный путь мог бы выглядеть как источник из ADR 0027. Лишние поля
+// (sessionID, via) store игнорирует, но они помогают внешнему наблюдателю.
+export function appendReceiptLog(paths, receipt) {
+  const line = JSON.stringify({
+    obligationID: receipt.obligationID,
+    attempt: receipt.attempt,
+    outcome: receipt.outcome,
+    at: receipt.at ?? new Date().toISOString(),
+    ...(receipt.sessionID ? { sessionID: receipt.sessionID } : {}),
+    ...(receipt.via ? { via: receipt.via } : {}),
+  }) + "\n"
+  try {
+    appendFileSync(paths.receiptLog, line)
+    return true
+  } catch {
+    // fail-open: квитанция не ломает сессию (ADR 0006).
+    return false
+  }
+}
+
+// W6-C: пинг может уйти напрямую из Go, минуя вызов ctx.session.prompt в
+// плагине. Тогда плагин не может честно написать posted по результату prompt:
+// он его не делал. Единственное доступное ему доказательство реального старта
+// модели — событие session.execution.started. По нему плагин дописывает
+// подтверждение в receipts.jsonl и plugin-events.jsonl. Идентификаторы берутся
+// из wake-pointer, который Go оставляет в том же каталоге состояния; без
+// указателя подтверждение остаётся только в plugin-events.jsonl.
+export function confirmExecutionStart(paths, event, project = null) {
+  const d = event?.data ?? event?.properties ?? {}
+  const sessionID = d.sessionID ?? null
+  let pointer = null
+  try {
+    pointer = readWakePointer(paths.state, project)
+  } catch {
+    pointer = null
+  }
+  if (!pointer || typeof pointer.obligationID !== "string" || !pointer.obligationID ||
+      !Number.isInteger(pointer.attempt)) {
+    emitEvidence(paths, {
+      kind: "execution-started-unbound",
+      type: "session.execution.started",
+      sessionID,
+      project,
+    })
+    return null
+  }
+  if (pointer.sessionID && sessionID && pointer.sessionID !== sessionID) {
+    return null
+  }
+  const receipt = appendReceiptLog(paths, {
+    obligationID: pointer.obligationID,
+    attempt: pointer.attempt,
+    outcome: "posted",
+    at: new Date().toISOString(),
+    sessionID,
+    via: "execution-started",
+  })
+  emitEvidence(paths, {
+    kind: "execution-started-confirmed",
+    type: "session.execution.started",
+    sessionID,
+    obligationID: pointer.obligationID,
+    attempt: pointer.attempt,
+    project,
+    receipt,
+  })
+  return receipt
+}
+
 // Читает review-указатель, который адаптер со стороны Beacon оставляет в
 // каталоге состояния. Отсутствие файла — не ошибка: это состояние покоя.
 export function readWakePointer(stateDir = adapterPaths.state, project = null) {
@@ -271,6 +345,15 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
     outcome = "transport-failed"
   }
   const receipt = await writeReceipt(stateDir, pointer, outcome)
+  // W6-C: та же квитанция в general-purpose receipts.jsonl, откуда ImportReceipts
+  // обновляет обязательство. wx-файл выше сохраняют для обратной совместимости
+  // адаптер-тестов и evals.
+  appendReceiptLog(statePaths(stateDir), {
+    obligationID: pointer.obligationID,
+    attempt: pointer.attempt,
+    outcome,
+    via: "review",
+  })
   return { delivery: STEER_DELIVERY, outcome, receipt }
 }
 
@@ -325,6 +408,19 @@ async function deliverEvent(ctx, item, paths, project = null) {
     try { renameSync(c.path, `${c.path}.failed`) } catch { /* fail-open */ }
     appendFileSync(paths.receiptLog,
       JSON.stringify({ id, sessionID, state: "transport-failed", t: new Date().toISOString() }) + "\n")
+  }
+  // W6-C: если событие несёт идентификаторы обязательства, добавляем честную
+  // квитанцию в формате ImportReceipts рядом с уже существующей строкой state.
+  // Старая строка нужна адаптер-тестам и e2e, новая — store.
+  if (typeof item.obligationID === "string" && item.obligationID &&
+      Number.isInteger(item.attempt)) {
+    appendReceiptLog(paths, {
+      obligationID: item.obligationID,
+      attempt: item.attempt,
+      outcome,
+      sessionID,
+      via: "s2",
+    })
   }
   return { id, outcome }
 }
@@ -424,6 +520,12 @@ const plugin = {
             sessionID: d.sessionID ?? null,
             project,
           })
+          // W6-C: реальный старт модели подтверждается только событием хоста.
+          // Для доставки самим плагином это лишнее свидетельство, для пинга
+          // напрямую из Go — единственный честный источник posted.
+          if (event.type === "session.execution.started") {
+            confirmExecutionStart(paths, event, project)
+          }
           if (event.type !== "beacon.review.comment") continue
           const pointer = readWakePointer(stateDir, project)
           if (!pointer || pointer.source !== REVIEW_SOURCE) continue
@@ -893,6 +995,138 @@ const adapterCases = [
       for (const needle of needles) {
         assert.equal(source.includes(needle), false, needle)
       }
+    },
+  },
+  {
+    // W6-C: честная квитанция пишется в receipts.jsonl в формате, который
+    // читает ImportReceipts. Исход берётся из реального результата prompt:
+    // ошибка транспорта не превращается в posted.
+    name: "W6-C: deliverReviewPointer аппендит честную квитанцию в receipts.jsonl",
+    async check(assert) {
+      const stateDir = mkdtempSync(join(tmpdir(), "beacon-w6c-receipts-"))
+      const pointer = reviewPointer({ obligationID: "obl-w6c-posted", attempt: 3 })
+      const h = promptHarness()
+      await deliverReviewPointer(h.ctx, pointer, stateDir)
+
+      const lines = readFileSync(join(stateDir, "receipts.jsonl"), "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      const r = lines.find((line) => line.obligationID === pointer.obligationID)
+      assert.ok(r, "честная квитанция отсутствует в receipts.jsonl")
+      assert.equal(r.attempt, 3)
+      assert.equal(r.outcome, "posted")
+      assert.equal(r.via, "review")
+      assert.equal(Number.isNaN(Date.parse(r.at)), false)
+      // Source и version не выдумываются: у доставки нет публичного артефакта.
+      assert.equal(Object.hasOwn(r, "source"), false)
+      assert.equal(Object.hasOwn(r, "verified"), false)
+
+      const failDir = mkdtempSync(join(tmpdir(), "beacon-w6c-failed-"))
+      const failed = reviewPointer({ obligationID: "obl-w6c-failed", attempt: 4 })
+      const fh = promptHarness({ fail: true })
+      const result = await deliverReviewPointer(fh.ctx, failed, failDir)
+      assert.equal(result.outcome, "transport-failed")
+      const failedLines = readFileSync(join(failDir, "receipts.jsonl"), "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      const f = failedLines.find((line) => line.obligationID === failed.obligationID)
+      assert.ok(f, "квитанция об ошибке отсутствует")
+      assert.equal(f.outcome, "transport-failed")
+      assert.equal(failedLines.some((line) => line.obligationID === failed.obligationID &&
+        line.outcome === "posted"), false)
+    },
+  },
+  {
+    // W6-C: пинг из Go плагин не видел, поэтому posted пишется только после
+    // реального session.execution.started и только для совпавшего обязательства.
+    name: "W6-C: старт модели подтверждается по session.execution.started",
+    async check(assert) {
+      const stateDir = mkdtempSync(join(tmpdir(), "beacon-w6c-start-"))
+      const paths = statePaths(stateDir)
+      await writeJSON(join(stateDir, "wake-pointer.json"), {
+        sessionID: "ses_w6c", obligationID: "obl-w6c-start", attempt: 2, source: "review",
+      })
+      const event = { type: "session.execution.started", data: { sessionID: "ses_w6c" } }
+      assert.equal(confirmExecutionStart(paths, event), true)
+
+      const lines = readFileSync(paths.receiptLog, "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      assert.equal(lines.length, 1)
+      assert.equal(lines[0].obligationID, "obl-w6c-start")
+      assert.equal(lines[0].attempt, 2)
+      assert.equal(lines[0].outcome, "posted")
+      assert.equal(lines[0].via, "execution-started")
+      const evidence = readFileSync(paths.pluginEvents, "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      assert.equal(evidence.some((e) => e.kind === "execution-started-confirmed" &&
+        e.obligationID === "obl-w6c-start" && e.attempt === 2), true)
+
+      // Чужой session не подтверждает обязательство из указателя.
+      assert.equal(confirmExecutionStart(paths, {
+        type: "session.execution.started", data: { sessionID: "ses_other" },
+      }), null)
+      assert.equal(readFileSync(paths.receiptLog, "utf8").split("\n").filter(Boolean).length, 1)
+
+      // Без указателя подтверждение остаётся только в plugin-events.jsonl.
+      const emptyDir = mkdtempSync(join(tmpdir(), "beacon-w6c-unbound-"))
+      const emptyPaths = statePaths(emptyDir)
+      assert.equal(confirmExecutionStart(emptyPaths, event), null)
+      assert.equal(existsSync(emptyPaths.receiptLog), false)
+      const unbound = readFileSync(emptyPaths.pluginEvents, "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      assert.equal(unbound.some((e) => e.kind === "execution-started-unbound"), true)
+    },
+  },
+  {
+    // W6-C: подписка плагина на событие хота превращает Go-пинг в квитанцию
+    // без вызова ctx.session.prompt из плагина.
+    name: "W6-C: подписка на execution.started подтверждает пинг из Go",
+    async check(assert) {
+      const stateDir = mkdtempSync(join(tmpdir(), "beacon-w6c-setup-"))
+      await writeJSON(join(stateDir, "wake-pointer.json"), {
+        sessionID: "ses_go", obligationID: "obl-w6c-go", attempt: 5, source: "review",
+      })
+      const prompts = []
+      const queue = []
+      const subscriptions = []
+      const ctx = {
+        beaconStateDir: stateDir,
+        session: {
+          async prompt(input) {
+            prompts.push(input)
+            return { sessionID: input.sessionID, delivery: input.delivery }
+          },
+        },
+        event: {
+          subscribe(options = {}) {
+            const sub = { types: options.types, signal: options.signal, queue }
+            subscriptions.push(sub)
+            return {
+              async *[Symbol.asyncIterator]() {
+                while (!sub.signal?.aborted) {
+                  if (sub.queue.length > 0) {
+                    yield sub.queue.shift()
+                    continue
+                  }
+                  await new Promise((tick) => setTimeout(tick, 2))
+                }
+              },
+            }
+          },
+        },
+      }
+      const stop = plugin.setup(ctx)
+      const ready = subscriptions.find((sub) =>
+        (sub.types ?? []).includes("session.execution.started"))
+      assert.ok(ready, "плагин подписан на session.execution.started")
+      queue.push({ type: "session.execution.started", data: { sessionID: "ses_go" } })
+      await new Promise((tick) => setTimeout(tick, 30))
+      stop()
+
+      assert.equal(prompts.length, 0, "плагин не должен сам будить сессию при Go-пинге")
+      const lines = readFileSync(join(stateDir, "receipts.jsonl"), "utf8")
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      assert.equal(lines.some((line) => line.obligationID === "obl-w6c-go" &&
+        line.attempt === 5 && line.outcome === "posted" &&
+        line.via === "execution-started"), true)
     },
   },
 ]

@@ -1,9 +1,11 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -243,6 +245,179 @@ func TestArchiveClosedWatchesSkipsCloseWithoutTerminalReason(t *testing.T) {
 	}
 	if got := strings.Join(activeWatchIDs(t, d), ","); got != "no-closed-at,no-reason" {
 		t.Errorf("active watches = %q, want no-closed-at,no-reason", got)
+	}
+}
+
+// W6-C: the cycle calls Run on every tick; it must archive once per hour, and
+// the marker must survive a restart so a fresh process does not re-run the
+// last hour's work or forget a pass that is due.
+func TestArchiveRunHourlySchedule(t *testing.T) {
+	d := openArchiveDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+
+	first := newArchiveWatch("scheduled-1", domain.StatusClosed, domain.VerdictMerged,
+		now.Add(-ClosedWatchRetention-time.Hour), "")
+	recent := newArchiveWatch("scheduled-recent", domain.StatusClosed, domain.VerdictMerged,
+		now.Add(-24*time.Hour), "")
+	for _, w := range []domain.Watch{first, recent} {
+		if err := d.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch(%s): %v", w.ID, err)
+		}
+	}
+	if err := d.SaveObligation(domain.Obligation{
+		ID: "scheduled-1:3:s1", WatchID: "scheduled-1", Revision: 3, SubscriberID: "s1",
+		Attempts: []domain.Attempt{{N: 1, At: now, Outcome: domain.OutcomePosted}},
+	}); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+
+	// A store with no marker is due at cycle start.
+	due, err := d.ArchiveDue(ctx, now)
+	if err != nil || !due {
+		t.Fatalf("ArchiveDue before first run = %v, %v; want true", due, err)
+	}
+	ran, err := d.ArchiveRun(ctx, now)
+	if err != nil {
+		t.Fatalf("first ArchiveRun: %v", err)
+	}
+	if !ran.Ran || ran.Moved != 1 {
+		t.Fatalf("first ArchiveRun = %+v, want Ran=true Moved=1", ran)
+	}
+	if got := strings.Join(activeWatchIDs(t, d), ","); got != "scheduled-recent" {
+		t.Errorf("active watches after first run = %q, want scheduled-recent", got)
+	}
+	last, ok, err := d.LastArchiveRun(ctx)
+	if err != nil || !ok || !last.Equal(now) {
+		t.Fatalf("LastArchiveRun = %v, %v, %v; want %v, true", last, ok, err, now)
+	}
+
+	// Half an hour later the cycle is a no-op.
+	soon := now.Add(30 * time.Minute)
+	due, err = d.ArchiveDue(ctx, soon)
+	if err != nil || due {
+		t.Fatalf("ArchiveDue at +30m = %v, %v; want false", due, err)
+	}
+	ran, err = d.ArchiveRun(ctx, soon)
+	if err != nil || ran.Ran || ran.Moved != 0 {
+		t.Fatalf("ArchiveRun at +30m = %+v, %v; want no-op", ran, err)
+	}
+
+	// A watch that crossed the boundary in the meantime is archived on the
+	// next hourly pass, and its obligation history survives.
+	later := newArchiveWatch("scheduled-2", domain.StatusClosed, domain.VerdictMerged,
+		soon.Add(-ClosedWatchRetention), "")
+	if err := d.SaveWatch(later); err != nil {
+		t.Fatalf("SaveWatch(scheduled-2): %v", err)
+	}
+	hour := now.Add(ArchiveScheduleInterval)
+	due, err = d.ArchiveDue(ctx, hour)
+	if err != nil || !due {
+		t.Fatalf("ArchiveDue at +1h = %v, %v; want true", due, err)
+	}
+	ran, err = d.ArchiveRun(ctx, hour)
+	if err != nil || !ran.Ran || ran.Moved != 1 {
+		t.Fatalf("ArchiveRun at +1h = %+v, %v; want Ran=true Moved=1", ran, err)
+	}
+	if got := strings.Join(activeWatchIDs(t, d), ","); got != "scheduled-recent" {
+		t.Errorf("active watches after +1h = %q, want scheduled-recent", got)
+	}
+	if got := strings.Join(archivedWatchIDs(t, d), ","); got != "scheduled-1,scheduled-2" {
+		t.Errorf("archived watches = %q, want scheduled-1,scheduled-2", got)
+	}
+	history, err := d.WatchObligations("scheduled-1")
+	if err != nil || len(history) != 1 || len(history[0].Attempts) != 1 {
+		t.Fatalf("obligation history after scheduled move = %+v, %v", history, err)
+	}
+}
+
+func TestArchiveRunMarkerSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	ctx := context.Background()
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := d.ArchiveRun(ctx, now); err != nil {
+		t.Fatalf("ArchiveRun: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	last, ok, err := reopened.LastArchiveRun(ctx)
+	if err != nil || !ok || !last.Equal(now) {
+		t.Fatalf("LastArchiveRun after reopen = %v, %v, %v; want %v", last, ok, err, now)
+	}
+	due, err := reopened.ArchiveDue(ctx, now.Add(ArchiveScheduleInterval-time.Minute))
+	if err != nil || due {
+		t.Fatalf("ArchiveDue after reopen = %v, %v; want false", due, err)
+	}
+}
+
+// Two cycles can tick at the same time. The single writer and the marker in
+// the same transaction must let exactly one of them perform the pass.
+func TestArchiveRunConcurrentCyclesArchiveOnce(t *testing.T) {
+	d := openArchiveDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	for _, id := range []string{"race-1", "race-2", "race-3"} {
+		w := newArchiveWatch(id, domain.StatusClosed, domain.VerdictMerged,
+			now.Add(-ClosedWatchRetention-time.Hour), "")
+		if err := d.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch(%s): %v", id, err)
+		}
+	}
+
+	const cycles = 8
+	var wg sync.WaitGroup
+	results := make(chan ArchiveRunResult, cycles)
+	errs := make(chan error, cycles)
+	for i := 0; i < cycles; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := d.ArchiveRun(ctx, now)
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- r
+		}()
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("ArchiveRun: %v", err)
+	}
+	runs, moved := 0, 0
+	for r := range results {
+		if r.Ran {
+			runs++
+		}
+		moved += r.Moved
+	}
+	if runs != 1 || moved != 3 {
+		t.Fatalf("runs = %d, moved = %d; want 1 and 3", runs, moved)
+	}
+}
+
+func TestArchiveRunRejectsZeroTime(t *testing.T) {
+	d := openArchiveDB(t)
+	ctx := context.Background()
+	if _, err := d.ArchiveRun(ctx, time.Time{}); err == nil {
+		t.Error("ArchiveRun with zero time succeeded")
+	}
+	if _, err := d.ArchiveDue(ctx, time.Time{}); err == nil {
+		t.Error("ArchiveDue with zero time succeeded")
 	}
 }
 
