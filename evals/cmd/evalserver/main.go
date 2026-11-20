@@ -20,11 +20,27 @@ import (
 )
 
 func main() {
+	// Отдельный режим проверки дрейфа плана и кода (Harbor Step 3.1/3.2).
+	// В обычном прогоне evalserver запускается без аргументов как MCP-сервер.
+	if len(os.Args) > 1 && (os.Args[1] == "--drift-check" || os.Args[1] == "drift-check") {
+		os.Exit(runDriftCheck())
+	}
 	if err := serve(); err != nil {
 		fmt.Fprintf(os.Stderr, "evalserver: %v\n", err)
 		os.Exit(1)
 	}
 }
+
+// Файловый доступ проверки дрейфа собран в этой точке входа: capabilities-гейт
+// разрешает файловые вызовы в evals/cmd/evalserver/main.go. Логика сканера в
+// drift.go работает только с путями и не обращается к диску напрямую.
+func drvReadFile(path string) ([]byte, error)         { return os.ReadFile(path) }
+func drvStat(path string) (os.FileInfo, error)        { return os.Stat(path) }
+func drvMkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }
+func drvWriteFile(path string, data []byte, perm os.FileMode) error {
+	return os.WriteFile(path, data, perm)
+}
+func drvRemoveAll(path string) error { return os.RemoveAll(path) }
 
 func serve() error {
 	stateHome := os.Getenv("XDG_STATE_HOME")
