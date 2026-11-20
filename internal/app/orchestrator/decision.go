@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"path"
 	"strings"
 )
@@ -29,6 +30,9 @@ const (
 	// DecisionRejectGeneratedEdit refuses a Watch whose diff edits a generated
 	// artifact. The gate fails the card: no merge, no retry and no wake.
 	DecisionRejectGeneratedEdit DecisionKind = "REJECT_GENERATED_EDIT"
+	// DecisionSourceError means the rules source could not be resolved, so the
+	// check could not run. It fails closed: no merge, no retry and no wake.
+	DecisionSourceError DecisionKind = "SOURCE_ERROR"
 )
 
 const (
@@ -43,6 +47,9 @@ const (
 	// ReasonGeneratedFileEdited is the REJECT_GENERATED_EDIT reason. It names
 	// the invariant, not the file; the offending paths are in Decision.GeneratedFiles.
 	ReasonGeneratedFileEdited = "generated_file_edited"
+	// ReasonSourceUnavailable is the SOURCE_ERROR reason. The resolver error
+	// is kept in Decision.SourceError.
+	ReasonSourceUnavailable = "source_unavailable"
 )
 
 // DefaultGeneratedFilePatterns lists the Beacon artifacts that tooling owns.
@@ -114,6 +121,87 @@ type Decision struct {
 	// GeneratedFiles lists the changed paths that matched a generated-file
 	// pattern. It is set only on DecisionRejectGeneratedEdit.
 	GeneratedFiles []string `json:"generatedFiles,omitempty"`
+	// ByRef reports whether the rules check ran against a git ref. It is set
+	// on every decision that reached the check, so a caller can tell a
+	// ref-backed result from one made against the PR diff.
+	ByRef bool `json:"byRef,omitempty"`
+	// SourceRef names the git ref the check ran against. It is empty for a
+	// diff-backed check and lets a caller reproduce the result on the same ref.
+	SourceRef string `json:"sourceRef,omitempty"`
+	// SourceError carries the resolver error when Kind is SOURCE_ERROR.
+	SourceError string `json:"sourceError,omitempty"`
+}
+
+// Source is the port a rules check reads its candidate files from. The gate
+// supports two modes (ADR 0304): check against changed files or against a git
+// ref. Both reduce to a list of repo-relative paths, so the pure model never
+// opens a working copy. Turning a ref into paths is the adapter's job.
+type Source interface {
+	// ChangedFiles returns the repo-relative paths to check. An error means the
+	// source could not be resolved and the caller must fail closed.
+	ChangedFiles(ctx context.Context) ([]string, error)
+	// Ref is the git ref backing this source, or "" for a diff source. A
+	// non-empty value marks the resulting decision as ref-backed.
+	Ref() string
+}
+
+// FilesSource is a Source backed by an explicit changed-file list. Its Ref is
+// empty, so a check made from it is not marked as ref-backed.
+type FilesSource struct {
+	Files []string
+}
+
+// ChangedFiles returns the file list unchanged.
+func (s FilesSource) ChangedFiles(context.Context) ([]string, error) {
+	return s.Files, nil
+}
+
+// Ref is empty for a diff-backed source.
+func (FilesSource) Ref() string { return "" }
+
+// RefSource is a Source backed by a git ref. Resolve supplies the paths changed
+// at that ref. The model passes the ref to Resolve and never touches a working
+// copy, so the same ref always produces the same check.
+type RefSource struct {
+	// RefName names the git ref to check. An empty name makes the source
+	// diff-like: it has no ref, resolves to no files and does not mark the
+	// decision as ref-backed.
+	RefName string
+	// Resolve returns the paths changed at RefName. A nil resolver is an error.
+	Resolve func(ctx context.Context, ref string) ([]string, error)
+}
+
+// ChangedFiles resolves the ref into its changed paths. An empty ref resolves
+// to no files without calling the resolver.
+func (s RefSource) ChangedFiles(ctx context.Context) ([]string, error) {
+	ref := strings.TrimSpace(s.RefName)
+	if ref == "" {
+		return nil, nil
+	}
+	if s.Resolve == nil {
+		return nil, fmt.Errorf("orchestrator: ref source %q has no resolver", ref)
+	}
+	return s.Resolve(ctx, ref)
+}
+
+// Ref returns the trimmed git ref, or "" when no ref was set.
+func (s RefSource) Ref() string { return strings.TrimSpace(s.RefName) }
+
+// CheckSource resolves src into the candidate file list and reports whether the
+// check is ref-backed. The flag comes from Source.Ref, so a source with an
+// empty ref is treated as diff-backed. A resolver error is returned with a nil
+// file list; the caller must fail closed instead of reading the list as an
+// empty diff.
+func CheckSource(ctx context.Context, src Source) (files []string, byRef bool, err error) {
+	if src == nil {
+		return nil, false, nil
+	}
+	ref := strings.TrimSpace(src.Ref())
+	files, err = src.ChangedFiles(ctx)
+	if err != nil {
+		return nil, ref != "", fmt.Errorf("orchestrator: rules source: %w", err)
+	}
+	return files, ref != "", nil
 }
 
 // Decide reduces a Watch, its dependency resolver and the CI view to exactly
@@ -124,8 +212,10 @@ type Decision struct {
 //     ready or a dependency is outstanding. Once MaxFixAttempts FIX agents
 //     have been spawned for that block, the Watch is escalated to a human
 //     with NOTIFY_ORCHESTRATOR instead of asking for another FIX agent;
-//  2. a diff that edits a generated artifact is rejected before any dependency
-//     is resolved, so a manual edit can never reach the merge path;
+//  2. a file list that edits a generated artifact is rejected before any
+//     dependency is resolved, so a manual edit can never reach the merge path;
+//     the list comes from Watch.Source, which may be a git ref, and a source
+//     error fails closed as SOURCE_ERROR;
 //  3. unsatisfied waitFor/waitForMain refs hold the merge and list the refs;
 //  4. ready plus auto-merge merges;
 //  5. retry goes back to the executor;
@@ -146,7 +236,23 @@ func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 		return d
 	}
 
-	if edited := GeneratedFileEdits(w.ChangedFiles, DefaultGeneratedFilePatterns); len(edited) > 0 {
+	src := w.Source
+	if src == nil {
+		src = FilesSource{Files: w.ChangedFiles}
+	}
+	files, byRef, srcErr := CheckSource(context.Background(), src)
+	d.ByRef = byRef
+	if byRef {
+		d.SourceRef = strings.TrimSpace(src.Ref())
+	}
+	if srcErr != nil {
+		d.Kind = DecisionSourceError
+		d.Reason = ReasonSourceUnavailable
+		d.SourceError = srcErr.Error()
+		return d
+	}
+
+	if edited := GeneratedFileEdits(files, DefaultGeneratedFilePatterns); len(edited) > 0 {
 		d.Kind = DecisionRejectGeneratedEdit
 		d.Reason = ReasonGeneratedFileEdited
 		d.GeneratedFiles = edited

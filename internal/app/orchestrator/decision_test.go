@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -502,5 +503,113 @@ func TestDecideBlockedWinsOverGeneratedEdit(t *testing.T) {
 
 	if got.Kind != DecisionBlockedFixAgent {
 		t.Fatalf("kind = %q, want %q", got.Kind, DecisionBlockedFixAgent)
+	}
+}
+
+// TestDecideChecksRulesAgainstGitRef proves the check reads the ref source, not
+// the working copy: ChangedFiles is empty and only the ref supplies the file
+// that triggers the rejection. The decision carries the ref for reproduction.
+func TestDecideChecksRulesAgainstGitRef(t *testing.T) {
+	var calledWith []string
+	src := RefSource{
+		RefName: "refs/heads/fix/hd057",
+		Resolve: func(_ context.Context, ref string) ([]string, error) {
+			calledWith = append(calledWith, ref)
+			return []string{"evals/reports/hd057.md"}, nil
+		},
+	}
+	w := decisionWatch(nil)
+	w.Source = src
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionRejectGeneratedEdit {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionRejectGeneratedEdit)
+	}
+	if !got.ByRef || got.SourceRef != "refs/heads/fix/hd057" {
+		t.Fatalf("byRef/sourceRef = %v/%q", got.ByRef, got.SourceRef)
+	}
+	if !reflect.DeepEqual(got.GeneratedFiles, []string{"evals/reports/hd057.md"}) {
+		t.Fatalf("generatedFiles = %q", got.GeneratedFiles)
+	}
+	if !reflect.DeepEqual(calledWith, []string{"refs/heads/fix/hd057"}) {
+		t.Fatalf("ref resolver calls = %q", calledWith)
+	}
+}
+
+// TestDecideChecksRulesAgainstChangedFiles keeps the diff-backed path: with no
+// Source the Watch falls back to ChangedFiles and the decision is not marked
+// as ref-backed.
+func TestDecideChecksRulesAgainstChangedFiles(t *testing.T) {
+	w := decisionWatch(nil)
+	w.ChangedFiles = []string{"evals/reports/hd057.md"}
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionRejectGeneratedEdit {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionRejectGeneratedEdit)
+	}
+	if got.ByRef || got.SourceRef != "" {
+		t.Fatalf("diff-backed decision marked by ref: byRef=%v sourceRef=%q", got.ByRef, got.SourceRef)
+	}
+	if !reflect.DeepEqual(got.GeneratedFiles, []string{"evals/reports/hd057.md"}) {
+		t.Fatalf("generatedFiles = %q", got.GeneratedFiles)
+	}
+}
+
+// TestDecideEmptyRefDoesNotMarkByRef proves an empty or whitespace-only ref is
+// treated as no ref: no resolver call, no rejection and no ref flag.
+func TestDecideEmptyRefDoesNotMarkByRef(t *testing.T) {
+	called := false
+	w := decisionWatch(nil)
+	w.Source = RefSource{
+		RefName: "  ",
+		Resolve: func(context.Context, string) ([]string, error) {
+			called = true
+			return nil, errors.New("resolver must not run for an empty ref")
+		},
+	}
+
+	got := Decide(w, nil, CIState{})
+
+	if got.Kind != DecisionMerge {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionMerge)
+	}
+	if got.ByRef || got.SourceRef != "" {
+		t.Fatalf("empty ref marked the decision by ref: byRef=%v sourceRef=%q", got.ByRef, got.SourceRef)
+	}
+	if called {
+		t.Fatal("empty ref must not call the resolver")
+	}
+}
+
+// TestDecideSourceErrorFailsClosed proves a failed ref resolution cannot fall
+// through to a merge or to dependency resolution.
+func TestDecideSourceErrorFailsClosed(t *testing.T) {
+	w := decisionWatch(&AutoMergePolicy{WaitFor: []string{"dep:a"}})
+	w.Source = RefSource{
+		RefName: "refs/heads/fix/hd057",
+		Resolve: func(context.Context, string) ([]string, error) {
+			return nil, errors.New("ref not found")
+		},
+	}
+	deps := &decisionDeps{inMain: map[string]bool{"dep:a": true}}
+
+	got := Decide(w, deps, CIState{})
+
+	if got.Kind != DecisionSourceError {
+		t.Fatalf("kind = %q, want %q", got.Kind, DecisionSourceError)
+	}
+	if got.Reason != ReasonSourceUnavailable {
+		t.Fatalf("reason = %q, want %q", got.Reason, ReasonSourceUnavailable)
+	}
+	if !got.ByRef || got.SourceRef != "refs/heads/fix/hd057" {
+		t.Fatalf("byRef/sourceRef = %v/%q", got.ByRef, got.SourceRef)
+	}
+	if !strings.Contains(got.SourceError, "ref not found") {
+		t.Fatalf("sourceError = %q", got.SourceError)
+	}
+	if len(deps.calls) != 0 {
+		t.Fatalf("source error must short-circuit dependency resolution: %v", deps.calls)
 	}
 }
