@@ -276,3 +276,122 @@ func TestDomainMergeAdapterPassesRepoAndReportsHold(t *testing.T) {
 		t.Fatalf("merge called with %s#%d, want owner/name#42", fake.repo, fake.pr)
 	}
 }
+
+// TestVerifyIssueEvidence drives the pure verifier with in-memory mock code.
+// It covers the three HD-009 outcomes: a matching file:line is current, a
+// stale reference is marked outdated before work, and a claim with no
+// reference is reported rather than accepted blindly.
+func TestVerifyIssueEvidence(t *testing.T) {
+	code := currentCode{
+		"cmd/beacon/orchestrate.go": {
+			"package main",
+			"func runOrchestrate(c *CLI, args []string) int {",
+			"	return 0",
+		},
+	}
+	tests := []struct {
+		name       string
+		ev         issueEvidence
+		wantStatus evidenceStatus
+		wantNote   string
+		wantClear  bool
+	}{
+		{
+			name: "matching link is current",
+			ev: issueEvidence{
+				Claim:    "runOrchestrate lives in orchestrate.go",
+				File:     "cmd/beacon/orchestrate.go",
+				Line:     2,
+				Expected: "runOrchestrate",
+			},
+			wantStatus: EvidenceCurrent,
+			wantClear:  true,
+		},
+		{
+			name: "drifted content is marked outdated",
+			ev: issueEvidence{
+				Claim:    "runDaemon lives at orchestrate.go:2",
+				File:     "cmd/beacon/orchestrate.go",
+				Line:     2,
+				Expected: "runDaemon",
+			},
+			wantStatus: EvidenceOutdated,
+			wantNote:   "устаревшим",
+		},
+		{
+			name: "missing line is marked outdated",
+			ev: issueEvidence{
+				Claim:    "helper is at orchestrate.go:99",
+				File:     "cmd/beacon/orchestrate.go",
+				Line:     99,
+				Expected: "helper",
+			},
+			wantStatus: EvidenceOutdated,
+			wantNote:   "устаревшим",
+		},
+		{
+			name: "missing file is marked outdated",
+			ev: issueEvidence{
+				Claim: "implementation moved out of gone.go",
+				File:  "cmd/beacon/gone.go",
+				Line:  1,
+			},
+			wantStatus: EvidenceOutdated,
+			wantNote:   "устаревшим",
+		},
+		{
+			name: "absent link is reported, not accepted blindly",
+			ev: issueEvidence{
+				Claim: "some claim with no file:line proof",
+			},
+			wantStatus: EvidenceNoRef,
+			wantNote:   "вслепую",
+		},
+		{
+			name: "non-positive line is treated as no link",
+			ev: issueEvidence{
+				Claim: "claim with a file but no line",
+				File:  "cmd/beacon/orchestrate.go",
+				Line:  0,
+			},
+			wantStatus: EvidenceNoRef,
+			wantNote:   "вслепую",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := verifyIssueEvidence(tc.ev, code)
+			if got.Status != tc.wantStatus {
+				t.Fatalf("status = %q, want %q (note: %s)", got.Status, tc.wantStatus, got.Note)
+			}
+			if got.Evidence != tc.ev {
+				t.Fatalf("evidence not carried through: got %+v, want %+v", got.Evidence, tc.ev)
+			}
+			if tc.wantNote != "" && !strings.Contains(got.Note, tc.wantNote) {
+				t.Fatalf("note = %q, want it to contain %q", got.Note, tc.wantNote)
+			}
+			if cleared := clearsForWork(got); cleared != tc.wantClear {
+				t.Fatalf("clearsForWork = %v, want %v for status %q", cleared, tc.wantClear, got.Status)
+			}
+		})
+	}
+}
+
+// TestVerifyIssueEvidenceReportsActual proves the verdict shows both the
+// expected fragment and the line that is actually in the current code, so an
+// agent can see why a claim was marked outdated before it starts work.
+func TestVerifyIssueEvidenceReportsActual(t *testing.T) {
+	code := currentCode{"f.go": {"line one", "func realHandler() {}"}}
+	got := verifyIssueEvidence(issueEvidence{
+		Claim:    "oldHandler is at f.go:2",
+		File:     "f.go",
+		Line:     2,
+		Expected: "oldHandler",
+	}, code)
+	if got.Status != EvidenceOutdated {
+		t.Fatalf("status = %q, want outdated", got.Status)
+	}
+	if got.Actual != "func realHandler() {}" {
+		t.Fatalf("actual = %q, want the current line", got.Actual)
+	}
+}
