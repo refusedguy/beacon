@@ -613,3 +613,131 @@ func TestDecideSourceErrorFailsClosed(t *testing.T) {
 		t.Fatalf("source error must short-circuit dependency resolution: %v", deps.calls)
 	}
 }
+
+// taskClosureFake is the port fake for AuditCompletion. It records every task
+// it is asked about so the tests can prove the audit queried the whole plan.
+type taskClosureFake struct {
+	closed map[string]bool
+	err    map[string]error
+	calls  []string
+}
+
+func (f *taskClosureFake) Closed(_ context.Context, id string) (bool, error) {
+	f.calls = append(f.calls, id)
+	if err := f.err[id]; err != nil {
+		return false, err
+	}
+	return f.closed[id], nil
+}
+
+func TestAuditCompletionAllTasksClosed(t *testing.T) {
+	plan := []string{"HD-013", "HD-014", "HD-015"}
+	closure := &taskClosureFake{closed: map[string]bool{
+		"HD-013": true, "HD-014": true, "HD-015": true,
+	}}
+
+	got, err := AuditCompletion(context.Background(), plan, closure)
+
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !got.Complete {
+		t.Fatalf("complete = false, want true")
+	}
+	if len(got.Missing) != 0 {
+		t.Fatalf("missing = %q, want empty", got.Missing)
+	}
+	if !reflect.DeepEqual(closure.calls, plan) {
+		t.Fatalf("closure calls = %q, want %q", closure.calls, plan)
+	}
+}
+
+func TestAuditCompletionOpenTaskBlocks(t *testing.T) {
+	closure := &taskClosureFake{closed: map[string]bool{"HD-013": true}}
+
+	got, err := AuditCompletion(context.Background(), []string{"HD-013", "HD-014", "HD-015"}, closure)
+
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got.Complete {
+		t.Fatal("partial completion must not be complete")
+	}
+	if !reflect.DeepEqual(got.Missing, []string{"HD-014", "HD-015"}) {
+		t.Fatalf("missing = %q, want [HD-014 HD-015]", got.Missing)
+	}
+}
+
+func TestAuditCompletionEmptyPlan(t *testing.T) {
+	closure := &taskClosureFake{}
+
+	got, err := AuditCompletion(context.Background(), nil, closure)
+
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !got.Complete {
+		t.Fatal("empty plan must be complete")
+	}
+	if len(got.Missing) != 0 {
+		t.Fatalf("missing = %q, want empty", got.Missing)
+	}
+	if len(closure.calls) != 0 {
+		t.Fatalf("empty plan must not query the port: %v", closure.calls)
+	}
+}
+
+func TestAuditCompletionPortErrorFailsClosed(t *testing.T) {
+	closure := &taskClosureFake{
+		closed: map[string]bool{"HD-013": true},
+		err:    map[string]error{"HD-014": errors.New("task store down")},
+	}
+
+	got, err := AuditCompletion(context.Background(), []string{"HD-013", "HD-014", "HD-015"}, closure)
+
+	if err == nil {
+		t.Fatal("err = nil, want the port error")
+	}
+	if !strings.Contains(err.Error(), "HD-014") || !strings.Contains(err.Error(), "task store down") {
+		t.Fatalf("err = %q, want task id and port cause", err)
+	}
+	if got.Complete {
+		t.Fatal("port error must leave the audit incomplete")
+	}
+	if !reflect.DeepEqual(got.Missing, []string{"HD-014"}) {
+		t.Fatalf("missing = %q, want [HD-014]", got.Missing)
+	}
+	if !reflect.DeepEqual(closure.calls, []string{"HD-013", "HD-014"}) {
+		t.Fatalf("closure calls = %q, want [HD-013 HD-014]", closure.calls)
+	}
+}
+
+func TestAuditCompletionTrimsAndDedupesPlan(t *testing.T) {
+	closure := &taskClosureFake{closed: map[string]bool{"HD-013": true, "HD-014": true}}
+
+	got, err := AuditCompletion(context.Background(), []string{" HD-013 ", "", "HD-013", "HD-014"}, closure)
+
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !got.Complete {
+		t.Fatal("deduplicated closed plan must be complete")
+	}
+	if !reflect.DeepEqual(closure.calls, []string{"HD-013", "HD-014"}) {
+		t.Fatalf("closure calls = %q, want [HD-013 HD-014]", closure.calls)
+	}
+}
+
+func TestAuditCompletionNilClosureFailsClosed(t *testing.T) {
+	got, err := AuditCompletion(context.Background(), []string{"HD-013", "HD-014"}, nil)
+
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if got.Complete {
+		t.Fatal("nil closure must not complete a non-empty plan")
+	}
+	if !reflect.DeepEqual(got.Missing, []string{"HD-013", "HD-014"}) {
+		t.Fatalf("missing = %q, want the whole plan", got.Missing)
+	}
+}
