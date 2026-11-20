@@ -34,10 +34,10 @@ const (
 // pointer so the absent value means "default true": a Watch with no declared
 // policy is mergeable. Any of the three hold-backs disables automatic merging.
 type AutoMergePolicy struct {
-	AutoMerge       *bool  `json:"autoMerge,omitempty"`
-	RequireApproval bool   `json:"requireApproval"`
-	WaitFor         string `json:"waitFor"`
-	WaitForMain     bool   `json:"waitForMain"`
+	AutoMerge       *bool    `json:"autoMerge,omitempty"`
+	RequireApproval bool     `json:"requireApproval"`
+	WaitFor         []string `json:"waitFor,omitempty"`
+	WaitForMain     []string `json:"waitForMain,omitempty"`
 }
 
 // DefaultAutoMergePolicy is the zero-configuration policy: automatic merging
@@ -51,8 +51,7 @@ func (p AutoMergePolicy) Allows() bool {
 	if p.AutoMerge != nil && !*p.AutoMerge {
 		return false
 	}
-	return !p.RequireApproval &&
-		strings.TrimSpace(p.WaitFor) == "" && !p.WaitForMain
+	return !p.RequireApproval && len(p.WaitFor) == 0 && len(p.WaitForMain) == 0
 }
 
 // Watch is the subset of a Beacon Watch the loop decides on. A nil Policy
@@ -61,6 +60,7 @@ type Watch struct {
 	ID       string
 	Repo     string
 	PR       int
+	HeadSHA  string
 	Verdict  string
 	Revision uint64
 	Policy   *AutoMergePolicy

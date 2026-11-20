@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/refusedguy/beacon/internal/infra/orchestrator"
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 )
 
 type orchFakeStore struct {

@@ -147,8 +147,8 @@ func TestRunPolicyHoldBacks(t *testing.T) {
 	}{
 		{"auto-merge off", AutoMergePolicy{AutoMerge: boolPtr(false)}},
 		{"require approval", AutoMergePolicy{RequireApproval: true}},
-		{"wait for check", AutoMergePolicy{WaitFor: "ci"}},
-		{"wait for main", AutoMergePolicy{WaitForMain: true}},
+		{"wait for check", AutoMergePolicy{WaitFor: []string{"ci"}}},
+		{"wait for main", AutoMergePolicy{WaitForMain: []string{"T3.100"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

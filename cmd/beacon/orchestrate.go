@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/refusedguy/beacon/internal/infra/orchestrator"
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -70,10 +70,18 @@ func (m ghMerger) Merge(ctx context.Context, repo string, pr int) error {
 	return fmt.Errorf("gh pr merge %d: %s", pr, reason)
 }
 
+// orchWatchReaderFunc adapts a function to the orchestrator's WatchReader
+// port. The projection from the domain store happens here in the composition
+// root, so neither cmd nor the app package needs to name domain types.
+type orchWatchReaderFunc func(context.Context) ([]orchestrator.Watch, error)
+
+func (f orchWatchReaderFunc) ActiveWatches(ctx context.Context) ([]orchestrator.Watch, error) {
+	return f(ctx)
+}
+
 // defaultOrchestratorDeps opens the real state store from the same directory
 // the MCP server uses and combines it with the gh merger. The concrete *store.DB
-// is needed for the merge ledger and for beacon_cancel_watch's event log; the
-// domain Store stays the read/write port for Watches.
+// is needed for the merge ledger and for beacon_cancel_watch's event log.
 func defaultOrchestratorDeps(c *CLI) (orchestratorDeps, func() error, error) {
 	deps, closeStore, err := openMCPDependencies()
 	if err != nil {
@@ -84,8 +92,31 @@ func defaultOrchestratorDeps(c *CLI) (orchestratorDeps, func() error, error) {
 		_ = closeStore()
 		return orchestratorDeps{}, nil, fmt.Errorf("beacon orchestrate: store is not *store.DB")
 	}
+	reader := orchWatchReaderFunc(func(_ context.Context) ([]orchestrator.Watch, error) {
+		all, err := deps.Store.ActiveWatches()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]orchestrator.Watch, 0, len(all))
+		for _, w := range all {
+			var policy *orchestrator.AutoMergePolicy
+			if raw, err := json.Marshal(w); err == nil {
+				policy = orchestrator.PolicyFromPayload(raw)
+			}
+			out = append(out, orchestrator.Watch{
+				ID:       w.ID,
+				Repo:     w.Repo,
+				PR:       w.PR,
+				HeadSHA:  w.HeadSHA,
+				Verdict:  string(w.Verdict),
+				Revision: w.Revision,
+				Policy:   policy,
+			})
+		}
+		return out, nil
+	})
 	return orchestratorDeps{
-		Store:  orchestrator.NewDBStore(deps.Store, db, deps.Clock),
+		Store:  orchestrator.NewDBStore(reader, db),
 		Merger: ghMerger{c: c},
 	}, closeStore, nil
 }
