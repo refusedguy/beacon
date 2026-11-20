@@ -1,9 +1,10 @@
 // Package orchestrator implements the automatic merge loop over active Beacon
-// Watches. The core is pure over four narrow ports: Store reads active
+// Watches. The core is pure over five narrow ports: Store reads active
 // Watches, remembers completed merges and closes Watches; Merger performs the
 // hosting-service merge; DependencyResolver resolves free-form waitFor and
 // waitForMain references; Waker leaves a retry/fail/wait Watch for its
-// subscriber. Concrete adapters live in this package and in cmd/beacon.
+// subscriber; Source supplies the file list a rules check reads, from either a
+// PR diff or a git ref. Concrete adapters live in this package and in cmd/beacon.
 package orchestrator
 
 import (
@@ -106,6 +107,11 @@ type Watch struct {
 	// DefaultGeneratedFilePatterns so a hand-edited generated artifact can
 	// never reach the merge path. A nil or empty list means no diff is known.
 	ChangedFiles []string
+	// Source supplies the file list the rules check reads. A nil Source falls
+	// back to ChangedFiles, so callers that only know the PR diff keep working.
+	// Set Source to a RefSource to check a git ref without a working copy
+	// (ADR 0304).
+	Source Source
 }
 
 func (w Watch) autoMergeAllowed() bool {
