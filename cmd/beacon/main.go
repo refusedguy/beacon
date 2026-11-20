@@ -12,8 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-
-	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 const usageText = `beacon — команды сборки и проверки Beacon
