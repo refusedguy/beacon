@@ -77,6 +77,9 @@ type OpenCodeDeliverer struct {
 	SessionActiveFunc SessionActiveFunc
 	// Obligations makes the delivery fact survive a process restart.
 	Obligations ObligationDeliveryStore
+	// LeaseGuard serializes delivery per target. Deliver builds one with the
+	// default ttl when nil; set a restored guard here after a restart.
+	LeaseGuard *DeliveryLeaseGuard
 
 	mu   sync.Mutex
 	seen map[wakeDeliveryKey]struct{}
@@ -118,6 +121,19 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 		return nil
 	}
 	d.mu.Unlock()
+
+	// Only one owner may deliver to a target at a time. A repeat from the
+	// same owner is a duplicate; a different owner is refused before any
+	// prompt reaches the pane (T3.242).
+	guard := d.leaseGuard()
+	acquired, err := guard.Acquire(sessionID, p.ObligationID)
+	if err != nil {
+		return err
+	}
+	if !acquired {
+		return nil
+	}
+	defer guard.Release(sessionID, p.ObligationID)
 
 	// The store is the durable half of dedup: a restarted process has an empty
 	// seen map but must still not wake the same obligation twice.
@@ -371,6 +387,149 @@ func verifyAck(out []byte) error {
 		return fmt.Errorf("wake: api response has no admitted message id")
 	}
 	return nil
+}
+
+// leaseGuard returns the injected guard or lazily builds the default one. The
+// short critical section shares d.mu with the seen map; the guard has its own
+// mutex and never calls back into the deliverer.
+func (d *OpenCodeDeliverer) leaseGuard() *DeliveryLeaseGuard {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.LeaseGuard == nil {
+		d.LeaseGuard = NewDeliveryLeaseGuard(0)
+	}
+	return d.LeaseGuard
+}
+
+// ===== T3.242: per-target delivery lease =====
+// The seen map dedups one pointer, but two different pointers can still reach
+// the transport for the same session at the same time. A lease serializes
+// delivery per target: one owner holds it, a different owner is refused while
+// it is held, and a crashed owner loses it when the ttl passes. Rows can be
+// snapshotted and restored so a restarted process keeps a still-live owner.
+
+// ErrTargetBusy is the refusal for a wake whose target already has a lease
+// owner. It is retryable and no prompt is sent for the refused wake.
+var ErrTargetBusy = errors.New("wake: target busy: delivery lease held")
+
+// defaultDeliveryLeaseTTL bounds a delivery whose process died before it could
+// release the lease. It exceeds opencodeCLITimeout so a slow transport cannot
+// lose its lease while a prompt is still in flight; the cost is that a crashed
+// owner parks its target for this long.
+const defaultDeliveryLeaseTTL = 30 * time.Second
+
+// TargetLeaseRecord is the durable shape of one lease. A caller persists these
+// rows outside this package and feeds them back through Restore after a
+// restart.
+type TargetLeaseRecord struct {
+	Target  string    `json:"target"`
+	Owner   string    `json:"owner"`
+	Expires time.Time `json:"expires"`
+}
+
+// DeliveryLeaseGuard grants at most one owner per wake target. Acquire returns
+// acquired=true when the caller took the lease, acquired=false with a nil
+// error when the same owner already holds it, and ErrTargetBusy when a
+// different owner holds it.
+type DeliveryLeaseGuard struct {
+	mu     sync.Mutex
+	ttl    time.Duration
+	now    func() time.Time
+	leases map[string]TargetLeaseRecord
+}
+
+// NewDeliveryLeaseGuard builds an empty guard. A non-positive ttl uses the
+// package default.
+func NewDeliveryLeaseGuard(ttl time.Duration) *DeliveryLeaseGuard {
+	if ttl <= 0 {
+		ttl = defaultDeliveryLeaseTTL
+	}
+	return &DeliveryLeaseGuard{ttl: ttl, now: time.Now, leases: make(map[string]TargetLeaseRecord)}
+}
+
+// SetClock replaces the clock. Tests expire a lease with it instead of
+// sleeping.
+func (g *DeliveryLeaseGuard) SetClock(now func() time.Time) {
+	if g == nil || now == nil {
+		return
+	}
+	g.mu.Lock()
+	g.now = now
+	g.mu.Unlock()
+}
+
+// Restore seeds the guard from durable rows. Expired rows are dropped so a
+// restarted process does not inherit a lease that can no longer be held.
+func (g *DeliveryLeaseGuard) Restore(rows []TargetLeaseRecord) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.leases == nil {
+		g.leases = make(map[string]TargetLeaseRecord)
+	}
+	now := g.now()
+	for _, row := range rows {
+		if row.Target == "" || row.Owner == "" || !row.Expires.After(now) {
+			continue
+		}
+		g.leases[row.Target] = row
+	}
+}
+
+// Snapshot returns live leases sorted by target. A caller persists these rows
+// and passes them to Restore after a restart.
+func (g *DeliveryLeaseGuard) Snapshot() []TargetLeaseRecord {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	now := g.now()
+	out := make([]TargetLeaseRecord, 0, len(g.leases))
+	for _, row := range g.leases {
+		if row.Expires.After(now) {
+			out = append(out, row)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Target < out[j].Target })
+	return out
+}
+
+// Acquire takes the lease for target. Repeating the call with the same owner
+// is a duplicate that reports acquired=false; a different owner is refused.
+func (g *DeliveryLeaseGuard) Acquire(target, owner string) (bool, error) {
+	if g == nil || target == "" || owner == "" {
+		return false, ErrTargetBusy
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.leases == nil {
+		g.leases = make(map[string]TargetLeaseRecord)
+	}
+	now := g.now()
+	if row, ok := g.leases[target]; ok && row.Expires.After(now) {
+		if row.Owner == owner {
+			return false, nil
+		}
+		return false, fmt.Errorf("%w: %s held by %s", ErrTargetBusy, target, row.Owner)
+	}
+	g.leases[target] = TargetLeaseRecord{Target: target, Owner: owner, Expires: now.Add(g.ttl)}
+	return true, nil
+}
+
+// Release frees target only when owner still holds it. A stale owner whose
+// lease expired and was reclaimed cannot free the new owner's lease.
+func (g *DeliveryLeaseGuard) Release(target, owner string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if row, ok := g.leases[target]; ok && row.Owner == owner {
+		delete(g.leases, target)
+	}
 }
 
 // ===== T3.202 steer/queue и interrupt (#287) =====
