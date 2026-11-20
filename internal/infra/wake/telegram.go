@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -142,13 +143,11 @@ func (s *TelegramNotifySink) Updates(ctx context.Context, offset int64) ([]Teleg
 	if !s.tokenConfigured() {
 		return nil, nil
 	}
-	var out struct {
-		Result []TelegramUpdate `json:"result"`
-	}
-	if err := s.call(ctx, "getUpdates", map[string]any{"offset": offset, "timeout": 0}, &out); err != nil {
+	var result []TelegramUpdate
+	if err := s.call(ctx, "getUpdates", map[string]any{"offset": offset, "timeout": 0}, &result); err != nil {
 		return nil, err
 	}
-	return out.Result, nil
+	return result, nil
 }
 
 type telegramResponse struct {
@@ -185,20 +184,41 @@ func (s *TelegramNotifySink) call(ctx context.Context, method string, payload an
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("wake: telegram %s: status %d: %s", method, resp.StatusCode, s.sanitize(string(raw)))
 	}
+	if err := decodeTelegramResult(raw, out); err != nil {
+		return fmt.Errorf("wake: telegram %s: %s", method, s.sanitize(err.Error()))
+	}
+	return nil
+}
+
+// decodeTelegramResult accepts both shapes the Bot API and mocks return: the
+// documented envelope {"ok":true,"result":...} and a bare array. A refusal is
+// {"ok":false,"description":...}. Decoding the shape is a boundary concern, so
+// it lives here rather than in each method.
+func decodeTelegramResult(raw []byte, out any) error {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	if trimmed[0] == '[' {
+		if out != nil {
+			return json.Unmarshal(trimmed, out)
+		}
+		return nil
+	}
 	var envelope telegramResponse
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return fmt.Errorf("wake: telegram %s: decode: %w", method, err)
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
+		return fmt.Errorf("decode: %w", err)
 	}
 	if !envelope.OK {
 		detail := strings.TrimSpace(envelope.Description)
 		if detail == "" {
 			detail = "telegram refused the request"
 		}
-		return fmt.Errorf("wake: telegram %s: %s", method, s.sanitize(detail))
+		return errors.New(detail)
 	}
 	if out != nil && len(envelope.Result) != 0 && string(envelope.Result) != "null" {
 		if err := json.Unmarshal(envelope.Result, out); err != nil {
-			return fmt.Errorf("wake: telegram %s: decode result: %w", method, err)
+			return fmt.Errorf("decode result: %w", err)
 		}
 	}
 	return nil

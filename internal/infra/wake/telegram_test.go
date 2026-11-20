@@ -163,6 +163,23 @@ func TestTelegramNotifySinkPollsUpdatesWithOffset(t *testing.T) {
 	}
 }
 
+func TestTelegramNotifySinkAcceptsBareArrayUpdates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `[{"update_id":9,"message":{"message_id":3,"text":"/status","chat":{"id":55}}}]`)
+	}))
+	defer srv.Close()
+
+	sink := NewTelegramNotifySink(TelegramConfig{Token: "test-token", APIBase: srv.URL, Doer: srv.Client()})
+	updates, err := sink.Updates(context.Background(), 9)
+	if err != nil {
+		t.Fatalf("Updates: %v", err)
+	}
+	if len(updates) != 1 || updates[0].UpdateID != 9 || updates[0].Message.Text != "/status" {
+		t.Fatalf("updates = %+v, want the bare-array entry", updates)
+	}
+}
+
 func TestTelegramNotifySinkReportsRefusalWithoutLeakingToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -267,8 +284,16 @@ func TestEventNotifySinkForwardsAttentionAndKeepsOriginalLog(t *testing.T) {
 		notifier.notifications[1].Kind != NotifyBlockerOpened {
 		t.Fatalf("kinds = %q, %q", notifier.notifications[0].Kind, notifier.notifications[1].Kind)
 	}
-	if len(previous.events) != 3 || previous.events[0] != "executor_orphaned" || previous.events[1] != "cycle" {
-		t.Fatalf("previous events = %v, want every original event", previous.events)
+	original := make([]string, 0, len(previous.events))
+	for _, event := range previous.events {
+		if strings.HasPrefix(event, "telegram_notify_") {
+			continue
+		}
+		original = append(original, event)
+	}
+	want := []string{"executor_orphaned", "cycle", "blocker_opened"}
+	if strings.Join(original, ",") != strings.Join(want, ",") {
+		t.Fatalf("original events = %v, want %v", original, want)
 	}
 }
 
