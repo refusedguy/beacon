@@ -43,13 +43,13 @@ func NewSessionRegistry(s SessionStore) *SessionRegistry {
 	return &SessionRegistry{store: s, now: time.Now}
 }
 
-// clock returns the configured clock, or time.Now on a registry built as a
-// zero value.
-func (r *SessionRegistry) clock() func() time.Time {
+// clock returns the current time from the configured clock, or time.Now on a
+// registry built as a zero value.
+func (r *SessionRegistry) clock() time.Time {
 	if r != nil && r.now != nil {
-		return r.now
+		return r.now()
 	}
-	return time.Now
+	return time.Now()
 }
 
 // Start records a new session under id. An empty status becomes active. Both
