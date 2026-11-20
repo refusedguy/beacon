@@ -3,10 +3,67 @@ package wake
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
+
+// NotificationKind names the three events that need a human's attention. The
+// spellings match the reason and event names emitted by the orchestrator, the
+// bridge and the blocker ack path, so an operator grep finds the same word in
+// the Telegram message and in the structured log.
+type NotificationKind string
+
+const (
+	NotifyEscalateHuman    NotificationKind = "escalate_human"
+	NotifyExecutorOrphaned NotificationKind = "executor_orphaned"
+	NotifyBlockerOpened    NotificationKind = "blocker_opened"
+)
+
+// Notification is one human-attention event. WatchID, PR and Revision are
+// identifiers only; Detail is the human-readable context and is redacted before
+// it leaves the process.
+type Notification struct {
+	Kind     NotificationKind
+	WatchID  string
+	PR       int
+	Revision uint64
+	Detail   string
+}
+
+// NotificationSink is the port the attention events are delivered to. A
+// Telegram sink implements it; a task's fake can record the events instead.
+type NotificationSink interface {
+	Notify(ctx context.Context, n Notification) error
+}
+
+// FormatNotification renders one notification as plain text. It is a pure
+// function: redaction and transport belong to the adapter, not to the shape of
+// the message.
+func FormatNotification(n Notification) string {
+	var b strings.Builder
+	b.WriteString("[")
+	b.WriteString(string(n.Kind))
+	b.WriteString("]")
+	if n.WatchID != "" {
+		b.WriteString(" watch=")
+		b.WriteString(n.WatchID)
+	}
+	if n.PR != 0 {
+		b.WriteString(" pr=")
+		b.WriteString(strconv.Itoa(n.PR))
+	}
+	if n.Revision != 0 {
+		b.WriteString(" revision=")
+		b.WriteString(strconv.FormatUint(n.Revision, 10))
+	}
+	if detail := strings.TrimSpace(n.Detail); detail != "" {
+		b.WriteString("\n")
+		b.WriteString(detail)
+	}
+	return b.String()
+}
 
 // TriageClass is the executor's conclusion after it compares failedChecks with
 // its own diff (red-verdict-triage skill).
