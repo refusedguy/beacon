@@ -26,9 +26,9 @@ var daemonRunner = func(c *CLI, args []string) int { return runDaemon(c, args) }
 // RegisterDaemon installs the daemon command implementation.
 func RegisterDaemon(fn func(*CLI, []string) int) { daemonRunner = fn }
 
-// runDaemon implements `beacon daemon [--interval 3m] [--once]`. The daemon is
-// the only process the operator starts: every pass calls checkall, the
-// orchestrator and the merged-PR closer by itself.
+// runDaemon implements `beacon daemon [--interval 3m] [--once]`. The primary
+// host of the cycle is now `beacon mcp`, which starts it as a goroutine of the
+// same process. This command stays for manual and one-shot runs only.
 func runDaemon(c *CLI, args []string) int {
 	defaultInterval := orchestrator.DaemonInterval
 	if raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv)); raw != "" {

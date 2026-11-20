@@ -15,6 +15,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/app/taskcli"
 	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/ghci"
@@ -34,6 +35,52 @@ const mcpStateDBName = "beacon.db"
 
 // ciBridgeInterval bounds how often Beacon observes CI for active Watches.
 const ciBridgeInterval = 5 * time.Second
+
+// mcpDaemonPorts and mcpDaemonRun are the seams through which `beacon mcp`
+// hosts the full daemon cycle. Tests replace them to observe the loop without
+// opening real stores or calling gh.
+var (
+	mcpDaemonPorts = makeDaemonPorts
+	mcpDaemonRun   = orchestrator.DaemonRun
+)
+
+// mcpDaemonInterval is the pass interval of the in-process daemon. The default
+// is the same three minutes as `beacon daemon`; BEACON_DAEMON_INTERVAL overrides
+// it. A broken override falls back to the default so a bad setting cannot stop
+// the loop.
+func mcpDaemonInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv))
+	if raw == "" {
+		return orchestrator.DaemonInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return orchestrator.DaemonInterval
+	}
+	return d
+}
+
+// startMCPDaemon builds the full daemon cycle in this process and starts it as
+// a goroutine. The returned stop cancels the loop, waits for it to exit and
+// closes the ports it used. Callers must invoke stop before closing any store
+// the daemon might still touch.
+func startMCPDaemon(ctx context.Context, c *CLI) (func(), error) {
+	ports, closePorts, err := mcpDaemonPorts(c)
+	if err != nil {
+		return nil, err
+	}
+	daemonCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = mcpDaemonRun(daemonCtx, ports, mcpDaemonInterval(), false)
+	}()
+	return func() {
+		cancel()
+		<-done
+		_ = closePorts()
+	}, nil
+}
 
 // mcpConnectionFileName is the connection file read on every `beacon mcp`
 // startup. It sits next to beacon.db in the state directory (ADR 0036 §1).
@@ -399,12 +446,30 @@ func runMCP(ctx context.Context) error {
 	}
 	defer func() { _ = closeStore() }()
 
-	// The CI bridge is the missing production verdict source. It observes the
+	// Both background loops belong to this MCP run and are cancelled when it
+	// ends. A reconnect starts a fresh pair in the new process.
+	runCtx, stopLoops := context.WithCancel(ctx)
+	defer stopLoops()
+
+	// The CI bridge keeps verdicts fresh every five seconds: it observes the
 	// hosting service for active Watches and persists ready/retry, so the
 	// orchestrator reads a verdict from get_result instead of polling CI.
 	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, ciBridgeInterval)
 	ciBridge.WithWaker(wake.NewRegistry())
-	go ciBridge.Run(ctx)
+	go ciBridge.Run(runCtx)
+
+	// A full daemon cycle runs in this process as well. Starting `beacon mcp`
+	// is now enough: checkall, orchestrate and close-merged are no longer a
+	// separate `beacon daemon` process. The bridge above stays because it is
+	// the fast verdict observer (5s), while the daemon owns the slower full
+	// cycle (3m by default). CloseMerged's bridge.Refresh is an idempotent
+	// refresh of terminal PR states, so the two loops complement each other
+	// instead of publishing competing verdicts.
+	stopDaemon, err := startMCPDaemon(runCtx, newDefaultCLI())
+	if err != nil {
+		return fmt.Errorf("mcp: daemon: %w", err)
+	}
+	defer stopDaemon()
 
 	return serveMCP(ctx, deps)
 }

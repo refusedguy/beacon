@@ -14,10 +14,34 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
+
+// stubMCPDaemon replaces the in-process daemon for MCP tests that only care
+// about the server itself. The daemon start and shutdown are covered by the
+// dedicated tests at the bottom of this file.
+func stubMCPDaemon(t *testing.T) {
+	t.Helper()
+	previousPorts, previousRun := mcpDaemonPorts, mcpDaemonRun
+	t.Cleanup(func() {
+		mcpDaemonPorts = previousPorts
+		mcpDaemonRun = previousRun
+	})
+	mcpDaemonPorts = func(*CLI) (orchestrator.DaemonPorts, func() error, error) {
+		return orchestrator.DaemonPorts{
+			CheckAll:    func(context.Context) error { return nil },
+			Orchestrate: func(context.Context, orchestrator.Waker) error { return nil },
+			CloseMerged: func(context.Context) error { return nil },
+		}, func() error { return nil }, nil
+	}
+	mcpDaemonRun = func(ctx context.Context, _ orchestrator.DaemonPorts, _ time.Duration, _ bool) error {
+		<-ctx.Done()
+		return nil
+	}
+}
 
 // TestW43MCPDispatchesAndRuns proves that `beacon mcp` reaches the MCP runner,
 // that the runner is called exactly once and that its exit code and diagnostics
@@ -95,6 +119,7 @@ func TestW43MCPInCatalog(t *testing.T) {
 func TestMCPCompositionRootBuildsServerWithStore(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
+	stubMCPDaemon(t)
 
 	previous := serveMCP
 	t.Cleanup(func() { serveMCP = previous })
@@ -211,6 +236,7 @@ func TestReadMCPConnection(t *testing.T) {
 func TestMCPReconnectsAfterAddressChange(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
+	stubMCPDaemon(t)
 	state := filepath.Join(base, "beacon")
 	if err := os.MkdirAll(state, 0o700); err != nil {
 		t.Fatal(err)
@@ -389,6 +415,7 @@ func TestMCPPrecheckSkippedWithoutInitEventSource(t *testing.T) {
 func TestMCPPrecheckPassesWithBypass(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
+	stubMCPDaemon(t)
 	t.Setenv("BEACON_INIT_EVENT", "control-plane")
 	t.Setenv("BEACON_INIT_BYPASS", "1")
 
@@ -541,6 +568,7 @@ func TestMCPPrecheckReasonReachesWaitResultOverToolsCall(t *testing.T) {
 func TestMCPSuccessfulRunClearsPrecheckReason(t *testing.T) {
 	base := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", base)
+	stubMCPDaemon(t)
 	t.Setenv("BEACON_INIT_EVENT", "")
 	t.Setenv("BEACON_INIT_BYPASS", "")
 
@@ -716,5 +744,251 @@ func TestSyncCallOverThresholdReturnsJobTicket(t *testing.T) {
 	}
 	if out.ResultType != "" || out.TaskID != "" {
 		t.Fatalf("обычный клиент не должен получать task-форму: %+v", out)
+	}
+}
+
+// emptyOrchestratorStore is the orchestrator Store projection for the start-up
+// test below. It holds no Watches, so a registration attempt would be visible
+// as a write to the real domain store opened by makeDaemonPorts.
+type emptyOrchestratorStore struct{}
+
+func (emptyOrchestratorStore) ActiveWatches(context.Context) ([]orchestrator.Watch, error) {
+	return nil, nil
+}
+
+func (emptyOrchestratorStore) WasMerged(context.Context, string, uint64) (bool, error) {
+	return false, nil
+}
+
+func (emptyOrchestratorStore) RecordMerge(context.Context, string, uint64) error { return nil }
+
+func (emptyOrchestratorStore) CloseWatch(context.Context, string) error { return nil }
+
+// TestMCPStartsDaemonCycle proves that `beacon mcp` starts the full daemon
+// cycle inside its own process. The ports and the loop are replaced by seams;
+// the test observes the interval, the continuous (once=false) mode, the stop
+// on shutdown and the order in which closePorts runs.
+func TestMCPStartsDaemonCycle(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("BEACON_INIT_EVENT", "")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	t.Setenv("BEACON_DAEMON_INTERVAL", "7m")
+
+	previousPorts, previousRun, previousServe := mcpDaemonPorts, mcpDaemonRun, serveMCP
+	t.Cleanup(func() {
+		mcpDaemonPorts = previousPorts
+		mcpDaemonRun = previousRun
+		serveMCP = previousServe
+	})
+
+	type runInfo struct {
+		interval time.Duration
+		once     bool
+		ports    orchestrator.DaemonPorts
+	}
+	started := make(chan runInfo, 1)
+	daemonStopped := make(chan struct{})
+	portsClosed := make(chan struct{})
+
+	mcpDaemonPorts = func(*CLI) (orchestrator.DaemonPorts, func() error, error) {
+		ports := orchestrator.DaemonPorts{
+			CheckAll:    func(context.Context) error { return nil },
+			Orchestrate: func(context.Context, orchestrator.Waker) error { return nil },
+			CloseMerged: func(context.Context) error { return nil },
+		}
+		return ports, func() error {
+			select {
+			case <-daemonStopped:
+			default:
+				t.Error("closePorts вызван до остановки daemon-горутины")
+			}
+			close(portsClosed)
+			return nil
+		}, nil
+	}
+	mcpDaemonRun = func(ctx context.Context, ports orchestrator.DaemonPorts, interval time.Duration, once bool) error {
+		defer close(daemonStopped)
+		started <- runInfo{interval: interval, once: once, ports: ports}
+		<-ctx.Done()
+		return nil
+	}
+
+	serveCalled := make(chan struct{})
+	releaseServe := make(chan struct{})
+	serveMCP = func(context.Context, mcp.Dependencies) error {
+		close(serveCalled)
+		<-releaseServe
+		return nil
+	}
+
+	runnerDone := make(chan int, 1)
+	go func() { runnerDone <- mcpRunner(new(bytes.Buffer)) }()
+
+	<-serveCalled
+	info := <-started
+	if info.interval != 7*time.Minute {
+		t.Fatalf("интервал daemon = %s, ожидался 7m", info.interval)
+	}
+	if info.once {
+		t.Fatal("mcp должен запускать непрерывный цикл daemon, а не once")
+	}
+	if info.ports.CheckAll == nil || info.ports.Orchestrate == nil || info.ports.CloseMerged == nil {
+		t.Fatal("в daemon-горутину переданы неполные порты")
+	}
+
+	close(releaseServe)
+	if code := <-runnerDone; code != 0 {
+		t.Fatalf("код выхода %d, ожидался 0", code)
+	}
+	select {
+	case <-daemonStopped:
+	default:
+		t.Fatal("daemon-горутина не остановилась после завершения MCP")
+	}
+	select {
+	case <-portsClosed:
+	default:
+		t.Fatal("closePorts не вызван при завершении MCP")
+	}
+}
+
+// TestMCPDaemonStopsOnContextCancel checks the other shutdown path: a caller
+// that cancels the context passed to runMCP stops the daemon goroutine even
+// while the server is still waiting inside serveMCP.
+func TestMCPDaemonStopsOnContextCancel(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("BEACON_INIT_EVENT", "")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	t.Setenv("BEACON_DAEMON_INTERVAL", "")
+
+	previousPorts, previousRun, previousServe := mcpDaemonPorts, mcpDaemonRun, serveMCP
+	t.Cleanup(func() {
+		mcpDaemonPorts = previousPorts
+		mcpDaemonRun = previousRun
+		serveMCP = previousServe
+	})
+
+	portsClosed := 0
+	mcpDaemonPorts = func(*CLI) (orchestrator.DaemonPorts, func() error, error) {
+		return orchestrator.DaemonPorts{
+			CheckAll:    func(context.Context) error { return nil },
+			Orchestrate: func(context.Context, orchestrator.Waker) error { return nil },
+			CloseMerged: func(context.Context) error { return nil },
+		}, func() error { portsClosed++; return nil }, nil
+	}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	mcpDaemonRun = func(ctx context.Context, _ orchestrator.DaemonPorts, _ time.Duration, _ bool) error {
+		defer close(stopped)
+		close(started)
+		<-ctx.Done()
+		return nil
+	}
+	serveMCP = func(ctx context.Context, _ mcp.Dependencies) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- runMCP(ctx) }()
+
+	<-started
+	cancel()
+	if err := <-runDone; err != nil {
+		t.Fatalf("runMCP: %v", err)
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("daemon-горутина не остановилась по ctx cancel")
+	}
+	if portsClosed != 1 {
+		t.Fatalf("closePorts вызван %d раз, ожидался 1", portsClosed)
+	}
+}
+
+// TestMCPStartDoesNotCreateOrchestratorWatch drives the real makeDaemonPorts
+// through runMCP with a stubbed gh runner. An open PR without a Watch must not
+// make the daemon register one: Watch creation belongs to beacon_watch_pr, so
+// no Watch with an orchestrator subscriber may appear at MCP start.
+func TestMCPStartDoesNotCreateOrchestratorWatch(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("BEACON_INIT_EVENT", "")
+	t.Setenv("BEACON_INIT_BYPASS", "")
+	t.Setenv("BEACON_DAEMON_INTERVAL", "")
+
+	previousPorts, previousRun, previousServe, previousDeps := mcpDaemonPorts, mcpDaemonRun, serveMCP, makeOrchestratorDeps
+	t.Cleanup(func() {
+		mcpDaemonPorts = previousPorts
+		mcpDaemonRun = previousRun
+		serveMCP = previousServe
+		makeOrchestratorDeps = previousDeps
+	})
+
+	makeOrchestratorDeps = func(*CLI) (orchestratorDeps, func() error, error) {
+		return orchestratorDeps{Store: emptyOrchestratorStore{}}, func() error { return nil }, nil
+	}
+	cli, _, _, childCalls := t06NewCLI(t, func(call t06Call) runResult {
+		if call.name == "gh" && len(call.args) >= 2 && call.args[0] == "pr" && call.args[1] == "list" {
+			return runResult{stdout: []byte(`[{"number":7,"headRefOid":"head-7"}]`)}
+		}
+		if call.name == "gh" && len(call.args) > 0 && call.args[0] == "api" {
+			return runResult{stdout: []byte(`{"data":{}}`)}
+		}
+		return runResult{code: 1, stderr: []byte("unexpected child call")}
+	})
+	mcpDaemonPorts = func(*CLI) (orchestrator.DaemonPorts, func() error, error) {
+		return makeDaemonPorts(cli)
+	}
+	mcpDaemonRun = func(ctx context.Context, ports orchestrator.DaemonPorts, _ time.Duration, _ bool) error {
+		return ports.CheckAll(ctx)
+	}
+	serveMCP = func(context.Context, mcp.Dependencies) error { return nil }
+
+	if err := runMCP(context.Background()); err != nil {
+		t.Fatalf("runMCP: %v", err)
+	}
+	if len(*childCalls) == 0 {
+		t.Fatal("daemon-проход не обратился к gh через CLI runner")
+	}
+
+	deps, closeStore, err := openMCPDependencies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closeStore() }()
+	watches, err := deps.Store.AllWatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(watches) != 0 {
+		for _, w := range watches {
+			for _, s := range w.Subscribers {
+				if s.Role == domain.RoleOrchestrator {
+					t.Fatalf("daemon создал Watch с orchestrator-подписчиком: %+v", w)
+				}
+			}
+		}
+		t.Fatalf("daemon создал Watch при старте mcp: %+v", watches)
+	}
+}
+
+// TestMCPDaemonInterval covers the interval override and its fallback so a
+// broken BEACON_DAEMON_INTERVAL cannot stop the in-process loop.
+func TestMCPDaemonInterval(t *testing.T) {
+	t.Setenv("BEACON_DAEMON_INTERVAL", "")
+	if got := mcpDaemonInterval(); got != orchestrator.DaemonInterval {
+		t.Fatalf("интервал по умолчанию %s, ожидался %s", got, orchestrator.DaemonInterval)
+	}
+	t.Setenv("BEACON_DAEMON_INTERVAL", "45s")
+	if got := mcpDaemonInterval(); got != 45*time.Second {
+		t.Fatalf("настроенный интервал %s, ожидался 45s", got)
+	}
+	for _, raw := range []string{"not-a-duration", "0s", "-1m"} {
+		t.Setenv("BEACON_DAEMON_INTERVAL", raw)
+		if got := mcpDaemonInterval(); got != orchestrator.DaemonInterval {
+			t.Fatalf("значение %q дало %s, ожидался дефолт %s", raw, got, orchestrator.DaemonInterval)
+		}
 	}
 }
