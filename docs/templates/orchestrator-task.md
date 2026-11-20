@@ -85,14 +85,20 @@ orchestrator-task:informational-checks -->
 
 Мерж разрешён только после вызова `beacon_get_result` с `verdict=ready`. Ни idle-отчёт, ни фраза в чате, ни зелёный CI сами по себе не дают права на мерж. Инструмент возвращает снимок с полями status, verdict, revision, merge{mergeable, mergeStateStatus}, failedChecks, obligationID, retryBudget. Вызов additive и пишет readAt, поэтому прочтение результата останавливает лестницу пробуждения.
 
-Перед каждым ручным мержем оркестратор заново читает `get_result` и проходит четыре пункта. Verdict `ready` не отменяет чек.
+Перед каждым ручным мержем оркестратор заново читает `get_result` и проходит пять пунктов. Verdict `ready` не отменяет чек.
 
 1. Критерии приёмки. Сверить PR с критериями приёмки его карточки из поля «Приёмка». Для кода критерий это зелёный CI в PR, а не локальный прогон. Состав проверок берётся из failedChecks, где каждое поле несёт name, conclusion, detailsUrl, required и flakyMatched.
 2. Скоуп. Подтвердить, что PR меняет только файлы из поля «Владелец файлов» своей карточки. Правки вне скоупа возвращают PR исполнителю.
 3. Ревью. Прочитать reviewDecision из снимка merge. В версии v1 действует `ignoreReviews=true`, поэтому CHANGES_REQUESTED не блокирует ready. Оркестратор всё равно фиксирует, что поле прочитано.
 4. Branch protection. Подтвердить `mergeable=MERGEABLE`, `mergeStateStatus` из набора CLEAN, HAS_HOOKS или BEHIND при `requireUpToDate=false`, PR не черновик, и среди failedChecks нет записи с `required=true` и отрицательным conclusion.
+5. Docs и код. Подтвердить, что PR с изменением кода обновляет затронутую документацию в том же PR. Расхождение между кодом и документацией возвращает PR исполнителю и проваливает карточку.
 
 Если любой пункт чека не проходит, ручной мерж заблокирован. Возврат исполнителя на доработку решает оркестратор, а не Beacon.
+
+<!-- orchestrator-task:docs-sync
+code-change: update-docs-in-same-pr
+mismatch: fail
+orchestrator-task:docs-sync -->
 
 ## Идемпотентность мержа
 
