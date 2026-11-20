@@ -144,6 +144,33 @@ continue-on-error:true -> informational, no blocked:not_mine
 docs gate with duplicate ADRs -> informational, not a main blocker
 executor-task:informational-checks -->
 
+## Триаж красного вердикта
+
+На вердикте `retry` исполнитель не чинит код вслепую. Он классифицирует причину, сравнив `failedChecks` со своим diff, и только потом решает, что делать (ADR 0072, ADR 0155). Классификация уходит wake'ом оркестратору, а не вопросом владельцу.
+
+<!-- executor-task:triage
+source: beacon_get_result.failedChecks
+fields: name, conclusion, detailsUrl, required, flakyMatched
+compare: git diff <baseRef>..HEAD
+own-diff: fix-branch-and-push-new-headSHA
+foreign-or-flaky: blocked:not_mine
+unknown: report-no-own-changes
+fix-main: forbidden
+wake: orchestrator
+executor-task:triage -->
+
+Процедура:
+
+1. Прочитать снимок `beacon_get_result`. В ответе есть `failedChecks` с полями `name`, `conclusion`, `detailsUrl`, `required` и `flakyMatched`. Полные логи не нужны.
+2. Сверить `failedChecks` со своим diff: `git status --short` и `git diff <baseRef>..HEAD` в своём worktree. Проверка считается твоей, когда её причина лежит в файлах, которые ты менял в этой ветке.
+3. Выбрать причину и отослать wake подписчику `role=orchestrator` на том же Watch.
+   - Причина вне твоего diff или красный `main` на последнем коммите: флейк или чужая поломка, `decision="blocked:not_mine"`.
+   - Причина в твоём diff: твоя ошибка. Исправить ветку и запушить новый headSHA.
+   - Причину нельзя отнести ни к тому, ни к другому: сообщить, что изменений моих нет.
+4. Завершить ход. Wake оркестратору не означает готовность PR. Мерж делает только оркестратор после своего `beacon_get_result` с `verdict=ready`.
+
+Не чинить `main` самому, не пушить в `main` и не править файлы вне своего worktree.
+
 ## Отложенная проводка (deferred wiring)
 
 Если часть фичи осталась не подключённой в этом PR, исполнитель не оставляет её молча «на потом». Он вызывает `beacon_defer_wiring` с `watchID`, номером PR, причиной и списком `OwnerFiles`, затем добавляет в свой PR сгенерированную карточку `docs/tasks/WIRING-<PR>.md` по шаблону `docs/templates/wiring-card.md`.

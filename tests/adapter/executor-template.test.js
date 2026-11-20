@@ -64,3 +64,19 @@ test("T3.7 шаблон: re-run делает агент, у Beacon нет ком
 test("T3.7 шаблон: TTL не является причиной выхода из цикла", () => {
   assert.equal(block("ttl"), "none")
 })
+
+test("T3.404 шаблон: триаж требует сравнить failedChecks со своим diff", () => {
+  const b = block("triage")
+  const fields = Object.fromEntries(
+    b.split("\n")
+      .filter((l) => l.includes(":"))
+      .map((l) => [l.slice(0, l.indexOf(":")).trim(), l.slice(l.indexOf(":") + 1).trim()])
+  )
+  assert.equal(fields.source, "beacon_get_result.failedChecks")
+  assert.match(fields.compare, /git diff/)
+  assert.equal(fields["own-diff"], "fix-branch-and-push-new-headSHA")
+  assert.equal(fields["foreign-or-flaky"], "blocked:not_mine")
+  assert.equal(fields.unknown, "report-no-own-changes")
+  assert.equal(fields["fix-main"], "forbidden")
+  assert.equal(fields.wake, "orchestrator")
+})
