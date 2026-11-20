@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -141,6 +143,125 @@ func watchPRTestInput(head string, role domain.Role) WatchPRInput {
 		HeadSHA: head,
 		Role:    role,
 		Notify:  &WatchPRNotify{Adapter: "opencode", Target: "delivery-target"},
+	}
+}
+
+// TestWatchPRInputSchemaHasExecutorDescriptor keeps the optional executor
+// descriptor in the derived MCP input schema, so a client can send the
+// executor data before it reports the waiting turn (T5.31, ADR 0088).
+func TestWatchPRInputSchemaHasExecutorDescriptor(t *testing.T) {
+	schema, err := jsonschema.For[WatchPRInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	executor, ok := schema.Properties["executor"]
+	if !ok {
+		t.Fatal("input schema has no executor property")
+	}
+	props := executor.Properties
+	if executor.Ref != "" {
+		def, ok := schema.Defs[strings.TrimPrefix(executor.Ref, "#/$defs/")]
+		if !ok {
+			t.Fatalf("executor $ref %q has no definition", executor.Ref)
+		}
+		props = def.Properties
+	}
+	for _, field := range []string{"id", "role", "runtime", "agent", "capabilities", "configId"} {
+		if _, ok := props[field]; !ok {
+			t.Errorf("executor descriptor has no %q property", field)
+		}
+	}
+}
+
+// TestWatchPRExecutorJSONFields proves the tool accepts the six descriptor
+// fields at the MCP boundary under their wire names.
+func TestWatchPRExecutorJSONFields(t *testing.T) {
+	var in WatchPRInput
+	raw := `{"executor":{"id":"exec-1","role":"executor","runtime":"subagent",` +
+		`"agent":"build","capabilities":["watch","ci-retry"],"configId":"cfg-1"}}`
+	if err := json.Unmarshal([]byte(raw), &in); err != nil {
+		t.Fatalf("decode watch_pr input: %v", err)
+	}
+	if in.Executor == nil {
+		t.Fatal("executor descriptor was not decoded")
+	}
+	want := &WatchPRExecutor{
+		ID: "exec-1", Role: "executor", Runtime: "subagent", Agent: "build",
+		Capabilities: []string{"watch", "ci-retry"}, ConfigID: "cfg-1",
+	}
+	if !reflect.DeepEqual(in.Executor, want) {
+		t.Fatalf("decoded executor = %+v, want %+v", in.Executor, want)
+	}
+}
+
+// TestWatchPRExecutorIsOptional proves a call made as before the descriptor
+// existed still registers, and that supplying a descriptor changes neither
+// validation nor the response shape (T5.31).
+func TestWatchPRExecutorIsOptional(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	req := sessionReq("session-optional")
+
+	without, err := h.Register(context.Background(), req, watchPRTestInput("optional-sha", domain.RoleExecutor))
+	if err != nil {
+		t.Fatalf("Register without executor: %v", err)
+	}
+	in := watchPRTestInput("optional-sha-2", domain.RoleExecutor)
+	in.Executor = &WatchPRExecutor{
+		ID: "exec-1", Role: "executor", Runtime: "subagent", Agent: "build",
+		Capabilities: []string{"watch", "read-verdict"}, ConfigID: "cfg-1",
+	}
+	with, err := h.Register(context.Background(), req, in)
+	if err != nil {
+		t.Fatalf("Register with executor: %v", err)
+	}
+	for name, out := range map[string]WatchPROutput{"without": without, "with": with} {
+		if out.WatchID == "" {
+			t.Errorf("%s: watchID is empty in %+v", name, out)
+		}
+		if out.Status != string(domain.StatusWatching) || out.Verdict != string(domain.VerdictWatching) {
+			t.Errorf("%s: unexpected status/verdict in %+v", name, out)
+		}
+	}
+
+	bad := in
+	bad.Repo = ""
+	_, err = h.Register(context.Background(), req, bad)
+	assertCode(t, err, domain.CodeInvalidInput)
+}
+
+// TestWatchPRExecutorAgentNameIsOpaque proves the core does not interpret the
+// descriptor's agent name: changing only that field leaves the Watch and its
+// subscriber identity untouched (T5.31 acceptance, ADR 0088).
+func TestWatchPRExecutorAgentNameIsOpaque(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	in := watchPRTestInput("opaque-sha", domain.RoleExecutor)
+	in.Executor = &WatchPRExecutor{ID: "exec-1", Role: "executor", Agent: "build"}
+	req := sessionReq("session-opaque")
+
+	first, err := h.Register(context.Background(), req, in)
+	if err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	in.Executor.Agent = "general"
+	second, err := h.Register(context.Background(), req, in)
+	if err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+
+	if first.WatchID != second.WatchID {
+		t.Errorf("agent name changed the Watch: %q -> %q", first.WatchID, second.WatchID)
+	}
+	all, err := store.AllWatches()
+	if err != nil {
+		t.Fatalf("AllWatches: %v", err)
+	}
+	if len(all) != 1 {
+		t.Fatalf("got %d watches, want 1", len(all))
+	}
+	if len(all[0].Subscribers) != 1 || all[0].Subscribers[0].ID != "session-opaque" {
+		t.Fatalf("agent name changed subscriber identity: %+v", all[0].Subscribers)
 	}
 }
 

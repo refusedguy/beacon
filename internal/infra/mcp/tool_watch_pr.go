@@ -32,21 +32,36 @@ const (
 // WatchPRInput is the argument shape of beacon_watch_pr (WORKER-PROMPT §4.1).
 // All fields except repo, pr and role are optional in the contract.
 type WatchPRInput struct {
-	Repo       string         `json:"repo" jsonschema:"repository slug, for example owner/name"`
-	PR         int            `json:"pr" jsonschema:"pull request number, must be positive"`
-	HeadSHA    string         `json:"headSHA,omitempty" jsonschema:"head commit SHA; resolved from the CI provider when omitted"`
-	Issue      string         `json:"issue,omitempty"`
-	Role       domain.Role    `json:"role" jsonschema:"subscriber role: executor or orchestrator"`
-	Notify     *WatchPRNotify `json:"notify,omitempty"`
-	Flaky      *WatchPRFlaky  `json:"flaky,omitempty"`
-	Policy     *WatchPRPolicy `json:"policy,omitempty"`
-	DeadlineMs *int64         `json:"deadlineMs,omitempty" jsonschema:"watch deadline in milliseconds from now"`
+	Repo       string           `json:"repo" jsonschema:"repository slug, for example owner/name"`
+	PR         int              `json:"pr" jsonschema:"pull request number, must be positive"`
+	HeadSHA    string           `json:"headSHA,omitempty" jsonschema:"head commit SHA; resolved from the CI provider when omitted"`
+	Issue      string           `json:"issue,omitempty"`
+	Role       domain.Role      `json:"role" jsonschema:"subscriber role: executor or orchestrator"`
+	Notify     *WatchPRNotify   `json:"notify,omitempty"`
+	Executor   *WatchPRExecutor `json:"executor,omitempty"`
+	Flaky      *WatchPRFlaky    `json:"flaky,omitempty"`
+	Policy     *WatchPRPolicy   `json:"policy,omitempty"`
+	DeadlineMs *int64           `json:"deadlineMs,omitempty" jsonschema:"watch deadline in milliseconds from now"`
 }
 
 // WatchPRNotify is the optional delivery endpoint of the registering party.
 type WatchPRNotify struct {
 	Adapter string `json:"adapter"`
 	Target  string `json:"target"`
+}
+
+// WatchPRExecutor is the optional descriptor of the executor that registers
+// the Watch. Every field is opaque caller data: the tool accepts it at the MCP
+// boundary and never interprets the agent name, the runtime or the declared
+// capabilities (ADR 0088, ADR 0089). An absent descriptor keeps the behaviour
+// of calls made before this field existed.
+type WatchPRExecutor struct {
+	ID           string   `json:"id,omitempty" jsonschema:"opaque executor identifier"`
+	Role         string   `json:"role,omitempty" jsonschema:"declared role, carried without interpretation"`
+	Runtime      string   `json:"runtime,omitempty" jsonschema:"declared session mode, carried without interpretation"`
+	Agent        string   `json:"agent,omitempty" jsonschema:"opaque agent name; the core never interprets it"`
+	Capabilities []string `json:"capabilities,omitempty" jsonschema:"declared capabilities, carried without interpretation"`
+	ConfigID     string   `json:"configId,omitempty" jsonschema:"configuration identity from ADR 0087"`
 }
 
 // WatchPRFlaky is the input form of the flaky-check configuration. It carries
@@ -142,6 +157,10 @@ func (h *WatchPRHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest
 // Register is the core operation. It validates input, derives the subscriber
 // identity, resolves headSHA when omitted, closes a superseded Watch on head
 // change, then upserts the Watch and subscriber through domain.Fanout.
+//
+// An optional in.Executor descriptor is accepted as opaque caller data. The
+// core never interprets its agent name and never uses the descriptor to change
+// subscriber identity, routing or the persisted Watch (T5.31, ADR 0088).
 func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolRequest, in WatchPRInput) (WatchPROutput, error) {
 	if in.Repo == "" || in.PR <= 0 {
 		return WatchPROutput{}, domain.NewAppError(domain.CodeInvalidInput, "watch_pr: repo and a positive pr are required")
