@@ -26,6 +26,9 @@ const (
 	// prefix differs from planLimitWarningPrefix because ADR 0056 p6 measures
 	// idle time and T3.52 warns about an approaching plan limit.
 	waitTelemetryPrefix = "wait telemetry: "
+	// registryStatsErrorPrefix marks a failed registry read inside loadErrors.
+	// It is a diagnostic, not a plan-limit warning (T5.60).
+	registryStatsErrorPrefix = "registry: "
 )
 
 // Plan limit levels reported in the stats response. A zero PlanLimitInfo uses
@@ -73,6 +76,51 @@ type WaitTelemetryReader interface {
 	WaitSamples() []WaitSample
 }
 
+// RegistryStats is the registry projection reported by beacon_stats (T5.60,
+// ADR 0093). Counts are plain integers and ConfigID is the configuration
+// identity shared by the registry rows. A mixed or empty registry has an empty
+// ConfigID; the counters still describe the rows that are present.
+type RegistryStats struct {
+	RegisteredAgents int
+	StaleAgents      int
+	ConfigID         string
+}
+
+// RegistryStatsReader is the narrow read-only port for the registry counters.
+// It is optional, like WaitTelemetryReader: a handler without one keeps the
+// pre-T5.60 response with zero counters. The composition root supplies a
+// DB-backed reader through Dependencies when registry state is available.
+type RegistryStatsReader interface {
+	RegistryStats(ctx context.Context) (RegistryStats, error)
+}
+
+// SnapshotRegistryStats adapts the Registry projection already carried by a
+// StateSnapshot (T5.29) to RegistryStatsReader. A wiring layer whose snapshot
+// reader fills Registry can pass this adapter to SetRegistryStatsReader.
+type SnapshotRegistryStats struct {
+	reader SnapshotReader
+}
+
+// NewSnapshotRegistryStats builds an adapter around reader.
+func NewSnapshotRegistryStats(reader SnapshotReader) *SnapshotRegistryStats {
+	return &SnapshotRegistryStats{reader: reader}
+}
+
+// RegistryStats projects the snapshot's Registry rows onto registry counters.
+// It reads the same store as the handler; a read error is returned to the
+// caller, which records it as a diagnostic instead of inventing counters.
+func (s *SnapshotRegistryStats) RegistryStats(_ context.Context) (RegistryStats, error) {
+	snap, err := s.reader.Snapshot()
+	if err != nil {
+		return RegistryStats{}, err
+	}
+	return RegistryStats{
+		RegisteredAgents: snap.RegisteredAgents(),
+		StaleAgents:      snap.StaleAgents(),
+		ConfigID:         snap.RegistryConfig(),
+	}, nil
+}
+
 // StatsInput is the empty input of beacon_stats. The tool takes no arguments.
 type StatsInput struct{}
 
@@ -81,13 +129,21 @@ type StatsInput struct{}
 // cached counter can hide a budget spike or a growing watch list from the
 // orchestrator, so the tool reports what the store says right now.
 type StatsHandler struct {
-	reader SnapshotReader
+	reader   SnapshotReader
+	registry RegistryStatsReader
 }
 
 // NewStatsHandler builds the handler. Pass handler.Handle to mcpsdk.AddTool
-// when wiring the tool into a server.
+// when wiring the tool into a server. The registry port is optional and is set
+// with SetRegistryStatsReader by a composition root that has one.
 func NewStatsHandler(reader SnapshotReader) *StatsHandler {
 	return &StatsHandler{reader: reader}
+}
+
+// SetRegistryStatsReader binds the optional registry counter port. Passing nil
+// removes it and restores the pre-T5.60 zero counters.
+func (h *StatsHandler) SetRegistryStatsReader(r RegistryStatsReader) {
+	h.registry = r
 }
 
 // planLimitInfo computes the warning from used and budget. A missing or
@@ -175,10 +231,12 @@ func (i WaitTelemetryInfo) entry() string {
 // Handle copies the values already present in a state snapshot into the stats
 // response. It appends a plan-limit warning to loadErrors when a threshold is
 // crossed and, when the reader also exposes wait samples, an idle metric with
-// the wait share and the mean worker count (ADR 0056 p6). It performs no write
-// and no model request. Slices are allocated even when empty so the response
-// always carries an array, never JSON null.
-func (h *StatsHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, _ StatsInput) (*mcpsdk.CallToolResult, StatsOutput, error) {
+// the wait share and the mean worker count (ADR 0056 p6). If a registry port is
+// bound, the three T5.60 counters come from it; a failed read is recorded in
+// loadErrors instead of producing invented counters. It performs no write and
+// no model request. Slices are allocated even when empty so the response always
+// carries an array, never JSON null.
+func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ StatsInput) (*mcpsdk.CallToolResult, StatsOutput, error) {
 	snap, err := h.reader.Snapshot()
 	if err != nil {
 		observe.ActorError("beacon_stats", "", err)
@@ -196,6 +254,16 @@ func (h *StatsHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, _ St
 		}
 	}
 
+	var registry RegistryStats
+	if h.registry != nil {
+		registry, err = h.registry.RegistryStats(ctx)
+		if err != nil {
+			observe.ActorError("beacon_stats", "", err)
+			loadErrors = append(loadErrors, registryStatsErrorPrefix+err.Error())
+			registry = RegistryStats{}
+		}
+	}
+
 	out := StatsOutput{
 		PointsThisHour: snap.PointsThisHour,
 		Budget:         snap.Budget,
@@ -209,7 +277,10 @@ func (h *StatsHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, _ St
 			Pending:   snap.LadderPending,
 			Escalated: snap.LadderEscalated,
 		},
-		Version: snap.Version,
+		Version:          snap.Version,
+		RegisteredAgents: registry.RegisteredAgents,
+		StaleAgents:      registry.StaleAgents,
+		ConfigID:         registry.ConfigID,
 	}
 	return &mcpsdk.CallToolResult{}, out, nil
 }
@@ -231,6 +302,18 @@ func planLimitWarning(out StatsOutput) string {
 func waitTelemetryEntry(out StatsOutput) string {
 	for _, entry := range out.LoadErrors {
 		if strings.HasPrefix(entry, waitTelemetryPrefix) {
+			return entry
+		}
+	}
+	return ""
+}
+
+// registryStatsError returns the registry diagnostic present in a stats
+// response, if any. Like the other prefixes it keeps the caller independent of
+// the entry's position in loadErrors.
+func registryStatsError(out StatsOutput) string {
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, registryStatsErrorPrefix) {
 			return entry
 		}
 	}

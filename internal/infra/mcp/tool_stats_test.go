@@ -23,6 +23,20 @@ type waitTelemetryReaderFake struct {
 
 func (f *waitTelemetryReaderFake) WaitSamples() []WaitSample { return f.samples }
 
+// registryStatsFake is a mock registry port. It returns fixed counters and an
+// optional read error, and counts calls so a test can prove the handler reads
+// it once per request.
+type registryStatsFake struct {
+	stats RegistryStats
+	err   error
+	calls int
+}
+
+func (f *registryStatsFake) RegistryStats(context.Context) (RegistryStats, error) {
+	f.calls++
+	return f.stats, f.err
+}
+
 func callStats(t *testing.T, handler *StatsHandler) StatsOutput {
 	t.Helper()
 	result, out, err := handler.Handle(context.Background(), nil, StatsInput{})
@@ -50,6 +64,7 @@ func TestStatsResponseHasEveryField(t *testing.T) {
 
 	for _, key := range []string{
 		"pointsThisHour", "budget", "activeWatches", "persist", "loadErrors", "ladder", "version",
+		"registeredAgents", "staleAgents", "configId",
 	} {
 		if _, ok := fields[key]; !ok {
 			t.Errorf("stats output missing field %q: %s", key, raw)
@@ -453,6 +468,158 @@ func TestWaitTelemetryDoesNotBreakOutputSchema(t *testing.T) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		t.Fatalf("unmarshal stats fields: %v", err)
+	}
+	for key := range fields {
+		if _, ok := statsSchema.Properties[key]; !ok {
+			t.Errorf("stats output has field %q not in the derived schema", key)
+		}
+	}
+}
+
+// TestStatsRegistryCountersFromPort proves the three T5.60 fields come from the
+// registry port. The seven original fields keep their values and names.
+func TestStatsRegistryCountersFromPort(t *testing.T) {
+	snap := sampleSnapshot()
+	port := &registryStatsFake{stats: RegistryStats{
+		RegisteredAgents: 7,
+		StaleAgents:      2,
+		ConfigID:         "ci=stub,gpt=codex",
+	}}
+	handler := NewStatsHandler(&snapshotReaderFake{snap: snap})
+	handler.SetRegistryStatsReader(port)
+	out := callStats(t, handler)
+
+	if out.RegisteredAgents != 7 {
+		t.Errorf("registeredAgents = %d, want 7", out.RegisteredAgents)
+	}
+	if out.StaleAgents != 2 {
+		t.Errorf("staleAgents = %d, want 2", out.StaleAgents)
+	}
+	if out.ConfigID != "ci=stub,gpt=codex" {
+		t.Errorf("configId = %q, want ci=stub,gpt=codex", out.ConfigID)
+	}
+	if port.calls != 1 {
+		t.Errorf("registry reads = %d, want 1", port.calls)
+	}
+
+	// The original contract is unchanged by the additive fields.
+	if out.PointsThisHour != snap.PointsThisHour || out.Budget != snap.Budget ||
+		out.ActiveWatches != len(snap.RadarWatches()) || out.Persist.Seq != snap.PersistSeq ||
+		!reflect.DeepEqual(out.LoadErrors, snap.LoadErrors) ||
+		out.Ladder.Pending != snap.LadderPending || out.Ladder.Escalated != snap.LadderEscalated ||
+		out.Version != snap.Version {
+		t.Errorf("original stats fields changed with a registry port: %+v", out)
+	}
+}
+
+// TestStatsRegistryCountersAbsentWithoutPort keeps the pre-T5.60 behaviour for
+// callers that have not wired a registry reader.
+func TestStatsRegistryCountersAbsentWithoutPort(t *testing.T) {
+	out := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()}))
+	if out.RegisteredAgents != 0 || out.StaleAgents != 0 || out.ConfigID != "" {
+		t.Errorf("registry counters without a port = %+v, want zero values", out)
+	}
+}
+
+// TestStatsRegistryCountersFromSnapshotProjection ties the port to the registry
+// projection already carried by StateSnapshot (T5.29): counts and config id are
+// derived from the same rows list_running reads.
+func TestStatsRegistryCountersFromSnapshotProjection(t *testing.T) {
+	snap := sampleSnapshot()
+	snap.Registry = []RegistryEntry{
+		{ID: "a", Config: "cfg-1", Status: RegistryActive},
+		{ID: "b", Config: "cfg-1", Status: RegistryStale},
+		{ID: "c", Config: "cfg-1", Status: RegistryStale},
+	}
+	reader := &snapshotReaderFake{snap: snap}
+	handler := NewStatsHandler(reader)
+	handler.SetRegistryStatsReader(NewSnapshotRegistryStats(reader))
+	out := callStats(t, handler)
+
+	if out.RegisteredAgents != 3 {
+		t.Errorf("registeredAgents = %d, want 3", out.RegisteredAgents)
+	}
+	if out.StaleAgents != 2 {
+		t.Errorf("staleAgents = %d, want 2", out.StaleAgents)
+	}
+	if out.ConfigID != "cfg-1" {
+		t.Errorf("configId = %q, want cfg-1", out.ConfigID)
+	}
+}
+
+// TestStatsRegistryPortErrorIsDiagnostic proves a failed registry read is
+// reported as a diagnostic and never produces invented counters.
+func TestStatsRegistryPortErrorIsDiagnostic(t *testing.T) {
+	want := errors.New("registry unavailable")
+	handler := NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()})
+	handler.SetRegistryStatsReader(&registryStatsFake{err: want})
+	out := callStats(t, handler)
+
+	if entry := registryStatsError(out); !strings.Contains(entry, want.Error()) {
+		t.Errorf("registry diagnostic = %q, want it to contain %q", entry, want.Error())
+	}
+	if out.RegisteredAgents != 0 || out.StaleAgents != 0 || out.ConfigID != "" {
+		t.Errorf("counters after a failed registry read = %+v, want zero values", out)
+	}
+	if out.LoadErrors[0] != "line 3: bad payload" {
+		t.Errorf("loadErrors[0] = %q, want the stored error", out.LoadErrors[0])
+	}
+}
+
+// TestStatsRegistryPortCanBeRemoved proves the port is optional in both
+// directions, so a caller can fall back to the legacy response.
+func TestStatsRegistryPortCanBeRemoved(t *testing.T) {
+	handler := NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()})
+	handler.SetRegistryStatsReader(&registryStatsFake{stats: RegistryStats{RegisteredAgents: 9}})
+	handler.SetRegistryStatsReader(nil)
+	out := callStats(t, handler)
+	if out.RegisteredAgents != 0 || out.StaleAgents != 0 || out.ConfigID != "" {
+		t.Errorf("counters after removing the port = %+v, want zero values", out)
+	}
+}
+
+// TestStatsRegistryCountersInDerivedSchema proves the new fields are in the
+// reflected output schema next to the seven original ones.
+func TestStatsRegistryCountersInDerivedSchema(t *testing.T) {
+	schemas, err := AllOutputSchemas()
+	if err != nil {
+		t.Fatalf("AllOutputSchemas: %v", err)
+	}
+	statsSchema := schemas["beacon_stats"]
+	resolved, err := statsSchema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve stats schema: %v", err)
+	}
+
+	handler := NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()})
+	handler.SetRegistryStatsReader(&registryStatsFake{stats: RegistryStats{
+		RegisteredAgents: 5,
+		StaleAgents:      1,
+		ConfigID:         "cfg-1",
+	}})
+	raw, err := json.Marshal(callStats(t, handler))
+	if err != nil {
+		t.Fatalf("marshal stats output: %v", err)
+	}
+	var instance map[string]any
+	if err := json.Unmarshal(raw, &instance); err != nil {
+		t.Fatalf("unmarshal stats output: %v", err)
+	}
+	if err := resolved.Validate(instance); err != nil {
+		t.Fatalf("stats output with registry counters fails derived schema: %v", err)
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal stats fields: %v", err)
+	}
+	for _, key := range []string{
+		"pointsThisHour", "budget", "activeWatches", "persist", "loadErrors", "ladder", "version",
+		"registeredAgents", "staleAgents", "configId",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("stats output missing field %q: %s", key, raw)
+		}
 	}
 	for key := range fields {
 		if _, ok := statsSchema.Properties[key]; !ok {
