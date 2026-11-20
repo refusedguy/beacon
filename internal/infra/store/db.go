@@ -124,6 +124,15 @@ func open(path, drv string, production bool) (*DB, error) {
 		return nil, fmt.Errorf("store: migrate: %w", err)
 	}
 
+	// The scoped event log extends the events table created by migration 0004.
+	// It is prepared here, at store initialization, so Append and ReadAfter can
+	// rely on the scope/type columns and the (scope, seq) replay index.
+	if err := ensureEventLog(ctx, writeDB); err != nil {
+		writeDB.Close()
+		readDB.Close()
+		return nil, fmt.Errorf("store: event log: %w", err)
+	}
+
 	conn, err := writeDB.Conn(ctx)
 	if err != nil {
 		writeDB.Close()
