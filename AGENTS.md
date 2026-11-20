@@ -1,46 +1,97 @@
 # Правила агента в репозитории beacon
 
-## Beacon MCP обязателен для цикла
+Этот файл описывает текущий цикл работы. Он важнее старых карточек и ADR, где зафиксированы отменённые режимы.
 
-MCP-сервер Beacon подключён в `/mnt/projects/beacon-handoff/opencode.json`. Инструменты доступны через инструмент `execute` (Code Mode): сначала `search({ query: "beacon", namespace: "beacon" })`, затем вызовы `tools.beacon.beacon_watch_pr({...})` и остальные шесть инструментов. Не писать самописный JSON-RPC-клиент.
+## Доступ к Beacon
 
-До начала работы прочитать шаблон своего цикла:
+MCP-сервер Beacon подключён в `/mnt/projects/beacon-handoff/opencode.json`. Инструменты доступны через инструмент `execute` в Code Mode: сначала `search({ query: "beacon", namespace: "beacon" })`, затем вызовы `tools.beacon.<name>`. Не писать самописный JSON-RPC-клиент.
 
-- исполнитель: `docs/templates/executor-task.md`
+Семь инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`.
+
+Перед работой прочитать шаблон своего цикла:
+
+- исполнитель и фиксер: `docs/templates/executor-task.md`
 - оркестратор: `docs/templates/orchestrator-task.md`
 
-Исполнитель после открытия PR:
+## Слабый ПК и CI-only
 
-1. Берёт `headSHA` командой `git rev-parse HEAD` в своём worktree.
-2. Вызывает `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"`, `notify: { adapter: "opencode", target: "<cardID>" }`.
-3. Завершает ход ровно фразой `waiting, <watchID>`. Не опрашивает `gh pr checks` в цикле и не ждёт вручную.
+Локально запускать только `gofmt -w <изменённые_файлы>`.
 
-Оркестратор подписывается на тот же PR с `role: "orchestrator"`. Вердикт читается только через `beacon_get_result`. `<subagent>`-отчёт со словом `waiting` вердиктом не является. Мерж только после зелёных проверок и читаного `verdict=ready`.
+Локально НЕ запускать:
 
-## Самоиспользование инструментов
+- `go test ./...`
+- `go build ./...`
+- `beacon gates`
+- `gh pr checks --watch`, `sleep` и любые циклы ожидания
 
-- Карточки создаются только через `go run ./cmd/batch-apply --dir <json> --check`, затем тем же вызовом без `--check`. Ручной `cat` для карточек не используется.
-- Закрытие карточек тоже делается тулзой: подготовь JSON с `card_closures: [{id, pr, merged_at}]` и запусти `go run ./cmd/batch-apply --dir <папка> --dry-run`, затем без `--dry-run`. Не редактируй `docs/tasks/*.md` вручную.
-- Любой сабагент, который видит незакрытую карточку с уже замерженным PR, обязан закрыть её через batch-apply, а не просто сообщить об этом.
-- Research-агенты пишут структурированный JSON в `/home/nbook/Projects/tmp/beacon-research/batch/`, а не сырые отчёты в чат. Оркестратор применяет его одной командой batch-apply.
-- Оркестратор регистрирует Watch через `tools.beacon.beacon_watch_pr` и читает вердикт через `beacon_get_result`. `gh pr checks` вручную не вызывается.
-- Wake доставляется через opencode API `POST /api/session/{id}/prompt` с `delivery=steer`. В тексте настоящие `watchID` и `obligationID`, а не заглушки.
-- Форматирование и проверки выполняет CI, локальный `gofmt` не запускается.
+Все полные проверки прогоняет GitHub Actions CI на PR. Локальный прогон не является гейтом и только тратит ресурсы слабого ПК.
 
-## Пересборка MCP-бинарника
+## Ветки, worktree и PR
 
-Если `beacon_watch_pr` отвечает `PERSIST_FAILED: watch_pr: store is nil`, бинарник собран до коммита с подключённым store. Пересобрать из корня репо:
+Прямые коммиты в `main` запрещены. Любая работа сабента идёт через отдельную ветку и worktree, затем через PR.
 
-```
-go build -o .opencode/bin/beacon ./cmd/beacon
-```
+1. Создать ветку от актуального `origin/main`.
+2. Внести изменения только в файлы из поля «Владелец файлов» своей карточки.
+3. Выполнить `git push -u origin <ветка>`, затем `gh pr create --base main --head <ветка>`.
+4. В отчёте указать номер PR, headSHA от `git rev-parse HEAD` и список файлов.
 
-## Коммиты и локальные проверки
+Мержит только CI вместе с Beacon. Оркестратор мержит вручную только после зелёного CI, когда авто-мерж невозможен по политике Watch.
 
-Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки. Локальные проверки не являются гейтом: `gofmt`, `go test` и `go build` выполняет CI.
+## Контракт beacon_watch_pr
 
-## Project scope и вердикты
+Исполнитель регистрирует PR сразу после `gh pr create`.
 
-Состояние Beacon привязано к проекту: state лежит в `<XDG_STATE_HOME>/beacon/projects/<name>-<hash>/beacon.db`, когда cwd содержит `.git`. MCP поднимается с `cwd` текущего проекта из `opencode.json`. Переход в другую папку проекта даёт другой state. Явный override: `BEACON_STATE_DIR`.
+- `repo`: `refusedguy/beacon`.
+- `pr`, `headSHA`, `baseRef`: факты сдачи PR.
+- role: "executor" или role: "fixer".
+- `notify.target`: РЕАЛЬНЫЙ `ses_...` из `_meta["ai.opencode/sessionID"]` текущей сессии или явно переданный `notify.target: "<ses_...>"`.
 
-Локальный MCP поднимает CI-мост: он читает проверки PR через `gh` и переводит Watch в `ready` (все зелёные) или `retry` (FAILURE/CANCELLED). Оркестратор мержит только после `beacon_get_result` с `verdict=ready`; ручной `gh pr checks` в цикле запрещён.
+НИКОГДА не передавать в `notify.target` значение `<cardID>`. Это ломает доставку wake: адрес должен быть идентификатором живой сессии OpenCode.
+
+После регистрации завершить ход ровно фразой `waiting, <watchID>`. Запрещено крутить `gh pr checks --watch` или `sleep` в цикле и ждать вручную. Сон означает завершение хода, а не опрос.
+
+## Авто-мерж по умолчанию
+
+Beacon сам мержит зелёный PR по `verdict=ready` (ADR 0072). Пустая политика Watch означает мерж без участия агента. Исключения задаются политикой Watch: `requireApproval`, `waitFor`, `waitForMain`.
+
+Исполнитель просыпается ТОЛЬКО если мерж невозможен: вердикты `keep_working`, `rebase`, `retry` или ошибка мержа. При `ready` исполнитель не получает команды мерж и не вызывает `gh pr merge`.
+
+## Внешние поломки main
+
+Если проверка красная и проблема на `main`, Beacon сам поставит Watch `blocked` и запишет `BlockerIncident`. Исполнитель не чинит чужую поломку.
+
+Если исполнитель увидел внешнюю поломку локально на `origin/main`, он вызывает `beacon_ack` с `decision="blocked:not_mine"` и непустой причиной. Оркестратор просыпается по этому сигналу и запускает FIX-агента.
+
+## Диагностика вместо гаданий и sleep
+
+Не грепать логи вручную и не ждать в bash. Использовать инструменты:
+
+- `beacon_list_running` для снимка активных Watch;
+- `beacon_stats` для счётчиков и диагностики состояния;
+- `beacon inspect` для разбора конкретного Watch;
+- `beacon logs --tail 50 --errors` для последних ошибок.
+
+## Запреты
+
+- Не закрывать чужие карточки в несвязанных PR.
+- Не запускать `batch-apply` без явной команды владельца. Карточки меняются только по такой команде.
+- Не делать прямые коммиты в `main`.
+- Не вызывать `gh pr checks --watch` и не использовать `sleep` в циклах.
+- Не вызывать `beacon gates` локально.
+
+## Архитектурные границы
+
+- `internal/domain` использует только stdlib.
+- Infra-пакеты не импортируют соседние infra-, app- и cmd-пакеты.
+- `internal/app` не импортирует `internal/domain`.
+- В `cmd/beacon` нет `os.ReadFile`, `os.WriteFile`, `net/http`, `os/exec`.
+
+Границы проверяются гейтами в CI, по ADR 0005.
+
+## Project scope
+
+Состояние Beacon привязано к проекту: state лежит в `<XDG_STATE_HOME>/beacon/projects/<name>-<hash>/beacon.db`, когда cwd содержит `.git`. MCP поднимается с `cwd` текущего проекта из `opencode.json`. Явный override: `BEACON_STATE_DIR`.
+
+## Коммиты
+
+Коммиты от `refusedguy <refusedguy@users.noreply.github.com>`, без флага `-c`, без `git add .`. В коммит только файлы из поля «Владелец файлов» карточки.
