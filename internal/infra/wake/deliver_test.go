@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os/exec"
 	"reflect"
 	"strings"
 	"sync"
@@ -972,5 +974,127 @@ func TestCursorSteerBodyHasNoDeliveryID(t *testing.T) {
 	}
 	if strings.Contains(string(body), "deliveryId") {
 		t.Fatalf("Cursor steer body = %s, want only prompt and delivery", body)
+	}
+}
+
+// ===== T3.250: history search with an explicit backend =====
+
+func historyExitOne(t *testing.T) error {
+	t.Helper()
+	err := exec.Command("/bin/sh", "-c", "exit 1").Run()
+	if err == nil {
+		t.Fatal("expected a non-zero exit status")
+	}
+	return err
+}
+
+func TestHistorySearchUsesRipgrepAndStripsANSI(t *testing.T) {
+	var gotName string
+	var gotArgs []string
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		gotName = name
+		gotArgs = args
+		return []byte("\x1b[31m12:ERROR\x1b[0m boot failed\n15:ready\n"), nil
+	}
+	res, err := HistorySearch(context.Background(), "transcript.txt", "ERROR|ready", runner, 0, 0)
+	if err != nil {
+		t.Fatalf("HistorySearch: %v", err)
+	}
+	if gotName != "rg" || res.Backend != HistorySearchRipgrep {
+		t.Fatalf("backend = %q, command = %q; want rg", res.Backend, gotName)
+	}
+	if !strings.Contains(strings.Join(gotArgs, " "), "--color=never") {
+		t.Fatalf("rg args = %v; want --color=never", gotArgs)
+	}
+	if len(res.Matches) != 2 || strings.Contains(strings.Join(res.Matches, ""), "\x1b") {
+		t.Fatalf("matches = %q; want two ANSI-free lines", res.Matches)
+	}
+	if res.Truncated {
+		t.Fatal("unexpected truncation")
+	}
+}
+
+func TestHistorySearchFallsBackToGrepWhenRipgrepAbsent(t *testing.T) {
+	grepCalled := false
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		switch name {
+		case "rg":
+			return nil, exec.ErrNotFound
+		case "grep":
+			grepCalled = true
+			if !strings.Contains(strings.Join(args, " "), "-E") {
+				t.Fatalf("grep args = %v; want -E", args)
+			}
+			return []byte("7:needle found\n"), nil
+		default:
+			t.Fatalf("unexpected command %q", name)
+			return nil, nil
+		}
+	}
+	res, err := HistorySearch(context.Background(), "chat.txt", "needle", runner, 0, 0)
+	if err != nil {
+		t.Fatalf("HistorySearch: %v", err)
+	}
+	if !grepCalled || res.Backend != HistorySearchGrep {
+		t.Fatalf("backend = %q, grepCalled = %v; want grep -E", res.Backend, grepCalled)
+	}
+	if len(res.Matches) != 1 || !strings.Contains(res.Matches[0], "needle") {
+		t.Fatalf("matches = %q", res.Matches)
+	}
+}
+
+func TestHistorySearchNoMatchDoesNotFallBack(t *testing.T) {
+	exitOne := historyExitOne(t)
+	grepCalled := false
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		if name == "rg" {
+			return nil, exitOne
+		}
+		grepCalled = true
+		return []byte("unexpected\n"), nil
+	}
+	res, err := HistorySearch(context.Background(), "transcript.txt", "absent", runner, 0, 0)
+	if err != nil {
+		t.Fatalf("HistorySearch: %v", err)
+	}
+	if grepCalled {
+		t.Fatal("grep must not run when rg is present but finds nothing")
+	}
+	if res.Backend != HistorySearchRipgrep || len(res.Matches) != 0 {
+		t.Fatalf("result = %+v; want an empty rg result", res)
+	}
+}
+
+func TestHistorySearchLimitsLinesAndBytes(t *testing.T) {
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		var b strings.Builder
+		for i := 0; i < 50; i++ {
+			fmt.Fprintf(&b, "%d:%s\n", i, strings.Repeat("x", 40))
+		}
+		return []byte(b.String()), nil
+	}
+	byLines, err := HistorySearch(context.Background(), "transcript.txt", "x", runner, 2, 0)
+	if err != nil {
+		t.Fatalf("HistorySearch by lines: %v", err)
+	}
+	if len(byLines.Matches) != 2 || !byLines.Truncated {
+		t.Fatalf("by lines = %+v; want two lines and truncation", byLines)
+	}
+	byBytes, err := HistorySearch(context.Background(), "transcript.txt", "x", runner, 0, 100)
+	if err != nil {
+		t.Fatalf("HistorySearch by bytes: %v", err)
+	}
+	if len(byBytes.Matches) != 2 || !byBytes.Truncated {
+		t.Fatalf("by bytes = %+v; want two lines within 100 bytes and truncation", byBytes)
+	}
+}
+
+func TestHistorySearchRejectsEmptyPattern(t *testing.T) {
+	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
+		t.Fatal("runner must not run with an empty pattern")
+		return nil, nil
+	}
+	if _, err := HistorySearch(context.Background(), "transcript.txt", "", runner, 0, 0); err == nil {
+		t.Fatal("empty pattern must fail before any search runs")
 	}
 }
