@@ -372,3 +372,125 @@ func TestHandleIsNotAuthorizationAndNotOtherKeys(t *testing.T) {
 		t.Error("an empty owner must not be authorized")
 	}
 }
+
+func TestIdentityValueFormat(t *testing.T) {
+	valid := []string{
+		"req-abc",
+		"ses_executor_1",
+		"watch-A",
+		"a:b.c-d",
+		"webhook-delivery",
+		"delivery-01",
+	}
+	invalid := []string{
+		"",
+		"   ",
+		" req",
+		"req ",
+		"req id",
+		"req\tid",
+		"req\nid",
+		"req\x00id",
+		strings.Repeat("x", maxIdentityLen+1),
+	}
+	for _, raw := range valid {
+		if !validIdentityValue(raw) {
+			t.Errorf("valid value %q was rejected", raw)
+		}
+	}
+	for _, raw := range invalid {
+		if validIdentityValue(raw) {
+			t.Errorf("invalid value %q was accepted", raw)
+		}
+	}
+}
+
+func TestNewIdentityTypesValidate(t *testing.T) {
+	tests := []struct {
+		name string
+		make func(string) error
+		want error
+	}{
+		{"client request id", func(s string) error { _, err := NewClientRequestID(s); return err }, ErrInvalidClientRequestID},
+		{"actor id", func(s string) error { _, err := NewActorID(s); return err }, ErrInvalidActorID},
+		{"idempotency value", func(s string) error { _, err := NewIdempotencyValue(s); return err }, ErrInvalidIdempotencyValue},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.make("valid-value"); err != nil {
+				t.Fatalf("valid value rejected: %v", err)
+			}
+			for _, raw := range []string{"", "  ", "bad value", "bad\nvalue"} {
+				if err := tc.make(raw); !errors.Is(err, tc.want) {
+					t.Errorf("make(%q) error = %v, want %v", raw, err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestIdentityTypeZeroValueInvalid(t *testing.T) {
+	if (ClientRequestID("")).Valid() {
+		t.Error("zero ClientRequestID must be invalid")
+	}
+	if (ActorID("")).Valid() {
+		t.Error("zero ActorID must be invalid")
+	}
+	if (IdempotencyValue("")).Valid() {
+		t.Error("zero IdempotencyValue must be invalid")
+	}
+}
+
+func TestIdentityKeysDeterministic(t *testing.T) {
+	id, err := NewClientRequestID("req-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := CommandKey(id)
+	for i := 0; i < 3; i++ {
+		if got := CommandKey(id); got != first {
+			t.Fatalf("call %d: command key changed: %q, want %q", i, got, first)
+		}
+	}
+
+	delivery, err := NewIdempotencyValue("delivery-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDelivery := DeliveryKey(delivery)
+	for i := 0; i < 3; i++ {
+		if got := DeliveryKey(delivery); got != firstDelivery {
+			t.Fatalf("call %d: delivery key changed: %q, want %q", i, got, firstDelivery)
+		}
+	}
+}
+
+func TestIdentityKeysDifferentNamespacesDoNotShareSlot(t *testing.T) {
+	raw, err := NewIdempotencyValue("same-value")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := ScopedKey(CommandNamespace, raw)
+	delivery := DeliveryKey(raw)
+	start := IdempotencyKey(StartNamespace, raw.String())
+	obligation := ScopedKey(ObligationNamespace, raw)
+
+	seen := map[string]string{}
+	for name, key := range map[string]string{
+		"command": command, "delivery": delivery, "start": start, "obligation": obligation,
+	} {
+		if prev, ok := seen[key]; ok {
+			t.Errorf("%s and %s share key %q", prev, name, key)
+		}
+		seen[key] = name
+	}
+}
+
+func TestEscapeKeyComponent(t *testing.T) {
+	if got, want := EscapeKeyComponent(`a:b\c`), `a\:b\\c`; got != want {
+		t.Errorf("EscapeKeyComponent = %q, want %q", got, want)
+	}
+	if EscapeKeyComponent("a:b") == EscapeKeyComponent("a")+":"+EscapeKeyComponent("b") {
+		t.Error("escaping failed: a separator inside a component is ambiguous")
+	}
+}
