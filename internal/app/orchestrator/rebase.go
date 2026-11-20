@@ -435,7 +435,7 @@ func parseWorktrees(listing string) []worktreeInfo {
 	var out []worktreeInfo
 	var cur worktreeInfo
 	flush := func() {
-		if cur.dir != "" {
+		if cur.dir != "" && cur.branch != "" {
 			out = append(out, cur)
 		}
 		cur = worktreeInfo{}
