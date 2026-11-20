@@ -80,8 +80,8 @@ func TestT556RegistryStopRequiresExpectedFlags(t *testing.T) {
 			if code != 2 {
 				t.Fatalf("code = %d, want 2", code)
 			}
-			if !strings.Contains(errOut.String(), "registry stop") {
-				t.Fatalf("stderr = %q, want the expectation-flag error", errOut.String())
+			if !strings.Contains(errOut, "registry stop") {
+				t.Fatalf("stderr = %q, want the expectation-flag error", errOut)
 			}
 		})
 	}
@@ -98,8 +98,8 @@ func TestT556RegistryStopRefusesChangedSelection(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("code = %d, want 1", code)
 	}
-	if !strings.Contains(out.String(), "stop_refused") || !strings.Contains(out.String(), "selection_changed") {
-		t.Fatalf("stdout = %q, want refused with selection_changed", out.String())
+	if !strings.Contains(out, "stop_refused") || !strings.Contains(out, "selection_changed") {
+		t.Fatalf("stdout = %q, want refused with selection_changed", out)
 	}
 }
 
@@ -115,8 +115,8 @@ func TestT556RegistryStopRefusesActiveObligations(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("code = %d, want 1", code)
 	}
-	if !strings.Contains(out.String(), "active_obligations") {
-		t.Fatalf("stdout = %q, want active_obligations reason", out.String())
+	if !strings.Contains(out, "active_obligations") {
+		t.Fatalf("stdout = %q, want active_obligations reason", out)
 	}
 }
 
@@ -131,8 +131,8 @@ func TestT556RegistryStopAllowsMatchingSelection(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
 	}
-	if !strings.Contains(out.String(), "stop_allowed watch=w1 revision=7 session=ses1") {
-		t.Fatalf("stdout = %q, want the allowed verdict", out.String())
+	if !strings.Contains(out, "stop_allowed watch=w1 revision=7 session=ses1") {
+		t.Fatalf("stdout = %q, want the allowed verdict", out)
 	}
 }
 
