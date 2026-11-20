@@ -1,0 +1,46 @@
+# WIRING-489. Подключить напоминания о дедлайнах
+Статус: todo
+Фаза: P0
+Тип: task
+Владелец файлов: internal/infra/taskstore/reminders.go, internal/app/orchestrator/reminders_loop.go
+OwnerFiles: internal/infra/taskstore/reminders.go, internal/app/orchestrator/reminders_loop.go
+Зависимости: PR 489
+Ссылка: PR 489
+SourceWatch: watch:refusedguy/beacon:489:d106ad77ea40d197a1f380839e5462777728ce81
+PR: 489
+Агент: нет
+Время: нет
+Цель: Подключить отложенную часть фичи после мержа PR 489.
+Контекст: PR 489 добавляет чистый Plan и Notifier в internal/app/tasks. Порт ReminderPorts пока не имеет адаптера в store, и никто не вызывает Notify по расписанию. Оба файла принадлежат другим агентам, поэтому проводка вынесена отдельно.
+Шаги: Создать карточку, подключить часть фичи, закрыть долг.
+Проверка: Проводка подключена, маркер и карточка лежат в одном PR.
+Приёмка: Соответствующий CI зелёный, долг `beacon deferred` переведён в done.
+
+## Причина
+
+Адаптер порта ReminderPorts читает задачи из store, а периодический вызов Notify живёт в daemon. Оба файла входят в OwnerFiles других агентов и выходят за скоуп BS.65. В PR 489 вошла только чистая логика, порт и тесты.
+
+## Шаги
+
+1. Дождаться мержа PR 489.
+2. Реализовать ReminderPorts в `internal/infra/taskstore/reminders.go`: запрос задач с дедлайном не позже переданного instant и идемпотентная отправка напоминания по ключу задачи и дедлайна.
+3. Добавить периодический вызов `NewNotifier(ports, time.Now).Notify(ctx)` в `internal/app/orchestrator/reminders_loop.go`.
+4. Вызвать `beacon deferred done` для записи с `watchID` из SourceWatch.
+
+## Проверка
+
+- Список OwnerFiles совпадает с полем «Владелец файлов».
+- Маркер `.beacon/wiring-pending` и карточка `docs/tasks/WIRING-489.md` попали в один PR.
+- Локальный гейт `WIRING-*` проходит: статус `todo`, OwnerFiles заполнен, `## Причина` есть.
+
+## Приёмка
+
+Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
+
+<!-- wiring-card:contract
+beacon_defer_wiring из W12-B пишет маркер .beacon/wiring-pending с одной строкой
+"WIRING:<PR>" на каждую отложенную проводку и добавляет эту карточку в тот же PR.
+Гейт локальный и не читает GitHub API: маркер заменяет маркер WIRING: в теле PR.
+Маркер без карточки, карточка без "Статус: todo", пустой OwnerFiles или
+отсутствующая "## Причина" проваливают проверку.
+wiring-card:contract -->
