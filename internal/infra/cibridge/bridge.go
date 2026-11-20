@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -134,6 +135,14 @@ type stateMerger interface {
 	MergePRWithState(ctx context.Context, repo string, pr int, state domain.PRState) (bool, bool, string, error)
 }
 
+// Rebaser updates a stale PR branch onto its base and reports the new head SHA.
+// It is an optional control-plane port: the composition root binds the real
+// implementation so this package stays independent of the gh runner (ADR 0005).
+// A nil rebaser keeps the legacy behaviour of waking the executor for a rebase.
+type Rebaser interface {
+	Rebase(ctx context.Context, repo string, pr int) (newHeadSHA string, err error)
+}
+
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider,
 // one Store and the optional control-plane ports, so a refresh is a batched
 // read followed by ordered writes.
@@ -152,6 +161,10 @@ type Bridge struct {
 	escalate       escalationWriter
 	orchestratorID OrchestratorIDSource
 	inWorkTimeout  time.Duration
+	autoRebase     bool
+	rebaser        Rebaser
+	rebaseMu       sync.Mutex
+	rebased        map[string]bool
 }
 
 // WithOrchestratorIDSource binds the config fallback used by blocked wakes.
@@ -274,6 +287,43 @@ func (b *Bridge) WithMerger(m domain.Merger) *Bridge {
 	return b
 }
 
+// WithAutoRebase enables the stale-base recovery on auto-merge. A Watch whose
+// first merge is held because its branch is BEHIND is rebased once and the
+// merge is retried once with the new head. A nil rebaser leaves the option off,
+// so an unbound composition root keeps the old wake-the-executor behaviour.
+func (b *Bridge) WithAutoRebase(r Rebaser) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.rebaser = r
+	b.autoRebase = r != nil
+	return b
+}
+
+// claimRebase reserves one rebase for (watchID, revision). A second tick that
+// observes the same revision never rebases twice, even when the first rebase
+// or the retry merge failed and the Watch has not moved on yet. Older entries
+// for the same Watch are dropped so the guard stays bounded per Watch.
+func (b *Bridge) claimRebase(w domain.Watch) bool {
+	key := fmt.Sprintf("%s:%d", w.ID, w.Revision)
+	b.rebaseMu.Lock()
+	defer b.rebaseMu.Unlock()
+	if b.rebased == nil {
+		b.rebased = make(map[string]bool)
+	}
+	if b.rebased[key] {
+		return false
+	}
+	prefix := w.ID + ":"
+	for k := range b.rebased {
+		if strings.HasPrefix(k, prefix) {
+			delete(b.rebased, k)
+		}
+	}
+	b.rebased[key] = true
+	return true
+}
+
 // WithBlockerControl binds the control-plane port. Wave 3 wires the real
 // store; until then a store that implements the methods directly is detected
 // by type assertion in New.
@@ -307,6 +357,7 @@ func New(store domain.Store, ci domain.CIProvider, clock domain.Clock, interval 
 	b := &Bridge{
 		store: store, ci: ci, clock: clock, interval: interval,
 		inWorkTimeout: DefaultInWorkTimeout,
+		rebased:       make(map[string]bool),
 	}
 	if p, ok := ci.(domain.BatchCIProvider); ok {
 		b.batch = p
@@ -752,25 +803,33 @@ func rolesFromTargets(targets []domain.WakeTarget) map[string]bool {
 	return out
 }
 
-// applyMerge runs the auto-merge step for a ready Watch. A confirmed merge
-// closes the Watch with closeReason=merged and finishes every subscriber
-// without waking anyone. A hold or error becomes a rebase (conflict/behind)
-// or keep_working verdict with the merge error saved on the subscribers.
-func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservation, now time.Time, cycleID string) int {
-	observe.MergeAttempt(w.ID, w.PR)
+// callMerge performs one merge through the batch-aware path when available.
+// obs.pr came from the same batch cycle that produced the ready verdict;
+// reusing it avoids a fresh GraphQL read that can report UNKNOWN for a PR the
+// batch already resolved to MERGEABLE/CLEAN.
+func (b *Bridge) callMerge(ctx context.Context, w domain.Watch, obs ciObservation) (bool, bool, string, error) {
 	start := time.Now()
 	var merged, held bool
 	var reason string
 	var err error
 	if sm, ok := b.merger.(stateMerger); ok {
-		// obs.pr came from the same batch cycle that produced the ready verdict.
-		// Reusing it avoids a fresh GraphQL read that can report UNKNOWN for a
-		// PR the batch already resolved to MERGEABLE/CLEAN.
 		merged, held, reason, err = sm.MergePRWithState(ctx, w.Repo, w.PR, obs.pr)
 	} else {
 		merged, held, reason, err = b.merger.Merge(ctx, w.Repo, w.PR)
 	}
 	observe.MergeDuration(time.Since(start))
+	return merged, held, reason, err
+}
+
+// applyMerge runs the auto-merge step for a ready Watch. A confirmed merge
+// closes the Watch with closeReason=merged and finishes every subscriber
+// without waking anyone. A hold or error becomes a rebase (conflict/behind)
+// or keep_working verdict with the merge error saved on the subscribers. When
+// auto-rebase is bound and the first hold is a stale BEHIND base, the branch is
+// rebased once and the merge is retried once before the Wake is published.
+func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservation, now time.Time, cycleID string) int {
+	observe.MergeAttempt(w.ID, w.PR)
+	merged, held, reason, err := b.callMerge(ctx, w, obs)
 	if merged {
 		observe.MergeSuccess(w.ID, w.PR)
 		n := b.closeWatch(ctx, w, domain.VerdictMerged, now, cycleID)
@@ -778,6 +837,36 @@ func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservati
 		return n
 	}
 	observe.MergeFailure(w.ID, w.PR, err)
+
+	retried := false
+	if b.autoRebase && b.rebaser != nil && isMergeBehind(reason, err) && b.claimRebase(w) {
+		newHead, rbErr := b.rebaser.Rebase(ctx, w.Repo, w.PR)
+		if rbErr == nil && strings.TrimSpace(newHead) != "" {
+			w.HeadSHA = newHead
+			retryObs := obs
+			retryObs.pr.HeadRefOid = newHead
+			b.cycleEvent(cycleID, "auto_rebase", observe.Fields{
+				"watchID": w.ID, "pr": w.PR, "headSHA": newHead,
+			})
+			merged, held, reason, err = b.callMerge(ctx, w, retryObs)
+			retried = true
+			if merged {
+				observe.MergeSuccess(w.ID, w.PR)
+				n := b.closeWatch(ctx, w, domain.VerdictMerged, now, cycleID)
+				b.cycleEvent(cycleID, "auto_merge_success", observe.Fields{
+					"watchID": w.ID, "pr": w.PR, "rebase": true,
+				})
+				return n
+			}
+			observe.MergeFailure(w.ID, w.PR, err)
+			b.cycleEvent(cycleID, "auto_rebase_retry_failed", observe.Fields{
+				"watchID": w.ID, "pr": w.PR, "reason": reason,
+			})
+		} else if rbErr != nil {
+			observe.ActorError("cibridge-autorebase", w.ID, rbErr)
+		}
+	}
+
 	mergeErr := strings.TrimSpace(reason)
 	if mergeErr == "" && held {
 		mergeErr = "merge held by policy"
@@ -786,7 +875,9 @@ func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservati
 		mergeErr = errText(err)
 	}
 	verdict := domain.VerdictKeepWorking
-	if isMergeConflict(reason, err) {
+	// A retried merge that still failed is always a rebase, even when the
+	// retry's reason is a policy hold rather than an explicit conflict.
+	if isMergeConflict(reason, err) || retried {
 		verdict = domain.VerdictRebase
 	}
 	stored := w
@@ -1629,6 +1720,14 @@ func isMergeConflict(reason string, err error) bool {
 		}
 	}
 	return false
+}
+
+// isMergeBehind reports the stale-base subset of isMergeConflict. Only this
+// case is safe to fix by rebasing: a content conflict, a DIRTY branch or a
+// 409/422 response needs a human and must keep waking the executor.
+func isMergeBehind(reason string, err error) bool {
+	s := strings.ToLower(reason + " " + errText(err))
+	return strings.Contains(s, "behind")
 }
 
 // isDeadSessionErr reports a delivery failure caused by a session that no
