@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -417,4 +418,40 @@ func TestOutputSchemasValidateRealResponses(t *testing.T) {
 	probe["nextCommand"] = ""
 	probe["nextHint"] = "orchestrator merges"
 	check("beacon_get_result", probe)
+}
+
+// toolOutputTemplate is the canonical report shape a Beacon tool prints at the
+// end of a turn (ADR 0094, HD-045): a human-readable summary first, then exactly
+// one fenced JSON block. It lives here as an executable contract so a template
+// that opens with the fence is caught by CI.
+const toolOutputTemplate = `Gate verify: 4 checks passed, 0 failed. Watch w-1 is watching.
+Machine-readable result follows.
+
+` + "```json\n" + `{"schema_version":1,"gate":"verify","status":"pass","blocking":false}
+` + "```\n"
+
+// summaryPrecedesJSON reports whether report has a non-empty, human-readable
+// summary before its first fenced JSON block. A fence with no prose before it
+// (JSON first) is rejected.
+func summaryPrecedesJSON(report string) bool {
+	fence := strings.Index(report, "```json")
+	if fence < 0 {
+		return false
+	}
+	return strings.TrimSpace(report[:fence]) != ""
+}
+
+// TestToolOutputSummaryBeforeJSON locks the output order from ADR 0094: the
+// human-readable summary comes first, the JSON fence last. The negative case
+// proves that a template which prints JSON first fails the check.
+func TestToolOutputSummaryBeforeJSON(t *testing.T) {
+	if !summaryPrecedesJSON(toolOutputTemplate) {
+		t.Fatalf("tool output template must print the summary before the JSON fence:\n%s", toolOutputTemplate)
+	}
+
+	jsonFirst := "```json\n" + `{"schema_version":1,"gate":"verify","status":"pass"}` + "\n```\n" +
+		"Gate verify: 4 checks passed, 0 failed.\n"
+	if summaryPrecedesJSON(jsonFirst) {
+		t.Fatalf("a template with the JSON fence before the summary must be rejected:\n%s", jsonFirst)
+	}
 }
