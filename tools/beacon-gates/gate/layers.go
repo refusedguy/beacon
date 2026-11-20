@@ -33,9 +33,13 @@ type MatrixLayer struct {
 // AllowedEntry is one permission in the matrix. The source of truth is the
 // explicit edge list, not the cross product of ranks: an unused permission
 // is a finding, so the config must contain only edges the tree really uses.
+// Shared marks a facade edge into a leaf package that every layer may import.
+// It is validated like any other edge, but excluded from liveness checks: a
+// facade is allowed to have no callers in a given tree.
 type AllowedEntry struct {
-	From string `json:"from"`
-	To   string `json:"to"`
+	From   string `json:"from"`
+	To     string `json:"to"`
+	Shared bool   `json:"shared,omitempty"`
 }
 
 type Matrix struct {
@@ -118,10 +122,14 @@ func (m *Matrix) Allows(importer, imported string) bool {
 	return m.allowed[[2]string{a.Name, b.Name}]
 }
 
-// AllowedEdges returns every permission in the matrix, sorted.
+// AllowedEdges returns every ordinary permission in the matrix, sorted.
+// Facade edges are excluded because they are not subject to liveness checks.
 func (m *Matrix) AllowedEdges() [][2]string {
 	out := make([][2]string, 0, len(m.Allowed))
 	for _, e := range m.Allowed {
+		if e.Shared {
+			continue
+		}
 		out = append(out, [2]string{e.From, e.To})
 	}
 	sort.Slice(out, func(i, j int) bool {
