@@ -306,7 +306,7 @@ func TestMergePRHoldsDirtyWithoutWrite(t *testing.T) {
 	defer srv.Close()
 
 	provider := NewBatchProvider(
-		NewClient(srv.URL, "", srv.Client(), counter),
+		NewClient(srv.URL+"/graphql", "", srv.Client(), counter),
 		newRESTTestClient(t, srv, counter, "test-token"), counter)
 	merged, held, reason, err := provider.MergePR(context.Background(), "refusedguy/beacon", 42)
 	if err != nil {
@@ -406,7 +406,7 @@ func TestMergePRRestConflictIsHeld(t *testing.T) {
 	defer srv.Close()
 
 	provider := NewBatchProvider(
-		NewClient(srv.URL, "", srv.Client(), counter),
+		NewClient(srv.URL+"/graphql", "", srv.Client(), counter),
 		newRESTTestClient(t, srv, counter, "test-token"), counter)
 
 	merged, held, reason, err := provider.MergePR(context.Background(), "refusedguy/beacon", 7)
