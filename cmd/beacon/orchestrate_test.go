@@ -58,6 +58,21 @@ func (m *orchFakeMerger) Merge(_ context.Context, _ string, pr int) error {
 	return nil
 }
 
+type orchFakeResolver map[string]bool
+
+func (r orchFakeResolver) Satisfied(_ context.Context, ref string) (bool, error) {
+	return r[ref], nil
+}
+
+func withOrchResolverDeps(t *testing.T, st orchestrator.Store, merger orchestrator.Merger, resolver orchestrator.DependencyResolver) {
+	t.Helper()
+	previous := makeOrchestratorDeps
+	t.Cleanup(func() { SetOrchestratorDeps(previous) })
+	SetOrchestratorDeps(func(*CLI) (orchestratorDeps, func() error, error) {
+		return orchestratorDeps{Store: st, Merger: merger, Resolver: resolver}, func() error { return nil }, nil
+	})
+}
+
 func withOrchDeps(t *testing.T, st orchestrator.Store, merger orchestrator.Merger, waker orchestrator.Waker) {
 	t.Helper()
 	previous := makeOrchestratorDeps
@@ -182,6 +197,43 @@ func TestOrchestrateMergeAndRebaseReport(t *testing.T) {
 	}
 	if !reflect.DeepEqual(result.Merged, []int{42}) || !reflect.DeepEqual(result.NeedsRebase, []int{7}) {
 		t.Fatalf("result = %+v, want merged [42] needsRebase [7]", result)
+	}
+}
+
+// TestOrchestrateUsesInjectedResolver proves the CLI passes the dependency
+// resolver into orchestrator.Run: a ready Watch with a satisfied waitFor merges,
+// the same Watch with an unsatisfied ref stays open and reports the reason.
+func TestOrchestrateUsesInjectedResolver(t *testing.T) {
+	policy := &orchestrator.AutoMergePolicy{WaitFor: []string{"T3.100"}}
+	watch := orchestrator.Watch{
+		ID: "w1", Repo: "refusedguy/beacon", PR: 42, Verdict: "ready", Revision: 3, Policy: policy,
+	}
+	for _, tc := range []struct {
+		name      string
+		satisfied bool
+		wantMerge bool
+		wantWait  bool
+	}{
+		{name: "satisfied", satisfied: true, wantMerge: true},
+		{name: "unsatisfied", satisfied: false, wantWait: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newOrchFakeStore(watch)
+			merger := &orchFakeMerger{}
+			resolver := orchFakeResolver{"T3.100": tc.satisfied}
+			withOrchResolverDeps(t, st, merger, resolver)
+			c, out, errOut, _ := t06NewCLI(t, t06NoChild(t))
+
+			if code := c.Run([]string{"orchestrate", "--format", "json"}); code != 0 {
+				t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+			}
+			if got := len(merger.calls) == 1; got != tc.wantMerge {
+				t.Fatalf("merged = %v, calls = %v", got, merger.calls)
+			}
+			if tc.wantWait && !strings.Contains(out.String(), "wait_for:T3.100") {
+				t.Fatalf("stdout = %q, want the wait reason", out.String())
+			}
+		})
 	}
 }
 

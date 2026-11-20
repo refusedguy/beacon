@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,6 +142,61 @@ func (s *DBStore) CloseWatch(ctx context.Context, watchID string) error {
 	return s.db.SaveWatch(w)
 }
 
+// MergedPR implements MergedPRReader from the Watch rows the process already
+// has in SQLite. Both the active table and the archive are checked: a PR merged
+// more than the retention window ago still satisfies a waitFor reference. No
+// hosting-service call is made here.
+func (s *DBStore) MergedPR(ctx context.Context, pr int) (bool, error) {
+	if s == nil || s.db == nil {
+		return false, errors.New("orchestrator: merge store is nil")
+	}
+	_ = ctx
+	all, err := s.db.AllWatches()
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: watches for PR %d: %w", pr, err)
+	}
+	for _, w := range all {
+		if w.PR == pr && (string(w.Verdict) == "merged" || w.CloseReason == "merged") {
+			return true, nil
+		}
+	}
+	archived, err := s.db.ArchivedWatches()
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: archived watches for PR %d: %w", pr, err)
+	}
+	for _, w := range archived {
+		if w.PR == pr && (string(w.Verdict) == "merged" || w.CloseReason == "merged") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// HoldWatch persists the hold reason on a Watch whose merge is waiting on a
+// dependency. The verdict is visible to beacon_list_running and beacon inspect
+// through the same store handle they already read, and no obligation is staged:
+// an unsatisfied dependency is nobody's fault and wakes nobody (ADR 0158).
+func (s *DBStore) HoldWatch(ctx context.Context, watchID, verdict string) error {
+	if s == nil || s.db == nil {
+		return errors.New("orchestrator: watch store is nil")
+	}
+	_ = ctx
+	w, err := s.db.Watch(watchID)
+	if err != nil {
+		return fmt.Errorf("orchestrator: load watch %s for dependency hold: %w", watchID, err)
+	}
+	if w.Status == "closed" {
+		return nil
+	}
+	setWatchVerdict(&w.Verdict, verdict)
+	return s.db.SaveWatch(w)
+}
+
+// setWatchVerdict assigns a string to a named string field without naming the
+// domain type. The app layer is not allowed to import internal/domain (ADR
+// 0005), but the Store adapter still has to write the persisted verdict.
+func setWatchVerdict[T ~string](dst *T, value string) { *dst = T(value) }
+
 // mergeFields mirrors the domain MergePolicy persisted under "mergePolicy".
 // The pointer on MergePolicy distinguishes an absent key (default policy) from
 // an explicit autoMerge=false that must block the merge.
@@ -178,10 +234,10 @@ func PolicyFromPayload(raw []byte) *AutoMergePolicy {
 	}
 }
 
-// CommandRunner is the seam the dependency resolver uses for `gh` and `git`.
-// The app layer must not import os/exec (ADR 0005), so the composition root
-// supplies the real runner and tests supply a fake. A runner error is never
-// reported as a satisfied dependency.
+// CommandRunner is the seam the dependency resolver uses for local `git`
+// probes. The app layer must not import os/exec (ADR 0005), so the composition
+// root supplies the real runner and tests supply a fake. A runner error is
+// never reported as a satisfied dependency. PR refs never reach this runner.
 type CommandRunner interface {
 	Run(ctx context.Context, name string, args ...string) ([]byte, error)
 }
@@ -195,23 +251,60 @@ var (
 	dependencyCardRef = regexp.MustCompile(`(?i)^t\d+\.\d+$`)
 )
 
-// FileDependencyResolver resolves free-form refs from the task card files and
-// from the hosting CLI / git. Card refs (T3.123) are satisfied when the card
-// file documents "Статус: done". PR refs (#12, PR#12, pr/12) are satisfied
-// when gh reports state MERGED. Every other string is a path that must exist
-// on main, checked with `git show main:<ref>`.
+// MergedPRReader answers whether a pull request already reached main. The
+// composition root backs it with the Watch rows the process already loaded
+// from SQLite (including the archive), so resolving a #12 reference costs a
+// local read instead of a `gh pr view` child process. An unverifiable answer
+// is an error, never a false positive.
+type MergedPRReader interface {
+	MergedPR(ctx context.Context, pr int) (bool, error)
+}
+
+// MergedPRReaderFunc adapts a function to the MergedPRReader port.
+type MergedPRReaderFunc func(ctx context.Context, pr int) (bool, error)
+
+// MergedPR calls f. A nil function reports "not merged" without an error, which
+// keeps the dependency gate fail-closed.
+func (f MergedPRReaderFunc) MergedPR(ctx context.Context, pr int) (bool, error) {
+	if f == nil {
+		return false, nil
+	}
+	return f(ctx, pr)
+}
+
+// FileDependencyResolver resolves free-form refs from facts the process
+// already holds. Card refs (T3.123) are satisfied when the card file documents
+// "Статус: done". PR refs (#12, PR#12, pr/12) are satisfied when MergedPR
+// confirms the PR is merged from loaded Watch state: no gh process is started.
+// Every other string is a path that must exist on main, checked locally with
+// `git show main:<ref>`.
 type FileDependencyResolver struct {
 	// DocsDir holds task cards. The empty value means "docs/tasks".
 	DocsDir string
-	// Runner supplies gh and git. A nil Runner yields an error, never a true.
+	// Runner supplies git for arbitrary file refs. It is never used for PR
+	// refs. A nil Runner yields an error, never a true.
 	Runner CommandRunner
+	// MergedPR supplies the already-loaded PR state. A nil reader is an error
+	// for a PR ref, never a silent pass.
+	MergedPR MergedPRReader
 }
 
 var _ DependencyResolver = (*FileDependencyResolver)(nil)
 
-// NewDependencyResolver builds the resolver with the conventional docs dir.
+// NewDependencyResolver builds a resolver for card and file refs with the
+// conventional docs dir. PR refs additionally need a MergedPRReader; callers
+// that resolve them should use NewStoreDependencyResolver or set the field.
 func NewDependencyResolver(runner CommandRunner) *FileDependencyResolver {
 	return &FileDependencyResolver{DocsDir: "docs/tasks", Runner: runner}
+}
+
+// NewStoreDependencyResolver builds the production resolver. mergedPR is the
+// already-loaded Watch state, so a #12 reference never starts a gh process.
+func NewStoreDependencyResolver(docsDir string, runner CommandRunner, mergedPR MergedPRReader) *FileDependencyResolver {
+	if docsDir == "" {
+		docsDir = "docs/tasks"
+	}
+	return &FileDependencyResolver{DocsDir: docsDir, Runner: runner, MergedPR: mergedPR}
 }
 
 // Satisfied resolves one dependency reference. An empty ref is unsatisfied,
@@ -257,23 +350,26 @@ func (r *FileDependencyResolver) cardDone(ref string) (bool, error) {
 	return false, nil
 }
 
-// prMerged asks gh for the PR state. Only MERGED satisfies the dependency;
-// OPEN, CLOSED and an unverifiable state all hold the merge back.
+// prMerged reads the PR state from the already-loaded Watch data. There is no
+// `gh pr view` fallback: an extra CLI process per dependency is exactly what
+// this resolver exists to remove. Only a merged PR satisfies the dependency;
+// an absent row, an open PR and an unverifiable answer all hold the merge back.
 func (r *FileDependencyResolver) prMerged(ctx context.Context, pr string) (bool, error) {
-	if r == nil || r.Runner == nil {
-		return false, errors.New("orchestrator: dependency runner is nil")
+	if r == nil || r.MergedPR == nil {
+		return false, errors.New("orchestrator: merged PR reader is nil")
 	}
-	out, err := r.Runner.Run(ctx, "gh", "pr", "view", pr, "--json", "state")
+	number, err := strconv.Atoi(strings.TrimSpace(pr))
 	if err != nil {
-		return false, fmt.Errorf("orchestrator: gh pr view %s: %w", pr, err)
+		return false, fmt.Errorf("orchestrator: bad PR dependency %q: %w", pr, err)
 	}
-	var payload struct {
-		State string `json:"state"`
+	if number <= 0 {
+		return false, fmt.Errorf("orchestrator: bad PR dependency %q", pr)
 	}
-	if err := json.Unmarshal(out, &payload); err != nil {
-		return false, fmt.Errorf("orchestrator: gh pr view %s decode: %w", pr, err)
+	merged, err := r.MergedPR.MergedPR(ctx, number)
+	if err != nil {
+		return false, fmt.Errorf("orchestrator: PR %d state: %w", number, err)
 	}
-	return strings.EqualFold(strings.TrimSpace(payload.State), "MERGED"), nil
+	return merged, nil
 }
 
 // existsOnMain probes the ref with `git show main:<ref>`. A path that is not

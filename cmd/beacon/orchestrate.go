@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
@@ -24,13 +25,14 @@ func RegisterOrchestrator(fn func(*CLI, []string) int) {
 	orchestratorRunner = fn
 }
 
-// orchestratorDeps is the three-port bundle the loop consumes. Tests install
+// orchestratorDeps is the four-port bundle the loop consumes. Tests install
 // fakes with SetOrchestratorDeps; production builds it from the state store
 // and the CLI child runner.
 type orchestratorDeps struct {
-	Store  orchestrator.Store
-	Merger orchestrator.Merger
-	Waker  orchestrator.Waker
+	Store    orchestrator.Store
+	Merger   orchestrator.Merger
+	Waker    orchestrator.Waker
+	Resolver orchestrator.DependencyResolver
 }
 
 type orchestratorDepsFactory func(*CLI) (orchestratorDeps, func() error, error)
@@ -177,9 +179,16 @@ func orchestratorDepsFromDB(c *CLI, db *store.DB) (orchestratorDeps, error) {
 		}
 		return out, nil
 	})
+	dbStore := orchestrator.NewDBStore(reader, db)
+	// The resolver reads merged PRs from the SQLite Watch rows and probes file
+	// refs with local git. It never starts `gh pr view`, so a dependency check
+	// adds no CLI process to the auto-merge gateway.
+	resolver := orchestrator.NewStoreDependencyResolver(
+		filepath.Join(c.root, "docs", "tasks"), cliRunner{c: c}, dbStore)
 	return orchestratorDeps{
-		Store:  orchestrator.NewDBStore(reader, db),
-		Merger: domainMergeAdapter{merger: ghBatch.provider},
+		Store:    dbStore,
+		Merger:   domainMergeAdapter{merger: ghBatch.provider},
+		Resolver: resolver,
 	}, nil
 }
 
@@ -227,7 +236,7 @@ func runOrchestrate(c *CLI, args []string) int {
 	defer func() { _ = closeStore() }()
 
 	result, err := orchestrator.Run(context.Background(), deps.Store, deps.Merger, deps.Waker,
-		orchestrator.Options{DryRun: *dryRun})
+		orchestrator.Options{DryRun: *dryRun, Resolver: deps.Resolver})
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon orchestrate: %v\n", err)
 	}

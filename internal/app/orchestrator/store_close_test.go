@@ -51,3 +51,71 @@ func TestDBStoreCloseWatchMarksMerged(t *testing.T) {
 		t.Fatalf("repeat close changed watch: %+v -> %+v", got, again)
 	}
 }
+
+// TestDBStoreMergedPRReadsLoadedWatch proves a PR dependency is resolved from
+// the SQLite Watch rows the process already has. There is no CLI runner in this
+// store, so a gh process cannot be started on this path.
+func TestDBStoreMergedPRReadsLoadedWatch(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "beacon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := db.SaveWatch(domain.Watch{
+		ID: "watch:merged:77", Repo: "refusedguy/beacon", PR: 77,
+		Status: domain.StatusClosed, Verdict: domain.VerdictMerged, CloseReason: "merged",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SaveWatch(domain.Watch{
+		ID: "watch:open:78", Repo: "refusedguy/beacon", PR: 78,
+		Status: domain.StatusWatching, Verdict: domain.VerdictReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewDBStore(nil, db)
+	merged, err := s.MergedPR(context.Background(), 77)
+	if err != nil || !merged {
+		t.Fatalf("MergedPR(77) = %t, %v, want true", merged, err)
+	}
+	merged, err = s.MergedPR(context.Background(), 78)
+	if err != nil || merged {
+		t.Fatalf("MergedPR(78) = %t, %v, want false", merged, err)
+	}
+}
+
+// TestDBStoreHoldWatchPersistsWaitReason proves the hold is visible through the
+// same store beacon_list_running and beacon inspect read.
+func TestDBStoreHoldWatchPersistsWaitReason(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "beacon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	w := domain.Watch{
+		ID: "watch:hold:1", Repo: "refusedguy/beacon", PR: 42,
+		Status: domain.StatusWatching, Verdict: domain.VerdictReady,
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewDBStore(nil, db)
+	verdict := WaitDependencyVerdict("wait_for:#77")
+	if err := s.HoldWatch(context.Background(), w.ID, verdict); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.Verdict) != verdict {
+		t.Fatalf("verdict = %q, want %q", got.Verdict, verdict)
+	}
+	if got.Status != domain.StatusWatching {
+		t.Fatalf("hold must keep the Watch in the control loop: %s", got.Status)
+	}
+}

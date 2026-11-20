@@ -20,9 +20,14 @@ import (
 const (
 	// VerdictReady is the only verdict that permits a merge.
 	VerdictReady = "ready"
-	// VerdictWait is the hold decision when a dependency is not satisfied.
-	// It carries a reason in the Action recorded for the Watch.
+	// VerdictWait is the in-process hold decision when a dependency is not
+	// satisfied. It carries a reason in the Action recorded for the Watch.
 	VerdictWait = "wait"
+	// VerdictWaitDependency is the persisted hold status. It is written to the
+	// Watch so beacon_list_running and beacon inspect can show why a merge is
+	// held, and so the next tick re-checks the dependency instead of dropping
+	// the Watch. The reason follows the colon in the persisted verdict.
+	VerdictWaitDependency = "wait_dependency"
 	// VerdictRetry and VerdictFail are left for the subscriber's wake. This
 	// card never repairs them; wake delivery belongs to another card.
 	VerdictRetry = "retry"
@@ -152,6 +157,24 @@ func (w Watch) canAutoMerge(ctx context.Context, resolver DependencyResolver) (v
 	return VerdictReady, "", nil
 }
 
+// WaitDependencyVerdict builds the persisted status for one unsatisfied ref.
+// Keeping the reason in the verdict makes it visible in the diagnostics that
+// read Watch rows directly, without changing their projection.
+func WaitDependencyVerdict(reason string) string {
+	if strings.TrimSpace(reason) == "" {
+		return VerdictWaitDependency
+	}
+	return VerdictWaitDependency + ":" + reason
+}
+
+// isWaitDependency reports whether a persisted verdict is a dependency hold.
+// Such a Watch is re-checked on the next pass: when the ref lands in main the
+// same path that held the merge now merges it.
+func isWaitDependency(verdict string) bool {
+	v := strings.ToLower(strings.TrimSpace(verdict))
+	return v == VerdictWaitDependency || strings.HasPrefix(v, VerdictWaitDependency+":")
+}
+
 // needsWake reports whether the verdict is one a subscriber must act on. The
 // orchestrator does not fix these Watches; it only reports their PRs and, when
 // a Waker is installed, hands the Watch over.
@@ -197,6 +220,13 @@ type Store interface {
 	// RecordFixAttempt persists one more FIX agent attempt on the Watch's
 	// block record. The counter belongs to the block, so an unblock resets it.
 	RecordFixAttempt(ctx context.Context, watchID string) error
+}
+
+// WatchHolder is an optional Store capability for persisting a dependency
+// hold. A store without it still holds the merge in memory for this pass; the
+// reason just is not visible in beacon_list_running / beacon inspect.
+type WatchHolder interface {
+	HoldWatch(ctx context.Context, watchID, verdict string) error
 }
 
 // Waker asks a subscriber to act on a retry/fail/wait Watch. Wake delivery
@@ -296,7 +326,9 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 			// Blocked wins over a stale ready verdict and over retry. Decide
 			// reads the block first, so a blocked Watch can never merge here.
 			handleBlocked(ctx, st, w, resolver, opts, &out, &errs)
-		case w.isReady():
+		case w.isReady() || isWaitDependency(w.Verdict):
+			// A Watch held on a previous tick is checked again with the same
+			// gate. As soon as the ref is in main, this pass merges it.
 			verdict, reason, err := w.canAutoMerge(ctx, resolver)
 			if err != nil {
 				observe.ActorError("orchestrator", w.ID, err)
@@ -308,13 +340,22 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 				observe.DependenciesResolved(w.ID, w.PR, nil)
 				mergeOne(ctx, st, merger, opts, w, &out, &errs)
 			case VerdictWait:
+				// An unsatisfied dependency is nobody's fault: there is no fix
+				// for an executor or a FIX agent to do, so no obligation is
+				// staged and no subscriber is woken. The hold and its reason
+				// are persisted instead and rechecked on the next tick.
 				observe.DependencyWait(w.ID, w.PR, reason)
 				out.Waiting = append(out.Waiting, w.PR)
 				out.Actions = append(out.Actions, Action{
 					Action: ActionWait, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
 					Message: reason,
 				})
-				wakeOne(ctx, waker, w, VerdictWait, reason, &out, &errs)
+				if holder, ok := st.(WatchHolder); ok && !opts.DryRun {
+					if err := holder.HoldWatch(ctx, w.ID, WaitDependencyVerdict(reason)); err != nil {
+						observe.ActorError("dependency-hold", w.ID, err)
+						errs = append(errs, fmt.Errorf("orchestrator: hold watch %s: %w", w.ID, err))
+					}
+				}
 			default:
 				out.Actions = append(out.Actions, Action{
 					Action: ActionSkip, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
