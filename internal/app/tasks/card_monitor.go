@@ -63,10 +63,11 @@ type Port interface {
 	Serialize(change Change) ([]byte, error)
 }
 
-// Result is one poll outcome. Changes are produced by the monitor; Events are
-// journal entries read since the last poll. Both slices are non-nil, so an
-// empty result never encodes as null.
-type Result struct {
+// PollResult is one poll outcome. Changes are produced by the monitor; Events
+// are journal entries read since the last poll. Both slices are non-nil, so an
+// empty result never encodes as null. The name avoids the Worker Result type
+// that lives in the same package.
+type PollResult struct {
 	Changes []Change
 	Events  []RecordedEvent
 }
@@ -151,36 +152,36 @@ func (m *Monitor) SubscriptionCount() int {
 // events newer than the last cursor. A card seen for the first time sets the
 // baseline without emitting a change. If any port call fails, Poll returns the
 // error and leaves the stored state untouched, so a retry cannot lose an event.
-func (m *Monitor) Poll(ctx context.Context, id string) (Result, error) {
+func (m *Monitor) Poll(ctx context.Context, id string) (PollResult, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return Result{}, ErrEmptyCardID
+		return PollResult{}, ErrEmptyCardID
 	}
 	if m == nil || m.port == nil {
-		return Result{}, errors.New("tasks: nil card monitor port")
+		return PollResult{}, errors.New("tasks: nil card monitor port")
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	state, ok := m.states[id]
 	if !ok {
-		return Result{}, fmt.Errorf("%w: %s", ErrNotSubscribed, id)
+		return PollResult{}, fmt.Errorf("%w: %s", ErrNotSubscribed, id)
 	}
 
 	snapshot, found, err := m.port.Card(ctx, id)
 	if err != nil {
-		return Result{}, fmt.Errorf("tasks: read card %s: %w", id, err)
+		return PollResult{}, fmt.Errorf("tasks: read card %s: %w", id, err)
 	}
 	events, err := m.port.EventsAfter(ctx, id, state.cursor, m.limit)
 	if err != nil {
-		return Result{}, fmt.Errorf("tasks: read events for %s: %w", id, err)
+		return PollResult{}, fmt.Errorf("tasks: read events for %s: %w", id, err)
 	}
 	if !found {
 		// An absent card has no status to compare and no cursor to advance.
-		return Result{}, nil
+		return PollResult{}, nil
 	}
 
-	res := Result{Events: make([]RecordedEvent, 0, len(events))}
+	res := PollResult{Events: make([]RecordedEvent, 0, len(events))}
 	cursor := state.cursor
 	for _, ev := range events {
 		if ev.Seq <= cursor {
@@ -206,7 +207,7 @@ func (m *Monitor) Poll(ctx context.Context, id string) (Result, error) {
 		}
 		payload, err := m.port.Serialize(change)
 		if err != nil {
-			return Result{}, fmt.Errorf("tasks: serialize change for %s: %w", id, err)
+			return PollResult{}, fmt.Errorf("tasks: serialize change for %s: %w", id, err)
 		}
 		change.Payload = payload
 		m.nextSeq = seq
