@@ -36,12 +36,56 @@ import (
 // adapter uses the OpenCode HTTP API through `opencode api`, the same path the
 // CLI and TUI use. It never invents a verdict and never merges a PR.
 
-// OpenCodeDeliverer posts a steer message to an existing OpenCode session.
+// PromptFunc writes text into an existing session through the already running
+// HTTP service. delivery is "steer" or "queue": "steer" also resumes an idle
+// session, "queue" parks the input without starting a new turn. A port that
+// discovers the HTTP service is gone returns an error wrapping ErrNoPromptPort
+// so Deliver can fall back to the CLI without inventing a second delivery.
+type PromptFunc func(ctx context.Context, sessionID, text, delivery string) error
+
+// SessionActiveFunc reports whether sessionID is busy and still alive. A
+// session that no longer exists (HTTP 404) is an error wrapping ErrSessionDead.
+type SessionActiveFunc func(ctx context.Context, sessionID string) (busy bool, alive bool, err error)
+
+// ObligationDeliveryStore is the slice of the domain store the deliverer needs.
+// A SQLite-backed domain.Store satisfies it; wake declares the port in terms of
+// domain types and never imports internal/infra/store (ADR 0005).
+type ObligationDeliveryStore interface {
+	Obligation(id string) (domain.Obligation, error)
+	MarkObligationDelivered(id string, at time.Time, attempt int, lastErr string) error
+}
+
+var (
+	// ErrSessionDead marks a session that no longer exists. errors.Is finds it
+	// through any transport wrapper.
+	ErrSessionDead = errors.New("wake: session dead")
+	// ErrNoPromptPort asks Deliver to use the CLI fallback. It is the honest
+	// answer when service.json is absent under a plain TUI.
+	ErrNoPromptPort = errors.New("wake: no http prompt port")
+)
+
+const (
+	wakeDeliverySteer = "steer"
+	wakeDeliveryQueue = "queue"
+
+	// opencodeCLITimeout bounds every fallback `opencode api` call. A hung CLI
+	// must not hold a wake forever when the HTTP port is not configured.
+	opencodeCLITimeout = 10 * time.Second
+)
+
+// OpenCodeDeliverer posts a wake pointer to an existing OpenCode session.
 // The sessionID comes from the MCP caller's _meta, so Beacon already knows
 // which agent to wake without a second registry.
 type OpenCodeDeliverer struct {
 	// Runner is replaceable in tests. Nil means exec.CommandContext.
 	Runner func(ctx context.Context, args ...string) ([]byte, error)
+	// PromptFunc is the live HTTP port. When set it is tried first, so no
+	// process is spawned for a wake on a service that is already running.
+	PromptFunc PromptFunc
+	// SessionActiveFunc decides queue vs steer before a prompt is sent.
+	SessionActiveFunc SessionActiveFunc
+	// Obligations makes the delivery fact survive a process restart.
+	Obligations ObligationDeliveryStore
 
 	mu   sync.Mutex
 	seen map[wakeDeliveryKey]struct{}
@@ -59,6 +103,9 @@ var _ domain.WakeDeliverer = (*OpenCodeDeliverer)(nil)
 
 // Deliver emits a <beacon-event> envelope with only identifiers. The host's
 // prompt admission treats the text as untrusted input, never as a command.
+// A live HTTP port is used first; the CLI path is the fallback when that port
+// is absent. A busy session gets delivery=queue so an in-flight dialogue is not
+// cut; an idle one gets delivery=steer with resume=true.
 func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
 	if !strings.HasPrefix(sessionID, "ses_") {
 		return fmt.Errorf("wake: invalid session id %q", sessionID)
@@ -81,31 +128,132 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	}
 	d.mu.Unlock()
 
-	body := map[string]any{
-		"text":     Envelope(p),
-		"delivery": "steer",
+	// The store is the durable half of dedup: a restarted process has an empty
+	// seen map but must still not wake the same obligation twice.
+	if d.Obligations != nil {
+		o, err := d.Obligations.Obligation(p.ObligationID)
+		if err == nil && !o.DeliveredAt.IsZero() {
+			d.remember(key)
+			return nil
+		}
+		if err != nil && !isObligationMissing(err) {
+			return fmt.Errorf("wake: obligation %s: %w", p.ObligationID, err)
+		}
+	}
+
+	delivery, resume := wakeDeliverySteer, false
+	if d.SessionActiveFunc != nil {
+		busy, alive, err := d.SessionActiveFunc(ctx, sessionID)
+		if err != nil {
+			if sessionNotFound(err, nil) {
+				return fmt.Errorf("%w: session %s: %v", ErrSessionDead, sessionID, err)
+			}
+			return fmt.Errorf("wake: session %s status: %w", sessionID, err)
+		}
+		if !alive {
+			return fmt.Errorf("%w: session %s", ErrSessionDead, sessionID)
+		}
+		if busy {
+			delivery = wakeDeliveryQueue
+		} else {
+			resume = true
+		}
+	}
+
+	text := Envelope(p)
+	if d.PromptFunc != nil {
+		err := d.PromptFunc(ctx, sessionID, text, delivery)
+		switch {
+		case err == nil:
+			return d.markDelivered(key, p)
+		case errors.Is(err, ErrNoPromptPort):
+			// No service.json under a plain TUI: fall through to `opencode api`.
+		case sessionNotFound(err, nil):
+			return fmt.Errorf("%w: session %s: %v", ErrSessionDead, sessionID, err)
+		default:
+			return fmt.Errorf("wake: prompt session %s: %w", sessionID, err)
+		}
+	}
+	if err := d.deliverCLI(ctx, sessionID, text, delivery, resume); err != nil {
+		return err
+	}
+	return d.markDelivered(key, p)
+}
+
+// deliverCLI is the fallback transport: one `opencode api` call under a hard
+// timeout, so a hung process cannot park a wake forever.
+func (d *OpenCodeDeliverer) deliverCLI(ctx context.Context, sessionID, text, delivery string, resume bool) error {
+	body := map[string]any{"text": text, "delivery": delivery}
+	if resume {
+		body["resume"] = true
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
 	args := []string{"api", "POST", "/api/session/" + sessionID + "/prompt", "--data", string(raw)}
+	cliCtx, cancel := context.WithTimeout(ctx, opencodeCLITimeout)
+	defer cancel()
 	var out []byte
 	if d.Runner != nil {
-		out, err = d.Runner(ctx, args...)
+		out, err = d.Runner(cliCtx, args...)
 	} else {
-		out, err = exec.CommandContext(ctx, "opencode", args...).Output()
+		out, err = exec.CommandContext(cliCtx, "opencode", args...).Output()
 	}
 	if err != nil {
+		if sessionNotFound(err, out) {
+			return fmt.Errorf("%w: session %s: %v", ErrSessionDead, sessionID, err)
+		}
 		return fmt.Errorf("wake: opencode api: %w", err)
 	}
-	if err := verifyAck(out); err != nil {
-		return err
-	}
+	return verifyAck(out)
+}
+
+// remember records the pointer in process memory. It runs only after a host
+// admitted the prompt, so a transport failure stays retryable (ADR 0017).
+func (d *OpenCodeDeliverer) remember(key wakeDeliveryKey) {
 	d.mu.Lock()
+	if d.seen == nil {
+		d.seen = make(map[wakeDeliveryKey]struct{})
+	}
 	d.seen[key] = struct{}{}
 	d.mu.Unlock()
+}
+
+// markDelivered records the fact in both places: memory stops a second prompt
+// in this process, SQLite stops one after a restart.
+func (d *OpenCodeDeliverer) markDelivered(key wakeDeliveryKey, p domain.WakePayload) error {
+	d.remember(key)
+	if d.Obligations == nil {
+		return nil
+	}
+	if err := d.Obligations.MarkObligationDelivered(p.ObligationID, time.Now(), 1, ""); err != nil {
+		return fmt.Errorf("wake: mark obligation %s delivered: %w", p.ObligationID, err)
+	}
 	return nil
+}
+
+// isObligationMissing accepts the two honest "not staged yet" answers from a
+// domain store: sql.ErrNoRows and the domain's WATCH_NOT_FOUND AppError.
+func isObligationMissing(err error) bool {
+	if errors.Is(err, sql.ErrNoRows) {
+		return true
+	}
+	var appErr *domain.AppError
+	return errors.As(err, &appErr) && appErr.Code == domain.CodeWatchNotFound
+}
+
+// sessionNotFound maps a 404 from either port to the typed ErrSessionDead. The
+// text check keeps a transport that only reports a status honest.
+func sessionNotFound(err error, out []byte) bool {
+	if errors.Is(err, ErrSessionDead) {
+		return true
+	}
+	msg := string(out)
+	if err != nil {
+		msg += " " + err.Error()
+	}
+	return strings.Contains(msg, "404") || strings.Contains(strings.ToLower(msg), "not found")
 }
 
 // Envelope renders the pointer into the host's wake text. Every field is
@@ -140,8 +288,10 @@ func WatchTarget(w domain.Watch, watchID string) (string, error) {
 
 // SubscriberTarget resolves the one session a wake may address on w. The
 // addressee must be subscriber.ID on the very Watch the pointer names, with
-// role executor or orchestrator. No caller session, _meta value, notify target
-// or role-wide broadcast can stand in for that id.
+// role executor, orchestrator or fixer. A fixer wakes like an executor and
+// carries FixFor, so it owns its own obligation and may be steered too (ADR
+// 0260). No caller session, _meta value, notify target or role-wide broadcast
+// can stand in for that id.
 func SubscriberTarget(w domain.Watch, watchID, addressee string) (string, error) {
 	if watchID == "" || w.ID != watchID {
 		return "", fmt.Errorf("wake: watchID %q does not name watch %q", watchID, w.ID)
@@ -153,7 +303,7 @@ func SubscriberTarget(w domain.Watch, watchID, addressee string) (string, error)
 		if sub.ID != addressee {
 			continue
 		}
-		if sub.Role != domain.RoleExecutor && sub.Role != domain.RoleOrchestrator {
+		if sub.Role != domain.RoleExecutor && sub.Role != domain.RoleOrchestrator && sub.Role != domain.RoleFixer {
 			return "", fmt.Errorf("wake: subscriber %q has role %q on watch %s", sub.ID, sub.Role, watchID)
 		}
 		return sub.ID, nil
@@ -358,7 +508,7 @@ func (d *T200Deliverer) Deliver(ctx context.Context, req T200Request) (T200Resul
 	}
 
 	payload := struct {
-		Text     string   `json:"text"`
+		Text         string       `json:"text"`
 		T200Delivery T200Delivery `json:"delivery"`
 	}{Text: req.Text, T200Delivery: mode}
 	body, err := json.Marshal(payload)
@@ -434,7 +584,7 @@ func T200readAdmission(resp *http.Response, mode T200Delivery) (T200Result, bool
 func T200parseAdmission(raw []byte) T200Result {
 	var envelope struct {
 		Data struct {
-			ID       string   `json:"id"`
+			ID           string       `json:"id"`
 			T200Delivery T200Delivery `json:"delivery"`
 		} `json:"data"`
 	}
@@ -442,7 +592,7 @@ func T200parseAdmission(raw []byte) T200Result {
 		return T200Result{ID: envelope.Data.ID, T200Delivery: envelope.Data.T200Delivery}
 	}
 	var bare struct {
-		ID       string   `json:"id"`
+		ID           string       `json:"id"`
 		T200Delivery T200Delivery `json:"delivery"`
 	}
 	if err := json.Unmarshal(raw, &bare); err == nil {
@@ -1378,8 +1528,8 @@ const T205AxisDelivery T205Axis = "result delivery"
 type T205Row struct {
 	T205Mechanism T205Mechanism
 	T205Axis      T205Axis
-	Fact      string
-	Source    string
+	Fact          string
+	Source        string
 }
 
 func T205row(m T205Mechanism, a T205Axis, fact, source string) T205Row {
@@ -1418,8 +1568,8 @@ const T205PrimitiveLeaseRelease T205Primitive = "lease/release"
 // T205PrimitiveDoc explains why a T205primitive was chosen and which reports ground it.
 type T205PrimitiveDoc struct {
 	T205Primitive T205Primitive
-	Summary   string
-	Reports   []string
+	Summary       string
+	Reports       []string
 }
 
 func T205primitive(p T205Primitive, summary string, reports ...string) T205PrimitiveDoc {
@@ -1539,20 +1689,20 @@ var (
 // generated once and kept on retry. IdempotencyKey is optional and is checked
 // against the body hash recorded for the first delivery.
 type T206WakeRequest struct {
-	DeliveryID     string    `json:"deliveryId"`
-	IdempotencyKey string    `json:"idempotencyKey,omitempty"`
-	Target         string    `json:"target"`
-	Kind           T206WakeKind  `json:"kind"`
-	Body           []byte    `json:"body,omitempty"`
-	At             time.Time `json:"at,omitempty"`
+	DeliveryID     string       `json:"deliveryId"`
+	IdempotencyKey string       `json:"idempotencyKey,omitempty"`
+	Target         string       `json:"target"`
+	Kind           T206WakeKind `json:"kind"`
+	Body           []byte       `json:"body,omitempty"`
+	At             time.Time    `json:"at,omitempty"`
 }
 
 // T206DeliveryResult reports what the deliverer did. Coalesced is true when the
 // request matched a journal entry and no second job was started.
 type T206DeliveryResult struct {
-	DeliveryID string         `json:"deliveryId"`
+	DeliveryID string             `json:"deliveryId"`
 	Status     T206DeliveryStatus `json:"status"`
-	Coalesced  bool           `json:"coalesced"`
+	Coalesced  bool               `json:"coalesced"`
 }
 
 // T206Transport performs the external side effect. It is a function so the
@@ -1586,7 +1736,7 @@ func T206WakeRequestFromWebhook(h http.Header, target string, kind T206WakeKind,
 
 type T206deliveryRecord struct {
 	deliveryID     string
-	T206bodyHash       string
+	T206bodyHash   string
 	idempotencyKey string
 	status         T206DeliveryStatus
 	seenAt         time.Time
@@ -1612,7 +1762,7 @@ func T206NewDeliveryJournal() *T206DeliveryJournal {
 // transport twice for the same deliveryId, and it records the key before the
 // external call so a concurrent retry sees the first attempt already staged.
 type T206Deliverer struct {
-	Journal   *T206DeliveryJournal
+	Journal       *T206DeliveryJournal
 	T206Transport T206Transport
 }
 
@@ -1653,7 +1803,7 @@ func (d *T206Deliverer) Deliver(ctx context.Context, req T206WakeRequest) (T206D
 	now := time.Now().UTC()
 	j.byID[req.DeliveryID] = T206deliveryRecord{
 		deliveryID:     req.DeliveryID,
-		T206bodyHash:       hash,
+		T206bodyHash:   hash,
 		idempotencyKey: req.IdempotencyKey,
 		status:         T206StatusQueued,
 		seenAt:         now,
@@ -1733,7 +1883,7 @@ const T207AcceptedStatus = 202
 // It has no result, no outcome and no verdict, so finality can never be read
 // from it.
 type T207Accepted struct {
-	Status     int        `json:"status"`
+	Status         int            `json:"status"`
 	T207DeliveryId T207DeliveryId `json:"deliveryId"`
 }
 
@@ -1749,7 +1899,7 @@ const (
 // T207Event is a hint published on the event channel, always carrying the
 // deliveryId of the admission it belongs to.
 type T207Event struct {
-	Type       T207EventType  `json:"type"`
+	Type           T207EventType  `json:"type"`
 	T207DeliveryId T207DeliveryId `json:"deliveryId"`
 }
 
@@ -1776,8 +1926,8 @@ const (
 // T207Request is one wake admission. An empty T207DeliveryId is generated. T207Mode is
 // recorded for observability but never changes the acknowledgement.
 type T207Request struct {
-	Target     string
-	Payload    string
+	Target         string
+	Payload        string
 	T207DeliveryId T207DeliveryId
 	T207Mode       T207Mode
 }
@@ -2240,7 +2390,7 @@ var (
 // lost a response can recognise its own reservation and avoid a second turn.
 type T209ClaimResult struct {
 	Outcome       T209ClaimOutcome
-	T209Lease         T209Lease
+	T209Lease     T209Lease
 	OwnerWorkerID string
 }
 
@@ -2341,7 +2491,7 @@ func (m *T209Manager) Claim(id, workerID string) (T209ClaimResult, error) {
 	if r.state == T209StateClaimed {
 		return T209ClaimResult{
 			Outcome:       T209ClaimConflict,
-			T209Lease:         r.lease,
+			T209Lease:     r.lease,
 			OwnerWorkerID: r.lease.WorkerID,
 		}, T209ErrLeaseLive
 	}
@@ -2358,7 +2508,7 @@ func (m *T209Manager) Claim(id, workerID string) (T209ClaimResult, error) {
 	}
 	return T209ClaimResult{
 		Outcome:       outcome,
-		T209Lease:         r.lease,
+		T209Lease:     r.lease,
 		OwnerWorkerID: workerID,
 	}, nil
 }
@@ -3626,11 +3776,11 @@ var (
 )
 
 type T220Receipt struct {
-	ObligationID string            `json:"obligationID"`
-	Attempt      int               `json:"attempt"`
-	Outcome      T220Outcome       `json:"outcome"`
+	ObligationID string             `json:"obligationID"`
+	Attempt      int                `json:"attempt"`
+	Outcome      T220Outcome        `json:"outcome"`
 	Pointer      domain.WakePayload `json:"pointer"`
-	At           time.Time         `json:"at"`
+	At           time.Time          `json:"at"`
 }
 
 type T220Ledger struct {
