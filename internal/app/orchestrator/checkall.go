@@ -21,6 +21,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Verdict values produced by this pass. They are the same strings the domain
@@ -70,10 +72,19 @@ const (
 // Config is the effective project configuration after the global and project
 // layers are merged.
 type Config struct {
-	MaxRebases     int    `json:"maxRebases"`
-	OrchestratorID string `json:"orchestratorID"`
-	SlotsTotal     int    `json:"slotsTotal"`
-	WakeTarget     string `json:"wakeTarget"`
+	MaxRebases     int         `json:"maxRebases" yaml:"maxRebases"`
+	OrchestratorID string      `json:"orchestratorID" yaml:"orchestratorID"`
+	SlotsTotal     int         `json:"slotsTotal" yaml:"slotsTotal"`
+	WakeTarget     string      `json:"wakeTarget" yaml:"wakeTarget"`
+	Flaky          FlakyConfig `json:"flaky,omitempty" yaml:"flaky,omitempty"`
+}
+
+// FlakyConfig is the app-layer mirror of the flaky-check settings. Names are
+// check-name patterns and MaxRetries is the per-check retry budget. The app
+// layer may not import internal/domain (ADR 0005), so the shape is repeated.
+type FlakyConfig struct {
+	Names      []string `json:"names,omitempty" yaml:"names,omitempty"`
+	MaxRetries int      `json:"maxRetries,omitempty" yaml:"maxRetries,omitempty"`
 }
 
 // DefaultConfig returns the built-in layer, before either YAML file is read.
@@ -101,16 +112,6 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
-}
-
-// configKeys maps the normalized YAML key to the field it fills. Normalizing
-// lowercases the key and drops separators, so maxRebases, max_rebases and
-// MAX-REBASES all name the same field.
-var configKeys = map[string]string{
-	"maxrebases":     "maxRebases",
-	"orchestratorid": "orchestratorID",
-	"slotstotal":     "slotsTotal",
-	"waketarget":     "wakeTarget",
 }
 
 // normalizeConfigKey is the lookup form shared by the parser and the merger.
@@ -156,81 +157,123 @@ func globalConfigPath() (string, error) {
 	return filepath.Join(home, ".config", "beacon", configFileName), nil
 }
 
-// applyConfigFile reads one flat YAML file and overlays the keys it contains.
+// applyConfigFile reads one YAML file and overlays the keys it contains.
+// Missing files leave the previous layer intact. Keys are normalized so
+// maxRebases, max_rebases and MAX-REBASES all name the same setting; a nested
+// flaky section carries the per-check retry configuration.
 // fs.ReadFile over os.DirFS keeps file access inside the capabilities gate's
 // infra capability boundary (ADR 0005), the same seam registry_config.go uses.
 func applyConfigFile(cfg *Config, path string) error {
-	values, err := readConfigFile(path)
-	if err != nil {
-		return err
+	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
-	for _, key := range []string{"maxRebases", "orchestratorID", "slotsTotal", "wakeTarget"} {
-		raw, found := values[key]
-		if !found {
-			continue
-		}
-		switch key {
-		case "maxRebases", "slotsTotal":
-			n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("config: %s: %w", path, err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("config: %s: ожидается key: value: %w", path, err)
+	}
+	for key, raw := range doc {
+		switch normalizeConfigKey(key) {
+		case "maxrebases":
+			n, err := configInt(path, key, raw)
 			if err != nil {
-				return fmt.Errorf("config: %s: %s: неверное целое %q", path, key, raw)
+				return err
 			}
-			if key == "maxRebases" {
-				cfg.MaxRebases = n
-			} else {
-				cfg.SlotsTotal = n
+			cfg.MaxRebases = n
+		case "slotstotal":
+			n, err := configInt(path, key, raw)
+			if err != nil {
+				return err
 			}
-		case "orchestratorID":
-			cfg.OrchestratorID = raw
-		case "wakeTarget":
-			cfg.WakeTarget = raw
+			cfg.SlotsTotal = n
+		case "orchestratorid":
+			s, err := configString(path, key, raw)
+			if err != nil {
+				return err
+			}
+			cfg.OrchestratorID = s
+		case "waketarget":
+			s, err := configString(path, key, raw)
+			if err != nil {
+				return err
+			}
+			cfg.WakeTarget = s
+		case "flaky":
+			if err := applyFlakySection(cfg, path, raw); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("config: %s: неизвестный ключ %q", path, key)
 		}
 	}
 	return nil
 }
 
-// readConfigFile parses flat `key: value` lines. It accepts comments and
-// quoted strings, and returns an empty map for a file that does not exist.
-func readConfigFile(path string) (map[string]string, error) {
-	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+// configInt accepts a YAML integer or a quoted integer string so values written
+// before the YAML migration keep loading. Anything else is a config error.
+func configInt(path, key string, raw any) (int, error) {
+	switch v := raw.(type) {
+	case int:
+		return v, nil
+	case int64:
+		return int(v), nil
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, fmt.Errorf("config: %s: %s: неверное целое %q", path, key, v)
+		}
+		return n, nil
+	default:
+		return 0, fmt.Errorf("config: %s: %s: неверное целое %v", path, key, raw)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("config: %s: %w", path, err)
-	}
-
-	values := make(map[string]string)
-	for i, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		field, raw, found := strings.Cut(trimmed, ":")
-		if !found {
-			return nil, fmt.Errorf("config: %s:%d: ожидается key: value", path, i+1)
-		}
-		key, known := configKeys[normalizeConfigKey(field)]
-		if !known {
-			return nil, fmt.Errorf("config: %s:%d: неизвестный ключ %q", path, i+1, strings.TrimSpace(field))
-		}
-		value := strings.TrimSpace(stripConfigComment(raw))
-		if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') && value[len(value)-1] == value[0] {
-			value = value[1 : len(value)-1]
-		}
-		values[key] = value
-	}
-	return values, nil
 }
 
-// stripConfigComment removes a trailing comment only when # starts a token.
-func stripConfigComment(value string) string {
-	for i, r := range value {
-		if r == '#' && (i == 0 || value[i-1] == ' ' || value[i-1] == '\t') {
-			return value[:i]
+// configString reads a scalar YAML value as a string.
+func configString(path, key string, raw any) (string, error) {
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("config: %s: %s: ожидается строка", path, key)
+	}
+	return strings.TrimSpace(s), nil
+}
+
+// applyFlakySection overlays the nested flaky settings. The section is optional
+// on both config layers, so a project can override only Names or only MaxRetries.
+func applyFlakySection(cfg *Config, path string, raw any) error {
+	section, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("config: %s: flaky: ожидается key: value", path)
+	}
+	for key, value := range section {
+		switch normalizeConfigKey(key) {
+		case "names":
+			items, ok := value.([]any)
+			if !ok {
+				return fmt.Errorf("config: %s: flaky.names: ожидается список", path)
+			}
+			names := make([]string, 0, len(items))
+			for _, item := range items {
+				name, err := configString(path, "flaky.names", item)
+				if err != nil {
+					return err
+				}
+				names = append(names, name)
+			}
+			cfg.Flaky.Names = names
+		case "maxretries":
+			n, err := configInt(path, "flaky.maxRetries", value)
+			if err != nil {
+				return err
+			}
+			cfg.Flaky.MaxRetries = n
+		default:
+			return fmt.Errorf("config: %s: flaky: неизвестный ключ %q", path, key)
 		}
 	}
-	return value
+	return nil
 }
 
 // PR is one open pull request reported by gh. Repo is the slug used as the
@@ -377,15 +420,16 @@ func CheckAll(ctx context.Context, deps Deps) (Summary, error) {
 
 // VerdictFromChecks applies cibridge's rules: no checks means still watching,
 // a failing or cancelled check asks for retry, all green is ready, and any
-// other pending state keeps the Watch watching.
+// other pending state keeps the Watch watching. SKIPPED and NEUTRAL count as
+// green, matching the domain's harmless-conclusion rule.
 func VerdictFromChecks(checks []Check) Verdict {
 	if len(checks) == 0 {
 		return CheckVerdictWatching
 	}
 	allGreen := true
 	for _, c := range checks {
-		switch c.Conclusion {
-		case "SUCCESS":
+		switch strings.ToUpper(strings.TrimSpace(c.Conclusion)) {
+		case "SUCCESS", "SKIPPED", "NEUTRAL":
 			continue
 		case "FAILURE", "CANCELLED":
 			allGreen = false
@@ -556,13 +600,16 @@ func checkFromNode(raw json.RawMessage) (Check, bool) {
 	return Check{Name: name, Conclusion: normalizeConclusion(conclusion)}, true
 }
 
+// normalizeConclusion maps a raw check conclusion to the three states the
+// verdict rules read. SKIPPED and NEUTRAL are allowed results, so they are
+// passes and never become a blocking CANCELLED.
 func normalizeConclusion(value string) string {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
-	case "PASS", "SUCCESS", "SUCCESSFUL":
+	case "PASS", "SUCCESS", "SUCCESSFUL", "SKIPPED", "NEUTRAL":
 		return "SUCCESS"
 	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
 		return "FAILURE"
-	case "CANCELLED", "CANCELED", "SKIPPED":
+	case "CANCELLED", "CANCELED":
 		return "CANCELLED"
 	default:
 		return "PENDING"

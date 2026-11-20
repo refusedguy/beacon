@@ -166,6 +166,22 @@ func TestVerdictFromChecks(t *testing.T) {
 	}
 }
 
+func TestNormalizeConclusionAllowedResultsAreSuccess(t *testing.T) {
+	for _, in := range []string{"SKIPPED", "skipped", "NEUTRAL", "neutral", "SUCCESS"} {
+		if got := normalizeConclusion(in); got != "SUCCESS" {
+			t.Errorf("normalizeConclusion(%q) = %q, want SUCCESS", in, got)
+		}
+	}
+	for _, in := range []string{"CANCELLED", "CANCELED"} {
+		if got := normalizeConclusion(in); got != "CANCELLED" {
+			t.Errorf("normalizeConclusion(%q) = %q, want CANCELLED", in, got)
+		}
+	}
+	if got := VerdictFromChecks([]Check{{Name: "skip", Conclusion: "SKIPPED"}, {Name: "neutral", Conclusion: "NEUTRAL"}}); got != VerdictReady {
+		t.Fatalf("verdict for SKIPPED/NEUTRAL = %s, want ready", got)
+	}
+}
+
 // isolateConfig points the global layer at a path with no file, so a test
 // never depends on the developer's ~/.config/beacon/config.yaml.
 func isolateConfig(t *testing.T) {
@@ -189,7 +205,7 @@ func TestLoadProjectConfigDefaultsWithoutFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (Config{MaxRebases: 3, SlotsTotal: 4}); got != want {
+	if want := (Config{MaxRebases: 3, SlotsTotal: 4}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
 	}
 }
@@ -214,7 +230,7 @@ wakeTarget: 'ses_global_wake'
 		t.Fatal(err)
 	}
 	want := Config{MaxRebases: 7, OrchestratorID: "ses_global", SlotsTotal: 2, WakeTarget: "ses_project_wake"}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
 	}
 }
@@ -230,8 +246,52 @@ func TestLoadProjectConfigUsesGlobalWhenProjectAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := Config{MaxRebases: 6, SlotsTotal: 0}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadProjectConfigReadsNestedFlakySection(t *testing.T) {
+	isolateConfig(t)
+	project := t.TempDir()
+	writeConfigFile(t, filepath.Join(project, configDirName, configFileName), `
+maxRebases: 4
+flaky:
+  names:
+    - ci/flaky
+    - ci/network
+  maxRetries: 2
+`)
+
+	got, err := LoadProjectConfig(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Config{
+		MaxRebases: 4, SlotsTotal: 4,
+		Flaky: FlakyConfig{Names: []string{"ci/flaky", "ci/network"}, MaxRetries: 2},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("config = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadProjectConfigMergesFlakyLayers(t *testing.T) {
+	isolateConfig(t)
+	global := filepath.Join(t.TempDir(), "global.yaml")
+	writeConfigFile(t, global, "flaky:\n  names: [ci/global]\n  maxRetries: 1\n")
+	t.Setenv(configPathEnv, global)
+
+	project := t.TempDir()
+	writeConfigFile(t, filepath.Join(project, configDirName, configFileName),
+		"flaky:\n  maxRetries: 3\n")
+
+	got, err := LoadProjectConfig(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Flaky.Names, []string{"ci/global"}) || got.Flaky.MaxRetries != 3 {
+		t.Fatalf("flaky = %+v", got.Flaky)
 	}
 }
 

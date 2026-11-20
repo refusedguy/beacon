@@ -181,9 +181,26 @@ func daemonWakeIsDelivered(outcome string) bool {
 
 var _ Waker = (*daemonWaker)(nil)
 
-// Wake leaves a "do the rebase yourself" pointer for the Watch's executor. It
-// never repairs the branch, reruns checks or merges: those belong to the
-// subscriber and to the other daemon ports.
+// daemonWakeInstruction maps a verdict to the action the subscriber must take.
+// A retry asks for a rerun, a rebase verdict asks for a rebase and keep_working
+// asks to continue. The old hardcoded rebase text was wrong for every verdict
+// except rebase; an unknown verdict stays neutral and still carries its name.
+func daemonWakeInstruction(verdict string) string {
+	switch strings.ToLower(strings.TrimSpace(verdict)) {
+	case "rebase":
+		return "нужен rebase, сделай его сам"
+	case "retry":
+		return "перезапусти проверки: gh run rerun --failed"
+	case "keep_working":
+		return "продолжай работу"
+	default:
+		return "нужны действия по вердикту"
+	}
+}
+
+// Wake leaves a verdict-shaped pointer for the Watch's executor. It never
+// repairs the branch, reruns checks or merges: those belong to the subscriber
+// and to the other daemon ports.
 func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64, verdict string) error {
 	if w == nil || w.lookup == nil || w.adapters == nil {
 		return errors.New("daemon: waker is not configured")
@@ -207,8 +224,8 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if adapter == "" {
 		adapter = wake.AdapterOpenCode
 	}
-	text := fmt.Sprintf("нужен rebase, сделай его сам: watchID=%s pr=%d revision=%d",
-		watchID, watch.PR, revision)
+	text := fmt.Sprintf("%s: verdict=%s watchID=%s pr=%d revision=%d",
+		daemonWakeInstruction(verdict), verdict, watchID, watch.PR, revision)
 	pointer := wake.T210WakePointer{
 		Adapter:      adapter,
 		Target:       watch.SubscriberID,

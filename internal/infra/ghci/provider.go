@@ -297,13 +297,15 @@ func (p *Provider) fetch(ctx context.Context, repo string, pr int) (domain.PRSta
 }
 
 // ghCheckConclusion maps gh's check state to Beacon's conclusion strings.
+// SKIPPED and NEUTRAL are allowed, non-blocking results, so they map to SUCCESS
+// rather than to a cancelled or pending check that would hold the merge.
 func ghCheckConclusion(state string) string {
 	switch strings.ToUpper(strings.TrimSpace(state)) {
-	case "PASS", "SUCCESS":
+	case "PASS", "SUCCESS", "SKIPPED", "NEUTRAL":
 		return "SUCCESS"
 	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
 		return "FAILURE"
-	case "CANCELLED", "SKIPPED":
+	case "CANCELLED":
 		return "CANCELLED"
 	default:
 		return "PENDING"

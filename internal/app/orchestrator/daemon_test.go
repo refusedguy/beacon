@@ -227,6 +227,7 @@ func TestDaemonRunRequiresPorts(t *testing.T) {
 type daemonRecordingAdapter struct {
 	calls   int
 	targets []string
+	texts   []string
 }
 
 func (a *daemonRecordingAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
@@ -239,6 +240,7 @@ func (a *daemonRecordingAdapter) Bind(p wake.T210WakePointer, _ *wake.T211Sessio
 func (a *daemonRecordingAdapter) Deliver(p wake.T210WakePointer, target wake.T210Target) (wake.T210Receipt, error) {
 	a.calls++
 	a.targets = append(a.targets, string(target))
+	a.texts = append(a.texts, p.VerdictRef)
 	return wake.T210Receipt{
 		ObligationID: p.ObligationID,
 		Attempt:      p.Attempt,
@@ -304,6 +306,36 @@ func TestDaemonWakerDeliversToSessionSubscriber(t *testing.T) {
 	}
 	if adapter.calls != 1 || !reflect.DeepEqual(adapter.targets, []string{"ses_abc123"}) {
 		t.Fatalf("Deliver calls = %d, targets = %q, want one ses_abc123", adapter.calls, adapter.targets)
+	}
+}
+
+// The wake pointer must tell the subscriber what the verdict asks for: a retry
+// is a rerun, never a hardcoded rebase instruction.
+func TestDaemonWakerTextMatchesVerdict(t *testing.T) {
+	cases := []struct {
+		verdict string
+		want    string
+	}{
+		{"rebase", "нужен rebase"},
+		{VerdictRetry, "gh run rerun --failed"},
+		{"keep_working", "продолжай работу"},
+	}
+	for i, tc := range cases {
+		adapter := &daemonRecordingAdapter{}
+		watchID := fmt.Sprintf("w-text-%d", i)
+		w := daemonTestWaker(DaemonWatch{
+			ID: watchID, PR: 7, Adapter: wake.AdapterOpenCode,
+			SubscriberID: "ses_text",
+		}, adapter)
+		if err := w.Wake(context.Background(), watchID, 1, tc.verdict); err != nil {
+			t.Fatalf("Wake(%s): %v", tc.verdict, err)
+		}
+		if len(adapter.texts) != 1 || !strings.Contains(adapter.texts[0], tc.want) {
+			t.Fatalf("wake text for %s = %q, want it to contain %q", tc.verdict, adapter.texts, tc.want)
+		}
+		if !strings.Contains(adapter.texts[0], tc.verdict) {
+			t.Fatalf("wake text for %s = %q, want the verdict name", tc.verdict, adapter.texts[0])
+		}
 	}
 }
 
@@ -379,7 +411,7 @@ func TestDaemonWakerDeliversForAnotherWatch(t *testing.T) {
 	adapters := wake.T211NewAdapterRegistry()
 	adapters.Register(wake.AdapterOpenCode, adapter)
 	w := &daemonWaker{
-		lookup:   func(id string) (DaemonWatch, error) {
+		lookup: func(id string) (DaemonWatch, error) {
 			view.ID = id
 			return view, nil
 		},
@@ -433,7 +465,7 @@ func TestDaemonWakerRetriesAfterError(t *testing.T) {
 	adapters := wake.T211NewAdapterRegistry()
 	adapters.Register(wake.AdapterOpenCode, adapter)
 	w := &daemonWaker{
-		lookup:   func(string) (DaemonWatch, error) {
+		lookup: func(string) (DaemonWatch, error) {
 			return DaemonWatch{ID: "w-err", PR: 3, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_err"}, nil
 		},
 		adapters: adapters,

@@ -787,8 +787,9 @@ func countActions(actions []Action, kind string) int {
 }
 
 // TestRunBlockedWatchSpawnsFixerOnce proves the blocked branch wins over a
-// stale ready verdict, records exactly one fix attempt and emits the fixer
-// metric. The Watch is never merged or closed on this path.
+// stale ready verdict, emits one fixer decision per pass and persists no fix
+// attempt. The tick must not charge an attempt every three minutes. The Watch
+// is never merged or closed on this path.
 func TestRunBlockedWatchSpawnsFixerOnce(t *testing.T) {
 	metrics := installOrchMetrics(t)
 	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
@@ -799,8 +800,8 @@ func TestRunBlockedWatchSpawnsFixerOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(st.fixAttempts, []string{"w1"}) {
-		t.Fatalf("fix attempts = %q, want [w1]", st.fixAttempts)
+	if len(st.fixAttempts) != 0 {
+		t.Fatalf("periodic pass persisted fix attempts: %q", st.fixAttempts)
 	}
 	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 1)
 	assertOrchCounter(t, metrics, observe.CounterBlocksEscalated, 0)
@@ -844,10 +845,10 @@ func TestRunBlockedWatchEscalatesAtCap(t *testing.T) {
 	}
 }
 
-// TestRunBlockedWatchDoesNotDoubleIncrement proves one decision per pass: two
-// passes over the same block spend exactly one attempt each, and no pass adds
-// a second increment or a second metric.
-func TestRunBlockedWatchDoesNotDoubleIncrement(t *testing.T) {
+// TestRunBlockedWatchReportsOncePerPass proves one decision per pass: two
+// passes over the same block each report one fixer decision and emit one
+// metric, while neither pass charges a fix attempt to the block record.
+func TestRunBlockedWatchReportsOncePerPass(t *testing.T) {
 	metrics := installOrchMetrics(t)
 	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
 	merger := &fakeMerger{}
@@ -859,12 +860,10 @@ func TestRunBlockedWatchDoesNotDoubleIncrement(t *testing.T) {
 	if n := countActions(first.Actions, ActionBlockedFixAgent); n != 1 {
 		t.Fatalf("first pass fix-agent actions = %d, want 1", n)
 	}
-	if !reflect.DeepEqual(st.fixAttempts, []string{"w1"}) {
-		t.Fatalf("first pass fix attempts = %q, want [w1]", st.fixAttempts)
+	if len(st.fixAttempts) != 0 {
+		t.Fatalf("first pass persisted fix attempts: %q", st.fixAttempts)
 	}
 
-	// The store persisted 0 -> 1. The next pass sees the new block record.
-	st.watches[0].Blocked.FixAttempts = 1
 	second, err := Run(context.Background(), st, merger, nil, Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -872,29 +871,32 @@ func TestRunBlockedWatchDoesNotDoubleIncrement(t *testing.T) {
 	if n := countActions(second.Actions, ActionBlockedFixAgent); n != 1 {
 		t.Fatalf("second pass fix-agent actions = %d, want 1", n)
 	}
-	if !reflect.DeepEqual(st.fixAttempts, []string{"w1", "w1"}) {
-		t.Fatalf("fix attempts = %q, want [w1 w1]", st.fixAttempts)
+	if len(st.fixAttempts) != 0 {
+		t.Fatalf("second pass persisted fix attempts: %q", st.fixAttempts)
 	}
 	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 2)
 	assertOrchCounter(t, metrics, observe.CounterBlocksEscalated, 0)
 }
 
-// TestRunBlockedFixAttemptWriteFailureIsReported proves a failed persist is an
-// error and does not emit the fixer metric.
-func TestRunBlockedFixAttemptWriteFailureIsReported(t *testing.T) {
+// TestRunBlockedWatchIgnoresStoreWriteFailure proves the periodic pass no
+// longer writes a fix attempt: a failing store cannot suppress the decision.
+func TestRunBlockedWatchIgnoresStoreWriteFailure(t *testing.T) {
 	metrics := installOrchMetrics(t)
 	st := newFakeStore(blockedWatch("w1", 42, 3, 0))
 	st.fixErr = errors.New("store down")
 
-	_, err := Run(context.Background(), st, nil, nil, Options{})
+	result, err := Run(context.Background(), st, nil, nil, Options{})
 
-	if err == nil || !strings.Contains(err.Error(), "record fix attempt w1") {
-		t.Fatalf("error = %v, want the fix-attempt write error", err)
+	if err != nil {
+		t.Fatalf("periodic pass must not write a fix attempt: %v", err)
 	}
-	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 0)
-	if !reflect.DeepEqual(st.fixAttempts, []string{"w1"}) {
-		t.Fatalf("fix attempts = %q, want one attempted write", st.fixAttempts)
+	if len(st.fixAttempts) != 0 {
+		t.Fatalf("fix attempts = %q, want none", st.fixAttempts)
 	}
+	if n := countActions(result.Actions, ActionBlockedFixAgent); n != 1 {
+		t.Fatalf("fix-agent actions = %d, want 1", n)
+	}
+	assertOrchCounter(t, metrics, observe.CounterFixersSpawned, 1)
 }
 
 // TestRunBlockedDryRunHasNoSideEffects keeps the merge dry-run contract: the
