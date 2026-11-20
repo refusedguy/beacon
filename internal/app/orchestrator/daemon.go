@@ -36,7 +36,9 @@ const DaemonInterval = 3 * time.Minute
 // already merged or closed, but only after Verify passes. CheckAll, Orchestrate
 // and CloseMerged are required. Subscribe, Summary and Verify are optional: a
 // nil port skips that step, and a nil Verify keeps the original close behaviour
-// for older callers. A nil Waker is allowed and simply suppresses wakes.
+// for older callers. A nil Waker is allowed and simply suppresses wakes. Tracer
+// is optional: a nil tracer uses the process tracer from observe.Current, so a
+// caller that wires nothing keeps the no-op default (T3.394).
 type DaemonPorts struct {
 	CheckAll    func(ctx context.Context) error
 	Subscribe   func(ctx context.Context) error
@@ -45,6 +47,7 @@ type DaemonPorts struct {
 	Verify      func(ctx context.Context) (bool, error)
 	CloseMerged func(ctx context.Context) error
 	Waker       Waker
+	Tracer      observe.Tracer
 	Log         func(format string, args ...any)
 }
 
@@ -74,19 +77,28 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 
 	pass := func() {
 		observe.DaemonPass()
-		if err := ports.CheckAll(ctx); err != nil {
+		tracer := ports.Tracer
+		if tracer == nil {
+			tracer = observe.Current()
+		}
+		// One span per pass, not per command: two ticks produce two daemon
+		// spans. The child context carries the span so deeper hooks in the
+		// wake path can nest under it (T3.394).
+		passCtx, end := tracer.Start(ctx, "beacon.daemon.tick")
+		defer end()
+		if err := ports.CheckAll(passCtx); err != nil {
 			logf("daemon: checkall: %v", err)
 		}
 		if ports.Subscribe != nil {
-			if err := ports.Subscribe(ctx); err != nil {
+			if err := ports.Subscribe(passCtx); err != nil {
 				logf("daemon: subscribe: %v", err)
 			}
 		}
-		if err := ports.Orchestrate(ctx, ports.Waker); err != nil {
+		if err := ports.Orchestrate(passCtx, ports.Waker); err != nil {
 			logf("daemon: orchestrate: %v", err)
 		}
 		if ports.Summary != nil {
-			report, err := ports.Summary(ctx)
+			report, err := ports.Summary(passCtx)
 			if err != nil {
 				logf("daemon: summary: %v", err)
 			} else {
@@ -103,7 +115,7 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 		// pass, which closes without a gate.
 		verified := ports.Verify == nil
 		if ports.Verify != nil {
-			ok, err := ports.Verify(ctx)
+			ok, err := ports.Verify(passCtx)
 			switch {
 			case err != nil:
 				logf("daemon: verify: %v", err)
@@ -114,7 +126,7 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 			}
 		}
 		if verified {
-			if err := ports.CloseMerged(ctx); err != nil {
+			if err := ports.CloseMerged(passCtx); err != nil {
 				logf("daemon: close merged: %v", err)
 			}
 		}

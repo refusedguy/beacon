@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // ===== база wake (#281) =====
@@ -1096,5 +1097,75 @@ func TestHistorySearchRejectsEmptyPattern(t *testing.T) {
 	}
 	if _, err := HistorySearch(context.Background(), "transcript.txt", "", runner, 0, 0); err == nil {
 		t.Fatal("empty pattern must fail before any search runs")
+	}
+}
+
+// ===== T3.394: spans inside the delivery loop =====
+
+func TestT210DeliverSpanCarriesIdentifiersOnly(t *testing.T) {
+	rec := &observe.SpanRecorder{}
+	restore := observe.SetTracer(observe.NewTracer(observe.Config{Enabled: true, SpanSink: rec}))
+	defer restore()
+
+	sessions := T211NewSessionRegistry()
+	sessions.Add("bridge-span", "t-1", "ses_1")
+	adapters := T211NewAdapterRegistry()
+	adapters.Register("bridge-span", &t210FakeAdapter{})
+	p := T210WakePointer{
+		Adapter:      "bridge-span",
+		Target:       "t-1",
+		WatchID:      "watch-span",
+		ObligationID: "obl-span",
+		Revision:     4,
+		VerdictRef:   "wake-envelope: verdict=ready watchID=watch-span",
+	}
+	if _, ok := T210Deliver(context.Background(), p, nil, sessions, adapters, nil); !ok {
+		t.Fatal("delivery failed")
+	}
+	spans := rec.Spans()
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want one per delivery", len(spans))
+	}
+	span := spans[0]
+	if span.Name != "beacon.wake.deliver" {
+		t.Fatalf("span name = %q, want beacon.wake.deliver", span.Name)
+	}
+	want := map[string]string{"watchID": "watch-span", "obligation_id": "obl-span"}
+	if len(span.Attrs) != len(want) {
+		t.Fatalf("attrs = %+v, want only watchID and obligation_id", span.Attrs)
+	}
+	for _, at := range span.Attrs {
+		v, ok := want[at.Key]
+		if !ok || v != at.Value {
+			t.Fatalf("attr %s = %q, want %q", at.Key, at.Value, v)
+		}
+		if strings.Contains(at.Value, "wake-envelope") || strings.Contains(at.Key, "wake-envelope") {
+			t.Fatalf("span carries wake-envelope text: %+v", at)
+		}
+	}
+}
+
+func TestT210DeliverSpanOnePerAttemptNoOpDefault(t *testing.T) {
+	rec := &observe.SpanRecorder{}
+	restore := observe.SetTracer(observe.NewTracer(observe.Config{Enabled: true, SpanSink: rec}))
+	defer restore()
+
+	sessions := T211NewSessionRegistry()
+	sessions.Add("bridge-repeat", "t-1", "ses_1")
+	adapters := T211NewAdapterRegistry()
+	adapters.Register("bridge-repeat", &t210FakeAdapter{})
+	p := T210WakePointer{
+		Adapter: "bridge-repeat", Target: "t-1",
+		WatchID: "watch-repeat", ObligationID: "obl-repeat", Revision: 1,
+	}
+	// Two attempts produce two spans: the tree reflects real deliveries, and
+	// the delivery registry still dedups receipts independently of the spans.
+	for i := 0; i < 2; i++ {
+		if _, ok := T210Deliver(context.Background(), p, nil, sessions, adapters, nil); !ok {
+			t.Fatalf("attempt %d failed", i)
+		}
+	}
+	if got := len(rec.Spans()); got != 2 {
+		t.Fatalf("got %d spans for two attempts, want 2", got)
 	}
 }
