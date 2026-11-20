@@ -319,6 +319,18 @@ func (r *BlockedRegistry) Block(watchID string, rec BlockedWatch) (BlockedWatch,
 	return rec, true
 }
 
+// Unblock forgets the local mirror of a block. The SQLite incident is
+// authoritative when a blocker port is installed; without this, a restarted
+// handler could still claim a resolved Watch is blocked.
+func (r *BlockedRegistry) Unblock(watchID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.records, watchID)
+}
+
 // ContinuationRegistry counts human-answer rounds per Watch. A round is
 // consumed only when an ack with continueOf is accepted, and the count never
 // passes domain.MaxContinueRounds (ADR 0031 §3). It is safe for concurrent use.
@@ -382,6 +394,7 @@ type AckHandler struct {
 	continuations *ContinuationRegistry
 	decisions     *DecisionRegistry
 	blocked       *BlockedRegistry
+	blockers      BlockerControl
 }
 
 // NewAckHandler builds a handler. A nil clock falls back to wall time.
@@ -423,6 +436,16 @@ func (h *AckHandler) SetDecisionRegistry(r *DecisionRegistry) {
 func (h *AckHandler) SetBlockedRegistry(r *BlockedRegistry) {
 	if h != nil && r != nil {
 		h.blocked = r
+	}
+}
+
+// SetBlockerControl injects the durable blocker port. With it installed the
+// SQLite incident is the source of truth for block and unblock, so a process
+// restart cannot forget why a Watch was blocked. A nil argument keeps the
+// legacy in-memory behaviour for callers that have not wired the port yet.
+func (h *AckHandler) SetBlockerControl(b BlockerControl) {
+	if h != nil {
+		h.blockers = b
 	}
 }
 
@@ -602,9 +625,10 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 
 // applyBlockedNotMine records a blocked:not_mine classification and blocks the
 // Watch once. The session ID comes from the request _meta and is never taken
-// from the client supplied input. A repeat is an idempotent no-op even when the
-// Watch is already blocked, so neither the block record nor the Watch changes
-// on a second call.
+// from the client supplied input. With a blocker port installed the SQLite
+// incident is authoritative: it dedupes the Watch in BlockedWatchIDs and
+// survives a restart, so the in-memory registry is only a local mirror. A
+// repeat is an idempotent no-op even when the Watch is already blocked.
 func (h *AckHandler) applyBlockedNotMine(in AckInput, w domain.Watch, sessionID string) (BlockedWatch, bool, error) {
 	if sessionID == "" {
 		return BlockedWatch{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: blocked decision requires sessionID from _meta")
@@ -613,41 +637,120 @@ func (h *AckHandler) applyBlockedNotMine(in AckInput, w domain.Watch, sessionID 
 		return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: blocked registry is nil")
 	}
 	failed := collectFailedChecks(w)
+	now := h.clock.Now()
 	rec := BlockedWatch{
 		WatchID:        in.WatchID,
 		Reason:         blockedReasonNotMine,
 		FailedChecks:   failed,
-		Since:          h.clock.Now(),
+		Since:          now,
 		BlockedBy:      sessionID,
 		OrchestratorID: w.OrchestratorID,
 	}
-	rec, applied := h.blocked.Block(in.WatchID, rec)
-	if !applied {
-		return rec, false, nil
-	}
-	// The domain BlockInfo is the authoritative payload: it is persisted on the
-	// Watch so every reader sees the reason, the failed checks, the blocker and
-	// the block time. The in-memory BlockedWatch above only guards idempotency.
 	info := domain.BlockedInfo{
 		Reason:       rec.Reason,
 		FailedChecks: failedCheckNames(failed),
 		Since:        rec.Since,
 		BlockedBy:    rec.BlockedBy,
 	}
-	if err := h.blockWatch(w, info); err != nil {
+
+	alreadyBlocked := w.Status == domain.StatusBlocked || w.Blocked != nil
+	blockerID := ""
+	if h.blockers != nil {
+		// GetOrCreateOpenBlocker appends watchID at most once, so a repeated
+		// ack cannot open a second incident or add a duplicate Watch.
+		incident, _, err := h.blockers.GetOrCreateOpenBlocker(
+			w.Repo, w.BaseRef, info.FailedChecks, in.WatchID, now)
+		if err != nil {
+			observe.ActorError("ack-blocker-open", in.WatchID, err)
+			return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
+		blockerID = incident.ID
+		if alreadyBlocked && w.BlockerID == "" {
+			// A Watch blocked before the port was wired has no incident link.
+			// Attach it without moving the existing block or its revision.
+			linked := w
+			linked.BlockerID = blockerID
+			if writer, ok := h.store.(ackWatchWriter); ok {
+				if err := writer.SaveWatch(linked); err != nil {
+					observe.ActorError("ack-blocker-link", in.WatchID, err)
+					return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+				}
+			}
+		}
+	}
+
+	// The persisted Watch is the durable idempotency signal when SQLite is in
+	// play: a restarted process has an empty in-memory registry but still sees
+	// StatusBlocked on the Watch. Without the port the registry is the only
+	// guard, so keep its applied flag as the legacy behaviour.
+	if h.blockers != nil {
+		rec, _ = h.blocked.Block(in.WatchID, rec)
+		if alreadyBlocked {
+			return rec, false, nil
+		}
+	} else {
+		var applied bool
+		rec, applied = h.blocked.Block(in.WatchID, rec)
+		if !applied {
+			return rec, false, nil
+		}
+	}
+	if err := h.blockWatch(w, info, blockerID); err != nil {
 		return BlockedWatch{}, false, err
 	}
 	observe.BlockEscalated(in.WatchID, blockedReasonNotMine)
+	if blockerID != "" {
+		observe.Event(observe.LevelInfo, "blocker_opened", observe.Fields{
+			"blockerID": blockerID, "watchID": in.WatchID, "repo": w.Repo, "baseRef": w.BaseRef,
+		})
+	}
 	return rec, true, nil
 }
 
-// applyBlockedResolved clears the block on a Watch whose fix was confirmed. It
-// applies the domain UnblockEvent so the Watch returns to watching with a fresh
-// revision and no Blocked info. A Watch that is not blocked is left alone: the
-// domain transition is a no-op for it, so a repeat resolve changes nothing.
-// Unblock touches only lifecycle fields; the fixFor link on the Watch and its
-// subscribers stays in the payload as the history of the repair.
+// applyBlockedResolved clears the block on a Watch whose fix was confirmed.
+// With a blocker port installed it resolves the incident, which returns the
+// Watch and every other Watch attached to it to watching in one transaction.
+// Without the port it applies the domain UnblockEvent to the named Watch only.
+// A Watch that is not blocked is left alone, so a repeat resolve changes
+// nothing. The fixFor link stays in the payload as the history of the repair.
 func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
+	if h.blockers != nil {
+		blockerID := w.BlockerID
+		if blockerID == "" {
+			// A Watch written before the block was linked still carries the
+			// blocked payload; find its open incident by membership.
+			active, err := h.blockers.ActiveBlockers()
+			if err != nil {
+				observe.ActorError("ack-blocker-list", w.ID, err)
+				return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			}
+			for _, incident := range active {
+				for _, id := range incident.BlockedWatchIDs {
+					if id == w.ID {
+						blockerID = incident.ID
+						break
+					}
+				}
+				if blockerID != "" {
+					break
+				}
+			}
+		}
+		if blockerID == "" {
+			return false, nil
+		}
+		unblocked, err := h.blockers.ResolveBlocker(blockerID, h.clock.Now())
+		if err != nil {
+			observe.ActorError("ack-blocker-resolve", w.ID, err)
+			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
+		h.blocked.Unblock(w.ID)
+		observe.Event(observe.LevelInfo, "blocker_resolved", observe.Fields{
+			"blockerID": blockerID, "watchID": w.ID, "watches": len(unblocked),
+		})
+		return len(unblocked) > 0, nil
+	}
+
 	next, effects := domain.Transition(w, domain.UnblockEvent(h.clock.Now()))
 	if next.Status != domain.StatusWatching || next.Verdict != domain.VerdictWatching || next.Blocked != nil {
 		return false, domain.NewAppError(domain.CodeInvalidInput, "ack: unblock requires a blocked Watch")
@@ -666,19 +769,22 @@ func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
 			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
 		}
 	}
+	h.blocked.Unblock(w.ID)
 	return true, nil
 }
 
 // blockWatch applies the domain block transition to the Watch and persists it.
 // Transition fills StatusBlocked, VerdictBlocked and the Blocked info while
 // keeping the Watch identity: blocking changes one task, it never retries or
-// creates a successor. A Watch that is already blocked is a no-op, so neither
-// the revision nor the original block details move.
-func (h *AckHandler) blockWatch(w domain.Watch, info domain.BlockedInfo) error {
+// creates a successor. blockerID links the Watch to the durable incident; it is
+// empty only on the legacy in-memory path. A Watch that is already blocked is a
+// no-op, so neither the revision nor the original block details move.
+func (h *AckHandler) blockWatch(w domain.Watch, info domain.BlockedInfo, blockerID string) error {
 	next, effects := domain.Transition(w, domain.BlockEvent(info, info.Since))
 	if next.Status != domain.StatusBlocked || next.Verdict != domain.VerdictBlocked || next.Blocked == nil {
 		return domain.NewAppError(domain.CodeInvalidInput, "ack: Watch is not live for a block")
 	}
+	next.BlockerID = blockerID
 	if next.Revision == w.Revision {
 		// Already blocked: the domain transition is a no-op, nothing to persist.
 		return nil

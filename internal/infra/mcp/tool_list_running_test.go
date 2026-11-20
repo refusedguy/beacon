@@ -111,6 +111,60 @@ func TestListRunningCountsMatchWatches(t *testing.T) {
 	}
 }
 
+// TestListRunningKeepsBlockedAndOrphanedOnRadar proves a blocked Watch in
+// LiveWatches is never dropped just because it left ActiveWatches. The compact
+// events carry the blocker link and every subscriber phase.
+func TestListRunningKeepsBlockedAndOrphanedOnRadar(t *testing.T) {
+	blocked := domain.Watch{
+		ID:        "watch-blocked",
+		Status:    domain.StatusBlocked,
+		Verdict:   domain.VerdictBlocked,
+		BlockerID: "blk_main_red",
+		Blocked:   &domain.BlockedInfo{Reason: "not_mine", FailedChecks: []string{"ci/test"}},
+		Subscribers: []domain.Subscriber{
+			{ID: "ses_orphan", Role: domain.RoleExecutor, Phase: domain.WorkerPhaseOrphaned},
+			{ID: "ses_fixer", Role: domain.RoleFixer, Phase: domain.WorkerPhaseBlocked},
+		},
+	}
+	snap := sampleSnapshot()
+	snap.ActiveWatches = []domain.Watch{sampleWatch("w1", domain.VerdictReady, 0)}
+	snap.LiveWatches = append(append([]domain.Watch(nil), snap.ActiveWatches...), blocked)
+
+	out := callListRunning(t, NewListRunningHandler(&snapshotReaderFake{snap: snap}), ListRunningInput{})
+
+	if out.Counts.Watches != 2 {
+		t.Fatalf("counts.watches = %d, want 2 (blocked Watch must stay on radar)", out.Counts.Watches)
+	}
+	var found *domain.Watch
+	for i := range out.Watches {
+		if out.Watches[i].ID == blocked.ID {
+			found = &out.Watches[i]
+		}
+	}
+	if found == nil {
+		t.Fatal("blocked Watch missing from watches")
+	}
+	if found.Status != domain.StatusBlocked || found.BlockerID != "blk_main_red" || found.Blocked == nil {
+		t.Errorf("blocked Watch projection = %+v", found)
+	}
+	var event *WatchEvent
+	for i := range out.Events {
+		if out.Events[i].WatchID == blocked.ID {
+			event = &out.Events[i]
+		}
+	}
+	if event == nil {
+		t.Fatal("blocked Watch missing from events")
+	}
+	if !event.Blocked || event.BlockerID != "blk_main_red" {
+		t.Errorf("blocked event = %+v", event)
+	}
+	wantPhases := map[string]string{"ses_orphan": "orphaned", "ses_fixer": "blocked"}
+	if !reflect.DeepEqual(event.Phases, wantPhases) {
+		t.Errorf("event phases = %v, want %v", event.Phases, wantPhases)
+	}
+}
+
 func TestListRunningFiltersKeepCountsConsistent(t *testing.T) {
 	reader := &snapshotReaderFake{snap: sampleSnapshot()}
 	handler := NewListRunningHandler(reader)

@@ -1328,3 +1328,39 @@ func TestTasksGetWireShapeMatchesSchema(t *testing.T) {
 		t.Errorf("completed tasks/get has no result field: %s", gotRaw)
 	}
 }
+
+// TestNextStepForVerdicts pins the self-teaching contract: the four wake
+// verdicts map to their action and command, every other verdict stays in the
+// wait family so an agent never invents a command from prose.
+func TestNextStepForVerdicts(t *testing.T) {
+	cases := []struct {
+		verdict domain.Verdict
+		action  string
+		command string
+	}{
+		{domain.VerdictKeepWorking, NextActionKeepWorking, ""},
+		{domain.VerdictRebase, NextActionRebase, RebaseCommand},
+		{domain.VerdictRetry, NextActionRetry, RetryCommand},
+		{domain.VerdictBlocked, NextActionBlocked, ""},
+		{domain.VerdictReady, NextActionWait, ""},
+		{domain.VerdictWatching, NextActionWait, ""},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.verdict), func(t *testing.T) {
+			action, command, hint := nextStepFor(tc.verdict)
+			if action != tc.action || command != tc.command {
+				t.Errorf("nextStepFor(%s) = %q/%q, want %q/%q", tc.verdict, action, command, tc.command)
+			}
+			if strings.TrimSpace(hint) == "" {
+				t.Error("nextStepFor returned an empty hint")
+			}
+		})
+	}
+	if !strings.Contains(RebaseCommand, "git rebase origin/main") ||
+		!strings.Contains(RebaseCommand, "git push --force-with-lease") {
+		t.Errorf("rebase command is incomplete: %q", RebaseCommand)
+	}
+	if RetryCommand != "gh run rerun --failed" {
+		t.Errorf("retry command = %q", RetryCommand)
+	}
+}

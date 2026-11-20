@@ -142,7 +142,7 @@ func watchPRTestInput(head string, role domain.Role) WatchPRInput {
 		PR:      7,
 		HeadSHA: head,
 		Role:    role,
-		Notify:  &WatchPRNotify{Adapter: "opencode", Target: "delivery-target"},
+		Notify:  &WatchPRNotify{Adapter: "opencode", Target: "ses_delivery-target"},
 	}
 }
 
@@ -177,7 +177,7 @@ func TestWatchPRInputSchemaHasExecutorDescriptor(t *testing.T) {
 // fields at the MCP boundary under their wire names.
 func TestWatchPRExecutorJSONFields(t *testing.T) {
 	var in WatchPRInput
-	raw := `{"executor":{"id":"exec-1","role":"executor","runtime":"subagent",` +
+	raw := `{"executor":{"id":"ses_exec-1","role":"executor","runtime":"subagent",` +
 		`"agent":"build","capabilities":["watch","ci-retry"],"configId":"cfg-1"}}`
 	if err := json.Unmarshal([]byte(raw), &in); err != nil {
 		t.Fatalf("decode watch_pr input: %v", err)
@@ -186,7 +186,7 @@ func TestWatchPRExecutorJSONFields(t *testing.T) {
 		t.Fatal("executor descriptor was not decoded")
 	}
 	want := &WatchPRExecutor{
-		ID: "exec-1", Role: "executor", Runtime: "subagent", Agent: "build",
+		ID: "ses_exec-1", Role: "executor", Runtime: "subagent", Agent: "build",
 		Capabilities: []string{"watch", "ci-retry"}, ConfigID: "cfg-1",
 	}
 	if !reflect.DeepEqual(in.Executor, want) {
@@ -200,7 +200,7 @@ func TestWatchPRExecutorJSONFields(t *testing.T) {
 func TestWatchPRExecutorIsOptional(t *testing.T) {
 	store := newMemStore()
 	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
-	req := sessionReq("session-optional")
+	req := sessionReq("ses_session-optional")
 
 	without, err := h.Register(context.Background(), req, watchPRTestInput("optional-sha", domain.RoleExecutor))
 	if err != nil {
@@ -208,7 +208,7 @@ func TestWatchPRExecutorIsOptional(t *testing.T) {
 	}
 	in := watchPRTestInput("optional-sha-2", domain.RoleExecutor)
 	in.Executor = &WatchPRExecutor{
-		ID: "exec-1", Role: "executor", Runtime: "subagent", Agent: "build",
+		ID: "ses_exec-1", Role: "executor", Runtime: "subagent", Agent: "build",
 		Capabilities: []string{"watch", "read-verdict"}, ConfigID: "cfg-1",
 	}
 	with, err := h.Register(context.Background(), req, in)
@@ -237,8 +237,8 @@ func TestWatchPRExecutorAgentNameIsOpaque(t *testing.T) {
 	store := newMemStore()
 	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
 	in := watchPRTestInput("opaque-sha", domain.RoleExecutor)
-	in.Executor = &WatchPRExecutor{ID: "exec-1", Role: "executor", Agent: "build"}
-	req := sessionReq("session-opaque")
+	in.Executor = &WatchPRExecutor{ID: "ses_exec-1", Role: "executor", Agent: "build"}
+	req := sessionReq("ses_session-opaque")
 
 	first, err := h.Register(context.Background(), req, in)
 	if err != nil {
@@ -260,7 +260,7 @@ func TestWatchPRExecutorAgentNameIsOpaque(t *testing.T) {
 	if len(all) != 1 {
 		t.Fatalf("got %d watches, want 1", len(all))
 	}
-	if len(all[0].Subscribers) != 1 || all[0].Subscribers[0].ID != "session-opaque" {
+	if len(all[0].Subscribers) != 1 || all[0].Subscribers[0].ID != "ses_session-opaque" {
 		t.Fatalf("agent name changed subscriber identity: %+v", all[0].Subscribers)
 	}
 }
@@ -271,7 +271,7 @@ func TestWatchPRIdempotentRenew(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)}
 	store := newMemStore()
 	h := NewWatchPRHandler(store, nil, clock)
-	req := sessionReq("session-A")
+	req := sessionReq("ses_session-A")
 	in := watchPRTestInput("aaa111", domain.RoleExecutor)
 
 	first, err := h.Register(context.Background(), req, in)
@@ -311,13 +311,13 @@ func TestWatchPRIdempotentRenew(t *testing.T) {
 		t.Fatalf("got %d subscribers, want 1", len(all[0].Subscribers))
 	}
 	sub := all[0].Subscribers[0]
-	if sub.ID != "session-A" || sub.Role != domain.RoleExecutor {
+	if sub.ID != "ses_session-A" || sub.Role != domain.RoleExecutor {
 		t.Errorf("unexpected subscriber: %+v", sub)
 	}
 	if !sub.LastActivity.Equal(clock.t) {
 		t.Errorf("LastActivity = %v, want renewed %v", sub.LastActivity, clock.t)
 	}
-	if sub.Adapter != "opencode" || sub.Target != "delivery-target" {
+	if sub.Adapter != "opencode" || sub.Target != "ses_delivery-target" {
 		t.Errorf("notify endpoint not stored: %+v", sub)
 	}
 }
@@ -329,11 +329,11 @@ func TestWatchPRFanout(t *testing.T) {
 	store := newMemStore()
 	h := NewWatchPRHandler(store, nil, clock)
 
-	execOut, err := h.Register(context.Background(), sessionReq("exec-1"), watchPRTestInput("bbb222", domain.RoleExecutor))
+	execOut, err := h.Register(context.Background(), sessionReq("ses_exec-1"), watchPRTestInput("bbb222", domain.RoleExecutor))
 	if err != nil {
 		t.Fatalf("executor Register: %v", err)
 	}
-	orchOut, err := h.Register(context.Background(), sessionReq("orch-1"), watchPRTestInput("bbb222", domain.RoleOrchestrator))
+	orchOut, err := h.Register(context.Background(), sessionReq("ses_orch-1"), watchPRTestInput("bbb222", domain.RoleOrchestrator))
 	if err != nil {
 		t.Fatalf("orchestrator Register: %v", err)
 	}
@@ -356,7 +356,7 @@ func TestWatchPRFanout(t *testing.T) {
 	for _, s := range all[0].Subscribers {
 		roles[s.Role] = s.ID
 	}
-	if roles[domain.RoleExecutor] != "exec-1" || roles[domain.RoleOrchestrator] != "orch-1" {
+	if roles[domain.RoleExecutor] != "ses_exec-1" || roles[domain.RoleOrchestrator] != "ses_orch-1" {
 		t.Errorf("unexpected role mapping: %+v", roles)
 	}
 
@@ -377,8 +377,8 @@ func TestWatchPRFanout(t *testing.T) {
 	if len(ids) != 2 {
 		t.Errorf("got %d obligations for the Watch, want 2", len(ids))
 	}
-	wantExec := domain.ObligationKey(execOut.WatchID, execOut.Revision, "exec-1")
-	wantOrch := domain.ObligationKey(execOut.WatchID, orchOut.Revision, "orch-1")
+	wantExec := domain.ObligationKey(execOut.WatchID, execOut.Revision, "ses_exec-1")
+	wantOrch := domain.ObligationKey(execOut.WatchID, orchOut.Revision, "ses_orch-1")
 	if !ids[wantExec] || !ids[wantOrch] {
 		t.Errorf("missing independent obligations: have %v, want %q and %q", ids, wantExec, wantOrch)
 	}
@@ -390,7 +390,7 @@ func TestWatchPRHeadChanged(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)}
 	store := newMemStore()
 	h := NewWatchPRHandler(store, nil, clock)
-	req := sessionReq("session-H")
+	req := sessionReq("ses_session-H")
 
 	old, err := h.Register(context.Background(), req, watchPRTestInput("old-head", domain.RoleExecutor))
 	if err != nil {
@@ -428,7 +428,7 @@ func TestWatchPRHeadChanged(t *testing.T) {
 	if newWatch.HeadSHA != "new-head" {
 		t.Errorf("successor headSHA = %q, want new-head", newWatch.HeadSHA)
 	}
-	if len(newWatch.Subscribers) != 1 || newWatch.Subscribers[0].ID != "session-H" {
+	if len(newWatch.Subscribers) != 1 || newWatch.Subscribers[0].ID != "ses_session-H" {
 		t.Errorf("subscribers not carried over: %+v", newWatch.Subscribers)
 	}
 
@@ -448,7 +448,7 @@ func TestWatchPRResolvesHeadSHA(t *testing.T) {
 	h := NewWatchPRHandler(store, ci, &stepClock{t: time.Now()})
 	in := watchPRTestInput("", domain.RoleExecutor)
 
-	out, err := h.Register(context.Background(), sessionReq("session-R"), in)
+	out, err := h.Register(context.Background(), sessionReq("ses_session-R"), in)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestWatchPRMergePolicyDefault(t *testing.T) {
 	store := newMemStore()
 	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
 
-	out, err := h.Register(context.Background(), sessionReq("merge-default"), watchPRTestInput("merge-default-sha", domain.RoleExecutor))
+	out, err := h.Register(context.Background(), sessionReq("ses_merge-default"), watchPRTestInput("merge-default-sha", domain.RoleExecutor))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -489,7 +489,7 @@ func TestWatchPRPolicyWithoutMergeKeepsDefault(t *testing.T) {
 	in := watchPRTestInput("policy-no-merge-sha", domain.RoleExecutor)
 	in.Policy = &WatchPRPolicy{RequireUpToDate: true, IgnoreReviews: true}
 
-	out, err := h.Register(context.Background(), sessionReq("policy-no-merge"), in)
+	out, err := h.Register(context.Background(), sessionReq("ses_policy-no-merge"), in)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -532,7 +532,7 @@ func TestWatchPRMergePolicyConditions(t *testing.T) {
 			in := watchPRTestInput("merge-conditions-sha", domain.RoleExecutor)
 			in.Policy = &WatchPRPolicy{Merge: tc.merge}
 
-			out, err := h.Register(context.Background(), sessionReq("merge-conditions"), in)
+			out, err := h.Register(context.Background(), sessionReq("ses_merge-conditions"), in)
 			if err != nil {
 				t.Fatalf("Register: %v", err)
 			}
@@ -556,7 +556,7 @@ func TestWatchPRMergePolicyCopiesInput(t *testing.T) {
 	merge := &WatchPRMergePolicy{WaitFor: []string{"pr/1"}, WaitForMain: []string{"task/main"}}
 	in.Policy = &WatchPRPolicy{Merge: merge}
 
-	out, err := h.Register(context.Background(), sessionReq("merge-copy"), in)
+	out, err := h.Register(context.Background(), sessionReq("ses_merge-copy"), in)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -585,7 +585,7 @@ func TestWatchPRSubscriberIdentity(t *testing.T) {
 
 	in := WatchPRInput{
 		Repo: "o/r", PR: 1, Role: domain.RoleExecutor, HeadSHA: "sha",
-		Notify: &WatchPRNotify{Adapter: "opencode", Target: "fallback-target"},
+		Notify: &WatchPRNotify{Adapter: "opencode", Target: "ses_fallback-target"},
 	}
 	out, err := h.Register(context.Background(), nil, in)
 	if err != nil {
@@ -595,15 +595,34 @@ func TestWatchPRSubscriberIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
-	if len(w.Subscribers) != 1 || w.Subscribers[0].ID != "fallback-target" {
+	if len(w.Subscribers) != 1 || w.Subscribers[0].ID != "ses_fallback-target" {
 		t.Errorf("subscriber ID = %+v, want fallback-target", w.Subscribers)
 	}
+}
+
+// TestWatchPRRejectsNonSessionSubscriber proves an executor cannot register
+// under a card id or an empty address: neither can receive a wake pointer.
+func TestWatchPRRejectsNonSessionSubscriber(t *testing.T) {
+	h := NewWatchPRHandler(newMemStore(), nil, &stepClock{t: time.Now()})
+	for _, target := range []string{"", "<BS.42>", "card-123"} {
+		in := WatchPRInput{
+			Repo: "o/r", PR: 1, HeadSHA: "non-session-sha", Role: domain.RoleExecutor,
+			Notify: &WatchPRNotify{Adapter: "opencode", Target: target},
+		}
+		_, err := h.Register(context.Background(), nil, in)
+		assertCode(t, err, domain.CodeInvalidInput)
+	}
+	// The final identity comes from _meta first, so a bad meta value is refused
+	// even when notify.target happens to be a real session.
+	in := watchPRTestInput("bad-meta-sha", domain.RoleExecutor)
+	_, err := h.Register(context.Background(), sessionReq("card-9"), in)
+	assertCode(t, err, domain.CodeInvalidInput)
 }
 
 // TestWatchPRRejectsInvalidRole covers input validation before any mutation.
 func TestWatchPRRejectsInvalidRole(t *testing.T) {
 	h := NewWatchPRHandler(newMemStore(), nil, &stepClock{t: time.Now()})
-	_, err := h.Register(context.Background(), sessionReq("s"), WatchPRInput{
+	_, err := h.Register(context.Background(), sessionReq("ses_s"), WatchPRInput{
 		Repo: "o/r", PR: 1, HeadSHA: "sha", Role: domain.Role("untrusted"),
 	})
 	assertCode(t, err, domain.CodeInvalidInput)
@@ -682,7 +701,7 @@ func TestWatchPRDrivesTwoBridges(t *testing.T) {
 	beta := &recordingBridge{name: "beta"}
 	h := NewWatchPRHandler(store, nil, clock).WithBridges(alpha, beta)
 
-	out, err := h.Register(context.Background(), sessionReq("session-2bridges"), watchPRTestInput("bridge-sha", domain.RoleExecutor))
+	out, err := h.Register(context.Background(), sessionReq("ses_session-2bridges"), watchPRTestInput("bridge-sha", domain.RoleExecutor))
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -705,7 +724,7 @@ func TestWatchPRDrivesTwoBridges(t *testing.T) {
 		if req.Repo != "refusedguy/beacon" || req.PR != 7 || req.HeadSHA != "bridge-sha" {
 			t.Errorf("bridge %s: unexpected request %+v", b.name, req)
 		}
-		if req.SubscriberID != "session-2bridges" {
+		if req.SubscriberID != "ses_session-2bridges" {
 			t.Errorf("bridge %s: subscriberID = %q, want session-2bridges", b.name, req.SubscriberID)
 		}
 	}
@@ -907,7 +926,7 @@ func TestRegistrySessionIDUsesMetaThenTarget(t *testing.T) {
 		fallback string
 		want     string
 	}{
-		{"meta wins over target", sessionReq("session-A"), "target-A", "session-A"},
+		{"meta wins over target", sessionReq("ses_session-A"), "target-A", "ses_session-A"},
 		{"no meta falls back to target", nil, "target-B", "target-B"},
 		{"empty meta value falls back", sessionReq(""), "target-C", "target-C"},
 		{"no meta and no target", nil, "", ""},
@@ -929,11 +948,11 @@ func TestWatchSessionRegistryDifferentSessions(t *testing.T) {
 	in := watchPRTestInput("bind-sha", domain.RoleExecutor)
 	out := WatchPROutput{WatchID: "watch-1", Revision: 1}
 
-	first, created, err := reg.BindWatchPR(sessionReq("session-A"), in, out)
+	first, created, err := reg.BindWatchPR(sessionReq("ses_session-A"), in, out)
 	if err != nil || !created {
 		t.Fatalf("first BindWatchPR: created=%v err=%v", created, err)
 	}
-	second, created, err := reg.BindWatchPR(sessionReq("session-B"), in, out)
+	second, created, err := reg.BindWatchPR(sessionReq("ses_session-B"), in, out)
 	if err != nil || !created {
 		t.Fatalf("second BindWatchPR: created=%v err=%v", created, err)
 	}
@@ -941,14 +960,14 @@ func TestWatchSessionRegistryDifferentSessions(t *testing.T) {
 	if reg.Len() != 2 {
 		t.Fatalf("registry entries = %d, want 2", reg.Len())
 	}
-	if first.SessionID != "session-A" || second.SessionID != "session-B" {
+	if first.SessionID != "ses_session-A" || second.SessionID != "ses_session-B" {
 		t.Fatalf("session IDs = %q, %q; want session-A, session-B", first.SessionID, second.SessionID)
 	}
 	snap := reg.Snapshot()
-	if _, ok := snap["session-A"]; !ok {
+	if _, ok := snap["ses_session-A"]; !ok {
 		t.Error("no entry keyed by session-A")
 	}
-	if _, ok := snap["session-B"]; !ok {
+	if _, ok := snap["ses_session-B"]; !ok {
 		t.Error("no entry keyed by session-B")
 	}
 	if _, ok := snap[in.Notify.Adapter]; ok {
@@ -984,11 +1003,11 @@ func TestWatchSessionRegistryIdempotentAndRebinding(t *testing.T) {
 	reg := NewWatchSessionRegistry()
 	in := watchPRTestInput("rebind-sha", domain.RoleExecutor)
 
-	first, created, err := reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 1})
+	first, created, err := reg.BindWatchPR(sessionReq("ses_session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 1})
 	if err != nil || !created {
 		t.Fatalf("first BindWatchPR: created=%v err=%v", created, err)
 	}
-	again, created, err := reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 1})
+	again, created, err := reg.BindWatchPR(sessionReq("ses_session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 1})
 	if err != nil {
 		t.Fatalf("repeat BindWatchPR: %v", err)
 	}
@@ -1002,14 +1021,14 @@ func TestWatchSessionRegistryIdempotentAndRebinding(t *testing.T) {
 		t.Fatalf("entries after repeat = %d, want 1", reg.Len())
 	}
 
-	next, created, err := reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 2})
+	next, created, err := reg.BindWatchPR(sessionReq("ses_session-A"), in, WatchPROutput{WatchID: "watch-1", Revision: 2})
 	if err != nil || !created {
 		t.Fatalf("rebind: created=%v err=%v", created, err)
 	}
 	if next.Revision != 2 || reg.Len() != 1 {
 		t.Fatalf("rebind gave revision=%d entries=%d; want 2, 1", next.Revision, reg.Len())
 	}
-	if stored, ok := reg.Lookup("session-A"); !ok || stored.Revision != 2 {
+	if stored, ok := reg.Lookup("ses_session-A"); !ok || stored.Revision != 2 {
 		t.Errorf("stored binding after rebind = %+v, ok=%v", stored, ok)
 	}
 }
@@ -1025,7 +1044,7 @@ func TestWatchSessionRegistryRejectsMissingAddress(t *testing.T) {
 		t.Errorf("failed bind wrote %d entries, want 0", reg.Len())
 	}
 
-	_, _, err = reg.BindWatchPR(sessionReq("session-A"), in, WatchPROutput{})
+	_, _, err = reg.BindWatchPR(sessionReq("ses_session-A"), in, WatchPROutput{})
 	assertCode(t, err, domain.CodeInvalidInput)
 	if reg.Len() != 0 {
 		t.Errorf("empty watchID wrote %d entries, want 0", reg.Len())
@@ -1040,8 +1059,8 @@ func TestRegisterAndBindLinksWatchToSession(t *testing.T) {
 		req  *mcpsdk.CallToolRequest
 		key  string
 	}{
-		{"with session meta", sessionReq("session-X"), "session-X"},
-		{"without session meta", nil, "delivery-target"},
+		{"with session meta", sessionReq("ses_session-X"), "ses_session-X"},
+		{"without session meta", nil, "ses_delivery-target"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := NewWatchSessionRegistry()
@@ -1067,10 +1086,10 @@ func TestRegisterAndBindFailsOnRegistryError(t *testing.T) {
 	h := NewWatchPRHandler(newMemStore(), nil, &stepClock{t: time.Now()})
 	in := watchPRTestInput("fail-sha", domain.RoleExecutor)
 	in.Notify = nil
-	_, err := RegisterAndBind(context.Background(), h, nil, sessionReq("session-X"), in)
+	_, err := RegisterAndBind(context.Background(), h, nil, sessionReq("ses_session-X"), in)
 	assertCode(t, err, domain.CodePersistFailed)
 
-	_, err = RegisterAndBind(context.Background(), nil, NewWatchSessionRegistry(), sessionReq("session-X"), in)
+	_, err = RegisterAndBind(context.Background(), nil, NewWatchSessionRegistry(), sessionReq("ses_session-X"), in)
 	assertCode(t, err, domain.CodePersistFailed)
 }
 

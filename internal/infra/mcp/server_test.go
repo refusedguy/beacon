@@ -432,7 +432,7 @@ func TestToolsCallWithRealStore(t *testing.T) {
 			"pr":      42,
 			"headSHA": "w44-head",
 			"role":    string(domain.RoleExecutor),
-			"notify":  map[string]any{"adapter": "opencode", "target": "w44-session"},
+			"notify":  map[string]any{"adapter": "opencode", "target": "ses_w44-session"},
 		},
 	})
 	if err != nil {
@@ -454,7 +454,7 @@ func TestToolsCallWithRealStore(t *testing.T) {
 	if len(watches) != 1 || watches[0].ID != out.WatchID {
 		t.Fatalf("store holds %d watches (%v), want one with id %q", len(watches), watches, out.WatchID)
 	}
-	obligationID := domain.ObligationKey(out.WatchID, out.Revision, "w44-session")
+	obligationID := domain.ObligationKey(out.WatchID, out.Revision, "ses_w44-session")
 	if _, err := db.Obligation(obligationID); err != nil {
 		t.Fatalf("stored obligation %q: %v", obligationID, err)
 	}
@@ -528,7 +528,7 @@ func TestSchemaErrorKeepsRealHandlers(t *testing.T) {
 			"pr":      42,
 			"headSHA": "t359-head",
 			"role":    string(domain.RoleExecutor),
-			"notify":  map[string]any{"adapter": "opencode", "target": "t359-session"},
+			"notify":  map[string]any{"adapter": "opencode", "target": "ses_t359-session"},
 		},
 	})
 	if err != nil {

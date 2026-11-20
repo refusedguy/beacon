@@ -16,6 +16,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // RegistryEntry is one read-only row of the agent registry carried by a
@@ -43,7 +44,13 @@ const (
 // observability tools. A SnapshotReader produces it. No field is sourced from
 // a write path, so the tools only project what was already persisted.
 type StateSnapshot struct {
+	// ActiveWatches holds watches in watching or notifying status. Kept for
+	// readers built before blocked watches had a dedicated field.
 	ActiveWatches []domain.Watch
+	// LiveWatches adds blocked watches to ActiveWatches. The wiring layer fills
+	// it from the store's LiveWatches so a blocked Watch never drops off the
+	// radar. A snapshot without it falls back to ActiveWatches.
+	LiveWatches []domain.Watch
 	// Sessions carries the disk signals used to decide session liveness
 	// without probing processes (ADR 0036 §4). The wiring layer fills it when
 	// session artifacts and recorded PIDs are available; a snapshot without
@@ -62,6 +69,16 @@ type StateSnapshot struct {
 	// registry state is available. A snapshot without entries keeps the exact
 	// previous output of both tools.
 	Registry []RegistryEntry
+}
+
+// RadarWatches returns every Watch the observability tools must show. It
+// prefers LiveWatches, which includes blocked watches, and falls back to the
+// legacy ActiveWatches field for a reader that has not been upgraded yet.
+func (s StateSnapshot) RadarWatches() []domain.Watch {
+	if len(s.LiveWatches) > 0 {
+		return s.LiveWatches
+	}
+	return s.ActiveWatches
 }
 
 // RegisteredAgents returns the number of registry rows in the snapshot.
@@ -480,6 +497,22 @@ func aggregateStatus(events []WatchEvent) string {
 	return status
 }
 
+// subscriberPhases projects the per-subscriber worker phase of one Watch into
+// a machine-readable map. An unset phase is reported as waiting: a subscriber
+// with no recorded obligation is not doing work yet, and fail-closed here
+// keeps a fresh Watch from disappearing from the radar.
+func subscriberPhases(w domain.Watch) map[string]string {
+	phases := make(map[string]string, len(w.Subscribers))
+	for _, sub := range w.Subscribers {
+		phase := sub.Phase
+		if !phase.Valid() {
+			phase = domain.WorkerPhaseWaiting
+		}
+		phases[sub.ID] = string(phase)
+	}
+	return phases
+}
+
 // Handle reads a snapshot and projects it onto counts, a watch array and a
 // cursor-delimited event stream. Every counter is derived from the returned
 // array, so counts stay consistent with watches for any filter. With an empty
@@ -493,16 +526,18 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 
 	snap, err := h.reader.Snapshot()
 	if err != nil {
+		observe.ActorError("beacon_list_running", "", err)
 		return nil, ListRunningOutput{}, fmt.Errorf("beacon_list_running: %w", err)
 	}
 
+	radar := snap.RadarWatches()
 	sessions := make(map[string]SessionLiveness, len(snap.Sessions))
 	for _, s := range snap.Sessions {
 		sessions[s.SessionID] = s
 	}
 
-	watches := make([]domain.Watch, 0, len(snap.ActiveWatches))
-	for _, w := range snap.ActiveWatches {
+	watches := make([]domain.Watch, 0, len(radar))
+	for _, w := range radar {
 		if in.Filters != nil && !in.Filters.matches(w) {
 			continue
 		}
@@ -520,14 +555,17 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 	// Events are a position-indexed view over the snapshot. Seq is the 1-based
 	// position, so a cursor stays opaque to clients yet stable within one
 	// stream. No event history is stored between calls.
-	events := make([]WatchEvent, 0, len(snap.ActiveWatches))
+	events := make([]WatchEvent, 0, len(radar))
 	terminalStatus, terminalVerdict := "", ""
-	for i, w := range snap.ActiveWatches {
+	for i, w := range radar {
 		ev := WatchEvent{
-			Seq:     uint64(i + 1),
-			WatchID: w.ID,
-			Status:  string(effectiveStatus(w, sessions)),
-			Verdict: string(w.Verdict),
+			Seq:       uint64(i + 1),
+			WatchID:   w.ID,
+			Status:    string(effectiveStatus(w, sessions)),
+			Verdict:   string(w.Verdict),
+			BlockerID: w.BlockerID,
+			Blocked:   w.Status == domain.StatusBlocked || w.Blocked != nil,
+			Phases:    subscriberPhases(w),
 		}
 		events = append(events, ev)
 		if terminalVerdict == "" && w.Status == domain.StatusClosed {
