@@ -377,3 +377,78 @@ func (a *daemonWakeAdapter) Deliver(p wake.T210WakePointer, target wake.T210Targ
 	receipt.Outcome = wake.T210Delivered
 	return receipt, nil
 }
+
+// ---------------------------------------------------------------------------
+// Findings validation (HD-043, ADR 0301)
+// ---------------------------------------------------------------------------
+
+// Finding is one code-review finding reduced to primitive fields so this
+// validator stays in app and imports no domain type (ADR 0005 layer matrix).
+// File is the cited path and Evidence is a verbatim quote from the reviewed
+// diff. Harbor's +check drops a finding when its citation exists neither in
+// the diff nor on disk; Beacon applies the same test against the diff here.
+type Finding struct {
+	ID       string
+	Severity string
+	File     string
+	Evidence string
+	Summary  string
+}
+
+// FindingDrop pairs a removed finding with the reason it was removed.
+type FindingDrop struct {
+	Finding Finding
+	Reason  string
+}
+
+// FindingValidation is the outcome of one validation pass. Kept holds the
+// findings that survive, in their original order. Dropped holds every removed
+// finding with its reason so the caller can render a filter summary.
+type FindingValidation struct {
+	Kept    []Finding
+	Dropped []FindingDrop
+}
+
+// The reasons a finding is removed. A finding with neither File nor Evidence
+// cannot be checked at all. One whose citations are absent from the diff is
+// invented.
+const (
+	FindingDropNoCitation = "finding cites neither a file nor evidence"
+	FindingDropNotInDiff  = "cited file or evidence is absent from the reviewed diff"
+)
+
+// ValidateFindings separates findings grounded in the reviewed diff from
+// invented ones before they reach any output. A finding is kept when either
+// its File path or its Evidence quote appears in diff. A finding with no
+// citation, or one whose citations are missing from diff, is dropped with a
+// reason. The function is pure and reads no filesystem, so a change that lives
+// only in the diff still validates. A finding about unchanged surrounding code
+// needs that code supplied in diff to survive.
+func ValidateFindings(findings []Finding, diff string) FindingValidation {
+	result := FindingValidation{
+		Kept:    make([]Finding, 0, len(findings)),
+		Dropped: make([]FindingDrop, 0),
+	}
+	for _, f := range findings {
+		if reason := findingDropReason(f, diff); reason != "" {
+			result.Dropped = append(result.Dropped, FindingDrop{Finding: f, Reason: reason})
+			continue
+		}
+		result.Kept = append(result.Kept, f)
+	}
+	return result
+}
+
+// findingDropReason returns why f must be dropped, or empty when it is kept.
+func findingDropReason(f Finding, diff string) string {
+	file := strings.TrimSpace(f.File)
+	evidence := strings.TrimSpace(f.Evidence)
+	if file == "" && evidence == "" {
+		return FindingDropNoCitation
+	}
+	if (file != "" && strings.Contains(diff, file)) ||
+		(evidence != "" && strings.Contains(diff, evidence)) {
+		return ""
+	}
+	return FindingDropNotInDiff
+}

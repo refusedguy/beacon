@@ -964,3 +964,111 @@ func TestDaemonWakerNeverDeliversToOrchestrator(t *testing.T) {
 		t.Fatalf("logs = %q, want exactly one line", logs)
 	}
 }
+
+// TestValidateFindingsKeepsFindingCitedInDiff: a finding whose cited file and
+// evidence both appear in the reviewed diff is real and must survive.
+func TestValidateFindingsKeepsFindingCitedInDiff(t *testing.T) {
+	diff := "--- a/internal/app/orchestrator/daemon.go\n+func ValidateFindings(findings []Finding, diff string) FindingValidation {"
+	f := Finding{
+		ID:       "f-valid",
+		Severity: "critical",
+		File:     "internal/app/orchestrator/daemon.go",
+		Evidence: "func ValidateFindings(findings []Finding, diff string) FindingValidation {",
+		Summary:  "validator returns a filter summary",
+	}
+
+	v := ValidateFindings([]Finding{f}, diff)
+	if len(v.Kept) != 1 || v.Kept[0] != f {
+		t.Fatalf("kept = %+v, want the single cited finding", v.Kept)
+	}
+	if len(v.Dropped) != 0 {
+		t.Fatalf("dropped = %+v, want none for a cited finding", v.Dropped)
+	}
+}
+
+// TestValidateFindingsDropsInventedFinding: a finding whose citations are
+// absent from the diff is fabricated and must be dropped with a reason.
+func TestValidateFindingsDropsInventedFinding(t *testing.T) {
+	f := Finding{ID: "f-invented", File: "does/not/exist.go", Evidence: "func nonexistent()", Summary: "invented issue"}
+	diff := "--- a/real.go\n+package real"
+
+	v := ValidateFindings([]Finding{f}, diff)
+	if len(v.Kept) != 0 {
+		t.Fatalf("kept = %+v, want an invented finding to be removed", v.Kept)
+	}
+	if len(v.Dropped) != 1 {
+		t.Fatalf("dropped = %+v, want one rejection", v.Dropped)
+	}
+	if v.Dropped[0].Finding != f {
+		t.Fatalf("dropped finding = %+v, want %+v", v.Dropped[0].Finding, f)
+	}
+	if v.Dropped[0].Reason != FindingDropNotInDiff {
+		t.Fatalf("reason = %q, want %q", v.Dropped[0].Reason, FindingDropNotInDiff)
+	}
+}
+
+// TestValidateFindingsEmptyList: no findings in, no findings out, and the
+// result carries non-nil empty slices so a caller can range over them.
+func TestValidateFindingsEmptyList(t *testing.T) {
+	v := ValidateFindings(nil, "--- a/real.go\n+package real")
+	if len(v.Kept) != 0 || len(v.Dropped) != 0 {
+		t.Fatalf("empty input produced kept=%+v dropped=%+v", v.Kept, v.Dropped)
+	}
+	if v.Kept == nil || v.Dropped == nil {
+		t.Fatalf("result slices must be non-nil, got kept=%v dropped=%v", v.Kept, v.Dropped)
+	}
+}
+
+// TestValidateFindingsDropReason: every dropped finding carries a concrete,
+// non-empty reason, and an uncited finding gets a different reason from one
+// whose citation is simply absent.
+func TestValidateFindingsDropReason(t *testing.T) {
+	uncited := Finding{ID: "f-uncited", Summary: "vague claim with no evidence"}
+	absent := Finding{ID: "f-absent", File: "ghost.go", Summary: "invented issue"}
+	diff := "--- a/real.go\n+package real"
+
+	v := ValidateFindings([]Finding{uncited, absent}, diff)
+	if len(v.Kept) != 0 || len(v.Dropped) != 2 {
+		t.Fatalf("kept=%+v dropped=%+v, want both findings dropped", v.Kept, v.Dropped)
+	}
+	reasons := make(map[string]string, len(v.Dropped))
+	for _, d := range v.Dropped {
+		if strings.TrimSpace(d.Reason) == "" {
+			t.Fatalf("finding %s dropped without a reason", d.Finding.ID)
+		}
+		reasons[d.Finding.ID] = d.Reason
+	}
+	if reasons[uncited.ID] != FindingDropNoCitation {
+		t.Fatalf("reason for %s = %q, want %q", uncited.ID, reasons[uncited.ID], FindingDropNoCitation)
+	}
+	if reasons[absent.ID] != FindingDropNotInDiff {
+		t.Fatalf("reason for %s = %q, want %q", absent.ID, reasons[absent.ID], FindingDropNotInDiff)
+	}
+}
+
+// TestValidateFindingsMixedListPreservesOrder: a mixed list keeps valid
+// findings in their original order and reports only the invented ones.
+func TestValidateFindingsMixedListPreservesOrder(t *testing.T) {
+	diff := "--- a/keep.go\n+package keep"
+	valid1 := Finding{ID: "a", File: "keep.go", Summary: "one"}
+	invented := Finding{ID: "b", File: "phantom.go", Summary: "two"}
+	valid2 := Finding{ID: "c", Evidence: "+package keep", Summary: "three"}
+
+	v := ValidateFindings([]Finding{valid1, invented, valid2}, diff)
+	if len(v.Kept) != 2 || v.Kept[0].ID != "a" || v.Kept[1].ID != "c" {
+		t.Fatalf("kept = %+v, want findings a and c in order", v.Kept)
+	}
+	if len(v.Dropped) != 1 || v.Dropped[0].Finding.ID != "b" {
+		t.Fatalf("dropped = %+v, want only finding b", v.Dropped)
+	}
+}
+
+// TestValidateFindingsKeepsEvidenceOnlyFinding: a finding needs no File when
+// its verbatim evidence appears in the diff.
+func TestValidateFindingsKeepsEvidenceOnlyFinding(t *testing.T) {
+	f := Finding{ID: "e", Evidence: "return err", Summary: "error path is untested"}
+	v := ValidateFindings([]Finding{f}, "\treturn err\n")
+	if len(v.Kept) != 1 || v.Kept[0] != f || len(v.Dropped) != 0 {
+		t.Fatalf("evidence-only finding: kept=%+v dropped=%+v", v.Kept, v.Dropped)
+	}
+}
