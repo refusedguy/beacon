@@ -1594,8 +1594,9 @@ func TestEvaluateGreenBlockedDoesNotChangeCIVerdict(t *testing.T) {
 	if string(blocked) == string(VerdictReady) {
 		t.Fatal("green-blocked must not become the ready verdict")
 	}
-	if got := Evaluate(s, Policy{}); got != VerdictReady {
-		t.Fatalf("Evaluate mutated by green-blocked check: %q, want ready", got)
+	ciVerdict, _ := Evaluate(s, Policy{})
+	if ciVerdict != VerdictReady {
+		t.Fatalf("Evaluate mutated by green-blocked check: %q, want ready", ciVerdict)
 	}
 
 	before := s

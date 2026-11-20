@@ -764,7 +764,8 @@ func (v GreenBlockedVerdict) ReleasesSlot() bool {
 // The function is pure: it runs no check, reads no clock or config, and mutates
 // neither s nor p. The same facts always give the same verdict.
 func EvaluateGreenBlocked(s Snapshot, p Policy, blockerOpen bool) GreenBlockedVerdict {
-	if blockerOpen && Evaluate(s, p) == VerdictReady {
+	verdict, _ := Evaluate(s, p)
+	if blockerOpen && verdict == VerdictReady {
 		return GreenBlocked
 	}
 	return GreenBlockedNone
