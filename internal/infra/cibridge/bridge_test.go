@@ -66,45 +66,39 @@ func (r *recordingAdapterWaker) forSession(id string) []adapterDelivery {
 	return out
 }
 
-func TestVerdictFromStateNoChecksCleanMergeable(t *testing.T) {
-	state := domain.PRState{
-		State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN",
-	}
-	if got := verdictFromState(state); got != domain.VerdictReady {
-		t.Fatalf("doc-only clean PR verdict = %q, want ready", got)
-	}
-	dirty := state
-	dirty.MergeStateStatus = "DIRTY"
-	if got := verdictFromState(dirty); got != domain.VerdictWatching {
-		t.Fatalf("dirty no-check PR verdict = %q, want watching", got)
-	}
-	draft := state
-	draft.IsDraft = true
-	if got := verdictFromState(draft); got != domain.VerdictWatching {
-		t.Fatalf("draft no-check PR verdict = %q, want watching", got)
-	}
-}
-
-func TestVerdictFromChecks(t *testing.T) {
+// checkFacts only normalizes CI facts. The verdict itself belongs to
+// domain.EvaluatePR, so this test asserts the facts and then the engine's
+// decision for the same observation.
+func TestCheckFactsAndEvaluatePR(t *testing.T) {
 	check := func(conclusion string) map[string]domain.Check {
 		return map[string]domain.Check{"build": {Conclusion: conclusion, Required: true}}
 	}
 	cases := []struct {
-		name   string
-		checks map[string]domain.Check
-		want   domain.Verdict
+		name        string
+		checks      map[string]domain.Check
+		wantRollup  string
+		wantFail    []string
+		wantVerdict domain.Verdict
 	}{
-		{"no checks", nil, domain.VerdictWatching},
-		{"all green", check("SUCCESS"), domain.VerdictReady},
-		{"failure", check("FAILURE"), domain.VerdictRetry},
-		{"cancelled", check("CANCELLED"), domain.VerdictRetry},
-		{"pending", check("PENDING"), domain.VerdictWatching},
-		{"mixed", map[string]domain.Check{"a": {Conclusion: "SUCCESS"}, "b": {Conclusion: "PENDING"}}, domain.VerdictWatching},
+		{"no checks", nil, "SUCCESS", nil, domain.VerdictReady},
+		{"all green", check("SUCCESS"), "SUCCESS", nil, domain.VerdictReady},
+		{"failure", check("FAILURE"), "FAILURE", []string{"build"}, domain.VerdictKeepWorking},
+		{"cancelled", check("CANCELLED"), "FAILURE", []string{"build"}, domain.VerdictKeepWorking},
+		{"pending", check("PENDING"), "PENDING", nil, domain.VerdictWatching},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := verdictFromChecks(tc.checks); got != tc.want {
-				t.Fatalf("verdict = %q, want %q", got, tc.want)
+			rollup, failed := checkFacts(tc.checks)
+			if rollup != tc.wantRollup || strings.Join(failed, ",") != strings.Join(tc.wantFail, ",") {
+				t.Fatalf("facts = %q/%v, want %q/%v", rollup, failed, tc.wantRollup, tc.wantFail)
+			}
+			s := domain.Snapshot{
+				State: "OPEN", Rollup: rollup, Failures: failed, Checks: tc.checks,
+				Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", SuitesValid: true,
+			}
+			got, _ := domain.EvaluatePR(s, domain.DefaultPolicy())
+			if got != tc.wantVerdict {
+				t.Fatalf("EvaluatePR = %q, want %q", got, tc.wantVerdict)
 			}
 		})
 	}
@@ -163,7 +157,7 @@ func TestBridgePublishesReadyVerdict(t *testing.T) {
 	}
 }
 
-func TestBridgeIgnoresStaleHeadAndKeepsPending(t *testing.T) {
+func TestBridgeHandlesStaleHeadWithHeadChangedEvent(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -171,13 +165,17 @@ func TestBridgeIgnoresStaleHeadAndKeepsPending(t *testing.T) {
 	defer db.Close()
 
 	w := domain.Watch{
-		ID:          "watch:refusedguy/beacon:43:old",
-		Repo:        "refusedguy/beacon",
-		PR:          43,
-		HeadSHA:     "old",
-		Status:      domain.StatusWatching,
-		Verdict:     domain.VerdictWatching,
-		Subscribers: []domain.Subscriber{{ID: "sub"}},
+		ID:             "watch:refusedguy/beacon:43:old",
+		Repo:           "refusedguy/beacon",
+		PR:             43,
+		HeadSHA:        "old",
+		BaseRef:        "main",
+		Status:         domain.StatusWatching,
+		Verdict:        domain.VerdictWatching,
+		OrchestratorID: "ses_parent",
+		Subscribers: []domain.Subscriber{
+			{ID: "ses_executor", Role: domain.RoleExecutor, Adapter: "opencode"},
+		},
 	}
 	if err := db.SaveWatch(w); err != nil {
 		t.Fatalf("SaveWatch: %v", err)
@@ -186,12 +184,24 @@ func TestBridgeIgnoresStaleHeadAndKeepsPending(t *testing.T) {
 		HeadRefOid: "new",
 		Checks:     map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
 	}}, fixedClock{at: time.Unix(1, 0)}, time.Second)
+	// Head change closes the old Watch rather than publishing a verdict, so it
+	// is counted as skipped, not updated.
 	if got := b.Refresh(context.Background()); got != 0 {
 		t.Fatalf("stale head changed %d watches, want 0", got)
 	}
-	got, _ := db.Watch(w.ID)
-	if got.Verdict != domain.VerdictWatching {
-		t.Fatalf("stale head verdict = %q", got.Verdict)
+	old, _ := db.Watch(w.ID)
+	if old.Status != domain.StatusClosed || old.CloseReason != string(domain.CloseReasonHeadChanged) {
+		t.Fatalf("old watch = %q/%q, want closed/head_changed", old.Status, old.CloseReason)
+	}
+	successor, err := db.Watch("watch:refusedguy/beacon:43:new")
+	if err != nil {
+		t.Fatalf("successor watch missing: %v", err)
+	}
+	if successor.HeadSHA != "new" || successor.OrchestratorID != "ses_parent" {
+		t.Fatalf("successor = %+v, want new SHA and carried OrchestratorID", successor)
+	}
+	if len(successor.Subscribers) != 1 || successor.Subscribers[0].ID != "ses_executor" {
+		t.Fatalf("successor subscribers = %+v, want the executor carried over", successor.Subscribers)
 	}
 }
 
@@ -207,6 +217,7 @@ func TestSelfWatchChainReadsReadyVerdictAndStampsReadAt(t *testing.T) {
 	const cardID = "T3.229"
 	b := New(db, fakeCI{state: domain.PRState{
 		HeadRefOid: "177bf240abc",
+		Mergeable:  "MERGEABLE", MergeStateStatus: "CLEAN",
 		Checks: map[string]domain.Check{
 			"build": {Conclusion: "SUCCESS", Required: true},
 		},
@@ -431,12 +442,12 @@ func TestBridgeClosesReadyWatchOnMerge(t *testing.T) {
 // subscribers. It mirrors the payload written by domain.BlockEvent.
 func blockedTestWatch(id string, pr int, subscribers ...domain.Subscriber) domain.Watch {
 	return domain.Watch{
-		ID:      id,
-		Repo:    "refusedguy/beacon",
-		PR:      pr,
-		HeadSHA: "abc",
-		Status:  domain.StatusBlocked,
-		Verdict: domain.VerdictBlocked,
+		ID:       id,
+		Repo:     "refusedguy/beacon",
+		PR:       pr,
+		HeadSHA:  "abc",
+		Status:   domain.StatusBlocked,
+		Verdict:  domain.VerdictBlocked,
 		Revision: 3,
 		Blocked: &domain.BlockedInfo{
 			Reason:       "two required checks failed outside executor's diff",
@@ -581,8 +592,8 @@ func TestBridgeResumesPollingAfterUnblock(t *testing.T) {
 	}
 
 	ci := &countingCI{state: domain.PRState{
-		HeadRefOid: "abc",
-		Checks:     map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
+		HeadRefOid: "abc", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN",
+		Checks: map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
 	}}
 	waker := &recordingAdapterWaker{}
 	b := New(db, ci, fixedClock{at: time.Unix(2, 0)}, time.Second).WithWaker(waker)
@@ -721,7 +732,7 @@ func TestBridgeUnblocksSourceOnFixerMerge(t *testing.T) {
 	ci := &perPRCI{
 		states: map[int]domain.PRState{
 			70: {State: "MERGED", HeadRefOid: "fix"},
-			60: {HeadRefOid: "abc", Checks: map[string]domain.Check{
+			60: {HeadRefOid: "abc", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", Checks: map[string]domain.Check{
 				"build": {Conclusion: "SUCCESS", Required: true},
 			}},
 		},
@@ -1124,6 +1135,7 @@ func TestProviderBackoffAfterError(t *testing.T) {
 		}
 	}
 }
+
 // ===== T3.225 сквозной прогон (#320) =====
 
 type chainWaker struct {
@@ -1150,7 +1162,9 @@ func TestChainWatchCIPointerWakeRead(t *testing.T) {
 	}
 	defer db.Close()
 
-	sub := domain.Subscriber{ID: "ses_chain", Role: domain.RoleExecutor, Adapter: "opencode", Target: "ses_chain"}
+	// EvaluatePR routes a ready verdict to the orchestrator, so the chain's
+	// subscriber must carry that role to receive the wake.
+	sub := domain.Subscriber{ID: "ses_chain", Role: domain.RoleOrchestrator, Adapter: "opencode", Target: "ses_chain"}
 	w := domain.Watch{
 		ID:          "watch:refusedguy/beacon:42:chain",
 		Repo:        "refusedguy/beacon",
@@ -1167,8 +1181,8 @@ func TestChainWatchCIPointerWakeRead(t *testing.T) {
 	at := time.Unix(100, 0).UTC()
 	ci := fakeCI{state: domain.PRState{
 		HeadRefOid: "chain-sha",
-		Mergeable:  "MERGEABLE",
-		Checks:     map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
+		Mergeable:  "MERGEABLE", MergeStateStatus: "CLEAN",
+		Checks: map[string]domain.Check{"build": {Conclusion: "SUCCESS", Required: true}},
 	}}
 	waker := &chainWaker{}
 	b := New(db, ci, fixedClock{at: at}, time.Second).WithWaker(waker)
