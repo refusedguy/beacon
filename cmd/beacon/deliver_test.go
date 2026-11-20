@@ -64,6 +64,12 @@ func deliverSub(role domain.Role, target string) domain.Subscriber {
 	return domain.Subscriber{ID: string(role), Role: role, Target: target}
 }
 
+// deliverView projects one test watch through the same boundary the command
+// uses, so helpers are tested on the local type rather than a domain type.
+func deliverView(w domain.Watch) deliverWatchView {
+	return deliverViews(mcp.StateSnapshot{ActiveWatches: []domain.Watch{w}})[0]
+}
+
 // ---------------------------------------------------------------------------
 // The delivery target port and the honest ADR 0026 outcome.
 // ---------------------------------------------------------------------------
@@ -221,20 +227,20 @@ func TestDeliverNoRetryOnUncertainOutcomes(t *testing.T) {
 }
 
 func TestDeliverTextCarriesStableObligation(t *testing.T) {
-	w := deliverWatch("w-1", domain.VerdictReady)
+	w := deliverView(deliverWatch("w-1", domain.VerdictReady))
 	first := deliverText(w, "session-A")
 	second := deliverText(w, "session-A")
 	if first != second {
 		t.Fatal("the same watch and session produced different pointers")
 	}
-	wantObligation := domain.ObligationKey(w.ID, w.Revision, "session-A")
+	wantObligation := domain.ObligationKey(w.id, w.revision, "session-A")
 	if !strings.Contains(first, wantObligation) {
 		t.Fatalf("pointer %q does not carry obligation %q", first, wantObligation)
 	}
 	if !strings.Contains(first, "watch=w-1") || !strings.Contains(first, "verdict=ready") {
 		t.Fatalf("pointer %q does not name the watch and verdict", first)
 	}
-	changed := deliverText(domain.Watch{ID: "w-1", Verdict: domain.VerdictReady, Revision: 8}, "session-A")
+	changed := deliverText(deliverWatchView{id: "w-1", verdict: "ready", revision: 8}, "session-A")
 	if changed == first {
 		t.Fatal("a new revision must produce a new pointer")
 	}
@@ -248,19 +254,19 @@ func TestDeliverSubscriberSelection(t *testing.T) {
 	exec := deliverSub(domain.RoleExecutor, "exec-session")
 	orch := deliverSub(domain.RoleOrchestrator, "orch-session")
 
-	ready := deliverWatch("w-1", domain.VerdictReady, exec, orch)
-	if got, ok := deliverySubscriber(ready); !ok || got.Target != "orch-session" {
+	ready := deliverView(deliverWatch("w-1", domain.VerdictReady, exec, orch))
+	if got, ok := deliverySubscriber(ready); !ok || got.target != "orch-session" {
 		t.Fatalf("ready subscriber = %+v/%v, want orchestrator", got, ok)
 	}
-	needs := deliverWatch("w-2", domain.VerdictNeedsInput, exec, orch)
-	if got, ok := deliverySubscriber(needs); !ok || got.Target != "exec-session" {
+	needs := deliverView(deliverWatch("w-2", domain.VerdictNeedsInput, exec, orch))
+	if got, ok := deliverySubscriber(needs); !ok || got.target != "exec-session" {
 		t.Fatalf("needs_input subscriber = %+v/%v, want executor", got, ok)
 	}
-	onlyExec := deliverWatch("w-3", domain.VerdictReady, exec)
-	if got, ok := deliverySubscriber(onlyExec); !ok || got.Target != "exec-session" {
+	onlyExec := deliverView(deliverWatch("w-3", domain.VerdictReady, exec))
+	if got, ok := deliverySubscriber(onlyExec); !ok || got.target != "exec-session" {
 		t.Fatalf("fallback subscriber = %+v/%v, want the only live session", got, ok)
 	}
-	none := deliverWatch("w-4", domain.VerdictReady, deliverSub(domain.RoleExecutor, ""))
+	none := deliverView(deliverWatch("w-4", domain.VerdictReady, deliverSub(domain.RoleExecutor, "")))
 	if _, ok := deliverySubscriber(none); ok {
 		t.Fatal("a watch with no live session must not yield a delivery target")
 	}
@@ -271,13 +277,16 @@ func TestFindDeliverWatch(t *testing.T) {
 		deliverWatch("w-1", domain.VerdictReady),
 		deliverWatch("w-2", domain.VerdictNeedsInput),
 	}}
-	if w, ok := findDeliverWatch(snap, "w-2"); !ok || w.ID != "w-2" {
+	views := deliverViews(snap)
+	if w, ok := findDeliverWatch(views, "w-2"); !ok || w.id != "w-2" {
 		t.Fatalf("findDeliverWatch = %+v/%v, want w-2", w, ok)
 	}
-	if _, ok := findDeliverWatch(snap, "missing"); ok {
+	if _, ok := findDeliverWatch(views, "missing"); ok {
 		t.Fatal("a missing watch must not be found")
 	}
-	if actionableVerdict(domain.VerdictWatching) || !actionableVerdict(domain.VerdictReady) || !actionableVerdict(domain.VerdictNeedsInput) {
+	if actionableVerdict(string(domain.VerdictWatching)) ||
+		!actionableVerdict(string(domain.VerdictReady)) ||
+		!actionableVerdict(string(domain.VerdictNeedsInput)) {
 		t.Fatal("only ready and needs_input are actionable verdicts")
 	}
 }

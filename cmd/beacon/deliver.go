@@ -13,15 +13,20 @@ package main
 // transport-failed attempt is retried, with the same pointer and obligationID,
 // capped at three attempts. A posted receipt, an indeterminate outcome and an
 // unsupported environment are never retried.
+//
+// This file reads the snapshot through mcp.StateSnapshot and projects the few
+// fields it needs into local types. It does not import internal/domain: the
+// ADR 0005 layer matrix allows cmd -> internal/infra but forbids cmd ->
+// internal/domain, and the gate enforces that edge.
 
 import (
 	"errors"
 	"flag"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
@@ -67,6 +72,65 @@ var deliverRunner = func(c *CLI, args []string) int { return runDeliver(c, args)
 // RegisterDeliver installs the deliver command implementation, mirroring
 // RegisterWatch and RegisterGC.
 func RegisterDeliver(fn func(*CLI, []string) int) { deliverRunner = fn }
+
+// The snapshot carries verdicts and roles as strings. These are the two
+// actionable verdicts and the two subscriber roles used for routing, kept as
+// strings so this layer never names a domain type (ADR 0005).
+const (
+	deliverVerdictReady      = "ready"
+	deliverVerdictNeedsInput = "needs_input"
+
+	deliverRoleExecutor     = "executor"
+	deliverRoleOrchestrator = "orchestrator"
+)
+
+// deliverWatchView is the part of a Beacon watch this command reads.
+type deliverWatchView struct {
+	id          string
+	verdict     string
+	revision    uint64
+	subscribers []deliverSubView
+}
+
+// deliverSubView is the part of a subscriber this command reads. Target is the
+// opaque session id carried in the subscription's _meta.
+type deliverSubView struct {
+	role   string
+	target string
+}
+
+// deliverViews projects a snapshot into local read-only views. It converts the
+// typed verdict and role fields to strings at the boundary; no domain name is
+// needed here.
+func deliverViews(snap mcp.StateSnapshot) []deliverWatchView {
+	views := make([]deliverWatchView, 0, len(snap.ActiveWatches))
+	for _, w := range snap.ActiveWatches {
+		v := deliverWatchView{
+			id:       w.ID,
+			verdict:  string(w.Verdict),
+			revision: w.Revision,
+		}
+		for _, s := range w.Subscribers {
+			v.subscribers = append(v.subscribers, deliverSubView{
+				role:   string(s.Role),
+				target: s.Target,
+			})
+		}
+		views = append(views, v)
+	}
+	return views
+}
+
+// deliverKeyEscaper mirrors the domain obligation-key encoding so the pointer
+// names the real obligation. It is local because cmd/beacon may not import
+// internal/domain under the ADR 0005 layer matrix.
+var deliverKeyEscaper = strings.NewReplacer("\\", "\\\\", ":", "\\:")
+
+func deliverObligationID(watchID string, revision uint64, subscriberID string) string {
+	return deliverKeyEscaper.Replace(watchID) + ":" +
+		strconv.FormatUint(revision, 10) + ":" +
+		deliverKeyEscaper.Replace(subscriberID)
+}
 
 // deliveryKind is the honest ADR 0026 outcome printed by the command.
 type deliveryKind string
@@ -192,51 +256,51 @@ func deliverPrompt(target deliveryTarget, sessionID, text string, sleep func(tim
 	}
 }
 
-// findDeliverWatch returns the watch with the given ID from a snapshot.
-func findDeliverWatch(snap mcp.StateSnapshot, watchID string) (domain.Watch, bool) {
-	for _, w := range snap.ActiveWatches {
-		if w.ID == watchID {
+// findDeliverWatch returns the projected watch with the given ID.
+func findDeliverWatch(views []deliverWatchView, watchID string) (deliverWatchView, bool) {
+	for _, w := range views {
+		if w.id == watchID {
 			return w, true
 		}
 	}
-	return domain.Watch{}, false
+	return deliverWatchView{}, false
 }
 
 // actionableVerdict reports whether the verdict asks for a follow-up to be
 // written back into the live session (ADR 0060 p4).
-func actionableVerdict(v domain.Verdict) bool {
-	return v == domain.VerdictReady || v == domain.VerdictNeedsInput
+func actionableVerdict(v string) bool {
+	return v == deliverVerdictReady || v == deliverVerdictNeedsInput
 }
 
 // deliverySubscriber picks the subscriber session to write to. A ready verdict
 // is for the orchestrator, a needs_input verdict is for the executor that asked
 // the question. When the preferred role has no live target, any subscriber with
 // a non-empty target is used, so a role mismatch never loses a delivery.
-func deliverySubscriber(w domain.Watch) (domain.Subscriber, bool) {
-	preferred := domain.RoleOrchestrator
-	if w.Verdict == domain.VerdictNeedsInput {
-		preferred = domain.RoleExecutor
+func deliverySubscriber(w deliverWatchView) (deliverSubView, bool) {
+	preferred := deliverRoleOrchestrator
+	if w.verdict == deliverVerdictNeedsInput {
+		preferred = deliverRoleExecutor
 	}
-	for _, s := range w.Subscribers {
-		if strings.TrimSpace(s.Target) != "" && s.Role == preferred {
+	for _, s := range w.subscribers {
+		if strings.TrimSpace(s.target) != "" && s.role == preferred {
 			return s, true
 		}
 	}
-	for _, s := range w.Subscribers {
-		if strings.TrimSpace(s.Target) != "" {
+	for _, s := range w.subscribers {
+		if strings.TrimSpace(s.target) != "" {
 			return s, true
 		}
 	}
-	return domain.Subscriber{}, false
+	return deliverSubView{}, false
 }
 
 // deliverText builds the pointer written into the session. It carries the
 // watch identifier and the obligation key, never check contents, so a retry
 // repeats the same pointer with the same obligationID (ADR 0017).
-func deliverText(w domain.Watch, sessionID string) string {
-	obligationID := domain.ObligationKey(w.ID, w.Revision, sessionID)
+func deliverText(w deliverWatchView, sessionID string) string {
+	obligationID := deliverObligationID(w.id, w.revision, sessionID)
 	return fmt.Sprintf("beacon deliver watch=%s revision=%d verdict=%s obligation=%s",
-		w.ID, w.Revision, w.Verdict, obligationID)
+		w.id, w.revision, w.verdict, obligationID)
 }
 
 // deliverResult is the outcome of one deliver command. The delivery field is
@@ -278,33 +342,33 @@ func runDeliver(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon deliver: snapshot: %v\n", err)
 		return 2
 	}
-	w, ok := findDeliverWatch(snap, watchID)
+	w, ok := findDeliverWatch(deliverViews(snap), watchID)
 	if !ok {
 		fmt.Fprintf(c.errOut, "beacon deliver: watch %s не найден в снимке\n", watchID)
 		return 2
 	}
-	if !actionableVerdict(w.Verdict) {
-		fmt.Fprintf(c.out, "watch=%s verdict=%s: доставка не требуется\n", w.ID, w.Verdict)
+	if !actionableVerdict(w.verdict) {
+		fmt.Fprintf(c.out, "watch=%s verdict=%s: доставка не требуется\n", w.id, w.verdict)
 		return 0
 	}
 	sub, ok := deliverySubscriber(w)
 	if !ok {
 		res := deliverResult{
-			WatchID:  w.ID,
-			Verdict:  string(w.Verdict),
+			WatchID:  w.id,
+			Verdict:  w.verdict,
 			Delivery: deliveryUnsupported,
 			Outcome:  outcomeUnsupported,
 		}
 		fmt.Fprintln(c.out, res.line())
-		fmt.Fprintf(c.errOut, "beacon deliver: у watch %s нет живой сессии для доставки\n", w.ID)
+		fmt.Fprintf(c.errOut, "beacon deliver: у watch %s нет живой сессии для доставки\n", w.id)
 		return 1
 	}
 
-	text := deliverText(w, sub.Target)
-	out, attempts := deliverPrompt(deliverTarget, sub.Target, text, deliverSleep)
+	text := deliverText(w, sub.target)
+	out, attempts := deliverPrompt(deliverTarget, sub.target, text, deliverSleep)
 	res := deliverResult{
-		WatchID:  w.ID,
-		Verdict:  string(w.Verdict),
+		WatchID:  w.id,
+		Verdict:  w.verdict,
 		Delivery: deliveryOf(out),
 		Outcome:  out,
 		Attempts: attempts,
