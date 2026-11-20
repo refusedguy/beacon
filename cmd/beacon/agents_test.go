@@ -1166,3 +1166,278 @@ func TestW133RouteReportsMalformedAttentionState(t *testing.T) {
 		t.Fatalf("нет понятной ошибки: %q", errOut.String())
 	}
 }
+
+// ---- ADR 0063 фича 6 / T3.158: мультирепо-задача с отдельным worktree ----
+
+func w158Bindings(t *testing.T, dir string) repoWorktreeState {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, repoWorktreesFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st repoWorktreeState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func TestW158BindRepoWorktreeProvisionsGitWorktree(t *testing.T) {
+	dir := w133State(t)
+	c, out, errOut, calls := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	wt := filepath.Join(t.TempDir(), "wt-A")
+
+	b, err := c.bindRepoWorktree("T3.158", "/srv/repoA.git", wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.TaskID != "T3.158" || b.Repo != "/srv/repoA.git" || b.Worktree != wt {
+		t.Fatalf("связка %+v, ожидалась T3.158/repoA/%s", b, wt)
+	}
+	if b.Branch == "" {
+		t.Fatal("ветка не выделена")
+	}
+	if out.Len() != 0 || errOut.Len() != 0 {
+		t.Fatalf("неожиданный вывод: out=%q err=%q", out.String(), errOut.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("вызовов раннера %d, ожидался 1", len(*calls))
+	}
+	call := (*calls)[0]
+	if call.name != "git" || call.dir != "/srv/repoA.git" {
+		t.Fatalf("раннер вызвал %q в %q, ожидался git в репозитории", call.name, call.dir)
+	}
+	want := []string{"worktree", "add", "-b", b.Branch, wt}
+	if !reflect.DeepEqual(call.args, want) {
+		t.Fatalf("аргументы %q, ожидались %q", call.args, want)
+	}
+	if st := w158Bindings(t, dir); len(st.Bindings) != 1 {
+		t.Fatalf("в состоянии %d связок, ожидалась 1", len(st.Bindings))
+	}
+}
+
+func TestW158TaskCanBindSeveralReposWithDistinctWorktrees(t *testing.T) {
+	w133State(t)
+	c, _, _, calls := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	base := t.TempDir()
+
+	b1, err := c.bindRepoWorktree("T3.158", "/srv/repoA.git", filepath.Join(base, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := c.bindRepoWorktree("T3.158", "/srv/repoB.git", filepath.Join(base, "b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b1.Worktree == b2.Worktree {
+		t.Fatalf("два репозитория получили один worktree %q", b1.Worktree)
+	}
+	if b1.Branch == b2.Branch {
+		t.Fatalf("два репозитория получили одну ветку %q", b1.Branch)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("вызовов git %d, ожидалось 2", len(*calls))
+	}
+}
+
+func TestW158BindIsIdempotent(t *testing.T) {
+	w133State(t)
+	c, _, _, calls := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	wt := filepath.Join(t.TempDir(), "wt")
+
+	b1, err := c.bindRepoWorktree("T3.158", "/srv/repoA.git", wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := c.bindRepoWorktree("T3.158", "/srv/repoA.git", filepath.Join(t.TempDir(), "ignored"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(b1, b2) {
+		t.Fatalf("повтор изменил связку: %+v против %+v", b1, b2)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("повтор вызвал git %d раз, ожидался 1", len(*calls))
+	}
+}
+
+func TestW158SameRepoDifferentTasksGetDistinctWorktrees(t *testing.T) {
+	w133State(t)
+	c, _, _, _ := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	base := t.TempDir()
+
+	b1, err := c.bindRepoWorktree("T1", "/srv/repo.git", filepath.Join(base, "t1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := c.bindRepoWorktree("T2", "/srv/repo.git", filepath.Join(base, "t2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b1.Worktree == b2.Worktree || b1.Branch == b2.Branch {
+		t.Fatalf("две задачи получили общий worktree/ветку: %+v и %+v", b1, b2)
+	}
+}
+
+func TestW158BindRejectsEmptyInput(t *testing.T) {
+	w133State(t)
+	for _, tc := range []struct {
+		name string
+		task string
+		repo string
+	}{
+		{"пустая задача", "", "/srv/repo.git"},
+		{"пробельная задача", "  ", "/srv/repo.git"},
+		{"пустой репозиторий", "T1", ""},
+		{"пробельный репозиторий", "T1", "  "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, _, calls := w68CLI(t, nil)
+			if _, err := c.bindRepoWorktree(tc.task, tc.repo, "/tmp/wt"); err == nil {
+				t.Fatal("пустой ввод принят")
+			}
+			if len(*calls) != 0 {
+				t.Fatalf("раннер вызван при пустом вводе: %+v", *calls)
+			}
+		})
+	}
+}
+
+func TestW158BindGitFailureDoesNotPersist(t *testing.T) {
+	dir := w133State(t)
+	c, _, _, _ := w68CLI(t, func(w68Call) runResult {
+		return runResult{code: 128, stderr: []byte("fatal: worktree already exists\n")}
+	})
+
+	if _, err := c.bindRepoWorktree("T1", "/srv/repo.git", "/tmp/wt"); err == nil {
+		t.Fatal("ошибка git проигнорирована")
+	} else if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("в ошибке нет причины: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, repoWorktreesFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("связка записана после ошибки git: %v", err)
+	}
+}
+
+func TestW158BindingSurvivesRestart(t *testing.T) {
+	dir := w133State(t)
+	respond := func(w68Call) runResult { return runResult{} }
+	c, _, _, _ := w68CLI(t, respond)
+	first, err := c.bindRepoWorktree("T1", "/srv/repoA.git", filepath.Join(t.TempDir(), "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := w158Bindings(t, dir); len(st.Bindings) != 1 {
+		t.Fatalf("связок %d, ожидалась 1", len(st.Bindings))
+	}
+
+	// Новый процесс читает то же состояние и не выделяет второй worktree.
+	c2, _, _, calls := w68CLI(t, respond)
+	again, err := c2.bindRepoWorktree("T1", "/srv/repoA.git", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Worktree != first.Worktree || again.Branch != first.Branch {
+		t.Fatalf("после рестарта связка %+v, ожидалась %+v", again, first)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("после рестарта git вызван %d раз, ожидался 0", len(*calls))
+	}
+}
+
+func TestW158RejectsWorktreeSharedByTwoBindings(t *testing.T) {
+	w133State(t)
+	c, _, _, _ := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	wt := filepath.Join(t.TempDir(), "shared")
+
+	if _, err := c.bindRepoWorktree("T1", "/srv/repoA.git", wt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.bindRepoWorktree("T2", "/srv/repoB.git", wt); err == nil {
+		t.Fatal("второй задаче отдан чужой worktree")
+	}
+}
+
+func TestW158DefaultWorktreePathIsUnderState(t *testing.T) {
+	dir := w133State(t)
+	c, _, _, _ := w68CLI(t, func(w68Call) runResult { return runResult{} })
+
+	b, err := c.bindRepoWorktree("T1", "/srv/repo.git", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, repoWorktreesDir, repoWorktreeKey("T1", "/srv/repo.git"))
+	if b.Worktree != want {
+		t.Fatalf("путь worktree %q, ожидался %q", b.Worktree, want)
+	}
+	if !strings.HasPrefix(b.Branch, "beacon/") {
+		t.Fatalf("ветка %q не пространстве beacon/", b.Branch)
+	}
+}
+
+func TestW158ReviewGateBeforePR(t *testing.T) {
+	w133State(t)
+	c, _, _, _ := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	if _, err := c.bindRepoWorktree("T1", "/srv/repo.git", "/tmp/wt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := recordRepoPR("T1", "/srv/repo.git", 42); err == nil {
+		t.Fatal("PR записан до review-гейта")
+	}
+	reviewed, err := markRepoReviewed("T1", "/srv/repo.git")
+	if err != nil || !reviewed.Reviewed {
+		t.Fatalf("review-гейт не пройден: %+v, %v", reviewed, err)
+	}
+	pr, err := recordRepoPR("T1", "/srv/repo.git", 42)
+	if err != nil || pr.PR != 42 {
+		t.Fatalf("PR не записан: %+v, %v", pr, err)
+	}
+	if _, err := markRepoReviewed("нет", "/srv/repo.git"); err == nil {
+		t.Fatal("review-гейт применён к неизвестной связке")
+	}
+}
+
+func TestW158RunAgentsBindsRepoAndPrintsJSON(t *testing.T) {
+	w133State(t)
+	wt := filepath.Join(t.TempDir(), "wt")
+	c, out, errOut, calls := w68CLI(t, func(w68Call) runResult { return runResult{} })
+
+	code := c.runAgents([]string{"--task", "T3.158", "--repo", "/srv/repo.git", "--worktree", wt})
+	if code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, errOut.String())
+	}
+	var got repoWorktree
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("stdout не JSON: %q: %v", out.String(), err)
+	}
+	if got.TaskID != "T3.158" || got.Worktree != wt || got.Branch == "" {
+		t.Fatalf("связка в JSON: %+v", got)
+	}
+	if len(*calls) != 1 || (*calls)[0].name != "git" {
+		t.Fatalf("git не вызван через раннер: %+v", *calls)
+	}
+}
+
+func TestW158RunAgentsBindRejectsMissingArgs(t *testing.T) {
+	w133State(t)
+	for _, args := range [][]string{
+		{"--task", "T3.158"},
+		{"--repo", "/srv/repo.git"},
+		{"--worktree", "/tmp/wt"},
+		{"--task", "T3.158", "--repo", "/srv/repo.git", "--route"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			c, out, errOut, _ := w68CLI(t, nil)
+			if code := c.runAgents(args); code != 2 {
+				t.Fatalf("код выхода %d, ожидался 2", code)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("stdout не пустой: %q", out.String())
+			}
+			if errOut.Len() == 0 {
+				t.Fatal("stderr пустой")
+			}
+		})
+	}
+}
