@@ -334,6 +334,7 @@ type checkNode struct {
 	Name       string `json:"name"`
 	Context    string `json:"context"`
 	Conclusion string `json:"conclusion"`
+	Status     string `json:"status"`
 	State      string `json:"state"`
 }
 
@@ -349,9 +350,16 @@ func checkFromNode(raw json.RawMessage) (Check, bool) {
 	if name == "" {
 		return Check{}, false
 	}
+	// A CheckRun carries conclusion and status; only StatusContext carries
+	// state. An unfinished CheckRun has no conclusion, so its status maps to
+	// pending.
 	conclusion := n.Conclusion
-	if n.Typename == "StatusContext" || conclusion == "" {
-		conclusion = n.State
+	if conclusion == "" {
+		if n.Typename == "StatusContext" {
+			conclusion = n.State
+		} else {
+			conclusion = n.Status
+		}
 	}
 	return Check{Name: name, Conclusion: normalizeConclusion(conclusion)}, true
 }
@@ -381,7 +389,7 @@ func BuildChecksQuery(prs []PR) string {
         contexts(first:50) {
           nodes {
             __typename
-            ... on CheckRun { name conclusion state }
+            ... on CheckRun { name conclusion status }
             ... on StatusContext { context state }
           }
         }
