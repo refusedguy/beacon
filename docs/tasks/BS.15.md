@@ -12,4 +12,4 @@
 Шаги: По heartbeat и lease помечать effect retired, писать событие.
 Проверка: Устаревший lease не блокирует очередь.
 Приёмка: Новый воркер не повторяет уже применённый эффект.
-- Premise проверен 2026-11-20: функционал уже в main (commit e56761b, PlanRetire/Retirer в internal/app/worker/retire.go), дубль не создан.
+- PR #597: premise проверен, функционал в main (commit e56761b, PlanRetire/Retirer в internal/app/worker/retire.go), дубль не создан.
