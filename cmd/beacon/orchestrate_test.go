@@ -79,7 +79,7 @@ func TestOrchestrateDispatch(t *testing.T) {
 }
 
 func ghViewArgs(pr int, fields string) []string {
-	return []string{"pr", "view", strconv.Itoa(pr), "--json", fields}
+	return []string{"pr", "view", strconv.Itoa(pr), "--json", fields, "--repo", "refusedguy/beacon"}
 }
 
 func ghMergeArgs(pr int) []string {

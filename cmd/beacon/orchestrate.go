@@ -88,10 +88,12 @@ type prViewFields struct {
 
 // prView runs one read-only gh call. fields is either the full gate tuple or
 // just "state" for the post-merge confirmation.
-func (m ghMerger) prView(pr int, fields string) (prViewFields, error) {
-	res := m.c.run(m.c.root, "gh", []string{
-		"pr", "view", strconv.Itoa(pr), "--json", fields,
-	}, nil)
+func (m ghMerger) prView(repo string, pr int, fields string) (prViewFields, error) {
+	args := []string{"pr", "view", strconv.Itoa(pr), "--json", fields}
+	if strings.TrimSpace(repo) != "" {
+		args = append(args, "--repo", repo)
+	}
+	res := m.c.run(m.c.root, "gh", args, nil)
 	if res.code != 0 {
 		return prViewFields{}, ghError(fmt.Sprintf("gh pr view %d", pr), res)
 	}
@@ -109,7 +111,7 @@ func (m ghMerger) prView(pr int, fields string) (prViewFields, error) {
 // confirmed before the orchestrator writes its ledger or closes the Watch.
 func (m ghMerger) MergeChecked(ctx context.Context, repo string, pr int) (orchestrator.MergeOutcome, error) {
 	_ = ctx
-	before, err := m.prView(pr, "mergeable,mergeStateStatus,state")
+	before, err := m.prView(repo, pr, "mergeable,mergeStateStatus,state")
 	if err != nil {
 		return orchestrator.MergeOutcome{}, err
 	}
@@ -133,7 +135,7 @@ func (m ghMerger) MergeChecked(ctx context.Context, repo string, pr int) (orches
 	if err := m.Merge(ctx, repo, pr); err != nil {
 		return orchestrator.MergeOutcome{}, err
 	}
-	after, err := m.prView(pr, "state")
+	after, err := m.prView(repo, pr, "state")
 	if err != nil {
 		return orchestrator.MergeOutcome{}, err
 	}
