@@ -253,9 +253,10 @@ func Observe(name string, seconds float64) {
 // DaemonPass at the start of a pass and the CLI calls FlushCycle on exit, so
 // the summary is emitted without the loop needing to know about counters.
 type cycleTracker struct {
-	mu                                       sync.Mutex
-	start                                    time.Time
-	watches, ready, retry, merges, wakes     int
+	mu                                    sync.Mutex
+	start                                 time.Time
+	started                               bool
+	watches, ready, retry, merges, wakes  int
 }
 
 var cycles = &cycleTracker{start: time.Now()}
@@ -266,16 +267,18 @@ func (c *cycleTracker) note(fn func(*cycleTracker)) {
 	fn(c)
 }
 
-func (c *cycleTracker) flush(now time.Time) CycleStats {
+func (c *cycleTracker) flush(now time.Time) (CycleStats, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s := CycleStats{
 		Watches: c.watches, Ready: c.ready, Retry: c.retry,
 		Merges: c.merges, Wakes: c.wakes, Duration: now.Sub(c.start),
 	}
+	started := c.started
 	c.watches, c.ready, c.retry, c.merges, c.wakes = 0, 0, 0, 0, 0
+	c.started = false
 	c.start = now
-	return s
+	return s, started
 }
 
 // PollCycle records the start of one CI poll and its number of Watches.
@@ -285,7 +288,7 @@ func PollCycle() { Default().Inc(CounterPollCycles, "") }
 // PollCycle so that a caller which only counts still gets a correct total.
 func PollCycleStart(watches int) {
 	Default().Inc(CounterPollCycles, "")
-	cycles.note(func(c *cycleTracker) { c.watches = watches })
+	cycles.note(func(c *cycleTracker) { c.watches, c.started = watches, true })
 	Event(LevelDebug, "poll_cycle_start", Fields{FieldWatches: watches})
 }
 
@@ -535,12 +538,16 @@ func ProviderCall(adapter, method, watchID string, err error, d time.Duration) {
 // starts a new one. An idle pass produces no summary line. The CLI calls it on
 // exit so a one-shot daemon still reports its pass.
 func FlushCycle() {
-	stats := cycles.flush(time.Now())
-	if stats.Watches != 0 || stats.Ready != 0 || stats.Retry != 0 || stats.Merges != 0 || stats.Wakes != 0 {
+	stats, started := cycles.flush(time.Now())
+	if started || stats.Watches != 0 || stats.Ready != 0 || stats.Retry != 0 || stats.Merges != 0 || stats.Wakes != 0 {
 		Cycle(stats)
 	}
 }
 
 // DaemonPass marks the start of a daemon pass. It flushes the previous pass,
-// then leaves the tracker ready for the new one.
-func DaemonPass() { FlushCycle() }
+// then leaves the tracker ready for the new one. An idle pass still gets its
+// compact summary line.
+func DaemonPass() {
+	FlushCycle()
+	cycles.note(func(c *cycleTracker) { c.started = true })
+}

@@ -176,6 +176,29 @@ func TestDaemonCycleSummaryAggregatesTransitions(t *testing.T) {
 	}
 }
 
+func TestIdleDaemonCycleStillLogsSummary(t *testing.T) {
+	SetDefault(nil)
+	FlushCycle()
+	buf := &bytes.Buffer{}
+	SetDefault(NewRecorder(NewLogger("json", LevelInfo, buf), NewMetrics()))
+	defer SetDefault(nil)
+
+	DaemonPass()
+	FlushCycle()
+
+	lines := cycleLines(t, buf.String())
+	if len(lines) != 1 {
+		t.Fatalf("холостой цикл дал %d строк, ожидалась 1: %q", len(lines), buf.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got[FieldWatches] != float64(0) || got[FieldEvent] != "cycle" {
+		t.Errorf("сводка холостого цикла = %v", got)
+	}
+}
+
 func cycleLines(t *testing.T, raw string) []string {
 	t.Helper()
 	var out []string
