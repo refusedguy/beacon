@@ -1139,9 +1139,9 @@ const (
 	blockStatusWatching = "watching"
 	blockStatusBlocked  = "blocked"
 
-	blockDecisionPrefix = "blocked:"
-	blockReasonNotMine  = "not_mine"
-	decisionUnblock     = "unblock"
+	blockDecisionPrefix     = "blocked:"
+	blockReasonNotMine      = "not_mine"
+	decisionBlockedResolved = "blocked:resolved"
 )
 
 // blockedWatch — состояние Watch, которое видно после ack с decision.
@@ -1171,12 +1171,12 @@ type blockAckOutcome struct {
 }
 
 // applyBlockDecision применяет decision из beacon_ack. Блокирует только известный
-// reason, снимает блокировку явным unblock и не меняет Watch во всех остальных
-// случаях. Причина сохраняется в Watch и возвращается в исходе ack.
+// reason, снимает блокировку явным blocked:resolved и не меняет Watch во всех
+// остальных случаях. Причина сохраняется в Watch и возвращается в исходе ack.
 func applyBlockDecision(w blockedWatch, decision, reason string) (blockedWatch, blockAckOutcome) {
 	d := strings.TrimSpace(decision)
 	reason = strings.TrimSpace(reason)
-	if d == decisionUnblock {
+	if d == decisionBlockedResolved {
 		if w.Status != blockStatusBlocked {
 			return w, blockAckOutcome{Action: "noop", Reason: "not_blocked"}
 		}
@@ -1301,15 +1301,15 @@ func evalB03BlockedWake() (string, bool) {
 }
 
 // evalB04UnknownDecisionAndUnblock проверяет негативный контроль и возврат в
-// опрос: неизвестный decision и неизвестный reason не блокируют, а unblock
-// снимает блокировку и возвращает Watch в опрос.
+// опрос: неизвестный decision и неизвестный reason не блокируют, а
+// blocked:resolved снимает блокировку и возвращает Watch в опрос.
 func evalB04UnknownDecisionAndUnblock() (string, bool) {
 	w := newBlockedWatch("watch:B04")
 	unknown, unknownOut := applyBlockDecision(w, "blocked:banana", "неизвестный reason")
 	unknownEffects := ciBridgeRefresh(unknown)
 	alien, alienOut := applyBlockDecision(w, "banana", "")
 	blocked, _ := applyBlockDecision(w, "blocked:not_mine", "моих правок нет")
-	unblocked, unblockOut := applyBlockDecision(blocked, "unblock", "")
+	unblocked, unblockOut := applyBlockDecision(blocked, decisionBlockedResolved, "")
 	resumedEffects := ciBridgeRefresh(unblocked)
 	actual := fmt.Sprintf("unknown=%s/%s polls=%d; alien=%s/%s; unblock=%s status=%s reason=%q polls=%d retries=%d",
 		unknownOut.Action, unknownOut.Reason, unknownEffects.Polls,
