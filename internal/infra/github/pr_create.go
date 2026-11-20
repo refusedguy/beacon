@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -29,21 +28,15 @@ type PRClient struct {
 	gh *gh.Client
 }
 
-// TokenFromEnv resolves a GitHub token from the same environment chain as the
-// read client, without its legacy gh fallback. A missing token is an error,
-// never an anonymous request.
-func TokenFromEnv() (string, error) {
-	for _, name := range tokenEnvChain {
-		if token := strings.TrimSpace(os.Getenv(name)); token != "" {
-			return token, nil
-		}
+// NewPRClient builds a client from the shared token resolver. The resolver
+// prefers BEACON_GITHUB_TOKEN and GITHUB_TOKEN and only falls back to one
+// `gh auth token` call when both are empty. The gh process is never spawned
+// per API call, and app/domain never name it.
+func NewPRClient(ctx context.Context) (*PRClient, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return "", errors.New("GitHub token: BEACON_GITHUB_TOKEN and GITHUB_TOKEN are empty")
-}
-
-// NewPRClient builds a client from the environment token.
-func NewPRClient() (*PRClient, error) {
-	token, err := TokenFromEnv()
+	token, err := ResolveToken(ctx)
 	if err != nil {
 		return nil, err
 	}

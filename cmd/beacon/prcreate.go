@@ -257,7 +257,7 @@ func SetPRCreateDeps(fn prcreateDepsFactory) {
 }
 
 func defaultPRCreateDeps(c *CLI) (prcreateDeps, error) {
-	client, err := github.NewPRClient()
+	client, err := github.NewPRClient(context.Background())
 	if err != nil {
 		return prcreateDeps{}, err
 	}
