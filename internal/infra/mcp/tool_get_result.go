@@ -23,6 +23,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // GetResultInput is the argument object of beacon_get_result. includeChecks is
@@ -217,6 +218,7 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 
 	w, err := h.store.Watch(in.WatchID)
 	if err != nil {
+		observe.ActorError("get_result", in.WatchID, err)
 		return GetResultOutput{}, mapResultReadError(err, "get_result: watch")
 	}
 
@@ -230,9 +232,11 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 
 	if _, _, err := h.stamper.StampRead(ctx, obligationID, h.clock.Now()); err != nil {
+		observe.ActorError("get_result-stamp", in.WatchID, err)
 		return GetResultOutput{}, err
 	}
 
+	observe.ResultRead(w.ID, string(w.Verdict), w.Revision)
 	failed := collectFailedChecks(w)
 	return GetResultOutput{
 		Status:       string(w.Status),

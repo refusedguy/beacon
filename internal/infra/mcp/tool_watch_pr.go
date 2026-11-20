@@ -13,6 +13,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 const (
@@ -176,6 +177,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 
 	headSHA, baseRef, err := h.resolveHead(ctx, in)
 	if err != nil {
+		observe.ActorError("watch_pr-head", "", err)
 		return WatchPROutput{}, err
 	}
 
@@ -186,6 +188,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	// subscribers to the successor.
 	carried, err := h.closeSuperseded(in.Repo, in.PR, headSHA, now)
 	if err != nil {
+		observe.ActorError("watch_pr-supersede", "", err)
 		return WatchPROutput{}, err
 	}
 
@@ -229,8 +232,10 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 
 	sub, err := h.fanout.Subscribe(w, s)
 	if err != nil {
+		observe.ActorError("watch_pr", "", err)
 		return WatchPROutput{}, err
 	}
+	observe.WatchRegistered(sub.Watch.ID, in.PR, sub.Watch.Revision, adapter)
 
 	// One watch_pr call reaches every injected bridge through the same
 	// six-operation port. Each bridge decides whether the work applies to its

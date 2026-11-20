@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
@@ -267,22 +268,35 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 	}
 	watches, err := st.ActiveWatches(ctx)
 	if err != nil {
+		observe.ActorError("orchestrator", "", err)
 		return out, fmt.Errorf("orchestrator: active watches: %w", err)
 	}
-
+	started := time.Now()
+	observe.RunStart(len(watches))
 	var errs []error
+	defer func() {
+		stats := observe.CycleStats{
+			Watches: len(watches), Merges: len(out.Merged), Wakes: len(out.Actions),
+			Duration: time.Since(started),
+		}
+		observe.RunEnd(stats, errors.Join(errs...))
+	}()
+
 	for _, w := range watches {
 		switch {
 		case w.isReady():
 			verdict, reason, err := w.canAutoMerge(ctx, resolver)
 			if err != nil {
+				observe.ActorError("orchestrator", w.ID, err)
 				errs = append(errs, err)
 				continue
 			}
 			switch verdict {
 			case VerdictReady:
+				observe.DependenciesResolved(w.ID, w.PR, nil)
 				mergeOne(ctx, st, merger, opts, w, &out, &errs)
 			case VerdictWait:
+				observe.DependencyWait(w.ID, w.PR, reason)
 				out.Waiting = append(out.Waiting, w.PR)
 				out.Actions = append(out.Actions, Action{
 					Action: ActionWait, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -314,12 +328,19 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 // that implements CheckedMerger owns the gh mergeability gate and the post-merge
 // state confirmation; a plain Merger is trusted on its success return.
 func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watch, out *Result, errs *[]error) {
+	started := time.Now()
+	defer func() { observe.MergeDuration(time.Since(started)) }()
 	done, err := st.WasMerged(ctx, w.ID, w.Revision)
 	if err != nil {
+		observe.ActorError("merge-ledger", w.ID, err)
 		*errs = append(*errs, fmt.Errorf("orchestrator: merge ledger %s@%d: %w", w.ID, w.Revision, err))
 		return
 	}
 	if done {
+		observe.Event(observe.LevelInfo, "merge_skipped", observe.Fields{
+			observe.FieldWatchID: w.ID, observe.FieldPR: w.PR,
+			observe.FieldRevision: w.Revision, observe.FieldReason: "already merged at this revision",
+		})
 		out.Skipped = append(out.Skipped, w.PR)
 		out.Actions = append(out.Actions, Action{
 			Action: ActionSkip, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -337,7 +358,9 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		return
 	}
 	if merger == nil {
-		*errs = append(*errs, fmt.Errorf("orchestrator: merger is nil for PR %d", w.PR))
+		mergerErr := fmt.Errorf("orchestrator: merger is nil for PR %d", w.PR)
+		observe.MergeFailure(w.ID, w.PR, mergerErr)
+		*errs = append(*errs, mergerErr)
 		return
 	}
 	observe.MergeAttempt(w.ID, w.PR)
@@ -346,6 +369,8 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		return
 	}
 	if err := merger.Merge(ctx, w.Repo, w.PR); err != nil {
+		observe.MergeFailure(w.ID, w.PR, err)
+		observe.ActorError("merger", w.ID, err)
 		out.Actions = append(out.Actions, Action{
 			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
 			Command: command, Message: err.Error(),
@@ -362,6 +387,8 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watch, command string, out *Result, errs *[]error) {
 	outcome, err := merger.MergeChecked(ctx, w.Repo, w.PR)
 	if err != nil {
+		observe.MergeFailure(w.ID, w.PR, err)
+		observe.ActorError("merger", w.ID, err)
 		log.Printf("orchestrator: merge PR %d: %v", w.PR, err)
 		out.Actions = append(out.Actions, Action{
 			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -374,6 +401,9 @@ func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watc
 	case outcome.Merged:
 		confirmMerge(ctx, st, w, command, out, errs)
 	case outcome.Pending:
+		observe.Event(observe.LevelInfo, "merge_pending", observe.Fields{
+			observe.FieldWatchID: w.ID, observe.FieldPR: w.PR, observe.FieldRevision: w.Revision,
+		})
 		log.Printf("orchestrator: PR %d: merge command reported success, waiting for MERGE state", w.PR)
 		out.Actions = append(out.Actions, Action{
 			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
@@ -384,6 +414,10 @@ func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watc
 		if reason == "" {
 			reason = "merge gate held the PR"
 		}
+		observe.Event(observe.LevelInfo, "merge_held", observe.Fields{
+			observe.FieldWatchID: w.ID, observe.FieldPR: w.PR,
+			observe.FieldRevision: w.Revision, observe.FieldReason: reason,
+		})
 		log.Printf("orchestrator: PR %d: merge held: %s", w.PR, reason)
 		out.Skipped = append(out.Skipped, w.PR)
 		out.Actions = append(out.Actions, Action{
@@ -398,9 +432,11 @@ func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watc
 func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *Result, errs *[]error) {
 	observe.MergeSuccess(w.ID, w.PR)
 	if err := st.RecordMerge(ctx, w.ID, w.Revision); err != nil {
+		observe.ActorError("merge-ledger", w.ID, err)
 		*errs = append(*errs, fmt.Errorf("orchestrator: record merge %s@%d: %w", w.ID, w.Revision, err))
 	}
 	if err := st.CloseWatch(ctx, w.ID); err != nil {
+		observe.ActorError("watch-closer", w.ID, err)
 		*errs = append(*errs, fmt.Errorf("orchestrator: close watch %s: %w", w.ID, err))
 	}
 	out.Merged = append(out.Merged, w.PR)
@@ -416,8 +452,14 @@ func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *R
 // subscriber supports it.
 func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, out *Result, errs *[]error) {
 	if waker == nil {
+		observe.WakeSkipped("", w.ID, "no waker installed")
 		return
 	}
+	observe.Event(observe.LevelInfo, "wake_requested", observe.Fields{
+		observe.FieldWatchID: w.ID, observe.FieldPR: w.PR,
+		observe.FieldRevision: w.Revision, observe.FieldVerdict: verdict,
+		observe.FieldReason: reason,
+	})
 	if verdict != VerdictWait {
 		observe.RebaseRequested(w.ID, w.PR)
 	}
@@ -429,6 +471,7 @@ func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, 
 	}
 	if wakeErr != nil {
 		observe.WakeFailed("", w.ID, wakeErr)
+		observe.ActorError("waker", w.ID, wakeErr)
 		*errs = append(*errs, fmt.Errorf("orchestrator: wake %s: %w", w.ID, wakeErr))
 	}
 	out.Actions = append(out.Actions, Action{

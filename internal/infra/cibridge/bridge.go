@@ -130,29 +130,36 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		return 0
 	}
 	start := time.Now()
-	defer func() { observe.PollCycleDuration(time.Since(start)) }()
-	observe.PollCycle()
+	updated, skipped := 0, 0
+	defer func() { observe.PollCycleEnd(updated, skipped, time.Since(start)) }()
 	watches, err := b.store.AllWatches()
 	if err != nil {
+		observe.ActorError("cibridge", "", err)
 		log.Printf("cibridge: live watches: %v", err)
 		return 0
 	}
-	updated := 0
+	observe.PollCycleStart(len(watches))
 	for i := range watches {
 		w := watches[i]
 		if w.Status == domain.StatusClosed || len(w.Subscribers) == 0 {
+			skipped++
 			continue
 		}
 		if w.Blocked != nil {
+			observe.BlockDetected(w.ID, w.PR, "blocked watch waits on outside action")
 			// A blocked Watch waits on outside action. Do not poll CI and do
 			// not publish a retry verdict for it; only steer the orchestrator
 			// so it can assign a FIX agent. Polling resumes after unblock.
 			b.handleBlocked(ctx, w)
+			skipped++
 			continue
 		}
+		callStart := time.Now()
 		state, err := b.ci.PRState(ctx, w.Repo, w.PR)
+		observe.ProviderCall("ghci", "PRState", w.ID, err, time.Since(callStart))
 		if err != nil {
 			log.Printf("cibridge: %s#%d: %v", w.Repo, w.PR, err)
+			skipped++
 			continue
 		}
 		verdict := verdictFromState(state)
@@ -161,18 +168,23 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			// the same head. Terminal PR states outrank both guards: a merged
 			// or closed PR closes the Watch from any live verdict.
 			if w.Verdict != domain.VerdictWatching {
+				skipped++
 				continue
 			}
 			if state.HeadRefOid != "" && state.HeadRefOid != w.HeadSHA {
+				skipped++
 				continue
 			}
 		}
 		if verdict == domain.VerdictWatching {
+			skipped++
 			continue
 		}
 		n, err := b.publish(ctx, w, state, verdict)
 		if err != nil {
+			observe.ActorError("cibridge-publish", w.ID, err)
 			log.Printf("cibridge: publish %s: %v", w.ID, err)
+			skipped++
 			continue
 		}
 		updated += n
@@ -262,6 +274,7 @@ func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
 		_, notified := b.blockedNotified[id]
 		b.mu.Unlock()
 		if notified {
+			observe.WakeSkipped(sub.Adapter, w.ID, "block notice already delivered for this revision")
 			continue
 		}
 
@@ -278,9 +291,12 @@ func (b *Bridge) handleBlocked(ctx context.Context, w domain.Watch) {
 			err = b.waker.Deliver(ctx, sub.ID, p)
 		}
 		if err != nil {
+			observe.WakeFailed(sub.Adapter, w.ID, err, w.Revision)
+			observe.ActorError("wake-blocked", w.ID, err)
 			log.Printf("cibridge: blocked wake %s: %v", sub.ID, err)
 			continue
 		}
+		observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
 		b.mu.Lock()
 		b.blockedNotified[id] = struct{}{}
 		b.mu.Unlock()
@@ -403,10 +419,12 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 		target, err := wakeAddressee(next, p.WatchID, addressee)
 		if err != nil || target != addressee || o.SubscriberID != addressee ||
 			domain.ObligationKey(p.WatchID, p.Revision, addressee) != p.ObligationID {
+			observe.WakeSkipped(sub.Adapter, next.ID, "obligation target mismatch")
 			log.Printf("cibridge: skip wake for watch %s: obligation %s addresses %q, subscriber %q, target %q (%v)",
 				next.ID, id, o.SubscriberID, addressee, target, err)
 			continue
 		}
+		wakeStart := time.Now()
 		var deliverErr error
 		if sw, ok := b.adapterWaker.(interface {
 			DeliverToSubscriber(context.Context, domain.Watch, domain.WakePayload, string) error
@@ -418,13 +436,15 @@ func (b *Bridge) publish(ctx context.Context, w domain.Watch, state domain.PRSta
 			deliverErr = b.waker.Deliver(ctx, addressee, p)
 		}
 		if deliverErr != nil {
-			observe.WakeFailed(sub.Adapter, next.ID, deliverErr)
+			observe.WakeFailed(sub.Adapter, next.ID, deliverErr, next.Revision)
+			observe.ActorError("wake", next.ID, deliverErr)
 			log.Printf("cibridge: wake %s: %v", target, deliverErr)
 		} else {
-			observe.WakeDelivered(sub.Adapter, next.ID)
+			observe.WakeDuration(sub.Adapter, time.Since(wakeStart))
+			observe.WakeDelivered(sub.Adapter, next.ID, next.Revision)
 		}
 	}
-	observe.VerdictPublished(string(verdict), next.ID, next.PR)
+	observe.VerdictPublished(string(verdict), next.ID, next.PR, next.Revision)
 	log.Printf("cibridge: %s#%d -> %s revision=%d", next.Repo, next.PR, verdict, next.Revision)
 	return 1, nil
 }

@@ -326,7 +326,7 @@ func Cycle(s CycleStats) {
 }
 
 // VerdictPublished records a verdict the bridge published to the store.
-func VerdictPublished(verdict, watchID string, pr int) {
+func VerdictPublished(verdict, watchID string, pr int, revision ...uint64) {
 	s := Default()
 	s.Inc(CounterVerdictPublished, verdict)
 	cycles.note(func(c *cycleTracker) {
@@ -336,9 +336,11 @@ func VerdictPublished(verdict, watchID string, pr int) {
 			c.retry++
 		}
 	})
-	s.Log(LevelInfo, "verdict_published", Fields{
-		FieldVerdict: verdict, FieldWatchID: watchID, FieldPR: pr,
-	})
+	fields := Fields{FieldVerdict: verdict, FieldWatchID: watchID, FieldPR: pr}
+	if len(revision) != 0 {
+		fields[FieldRevision] = revision[0]
+	}
+	s.Log(LevelInfo, "verdict_published", fields)
 }
 
 // MergeAttempt records an attempted automatic merge.
@@ -374,11 +376,15 @@ func MergeDuration(d time.Duration) {
 }
 
 // WakeDelivered records one wake the host admitted.
-func WakeDelivered(adapter, watchID string) {
+func WakeDelivered(adapter, watchID string, revision ...uint64) {
 	s := Default()
 	s.Inc(CounterWakeDelivered, adapter)
 	cycles.note(func(c *cycleTracker) { c.wakes++ })
-	s.Log(LevelInfo, "wake_delivered", Fields{FieldAdapter: adapter, FieldWatchID: watchID})
+	fields := Fields{FieldAdapter: adapter, FieldWatchID: watchID}
+	if len(revision) != 0 {
+		fields[FieldRevision] = revision[0]
+	}
+	s.Log(LevelInfo, "wake_delivered", fields)
 }
 
 // WakeDuration records how long one wake delivery took.
@@ -402,7 +408,7 @@ func WakeSkipped(adapter, watchID, reason string) {
 }
 
 // WakeFailed records one wake the host refused or that failed in transport.
-func WakeFailed(adapter, watchID string, err error) {
+func WakeFailed(adapter, watchID string, err error, revision ...uint64) {
 	s := Default()
 	s.Inc(CounterWakeErrors, adapter)
 	cycles.note(func(c *cycleTracker) { c.wakes++ })
@@ -412,6 +418,9 @@ func WakeFailed(adapter, watchID string, err error) {
 	}
 	if err != nil {
 		fields[FieldError] = err.Error()
+	}
+	if len(revision) != 0 {
+		fields[FieldRevision] = revision[0]
 	}
 	s.Log(LevelWarn, "wake_error", fields)
 }

@@ -7,8 +7,10 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // ghCIProvider adapts the authenticated `gh` CLI to domain.CIProvider. The
@@ -19,7 +21,20 @@ type Provider struct{}
 
 var _ domain.CIProvider = (*Provider)(nil)
 
-func (Provider) PRState(ctx context.Context, repo string, pr int) (domain.PRState, error) {
+func (Provider) PRState(ctx context.Context, repo string, pr int) (state domain.PRState, err error) {
+	started := time.Now()
+	defer func() {
+		level := observe.LevelDebug
+		fields := observe.Fields{
+			observe.FieldAdapter: "ghci", "method": "PRState", "repo": repo,
+			observe.FieldPR: pr, observe.FieldDuration: time.Since(started).String(),
+		}
+		if err != nil {
+			level = observe.LevelWarn
+			fields[observe.FieldError] = err.Error()
+		}
+		observe.Event(level, "provider_call", fields)
+	}()
 	prArg := strconv.Itoa(pr)
 	view, err := exec.CommandContext(ctx, "gh", "pr", "view", prArg, "--repo", repo, "--json",
 		"headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision").Output()

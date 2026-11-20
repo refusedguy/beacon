@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // ===== база wake (#281) =====
@@ -2532,18 +2533,22 @@ func ValidateT210Target(p T210WakePointer) error {
 // T210Deliver is the central path. It binds through the registry only. A
 // pointer with no exact match is skipped, never routed to a guessed session.
 func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, sessions *T211SessionRegistry, adapters *T211AdapterRegistry, deliveries *T211DeliveryRegistry) (T210Receipt, bool) {
+	started := time.Now()
 	if err := ValidateT210Target(p); err != nil {
+		observe.WakeSkipped(p.Adapter, p.WatchID, "invalid wake target: "+err.Error())
 		log.Printf("wake: skip pointer %s: %v", p.ObligationID, err)
 		T210settle(src, p, deliveries, T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}, nil)
 		return T210Receipt{}, false
 	}
 	adapter, ok := adapters.Get(p.Adapter)
 	if !ok {
+		observe.WakeSkipped(p.Adapter, p.WatchID, "no wake adapter registered")
 		T210settle(src, p, deliveries, T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Outcome: T210Skipped}, nil)
 		return T210Receipt{}, false
 	}
 	target, ok := adapter.Bind(p, sessions)
 	if !ok {
+		observe.WakeSkipped(p.Adapter, p.WatchID, "adapter could not bind target")
 		r := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}
 		T210settle(src, p, deliveries, r, adapter)
 		return r, false
@@ -2552,14 +2557,26 @@ func T210Deliver(ctx context.Context, p T210WakePointer, src T210PointerSource, 
 	// subscriber address, even when its own registry maps that address.
 	// Opaque non-session targets stay under the adapter's own registry.
 	if strings.HasPrefix(p.Target, "ses_") && string(target) != p.Target {
+		observe.WakeSkipped(p.Adapter, p.WatchID, "adapter bound a different session")
 		log.Printf("wake: skip pointer %s: adapter bound %q, subscriber %q", p.ObligationID, target, p.Target)
 		r := T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Skipped}
 		T210settle(src, p, deliveries, r, adapter)
 		return r, false
 	}
 	r, err := adapter.Deliver(p, target)
+	observe.WakeDuration(p.Adapter, time.Since(started))
 	if err != nil {
+		observe.WakeFailed(p.Adapter, p.WatchID, err, p.Revision)
 		r = T210Receipt{ObligationID: p.ObligationID, Attempt: p.Attempt, Delivery: p.Delivery, Outcome: T210Errored}
+	} else {
+		switch r.Outcome {
+		case T210Delivered, T210Queued, T210Enqueued:
+			observe.WakeDelivered(p.Adapter, p.WatchID, p.Revision)
+		case T210Errored:
+			observe.WakeFailed(p.Adapter, p.WatchID, errors.New(r.Outcome), p.Revision)
+		default:
+			observe.WakeSkipped(p.Adapter, p.WatchID, "adapter outcome: "+r.Outcome)
+		}
 	}
 	T210settle(src, p, deliveries, r, adapter)
 	return r, true
