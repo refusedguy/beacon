@@ -600,3 +600,134 @@ func TestStartGeneratesRandomToken(t *testing.T) {
 		t.Fatalf("длина токена = %d, ожидалась 48", len(a.Token))
 	}
 }
+
+func TestVersionEndpoint(t *testing.T) {
+	srv := newTestServer(t, stubProvider{}, &stubSink{}, NewEventBus(0))
+
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/version", nil)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("version status = %d, body %s", w.Code, w.Body.String())
+	}
+	var body VersionInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.OK || body.Version != "v-test" || body.PID != os.Getpid() || body.ProjectKey != "project-key" {
+		t.Fatalf("version body = %+v", body)
+	}
+	if body.UptimeSec < 3 || !body.StartedAt.Equal(srv.cfg.StartedAt) {
+		t.Fatalf("version uptime/startedAt = %d/%s", body.UptimeSec, body.StartedAt)
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/version", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("version без токена = %d, ожидался 401", w.Code)
+	}
+}
+
+func TestMetricsActiveTasksMatchesLiveWatches(t *testing.T) {
+	snap := Snapshot{LiveWatches: []domain.Watch{
+		{ID: "w1", Status: domain.StatusWatching},
+		{ID: "w2", Status: domain.StatusWatching},
+	}}
+	srv := newTestServer(t, stubProvider{snap: snap}, &stubSink{}, NewEventBus(0))
+
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, body %s", w.Code, w.Body.String())
+	}
+	var body OpsMetrics
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.OK || body.ActiveTasks != len(snap.LiveWatches) {
+		t.Fatalf("metrics = %+v, active_tasks должен быть %d", body, len(snap.LiveWatches))
+	}
+	if body.WakesTotal != 0 {
+		t.Fatalf("wakes_total = %d, ожидался 0", body.WakesTotal)
+	}
+}
+
+func TestMetricsAfterWake(t *testing.T) {
+	snap := Snapshot{LiveWatches: []domain.Watch{{ID: "w1", Status: domain.StatusWatching}}}
+	srv := newTestServer(t, stubProvider{snap: snap}, &stubSink{}, NewEventBus(0))
+	srv.ObserveWake(120 * time.Millisecond)
+	srv.ObserveWake(180 * time.Millisecond)
+
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("metrics status = %d, body %s", w.Code, w.Body.String())
+	}
+	var body OpsMetrics
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.WakesTotal != 2 || body.WakeLatencyMs != 150 || body.WakeLatencyMaxMs != 180 || body.WakeLatencyLastMs != 180 {
+		t.Fatalf("wake metrics = %+v", body)
+	}
+	if body.ActiveTasks != 1 {
+		t.Fatalf("active_tasks = %d, ожидался 1", body.ActiveTasks)
+	}
+}
+
+func TestMetricsSnapshotFailure(t *testing.T) {
+	srv := newTestServer(t, stubProvider{err: errors.New("store down")}, &stubSink{}, NewEventBus(0))
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/metrics", nil)))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("metrics при ошибке провайдера = %d, ожидался 500", w.Code)
+	}
+}
+
+func TestAuditActorIngress(t *testing.T) {
+	sink := &stubSink{result: DecisionResult{DecisionID: "journal-9"}}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+
+	body := `{"command":"approve","watchID":"w1","actor":"human"}`
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(body, "http://127.0.0.1:7432"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d, body %s", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/audit", nil)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("audit status = %d, body %s", w.Code, w.Body.String())
+	}
+	var page AuditPage
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Entries) != 1 {
+		t.Fatalf("audit page = %+v", page)
+	}
+	got := page.Entries[0]
+	if got.Actor != "human" || got.Ingress != ingressHTTPAPI || got.Command != "approve" ||
+		got.WatchID != "w1" || got.DecisionID != "journal-9" || got.At.IsZero() {
+		t.Fatalf("audit entry = %+v", got)
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/audit?actor=other", nil)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("audit filter status = %d", w.Code)
+	}
+	var filtered AuditPage
+	if err := json.Unmarshal(w.Body.Bytes(), &filtered); err != nil {
+		t.Fatal(err)
+	}
+	if filtered.Total != 0 || len(filtered.Entries) != 0 {
+		t.Fatalf("audit filter page = %+v", filtered)
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/audit", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("audit без токена = %d, ожидался 401", w.Code)
+	}
+}
