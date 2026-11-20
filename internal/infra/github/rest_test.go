@@ -322,3 +322,58 @@ func TestTokenOnlyInAuthorizationHeader(t *testing.T) {
 		}
 	}
 }
+
+// TestFailureExcerptReadsAnnotations covers the W11-B REST read path: one call
+// resolves the failed CheckRun by name on the head SHA, the next reads its
+// annotations. A successful check with the same name is ignored.
+func TestFailureExcerptReadsAnnotations(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/repos/o/r/commits/sha/check-runs":
+			fmt.Fprint(w, `{"total_count":2,"check_runs":[`+
+				`{"id":41,"name":"ci/failure","conclusion":"success"},`+
+				`{"id":42,"name":"ci/failure","conclusion":"failure"}]}`)
+		case "/repos/o/r/check-runs/42/annotations":
+			fmt.Fprint(w, `[{"path":"pkg/a.go","start_line":12,"title":"panic","message":"nil pointer"}]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+	got, err := rc.FailureExcerpt(context.Background(), "o/r", "sha", "ci/failure")
+	if err != nil {
+		t.Fatalf("FailureExcerpt: %v", err)
+	}
+	if !strings.Contains(got, "pkg/a.go:12") || !strings.Contains(got, "panic") ||
+		!strings.Contains(got, "nil pointer") {
+		t.Errorf("excerpt = %q", got)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("REST calls = %d (%v), want 2", len(paths), paths)
+	}
+	if paths[1] != "/repos/o/r/check-runs/42/annotations" {
+		t.Errorf("annotations path = %q, want the failed run 42", paths[1])
+	}
+}
+
+func TestFailureExcerptNoFailedRunIsEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"total_count":1,"check_runs":[{"id":9,"name":"ci/failure","conclusion":"success"}]}`)
+	}))
+	defer srv.Close()
+
+	rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+	got, err := rc.FailureExcerpt(context.Background(), "o/r", "sha", "ci/failure")
+	if err != nil {
+		t.Fatalf("FailureExcerpt: %v", err)
+	}
+	if got != "" {
+		t.Errorf("excerpt = %q, want empty for a green run", got)
+	}
+}

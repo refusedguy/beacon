@@ -2,9 +2,10 @@
 //
 // This file implements beacon_get_result (WORKER-PROMPT §4.1): an additive tool
 // that hands out a Watch result and stamps readAt on the caller's obligation.
-// It never returns full logs or check output, only names, conclusions, links and
-// the flaky/retry facts needed to decide the next step (WORKER-PROMPT §4.1,
-// ADR 0012). The tool is additive, not read-only: issuing content is a state
+// It never returns full logs or raw check output, only names, conclusions,
+// links, a bounded redacted annotation excerpt (W11-B) and the flaky/retry
+// facts needed to decide the next step (WORKER-PROMPT §4.1, ADR 0012). The tool
+// is additive, not read-only: issuing content is a state
 // change even though the response is a projection of the Watch.
 package mcp
 
@@ -14,11 +15,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -46,6 +52,27 @@ var failureConclusions = map[string]bool{
 	"CANCELLED":       true,
 }
 
+// FailureExcerpt is the bounded answer of a failure-excerpt source. W11-B adds
+// it to beacon_get_result so a subscriber reads the reason for a failed check
+// from the tool instead of shelling out to `gh run view --log-failed`. The
+// source is fetched at most once per (watchID, headSHA, checkName) and cached
+// in SQLite; a second poll in the same cycle never touches the network again.
+type FailureExcerptSource interface {
+	// FailureExcerpt returns a short annotation excerpt for one failed check.
+	// The handler redacts and escapes it before it reaches the wire. An empty
+	// string with a nil error means the check has no annotations; it is cached
+	// like any other answer so it is not re-fetched.
+	FailureExcerpt(ctx context.Context, repo, headSHA, checkName string) (string, error)
+}
+
+// failureExcerptLimit is the 2 KB ceiling of a single excerpt and of the
+// aggregate string returned in GetResultOutput.
+const failureExcerptLimit = 2048
+
+// failureExcerptAnnotationCount bounds how many annotations are requested and
+// rendered per failed check.
+const failureExcerptAnnotationCount = 8
+
 // resultStoreReader is the narrow read port used by beacon_get_result and
 // beacon_ack. It is satisfied by the store and by test doubles. The core only
 // reads; every write goes through ObligationStamper.
@@ -58,6 +85,83 @@ type resultStoreReader interface {
 // production store satisfies it with one SQLite transaction per stamp.
 type resultTxWriter interface {
 	Write(ctx context.Context, fn func(*sql.Tx) error) error
+}
+
+// failureExcerptCache stores one excerpt per (watchID, headSHA, checkName). It
+// is deliberately a port so a test can assert that a second read of the same
+// triple never reaches the source again.
+type failureExcerptCache interface {
+	Get(ctx context.Context, watchID, headSHA, checkName string) (string, bool, error)
+	Put(ctx context.Context, watchID, headSHA, checkName, excerpt string) error
+}
+
+// failureExcerptTableDDL is idempotent: the cache owns its own table so a
+// caller does not need a migration just to enable excerpts. Reads go through
+// the same single writer as stamps, which keeps the cache consistent with the
+// Watch it describes.
+const failureExcerptTableDDL = `CREATE TABLE IF NOT EXISTS failure_excerpts (
+	watch_id   TEXT NOT NULL,
+	head_sha   TEXT NOT NULL,
+	check_name TEXT NOT NULL,
+	excerpt    TEXT NOT NULL,
+	PRIMARY KEY (watch_id, head_sha, check_name)
+)`
+
+// sqlFailureExcerptCache implements failureExcerptCache over the store's single
+// writer. The stored text is already redacted, escaped and bounded before it
+// reaches SQLite, so a cache hit needs no further sanitising.
+type sqlFailureExcerptCache struct {
+	w resultTxWriter
+}
+
+func newSQLFailureExcerptCache(w resultTxWriter) *sqlFailureExcerptCache {
+	if w == nil {
+		return nil
+	}
+	return &sqlFailureExcerptCache{w: w}
+}
+
+func (c *sqlFailureExcerptCache) Get(ctx context.Context, watchID, headSHA, checkName string) (string, bool, error) {
+	if c == nil || c.w == nil {
+		return "", false, nil
+	}
+	var (
+		excerpt string
+		found   bool
+	)
+	err := c.w.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(failureExcerptTableDDL); err != nil {
+			return err
+		}
+		err := tx.QueryRow(`SELECT excerpt FROM failure_excerpts
+			WHERE watch_id = ? AND head_sha = ? AND check_name = ?`,
+			watchID, headSHA, checkName).Scan(&excerpt)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return nil
+	})
+	return excerpt, found, err
+}
+
+func (c *sqlFailureExcerptCache) Put(ctx context.Context, watchID, headSHA, checkName, excerpt string) error {
+	if c == nil || c.w == nil {
+		return nil
+	}
+	return c.w.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(failureExcerptTableDDL); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO failure_excerpts
+			(watch_id, head_sha, check_name, excerpt) VALUES (?, ?, ?, ?)
+			ON CONFLICT(watch_id, head_sha, check_name) DO NOTHING`,
+			watchID, headSHA, checkName, excerpt)
+		return err
+	})
 }
 
 // obligationStamp selects which delivery fact a stamp writes.
@@ -164,6 +268,12 @@ type GetResultHandler struct {
 	stamper ObligationStamper
 	clock   domain.Clock
 	after   time.Duration
+
+	// W11-B failure-excerpt plumbing. Both fields are optional: a nil source
+	// omits failureExcerpt entirely, and a nil cache falls back to the store's
+	// single writer when the stamper is SQL-backed.
+	excerptSource FailureExcerptSource
+	excerptCache  failureExcerptCache
 }
 
 // NewGetResultHandler builds a handler. A nil clock falls back to wall time.
@@ -171,7 +281,49 @@ func NewGetResultHandler(store resultStoreReader, stamper ObligationStamper, clo
 	if clock == nil {
 		clock = getResultWallClock{}
 	}
-	return &GetResultHandler{store: store, stamper: stamper, clock: clock}
+	return &GetResultHandler{
+		store:         store,
+		stamper:       stamper,
+		clock:         clock,
+		excerptSource: newEnvFailureExcerptSource(),
+	}
+}
+
+// SetFailureExcerptSource supplies the port that fetches annotations for a
+// failed check. A nil source disables the W11-B field altogether, so a server
+// without GitHub credentials keeps the exact previous response shape.
+func (h *GetResultHandler) SetFailureExcerptSource(src FailureExcerptSource) {
+	if h != nil {
+		h.excerptSource = src
+	}
+}
+
+// SetFailureExcerptCache overrides the excerpt cache. Tests inject a counting
+// cache here to prove a repeated read does not call the source twice.
+func (h *GetResultHandler) SetFailureExcerptCache(cache failureExcerptCache) {
+	if h != nil {
+		h.excerptCache = cache
+	}
+}
+
+// excerptStore derives the cache from the store's single writer when none was
+// injected. The production store implements Write directly; a bare SQL stamper
+// is the fallback for callers that pass only a stamper. Keeping this derivation
+// here avoids a new composition-root port just to persist one short string.
+func (h *GetResultHandler) excerptStore() failureExcerptCache {
+	if h == nil {
+		return nil
+	}
+	if h.excerptCache != nil {
+		return h.excerptCache
+	}
+	if w, ok := h.store.(resultTxWriter); ok {
+		return newSQLFailureExcerptCache(w)
+	}
+	if s, ok := h.stamper.(*SQLObligationStamper); ok && s != nil {
+		return newSQLFailureExcerptCache(s.w)
+	}
+	return nil
 }
 
 // SetAfter sets the MCP-boundary threshold that turns a slow call into the
@@ -267,19 +419,286 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 
 	observe.ResultRead(w.ID, string(w.Verdict), w.Revision)
 	failed := collectFailedChecks(w)
+	excerpt := h.attachFailureExcerpts(ctx, w, failed)
 	action, command, hint := nextStepFor(w.Verdict)
 	return GetResultOutput{
-		Status:       string(w.Status),
-		Verdict:      string(w.Verdict),
-		Revision:     w.Revision,
-		Merge:        MergeSnapshot{Mergeable: w.Merge.Mergeable, MergeStateStatus: w.Merge.MergeStateStatus},
-		FailedChecks: failed,
-		ObligationID: obligationID,
-		RetryBudget:  remainingRetryBudget(w, failed),
-		NextAction:   action,
-		NextCommand:  command,
-		NextHint:     hint,
+		Status:         string(w.Status),
+		Verdict:        string(w.Verdict),
+		Revision:       w.Revision,
+		Merge:          MergeSnapshot{Mergeable: w.Merge.Mergeable, MergeStateStatus: w.Merge.MergeStateStatus},
+		FailedChecks:   failed,
+		ObligationID:   obligationID,
+		RetryBudget:    remainingRetryBudget(w, failed),
+		NextAction:     action,
+		NextCommand:    command,
+		NextHint:       hint,
+		FailureExcerpt: excerpt,
 	}, nil
+}
+
+// --- Failure excerpts (W11-B) ----------------------------------------------
+//
+// A failed check alone does not tell a subscriber what broke. Before W11-B the
+// subscriber had to run `gh run view --log-failed` itself. The handler now asks
+// a FailureExcerptSource once per (watchID, headSHA, checkName), caches the
+// answer in SQLite, redacts and escapes it at this boundary, and returns it in
+// failureExcerpt plus the matching failedChecks entry. The field is optional:
+// with no source configured the response is byte-for-byte the old shape.
+
+// attachFailureExcerpts fills each failed check's excerpt and returns the
+// aggregate bounded at failureExcerptLimit. A cache hit never calls the source;
+// a miss calls it exactly once and stores the answer, including an empty one,
+// so a check with no annotations is not re-fetched on the next poll.
+func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.Watch, failed []FailedCheck) string {
+	if h == nil || h.excerptSource == nil || len(failed) == 0 {
+		return ""
+	}
+	cache := h.excerptStore()
+	var agg strings.Builder
+	for i := range failed {
+		name := failed[i].Name
+		excerpt, ok, err := cacheGet(ctx, cache, w.ID, w.HeadSHA, name)
+		if err != nil {
+			observe.ActorError("get_result-excerpt-cache", w.ID, err)
+			ok = false
+		}
+		if !ok {
+			raw, fetchErr := h.excerptSource.FailureExcerpt(ctx, w.Repo, w.HeadSHA, name)
+			if fetchErr != nil {
+				observe.ActorError("get_result-excerpt", w.ID, fetchErr)
+				raw = ""
+			}
+			excerpt = sanitizeExcerpt(raw, failureExcerptLimit)
+			if putErr := cachePut(ctx, cache, w.ID, w.HeadSHA, name, excerpt); putErr != nil {
+				observe.ActorError("get_result-excerpt-cache", w.ID, putErr)
+			}
+		}
+		failed[i].FailureExcerpt = excerpt
+		if excerpt == "" || agg.Len() >= failureExcerptLimit {
+			continue
+		}
+		if agg.Len() > 0 {
+			agg.WriteByte('\n')
+		}
+		agg.WriteString(name)
+		agg.WriteString(": ")
+		agg.WriteString(excerpt)
+	}
+	return clampExcerpt(agg.String(), failureExcerptLimit)
+}
+
+func cacheGet(ctx context.Context, c failureExcerptCache, watchID, headSHA, name string) (string, bool, error) {
+	if c == nil {
+		return "", false, nil
+	}
+	return c.Get(ctx, watchID, headSHA, name)
+}
+
+func cachePut(ctx context.Context, c failureExcerptCache, watchID, headSHA, name, excerpt string) error {
+	if c == nil {
+		return nil
+	}
+	return c.Put(ctx, watchID, headSHA, name, excerpt)
+}
+
+// escapeUntrusted escapes every character that could turn an annotation into
+// markup, a JSON string delimiter or a control sequence. It mirrors the wake
+// package's identifier escaping: annotations are untrusted CI output and must
+// never be able to rewrite an agent's instructions or a tool parameter.
+func escapeUntrusted(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '<':
+			b.WriteString("&lt;")
+		case '>':
+			b.WriteString("&gt;")
+		case '&':
+			b.WriteString("&amp;")
+		case '"':
+			b.WriteString("&quot;")
+		case '\'':
+			b.WriteString("&#39;")
+		default:
+			if r < 0x20 || r == 0x7f {
+				b.WriteString(fmt.Sprintf("\\u%04x", r))
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// sanitizeExcerpt redacts secrets, escapes untrusted markup and bounds the
+// text. Redaction runs on the raw bytes first so its byte patterns still match;
+// escaping and truncation follow. Truncation is rune-safe, so a multi-byte
+// character is never cut in half.
+func sanitizeExcerpt(raw string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	clean := observe.Redact([]byte(raw))
+	return clampExcerpt(escapeUntrusted(string(clean)), limit)
+}
+
+func clampExcerpt(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+	cut := s[:limit]
+	for len(cut) > 0 && !utf8.ValidString(cut) {
+		cut = cut[:len(cut)-1]
+	}
+	return cut
+}
+
+// envFailureExcerptSource is the zero-wiring default. It reads the token from
+// BEACON_GITHUB_TOKEN only: GitHub Actions injects GITHUB_TOKEN into every
+// test run, and gating on that would make hermetic tests call the network. A
+// nil source means "no credentials", which keeps the response unchanged.
+// The API base can be overridden with BEACON_GITHUB_API for hermetic tests.
+type envFailureExcerptSource struct {
+	token  string
+	base   string
+	client *http.Client
+}
+
+func newEnvFailureExcerptSource() FailureExcerptSource {
+	token := strings.TrimSpace(os.Getenv("BEACON_GITHUB_TOKEN"))
+	if token == "" {
+		return nil
+	}
+	base := strings.TrimSpace(os.Getenv("BEACON_GITHUB_API"))
+	if base == "" {
+		base = "https://api.github.com"
+	}
+	return &envFailureExcerptSource{
+		token:  token,
+		base:   strings.TrimRight(base, "/"),
+		client: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+type githubCheckRun struct {
+	ID         int64  `json:"id"`
+	Name       string `json:"name"`
+	Conclusion string `json:"conclusion"`
+	State      string `json:"state"`
+}
+
+type githubAnnotation struct {
+	Path      string `json:"path"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+	Title     string `json:"title"`
+	Message   string `json:"message"`
+	Level     string `json:"annotation_level"`
+}
+
+// FailureExcerpt finds the failed CheckRun by name on the Watch's head SHA and
+// reads its annotations through REST. The two endpoints are the REST half of
+// W11-B; a GraphQL checkRun.annotations(first:N) source can be injected instead
+// by supplying another FailureExcerptSource.
+func (s *envFailureExcerptSource) FailureExcerpt(ctx context.Context, repo, headSHA, checkName string) (string, error) {
+	if s == nil || s.client == nil || repo == "" || headSHA == "" || checkName == "" {
+		return "", nil
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" {
+		return "", nil
+	}
+	path := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?per_page=100", s.base, owner, name, headSHA)
+	var body struct {
+		CheckRuns []githubCheckRun `json:"check_runs"`
+	}
+	if err := s.getJSON(ctx, path, &body); err != nil {
+		return "", err
+	}
+	var id int64
+	for _, run := range body.CheckRuns {
+		if run.Name != checkName || !failedRunConclusion(run.Conclusion) {
+			continue
+		}
+		id = run.ID
+		break
+	}
+	if id == 0 {
+		return "", nil
+	}
+	annotationsPath := fmt.Sprintf("%s/repos/%s/%s/check-runs/%d/annotations?per_page=%d",
+		s.base, owner, name, id, failureExcerptAnnotationCount)
+	var annotations []githubAnnotation
+	if err := s.getJSON(ctx, annotationsPath, &annotations); err != nil {
+		return "", err
+	}
+	return formatAnnotations(annotations), nil
+}
+
+func (s *envFailureExcerptSource) getJSON(ctx context.Context, url string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("github excerpt: status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
+}
+
+// failedRunConclusion is the CheckRun conclusion subset W11-B treats as a
+// failure. StatusContext states are capitalised and are not CheckRuns, so they
+// are deliberately absent here as well.
+func failedRunConclusion(conclusion string) bool {
+	switch strings.ToUpper(conclusion) {
+	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "CANCELLED", "CANCELED":
+		return true
+	}
+	return false
+}
+
+// formatAnnotations renders at most failureExcerptAnnotationCount lines of
+// "path:line: title: message". Empty fields are skipped so an annotation with
+// only a message still produces a useful line. The caller bounds the result.
+func formatAnnotations(annotations []githubAnnotation) string {
+	var b strings.Builder
+	for i, a := range annotations {
+		if i >= failureExcerptAnnotationCount {
+			break
+		}
+		msg := strings.TrimSpace(a.Message)
+		title := strings.TrimSpace(a.Title)
+		if msg == "" && title == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		if p := strings.TrimSpace(a.Path); p != "" {
+			b.WriteString(p)
+			if a.StartLine > 0 {
+				b.WriteByte(':')
+				b.WriteString(strconv.Itoa(a.StartLine))
+			}
+			b.WriteString(": ")
+		}
+		if title != "" {
+			b.WriteString(title)
+			if msg != "" {
+				b.WriteString(": ")
+			}
+		}
+		b.WriteString(msg)
+	}
+	return b.String()
 }
 
 // --- Ship facts from observed checks (ADR 0040 §2, T3.75) -------------------
