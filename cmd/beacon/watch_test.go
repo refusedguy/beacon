@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -707,5 +708,333 @@ func TestRunWatchWakeJSONKeepsStdoutValid(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "wake session=ses-1 ") {
 		t.Fatalf("wake не в stderr: %q", errOut.String())
+	}
+}
+
+// --- T3.141 / ADR 0060 p2: beacon watch --live ---
+
+// w3141Source is the stand-in for the opencode client. It feeds a script of
+// event channels: closing a channel is an SSE disconnect, and after the script
+// runs out Events returns a channel that blocks until the lifetime ends.
+type w3141Source struct {
+	sessions    []opencodeSession
+	sessionErr  error
+	channels    []chan liveEvent
+	sessionCall int
+	eventsCall  int
+}
+
+func (s *w3141Source) SessionList() ([]opencodeSession, error) {
+	s.sessionCall++
+	if s.sessionErr != nil {
+		return nil, s.sessionErr
+	}
+	return s.sessions, nil
+}
+
+func (s *w3141Source) Events(ctx context.Context) <-chan liveEvent {
+	n := s.eventsCall
+	s.eventsCall++
+	if n < len(s.channels) {
+		return s.channels[n]
+	}
+	ch := make(chan liveEvent)
+	return ch
+}
+
+// w3141Session builds one session.list row for the stand-in.
+func w3141Session(id, agent, state string) opencodeSession {
+	status, _ := json.Marshal(map[string]string{"type": state})
+	return opencodeSession{ID: id, Agent: agent, Status: status}
+}
+
+// w3141Harness owns the loop goroutine and the replaced seams of one test.
+type w3141Harness struct {
+	out      *bytes.Buffer
+	errOut   *bytes.Buffer
+	calls    *[]w69Call
+	rendered <-chan struct{}
+	done     <-chan int
+	cancel   context.CancelFunc
+	waited   bool
+}
+
+// w3141Start installs the stand-in, starts runWatch --live in a goroutine and
+// wraps watchSnapshot so tests can wait for each refresh deterministically.
+// Call w69Snapshot before w3141Start to set the snapshot contents.
+func w3141Start(t *testing.T, src *w3141Source, args ...string) *w3141Harness {
+	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	c, out, errOut, calls := w69CLI(t, nil)
+	prevSnap, prevSrc, prevCtx, prevDelay := watchSnapshot, watchLiveSource, watchLiveContext, watchReconnectDelay
+	watchReconnectDelay = 0
+
+	rendered := make(chan struct{}, 64)
+	watchSnapshot = func() (mcp.StateSnapshot, error) {
+		select {
+		case rendered <- struct{}{}:
+		default:
+		}
+		return prevSnap()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	watchLiveContext = func() (context.Context, context.CancelFunc) { return ctx, cancel }
+	SetLiveSource(src)
+
+	done := make(chan int, 1)
+	go func() { done <- runWatch(c, append([]string{"--live"}, args...)) }()
+
+	h := &w3141Harness{
+		out: out, errOut: errOut, calls: calls,
+		rendered: rendered, done: done, cancel: cancel,
+	}
+	t.Cleanup(func() {
+		cancel()
+		SetLiveSource(prevSrc)
+		watchLiveContext = prevCtx
+		watchSnapshot = prevSnap
+		watchReconnectDelay = prevDelay
+	})
+	return h
+}
+
+// w3141Renders waits for n snapshot reads, so the loop has printed n tables.
+func (h *w3141Harness) w3141Renders(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case <-h.rendered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("не дождались рендера %d из %d, stderr %q", i+1, n, h.errOut.String())
+		}
+	}
+}
+
+// w3141Stop cancels the lifetime, then returns the command exit code.
+func (h *w3141Harness) w3141Stop(t *testing.T) int {
+	t.Helper()
+	if !h.waited {
+		h.waited = true
+		h.cancel()
+		select {
+		case code := <-h.done:
+			return code
+		case <-time.After(2 * time.Second):
+			t.Fatal("живой цикл не остановился по context")
+		}
+	}
+	return -1
+}
+
+func TestW3141LiveRendersSevenColumnJoinTable(t *testing.T) {
+	snapshots := w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictReady, 7, "ses-1"),
+		}}, nil
+	})
+	events := make(chan liveEvent, 2)
+	events <- liveEvent{Type: "session.status"}
+	events <- liveEvent{Type: "session.execution.started"}
+	close(events)
+	src := &w3141Source{
+		sessions: []opencodeSession{w3141Session("ses-1", "developer", "idle")},
+		channels: []chan liveEvent{events},
+	}
+	h := w3141Start(t, src)
+
+	// connect + two events + reconnect after the channel closes.
+	h.w3141Renders(t, 4)
+	if code := h.w3141Stop(t); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, h.errOut.String())
+	}
+	if h.errOut.Len() != 0 {
+		t.Fatalf("stderr не пустой: %q", h.errOut.String())
+	}
+	for _, column := range []string{
+		"WATCH", "VERDICT", "REVISION", "SESSION", "AGENT", "OPENCODE STATE", "ATTENTION",
+	} {
+		if !strings.Contains(h.out.String(), column) {
+			t.Fatalf("нет колонки %s: %q", column, h.out.String())
+		}
+	}
+	for _, value := range []string{"watch-1", "ready", "7", "ses-1", "developer", "idle", "-"} {
+		if !strings.Contains(h.out.String(), value) {
+			t.Fatalf("нет значения %s: %q", value, h.out.String())
+		}
+	}
+	if *snapshots != 4 {
+		t.Fatalf("снимков %d, ожидалось 4", *snapshots)
+	}
+	if src.sessionCall != 4 {
+		t.Fatalf("session.list вызовов %d, ожидалось 4", src.sessionCall)
+	}
+	if src.eventsCall != 2 {
+		t.Fatalf("подписок %d, ожидалось 2 (подключение + reconnect)", src.eventsCall)
+	}
+	if len(*h.calls) != 0 {
+		t.Fatalf("живой контур вызвал внешний runner %d раз", len(*h.calls))
+	}
+}
+
+func TestW3141LiveVerdictComesFromBeaconNotIdle(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictWatching, 3, "ses-1"),
+		}}, nil
+	})
+	events := make(chan liveEvent, 1)
+	events <- liveEvent{Type: "session.status"}
+	close(events)
+	src := &w3141Source{
+		sessions: []opencodeSession{w3141Session("ses-1", "developer", "idle")},
+		channels: []chan liveEvent{events},
+	}
+	h := w3141Start(t, src)
+	h.w3141Renders(t, 2)
+	if code := h.w3141Stop(t); code != 0 {
+		t.Fatalf("код выхода %d", code)
+	}
+
+	line := w69LineContaining(h.out.String(), "watch-1")
+	if !strings.Contains(line, "watching") || strings.Contains(line, "ready") {
+		t.Fatalf("idle из OpenCode изменил вердикт: %q", line)
+	}
+}
+
+func TestW3141LiveIntervalRefreshesWithoutEvents(t *testing.T) {
+	snapshots := w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{}, nil
+	})
+	src := &w3141Source{}
+	h := w3141Start(t, src, "--interval", "20ms")
+	h.w3141Renders(t, 3)
+	if code := h.w3141Stop(t); code != 0 {
+		t.Fatalf("код выхода %d", code)
+	}
+	if *snapshots < 3 || src.sessionCall < 3 {
+		t.Fatalf("перечитываний: снимков %d, session.list %d, ожидалось минимум 3",
+			*snapshots, src.sessionCall)
+	}
+	if src.eventsCall != 1 {
+		t.Fatalf("подписок %d, интервал не должен создавать новые", src.eventsCall)
+	}
+}
+
+func TestW3141LiveReconnectRereadsSnapshotWithoutReplay(t *testing.T) {
+	first := make(chan liveEvent, 1)
+	first <- liveEvent{Type: "session.status"}
+	close(first)
+	second := make(chan liveEvent, 1)
+	second <- liveEvent{Type: "session.status"}
+	close(second)
+	snapshots := w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictReady, 7, "ses-1"),
+		}}, nil
+	})
+	src := &w3141Source{
+		sessions: []opencodeSession{w3141Session("ses-1", "developer", "idle")},
+		channels: []chan liveEvent{first, second},
+	}
+	h := w3141Start(t, src)
+
+	// connect, event, reconnect with a fresh snapshot, event, reconnect.
+	h.w3141Renders(t, 5)
+	if code := h.w3141Stop(t); code != 0 {
+		t.Fatalf("код выхода %d", code)
+	}
+	if src.eventsCall != 3 {
+		t.Fatalf("подписок %d, ожидалось 3", src.eventsCall)
+	}
+	if *snapshots != 5 || src.sessionCall != 5 {
+		t.Fatalf("перечитываний: снимков %d, session.list %d, ожидалось 5",
+			*snapshots, src.sessionCall)
+	}
+}
+
+func TestW3141LiveNoSourceFailsClosed(t *testing.T) {
+	prev := watchLiveSource
+	SetLiveSource(nil)
+	t.Cleanup(func() { SetLiveSource(prev) })
+	c, out, errOut, _ := w69CLI(t, nil)
+
+	if code := runWatch(c, []string{"--live"}); code != 2 {
+		t.Fatalf("код выхода %d, ожидался 2", code)
+	}
+	if out.Len() != 0 || !strings.Contains(errOut.String(), "не подключён") {
+		t.Fatalf("нет ошибки источника: stdout %q stderr %q", out.String(), errOut.String())
+	}
+}
+
+func TestW3141LiveSnapshotFailureFailsClosed(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{}, errSnapshot
+	})
+	prev := watchLiveSource
+	t.Cleanup(func() { SetLiveSource(prev) })
+	SetLiveSource(&w3141Source{})
+	c, out, errOut, _ := w69CLI(t, nil)
+
+	if code := runWatch(c, []string{"--live"}); code != 2 {
+		t.Fatalf("код выхода %d, ожидался 2", code)
+	}
+	if out.Len() != 0 || !strings.Contains(errOut.String(), "snapshot") {
+		t.Fatalf("ожидалась ошибка снимка: stdout %q stderr %q", out.String(), errOut.String())
+	}
+}
+
+func TestW3141MarkAttentionUsesVerdictAndRequests(t *testing.T) {
+	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	requests := []attentionRequest{
+		{Agent: "reviewer", TaskID: "watch-2", Reason: "question", RequestedAt: base.Add(time.Second)},
+		{Agent: "developer", TaskID: "watch-1", Reason: "approval", RequestedAt: base},
+	}
+	rows := []watchRow{
+		{Watch: "watch-1", Verdict: "watching", Agent: "developer"},
+		{Watch: "watch-2", Verdict: "ready", Agent: "reviewer"},
+		{Watch: "watch-3", Verdict: "needs_input", Agent: "builder"},
+		{Watch: "watch-4", Verdict: "ready", Agent: "unknown"},
+	}
+	markAttention(rows, requests)
+	want := map[string]string{
+		"watch-1": attentionYes,
+		"watch-2": attentionYes,
+		"watch-3": attentionYes,
+		"watch-4": "",
+	}
+	for _, r := range rows {
+		if r.Attention != want[r.Watch] {
+			t.Fatalf("внимание %s = %q, хотим %q", r.Watch, r.Attention, want[r.Watch])
+		}
+	}
+	// Ровно то же решение без запросов: вердикт needs_input всё ещё виден.
+	again := []watchRow{{Watch: "watch-3", Verdict: "needs_input"}}
+	markAttention(again, nil)
+	if again[0].Attention != attentionYes {
+		t.Fatalf("needs_input без запросов не отмечен: %+v", again[0])
+	}
+}
+
+func TestW3141LiveJSONIncludesAttention(t *testing.T) {
+	w69Snapshot(t, func() (mcp.StateSnapshot, error) {
+		return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+			w69Watch(domain.VerdictNeedsInput, 4, "ses-1"),
+		}}, nil
+	})
+	src := &w3141Source{sessions: []opencodeSession{w3141Session("ses-1", "developer", "retry")}}
+	h := w3141Start(t, src, "--format", "json")
+	h.w3141Renders(t, 1)
+	if code := h.w3141Stop(t); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, h.errOut.String())
+	}
+	if !json.Valid(h.out.Bytes()) {
+		t.Fatalf("stdout не JSON: %q", h.out.String())
+	}
+	var rows []watchRow
+	if err := json.Unmarshal(h.out.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Attention != attentionYes || rows[0].Verdict != "needs_input" {
+		t.Fatalf("неверная строка: %+v", rows)
 	}
 }
