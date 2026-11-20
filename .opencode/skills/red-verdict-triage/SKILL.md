@@ -1,23 +1,22 @@
 ---
 name: red-verdict-triage
-description: Classify a red or retry Beacon verdict against your own diff and wake the orchestrator. Use when a subagent wakes on verdict retry or red.
+description: Classify a red or retry Beacon verdict against your own diff and signal the orchestrator through beacon_ack. Use when a subagent wakes on verdict retry or red.
 ---
 
 # Red verdict triage
 
-Исполнитель просыпается на вердикте `retry`, когда CI красный. Сначала он определяет причину, потом шлёт wake оркестратору. До классификации он не меняет код и не трогает `main`.
+Исполнитель просыпается на вердикте `retry`, когда CI красный. Сначала он определяет причину, потом сообщает оркестратору через `beacon_ack`. До классификации он не меняет код и не трогает `main`.
 
 ## Процедура
 
 1. Прочитать снимок вызовом `beacon_get_result`. В ответе есть `failedChecks`. Каждая запись несёт `name`, `conclusion`, `detailsUrl`, `required` и `flakyMatched`. Полные логи не нужны.
 2. Сверить `failedChecks` со своим diff. Посмотреть `git status --short` и `git diff <baseRef>..HEAD` в своём worktree. Проверка считается твоей, когда её причина лежит в файлах, которые ты менял в этой ветке.
-3. Выбрать одну из трёх причин и отослать wake подписчику `role=orchestrator` на том же Watch. Причина уходит в текст wake, оркестратор видит её под полем `verdict`.
+3. Выбрать одну из трёх причин.
    - Записи `failedChecks` лежат вне твоего diff, либо `main` красный на последнем коммите. Это флейк или сломанный `main`. Причина: `братан иди чини main`.
-   - Причина падения лежит в твоём diff. Это твоя ошибка. Причина: `моя вина, чиню`. После wake исправить свою ветку и запушить новый headSHA.
+   - Причина падения лежит в твоём diff. Это твоя ошибка. Причина: `моя вина, чиню`. Исправь свою ветку и запушь новый headSHA.
    - Причину нельзя уверенно отнести ни к тому, ни к другому. Причина: `проверил, изменений моих нет`.
-4. Завершить ход. Wake оркестратору не означает готовность PR. Мерж делает только оркестратор после своего `beacon_get_result` с `verdict=ready`.
-
-Для отправки использовать `wake.NotifyOrchestrator(ctx, reason, p)`. Функция сама находит сессию оркестратора по подписчику `role=orchestrator` на Watch из `p.WatchID` и обрезает пробелы вокруг причины.
+4. Для причин вне твоего diff (первая и третья) вызвать `beacon_ack` с `decision="blocked:not_mine"` на том же Watch. Передать непустую причину из выбранного пункта и `revision`, равный текущей ревизии Watch. Инструмент копирует упавшие проверки из снимка CI, записывает причину и будит оркестратора с текстом `spawn FIX-agent`. Для своей ошибки (вторая причина) блокировку не ставить: исправь код и запушь новый headSHA.
+5. Завершить ход. Wake оркестратору не означает готовность PR. Мерж делает только оркестратор после своего `beacon_get_result` с `verdict=ready`.
 
 ## Запрет
 
