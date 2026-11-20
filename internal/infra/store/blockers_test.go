@@ -60,9 +60,20 @@ func TestLiveWatchesIncludesBlocked(t *testing.T) {
 	if len(live) != 3 {
 		t.Fatalf("LiveWatches = %d, want 3 (blocked included, closed excluded)", len(live))
 	}
-	for i, w := range live {
-		if w.ID != watches[i].ID {
-			t.Errorf("LiveWatches[%d] = %s, want %s", i, w.ID, watches[i].ID)
+	// queryWatches orders by id, not by insertion order. Compare the set of
+	// live ids and their statuses so the assertion is order-insensitive.
+	got := make(map[string]domain.Status, len(live))
+	for _, w := range live {
+		got[w.ID] = w.Status
+	}
+	want := map[string]domain.Status{
+		"live-watch":    domain.StatusWatching,
+		"notify-watch":  domain.StatusNotifying,
+		"blocked-watch": domain.StatusBlocked,
+	}
+	for id, status := range want {
+		if gotStatus, ok := got[id]; !ok || gotStatus != status {
+			t.Errorf("LiveWatches[%s] = %q (present=%v), want %q", id, gotStatus, ok, status)
 		}
 	}
 }

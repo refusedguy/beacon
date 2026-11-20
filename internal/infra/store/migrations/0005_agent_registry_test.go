@@ -123,7 +123,7 @@ func TestMigration0005AppliesToExistingDB(t *testing.T) {
 	}
 	defer d.Close()
 	if got := d.Version(); got != 5 {
-		t.Fatalf("Version() = %d, want 5", got)
+		t.Fatalf("Version() = %d, want 6", got)
 	}
 
 	db := rawDB(t, path)
@@ -172,7 +172,7 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 		t.Fatalf("first Open: %v", err)
 	}
 	if got := first.Version(); got != 5 {
-		t.Fatalf("first Version() = %d, want 5", got)
+		t.Fatalf("first Version() = %d, want 6", got)
 	}
 	db := rawDB(t, path)
 	beforeTables := objectCount(t, db, "table")
@@ -187,7 +187,7 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 	}
 	defer second.Close()
 	if got := second.Version(); got != 5 {
-		t.Fatalf("second Version() = %d, want 5", got)
+		t.Fatalf("second Version() = %d, want 6", got)
 	}
 	checkSchema0005(t, db)
 	if got := objectCount(t, db, "table"); got != beforeTables {
@@ -204,5 +204,13 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 	}
 	if got := objectCount(t, db, "index"); got != beforeIndexes {
 		t.Errorf("indexes after SQL replay = %d, want %d", got, beforeIndexes)
+	}
+	// A direct replay of the old SQL must not move user_version either.
+	var version int
+	if err := db.QueryRowContext(context.Background(), `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version after SQL replay: %v", err)
+	}
+	if version != 6 {
+		t.Errorf("user_version after SQL replay = %d, want 6", version)
 	}
 }
