@@ -83,12 +83,12 @@ type Card struct {
 var (
 	// Several waves produce valid card ids: T3.226, T5.1, S1.001 and UI-31.
 	// Parse the common shapes and keep the exact filename as the card id.
-	idRE       = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)[.]([0-9]+)(?:-.*)?$`)
-	dashIDRE   = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([0-9]+)$`)
+	idRE     = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)[.]([0-9]+)(?:-.*)?$`)
+	dashIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([0-9]+)$`)
 	// dotIDRE accepts an alphabetic prefix followed directly by a dot and a
 	// number, for example BS.1. The idRE above requires a digit before the dot
 	// (T3.123), so families like BS need their own form.
-	dotIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
+	dotIDRE    = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
 	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+$`)
 	titleRE    = regexp.MustCompile(`^#\s+[A-Za-z][A-Za-z0-9_.-]*\.\s*(.*)$`)
 	headerRE   = regexp.MustCompile(`^#\s+(.*)$`)
@@ -740,4 +740,103 @@ func ReplaceFields(raw, agent, when string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// ---- HD-022 / ADR 0295: связь feat/fix с milestone ----
+//
+// Для Beacon milestone это ссылка на ADR и на карточку. Коммит feat или fix
+// обязан указать обе ссылки либо обоснование исключения. Проверка чистая:
+// она работает с переданными данными и портами. Чтение файлов и сетевые
+// вызовы остаются за пределами проверки.
+
+// Linkage содержит данные коммита, нужные для проверки связи. Subject
+// отделяет проверенный коммит от пустого состояния: пустой Subject и пустые
+// остальные поля дают LinkageEmpty.
+type Linkage struct {
+	Subject       string
+	ADRRef        string
+	CardRef       string
+	Justification string
+}
+
+// LinkageVerdict это исход проверки связи с milestone.
+type LinkageVerdict string
+
+const (
+	// LinkageLinked: ссылка на ADR и карточку есть.
+	LinkageLinked LinkageVerdict = "linked"
+	// LinkageExempted: ссылки нет, но есть обоснование исключения.
+	LinkageExempted LinkageVerdict = "exempted"
+	// LinkageMissing: нет ни ссылки, ни обоснования. Такой коммит даёт warning.
+	LinkageMissing LinkageVerdict = "missing"
+	// LinkageEmpty: данные для проверки не переданы.
+	LinkageEmpty LinkageVerdict = "empty"
+)
+
+// LinkagePorts это порты проверки связи. Оба поля это чистые предикаты,
+// которые решают, считается ли ссылка действительной. Вызывающий подставляет
+// порты, а проверка не делает I/O. Nil-порт принимает любую непустую ссылку.
+type LinkagePorts struct {
+	ValidADR  func(ref string) bool
+	ValidCard func(ref string) bool
+}
+
+// CheckLinkage проверяет связь коммита с milestone. Пустое состояние даёт
+// LinkageEmpty. Ссылка на ADR и карточку даёт LinkageLinked. Когда ссылки нет,
+// но есть обоснование, исход LinkageExempted. Иначе LinkageMissing.
+func CheckLinkage(l Linkage, ports LinkagePorts) LinkageVerdict {
+	if strings.TrimSpace(l.Subject) == "" &&
+		strings.TrimSpace(l.ADRRef) == "" &&
+		strings.TrimSpace(l.CardRef) == "" &&
+		strings.TrimSpace(l.Justification) == "" {
+		return LinkageEmpty
+	}
+	adr := strings.TrimSpace(l.ADRRef)
+	card := strings.TrimSpace(l.CardRef)
+	adrOK := adr != "" && (ports.ValidADR == nil || ports.ValidADR(adr))
+	cardOK := card != "" && (ports.ValidCard == nil || ports.ValidCard(card))
+	if adrOK && cardOK {
+		return LinkageLinked
+	}
+	if strings.TrimSpace(l.Justification) != "" {
+		return LinkageExempted
+	}
+	return LinkageMissing
+}
+
+var (
+	linkageADRRE  = regexp.MustCompile(`(?i)\bADR[\s-]*([0-9]{4})\b`)
+	linkageCardRE = regexp.MustCompile(`\b[A-Z][A-Z0-9]*[-.][0-9]+(?:\.[0-9]+)?\b`)
+	linkageJustRE = regexp.MustCompile(`(?im)^[ \t]*(Обоснование|Исключение|Justification|Exception)[ \t]*:[ \t]*(.+)$`)
+	commitTypeRE  = regexp.MustCompile(`^([a-z]+)(?:\([^)]*\))?[!]?:`)
+)
+
+// ParseLinkage разбирает текст коммита на поля связи. Subject это первая
+// строка сообщения. ADR и карточка берутся из первых совпадений, обоснование
+// из строки с соответствующим заголовком. Функция чистая и не делает I/O.
+func ParseLinkage(message string) Linkage {
+	normalized := strings.ReplaceAll(message, "\r\n", "\n")
+	lines := strings.Split(normalized, "\n")
+	l := Linkage{Subject: strings.TrimSpace(lines[0])}
+	if m := linkageADRRE.FindStringSubmatch(normalized); m != nil {
+		l.ADRRef = "ADR " + m[1]
+	}
+	for _, m := range linkageCardRE.FindAllString(normalized, -1) {
+		if strings.HasPrefix(strings.ToUpper(m), "ADR") {
+			continue
+		}
+		l.CardRef = m
+		break
+	}
+	if m := linkageJustRE.FindStringSubmatch(normalized); m != nil {
+		l.Justification = strings.TrimSpace(m[2])
+	}
+	return l
+}
+
+// RequiresLinkage сообщает, требует ли subject коммита связи с milestone.
+// Требование действует только для типов feat и fix.
+func RequiresLinkage(subject string) bool {
+	m := commitTypeRE.FindStringSubmatch(strings.TrimSpace(subject))
+	return m != nil && (m[1] == "feat" || m[1] == "fix")
 }
