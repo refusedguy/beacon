@@ -1,22 +1,19 @@
 // Package gate: the WIRING-* rule keeps deferred wiring honest.
 //
-// A PR that defers part of a feature past its Watch handoff must carry two
-// things in the same tree the local gate can see:
+// A PR that defers part of a feature past its Watch handoff must carry one
+// thing in the same tree the local gate can see:
 //
 //   - docs/tasks/WIRING-<PR>.md, a card with "Статус: todo", a non-empty
-//     "OwnerFiles" field and a "## Причина" section;
-//   - .beacon/wiring-pending, written by beacon_defer_wiring, with one
-//     "WIRING:<PR>" line per deferral.
+//     "OwnerFiles" field and a "## Причина" section.
 //
-// The gate cannot read the GitHub API, so the pending marker stands in for the
-// "WIRING:" token in the PR body. A marker without a card is a finding, and
-// every referenced id must resolve to a card. The card template lives in
-// docs/templates/wiring-card.md.
+// The card is the whole contract. beacon_defer_wiring adds it to the PR and
+// records the deferral in the durable store, so the gate reads no marker file.
+// An old .beacon/wiring-pending file left in a tree is ignored. The card
+// template lives in docs/templates/wiring-card.md.
 package gate
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -29,8 +26,6 @@ import (
 type WiringConfig struct {
 	CardDir       string `json:"card_dir"`
 	CardPrefix    string `json:"card_prefix"`
-	Marker        string `json:"marker"`
-	MarkerToken   string `json:"marker_token"`
 	Status        string `json:"status"`
 	OwnerField    string `json:"owner_field"`
 	ReasonSection string `json:"reason_section"`
@@ -52,12 +47,6 @@ func LoadWiringConfig() (WiringConfig, error) {
 	}
 	if cfg.CardPrefix == "" {
 		cfg.CardPrefix = "WIRING-"
-	}
-	if cfg.Marker == "" {
-		cfg.Marker = ".beacon/wiring-pending"
-	}
-	if cfg.MarkerToken == "" {
-		cfg.MarkerToken = "WIRING:"
 	}
 	if cfg.Status == "" {
 		cfg.Status = "todo"
@@ -98,9 +87,10 @@ func readWiringCards(root, dir, prefix string) ([]wiringCard, error) {
 	return out, nil
 }
 
-// CheckWiring validates every WIRING card and the pending marker. A marker
-// with no card fails, and every "WIRING:<id>" line in the marker must resolve
-// to a card in the same tree.
+// CheckWiring validates every WIRING card. A card is the only proof of a
+// deferred wiring: it must carry the configured status, a non-empty owner
+// field and the reason section. A leftover marker file is not read, so it
+// cannot add a finding or hide a defect.
 func CheckWiring(root string, cfg WiringConfig) ([]Finding, error) {
 	cards, err := readWiringCards(root, cfg.CardDir, cfg.CardPrefix)
 	if err != nil {
@@ -141,67 +131,6 @@ func CheckWiring(root string, cfg WiringConfig) ([]Finding, error) {
 			})
 		}
 	}
-
-	markerPath := filepath.ToSlash(cfg.Marker)
-	body, err := fs.ReadFile(os.DirFS(root), markerPath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			SortFindings(findings)
-			return findings, nil
-		}
-		return nil, fmt.Errorf("read wiring marker: %w", err)
-	}
-	if len(cards) == 0 {
-		findings = append(findings, Finding{
-			Rule:    "WIRING-MARKER-NO-CARD",
-			Path:    markerPath,
-			Line:    1,
-			Message: "deferred wiring marker present but no " + cfg.CardPrefix + "*.md card in " + cfg.CardDir,
-		})
-		SortFindings(findings)
-		return findings, nil
-	}
-
-	// beacon_defer_wiring writes one "<marker token><id>" per deferral. The id
-	// is the PR number used in the card filename.
-	for i, line := range strings.Split(string(body), "\n") {
-		rest := line
-		for {
-			at := strings.Index(rest, cfg.MarkerToken)
-			if at < 0 {
-				break
-			}
-			tail := strings.TrimSpace(rest[at+len(cfg.MarkerToken):])
-			rest = rest[at+len(cfg.MarkerToken):]
-			id := ""
-			for _, r := range tail {
-				if r == ' ' || r == '\t' || r == ',' || r == ';' || r == ')' {
-					break
-				}
-				id += string(r)
-			}
-			if id == "" {
-				continue
-			}
-			want := cfg.CardPrefix + id + ".md"
-			found := false
-			for _, c := range cards {
-				base := filepath.Base(c.path)
-				if base == want || strings.HasPrefix(base, cfg.CardPrefix+id+"-") {
-					found = true
-					break
-				}
-			}
-			if !found {
-				findings = append(findings, Finding{
-					Rule:    "WIRING-CARD-MISSING",
-					Path:    markerPath,
-					Line:    i + 1,
-					Message: fmt.Sprintf("marker references %s but %s is absent", id, want),
-				})
-			}
-		}
-	}
 	SortFindings(findings)
 	return findings, nil
 }
@@ -224,9 +153,9 @@ func RunWiring(args []string) int {
 	return Finish(findings, opts.MinFindings)
 }
 
-// WiringSelfTestRun plants broken cards and markers in fixtures and checks
-// that the production scanner reports every rule. It proves the gate is not
-// vacuous.
+// WiringSelfTestRun plants broken cards in fixtures and checks that the
+// production scanner reports every rule. It also plants a stale marker and
+// proves the gate ignores it. It proves the gate is not vacuous.
 func WiringSelfTestRun() int {
 	cfg, err := LoadWiringConfig()
 	if err != nil {
@@ -254,43 +183,42 @@ func WiringSelfTestRun() int {
 
 	goodCard := "# WIRING-777. Valid card\nСтатус: todo\nOwnerFiles: docs/a.go\n" +
 		"## Причина\n deferred wiring\n"
+	badCard := "# WIRING-888. Bad\nСтатус: done\nOwnerFiles: \n"
+
+	hasAllDefects := func(fs []Finding) bool {
+		return HasRule(fs, "WIRING-STATUS") &&
+			HasRule(fs, "WIRING-OWNERFILES") &&
+			HasRule(fs, "WIRING-REASON")
+	}
 
 	ok := true
 
-	// Positive control: a complete card with no marker is green.
+	// Positive control: a complete card and no marker is green.
 	ok = check(map[string]string{
 		"docs/tasks/WIRING-777.md": goodCard,
 	}, func(fs []Finding) bool { return len(fs) == 0 }) && ok
 
 	// Planted defects: wrong status, empty OwnerFiles, missing reason section.
 	ok = check(map[string]string{
-		"docs/tasks/WIRING-888.md": "# WIRING-888. Bad\nСтатус: done\nOwnerFiles: \n",
-	}, func(fs []Finding) bool {
-		return HasRule(fs, "WIRING-STATUS") &&
-			HasRule(fs, "WIRING-OWNERFILES") &&
-			HasRule(fs, "WIRING-REASON")
-	}) && ok
+		"docs/tasks/WIRING-888.md": badCard,
+	}, hasAllDefects) && ok
 
-	// A marker with no card is the false-deferral case.
+	// A stale marker next to a valid card changes nothing.
 	ok = check(map[string]string{
-		".beacon/wiring-pending": "WIRING: 999\n",
-	}, func(fs []Finding) bool {
-		return HasRule(fs, "WIRING-MARKER-NO-CARD")
-	}) && ok
-
-	// A marker token that resolves to a card is green.
-	ok = check(map[string]string{
-		".beacon/wiring-pending":   "WIRING: 777\n",
+		".beacon/wiring-pending":   "WIRING: 999\n",
 		"docs/tasks/WIRING-777.md": goodCard,
 	}, func(fs []Finding) bool { return len(fs) == 0 }) && ok
 
-	// A marker token with no matching card is reported against the marker.
+	// A marker with no card is ignored too: the card is the only contract.
 	ok = check(map[string]string{
-		".beacon/wiring-pending":   "WIRING: 555\n",
-		"docs/tasks/WIRING-777.md": goodCard,
-	}, func(fs []Finding) bool {
-		return HasRule(fs, "WIRING-CARD-MISSING")
-	}) && ok
+		".beacon/wiring-pending": "WIRING: 555\n",
+	}, func(fs []Finding) bool { return len(fs) == 0 }) && ok
+
+	// A marker does not hide defects in a card.
+	ok = check(map[string]string{
+		".beacon/wiring-pending":   "WIRING: 888\n",
+		"docs/tasks/WIRING-888.md": badCard,
+	}, hasAllDefects) && ok
 
 	if !ok {
 		fmt.Println("self-test FAILED: 5 fixtures")
