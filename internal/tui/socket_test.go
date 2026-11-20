@@ -150,9 +150,10 @@ func TestSocketCommandIsIdempotentByWatchIDAndRevision(t *testing.T) {
 	second := sendRequest(t, client, req)
 
 	mu.Lock()
-	defer mu.Unlock()
-	if calls != 1 {
-		t.Fatalf("handler called %d times for one watchID+revision, want 1", calls)
+	gotCalls := calls
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("handler called %d times for one watchID+revision, want 1", gotCalls)
 	}
 	if first != second {
 		t.Errorf("duplicate answers differ: first=%+v second=%+v", first, second)
@@ -161,8 +162,11 @@ func TestSocketCommandIsIdempotentByWatchIDAndRevision(t *testing.T) {
 	// A new revision is a distinct command and must reach the handler again.
 	req.Revision = 4
 	_ = sendRequest(t, client, req)
-	if calls != 2 {
-		t.Errorf("handler called %d times after a new revision, want 2", calls)
+	mu.Lock()
+	gotCalls = calls
+	mu.Unlock()
+	if gotCalls != 2 {
+		t.Errorf("handler called %d times after a new revision, want 2", gotCalls)
 	}
 }
 
