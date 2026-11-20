@@ -461,6 +461,14 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 
 		snap := snapshotFor(w, obs, now)
 		verdict, targets := domain.EvaluatePR(snap, w.Policy)
+		// One info line per live Watch per cycle. It carries the raw PR state
+		// and the derived verdict, so a Watch that stays watching because the
+		// provider returned an empty state is visible without a debugger.
+		b.cycleEvent(cycleID, "observe", observe.Fields{
+			"watchID": w.ID, "pr": w.PR, "state": obs.pr.State,
+			"headSHA": obs.pr.HeadRefOid, "mergeable": obs.pr.Mergeable,
+			"verdict": string(verdict), "revision": w.Revision,
+		})
 		updated += b.applyVerdict(ctx, w, obs, verdict, targets, now, cycleID)
 	}
 

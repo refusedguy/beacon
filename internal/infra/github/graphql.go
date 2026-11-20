@@ -475,6 +475,26 @@ func (c *Client) sleepOr() func(time.Duration) {
 	return c.sleep
 }
 
+// unwrapPullRequestAlias returns the pullRequest object carried by one
+// repository alias in a TierBatch response. The query binds the alias on
+// repository, so a real reply is data.p0 = {"pullRequest": {...}}. Reading
+// fields such as state or headRefOid straight off the alias yields zero values,
+// which quietly turns a merged PR into a watching verdict. Payloads that are
+// already a bare pullRequest object, as in older unit fixtures, pass through
+// unchanged.
+func unwrapPullRequestAlias(raw json.RawMessage) json.RawMessage {
+	var envelope struct {
+		PullRequest json.RawMessage `json:"pullRequest"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return raw
+	}
+	if len(envelope.PullRequest) == 0 || string(envelope.PullRequest) == "null" {
+		return raw
+	}
+	return envelope.PullRequest
+}
+
 // withUniqueNames fills missing alias names and rejects explicit duplicates.
 func withUniqueNames(aliases []Alias) ([]Alias, error) {
 	out := make([]Alias, len(aliases))

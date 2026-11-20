@@ -50,6 +50,11 @@ func TestEvaluatePRDecisionTable(t *testing.T) {
 			want: VerdictMerged, wake: nil,
 		},
 		{
+			name: "merged is case insensitive",
+			s:    prMutate(func(s *Snapshot) { s.State = "merged" }),
+			want: VerdictMerged, wake: nil,
+		},
+		{
 			name: "CLOSED closes without waking",
 			s:    prMutate(func(s *Snapshot) { s.State = "CLOSED" }),
 			want: VerdictClosed, wake: nil,

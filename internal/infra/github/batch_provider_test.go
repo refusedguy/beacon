@@ -15,7 +15,9 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
-const greenPRJSON = `{"state":"OPEN","isDraft":false,"headRefOid":"head-sha",` +
+// PR fixtures mirror the real GraphQL envelope: the alias binds repository,
+// so the PR fields sit under pullRequest.
+const greenPRJSON = `{"pullRequest":{"state":"OPEN","isDraft":false,"headRefOid":"head-sha",` +
 	`"baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",` +
 	`"reviewDecision":"APPROVED",` +
 	`"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]},` +
@@ -24,7 +26,7 @@ const greenPRJSON = `{"state":"OPEN","isDraft":false,"headRefOid":"head-sha",` +
 	`"detailsUrl":"https://ci.example/1","isRequired":true,"checkSuite":{"id":"suite-1"}},` +
 	`{"__typename":"StatusContext","context":"lint","state":"NEUTRAL",` +
 	`"targetUrl":"https://ci.example/2","isRequired":true}` +
-	`],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`
+	`],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`
 
 const failingBaseJSON = `{"ref":{"target":{"oid":"main-sha","statusCheckRollup":{"contexts":{"nodes":[` +
 	`{"__typename":"CheckRun","name":"main-ci","status":"COMPLETED","conclusion":"FAILURE",` +
@@ -32,12 +34,12 @@ const failingBaseJSON = `{"ref":{"target":{"oid":"main-sha","statusCheckRollup":
 	`],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`
 
 func prStateJSON(state, mergeable, status string) string {
-	return fmt.Sprintf(`{"state":%q,"isDraft":false,"headRefOid":"head-sha",`+
+	return fmt.Sprintf(`{"pullRequest":{"state":%q,"isDraft":false,"headRefOid":"head-sha",`+
 		`"baseRefName":"main","mergeable":%q,"mergeStateStatus":%q,`+
 		`"reviewDecision":"APPROVED","commits":{"nodes":[{"commit":`+
 		`{"statusCheckRollup":{"state":"SUCCESS"}}}]},`+
 		`"statusCheckRollup":{"contexts":{"nodes":[],`+
-		`"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`, state, mergeable, status)
+		`"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`, state, mergeable, status)
 }
 
 // batchReply answers one batched document with a payload for every alias it
@@ -241,6 +243,50 @@ func TestFetchBatchSingleflightSharesOneRequest(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("GraphQL requests = %d, want one shared batch", got)
+	}
+}
+
+// TestFetchBatchReadsMergedStateFromRepositoryAlias guards the regression that
+// left merged PRs watching forever. The GraphQL alias binds repository, so the
+// PR fields live under pullRequest. Reading them off the alias yields an empty
+// State and EvaluatePR never reaches its terminal rule.
+func TestFetchBatchReadsMergedStateFromRepositoryAlias(t *testing.T) {
+	counter, _, _ := newTestCounter(t, 0)
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode query: %v", err)
+			return
+		}
+		pr := fmt.Sprintf(`{"pullRequest":{"state":"MERGED","headRefOid":%q,`+
+			`"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN",`+
+			`"statusCheckRollup":{"contexts":{"nodes":[],`+
+			`"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`, head)
+		batchReply(t, w, req.Query, pr, `{}`, 1)
+	}))
+	defer srv.Close()
+
+	provider := NewBatchProvider(NewClient(srv.URL, "", srv.Client(), counter), nil, counter)
+	watches := []domain.Watch{{
+		ID: "w0", Repo: "refusedguy/beacon", PR: 406,
+		HeadSHA: head, BaseRef: "main", Status: domain.StatusWatching,
+	}}
+	out, err := provider.FetchBatch(context.Background(), watches)
+	if err != nil {
+		t.Fatalf("FetchBatch: %v", err)
+	}
+	snap, ok := out["w0"]
+	if !ok {
+		t.Fatalf("FetchBatch has no snapshot for w0: %v", out)
+	}
+	if snap.PR.State != "MERGED" {
+		t.Fatalf("state = %q, want MERGED", snap.PR.State)
+	}
+	if snap.PR.HeadRefOid != head {
+		t.Fatalf("head = %q, want %q", snap.PR.HeadRefOid, head)
 	}
 }
 
