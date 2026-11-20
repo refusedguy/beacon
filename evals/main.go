@@ -88,7 +88,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 31)
+	results := make([]evalResult, 0, 34)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -599,6 +599,24 @@ func run() int {
 	record("B04_unknown_and_unblock",
 		"неизвестный decision и неизвестный reason не блокируют; unblock возвращает Watch в опрос",
 		b04Actual, b04Pass)
+
+	// OW01-OW03: self-awareness оркестратора. Сводка активных Watch по вердиктам
+	// и идемпотентная подписка на все Watch проекта. Модель и негативные контроли
+	// описаны в docs/evals/orchestrator-workload.md.
+	ow01Actual, ow01Pass := evalOW01WorkloadByVerdict()
+	record("OW01_workload_by_verdict",
+		"сводка считает ready/retry/blocked/watching; терминальные вердикты не попадают; нулевые ключи присутствуют",
+		ow01Actual, ow01Pass)
+
+	ow02Actual, ow02Pass := evalOW02IdempotentSubscription()
+	record("OW02_idempotent_subscription",
+		"оркестратор подписывается на все Watch проекта; повтор не дублирует; executor сохранён",
+		ow02Actual, ow02Pass)
+
+	ow03Actual, ow03Pass := evalOW03ProjectBoundary()
+	record("OW03_project_boundary",
+		"чужой проект не входит в сводку и не получает подписку по ошибке; повтор не дублирует подписку",
+		ow03Actual, ow03Pass)
 
 	// T3.227/T3.228: eval-покрытие живых сценариев. Наблюдатель читает файлы
 	// каталога состояния и ответы фейк-хоста, а не внутренние массивы плагина.
@@ -1156,6 +1174,201 @@ func evalB04UnknownDecisionAndUnblock() (string, bool) {
 		alien.Status == blockStatusWatching &&
 		unblockOut.Action == "unblocked" && unblocked.Status == blockStatusWatching &&
 		unblocked.Reason == "" && resumedEffects.Polls == 1 && resumedEffects.Retries == 1
+	return actual, pass
+}
+
+// ---- OW01-OW03: self-awareness оркестратора (beacon workload) ----
+//
+// Контракт: оркестратор видит сводку активных Watch своего проекта по вердиктам
+// ready/retry/blocked/watching и идемпотентно регистрируется подписчиком на каждый
+// Watch проекта. Production-код такой сводки и массовой подписки пока не существует,
+// поэтому eval фиксирует контракт исполняемой моделью, как W14-W18 и B01-B04.
+// Наблюдаются только исходы, видимые вызывающему: счётчики в сводке, число
+// подписчиков-оркестраторов на Watch и принадлежность Watch проекту. Подробности
+// в docs/evals/orchestrator-workload.md.
+
+const (
+	workloadOwnProject     = "refusedguy/beacon"
+	workloadForeignProject = "refusedguy/other"
+	workloadOrchestratorID = "ses_orchestrator"
+	workloadExecutorID     = "ses_executor"
+)
+
+// workloadWatch — Watch, который оркестратор видит в сводке.
+type workloadWatch struct {
+	ID          string
+	Project     string
+	Verdict     domain.Verdict
+	Subscribers []workloadSubscriber
+}
+
+type workloadSubscriber struct {
+	ID   string
+	Role domain.Role
+}
+
+// workloadVerdicts — ровно четыре вердикта активного Watch в сводке. Терминальные
+// (merged, closed) и остальные (rebase, keep_working, timeout) в сводку не идут.
+var workloadVerdicts = []domain.Verdict{
+	domain.VerdictReady,
+	domain.VerdictRetry,
+	domain.VerdictBlocked,
+	domain.VerdictWatching,
+}
+
+// workloadSummary — видимая оркестратору сводка активных Watch проекта.
+type workloadSummary struct {
+	Project   string
+	ByVerdict map[string]int
+	Total     int
+}
+
+// summarizeWorkload считает активные Watch проекта по четырём вердиктам. Ключи
+// всех четырёх вердиктов присутствуют и при нулевом счёте: вызывающий отличает
+// «нет Watch с таким вердиктом» от «вердикт в сводке неизвестен».
+func summarizeWorkload(project string, watches []workloadWatch) workloadSummary {
+	s := workloadSummary{Project: project, ByVerdict: make(map[string]int, len(workloadVerdicts))}
+	for _, v := range workloadVerdicts {
+		s.ByVerdict[string(v)] = 0
+	}
+	for _, w := range watches {
+		if w.Project != project {
+			continue
+		}
+		if _, ok := s.ByVerdict[string(w.Verdict)]; !ok {
+			continue
+		}
+		s.ByVerdict[string(w.Verdict)]++
+		s.Total++
+	}
+	return s
+}
+
+// subscribeProjectOrchestrator идемпотентно добавляет оркестратора в подписчики
+// каждого Watch проекта и возвращает число новых подписок. Повторный вызов ничего
+// не добавляет, чужие проекты и существующие подписчики не трогаются.
+func subscribeProjectOrchestrator(project, subscriberID string, watches []workloadWatch) int {
+	added := 0
+	for i := range watches {
+		if watches[i].Project != project {
+			continue
+		}
+		found := false
+		for _, sub := range watches[i].Subscribers {
+			if sub.ID == subscriberID && sub.Role == domain.RoleOrchestrator {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		watches[i].Subscribers = append(watches[i].Subscribers, workloadSubscriber{
+			ID: subscriberID, Role: domain.RoleOrchestrator,
+		})
+		added++
+	}
+	return added
+}
+
+func countRoleSubscribers(w workloadWatch, id string, role domain.Role) int {
+	n := 0
+	for _, sub := range w.Subscribers {
+		if sub.ID == id && sub.Role == role {
+			n++
+		}
+	}
+	return n
+}
+
+// evalOW01WorkloadByVerdict проверяет счётчики сводки по четырём вердиктам.
+// Негативные контроли: merged, rebase и keep_working в счёт не идут, а сводка
+// проекта без Watch содержит все четыре ключа с нулями.
+func evalOW01WorkloadByVerdict() (string, bool) {
+	watches := []workloadWatch{
+		{ID: "ow01-1", Project: workloadOwnProject, Verdict: domain.VerdictReady},
+		{ID: "ow01-2", Project: workloadOwnProject, Verdict: domain.VerdictReady},
+		{ID: "ow01-3", Project: workloadOwnProject, Verdict: domain.VerdictRetry},
+		{ID: "ow01-4", Project: workloadOwnProject, Verdict: domain.VerdictBlocked},
+		{ID: "ow01-5", Project: workloadOwnProject, Verdict: domain.VerdictWatching},
+		{ID: "ow01-6", Project: workloadOwnProject, Verdict: domain.VerdictWatching},
+		{ID: "ow01-7", Project: workloadOwnProject, Verdict: domain.VerdictWatching},
+		{ID: "ow01-merged", Project: workloadOwnProject, Verdict: domain.VerdictMerged},
+		{ID: "ow01-rebase", Project: workloadOwnProject, Verdict: domain.VerdictRebase},
+		{ID: "ow01-keep", Project: workloadOwnProject, Verdict: domain.VerdictKeepWorking},
+	}
+	s := summarizeWorkload(workloadOwnProject, watches)
+	quiet := summarizeWorkload("refusedguy/quiet", watches)
+	actual := fmt.Sprintf("ready=%d retry=%d blocked=%d watching=%d total=%d keys=%d; quiet total=%d keys=%d ready=%d",
+		s.ByVerdict["ready"], s.ByVerdict["retry"], s.ByVerdict["blocked"], s.ByVerdict["watching"],
+		s.Total, len(s.ByVerdict), quiet.Total, len(quiet.ByVerdict), quiet.ByVerdict["ready"])
+	pass := s.ByVerdict["ready"] == 2 && s.ByVerdict["retry"] == 1 &&
+		s.ByVerdict["blocked"] == 1 && s.ByVerdict["watching"] == 3 &&
+		s.Total == 7 && len(s.ByVerdict) == 4 &&
+		quiet.Total == 0 && len(quiet.ByVerdict) == 4 && quiet.ByVerdict["ready"] == 0
+	return actual, pass
+}
+
+// evalOW02IdempotentSubscription проверяет подписку на все Watch проекта.
+// Негативные контроли: повторный вызов не добавляет подписчика, существующая
+// подписка оркестратора не дублируется, а подписчик executor сохраняется.
+func evalOW02IdempotentSubscription() (string, bool) {
+	watches := []workloadWatch{
+		{
+			ID: "ow02-1", Project: workloadOwnProject, Verdict: domain.VerdictReady,
+			Subscribers: []workloadSubscriber{{ID: workloadExecutorID, Role: domain.RoleExecutor}},
+		},
+		{ID: "ow02-2", Project: workloadOwnProject, Verdict: domain.VerdictWatching},
+		{
+			ID: "ow02-3", Project: workloadOwnProject, Verdict: domain.VerdictBlocked,
+			Subscribers: []workloadSubscriber{{ID: workloadOrchestratorID, Role: domain.RoleOrchestrator}},
+		},
+	}
+	addedFirst := subscribeProjectOrchestrator(workloadOwnProject, workloadOrchestratorID, watches)
+	addedRepeat := subscribeProjectOrchestrator(workloadOwnProject, workloadOrchestratorID, watches)
+	counts := make([]int, 0, len(watches))
+	for _, w := range watches {
+		counts = append(counts, countRoleSubscribers(w, workloadOrchestratorID, domain.RoleOrchestrator))
+	}
+	executorKept := countRoleSubscribers(watches[0], workloadExecutorID, domain.RoleExecutor) == 1
+	actual := fmt.Sprintf("first=%d repeat=%d orchestratorPerWatch=%v executorKept=%t",
+		addedFirst, addedRepeat, counts, executorKept)
+	pass := addedFirst == 2 && addedRepeat == 0 &&
+		slices.Equal(counts, []int{1, 1, 1}) && executorKept
+	return actual, pass
+}
+
+// evalOW03ProjectBoundary проверяет границу проекта в сводке и подписке. Чужой
+// проект не попадает в сводку своего проекта и не получает его подписчика; повтор
+// подписки на чужой проект не дублирует обязательство.
+func evalOW03ProjectBoundary() (string, bool) {
+	watches := []workloadWatch{
+		{ID: "ow03-own-1", Project: workloadOwnProject, Verdict: domain.VerdictReady},
+		{ID: "ow03-own-2", Project: workloadOwnProject, Verdict: domain.VerdictRetry},
+		{ID: "ow03-foreign-1", Project: workloadForeignProject, Verdict: domain.VerdictReady},
+		{ID: "ow03-foreign-2", Project: workloadForeignProject, Verdict: domain.VerdictBlocked},
+	}
+	own := summarizeWorkload(workloadOwnProject, watches)
+	foreign := summarizeWorkload(workloadForeignProject, watches)
+	addedFirst := subscribeProjectOrchestrator(workloadForeignProject, workloadOrchestratorID, watches)
+	addedRepeat := subscribeProjectOrchestrator(workloadForeignProject, workloadOrchestratorID, watches)
+	ownSubs, foreignSubs := 0, 0
+	for _, w := range watches {
+		n := countRoleSubscribers(w, workloadOrchestratorID, domain.RoleOrchestrator)
+		if w.Project == workloadOwnProject {
+			ownSubs += n
+		} else {
+			foreignSubs += n
+		}
+	}
+	actual := fmt.Sprintf("own total=%d ready=%d retry=%d blocked=%d; foreign total=%d ready=%d blocked=%d; added=%d/%d ownSubs=%d foreignSubs=%d",
+		own.Total, own.ByVerdict["ready"], own.ByVerdict["retry"], own.ByVerdict["blocked"],
+		foreign.Total, foreign.ByVerdict["ready"], foreign.ByVerdict["blocked"],
+		addedFirst, addedRepeat, ownSubs, foreignSubs)
+	pass := own.Total == 2 && own.ByVerdict["ready"] == 1 && own.ByVerdict["retry"] == 1 &&
+		own.ByVerdict["blocked"] == 0 &&
+		foreign.Total == 2 && foreign.ByVerdict["ready"] == 1 && foreign.ByVerdict["blocked"] == 1 &&
+		addedFirst == 2 && addedRepeat == 0 && ownSubs == 0 && foreignSubs == 2
 	return actual, pass
 }
 
