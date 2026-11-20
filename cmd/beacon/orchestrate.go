@@ -279,3 +279,83 @@ func renderOrchestratorTable(w io.Writer, result orchestrator.Result) {
 func renderOrchestratorJSON(w io.Writer, result orchestrator.Result) error {
 	return json.NewEncoder(w).Encode(result)
 }
+
+// --- HD-009: issue evidence verification (ADR 0292) -----------------------
+
+// evidenceCheckStep is the brief step an executor performs before it starts
+// work: cross-check every file:line proof in the issue against the current
+// tree, mark a claim that no longer matches as outdated first, and never take
+// a claim with no proof on faith. Blind acceptance fails the card.
+const evidenceCheckStep = "Сверь каждую ссылку file:line из issue с текущим кодом; устаревшее утверждение отметь до начала работы; утверждение без ссылки не принимай вслепую."
+
+// evidenceStatus is the outcome of one cross-check. Only EvidenceCurrent
+// clears a claim for work. The other two must be reported before proceeding.
+type evidenceStatus string
+
+const (
+	EvidenceCurrent  evidenceStatus = "current"  // file:line resolves and still matches
+	EvidenceOutdated evidenceStatus = "outdated" // file:line is gone or its content drifted
+	EvidenceNoRef    evidenceStatus = "no-ref"   // no file:line proof to cross-check
+)
+
+// issueEvidence is one issue claim together with the file:line proof the
+// issue offers. Expected is the fragment the claim says lives at File:Line;
+// empty means only the location itself is asserted. An empty File or a
+// non-positive Line means the claim carries no proof at all.
+type issueEvidence struct {
+	Claim    string
+	File     string
+	Line     int
+	Expected string
+}
+
+// currentCode is the current tree as file path -> lines, with index 0 being
+// line 1. Callers supply it, so verifyIssueEvidence stays pure and tests can
+// drive it with mock data instead of touching the filesystem.
+type currentCode map[string][]string
+
+// evidenceVerdict is the result of cross-checking one claim. Evidence and
+// Actual are copied through so the caller can show what was checked and what
+// the code actually says.
+type evidenceVerdict struct {
+	Status   evidenceStatus
+	Evidence issueEvidence
+	Actual   string
+	Note     string
+}
+
+// verifyIssueEvidence cross-checks a claim's file:line proof against the
+// current code. A reference that resolves and still matches is current. A
+// reference whose file or line is gone, or whose content drifted from
+// Expected, is outdated and must be marked before work. A claim with no
+// file:line is reported as no-ref and is never accepted blindly (ADR 0292).
+// The function reads no files and has no side effects.
+func verifyIssueEvidence(ev issueEvidence, code currentCode) evidenceVerdict {
+	v := evidenceVerdict{Evidence: ev}
+	if ev.File == "" || ev.Line <= 0 {
+		v.Status = EvidenceNoRef
+		v.Note = "нет ссылки file:line: не принимать вслепую, запросить доказательство до работы"
+		return v
+	}
+	lines, ok := code[ev.File]
+	if !ok || ev.Line > len(lines) {
+		v.Status = EvidenceOutdated
+		v.Note = "ссылка file:line отсутствует в текущем коде: пометить утверждение устаревшим до работы"
+		return v
+	}
+	v.Actual = lines[ev.Line-1]
+	if ev.Expected != "" && !strings.Contains(v.Actual, ev.Expected) {
+		v.Status = EvidenceOutdated
+		v.Note = "код по ссылке file:line изменился: пометить утверждение устаревшим до работы"
+		return v
+	}
+	v.Status = EvidenceCurrent
+	v.Note = "ссылка file:line совпадает с текущим кодом; " + evidenceCheckStep
+	return v
+}
+
+// clearsForWork reports whether a verdict may be acted on. Only a current
+// reference clears a claim; the agent must surface the other two first.
+func clearsForWork(v evidenceVerdict) bool {
+	return v.Status == EvidenceCurrent
+}
