@@ -78,6 +78,7 @@ func TestTypes(t *testing.T) {
 			Merge:       MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
 			Flaky:       FlakyConfig{Names: []string{"ci/flaky"}, MaxRetries: 2, Used: map[string]int{"ci/flaky": 1}},
 			Policy:      Policy{RequireUpToDate: true},
+			MergePolicy: MergePolicy{AutoMerge: true, RequireApproval: true, WaitFor: []string{"pr/12"}, WaitForMain: []string{"issue/9"}},
 			Subscribers: []Subscriber{{ID: "s1", Role: RoleExecutor, Target: "t1"}},
 			CreatedAt:   time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC),
 		}
@@ -87,7 +88,7 @@ func TestTypes(t *testing.T) {
 			t.Fatalf("marshal Watch: %v", err)
 		}
 		assertJSONKeys(t, b, "id", "repo", "pr", "headSHA", "baseRef", "issue", "status", "verdict",
-			"revision", "checks", "merge", "flaky", "policy", "subscribers", "deadlineAt",
+			"revision", "checks", "merge", "flaky", "policy", "mergePolicy", "subscribers", "deadlineAt",
 			"noChecksSince", "createdAt", "closedAt", "closeReason")
 
 		var got Watch
@@ -97,6 +98,9 @@ func TestTypes(t *testing.T) {
 		if got.Revision != 3 || got.Status != StatusWatching || got.Verdict != VerdictReady ||
 			got.Checks["ci/test"].Conclusion != "SUCCESS" || got.Subscribers[0].Role != RoleExecutor {
 			t.Fatalf("Watch round trip mismatch: %+v", got)
+		}
+		if !reflect.DeepEqual(got.MergePolicy, want.MergePolicy) {
+			t.Fatalf("MergePolicy round trip: got %+v, want %+v", got.MergePolicy, want.MergePolicy)
 		}
 	})
 
@@ -588,6 +592,64 @@ func TestNestedContextDeadlineRules(t *testing.T) {
 		t.Errorf("plain context deadline = %v has=%v, want %v", got, has, earlier)
 	}
 	cancel()
+}
+
+// TestMergePolicyDefault pins the policy a Watch gets when the caller says
+// nothing about merging: auto-merge on, no approval, no conditions.
+func TestMergePolicyDefault(t *testing.T) {
+	got := DefaultMergePolicy()
+	if !got.AutoMerge {
+		t.Fatal("DefaultMergePolicy must enable auto-merge")
+	}
+	if got.RequireApproval || len(got.WaitFor) != 0 || len(got.WaitForMain) != 0 {
+		t.Fatalf("DefaultMergePolicy has non-empty conditions: %+v", got)
+	}
+
+	b, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal MergePolicy: %v", err)
+	}
+	assertJSONKeys(t, b, "autoMerge", "requireApproval", "waitFor", "waitForMain")
+
+	var restored MergePolicy
+	if err := json.Unmarshal(b, &restored); err != nil {
+		t.Fatalf("unmarshal MergePolicy: %v", err)
+	}
+	if !reflect.DeepEqual(restored, got) {
+		t.Fatalf("MergePolicy round trip: got %+v, want %+v", restored, got)
+	}
+}
+
+// TestMergePolicyConditions checks that every condition is independent and
+// survives persistence. Each case changes exactly one field off the default.
+func TestMergePolicyConditions(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*MergePolicy)
+	}{
+		{"auto merge disabled", func(p *MergePolicy) { p.AutoMerge = false }},
+		{"require approval", func(p *MergePolicy) { p.RequireApproval = true }},
+		{"wait for free form", func(p *MergePolicy) { p.WaitFor = []string{"pr/42", "issue/7", "task/alpha"} }},
+		{"wait for main free form", func(p *MergePolicy) { p.WaitForMain = []string{"pr/99", "task/main"} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := DefaultMergePolicy()
+			tc.edit(&want)
+
+			b, err := json.Marshal(want)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			var got MergePolicy
+			if err := json.Unmarshal(b, &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("MergePolicy round trip: got %+v, want %+v", got, want)
+			}
+		})
+	}
 }
 
 func assertJSONKeys(t *testing.T, b []byte, keys ...string) {

@@ -54,9 +54,40 @@ type WatchPRFlaky struct {
 }
 
 // WatchPRPolicy is the input form of the per-watch verification policy.
+// Merge is optional: when it is absent the Watch keeps auto-merge enabled, so
+// callers written before this field existed keep their behaviour.
 type WatchPRPolicy struct {
-	RequireUpToDate bool `json:"requireUpToDate"`
-	IgnoreReviews   bool `json:"ignoreReviews"`
+	RequireUpToDate bool                `json:"requireUpToDate"`
+	IgnoreReviews   bool                `json:"ignoreReviews"`
+	Merge           *WatchPRMergePolicy `json:"merge,omitempty"`
+}
+
+// WatchPRMergePolicy is the input form of domain.MergePolicy. AutoMerge is a
+// pointer so an omitted field keeps the enabled default while an explicit
+// false turns auto-merge off.
+type WatchPRMergePolicy struct {
+	AutoMerge       *bool    `json:"autoMerge,omitempty"`
+	RequireApproval bool     `json:"requireApproval,omitempty"`
+	WaitFor         []string `json:"waitFor,omitempty"`
+	WaitForMain     []string `json:"waitForMain,omitempty"`
+}
+
+// watchPRMergePolicy resolves the optional input into a domain policy. An
+// absent merge block, or a block that does not set autoMerge explicitly, keeps
+// the default of auto-merge on. Slices are copied so the stored Watch does not
+// alias the caller's input.
+func watchPRMergePolicy(in *WatchPRPolicy) domain.MergePolicy {
+	policy := domain.DefaultMergePolicy()
+	if in == nil || in.Merge == nil {
+		return policy
+	}
+	policy.RequireApproval = in.Merge.RequireApproval
+	policy.WaitFor = append([]string(nil), in.Merge.WaitFor...)
+	policy.WaitForMain = append([]string(nil), in.Merge.WaitForMain...)
+	if in.Merge.AutoMerge != nil {
+		policy.AutoMerge = *in.Merge.AutoMerge
+	}
+	return policy
 }
 
 // WatchPRHandler implements beacon_watch_pr over the domain ports. One handler
@@ -160,6 +191,9 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 			IgnoreReviews:   in.Policy.IgnoreReviews,
 		}
 	}
+	// Always materialise a concrete policy, so an absent policy.merge leaves a
+	// stored Watch with auto-merge on and empty conditions.
+	w.MergePolicy = watchPRMergePolicy(in.Policy)
 	if in.DeadlineMs != nil && *in.DeadlineMs > 0 {
 		w.DeadlineAt = now.Add(time.Duration(*in.DeadlineMs) * time.Millisecond)
 	}
