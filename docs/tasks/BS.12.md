@@ -1,5 +1,6 @@
 # BS.12. Outbox в транзакции команды
 Статус: done
+Обоснование: реализация уже в main (commit 0a830e9, PR #447; internal/app/command/processor.go, internal/infra/store/outbox.go), карта уже в статусе done. Дубля в OwnerFiles нет, код не писался.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/command/processor.go, internal/infra/store/outbox.go
