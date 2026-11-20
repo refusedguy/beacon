@@ -10,10 +10,9 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
-// deferredRunner is the dispatch seam, like the other command runners. A
-// follow-up wiring change adds `case "deferred"` to CLI.dispatch and the
-// command to usageText and the catalog; RegisterDeferred replaces the runner
-// in tests without that wiring.
+// deferredRunner is the dispatch seam, like the other command runners.
+// CLI.dispatch routes `beacon deferred` here, and RegisterDeferred replaces
+// the runner in tests.
 var deferredRunner = func(c *CLI, args []string) int { return runDeferred(c, args) }
 
 // RegisterDeferred installs the deferred command implementation.

@@ -39,6 +39,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
   beacon daemon [--interval 10s|30s] [--once]
+  beacon deferred [--format table|json]
   beacon workload [--format table|json]
   beacon metrics [--format json|prometheus]
   beacon pr create [--title ...] [--body ...] [--card T3.xxx] [--dry-run]
@@ -265,6 +266,8 @@ func (c *CLI) dispatch(args []string) int {
 		return ciRunner(c, args[1:])
 	case "daemon":
 		return daemonRunner(c, args[1:])
+	case "deferred":
+		return deferredRunner(c, args[1:])
 	case "workload":
 		return workloadRunner(c, args[1:])
 	case "metrics":
