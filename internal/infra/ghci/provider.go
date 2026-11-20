@@ -1,4 +1,4 @@
-package main
+package ghci
 
 import (
 	"context"
@@ -15,11 +15,11 @@ import (
 // project already has a richer GitHub adapter under internal/infra/github;
 // this one is the small composition-root bridge used by the local MCP server
 // to turn observed checks into verdicts without a second credential store.
-type ghCIProvider struct{}
+type Provider struct{}
 
-var _ domain.CIProvider = (*ghCIProvider)(nil)
+var _ domain.CIProvider = (*Provider)(nil)
 
-func (ghCIProvider) PRState(ctx context.Context, repo string, pr int) (domain.PRState, error) {
+func (Provider) PRState(ctx context.Context, repo string, pr int) (domain.PRState, error) {
 	prArg := strconv.Itoa(pr)
 	view, err := exec.CommandContext(ctx, "gh", "pr", "view", prArg, "--repo", repo, "--json",
 		"headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision").Output()

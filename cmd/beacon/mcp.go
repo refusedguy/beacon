@@ -15,8 +15,9 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/refusedguy/beacon/internal/app/cibridge"
 	"github.com/refusedguy/beacon/internal/app/taskcli"
+	"github.com/refusedguy/beacon/internal/infra/cibridge"
+	"github.com/refusedguy/beacon/internal/infra/ghci"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -400,7 +401,7 @@ func runMCP(ctx context.Context) error {
 	// The CI bridge is the missing production verdict source. It observes the
 	// hosting service for active Watches and persists ready/retry, so the
 	// orchestrator reads a verdict from get_result instead of polling CI.
-	ciBridge := cibridge.New(deps.Store, ghCIProvider{}, deps.Clock, ciBridgeInterval)
+	ciBridge := cibridge.New(deps.Store, &ghci.Provider{}, deps.Clock, ciBridgeInterval)
 	go ciBridge.Run(ctx)
 
 	return serveMCP(ctx, deps)
