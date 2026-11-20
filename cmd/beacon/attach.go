@@ -194,6 +194,27 @@ func savedAttachSession(taskID string) (string, error) {
 	return "", nil
 }
 
+// registryResumeSession confirms the saved session id in the durable session
+// registry (WIRING-488). Resume reaches GetSession through the app-layer port,
+// so cmd never opens a database for this lookup. The registry is best effort:
+// when it is absent, reports an error or has no row, attach keeps the id from
+// attach-sessions.json, which ADR 0043 §6 makes the source of truth for resume.
+// A stored id replaces the saved one so both registries converge on one session.
+func registryResumeSession(sessionID string) string {
+	reg := sessionRegistryForSpawn()
+	if reg == nil {
+		return sessionID
+	}
+	stored, found, err := reg.Resume(sessionID)
+	if err != nil || !found {
+		return sessionID
+	}
+	if id := strings.TrimSpace(stored.ID); id != "" {
+		return id
+	}
+	return sessionID
+}
+
 // parseAttachArgs accepts the original `attach <sessionID>` plus the resume
 // form `attach --resume [taskID]`. Anything else is a usage error.
 func parseAttachArgs(args []string) (taskID, sessionID string, resume, ok bool) {
@@ -236,6 +257,7 @@ func (c *CLI) runAttach(args []string) int {
 			return 2
 		}
 		sessionID = saved
+		sessionID = registryResumeSession(sessionID)
 	}
 
 	cfg, err := readServiceConfig()
