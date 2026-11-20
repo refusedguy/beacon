@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -203,5 +204,96 @@ func TestACPStdioTransportFramesRequest(t *testing.T) {
 	}
 	if req.Method != "session/prompt" {
 		t.Errorf("method = %q, want session/prompt", req.Method)
+	}
+}
+
+// ===== ACP capability negotiation (S3.005) =====
+
+func TestParseACPCapabilities(t *testing.T) {
+	full := parseACPCapabilities(json.RawMessage(`{"agentCapabilities":{"loadSession":true,"fork":true,"models":true,"modes":true,"mcp":true}}`))
+	if !full.SessionLoad || !full.Fork || !full.Models || !full.Modes || !full.MCPTransport {
+		t.Fatalf("capabilities = %+v, want all five flags set", full)
+	}
+	if !full.Has(ACPCapSessionLoad) || full.Has(ACPCapability("unknown")) {
+		t.Fatalf("Has() disagrees with capabilities %+v", full)
+	}
+
+	// An agent that declares nothing must not be treated as capable.
+	none := parseACPCapabilities(json.RawMessage(`{"agentCapabilities":{}}`))
+	if none != (ACPCapabilities{}) {
+		t.Fatalf("capabilities = %+v, want the zero value", none)
+	}
+
+	// A malformed, missing or partial capability block degrades to zero rather
+	// than failing the handshake.
+	for _, raw := range []string{
+		`not json`,
+		`{}`,
+		`{"agentCapabilities":null}`,
+		`{"agentCapabilities":{"fork":false,"models":42,"mcp":"yes"}}`,
+	} {
+		if got := parseACPCapabilities(json.RawMessage(raw)); got != (ACPCapabilities{}) {
+			t.Errorf("parseACPCapabilities(%s) = %+v, want the zero value", raw, got)
+		}
+	}
+
+	// Some harnesses name the block serverCapabilities instead.
+	if got := parseACPCapabilities(json.RawMessage(`{"serverCapabilities":{"loadSession":true}}`)); !got.SessionLoad {
+		t.Errorf("serverCapabilities alias ignored: %+v", got)
+	}
+}
+
+func TestBeaconClientCapabilitiesNotEmpty(t *testing.T) {
+	caps := beaconClientCapabilities()
+	if len(caps) == 0 {
+		t.Fatal("initialize would send an empty clientCapabilities object")
+	}
+	if _, ok := caps[string(ACPCapSessionLoad)]; !ok {
+		t.Errorf("clientCapabilities = %v, want a session/load declaration", caps)
+	}
+}
+
+func TestACPDeliveryPolicyDegradesWithoutCapabilities(t *testing.T) {
+	full := ACPCapabilities{SessionLoad: true, Fork: true, Models: true, Modes: true, MCPTransport: true}
+	plan := (ACPDeliveryPolicy{PreferResume: true}).Plan(full)
+	if plan.Mode != ACPDeliveryResume {
+		t.Errorf("mode = %q, want resume", plan.Mode)
+	}
+	if !plan.UseFork || !plan.SendModels || !plan.SendModes || !plan.SendMCP {
+		t.Errorf("plan = %+v, want every advertised optional feature enabled", plan)
+	}
+
+	// The acceptance rule: no capabilities still produces a usable plan, only
+	// the mode changes.
+	degraded := (ACPDeliveryPolicy{PreferResume: true}).Plan(ACPCapabilities{})
+	if degraded.Mode != ACPDeliveryNewRun {
+		t.Errorf("mode = %q, want newRun (degraded)", degraded.Mode)
+	}
+	if degraded.UseFork || degraded.SendModels || degraded.SendModes || degraded.SendMCP {
+		t.Errorf("plan = %+v, want every optional feature dropped", degraded)
+	}
+
+	// Without a resume preference a capable agent still starts a new run.
+	newRun := (ACPDeliveryPolicy{}).Plan(full)
+	if newRun.Mode != ACPDeliveryNewRun {
+		t.Errorf("mode = %q, want newRun", newRun.Mode)
+	}
+}
+
+func TestPersistentACPInitializeNegotiatesCapabilities(t *testing.T) {
+	client, _ := newW2BACPPipe(false)
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	if !client.Capabilities().SessionLoad {
+		t.Fatalf("negotiated capabilities = %+v, want session/load", client.Capabilities())
+	}
+	plan := client.DeliveryPlan(ACPDeliveryPolicy{PreferResume: true})
+	if plan.Mode != ACPDeliveryResume {
+		t.Errorf("delivery plan = %+v, want resume", plan)
 	}
 }
