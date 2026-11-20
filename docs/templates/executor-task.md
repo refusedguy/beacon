@@ -54,6 +54,26 @@ executor-task:verdicts -->
 
 Если исполнитель увидел внешнюю поломку локально на `origin/main`, он вызывает `beacon_ack` с `decision="blocked:not_mine"` и непустой причиной, затем завершает ход. Оркестратор просыпается по этому сигналу и запускает FIX-агента.
 
+## Информационные проверки не являются блокировкой main
+
+Проверка с `required: false` в `beacon_list_running` или с `continue-on-error: true` в workflow является информационной. Такой проверкой является гейт `docs` из `.github/workflows/docs.yml`: он сообщает о дублях ADR и статусах карточек, но не блокирует merge.
+
+Информационная проверка НЕ является `blocked.main` и НЕ является `failedCheck`, требующим починки. По её `FAILURE` НЕ вызывать `beacon_ack` с `decision="blocked:not_mine"`. Блокер main объявляется только по required-проверке с реальной ошибкой в коде main, которая ломает сборку или тесты. Информационный `docs`-гейт с дублями ADR к таким не относится.
+
+Основание: в PR #434 (HD-045) и #437 (BS.10) исполнители вызвали `beacon_ack decision=blocked:not_mine` по `FAILURE` информационного `docs`-гейта и заблокировали свои PR. Это ложная блокировка: все проверки в ответе `beacon_list_running` имели `required: false`, а сам workflow помечен `continue-on-error: true`.
+
+<!-- executor-task:informational-checks
+required:false -> informational, no blocked:not_mine
+continue-on-error:true -> informational, no blocked:not_mine
+docs gate with duplicate ADRs -> informational, not a main blocker
+executor-task:informational-checks -->
+
+## Отложенная проводка (deferred wiring)
+
+Если часть фичи осталась не подключённой в этом PR, исполнитель не оставляет её молча «на потом». Он вызывает `beacon_defer_wiring` с `watchID`, номером PR, причиной и списком `OwnerFiles`, затем добавляет в свой PR сгенерированную карточку `docs/tasks/WIRING-<PR>.md` по шаблону `docs/templates/wiring-card.md`.
+
+Тулза пишет маркер `.beacon/wiring-pending` с одной строкой `WIRING:<PR>` на каждую отложенную проводку. Локальный гейт `WIRING-*` читает маркер и карточки из дерева: маркер без карточки, карточка без `Статус: todo`, пустой `OwnerFiles` или отсутствующая `## Причина` проваливают проверку. Маркер и карточка должны попасть в один PR.
+
 ## Диагностика вместо гаданий и sleep
 
 Не грепать логи вручную и не ждать в bash. Использовать `beacon_list_running` для снимка активных Watch, `beacon_stats` для счётчиков, `beacon inspect` для разбора конкретного Watch и `beacon logs --tail 50 --errors` для последних ошибок.

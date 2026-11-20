@@ -1,4 +1,13 @@
 {
   "baseline_limit": 0,
-  "baseline": []
+  "baseline": [],
+  "wiring": {
+    "card_dir": "docs/tasks",
+    "card_prefix": "WIRING-",
+    "marker": ".beacon/wiring-pending",
+    "marker_token": "WIRING:",
+    "status": "todo",
+    "owner_field": "OwnerFiles",
+    "reason_section": "## Причина"
+  }
 }
