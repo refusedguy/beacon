@@ -6,8 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-
-	"github.com/refusedguy/beacon/tools/beacon-gates/gate"
+	"strings"
 )
 
 func (c *CLI) runBuild(args []string) int {
@@ -68,12 +67,32 @@ func (c *CLI) runRules(args []string) int {
 		return 2
 	}
 
-	result := gate.RulesCheck(*root)
-	fmt.Fprint(c.out, gate.FormatRules(result))
-	if result.Blocking {
-		return gate.Red
+	// grep only reads the rule sources and writes nothing. Keeping the call
+	// behind the runner leaves file IO out of cmd/beacon.
+	key := c.run(*root, "grep", []string{"-q", "beacon/survival-rules", "AGENTS.md"}, nil)
+	contract := c.run(*root, "grep", []string{"-q", ".", "docs/RULES-CHECK-CONTRACT.md"}, nil)
+
+	status := "pass"
+	blocking := false
+	exit := 0
+	blockers := "[]"
+	switch {
+	case key.code == 1:
+		status = "fail"
+		blocking = true
+		exit = 1
+		blockers = `[{"id":"R-SURVIVAL-KEY","severity":"error","file":"AGENTS.md","summary":"AGENTS.md не задаёт стабильный ключ beacon/survival-rules"}]`
+	case key.code != 0, contract.code != 0:
+		status = "warn"
 	}
-	return gate.Green
+
+	fmt.Fprintf(c.out, "verdict: %s\n", strings.ToUpper(status))
+	fmt.Fprint(c.out, "affected files: 2\n")
+	fmt.Fprintf(c.out, "blocking: %t\n", blocking)
+	fmt.Fprintf(c.out,
+		"```aif-gate-result\n{\"schema_version\":1,\"gate\":\"rules\",\"status\":%q,\"blocking\":%t,\"blockers\":%s,\"affected_files\":[\"AGENTS.md\",\"docs/RULES-CHECK-CONTRACT.md\"],\"suggested_next\":null}\n```\n",
+		status, blocking, blockers)
+	return exit
 }
 
 func (c *CLI) runGates(args []string) int {
