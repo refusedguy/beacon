@@ -42,34 +42,40 @@ bash scripts/verify-daemon.sh
 | `beacon_stats` | `tools/call` прошёл без `isError`, в `structuredContent` есть ключи `activeWatches`, `budget`, `ladder`, `persist`, `version`. |
 | Проект-scoped БД | Файл `<state>/beacon/projects/<name>-<hash>/beacon.db` существует, `PRAGMA quick_check` возвращает `ok`, в базе есть таблицы. Хеш вычисляется по тому же абсолютному пути проекта, что и в коде. |
 | Логи | Два последовательных запуска `beacon metrics` создали два разных файла `beacon-<UTC>-<pid>.log`, и `beacon.latest.log` указывает на каждый новый файл. |
-| Метрики | `beacon metrics --format json` дал разбираемый JSON с семью ключами счётчиков: `poll_cycles`, `verdict_published`, `merge_attempt`, `merge_success`, `wake_delivered`, `wake_failed`, `rebase_requested`. |
-| Демон | Процесс `beacon daemon --interval 300ms` жив во время проверки и записал минимум две строки `event=daemon_pass` в свой лог. Внешний `gh` подменён заглушкой без PR, поэтому циклы не обращаются к GitHub. |
+| Метрики | `beacon metrics --format json` дал разбираемый JSON с ключами `poll_cycles_total`, `verdict_published_total`, `merge_attempts_total`, `merge_success_total`, `merge_failures_total`, `wake_delivered_total`, `wake_errors_total`, `wake_skipped_total`, `rebase_requests_total`, `dependency_waits_total`, `blocks_total`, `actor_errors_total`. |
+| Демон | Процесс `beacon daemon --interval 300ms` жив во время проверки и записал минимум две строки `event=poll_cycle` в свой лог. Внешний `gh` подменён заглушкой без PR, поэтому циклы не обращаются к GitHub. |
 
 ## Что проверяет `verify-daemon.sh`
 
 Скрипт проверяет мерж на реальном пути: настоящий бинарник `beacon`, настоящий
 store SQLite, настоящий движок вердиктов и настоящий `orchestrator.Run`.
 Внешний `gh` подменён локальной заглушкой, которая записывает все вызовы в
-журнал и возвращает успех только для команды с флагом `--auto`. Перед запуском
-демона скрипт проверяет, что `gh` из `PATH` разрешается в эту заглушку.
-Реальные PR не мержатся и не закрываются.
+журнал. Заглушка сообщает `MERGEABLE` и `CLEAN` для PR 901, `DIRTY` для PR 902
+и `state=MERGED` после команды мержа. Команда `gh pr merge` принимается только
+без `--auto`: заглушка возвращает ошибку GraphQL для `--auto`, потому что в
+этом репозитории `enablePullRequestAutoMerge` выключен. Перед запуском демона
+скрипт проверяет, что `gh` из `PATH` разрешается в заглушку. Реальные PR не
+мержатся и не закрываются.
 
 Порядок проверки:
 
 1. `domain.Evaluate` на снимке `MERGEABLE` и `CLEAN` должен вернуть `ready`.
    Тот же снимок с `DIRTY` должен вернуть `rebase`. Оба Watch сохраняются в
-   настоящий store через `SaveWatch`.
+   настоящий store через `SaveWatch` с вердиктом `ready`. Для PR 902 это
+   намеренно устаревший вердикт: заглушка сообщает `DIRTY` на момент мержа.
 2. Первый проход `beacon daemon --once` должен вызвать
-   `gh pr merge 901 --auto --squash --delete-branch` ровно один раз и не
-   вызывать мерж для PR 902.
+   `gh pr merge 901 --squash --delete-branch` ровно один раз. Для PR 902
+   проверенный merger должен отказать до команды мержа и записать в лог
+   `PR 902: merge held: mergeable=MERGEABLE mergeStateStatus=DIRTY`.
 3. Второй проход не должен повторить мерж. Это проверяет журнал
    `orchestrator_merges` и отсутствие повторных вызовов `gh pr merge`.
 4. В логах не должно быть строки `add the --auto flag`. Заглушка возвращает
-   эту ошибку для команды мержа без `--auto`, поэтому проверка ловит откат
-   фикса `--auto`.
+   ошибку для команды мержа с `--auto`, поэтому проверка ловит откат к старому
+   поведению.
 5. В таблице `orchestrator_merges` должна быть запись
    `('watch:verify-ready', 1)` и не должно быть записи про
-   `watch:verify-conflict`.
+   `watch:verify-conflict`. Запись появляется только после подтверждения
+   `state=MERGED`.
 
 ## Что означает результат
 
@@ -90,9 +96,10 @@ store SQLite, настоящий движок вердиктов и настоя
 каждого процесса. Один и тот же файл на два запуска был бы признаком записи
 в общий лог.
 
-`демон сделал N циклов` означает, что строка `daemon_pass` появилась в логе
-работающего процесса. Один цикл был бы недостаточен: проверка требует как
-минимум второй проход по тикеру.
+`демон сделал N циклов` означает, что строка `event=poll_cycle` появилась в
+логе работающего процесса. Её пишет `PollCycleDuration` на каждом проходе
+`CloseMerged`. Один цикл был бы недостаточен: проверка требует как минимум
+второй проход по тикеру.
 
 `LEDGER_OK rows=[('watch:verify-ready', 1)]` означает, что реальный оркестратор
 записал мерж в постоянный журнал и что конфликтующий Watch туда не попал.
@@ -103,12 +110,13 @@ store SQLite, настоящий движок вердиктов и настоя
 - `beacon mcp` поднимается как отдельный процесс и отвечает на `beacon_stats`.
 - В проект-scoped каталоге состояния есть читаемая `beacon.db` с таблицами.
 - Каждый запуск CLI оставляет новый лог-файл, и `beacon.latest.log` указывает на него.
-- `beacon metrics --format json` возвращает JSON со всеми семью счётчиками.
-- Демон жив и пишет в свой лог как минимум два цикла.
-- PR с вердиктом `ready` получает одну команду мержа с `--auto` и попадает в
-  журнал `orchestrator_merges`.
-- Конфликтующий PR не получает команды мержа и не вызывает повторных ошибок
-  `--auto`.
+- `beacon metrics --format json` возвращает JSON со всеми ожидаемыми счётчиками.
+- Демон жив и пишет в свой лог как минимум два цикла `poll_cycle`.
+- PR с вердиктом `ready` и `mergeStateStatus=CLEAN` получает одну команду
+  `gh pr merge --squash --delete-branch`, подтверждает `state=MERGED` и попадает
+  в журнал `orchestrator_merges`.
+- Конфликтующий PR не получает команды мержа, получает диагностику `merge held`
+  и не вызывает ошибок `--auto`.
 
 ## Факты реального прогона
 
@@ -117,9 +125,11 @@ store SQLite, настоящий движок вердиктов и настоя
 
 - `bash scripts/verify-beacon.sh` завершился с кодом `0`, все проверки `PASS`.
   В выводе были `MCP_OK server=beacon tools=7 stats_keys=7`,
-  `DB_OK quick_check=ok tables=7`, два новых лог-файла и
+  `DB_OK quick_check=ok tables=7`, `METRICS_OK keys=13`, два новых лог-файла и
   `демон сделал 2 циклов`.
 - `bash scripts/verify-daemon.sh` завершился с кодом `0`, все проверки `PASS`.
+  PR 901 получил команду `gh pr merge 901 --squash --delete-branch` ровно один
+  раз, PR 902 получил диагностику отказа по `DIRTY`, повторного мержа не было.
   Журнал мержа содержал только `('watch:verify-ready', 1)`.
 
 Эти строки не self-report: их напечатали сами скрипты после прямого

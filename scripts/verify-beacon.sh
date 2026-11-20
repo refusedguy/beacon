@@ -230,13 +230,18 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as fh:
     data = json.load(fh)
 want = {
-    "poll_cycles",
-    "verdict_published",
-    "merge_attempt",
-    "merge_success",
-    "wake_delivered",
-    "wake_failed",
-    "rebase_requested",
+    "poll_cycles_total",
+    "verdict_published_total",
+    "merge_attempts_total",
+    "merge_success_total",
+    "merge_failures_total",
+    "wake_delivered_total",
+    "wake_errors_total",
+    "wake_skipped_total",
+    "rebase_requests_total",
+    "dependency_waits_total",
+    "blocks_total",
+    "actor_errors_total",
 }
 missing = sorted(want - set(data))
 if missing:
@@ -279,7 +284,7 @@ if [[ -z "$daemon_log" ]]; then
 else
   cycles=0
   for _ in $(seq 1 100); do
-    cycles="$(grep -c 'event=daemon_pass' "$STATE_DIR/logs/$daemon_log" 2>/dev/null || true)"
+    cycles="$(grep -c 'event=poll_cycle' "$STATE_DIR/logs/$daemon_log" 2>/dev/null || true)"
     if [[ -z "$cycles" ]]; then cycles=0; fi
     if [[ "$cycles" -ge 2 ]]; then break; fi
     kill -0 "$DAEMON_PID" 2>/dev/null || break
@@ -293,7 +298,7 @@ else
   if [[ "$cycles" -ge 2 ]]; then
     pass "демон сделал $cycles циклов, записано в $daemon_log"
   else
-    fail 'демон не записал два цикла в лог' "cycles=$cycles log=$daemon_log"
+    fail 'демон не записал два цикла (event=poll_cycle) в лог' "cycles=$cycles log=$daemon_log"
   fi
 fi
 kill -TERM "$DAEMON_PID" 2>/dev/null || true

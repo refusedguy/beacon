@@ -41,6 +41,8 @@ project_hash="$(printf '%s' "$REPO" | sha256sum | cut -c1-16)"
 STATE_DIR="$XDG_STATE_HOME/beacon/projects/$project_name-$project_hash"
 GH_CALLS="$WORK/gh-calls.log"
 export GH_CALLS
+mkdir -p "$WORK/merged"
+export MERGED_DIR="$WORK/merged"
 : > "$GH_CALLS"
 
 FAILURES=0
@@ -49,7 +51,7 @@ fail() { printf 'FAIL  %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
 section() { printf '\n== %s ==\n' "$*"; }
 count_merge() {
   local n
-  n="$(grep -c "^pr merge $1 --auto --squash --delete-branch$" "$GH_CALLS" 2>/dev/null || true)"
+  n="$(grep -c "^pr merge $1 --squash --delete-branch$" "$GH_CALLS" 2>/dev/null || true)"
   printf '%s' "${n:-0}"
 }
 
@@ -67,30 +69,35 @@ section "Заглушка gh и подготовка состояния"
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/gh" <<'EOF'
 #!/usr/bin/env bash
-# Локальная заглушка. PR нет, команды мержа возвращают успех и пишутся в GH_CALLS.
+# Локальная заглушка. Записывает вызовы и не трогает реальный GitHub.
 printf '%s\n' "$*" >> "$GH_CALLS"
-case "${1:-} ${2:-}" in
-  "pr merge")
-    for arg in "$@"; do
-      if [[ "$arg" == "--auto" ]]; then
-        exit 0
-      fi
-    done
-    printf '%s\n' 'add the --auto flag: подождите GitHub requirements' >&2
-    exit 1
-    ;;
-  "pr view")
-    if [[ "${3:-}" == "902" ]]; then
-      merge_state=DIRTY
-    else
-      merge_state=CLEAN
+pr="${3:-}"
+if [[ "${1:-} ${2:-}" == "pr merge" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == "--auto" ]]; then
+      printf '%s\n' 'GraphQL: enablePullRequestAutoMerge is disabled' >&2
+      exit 1
     fi
-    printf '{"headRefOid":"head-%s","baseRefName":"main","state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"%s","reviewDecision":"APPROVED"}\n' \
-      "${3:-0}" "$merge_state"
+  done
+  : > "$MERGED_DIR/$pr"
+  exit 0
+fi
+case "${1:-} ${2:-}" in
+  "pr view")
+    state=OPEN
+    if [[ -f "$MERGED_DIR/$pr" ]]; then
+      state=MERGED
+    fi
+    merge_status=CLEAN
+    if [[ "$pr" == "902" ]]; then
+      merge_status=DIRTY
+    fi
+    printf '{"headRefOid":"head-%s","baseRefName":"main","state":"%s","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"%s","reviewDecision":"APPROVED"}\n' \
+      "$pr" "$state" "$merge_status"
     exit 0
     ;;
   "pr checks")
-    printf '%s\n' '[]'
+    printf '%s\n' '[{"name":"build","state":"PASS","link":"https://example.invalid/build"}]'
     exit 0
     ;;
   "pr list")
@@ -172,6 +179,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Оба Watch несут вердикт ready. Для 902 заглушка gh сообщает DIRTY,
+	// поэтому отказ должен принять проверенный merger, а не движок вердиктов.
 	watches := []domain.Watch{
 		{
 			ID:          "watch:verify-ready",
@@ -189,7 +198,7 @@ func main() {
 			PR:          902,
 			HeadSHA:     "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			Status:      domain.StatusNotifying,
-			Verdict:     rebase,
+			Verdict:     ready,
 			Revision:    1,
 			MergePolicy: domain.DefaultMergePolicy(),
 		},
@@ -200,7 +209,7 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	fmt.Printf("SEED_OK ready=%s conflict=%s watches=%d\n", ready, rebase, len(watches))
+	fmt.Printf("SEED_OK ready=%s dirty=%s watches=%d\n", ready, rebase, len(watches))
 }
 GOEOF
 if ! (cd "$WORK/seed" && GOFLAGS=-mod=mod "$GO" run . "$STATE_DIR/beacon.db" >"$WORK/seed.out" 2>"$WORK/seed.err"); then
@@ -208,7 +217,7 @@ if ! (cd "$WORK/seed" && GOFLAGS=-mod=mod "$GO" run . "$STATE_DIR/beacon.db" >"$
   printf '\nИТОГ: %d проверок провалено\n' "$FAILURES" >&2
   exit 1
 fi
-if grep -q 'SEED_OK ready=ready conflict=rebase watches=2' "$WORK/seed.out"; then
+if grep -q 'SEED_OK ready=ready dirty=rebase watches=2' "$WORK/seed.out"; then
   pass "вердикты посчитаны реальным движком: $(cat "$WORK/seed.out")"
 else
   fail 'вердикты не совпали с ожиданием' "$(cat "$WORK/seed.out")"
@@ -226,14 +235,19 @@ else
   fail 'daemon --once завершился с ошибкой' "rc=$rc1 $(tail -n 20 "$WORK/pass1.out")"
 fi
 if [[ "$first_ready" -eq 1 ]]; then
-  pass 'готовый PR 901 получил ровно одну команду gh pr merge с --auto'
+  pass 'PR 901 с ready и CLEAN получил ровно одну команду gh pr merge --squash --delete-branch'
 else
-  fail 'готовый PR 901 не получил одну команду gh pr merge с --auto' "calls=$first_ready $(cat "$GH_CALLS")"
+  fail 'PR 901 не получил одну команду gh pr merge' "calls=$first_ready $(cat "$GH_CALLS")"
 fi
 if [[ "$first_conflict" -eq 0 ]]; then
   pass 'конфликтующий PR 902 не получил команду gh pr merge'
 else
   fail 'конфликтующий PR 902 получил команду gh pr merge' "calls=$first_conflict"
+fi
+if grep -R -q 'PR 902: merge held: mergeable=MERGEABLE mergeStateStatus=DIRTY' "$STATE_DIR/logs" 2>/dev/null; then
+  pass 'проверенный merger отказал 902 по mergeStateStatus=DIRTY'
+else
+  fail 'нет диагностики отказа 902 по DIRTY'
 fi
 
 section "Второй проход демона"
@@ -249,16 +263,16 @@ else
   fail 'второй daemon --once завершился с ошибкой' "rc=$rc2 $(tail -n 20 "$WORK/pass2.out")"
 fi
 if [[ "$second_ready" -eq 0 && "$second_conflict" -eq 0 ]]; then
-  pass 'повторный проход не повторил мерж и не отправил 902 под --auto'
+  pass 'повторный проход не повторил мерж'
 else
   fail 'повторный проход снова вызвал мерж' "901=$second_ready 902=$second_conflict"
 fi
 
 section "Журнал и ledgers"
 if grep -R -q -i 'add the --auto flag' "$STATE_DIR/logs" "$WORK/pass1.out" "$WORK/pass2.out" 2>/dev/null; then
-  fail 'в логах есть повторяющаяся ошибка про --auto'
+  fail 'в логах есть ошибка про --auto'
 else
-  pass 'в логах нет ошибок "add the --auto flag"'
+  pass 'в логах нет ошибки "add the --auto flag"'
 fi
 if "$PYTHON" - "$STATE_DIR/beacon.db" >"$WORK/ledger.out" 2>"$WORK/ledger.err" <<'PYEOF'
 import sqlite3
