@@ -329,6 +329,7 @@ func (l *Lifecycle) Stop() error {
 			return
 		}
 		srv := l.httpSrv
+		done := l.done
 		l.state = StateDraining
 		l.mu.Unlock()
 
@@ -338,6 +339,11 @@ func (l *Lifecycle) Stop() error {
 		if errors.Is(err, context.DeadlineExceeded) {
 			err = srv.Close()
 		}
+
+		// Shutdown closes the listener, which unblocks Serve. Wait for that
+		// goroutine to exit before publishing StateStopped, so the state means
+		// the accept loop is gone and not just that shutdown was requested.
+		<-done
 
 		l.mu.Lock()
 		defer l.mu.Unlock()
