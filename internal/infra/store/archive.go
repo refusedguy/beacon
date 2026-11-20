@@ -59,6 +59,9 @@ CREATE INDEX IF NOT EXISTS watch_archive_closed_at ON watch_archive(closed_at);
 //
 // Obligations are never deleted. They stay in the obligations table keyed by
 // watch_id, and WatchObligations reads them after the Watch has moved.
+//
+// This is the raw, unconditional pass. A cycle should call ArchiveRun, which
+// adds the hourly schedule on top of this method.
 func (d *DB) ArchiveClosedWatches(now time.Time) (int, error) {
 	if now.IsZero() {
 		return 0, errors.New("store: archive: zero time")
@@ -66,60 +69,194 @@ func (d *DB) ArchiveClosedWatches(now time.Time) (int, error) {
 
 	moved := 0
 	err := d.Write(context.Background(), func(tx *sql.Tx) error {
-		if _, err := tx.Exec(createWatchArchiveSQL); err != nil {
-			return fmt.Errorf("store: archive: create table: %w", err)
-		}
-
-		rows, err := tx.Query(`
-			SELECT id, payload FROM watches WHERE status = ? ORDER BY id`,
-			string(domain.StatusClosed))
-		if err != nil {
-			return err
-		}
-		type candidate struct {
-			id string
-			w  domain.Watch
-		}
-		var candidates []candidate
-		for rows.Next() {
-			var id string
-			var payload []byte
-			if err := rows.Scan(&id, &payload); err != nil {
-				rows.Close()
-				return err
-			}
-			w, err := decodeWatch(payload)
-			if err != nil {
-				rows.Close()
-				return err
-			}
-			if archiveEligible(w, now) {
-				candidates = append(candidates, candidate{id: id, w: w})
-			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-
-		for _, c := range candidates {
-			if err := insertArchivedWatch(tx, c.w, now); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(`DELETE FROM watches WHERE id = ?`, c.id); err != nil {
-				return err
-			}
-			moved++
-		}
-		return nil
+		var err error
+		moved, err = archiveClosedWatchesTx(tx, now)
+		return err
 	})
 	if err != nil {
 		return 0, err
 	}
 	return moved, nil
+}
+
+// archiveClosedWatchesTx is the unconditional pass inside a caller-owned
+// transaction. ArchiveRun reuses it so the move and the schedule marker commit
+// together; a crash between the two cannot leave a "completed" pass that never
+// archived, or an archived pass that will be repeated on the next tick.
+func archiveClosedWatchesTx(tx *sql.Tx, now time.Time) (int, error) {
+	if _, err := tx.Exec(createWatchArchiveSQL); err != nil {
+		return 0, fmt.Errorf("store: archive: create table: %w", err)
+	}
+
+	rows, err := tx.Query(`
+		SELECT id, payload FROM watches WHERE status = ? ORDER BY id`,
+		string(domain.StatusClosed))
+	if err != nil {
+		return 0, err
+	}
+	type candidate struct {
+		id string
+		w  domain.Watch
+	}
+	var candidates []candidate
+	for rows.Next() {
+		var id string
+		var payload []byte
+		if err := rows.Scan(&id, &payload); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		w, err := decodeWatch(payload)
+		if err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if archiveEligible(w, now) {
+			candidates = append(candidates, candidate{id: id, w: w})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	moved := 0
+	for _, c := range candidates {
+		if err := insertArchivedWatch(tx, c.w, now); err != nil {
+			return 0, err
+		}
+		if _, err := tx.Exec(`DELETE FROM watches WHERE id = ?`, c.id); err != nil {
+			return 0, err
+		}
+		moved++
+	}
+	return moved, nil
+}
+
+// ArchiveScheduleInterval is how often the hourly archive pass runs. A cycle
+// may call ArchiveRun on every tick; it archives at most once per interval.
+const ArchiveScheduleInterval = time.Hour
+
+const archiveScheduleKey = "archive"
+
+// createArchiveScheduleSQL is the durable marker for the last archive pass.
+// It is created on first use, like the other tables owned by this package, so
+// a process restart does not re-run an hour's work or forget a pass that is
+// due. One row, keyed by a fixed name.
+const createArchiveScheduleSQL = `
+CREATE TABLE IF NOT EXISTS archive_schedule (
+  id          TEXT PRIMARY KEY,
+  last_run_at INTEGER NOT NULL
+);
+`
+
+// ArchiveRunResult is what one scheduled pass did. Ran is false when the
+// interval has not elapsed; Moved is zero in that case and also when the pass
+// ran but nothing had passed the retention window.
+type ArchiveRunResult struct {
+	Ran   bool
+	Moved int
+}
+
+// ArchiveDue reports whether the next hourly pass is due by now. A store with
+// no marker yet is due, so the first cycle archives immediately on startup.
+// It only reads; a caller that wants to perform the pass calls ArchiveRun.
+func (d *DB) ArchiveDue(ctx context.Context, now time.Time) (bool, error) {
+	if now.IsZero() {
+		return false, errors.New("store: archive: zero time")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ok, err := tableExists(ctx, d.readDB, "archive_schedule")
+	if err != nil || !ok {
+		return err == nil, err
+	}
+	last, ok, err := readLastArchiveRun(ctx, d.readDB)
+	if err != nil || !ok {
+		return err == nil, err
+	}
+	return !now.Before(last.Add(ArchiveScheduleInterval)), nil
+}
+
+// ArchiveRun performs the archive pass when it is due and records the run in
+// the same transaction as the move. A pass that is not due is a no-op with
+// Ran=false. Repeated or concurrent calls in the same interval commit at most
+// one pass, so the watches table stays compact without the cycle tracking any
+// schedule state of its own.
+func (d *DB) ArchiveRun(ctx context.Context, now time.Time) (ArchiveRunResult, error) {
+	if now.IsZero() {
+		return ArchiveRunResult{}, errors.New("store: archive: zero time")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var result ArchiveRunResult
+	err := d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createArchiveScheduleSQL); err != nil {
+			return fmt.Errorf("store: archive: create schedule: %w", err)
+		}
+		last, ok, err := readLastArchiveRun(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if ok && now.Before(last.Add(ArchiveScheduleInterval)) {
+			return nil
+		}
+		moved, err := archiveClosedWatchesTx(tx, now)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO archive_schedule (id, last_run_at) VALUES (?, ?)
+			ON CONFLICT(id) DO UPDATE SET last_run_at = excluded.last_run_at`,
+			archiveScheduleKey, timeToNano(now)); err != nil {
+			return fmt.Errorf("store: archive: record run: %w", err)
+		}
+		result = ArchiveRunResult{Ran: true, Moved: moved}
+		return nil
+	})
+	if err != nil {
+		return ArchiveRunResult{}, err
+	}
+	return result, nil
+}
+
+// LastArchiveRun returns the time of the last committed pass and whether one
+// has been recorded. W6-B can log it when it wires the scheduler into its
+// cycle; tests use it to assert a pass was persisted across a reopen.
+func (d *DB) LastArchiveRun(ctx context.Context) (time.Time, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ok, err := tableExists(ctx, d.readDB, "archive_schedule")
+	if err != nil || !ok {
+		return time.Time{}, false, err
+	}
+	return readLastArchiveRun(ctx, d.readDB)
+}
+
+// queryer is the narrow read surface shared by *sql.DB and *sql.Tx. Both the
+// read pool and the writer transaction can answer "when did we last run".
+type queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func readLastArchiveRun(ctx context.Context, q queryer) (time.Time, bool, error) {
+	var nano int64
+	err := q.QueryRowContext(ctx,
+		`SELECT last_run_at FROM archive_schedule WHERE id = ?`, archiveScheduleKey,
+	).Scan(&nano)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	return time.Unix(0, nano).UTC(), true, nil
 }
 
 // archiveEligible accepts a closed Watch only when it was closed by a

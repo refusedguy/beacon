@@ -1305,3 +1305,54 @@ func TestClaimResultsEmptyBeforeFirstSave(t *testing.T) {
 		t.Fatalf("ClaimResults = %+v, want empty", got)
 	}
 }
+
+// W6-C: the plugin appends exactly {obligationID, attempt, outcome, at} to
+// receipts.jsonl. No source, no verified flag. Such a line must import, set
+// deliveredAt only for posted, and stay a single row on a repeated import.
+func TestImportReceiptsPluginWireShape(t *testing.T) {
+	d := newReceiptDB(t)
+	for _, id := range []string{"wire-posted", "wire-failed"} {
+		seedReceiptObligation(t, d, id)
+	}
+	path := writeReceiptsFile(t, strings.Join([]string{
+		`{"obligationID":"wire-posted","attempt":1,"outcome":"posted","at":"` + testReceiptAt + `"}`,
+		`{"obligationID":"wire-failed","attempt":2,"outcome":"transport-failed","at":"` + testReceiptAt + `"}`,
+	}, "\n")+"\n")
+
+	first, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if first.Imported != 2 || first.Malformed != 0 {
+		t.Fatalf("first import = %+v, want 2 imported and no malformed lines", first)
+	}
+	posted, err := d.Obligation("wire-posted")
+	if err != nil {
+		t.Fatalf("Obligation(wire-posted): %v", err)
+	}
+	failed, err := d.Obligation("wire-failed")
+	if err != nil {
+		t.Fatalf("Obligation(wire-failed): %v", err)
+	}
+	if posted.DeliveredAt.IsZero() {
+		t.Error("posted plugin receipt did not set deliveredAt")
+	}
+	if !failed.DeliveredAt.IsZero() {
+		t.Errorf("transport-failed plugin receipt set deliveredAt = %v", failed.DeliveredAt)
+	}
+	if len(posted.Attempts) != 1 || len(failed.Attempts) != 1 {
+		t.Fatalf("attempts = %d/%d, want one each", len(posted.Attempts), len(failed.Attempts))
+	}
+
+	second, err := d.ImportReceipts(path)
+	if err != nil {
+		t.Fatalf("second import: %v", err)
+	}
+	if second.Imported != 0 || second.Duplicates != 2 {
+		t.Fatalf("second import = %+v, want 0 imported and 2 duplicates", second)
+	}
+	count, err := d.ReceiptCount()
+	if err != nil || count != 2 {
+		t.Fatalf("ReceiptCount = %d, %v; want 2", count, err)
+	}
+}
