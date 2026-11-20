@@ -4,6 +4,8 @@
 package batchapply
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,8 +65,12 @@ func languageFor(scope languageScope) string {
 // technical terms; prose lines are Russian. Keeping the formats here lets
 // tests pin the exact output a caller sees.
 const (
-	checkReportFormat    = "valid=%d invalid=%d\n"
-	summaryReportFormat  = "batches=%d adrs=%d cards=%d evals=%d closures=%d\n"
+	checkReportFormat   = "valid=%d invalid=%d\n"
+	summaryReportFormat = "batches=%d adrs=%d cards=%d evals=%d closures=%d\n"
+	// HD-066 (ADR 0307): the iteration report carries the SHA-256 of the
+	// artifact set. The next refinement reads it as previous_artifact_hash and
+	// can verify what changed. The key stays English as a technical term.
+	hashReportFormat     = "hash=%s\n"
 	mergeReportFormat    = "merged=%d held=%d\n"
 	renumberReportFormat = "перенумеровать ADR %d в %d\n"
 	skipReportFormat     = "пропуск %s\n"
@@ -141,6 +147,29 @@ type cardClosure struct {
 type ghCheck struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
+}
+
+// artifactEntry pairs a rendered document with its path relative to the repo
+// root. Both belong to one batch-apply iteration (HD-066, ADR 0307).
+type artifactEntry struct {
+	path    string
+	content string
+}
+
+// iterationHash returns the SHA-256 of the artifact set produced by one
+// iteration. Paths and contents feed the digest in a fixed order, so the same
+// inputs always give the same hash and a change to any artifact changes it.
+func iterationHash(entries []artifactEntry) string {
+	sorted := append([]artifactEntry(nil), entries...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].path < sorted[j].path })
+	h := sha256.New()
+	for _, e := range sorted {
+		io.WriteString(h, e.path)
+		h.Write([]byte{0})
+		io.WriteString(h, e.content)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 var nonSlug = regexp.MustCompile(`[^a-z0-9]+`)
@@ -519,23 +548,32 @@ func Run(opts Options, out, errOut io.Writer) int {
 	}
 	sort.Strings(names)
 
-	r.printf(summaryReportFormat,
-		len(batches), len(adrs), len(cards), len(evals), len(closures))
+	var entries []artifactEntry
 	for _, n := range nums {
 		a := adrs[n]
-		if err := r.writeFile(root, filepath.Join("docs", "adrs", fmt.Sprintf("%04d-%s.md", n, slug(a.Title))), renderADR(a)); err != nil {
-			r.errf("%v\n", err)
-			return 1
-		}
+		entries = append(entries, artifactEntry{
+			path:    filepath.Join("docs", "adrs", fmt.Sprintf("%04d-%s.md", n, slug(a.Title))),
+			content: renderADR(a),
+		})
 	}
 	for _, id := range ids {
-		if err := r.writeFile(root, filepath.Join("docs", "tasks", id+".md"), renderCard(cards[id])); err != nil {
-			r.errf("%v\n", err)
-			return 1
-		}
+		entries = append(entries, artifactEntry{
+			path:    filepath.Join("docs", "tasks", id+".md"),
+			content: renderCard(cards[id]),
+		})
 	}
 	for _, name := range names {
-		if err := r.writeFile(root, filepath.Join("docs", "evals", slug(name)+".md"), renderEval(evals[name])); err != nil {
+		entries = append(entries, artifactEntry{
+			path:    filepath.Join("docs", "evals", slug(name)+".md"),
+			content: renderEval(evals[name]),
+		})
+	}
+
+	r.printf(summaryReportFormat,
+		len(batches), len(adrs), len(cards), len(evals), len(closures))
+	r.printf(hashReportFormat, iterationHash(entries))
+	for _, e := range entries {
+		if err := r.writeFile(root, e.path, e.content); err != nil {
 			r.errf("%v\n", err)
 			return 1
 		}
