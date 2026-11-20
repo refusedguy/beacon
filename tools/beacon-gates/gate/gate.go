@@ -3,6 +3,7 @@
 package gate
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -188,4 +189,86 @@ func RemoveFixture(root string) { _ = os.RemoveAll(root) }
 func Brokenf(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "broken: "+format+"\n", args...)
 	return Broken
+}
+
+// ---- read-only rules gate ------------------------------------------------
+
+// RuleBlocker is one hard-rule violation. Only a FAIL verdict carries blockers.
+type RuleBlocker struct {
+	ID       string `json:"id"`
+	Severity string `json:"severity"`
+	File     string `json:"file"`
+	Summary  string `json:"summary"`
+}
+
+// RulesResult is the verdict of the read-only rules gate. Its JSON form is the
+// aif-gate-result fence defined in docs/RULES-CHECK-CONTRACT.md.
+type RulesResult struct {
+	SchemaVersion int           `json:"schema_version"`
+	Gate          string        `json:"gate"`
+	Status        string        `json:"status"`
+	Blocking      bool          `json:"blocking"`
+	Blockers      []RuleBlocker `json:"blockers"`
+	AffectedFiles []string      `json:"affected_files"`
+	SuggestedNext *string       `json:"suggested_next"`
+}
+
+// RulesCheck inspects the canonical rule sources under root. It only reads
+// files and never changes them. AGENTS.md is the always-active rule source and
+// must declare the stable survival key. The contract document is optional, so
+// its absence downgrades the verdict to WARN rather than FAIL.
+func RulesCheck(root string) RulesResult {
+	r := RulesResult{
+		SchemaVersion: 1,
+		Gate:          "rules",
+		Status:        "pass",
+		Blockers:      []RuleBlocker{},
+		AffectedFiles: []string{},
+	}
+
+	agents := "AGENTS.md"
+	data, err := os.ReadFile(filepath.Join(root, agents))
+	if err != nil {
+		r.Status = "warn"
+		r.AffectedFiles = append(r.AffectedFiles, agents)
+		return r
+	}
+	r.AffectedFiles = append(r.AffectedFiles, agents)
+	if !strings.Contains(string(data), "beacon/survival-rules") {
+		r.Status = "fail"
+		r.Blocking = true
+		r.Blockers = append(r.Blockers, RuleBlocker{
+			ID:       "R-SURVIVAL-KEY",
+			Severity: "error",
+			File:     agents,
+			Summary:  "AGENTS.md не задаёт стабильный ключ beacon/survival-rules",
+		})
+	}
+
+	contract := "docs/RULES-CHECK-CONTRACT.md"
+	if _, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(contract))); err != nil {
+		if r.Status != "fail" {
+			r.Status = "warn"
+		}
+		r.AffectedFiles = append(r.AffectedFiles, contract)
+	}
+	return r
+}
+
+// FormatRules renders the human-readable report followed by exactly one
+// aif-gate-result fence. The orchestrator reads the last fence in the output.
+func FormatRules(r RulesResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "verdict: %s\n", strings.ToUpper(r.Status))
+	fmt.Fprintf(&b, "affected files: %d\n", len(r.AffectedFiles))
+	fmt.Fprintf(&b, "blocking: %t\n", r.Blocking)
+	for _, blocker := range r.Blockers {
+		fmt.Fprintf(&b, "%s: %s: %s\n", blocker.ID, blocker.File, blocker.Summary)
+	}
+	encoded, err := json.Marshal(r)
+	if err != nil {
+		encoded = []byte(`{"schema_version":1,"gate":"rules","status":"warn","blocking":false,"blockers":[],"affected_files":[],"suggested_next":null}`)
+	}
+	fmt.Fprintf(&b, "```aif-gate-result\n%s\n```\n", encoded)
+	return b.String()
 }

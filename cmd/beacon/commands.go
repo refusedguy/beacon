@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+
+	"github.com/refusedguy/beacon/tools/beacon-gates/gate"
 )
 
 func (c *CLI) runBuild(args []string) int {
@@ -43,7 +46,40 @@ func (c *CLI) runTest(args []string) int {
 	return res.code
 }
 
+// rulesCatalogEntry registers the read-only rules gate with beacon list and
+// beacon what. The gate itself is dispatched from runGates below.
+var rulesCatalogEntry = command{
+	Name:    "rules",
+	Summary: "Проверить правила Beacon в режиме только для чтения",
+	Usage:   "beacon gates rules [--root <dir>]",
+}
+
+func init() {
+	catalog = append(catalog, rulesCatalogEntry)
+	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
+}
+
+// runRules is the separate read-only rules gate. It checks the canonical rule
+// sources and prints an aif-gate-result fence. It never writes to the checkout.
+func (c *CLI) runRules(args []string) int {
+	fs := flag.NewFlagSet("rules", flag.ContinueOnError)
+	root := fs.String("root", c.root, "каталог проекта для проверки правил")
+	if !parseFlags("rules", args, c.errOut, fs) {
+		return 2
+	}
+
+	result := gate.RulesCheck(*root)
+	fmt.Fprint(c.out, gate.FormatRules(result))
+	if result.Blocking {
+		return gate.Red
+	}
+	return gate.Green
+}
+
 func (c *CLI) runGates(args []string) int {
+	if len(args) > 0 && args[0] == "rules" {
+		return c.runRules(args[1:])
+	}
 	path, err := findGates(c.root)
 	if err != nil {
 		fmt.Fprintln(c.errOut, "beacon gates:", err)
