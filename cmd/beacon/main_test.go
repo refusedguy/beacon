@@ -88,7 +88,7 @@ func TestT06ListJSONCatalog(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "human", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "watch", "what", "why"}
+	wantNames := []string{"agents", "attach", "build", "doctor", "gates", "human", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "up", "watch", "what", "why"}
 	if len(entries) != len(wantNames) {
 		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
 	}
