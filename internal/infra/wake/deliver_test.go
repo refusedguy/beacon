@@ -1169,3 +1169,69 @@ func TestT210DeliverSpanOnePerAttemptNoOpDefault(t *testing.T) {
 		t.Fatalf("got %d spans for two attempts, want 2", got)
 	}
 }
+
+// ===== T5.45: receipt carries the registry identity =====
+
+func TestT545ReceiptCarriesRegistryKey(t *testing.T) {
+	r := T210Receipt{
+		ObligationID: "o-45",
+		Attempt:      2,
+		Outcome:      T210Delivered,
+		AgentID:      "ses_45",
+		ConfigID:     "cfg-45",
+	}
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"agent_id":"ses_45"`, `"config_id":"cfg-45"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Fatalf("receipt JSON %s has no %s", raw, want)
+		}
+	}
+	var back T210Receipt
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	agentID, configID := back.RegistryKey()
+	if agentID != "ses_45" || configID != "cfg-45" {
+		t.Fatalf("RegistryKey = %q, %q", agentID, configID)
+	}
+}
+
+func TestT545OldReceiptStillReads(t *testing.T) {
+	legacy := []byte(`{"obligationID":"o-old","attempt":1,"delivery":"steer","outcome":"delivered"}`)
+	var r T210Receipt
+	if err := json.Unmarshal(legacy, &r); err != nil {
+		t.Fatalf("old receipt not readable: %v", err)
+	}
+	if r.ObligationID != "o-old" || r.Attempt != 1 || r.Outcome != T210Delivered {
+		t.Fatalf("old receipt = %+v", r)
+	}
+	if r.AgentID != "" || r.ConfigID != "" {
+		t.Fatalf("old receipt gained identity: %+v", r)
+	}
+}
+
+func TestT545DeliverFillsAgentIDFromBoundTarget(t *testing.T) {
+	sessions := T211NewSessionRegistry()
+	sessions.Add("bridge-45", "t-45", "ses_45")
+	adapters := T211NewAdapterRegistry()
+	adapters.Register("bridge-45", &t210FakeAdapter{})
+	deliveries := T211NewDeliveryRegistry()
+	p := T210WakePointer{
+		Adapter: "bridge-45", Target: "t-45",
+		WatchID: "watch-45", ObligationID: "o-45", Attempt: 1,
+	}
+	r, ok := T210Deliver(context.Background(), p, nil, sessions, adapters, deliveries)
+	if !ok {
+		t.Fatal("delivery failed")
+	}
+	if r.AgentID != "ses_45" {
+		t.Fatalf("receipt AgentID = %q, want ses_45", r.AgentID)
+	}
+	stored, ok := deliveries.Get("o-45", 1)
+	if !ok || stored.AgentID != "ses_45" {
+		t.Fatalf("stored receipt = %+v, ok = %v", stored, ok)
+	}
+}
