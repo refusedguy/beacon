@@ -88,7 +88,7 @@ func main() {
 }
 
 func run() int {
-	results := make([]evalResult, 0, 27)
+	results := make([]evalResult, 0, 31)
 	record := func(name, expected, actual string, pass bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, pass: pass})
 	}
@@ -577,6 +577,29 @@ func run() int {
 	record("W18_rebase_conflict_wake",
 		"конфликт ребейза шлёт wake подписавшемуся через adapter, мержа нет",
 		w18Actual, w18Pass)
+
+	// B01-B04: контракт blocked Watch. Модель и негативные контроли описаны
+	// в docs/evals/blocked-watch.md.
+	b01Actual, b01Pass := evalB01BlockDecision()
+	record("B01_block_decision",
+		"decision blocked:not_mine переводит Watch в blocked и сохраняет причину; approve не блокирует",
+		b01Actual, b01Pass)
+
+	b02Actual, b02Pass := evalB02CIBridgeSkipsBlocked()
+	record("B02_ci_bridge_skips_blocked",
+		"заблокированный Watch не опрашивается и не получает retry; до блокировки опрос и retry есть",
+		b02Actual, b02Pass)
+
+	b03Actual, b03Pass := evalB03BlockedWake()
+	record("B03_blocked_wake",
+		"оркестратор получает wake с PR, причиной и failedChecks; незаблокированный Watch wake не шлёт",
+		b03Actual, b03Pass)
+
+	b04Actual, b04Pass := evalB04UnknownDecisionAndUnblock()
+	record("B04_unknown_and_unblock",
+		"неизвестный decision и неизвестный reason не блокируют; unblock возвращает Watch в опрос",
+		b04Actual, b04Pass)
+
 	// T3.227/T3.228: eval-покрытие живых сценариев. Наблюдатель читает файлы
 	// каталога состояния и ответы фейк-хоста, а не внутренние массивы плагина.
 	bt := bridge.BindTarget
@@ -934,6 +957,205 @@ func evalW18RebaseConflictWake() (string, bool) {
 		bad.Action == mergeActionWake && bad.Reason == "adapter_unavailable" && badLedger.Count() == 0 &&
 		notWatch.Action == mergeActionHold && notWatch.Reason == "rebase_not_watch_pr" && notWatchLedger.Count() == 0 &&
 		ready.Action == mergeActionMerge && readyLedger.Count() == 1
+	return actual, pass
+}
+
+// ---- B01-B04: контракт blocked Watch ----
+//
+// Production-код блокировки живёт в отдельных карточках, поэтому eval фиксирует
+// контракт исполняемой моделью, как W14-W18 фиксируют ADR 0072. Наблюдаются
+// только исходы, которые увидит вызывающий: статус и причину Watch, число опросов
+// и retry в проходе CI-моста, поля wake для оркестратора. Карточки перенесут
+// проверку на реальный beacon_ack, CI-мост и доставку wake, сохранив имена кейсов
+// и негативные контроли. Подробности в docs/evals/blocked-watch.md.
+
+const (
+	blockStatusWatching = "watching"
+	blockStatusBlocked  = "blocked"
+
+	blockDecisionPrefix = "blocked:"
+	blockReasonNotMine  = "not_mine"
+	decisionUnblock     = "unblock"
+)
+
+// blockedWatch — состояние Watch, которое видно после ack с decision.
+type blockedWatch struct {
+	ID           string
+	Repo         string
+	PR           int
+	Status       string
+	Reason       string
+	FailedChecks []string
+}
+
+func newBlockedWatch(id string) blockedWatch {
+	return blockedWatch{
+		ID:           id,
+		Repo:         "refusedguy/beacon",
+		PR:           299,
+		Status:       blockStatusWatching,
+		FailedChecks: []string{"ci-build", "ci-audit"},
+	}
+}
+
+// blockAckOutcome — результат ack с decision, который видит вызывающий.
+type blockAckOutcome struct {
+	Action string
+	Reason string
+}
+
+// applyBlockDecision применяет decision из beacon_ack. Блокирует только известный
+// reason, снимает блокировку явным unblock и не меняет Watch во всех остальных
+// случаях. Причина сохраняется в Watch и возвращается в исходе ack.
+func applyBlockDecision(w blockedWatch, decision, reason string) (blockedWatch, blockAckOutcome) {
+	d := strings.TrimSpace(decision)
+	reason = strings.TrimSpace(reason)
+	if d == decisionUnblock {
+		if w.Status != blockStatusBlocked {
+			return w, blockAckOutcome{Action: "noop", Reason: "not_blocked"}
+		}
+		w.Status = blockStatusWatching
+		w.Reason = ""
+		return w, blockAckOutcome{Action: "unblocked", Reason: "cleared"}
+	}
+	if !strings.HasPrefix(d, blockDecisionPrefix) {
+		return w, blockAckOutcome{Action: "noop", Reason: "unknown_decision"}
+	}
+	r := strings.TrimPrefix(d, blockDecisionPrefix)
+	if r != blockReasonNotMine {
+		return w, blockAckOutcome{Action: "noop", Reason: "unknown_reason"}
+	}
+	if w.Status == blockStatusBlocked && w.Reason == reason {
+		return w, blockAckOutcome{Action: "noop", Reason: "already_blocked"}
+	}
+	if reason == "" {
+		reason = r
+	}
+	w.Status = blockStatusBlocked
+	w.Reason = reason
+	return w, blockAckOutcome{Action: "blocked", Reason: reason}
+}
+
+// ciBridgeEffects — наблюдаемые эффекты одного прохода CI-моста по Watch.
+type ciBridgeEffects struct {
+	Polls   int
+	Retries int
+}
+
+// ciBridgeRefresh считает опрос и retry. Заблокированный Watch не опрашивается
+// и не получает retry executor. Остальные Watch опрашиваются, а красные проверки
+// дают один retry.
+func ciBridgeRefresh(w blockedWatch) ciBridgeEffects {
+	if w.Status == blockStatusBlocked {
+		return ciBridgeEffects{}
+	}
+	e := ciBridgeEffects{Polls: 1}
+	if len(w.FailedChecks) > 0 {
+		e.Retries = 1
+	}
+	return e
+}
+
+// blockedWake — wake, который получает оркестратор при блокировке Watch.
+type blockedWake struct {
+	WatchID      string
+	PR           string
+	Reason       string
+	FailedChecks []string
+}
+
+// blockedWakeFor строит wake только для заблокированного Watch. Список проверок
+// копируется и сортируется: порядок в wake не зависит от порядка в store.
+func blockedWakeFor(w blockedWatch) *blockedWake {
+	if w.Status != blockStatusBlocked {
+		return nil
+	}
+	checks := append([]string(nil), w.FailedChecks...)
+	sort.Strings(checks)
+	return &blockedWake{
+		WatchID:      w.ID,
+		PR:           fmt.Sprintf("%s#%d", w.Repo, w.PR),
+		Reason:       w.Reason,
+		FailedChecks: checks,
+	}
+}
+
+// evalB01BlockDecision проверяет, что ack с decision blocked:not_mine переводит
+// Watch в blocked и сохраняет причину. Негативный контроль: approve не блокирует.
+func evalB01BlockDecision() (string, bool) {
+	w := newBlockedWatch("watch:B01")
+	blocked, out := applyBlockDecision(w, "blocked:not_mine", "правки моих нет, проверил diff")
+	approved, approvedOut := applyBlockDecision(w, "approve", "")
+	actual := fmt.Sprintf("block=%s/%s status=%s reason=%s; approve=%s/%s status=%s",
+		out.Action, out.Reason, blocked.Status, blocked.Reason,
+		approvedOut.Action, approvedOut.Reason, approved.Status)
+	pass := out.Action == "blocked" &&
+		out.Reason == "правки моих нет, проверил diff" &&
+		blocked.Status == blockStatusBlocked &&
+		blocked.Reason == "правки моих нет, проверил diff" &&
+		approvedOut.Action == "noop" && approvedOut.Reason == "unknown_decision" &&
+		approved.Status == blockStatusWatching
+	return actual, pass
+}
+
+// evalB02CIBridgeSkipsBlocked проверяет, что CI-мост пропускает заблокированный
+// Watch: нет ни нового опроса, ни retry executor. Негативный контроль: тот же
+// Watch до блокировки опрашивается и получает retry по красным проверкам.
+func evalB02CIBridgeSkipsBlocked() (string, bool) {
+	w := newBlockedWatch("watch:B02")
+	blocked, _ := applyBlockDecision(w, "blocked:not_mine", "моих правок нет")
+	blockedEffects := ciBridgeRefresh(blocked)
+	watchingEffects := ciBridgeRefresh(w)
+	actual := fmt.Sprintf("blocked: polls=%d retries=%d; watching: polls=%d retries=%d",
+		blockedEffects.Polls, blockedEffects.Retries, watchingEffects.Polls, watchingEffects.Retries)
+	pass := blockedEffects.Polls == 0 && blockedEffects.Retries == 0 &&
+		watchingEffects.Polls == 1 && watchingEffects.Retries == 1
+	return actual, pass
+}
+
+// evalB03BlockedWake проверяет, что оркестратор получает wake с PR, причиной и
+// failedChecks. Негативный контроль: незаблокированный Watch wake не шлёт.
+func evalB03BlockedWake() (string, bool) {
+	w := newBlockedWatch("watch:B03")
+	blocked, _ := applyBlockDecision(w, "blocked:not_mine", "не моя вина")
+	wake := blockedWakeFor(blocked)
+	noWake := blockedWakeFor(w)
+	actual := "нет wake для заблокированного Watch"
+	pass := false
+	if wake != nil {
+		actual = fmt.Sprintf("watch=%s, pr=%s, reason=%s, failedChecks=%v, watchingWake=%t",
+			wake.WatchID, wake.PR, wake.Reason, wake.FailedChecks, noWake != nil)
+		pass = wake.WatchID == blocked.ID &&
+			wake.PR == "refusedguy/beacon#299" &&
+			wake.Reason == "не моя вина" &&
+			slices.Equal(wake.FailedChecks, []string{"ci-audit", "ci-build"}) &&
+			noWake == nil
+	}
+	return actual, pass
+}
+
+// evalB04UnknownDecisionAndUnblock проверяет негативный контроль и возврат в
+// опрос: неизвестный decision и неизвестный reason не блокируют, а unblock
+// снимает блокировку и возвращает Watch в опрос.
+func evalB04UnknownDecisionAndUnblock() (string, bool) {
+	w := newBlockedWatch("watch:B04")
+	unknown, unknownOut := applyBlockDecision(w, "blocked:banana", "неизвестный reason")
+	unknownEffects := ciBridgeRefresh(unknown)
+	alien, alienOut := applyBlockDecision(w, "banana", "")
+	blocked, _ := applyBlockDecision(w, "blocked:not_mine", "моих правок нет")
+	unblocked, unblockOut := applyBlockDecision(blocked, "unblock", "")
+	resumedEffects := ciBridgeRefresh(unblocked)
+	actual := fmt.Sprintf("unknown=%s/%s polls=%d; alien=%s/%s; unblock=%s status=%s reason=%q polls=%d retries=%d",
+		unknownOut.Action, unknownOut.Reason, unknownEffects.Polls,
+		alienOut.Action, alienOut.Reason,
+		unblockOut.Action, unblocked.Status, unblocked.Reason,
+		resumedEffects.Polls, resumedEffects.Retries)
+	pass := unknownOut.Action == "noop" && unknownOut.Reason == "unknown_reason" &&
+		unknown.Status == blockStatusWatching && unknownEffects.Polls == 1 &&
+		alienOut.Action == "noop" && alienOut.Reason == "unknown_decision" &&
+		alien.Status == blockStatusWatching &&
+		unblockOut.Action == "unblocked" && unblocked.Status == blockStatusWatching &&
+		unblocked.Reason == "" && resumedEffects.Polls == 1 && resumedEffects.Retries == 1
 	return actual, pass
 }
 
