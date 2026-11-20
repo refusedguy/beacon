@@ -139,14 +139,47 @@ type Agent struct {
 	Mode string `json:"mode"`
 }
 
+// ModelID is the model of a session. Live opencode v2 returns it as an object
+// {"id","providerID","variant"}; older versions returned a bare string. Both
+// forms decode to the model id (ADR 0060, T3.148).
+type ModelID string
+
+// UnmarshalJSON accepts the object form and the legacy string form so a live
+// watch does not fail when opencode changes the shape of model (T3.148).
+func (m *ModelID) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("пустой model")
+	}
+	switch data[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*m = ModelID(s)
+		return nil
+	case '{':
+		var obj struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(data, &obj); err != nil {
+			return err
+		}
+		*m = ModelID(obj.ID)
+		return nil
+	default:
+		return fmt.Errorf("неверный формат model: %s", data)
+	}
+}
+
 // Session is one entry of GET /api/session. Fields follow the v2 response
 // shape recorded in ADR 0060.
 type Session struct {
-	ID       string `json:"id"`
-	ParentID string `json:"parentID"`
-	Agent    string `json:"agent"`
-	ModelID  string `json:"model"`
-	Title    string `json:"title"`
+	ID       string  `json:"id"`
+	ParentID string  `json:"parentID"`
+	Agent    string  `json:"agent"`
+	ModelID  ModelID `json:"model"`
+	Title    string  `json:"title"`
 	Time     struct {
 		Busy    int64  `json:"busy"`
 		Idle    int64  `json:"idle"`

@@ -187,6 +187,37 @@ func TestSessionsTTL(t *testing.T) {
 	}
 }
 
+func TestSessionsModelFormats(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{
+			name: "object",
+			body: `{"data":[{"id":"s1","model":{"id":"hy4-flash-free","providerID":"opencode","variant":"default"}}]}`,
+		},
+		{
+			name: "string",
+			body: `{"data":[{"id":"s1","model":"hy4-flash-free"}]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+				return fakeResponse(tc.body, http.StatusOK), nil
+			}}
+			c := newTestClient(t, doer)
+
+			sessions, err := c.Sessions(context.Background())
+			if err != nil {
+				t.Fatalf("Sessions: %v", err)
+			}
+			if len(sessions) != 1 || sessions[0].ModelID != ModelID("hy4-flash-free") {
+				t.Fatalf("неверная модель: %+v", sessions)
+			}
+		})
+	}
+}
+
 func TestSessionsNoCacheWhenTTLZero(t *testing.T) {
 	calls := 0
 	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
