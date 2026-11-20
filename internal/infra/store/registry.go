@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS agent_registry (
   project_key    TEXT NOT NULL,
   agent_id       TEXT NOT NULL,
   role           TEXT NOT NULL,
+  runtime        TEXT NOT NULL DEFAULT '',
   session_id     TEXT NOT NULL DEFAULT '',
   notify_adapter TEXT NOT NULL DEFAULT '',
   notify_target  TEXT NOT NULL DEFAULT '',
@@ -63,8 +64,9 @@ CREATE INDEX IF NOT EXISTS agent_registry_by_project_status
   ON agent_registry(project_key, status);
 `
 
-// createWatchBindingsSQL owns the binding table. config_id and fencing_token
-// are already present so T5.25 can fill them without changing the schema.
+// createWatchBindingsSQL owns the binding table. config_id, fencing_token and
+// subscriber_id are present so the migration schema and the on-first-use schema
+// accept the same insert without changing either one at write time.
 const createWatchBindingsSQL = `
 CREATE TABLE IF NOT EXISTS watch_bindings (
   watch_id      TEXT NOT NULL,
@@ -73,6 +75,7 @@ CREATE TABLE IF NOT EXISTS watch_bindings (
   agent_id      TEXT NOT NULL,
   config_id     TEXT NOT NULL DEFAULT '',
   fencing_token TEXT NOT NULL DEFAULT '',
+  subscriber_id TEXT NOT NULL DEFAULT '',
   created_at    INTEGER NOT NULL,
   PRIMARY KEY (watch_id, revision)
 );
@@ -82,12 +85,14 @@ CREATE INDEX IF NOT EXISTS watch_bindings_by_executor
 
 // ExecutorRecord is one registered executor. AgentID is the primary key inside
 // a project; SessionID is the opaque delivery address and may be empty when a
-// caller has no live session yet. Capabilities are stored as JSON so a later
-// reader can build the derived capability index (ADR 0089).
+// caller has no live session yet. Runtime names the agent's runtime and may be
+// empty when the caller does not declare one. Capabilities are stored as JSON
+// so a later reader can build the derived capability index (ADR 0089).
 type ExecutorRecord struct {
 	ProjectKey    string
 	AgentID       string
 	Role          string
+	Runtime       string
 	SessionID     string
 	NotifyAdapter string
 	NotifyTarget  string
@@ -237,11 +242,12 @@ func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, er
 	stored := normalizeExecutor(e, now)
 	_, err = tx.Exec(`
 		INSERT INTO agent_registry
-		  (project_key, agent_id, role, session_id, notify_adapter, notify_target,
+		  (project_key, agent_id, role, runtime, session_id, notify_adapter, notify_target,
 		   capabilities, config_id, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_key, agent_id) DO UPDATE SET
 		  role           = excluded.role,
+		  runtime        = excluded.runtime,
 		  session_id     = excluded.session_id,
 		  notify_adapter = excluded.notify_adapter,
 		  notify_target  = excluded.notify_target,
@@ -249,7 +255,7 @@ func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, er
 		  config_id      = excluded.config_id,
 		  status         = excluded.status,
 		  updated_at     = excluded.updated_at`,
-		stored.ProjectKey, stored.AgentID, stored.Role, stored.SessionID,
+		stored.ProjectKey, stored.AgentID, stored.Role, stored.Runtime, stored.SessionID,
 		stored.NotifyAdapter, stored.NotifyTarget, encodeCapabilities(stored.Capabilities),
 		stored.ConfigID, stored.Status, stored.CreatedAt, stored.UpdatedAt)
 	if err != nil {
@@ -272,10 +278,11 @@ func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, er
 func bindWatchTx(tx *sql.Tx, b WatchBinding, now int64) (BindResult, error) {
 	res, err := tx.Exec(`
 		INSERT OR IGNORE INTO watch_bindings
-		  (watch_id, revision, project_key, agent_id, config_id, fencing_token, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		  (watch_id, revision, project_key, agent_id, config_id, fencing_token,
+		   subscriber_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		b.WatchID, int64(b.Revision), b.ProjectKey, b.AgentID,
-		b.ConfigID, b.FencingToken, now)
+		b.ConfigID, b.FencingToken, b.AgentID, now)
 	if err != nil {
 		return BindResult{}, fmt.Errorf("store: binding: insert: %w", err)
 	}
@@ -398,11 +405,11 @@ func (d *DB) Executor(projectKey, agentID string) (ExecutorRecord, bool, error) 
 	var e ExecutorRecord
 	var caps []byte
 	err = d.readDB.QueryRow(`
-		SELECT project_key, agent_id, role, session_id, notify_adapter, notify_target,
+		SELECT project_key, agent_id, role, runtime, session_id, notify_adapter, notify_target,
 		       capabilities, config_id, status, created_at, updated_at
 		FROM agent_registry WHERE project_key = ? AND agent_id = ?`,
 		projectKey, agentID,
-	).Scan(&e.ProjectKey, &e.AgentID, &e.Role, &e.SessionID, &e.NotifyAdapter,
+	).Scan(&e.ProjectKey, &e.AgentID, &e.Role, &e.Runtime, &e.SessionID, &e.NotifyAdapter,
 		&e.NotifyTarget, &caps, &e.ConfigID, &e.Status, &e.CreatedAt, &e.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ExecutorRecord{}, false, nil
@@ -455,7 +462,7 @@ func (d *DB) Executors(projectKey string) ([]ExecutorRecord, error) {
 		return nil, err
 	}
 	rows, err := d.readDB.Query(`
-		SELECT project_key, agent_id, role, session_id, notify_adapter, notify_target,
+		SELECT project_key, agent_id, role, runtime, session_id, notify_adapter, notify_target,
 		       capabilities, config_id, status, created_at, updated_at
 		FROM agent_registry WHERE project_key = ? ORDER BY agent_id`, projectKey)
 	if err != nil {
@@ -466,7 +473,7 @@ func (d *DB) Executors(projectKey string) ([]ExecutorRecord, error) {
 	for rows.Next() {
 		var e ExecutorRecord
 		var caps []byte
-		if err := rows.Scan(&e.ProjectKey, &e.AgentID, &e.Role, &e.SessionID,
+		if err := rows.Scan(&e.ProjectKey, &e.AgentID, &e.Role, &e.Runtime, &e.SessionID,
 			&e.NotifyAdapter, &e.NotifyTarget, &caps, &e.ConfigID, &e.Status,
 			&e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, err

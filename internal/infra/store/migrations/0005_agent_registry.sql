@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS agent_registry (
   project_key    TEXT NOT NULL CHECK (length(project_key) > 0),
   agent_id       TEXT NOT NULL CHECK (length(agent_id) > 0),
   role           TEXT NOT NULL,
-  runtime        TEXT NOT NULL,
+  runtime        TEXT NOT NULL DEFAULT '',
   status         TEXT NOT NULL DEFAULT 'active',
   session_id     TEXT NOT NULL DEFAULT '',
   notify_adapter TEXT NOT NULL DEFAULT '',
