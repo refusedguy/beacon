@@ -169,6 +169,54 @@ func TestPingMergeableReadsComputedState(t *testing.T) {
 	}
 }
 
+func TestPingMergeableForceIgnoresCachedETag(t *testing.T) {
+	const etag = `"pr-11-v1"`
+	var ifNoneMatch []string
+	uncounted := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ifNoneMatch = append(ifNoneMatch, r.Header.Get("If-None-Match"))
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		uncounted++
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Type", "application/json")
+		if uncounted == 1 {
+			fmt.Fprint(w, `{"number":11,"mergeable":null,"mergeable_state":"unknown"}`)
+			return
+		}
+		fmt.Fprint(w, `{"number":11,"mergeable":true,"mergeable_state":"clean"}`)
+	}))
+	defer srv.Close()
+
+	rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+	seeded, notModified, err := rc.PingMergeable(context.Background(), "octo", "demo", 11)
+	if err != nil || notModified || !seeded.Unknown() {
+		t.Fatalf("seed ping = (%+v,%v,%v), want UNKNOWN/200", seeded, notModified, err)
+	}
+
+	// A conditional ping now returns 304 with no usable value.
+	_, notModified, err = rc.PingMergeable(context.Background(), "octo", "demo", 11)
+	if err != nil || !notModified {
+		t.Fatalf("conditional ping = (%v,%v), want 304", notModified, err)
+	}
+
+	forced, err := rc.PingMergeableForce(context.Background(), "octo", "demo", 11)
+	if err != nil {
+		t.Fatalf("PingMergeableForce: %v", err)
+	}
+	if forced.Mergeable == nil || !*forced.Mergeable {
+		t.Fatalf("forced Mergeable = %v, want true", forced.Mergeable)
+	}
+	if len(ifNoneMatch) != 3 {
+		t.Fatalf("GET calls = %d, want 3", len(ifNoneMatch))
+	}
+	if ifNoneMatch[0] != "" || ifNoneMatch[1] != etag || ifNoneMatch[2] != "" {
+		t.Fatalf("If-None-Match = %q, want [\"\", %q, \"\"]", ifNoneMatch, etag)
+	}
+}
+
 func TestResolveTokenChain(t *testing.T) {
 	t.Setenv("BEACON_GITHUB_TOKEN", "primary-token")
 	t.Setenv("GITHUB_TOKEN", "secondary-token")
