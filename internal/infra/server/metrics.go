@@ -7,6 +7,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +36,18 @@ const (
 	// HistogramCallDuration records call latency in seconds. The exported name
 	// is beacon_call_duration_seconds.
 	HistogramCallDuration = "call_duration_seconds"
+
+	// GaugeRSSBytes is the resident set size of the process in bytes. It has no
+	// labels, so it adds exactly one series whatever the number of Watches
+	// (BS.49, ADR 0195). The exported name is beacon_rss_bytes.
+	GaugeRSSBytes = "rss_bytes"
+)
+
+// Footprint budget from ADR 0191 (BS.51). The process must stay below 100 MB
+// of resident memory when 15 or more Watches are active.
+const (
+	FootprintWatchThreshold = 15
+	FootprintLimitBytes     = 100 * 1024 * 1024 // 100 MB
 )
 
 // labelDomains are closed sets of values for each label key. Every series the
@@ -156,6 +169,7 @@ type Metrics struct {
 	mu        sync.Mutex
 	calls     map[seriesKey]uint64
 	durations map[seriesKey]*histogram
+	rssBytes  uint64
 }
 
 // NewMetrics builds an empty set with every possible series present at zero.
@@ -183,6 +197,26 @@ func (m *Metrics) initLocked() {
 	if m.durations == nil {
 		m.durations = make(map[seriesKey]*histogram)
 	}
+}
+
+// SetRSS publishes the process resident set size in bytes.
+func (m *Metrics) SetRSS(bytes uint64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.rssBytes = bytes
+	m.mu.Unlock()
+}
+
+// RSSBytes returns the last published resident set size in bytes.
+func (m *Metrics) RSSBytes() uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rssBytes
 }
 
 // IncCall advances the call counter for attrs by one. Unknown attribute values
@@ -289,7 +323,59 @@ func (m *Metrics) Reset() {
 		}
 		h.mu.Unlock()
 	}
+	m.rssBytes = 0
 	m.mu.Unlock()
+}
+
+// RSSReader reports resident set size in bytes. The bool is false when the
+// platform does not expose the value. A false reading never warns.
+type RSSReader func() (bytes uint64, ok bool)
+
+// ProcessRSSBytes reads VmRSS from /proc/self/status on Linux and returns
+// bytes. It reports false when procfs is absent or the field is missing, so
+// callers on other platforms stay honest instead of guessing.
+func ProcessRSSBytes() (uint64, bool) {
+	data, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			return 0, false
+		}
+		kb, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return kb * 1024, true
+	}
+	return 0, false
+}
+
+// FootprintCheck publishes bytes as the rss_bytes gauge on m. It reports
+// whether the process is over budget: at least 15 active Watches and more than
+// 100 MB RSS. When it is over budget it calls warn with one line. The reader
+// and the warning sink are injected so the check is testable without reading
+// the host process.
+func FootprintCheck(m *Metrics, activeWatches int, readRSS RSSReader, warn func(string, ...any)) bool {
+	if readRSS == nil {
+		readRSS = ProcessRSSBytes
+	}
+	bytes, ok := readRSS()
+	if !ok {
+		return false
+	}
+	m.SetRSS(bytes)
+	over := activeWatches >= FootprintWatchThreshold && bytes > FootprintLimitBytes
+	if over && warn != nil {
+		warn("WARNING: RSS %d bytes exceeds %d bytes at %d active watches",
+			bytes, FootprintLimitBytes, activeWatches)
+	}
+	return over
 }
 
 type seriesJSON struct {
@@ -309,6 +395,7 @@ type durationJSON struct {
 type metricsJSON struct {
 	Counter   string       `json:"counter"`
 	Histogram string       `json:"histogram"`
+	RSSBytes  uint64       `json:"rssBytes"`
 	Series    []seriesJSON `json:"series"`
 }
 
@@ -318,6 +405,7 @@ func (m *Metrics) JSON() []byte {
 	out := metricsJSON{
 		Counter:   CounterCalls,
 		Histogram: HistogramCallDuration,
+		RSSBytes:  m.RSSBytes(),
 		Series:    []seriesJSON{},
 	}
 	for _, s := range m.Snapshot() {
@@ -353,6 +441,9 @@ func (m *Metrics) Prometheus() []byte {
 	fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", CounterCalls)
 	fmt.Fprintf(&buf, "# HELP beacon_%s Call latency in seconds.\n", HistogramCallDuration)
 	fmt.Fprintf(&buf, "# TYPE beacon_%s histogram\n", HistogramCallDuration)
+	fmt.Fprintf(&buf, "# HELP beacon_%s Resident set size of the process in bytes.\n", GaugeRSSBytes)
+	fmt.Fprintf(&buf, "# TYPE beacon_%s gauge\n", GaugeRSSBytes)
+	fmt.Fprintf(&buf, "beacon_%s %d\n", GaugeRSSBytes, m.RSSBytes())
 	for _, s := range m.Snapshot() {
 		labels := labelString(s.Attributes)
 		fmt.Fprintf(&buf, "beacon_%s{%s} %d\n", CounterCalls, labels, s.Calls)
