@@ -96,6 +96,11 @@ var (
 	statusLine = regexp.MustCompile(`^(Статус|Агент|Время):[ \t]*(.*?)[ \t]*$`)
 )
 
+// requiredFields is the canonical list of the 13 task card fields for this
+// package. tools/beacon-gates/docsgate keeps a copy in taskFields. The two
+// packages cannot share one list: layers.json has no allowed edge from
+// tools/beacon-gates to internal/infra, and the nested tools/beacon-gates go.mod
+// blocks a cross-module import. Keep both lists in sync; see ARDH-08.
 var requiredFields = []string{
 	"Тип", "Статус", "Фаза", "Владелец файлов", "Зависимости", "Ссылка",
 	"Цель", "Контекст", "Шаги", "Проверка", "Приёмка", "Агент", "Время",
