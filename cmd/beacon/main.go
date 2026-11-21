@@ -40,6 +40,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon watch [--live] [--interval 2s] [--format table|json]
   beacon spawn <taskID> [--agent id] [--title ...]
   beacon attach <sessionID>
+  beacon registry list [--format table|json]
   beacon registry stop --watch <id> --revision <n> --session <id> --token <t>
   beacon registry sync [--project <key>]
   beacon registry check --config <file>
@@ -323,14 +324,21 @@ func (c *CLI) dispatch(args []string) int {
 	return 2
 }
 
-// registryCommand routes the registry subcommands. The check subcommand is
-// wired here (T5.63) while stop and sync stay in registry_stop.go, which other
-// cards own.
+// registryCommand routes the registry subcommands. The list and check
+// subcommands are wired here (T5.53, T5.63) while stop and sync stay in
+// registry_stop.go, which other cards own.
 func (c *CLI) registryCommand(args []string) int {
-	if len(args) > 0 && args[0] == "check" {
-		return c.runRegistryCheck(args[1:])
+	if len(args) == 0 {
+		return registryRunner(c, args)
 	}
-	return registryRunner(c, args)
+	switch args[0] {
+	case "list":
+		return registryListRunner(c, args[1:])
+	case "check":
+		return c.runRegistryCheck(args[1:])
+	default:
+		return registryRunner(c, args)
+	}
 }
 
 // runRegistryCheck reads an author registry config and runs the check from
