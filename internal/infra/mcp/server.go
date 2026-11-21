@@ -129,7 +129,7 @@ type toolDescriptor struct {
 // toolDescriptors lists exactly the advertised tools. Adding a name here is
 // the only way to change the derived tables and the real-handler sequence.
 // Opt-in tools such as t3_thread_read stay out: the advertised set has a
-// byte-pinned tools/list contract that a tenth name would break.
+// byte-pinned tools/list contract that an eleventh name would break.
 var toolDescriptors = []toolDescriptor{
 	{
 		Name:        "beacon_watch_pr",
@@ -219,6 +219,15 @@ var toolDescriptors = []toolDescriptor{
 		Kind:        kindAdditiveOnce,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
 			attachTaskClaim(s, NewTaskClaimHandler(deps.TaskClaimStore), schemas[TaskClaimToolName])
+		},
+	},
+	{
+		Name:        TaskCloseToolName,
+		Description: "Close one task card with a terminal status and a reason. Idempotent by (cardID, status, reason): a repeat with the same values returns ok without a second write. A card held in_progress by another agent can only be closed by its owner.",
+		OutputType:  taskCloseOutputSchema,
+		Kind:        kindAdditive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
+			attachTaskClose(s, NewTaskCloseHandler(deps.TaskCloseStore), schemas[TaskCloseToolName])
 		},
 	},
 }
@@ -350,7 +359,7 @@ type StateStore interface {
 	domain.ObligationStore
 }
 
-// Dependencies groups the ports the eight real handlers need. NewServer's
+// Dependencies groups the ports the ten real handlers need. NewServer's
 // zero-dependency form still registers every real handler; handlers that lack a
 // backing port report a domain error instead of pretending to succeed. A
 // composition root supplies the real ports through NewServerWithDeps.
@@ -423,8 +432,13 @@ type Dependencies struct {
 	// until a composition root supplies the store port.
 	TaskClaimStore TaskClaimStore
 
+	// TaskCloseStore is the card store behind beacon_task_close. A nil value
+	// keeps the tool registered, but its handler reports PERSIST_FAILED until a
+	// composition root supplies the store port.
+	TaskCloseStore TaskCloseStore
+
 	// ChildThreads and ParentNotifier carry the child-thread lineage wiring at
-	// the MCP boundary. The ninth tool is the task claim from ADR 0268, so the
+	// the MCP boundary. Task claim and task close are the two card tools, so the
 	// question route stays a port pair instead of another tool. The composition
 	// root supplies both from the server's reference store and the chat adapter.
 	// A nil resolver keeps AskChildQuestion honest about the missing wiring.
@@ -583,7 +597,7 @@ func NewWaitResultServiceFromDeps(deps Dependencies) *WaitResultService {
 	return svc
 }
 
-// NewServer builds the Beacon MCP server with all nine real tools registered
+// NewServer builds the Beacon MCP server with all ten real tools registered
 // and the cycle protocol attached to the handshake. With no dependencies it
 // still exercises the real handlers; inject Dependencies with NewServerWithDeps
 // to give them a persistent store and the other production ports.
@@ -618,7 +632,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	// nil maps (ADR 0003, ADR 0009). A derivation failure is a broken contract
 	// type: log it and fall back to a permissive object schema so every real
 	// handler is still registered. The precise schema is optional; the real
-	// tool is not. Returning here would leave all nine tools on startup stubs
+	// tool is not. Returning here would leave all ten tools on startup stubs
 	// (T3.59).
 	schemas, err := AllOutputSchemas()
 	if err != nil {
@@ -705,10 +719,31 @@ func attachTaskClaim(s *mcpsdk.Server, handler *TaskClaimHandler, outputSchema *
 	}, handler.Handle)
 }
 
+// attachTaskClose installs beacon_task_close over the handler defined in
+// tool_task_close.go. The output schema is passed from AllOutputSchemas so
+// go-sdk never infers one from the handler type. A nil schema keeps the real
+// handler registered with a permissive object, as the other tools do.
+func attachTaskClose(s *mcpsdk.Server, handler *TaskCloseHandler, outputSchema *jsonschema.Schema) {
+	if s == nil || handler == nil {
+		return
+	}
+	if outputSchema == nil {
+		outputSchema = &jsonschema.Schema{Type: "object"}
+	}
+	annotations := toolAnnotations[TaskCloseToolName]
+	s.RemoveTools(TaskCloseToolName)
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:         TaskCloseToolName,
+		Description:  "Close one task card with a terminal status and a reason. Idempotent by (cardID, status, reason): a repeat with the same values returns ok without a second write. A card held in_progress by another agent can only be closed by its owner.",
+		OutputSchema: outputSchema,
+		Annotations:  &annotations,
+	}, handler.Handle)
+}
+
 // AttachThreadRead installs t3_thread_read as an opt-in read-only tool. The
 // name is deliberately absent from ToolNames and outputSchemaFactories: the
-// nine advertised tools have a byte-for-byte pinned tools/list contract, so a
-// tenth tool must be attached by a composition root that needs thread history.
+// ten advertised tools have a byte-for-byte pinned tools/list contract, so an
+// eleventh tool must be attached by a composition root that needs thread history.
 // A nil source leaves the server unchanged, and a nil schema falls back to the
 // derived one, so a broken optional schema cannot suppress the real handler.
 func AttachThreadRead(server *mcpsdk.Server, source ThreadHistorySource, outputSchema *jsonschema.Schema) {

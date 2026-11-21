@@ -388,6 +388,18 @@ func taskClaimOutputSchema() (*jsonschema.Schema, error) {
 	return s, nil
 }
 
+// taskCloseOutputSchema derives the close output schema from TaskCloseOutput,
+// the type owned by tool_task_close.go. The top-level object stays open to
+// extra fields, and the field schemas stay derived from the Go type.
+func taskCloseOutputSchema() (*jsonschema.Schema, error) {
+	s, err := OutputSchema[TaskCloseOutput]()
+	if err != nil {
+		return nil, err
+	}
+	s.AdditionalProperties = &jsonschema.Schema{}
+	return s, nil
+}
+
 // AllOutputSchemas returns the derived output schema of every tool, keyed by
 // tool name. An error means a Go type could not be reflected into a schema.
 func AllOutputSchemas() (map[string]*jsonschema.Schema, error) {
