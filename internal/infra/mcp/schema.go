@@ -14,8 +14,8 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
-// Output types for the eight tools (WORKER-PROMPT §4.1 plus W12-B). Every
-// schema shown to a client is derived from one of these structs by reflection,
+// Output types for the contracted tools (WORKER-PROMPT §4.1, W12-B and ADR 0268).
+// Every schema shown to a client is derived from one of these structs by reflection,
 // never by a hand-written JSON literal.
 
 // WatchPROutput is the response of beacon_watch_pr. The five leading fields
@@ -291,7 +291,8 @@ func OutputSchema[T any]() (*jsonschema.Schema, error) {
 }
 
 // outputSchemaFactories pairs each tool name with its output type. Keys are
-// tool names from WORKER-PROMPT §4.1 plus beacon_defer_wiring (W12-B).
+// tool names from WORKER-PROMPT §4.1 plus beacon_defer_wiring (W12-B) and
+// beacon_task_claim (ADR 0268).
 var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_watch_pr":     func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
 	"beacon_wait_result":  func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
@@ -301,6 +302,7 @@ var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 	"beacon_stats":        func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
 	"beacon_defer_wiring": func() (*jsonschema.Schema, error) { return OutputSchema[DeferWiringOutput]() },
+	"beacon_task_claim":   taskClaimOutputSchema,
 }
 
 // nullableMap relaxes a reflected map schema to accept JSON null. A nil Go map
@@ -337,6 +339,19 @@ func listRunningOutputSchema() (*jsonschema.Schema, error) {
 	}
 	// Checks is the other map on a Watch: an unexecuted Watch has no checks.
 	nullableMap(watches.Items.Properties["checks"])
+	return s, nil
+}
+
+// taskClaimOutputSchema derives the claim output schema from TaskClaimOutput,
+// the type owned by IDX-05 in tool_task_claim.go. The top-level object is open
+// to extra fields so a handler can add an additive marker without a schema
+// change. Field schemas stay derived from the Go type.
+func taskClaimOutputSchema() (*jsonschema.Schema, error) {
+	s, err := OutputSchema[TaskClaimOutput]()
+	if err != nil {
+		return nil, err
+	}
+	s.AdditionalProperties = &jsonschema.Schema{}
 	return s, nil
 }
 

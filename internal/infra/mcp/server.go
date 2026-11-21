@@ -100,9 +100,10 @@ Self-teaching next action: beacon_get_result returns nextAction, nextCommand and
 
 Verdicts: watching, ready, rebase, retry, keep_working, timeout, merged, closed. A watching-to-watching tick changes no revision and wakes nobody.`
 
-// ToolNames is the exact set of eight tool names in the registry: the seven
-// contracted tools (WORKER-PROMPT §4.1) plus beacon_defer_wiring (W12-B). T2.1
-// registers stubs; each real handler replaces its stub when wired.
+// ToolNames is the exact set of tool names in the registry: the seven
+// contracted tools (WORKER-PROMPT §4.1), beacon_defer_wiring (W12-B) and
+// beacon_task_claim (ADR 0268). T2.1 registers stubs; each real handler
+// replaces its stub when wired.
 var ToolNames = []string{
 	"beacon_watch_pr",
 	"beacon_wait_result",
@@ -112,6 +113,7 @@ var ToolNames = []string{
 	"beacon_cancel_watch",
 	"beacon_stats",
 	"beacon_defer_wiring",
+	"beacon_task_claim",
 }
 
 // Bridge is the six-operation port between Beacon's MCP core and one external
@@ -163,6 +165,7 @@ var toolAnnotations = map[string]mcpsdk.ToolAnnotations{
 	"beacon_cancel_watch": {DestructiveHint: boolPtr(true)},
 	"beacon_stats":        {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
 	"beacon_defer_wiring": {DestructiveHint: boolPtr(false), IdempotentHint: true},
+	"beacon_task_claim":   {DestructiveHint: boolPtr(false)},
 }
 
 // BlockerControl is the narrow control-plane port the two writing tools need.
@@ -309,11 +312,16 @@ type Dependencies struct {
 	// composition root supplies the store port from W12-A.
 	DeferWiring DeferWriter
 
+	// TaskClaimStore is the card store behind beacon_task_claim (IDX-05). A nil
+	// value keeps the tool registered, but its handler reports PERSIST_FAILED
+	// until a composition root supplies the store port.
+	TaskClaimStore TaskClaimStore
+
 	// ChildThreads and ParentNotifier carry the child-thread lineage wiring at
-	// the MCP boundary. Adding a ninth tool would break the contracted set, so
-	// the question route is a port pair instead. The composition root supplies
-	// both from the server's reference store and the chat adapter. A nil
-	// resolver keeps AskChildQuestion honest about the missing wiring.
+	// the MCP boundary. The ninth tool is the task claim from ADR 0268, so the
+	// question route stays a port pair instead of another tool. The composition
+	// root supplies both from the server's reference store and the chat adapter.
+	// A nil resolver keeps AskChildQuestion honest about the missing wiring.
 	ChildThreads   ChildThreadResolver
 	ParentNotifier ParentNotifier
 
@@ -469,7 +477,7 @@ func NewWaitResultServiceFromDeps(deps Dependencies) *WaitResultService {
 	return svc
 }
 
-// NewServer builds the Beacon MCP server with all eight real tools registered
+// NewServer builds the Beacon MCP server with all nine real tools registered
 // and the cycle protocol attached to the handshake. With no dependencies it
 // still exercises the real handlers; inject Dependencies with NewServerWithDeps
 // to give them a persistent store and the other production ports.
@@ -504,7 +512,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	// nil maps (ADR 0003, ADR 0009). A derivation failure is a broken contract
 	// type: log it and fall back to a permissive object schema so every real
 	// handler is still registered. The precise schema is optional; the real
-	// tool is not. Returning here would leave all eight tools on startup stubs
+	// tool is not. Returning here would leave all nine tools on startup stubs
 	// (T3.59).
 	schemas, err := AllOutputSchemas()
 	if err != nil {
@@ -532,6 +540,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
 	attachStats(s, deps.Snapshot, schemas["beacon_stats"], version)
 	AttachDeferWiring(s, NewDeferWiringHandler(deps.DeferWiring))
+	attachTaskClaim(s, NewTaskClaimHandler(deps.TaskClaimStore), schemas["beacon_task_claim"])
 	return s
 }
 
@@ -581,6 +590,28 @@ func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonsche
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, NewStatsHandler(reader).Handle)
+}
+
+// attachTaskClaim installs the ninth tool over the handler owned by IDX-05 in
+// tool_task_claim.go. This file adds the registration and the explicit output
+// schema, not the claim logic. A nil schema means derivation failed; go-sdk
+// panics when a typed handler gets nil, so a permissive object keeps the real
+// handler registered just like the fallback for list_running and stats.
+func attachTaskClaim(s *mcpsdk.Server, handler *TaskClaimHandler, outputSchema *jsonschema.Schema) {
+	if s == nil || handler == nil {
+		return
+	}
+	if outputSchema == nil {
+		outputSchema = &jsonschema.Schema{Type: "object"}
+	}
+	annotations := toolAnnotations["beacon_task_claim"]
+	s.RemoveTools(TaskClaimToolName)
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:         TaskClaimToolName,
+		Description:  "Atomically claim one todo task card for an agent and return its full context.",
+		OutputSchema: outputSchema,
+		Annotations:  &annotations,
+	}, handler.Handle)
 }
 
 // emptySnapshotReader is the minimal dependency used when no SnapshotReader is
