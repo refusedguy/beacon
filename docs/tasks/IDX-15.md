@@ -2,7 +2,7 @@
 Статус: done
 Фаза: P2
 Тип: task
-Владелец файлов: internal/infra/cibridge/bridge.go, internal/infra/worktree/gc.go, internal/infra/cibridge/bridge_test.go
+Владелец файлов: internal/infra/cibridge/bridge.go, internal/infra/cibridge/bridge_test.go, internal/infra/worktree/gc.go, docs/tasks/IDX-15.md
 Зависимости: IDX-07, IDX-08, IDX-12
 Ссылка: https://github.com/refusedguy/beacon/pull/1106
 Агент: ses_e020bebe1ffeF6R5NjhS3682mh
@@ -16,3 +16,4 @@
 
 ## Подтверждение
 - 2026-11-21: реализация в PR [#1106](https://github.com/refusedguy/beacon/pull/1106), коммит `18a10c8`. Изменены `internal/infra/cibridge/bridge.go`, `internal/infra/cibridge/bridge_test.go`, `internal/infra/worktree/gc.go`, карточка и добавлена `docs/tasks/WIRING-1106.md`. Тест `TestMergedClosesCardThenRunsWorktreeGC` прогоняет collector на фейковом git runner и проверяет `worktree remove`. Тесты `TestNonMergedVerdictSkipsWorktreeGC` и `TestCardCloseErrorSkipsWorktreeGC` проверяют, что GC не вызывается при удержанном merge и при ошибке закрытия карточки. Связывание порта в `cmd/beacon/mcp.go` вынесено в WIRING-1106. go test и go build локально не запускались, их выполнит CI.
+- 2026-11-21: параллельная реализация той же фичи в PR [#1115](https://github.com/refusedguy/beacon/pull/1115), коммит `cfbb803`. После влития #1106 код из #1115 в main не попадал: cardindex в PR #1115 падал из-за двойного применения относительного `-root ../..` и устаревшего индекса. На main обе проблемы уже исправлены, поэтому #1115 сохраняет только подтверждающую запись.
