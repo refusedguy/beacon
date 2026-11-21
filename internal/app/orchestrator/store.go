@@ -307,8 +307,37 @@ func NewStoreDependencyResolver(docsDir string, runner CommandRunner, mergedPR M
 	return &FileDependencyResolver{DocsDir: docsDir, Runner: runner, MergedPR: mergedPR}
 }
 
+// DependencyCardStatus is the tri-state result of resolving a task card ref.
+// Waiting can change not_done into done, but it cannot create a missing card.
+// Keeping the states apart lets Decide report a broken ref instead of waiting
+// forever for a file that does not exist.
+type DependencyCardStatus string
+
+const (
+	// DependencyCardDone means the card carries an explicit done status.
+	DependencyCardDone DependencyCardStatus = "done"
+	// DependencyCardNotDone means the card exists but is not done yet, or has
+	// no status line. A later tick may satisfy this ref.
+	DependencyCardNotDone DependencyCardStatus = "not_done"
+	// DependencyCardNotFound means the card file does not exist in DocsDir.
+	DependencyCardNotFound DependencyCardStatus = "not_found"
+)
+
+// DependencyCardNotFoundError is returned by Satisfied when a waitFor ref
+// names a task card that does not exist. Callers can match it with errors.As
+// and report a broken dependency instead of treating it as a normal wait.
+type DependencyCardNotFoundError struct {
+	Ref string
+}
+
+func (e *DependencyCardNotFoundError) Error() string {
+	return fmt.Sprintf("orchestrator: dependency card %s not found", e.Ref)
+}
+
 // Satisfied resolves one dependency reference. An empty ref is unsatisfied,
 // and any failure to verify a fact is an error rather than a false positive.
+// A missing task card is an error of type *DependencyCardNotFoundError: no
+// future tick can satisfy a ref to a card that is not in DocsDir.
 func (r *FileDependencyResolver) Satisfied(ctx context.Context, ref string) (bool, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
@@ -318,25 +347,32 @@ func (r *FileDependencyResolver) Satisfied(ctx context.Context, ref string) (boo
 		return r.prMerged(ctx, m[1])
 	}
 	if dependencyCardRef.MatchString(ref) {
-		return r.cardDone(ref)
+		status, err := r.cardDone(ref)
+		if err != nil {
+			return false, err
+		}
+		if status == DependencyCardNotFound {
+			return false, &DependencyCardNotFoundError{Ref: ref}
+		}
+		return status == DependencyCardDone, nil
 	}
 	return r.existsOnMain(ctx, ref)
 }
 
 // cardDone reads a task card through an fs.FS so the app layer uses no
-// os.ReadFile (ADR 0005). A missing card is simply not done; a read failure
-// is an error. The status line is accepted in Russian and English.
-func (r *FileDependencyResolver) cardDone(ref string) (bool, error) {
+// os.ReadFile (ADR 0005). It separates not_found, not_done and done. A read
+// failure is an error. The status line is accepted in Russian and English.
+func (r *FileDependencyResolver) cardDone(ref string) (DependencyCardStatus, error) {
 	dir := r.DocsDir
 	if dir == "" {
 		dir = "docs/tasks"
 	}
 	raw, err := fs.ReadFile(os.DirFS(dir), ref+".md")
 	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
+		return DependencyCardNotFound, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("orchestrator: read card %s: %w", ref, err)
+		return "", fmt.Errorf("orchestrator: read card %s: %w", ref, err)
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
@@ -345,9 +381,12 @@ func (r *FileDependencyResolver) cardDone(ref string) (bool, error) {
 			continue
 		}
 		value := strings.TrimSpace(line[strings.Index(line, ":")+1:])
-		return strings.EqualFold(strings.Trim(value, "*` "), "done"), nil
+		if strings.EqualFold(strings.Trim(value, "*` "), "done") {
+			return DependencyCardDone, nil
+		}
+		return DependencyCardNotDone, nil
 	}
-	return false, nil
+	return DependencyCardNotDone, nil
 }
 
 // prMerged reads the PR state from the already-loaded Watch data. There is no

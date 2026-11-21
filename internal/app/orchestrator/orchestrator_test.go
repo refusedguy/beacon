@@ -387,17 +387,26 @@ func TestResolverSatisfiesDoneCardOnly(t *testing.T) {
 	r := &FileDependencyResolver{DocsDir: dir, Runner: &fakeRunner{}}
 
 	for _, tc := range []struct {
-		ref  string
-		want bool
+		ref     string
+		want    bool
+		wantErr bool
 	}{
-		{"T3.100", true},
-		{" T3.100 ", true},
-		{"T3.101", false},
-		{"T3.102", true},
-		{"T3.999", false},
+		{"T3.100", true, false},
+		{" T3.100 ", true, false},
+		{"T3.101", false, false},
+		{"T3.102", true, false},
+		{"T3.999", false, true},
 	} {
 		got, err := r.Satisfied(context.Background(), tc.ref)
-		if err != nil {
+		if tc.wantErr {
+			var missing *DependencyCardNotFoundError
+			if !errors.As(err, &missing) {
+				t.Fatalf("Satisfied(%q) error = %v, want *DependencyCardNotFoundError", tc.ref, err)
+			}
+			if want := strings.TrimSpace(tc.ref); missing.Ref != want {
+				t.Fatalf("missing ref = %q, want %q", missing.Ref, want)
+			}
+		} else if err != nil {
 			t.Fatalf("Satisfied(%q): %v", tc.ref, err)
 		}
 		if got != tc.want {
