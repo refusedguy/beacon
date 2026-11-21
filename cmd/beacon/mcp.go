@@ -777,32 +777,77 @@ func startHTTPAPI(_ context.Context, cfg reconcileConfig, bus *httpapi.EventBus)
 // Signed webhook receiver (T3.376).
 //
 // The transport lives in infra/webhook and binds 127.0.0.1 only. This file
-// supplies the journal adapter so the receiver depends on a port, not on the
-// durable store table that T3.375 has not landed yet.
+// supplies the recorder adapter and rebuilds the dedupe index from the durable
+// journal at startup, so the receiver depends on a port rather than on store.
 // ---------------------------------------------------------------------------
 
-// webhookDeliveryRecorder adapts a process-local delivery journal to the
-// receiver's minimal port. T3.375 swaps the journal for the store-backed
-// RecordDelivery implementation without touching the receiver.
+// webhookRestorePageSize bounds one read of the delivery journal at startup.
+const webhookRestorePageSize = 256
+
+// restoreWebhookFilter builds the receiver's dedupe filter and rebuilds its
+// index from the durable journal one page at a time. A restart then rejects a
+// redelivery before any effect is queued. The store keeps its own idempotency;
+// this only refills the in-memory index.
+func restoreWebhookFilter(db *store.DB) (*webhook.Filter, error) {
+	f := webhook.NewFilter(webhook.FilterConfig{})
+	if db == nil {
+		return f, nil
+	}
+	cursor := ""
+	for {
+		page, err := db.ListWebhookDeliveries(context.Background(), cursor, webhookRestorePageSize)
+		if err != nil {
+			return nil, fmt.Errorf("webhook: restore dedupe index: %w", err)
+		}
+		for _, row := range page.Rows {
+			f.Restore(store.RawWebhookDeliveryID(row.DeliveryID), row.HeadSHA)
+		}
+		if page.Next == "" {
+			return f, nil
+		}
+		cursor = page.Next
+	}
+}
+
+// webhookDeliveryRecorder gates a delivery through the restored filter and
+// then writes it to the durable journal. A repeat fails the filter before the
+// write. The uniqueness constraint in RecordDelivery stays the last defence.
 type webhookDeliveryRecorder struct {
-	journal *webhook.MemoryDeliveryJournal
+	filter  *webhook.Filter
+	journal *store.DB
 }
 
 func (r webhookDeliveryRecorder) Record(ctx context.Context, d webhook.Delivery) (bool, error) {
-	if r.journal == nil {
-		return false, errors.New("webhook: nil delivery journal")
+	if r.filter == nil || r.journal == nil {
+		return false, errors.New("webhook: nil delivery filter or journal")
 	}
-	return r.journal.ClaimDelivery(ctx, webhook.DeliveryKey(d.ID), d.At)
+	if !r.filter.ClaimDelivery(d.ID) {
+		return false, nil
+	}
+	result, err := r.journal.RecordDelivery(store.WebhookDelivery{
+		DeliveryID: d.ID,
+		Event:      d.Event,
+		Action:     d.Action,
+		ReceivedAt: d.At.UnixNano(),
+	})
+	if err != nil {
+		return false, err
+	}
+	return result.Created, nil
 }
 
 // startWebhookReceiver loads the 0600 secret from the state directory and
 // starts the loopback listener. A missing secret or a bad address is logged and
 // skipped: an optional receiver must never take down the stdio MCP transport.
 func startWebhookReceiver(cfg reconcileConfig) (func(), error) {
+	filter, err := restoreWebhookFilter(cfg.db)
+	if err != nil {
+		return nil, err
+	}
 	srv, err := webhook.Start(webhook.Config{
 		Addr:       os.Getenv(webhook.WebhookAddrEnv),
 		SecretPath: filepath.Join(cfg.dir, webhook.SecretFileName),
-		Recorder:   webhookDeliveryRecorder{journal: webhook.NewMemoryDeliveryJournal()},
+		Recorder:   webhookDeliveryRecorder{filter: filter, journal: cfg.db},
 	})
 	if err != nil {
 		return nil, err

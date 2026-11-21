@@ -185,3 +185,74 @@ func (d *DB) WebhookDeliveryCount() (int, error) {
 	}
 	return n, nil
 }
+
+// WebhookDeliveryPage is one bounded read of the journal. Rows holds at most
+// the requested page size. Next is the cursor for the following page and is
+// empty on the last page.
+type WebhookDeliveryPage struct {
+	Rows []WebhookDelivery
+	Next string
+}
+
+// ListWebhookDeliveries reads at most limit rows with a delivery_id greater
+// than cursor, ordered by delivery_id. Keyset pagination bounds memory, so a
+// restart can rebuild an in-memory index one page at a time. The scan fetches
+// one extra row to tell whether another page follows without a count query.
+func (d *DB) ListWebhookDeliveries(ctx context.Context, cursor string, limit int) (WebhookDeliveryPage, error) {
+	if limit <= 0 {
+		return WebhookDeliveryPage{}, domain.NewAppError(domain.CodeInvalidInput, "store: webhook deliveries: non-positive limit")
+	}
+	ok, err := tableExists(ctx, d.readDB, "webhook_events")
+	if err != nil || !ok {
+		return WebhookDeliveryPage{}, err
+	}
+	rows, err := d.readDB.QueryContext(ctx, `
+		SELECT delivery_id, event, action, repo, pr, head_sha, watch_id,
+		       revision, status, received_at, outcome
+		FROM webhook_events
+		WHERE delivery_id > ?
+		ORDER BY delivery_id ASC
+		LIMIT ?`, cursor, limit+1)
+	if err != nil {
+		return WebhookDeliveryPage{}, fmt.Errorf("store: webhook deliveries: query: %w", err)
+	}
+	defer rows.Close()
+
+	var page WebhookDeliveryPage
+	for rows.Next() {
+		var item WebhookDelivery
+		if err := rows.Scan(&item.DeliveryID, &item.Event, &item.Action, &item.Repo, &item.PR,
+			&item.HeadSHA, &item.WatchID, &item.Revision, &item.Status, &item.ReceivedAt, &item.Outcome); err != nil {
+			return WebhookDeliveryPage{}, fmt.Errorf("store: webhook deliveries: scan: %w", err)
+		}
+		page.Rows = append(page.Rows, item)
+	}
+	if err := rows.Err(); err != nil {
+		return WebhookDeliveryPage{}, fmt.Errorf("store: webhook deliveries: rows: %w", err)
+	}
+	if len(page.Rows) > limit {
+		page.Next = page.Rows[limit-1].DeliveryID
+		page.Rows = page.Rows[:limit]
+	}
+	return page, nil
+}
+
+// RawWebhookDeliveryID reverses WebhookDeliveryKey for a stored row. The
+// dedupe index in webhook uses the raw X-GitHub-Delivery value, while the
+// journal stores the namespaced key. Rebuilding the index needs the raw form.
+func RawWebhookDeliveryID(key string) string {
+	prefix := domain.GitHubDeliveryNamespace + ":"
+	if !strings.HasPrefix(key, prefix) {
+		return key
+	}
+	escaped := strings.TrimPrefix(key, prefix)
+	var b strings.Builder
+	b.Grow(len(escaped))
+	for i := 0; i < len(escaped); i++ {
+		if escaped[i] == '\\' && i+1 < len(escaped) && (escaped[i+1] == '\\' || escaped[i+1] == ':') {
+			i++
+		}
+		b.WriteByte(escaped[i])
+	}
+	return b.String()
+}

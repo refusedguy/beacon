@@ -3,7 +3,11 @@ package worker
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/webhook"
 )
 
 type recordingRunner struct {
@@ -195,5 +199,85 @@ func TestEffectRunnerFunc(t *testing.T) {
 	})
 	if err := runner.Run(context.Background(), Effect{ID: "eff-1"}); err != nil || !called {
 		t.Fatalf("Run: called=%v err=%v", called, err)
+	}
+}
+
+// TestRedeliveryAfterRestartCreatesNoSecondEffect covers the restart contract.
+// The first process records a delivery and drains its effect once. A second
+// process rebuilds the dedupe index from the journal in pages of one row, then
+// sees the same delivery as a duplicate and queues no effect. The store's
+// INSERT OR IGNORE is not reimplemented here; it keeps the second row out.
+func TestRedeliveryAfterRestartCreatesNoSecondEffect(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+
+	delivered := store.WebhookDelivery{DeliveryID: "delivery-1", Event: "workflow_run", HeadSHA: "sha-1"}
+	first, err := db.RecordDelivery(delivered)
+	if err != nil {
+		t.Fatalf("first RecordDelivery: %v", err)
+	}
+	if !first.Created {
+		t.Fatal("first delivery was not created")
+	}
+	if _, err := db.RecordDelivery(store.WebhookDelivery{DeliveryID: "delivery-2", Event: "workflow_run", HeadSHA: "sha-2"}); err != nil {
+		t.Fatalf("second RecordDelivery: %v", err)
+	}
+
+	runner := &recordingRunner{}
+	firstProcess := New(runner)
+	if _, err := firstProcess.Drain(ctx, []Effect{{ID: "effect-1"}}); err != nil {
+		t.Fatalf("first Drain: %v", err)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d, want 1", len(runner.calls))
+	}
+
+	// Rebuild the index from the journal. A page size of one forces more than
+	// one read, so a broken cursor loses the delivery and fails the check below.
+	restarted := webhook.NewFilter(webhook.FilterConfig{})
+	cursor := ""
+	pages := 0
+	for {
+		page, err := db.ListWebhookDeliveries(ctx, cursor, 1)
+		if err != nil {
+			t.Fatalf("ListWebhookDeliveries: %v", err)
+		}
+		pages++
+		for _, row := range page.Rows {
+			restarted.Restore(store.RawWebhookDeliveryID(row.DeliveryID), row.HeadSHA)
+		}
+		if page.Next == "" {
+			break
+		}
+		cursor = page.Next
+	}
+	if pages < 2 {
+		t.Fatalf("pages = %d, want at least 2 for a paged read", pages)
+	}
+
+	decision, _ := restarted.Filter(webhook.EventWorkflowRun, "main", "refusedguy", "delivery-1", "sha-1")
+	if decision != webhook.DecisionDuplicateDelivery {
+		t.Fatalf("redelivery decision = %q, want %q", decision, webhook.DecisionDuplicateDelivery)
+	}
+	if decision.Publish() {
+		t.Fatal("redelivery must not publish a second effect")
+	}
+
+	if _, err := db.RecordDelivery(delivered); err != nil {
+		t.Fatalf("repeat RecordDelivery: %v", err)
+	}
+	count, err := db.WebhookDeliveryCount()
+	if err != nil {
+		t.Fatalf("WebhookDeliveryCount: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("delivery count = %d, want 2", count)
+	}
+	if len(runner.calls) != 1 {
+		t.Fatalf("runner calls = %d after restart, want 1", len(runner.calls))
 	}
 }
