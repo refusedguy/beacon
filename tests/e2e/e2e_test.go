@@ -31,11 +31,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -127,19 +125,6 @@ func buildBeacon(t *testing.T, src, out string) {
 	if _, err := os.Stat(out); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func freePort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
-	}
-	return port
 }
 
 // --- 1. MCP client: official go-sdk with CommandTransport -------------------
@@ -274,6 +259,43 @@ type apiSession struct {
 	ID string `json:"id"`
 }
 
+// serviceConnection is the registration record opencode writes to
+// $XDG_STATE_HOME/opencode/service.json when started with --service. The
+// record appears only once the HTTP API is listening and carries the real
+// address and password, so it is a reliable readiness source: no log scraping
+// and no guessed port.
+type serviceConnection struct {
+	URL      string `json:"url"`
+	Password string `json:"password"`
+}
+
+// waitServiceConnection waits for opencode's registration file and returns the
+// address and password written there. The short ticker only bounds how long we
+// wait for a small file written by the server itself; it never polls a log or
+// sleeps a fixed 200 ms per iteration. The context deadline keeps a hung
+// opencode from stalling CI.
+func waitServiceConnection(t *testing.T, srv *server, path string) serviceConnection {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if data, err := os.ReadFile(path); err == nil {
+			var conn serviceConnection
+			if json.Unmarshal(data, &conn) == nil && conn.URL != "" && conn.Password != "" {
+				return conn
+			}
+		}
+		select {
+		case <-ctx.Done():
+			stopServer(srv)
+			t.Fatalf("opencode service не зарегистрировался за 30s: %s", tail(t, srv.logPath))
+		case <-ticker.C:
+		}
+	}
+}
+
 func startServer(t *testing.T, base, pluginPath string) *server {
 	t.Helper()
 	project := filepath.Join(base, "project")
@@ -305,22 +327,29 @@ func startServer(t *testing.T, base, pluginPath string) *server {
 		}
 	}
 
-	port := freePort(t)
+	stateHome := filepath.Join(base, "state")
 	logPath := filepath.Join(base, "serve.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	env := append(os.Environ(),
+		// --service chdirs the server to HOME. Keep the temp project there so
+		// plugin discovery and session location stay scoped to this test.
+		"HOME="+project,
 		"XDG_CONFIG_HOME="+filepath.Join(base, "xdg-config"),
 		"XDG_DATA_HOME="+filepath.Join(base, "xdg-data"),
 		"XDG_CACHE_HOME="+filepath.Join(base, "xdg-cache"),
-		"XDG_STATE_HOME="+filepath.Join(base, "state"),
+		"XDG_STATE_HOME="+stateHome,
 		"OPENCODE_CONFIG="+filepath.Join(project, "opencode.json"),
 		"OPENCODE_DISABLE_AUTOUPDATE=1",
 		"OPENCODE_DISABLE_MODELS_FETCH=1",
 	)
-	proc := exec.Command(openBin, "serve", "--hostname", "127.0.0.1", "--port", fmt.Sprint(port))
+	// --service makes opencode publish its live address and password in
+	// $XDG_STATE_HOME/opencode/service.json. Port 0 lets opencode choose the
+	// port and report the one it actually bound, so there is no close/rebind
+	// window between reserving a port and starting the server.
+	proc := exec.Command(openBin, "serve", "--hostname", "127.0.0.1", "--port", "0", "--service")
 	proc.Dir = project
 	proc.Env = env
 	proc.Stdout = logFile
@@ -329,29 +358,16 @@ func startServer(t *testing.T, base, pluginPath string) *server {
 		t.Fatalf("opencode serve: %v", err)
 	}
 	srv := &server{
-		url:     fmt.Sprintf("http://127.0.0.1:%d", port),
 		proc:    proc,
 		logPath: logPath,
 		base:    base,
 		project: project,
 	}
 
-	passwordRe := regexp.MustCompile(`server password\s+(\S+)`)
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if proc.ProcessState != nil {
-			t.Fatalf("opencode serve завершился: %s", tail(t, logPath))
-		}
-		data, _ := os.ReadFile(logPath)
-		if m := passwordRe.FindSubmatch(data); m != nil && strings.Contains(string(data), "server listening") {
-			srv.password = string(m[1])
-			return srv
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	stopServer(srv)
-	t.Fatalf("opencode serve не поднялся за 30s: %s", tail(t, logPath))
-	return nil
+	conn := waitServiceConnection(t, srv, filepath.Join(stateHome, "opencode", "service.json"))
+	srv.url = conn.URL
+	srv.password = conn.Password
+	return srv
 }
 
 func stopServer(srv *server) {
