@@ -166,6 +166,11 @@ type Bridge struct {
 	rebaseMu       sync.Mutex
 	rebased        map[string]bool
 	tracer         observe.Tracer
+
+	// breakers holds the in-memory circuit breaker of each wake adapter.
+	// The durable per-Watch wake cap stays separate and keeps its own counter.
+	breakerMu sync.Mutex
+	breakers  map[string]*adapterBreaker
 }
 
 // WithTracer binds the tracer used for the per-refresh span. It is optional:
@@ -1360,10 +1365,147 @@ func (b *Bridge) recordWake(w domain.Watch, now time.Time, attempt int) {
 	b.markDelivered(id, now, attempt, "")
 }
 
-// wakeOne validates the address, applies the wake cap, delivers the pointer
-// and records the attempt. A dead-session error marks the subscriber orphaned
-// and escalates to the orchestrator once; other errors are left pending so a
-// later tick can retry.
+// Circuit breaker tuning, expressed with Resilience4j's vocabulary. The
+// breaker is per adapter and lives in the process: the sliding window and the
+// open timer are outcome statistics, not durable state. A bulkhead, not this
+// window, would limit parallelism.
+const (
+	breakerWindowSize   = 10               // sliding window of recent outcomes
+	breakerMinimumCalls = 3                // minimumNumberOfCalls before an opening decision
+	breakerFailureNum   = 1                // failure rate numerator
+	breakerFailureDenom = 2                // failure rate denominator: 1/2
+	breakerOpenWait     = 30 * time.Second // waitDurationInOpenState
+)
+
+// adapterBreakerState is the state of one adapter's circuit breaker.
+type adapterBreakerState int
+
+const (
+	breakerClosed adapterBreakerState = iota
+	breakerOpen
+	breakerHalfOpen
+)
+
+// adapterBreaker is the state machine of a single wake adapter. outcomes is a
+// sliding window of recent deliveries: true means a transport failure, false
+// means success. openedAt is the wall-clock time the breaker went OPEN.
+type adapterBreaker struct {
+	state         adapterBreakerState
+	outcomes      []bool
+	openedAt      time.Time
+	probeInFlight bool
+}
+
+// breakerFor returns the state of adapter, creating it on first use. The caller
+// must hold b.breakerMu.
+func (b *Bridge) breakerFor(adapter string) *adapterBreaker {
+	if b.breakers == nil {
+		b.breakers = make(map[string]*adapterBreaker)
+	}
+	s := b.breakers[adapter]
+	if s == nil {
+		s = &adapterBreaker{}
+		b.breakers[adapter] = s
+	}
+	return s
+}
+
+// breakerAdapterKey groups legacy (non adapter-aware) deliveries under one
+// breaker so every wake path has a key.
+func breakerAdapterKey(sub domain.Subscriber) string {
+	if sub.Adapter != "" {
+		return sub.Adapter
+	}
+	return "legacy"
+}
+
+// breakerPermit reports whether a wake for adapter may go out at now. CLOSED
+// permits every call: the sliding window measures outcomes and does not cap
+// concurrency. OPEN refuses calls until breakerOpenWait has passed, then moves
+// to HALF_OPEN. HALF_OPEN permits exactly one probe at a time.
+func (b *Bridge) breakerPermit(adapter string, now time.Time) bool {
+	b.breakerMu.Lock()
+	defer b.breakerMu.Unlock()
+	s := b.breakerFor(adapter)
+	switch s.state {
+	case breakerOpen:
+		if now.Sub(s.openedAt) < breakerOpenWait {
+			return false
+		}
+		s.state = breakerHalfOpen
+		s.outcomes = nil
+		s.probeInFlight = true
+	case breakerHalfOpen:
+		if s.probeInFlight {
+			return false
+		}
+		s.probeInFlight = true
+	}
+	return true
+}
+
+// breakerRecord records the outcome of a wake that breakerPermit allowed.
+// A HALF_OPEN probe either closes the breaker on success or reopens it on
+// failure. In CLOSED the outcome enters the sliding window, which opens the
+// breaker once enough calls arrived and the failure rate crossed the threshold.
+func (b *Bridge) breakerRecord(adapter string, now time.Time, failure bool) {
+	b.breakerMu.Lock()
+	defer b.breakerMu.Unlock()
+	s := b.breakerFor(adapter)
+	switch s.state {
+	case breakerHalfOpen:
+		s.probeInFlight = false
+		if failure {
+			b.openBreaker(s, now)
+		} else {
+			s.state = breakerClosed
+			s.outcomes = nil
+		}
+	case breakerClosed:
+		s.outcomes = append(s.outcomes, failure)
+		if len(s.outcomes) > breakerWindowSize {
+			s.outcomes = s.outcomes[len(s.outcomes)-breakerWindowSize:]
+		}
+		if len(s.outcomes) < breakerMinimumCalls {
+			return
+		}
+		failures := 0
+		for _, f := range s.outcomes {
+			if f {
+				failures++
+			}
+		}
+		if failures*breakerFailureDenom >= len(s.outcomes)*breakerFailureNum {
+			b.openBreaker(s, now)
+		}
+	}
+}
+
+// breakerIgnore records a dead-session failure. It is neither a success nor a
+// failure for the backend, so it never opens the breaker. A HALF_OPEN probe
+// that hits a dead session releases its slot for a later tick.
+func (b *Bridge) breakerIgnore(adapter string) {
+	b.breakerMu.Lock()
+	defer b.breakerMu.Unlock()
+	s := b.breakerFor(adapter)
+	if s.state == breakerHalfOpen {
+		s.probeInFlight = false
+	}
+}
+
+// openBreaker moves s to OPEN and starts the wait timer. The caller must hold
+// b.breakerMu.
+func (b *Bridge) openBreaker(s *adapterBreaker, now time.Time) {
+	s.state = breakerOpen
+	s.openedAt = now
+	s.outcomes = nil
+	s.probeInFlight = false
+}
+
+// wakeOne validates the address, applies the wake cap, checks the per-adapter
+// circuit breaker, delivers the pointer and records the attempt. A dead-session
+// error marks the subscriber orphaned and escalates to the orchestrator once;
+// other errors are left pending so a later tick can retry.
 func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscriber, text string, now time.Time, cycleID string, breaker bool) {
 	if b.waker == nil && b.adapterWaker == nil {
 		return
@@ -1376,6 +1518,12 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 	}
 	if breaker && b.wakeCount(w) >= wakeCap(w) {
 		b.parkForWakeCap(ctx, w, cycleID)
+		return
+	}
+	adapter := breakerAdapterKey(sub)
+	if !b.breakerPermit(adapter, now) {
+		observe.WakeSkipped(adapter, w.ID, "adapter circuit breaker open")
+		log.Printf("cibridge: skip wake for watch %s: adapter %q circuit breaker open", w.ID, adapter)
 		return
 	}
 	p := domain.WakePayload{
@@ -1402,21 +1550,27 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 		deliverErr = b.waker.Deliver(ctx, target, p)
 	}
 	if deliverErr != nil {
+		dead := isDeadSessionErr(deliverErr)
 		outcome := domain.OutcomeTransportFailed
-		if isDeadSessionErr(deliverErr) {
+		if dead {
 			// A dead session can never send a receipt. It is indeterminate,
-			// which the ladder never retries (ADR 0017).
+			// which the ladder never retries (ADR 0017). It is also not a
+			// backend failure, so ignoreExceptions keeps the breaker closed.
 			outcome = domain.OutcomeIndeterminate
+			b.breakerIgnore(adapter)
+		} else {
+			b.breakerRecord(adapter, now, true)
 		}
 		b.recordDelivery(ctx, p.ObligationID, attempt, outcome, now)
 		observe.WakeFailed(sub.Adapter, w.ID, deliverErr, w.Revision)
 		observe.ActorError("wake", w.ID, deliverErr)
 		log.Printf("cibridge: wake %s: %v", target, deliverErr)
-		if isDeadSessionErr(deliverErr) {
+		if dead {
 			b.markOrphaned(ctx, w, sub, now, cycleID)
 		}
 		return
 	}
+	b.breakerRecord(adapter, now, false)
 	observe.WakeDuration(sub.Adapter, time.Since(start))
 	observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
 	b.recordDelivery(ctx, p.ObligationID, attempt, domain.OutcomePosted, now)

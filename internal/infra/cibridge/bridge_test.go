@@ -1247,3 +1247,182 @@ func TestChainWatchCIPointerWakeRead(t *testing.T) {
 		t.Fatalf("repeat readAt = %v, want the first read unchanged", again.ReadAt)
 	}
 }
+
+// scriptedAdapterWaker returns one queued result per delivery and records the
+// adapters it was asked to wake. A drained queue means success.
+type scriptedAdapterWaker struct {
+	results []error
+	calls   []string
+}
+
+func (w *scriptedAdapterWaker) Deliver(_ context.Context, adapter, _ string, _ domain.WakePayload) error {
+	w.calls = append(w.calls, adapter)
+	if len(w.results) == 0 {
+		return nil
+	}
+	err := w.results[0]
+	w.results = w.results[1:]
+	return err
+}
+
+// breakerTestBridge builds a bridge with one executor subscriber and a
+// scripted waker. No orchestrator is present, so a dead session cannot trigger
+// an extra orphan notification delivery through the same waker.
+func breakerTestBridge(t *testing.T, results []error) (*Bridge, *scriptedAdapterWaker, domain.Watch, domain.Subscriber) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	exec := domain.Subscriber{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}
+	w := domain.Watch{
+		ID: "watch:breaker:1:abc", Repo: "o/r", PR: 1, HeadSHA: "abc",
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1,
+		Subscribers: []domain.Subscriber{exec},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	waker := &scriptedAdapterWaker{results: results}
+	b := New(db, fakeCI{}, fixedClock{at: time.Unix(0, 0)}, time.Second).WithWaker(waker)
+	return b, waker, w, exec
+}
+
+func breakerWake(b *Bridge, w domain.Watch, sub domain.Subscriber, at time.Time, cycle string) {
+	b.wakeOne(context.Background(), w, sub, "keep_working: continue", at, cycle, true)
+}
+
+// TestAdapterBreakerOpensAfterMinimumFailedCalls proves a broken adapter stops
+// receiving a delivery on every tick. One or two failures leave the breaker
+// closed; the third opens it and later ticks are skipped until the wait ends.
+func TestAdapterBreakerOpensAfterMinimumFailedCalls(t *testing.T) {
+	transport := errors.New("transport down")
+	b, waker, w, exec := breakerTestBridge(t, []error{transport, transport, transport})
+	base := time.Unix(100, 0)
+
+	for i := 0; i < 3; i++ {
+		breakerWake(b, w, exec, base.Add(time.Duration(i)*time.Second), "cycle-open")
+	}
+	if got := len(waker.calls); got != 3 {
+		t.Fatalf("deliveries before open = %d, want 3", got)
+	}
+	s := b.breakerFor("opencode")
+	if s.state != breakerOpen {
+		t.Fatalf("state after failures = %v, want open", s.state)
+	}
+
+	for i := 3; i < 6; i++ {
+		breakerWake(b, w, exec, base.Add(time.Duration(i)*time.Second), "cycle-open")
+	}
+	if got := len(waker.calls); got != 3 {
+		t.Fatalf("deliveries while OPEN = %d, want 3 (no retry each tick)", got)
+	}
+}
+
+// TestAdapterBreakerHalfOpenProbeClosesBreaker proves one successful probe
+// after the open wait returns the adapter to normal delivery.
+func TestAdapterBreakerHalfOpenProbeClosesBreaker(t *testing.T) {
+	transport := errors.New("transport down")
+	b, waker, w, exec := breakerTestBridge(t, []error{transport, transport, transport, nil, nil})
+	base := time.Unix(200, 0)
+	for i := 0; i < 3; i++ {
+		breakerWake(b, w, exec, base.Add(time.Duration(i)*time.Second), "cycle-half")
+	}
+	openedAt := b.breakerFor("opencode").openedAt
+
+	probeAt := openedAt.Add(breakerOpenWait + time.Second)
+	breakerWake(b, w, exec, probeAt, "cycle-half")
+	if got := len(waker.calls); got != 4 {
+		t.Fatalf("deliveries after probe = %d, want 4", got)
+	}
+	if s := b.breakerFor("opencode"); s.state != breakerClosed {
+		t.Fatalf("state after successful probe = %v, want closed", s.state)
+	}
+
+	breakerWake(b, w, exec, probeAt.Add(time.Second), "cycle-half")
+	if got := len(waker.calls); got != 5 {
+		t.Fatalf("deliveries after close = %d, want 5", got)
+	}
+}
+
+// TestAdapterBreakerHalfOpenFailedProbeReopens proves HALF_OPEN permits one
+// probe: a failed probe reopens the breaker and the next tick is skipped.
+func TestAdapterBreakerHalfOpenFailedProbeReopens(t *testing.T) {
+	transport := errors.New("transport down")
+	b, waker, w, exec := breakerTestBridge(t, []error{transport, transport, transport, transport})
+	base := time.Unix(300, 0)
+	for i := 0; i < 3; i++ {
+		breakerWake(b, w, exec, base.Add(time.Duration(i)*time.Second), "cycle-reopen")
+	}
+	openedAt := b.breakerFor("opencode").openedAt
+
+	probeAt := openedAt.Add(breakerOpenWait + time.Second)
+	breakerWake(b, w, exec, probeAt, "cycle-reopen")
+	if s := b.breakerFor("opencode"); s.state != breakerOpen {
+		t.Fatalf("state after failed probe = %v, want open", s.state)
+	}
+	breakerWake(b, w, exec, probeAt, "cycle-reopen")
+	if got := len(waker.calls); got != 4 {
+		t.Fatalf("deliveries after failed probe = %d, want 4", got)
+	}
+}
+
+// TestAdapterBreakerIgnoresDeadSessionFailures proves ignoreExceptions:
+// a dead session is an indeterminate ladder outcome, not a backend failure,
+// so it never opens the breaker.
+func TestAdapterBreakerIgnoresDeadSessionFailures(t *testing.T) {
+	results := []error{
+		errors.New("session not found: HTTP 404"),
+		errors.New("no such session"),
+		errors.New("session gone"),
+		errors.New("410 gone"),
+		errors.New("session not found"),
+	}
+	b, waker, w, exec := breakerTestBridge(t, results)
+	base := time.Unix(400, 0)
+	for i := range results {
+		breakerWake(b, w, exec, base.Add(time.Duration(i)*time.Second), "cycle-ignore")
+	}
+	if got := len(waker.calls); got != len(results) {
+		t.Fatalf("deliveries = %d, want %d (dead sessions must not open the breaker)", got, len(results))
+	}
+	if s := b.breakerFor("opencode"); s.state != breakerClosed {
+		t.Fatalf("state after dead sessions = %v, want closed", s.state)
+	}
+}
+
+// TestAdapterBreakerKeepsWatchWakeCap proves the durable per-Watch cap still
+// parks a Watch even while the per-adapter breaker permits the delivery.
+func TestAdapterBreakerKeepsWatchWakeCap(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+	exec := domain.Subscriber{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}
+	w := domain.Watch{
+		ID: "watch:breaker:cap:abc", Repo: "o/r", PR: 7, HeadSHA: "abc",
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1,
+		Policy:      domain.Policy{MaxWakesPerWatch: 1},
+		Subscribers: []domain.Subscriber{exec},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	waker := &scriptedAdapterWaker{}
+	b := New(db, fakeCI{}, fixedClock{at: time.Unix(500, 0)}, time.Second).
+		WithWaker(waker).WithEscalationWriter(func(string) {})
+	breakerWake(b, w, exec, time.Unix(500, 0), "cycle-cap")
+	breakerWake(b, w, exec, time.Unix(501, 0), "cycle-cap")
+	if got := len(waker.calls); got != 1 {
+		t.Fatalf("deliveries = %d, want 1 before the cap", got)
+	}
+	got, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if got.Status != domain.StatusParked {
+		t.Fatalf("status = %q, want parked by the wake cap", got.Status)
+	}
+}
