@@ -1662,7 +1662,10 @@ func TestEvaluatePRBaseBlamePrecedesConclusionFiltering(t *testing.T) {
 		MergeStateStatus: "CLEAN",
 		ReviewDecision:   "APPROVED",
 		Checks: map[string]Check{
-			"ci-build": {State: "COMPLETED", Conclusion: "SUCCESS"},
+			// The check broken on the base is a required gate. Rule 5 skips
+			// only informational (required:false) base failures, so this one
+			// must stay a blocker even though the caller saw SUCCESS.
+			"ci-build": {State: "COMPLETED", Conclusion: "SUCCESS", Required: true},
 		},
 		Failures:         []string{"ci-build", "ci-flaky"},
 		BaseFailedChecks: map[string]bool{"ci-build": true},
