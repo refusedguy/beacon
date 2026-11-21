@@ -48,62 +48,62 @@
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/ClaimHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/HolderLeaseHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewCapabilityFallbackWakeHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewCapabilityWakeHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewClaimHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewFallbackWakeHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewHolderLeaseHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewWakeHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewWorktreeLeaseHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewWorktreeWakeHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/WakeHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/WorktreeLeaseHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
+      "reason": "ADR 0263: wake/claim/wait вне MCP; нужен отдельный ADR (BCX-49)"
     },
     {
       "rule": "REACH-UNWIRED",
