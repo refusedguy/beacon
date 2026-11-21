@@ -436,3 +436,122 @@ func (d *DB) WatchObligations(watchID string) ([]domain.Obligation, error) {
 	}
 	return obligations, rows.Err()
 }
+
+// createObligationEraseLedgerSQL owns the audit trail for erased obligations.
+// The table is created on first use, like the watch archive and the other
+// package-owned tables. A row keeps the erased id, who removed it, when and
+// why, together with a copy of the removed payload. The copy lets an operator
+// check the erase after a restore, when the source row is gone.
+const createObligationEraseLedgerSQL = `
+CREATE TABLE IF NOT EXISTS obligation_erase_ledger (
+  id        TEXT PRIMARY KEY,
+  actor     TEXT NOT NULL,
+  reason    TEXT NOT NULL,
+  erased_at INTEGER NOT NULL,
+  payload   BLOB
+);
+`
+
+// ObligationEraseRecord is one ledger row. Erased is true only for the call
+// that wrote the row; a repeat of the same erase returns the stored record
+// with Erased=false.
+type ObligationEraseRecord struct {
+	ObligationID string    `json:"obligationID"`
+	Actor        string    `json:"actor"`
+	Reason       string    `json:"reason"`
+	ErasedAt     time.Time `json:"erasedAt"`
+	Payload      []byte    `json:"payload,omitempty"`
+	Erased       bool      `json:"erased"`
+}
+
+// EraseObligation removes one obligation and records the removal in the same
+// transaction. The ledger row is written before the delete, so a crash cannot
+// leave an erased obligation without its audit trail. A repeated call for the
+// same id returns the original record and writes nothing.
+func (d *DB) EraseObligation(ctx context.Context, id, actor, reason string, at time.Time) (ObligationEraseRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if id == "" {
+		return ObligationEraseRecord{}, errors.New("store: erase: empty obligation id")
+	}
+	if at.IsZero() {
+		return ObligationEraseRecord{}, errors.New("store: erase: zero time")
+	}
+
+	var rec ObligationEraseRecord
+	err := d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createObligationEraseLedgerSQL); err != nil {
+			return fmt.Errorf("store: erase: create ledger: %w", err)
+		}
+
+		var erasedAt int64
+		err := tx.QueryRowContext(ctx, `
+			SELECT actor, reason, erased_at, payload
+			FROM obligation_erase_ledger WHERE id = ?`, id,
+		).Scan(&rec.Actor, &rec.Reason, &erasedAt, &rec.Payload)
+		if err == nil {
+			rec.ObligationID = id
+			rec.ErasedAt = time.Unix(0, erasedAt).UTC()
+			rec.Erased = false
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		var payload []byte
+		err = tx.QueryRowContext(ctx, `SELECT payload FROM obligations WHERE id = ?`, id).Scan(&payload)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+
+		rec = ObligationEraseRecord{
+			ObligationID: id,
+			Actor:        actor,
+			Reason:       reason,
+			ErasedAt:     at.UTC(),
+			Payload:      payload,
+			Erased:       true,
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO obligation_erase_ledger (id, actor, reason, erased_at, payload)
+			VALUES (?, ?, ?, ?, ?)`, id, actor, reason, timeToNano(at), payload); err != nil {
+			return fmt.Errorf("store: erase: record ledger: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM obligations WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("store: erase: delete obligation: %w", err)
+		}
+		return nil
+	})
+	return rec, err
+}
+
+// ObligationErase returns the ledger row for an erased obligation.
+func (d *DB) ObligationErase(id string) (ObligationEraseRecord, error) {
+	if err := d.ensureObligationEraseLedger(); err != nil {
+		return ObligationEraseRecord{}, err
+	}
+	var rec ObligationEraseRecord
+	var erasedAt int64
+	err := d.readDB.QueryRow(`
+		SELECT actor, reason, erased_at, payload
+		FROM obligation_erase_ledger WHERE id = ?`, id,
+	).Scan(&rec.Actor, &rec.Reason, &erasedAt, &rec.Payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ObligationEraseRecord{}, domain.NewAppError(domain.CodeWatchNotFound, "erase record "+id+" not found")
+	}
+	if err != nil {
+		return ObligationEraseRecord{}, err
+	}
+	rec.ObligationID = id
+	rec.ErasedAt = time.Unix(0, erasedAt).UTC()
+	return rec, nil
+}
+
+func (d *DB) ensureObligationEraseLedger() error {
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(createObligationEraseLedgerSQL)
+		return err
+	})
+}
