@@ -18,6 +18,7 @@
     {"from": "internal/app", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/app"},
+    {"from": "cmd", "to": "internal/tui"},
     {"from": "cmd", "to": "internal/domain", "shared": true},
     {"from": "internal/infra", "to": "internal/infra/observe", "shared": true},
     {"from": "internal/app", "to": "internal/infra/observe", "shared": true},
