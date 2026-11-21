@@ -1184,14 +1184,10 @@ func AttachGetResult(server *mcpsdk.Server, handler *GetResultHandler) {
 		return
 	}
 	server.RemoveTools("beacon_get_result")
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_get_result",
 		Description: "Read a Watch result without logs and mark its content as read.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, handler.Handle)
 }
 
@@ -1713,13 +1709,9 @@ func AttachTasksGet(server *mcpsdk.Server, store *ProtocolTaskStore) {
 		return
 	}
 	server.RemoveTools(TasksGetMethod)
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        TasksGetMethod,
 		Description: "Query the state and result of an MCP task without holding a connection.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, store.GetHandle)
 }

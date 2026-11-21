@@ -738,6 +738,18 @@ func (h *WatchPRHandler) now() time.Time {
 	return h.clock.Now()
 }
 
+// attachToolAnnotations builds the SDK annotations shared by the opt-in Attach*
+// tools. DestructiveHint is a pointer in the SDK, so it stays set explicitly to
+// false even for additive tools. IdempotentHint is the only value that differs
+// between tools, so callers pass it in.
+func attachToolAnnotations(idempotent bool) *mcpsdk.ToolAnnotations {
+	no := false
+	return &mcpsdk.ToolAnnotations{
+		DestructiveHint: &no,
+		IdempotentHint:  idempotent,
+	}
+}
+
 // AttachWatchPR replaces the T2.1 stub with the real tool on a go-sdk server.
 // Wiring all seven tools into NewServer belongs to a later task; this helper
 // keeps the feature usable on its own.
@@ -746,14 +758,10 @@ func AttachWatchPR(server *mcpsdk.Server, handler *WatchPRHandler) {
 		return
 	}
 	server.RemoveTools("beacon_watch_pr")
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_watch_pr",
 		Description: "Register or renew a Watch on a pull request head and subscribe the caller.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, handler.Handle)
 }
 

@@ -205,13 +205,9 @@ func AttachDeferWiring(server *mcpsdk.Server, handler *DeferWiringHandler) {
 		return
 	}
 	server.RemoveTools("beacon_defer_wiring")
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_defer_wiring",
 		Description: "Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, handler.Handle)
 }

@@ -1803,13 +1803,9 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 		return
 	}
 	server.RemoveTools(WakeToolName)
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
 		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task. mailbox names the recipient's private doorbell: a message addressed to it rings the bell so a long-poll listener on that address wakes, and doorbellRang reports it. A broadcast message reaches no single mailbox and rings nothing; the doorbell is a wake trigger, not a new delivery value or a ladder step. heartbeatState, quotaShouldRun and heartbeatTick feed the guarded heartbeat: when a guard is attached the wake is released only if the state changed or the quota gate is open, so a timer tick alone holds the wake with ok=false and guarded=true. The guard is a precondition checked before any delivery, not a new delivery value or a ladder step. registryStatus reports the executor status held by the registry guard; a stale or missing row holds the wake with ok=false and no delivery, because a heartbeat tick does not replace a successful sync.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
+		Annotations: attachToolAnnotations(false),
 	}, handler.Handle)
 }

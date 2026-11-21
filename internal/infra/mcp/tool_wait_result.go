@@ -1397,13 +1397,9 @@ func AttachWaitResult(server *mcpsdk.Server, svc *WaitResultService) {
 		return
 	}
 	server.RemoveTools("beacon_wait_result")
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_wait_result",
 		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, svc.Handle)
 }

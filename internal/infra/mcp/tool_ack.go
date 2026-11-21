@@ -921,13 +921,9 @@ func AttachAck(server *mcpsdk.Server, handler *AckHandler) {
 		return
 	}
 	server.RemoveTools("beacon_ack")
-	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_ack",
 		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, handler.Handle)
 }
