@@ -79,7 +79,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	opts := options{}
 	fs.StringVar(&opts.repo, "repo", ".", "repository root containing docs/tasks")
 	fs.StringVar(&opts.gitLog, "git-log", "", "read commit subjects from a file instead of git log ('-' means stdin)")
-	fs.BoolVar(&opts.write, "write", false, "write card status lines (default: dry run)")
+	fs.BoolVar(&opts.write, "write", false, "write card status lines and an existing ROADMAP_STATUS.md (default: dry run)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -103,7 +103,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "roadmap-sync: write: %v\n", err)
 		return 1
 	}
-	roadmapChanges := planRoadmap(opts.repo, counts, priorities)
+	roadmapChanges, err := updateRoadmap(opts.repo, counts, priorities, opts.write)
+	if err != nil {
+		fmt.Fprintf(stderr, "roadmap-sync: roadmap: %v\n", err)
+		return 1
+	}
 
 	mode := "dry run"
 	if opts.write {
@@ -455,15 +459,19 @@ func roadmapPath(repo string) string {
 	return filepath.Join(repo, "docs", "ROADMAP_STATUS.md")
 }
 
-// planRoadmap reports the edits that would bring the three counts and the
+// updateRoadmap reports the edits that would bring the three counts and the
 // priority lines of ROADMAP_STATUS.md in line with the cards. The document is
-// derived (IDX-11): --write never touches it, and the change lines printed by
-// run let an operator regenerate a local copy by hand. A copy is optional, so
-// a missing file produces no changes instead of an error.
-func planRoadmap(repo string, counts, priorities map[string]int) []string {
-	data, err := readFile(roadmapPath(repo))
+// derived (IDX-11): it is absent from a fresh checkout, so the generator never
+// creates it. An operator can generate a local copy by hand, and --write keeps
+// that copy current. A missing file produces no changes and no error.
+func updateRoadmap(repo string, counts, priorities map[string]int, write bool) ([]string, error) {
+	path := roadmapPath(repo)
+	data, err := readFile(path)
 	if err != nil {
-		return nil
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	content := string(data)
 	lines := strings.Split(content, "\n")
@@ -501,7 +509,48 @@ func planRoadmap(repo string, counts, priorities map[string]int) []string {
 		}
 	}
 	sort.Strings(changes)
-	return changes
+
+	if !write || len(changes) == 0 {
+		return changes, nil
+	}
+
+	phases := make([]string, 0, len(priorities))
+	for phase := range priorities {
+		phases = append(phases, phase)
+	}
+	sort.Strings(phases)
+
+	var out []string
+	seenPriorities := false
+	for _, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "- Закрыто done:"):
+			out = append(out, fmt.Sprintf("- Закрыто done: **%d**", counts[statusDone]))
+		case strings.HasPrefix(line, "- Переведено dropped:"):
+			out = append(out, fmt.Sprintf("- Переведено dropped: **%d**", counts[statusDropped]))
+		case strings.HasPrefix(line, "- Осталось реальных todo:"):
+			out = append(out, fmt.Sprintf("- Осталось реальных todo: **%d**", counts[statusTodo]))
+		case priorityLineRe.MatchString(line):
+			if !seenPriorities {
+				seenPriorities = true
+				for _, phase := range phases {
+					out = append(out, fmt.Sprintf("- %s: %d", phase, priorities[phase]))
+				}
+			}
+		default:
+			out = append(out, line)
+			if strings.TrimSpace(line) == "## Приоритеты" && !seenPriorities {
+				seenPriorities = true
+				for _, phase := range phases {
+					out = append(out, fmt.Sprintf("- %s: %d", phase, priorities[phase]))
+				}
+			}
+		}
+	}
+	if err := writeFile(path, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+		return changes, fmt.Errorf("%s: %w", path, err)
+	}
+	return changes, nil
 }
 
 func countKeyStatus(key string) string {
