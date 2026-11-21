@@ -227,6 +227,102 @@ Executor видит внешнюю поломку и отвечает `beacon_ac
 
 Для локальной диагностики используйте `beacon_list_running`, `beacon_stats`, `beacon inspect` и `beacon logs --tail 40 --errors`.
 
+## Конфигурация: переменные окружения
+
+Beacon читает настройки из окружения через `os.Getenv`. Отдельного файла настроек рантайма нет. Переменная `BEACON_CONFIG` задаёт путь к YAML с политикой Watch, а не к настройкам процесса. Все production-переменные собраны ниже в одном документе. Факты взяты из аудита `docs/research/config-env-audit.md` от 2026-11-21 и сверены с кодом в `cmd/`, `internal/` и `tools/`. Переменная из production-кода, которой нет в таблице, это пробел в документации.
+
+В колонке «по умолчанию» указано значение при пустой переменной. «Валидация» описывает, что код делает с неверным значением. Многие переменные молча подставляют default, поэтому опечатку нельзя заметить в логе. «Где читается» даёт файл и строку. «Риск» это практическое последствие ошибки конфига.
+
+### Пути, состояние и конфиг
+
+| Переменная | По умолчанию | Валидация | Где читается | Риск |
+| --- | --- | --- | --- | --- |
+| `BEACON_STATE_DIR` | `<XDG_STATE_HOME>/beacon/projects/<name>-<hash>` при `.git` в cwd, иначе `<XDG_STATE_HOME>/beacon` | нет, любая строка становится путём без проверки существования | `cmd/beacon/doctor.go:244,262` | опечатка даёт новый пустой store |
+| `XDG_STATE_HOME` | `~/.local/state` | нет, относительный путь остаётся относительным | `cmd/beacon/attach.go:56`, `cmd/beacon/doctor.go:299`, `internal/infra/server/config.go:51` | влияет на каталог состояния |
+| `BEACON_PROJECT_ROOT` | `os.Getwd()` | `TrimSpace`, нет проверки что каталог существует | `cmd/beacon/doctor.go:249,269`, `cmd/beacon/mcp.go:1143` | неверное значение меняет ключ проекта и store |
+| `BEACON_CONFIG` | `~/.config/beacon/config.yaml` | `TrimSpace`, отсутствующий файл не ошибка | `internal/app/orchestrator/checkall.go:70,152`, `internal/infra/mcp/tool_watch_pr.go:49,99` | опечатка молча даёт дефолтную политику |
+
+### Логи и наблюдаемость
+
+| Переменная | По умолчанию | Валидация | Где читается | Риск |
+| --- | --- | --- | --- | --- |
+| `BEACON_LOG_FORMAT` | `text` | `NewLogger` сравнивает с `json` без регистра, остальное даёт `text` без предупреждения | `cmd/beacon/observe.go:75,208` | опечатка даёт logfmt вместо JSON |
+| `BEACON_LOG_LEVEL` | `info` | `ParseLevel` принимает `debug`, `info`, `warn`, `error`; CLI пишет warning в stderr, `OpenServerLog` молча берёт `info` | `cmd/beacon/observe.go:78,203`, `observe/log.go:33,230` | поведение различается между CLI и server log |
+| `BEACON_METRICS_PORT` | пусто, endpoint не открывается | `strconv.Atoi`, bind только на `127.0.0.1`, ошибка в stderr без падения команды | `cmd/beacon/observe.go:99`, `observe/metrics.go:496,512` | `/metrics` просто не поднимется |
+| `BEACON_OTEL_ENABLED` | `false` | `EqualFold(TrimSpace(v), "true")`, значение `1` выключено | `observe/otel.go:29,157` | только литерал `true` включает экспорт |
+| `BEACON_OTEL_EXPORTER` | пусто, local slog sink | `TrimSpace`, любые значения молча дают local | `observe/otel.go:32,158` | опечатка отключает экспорт без ошибки |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | пусто, local spans | `url.Parse`, нужны scheme и host, схема не ограничена | `observe/otel.go:35,152` | POST уходит на любой адрес |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | пусто | та же проверка, перекрывает базовый endpoint | `observe/otel.go:37,153` | тот же канал с более прямым адресом |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` | `normalizeProtocol` принимает `http/json`, `json`, `grpc`; `grpc` затем отвергается экспортером и даёт local fallback | `observe/otel.go:40,160` | `grpc` отключает OTLP |
+
+### Каналы и уведомления
+
+| Переменная | По умолчанию | Валидация | Где читается | Риск |
+| --- | --- | --- | --- | --- |
+| `BEACON_CHANNELS` | `false` | `1/true/yes/on` без регистра, остальное false без предупреждения | `cmd/beacon/server.go:33,57,79-86` | выключенный ingress не защищает слэш-команды |
+| `BEACON_CHANNEL_SENDERS` | пусто, ни одного отправителя | строгая запись `sender=actor`; actor проходит `domain.NewActorID`; неверная запись даёт exit 2 | `cmd/beacon/server.go:37,60-75` | единственный источник actor для ingress без документации |
+| `BEACON_TELEGRAM_TOKEN` | пусто, sink не настроен | `TrimSpace`, формат токена не проверяется | `wake/telegram.go:22,55` | секрет в env без документации |
+| `BEACON_TELEGRAM_CHAT` | пусто | `TrimSpace` | `wake/telegram.go:23,56` | низкий |
+| `BEACON_TELEGRAM_API` | `https://api.telegram.org` | `TrimSpace`, `TrimRight("/")`, схема и хост не проверяются | `wake/telegram.go:24,57` | токен в пути запроса уходит на произвольный хост |
+| `BEACON_NTFY_URL` | `https://ntfy.sh` | `TrimSpace`, `TrimRight("/")`, схема и хост не проверяются | `wake/ntfy.go:20,23,51,68` | POST с уведомлением уходит на произвольный хост |
+| `BEACON_NTFY_TOPIC` | пусто, sink не настроен | `TrimSpace`, формат топика не проверяется | `wake/ntfy.go:21,52,85` | неверный топик молча отключает уведомления |
+| `BEACON_GITHUB_TOKEN` | пусто, затем `GITHUB_TOKEN`, затем `gh auth token` | `TrimSpace`, пустое значение молча пропускается | `github/rest.go:38,47`, `mcp/tool_get_result.go:569` | failure excerpt читает только этот токен |
+| `GITHUB_TOKEN` | пусто | `TrimSpace` | `github/rest.go:38,47` | fallback в CI, failure excerpt его игнорирует |
+| `BEACON_GITHUB_API` | `https://api.github.com` | `TrimSpace`, `TrimRight("/")`, без проверки схемы, хоста и пути | `mcp/tool_get_result.go:573-580` | Bearer-токен уходит на любой хост, переменная не управляет основным GitHub-клиентом |
+
+### HTTP, webhook, сессии и задачи
+
+| Переменная | По умолчанию | Валидация | Где читается | Риск |
+| --- | --- | --- | --- | --- |
+| `BEACON_HTTP_ADDR` | `127.0.0.1:0` | `net.SplitHostPort`, `Atoi(port)`, хост принудительно `127.0.0.1` | `cmd/beacon/mcp.go:752`, `httpapi/server.go:35,489` | опечатка роняет старт HTTP API |
+| `BEACON_WEBHOOK_ADDR` | `127.0.0.1:8788` | хост loopback, порт числовой; ошибка optional receiver не роняет MCP | `cmd/beacon/mcp.go:803`, `webhook/receiver.go:28` | низкий |
+| `BEACON_GATES` | пусто, затем `PATH`, затем `tools/beacon-gates/beacon-gates` | `os.Stat`, файл обязан существовать и не быть каталогом | `cmd/beacon/doctor.go:221-228` | только `doctor`, в проде не читается |
+| `BEACON_SESSION_ID` | пусто | `TrimSpace`, формат `ses_` не проверяется | `cmd/beacon/orchestrator.go:25,108`, `daemon.go:219` | неверный ID меняет привязку оркестратора |
+| `BEACON_PARENT_SESSION` | пусто | `TrimSpace` | `cmd/beacon/spawn.go:119,164`, `prcreate.go:35,306` | неверная адресация wake или PR-подписчика |
+| `BEACON_TASK_ID` | пусто | `TrimSpace`, формат карточки не проверяется | `cmd/beacon/attach.go:274` | низкий |
+| `BEACON_TASK_DEADLINE` | пусто | `time.Parse(RFC3339)`, неверное значение молча игнорируется | `cmd/beacon/attach.go:154-159` | дедлайн тихо теряется, запись сохраняется без него |
+| `BEACON_AGENT` | пусто | `TrimSpace`, пустое значение без флага даёт exit 1 | `cmd/beacon/task.go:212` | низкий |
+| `BEACON_ROOT` | `findProjectRoot()` | `TrimSpace` | `cmd/beacon/task.go:700` | конфликтует с `BEACON_REPO` в скриптах и `BEACON_PROJECT_ROOT` в плагине |
+
+### Демон, MCP и доставка
+
+| Переменная | По умолчанию | Валидация | Где читается | Риск |
+| --- | --- | --- | --- | --- |
+| `BEACON_DAEMON_INTERVAL` | `3m` | `ParseDuration`, значение больше нуля, неверное молча даёт `3m` | `cmd/beacon/daemon.go:25,219`, `cmd/beacon/mcp.go:60-68` | опечатка меняет цикл демона без предупреждения |
+| `BEACON_CI_POLL_INTERVAL` | `30s` | `TrimSpace`, `ParseDuration`, значение больше нуля, неверное даёт `30s` | `internal/infra/cibridge/bridge.go:23-51` | неверное значение возвращает частый опрос и много вызовов `gh` |
+| `BEACON_VERDICT_POLL_INTERVAL` | `750ms` | `ParseDuration`, значение больше нуля, неверное молча даёт `750ms` | `cmd/beacon/mcp.go:79,82-86` | меняет свежесть `beacon_wait_result` |
+| `BEACON_SYNC_CALL_TIMEOUT` | `30s`, максимум `120s` | `ParseDuration`, значение больше нуля, clamp до `120s`, неверное молча даёт `30s` | `cmd/beacon/mcp.go:213-224` | меняет поведение долгих MCP-вызовов |
+| `BEACON_INIT_EVENT` | пусто, precheck не запускается | нет | `cmd/beacon/mcp.go:172` | неверное имя блокирует старт MCP на 10s |
+| `BEACON_INIT_BYPASS` | `false` | точный switch `1/true/yes/on` без `TrimSpace` и `ToLower` | `cmd/beacon/mcp.go:173-176` | `TRUE` или ` 1` не срабатывают и дают тихий precheck failure |
+| `BEACON_INIT_EVENT_TIMEOUT` | `10s` | `ParseDuration`, значение больше нуля, неверное молча даёт `10s` | `cmd/beacon/mcp.go:177-181` | низкий |
+| `BEACON_MCP_REMOTE` | `false` | `1/true/yes/on` с `ToLower` и `TrimSpace`, остальное false | `cmd/beacon/mcp.go:381,384-389` | включает другой набор инструментов без документации |
+| `BEACON_PR_PROVIDER` | `github` | `TrimSpace`, enum не проверяется | `prcreate/config.go:11,18` | неизвестный провайдер упадёт позже |
+| `BEACON_ACP_RUNNER` | `opencode` | `TrimSpace`, исполняемый файл не проверяется | `cmd/beacon/spawn.go:249,257` | env выбирает исполняемый файл |
+| `BEACON_ACP_COMMAND` | пусто, используется runner | `TrimSpace`, полностью заменяет runner, проверки нет | `cmd/beacon/spawn.go:250,263-265` | env выбирает исполняемый файл |
+| `BEACON_ACP_ARGS` | пусто | `strings.Fields`, кавычки не интерпретируются | `cmd/beacon/spawn.go:251,266-268` | аргументы с пробелами нельзя передать |
+| `BEACON_DELIVER_ADAPTER` | пусто, остаётся installed target | `TrimSpace`, enum здесь не проверяется | `cmd/beacon/deliver.go:318,334` | опечатка молча сохраняет unsupported |
+| `BEACON_DELIVER_PI_MODE` | `queue` | `wake.ParsePiDeliveryMode`, только `queue` и `steer`, неверное значение даёт fallback | `cmd/beacon/deliver.go:319,335-340` | низкий |
+| `BEACON_DELIVER_PI_TIMEOUT` | `0`, клиентский default | `ParseDuration`, значение больше нуля, неверное даёт fallback | `cmd/beacon/deliver.go:320,341-348` | низкий |
+
+### Имена вне production-рантайма
+
+Следующие имена встречаются в документации и скриптах, но production Go-код их не читает. Оператору не стоит добавлять их в конфиг сервиса.
+
+- `BEACON_REPO` читают только `scripts/verify-beacon.sh` и `scripts/verify-daemon.sh`. Это корень для проверок, а не настройка сервиса. Рядом живут `BEACON_ROOT` в task CLI и `BEACON_PROJECT_ROOT` в плагине. У трёх имён разные default и consumer.
+- `BEACON_WAKE_TARGET`, `BEACON_CONTRACT_TEST` и `BEACON_W10A_ACP_MOCK` живут только в тестах. Настоящая цель wake берётся из конфига через `BEACON_CONFIG`.
+- `BEACON_HOME`, `BEACON_PERF_WATCHES`, `BEACON_GRAPHQL_URL`, `BEACON_MCP_SRC`, `BEACON_E2E_INSPECTOR` относятся к dropped-карточкам, харнесу eval, perf-скриптам и e2e-тестам.
+- `BEACON_ALLOW_MAIN_COMMIT` читает pre-commit hook, который ставит `beacon init`. Значение `1` разрешает коммит в `main` или `master`. Это guard разработчика, а не настройка сервиса.
+- `BEACON_PERF_SEED_USED` и `BEACON_PID` живут внутри `tools/perf/measure.sh` и нужны только самому скрипту.
+- Переменные `OTEL_SDK_DISABLED`, `OTEL_NOOP_BY_DEFAULT` и другие OTEL-имена из eval-сценариев код сервиса не читает.
+
+Проверить полноту таблицы можно командой из корня репозитория. Она печатает имена `BEACON_*` из production-каталогов, которых нет в `README.md`. Каждый результат должен быть либо добавлен в таблицу, либо отнесён к исключениям выше.
+
+```bash
+rg -o --no-filename 'BEACON_[A-Z0-9_]+' cmd internal tools \
+  | sort -u \
+  | while read -r v; do rg -q "$v" README.md || echo "$v"; done
+```
+
 ## Живой контур и API
 
 `beacon watch --live` уже работает в коде на `main`. Команда подключается к фоновому сервису OpenCode через тонкий HTTP-клиент. Адрес и пароль берутся из `$XDG_STATE_HOME/opencode/service.json`, авторизация Basic. Подписка идёт на `GET /api/event?types=session.status,session.execution.started`. На каждом событии команда перечитывает снимок Beacon и список сессий через `GET /api/session`, затем печатает таблицу `WATCH | VERDICT | REVISION | SESSION | AGENT | OPENCODE STATE | ATTENTION`. Готовность берётся из вердикта Beacon, а не из `idle` OpenCode. После обрыва SSE клиент переподключается и перечитывает состояние, прошедшие события не проигрываются, потому что поток истории не хранит. Флаг `--interval` задаёт период предохранительного перечитывания, а не замену подписки. Если источник событий не подключён, команда честно падает с ошибкой.
