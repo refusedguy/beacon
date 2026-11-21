@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -10,8 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
@@ -21,9 +25,32 @@ import (
 // protected; everything else with `opencode serve --hostname` is an orphan.
 
 const (
-	gcKindServe    gcKind = "serve"
-	gcReasonOrphan        = "orphan"
+	gcKindServe      gcKind = "serve"
+	gcKindObligation gcKind = "obligation"
+	gcReasonOrphan          = "orphan"
 )
+
+// gcObligationStore is the slice of the state store the collector needs. The
+// production store implements it; tests install a fake with the same method.
+type gcObligationStore interface {
+	GCObligations(ctx context.Context, now time.Time, retention time.Duration, apply bool) ([]store.ObligationGCItem, error)
+}
+
+// gcObligationsForGC opens the state store, collects the obligations of closed
+// Watches and erases them on apply. The store owns the eligibility rule and the
+// erase ledger; this seam only supplies the CLI's clock and retention window.
+var gcObligationsForGC = func(c *CLI, apply bool) ([]store.ObligationGCItem, error) {
+	s, closeStore, err := makeInspectStore(c)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	defer func() { _ = closeStore() }()
+	gs, ok := s.(gcObligationStore)
+	if !ok {
+		return nil, errors.New("store не поддерживает чистку обязательств")
+	}
+	return gs.GCObligations(context.Background(), gcNow(), store.ObligationGCRetention, apply)
+}
 
 // The seams keep process discovery and termination out of the command's code
 // path in tests. Production falls through to the infra package.
@@ -130,9 +157,25 @@ func runGCWithServe(c *CLI, args []string) int {
 	servePlan := gcServePlan(serves, gcServicePID(), servicePort, recorded, hasRecord)
 	plan = append(plan, servePlan...)
 
+	// The store selects obligations of closed Watches past the replay window.
+	// One call plans a dry run and erases on --apply, so the report lists the
+	// exact rows that were removed.
+	obligations, err := gcObligationsForGC(c, *apply)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc: обязательства: %v\n", err)
+		return 2
+	}
+	obligationItems := make([]gcItem, 0, len(obligations))
+	for _, o := range obligations {
+		obligationItems = append(obligationItems, gcItem{Kind: gcKindObligation, ID: o.ID, Reason: o.Reason})
+	}
+	if !*apply {
+		plan = append(plan, obligationItems...)
+	}
+
 	if !*apply {
 		if *format == "json" {
-			if err := renderGCJSON(c.out, gcResult{Mode: "dry-run", Items: plan}); err != nil {
+			if err := renderGCJSON(c.out, gcResult{Mode: "dry-run", Removed: len(plan), Items: plan}); err != nil {
 				fmt.Fprintf(c.errOut, "beacon gc: %v\n", err)
 				return 2
 			}
@@ -176,6 +219,7 @@ func runGCWithServe(c *CLI, args []string) int {
 			Reason: gcReasonDead,
 		})
 	}
+	removed = append(removed, obligationItems...)
 	if removed == nil {
 		removed = []gcItem{}
 	}
