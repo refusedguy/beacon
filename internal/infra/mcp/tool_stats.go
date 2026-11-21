@@ -35,8 +35,8 @@ const (
 	// loadErrors, so a reader can tell it from a state load failure (T5.64).
 	activeWatchWarningPrefix = "active watch limit warning: "
 	// blockedWatchPrefix marks the blocked-watch count inside loadErrors. The
-	// derived beacon_stats schema forbids extra properties, so the count rides
-	// in the diagnostic array like the plan-limit and wait metrics (T3.440).
+	// count also has its own StatsOutput.Blocked field (T3.440), but the
+	// diagnostic stays for readers that already parse it from loadErrors.
 	blockedWatchPrefix = "blocked watches: "
 	// graphReadyPrefix marks the graph readiness marker inside loadErrors. The
 	// schema of beacon_stats is derived from StatsOutput in schema.go, a file
@@ -368,8 +368,9 @@ func (i WaitTelemetryInfo) entry() string {
 }
 
 // Handle copies the values already present in a state snapshot into the stats
-// response. It appends a plan-limit warning to loadErrors when a threshold is
-// crossed, an active-watch limit warning once per 75%/90% crossing (T5.64),
+// response. Blocked reports the number of watches with a blocked status or a
+// block record. It appends a plan-limit warning to loadErrors when a
+// threshold is crossed, an active-watch limit warning once per 75%/90% crossing (T5.64),
 // and, when the reader also exposes wait samples, an idle metric with the wait
 // share and the mean worker count (ADR 0056 p6). If a registry port is bound,
 // the three T5.60 counters come from it; a failed read is recorded in
@@ -390,15 +391,9 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 	activeWatches := len(radar)
 	loadErrors := make([]string, len(snap.LoadErrors))
 	copy(loadErrors, snap.LoadErrors)
-	// T3.440: show blocked watches in stats. Count the watches that carry a
-	// blocked status or a block record. Append the count only when it is
-	// non-zero, so a snapshot without blocked watches keeps the old response.
-	blockedWatches := 0
-	for _, w := range radar {
-		if w.Status == domain.StatusBlocked || w.Blocked != nil {
-			blockedWatches++
-		}
-	}
+	// T3.440: show blocked watches in stats. The field carries the count; the
+	// diagnostic stays only for readers that already parse loadErrors.
+	blockedWatches := blockedWatchCount(radar)
 	if blockedWatches > 0 {
 		loadErrors = append(loadErrors, fmt.Sprintf("%s%d", blockedWatchPrefix, blockedWatches))
 	}
@@ -447,6 +442,7 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		PointsThisHour: snap.PointsThisHour,
 		Budget:         snap.Budget,
 		ActiveWatches:  activeWatches,
+		Blocked:        blockedWatches,
 		Persist: PersistInfo{
 			Seq:       snap.PersistSeq,
 			LastError: snap.LastPersistErr,
@@ -517,16 +513,17 @@ func activeWatchWarnings(out StatsOutput) []string {
 	return warnings
 }
 
-// blockedWatchCount returns the blocked-watch entry in a stats response, if
-// any. Like the other helpers it keeps the caller independent of the entry's
-// position in loadErrors.
-func blockedWatchCount(out StatsOutput) string {
-	for _, entry := range out.LoadErrors {
-		if strings.HasPrefix(entry, blockedWatchPrefix) {
-			return entry
+// blockedWatchCount counts watches that are blocked by status or by a block
+// record. A watch with both is counted once. The handler calls it on the radar
+// watches and reports the result as StatsOutput.Blocked (T3.440).
+func blockedWatchCount(watches []domain.Watch) int {
+	count := 0
+	for _, w := range watches {
+		if w.Status == domain.StatusBlocked || w.Blocked != nil {
+			count++
 		}
 	}
-	return ""
+	return count
 }
 
 // graphReadyEntry returns the graph readiness marker present in a stats
