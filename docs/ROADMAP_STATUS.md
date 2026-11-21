@@ -3,7 +3,7 @@
 Триаж `docs/tasks/` по состоянию main после Waves 1–4 (2026-11-20).
 
 Дата пересчёта: 2026-11-21
-Baseline SHA: 05996df6c723b05fffb03cf20b29002e69a0df98
+Baseline SHA: e71e117e7071d58479308c4cec7967657658b5a2
 
 - Закрыто done: **607**
 - Переведено dropped: **326**
