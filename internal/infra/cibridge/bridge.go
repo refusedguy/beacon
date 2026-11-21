@@ -150,6 +150,16 @@ type Rebaser interface {
 	Rebase(ctx context.Context, repo string, pr int) (newHeadSHA string, err error)
 }
 
+// CardLinks closes the task card linked to a Watch. It is a narrow
+// control-plane port declared here so cibridge does not import the store
+// adapter or a card writer (ADR 0005). The production adapter reads the
+// card_links row for watchID, sets that card to done and appends the PR to its
+// confirmation section. CloseMerged must be idempotent by watchID: a repeated
+// merged observation writes the card once.
+type CardLinks interface {
+	CloseMerged(ctx context.Context, watchID string, pr int, at time.Time) error
+}
+
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider,
 // one Store and the optional control-plane ports, so a refresh is a batched
 // read followed by ordered writes.
@@ -159,6 +169,7 @@ type Bridge struct {
 	batch          domain.BatchCIProvider
 	merger         domain.Merger
 	control        blockerControl
+	cardLinks      CardLinks
 	clock          domain.Clock
 	interval       time.Duration
 	waker          domain.WakeDeliverer
@@ -367,6 +378,16 @@ func (b *Bridge) WithBlockerControl(c blockerControl) *Bridge {
 	return b
 }
 
+// WithCardLinks binds the card-closing port. Without one a merged Watch still
+// closes and resolves blockers, but no task card is marked done.
+func (b *Bridge) WithCardLinks(c CardLinks) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.cardLinks = c
+	return b
+}
+
 // WithEscalationWriter replaces the ESCALATIONS.md appender. It is mainly a
 // test seam; production leaves the file writer installed.
 func (b *Bridge) WithEscalationWriter(fn escalationWriter) *Bridge {
@@ -399,6 +420,9 @@ func New(store domain.Store, ci domain.CIProvider, clock domain.Clock, interval 
 	}
 	if c, ok := store.(blockerControl); ok {
 		b.control = c
+	}
+	if c, ok := store.(CardLinks); ok {
+		b.cardLinks = c
 	}
 	return b
 }
@@ -1081,6 +1105,20 @@ func (b *Bridge) applyMerged(ctx context.Context, w domain.Watch, obs ciObservat
 	return n
 }
 
+// closeLinkedCard marks the card linked to a Watch as done. closeWatch calls it
+// only for a merged verdict, so a hold never reaches it. The port owns the
+// card_links lookup and the card file write. An unbound port only skips the
+// card write, and a port failure is logged without blocking the Watch close or
+// blocker resolution.
+func (b *Bridge) closeLinkedCard(ctx context.Context, w domain.Watch, at time.Time) {
+	if b == nil || b.cardLinks == nil || w.ID == "" {
+		return
+	}
+	if err := b.cardLinks.CloseMerged(ctx, w.ID, w.PR, at); err != nil {
+		observe.ActorError("cibridge-card-close", w.ID, err)
+	}
+}
+
 // closeWatch applies a terminal verdict and marks each subscriber finished.
 // It never wakes anyone: a closed Watch has no further work for a subscriber.
 func (b *Bridge) closeWatch(ctx context.Context, w domain.Watch, verdict domain.Verdict, now time.Time, cycleID string) int {
@@ -1097,6 +1135,9 @@ func (b *Bridge) closeWatch(ctx context.Context, w domain.Watch, verdict domain.
 	if err := b.store.SaveWatch(next); err != nil {
 		observe.ActorError("cibridge-close", next.ID, err)
 		return 0
+	}
+	if verdict == domain.VerdictMerged {
+		b.closeLinkedCard(ctx, w, now)
 	}
 	// The terminal verdict is still readable at the new revision, so get_result
 	// can confirm the close without a wake.

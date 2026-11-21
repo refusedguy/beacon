@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -1446,5 +1448,147 @@ func TestWakeTextStaleBaseRebaseIncludesReason(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Fatalf("wake text %q missing %q", text, want)
 		}
+	}
+}
+
+// cardCloseCall records one CloseMerged invocation. It carries the arguments
+// the card-links port needs to find the card and write its confirmation.
+type cardCloseCall struct {
+	watchID string
+	pr      int
+	at      time.Time
+}
+
+// recordingCardLinks stands in for the production card-links adapter. It
+// writes a real card file the same way: flip the status to done and append the
+// PR to the confirmation section. Calls are recorded so a test can prove that
+// cibridge invoked the port with the right Watch and PR.
+type recordingCardLinks struct {
+	cardID string
+	dir    string
+	calls  []cardCloseCall
+	err    error
+}
+
+func (r *recordingCardLinks) CloseMerged(_ context.Context, watchID string, pr int, at time.Time) error {
+	r.calls = append(r.calls, cardCloseCall{watchID: watchID, pr: pr, at: at})
+	if r.err != nil {
+		return r.err
+	}
+	path := filepath.Join(r.dir, r.cardID+".md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	text := strings.Replace(string(raw), "Статус: todo", "Статус: done", 1)
+	text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n", pr, at.UTC().Format("2006-01-02"))
+	return os.WriteFile(path, []byte(text), 0644)
+}
+
+// linkedCard creates a fresh todo card and a port that closes it.
+func linkedCard(t *testing.T, id string) (*recordingCardLinks, string) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, id+".md")
+	card := fmt.Sprintf("# %s. тестовая карточка\nСтатус: todo\n\nЦель: тест\n", id)
+	if err := os.WriteFile(path, []byte(card), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return &recordingCardLinks{cardID: id, dir: dir}, path
+}
+
+func assertCardClosed(t *testing.T, links *recordingCardLinks, path, watchID string, pr int) {
+	t.Helper()
+	if len(links.calls) != 1 {
+		t.Fatalf("CloseMerged calls = %d, want 1", len(links.calls))
+	}
+	call := links.calls[0]
+	if call.watchID != watchID || call.pr != pr {
+		t.Fatalf("CloseMerged call = %+v, want watch %s pr %d", call, watchID, pr)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), "Статус: done") {
+		t.Fatalf("card status is not done: %q", raw)
+	}
+	if !strings.Contains(string(raw), fmt.Sprintf("PR #%d MERGED", pr)) {
+		t.Fatalf("card confirmation lacks PR %d: %q", pr, raw)
+	}
+}
+
+// TestMergedReportClosesLinkedCard covers the path where GitHub reports a
+// merged PR. applyMerged must close the Watch and the linked card.
+func TestMergedReportClosesLinkedCard(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	w := domain.Watch{
+		ID:   "watch:refusedguy/beacon:406:" + head,
+		Repo: "refusedguy/beacon", PR: 406, HeadSHA: head,
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if _, err := db.Link("IDX-08", w.ID, w.PR); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	links, cardPath := linkedCard(t, "IDX-08")
+	ci := mergedBatchCI{snaps: map[string]domain.PRSnapshot{w.ID: mergedSnapshot(head)}}
+	b := New(db, ci, fixedClock{at: time.Unix(1, 0)}, time.Second).WithCardLinks(links)
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+	assertCardClosed(t, links, cardPath, w.ID, w.PR)
+}
+
+// TestAutoMergeSuccessClosesLinkedCard covers the path where the bridge merges
+// the PR itself. A confirmed merge is terminal and must close the card too.
+func TestAutoMergeSuccessClosesLinkedCard(t *testing.T) {
+	db, w := mergeTestWatch(t)
+	defer db.Close()
+	if _, err := db.Link("IDX-08", w.ID, w.PR); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	links, cardPath := linkedCard(t, "IDX-08")
+	b := New(db, fakeCI{state: mergeTestState()}, fixedClock{at: time.Unix(1, 0)}, time.Second).
+		WithMerger(fakeMerger{merged: true}).WithWaker(&recordingWaker{}).WithCardLinks(links)
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+	assertCardClosed(t, links, cardPath, w.ID, w.PR)
+}
+
+// TestHeldMergeLeavesCardUnchanged proves a held merge is not terminal: the
+// card stays todo and no confirmation is written.
+func TestHeldMergeLeavesCardUnchanged(t *testing.T) {
+	db, w := mergeTestWatch(t)
+	defer db.Close()
+	if _, err := db.Link("IDX-08", w.ID, w.PR); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	links, cardPath := linkedCard(t, "IDX-08")
+	b := New(db, fakeCI{state: mergeTestState()}, fixedClock{at: time.Unix(1, 0)}, time.Second).
+		WithMerger(fakeMerger{held: true, reason: "merge conflict"}).
+		WithWaker(&recordingWaker{}).WithCardLinks(links)
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+	if len(links.calls) != 0 {
+		t.Fatalf("CloseMerged calls = %d, want 0 on hold", len(links.calls))
+	}
+	raw, err := os.ReadFile(cardPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), "Статус: todo") || strings.Contains(string(raw), "Подтверждение") {
+		t.Fatalf("hold changed the card: %q", raw)
 	}
 }
