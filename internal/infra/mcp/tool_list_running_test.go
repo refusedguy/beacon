@@ -3,13 +3,17 @@ package mcp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -899,6 +903,122 @@ func TestListRunningDoesNotMutateRegistry(t *testing.T) {
 
 	if !reflect.DeepEqual(reader.snap.Registry, before) {
 		t.Errorf("registry was mutated: %#v -> %#v", before, reader.snap.Registry)
+	}
+}
+
+// limitWatchSnapshot builds a snapshot with exactly n watches for the response
+// limit controls.
+func limitWatchSnapshot(n int) StateSnapshot {
+	watches := make([]domain.Watch, n)
+	for i := range watches {
+		watches[i] = sampleWatch(fmt.Sprintf("limit-w-%d", i), domain.VerdictWatching, 0)
+	}
+	return StateSnapshot{ActiveWatches: watches}
+}
+
+// assertLimitError checks the error a caller can branch on and the hint the
+// tool must show when it refuses an oversized response.
+func assertLimitError(t *testing.T, err error, wantText ...string) {
+	t.Helper()
+	var app *domain.AppError
+	if !errors.As(err, &app) || app.Code != domain.CodeLimitExceeded {
+		t.Fatalf("error = %v, want LIMIT_EXCEEDED", err)
+	}
+	for _, text := range wantText {
+		if !strings.Contains(app.Message, text) {
+			t.Errorf("error message %q missing %q", app.Message, text)
+		}
+	}
+}
+
+func TestListRunningRecordLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		watches int
+		wantErr bool
+	}{
+		{"empty", 0, false},
+		{"at limit", listRunningMaxRecords, false},
+		{"over limit", listRunningMaxRecords + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := NewListRunningHandler(&snapshotReaderFake{snap: limitWatchSnapshot(tc.watches)})
+			_, out, err := handler.Handle(context.Background(), nil, ListRunningInput{})
+			if tc.wantErr {
+				assertLimitError(t, err, "200-record", "filters.verdict", "cursor")
+				return
+			}
+			if err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(out.Watches) != tc.watches || len(out.Events) != tc.watches {
+				t.Fatalf("watches=%d events=%d, want %d of each", len(out.Watches), len(out.Events), tc.watches)
+			}
+		})
+	}
+}
+
+func TestListRunningByteLimit(t *testing.T) {
+	snap := StateSnapshot{ActiveWatches: []domain.Watch{{
+		ID:        "w-huge",
+		Status:    domain.StatusWatching,
+		Verdict:   domain.VerdictWatching,
+		BlockerID: strings.Repeat("b", listRunningMaxBytes+1),
+	}}}
+	_, _, err := NewListRunningHandler(&snapshotReaderFake{snap: snap}).Handle(context.Background(), nil, ListRunningInput{})
+	assertLimitError(t, err, "262144-byte", "filters.verdict")
+}
+
+// TestListRunningLimitRefusalKeepsCursor proves a refused call cannot consume
+// the client's place in the event stream. The retry with the same cursor still
+// sees the events added after the refusal.
+func TestListRunningLimitRefusalKeepsCursor(t *testing.T) {
+	reader := &snapshotReaderFake{snap: limitWatchSnapshot(2)}
+	handler := NewListRunningHandler(reader)
+	first := callListRunning(t, handler, ListRunningInput{})
+	second := callListRunning(t, handler, ListRunningInput{Cursor: first.Cursor})
+	if len(second.Events) != 0 {
+		t.Fatalf("events on unchanged snapshot = %+v, want none", second.Events)
+	}
+	if handler.cursor != 2 {
+		t.Fatalf("cursor after second call = %d, want 2", handler.cursor)
+	}
+
+	reader.snap = limitWatchSnapshot(listRunningMaxRecords + 1)
+	_, _, err := handler.Handle(context.Background(), nil, ListRunningInput{Cursor: first.Cursor})
+	assertLimitError(t, err, "200-record", "cursor")
+	if handler.cursor != 2 {
+		t.Fatalf("cursor after refusal = %d, want 2", handler.cursor)
+	}
+
+	reader.snap = limitWatchSnapshot(3)
+	out := callListRunning(t, handler, ListRunningInput{Cursor: first.Cursor})
+	if len(out.Events) != 1 || out.Events[0].WatchID != "limit-w-2" {
+		t.Fatalf("events after retry = %+v, want only the third watch", out.Events)
+	}
+}
+
+func TestListRunningLimitIsToolError(t *testing.T) {
+	session := connectTestSession(t, Dependencies{Snapshot: SnapshotFunc(func() (StateSnapshot, error) {
+		return limitWatchSnapshot(listRunningMaxRecords + 1), nil
+	})})
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_list_running",
+		Arguments: ListRunningInput{},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_list_running: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("oversized list_running did not set isError: %+v", result.StructuredContent)
+	}
+	body, err := json.Marshal(result.Content)
+	if err != nil {
+		t.Fatalf("marshal error content: %v", err)
+	}
+	if !strings.Contains(string(body), "200-record") || !strings.Contains(string(body), "filters.verdict") {
+		t.Fatalf("tool error text = %s, want the limit and the narrowing hint", body)
 	}
 }
 

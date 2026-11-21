@@ -73,6 +73,14 @@ const failureExcerptLimit = 2048
 // rendered per failed check.
 const failureExcerptAnnotationCount = 8
 
+// The ceilings bound the failed-check array and the encoded result response.
+const (
+	getResultMaxRecords = 200
+	getResultMaxBytes   = 256 * 1024
+)
+
+const getResultNarrowHint = "narrow the request by reading a watchID with fewer failedChecks; includeChecks does not reduce the response"
+
 // resultStoreReader is the narrow read port used by beacon_get_result and
 // beacon_ack. It is satisfied by the store and by test doubles. The core only
 // reads; every write goes through ObligationStamper.
@@ -412,16 +420,10 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 		return GetResultOutput{}, mapResultReadError(err, "get_result: obligation")
 	}
 
-	if _, _, err := h.stamper.StampRead(ctx, obligationID, h.clock.Now()); err != nil {
-		observe.ActorError("get_result-stamp", in.WatchID, err)
-		return GetResultOutput{}, err
-	}
-
-	observe.ResultRead(w.ID, string(w.Verdict), w.Revision)
 	failed := collectFailedChecks(w)
 	excerpt := h.attachFailureExcerpts(ctx, w, failed)
 	action, command, hint := nextStepFor(w.Verdict)
-	return GetResultOutput{
+	out := GetResultOutput{
 		Status:         string(w.Status),
 		Verdict:        string(w.Verdict),
 		Revision:       w.Revision,
@@ -434,7 +436,21 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 		NextHint:       hint,
 		FailureExcerpt: excerpt,
 		ConfigID:       w.ConfigID,
-	}, nil
+	}
+
+	// Refuse before the read stamp: a response the caller never receives must
+	// not consume the obligation's single readAt fact.
+	limits := responseLimits{records: getResultMaxRecords, bytes: getResultMaxBytes}
+	if err := checkResponseLimits("beacon_get_result", "failedCheck", len(out.FailedChecks), limits, getResultNarrowHint, out); err != nil {
+		return GetResultOutput{}, err
+	}
+
+	if _, _, err := h.stamper.StampRead(ctx, obligationID, h.clock.Now()); err != nil {
+		observe.ActorError("get_result-stamp", in.WatchID, err)
+		return GetResultOutput{}, err
+	}
+	observe.ResultRead(w.ID, string(w.Verdict), w.Revision)
+	return out, nil
 }
 
 // --- Failure excerpts (W11-B) ----------------------------------------------

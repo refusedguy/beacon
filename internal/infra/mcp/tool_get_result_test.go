@@ -16,6 +16,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
@@ -1809,5 +1811,102 @@ func TestSQLFailureExcerptCachePersists(t *testing.T) {
 	}
 	if _, ok, _ := cache.Get(context.Background(), "w-1", "new-sha", "ci/failure"); ok {
 		t.Error("a new head SHA must miss the cache")
+	}
+}
+
+// limitResultFixture builds a stored watch with exactly n failed checks and
+// the obligation the caller needs to read it.
+func limitResultFixture(t *testing.T, n int) (domain.Watch, *memStore, *recordingStamper, *stepClock) {
+	t.Helper()
+	w := resultFixture(domain.VerdictKeepWorking)
+	w.Checks = make(map[string]domain.Check, n)
+	for i := 0; i < n; i++ {
+		w.Checks[fmt.Sprintf("ci/fail-%03d", i)] = domain.Check{
+			State: "FAILURE", Conclusion: "FAILURE", Required: true,
+		}
+	}
+	o := resultObligation(w, "session-limit")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	return w, store, stamper, &stepClock{t: time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)}
+}
+
+func TestGetResultRecordLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		checks  int
+		wantErr bool
+	}{
+		{"empty", 0, false},
+		{"at limit", getResultMaxRecords, false},
+		{"over limit", getResultMaxRecords + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, store, stamper, clock := limitResultFixture(t, tc.checks)
+			h := NewGetResultHandler(store, stamper, clock)
+			h.SetFailureExcerptSource(nil)
+			_, out, err := h.Handle(context.Background(), sessionReq("session-limit"), GetResultInput{WatchID: w.ID})
+			if tc.wantErr {
+				assertLimitError(t, err, "200-failedCheck", "fewer failedChecks")
+				if stamper.readCalls != 0 {
+					t.Fatalf("refused result consumed the read stamp: %d stamps", stamper.readCalls)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(out.FailedChecks) != tc.checks {
+				t.Fatalf("failedChecks = %d, want %d", len(out.FailedChecks), tc.checks)
+			}
+			if stamper.readCalls != 1 {
+				t.Fatalf("read stamps = %d, want 1", stamper.readCalls)
+			}
+		})
+	}
+}
+
+func TestGetResultByteLimit(t *testing.T) {
+	w, store, stamper, clock := limitResultFixture(t, 1)
+	check := w.Checks["ci/fail-000"]
+	check.DetailsURL = strings.Repeat("u", getResultMaxBytes+1)
+	w.Checks["ci/fail-000"] = check
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	h := NewGetResultHandler(store, stamper, clock)
+	h.SetFailureExcerptSource(nil)
+	_, _, err := h.Handle(context.Background(), sessionReq("session-limit"), GetResultInput{WatchID: w.ID})
+	assertLimitError(t, err, "262144-byte", "fewer failedChecks")
+}
+
+func TestGetResultLimitIsToolError(t *testing.T) {
+	_, store, stamper, clock := limitResultFixture(t, getResultMaxRecords+1)
+	session := connectTestSession(t, Dependencies{Store: store, Stamper: stamper, Clock: clock})
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_get_result",
+		Arguments: GetResultInput{WatchID: "w-1"},
+		Meta:      mcpsdk.Meta{sessionIDMetaKey: "session-limit"},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_get_result: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("oversized result did not set isError: %+v", result.StructuredContent)
+	}
+	body, err := json.Marshal(result.Content)
+	if err != nil {
+		t.Fatalf("marshal error content: %v", err)
+	}
+	if !strings.Contains(string(body), "200-failedCheck") || !strings.Contains(string(body), "fewer failedChecks") {
+		t.Fatalf("tool error text = %s, want the limit and the narrowing hint", body)
 	}
 }
