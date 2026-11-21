@@ -1,6 +1,6 @@
+# IDX-06. Схема и регистрация claim инструмента
 Premise: проверено 2026-11-21 по origin/main. ADR 0094 (docs/adrs/0094-seven-tools.md, раздел «Приёмка») прямо требует отдельного решения или ADR на девятый инструмент. Контракт в `internal/infra/mcp/contract_test.go` имел ровно восемь имён в `expectedToolNames`, восемь записей в `toolsListOrder` и восемь в `expectedToolKinds`; золотые константы описывали ответ `tools/list` для восьми инструментов. Инструмент `beacon_task_claim` в реестре отсутствовал. Реализация обработчика принадлежит IDX-05 (`tool_task_claim.go`, `tool_task_claim_test.go`) и в этой карточке не дублируется.
 baseline: `git show origin/main:docs/adrs/0094-seven-tools.md | grep -n 'Девятый инструмент требует отдельного решения или ADR'` = строка приёмки; `git show origin/main:internal/infra/mcp/contract_test.go | grep -c 'beacon_'` = 24 упоминания восьми имён до правки; `grep -n 'toolsListByteCount' internal/infra/mcp/contract_test.go` = 16336 байт и SHA-256 `315a91fb62d576668aaecf4f1c2b3caaee3f06347c52edf4a771d74ab2c9ddd1` для восьми инструментов; `grep -n 'ToolNames' internal/infra/mcp/server.go` = список из восьми имён; бюджет `toolsListByteBudget` = 16 * 1024 байт.
-# IDX-06. Схема и регистрация claim инструмента
 Статус: todo
 Фаза: P1
 Тип: task
