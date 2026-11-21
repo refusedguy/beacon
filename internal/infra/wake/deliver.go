@@ -81,6 +81,10 @@ type OpenCodeDeliverer struct {
 	// LeaseGuard serializes delivery per target. Deliver builds one with the
 	// default ttl when nil; set a restored guard here after a restart.
 	LeaseGuard *DeliveryLeaseGuard
+	// DraftAware, when set, replaces the immediate PromptFunc/CLI path with
+	// verified composer/draft delivery (T3.244). A nil value keeps the default
+	// behavior: the whole Envelope is steered into the session at once.
+	DraftAware domain.WakeDeliverer
 
 	mu   sync.Mutex
 	seen map[wakeDeliveryKey]struct{}
@@ -267,6 +271,16 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	}
 
 	text := Envelope(p)
+	if d.DraftAware != nil {
+		// Draft-aware mode stages the pointer into the composer and presses
+		// Enter only after the composer text matches the expected Envelope.
+		// A refusal is returned verbatim and does not mark the obligation
+		// delivered, so it stays retryable (T3.244).
+		if err := d.DraftAware.Deliver(ctx, sessionID, p); err != nil {
+			return err
+		}
+		return d.markDelivered(key, p)
+	}
 	if d.PromptFunc != nil {
 		err := d.PromptFunc(ctx, sessionID, text, delivery)
 		switch {
