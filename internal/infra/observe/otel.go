@@ -449,8 +449,8 @@ func (e *OTLPExporter) Flush(ctx context.Context) error {
 }
 
 // Shutdown flushes the remaining batch and closes idle connections. Callers
-// invoke it on process exit; a dead collector returns an error but never stops
-// the command.
+// invoke it on process exit. A dead collector returns an error; the CLI treats
+// that unconfirmed drain as a failed shutdown and exits nonzero.
 func (e *OTLPExporter) Shutdown(ctx context.Context) error {
 	err := e.Flush(ctx)
 	e.mu.Lock()
