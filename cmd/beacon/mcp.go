@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/server"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 	"github.com/refusedguy/beacon/internal/infra/webhook"
 	"github.com/refusedguy/beacon/internal/infra/worktree"
@@ -51,7 +53,7 @@ type deferredCardLinks struct {
 
 var _ cibridge.CardLinks = (*deferredCardLinks)(nil)
 
-func (l *deferredCardLinks) CloseMerged(_ context.Context, watchID string, pr int, at time.Time) error {
+func (l *deferredCardLinks) CloseMerged(ctx context.Context, watchID string, pr int, at time.Time) error {
 	if l == nil || l.db == nil {
 		return nil
 	}
@@ -70,7 +72,50 @@ func (l *deferredCardLinks) CloseMerged(_ context.Context, watchID string, pr in
 			return err
 		}
 	}
+
+	// A watch may also carry an ordinary card link written by beacon_watch_pr.
+	// Closing it here makes MERGED move any linked card to done, not only the
+	// WIRING-* cards that come from the deferred queue.
+	cardID, err := linkedCardID(ctx, l.db, watchID)
+	if err != nil {
+		observe.ActorError("card-link-lookup", watchID, err)
+		return err
+	}
+	if cardID == "" {
+		return nil
+	}
+	if err := closeLinkedCardFile(l.root, cardID, pr, at); err != nil {
+		return err
+	}
+	_, _ = l.db.Unlink(cardID)
 	return nil
+}
+
+// linkedCardID reads the card bound to a watch from card_links. The table is
+// created on first use by store.Link, so the CREATE here only matters when a
+// watch registers without a cardID. A missing row is not an error.
+func linkedCardID(ctx context.Context, db *store.DB, watchID string) (string, error) {
+	if db == nil || strings.TrimSpace(watchID) == "" {
+		return "", nil
+	}
+	cardID := ""
+	err := db.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS card_links (
+  card_id  TEXT NOT NULL PRIMARY KEY,
+  watch_id TEXT NOT NULL,
+  pr       INTEGER NOT NULL
+)`); err != nil {
+			return err
+		}
+		return tx.QueryRow(`SELECT card_id FROM card_links WHERE watch_id = ? LIMIT 1`, watchID).Scan(&cardID)
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return cardID, nil
 }
 
 // wiringCardWriteFile is the capabilities-gate seam for writing a card. The
@@ -102,6 +147,35 @@ func closeWiringCard(root string, pr int, at time.Time) error {
 	text = strings.Replace(text, "Статус: todo", "Статус: done", 1)
 	text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n",
 		pr, at.UTC().Format("2006-01-02"))
+	return wiringCardWriteFile(path, []byte(text), 0o644)
+}
+
+// closeLinkedCardFile flips the card linked to a merged Watch to done. The PR
+// marker makes the write idempotent: a repeated merged observation leaves the
+// card unchanged. setCardField owns the field edit, so the result still parses
+// with taskstore.LoadCards.
+func closeLinkedCardFile(root, cardID string, pr int, at time.Time) error {
+	if root == "" || strings.TrimSpace(cardID) == "" || pr <= 0 {
+		return nil
+	}
+	path := filepath.Join(root, "docs", "tasks", strings.TrimSpace(cardID)+".md")
+	raw, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	text := string(raw)
+	marker := fmt.Sprintf("PR #%d MERGED", pr)
+	if strings.Contains(text, marker) {
+		return nil
+	}
+	text = setCardField(text, "Статус", "done")
+	text = setCardField(text, "Состояние", "")
+	text = setCardField(text, "Вопрос", "")
+	text += fmt.Sprintf("\n## Подтверждение\n- %s: %s (squash).\n",
+		marker, at.UTC().Format("2006-01-02"))
 	return wiringCardWriteFile(path, []byte(text), 0o644)
 }
 
@@ -431,10 +505,77 @@ func newMCPServer(deps mcp.Dependencies) *mcpsdk.Server {
 	s := mcp.NewServerWithDeps(deps)
 	mcp.AttachWaitResult(s, newMCPWaitResult(deps))
 	// The generic server knows no project root. Bind watch_pr here so every
-	// Watch inherits this project's flaky set and layered limits.
-	mcp.AttachWatchPRWithConfig(s, deps, projectRootForConfig())
+	// Watch inherits this project's flaky set and layered limits. The local
+	// adapter also records the optional cardID link for merged-card closing.
+	attachWatchPRWithCardLink(s, deps, projectRootForConfig())
 	mcp.AttachWake(s, newMCPWakeHandler(deps))
 	return s
+}
+
+// watchPRInputWithCard is the tool input at the CLI boundary. It embeds the
+// mcp-owned input so every existing argument keeps its schema and validation,
+// and adds the optional cardID that binds a Watch to the card a merged PR must
+// close. The mcp package stays unaware of the card link.
+type watchPRInputWithCard struct {
+	mcp.WatchPRInput
+	CardID string `json:"cardID,omitempty" jsonschema:"card id to close when the PR merges, for example T3.329"`
+}
+
+// attachWatchPRWithCardLink installs the real watch_pr handler and records the
+// optional cardID link after a successful registration. A failed link write is
+// logged but does not fail a Watch that is already registered.
+func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectRoot string) {
+	if s == nil {
+		return
+	}
+	handler := mcp.NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
+	handler.SetBlockerControl(deps.Blockers)
+	if registrar, ok := deps.Store.(mcp.WatchPRRegistrar); ok {
+		handler.SetRegistry(registrar)
+	}
+	handler.SetProjectRoot(projectRoot)
+	db, _ := deps.Store.(*store.DB)
+
+	no := false
+	s.RemoveTools("beacon_watch_pr")
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:        "beacon_watch_pr",
+		Description: "Register or renew a Watch on a pull request head and subscribe the caller.",
+		Annotations: &mcpsdk.ToolAnnotations{
+			DestructiveHint: &no,
+			IdempotentHint:  true,
+		},
+	}, func(ctx context.Context, req *mcpsdk.CallToolRequest, in watchPRInputWithCard) (*mcpsdk.CallToolResult, mcp.WatchPROutput, error) {
+		result, out, err := handler.Handle(ctx, req, in.WatchPRInput)
+		if err != nil || out.WatchID == "" || db == nil {
+			return result, out, err
+		}
+		cardID := strings.TrimSpace(in.CardID)
+		if cardID == "" {
+			return result, out, err
+		}
+		if !taskstore.IsID(cardID) {
+			observe.ActorError("watch_pr-card-link", out.WatchID,
+				fmt.Errorf("invalid cardID %q", cardID))
+			return result, out, err
+		}
+		linked, linkErr := db.Link(cardID, out.WatchID, in.PR)
+		if linkErr == nil && linked.Duplicate &&
+			(linked.Link.WatchID != out.WatchID || linked.Link.PR != in.PR) {
+			// A rebase creates a successor Watch. The first row still points at
+			// the closed Watch, so move the single link to the live one before
+			// its merged verdict can close the card.
+			if _, unlinkErr := db.Unlink(cardID); unlinkErr != nil {
+				linkErr = unlinkErr
+			} else {
+				_, linkErr = db.Link(cardID, out.WatchID, in.PR)
+			}
+		}
+		if linkErr != nil {
+			observe.ActorError("watch_pr-card-link", out.WatchID, linkErr)
+		}
+		return result, out, err
+	})
 }
 
 // newMCPWakeHandler builds the production wake handler. The registry guard is
@@ -1440,18 +1581,26 @@ const githubAPIURL = "https://api.github.com"
 // a token or a network. Every merge it performs carries --repo through the
 // CLI runner, so the target never depends on the working directory.
 var newGitHubBatch = func(ctx context.Context, c *CLI) githubBatch {
-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	counter, err := github.NewCounter(ctx, nil, githubAPIURL)
-	if err != nil {
-		counter = nil
-	}
-	token, err := github.ResolveToken(ctx)
+	// Token resolution shells out to `gh auth token`. It needs its own budget:
+	// the counter GET used to spend the same three seconds, leaving ResolveToken
+	// with an expired context, an empty token and a 403 on every CI read.
+	tokenCtx, tokenCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer tokenCancel()
+	token, err := github.ResolveToken(tokenCtx)
 	if err != nil {
 		token = ""
 	}
+
+	// Only the rate_limit GET keeps the short deadline.
+	counterCtx, counterCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer counterCancel()
+	counter, err := github.NewCounter(counterCtx, nil, githubAPIURL)
+	if err != nil {
+		counter = nil
+	}
+
 	graph := github.NewClient("", token, nil, counter)
-	rest, err := github.NewRestClient(ctx, counter)
+	rest, err := github.NewRestClient(tokenCtx, counter)
 	if err != nil {
 		rest = nil
 	}
