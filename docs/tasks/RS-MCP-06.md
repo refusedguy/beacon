@@ -1,5 +1,5 @@
 # RS-MCP-06. Срок жизни watchID как непрозрачного handle
-Статус: blocked
+Статус: todo
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/mcp/tool_wait_result.go, internal/infra/mcp/tool_claim.go
