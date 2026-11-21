@@ -591,31 +591,39 @@ func (b *BatchProvider) parsePRAlias(ctx context.Context, alias Alias, raw json.
 	return state, suites, nil
 }
 
-// normalizeGitHubCheck maps the raw GitHub fields into the three states the
-// verdict engine reads. CheckRun contributes conclusion, StatusContext
-// contributes state; when both are present conclusion wins. SKIPPED and NEUTRAL
-// are non-blocking successes, never CANCELLED or FAILURE.
+// normalizeGitHubCheck maps the raw GitHub fields into the states the verdict
+// engine reads. CheckRun contributes conclusion, StatusContext contributes
+// state; when both are present conclusion wins. The PASS and FAIL aliases come
+// from domain.NormalizeConclusion, so this adapter keeps one vocabulary with
+// the verdict engine.
 func normalizeGitHubCheck(conclusion, state string) domain.Check {
 	raw := conclusion
 	if raw == "" {
 		raw = state
 	}
 	fromRun := conclusion != ""
-	switch strings.ToUpper(raw) {
-	case "SUCCESS", "SKIPPED", "NEUTRAL":
+	canonical := domain.NormalizeConclusion(raw)
+	// A check run with ACTION_REQUIRED waits on a human. It stays pending here
+	// even though the domain vocabulary treats it as a failure.
+	if strings.EqualFold(strings.TrimSpace(raw), "ACTION_REQUIRED") {
+		canonical = "PENDING"
+	}
+	switch canonical {
+	case "SUCCESS":
 		if fromRun {
 			return domain.Check{State: "COMPLETED", Conclusion: "SUCCESS"}
 		}
 		return domain.Check{State: "SUCCESS", Conclusion: "SUCCESS"}
-	case "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "CANCELLED", "CANCELED":
+	case "FAILURE", "CANCELLED":
+		// CANCELLED and CANCELED reach this branch through the domain mapping.
+		// Both remain failed checks, as they did before the shared vocabulary.
 		if fromRun {
 			return domain.Check{State: "COMPLETED", Conclusion: "FAILURE"}
 		}
 		return domain.Check{State: "FAILURE", Conclusion: "FAILURE"}
 	default:
-		// QUEUED, IN_PROGRESS, WAITING, REQUESTED, PENDING and ACTION_REQUIRED
-		// are all pending. An unknown value also stays pending rather than
-		// being promoted to a failure that would block an unrelated PR.
+		// QUEUED, IN_PROGRESS, WAITING, REQUESTED and unknown values stay
+		// pending instead of blocking an unrelated PR.
 		return domain.Check{State: "PENDING"}
 	}
 }

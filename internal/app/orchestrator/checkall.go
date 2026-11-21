@@ -445,8 +445,8 @@ func VerdictFromChecks(checks []Check) Verdict {
 	}
 	allGreen := true
 	for _, c := range checks {
-		switch strings.ToUpper(strings.TrimSpace(c.Conclusion)) {
-		case "SUCCESS", "SKIPPED", "NEUTRAL":
+		switch normalizeConclusion(c.Conclusion) {
+		case "SUCCESS":
 			continue
 		case "FAILURE", "CANCELLED":
 			allGreen = false
@@ -465,7 +465,8 @@ func VerdictFromChecks(checks []Check) Verdict {
 func FailedChecks(checks []Check) []string {
 	var out []string
 	for _, c := range checks {
-		if c.Conclusion == "FAILURE" || c.Conclusion == "CANCELLED" {
+		canonical := normalizeConclusion(c.Conclusion)
+		if canonical == "FAILURE" || canonical == "CANCELLED" {
 			out = append(out, c.Name)
 		}
 	}
@@ -706,14 +707,15 @@ func checkFromNode(raw json.RawMessage) (Check, bool) {
 	return Check{Name: name, Conclusion: normalizeConclusion(conclusion)}, true
 }
 
-// normalizeConclusion maps a raw check conclusion to the three states the
-// verdict rules read. SKIPPED and NEUTRAL are allowed results, so they are
-// passes and never become a blocking CANCELLED.
+// normalizeConclusion is the app-layer mirror of domain.NormalizeConclusion.
+// ADR 0005 forbids an app import of domain, so the vocabulary is repeated here.
+// Every check conclusion in this pass goes through this one function: parsing,
+// verdict selection and failure listing.
 func normalizeConclusion(value string) string {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
 	case "PASS", "SUCCESS", "SUCCESSFUL", "SKIPPED", "NEUTRAL":
 		return "SUCCESS"
-	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED":
 		return "FAILURE"
 	case "CANCELLED", "CANCELED":
 		return "CANCELLED"
