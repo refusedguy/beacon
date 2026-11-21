@@ -49,6 +49,7 @@ type Filter struct {
 	mu         sync.Mutex
 	deliveries map[string]struct{}
 	headSHAs   map[string]struct{}
+	restored   map[string]struct{}
 }
 
 // NewFilter builds a filter with empty dedupe indexes.
@@ -59,6 +60,7 @@ func NewFilter(cfg FilterConfig) *Filter {
 		authors:    keySet(cfg.Authors),
 		deliveries: make(map[string]struct{}),
 		headSHAs:   make(map[string]struct{}),
+		restored:   make(map[string]struct{}),
 	}
 }
 
@@ -82,6 +84,10 @@ func (f *Filter) Restore(deliveryID, headSHA string) {
 			f.deliveries = make(map[string]struct{})
 		}
 		f.deliveries[deliveryID] = struct{}{}
+		if f.restored == nil {
+			f.restored = make(map[string]struct{})
+		}
+		f.restored[deliveryID] = struct{}{}
 	}
 	if headSHA != "" {
 		if f.headSHAs == nil {
@@ -92,10 +98,12 @@ func (f *Filter) Restore(deliveryID, headSHA string) {
 }
 
 // ClaimDelivery reports whether a delivery ID is new and records it when so.
-// It is the fast in-memory gate for the receiver. The restored index makes a
-// repeat after a restart fail this check, so no second effect is queued. The
-// durable journal keeps its own idempotency; this method only avoids the
-// write for a delivery the process already knows.
+// It is the fast in-memory gate for the receiver. An ID claimed earlier in this
+// process fails the check, so the receiver does not write twice. An ID loaded
+// from the journal at startup passes the check. Its body may have changed, so
+// the durable journal must classify the repeat. The journal's INSERT OR IGNORE
+// still keeps a second effect out; this method only skips the write for a
+// delivery this process already handled itself.
 func (f *Filter) ClaimDelivery(deliveryID string) bool {
 	if f == nil {
 		return false
@@ -107,7 +115,8 @@ func (f *Filter) ClaimDelivery(deliveryID string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, seen := f.deliveries[deliveryID]; seen {
-		return false
+		_, fromJournal := f.restored[deliveryID]
+		return fromJournal
 	}
 	if f.deliveries == nil {
 		f.deliveries = make(map[string]struct{})
