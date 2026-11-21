@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
+	"gopkg.in/yaml.v3"
 )
 
 const usageText = `beacon — команды сборки и проверки Beacon
@@ -39,6 +42,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon attach <sessionID>
   beacon registry stop --watch <id> --revision <n> --session <id> --token <t>
   beacon registry sync [--project <key>]
+  beacon registry check --config <file>
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
   beacon daemon [--interval 10s|30s] [--once]
@@ -277,7 +281,7 @@ func (c *CLI) dispatch(args []string) int {
 	case "attach":
 		return c.runAttach(args[1:])
 	case "registry":
-		return registryRunner(c, args[1:])
+		return c.registryCommand(args[1:])
 	case "deliver":
 		return deliverRunner(c, args[1:])
 	case "ci":
@@ -313,6 +317,52 @@ func (c *CLI) dispatch(args []string) int {
 		writeUsage(c.errOut)
 		return 2
 	}
+}
+
+// registryCommand routes the registry subcommands. The check subcommand is
+// wired here (T5.63) while stop and sync stay in registry_stop.go, which other
+// cards own.
+func (c *CLI) registryCommand(args []string) int {
+	if len(args) > 0 && args[0] == "check" {
+		return c.runRegistryCheck(args[1:])
+	}
+	return registryRunner(c, args)
+}
+
+// runRegistryCheck reads an author registry config and runs the check from
+// registry_check.go. The file goes through fs.FS so cmd/beacon keeps the file
+// capability inside internal/infra (ADR 0005). A decode or read failure is a
+// broken run with exit 2; a config with issues exits 1.
+func (c *CLI) runRegistryCheck(args []string) int {
+	fsFlags := flag.NewFlagSet("registry check", flag.ContinueOnError)
+	configPath := fsFlags.String("config", "", "path to the registry config file")
+	if !parseFlags("registry check", args, c.errOut, fsFlags) {
+		return 2
+	}
+	path := *configPath
+	if path == "" {
+		fmt.Fprintln(c.errOut, "beacon registry check: --config is required")
+		return 2
+	}
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	data, err := fs.ReadFile(os.DirFS(dir), name)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry check: read config: %v\n", err)
+		return 2
+	}
+	var config map[string]any
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry check: decode config: %v\n", err)
+		return 2
+	}
+	if config == nil {
+		fmt.Fprintln(c.errOut, "beacon registry check: empty config")
+		return 2
+	}
+	return registryCheckRunner(checkRegistryConfig(config), c.out)
 }
 
 func writeUsage(w io.Writer) {
