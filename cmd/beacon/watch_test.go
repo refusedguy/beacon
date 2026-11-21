@@ -334,13 +334,11 @@ func t3114State() gcState {
 	}
 }
 
-func t3114AlivePID() func(int) bool { return func(pid int) bool { return pid == 222 } }
-
 func TestT3114DryRunListsStaleWithoutRemoving(t *testing.T) {
 	t3114Restore(t)
 	gcReadState = func() (gcState, error) { return t3114State(), nil }
 	calls, _ := t3114Write(t, nil)
-	gcProcessAlive = t3114AlivePID()
+	gcProcessAlive = func(pid int) bool { return pid == 222 }
 	c, out, errOut, _ := w69CLI(t, nil)
 
 	if code := runGC(c, nil); code != 0 {
@@ -371,7 +369,7 @@ func TestT3114ApplyRemovesOnlyStaleAndReports(t *testing.T) {
 	t3114Restore(t)
 	gcReadState = func() (gcState, error) { return t3114State(), nil }
 	calls, applied := t3114Write(t, nil)
-	gcProcessAlive = t3114AlivePID()
+	gcProcessAlive = func(pid int) bool { return pid == 222 }
 	c, out, errOut, _ := w69CLI(t, nil)
 
 	if code := runGC(c, []string{"--apply"}); code != 0 {
@@ -404,7 +402,7 @@ func TestT3114JSONReport(t *testing.T) {
 	t3114Restore(t)
 	gcReadState = func() (gcState, error) { return t3114State(), nil }
 	_, _ = t3114Write(t, nil)
-	gcProcessAlive = t3114AlivePID()
+	gcProcessAlive = func(pid int) bool { return pid == 222 }
 	c, out, errOut, _ := w69CLI(t, nil)
 
 	if code := runGC(c, []string{"--format", "json"}); code != 0 {
@@ -475,7 +473,7 @@ func TestT3114ApplyFailure(t *testing.T) {
 	t3114Restore(t)
 	gcReadState = func() (gcState, error) { return t3114State(), nil }
 	calls, _ := t3114Write(t, errSnapshot)
-	gcProcessAlive = t3114AlivePID()
+	gcProcessAlive = func(pid int) bool { return pid == 222 }
 	c, out, errOut, _ := w69CLI(t, nil)
 
 	if code := runGC(c, []string{"--apply"}); code != 2 {

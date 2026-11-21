@@ -476,25 +476,15 @@ const (
 	interruptReasonBoth     = "wake: interrupted, agent has a pending question and is waiting for human approval"
 )
 
-// WakeSender is the narrow port implemented by the environment adapter. It
-// attempts one delivery and reports the method that actually happened. Source
-// is passed through so a review (diff comment) is routed to the steer channel
-// and can be recorded on the receipt; it is metadata, never check contents.
-// An adapter that cannot deliver to an open session returns DeliveryUnsupported
-// with a reason; it must never report steer or queue in that case. The core
-// does not know which concrete client implements the port (ADR 0001).
-type WakeSender interface {
-	Deliver(ctx context.Context, target, text string, source WakeSource) (Delivery, string)
-}
-
-// FallbackWakeSender attempts one delivery on a requested channel (ADR 0038
-// p6). The channel is only a hint: the adapter reports the Delivery that
-// actually happened and an honest reason. It must never report steer or queue
-// for an attempt it could not make. A handler built with
-// NewFallbackWakeHandler uses this port instead of WakeSender.
-type FallbackWakeSender interface {
-	Deliver(ctx context.Context, target, text string, source WakeSource, channel WakeChannel) (Delivery, string)
-}
+// WakeSender attempts one delivery and reports the method that actually
+// happened. Source is passed through so a review (diff comment) is routed to
+// the steer channel and can be recorded on the receipt; it is metadata, never
+// check contents. Channel names the channel to try; the single-delivery path
+// passes an empty channel and lets the adapter choose. An adapter that cannot
+// deliver to an open session returns DeliveryUnsupported with a reason; it
+// must never report steer or queue in that case. The core does not know which
+// concrete client implements the port (ADR 0001, ADR 0038 p6).
+type WakeSender func(ctx context.Context, target, text string, source WakeSource, channel WakeChannel) (Delivery, string)
 
 // ReceiptConfirmer reports whether the agent confirmed receipt of a follow-up
 // sent on a channel (ADR 0038 p6). It is consulted after each successful
@@ -643,19 +633,18 @@ func selectAgentByWorktree(candidates []CandidateAgent, worktreePath string) (st
 // the ADR 0038 p6 chain over its own ports. In either case it holds no state
 // beyond those ports and performs no I/O of its own.
 type WakeHandler struct {
-	sender         WakeSender
-	directory      AgentDirectory
-	fallbackSender FallbackWakeSender
-	confirmer      ReceiptConfirmer
-	tracer         TaskTracer
-	useFallback    bool
-	sleeper        WakeSleeper
-	point          func(time.Duration) time.Duration
-	confirmations  *ConfirmationLedger
-	operations     OperationRegistry
-	doorbell       DoorbellPort
-	guard          *HeartbeatGuard
-	registryGuard  RegistryWakeGuard
+	sender        WakeSender
+	directory     AgentDirectory
+	confirmer     ReceiptConfirmer
+	tracer        TaskTracer
+	useFallback   bool
+	sleeper       WakeSleeper
+	point         func(time.Duration) time.Duration
+	confirmations *ConfirmationLedger
+	operations    OperationRegistry
+	doorbell      DoorbellPort
+	guard         *HeartbeatGuard
+	registryGuard RegistryWakeGuard
 }
 
 // WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
@@ -740,21 +729,21 @@ func NewWorktreeWakeHandler(sender WakeSender, directory AgentDirectory) *WakeHa
 // confirmation failed again. Nil ports are honest refusals, never guesses: a
 // nil sender reports unsupported on every channel, a nil confirmer counts as
 // unconfirmed, and a nil tracer records Traced=false with a reason.
-func NewFallbackWakeHandler(sender FallbackWakeSender, confirmer ReceiptConfirmer, tracer TaskTracer) *WakeHandler {
-	return &WakeHandler{fallbackSender: sender, confirmer: confirmer, tracer: tracer, useFallback: true}
+func NewFallbackWakeHandler(sender WakeSender, confirmer ReceiptConfirmer, tracer TaskTracer) *WakeHandler {
+	return &WakeHandler{sender: sender, confirmer: confirmer, tracer: tracer, useFallback: true}
 }
 
 // NewCapabilityFallbackWakeHandler adds capability-based target selection to
 // the fallback chain. It keeps the ADR 0037 p1 path intact while the chain
 // drives delivery. The same directory resolves worktree-addressed wakes
 // (ADR 0042 p3), so the chain delivers to the session in the requested worktree.
-func NewCapabilityFallbackWakeHandler(sender FallbackWakeSender, confirmer ReceiptConfirmer, tracer TaskTracer, directory AgentDirectory) *WakeHandler {
+func NewCapabilityFallbackWakeHandler(sender WakeSender, confirmer ReceiptConfirmer, tracer TaskTracer, directory AgentDirectory) *WakeHandler {
 	return &WakeHandler{
-		fallbackSender: sender,
-		confirmer:      confirmer,
-		tracer:         tracer,
-		directory:      directory,
-		useFallback:    true,
+		sender:      sender,
+		confirmer:   confirmer,
+		tracer:      tracer,
+		directory:   directory,
+		useFallback: true,
 	}
 }
 
@@ -1033,7 +1022,7 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (out WakeOutput, e
 		}), nil
 	}
 
-	delivery, reason := h.sender.Deliver(ctx, setup.target, in.Text, setup.source)
+	delivery, reason := h.sender(ctx, setup.target, in.Text, setup.source, "")
 	switch delivery {
 	case DeliverySteer, DeliveryQueue:
 		return finish(WakeOutput{Delivery: delivery, OK: true, Source: setup.source, Executor: in.Executor, Woke: in.Woke}), nil
@@ -1124,8 +1113,8 @@ func (h *WakeHandler) runFallback(ctx context.Context, in WakeInput, target stri
 	}
 	for _, channel := range []WakeChannel{ChannelSteer, ChannelQueue} {
 		delivery, reason := DeliveryUnsupported, "wake: no fallback sender configured"
-		if h != nil && h.fallbackSender != nil {
-			delivery, reason = h.fallbackSender.Deliver(ctx, target, in.Text, source, channel)
+		if h != nil && h.sender != nil {
+			delivery, reason = h.sender(ctx, target, in.Text, source, channel)
 		}
 		if !isSuccessDelivery(delivery) {
 			if reason == "" {

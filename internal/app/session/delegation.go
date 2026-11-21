@@ -4,9 +4,9 @@
 //
 // The model is pure. It reads no clock, store or network. A Registry keeps
 // in-memory state and the caller persists it. Delivery of a parent notice goes
-// through the Notifier port, so this package never writes to a chat or a
-// session by itself. The server creates the thread references and calls into
-// this model.
+// through a Notifier function supplied by the caller, so this package never
+// writes to a chat or a session by itself. The server creates the thread
+// references and calls into this model.
 package session
 
 import (
@@ -215,19 +215,10 @@ type ParentNotice struct {
 	Question  string   `json:"question"`
 }
 
-// Notifier delivers a notice to a parent chat. The model calls this port and
-// owns no chat or network client. The caller supplies the implementation.
-type Notifier interface {
-	Notify(ctx context.Context, notice ParentNotice) error
-}
-
-// NotifierFunc adapts a function to Notifier.
-type NotifierFunc func(ctx context.Context, notice ParentNotice) error
-
-// Notify calls f with notice.
-func (f NotifierFunc) Notify(ctx context.Context, notice ParentNotice) error {
-	return f(ctx, notice)
-}
+// Notifier delivers a notice to a parent chat. The model calls this function
+// and owns no chat or network client. A nil Notifier builds the notice without
+// delivering it.
+type Notifier func(ctx context.Context, notice ParentNotice) error
 
 // Ask records a question from a child and returns the notice for its parent.
 // When notifier is not nil, Ask also delivers the notice through that port.
@@ -255,7 +246,7 @@ func (r *Registry) Ask(ctx context.Context, notifier Notifier, childID ThreadID,
 	if notifier == nil {
 		return notice, nil
 	}
-	if err := notifier.Notify(ctx, notice); err != nil {
+	if err := notifier(ctx, notice); err != nil {
 		return notice, err
 	}
 	return notice, nil

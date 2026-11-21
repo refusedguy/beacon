@@ -157,7 +157,7 @@ func TestQuestionNotifiesParent(t *testing.T) {
 	}
 	n := &captureNotifier{}
 
-	notice, err := r.Ask(context.Background(), n, "child", "  which branch?  ")
+	notice, err := r.Ask(context.Background(), n.Notify, "child", "  which branch?  ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestQuestionNotifiesParent(t *testing.T) {
 	// A delivery failure is returned with the notice so the caller can retry.
 	boom := errors.New("delivery failed")
 	n.err = boom
-	failed, err := r.Ask(context.Background(), n, "child", "retry me")
+	failed, err := r.Ask(context.Background(), n.Notify, "child", "retry me")
 	if !errors.Is(err, boom) {
 		t.Fatalf("notifier error = %v, want boom", err)
 	}
@@ -205,13 +205,13 @@ func TestQuestionErrors(t *testing.T) {
 	}
 	n := &captureNotifier{}
 
-	if _, err := r.Ask(context.Background(), n, "missing", "why"); !errors.Is(err, ErrUnknownThread) {
+	if _, err := r.Ask(context.Background(), n.Notify, "missing", "why"); !errors.Is(err, ErrUnknownThread) {
 		t.Fatalf("unknown child error = %v, want ErrUnknownThread", err)
 	}
-	if _, err := r.Ask(context.Background(), n, "child", "   "); !errors.Is(err, ErrEmptyQuestion) {
+	if _, err := r.Ask(context.Background(), n.Notify, "child", "   "); !errors.Is(err, ErrEmptyQuestion) {
 		t.Fatalf("empty question error = %v, want ErrEmptyQuestion", err)
 	}
-	if _, err := r.Ask(context.Background(), n, "root", "why"); !errors.Is(err, ErrNoParent) {
+	if _, err := r.Ask(context.Background(), n.Notify, "root", "why"); !errors.Is(err, ErrNoParent) {
 		t.Fatalf("root question error = %v, want ErrNoParent", err)
 	}
 	if len(n.notices) != 0 {
@@ -240,7 +240,7 @@ func TestEmptyRegistry(t *testing.T) {
 		t.Fatalf("ContextOf = %v, want empty", got.Entries())
 	}
 	n := &captureNotifier{}
-	if _, err := r.Ask(context.Background(), n, "missing", "why"); !errors.Is(err, ErrUnknownThread) {
+	if _, err := r.Ask(context.Background(), n.Notify, "missing", "why"); !errors.Is(err, ErrUnknownThread) {
 		t.Fatalf("Ask error = %v, want ErrUnknownThread", err)
 	}
 	if len(n.notices) != 0 {

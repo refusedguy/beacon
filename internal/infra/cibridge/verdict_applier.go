@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"reflect"
 	"strings"
 	"time"
 
@@ -816,10 +815,8 @@ type fixForSource interface {
 
 // watchFixFor returns the id of the Watch a fixer Watch is assigned to clear.
 func (b *verdictApplier) watchFixFor(w domain.Watch) string {
-	if f := reflect.ValueOf(w).FieldByName("FixFor"); f.IsValid() && f.Kind() == reflect.String {
-		if s := strings.TrimSpace(f.String()); s != "" {
-			return s
-		}
+	if s := strings.TrimSpace(w.FixFor); s != "" {
+		return s
 	}
 	if b.store != nil {
 		if src, ok := b.store.(fixForSource); ok {

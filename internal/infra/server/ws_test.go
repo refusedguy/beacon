@@ -331,7 +331,7 @@ func newLineageTree(t *testing.T) (*ChildThreads, *recordingParentNotifier) {
 func TestChildThreadsRoutesQuestionToParent(t *testing.T) {
 	threads, notifier := newLineageTree(t)
 
-	notice, err := threads.Ask(context.Background(), notifier, "child", "  which branch?  ")
+	notice, err := threads.Ask(context.Background(), notifier.Notify, "child", "  which branch?  ")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +379,7 @@ func TestChildThreadsRejectsBadQuestions(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := threads.Ask(context.Background(), notifier, tc.childID, tc.question); !errors.Is(err, tc.want) {
+			if _, err := threads.Ask(context.Background(), notifier.Notify, tc.childID, tc.question); !errors.Is(err, tc.want) {
 				t.Fatalf("Ask error = %v, want %v", err, tc.want)
 			}
 		})
@@ -393,7 +393,7 @@ func TestChildThreadsDeliveryError(t *testing.T) {
 	threads, notifier := newLineageTree(t)
 	boom := errors.New("delivery failed")
 	notifier.err = boom
-	notice, err := threads.Ask(context.Background(), notifier, "child", "retry me")
+	notice, err := threads.Ask(context.Background(), notifier.Notify, "child", "retry me")
 	if !errors.Is(err, boom) {
 		t.Fatalf("Ask error = %v, want boom", err)
 	}
@@ -427,7 +427,7 @@ func TestChildThreadsReferenceErrors(t *testing.T) {
 func TestWebSocketQuestionFrameNotifiesParent(t *testing.T) {
 	threads, notifier := newLineageTree(t)
 	notifier.ch = make(chan ParentNotice, 1)
-	ws := NewWebSocketWithLineage(&mockEventReader{}, Config{Enabled: true, PollInterval: time.Millisecond}, threads, notifier)
+	ws := NewWebSocketWithLineage(&mockEventReader{}, Config{Enabled: true, PollInterval: time.Millisecond}, threads, notifier.Notify)
 
 	s := startSession(t, ws, 0)
 	defer s.client.Close()
