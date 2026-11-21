@@ -325,6 +325,10 @@ func runPRCreate(c *CLI, args []string) int {
 		Draft:    *draft,
 		DryRun:   *dryRun,
 	})
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon pr create: %v\n", err)
+		return 2
+	}
 	if *format == "json" {
 		if encErr := renderPRCreateJSON(c.out, result); encErr != nil {
 			fmt.Fprintf(c.errOut, "beacon pr create: %v\n", encErr)
@@ -332,10 +336,6 @@ func runPRCreate(c *CLI, args []string) int {
 		}
 	} else {
 		renderPRCreateTable(c.out, result)
-	}
-	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon pr create: %v\n", err)
-		return 2
 	}
 	return 0
 }
