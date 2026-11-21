@@ -110,11 +110,11 @@ func loadAttachSessions() (attachSessionState, error) {
 		return attachSessionState{}, nil
 	}
 	if err != nil {
-		return attachSessionState{}, fmt.Errorf("%s: не удалось прочитать реестр сессий: %v", path, err)
+		return attachSessionState{}, fmt.Errorf("%s: не удалось прочитать реестр сессий: %w", path, err)
 	}
 	var st attachSessionState
 	if err := json.Unmarshal(data, &st); err != nil {
-		return attachSessionState{}, fmt.Errorf("%s: неверный реестр сессий: %v", path, err)
+		return attachSessionState{}, fmt.Errorf("%s: неверный реестр сессий: %w", path, err)
 	}
 	return st, nil
 }
@@ -127,11 +127,11 @@ func saveAttachSessions(st attachSessionState) error {
 		return err
 	}
 	if err := attachMkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("%s: не создан каталог состояния: %v", path, err)
+		return fmt.Errorf("%s: не создан каталог состояния: %w", path, err)
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
-		return fmt.Errorf("не собран реестр сессий: %v", err)
+		return fmt.Errorf("не собран реестр сессий: %w", err)
 	}
 	return attachWriteFile(path, append(data, '\n'), 0o600)
 }

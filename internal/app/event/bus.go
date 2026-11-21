@@ -284,6 +284,10 @@ func (b *Bus) drain(ctx context.Context, envs []Envelope) {
 func deliverOne(ctx context.Context, sub Subscriber, env Envelope) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			if panicErr, ok := r.(error); ok {
+				err = fmt.Errorf("subscriber panic: %w", panicErr)
+				return
+			}
 			err = fmt.Errorf("subscriber panic: %v", r)
 		}
 	}()
