@@ -101,6 +101,77 @@ func daemonWakeRoute(deliver wake.TargetDeliverer) orchestrator.WakeRoute {
 	}
 }
 
+// daemonClaimSource reads the durable claim of the executor's obligation for
+// one (watchID, revision, subscriberID). A stored claimedAt proves an earlier
+// wake was already acknowledged, which matters after a daemon restart empties
+// the in-memory dedupe (Q-B-04).
+type daemonClaimSource interface {
+	ClaimedAt(watchID string, revision uint64, subscriberID string) time.Time
+}
+
+// dbClaimSource adapts the daemon's existing store handle to daemonClaimSource.
+// It opens no second connection and reads the obligation history by watchID.
+type dbClaimSource struct{ db *store.DB }
+
+func (s dbClaimSource) ClaimedAt(watchID string, revision uint64, subscriberID string) time.Time {
+	if s.db == nil || watchID == "" || subscriberID == "" {
+		return time.Time{}
+	}
+	obligations, err := s.db.WatchObligations(watchID)
+	if err != nil {
+		return time.Time{}
+	}
+	for _, o := range obligations {
+		if o.Revision == revision && o.SubscriberID == subscriberID {
+			return o.ClaimedAt
+		}
+	}
+	return time.Time{}
+}
+
+// daemonWakeGate is the second line of wake defence. The slot ledger opens at
+// most one slot per (watchID, revision) in this process, so a repeated
+// completion signal cannot open a second one. The claimedAt check is the
+// durable line: a claim taken before a restart still suppresses the wake.
+type daemonWakeGate struct {
+	ledger *orchestrator.SlotLedger
+	claims daemonClaimSource
+}
+
+func newDaemonWakeGate(claims daemonClaimSource) *daemonWakeGate {
+	return &daemonWakeGate{ledger: orchestrator.NewSlotLedger(), claims: claims}
+}
+
+// claimConsumed reports whether the executor already acknowledged this
+// revision. The check is durable, so it survives a daemon restart that empties
+// both the waker's in-memory dedupe and this gate's ledger.
+func (g *daemonWakeGate) claimConsumed(w orchestrator.DaemonWatch, revision uint64) bool {
+	return g.claims != nil && !g.claims.ClaimedAt(w.ID, revision, w.SubscriberID).IsZero()
+}
+
+// open records one slot for a successfully delivered wake. A failed delivery
+// leaves the slot closed, so the next daemon pass may retry it.
+func (g *daemonWakeGate) open(w orchestrator.DaemonWatch, revision uint64) {
+	g.ledger.Issue(orchestrator.SignalReportToOrchestrator, w.ID, revision, w.PR)
+}
+
+// daemonWakeRouteWithGate wraps daemonWakeRoute with the one-slot gate. The
+// plain route keeps its contract for callers that do not have a store handle.
+func daemonWakeRouteWithGate(deliver wake.TargetDeliverer, claims daemonClaimSource) orchestrator.WakeRoute {
+	route := daemonWakeRoute(deliver)
+	gate := newDaemonWakeGate(claims)
+	return func(ctx context.Context, w orchestrator.DaemonWatch, revision uint64, verdict, text string) error {
+		if gate.claimConsumed(w, revision) || gate.ledger.IsLive(w.ID, revision) {
+			return nil
+		}
+		if err := route(ctx, w, revision, verdict, text); err != nil {
+			return err
+		}
+		gate.open(w, revision)
+		return nil
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Session heartbeat (WIRING-488)
 // ---------------------------------------------------------------------------
@@ -374,7 +445,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			}
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
-		}, daemonWakeRoute(wake.PromptTargetDeliverer(&wake.T202API{}))),
+		}, daemonWakeRouteWithGate(wake.PromptTargetDeliverer(&wake.T202API{}), dbClaimSource{db: db})),
 	}, db.Close, nil
 }
 
