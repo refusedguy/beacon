@@ -41,6 +41,10 @@ PR: 489
 
 Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
 
+## Подтверждение
+
+2026-11-21 перепроверено по свежему origin/main (c716b61; база ветки fix/ai5 была 11ce87e). PR [#489](https://github.com/refusedguy/beacon/pull/489) влит коммитом 9d1a480, но внёс только чистый Plan и Notifier и тесты к ним. Проводка не выполнена: `git grep -E 'NewNotifier|ReminderPorts|\.Notify\('` по origin/main в `internal/infra/taskstore` и `internal/app/orchestrator` не дал ни одной строки, файла `reminders_loop.go` нет. Причина остаётся прежней и подтверждена заново. Матрица `tools/beacon-gates/gate/config/layers.json` разрешает ребро `internal/app` -> `internal/infra`, но не наоборот, поэтому адаптер в `internal/infra/taskstore/reminders.go` не может импортировать `internal/app/tasks`. Периодический вызов Notify живёт в `cmd/beacon/daemon.go`, который не входит в OwnerFiles карточки. В `taskstore.Card` нет поля дедлайна, а дедлайн Watch уже обрабатывает `internal/domain/verdict.go` через `DeadlineAt` и `timedOut`. Канал доставки напоминаний не задан. Статус остаётся todo до решения владельца о расширении OwnerFiles. Код не писал, gofmt не применял, чужие файлы, wiring и .beacon/ не трогал, правка только текстовая.
+
 <!-- wiring-card:contract
 beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
 эту карточку в тот же PR. Файловый маркер больше не входит в контракт: гейт

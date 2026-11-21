@@ -1,7 +1,7 @@
 # WIRING-488. Подключить реестр сессий к приложению
-Premise: проверено 2026-11-21 по origin/main (ee67c1fa). Проводка уже применена тремя влитыми PR, и каждый несёт WIRING-488 в заголовке. PR #531 подключил запись сессии при старте через SaveSession. PR #545 подключил чтение сессии при resume через GetSession. PR #552 подключил heartbeat демона через Touch. Вызовы лежат в cmd/beacon, чужие OwnerFiles и .beacon/ не тронуты. Правка только текстовая. Статус остаётся todo по контракту гейта.
-Статус: todo
-baseline: `git rev-parse --short origin/main` = ee67c1fa; `gh pr view 531 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:19:51Z; #545 = MERGED 2026-11-20T17:36:14Z; #552 = MERGED 2026-11-20T17:40:39Z; `git grep -n -E 'reg\.Start|reg\.Resume|hb\.Heartbeat' origin/main -- cmd/beacon` = spawn.go:103, attach.go:208, daemon.go:128.
+Premise: перепроверено 2026-11-21 по свежему origin/main (c716b61). Проводка применена тремя влитыми PR, и каждый несёт WIRING-488 в заголовке. PR [#531](https://github.com/refusedguy/beacon/pull/531) (67e0401) подключил запись сессии при старте через SaveSession. PR [#545](https://github.com/refusedguy/beacon/pull/545) (cd89697) подключил чтение сессии при resume через GetSession. PR [#552](https://github.com/refusedguy/beacon/pull/552) (832fee5) подключил heartbeat демона через Touch. Вызовы лежат в cmd/beacon: reg.Start в spawn.go:103, reg.Resume в attach.go:208 и daemon.go:216, hb.Heartbeat в daemon.go:199. Чужие OwnerFiles и .beacon/ не тронуты, правка только текстовая. Статус снят с todo и переведён в done.
+Статус: done
+baseline: 2026-11-21 `git rev-parse --short origin/main` = c716b61 (база ветки fix/ai5 была 11ce87e); `gh pr view 531 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:19:51Z (67e0401); #545 = MERGED 2026-11-20T17:36:14Z (cd89697); #552 = MERGED 2026-11-20T17:40:39Z (832fee5); `git grep -n -E 'reg\.Start|reg\.Resume|hb\.Heartbeat' origin/main -- cmd/beacon` = spawn.go:103, attach.go:208, daemon.go:199 и 216.
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/session/, cmd/beacon/
@@ -39,7 +39,7 @@ PR: 488
 Проводка применена, CI зелёный.
 
 ## Подтверждение
-- Premise проверен 2026-11-21 по origin/main (ee67c1fa). Дубль подтверждён влитыми PR #531, #545 и #552: app-порт SessionStore подключён к старту сессии, к resume и к heartbeat демона. Код не писал, gofmt не применял, чужие файлы и .beacon/ не трогал, правка только текстовая. Статус остаётся todo по контракту гейта.
+- Premise перепроверен 2026-11-21 по свежему origin/main (c716b61; база ветки fix/ai5 была 11ce87e). Дубль подтверждён влитыми PR [#531](https://github.com/refusedguy/beacon/pull/531), [#545](https://github.com/refusedguy/beacon/pull/545) и [#552](https://github.com/refusedguy/beacon/pull/552): app-порт SessionStore подключён к старту сессии, к resume и к heartbeat демона. `gh pr view` отдаёт state MERGED для всех трёх, merge commit'ы 67e0401, cd89697 и 832fee5 лежат в origin/main. Код не писал, gofmt не применял, чужие файлы, wiring и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done, карточку закрывают PR #531, #545 и #552.
 
 <!-- wiring-card:contract
 beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
