@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -50,7 +51,15 @@ const (
 	maxRecentWatches = 30
 
 	// maxAuditRecords bounds the in-process audit list exposed by /api/v1/audit.
-	maxAuditRecords = 200
+	// ATX-41 raises the old 200-entry cap so a normal command history stays
+	// reachable in full. Older entries are returned through a cursor instead of
+	// being trimmed at 200. The cap still bounds memory in a long-lived process.
+	maxAuditRecords = 100000
+	// defaultAuditPageSize is the page size when a request omits limit. It keeps
+	// the old behaviour of returning up to 200 entries in one response.
+	defaultAuditPageSize = 200
+	// maxAuditPageSize bounds one page so one call cannot grow without limit.
+	maxAuditPageSize = 500
 
 	// ingressHTTPAPI marks commands recorded by this transport in the audit
 	// projection. The other ingresses (mcp, tui, webhook) belong to other
@@ -117,9 +126,12 @@ type AuditRecord struct {
 }
 
 // AuditPage is the response of GET /api/v1/audit. Entries are oldest first.
+// Total counts every entry matching the query before paging. NextCursor is
+// empty on the last page.
 type AuditPage struct {
-	Entries []AuditRecord `json:"entries"`
-	Total   int           `json:"total"`
+	Entries    []AuditRecord `json:"entries"`
+	Total      int           `json:"total"`
+	NextCursor string        `json:"nextCursor,omitempty"`
 
 	// Truncated reports that the buffer trimmed at least one older record, so
 	// this page is not the full audit history. The flag describes the buffer
@@ -478,8 +490,20 @@ func (o *opsState) recordAudit(rec AuditRecord) {
 	}
 }
 
-// auditView returns the recorded commands, optionally filtered by actor.
-func (o *opsState) auditView(actor string) AuditPage {
+// auditView returns one page of recorded commands, optionally filtered by
+// actor. A cursor is an opaque offset into the matching entries, so a caller
+// can walk back to the oldest record instead of losing it at a fixed cap.
+func (o *opsState) auditView(actor, cursor string, limit int) (AuditPage, error) {
+	offset, err := decodeAuditCursor(cursor)
+	if err != nil {
+		return AuditPage{}, err
+	}
+	if limit <= 0 {
+		limit = defaultAuditPageSize
+	}
+	if limit > maxAuditPageSize {
+		limit = maxAuditPageSize
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	entries := make([]AuditRecord, 0, len(o.audit))
@@ -489,12 +513,47 @@ func (o *opsState) auditView(actor string) AuditPage {
 		}
 		entries = append(entries, rec)
 	}
-	return AuditPage{
-		Entries:   entries,
-		Total:     len(entries),
-		Truncated: o.auditDropped > 0,
-		Dropped:   o.auditDropped,
+	total := len(entries)
+	if offset > total {
+		offset = total
 	}
+	end := offset + limit
+	if end > total || end < offset {
+		end = total
+	}
+	next := ""
+	if end < total {
+		next = encodeAuditCursor(end)
+	}
+	return AuditPage{
+		Entries:    entries[offset:end],
+		Total:      total,
+		NextCursor: next,
+		Truncated:  o.auditDropped > 0,
+		Dropped:    o.auditDropped,
+	}, nil
+}
+
+// encodeAuditCursor and decodeAuditCursor use the same opaque offset format as
+// the persistent audit projection in internal/infra/server. A client treats
+// the value as a token and passes it back unchanged.
+func encodeAuditCursor(offset int) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset)))
+}
+
+func decodeAuditCursor(s string) (int, error) {
+	if s == "" {
+		return 0, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid audit cursor: %v", err)
+	}
+	offset, err := strconv.Atoi(string(raw))
+	if err != nil || offset < 0 {
+		return 0, fmt.Errorf("invalid audit cursor: %q", s)
+	}
+	return offset, nil
 }
 
 // Server owns the listener, the bearer token and the connection file. Close
@@ -842,14 +901,32 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAudit serves the commands recorded by this transport. An optional
-// actor query parameter narrows the list; actor and ingress are always present
-// on every entry.
+// actor query parameter narrows the list. A cursor walks through older pages
+// so a caller can reach the first recorded command. Actor and ingress are
+// always present on every entry.
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 	actor := ""
+	cursor := ""
+	limit := 0
 	if r.URL != nil {
-		actor = strings.TrimSpace(r.URL.Query().Get("actor"))
+		q := r.URL.Query()
+		actor = strings.TrimSpace(q.Get("actor"))
+		cursor = strings.TrimSpace(q.Get("cursor"))
+		if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				writeError(w, http.StatusBadRequest, "INVALID_AUDIT_LIMIT", "limit must be a positive integer")
+				return
+			}
+			limit = parsed
+		}
 	}
-	writeJSON(w, http.StatusOK, s.ops.auditView(actor))
+	page, err := s.ops.auditView(actor, cursor, limit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_AUDIT_CURSOR", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
