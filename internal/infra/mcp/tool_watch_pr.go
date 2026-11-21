@@ -700,21 +700,36 @@ func (h *WatchPRHandler) resolveHead(ctx context.Context, in WatchPRInput) (stri
 	return state.HeadRefOid, state.BaseRefName, nil
 }
 
-// closeSuperseded closes every active Watch on (repo, pr) whose head differs
-// from headSHA and returns the subscribers to carry to the successor. It
-// reuses the domain state machine so closeReason and ClosedAt follow T1.2.
+// liveWatchSource is the optional store port that includes blocked Watches.
+// StateStore only promises ActiveWatches, so a store that has not been upgraded
+// falls back to the active set.
+type liveWatchSource interface {
+	LiveWatches() ([]domain.Watch, error)
+}
+
+// closeSuperseded closes every live Watch on (repo, pr) whose head differs
+// from headSHA and returns the subscribers to carry to the successor. A blocked
+// Watch counts as live: a force-push must close it instead of leaving the block
+// behind. It reuses the domain state machine so closeReason and ClosedAt follow
+// T1.2.
 func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, now time.Time) ([]domain.Subscriber, error) {
 	if h.store == nil {
 		return nil, domain.NewAppError(domain.CodePersistFailed, "watch_pr: store is nil")
 	}
-	active, err := h.store.ActiveWatches()
+	var watches []domain.Watch
+	var err error
+	if src, ok := h.store.(liveWatchSource); ok {
+		watches, err = src.LiveWatches()
+	} else {
+		watches, err = h.store.ActiveWatches()
+	}
 	if err != nil {
 		return nil, domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
 
 	var carried []domain.Subscriber
-	for i := range active {
-		w := &active[i]
+	for i := range watches {
+		w := &watches[i]
 		if w.Repo != repo || w.PR != pr || w.HeadSHA == headSHA {
 			continue
 		}
