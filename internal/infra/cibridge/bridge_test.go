@@ -18,6 +18,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 type fakeCI struct {
@@ -1590,5 +1591,143 @@ func TestHeldMergeLeavesCardUnchanged(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "Статус: todo") || strings.Contains(string(raw), "Подтверждение") {
 		t.Fatalf("hold changed the card: %q", raw)
+	}
+}
+
+// gcRunnerFake is a worktree.Runner that reports one clean stale worktree and
+// records every git command. Nothing touches a real repository.
+type gcRunnerFake struct {
+	mu    sync.Mutex
+	calls [][]string
+}
+
+func (f *gcRunnerFake) run(dir string, args ...string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, append([]string{dir}, args...))
+	if len(args) >= 2 && args[0] == "worktree" && args[1] == "list" {
+		return "worktree /main\nHEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbranch refs/heads/main\n\n" +
+			"worktree /stale\nHEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\nbranch refs/heads/fix/stale\n\n", nil
+	}
+	return "", nil
+}
+
+func (f *gcRunnerFake) hasRemove() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, call := range f.calls {
+		if len(call) >= 4 && call[1] == "worktree" && call[2] == "remove" {
+			return true
+		}
+	}
+	return false
+}
+
+// bindFakeGC wires a WorktreeGC port that runs the real collector over a fake
+// git runner and counts invocations.
+func bindFakeGC(b *Bridge, fake *gcRunnerFake, calls *int) *Bridge {
+	return b.WithWorktreeGC(func(context.Context) (int, error) {
+		*calls = *calls + 1
+		res, err := worktree.Collect(fake.run, nil)
+		return len(res.Removed), err
+	})
+}
+
+// TestMergedClosesCardThenRunsWorktreeGC proves the terminal merged verdict
+// collects worktrees after the linked card closes, and that the collector
+// really issues a git worktree remove through the fake runner.
+func TestMergedClosesCardThenRunsWorktreeGC(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	w := domain.Watch{
+		ID:   "watch:refusedguy/beacon:406:" + head,
+		Repo: "refusedguy/beacon", PR: 406, HeadSHA: head,
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if _, err := db.Link("IDX-08", w.ID, w.PR); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	links, cardPath := linkedCard(t, "IDX-08")
+	fake := &gcRunnerFake{}
+	gcCalls := 0
+	ci := mergedBatchCI{snaps: map[string]domain.PRSnapshot{w.ID: mergedSnapshot(head)}}
+	b := bindFakeGC(New(db, ci, fixedClock{at: time.Unix(1, 0)}, time.Second).
+		WithCardLinks(links), fake, &gcCalls)
+
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+	if gcCalls != 1 {
+		t.Fatalf("WorktreeGC calls = %d, want 1 on merged", gcCalls)
+	}
+	if !fake.hasRemove() {
+		t.Fatalf("fake runner saw no worktree remove, calls: %v", fake.calls)
+	}
+	assertCardClosed(t, links, cardPath, w.ID, w.PR)
+}
+
+// TestNonMergedVerdictSkipsWorktreeGC proves a held merge, which is not
+// terminal, never reaches the collector.
+func TestNonMergedVerdictSkipsWorktreeGC(t *testing.T) {
+	db, w := mergeTestWatch(t)
+	defer db.Close()
+	if _, err := db.Link("IDX-08", w.ID, w.PR); err != nil {
+		t.Fatalf("Link: %v", err)
+	}
+	fake := &gcRunnerFake{}
+	gcCalls := 0
+	b := bindFakeGC(New(db, fakeCI{state: mergeTestState()}, fixedClock{at: time.Unix(1, 0)}, time.Second).
+		WithMerger(fakeMerger{held: true, reason: "merge conflict"}).
+		WithWaker(&recordingWaker{}), fake, &gcCalls)
+
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+	if gcCalls != 0 {
+		t.Fatalf("WorktreeGC calls = %d, want 0 on a held merge", gcCalls)
+	}
+}
+
+// TestCardCloseErrorSkipsWorktreeGC proves a failed card close keeps the
+// worktrees untouched: GC only runs after a successful closeLinkedCard.
+func TestCardCloseErrorSkipsWorktreeGC(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	w := domain.Watch{
+		ID:   "watch:refusedguy/beacon:406:" + head,
+		Repo: "refusedguy/beacon", PR: 406, HeadSHA: head,
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	links, _ := linkedCard(t, "IDX-08")
+	links.err = errors.New("card write failed")
+	fake := &gcRunnerFake{}
+	gcCalls := 0
+	ci := mergedBatchCI{snaps: map[string]domain.PRSnapshot{w.ID: mergedSnapshot(head)}}
+	b := bindFakeGC(New(db, ci, fixedClock{at: time.Unix(1, 0)}, time.Second).
+		WithCardLinks(links), fake, &gcCalls)
+
+	if got := b.Refresh(context.Background()); got != 1 {
+		t.Fatalf("Refresh updated %d watches, want 1", got)
+	}
+	if gcCalls != 0 {
+		t.Fatalf("WorktreeGC calls = %d, want 0 when card close fails", gcCalls)
 	}
 }
