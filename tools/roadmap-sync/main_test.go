@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -289,6 +290,78 @@ func TestScanGitLogExtractsOnlyMergedCards(t *testing.T) {
 	if scan.ids["0203"] || scan.ids["ADR"] {
 		t.Errorf("unexpected IDs extracted: %v", scan.ids)
 	}
+}
+
+func TestIDPatternParsesRSAndQCards(t *testing.T) {
+	// Filenames: the ID is the stem before any slug suffix.
+	for name, want := range map[string]string{
+		"RS-CMP-01.md":       "RS-CMP-01",
+		"RS2-WK-03.md":       "RS2-WK-03",
+		"RS-MCP-07-notes.md": "RS-MCP-07",
+		"Q-A-01.md":          "Q-A-01",
+		"Q-D-03.md":          "Q-D-03",
+	} {
+		match := cardFileRe.FindStringSubmatch(name)
+		if match == nil || match[1] != want {
+			t.Errorf("cardFileRe(%q) = %v, want ID %q", name, match, want)
+		}
+	}
+
+	// Commit subjects: each RS/Q ID in a PR-suffixed subject counts as merged.
+	subject := "feat: pass base SHA (RS2-CMP-01), add probe (RS-OBS-03), queue gate (Q-A-02) (#999)"
+	scan := scanGitLog([]string{subject})
+	for _, id := range []string{"RS2-CMP-01", "RS-OBS-03", "Q-A-02"} {
+		if !scan.ids[id] {
+			t.Errorf("scanGitLog merged IDs missing %s: %v", id, scan.ids)
+		}
+	}
+	if len(scan.ids) != 3 {
+		t.Errorf("scanGitLog merged IDs = %v, want exactly three RS/Q IDs", scan.ids)
+	}
+}
+
+func TestReadCardsIncludesRSAndQ(t *testing.T) {
+	repo := t.TempDir()
+	fixtures := map[string]string{
+		"RS-CMP-01.md": "# RS-CMP-01\nСтатус: done\nФаза: P3\n",
+		"RS2-WK-03.md": "# RS2-WK-03\nСтатус: todo\nФаза: P3\n",
+		"Q-A-01.md":    "# Q-A-01\nСтатус: todo\nФаза: P0\n",
+	}
+	for name, content := range fixtures {
+		writeFixtureFile(t, filepath.Join(repo, "docs", "tasks", name), content)
+	}
+	got, err := readCards(repo, map[string]bool{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]card{}
+	for _, c := range got {
+		byID[c.id] = c
+	}
+	for name := range fixtures {
+		id := strings.TrimSuffix(name, ".md")
+		c, ok := byID[id]
+		if !ok {
+			t.Errorf("readCards skipped %s: got IDs %v", id, keys(byID))
+			continue
+		}
+		wantStatus := statusTodo
+		if id == "RS-CMP-01" {
+			wantStatus = statusDone
+		}
+		if c.resolved != wantStatus {
+			t.Errorf("%s resolved = %q, want %q", id, c.resolved, wantStatus)
+		}
+	}
+}
+
+func keys(m map[string]card) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func TestResolveStatusPriority(t *testing.T) {
