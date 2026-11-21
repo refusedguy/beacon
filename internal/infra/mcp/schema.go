@@ -132,6 +132,15 @@ type GetResultOutput struct {
 	// (W11-B).
 	FailureExcerpt string `json:"failureExcerpt,omitempty"`
 
+	// FailureExcerptTruncated reports whether the byte ceiling cut any excerpt.
+	// When true the agent has only part of the error text and should read the
+	// full CI log at FailureExcerptLogURL (ATX-36).
+	FailureExcerptTruncated bool `json:"failureExcerptTruncated,omitempty"`
+
+	// FailureExcerptLogURL links to the check run whose excerpt was cut, so the
+	// agent can read the full CI log. It is set only when an excerpt is present.
+	FailureExcerptLogURL string `json:"failureExcerptLogUrl,omitempty"`
+
 	// ConfigID is the Watch's configuration identity from ADR 0087 (T5.36).
 	// It is optional and emitted last, so a Watch without one keeps the exact
 	// previous bytes and field order.

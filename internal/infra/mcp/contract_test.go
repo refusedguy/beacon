@@ -29,13 +29,13 @@ const toolsListByteBudget = 20 * 1024
 // toolsListByteCount is the measured serialized size of the tools/list response
 // for the contracted ten tools. The budget above is a ceiling. Do not derive
 // this value from an estimate.
-const toolsListByteCount = 19381
+const toolsListByteCount = 19467
 
 // toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
 // catches any byte change, including a swap of two tools whose names have equal
 // length, which a size check alone would miss. The value is the measured
 // ten-tool response, not a guess.
-const toolsListGoldenSHA256 = "0a1b0af4931cc90aa6d6008fdc2347e05f28cd64a15f3ea8954c84298617cf75"
+const toolsListGoldenSHA256 = "5d1d226c8afa1fb3db566c44bbf003534aee9ac7fff310f933668ad7b9359401"
 
 // expectedToolNames is the complete advertised tool contract. It is derived
 // from the descriptors so the witness cannot omit a tool the registry gained.
