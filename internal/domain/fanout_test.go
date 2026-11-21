@@ -349,7 +349,7 @@ func TestSubscribeDerivesIDAndFillsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	if res.Watch.ID != watchID("org/repo", 7, "sha1") {
+	if res.Watch.ID != watchID("org/repo", 7, "sha1", res.Watch.CreatedAt) {
 		t.Fatalf("derived ID = %q", res.Watch.ID)
 	}
 	if res.Watch.Status != StatusWatching || res.Watch.Verdict != VerdictWatching {
