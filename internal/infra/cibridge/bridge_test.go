@@ -1731,3 +1731,25 @@ func TestCardCloseErrorSkipsWorktreeGC(t *testing.T) {
 		t.Fatalf("WorktreeGC calls = %d, want 0 when card close fails", gcCalls)
 	}
 }
+
+// TestResponsibilityPartsAreWired guards the ARDH-11 split. Bridge stays the
+// single public surface, but each responsibility must be a distinct part bound
+// back to the coordinator so its methods read the same configuration the
+// With* setters mutate.
+func TestResponsibilityPartsAreWired(t *testing.T) {
+	b := New(nil, nil, nil, 0)
+	parts := []struct {
+		name  string
+		owner *Bridge
+	}{
+		{"CIRefresh", b.ciRefresh.Bridge},
+		{"VerdictApplier", b.verdictApplier.Bridge},
+		{"WakeDispatcher", b.wakeDispatcher.Bridge},
+		{"ReadAPI", b.readAPI.Bridge},
+	}
+	for _, p := range parts {
+		if p.owner != b {
+			t.Fatalf("%s part is bound to %p, want coordinator %p", p.name, p.owner, b)
+		}
+	}
+}
