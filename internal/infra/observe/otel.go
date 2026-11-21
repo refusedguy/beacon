@@ -25,8 +25,8 @@ import (
 )
 
 const (
-	// EnabledEnv is the feature flag. Only the literal "true" enables tracing;
-	// "1" and other truthy strings stay off, as in the OTel SDK kill switch.
+	// EnabledEnv is the feature flag. ParseBoolEnv decides truthiness, so the
+	// four common truthy forms enable tracing and every other value keeps it off.
 	EnabledEnv = "BEACON_OTEL_ENABLED"
 	// ExporterEnv selects the sink. The value "otlp" asks for the OTLP exporter;
 	// any other value keeps spans in the local slog sink.
@@ -55,6 +55,19 @@ const (
 	defaultOTLPTimeout = 2 * time.Second
 	maxResponseDrain   = 1 << 20
 )
+
+// ParseBoolEnv reports whether a boolean environment value is truthy. Every
+// Beacon boolean variable uses this one rule: after trimming surrounding
+// whitespace and folding case, 1, true, yes and on are true and all other
+// values, including an empty string, are false.
+func ParseBoolEnv(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // normalizeProtocol maps a configured protocol onto the supported values.
 // Empty and unknown values fall back to http/protobuf, the OTLP default.
@@ -163,9 +176,10 @@ func WarnConfig(env, value, reason string) {
 }
 
 // ConfigFromEnv reads the Beacon flag, the exporter name and the standard OTLP
-// environment variables. The flag is strict so an accidental "1" cannot enable
-// tracing. An empty protocol means http/protobuf. An unsupported exporter or
-// protocol produces a warning and keeps the local sink.
+// environment variables. The flag uses the shared ParseBoolEnv rule, so its
+// truthy forms match every other Beacon boolean. An empty protocol means
+// http/protobuf. An unsupported exporter or protocol produces a warning and
+// keeps the local sink.
 func ConfigFromEnv() Config {
 	endpoint := strings.TrimSpace(os.Getenv(OTLPEndpointEnv))
 	if direct := strings.TrimSpace(os.Getenv(TracesEndpointEnv)); direct != "" {
@@ -182,7 +196,7 @@ func ConfigFromEnv() Config {
 		WarnConfig(OTLPProtocolEnv, protocolRaw, "неизвестный протокол, используется "+ProtocolHTTPProtobuf)
 	}
 	return Config{
-		Enabled:  strings.EqualFold(strings.TrimSpace(os.Getenv(EnabledEnv)), "true"),
+		Enabled:  ParseBoolEnv(os.Getenv(EnabledEnv)),
 		Exporter: exporter,
 		Endpoint: endpoint,
 		Protocol: normalizeProtocol(protocolRaw),

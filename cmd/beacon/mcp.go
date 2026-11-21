@@ -318,10 +318,7 @@ type initEventConfig struct {
 func readInitEventConfig() initEventConfig {
 	cfg := initEventConfig{timeout: initEventTimeoutDefault}
 	cfg.source = os.Getenv("BEACON_INIT_EVENT")
-	switch os.Getenv("BEACON_INIT_BYPASS") {
-	case "1", "true", "yes", "on":
-		cfg.bypass = true
-	}
+	cfg.bypass = observe.ParseBoolEnv(os.Getenv("BEACON_INIT_BYPASS"))
 	if raw := strings.TrimSpace(os.Getenv("BEACON_INIT_EVENT_TIMEOUT")); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			cfg.timeout = d
@@ -639,11 +636,7 @@ var serveMCP = func(ctx context.Context, deps mcp.Dependencies) error {
 const mcpRemoteEnv = "BEACON_MCP_REMOTE"
 
 func remoteToolsEnabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(mcpRemoteEnv))) {
-	case "1", "true", "yes", "on":
-		return true
-	}
-	return false
+	return observe.ParseBoolEnv(os.Getenv(mcpRemoteEnv))
 }
 
 // serveMCPRemote serves the same stdio transport with every contracted tool
