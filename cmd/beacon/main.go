@@ -40,6 +40,8 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
   beacon daemon [--interval 10s|30s] [--once]
+  beacon gc [--format table|json] [--apply]
+  beacon gc-worktree [--format table|json] [--apply]
   beacon deferred [--format table|json]
   beacon workload [--format table|json]
   beacon metrics [--format json|prometheus]
@@ -269,6 +271,10 @@ func (c *CLI) dispatch(args []string) int {
 		return ciRunner(c, args[1:])
 	case "daemon":
 		return daemonRunner(c, args[1:])
+	case "gc":
+		return gcRunner(c, args[1:])
+	case "gc-worktree":
+		return gcWorktreeRunner(c, args[1:])
 	case "deferred":
 		return deferredRunner(c, args[1:])
 	case "workload":
