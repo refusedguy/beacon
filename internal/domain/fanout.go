@@ -104,11 +104,11 @@ func (f *Fanout) Subscribe(w Watch, s Subscriber) (Subscription, error) {
 	now := f.clock.Now()
 	active, err := f.store.ActiveWatches()
 	if err != nil {
-		return Subscription{}, NewAppError(CodePersistFailed, err.Error())
+		return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 	}
 	all, err := f.store.AllWatches()
 	if err != nil {
-		return Subscription{}, NewAppError(CodePersistFailed, err.Error())
+		return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 	}
 
 	existing := findByAlias(active, w.Repo, w.PR, w.HeadSHA)
@@ -163,7 +163,7 @@ func (f *Fanout) Subscribe(w Watch, s Subscriber) (Subscription, error) {
 	}
 
 	if err := f.store.SaveWatch(target); err != nil {
-		return Subscription{}, NewAppError(CodePersistFailed, err.Error())
+		return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 	}
 
 	return Subscription{Watch: target, Obligation: o, Renewed: renew}, nil
@@ -187,7 +187,7 @@ func (f *Fanout) ensureObligation(w Watch, subscriberID string, now time.Time) (
 		StagedAt:       now,
 	}
 	if err := f.store.SaveObligation(o); err != nil {
-		return Obligation{}, NewAppError(CodePersistFailed, err.Error())
+		return Obligation{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 	}
 	return o, nil
 }

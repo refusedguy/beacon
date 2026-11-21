@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"sync"
@@ -15,10 +16,13 @@ type fanoutClock struct {
 func (c fanoutClock) Now() time.Time { return c.at }
 
 type memStore struct {
-	mu          sync.Mutex
-	watches     map[string]Watch
-	obligations map[string]Obligation
-	obligErr    error
+	mu           sync.Mutex
+	watches      map[string]Watch
+	obligations  map[string]Obligation
+	activeErr    error
+	allErr       error
+	saveWatchErr error
+	obligErr     error
 }
 
 func newMemStore() *memStore {
@@ -31,6 +35,9 @@ func newMemStore() *memStore {
 func (m *memStore) SaveWatch(w Watch) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.saveWatchErr != nil {
+		return m.saveWatchErr
+	}
 	m.watches[w.ID] = w
 	return nil
 }
@@ -48,6 +55,9 @@ func (m *memStore) Watch(id string) (Watch, error) {
 func (m *memStore) ActiveWatches() ([]Watch, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.activeErr != nil {
+		return nil, m.activeErr
+	}
 	var out []Watch
 	for _, w := range m.watches {
 		if w.Status != StatusClosed {
@@ -60,6 +70,9 @@ func (m *memStore) ActiveWatches() ([]Watch, error) {
 func (m *memStore) AllWatches() ([]Watch, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.allErr != nil {
+		return nil, m.allErr
+	}
 	out := make([]Watch, 0, len(m.watches))
 	for _, w := range m.watches {
 		out = append(out, w)
@@ -439,4 +452,46 @@ func TestSubscribeErrors(t *testing.T) {
 			t.Fatalf("error = %v, want PERSIST_FAILED", err)
 		}
 	})
+}
+
+func TestSubscribePreservesStoreErrorCause(t *testing.T) {
+	noRows := sql.ErrNoRows
+	disk := errors.New("disk full")
+
+	cases := []struct {
+		name    string
+		breakAt func(*memStore)
+		want    error
+		other   error
+	}{
+		{"active watches", func(s *memStore) { s.activeErr = noRows }, noRows, disk},
+		{"all watches", func(s *memStore) { s.allErr = disk }, disk, noRows},
+		{"save watch", func(s *memStore) { s.saveWatchErr = noRows }, noRows, disk},
+		{"save obligation", func(s *memStore) { s.obligErr = disk }, disk, noRows},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, store := newTestFanout(t)
+			tc.breakAt(store)
+
+			_, err := f.Subscribe(
+				Watch{Repo: "org/repo", PR: 7, HeadSHA: "sha1"},
+				Subscriber{ID: "s"},
+			)
+			var app *AppError
+			if !errors.As(err, &app) || app.Code != CodePersistFailed {
+				t.Fatalf("error = %v, want PERSIST_FAILED AppError", err)
+			}
+			if app.Message != tc.want.Error() {
+				t.Fatalf("message = %q, want %q", app.Message, tc.want.Error())
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("errors.Is(%v, %v) = false", err, tc.want)
+			}
+			if errors.Is(err, tc.other) {
+				t.Fatalf("errors.Is(%v, %v) = true, want false", err, tc.other)
+			}
+		})
+	}
 }
