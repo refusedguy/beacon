@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 )
 
@@ -263,5 +265,103 @@ func TestW8BHumanJSONSQLite(t *testing.T) {
 	}
 	if res.Verb != "unblock" || res.Target != "b-json" || res.State != "applied via sqlite" || res.Transport != "sqlite" {
 		t.Fatalf("result = %+v, want unblock/b-json/applied via sqlite/sqlite", res)
+	}
+}
+
+// BCX-57 / needs_input_continue_of_same_watch (ADR 0061 §4).
+//
+// A Watch parked in needs_input receives a human approve. The same Watch must
+// resume at the next revision, no successor Watch may be created, and the
+// obligation must keep its recorded intention. The two eval specs
+// w21-human-question-revision and e05-wait-pending-question describe the same
+// flow at the live-wait boundary.
+func TestNeedsInputContinueOfSameWatch(t *testing.T) {
+	dir := t.TempDir()
+	seed, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch := domain.Watch{
+		ID:       "w-same-watch",
+		Repo:     "o/r",
+		PR:       7,
+		HeadSHA:  "sha",
+		Status:   domain.StatusNeedsInput,
+		Verdict:  domain.VerdictNeedsInput,
+		Revision: 7,
+	}
+	if err := seed.SaveWatch(watch); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	obligation := domain.Obligation{
+		ID:             domain.ObligationKey(watch.ID, watch.Revision, "session-answer"),
+		WatchID:        watch.ID,
+		Revision:       watch.Revision,
+		SubscriberID:   "session-answer",
+		VerdictPointer: watch.Verdict,
+		StagedAt:       time.Now(),
+	}
+	if err := seed.SaveObligation(obligation); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	applier := sqliteHumanStore{dir: dir}
+	if err := applier.Apply(context.Background(), httpapi.ClientDecision{
+		Verb: "approve", Target: watch.ID, Note: "human-answer-1",
+	}); err != nil {
+		t.Fatalf("human approve: %v", err)
+	}
+
+	check, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+
+	got, err := check.Watch(watch.ID)
+	if err != nil {
+		t.Fatalf("read Watch after answer: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+		t.Fatalf("answer did not resume the same Watch: status %q verdict %q", got.Status, got.Verdict)
+	}
+	if got.Revision != watch.Revision+1 {
+		t.Fatalf("revision = %d, want %d", got.Revision, watch.Revision+1)
+	}
+	watches, err := check.AllWatches()
+	if err != nil {
+		t.Fatalf("AllWatches: %v", err)
+	}
+	if len(watches) != 1 || watches[0].ID != watch.ID {
+		t.Fatalf("answer created a successor Watch: %+v", watches)
+	}
+	obligations, err := check.WatchObligations(watch.ID)
+	if err != nil {
+		t.Fatalf("WatchObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ClaimedAt.IsZero() {
+		t.Fatalf("answer lost the obligation intention: %+v", obligations)
+	}
+}
+
+// Negative control for the same scenario. When the question changes, the
+// server refuses the stale answer. There is no question_changed code in main,
+// so the fake returns a plain refusal. The command must report failure without
+// falling back to a store write, so no second Watch is created and no
+// obligation is stamped. See w21-human-question-revision.md.
+func TestNeedsInputContinueOfSameWatchChangedQuestion(t *testing.T) {
+	c, decider, store := w8bHumanHarness(t, true)
+	decider.err = errors.New("question changed")
+	if code := runHuman(c, []string{"approve", "w-stale"}); code == 0 {
+		t.Fatal("stale answer to a changed question was accepted")
+	}
+	if decider.calls != 1 {
+		t.Fatalf("http calls = %d, want 1", decider.calls)
+	}
+	if store.calls != 0 {
+		t.Fatalf("stale answer reached the store: %d", store.calls)
 	}
 }
