@@ -1,12 +1,12 @@
 # BCX-11. Развести два контракта literals timeout
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/domain/types.go, internal/infra/mcp/tool_get_result.go, internal/infra/mcp/tool_wait_result.go
 Зависимости: 
 Ссылка: 
-Агент: нет
-Время: нет
+Агент: exe130
+Время: 2026-11-21T18:04:53Z
 Цель: Убрать коллизию: вердикт timeout и локальный long-poll timeout не должны давать противоположные инструкции агенту.
 Контекст: Источник: docs/research/error-codes-audit.md, P0 «Один и тот же literals timeout». domain.VerdictTimeout в types.go:32 даёт nextAction=wait и подсказку «Watch finished» в tool_get_result.go:381-382. WaitStopTimeout в tool_wait_result.go:106 даёт exit code 143 (:134) и Retryable true (:144-146). Базовый замер и приоритет из отчёта: P0.
 Шаги: Выбрать разные строковые значения или добавить поле источника в выходной контракт. Обновить nextStepFor и ExitCode. Добавить тест, который различает терминальный вердикт и повторяемое ожидание.
