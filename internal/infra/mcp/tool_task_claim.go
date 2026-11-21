@@ -149,7 +149,7 @@ type claimCard struct {
 }
 
 var (
-	claimCardIDRE     = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+$`)
+	claimCardIDRE     = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|[.-][0-9]+)$`)
 	claimFieldLineRE  = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
 	claimStatusLineRE = regexp.MustCompile(`^(Статус|Агент|Время):[ \t]*(.*?)[ \t]*$`)
 )
