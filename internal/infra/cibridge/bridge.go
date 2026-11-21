@@ -243,6 +243,19 @@ type Bridge struct {
 	breakers  map[string]*adapterBreaker
 }
 
+// wakeOne filters orphaned subscribers before the wake dispatcher sees them.
+// markOrphaned and the in_work stall watchdog set WorkerPhaseOrphaned on a
+// subscriber whose session is gone. A later verdict still names that role, so
+// publishActionable would otherwise send another wake to a dead address. The
+// obligation is still staged by the caller, which keeps the verdict readable.
+func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscriber, text string, now time.Time, cycleID string, breaker bool) {
+	if sub.Phase == domain.WorkerPhaseOrphaned {
+		observe.WakeSkipped(sub.Adapter, w.ID, "subscriber orphaned")
+		return
+	}
+	b.wakeDispatcher.wakeOne(ctx, w, sub, text, now, cycleID, breaker)
+}
+
 // WithTracer binds the tracer used for the per-refresh span. It is optional:
 // a nil tracer falls back to observe.Current, so a Bridge built without it
 // keeps the process tracer and its no-op default (T3.394).
