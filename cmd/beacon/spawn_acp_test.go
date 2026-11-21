@@ -185,8 +185,10 @@ func TestW10ASpawnACPStreamsUpdates(t *testing.T) {
 	if cfg.Runtime != "claude" {
 		t.Errorf("factory runtime = %q, want claude", cfg.Runtime)
 	}
-	if !rt.closed {
-		t.Error("runtime Close was not called")
+	// A cancelled context stands for a closed terminal. The run is recorded
+	// as interrupted and the runtime stays alive for a later reattach.
+	if rt.closed {
+		t.Error("runtime Close was called after the terminal closed")
 	}
 
 	payloads := stats.snapshot()

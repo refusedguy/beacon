@@ -96,6 +96,13 @@ func recordSpawnSession(c *CLI, id, taskID, title string) {
 	if reg == nil {
 		return
 	}
+	// A spawn that reattaches to a run from an earlier invocation already has
+	// a session row for the task. Keep that row instead of writing a second
+	// one. Stores without task lookup report ErrNoTaskLookup and take the
+	// normal path.
+	if _, found, err := reg.ResumeByTask(taskID); err == nil && found {
+		return
+	}
 	metadata := map[string]string{spawnMetaTaskID: taskID}
 	if title != "" {
 		metadata[spawnMetaTitle] = title
@@ -109,7 +116,7 @@ func recordSpawnSession(c *CLI, id, taskID, title string) {
 // by its opaque sessionID; the task id in metadata is what makes the link
 // readable back to Beacon. The title is stored only when the caller set one.
 const (
-	spawnMetaTaskID = "ai.beacon/taskID"
+	spawnMetaTaskID = store.SessionMetaTaskID
 	spawnMetaTitle  = "ai.beacon/title"
 )
 
@@ -236,6 +243,56 @@ func SetSpawnRuntimeStats(s spawnStatsStore) { spawnRuntimeStats = s }
 // SetSpawnEvents installs the SSE sink (/api/v1/events) for ACP updates.
 func SetSpawnEvents(s spawnEventSink) { spawnEvents = s }
 
+// ACPRunStore is the durable run port used by beacon spawn. *store.DB
+// satisfies it. Tests install a fake so they never touch beacon.db.
+type ACPRunStore interface {
+	ClaimACPRun(store.ACPRun) (store.ACPRun, bool, error)
+	GetACPRun(task string) (store.ACPRun, bool, error)
+	TransitionACPRun(task string, to store.ACPRunState, sessionID string, result json.RawMessage) (bool, error)
+}
+
+var (
+	spawnACPRunStore ACPRunStore
+	spawnACPRunOnce  sync.Once
+	spawnACPRunDB    ACPRunStore
+)
+
+// SetACPRunStore installs the durable run store used by beacon spawn. A nil
+// value falls back to the lazy store in the project state directory.
+func SetACPRunStore(s ACPRunStore) { spawnACPRunStore = s }
+
+// acpRunStoreForSpawn returns the installed run store, or one on the same
+// beacon.db the session registry and runtime_stats use. Nothing here writes
+// outside the state directory of the current project (ADR 0086).
+func acpRunStoreForSpawn() ACPRunStore {
+	if spawnACPRunStore != nil {
+		return spawnACPRunStore
+	}
+	spawnACPRunOnce.Do(func() {
+		dir, err := stateDir()
+		if err != nil {
+			return
+		}
+		db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+		if err == nil {
+			spawnACPRunDB = db
+		}
+	})
+	return spawnACPRunDB
+}
+
+// transitionSpawnACPRun records a state change when a run store is present.
+// A failed write is reported and does not change the command exit code: the
+// runner is already in that state, so a later spawn can repair the row.
+func transitionSpawnACPRun(c *CLI, storePort ACPRunStore, task string, to store.ACPRunState, sessionID string, result json.RawMessage) {
+	if storePort == nil {
+		return
+	}
+	if _, err := storePort.TransitionACPRun(task, to, sessionID, result); err != nil {
+		fmt.Fprintf(c.errOut, "beacon spawn: run %s не переведён в %s: %v\n", task, to, err)
+	}
+}
+
 // spawnACPLifetime is the lifetime of the attached worker. Production stops
 // on a signal; tests replace it with a cancellable context.
 var spawnACPLifetime = func() (context.Context, context.CancelFunc) {
@@ -304,98 +361,159 @@ func defaultSpawnStats() spawnStatsStore {
 
 // streamACPSession drains session/update into runtime_stats and the SSE bus
 // until the runtime or the caller's context ends. Both sinks are captured at
-// entry so a test can swap the globals without racing this loop.
-func streamACPSession(ctx context.Context, rt wake.WorkerRuntime, sessionID, taskID, title, runner string) {
+// entry so a test can swap the globals without racing this loop. The last
+// snapshot becomes the durable run result. finished reports whether the
+// worker ended on its own; a cancelled context means the terminal closed and
+// the run is only interrupted.
+func streamACPSession(ctx context.Context, rt wake.WorkerRuntime, sessionID, taskID, title, runner string) (json.RawMessage, bool) {
 	statsSink, eventSink := spawnRuntimeStats, spawnEvents
 	if statsSink == nil {
 		statsSink = defaultSpawnStats()
 	}
 	stats := &acpSessionStats{TaskID: taskID, SessionID: sessionID, Runner: runner, Title: title}
+	snapshot := func() json.RawMessage {
+		payload, err := json.Marshal(stats)
+		if err != nil {
+			return json.RawMessage(`{}`)
+		}
+		return payload
+	}
 	for {
 		select {
 		case update, ok := <-rt.Updates():
 			if !ok {
-				return
+				return snapshot(), false
 			}
 			stats.Updates = append(stats.Updates, append(json.RawMessage(nil), update.Update...))
+			payload := snapshot()
 			if statsSink != nil {
-				if payload, err := json.Marshal(stats); err == nil {
-					_ = statsSink.SaveRuntimeStats(payload, time.Now().UTC())
-				}
+				_ = statsSink.SaveRuntimeStats(payload, time.Now().UTC())
 			}
 			if eventSink != nil {
-				payload, err := json.Marshal(map[string]any{
+				event, err := json.Marshal(map[string]any{
 					"taskId": taskID, "sessionId": update.SessionID,
 					"runner": runner, "update": update.Update,
 				})
 				if err == nil {
 					eventSink.Publish(httpapi.Event{
-						Type: "session.update", WatchID: taskID, Payload: payload,
+						Type: "session.update", WatchID: taskID, Payload: event,
 					})
 				}
 			}
 		case <-rt.Done():
-			return
+			return snapshot(), true
 		case <-ctx.Done():
-			return
+			return snapshot(), false
 		}
 	}
 }
 
-// runSpawnACP starts an ACP runner, creates a session, prompts it and stays
-// attached to session/update. The session id is printed before the prompt so
-// the caller can watch the stream while the worker is still running.
+// runSpawnACP starts or resumes an ACP run for one task line and stays
+// attached to session/update. The durable record is claimed before the runner
+// starts, so a second invocation returns the existing run instead of creating
+// a second piece of work. Closing the terminal cancels the local context but
+// never closes the runner: the command records interrupted and leaves the
+// worker alive. A later invocation reuses the run record and its stored
+// result.
+//
+// The session id is printed before the prompt so the caller can watch the
+// stream while the worker is still running.
 func (c *CLI) runSpawnACP(taskID, title, runner string) int {
 	factory := spawnACPRuntimeFactory
 	if factory == nil {
 		fmt.Fprintln(c.errOut, "beacon spawn: ACP-раннер не подключён")
 		return 2
 	}
+
+	runStore := acpRunStoreForSpawn()
+	var run store.ACPRun
+	if runStore != nil {
+		stored, created, err := runStore.ClaimACPRun(store.ACPRun{
+			TaskID: taskID, Runner: runner, Title: title, State: store.ACPRunRequested,
+		})
+		run = stored
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon spawn: run %s не записан: %v\n", taskID, err)
+			return 2
+		}
+		if !created && run.State == store.ACPRunFinished {
+			fmt.Fprintln(c.out, run.SessionID)
+			if len(run.Result) != 0 {
+				fmt.Fprintln(c.out, string(run.Result))
+			}
+			return 0
+		}
+	}
+
 	cfg := spawnACPConfig(runner)
 	rt, err := factory(cfg)
 	if err != nil {
+		transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, "", nil)
 		fmt.Fprintf(c.errOut, "beacon spawn: не удалось запустить ACP-раннер: %v\n", err)
 		return 2
 	}
-	defer func() { _ = rt.Close() }()
+	// There is deliberately no deferred rt.Close here. A terminal closing is
+	// a cancelled context, not a reason to kill the worker.
 
 	ctx, cancel := spawnACPLifetime()
 	defer cancel()
 
 	if err := rt.Initialize(ctx); err != nil {
+		transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, "", nil)
 		fmt.Fprintf(c.errOut, "beacon spawn: ACP initialize: %v\n", err)
 		return 2
 	}
 	cwd, err := os.Getwd()
 	if err != nil {
+		transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, "", nil)
 		fmt.Fprintf(c.errOut, "beacon spawn: рабочая директория: %v\n", err)
 		return 2
 	}
-	sessionID, err := rt.NewSession(ctx, cwd)
-	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon spawn: ACP session/new: %v\n", err)
-		return 2
-	}
-	sessionID = strings.TrimSpace(sessionID)
-	if sessionID == "" {
-		fmt.Fprintln(c.errOut, "beacon spawn: ACP session/new вернул пустой sessionID")
-		return 2
+
+	sessionID := strings.TrimSpace(run.SessionID)
+	if run.State == store.ACPRunStarted && sessionID != "" {
+		// The worker died while the run was still active. Hand the old session
+		// id back to the runner through session/load instead of losing it.
+		if err := rt.LoadSession(ctx, sessionID, cwd); err != nil {
+			transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, sessionID, nil)
+			fmt.Fprintf(c.errOut, "beacon spawn: ACP session/load: %v\n", err)
+			return 2
+		}
+	} else {
+		// A fresh run, or one interrupted by a closed terminal, gets a new
+		// runner session under the same durable run record.
+		sessionID, err = rt.NewSession(ctx, cwd)
+		if err != nil {
+			transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, "", nil)
+			fmt.Fprintf(c.errOut, "beacon spawn: ACP session/new: %v\n", err)
+			return 2
+		}
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, "", nil)
+			fmt.Fprintln(c.errOut, "beacon spawn: ACP session/new вернул пустой sessionID")
+			return 2
+		}
 	}
 
+	transitionSpawnACPRun(c, runStore, taskID, store.ACPRunStarted, sessionID, nil)
 	recordSpawnSession(c, sessionID, taskID, title)
 
 	fmt.Fprintln(c.out, sessionID)
 
 	streamDone := make(chan struct{})
+	var result json.RawMessage
+	var finished bool
 	go func() {
 		defer close(streamDone)
-		streamACPSession(ctx, rt, sessionID, taskID, title, cfg.Runtime)
+		result, finished = streamACPSession(ctx, rt, sessionID, taskID, title, cfg.Runtime)
 	}()
 
 	if err := rt.Prompt(ctx, sessionID, spawnPrompt(taskID, title)); err != nil {
 		fmt.Fprintf(c.errOut, "beacon spawn: сессия %s создана, но промпт не отправлен: %v\n", sessionID, err)
 		cancel()
 		<-streamDone
+		transitionSpawnACPRun(c, runStore, taskID, store.ACPRunInterrupted, sessionID, result)
 		return 2
 	}
 	select {
@@ -403,5 +521,10 @@ func (c *CLI) runSpawnACP(taskID, title, runner string) int {
 	case <-ctx.Done():
 		<-streamDone
 	}
+	to := store.ACPRunInterrupted
+	if finished {
+		to = store.ACPRunFinished
+	}
+	transitionSpawnACPRun(c, runStore, taskID, to, sessionID, result)
 	return 0
 }
