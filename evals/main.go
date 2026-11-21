@@ -39,8 +39,11 @@ import (
 
 const (
 	serverName = "beacon"
-	// contractToolCount: ровно семь имён из контракта. Порядок не важен.
-	contractToolCount = 7
+	// contractTools задаёт список инструментов в одном месте.
+	// frozenContractToolsHash замораживает его хеш по образцу frozenScenarioHash.
+	frozenContractToolsHash = "b0a23b5455360b807e3fd34e9260d170e4e259988262f6ac5ff6fb4aaa877c67"
+	// passTrials задаёт число прогонов стохастического кейса. Требуем пять из пяти.
+	passTrials = 5
 	// evalHeadSHA передаётся явно, чтобы обработчик не ходил в GitHub.
 	evalHeadSHA = "0123456789abcdef0123456789abcdef01234567"
 	// sessionIDMetaKey: ключ, под которым get_result ищет идентификатор
@@ -64,6 +67,7 @@ var contractTools = []string{
 	"beacon_ack",
 	"beacon_cancel_watch",
 	"beacon_stats",
+	"beacon_defer_wiring",
 }
 
 // evalStatus задаёт трёхзначный статус проверки (ADR 0301). WARN и FAIL не равны:
@@ -153,14 +157,174 @@ var (
 	// латинские буквы, цифры и одиночные дефисы между частями. Имя начинается
 	// с буквы. Один slug годится и для каталога скилла, и для имени workflow.
 	reBeaconSlug = regexp.MustCompile(`^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$`)
+	// reFlakyRow находит только строки с двумя колонками дат. Обычные таблицы
+	// README под этот шаблон не подходят.
+	reFlakyRow = regexp.MustCompile(`^\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*(\d{4}-\d{2}-\d{2})\s*\|$`)
 )
+
+// passGate требует успеха во всех прогонах. Число прогонов обязано равняться
+// passTrials: пять успехов из пяти. Один провал блокирует.
+func passGate(trials []bool) (string, bool) {
+	passes := 0
+	var pattern strings.Builder
+	for _, ok := range trials {
+		if ok {
+			passes++
+			pattern.WriteByte('1')
+		} else {
+			pattern.WriteByte('0')
+		}
+	}
+	verdict := fmt.Sprintf("%d/%d (%s)", passes, len(trials), pattern.String())
+	return verdict, len(trials) == passTrials && passes == len(trials)
+}
+
+// bridgeTrials считает предикат на каждом прогоне харнесса и требует пять
+// успехов из пяти. Ошибка харнесса приравнивается к провалу прогона.
+func bridgeTrials(bridges []bridgeObservation, errs []error, check func(bridgeObservation) bool) (string, bool) {
+	trials := make([]bool, len(bridges))
+	for i, b := range bridges {
+		trials[i] = errs[i] == nil && check(b)
+	}
+	return passGate(trials)
+}
+
+// contractToolsHash считает хеш по отсортированным именам инструментов.
+func contractToolsHash() string {
+	names := slices.Clone(contractTools)
+	sort.Strings(names)
+	sum := sha256.Sum256([]byte(strings.Join(names, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+// checkContractToolsFrozen сверяет список инструментов с замороженным хешем.
+// Негативный контроль: правка списка без обновления хеша даёт FAIL.
+func checkContractToolsFrozen() (string, bool) {
+	got := contractToolsHash()
+	ok := len(contractTools) > 0 && got == frozenContractToolsHash
+	if !ok {
+		return fmt.Sprintf("%d инструментов, хеш %s не совпадает с замороженным %s",
+			len(contractTools), got, frozenContractToolsHash), false
+	}
+	return fmt.Sprintf("%d инструментов, хеш %s… совпадает с замороженным", len(contractTools), got[:12]), true
+}
+
+const (
+	flakyMaxRows = 5
+	flakyMaxDays = 7
+)
+
+// flakyEntry хранит строку таблицы карантина. Даты хранятся явно, чтобы просрочку
+// было видно без вычислений.
+type flakyEntry struct {
+	caseName string
+	reason   string
+	added    time.Time
+	expires  time.Time
+}
+
+// parseFlakyTable читает строки карантина из README. Формат строки:
+// | кейс | причина | добавлен (YYYY-MM-DD) | истекает (YYYY-MM-DD) |.
+func parseFlakyTable(readme string) []flakyEntry {
+	var entries []flakyEntry
+	for _, line := range strings.Split(readme, "\n") {
+		m := reFlakyRow.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil {
+			continue
+		}
+		added, errAdded := time.Parse("2006-01-02", m[3])
+		expires, errExpires := time.Parse("2006-01-02", m[4])
+		if errAdded != nil || errExpires != nil {
+			continue
+		}
+		entries = append(entries, flakyEntry{
+			caseName: strings.TrimSpace(m[1]),
+			reason:   strings.TrimSpace(m[2]),
+			added:    added,
+			expires:  expires,
+		})
+	}
+	return entries
+}
+
+// checkFlakyQuarantine проверяет лимит в пять строк и срок семь дней.
+// Просроченная строка блокирует: карантин не становится постоянной свалкой.
+func checkFlakyQuarantine(entries []flakyEntry, now time.Time) (string, bool) {
+	var failures []string
+	if len(entries) > flakyMaxRows {
+		failures = append(failures, fmt.Sprintf("строк %d, лимит %d", len(entries), flakyMaxRows))
+	}
+	today := now.Truncate(24 * time.Hour)
+	for _, e := range entries {
+		if e.expires.Before(e.added) {
+			failures = append(failures, fmt.Sprintf("%s: истекает раньше добавления", e.caseName))
+			continue
+		}
+		if e.expires.Sub(e.added) > flakyMaxDays*24*time.Hour {
+			failures = append(failures, fmt.Sprintf("%s: срок %d дней больше лимита %d",
+				e.caseName, int(e.expires.Sub(e.added).Hours()/24), flakyMaxDays))
+		}
+		if !e.expires.After(today) {
+			failures = append(failures, fmt.Sprintf("%s: срок истёк %s", e.caseName, e.expires.Format("2006-01-02")))
+		}
+	}
+	if len(failures) > 0 {
+		return strings.Join(failures, "; "), false
+	}
+	return fmt.Sprintf("строк %d/%d, срок не более %d дней, просроченных нет",
+		len(entries), flakyMaxRows, flakyMaxDays), true
+}
+
+// evalFlakyQuarantine читает таблицу из README и проверяет лимиты.
+// Негативные контроли показывают, что нарушение лимита строк, срока и
+// просроченная строка действительно блокируют.
+func evalFlakyQuarantine(repoRoot string) (string, bool) {
+	data, err := os.ReadFile(filepath.Join(findGateRoot(repoRoot), "evals", "README.md"))
+	if err != nil {
+		return "evals/README.md: " + err.Error(), false
+	}
+	entries := parseFlakyTable(string(data))
+	actual, ok := checkFlakyQuarantine(entries, time.Now())
+	if !ok {
+		return actual, false
+	}
+
+	now := time.Now()
+	base := now.AddDate(0, 0, -2)
+	tooMany := make([]flakyEntry, flakyMaxRows+1)
+	for i := range tooMany {
+		tooMany[i] = flakyEntry{caseName: fmt.Sprintf("c%d", i), added: base, expires: base.AddDate(0, 0, flakyMaxDays)}
+	}
+	tooLong := []flakyEntry{{caseName: "long", added: base, expires: base.AddDate(0, 0, flakyMaxDays+1)}}
+	expired := []flakyEntry{{caseName: "old", added: base.AddDate(0, 0, -20), expires: base.AddDate(0, 0, -15)}}
+
+	_, manyBad := checkFlakyQuarantine(tooMany, now)
+	_, longBad := checkFlakyQuarantine(tooLong, now)
+	_, expiredBad := checkFlakyQuarantine(expired, now)
+	if !manyBad || !longBad || !expiredBad {
+		return fmt.Sprintf("негативный контроль не сработал: лимит=%t срок=%t просрочка=%t",
+			manyBad, longBad, expiredBad), false
+	}
+	return actual + "; негативные контроли сработали", true
+}
+
+// evalPass5NegativeControl проверяет сам гейт pass^5. Пять успехов проходят,
+// один провал из пяти блокирует.
+func evalPass5NegativeControl() (string, bool) {
+	all := []bool{true, true, true, true, true}
+	one := []bool{true, true, false, true, true}
+	allVerdict, allOK := passGate(all)
+	oneVerdict, oneOK := passGate(one)
+	actual := fmt.Sprintf("пять из пяти: %s=%t; один провал: %s=%t", allVerdict, allOK, oneVerdict, oneOK)
+	return actual, allOK && !oneOK
+}
 
 func main() {
 	os.Exit(run())
 }
 
 func run() int {
-	results := make([]evalResult, 0, 42)
+	results := make([]evalResult, 0, 48)
 	record := func(name, expected, actual string, ok bool) {
 		results = append(results, evalResult{name: name, expected: expected, actual: actual, status: statusOf(ok)})
 	}
@@ -228,7 +392,7 @@ func run() int {
 	wantTools := slices.Clone(contractTools)
 	sort.Strings(wantTools)
 	tools, listErr := session.ListTools(ctx, &mcpsdk.ListToolsParams{})
-	gotTools := make([]string, 0, contractToolCount)
+	gotTools := make([]string, 0, len(contractTools))
 	if listErr == nil {
 		for _, tool := range tools.Tools {
 			gotTools = append(gotTools, tool.Name)
@@ -239,7 +403,7 @@ func run() int {
 	if listErr != nil {
 		actualTools = "tools/list: " + listErr.Error()
 	}
-	record("02_catalog", fmt.Sprintf("ровно %d контрактных имён", contractToolCount),
+	record("02_catalog", fmt.Sprintf("ровно %d контрактных имён", len(contractTools)),
 		fmt.Sprintf("%d: %s", len(gotTools), actualTools),
 		listErr == nil && slices.Equal(gotTools, wantTools))
 
@@ -542,12 +706,19 @@ func run() int {
 	// импортирует репозиторный плагин .opencode/plugins/beacon-bridge.js и
 	// вызывает его реальные экспорты. Ни свой JSON-RPC-клиент, ни подмена кода
 	// плагина здесь не используются: проверяются наблюдаемые факты.
-	bridge, bridgeErr := checkBridgeWakeDelivery(repoRoot, stateRoot, identityWatchID, identityObligationID, identityRevision)
+	// Стохастические кейсы 12-15 и 19-20 прогоняются passTrials раз. Один
+	// провал из пяти блокирует. Однопроходные кейсы читают первый прогон.
+	bridges := make([]bridgeObservation, passTrials)
+	bridgeErrs := make([]error, passTrials)
+	for i := 0; i < passTrials; i++ {
+		bridges[i], bridgeErrs[i] = checkBridgeWakeDelivery(repoRoot, stateRoot, identityWatchID, identityObligationID, identityRevision)
+	}
+	bridge, bridgeErr := bridges[0], bridgeErrs[0]
 
 	// eval 12: валидный указатель доставляется steer, квитанция wx 0600, повтор
 	// той же пары не перезаписывает и не дублирует квитанцию.
 	d := bridge.Delivery
-	deliveryExpected := "1 prompt steer по beacon.review.comment; квитанция wx 0600 posted; повтор не меняет файл"
+	deliveryExpected := "пять из пяти: 1 prompt steer по beacon.review.comment; квитанция wx 0600 posted; повтор не меняет файл"
 	deliveryActual := "нет ответа"
 	if bridgeErr != nil {
 		deliveryActual = "харнесс: " + bridgeErr.Error()
@@ -557,23 +728,25 @@ func run() int {
 			d.ReceiptCount, orNone(d.ReceiptMode), orNone(d.ReceiptOutcome), orNone(d.ReceiptDelivery),
 			orNone(d.ReceiptSource), d.ReceiptUnchanged, d.WakeObserved)
 	}
-	deliveryPass := bridgeErr == nil &&
-		d.CallsAfterFirst == 1 &&
-		d.FirstSessionID == evalWakeSessionID &&
-		d.FirstDelivery == "steer" &&
-		d.WrapperOK && d.HasIDs && d.NoLeak &&
-		d.ReceiptCount == 1 &&
-		d.ReceiptMode == "600" &&
-		d.ReceiptOutcome == "posted" &&
-		d.ReceiptDelivery == "steer" &&
-		d.ReceiptSource == "review" &&
-		d.ReceiptUnchanged &&
-		d.WakeObserved
-	record("12_wake_pointer_delivery", deliveryExpected, deliveryActual, deliveryPass)
+	deliveryVerdict, deliveryPass := bridgeTrials(bridges, bridgeErrs, func(obs bridgeObservation) bool {
+		x := obs.Delivery
+		return x.CallsAfterFirst == 1 &&
+			x.FirstSessionID == evalWakeSessionID &&
+			x.FirstDelivery == "steer" &&
+			x.WrapperOK && x.HasIDs && x.NoLeak &&
+			x.ReceiptCount == 1 &&
+			x.ReceiptMode == "600" &&
+			x.ReceiptOutcome == "posted" &&
+			x.ReceiptDelivery == "steer" &&
+			x.ReceiptSource == "review" &&
+			x.ReceiptUnchanged &&
+			x.WakeObserved
+	})
+	record("12_wake_pointer_delivery", deliveryExpected, "trials "+deliveryVerdict+"; "+deliveryActual, deliveryPass)
 
 	// eval 13: недоверенный текст из события не становится инструкцией в prompt.
 	e := bridge.Escaping
-	escapingExpected := "обёртка цела, сырых <script> и фразы-инструкции нет, экранированные формы есть"
+	escapingExpected := "пять из пяти: обёртка цела, сырых <script> и фразы-инструкции нет, экранированные формы есть"
 	escapingActual := "нет ответа"
 	if bridgeErr != nil {
 		escapingActual = "харнесс: " + bridgeErr.Error()
@@ -581,14 +754,16 @@ func run() int {
 		escapingActual = fmt.Sprintf("wrapper=%t, rawScript=%t, rawInstruction=%t, escapedScript=%t, escapedInstruction=%t, ids=%t, lenOK=%t, prompt=%s",
 			e.WrapperOK, e.HasRawScript, e.HasRawInstruction, e.HasEscapedScript, e.HasEscapedInstruction, e.HasIDs, e.LengthOK, clip(e.Text, 60))
 	}
-	escapingPass := bridgeErr == nil &&
-		e.WrapperOK && !e.HasRawScript && !e.HasRawInstruction &&
-		e.HasEscapedScript && e.HasEscapedInstruction && e.HasIDs && e.LengthOK
-	record("13_untrusted_escaping", escapingExpected, escapingActual, escapingPass)
+	escapingVerdict, escapingPass := bridgeTrials(bridges, bridgeErrs, func(obs bridgeObservation) bool {
+		x := obs.Escaping
+		return x.WrapperOK && !x.HasRawScript && !x.HasRawInstruction &&
+			x.HasEscapedScript && x.HasEscapedInstruction && x.HasIDs && x.LengthOK
+	})
+	record("13_untrusted_escaping", escapingExpected, "trials "+escapingVerdict+"; "+escapingActual, escapingPass)
 
 	// eval 14: ошибка prompt даёт transport-failed в квитанции, а не ложный posted.
 	t := bridge.Transport
-	transportExpected := "outcome=transport-failed в квитанции wx 0600, posted-квитанции нет"
+	transportExpected := "пять из пяти: outcome=transport-failed в квитанции wx 0600, posted-квитанции нет"
 	transportActual := "нет ответа"
 	if bridgeErr != nil {
 		transportActual = "харнесс: " + bridgeErr.Error()
@@ -596,15 +771,17 @@ func run() int {
 		transportActual = fmt.Sprintf("outcome=%s, delivery=%s, receiptCreated=%t, promptCalls=%d, receiptOutcome=%s, mode=%s, postedReceipt=%t",
 			orNone(t.Outcome), orNone(t.Delivery), t.ReceiptCreated, t.PromptCalls, orNone(t.ReceiptOutcome), orNone(t.ReceiptMode), t.PostedReceipt)
 	}
-	transportPass := bridgeErr == nil &&
-		t.Outcome == "transport-failed" &&
-		t.Delivery == "steer" &&
-		t.ReceiptCreated &&
-		t.PromptCalls == 1 &&
-		t.ReceiptOutcome == "transport-failed" &&
-		t.ReceiptMode == "600" &&
-		!t.PostedReceipt
-	record("14_transport_failed", transportExpected, transportActual, transportPass)
+	transportVerdict, transportPass := bridgeTrials(bridges, bridgeErrs, func(obs bridgeObservation) bool {
+		x := obs.Transport
+		return x.Outcome == "transport-failed" &&
+			x.Delivery == "steer" &&
+			x.ReceiptCreated &&
+			x.PromptCalls == 1 &&
+			x.ReceiptOutcome == "transport-failed" &&
+			x.ReceiptMode == "600" &&
+			!x.PostedReceipt
+	})
+	record("14_transport_failed", transportExpected, "trials "+transportVerdict+"; "+transportActual, transportPass)
 
 	// eval 15: wake-указатель несёт идентификаторы из реального store, а не
 	// синтетические значения eval 12. Харнесс передаёт в buildPromptText те же
@@ -614,17 +791,19 @@ func run() int {
 	// колонке ACTUAL. Ack с теми же ID подтверждает цепочку store → указатель
 	// → обязательство.
 	identity := bridge.RealIDs
-	identityExpected := "watchID, obligationID и revision в указателе выведены из store; ack ok=true"
+	identityExpected := "пять из пяти: watchID, obligationID и revision в указателе выведены из store; ack ok=true"
 	identityActual := fmt.Sprintf("%s; %s; prompt: watch=%t (%d→%d), obl=%t (%d→%d), rev=%t; ack=%s",
 		identityWatchActual, identityGetActual,
 		identity.WatchIDFromStore, identity.WatchIDLen, identity.PromptWatchIDLen,
 		identity.ObligationIDFromStore, identity.ObligationIDLen, identity.PromptObligationIDLen,
 		identity.RevisionEqual, identityAckActual)
-	identityPass := bridgeErr == nil &&
-		identityWatchID != "" && identityObligationID != "" &&
-		identity.WatchIDFromStore && identity.ObligationIDFromStore && identity.RevisionEqual &&
-		identityAckOK
-	record("15_real_store_wake_identity", identityExpected, identityActual, identityPass)
+	identityVerdict, identityPass := bridgeTrials(bridges, bridgeErrs, func(obs bridgeObservation) bool {
+		x := obs.RealIDs
+		return identityWatchID != "" && identityObligationID != "" &&
+			x.WatchIDFromStore && x.ObligationIDFromStore && x.RevisionEqual &&
+			identityAckOK
+	})
+	record("15_real_store_wake_identity", identityExpected, "trials "+identityVerdict+"; "+identityActual, identityPass)
 
 	// eval W14-W18: исполняемый контракт авто-мерж-цикла из ADR 0072.
 	// Модель, негативные контроли и причины описаны в evals/README.md.
@@ -788,16 +967,24 @@ func run() int {
 			len(ro.Modes) == 2 && ro.Modes[0] == "600" && ro.Modes[1] == "600")
 
 	cp := bridge.CloudPointer
+	cpVerdict, cpPass := bridgeTrials(bridges, bridgeErrs, func(obs bridgeObservation) bool {
+		x := obs.CloudPointer
+		return x.Received && x.ProjectPreserved && x.NoLocalSpool
+	})
 	record("19_w11_cloud_pointer",
-		"указатель из облачного каталога без локального spool, проект сохранён",
-		fmt.Sprintf("received=%t, project=%t, noSpool=%t", cp.Received, cp.ProjectPreserved, cp.NoLocalSpool),
-		bridgeErr == nil && cp.Received && cp.ProjectPreserved && cp.NoLocalSpool)
+		"пять из пяти: указатель из облачного каталога без локального spool, проект сохранён",
+		"trials "+cpVerdict+"; "+fmt.Sprintf("received=%t, project=%t, noSpool=%t", cp.Received, cp.ProjectPreserved, cp.NoLocalSpool),
+		cpPass)
 
 	ll := bridge.LocationLiveness
+	llVerdict, llPass := bridgeTrials(bridges, bridgeErrs, func(obs bridgeObservation) bool {
+		x := obs.LocationLiveness
+		return x.Stable && x.FallbackDifferent
+	})
 	record("20_w12_location_liveness",
-		"каталог проекта стабилен, без location глобальный fallback",
-		fmt.Sprintf("stable=%t, fallback=%t", ll.Stable, ll.FallbackDifferent),
-		bridgeErr == nil && ll.Stable && ll.FallbackDifferent)
+		"пять из пяти: каталог проекта стабилен, без location глобальный fallback",
+		"trials "+llVerdict+"; "+fmt.Sprintf("stable=%t, fallback=%t", ll.Stable, ll.FallbackDifferent),
+		llPass)
 
 	piActual, piPass := checkAdapterHonesty(wake.AdapterPi)
 	record("21_w05_pi_honest_unsupported", "pi не выдаёт ложный ok; после Register одна доставка", piActual, piPass)
@@ -813,6 +1000,24 @@ func run() int {
 		"замечание: сетевой CIProvider не опрашивается, headSHA заглушка",
 		fmt.Sprintf("headSHA=%s… (stub), сеть не используется", evalHeadSHA[:12]),
 		statusWarn)
+
+	// CT01: список инструментов живёт в одном месте, хеш заморожен.
+	ctActual, ctPass := checkContractToolsFrozen()
+	record("CT01_contract_tools_frozen",
+		"хеш contractTools совпадает с замороженным; один источник истины",
+		ctActual, ctPass)
+
+	// FQ01: таблица карантина имеет лимит строк и семидневный срок.
+	fqActual, fqPass := evalFlakyQuarantine(repoRoot)
+	record("FQ01_flaky_quarantine_limits",
+		"не более пяти строк, срок не более семи дней, просроченных нет",
+		fqActual, fqPass)
+
+	// PC01: негативный контроль гейта pass^5. Один провал из пяти блокирует.
+	pcActual, pcPass := evalPass5NegativeControl()
+	record("PC01_pass5_negative_control",
+		"пять из пяти проходят; один провал из пяти блокирует",
+		pcActual, pcPass)
 
 	printTable(results)
 	summary := summarize(results)
