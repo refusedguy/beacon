@@ -1,5 +1,5 @@
 # RS-WK-03. Восстановление dedupe индекса из журнала
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/app/worker/effect.go, internal/app/worker/effect_test.go
@@ -31,3 +31,6 @@ baseline: 2026-11-21 по origin/main d3b1bfb. `grep -c 'deliveries\|headSHAs' i
   Уникальный ключ уже даёт no-op. `RecordDelivery` пишет через `INSERT OR IGNORE` в `webhook_events.go:111-117`, повтор не создаёт вторую строку. Второй эффект подавляет runner, как записано в `internal/app/worker/effect.go:23-31`.
 
   Статус todo сохранён. Код не писал, gofmt не применял, `go test` не запускал. OwnerFiles, чужие файлы и wiring/.beacon не трогал. Блокер возвращён оркестратору. Для карточки нужны OwnerFiles с `internal/infra/webhook/filters.go`, `internal/infra/store/webhook_events.go` и точкой старта в `cmd/beacon`, либо переформулировка шагов под уже существующее поведение.
+
+## Подтверждение
+- PR #872 MERGED: 2026-11-21 (squash).

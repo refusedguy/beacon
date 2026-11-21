@@ -1,5 +1,5 @@
 # RS-WK-04. Уже обработанная доставка как успешный ответ
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/webhook/receiver.go, internal/infra/webhook/receiver_test.go
@@ -24,3 +24,6 @@ baseline: `grep -c 'Duplicate' internal/infra/webhook/receiver.go` = 0; `grep -n
   Честное подключение результата RecordDelivery к приёмнику требует чужих OwnerFiles. Порт `DeliveryRecorder.Record` в receiver.go:48-49 возвращает только `claimed bool`. Флагов Duplicate и Conflict в нём нет. Единственный рабочий адаптер `webhookDeliveryRecorder` живёт в cmd/beacon/mcp.go:787-796, а дедупликацию ведёт `MemoryDeliveryJournal.ClaimDelivery` в internal/infra/webhook/workflow_run.go:54-79. Оба файла вне OwnerFiles карточки. `RecordDelivery` лежит в internal/infra/store/webhook_events.go:97-152 и не имеет ни одного рабочего вызывающего. Адаптер store для приёмника нельзя положить в internal/infra/webhook: AGENTS.md запрещает infra импортировать соседнюю infra. Нужен файл в cmd/beacon или internal/app. Тест на изменение тела требует, чтобы порт различал Duplicate и Conflict. С булевым портом изменение тела даёт тот же `claimed=false`, что и повтор с прежним телом, поэтому отделить Conflict от Duplicate внутри OwnerFiles нельзя.
 
   Статус todo сохранён. Код не писал, gofmt не применял, OwnerFiles не менял, чужие файлы и wiring/.beacon не трогал. Блокер возвращён оркестратору: для карточки нужны OwnerFiles с cmd/beacon/mcp.go и internal/infra/webhook/workflow_run.go либо переформулировка шагов под уже существующее поведение.
+
+## Подтверждение
+- PR #874 MERGED: 2026-11-21 (squash).
