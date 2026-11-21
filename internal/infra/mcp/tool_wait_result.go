@@ -381,8 +381,8 @@ func cloneWaitResultOutput(out WaitResultOutput) WaitResultOutput {
 // waitStart is one registered start of a wait, keyed by StartKey (ADR 0045 p1).
 // The owner of the entry runs the wait and publishes the outcome; a repeat with
 // the same key waits on done and returns that outcome without running a second
-// wait. The index lives for the lifetime of the service, like the
-// clientRequestId index.
+// wait, even when the first response was lost. The registry evicts the oldest
+// start when it fills, so the index cannot grow without bound.
 type waitStart struct {
 	done chan struct{}
 	out  WaitResultOutput
@@ -407,16 +407,36 @@ func (e *waitStart) await(ctx context.Context) (WaitResultOutput, error) {
 	}
 }
 
-// waitStartRegistry maps a StartKey to the wait it first started. begin returns
-// the entry and true for the caller that must run the wait, false for a repeat
-// that only joins the existing one.
+// maxWaitStarts bounds the number of live start keys. Without a cap a caller
+// that keeps sending fresh start keys would grow the registry for the lifetime
+// of the service. Eviction drops the oldest start first; a caller already
+// holding an entry is unaffected because finish still releases its joiners.
+const maxWaitStarts = 4096
+
+// waitStartRegistry maps a StartKey to the wait it first started, up to
+// maxWaitStarts live starts. begin returns the entry and true for the caller
+// that must run the wait, false for a repeat that only joins the existing one.
+// A start stays available for replay until the registry evicts it.
 type waitStartRegistry struct {
 	mu     sync.Mutex
 	starts map[string]*waitStart
+	order  []string // start keys in insertion order, for oldest-first eviction
 }
 
 func newWaitStartRegistry() *waitStartRegistry {
 	return &waitStartRegistry{starts: make(map[string]*waitStart)}
+}
+
+// forgetLocked removes a key from the eviction order. The caller holds r.mu.
+func (r *waitStartRegistry) forgetLocked(key string) {
+	for i, k := range r.order {
+		if k == key {
+			copy(r.order[i:], r.order[i+1:])
+			r.order[len(r.order)-1] = ""
+			r.order = r.order[:len(r.order)-1]
+			return
+		}
+	}
 }
 
 func (r *waitStartRegistry) begin(key string) (*waitStart, bool) {
@@ -428,8 +448,14 @@ func (r *waitStartRegistry) begin(key string) (*waitStart, bool) {
 	if existing, ok := r.starts[key]; ok {
 		return existing, false
 	}
+	if len(r.starts) >= maxWaitStarts {
+		oldest := r.order[0]
+		delete(r.starts, oldest)
+		r.forgetLocked(oldest)
+	}
 	entry := &waitStart{done: make(chan struct{})}
 	r.starts[key] = entry
+	r.order = append(r.order, key)
 	return entry, true
 }
 
@@ -1077,7 +1103,7 @@ func (s *WaitResultService) waitScoped(ctx context.Context, subscriberID string,
 // key joins that entry: it opens no subscription and creates no second task,
 // even when the first response was lost. Unlike clientRequestId, a departure
 // does not clear the key, because the join must survive a broken connection.
-func (s *WaitResultService) waitStarted(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (WaitResultOutput, error) {
+func (s *WaitResultService) waitStarted(ctx context.Context, subscriberID string, in WaitResultInput, exits CallerExit, capCtx *CapabilityContext) (out WaitResultOutput, err error) {
 	if s == nil || in.StartKey == "" || s.starts == nil {
 		return s.wait(ctx, subscriberID, in, exits, capCtx)
 	}
@@ -1085,9 +1111,10 @@ func (s *WaitResultService) waitStarted(ctx context.Context, subscriberID string
 	if !owner {
 		return entry.await(ctx)
 	}
-	out, err := s.wait(ctx, subscriberID, in, exits, capCtx)
-	entry.finish(out, err)
-	return out, err
+	// The owner always publishes, even if wait panics or a future edit adds an
+	// early return: a joiner must never block on done with a long context.
+	defer func() { entry.finish(out, err) }()
+	return s.wait(ctx, subscriberID, in, exits, capCtx)
 }
 
 // cancelledByCapability builds the error for a wait whose capability context is
