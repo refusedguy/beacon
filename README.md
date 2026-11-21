@@ -217,7 +217,7 @@ Executor видит внешнюю поломку и отвечает `beacon_ac
 | `beacon watch [--live] [--interval 2s]` | Таблица Watch и сессий. `--live` подписывается на SSE |
 | `beacon spawn <taskID>`, `beacon attach <sessionID>`, `beacon deliver <watchID>` | Создание сессии, подключение и доставка результата по Watch |
 | `beacon ci check --all` | Опрашивает открытые PR через CI-провайдер |
-| `beacon daemon [--interval] [--once]` | Фоновый цикл. Шаг по умолчанию раз в три минуты |
+| `beacon daemon [--interval 0 = адаптивный 10s/30s] [--once]` | Фоновый цикл. Интервал прохода по умолчанию: 0 = адаптивный 10s/30s |
 | `beacon pr create` | Открывает PR по карточке |
 | `beacon inspect [<pr\|watchID>] [--json]` | Читает Watch, блокеры, привязку оркестратора, счётчики и журнал эскалаций |
 | `beacon logs [--tail N] [--watch id] [--pr n] [--errors] [--json]` | Читает структурированные логи проекта |
