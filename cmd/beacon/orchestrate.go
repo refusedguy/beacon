@@ -242,6 +242,7 @@ func runOrchestrate(c *CLI, args []string) int {
 		orchestrator.Options{DryRun: *dryRun, Resolver: deps.Resolver})
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon orchestrate: %v\n", err)
+		return 2
 	}
 	if *format == "json" {
 		if encErr := renderOrchestratorJSON(c.out, result); encErr != nil {
@@ -250,9 +251,6 @@ func runOrchestrate(c *CLI, args []string) int {
 		}
 	} else {
 		renderOrchestratorTable(c.out, result)
-	}
-	if err != nil {
-		return 2
 	}
 	return 0
 }

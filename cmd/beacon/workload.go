@@ -140,6 +140,7 @@ func runWorkload(c *CLI, args []string) int {
 	report, err := orchestrator.RunWorkload(context.Background(), deps.Store)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon workload: %v\n", err)
+		return 2
 	}
 	if *format == "json" {
 		if encErr := renderWorkloadJSON(c.out, report); encErr != nil {
@@ -148,9 +149,6 @@ func runWorkload(c *CLI, args []string) int {
 		}
 	} else {
 		renderWorkloadTable(c.out, report)
-	}
-	if err != nil {
-		return 2
 	}
 	return 0
 }
