@@ -14,7 +14,7 @@
   ],
   "allowed": [
     {"from": "internal/infra", "to": "internal/domain"},
-    {"from": "internal/beacon", "to": "internal/infra"},
+    {"from": "internal/beacon", "to": "internal/infra", "shared": true},
     {"from": "internal/app", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/app"},
