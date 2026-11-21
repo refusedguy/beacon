@@ -1323,26 +1323,50 @@ type T212PromptData struct {
 // T212buildPromptText returns the <beacon-event> envelope. It has no check
 // name, PR title or branch, and never exceeds 512 bytes. ID is the explicit
 // notification id, set to the same ObligationKey as obligationID.
+//
+// The size cap works on whole JSON fields, never on the marshaled bytes.
+// Trimming the serialized text with text[:keep] can split a string token and
+// leave invalid JSON, which the wake receiver cannot parse. Instead we shrink
+// the string values by runes and marshal again until the envelope fits. Each
+// attempt produces a complete JSON object, so the result stays parseable.
 func T212buildPromptText(p T210WakePointer) string {
-	obligationID := T212clamp(T212escapeUntrusted(p.ObligationID), 96)
-	data := T212PromptData{
-		ID:           obligationID,
-		WatchID:      T212clamp(T212escapeUntrusted(p.WatchID), 96),
-		ObligationID: obligationID,
-		Revision:     p.Revision,
-		VerdictRef:   T212clamp(T212escapeUntrusted(p.VerdictRef), 96),
+	const (
+		limit    = 512
+		maxField = 96
+	)
+	prefix := "<beacon-event>"
+	suffix := "</beacon-event>"
+
+	watched := T212escapeUntrusted(p.WatchID)
+	obligation := T212escapeUntrusted(p.ObligationID)
+	verdict := T212escapeUntrusted(p.VerdictRef)
+
+	build := func(fieldCap int) T212PromptData {
+		ob := T212clamp(obligation, fieldCap)
+		return T212PromptData{
+			ID:           ob,
+			WatchID:      T212clamp(watched, fieldCap),
+			ObligationID: ob,
+			Revision:     p.Revision,
+			VerdictRef:   T212clamp(verdict, fieldCap),
+		}
 	}
-	raw, err := json.Marshal(data)
-	if err != nil {
-		raw = []byte(`{}`)
+	marshal := func(d T212PromptData) []byte {
+		raw, err := json.Marshal(d)
+		if err != nil {
+			return []byte(`{}`)
+		}
+		return raw
 	}
-	const limit = 512
-	text := "<beacon-event>" + string(raw) + "</beacon-event>"
-	if len(text) > limit {
-		keep := limit - len("</beacon-event>")
-		text = text[:keep] + "</beacon-event>"
+
+	fieldCap := maxField
+	raw := marshal(build(fieldCap))
+	for len(prefix)+len(raw)+len(suffix) > limit && fieldCap > 0 {
+		fieldCap /= 2
+		raw = marshal(build(fieldCap))
 	}
-	return text
+
+	return prefix + string(raw) + suffix
 }
 
 // ===== T3.222 канонический ключ _meta для сессии (#320) =====
