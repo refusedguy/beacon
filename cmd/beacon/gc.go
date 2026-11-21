@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"os/signal"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -121,13 +124,57 @@ func gcServePlan(serves []opencode.ServeProcess, servicePID int, servicePort str
 	return items
 }
 
+// gcOrphanInterval is the period of the scheduled orphan sweep. The leak
+// reports measured about twenty serve processes in two hours, so ten minutes
+// catches a leak before the alarm threshold of two live servers.
+const gcOrphanInterval = 10 * time.Minute
+
+// gcTicker and gcShutdown are seams around the timer and the stop signal. A
+// test can drive a finite set of ticks and close done; production uses a real
+// ticker and SIGINT or SIGTERM.
+var (
+	gcTicker = func(d time.Duration) (<-chan time.Time, func()) {
+		t := time.NewTicker(d)
+		return t.C, t.Stop
+	}
+	gcShutdown = func() (<-chan struct{}, func()) {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		return ctx.Done(), stop
+	}
+)
+
+// runGCScheduled sweeps once at startup, then once per interval until the
+// process is stopped. A failed sweep is reported and the timer keeps running:
+// a transient store or process error must not disable orphan cleanup.
+func runGCScheduled(c *CLI, apply bool, format string, interval time.Duration) int {
+	if code := gcSweep(c, apply, format); code != 0 {
+		return code
+	}
+	ticks, stopTicks := gcTicker(interval)
+	defer stopTicks()
+	done, stopSignals := gcShutdown()
+	defer stopSignals()
+	for {
+		select {
+		case <-ticks:
+			if code := gcSweep(c, apply, format); code != 0 {
+				fmt.Fprintf(c.errOut, "beacon gc: запланированный проход завершился кодом %d\n", code)
+			}
+		case <-done:
+			return 0
+		}
+	}
+}
+
 // runGCWithServe keeps the read-only/apply split of the existing collector.
 // A plain run prints the plan; --apply removes stale state and terminates the
-// orphaned serve processes it found.
+// orphaned serve processes it found. A positive --interval repeats the sweep
+// every interval, starting with one pass at startup.
 func runGCWithServe(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
 	format := fs.String("format", "table", "формат вывода: table или json")
 	apply := fs.Bool("apply", false, "удалить найденные записи и terminate сироты")
+	interval := fs.Duration("interval", 0, "период повтора уборки, 0 = один проход; рекомендуется "+gcOrphanInterval.String())
 	if !parseFlags("gc", args, c.errOut, fs) {
 		return 2
 	}
@@ -136,7 +183,19 @@ func runGCWithServe(c *CLI, args []string) int {
 		writeUsage(c.errOut)
 		return 2
 	}
+	if *interval < 0 {
+		fmt.Fprintf(c.errOut, "beacon gc: отрицательный интервал %v\n", *interval)
+		return 2
+	}
+	if *interval > 0 {
+		return runGCScheduled(c, *apply, *format, *interval)
+	}
+	return gcSweep(c, *apply, *format)
+}
 
+// gcSweep is one pass of the collector. It stays separate from flag parsing
+// so the scheduled mode uses the same dry-run and apply rules.
+func gcSweep(c *CLI, apply bool, format string) int {
 	plan := make([]gcItem, 0)
 	var legacy []gcItem
 	if state, err := gcReadState(); err == nil {
@@ -160,7 +219,7 @@ func runGCWithServe(c *CLI, args []string) int {
 	// The store selects obligations of closed Watches past the replay window.
 	// One call plans a dry run and erases on --apply, so the report lists the
 	// exact rows that were removed.
-	obligations, err := gcObligationsForGC(c, *apply)
+	obligations, err := gcObligationsForGC(c, apply)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon gc: обязательства: %v\n", err)
 		return 2
@@ -169,12 +228,12 @@ func runGCWithServe(c *CLI, args []string) int {
 	for _, o := range obligations {
 		obligationItems = append(obligationItems, gcItem{Kind: gcKindObligation, ID: o.ID, Reason: o.Reason})
 	}
-	if !*apply {
+	if !apply {
 		plan = append(plan, obligationItems...)
 	}
 
-	if !*apply {
-		if *format == "json" {
+	if !apply {
+		if format == "json" {
 			if err := renderGCJSON(c.out, gcResult{Mode: "dry-run", Removed: len(plan), Items: plan}); err != nil {
 				fmt.Fprintf(c.errOut, "beacon gc: %v\n", err)
 				return 2
@@ -223,7 +282,7 @@ func runGCWithServe(c *CLI, args []string) int {
 	if removed == nil {
 		removed = []gcItem{}
 	}
-	if *format == "json" {
+	if format == "json" {
 		if err := renderGCJSON(c.out, gcResult{Mode: "applied", Removed: len(removed), Items: removed}); err != nil {
 			fmt.Fprintf(c.errOut, "beacon gc: %v\n", err)
 			return 2
