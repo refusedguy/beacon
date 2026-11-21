@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -209,5 +211,57 @@ func TestRSCMP06ValidAnswerPostsTypedOutcome(t *testing.T) {
 	}
 	if decider.req.Verb != "approve" || decider.req.Target != "w-9" || decider.req.Note != "looks good" {
 		t.Fatalf("request = %+v", decider.req)
+	}
+}
+
+// humanJSONHarness is the w8b harness with the output buffers kept so a test
+// can decode the structured result of a decision.
+func humanJSONHarness(t *testing.T, withConnection bool) (*CLI, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+	dir := t.TempDir()
+	if withConnection {
+		data := []byte(`{"host":"127.0.0.1","port":8787,"token":"t"}`)
+		if err := os.WriteFile(filepath.Join(dir, "connection.json"), data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c, out, errOut, _ := w69CLI(t, nil)
+	prevDir, prevDecider, prevStore := humanStateDir, humanDeciderFor, humanStoreFor
+	humanStateDir = func() (string, error) { return dir, nil }
+	humanDeciderFor = func(httpapi.ClientConn) (humanDecider, error) {
+		return &w8bDecider{resp: httpapi.ClientDecisionReceipt{OK: true, Applied: true}}, nil
+	}
+	humanStoreFor = func(string) humanDecisionStore { return &w8bStore{} }
+	t.Cleanup(func() {
+		humanStateDir, humanDeciderFor, humanStoreFor = prevDir, prevDecider, prevStore
+	})
+	return c, out, errOut
+}
+
+func TestW8BHumanJSONHTTP(t *testing.T) {
+	c, out, errOut, _ := humanJSONHarness(t, true)
+	if code := runHuman(c, []string{"--format", "json", "approve", "w-json"}); code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, errOut.String())
+	}
+	var res humanResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		t.Fatalf("decode human JSON: %v; output: %q", err, out.String())
+	}
+	if res.Verb != "approve" || res.Target != "w-json" || res.State != "ok" || res.Transport != "http" {
+		t.Fatalf("result = %+v, want approve/w-json/ok/http", res)
+	}
+}
+
+func TestW8BHumanJSONSQLite(t *testing.T) {
+	c, out, errOut, _ := humanJSONHarness(t, false)
+	if code := runHuman(c, []string{"--format", "json", "unblock", "b-json"}); code != 0 {
+		t.Fatalf("code = %d, stderr = %s", code, errOut.String())
+	}
+	var res humanResult
+	if err := json.Unmarshal(out.Bytes(), &res); err != nil {
+		t.Fatalf("decode human JSON: %v; output: %q", err, out.String())
+	}
+	if res.Verb != "unblock" || res.Target != "b-json" || res.State != "applied via sqlite" || res.Transport != "sqlite" {
+		t.Fatalf("result = %+v, want unblock/b-json/applied via sqlite/sqlite", res)
 	}
 }

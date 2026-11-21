@@ -172,6 +172,9 @@ func runInspect(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon inspect: blockers: %v\n", err)
 		return 2
 	}
+	if view.Blockers == nil {
+		view.Blockers = []domain.BlockerIncident{}
+	}
 	if binding, bound, err := s.BoundOrchestrator(orchestratorProjectKey()); err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: orchestrator: %v\n", err)
 		return 2

@@ -118,3 +118,23 @@ func TestInspectJSONIncludesBoundOrchestrator(t *testing.T) {
 		t.Errorf("boundAt = %s, want %s", view.Orchestrator.BoundAt, s.binding.BoundAt)
 	}
 }
+
+func TestInspectJSONEmptyBlockersIsArray(t *testing.T) {
+	c, out, errOut, _ := t06NewCLI(t, nil)
+	installFakeInspectStore(t, &fakeInspectStore{})
+
+	if code := c.Run([]string{"inspect", "--json"}); code != 0 {
+		t.Fatalf("code = %d, stderr: %s", code, errOut.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+		t.Fatalf("decode inspect JSON: %v; output: %q", err, out.String())
+	}
+	blockers, ok := raw["blockers"]
+	if !ok {
+		t.Fatalf("blockers field missing: %q", out.String())
+	}
+	if got := strings.TrimSpace(string(blockers)); got != "[]" {
+		t.Errorf("blockers = %s, want []", got)
+	}
+}
