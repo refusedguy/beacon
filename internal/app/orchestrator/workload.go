@@ -58,9 +58,10 @@ type WorkloadWatch struct {
 
 // Workload is the answer printed by `beacon workload`. Ready is the number of
 // Watches awaiting a merge, NeedsAttention the ones blocked on retry/rebase,
-// Watching the ones still in progress. The three maps group the same Watches
-// by verdict, subscriber role and project. Registered counts the new
-// orchestrator subscriptions installed during the pass.
+// Watching the ones still in progress. ByAttention splits NeedsAttention by
+// typed reason. The other maps group the same Watches by verdict, subscriber
+// role and project. Registered counts the new orchestrator subscriptions
+// installed during the pass.
 type Workload struct {
 	Total          int            `json:"total"`
 	Ready          int            `json:"ready"`
@@ -70,6 +71,7 @@ type Workload struct {
 	ByVerdict      map[string]int `json:"byVerdict"`
 	ByRole         map[string]int `json:"byRole"`
 	ByProject      map[string]int `json:"byProject"`
+	ByAttention    map[string]int `json:"byAttention"`
 }
 
 // WorkloadStore is the port the command needs from Beacon state: read the
@@ -87,15 +89,37 @@ func normalizeToken(v string) string {
 	return strings.ToLower(strings.TrimSpace(v))
 }
 
-// needsAttention reports whether a verdict is blocked and needs an agent to
-// act: retry, rebase, keep_working or a timeout. Ready and watching are
-// deliberately not counted here.
-func needsAttention(verdict string) bool {
+// workloadAttention is the app-layer mirror of domain.Attention. The layer
+// matrix forbids internal/app -> internal/domain (ADR 0005), so the values are
+// plain strings here. An empty Reason means no known trigger, not proof that
+// the Watch is clear.
+type workloadAttention struct {
+	Level      string
+	Reason     string
+	NextAction string
+}
+
+// NeedsAction reports whether an agent has to act on the Watch.
+func (a workloadAttention) NeedsAction() bool {
+	return a.Level == "action"
+}
+
+// attentionForVerdict classifies a verdict into the typed attention model.
+// Retry, rebase, keep_working and timeout need an agent. Ready, watching and
+// unrecognised sources get no reason, which is not proof that the Watch is
+// clear.
+func attentionForVerdict(verdict string) workloadAttention {
 	switch normalizeToken(verdict) {
-	case VerdictRetry, workloadVerdictRebase, workloadVerdictKeepWorking, workloadVerdictTimeout:
-		return true
+	case VerdictRetry:
+		return workloadAttention{Level: "action", Reason: "retry", NextAction: "rerun the failed checks"}
+	case workloadVerdictRebase:
+		return workloadAttention{Level: "action", Reason: "rebase", NextAction: "rebase onto origin/main"}
+	case workloadVerdictKeepWorking:
+		return workloadAttention{Level: "action", Reason: "keep_working", NextAction: "resume the failed checks"}
+	case workloadVerdictTimeout:
+		return workloadAttention{Level: "action", Reason: "timeout", NextAction: "inspect the Watch and decide whether to continue"}
 	}
-	return false
+	return workloadAttention{}
 }
 
 // hasWorkloadRole reports whether w already carries a subscriber with role.
@@ -110,15 +134,17 @@ func hasWorkloadRole(w WorkloadWatch, role string) bool {
 	return false
 }
 
-// BuildWorkload groups watches by verdict, subscriber role and project and
-// counts the three headline buckets. It is pure: it never writes to the store.
+// BuildWorkload groups watches by verdict, subscriber role, project and typed
+// attention reason, and counts the three headline buckets. It is pure: it never
+// writes to the store.
 // Each role is counted at most once per Watch, so a Watch with two executors
 // still contributes one to byRole["executor"].
 func BuildWorkload(watches []WorkloadWatch) Workload {
 	out := Workload{
-		ByVerdict: make(map[string]int),
-		ByRole:    make(map[string]int),
-		ByProject: make(map[string]int),
+		ByVerdict:   make(map[string]int),
+		ByRole:      make(map[string]int),
+		ByProject:   make(map[string]int),
+		ByAttention: make(map[string]int),
 	}
 	for _, w := range watches {
 		out.Total++
@@ -130,10 +156,12 @@ func BuildWorkload(watches []WorkloadWatch) Workload {
 		switch {
 		case verdict == VerdictReady:
 			out.Ready++
-		case needsAttention(verdict):
-			out.NeedsAttention++
 		case verdict == workloadVerdictWatching:
 			out.Watching++
+		}
+		if attention := attentionForVerdict(verdict); attention.NeedsAction() {
+			out.NeedsAttention++
+			out.ByAttention[attention.Reason]++
 		}
 
 		project := normalizeToken(w.Project)
