@@ -234,10 +234,13 @@ func (d *DB) rawWrite(ctx context.Context, fn func(*sql.Tx) error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Hold the read lock through the enqueue. Close takes the write lock before
+	// it closes closing and makes the writer drain the queue, so a job queued
+	// here is always picked up by the writer. Releasing the lock earlier would
+	// let Close finish first and leave the job queued with nobody to run it.
 	d.mu.RLock()
-	closed := d.closed
-	d.mu.RUnlock()
-	if closed {
+	if d.closed {
+		d.mu.RUnlock()
 		return errClosed
 	}
 
@@ -245,18 +248,19 @@ func (d *DB) rawWrite(ctx context.Context, fn func(*sql.Tx) error) error {
 	select {
 	case d.writeCh <- job:
 	case <-ctx.Done():
+		d.mu.RUnlock()
 		return ctx.Err()
-	case <-d.closing:
-		return errClosed
 	}
-	select {
-	case err := <-job.err:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-d.closing:
-		return errClosed
-	}
+	d.mu.RUnlock()
+
+	// Once the job is queued, its execution belongs to the writer. Wait for the
+	// job's result instead of returning on ctx.Done or closing: a caller must
+	// not observe a return while the transaction is still committing or
+	// rolling back its side effect (ATX-16). Cancellation still reaches the job
+	// through job.ctx, so the job finishes and reports the outcome this wait
+	// reads. Returning that outcome is honest: a write that committed before a
+	// late cancellation is still a success.
+	return <-job.err
 }
 
 func (d *DB) writeLoop() {
