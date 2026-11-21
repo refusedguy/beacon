@@ -219,6 +219,25 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 		}
 	}
 	failed := realFailures(s)
+	// The rollup counts every check, including informational ones. When the
+	// per-check facts are present and no required check failed, a red rollup
+	// came from a failed required:false gate and must not move the verdict.
+	// Rebuild the rollup from the checks that can block: a pending required
+	// check keeps the Watch in watching, an all-green set can reach ready.
+	if len(s.Checks) > 0 && rollup == "FAILURE" && len(failed) == 0 {
+		rollup = "SUCCESS"
+		for _, c := range s.Checks {
+			if !c.Required {
+				continue
+			}
+			green := NormalizeConclusion(c.Conclusion) == "SUCCESS" ||
+				NormalizeConclusion(c.State) == "SUCCESS"
+			if !green {
+				rollup = "PENDING"
+				break
+			}
+		}
+	}
 	if rollup == "FAILURE" || rollup == "ERROR" || len(failed) > 0 {
 		// A PR left behind by a fixed main must rebase, not keep working. The
 		// behindBy signal arrives from the batch as mergeStateStatus=BEHIND;
@@ -285,6 +304,7 @@ func NormalizeConclusion(value string) string {
 // realFailures returns the failure names that represent an actual failed check.
 // SKIPPED and NEUTRAL conclusions are passes for this decision table even when
 // a caller included them in Failures, so they never trigger a block or retry.
+// A check observed as non-required is informational and is dropped as well.
 func realFailures(s Snapshot) []string {
 	out := make([]string, 0, len(s.Failures))
 	seen := make(map[string]bool, len(s.Failures))
@@ -296,7 +316,14 @@ func realFailures(s Snapshot) []string {
 		if NormalizeConclusion(name) == "SUCCESS" {
 			continue
 		}
-		if harmlessConclusion(s.Checks[name]) {
+		c, observed := s.Checks[name]
+		// An explicitly non-required check cannot block the verdict. A check
+		// absent from the map is not informational, so a caller that reports a
+		// failure without per-check detail stays fail-closed.
+		if observed && !c.Required {
+			continue
+		}
+		if harmlessConclusion(c) {
 			continue
 		}
 		out = append(out, name)
