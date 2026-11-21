@@ -634,6 +634,86 @@ func TestMergePRWithStateUsesProvidedState(t *testing.T) {
 	}
 }
 
+// TestMergePRWithStateTwoPRsOneFile models two PRs that touch the same file.
+// Both batch snapshots carry the base head observed before either merge. The
+// first PR merges. The second PR's fresh mergeability is CONFLICTING because
+// main moved after the first merge, so it is held before any write reaches
+// GitHub. The stale BaseHeadSHA travels with the provided state and never
+// turns the conflict into a merge.
+func TestMergePRWithStateTwoPRsOneFile(t *testing.T) {
+	const (
+		repo    = "refusedguy/beacon"
+		oldBase = "base-before-first-merge"
+		newBase = "base-after-first-merge"
+	)
+	counter, _, _ := newTestCounter(t, 0)
+	var graphCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode query: %v", err)
+			http.Error(w, "bad query", http.StatusBadRequest)
+			return
+		}
+		graphCalls.Add(1)
+		batchReply(t, w, req.Query, prStateJSON("MERGED", "MERGEABLE", "CLEAN"), `{}`, 1)
+	}))
+	defer srv.Close()
+
+	runner := &recordingRunner{}
+	provider := NewBatchProvider(
+		NewClient(srv.URL, "", srv.Client(), counter),
+		newRESTTestClient(t, srv, counter, "test-token"),
+		counter, WithRunner(runner))
+
+	// PR 41 was green against oldBase and is the first to reach the merge.
+	first := domain.PRState{
+		State: "OPEN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN",
+		BaseHeadSHA: oldBase,
+	}
+	merged, held, reason, err := provider.MergePRWithState(context.Background(), repo, 41, first)
+	if err != nil {
+		t.Fatalf("first MergePRWithState: %v", err)
+	}
+	if !merged || held || reason != "" {
+		t.Fatalf("first MergePRWithState = (%v,%v,%q), want confirmed merge", merged, held, reason)
+	}
+	if first.BaseHeadSHA != oldBase {
+		t.Fatalf("first state base SHA = %q, want %q", first.BaseHeadSHA, oldBase)
+	}
+
+	// PR 42 changes the same file. Its batch snapshot still names oldBase, but
+	// main now sits at newBase and the fresh read reports a conflict. The
+	// provided state must hold the merge without touching the runner.
+	second := domain.PRState{
+		State: "OPEN", Mergeable: "CONFLICTING", MergeStateStatus: "CLEAN",
+		BaseHeadSHA: oldBase,
+	}
+	merged, held, reason, err = provider.MergePRWithState(context.Background(), repo, 42, second)
+	if err != nil {
+		t.Fatalf("second MergePRWithState: %v", err)
+	}
+	if merged || !held || reason != MergeHeldConflict {
+		t.Fatalf("second MergePRWithState = (%v,%v,%q), want conflict hold", merged, held, reason)
+	}
+	if second.BaseHeadSHA != oldBase {
+		t.Fatalf("second state base SHA = %q, want stale %q", second.BaseHeadSHA, oldBase)
+	}
+	if second.BaseHeadSHA == newBase {
+		t.Fatalf("second state base SHA = %q, want the batch value not fresh main", second.BaseHeadSHA)
+	}
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if !strings.Contains(fmt.Sprint(runner.args), "41") || strings.Contains(fmt.Sprint(runner.args), "42") {
+		t.Fatalf("runner args = %v, want only the first PR", runner.args)
+	}
+	if graphCalls.Load() != 1 {
+		t.Fatalf("GraphQL reads = %d, want 1 (first merge confirmation only)", graphCalls.Load())
+	}
+}
+
 // TestPingMergeableConcurrentCallersShareResolvedState checks that a second
 // caller joining an in-flight ping still gets its own state updated. The old
 // closure mutated only the leader's pointer and left the follower UNKNOWN.

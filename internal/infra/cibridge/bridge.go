@@ -63,6 +63,11 @@ const fieldCycleID = observe.FieldCycleID
 // wake cap without green CI is parked and its reason is appended here once.
 const escalationFile = "ESCALATIONS.md"
 
+// mergeHeldRecheck is the machine-readable hold a provider returns when the
+// base branch moved after the batch snapshot. applyMerge turns it into the
+// recheck verdict instead of a rebase, so a stale snapshot never ships.
+const mergeHeldRecheck = "recheck"
+
 var cycleSeq atomic.Uint64
 
 // newCycleID returns a process-unique id for one Refresh. The timestamp keeps
@@ -130,7 +135,9 @@ type escalationWriter func(line string)
 // stateMerger is an optional refinement of domain.Merger. A provider that
 // already holds a fresh PRState from the batch can merge with it directly,
 // skipping a second GraphQL read whose lazy mergeable field may report UNKNOWN.
-// Mergers that only implement domain.Merger keep working through the fallback.
+// callMerge copies the batch base head into PRState.BaseHeadSHA before this
+// call, so the provider sees the base SHA alongside the PR without a signature
+// change. Mergers that only implement domain.Merger keep the fallback.
 type stateMerger interface {
 	MergePRWithState(ctx context.Context, repo string, pr int, state domain.PRState) (bool, bool, string, error)
 }
@@ -862,6 +869,62 @@ func (b *Bridge) publishActionable(ctx context.Context, w domain.Watch, obs ciOb
 	return 1
 }
 
+// publishRecheck publishes the recheck verdict produced when the base branch
+// moved after the batch snapshot. VerdictRecheck is not an engine verdict, so
+// validVerdict rejects a verdict event for it; the Watch state is built here
+// instead. The Watch stays live, its revision grows and both subscribers are
+// woken to repeat CI against the current main (ADR 0266).
+func (b *Bridge) publishRecheck(ctx context.Context, w domain.Watch, obs ciObservation, now time.Time, cycleID, reason string) int {
+	if w.Status == domain.StatusClosed || w.Status == domain.StatusParked || w.Status == domain.StatusBlocked {
+		return 0
+	}
+	if w.Revision == ^uint64(0) {
+		return 0
+	}
+	next := w
+	next.Status = domain.StatusNotifying
+	next.Verdict = domain.VerdictRecheck
+	next.Revision = w.Revision + 1
+	next.Checks = obs.pr.Checks
+	next.Merge = domain.MergeInfo{
+		Mergeable:        obs.pr.Mergeable,
+		MergeStateStatus: obs.pr.MergeStateStatus,
+		ReviewDecision:   obs.pr.ReviewDecision,
+	}
+	if err := b.store.SaveWatch(next); err != nil {
+		observe.ActorError("cibridge-recheck", next.ID, err)
+		return 0
+	}
+
+	text := wakeText(domain.VerdictRecheck, obs, nil, reason)
+	roles := map[string]bool{
+		string(domain.RoleExecutor):     true,
+		string(domain.RoleOrchestrator): true,
+	}
+	for _, sub := range next.Subscribers {
+		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
+		if _, err := b.store.Obligation(id); err != nil {
+			o := domain.Obligation{
+				ID: id, WatchID: next.ID, Revision: next.Revision,
+				SubscriberID: sub.ID, VerdictPointer: domain.VerdictRecheck, StagedAt: now,
+			}
+			if err := b.store.SaveObligation(o); err != nil {
+				observe.ActorError("cibridge-recheck-obligation", next.ID, err)
+				continue
+			}
+		}
+		if !roles[string(sub.Role)] {
+			continue
+		}
+		b.wakeOne(ctx, next, sub, text, now, cycleID, true)
+	}
+	observe.VerdictPublished(string(domain.VerdictRecheck), next.ID, next.PR, next.Revision)
+	b.cycleEvent(cycleID, "recheck", cycleFields{
+		watchID: next.ID, revision: next.Revision, verdict: domain.VerdictRecheck,
+	}, observe.Fields{observe.FieldReason: reason})
+	return 1
+}
+
 // rolesFromTargets collects the subscriber roles EvaluatePR asked to wake.
 // A rest_pin target has no role and therefore wakes nobody.
 func rolesFromTargets(targets []domain.WakeTarget) map[string]bool {
@@ -878,14 +941,17 @@ func rolesFromTargets(targets []domain.WakeTarget) map[string]bool {
 // callMerge performs one merge through the batch-aware path when available.
 // obs.pr came from the same batch cycle that produced the ready verdict;
 // reusing it avoids a fresh GraphQL read that can report UNKNOWN for a PR the
-// batch already resolved to MERGEABLE/CLEAN.
+// batch already resolved to MERGEABLE/CLEAN. The base head from the same cycle
+// travels in PRState.BaseHeadSHA so the merge can detect a base that moved.
 func (b *Bridge) callMerge(ctx context.Context, w domain.Watch, obs ciObservation) (bool, bool, string, error) {
 	start := time.Now()
 	var merged, held bool
 	var reason string
 	var err error
 	if sm, ok := b.merger.(stateMerger); ok {
-		merged, held, reason, err = sm.MergePRWithState(ctx, w.Repo, w.PR, obs.pr)
+		state := obs.pr
+		state.BaseHeadSHA = obs.base.HeadSHA
+		merged, held, reason, err = sm.MergePRWithState(ctx, w.Repo, w.PR, state)
 	} else {
 		merged, held, reason, err = b.merger.Merge(ctx, w.Repo, w.PR)
 	}
@@ -912,6 +978,12 @@ func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservati
 	}
 	observe.MergeFailure(w.ID, w.PR, err)
 
+	// A provider that re-read the base reports a moved main before any write.
+	// That is a recheck, not a rebase after a failed merge (ADR 0266).
+	if r := isMergeRecheck(reason, err); r != "" {
+		return b.publishRecheck(ctx, w, obs, now, cycleID, r)
+	}
+
 	retried := false
 	if b.autoRebase && b.rebaser != nil && isMergeBehind(reason, err) && b.claimRebase(w) {
 		newHead, rbErr := b.rebaser.Rebase(ctx, w.Repo, w.PR)
@@ -933,6 +1005,9 @@ func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservati
 				return n
 			}
 			observe.MergeFailure(w.ID, w.PR, err)
+			if r := isMergeRecheck(reason, err); r != "" {
+				return b.publishRecheck(ctx, w, retryObs, now, cycleID, r)
+			}
 			b.cycleEvent(cycleID, "auto_rebase_retry_failed", cycleFields{watchID: w.ID}, observe.Fields{
 				observe.FieldPR: w.PR, observe.FieldReason: reason,
 			})
@@ -1922,6 +1997,8 @@ func wakeText(verdict domain.Verdict, obs ciObservation, targets []domain.WakeTa
 		}
 	case domain.VerdictRebase:
 		text = "rebase: git fetch origin main && git rebase origin/main && git push --force-with-lease"
+	case domain.VerdictRecheck:
+		text = "recheck: база main сдвинулась после снимка; повтори проверку CI на свежем main"
 	case domain.VerdictRetry:
 		checks := make([]string, 0)
 		for _, t := range targets {
@@ -1978,6 +2055,19 @@ func isMergeConflict(reason string, err error) bool {
 func isMergeBehind(reason string, err error) bool {
 	s := strings.ToLower(reason + " " + errText(err))
 	return strings.Contains(s, "behind")
+}
+
+// isMergeRecheck reports the hold a provider returns when the base branch
+// moved after the batch snapshot. The returned string is the reason to record
+// on the recheck verdict; an empty string means the merge was not a recheck.
+func isMergeRecheck(reason string, err error) string {
+	s := strings.ToLower(reason + " " + errText(err))
+	for _, key := range []string{mergeHeldRecheck, "base_changed", "base changed", "base moved"} {
+		if strings.Contains(s, key) {
+			return strings.TrimSpace(reason)
+		}
+	}
+	return ""
 }
 
 // isDeadSessionErr reports a delivery failure caused by a session that no
