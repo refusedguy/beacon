@@ -1,5 +1,5 @@
 # CLEAN-02. Удалить пять неимпортируемых серверных пакетов
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/server/http/, internal/infra/server/eventlog/, internal/infra/server/eventbus/, internal/infra/server/recovery/, internal/infra/server/store/
@@ -12,3 +12,6 @@
 Шаги: Проверить импорты по явным каталогам internal, cmd, tools, tests. Удалить пять каталогов вместе с тестами. Проверить, что пакет internal/infra/server как точка входа остался. Не трогать живые internal/infra/httpapi и internal/infra/store.
 Проверка: CI на PR показывает зелёные build и test. Поиск по internal, cmd, tools не находит импортов удалённых путей.
 Приёмка: Пять каталогов удалены, живой HTTP и store не изменены, required-гейты не требуют правки конфигов.
+
+## Подтверждение
+- PR #1154: удалены каталоги `internal/infra/server/http`, `eventlog`, `eventbus`, `recovery` и `store` вместе с тестами, всего 20 файлов и 2666 строк. Поиск `rg -n 'internal/infra/server/(http|eventlog|eventbus|recovery|store)' internal cmd tools tests` не нашёл ни одного импорта, включая полный путь модуля и родительский пакет `internal/infra/server`. В `layers.json`, `reachability.json` и `reachability_exceptions.go` ссылок на удалённые пути нет. Родительский пакет `internal/infra/server`, а также живые `internal/infra/httpapi` и `internal/infra/store` не тронуты. Запрошенная база `fix/reports-to-tasks` уже влита PR #1152 и удалена из remote, поэтому PR открыт против `main` на коммите `5772223` с тем же набором карточек. Build, test и required-гейты проверяет CI на PR.
