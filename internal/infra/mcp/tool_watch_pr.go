@@ -453,6 +453,9 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	if in.Policy != nil && in.Policy.MaxWakesPerWatch > 0 {
 		maxWakes = in.Policy.MaxWakesPerWatch
 	}
+	// cibridge reads MaxRebases from the stored Watch. It charges each rebase
+	// to a durable obligation and blocks the Watch on the shared incident when
+	// the budget runs out, so the value must be materialised here.
 	maxRebases := defaults.MaxRebases
 	if in.Policy != nil && in.Policy.MaxRebases > 0 {
 		maxRebases = in.Policy.MaxRebases
