@@ -26,7 +26,18 @@ var (
 	ErrNilStore = errors.New("session: store is nil")
 	// ErrEmptyID means a lifecycle call carried no usable session id.
 	ErrEmptyID = errors.New("session: empty session id")
+	// ErrNoTaskLookup means the store cannot resolve a session by task line.
+	// Stores that only implement SessionStore keep working for every other
+	// registry method.
+	ErrNoTaskLookup = errors.New("session: store has no task lookup")
 )
+
+// TaskSessionFinder is the optional port a SessionStore can implement so the
+// registry can resolve a session by the task it was spawned for. *store.DB
+// satisfies it. Stores used by older tests need not implement it.
+type TaskSessionFinder interface {
+	FindSessionByTask(task string) (store.Session, bool, error)
+}
 
 // SessionRegistry drives session lifecycle events through a SessionStore. It
 // reads the current time through now, so a test can pin the clock. The zero
@@ -88,6 +99,25 @@ func (r *SessionRegistry) Resume(id string) (store.Session, bool, error) {
 		return store.Session{}, false, ErrEmptyID
 	}
 	return r.store.GetSession(id)
+}
+
+// ResumeByTask loads the session spawned for task. Resume alone needs an
+// opaque session id, which a restarted command does not have; task is the
+// stable line the caller knows. found is false when the store has no session
+// for that task. The registry never creates one here.
+func (r *SessionRegistry) ResumeByTask(task string) (store.Session, bool, error) {
+	if r == nil || r.store == nil {
+		return store.Session{}, false, ErrNilStore
+	}
+	task = strings.TrimSpace(task)
+	if task == "" {
+		return store.Session{}, false, ErrEmptyID
+	}
+	finder, ok := r.store.(TaskSessionFinder)
+	if !ok {
+		return store.Session{}, false, ErrNoTaskLookup
+	}
+	return finder.FindSessionByTask(task)
 }
 
 // Heartbeat moves the last-seen time of id to now. A live session writes this

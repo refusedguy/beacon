@@ -28,6 +28,11 @@ const (
 	SessionStatusClosed = "closed"
 )
 
+// SessionMetaTaskID is the metadata key beacon spawn uses to link a session
+// to the task line that created it. The store reads the key without knowing
+// which command wrote it (T3.278).
+const SessionMetaTaskID = "ai.beacon/taskID"
+
 // createSessionsSQL is issued on first use by every write method. id is the
 // stable key a caller uses to find a session again after a restart.
 // created_at is set on insert and never rewritten by SaveSession, so it keeps
@@ -153,6 +158,27 @@ func (d *DB) ListSessions() ([]Session, error) {
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// FindSessionByTask returns the oldest session whose metadata links it to
+// task. A task line has one spawn session, so the first match in creation
+// order wins. found is false on a store with no such session; the read never
+// creates the table.
+func (d *DB) FindSessionByTask(task string) (Session, bool, error) {
+	task = strings.TrimSpace(task)
+	if task == "" {
+		return Session{}, false, domain.NewAppError(domain.CodeInvalidInput, "store: sessions: empty task id")
+	}
+	all, err := d.ListSessions()
+	if err != nil {
+		return Session{}, false, err
+	}
+	for _, s := range all {
+		if s.Metadata[SessionMetaTaskID] == task {
+			return s, true, nil
+		}
+	}
+	return Session{}, false, nil
 }
 
 // Touch moves id's last_seen to at, or to the current UTC time when at is
