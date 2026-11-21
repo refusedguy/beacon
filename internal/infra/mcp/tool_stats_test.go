@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
@@ -791,5 +793,73 @@ func TestActiveWatchWarningInJSONAndSchema(t *testing.T) {
 		if _, ok := statsSchema.Properties[key]; !ok {
 			t.Errorf("stats output has field %q not in the derived schema", key)
 		}
+	}
+}
+
+// loadErrorSnapshot builds a snapshot with exactly n diagnostics. The handler
+// appends no extra entry for this small, healthy snapshot.
+func loadErrorSnapshot(n int) StateSnapshot {
+	snap := sampleSnapshot()
+	snap.LoadErrors = make([]string, n)
+	for i := range snap.LoadErrors {
+		snap.LoadErrors[i] = fmt.Sprintf("diagnostic %d", i)
+	}
+	return snap
+}
+
+func TestStatsRecordLimit(t *testing.T) {
+	cases := []struct {
+		name    string
+		entries int
+		wantErr bool
+	}{
+		{"empty", 0, false},
+		{"at limit", statsMaxRecords, false},
+		{"over limit", statsMaxRecords + 1, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, out, err := NewStatsHandler(&snapshotReaderFake{snap: loadErrorSnapshot(tc.entries)}).Handle(context.Background(), nil, StatsInput{})
+			if tc.wantErr {
+				assertLimitError(t, err, "200-loadError", "fewer or shorter loadErrors")
+				return
+			}
+			if err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(out.LoadErrors) != tc.entries {
+				t.Fatalf("loadErrors = %d, want %d", len(out.LoadErrors), tc.entries)
+			}
+		})
+	}
+}
+
+func TestStatsByteLimit(t *testing.T) {
+	snap := sampleSnapshot()
+	snap.LoadErrors = []string{strings.Repeat("e", statsMaxBytes+1)}
+	_, _, err := NewStatsHandler(&snapshotReaderFake{snap: snap}).Handle(context.Background(), nil, StatsInput{})
+	assertLimitError(t, err, "262144-byte", "fewer or shorter loadErrors")
+}
+
+func TestStatsLimitIsToolError(t *testing.T) {
+	session := connectTestSession(t, Dependencies{Snapshot: SnapshotFunc(func() (StateSnapshot, error) {
+		return loadErrorSnapshot(statsMaxRecords + 1), nil
+	})})
+	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
+		Name:      "beacon_stats",
+		Arguments: StatsInput{},
+	})
+	if err != nil {
+		t.Fatalf("tools/call beacon_stats: %v", err)
+	}
+	if !result.IsError {
+		t.Fatalf("oversized stats did not set isError: %+v", result.StructuredContent)
+	}
+	body, err := json.Marshal(result.Content)
+	if err != nil {
+		t.Fatalf("marshal error content: %v", err)
+	}
+	if !strings.Contains(string(body), "200-loadError") || !strings.Contains(string(body), "fewer or shorter loadErrors") {
+		t.Fatalf("tool error text = %s, want the limit and the narrowing hint", body)
 	}
 }

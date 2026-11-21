@@ -4,6 +4,7 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -211,6 +212,42 @@ func (f *ListRunningFilters) matches(w domain.Watch) bool {
 	}
 	return true
 }
+
+// responseLimits is a pair of ceilings on one read tool's output. The byte
+// ceiling counts the encoded structured response, which is what an MCP client
+// loads into its context.
+type responseLimits struct {
+	records int
+	bytes   int
+}
+
+// checkResponseLimits refuses an oversized response. The error is a
+// LIMIT_EXCEEDED tool error whose text names the ceiling and tells the caller
+// how to ask for less. It carries no clock value or run data, so the negative
+// control is reproducible.
+func checkResponseLimits(tool, recordName string, records int, limits responseLimits, narrow string, out any) error {
+	if records > limits.records {
+		return domain.NewAppError(domain.CodeLimitExceeded, fmt.Sprintf(
+			"%s: response exceeds the %d-%s limit; %s", tool, limits.records, recordName, narrow))
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		return fmt.Errorf("%s: encode response for size check: %w", tool, err)
+	}
+	if len(data) > limits.bytes {
+		return domain.NewAppError(domain.CodeLimitExceeded, fmt.Sprintf(
+			"%s: response exceeds the %d-byte limit; %s", tool, limits.bytes, narrow))
+	}
+	return nil
+}
+
+// The ceilings bound the watches and events in one list_running response.
+const (
+	listRunningMaxRecords = 200
+	listRunningMaxBytes   = 256 * 1024
+)
+
+const listRunningNarrowHint = "narrow the selection with filters.verdict or filters.status, then page with cursor"
 
 // ListRunningInput is the input of beacon_list_running. Filters and Cursor are
 // optional: an empty Cursor selects every current event (ADR 0025).
@@ -577,13 +614,16 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Remember only the cursor and the terminal verdict, never the history.
+	// Work on local copies of the cursor and terminal verdict. A response
+	// refused by the size limits leaves both untouched, so the client can
+	// narrow its filters and retry without losing its place in the stream.
+	nextStatus, nextVerdict := h.terminalStatus, h.terminalVerdict
 	if terminalVerdict != "" {
-		h.terminalStatus = terminalStatus
-		h.terminalVerdict = terminalVerdict
+		nextStatus, nextVerdict = terminalStatus, terminalVerdict
 	}
 
 	newEvents := make([]WatchEvent, 0, len(events))
+	nextCursor := h.cursor
 	if in.Cursor == "" {
 		// Stateless full read: every current event, no cursor state consumed.
 		newEvents = append(newEvents, events...)
@@ -591,16 +631,16 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 		// A cursor call returns only events past the client cursor and past the
 		// last delivered position, so a reconnect never replays old events.
 		floor := from
-		if h.cursor > floor {
-			floor = h.cursor
+		if nextCursor > floor {
+			floor = nextCursor
 		}
 		for _, ev := range events {
 			if ev.Seq > floor {
 				newEvents = append(newEvents, ev)
 			}
 		}
-		if uint64(len(events)) > h.cursor {
-			h.cursor = uint64(len(events))
+		if uint64(len(events)) > nextCursor {
+			nextCursor = uint64(len(events))
 		}
 	}
 
@@ -616,11 +656,20 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 		Events:  newEvents,
 	}
 
-	if h.terminalVerdict != "" {
-		out.Status = h.terminalStatus
-		out.Verdict = h.terminalVerdict
+	if nextVerdict != "" {
+		out.Status = nextStatus
+		out.Verdict = nextVerdict
 		out.Events = nil
 	}
 
+	limits := responseLimits{records: listRunningMaxRecords, bytes: listRunningMaxBytes}
+	if err := checkResponseLimits("beacon_list_running", "record", max(len(out.Watches), len(out.Events)), limits, listRunningNarrowHint, out); err != nil {
+		return nil, ListRunningOutput{}, err
+	}
+
+	// Commit only a response that passed the limits. Remember the cursor and
+	// the terminal verdict, never the history.
+	h.cursor = nextCursor
+	h.terminalStatus, h.terminalVerdict = nextStatus, nextVerdict
 	return &mcpsdk.CallToolResult{}, out, nil
 }

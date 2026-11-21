@@ -181,6 +181,14 @@ func (s *SnapshotRegistryStats) RegistryStats(_ context.Context) (RegistryStats,
 	}, nil
 }
 
+// The ceilings bound the diagnostic array and the encoded stats response.
+const (
+	statsMaxRecords = 200
+	statsMaxBytes   = 256 * 1024
+)
+
+const statsNarrowHint = "narrow the diagnostics by keeping fewer or shorter loadErrors in the snapshot; beacon_stats takes no filters"
+
 // StatsInput is the empty input of beacon_stats. The tool takes no arguments.
 type StatsInput struct{}
 
@@ -361,6 +369,11 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		RegisteredAgents: registry.RegisteredAgents,
 		StaleAgents:      registry.StaleAgents,
 		ConfigID:         registry.ConfigID,
+	}
+
+	limits := responseLimits{records: statsMaxRecords, bytes: statsMaxBytes}
+	if err := checkResponseLimits("beacon_stats", "loadError", len(out.LoadErrors), limits, statsNarrowHint, out); err != nil {
+		return nil, StatsOutput{}, err
 	}
 	return &mcpsdk.CallToolResult{}, out, nil
 }
