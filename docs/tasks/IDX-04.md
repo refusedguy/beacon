@@ -20,3 +20,4 @@
 - В `ci.yml` добавлена обязательная job `cardindex`: checkout с `fetch-depth: 0` (иначе усечённая история ломает разрешение статусов), `go run ./cardindex --self-test` и `go run ./cardindex -root ../..`.
 - Команда толерантна к отсутствию `docs/ROADMAP_STATUS.md`: IDX-11 планирует убрать производные документы из git, и после этого проверка становится no-op.
 - gofmt применён к новому файлу. go test и go build локально не запускались по правилам репозитория, проверка идёт в CI.
+- PR: https://github.com/refusedguy/beacon/pull/909, ветка fix/z4.
