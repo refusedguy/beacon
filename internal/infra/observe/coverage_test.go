@@ -39,9 +39,9 @@ func TestEveryCounterIsExportedAndIncrements(t *testing.T) {
 	want := []string{
 		"poll_cycles_total", "verdict_published_total", "merge_attempts_total",
 		"merge_success_total", "merge_failures_total", "wake_delivered_total",
-		"wake_errors_total", "wake_skipped_total", "rebase_requests_total",
-		"dependency_waits_total", "blocks_total", "actor_errors_total",
-		"fix_total",
+		"wake_errors_total", "wake_skipped_total", "wake_duplicate_total",
+		"rebase_requests_total", "dependency_waits_total", "blocks_total",
+		"actor_errors_total", "fix_total",
 	}
 	if len(want) != len(CounterNames()) {
 		t.Fatalf(" счётчиков %d, ожидалось %d", len(CounterNames()), len(want))
@@ -56,6 +56,34 @@ func TestEveryCounterIsExportedAndIncrements(t *testing.T) {
 		if !strings.Contains(text, "beacon_"+name+" ") {
 			t.Errorf("в Prometheus нет beacon_%s:\n%s", name, text)
 		}
+	}
+}
+
+func TestWakeDuplicateCounterExportedInAllFormats(t *testing.T) {
+	m := NewMetrics()
+	m.Inc(CounterWakeDuplicate, "")
+	m.Inc(CounterWakeDuplicate, "")
+
+	var jsonGot map[string]any
+	if err := json.Unmarshal(m.JSON(), &jsonGot); err != nil {
+		t.Fatalf("невалидный JSON: %v", err)
+	}
+	if v, ok := jsonGot[CounterWakeDuplicate].(float64); !ok || int(v) != 2 {
+		t.Errorf("JSON %s = %v, ожидалось 2", CounterWakeDuplicate, jsonGot[CounterWakeDuplicate])
+	}
+
+	text := string(m.Prometheus())
+	if !strings.Contains(text, "beacon_"+CounterWakeDuplicate+" 2") {
+		t.Errorf("в Prometheus нет beacon_%s 2:\n%s", CounterWakeDuplicate, text)
+	}
+
+	restored := MetricsFromSnapshotJSON(m.SnapshotJSON())
+	var snapGot map[string]any
+	if err := json.Unmarshal(restored.JSON(), &snapGot); err != nil {
+		t.Fatalf("невалидный snapshot JSON: %v", err)
+	}
+	if v, ok := snapGot[CounterWakeDuplicate].(float64); !ok || int(v) != 2 {
+		t.Errorf("snapshot %s = %v, ожидалось 2", CounterWakeDuplicate, snapGot[CounterWakeDuplicate])
 	}
 }
 
