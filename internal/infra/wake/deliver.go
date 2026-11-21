@@ -1731,11 +1731,13 @@ type HistorySearchRunner func(ctx context.Context, name string, args ...string) 
 
 // HistorySearchResult is the bounded answer to a history query. Matches hold
 // ANSI-free lines with line numbers. Truncated reports that a limit dropped
-// content.
+// content. NextCursor is empty when nothing is left; pass it back to
+// HistorySearchPage to fetch the next page.
 type HistorySearchResult struct {
-	Backend   HistorySearchBackend
-	Matches   []string
-	Truncated bool
+	Backend    HistorySearchBackend
+	Matches    []string
+	Truncated  bool
+	NextCursor string
 }
 
 const (
@@ -1777,12 +1779,22 @@ func runHistorySearch(ctx context.Context, runner HistorySearchRunner, backend H
 	return nil, err
 }
 
-// HistorySearch looks for pattern in path with rg, then falls back to grep -E
-// when rg is missing. It strips ANSI escapes and caps the number of lines and
-// total bytes, so an agent finds fragments without reading the whole file.
+// HistorySearch returns the first page of a history query. It is
+// HistorySearchPage with an empty cursor.
 func HistorySearch(ctx context.Context, path, pattern string, runner HistorySearchRunner, maxLines, maxBytes int) (HistorySearchResult, error) {
+	return HistorySearchPage(ctx, path, pattern, runner, maxLines, maxBytes, "")
+}
+
+// HistorySearchPage returns one page of a history query. cursor is the
+// NextCursor from a previous result; an empty cursor starts at the first
+// match. A caller pages until NextCursor is empty.
+func HistorySearchPage(ctx context.Context, path, pattern string, runner HistorySearchRunner, maxLines, maxBytes int, cursor string) (HistorySearchResult, error) {
 	if pattern == "" {
 		return HistorySearchResult{}, errors.New("wake: history search: empty pattern")
+	}
+	offset, err := parseHistoryCursor(cursor)
+	if err != nil {
+		return HistorySearchResult{}, err
 	}
 	if runner == nil {
 		runner = defaultHistorySearchRunner
@@ -1804,29 +1816,64 @@ func HistorySearch(ctx context.Context, path, pattern string, runner HistorySear
 		return HistorySearchResult{}, fmt.Errorf("wake: history search: %w", err)
 	}
 
-	lines, truncated := clampHistoryOutput(historyANSI.ReplaceAllString(string(out), ""), maxLines, maxBytes)
-	return HistorySearchResult{Backend: backend, Matches: lines, Truncated: truncated}, nil
+	lines, truncated, next := clampHistoryPage(historyANSI.ReplaceAllString(string(out), ""), maxLines, maxBytes, offset)
+	return HistorySearchResult{Backend: backend, Matches: lines, Truncated: truncated, NextCursor: next}, nil
 }
 
-// clampHistoryOutput keeps at most maxLines lines and maxBytes bytes. It
-// reports truncation when either limit drops content.
-func clampHistoryOutput(s string, maxLines, maxBytes int) ([]string, bool) {
+// parseHistoryCursor decodes the offset carried by a NextCursor. An empty
+// cursor asks for the first page.
+func parseHistoryCursor(cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	offset, err := strconv.Atoi(cursor)
+	if err != nil || offset < 0 {
+		return 0, fmt.Errorf("wake: history search: invalid cursor %q", cursor)
+	}
+	return offset, nil
+}
+
+// clampHistoryPage keeps at most maxLines lines and maxBytes bytes starting at
+// offset. Truncated reports that either limit dropped content. nextCursor is
+// empty when nothing remains; otherwise it encodes the offset of the first
+// line not returned.
+func clampHistoryPage(s string, maxLines, maxBytes, offset int) ([]string, bool, string) {
 	if s == "" {
-		return nil, false
+		return nil, false, ""
 	}
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
-	truncated := len(lines) > maxLines
+	if offset >= len(lines) {
+		return nil, false, ""
+	}
+	truncated := len(lines)-offset > maxLines
 	if truncated {
-		lines = lines[:maxLines]
+		lines = lines[offset : offset+maxLines]
+	} else {
+		lines = lines[offset:]
 	}
 	kept := make([]string, 0, len(lines))
 	used := 0
-	for _, line := range lines {
+	for i, line := range lines {
 		if used+len(line) > maxBytes {
-			return kept, true
+			if i == 0 {
+				// A line larger than maxBytes would stall pagination at the
+				// same offset. Return it once and move past it.
+				return []string{line}, true, strconv.Itoa(offset + 1)
+			}
+			return kept, true, strconv.Itoa(offset + i)
 		}
 		used += len(line)
 		kept = append(kept, line)
 	}
-	return kept, truncated
+	if truncated {
+		return kept, true, strconv.Itoa(offset + len(kept))
+	}
+	return kept, false, ""
+}
+
+// clampHistoryOutput keeps the first page within both limits for callers that
+// do not need a cursor.
+func clampHistoryOutput(s string, maxLines, maxBytes int) ([]string, bool) {
+	lines, truncated, _ := clampHistoryPage(s, maxLines, maxBytes, 0)
+	return lines, truncated
 }
