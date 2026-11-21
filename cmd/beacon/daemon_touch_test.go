@@ -70,29 +70,42 @@ func TestDaemonHeartbeatPropagatesStoreError(t *testing.T) {
 
 func TestRunDaemonHeartbeatTicksAndStops(t *testing.T) {
 	r := &heartbeatRecorder{}
+	ticks := make(chan time.Time)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runDaemonHeartbeat(ctx, r, "ses_1", 5*time.Millisecond)
+		runDaemonHeartbeat(ctx, r, "ses_1", ticks)
 	}()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for len(r.snapshot()) < 2 {
-		if time.Now().After(deadline) {
+	// An unbuffered send completes only once the loop has received the tick,
+	// and Heartbeat runs in that same loop iteration before the next select.
+	for i := 0; i < 2; i++ {
+		select {
+		case ticks <- time.Now():
+		case <-done:
 			cancel()
-			<-done
-			t.Fatal("heartbeat did not tick twice")
+			t.Fatal("heartbeat loop exited before all ticks were delivered")
 		}
-		time.Sleep(time.Millisecond)
 	}
 
 	cancel()
 	<-done
-	count := len(r.snapshot())
-	time.Sleep(20 * time.Millisecond)
-	if got := len(r.snapshot()); got != count {
-		t.Fatalf("heartbeat continued after cancel: %d calls, want %d", got, count)
+
+	got := r.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("heartbeat ids = %v, want two ticks", got)
+	}
+	for i, id := range got {
+		if id != "ses_1" {
+			t.Fatalf("heartbeat id %d = %q, want ses_1", i, id)
+		}
+	}
+
+	select {
+	case ticks <- time.Now():
+		t.Fatal("heartbeat loop still receives ticks after cancel")
+	default:
 	}
 }
 
@@ -178,28 +191,17 @@ func TestEnsureDaemonSessionSkipsEmptyID(t *testing.T) {
 	}
 }
 
-func TestRunDaemonHeartbeatZeroIntervalUsesDefault(t *testing.T) {
+func TestDaemonHeartbeatZeroIntervalUsesDefault(t *testing.T) {
 	previous := daemonHeartbeatInterval
-	daemonHeartbeatInterval = 5 * time.Millisecond
+	daemonHeartbeatInterval = 5 * time.Second
 	defer func() { daemonHeartbeatInterval = previous }()
 
-	r := &heartbeatRecorder{}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runDaemonHeartbeat(ctx, r, "ses_1", 0)
-	}()
-
-	deadline := time.Now().Add(2 * time.Second)
-	for len(r.snapshot()) < 1 {
-		if time.Now().After(deadline) {
-			cancel()
-			<-done
-			t.Fatal("heartbeat did not use the default interval")
+	for _, interval := range []time.Duration{0, -time.Second} {
+		if got := daemonHeartbeatEffectiveInterval(interval); got != daemonHeartbeatInterval {
+			t.Fatalf("effective interval for %v = %v, want default %v", interval, got, daemonHeartbeatInterval)
 		}
-		time.Sleep(time.Millisecond)
 	}
-	cancel()
-	<-done
+	if got := daemonHeartbeatEffectiveInterval(time.Second); got != time.Second {
+		t.Fatalf("effective interval for a positive value = %v, want 1s", got)
+	}
 }

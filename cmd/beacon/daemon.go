@@ -227,20 +227,25 @@ func ensureDaemonSession(reg *session.SessionRegistry, sessionID string) error {
 	return reg.Start(id, store.SessionStatusActive, nil)
 }
 
-// runDaemonHeartbeat ticks until ctx is done and calls daemonHeartbeat on each
-// tick. A registry failure is logged and never stops the daemon cycle. An
-// interval that is not positive falls back to daemonHeartbeatInterval.
-func runDaemonHeartbeat(ctx context.Context, hb sessionHeartbeater, sessionID string, interval time.Duration) {
+// daemonHeartbeatEffectiveInterval resolves the production heartbeat interval.
+// A non-positive value falls back to daemonHeartbeatInterval. Keeping this as a
+// pure function lets a test verify the fallback without waiting on a ticker.
+func daemonHeartbeatEffectiveInterval(interval time.Duration) time.Duration {
 	if interval <= 0 {
-		interval = daemonHeartbeatInterval
+		return daemonHeartbeatInterval
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	return interval
+}
+
+// runDaemonHeartbeat consumes ticks until ctx is done and calls daemonHeartbeat
+// on each one. The caller owns the tick source and stops it. A registry failure
+// is logged and never stops the daemon cycle.
+func runDaemonHeartbeat(ctx context.Context, hb sessionHeartbeater, sessionID string, ticks <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			if err := daemonHeartbeat(hb, sessionID); err != nil {
 				observe.ActorError("session-heartbeat", "", err)
 			}
@@ -402,10 +407,12 @@ func runDaemon(c *CLI, args []string) int {
 	}
 	defer stopLoop()
 
+	hbTicker := time.NewTicker(daemonHeartbeatEffectiveInterval(daemonHeartbeatInterval))
+	defer hbTicker.Stop()
 	hbDone := make(chan struct{})
 	go func() {
 		defer close(hbDone)
-		runDaemonHeartbeat(ctx, hb, sessionID, daemonHeartbeatInterval)
+		runDaemonHeartbeat(ctx, hb, sessionID, hbTicker.C)
 	}()
 	defer func() { <-hbDone }()
 
