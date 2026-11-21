@@ -42,6 +42,34 @@ const (
 
 var extendedCounterNames = []string{CounterFixersSpawned, CounterBlocksEscalated}
 
+// CounterWakeOutcome breaks wakes down by adapter and outcome. It stays outside
+// counterLabels because that registry is a closed set whose JSON shape older
+// consumers rely on. The single label value is the composite "adapter:outcome"
+// pair, so both dimensions survive a metrics snapshot without a second
+// exporter or a change to the existing wake counters.
+const (
+	CounterWakeOutcome  = "wake_outcome_total"
+	LabelAdapterOutcome = "adapter_outcome"
+)
+
+var outcomeCounters = map[string]string{CounterWakeOutcome: LabelAdapterOutcome}
+
+// outcomeKey joins the two dimensions of CounterWakeOutcome into one label
+// value. The colon cannot appear in an adapter name or an outcome, so the pair
+// is unambiguous.
+func outcomeKey(adapter, outcome string) string {
+	return adapter + ":" + outcome
+}
+
+// counterLabelKey resolves the label of a counter from both registries. Unknown
+// names have no label and are exported as plain totals.
+func counterLabelKey(name string) string {
+	if label, ok := counterLabels[name]; ok {
+		return label
+	}
+	return outcomeCounters[name]
+}
+
 // Gauges are point-in-time values, not monotonic totals. A scrape sees them as
 // beacon_active_watches and beacon_outbox_depth. They carry no labels, so
 // cardinality stays fixed no matter how many Watches or sessions exist.
@@ -180,6 +208,10 @@ func NewMetrics() *Metrics {
 	for _, name := range extendedCounterNames {
 		m.values[name] = 0
 	}
+	for name := range outcomeCounters {
+		m.values[name] = 0
+		m.labelled[name] = make(map[string]uint64)
+	}
 	for _, name := range GaugeNames() {
 		m.gauges[name] = 0
 	}
@@ -197,10 +229,7 @@ func (m *Metrics) Inc(name, labelValue string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	label, known := counterLabels[name]
-	if !known {
-		label = ""
-	}
+	label := counterLabelKey(name)
 	m.values[name]++
 	if label != "" {
 		if m.labelled[name] == nil {
@@ -316,6 +345,13 @@ func (m *Metrics) JSON() []byte {
 		}
 		for _, name := range extendedCounterNames {
 			out[name] = m.values[name]
+		}
+		for name := range outcomeCounters {
+			byValue := make(map[string]uint64)
+			for k, v := range m.labelled[name] {
+				byValue[k] = v
+			}
+			out[name] = byValue
 		}
 		for _, name := range GaugeNames() {
 			out[name] = m.gauges[name]
@@ -453,6 +489,25 @@ func (m *Metrics) Prometheus() []byte {
 		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)
 		fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", name)
 		fmt.Fprintf(&buf, "beacon_%s %d\n", name, m.values[name])
+	}
+	outcomeNames := make([]string, 0, len(outcomeCounters))
+	for name := range outcomeCounters {
+		outcomeNames = append(outcomeNames, name)
+	}
+	sort.Strings(outcomeNames)
+	for _, name := range outcomeNames {
+		label := outcomeCounters[name]
+		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)
+		fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", name)
+		values := m.labelled[name]
+		keys := make([]string, 0, len(values))
+		for k := range values {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, label, escapeLabel(k), values[k])
+		}
 	}
 	for _, name := range GaugeNames() {
 		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon gauge %s.\n", name, name)

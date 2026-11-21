@@ -2,6 +2,7 @@ package observe
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -42,6 +43,81 @@ func TestMetricsIncrementUnlabeledAndLabelledCounters(t *testing.T) {
 	adapters, ok := got[CounterWakeDelivered].(map[string]any)
 	if !ok || adapters["opencode"] != float64(1) {
 		t.Errorf("wake_delivered = %v", got[CounterWakeDelivered])
+	}
+}
+
+func TestWakeOutcomeCounterBreaksDownAdapterAndOutcome(t *testing.T) {
+	previous := Default()
+	defer SetDefault(previous)
+
+	m := NewMetrics()
+	SetDefault(NewRecorder(nil, m))
+
+	WakeFailedOutcome("opencode", "w1", WakeOutcomeTransportFailed, errors.New("boom"), 3)
+	WakeFailedOutcome("pi", "w2", WakeOutcomeTransportFailed, errors.New("refused"))
+	WakeDeliveredOutcome("opencode", "w3", WakeOutcomePosted)
+	WakeDuplicate("w4", 5)
+
+	var got map[string]any
+	if err := json.Unmarshal(m.JSON(), &got); err != nil {
+		t.Fatalf("невалидный JSON метрик: %v", err)
+	}
+	byPair, ok := got[CounterWakeOutcome].(map[string]any)
+	if !ok {
+		t.Fatalf("%s не объект: %v", CounterWakeOutcome, got[CounterWakeOutcome])
+	}
+	want := map[string]float64{
+		"opencode:" + WakeOutcomeTransportFailed: 1,
+		"pi:" + WakeOutcomeTransportFailed:       1,
+		"opencode:" + WakeOutcomePosted:          1,
+		":" + WakeOutcomeDuplicate:               1,
+	}
+	for key, count := range want {
+		if byPair[key] != count {
+			t.Errorf("%s[%q] = %v, ожидалось %v", CounterWakeOutcome, key, byPair[key], count)
+		}
+	}
+	if len(byPair) != len(want) {
+		t.Errorf("в %s %d ключей, ожидалось %d: %v", CounterWakeOutcome, len(byPair), len(want), byPair)
+	}
+
+	text := string(m.Prometheus())
+	for _, line := range []string{
+		`beacon_wake_outcome_total{adapter_outcome="opencode:transport-failed"} 1`,
+		`beacon_wake_outcome_total{adapter_outcome="pi:transport-failed"} 1`,
+		`beacon_wake_outcome_total{adapter_outcome=":duplicate"} 1`,
+	} {
+		if !strings.Contains(text, line) {
+			t.Errorf("в Prometheus-выводе нет %q:\n%s", line, text)
+		}
+	}
+}
+
+func TestWakeOutcomeKeepsExistingJSONShape(t *testing.T) {
+	m := NewMetrics()
+	m.Inc(CounterWakeDelivered, "opencode")
+	m.Inc(CounterWakeErrors, "opencode")
+	m.Inc(CounterWakeOutcome, outcomeKey("opencode", WakeOutcomeTransportFailed))
+
+	var got map[string]any
+	if err := json.Unmarshal(m.JSON(), &got); err != nil {
+		t.Fatalf("невалидный JSON метрик: %v", err)
+	}
+	for _, name := range []string{CounterWakeDelivered, CounterWakeErrors} {
+		byAdapter, ok := got[name].(map[string]any)
+		if !ok || byAdapter["opencode"] != float64(1) {
+			t.Errorf("%s = %v, ожидалось {opencode: 1}", name, got[name])
+		}
+	}
+	hist, ok := got["histograms"].(map[string]any)
+	if !ok {
+		t.Fatalf("нет histograms: %v", got)
+	}
+	if len(hist) != len(HistogramNames()) {
+		t.Errorf("гистограмм %d, ожидалось %d: %v", len(hist), len(HistogramNames()), hist)
+	}
+	if _, ok := hist[HistogramPollCycle]; !ok {
+		t.Errorf("гистограмма цикла потеряна: %v", hist)
 	}
 }
 

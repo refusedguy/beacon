@@ -1118,12 +1118,12 @@ func (b *Bridge) notifyOrchestratorTerminal(ctx context.Context, w domain.Watch,
 			outcome = domain.OutcomeIndeterminate
 		}
 		b.recordDelivery(ctx, obligationID, 1, outcome, now)
-		observe.WakeFailed(adapter, w.ID, deliverErr, w.Revision)
+		observe.WakeFailedOutcome(adapter, w.ID, string(outcome), deliverErr, w.Revision)
 		observe.ActorError("wake-terminal", w.ID, deliverErr)
 		log.Printf("cibridge: terminal confirmation %s: %v", session, deliverErr)
 		return
 	}
-	observe.WakeDelivered(adapter, w.ID, w.Revision)
+	observe.WakeDeliveredOutcome(adapter, w.ID, observe.WakeOutcomePosted, w.Revision)
 	b.recordDelivery(ctx, obligationID, 1, domain.OutcomePosted, now)
 	b.markDelivered(obligationID, now, 1, "")
 	b.cycleEvent(cycleID, "terminal_confirmation", cycleFields{
@@ -1307,12 +1307,12 @@ func (b *Bridge) notifyBlocked(ctx context.Context, w domain.Watch, dedup string
 			outcome = domain.OutcomeIndeterminate
 		}
 		b.recordDelivery(ctx, obligationID, 1, outcome, now)
-		observe.WakeFailed(adapter, w.ID, deliverErr, w.Revision)
+		observe.WakeFailedOutcome(adapter, w.ID, string(outcome), deliverErr, w.Revision)
 		observe.ActorError("wake-blocked", w.ID, deliverErr)
 		log.Printf("cibridge: blocked wake %s: %v", sessionID, deliverErr)
 		return false
 	}
-	observe.WakeDelivered(adapter, w.ID, w.Revision)
+	observe.WakeDeliveredOutcome(adapter, w.ID, observe.WakeOutcomePosted, w.Revision)
 	b.recordDelivery(ctx, obligationID, 1, domain.OutcomePosted, now)
 	b.markDelivered(dedup, now, 1, "")
 	b.markDelivered(obligationID, now, 1, "")
@@ -1612,7 +1612,7 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 			b.breakerRecord(adapter, now, true)
 		}
 		b.recordDelivery(ctx, p.ObligationID, attempt, outcome, now)
-		observe.WakeFailed(sub.Adapter, w.ID, deliverErr, w.Revision)
+		observe.WakeFailedOutcome(sub.Adapter, w.ID, string(outcome), deliverErr, w.Revision)
 		observe.ActorError("wake", w.ID, deliverErr)
 		log.Printf("cibridge: wake %s: %v", target, deliverErr)
 		if dead {
@@ -1622,7 +1622,7 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 	}
 	b.breakerRecord(adapter, now, false)
 	observe.WakeDuration(sub.Adapter, time.Since(start))
-	observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
+	observe.WakeDeliveredOutcome(sub.Adapter, w.ID, observe.WakeOutcomePosted, w.Revision)
 	b.recordDelivery(ctx, p.ObligationID, attempt, domain.OutcomePosted, now)
 	b.recordWake(w, now, attempt)
 	b.markDelivered(p.ObligationID, now, attempt, "")
@@ -1750,7 +1750,7 @@ func (b *Bridge) markOrphaned(ctx context.Context, w domain.Watch, sub domain.Su
 			outcome = domain.OutcomeIndeterminate
 		}
 		b.recordDelivery(ctx, id, 1, outcome, now)
-		observe.WakeFailed("", current.ID, deliverErr, current.Revision)
+		observe.WakeFailedOutcome("", current.ID, string(outcome), deliverErr, current.Revision)
 		return
 	}
 	b.recordDelivery(ctx, id, 1, domain.OutcomePosted, now)
@@ -1863,7 +1863,7 @@ func (b *Bridge) markInWorkStalled(ctx context.Context, w domain.Watch, sub doma
 			outcome = domain.OutcomeIndeterminate
 		}
 		b.recordDelivery(ctx, id, 1, outcome, now)
-		observe.WakeFailed("", w.ID, deliverErr, w.Revision)
+		observe.WakeFailedOutcome("", w.ID, string(outcome), deliverErr, w.Revision)
 		observe.ActorError("wake-in-work-stall", w.ID, deliverErr)
 		return false
 	}
