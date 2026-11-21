@@ -1,5 +1,5 @@
 # ARDH-04. Вынести общий скелет региstrации MCP инструментов
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/mcp/tool_watch_pr.go, internal/infra/mcp/tool_ack.go, internal/infra/mcp/tool_defer_wiring.go, internal/infra/mcp/tool_get_result.go, internal/infra/mcp/tool_wait_result.go, internal/infra/mcp/tool_wake.go, internal/infra/mcp/tool_claim.go
@@ -12,3 +12,6 @@
 Шаги: Ввести attachTool в пакете mcp. Перевести десять хелперов. Сохранить ручной список из восьми инструментов и золотой контракт tools/list без изменений.
 Проверка: tools/list contract test проходит без обновления SHA и байтового счётчика. CI зелёный.
 Приёмка: Общий скелет регистрации инструментов один, восемь инструментов и их аннотации не изменились.
+
+Итог: Уже влито в PR #1209
+Доказательство: 8090ea6b в origin/main, merge-base --is-ancestor=0

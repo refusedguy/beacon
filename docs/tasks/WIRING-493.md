@@ -1,6 +1,6 @@
 # WIRING-493. Подключить control socket TUI к приложению и CLI
 Premise: перепроверено 2026-11-21 по origin/main (b9937c01) в рамках CLEAN-12. Проводка в main не влита. PR #493 добавил сервер и клиент control socket, но ни один продакшен-вызов `tui.Listen` не появился. Все три ограничения из раздела «Причина» сохраняются. Owner-decision по ADR 0060 и layer-ребру cmd к internal/tui в дереве не зафиксирована. Код не менял, карточку оставляю todo.
-Статус: todo
+Статус: in_progress
 baseline: `git rev-parse --short origin/main` = b9937c01; `git grep -n 'tui.Listen(' origin/main -- internal cmd` = пусто; `git grep -n 'internal/tui' origin/main -- cmd` = только комментарии в cmd/beacon/board.go:25-26 и board_wire.go:5; `git show origin/main:tools/beacon-gates/gate/config/layers.json` = `internal/tui` объявлен строкой 9, allowed-ребер в него нет, `cmd` разрешён только к `internal/infra`, `internal/app`, `internal/domain` и `internal/infra/observe`; `layers-ast` обязателен в .github/workflows/ci.yml:193; `git show origin/main:internal/infra/httpapi/server.go` = `validCommands` на строках 954-958, claim и release отсутствуют; `git grep -n 'humanDecisionSink' origin/main -- cmd` = cmd/beacon/mcp.go:760, switch обрабатывает только cancel, unblock, pause и resume; `git show origin/main:docs/adrs/0060-cli-adapter-boundary-and-live-loop.md` = п2 «Свой TUI ... не создаётся», п5 `beacon attach` остаётся переходом в обычный TUI; main с df10f2d ушёл вперёд на ARDH-рефакторинг, но три условия перепроверены напрямую и сохраняются; `git diff origin/main...HEAD -- internal/tui cmd/beacon/main.go internal/infra/httpapi` = пусто. Прямая проверка гейта из предыдущей итерации: временный импорт internal/tui в cmd/beacon/main.go дал `LAYER-FORBIDDEN-EDGE: cmd/beacon/main.go:18: cmd/beacon imports internal/tui against the layer matrix`, код выхода 1; импорт убрали, дерево чистое.
 Фаза: P3
 Тип: task
@@ -44,3 +44,6 @@ beacon_defer_wiring записывает отложенную проводку �
 Карточка без "Статус: todo", пустой OwnerFiles или отсутствующая "## Причина"
 проваливает проверку.
 wiring-card:contract -->
+
+Состояние: needs_input
+Вопрос: Нужно ли решение владельца: разрешить собственный TUI-процесс по ADR 0060 и добавить ребро cmd -> internal/tui в layers.json, а также передать права на cmd/beacon/mcp.go для эффекта claim/release по образцу beacon_ack (ADR 0094)? Без двух решений проводка невозможна, карточку закрыть нельзя.
