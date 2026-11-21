@@ -930,3 +930,26 @@ var ErrIndeterminateOutcome = errors.New("domain: indeterminate operation outcom
 func IsIndeterminate(err error) bool {
 	return errors.Is(err, ErrIndeterminateOutcome)
 }
+
+// ---- IDX-09: graph readiness marker ----
+//
+// Agents need one signal that says the task graph exists and still matches the
+// card tree. The rule lives in the domain so every tool that reports the marker
+// applies the same definition. A missing or stale index must never advertise a
+// graph an agent cannot trust.
+
+// GraphStatus is the read-only state of the task graph index. IndexHash is the
+// source digest the index was built from; SourceHash is the digest observed in
+// the same read. Equal non-empty hashes mean the graph is current.
+type GraphStatus struct {
+	Built      bool
+	IndexHash  string
+	SourceHash string
+}
+
+// Ready reports the graphReady marker. It is true only when the index exists
+// and both hashes are present and equal. An index built from an older card set
+// fails the comparison, so a stale graph reads as not ready.
+func (g GraphStatus) Ready() bool {
+	return g.Built && g.IndexHash != "" && g.IndexHash == g.SourceHash
+}

@@ -38,6 +38,14 @@ const (
 	// derived beacon_stats schema forbids extra properties, so the count rides
 	// in the diagnostic array like the plan-limit and wait metrics (T3.440).
 	blockedWatchPrefix = "blocked watches: "
+	// graphReadyPrefix marks the graph readiness marker inside loadErrors. The
+	// schema of beacon_stats is derived from StatsOutput in schema.go, a file
+	// owned by another card, so the marker uses the same diagnostic channel as
+	// the blocked-watch count and the wait metric instead of a new field.
+	graphReadyPrefix = "graphReady: "
+	// graphIndexErrorPrefix records a failed graph index read. A read that
+	// cannot be verified is reported as not ready, never as a current graph.
+	graphIndexErrorPrefix = "graph index: "
 	// activeWatchLimit is the global active-watch cap from ADR 0093
 	// (maxActiveWatchesGlobal) and T1.4. T5.64 warns at 75% and 90% of it.
 	activeWatchLimit = 200
@@ -154,6 +162,14 @@ type RegistryStatsReader interface {
 	RegistryStats(ctx context.Context) (RegistryStats, error)
 }
 
+// GraphIndexReader reports the current state of the task graph index. It is
+// optional, like WaitTelemetryReader and RegistryStatsReader: a handler with
+// no reader bound reports the graph as not ready. An agent that cannot verify
+// the index must never treat the graph as built and current.
+type GraphIndexReader interface {
+	GraphStatus(ctx context.Context) (domain.GraphStatus, error)
+}
+
 // SnapshotRegistryStats adapts the Registry projection already carried by a
 // StateSnapshot (T5.29) to RegistryStatsReader. A wiring layer whose snapshot
 // reader fills Registry can pass this adapter to SetRegistryStatsReader.
@@ -199,6 +215,7 @@ type StatsInput struct{}
 type StatsHandler struct {
 	reader     SnapshotReader
 	registry   RegistryStatsReader
+	graph      GraphIndexReader
 	watchLimit *watchLimitLatch
 }
 
@@ -213,6 +230,13 @@ func NewStatsHandler(reader SnapshotReader) *StatsHandler {
 // removes it and restores the pre-T5.60 zero counters.
 func (h *StatsHandler) SetRegistryStatsReader(r RegistryStatsReader) {
 	h.registry = r
+}
+
+// SetGraphIndexReader binds the optional graph index port. Passing nil removes
+// it and makes beacon_stats report graphReady as false, so a graph nobody can
+// verify is never advertised as current.
+func (h *StatsHandler) SetGraphIndexReader(r GraphIndexReader) {
+	h.graph = r
 }
 
 // planLimitInfo computes the warning from used and budget. A missing or
@@ -303,9 +327,12 @@ func (i WaitTelemetryInfo) entry() string {
 // and, when the reader also exposes wait samples, an idle metric with the wait
 // share and the mean worker count (ADR 0056 p6). If a registry port is bound,
 // the three T5.60 counters come from it; a failed read is recorded in
-// loadErrors instead of producing invented counters. It performs no write and
-// no model request. Slices are allocated even when empty so the response always
-// carries an array, never JSON null.
+// loadErrors instead of producing invented counters. When a graph index port is
+// bound, the graphReady marker reflects whether the graph is built and current;
+// a failing read also reports false. With no port bound the marker is absent,
+// which callers read as not ready. It performs no write and no model request.
+// Slices are allocated even when empty so the response always carries an array,
+// never JSON null.
 func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ StatsInput) (*mcpsdk.CallToolResult, StatsOutput, error) {
 	snap, err := h.reader.Snapshot()
 	if err != nil {
@@ -350,6 +377,20 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			loadErrors = append(loadErrors, registryStatsErrorPrefix+err.Error())
 			registry = RegistryStats{}
 		}
+	}
+
+	// IDX-09: report whether the task graph is built and current. A missing
+	// reader or a failed read fails closed, so an agent never trusts a graph it
+	// cannot verify. The marker rides in loadErrors because the stats schema is
+	// derived in schema.go and forbids extra properties.
+	if h.graph != nil {
+		graph, err := h.graph.GraphStatus(ctx)
+		if err != nil {
+			observe.ActorError("beacon_stats", "", err)
+			loadErrors = append(loadErrors, graphIndexErrorPrefix+err.Error())
+			graph = domain.GraphStatus{}
+		}
+		loadErrors = append(loadErrors, fmt.Sprintf("%s%t", graphReadyPrefix, graph.Ready()))
 	}
 
 	out := StatsOutput{
@@ -436,4 +477,23 @@ func blockedWatchCount(out StatsOutput) string {
 		}
 	}
 	return ""
+}
+
+// graphReadyEntry returns the graph readiness marker present in a stats
+// response, if any. Callers and tests read the marker through this helper so
+// they do not depend on its position in loadErrors.
+func graphReadyEntry(out StatsOutput) string {
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, graphReadyPrefix) {
+			return entry
+		}
+	}
+	return ""
+}
+
+// graphReady reports whether the stats response advertises a current graph.
+// A response with no marker is not ready, so a caller built before IDX-09
+// never mistakes silence for a green signal.
+func graphReady(out StatsOutput) bool {
+	return graphReadyEntry(out) == graphReadyPrefix+"true"
 }
