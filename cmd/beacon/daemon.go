@@ -191,6 +191,10 @@ type sessionHeartbeater interface {
 // alive in the durable registry. It is a variable so a test can shorten it.
 var daemonHeartbeatInterval = 30 * time.Second
 
+// daemonReminderInterval is how often the daemon runs a deadline reminder
+// pass. It is a variable so a test can shorten it.
+var daemonReminderInterval = time.Minute
+
 // daemonHeartbeat marks one session alive. This is the single call that binds
 // the daemon cycle to the durable session registry: Heartbeat moves last_seen
 // through the store's Touch. An empty id or a missing port is skipped, so a
@@ -242,6 +246,69 @@ func runDaemonHeartbeat(ctx context.Context, hb sessionHeartbeater, sessionID st
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Deadline reminders (WIRING-489)
+// ---------------------------------------------------------------------------
+
+// daemonReminderStore builds the store adapter that feeds the app notifier.
+// The loader reads active Watches from the daemon's existing store handle and
+// keeps those whose deadline has passed. The deliverer emits one observe event
+// per reminder, which is the configured log and metric sink. The card left the
+// delivery channel open; the structured event is a channel that needs no new
+// transport or schema.
+func daemonReminderStore(db *store.DB) *taskstore.ReminderStore {
+	load := func(_ context.Context, at time.Time) ([]taskstore.ReminderTask, error) {
+		if db == nil {
+			return nil, nil
+		}
+		watches, err := db.ActiveWatches()
+		if err != nil {
+			return nil, err
+		}
+		out := make([]taskstore.ReminderTask, 0, len(watches))
+		for _, w := range watches {
+			if w.DeadlineAt.IsZero() || w.DeadlineAt.After(at) {
+				continue
+			}
+			out = append(out, taskstore.ReminderTask{ID: w.ID, DeadlineAt: w.DeadlineAt})
+		}
+		return out, nil
+	}
+	deliver := func(_ context.Context, r taskstore.Reminder) error {
+		observe.Event(observe.LevelInfo, "deadline_reminder", observe.Fields{
+			"task":     r.TaskID,
+			"reason":   r.Reason,
+			"at":       r.At,
+			"deadline": r.DeadlineAt,
+		})
+		return nil
+	}
+	return taskstore.NewReminderStore(load, deliver)
+}
+
+// daemonReminderNotify wraps one notifier pass as a loop callback. A delivery
+// failure becomes an error so the loop's reporter records it; the notifier
+// still retries the reminder on its next pass.
+func daemonReminderNotify(n *tasks.Notifier) orchestrator.NotifyFunc {
+	return func(ctx context.Context) error {
+		report, err := n.Notify(ctx)
+		if err != nil {
+			return err
+		}
+		if len(report.Failed) > 0 {
+			return fmt.Errorf("beacon daemon: %d reminder deliveries failed", len(report.Failed))
+		}
+		return nil
+	}
+}
+
+// runDaemonReminders builds the notifier over the store adapter and ticks until
+// ctx is done. It reuses the store handle the daemon already opened.
+func runDaemonReminders(ctx context.Context, db *store.DB, interval time.Duration) {
+	notifier := tasks.NewNotifier(daemonReminderStore(db), time.Now)
+	orchestrator.RunNotifyLoop(ctx, daemonReminderNotify(notifier), interval)
 }
 
 // runDaemon implements `beacon daemon [--interval 3m] [--once]`. It runs the
@@ -322,6 +389,9 @@ func runDaemon(c *CLI, args []string) int {
 		}
 		daemonPollCards(ctx, cardMonitor, db, root)
 		ReconcilePass(ctx, cfg)
+		if err := daemonReminderNotify(tasks.NewNotifier(daemonReminderStore(db), time.Now))(ctx); err != nil {
+			observe.ActorError("reminder", "", err)
+		}
 		return 0
 	}
 
@@ -345,6 +415,13 @@ func runDaemon(c *CLI, args []string) int {
 		runDaemonCardMonitor(ctx, cardMonitor, db, root, daemonCardPollInterval)
 	}()
 	defer func() { <-cmDone }()
+
+	reminderDone := make(chan struct{})
+	go func() {
+		defer close(reminderDone)
+		runDaemonReminders(ctx, db, daemonReminderInterval)
+	}()
+	defer func() { <-reminderDone }()
 
 	<-ctx.Done()
 	return 0

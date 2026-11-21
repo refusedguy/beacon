@@ -1,14 +1,17 @@
 // Package tasks turns task deadlines into reminders. The decision is pure:
 // Plan reads no clock, store or network. The caller supplies "now", the task
 // snapshot and the ledger of reminders already sent, so equal inputs always
-// give an equal plan. A narrow port reads tasks from storage and delivers the
-// reminders; this package owns neither.
+// give an equal plan. The port and its data types live in internal/infra and
+// are aliased here, so the store adapter can implement them without an
+// internal/infra -> internal/app edge.
 package tasks
 
 import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 // ReminderReasonDeadline is the reason carried by a deadline reminder. It is
@@ -18,28 +21,21 @@ const ReminderReasonDeadline = "deadline_overdue"
 
 // Task is one deadline-carrying task. ID is the stable task identifier and
 // DeadlineAt is the absolute instant after which the task is overdue. A zero
-// deadline means the task has no deadline and never produces a reminder.
-type Task struct {
-	ID         string
-	DeadlineAt time.Time
-}
+// deadline means the task has no deadline and never produces a reminder. The
+// type is an alias to the infra shape so the store adapter can use it directly.
+type Task = taskstore.ReminderTask
 
 // Reminder is one reminder generated for an overdue task. At is the injected
 // "now" of the pass that produced it. ReminderKey(TaskID, DeadlineAt) is the
 // deduplication key, so a new deadline produces a fresh reminder while a
-// repeat of the same pass does not.
-type Reminder struct {
-	TaskID     string
-	DeadlineAt time.Time
-	At         time.Time
-	Reason     string
-}
+// repeat of the same pass does not. It aliases the infra delivery shape.
+type Reminder = taskstore.Reminder
 
 // ReminderKey builds the deduplication key for a task and the deadline a
-// reminder covers. UTC and a fixed layout keep the key stable across zones and
-// across monotonic clock readings on the same instant.
+// reminder covers. It delegates to the infra definition so the store adapter
+// and this package never drift apart.
 func ReminderKey(taskID string, deadline time.Time) string {
-	return taskID + "\x00" + deadline.UTC().Format(time.RFC3339Nano)
+	return taskstore.ReminderKey(taskID, deadline)
 }
 
 // reminderKeyOf returns the key of a reminder already built from a task.
@@ -101,15 +97,9 @@ func Plan(now time.Time, tasks []Task, sent ReminderLedger) ([]Reminder, Reminde
 // ReminderPorts is the I/O boundary of reminder generation. An adapter owns
 // the store and the delivery channel. SendReminder must be idempotent by task
 // id and deadline, because a restart loses this package's in-memory ledger and
-// can replay a reminder whose delivery was never confirmed.
-type ReminderPorts interface {
-	// OverdueTasks returns tasks whose deadline is at or before at. The
-	// adapter reads the store; this package only consumes the result.
-	OverdueTasks(ctx context.Context, at time.Time) ([]Task, error)
-	// SendReminder delivers one reminder. Implementations must suppress a
-	// second delivery for the same task id and deadline.
-	SendReminder(ctx context.Context, reminder Reminder) error
-}
+// can replay a reminder whose delivery was never confirmed. The interface is
+// declared in internal/infra and aliased here to respect the layer matrix.
+type ReminderPorts = taskstore.ReminderPorts
 
 // ReminderFailure records one reminder that the port could not deliver.
 type ReminderFailure struct {
