@@ -170,3 +170,65 @@ func TestFilterDedupeConvergesUnderConcurrency(t *testing.T) {
 		t.Fatalf("accepted deliveries = %d, want exactly 1", got)
 	}
 }
+
+// TestFilterDistinctIDsAtSameCreatedDoNotMerge is the negative control from
+// RS-WK-06. The filter takes no created or timestamp input, so two events
+// emitted at the same instant cannot merge just because their clocks match.
+// Dedupe keys are the delivery id and the head SHA, nothing about when the
+// event happened.
+func TestFilterDistinctIDsAtSameCreatedDoNotMerge(t *testing.T) {
+	f := newTestFilter()
+	first, reason := f.Filter(EventWorkflowRun, "main", "refusedguy", "delivery-a", "sha-a")
+	if first != DecisionAccept {
+		t.Fatalf("first decision = %q, want %q (reason %q)", first, DecisionAccept, reason)
+	}
+
+	// Same event, branch and author as an event created in the same second, but
+	// a different delivery id and head SHA. It is a second, independent effect.
+	second, reason := f.Filter(EventWorkflowRun, "main", "refusedguy", "delivery-b", "sha-b")
+	if second != DecisionAccept {
+		t.Fatalf("second decision = %q, want %q (reason %q)", second, DecisionAccept, reason)
+	}
+}
+
+// TestFilterRepeatedIDCreatesNoSecondEffect is the negative control from
+// RS-WK-06. Redelivering one id is dropped, so it cannot queue a second outbox
+// row. A new head SHA on the repeat does not change that: delivery is checked
+// before head SHA.
+func TestFilterRepeatedIDCreatesNoSecondEffect(t *testing.T) {
+	f := newTestFilter()
+	first, _ := f.Filter(EventWorkflowRun, "main", "refusedguy", "delivery-a", "sha-a")
+	if first != DecisionAccept {
+		t.Fatalf("first decision = %q, want %q", first, DecisionAccept)
+	}
+	if !first.Publish() {
+		t.Fatal("first accepted delivery must publish one effect")
+	}
+
+	second, reason := f.Filter(EventWorkflowRun, "main", "refusedguy", "delivery-a", "sha-b")
+	if second != DecisionDuplicateDelivery {
+		t.Fatalf("second decision = %q, want %q (reason %q)", second, DecisionDuplicateDelivery, reason)
+	}
+	if second.Publish() {
+		t.Fatal("repeated delivery id must not publish a second effect")
+	}
+}
+
+// TestFilterDeliveryCheckedBeforeHeadSHA pins the order of the dedupe checks.
+// When a delivery is both a repeated id and a repeated head SHA, the delivery
+// check wins. Time plays no part in either check.
+func TestFilterDeliveryCheckedBeforeHeadSHA(t *testing.T) {
+	f := newTestFilter()
+	first, _ := f.Filter(EventWorkflowRun, "main", "refusedguy", "delivery-a", "sha-a")
+	if first != DecisionAccept {
+		t.Fatalf("first decision = %q, want %q", first, DecisionAccept)
+	}
+
+	decision, reason := f.Filter(EventWorkflowRun, "main", "refusedguy", "delivery-a", "sha-a")
+	if decision != DecisionDuplicateDelivery {
+		t.Fatalf("decision = %q, want %q (reason %q)", decision, DecisionDuplicateDelivery, reason)
+	}
+	if want := "webhook: delivery delivery-a already handled"; reason != want {
+		t.Fatalf("reason = %q, want %q", reason, want)
+	}
+}
