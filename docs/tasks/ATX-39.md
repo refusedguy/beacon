@@ -1,12 +1,12 @@
 # ATX-39. Помечать обрезание recentWatches в снимке
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/httpapi/server.go
 Зависимости: 
 Ссылка: 
-Агент: нет
-Время: нет
+Агент: exe114
+Время: 2026-11-21T17:57:51Z
 Цель: Показывать, что снимок содержит не все вотчи.
 Контекст: Источник: docs/research/output-limits-audit.md, раздел 3 и строка таблицы 174. internal/infra/httpapi/server.go:46-50 задаёт maxRecentWatches = 30, применение в :832-834 берёт срез [:30]. Провайдер обязан отдавать записи от новых к старым по ClosedAt, комментарий :184-185. Отбрасывание молчаливое. Восстановление возможно через GET /api/v1/watches с nextCursor в internal/infra/server/api_watches.go:154-174. Baseline: 30 записей.
 Шаги: Добавить поле recentWatchesTruncated или ссылку на постраничный endpoint в снимок. Обновить openapi.yaml и тесты контракта.
