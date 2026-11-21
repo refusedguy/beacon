@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +37,13 @@ var LegacyProtocolVersions = []string{
 	"2025-06-18",
 	"2025-03-26",
 	"2024-11-05",
+}
+
+// LegacyProtocolVersionsCopy returns a fresh copy of the legacy version set.
+// The initialize response holds this copy, so a client that edits the returned
+// slice cannot change the package global used by later handshakes (ARDH-22).
+func LegacyProtocolVersionsCopy() []string {
+	return slices.Clone(LegacyProtocolVersions)
 }
 
 // Task dialect capability keys. They are read from the client's capabilities
@@ -233,6 +241,13 @@ var ToolNames = func() []string {
 	}
 	return names
 }()
+
+// ToolNamesCopy returns a fresh copy of the advertised tool names. Callers that
+// sort, append or otherwise edit the result cannot change the global registry
+// used by the init check and the MCP client (ARDH-22).
+func ToolNamesCopy() []string {
+	return slices.Clone(ToolNames)
+}
 
 // Bridge is the six-operation port between Beacon's MCP core and one external
 // agent (ADR 0024). The core speaks only MCP; a bridge translates these six
@@ -638,7 +653,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 		&mcpsdk.Implementation{Name: ServerName, Version: ServerVersion},
 		&mcpsdk.ServerOptions{
 			Instructions:              CycleInstructions,
-			SupportedProtocolVersions: LegacyProtocolVersions,
+			SupportedProtocolVersions: LegacyProtocolVersionsCopy(),
 		},
 	)
 	for _, descriptor := range toolDescriptors {
