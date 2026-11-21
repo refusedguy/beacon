@@ -31,6 +31,31 @@ var counterLabels = map[string]string{
 	CounterActorErrors:      "",
 }
 
+// LabelSource breaks wake deliveries down by the path that admitted them: MCP
+// or daemon. It is a second label on wake_delivered_total next to LabelAdapter.
+const LabelSource = "source"
+
+// sourceLabelSep joins adapter and source into one JSON label key, the way
+// outcomeKey joins adapter and outcome. Adapter and source names never contain
+// it, so the pair stays unambiguous.
+const sourceLabelSep = ":"
+
+// counterSourceLabels lists the counters that accept a second label through
+// IncSource. Other counters keep their single label and their JSON shape.
+var counterSourceLabels = map[string]bool{CounterWakeDelivered: true}
+
+// sourceLabelKey joins the two label values of a source-aware counter.
+func sourceLabelKey(adapter, source string) string {
+	return adapter + sourceLabelSep + source
+}
+
+// splitSourceLabelKey splits a key written by IncSource. The boolean is false
+// for keys written by the older single-label Inc, which keeps its old shape.
+func splitSourceLabelKey(key string) (adapter, source string, ok bool) {
+	adapter, source, ok = strings.Cut(key, sourceLabelSep)
+	return adapter, source, ok
+}
+
 // Counters for the blocked -> fixer -> unblock path and for file adapter reads.
 // They live outside the generic counterLabels registry on purpose: that
 // registry is a closed set whose export is covered by a fixed-name test. These
@@ -233,8 +258,22 @@ func NewMetrics() *Metrics {
 }
 
 // Inc adds one to name. labelValue is used only by counters that declare a
-// label; an unknown name is recorded as a plain total.
+// label; an unknown name is recorded as a plain total. Counters that also carry
+// a source keep the adapter-only series here, so older callers and snapshots
+// keep their current shape.
 func (m *Metrics) Inc(name, labelValue string) {
+	m.add(name, labelValue, "")
+}
+
+// IncSource adds one to name and records source as a second label on counters
+// that declare it. For other counters, or when source is empty, it behaves like
+// Inc. The two values share one JSON key with a separator, while Prometheus
+// exports them as adapter and source labels.
+func (m *Metrics) IncSource(name, labelValue, source string) {
+	m.add(name, labelValue, source)
+}
+
+func (m *Metrics) add(name, labelValue, source string) {
 	if m == nil {
 		return
 	}
@@ -243,10 +282,14 @@ func (m *Metrics) Inc(name, labelValue string) {
 	label := counterLabelKey(name)
 	m.values[name]++
 	if label != "" {
+		key := labelValue
+		if source != "" && counterSourceLabels[name] {
+			key = sourceLabelKey(labelValue, source)
+		}
 		if m.labelled[name] == nil {
 			m.labelled[name] = make(map[string]uint64)
 		}
-		m.labelled[name][labelValue]++
+		m.labelled[name][key]++
 	}
 }
 
@@ -337,7 +380,9 @@ func HistogramNames() []string {
 
 // JSON renders every metric as a JSON object. An unlabeled counter is a
 // number, a labelled counter is an object from label value to count, and a
-// histogram is an object with count, sum and cumulative buckets.
+// histogram is an object with count, sum and cumulative buckets. A counter with
+// a source label keeps both values in one key, adapter then source separated by
+// a colon, the same way wake_outcome_total stores its adapter and outcome.
 func (m *Metrics) JSON() []byte {
 	out := make(map[string]any)
 	histograms := make(map[string]any)
@@ -493,6 +538,13 @@ func (m *Metrics) Prometheus() []byte {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
+			if counterSourceLabels[name] {
+				if adapter, source, ok := splitSourceLabelKey(k); ok {
+					fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\",%s=\"%s\"} %d\n",
+						name, label, escapeLabel(adapter), LabelSource, escapeLabel(source), values[k])
+					continue
+				}
+			}
 			fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, label, escapeLabel(k), values[k])
 		}
 	}

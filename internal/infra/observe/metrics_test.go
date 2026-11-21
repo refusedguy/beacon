@@ -121,6 +121,79 @@ func TestWakeOutcomeKeepsExistingJSONShape(t *testing.T) {
 	}
 }
 
+func TestWakeDeliveredSourceLabelExportsJSONAndPrometheus(t *testing.T) {
+	m := NewMetrics()
+	m.IncSource(CounterWakeDelivered, "opencode", WakeSourceMCP)
+	m.IncSource(CounterWakeDelivered, "opencode", WakeSourceDaemon)
+	m.IncSource(CounterWakeDelivered, "opencode", WakeSourceDaemon)
+	m.Inc(CounterWakeDelivered, "pi")
+
+	var got map[string]any
+	if err := json.Unmarshal(m.JSON(), &got); err != nil {
+		t.Fatalf("невалидный JSON метрик: %v", err)
+	}
+	byLabel, ok := got[CounterWakeDelivered].(map[string]any)
+	if !ok {
+		t.Fatalf("%s не объект: %v", CounterWakeDelivered, got[CounterWakeDelivered])
+	}
+	wantJSON := map[string]float64{
+		sourceLabelKey("opencode", WakeSourceMCP):    1,
+		sourceLabelKey("opencode", WakeSourceDaemon): 2,
+		"pi": 1,
+	}
+	for key, want := range wantJSON {
+		if byLabel[key] != want {
+			t.Errorf("%s[%q] = %v, ожидалось %v", CounterWakeDelivered, key, byLabel[key], want)
+		}
+	}
+	if len(byLabel) != len(wantJSON) {
+		t.Errorf("в %s %d ключей, ожидалось %d: %v", CounterWakeDelivered, len(byLabel), len(wantJSON), byLabel)
+	}
+
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		`beacon_wake_delivered_total{adapter="opencode",source="mcp"} 1`,
+		`beacon_wake_delivered_total{adapter="opencode",source="daemon"} 2`,
+		`beacon_wake_delivered_total{adapter="pi"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus-выводе нет %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestWakeDeliveredSourceLabelSurvivesSnapshot(t *testing.T) {
+	m := NewMetrics()
+	m.IncSource(CounterWakeDelivered, "opencode", WakeSourceDaemon)
+	m.Inc(CounterWakeDelivered, "pi")
+
+	restored := MetricsFromSnapshotJSON(m.SnapshotJSON())
+	if got, want := string(restored.Prometheus()), string(m.Prometheus()); got != want {
+		t.Errorf("снапшот изменил метрику с source:\n%s\n----\n%s", got, want)
+	}
+}
+
+func TestWakeDeliveredSourceWritesLabelThroughRecorder(t *testing.T) {
+	previous := Default()
+	defer SetDefault(previous)
+
+	m := NewMetrics()
+	SetDefault(NewRecorder(nil, m))
+	WakeDeliveredSource("opencode", "w1", WakeSourceDaemon)
+	want := `beacon_wake_delivered_total{adapter="opencode",source="daemon"} 1`
+	if text := string(m.Prometheus()); !strings.Contains(text, want) {
+		t.Errorf("в Prometheus-выводе нет %q:\n%s", want, text)
+	}
+
+	plain := newCaptureSink()
+	SetDefault(plain)
+	WakeDeliveredSource("opencode", "w2", WakeSourceDaemon)
+	if plain.counts[CounterWakeDelivered] != 1 || plain.labels[CounterWakeDelivered] != "opencode" {
+		t.Errorf("старый sink получил %d вызовов с меткой %q, ожидалось 1 и %q",
+			plain.counts[CounterWakeDelivered], plain.labels[CounterWakeDelivered], "opencode")
+	}
+}
+
 func TestMetricsReset(t *testing.T) {
 	m := NewMetrics()
 	m.Inc(CounterWakeErrors, "opencode")

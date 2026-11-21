@@ -59,6 +59,23 @@ func TestEveryCounterIsExportedAndIncrements(t *testing.T) {
 	}
 }
 
+func TestEverySourceLabelCounterExportsSecondLabel(t *testing.T) {
+	if len(counterSourceLabels) == 0 {
+		t.Fatal("нет счётчиков с меткой source")
+	}
+	m := NewMetrics()
+	for name := range counterSourceLabels {
+		m.IncSource(name, "opencode", WakeSourceDaemon)
+	}
+	text := string(m.Prometheus())
+	for name := range counterSourceLabels {
+		want := "beacon_" + name + `{adapter="opencode",` + LabelSource + `="daemon"} 1`
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus нет %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestHelpersCoverEveryTransition(t *testing.T) {
 	sink := newCaptureSink()
 	SetDefault(sink)
