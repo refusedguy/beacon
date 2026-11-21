@@ -243,80 +243,58 @@ func (c *CLI) Run(args []string) int {
 	return code
 }
 
+// runnerFor is the single name -> runner table for the CLI. Every dispatchable
+// command is here, including the ones hidden from `beacon list`. Each entry
+// adapts the varied runner signatures to commandRunner and reads the current
+// seam, so Register* replacements in tests are honoured at call time.
+var runnerFor = map[string]commandRunner{
+	"list":         func(c *CLI, args []string) int { return runList(args, c.out, c.errOut) },
+	"board":        func(c *CLI, args []string) int { return boardRunner(c, args) },
+	"what":         func(c *CLI, args []string) int { return runWhat(args, c.out, c.errOut) },
+	"doctor":       func(c *CLI, args []string) int { return c.runDoctor(args) },
+	"build":        func(c *CLI, args []string) int { return c.runBuild(args) },
+	"test":         func(c *CLI, args []string) int { return c.runTest(args) },
+	"gates":        func(c *CLI, args []string) int { return c.runGates(args) },
+	"task":         func(c *CLI, args []string) int { return taskRunner(args, c.out, c.errOut) },
+	"why":          func(c *CLI, args []string) int { return taskRunner(append([]string{"why"}, args...), c.out, c.errOut) },
+	"mcp":          func(c *CLI, args []string) int { return mcpRunner(c.errOut) },
+	"orchestrate":  func(c *CLI, args []string) int { return orchestratorRunner(c, args) },
+	"orchestrator": func(c *CLI, args []string) int { return orchestratorCommandRunner(c, args) },
+	"agents":       func(c *CLI, args []string) int { return c.runAgents(args) },
+	"watch":        func(c *CLI, args []string) int { return watchRunner(c, args) },
+	"spawn":        func(c *CLI, args []string) int { return c.runSpawn(args) },
+	"attach":       func(c *CLI, args []string) int { return c.runAttach(args) },
+	"registry":     func(c *CLI, args []string) int { return c.registryCommand(args) },
+	"deliver":      func(c *CLI, args []string) int { return deliverRunner(c, args) },
+	"ci":           func(c *CLI, args []string) int { return ciRunner(c, args) },
+	"daemon":       func(c *CLI, args []string) int { return daemonRunner(c, args) },
+	"gc":           func(c *CLI, args []string) int { return gcRunner(c, args) },
+	"gc-worktree":  func(c *CLI, args []string) int { return gcWorktreeRunner(c, args) },
+	"init":         func(c *CLI, args []string) int { return initRunner(c, args) },
+	"index":        func(c *CLI, args []string) int { return indexRunner(c, args) },
+	"deferred":     func(c *CLI, args []string) int { return deferredRunner(c, args) },
+	"workload":     func(c *CLI, args []string) int { return workloadRunner(c, args) },
+	"metrics":      func(c *CLI, args []string) int { return metricsRunner(c, args) },
+	"pr":           func(c *CLI, args []string) int { return prcreateRunner(c, args) },
+	"logs":         func(c *CLI, args []string) int { return logsRunner(c, args) },
+	"inspect":      func(c *CLI, args []string) int { return inspectRunner(c, args) },
+	"human":        func(c *CLI, args []string) int { return humanRunner(c, args) },
+	"reset":        func(c *CLI, args []string) int { return resetRunner(c, args) },
+	"up":           func(c *CLI, args []string) int { return upRunner(c, args) },
+}
+
 func (c *CLI) dispatch(args []string) int {
 	switch args[0] {
 	case "-h", "--help", "help":
 		writeUsage(c.out)
 		return 0
-	case "list":
-		return runList(args[1:], c.out, c.errOut)
-	case "board":
-		return boardRunner(c, args[1:])
-	case "what":
-		return runWhat(args[1:], c.out, c.errOut)
-	case "doctor":
-		return c.runDoctor(args[1:])
-	case "build":
-		return c.runBuild(args[1:])
-	case "test":
-		return c.runTest(args[1:])
-	case "gates":
-		return c.runGates(args[1:])
-	case "task":
-		return taskRunner(args[1:], c.out, c.errOut)
-	case "why":
-		return taskRunner(append([]string{"why"}, args[1:]...), c.out, c.errOut)
-	case "mcp":
-		return mcpRunner(c.errOut)
-	case "orchestrate":
-		return orchestratorRunner(c, args[1:])
-	case "orchestrator":
-		return orchestratorCommandRunner(c, args[1:])
-	case "agents":
-		return c.runAgents(args[1:])
-	case "watch":
-		return watchRunner(c, args[1:])
-	case "spawn":
-		return c.runSpawn(args[1:])
-	case "attach":
-		return c.runAttach(args[1:])
-	case "registry":
-		return c.registryCommand(args[1:])
-	case "deliver":
-		return deliverRunner(c, args[1:])
-	case "ci":
-		return ciRunner(c, args[1:])
-	case "daemon":
-		return daemonRunner(c, args[1:])
-	case "gc":
-		return gcRunner(c, args[1:])
-	case "gc-worktree":
-		return gcWorktreeRunner(c, args[1:])
-	case "init":
-		return initRunner(c, args[1:])
-	case "index":
-		return indexRunner(c, args[1:])
-	case "deferred":
-		return deferredRunner(c, args[1:])
-	case "workload":
-		return workloadRunner(c, args[1:])
-	case "metrics":
-		return metricsRunner(c, args[1:])
-	case "pr":
-		return prcreateRunner(c, args[1:])
-	case "logs":
-		return logsRunner(c, args[1:])
-	case "inspect":
-		return inspectRunner(c, args[1:])
-	case "human":
-		return humanRunner(c, args[1:])
-	case "reset":
-		return resetRunner(c, args[1:])
-	default:
-		fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
-		writeUsage(c.errOut)
-		return 2
 	}
+	if run, ok := runnerFor[args[0]]; ok {
+		return run(c, args[1:])
+	}
+	fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
+	writeUsage(c.errOut)
+	return 2
 }
 
 // registryCommand routes the registry subcommands. The check subcommand is

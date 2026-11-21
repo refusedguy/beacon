@@ -84,13 +84,13 @@ func TestT06ListJSONCatalog(t *testing.T) {
 		t.Fatalf("stdout не является JSON: %q", out.String())
 	}
 
+	want := commands()
 	var entries []map[string]json.RawMessage
 	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		t.Fatal(err)
 	}
-	wantNames := []string{"agents", "attach", "board", "build", "deferred", "doctor", "gates", "gc", "gc-worktree", "human", "index", "init", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "up", "watch", "what", "why"}
-	if len(entries) != len(wantNames) {
-		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(wantNames))
+	if len(entries) != len(want) {
+		t.Fatalf("в каталоге %d команд, ожидалось %d", len(entries), len(want))
 	}
 	for i, entry := range entries {
 		if len(entry) != 3 {
@@ -105,30 +105,18 @@ func TestT06ListJSONCatalog(t *testing.T) {
 		if err := json.Unmarshal(entry["name"], &name); err != nil {
 			t.Fatal(err)
 		}
-		if name != wantNames[i] {
-			t.Fatalf("команда %d: имя %q, ожидалось %q", i, name, wantNames[i])
+		if name != want[i].Name {
+			t.Fatalf("команда %d: имя %q, ожидалось %q", i, name, want[i].Name)
 		}
 	}
 
-	var parsed []command
-	if err := json.Unmarshal(out.Bytes(), &parsed); err != nil {
-		t.Fatal(err)
-	}
-	byName := make(map[string]command, len(parsed))
-	for _, cmd := range parsed {
-		byName[cmd.Name] = cmd
-	}
-	for _, name := range wantNames {
-		want, ok := byName[name]
-		if !ok {
-			t.Fatalf("в каталоге нет команды %s", name)
-		}
+	for _, cmd := range want {
 		whatOut, whatErr := new(bytes.Buffer), new(bytes.Buffer)
-		if code := runWhat([]string{name}, whatOut, whatErr); code != 0 {
-			t.Fatalf("what %s: код %d, stderr %q", name, code, whatErr.String())
+		if code := runWhat([]string{cmd.Name}, whatOut, whatErr); code != 0 {
+			t.Fatalf("what %s: код %d, stderr %q", cmd.Name, code, whatErr.String())
 		}
-		if !strings.Contains(whatOut.String(), want.Summary) || !strings.Contains(whatOut.String(), want.Usage) {
-			t.Fatalf("what %s расходится с каталогом: %q", name, whatOut.String())
+		if !strings.Contains(whatOut.String(), cmd.Summary) || !strings.Contains(whatOut.String(), cmd.Usage) {
+			t.Fatalf("what %s расходится с каталогом: %q", cmd.Name, whatOut.String())
 		}
 	}
 }
@@ -142,13 +130,10 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 	if errOut.Len() != 0 {
 		t.Fatalf("stderr не пустой: %q", errOut.String())
 	}
-	for _, name := range []string{"agents", "attach", "build", "deferred", "doctor", "gates", "inspect", "list", "logs", "mcp", "reset", "spawn", "task", "watch", "what", "why"} {
-		if !strings.Contains(out.String(), name) {
-			t.Fatalf("таблица не содержит %s: %q", name, out.String())
+	for _, cmd := range commands() {
+		if !strings.Contains(out.String(), cmd.Name) {
+			t.Fatalf("таблица не содержит %s: %q", cmd.Name, out.String())
 		}
-	}
-
-	for _, cmd := range catalog {
 		whatOut, whatErr := new(bytes.Buffer), new(bytes.Buffer)
 		if code := runWhat([]string{cmd.Name}, whatOut, whatErr); code != 0 {
 			t.Fatalf("what %s: код %d", cmd.Name, code)
@@ -156,6 +141,37 @@ func TestT06ListTableAndWhatAgree(t *testing.T) {
 		if !strings.Contains(whatOut.String(), cmd.Summary) || !strings.Contains(whatOut.String(), cmd.Usage) {
 			t.Fatalf("what %s расходится с каталогом: %q", cmd.Name, whatOut.String())
 		}
+	}
+}
+
+func TestRegistryEveryCatalogCommandHasRunner(t *testing.T) {
+	seen := make(map[string]bool)
+	for _, cmd := range commands() {
+		if seen[cmd.Name] {
+			t.Fatalf("дубль в каталоге: %s", cmd.Name)
+		}
+		seen[cmd.Name] = true
+		if cmd.run == nil || runnerFor[cmd.Name] == nil {
+			t.Fatalf("команда %s есть в каталоге, но не в реестре раннеров", cmd.Name)
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("реестр команд пуст")
+	}
+}
+
+func TestRegistryDispatchUsesSameTable(t *testing.T) {
+	previous := upRunner
+	t.Cleanup(func() { upRunner = previous })
+	called := false
+	upRunner = func(_ *CLI, args []string) int {
+		called = len(args) == 1 && args[0] == "--once"
+		return 9
+	}
+	c, _, errOut, _ := t06NewCLI(t, t06NoChild(t))
+
+	if code := c.Run([]string{"up", "--once"}); code != 9 || !called {
+		t.Fatalf("dispatch up: код %d, вызван %v, stderr %q", code, called, errOut.String())
 	}
 }
 
