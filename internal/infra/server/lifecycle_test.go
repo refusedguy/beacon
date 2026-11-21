@@ -281,12 +281,10 @@ func TestLifecycleRunStopsOnContext(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- lc.Run(ctx) }()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for lc.State() != StateRunning {
-		if time.Now().After(deadline) {
-			t.Fatal("server did not reach running state")
-		}
-		time.Sleep(5 * time.Millisecond)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	if err := lc.WaitForState(waitCtx, StateRunning); err != nil {
+		t.Fatalf("wait for running state: %v", err)
 	}
 	cancel()
 

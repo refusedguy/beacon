@@ -238,8 +238,11 @@ type Lifecycle struct {
 	handler http.Handler
 	drain   time.Duration
 
-	mu       sync.Mutex
-	state    State
+	mu    sync.Mutex
+	state State
+	// stateCh closes and gets replaced on each transition, so waiters wake
+	// on a signal instead of polling State. Nil only for a zero value.
+	stateCh  chan struct{}
 	listener net.Listener
 	httpSrv  *http.Server
 	done     chan struct{}
@@ -254,7 +257,7 @@ func NewLifecycle(addr string, handler http.Handler) *Lifecycle {
 	if handler == nil {
 		handler = HealthHandler()
 	}
-	return &Lifecycle{addr: addr, handler: handler, drain: defaultDrainTimeout}
+	return &Lifecycle{addr: addr, handler: handler, drain: defaultDrainTimeout, stateCh: make(chan struct{})}
 }
 
 // Addr returns the bound address. Before Start it returns the configured
@@ -274,6 +277,42 @@ func (l *Lifecycle) State() State {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.state
+}
+
+// stateChLocked returns the current state-change channel, creating it for a
+// zero-value Lifecycle. Callers hold l.mu.
+func (l *Lifecycle) stateChLocked() chan struct{} {
+	if l.stateCh == nil {
+		l.stateCh = make(chan struct{})
+	}
+	return l.stateCh
+}
+
+// notifyStateLocked wakes every waiter after a state change. Callers hold l.mu.
+func (l *Lifecycle) notifyStateLocked() {
+	close(l.stateChLocked())
+	l.stateCh = make(chan struct{})
+}
+
+// WaitForState blocks until the lifecycle reaches want or ctx ends. It returns
+// nil on a match and ctx.Err() when the context ends first. Waiting on a signal
+// avoids the 5 ms polling loop and its scheduling dependency.
+func (l *Lifecycle) WaitForState(ctx context.Context, want State) error {
+	for {
+		l.mu.Lock()
+		if l.state == want {
+			l.mu.Unlock()
+			return nil
+		}
+		ch := l.stateChLocked()
+		l.mu.Unlock()
+
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // Start binds the listener and begins serving. A second Start fails with
@@ -298,6 +337,7 @@ func (l *Lifecycle) Start() error {
 	l.httpSrv = srv
 	l.done = make(chan struct{})
 	l.state = StateRunning
+	l.notifyStateLocked()
 
 	go func() {
 		err := srv.Serve(listener)
@@ -331,6 +371,7 @@ func (l *Lifecycle) Stop() error {
 		srv := l.httpSrv
 		done := l.done
 		l.state = StateDraining
+		l.notifyStateLocked()
 		l.mu.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), l.drain)
@@ -348,6 +389,7 @@ func (l *Lifecycle) Stop() error {
 		l.mu.Lock()
 		defer l.mu.Unlock()
 		l.state = StateStopped
+		l.notifyStateLocked()
 		if err == nil {
 			err = l.serveErr
 		}
