@@ -15,4 +15,4 @@
 
 ## Подтверждение
 
-Выполнено в PR https://github.com/refusedguy/beacon/pull/1173 (ветка fix/ardh11-split-bridge, рефакторинг в коммите d098ea2). Bridge разделён на CIRefresh, VerdictApplier, WakeDispatcher и ReadAPI; координатор держит поля, 15 setter-ов, New, Run и Refresh. Публичные сигнатуры и тела методов не изменились, перемещены только получатели. gofmt выполнен, go test и gates оставлены CI.
+Выполнено в PR https://github.com/refusedguy/beacon/pull/1173 (ветка fix/ardh11-split-bridge, рефакторинг в коммите b289a7b). Bridge разделён на CIRefresh, VerdictApplier, WakeDispatcher и ReadAPI; координатор держит поля, 15 setter-ов, New, Run и Refresh. Публичные сигнатуры и тела методов не изменились, перемещены только получатели. gofmt выполнен, go test и gates оставлены CI.
