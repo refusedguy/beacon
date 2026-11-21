@@ -8,8 +8,8 @@
 
 - beacon_stats содержит byExecutorState с тремя состояниями
 - beacon_list_running показывает state и parentSessionID у подписчиков
-- tools/list возвращает ровно семь инструментов
+- tools/list возвращает ровно десять инструментов
 
 ## Негативный контроль
 
-Добавление восьмого инструмента ломает contract_test.
+Добавление одиннадцатого инструмента ломает contract_test.

@@ -42,7 +42,8 @@ const (
 	serverName = "beacon"
 	// contractTools задаёт список инструментов в одном месте.
 	// frozenContractToolsHash замораживает его хеш по образцу frozenScenarioHash.
-	frozenContractToolsHash = "b0a23b5455360b807e3fd34e9260d170e4e259988262f6ac5ff6fb4aaa877c67"
+	// Хеш пересчитан для десяти имён после добавления task_claim и task_close.
+	frozenContractToolsHash = "ad40be47dea5b2c76a079255bbe46096bf44c15dd2fc3ead61f4d9bd00714442"
 	// passTrials задаёт число прогонов стохастического кейса. Требуем пять из пяти.
 	passTrials = 5
 	// evalHeadSHA передаётся явно, чтобы обработчик не ходил в GitHub.
@@ -69,6 +70,8 @@ var contractTools = []string{
 	"beacon_cancel_watch",
 	"beacon_stats",
 	"beacon_defer_wiring",
+	"beacon_task_claim",
+	"beacon_task_close",
 }
 
 // evalStatus задаёт трёхзначный статус проверки (ADR 0301). WARN и FAIL не равны:

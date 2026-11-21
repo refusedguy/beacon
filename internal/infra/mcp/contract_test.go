@@ -18,27 +18,40 @@ import (
 
 // toolsListByteBudget is the ceiling for the serialized tools/list result.
 // The budget counts real bytes (method Tirith), not the presence of fields.
-// ADR 0094 set 16 KiB for eight tools. ADR 0268 raises it to 20 KiB for nine
-// tools with a derived claim schema that carries the handoff fields. The
-// ceiling still catches runaway growth in descriptions and schemas. CI logs
-// the measured size next to it so drift is visible before it becomes a failure.
+// ADR 0094 set 16 KiB for eight tools. ADR 0268 raised it to 20 KiB for nine
+// tools with a derived claim schema. ADR 0270 keeps the ceiling at 20 KiB for
+// ten tools while CI measures the tenth tool. The ceiling still catches runaway
+// growth in descriptions and schemas. CI logs the measured size next to it so
+// drift is visible before it becomes a failure. If the ten-tool response exceeds
+// 20480 bytes, a follow-up raises the budget and records the measurement.
 const toolsListByteBudget = 20 * 1024
 
 // toolsListByteCount is the exact serialized size of the tools/list response
-// for the contracted nine tools. The budget above is a ceiling; this number is
-// the current value. Pinning it makes an unannounced change to a description or
-// schema fail the contract until this constant is updated with that change.
+// for the contracted ten tools. The budget above is a ceiling. This number is
+// the last recorded measurement for nine tools and is a placeholder until the
+// tenth tool lands.
+// TODO: replace 18212 with the size CI measures for the ten-tool response.
+// Do not derive this value from an estimate.
 const toolsListByteCount = 18212
 
 // toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
 // catches any byte change, including a swap of two tools whose names have equal
 // length, which a size check alone would miss.
+// TODO: replace this hash with the one CI measures for the ten-tool response.
+// The current value is the nine-tool baseline and must not be guessed.
 const toolsListGoldenSHA256 = "ba0a9f42031cab8ff4733f89a8f6b3d1424be695367cbb6f305a3a0b60865f99"
 
 // expectedToolNames is the complete advertised tool contract. It is derived
 // from the descriptors so the witness cannot omit a tool the registry gained.
-// The byte count and SHA above stay hand-written: they are the independent
+// The byte count and SHA above stay hand-written. They are the independent
 // check that catches an unannounced change to a description or schema.
+//
+// The ten expected names in emitted order are beacon_ack, beacon_cancel_watch,
+// beacon_defer_wiring, beacon_get_result, beacon_list_running, beacon_stats,
+// beacon_task_claim, beacon_task_close, beacon_wait_result and beacon_watch_pr.
+// beacon_task_close sits between beacon_task_claim and beacon_wait_result.
+// The descriptor table owns the names. This list records the expected result
+// once the beacon_task_close descriptor is registered.
 var expectedToolNames = func() []string {
 	names := make([]string, 0, len(toolDescriptors))
 	for _, descriptor := range toolDescriptors {
@@ -69,7 +82,7 @@ var expectedToolKinds = func() map[string]toolKind {
 
 // listAllTools walks every tools/list page and returns the tools together with
 // the number of bytes produced by serializing each response. Counting every
-// page keeps the "exactly nine, no tenth" check honest if the server paginates.
+// page keeps the "exactly ten, no eleventh" check honest if the server paginates.
 func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, int) {
 	t.Helper()
 
