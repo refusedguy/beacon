@@ -541,14 +541,14 @@ func TestOutputSchemasValidateRealResponses(t *testing.T) {
 	// flaky.used maps. The derived schema widens exactly those two fields.
 	check("beacon_list_running", ListRunningOutput{
 		Counts: WatchCounts{Watches: 1, ByVerdict: map[string]int{}, Subscribers: 0},
-		Watches: []domain.Watch{{
+		Watches: []WatchOutput{watchOutput(domain.Watch{
 			ID: "w1", Status: domain.StatusWatching, Verdict: domain.VerdictWatching, Revision: 1,
-		}},
+		})},
 		Status: string(domain.StatusWatching), Cursor: "c-1", Events: []WatchEvent{},
 	})
 	check("beacon_list_running", ListRunningOutput{
 		Counts:  WatchCounts{Watches: 0, ByVerdict: map[string]int{}, Subscribers: 0},
-		Watches: []domain.Watch{}, Status: string(domain.StatusClosed),
+		Watches: []WatchOutput{}, Status: string(domain.StatusClosed),
 		Cursor: "c-2", Verdict: string(domain.VerdictReady),
 	})
 
@@ -666,6 +666,48 @@ func summaryPrecedesJSON(report string) bool {
 		return false
 	}
 	return strings.TrimSpace(report[:fence]) != ""
+}
+
+// listRunningUnexposedDomainFields records domain.Watch fields that must stay
+// out of tools/list. Add a field here when the domain gains one that clients
+// should not see. The test then passes only after someone made that decision.
+var listRunningUnexposedDomainFields = map[string]bool{}
+
+// TestListRunningWatchOutputFields pins the field set of the list_running DTO.
+// The output schema reflects WatchOutput, not domain.Watch. A new domain field
+// fails this test until it is added to the DTO or to the unexposed list above.
+// Adding it to the DTO changes tools/list and requires the golden schema in the
+// same change.
+func TestListRunningWatchOutputFields(t *testing.T) {
+	dto := jsonFieldNames[WatchOutput]()
+	domainFields := jsonFieldNames[domain.Watch]()
+	for name := range domainFields {
+		if dto[name] || listRunningUnexposedDomainFields[name] {
+			continue
+		}
+		t.Errorf("domain.Watch field %q is not covered by WatchOutput or the unexposed list; decide whether to expose it", name)
+	}
+	for name := range listRunningUnexposedDomainFields {
+		if dto[name] {
+			t.Errorf("field %q is both exposed and marked unexposed", name)
+		}
+	}
+
+	frozen := []string{
+		"baseRef", "blockerID", "blocked", "checks", "closeReason", "closedAt",
+		"configId", "createdAt", "deadlineAt", "depth", "fixBlockerID", "fixFor",
+		"flaky", "headSHA", "id", "issue", "merge", "mergePolicy",
+		"noChecksSince", "orchestratorID", "policy", "pr", "repo", "revision",
+		"status", "subscribers", "verdict",
+	}
+	got := make([]string, 0, len(dto))
+	for name := range dto {
+		got = append(got, name)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, frozen) {
+		t.Fatalf("WatchOutput fields = %v, want %v", got, frozen)
+	}
 }
 
 // TestToolOutputSummaryBeforeJSON locks the output order from ADR 0094: the
