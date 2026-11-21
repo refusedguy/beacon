@@ -28,6 +28,11 @@ const (
 	telegramMaxRespBytes   = 1 << 20
 )
 
+// ErrTelegramTransport marks a failed Telegram request. Callers use errors.Is
+// to detect transport failures. The original cause stays unwrapped because its
+// text can carry the token from the request URL.
+var ErrTelegramTransport = errors.New("wake: telegram transport failure")
+
 // TelegramConfig is the boundary between the process environment and the
 // transport. Token and ChatID are secrets and never appear in a log field;
 // APIBase exists only so a test can point the sink at an httptest server.
@@ -167,25 +172,25 @@ func (s *TelegramNotifySink) call(ctx context.Context, method string, payload an
 	endpoint := s.base + "/bot" + s.cfg.Token + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("wake: telegram %s: request: %s", method, s.sanitize(err.Error()))
+		return fmt.Errorf("wake: telegram %s: request: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.doer.Do(req)
 	if err != nil {
-		return fmt.Errorf("wake: telegram %s: transport: %s", method, s.sanitize(err.Error()))
+		return fmt.Errorf("wake: telegram %s: transport: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, telegramMaxRespBytes))
 	if err != nil {
-		return fmt.Errorf("wake: telegram %s: read: %s", method, s.sanitize(err.Error()))
+		return fmt.Errorf("wake: telegram %s: read: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("wake: telegram %s: status %d: %s", method, resp.StatusCode, s.sanitize(string(raw)))
 	}
 	if err := decodeTelegramResult(raw, out); err != nil {
-		return fmt.Errorf("wake: telegram %s: %s", method, s.sanitize(err.Error()))
+		return fmt.Errorf("wake: telegram %s: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
 	}
 	return nil
 }

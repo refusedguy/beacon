@@ -146,6 +146,16 @@ func TestWriterErrorDoesNotBlockBus(t *testing.T) {
 	}
 }
 
+func TestDeliverOnePanicKeepsErrorCause(t *testing.T) {
+	wantErr := errors.New("subscriber crashed")
+	sub := func(context.Context, Envelope) error { panic(wantErr) }
+
+	err := deliverOne(context.Background(), sub, Envelope{Type: "one"})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("panic error = %v, want the panic cause in the chain", err)
+	}
+}
+
 func TestPoisonMovesWatermark(t *testing.T) {
 	b := NewBus(nil)
 	poisonPayload := []byte("undecodable")

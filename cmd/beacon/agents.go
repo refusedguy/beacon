@@ -73,11 +73,11 @@ var readStaleTasks = func(now time.Time) ([]staleTask, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: не удалось прочитать снимок мёртвых аренд: %v", path, err)
+		return nil, fmt.Errorf("%s: не удалось прочитать снимок мёртвых аренд: %w", path, err)
 	}
 	var st staleTasksState
 	if err := json.Unmarshal(data, &st); err != nil {
-		return nil, fmt.Errorf("%s: неверный снимок мёртвых аренд: %v", path, err)
+		return nil, fmt.Errorf("%s: неверный снимок мёртвых аренд: %w", path, err)
 	}
 	return st.Tasks, nil
 }
@@ -150,7 +150,7 @@ func readServiceRegistration() error {
 	}
 	data, err := readServiceFile(path)
 	if err != nil {
-		return fmt.Errorf("%s: %v", path, err)
+		return fmt.Errorf("%s: %w", path, err)
 	}
 	var reg struct {
 		URL     string `json:"url"`
@@ -158,7 +158,7 @@ func readServiceRegistration() error {
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(data, &reg); err != nil {
-		return fmt.Errorf("%s: неверный registration-файл: %v", path, err)
+		return fmt.Errorf("%s: неверный registration-файл: %w", path, err)
 	}
 	return nil
 }
@@ -453,11 +453,11 @@ func loadPortRegistry() (*portRegistry, error) {
 		return newPortRegistry(), nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: не удалось прочитать реестр портов: %v", path, err)
+		return nil, fmt.Errorf("%s: не удалось прочитать реестр портов: %w", path, err)
 	}
 	var reg portRegistry
 	if err := json.Unmarshal(data, &reg); err != nil {
-		return nil, fmt.Errorf("%s: неверный реестр портов: %v", path, err)
+		return nil, fmt.Errorf("%s: неверный реестр портов: %w", path, err)
 	}
 	if reg.Base <= 0 || reg.Count <= 0 {
 		return nil, fmt.Errorf("%s: неверный диапазон портов %d-%d", path, reg.Base, reg.Count)
@@ -487,14 +487,14 @@ func savePortRegistry(reg *portRegistry) error {
 		return err
 	}
 	if err := portStateMkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("%s: не удалось создать каталог состояния: %v", path, err)
+		return fmt.Errorf("%s: не удалось создать каталог состояния: %w", path, err)
 	}
 	data, err := json.MarshalIndent(reg, "", "  ")
 	if err != nil {
 		return err
 	}
 	if err := portStateWriteFile(path, append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("%s: не удалось записать реестр портов: %v", path, err)
+		return fmt.Errorf("%s: не удалось записать реестр портов: %w", path, err)
 	}
 	return nil
 }
@@ -629,11 +629,11 @@ func readAttentionRequests() ([]attentionRequest, error) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: не удалось прочитать запросы внимания: %v", path, err)
+		return nil, fmt.Errorf("%s: не удалось прочитать запросы внимания: %w", path, err)
 	}
 	var st attentionState
 	if err := json.Unmarshal(data, &st); err != nil {
-		return nil, fmt.Errorf("%s: неверный список запросов внимания: %v", path, err)
+		return nil, fmt.Errorf("%s: неверный список запросов внимания: %w", path, err)
 	}
 	return st.Requests, nil
 }
@@ -755,11 +755,11 @@ func loadHandoffs() (handoffState, error) {
 		return handoffState{}, nil
 	}
 	if err != nil {
-		return handoffState{}, fmt.Errorf("%s: не удалось прочитать журнал передач: %v", path, err)
+		return handoffState{}, fmt.Errorf("%s: не удалось прочитать журнал передач: %w", path, err)
 	}
 	var st handoffState
 	if err := json.Unmarshal(data, &st); err != nil {
-		return handoffState{}, fmt.Errorf("%s: неверный журнал передач: %v", path, err)
+		return handoffState{}, fmt.Errorf("%s: неверный журнал передач: %w", path, err)
 	}
 	return st, nil
 }
@@ -770,7 +770,7 @@ func saveHandoffs(st handoffState) error {
 		return err
 	}
 	if err := handoffMkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("%s: не создан каталог состояния: %v", path, err)
+		return fmt.Errorf("%s: не создан каталог состояния: %w", path, err)
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -937,11 +937,11 @@ func loadRepoWorktrees() (repoWorktreeState, error) {
 		return repoWorktreeState{}, nil
 	}
 	if err != nil {
-		return repoWorktreeState{}, fmt.Errorf("%s: не удалось прочитать реестр worktree: %v", path, err)
+		return repoWorktreeState{}, fmt.Errorf("%s: не удалось прочитать реестр worktree: %w", path, err)
 	}
 	var st repoWorktreeState
 	if err := json.Unmarshal(data, &st); err != nil {
-		return repoWorktreeState{}, fmt.Errorf("%s: неверный реестр worktree: %v", path, err)
+		return repoWorktreeState{}, fmt.Errorf("%s: неверный реестр worktree: %w", path, err)
 	}
 	seenPair := map[string]bool{}
 	seenPath := map[string]string{}
@@ -967,7 +967,7 @@ func saveRepoWorktrees(st repoWorktreeState) error {
 		return err
 	}
 	if err := repoWorktreeMkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("%s: не создан каталог состояния: %v", path, err)
+		return fmt.Errorf("%s: не создан каталог состояния: %w", path, err)
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {

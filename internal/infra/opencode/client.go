@@ -67,11 +67,11 @@ func ReadConfig() (Config, error) {
 
 	data, err := readFile(path)
 	if err != nil {
-		return Config{}, fmt.Errorf("%s: %v", path, err)
+		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("%s: неверный registration-файл: %v", path, err)
+		return Config{}, fmt.Errorf("%s: неверный registration-файл: %w", path, err)
 	}
 	cfg.URL = strings.TrimSpace(cfg.URL)
 	if cfg.URL == "" {
@@ -111,7 +111,7 @@ func New(cfg Config, doer Doer) (*Client, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, fmt.Errorf("неверный url сервиса opencode %q: %v", raw, err)
+		return nil, fmt.Errorf("неверный url сервиса opencode %q: %w", raw, err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("неверная схема url сервиса opencode %q", raw)
@@ -232,7 +232,7 @@ func (c *Client) get(ctx context.Context, path string) (*http.Response, error) {
 func (c *Client) post(ctx context.Context, path string, payload any) (*http.Response, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("opencode POST %s: %v", path, err)
+		return nil, fmt.Errorf("opencode POST %s: %w", path, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
 	if err != nil {
@@ -305,7 +305,7 @@ func (c *Client) ListAgents(ctx context.Context) ([]Agent, error) {
 	}
 	decoded, err := decodeList[[]Agent](resp)
 	if err != nil {
-		return nil, fmt.Errorf("opencode /api/agent: %v", err)
+		return nil, fmt.Errorf("opencode /api/agent: %w", err)
 	}
 	return decoded.Data, nil
 }
@@ -327,7 +327,7 @@ func (c *Client) Sessions(ctx context.Context) ([]Session, error) {
 	}
 	decoded, err := decodeList[[]Session](resp)
 	if err != nil {
-		return nil, fmt.Errorf("opencode /api/session: %v", err)
+		return nil, fmt.Errorf("opencode /api/session: %w", err)
 	}
 
 	if c.sessionTTL > 0 {
@@ -362,7 +362,7 @@ func (c *Client) CreateSession(ctx context.Context, parentID, agent, title strin
 	// also accepts a bare object for handlers that omit the envelope.
 	session, err := decodeSingle[Session](resp)
 	if err != nil {
-		return Session{}, fmt.Errorf("opencode POST /api/session: %v", err)
+		return Session{}, fmt.Errorf("opencode POST /api/session: %w", err)
 	}
 	return session, nil
 }
@@ -393,7 +393,7 @@ func (c *Client) Config(ctx context.Context) (json.RawMessage, error) {
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("opencode /api/config: %v", err)
+		return nil, fmt.Errorf("opencode /api/config: %w", err)
 	}
 	return json.RawMessage(data), nil
 }
@@ -503,7 +503,7 @@ func (c *Client) consumeEvent(ctx context.Context, body io.ReadCloser, out chan<
 		var ev Event
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 			select {
-			case out <- EventResult{Err: fmt.Errorf("opencode event: %v", err)}:
+			case out <- EventResult{Err: fmt.Errorf("opencode event: %w", err)}:
 			case <-ctx.Done():
 				return false
 			}
@@ -539,7 +539,7 @@ func (c *Client) consumeEvent(ctx context.Context, body io.ReadCloser, out chan<
 	}
 	if err := scanner.Err(); err != nil && ctx.Err() == nil {
 		select {
-		case out <- EventResult{Err: fmt.Errorf("opencode event stream: %v", err)}:
+		case out <- EventResult{Err: fmt.Errorf("opencode event stream: %w", err)}:
 		case <-ctx.Done():
 		}
 	}

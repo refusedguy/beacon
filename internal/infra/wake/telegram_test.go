@@ -23,6 +23,14 @@ func (d *countingDoer) Do(*http.Request) (*http.Response, error) {
 	return nil, errors.New("transport must not be called")
 }
 
+type failingDoer struct {
+	err error
+}
+
+func (d *failingDoer) Do(*http.Request) (*http.Response, error) {
+	return nil, d.err
+}
+
 func TestTelegramConfigFromEnv(t *testing.T) {
 	cfg := TelegramConfigFromEnv(func(key string) string {
 		switch key {
@@ -197,6 +205,30 @@ func TestTelegramNotifySinkReportsRefusalWithoutLeakingToken(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "test-token") {
 		t.Fatalf("err leaked the token: %v", err)
+	}
+}
+
+func TestTelegramTransportErrorKeepsSentinelAndRedactsToken(t *testing.T) {
+	doer := &failingDoer{err: errors.New(`Post "http://example.test/botsecret-token/sendMessage": secret-token refused`)}
+	sink := NewTelegramNotifySink(TelegramConfig{
+		Token:   "secret-token",
+		ChatID:  "42",
+		APIBase: "http://example.test",
+		Doer:    doer,
+	})
+
+	err := sink.SendText(context.Background(), "42", "hello")
+	if err == nil {
+		t.Fatal("transport failure must return an error")
+	}
+	if !errors.Is(err, ErrTelegramTransport) {
+		t.Fatalf("err = %v, want ErrTelegramTransport in the chain", err)
+	}
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Fatalf("err leaked the token: %v", err)
+	}
+	if !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("err = %v, want the redaction marker", err)
 	}
 }
 
