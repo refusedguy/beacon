@@ -37,6 +37,10 @@ const (
 	// need outside action. The CI-cycle engine produces it when a failure is
 	// already present on the base branch; a block event can also set it.
 	VerdictBlocked Verdict = "blocked"
+	// VerdictRecheck asks the subscriber to repeat CI evaluation against the
+	// current base branch. The merge path produces it when main moved after
+	// the batch snapshot, before any write reaches GitHub (ADR 0266).
+	VerdictRecheck Verdict = "recheck"
 )
 
 // Role is the subscriber role on a Watch.
@@ -387,6 +391,11 @@ type PRState struct {
 	MergeStateStatus string           `json:"mergeStateStatus"`
 	ReviewDecision   string           `json:"reviewDecision"`
 	Checks           map[string]Check `json:"checks"`
+	// BaseHeadSHA is the base branch head seen in the same batch as this PR.
+	// cibridge copies it from BaseBranchState.HeadSHA before calling
+	// MergePRWithState, so the merge path can detect a base that moved after
+	// the snapshot without a signature change on the provider port.
+	BaseHeadSHA string `json:"baseHeadSHA,omitempty"`
 }
 
 // WakePayload is the minimal pointer payload a verdict source hands to a wake
