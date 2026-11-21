@@ -147,3 +147,180 @@ func TestRecorderRoutesToLoggerAndMetrics(t *testing.T) {
 		t.Errorf("событие = %v", got)
 	}
 }
+
+// withContentCapture restores the previous mode when the test ends so global
+// state does not leak into other tests in the package.
+func withContentCapture(t *testing.T, mode ContentCaptureMode) {
+	t.Helper()
+	prev := ContentCapture()
+	SetContentCapture(mode)
+	t.Cleanup(func() { SetContentCapture(prev) })
+}
+
+func TestContentCaptureDefaultsToNoContent(t *testing.T) {
+	SetContentCapture("")
+	if got := ContentCapture(); got != ContentCaptureNoContent {
+		t.Fatalf("режим после сброса = %q, ожидалось %q", got, ContentCaptureNoContent)
+	}
+}
+
+func TestParseContentCaptureMode(t *testing.T) {
+	for raw, want := range map[string]ContentCaptureMode{
+		"":           ContentCaptureNoContent,
+		"  ":         ContentCaptureNoContent,
+		"no_content": ContentCaptureNoContent,
+		"NONE":       ContentCaptureNoContent,
+		"disabled":   ContentCaptureNoContent,
+		"misspelled": ContentCaptureNoContent,
+		"enabled":    ContentCaptureEnabled,
+		" ALL ":      ContentCaptureEnabled,
+		"content":    ContentCaptureEnabled,
+	} {
+		if got := ParseContentCaptureMode(raw); got != want {
+			t.Errorf("ParseContentCaptureMode(%q) = %q, ожидалось %q", raw, got, want)
+		}
+	}
+}
+
+func TestSanitizeContentNoContentKeepsOnlyRef(t *testing.T) {
+	withContentCapture(t, ContentCaptureNoContent)
+	ref := "s3://beacon-content/watch-1"
+	in := Fields{
+		FieldWatchID:            "watch:1",
+		FieldWakeText:           "WAKE-SECRET",
+		FieldToolArguments:      "ARG-SECRET",
+		FieldSystemInstructions: "SYSTEM-SECRET",
+		FieldPRDiff:             "DIFF-SECRET",
+		FieldContentRef:         ref,
+	}
+
+	out := SanitizeContent(in)
+
+	for _, key := range []string{
+		FieldWakeText, FieldToolArguments, FieldSystemInstructions, FieldPRDiff,
+	} {
+		if _, ok := out[key]; ok {
+			t.Errorf("поле %s попало в телеметрию: %v", key, out)
+		}
+		if _, ok := in[key]; !ok {
+			t.Errorf("SanitizeContent изменил входную карту: нет ключа %s", key)
+		}
+	}
+	if out[FieldContentRef] != ref {
+		t.Errorf("ссылка = %v, ожидалось %q", out[FieldContentRef], ref)
+	}
+	if out[FieldWatchID] != "watch:1" {
+		t.Errorf("обычное поле потеряно: %v", out)
+	}
+}
+
+func TestSanitizeContentNoContentWithoutRefMarksWithheld(t *testing.T) {
+	withContentCapture(t, ContentCaptureNoContent)
+	out := SanitizeContent(Fields{FieldWakeText: "WAKE-SECRET"})
+	if out[FieldContentRef] != "withheld" {
+		t.Errorf("ссылка = %v, ожидалось %q", out[FieldContentRef], "withheld")
+	}
+	if _, ok := out[FieldWakeText]; ok {
+		t.Errorf("текст wake попал в телеметрию: %v", out)
+	}
+}
+
+func TestSanitizeContentEnabledKeepsContent(t *testing.T) {
+	withContentCapture(t, ContentCaptureEnabled)
+	in := Fields{
+		FieldWakeText:   "WAKE-SECRET",
+		FieldPRDiff:     "DIFF-SECRET",
+		FieldContentRef: "s3://beacon-content/watch-1",
+	}
+	out := SanitizeContent(in)
+	if len(out) != len(in) {
+		t.Fatalf("полей %d, ожидалось %d: %v", len(out), len(in), out)
+	}
+	for k, v := range in {
+		if out[k] != v {
+			t.Errorf("поле %s изменено при opt-in: %v", k, out[k])
+		}
+	}
+}
+
+func TestRecorderLogDropsContentWithoutOptIn(t *testing.T) {
+	withContentCapture(t, ContentCaptureNoContent)
+	buf := &strings.Builder{}
+	rec := NewRecorder(NewLogger("json", LevelDebug, buf), NewMetrics())
+
+	rec.Log(LevelInfo, "content_probe", Fields{
+		FieldWatchID:            "watch:1",
+		FieldWakeText:           "WAKE-SECRET",
+		FieldToolArguments:      "ARG-SECRET",
+		FieldSystemInstructions: "SYSTEM-SECRET",
+		FieldPRDiff:             "DIFF-SECRET",
+		FieldContentRef:         "s3://beacon-content/watch-1",
+	})
+
+	raw := buf.String()
+	for _, secret := range []string{"WAKE-SECRET", "ARG-SECRET", "SYSTEM-SECRET", "DIFF-SECRET"} {
+		if strings.Contains(raw, secret) {
+			t.Errorf("секрет %q попал в лог: %q", secret, raw)
+		}
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("невалидный JSON: %q", raw)
+	}
+	if got[FieldContentRef] != "s3://beacon-content/watch-1" {
+		t.Errorf("ссылка = %v", got[FieldContentRef])
+	}
+	if got[FieldWatchID] != "watch:1" {
+		t.Errorf("обычное поле = %v", got[FieldWatchID])
+	}
+}
+
+func TestRecorderLogKeepsContentWithOptIn(t *testing.T) {
+	withContentCapture(t, ContentCaptureEnabled)
+	buf := &strings.Builder{}
+	rec := NewRecorder(NewLogger("json", LevelDebug, buf), NewMetrics())
+
+	rec.Log(LevelInfo, "content_probe", Fields{FieldWakeText: "WAKE-SECRET"})
+
+	if !strings.Contains(buf.String(), "WAKE-SECRET") {
+		t.Errorf("текст не попал в лог при opt-in: %q", buf.String())
+	}
+}
+
+func TestAttemptToWriteContentWithoutOptInKeepsOnlyRef(t *testing.T) {
+	withContentCapture(t, ContentCaptureNoContent)
+	buf := &strings.Builder{}
+	rec := NewRecorder(NewLogger("json", LevelDebug, buf), NewMetrics())
+	SetDefault(rec)
+	defer SetDefault(nil)
+
+	// This is the boundary an unwitting caller hits: it passes all four
+	// content categories with no reference. The write must keep only the
+	// "withheld" marker, never the text.
+	Event(LevelInfo, "content_probe", Fields{
+		FieldWakeText:           "WAKE-SECRET",
+		FieldToolArguments:      "ARG-SECRET",
+		FieldSystemInstructions: "SYSTEM-SECRET",
+		FieldPRDiff:             "DIFF-SECRET",
+	})
+
+	raw := buf.String()
+	for _, secret := range []string{"WAKE-SECRET", "ARG-SECRET", "SYSTEM-SECRET", "DIFF-SECRET"} {
+		if strings.Contains(raw, secret) {
+			t.Errorf("секрет %q попал в лог: %q", secret, raw)
+		}
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("невалидный JSON: %q", raw)
+	}
+	if got[FieldContentRef] != "withheld" {
+		t.Errorf("ссылка = %v, ожидалось %q", got[FieldContentRef], "withheld")
+	}
+	if got[FieldEvent] != "content_probe" {
+		t.Errorf("событие = %v", got[FieldEvent])
+	}
+	if got := ContentCapture(); got != ContentCaptureNoContent {
+		t.Fatalf("режим изменился при попытке записи: %q", got)
+	}
+}

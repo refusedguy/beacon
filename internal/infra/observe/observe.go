@@ -72,6 +72,16 @@ const (
 	FieldRole         = "role"
 	FieldFailedChecks = "failedChecks"
 	FieldSource       = "source"
+
+	// Content fields. Under the default NO_CONTENT policy the write boundary
+	// removes these and keeps only FieldContentRef, a link to the store that
+	// holds the text. They are names in ADR 0267: wake text, tool arguments,
+	// system instructions and PR diffs.
+	FieldWakeText           = "wakeText"
+	FieldToolArguments      = "toolArguments"
+	FieldSystemInstructions = "systemInstructions"
+	FieldPRDiff             = "prDiff"
+	FieldContentRef         = "contentRef"
 )
 
 // Event names of the blocker and auto-merge transitions reported by the
@@ -86,6 +96,95 @@ const (
 
 // Fields are the structured values of one event.
 type Fields map[string]any
+
+// ContentCaptureMode controls whether message text reaches telemetry. The
+// default, ContentCaptureNoContent, keeps identifiers and an external-store
+// reference only. ContentCaptureEnabled is an explicit opt-in for the four
+// content categories named in ADR 0267: wake text, tool arguments, system
+// instructions and PR diffs.
+type ContentCaptureMode string
+
+const (
+	ContentCaptureNoContent ContentCaptureMode = "no_content"
+	ContentCaptureEnabled   ContentCaptureMode = "enabled"
+)
+
+// ContentCaptureEnv is the configuration key whose value is parsed by
+// ParseContentCaptureMode. The composition root reads it once and installs the
+// result with SetContentCapture.
+const ContentCaptureEnv = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT"
+
+// ParseContentCaptureMode maps a configuration value onto a capture mode.
+// Empty, unknown and misspelled values fail closed to ContentCaptureNoContent,
+// so a bad value never exposes message text.
+func ParseContentCaptureMode(raw string) ContentCaptureMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "enabled", "all", "content":
+		return ContentCaptureEnabled
+	default:
+		return ContentCaptureNoContent
+	}
+}
+
+var (
+	contentModeMu sync.RWMutex
+	contentMode   = ContentCaptureNoContent
+)
+
+// ContentCapture returns the active capture mode. A process starts in
+// ContentCaptureNoContent and stays there until the composition root opts in.
+func ContentCapture() ContentCaptureMode {
+	contentModeMu.RLock()
+	defer contentModeMu.RUnlock()
+	return contentMode
+}
+
+// SetContentCapture installs the process-wide capture mode. An empty value
+// restores ContentCaptureNoContent.
+func SetContentCapture(mode ContentCaptureMode) {
+	contentModeMu.Lock()
+	defer contentModeMu.Unlock()
+	if mode == "" {
+		mode = ContentCaptureNoContent
+	}
+	contentMode = mode
+}
+
+// contentFields are the keys removed at the write boundary when capture is
+// off. No other field is inspected, so ordinary identifiers pass unchanged.
+var contentFields = map[string]struct{}{
+	FieldWakeText:           {},
+	FieldToolArguments:      {},
+	FieldSystemInstructions: {},
+	FieldPRDiff:             {},
+}
+
+// SanitizeContent applies the active capture mode to a field set before a sink
+// sees it. Under ContentCaptureNoContent each content field is dropped and
+// FieldContentRef, the link to the external store, is kept. When the caller
+// provided no reference, the value "withheld" records that text was suppressed.
+// Under ContentCaptureEnabled the fields pass through unchanged. The caller's
+// map is never mutated.
+func SanitizeContent(fields Fields) Fields {
+	if ContentCapture() == ContentCaptureEnabled {
+		return fields
+	}
+	out := make(Fields, len(fields)+1)
+	withheld := false
+	for k, v := range fields {
+		if _, content := contentFields[k]; content {
+			withheld = true
+			continue
+		}
+		out[k] = v
+	}
+	if withheld {
+		if ref, ok := out[FieldContentRef]; !ok || ref == nil || ref == "" {
+			out[FieldContentRef] = "withheld"
+		}
+	}
+	return out
+}
 
 // Counter names exported by Metrics. The _total suffix is the Prometheus
 // convention for counters and is part of the exported name.
@@ -215,7 +314,7 @@ func (r *Recorder) Log(level Level, event string, fields Fields) {
 	if r == nil || r.log == nil {
 		return
 	}
-	r.log.Log(context.Background(), level, "", eventAttrs(event, fields)...)
+	r.log.Log(context.Background(), level, "", eventAttrs(event, SanitizeContent(fields))...)
 }
 
 // Inc adds one to a counter through the recorder's metric set.
@@ -261,7 +360,7 @@ func MetricsOf(s Sink) *Metrics {
 // Event writes one structured record through the installed sink. Call sites
 // use it for transitions that have no dedicated helper.
 func Event(level Level, event string, fields Fields) {
-	Default().Log(level, event, fields)
+	Default().Log(level, event, SanitizeContent(fields))
 }
 
 // LogEvent is the older spelling of Event, kept for existing call sites.
