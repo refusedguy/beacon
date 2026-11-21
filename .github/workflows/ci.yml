@@ -37,17 +37,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
-
-      - name: Cache Go
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.mod') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
 
       - name: Build beacon
         shell: bash
@@ -72,17 +61,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
-
-      - name: Cache Go
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.mod') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
 
       - name: Download modules
         shell: bash
@@ -122,7 +100,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
 
       - name: Seed spec has required seeds and run order
         shell: bash
@@ -193,17 +170,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
-
-      - name: Cache Go
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum', 'tools/beacon-gates/go.mod') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
 
       - name: Check committed gates binary
         shell: bash
@@ -267,7 +233,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
 
       - name: Self-test on planted divergence
         working-directory: tools/beacon-gates
@@ -298,7 +263,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
 
       - name: Build beacon
         shell: bash
@@ -346,7 +310,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: false
 
       - name: Set up Node
         uses: actions/setup-node@v4
