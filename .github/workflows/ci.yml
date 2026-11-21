@@ -103,6 +103,48 @@ jobs:
           set -euo pipefail
           go test ./...
 
+  # T3.342. Две проверки seed-artery. Первая следит за составом
+  # tests/scenarios/seeded.yaml: четыре отказа из S7.011 и прогон
+  # healthy -> seeded -> healthy из w25. Вторая гоняет реальный
+  # детерминированный seed-регресс в internal/testsystem: при смене seed
+  # отпечаток трассы обязан измениться, а запись с зафиксированным seed
+  # обязана воспроизводиться. Живой прогон с daemon, tmux и stub-агентами
+  # сюда не входит: раннера, который читает seeded.yaml, в main нет.
+  seed-spec:
+    name: seed-spec
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Seed spec has required seeds and run order
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=tests/scenarios/seeded.yaml
+          test -f "$file" || { printf 'missing %s\n' "$file" >&2; exit 1; }
+          for seed in lost_baton late_event pruned_cursor duplicate_client_request_id; do
+            grep -q "id: $seed" "$file" || { printf 'missing seed: %s\n' "$seed" >&2; exit 1; }
+          done
+          for run in healthy seeded healthy_again; do
+            grep -q "name: $run" "$file" || { printf 'missing run: %s\n' "$run" >&2; exit 1; }
+          done
+          printf 'seed spec ok: 4 seeds, 3 runs\n'
+
+      - name: Stub harness seed regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/testsystem/... \
+            -run 'TestGoldenFingerprint|TestSeedRoundTrip|TestSeedDrivesTrace' -count=1
+
   # Node предустановлен на ubuntu-latest, отдельный setup-node не нужен.
   js-test:
     name: js-test

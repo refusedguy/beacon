@@ -1,0 +1,49 @@
+# T3.342 / S7.011. Seed-спецификация artery "seeded regression".
+#
+# Источники данных, все из репозитория:
+#   docs/tasks/S7.011.md                        четыре именованных seed-отказа
+#   docs/evals/w25-seed-regression-artery.md    порядок прогонов и негативный контроль
+#   docs/adrs/0214-seeded-regression.md         требование пары healthy + seeded
+#
+# Числовых seed-значений и fault-кодов здесь нет: в main нет раннера, который
+# читает этот файл и внедряет отказы. T3.341 (todo) и S7.009 (dropped после
+# PR #394) оставляют живой зонд с daemon, tmux и stub-агентами недоступным.
+# Файл фиксирует состав seed-данных; CI проверяет его состав и прогоняет
+# детерминированный seed-регресс в internal/testsystem.
+schema: beacon.seeded-regression/v1
+
+sources:
+  card: docs/tasks/T3.342.md
+  seeds: docs/tasks/S7.011.md
+  runs: docs/evals/w25-seed-regression-artery.md
+  adr: docs/adrs/0214-seeded-regression.md
+
+seeds:
+  - id: lost_baton
+    fault: lost baton
+    source: docs/tasks/S7.011.md
+  - id: late_event
+    fault: late event
+    source: docs/tasks/S7.011.md
+  - id: pruned_cursor
+    fault: pruned cursor
+    source: docs/tasks/S7.011.md
+  - id: duplicate_client_request_id
+    fault: duplicate clientRequestId
+    source: docs/tasks/S7.011.md
+
+runs:
+  - name: healthy
+    seed: none
+    expect: pass
+  - name: seeded
+    seed: [lost_baton, late_event, pruned_cursor, duplicate_client_request_id]
+    expect: fail_at_expect
+  - name: healthy_again
+    seed: none
+    expect: pass
+
+negative_control:
+  seed: none
+  expect: no_diagnostic_value
+  description: Убрать seed и показать, что тест ничего не доказывает.
