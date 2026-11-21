@@ -100,6 +100,7 @@ function createS2Channel({
   let watcher = null
   let ticking = false
   let started = false
+  let tickCount = 0
   const seen = new Set()
 
   // Отпечаток уже прочитанных байт. Append его не меняет, а пересоздание
@@ -165,6 +166,7 @@ function createS2Channel({
       await storage.set(CURSOR_KEY, cursor)
     } finally {
       ticking = false
+      tickCount += 1
     }
   }
 
@@ -195,6 +197,11 @@ function createS2Channel({
     tick,
     cursor() {
       return { ...cursor }
+    },
+    // Барьер завершения тика: каждый тик увеличивает счётчик в finally,
+    // после всех await onEvent и записи курсора.
+    tickCount() {
+      return tickCount
     },
   }
 }
@@ -326,7 +333,13 @@ test("неполная строка не разбирается, битая ст
   try {
     await channel.start()
     appendFileSync(path, '{"id":"partial","watchID":"w","obligationID"')
-    await new Promise((resolve) => setTimeout(resolve, 3 * TEST_POLL_MS))
+    // Ждём завершения тика, который прочитал неполную строку. Счётчик
+    // увеличивается в finally, когда вся обработка уже закончена.
+    const ticksAfterAppend = channel.tickCount()
+    await waitFor(
+      () => channel.tickCount() > ticksAfterAppend,
+      "тик обработал неполную строку",
+    )
     assert.deepEqual(delivered, [])
 
     appendFileSync(path, ':"o","revision":1,"kind":"beacon.pointer"}\n')
