@@ -342,6 +342,19 @@ func collectFacts(entries []artifactEntry, declared []fact) []factEntry {
 	return facts
 }
 
+// factsLink maps an owner path to a link target as seen from docs/FACTS.md.
+// Owners under docs/ are relative to that directory already, external URLs
+// stay untouched, and owners elsewhere in the repo need one level up.
+func factsLink(owner string) string {
+	if strings.HasPrefix(owner, "http://") || strings.HasPrefix(owner, "https://") {
+		return owner
+	}
+	if strings.HasPrefix(owner, "docs/") {
+		return strings.TrimPrefix(owner, "docs/")
+	}
+	return "../" + owner
+}
+
 // renderFacts builds docs/FACTS.md. Each row links a number to the file that
 // owns it, so a copy in another document can name its source. Artifacts and
 // prose stay in Russian; paths and numbers are technical tokens.
@@ -351,7 +364,7 @@ func renderFacts(facts []factEntry) string {
 	b.WriteString("Владелец числа - файл, где оно напечатано. Копия числа ссылается на этого владельца.\n\n")
 	b.WriteString("| Число | Владелец |\n| --- | --- |\n")
 	for _, f := range facts {
-		link := strings.TrimPrefix(f.owner, "docs/")
+		link := factsLink(f.owner)
 		b.WriteString("| " + f.value + " | [" + f.owner + "](" + link + ") |\n")
 	}
 	return b.String()
