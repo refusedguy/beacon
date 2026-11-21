@@ -34,7 +34,9 @@ fi
 # Ошибка или отсутствие инструмента блокирует коммит. Это отдельная проверка:
 # fail-open аренда ниже остаётся без изменений и коммит не блокирует.
 if command -v go >/dev/null 2>&1; then
-  if index_out=$(go run ./tools/beacon-gates/cardindex -root . 2>&1); then
+  # cardindex живёт во вложенном модуле tools/beacon-gates. Запускаем его оттуда,
+  # а -root ../.. по-прежнему указывает на корень репозитория.
+  if index_out=$(cd tools/beacon-gates && go run ./cardindex -root ../.. 2>&1); then
     :
   else
     echo "FORBIDDEN: $index_out" >&2
