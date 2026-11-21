@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 func (c *CLI) runBuild(args []string) int {
@@ -58,29 +57,31 @@ func (c *CLI) runRules(args []string) int {
 	key := c.run(*root, "grep", []string{"-q", "beacon/survival-rules", "AGENTS.md"}, nil)
 	contract := c.run(*root, "grep", []string{"-q", ".", "docs/RULES-CHECK-CONTRACT.md"}, nil)
 
-	status := "pass"
+	// Machine and human parts of the report share one uppercase register:
+	// PASS, WARN, FAIL, BROKEN (RULES-CHECK-CONTRACT.md).
+	status := "PASS"
 	blocking := false
 	exit := 0
 	blockers := "[]"
 	switch {
 	case key.code == 2 || contract.code == 2:
 		// Код 2 означает, что инструмент не смог выполнить проверку.
-		// Передаём его наружу без преобразования в warn и ставим блокирующий
+		// Передаём его наружу без преобразования в WARN и ставим блокирующий
 		// вердикт BROKEN по контракту RULES-CHECK-CONTRACT.md.
-		status = "broken"
+		status = "BROKEN"
 		blocking = true
 		exit = 2
 		blockers = `[{"id":"R-TOOL-BROKEN","severity":"error","file":".","summary":"rules gate завершился кодом 2: не удалось выполнить проверку правил"}]`
 	case key.code == 1:
-		status = "fail"
+		status = "FAIL"
 		blocking = true
 		exit = 1
 		blockers = `[{"id":"R-SURVIVAL-KEY","severity":"error","file":"AGENTS.md","summary":"AGENTS.md не задаёт стабильный ключ beacon/survival-rules"}]`
 	case contract.code != 0:
-		status = "warn"
+		status = "WARN"
 	}
 
-	fmt.Fprintf(c.out, "verdict: %s\n", strings.ToUpper(status))
+	fmt.Fprintf(c.out, "verdict: %s\n", status)
 	fmt.Fprint(c.out, "affected files: 2\n")
 	fmt.Fprintf(c.out, "blocking: %t\n", blocking)
 	fmt.Fprintf(c.out,
