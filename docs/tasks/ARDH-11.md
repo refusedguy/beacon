@@ -1,5 +1,5 @@
 # ARDH-11. Разделить cibridge.Bridge по ответственностям
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/cibridge/bridge.go, internal/infra/cibridge/bridge_test.go
@@ -12,3 +12,7 @@
 Шаги: Выделить первый порт, например ReadAPI, с тестами на границе. Проверить CI. Повторить для остальных портов отдельными PR, не меняя за раз весь файл.
 Проверка: Каждый шаг проходит CI. Поведение опроса CI, мержа и доставки wake не изменилось.
 Приёмка: Координатор держит только маршрутизацию, ответственности вынесены в отдельные типы.
+
+## Подтверждение
+
+Выполнено в PR https://github.com/refusedguy/beacon/pull/1175 (ветка fix/ardh11-bridge). Bridge разделён на CIRefresh, VerdictApplier, WakeDispatcher и ReadAPI. Координатор держит поля, 15 setter-ов, New, Run и Refresh. Тела функций не изменились, только получатели и четыре строки в New. bridge.go сократился с 2461 до 635 строк. gofmt выполнен, go test и gates оставлены CI.
