@@ -7,12 +7,14 @@
     {"name": "tools/roadmap-sync", "rank": 1},
     {"name": "internal/app", "rank": 2},
     {"name": "internal/tui", "rank": 2},
+    {"name": "internal/beacon", "rank": 2},
     {"name": "cmd", "rank": 3},
     {"name": "tests", "rank": 0},
     {"name": "internal/testsystem", "rank": 0}
   ],
   "allowed": [
     {"from": "internal/infra", "to": "internal/domain"},
+    {"from": "internal/beacon", "to": "internal/infra", "shared": true},
     {"from": "internal/app", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/app"},
