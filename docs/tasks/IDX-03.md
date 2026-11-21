@@ -1,5 +1,5 @@
 # IDX-03. Команда сборки индекса и pre-commit
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: cmd/beacon/index.go, .githooks/pre-commit
@@ -22,3 +22,7 @@
 Проверку аренды оставляем fail-open и не смешиваем режимы. Код в OwnerFiles IDX-03 не меняется, чтобы не добавлять команду без индекса и генератора. Go файлы не менялись, gofmt не требуется, go test и go build локально не запускались.
 
 Точный блокер: internal/infra/taskstore/index.go, владелец IDX-01, статус todo. Второй блокер: tools/beacon-gates/cardindex/check.go, владелец IDX-04, статус todo.
+
+## Подтверждение
+
+Проверено 2026-11-21 по `git log` и `gh pr view`. Реализация влита в origin/main через PR #931, https://github.com/refusedguy/beacon/pull/931. Merge commit 42af2b209b58b0f1c991fc8a2ba022ae400c3e74 добавил cmd/beacon/index.go и .githooks/pre-commit. Оба блокера сняты: internal/infra/taskstore/index.go и tools/beacon-gates/cardindex/check.go есть на main. Статус переведён в done.
