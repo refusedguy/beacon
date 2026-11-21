@@ -1,0 +1,14 @@
+# Q-D3. OpenAPI 3.1 и канон ACP и Telegram
+Статус: todo
+Фаза: P3
+Тип: task
+Владелец файлов: docs/api/openapi.yaml, internal/infra/acp/client.go, internal/infra/wake/telegram.go, cmd/beacon/up.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: Контракт API зафиксирован, ACP и Telegram доведены до рабочего канона, beacon up работает без OpenCode.
+Контекст: Premise: пользователь просит зафиксировать openapi.yaml и автотест соответствия для /api/v1/snapshot, events, human/decide плюс 24-часовую историю последних 30 Watch.
+Шаги: Описать схемы, добавить автотест, довести PersistentACPClient и TelegramNotifySink, реализовать autonomous up.
+Проверка: gofmt, go test и js-test в CI.
+Приёмка: Клиент под любую морду генерируется из openapi.yaml без ручных правок.

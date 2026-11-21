@@ -1,0 +1,14 @@
+# Q-C3. Производительность и устранение самописцев
+Статус: todo
+Фаза: P2
+Тип: task
+Владелец файлов: internal/app/taskcli/service.go, internal/domain/identity.go, internal/infra/cibridge/bridge.go, internal/infra/wake/deliver.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: doublestar вместо самописных glob, единый ObligationKey, staggered fan-out и детектор in-work stall.
+Контекст: Premise: в спецификации пользователя просят заменить самописные матчеры, вынести 6 копий escapера, уложить tools/list в 18 KB и добавить jitter 1-2s плюс inWorkTimeout 20m.
+Шаги: Заменить матчеры, свести escapер, измерить tools/list, добавить jitter и детектор с сохранением 5-польного handoff-слепка.
+Проверка: gofmt, go test в CI, размер tools/list замером.
+Приёмка: Размер листинга меньше 18 KB, лишние копии удалены.

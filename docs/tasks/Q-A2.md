@@ -1,0 +1,14 @@
+# Q-A2. Убийца сирот opencode serve и зависших процессов
+Статус: todo
+Фаза: P0
+Тип: task
+Владелец файлов: internal/infra/opencode/server.go, cmd/beacon/gc.go, cmd/beacon/commands.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: Не плодить серверы на вызов, переиспользовать живой, подчищать сироты через beacon gc --apply.
+Контекст: Premise: за смену накопилось 37 процессов opencode serve, 29 сирот без живого beacon mcp. baseline: `ps -eo args | grep 'opencode serve --hostname' | wc -l` = 37 до чистки.
+Шаги: Читать service.json, переиспользовать живой сервер, выставлять Pdeathsig SIGTERM при спавне, хранить PID, добавить beacon gc --apply с защитой основной сессии пользователя.
+Проверка: gofmt, go test в CI.
+Приёмка: Повторный вызов не создаёт второй сервер, сироты подчищаются, основная сессия не трогается.

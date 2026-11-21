@@ -1,0 +1,14 @@
+# Q-C1. Кэшированный failureExcerpt в beacon_get_result
+Статус: todo
+Фаза: P2
+Тип: task
+Владелец файлов: internal/infra/github/annotations.go, internal/infra/mcp/tool_get_result.go, internal/infra/store/failure_excerpts.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: Агент видит причину красной проверки сразу в ответе инструмента, без gh run view.
+Контекст: Premise: агенты при keep_working запускают локальный gh run view. Требуется вытянуть аннотации через GraphQL или REST, redact, escapeUntrusted, обрезать до 2 KB и кэшировать по (watchID, headSHA, checkName).
+Шаги: Добавить загрузчик аннотаций, таблицу кэша, поле excerpt в FailedCheck, тесты на redact и на absent annotations.
+Проверка: gofmt, go test в CI.
+Приёмка: Схема ответа не ломается, excerpt приходит для FAILURE и BLOCKER.

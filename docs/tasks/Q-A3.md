@@ -1,0 +1,14 @@
+# Q-A3. Детект устаревшей базы stale_base вместо keep_working
+Статус: todo
+Фаза: P0
+Тип: task
+Владелец файлов: internal/infra/github/batch_provider.go, internal/domain/verdict.go, internal/infra/cibridge/bridge.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: PR, отставший от починенного main, получает VerdictRebase с причиной stale_base_after_main_fix.
+Контекст: Premise: после починки main семь Watch остались в keep_working из-за старого merge-base, ребаз делали вручную. baseline: `grep -rn 'stale_base' internal/domain internal/infra/github` пусто.
+Шаги: Читать behindBy и baseRefOid в GraphQL батче, хранить BaseHeadSHA, добавить причину в EvaluatePR, тест на PR с красными чеками и зелёным main.
+Проверка: gofmt, go test в CI.
+Приёмка: Агент получает nextCommand ребаза сразу, без ручного разбора.diff
