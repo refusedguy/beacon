@@ -18,24 +18,24 @@ import (
 
 // toolsListByteBudget is the ceiling for the serialized tools/list result.
 // The budget counts real bytes (method Tirith), not the presence of fields.
-// 16 KiB still fits eight detailed input/output schemas while catching runaway
+// 16 KiB still fits nine detailed input/output schemas while catching runaway
 // growth in descriptions and schemas. CI logs the measured size next to the
 // ceiling so drift is visible before it becomes a failure.
 const toolsListByteBudget = 16 * 1024
 
 // toolsListByteCount is the exact serialized size of the tools/list response
-// for the contracted eight tools. The budget above is a ceiling; this number is
+// for the contracted nine tools. The budget above is a ceiling; this number is
 // the current value. Pinning it makes an unannounced change to a description or
 // schema fail the contract until this constant is updated with that change.
-const toolsListByteCount = 16336
+const toolsListByteCount = 17922
 
 // toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
 // catches any byte change, including a swap of two tools whose names have equal
 // length, which a size check alone would miss.
-const toolsListGoldenSHA256 = "315a91fb62d576668aaecf4f1c2b3caaee3f06347c52edf4a771d74ab2c9ddd1"
+const toolsListGoldenSHA256 = "cc1b166a25af2c69e2f6dfe4fb9f5d22b9996b2712f6bc971eb32abd24005266"
 
 // toolsListOrder is the fixed order in which the server lists its tools. The
-// SDK returns the eight tools sorted by name. Pinning the order makes that
+// SDK returns the nine tools sorted by name. Pinning the order makes that
 // behavior part of the contract, so a registration change that shuffles the
 // listing fails the test.
 var toolsListOrder = []string{
@@ -45,13 +45,15 @@ var toolsListOrder = []string{
 	"beacon_get_result",
 	"beacon_list_running",
 	"beacon_stats",
+	"beacon_task_claim",
 	"beacon_wait_result",
 	"beacon_watch_pr",
 }
 
 // expectedToolNames is the complete tool contract: the seven tools from
-// WORKER-PROMPT 4.1 plus beacon_defer_wiring (W12-B). The order is not part of
-// the contract, so the test compares sorted slices.
+// WORKER-PROMPT 4.1, beacon_defer_wiring (W12-B) and beacon_task_claim
+// (ADR 0268). The order is not part of the contract, so the test compares
+// sorted slices.
 var expectedToolNames = []string{
 	"beacon_watch_pr",
 	"beacon_wait_result",
@@ -61,6 +63,7 @@ var expectedToolNames = []string{
 	"beacon_cancel_watch",
 	"beacon_stats",
 	"beacon_defer_wiring",
+	"beacon_task_claim",
 }
 
 // toolKind is the annotation class assigned to a tool in WORKER-PROMPT 4.1.
@@ -84,11 +87,12 @@ var expectedToolKinds = map[string]toolKind{
 	"beacon_cancel_watch": kindDestructive,
 	"beacon_stats":        kindRead,
 	"beacon_defer_wiring": kindAdditive,
+	"beacon_task_claim":   kindAdditive,
 }
 
 // listAllTools walks every tools/list page and returns the tools together with
 // the number of bytes produced by serializing each response. Counting every
-// page keeps the "exactly eight, no ninth" check honest if the server paginates.
+// page keeps the "exactly nine, no tenth" check honest if the server paginates.
 func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, int) {
 	t.Helper()
 
