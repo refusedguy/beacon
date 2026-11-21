@@ -509,16 +509,6 @@ type BlockerStore interface {
 	BindingBySession(sessionID string) (OrchestratorBinding, bool, error)
 }
 
-// ControlPlaneStore is the alternate name for BlockerStore. It exists so callers
-// that think of incidents and bindings as one control-plane concern can name
-// the same port.
-type ControlPlaneStore = BlockerStore
-
-// Notifier delivers a wake pointer to a subscriber.
-type Notifier interface {
-	Notify(ctx context.Context, o Obligation, p Pointer) (AttemptOutcome, error)
-}
-
 // ErrorCode is one of the contract v2 error codes.
 type ErrorCode string
 
