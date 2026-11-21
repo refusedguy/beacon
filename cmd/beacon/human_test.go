@@ -149,3 +149,65 @@ func TestW8BHumanRegisteredInCatalog(t *testing.T) {
 	}
 	t.Fatal("human missing from catalog")
 }
+
+// RS-CMP-06: the human answer is parsed into a typed schema before any write
+// path runs. These tests pin the schema, its errors, and the callback boundary.
+
+func TestRSCMP06ParsesValidResponse(t *testing.T) {
+	resp, err := parseHumanResponse("approve", "w-1", "ok by me")
+	if err != nil {
+		t.Fatalf("parse valid answer: %v", err)
+	}
+	if resp.Outcome != humanApprove || resp.Target != "w-1" || resp.Note != "ok by me" {
+		t.Fatalf("response = %+v", resp)
+	}
+	if !resp.Outcome.valid() {
+		t.Fatalf("outcome %q must be declared", resp.Outcome)
+	}
+}
+
+func TestRSCMP06RejectsInvalidOutcomeType(t *testing.T) {
+	_, err := parseHumanResponse("ban", "w-1", "")
+	if err == nil {
+		t.Fatal("invalid outcome type must fail")
+	}
+	if !strings.Contains(err.Error(), "неизвестный тип ответа") {
+		t.Fatalf("error = %q, want a clear type error", err)
+	}
+	if !strings.Contains(err.Error(), "approve") {
+		t.Fatalf("error must list declared outcomes: %q", err)
+	}
+}
+
+func TestRSCMP06RejectsMissingTarget(t *testing.T) {
+	_, err := parseHumanResponse("approve", "   ", "")
+	if err == nil {
+		t.Fatal("missing target must fail")
+	}
+	if !strings.Contains(err.Error(), "пропущено поле") {
+		t.Fatalf("error = %q, want a missing field error", err)
+	}
+}
+
+func TestRSCMP06InvalidAnswerNeverReachesCallback(t *testing.T) {
+	c, decider, store := w8bHumanHarness(t, true)
+	if code := runHuman(c, []string{"ban", "w-1"}); code != 2 {
+		t.Fatalf("code = %d", code)
+	}
+	if decider.calls != 0 || store.calls != 0 {
+		t.Fatalf("invalid answer reached a write path: http=%d sqlite=%d", decider.calls, store.calls)
+	}
+}
+
+func TestRSCMP06ValidAnswerPostsTypedOutcome(t *testing.T) {
+	c, decider, store := w8bHumanHarness(t, true)
+	if code := runHuman(c, []string{"--note", "looks good", "approve", "w-9"}); code != 0 {
+		t.Fatalf("code = %d", code)
+	}
+	if decider.calls != 1 || store.calls != 0 {
+		t.Fatalf("http=%d sqlite=%d, want 1/0", decider.calls, store.calls)
+	}
+	if decider.req.Verb != "approve" || decider.req.Target != "w-9" || decider.req.Note != "looks good" {
+		t.Fatalf("request = %+v", decider.req)
+	}
+}
