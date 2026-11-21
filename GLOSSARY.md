@@ -37,7 +37,7 @@ _Avoid_: listener, подписка, consumer
 _Avoid_: state, статус сессии, presence
 
 **Verdict**:
-Результат, посчитанный для одной ревизии Watch. Значения: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`. Переходы добавляют `needs_input`, `parked` и `accepted`. Вердикт берётся только из `beacon_get_result`, а не из отчёта сабагента.
+Результат, посчитанный для одной ревизии Watch. Контракт вердиктов живёт в `internal/domain/types.go` в функции `Verdicts`. Значения: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`, `recheck`. Переходы добавляют `needs_input`, `parked` и `accepted`. Оркестратор добавляет `fail`, `wait`, `wait_dependency` и `green_blocked`. Вердикт `green_blocked` означает зелёные проверки при удержанном слоте из-за открытого блокера. Вердикт берётся только из `beacon_get_result`, а не из отчёта сабагента.
 _Avoid_: status, conclusion, результат агента
 
 **Obligation**:
