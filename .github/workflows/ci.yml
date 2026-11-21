@@ -180,7 +180,7 @@ jobs:
           set -euo pipefail
           bin=tools/beacon-gates/beacon-gates
           "$bin" --list
-          for gate in capabilities layers-ast layers-list; do
+          for gate in capabilities layers-ast layers-list wiring; do
             printf 'self-test gate=%s\n' "$gate"
             "$bin" "$gate" --self-test
           done
@@ -194,6 +194,17 @@ jobs:
             printf 'gate gate=%s\n' "$gate"
             "$bin" "$gate"
           done
+
+      # WIRING-карты остаются в дереве после завершения работы и получают
+      # "Статус: done". Гейт требует "todo" и помечает готовые карты находкой.
+      # Оставляем прогон информационным, как у docs-гейта.
+      - name: Run wiring gate (informational)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=tools/beacon-gates/beacon-gates
+          "$bin" wiring
 
   # RS2-EVAL-05. Отдельная обязательная проверка на отказ инструмента.
   # rules gate возвращает код 2 при BROKEN. Джоба обязана стать красной,

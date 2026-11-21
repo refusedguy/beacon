@@ -26,6 +26,7 @@ var registry = []command{
 	{"layers-ast", "layer edges from go/parser, cross-checked with go list", layersast.Run, layersast.SelfTestRun},
 	{"layers-list", "layer edges from go list -e -deps -json ./...", layerslist.Run, layerslist.SelfTestRun},
 	{"reachability", "unwired exported adapters and disabled tests", reachability.Run, reachability.SelfTestRun},
+	{"wiring", "WIRING cards for deferred wiring", gate.RunWiring, gate.WiringSelfTestRun},
 }
 
 func lookup(name string) (command, bool) {
