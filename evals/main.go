@@ -2120,14 +2120,53 @@ type artifactNameCase struct {
 	ok   bool
 }
 
-// checkArtifactNames прогоняет набор имён через checkArtifactName. При
-// расхождении в ACTUAL видно конкретное имя и полученный результат.
+// reSkillGoFunction ловит упоминания Go-функций в тексте skill: имена вида
+// wake.NotifyOrchestrator и вызовы Func(...).
+var reSkillGoFunction = regexp.MustCompile(`\b[a-z][a-z0-9_]*\.[A-Z][A-Za-z0-9_]*\b|\b[A-Z][A-Za-z0-9_]*\s*\(`)
+
+// forbiddenSkillGoNames — конкретные Go-функции, которых нет в контракте семи
+// MCP-инструментов. Их упоминание в skill роняет eval.
+var forbiddenSkillGoNames = []string{"NotifyOrchestrator"}
+
+// checkSkillNoGoFunctions читает текст SKILL.md и возвращает первое упоминание
+// Go-функции. Корень ищется через findRepoRoot, чтобы проверка не зависела от
+// рабочего каталога раннера.
+func checkSkillNoGoFunctions(name string) (string, bool) {
+	root, err := findRepoRoot()
+	if err != nil {
+		return "repo root: " + err.Error(), false
+	}
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
+	if err != nil {
+		return "read " + name + ": " + err.Error(), false
+	}
+	text := string(data)
+	for _, fn := range forbiddenSkillGoNames {
+		if strings.Contains(text, fn) {
+			return fn + " in " + name, false
+		}
+	}
+	if loc := reSkillGoFunction.FindString(text); loc != "" {
+		return loc + " in " + name, false
+	}
+	return "no go functions in " + name, true
+}
+
+// checkArtifactNames прогоняет набор имён через checkArtifactName. Для валидных
+// SKILL.md дополнительно читается текст файла: упоминание Go-функции роняет
+// eval. При расхождении в ACTUAL видно конкретное имя и результат.
 func checkArtifactNames(cases []artifactNameCase) (string, bool) {
 	var bad []string
 	for _, tc := range cases {
 		kind, ok := checkArtifactName(tc.name)
 		if kind != tc.kind || ok != tc.ok {
 			bad = append(bad, fmt.Sprintf("%s=%s/%t", tc.name, kind, ok))
+			continue
+		}
+		if ok && kind == artifactKnowledge && strings.HasSuffix(tc.name, "/SKILL.md") {
+			if detail, clean := checkSkillNoGoFunctions(tc.name); !clean {
+				bad = append(bad, detail)
+			}
 		}
 	}
 	if len(bad) > 0 {
