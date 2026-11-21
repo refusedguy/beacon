@@ -1,0 +1,294 @@
+package mcp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
+)
+
+// fakeTaskClaimStore lets a handler test assert the port contract without
+// touching the filesystem.
+type fakeTaskClaimStore struct {
+	out      TaskClaimOutput
+	err      error
+	gotInput TaskClaimInput
+	gotAt    string
+}
+
+func (f *fakeTaskClaimStore) Claim(_ context.Context, in TaskClaimInput, claimedAt string) (TaskClaimOutput, error) {
+	f.gotInput = in
+	f.gotAt = claimedAt
+	return f.out, f.err
+}
+
+func claimTestCard(id, phase string, extra ...string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s. Test card\n", id)
+	fmt.Fprintln(&b, "Статус: todo")
+	fmt.Fprintf(&b, "Фаза: %s\n", phase)
+	fmt.Fprintln(&b, "Тип: task")
+	fmt.Fprintln(&b, "Владелец файлов: internal/a.go, internal/b.go")
+	fmt.Fprintln(&b, "Зависимости: T0.1, T0.2")
+	fmt.Fprintln(&b, "Ссылка: нет")
+	fmt.Fprintln(&b, "Агент: нет")
+	fmt.Fprintln(&b, "Время: нет")
+	fmt.Fprintln(&b, "Цель: цель задачи")
+	fmt.Fprintln(&b, "Контекст: контекст задачи")
+	fmt.Fprintln(&b, "Шаги: шаги задачи")
+	fmt.Fprintln(&b, "Проверка: проверка задачи")
+	fmt.Fprintln(&b, "Приёмка: приёмка задачи")
+	for _, line := range extra {
+		fmt.Fprintln(&b, line)
+	}
+	return b.String()
+}
+
+func writeClaimTestCard(t *testing.T, dir, id, phase string, extra ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, id+".md")
+	if err := os.WriteFile(path, []byte(claimTestCard(id, phase, extra...)), 0644); err != nil {
+		t.Fatalf("write card: %v", err)
+	}
+	return path
+}
+
+func claimErrorCode(t *testing.T, err error) domain.ErrorCode {
+	t.Helper()
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected domain.AppError, got %v", err)
+	}
+	return appErr.Code
+}
+
+func TestTaskClaimHandlerRequiresAgentID(t *testing.T) {
+	store := &fakeTaskClaimStore{}
+	h := newTaskClaimHandler(store, func() time.Time { return time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC) })
+
+	_, err := h.Claim(context.Background(), TaskClaimInput{})
+	if claimErrorCode(t, err) != domain.CodeInvalidInput {
+		t.Fatalf("empty agentID gave %v, want INVALID_INPUT", err)
+	}
+	if store.gotAt != "" {
+		t.Fatalf("store was called for an invalid input at %q", store.gotAt)
+	}
+}
+
+func TestTaskClaimHandlerReturnsFullContext(t *testing.T) {
+	want := TaskClaimOutput{
+		CardID:       "IDX-05",
+		Title:        "MCP инструмент beacon_task_claim",
+		Status:       "in_progress",
+		AgentID:      "ses_worker",
+		Goal:         "атомарная выдача задачи",
+		Dependencies: []string{"IDX-01"},
+		OwnerFiles:   []string{"internal/infra/mcp/tool_task_claim.go"},
+		PlanMode:     "full",
+		ClaimedAt:    "2026-11-21T12:00:00Z",
+		Handoff: domain.Handoff{
+			Intent:           "цель",
+			Evidence:         "контекст",
+			PatchPlan:        "шаги",
+			VerificationPlan: "проверка",
+			RiskNotes:        "приёмка",
+		},
+	}
+	store := &fakeTaskClaimStore{out: want}
+	h := newTaskClaimHandler(store, func() time.Time { return time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC) })
+
+	got, err := h.Claim(context.Background(), TaskClaimInput{AgentID: "ses_worker", Phase: "P1"})
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if got.CardID != want.CardID || got.Goal != want.Goal || got.Status != "in_progress" {
+		t.Fatalf("core fields = %+v, want %+v", got, want)
+	}
+	if len(got.Dependencies) != 1 || got.Dependencies[0] != "IDX-01" {
+		t.Fatalf("dependencies = %v", got.Dependencies)
+	}
+	if len(got.OwnerFiles) != 1 || got.OwnerFiles[0] != "internal/infra/mcp/tool_task_claim.go" {
+		t.Fatalf("ownerFiles = %v", got.OwnerFiles)
+	}
+	if got.PlanMode != "full" || got.ClaimedAt != want.ClaimedAt {
+		t.Fatalf("plan mode or time = %q / %q", got.PlanMode, got.ClaimedAt)
+	}
+	if got.Handoff != want.Handoff {
+		t.Fatalf("handoff = %+v, want %+v", got.Handoff, want.Handoff)
+	}
+	if store.gotInput.AgentID != "ses_worker" || store.gotInput.Phase != "P1" {
+		t.Fatalf("store input = %+v", store.gotInput)
+	}
+	if store.gotAt != want.ClaimedAt {
+		t.Fatalf("claimedAt = %q, want %q", store.gotAt, want.ClaimedAt)
+	}
+}
+
+func TestFileTaskClaimMarksCardInProgress(t *testing.T) {
+	dir := t.TempDir()
+	path := writeClaimTestCard(t, dir, "IDX-05", "P1")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+	when := "2026-11-21T12:00:00Z"
+
+	out, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_worker", CardID: "IDX-05"}, when)
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if out.CardID != "IDX-05" || out.Status != "in_progress" || out.AgentID != "ses_worker" {
+		t.Fatalf("output = %+v", out)
+	}
+	if out.ClaimedAt != when {
+		t.Fatalf("claimedAt = %q, want %q", out.ClaimedAt, when)
+	}
+	if len(out.OwnerFiles) != 2 || out.OwnerFiles[0] != "internal/a.go" {
+		t.Fatalf("ownerFiles = %v", out.OwnerFiles)
+	}
+	if len(out.Dependencies) != 2 || out.Dependencies[0] != "T0.1" {
+		t.Fatalf("dependencies = %v", out.Dependencies)
+	}
+	if out.PlanMode != "fast" {
+		t.Fatalf("planMode = %q, want fast for a missing field", out.PlanMode)
+	}
+	if err := out.Handoff.Validate(); err != nil {
+		t.Fatalf("handoff is incomplete: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read claimed card: %v", err)
+	}
+	text := string(data)
+	for _, want := range []string{"Статус: in_progress", "Агент: ses_worker", "Время: " + when} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("claimed card is missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestFileTaskClaimRejectsSecondAgent(t *testing.T) {
+	dir := t.TempDir()
+	writeClaimTestCard(t, dir, "IDX-05", "P1")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+	in := TaskClaimInput{CardID: "IDX-05"}
+
+	in.AgentID = "ses_first"
+	if _, err := store.Claim(context.Background(), in, "2026-11-21T12:00:00Z"); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	in.AgentID = "ses_second"
+	if _, err := store.Claim(context.Background(), in, "2026-11-21T12:01:00Z"); err == nil {
+		t.Fatal("second agent received the same card")
+	} else if code := claimErrorCode(t, err); code != domain.CodeGone {
+		t.Fatalf("second claim code = %s, want GONE", code)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "IDX-05.md"))
+	if err != nil {
+		t.Fatalf("read card: %v", err)
+	}
+	if !strings.Contains(string(data), "Агент: ses_first") {
+		t.Fatalf("second claim overwrote the first agent:\n%s", data)
+	}
+}
+
+func TestFileTaskClaimConcurrentAgentsGetDifferentCards(t *testing.T) {
+	dir := t.TempDir()
+	writeClaimTestCard(t, dir, "IDX-05", "P1")
+	writeClaimTestCard(t, dir, "IDX-06", "P1")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+	when := "2026-11-21T12:00:00Z"
+
+	type result struct {
+		out TaskClaimOutput
+		err error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, agent := range []string{"ses_a", "ses_b"} {
+		wg.Add(1)
+		go func(agent string) {
+			defer wg.Done()
+			out, err := store.Claim(context.Background(), TaskClaimInput{AgentID: agent}, when)
+			results <- result{out: out, err: err}
+		}(agent)
+	}
+	wg.Wait()
+	close(results)
+
+	seen := make(map[string]string)
+	for r := range results {
+		if r.err != nil {
+			t.Fatalf("concurrent claim: %v", r.err)
+		}
+		if r.out.CardID == "" {
+			t.Fatal("agent got an empty card id")
+		}
+		if other, dup := seen[r.out.CardID]; dup {
+			t.Fatalf("card %s went to both %s and %s", r.out.CardID, other, r.out.AgentID)
+		}
+		seen[r.out.CardID] = r.out.AgentID
+		data, err := os.ReadFile(filepath.Join(dir, r.out.CardID+".md"))
+		if err != nil {
+			t.Fatalf("read %s: %v", r.out.CardID, err)
+		}
+		if !strings.Contains(string(data), "Агент: "+r.out.AgentID) {
+			t.Fatalf("card %s did not record %s", r.out.CardID, r.out.AgentID)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("claimed %d cards, want 2", len(seen))
+	}
+}
+
+func TestFileTaskClaimPlanMode(t *testing.T) {
+	dir := t.TempDir()
+	writeClaimTestCard(t, dir, "IDX-05", "P1", "Режим плана: full")
+	writeClaimTestCard(t, dir, "IDX-06", "P1")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+
+	for _, tc := range []struct {
+		id   string
+		want string
+	}{
+		{"IDX-05", "full"},
+		{"IDX-06", "fast"},
+	} {
+		out, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_plan", CardID: tc.id}, "2026-11-21T12:00:00Z")
+		if err != nil {
+			t.Fatalf("claim %s: %v", tc.id, err)
+		}
+		if out.PlanMode != tc.want {
+			t.Fatalf("%s planMode = %q, want %q", tc.id, out.PlanMode, tc.want)
+		}
+	}
+}
+
+func TestFileTaskClaimPhaseFilter(t *testing.T) {
+	dir := t.TempDir()
+	writeClaimTestCard(t, dir, "IDX-05", "P1")
+	writeClaimTestCard(t, dir, "IDX-06", "P2")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+
+	out, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_phase", Phase: "P2"}, "2026-11-21T12:00:00Z")
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if out.CardID != "IDX-06" {
+		t.Fatalf("claimed %s, want the P2 card", out.CardID)
+	}
+	if out.Title != "Test card" {
+		t.Fatalf("title = %q, want Test card", out.Title)
+	}
+	if _, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_phase2", Phase: "P3"}, "2026-11-21T12:00:00Z"); err == nil {
+		t.Fatal("claim with no matching card should fail")
+	} else if code := claimErrorCode(t, err); code != domain.CodeGone {
+		t.Fatalf("no-card code = %s, want GONE", code)
+	}
+}
