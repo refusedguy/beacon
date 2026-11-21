@@ -44,6 +44,9 @@ func runLogs(c *CLI, args []string) int {
 		PR:         *pr,
 		OnlyErrors: *errorsOnly,
 		JSON:       *jsonOut,
+		OnTruncate: func(dropped int) {
+			fmt.Fprintf(c.errOut, "beacon logs: предупреждение: пропущено %d более старых записей, показаны последние %d (--tail 0 показывает все)\n", dropped, *tail)
+		},
 	}
 	lines, err := observe.ReadLogs(dir, filter)
 	if err != nil {

@@ -15,11 +15,12 @@ import (
 // LogFilter selects records when reading logs back from disk. cmd/beacon uses
 // it for `beacon logs` so the command never has to call os.ReadFile itself.
 type LogFilter struct {
-	Tail       int    // keep only the last N matching records; <= 0 keeps all
-	WatchID    string // keep records with this watchID; empty keeps all
-	PR         int    // keep records with this pr; zero keeps all
-	OnlyErrors bool   // keep ERROR records and records carrying an error field
-	JSON       bool   // keep records as JSON lines; false renders text lines
+	Tail       int               // keep only the last N matching records; <= 0 keeps all (CLI: --tail 0)
+	WatchID    string            // keep records with this watchID; empty keeps all
+	PR         int               // keep records with this pr; zero keeps all
+	OnlyErrors bool              // keep ERROR records and records carrying an error field
+	JSON       bool              // keep records as JSON lines; false renders text lines
+	OnTruncate func(dropped int) // called when Tail drops older matching records
 }
 
 // ReadLogs reads the log files under <dir>/logs and returns the records that
@@ -68,6 +69,7 @@ func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 	})
 
 	var matched []string
+	var scanErr error
 	for _, file := range files {
 		f, err := os.Open(file.path)
 		if err != nil {
@@ -86,11 +88,22 @@ func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 				matched = append(matched, formatLogLine(line))
 			}
 		}
-		_ = scanner.Err()
+		// A line longer than the scanner buffer stops Scan and leaves valid
+		// records unread. Surface it instead of dropping the rest in silence.
+		if err := scanner.Err(); err != nil && scanErr == nil {
+			scanErr = fmt.Errorf("observe: чтение %s: %w", file.path, err)
+		}
 		_ = f.Close()
 	}
+	if scanErr != nil {
+		return nil, scanErr
+	}
 	if opts.Tail > 0 && len(matched) > opts.Tail {
+		dropped := len(matched) - opts.Tail
 		matched = matched[len(matched)-opts.Tail:]
+		if opts.OnTruncate != nil {
+			opts.OnTruncate(dropped)
+		}
 	}
 	if matched == nil {
 		return []string{}, nil
