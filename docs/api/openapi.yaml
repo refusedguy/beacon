@@ -665,6 +665,7 @@ components:
         closedAt:
           type: string
           format: date-time
+          description: For entries in recentWatches, no older than 24 hours before the request.
         closeReason:
           type: string
 
@@ -713,7 +714,8 @@ components:
             type: string
         recentWatches:
           type: array
-          description: Newest 30 completed Watches, newest first. Omitted without a history provider.
+          description: Up to 30 completed Watches closed within the last 24 hours, newest first by closedAt. Omitted without a history provider.
+          maxItems: 30
           items:
             $ref: "#/components/schemas/WatchHistory"
         hourlyStats:

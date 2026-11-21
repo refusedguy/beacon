@@ -599,8 +599,16 @@ func pointsValue(points func() (int, int)) (int, int) {
 // wiring honest if either interface changes.
 var (
 	_ httpapi.StateProvider = httpStateProvider{}
+	_ httpapi.HistorySource = httpStateProvider{}
 	_ httpapi.DecisionSink  = humanDecisionSink{}
 )
+
+// snapshotHistoryWindow is the time range published in recentWatches.
+const snapshotHistoryWindow = 24 * time.Hour
+
+// snapshotHistoryLimit mirrors httpapi.maxRecentWatches. The transport also
+// truncates, but the store read stays bounded before it reaches the wire.
+const snapshotHistoryLimit = 30
 
 // httpStateProvider projects the MCP snapshot plus the control-plane rows the
 // HTTP view needs. It reads only; every write goes through humanDecisionSink.
@@ -658,6 +666,59 @@ func (p httpStateProvider) Snapshot(ctx context.Context) (httpapi.Snapshot, erro
 	}
 	snap.LastCycle = lastCycleInfo()
 	return snap, nil
+}
+
+// SnapshotHistory implements httpapi.HistorySource. It publishes the newest
+// Watches closed in the last day. A store that is not wired in is not an
+// error; the caller then receives an empty history block.
+func (p httpStateProvider) SnapshotHistory(ctx context.Context) (httpapi.SnapshotHistory, error) {
+	h := httpapi.SnapshotHistory{RecentWatches: []httpapi.WatchHistory{}}
+	if p.db == nil {
+		return h, nil
+	}
+	since := time.Now().Add(-snapshotHistoryWindow)
+	watches, err := p.db.RecentClosedWatches(ctx, since, snapshotHistoryLimit)
+	if err != nil {
+		return h, err
+	}
+	for _, w := range watches {
+		outcome := historyOutcome(w)
+		h.RecentWatches = append(h.RecentWatches, httpapi.WatchHistory{
+			ID:          w.ID,
+			Repo:        w.Repo,
+			PR:          w.PR,
+			HeadSHA:     w.HeadSHA,
+			Outcome:     outcome,
+			ClosedAt:    w.ClosedAt,
+			CloseReason: w.CloseReason,
+		})
+		if outcome == httpapi.OutcomeMerged {
+			h.HourlyStats.Merges++
+		}
+	}
+	if blockers, err := p.db.ActiveBlockers(); err == nil {
+		h.HourlyStats.Blockers = len(blockers)
+	}
+	if p.deps.Snapshot != nil {
+		if base, err := p.deps.Snapshot.Snapshot(); err == nil {
+			h.HourlyStats.Points = base.PointsThisHour
+		}
+	}
+	return h, nil
+}
+
+// historyOutcome maps a closed Watch verdict to the transport's stable enum.
+// Cancelled and head-changed closes keep their earlier verdict, so their
+// outcome is "closed" and the reason carries the cause.
+func historyOutcome(w domain.Watch) httpapi.WatchOutcome {
+	switch w.Verdict {
+	case domain.VerdictMerged:
+		return httpapi.OutcomeMerged
+	case domain.VerdictTimeout, domain.VerdictBlocked:
+		return httpapi.OutcomeEscalated
+	default:
+		return httpapi.OutcomeClosed
+	}
 }
 
 // cleanLoadErrors drops the successful runtime_stats byte-count note the MCP

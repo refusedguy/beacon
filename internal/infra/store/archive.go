@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -257,6 +258,56 @@ func readLastArchiveRun(ctx context.Context, q queryer) (time.Time, bool, error)
 		return time.Time{}, false, err
 	}
 	return time.Unix(0, nano).UTC(), true, nil
+}
+
+// RecentClosedWatches returns the completed Watches closed at or after since,
+// newest first and no more than limit. The history window is shorter than
+// ClosedWatchRetention, so the rows still live in the active watches table;
+// watch_archive holds only Watches older than the retention window.
+//
+// The SQL filter narrows the rows by the closedAt field in the payload. Go
+// repeats the boundary check on decoded times, because the SQL timestamp
+// comparison has coarser precision than time.Time.
+func (d *DB) RecentClosedWatches(ctx context.Context, since time.Time, limit int) ([]domain.Watch, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 {
+		return []domain.Watch{}, nil
+	}
+	rows, err := d.readDB.QueryContext(ctx, `
+		SELECT payload FROM watches
+		WHERE status = ?
+		  AND julianday(json_extract(payload, '$.closedAt')) >= julianday(?)
+		ORDER BY julianday(json_extract(payload, '$.closedAt')) DESC
+		LIMIT ?`,
+		string(domain.StatusClosed), since.UTC().Format(time.RFC3339Nano), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	watches := make([]domain.Watch, 0, limit)
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		w, err := decodeWatch(payload)
+		if err != nil {
+			return nil, err
+		}
+		if w.ClosedAt.Before(since) {
+			continue
+		}
+		watches = append(watches, w)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(watches, func(i, j int) bool {
+		return watches[i].ClosedAt.After(watches[j].ClosedAt)
+	})
+	return watches, nil
 }
 
 // archiveEligible accepts a closed Watch only when it was closed by a
