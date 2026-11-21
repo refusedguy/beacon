@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app/session"
-	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // attachResumeStore is a mock SessionStore. It records GetSession ids so a
@@ -15,14 +14,14 @@ import (
 type attachResumeStore struct {
 	looked []string
 
-	want   store.Session
+	want   session.Session
 	found  bool
 	getErr error
 }
 
-func (s *attachResumeStore) SaveSession(store.Session) error { return nil }
+func (s *attachResumeStore) SaveSession(session.Session) error { return nil }
 
-func (s *attachResumeStore) GetSession(id string) (store.Session, bool, error) {
+func (s *attachResumeStore) GetSession(id string) (session.Session, bool, error) {
 	s.looked = append(s.looked, id)
 	return s.want, s.found, s.getErr
 }
@@ -54,7 +53,7 @@ func attachResumeSetup(t *testing.T) string {
 func TestAttachResumeCallsGetSession(t *testing.T) {
 	saved := attachResumeSetup(t)
 	st := &attachResumeStore{
-		want:  store.Session{ID: saved, Status: store.SessionStatusActive},
+		want:  session.Session{ID: saved, Status: session.SessionStatusActive},
 		found: true,
 	}
 	attachResumeInstallRegistry(t, st)
@@ -76,7 +75,7 @@ func TestAttachResumeRegistryUsesStoredID(t *testing.T) {
 	attachResumeSetup(t)
 	const canonical = "sess-canonical"
 	st := &attachResumeStore{
-		want:  store.Session{ID: canonical, Status: store.SessionStatusActive},
+		want:  session.Session{ID: canonical, Status: session.SessionStatusActive},
 		found: true,
 	}
 	attachResumeInstallRegistry(t, st)

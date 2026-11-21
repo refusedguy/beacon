@@ -8,16 +8,32 @@ import (
 	"errors"
 	"strings"
 	"time"
+)
 
-	"github.com/refusedguy/beacon/internal/infra/store"
+// Session is one persisted session row. It is a primitive copy of the store
+// row, declared here so the app layer names no infra type (DIP, ARDH-15).
+type Session struct {
+	ID        string
+	Status    string
+	CreatedAt time.Time
+	LastSeen  time.Time
+	Metadata  map[string]string
+}
+
+// Session status values mirror the persisted values. The adapter in cmd maps
+// them to the store constants without changing what is written to disk.
+const (
+	SessionStatusActive = "active"
+	SessionStatusIdle   = "idle"
+	SessionStatusClosed = "closed"
 )
 
 // SessionStore is the durable session port. SaveSession records a session,
-// GetSession loads one by id and Touch moves its last-seen time. *store.DB
-// satisfies this interface. Tests install a mock instead.
+// GetSession loads one by id and Touch moves its last-seen time. The adapter
+// in cmd satisfies this interface. Tests install a mock instead.
 type SessionStore interface {
-	SaveSession(s store.Session) error
-	GetSession(id string) (store.Session, bool, error)
+	SaveSession(s Session) error
+	GetSession(id string) (Session, bool, error)
 	Touch(id string, at time.Time) error
 }
 
@@ -33,10 +49,10 @@ var (
 )
 
 // TaskSessionFinder is the optional port a SessionStore can implement so the
-// registry can resolve a session by the task it was spawned for. *store.DB
-// satisfies it. Stores used by older tests need not implement it.
+// registry can resolve a session by the task it was spawned for. The adapter
+// in cmd satisfies it. Stores used by older tests need not implement it.
 type TaskSessionFinder interface {
-	FindSessionByTask(task string) (store.Session, bool, error)
+	FindSessionByTask(task string) (Session, bool, error)
 }
 
 // SessionRegistry drives session lifecycle events through a SessionStore. It
@@ -76,10 +92,10 @@ func (r *SessionRegistry) Start(id, status string, metadata map[string]string) e
 		return ErrEmptyID
 	}
 	if strings.TrimSpace(status) == "" {
-		status = store.SessionStatusActive
+		status = SessionStatusActive
 	}
 	now := r.clock().UTC()
-	return r.store.SaveSession(store.Session{
+	return r.store.SaveSession(Session{
 		ID:        id,
 		Status:    status,
 		CreatedAt: now,
@@ -90,13 +106,13 @@ func (r *SessionRegistry) Start(id, status string, metadata map[string]string) e
 
 // Resume loads the session with id. found is false when the store has no such
 // session. It never creates one.
-func (r *SessionRegistry) Resume(id string) (store.Session, bool, error) {
+func (r *SessionRegistry) Resume(id string) (Session, bool, error) {
 	if r == nil || r.store == nil {
-		return store.Session{}, false, ErrNilStore
+		return Session{}, false, ErrNilStore
 	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return store.Session{}, false, ErrEmptyID
+		return Session{}, false, ErrEmptyID
 	}
 	return r.store.GetSession(id)
 }
@@ -105,17 +121,17 @@ func (r *SessionRegistry) Resume(id string) (store.Session, bool, error) {
 // opaque session id, which a restarted command does not have; task is the
 // stable line the caller knows. found is false when the store has no session
 // for that task. The registry never creates one here.
-func (r *SessionRegistry) ResumeByTask(task string) (store.Session, bool, error) {
+func (r *SessionRegistry) ResumeByTask(task string) (Session, bool, error) {
 	if r == nil || r.store == nil {
-		return store.Session{}, false, ErrNilStore
+		return Session{}, false, ErrNilStore
 	}
 	task = strings.TrimSpace(task)
 	if task == "" {
-		return store.Session{}, false, ErrEmptyID
+		return Session{}, false, ErrEmptyID
 	}
 	finder, ok := r.store.(TaskSessionFinder)
 	if !ok {
-		return store.Session{}, false, ErrNoTaskLookup
+		return Session{}, false, ErrNoTaskLookup
 	}
 	return finder.FindSessionByTask(task)
 }

@@ -72,7 +72,7 @@ func defaultSessionRegistry() *session.SessionRegistry {
 		}
 		db, err := store.Open(filepath.Join(dir, mcpStateDBName))
 		if err == nil {
-			spawnSessionDB = session.NewSessionRegistry(db)
+			spawnSessionDB = session.NewSessionRegistry(newSessionDBAdapter(db))
 		}
 	})
 	return spawnSessionDB

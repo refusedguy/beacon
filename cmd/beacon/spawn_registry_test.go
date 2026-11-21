@@ -8,23 +8,22 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app/session"
-	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // w488Store is a mock SessionStore. It records SaveSession so a test can see
 // the session that beacon spawn registered, without opening a database.
 type w488Store struct {
-	saved   []store.Session
+	saved   []session.Session
 	saveErr error
 }
 
-func (s *w488Store) SaveSession(v store.Session) error {
+func (s *w488Store) SaveSession(v session.Session) error {
 	s.saved = append(s.saved, v)
 	return s.saveErr
 }
 
-func (s *w488Store) GetSession(id string) (store.Session, bool, error) {
-	return store.Session{}, false, nil
+func (s *w488Store) GetSession(id string) (session.Session, bool, error) {
+	return session.Session{}, false, nil
 }
 
 func (s *w488Store) Touch(id string, at time.Time) error { return nil }
@@ -57,7 +56,7 @@ func TestW488SpawnSavesSessionAtStart(t *testing.T) {
 		t.Fatalf("SaveSession calls = %d, want 1", len(st.saved))
 	}
 	got := st.saved[0]
-	if got.ID != "sess-w488" || got.Status != store.SessionStatusActive {
+	if got.ID != "sess-w488" || got.Status != session.SessionStatusActive {
 		t.Errorf("saved session = %+v", got)
 	}
 	if got.Metadata[spawnMetaTaskID] != "T9.9" || got.Metadata[spawnMetaTitle] != "Wiring card" {

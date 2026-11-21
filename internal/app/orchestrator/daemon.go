@@ -19,7 +19,6 @@ import (
 	// emitted at the decision sites; a port through every call would add noise
 	// without moving an adapter.
 	"github.com/refusedguy/beacon/internal/infra/observe"
-	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // DaemonInterval is the delay between passes when neither the flag nor the
@@ -206,16 +205,14 @@ func DaemonWakeSubscriber(subs []DaemonSubscriber) (DaemonSubscriber, error) {
 }
 
 // NewDaemonWaker builds the Waker the daemon passes to the orchestrator. The
-// adapter registry in internal/infra/wake selects a deliverer by the
-// subscriber's own adapter name; no harness name is hard-coded here.
-func NewDaemonWaker(lookup DaemonWatchLookup) Waker {
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, &daemonWakeAdapter{api: &wake.T202API{}})
+// composition root supplies the delivery backend and the shared dedup ledger
+// as ports, so this package names no infra type (ARDH-15 DIP).
+func NewDaemonWaker(lookup DaemonWatchLookup, backend WakeBackend, dedup WakeDedup) Waker {
 	return &daemonWaker{
 		lookup:        lookup,
-		adapters:      adapters,
+		backend:       backend,
+		dedup:         dedup,
 		deliveredKeys: make(map[string]struct{}),
-		dedup:         wake.SharedDeliveryDedup(),
 	}
 }
 
@@ -226,27 +223,29 @@ func NewDaemonWaker(lookup DaemonWatchLookup) Waker {
 type WakeRoute func(ctx context.Context, watch DaemonWatch, revision uint64, verdict, text string) error
 
 // NewDaemonWakerWithRoute builds a Waker that hands verdict delivery to route.
-// A nil route keeps the built-in adapter registry used by NewDaemonWaker and
-// by the tests. Validation and dedup run in Wake for both forms.
+// A nil route keeps the local delivery path built by NewDaemonWaker.
 func NewDaemonWakerWithRoute(lookup DaemonWatchLookup, route WakeRoute) Waker {
-	w := NewDaemonWaker(lookup).(*daemonWaker)
+	w := NewDaemonWaker(lookup, nil, nil).(*daemonWaker)
+	w.route = route
+	return w
+}
+
+// NewDaemonWakerWithBackend builds the full Waker the composition root uses:
+// a notify route, the wake backend and the shared dedup ledger.
+func NewDaemonWakerWithBackend(lookup DaemonWatchLookup, route WakeRoute, backend WakeBackend, dedup WakeDedup) Waker {
+	w := NewDaemonWaker(lookup, backend, dedup).(*daemonWaker)
 	w.route = route
 	return w
 }
 
 type daemonWaker struct {
-	lookup   DaemonWatchLookup
-	adapters *wake.T211AdapterRegistry
-	route    WakeRoute
+	lookup  DaemonWatchLookup
+	backend WakeBackend
+	route   WakeRoute
 
 	// mu guards deliveredKeys and the check-deliver-record sequence, so two
 	// concurrent passes cannot steer the same obligation twice. deliveredKeys
 	// holds obligation keys already admitted to a subscriber in this process.
-	// The ledger is in-memory only: a daemon restart starts with an empty map
-	// and may deliver the same (watchID, revision, subscriber) again. The host
-	// prompt API keeps its own admission id, so the duplicate is admitted as a
-	// new task. Surviving a restart needs a durable receipt store, which is out
-	// of scope for this fix.
 	mu            sync.Mutex
 	deliveredKeys map[string]struct{}
 
@@ -254,7 +253,25 @@ type daemonWaker struct {
 	// the bridge and the daemon from admitting the same obligation twice in
 	// one process. A nil ledger disables the cross-supplier guard in tests
 	// that build daemonWaker by hand.
-	dedup *wake.DeliveryDedup
+	dedup WakeDedup
+}
+
+// validateDaemonWakePointer checks that the subscriber named on the pointer
+// owns its obligation. It is the app-local form of the wake bridge check, so
+// no infra type is needed here.
+func validateDaemonWakePointer(p WakePointer) error {
+	if p.Target == "" {
+		return errors.New("daemon: empty subscriber target")
+	}
+	if !strings.HasPrefix(p.Target, "ses_") || len(p.Target) == len("ses_") {
+		return nil
+	}
+	if strings.Contains(p.ObligationID, ":") {
+		if want := obligationKey(p.WatchID, p.Revision, p.Target); p.ObligationID != want {
+			return fmt.Errorf("daemon: subscriber %q does not own obligation %q", p.Target, p.ObligationID)
+		}
+	}
+	return nil
 }
 
 // daemonWakeIsDelivered reports whether an adapter receipt counts as a
@@ -262,7 +279,7 @@ type daemonWaker struct {
 // leaves the obligation eligible for the next daemon pass.
 func daemonWakeIsDelivered(outcome string) bool {
 	switch outcome {
-	case wake.T210Delivered, wake.T210Queued, wake.T210Enqueued:
+	case WakeDelivered, WakeQueued, WakeEnqueued:
 		return true
 	default:
 		return false
@@ -272,10 +289,6 @@ func daemonWakeIsDelivered(outcome string) bool {
 // daemonWakeAlreadyExists is the daemon's "search before create" check for
 // wakes. Before a repeated pass steers an executor again, it searches the
 // in-memory ledger for an admission already recorded for the same obligation.
-// A miss means no wake was created yet for this (watchID, revision,
-// subscriber), so the caller may go on and deliver one. Only successful
-// receipts are recorded, so an error or a skip stays eligible for the next
-// pass (see Wake).
 func daemonWakeAlreadyExists(w *daemonWaker, obligationID string) bool {
 	if w == nil || w.deliveredKeys == nil {
 		return false
@@ -307,7 +320,7 @@ func daemonWakeInstruction(verdict string) string {
 // repairs the branch, reruns checks or merges: those belong to the subscriber
 // and to the other daemon ports.
 func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64, verdict string) error {
-	if w == nil || w.lookup == nil || w.adapters == nil {
+	if w == nil || w.lookup == nil || (w.backend == nil && w.route == nil) {
 		return errors.New("daemon: waker is not configured")
 	}
 	watch, err := w.lookup(watchID)
@@ -327,14 +340,14 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	}
 	adapter := watch.Adapter
 	if adapter == "" {
-		adapter = wake.AdapterOpenCode
+		adapter = WakeDefaultAdapter
 	}
 	text := fmt.Sprintf("%s: verdict=%s watchID=%s pr=%d headSHA=%s baseRef=%s revision=%d",
 		daemonWakeInstruction(verdict), verdict, watchID, watch.PR, watch.HeadSHA, watch.BaseRef, revision)
 	if sha := strings.TrimSpace(watch.MainHeadSHA); sha != "" {
 		text += " mainHeadSHA=" + sha
 	}
-	pointer := wake.T210WakePointer{
+	pointer := WakePointer{
 		Adapter:      adapter,
 		Target:       watch.SubscriberID,
 		WatchID:      watchID,
@@ -342,11 +355,11 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		Revision:     revision,
 		VerdictRef:   text,
 		Attempt:      1,
-		Delivery:     string(wake.T202DeliverySteer),
+		Delivery:     "steer",
 	}
 	// The address and the obligation must name the same subscriber. A lookup
 	// that substitutes the current caller's session is refused before delivery.
-	if err := wake.ValidateT210Target(pointer); err != nil {
+	if err := validateDaemonWakePointer(pointer); err != nil {
 		log.Printf("daemon: skip wake for watch %s: %v", watchID, err)
 		return fmt.Errorf("daemon: watch %s: %w", watchID, err)
 	}
@@ -359,13 +372,9 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if w.deliveredKeys == nil {
 		w.deliveredKeys = make(map[string]struct{})
 	}
-	// Search for an existing admission before creating a new wake. A repeated
-	// daemon pass over an unchanged Watch must not steer the executor twice.
 	if daemonWakeAlreadyExists(w, pointer.ObligationID) {
 		return nil
 	}
-	// The CI bridge and the daemon share one wake-identity ledger. An
-	// obligation already admitted by the bridge must not be steered again here.
 	if w.dedup != nil && w.dedup.Seen(pointer.ObligationID) {
 		observe.WakeDuplicate(watchID, revision)
 		return nil
@@ -375,11 +384,11 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 			return err
 		}
 	} else {
-		receipt, ok := wake.T210Deliver(ctx, pointer, nil, nil, w.adapters, nil)
+		receipt, ok := w.backend.Deliver(ctx, pointer)
 		if !ok {
 			return fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
 		}
-		if receipt.Outcome == wake.T210Errored {
+		if receipt.Outcome == WakeErrored {
 			return fmt.Errorf("daemon: wake %s: %s", watchID, receipt.Outcome)
 		}
 		if !daemonWakeIsDelivered(receipt.Outcome) {
@@ -391,51 +400,6 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		w.dedup.Claim(pointer.ObligationID)
 	}
 	return nil
-}
-
-// daemonWakeAdapter is the one built-in deliverer the daemon registers. It
-// implements wake.T210WakeAdapter so T210Deliver can route by the adapter name
-// carried on the pointer, and it uses only wake's primitive API for delivery.
-type daemonWakeAdapter struct {
-	api *wake.T202API
-}
-
-func (a *daemonWakeAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
-	if err := wake.ValidateT210Target(p); err != nil {
-		log.Printf("daemon: skip wake bind for %s: %v", p.ObligationID, err)
-		return "", false
-	}
-	// Defence in depth: the opencode deliverer only accepts sessions. A stale
-	// subscriber must never reach Deliver even if a caller bypasses Wake.
-	if err := ValidateWakeTarget(p.Target); err != nil {
-		log.Printf("daemon: skip wake bind for %s: %v", p.ObligationID, err)
-		return "", false
-	}
-	return wake.T210Target(p.Target), true
-}
-
-func (a *daemonWakeAdapter) Deliver(p wake.T210WakePointer, target wake.T210Target) (wake.T210Receipt, error) {
-	receipt := wake.T210Receipt{
-		ObligationID: p.ObligationID,
-		Attempt:      p.Attempt,
-		Delivery:     string(wake.T202DeliverySteer),
-	}
-	// No session substitution at the adapter boundary either.
-	if string(target) != p.Target {
-		err := fmt.Errorf("daemon: target %q is not subscriber %q", target, p.Target)
-		receipt.Outcome = wake.T210Errored
-		return receipt, err
-	}
-	if a == nil || a.api == nil {
-		receipt.Outcome = wake.T210Errored
-		return receipt, errors.New("daemon: wake API is nil")
-	}
-	if _, err := a.api.Prompt(context.Background(), string(target), p.VerdictRef, wake.T202DeliverySteer); err != nil {
-		receipt.Outcome = wake.T210Errored
-		return receipt, err
-	}
-	receipt.Outcome = wake.T210Delivered
-	return receipt, nil
 }
 
 // ---------------------------------------------------------------------------

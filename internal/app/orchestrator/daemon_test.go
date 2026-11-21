@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // daemonCheckAll is the fake CI pass. It counts calls and can fail or cancel
@@ -488,31 +486,22 @@ type daemonRecordingAdapter struct {
 	texts   []string
 }
 
-func (a *daemonRecordingAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
-	if err := wake.ValidateT210Target(p); err != nil {
-		return "", false
-	}
-	return wake.T210Target(p.Target), true
-}
-
-func (a *daemonRecordingAdapter) Deliver(p wake.T210WakePointer, target wake.T210Target) (wake.T210Receipt, error) {
+func (a *daemonRecordingAdapter) Deliver(_ context.Context, p WakePointer) (WakeReceipt, bool) {
 	a.calls++
-	a.targets = append(a.targets, string(target))
+	a.targets = append(a.targets, p.Target)
 	a.texts = append(a.texts, p.VerdictRef)
-	return wake.T210Receipt{
+	return WakeReceipt{
 		ObligationID: p.ObligationID,
 		Attempt:      p.Attempt,
 		Delivery:     p.Delivery,
-		Outcome:      wake.T210Delivered,
-	}, nil
+		Outcome:      WakeDelivered,
+	}, true
 }
 
-func daemonTestWaker(watch DaemonWatch, adapter *daemonRecordingAdapter) *daemonWaker {
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
+func daemonTestWaker(watch DaemonWatch, adapter WakeBackend) *daemonWaker {
 	return &daemonWaker{
-		lookup:   func(string) (DaemonWatch, error) { return watch, nil },
-		adapters: adapters,
+		lookup:  func(string) (DaemonWatch, error) { return watch, nil },
+		backend: adapter,
 	}
 }
 
@@ -530,7 +519,7 @@ func daemonLogs(fn func()) string {
 func TestDaemonWakerSkipsLegacySubscriber(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
 	w := daemonTestWaker(DaemonWatch{
-		ID: "w1", PR: 42, Adapter: wake.AdapterOpenCode,
+		ID: "w1", PR: 42, Adapter: WakeDefaultAdapter,
 		SubscriberID: "beacon-ci-checkall",
 	}, adapter)
 
@@ -555,7 +544,7 @@ func TestDaemonWakerSkipsLegacySubscriber(t *testing.T) {
 func TestDaemonWakerDeliversToSessionSubscriber(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
 	w := daemonTestWaker(DaemonWatch{
-		ID: "w2", PR: 7, Adapter: wake.AdapterOpenCode,
+		ID: "w2", PR: 7, Adapter: WakeDefaultAdapter,
 		SubscriberID: "ses_abc123",
 	}, adapter)
 
@@ -582,7 +571,7 @@ func TestDaemonWakerTextMatchesVerdict(t *testing.T) {
 		adapter := &daemonRecordingAdapter{}
 		watchID := fmt.Sprintf("w-text-%d", i)
 		w := daemonTestWaker(DaemonWatch{
-			ID: watchID, PR: 7, Adapter: wake.AdapterOpenCode,
+			ID: watchID, PR: 7, Adapter: WakeDefaultAdapter,
 			SubscriberID: "ses_text",
 		}, adapter)
 		if err := w.Wake(context.Background(), watchID, 1, tc.verdict); err != nil {
@@ -606,7 +595,7 @@ func TestDaemonWakerTextCarriesDiffCoordinates(t *testing.T) {
 	const base = "main"
 	w := daemonTestWaker(DaemonWatch{
 		ID: watchID, PR: 12, HeadSHA: head, BaseRef: base,
-		Adapter: wake.AdapterOpenCode, SubscriberID: "ses_diff",
+		Adapter: WakeDefaultAdapter, SubscriberID: "ses_diff",
 	}, adapter)
 	if err := w.Wake(context.Background(), watchID, 2, VerdictRetry); err != nil {
 		t.Fatalf("Wake: %v", err)
@@ -648,7 +637,7 @@ func TestDaemonWakeAlreadyExistsSearchesLedger(t *testing.T) {
 func TestDaemonWakerDeliversSameObligationOnce(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
 	w := daemonTestWaker(DaemonWatch{
-		ID: "w-repeat", PR: 42, Adapter: wake.AdapterOpenCode,
+		ID: "w-repeat", PR: 42, Adapter: WakeDefaultAdapter,
 		SubscriberID: "ses_repeat",
 	}, adapter)
 
@@ -666,7 +655,7 @@ func TestDaemonWakerDeliversSameObligationOnce(t *testing.T) {
 func TestDaemonWakerDeliversOnNewRevision(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
 	w := daemonTestWaker(DaemonWatch{
-		ID: "w-rev", PR: 7, Adapter: wake.AdapterOpenCode,
+		ID: "w-rev", PR: 7, Adapter: WakeDefaultAdapter,
 		SubscriberID: "ses_rev",
 	}, adapter)
 
@@ -684,12 +673,10 @@ func TestDaemonWakerDeliversOnNewRevision(t *testing.T) {
 // same revision must reach the new session and be deduped there on its own.
 func TestDaemonWakerDeliversForAnotherSubscriber(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
-	view := DaemonWatch{ID: "w-sub", PR: 5, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_first"}
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
+	view := DaemonWatch{ID: "w-sub", PR: 5, Adapter: WakeDefaultAdapter, SubscriberID: "ses_first"}
 	w := &daemonWaker{
-		lookup:   func(string) (DaemonWatch, error) { return view, nil },
-		adapters: adapters,
+		lookup:  func(string) (DaemonWatch, error) { return view, nil },
+		backend: adapter,
 	}
 
 	if err := w.Wake(context.Background(), "w-sub", 1, VerdictRetry); err != nil {
@@ -711,15 +698,13 @@ func TestDaemonWakerDeliversForAnotherSubscriber(t *testing.T) {
 // and subscriber each get one delivery.
 func TestDaemonWakerDeliversForAnotherWatch(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
-	view := DaemonWatch{ID: "w-one", PR: 1, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_same"}
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
+	view := DaemonWatch{ID: "w-one", PR: 1, Adapter: WakeDefaultAdapter, SubscriberID: "ses_same"}
 	w := &daemonWaker{
 		lookup: func(id string) (DaemonWatch, error) {
 			view.ID = id
 			return view, nil
 		},
-		adapters: adapters,
+		backend: adapter,
 	}
 
 	for _, id := range []string{"w-one", "w-two", "w-one"} {
@@ -737,12 +722,10 @@ func TestDaemonWakerDeliversForAnotherWatch(t *testing.T) {
 // same revision still gets exactly one delivery.
 func TestDaemonWakerRefusalDoesNotConsumeLedgerKey(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
-	view := DaemonWatch{ID: "w-block", PR: 9, Adapter: wake.AdapterOpenCode}
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
+	view := DaemonWatch{ID: "w-block", PR: 9, Adapter: WakeDefaultAdapter}
 	w := &daemonWaker{
-		lookup:   func(string) (DaemonWatch, error) { return view, nil },
-		adapters: adapters,
+		lookup:  func(string) (DaemonWatch, error) { return view, nil },
+		backend: adapter,
 	}
 
 	if err := w.Wake(context.Background(), "w-block", 1, VerdictRetry); err == nil {
@@ -766,13 +749,11 @@ func TestDaemonWakerRefusalDoesNotConsumeLedgerKey(t *testing.T) {
 // eligible so the next daemon pass can retry it.
 func TestDaemonWakerRetriesAfterError(t *testing.T) {
 	adapter := &flakyDaemonAdapter{}
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
 	w := &daemonWaker{
 		lookup: func(string) (DaemonWatch, error) {
-			return DaemonWatch{ID: "w-err", PR: 3, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_err"}, nil
+			return DaemonWatch{ID: "w-err", PR: 3, Adapter: WakeDefaultAdapter, SubscriberID: "ses_err"}, nil
 		},
-		adapters: adapters,
+		backend: adapter,
 	}
 
 	if err := w.Wake(context.Background(), "w-err", 1, VerdictRetry); err == nil {
@@ -792,21 +773,17 @@ func TestDaemonWakerRetriesAfterError(t *testing.T) {
 // flakyDaemonAdapter errors once, then reports a normal delivery.
 type flakyDaemonAdapter struct{ calls int }
 
-func (a *flakyDaemonAdapter) Bind(p wake.T210WakePointer, _ *wake.T211SessionRegistry) (wake.T210Target, bool) {
-	return wake.T210Target(p.Target), true
-}
-
-func (a *flakyDaemonAdapter) Deliver(p wake.T210WakePointer, _ wake.T210Target) (wake.T210Receipt, error) {
+func (a *flakyDaemonAdapter) Deliver(_ context.Context, p WakePointer) (WakeReceipt, bool) {
 	a.calls++
 	if a.calls == 1 {
-		return wake.T210Receipt{ObligationID: p.ObligationID, Outcome: wake.T210Errored}, errors.New("transport down")
+		return WakeReceipt{ObligationID: p.ObligationID, Outcome: WakeErrored}, true
 	}
-	return wake.T210Receipt{ObligationID: p.ObligationID, Outcome: wake.T210Delivered}, nil
+	return WakeReceipt{ObligationID: p.ObligationID, Outcome: WakeDelivered}, true
 }
 
 func TestDaemonWakerWithoutSubscriberIsError(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
-	w := daemonTestWaker(DaemonWatch{ID: "w3", PR: 8, Adapter: wake.AdapterOpenCode}, adapter)
+	w := daemonTestWaker(DaemonWatch{ID: "w3", PR: 8, Adapter: WakeDefaultAdapter}, adapter)
 
 	var wakeErr error
 	logs := daemonLogs(func() {
@@ -828,15 +805,15 @@ func TestDaemonWakerWithoutSubscriberIsError(t *testing.T) {
 
 func TestDaemonWakeSubscriberSelection(t *testing.T) {
 	legacy := DaemonSubscriber{
-		ID: "beacon-ci-checkall", Role: RoleExecutor, Adapter: wake.AdapterOpenCode,
+		ID: "beacon-ci-checkall", Role: RoleExecutor, Adapter: WakeDefaultAdapter,
 		Target: "beacon-ci-checkall",
 	}
 	orchestratorSub := DaemonSubscriber{
-		ID: "ses_orch", Role: RoleOrchestrator, Adapter: wake.AdapterOpenCode,
+		ID: "ses_orch", Role: RoleOrchestrator, Adapter: WakeDefaultAdapter,
 		Target: "ses_orch",
 	}
 	executorSub := DaemonSubscriber{
-		ID: "ses_exec", Role: RoleExecutor, Adapter: wake.AdapterOpenCode,
+		ID: "ses_exec", Role: RoleExecutor, Adapter: WakeDefaultAdapter,
 		Target: "ses_exec",
 	}
 	staleOrchestrator := DaemonSubscriber{
@@ -844,7 +821,7 @@ func TestDaemonWakeSubscriberSelection(t *testing.T) {
 		Target: "beacon-daemon-checkall",
 	}
 	fixerSub := DaemonSubscriber{
-		ID: "ses_fix", Role: RoleFixer, Adapter: wake.AdapterOpenCode,
+		ID: "ses_fix", Role: RoleFixer, Adapter: WakeDefaultAdapter,
 		Target: "ses_fix",
 	}
 
@@ -927,10 +904,8 @@ func TestDaemonWakeSubscriberSelection(t *testing.T) {
 // reaches the fixer's own session at the adapter boundary.
 func TestDaemonWakerDeliversToFixer(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
 	subs := []DaemonSubscriber{{
-		ID: "ses_fix", Role: RoleFixer, Adapter: wake.AdapterOpenCode, Target: "ses_fix",
+		ID: "ses_fix", Role: RoleFixer, Adapter: WakeDefaultAdapter, Target: "ses_fix",
 	}}
 	w := &daemonWaker{
 		lookup: func(id string) (DaemonWatch, error) {
@@ -940,7 +915,7 @@ func TestDaemonWakerDeliversToFixer(t *testing.T) {
 			}
 			return view, nil
 		},
-		adapters: adapters,
+		backend: adapter,
 	}
 
 	if err := w.Wake(context.Background(), "w-fix", 2, VerdictRetry); err != nil {
@@ -957,14 +932,12 @@ func TestDaemonWakerDeliversToFixer(t *testing.T) {
 // session through Deliver.
 func TestDaemonWakerNeverDeliversToOrchestrator(t *testing.T) {
 	adapter := &daemonRecordingAdapter{}
-	adapters := wake.T211NewAdapterRegistry()
-	adapters.Register(wake.AdapterOpenCode, adapter)
 	w := &daemonWaker{
 		lookup: func(id string) (DaemonWatch, error) {
 			view := DaemonWatch{ID: id, PR: 7}
 			subs := []DaemonSubscriber{{
 				ID: "ses_orch", Role: RoleOrchestrator,
-				Adapter: wake.AdapterOpenCode, Target: "ses_orch",
+				Adapter: WakeDefaultAdapter, Target: "ses_orch",
 			}}
 			sub, err := DaemonWakeSubscriber(subs)
 			if err != nil {
@@ -973,7 +946,7 @@ func TestDaemonWakerNeverDeliversToOrchestrator(t *testing.T) {
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
 		},
-		adapters: adapters,
+		backend: adapter,
 	}
 
 	var wakeErr error
@@ -1102,7 +1075,7 @@ func TestValidateFindingsKeepsEvidenceOnlyFinding(t *testing.T) {
 // TestDaemonWakerWithRouteUsesHook: an injected route receives the verdict
 // pointer and keeps the dedup guarantee of the built-in delivery path.
 func TestDaemonWakerWithRouteUsesHook(t *testing.T) {
-	watch := DaemonWatch{ID: "w-route", PR: 9, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_route"}
+	watch := DaemonWatch{ID: "w-route", PR: 9, Adapter: WakeDefaultAdapter, SubscriberID: "ses_route"}
 	type call struct {
 		watchID  string
 		revision uint64
@@ -1142,7 +1115,7 @@ func TestDaemonWakerWithRouteUsesHook(t *testing.T) {
 // TestDaemonWakerWithRouteErrorStaysRetryable: a route error is returned and
 // does not record a delivery, so the next pass may try again.
 func TestDaemonWakerWithRouteErrorStaysRetryable(t *testing.T) {
-	watch := DaemonWatch{ID: "w-err", PR: 3, Adapter: wake.AdapterOpenCode, SubscriberID: "ses_err"}
+	watch := DaemonWatch{ID: "w-err", PR: 3, Adapter: WakeDefaultAdapter, SubscriberID: "ses_err"}
 	boom := errors.New("route refused")
 	calls := 0
 	route := func(context.Context, DaemonWatch, uint64, string, string) error {
