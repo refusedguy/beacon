@@ -75,6 +75,7 @@ type Receiver struct {
 	secret   []byte
 	recorder DeliveryRecorder
 	clock    domain.Clock
+	records  sync.WaitGroup
 }
 
 // NewReceiver builds a loopback webhook handler. An empty secret or a nil
@@ -144,8 +145,13 @@ func (h *Receiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		At:      h.clock.Now(),
 	}
 	// ServeHTTP's request context is cancelled on return, so the detached
-	// goroutine must not inherit it.
-	go h.record(d)
+	// goroutine must not inherit it. Track the goroutine so Server.Close can
+	// drain it before returning.
+	h.records.Add(1)
+	go func() {
+		defer h.records.Done()
+		h.record(d)
+	}()
 	writeJSON(w, http.StatusAccepted, "accepted", "")
 }
 
@@ -182,6 +188,22 @@ func (h *Receiver) record(d Delivery) {
 			"delivery": d.ID,
 			"event":    d.Event,
 		})
+	}
+}
+
+// waitRecords blocks until every detached record goroutine finishes or ctx
+// expires. It reports whether all of them finished before the deadline.
+func (h *Receiver) waitRecords(ctx context.Context) bool {
+	done := make(chan struct{})
+	go func() {
+		h.records.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -225,10 +247,12 @@ type Config struct {
 	Clock      domain.Clock
 }
 
-// Server owns the loopback listener and its HTTP server. Close stops serving.
+// Server owns the loopback listener and its HTTP server. Close stops serving
+// and drains the receiver's detached record goroutines.
 type Server struct {
 	listener   net.Listener
 	httpServer *http.Server
+	receiver   *Receiver
 	addr       string
 	closeOnce  sync.Once
 	closeErr   error
@@ -254,7 +278,7 @@ func Start(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{listener: listener, addr: listener.Addr().String()}
+	s := &Server{listener: listener, addr: listener.Addr().String(), receiver: receiver}
 	s.httpServer = &http.Server{
 		Handler:           receiver,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -272,7 +296,8 @@ func Start(cfg Config) (*Server, error) {
 // Addr reports the bound 127.0.0.1:port endpoint.
 func (s *Server) Addr() string { return s.addr }
 
-// Close stops the listener and waits for in-flight requests.
+// Close stops the listener, waits for in-flight requests and drains detached
+// record goroutines under a bounded deadline.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -281,6 +306,12 @@ func (s *Server) Close() error {
 		if errors.Is(s.closeErr, context.DeadlineExceeded) {
 			s.closeErr = s.httpServer.Close()
 		}
+		// Shutdown waits for ServeHTTP, which returns before record finishes.
+		// Drain the detached goroutines under a separate deadline so a stuck
+		// recorder cannot hold Close open forever.
+		recordCtx, recordCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer recordCancel()
+		s.receiver.waitRecords(recordCtx)
 	})
 	return s.closeErr
 }
