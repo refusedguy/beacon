@@ -195,13 +195,13 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	card.Check = fields["Проверка"]
 	card.Acceptance = fields["Приёмка"]
 
-	if !oneOf(card.Type, "task", "epic", "adr", "doc", "eval") {
+	if !IsValidType(card.Type) {
 		return card, Validationf("%s: поле Тип имеет неизвестное значение %q", name, card.Type)
 	}
-	if !oneOf(card.Status, "todo", "in_progress", "done", "dropped") {
+	if !IsValidStatus(card.Status) {
 		return card, Validationf("%s: поле Статус имеет неизвестное значение %q", name, card.Status)
 	}
-	if !oneOf(card.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
+	if !IsValidPhase(card.Phase) {
 		return card, Validationf("%s: поле Фаза имеет неизвестное значение %q", name, card.Phase)
 	}
 	for key, value := range fields {
@@ -220,6 +220,39 @@ func oneOf(v string, allowed ...string) bool {
 	}
 	return false
 }
+
+// Допустимые значения полей Тип, Статус и Фаза определены один раз и живут
+// только здесь. ParseCard проверяет их через IsValidType, IsValidStatus и
+// IsValidPhase. Другие подсистемы переиспользуют те же множества через Valid*
+// функции, поэтому наборы статусов и фаз не расходятся между парсером, гейтом
+// документации и CLI.
+
+var (
+	cardTypes    = []string{"task", "epic", "adr", "doc", "eval"}
+	cardStatuses = []string{"todo", "in_progress", "done", "dropped"}
+	cardPhases   = []string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}
+)
+
+// ValidTypes возвращает все значения поля Тип, которые принимает ParseCard.
+// Возвращается копия. Изменение результата не меняет каноническое множество.
+func ValidTypes() []string { return append([]string(nil), cardTypes...) }
+
+// ValidStatuses возвращает все значения поля Статус, которые принимает ParseCard.
+// Возвращается копия. Изменение результата не меняет каноническое множество.
+func ValidStatuses() []string { return append([]string(nil), cardStatuses...) }
+
+// ValidPhases возвращает все значения поля Фаза, которые принимает ParseCard.
+// Возвращается копия. Изменение результата не меняет каноническое множество.
+func ValidPhases() []string { return append([]string(nil), cardPhases...) }
+
+// IsValidType сообщает, принимает ли ParseCard значение поля Тип.
+func IsValidType(v string) bool { return oneOf(v, cardTypes...) }
+
+// IsValidStatus сообщает, принимает ли ParseCard значение поля Статус.
+func IsValidStatus(v string) bool { return oneOf(v, cardStatuses...) }
+
+// IsValidPhase сообщает, принимает ли ParseCard значение поля Фаза.
+func IsValidPhase(v string) bool { return oneOf(v, cardPhases...) }
 
 // splitList разбирает список через запятую. Значение «нет» даёт пустой список.
 func splitList(v string) []string {
