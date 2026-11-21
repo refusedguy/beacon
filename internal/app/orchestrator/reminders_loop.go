@@ -7,6 +7,8 @@ import (
 	"context"
 	"time"
 
+	// ARDH-15: observe is the documented cross-cutting exception. The loop
+	// reports a failed pass here instead of threading a logger through callers.
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 

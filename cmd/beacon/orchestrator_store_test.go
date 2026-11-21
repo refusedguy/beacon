@@ -1,10 +1,11 @@
-package orchestrator
+package main
 
 import (
 	"context"
 	"path/filepath"
 	"testing"
 
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -26,7 +27,7 @@ func TestDBStoreCloseWatchMarksMerged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewDBStore(nil, db)
+	s := newDBOrchestratorStore(nil, db)
 	if err := s.CloseWatch(context.Background(), w.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +76,7 @@ func TestDBStoreMergedPRReadsLoadedWatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewDBStore(nil, db)
+	s := newDBOrchestratorStore(nil, db)
 	merged, err := s.MergedPR(context.Background(), 77)
 	if err != nil || !merged {
 		t.Fatalf("MergedPR(77) = %t, %v, want true", merged, err)
@@ -103,8 +104,8 @@ func TestDBStoreHoldWatchPersistsWaitReason(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := NewDBStore(nil, db)
-	verdict := WaitDependencyVerdict("wait_for:#77")
+	s := newDBOrchestratorStore(nil, db)
+	verdict := orchestrator.WaitDependencyVerdict("wait_for:#77")
 	if err := s.HoldWatch(context.Background(), w.ID, verdict); err != nil {
 		t.Fatal(err)
 	}
