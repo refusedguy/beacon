@@ -6,6 +6,7 @@
 package chaos
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 const (
@@ -344,4 +346,121 @@ func TestRestartPreservesObligations(t *testing.T) {
 
 	t.Logf("restart: duration=%s budget=%s obligations=2 pending=%d receipts=%d post_restart_effects=0",
 		startup, startupBudget, len(afterPending), finalReceipts)
+}
+
+// TestSteerDedupAcrossRestart is the live probe for BCX-56. A steer goes to a
+// real ses_ pointer, the process restarts with an empty in-memory ledger, and
+// the repeated pointer must not start a second prompt. The SQLite store is the
+// real durable dedup. SessionActiveFunc and PromptFunc are the only test
+// doubles, and they report whether a steer reached the session. This is not the
+// fake host from eval 18_w09: the dedup decision and the delivery fact come
+// from the same store and adapter that run in production.
+func TestSteerDedupAcrossRestart(t *testing.T) {
+	env := newChaosEnv(t)
+	defer env.close(t)
+
+	const (
+		sessionID = "ses_bcx56_live"
+		watchID   = "watch-bcx56"
+		revision  = 1
+	)
+	o := env.seedObligation(t, watchID, revision, sessionID)
+	p := domain.WakePayload{
+		WatchID:      watchID,
+		ObligationID: o.ID,
+		Revision:     revision,
+		Verdict:      "ready",
+	}
+
+	var prompts int
+	var deliveries []string
+	newDeliverer := func() *wake.OpenCodeDeliverer {
+		return &wake.OpenCodeDeliverer{
+			Runner: func(context.Context, ...string) ([]byte, error) {
+				t.Fatal("CLI fallback must not run when PromptFunc is installed")
+				return nil, nil
+			},
+			SessionActiveFunc: func(context.Context, string) (bool, bool, error) {
+				return false, true, nil // idle and alive, so the wake is a steer
+			},
+			PromptFunc: func(_ context.Context, sid, _ string, delivery string) error {
+				if sid != sessionID {
+					t.Fatalf("prompt session = %q, want %q", sid, sessionID)
+				}
+				prompts++
+				deliveries = append(deliveries, delivery)
+				return nil
+			},
+			Obligations: env.db,
+		}
+	}
+
+	// First delivery: one steer and one durable delivery fact.
+	if err := newDeliverer().Deliver(context.Background(), sessionID, p); err != nil {
+		t.Fatalf("first Deliver: %v", err)
+	}
+	if prompts != 1 || len(deliveries) != 1 || deliveries[0] != "steer" {
+		t.Fatalf("first delivery: prompts=%d deliveries=%v, want one steer", prompts, deliveries)
+	}
+	before, err := env.db.Obligation(o.ID)
+	if err != nil {
+		t.Fatalf("Obligation after first delivery: %v", err)
+	}
+	if before.DeliveredAt.IsZero() {
+		t.Fatal("first delivery did not persist deliveredAt")
+	}
+	if len(before.Attempts) != 1 {
+		t.Fatalf("attempts after first delivery = %d, want 1", len(before.Attempts))
+	}
+
+	// Restart: fresh in-memory ledger, same SQLite store.
+	env.close(t)
+	start := time.Now()
+	env.reopen(t)
+	if startup := time.Since(start); startup > startupBudget {
+		t.Fatalf("restart took %s, want <= %s", startup, startupBudget)
+	}
+
+	// The repeated pointer must not start a second steer.
+	if err := newDeliverer().Deliver(context.Background(), sessionID, p); err != nil {
+		t.Fatalf("repeat Deliver after restart: %v", err)
+	}
+	if prompts != 1 {
+		t.Fatalf("prompt calls after restart = %d, want 1", prompts)
+	}
+	after, err := env.db.Obligation(o.ID)
+	if err != nil {
+		t.Fatalf("Obligation after repeat: %v", err)
+	}
+	if !after.DeliveredAt.Equal(before.DeliveredAt) {
+		t.Fatalf("deliveredAt changed on repeat: %v -> %v", before.DeliveredAt, after.DeliveredAt)
+	}
+	if len(after.Attempts) != 1 {
+		t.Fatalf("attempts after repeat = %d, want 1", len(after.Attempts))
+	}
+
+	// Negative control: a process with no durable store forgets the first
+	// steer, so the repeat starts a second one. This proves the store, not
+	// luck, stops the duplicate.
+	var negativePrompts int
+	newNoStore := func() *wake.OpenCodeDeliverer {
+		return &wake.OpenCodeDeliverer{
+			PromptFunc: func(context.Context, string, string, string) error {
+				negativePrompts++
+				return nil
+			},
+		}
+	}
+	if err := newNoStore().Deliver(context.Background(), sessionID, p); err != nil {
+		t.Fatalf("negative first Deliver: %v", err)
+	}
+	if err := newNoStore().Deliver(context.Background(), sessionID, p); err != nil {
+		t.Fatalf("negative repeat Deliver: %v", err)
+	}
+	if negativePrompts != 2 {
+		t.Fatalf("negative control prompts = %d, want 2 without the durable store", negativePrompts)
+	}
+
+	t.Logf("live steer dedup: prompts=%d deliveredAt=%s attempts=%d negative-prompts=%d",
+		prompts, after.DeliveredAt.Format(time.RFC3339Nano), len(after.Attempts), negativePrompts)
 }
