@@ -41,6 +41,11 @@ const (
 	// SchemaVersion is stamped on envelopes that reach the projection without
 	// one. Clients switch payload decoding on this number (ADR 0012).
 	SchemaVersion = 1
+
+	// MaxCursorLength bounds an accepted cursor. The largest uint64 decimal
+	// has 20 digits, so a longer Last-Event-ID or replay value cannot be a
+	// seq and is rejected before it reaches the journal.
+	MaxCursorLength = 20
 )
 
 // ErrInvalidCursor marks a Last-Event-ID or replay value that is not a seq.
@@ -162,7 +167,8 @@ func (p *Projection) ReplayAndLive(ctx context.Context, cursor uint64, live <-ch
 // CursorFromRequest resolves the replay cursor for an SSE request. The
 // Last-Event-ID header wins over the replay query parameter (BS.17). A
 // malformed header is an error: falling back to the query could resend events
-// under an id the client has already passed.
+// under an id the client has already passed. Both values go through the same
+// length and digit check, so a forged cursor cannot reach the journal.
 func CursorFromRequest(r *http.Request) (uint64, error) {
 	if r == nil {
 		return 0, fmt.Errorf("%w: nil request", ErrInvalidCursor)
@@ -181,6 +187,14 @@ func CursorFromRequest(r *http.Request) (uint64, error) {
 }
 
 func parseCursor(raw string) (uint64, error) {
+	if len(raw) > MaxCursorLength {
+		return 0, fmt.Errorf("%w: cursor longer than %d characters", ErrInvalidCursor, MaxCursorLength)
+	}
+	for i := 0; i < len(raw); i++ {
+		if raw[i] < '0' || raw[i] > '9' {
+			return 0, fmt.Errorf("%w: %q: non-digit character", ErrInvalidCursor, raw)
+		}
+	}
 	n, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%w: %q: %v", ErrInvalidCursor, raw, err)

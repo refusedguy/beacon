@@ -147,6 +147,46 @@ func TestCursorFromRequest(t *testing.T) {
 	}
 }
 
+func TestCursorFromRequestRejectsLongCursor(t *testing.T) {
+	r := httptest.NewRequest("GET", "/api/v1/events?replay=3", nil)
+	r.Header.Set("Last-Event-ID", strings.Repeat("1", MaxCursorLength+1))
+	if _, err := CursorFromRequest(r); !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("long header error = %v, want ErrInvalidCursor without falling back to replay", err)
+	}
+}
+
+func TestCursorFromRequestEmptyID(t *testing.T) {
+	withReplay := httptest.NewRequest("GET", "/api/v1/events?replay=3", nil)
+	withReplay.Header.Set("Last-Event-ID", "  ")
+	if got, err := CursorFromRequest(withReplay); err != nil || got != 3 {
+		t.Fatalf("blank header + query = %d, %v; want 3 from replay", got, err)
+	}
+
+	noReplay := httptest.NewRequest("GET", "/api/v1/events", nil)
+	noReplay.Header.Set("Last-Event-ID", "")
+	if got, err := CursorFromRequest(noReplay); err != nil || got != 0 {
+		t.Fatalf("empty header, no query = %d, %v; want 0", got, err)
+	}
+}
+
+func TestCursorFromRequestValidCursorAtLengthLimit(t *testing.T) {
+	const maxUint64 = "18446744073709551615"
+	r := httptest.NewRequest("GET", "/api/v1/events", nil)
+	r.Header.Set("Last-Event-ID", maxUint64)
+	got, err := CursorFromRequest(r)
+	if err != nil || got != 18446744073709551615 {
+		t.Fatalf("max-length cursor = %d, %v; want %s", got, err, maxUint64)
+	}
+}
+
+func TestCursorFromRequestRejectsNonDigitCursor(t *testing.T) {
+	r := httptest.NewRequest("GET", "/api/v1/events?replay=3", nil)
+	r.Header.Set("Last-Event-ID", "+9")
+	if _, err := CursorFromRequest(r); !errors.Is(err, ErrInvalidCursor) {
+		t.Fatalf("non-digit header error = %v, want ErrInvalidCursor", err)
+	}
+}
+
 // midReplayReader publishes a live event from inside the first replay page,
 // the way a writer appending while the page is read would.
 type midReplayReader struct {
