@@ -306,8 +306,6 @@ func parseClaimCard(filePath string, data []byte) (claimCard, error) {
 			c.Status = fm[2]
 		case "Фаза":
 			c.Phase = fm[2]
-		case "Тип":
-			c.Type = fm[2]
 		case "Агент":
 			c.Agent = fm[2]
 		case "Время":
