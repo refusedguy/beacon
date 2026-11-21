@@ -1,12 +1,12 @@
 # BCX-39. Настроить WAL checkpoint и ограничить рост файла
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/store/db.go
 Зависимости: 
 Ссылка: 
-Агент: нет
-Время: нет
+Агент: exe154
+Время: 2026-11-21T18:09:06Z
 Цель: Добавить synchronous, wal_autocheckpoint и passive checkpoint после архивации.
 Контекст: Источник: docs/research/sqlite-perf-audit.md, топ-10 строка 9. db.go:96-177 задаёт только busy_timeout и journal_mode(WAL). Четыре соединения чтения с длинными запросами ReadAfter и queryWatches удерживают старую кадровую страницу и не дают WAL сжаться. Базовый замер и приоритет из отчёта: P2.
 Шаги: Задать synchronous=NORMAL после решения владельца о потере питания. Подобрать wal_autocheckpoint. Делать passive checkpoint после ArchiveClosedWatches. Ограничить время длинных чтений. Измерить размер WAL до и после.
