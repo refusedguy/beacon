@@ -88,9 +88,18 @@ var (
 
 // Open opens path, enables WAL, applies pending migrations and starts the
 // single writer. PRAGMAs are set in the DSN so modernc applies them to every
-// new connection; busy_timeout comes first (report G §3). Writes reach the
-// file directly, as before; use OpenProduction for a store whose writes are
-// redacted and observed.
+// new connection; busy_timeout comes first (report G §3).
+//
+// WAL uses synchronous=NORMAL: frames are synced at checkpoint instead of on
+// every commit, so a power loss can roll back transactions committed since the
+// last checkpoint. The store keeps that tradeoff deliberately; the perf audit
+// (sqlite-perf-audit.md, top-10 row 9) recommends it. wal_autocheckpoint runs a
+// passive checkpoint every 1000 pages to bound WAL growth during ordinary
+// writes. Long readers can still pin the oldest frame, so callers run an
+// explicit Checkpoint after a pass that frees pages.
+//
+// Writes reach the file directly, as before; use OpenProduction for a store
+// whose writes are redacted and observed.
 func Open(path string) (*DB, error) {
 	return open(path, driverName, false)
 }
@@ -185,7 +194,10 @@ func openPool(path string, maxConns int, drv string) (*sql.DB, error) {
 
 func dsn(path string) string {
 	return "file:" + path +
-		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
+		"&_pragma=synchronous(NORMAL)" +
+		"&_pragma=wal_autocheckpoint(1000)"
 }
 
 // Version returns the schema version the store was opened with.
@@ -200,6 +212,23 @@ func journalMode(ctx context.Context, db *sql.DB) (string, error) {
 	var mode string
 	err := db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode)
 	return mode, err
+}
+
+// Checkpoint runs a passive WAL checkpoint so committed frames return to the
+// database without waiting for readers. PASSIVE never blocks readers or the
+// single writer; a busy result only defers the work to the next autocheckpoint
+// or explicit call. Callers run this after a pass that frees pages, such as an
+// archive cycle, to keep long reads from pinning the oldest frame forever.
+func (d *DB) Checkpoint(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var busy int
+	if err := d.writeDB.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").
+		Scan(&busy, new(int), new(int)); err != nil {
+		return fmt.Errorf("store: checkpoint: %w", err)
+	}
+	return nil
 }
 
 // Close drains pending writes and releases the pools. Repeated calls are safe.
