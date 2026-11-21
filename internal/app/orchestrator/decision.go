@@ -114,6 +114,18 @@ type CIState struct {
 	Verdict string `json:"verdict,omitempty"`
 }
 
+// DepthDecision is the app-layer mirror of the domain depth decision. The
+// layer matrix (ADR 0005) forbids internal/app -> internal/domain, so the
+// values are repeated here and the composition root fills them from a stored
+// domain.Descent. Empty values leave existing decisions unchanged.
+type DepthDecision struct {
+	Layer      string `json:"layer"`
+	Hypothesis string `json:"hypothesis,omitempty"`
+	Falsifier  string `json:"falsifier,omitempty"`
+	Evidence   string `json:"evidence,omitempty"`
+	Steps      int    `json:"steps"`
+}
+
 // Decision is the single outcome of one orchestrator pass for one Watch.
 // WatchID, PR and Revision travel with every outcome, so the caller can key
 // merges, wakes and retries on (watchID, revision) and stay idempotent.
@@ -138,6 +150,10 @@ type Decision struct {
 	SourceRef string `json:"sourceRef,omitempty"`
 	// SourceError carries the resolver error when Kind is SOURCE_ERROR.
 	SourceError string `json:"sourceError,omitempty"`
+	// Depth carries the depth.look-below decision for this outcome. It is nil
+	// for outcomes that did not reach a descent, so existing decisions keep
+	// their wire shape.
+	Depth *DepthDecision `json:"depth,omitempty"`
 }
 
 // Source is the port a rules check reads its candidate files from. The gate
