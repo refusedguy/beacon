@@ -214,7 +214,12 @@ type Bridge struct {
 	rebaser        Rebaser
 	rebaseMu       sync.Mutex
 	rebased        map[string]bool
-	tracer         observe.Tracer
+	// refreshMu and refreshing form a single-flight guard: at most one
+	// Refresh runs at a time, so a ticker tick cannot duplicate the CI polls
+	// of a Refresh already in flight (a manual call or an earlier tick).
+	refreshMu  sync.Mutex
+	refreshing bool
+	tracer     observe.Tracer
 	// generations stamps a fresh generation on every Watch an unblock returns
 	// to watching (T3.457). It is optional: a bridge built before the port was
 	// added keeps its block and unblock behaviour, while one wired with the same
@@ -554,6 +559,20 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	if b == nil || b.store == nil || b.ci == nil {
 		return 0
 	}
+	// Single-flight guard: drop a concurrent Refresh instead of running a
+	// second batch of CI polls against the same watches.
+	b.refreshMu.Lock()
+	if b.refreshing {
+		b.refreshMu.Unlock()
+		return 0
+	}
+	b.refreshing = true
+	b.refreshMu.Unlock()
+	defer func() {
+		b.refreshMu.Lock()
+		b.refreshing = false
+		b.refreshMu.Unlock()
+	}()
 	// One span covers the whole refresh, not one per Watch: fifteen Watches
 	// produce a single beacon.ci.refresh span. The child context lets any
 	// deeper wake hook nest under it (T3.394).
