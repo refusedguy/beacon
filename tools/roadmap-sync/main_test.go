@@ -320,6 +320,30 @@ func TestIDPatternParsesRSAndQCards(t *testing.T) {
 	}
 }
 
+func TestIDPatternParsesCleanAndArdhCards(t *testing.T) {
+	for name, want := range map[string]string{
+		"CLEAN-01.md":       "CLEAN-01",
+		"ARDH-23.md":        "ARDH-23",
+		"CLEAN-05-notes.md": "CLEAN-05",
+	} {
+		match := cardFileRe.FindStringSubmatch(name)
+		if match == nil || match[1] != want {
+			t.Errorf("cardFileRe(%q) = %v, want ID %q", name, match, want)
+		}
+	}
+
+	subject := "docs: add cleanup cards (CLEAN-01, ARDH-23) (#1000)"
+	scan := scanGitLog([]string{subject})
+	for _, id := range []string{"CLEAN-01", "ARDH-23"} {
+		if !scan.ids[id] {
+			t.Errorf("scanGitLog merged IDs missing %s: %v", id, scan.ids)
+		}
+	}
+	if len(scan.ids) != 2 {
+		t.Errorf("scanGitLog merged IDs = %v, want exactly two cleanup IDs", scan.ids)
+	}
+}
+
 func TestReadCardsIncludesRSAndQ(t *testing.T) {
 	repo := t.TempDir()
 	fixtures := map[string]string{

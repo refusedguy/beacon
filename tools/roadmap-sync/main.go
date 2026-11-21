@@ -33,8 +33,9 @@ var (
 	// The same ID grammar covers commit subjects and card filenames. Slugged
 	// filenames such as T4.7-rollback-drill.md keep the ID T4.7. RS cards carry
 	// an optional generation number (RS-CMP-01, RS2-WK-03) and Q cards a queue
-	// letter (Q-A-01), so both families use the same three-part shape.
-	idPattern  = `BS\.[0-9]+|HD-[0-9]+|T[0-9]+\.[0-9]+|S[1-7]\.[0-9]+|WIRING-[0-9]+|UI-[0-9]+|RS[0-9]*-[A-Z]+-[0-9]+|Q-[A-Z]-[0-9]+`
+	// letter (Q-A-01), so both families use the same three-part shape. CLEAN
+	// and ARDH are the two families produced from the research audits.
+	idPattern  = `BS\.[0-9]+|HD-[0-9]+|T[0-9]+\.[0-9]+|S[1-7]\.[0-9]+|WIRING-[0-9]+|UI-[0-9]+|RS[0-9]*-[A-Z]+-[0-9]+|Q-[A-Z]-[0-9]+|CLEAN-[0-9]+|ARDH-[0-9]+`
 	cardIDRe   = regexp.MustCompile(`\b(` + idPattern + `)\b`)
 	cardFileRe = regexp.MustCompile(`^(` + idPattern + `)(?:-[A-Za-z0-9-]+)?\.md$`)
 
