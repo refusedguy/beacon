@@ -1,4 +1,4 @@
-# ADR 194: Адрес сервера в connection.json
+# ADR 289: Адрес сервера в connection.json
 
 Статус: proposed
 

@@ -1,4 +1,4 @@
-# ADR 89: Два источника указателей: SpoolSource и McpPullSource
+# ADR 273: Два источника указателей: SpoolSource и McpPullSource
 
 Статус: accepted
 

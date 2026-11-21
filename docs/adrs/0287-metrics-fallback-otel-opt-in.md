@@ -1,4 +1,4 @@
-# ADR 192: /metrics как fallback, OTel по явному opt-in
+# ADR 287: /metrics как fallback, OTel по явному opt-in
 
 Статус: proposed
 

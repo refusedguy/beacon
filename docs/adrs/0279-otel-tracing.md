@@ -1,4 +1,4 @@
-# ADR 185: OTel tracing
+# ADR 279: OTel tracing
 
 Статус: accepted
 

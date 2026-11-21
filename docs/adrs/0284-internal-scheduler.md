@@ -1,4 +1,4 @@
-# ADR 189: Внутренний планировщик /internal/scheduler
+# ADR 284: Внутренний планировщик /internal/scheduler
 
 Статус: proposed
 

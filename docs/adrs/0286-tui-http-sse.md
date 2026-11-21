@@ -1,4 +1,4 @@
-# ADR 191: TUI как тонкий клиент HTTP и SSE
+# ADR 286: TUI как тонкий клиент HTTP и SSE
 
 Статус: proposed
 

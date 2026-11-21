@@ -1,4 +1,4 @@
-# ADR 71: Интерфейс WakeAdapter и непрозрачные цели
+# ADR 271: Интерфейс WakeAdapter и непрозрачные цели
 
 Статус: accepted
 
