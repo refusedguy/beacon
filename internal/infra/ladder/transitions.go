@@ -132,6 +132,10 @@ type Marker struct {
 	AckContext  string     `json:"ackContext,omitempty"`
 	AckReviewer string     `json:"ackReviewer,omitempty"`
 	Held        *gateHold  `json:"held,omitempty"`
+	// HumanAlerted records that the episode already notified a human. The
+	// first revoke sets it; later revokes of the same episode do not issue a
+	// second alert. It lives on the marker so a restart cannot reset it.
+	HumanAlerted bool `json:"humanAlerted,omitempty"`
 }
 
 // Receipt is the fact produced by the adapter boundary (T3.6). The wire shape
@@ -339,6 +343,11 @@ func (l *Ladder) Stage(ctx context.Context, o domain.Obligation, verdict domain.
 		if o.StagedAt.IsZero() {
 			o.StagedAt = at
 		}
+		// Rung 1 is the initial pointer and no retry is armed yet. These live
+		// on Obligation so saveObligation persists them with the verdict.
+		o.DeliveryRung = 1
+		o.DeliveryAttempts = 1
+		o.NextRetryAt = time.Time{}
 		_, exists, err := loadObligation(tx, o.ID)
 		if err != nil {
 			return err
@@ -449,6 +458,16 @@ func (l *Ladder) Record(ctx context.Context, r Receipt) error {
 			m.NextAt = m.EvidenceAt
 		}
 
+		// Keep the delivery markers on the obligation so beacon inspect shows
+		// the current rung, the attempts seen and the armed retry time.
+		o.DeliveryRung = m.Attempts
+		o.DeliveryAttempts = len(o.Attempts)
+		if m.Branch == domain.OutcomeTransportFailed {
+			o.NextRetryAt = m.NextAt
+		} else {
+			o.NextRetryAt = time.Time{}
+		}
+
 		if exists {
 			if err := saveObligation(tx, o); err != nil {
 				return err
@@ -456,6 +475,104 @@ func (l *Ladder) Record(ctx context.Context, r Receipt) error {
 		}
 		return appendMarker(tx, m, "receipt", r.At)
 	})
+}
+
+// RevokeResult is the work a caller must do after a revoke. HumanAlert is true
+// only for the first revoke of an episode, so one incident never notifies a
+// human twice. Retry is true when the revoke armed the next delivery.
+type RevokeResult struct {
+	ObligationID string
+	WatchID      string
+	HumanAlert   bool
+	Retry        bool
+	Rung         int
+	Attempts     int
+	NextAt       time.Time
+}
+
+// Revoke consumes a failed delivery reported by a domain revoke event. It
+// records the failure on the obligation, advances the delivery rung and arms
+// the next retry from the rung it replaces. The first revoke of an episode
+// emits one human alert; later revokes of the same episode do not. A retry is
+// armed only when a revoke arrives, so retries stay tied to revokes. Revokes
+// on a stopped, paused, approved or escalated episode are no-ops.
+func (l *Ladder) Revoke(ctx context.Context, r domain.DeliveryRevoke, at time.Time) (RevokeResult, error) {
+	var out RevokeResult
+	if r.ObligationID == "" {
+		return out, errors.New("ladder: revoke: empty obligation id")
+	}
+	outcome := r.Outcome
+	if outcome == "" {
+		outcome = domain.OutcomeTransportFailed
+	}
+	switch outcome {
+	case domain.OutcomePosted, domain.OutcomeTransportFailed, domain.OutcomeIndeterminate:
+	default:
+		return out, fmt.Errorf("ladder: revoke: unknown outcome %q", r.Outcome)
+	}
+
+	err := l.writer.Write(ctx, func(tx *sql.Tx) error {
+		if err := ensureJournal(tx); err != nil {
+			return err
+		}
+		m, err := currentMarker(tx, r.ObligationID)
+		if err != nil {
+			return err
+		}
+		if m.Status != StatusActive {
+			return nil
+		}
+		o, exists, err := loadObligation(tx, r.ObligationID)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotStaged
+		}
+
+		// One alert per episode. The flag is on the marker, so a restart or a
+		// repeated revoke cannot open a second alert.
+		out.HumanAlert = !m.HumanAlerted
+		m.HumanAlerted = true
+
+		// Every revoke is a failure report, so it counts as a delivery try
+		// even after the retry cap is spent. The rung stays capped.
+		o.DeliveryAttempts++
+
+		nextRung := m.Attempts + 1
+		if nextRung <= MaxAttempts {
+			idx := nextRung - 2
+			nextAt := m.StagedAt.Add(retryDelays[idx] + l.jitter(nextRung))
+			m.Attempts = nextRung
+			m.NextAt = nextAt
+			o.DeliveryRung = nextRung
+			o.NextRetryAt = nextAt
+			out.Retry = true
+			out.NextAt = nextAt
+		} else {
+			// The retry cap is spent. The evidence check owns the rest and no
+			// further retry is armed.
+			m.NextAt = m.EvidenceAt
+			o.DeliveryRung = MaxAttempts
+			o.NextRetryAt = time.Time{}
+		}
+
+		if err := saveObligation(tx, o); err != nil {
+			return err
+		}
+		if err := appendMarker(tx, m, "revoke", at); err != nil {
+			return err
+		}
+		out.ObligationID = m.ObligationID
+		out.WatchID = m.WatchID
+		out.Rung = o.DeliveryRung
+		out.Attempts = o.DeliveryAttempts
+		return nil
+	})
+	if err != nil {
+		return RevokeResult{}, err
+	}
+	return out, nil
 }
 
 // Due returns the active markers whose next timer has fired by now. It does

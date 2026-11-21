@@ -309,6 +309,17 @@ type Obligation struct {
 	ReadAt          time.Time `json:"readAt"`
 	EscalatedAt     time.Time `json:"escalatedAt"`
 	EscalationLevel int       `json:"escalationLevel"`
+	// DeliveryRung is the explicit step of the wake delivery ladder. Rung 1 is
+	// the initial pointer, rungs 2 and 3 are its two retries (ADR 0017). Zero
+	// means the obligation has not been staged for delivery.
+	DeliveryRung int `json:"deliveryRung,omitempty"`
+	// DeliveryAttempts counts every wake send for the obligation, including the
+	// initial pointer and every failed try closed by a revoke. It can pass the
+	// retry cap, which is why an incident needs a single human alert.
+	DeliveryAttempts int `json:"deliveryAttempts,omitempty"`
+	// NextRetryAt is the instant the next retry is due. It is zero when no
+	// retry is armed.
+	NextRetryAt time.Time `json:"nextRetryAt,omitempty"`
 }
 
 // Pointer is the payload sent through a notification channel. It carries no
