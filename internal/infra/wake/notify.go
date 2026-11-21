@@ -38,6 +38,42 @@ type NotificationSink interface {
 	Notify(ctx context.Context, n Notification) error
 }
 
+// MultiNotificationSink fans one notification out to every sink. Nil sinks are
+// dropped at construction so an optional transport needs no guard at each call
+// site. Every sink is tried even when one fails, and the first error is returned
+// so the observe decorator can log it.
+type MultiNotificationSink struct {
+	Sinks []NotificationSink
+}
+
+// NewMultiNotificationSink builds a fan-out sink from the given sinks.
+func NewMultiNotificationSink(sinks ...NotificationSink) *MultiNotificationSink {
+	all := make([]NotificationSink, 0, len(sinks))
+	for _, s := range sinks {
+		if s != nil {
+			all = append(all, s)
+		}
+	}
+	return &MultiNotificationSink{Sinks: all}
+}
+
+// Notify delivers n to each sink in order.
+func (m *MultiNotificationSink) Notify(ctx context.Context, n Notification) error {
+	if m == nil {
+		return nil
+	}
+	var firstErr error
+	for _, sink := range m.Sinks {
+		if sink == nil {
+			continue
+		}
+		if err := sink.Notify(ctx, n); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // FormatNotification renders one notification as plain text. It is a pure
 // function: redaction and transport belong to the adapter, not to the shape of
 // the message.

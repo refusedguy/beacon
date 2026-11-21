@@ -61,6 +61,9 @@ var (
 	upTelegramFor  = func() *wake.TelegramNotifySink {
 		return wake.NewTelegramNotifySink(wake.TelegramConfigFromEnv(nil))
 	}
+	upNtfyFor = func() *wake.NtfyNotifySink {
+		return wake.NewNtfyNotifySink(wake.NtfyConfigFromEnv(nil))
+	}
 )
 
 // channelMessagePort is the narrow view of the channel ingress the loop uses.
@@ -109,10 +112,11 @@ func newUpDecisionPort(dir string) upDecisionPort {
 	return upDecisionAdapter{store: humanStoreFor(dir)}
 }
 
-// installUpNotifications tees the three human-attention observe events to
-// Telegram. The typed Recorder variant keeps histogram support; the generic
-// variant covers a test sink or the no-op default.
-func installUpNotifications(sink *wake.TelegramNotifySink) func() {
+// installUpNotifications tees the three human-attention observe events to every
+// configured notification sink, Telegram and ntfy. The typed Recorder variant
+// keeps histogram support; the generic variant covers a test sink or the no-op
+// default.
+func installUpNotifications(sink wake.NotificationSink) func() {
 	previous := observe.Default()
 	var next observe.Sink
 	switch p := previous.(type) {
@@ -180,7 +184,8 @@ func runUp(c *CLI, args []string) int {
 	}
 
 	tg := upTelegramFor()
-	restore := installUpNotifications(tg)
+	ntfy := upNtfyFor()
+	restore := installUpNotifications(wake.NewMultiNotificationSink(tg, ntfy))
 	defer restore()
 	decisions := upDecisionsFor(dir)
 	status := upStatusPort(db)
@@ -208,8 +213,8 @@ func runUp(c *CLI, args []string) int {
 		return 0
 	}
 
-	fmt.Fprintf(c.out, "beacon up: telegram=%s channels=%s interval=%s\n",
-		upNotifyState(tg), upChannelState(), *interval)
+	fmt.Fprintf(c.out, "beacon up: telegram=%s ntfy=%s channels=%s interval=%s\n",
+		upNotifyState(tg), upNtfyState(ntfy), upChannelState(), *interval)
 	fmt.Fprint(c.out, renderUpStatus(ctx, status))
 
 	ticker := time.NewTicker(*interval)
@@ -227,6 +232,13 @@ func runUp(c *CLI, args []string) int {
 
 func upNotifyState(tg *wake.TelegramNotifySink) string {
 	if tg != nil && tg.Configured() {
+		return "on"
+	}
+	return "off"
+}
+
+func upNtfyState(ntfy *wake.NtfyNotifySink) string {
+	if ntfy != nil && ntfy.Configured() {
 		return "on"
 	}
 	return "off"
