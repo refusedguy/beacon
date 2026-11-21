@@ -54,6 +54,9 @@ var (
 	// ErrNoPromptPort asks Deliver to use the CLI fallback. It is the honest
 	// answer when service.json is absent under a plain TUI.
 	ErrNoPromptPort = errors.New("wake: no http prompt port")
+	// ErrExportLeak refuses a wake whose envelope trips an export policy. No
+	// prompt reaches the session, and Deliver releases its lease on the way out.
+	ErrExportLeak = errors.New("wake: export leak")
 )
 
 const (
@@ -85,6 +88,10 @@ type OpenCodeDeliverer struct {
 	// verified composer/draft delivery (T3.244). A nil value keeps the default
 	// behavior: the whole Envelope is steered into the session at once.
 	DraftAware domain.WakeDeliverer
+	// ExportPolicy guards the wake text before it leaves the process. Nil
+	// keeps today's envelope untouched (T3.344). A set policy scans the text
+	// at the context-pack boundary before any transport call.
+	ExportPolicy *domain.ExportPolicy
 
 	mu   sync.Mutex
 	seen map[wakeDeliveryKey]struct{}
@@ -271,6 +278,12 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	}
 
 	text := Envelope(p)
+	if d.ExportPolicy != nil {
+		findings := domain.ScanExport(domain.BoundaryContextPack, strings.Split(text, "\n"), *d.ExportPolicy)
+		if len(findings) > 0 {
+			return fmt.Errorf("%w: %v", ErrExportLeak, findings)
+		}
+	}
 	if d.DraftAware != nil {
 		// Draft-aware mode stages the pointer into the composer and presses
 		// Enter only after the composer text matches the expected Envelope.
