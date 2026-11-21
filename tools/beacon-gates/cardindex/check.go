@@ -34,8 +34,9 @@ const (
 var (
 	// These rules mirror tools/roadmap-sync so the rebuilt bytes match the
 	// generator exactly. A change to the generator must be mirrored here.
+	// CLEAN and ARDH come from the research audit batches.
 	prSuffixRe     = regexp.MustCompile(`\(#([0-9]+)\)`)
-	idPattern      = `BS\.[0-9]+|HD-[0-9]+|T[0-9]+\.[0-9]+|S[1-7]\.[0-9]+|WIRING-[0-9]+|UI-[0-9]+|RS[0-9]*-[A-Z]+-[0-9]+|Q-[A-Z]-[0-9]+`
+	idPattern      = `BS\.[0-9]+|HD-[0-9]+|T[0-9]+\.[0-9]+|S[1-7]\.[0-9]+|WIRING-[0-9]+|UI-[0-9]+|RS[0-9]*-[A-Z]+-[0-9]+|Q-[A-Z]-[0-9]+|CLEAN-[0-9]+|ARDH-[0-9]+`
 	cardIDRe       = regexp.MustCompile(`\b(` + idPattern + `)\b`)
 	cardFileRe     = regexp.MustCompile(`^(` + idPattern + `)(?:-[A-Za-z0-9-]+)?\.md$`)
 	priorityLineRe = regexp.MustCompile(`^- (P[0-9]+): ([0-9]+)$`)
