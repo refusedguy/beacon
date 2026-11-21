@@ -300,3 +300,41 @@ func TestLifecycleRunStopsOnContext(t *testing.T) {
 		t.Fatalf("state after cancel = %s, want stopped", got)
 	}
 }
+
+// TestCrashRecoveryOldPIDNotReadAfterKill models a service killed while a
+// wait_result is in flight: the process is gone, the flock is released, but
+// its pidfile survives. A fresh start must not read the old PID as the owner.
+// It takes the lease and overwrites the pidfile with the live process id, the
+// crash-recovery case in ADR 0061 p5.
+func TestCrashRecoveryOldPIDNotReadAfterKill(t *testing.T) {
+	stateDir := t.TempDir()
+	oldPID := deadPID(t)
+
+	// The killed process left a pidfile behind but no longer holds the lock.
+	if err := os.WriteFile(filepath.Join(stateDir, LeasePIDName), []byte(strconv.Itoa(oldPID)), 0o600); err != nil {
+		t.Fatalf("seed stale pidfile: %v", err)
+	}
+
+	lease, err := NewManager().Acquire(stateDir)
+	if err != nil {
+		t.Fatalf("reacquire after crash: %v", err)
+	}
+	defer func() { _ = lease.Release() }()
+
+	if got, want := pidFile(t, stateDir), strconv.Itoa(os.Getpid()); got != want {
+		t.Fatalf("pidfile after crash = %q, want %q", got, want)
+	}
+
+	// A refused starter must name the new owner, never the dead PID from the
+	// abandoned file.
+	_, err = NewManager().Acquire(stateDir)
+	if err == nil {
+		t.Fatal("second start after crash must be refused")
+	}
+	if !errors.Is(err, ErrAnotherInstance) {
+		t.Fatalf("second start error = %v, want ErrAnotherInstance", err)
+	}
+	if strings.Contains(err.Error(), strconv.Itoa(oldPID)) {
+		t.Fatalf("refusal still reads old pid %d: %q", oldPID, err)
+	}
+}

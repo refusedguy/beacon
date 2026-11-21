@@ -76,6 +76,16 @@ func (a *App) View() string {
 	return a.cachedView
 }
 
+// FirstFrame renders the current snapshot once without touching the cached
+// view. A live-server probe calls Refresh then FirstFrame and times the pair,
+// which records the time to first frame against a real listener rather than a
+// fake socket.
+func (a *App) FirstFrame() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.render(a.snap)
+}
+
 // Decide sends one command through the REST route, then refreshes so the view
 // shows the server's answer rather than a local guess.
 func (a *App) Decide(ctx context.Context, d Decision) error {
