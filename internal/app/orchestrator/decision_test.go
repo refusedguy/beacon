@@ -741,3 +741,220 @@ func TestAuditCompletionNilClosureFailsClosed(t *testing.T) {
 		t.Fatalf("missing = %q, want the whole plan", got.Missing)
 	}
 }
+
+// slotVerifier is the artifact port fake. ready gates the answer, so a test can
+// hold the artifact back and then let it land. calls records every check.
+type slotVerifier struct {
+	ready bool
+	err   error
+	calls []SlotToken
+}
+
+func (v *slotVerifier) Verified(_ context.Context, t SlotToken, _ SlotArtifact) (bool, error) {
+	v.calls = append(v.calls, t)
+	if v.err != nil {
+		return false, v.err
+	}
+	return v.ready, nil
+}
+
+func TestSlotLedgerOneSignalOneSpawn(t *testing.T) {
+	l := NewSlotLedger()
+	v := &slotVerifier{ready: true}
+
+	first, inc := l.Issue(SignalReportToOrchestrator, "watch:D1", 7, 42)
+	if inc != nil || first.WatchID != "watch:D1" || first.Revision != 7 || first.PR != 42 {
+		t.Fatalf("first issue = %+v, incident = %+v", first, inc)
+	}
+	if !l.IsLive("watch:D1", 7) {
+		t.Fatal("first signal did not open a slot")
+	}
+
+	second, inc := l.Issue(SignalReportToOrchestrator, "watch:D1", 7, 42)
+	if inc == nil || inc.Kind != SlotDuplicateSignal {
+		t.Fatalf("second signal incident = %+v, want %s", inc, SlotDuplicateSignal)
+	}
+	if second != (SlotToken{}) {
+		t.Fatalf("second signal opened a slot: %+v", second)
+	}
+	if len(l.live) != 1 {
+		t.Fatalf("two signals opened %d slots, want 1", len(l.live))
+	}
+
+	burned, inc := l.Burn(context.Background(), first, SlotArtifact{PR: 42}, v)
+	if inc != nil || !burned {
+		t.Fatalf("burn = %v, incident = %+v, want true/nil", burned, inc)
+	}
+	if l.IsLive("watch:D1", 7) {
+		t.Fatal("burned token still holds a slot")
+	}
+
+	third, inc := l.Issue(SignalReportToOrchestrator, "watch:D1", 7, 42)
+	if inc != nil || third == (SlotToken{}) {
+		t.Fatalf("signal after burn = %+v, incident = %+v, want a fresh token", third, inc)
+	}
+}
+
+// TestSlotLedgerDelayedArtifact holds the artifact back after the first signal.
+// A duplicate signal during the delay must not open a second slot. The slot
+// opens again only after the artifact lands and the token burns.
+func TestSlotLedgerDelayedArtifact(t *testing.T) {
+	l := NewSlotLedger()
+	v := &slotVerifier{ready: false}
+	signal := SignalReportToOrchestrator
+
+	token, inc := l.Issue(signal, "watch:D1", 7, 42)
+	if inc != nil || token == (SlotToken{}) {
+		t.Fatalf("first issue = %+v, incident = %+v", token, inc)
+	}
+
+	burned, inc := l.Burn(context.Background(), token, SlotArtifact{Plan: "PLAN.md"}, v)
+	if inc != nil || burned {
+		t.Fatalf("burn with delayed artifact = %v, incident = %+v, want false/nil", burned, inc)
+	}
+	if !l.IsLive("watch:D1", 7) {
+		t.Fatal("delayed artifact freed the slot")
+	}
+
+	duplicate, inc := l.Issue(signal, "watch:D1", 7, 42)
+	if inc == nil || inc.Kind != SlotDuplicateSignal || duplicate != (SlotToken{}) {
+		t.Fatalf("signal during delay = %+v, incident = %+v, want duplicate and no token", duplicate, inc)
+	}
+	if len(l.live) != 1 {
+		t.Fatalf("signal during delay opened %d slots, want 1", len(l.live))
+	}
+
+	v.ready = true
+	burned, inc = l.Burn(context.Background(), token, SlotArtifact{Plan: "PLAN.md"}, v)
+	if inc != nil || !burned {
+		t.Fatalf("burn after artifact landed = %v, incident = %+v, want true/nil", burned, inc)
+	}
+	if len(v.calls) != 2 {
+		t.Fatalf("verifier calls = %d, want 2 (delayed, then landed)", len(v.calls))
+	}
+
+	if _, inc := l.Issue(signal, "watch:D1", 7, 42); inc != nil {
+		t.Fatalf("fresh signal after burn returned an incident: %+v", inc)
+	}
+	if len(l.live) != 1 {
+		t.Fatalf("slot count after burn and new signal = %d, want 1", len(l.live))
+	}
+}
+
+func TestSlotLedgerOnlyReportSignalOpensSlot(t *testing.T) {
+	l := NewSlotLedger()
+	for _, signal := range []string{"", "keep_working", "rebase", "retry", "blocked", "wait", "MERGE"} {
+		token, inc := l.Issue(signal, "watch:D1", 7, 42)
+		if token != (SlotToken{}) || inc != nil {
+			t.Fatalf("signal %q opened a slot: %+v, incident %+v", signal, token, inc)
+		}
+	}
+	if len(l.live) != 0 {
+		t.Fatalf("non-completion signals opened %d slots, want 0", len(l.live))
+	}
+}
+
+func TestSlotLedgerBurnWithoutTokenIsIncident(t *testing.T) {
+	l := NewSlotLedger()
+	v := &slotVerifier{ready: true}
+	token := SlotToken{WatchID: "watch:D1", Revision: 7, PR: 42}
+
+	burned, inc := l.Burn(context.Background(), token, SlotArtifact{PR: 42}, v)
+
+	if burned {
+		t.Fatal("burn without a token succeeded")
+	}
+	if inc == nil || inc.Kind != SlotSpawnWithoutToken {
+		t.Fatalf("incident = %+v, want %s", inc, SlotSpawnWithoutToken)
+	}
+	if len(v.calls) != 0 {
+		t.Fatalf("verifier called with no token: %d calls", len(v.calls))
+	}
+}
+
+func TestSlotLedgerBurnKeepsTokenWhenArtifactInvalid(t *testing.T) {
+	l := NewSlotLedger()
+	v := &slotVerifier{ready: true}
+	token, _ := l.Issue(SignalReportToOrchestrator, "watch:D1", 7, 42)
+
+	burned, inc := l.Burn(context.Background(), token, SlotArtifact{}, v)
+	if burned || inc != nil {
+		t.Fatalf("burn with empty artifact = %v, incident %+v, want false/nil", burned, inc)
+	}
+	if !l.IsLive("watch:D1", 7) {
+		t.Fatal("empty artifact freed the slot")
+	}
+	if len(v.calls) != 0 {
+		t.Fatalf("verifier called for an invalid artifact: %d calls", len(v.calls))
+	}
+}
+
+func TestSlotLedgerBurnVerifierErrorKeepsSlot(t *testing.T) {
+	l := NewSlotLedger()
+	v := &slotVerifier{err: errors.New("artifact store down")}
+	token, _ := l.Issue(SignalReportToOrchestrator, "watch:D1", 7, 42)
+
+	burned, inc := l.Burn(context.Background(), token, SlotArtifact{PR: 42}, v)
+	if burned || inc != nil {
+		t.Fatalf("burn with verifier error = %v, incident %+v, want false/nil", burned, inc)
+	}
+	if !l.IsLive("watch:D1", 7) {
+		t.Fatal("verifier error freed the slot")
+	}
+}
+
+func TestSlotLedgerKeysByWatchAndRevision(t *testing.T) {
+	l := NewSlotLedger()
+	_, inc := l.Issue(SignalReportToOrchestrator, "watch:D1", 7, 42)
+	if inc != nil {
+		t.Fatalf("first issue: %+v", inc)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		watchID string
+		rev     uint64
+		wantInc bool
+	}{
+		{name: "same watch new revision", watchID: "watch:D1", rev: 8},
+		{name: "new watch same revision", watchID: "watch:D2", rev: 7},
+		{name: "same watch same revision", watchID: "watch:D1", rev: 7, wantInc: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			token, inc := l.Issue(SignalReportToOrchestrator, tc.watchID, tc.rev, 43)
+			if tc.wantInc {
+				if inc == nil || inc.Kind != SlotDuplicateSignal || token != (SlotToken{}) {
+					t.Fatalf("issue = %+v, incident = %+v, want duplicate and no token", token, inc)
+				}
+				return
+			}
+			if inc != nil || token == (SlotToken{}) {
+				t.Fatalf("issue = %+v, incident = %+v, want a fresh token", token, inc)
+			}
+		})
+	}
+	if len(l.live) != 3 {
+		t.Fatalf("slot count = %d, want 3", len(l.live))
+	}
+}
+
+func TestSlotArtifactValid(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		art  SlotArtifact
+		want bool
+	}{
+		{name: "plan", art: SlotArtifact{Plan: "PLAN.md"}, want: true},
+		{name: "pr", art: SlotArtifact{PR: 42}, want: true},
+		{name: "both", art: SlotArtifact{Plan: "PLAN.md", PR: 42}, want: true},
+		{name: "empty", art: SlotArtifact{}},
+		{name: "blank plan", art: SlotArtifact{Plan: "  "}},
+		{name: "zero pr", art: SlotArtifact{PR: 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.art.Valid(); got != tc.want {
+				t.Fatalf("Valid() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

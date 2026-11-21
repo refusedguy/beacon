@@ -465,3 +465,149 @@ func AuditCompletion(ctx context.Context, plan []string, closure TaskClosure) (C
 	out.Complete = len(out.Missing) == 0
 	return out, nil
 }
+
+// ---- RS-CMP-02: one signal = one spawn ----
+
+// SignalReportToOrchestrator is the only completion signal that opens an
+// execution slot. It is the nextAction carried by the terminal_ack that ends a
+// wave item. Other signals never open a slot.
+const SignalReportToOrchestrator = "report_to_orchestrator"
+
+// SlotArtifact is the proof a spawn leaves behind before its token burns. A
+// plan-mode task leaves PLAN.md; a full-mode task leaves a PR. Either field may
+// be set, but at least one must be non-empty for the artifact to count.
+type SlotArtifact struct {
+	Plan string `json:"plan,omitempty"`
+	PR   int    `json:"pr,omitempty"`
+}
+
+// Valid reports whether the artifact names a concrete completion proof.
+func (a SlotArtifact) Valid() bool {
+	return strings.TrimSpace(a.Plan) != "" || a.PR > 0
+}
+
+// SlotToken is a one-shot permission to open one execution slot for one
+// completion signal. Its key is (WatchID, Revision), the same idempotency key
+// merges and wakes use, so two signals from one task at one revision cannot
+// open two slots.
+type SlotToken struct {
+	WatchID  string `json:"watchID"`
+	Revision uint64 `json:"revision"`
+	PR       int    `json:"pr,omitempty"`
+	Signal   string `json:"signal"`
+}
+
+// Key returns the idempotency key for the token. WatchID and Revision alone
+// identify one signal, so PR and Signal do not take part in the key.
+func (t SlotToken) Key() string {
+	return fmt.Sprintf("%s@%d", t.WatchID, t.Revision)
+}
+
+// SlotIncidentKind names a mismatch between a completion signal and a spawn.
+type SlotIncidentKind string
+
+const (
+	// SlotDuplicateSignal fires when a second completion signal arrives while
+	// the first signal's token is still live. No second slot opens.
+	SlotDuplicateSignal SlotIncidentKind = "duplicate_signal"
+	// SlotSpawnWithoutToken fires when a spawn reports an artifact but no live
+	// token covers the signal. The signal and the spawn do not match.
+	SlotSpawnWithoutToken SlotIncidentKind = "spawn_without_token"
+)
+
+// SlotIncident is a pure incident value. The caller records it in observe and
+// fails the card. No I/O happens here, so the rule stays testable without a
+// store, a hosting service or a wake adapter.
+type SlotIncident struct {
+	Kind     SlotIncidentKind `json:"kind"`
+	WatchID  string           `json:"watchID"`
+	Revision uint64           `json:"revision"`
+	Detail   string           `json:"detail,omitempty"`
+}
+
+// ArtifactVerifier reports whether artifact is present for token. A nil
+// verifier verifies nothing, so the token stays live and no slot frees. The
+// wiring layer owns the real PLAN.md read and PR lookup; neither lives in this
+// package.
+type ArtifactVerifier interface {
+	Verified(ctx context.Context, token SlotToken, artifact SlotArtifact) (bool, error)
+}
+
+// ArtifactVerifierFunc adapts a function to ArtifactVerifier.
+type ArtifactVerifierFunc func(ctx context.Context, token SlotToken, artifact SlotArtifact) (bool, error)
+
+// Verified calls f. A nil function reports the artifact as not verified.
+func (f ArtifactVerifierFunc) Verified(ctx context.Context, t SlotToken, a SlotArtifact) (bool, error) {
+	if f == nil {
+		return false, nil
+	}
+	return f(ctx, t, a)
+}
+
+// SlotLedger enforces one signal = one spawn. It is pure: the caller owns
+// persistence, the wake delivery and the observe write. A live token means a
+// spawn is authorized and its artifact is not verified yet.
+type SlotLedger struct {
+	live map[string]SlotToken
+}
+
+// NewSlotLedger returns an empty ledger.
+func NewSlotLedger() *SlotLedger {
+	return &SlotLedger{live: map[string]SlotToken{}}
+}
+
+// Issue handles one completion signal. Only SignalReportToOrchestrator opens
+// a slot. A second signal for the same (watchID, revision) returns a
+// SlotDuplicateSignal incident and no token, so the caller cannot open a
+// second slot.
+func (l *SlotLedger) Issue(signal string, watchID string, revision uint64, pr int) (SlotToken, *SlotIncident) {
+	if signal != SignalReportToOrchestrator {
+		return SlotToken{}, nil
+	}
+	t := SlotToken{WatchID: watchID, Revision: revision, PR: pr, Signal: signal}
+	if _, ok := l.live[t.Key()]; ok {
+		return SlotToken{}, &SlotIncident{
+			Kind:     SlotDuplicateSignal,
+			WatchID:  watchID,
+			Revision: revision,
+			Detail:   "slot token already live for " + t.Key(),
+		}
+	}
+	if l.live == nil {
+		l.live = map[string]SlotToken{}
+	}
+	l.live[t.Key()] = t
+	return t, nil
+}
+
+// Burn extinguishes token after its artifact is verified. A verifier that
+// reports false, including one whose answer is delayed, leaves the token live
+// and returns false so the slot stays held and no new signal can open another
+// one. A burn for a token that is not live is a SlotSpawnWithoutToken
+// incident: a spawn claims an artifact with no matching signal.
+func (l *SlotLedger) Burn(ctx context.Context, token SlotToken, artifact SlotArtifact, verifier ArtifactVerifier) (bool, *SlotIncident) {
+	if _, ok := l.live[token.Key()]; !ok {
+		return false, &SlotIncident{
+			Kind:     SlotSpawnWithoutToken,
+			WatchID:  token.WatchID,
+			Revision: token.Revision,
+			Detail:   "no live slot token for " + token.Key(),
+		}
+	}
+	if !artifact.Valid() || verifier == nil {
+		return false, nil
+	}
+	verified, err := verifier.Verified(ctx, token, artifact)
+	if err != nil || !verified {
+		return false, nil
+	}
+	delete(l.live, token.Key())
+	return true, nil
+}
+
+// IsLive reports whether token still holds its slot.
+func (l *SlotLedger) IsLive(watchID string, revision uint64) bool {
+	key := SlotToken{WatchID: watchID, Revision: revision}.Key()
+	_, ok := l.live[key]
+	return ok
+}
