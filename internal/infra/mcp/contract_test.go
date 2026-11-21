@@ -27,12 +27,12 @@ const toolsListByteBudget = 16 * 1024
 // for the contracted eight tools. The budget above is a ceiling; this number is
 // the current value. Pinning it makes an unannounced change to a description or
 // schema fail the contract until this constant is updated with that change.
-const toolsListByteCount = 16095
+const toolsListByteCount = 16153
 
 // toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
 // catches any byte change, including a swap of two tools whose names have equal
 // length, which a size check alone would miss.
-const toolsListGoldenSHA256 = "8324205f18b1b4c8e90843aeafcad90b8170c8c7ae7b49733a864b6a358f3aab"
+const toolsListGoldenSHA256 = "bb50bd3b55f90e15b2f32201358db0051ebfa6c835484d76c755ddd022c27122"
 
 // toolsListOrder is the fixed order in which the server lists its tools. The
 // SDK returns the eight tools sorted by name. Pinning the order makes that
