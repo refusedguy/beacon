@@ -73,7 +73,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		o.Format = "table"
 	}
 	if o.Format != "table" && o.Format != "json" {
-		return "", Validationf("неизвестный формат %q", o.Format)
+		return "", Validationf("beacon task list: неверное значение --format %q, ожидается table или json", o.Format)
 	}
 	for _, v := range o.Statuses {
 		if !oneOf(v, "todo", "in_progress", "done", "dropped") {

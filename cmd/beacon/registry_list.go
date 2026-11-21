@@ -102,7 +102,7 @@ func renderRegistry(format string, rows []registryListRow, w io.Writer) error {
 	case "json":
 		return renderRegistryJSON(w, rows)
 	default:
-		return fmt.Errorf("registry list: unknown format %q, expected table or json", format)
+		return fmt.Errorf("неверное значение --format %q, ожидается table или json", format)
 	}
 }
 
@@ -115,16 +115,16 @@ func runRegistryList(c *CLI, args []string) int {
 	}
 	reader, err := registryListSource()
 	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon registry list: %v\n", err)
+		fmt.Fprintf(c.errOut, "%v\n", cliError("registry list", err))
 		return 2
 	}
 	entries, err := reader.Executors()
 	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon registry list: %v\n", err)
+		fmt.Fprintf(c.errOut, "%v\n", cliError("registry list", err))
 		return 2
 	}
 	if err := renderRegistry(*format, registryListRows(entries), c.out); err != nil {
-		fmt.Fprintf(c.errOut, "%v\n", err)
+		fmt.Fprintf(c.errOut, "%v\n", cliError("registry list", err))
 		return 2
 	}
 	return 0
