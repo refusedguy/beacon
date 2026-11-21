@@ -32,14 +32,14 @@ const toolsListByteBudget = 20 * 1024
 // tenth tool lands.
 // TODO: replace 18212 with the size CI measures for the ten-tool response.
 // Do not derive this value from an estimate.
-const toolsListByteCount = 18212
+const toolsListByteCount = 19381
 
 // toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
 // catches any byte change, including a swap of two tools whose names have equal
 // length, which a size check alone would miss.
 // TODO: replace this hash with the one CI measures for the ten-tool response.
 // The current value is the nine-tool baseline and must not be guessed.
-const toolsListGoldenSHA256 = "ba0a9f42031cab8ff4733f89a8f6b3d1424be695367cbb6f305a3a0b60865f99"
+const toolsListGoldenSHA256 = "0a1b0af4931cc90aa6d6008fdc2347e05f28cd64a15f3ea8954c84298617cf75"
 
 // expectedToolNames is the complete advertised tool contract. It is derived
 // from the descriptors so the witness cannot omit a tool the registry gained.
