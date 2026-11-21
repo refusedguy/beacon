@@ -55,13 +55,14 @@ func TestVerdictMirrorsMatchDomain(t *testing.T) {
 		}
 	}
 
-	// Each verdict the app actually emits has a mirror, so a rename in the
-	// contract cannot leave the app on an old string.
+	// Each verdict this package emits has a mirror, so a rename in the contract
+	// cannot leave the app on an old string. Blocked is produced outside this
+	// package and its mirror is mcp.NextActionBlocked, which derives from
+	// domain.VerdictBlocked in schema.go.
 	for _, v := range []domain.Verdict{
 		domain.VerdictWatching, domain.VerdictReady, domain.VerdictRebase,
 		domain.VerdictRetry, domain.VerdictKeepWorking, domain.VerdictTimeout,
-		domain.VerdictBlocked, domain.VerdictFail, domain.VerdictWait,
-		domain.VerdictWaitDependency,
+		domain.VerdictFail, domain.VerdictWait, domain.VerdictWaitDependency,
 	} {
 		if !mirrorSet[string(v)] {
 			t.Errorf("domain verdict %q has no app mirror", v)
