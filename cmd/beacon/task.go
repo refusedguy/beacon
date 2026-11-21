@@ -418,24 +418,43 @@ func whyKnownEdge(kind string) bool {
 // разные флаги и разные поля карточки. Попытка закрыться без доказательства
 // не закрывает карточку, а переводит её в needs_input.
 
-// completionFields это два входа команды завершения.
+// completionFields это входы команды завершения. reason и duplicateOf несут
+// причину закрытия и карточку-дубль; оба поля необязательны и не меняют rule
+// об обязательном доказательстве.
 type completionFields struct {
-	summary  string
-	evidence string
+	summary     string
+	evidence    string
+	reason      string
+	duplicateOf string
 }
 
 // runTaskDone завершает карточку только при наличии отдельного поля
 // --evidence. Без доказательства карточка не закрывается: она уходит в
 // needs_input с вопросом, который нужно закрыть перед повторной попыткой.
 func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
-	p, err := parseTaskArgs(argv, map[string]bool{"summary": true, "evidence": true}, nil)
+	p, err := parseTaskArgs(argv, map[string]bool{
+		"summary": true, "evidence": true, "reason": true,
+		"duplicate-of": true, "duplicateOf": true,
+	}, nil)
 	if err != nil {
 		return failTask(stderr, err)
 	}
 	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
 		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки вида T<g>.<n>"))
 	}
-	report := completionFields{summary: p.value("summary"), evidence: p.value("evidence")}
+	duplicateOf := p.value("duplicate-of")
+	if duplicateOf == "" {
+		duplicateOf = p.value("duplicateOf")
+	}
+	report := completionFields{
+		summary:     p.value("summary"),
+		evidence:    p.value("evidence"),
+		reason:      oneLine(p.value("reason")),
+		duplicateOf: strings.TrimSpace(duplicateOf),
+	}
+	if report.duplicateOf != "" && !taskstore.IsID(report.duplicateOf) {
+		return failTask(stderr, taskstore.Validationf("--duplicate-of: неверный ID карточки %q", report.duplicateOf))
+	}
 	hasEvidence := strings.TrimSpace(report.evidence) != ""
 	if hasEvidence && strings.TrimSpace(report.summary) == "" {
 		return failTask(stderr, taskstore.Validationf("завершение без итога отклонено: задайте --summary"))
@@ -480,6 +499,12 @@ func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 	newText = setCardField(newText, "Доказательство", oneLine(report.evidence))
 	newText = setCardField(newText, "Состояние", "")
 	newText = setCardField(newText, "Вопрос", "")
+	if report.reason != "" {
+		newText = setCardField(newText, "Причина", report.reason)
+	}
+	if report.duplicateOf != "" {
+		newText = setCardField(newText, "Дублирует", report.duplicateOf)
+	}
 	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
 		return failTask(stderr, err)
 	}
