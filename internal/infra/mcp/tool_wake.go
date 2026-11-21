@@ -81,6 +81,14 @@
 // The guard is attached as a narrow port, so callers written before this
 // feature keep their exact behaviour.
 //
+// T5.49 (ADR 0090 and ADR 0095) adds the registry status precondition. An
+// executor whose registry row is stale, stopped or missing must not be woken;
+// a heartbeat tick does not replace a successful sync. The environment owns
+// the registry rule and reports it through RegistryWakeGuard, so this package
+// reads the answer without importing a store or a registry implementation.
+// The refusal stays inside the ADR 0026 closed set and names the stored status
+// on the receipt.
+//
 // The tool is intentionally not registered in NewServer. Wiring it into a
 // server is a separate integration task; AttachWake is the hook for it.
 package mcp
@@ -370,6 +378,11 @@ type WakeOutput struct {
 	// HeartbeatTick echoes whether this attempt was a timer tick. It stays a
 	// separate fact and never by itself makes Guarded or Delivery succeed.
 	HeartbeatTick bool `json:"heartbeatTick,omitempty"`
+	// RegistryStatus is the status the registry held when a guard was attached
+	// (T5.49). It names the stored value on both a refusal and a released wake,
+	// so a receipt can show that a stale row held the wake. It stays empty when
+	// no guard is attached.
+	RegistryStatus string `json:"registryStatus,omitempty"`
 }
 
 // T3.110 (ADR 0046 feature 2) makes a wake error repairable. ADR 0009 fixes the
@@ -526,6 +539,15 @@ type AgentDirectory interface {
 	CandidateAgents(ctx context.Context) []CandidateAgent
 }
 
+// RegistryWakeGuard reports the registry status of one executor and whether
+// the registry permits a wake for it (T5.49, ADR 0090 and ADR 0095). The rule
+// belongs to the environment that owns the registry, so the core only reads
+// the answer. An empty status is an unknown row and never allows a wake.
+// Status is copied to the receipt so a refusal names the stored value.
+type RegistryWakeGuard interface {
+	WakeStatus(executorID string) (status string, allowed bool)
+}
+
 // WakeSleeper waits until a chosen point inside the wake window (ADR 0041 p5).
 // It is the narrow seam that lets a test observe the chosen wake points without
 // sleeping. The real implementation uses a timer that honors context
@@ -633,6 +655,7 @@ type WakeHandler struct {
 	operations     OperationRegistry
 	doorbell       DoorbellPort
 	guard          *HeartbeatGuard
+	registryGuard  RegistryWakeGuard
 }
 
 // WithWakeSleeper replaces the timer used to stagger wake points (ADR 0041
@@ -756,17 +779,21 @@ func (h *WakeHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in 
 // resolving its delivery target. Both the single-delivery and the fallback
 // paths use it so the human-first rule and capability selection stay identical.
 type wakeSetup struct {
-	target  string
-	source  WakeSource
-	refusal *WakeOutput
-	err     error
+	target          string
+	source          WakeSource
+	refusal         *WakeOutput
+	err             error
+	registryStatus  string
+	registryChecked bool
 }
 
 // prepareWake validates input and resolves the target without attempting any
 // delivery. An interruption or an honest refusal from a routing-key lookup
 // (capability or worktree) arrives as a refusal; a malformed call arrives as
 // an error. Routing keys are resolved in one pass so a caller may request both
-// a capability set and a worktree path.
+// a capability set and a worktree path. With a registry guard attached, the
+// stored status is checked before the setup is returned, so a stale row never
+// reaches an operation, a wake window, a doorbell or a delivery channel.
 func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 	if in.HasPendingQuestion || in.PendingApproval {
 		out := interruptedWake(in)
@@ -851,7 +878,48 @@ func (h *WakeHandler) prepareWake(ctx context.Context, in WakeInput) wakeSetup {
 			recoveryCursorTarget,
 		)}
 	}
-	return wakeSetup{target: target, source: source}
+	if h == nil || h.registryGuard == nil {
+		return wakeSetup{target: target, source: source}
+	}
+	executorID := strings.TrimSpace(in.Executor)
+	if executorID == "" {
+		executorID = target
+	}
+	status, allowed := h.registryGuard.WakeStatus(executorID)
+	setup := wakeSetup{target: target, source: source, registryStatus: status, registryChecked: true}
+	if !allowed {
+		out := WakeOutput{
+			Delivery:       DeliveryUnsupported,
+			OK:             false,
+			Source:         source,
+			Executor:       in.Executor,
+			Reason:         registryHeldReason(executorID, status),
+			Woke:           in.Woke,
+			RegistryStatus: status,
+		}
+		setup.refusal = &out
+	}
+	return setup
+}
+
+// registryHeldReason names the stored status in a registry refusal. An unknown
+// row has no status string, so the reason says unknown instead of quoting an
+// empty value. The status is also reported in the RegistryStatus receipt field.
+func registryHeldReason(executorID, status string) string {
+	if status == "" {
+		status = "unknown"
+	}
+	return fmt.Sprintf("wake: registry guard held; executor %q has status %q, which does not allow wake", executorID, status)
+}
+
+// withRegistryReceipt copies the checked registry status onto a receipt. It is
+// a no-op for callers with no guard, so their output is byte-for-byte unchanged.
+func withRegistryReceipt(out WakeOutput, setup wakeSetup) WakeOutput {
+	if !setup.registryChecked {
+		return out
+	}
+	out.RegistryStatus = setup.registryStatus
+	return out
 }
 
 // isSuccessDelivery reports whether a delivery value is one of the two honest
@@ -917,9 +985,13 @@ func withReceiptState(out WakeOutput, in WakeInput) WakeOutput {
 // message rings no mailbox. When a guard is attached, ADR 0059 p2 checks it
 // before any of that work: a tick with no state change and a closed quota gate
 // returns a held receipt with OK=false and touches no operation, window,
-// doorbell or delivery channel.
-func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error) {
+// doorbell or delivery channel. With a registry guard attached, T5.49 checks
+// the stored executor status before any of that work: a stale or unknown row
+// returns a held receipt with OK=false and the status on the receipt, and no
+// operation, window, doorbell or delivery channel is touched.
+func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (out WakeOutput, err error) {
 	setup := h.prepareWake(ctx, in)
+	defer func() { out = withRegistryReceipt(out, setup) }()
 	if setup.err != nil {
 		return WakeOutput{}, setup.err
 	}
@@ -996,9 +1068,11 @@ func (h *WakeHandler) Wake(ctx context.Context, in WakeInput) (WakeOutput, error
 // rings its addressed doorbell (ADR 0058 p2) as a separate trigger fact; it
 // does not change the honest delivery the chain reports. The ADR 0059 p2 guard
 // is checked before the chain, so a held heartbeat walks no channel and writes
-// no trace.
-func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeOutput, error) {
+// no trace. The registry guard of T5.49 runs at the same boundary: a stale or
+// unknown executor status holds the wake before any channel or trace is used.
+func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (out WakeOutput, err error) {
 	setup := h.prepareWake(ctx, in)
+	defer func() { out = withRegistryReceipt(out, setup) }()
 	if setup.err != nil {
 		return WakeOutput{}, setup.err
 	}
@@ -1021,7 +1095,7 @@ func (h *WakeHandler) WakeWithFallback(ctx context.Context, in WakeInput) (WakeO
 		return WakeOutput{}, err
 	}
 	rang := h.ringDoorbell(in)
-	out := withOperation(h.runFallback(ctx, in, setup.target, setup.source), op)
+	out = withOperation(h.runFallback(ctx, in, setup.target, setup.source), op)
 	out.DoorbellRang = rang
 	out = withGuard(out, decision, guarded)
 	return withReceiptState(out, in), nil
@@ -1693,6 +1767,18 @@ func (h *WakeHandler) WithHeartbeatGuard(g *HeartbeatGuard) *WakeHandler {
 	return h
 }
 
+// WithRegistryGuard attaches the registry status precondition to a wake
+// handler (T5.49). A nil guard keeps the pre-feature path, so callers that own
+// no registry still wake through their delivery port. With a guard attached,
+// every wake asks for the executor status before any delivery or operation is
+// started; an unknown or stale row is an honest refusal.
+func (h *WakeHandler) WithRegistryGuard(g RegistryWakeGuard) *WakeHandler {
+	if h != nil {
+		h.registryGuard = g
+	}
+	return h
+}
+
 // evaluateHeartbeat runs the guard when one is attached. The bool reports
 // whether a guard evaluated this wake, so callers with no guard keep the
 // pre-feature path and emit no guard facts on their receipt.
@@ -1745,7 +1831,7 @@ func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WakeToolName,
-		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task. mailbox names the recipient's private doorbell: a message addressed to it rings the bell so a long-poll listener on that address wakes, and doorbellRang reports it. A broadcast message reaches no single mailbox and rings nothing; the doorbell is a wake trigger, not a new delivery value or a ladder step. heartbeatState, quotaShouldRun and heartbeatTick feed the guarded heartbeat: when a guard is attached the wake is released only if the state changed or the quota gate is open, so a timer tick alone holds the wake with ok=false and guarded=true. The guard is a precondition checked before any delivery, not a new delivery value or a ladder step.",
+		Description: "Wake an open session and report the delivery actually used: steer, queue, unsupported, or interrupted when a human is needed. Delivery says the follow-up was sent, not that the agent started; woke is a separate caller-supplied confirmation. Source review marks a diff comment delivered as steer. A fallback handler tries the running turn, then the next turn, then the task trace; a traced follow-up stays unsupported and is not a delivery. wakeBetweenMillis in the wait contract staggers each waiter to one random point in that window so waiters on the same event do not wake all at once. targetWorktree addresses the notification to the worktree path, not a session id: a restarted session in that worktree receives it and a session in another worktree does not. The state field reports the receipt lifecycle state: spooled, pending, held, pushed, push-unreachable, read, refused or expired. State answers where the message is, delivery answers how it was sent; refused, push-unreachable and expired are never a delivered follow-up. prompt names the content of the long job: an operationId is issued at entry, and an equal prompt already running returns that existing id with duplicate=true and starts no second task. mailbox names the recipient's private doorbell: a message addressed to it rings the bell so a long-poll listener on that address wakes, and doorbellRang reports it. A broadcast message reaches no single mailbox and rings nothing; the doorbell is a wake trigger, not a new delivery value or a ladder step. heartbeatState, quotaShouldRun and heartbeatTick feed the guarded heartbeat: when a guard is attached the wake is released only if the state changed or the quota gate is open, so a timer tick alone holds the wake with ok=false and guarded=true. The guard is a precondition checked before any delivery, not a new delivery value or a ladder step. registryStatus reports the executor status held by the registry guard; a stale or missing row holds the wake with ok=false and no delivery, because a heartbeat tick does not replace a successful sync.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  false,
