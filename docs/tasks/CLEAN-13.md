@@ -1,12 +1,12 @@
 # CLEAN-13. Удалить internal/app/tasks после закрытия WIRING-487 и WIRING-489
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/tasks/, docs/tasks/WIRING-487.md, docs/tasks/WIRING-489.md
 Зависимости: WIRING-487, WIRING-489
 Ссылка: 
-Агент: нет
-Время: нет
+Агент: exe79
+Время: 2026-11-21T17:44:48Z
 baseline: `git rev-parse --short origin/main` = b9937c01; обе wiring-карточки имеют `Статус: done`; `rg -n 'refusedguy/beacon/internal/app/tasks' internal cmd tools tests` даёт cmd/beacon/daemon.go:18 и cmd/beacon/reminders_test.go:9; `rg -n 'Poll\(' internal/app/tasks/card_monitor.go` даёт строку 155; `git merge-base --is-ancestor 94f6d29c origin/main` и то же для 370041d8 возвращают true.
 Цель: Разобраться с двумя wiring-карточками и решить, удалять ли card monitor и night shift.
 Контекст: Источник: docs/research/deadcode-audit.md, строка про internal/app/tasks. 673 не-тестовых строки, 0 импортёров. Обе wiring-карточки в todo и содержат блокировщик по OwnerFiles и layers.json. Риск: высокий. Нужен owner-decision: удаление закроет запланированную проводку.
