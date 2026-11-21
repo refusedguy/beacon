@@ -1,5 +1,5 @@
 # RS-EVAL-03. Именованные таймауты и smoke тест старта evalserver
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: evals/run.sh, evals/cmd/smoke.go
@@ -14,16 +14,5 @@ baseline: 2026-11-21 по origin/main 89276ef. `grep -n '60\*time.Second\|2 \* t
 Проверка: gofmt чистый. Скрипт и smoke тест зелёные в CI.
 Приёмка: Увеличение таймаута не выглядит как исправление логики. Причина провала видна в отчёте.
 
-## Блокер
-
-- 2026-11-21. Оба таймаута живут в чужом OwnerFiles.
-
-  Литерал 60 секунд стоит в `evals/main.go:191` внутри run(). Литерал 2 секунды стоит в `evals/main.go:206` в `CommandTransport.TerminateDuration` внутри того же run(). Файл `evals/main.go` не входит в OwnerFiles карточки `evals/run.sh` и `evals/cmd/smoke.go`. Чтобы заменить литералы на константы или env, нужно править этот файл. Я его не трогал.
-
-  В `evals/run.sh` таймаутов нет, поэтому вынести 60 и 2 секунды из скрипта нельзя. Env, который читал бы эти значения, в evals/main.go отсутствует. Добавление env требует правки evals/main.go.
-
-  Smoke тест старта evalserver тоже упирается в evals/main.go. Сервер поднимается через `client.Connect` с `CommandTransport` в evals/main.go:191-215. Отличить медленный старт от логического провала можно только по этому пути подключения и инициализации. В evals/cmd/evalserver/main.go готового сигнала готовности или отдельного стартового режима нет. Новый файл evals/cmd/smoke.go может запустить evalserver, но не знает про таймауты из run() и дублирует стартовую последовательность. Без правки evals/main.go тест не проверит тот таймаут, который описан в карточке.
-
-  Поведения в main нет. origin/main 89276ef содержит те же два литерала на строках 191 и 206. PR по RS-EVAL-03 в репозитории нет. Дубль не создавал.
-
-  Статус todo сохранён. Код не писал, gofmt не применял, go test не запускал, OwnerFiles не менял, чужие файлы, wiring и .beacon не трогал. Блокер возвращён оркестратору с именем файла `evals/main.go`. Для карточки нужны OwnerFiles с `evals/main.go`, либо переформулировка шагов под уже существующие проверки в evals/cmd/evalserver.
+## Подтверждение
+- Premise перепроверен 2026-11-21 по свежему origin/main (527084c). Прежний блокер снят: реализация влита PR #879, коммит 74ad82de, merged 2026-11-21. Baseline от 89276ef устарел. В evals/cmd/smoke.go на main определены DefaultStartTimeout (60s) и DefaultTerminateTimeout (2s) с env BEACON_EVAL_START_TIMEOUT и BEACON_EVAL_TERMINATE_TIMEOUT. Парсер Duration сохраняет значение по умолчанию при пустом или неверном env. Проверка smoke.Check ждёт handshake MCP через контекст с дедлайтом и не использует sleep. Причина провала попадает в сообщение об ошибке через Reason: start_timeout отличает медленный старт от connect_error. В evals/main.go на main оба таймаута читаются через smoke.Duration, terminateTimeout передаётся в CommandTransport.TerminateDuration, литералов 60 и 2 секунд в run() больше нет. evals/run.sh экспортирует оба env со старыми значениями по умолчанию. Открытых PR по карточке нет, дубля нет. Статус изменён с todo на done со ссылкой на PR #879. OwnerFiles не менял, код не писал, gofmt не применял, чужие файлы, wiring и .beacon не трогал, правка только текстовая.
