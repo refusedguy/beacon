@@ -20,25 +20,21 @@ import (
 // The budget counts real bytes (method Tirith), not the presence of fields.
 // ADR 0094 set 16 KiB for eight tools. ADR 0268 raised it to 20 KiB for nine
 // tools with a derived claim schema. ADR 0270 keeps the ceiling at 20 KiB for
-// ten tools while CI measures the tenth tool. The ceiling still catches runaway
-// growth in descriptions and schemas. CI logs the measured size next to it so
-// drift is visible before it becomes a failure. If the ten-tool response exceeds
-// 20480 bytes, a follow-up raises the budget and records the measurement.
+// ten tools. The ceiling still catches runaway growth in descriptions and
+// schemas. CI logs the measured size next to it so drift is visible before it
+// becomes a failure. If the ten-tool response exceeds 20480 bytes, a follow-up
+// raises the budget and records the measurement.
 const toolsListByteBudget = 20 * 1024
 
-// toolsListByteCount is the exact serialized size of the tools/list response
-// for the contracted ten tools. The budget above is a ceiling. This number is
-// the last recorded measurement for nine tools and is a placeholder until the
-// tenth tool lands.
-// TODO: replace 18212 with the size CI measures for the ten-tool response.
-// Do not derive this value from an estimate.
+// toolsListByteCount is the measured serialized size of the tools/list response
+// for the contracted ten tools. The budget above is a ceiling. Do not derive
+// this value from an estimate.
 const toolsListByteCount = 19381
 
 // toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
 // catches any byte change, including a swap of two tools whose names have equal
-// length, which a size check alone would miss.
-// TODO: replace this hash with the one CI measures for the ten-tool response.
-// The current value is the nine-tool baseline and must not be guessed.
+// length, which a size check alone would miss. The value is the measured
+// ten-tool response, not a guess.
 const toolsListGoldenSHA256 = "0a1b0af4931cc90aa6d6008fdc2347e05f28cd64a15f3ea8954c84298617cf75"
 
 // expectedToolNames is the complete advertised tool contract. It is derived

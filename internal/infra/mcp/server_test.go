@@ -1023,10 +1023,10 @@ func (n *mockParentNotifier) delivered() []ParentNotice {
 	return append([]ParentNotice(nil), n.notices...)
 }
 
-// TestAskChildQuestionKeepsNineTools proves WIRING-490 at the MCP boundary:
+// TestAskChildQuestionKeepsTenTools proves WIRING-490 at the MCP boundary:
 // a child question reaches the parent chat through the injected ports, and the
 // contracted set of ten tools is unchanged by the new wiring.
-func TestAskChildQuestionKeepsNineTools(t *testing.T) {
+func TestAskChildQuestionKeepsTenTools(t *testing.T) {
 	notifier := &mockParentNotifier{}
 	deps := Dependencies{
 		ChildThreads:   mockChildThreadResolver{parentID: "root", name: "Builder", ok: true},
