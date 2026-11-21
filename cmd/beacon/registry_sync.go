@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -361,4 +362,49 @@ func runRegistrySync(c *CLI, args []string) int {
 		fmt.Fprintf(c.out, "updated: %s\n", strings.Join(updates, " "))
 	}
 	return 0
+}
+
+// wakeRegistryGuard adapts the project registry to mcp.RegistryWakeGuard. It
+// reads one stored row and applies registryWakeAllowed, so the CLI owns the
+// wake rule while the MCP wake boundary only consumes the answer (T5.49).
+// An absent row, a read error or an unknown id yields an empty status and
+// denies wake: a heartbeat tick never stands in for a successful sync.
+type wakeRegistryGuard struct {
+	db         *store.DB
+	projectKey string
+}
+
+// newWakeRegistryGuard binds the guard to one project. It is the production
+// adapter installed on the wake handler by newMCPServer.
+func newWakeRegistryGuard(db *store.DB, projectKey string) mcp.RegistryWakeGuard {
+	return wakeRegistryGuard{db: db, projectKey: projectKey}
+}
+
+// WakeStatus looks up one executor and applies the registry wake rule. The id
+// is first read as an agent id, then as a session id, because an explicit wake
+// carries the opaque session target while a routed wake carries the executor.
+func (g wakeRegistryGuard) WakeStatus(executorID string) (string, bool) {
+	status := g.status(executorID)
+	return status, registryWakeAllowed(status)
+}
+
+// status reads the stored status of one executor in the bound project.
+func (g wakeRegistryGuard) status(executorID string) string {
+	if g.db == nil || strings.TrimSpace(executorID) == "" || strings.TrimSpace(g.projectKey) == "" {
+		return ""
+	}
+	record, found, err := g.db.Executor(g.projectKey, executorID)
+	if err == nil && found {
+		return record.Status
+	}
+	entries, err := g.db.Executors(g.projectKey)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		if entry.SessionID == executorID {
+			return entry.Status
+		}
+	}
+	return ""
 }
