@@ -1,5 +1,7 @@
 # WIRING-915. Подключить интерактивный beacon board к dispatch
+Premise: проверено 2026-11-21 по свежему origin/main (cd50c15). PR #930 влит и подключил dispatch `beacon board` к локальному раннеру через RegisterBoard, но адаптер вызывает runBoard, а не tui.Run. Ребра cmd к internal/tui в layers.json нет, ребро требует пересборки закоммиченного бинарника гейтов. Статус todo сохранён, точная причина ниже.
 Статус: todo
+baseline: `git rev-parse --short origin/main` = cd50c15; `gh pr view 930 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-21T10:02:39Z; `git merge-base --is-ancestor f42d582 origin/main` = 0; `git grep -n -E 'tui\.Run|tui\.RenderFallback' origin/main -- '*.go'` = пусто; `grep -n '"to": "internal/tui"' tools/beacon-gates/gate/config/layers.json` = пусто.
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/main.go, cmd/beacon/board_wire.go, tools/beacon-gates/gate/config/layers.json
@@ -20,6 +22,8 @@ baseline: 2026-11-21, в дереве PR 915 считано 970 карточек
 ## Причина
 
 Матрица `tools/beacon-gates/gate/config/layers.json` не разрешает cmd импортировать internal/tui. Добавление ребра меняет конфигурацию, которую бинарник `tools/beacon-gates/beacon-gates` хранит внутри себя через go:embed. Пересборка бинарника требует `go build` и правки файла вне OwnerFiles этой карточки, поэтому ребро и адаптер к tui.Run перенесены в отдельную проводку. Текущий PR подключает dispatch к локальному раннеру из board.go через RegisterBoard и сохраняет матрицу без изменений.
+
+Проверка 2026-11-21 по origin/main (cd50c15): PR #930 влит, dispatch вызывает boardRunner через RegisterBoard, но cmd/beacon/board_wire.go вызывает локальный runBoard из board.go. Вызовов tui.Run и tui.RenderFallback в дереве нет. Список allowed в layers.json не содержит ребра cmd к internal/tui, а бинарник гейтов хранит копию конфига через go:embed. Для завершения нужно разрешение владельца на ребро и воспроизводимая пересборка бинарника. До этого статус остаётся todo.
 
 ## Шаги
 

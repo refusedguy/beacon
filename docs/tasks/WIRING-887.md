@@ -1,5 +1,7 @@
 # WIRING-887. Подключить beacon gc к dispatch CLI
-Статус: todo
+Premise: проверено 2026-11-21 по свежему origin/main (cd50c15). PR #951 влит, commit 6e4b918 лежит в origin/main. Dispatch сохранил case "gc" и "gc-worktree", каталог получил записи gc и gc-worktree, тест каталога обновлён. Матрица слоёв не менялась. Дубля нет. Правка только текстовая.
+Статус: done
+baseline: `git rev-parse --short origin/main` = cd50c15; `gh pr view 951 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-21T10:19:57Z; `git merge-base --is-ancestor 6e4b918 origin/main` = 0; `git grep -n -E '"(gc|gc-worktree)"' origin/main -- cmd/beacon/catalog.go cmd/beacon/main.go` = catalog.go:28,29, main.go:286,288.
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/main.go, cmd/beacon/commands.go, cmd/beacon/catalog.go
@@ -35,3 +37,6 @@ PR: 887
 ## Приёмка
 
 Проводка применена, CI зелёный, карточка и отложенная запись переведены в done.
+
+## Подтверждение
+- Premise проверен 2026-11-21 по origin/main (cd50c15). PR #951 влит 2026-11-21, commit 6e4b918 лежит в origin/main. Dispatch сохранил case "gc" и "gc-worktree", cmd/beacon/catalog.go содержит записи gc и gc-worktree, cmd/beacon/main_test.go обновил ожидаемые имена. RegisterGC и RegisterGCWorktree установлены в gc.go через init(). Ребро в layers.json не добавлялось. Код не писал, чужие OwnerFiles и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done. Ссылка: https://github.com/refusedguy/beacon/pull/951.
