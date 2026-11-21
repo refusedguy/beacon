@@ -21,6 +21,7 @@ const usageText = `beacon — команды сборки и проверки Be
 
 Использование:
   beacon list [--format table|json]
+  beacon board [--root <dir>] [--status <status>] [--owner <owner>]
   beacon what <command>
   beacon doctor
   beacon build
@@ -235,6 +236,8 @@ func (c *CLI) dispatch(args []string) int {
 		return 0
 	case "list":
 		return runList(args[1:], c.out, c.errOut)
+	case "board":
+		return boardRunner(c, args[1:])
 	case "what":
 		return runWhat(args[1:], c.out, c.errOut)
 	case "doctor":
