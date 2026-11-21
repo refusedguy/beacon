@@ -40,8 +40,8 @@ func TestRegistry(t *testing.T) {
 	for _, c := range registry {
 		names = append(names, c.name)
 	}
-	if len(names) != 5 {
-		t.Fatalf("registry has %d commands, want 5: %v", len(names), names)
+	if len(names) != 6 {
+		t.Fatalf("registry has %d commands, want 6: %v", len(names), names)
 	}
 	want := append([]string(nil), names...)
 	sort.Strings(want)
