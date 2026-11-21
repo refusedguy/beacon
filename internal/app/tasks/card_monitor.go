@@ -222,6 +222,7 @@ func (m *Monitor) Poll(ctx context.Context, id string) (PollResult, error) {
 			return PollResult{}, fmt.Errorf("tasks: serialize change for %s: %w", id, err)
 		}
 		change.Payload = payload
+		st.status = snapshot.Status
 		emit = true
 	}
 	st.cursor = cursor
