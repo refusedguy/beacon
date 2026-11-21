@@ -62,6 +62,60 @@ func NewFilter(cfg FilterConfig) *Filter {
 	}
 }
 
+// Restore seeds one stored delivery into the dedupe index. Startup calls it
+// for every row in the journal so a restart keeps the delivery IDs and head
+// SHAs the previous process already handled. Empty keys are ignored. Values
+// are trimmed to match the inputs Filter takes.
+func (f *Filter) Restore(deliveryID, headSHA string) {
+	if f == nil {
+		return
+	}
+	deliveryID = strings.TrimSpace(deliveryID)
+	headSHA = strings.TrimSpace(headSHA)
+	if deliveryID == "" && headSHA == "" {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if deliveryID != "" {
+		if f.deliveries == nil {
+			f.deliveries = make(map[string]struct{})
+		}
+		f.deliveries[deliveryID] = struct{}{}
+	}
+	if headSHA != "" {
+		if f.headSHAs == nil {
+			f.headSHAs = make(map[string]struct{})
+		}
+		f.headSHAs[headSHA] = struct{}{}
+	}
+}
+
+// ClaimDelivery reports whether a delivery ID is new and records it when so.
+// It is the fast in-memory gate for the receiver. The restored index makes a
+// repeat after a restart fail this check, so no second effect is queued. The
+// durable journal keeps its own idempotency; this method only avoids the
+// write for a delivery the process already knows.
+func (f *Filter) ClaimDelivery(deliveryID string) bool {
+	if f == nil {
+		return false
+	}
+	deliveryID = strings.TrimSpace(deliveryID)
+	if deliveryID == "" {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, seen := f.deliveries[deliveryID]; seen {
+		return false
+	}
+	if f.deliveries == nil {
+		f.deliveries = make(map[string]struct{})
+	}
+	f.deliveries[deliveryID] = struct{}{}
+	return true
+}
+
 func keySet(values []string) map[string]struct{} {
 	if len(values) == 0 {
 		return nil
