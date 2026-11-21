@@ -1,4 +1,5 @@
 # IDX-13. Метрика dual-read и условие выхода
+Блокер: точный блокер с именем файла `internal/infra/taskstore/store.go`. Функция `LoadCards` (строка 286) по-прежнему читает карточки через `os.ReadFile` напрямую и не проходит через `FileAdapter`. PR #910 (коммит 54d2123, MERGED) влил счётчик `file_adapter_reads_total` и `FileAdapter.ReadFile` в `internal/infra/taskstore/load.go`, но покрывает только путь адаптера. Приёмка «метрика позволяет доказать ноль обращений за семь дней» не закрыта: нужен отдельный PR с OwnerFiles на `internal/infra/taskstore/store.go`, переводящий `LoadCards` на адаптер. Статус todo сохранён.
 Статус: todo
 Фаза: P2
 Тип: task
@@ -20,3 +21,6 @@
 - Тест TestFileAdapterReadsCounterGrowsAndResets проверяет рост до 3, экспорт в Prometheus и обнуление через Metrics.Reset.
 - Ограничение: LoadCards всё ещё читает файлы через os.ReadFile напрямую и не попадает в счётчик. Чтобы доказать ноль по всем путям, его нужно перевести на FileAdapter отдельным изменением.
 - gofmt выполнен. go test и go build по инструкции не запускались, проверка идёт в CI.
+
+## Подтверждение
+- Premise проверен 2026-11-21 по свежему origin/main (c716b61). `git log origin/main -- internal/infra/taskstore/load.go internal/infra/observe/metrics.go` даёт 54d2123 (#910) как последнюю правку; `gh pr list --state all --search 'dual-read OR LoadCards OR FileAdapter'` даёт #910 (MERGED), #912 и #915, ни один из которых не переводит `LoadCards` на адаптер. `git show origin/main:internal/infra/taskstore/store.go` содержит `os.ReadFile` в строках 286, 433, 486 и 682; `LoadCards` не вызывает `FileAdapter`. Открытых PR с миграцией `LoadCards` нет. Часть работы влита, но карточку закрыть нельзя: остаётся точный блокер в `internal/infra/taskstore/store.go`. Статус todo сохранён, код не писал, gofmt не применял, чужие файлы, wiring и .beacon не трогал, правка только текстовая.
