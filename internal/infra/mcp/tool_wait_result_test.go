@@ -1625,6 +1625,49 @@ func TestWaitStopReasonsContract(t *testing.T) {
 	}
 }
 
+// TestTimeoutContractsAreDistinct pins the wait_result half of BCX-11: the
+// retryable long-poll timeout keeps its own wire string and exit code, so a
+// client never reads it as the terminal verdict's nextAction=wait.
+func TestTimeoutContractsAreDistinct(t *testing.T) {
+	verdictString := string(domain.VerdictTimeout)
+	reasonString := string(WaitStopTimeout)
+	if verdictString == reasonString {
+		t.Fatalf("terminal verdict and retryable wait share the string %q", verdictString)
+	}
+	if verdictString != "timeout" {
+		t.Errorf("domain.VerdictTimeout wire value = %q, want timeout", verdictString)
+	}
+	if reasonString != "wait_timeout" {
+		t.Errorf("WaitStopTimeout wire value = %q, want wait_timeout", reasonString)
+	}
+	if got := WaitStopTimeout.ExitCode(); got != 143 {
+		t.Errorf("WaitStopTimeout exit code = %d, want 143", got)
+	}
+	if !WaitStopTimeout.Retryable() {
+		t.Error("WaitStopTimeout must stay retryable")
+	}
+
+	svc, _, _, _, timeout := newWaitTestService()
+	close(timeout)
+	out, err := svc.Wait(context.Background(), "sub-A", WaitResultInput{WatchID: "watch-1"}, CallerExit{})
+	if err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if reason := StopReasonOf(out); reason != WaitStopTimeout {
+		t.Fatalf("stop reason = %q, want %q", reason, WaitStopTimeout)
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"reason":"wait_timeout"`) {
+		t.Errorf("response has no distinct reason field: %s", raw)
+	}
+	if action, _, _ := nextStepFor(domain.VerdictTimeout); action == NextActionWait {
+		t.Error("the terminal timeout verdict still instructs the agent to wait")
+	}
+}
+
 // TestWaitResultStopReasonTerminal proves a delivered verdict is named
 // terminal and the readAt write is unchanged.
 func TestWaitResultStopReasonTerminal(t *testing.T) {

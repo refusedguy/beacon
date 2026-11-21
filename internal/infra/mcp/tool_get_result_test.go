@@ -1484,8 +1484,9 @@ func TestTasksGetWireShapeMatchesSchema(t *testing.T) {
 }
 
 // TestNextStepForVerdicts pins the self-teaching contract: the four wake
-// verdicts map to their action and command, every other verdict stays in the
-// wait family so an agent never invents a command from prose.
+// verdicts map to their action and command, the non-terminal ones stay in the
+// wait family, and the terminal timeout ends the turn so an agent never
+// invents a command from prose (BCX-11).
 func TestNextStepForVerdicts(t *testing.T) {
 	cases := []struct {
 		verdict domain.Verdict
@@ -1498,6 +1499,7 @@ func TestNextStepForVerdicts(t *testing.T) {
 		{domain.VerdictBlocked, NextActionBlocked, ""},
 		{domain.VerdictReady, NextActionWait, ""},
 		{domain.VerdictWatching, NextActionWait, ""},
+		{domain.VerdictTimeout, domain.NextActionDone, ""},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.verdict), func(t *testing.T) {
@@ -1516,6 +1518,25 @@ func TestNextStepForVerdicts(t *testing.T) {
 	}
 	if RetryCommand != "gh run rerun --failed" {
 		t.Errorf("retry command = %q", RetryCommand)
+	}
+}
+
+// TestTerminalVerdictTimeoutIsNotRetryableWait pins the get_result half of
+// BCX-11: a terminal timeout verdict ends the turn and its hint names the
+// long-poll it must not be confused with.
+func TestTerminalVerdictTimeoutIsNotRetryableWait(t *testing.T) {
+	action, command, hint := nextStepFor(domain.VerdictTimeout)
+	if action != domain.NextActionDone {
+		t.Errorf("nextStepFor(timeout) action = %q, want %q", action, domain.NextActionDone)
+	}
+	if action == NextActionWait {
+		t.Error("terminal timeout verdict still tells the agent to wait")
+	}
+	if command != "" {
+		t.Errorf("nextStepFor(timeout) command = %q, want empty", command)
+	}
+	if !strings.Contains(hint, "terminal") || !strings.Contains(hint, "long-poll") {
+		t.Errorf("nextStepFor(timeout) hint = %q, want terminal and long-poll wording", hint)
 	}
 }
 
