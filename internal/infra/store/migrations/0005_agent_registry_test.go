@@ -122,8 +122,8 @@ func TestMigration0005AppliesToExistingDB(t *testing.T) {
 		t.Fatalf("Open v4 db: %v", err)
 	}
 	defer d.Close()
-	if got := d.Version(); got != 6 {
-		t.Fatalf("Version() = %d, want 6", got)
+	if got := d.Version(); got != 7 {
+		t.Fatalf("Version() = %d, want 7", got)
 	}
 
 	db := rawDB(t, path)
@@ -171,8 +171,8 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if got := first.Version(); got != 6 {
-		t.Fatalf("first Version() = %d, want 6", got)
+	if got := first.Version(); got != 7 {
+		t.Fatalf("first Version() = %d, want 7", got)
 	}
 	db := rawDB(t, path)
 	beforeTables := objectCount(t, db, "table")
@@ -186,8 +186,8 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 		t.Fatalf("second Open: %v", err)
 	}
 	defer second.Close()
-	if got := second.Version(); got != 6 {
-		t.Fatalf("second Version() = %d, want 6", got)
+	if got := second.Version(); got != 7 {
+		t.Fatalf("second Version() = %d, want 7", got)
 	}
 	checkSchema0005(t, db)
 	if got := objectCount(t, db, "table"); got != beforeTables {
@@ -210,7 +210,7 @@ func TestMigration0005RepeatChangesNothing(t *testing.T) {
 	if err := db.QueryRowContext(context.Background(), `PRAGMA user_version`).Scan(&version); err != nil {
 		t.Fatalf("read user_version after SQL replay: %v", err)
 	}
-	if version != 6 {
-		t.Errorf("user_version after SQL replay = %d, want 6", version)
+	if version != 7 {
+		t.Errorf("user_version after SQL replay = %d, want 7", version)
 	}
 }
