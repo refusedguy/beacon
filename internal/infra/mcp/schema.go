@@ -328,20 +328,15 @@ func OutputSchema[T any]() (*jsonschema.Schema, error) {
 	return jsonschema.For[T](nil)
 }
 
-// outputSchemaFactories pairs each tool name with its output type. Keys are
-// tool names from WORKER-PROMPT §4.1 plus beacon_defer_wiring (W12-B) and
-// beacon_task_claim (ADR 0268).
-var outputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
-	"beacon_watch_pr":     func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
-	"beacon_wait_result":  func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
-	"beacon_get_result":   func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
-	"beacon_list_running": listRunningOutputSchema,
-	"beacon_ack":          func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
-	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
-	"beacon_stats":        func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
-	"beacon_defer_wiring": func() (*jsonschema.Schema, error) { return OutputSchema[DeferWiringOutput]() },
-	"beacon_task_claim":   taskClaimOutputSchema,
-}
+// outputSchemaFactories pairs each tool name with its output type. Derived
+// from toolDescriptors so a name cannot be registered without a schema factory.
+var outputSchemaFactories = func() map[string]func() (*jsonschema.Schema, error) {
+	out := make(map[string]func() (*jsonschema.Schema, error), len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		out[descriptor.Name] = descriptor.OutputType
+	}
+	return out
+}()
 
 // nullableMap relaxes a reflected map schema to accept JSON null. A nil Go map
 // marshals to null, while reflection only infers "object", so the unadjusted

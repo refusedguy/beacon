@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -231,16 +232,9 @@ func TestAllOutputSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AllOutputSchemas: %v", err)
 	}
-	wantTools := []string{
-		"beacon_watch_pr",
-		"beacon_wait_result",
-		"beacon_get_result",
-		"beacon_list_running",
-		"beacon_ack",
-		"beacon_cancel_watch",
-		"beacon_stats",
-		"beacon_defer_wiring",
-		"beacon_task_claim",
+	wantTools := make([]string, 0, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		wantTools = append(wantTools, descriptor.Name)
 	}
 	if len(schemas) != len(wantTools) {
 		t.Errorf("schema count = %d, want %d", len(schemas), len(wantTools))
@@ -260,6 +254,45 @@ func TestAllOutputSchemas(t *testing.T) {
 	assertSchemaFromType[StatsOutput](t, schemas["beacon_stats"])
 	assertSchemaFromType[DeferWiringOutput](t, schemas["beacon_defer_wiring"])
 	assertSchemaFromType[TaskClaimOutput](t, schemas["beacon_task_claim"])
+}
+
+// TestOutputSchemasComeFromDescriptors proves AllOutputSchemas is derived from
+// the descriptor table: every advertised name has exactly one factory and the
+// schema that factory produces is the one the server advertises.
+func TestOutputSchemasComeFromDescriptors(t *testing.T) {
+	schemas, err := AllOutputSchemas()
+	if err != nil {
+		t.Fatalf("AllOutputSchemas: %v", err)
+	}
+	if len(schemas) != len(toolDescriptors) {
+		t.Fatalf("schema count = %d, descriptors = %d", len(schemas), len(toolDescriptors))
+	}
+	for _, descriptor := range toolDescriptors {
+		if descriptor.OutputType == nil {
+			t.Errorf("%s: descriptor has no output schema factory", descriptor.Name)
+			continue
+		}
+		got, ok := schemas[descriptor.Name]
+		if !ok {
+			t.Errorf("no advertised schema for %s", descriptor.Name)
+			continue
+		}
+		want, err := descriptor.OutputType()
+		if err != nil {
+			t.Fatalf("%s: output schema: %v", descriptor.Name, err)
+		}
+		gotRaw, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("%s: marshal advertised schema: %v", descriptor.Name, err)
+		}
+		wantRaw, err := json.Marshal(want)
+		if err != nil {
+			t.Fatalf("%s: marshal descriptor schema: %v", descriptor.Name, err)
+		}
+		if !bytes.Equal(gotRaw, wantRaw) {
+			t.Errorf("%s: advertised schema differs from its descriptor factory", descriptor.Name)
+		}
+	}
 }
 
 // TestWatchPRSchemaExecutorMetadata proves the notify-metadata executor is

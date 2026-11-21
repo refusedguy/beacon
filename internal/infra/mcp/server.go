@@ -100,21 +100,139 @@ Self-teaching next action: beacon_get_result returns nextAction, nextCommand and
 
 Verdicts: watching, ready, rebase, retry, keep_working, timeout, merged, closed. A watching-to-watching tick changes no revision and wakes nobody.`
 
-// ToolNames is the exact set of tool names in the registry: the seven
-// contracted tools (WORKER-PROMPT §4.1), beacon_defer_wiring (W12-B) and
-// beacon_task_claim (ADR 0268). T2.1 registers stubs; each real handler
-// replaces its stub when wired.
-var ToolNames = []string{
-	"beacon_watch_pr",
-	"beacon_wait_result",
-	"beacon_get_result",
-	"beacon_list_running",
-	"beacon_ack",
-	"beacon_cancel_watch",
-	"beacon_stats",
-	"beacon_defer_wiring",
-	"beacon_task_claim",
+// toolKind is the honest annotation class of one advertised MCP tool. A tool
+// that writes readAt or claimedAt is additive, not read-only; cancel_watch is
+// the only destructive tool. kindAdditiveOnce is additive but leaves the stub's
+// idempotentHint unset, as beacon_task_claim does.
+type toolKind int
+
+const (
+	kindAdditive toolKind = iota
+	kindRead
+	kindDestructive
+	kindAdditiveOnce
+)
+
+// toolDescriptor is the single source of truth for one advertised MCP tool.
+// Its fields feed ToolNames, toolAnnotations and outputSchemaFactories, so a
+// tool cannot be present in some copies and absent from the rest. Handler calls
+// the existing Attach helper; it does not replace the helper with a generic
+// AddTool loop, because ADR 0263 forbids silent registration (ARDH-07).
+type toolDescriptor struct {
+	Name        string
+	Description string
+	OutputType  func() (*jsonschema.Schema, error)
+	Kind        toolKind
+	Handler     func(*mcpsdk.Server, Dependencies, map[string]*jsonschema.Schema, string)
 }
+
+// toolDescriptors lists exactly the advertised tools. Adding a name here is
+// the only way to change the derived tables and the real-handler sequence.
+// Opt-in tools such as t3_thread_read stay out: the advertised set has a
+// byte-pinned tools/list contract that a tenth name would break.
+var toolDescriptors = []toolDescriptor{
+	{
+		Name:        "beacon_watch_pr",
+		Description: "Register or renew a Watch on a pull request head and subscribe the caller.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
+		Kind:        kindAdditive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
+			handler := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
+			handler.SetBlockerControl(deps.Blockers)
+			AttachWatchPR(s, handler)
+		},
+	},
+	{
+		Name:        "beacon_wait_result",
+		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
+		Kind:        kindAdditive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
+			AttachWaitResult(s, NewWaitResultServiceFromDeps(deps))
+		},
+	},
+	{
+		Name:        "beacon_get_result",
+		Description: "Read a Watch result without logs and mark its content as read.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
+		Kind:        kindAdditive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
+			handler := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
+			handler.SetAfter(deps.After)
+			AttachGetResult(s, handler)
+		},
+	},
+	{
+		Name:        "beacon_list_running",
+		Description: "List running Watches from a read-only state snapshot.",
+		OutputType:  listRunningOutputSchema,
+		Kind:        kindRead,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
+			attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"])
+		},
+	},
+	{
+		Name:        "beacon_ack",
+		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
+		Kind:        kindAdditive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
+			handler := NewAckHandler(deps.Store, deps.Stamper, deps.Clock)
+			handler.SetBlockerControl(deps.Blockers)
+			if deps.Continuations != nil {
+				handler.SetContinuationRegistry(deps.Continuations)
+			}
+			AttachAck(s, handler)
+		},
+	},
+	{
+		Name:        "beacon_cancel_watch",
+		Description: "Cancel a Watch or one subscriber; idempotent, history is kept.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
+		Kind:        kindDestructive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
+			RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
+		},
+	},
+	{
+		Name:        "beacon_stats",
+		Description: "Report persisted state counters from a read-only snapshot.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
+		Kind:        kindRead,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, version string) {
+			attachStats(s, deps.Snapshot, schemas["beacon_stats"], version)
+		},
+	},
+	{
+		Name:        "beacon_defer_wiring",
+		Description: "Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md.",
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[DeferWiringOutput]() },
+		Kind:        kindAdditive,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
+			AttachDeferWiring(s, NewDeferWiringHandler(deps.DeferWiring))
+		},
+	},
+	{
+		Name:        TaskClaimToolName,
+		Description: "Atomically claim one todo task card for an agent and return its full context.",
+		OutputType:  taskClaimOutputSchema,
+		Kind:        kindAdditiveOnce,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
+			attachTaskClaim(s, NewTaskClaimHandler(deps.TaskClaimStore), schemas[TaskClaimToolName])
+		},
+	},
+}
+
+// ToolNames is the exact set of advertised tool names. T2.1 registers stubs;
+// each real handler replaces its stub when wired. Derived from toolDescriptors
+// so the name cannot drift from the annotations, schema or handler tables.
+var ToolNames = func() []string {
+	names := make([]string, 0, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		names = append(names, descriptor.Name)
+	}
+	return names
+}()
 
 // Bridge is the six-operation port between Beacon's MCP core and one external
 // agent (ADR 0024). The core speaks only MCP; a bridge translates these six
@@ -152,20 +270,34 @@ type BridgeReply struct {
 
 func boolPtr(b bool) *bool { return &b }
 
-// toolAnnotations records the honest annotation class of each contracted tool
-// (WORKER-PROMPT §4.1). Tools that write readAt or claimedAt are additive, not
-// read-only; cancel_watch is the only destructive tool. DestructiveHint is a
-// pointer in the SDK, so it must be set explicitly even when false.
-var toolAnnotations = map[string]mcpsdk.ToolAnnotations{
-	"beacon_watch_pr":     {DestructiveHint: boolPtr(false), IdempotentHint: true},
-	"beacon_wait_result":  {DestructiveHint: boolPtr(false), IdempotentHint: true},
-	"beacon_get_result":   {DestructiveHint: boolPtr(false), IdempotentHint: true},
-	"beacon_list_running": {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
-	"beacon_ack":          {DestructiveHint: boolPtr(false), IdempotentHint: true},
-	"beacon_cancel_watch": {DestructiveHint: boolPtr(true)},
-	"beacon_stats":        {ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
-	"beacon_defer_wiring": {DestructiveHint: boolPtr(false), IdempotentHint: true},
-	"beacon_task_claim":   {DestructiveHint: boolPtr(false)},
+// annotationsForKind maps a descriptor's honest annotation class to the SDK
+// annotations used by the stub registration. DestructiveHint is a pointer in
+// the SDK, so it must be set explicitly even when false.
+func annotationsForKind(kind toolKind) mcpsdk.ToolAnnotations {
+	switch kind {
+	case kindRead:
+		return mcpsdk.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: boolPtr(false)}
+	case kindDestructive:
+		return mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(true)}
+	case kindAdditiveOnce:
+		return mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(false)}
+	default:
+		return mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: true}
+	}
+}
+
+// toolAnnotations records the honest annotation class of each advertised tool
+// (WORKER-PROMPT §4.1). Derived from toolDescriptors so an annotation cannot
+// drift from the name it belongs to. It is filled in init rather than by an
+// initializer: the descriptor Handler closures call attach helpers that read
+// this map, and an initializer would close a package initialization cycle.
+var toolAnnotations map[string]mcpsdk.ToolAnnotations
+
+func init() {
+	toolAnnotations = make(map[string]mcpsdk.ToolAnnotations, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		toolAnnotations[descriptor.Name] = annotationsForKind(descriptor.Kind)
+	}
 }
 
 // BlockerControl is the narrow control-plane port the two writing tools need.
@@ -501,9 +633,9 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 			SupportedProtocolVersions: LegacyProtocolVersions,
 		},
 	)
-	for _, name := range ToolNames {
-		annotations := toolAnnotations[name]
-		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: name, Annotations: &annotations}, stubHandler)
+	for _, descriptor := range toolDescriptors {
+		annotations := toolAnnotations[descriptor.Name]
+		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: descriptor.Name, Annotations: &annotations}, stubHandler)
 	}
 
 	// The real read tools carry an explicit output schema. go-sdk cannot infer
@@ -523,24 +655,9 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 		}
 	}
 
-	watchPR := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
-	watchPR.SetBlockerControl(deps.Blockers)
-	AttachWatchPR(s, watchPR)
-	AttachWaitResult(s, NewWaitResultServiceFromDeps(deps))
-	getResult := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
-	getResult.SetAfter(deps.After)
-	AttachGetResult(s, getResult)
-	attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"])
-	ack := NewAckHandler(deps.Store, deps.Stamper, deps.Clock)
-	ack.SetBlockerControl(deps.Blockers)
-	if deps.Continuations != nil {
-		ack.SetContinuationRegistry(deps.Continuations)
+	for _, descriptor := range toolDescriptors {
+		descriptor.Handler(s, deps, schemas, version)
 	}
-	AttachAck(s, ack)
-	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
-	attachStats(s, deps.Snapshot, schemas["beacon_stats"], version)
-	AttachDeferWiring(s, NewDeferWiringHandler(deps.DeferWiring))
-	attachTaskClaim(s, NewTaskClaimHandler(deps.TaskClaimStore), schemas["beacon_task_claim"])
 	return s
 }
 

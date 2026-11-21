@@ -35,61 +35,37 @@ const toolsListByteCount = 18212
 // length, which a size check alone would miss.
 const toolsListGoldenSHA256 = "ba0a9f42031cab8ff4733f89a8f6b3d1424be695367cbb6f305a3a0b60865f99"
 
+// expectedToolNames is the complete advertised tool contract. It is derived
+// from the descriptors so the witness cannot omit a tool the registry gained.
+// The byte count and SHA above stay hand-written: they are the independent
+// check that catches an unannounced change to a description or schema.
+var expectedToolNames = func() []string {
+	names := make([]string, 0, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		names = append(names, descriptor.Name)
+	}
+	return names
+}()
+
 // toolsListOrder is the fixed order in which the server lists its tools. The
-// SDK returns the nine tools sorted by name. Pinning the order makes that
-// behavior part of the contract, so a registration change that shuffles the
-// listing fails the test.
-var toolsListOrder = []string{
-	"beacon_ack",
-	"beacon_cancel_watch",
-	"beacon_defer_wiring",
-	"beacon_get_result",
-	"beacon_list_running",
-	"beacon_stats",
-	"beacon_task_claim",
-	"beacon_wait_result",
-	"beacon_watch_pr",
-}
+// SDK returns the tools sorted by name, so sorting the descriptor names pins
+// that behavior without repeating the names a third time.
+var toolsListOrder = func() []string {
+	names := slices.Clone(expectedToolNames)
+	slices.Sort(names)
+	return names
+}()
 
-// expectedToolNames is the complete tool contract: the seven tools from
-// WORKER-PROMPT 4.1, beacon_defer_wiring (W12-B) and beacon_task_claim
-// (ADR 0268). The order is not part of the contract, so the test compares
-// sorted slices.
-var expectedToolNames = []string{
-	"beacon_watch_pr",
-	"beacon_wait_result",
-	"beacon_get_result",
-	"beacon_list_running",
-	"beacon_ack",
-	"beacon_cancel_watch",
-	"beacon_stats",
-	"beacon_defer_wiring",
-	"beacon_task_claim",
-}
-
-// toolKind is the annotation class assigned to a tool in WORKER-PROMPT 4.1.
-type toolKind int
-
-const (
-	kindAdditive toolKind = iota
-	kindRead
-	kindDestructive
-)
-
-// expectedToolKinds maps every contracted tool to its honest annotation class.
+// expectedToolKinds maps every advertised tool to its honest annotation class.
 // A tool that writes readAt or claimedAt is additive, not read-only: the
 // distinction is the lesson from Tirith ADR-0033/0034 recorded in the audit.
-var expectedToolKinds = map[string]toolKind{
-	"beacon_watch_pr":     kindAdditive,
-	"beacon_wait_result":  kindAdditive,
-	"beacon_get_result":   kindAdditive,
-	"beacon_list_running": kindRead,
-	"beacon_ack":          kindAdditive,
-	"beacon_cancel_watch": kindDestructive,
-	"beacon_stats":        kindRead,
-	"beacon_defer_wiring": kindAdditive,
-	"beacon_task_claim":   kindAdditive,
-}
+var expectedToolKinds = func() map[string]toolKind {
+	out := make(map[string]toolKind, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		out[descriptor.Name] = descriptor.Kind
+	}
+	return out
+}()
 
 // listAllTools walks every tools/list page and returns the tools together with
 // the number of bytes produced by serializing each response. Counting every
@@ -192,7 +168,7 @@ func TestToolsListContract(t *testing.T) {
 			continue
 		}
 		switch expectedToolKinds[name] {
-		case kindAdditive:
+		case kindAdditive, kindAdditiveOnce:
 			if annotations.ReadOnlyHint {
 				t.Errorf("%s: additive tool must not be read-only", name)
 			}
@@ -311,6 +287,46 @@ func TestToolsListStabilityAcrossConnections(t *testing.T) {
 	}
 	if !slices.Equal(gotOrder, toolsListOrder) {
 		t.Errorf("tools/list order = %v, want %v", gotOrder, toolsListOrder)
+	}
+}
+
+// TestToolDescriptorsDescribeAdvertisedTools proves the single descriptor table
+// matches what tools/list advertises. The byte count and SHA above stay
+// hand-written; this test catches a descriptor that lost its handler or whose
+// description drifted from the tool a client actually sees.
+func TestToolDescriptorsDescribeAdvertisedTools(t *testing.T) {
+	clientSession := connectContractClient(t)
+	tools, _ := listAllTools(t, clientSession)
+
+	if len(tools) != len(toolDescriptors) {
+		t.Fatalf("advertised tools = %d, descriptors = %d", len(tools), len(toolDescriptors))
+	}
+	byName := make(map[string]*sdkmcp.Tool, len(tools))
+	for _, tool := range tools {
+		byName[tool.Name] = tool
+	}
+
+	version := BuildVersion()
+	for _, descriptor := range toolDescriptors {
+		if descriptor.Name == "" {
+			t.Error("descriptor with an empty name")
+			continue
+		}
+		if descriptor.Handler == nil {
+			t.Errorf("%s: descriptor has no handler", descriptor.Name)
+		}
+		tool := byName[descriptor.Name]
+		if tool == nil {
+			t.Errorf("no advertised tool for descriptor %s", descriptor.Name)
+			continue
+		}
+		wantDescription := descriptor.Description
+		if descriptor.Name == "beacon_stats" {
+			wantDescription = DescriptionWithVersion(wantDescription, version)
+		}
+		if tool.Description != wantDescription {
+			t.Errorf("%s: description = %q, want %q", descriptor.Name, tool.Description, wantDescription)
+		}
 	}
 }
 
