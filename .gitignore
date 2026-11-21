@@ -19,3 +19,8 @@ beacon.sock
 # Бинарники. Гейты коммитим намеренно, по Harbor и ADR 0016.
 /beacon
 bin/
+
+# Производные документы: создаются генераторами по запросу, в git не коммитятся (IDX-11).
+docs/FACTS.md
+docs/ROADMAP_STATUS.md
+docs/adrs/README.md
