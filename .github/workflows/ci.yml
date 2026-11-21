@@ -118,6 +118,26 @@ jobs:
           export PATH="$HOME/.opencode/bin:$PATH"
           bash tests/e2e/run.sh
 
+  # BCX-58. Живая проверка границы проекта: два проекта, разные watchID,
+  # реальный session.list через HTTP-клиент и реальный store. Тест входит и в
+  # go test ./..., но отдельная джоба делает прогон видимым и обязательным.
+  registry-live:
+    name: registry-live
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: ./.github/actions/go-runner-setup
+
+      - name: Live registry with two projects
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./cmd/beacon -run '^TestLiveRegistryTwoProjects$' -count=1 -v
+
   # T3.342. Две проверки seed-artery. Первая следит за составом
   # tests/scenarios/seeded.yaml: четыре отказа из S7.011 и прогон
   # healthy -> seeded -> healthy из w25. Вторая гоняет реальный
