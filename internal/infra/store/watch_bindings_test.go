@@ -1,8 +1,11 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -82,6 +85,30 @@ func TestRegisterWatchExecutorWritesBinding(t *testing.T) {
 	}
 	if executor.ConfigID != configID || executor.SessionID != sessionID {
 		t.Errorf("executor = %+v, want config %s and session %s", executor, configID, sessionID)
+	}
+}
+
+// TestWriteWatchBindingUsesCanonicalDDL pins the fix for the old mismatch:
+// registry.go created fencing_token as TEXT while migration 0005 declared it
+// INTEGER. A binding written after the table is dropped must get the migration
+// shape, including the project_key CHECK.
+func TestWriteWatchBindingUsesCanonicalDDL(t *testing.T) {
+	d := newWatchBindingTestDB(t)
+	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DROP TABLE IF EXISTS watch_bindings`)
+		return err
+	}); err != nil {
+		t.Fatalf("drop watch_bindings: %v", err)
+	}
+	if _, err := d.WriteWatchBinding(watchBindingEntry("watch-1", 2, 20, "cfg")); err != nil {
+		t.Fatalf("WriteWatchBinding after drop: %v", err)
+	}
+	if got := registryColumnType(t, d, "watch_bindings", "fencing_token"); got != "INTEGER" {
+		t.Errorf("fencing_token type = %q, want INTEGER", got)
+	}
+	body := registryTableSQL(t, d, "watch_bindings")
+	if !strings.Contains(body, "CHECK (length(project_key) > 0)") {
+		t.Errorf("watch_bindings lost the project_key CHECK: %s", body)
 	}
 }
 

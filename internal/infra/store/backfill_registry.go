@@ -47,8 +47,8 @@ func backfillRuntime(role domain.Role) string {
 }
 
 // registryHasColumn reports whether the live agent_registry schema owns the
-// named column. Migration 0005 has runtime, while a registry created on first
-// use by registry.go does not. Both shapes are accepted.
+// named column. EnsureRegistrySchema adds the columns read paths use, so a
+// caller can check a table that an older build created (ARDH-02).
 func registryHasColumn(q columnQuerier, name string) (bool, error) {
 	cols, err := tableColumns(q, "agent_registry")
 	if err != nil {
@@ -57,21 +57,13 @@ func registryHasColumn(q columnQuerier, name string) (bool, error) {
 	return cols[strings.ToLower(name)], nil
 }
 
-// backfillInsertSQL builds the insert for the schema in use. The migration
-// table needs runtime because it has no default; the registry-created table
-// has no such column and rejects the wider insert.
-func backfillInsertSQL(hasRuntime bool) string {
-	if hasRuntime {
-		return `INSERT OR IGNORE INTO agent_registry
+// backfillInsertSQL is the single insert shape. The canonical schema from
+// migration 0005 always has runtime, and EnsureRegistrySchema adds it to a
+// table created by an older build, so no per-schema variant is needed.
+const backfillInsertSQL = `INSERT OR IGNORE INTO agent_registry
 		  (project_key, agent_id, role, runtime, session_id, notify_adapter,
 		   notify_target, config_id, status, capabilities, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-	}
-	return `INSERT OR IGNORE INTO agent_registry
-		  (project_key, agent_id, role, session_id, notify_adapter,
-		   notify_target, config_id, status, capabilities, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-}
 
 // BackfillRegistry fills the project registry from the active watches. It is
 // safe to call on every read: an existing executor row is never rewritten, so
@@ -99,11 +91,6 @@ func (d *DB) BackfillRegistry(projectKey string, liveSessions []string) (Backfil
 		if err := ensureRegistryTables(tx); err != nil {
 			return err
 		}
-		hasRuntime, err := registryHasColumn(tx, "runtime")
-		if err != nil {
-			return err
-		}
-		insert := backfillInsertSQL(hasRuntime)
 		for _, w := range watches {
 			for _, s := range w.Subscribers {
 				agentID := strings.TrimSpace(s.ID)
@@ -118,13 +105,10 @@ func (d *DB) BackfillRegistry(projectKey string, liveSessions []string) (Backfil
 				if _, ok := live[agentID]; ok {
 					status = RegistryStatusActive
 				}
-				args := []any{projectKey, agentID, string(role)}
-				if hasRuntime {
-					args = append(args, backfillRuntime(role))
-				}
-				args = append(args, agentID, s.Adapter, s.Target, "", status,
-					encodeCapabilities(nil), now, now)
-				res, err := tx.Exec(insert, args...)
+				args := []any{projectKey, agentID, string(role), backfillRuntime(role),
+					agentID, s.Adapter, s.Target, "", status,
+					encodeCapabilities(nil), now, now}
+				res, err := tx.Exec(backfillInsertSQL, args...)
 				if err != nil {
 					return fmt.Errorf("store: backfill: insert %s: %w", agentID, err)
 				}

@@ -8,11 +8,10 @@
 // instead of being inserted, so wake never follows a stale subscriber
 // (ADR 0088, T5.37).
 //
-// The table normally arrives with T5.21's migration. This file also creates
-// it on first use, so a tree without that migration still compiles and runs.
-// The insert adapts to both schema variants: the migration has a dedicated
-// subscriber_id column, while an older registry stores the subscriber in
-// agent_id only.
+// The table has one DDL source: migrations/0005_agent_registry.sql. Startup
+// applies it as a migration and the first-use path executes the same embedded
+// file (ARDH-02). Both routes create a dedicated subscriber_id column and an
+// INTEGER fencing_token, so the inserts below need no schema detection.
 package store
 
 import (
@@ -31,35 +30,11 @@ import (
 // a lost race instead of a corrupt request.
 var ErrStaleWatchBinding = errors.New("store: binding: stale watch binding")
 
-const createWatchBindingTableSQL = `
-CREATE TABLE IF NOT EXISTS watch_bindings (
-  watch_id      TEXT NOT NULL,
-  revision      INTEGER NOT NULL,
-  project_key   TEXT NOT NULL,
-  agent_id      TEXT NOT NULL,
-  config_id     TEXT NOT NULL DEFAULT '',
-  fencing_token INTEGER NOT NULL DEFAULT 0,
-  subscriber_id TEXT NOT NULL DEFAULT '',
-  created_at    INTEGER NOT NULL,
-  PRIMARY KEY (watch_id, revision)
-);
-CREATE INDEX IF NOT EXISTS watch_bindings_by_project_agent
-  ON watch_bindings(project_key, agent_id);
-`
-
-const (
-	insertWatchBindingWithSubscriberSQL = `
+const insertWatchBindingSQL = `
 INSERT OR IGNORE INTO watch_bindings
   (project_key, watch_id, revision, agent_id, config_id,
    fencing_token, subscriber_id, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-
-	insertWatchBindingSQL = `
-INSERT OR IGNORE INTO watch_bindings
-  (project_key, watch_id, revision, agent_id, config_id,
-   fencing_token, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?)`
-)
 
 // WatchBindingEntry is one stored watch-to-executor binding. Revision is
 // uint64 in the domain and INTEGER in SQLite; the conversion is guarded.
@@ -103,25 +78,12 @@ func validateWatchBindingEntry(e WatchBindingEntry) error {
 }
 
 func ensureWatchBindingTable(tx *sql.Tx) error {
-	if _, err := tx.Exec(createWatchBindingTableSQL); err != nil {
-		return fmt.Errorf("store: binding: create table: %w", err)
-	}
-	return nil
+	return createRegistrySchema(tx)
 }
 
 // columnQuerier is satisfied by both *sql.Tx and *sql.DB.
 type columnQuerier interface {
 	Query(query string, args ...any) (*sql.Rows, error)
-}
-
-// hasWatchBindingColumn detects the schema variant in use. The migration
-// (T5.21) has subscriber_id; an older registry-created table does not.
-func hasWatchBindingColumn(q columnQuerier, name string) (bool, error) {
-	cols, err := tableColumns(q, "watch_bindings")
-	if err != nil {
-		return false, fmt.Errorf("store: binding: table info: %w", err)
-	}
-	return cols[strings.ToLower(name)], nil
 }
 
 // storedWatchBindings is the current state of one watch, read inside the write
@@ -133,17 +95,11 @@ type storedWatchBindings struct {
 	byRevision  map[uint64]WatchBindingEntry
 }
 
-func readWatchBindingState(q columnQuerier, watchID string, hasSubscriber bool) (storedWatchBindings, error) {
+func readWatchBindingState(q columnQuerier, watchID string) (storedWatchBindings, error) {
 	query := `
-SELECT project_key, revision, agent_id, config_id,
-       CAST(fencing_token AS INTEGER), created_at
-FROM watch_bindings WHERE watch_id = ?`
-	if hasSubscriber {
-		query = `
 SELECT project_key, revision, agent_id, config_id,
        CAST(fencing_token AS INTEGER), subscriber_id, created_at
 FROM watch_bindings WHERE watch_id = ?`
-	}
 
 	rows, err := q.Query(query, watchID)
 	if err != nil {
@@ -155,12 +111,8 @@ FROM watch_bindings WHERE watch_id = ?`
 	for rows.Next() {
 		var e WatchBindingEntry
 		var revision, token int64
-		var subscriber sql.NullString
-		dest := []any{&e.ProjectKey, &revision, &e.AgentID, &e.ConfigID, &token}
-		if hasSubscriber {
-			dest = append(dest, &subscriber)
-		}
-		dest = append(dest, &e.CreatedAt)
+		dest := []any{&e.ProjectKey, &revision, &e.AgentID, &e.ConfigID, &token,
+			&e.SubscriberID, &e.CreatedAt}
 		if err := rows.Scan(dest...); err != nil {
 			return storedWatchBindings{}, fmt.Errorf("store: binding: scan state: %w", err)
 		}
@@ -170,7 +122,6 @@ FROM watch_bindings WHERE watch_id = ?`
 		e.WatchID = watchID
 		e.Revision = uint64(revision)
 		e.FencingToken = token
-		e.SubscriberID = subscriber.String
 		if e.SubscriberID == "" {
 			e.SubscriberID = e.AgentID
 		}
@@ -209,11 +160,7 @@ func (d *DB) WriteWatchBinding(e WatchBindingEntry) (WatchBindingWrite, error) {
 		if err := ensureWatchBindingTable(tx); err != nil {
 			return err
 		}
-		hasSubscriber, err := hasWatchBindingColumn(tx, "subscriber_id")
-		if err != nil {
-			return err
-		}
-		state, err := readWatchBindingState(tx, e.WatchID, hasSubscriber)
+		state, err := readWatchBindingState(tx, e.WatchID)
 		if err != nil {
 			return err
 		}
@@ -227,16 +174,9 @@ func (d *DB) WriteWatchBinding(e WatchBindingEntry) (WatchBindingWrite, error) {
 				state.maxRevision, state.maxToken)
 		}
 
-		var res sql.Result
-		if hasSubscriber {
-			res, err = tx.Exec(insertWatchBindingWithSubscriberSQL,
-				e.ProjectKey, e.WatchID, int64(e.Revision), e.AgentID,
-				e.ConfigID, e.FencingToken, e.SubscriberID, now)
-		} else {
-			res, err = tx.Exec(insertWatchBindingSQL,
-				e.ProjectKey, e.WatchID, int64(e.Revision), e.AgentID,
-				e.ConfigID, e.FencingToken, now)
-		}
+		res, err := tx.Exec(insertWatchBindingSQL,
+			e.ProjectKey, e.WatchID, int64(e.Revision), e.AgentID,
+			e.ConfigID, e.FencingToken, e.SubscriberID, now)
 		if err != nil {
 			return fmt.Errorf("store: binding: insert: %w", err)
 		}
@@ -294,11 +234,7 @@ func (d *DB) LatestWatchBinding(watchID string) (WatchBindingEntry, bool, error)
 	if err != nil || !ok {
 		return WatchBindingEntry{}, false, err
 	}
-	hasSubscriber, err := hasWatchBindingColumn(d.readDB, "subscriber_id")
-	if err != nil {
-		return WatchBindingEntry{}, false, err
-	}
-	state, err := readWatchBindingState(d.readDB, watchID, hasSubscriber)
+	state, err := readWatchBindingState(d.readDB, watchID)
 	if err != nil {
 		return WatchBindingEntry{}, false, err
 	}

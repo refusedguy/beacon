@@ -1,9 +1,9 @@
 // Package store: project-scoped executor registry and watch bindings.
 //
-// This file owns the agent_registry and watch_bindings tables. The migration
-// corpus belongs to another card (T5.21), so both tables are created on first
-// use, the same way archive.go, observability.go and receipts.go own theirs.
-// No caller outside this package needs to know when the tables appeared.
+// The registry tables have one DDL source: migrations/0005_agent_registry.sql.
+// Startup applies that file as a migration, and the first-use path executes the
+// same embedded file, so both routes create the same columns, types and CHECK
+// constraints (ARDH-02). No caller outside this package creates these tables.
 //
 // The registry stores one executor per (project_key, agent_id) pair. A repeated
 // register with the same pair is an upsert: it refreshes the mutable fields and
@@ -40,50 +40,26 @@ const (
 	RegistryStatusStopped = "stopped"
 )
 
-// createAgentRegistrySQL owns the executor table. created_at is written once
-// and preserved by the upsert; updated_at moves on every refresh. The index
-// mirrors the (project_key, status) index from the migration, so a registry
-// created here has the same access path as one created by T5.21.
-const createAgentRegistrySQL = `
-CREATE TABLE IF NOT EXISTS agent_registry (
-  project_key    TEXT NOT NULL,
-  agent_id       TEXT NOT NULL,
-  role           TEXT NOT NULL,
-  runtime        TEXT NOT NULL DEFAULT '',
-  session_id     TEXT NOT NULL DEFAULT '',
-  notify_adapter TEXT NOT NULL DEFAULT '',
-  notify_target  TEXT NOT NULL DEFAULT '',
-  capabilities   BLOB NOT NULL DEFAULT '[]',
-  config_id      TEXT NOT NULL DEFAULT '',
-  status         TEXT NOT NULL DEFAULT 'active',
-  last_seen      INTEGER NOT NULL DEFAULT 0,
-  worktree       TEXT NOT NULL DEFAULT '',
-  created_at     INTEGER NOT NULL,
-  updated_at     INTEGER NOT NULL,
-  PRIMARY KEY (project_key, agent_id)
-);
-CREATE INDEX IF NOT EXISTS agent_registry_by_project_status
-  ON agent_registry(project_key, status);
-`
+// registrySchemaFile is the single DDL source for the registry tables. db.go
+// embeds it in migrationFS, so startup migrations and first-use creation run
+// the same statements (ARDH-02). Do not add a second CREATE TABLE for these
+// tables anywhere in this package.
+const registrySchemaFile = "migrations/0005_agent_registry.sql"
 
-// createWatchBindingsSQL owns the binding table. config_id, fencing_token and
-// subscriber_id are present so the migration schema and the on-first-use schema
-// accept the same insert without changing either one at write time.
-const createWatchBindingsSQL = `
-CREATE TABLE IF NOT EXISTS watch_bindings (
-  watch_id      TEXT NOT NULL,
-  revision      INTEGER NOT NULL,
-  project_key   TEXT NOT NULL,
-  agent_id      TEXT NOT NULL,
-  config_id     TEXT NOT NULL DEFAULT '',
-  fencing_token TEXT NOT NULL DEFAULT '',
-  subscriber_id TEXT NOT NULL DEFAULT '',
-  created_at    INTEGER NOT NULL,
-  PRIMARY KEY (watch_id, revision)
-);
-CREATE INDEX IF NOT EXISTS watch_bindings_by_executor
-  ON watch_bindings(project_key, agent_id);
-`
+// createRegistrySchema executes the canonical registry DDL. Write paths call
+// it before touching a table, so agent_registry, agent_capabilities and
+// watch_bindings keep the migration's column types, defaults and CHECK
+// constraints regardless of which path created them.
+func createRegistrySchema(tx *sql.Tx) error {
+	ddl, err := migrationFS.ReadFile(registrySchemaFile)
+	if err != nil {
+		return fmt.Errorf("store: registry: read schema: %w", err)
+	}
+	if _, err := tx.Exec(string(ddl)); err != nil {
+		return fmt.Errorf("store: registry: create schema: %w", err)
+	}
+	return nil
+}
 
 // ExecutorRecord is one registered executor. AgentID is the primary key inside
 // a project; SessionID is the opaque delivery address and may be empty when a
@@ -143,22 +119,30 @@ type RegisterResult struct {
 	BindingNew  bool
 }
 
-// ensureRegistryTables creates both tables inside the caller's transaction.
-// It is safe to call on every write; IF NOT EXISTS makes a repeat free.
+// ensureRegistryTables applies the canonical DDL inside the caller's
+// transaction, then lifts an older agent_registry to the current column set.
+// The CREATE statements use IF NOT EXISTS; the ALTERs are guarded by
+// PRAGMA table_info. Both parts are idempotent and safe against a second
+// writer (ARDH-02).
+//
+// Migration 0005 predates the sync columns. Earlier on-first-use builds also
+// omitted digest and runtime. Read paths select these by name, so add whatever
+// is missing on every write.
+//
+// TODO(ARDH-02): SQLite cannot change a stored column type with ALTER. A
+// watch_bindings table from the old on-first-use DDL keeps fencing_token as
+// TEXT, and an old agent_registry keeps capabilities as BLOB. Reads cast the
+// token and scan capabilities into bytes, so both stay usable. Converting the
+// stored types needs a table rebuild and is left for a live migration window.
 func ensureRegistryTables(tx *sql.Tx) error {
-	for _, stmt := range []string{createAgentRegistrySQL, createWatchBindingsSQL} {
-		if _, err := tx.Exec(stmt); err != nil {
-			return fmt.Errorf("store: registry: create table: %w", err)
-		}
+	if err := createRegistrySchema(tx); err != nil {
+		return err
 	}
-	// A table created by migration 0005 predates the sync columns. CREATE TABLE
-	// IF NOT EXISTS cannot add them, and the read paths below select them by
-	// name, so add what is missing here on every write. PRAGMA table_info is a
-	// read and the ALTER runs in the caller's transaction, which makes the
-	// whole guard idempotent and safe against a second writer.
 	for _, col := range []struct{ name, def string }{
 		{"last_seen", "INTEGER NOT NULL DEFAULT 0"},
 		{"worktree", "TEXT NOT NULL DEFAULT ''"},
+		{"digest", "TEXT NOT NULL DEFAULT ''"},
+		{"runtime", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		has, err := registryHasColumn(tx, col.name)
 		if err != nil {

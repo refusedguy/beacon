@@ -6,9 +6,68 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 )
+
+// registryColumnType reads a column's declared SQLite type. The schema has one
+// DDL source, so the type must match migration 0005 on both creation paths.
+func registryColumnType(t *testing.T, d *DB, table, column string) string {
+	t.Helper()
+	rows, err := d.readDB.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatalf("table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		if name == column {
+			return typ
+		}
+	}
+	t.Fatalf("column %s.%s missing", table, column)
+	return ""
+}
+
+func registryTableSQL(t *testing.T, d *DB, table string) string {
+	t.Helper()
+	var body string
+	if err := d.readDB.QueryRow(
+		`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, table,
+	).Scan(&body); err != nil {
+		t.Fatalf("read DDL for %s: %v", table, err)
+	}
+	return body
+}
+
+func assertCanonicalColumns(t *testing.T, d *DB) {
+	t.Helper()
+	for _, tc := range []struct{ table, column, want string }{
+		{"agent_registry", "digest", "TEXT"},
+		{"agent_registry", "capabilities", "TEXT"},
+		{"watch_bindings", "fencing_token", "INTEGER"},
+		{"watch_bindings", "subscriber_id", "TEXT"},
+	} {
+		if got := registryColumnType(t, d, tc.table, tc.column); got != tc.want {
+			t.Errorf("%s.%s type = %q, want %q", tc.table, tc.column, got, tc.want)
+		}
+	}
+	for _, tc := range []struct{ table, column string }{
+		{"agent_registry", "project_key"},
+		{"agent_registry", "agent_id"},
+		{"watch_bindings", "project_key"},
+	} {
+		if body := registryTableSQL(t, d, tc.table); !strings.Contains(body, "CHECK") {
+			t.Errorf("%s has no CHECK constraint: %s", tc.table, body)
+		}
+	}
+}
 
 func newRegistryTestDB(t *testing.T) *DB {
 	t.Helper()
@@ -435,6 +494,36 @@ func TestRegisterResultIsUseful(t *testing.T) {
 	}
 }
 
+func TestMigratedSchemaIsCanonical(t *testing.T) {
+	d := newRegistryTestDB(t)
+	assertCanonicalColumns(t, d)
+}
+
+func TestFirstUseCreationUsesCanonicalSchema(t *testing.T) {
+	d := newRegistryTestDB(t)
+	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		for _, table := range []string{"agent_registry", "agent_capabilities", "watch_bindings"} {
+			if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("drop registry tables: %v", err)
+	}
+
+	if _, err := d.UpsertExecutor(registryExecutor("project-a", "session-1")); err != nil {
+		t.Fatalf("UpsertExecutor after drop: %v", err)
+	}
+	if _, err := d.WriteWatchBinding(watchBindingEntry("watch-1", 1, 1, "cfg")); err != nil {
+		t.Fatalf("WriteWatchBinding after drop: %v", err)
+	}
+	assertCanonicalColumns(t, d)
+	for _, table := range []string{"agent_registry", "agent_capabilities", "watch_bindings"} {
+		registryTableSQL(t, d, table)
+	}
+}
+
 func TestRegistrySchemaHasSyncColumns(t *testing.T) {
 	d := newRegistryTestDB(t)
 	// A write runs the on-first-use migration that adds the sync columns.
@@ -476,7 +565,7 @@ func TestEnsureRegistrySchemaAddsSyncColumnsToOldTable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recreate old table: %v", err)
 	}
-	for _, name := range []string{"last_seen", "worktree"} {
+	for _, name := range []string{"last_seen", "worktree", "digest"} {
 		has, err := registryHasColumn(d.readDB, name)
 		if err != nil {
 			t.Fatalf("registryHasColumn(%s): %v", name, err)
@@ -493,7 +582,7 @@ func TestEnsureRegistrySchemaAddsSyncColumnsToOldTable(t *testing.T) {
 	if err := d.EnsureRegistrySchema(); err != nil {
 		t.Fatalf("second EnsureRegistrySchema: %v", err)
 	}
-	for _, name := range []string{"last_seen", "worktree"} {
+	for _, name := range []string{"last_seen", "worktree", "digest"} {
 		has, err := registryHasColumn(d.readDB, name)
 		if err != nil {
 			t.Fatalf("registryHasColumn(%s) after migration: %v", name, err)
