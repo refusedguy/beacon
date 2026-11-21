@@ -132,3 +132,85 @@ func (d *DB) SnapshotCount() (int, error) {
 	err = d.readDB.QueryRow(`SELECT count(*) FROM snapshots`).Scan(&n)
 	return n, err
 }
+
+// RecoveryOutcome is the explicit result of restoring one node from a
+// snapshot. The values are stable strings so an operator can read them from a
+// restore report. A node always gets one of them; restore never leaves a node
+// in an unnamed state.
+type RecoveryOutcome string
+
+const (
+	// OutcomeResumed reuses the live session and Watch recorded in the
+	// snapshot: the worker picks up its in-flight obligation.
+	OutcomeResumed RecoveryOutcome = "resumed"
+	// OutcomeFreshPrimed starts a fresh worker from a healthy Watch that has
+	// no durable session. It is never used to hide a failed resume.
+	OutcomeFreshPrimed RecoveryOutcome = "fresh-primed"
+	// OutcomeAwaitingDecision holds the node until the orchestrator decides
+	// whether to merge the ready Watch or wait.
+	OutcomeAwaitingDecision RecoveryOutcome = "awaiting-decision"
+	// OutcomeAttentionRequired needs an agent or an operator to act: a failed
+	// session, a blocked Watch or a verdict that cannot advance on its own.
+	OutcomeAttentionRequired RecoveryOutcome = "attention-required"
+	// OutcomeFailed means the node could not be restored at all. It is
+	// reported explicitly instead of silently starting a fresh worker
+	// (ADR 0113).
+	OutcomeFailed RecoveryOutcome = "failed"
+)
+
+// RecoveryNode is the per-node input to ClassifyRecovery. Session is nil when
+// the node has no persisted session, Watch is nil when the snapshot carried no
+// Watch, and Err carries a decode or read failure for the node.
+type RecoveryNode struct {
+	Session *Session
+	Watch   *domain.Watch
+	Err     error
+}
+
+// verdictNeedsAttention reports whether v is a verdict that cannot advance
+// without an agent or an operator: a rebase, a bounded retry, a keep_working
+// fix, a timeout or a block. Ready and watching are deliberately excluded.
+func verdictNeedsAttention(v domain.Verdict) bool {
+	switch v {
+	case domain.VerdictRebase, domain.VerdictRetry, domain.VerdictKeepWorking,
+		domain.VerdictTimeout, domain.VerdictBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+// terminalWatch reports whether w has finished: a merged or closed verdict,
+// or a closed status. A finished node has no live work to resume and is left
+// for an operator to archive.
+func terminalWatch(w domain.Watch) bool {
+	return w.Verdict == domain.VerdictMerged || w.Verdict == domain.VerdictClosed ||
+		w.Status == domain.StatusClosed
+}
+
+// ClassifyRecovery returns the explicit restore outcome for one node. Rules
+// are applied in priority order and the first match wins. A failed restore is
+// never downgraded to a fresh prime, and a Watch that needs attention or a
+// decision is reported as such even when it has no session.
+func ClassifyRecovery(node RecoveryNode) RecoveryOutcome {
+	if node.Err != nil || node.Watch == nil {
+		return OutcomeFailed
+	}
+	w := node.Watch
+	if terminalWatch(*w) {
+		return OutcomeAttentionRequired
+	}
+	if verdictNeedsAttention(w.Verdict) || w.Status == domain.StatusBlocked || w.Blocked != nil {
+		return OutcomeAttentionRequired
+	}
+	if node.Session != nil && node.Session.Status == SessionStatusClosed {
+		return OutcomeAttentionRequired
+	}
+	if w.Verdict == domain.VerdictReady {
+		return OutcomeAwaitingDecision
+	}
+	if node.Session == nil {
+		return OutcomeFreshPrimed
+	}
+	return OutcomeResumed
+}

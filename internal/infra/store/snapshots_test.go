@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 func openSnapshotsDB(t *testing.T) *DB {
@@ -220,5 +222,113 @@ func TestSaveSnapshotRejectsNegativeSchemaVersion(t *testing.T) {
 	}
 	if count != 0 {
 		t.Errorf("SnapshotCount = %d, want 0", count)
+	}
+}
+
+// healthyWatch is a Watch with live work and no block: restoring it with an
+// active session is an ordinary resume, and without a session a fresh prime.
+func healthyWatch() *domain.Watch {
+	return &domain.Watch{
+		ID:      "watch-1",
+		Status:  domain.StatusWatching,
+		Verdict: domain.VerdictWatching,
+	}
+}
+
+func activeSession() *Session {
+	return &Session{ID: "sess-1", Status: SessionStatusActive}
+}
+
+func TestClassifyRecoveryAllOutcomes(t *testing.T) {
+	blocked := healthyWatch()
+	blocked.Status = domain.StatusBlocked
+	blocked.Blocked = &domain.BlockedInfo{Reason: "failed checks"}
+	terminal := healthyWatch()
+	terminal.Verdict = domain.VerdictMerged
+	closedSession := activeSession()
+	closedSession.Status = SessionStatusClosed
+
+	cases := []struct {
+		name string
+		node RecoveryNode
+		want RecoveryOutcome
+	}{
+		{
+			name: "resumed",
+			node: RecoveryNode{Session: activeSession(), Watch: healthyWatch()},
+			want: OutcomeResumed,
+		},
+		{
+			name: "fresh-primed",
+			node: RecoveryNode{Watch: healthyWatch()},
+			want: OutcomeFreshPrimed,
+		},
+		{
+			name: "awaiting-decision",
+			node: RecoveryNode{Session: activeSession(), Watch: &domain.Watch{
+				Status: domain.StatusWatching, Verdict: domain.VerdictReady,
+			}},
+			want: OutcomeAwaitingDecision,
+		},
+		{
+			name: "attention-required-rebase",
+			node: RecoveryNode{Session: activeSession(), Watch: &domain.Watch{
+				Status: domain.StatusWatching, Verdict: domain.VerdictRebase,
+			}},
+			want: OutcomeAttentionRequired,
+		},
+		{
+			name: "attention-required-blocked",
+			node: RecoveryNode{Session: activeSession(), Watch: blocked},
+			want: OutcomeAttentionRequired,
+		},
+		{
+			name: "attention-required-closed-session",
+			node: RecoveryNode{Session: closedSession, Watch: healthyWatch()},
+			want: OutcomeAttentionRequired,
+		},
+		{
+			name: "attention-required-terminal-watch",
+			node: RecoveryNode{Session: activeSession(), Watch: terminal},
+			want: OutcomeAttentionRequired,
+		},
+		{
+			name: "failed-decode-error",
+			node: RecoveryNode{
+				Session: activeSession(), Watch: healthyWatch(),
+				Err: errors.New("decode payload"),
+			},
+			want: OutcomeFailed,
+		},
+		{
+			name: "failed-missing-watch",
+			node: RecoveryNode{Session: activeSession()},
+			want: OutcomeFailed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClassifyRecovery(tc.node); got != tc.want {
+				t.Errorf("ClassifyRecovery = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestClassifyRecoveryAbsentSession(t *testing.T) {
+	// A healthy Watch with no durable session is primed fresh, not resumed and
+	// not failed. The absence of a session is itself the deciding input.
+	node := RecoveryNode{Watch: healthyWatch()}
+	if got := ClassifyRecovery(node); got != OutcomeFreshPrimed {
+		t.Errorf("ClassifyRecovery with no session = %q, want %q", got, OutcomeFreshPrimed)
+	}
+}
+
+func TestClassifyRecoveryFailedIsNotSilentlyReprimed(t *testing.T) {
+	// A failed restore is reported even when there is no session, so it can
+	// never be mistaken for an ordinary fresh prime (ADR 0113).
+	node := RecoveryNode{Err: errors.New("decode payload"), Watch: healthyWatch()}
+	if got := ClassifyRecovery(node); got != OutcomeFailed {
+		t.Errorf("ClassifyRecovery with error and no session = %q, want %q", got, OutcomeFailed)
 	}
 }
