@@ -317,11 +317,31 @@ func (c *CLI) dispatch(args []string) int {
 		return 0
 	}
 	if run, ok := runnerFor[args[0]]; ok {
+		if hasHelpFlag(args[1:]) {
+			if !writeCommandHelp(c.out, args[0]) {
+				// Hidden commands have no catalog entry, but still owe the
+				// caller help on stdout with a zero exit code.
+				fmt.Fprintf(c.out, "name: %s\nusage: beacon %s [flags]\n", args[0], args[0])
+			}
+			return 0
+		}
 		return run(c, args[1:])
 	}
 	fmt.Fprintf(c.errOut, "beacon: неизвестная подкоманда %q\n", args[0])
 	writeUsage(c.errOut)
 	return 2
+}
+
+// hasHelpFlag reports whether the command arguments ask for help. It is
+// checked at dispatch so every command, including task and spawn whose flags
+// are parsed by hand, answers --help with its own help on stdout and exit 0.
+func hasHelpFlag(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			return true
+		}
+	}
+	return false
 }
 
 // registryCommand routes the registry subcommands. The list and check

@@ -141,6 +141,10 @@ func spawnPrompt(taskID, title string) string {
 // long-lived ACP runner instead and stays attached to its session/update
 // stream. No HTTP server or TUI is opened here (ADR 0060 п3 and п5).
 func (c *CLI) runSpawn(args []string) int {
+	if hasHelpFlag(args) {
+		writeCommandHelp(c.out, "spawn")
+		return 0
+	}
 	// parseFlags rejects positional arguments and the flag package stops at the
 	// first one, while spawn accepts flags both before and after the taskID.
 	// parseTaskArgs is the existing parser with that shape (cmd/beacon/task.go).

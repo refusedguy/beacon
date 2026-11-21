@@ -32,6 +32,10 @@ func TaskCommand(args []string, stdout, stderr io.Writer) int {
 
 // TaskCommandWithConfig выполняет подкоманду task с заданными каталогами.
 func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	if hasHelpFlag(args) {
+		writeCommandHelp(stdout, "task")
+		return taskstore.ExitOK
+	}
 	if len(args) > 0 && args[0] == "task" {
 		args = args[1:]
 	}

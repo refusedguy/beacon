@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -62,6 +63,20 @@ func commands() []command {
 	return out
 }
 
+// writeCommandHelp prints the one help format shared by `beacon what <cmd>`
+// and `<cmd> --help`. It writes to out so --help exits 0 with help on stdout
+// and never falls back to the general usage text. It reports whether the name
+// was found in the catalog.
+func writeCommandHelp(out io.Writer, name string) bool {
+	for _, c := range commands() {
+		if c.Name == name {
+			fmt.Fprintf(out, "name: %s\nsummary: %s\nusage: %s\n", c.Name, c.Summary, c.Usage)
+			return true
+		}
+	}
+	return false
+}
+
 func parseFlags(name string, args []string, errOut io.Writer, fs *flag.FlagSet) bool {
 	fs.SetOutput(errOut)
 	fs.Usage = func() {}
@@ -110,7 +125,12 @@ func runWhat(args []string, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("what", flag.ContinueOnError)
 	fs.SetOutput(errOut)
 	fs.Usage = func() {}
-	if fs.Parse(args) != nil {
+	err := fs.Parse(args)
+	if errors.Is(err, flag.ErrHelp) {
+		writeCommandHelp(out, "what")
+		return 0
+	}
+	if err != nil {
 		writeUsage(errOut)
 		return 2
 	}
@@ -121,11 +141,8 @@ func runWhat(args []string, out, errOut io.Writer) int {
 	}
 
 	name := fs.Arg(0)
-	for _, c := range commands() {
-		if c.Name == name {
-			fmt.Fprintf(out, "name: %s\nsummary: %s\nusage: %s\n", c.Name, c.Summary, c.Usage)
-			return 0
-		}
+	if writeCommandHelp(out, name) {
+		return 0
 	}
 
 	fmt.Fprintf(errOut, "beacon what: неизвестная команда %q\n", name)
