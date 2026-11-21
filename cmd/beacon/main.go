@@ -134,6 +134,7 @@ func wireOpenCodePorts() {
 		return
 	}
 	installOpenCodePorts(port)
+	SetOpenCodePort(port)
 }
 
 // installOpenCodePorts adapts one client to every command port it can serve.
@@ -142,30 +143,18 @@ func wireOpenCodePorts() {
 // deliver.go and opencode.go; the T3.144 reader has no POST routes and no
 // fallback starter, so those ports stay honestly unwired until T3.150 and
 // T3.151 merge. No call to a method that does not exist yet is compiled here.
-func installOpenCodePorts(port opencodePort) {
+func installOpenCodePorts(port opencodeReader) {
 	SetLiveSource(newLiveOpencodeSource(port))
-	if spawner, ok := port.(sessionSpawner); ok {
-		SetSessionSpawner(spawner)
-	}
-	if target, ok := port.(deliveryTarget); ok {
-		SetDeliveryTarget(observingDeliveryTarget{next: target})
-	}
-	if creator, ok := port.(sessionCreator); ok {
-		SetSessionCreator(creator)
-	}
-	if ensurer, ok := port.(serverEnsurer); ok {
-		SetServerEnsurer(ensurer)
-	}
 }
 
 // liveOpencodeSource adapts the T3.144 client to the liveSource port consumed
 // by beacon watch --live. It only reshapes data: sessions become watch rows
 // and SSE results become opaque events. Reconnect stays in the client.
 type liveOpencodeSource struct {
-	port opencodePort
+	port opencodeReader
 }
 
-func newLiveOpencodeSource(port opencodePort) *liveOpencodeSource {
+func newLiveOpencodeSource(port opencodeReader) *liveOpencodeSource {
 	return &liveOpencodeSource{port: port}
 }
 

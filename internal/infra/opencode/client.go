@@ -17,8 +17,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,45 +39,6 @@ const (
 	maxSSEFrameBytes = 1 << 20
 	maxHTTPBodyBytes = 1 << 20
 )
-
-// readFile is replaceable in tests.
-var readFile = os.ReadFile
-
-// Config is the part of $XDG_STATE_HOME/opencode/service.json that the thin
-// client needs. Beacon only reads the registration file of an already running
-// service; it never starts one while the file exists (ADR 0029).
-type Config struct {
-	URL      string `json:"url"`
-	Password string `json:"password"`
-}
-
-// ReadConfig reads and validates the service registration file. A missing,
-// unreadable or malformed file is an error.
-func ReadConfig() (Config, error) {
-	base := os.Getenv("XDG_STATE_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return Config{}, fmt.Errorf("не удалось определить домашний каталог: %w", err)
-		}
-		base = filepath.Join(home, ".local", "state")
-	}
-	path := filepath.Join(base, "opencode", "service.json")
-
-	data, err := readFile(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("%s: %w", path, err)
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return Config{}, fmt.Errorf("%s: неверный registration-файл: %w", path, err)
-	}
-	cfg.URL = strings.TrimSpace(cfg.URL)
-	if cfg.URL == "" {
-		return Config{}, fmt.Errorf("%s: пустой url в registration-файле", path)
-	}
-	return cfg, nil
-}
 
 // Doer is the single HTTP seam. *http.Client implements it, and tests pass a
 // fake so no real server is needed.
@@ -133,7 +93,8 @@ func New(cfg Config, doer Doer) (*Client, error) {
 }
 
 // Agent is one entry of GET /api/agent. The primary source of agents is the
-// agent field of a session; this route is secondary (ADR 0060 п2).
+// agent field of a session; this route is kept for compatibility with older
+// OpenCode versions (ADR 0060 п2).
 type Agent struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -179,11 +140,12 @@ func (m *modelID) UnmarshalJSON(data []byte) error {
 // Session is one entry of GET /api/session. Fields follow the v2 response
 // shape recorded in ADR 0060.
 type Session struct {
-	ID       string  `json:"id"`
-	ParentID string  `json:"parentID"`
-	Agent    string  `json:"agent"`
-	ModelID  modelID `json:"model"`
-	Title    string  `json:"title"`
+	ID       string          `json:"id"`
+	ParentID string          `json:"parentID"`
+	Agent    string          `json:"agent"`
+	Status   json.RawMessage `json:"status"`
+	ModelID  modelID         `json:"model"`
+	Title    string          `json:"title"`
 	Time     struct {
 		Busy    int64  `json:"busy"`
 		Idle    int64  `json:"idle"`
@@ -194,13 +156,42 @@ type Session struct {
 	} `json:"location"`
 }
 
-// list is the envelope used by the agent and session routes:
-// {"data":[...],"location":{...}}.
+// ParseSessions is the single reader of a session.list payload. It accepts the
+// {"data":[...]} envelope returned by the API and by `opencode api`, as well as
+// a bare array for a stand-in. Every caller of session.list uses this function,
+// so the wire shape is decoded in one place (ADR 0060, ADR 0092).
+func ParseSessions(raw []byte) ([]Session, error) {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Data) != 0 {
+		var sessions []Session
+		if err := json.Unmarshal(envelope.Data, &sessions); err == nil {
+			return sessions, nil
+		}
+	}
+	var sessions []Session
+	if err := json.Unmarshal(raw, &sessions); err != nil {
+		return nil, fmt.Errorf("session.list: %w", err)
+	}
+	return sessions, nil
+}
+
+// list is the envelope used by the agent route: {"data":[...],"location":{...}}.
 type list[T any] struct {
 	Data     T `json:"data"`
 	Location struct {
 		Directory string `json:"directory"`
 	} `json:"location"`
+}
+
+func decodeList[T any](resp *http.Response) (list[T], error) {
+	defer resp.Body.Close()
+	var out list[T]
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 // get performs one authenticated GET. Callers own resp.Body on success; on a
@@ -230,11 +221,20 @@ func (c *Client) get(ctx context.Context, path string) (*http.Response, error) {
 // post performs one authenticated JSON POST. As with get, the caller owns
 // resp.Body on success; on a non-2xx status the body is closed here.
 func (c *Client) post(ctx context.Context, path string, payload any) (*http.Response, error) {
+	return c.send(ctx, http.MethodPost, path, payload)
+}
+
+// patch performs one authenticated JSON PATCH (the inbox promote route).
+func (c *Client) patch(ctx context.Context, path string, payload any) (*http.Response, error) {
+	return c.send(ctx, http.MethodPatch, path, payload)
+}
+
+func (c *Client) send(ctx context.Context, method, path string, payload any) (*http.Response, error) {
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("opencode POST %s: %w", path, err)
+		return nil, fmt.Errorf("opencode %s %s: %w", method, path, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
@@ -251,18 +251,9 @@ func (c *Client) post(ctx context.Context, path string, payload any) (*http.Resp
 		if msg == "" {
 			msg = resp.Status
 		}
-		return nil, fmt.Errorf("opencode POST %s: %s: %s", path, resp.Status, msg)
+		return nil, fmt.Errorf("opencode %s %s: %s: %s", method, path, resp.Status, msg)
 	}
 	return resp, nil
-}
-
-func decodeList[T any](resp *http.Response) (list[T], error) {
-	defer resp.Body.Close()
-	var out list[T]
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxHTTPBodyBytes)).Decode(&out); err != nil {
-		return out, err
-	}
-	return out, nil
 }
 
 // decodeSingle reads one object from the {"data":{...}} envelope used by the
@@ -311,7 +302,8 @@ func (c *Client) ListAgents(ctx context.Context) ([]Agent, error) {
 }
 
 // Sessions reads GET /api/session with a TTL cache. A cache hit returns a copy
-// so a caller cannot mutate the cached slice.
+// so a caller cannot mutate the cached slice. The payload is decoded by
+// ParseSessions, the same decoder used for every other session.list response.
 func (c *Client) Sessions(ctx context.Context) ([]Session, error) {
 	c.mu.Lock()
 	if c.sessionTTL > 0 && c.cachedSessions != nil && c.now().Sub(c.cachedAt) < c.sessionTTL {
@@ -325,18 +317,23 @@ func (c *Client) Sessions(ctx context.Context) ([]Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	decoded, err := decodeList[[]Session](resp)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, fmt.Errorf("opencode /api/session: %w", err)
+	}
+	sessions, err := ParseSessions(body)
 	if err != nil {
 		return nil, fmt.Errorf("opencode /api/session: %w", err)
 	}
 
 	if c.sessionTTL > 0 {
 		c.mu.Lock()
-		c.cachedSessions = append([]Session(nil), decoded.Data...)
+		c.cachedSessions = append([]Session(nil), sessions...)
 		c.cachedAt = c.now()
 		c.mu.Unlock()
 	}
-	return decoded.Data, nil
+	return sessions, nil
 }
 
 // CreateSession posts POST /api/session and returns the created session. The
@@ -384,7 +381,8 @@ func (c *Client) Prompt(ctx context.Context, sessionID, text string) error {
 }
 
 // Config reads the raw body of GET /api/config. The config shape belongs to
-// opencode, so the client does not guess it.
+// opencode, so the client does not guess it. The same route is the health probe
+// of the legacy spawn path in server.go.
 func (c *Client) Config(ctx context.Context) (json.RawMessage, error) {
 	resp, err := c.get(ctx, "/api/config")
 	if err != nil {
@@ -396,6 +394,31 @@ func (c *Client) Config(ctx context.Context) (json.RawMessage, error) {
 		return nil, fmt.Errorf("opencode /api/config: %w", err)
 	}
 	return json.RawMessage(data), nil
+}
+
+// Interrupt posts POST /api/session/:id/interrupt?resume=<bool>. The wake path
+// used to reach this route through `opencode api`; it now uses the one client
+// (ADR 0079, ADR 0092).
+func (c *Client) Interrupt(ctx context.Context, sessionID string, resume bool) error {
+	path := "/api/session/" + url.PathEscape(sessionID) + "/interrupt?resume=" + strconv.FormatBool(resume)
+	resp, err := c.post(ctx, path, struct{}{})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+// Promote patches one inbox item of a session so a parked input becomes steer.
+// This is the PATCH /api/session/:id/inbox/:inboxID route of ADR 0076.
+func (c *Client) Promote(ctx context.Context, sessionID, inboxID string) error {
+	path := "/api/session/" + url.PathEscape(sessionID) + "/inbox/" + url.PathEscape(inboxID)
+	resp, err := c.patch(ctx, path, map[string]string{"delivery": "steer"})
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
 }
 
 // Event is one parsed SSE frame from GET /api/event.

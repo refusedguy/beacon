@@ -17,6 +17,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 // watchSnapshot is the read-only Beacon port used by beacon watch. It has the
@@ -95,24 +96,19 @@ type watchRow struct {
 	Attention string `json:"attention,omitempty"`
 }
 
-// parseSessions reads the output of `opencode api session.list`. The CLI wraps
-// the payload in {"data": [...]}; a bare array is accepted as well so a mock
-// or a future CLI version works unchanged.
+// parseSessions reshapes a session.list payload into the watch table's view.
+// The JSON itself is decoded once by opencode.ParseSessions, which is also the
+// decoder of the HTTP client and of beacon agents (ADR 0092).
 func parseSessions(raw []byte) ([]opencodeSession, error) {
-	var envelope struct {
-		Data json.RawMessage `json:"data"`
+	decoded, err := opencode.ParseSessions(raw)
+	if err != nil {
+		return nil, err
 	}
-	if err := json.Unmarshal(raw, &envelope); err == nil && len(envelope.Data) != 0 {
-		var sessions []opencodeSession
-		if err := json.Unmarshal(envelope.Data, &sessions); err == nil {
-			return sessions, nil
-		}
+	out := make([]opencodeSession, 0, len(decoded))
+	for _, s := range decoded {
+		out = append(out, opencodeSession{ID: s.ID, Agent: s.Agent, Status: s.Status})
 	}
-	var sessions []opencodeSession
-	if err := json.Unmarshal(raw, &sessions); err != nil {
-		return nil, fmt.Errorf("session.list: %w", err)
-	}
-	return sessions, nil
+	return out, nil
 }
 
 // joinWatches pairs every subscriber with the session whose id equals the

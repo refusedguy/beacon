@@ -7,33 +7,54 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
-// opencodePort is the part of the opencode client the CLI may use. Keeping it
-// as a port lets future watch/spawn/deliver cards inject a fake without
-// importing net/http into cmd/beacon, which the capabilities gate forbids
-// (ADR 0005, ADR 0060 п1). The port knows no agent names from the domain core.
-type opencodePort interface {
+// opencodeReader is the read-only view of the one OpenCode client. It is the
+// part beacon watch and registry sync need; it exists so the composition root
+// can still install a stand-in without HTTP (ADR 0005, ADR 0060 п1).
+type opencodeReader interface {
 	ListAgents(context.Context) ([]opencode.Agent, error)
 	Sessions(context.Context) ([]opencode.Session, error)
 	Config(context.Context) (json.RawMessage, error)
 	EventStream(context.Context, []string) <-chan opencode.EventResult
 }
 
-var _ opencodePort = (*opencode.Client)(nil)
+// opencodePort is the one port through which every OpenCode call in cmd/beacon
+// goes. It carries both the read routes and the write routes. There is no
+// second write port: spawn, deliver and wake all resolve the same installed
+// object (ADR 0092).
+type opencodePort interface {
+	opencodeReader
+	CreateSession(parentID, agent, title string, metadata map[string]string) (string, error)
+	Prompt(sessionID, text string) error
+}
 
-// clientSessionCreator adapts the context-aware POST client of T3.150 to the
-// narrow ports used by beacon spawn and deliver. The client takes a context and
-// returns a Session, so *opencode.Client does not satisfy sessionCreator by
-// itself; installOpenCodePorts needs this adapter to wire the live client
-// (ADR 0060 п3/п4).
-type clientSessionCreator struct {
+// livePort is the single adapter from the context-aware HTTP client to the
+// context-free port used by spawn and deliver. It replaces the old
+// clientSessionCreator, sessionCreator and deliveryTarget adapters.
+type livePort struct {
 	client *opencode.Client
 }
 
-var _ sessionCreator = (*clientSessionCreator)(nil)
+var _ opencodePort = (*livePort)(nil)
+
+func (p *livePort) ListAgents(ctx context.Context) ([]opencode.Agent, error) {
+	return p.client.ListAgents(ctx)
+}
+
+func (p *livePort) Sessions(ctx context.Context) ([]opencode.Session, error) {
+	return p.client.Sessions(ctx)
+}
+
+func (p *livePort) Config(ctx context.Context) (json.RawMessage, error) {
+	return p.client.Config(ctx)
+}
+
+func (p *livePort) EventStream(ctx context.Context, types []string) <-chan opencode.EventResult {
+	return p.client.EventStream(ctx, types)
+}
 
 // CreateSession posts the session and returns its opaque id.
-func (a *clientSessionCreator) CreateSession(parentID, agent, title string, metadata map[string]string) (string, error) {
-	session, err := a.client.CreateSession(context.Background(), parentID, agent, title, metadata)
+func (p *livePort) CreateSession(parentID, agent, title string, metadata map[string]string) (string, error) {
+	session, err := p.client.CreateSession(context.Background(), parentID, agent, title, metadata)
 	if err != nil {
 		return "", err
 	}
@@ -41,48 +62,65 @@ func (a *clientSessionCreator) CreateSession(parentID, agent, title string, meta
 }
 
 // Prompt posts one message into an existing session.
-func (a *clientSessionCreator) Prompt(sessionID, text string) error {
-	return a.client.Prompt(context.Background(), sessionID, text)
+func (p *livePort) Prompt(sessionID, text string) error {
+	return p.client.Prompt(context.Background(), sessionID, text)
 }
 
-// sessionCreator is the narrow POST port shared by beacon spawn and deliver.
-// Both commands write one message into a live session, so the same two methods
-// serve both. Defining the port here lets the composition root install one
-// client behind both commands as soon as T3.150 adds the POST routes, with no
-// net/http import in cmd/beacon (ADR 0005, ADR 0060 п3 and п4).
-type sessionCreator interface {
-	CreateSession(parentID, agent, title string, metadata map[string]string) (string, error)
-	Prompt(sessionID, text string) error
-}
-
-// serverEnsurer is the fallback-server port of T3.151. A client that can ensure
-// a running server returns the registration it resolved, including the case
-// where it had to spawn opencode serve on a free port. This is the expected
-// T3.151 contract. installOpenCodePorts installs it by type assertion, so a
-// client without it keeps the service.json-only behaviour and the build stays
-// green until that card merges.
+// serverEnsurer and its shims are kept only so older stand-in tests still
+// compile. No production path installs one: the client reads service.json
+// through Discover and never spawns a server (ADR 0029, ADR 0092).
 type serverEnsurer interface {
 	EnsureServer(context.Context) (opencode.Config, error)
 }
 
-// serverEnsurerFunc adapts a package-level function to serverEnsurer. T3.151
-// may expose EnsureServer as a package function; the adapter lets the wiring
-// install it without moving the boundary into cmd/beacon.
 type serverEnsurerFunc func(context.Context) (opencode.Config, error)
 
 func (f serverEnsurerFunc) EnsureServer(ctx context.Context) (opencode.Config, error) {
 	return f(ctx)
 }
 
-// installedServerEnsurer is the fallback server starter. Nil means the CLI
-// still reads service.json only. wireOpenCodePorts installs one by type
-// assertion when the client exposes the port.
 var installedServerEnsurer serverEnsurer
 
-// SetSessionCreator installs one POST-capable client as both the spawn and the
-// delivery port. A nil argument clears both, so a command without a port
-// reports an honest error instead of dereferencing nil.
-func SetSessionCreator(c sessionCreator) {
+// SetServerEnsurer installs a stand-in starter for tests only.
+func SetServerEnsurer(e serverEnsurer) { installedServerEnsurer = e }
+
+func resolveOpencodeConfig(ctx context.Context) (opencode.Config, error) {
+	if installedServerEnsurer != nil {
+		return installedServerEnsurer.EnsureServer(ctx)
+	}
+	return opencode.Discover()
+}
+
+// opencodeHTTPDoer is replaceable in tests. A nil value means the real HTTP
+// client inside internal/infra/opencode.
+var opencodeHTTPDoer opencode.Doer
+
+// installedOpenCodePort is the single client object shared by every command.
+var installedOpenCodePort opencodePort
+
+// SetOpenCodePort installs the one port and fans it out to the command seams.
+// A nil argument clears all of them, so a command without a client reports an
+// honest error instead of dereferencing nil.
+func SetOpenCodePort(p opencodePort) {
+	installedOpenCodePort = p
+	if p == nil {
+		SetSessionSpawner(nil)
+		SetDeliveryTarget(nil)
+		return
+	}
+	SetSessionSpawner(p)
+	SetDeliveryTarget(observingDeliveryTarget{next: p})
+}
+
+// openCodePort returns the installed client. It may be nil.
+func openCodePort() opencodePort { return installedOpenCodePort }
+
+// SetSessionCreator is the legacy seam kept for tests that install a narrow
+// write stand-in. Production uses SetOpenCodePort.
+func SetSessionCreator(c interface {
+	CreateSession(string, string, string, map[string]string) (string, error)
+	Prompt(string, string) error
+}) {
 	if c == nil {
 		SetSessionSpawner(nil)
 		SetDeliveryTarget(nil)
@@ -92,29 +130,8 @@ func SetSessionCreator(c sessionCreator) {
 	SetDeliveryTarget(c)
 }
 
-// SetServerEnsurer installs the fallback server starter. A nil argument
-// restores the service.json-only path.
-func SetServerEnsurer(e serverEnsurer) { installedServerEnsurer = e }
-
-// resolveOpencodeConfig prefers the installed fallback starter and otherwise
-// reads service.json. Keeping the choice in one seam lets a stand-in drive the
-// whole path in tests without a live server or a hardcoded port (ADR 0060 п3).
-func resolveOpencodeConfig(ctx context.Context) (opencode.Config, error) {
-	if installedServerEnsurer != nil {
-		return installedServerEnsurer.EnsureServer(ctx)
-	}
-	return opencode.ReadConfig()
-}
-
-// opencodeHTTPDoer is replaceable in tests. A nil value means the real HTTP
-// client inside internal/infra/opencode.
-var opencodeHTTPDoer opencode.Doer
-
-// newOpencodePort resolves the service registration and returns a live client
-// for its address. The client never hardcodes a port (ADR 0029, ADR 0060 п3).
-// It also installs the POST and fallback ports here: the client's methods take
-// a context, so installOpenCodePorts cannot match them by type assertion
-// without these adapters.
+// newOpencodePort resolves the registration and builds the one client. The
+// address and password come from Discover; no fallback starter is installed.
 func newOpencodePort() (opencodePort, error) {
 	cfg, err := resolveOpencodeConfig(context.Background())
 	if err != nil {
@@ -124,17 +141,15 @@ func newOpencodePort() (opencodePort, error) {
 	if err != nil {
 		return nil, err
 	}
-	SetSessionCreator(&clientSessionCreator{client: client})
-	SetServerEnsurer(serverEnsurerFunc(opencode.EnsureServer))
-	return client, nil
+	return &livePort{client: client}, nil
 }
 
 // newReadOnlyOpencodePort builds a client from an existing service.json only.
-// It never installs the fallback server starter, so the MCP wake path cannot
+// It never installs a fallback server starter, so the MCP wake path cannot
 // spawn opencode serve. A missing registration returns an error; callers that
 // treat the port as optional leave the wake ports nil and use their CLI path.
-func newReadOnlyOpencodePort() (opencodePort, error) {
-	cfg, err := opencode.ReadConfig()
+func newReadOnlyOpencodePort() (opencodeReader, error) {
+	cfg, err := opencode.Discover()
 	if err != nil {
 		return nil, err
 	}

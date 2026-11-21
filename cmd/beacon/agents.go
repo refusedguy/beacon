@@ -14,6 +14,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 // agentsServiceHint is printed when the background OpenCode service has not
@@ -125,42 +127,13 @@ var subagentModes = map[string]bool{"subagent": true, "all": true}
 // file of the already running service, it never starts one (ADR 0029).
 var readServiceFile = os.ReadFile
 
-// opencodeServiceFile returns the registration file path
-// $XDG_STATE_HOME/opencode/service.json. The HOME fallback matches stateDir()
-// in doctor.go.
-func opencodeServiceFile() (string, error) {
-	base := os.Getenv("XDG_STATE_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("не удалось определить домашний каталог: %w", err)
-		}
-		base = filepath.Join(home, ".local", "state")
-	}
-	return filepath.Join(base, "opencode", "service.json"), nil
-}
-
-// readServiceRegistration confirms that the background service is running by
-// reading and validating its registration file. A missing, unreadable or
-// malformed file means the service is not available.
+// readServiceRegistration confirms that the background service is running.
+// The registration file is read by opencode.DiscoverWith, the single reader in
+// the infra package; readServiceFile stays here only as the injectable seam
+// used by tests (ADR 0092).
 func readServiceRegistration() error {
-	path, err := opencodeServiceFile()
-	if err != nil {
-		return err
-	}
-	data, err := readServiceFile(path)
-	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	var reg struct {
-		URL     string `json:"url"`
-		PID     int    `json:"pid"`
-		Version string `json:"version"`
-	}
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return fmt.Errorf("%s: неверный registration-файл: %w", path, err)
-	}
-	return nil
+	_, err := opencode.DiscoverWith(readServiceFile)
+	return err
 }
 
 // runAgents implements beacon agents [--format table|json] [--route]
@@ -300,14 +273,14 @@ func parseAgentRows(data []byte) ([]agentRow, error) {
 	return rows, nil
 }
 
-// parseAgentRowsFromSessions builds agent rows from `opencode api session.list`
-// (ADR 0060). parseSessions handles both the {"data": [...]} envelope and a
-// bare array. Every distinct non-empty `agent` value becomes one row; the agent
-// string is the ID and the name so attention requests and stale tasks keep
-// matching the same agent as they did with app.agents. Rows are sorted by ID
-// for stable output, with one row per agent even if several sessions use it.
+// parseAgentRowsFromSessions builds agent rows from a session.list payload.
+// The payload is decoded by opencode.ParseSessions, the single decoder shared
+// with the HTTP client and beacon watch (ADR 0060, ADR 0092). Every distinct
+// non-empty `agent` value becomes one row; the agent string is the ID and the
+// name so attention requests and stale tasks keep matching the same agent as
+// they did with app.agents. Rows are sorted by ID for stable output.
 func parseAgentRowsFromSessions(raw []byte) ([]agentRow, error) {
-	sessions, err := parseSessions(raw)
+	sessions, err := opencode.ParseSessions(raw)
 	if err != nil {
 		return nil, err
 	}
