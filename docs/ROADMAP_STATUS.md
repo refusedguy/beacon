@@ -3,7 +3,7 @@
 Триаж `docs/tasks/` по состоянию main после Waves 1–4 (2026-11-20).
 
 Дата пересчёта: 2026-11-21
-Baseline SHA: 800eea13496573cc750856d067f2729912664cf2
+Baseline SHA: a67afaf02961837b47ae3d7a7acd5b3985bf3be2
 
 - Закрыто done: **662**
 - Переведено dropped: **326**
@@ -18,13 +18,14 @@ Baseline SHA: 800eea13496573cc750856d067f2729912664cf2
 
 | Статус | Файлов |
 |---|---|
-| done | 607 |
+| done | 673 |
 | dropped | 326 |
-| todo | 45 |
+| todo | 146 |
+| in_progress | 1 |
 
-Фазы среди todo: P0 3, P2 4, P3 33, P5 5.
+Фазы среди todo: P0 32, P1 75, P2 35, P3 4.
 
-Команда: `git grep -l '^Статус: done\|^Статус: todo\|^Статус: dropped' <baseline> -- 'docs/tasks/*.md'`
+Команда: `git grep -l '^Статус: done\|^Статус: todo\|^Статус: dropped\|^Статус: in_progress' <baseline> -- 'docs/tasks/*.md'`
 
 
 ## Реестр оставшихся todo
