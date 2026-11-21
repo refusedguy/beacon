@@ -80,9 +80,8 @@ func TestDaemonWithoutWakeTargetDoesNotRegisterWatch(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("BEACON_STATE_DIR", stateDir)
 	t.Setenv("BEACON_DAEMON_INTERVAL", "")
-	// Values that used to supply the orchestrator session. They must be
+	// No wake-target env exists. A leftover BEACON_PARENT_SESSION must be
 	// ignored: the daemon has no wake target and no orchestrator subscriber.
-	t.Setenv("BEACON_WAKE_TARGET", "ses_ignored_env")
 	t.Setenv("BEACON_PARENT_SESSION", "ses_ignored_parent")
 
 	var out, errOut bytes.Buffer
@@ -117,7 +116,7 @@ func TestDaemonRejectsWakeTargetFlag(t *testing.T) {
 func TestCICheckAllWithoutWakeTargetDoesNotRegisterWatch(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("BEACON_STATE_DIR", stateDir)
-	t.Setenv("BEACON_WAKE_TARGET", "ses_ignored_env")
+	// No wake-target env exists. A leftover BEACON_PARENT_SESSION must be ignored.
 	t.Setenv("BEACON_PARENT_SESSION", "ses_ignored_parent")
 
 	var out, errOut bytes.Buffer
@@ -155,7 +154,7 @@ func TestCICheckAllRejectsWakeTargetFlag(t *testing.T) {
 func TestCICheckAllUpdatesExistingWatchWithoutWakeTarget(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("BEACON_STATE_DIR", stateDir)
-	t.Setenv("BEACON_WAKE_TARGET", "ses_ignored_env")
+	// No wake-target env exists. A leftover BEACON_PARENT_SESSION must be ignored.
 	t.Setenv("BEACON_PARENT_SESSION", "ses_ignored_parent")
 
 	db := ciOpenState(t, stateDir)
