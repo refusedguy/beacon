@@ -25,7 +25,7 @@ import (
 // missing Watch or Obligation. domain.Fanout relies on a non-nil error here.
 var errMissing = errors.New("memstore: not found")
 
-// memStore is a minimal domain.Store for these tool tests. It keeps the same
+// memStore is a minimal StateStore for these tool tests. It keeps the same
 // value semantics as the SQLite store: SaveWatch replaces by ID and a reader
 // never mutates the stored copy.
 type memStore struct {

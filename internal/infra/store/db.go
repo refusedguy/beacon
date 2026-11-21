@@ -1,4 +1,4 @@
-// Package store is the SQLite implementation of domain.Store.
+// Package store is the SQLite implementation of the domain state ports.
 //
 // One database file, driver modernc.org/sqlite (pure Go, CGO_ENABLED=0), WAL
 // and a single writer. Read traffic uses a separate pool so readers do not
@@ -44,8 +44,9 @@ var (
 	migrationFS embed.FS
 )
 
-// DB implements domain.Store on one SQLite file. Every mutating call is
-// serialized through one writer goroutine that owns one connection.
+// DB implements the narrow domain state and control-plane ports on one SQLite
+// file. Every mutating call is serialized through one writer goroutine that
+// owns one connection.
 type DB struct {
 	writeDB   *sql.DB
 	readDB    *sql.DB
@@ -74,7 +75,12 @@ type writeJob struct {
 	err chan error
 }
 
-var _ domain.Store = (*DB)(nil)
+var (
+	_ domain.WatchStore               = (*DB)(nil)
+	_ domain.ObligationStore          = (*DB)(nil)
+	_ domain.BlockerIncidentStore     = (*DB)(nil)
+	_ domain.OrchestratorBindingStore = (*DB)(nil)
+)
 
 // Open opens path, enables WAL, applies pending migrations and starts the
 // single writer. PRAGMAs are set in the DSN so modernc applies them to every

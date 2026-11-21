@@ -442,12 +442,18 @@ type Clock interface {
 	Now() time.Time
 }
 
-// Store persists watches and obligations. The domain only names the port.
-type Store interface {
+// WatchStore persists watches. The domain only names the port; infra implements it.
+type WatchStore interface {
 	SaveWatch(w Watch) error
 	Watch(id string) (Watch, error)
 	ActiveWatches() ([]Watch, error)
 	AllWatches() ([]Watch, error)
+}
+
+// ObligationStore persists subscriber obligations. A single WatchStore and a
+// single ObligationStore are assembled into one state store only in the
+// composition root; consumers declare the narrow port they need.
+type ObligationStore interface {
 	SaveObligation(o Obligation) error
 	Obligation(id string) (Obligation, error)
 	PendingObligations() ([]Obligation, error)
@@ -494,25 +500,25 @@ type Merger interface {
 	Merge(ctx context.Context, repo string, pr int) (merged bool, held bool, reason string, err error)
 }
 
-// BlockerStore persists blocker incidents and orchestrator bindings. FindBlocker
-// matches an open incident by repo, base ref and signature; the boolean reports
-// whether one was found. ResolveBlocker stamps ResolvedAt with at and is
-// idempotent. Binding and BindingBySession report false when no binding exists.
-type BlockerStore interface {
+// BlockerIncidentStore persists blocker incidents. FindBlocker matches an open
+// incident by repo, base ref and signature; the boolean reports whether one was
+// found. ResolveBlocker stamps ResolvedAt with at and is idempotent.
+type BlockerIncidentStore interface {
 	SaveBlocker(incident BlockerIncident) error
 	Blocker(id string) (BlockerIncident, error)
 	FindBlocker(repo, baseRef, signature string) (BlockerIncident, bool, error)
 	OpenBlockers() ([]BlockerIncident, error)
 	ResolveBlocker(id string, at time.Time) error
+}
+
+// OrchestratorBindingStore persists orchestrator bindings. Binding and
+// BindingBySession report false when no binding exists. The incident and binding
+// ports are assembled into one store only in the composition root.
+type OrchestratorBindingStore interface {
 	SaveBinding(binding OrchestratorBinding) error
 	Binding(projectKey string) (OrchestratorBinding, bool, error)
 	BindingBySession(sessionID string) (OrchestratorBinding, bool, error)
 }
-
-// ControlPlaneStore is the alternate name for BlockerStore. It exists so callers
-// that think of incidents and bindings as one control-plane concern can name
-// the same port.
-type ControlPlaneStore = BlockerStore
 
 // Notifier delivers a wake pointer to a subscriber.
 type Notifier interface {

@@ -3,7 +3,7 @@
 // One rapid.Check draws one command sequence; ten subtests run the same 1000
 // sequences and check a different invariant after every command. The harness
 // drives the real domain code (Fanout.Subscribe and Transition) through a
-// domain.Store implemented in memory. Checks 7 and 9 use that Store's write
+// domain state ports implemented in memory. Checks 7 and 9 use that store's write
 // counter and read-only methods as the card requires.
 //
 // Checks 8 and 10 encode the contract on domain types: the wake ledger and the
@@ -35,7 +35,7 @@ type propCommit struct {
 	obligations []Obligation
 }
 
-// propStore is the in-memory domain.Store used by the property harness. It
+// propStore is the in-memory state store used by the property harness. It
 // counts writes so read-only operations can be proven write-free.
 type propStore struct {
 	watches     map[string]Watch
@@ -51,7 +51,10 @@ func newPropStore() *propStore {
 	}
 }
 
-var _ Store = (*propStore)(nil)
+var (
+	_ WatchStore      = (*propStore)(nil)
+	_ ObligationStore = (*propStore)(nil)
+)
 
 func (s *propStore) SaveWatch(w Watch) error {
 	s.writes++

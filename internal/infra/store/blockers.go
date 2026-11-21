@@ -1,4 +1,4 @@
-// Package store is the SQLite implementation of domain.Store.
+// Package store is the SQLite implementation of the domain state ports.
 //
 // This file owns the control-plane tables added by migration 0006: blocker
 // incidents, project orchestrator bindings and runtime stats. All writes go

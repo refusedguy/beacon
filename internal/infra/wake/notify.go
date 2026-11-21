@@ -153,8 +153,8 @@ func ReasonFor(c TriageClass) string {
 	}
 }
 
-// WatchReader is the slice of domain.Store the notifier needs: read one Watch
-// by id. A full domain.Store satisfies it.
+// WatchReader is the slice of domain.WatchStore the notifier needs: read one
+// Watch by id. A full WatchStore satisfies it.
 type WatchReader interface {
 	Watch(id string) (domain.Watch, error)
 }

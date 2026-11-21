@@ -36,11 +36,12 @@ func (testNotifier) Notify(context.Context, Obligation, Pointer) (AttemptOutcome
 }
 
 var (
-	_ Clock      = testClock{}
-	_ Store      = testStore{}
-	_ CIProvider = testCI{}
-	_ Notifier   = testNotifier{}
-	_ error      = (*AppError)(nil)
+	_ Clock           = testClock{}
+	_ WatchStore      = testStore{}
+	_ ObligationStore = testStore{}
+	_ CIProvider      = testCI{}
+	_ Notifier        = testNotifier{}
+	_ error           = (*AppError)(nil)
 )
 
 func TestTypes(t *testing.T) {

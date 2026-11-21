@@ -1,4 +1,4 @@
-// Package store is the SQLite implementation of domain.Store.
+// Package store is the SQLite implementation of the domain state ports.
 //
 // This file owns the failure_excerpts cache table. The MCP handler calls it
 // through a narrow port and never imports this package (ADR 0005).

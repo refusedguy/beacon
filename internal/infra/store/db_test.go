@@ -263,7 +263,12 @@ func TestTwoConcurrentWritersAreSerialized(t *testing.T) {
 }
 
 func TestStorePortAndIdempotency(t *testing.T) {
-	var _ domain.Store = (*DB)(nil)
+	var (
+		_ domain.WatchStore               = (*DB)(nil)
+		_ domain.ObligationStore          = (*DB)(nil)
+		_ domain.BlockerIncidentStore     = (*DB)(nil)
+		_ domain.OrchestratorBindingStore = (*DB)(nil)
+	)
 
 	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

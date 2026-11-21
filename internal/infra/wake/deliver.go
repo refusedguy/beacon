@@ -40,7 +40,7 @@ type PromptFunc func(ctx context.Context, sessionID, text, delivery string) erro
 type SessionActiveFunc func(ctx context.Context, sessionID string) (busy bool, alive bool, err error)
 
 // ObligationDeliveryStore is the slice of the domain store the deliverer needs.
-// A SQLite-backed domain.Store satisfies it; wake declares the port in terms of
+// A SQLite-backed state store satisfies it; wake declares the port in terms of
 // domain types and never imports internal/infra/store (ADR 0005).
 type ObligationDeliveryStore interface {
 	Obligation(id string) (domain.Obligation, error)
