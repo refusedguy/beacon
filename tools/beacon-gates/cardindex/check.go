@@ -173,13 +173,23 @@ func gitLogFromProcess(root string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Dir already places the child in root. Passing -C root as well applies a
+	// relative root twice and makes git look outside the repository.
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	gitPath, err := filepath.Abs(git)
+	if err != nil {
+		return nil, err
+	}
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	proc, err := os.StartProcess(git, []string{git, "-C", root, "log", "--format=%s"}, &os.ProcAttr{
-		Dir:   root,
+	proc, err := os.StartProcess(gitPath, []string{gitPath, "log", "--format=%s"}, &os.ProcAttr{
+		Dir:   absRoot,
 		Files: []*os.File{os.Stdin, w, os.Stderr},
 	})
 	if err != nil {
@@ -198,7 +208,7 @@ func gitLogFromProcess(root string) ([]byte, error) {
 		return nil, err
 	}
 	if !state.Success() {
-		return nil, fmt.Errorf("git -C %s log: %s", root, state.String())
+		return nil, fmt.Errorf("git log in %s: %s", absRoot, state.String())
 	}
 	return out.Bytes(), nil
 }
