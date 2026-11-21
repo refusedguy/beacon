@@ -1,6 +1,6 @@
 # WIRING-1106. Bind worktree GC port in bridge composition root
 
-Статус: deferred
+Статус: todo
 Фаза: P3
 Тип: task
 Владелец файлов: cmd/beacon/mcp.go
