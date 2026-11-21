@@ -96,6 +96,102 @@ type wakeDeliveryKey struct {
 
 var _ domain.WakeDeliverer = (*OpenCodeDeliverer)(nil)
 
+// ===== Shared wake-identity dedup (T3.414) =====
+
+// DeliveryDedup is the ledger of wake identities already admitted by a
+// delivery supplier. The CI bridge path and the daemon path consult one shared
+// instance, so an obligation admitted by one supplier is a duplicate for the
+// other. The key is the obligation id, which already folds watchID, revision
+// and subscriber into one identity.
+type DeliveryDedup struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+}
+
+// NewDeliveryDedup returns an empty ledger. Tests use a fresh ledger so cases
+// cannot influence each other; production wiring uses SharedDeliveryDedup.
+func NewDeliveryDedup() *DeliveryDedup {
+	return &DeliveryDedup{seen: make(map[string]struct{})}
+}
+
+// Claim records obligationID and reports whether the caller is the first to
+// claim it. A false return means another supplier already admitted this wake,
+// so the caller must not start a second delivery.
+func (d *DeliveryDedup) Claim(obligationID string) bool {
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.seen == nil {
+		d.seen = make(map[string]struct{})
+	}
+	if _, exists := d.seen[obligationID]; exists {
+		return false
+	}
+	d.seen[obligationID] = struct{}{}
+	return true
+}
+
+// Seen reports whether obligationID was already claimed by either supplier.
+func (d *DeliveryDedup) Seen(obligationID string) bool {
+	if d == nil {
+		return false
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, exists := d.seen[obligationID]
+	return exists
+}
+
+// Release drops a claim after a failed delivery, so the obligation stays
+// eligible for a later pass.
+func (d *DeliveryDedup) Release(obligationID string) {
+	if d == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.seen, obligationID)
+}
+
+var sharedDeliveryDedup = NewDeliveryDedup()
+
+// SharedDeliveryDedup is the single ledger the two process suppliers share.
+// The bridge takes it through AdapterDedupDeliverer; the daemon takes it in
+// NewDaemonWaker. Both therefore agree on what counts as an already delivered
+// wake identity.
+func SharedDeliveryDedup() *DeliveryDedup { return sharedDeliveryDedup }
+
+// AdapterDedupDeliverer wraps an adapter-aware deliverer with a wake-identity
+// ledger. The bridge dispatches through the adapter name; a second wake for the
+// same obligation is coalesced before it reaches the inner deliverer.
+type AdapterDedupDeliverer struct {
+	Inner domain.AdapterWakeDeliverer
+	Dedup *DeliveryDedup
+}
+
+var _ domain.AdapterWakeDeliverer = (*AdapterDedupDeliverer)(nil)
+
+func (d *AdapterDedupDeliverer) Deliver(ctx context.Context, adapter, sessionID string, p domain.WakePayload) error {
+	if d == nil || d.Inner == nil {
+		return nil
+	}
+	ledger := d.Dedup
+	if ledger == nil {
+		ledger = SharedDeliveryDedup()
+	}
+	if !ledger.Claim(p.ObligationID) {
+		observe.WakeDuplicate(p.WatchID, p.Revision)
+		return nil
+	}
+	if err := d.Inner.Deliver(ctx, adapter, sessionID, p); err != nil {
+		ledger.Release(p.ObligationID)
+		return err
+	}
+	return nil
+}
+
 // Deliver emits a <beacon-event> envelope with only identifiers. The host's
 // prompt admission treats the text as untrusted input, never as a command.
 // A live HTTP port is used first; the CLI path is the fallback when that port

@@ -212,6 +212,7 @@ func NewDaemonWaker(lookup DaemonWatchLookup) Waker {
 		lookup:        lookup,
 		adapters:      adapters,
 		deliveredKeys: make(map[string]struct{}),
+		dedup:         wake.SharedDeliveryDedup(),
 	}
 }
 
@@ -245,6 +246,12 @@ type daemonWaker struct {
 	// of scope for this fix.
 	mu            sync.Mutex
 	deliveredKeys map[string]struct{}
+
+	// dedup is the wake-identity ledger shared with the CI bridge. It stops
+	// the bridge and the daemon from admitting the same obligation twice in
+	// one process. A nil ledger disables the cross-supplier guard in tests
+	// that build daemonWaker by hand.
+	dedup *wake.DeliveryDedup
 }
 
 // daemonWakeIsDelivered reports whether an adapter receipt counts as a
@@ -354,6 +361,12 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if daemonWakeAlreadyExists(w, pointer.ObligationID) {
 		return nil
 	}
+	// The CI bridge and the daemon share one wake-identity ledger. An
+	// obligation already admitted by the bridge must not be steered again here.
+	if w.dedup != nil && w.dedup.Seen(pointer.ObligationID) {
+		observe.WakeDuplicate(watchID, revision)
+		return nil
+	}
 	if w.route != nil {
 		if err := w.route(ctx, watch, revision, verdict, text); err != nil {
 			return err
@@ -371,6 +384,9 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 		}
 	}
 	w.deliveredKeys[pointer.ObligationID] = struct{}{}
+	if w.dedup != nil {
+		w.dedup.Claim(pointer.ObligationID)
+	}
 	return nil
 }
 

@@ -1235,3 +1235,131 @@ func TestT545DeliverFillsAgentIDFromBoundTarget(t *testing.T) {
 		t.Fatalf("stored receipt = %+v, ok = %v", stored, ok)
 	}
 }
+
+// ===== T3.414: one wake identity, one delivery across both suppliers =====
+
+type adapterDelivererFn struct {
+	fn func(context.Context, string, string, domain.WakePayload) error
+}
+
+func (a *adapterDelivererFn) Deliver(ctx context.Context, adapter, sessionID string, p domain.WakePayload) error {
+	return a.fn(ctx, adapter, sessionID, p)
+}
+
+// The CI bridge and the daemon consult the same ledger. A wake admitted by
+// one supplier is a duplicate for the other, so the obligation is steered once.
+func TestSharedDeliveryDedupCoalescesBothSuppliers(t *testing.T) {
+	ledger := NewDeliveryDedup()
+	const sessionID = "ses_shared"
+	p := domain.WakePayload{
+		WatchID:      "watch-shared",
+		ObligationID: domain.ObligationKey("watch-shared", 3, sessionID),
+		Revision:     3,
+		Verdict:      "ready",
+	}
+
+	bridgeCalls := 0
+	bridge := &AdapterDedupDeliverer{
+		Inner: &adapterDelivererFn{fn: func(context.Context, string, string, domain.WakePayload) error {
+			bridgeCalls++
+			return nil
+		}},
+		Dedup: ledger,
+	}
+
+	if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, p); err != nil {
+		t.Fatalf("bridge deliver: %v", err)
+	}
+	if bridgeCalls != 1 {
+		t.Fatalf("bridge calls = %d, want 1", bridgeCalls)
+	}
+
+	// The daemon sees the bridge's claim and refuses to steer the same wake.
+	if !ledger.Seen(p.ObligationID) {
+		t.Fatal("shared ledger does not record the bridge delivery")
+	}
+	if ledger.Claim(p.ObligationID) {
+		t.Fatal("a second claim for the same obligation must be refused")
+	}
+	if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, p); err != nil {
+		t.Fatalf("repeat bridge deliver: %v", err)
+	}
+	if bridgeCalls != 1 {
+		t.Fatalf("bridge calls = %d after repeat, want 1", bridgeCalls)
+	}
+
+	// A new revision is a new wake identity and gets its own delivery.
+	next := p
+	next.WatchID = "watch-shared-next"
+	next.ObligationID = domain.ObligationKey("watch-shared-next", 4, sessionID)
+	next.Revision = 4
+	if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, next); err != nil {
+		t.Fatalf("new revision deliver: %v", err)
+	}
+	if bridgeCalls != 2 {
+		t.Fatalf("bridge calls = %d after a new revision, want 2", bridgeCalls)
+	}
+}
+
+// The daemon may admit the wake first. The bridge then skips its delivery.
+func TestSharedDeliveryDedupDaemonFirstSuppressesBridge(t *testing.T) {
+	ledger := NewDeliveryDedup()
+	const sessionID = "ses_daemon_first"
+	obligationID := domain.ObligationKey("watch-daemon-first", 1, sessionID)
+
+	if !ledger.Claim(obligationID) {
+		t.Fatal("first daemon claim failed")
+	}
+
+	bridgeCalls := 0
+	bridge := &AdapterDedupDeliverer{
+		Inner: &adapterDelivererFn{fn: func(context.Context, string, string, domain.WakePayload) error {
+			bridgeCalls++
+			return nil
+		}},
+		Dedup: ledger,
+	}
+	p := domain.WakePayload{WatchID: "watch-daemon-first", ObligationID: obligationID, Revision: 1, Verdict: "ready"}
+	if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, p); err != nil {
+		t.Fatalf("bridge deliver: %v", err)
+	}
+	if bridgeCalls != 0 {
+		t.Fatalf("bridge calls = %d, want 0 for an obligation the daemon already delivered", bridgeCalls)
+	}
+}
+
+// A failed delivery releases the claim so the next pass may retry it.
+func TestSharedDeliveryDedupReleasesFailedClaim(t *testing.T) {
+	ledger := NewDeliveryDedup()
+	boom := errors.New("transport failed")
+	const sessionID = "ses_release"
+	p := domain.WakePayload{
+		WatchID:      "watch-release",
+		ObligationID: domain.ObligationKey("watch-release", 2, sessionID),
+		Revision:     2,
+	}
+
+	calls := 0
+	bridge := &AdapterDedupDeliverer{
+		Inner: &adapterDelivererFn{fn: func(context.Context, string, string, domain.WakePayload) error {
+			calls++
+			if calls == 1 {
+				return boom
+			}
+			return nil
+		}},
+		Dedup: ledger,
+	}
+	if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, p); !errors.Is(err, boom) {
+		t.Fatalf("first deliver = %v, want %v", err, boom)
+	}
+	if ledger.Seen(p.ObligationID) {
+		t.Fatal("a failed delivery must not stay claimed")
+	}
+	if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, p); err != nil {
+		t.Fatalf("retry deliver: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2 after a retry", calls)
+	}
+}

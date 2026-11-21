@@ -1673,7 +1673,10 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		return 0
 	}
 	bridge := cibridge.New(cfg.db, cfg.batch, cfg.deps.Clock, 0)
-	bridge.WithWaker(reconcileWaker(cfg.db)).
+	bridge.WithWaker(&wake.AdapterDedupDeliverer{
+		Inner: reconcileWaker(cfg.db),
+		Dedup: wake.SharedDeliveryDedup(),
+	}).
 		WithReader(cfg.deps.Stamper).
 		WithLadder(bridgeLadder{l: ladder.New(cfg.db)}).
 		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
