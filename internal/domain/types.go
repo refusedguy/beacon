@@ -500,24 +500,23 @@ type Merger interface {
 	Merge(ctx context.Context, repo string, pr int) (merged bool, held bool, reason string, err error)
 }
 
-// BlockerIncidentStore persists blocker incidents. FindBlocker matches an open
-// incident by repo, base ref and signature; the boolean reports whether one was
-// found. ResolveBlocker stamps ResolvedAt with at and is idempotent.
+// BlockerIncidentStore persists blocker incidents and steers their lifecycle.
+// GetOrCreateOpenBlocker folds failed checks into one incident and reports
+// whether it created a new one. ResolveBlocker returns the Watches it unblocked.
 type BlockerIncidentStore interface {
-	SaveBlocker(incident BlockerIncident) error
-	Blocker(id string) (BlockerIncident, error)
-	FindBlocker(repo, baseRef, signature string) (BlockerIncident, bool, error)
-	OpenBlockers() ([]BlockerIncident, error)
-	ResolveBlocker(id string, at time.Time) error
+	GetOrCreateOpenBlocker(repo, baseRef string, failedChecks []string, watchID string, now time.Time) (BlockerIncident, bool, error)
+	AssignFixer(blockerID, fixerWatchID string) (BlockerIncident, error)
+	ResolveBlocker(blockerID string, now time.Time) ([]Watch, error)
+	ResolveBlockersByBaseGreen(repo, baseRef string, baseFailed map[string]bool, now time.Time) ([]BlockerIncident, error)
+	ActiveBlockers() ([]BlockerIncident, error)
 }
 
-// OrchestratorBindingStore persists orchestrator bindings. Binding and
-// BindingBySession report false when no binding exists. The incident and binding
-// ports are assembled into one store only in the composition root.
+// OrchestratorBindingStore persists the session bound to a project.
+// BoundOrchestrator reports false when no binding exists. The incident and
+// binding ports are assembled into one store only in the composition root.
 type OrchestratorBindingStore interface {
-	SaveBinding(binding OrchestratorBinding) error
-	Binding(projectKey string) (OrchestratorBinding, bool, error)
-	BindingBySession(sessionID string) (OrchestratorBinding, bool, error)
+	BindOrchestrator(projectKey, sessionID, adapter string, now time.Time) error
+	BoundOrchestrator(projectKey string) (OrchestratorBinding, bool, error)
 }
 
 // Notifier delivers a wake pointer to a subscriber.
