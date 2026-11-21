@@ -21,6 +21,26 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
+// cliError is the one error form used by the CLI runners. It names the command
+// once and keeps the message in Russian. A nested "beacon <cmd>:" or "<cmd>:"
+// prefix is stripped so a runner that already labelled an error cannot print
+// the command name twice.
+func cliError(cmd string, err error) error {
+	msg := strings.TrimSpace(err.Error())
+	beaconPrefix := "beacon " + cmd + ": "
+	cmdPrefix := cmd + ": "
+	for {
+		switch {
+		case strings.HasPrefix(msg, beaconPrefix):
+			msg = strings.TrimSpace(strings.TrimPrefix(msg, beaconPrefix))
+		case strings.HasPrefix(msg, cmdPrefix):
+			msg = strings.TrimSpace(strings.TrimPrefix(msg, cmdPrefix))
+		default:
+			return fmt.Errorf("beacon %s: %s", cmd, msg)
+		}
+	}
+}
+
 // Refusal reasons are stable strings so callers and the CLI can branch on them
 // without parsing the human-readable Detail.
 const (
@@ -110,13 +130,13 @@ func selectionDiff(current, want registryStopSelection) []string {
 func validateStopSelection(want registryStopSelection) error {
 	switch {
 	case strings.TrimSpace(want.WatchID) == "":
-		return fmt.Errorf("registry stop: expected watchID is required")
+		return fmt.Errorf("требуется watchID")
 	case want.Revision == 0:
-		return fmt.Errorf("registry stop: expected revision is required")
+		return fmt.Errorf("требуется revision")
 	case strings.TrimSpace(want.SessionID) == "":
-		return fmt.Errorf("registry stop: expected sessionID is required")
+		return fmt.Errorf("требуется sessionID")
 	case strings.TrimSpace(want.Token) == "":
-		return fmt.Errorf("registry stop: expected token is required")
+		return fmt.Errorf("требуется token")
 	}
 	return nil
 }
@@ -129,7 +149,7 @@ func validateStopSelection(want registryStopSelection) error {
 // allows the caller to proceed to the stop.
 func checkRegistryStop(port registryStopStore, want registryStopSelection) (registryStopVerdict, error) {
 	if port == nil {
-		return registryStopVerdict{}, fmt.Errorf("registry stop: store not connected")
+		return registryStopVerdict{}, fmt.Errorf("хранилище не подключено")
 	}
 	if err := validateStopSelection(want); err != nil {
 		return registryStopVerdict{}, err
@@ -137,7 +157,7 @@ func checkRegistryStop(port registryStopStore, want registryStopSelection) (regi
 
 	current, found, err := port.Selection(want.WatchID)
 	if err != nil {
-		return registryStopVerdict{}, fmt.Errorf("registry stop: read selection: %w", err)
+		return registryStopVerdict{}, fmt.Errorf("чтение выбора: %w", err)
 	}
 	if !found {
 		return registryStopVerdict{
@@ -156,7 +176,7 @@ func checkRegistryStop(port registryStopStore, want registryStopSelection) (regi
 
 	active, err := port.ActiveObligations(want.SessionID)
 	if err != nil {
-		return registryStopVerdict{}, fmt.Errorf("registry stop: read obligations: %w", err)
+		return registryStopVerdict{}, fmt.Errorf("чтение обязательств: %w", err)
 	}
 	if active > 0 {
 		return registryStopVerdict{
@@ -214,7 +234,7 @@ func stopRegistryExecutor(port registryStopStore, effector registryStopEffector,
 	}
 	if effector == nil {
 		return registryStopVerdict{Outcome: stopOutcomeError, Selection: want},
-			fmt.Errorf("registry stop: effect port not connected")
+			fmt.Errorf("порт эффектов не подключён")
 	}
 
 	if err := effector.Terminate(want); err != nil {
@@ -248,7 +268,7 @@ type registryStopDBStore struct {
 
 func (s registryStopDBStore) Selection(watchID string) (registryStopSelection, bool, error) {
 	if s.db == nil {
-		return registryStopSelection{}, false, fmt.Errorf("registry stop: database not connected")
+		return registryStopSelection{}, false, fmt.Errorf("база данных не подключена")
 	}
 	binding, found, err := s.db.LatestWatchBinding(watchID)
 	if err != nil || !found {
@@ -264,7 +284,7 @@ func (s registryStopDBStore) Selection(watchID string) (registryStopSelection, b
 
 func (s registryStopDBStore) ActiveObligations(sessionID string) (int, error) {
 	if s.db == nil {
-		return 0, fmt.Errorf("registry stop: database not connected")
+		return 0, fmt.Errorf("база данных не подключена")
 	}
 	pending, err := s.db.PendingObligations()
 	if err != nil {
@@ -285,30 +305,30 @@ func (s registryStopDBStore) ActiveObligations(sessionID string) (int, error) {
 // and the stop is reported as uncertain at the terminate phase.
 func (s registryStopDBStore) Terminate(want registryStopSelection) error {
 	if s.db == nil {
-		return fmt.Errorf("registry stop: database not connected")
+		return fmt.Errorf("база данных не подключена")
 	}
 	pid := 0
 	session, found, err := s.db.GetSession(want.SessionID)
 	if err != nil {
-		return fmt.Errorf("registry stop: read session: %w", err)
+		return fmt.Errorf("чтение сессии: %w", err)
 	}
 	if found {
 		raw := strings.TrimSpace(session.Metadata["pid"])
 		if raw != "" {
 			pid, err = strconv.Atoi(raw)
 			if err != nil || pid <= 0 {
-				return fmt.Errorf("registry stop: session %q has invalid pid %q", want.SessionID, raw)
+				return fmt.Errorf("сессия %q имеет неверный pid %q", want.SessionID, raw)
 			}
 		}
 	}
 	if pid == 0 {
 		pid, err = strconv.Atoi(want.SessionID)
 		if err != nil || pid <= 0 {
-			return fmt.Errorf("registry stop: session %q has no process id", want.SessionID)
+			return fmt.Errorf("у сессии %q нет идентификатора процесса", want.SessionID)
 		}
 	}
 	if err := opencode.TerminateServe(pid); err != nil {
-		return fmt.Errorf("registry stop: terminate session %q: %w", want.SessionID, err)
+		return fmt.Errorf("завершение сессии %q: %w", want.SessionID, err)
 	}
 	return nil
 }
@@ -319,20 +339,20 @@ func (s registryStopDBStore) Terminate(want registryStopSelection) error {
 // sync, using the stopped status that ADR 0090 defines.
 func (s registryStopDBStore) SaveState(want registryStopSelection) error {
 	if s.db == nil {
-		return fmt.Errorf("registry stop: database not connected")
+		return fmt.Errorf("база данных не подключена")
 	}
 	binding, found, err := s.db.LatestWatchBinding(want.WatchID)
 	if err != nil {
-		return fmt.Errorf("registry stop: read binding: %w", err)
+		return fmt.Errorf("чтение привязки: %w", err)
 	}
 	if !found {
-		return fmt.Errorf("registry stop: binding for watch %q disappeared after terminate", want.WatchID)
+		return fmt.Errorf("привязка к watch %q исчезла после завершения", want.WatchID)
 	}
 	if binding.Revision != want.Revision || strconv.FormatInt(binding.FencingToken, 10) != want.Token {
-		return fmt.Errorf("registry stop: binding changed after terminate")
+		return fmt.Errorf("привязка изменилась после завершения")
 	}
 	if err := (registryDBStore{db: s.db}).SetStatus(binding.ProjectKey, binding.AgentID, registryStatusStopped); err != nil {
-		return fmt.Errorf("registry stop: save stopped state: %w", err)
+		return fmt.Errorf("сохранение состояния останова: %w", err)
 	}
 	return nil
 }
@@ -393,20 +413,20 @@ func runRegistryStop(c *CLI, args []string) int {
 		Token:     *token,
 	}
 	if err := validateStopSelection(want); err != nil {
-		fmt.Fprintf(c.errOut, "beacon registry stop: %v\n", err)
+		fmt.Fprintf(c.errOut, "%v\n", cliError("registry stop", err))
 		return 2
 	}
 
 	port, closeStore, err := registryStopOpenStore()
 	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon registry stop: store: %v\n", err)
+		fmt.Fprintf(c.errOut, "%v\n", cliError("registry stop", fmt.Errorf("хранилище: %w", err)))
 		return 2
 	}
 	defer func() { _ = closeStore() }()
 
 	verdict, err := stopRegistryExecutor(port, registryStopEffectorFor(port), want)
 	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon registry stop: %v\n", err)
+		fmt.Fprintf(c.errOut, "%v\n", cliError("registry stop", err))
 		return 2
 	}
 	return printRegistryStopVerdict(c, verdict)
