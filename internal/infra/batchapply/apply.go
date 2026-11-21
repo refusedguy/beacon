@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -78,6 +79,10 @@ const (
 	// HD-088 (ADR 0313): a number with no source has no owner and breaks the
 	// card. The line is Russian prose, so it keeps the interface scope.
 	factProblemFormat = "число без владельца: %s\n"
+	// Q-A4: a generated card field outside its closed set fails --check before
+	// any artifact reaches disk. The field name is a technical token, the
+	// complaint is Russian interface prose.
+	invalidFieldFormat = "недопустимое значение поля %s: %s\n"
 )
 
 // Options mirrors the command line of cmd/batch-apply.
@@ -196,6 +201,47 @@ var (
 	factNumber = regexp.MustCompile(`\b[0-9]+(?:\.[0-9]+)?\b`)
 )
 
+// Generated card fields are closed sets. The values match the cards already
+// in docs/tasks. An empty value is left to renderCard defaults and is not a
+// problem: the check only rejects a value the batch actually declared.
+var (
+	allowedCardTypes    = []string{"task", "adr", "eval", "doc"}
+	allowedCardPhases   = []string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}
+	allowedCardStatuses = []string{"todo", "done", "dropped"}
+)
+
+func allowedValue(value string, allowed []string) bool {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// cardFieldProblems returns one line per declared card value outside its
+// closed set. Batches and cards keep load order, so the report is reproducible.
+func cardFieldProblems(batches []batch) []string {
+	var problems []string
+	for _, b := range batches {
+		for _, c := range b.Cards {
+			for _, field := range []struct {
+				name, value string
+				allowed     []string
+			}{
+				{"type", c.Type, allowedCardTypes},
+				{"phase", c.Phase, allowedCardPhases},
+				{"status", c.Status, allowedCardStatuses},
+			} {
+				if field.value != "" && !allowedValue(field.value, field.allowed) {
+					problems = append(problems, fmt.Sprintf(invalidFieldFormat, field.name, field.value))
+				}
+			}
+		}
+	}
+	return problems
+}
+
 // declaredFactProblems returns the values of facts that carry no source. The
 // acceptance rule for HD-088 is that a number without an owner fails the card.
 func declaredFactProblems(facts []fact) []string {
@@ -253,6 +299,104 @@ func renderFacts(facts []factEntry) string {
 	for _, f := range facts {
 		link := strings.TrimPrefix(f.owner, "docs/")
 		b.WriteString("| " + f.value + " | [" + f.owner + "](" + link + ") |\n")
+	}
+	return b.String()
+}
+
+// adrIndexHeader is the fixed prose above the generated table. It is kept
+// byte-for-byte from the hand-maintained index so regeneration changes only
+// the rows.
+const adrIndexHeader = "# Beacon. Architecture Decision Records\n\n" +
+	"Это каталог решений, согласованных с владельцем. Каждый ADR фиксирует одно решение, причину и последствия. Решения в этом каталоге обязательны для implementation.\n\n" +
+	"Статусы решений:\n\n" +
+	"- `accepted` владелец согласился явно.\n" +
+	"- `default` я предложил, владелец не возразил. Может быть переопределно до гейта G0.\n" +
+	"- `open` решение ещё не принято, ждёт отчёта или вопроса.\n" +
+	"- `proposed` решение предложено, ожидает решения владельца.\n\n" +
+	"Индекс:\n\n" +
+	"| ADR | Тема | Статус |\n|---|---|---|\n"
+
+// adrIndexEntry is one row of the generated ADR index. Number comes from the
+// file name, Title from its heading and Status from its Статус line.
+type adrIndexEntry struct {
+	number int
+	title  string
+	status string
+}
+
+var (
+	adrFileName = regexp.MustCompile(`^([0-9]{4})-.*\.md$`)
+	adrTitle    = regexp.MustCompile(`(?m)^# ADR\s+[0-9]+\s*[.:]\s*(.+?)\s*$`)
+	adrStatus   = regexp.MustCompile(`(?m)^Статус:\s*([^\s]+)`)
+)
+
+// scanADRIndex reads every numbered ADR file and merges the ADRs produced by
+// this iteration. Incoming ADRs win over a file with the same number, so the
+// index reflects the artifacts about to be written. Duplicate numbers survive
+// because each file gets its own row.
+func scanADRIndex(root string, incoming map[int]adr) ([]adrIndexEntry, error) {
+	dir := filepath.Join(root, "docs", "adrs")
+	names, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	seen := map[adrIndexEntry]bool{}
+	var entries []adrIndexEntry
+	for _, name := range names {
+		if name.IsDir() {
+			continue
+		}
+		match := adrFileName.FindStringSubmatch(name.Name())
+		if match == nil {
+			continue
+		}
+		number, err := strconv.Atoi(match[1])
+		if err != nil {
+			continue
+		}
+		if _, replaced := incoming[number]; replaced {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, name.Name()))
+		if err != nil {
+			return nil, err
+		}
+		entry := adrIndexEntry{number: number}
+		if title := adrTitle.FindSubmatch(raw); title != nil {
+			entry.title = string(title[1])
+		}
+		if status := adrStatus.FindSubmatch(raw); status != nil {
+			entry.status = string(status[1])
+		}
+		if !seen[entry] {
+			seen[entry] = true
+			entries = append(entries, entry)
+		}
+	}
+	for number, a := range incoming {
+		status := a.Status
+		if status == "" {
+			status = "accepted"
+		}
+		entries = append(entries, adrIndexEntry{number: number, title: a.Title, status: status})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].number != entries[j].number {
+			return entries[i].number < entries[j].number
+		}
+		return entries[i].title < entries[j].title
+	})
+	return entries, nil
+}
+
+// renderADRIndex writes docs/adrs/README.md from the scanned entries. Rows
+// stay in number order so a rerun with the same inputs writes the same bytes.
+func renderADRIndex(entries []adrIndexEntry) string {
+	var b strings.Builder
+	b.WriteString(adrIndexHeader)
+	for _, e := range entries {
+		fmt.Fprintf(&b, "| %04d | %s | %s |\n", e.number, e.title, e.status)
 	}
 	return b.String()
 }
@@ -597,6 +741,15 @@ func Run(opts Options, out, errOut io.Writer) int {
 		}
 		return 1
 	}
+	// Q-A4: reject an invalid Тип, Фаза or Статус here, before --check returns
+	// and before the write loop below. A bad card can never reach disk.
+	badFields := cardFieldProblems(batches)
+	for _, line := range badFields {
+		r.errf("%s", line)
+	}
+	if len(badFields) > 0 {
+		return 1
+	}
 	if opts.MergePlan {
 		var decisions []mergeDecision
 		for _, b := range batches {
@@ -716,6 +869,18 @@ func Run(opts Options, out, errOut io.Writer) int {
 	entries = append(entries, artifactEntry{
 		path:    filepath.Join("docs", "FACTS.md"),
 		content: factsDoc,
+	})
+
+	// Q-A4: the ADR index is generated from the numbered ADR files plus the
+	// ADRs in this batch. The index is no longer maintained by hand.
+	indexEntries, err := scanADRIndex(root, adrs)
+	if err != nil {
+		r.errf("%v\n", err)
+		return 1
+	}
+	entries = append(entries, artifactEntry{
+		path:    filepath.Join("docs", "adrs", "README.md"),
+		content: renderADRIndex(indexEntries),
 	})
 
 	r.printf(summaryReportFormat,
