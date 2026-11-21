@@ -1683,6 +1683,104 @@ func TestFailureExcerptTruncation(t *testing.T) {
 	}
 }
 
+// TestFailureExcerptTruncationIsVisible proves a long annotation sets the flag,
+// carries the marker and exposes the full CI log link (ATX-36).
+func TestFailureExcerptTruncationIsVisible(t *testing.T) {
+	src := newFakeExcerptSource(map[string]string{
+		"ci/failure": strings.Repeat("a", 4096) + "€",
+	})
+	h, w := excerptTestHandler(t, src, nil)
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if !out.FailureExcerptTruncated {
+		t.Error("aggregate truncation did not set failureExcerptTruncated")
+	}
+	if !strings.HasSuffix(out.FailureExcerpt, failureExcerptTruncatedMarker) {
+		t.Errorf("aggregate excerpt = %q, want suffix %q", out.FailureExcerpt, failureExcerptTruncatedMarker)
+	}
+	if out.FailureExcerptLogURL != "https://ci/1" {
+		t.Errorf("log URL = %q, want %q", out.FailureExcerptLogURL, "https://ci/1")
+	}
+	for _, fc := range out.FailedChecks {
+		if fc.Name == "ci/failure" && !strings.HasSuffix(fc.FailureExcerpt, failureExcerptTruncatedMarker) {
+			t.Errorf("ci/failure excerpt = %q, want suffix %q", fc.FailureExcerpt, failureExcerptTruncatedMarker)
+		}
+	}
+}
+
+// TestFailureExcerptManyAnnotationsKeepMarker proves eight short annotations
+// keep the truncation flag when the aggregate, not a single excerpt, is cut
+// (ATX-36).
+func TestFailureExcerptManyAnnotationsKeepMarker(t *testing.T) {
+	answers := map[string]string{}
+	w := resultFixture(domain.VerdictKeepWorking)
+	w.Checks = map[string]domain.Check{}
+	for i := 0; i < 8; i++ {
+		name := fmt.Sprintf("ci/many-%d", i)
+		w.Checks[name] = domain.Check{State: "FAILURE", Conclusion: "FAILURE", Required: true, DetailsURL: fmt.Sprintf("https://ci/many/%d", i)}
+		answers[name] = strings.Repeat("x", 300)
+	}
+	src := newFakeExcerptSource(answers)
+	o := resultObligation(w, "session-E")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+	h.SetFailureExcerptSource(src)
+
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if !out.FailureExcerptTruncated {
+		t.Error("aggregate truncation of eight annotations did not set the flag")
+	}
+	if !strings.HasSuffix(out.FailureExcerpt, failureExcerptTruncatedMarker) {
+		t.Errorf("aggregate excerpt = %q, want suffix %q", out.FailureExcerpt, failureExcerptTruncatedMarker)
+	}
+	if out.FailureExcerptLogURL == "" {
+		t.Error("truncated aggregate has no full CI log link")
+	}
+	for _, fc := range out.FailedChecks {
+		if strings.HasSuffix(fc.FailureExcerpt, failureExcerptTruncatedMarker) {
+			t.Errorf("per-check excerpt %q was cut, want aggregate-only cut", fc.FailureExcerpt)
+		}
+	}
+}
+
+// TestFailureExcerptTruncationSurvivesCache proves a cache hit keeps the flag
+// and the marker instead of re-fetching the source (ATX-36).
+func TestFailureExcerptTruncationSurvivesCache(t *testing.T) {
+	src := newFakeExcerptSource(map[string]string{"ci/failure": strings.Repeat("a", 4096)})
+	cache := newCountingExcerptCache()
+	h, w := excerptTestHandler(t, src, cache)
+	if _, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID}); err != nil {
+		t.Fatalf("first Result: %v", err)
+	}
+	src.byName["ci/failure"] = ""
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("second Result: %v", err)
+	}
+	if !out.FailureExcerptTruncated {
+		t.Error("cached truncation lost the flag")
+	}
+	if !strings.HasSuffix(out.FailureExcerpt, failureExcerptTruncatedMarker) {
+		t.Errorf("cached excerpt = %q, want suffix %q", out.FailureExcerpt, failureExcerptTruncatedMarker)
+	}
+	if got := src.callCount("ci/failure"); got != 1 {
+		t.Errorf("source calls = %d, want 1", got)
+	}
+}
+
 // TestFailureExcerptCacheAvoidsSecondFetch proves one fetch per triple: a
 // second Result on the same Watch reads the cache instead of calling GitHub.
 func TestFailureExcerptCacheAvoidsSecondFetch(t *testing.T) {

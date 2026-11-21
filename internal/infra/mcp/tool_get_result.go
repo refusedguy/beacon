@@ -70,6 +70,10 @@ type FailureExcerptSource interface {
 // aggregate string returned in GetResultOutput.
 const failureExcerptLimit = 2048
 
+// failureExcerptTruncatedMarker is appended when the byte ceiling cut an
+// excerpt. It stays in the cached string, so a cache hit still shows the loss.
+const failureExcerptTruncatedMarker = "...[truncated]"
+
 // failureExcerptAnnotationCount bounds how many annotations are requested and
 // rendered per failed check.
 const failureExcerptAnnotationCount = 8
@@ -447,21 +451,23 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 
 	failed := collectFailedChecks(w)
-	excerpt := h.attachFailureExcerpts(ctx, w, failed)
+	excerpt, excerptTruncated, excerptLogURL := h.attachFailureExcerpts(ctx, w, failed)
 	action, command, hint := nextStepFor(w.Verdict)
 	out := GetResultOutput{
-		Status:         string(w.Status),
-		Verdict:        string(w.Verdict),
-		Revision:       w.Revision,
-		Merge:          MergeSnapshot{Mergeable: w.Merge.Mergeable, MergeStateStatus: w.Merge.MergeStateStatus},
-		FailedChecks:   failed,
-		ObligationID:   obligationID,
-		RetryBudget:    remainingRetryBudget(w, failed),
-		NextAction:     action,
-		NextCommand:    command,
-		NextHint:       hint,
-		FailureExcerpt: excerpt,
-		ConfigID:       w.ConfigID,
+		Status:                  string(w.Status),
+		Verdict:                 string(w.Verdict),
+		Revision:                w.Revision,
+		Merge:                   MergeSnapshot{Mergeable: w.Merge.Mergeable, MergeStateStatus: w.Merge.MergeStateStatus},
+		FailedChecks:            failed,
+		ObligationID:            obligationID,
+		RetryBudget:             remainingRetryBudget(w, failed),
+		NextAction:              action,
+		NextCommand:             command,
+		NextHint:                hint,
+		FailureExcerpt:          excerpt,
+		FailureExcerptTruncated: excerptTruncated,
+		FailureExcerptLogURL:    excerptLogURL,
+		ConfigID:                w.ConfigID,
 	}
 
 	// Refuse before the read stamp: a response the caller never receives must
@@ -489,15 +495,19 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 // with no source configured the response is byte-for-byte the old shape.
 
 // attachFailureExcerpts fills each failed check's excerpt and returns the
-// aggregate bounded at failureExcerptLimit. A cache hit never calls the source;
-// a miss calls it exactly once and stores the answer, including an empty one,
-// so a check with no annotations is not re-fetched on the next poll.
-func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.Watch, failed []FailedCheck) string {
+// aggregate bounded at failureExcerptLimit plus a truncation flag and a link to
+// the full CI log. A cache hit never calls the source; a miss calls it exactly
+// once and stores the answer, including an empty one, so a check with no
+// annotations is not re-fetched on the next poll. The truncation marker lives
+// in the cached string, so a cache hit keeps the flag too.
+func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.Watch, failed []FailedCheck) (string, bool, string) {
 	if h == nil || h.excerptSource == nil || len(failed) == 0 {
-		return ""
+		return "", false, ""
 	}
 	cache := h.excerptStore()
 	var agg strings.Builder
+	truncated := false
+	logURL := ""
 	for i := range failed {
 		name := failed[i].Name
 		excerpt, ok, err := cacheGet(ctx, cache, w.ID, w.HeadSHA, name)
@@ -517,6 +527,12 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 			}
 		}
 		failed[i].FailureExcerpt = excerpt
+		if excerptWasTruncated(excerpt) {
+			truncated = true
+			if logURL == "" {
+				logURL = failed[i].DetailsURL
+			}
+		}
 		if excerpt == "" || agg.Len() >= failureExcerptLimit {
 			continue
 		}
@@ -527,7 +543,19 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 		agg.WriteString(": ")
 		agg.WriteString(excerpt)
 	}
-	return clampExcerpt(agg.String(), failureExcerptLimit)
+	aggregate := clampExcerpt(agg.String(), failureExcerptLimit)
+	if excerptWasTruncated(aggregate) {
+		truncated = true
+	}
+	if aggregate != "" && logURL == "" && len(failed) > 0 {
+		logURL = failed[0].DetailsURL
+	}
+	return aggregate, truncated, logURL
+}
+
+// excerptWasTruncated reports whether an excerpt carries the truncation marker.
+func excerptWasTruncated(excerpt string) bool {
+	return strings.HasSuffix(excerpt, failureExcerptTruncatedMarker)
 }
 
 func cacheGet(ctx context.Context, c failureExcerptCache, watchID, headSHA, name string) (string, bool, error) {
@@ -575,8 +603,9 @@ func escapeUntrusted(s string) string {
 
 // sanitizeExcerpt redacts secrets, escapes untrusted markup and bounds the
 // text. Redaction runs on the raw bytes first so its byte patterns still match;
-// escaping and truncation follow. Truncation is rune-safe, so a multi-byte
-// character is never cut in half.
+// escaping and truncation follow. A cut appends the truncation marker so the
+// loss is visible. Truncation is rune-safe, so a multi-byte character is never
+// cut in half.
 func sanitizeExcerpt(raw string, limit int) string {
 	if limit <= 0 {
 		return ""
@@ -585,15 +614,31 @@ func sanitizeExcerpt(raw string, limit int) string {
 	return clampExcerpt(escapeUntrusted(string(clean)), limit)
 }
 
+// clampExcerpt clamps s to at most limit bytes. When it cuts text it appends
+// the truncation marker, which stays in the cached string so a cache hit still
+// shows the loss. It is rune-safe, so a multi-byte character is never cut in
+// half.
 func clampExcerpt(s string, limit int) string {
-	if limit <= 0 || len(s) <= limit {
+	if limit <= 0 {
+		return ""
+	}
+	if len(s) <= limit {
 		return s
 	}
-	cut := s[:limit]
+	markerLen := len(failureExcerptTruncatedMarker)
+	if limit <= markerLen {
+		// No room for the marker; keep the plain rune-safe cut.
+		cut := s[:limit]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			cut = cut[:len(cut)-1]
+		}
+		return cut
+	}
+	cut := s[:limit-markerLen]
 	for len(cut) > 0 && !utf8.ValidString(cut) {
 		cut = cut[:len(cut)-1]
 	}
-	return cut
+	return cut + failureExcerptTruncatedMarker
 }
 
 // clampRunes truncates s to at most limit characters. It is the character
