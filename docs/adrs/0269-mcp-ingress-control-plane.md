@@ -1,4 +1,4 @@
-# ADR 185: MCP как единый ingress внешнего control plane
+# ADR 269: MCP как единый ingress внешнего control plane
 
 Статус: accepted
 
@@ -16,4 +16,4 @@ T3 Code, Compozy, Mission Control и OpenRig держат состояние а�
 
 ## Происхождение
 
-Перенесён дословно из коммита `35d149d` (HEAD ветки `feat/batch-competitors-v2`) методом `git show 35d149d:docs/adrs/0185-mcp-ingress-control-plane.md`. В `origin/main` этого пути не было: там под номером 0185 лежат другие решения (`0185-mcp-beacon-wake.md`, `0185-otel-tracing.md`, `0185-untitled.md`). Коллизии имён нет, текст не выдуман. Связано с инвентарём `docs/inventory/F01-F80.md` и карточкой `docs/tasks/T3.240.md`.
+Текст перенесён дословно из коммита `35d149d` (HEAD ветки `feat/batch-competitors-v2`) методом `git show 35d149d:docs/adrs/0185-mcp-ingress-control-plane.md`. Номер 185 в `origin/main` занят тремя принятыми ADR (`0185-mcp-beacon-wake.md`, `0185-otel-tracing.md`, `0185-untitled.md`). Проверка `docs` в CI отклоняет четвёртый файл с заголовком `ADR 185` как stale revision, поэтому порт получил следующий свободный номер 269. Из исходного текста изменён только номер в заголовке. Связано с инвентарём `docs/inventory/F01-F80.md` и карточкой `docs/tasks/T3.240.md`.
