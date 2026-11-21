@@ -43,7 +43,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0090-honest-delivery-unchanged-ladder.md",
+      "path": "docs/adrs/0090-registry-lifecycle.md",
       "task": "HD-085"
     },
     {
@@ -98,7 +98,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0185-background-server-state-owner.md",
+      "path": "docs/adrs/0185-mcp-beacon-wake.md",
       "task": "HD-085"
     },
     {
@@ -118,7 +118,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0189-honest-delivery-unchanged-ladder.md",
+      "path": "docs/adrs/0189-internal-scheduler.md",
       "task": "HD-085"
     },
     {
@@ -148,7 +148,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0196-single-background-server-state-owner.md",
+      "path": "docs/adrs/0196-terminal-guard-snooze-loop.md",
       "task": "HD-085"
     },
     {
