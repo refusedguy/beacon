@@ -128,6 +128,15 @@ type blockerControl interface {
 	MarkObligationDelivered(id string, at time.Time, attempt int, lastErr string) error
 }
 
+// GenerationControl is the generation-stamping port used when an unblock
+// returns a Watch to watching (T3.457). It is declared here, in infra, so
+// cibridge never imports the app layer (ADR 0005): the orchestrator claim
+// model implements it and the composition root injects one shared instance.
+// A string token and a task ID cross the boundary, no app type does.
+type GenerationControl interface {
+	ResolveBlocked(taskID string) (string, bool)
+}
+
 // escalationWriter is the injection point for the ESCALATIONS.md append. Tests
 // replace it so a parked Watch does not touch the working tree.
 type escalationWriter func(line string)
@@ -193,6 +202,11 @@ type Bridge struct {
 	rebaseMu       sync.Mutex
 	rebased        map[string]bool
 	tracer         observe.Tracer
+	// generations stamps a fresh generation on every Watch an unblock returns
+	// to watching (T3.457). It is optional: a bridge built before the port was
+	// added keeps its block and unblock behaviour, while one wired with the same
+	// ledger as beacon_claim ends the previous owner's claim on resolve.
+	generations GenerationControl
 
 	// breakers holds the in-memory circuit breaker of each wake adapter.
 	// The durable per-Watch wake cap stays separate and keeps its own counter.
@@ -208,6 +222,30 @@ func (b *Bridge) WithTracer(t observe.Tracer) *Bridge {
 		b.tracer = t
 	}
 	return b
+}
+
+// WithGenerationStore binds the generation ledger shared with beacon_claim and
+// the ack handler. When a merge or a fixer resolves a blocker, the bridge
+// rotates the generation of every Watch it unblocks so the previous owner's
+// claim cannot continue at the old revision. A nil ledger leaves the legacy
+// unblock path unchanged.
+func (b *Bridge) WithGenerationStore(g GenerationControl) *Bridge {
+	if b != nil {
+		b.generations = g
+	}
+	return b
+}
+
+// rotateGenerations restamps every Watch an unblock returned to watching. The
+// ledger is idempotent, so a Watch with no live claim is left alone and a
+// repeated resolve cannot rotate it twice.
+func (b *Bridge) rotateGenerations(watchIDs ...string) {
+	if b == nil || b.generations == nil {
+		return
+	}
+	for _, id := range watchIDs {
+		b.generations.ResolveBlocked(id)
+	}
 }
 
 // spanTracer resolves the tracer once per call. Callers that inject a tracer
@@ -1095,8 +1133,15 @@ func (b *Bridge) applyMerged(ctx context.Context, w domain.Watch, obs ciObservat
 			if id == "" {
 				continue
 			}
-			if _, err := b.control.ResolveBlocker(id, now); err != nil {
+			unblocked, err := b.control.ResolveBlocker(id, now)
+			if err != nil {
 				observe.ActorError("cibridge-resolve", w.ID, err)
+			} else {
+				ids := make([]string, 0, len(unblocked))
+				for _, unwound := range unblocked {
+					ids = append(ids, unwound.ID)
+				}
+				b.rotateGenerations(ids...)
 			}
 		}
 		// Resolve by base green only when the provider actually observed the
@@ -2260,6 +2305,7 @@ func (b *Bridge) unblockFixed(merged domain.Watch) {
 		log.Printf("cibridge: unblock save %s: %v", target.ID, err)
 		return
 	}
+	b.rotateGenerations(target.ID)
 	log.Printf("cibridge: %s unblocked by %s#%d revision=%d", target.ID, fixer.Repo, fixer.PR, next.Revision)
 }
 

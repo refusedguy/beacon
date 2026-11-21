@@ -33,6 +33,12 @@
 // fixFor link on the Watch and its subscribers stays in place, so the history
 // of which fixer repaired the block survives. No MCP tool is added for this:
 // the contract stays at exactly seven tools.
+//
+// A resolve also rotates the generation of every Watch it unblocks (T3.457).
+// Returning the Watch to watching without restamping its claim would leave the
+// previous owner's generation live, and the next swap would skip the row
+// because the stale claim still matches. The stamp is applied on the same
+// successful path as the unblock, so a repeat resolve cannot rotate it twice.
 package mcp
 
 import (
@@ -395,6 +401,12 @@ type AckHandler struct {
 	decisions     *DecisionRegistry
 	blocked       *BlockedRegistry
 	blockers      BlockerControl
+	// generations stamps a fresh generation on every Watch a resolve unblocks.
+	// It is optional so handlers built before the port was added keep their
+	// idempotency and block behaviour unchanged; a nil store simply skips the
+	// stamp. The composition root shares one ledger with beacon_claim and the CI
+	// bridge so all three move the same generation for a Watch.
+	generations GenerationLedger
 }
 
 // NewAckHandler builds a handler. A nil clock falls back to wall time.
@@ -446,6 +458,28 @@ func (h *AckHandler) SetBlockedRegistry(r *BlockedRegistry) {
 func (h *AckHandler) SetBlockerControl(b BlockerControl) {
 	if h != nil {
 		h.blockers = b
+	}
+}
+
+// SetGenerationStore shares the generation ledger with a composition root so
+// blocked:resolved rotates the same generation that beacon_claim stamps. A nil
+// argument leaves the handler without a stamp, which keeps older callers
+// unchanged.
+func (h *AckHandler) SetGenerationStore(g GenerationLedger) {
+	if h != nil {
+		h.generations = g
+	}
+}
+
+// rotateGenerations restamps every Watch a resolve just unblocked. The
+// generation ledger is idempotent, so a Watch with no live claim is left
+// alone and a repeated resolve cannot rotate it twice.
+func (h *AckHandler) rotateGenerations(watchIDs ...string) {
+	if h == nil || h.generations == nil {
+		return
+	}
+	for _, id := range watchIDs {
+		h.generations.ResolveBlocked(id)
 	}
 }
 
@@ -744,6 +778,11 @@ func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
 			observe.ActorError("ack-blocker-resolve", w.ID, err)
 			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
 		}
+		ids := make([]string, 0, len(unblocked))
+		for _, unwound := range unblocked {
+			ids = append(ids, unwound.ID)
+		}
+		h.rotateGenerations(ids...)
 		h.blocked.Unblock(w.ID)
 		observe.Event(observe.LevelInfo, "blocker_resolved", observe.Fields{
 			"blockerID": blockerID, "watchID": w.ID, "watches": len(unblocked),
@@ -769,6 +808,7 @@ func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
 			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
 		}
 	}
+	h.rotateGenerations(w.ID)
 	h.blocked.Unblock(w.ID)
 	return true, nil
 }

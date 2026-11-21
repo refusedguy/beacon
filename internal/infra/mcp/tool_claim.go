@@ -58,6 +58,21 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// GenerationLedger is the generation-stamping port shared by beacon_claim and
+// beacon_ack. It is declared here, in infra, so this package never imports the
+// app layer (ADR 0005): the orchestrator claim model implements it and the
+// composition root injects one shared instance into both handlers. IDs and
+// generation tokens are plain strings, so no app type crosses the boundary.
+type GenerationLedger interface {
+	// IssueFor allocates a fresh generation for an owner and makes it current.
+	IssueFor(ownerID string) string
+	// GenerationFor returns the owner's current generation, or empty.
+	GenerationFor(ownerID string) string
+	// ResolveBlocked rotates the generation of a task row and returns it to
+	// pending. The bool reports whether the row was live and moved.
+	ResolveBlocked(taskID string) (string, bool)
+}
+
 // ClaimToolName and ReleaseToolName are the names the tools are registered
 // under when AttachClaim is called. They are deliberately absent from ToolNames.
 const (
@@ -77,6 +92,12 @@ type ClaimInput struct {
 	TaskID         string `json:"taskID" jsonschema:"identifier of the one task being claimed"`
 	OwnerID        string `json:"ownerID" jsonschema:"identifier of the agent that owns the task until release"`
 	IdempotencyKey string `json:"idempotencyKey" jsonschema:"caller key that makes a claim retry idempotent"`
+	// GenerationUUID pins the owner generation the claim is presented at. It
+	// is the claimed_by_generation_uuid of the worker taking the task. Empty
+	// keeps the pre-T3.457 contract; a value that no longer matches the owner's
+	// current generation is refused so a worker whose generation rotated after
+	// a blocked:resolved cannot continue (T3.457, ADR 0189).
+	GenerationUUID string `json:"generationUUID,omitempty" jsonschema:"owner generation the claim is presented at; an older generation is refused; empty skips the check"`
 }
 
 // ClaimOutput is the claim held after the call. IdempotencyKey echoes the
@@ -92,6 +113,10 @@ type ClaimOutput struct {
 	IdempotencyKey string `json:"idempotencyKey"`
 	FencingToken   uint64 `json:"fencingToken"`
 	SourceEpoch    uint64 `json:"sourceEpoch"`
+	// GenerationUUID is the generation stamped on this claim, the
+	// claimed_by_generation_uuid of the row. A blocked:resolved rotates it, so
+	// a worker must present the value from a fresh claim to continue.
+	GenerationUUID string `json:"generationUUID,omitempty"`
 }
 
 // ReleaseInput is the argument object of beacon_release. It names the task and
@@ -108,6 +133,10 @@ type ReleaseInput struct {
 	OwnerID      string `json:"ownerID" jsonschema:"identifier of the current owner releasing the task"`
 	FencingToken uint64 `json:"fencingToken,omitempty" jsonschema:"lease token from beacon_claim; an older token is refused; zero skips the check"`
 	SourceEpoch  uint64 `json:"sourceEpoch,omitempty" jsonschema:"source epoch from beacon_claim; a lease from an older epoch is refused after a crash; zero skips the check"`
+	// GenerationUUID is the generation from the claim being released. A
+	// generation rotated away by a blocked:resolved is refused even when the
+	// fencing token and source epoch still match; zero value skips the check.
+	GenerationUUID string `json:"generationUUID,omitempty" jsonschema:"generationUUID from beacon_claim; an older generation is refused after a resolve; empty skips the check"`
 }
 
 // ReleaseOutput confirms which owner gave the task up.
@@ -347,11 +376,73 @@ func claimConflict(message string) error {
 // performs no I/O of its own beyond the in-memory lock.
 type ClaimHandler struct {
 	store *claimStore
+	// generations issues and checks owner generations (T3.457). It is optional
+	// so a handler built only for the fencing-token contract still works; with
+	// it installed every claim output carries the generation stamped for the
+	// owner, and a claim presented at an older generation is refused.
+	generations GenerationLedger
 }
 
-// NewClaimHandler builds a handler with a fresh, empty claim store.
+// NewClaimHandler builds a handler with a fresh, empty claim store. The
+// generation ledger is injected separately so one instance can be shared with
+// the ack handler and the CI bridge at the composition root.
 func NewClaimHandler() *ClaimHandler {
 	return &ClaimHandler{store: newClaimStore()}
+}
+
+// SetGenerationStore shares the generation ledger with a composition root. The
+// same ledger is installed on the ack handler and the CI bridge so a resolve
+// rotates the generation that beacon_claim stamped. A nil argument disables
+// the generation check for callers that have not wired the port yet.
+func (h *ClaimHandler) SetGenerationStore(g GenerationLedger) {
+	if h != nil {
+		h.generations = g
+	}
+}
+
+// GenerationStore returns the ledger used by this handler, or nil when no
+// generation store was installed. A composition root uses it to share one
+// ledger across the claim, ack and bridge handlers.
+func (h *ClaimHandler) GenerationStore() GenerationLedger {
+	if h == nil {
+		return nil
+	}
+	return h.generations
+}
+
+// generationFor stamps the owner's generation on a new claim. An owner that
+// already has a generation keeps it, so an idempotent retry returns the same
+// ClaimOutput; an owner taking the task for the first time gets a fresh one.
+func (h *ClaimHandler) generationFor(ownerID string) string {
+	if h == nil || h.generations == nil || ownerID == "" {
+		return ""
+	}
+	if g := h.generations.GenerationFor(ownerID); g != "" {
+		return g
+	}
+	return h.generations.IssueFor(ownerID)
+}
+
+// checkGeneration refuses a claim presented at a generation that is no longer
+// the owner's current one. A resolve rotates that generation, so a worker that
+// kept the previous ClaimOutput cannot claim or continue the task.
+func (h *ClaimHandler) checkGeneration(in ClaimInput) error {
+	if in.GenerationUUID == "" || h == nil || h.generations == nil {
+		return nil
+	}
+	current := h.generations.GenerationFor(in.OwnerID)
+	if current == "" || current != in.GenerationUUID {
+		return domain.NewAppError(domain.CodeGone, "claim: generation is stale, the owner's generation rotated after a resolve")
+	}
+	return nil
+}
+
+// stampGeneration attaches the owner's generation to a claim result.
+func (h *ClaimHandler) stampGeneration(out ClaimOutput, ownerID string) ClaimOutput {
+	if out.GenerationUUID == "" {
+		out.GenerationUUID = string(h.generationFor(ownerID))
+	}
+	return out
 }
 
 // Handle adapts Claim to the go-sdk typed tool handler signature.
@@ -403,7 +494,14 @@ func (h *ClaimHandler) Claim(_ context.Context, in ClaimInput) (ClaimOutput, err
 	if h == nil || h.store == nil {
 		return ClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, "claim: no claim store configured")
 	}
-	return h.store.claim(in.TaskID, in.OwnerID, in.IdempotencyKey)
+	if err := h.checkGeneration(in); err != nil {
+		return ClaimOutput{}, err
+	}
+	out, err := h.store.claim(in.TaskID, in.OwnerID, in.IdempotencyKey)
+	if err != nil {
+		return ClaimOutput{}, err
+	}
+	return h.stampGeneration(out, in.OwnerID), nil
 }
 
 // Reassign hands a task to a new owner with a higher fencing token. It models a
@@ -417,7 +515,14 @@ func (h *ClaimHandler) Reassign(_ context.Context, in ClaimInput) (ClaimOutput, 
 	if h == nil || h.store == nil {
 		return ClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, "claim: no claim store configured")
 	}
-	return h.store.reassign(in.TaskID, in.OwnerID, in.IdempotencyKey)
+	if err := h.checkGeneration(in); err != nil {
+		return ClaimOutput{}, err
+	}
+	out, err := h.store.reassign(in.TaskID, in.OwnerID, in.IdempotencyKey)
+	if err != nil {
+		return ClaimOutput{}, err
+	}
+	return h.stampGeneration(out, in.OwnerID), nil
 }
 
 // Recover records that the source was restored after a crash. Every lease
@@ -445,6 +550,16 @@ func (h *ClaimHandler) Release(_ context.Context, in ReleaseInput) (ReleaseOutpu
 	}
 	if h == nil || h.store == nil {
 		return ReleaseOutput{}, domain.NewAppError(domain.CodePersistFailed, "claim: no claim store configured")
+	}
+	if in.GenerationUUID != "" {
+		current := ""
+		if h.generations != nil {
+			current = h.generations.GenerationFor(in.OwnerID)
+		}
+		if current == "" || current != in.GenerationUUID {
+			return ReleaseOutput{}, domain.NewAppError(domain.CodeGone,
+				"claim: generation is stale, the owner's generation rotated after a resolve")
+		}
 	}
 	return h.store.release(in.TaskID, in.OwnerID, in.FencingToken, in.SourceEpoch)
 }
