@@ -1,9 +1,10 @@
 // Package store: project-scoped watch bindings with revision fencing.
 //
 // A binding ties one Watch revision to the executor that waits on it. The
-// (watch_id, revision) key gives one row per revision: a repeat with the same
-// key changes nothing, and a new revision adds its own row (T5.25, ADR 0088).
-// The fencing token stops a delayed registration from rolling the binding
+// (project_key, watch_id, revision) key gives one row per project and revision:
+// a repeat with the same key changes nothing, a new revision adds its own row,
+// and the same watch in another project keeps its own row (T5.25, ADR 0088,
+// BCX-34). The fencing token stops a delayed registration from rolling the binding
 // back. A write older than the newest stored revision or token is rejected
 // instead of being inserted, so wake never follows a stale subscriber
 // (ADR 0088, T5.37).
@@ -31,10 +32,11 @@ import (
 var ErrStaleWatchBinding = errors.New("store: binding: stale watch binding")
 
 const insertWatchBindingSQL = `
-INSERT OR IGNORE INTO watch_bindings
+INSERT INTO watch_bindings
   (project_key, watch_id, revision, agent_id, config_id,
    fencing_token, subscriber_id, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(project_key, watch_id, revision) DO NOTHING`
 
 // WatchBindingEntry is one stored watch-to-executor binding. Revision is
 // uint64 in the domain and INTEGER in SQLite; the conversion is guarded.
@@ -51,8 +53,8 @@ type WatchBindingEntry struct {
 }
 
 // WatchBindingWrite is the outcome of one binding write. Created is false
-// when the (watch_id, revision) row already existed; Entry is then the stored
-// row, not the incoming one.
+// when the (project_key, watch_id, revision) row already existed; Entry is then
+// the stored row, not the incoming one.
 type WatchBindingWrite struct {
 	Entry   WatchBindingEntry
 	Created bool
@@ -95,15 +97,23 @@ type storedWatchBindings struct {
 	byRevision  map[uint64]WatchBindingEntry
 }
 
-func readWatchBindingState(q columnQuerier, watchID string) (storedWatchBindings, error) {
+// readWatchBindingState reads one project's rows for a watch. An empty
+// projectKey reads every project, which the global LatestWatchBinding uses.
+// Write paths pass a project key so a foreign row cannot mask a local write.
+func readWatchBindingState(q columnQuerier, projectKey, watchID string) (storedWatchBindings, error) {
 	// Migration 0005 stores fencing_token as INTEGER, so read it in its
 	// stored type instead of casting it on every binding read (BCX-33).
 	query := `
 SELECT project_key, revision, agent_id, config_id,
        fencing_token, subscriber_id, created_at
 FROM watch_bindings WHERE watch_id = ?`
+	args := []any{watchID}
+	if projectKey != "" {
+		query += ` AND project_key = ?`
+		args = append(args, projectKey)
+	}
 
-	rows, err := q.Query(query, watchID)
+	rows, err := q.Query(query, args...)
 	if err != nil {
 		return storedWatchBindings{}, fmt.Errorf("store: binding: read state: %w", err)
 	}
@@ -142,9 +152,10 @@ FROM watch_bindings WHERE watch_id = ?`
 }
 
 // WriteWatchBinding writes one binding. The write is idempotent by
-// (watch_id, revision) and fenced: a repeat of a stored revision returns the
-// old row, while a revision or token below the stored maximum returns
-// ErrStaleWatchBinding. Both checks and the insert share one transaction.
+// (project_key, watch_id, revision) and fenced: a repeat of a stored revision
+// in the same project returns the old row, while a revision or token below the
+// stored maximum returns ErrStaleWatchBinding. Both checks and the insert share
+// one transaction.
 func (d *DB) WriteWatchBinding(e WatchBindingEntry) (WatchBindingWrite, error) {
 	if err := validateWatchBindingEntry(e); err != nil {
 		return WatchBindingWrite{}, err
@@ -162,7 +173,7 @@ func (d *DB) WriteWatchBinding(e WatchBindingEntry) (WatchBindingWrite, error) {
 		if err := ensureWatchBindingTable(tx); err != nil {
 			return err
 		}
-		state, err := readWatchBindingState(tx, e.WatchID)
+		state, err := readWatchBindingState(tx, e.ProjectKey, e.WatchID)
 		if err != nil {
 			return err
 		}
@@ -236,7 +247,7 @@ func (d *DB) LatestWatchBinding(watchID string) (WatchBindingEntry, bool, error)
 	if err != nil || !ok {
 		return WatchBindingEntry{}, false, err
 	}
-	state, err := readWatchBindingState(d.readDB, watchID)
+	state, err := readWatchBindingState(d.readDB, "", watchID)
 	if err != nil {
 		return WatchBindingEntry{}, false, err
 	}
