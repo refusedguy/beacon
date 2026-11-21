@@ -641,11 +641,34 @@ func TestRunWaitNeverWakesAReasonWaker(t *testing.T) {
 	waker := &fakeReasonWaker{}
 	r := &fakeResolver{ok: map[string]bool{"T3.100": false}}
 
-	if _, err := Run(context.Background(), st, &fakeMerger{}, waker, Options{Resolver: r}); err != nil {
+	if _, err := Run(context.Background(), st, &fakeMerger{}, waker, Options{Resolver: r, ReasonWaker: waker}); err != nil {
 		t.Fatal(err)
 	}
 	if len(waker.calls) != 0 {
 		t.Fatalf("a dependency hold must not wake even a ReasonWaker: %+v", waker.calls)
+	}
+}
+
+// TestWakeOneUsesExplicitReasonWaker proves the reason reaches the subscriber
+// only when the caller passes the alternate port explicitly. A plain Waker must
+// not be upgraded by a hidden type assertion.
+func TestWakeOneUsesExplicitReasonWaker(t *testing.T) {
+	waker := &fakeWaker{}
+	reasonWaker := &fakeReasonWaker{}
+	w := Watch{ID: "w1", PR: 7, Revision: 3, Verdict: VerdictRetry}
+	out := &Result{}
+	var errs []error
+
+	wakeOne(context.Background(), waker, reasonWaker, w, VerdictRetry, "ci red", out, &errs)
+
+	if len(errs) != 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	if len(waker.calls) != 0 {
+		t.Fatalf("plain waker must stay unused: %+v", waker.calls)
+	}
+	if len(reasonWaker.calls) != 1 || reasonWaker.calls[0] != (reasonWakeCall{"w1", 3, VerdictRetry, "ci red"}) {
+		t.Fatalf("reason wake = %+v, want one call with the reason", reasonWaker.calls)
 	}
 }
 
@@ -683,7 +706,7 @@ func TestRunCheckedMergePendingKeepsWatchOpen(t *testing.T) {
 	st := newFakeStore(readyWatch("w1", 312, 3))
 	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Pending: true}}}
 
-	result, err := Run(context.Background(), st, merger, nil, Options{})
+	result, err := Run(context.Background(), st, merger, nil, Options{CheckedMerger: merger})
 
 	if err != nil {
 		t.Fatal(err)
@@ -712,7 +735,7 @@ func TestRunCheckedMergeConfirmedClosesWatch(t *testing.T) {
 	st := newFakeStore(readyWatch("w1", 312, 3))
 	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Merged: true}}}
 
-	result, err := Run(context.Background(), st, merger, nil, Options{})
+	result, err := Run(context.Background(), st, merger, nil, Options{CheckedMerger: merger})
 
 	if err != nil {
 		t.Fatal(err)
@@ -736,7 +759,7 @@ func TestRunCheckedMergeHeldByGateDoesNotMerge(t *testing.T) {
 	st := newFakeStore(readyWatch("w1", 312, 3))
 	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Reason: reason}}}
 
-	result, err := Run(context.Background(), st, merger, nil, Options{})
+	result, err := Run(context.Background(), st, merger, nil, Options{CheckedMerger: merger})
 
 	if err != nil {
 		t.Fatalf("a held PR is a diagnostic, not an error: %v", err)
@@ -765,14 +788,14 @@ func TestRunCheckedMergeRepeatedPassDoesNotRemerge(t *testing.T) {
 	st := newFakeStore(readyWatch("w1", 312, 3))
 	merger := &fakeCheckedMerger{outcomes: []MergeOutcome{{Pending: true}, {Merged: true}}}
 
-	first, err := Run(context.Background(), st, merger, nil, Options{})
+	first, err := Run(context.Background(), st, merger, nil, Options{CheckedMerger: merger})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(st.closed) != 0 || len(st.merged) != 0 {
 		t.Fatalf("first pass must only arm: closed=%q merged=%v", st.closed, st.merged)
 	}
-	second, err := Run(context.Background(), st, merger, nil, Options{})
+	second, err := Run(context.Background(), st, merger, nil, Options{CheckedMerger: merger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -842,7 +865,7 @@ func TestWakeOneNamesOnlyRebaseAsRebase(t *testing.T) {
 			out := &Result{}
 			var errs []error
 			w := Watch{ID: "w1", PR: 7, Revision: 3, Verdict: tc.verdict}
-			wakeOne(context.Background(), waker, w, tc.verdict, "reason", out, &errs)
+			wakeOne(context.Background(), waker, nil, w, tc.verdict, "reason", out, &errs)
 
 			assertOrchCounter(t, metrics, observe.CounterRebaseRequests, tc.wantRebase)
 			if len(waker.calls) != 1 {
