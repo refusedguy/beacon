@@ -11,6 +11,9 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
   pull_request:
     paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
+  # Живой опрос CIProvider требует реального токена. Запускаем его вручную,
+  # чтобы он не был обязательным для локального прогона и для merge PR.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -239,3 +242,77 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.opencode/bin:$PATH"
           bash tests/e2e/run.sh
+
+  # Информационный probe живого CIProvider для слепой зоны R01. Переменные
+  # окружения записаны в docs/evals/ci-provider-probe.md. Джоба не обязательна
+  # для локального прогона и не блокирует merge: continue-on-error и ручной
+  # запуск через workflow_dispatch с реальным токеном из секретов.
+  ci-provider-probe:
+    name: ci-provider-probe
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ secrets.BEACON_CI_PROBE_TOKEN }}
+      BEACON_GITHUB_TOKEN: ${{ secrets.BEACON_CI_PROBE_TOKEN }}
+      PROBE_REPO: refusedguy/beacon-ci-fixture
+      PROBE_PR: '1'
+      PROBE_NEGATIVE_PR: '999999'
+    steps:
+      - name: Token configured
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            printf 'BEACON_CI_PROBE_TOKEN is not set; configure the secret and rerun\n' >&2
+            exit 1
+          fi
+          gh --version
+
+      # Те же два вызова gh, что делает internal/infra/ghci.Provider.fetch.
+      # headSHA не подставляется заглушкой: ответ приходит из живой сети.
+      - name: Positive control - fixture PR resolves through live provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'probe repo=%s pr=%s\n' "$PROBE_REPO" "$PROBE_PR"
+          gh pr view "$PROBE_PR" --repo "$PROBE_REPO" \
+            --json headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision \
+            > "$RUNNER_TEMP/probe-view.json"
+          cat "$RUNNER_TEMP/probe-view.json"
+          pr_state=$(jq -r '.state' "$RUNNER_TEMP/probe-view.json")
+          head_sha=$(jq -r '.headRefOid' "$RUNNER_TEMP/probe-view.json")
+          if [ "$pr_state" != 'OPEN' ]; then
+            printf 'positive control failed: fixture PR state=%s, expected OPEN\n' "$pr_state" >&2
+            exit 1
+          fi
+          if ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'positive control failed: headSHA=%s is not a live 40-hex value\n' "$head_sha" >&2
+            exit 1
+          fi
+          gh pr checks "$PROBE_PR" --repo "$PROBE_REPO" --json name,state,link \
+            > "$RUNNER_TEMP/probe-checks.json"
+          cat "$RUNNER_TEMP/probe-checks.json"
+          if ! grep -q '"state":"PASS"\|"state":"SUCCESS"' "$RUNNER_TEMP/probe-checks.json"; then
+            printf 'positive control failed: no passing check on fixture PR\n' >&2
+            exit 1
+          fi
+          printf 'positive control ok: headSHA=%s\n' "$head_sha"
+
+      # Негативный контроль ловит ложное срабатывание: если несуществующий PR
+      # тоже «нашёлся», probe слеп и его результат нельзя доверять.
+      - name: Negative control - unknown PR does not resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh pr view "$PROBE_NEGATIVE_PR" --repo "$PROBE_REPO" \
+            --json headRefOid > "$RUNNER_TEMP/probe-negative.json" 2>&1; then
+            printf 'negative control failed: PR %s resolved, probe is blind\n' "$PROBE_NEGATIVE_PR" >&2
+            cat "$RUNNER_TEMP/probe-negative.json" >&2
+            exit 1
+          fi
+          printf 'negative control ok: PR %s did not resolve\n' "$PROBE_NEGATIVE_PR"
