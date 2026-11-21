@@ -21,6 +21,9 @@ const minGoVersion = "1.26.0"
 
 var goVersionPattern = regexp.MustCompile(`go([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
 
+// checkResult statuses use the same uppercase register as the rules report in
+// commands.go and RULES-CHECK-CONTRACT.md: PASS, WARN, FAIL, BROKEN. A healthy
+// doctor check prints OK; a failed one prints FAIL and makes doctor exit 1.
 type checkResult struct {
 	name   string
 	status string

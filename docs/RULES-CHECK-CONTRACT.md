@@ -53,7 +53,7 @@ Rules gate возвращает ровно один вердикт: `PASS`, `WAR
 
 Схема полей определена в ADR 0237. Обязательные поля: `schema_version` со значением `1`, `gate` со значением `rules`, `status`, `blocking`, `blockers`, `affected_files` и `suggested_next`.
 
-Поле `status` использует строчные значения `pass`, `warn`, `fail` и `broken`. Значение `broken` расширяет перечень ADR 0237 для отказа инструмента. Вердикт отчёта задаёт значение поля: `PASS` даёт `pass`, `WARN` даёт `warn`, `FAIL` даёт `fail`, `BROKEN` даёт `broken`. В человекочитаемом отчёте вердикт остаётся в верхнем регистре.
+Поле `status` и человекочитаемый вердикт используют один верхний регистр: `PASS`, `WARN`, `FAIL`, `BROKEN`. Вердикт отчёта задаёт значение поля напрямую: `PASS` даёт `PASS`, `WARN` даёт `WARN`, `FAIL` даёт `FAIL`, `BROKEN` даёт `BROKEN`. Так machine и human отчёты перечисляют одинаковые значения в одном регистре. ADR 0237 задаёт строчные `pass`/`warn`/`fail`; контракт приводит их к верхнему регистру, добавляя `BROKEN` для отказа инструмента по коду выхода `2` (ADR 0016).
 
 В `blockers` попадают жёсткие нарушения, которые дают вердикт `FAIL`, и отказ инструмента, который даёт вердикт `BROKEN`. Каждая запись содержит `id`, `severity`, `file` и `summary`. Для `BROKEN` запись использует `file` со значением `.` и описывает причину отказа, например код выхода `2`. В `affected_files` попадают проверенные или изменённые пути. Поле `suggested_next` содержит разрешённую команду Beacon или `null`, когда подходящей команды нет.
 
@@ -63,7 +63,7 @@ Rules gate возвращает ровно один вердикт: `PASS`, `WAR
 {
   "schema_version": 1,
   "gate": "rules",
-  "status": "warn",
+  "status": "WARN",
   "blocking": false,
   "blockers": [],
   "affected_files": [],
@@ -77,7 +77,7 @@ Rules gate возвращает ровно один вердикт: `PASS`, `WAR
 {
   "schema_version": 1,
   "gate": "rules",
-  "status": "fail",
+  "status": "FAIL",
   "blocking": true,
   "blockers": [
     {
@@ -98,7 +98,7 @@ Rules gate возвращает ровно один вердикт: `PASS`, `WAR
 {
   "schema_version": 1,
   "gate": "rules",
-  "status": "broken",
+  "status": "BROKEN",
   "blocking": true,
   "blockers": [
     {

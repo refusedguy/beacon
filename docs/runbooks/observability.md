@@ -57,7 +57,7 @@ beacon metrics --format prometheus
 | Метрика | Что считает |
 | --- | --- |
 | `poll_cycles_total` | запусков опроса CI |
-| `verdict_published_total{verdict}` | опубликованных вердиктов, с меткой `ready`/`retry`/`fail` |
+| `verdict_published_total{verdict}` | опубликованных вердиктов; метка `verdict` это доменный вердикт из `internal/domain/types.go` |
 | `merge_attempts_total` | попыток автоматического мержа |
 | `merge_success_total` | успешных мержей |
 | `merge_failures_total` | отказов мержа |
@@ -70,6 +70,8 @@ beacon metrics --format prometheus
 | `blocks_escalated_total` | блокировок, записанных `blocked:not_mine` (считается только первый ack) |
 | `fixers_spawned_total` | FIX-агентов, запущенных для снятия блокировки |
 | `actor_errors_total` | ошибок акторов демона и обработчиков |
+
+Метка `verdict` берётся из перечисления `domain.Verdict` в `internal/domain/types.go`: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`, `recheck`. Других значений в метрике не бывает. В частности `fail` в неё не пишется: это внутреннее решение оркестратора (`orchestrator.VerdictFail`), а не доменный вердикт.
 
 Гистограммы времени: `poll_cycle_duration_seconds`, `merge_duration_seconds`, `wake_duration_seconds`, `run_duration_seconds`. В Prometheus они экспортируются обычными наборами `_bucket{le=...}`, `_sum`, `_count`.
 

@@ -32,8 +32,10 @@ const (
 	// held, and so the next tick re-checks the dependency instead of dropping
 	// the Watch. The reason follows the colon in the persisted verdict.
 	VerdictWaitDependency = "wait_dependency"
-	// VerdictRetry and VerdictFail are left for the subscriber's wake. This
-	// card never repairs them; wake delivery belongs to another card.
+	// VerdictRetry and VerdictFail are left for the subscriber's wake. Wake
+	// delivery belongs to another card. VerdictFail is an orchestrator-internal
+	// decision, not a domain.Verdict: the bridge never writes it to the store,
+	// so verdict_published_total never carries a fail label.
 	VerdictRetry = "retry"
 	VerdictFail  = "fail"
 )
