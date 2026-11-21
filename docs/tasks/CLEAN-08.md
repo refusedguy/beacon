@@ -1,12 +1,12 @@
 # CLEAN-08. Зафиксировать решение о закоммиченном бинарнике гейтов
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: .gitignore, docs/adrs/0016-*.md, tools/beacon-gates/beacon-gates
 Зависимости: 
 Ссылка: ADR 0016
-Агент: нет
-Время: нет
+Агент: exe75
+Время: 2026-11-21T17:44:02Z
 baseline: tools/beacon-gates/beacon-gates закоммичен как обычный файл с режимом 100755, размер 3 117 182 байта (3,0 МБ), blob 565a68f5cb5f71f90400541cc87b317cd6c82052, sha256 81f927d7d1ae7c64b0644720d9d68464cafc2a96f315cbbc6dfce44ed208ebc4. Замер снят локально `git ls-files --stage`, `stat` и `sha256sum` на коммите ef029392. Механизм сверки со сборкой лежит в `gates-binary.yml` и использует `cmp -s committed rebuilt`.
 
 Цель: Явно подтвердить, что tools/beacon-gates/beacon-gates остаётся в репозитории, или описать альтернативный способ доставки гейта.
