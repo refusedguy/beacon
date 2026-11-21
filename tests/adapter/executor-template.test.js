@@ -65,6 +65,26 @@ test("T3.7 шаблон: TTL не является причиной выхода
   assert.equal(block("ttl"), "none")
 })
 
+test("шаблон: полный цикл карточки с веткой закрытия", () => {
+  const b = block("card-lifecycle")
+  const fields = Object.fromEntries(
+    b.split("\n")
+      .filter((l) => l.includes(":"))
+      .map((l) => [l.slice(0, l.indexOf(":")).trim(), l.slice(l.indexOf(":") + 1).trim()])
+  )
+  assert.equal(fields.orchestrator, "spawn-N, one-signal-one-spawn")
+  assert.equal(
+    fields.steps,
+    "spawn, assign-id, claim, check-premise, implement-or-close, pr, finish"
+  )
+  assert.match(fields["branch-6a"], /code-PR/)
+  assert.match(fields["branch-6b"], /close-card-with-evidence/)
+  assert.match(fields["close-tool"], /beacon_task_close/)
+  assert.match(fields["close-tool"], /beacon task done/)
+  assert.match(fields.evidence, /merge-base/)
+  assert.equal(fields["duplicate-code-PR"], "forbidden")
+})
+
 test("T3.404 шаблон: триаж требует сравнить failedChecks со своим diff", () => {
   const b = block("triage")
   const fields = Object.fromEntries(
