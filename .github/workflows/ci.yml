@@ -195,6 +195,53 @@ jobs:
             "$bin" "$gate"
           done
 
+  # RS2-EVAL-05. Отдельная обязательная проверка на отказ инструмента.
+  # rules gate возвращает код 2 при BROKEN. Джоба обязана стать красной,
+  # иначе зелёные проверки скрывают отказ. Не объединяем её с gates.
+  rules-broken:
+    name: rules-broken
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build beacon
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags="-buildid= -s -w" \
+            -o beacon ./cmd/beacon
+
+      - name: Run rules gate
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          ./beacon gates rules
+          code=$?
+          case "$code" in
+            0)
+              printf 'rules gate exit 0\n'
+              ;;
+            2)
+              printf 'rules gate BROKEN: exit 2\n' >&2
+              ;;
+            *)
+              printf 'rules gate FAIL: exit %d\n' "$code" >&2
+              ;;
+          esac
+          exit "$code"
+
   # Пока не делаем e2e обязательным для merge: job запускает реальный
   # opencode 2.3.0 и зависит от его бинарника в runner. continue-on-error
   # поэтому он не блокирует остальные job, пока прогон не станет стабильным.
