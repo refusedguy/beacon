@@ -716,6 +716,24 @@ func (r *runner) applyMergePlan(decisions []mergeDecision) {
 	r.printf(mergeReportFormat, merged, held)
 }
 
+// commitArtifacts stages and commits the generated documentation. Since
+// IDX-11 the derived documents (FACTS.md, ROADMAP_STATUS.md and adrs/README.md)
+// are gitignored. Naming an ignored path in git add makes it exit 1 and aborts
+// --commit, so stage the three source trees by directory instead. Git skips
+// ignored files inside a directory without failing, and still stages cards
+// changed by closures.
+func commitArtifacts(root string, cards, adrs, evals int) error {
+	add := exec.Command("git", "add", "--", "docs/adrs", "docs/tasks", "docs/evals")
+	add.Dir = root
+	if err := add.Run(); err != nil {
+		return err
+	}
+	commit := exec.Command("git", "commit", "-m",
+		fmt.Sprintf("docs: batch apply %d cards, %d ADRs, %d evals", cards, adrs, evals))
+	commit.Dir = root
+	return commit.Run()
+}
+
 // Run executes the batch apply and returns the process exit code. All file
 // and subprocess work happens in this infra package, not in cmd.
 func Run(opts Options, out, errOut io.Writer) int {
@@ -898,16 +916,7 @@ func Run(opts Options, out, errOut io.Writer) int {
 	}
 
 	if opts.Commit && !opts.DryRun {
-		cmd := exec.Command("git", "add", "docs/adrs", "docs/tasks", "docs/evals", "docs/FACTS.md")
-		cmd.Dir = root
-		if err := cmd.Run(); err != nil {
-			r.errf("%v\n", err)
-			return 1
-		}
-		cmd = exec.Command("git", "commit", "-m",
-			fmt.Sprintf("docs: batch apply %d cards, %d ADRs, %d evals", len(cards), len(adrs), len(evals)))
-		cmd.Dir = root
-		if err := cmd.Run(); err != nil {
+		if err := commitArtifacts(root, len(cards), len(adrs), len(evals)); err != nil {
 			r.errf("%v\n", err)
 			return 1
 		}

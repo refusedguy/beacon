@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -520,5 +521,86 @@ func TestEvaluateChecksMergeGate(t *testing.T) {
 				t.Fatalf("evaluateChecks() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestCommitArtifactsSkipsIgnoredDerivedDocs covers IDX-11. Derived documents
+// are gitignored, and naming one in git add makes batch-apply --commit exit 1.
+// Staging the source trees by directory must commit ADRs, cards and evals while
+// leaving every ignored document out of the commit.
+func TestCommitArtifactsSkipsIgnoredDerivedDocs(t *testing.T) {
+	root := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	git("init", "-q")
+	git("config", "user.email", "batch@example.com")
+	git("config", "user.name", "batch")
+	write := func(rel, content string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	write(".gitignore", "docs/FACTS.md\ndocs/ROADMAP_STATUS.md\ndocs/adrs/README.md\n")
+	write("docs/adrs/0001-source.md", "# ADR 1\n")
+	write("docs/tasks/W1.md", "# W1\n")
+	write("docs/evals/e1.md", "# e1\n")
+	write("docs/FACTS.md", "derived\n")
+	write("docs/adrs/README.md", "derived\n")
+	write("docs/ROADMAP_STATUS.md", "derived\n")
+
+	if err := commitArtifacts(root, 1, 1, 1); err != nil {
+		t.Fatalf("commitArtifacts: %v", err)
+	}
+	committed := git("ls-tree", "-r", "--name-only", "HEAD")
+	for _, want := range []string{"docs/adrs/0001-source.md", "docs/tasks/W1.md", "docs/evals/e1.md"} {
+		if !strings.Contains(committed, want) {
+			t.Fatalf("commit missing %q:\n%s", want, committed)
+		}
+	}
+	for _, ignored := range []string{"docs/FACTS.md", "docs/adrs/README.md", "docs/ROADMAP_STATUS.md"} {
+		if strings.Contains(committed, ignored) {
+			t.Fatalf("commit contains ignored %q:\n%s", ignored, committed)
+		}
+	}
+}
+
+// TestWriteFileNeverOverwritesExistingCard pins the invariant that a later
+// batch cannot replace a card already on disk. The commit change must not
+// weaken it.
+func TestWriteFileNeverOverwritesExistingCard(t *testing.T) {
+	root := t.TempDir()
+	rel := filepath.Join("docs", "tasks", "W1.md")
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const existing = "# W1. Existing card\nСтатус: done\n"
+	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &runner{out: io.Discard, err: io.Discard}
+	if err := r.writeFile(root, rel, "# W1. Replacement\n"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != existing {
+		t.Fatalf("existing card changed: got %q, want %q", got, existing)
 	}
 }
