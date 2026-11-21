@@ -22,6 +22,13 @@ import (
 
 const rootModuleLine = "module github.com/refusedguy/beacon"
 
+// Негативный контроль. Пустой план или план без активной фазы не должен
+// проходить проверку: сканеру нечего сканировать, и PASS в этом случае врёт.
+const (
+	noCardsMsg = "нет карточек плана в docs/tasks: детектору нечего проверять"
+	noPhaseMsg = "не найдена активная фаза плана: у карточек нет поля «Фаза»"
+)
+
 // Маркеры незавершённой работы из Harbor Step 3.2. Слова собраны из частей,
 // чтобы сканер не нашёл их в собственном исходнике.
 var leftoverPattern = regexp.MustCompile(
@@ -124,7 +131,8 @@ func hasRootModule(text string) bool {
 }
 
 // activePhase возвращает последнюю фазу плана. Карточки прошлых волн остаются
-// в docs/tasks как история и по ним дрейф не считается.
+// в docs/tasks как история и по ним дрейф не считается. Пустая строка означает
+// отсутствие плана; scanRepo разбирает её как находку, а не как валидную фазу.
 func activePhase(cards []taskCard) string {
 	best := ""
 	for _, c := range cards {
@@ -202,7 +210,21 @@ func hasPRConfirmation(text string) bool {
 func scanRepo(root string) []driftFinding {
 	cards := readCards(filepath.Join(root, "docs", "tasks"))
 	phase := activePhase(cards)
-	findings := make([]driftFinding, 0)
+	findings := make([]driftFinding, 0, 4)
+
+	if len(cards) == 0 {
+		findings = append(findings, driftFinding{
+			kind: "plan",
+			path: "docs/tasks/",
+			msg:  noCardsMsg,
+		})
+	} else if phase == "" {
+		findings = append(findings, driftFinding{
+			kind: "plan",
+			path: "docs/tasks/",
+			msg:  noPhaseMsg,
+		})
+	}
 
 	for _, card := range cards {
 		if card.phase != phase && card.phase != "" {
@@ -370,7 +392,7 @@ func artifactName(base string) bool {
 // Так проверка доказывает, что она ловит именно устаревший план и артефакт,
 // а не просто всегда возвращает PASS.
 func selfTest() []string {
-	out := make([]string, 0, 4)
+	out := make([]string, 0, 6)
 	root, err := os.MkdirTemp("", "beacon-drift-selftest-")
 	if err != nil {
 		return []string{"FAIL создать временный каталог: " + err.Error()}
@@ -437,7 +459,44 @@ func selfTest() []string {
 	} else {
 		out = append(out, "FAIL чистая фикстура дала ложное срабатывание")
 	}
+
+	// Негативный контроль: без карточек или без активной фазы детектор обязан
+	// падать, а не выдавать PASS на пустом плане.
+	emptyRoot, err := os.MkdirTemp("", "beacon-drift-empty-")
+	if err != nil {
+		return append(out, "FAIL создать фикстуру без карточек: "+err.Error())
+	}
+	defer func() { _ = drvRemoveAll(emptyRoot) }()
+	if hasFinding(scanRepo(emptyRoot), noCardsMsg) {
+		out = append(out, "PASS негативный контроль: пустой план даёт FAIL")
+	} else {
+		out = append(out, "FAIL негативный контроль: пустой план дал PASS")
+	}
+
+	noPhaseRoot, err := os.MkdirTemp("", "beacon-drift-nophase-")
+	if err != nil {
+		return append(out, "FAIL создать фикстуру без фазы: "+err.Error())
+	}
+	defer func() { _ = drvRemoveAll(noPhaseRoot) }()
+	noPhaseCard := "# HD-997. Карточка без фазы\nСтатус: new\n"
+	if err := writeFixture(noPhaseRoot, "docs/tasks/HD-997.md", noPhaseCard); err != nil {
+		return append(out, "FAIL записать карточку без фазы: "+err.Error())
+	}
+	if hasFinding(scanRepo(noPhaseRoot), noPhaseMsg) {
+		out = append(out, "PASS негативный контроль: план без активной фазы даёт FAIL")
+	} else {
+		out = append(out, "FAIL негативный контроль: план без активной фазы дал PASS")
+	}
 	return out
+}
+
+func hasFinding(findings []driftFinding, wantMsg string) bool {
+	for _, f := range findings {
+		if f.msg == wantMsg {
+			return true
+		}
+	}
+	return false
 }
 
 func writeFixture(root, rel, content string) error {
