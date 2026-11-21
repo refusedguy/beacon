@@ -6,6 +6,8 @@ package worktree
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -115,4 +117,105 @@ func Remove(run Runner, dir string) error {
 		return fmt.Errorf("worktree: remove %s: %w: %s", dir, err, strings.TrimSpace(out))
 	}
 	return nil
+}
+
+// Reasons recorded for a worktree that collection kept.
+const (
+	ReasonLocked       = "locked"
+	ReasonActiveWatch  = "active_watch"
+	ReasonStatusError  = "status_error"
+	ReasonDirty        = "dirty"
+	ReasonProtectedDir = "protected_dir"
+	ReasonRemoveError  = "remove_error"
+)
+
+// Kept is one worktree that collection did not remove.
+type Kept struct {
+	Dir    string `json:"dir"`
+	Branch string `json:"branch,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// Result is the outcome of one collection pass. Removed holds the paths git
+// actually deleted; Kept explains every survivor.
+type Result struct {
+	Removed []string `json:"removed"`
+	Kept    []Kept   `json:"kept"`
+}
+
+// WatchIDForHead maps a worktree head to a live Watch ID. A short head stays
+// comparable through the prefix check. Sorted keys give a stable answer when
+// two Watches record the same head. An empty head or no match returns "".
+func WatchIDForHead(heads map[string]string, head string) string {
+	head = strings.ToLower(strings.TrimSpace(head))
+	if len(head) < 7 {
+		return ""
+	}
+	keys := make([]string, 0, len(heads))
+	for sha := range heads {
+		keys = append(keys, sha)
+	}
+	sort.Strings(keys)
+	for _, sha := range keys {
+		if strings.HasPrefix(sha, head) {
+			return heads[sha]
+		}
+	}
+	return ""
+}
+
+func cleanDir(dir string) string {
+	return filepath.Clean(strings.TrimSpace(dir))
+}
+
+// Collect removes clean, unlocked worktrees that have no live Watch at their
+// head and are not in protectedDirs. It reuses List, Status and Remove, so List
+// always drops the main worktree and Remove can never delete a dirty tree even
+// if the status check is skipped. A status error or a failed remove keeps the
+// worktree with a reason instead of aborting the whole pass.
+func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Result, error) {
+	entries, err := List(run)
+	if err != nil {
+		return Result{}, err
+	}
+	protected := make(map[string]bool, len(protectedDirs))
+	for _, dir := range protectedDirs {
+		if dir = strings.TrimSpace(dir); dir != "" {
+			protected[cleanDir(dir)] = true
+		}
+	}
+
+	var out Result
+	for _, e := range entries {
+		keep := func(reason string) {
+			out.Kept = append(out.Kept, Kept{Dir: e.Dir, Branch: e.Branch, Reason: reason})
+		}
+		switch {
+		case e.Locked:
+			keep(ReasonLocked)
+			continue
+		case protected[cleanDir(e.Dir)]:
+			keep(ReasonProtectedDir)
+			continue
+		}
+		if id := WatchIDForHead(heads, e.Head); id != "" {
+			keep(ReasonActiveWatch + ":" + id)
+			continue
+		}
+		status, statusErr := Status(run, e.Dir)
+		switch {
+		case statusErr != nil:
+			keep(ReasonStatusError + ":" + statusErr.Error())
+			continue
+		case strings.TrimSpace(status) != "":
+			keep(ReasonDirty)
+			continue
+		}
+		if err := Remove(run, e.Dir); err != nil {
+			keep(ReasonRemoveError + ":" + err.Error())
+			continue
+		}
+		out.Removed = append(out.Removed, e.Dir)
+	}
+	return out, nil
 }
