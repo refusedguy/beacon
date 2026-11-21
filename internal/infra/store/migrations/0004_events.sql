@@ -6,4 +6,8 @@ CREATE TABLE events (
   payload        BLOB NOT NULL,
   created_at     INTEGER NOT NULL
 );
-CREATE INDEX events_by_watch ON events(watch_id, seq);
+-- BCX-38: раньше здесь создавался events_by_watch(watch_id, seq). Append пишет
+-- watch_id = scope, поэтому индекс дублировал events_by_scope(scope, seq) из
+-- events.go и удваивал запись в индексы на каждое событие. Единственный рабочий
+-- индекс events_by_scope создаёт ensureEventLog при открытии базы; он же удаляет
+-- унаследованный events_by_watch из уже существующих баз.
