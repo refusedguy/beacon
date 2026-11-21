@@ -5,8 +5,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
+
+// gcCatalogEntry makes the collector visible in `beacon list` and
+// `beacon what`. The implementation is registered from gc.go.
+var gcCatalogEntry = command{
+	Name:    "gc",
+	Summary: "Удалить мёртвые записи и осиротевшие процессы opencode serve",
+	Usage:   "beacon gc [--apply] [--format table|json]",
+}
+
+func init() {
+	catalog = append(catalog, gcCatalogEntry)
+	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
+}
 
 func (c *CLI) runBuild(args []string) int {
 	fs := flag.NewFlagSet("build", flag.ContinueOnError)
