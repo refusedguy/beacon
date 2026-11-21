@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 const validCard = `# T2.4. Пример карточки
@@ -107,6 +109,42 @@ func TestLoadCardsSortAndViolation(t *testing.T) {
 	_, err = LoadCards(dir)
 	if err == nil || !strings.Contains(err.Error(), "T0.1.md") || !strings.Contains(err.Error(), "Статус") {
 		t.Fatalf("LoadCards должен сообщить об имени файла и поле, получил %v", err)
+	}
+}
+
+func TestLoadCardsAndReadTaskEventsUseFileAdapter(t *testing.T) {
+	previous := observe.Default()
+	defer observe.SetDefault(previous)
+
+	m := observe.NewMetrics()
+	observe.SetDefault(observe.NewRecorder(nil, m))
+
+	dir := t.TempDir()
+	write := func(name, text string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("T2.4.md", validCard)
+	write("T1.1.md", strings.Replace(validCard, "T2.4", "T1.1", 1))
+	write("notes.txt", "не карточка")
+
+	cards, err := LoadCards(dir)
+	if err != nil {
+		t.Fatalf("LoadCards: %v", err)
+	}
+	if len(cards) != 2 {
+		t.Fatalf("карточек = %d, ждали 2", len(cards))
+	}
+	if got := counterValue(t, m, observe.CounterFileAdapterReads); got != 2 {
+		t.Errorf("%s = %d, ждали 2 прочитанные карточки", observe.CounterFileAdapterReads, got)
+	}
+
+	if _, err := ReadTaskEvents(filepath.Join(dir, "T1.1.md")); err != nil {
+		t.Fatalf("ReadTaskEvents: %v", err)
+	}
+	if got := counterValue(t, m, observe.CounterFileAdapterReads); got != 3 {
+		t.Errorf("%s = %d, ждали 3 после ReadTaskEvents", observe.CounterFileAdapterReads, got)
 	}
 }
 

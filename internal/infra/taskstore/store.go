@@ -276,6 +276,10 @@ func splitList(v string) []string {
 	return out
 }
 
+// fileAdapter is the counted markdown reader. Card reads go through it so the
+// dual-read exit metric sees every access to the legacy source.
+var fileAdapter FileAdapter
+
 // LoadCards читает все карточки каталога и сортирует их по ID.
 func LoadCards(tasksDir string) ([]Card, error) {
 	entries, err := os.ReadDir(tasksDir)
@@ -288,7 +292,7 @@ func LoadCards(tasksDir string) ([]Card, error) {
 			continue
 		}
 		filePath := filepath.Join(tasksDir, e.Name())
-		data, err := os.ReadFile(filePath)
+		data, err := fileAdapter.ReadFile(filePath)
 		if err != nil {
 			return nil, Startupf("не прочитана карточка %s: %v", e.Name(), err)
 		}
@@ -684,7 +688,7 @@ func (tx TaskEventTx) Write(beforePublish func() error) error {
 // равен пустому журналу. События и карточка читаются из одного файла, поэтому
 // нельзя получить событие без карточки.
 func ReadTaskEvents(path string) ([]TaskEvent, error) {
-	data, err := os.ReadFile(path)
+	data, err := fileAdapter.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return []TaskEvent{}, nil
 	}
