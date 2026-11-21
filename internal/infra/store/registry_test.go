@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"reflect"
@@ -430,5 +432,153 @@ func TestRegisterResultIsUseful(t *testing.T) {
 	}
 	if res.Executor.CreatedAt == 0 || res.Binding.CreatedAt == 0 {
 		t.Fatal("timestamps must be populated")
+	}
+}
+
+func TestRegistrySchemaHasSyncColumns(t *testing.T) {
+	d := newRegistryTestDB(t)
+	// A write runs the on-first-use migration that adds the sync columns.
+	if _, err := d.UpsertExecutor(registryExecutor("project-a", "session-1")); err != nil {
+		t.Fatalf("UpsertExecutor: %v", err)
+	}
+	for _, name := range []string{"last_seen", "worktree"} {
+		has, err := registryHasColumn(d.readDB, name)
+		if err != nil {
+			t.Fatalf("registryHasColumn(%s): %v", name, err)
+		}
+		if !has {
+			t.Errorf("agent_registry has no %s column", name)
+		}
+	}
+}
+
+func TestEnsureRegistrySchemaAddsSyncColumnsToOldTable(t *testing.T) {
+	d := newRegistryTestDB(t)
+	// Recreate the migration 0005 shape without the sync columns.
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DROP TABLE agent_registry`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			CREATE TABLE agent_registry (
+			  project_key TEXT NOT NULL,
+			  agent_id TEXT NOT NULL,
+			  role TEXT NOT NULL,
+			  runtime TEXT NOT NULL DEFAULT '',
+			  session_id TEXT NOT NULL DEFAULT '',
+			  status TEXT NOT NULL DEFAULT 'active',
+			  created_at INTEGER NOT NULL,
+			  updated_at INTEGER NOT NULL,
+			  PRIMARY KEY (project_key, agent_id)
+			)`)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("recreate old table: %v", err)
+	}
+	for _, name := range []string{"last_seen", "worktree"} {
+		has, err := registryHasColumn(d.readDB, name)
+		if err != nil {
+			t.Fatalf("registryHasColumn(%s): %v", name, err)
+		}
+		if has {
+			t.Fatalf("old table already has %s", name)
+		}
+	}
+
+	if err := d.EnsureRegistrySchema(); err != nil {
+		t.Fatalf("EnsureRegistrySchema: %v", err)
+	}
+	// A second call must not try to add the columns again.
+	if err := d.EnsureRegistrySchema(); err != nil {
+		t.Fatalf("second EnsureRegistrySchema: %v", err)
+	}
+	for _, name := range []string{"last_seen", "worktree"} {
+		has, err := registryHasColumn(d.readDB, name)
+		if err != nil {
+			t.Fatalf("registryHasColumn(%s) after migration: %v", name, err)
+		}
+		if !has {
+			t.Errorf("EnsureRegistrySchema did not add %s", name)
+		}
+	}
+}
+
+func TestSyncExecutorWritesObservationAndStatus(t *testing.T) {
+	d := newRegistryTestDB(t)
+	if _, err := d.UpsertExecutor(registryExecutor("project-a", "ses-live")); err != nil {
+		t.Fatalf("UpsertExecutor: %v", err)
+	}
+
+	firstSeen := int64(1_700_000_000_000_000_000)
+	if err := d.SyncExecutor("project-a", "ses-live", RegistryStatusStale, "/work/t5.55", firstSeen); err != nil {
+		t.Fatalf("SyncExecutor stale: %v", err)
+	}
+	stored, found, err := d.Executor("project-a", "ses-live")
+	if err != nil {
+		t.Fatalf("Executor after stale sync: %v", err)
+	}
+	if !found {
+		t.Fatal("executor lost after sync")
+	}
+	if stored.Status != RegistryStatusStale || stored.LastSeen != firstSeen || stored.Worktree != "/work/t5.55" {
+		t.Fatalf("stale row = %+v", stored)
+	}
+
+	secondSeen := firstSeen + 60_000_000_000
+	if err := d.SyncExecutor("project-a", "ses-live", RegistryStatusActive, "/work/t5.55b", secondSeen); err != nil {
+		t.Fatalf("SyncExecutor active: %v", err)
+	}
+	stored, found, err = d.Executor("project-a", "ses-live")
+	if err != nil {
+		t.Fatalf("Executor after active sync: %v", err)
+	}
+	if !found {
+		t.Fatal("executor lost after second sync")
+	}
+	if stored.Status != RegistryStatusActive || stored.LastSeen != secondSeen || stored.Worktree != "/work/t5.55b" {
+		t.Fatalf("active row = %+v", stored)
+	}
+}
+
+func TestSyncExecutorKeepsObservationOnRegister(t *testing.T) {
+	d := newRegistryTestDB(t)
+	e := registryExecutor("project-a", "ses-live")
+	if _, err := d.UpsertExecutor(e); err != nil {
+		t.Fatalf("UpsertExecutor: %v", err)
+	}
+
+	seen := int64(1_700_000_100_000_000_000)
+	if err := d.SyncExecutor("project-a", "ses-live", RegistryStatusActive, "/work/t5.55", seen); err != nil {
+		t.Fatalf("SyncExecutor: %v", err)
+	}
+	e.NotifyTarget = "T5.55-updated"
+	if _, err := d.UpsertExecutor(e); err != nil {
+		t.Fatalf("repeat UpsertExecutor: %v", err)
+	}
+	stored, found, err := d.Executor("project-a", "ses-live")
+	if err != nil {
+		t.Fatalf("Executor: %v", err)
+	}
+	if !found {
+		t.Fatal("executor lost after register")
+	}
+	if stored.LastSeen != seen || stored.Worktree != "/work/t5.55" {
+		t.Fatalf("register erased sync observation: %+v", stored)
+	}
+	if stored.NotifyTarget != "T5.55-updated" {
+		t.Fatalf("mutable registration field not refreshed: %q", stored.NotifyTarget)
+	}
+}
+
+func TestSyncExecutorRejectsEmptyKeys(t *testing.T) {
+	d := newRegistryTestDB(t)
+	for _, tc := range []struct{ project, agent string }{
+		{"", "ses-1"},
+		{"project-a", ""},
+	} {
+		if err := d.SyncExecutor(tc.project, tc.agent, RegistryStatusStale, "", 1); err == nil {
+			t.Errorf("SyncExecutor(%q, %q): want an error", tc.project, tc.agent)
+		}
 	}
 }

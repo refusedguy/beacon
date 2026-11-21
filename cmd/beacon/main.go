@@ -38,6 +38,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon spawn <taskID> [--agent id] [--title ...]
   beacon attach <sessionID>
   beacon registry stop --watch <id> --revision <n> --session <id> --token <t>
+  beacon registry sync [--project <key>]
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
   beacon daemon [--interval 10s|30s] [--once]
