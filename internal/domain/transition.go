@@ -76,6 +76,10 @@ const (
 	EventBlock EventKind = "block"
 	// EventUnblock resumes a blocked Watch to watching, clearing the block.
 	EventUnblock EventKind = "unblock"
+	// EventUnpark resumes a parked Watch to watching after every subscriber has
+	// been notified of the park. Parking stays in force until then, so a CI
+	// refresh cannot silently revive a Watch nobody has seen (ATX-32).
+	EventUnpark EventKind = "unpark"
 	// EventRevoke closes one failed wake delivery. It is the boundary that ties
 	// a retry to the delivery it replaces: the ladder records the revoke,
 	// advances the rung and arms the next attempt. A revoke changes no verdict
@@ -219,6 +223,13 @@ func UnblockEvent(at time.Time) Event {
 	return Event{Kind: EventUnblock, At: at}
 }
 
+// UnparkEvent resumes a parked Watch after its park notice reached every
+// subscriber. It is a no-op on a Watch that is not parked, so a repeated notice
+// cannot revive a Watch twice.
+func UnparkEvent(at time.Time) Event {
+	return Event{Kind: EventUnpark, At: at}
+}
+
 // RevokeEvent builds the event that closes one failed wake delivery. The
 // revoke time is set from at so the caller does not have to fill it twice.
 func RevokeEvent(r DeliveryRevoke, at time.Time) Event {
@@ -252,6 +263,7 @@ func CanContinueRound(round uint64) bool {
 //	notifying -> parked    : same failure after an actionable verdict
 //	needs_input -> parked   : same failure while waiting for a human answer
 //	parked    -> parked    : repeated failure or a verdict/answer/needs_input event (no-op)
+//	parked    -> watching  : explicit unpark after all subscribers saw the park notice
 //	parked    -> closed    : cancel, head_changed or a successful acceptance command
 //	watching  -> blocked   : required checks fail and need outside action (no wake)
 //	notifying -> blocked   : same block after an actionable verdict (no wake)
@@ -270,8 +282,9 @@ func CanContinueRound(round uint64) bool {
 // Forbidden transitions: anything leaving closed (closed -> watching,
 // closed -> notifying, closed -> needs_input, closed -> parked). A cancelled
 // Watch therefore never becomes ready. A parked Watch never resumes from a
-// verdict, a ContinueEvent or a needs_input event: leaving park is a human
-// action that starts a new record, not a retry of the failed step. Head change
+// verdict, a ContinueEvent or a needs_input event: leaving park needs either an
+// explicit unpark after all subscribers saw the notice, another human action
+// that starts a new record, or a head change. Head change
 // still closes a parked Watch and creates a successor, as it does for any live
 // Watch (ADR 0019); that is a new PR head, not a retry of the failure. A
 // ContinueEvent whose ContinueOf is a different Watch is also a no-op: an
@@ -320,6 +333,8 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		return blockWatch(w, e)
 	case EventUnblock:
 		return unblockWatch(w, e)
+	case EventUnpark:
+		return unparkParked(w, e)
 	case EventRevoke:
 		return revokeDelivery(w, e)
 	default:
@@ -392,6 +407,21 @@ func unblockWatch(w Watch, e Event) (Watch, []Effect) {
 	next.Status = StatusWatching
 	next.Verdict = VerdictWatching
 	next.Blocked = nil
+	next.Revision = bumpRevision(w.Revision)
+	return next, nil
+}
+
+// unparkParked resumes a parked Watch to watching once its park notice reached
+// every subscriber. It is a no-op on any other status and stages no effect, so
+// no wake is armed by the resume itself. The revision grows so consumers see
+// that the Watch re-entered the control loop.
+func unparkParked(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status != StatusParked {
+		return next, nil
+	}
+	next.Status = StatusWatching
+	next.Verdict = VerdictWatching
 	next.Revision = bumpRevision(w.Revision)
 	return next, nil
 }
