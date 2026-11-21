@@ -4,7 +4,7 @@
 Тип: task
 Владелец файлов: internal/infra/otel/, docs/tasks/RS-OBS-02.md
 Зависимости: RS-OBS-02
-Ссылка: {{PR_LINK}}
+Ссылка: PR #1166 (https://github.com/refusedguy/beacon/pull/1166)
 Агент: нет
 Время: нет
 Цель: Подтвердить, что observability переехала в internal/infra/observe, закрыть RS-OBS-02 и удалить дублирующий локальный sink.
@@ -19,4 +19,4 @@
 - Старый пакет internal/infra/otel содержал локальный NDJSON sink с ротацией, функции ReadAll и ReadStateDir и пять GenAI-атрибутов. Чтение файла и ротация в observe не перенесены. У пакета не было импортёров, поэтому удаление не меняет поведение во время работы.
 - RS-OBS-02 уже закрыта в main. Реализация вошла в PR #854, коммит 43d2788. В карточке заполнена строка Ссылка. Отдельное решение владельца не потребовалось.
 - Удалены internal/infra/otel/local.go и internal/infra/otel/local_test.go. gofmt не применялся, .go-файлов после удаления нет. go test, go build и гейты не запускались локально, проверка идёт в CI.
-- Ссылка на этот PR: {{PR_LINK}}
+- Ссылка на этот PR: PR #1166 (https://github.com/refusedguy/beacon/pull/1166)
