@@ -416,7 +416,12 @@ func nextStepFor(verdict domain.Verdict) (action, command, hint string) {
 	case domain.VerdictReady:
 		return NextActionWait, "",
 			"checks are green; the orchestrator merges, no command is needed here"
-	case domain.VerdictMerged, domain.VerdictClosed, domain.VerdictTimeout:
+	case domain.VerdictTimeout:
+		// Terminal verdict, not the retryable long-poll reason. The two used to
+		// share the "timeout" string and gave opposite instructions (BCX-11).
+		return domain.NextActionDone, "",
+			"the Watch hit a terminal timeout verdict; stop here and do not retry the long-poll wait"
+	case domain.VerdictMerged, domain.VerdictClosed:
 		return NextActionWait, "", "the Watch is finished; there is no next step"
 	default:
 		return NextActionWait, "", "no verdict yet; finish the turn with waiting, watchID"

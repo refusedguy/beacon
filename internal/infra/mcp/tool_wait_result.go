@@ -99,11 +99,17 @@ const (
 // does not replace the ADR 0026 delivery field.
 type WaitStopReason string
 
+// The long-poll timeout has its own wire value. A terminal domain verdict also
+// serialises as "timeout", and get_result maps that verdict to nextAction=wait
+// with "the Watch is finished". Both strings reach the same agent, but this
+// reason is retryable and exits 143. A client branching on one string would
+// finish the turn on a wait it should retry (BCX-11). The two contracts keep
+// separate values so the string alone decides whether to wait or to end.
 const (
 	WaitStopTerminal          WaitStopReason = "terminal"
 	WaitStopInputRequired     WaitStopReason = "input_required"
 	WaitStopUnknownSubmission WaitStopReason = "unknown_submission"
-	WaitStopTimeout           WaitStopReason = "timeout"
+	WaitStopTimeout           WaitStopReason = "wait_timeout"
 	WaitStopInterrupted       WaitStopReason = "interrupted"
 )
 
@@ -123,7 +129,9 @@ func (r WaitStopReason) valid() bool {
 // reasons get distinct codes so a script can tell them apart: an unknown
 // submission is a usage error, an interruption is a signal, a timeout is an
 // expired budget. The CLI owns the actual process exit; this mapping is the
-// contract value it reads from the reason.
+// contract value it reads from the reason. Code 143 belongs only to the
+// "wait_timeout" reason, so an expired budget never reads as nextAction=wait
+// borrowed from the terminal "timeout" verdict (BCX-11).
 func (r WaitStopReason) ExitCode() int {
 	switch r {
 	case WaitStopUnknownSubmission:
