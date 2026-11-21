@@ -181,6 +181,43 @@ func TestTypes(t *testing.T) {
 	})
 }
 
+func TestAppErrorUnwrap(t *testing.T) {
+	cause := errors.New("store down")
+	e := NewAppErrorWithCause(CodePersistFailed, "store down", cause)
+
+	if e.Unwrap() != cause {
+		t.Fatalf("Unwrap = %v, want %v", e.Unwrap(), cause)
+	}
+	if !errors.Is(e, cause) {
+		t.Fatal("errors.Is must follow AppError.Unwrap")
+	}
+	if !errors.Is(fmt.Errorf("mcp: %w", e), cause) {
+		t.Fatal("errors.Is must follow a wrapped AppError")
+	}
+	var target *AppError
+	if !errors.As(fmt.Errorf("mcp: %w", e), &target) || target != e {
+		t.Fatal("AppError must still work with errors.As")
+	}
+	if e.Error() == "" || e.Message != "store down" || e.Code != CodePersistFailed {
+		t.Fatalf("cause changed the response shape: %+v", e)
+	}
+
+	plain := NewAppError(CodePersistFailed, "msg")
+	if plain.Unwrap() != nil {
+		t.Fatalf("plain AppError Unwrap = %v, want nil", plain.Unwrap())
+	}
+	var nilErr *AppError
+	if nilErr.Unwrap() != nil {
+		t.Fatal("nil AppError Unwrap must be nil")
+	}
+
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("marshal AppError with cause: %v", err)
+	}
+	assertJSONKeys(t, b, "code", "message", "status")
+}
+
 func TestStreamEventJSON(t *testing.T) {
 	ev := StreamEvent{Seq: 3, WatchID: "w1", Payload: []byte("step 3")}
 	b, err := json.Marshal(ev)

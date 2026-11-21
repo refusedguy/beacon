@@ -539,18 +539,29 @@ const (
 	CodePersistFailed  ErrorCode = "PERSIST_FAILED"
 )
 
-// AppError is the shared error shape. No Result[T] type is used.
+// AppError is the shared error shape. No Result[T] type is used. cause is not
+// exported and carries no JSON tag, so it never appears in the wire response.
 type AppError struct {
 	Code         ErrorCode `json:"code"`
 	Message      string    `json:"message"`
 	Status       int       `json:"status"`
 	RetryAfterMs *int64    `json:"retryAfterMs,omitempty"`
 	NewWatchID   string    `json:"newWatchID,omitempty"`
+	cause        error
 }
 
 // NewAppError builds an AppError with the status defined by the contract.
 func NewAppError(code ErrorCode, message string) *AppError {
 	return &AppError{Code: code, Message: message, Status: statusForCode(code)}
+}
+
+// NewAppErrorWithCause builds an AppError that keeps cause reachable through
+// Unwrap. Message is independent of cause, so callers can keep the existing
+// response text while errors.Is and errors.As still see the original error.
+func NewAppErrorWithCause(code ErrorCode, message string, cause error) *AppError {
+	e := NewAppError(code, message)
+	e.cause = cause
+	return e
 }
 
 func statusForCode(code ErrorCode) int {
@@ -582,6 +593,16 @@ func (e *AppError) Error() string {
 		return string(e.Code)
 	}
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
+}
+
+// Unwrap exposes the stored cause so callers can match a store error with
+// errors.Is or errors.As after it crossed an AppError boundary. A nil receiver
+// has no cause.
+func (e *AppError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // StreamEvent is one chunk of a Beacon event stream. Seq is a monotonic,
