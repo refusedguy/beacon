@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,40 @@ const (
 	// result in a tool result's _meta.
 	finalMetaKey = "ai.beacon/streamFinal"
 )
+
+// versionFromBuild is the release stamp a build writes into the binary. The
+// build sets it with
+// -ldflags "-X github.com/refusedguy/beacon/internal/infra/mcp.versionFromBuild=v1.2.3".
+// No release number lives in this source file.
+var versionFromBuild string
+
+// BuildVersion returns the version carried by the running binary. A value
+// stamped by the build wins. A module installed at a version supplies its main
+// module version. A source build reports "(devel)" and has no stamp, so this
+// returns the empty string. An empty version leaves tool descriptions unchanged
+// and keeps the pinned tools/list contract byte-identical.
+func BuildVersion() string {
+	if v := strings.TrimSpace(versionFromBuild); v != "" {
+		return v
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := strings.TrimSpace(info.Main.Version); v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return ""
+}
+
+// DescriptionWithVersion appends the build version to a tool description. The
+// version is the only part of the description that varies between builds. An
+// empty version returns the description unchanged.
+func DescriptionWithVersion(description, version string) string {
+	version = strings.TrimSpace(version)
+	if version == "" {
+		return description
+	}
+	return description + " Version: " + version + "."
+}
 
 // SessionIDFromRequest reads the caller's session identifier from the tool
 // request's _meta and returns it as an opaque string. It returns nil when the

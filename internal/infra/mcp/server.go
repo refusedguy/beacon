@@ -316,6 +316,11 @@ type Dependencies struct {
 	// resolver keeps AskChildQuestion honest about the missing wiring.
 	ChildThreads   ChildThreadResolver
 	ParentNotifier ParentNotifier
+
+	// Version is the release stamp passed at server creation. An empty value
+	// falls back to BuildVersion, the binary's build artifact. The description
+	// of beacon_stats is the one place the version reaches tools/list.
+	Version string
 }
 
 // CapabilityScopeRegistry owns one cancellation scope per calling agent
@@ -477,6 +482,10 @@ func NewServer() *mcpsdk.Server {
 // on the initial registration; each helper re-registers its tool with the same
 // honest annotation class.
 func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
+	version := strings.TrimSpace(deps.Version)
+	if version == "" {
+		version = BuildVersion()
+	}
 	s := mcpsdk.NewServer(
 		&mcpsdk.Implementation{Name: ServerName, Version: ServerVersion},
 		&mcpsdk.ServerOptions{
@@ -521,7 +530,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	}
 	AttachAck(s, ack)
 	RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
-	attachStats(s, deps.Snapshot, schemas["beacon_stats"])
+	attachStats(s, deps.Snapshot, schemas["beacon_stats"], version)
 	AttachDeferWiring(s, NewDeferWiringHandler(deps.DeferWiring))
 	return s
 }
@@ -555,7 +564,9 @@ func attachListRunning(s *mcpsdk.Server, reader SnapshotReader, outputSchema *js
 // tool_stats.go and has no separate Attach helper. The schema comes from
 // AllOutputSchemas for the same reason as list_running; a nil schema still
 // registers the real handler so the tool never falls back to a stub (T3.59).
-func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema) {
+// The version is the build stamp passed at server creation. It changes only the
+// description; the name, order, schema and handler stay fixed.
+func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema, version string) {
 	if s == nil {
 		return
 	}
@@ -566,7 +577,7 @@ func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonsche
 	s.RemoveTools("beacon_stats")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:         "beacon_stats",
-		Description:  "Report persisted state counters from a read-only snapshot.",
+		Description:  DescriptionWithVersion("Report persisted state counters from a read-only snapshot.", version),
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, NewStatsHandler(reader).Handle)
