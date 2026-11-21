@@ -11,12 +11,14 @@ import (
 )
 
 // ensureEventLog gives the events table from migration 0004 the scoped-log
-// shape used by Append and ReadAfter: a scope column, a type column and an
-// index on (scope, seq). Migration 0004 owns the original table and other
-// store components keep writing it with (watch_id, schema_version, payload,
-// created_at), so this adds columns instead of replacing the table. It runs at
-// every Open and is idempotent: SQLite has no ADD COLUMN IF NOT EXISTS, so the
-// existing columns are read from PRAGMA table_info first.
+// shape used by Append and ReadAfter: a scope column, a type column and the
+// single working index on (scope, seq). Migration 0004 owns the original table
+// and other store components keep writing it with (watch_id, schema_version,
+// payload, created_at), so this adds columns instead of replacing the table. It
+// runs at every Open and is idempotent: SQLite has no ADD COLUMN IF NOT EXISTS,
+// so the existing columns are read from PRAGMA table_info first. It also drops
+// the legacy events_by_watch index that migration 0004 used to create; dropping
+// it keeps older databases on one index as well (BCX-38).
 func ensureEventLog(ctx context.Context, db *sql.DB) error {
 	cols, err := eventLogColumns(ctx, db)
 	if err != nil {
@@ -31,6 +33,13 @@ func ensureEventLog(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, `ALTER TABLE events ADD COLUMN type TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("add type column: %w", err)
 		}
+	}
+	// Append writes watch_id = scope, so the old events_by_watch(watch_id, seq)
+	// from migration 0004 led with the same value as events_by_scope and made
+	// every insert write two indexes. Fresh databases no longer get it from the
+	// migration; drop it from databases created by an older build (BCX-38).
+	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS events_by_watch`); err != nil {
+		return fmt.Errorf("drop legacy watch index: %w", err)
 	}
 	if _, err := db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS events_by_scope ON events(scope, seq)`); err != nil {
 		return fmt.Errorf("create replay index: %w", err)
@@ -114,4 +123,38 @@ func (d *DB) ReadAfter(scope string, cursor int64) ([]LogEvent, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// RetainEventLog erases the committed prefix of the event log at or below
+// cursor and returns the number of rows removed (BCX-38). The delete runs in
+// one writer transaction, so a concurrent Append cannot place a row into the
+// erased range after the cursor was chosen.
+//
+// Replay stays correct because ReadAfter returns only rows with seq greater
+// than the caller's cursor. Removing rows at or below cursor cannot change what
+// such a reader sees. The caller must pick a cursor no newer than the oldest
+// active replay position; a newer cursor would erase events a subscriber has
+// not read. Rows that survive keep their own schema_version, so replay from any
+// remaining seq decodes with the version stamped at append time (ADR 0012).
+func (d *DB) RetainEventLog(cursor int64) (int64, error) {
+	if cursor <= 0 {
+		return 0, domain.NewAppError(domain.CodeInvalidInput,
+			"store: event: retention cursor must be positive")
+	}
+	var deleted int64
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		res, err := tx.Exec(`DELETE FROM events WHERE seq <= ?`, cursor)
+		if err != nil {
+			return fmt.Errorf("store: event: retain: %w", err)
+		}
+		deleted, err = res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: event: retain rows: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return deleted, nil
 }
