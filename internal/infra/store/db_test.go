@@ -3516,3 +3516,333 @@ func TestFIFOEnqueueBatchEmptyAndMixedWithSingle(t *testing.T) {
 		t.Fatalf("items after completion = %d, want 0", len(state.Items))
 	}
 }
+
+// ---- ADR 265: operation receipts, tombstones and exactly-once effects ----
+
+func newOperationStore(t *testing.T) *DB {
+	t.Helper()
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS effect_runs (marker TEXT PRIMARY KEY)`)
+		return err
+	}); err != nil {
+		t.Fatalf("create effect_runs: %v", err)
+	}
+	return d
+}
+
+func countingEffect(counter *atomic.Int64) func(*sql.Tx) ([]byte, error) {
+	return func(tx *sql.Tx) ([]byte, error) {
+		counter.Add(1)
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO effect_runs (marker) VALUES (?)`, "effect"); err != nil {
+			return nil, err
+		}
+		return []byte("stored-result"), nil
+	}
+}
+
+func effectRunCount(t *testing.T, d *DB) int {
+	t.Helper()
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM effect_runs`).Scan(&n); err != nil {
+		t.Fatalf("count effect_runs: %v", err)
+	}
+	return n
+}
+
+func TestExecuteOperationParallelRetriesRunEffectOnce(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+	params := []byte(`{"repo":"r","pr":7}`)
+
+	const n = 16
+	type outcome struct {
+		res OperationResult
+		err error
+	}
+	outcomes := make(chan outcome, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			res, err := d.ExecuteOperation(domain.OperationID("op-parallel"), params, countingEffect(&counter))
+			outcomes <- outcome{res: res, err: err}
+		}()
+	}
+	wg.Wait()
+	close(outcomes)
+
+	created, duplicate := 0, 0
+	for got := range outcomes {
+		if got.err != nil {
+			t.Fatalf("ExecuteOperation: %v", got.err)
+		}
+		switch {
+		case got.res.Created:
+			created++
+		case got.res.Duplicate:
+			duplicate++
+		default:
+			t.Fatalf("unexpected result: %+v", got.res)
+		}
+		if got.res.Receipt.OperationID != domain.OperationID("op-parallel") {
+			t.Fatalf("operation id = %q, want op-parallel", got.res.Receipt.OperationID)
+		}
+	}
+	if created != 1 || duplicate != n-1 {
+		t.Fatalf("created=%d duplicate=%d, want 1 and %d", created, duplicate, n-1)
+	}
+	if got := counter.Load(); got != 1 {
+		t.Fatalf("effect calls = %d, want 1", got)
+	}
+	if got := effectRunCount(t, d); got != 1 {
+		t.Fatalf("effect rows = %d, want 1", got)
+	}
+	if got, err := d.OperationCount(); err != nil || got != 1 {
+		t.Fatalf("OperationCount = %d, %v; want 1", got, err)
+	}
+}
+
+func TestExecuteOperationLostResponseReturnsStoredResult(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+	params := []byte(`{"amount":42}`)
+
+	first, err := d.ExecuteOperation(domain.OperationID("op-lost"), params, countingEffect(&counter))
+	if err != nil || !first.Created {
+		t.Fatalf("first ExecuteOperation = %+v, %v; want Created", first, err)
+	}
+	// The reply never reached the caller. The receipt and effect are committed.
+	if first.Receipt.State != domain.OperationSucceeded || first.Receipt.NextAction != domain.NextActionDone {
+		t.Fatalf("receipt = %+v, want succeeded/done", first.Receipt)
+	}
+
+	retry, err := d.ExecuteOperation(domain.OperationID("op-lost"), params, countingEffect(&counter))
+	if err != nil || !retry.Duplicate {
+		t.Fatalf("retry = %+v, %v; want Duplicate", retry, err)
+	}
+	if !bytes.Equal(retry.Receipt.Result, first.Receipt.Result) {
+		t.Fatalf("result = %q, want %q", retry.Receipt.Result, first.Receipt.Result)
+	}
+	if got := counter.Load(); got != 1 {
+		t.Fatalf("effect calls = %d, want 1", got)
+	}
+	if got := effectRunCount(t, d); got != 1 {
+		t.Fatalf("effect rows = %d, want 1", got)
+	}
+}
+
+func TestExecuteOperationConflictingParameters(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+
+	first, err := d.ExecuteOperation(domain.OperationID("op-conflict"), []byte(`{"to":"alice"}`), countingEffect(&counter))
+	if err != nil || !first.Created {
+		t.Fatalf("first ExecuteOperation = %+v, %v; want Created", first, err)
+	}
+
+	second, err := d.ExecuteOperation(domain.OperationID("op-conflict"), []byte(`{"to":"bob"}`), countingEffect(&counter))
+	if err != nil {
+		t.Fatalf("second ExecuteOperation: %v", err)
+	}
+	if !second.Conflict || second.Created || second.Duplicate {
+		t.Fatalf("second result = %+v, want Conflict", second)
+	}
+	if second.Receipt.ParamsHash != first.Receipt.ParamsHash {
+		t.Fatalf("params hash changed on conflict: %q -> %q", first.Receipt.ParamsHash, second.Receipt.ParamsHash)
+	}
+	if got := counter.Load(); got != 1 {
+		t.Fatalf("effect calls = %d, want 1", got)
+	}
+	if got := effectRunCount(t, d); got != 1 {
+		t.Fatalf("effect rows = %d, want 1", got)
+	}
+}
+
+func TestExecuteOperationIndeterminateOutcomeWritesTombstone(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+	params := []byte(`{"call":"downstream"}`)
+
+	apply := func(tx *sql.Tx) ([]byte, error) {
+		counter.Add(1)
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO effect_runs (marker) VALUES (?)`, "effect"); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("gateway 5xx: %w", domain.ErrIndeterminateOutcome)
+	}
+	first, err := d.ExecuteOperation(domain.OperationID("op-unknown"), params, apply)
+	if !domain.IsIndeterminate(err) {
+		t.Fatalf("err = %v, want indeterminate", err)
+	}
+	if !first.OutcomeUnknown || first.Created {
+		t.Fatalf("first result = %+v, want tombstone", first)
+	}
+	r := first.Receipt
+	if r.State != domain.OperationFailed || r.Reason != domain.TombstoneReasonUnknown || !r.IsTombstone() {
+		t.Fatalf("receipt = %+v, want failed/unknown tombstone", r)
+	}
+	if r.ObservedState() != domain.OperationOutcomeUnknown || r.NextAction != domain.NextActionWaitForHuman {
+		t.Fatalf("receipt = %+v, want outcome_unknown/wait_for_human", r)
+	}
+
+	retry, err := d.ExecuteOperation(domain.OperationID("op-unknown"), params, countingEffect(&counter))
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if !retry.OutcomeUnknown || retry.Created || retry.Duplicate {
+		t.Fatalf("retry = %+v, want OutcomeUnknown", retry)
+	}
+	if got := counter.Load(); got != 1 {
+		t.Fatalf("effect calls = %d, want 1 (retry must not re-run)", got)
+	}
+	if got := effectRunCount(t, d); got != 1 {
+		t.Fatalf("effect rows = %d, want 1", got)
+	}
+}
+
+func TestMarkOutcomeUnknownStopsRetry(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+	params := []byte(`{"call":"timeout"}`)
+	opID := domain.OperationID("op-lost-reply")
+
+	accepted, err := d.BeginOperation(opID, params)
+	if err != nil || accepted.State != domain.OperationAccepted {
+		t.Fatalf("BeginOperation = %+v, %v; want accepted", accepted, err)
+	}
+
+	tomb, err := d.MarkOutcomeUnknown(opID, params)
+	if err != nil || !tomb.IsTombstone() || tomb.ObservedState() != domain.OperationOutcomeUnknown {
+		t.Fatalf("MarkOutcomeUnknown = %+v, %v; want tombstone", tomb, err)
+	}
+
+	retry, err := d.ExecuteOperation(opID, params, countingEffect(&counter))
+	if err != nil || !retry.OutcomeUnknown {
+		t.Fatalf("retry = %+v, %v; want OutcomeUnknown", retry, err)
+	}
+	if got := counter.Load(); got != 0 {
+		t.Fatalf("effect calls = %d, want 0", got)
+	}
+	if got := effectRunCount(t, d); got != 0 {
+		t.Fatalf("effect rows = %d, want 0", got)
+	}
+
+	// A second mark is idempotent and cannot move the tombstone.
+	again, err := d.MarkOutcomeUnknown(opID, params)
+	if err != nil || again.UpdatedAt != tomb.UpdatedAt {
+		t.Fatalf("second mark = %+v, %v; want unchanged", again, err)
+	}
+}
+
+func TestOperationStateTransitions(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+	params := []byte(`{"k":"v"}`)
+
+	accepted, err := d.BeginOperation(domain.OperationID("op-states"), params)
+	if err != nil || accepted.State != domain.OperationAccepted || accepted.NextAction != domain.NextActionPoll {
+		t.Fatalf("BeginOperation = %+v, %v; want accepted/poll", accepted, err)
+	}
+	running, err := d.StartOperation(domain.OperationID("op-states"))
+	if err != nil || running.State != domain.OperationRunning {
+		t.Fatalf("StartOperation = %+v, %v; want running", running, err)
+	}
+
+	inFlight, err := d.ExecuteOperation(domain.OperationID("op-states"), params, countingEffect(&counter))
+	if err != nil || !inFlight.InFlight || inFlight.Receipt.State != domain.OperationRunning {
+		t.Fatalf("in-flight retry = %+v, %v; want InFlight", inFlight, err)
+	}
+	if got := counter.Load(); got != 0 {
+		t.Fatalf("effect calls during flight = %d, want 0", got)
+	}
+
+	// A fresh id runs the effect and lands in succeeded.
+	done, err := d.ExecuteOperation(domain.OperationID("op-done"), params, countingEffect(&counter))
+	if err != nil || !done.Created || done.Receipt.State != domain.OperationSucceeded || done.Receipt.NextAction != domain.NextActionDone {
+		t.Fatalf("ExecuteOperation = %+v, %v; want succeeded/done", done, err)
+	}
+	// Starting a completed operation cannot drag it back into flight.
+	after, err := d.StartOperation(domain.OperationID("op-done"))
+	if err != nil || after.State != domain.OperationSucceeded {
+		t.Fatalf("StartOperation after success = %+v, %v; want succeeded", after, err)
+	}
+}
+
+func TestExecuteOperationDefiniteFailureIsRecorded(t *testing.T) {
+	d := newOperationStore(t)
+	var counter atomic.Int64
+	params := []byte(`{"k":"v"}`)
+
+	fail := func(tx *sql.Tx) ([]byte, error) {
+		counter.Add(1)
+		return nil, errors.New("downstream refused")
+	}
+	first, err := d.ExecuteOperation(domain.OperationID("op-failed"), params, fail)
+	if err == nil || !strings.Contains(err.Error(), "downstream refused") {
+		t.Fatalf("err = %v, want definite failure", err)
+	}
+	if first.Receipt.State != domain.OperationFailed || first.Receipt.IsTombstone() ||
+		first.Receipt.ObservedState() != domain.OperationFailed || first.Receipt.NextAction != domain.NextActionRetry {
+		t.Fatalf("receipt = %+v, want failed/retry", first.Receipt)
+	}
+
+	retry, err := d.ExecuteOperation(domain.OperationID("op-failed"), params, countingEffect(&counter))
+	if err != nil || !retry.Duplicate {
+		t.Fatalf("retry = %+v, %v; want Duplicate", retry, err)
+	}
+	if got := counter.Load(); got != 1 {
+		t.Fatalf("effect calls = %d, want 1", got)
+	}
+}
+
+func TestOperationReceiptRedactsResultAndSeparatesKeys(t *testing.T) {
+	d := newOperationStore(t)
+	secret := []byte(`token=ghp_` + strings.Repeat("a", 36))
+
+	apply := func(tx *sql.Tx) ([]byte, error) { return secret, nil }
+	first, err := d.ExecuteOperation(domain.OperationID("op-redact"), []byte(`{}`), apply)
+	if err != nil || !first.Created {
+		t.Fatalf("ExecuteOperation = %+v, %v; want Created", first, err)
+	}
+	if bytes.Contains(first.Receipt.Result, []byte("ghp_")) || !bytes.Contains(first.Receipt.Result, []byte("[REDACTED]")) {
+		t.Fatalf("result not redacted: %q", first.Receipt.Result)
+	}
+
+	other, err := d.ExecuteOperation(domain.OperationID("op-other"), []byte(`{}`), apply)
+	if err != nil || !other.Created || other.Receipt.OperationID != domain.OperationID("op-other") {
+		t.Fatalf("other operation = %+v, %v; want separate Created", other, err)
+	}
+	if got, err := d.OperationCount(); err != nil || got != 2 {
+		t.Fatalf("OperationCount = %d, %v; want 2", got, err)
+	}
+}
+
+func TestOperationRejectsInvalidInput(t *testing.T) {
+	d := newOperationStore(t)
+	apply := func(tx *sql.Tx) ([]byte, error) { return nil, nil }
+
+	if _, err := d.BeginOperation("", []byte(`{}`)); err == nil {
+		t.Fatal("BeginOperation accepted empty operation id")
+	}
+	if _, err := d.ExecuteOperation("", []byte(`{}`), apply); err == nil {
+		t.Fatal("ExecuteOperation accepted empty operation id")
+	}
+	if _, err := d.ExecuteOperation(domain.OperationID("op"), []byte(`{}`), nil); err == nil {
+		t.Fatal("ExecuteOperation accepted nil apply")
+	}
+	if _, err := d.MarkOutcomeUnknown("", []byte(`{}`)); err == nil {
+		t.Fatal("MarkOutcomeUnknown accepted empty operation id")
+	}
+	if _, _, err := d.Operation(""); err == nil {
+		t.Fatal("Operation accepted empty operation id")
+	}
+	if _, err := d.StartOperation(domain.OperationID("op-missing")); err == nil {
+		t.Fatal("StartOperation accepted unknown operation id")
+	}
+}

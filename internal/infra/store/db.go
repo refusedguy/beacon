@@ -8,8 +8,10 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -2684,4 +2686,396 @@ func (d *DB) FIFOEnqueueBatch(items []FIFOItem) (FIFOEnqueueBatchResult, error) 
 		return FIFOEnqueueBatchResult{}, err
 	}
 	return out, nil
+}
+
+// ---- ADR 265: idempotent operations with receipts and tombstones ----
+//
+// A mutating tool call carries an operation_id chosen by the caller. The
+// receipt and the effect commit in one transaction, so a crash between them
+// cannot leave an effect without a receipt or a receipt without an effect.
+// The table is created on first use, like the other tables in this file owned
+// by a card that adds no migration. A dedicated table means the namespaced key
+// can never collide with a task start, a webhook delivery or a client command.
+
+const operationNamespace = "operation"
+
+// operationKey namespacing keeps the operation key distinct from the other
+// idempotency keys even though each already lives in its own table.
+func operationKey(opID domain.OperationID) string {
+	return domain.IdempotencyKey(operationNamespace, string(opID))
+}
+
+// createOperationReceiptsSQL owns the operation receipt table. key is the
+// namespaced idempotency key and is the primary key, so a repeat with the same
+// operation_id can never insert a second row. operation_id keeps the raw value
+// the caller supplied, which is returned with every receipt.
+const createOperationReceiptsSQL = `
+CREATE TABLE IF NOT EXISTS operation_receipts (
+  key          TEXT PRIMARY KEY,
+  operation_id TEXT NOT NULL,
+  state        TEXT NOT NULL,
+  params_hash  TEXT NOT NULL,
+  next_action  TEXT NOT NULL,
+  result       BLOB NOT NULL DEFAULT X'',
+  reason       TEXT NOT NULL DEFAULT '',
+  updated_at   INTEGER NOT NULL
+);
+`
+
+func ensureOperationReceipts(tx *sql.Tx) error {
+	if _, err := tx.Exec(createOperationReceiptsSQL); err != nil {
+		return fmt.Errorf("store: operation: create table: %w", err)
+	}
+	return nil
+}
+
+// hashParams binds a receipt to the exact bytes of the first call. The hash is
+// one-way, so a parameter containing a secret never reaches the stored receipt
+// in the clear.
+func hashParams(params []byte) string {
+	sum := sha256.Sum256(params)
+	return hex.EncodeToString(sum[:])
+}
+
+func validateOperationID(opID domain.OperationID) error {
+	if strings.TrimSpace(string(opID)) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: operation: empty operation id")
+	}
+	return nil
+}
+
+func operationConflict(opID domain.OperationID) error {
+	return domain.NewAppError(domain.CodeRejectDuplicate,
+		fmt.Sprintf("store: operation %q: parameters differ from first call", string(opID)))
+}
+
+func scanOperationReceipt(scanner interface{ Scan(...any) error }) (domain.OperationReceipt, error) {
+	var r domain.OperationReceipt
+	var opID, state, next, reason string
+	var result []byte
+	var updated int64
+	err := scanner.Scan(&opID, &state, &r.ParamsHash, &next, &result, &reason, &updated)
+	r.OperationID = domain.OperationID(opID)
+	r.State = domain.OperationState(state)
+	r.NextAction = next
+	r.Result = result
+	r.Reason = reason
+	r.UpdatedAt = time.Unix(0, updated).UTC()
+	return r, err
+}
+
+func loadOperationTx(tx *sql.Tx, key string) (domain.OperationReceipt, bool, error) {
+	r, err := scanOperationReceipt(tx.QueryRow(`
+		SELECT operation_id, state, params_hash, next_action, result, reason, updated_at
+		FROM operation_receipts WHERE key = ?`, key))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.OperationReceipt{}, false, nil
+	}
+	if err != nil {
+		return domain.OperationReceipt{}, false, fmt.Errorf("store: operation: load receipt: %w", err)
+	}
+	return r, true, nil
+}
+
+func writeOperationTx(tx *sql.Tx, key string, r domain.OperationReceipt) error {
+	// database/sql binds a nil []byte as SQL NULL. Treat an empty result as an
+	// empty blob so the NOT NULL column never rejects a receipt without a
+	// result (accepted, running, failed and tombstone states).
+	result := r.Result
+	if result == nil {
+		result = []byte{}
+	}
+	_, err := tx.Exec(`
+		INSERT INTO operation_receipts
+		  (key, operation_id, state, params_hash, next_action, result, reason, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+		  operation_id = excluded.operation_id,
+		  state        = excluded.state,
+		  params_hash  = excluded.params_hash,
+		  next_action  = excluded.next_action,
+		  result       = excluded.result,
+		  reason       = excluded.reason,
+		  updated_at   = excluded.updated_at`,
+		key, string(r.OperationID), string(r.State), r.ParamsHash, r.NextAction,
+		result, r.Reason, r.UpdatedAt.UnixNano())
+	if err != nil {
+		return fmt.Errorf("store: operation: write receipt: %w", err)
+	}
+	return nil
+}
+
+// BeginOperation records that the caller accepted an operation without running
+// its effect. It is the first transition of the state machine: a receipt in
+// accepted state is visible to other processes before the effect starts. A
+// later ExecuteOperation with the same id and the same parameters reports
+// InFlight and runs no effect. A different parameter body is a conflict.
+func (d *DB) BeginOperation(opID domain.OperationID, params []byte) (domain.OperationReceipt, error) {
+	if err := validateOperationID(opID); err != nil {
+		return domain.OperationReceipt{}, err
+	}
+	key := operationKey(opID)
+	hash := hashParams(params)
+	var out domain.OperationReceipt
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureOperationReceipts(tx); err != nil {
+			return err
+		}
+		prev, found, err := loadOperationTx(tx, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			if prev.ParamsHash != hash {
+				return operationConflict(opID)
+			}
+			out = prev
+			return nil
+		}
+		out = domain.OperationReceipt{
+			OperationID: opID, State: domain.OperationAccepted,
+			ParamsHash: hash, NextAction: domain.NextActionPoll,
+			UpdatedAt: time.Now().UTC(),
+		}
+		return writeOperationTx(tx, key, out)
+	})
+	return out, err
+}
+
+// StartOperation moves an accepted receipt to running. The transition is a
+// no-op once the receipt has already moved on, so a redelivered start cannot
+// drag a completed operation back into flight. An unknown operation id is
+// rejected rather than implicitly created.
+func (d *DB) StartOperation(opID domain.OperationID) (domain.OperationReceipt, error) {
+	if err := validateOperationID(opID); err != nil {
+		return domain.OperationReceipt{}, err
+	}
+	key := operationKey(opID)
+	var out domain.OperationReceipt
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureOperationReceipts(tx); err != nil {
+			return err
+		}
+		prev, found, err := loadOperationTx(tx, key)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return domain.NewAppError(domain.CodeWatchNotFound,
+				"store: operation: unknown operation "+string(opID))
+		}
+		if prev.State == domain.OperationAccepted {
+			prev.State = domain.OperationRunning
+			prev.NextAction = domain.NextActionPoll
+			prev.UpdatedAt = time.Now().UTC()
+			if err := writeOperationTx(tx, key, prev); err != nil {
+				return err
+			}
+		}
+		out = prev
+		return nil
+	})
+	return out, err
+}
+
+// OperationResult reports what one ExecuteOperation call did. Created means
+// the effect ran and its receipt was stored, Duplicate means the first result
+// was returned unchanged, Conflict means the parameters differed, InFlight
+// means the operation was still accepted or running, and OutcomeUnknown means
+// the call hit a tombstone. Receipt always carries the stored operation_id and
+// next_action so a caller can answer a retry without running the effect.
+type OperationResult struct {
+	Receipt        domain.OperationReceipt
+	Created        bool
+	Duplicate      bool
+	Conflict       bool
+	InFlight       bool
+	OutcomeUnknown bool
+}
+
+// ExecuteOperation runs a mutating operation at most once per operation_id.
+// The receipt and the effect commit in one transaction (ADR 265): apply runs
+// inside that transaction, so a failing step leaves neither a receipt nor a
+// partial effect. A repeat with the same parameters inserts nothing, runs no
+// effect and returns the first result; a repeat with different parameters is a
+// conflict; a repeat while the operation is accepted or running is in flight.
+//
+// When apply returns an error wrapping domain.ErrIndeterminateOutcome (a
+// timeout or a 5xx), the transaction commits a tombstone instead of a clean
+// failure and the error is returned to the caller. A later retry reads the
+// tombstone as outcome_unknown and never runs apply again. A definite error
+// is recorded as a failed receipt and also returned after the commit.
+func (d *DB) ExecuteOperation(opID domain.OperationID, params []byte, apply func(*sql.Tx) ([]byte, error)) (OperationResult, error) {
+	if err := validateOperationID(opID); err != nil {
+		return OperationResult{}, err
+	}
+	if apply == nil {
+		return OperationResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: operation: nil apply")
+	}
+	key := operationKey(opID)
+	hash := hashParams(params)
+	var out OperationResult
+	var execErr error
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureOperationReceipts(tx); err != nil {
+			return err
+		}
+		prev, found, err := loadOperationTx(tx, key)
+		if err != nil {
+			return err
+		}
+		if found {
+			if prev.ParamsHash != hash {
+				out = OperationResult{Receipt: prev, Conflict: true}
+				return nil
+			}
+			switch {
+			case prev.IsTombstone():
+				out = OperationResult{Receipt: prev, OutcomeUnknown: true}
+			case prev.State == domain.OperationAccepted, prev.State == domain.OperationRunning:
+				out = OperationResult{Receipt: prev, InFlight: true}
+			default:
+				// succeeded or definitely failed: the first outcome is final.
+				out = OperationResult{Receipt: prev, Duplicate: true}
+			}
+			return nil
+		}
+
+		start := domain.OperationReceipt{
+			OperationID: opID, State: domain.OperationRunning,
+			ParamsHash: hash, NextAction: domain.NextActionPoll,
+			UpdatedAt: time.Now().UTC(),
+		}
+		if err := writeOperationTx(tx, key, start); err != nil {
+			return err
+		}
+		result, applyErr := apply(tx)
+		switch {
+		case applyErr == nil:
+			done := start
+			done.State = domain.OperationSucceeded
+			done.NextAction = domain.NextActionDone
+			done.Result = Redact(result)
+			done.UpdatedAt = time.Now().UTC()
+			if err := writeOperationTx(tx, key, done); err != nil {
+				return err
+			}
+			out = OperationResult{Receipt: done, Created: true}
+			return nil
+
+		case domain.IsIndeterminate(applyErr):
+			// The effect may or may not have applied. Commit a tombstone so a
+			// retry returns outcome_unknown instead of a second effect.
+			tomb := start
+			tomb.State = domain.OperationFailed
+			tomb.Reason = domain.TombstoneReasonUnknown
+			tomb.NextAction = domain.NextActionWaitForHuman
+			tomb.UpdatedAt = time.Now().UTC()
+			if err := writeOperationTx(tx, key, tomb); err != nil {
+				return err
+			}
+			out = OperationResult{Receipt: tomb, OutcomeUnknown: true}
+			execErr = applyErr
+			return nil
+
+		default:
+			failed := start
+			failed.State = domain.OperationFailed
+			failed.Reason = applyErr.Error()
+			failed.NextAction = domain.NextActionRetry
+			failed.UpdatedAt = time.Now().UTC()
+			if err := writeOperationTx(tx, key, failed); err != nil {
+				return err
+			}
+			out = OperationResult{Receipt: failed}
+			execErr = applyErr
+			return nil
+		}
+	})
+	if err != nil {
+		return OperationResult{}, err
+	}
+	return out, execErr
+}
+
+// MarkOutcomeUnknown writes a tombstone when the caller lost the response or
+// saw a 5xx and cannot tell whether the effect applied. If no receipt exists,
+// one is created with the unknown outcome; an existing unfinished receipt is
+// escalated to it. A tombstone or a known success is returned unchanged, so a
+// lost response never overwrites a committed result. A different parameter
+// body is a conflict. A later retry returns outcome_unknown and runs no effect.
+func (d *DB) MarkOutcomeUnknown(opID domain.OperationID, params []byte) (domain.OperationReceipt, error) {
+	if err := validateOperationID(opID); err != nil {
+		return domain.OperationReceipt{}, err
+	}
+	key := operationKey(opID)
+	hash := hashParams(params)
+	var out domain.OperationReceipt
+	err := d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureOperationReceipts(tx); err != nil {
+			return err
+		}
+		prev, found, err := loadOperationTx(tx, key)
+		if err != nil {
+			return err
+		}
+		if found && prev.ParamsHash != hash {
+			return operationConflict(opID)
+		}
+		if found && (prev.IsTombstone() || prev.State == domain.OperationSucceeded) {
+			out = prev
+			return nil
+		}
+		tomb := domain.OperationReceipt{
+			OperationID: opID, State: domain.OperationFailed,
+			ParamsHash: hash, NextAction: domain.NextActionWaitForHuman,
+			Reason: domain.TombstoneReasonUnknown, UpdatedAt: time.Now().UTC(),
+		}
+		if found {
+			tomb.Result = append([]byte(nil), prev.Result...)
+		}
+		if err := writeOperationTx(tx, key, tomb); err != nil {
+			return err
+		}
+		out = tomb
+		return nil
+	})
+	return out, err
+}
+
+// Operation reads the current receipt for opID. found=false means no receipt
+// was ever stored for that id. Reads use the separate pool, so a restarted
+// process sees the committed receipt without waiting on the writer.
+func (d *DB) Operation(opID domain.OperationID) (domain.OperationReceipt, bool, error) {
+	if err := validateOperationID(opID); err != nil {
+		return domain.OperationReceipt{}, false, err
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "operation_receipts")
+	if err != nil || !ok {
+		return domain.OperationReceipt{}, false, err
+	}
+	r, err := scanOperationReceipt(d.readDB.QueryRow(`
+		SELECT operation_id, state, params_hash, next_action, result, reason, updated_at
+		FROM operation_receipts WHERE key = ?`, operationKey(opID)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.OperationReceipt{}, false, nil
+	}
+	if err != nil {
+		return domain.OperationReceipt{}, false, err
+	}
+	return r, true, nil
+}
+
+// OperationCount returns the number of stored receipts. A repeat with the
+// same operation_id must not increase it.
+func (d *DB) OperationCount() (int, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "operation_receipts")
+	if err != nil || !ok {
+		return 0, err
+	}
+	var n int
+	if err := d.readDB.QueryRow(`SELECT count(*) FROM operation_receipts`).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

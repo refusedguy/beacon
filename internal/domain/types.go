@@ -4,6 +4,7 @@ package domain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -818,4 +819,91 @@ func NestedContext(ctx context.Context, requested time.Time) (context.Context, c
 		return context.WithCancel(ctx)
 	}
 	return context.WithDeadline(ctx, requested)
+}
+
+// ---- ADR 265: explicit idempotency protocol for mutating operations ----
+//
+// A mutating tool call carries an operation_id chosen by the caller. The
+// receipt and the effect commit in one transaction, so a crash between them
+// cannot leave an effect without a receipt or a receipt without an effect.
+// A retry with the same id and the same parameters returns the first result;
+// a retry with a different body is a conflict; a retry while the operation is
+// still running is in flight; and a retry after an indeterminate outcome is
+// outcome_unknown instead of a second execution of the effect. Deduplication
+// by JSON-RPC id is deliberately not used.
+
+// OperationID is the caller-supplied idempotency key of one mutating operation
+// (ADR 265). It travels as a tool argument or a _meta field, never an HTTP
+// header, and is never derived from a JSON-RPC id.
+type OperationID string
+
+// OperationState is the lifecycle state recorded on an operation receipt
+// (ADR 265). accepted and running are transient, succeeded and failed are
+// terminal, and outcome_unknown is the state a caller observes on a tombstone.
+type OperationState string
+
+const (
+	OperationAccepted       OperationState = "accepted"
+	OperationRunning        OperationState = "running"
+	OperationSucceeded      OperationState = "succeeded"
+	OperationFailed         OperationState = "failed"
+	OperationOutcomeUnknown OperationState = "outcome_unknown"
+)
+
+// TombstoneReasonUnknown marks a failed receipt whose effect may or may not
+// have applied (a timeout or a 5xx). Such a receipt is a tombstone: no later
+// retry may run the action again.
+const TombstoneReasonUnknown = "unknown"
+
+// Next-action values carried by a receipt so the caller knows how to proceed
+// without re-running the effect (ADR 265).
+const (
+	NextActionPoll         = "poll"
+	NextActionDone         = "done"
+	NextActionRetry        = "retry"
+	NextActionWaitForHuman = "wait_for_human"
+)
+
+// OperationReceipt is the durable record of one operation (ADR 265).
+// OperationID is the caller's key, State is the lifecycle state, ParamsHash
+// binds the receipt to the exact parameters of the first call, NextAction
+// tells the caller what to do, Result is the redacted effect result and Reason
+// explains a failed or unknown outcome.
+type OperationReceipt struct {
+	OperationID OperationID    `json:"operationId"`
+	State       OperationState `json:"state"`
+	ParamsHash  string         `json:"paramsHash"`
+	NextAction  string         `json:"nextAction"`
+	Result      []byte         `json:"result,omitempty"`
+	Reason      string         `json:"reason,omitempty"`
+	UpdatedAt   time.Time      `json:"updatedAt"`
+}
+
+// IsTombstone reports whether the receipt forbids any further attempt. A
+// receipt is a tombstone when its state is outcome_unknown, or when it failed
+// with the unknown reason (ADR 265).
+func (r OperationReceipt) IsTombstone() bool {
+	return r.State == OperationOutcomeUnknown ||
+		(r.State == OperationFailed && r.Reason == TombstoneReasonUnknown)
+}
+
+// ObservedState returns the state a caller should see. A failed-unknown
+// tombstone is reported as outcome_unknown, so a retry never mistakes it for
+// a clean failure it could retry.
+func (r OperationReceipt) ObservedState() OperationState {
+	if r.IsTombstone() {
+		return OperationOutcomeUnknown
+	}
+	return r.State
+}
+
+// ErrIndeterminateOutcome marks an error whose effect may or may not have
+// applied: a timeout or a 5xx from a downstream service (ADR 265). When an
+// effect returns this error the store writes a tombstone instead of a clean
+// failure, and no later retry runs the action again.
+var ErrIndeterminateOutcome = errors.New("domain: indeterminate operation outcome")
+
+// IsIndeterminate reports whether err marks an indeterminate outcome.
+func IsIndeterminate(err error) bool {
+	return errors.Is(err, ErrIndeterminateOutcome)
 }
