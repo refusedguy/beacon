@@ -206,6 +206,41 @@ jobs:
           bin=tools/beacon-gates/beacon-gates
           "$bin" wiring
 
+  # IDX-04. Обязательная проверка сгенерированного индекса карточек.
+  # Гейт пересобирает индекс из docs/tasks и сравнивает его байты с
+  # закоммиченной копией. Разрешение статусов читает git log, поэтому
+  # checkout получает полную историю: fetch-depth 1 ломает пересборку.
+  # Отдельный main package не меняет закоммиченный бинарник гейтов.
+  cardindex:
+    name: cardindex
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Self-test on planted divergence
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cardindex --self-test
+
+      - name: Compare rebuilt index with committed
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cardindex -root ../..
+
   # RS2-EVAL-05. Отдельная обязательная проверка на отказ инструмента.
   # rules gate возвращает код 2 при BROKEN. Джоба обязана стать красной,
   # иначе зелёные проверки скрывают отказ. Не объединяем её с gates.
