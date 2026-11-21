@@ -77,6 +77,12 @@ type channelMessagePort interface {
 // message keeps the old behaviour on a server without channels enabled.
 var upChannelIngress channelMessagePort
 
+// upActorResolver authorizes slash commands. runUp installs the same resolver
+// the channel ingress uses, so a chat sender must be in the known-sender
+// registry before a slash command reaches the decision port. It stays nil only
+// when the handler runs outside runUp, such as in a direct handler test.
+var upActorResolver channel.ActorResolver
+
 // upDecisionAdapter prefers the HTTP human-decide port and falls back to the
 // local SQLite port. The fallback also covers a server that answers with a
 // protocol error, so a long-running `up` session keeps accepting commands.
@@ -155,6 +161,11 @@ func runUp(c *CLI, args []string) int {
 		return 2
 	}
 	channelsCfg.Enabled = *channels
+
+	// Slash commands skip the channel ingress, so authorize their sender with
+	// the same registry. An empty registry refuses every slash command.
+	upActorResolver = channelSenderResolver{senders: channelsCfg.Senders}
+	defer func() { upActorResolver = nil }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -269,6 +280,22 @@ func upHandleTick(ctx context.Context, c *CLI, tg *wake.TelegramNotifySink, stat
 	fmt.Fprint(c.out, renderUpStatus(ctx, status))
 }
 
+// authorizeUpSlashSender resolves a Telegram sender through the same
+// ActorResolver the channel ingress uses. A slash command never reaches the
+// decision port without a known actor. A nil resolver leaves the handler's
+// legacy behaviour intact for callers outside runUp.
+func authorizeUpSlashSender(ctx context.Context, sender string) (domain.ActorID, error) {
+	resolver := upActorResolver
+	if resolver == nil {
+		return "", nil
+	}
+	actor, err := resolver.Resolve(ctx, channelTelegram, sender)
+	if err != nil {
+		return "", fmt.Errorf("beacon up: slash sender %q: %w", sender, err)
+	}
+	return actor, nil
+}
+
 // handleUpCommand parses one chat message and answers through the messenger.
 // Read-only commands render the store projection; write commands go through the
 // human-decide port so the same idempotency and journal rules apply as to
@@ -282,6 +309,17 @@ func handleUpCommand(ctx context.Context, messenger upMessenger, chatID, text st
 	}
 	cmd, ok := wake.ParseBotCommand(text)
 	if !ok {
+		return
+	}
+	actor, err := authorizeUpSlashSender(ctx, chatID)
+	if err != nil {
+		observe.ActorError("telegram-slash", chatID, err)
+		if messenger != nil {
+			_ = messenger.SendText(ctx, chatID, "slash: sender не авторизован")
+		}
+		if out != nil {
+			fmt.Fprintf(out, "beacon up: slash refusal from %s: %v\n", chatID, err)
+		}
 		return
 	}
 	var reply string
@@ -299,7 +337,7 @@ func handleUpCommand(ctx context.Context, messenger upMessenger, chatID, text st
 			break
 		}
 		verb := strings.TrimPrefix(string(cmd.Command), "/")
-		receipt, err := decisions.Decide(ctx, httpapi.ClientDecision{Verb: verb, Target: cmd.Target, Note: cmd.Note})
+		receipt, err := decisions.Decide(ctx, httpapi.ClientDecision{Verb: verb, Target: cmd.Target, Note: cmd.Note, Actor: string(actor)})
 		if err != nil {
 			reply = fmt.Sprintf("%s %s: %v", verb, cmd.Target, err)
 			break
