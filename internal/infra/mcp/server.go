@@ -288,14 +288,17 @@ func annotationsForKind(kind toolKind) mcpsdk.ToolAnnotations {
 
 // toolAnnotations records the honest annotation class of each advertised tool
 // (WORKER-PROMPT §4.1). Derived from toolDescriptors so an annotation cannot
-// drift from the name it belongs to.
-var toolAnnotations = func() map[string]mcpsdk.ToolAnnotations {
-	out := make(map[string]mcpsdk.ToolAnnotations, len(toolDescriptors))
+// drift from the name it belongs to. It is filled in init rather than by an
+// initializer: the descriptor Handler closures call attach helpers that read
+// this map, and an initializer would close a package initialization cycle.
+var toolAnnotations map[string]mcpsdk.ToolAnnotations
+
+func init() {
+	toolAnnotations = make(map[string]mcpsdk.ToolAnnotations, len(toolDescriptors))
 	for _, descriptor := range toolDescriptors {
-		out[descriptor.Name] = annotationsForKind(descriptor.Kind)
+		toolAnnotations[descriptor.Name] = annotationsForKind(descriptor.Kind)
 	}
-	return out
-}()
+}
 
 // BlockerControl is the narrow control-plane port the two writing tools need.
 // watch_pr uses AssignFixer to bind a fixer to an incident, ack uses
