@@ -202,3 +202,132 @@ func TestBuildCapabilityIndexEmptyRoster(t *testing.T) {
 		t.Fatalf("Capabilities = %v, want none", got)
 	}
 }
+
+// TestACPAgentRegistryRegisterFindList is the core T3.285 case: register agents
+// with a name, capabilities and address, then find them by capability and by
+// address and list them all.
+func TestACPAgentRegistryRegisterFindList(t *testing.T) {
+	reg := NewACPAgentRegistry()
+	for _, agent := range []ACPAgent{
+		{Name: "coder", Capabilities: []string{"code", "review"}, Address: "https://acp.example/coder"},
+		{Name: "reviewer", Capabilities: []string{"review"}, Address: "https://acp.example/reviewer"},
+	} {
+		if err := reg.Register(agent); err != nil {
+			t.Fatalf("Register(%s): %v", agent.Name, err)
+		}
+	}
+
+	got := reg.FindByCapability("review")
+	names := make([]string, 0, len(got))
+	for _, agent := range got {
+		names = append(names, agent.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"coder", "reviewer"}) {
+		t.Fatalf("FindByCapability(review) = %v, want [coder reviewer]", names)
+	}
+	if got := reg.FindByCapability("code"); len(got) != 1 || got[0].Name != "coder" {
+		t.Fatalf("FindByCapability(code) = %v, want [coder]", got)
+	}
+	if got := reg.FindByCapability("missing"); len(got) != 0 {
+		t.Fatalf("FindByCapability(missing) = %v, want none", got)
+	}
+
+	found, ok := reg.FindByAddress("https://acp.example/reviewer")
+	if !ok || found.Name != "reviewer" {
+		t.Fatalf("FindByAddress = %v, %v, want reviewer", found, ok)
+	}
+	if _, ok := reg.FindByAddress("https://acp.example/unknown"); ok {
+		t.Fatal("FindByAddress found an unknown address")
+	}
+
+	names = names[:0]
+	for _, agent := range reg.List() {
+		names = append(names, agent.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"coder", "reviewer"}) {
+		t.Fatalf("List = %v, want [coder reviewer]", names)
+	}
+}
+
+// TestACPAgentRegistryReRegisterReplacesState proves a re-registration drops
+// stale capabilities and moves the address mapping to the new agent.
+func TestACPAgentRegistryReRegisterReplacesState(t *testing.T) {
+	reg := NewACPAgentRegistry()
+	if err := reg.Register(ACPAgent{Name: "bot", Capabilities: []string{"old"}, Address: "addr-1"}); err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	if err := reg.Register(ACPAgent{Name: "bot", Capabilities: []string{"new"}, Address: "addr-2"}); err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+	if got := reg.FindByCapability("old"); len(got) != 0 {
+		t.Fatalf("stale capability survived re-registration: %v", got)
+	}
+	if got := reg.FindByCapability("new"); len(got) != 1 || got[0].Name != "bot" {
+		t.Fatalf("FindByCapability(new) = %v, want [bot]", got)
+	}
+	if _, ok := reg.FindByAddress("addr-1"); ok {
+		t.Fatal("old address is still mapped")
+	}
+	if agent, ok := reg.FindByAddress("addr-2"); !ok || agent.Name != "bot" {
+		t.Fatalf("FindByAddress(addr-2) = %v, %v, want bot", agent, ok)
+	}
+
+	if err := reg.Register(ACPAgent{Name: "other", Capabilities: []string{"new"}, Address: "addr-2"}); err != nil {
+		t.Fatalf("takeover Register: %v", err)
+	}
+	if agent, ok := reg.FindByAddress("addr-2"); !ok || agent.Name != "other" {
+		t.Fatalf("address owner = %v, %v, want other", agent, ok)
+	}
+	if got := reg.FindByCapability("new"); len(got) != 1 || got[0].Name != "other" {
+		t.Fatalf("capability owner after takeover = %v", got)
+	}
+}
+
+// TestACPAgentRegistryRejectsIncompleteAgents checks the registration boundary:
+// empty names, addresses and capabilities fail without changing the registry.
+func TestACPAgentRegistryRejectsIncompleteAgents(t *testing.T) {
+	reg := NewACPAgentRegistry()
+	tests := []struct {
+		name  string
+		agent ACPAgent
+		field string
+	}{
+		{"empty name", ACPAgent{Address: "addr"}, "name"},
+		{"empty address", ACPAgent{Name: "bot"}, "address"},
+		{"empty capability", ACPAgent{Name: "bot", Address: "addr", Capabilities: []string{"ok", ""}}, "capability"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := reg.Register(tt.agent)
+			if err == nil {
+				t.Fatal("Register accepted an incomplete agent")
+			}
+			if !strings.Contains(err.Error(), tt.field) {
+				t.Errorf("error %q does not name %q", err, tt.field)
+			}
+		})
+	}
+	if got := reg.List(); len(got) != 0 {
+		t.Fatalf("failed registrations left entries: %v", got)
+	}
+}
+
+// TestACPAgentRegistryCopiesReturns proves callers cannot mutate registry state
+// through a returned agent or through the slice passed to Register.
+func TestACPAgentRegistryCopiesReturns(t *testing.T) {
+	reg := NewACPAgentRegistry()
+	declared := []string{"watch"}
+	if err := reg.Register(ACPAgent{Name: "bot", Capabilities: declared, Address: "addr"}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	declared[0] = "merge"
+	if got := reg.FindByCapability("watch"); len(got) != 1 {
+		t.Fatalf("registry aliased caller capability slice: %v", got)
+	}
+
+	listed := reg.List()
+	listed[0].Capabilities[0] = "changed"
+	if got := reg.FindByCapability("watch"); len(got) != 1 {
+		t.Fatalf("List aliased stored capabilities: %v", got)
+	}
+}

@@ -11,6 +11,7 @@ package registry
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // ExecutorRecord is one registered executor as the index sees it. ID is the
@@ -136,4 +137,131 @@ func canonicalCapabilities(declared []string, executorID string) ([]string, erro
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// ===== ACP agent registry (T3.285) =====
+// The capability index above answers "which executor declares capability X".
+// An ACP host needs the reverse view: given a capability or an address, which
+// registered agent should receive a wake. This section adds that view as a
+// thin layer over CapabilityIndex. It stores no protocol state, so the ACP
+// server and transports in wake stay untouched here.
+
+// ACPAgent is one agent an ACP host can discover. Name identifies the agent,
+// Address is the URL or command the host uses to reach it, and Capabilities are
+// the declared capability names used for lookup.
+type ACPAgent struct {
+	Name         string
+	Capabilities []string
+	Address      string
+}
+
+// ACPAgentRegistry registers ACP agents and answers lookup by capability and
+// by address. It reuses CapabilityIndex for capability membership, so the same
+// canonical rules apply: names are sorted, duplicates are dropped and empty
+// names are rejected. The zero value is not ready for use; create one with
+// NewACPAgentRegistry.
+type ACPAgentRegistry struct {
+	index     *CapabilityIndex
+	byName    map[string]ACPAgent
+	byAddress map[string]string
+}
+
+// NewACPAgentRegistry returns an empty ACP agent registry.
+func NewACPAgentRegistry() *ACPAgentRegistry {
+	return &ACPAgentRegistry{
+		index:     NewCapabilityIndex(),
+		byName:    make(map[string]ACPAgent),
+		byAddress: make(map[string]string),
+	}
+}
+
+// Register adds agent to the registry. Name and address are required and are
+// trimmed before storage. Re-registering a name replaces its capability set and
+// address. If address already belongs to another name, that older registration
+// is removed, so one address always maps to one agent.
+func (r *ACPAgentRegistry) Register(agent ACPAgent) error {
+	if r == nil {
+		return fmt.Errorf("registry: acp: nil registry")
+	}
+	name := strings.TrimSpace(agent.Name)
+	if name == "" {
+		return fmt.Errorf("registry: acp: empty agent name")
+	}
+	address := strings.TrimSpace(agent.Address)
+	if address == "" {
+		return fmt.Errorf("registry: acp: empty address for agent %q", name)
+	}
+	if owner, ok := r.byAddress[address]; ok && owner != name {
+		r.unregister(owner)
+	}
+	if old, ok := r.byName[name]; ok {
+		delete(r.byAddress, old.Address)
+		r.index.Remove(name)
+	}
+	record := &ExecutorRecord{ID: name, Capabilities: agent.Capabilities}
+	if err := r.index.Upsert(record); err != nil {
+		return err
+	}
+	agent.Name = name
+	agent.Address = address
+	agent.Capabilities = append([]string(nil), record.AgentCapabilities...)
+	r.byName[name] = agent
+	r.byAddress[address] = name
+	return nil
+}
+
+// unregister drops one agent from the name, address and capability views.
+func (r *ACPAgentRegistry) unregister(name string) {
+	old, ok := r.byName[name]
+	if !ok {
+		return
+	}
+	delete(r.byAddress, old.Address)
+	delete(r.byName, name)
+	r.index.Remove(name)
+}
+
+// FindByCapability returns the agents declaring capability, sorted by name.
+// An unknown capability returns an empty slice.
+func (r *ACPAgentRegistry) FindByCapability(capability string) []ACPAgent {
+	names := r.index.Executors(capability)
+	out := make([]ACPAgent, 0, len(names))
+	for _, name := range names {
+		if agent, ok := r.byName[name]; ok {
+			out = append(out, copyACPAgent(agent))
+		}
+	}
+	return out
+}
+
+// FindByAddress returns the agent registered at address.
+func (r *ACPAgentRegistry) FindByAddress(address string) (ACPAgent, bool) {
+	name, ok := r.byAddress[strings.TrimSpace(address)]
+	if !ok {
+		return ACPAgent{}, false
+	}
+	agent, ok := r.byName[name]
+	if !ok {
+		return ACPAgent{}, false
+	}
+	return copyACPAgent(agent), true
+}
+
+// List returns every registered agent sorted by name.
+func (r *ACPAgentRegistry) List() []ACPAgent {
+	names := make([]string, 0, len(r.byName))
+	for name := range r.byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]ACPAgent, 0, len(names))
+	for _, name := range names {
+		out = append(out, copyACPAgent(r.byName[name]))
+	}
+	return out
+}
+
+func copyACPAgent(agent ACPAgent) ACPAgent {
+	agent.Capabilities = append([]string(nil), agent.Capabilities...)
+	return agent
 }
