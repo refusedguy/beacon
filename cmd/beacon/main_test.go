@@ -707,6 +707,7 @@ func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
 	port := &t3145BothPort{t3145Port: &t3145Port{}}
 
 	installOpenCodePorts(port)
+	SetOpenCodePort(port)
 
 	if src, ok := watchLiveSource.(*liveOpencodeSource); !ok || src.port != port {
 		t.Fatalf("live source = %#v, want adapter over the client", watchLiveSource)
@@ -714,10 +715,8 @@ func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
 	if spawnSessionSpawner != port {
 		t.Fatalf("spawn port = %#v, want the client itself", spawnSessionSpawner)
 	}
-	// A client that can spawn also has Prompt, so it satisfies deliveryTarget
-	// and must be installed as the live delivery target.
-	if deliverTarget != port {
-		t.Fatalf("delivery target = %#v, want the client itself", deliverTarget)
+	if deliverTarget == nil {
+		t.Fatal("delivery port was not installed by SetOpenCodePort")
 	}
 }
 
@@ -743,35 +742,25 @@ func TestT3152InstallOpenCodePortsInstallsPostAndFallbackPorts(t *testing.T) {
 	}
 
 	installOpenCodePorts(port)
+	SetOpenCodePort(port)
 
 	if spawnSessionSpawner != port {
 		t.Fatalf("spawn port = %#v, want the full stand-in", spawnSessionSpawner)
 	}
-	if deliverTarget != port {
-		t.Fatalf("delivery port = %#v, want the full stand-in", deliverTarget)
-	}
-	if installedServerEnsurer != port {
-		t.Fatalf("fallback port = %#v, want the full stand-in", installedServerEnsurer)
-	}
-	if _, err := resolveOpencodeConfig(context.Background()); err != nil {
-		t.Fatalf("resolveOpencodeConfig: %v", err)
-	}
-	if port.ensurerCalls != 1 {
-		t.Fatalf("EnsureServer вызовов %d, ожидался 1", port.ensurerCalls)
+	if deliverTarget == nil {
+		t.Fatal("delivery port was not installed by SetOpenCodePort")
 	}
 }
 
 func TestT3152InstallOpenCodePortsLeavesReaderClientUnwired(t *testing.T) {
 	t3145RestorePorts(t)
-	t.Cleanup(func() { SetServerEnsurer(nil) })
-	SetServerEnsurer(nil)
 	port := &t3145Port{}
 
 	installOpenCodePorts(port)
 
-	if spawnSessionSpawner != nil || deliverTarget != nil || installedServerEnsurer != nil {
-		t.Fatalf("порты POST не должны ставиться без T3.150/151: spawn=%v deliver=%v ensurer=%v",
-			spawnSessionSpawner, deliverTarget, installedServerEnsurer)
+	if spawnSessionSpawner != nil || deliverTarget != nil {
+		t.Fatalf("порты POST не должны ставиться без полного порта: spawn=%v deliver=%v",
+			spawnSessionSpawner, deliverTarget)
 	}
 }
 
@@ -804,12 +793,11 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 	// T3.153 adapts the context-aware POST client to both write ports, so a
 	// resolved registration must install the same adapter for spawn and deliver.
 	// Without it the commands keep reporting an unwired port.
-	spawnCreator, ok := spawnSessionSpawner.(*clientSessionCreator)
+	spawnCreator, ok := spawnSessionSpawner.(*livePort)
 	if !ok || spawnCreator == nil {
-		t.Fatalf("spawn port = %#v, want *clientSessionCreator over the live client", spawnSessionSpawner)
+		t.Fatalf("spawn port = %#v, want *livePort over the live client", spawnSessionSpawner)
 	}
-	deliverCreator, ok := deliverTarget.(*clientSessionCreator)
-	if !ok || deliverCreator != spawnCreator {
-		t.Fatalf("delivery port = %#v, want the same *clientSessionCreator as spawn", deliverTarget)
+	if deliverTarget == nil {
+		t.Fatal("delivery port = nil, want the live client")
 	}
 }

@@ -30,7 +30,7 @@ const (
 var (
 	gcServeList  = opencode.ListServeProcesses
 	gcServicePID = opencode.ReadServicePID
-	gcServiceCfg = opencode.ReadConfig
+	gcServiceCfg = opencode.Discover
 	gcServeState = opencode.ReadServeState
 	gcServeClear = opencode.ClearServeState
 	gcServeKill  = opencode.TerminateServe

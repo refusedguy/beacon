@@ -56,7 +56,7 @@ func newTestClient(t *testing.T, doer Doer) *Client {
 	return c
 }
 
-func TestReadConfig(t *testing.T) {
+func TestDiscover(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", dir)
 	path := filepath.Join(dir, "opencode", "service.json")
@@ -68,19 +68,19 @@ func TestReadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := ReadConfig()
+	cfg, err := Discover()
 	if err != nil {
-		t.Fatalf("ReadConfig: %v", err)
+		t.Fatalf("Discover: %v", err)
 	}
 	if cfg.URL != "http://127.0.0.1:49374" || cfg.Password != "secret" {
 		t.Fatalf("неверный конфиг: %+v", cfg)
 	}
 }
 
-func TestReadConfigErrors(t *testing.T) {
+func TestDiscoverErrors(t *testing.T) {
 	t.Run("missing file", func(t *testing.T) {
 		t.Setenv("XDG_STATE_HOME", t.TempDir())
-		if _, err := ReadConfig(); err == nil {
+		if _, err := Discover(); err == nil {
 			t.Fatal("ожидалась ошибка для отсутствующего файла")
 		}
 	})
@@ -95,7 +95,7 @@ func TestReadConfigErrors(t *testing.T) {
 		if err := os.WriteFile(path, []byte(`{"url":`), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ReadConfig(); err == nil {
+		if _, err := Discover(); err == nil {
 			t.Fatal("ожидалась ошибка для неверного JSON")
 		}
 	})
@@ -107,7 +107,7 @@ func TestReadConfigErrors(t *testing.T) {
 		readFile = func(string) ([]byte, error) {
 			return []byte(`{"url":"  ","password":"p"}`), nil
 		}
-		if _, err := ReadConfig(); err == nil {
+		if _, err := Discover(); err == nil {
 			t.Fatal("ожидалась ошибка для пустого url")
 		}
 	})

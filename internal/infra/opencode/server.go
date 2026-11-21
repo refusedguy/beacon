@@ -205,14 +205,7 @@ type ServeState struct {
 var ensureMu sync.Mutex
 
 func stateHomeDir() (string, error) {
-	if base := os.Getenv("XDG_STATE_HOME"); base != "" {
-		return base, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("не удалось определить домашний каталог: %w", err)
-	}
-	return filepath.Join(home, ".local", "state"), nil
+	return StateBaseDir()
 }
 
 func serveStatePath() (string, error) {
@@ -221,14 +214,6 @@ func serveStatePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(base, "beacon", serveStateFile), nil
-}
-
-func serviceRegistrationPath() (string, error) {
-	base, err := stateHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, "opencode", "service.json"), nil
 }
 
 // ReadServeState returns the record of a server spawned by Beacon. The bool is
@@ -283,21 +268,11 @@ func ClearServeState() error {
 // ReadServicePID returns the pid of the user's main OpenCode server from
 // service.json. Zero means the registration has no pid or cannot be read.
 func ReadServicePID() int {
-	path, err := serviceRegistrationPath()
+	cfg, err := Discover()
 	if err != nil {
 		return 0
 	}
-	data, err := readFile(path)
-	if err != nil {
-		return 0
-	}
-	var reg struct {
-		PID int `json:"pid"`
-	}
-	if err := json.Unmarshal(data, &reg); err != nil {
-		return 0
-	}
-	return reg.PID
+	return cfg.PID
 }
 
 // ProcessAlive mirrors the signal-0 check used elsewhere in Beacon: EPERM
@@ -394,7 +369,7 @@ func EnsureServer(ctx context.Context) (Config, error) {
 	if st, ok := ReadServeState(); ok && ProcessAlive(st.PID) {
 		return Config{URL: st.URL, Password: st.Password}, nil
 	}
-	if cfg, err := ReadConfig(); err == nil {
+	if cfg, err := Discover(); err == nil {
 		return cfg, nil
 	}
 

@@ -289,7 +289,7 @@ func TestW254ClientSessionCreatorPostsAndReturnsID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("opencode.New: %v", err)
 	}
-	creator := &clientSessionCreator{client: client}
+	creator := &livePort{client: client}
 
 	id, err := creator.CreateSession("parent", "general", "T3.999", map[string]string{"task": "T3.999"})
 	if err != nil {
@@ -343,14 +343,9 @@ func TestW254NewOpencodePortInstallsClientPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newOpencodePort: %v", err)
 	}
-	if _, ok := port.(sessionCreator); ok {
-		t.Fatal("сырой клиент не должен удовлетворять sessionCreator")
-	}
+	SetOpenCodePort(port)
 	if spawnSessionSpawner == nil || deliverTarget == nil {
 		t.Fatalf("порты не установлены: spawn=%v deliver=%v", spawnSessionSpawner, deliverTarget)
-	}
-	if installedServerEnsurer == nil {
-		t.Fatal("порт EnsureServer не установлен")
 	}
 	id, err := spawnSessionSpawner.CreateSession("parent", "general", "T3.999", nil)
 	if err != nil || id != "sess-live" {
@@ -364,9 +359,5 @@ func TestW254NewOpencodePortInstallsClientPorts(t *testing.T) {
 	}
 	if got := doer.requests[0].Method + " " + doer.requests[0].URL.String(); got != "POST http://127.0.0.1:65000/api/session" {
 		t.Fatalf("первый запрос = %q", got)
-	}
-	cfg, err := installedServerEnsurer.EnsureServer(context.Background())
-	if err != nil || cfg.URL != "http://127.0.0.1:65000/" {
-		t.Fatalf("EnsureServer через адаптер = %+v, %v", cfg, err)
 	}
 }

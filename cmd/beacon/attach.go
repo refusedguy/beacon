@@ -3,11 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 const attachSessionsFile = "attach-sessions.json"
@@ -49,42 +50,15 @@ type opencodeService struct {
 	URL string `json:"url"`
 }
 
-// serviceConfigPath returns the registration file of the running OpenCode
-// service. It mirrors stateDir() but points at the opencode state directory
-// instead of beacon.
-func serviceConfigPath() (string, error) {
-	base := os.Getenv("XDG_STATE_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", fmt.Errorf("не удалось определить домашний каталог: %w", err)
-		}
-		base = filepath.Join(home, ".local", "state")
-	}
-	return filepath.Join(base, "opencode", "service.json"), nil
-}
-
-// readServiceConfig reads and validates the service registration file. A
-// missing or malformed file means the background service is not running.
+// readServiceConfig reads the service address through opencode.Discover, the
+// one reader of the registration file. A missing or malformed file means the
+// background service is not running (ADR 0005, ADR 0092).
 func readServiceConfig() (opencodeService, error) {
-	path, err := serviceConfigPath()
+	cfg, err := opencode.Discover()
 	if err != nil {
 		return opencodeService{}, err
 	}
-	// os.DirFS + fs.ReadFile keeps file access out of cmd's forbidden
-	// os.ReadFile capability (ADR 0005 capabilities gate).
-	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
-	if err != nil {
-		return opencodeService{}, fmt.Errorf("%s: %w", path, err)
-	}
-	var cfg opencodeService
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return opencodeService{}, fmt.Errorf("%s: неверный JSON: %w", path, err)
-	}
-	if cfg.URL == "" {
-		return opencodeService{}, fmt.Errorf("%s: нет поля url", path)
-	}
-	return cfg, nil
+	return opencodeService{URL: cfg.URL}, nil
 }
 
 // attachSessionsPath points at the session registry in Beacon state. It uses

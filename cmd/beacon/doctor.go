@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 const minGoVersion = "1.26.0"
@@ -295,15 +297,10 @@ func stateDir(root ...string) (string, error) {
 }
 
 // stateBaseDir resolves XDG_STATE_HOME or the user's home state directory.
+// The fallback lives in opencode.StateBaseDir so the XDG rule is written once
+// and shared with the service discovery path (ADR 0092).
 func stateBaseDir() (string, error) {
-	if base := os.Getenv("XDG_STATE_HOME"); base != "" {
-		return base, nil
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("не удалось определить домашний каталог: %w", err)
-	}
-	return filepath.Join(home, ".local", "state"), nil
+	return opencode.StateBaseDir()
 }
 
 // projectStateKey builds a stable, readable directory key for a project root.
