@@ -19,23 +19,48 @@ import (
 func init() {
 	daemon := daemonRunner
 	RegisterDaemon(func(c *CLI, args []string) int {
-		return tracedCommand("beacon.daemon.tick", "daemon", func() int { return daemon(c, args) })
+		return tracedCommand("beacon.daemon.tick", "daemon", func() int { return daemon(c, stripOTLPFlags(args)) })
 	})
 
 	orchestrate := orchestratorRunner
 	RegisterOrchestrator(func(c *CLI, args []string) int {
-		return tracedCommand("beacon.orchestrator.pass", "orchestrator", func() int { return orchestrate(c, args) })
+		return tracedCommand("beacon.orchestrator.pass", "orchestrator", func() int {
+			return orchestrate(c, stripOTLPFlags(args))
+		})
 	})
 
 	ci := ciRunner
 	RegisterCI(func(c *CLI, args []string) int {
-		return tracedCommand("beacon.ci.refresh", "cibridge", func() int { return ci(c, args) })
+		return tracedCommand("beacon.ci.refresh", "cibridge", func() int { return ci(c, stripOTLPFlags(args)) })
 	})
 
 	deliver := deliverRunner
 	RegisterDeliver(func(c *CLI, args []string) int {
-		return tracedCommand("beacon.wake.deliver", "wake", func() int { return deliver(c, args) })
+		return tracedCommand("beacon.wake.deliver", "wake", func() int { return deliver(c, stripOTLPFlags(args)) })
 	})
+}
+
+// stripOTLPFlags removes the OTLP knobs before a traced command parses its own
+// flags. The knobs are consumed by setupObserve, which runs first in main.
+func stripOTLPFlags(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--otel-exporter="),
+			strings.HasPrefix(a, "--otel-endpoint="),
+			strings.HasPrefix(a, "--otel-protocol="):
+			continue
+		case a == "--otel-exporter", a == "--otel-endpoint", a == "--otel-protocol":
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		default:
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 func tracedCommand(name, component string, fn func() int) int {
@@ -115,12 +140,66 @@ func runMetrics(c *CLI, args []string) int {
 	return 0
 }
 
+// otlpConfigFromArgs layers the OTLP command flags over the environment. The
+// env variables are the supported path for every command; a caller that owns
+// its own flag set can pass these flags through and get the same config. No
+// flag value contacts a collector here, so enabling OTLP never needs a live
+// endpoint at parse time.
+func otlpConfigFromArgs(args []string) observe.Config {
+	cfg := observe.ConfigFromEnv()
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case strings.HasPrefix(a, "--otel-exporter="):
+			cfg.Exporter = strings.TrimSpace(strings.TrimPrefix(a, "--otel-exporter="))
+		case a == "--otel-exporter" && i+1 < len(args):
+			i++
+			cfg.Exporter = strings.TrimSpace(args[i])
+		case strings.HasPrefix(a, "--otel-endpoint="):
+			cfg.Endpoint = strings.TrimSpace(strings.TrimPrefix(a, "--otel-endpoint="))
+		case a == "--otel-endpoint" && i+1 < len(args):
+			i++
+			cfg.Endpoint = strings.TrimSpace(args[i])
+		case strings.HasPrefix(a, "--otel-protocol="):
+			cfg.Protocol = cmdProtocol(strings.TrimPrefix(a, "--otel-protocol="))
+		case a == "--otel-protocol" && i+1 < len(args):
+			i++
+			cfg.Protocol = cmdProtocol(args[i])
+		}
+	}
+	return cfg
+}
+
+func cmdProtocol(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case observe.ProtocolHTTPJSON, "json":
+		return observe.ProtocolHTTPJSON
+	case observe.ProtocolGRPC:
+		return observe.ProtocolGRPC
+	default:
+		return observe.ProtocolHTTPProtobuf
+	}
+}
+
+// installOTLPExporter swaps in the OTLP tracer only when tracing is enabled,
+// the exporter is named and an endpoint is present. Every other combination
+// leaves the local tracer from package init in place.
+func installOTLPExporter(args []string) {
+	cfg := otlpConfigFromArgs(args)
+	if !cfg.Enabled || !strings.EqualFold(strings.TrimSpace(cfg.Exporter), "otlp") ||
+		strings.TrimSpace(cfg.Endpoint) == "" {
+		return
+	}
+	observe.SetTracer(observe.NewTracer(cfg))
+}
+
 // setupObserve installs a slog logger and the in-memory counters. A long-lived
 // server command (mcp or daemon) opens the rotating JSONL server log and moves
 // both latest links to it. Every other command opens a fresh timestamped CLI
 // log and leaves those links alone, so a one-shot command cannot hide the
 // server log from an operator following beacon.mcp.latest.log.
 func setupObserve(args ...string) func() {
+	installOTLPExporter(args)
 	rawLevel := os.Getenv(beaconLogLevelEnv)
 	level, ok := observe.ParseLevel(rawLevel)
 	if !ok {
@@ -140,6 +219,7 @@ func setupObserve(args ...string) func() {
 		return func() {
 			stopMetrics()
 			observe.FlushCycle()
+			_ = observe.Shutdown(context.Background())
 			log.SetOutput(previousLogOutput)
 			observe.SetDefault(nil)
 		}
