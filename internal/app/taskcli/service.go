@@ -83,7 +83,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		}
 	}
 	for _, v := range o.Phases {
-		if !oneOf(v, "P0", "P1", "P2", "P3", "P4") {
+		if !oneOf(v, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
 			return "", taskstore.Validationf("неизвестная фаза %q", v)
 		}
 	}
@@ -197,7 +197,7 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	if !oneOf(o.Type, "task", "epic") {
 		return "", "", taskstore.Validationf("неизвестный тип %q", o.Type)
 	}
-	if !oneOf(o.Phase, "P0", "P1", "P2", "P3", "P4") {
+	if !oneOf(o.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
 		return "", "", taskstore.Validationf("неверная или отсутствующая фаза %q", o.Phase)
 	}
 	if strings.TrimSpace(o.Title) == "" {
