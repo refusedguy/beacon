@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // Smoke-тест живёт отдельно от адаптера ACP: он проверяет внешний бинарник,
@@ -30,6 +32,7 @@ type acpRPCError struct {
 type acpMessage struct {
 	ID     *int            `json:"id"`
 	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
 	Result json.RawMessage `json:"result"`
 	Error  *acpRPCError    `json:"error"`
 }
@@ -191,6 +194,57 @@ func (c *acpClient) request(t *testing.T, timeout time.Duration, method string, 
 	}
 }
 
+// promptWithUpdates отправляет session/prompt и собирает session/update,
+// пришедшие до ответа. Наличие update доказывает, что агент начал работу,
+// а не только подтвердил приём запроса.
+func (c *acpClient) promptWithUpdates(t *testing.T, timeout time.Duration, sessionID, text string) (json.RawMessage, []json.RawMessage) {
+	t.Helper()
+	c.id++
+	id := c.id
+	req := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  "session/prompt",
+		"params": map[string]any{
+			"sessionId": sessionID,
+			"prompt": []map[string]any{
+				{"type": "text", "text": text},
+			},
+		},
+	}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("session/prompt: сериализация запроса: %v", err)
+	}
+	if _, err := fmt.Fprintf(c.stdin, "%s\n", raw); err != nil {
+		t.Fatalf("session/prompt: запись запроса: %v", err)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var updates []json.RawMessage
+	for {
+		select {
+		case read := <-c.msgs:
+			if read.err != nil {
+				t.Fatalf("session/prompt: %v; stderr: %s", read.err, c.diagnostics())
+			}
+			if read.msg.ID == nil || *read.msg.ID != id {
+				if read.msg.Method == "session/update" {
+					updates = append(updates, read.msg.Params)
+				}
+				continue
+			}
+			if read.msg.Error != nil {
+				t.Fatalf("session/prompt: RPC-ошибка %d: %s; stderr: %s", read.msg.Error.Code, read.msg.Error.Message, c.diagnostics())
+			}
+			return read.msg.Result, updates
+		case <-timer.C:
+			t.Fatalf("session/prompt: нет ответа за %s; stderr: %s", timeout, c.diagnostics())
+		}
+	}
+}
+
 func (c *acpClient) diagnostics() string {
 	out := c.stderr.String()
 	if out == "" {
@@ -265,4 +319,95 @@ func TestOpenCodeACPHandshakeAndSession(t *testing.T) {
 		t.Fatalf("session/load: пустой результат для %s", created.SessionID)
 	}
 	t.Logf("session/load: принят, sessionId=%s", created.SessionID)
+}
+
+// TestOpenCodeACPWakeSequence ведёт живой ACP-сеанс от handshake до реального
+// wake: session/load (resume), session/prompt и session/update от агента.
+// Это W06 без подмены адаптера моком.
+func TestOpenCodeACPWakeSequence(t *testing.T) {
+	root := t.TempDir()
+	client := startACPServer(t, root)
+
+	initRaw := client.request(t, 30*time.Second, "initialize", map[string]any{
+		"protocolVersion":    acpProtocolVersion,
+		"clientCapabilities": map[string]any{"loadSession": true},
+		"clientInfo":         map[string]any{"name": "beacon-acp-smoke", "version": "0.0.0"},
+	})
+	var init struct {
+		AgentCapabilities struct {
+			LoadSession bool `json:"loadSession"`
+		} `json:"agentCapabilities"`
+	}
+	if err := json.Unmarshal(initRaw, &init); err != nil {
+		t.Fatalf("initialize: разбор результата: %v; результат: %s", err, clip(string(initRaw), 300))
+	}
+
+	newRaw := client.request(t, 30*time.Second, "session/new", map[string]any{
+		"cwd":        root,
+		"mcpServers": []any{},
+	})
+	var created struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(newRaw, &created); err != nil || created.SessionID == "" {
+		t.Fatalf("session/new: sessionId пустой или не разобран: %v; результат: %s", err, clip(string(newRaw), 300))
+	}
+
+	// W06: перед prompt Beacon резюмирует сессию через session/load, когда
+	// агент объявил loadSession. Без этой способности адаптер делает session/new.
+	resumeMode := "newRun"
+	if init.AgentCapabilities.LoadSession {
+		resumeMode = "resume"
+		loadRaw := client.request(t, 30*time.Second, "session/load", map[string]any{
+			"sessionId":  created.SessionID,
+			"cwd":        root,
+			"mcpServers": []any{},
+		})
+		if len(loadRaw) == 0 || string(loadRaw) == "null" {
+			t.Fatalf("session/load: пустой результат для %s", created.SessionID)
+		}
+	}
+
+	promptRaw, updates := client.promptWithUpdates(t, 90*time.Second, created.SessionID,
+		"Ответь ровно одним словом: pong")
+	var prompt struct {
+		StopReason string `json:"stopReason"`
+	}
+	if err := json.Unmarshal(promptRaw, &prompt); err != nil {
+		t.Fatalf("session/prompt: разбор результата: %v; результат: %s", err, clip(string(promptRaw), 300))
+	}
+	if prompt.StopReason == "" {
+		t.Fatalf("session/prompt: пустой stopReason; результат: %s", clip(string(promptRaw), 300))
+	}
+	if len(updates) == 0 {
+		t.Fatalf("session/prompt: агент не прислал ни одного session/update, wake не подтверждён")
+	}
+	t.Logf("wake: mode=%s, sessionId=%s, stopReason=%s, updates=%d",
+		resumeMode, created.SessionID, prompt.StopReason, len(updates))
+}
+
+// TestACPRoleMatrix проверяет W07: агенты ACP пригодны как цели wake, а
+// клиенты ACP (редакторы) таковыми не являются. Негатив на неверной роли:
+// попытка собрать wake для клиента отклоняется резолвером рантаймов.
+func TestACPRoleMatrix(t *testing.T) {
+	agents := make(map[string]bool)
+	for _, name := range wake.SupportedACPRuntimes() {
+		agents[name] = true
+	}
+
+	for _, name := range []string{"opencode", "claude", "codex", "pi"} {
+		if !agents[name] {
+			t.Errorf("агент ACP %s отсутствует в SupportedACPRuntimes", name)
+		}
+	}
+
+	clients := []string{"zed", "cursor", "cursor desktop"}
+	for _, name := range clients {
+		if agents[name] {
+			t.Errorf("ACP-клиент %s ошибочно отнесён к агентам", name)
+		}
+		if _, _, err := wake.ResolveACPRuntimeCommand(wake.ACPRuntimeConfig{Runtime: name}); err == nil {
+			t.Errorf("негатив роли: рантайм %s (клиент ACP) принят как цель wake", name)
+		}
+	}
 }
