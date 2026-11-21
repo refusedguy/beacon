@@ -411,6 +411,48 @@ func TestContractDecide(t *testing.T) {
 	}
 }
 
+func TestContractDecideVersioned(t *testing.T) {
+	doc := loadOpenAPI(t)
+	sink := &stubSink{result: DecisionResult{DecisionID: "journal-9"}}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(
+		`{"command":"approve","watchID":"w1","actor":"ext-app","contract":"beacon.human-decide.v1"}`,
+		"http://127.0.0.1:7432",
+	))
+	if w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d, body %s", w.Code, w.Body.String())
+	}
+	doc.validateBody(t, "DecisionResult", w.Body.Bytes())
+	var result DecisionResult
+	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Contract != HumanDecideContract {
+		t.Fatalf("contract = %q, want %q", result.Contract, HumanDecideContract)
+	}
+	if len(sink.calls) != 1 || sink.calls[0].Actor != "ext-app" {
+		t.Fatalf("sink calls = %+v", sink.calls)
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(
+		`{"command":"approve","watchID":"w1","contract":"beacon.human-decide.v9"}`,
+		"http://127.0.0.1:7432",
+	))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported contract status = %d, body %s", w.Code, w.Body.String())
+	}
+	doc.validateBody(t, "Error", w.Body.Bytes())
+	if !strings.Contains(w.Body.String(), "UNSUPPORTED_CONTRACT") {
+		t.Fatalf("body = %s, want UNSUPPORTED_CONTRACT", w.Body.String())
+	}
+	if len(sink.calls) != 1 {
+		t.Fatalf("unsupported contract reached the sink: %+v", sink.calls)
+	}
+}
+
 func TestContractEvents(t *testing.T) {
 	doc := loadOpenAPI(t)
 	bus := NewEventBus(10)

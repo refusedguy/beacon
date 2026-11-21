@@ -543,25 +543,53 @@ func (c *ProjectionClient) consumeEvents(ctx context.Context, body io.ReadCloser
 // ---------------------------------------------------------------------------
 
 // ClientDecision is one human command. Target is a watchID or a blockerID,
-// depending on Verb. The server owns the meaning of each verb.
+// depending on Verb. The server owns the meaning of each verb. Actor carries
+// the identity of the caller so an external app can write an answer through the
+// same route the TUI uses. Contract names the wire contract version; empty
+// selects HumanDecideContract.
 type ClientDecision struct {
-	Verb   string `json:"verb"`
-	Target string `json:"target"`
-	Note   string `json:"note,omitempty"`
+	Verb     string `json:"verb"`
+	Target   string `json:"target"`
+	Note     string `json:"note,omitempty"`
+	Actor    string `json:"actor,omitempty"`
+	Contract string `json:"contract,omitempty"`
+}
+
+// decideWire is the JSON shape of POST /api/v1/human/decide. It is the same
+// command/watchID shape the TUI client and the server use; ClientDecision keeps
+// its Verb/Target names for callers and is translated here at the boundary.
+type decideWire struct {
+	Command  string `json:"command"`
+	WatchID  string `json:"watchID"`
+	Note     string `json:"note,omitempty"`
+	Actor    string `json:"actor,omitempty"`
+	Contract string `json:"contract,omitempty"`
 }
 
 // ClientDecisionReceipt is the server receipt. OK false means the command was
-// refused; Message carries the reason when the server provides one.
+// refused; Message carries the reason when the server provides one. Contract is
+// the version the server applied.
 type ClientDecisionReceipt struct {
-	OK      bool   `json:"ok"`
-	Applied bool   `json:"applied,omitempty"`
-	Message string `json:"message,omitempty"`
+	OK       bool   `json:"ok"`
+	Applied  bool   `json:"applied,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Contract string `json:"contract,omitempty"`
 }
 
 // Decide posts one decision with the bearer token from connection.json. A
 // refused command is an error, so a caller never reports success by accident.
 func (c *ProjectionClient) Decide(ctx context.Context, req ClientDecision) (ClientDecisionReceipt, error) {
-	payload, err := json.Marshal(req)
+	contract := strings.TrimSpace(req.Contract)
+	if contract == "" {
+		contract = HumanDecideContract
+	}
+	payload, err := json.Marshal(decideWire{
+		Command:  strings.TrimSpace(req.Verb),
+		WatchID:  strings.TrimSpace(req.Target),
+		Note:     req.Note,
+		Actor:    req.Actor,
+		Contract: contract,
+	})
 	if err != nil {
 		return ClientDecisionReceipt{}, fmt.Errorf("httpapi: encode decision: %w", err)
 	}
@@ -585,14 +613,15 @@ func (c *ProjectionClient) Decide(ctx context.Context, req ClientDecision) (Clie
 		out.OK = true
 	} else {
 		var raw struct {
-			OK      *bool  `json:"ok"`
-			Applied bool   `json:"applied,omitempty"`
-			Message string `json:"message,omitempty"`
+			OK       *bool  `json:"ok"`
+			Applied  bool   `json:"applied,omitempty"`
+			Message  string `json:"message,omitempty"`
+			Contract string `json:"contract,omitempty"`
 		}
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return ClientDecisionReceipt{}, fmt.Errorf("httpapi: decode decision: %w", err)
 		}
-		out = ClientDecisionReceipt{Applied: raw.Applied, Message: raw.Message}
+		out = ClientDecisionReceipt{Applied: raw.Applied, Message: raw.Message, Contract: raw.Contract}
 		// A receipt that omits "ok" is still a success; only an explicit false
 		// means the server refused the command.
 		out.OK = raw.OK == nil || *raw.OK

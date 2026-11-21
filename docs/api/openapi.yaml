@@ -756,6 +756,13 @@ components:
           type: string
         actor:
           type: string
+          description: Identity of the caller, recorded in the audit by the sink.
+        contract:
+          type: string
+          description: >-
+            Wire contract version. Omitted for the original shape; when set it
+            must equal beacon.human-decide.v1 or the command is refused.
+          example: beacon.human-decide.v1
 
     DecisionResult:
       type: object
@@ -776,3 +783,7 @@ components:
           type: string
         status:
           type: string
+        contract:
+          type: string
+          description: Wire contract version the server applied.
+          example: beacon.human-decide.v1

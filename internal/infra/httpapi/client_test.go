@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,27 +154,89 @@ func TestClientDecidePostsDecisionWithBearer(t *testing.T) {
 		gotMethod, gotPath, gotAuth = req.Method, req.URL.Path, req.Header.Get("Authorization")
 		body, _ := io.ReadAll(req.Body)
 		gotBody = string(body)
-		return fakeResponse(http.StatusOK, `{"ok":true,"applied":true}`), nil
+		return fakeResponse(http.StatusOK, `{"ok":true,"applied":true,"contract":"beacon.human-decide.v1"}`), nil
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := client.Decide(context.Background(), ClientDecision{Verb: "approve", Target: "w-1", Note: "looks good"})
+	receipt, err := client.Decide(context.Background(), ClientDecision{
+		Verb: "approve", Target: "w-1", Note: "looks good", Actor: "ext-app",
+	})
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if !receipt.OK || !receipt.Applied {
+	if !receipt.OK || !receipt.Applied || receipt.Contract != HumanDecideContract {
 		t.Fatalf("receipt = %+v", receipt)
 	}
 	if gotMethod != http.MethodPost || gotPath != clientDecidePath || gotAuth != "Bearer sekret" {
 		t.Fatalf("request = %s %s %q", gotMethod, gotPath, gotAuth)
 	}
-	var decoded ClientDecision
+	var decoded decideWire
 	if err := json.Unmarshal([]byte(gotBody), &decoded); err != nil {
 		t.Fatalf("body %q: %v", gotBody, err)
 	}
-	if decoded.Verb != "approve" || decoded.Target != "w-1" || decoded.Note != "looks good" {
+	if decoded.Command != "approve" || decoded.WatchID != "w-1" || decoded.Note != "looks good" ||
+		decoded.Actor != "ext-app" || decoded.Contract != HumanDecideContract {
 		t.Fatalf("decoded = %+v", decoded)
+	}
+	// The bytes on the wire must satisfy the server's published contract.
+	loadOpenAPI(t).validateBody(t, "Decision", []byte(gotBody))
+}
+
+// testServerDoer forwards a client request into a real Server handler and turns
+// the recorded response back into an http.Response. It proves client and server
+// agree on the human-decide wire without opening a socket.
+func testServerDoer(srv *Server) ClientDoer {
+	return fakeDoer{fn: func(req *http.Request) (*http.Response, error) {
+		w := httptest.NewRecorder()
+		srv.handler().ServeHTTP(w, req)
+		return w.Result(), nil
+	}}
+}
+
+func TestClientDecideWritesThroughServerPath(t *testing.T) {
+	sink := &stubSink{result: DecisionResult{DecisionID: "journal-9"}}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+	conn := ClientConn{Host: "127.0.0.1", Port: 8787, Token: "tok"}
+	client, err := NewProjectionClient(conn, testServerDoer(srv))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receipt, err := client.Decide(context.Background(), ClientDecision{
+		Verb: "approve", Target: "w1", Note: "ok", Actor: "ext-app",
+	})
+	if err != nil {
+		t.Fatalf("Decide through server: %v", err)
+	}
+	if !receipt.OK || !receipt.Applied || receipt.Contract != HumanDecideContract {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if len(sink.calls) != 1 {
+		t.Fatalf("sink calls = %d, want 1", len(sink.calls))
+	}
+	got := sink.calls[0]
+	if got.Command != "approve" || got.WatchID != "w1" || got.Actor != "ext-app" || got.Contract != HumanDecideContract {
+		t.Fatalf("sink decision = %+v", got)
+	}
+}
+
+func TestClientDecideRejectsUnsupportedContract(t *testing.T) {
+	sink := &stubSink{}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+	client, err := NewProjectionClient(ClientConn{Host: "127.0.0.1", Port: 8787, Token: "tok"}, testServerDoer(srv))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.Decide(context.Background(), ClientDecision{
+		Verb: "approve", Target: "w1", Contract: "beacon.human-decide.v9",
+	})
+	if err == nil || !strings.Contains(err.Error(), "UNSUPPORTED_CONTRACT") {
+		t.Fatalf("err = %v, want UNSUPPORTED_CONTRACT", err)
+	}
+	if len(sink.calls) != 0 {
+		t.Fatalf("sink must not see an unsupported contract, got %+v", sink.calls)
 	}
 }
 
