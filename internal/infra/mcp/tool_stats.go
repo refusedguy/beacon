@@ -46,6 +46,10 @@ const (
 	// graphIndexErrorPrefix records a failed graph index read. A read that
 	// cannot be verified is reported as not ready, never as a current graph.
 	graphIndexErrorPrefix = "graph index: "
+	// pollerStatsPrefix marks the poller state inside loadErrors. The derived
+	// schema is fixed in schema.go, so pollerActive and pollerPID ride in the
+	// diagnostic array with the other counters.
+	pollerStatsPrefix = "poller: "
 	// activeWatchLimit is the global active-watch cap from ADR 0093
 	// (maxActiveWatchesGlobal) and T1.4. T5.64 warns at 75% and 90% of it.
 	activeWatchLimit = 200
@@ -195,6 +199,48 @@ func (s *SnapshotRegistryStats) RegistryStats(_ context.Context) (RegistryStats,
 		StaleAgents:      snap.StaleAgents(),
 		ConfigID:         snap.RegistryConfig(),
 	}, nil
+}
+
+// PollerStatus is the observable state of the single CI poller. Active is true
+// when a poller process is alive. PID names that process and is zero when none
+// runs.
+type PollerStatus struct {
+	Active bool
+	PID    int
+}
+
+var (
+	pollerStatusMu      sync.RWMutex
+	pollerStatus        PollerStatus
+	pollerStatusOrdered bool
+)
+
+// SetPollerStatus publishes the poller state read by beacon_stats. The
+// composition root calls it once the lock check finishes. Both values change
+// under one lock, so a reader never sees a new PID with the old active flag.
+func SetPollerStatus(s PollerStatus) {
+	if s.PID < 0 || !s.Active {
+		s.PID = 0
+	}
+	pollerStatusMu.Lock()
+	pollerStatus = s
+	pollerStatusOrdered = true
+	pollerStatusMu.Unlock()
+}
+
+// ClearPollerStatus removes the published state and restores the response a
+// server has before its first lock check.
+func ClearPollerStatus() {
+	pollerStatusMu.Lock()
+	pollerStatus = PollerStatus{}
+	pollerStatusOrdered = false
+	pollerStatusMu.Unlock()
+}
+
+func currentPollerStatus() (PollerStatus, bool) {
+	pollerStatusMu.RLock()
+	defer pollerStatusMu.RUnlock()
+	return pollerStatus, pollerStatusOrdered
 }
 
 // The ceilings bound the diagnostic array and the encoded stats response.
@@ -368,6 +414,10 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			loadErrors = append(loadErrors, entry)
 		}
 	}
+	if status, ok := currentPollerStatus(); ok {
+		loadErrors = append(loadErrors, fmt.Sprintf("%spollerActive=%t pollerPID=%d",
+			pollerStatsPrefix, status.Active, status.PID))
+	}
 
 	var registry RegistryStats
 	if h.registry != nil {
@@ -496,4 +546,15 @@ func graphReadyEntry(out StatsOutput) string {
 // never mistakes silence for a green signal.
 func graphReady(out StatsOutput) bool {
 	return graphReadyEntry(out) == graphReadyPrefix+"true"
+}
+
+// pollerStatsEntry returns the poller diagnostic in a stats response, if any.
+// It keeps callers independent of the entry's position in loadErrors.
+func pollerStatsEntry(out StatsOutput) string {
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, pollerStatsPrefix) {
+			return entry
+		}
+	}
+	return ""
 }
