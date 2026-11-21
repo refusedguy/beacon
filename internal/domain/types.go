@@ -272,6 +272,10 @@ type Watch struct {
 	// ConfigID records the configuration identity from ADR 0087 at creation
 	// time. Old Watch records carry no value and read back as the zero string.
 	ConfigID string `json:"configId,omitempty"`
+	// Depth stores the depth decision for this task (depth.look-below). A nil
+	// value means no descent has been decided yet, so old records read back
+	// unchanged.
+	Depth *Descent `json:"depth,omitempty"`
 }
 
 // RecordFixAttempt returns a copy of w with one more FIX agent recorded for

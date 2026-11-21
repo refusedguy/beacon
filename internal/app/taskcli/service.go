@@ -1405,13 +1405,21 @@ const (
 )
 
 // HealingDecision — наблюдаемое решение одной проверки.
+// Поля глубины зеркалят модель domain.Descent. Матрица слоёв (ADR 0005)
+// запрещает app импортировать internal/domain, поэтому значения хранятся
+// примитивами; пустые значения не меняют существующие решения.
 type HealingDecision struct {
-	Action   HealingAction `json:"action"`
-	Class    CheckClass    `json:"class"`
-	Attempt  int           `json:"attempt"`
-	Reason   string        `json:"reason"`
-	CapSpent int           `json:"capSpent"`
-	CapLimit int           `json:"capLimit"`
+	Action     HealingAction `json:"action"`
+	Class      CheckClass    `json:"class"`
+	Attempt    int           `json:"attempt"`
+	Reason     string        `json:"reason"`
+	CapSpent   int           `json:"capSpent"`
+	CapLimit   int           `json:"capLimit"`
+	Layer      string        `json:"layer,omitempty"`
+	Hypothesis string        `json:"hypothesis,omitempty"`
+	Falsifier  string        `json:"falsifier,omitempty"`
+	Evidence   string        `json:"evidence,omitempty"`
+	Steps      int           `json:"steps,omitempty"`
 }
 
 // HealingLogEntry — одна запись журнала. Класс, номер попытки и расход
