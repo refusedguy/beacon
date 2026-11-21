@@ -1029,6 +1029,24 @@ func storedObligation(t *testing.T, stateDir, obligationID string) domain.Obliga
 	return o
 }
 
+// storedRegistration reads the subscribers the watch_pr handler persisted on
+// a Watch. It is a file fact, not a value echoed by the tool: a handler that
+// answered ok:true without writing would leave no row here. ADR 0088 puts the
+// executor registration inside the watch_pr call, before `waiting, watchID`.
+func storedRegistration(t *testing.T, stateDir, watchID string) []domain.Subscriber {
+	t.Helper()
+	db, err := store.Open(filepath.Join(stateDir, "beacon.db"))
+	if err != nil {
+		t.Fatalf("open store for registration check: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	w, err := db.Watch(watchID)
+	if err != nil {
+		t.Fatalf("watch for registration check: %v", err)
+	}
+	return w.Subscribers
+}
+
 func runLiveMCPCycle(t *testing.T, binary string) {
 	t.Helper()
 	base := newBase(t, "cycle")
@@ -1108,6 +1126,59 @@ func runLiveMCPCycle(t *testing.T, binary string) {
 	}
 	t.Logf("beacon_watch_pr: watchID=%s revision=%d status=%s verdict=%s",
 		watch.WatchID, watch.Revision, watch.Status, watch.Verdict)
+
+	// T5.61: the registration point is this watch_pr call (ADR 0088). Verify
+	// the durable record, not the tool answer. The stored executor subscriber
+	// must carry the sessionID from _meta and the notify adapter. This reads a
+	// file the handler wrote; it needs no live probe beyond the server already
+	// running in this scenario.
+	subs := storedRegistration(t, stateDir, watch.WatchID)
+	var registered *domain.Subscriber
+	for i := range subs {
+		if subs[i].Role == domain.RoleExecutor {
+			registered = &subs[i]
+			break
+		}
+	}
+	if registered == nil || registered.ID != session.ID ||
+		registered.Adapter != "opencode" || registered.Target != session.ID {
+		t.Fatalf("T5.61: регистрация исполнителя в store: %+v, ждали id=%s adapter=opencode target=%s",
+			subs, session.ID, session.ID)
+	}
+	t.Logf("T5.61: регистрация в store: subscriber=%s adapter=%s target=%s role=%s",
+		registered.ID, registered.Adapter, registered.Target, registered.Role)
+
+	// Negative control: a card id in _meta is not an addressable session. The
+	// real handler must refuse it, otherwise the stored sessionID above is a
+	// stub value and proves nothing. A stub that answers ok:true would pass.
+	cardMeta := mcpsdk.Meta{"ai.opencode/sessionID": "T5.61"}
+	badReg, badRegErr := mcpSession.CallTool(ctx, &mcpsdk.CallToolParams{
+		Name: "beacon_watch_pr",
+		Arguments: map[string]any{
+			"repo": "refusedguy/beacon", "pr": 142,
+			"headSHA": "beacon-e2e-t3146-registration-negative",
+			"role":    string(domain.RoleExecutor),
+		},
+		Meta: cardMeta,
+	})
+	if badRegErr == nil && !badReg.IsError {
+		t.Fatal("T5.61: негативный контроль регистрации: card id в _meta принят как сессия")
+	}
+	t.Logf("T5.61: негативный контроль регистрации: card id в _meta отклонён (%v)", badRegErr)
+
+	// Acceptance: a call written before the executor descriptor existed still
+	// works with no _meta and no executor field. It finds its identity in
+	// notify.target, so the registration change did not break older callers.
+	legacy := callE2ETool[beaconmcp.WatchPROutput](t, ctx, mcpSession, "beacon_watch_pr", map[string]any{
+		"repo": "refusedguy/beacon", "pr": 143,
+		"headSHA": "beacon-e2e-t3146-legacy",
+		"role":    string(domain.RoleOrchestrator),
+		"notify":  map[string]any{"adapter": "opencode", "target": session.ID},
+	}, mcpsdk.Meta{})
+	if legacy.WatchID == "" {
+		t.Fatalf("T5.61: вызов без executor сломан: %+v", legacy)
+	}
+	t.Logf("T5.61: вызов без executor работает: watchID=%s role=%s", legacy.WatchID, domain.RoleOrchestrator)
 
 	// The agent's turn report from CycleInstructions step 2 goes to a real
 	// opencode session through the loaded plugin, not through a test double.
