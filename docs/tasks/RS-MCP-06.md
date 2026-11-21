@@ -17,4 +17,4 @@
 Приёмка: Обращение к мёртвому watchID больше не выглядит как пустой результат.
 
 ## Подтверждение
-- PR #882 MERGED: 2026-11-21 (squash).
+- PR #882 MERGED: 2026-11-21 (squash). https://github.com/refusedguy/beacon/pull/882

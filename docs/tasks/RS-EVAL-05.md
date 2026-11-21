@@ -2,7 +2,7 @@
 Premise: проверено 2026-11-21 по origin/main (база 89276ef). Контракт `docs/RULES-CHECK-CONTRACT.md` задаёт три вердикта PASS, WARN и FAIL; кода выхода 2 и вердикта BROKEN в нём нет. Обязательной джобы, которая запускает `beacon gates rules`, в `.github/workflows/ci.yml` нет. `runRules` в `cmd/beacon/commands.go:49` при ненулевом коде внутренней команды ставит `status = "warn"` (строки 71-72), то есть отказ инструмента уходит в WARN. GitHub считает skipped и neutral прохождением required check. Часть шагов выполнима в OwnerFiles, проводка проверки в CI лежит в чужих файлах.
 
 baseline: `head -20 docs/RULES-CHECK-CONTRACT.md` перечисляет три вердикта в строке 9 и строчные значения `pass`, `warn`, `fail` в строке 42; `grep -rn 'gates rules' .github/workflows/` не даёт совпадений; `sed -n '71,72p' cmd/beacon/commands.go` даёт `status = "warn"`. Измерение подтверждает расхождение: контракт и код не различают отказ инструмента.
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: tools/beacon-gates/gate/exceptions.go, docs/RULES-CHECK-CONTRACT.md
@@ -33,3 +33,7 @@ baseline: `head -20 docs/RULES-CHECK-CONTRACT.md` перечисляет три 
   Для полноты согласованности схема в `docs/adrs/0237-untitled.md:11` перечисляет `status pass/warn/fail` и тоже требует обновления или нового ADR. Этот файл не входит в OwnerFiles.
 
   Статус todo сохранён. Контракт в OwnerFiles обновлён, `exceptions.go` оставлен без правок ради побайтового совпадения бинарника, чужие файлы, wiring и .beacon не трогал, дубль не создал. Блокер возвращён оркестратору с именами файлов `.github/workflows/ci.yml` и `cmd/beacon/commands.go`.
+
+## Подтверждение
+- PR #871 MERGED: 2026-11-21 (squash). https://github.com/refusedguy/beacon/pull/871
+- Проверено по origin/main: `grep -n 'R-TOOL-BROKEN' cmd/beacon/commands.go` = 73, `grep -n 'rules-broken' .github/workflows/ci.yml` = 247. Код выхода 2 даёт вердикт BROKEN и блокировщик вместо WARN, отдельная джоба без continue-on-error падает на BROKEN. Блокер снят. Код не писал, gofmt не применял, OwnerFiles не менял, wiring и .beacon не трогал.

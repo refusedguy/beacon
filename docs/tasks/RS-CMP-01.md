@@ -37,4 +37,4 @@ baseline: `grep -n 'func (b \*BatchProvider) MergePRWithState' internal/infra/gi
   Статус todo сохранён. OwnerFiles не менял, код не писал, gofmt не применял, чужие файлы, wiring и .beacon не трогал, дубль не создал. Блокер возвращён оркестратору с именем файла `internal/infra/cibridge/bridge.go`. Для реализации нужны OwnerFiles с bridge.go, а также доступ к domain/types.go и batch_provider_test.go или переформулировка шагов под существующие поля и интерфейс.
 
 ## Подтверждение
-- PR #878 MERGED: 2026-11-21 (squash).
+- PR #878 MERGED: 2026-11-21 (squash). https://github.com/refusedguy/beacon/pull/878
