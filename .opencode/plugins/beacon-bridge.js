@@ -160,10 +160,18 @@ export function escapeUntrusted(value, maxLength = MAX_FIELD_LENGTH) {
     .slice(0, maxLength)
 }
 
+// Явный id уведомления из конверта beacon-event. Это ObligationKey: Go кладёт
+// его в поле id, адаптер дедуплицирует по нему до вызова steer. Повтор
+// конверта после рестарта клиента не шлёт второй prompt (RS-WK-02).
+export function notificationID(event) {
+  return escapeUntrusted(event?.id ?? event?.obligationID ?? "")
+}
+
 // Prompt несёт только идентификаторы и экранированные поля. Содержимого
 // проверок в нём нет (T3.3, T3.4, ADR 0017).
 export function buildPromptText(event) {
   const pointer = {
+    id: notificationID(event),
     watchID: escapeUntrusted(event.watchID ?? ""),
     obligationID: escapeUntrusted(event.obligationID ?? ""),
     revision: Number.isInteger(event.revision) ? event.revision : 0,
@@ -364,6 +372,7 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
     throw new Error("wake pointer is missing sessionID, obligationID or attempt")
   }
   const payload = {
+    id: notificationID(pointer),
     watchID: escapeUntrusted(pointer.watchID ?? ""),
     obligationID: escapeUntrusted(pointer.obligationID ?? ""),
     revision: Number.isInteger(pointer.revision) ? pointer.revision : 0,
@@ -373,6 +382,21 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
     payload.project = escapeUntrusted(pointer.project)
   }
   const text = `<beacon-event>${JSON.stringify(payload)}</beacon-event>`
+
+  // RS-WK-02: явный id проверяется до steer. Claim лежит в receipts и живёт
+  // после рестарта клиента, поэтому повтор конверта по уже прочитанному
+  // обязательству не шлёт второй prompt.
+  const paths = statePaths(stateDir)
+  const dedupID = `${notificationID(pointer)}.${pointer.attempt}`
+  const gate = await claim(dedupID, paths.receipts)
+  if (!gate.ok) {
+    return {
+      delivery: STEER_DELIVERY,
+      outcome: "duplicate",
+      receipt: { created: false, path: gate.path, code: "EEXIST" },
+    }
+  }
+
   let outcome = "posted"
   try {
     await ctx.session.prompt({
@@ -382,6 +406,9 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
     })
   } catch {
     outcome = "transport-failed"
+    // Сбой транспорта снимает claim: агент не прочитал вердикт, повтор должен
+    // получить возможность доставить его (как в S2).
+    try { rmSync(gate.path, { force: true }) } catch { /* fail-open */ }
   }
   const receipt = await writeReceipt(stateDir, pointer, outcome)
   // W6-C: та же квитанция в general-purpose receipts.jsonl, откуда ImportReceipts
@@ -400,7 +427,9 @@ export async function deliverReviewPointer(ctx, pointer, stateDir = adapterPaths
 // Квитанции posted/transport-failed пишутся в receipts.jsonl, atomic claim
 // лежит в receipts/<id>.wrote. Любая ошибка гасится вызывающим poller.
 async function deliverEvent(ctx, item, paths, project = null) {
-  const id = item.id ?? `auto-${Date.now()}`
+  // RS-WK-02: ключ дедупликации — явный id конверта (ObligationKey). claim
+  // ниже проверяет его до steer, поэтому повтор после рестарта не будит сессию.
+  const id = notificationID(item) || `auto-${Date.now()}`
   const sessionID = item.sessionID
   if (!sessionID) {
     log(paths, `deliver.skip id=${id} no sessionID in event`)
@@ -746,7 +775,7 @@ const adapterCases = [
     },
   },
   {
-    name: "T3.16: повтор той же пары review не перезаписывает квитанцию",
+    name: "T3.16: повтор той же пары review не перезаписывает квитанцию и не шлёт steer",
     async check(assert) {
       const stateDir = mkdtempSync(join(tmpdir(), "beacon-t316-state-"))
       const pointer = reviewPointer()
@@ -759,8 +788,108 @@ const adapterCases = [
       assert.equal(first.receipt.created, true)
       assert.equal(second.receipt.created, false)
       assert.equal(second.receipt.code, "EEXIST")
-      assert.equal(h.calls.length, 2)
+      assert.equal(second.outcome, "duplicate")
+      // RS-WK-02: id проверен до steer, второй prompt не ушёл.
+      assert.equal(h.calls.length, 1)
       assert.equal(readFileSync(join(stateDir, "receipts", "obl-t316.1"), "utf8"), before)
+    },
+  },
+  {
+    name: "RS-WK-02: конверт несёт явный id ObligationKey",
+    check(assert) {
+      const text = buildPromptText({
+        id: "watch-rs02:7:ses_A",
+        watchID: "watch-rs02",
+        obligationID: "watch-rs02:7:ses_A",
+        revision: 7,
+      })
+      assert.ok(text.startsWith(WRAPPER_OPEN) && text.endsWith(WRAPPER_CLOSE))
+      const body = JSON.parse(text.slice(WRAPPER_OPEN.length, -WRAPPER_CLOSE.length))
+      assert.equal(body.id, "watch-rs02:7:ses_A")
+      assert.equal(body.id, body.obligationID)
+      // Без явного id поле берётся из obligationID.
+      const fallback = JSON.parse(buildPromptText({ obligationID: "watch-rs02:7:ses_B", revision: 7 })
+        .slice(WRAPPER_OPEN.length, -WRAPPER_CLOSE.length))
+      assert.equal(fallback.id, "watch-rs02:7:ses_B")
+    },
+  },
+  {
+    name: "RS-WK-02: повтор конверта после рестарта клиента не шлёт steer",
+    async check(assert) {
+      const stateDir = mkdtempSync(join(tmpdir(), "beacon-rswk02-restart-"))
+      const pointer = reviewPointer({ obligationID: "watch-rs02:7:ses_A" })
+      await writeJSON(join(stateDir, "wake-pointer.json"), pointer)
+
+      // Первый клиент: указатель прочитан, steer ушёл один раз.
+      const first = promptHarness()
+      const firstResult = await deliverReviewPointer(first.ctx, pointer, stateDir)
+      assert.equal(firstResult.outcome, "posted")
+      assert.equal(first.calls.length, 1)
+      const envelope = JSON.parse(first.calls[0].text.slice(WRAPPER_OPEN.length, -WRAPPER_CLOSE.length))
+      assert.equal(envelope.id, pointer.obligationID)
+
+      // Рестарт клиента: новый ctx, тот же каталог состояния. Тот же конверт
+      // находит claim в receipts и не вызывает steer повторно.
+      const restarted = promptHarness()
+      const secondResult = await deliverReviewPointer(restarted.ctx, pointer, stateDir)
+      assert.equal(secondResult.outcome, "duplicate")
+      assert.equal(secondResult.receipt.created, false)
+      assert.equal(restarted.calls.length, 0)
+      assert.equal(first.calls.length, 1)
+    },
+  },
+  {
+    name: "RS-WK-02: S2-повтор после рестарта плагина не будит сессию дважды",
+    async check(assert) {
+      const stateDir = mkdtempSync(join(tmpdir(), "beacon-rswk02-s2-"))
+      const id = "watch-rs02:9:ses_A"
+      appendFileSync(join(stateDir, "events.jsonl"),
+        JSON.stringify({ id, sessionID: "ses_rs02", obligationID: id }) + "\n")
+
+      const makeCtx = (harness) => ({
+        beaconStateDir: stateDir,
+        session: harness.ctx.session,
+        event: {
+          subscribe(options = {}) {
+            const sub = { types: options.types, signal: options.signal, queue: [] }
+            return {
+              async *[Symbol.asyncIterator]() {
+                while (!sub.signal?.aborted) {
+                  await new Promise((tick) => setTimeout(tick, 2))
+                }
+              },
+            }
+          },
+        },
+      })
+
+      const first = promptHarness()
+      let stop = plugin.setup(makeCtx(first))
+      const deadline = Date.now() + POLL_MS + 3000
+      while (Date.now() < deadline && first.calls.length === 0) {
+        await new Promise((tick) => setTimeout(tick, 25))
+      }
+      await new Promise((tick) => setTimeout(tick, 50))
+      stop()
+      assert.equal(first.calls.length, 1)
+
+      // Рестарт: курсор сброшен, то же событие читается снова. Claim в receipts
+      // сохранился, второй steer не уходит.
+      rmSync(join(stateDir, "cursor.json"), { force: true })
+      const restarted = promptHarness()
+      stop = plugin.setup(makeCtx(restarted))
+      const restartDeadline = Date.now() + POLL_MS + 3000
+      while (Date.now() < restartDeadline) {
+        await new Promise((tick) => setTimeout(tick, 25))
+        let cursor = null
+        try { cursor = JSON.parse(readFileSync(join(stateDir, "cursor.json"), "utf8")) } catch { /* ещё нет */ }
+        if (cursor && cursor.offset > 0) break
+      }
+      await new Promise((tick) => setTimeout(tick, 50))
+      stop()
+
+      assert.equal(restarted.calls.length, 0)
+      assert.equal(first.calls.length, 1)
     },
   },
   {
@@ -815,13 +944,19 @@ const adapterCases = [
         (sub.types ?? []).includes("beacon.review.comment"),
       )
       assert.ok(reviewSub, "плагин подписан на beacon.review.comment")
+      const receiptPath = join(stateDir, "receipts", "obl-t316.1")
       queue.push({ type: "beacon.review.comment" })
-      await new Promise((tick) => setTimeout(tick, 30))
+      // Ждём факт, а не фиксированные 30 мс: под CI запись квитанции после
+      // async-claim может занять больше, и жёсткий sleep давал ENOENT.
+      const deadline = Date.now() + POLL_MS + 3000
+      while (Date.now() < deadline && !existsSync(receiptPath)) {
+        await new Promise((tick) => setTimeout(tick, 5))
+      }
       stop()
 
       assert.equal(h.calls.length, 1)
       assert.equal(h.calls[0].delivery, "steer")
-      const line = JSON.parse(readFileSync(join(stateDir, "receipts", "obl-t316.1"), "utf8").trim())
+      const line = JSON.parse(readFileSync(receiptPath, "utf8").trim())
       assert.equal(line.messageSource, "review")
       assert.equal(line.outcome, "posted")
     },

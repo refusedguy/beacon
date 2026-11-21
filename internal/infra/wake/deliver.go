@@ -267,12 +267,16 @@ func sessionNotFound(err error, out []byte) bool {
 }
 
 // Envelope renders the pointer into the host's wake text. Every field is
-// whitelisted: no check body or PR title is included.
+// whitelisted: no check body or PR title is included. The explicit id is the
+// ObligationKey (p.ObligationID is domain.ObligationKey of this pointer). The
+// adapter keys its durable dedup on it, so a replay after a client restart
+// cannot steer the same obligation twice (RS-WK-02).
 func Envelope(p domain.WakePayload) string {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(map[string]any{
+		"id":           p.ObligationID,
 		"watchID":      p.WatchID,
 		"obligationID": p.ObligationID,
 		"revision":     p.Revision,
@@ -678,11 +682,13 @@ type T202Pointer struct {
 }
 
 // T202Envelope renders a pointer as the untrusted wake text admitted to a session.
+// The explicit id is the ObligationKey, the same value carried in obligationID.
 func T202Envelope(p T202Pointer) string {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
 	_ = enc.Encode(map[string]any{
+		"id":           p.ObligationID,
 		"watchID":      p.WatchID,
 		"obligationID": p.ObligationID,
 		"revision":     p.Revision,
@@ -1176,6 +1182,7 @@ func T212clamp(s string, max int) string {
 }
 
 type T212PromptData struct {
+	ID           string `json:"id"`
 	WatchID      string `json:"watchID"`
 	ObligationID string `json:"obligationID"`
 	Revision     uint64 `json:"revision"`
@@ -1183,11 +1190,14 @@ type T212PromptData struct {
 }
 
 // T212buildPromptText returns the <beacon-event> envelope. It has no check
-// name, PR title or branch, and never exceeds 512 bytes.
+// name, PR title or branch, and never exceeds 512 bytes. ID is the explicit
+// notification id, set to the same ObligationKey as obligationID.
 func T212buildPromptText(p T210WakePointer) string {
+	obligationID := T212clamp(T212escapeUntrusted(p.ObligationID), 96)
 	data := T212PromptData{
+		ID:           obligationID,
 		WatchID:      T212clamp(T212escapeUntrusted(p.WatchID), 96),
-		ObligationID: T212clamp(T212escapeUntrusted(p.ObligationID), 96),
+		ObligationID: obligationID,
 		Revision:     p.Revision,
 		VerdictRef:   T212clamp(T212escapeUntrusted(p.VerdictRef), 96),
 	}
