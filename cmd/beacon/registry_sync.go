@@ -15,7 +15,7 @@ package main
 
 import (
 	"context"
-	"database/sql"
+	"flag"
 	"fmt"
 	"sort"
 	"strings"
@@ -79,6 +79,14 @@ func (s registryStoreFuncs) Entries(projectKey string) ([]registryEntry, error) 
 
 func (s registryStoreFuncs) SetStatus(projectKey, agentID, status string) error {
 	return s.setStatus(projectKey, agentID, status)
+}
+
+// registrySyncWriter is the optional persistence capability for the live
+// observation fields. registryDBStore implements it. A stand-in that only
+// implements registryStore keeps its status-only contract and is never asked
+// for a write it cannot answer (ADR 0095).
+type registrySyncWriter interface {
+	SyncExecutor(projectKey, agentID, status, worktree string, lastSeen int64) error
 }
 
 // registryStatusUpdate is one requested status change for an executor.
@@ -188,14 +196,39 @@ func syncRegistry(ctx context.Context, source registrySessionSource, storePort r
 	}
 	liveIDs := liveSessionIDs(sessions)
 
+	// A live session carries its worktree in Location.Directory. Map it by
+	// session id before reading the entries, so the write loop needs no second
+	// session list call (ADR 0095).
+	sessionsByID := make(map[string]opencode.Session, len(sessions))
+	for _, s := range sessions {
+		if id := strings.TrimSpace(s.ID); id != "" {
+			sessionsByID[id] = s
+		}
+	}
+
 	entries, err := storePort.Entries(projectKey)
 	if err != nil {
 		return registrySyncResult{}, fmt.Errorf("registry sync: entries: %w", err)
 	}
 
+	worktreeByAgent := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if s, ok := sessionsByID[strings.TrimSpace(e.SessionID)]; ok {
+			worktreeByAgent[e.AgentID] = s.Location.Directory
+		}
+	}
+
+	observedAt := time.Now().UTC().UnixNano()
+	writer, hasWriter := storePort.(registrySyncWriter)
 	updates := reconcileStale(entries, liveIDs)
 	for _, u := range updates {
-		if err := storePort.SetStatus(projectKey, u.AgentID, u.Status); err != nil {
+		var err error
+		if hasWriter {
+			err = writer.SyncExecutor(projectKey, u.AgentID, u.Status, worktreeByAgent[u.AgentID], observedAt)
+		} else {
+			err = storePort.SetStatus(projectKey, u.AgentID, u.Status)
+		}
+		if err != nil {
 			return registrySyncResult{}, fmt.Errorf("registry sync: set %s to %s: %w", u.AgentID, u.Status, err)
 		}
 	}
@@ -219,6 +252,11 @@ type registryDBStore struct {
 }
 
 func (s registryDBStore) Entries(projectKey string) ([]registryEntry, error) {
+	// A registry written by an older binary may still be on the migration 0005
+	// shape. Bring it up to date before the read below selects the sync columns.
+	if err := s.db.EnsureRegistrySchema(); err != nil {
+		return nil, err
+	}
 	records, err := s.db.Executors(projectKey)
 	if err != nil {
 		return nil, err
@@ -231,11 +269,96 @@ func (s registryDBStore) Entries(projectKey string) ([]registryEntry, error) {
 }
 
 func (s registryDBStore) SetStatus(projectKey, agentID, status string) error {
-	return s.db.Write(context.Background(), func(tx *sql.Tx) error {
-		_, err := tx.Exec(`
-			UPDATE agent_registry SET status = ?, updated_at = ?
-			WHERE project_key = ? AND agent_id = ?`,
-			status, time.Now().UTC().UnixNano(), projectKey, agentID)
-		return err
-	})
+	return s.SyncExecutor(projectKey, agentID, status, "", time.Now().UTC().UnixNano())
+}
+
+// SyncExecutor persists the status and the live observation of one executor.
+// The store writes all three columns in one transaction, so a sync pass cannot
+// leave a refreshed status with a stale last_seen or worktree.
+func (s registryDBStore) SyncExecutor(projectKey, agentID, status, worktree string, lastSeen int64) error {
+	return s.db.SyncExecutor(projectKey, agentID, status, worktree, lastSeen)
+}
+
+// ---------------------------------------------------------------------------
+// T5.55: the sync subcommand (ADR 0095).
+//
+// This file owns the comparison and now the CLI that runs it. The command reads
+// session.list through a read-only source and writes registry rows. It has no
+// prompt or session creation port, so it cannot wake a session or start a model
+// while reconciling.
+// ---------------------------------------------------------------------------
+
+// registrySyncOpenSource resolves the live session.list source. The seam keeps
+// the command testable without an opencode server.
+var registrySyncOpenSource = func() (registrySessionSource, error) {
+	return newOpencodePort()
+}
+
+// registrySyncOpenStore opens the process store that owns agent_registry. The
+// same store backs the stop command, so both subcommands read one registry.
+var registrySyncOpenStore = func() (*store.DB, func() error, error) {
+	dir, err := stateDir()
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := openProcessStore(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db, func() error { return db.Close() }, nil
+}
+
+// runRegistrySync reconciles the project registry with the live session list.
+// The project key defaults to the current project and can be overridden when a
+// caller needs to sync a different scope.
+func runRegistrySync(c *CLI, args []string) int {
+	fs := flag.NewFlagSet("registry sync", flag.ContinueOnError)
+	project := fs.String("project", "", "project key (default: current project)")
+	if !parseFlags("registry sync", args, c.errOut, fs) {
+		return 2
+	}
+
+	key := strings.TrimSpace(*project)
+	if key == "" {
+		key = orchestratorProjectKey()
+	}
+	if key == "" {
+		fmt.Fprintf(c.errOut, "beacon registry sync: empty project key, pass --project\n")
+		return 2
+	}
+
+	source, err := registrySyncOpenSource()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry sync: session source: %v\n", err)
+		return 2
+	}
+	db, closeStore, err := registrySyncOpenStore()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry sync: store: %v\n", err)
+		return 2
+	}
+	defer func() { _ = closeStore() }()
+
+	result, err := syncRegistry(context.Background(), source, registryDBStore{db: db}, key)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon registry sync: %v\n", err)
+		return 2
+	}
+
+	fmt.Fprintf(c.out, "project=%s stale=%d active=%d updated=%d\n",
+		result.ProjectKey, len(result.Stale), len(result.Active), len(result.Updated))
+	if len(result.Stale) > 0 {
+		fmt.Fprintf(c.out, "stale: %s\n", strings.Join(result.Stale, " "))
+	}
+	if len(result.Active) > 0 {
+		fmt.Fprintf(c.out, "active: %s\n", strings.Join(result.Active, " "))
+	}
+	if len(result.Updated) > 0 {
+		updates := make([]string, 0, len(result.Updated))
+		for _, u := range result.Updated {
+			updates = append(updates, u.AgentID+"="+u.Status)
+		}
+		fmt.Fprintf(c.out, "updated: %s\n", strings.Join(updates, " "))
+	}
+	return 0
 }

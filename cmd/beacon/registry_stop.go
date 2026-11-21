@@ -209,17 +209,19 @@ var registryStopOpenStore = func() (registryStopStore, func() error, error) {
 	return registryStopDBStore{db: db}, func() error { return db.Close() }, nil
 }
 
-// runRegistry dispatches the registry subcommands. T5.56 owns stop; the check
-// and sync seams stay in their own cards until their dispatch is wired.
+// runRegistry dispatches the registry subcommands. T5.56 owns stop and T5.55
+// owns sync; the check seam stays in its own card until its dispatch is wired.
 func runRegistry(c *CLI, args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintf(c.errOut, "beacon registry: нужна подкоманда (stop)\n")
+		fmt.Fprintf(c.errOut, "beacon registry: нужна подкоманда (stop|sync)\n")
 		writeUsage(c.errOut)
 		return 2
 	}
 	switch args[0] {
 	case "stop":
 		return runRegistryStop(c, args[1:])
+	case "sync":
+		return runRegistrySync(c, args[1:])
 	default:
 		fmt.Fprintf(c.errOut, "beacon registry: неизвестная подкоманда %q\n", args[0])
 		writeUsage(c.errOut)
