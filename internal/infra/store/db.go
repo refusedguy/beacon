@@ -59,6 +59,10 @@ type DB struct {
 	closed    bool
 	closeOnce sync.Once
 
+	// watchers tracks the goroutines started by WatchOutcome so Close can join
+	// them before it closes the pools they read from.
+	watchers sync.WaitGroup
+
 	version int
 
 	// progress is non-nil only on a DB opened with OpenProduction. It makes
@@ -207,6 +211,7 @@ func (d *DB) Close() error {
 		d.mu.Unlock()
 		close(d.closing)
 		<-d.done
+		d.watchers.Wait()
 		err = errors.Join(
 			d.writeConn.Close(),
 			d.readDB.Close(),
@@ -1042,11 +1047,14 @@ func (d *DB) WatchOutcome(ctx context.Context, key string) (<-chan WatchOutcome,
 		ctx = context.Background()
 	}
 	d.mu.RLock()
-	closed := d.closed
-	d.mu.RUnlock()
-	if closed {
+	if d.closed {
+		d.mu.RUnlock()
 		return nil, errClosed
 	}
+	// Register under the same lock Close uses to set closed, so no watcher can
+	// be added after Close has begun waiting for them.
+	d.watchers.Add(1)
+	d.mu.RUnlock()
 
 	out := make(chan WatchOutcome, 1)
 	go d.watchOutcome(ctx, key, out)
@@ -1054,6 +1062,7 @@ func (d *DB) WatchOutcome(ctx context.Context, key string) (<-chan WatchOutcome,
 }
 
 func (d *DB) watchOutcome(ctx context.Context, key string, out chan<- WatchOutcome) {
+	defer d.watchers.Done()
 	defer close(out)
 	ticker := time.NewTicker(outcomePollInterval)
 	defer ticker.Stop()
