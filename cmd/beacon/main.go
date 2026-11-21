@@ -287,6 +287,39 @@ func init() {
 	}
 }
 
+// registryRunner holds the registry command implementation. The stop path
+// returns a verdict and hands it to printRegistryStopVerdict, so the CLI never
+// prints success before the stopped state is saved (ADR 0091).
+var registryRunner = func(c *CLI, args []string) int { return runRegistry(c, args) }
+
+// RegisterRegistry installs the registry command implementation, mirroring
+// RegisterWatch and RegisterTask.
+func RegisterRegistry(fn func(*CLI, []string) int) { registryRunner = fn }
+
+// printRegistryStopVerdict turns one checked-stop verdict into CLI output and
+// an exit code. A refusal and an uncertain stop are different answers. Only a
+// saved state prints the allowed and stopped lines, and they print together.
+func printRegistryStopVerdict(c *CLI, verdict registryStopVerdict) int {
+	switch verdict.Outcome {
+	case stopOutcomeStopped:
+		want := verdict.Selection
+		fmt.Fprintf(c.out, "stop_allowed watch=%s revision=%d session=%s\n",
+			want.WatchID, want.Revision, want.SessionID)
+		fmt.Fprintf(c.out, "stopped watch=%s revision=%d session=%s\n",
+			want.WatchID, want.Revision, want.SessionID)
+		return 0
+	case stopOutcomeRefused:
+		fmt.Fprintf(c.out, "stop_refused reason=%s detail=%s\n", verdict.Reason, verdict.Detail)
+		return 1
+	case stopOutcomeUncertain:
+		fmt.Fprintf(c.out, "stop_uncertain stopPhase=%s reason=%s detail=%s\n",
+			verdict.StopPhase, verdict.Reason, verdict.Detail)
+		return 2
+	default:
+		return 2
+	}
+}
+
 func (c *CLI) dispatch(args []string) int {
 	switch args[0] {
 	case "-h", "--help", "help":
