@@ -29,7 +29,7 @@ WakeSender и FallbackWakeSender объединены в один func-тип с
 
 PR: https://github.com/refusedguy/beacon/pull/1189
 
-Проверка:
+Локальные проверки:
 - `gofmt -w` на восьми изменённых Go-файлах.
 - `rg` по `internal/` и `cmd/`: `NotifierFunc`, `ParentNotifierFunc`, `FallbackWakeSender` и `t3114AlivePID` отсутствуют.
 - `go test`, `go build` и `beacon gates` локально не запускались. Подтверждение сборки и тестов даёт CI PR 1189.
