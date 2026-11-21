@@ -1,5 +1,5 @@
 # ARDH-15. Убрать импорты infra из слоя app
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/orchestrator/orchestrator.go, internal/app/orchestrator/daemon.go, internal/app/orchestrator/store.go, internal/app/session/registry.go, internal/app/command/processor.go, internal/app/taskcli/service.go, cmd/beacon/mcp.go
@@ -27,3 +27,6 @@ baseline: 9 продуктовых импортов internal/infra/* в internal
 - internal/app/taskcli/service.go и internal/app/tasks/reminders.go, импорт taskstore. taskcli использует LoadCards, Card, LockPath и другие функции пакета как библиотеку. В tasks порты и типы объявлены в taskstore, адаптер `ReminderStore` живёт там же. Перенос требует перевода адаптера в cmd и правки его тестов. Шаг отложен до отдельного PR с прогоном CI.
 
 После этого PR выполнен `gofmt -w` на изменённых файлах .go. Команды `go test`, `go build` и gates не запускались локально по правилам AGENTS.md. Окончательная проверка в CI.
+
+Итог: Уже влито в PR #1177
+Доказательство: 6b7ce52a ancestor of origin/main

@@ -1,5 +1,5 @@
 # ARDH-21. Свести два формата ошибки HTTP к одному типу
-Статус: todo
+Статус: in_progress
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/server/http/error.go, internal/infra/httpapi/server.go
@@ -19,3 +19,6 @@
 Делегировать некому. Два формата и раньше не совпадали по байтам. У `httproute.Error` не было поля `ok`. Коды были в нижнем регистре, например `invalid_argument` и `unauthorized`. Статус выводился из кода через `Code.Status()`. Content-Type был `application/json`. У `httpapi` коды пишутся в верхнем регистре, например `UNAUTHORIZED` и `INVALID_INPUT`. Статус передаёт каждый вызов `writeError`. Тело содержит `"ok":false`. Content-Type равен `application/json; charset=utf-8`. Возврат удалённого пакета вернул бы мёртвый код и изменил тела ответов.
 
 Код не менялся. Формат зафиксирован тестом `internal/infra/httpapi/error_format_test.go`. Тест проверяет статус, Content-Type и точные байты тела. Проверки `go test`, `go build` и `beacon gates` запускает CI на PR.
+
+Состояние: needs_input
+Вопрос: Premise устарел: CLEAN-02 (d4f7b326) удалил пакет httproute.Error, второго формата ошибки в origin/main нет. Подтвердите закрытие карточки как неактуальной или сформулируйте новую цель; делегировать некому, формат httpapi зафиксирован тестом error_format_test.go.

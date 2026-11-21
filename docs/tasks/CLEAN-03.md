@@ -1,5 +1,5 @@
 # CLEAN-03. Удалить мёртвые порты mcp.Bridge, Notifier и ControlPlaneStore
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/server.go, internal/infra/mcp/tool_watch_pr.go, internal/infra/mcp/tool_watch_pr_test.go, internal/domain/types.go, internal/domain/types_test.go
@@ -12,3 +12,6 @@
 Шаги: Удалить объявления и ветки рассылки, убрать тесты, которые держали только эти символы. Проверить, что mcp.NewServerWithDeps и восемь инструментов не изменились.
 Проверка: CI зелёный. tools/list contract test проходит без обновления золотых значений.
 Приёмка: Символов Bridge, BridgeRequest, WithBridges, ControlPlaneStore и Notifier нет в продакшен-коде и тестах. Контракт из восьми инструментов не изменился.
+
+Итог: Уже влито в PR #1207
+Доказательство: 0205134e в origin/main, merge-base --is-ancestor=0

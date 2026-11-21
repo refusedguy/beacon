@@ -1,5 +1,5 @@
 # ATX-15. Дождаться detached goroutine webhook в Server.Close
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/webhook/receiver.go
@@ -12,3 +12,6 @@
 Шаги: Добавить sync.WaitGroup в Receiver. Add перед go h.record, Done в record. В Server.Close после Shutdown ждать группу с таймаутом. Либо заменить горутину на один worker с ограниченной очередью.
 Проверка: CI зелёный. Тест с блокирующим recorder подтверждает, что Close дожидается всех N записей. go test -race не показывает рост goroutine.
 Приёмка: Close возвращается только после завершения всех record. Запись в закрытый store исключена.
+
+Итог: Уже влито в PR #1226
+Доказательство: 43a0230f в origin/main, merge-base --is-ancestor=0
