@@ -197,7 +197,7 @@ var (
 // mcpDaemonInterval is the pass interval of the in-process daemon. The default
 // is the same three minutes as `beacon daemon`; BEACON_DAEMON_INTERVAL overrides
 // it. A broken override falls back to the default so a bad setting cannot stop
-// the loop.
+// the loop, but the ignored value reaches the log.
 func mcpDaemonInterval() time.Duration {
 	raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv))
 	if raw == "" {
@@ -205,6 +205,7 @@ func mcpDaemonInterval() time.Duration {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		observe.WarnConfig(daemonIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
 		return orchestrator.DaemonInterval
 	}
 	return d
@@ -220,7 +221,8 @@ const defaultVerdictPollInterval = 30 * time.Second
 
 // verdictPollIntervalEnv overrides the poller cadence at the CLI boundary, the
 // same way BEACON_DAEMON_INTERVAL overrides the daemon cycle. A broken value
-// falls back to the default so a bad setting cannot stall waiting callers.
+// falls back to the default so a bad setting cannot stall waiting callers, and
+// the ignored value reaches the log.
 const verdictPollIntervalEnv = "BEACON_VERDICT_POLL_INTERVAL"
 
 func verdictPollInterval() time.Duration {
@@ -230,6 +232,7 @@ func verdictPollInterval() time.Duration {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		observe.WarnConfig(verdictPollIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
 		return defaultVerdictPollInterval
 	}
 	return d
@@ -319,9 +322,11 @@ func readInitEventConfig() initEventConfig {
 	case "1", "true", "yes", "on":
 		cfg.bypass = true
 	}
-	if raw := os.Getenv("BEACON_INIT_EVENT_TIMEOUT"); raw != "" {
+	if raw := strings.TrimSpace(os.Getenv("BEACON_INIT_EVENT_TIMEOUT")); raw != "" {
 		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
 			cfg.timeout = d
+		} else {
+			observe.WarnConfig("BEACON_INIT_EVENT_TIMEOUT", raw, "ожидается положительная длительность, используется значение по умолчанию")
 		}
 	}
 	return cfg
@@ -361,9 +366,11 @@ func readSyncCallConfig() syncCallConfig {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
+		observe.WarnConfig("BEACON_SYNC_CALL_TIMEOUT", raw, "ожидается положительная длительность, используется значение по умолчанию")
 		return cfg
 	}
 	if d > syncCallTimeoutMax {
+		observe.WarnConfig("BEACON_SYNC_CALL_TIMEOUT", raw, "значение больше максимума, используется "+syncCallTimeoutMax.String())
 		d = syncCallTimeoutMax
 	}
 	cfg.after = d

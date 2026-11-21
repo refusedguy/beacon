@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
@@ -113,7 +114,9 @@ func saveAttachSessions(st attachSessionState) error {
 // rememberAttachSession saves sessionID for taskID. A second attach for the
 // same task replaces the record instead of stacking duplicates, so resume
 // always finds the most recent session. BEACON_TASK_DEADLINE, when set as an
-// RFC3339 instant, records the task's hard limit without deleting the id.
+// RFC3339 instant, records the task's hard limit without deleting the id. An
+// invalid deadline is an error: Beacon refuses to write a session record that
+// silently lost its hard limit.
 func rememberAttachSession(taskID, sessionID string, now time.Time) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
@@ -126,9 +129,12 @@ func rememberAttachSession(taskID, sessionID string, now time.Time) error {
 
 	rec := attachSession{TaskID: taskID, SessionID: sessionID, SavedAt: now.UTC()}
 	if raw := strings.TrimSpace(os.Getenv("BEACON_TASK_DEADLINE")); raw != "" {
-		if at, err := time.Parse(time.RFC3339, raw); err == nil {
-			rec.DeadlineAt = at.UTC()
+		at, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			observe.WarnConfig("BEACON_TASK_DEADLINE", raw, "ожидается RFC3339")
+			return fmt.Errorf("неверный BEACON_TASK_DEADLINE=%q: ожидается RFC3339", raw)
 		}
+		rec.DeadlineAt = at.UTC()
 	}
 
 	st, err := loadAttachSessions()
