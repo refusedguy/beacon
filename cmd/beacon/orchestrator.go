@@ -152,7 +152,7 @@ func renderBindDigest(out, errOut io.Writer, s bindStore, session, projectKey st
 			if w.Status == domain.StatusBlocked || w.Blocked != nil {
 				reason := ""
 				if w.Blocked != nil {
-					reason = w.Blocked.Reason
+					reason = string(w.Blocked.Reason)
 				}
 				fmt.Fprintf(out, "BLOCKED watch=%s pr=%d repo=%s reason=%s\n", w.ID, w.PR, w.Repo, reason)
 			}

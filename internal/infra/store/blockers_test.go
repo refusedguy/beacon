@@ -187,7 +187,7 @@ func TestResolveBlockerUnblocksWatches(t *testing.T) {
 			BlockerID: b.ID,
 			Revision:  4,
 			Blocked: &domain.BlockedInfo{
-				Reason:       "ci failed",
+				Reason:       domain.BlockReasonBaseChecksFailed,
 				FailedChecks: []string{"ci/test"},
 				Since:        now,
 			},
@@ -259,7 +259,7 @@ func TestResolveBlockersByBaseGreen(t *testing.T) {
 		if err := d.SaveWatch(domain.Watch{
 			ID: id, Status: domain.StatusBlocked, Verdict: domain.VerdictBlocked,
 			BlockerID: green.ID,
-			Blocked:   &domain.BlockedInfo{FailedChecks: []string{"ci/test"}},
+			Blocked:   &domain.BlockedInfo{Reason: domain.BlockReasonBaseChecksFailed, FailedChecks: []string{"ci/test"}},
 		}); err != nil {
 			t.Fatalf("SaveWatch(%s): %v", id, err)
 		}

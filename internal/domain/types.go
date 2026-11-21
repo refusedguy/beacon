@@ -276,6 +276,38 @@ type Subscriber struct {
 	LastActivity   time.Time   `json:"lastActivity"`
 }
 
+// BlockReason is the machine-readable cause of a block. The set is closed so
+// no free-text sentence can reach a log line or the UI (BCX-14). Callers that
+// persist a block must use one of these codes.
+type BlockReason string
+
+const (
+	// BlockReasonNotMine marks a Watch blocked by a blocked:not_mine ack.
+	BlockReasonNotMine BlockReason = "not_mine"
+	// BlockReasonResolved is the code for a confirmed fix. A resolve ack clears
+	// the block instead of writing this code, but it stays in the closed set so
+	// every downstream consumer can handle the same vocabulary.
+	BlockReasonResolved BlockReason = "resolved"
+	// BlockReasonBaseChecksFailed marks a Watch blocked by checks that were
+	// already red on the base branch.
+	BlockReasonBaseChecksFailed BlockReason = "base_checks_failed"
+	// BlockReasonRebaseBudgetExhausted marks a Watch blocked after its rebase
+	// budget ran out. The budget count itself is carried by FailedChecks.
+	BlockReasonRebaseBudgetExhausted BlockReason = "rebase_budget_exhausted"
+)
+
+// Valid reports whether r is one of the defined block reasons. The zero value
+// fails closed, so a block with an unset reason is never persisted.
+func (r BlockReason) Valid() bool {
+	switch r {
+	case BlockReasonNotMine, BlockReasonResolved,
+		BlockReasonBaseChecksFailed, BlockReasonRebaseBudgetExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
 // BlockedInfo records why a Watch is blocked, which checks failed, when the
 // block started and which actor or rule set it. It is stored as JSON on the
 // Watch, so a legacy payload without the field decodes to nil and needs no
@@ -283,11 +315,11 @@ type Subscriber struct {
 // block. It lives on the block record, so an unblock that clears Blocked also
 // resets the budget and the next block starts from zero.
 type BlockedInfo struct {
-	Reason       string    `json:"reason"`
-	FailedChecks []string  `json:"failedChecks,omitempty"`
-	Since        time.Time `json:"since"`
-	BlockedBy    string    `json:"blockedBy"`
-	FixAttempts  int       `json:"fixAttempts,omitempty"`
+	Reason       BlockReason `json:"reason"`
+	FailedChecks []string    `json:"failedChecks,omitempty"`
+	Since        time.Time   `json:"since"`
+	BlockedBy    string      `json:"blockedBy"`
+	FixAttempts  int         `json:"fixAttempts,omitempty"`
 }
 
 // BlockerIncident is one control-plane record for a failed check on the base

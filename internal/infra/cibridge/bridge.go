@@ -633,7 +633,7 @@ func (b *Bridge) claimRebase(w domain.Watch) bool {
 // every affected Watch instead of spending a rebase on each of them.
 func (b *Bridge) blockRebaseExhausted(ctx context.Context, w domain.Watch, now time.Time, cycleID string) int {
 	info := domain.BlockedInfo{
-		Reason:       fmt.Sprintf("rebase budget of %d exhausted", rebaseBudget(w)),
+		Reason:       domain.BlockReasonRebaseBudgetExhausted,
 		FailedChecks: []string{"rebase-budget-exhausted"},
 		Since:        now,
 		BlockedBy:    "cibridge",

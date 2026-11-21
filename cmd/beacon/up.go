@@ -455,7 +455,7 @@ func renderInspectText(ctx context.Context, st upStatusPort, query string) strin
 			w.ID, w.PR, w.Status, w.Verdict, w.Revision)
 		if w.Blocked != nil {
 			fmt.Fprintf(&b, "  blocked reason=%s checks=[%s] fixAttempts=%d\n",
-				w.Blocked.Reason, strings.Join(w.Blocked.FailedChecks, ","), w.Blocked.FixAttempts)
+				string(w.Blocked.Reason), strings.Join(w.Blocked.FailedChecks, ","), w.Blocked.FixAttempts)
 		}
 		for _, sub := range w.Subscribers {
 			fmt.Fprintf(&b, "  subscriber=%s role=%s phase=%s\n", sub.ID, sub.Role, sub.Phase)

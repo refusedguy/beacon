@@ -564,7 +564,7 @@ func (b *verdictApplier) applyBlocked(ctx context.Context, w domain.Watch, obs c
 	base := baseRefOf(w)
 	failed := realFailedNames(obs.pr.Checks)
 	info := domain.BlockedInfo{
-		Reason:       "failed checks already present on base branch",
+		Reason:       domain.BlockReasonBaseChecksFailed,
 		FailedChecks: failed,
 		Since:        now,
 		BlockedBy:    "cibridge",

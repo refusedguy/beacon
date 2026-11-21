@@ -382,11 +382,12 @@ func parkOnFailure(w Watch, e Event) (Watch, []Effect) {
 // blockWatch moves a live Watch to blocked. It is idempotent: a second block
 // changes nothing, including the original BlockedInfo. Blocking keeps the ID
 // and subscribers, clears no obligation and stages no effect, so no subscriber
-// is woken. A closed Watch cannot be blocked, and a block without details is
-// ignored.
+// is woken. A closed Watch cannot be blocked, and a block without details or
+// with a reason outside the closed set is ignored, so only known codes reach
+// logs and the UI.
 func blockWatch(w Watch, e Event) (Watch, []Effect) {
 	next := cloneWatch(w)
-	if w.Status == StatusClosed || w.Status == StatusBlocked || e.Blocked == nil {
+	if w.Status == StatusClosed || w.Status == StatusBlocked || e.Blocked == nil || !e.Blocked.Reason.Valid() {
 		return next, nil
 	}
 	next.Status = StatusBlocked

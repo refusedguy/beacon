@@ -241,7 +241,7 @@ func renderInspectTable(w io.Writer, view inspectView) {
 	for _, watch := range view.Watches {
 		reason := ""
 		if watch.Blocked != nil {
-			reason = watch.Blocked.Reason
+			reason = string(watch.Blocked.Reason)
 		}
 		fmt.Fprintf(w, "WATCH id=%s pr=%d repo=%s status=%s verdict=%s revision=%d blocked=%s\n",
 			watch.ID, watch.PR, watch.Repo, watch.Status, watch.Verdict, watch.Revision, reason)

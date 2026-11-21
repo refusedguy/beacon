@@ -165,8 +165,8 @@ func Render(s Snapshot) string {
 	})
 	for _, w := range watches {
 		blocked := ""
-		if w.Blocked != nil && w.Blocked.Reason != "" {
-			blocked = " blocked=" + w.Blocked.Reason
+		if w.Blocked != nil && w.Blocked.Reason.Valid() {
+			blocked = " blocked=" + string(w.Blocked.Reason)
 		}
 		fmt.Fprintf(&b, "#%d %s %s verdict=%s rev=%d%s\n", w.PR, shortSHA(w.HeadSHA), w.Status, w.Verdict, w.Revision, blocked)
 	}

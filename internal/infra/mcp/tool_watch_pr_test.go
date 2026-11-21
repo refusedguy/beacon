@@ -1201,7 +1201,7 @@ func seedBlockedWatch(t *testing.T, store *memStore, id string) domain.Watch {
 		HeadSHA: "blocked-" + id,
 		Status:  domain.StatusBlocked,
 		Verdict: domain.VerdictBlocked,
-		Blocked: &domain.BlockedInfo{Reason: "чужой тест", Since: time.Now()},
+		Blocked: &domain.BlockedInfo{Reason: domain.BlockReasonNotMine, Since: time.Now()},
 	}
 	if err := store.SaveWatch(w); err != nil {
 		t.Fatalf("seed blocked watch: %v", err)

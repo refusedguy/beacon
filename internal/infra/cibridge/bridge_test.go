@@ -471,7 +471,7 @@ func blockedTestWatch(id string, pr int, subscribers ...domain.Subscriber) domai
 		Verdict:  domain.VerdictBlocked,
 		Revision: 3,
 		Blocked: &domain.BlockedInfo{
-			Reason:       "two required checks failed outside executor's diff",
+			Reason:       domain.BlockReasonBaseChecksFailed,
 			FailedChecks: []string{"ci/test", "gates"},
 			Since:        time.Unix(1, 0),
 			BlockedBy:    "ci-bridge",

@@ -428,7 +428,7 @@ func TestStoreBlockedWatchSurvivesReopen(t *testing.T) {
 		Verdict:  domain.VerdictBlocked,
 		Revision: 4,
 		Blocked: &domain.BlockedInfo{
-			Reason:       "two required checks failed",
+			Reason:       domain.BlockReasonBaseChecksFailed,
 			FailedChecks: []string{"ci/test", "gates"},
 			Since:        since,
 			BlockedBy:    "ci-bridge",
