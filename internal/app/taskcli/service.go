@@ -32,8 +32,9 @@ type Config struct {
 	Root     string
 
 	// LockRetryInterval задаёт паузу между попытками взять общий файловый
-	// замок. Ноль или отрицательное значение включает значение по умолчанию.
-	// Тесты ставят короткий интервал, не меняя production-путь.
+	// замок. Ноль и отрицательное значение включают поведение по умолчанию:
+	// вызов идёт через taskstore.AcquireLock с его шагом 100 мс. Тесты ставят
+	// короткий интервал, не меняя production-путь.
 	LockRetryInterval time.Duration
 }
 
@@ -50,16 +51,13 @@ type cardLock interface {
 	Release() error
 }
 
-// acquireLock берёт общий замок карточек. При интервале по умолчанию вызов
-// идёт через taskstore, поэтому production-путь не меняется. Короткий
-// интервал включает локальную реализацию с тем же flock и числом попыток.
+// acquireLock берёт общий замок карточек. С интервалом по умолчанию вызов
+// идёт через taskstore, поэтому production-путь не меняется. Другой интервал
+// включает локальную реализацию с тем же flock, проверкой inode и 50 попытками.
 func (s *Service) acquireLock() (cardLock, error) {
 	path := LockPath(s.Cfg.StateDir, s.Cfg.Root)
 	interval := s.Cfg.LockRetryInterval
-	if interval <= 0 {
-		interval = DefaultLockRetryInterval
-	}
-	if interval == DefaultLockRetryInterval {
+	if interval <= 0 || interval == DefaultLockRetryInterval {
 		return AcquireLock(path, s.Cfg.Root)
 	}
 	return acquireLockWithInterval(path, s.Cfg.Root, interval)
@@ -90,8 +88,8 @@ func (l *flockLock) Release() error {
 }
 
 // acquireLockWithInterval повторяет логику taskstore.AcquireLock, но ждёт
-// retry между попытками вместо фиксированных 100 мс. Замок остаётся тем же:
-// flock на открытом файле, проверка inode и 50 попыток.
+// заданный интервал между попытками. Замок остаётся тем же: flock на открытом
+// файле, проверка current inode и 50 попыток. Проверка конкуренции не слабеет.
 func acquireLockWithInterval(lockPath, root string, retry time.Duration) (cardLock, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
 		return nil, Startupf("не создан каталог состояния: %v", err)
