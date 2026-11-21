@@ -16,6 +16,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -782,5 +783,83 @@ func TestMCPDaemonInterval(t *testing.T) {
 		if got := mcpDaemonInterval(); got != orchestrator.DaemonInterval {
 			t.Fatalf("значение %q дало %s, ожидался дефолт %s", raw, got, orchestrator.DaemonInterval)
 		}
+	}
+}
+
+// TestHTTPStateProviderSnapshotHistoryBoundsByTimeAndCount proves that the
+// production provider publishes the newest closed Watches only, with the
+// transport's 30-entry cap and the 24-hour window enforced at the source.
+func TestHTTPStateProviderSnapshotHistoryBoundsByTimeAndCount(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	now := time.Now().UTC()
+	for i := 0; i < snapshotHistoryLimit+5; i++ {
+		w := domain.Watch{
+			ID:          fmt.Sprintf("recent-%02d", i),
+			Repo:        "refusedguy/beacon",
+			PR:          i + 1,
+			HeadSHA:     fmt.Sprintf("sha-%02d", i),
+			Status:      domain.StatusClosed,
+			Verdict:     domain.VerdictMerged,
+			CloseReason: string(domain.CloseReasonMerged),
+			CreatedAt:   now.Add(-25 * time.Hour),
+			ClosedAt:    now.Add(-time.Duration(i) * time.Minute),
+		}
+		if err := db.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch %s: %v", w.ID, err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		w := domain.Watch{
+			ID:          fmt.Sprintf("old-%d", i),
+			Repo:        "refusedguy/beacon",
+			PR:          100 + i,
+			Status:      domain.StatusClosed,
+			Verdict:     domain.VerdictTimeout,
+			CloseReason: "timeout",
+			ClosedAt:    now.Add(-25*time.Hour - time.Duration(i)*time.Hour),
+		}
+		if err := db.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch %s: %v", w.ID, err)
+		}
+	}
+	live := domain.Watch{
+		ID: "live", Repo: "refusedguy/beacon", Status: domain.StatusWatching,
+		Verdict: domain.VerdictWatching, ClosedAt: now,
+	}
+	if err := db.SaveWatch(live); err != nil {
+		t.Fatalf("SaveWatch live: %v", err)
+	}
+
+	history, err := (httpStateProvider{db: db}).SnapshotHistory(context.Background())
+	if err != nil {
+		t.Fatalf("SnapshotHistory: %v", err)
+	}
+	if len(history.RecentWatches) != snapshotHistoryLimit {
+		t.Fatalf("recentWatches length = %d, want %d", len(history.RecentWatches), snapshotHistoryLimit)
+	}
+	window := now.Add(-snapshotHistoryWindow)
+	for i, got := range history.RecentWatches {
+		if want := fmt.Sprintf("recent-%02d", i); got.ID != want {
+			t.Fatalf("recentWatches[%d].ID = %q, want %q", i, got.ID, want)
+		}
+		if got.ClosedAt.Before(window) {
+			t.Fatalf("recentWatches[%d].ClosedAt = %s, outside the 24h window", i, got.ClosedAt)
+		}
+		if got.Outcome != httpapi.OutcomeMerged {
+			t.Fatalf("recentWatches[%d].Outcome = %q, want %q", i, got.Outcome, httpapi.OutcomeMerged)
+		}
+	}
+	if history.HourlyStats.Merges != snapshotHistoryLimit {
+		t.Fatalf("hourlyStats.merges = %d, want %d", history.HourlyStats.Merges, snapshotHistoryLimit)
+	}
+
+	empty, err := (httpStateProvider{}).SnapshotHistory(context.Background())
+	if err != nil || len(empty.RecentWatches) != 0 {
+		t.Fatalf("SnapshotHistory without store = %+v, %v", empty, err)
 	}
 }
