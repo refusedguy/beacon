@@ -44,6 +44,61 @@ const (
 	VerdictRecheck Verdict = "recheck"
 )
 
+// ---- Verdict contract ------------------------------------------------------
+//
+// Verdict and its reasons are defined once, here. The layer matrix (ADR 0005)
+// forbids internal/app from importing internal/domain, so adapters keep small
+// mirrors of these strings. Verdicts is the authoritative set. A test in
+// internal/app/orchestrator compares every mirror against it, so a value added
+// only to a mirror fails CI.
+//
+// Verdict values and the constant that owns each one:
+//
+//	watching, ready, rebase, retry, keep_working, timeout, merged, closed,
+//	blocked, recheck   (this file)
+//	needs_input, parked, accepted   (transition.go)
+//	fail, wait, wait_dependency, green_blocked   (this file, below)
+//
+// Machine-readable reasons carried by blocked or stopped Watches are owned by
+// their domain constants and listed here so adapters can find them:
+//
+//	blocked:not_mine, blocked:resolved   (beacon_ack decisions, ADR 0072)
+//	stale_base_after_main_fix            (ReasonStaleBaseAfterMainFix, verdict.go)
+//	deadline_exceeded                    (DeadlineReasonExceeded, this file)
+//	limit, budget, crash, error          (ParkReason*, transition.go)
+//	head_changed, cancelled, merged, closed, accepted   (CloseReason*, transition.go)
+//	unknown                              (TombstoneReasonUnknown, this file)
+
+const (
+	// VerdictFail is set when a step fails and the Watch is left for the
+	// subscriber. The orchestrator writes it after matching a decision.
+	VerdictFail Verdict = "fail"
+	// VerdictWait is the in-process hold while a dependency stays unresolved.
+	// It carries a reason in the Action recorded for the Watch.
+	VerdictWait Verdict = "wait"
+	// VerdictWaitDependency is the persisted form of VerdictWait, written to
+	// the Watch so the next tick re-checks the dependency instead of dropping
+	// the Watch.
+	VerdictWaitDependency Verdict = "wait_dependency"
+	// VerdictGreenBlocked means checks are green but an orchestrator slot is
+	// held by an open blocker (ADR 0072). It frees no slot until the blocker
+	// closes.
+	VerdictGreenBlocked Verdict = "green_blocked"
+)
+
+// Verdicts returns every verdict the system can emit, in one place. It is the
+// source the mirror-equality test reads. Add a new verdict here first, then
+// update the app mirrors so the test stays green. The returned slice is a copy.
+func Verdicts() []Verdict {
+	return []Verdict{
+		VerdictWatching, VerdictReady, VerdictRebase, VerdictRetry,
+		VerdictKeepWorking, VerdictTimeout, VerdictMerged, VerdictClosed,
+		VerdictBlocked, VerdictRecheck,
+		VerdictNeedsInput, VerdictParked, VerdictAccepted,
+		VerdictFail, VerdictWait, VerdictWaitDependency, VerdictGreenBlocked,
+	}
+}
+
 // Role is the subscriber role on a Watch.
 type Role string
 

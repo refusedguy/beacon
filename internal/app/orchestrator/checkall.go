@@ -26,8 +26,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Verdict values produced by this pass. They are the same strings the domain
-// state machine and cibridge use, kept as a mirror for the layer boundary.
+// Verdict values produced by this pass. This is a mirror of the domain verdict
+// contract in internal/domain/types.go. ADR 0005 forbids internal/app from
+// importing internal/domain, so the strings are repeated here and a test in
+// this package compares them with domain.Verdicts(). CheckVerdictWatching is
+// the only value the pass treats as non-terminal.
 type Verdict string
 
 const (
@@ -41,6 +44,12 @@ const (
 	// delivered pointer.
 	wakeSessionPrefix = "ses_"
 )
+
+// CheckVerdicts returns the verdict values this pass can publish. Keeping the
+// set in one value lets the equality test compare it with domain.Verdicts().
+func CheckVerdicts() []Verdict {
+	return []Verdict{CheckVerdictWatching, CheckVerdictReady, CheckVerdictRetry}
+}
 
 // ValidateWakeTarget checks that a notify target can address an OpenCode
 // session. The orchestrator subscriber of a Watch is the wake recipient, so a

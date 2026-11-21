@@ -79,13 +79,15 @@ type MergeSnapshot struct {
 
 // Machine-readable next actions attached to a result. An agent branches on
 // nextAction, not on prose: the four wake verdicts map one-to-one, and every
-// other verdict reports "wait" with an explanatory hint.
+// other verdict reports "wait" with an explanatory hint. The values come from
+// the domain verdict contract in internal/domain/types.go, so a rename changes
+// this schema with the verdict.
 const (
-	NextActionKeepWorking = "keep_working"
-	NextActionRebase      = "rebase"
-	NextActionRetry       = "retry"
-	NextActionBlocked     = "blocked"
-	NextActionWait        = "wait"
+	NextActionKeepWorking = string(domain.VerdictKeepWorking)
+	NextActionRebase      = string(domain.VerdictRebase)
+	NextActionRetry       = string(domain.VerdictRetry)
+	NextActionBlocked     = string(domain.VerdictBlocked)
+	NextActionWait        = string(domain.VerdictWait)
 )
 
 // Commands paired with an action. They are literal shell lines so a client can

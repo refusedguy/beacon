@@ -21,6 +21,9 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
+// The verdict strings below mirror internal/domain/types.go. ADR 0005 forbids
+// app from importing domain, so a test in this package checks the values
+// against domain.Verdicts().
 const (
 	// VerdictReady is the only verdict that permits a merge.
 	VerdictReady = "ready"
@@ -37,6 +40,11 @@ const (
 	VerdictRetry = "retry"
 	VerdictFail  = "fail"
 )
+
+// OrchestratorVerdicts returns the verdict strings the merge loop can emit.
+func OrchestratorVerdicts() []string {
+	return []string{VerdictReady, VerdictWait, VerdictWaitDependency, VerdictRetry, VerdictFail}
+}
 
 // Action kinds recorded in Result.Actions.
 const (
