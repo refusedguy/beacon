@@ -861,7 +861,7 @@ func run() int {
 		results = append(results, runWakeEvalSet(ctx, obs)...)
 	}
 
-	// B01-B04: контракт blocked Watch. Модель и негативные контроли описаны
+	// B01-B05: контракт blocked Watch. Модель и негативные контроли описаны
 	// в docs/evals/blocked-watch.md.
 	b01Actual, b01Pass := evalB01BlockDecision()
 	record("B01_block_decision",
@@ -882,6 +882,11 @@ func run() int {
 	record("B04_unknown_and_unblock",
 		"неизвестный decision и неизвестный reason не блокируют; unblock возвращает Watch в опрос",
 		b04Actual, b04Pass)
+
+	b05Actual, b05Pass := evalB05PlainAckVsBlockedWake()
+	record("B05_plain_ack_vs_blocked_wake",
+		"plain ack ставит claimedAt и не глушит wake; blocked:not_mine останавливает wake демона и шлёт wake оркестратору; resolve возвращает wake",
+		b05Actual, b05Pass)
 
 	// OW01-OW03: self-awareness оркестратора. Сводка активных Watch по вердиктам
 	// и идемпотентная подписка на все Watch проекта. Модель и негативные контроли
@@ -1356,14 +1361,16 @@ func evalW18RebaseConflictWake() (string, bool) {
 	return actual, pass
 }
 
-// ---- B01-B04: контракт blocked Watch ----
+// ---- B01-B05: контракт blocked Watch ----
 //
 // Production-код блокировки живёт в отдельных карточках, поэтому eval фиксирует
 // контракт исполняемой моделью, как W14-W18 фиксируют ADR 0072. Наблюдаются
-// только исходы, которые увидит вызывающий: статус и причину Watch, число опросов
-// и retry в проходе CI-моста, поля wake для оркестратора. Карточки перенесут
-// проверку на реальный beacon_ack, CI-мост и доставку wake, сохранив имена кейсов
-// и негативные контроли. Подробности в docs/evals/blocked-watch.md.
+// только исходы, которые увидит вызывающий: статус и причину Watch, пометку
+// plain ack, число опросов и retry в проходе CI-моста, два маршрута wake.
+// Заблокированный Watch не опрашивается и не шлёт wake исполнителю, но шлёт wake
+// оркестратору. Карточки перенесут проверку на реальный beacon_ack, CI-мост и
+// доставку wake, сохранив имена кейсов и негативные контроли. Подробности в
+// docs/evals/blocked-watch.md.
 
 const (
 	blockStatusWatching = "watching"
@@ -1375,6 +1382,9 @@ const (
 )
 
 // blockedWatch — состояние Watch, которое видно после ack с decision.
+// ClaimedAt фиксирует plain ack: он меняет только эту пометку. WakeActive
+// показывает, что демон ещё может слать wake исполнителю; блокировка снимает
+// эту возможность, resolve возвращает её.
 type blockedWatch struct {
 	ID           string
 	Repo         string
@@ -1382,6 +1392,8 @@ type blockedWatch struct {
 	Status       string
 	Reason       string
 	FailedChecks []string
+	ClaimedAt    bool
+	WakeActive   bool
 }
 
 func newBlockedWatch(id string) blockedWatch {
@@ -1391,6 +1403,7 @@ func newBlockedWatch(id string) blockedWatch {
 		PR:           299,
 		Status:       blockStatusWatching,
 		FailedChecks: []string{"ci-build", "ci-audit"},
+		WakeActive:   true,
 	}
 }
 
@@ -1398,6 +1411,24 @@ func newBlockedWatch(id string) blockedWatch {
 type blockAckOutcome struct {
 	Action string
 	Reason string
+}
+
+// plainAck обрабатывает простой ack без decision. Как и в beacon_ack, он ставит claimedAt,
+// но не меняет статус Watch и не глушит wake. Пустой obligationID отвергается:
+// нечего отмечать, Watch остаётся нетронутым.
+func plainAck(w blockedWatch, obligationID string) (blockedWatch, blockAckOutcome) {
+	if strings.TrimSpace(obligationID) == "" {
+		return w, blockAckOutcome{Action: "noop", Reason: "invalid_obligation"}
+	}
+	w.ClaimedAt = true
+	return w, blockAckOutcome{Action: "acked", Reason: "claimed"}
+}
+
+// daemonWakeAllowed решает, может ли демон слать wake исполнителю. Plain ack
+// оставляет wake активным, blocked его останавливает: заблокированный Watch
+// уходит по отдельному маршруту оркестратора, а не в steering исполнителю.
+func daemonWakeAllowed(w blockedWatch) bool {
+	return w.Status != blockStatusBlocked && w.WakeActive
 }
 
 // applyBlockDecision применяет decision из beacon_ack. Блокирует только известный
@@ -1412,6 +1443,7 @@ func applyBlockDecision(w blockedWatch, decision, reason string) (blockedWatch, 
 		}
 		w.Status = blockStatusWatching
 		w.Reason = ""
+		w.WakeActive = true
 		return w, blockAckOutcome{Action: "unblocked", Reason: "cleared"}
 	}
 	if !strings.HasPrefix(d, blockDecisionPrefix) {
@@ -1429,6 +1461,7 @@ func applyBlockDecision(w blockedWatch, decision, reason string) (blockedWatch, 
 	}
 	w.Status = blockStatusBlocked
 	w.Reason = reason
+	w.WakeActive = false
 	return w, blockAckOutcome{Action: "blocked", Reason: reason}
 }
 
@@ -1555,6 +1588,32 @@ func evalB04UnknownDecisionAndUnblock() (string, bool) {
 	return actual, pass
 }
 
+// evalB05PlainAckVsBlockedWake различает два ack подряд. Plain ack только ставит
+// claimedAt и оставляет wake исполнителю активным. Следующий blocked:not_mine
+// останавливает wake демона, но шлёт wake оркестратору. blocked:resolved
+// возвращает wake. Негативный контроль: plain ack не подавляет wake.
+func evalB05PlainAckVsBlockedWake() (string, bool) {
+	w := newBlockedWatch("watch:B05")
+	plain, plainOut := plainAck(w, "obligation:B05")
+	blocked, blockedOut := applyBlockDecision(plain, "blocked:not_mine", "правки моих нет")
+	resumed, resumedOut := applyBlockDecision(blocked, decisionBlockedResolved, "")
+	actual := fmt.Sprintf("plain=%s/%s claimed=%t status=%s wake=%t; "+
+		"blocked=%s/%s status=%s wake=%t orchestratorWake=%t; "+
+		"resolved=%s status=%s wake=%t",
+		plainOut.Action, plainOut.Reason, plain.ClaimedAt, plain.Status, daemonWakeAllowed(plain),
+		blockedOut.Action, blockedOut.Reason, blocked.Status, daemonWakeAllowed(blocked),
+		blockedWakeFor(blocked) != nil,
+		resumedOut.Action, resumed.Status, daemonWakeAllowed(resumed))
+	pass := plainOut.Action == "acked" && plainOut.Reason == "claimed" &&
+		plain.ClaimedAt && plain.Status == blockStatusWatching &&
+		daemonWakeAllowed(plain) &&
+		blockedOut.Action == "blocked" && blocked.Status == blockStatusBlocked &&
+		!daemonWakeAllowed(blocked) && blockedWakeFor(blocked) != nil &&
+		resumedOut.Action == "unblocked" && resumed.Status == blockStatusWatching &&
+		daemonWakeAllowed(resumed)
+	return actual, pass
+}
+
 // ---- EC01-EC02: явное подтверждение критериев и лимита до старта (HD-064) ----
 //
 // Контракт ADR 0243: цикл не начинает итерации без явного подтверждения
@@ -1639,7 +1698,7 @@ func evalEC02StartWithoutConfirmationFails() (string, bool) {
 // Контракт: оркестратор видит сводку активных Watch своего проекта по вердиктам
 // ready/retry/blocked/watching и идемпотентно регистрируется подписчиком на каждый
 // Watch проекта. Production-код такой сводки и массовой подписки пока не существует,
-// поэтому eval фиксирует контракт исполняемой моделью, как W14-W18 и B01-B04.
+// поэтому eval фиксирует контракт исполняемой моделью, как W14-W18 и B01-B05.
 // Наблюдаются только исходы, видимые вызывающему: счётчики в сводке, число
 // подписчиков-оркестраторов на Watch и принадлежность Watch проекту. Подробности
 // в docs/evals/orchestrator-workload.md.
@@ -1836,7 +1895,7 @@ func evalOW03ProjectBoundary() (string, bool) {
 // затем обязателен verdict=ready, затем каждая зависимость waitFor должна
 // оказаться в main. Ошибка DependencyResolver приравнивается к «не в main» и
 // мерж не вызывается. Production-код единого решения в eval не подключён,
-// поэтому контракт живёт в исполняемой модели, как W14-W18 и B01-B04.
+// поэтому контракт живёт в исполняемой модели, как W14-W18 и B01-B05.
 // Подробности в docs/evals/orchestrator-decision.md.
 
 // orchAction — решение, которое оркестратор принимает по одному Watch.
