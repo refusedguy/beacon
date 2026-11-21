@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 func mockServeGC(t *testing.T) (*bytes.Buffer, *bytes.Buffer, *[]int, *int) {
@@ -14,11 +15,19 @@ func mockServeGC(t *testing.T) (*bytes.Buffer, *bytes.Buffer, *[]int, *int) {
 	oldList, oldPID, oldCfg := gcServeList, gcServicePID, gcServiceCfg
 	oldState, oldClear, oldKill := gcServeState, gcServeClear, gcServeKill
 	oldAlive, oldRead, oldWrite := gcProcessAlive, gcReadState, gcWriteState
+	oldObligations := gcObligationsForGC
 	t.Cleanup(func() {
 		gcServeList, gcServicePID, gcServiceCfg = oldList, oldPID, oldCfg
 		gcServeState, gcServeClear, gcServeKill = oldState, oldClear, oldKill
 		gcProcessAlive, gcReadState, gcWriteState = oldAlive, oldRead, oldWrite
+		gcObligationsForGC = oldObligations
 	})
+
+	// Obligations need the state store; the serve collector tests do not, so
+	// keep the seam quiet here and cover it in TestGCObligationsCollectsClosedWatch.
+	gcObligationsForGC = func(*CLI, bool) ([]store.ObligationGCItem, error) {
+		return nil, nil
+	}
 
 	killed := make([]int, 0)
 	cleared := 0
@@ -166,6 +175,49 @@ func TestQA2GCApplyClearsDeadRecord(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"mode":"applied"`) || !strings.Contains(out.String(), "state:999") {
 		t.Fatalf("out = %q", out.String())
+	}
+}
+
+// TestGCObligationsCollectsClosedWatch verifies the command wiring: a dry run
+// lists the store's obligation items, and --apply reports them as removed. The
+// eligibility rule itself is tested in the store package.
+func TestGCObligationsCollectsClosedWatch(t *testing.T) {
+	out, errOut, _, _ := mockServeGC(t)
+	gcServeList = func() ([]opencode.ServeProcess, error) { return nil, nil }
+	gcServeState = func() (opencode.ServeState, bool) { return opencode.ServeState{}, false }
+
+	applies := make([]bool, 0, 2)
+	gcObligationsForGC = func(_ *CLI, apply bool) ([]store.ObligationGCItem, error) {
+		applies = append(applies, apply)
+		return []store.ObligationGCItem{
+			{ID: "old:1:s1", WatchID: "old", Reason: "closed"},
+			{ID: "arch:2:s1", WatchID: "arch", Reason: "archived"},
+		}, nil
+	}
+
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--format", "json"}); code != 0 {
+		t.Fatalf("dry run code = %d, stderr = %s", code, errOut.String())
+	}
+	dry := out.String()
+	if !strings.Contains(dry, `"mode":"dry-run"`) || !strings.Contains(dry, `"removed":2`) ||
+		!strings.Contains(dry, `"kind":"obligation"`) ||
+		!strings.Contains(dry, "old:1:s1") || !strings.Contains(dry, "arch:2:s1") {
+		t.Fatalf("dry run out = %q", dry)
+	}
+
+	out.Reset()
+	if code := runGCWithServe(c, []string{"--format", "json", "--apply"}); code != 0 {
+		t.Fatalf("apply code = %d, stderr = %s", code, errOut.String())
+	}
+	applied := out.String()
+	if !strings.Contains(applied, `"mode":"applied"`) || !strings.Contains(applied, `"removed":2`) ||
+		!strings.Contains(applied, "old:1:s1") {
+		t.Fatalf("apply out = %q", applied)
+	}
+
+	if len(applies) != 2 || applies[0] || !applies[1] {
+		t.Fatalf("seam apply flags = %v, want [false true]", applies)
 	}
 }
 
