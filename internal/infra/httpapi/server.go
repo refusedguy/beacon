@@ -139,6 +139,12 @@ type Snapshot struct {
 	// an older client sees the same shape as before they were added.
 	RecentWatches []WatchHistory `json:"recentWatches,omitempty"`
 	HourlyStats   *HourlyStats   `json:"hourlyStats,omitempty"`
+
+	// RecentWatchesTruncated is true when the provider returned more than
+	// maxRecentWatches completed Watches and the transport kept only the newest
+	// ones. It stays absent when nothing was cut, so the flag is part of the
+	// optional history block rather than a field on every snapshot.
+	RecentWatchesTruncated bool `json:"recentWatchesTruncated,omitempty"`
 }
 
 // WatchOutcome groups a completed Watch for the history list. It stays a string
@@ -182,9 +188,9 @@ type SnapshotHistory struct {
 // never opens SQLite itself. The composition root decides whether history is
 // available and implements this method on the value it passes as Provider.
 // RecentWatches must be newest first by ClosedAt; the transport keeps the first
-// maxRecentWatches entries. A failed read becomes a LoadErrors entry and the
-// snapshot still returns 200, so a UI that does not understand history keeps
-// working.
+// maxRecentWatches entries and sets RecentWatchesTruncated when it drops any.
+// A failed read becomes a LoadErrors entry and the snapshot still returns 200,
+// so a UI that does not understand history keeps working.
 type HistorySource interface {
 	SnapshotHistory(ctx context.Context) (SnapshotHistory, error)
 }
@@ -858,6 +864,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(snap.RecentWatches) > maxRecentWatches {
 		snap.RecentWatches = snap.RecentWatches[:maxRecentWatches]
+		snap.RecentWatchesTruncated = true
 	}
 	writeJSON(w, http.StatusOK, snap)
 }

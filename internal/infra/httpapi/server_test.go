@@ -601,6 +601,9 @@ func TestSnapshotIncludesOptionalHistory(t *testing.T) {
 	if snap.HourlyStats == nil || *snap.HourlyStats != history.HourlyStats {
 		t.Fatalf("hourlyStats = %+v", snap.HourlyStats)
 	}
+	if snap.RecentWatchesTruncated {
+		t.Fatal("truncation reported for a history that fits the cap")
+	}
 }
 
 func TestSnapshotCapsHistoryAtThirty(t *testing.T) {
@@ -620,6 +623,9 @@ func TestSnapshotCapsHistoryAtThirty(t *testing.T) {
 	}
 	if snap.RecentWatches[0].ID != "w0" || snap.RecentWatches[maxRecentWatches-1].ID != fmt.Sprintf("w%d", maxRecentWatches-1) {
 		t.Fatalf("history was not truncated from the front: %+v", snap.RecentWatches)
+	}
+	if !snap.RecentWatchesTruncated {
+		t.Fatal("truncation was not reported to the consumer")
 	}
 }
 
@@ -659,6 +665,9 @@ func TestSnapshotWithoutHistoryKeepsOldShape(t *testing.T) {
 	}
 	if _, ok := raw["hourlyStats"]; ok {
 		t.Fatal("hourlyStats present without a history provider")
+	}
+	if _, ok := raw["recentWatchesTruncated"]; ok {
+		t.Fatal("recentWatchesTruncated present without a history provider")
 	}
 }
 

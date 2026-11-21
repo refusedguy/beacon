@@ -78,6 +78,7 @@ paths:
         hourlyStats are optional and absent when the provider has no history
         source. Recent watches are the newest 30 completed Watches with an
         outcome of merged, closed or escalated, newest first by closedAt.
+        When more completed Watches exist, recentWatchesTruncated is true.
       security:
         - bearerAuth: []
       responses:
@@ -721,6 +722,11 @@ components:
         hourlyStats:
           $ref: "#/components/schemas/HourlyStats"
           description: Omitted without a history provider.
+        recentWatchesTruncated:
+          type: boolean
+          description: >-
+            True when the provider had more than 30 completed Watches and only
+            the newest ones are published. Omitted when nothing was cut.
 
     Event:
       type: object
