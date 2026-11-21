@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -18,6 +19,10 @@ const (
 	// DecisionWaitDependency holds the merge until one or more waitFor refs
 	// land in main. Refs lists the ones still missing.
 	DecisionWaitDependency DecisionKind = "WAIT_DEPENDENCY"
+	// DecisionDependencyNotFound reports a waitFor ref that names a missing
+	// task card. Waiting cannot create the card, so the decision asks the
+	// orchestrator to fix the ref instead of parking the Watch forever.
+	DecisionDependencyNotFound DecisionKind = "DEPENDENCY_NOT_FOUND"
 	// DecisionBlockedFixAgent hands a blocked Watch to the FIX agent. Reason
 	// and FailedChecks come from Watch.Blocked.
 	DecisionBlockedFixAgent DecisionKind = "BLOCKED_FIX_AGENT"
@@ -50,6 +55,9 @@ const (
 	// ReasonSourceUnavailable is the SOURCE_ERROR reason. The resolver error
 	// is kept in Decision.SourceError.
 	ReasonSourceUnavailable = "source_unavailable"
+	// ReasonDependencyCardNotFound is the DEPENDENCY_NOT_FOUND reason. The
+	// broken refs are kept in Decision.Refs.
+	ReasonDependencyCardNotFound = "dependency_card_not_found"
 )
 
 // DefaultGeneratedFilePatterns lists the Beacon artifacts that tooling owns.
@@ -216,10 +224,12 @@ func CheckSource(ctx context.Context, src Source) (files []string, byRef bool, e
 //     dependency is resolved, so a manual edit can never reach the merge path;
 //     the list comes from Watch.Source, which may be a git ref, and a source
 //     error fails closed as SOURCE_ERROR;
-//  3. unsatisfied waitFor/waitForMain refs hold the merge and list the refs;
-//  4. ready plus auto-merge merges;
-//  5. retry goes back to the executor;
-//  6. anything else is escalated, never merged.
+//  3. a waitFor/waitForMain ref that names a missing task card is an incident
+//     and is reported with its ref, because waiting cannot create the card;
+//  4. other unsatisfied refs hold the merge and list the refs;
+//  5. ready plus auto-merge merges;
+//  6. retry goes back to the executor;
+//  7. anything else is escalated, never merged.
 func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 	d := Decision{WatchID: w.ID, PR: w.PR, Revision: w.Revision}
 
@@ -259,9 +269,16 @@ func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 		return d
 	}
 
-	if refs := unsatisfiedRefs(w, deps); len(refs) > 0 {
+	waiting, notFound := unsatisfiedRefs(w, deps)
+	if len(notFound) > 0 {
+		d.Kind = DecisionDependencyNotFound
+		d.Refs = notFound
+		d.Reason = ReasonDependencyCardNotFound
+		return d
+	}
+	if len(waiting) > 0 {
 		d.Kind = DecisionWaitDependency
-		d.Refs = refs
+		d.Refs = waiting
 		return d
 	}
 
@@ -335,12 +352,14 @@ func matchesGeneratedPath(pattern, file string) bool {
 }
 
 // unsatisfiedRefs resolves waitFor first and waitForMain second, preserving
-// order and dropping duplicates. Resolution errors count as unsatisfied.
-func unsatisfiedRefs(w Watch, deps DependencyResolver) []string {
+// order and dropping duplicates. Ordinary resolution errors count as waiting,
+// so an unverifiable fact never allows a merge. A *DependencyCardNotFoundError
+// goes into notFound: the ref cannot ever resolve, so Decide reports an
+// incident instead of parking the Watch in WAIT_DEPENDENCY.
+func unsatisfiedRefs(w Watch, deps DependencyResolver) (waiting, notFound []string) {
 	if w.Policy == nil {
-		return nil
+		return nil, nil
 	}
-	var out []string
 	seen := make(map[string]bool)
 	for _, group := range [][]string{w.Policy.WaitFor, w.Policy.WaitForMain} {
 		for _, raw := range group {
@@ -349,16 +368,22 @@ func unsatisfiedRefs(w Watch, deps DependencyResolver) []string {
 				continue
 			}
 			seen[ref] = true
-			satisfied := false
-			if deps != nil {
-				satisfied, _ = deps.Satisfied(context.Background(), ref)
+			if deps == nil {
+				waiting = append(waiting, ref)
+				continue
 			}
-			if !satisfied {
-				out = append(out, ref)
+			satisfied, err := deps.Satisfied(context.Background(), ref)
+			var missing *DependencyCardNotFoundError
+			if errors.As(err, &missing) {
+				notFound = append(notFound, ref)
+				continue
+			}
+			if err != nil || !satisfied {
+				waiting = append(waiting, ref)
 			}
 		}
 	}
-	return out
+	return waiting, notFound
 }
 
 // decisionVerdict lowercases and trims the Watch verdict, falling back to CI
