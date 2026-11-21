@@ -1,12 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 // Q-A-02: the lease/ticket collector in watch.go stays intact. This file adds
@@ -181,5 +187,233 @@ func runGCWithServe(c *CLI, args []string) int {
 		return 0
 	}
 	renderGCTable(c.out, removed, true)
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// IDX-12: worktree GC. A worktree is removed only when no live Watch points at
+// its HEAD and `git status --porcelain` is empty. Every other worktree stays
+// with a reason in the report. The serve collector above stays unchanged.
+// ---------------------------------------------------------------------------
+
+const (
+	gcReasonActiveWatch = "active_watch"
+	gcReasonDirty       = "dirty"
+	gcReasonLocked      = "locked"
+	gcReasonStatusError = "status_error"
+	gcReasonClean       = "clean"
+	gcReasonRemoveError = "remove_error"
+)
+
+// gcWorktreeResult is one line of the worktree report. Status is "remove" for
+// a dry-run candidate, "removed" after apply and "kept" for everything that
+// stays. Reason explains the status.
+type gcWorktreeResult struct {
+	Dir    string `json:"dir"`
+	Branch string `json:"branch,omitempty"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+}
+
+// gcWorktreeReport is the JSON form of both a dry run and an apply. Items holds
+// every inspected worktree, so the report names the kept ones and their
+// reasons. Removed counts the removal set: candidates in a dry run, deletions
+// after apply.
+type gcWorktreeReport struct {
+	Mode    string             `json:"mode"`
+	Removed int                `json:"removed"`
+	Kept    int                `json:"kept"`
+	Items   []gcWorktreeResult `json:"items"`
+}
+
+var (
+	gcWorktreeList   = func() ([]worktree.Entry, error) { return worktree.List(worktree.CommandRunner) }
+	gcWorktreeStatus = func(dir string) (string, error) { return worktree.Status(worktree.CommandRunner, dir) }
+	gcWorktreeRemove = func(dir string) error { return worktree.Remove(worktree.CommandRunner, dir) }
+	gcWorktreeHeads  = liveWatchHeads
+	gcWorktreeRunner = func(c *CLI, args []string) int { return runGCWorktree(c, args) }
+)
+
+// RegisterGCWorktree installs the worktree command implementation. Tests use
+// it to replace the runner without touching dispatch.
+func RegisterGCWorktree(fn func(*CLI, []string) int) { gcWorktreeRunner = fn }
+
+func init() {
+	RegisterGCWorktree(runGCWorktree)
+}
+
+// liveWatchHeads maps the head SHA of every live Watch to its Watch ID. A
+// blocked Watch is still live, so it protects its worktree too. The store is
+// opened through the existing inspect factory and closed on every path.
+func liveWatchHeads(c *CLI) (map[string]string, error) {
+	st, closeStore, err := makeInspectStore(c)
+	if err != nil {
+		return nil, fmt.Errorf("gc-worktree: store: %w", err)
+	}
+	defer closeStore()
+	watches, err := st.LiveWatches()
+	if err != nil {
+		return nil, fmt.Errorf("gc-worktree: live watches: %w", err)
+	}
+	heads := make(map[string]string, len(watches))
+	for _, w := range watches {
+		if w.HeadSHA == "" {
+			continue
+		}
+		heads[strings.ToLower(w.HeadSHA)] = w.ID
+	}
+	return heads, nil
+}
+
+// watchIDForHead finds a Watch whose recorded head matches the worktree HEAD.
+// Git and the store both write full hashes, but a short HEAD stays comparable
+// through the prefix check. Sorted keys give a stable answer when two Watches
+// record the same head.
+func watchIDForHead(heads map[string]string, head string) string {
+	head = strings.ToLower(strings.TrimSpace(head))
+	if len(head) < 7 {
+		return ""
+	}
+	keys := make([]string, 0, len(heads))
+	for sha := range heads {
+		keys = append(keys, sha)
+	}
+	sort.Strings(keys)
+	for _, sha := range keys {
+		if strings.HasPrefix(sha, head) {
+			return heads[sha]
+		}
+	}
+	return ""
+}
+
+// gcWorktreeDecision turns collected facts into one report line. Facts are
+// checked in this order: a locked worktree, then an active Watch, then a
+// status error, then a dirty tree. Only a clean, unlocked worktree with no
+// Watch is a removal candidate.
+func gcWorktreeDecision(e worktree.Entry, watchID, status string, statusErr error) gcWorktreeResult {
+	item := gcWorktreeResult{Dir: e.Dir, Branch: e.Branch, Status: "kept"}
+	switch {
+	case e.Locked:
+		item.Reason = gcReasonLocked
+	case watchID != "":
+		item.Reason = gcReasonActiveWatch + ":" + watchID
+	case statusErr != nil:
+		item.Reason = gcReasonStatusError + ":" + statusErr.Error()
+	case strings.TrimSpace(status) != "":
+		item.Reason = gcReasonDirty
+	default:
+		item.Status = "remove"
+		item.Reason = gcReasonClean
+	}
+	return item
+}
+
+// gcWorktreeCollect reads Watch heads and git status for every worktree. A
+// locked worktree or one with a live Watch skips the status call: its reason
+// is already decisive and a git failure there must not hide that reason.
+func gcWorktreeCollect() ([]gcWorktreeResult, error) {
+	entries, err := gcWorktreeList()
+	if err != nil {
+		return nil, fmt.Errorf("beacon gc-worktree: список worktree: %w", err)
+	}
+	heads, err := gcWorktreeHeads()
+	if err != nil {
+		return nil, err
+	}
+	plan := make([]gcWorktreeResult, 0, len(entries))
+	for _, e := range entries {
+		watchID := watchIDForHead(heads, e.Head)
+		var status string
+		var statusErr error
+		if !e.Locked && watchID == "" {
+			status, statusErr = gcWorktreeStatus(e.Dir)
+		}
+		plan = append(plan, gcWorktreeDecision(e, watchID, status, statusErr))
+	}
+	return plan, nil
+}
+
+func renderGCWorktreeJSON(w io.Writer, report gcWorktreeReport) error {
+	return json.NewEncoder(w).Encode(report)
+}
+
+func renderGCWorktreeTable(w io.Writer, report gcWorktreeReport) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "STATUS\tDIR\tBRANCH\tREASON")
+	for _, item := range report.Items {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", item.Status, item.Dir, item.Branch, item.Reason)
+	}
+	_ = tw.Flush()
+	if report.Mode == "applied" {
+		fmt.Fprintf(w, "УДАЛЕНО: %d, ОСТАВЛЕНО: %d\n", report.Removed, report.Kept)
+		return
+	}
+	fmt.Fprintf(w, "КАНДИДАТЫ: %d, ОСТАВЛЕНО: %d (просмотр без удаления, --apply удалит)\n", report.Removed, report.Kept)
+}
+
+// runGCWorktree implements `beacon gc-worktree [--format table|json] [--apply]`.
+// Without --apply it prints the plan. With --apply it removes the candidates
+// and prints the outcome for every worktree.
+func runGCWorktree(c *CLI, args []string) int {
+	fs := flag.NewFlagSet("gc-worktree", flag.ContinueOnError)
+	format := fs.String("format", "table", "формат вывода: table или json")
+	apply := fs.Bool("apply", false, "удалить безопасные worktree (по умолчанию только просмотр)")
+	if !parseFlags("gc-worktree", args, c.errOut, fs) {
+		return 2
+	}
+	if *format != "table" && *format != "json" {
+		fmt.Fprintf(c.errOut, "beacon gc-worktree: неизвестный формат %q, ожидается table или json\n", *format)
+		writeUsage(c.errOut)
+		return 2
+	}
+
+	plan, err := gcWorktreeCollect()
+	if err != nil {
+		fmt.Fprintln(c.errOut, err)
+		return 2
+	}
+
+	report := gcWorktreeReport{Mode: "dry-run", Items: plan}
+	for _, item := range plan {
+		if item.Status == "remove" {
+			report.Removed++
+		} else {
+			report.Kept++
+		}
+	}
+
+	failed := false
+	if *apply {
+		report.Mode = "applied"
+		report.Removed = 0
+		for i, item := range plan {
+			if item.Status != "remove" {
+				continue
+			}
+			if err := gcWorktreeRemove(item.Dir); err != nil {
+				report.Items[i].Status = "kept"
+				report.Items[i].Reason = gcReasonRemoveError + ":" + err.Error()
+				report.Kept++
+				failed = true
+				fmt.Fprintf(c.errOut, "beacon gc-worktree: удаление %s: %v\n", item.Dir, err)
+				continue
+			}
+			report.Items[i].Status = "removed"
+			report.Removed++
+		}
+	}
+
+	if *format == "json" {
+		if err := renderGCWorktreeJSON(c.out, report); err != nil {
+			fmt.Fprintf(c.errOut, "beacon gc-worktree: %v\n", err)
+			return 2
+		}
+	} else {
+		renderGCWorktreeTable(c.out, report)
+	}
+	if failed {
+		return 2
+	}
 	return 0
 }
