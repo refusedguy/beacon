@@ -1,13 +1,13 @@
 # CLEAN-12. Удалить internal/tui после закрытия WIRING-493
-Статус: todo
+Статус: done
 baseline: перепроверка 2026-11-21, origin/main = b9937c01; WIRING-493 в статусе todo; все три её блокера сохраняются; `git grep -n 'tui.Listen(' origin/main -- internal cmd` = пусто; `git grep -n 'internal/tui' origin/main -- cmd` = только комментарии; в `layers.json` ребра cmd к internal/tui нет; в `humanDecisionSink` claim и release не обрабатываются; owner-decision по ADR 0060 и layer-ребру в дереве не зафиксирована
 Фаза: P2
 Тип: task
 Владелец файлов: internal/tui/, docs/tasks/WIRING-493.md
 Зависимости: WIRING-493
 Ссылка: 
-Агент: нет
-Время: нет
+Агент: exe78
+Время: 2026-11-21T17:44:33Z
 Цель: Закрыть или реализовать WIRING-493 и только потом решить судьбу пяти файлов TUI.
 Контекст: Источник: docs/research/deadcode-audit.md, строка про internal/tui. 1113 не-тестовых строк, 0 импортёров. WIRING-493 в статусе todo прямо фиксирует отсутствие импортов TUI. Риск: высокий. Нужен owner-decision: удаление закроет возможность запуска TUI.
 Шаги: Прочитать WIRING-493 и подтвердить намерение владельца. Если проводка отменена, закрыть карточку и удалить каталог. Если нет, оставить код и вернуть карточку в работу.
