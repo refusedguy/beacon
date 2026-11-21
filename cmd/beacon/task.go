@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,9 +81,17 @@ var whyEdgeKinds = []string{
 	"depends-on", "conflicts-with", "part-of", "derived-from", "supersedes", "same-as",
 }
 
+// whyCardID — грамматика ID, которую понимает ParseCard. Она совпадает с
+// taskstore.exactIDRE: буквенный префикс, дефис или точка и номер. Поэтому
+// почему-граф видит не только T3.17, но и RS-MCP-02, WIRING-485, BS.1 и S1.001.
+const whyCardID = `[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+`
+
 // whyEdgeRE находит ребро и ID карточки в строке, например
-// "depends-on T3.17", "conflicts-with:T3.18" или "same-as: T3.19".
-var whyEdgeRE = regexp.MustCompile(`\b(depends-on|conflicts-with|part-of|derived-from|supersedes|same-as)[ \t]*[ :][ \t]*(T[0-9]+\.[0-9]+)\b`)
+// "depends-on T3.17", "conflicts-with:RS-MCP-02" или "same-as: BS.1".
+// Вторая группа — любая поддерживаемая форма ID. Окончательно кандидатов
+// проверяет whyEdges через taskstore.IsID, поэтому лишние совпадения
+// в граф не попадают.
+var whyEdgeRE = regexp.MustCompile(`\b(depends-on|conflicts-with|part-of|derived-from|supersedes|same-as)[ \t]*[ :][ \t]*(` + whyCardID + `)\b`)
 
 type whyEdge struct {
 	kind string
@@ -229,7 +238,7 @@ func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int
 		return failTask(stderr, err)
 	}
 	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
-		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки вида T<g>.<n>"))
+		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки"))
 	}
 	cards, err := taskstore.LoadCards(cfg.TasksDir)
 	if err != nil {
@@ -332,6 +341,35 @@ func whyChain(start string, byID map[string]taskstore.Card) []whyStep {
 
 func whyClosed(c taskstore.Card) bool {
 	return c.Status == "done" || c.Status == "dropped"
+}
+
+// whyDependents возвращает карточки, которые прямо зависят от id. Это обратные
+// рёбра графа X -> id, прочитанного whyEdges. Порядок детерминирован по ID,
+// каждая карточка попадает в результат один раз. Обхода нет, поэтому циклы
+// здесь невозможны; обрыв циклов при прямом ходе остаётся в whyChain.
+func whyDependents(id string, byID map[string]taskstore.Card) []whyStep {
+	ids := make([]string, 0, len(byID))
+	for key := range byID {
+		ids = append(ids, key)
+	}
+	sort.Strings(ids)
+	var out []whyStep
+	for _, key := range ids {
+		c := byID[key]
+		for _, e := range whyEdges(c) {
+			if e.to != id {
+				continue
+			}
+			out = append(out, whyStep{
+				id:     c.ID,
+				edge:   e.kind,
+				status: c.Status,
+				agent:  c.Agent,
+			})
+			break
+		}
+	}
+	return out
 }
 
 // whyEdges читает ребра из поля Зависимости и из текста карточки. Голый ID в
