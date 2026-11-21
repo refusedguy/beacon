@@ -1,7 +1,10 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"slices"
 	"strings"
@@ -19,6 +22,32 @@ import (
 // growth in descriptions and schemas. CI logs the measured size next to the
 // ceiling so drift is visible before it becomes a failure.
 const toolsListByteBudget = 16 * 1024
+
+// toolsListByteCount is the exact serialized size of the tools/list response
+// for the contracted eight tools. The budget above is a ceiling; this number is
+// the current value. Pinning it makes an unannounced change to a description or
+// schema fail the contract until this constant is updated with that change.
+const toolsListByteCount = 16095
+
+// toolsListGoldenSHA256 is the SHA-256 of the same serialized response. A hash
+// catches any byte change, including a swap of two tools whose names have equal
+// length, which a size check alone would miss.
+const toolsListGoldenSHA256 = "8324205f18b1b4c8e90843aeafcad90b8170c8c7ae7b49733a864b6a358f3aab"
+
+// toolsListOrder is the fixed order in which the server lists its tools. The
+// SDK returns the eight tools sorted by name. Pinning the order makes that
+// behavior part of the contract, so a registration change that shuffles the
+// listing fails the test.
+var toolsListOrder = []string{
+	"beacon_ack",
+	"beacon_cancel_watch",
+	"beacon_defer_wiring",
+	"beacon_get_result",
+	"beacon_list_running",
+	"beacon_stats",
+	"beacon_wait_result",
+	"beacon_watch_pr",
+}
 
 // expectedToolNames is the complete tool contract: the seven tools from
 // WORKER-PROMPT 4.1 plus beacon_defer_wiring (W12-B). The order is not part of
@@ -182,6 +211,101 @@ func TestToolsListContract(t *testing.T) {
 	t.Logf("tools/list serialized to %d bytes (budget %d)", responseBytes, toolsListByteBudget)
 	if responseBytes > toolsListByteBudget {
 		t.Errorf("tools/list response is %d bytes, over the %d byte budget", responseBytes, toolsListByteBudget)
+	}
+}
+
+// toolsListRawBytes opens a fresh server and client pair over its own in-memory
+// transport, walks tools/list and returns the concatenated serialized response
+// bytes. Each call builds a new server, so two calls compare independent
+// connections rather than two reads of the same session.
+func toolsListRawBytes(t *testing.T) []byte {
+	t.Helper()
+
+	server := NewServer()
+	client := sdkmcp.NewClient(
+		&sdkmcp.Implementation{Name: "beacon-stability-test", Version: "v0.0.0"},
+		nil,
+	)
+	serverTransport, clientTransport := sdkmcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
+	if err != nil {
+		t.Fatalf("connect server: %v", err)
+	}
+	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
+	if err != nil {
+		t.Fatalf("connect client: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientSession.Close()
+		_ = serverSession.Wait()
+	})
+
+	var all []byte
+	cursor := ""
+	seen := make(map[string]bool)
+	for {
+		params := &sdkmcp.ListToolsParams{}
+		if cursor != "" {
+			params.Cursor = cursor
+		}
+		response, err := clientSession.ListTools(context.Background(), params)
+		if err != nil {
+			t.Fatalf("tools/list: %v", err)
+		}
+		raw, err := json.Marshal(response)
+		if err != nil {
+			t.Fatalf("marshal tools/list response: %v", err)
+		}
+		all = append(all, raw...)
+		if response.NextCursor == "" {
+			return all
+		}
+		if seen[response.NextCursor] {
+			t.Fatalf("tools/list pagination loop: cursor %q repeated", response.NextCursor)
+		}
+		seen[response.NextCursor] = true
+		cursor = response.NextCursor
+	}
+}
+
+// TestToolsListStabilityAcrossConnections pins the tools/list listing as a
+// byte-for-byte artifact of CI. Two independent connections must return the
+// same bytes. The test also checks unique names, a fixed order and the recorded
+// size and hash. Swapping two tools changes the hash even when the byte count
+// stays the same, so the negative control fails the test.
+func TestToolsListStabilityAcrossConnections(t *testing.T) {
+	first := toolsListRawBytes(t)
+	second := toolsListRawBytes(t)
+
+	if !bytes.Equal(first, second) {
+		t.Fatalf("tools/list differs between connections: first %d bytes, second %d bytes", len(first), len(second))
+	}
+
+	if len(first) != toolsListByteCount {
+		t.Errorf("tools/list size = %d bytes, want %d", len(first), toolsListByteCount)
+	}
+
+	gotHash := sha256.Sum256(first)
+	if got := hex.EncodeToString(gotHash[:]); got != toolsListGoldenSHA256 {
+		t.Errorf("tools/list SHA-256 = %s, want %s", got, toolsListGoldenSHA256)
+	}
+
+	var response sdkmcp.ListToolsResult
+	if err := json.Unmarshal(first, &response); err != nil {
+		t.Fatalf("unmarshal tools/list response: %v", err)
+	}
+
+	gotOrder := make([]string, 0, len(response.Tools))
+	seen := make(map[string]bool, len(response.Tools))
+	for _, tool := range response.Tools {
+		if seen[tool.Name] {
+			t.Errorf("duplicate tool name %q", tool.Name)
+		}
+		seen[tool.Name] = true
+		gotOrder = append(gotOrder, tool.Name)
+	}
+	if !slices.Equal(gotOrder, toolsListOrder) {
+		t.Errorf("tools/list order = %v, want %v", gotOrder, toolsListOrder)
 	}
 }
 
