@@ -35,6 +35,14 @@ INSERT OR IGNORE INTO persist_progress (id, seq, last_error, failed_since)
 VALUES (1, 0, '', 0);
 `
 
+// updateProgressSuccessSQL runs inside the data transaction. Keeping the seq
+// bump in the same transaction as the data is what makes a successful Write a
+// durable ack of both facts (ADR 0067).
+const updateProgressSuccessSQL = `
+UPDATE persist_progress
+SET seq = seq + 1, last_error = '', failed_since = 0
+WHERE id = 1`
+
 const createStreamHealthSQL = `
 CREATE TABLE IF NOT EXISTS stream_health (
   id         INTEGER PRIMARY KEY CHECK (id = 1),
@@ -127,6 +135,12 @@ type ObservedPersist struct {
 	mu     sync.Mutex
 	db     *DB
 	writer SingleWriter
+
+	// initOnce creates the progress table on first use for observers built
+	// outside open(). Production DBs create it at Open, so this path is a
+	// fallback and never runs on the hot write loop after the first call.
+	initOnce sync.Once
+	initErr  error
 }
 
 // Observed returns a progress-tracking writer bound to d's own writer.
@@ -147,9 +161,32 @@ func NewObservedPersistWithWriter(db *DB, w SingleWriter) *ObservedPersist {
 	return &ObservedPersist{db: db, writer: w}
 }
 
-// Write runs fn on the wrapped writer and records the outcome. It never
-// reports success when the data write or the progress write failed. A failed
-// write keeps seq unchanged and is returned as PERSIST_FAILED.
+// ensureProgressTable creates the progress table once, outside the hot write
+// path. Production DBs already did this at Open; observers created directly in
+// tests still need it before their first write.
+func (p *ObservedPersist) ensureProgressTable() error {
+	p.initOnce.Do(func() {
+		ok, err := tableExists(context.Background(), p.db.readDB, "persist_progress")
+		if err != nil {
+			p.initErr = err
+			return
+		}
+		if ok {
+			return
+		}
+		p.initErr = p.db.rawWrite(context.Background(), func(tx *sql.Tx) error {
+			_, err := tx.Exec(createPersistProgressSQL)
+			return err
+		})
+	})
+	return p.initErr
+}
+
+// Write runs fn on the wrapped writer and records the outcome. Data and the
+// success counter commit in one transaction, so a crash between them cannot
+// leave seq behind the data it counts. A failed write rolls the data back and
+// records last_error in its own transaction; the caller still sees
+// PERSIST_FAILED (ADR 0067: only a durable commit is an ack).
 func (p *ObservedPersist) Write(ctx context.Context, fn func(*sql.Tx) error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -157,13 +194,21 @@ func (p *ObservedPersist) Write(ctx context.Context, fn func(*sql.Tx) error) err
 		ctx = context.Background()
 	}
 
-	if err := p.writer.Write(ctx, fn); err != nil {
+	if err := p.ensureProgressTable(); err != nil {
+		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+	}
+
+	withProgress := func(tx *sql.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(updateProgressSuccessSQL)
+		return err
+	}
+	if err := p.writer.Write(ctx, withProgress); err != nil {
 		if recErr := p.recordFailure(ctx, err); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
-	}
-	if err := p.recordSuccess(ctx); err != nil {
 		return domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
 	return nil
@@ -171,26 +216,10 @@ func (p *ObservedPersist) Write(ctx context.Context, fn func(*sql.Tx) error) err
 
 func (p *ObservedPersist) recordFailure(ctx context.Context, cause error) error {
 	return p.db.rawWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(createPersistProgressSQL); err != nil {
-			return fmt.Errorf("store: persist progress: create table: %w", err)
-		}
 		_, err := tx.Exec(`
 			UPDATE persist_progress
 			SET last_error = ?, failed_since = ?
 			WHERE id = 1`, cause.Error(), time.Now().UTC().UnixNano())
-		return err
-	})
-}
-
-func (p *ObservedPersist) recordSuccess(ctx context.Context) error {
-	return p.db.rawWrite(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(createPersistProgressSQL); err != nil {
-			return fmt.Errorf("store: persist progress: create table: %w", err)
-		}
-		_, err := tx.Exec(`
-			UPDATE persist_progress
-			SET seq = seq + 1, last_error = '', failed_since = 0
-			WHERE id = 1`)
 		return err
 	})
 }

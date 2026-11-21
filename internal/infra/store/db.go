@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -71,6 +72,10 @@ type DB struct {
 	// Plain Open leaves it nil to keep the existing test fixtures' writer
 	// behavior unchanged.
 	progress *ObservedPersist
+
+	// writeCount counts committed writer transactions. Tests use it to assert
+	// that one observed Write costs one transaction, not two.
+	writeCount atomic.Int64
 }
 
 type writeJob struct {
@@ -152,6 +157,18 @@ func open(path, drv string, production bool) (*DB, error) {
 		writeDB.Close()
 		readDB.Close()
 		return nil, fmt.Errorf("store: event log: %w", err)
+	}
+
+	// Create the progress table once at Open for observed stores. Doing it
+	// here keeps CREATE TABLE IF NOT EXISTS off every write. This runs before
+	// writeDB.Conn takes the pool's only connection, so it can use the pool
+	// directly without going through the writer goroutine.
+	if production {
+		if _, err := writeDB.ExecContext(ctx, createPersistProgressSQL); err != nil {
+			writeDB.Close()
+			readDB.Close()
+			return nil, fmt.Errorf("store: persist progress: %w", err)
+		}
 	}
 
 	conn, err := writeDB.Conn(ctx)
@@ -327,8 +344,17 @@ func (d *DB) runJob(job writeJob) {
 		job.err <- err
 		return
 	}
-	job.err <- tx.Commit()
+	commitErr := tx.Commit()
+	if commitErr == nil {
+		d.writeCount.Add(1)
+	}
+	job.err <- commitErr
 }
+
+// WriteCount reports how many writer transactions have committed. It is an
+// observability counter used to prove the observed write path stays at one
+// transaction per Write (BCX-37).
+func (d *DB) WriteCount() int64 { return d.writeCount.Load() }
 
 // migrate applies each migrations/NNNN_name.sql once. Schema version and SQL
 // body commit in the same transaction, so a failed migration never advances
