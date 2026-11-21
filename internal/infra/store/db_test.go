@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,6 +100,69 @@ func TestOpenFromEmpty(t *testing.T) {
 	}
 	if stored != want {
 		t.Errorf("meta schema_version = %d, want %d", stored, want)
+	}
+}
+
+// TestMigration0007ParityAcrossInstallDates checks that a database opened from
+// user_version 5 ends with the same registry schema as a fresh database. Version
+// 7 adds columns that were appended to 0005 after that version had shipped.
+func TestMigration0007ParityAcrossInstallDates(t *testing.T) {
+	ctx := context.Background()
+	oldPath := filepath.Join(t.TempDir(), "v5.db")
+	old, err := openPool(oldPath, 1, driverName)
+	if err != nil {
+		t.Fatalf("open v5 db: %v", err)
+	}
+	names, err := fs.Glob(migrationFS, "migrations/*.sql")
+	if err != nil {
+		t.Fatalf("glob migrations: %v", err)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		version, err := migrationVersion(name)
+		if err != nil {
+			t.Fatalf("migration version %s: %v", name, err)
+		}
+		if version > 5 {
+			continue
+		}
+		body, err := fs.ReadFile(migrationFS, name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		if _, err := old.ExecContext(ctx, string(body)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
+	}
+	if _, err := old.ExecContext(ctx, "PRAGMA user_version = 5"); err != nil {
+		t.Fatalf("set user_version 5: %v", err)
+	}
+	if err := old.Close(); err != nil {
+		t.Fatalf("close v5 db: %v", err)
+	}
+
+	upgraded, err := Open(oldPath)
+	if err != nil {
+		t.Fatalf("Open v5 db: %v", err)
+	}
+	defer upgraded.Close()
+	fresh, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("Open fresh db: %v", err)
+	}
+	defer fresh.Close()
+
+	if upgraded.Version() != fresh.Version() {
+		t.Errorf("version from v5 = %d, fresh = %d", upgraded.Version(), fresh.Version())
+	}
+	for _, table := range []string{"agent_registry", "watch_bindings"} {
+		want := tableColumnSigs(t, fresh.readDB, table)
+		got := tableColumnSigs(t, upgraded.readDB, table)
+		for col, sig := range want {
+			if got[col] != sig {
+				t.Errorf("%s.%s from v5 = %q, fresh = %q", table, col, got[col], sig)
+			}
+		}
 	}
 }
 
@@ -3863,6 +3927,7 @@ var allMigrations = []string{
 	"migrations/0004_events.sql",
 	"migrations/0005_agent_registry.sql",
 	"migrations/0006_control_plane.sql",
+	"migrations/0007_registry_columns.sql",
 }
 
 // migrationFileExclusions records corpus files that are intentionally not

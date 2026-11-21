@@ -380,13 +380,183 @@ func userVersion(ctx context.Context, db *sql.DB) (int, error) {
 	return version, nil
 }
 
+// codeMigrations holds upgrades SQLite cannot express as static SQL. SQLite has
+// no conditional ADD COLUMN and cannot change a column default without a table
+// rebuild, so version 7 inspects PRAGMA table_info and runs the DDL in Go. The
+// corpus file for that version stays in the embedded set; applyMigration skips
+// its comment-only body and runs the Go function in the same transaction.
+var codeMigrations = map[int]func(context.Context, *sql.Tx) error{
+	7: migrateRegistryColumns,
+}
+
+// registryColumnUpgrades are the columns 0005 gained after its first release.
+// A database at user_version 5 or 6 may miss any of them. Every definition has
+// a default so ALTER works on a table that already holds rows.
+var registryColumnUpgrades = []struct{ name, definition string }{
+	{"runtime", "TEXT NOT NULL DEFAULT ''"},
+	{"digest", "TEXT NOT NULL DEFAULT ''"},
+	{"last_seen", "INTEGER NOT NULL DEFAULT 0"},
+	{"worktree", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// registryV7Schema is the canonical agent_registry shape. It matches the
+// embedded 0005 DDL with the sync columns in place. It is used only when an
+// older runtime column needs its default restored.
+const registryV7Schema = `
+CREATE TABLE agent_registry_v7 (
+  project_key    TEXT NOT NULL CHECK (length(project_key) > 0),
+  agent_id       TEXT NOT NULL CHECK (length(agent_id) > 0),
+  role           TEXT NOT NULL,
+  runtime        TEXT NOT NULL DEFAULT '',
+  status         TEXT NOT NULL DEFAULT 'active',
+  session_id     TEXT NOT NULL DEFAULT '',
+  notify_adapter TEXT NOT NULL DEFAULT '',
+  notify_target  TEXT NOT NULL DEFAULT '',
+  config_id      TEXT NOT NULL DEFAULT '',
+  digest         TEXT NOT NULL DEFAULT '',
+  capabilities   TEXT NOT NULL DEFAULT '[]',
+  last_seen      INTEGER NOT NULL DEFAULT 0,
+  worktree       TEXT NOT NULL DEFAULT '',
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  PRIMARY KEY (project_key, agent_id)
+)`
+
+// migrateRegistryColumns brings an older registry schema to the current column
+// set. It is idempotent: a database created from today's corpus needs no DDL.
+func migrateRegistryColumns(ctx context.Context, tx *sql.Tx) error {
+	registryCols, err := tableColumns(tx, "agent_registry")
+	if err != nil {
+		return fmt.Errorf("store: migration 7: agent_registry columns: %w", err)
+	}
+	if len(registryCols) == 0 {
+		return nil
+	}
+
+	// Capture the runtime default before adding anything, so a missing column
+	// is not mistaken for an existing column without a default.
+	runtimeHasDefault := false
+	if _, ok := registryCols["runtime"]; ok {
+		runtimeHasDefault, err = columnHasDefault(ctx, tx, "agent_registry", "runtime")
+		if err != nil {
+			return fmt.Errorf("store: migration 7: runtime default: %w", err)
+		}
+	}
+
+	for _, col := range registryColumnUpgrades {
+		if registryCols[col.name] {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE agent_registry ADD COLUMN %s %s", col.name, col.definition)
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("store: migration 7: add agent_registry.%s: %w", col.name, err)
+		}
+	}
+
+	// ALTER cannot change the default of an existing column. Rebuild the table
+	// so an early "runtime TEXT NOT NULL" matches the current schema.
+	if !runtimeHasDefault && registryCols["runtime"] {
+		if err := rebuildAgentRegistry(ctx, tx); err != nil {
+			return err
+		}
+	}
+
+	bindingCols, err := tableColumns(tx, "watch_bindings")
+	if err != nil {
+		return fmt.Errorf("store: migration 7: watch_bindings columns: %w", err)
+	}
+	if len(bindingCols) > 0 && !bindingCols["subscriber_id"] {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE watch_bindings ADD COLUMN subscriber_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: migration 7: add watch_bindings.subscriber_id: %w", err)
+		}
+	}
+	return nil
+}
+
+// columnHasDefault reports whether a column declares a DEFAULT clause.
+func columnHasDefault(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return defaultValue.Valid, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+// rebuildAgentRegistry copies rows into the canonical table definition, keeps
+// every explicit index, then swaps the tables inside the migration transaction.
+func rebuildAgentRegistry(ctx context.Context, tx *sql.Tx) error {
+	type indexDef struct{ sql string }
+	var indexes []indexDef
+	rows, err := tx.QueryContext(ctx, `
+		SELECT sql FROM sqlite_master
+		WHERE type = 'index' AND tbl_name = 'agent_registry' AND sql IS NOT NULL`)
+	if err != nil {
+		return fmt.Errorf("store: migration 7: list indexes: %w", err)
+	}
+	for rows.Next() {
+		var body string
+		if err := rows.Scan(&body); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: migration 7: scan index: %w", err)
+		}
+		indexes = append(indexes, indexDef{sql: body})
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("store: migration 7: close indexes: %w", err)
+	}
+
+	statements := []string{
+		registryV7Schema,
+		`INSERT INTO agent_registry_v7
+		   (project_key, agent_id, role, runtime, status, session_id,
+		    notify_adapter, notify_target, config_id, digest, capabilities,
+		    last_seen, worktree, created_at, updated_at)
+		 SELECT project_key, agent_id, role, COALESCE(runtime, ''), status,
+		        session_id, notify_adapter, notify_target, config_id,
+		        COALESCE(digest, ''), COALESCE(capabilities, '[]'),
+		        COALESCE(last_seen, 0), COALESCE(worktree, ''),
+		        created_at, updated_at
+		 FROM agent_registry`,
+		`DROP TABLE agent_registry`,
+		`ALTER TABLE agent_registry_v7 RENAME TO agent_registry`,
+	}
+	for _, stmt := range statements {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("store: migration 7: rebuild agent_registry: %w", err)
+		}
+	}
+	for _, idx := range indexes {
+		if _, err := tx.ExecContext(ctx, idx.sql); err != nil {
+			return fmt.Errorf("store: migration 7: restore index: %w", err)
+		}
+	}
+	return nil
+}
+
 func applyMigration(ctx context.Context, db *sql.DB, body string, version int) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, body); err != nil {
+	if fn, ok := codeMigrations[version]; ok {
+		if err := fn(ctx, tx); err != nil {
+			return err
+		}
+	} else if _, err := tx.ExecContext(ctx, body); err != nil {
 		return err
 	}
 	// schema_version belongs to SQLite; only user_version may be set here.
