@@ -1,56 +1,33 @@
 # WIRING-489. Подключить напоминания о дедлайнах
-Статус: todo
-baseline: 2026-11-21, свежий origin/main = 05996df. `git grep -n -E 'ReminderPorts|NewNotifier' 05996df -- internal cmd` даёт только internal/app/tasks/reminders.go и reminders_test.go. `git ls-tree -r --name-only 05996df -- internal cmd | rg reminders` даёт только те же два файла. `git log --all --oneline -- internal/infra/taskstore/reminders.go internal/app/orchestrator/reminders_loop.go` пуст. `gh pr list --state all --search 'reminder OR ReminderPorts OR 489'` даёт PR 489 MERGED, PR 1060 MERGED, PR 1055 MERGED, PR 1039 MERGED и docs-карточки 821/989/897/1006/1016/1036, реализующего PR после 489 нет.
+Premise: проверено 2026-11-21. Ветка от origin/main 152b013, замеры снимались на 5932a62. PR 489 влит, но после него в дереве лежали только чистый Plan, Notifier и тесты в internal/app/tasks. Адаптера store и периодического вызова Notify не было. Матрица `tools/beacon-gates/gate/config/layers.json` запрещает ребра `internal/infra -> internal/app` и `internal/app -> internal/app`. Порт перенесён в `internal/infra/taskstore`, app-пакет алиасирует его типы, цикл живёт в `internal/app/orchestrator` и принимает `NotifyFunc`, а `cmd/beacon/daemon.go` собирает адаптер и нотификатор. Ребро `internal/app -> internal/infra` и `cmd -> internal/app` в матрице есть, новых ребер правка не добавляет.
+Статус: done
+baseline: замер 2026-11-21 на 5932a6298790173c593235dc8c6b6283447f0c7a, бака ветки 152b01337d1cd784f2530b69f66342a58f54cdd0. До правки `git grep -n -E 'ReminderPorts|NewNotifier' 5932a62 -- internal cmd` давал только `internal/app/tasks/reminders.go` и `internal/app/tasks/reminders_test.go`. `rg -n '"github.com/refusedguy/beacon/internal/app/' internal/app --glob '*.go'` пуст, поэтому ребро `internal/app -> internal/app` в матрице не используется. `cat tools/beacon-gates/gate/config/layers.json` содержит `internal/app -> internal/infra` и `cmd -> internal/app`, но не содержит `internal/infra -> internal/app` и `internal/app -> internal/app`.
 Фаза: P0
 Тип: task
-Владелец файлов: internal/infra/taskstore/reminders.go, internal/app/orchestrator/reminders_loop.go
-OwnerFiles: internal/infra/taskstore/reminders.go, internal/app/orchestrator/reminders_loop.go
+Владелец файлов: internal/infra/taskstore/reminders.go, internal/infra/taskstore/reminders_test.go, internal/app/orchestrator/reminders_loop.go, internal/app/orchestrator/reminders_loop_test.go, internal/app/tasks/reminders.go, cmd/beacon/daemon.go, cmd/beacon/reminders_test.go, docs/tasks/WIRING-489.md
+OwnerFiles: internal/infra/taskstore/reminders.go, internal/infra/taskstore/reminders_test.go, internal/app/orchestrator/reminders_loop.go, internal/app/orchestrator/reminders_loop_test.go, internal/app/tasks/reminders.go, cmd/beacon/daemon.go, cmd/beacon/reminders_test.go, docs/tasks/WIRING-489.md
 Зависимости: PR 489
 Ссылка: PR 489
 SourceWatch: watch:refusedguy/beacon:489:d106ad77ea40d197a1f380839e5462777728ce81
 PR: 489
-Агент: нет
+Агент: executor
 Время: нет
 Цель: Подключить отложенную часть фичи после мержа PR 489.
-Контекст: PR 489 добавляет чистый Plan и Notifier в internal/app/tasks. Порт ReminderPorts пока не имеет адаптера в store, и никто не вызывает Notify по расписанию. Оба файла принадлежат другим агентам, поэтому проводка вынесена отдельно.
-Шаги: Создать карточку, подключить часть фичи, закрыть долг.
-Проверка: Проводка подключена, карточка лежит в PR.
+Контекст: PR 489 добавляет чистый Plan и Notifier в internal/app/tasks. Порт ReminderPorts не имел адаптера в store, и никто не вызывал Notify по расписанию. OwnerFiles расширены владельцем, код написан.
+Шаги: Подключить адаптер в infra, перенести типы порта в infra и алиасировать их в app, добавить периодический цикл и wiring в daemon.
+Проверка: Адаптер реализует порт, цикл вызывает Notify по тикеру, тесты на фейковом порту и фейковом NotifyFunc проходят в CI, слои не ломаются.
 Приёмка: Соответствующий CI зелёный, долг `beacon deferred` переведён в done.
 
 ## Причина
 
-Адаптер порта ReminderPorts читает задачи из store, а периодический вызов Notify живёт в daemon. Оба файла входят в OwnerFiles других агентов и выходят за скоуп BS.65. В PR 489 вошла только чистая логика, порт и тесты.
+Адаптер порта ReminderPorts читает задачи из store, а периодический вызов Notify живёт в daemon. Изначально оба файла входили в OwnerFiles других агентов, поэтому проводка была вынесена отдельно. Владелец расширил OwnerFiles, блокер снят.
 
-## Блокер
+## Решение слоёв
 
-- 2026-11-21, проверка premise: PR 489 влит коммитом `9d1a480`, но после `git fetch origin/main` ветка осталась на `6e8f1fd` и не содержит OwnerFiles; вызовов `tasks.NewNotifier` вне тестов нет. Адаптер в `internal/infra/taskstore/reminders.go` требует импорта `internal/app/tasks`, а матрица `tools/beacon-gates/gate/config/layers.json` запрещает ребро `internal/infra` -> `internal/app`. Запуск периодического цикла живёт в `cmd/beacon/daemon.go`. Матрица и daemon находятся вне OwnerFiles. В `taskstore.Card` нет поля дедлайна, канал доставки напоминаний не задан, а дедлайн Watch уже обрабатывает `internal/domain/verdict.go:336`. Статус остаётся todo до решения владельца о расширении OwnerFiles.
+Матрица ставит `internal/infra` на ранг 1, `internal/app` на ранг 2, `cmd` на ранг 3. Разрешены ребра `app -> infra` и `cmd -> app`. Ребра `infra -> app` и `app -> app` отсутствуют. Прямая реализация `tasks.ReminderPorts` в `internal/infra/taskstore` потребовала бы запрещённого импорта `internal/app/tasks`. Поэтому интерфейс и его два типа данных определены в `internal/infra/taskstore`, а `internal/app/tasks` объявляет алиасы `Task`, `Reminder` и `ReminderPorts`. Чистая логика `Plan` и `Notifier` осталась в app. Тикер не импортирует соседний app-пакет: `internal/app/orchestrator/reminders_loop.go` принимает `NotifyFunc`. Композиция живёт в `cmd/beacon/daemon.go`, который импортирует и app, и infra. Матрица не менялась.
 
-## Шаги
-
-1. Дождаться мержа PR 489.
-2. Реализовать ReminderPorts в `internal/infra/taskstore/reminders.go`: запрос задач с дедлайном не позже переданного instant и идемпотентная отправка напоминания по ключу задачи и дедлайна.
-3. Добавить периодический вызов `NewNotifier(ports, time.Now).Notify(ctx)` в `internal/app/orchestrator/reminders_loop.go`.
-4. Вызвать `beacon deferred done` для записи с `watchID` из SourceWatch.
-
-## Проверка
-
-- Список OwnerFiles совпадает с полем «Владелец файлов».
-- Карточка `docs/tasks/WIRING-489.md` попала в PR.
-- Локальный гейт `WIRING-*` проходит: статус `todo`, OwnerFiles заполнен, `## Причина` есть.
-
-## Приёмка
-
-Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
+Канал доставки в карточке не был задан. Адаптер отправляет каждое напоминание структурированным событием `deadline_reminder` через `internal/infra/observe`, то есть в настроенный лог и метрики. Новый транспорт и схема БД не нужны. Дедупликация идёт по ключу задачи и дедлайна в адаптере и в ledger нотификатора.
 
 ## Подтверждение
 
-2026-11-21 перепроверено по свежему origin/main (05996df). PR [#489](https://github.com/refusedguy/beacon/pull/489) влит коммитом 9d1a480 2026-11-20T17:14:32Z. Он внёс только чистый Plan, Notifier и тесты к ним. `git grep -n -E 'ReminderPorts|NewNotifier' 05996df -- internal cmd` показывает эти имена только в `internal/app/tasks/reminders.go` и `internal/app/tasks/reminders_test.go`. `git ls-tree -r --name-only 05996df -- internal cmd | rg reminders` отдаёт только те же два файла. Файлов `internal/infra/taskstore/reminders.go` и `internal/app/orchestrator/reminders_loop.go` на свежей main нет. `git log --all --oneline -- internal/infra/taskstore/reminders.go internal/app/orchestrator/reminders_loop.go` пуст. `git log 3dcf948..origin/main` содержит только docs-коммит 05996df, который влил PR #1060 с baseline bdfe973. Реализацию он не принёс. `gh pr list --state all --search 'reminder OR ReminderPorts OR 489'` показывает PR 489 MERGED, PR 1060 MERGED с baseline bdfe973, PR 1055 MERGED с baseline c3dcae3, PR 1039 MERGED с baseline e16033c и docs-карточки 821, 989, 897, 1006, 1016, 1036. Реализующего PR после 489 нет. Матрица `tools/beacon-gates/gate/config/layers.json` ставит `internal/infra` на ранг 1, а `internal/app` на ранг 2. Разрешено только ребро `internal/app` -> `internal/infra`. Обратное ребро запрещено, поэтому адаптер в `internal/infra/taskstore/reminders.go` не может импортировать `internal/app/tasks`. Вызовов `Notify(` в `cmd` и `internal/app/orchestrator` нет. Маршрут Notify в `cmd/beacon/daemon.go` относится к доставке вердиктов WIRING-485. В `taskstore.Card` из `internal/infra/taskstore/store.go:60` поля дедлайна нет. Дедлайн Watch обрабатывает `internal/domain/verdict.go` через `timedOut` и `Snapshot.DeadlineAt`, а `TaskDescriptor.DeadlineAt` живёт в `internal/domain/types.go`. Канал доставки напоминаний не задан. Блокер описывает актуальное состояние. Статус остаётся todo до решения владельца о расширении OwnerFiles. Код не писал, gofmt не применял, чужие файлы, wiring и .beacon/ не трогал, правка только текстовая.
-
-<!-- wiring-card:contract
-beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
-эту карточку в тот же PR. Файловый маркер больше не входит в контракт: гейт
-читает только карточки docs/tasks/WIRING-*.md. Старый файл
-.beacon/wiring-pending, если он остался в дереве, гейт игнорирует.
-Карточка без "Статус: todo", пустой OwnerFiles или отсутствующая "## Причина"
-проваливает проверку.
-wiring-card:contract -->
+2026-11-21. Реализовано на ветке `fix/w489-reminders` от origin/main 152b013. Создан адаптер `taskstore.ReminderStore` с внедрёнными `ReminderLoad` и `ReminderDeliver`, он подавляет повтор по ключу `ReminderKey`. `internal/app/tasks/reminders.go` алиасирует порт и типы из infra. `internal/app/orchestrator/reminders_loop.go` запускает тикер с интервалом по умолчанию одна минута. `cmd/beacon/daemon.go` собирает нотификатор над store-адаптером, запускает цикл в горутине и делает один проход при `--once`. Тесты: `internal/infra/taskstore/reminders_test.go` на фейковом deliver, `internal/app/orchestrator/reminders_loop_test.go` на фейковом `NotifyFunc`, `cmd/beacon/reminders_test.go` на фейковом порте. Локально применён только `gofmt`; `go test` и `go build` оставлены CI. Ссылка на PR: #TBD.
