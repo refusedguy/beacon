@@ -42,9 +42,32 @@ var (
 	priorityLineRe = regexp.MustCompile(`^- (P[0-9]+): ([0-9]+)$`)
 	countLineRe    = regexp.MustCompile(`\*\*([0-9]+)\*\*$`)
 
+	// ADR topics come from the first heading of each file, not from the
+	// filename: "# ADR 12: Topic" or "# ADR 0012. Topic". The number in the
+	// heading is ignored because the filename prefix is authoritative.
+	adrTopicRe = regexp.MustCompile(`^# ADR [0-9]+[.:]?\s*(.*)$`)
+
 	// Indirection keeps file access out of cmd/ and tools/ capability gates.
 	readFile  = os.ReadFile
 	writeFile = os.WriteFile
+
+	// adrIndexHeader is the human-written preamble of docs/adrs/README.md.
+	// Everything below "Индекс:" is generated from docs/adrs/*.md.
+	adrIndexHeader = strings.Join([]string{
+		"# Beacon. Architecture Decision Records",
+		"",
+		"Это каталог решений, согласованных с владельцем. Каждый ADR фиксирует одно решение, причину и последствия. Решения в этом каталоге обязательны для implementation.",
+		"",
+		"Статусы решений:",
+		"",
+		"- `accepted` владелец согласился явно.",
+		"- `default` я предложил, владелец не возразил. Может быть переопределно до гейта G0.",
+		"- `open` решение ещё не принято, ждёт отчёта или вопроса.",
+		"- `proposed` решение предложено, ожидает решения владельца.",
+		"",
+		"Индекс:",
+		"",
+	}, "\n")
 )
 
 type card struct {
@@ -80,7 +103,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	opts := options{}
 	fs.StringVar(&opts.repo, "repo", ".", "repository root containing docs/tasks")
 	fs.StringVar(&opts.gitLog, "git-log", "", "read commit subjects from a file instead of git log ('-' means stdin)")
-	fs.BoolVar(&opts.write, "write", false, "write card status lines and an existing ROADMAP_STATUS.md (default: dry run)")
+	fs.BoolVar(&opts.write, "write", false, "write card status lines, an existing ROADMAP_STATUS.md and docs/adrs/README.md (default: dry run)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -109,17 +132,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "roadmap-sync: roadmap: %v\n", err)
 		return 1
 	}
+	adrChanges, err := updateADRIndex(opts.repo, opts.write)
+	if err != nil {
+		fmt.Fprintf(stderr, "roadmap-sync: adr-index: %v\n", err)
+		return 1
+	}
 
 	mode := "dry run"
 	if opts.write {
 		mode = "written"
 	}
 	fmt.Fprintf(stdout, "roadmap-sync: %s, merged commits %d, merged cards %d, cards %d, changed %d\n",
-		mode, scan.commits, len(scan.ids), len(cards), len(changes)+len(roadmapChanges))
+		mode, scan.commits, len(scan.ids), len(cards), len(changes)+len(roadmapChanges)+len(adrChanges))
 	for _, line := range changes {
 		fmt.Fprintln(stdout, line)
 	}
 	for _, line := range roadmapChanges {
+		fmt.Fprintln(stdout, line)
+	}
+	for _, line := range adrChanges {
 		fmt.Fprintln(stdout, line)
 	}
 	fmt.Fprintf(stdout, "done: %d\ndropped: %d\ntodo: %d\n", counts[statusDone], counts[statusDropped], counts[statusTodo])
@@ -563,4 +594,149 @@ func countKeyStatus(key string) string {
 	default:
 		return statusTodo
 	}
+}
+
+// adrRow is one line of the generated ADR index.
+type adrRow struct {
+	number int
+	file   string
+	topic  string
+	status string
+}
+
+func adrIndexPath(repo string) string {
+	return filepath.Join(repo, "docs", "adrs", "README.md")
+}
+
+// adrNumberFromName mirrors docsgate's adrNumber: the numeric prefix of the
+// filename (0005-architecture-gates.md yields 5).
+func adrNumberFromName(base string) (int, bool) {
+	i := 0
+	for i < len(base) && base[i] >= '0' && base[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(base[:i])
+	return n, err == nil
+}
+
+// adrTopicFromHeading reads the human-written topic from "# ADR 12: Topic" or
+// "# ADR 0012. Topic". The number is not part of the topic.
+func adrTopicFromHeading(heading string) string {
+	match := adrTopicRe.FindStringSubmatch(strings.TrimSpace(heading))
+	if match == nil {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+// fallbackTopic keeps an index row readable when an ADR has no parseable
+// heading. The normal path always uses the heading.
+func fallbackTopic(base string) string {
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	i := 0
+	for i < len(name) && name[i] >= '0' && name[i] <= '9' {
+		i++
+	}
+	name = strings.TrimLeft(name[i:], "-")
+	return strings.ReplaceAll(name, "-", " ")
+}
+
+func firstNonEmptyLine(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// readADRIndexRows collects one row per ADR file, skipping the generated
+// README. Rows sort by ADR number, then by filename. The filename tie-break
+// keeps duplicate numbers deterministic (0260-fix-watch.md precedes
+// 0260-fixer.md) and preserves the order the index has always used.
+func readADRIndexRows(repo string) ([]adrRow, error) {
+	paths, err := filepath.Glob(filepath.Join(repo, "docs", "adrs", "*.md"))
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]adrRow, 0, len(paths))
+	for _, path := range paths {
+		base := filepath.Base(path)
+		if base == "README.md" {
+			continue
+		}
+		number, ok := adrNumberFromName(base)
+		if !ok {
+			continue
+		}
+		data, err := readFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		content := string(data)
+		topic := adrTopicFromHeading(firstNonEmptyLine(content))
+		if topic == "" {
+			topic = fallbackTopic(base)
+		}
+		rows = append(rows, adrRow{
+			number: number,
+			file:   base,
+			topic:  strings.ReplaceAll(topic, "|", `\|`),
+			status: fieldValue(content, "Статус"),
+		})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].number != rows[j].number {
+			return rows[i].number < rows[j].number
+		}
+		return rows[i].file < rows[j].file
+	})
+	return rows, nil
+}
+
+func renderADRIndex(rows []adrRow) string {
+	lines := strings.Split(strings.TrimSuffix(adrIndexHeader, "\n"), "\n")
+	lines = append(lines, "", "| ADR | Тема | Статус |", "|---|---|---|")
+	for _, row := range rows {
+		lines = append(lines, fmt.Sprintf("| %04d | %s | %s |", row.number, row.topic, row.status))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// updateADRIndex rebuilds docs/adrs/README.md from docs/adrs/*.md. The file is
+// derived and gitignored (IDX-11), so a fresh checkout has no index: --write
+// creates it when ADR files exist. A repository without ADR files is left
+// alone, which keeps small fixtures and non-ADR repos untouched.
+func updateADRIndex(repo string, write bool) ([]string, error) {
+	rows, err := readADRIndexRows(repo)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	path := adrIndexPath(repo)
+	want := renderADRIndex(rows)
+	data, err := readFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err == nil && string(data) == want {
+		return nil, nil
+	}
+	verb := "update"
+	if err != nil {
+		verb = "create"
+	}
+	line := fmt.Sprintf("docs/adrs/README.md: %s from %d ADR files", verb, len(rows))
+	if !write {
+		return []string{line}, nil
+	}
+	if err := writeFile(path, []byte(want), 0o644); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return []string{line}, nil
 }
