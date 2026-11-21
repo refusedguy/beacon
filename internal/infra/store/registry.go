@@ -195,8 +195,8 @@ func validateBinding(b WatchBinding) error {
 	if strings.TrimSpace(b.WatchID) == "" {
 		return domain.NewAppError(domain.CodeInvalidInput, "store: binding: empty watch id")
 	}
-	if b.Revision > uint64(maxSQLiteInt64) {
-		return domain.NewAppError(domain.CodeInvalidInput, "store: binding: revision out of range")
+	if err := validateRevision(b.Revision); err != nil {
+		return err
 	}
 	return nil
 }
@@ -205,6 +205,15 @@ func validateBinding(b WatchBinding) error {
 // value is a compile-time constant so no uint64 can silently wrap to negative
 // when it reaches the database driver.
 const maxSQLiteInt64 = int64(^uint64(0) >> 1)
+
+// validateRevision rejects a revision that would wrap when stored as a SQLite
+// INTEGER. Both binding validators call it so the range check has one home.
+func validateRevision(revision uint64) error {
+	if revision > uint64(maxSQLiteInt64) {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: binding: revision out of range")
+	}
+	return nil
+}
 
 func encodeCapabilities(caps []string) []byte {
 	if len(caps) == 0 {

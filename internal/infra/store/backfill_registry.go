@@ -50,26 +50,11 @@ func backfillRuntime(role domain.Role) string {
 // named column. Migration 0005 has runtime, while a registry created on first
 // use by registry.go does not. Both shapes are accepted.
 func registryHasColumn(q columnQuerier, name string) (bool, error) {
-	rows, err := q.Query(`PRAGMA table_info(agent_registry)`)
+	cols, err := tableColumns(q, "agent_registry")
 	if err != nil {
 		return false, fmt.Errorf("store: backfill: table info: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, pk int
-		var column, columnType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &column, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return false, fmt.Errorf("store: backfill: scan table info: %w", err)
-		}
-		if strings.EqualFold(column, name) {
-			return true, rows.Err()
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return false, nil
+	return cols[strings.ToLower(name)], nil
 }
 
 // backfillInsertSQL builds the insert for the schema in use. The migration

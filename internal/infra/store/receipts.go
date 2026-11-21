@@ -480,32 +480,12 @@ func splitCompleteLines(data []byte) ([][]byte, bool) {
 // here too instead of in the migration corpus. column is one of our own fixed
 // names ("source", "version"), never external input.
 func ensureReceiptColumn(tx *sql.Tx, column string) error {
-	rows, err := tx.Query(`PRAGMA table_info(receipts)`)
+	cols, err := tableColumns(tx, "receipts")
 	if err != nil {
 		return fmt.Errorf("store: receipts: table info: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var (
-			cid      int
-			name     string
-			typ      string
-			notNull  int
-			defaultV any
-			primary  int
-		)
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultV, &primary); err != nil {
-			return fmt.Errorf("store: receipts: scan table info: %w", err)
-		}
-		if strings.EqualFold(name, column) {
-			return nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("store: receipts: table info rows: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("store: receipts: close table info: %w", err)
+	if cols[strings.ToLower(column)] {
+		return nil
 	}
 	if _, err := tx.Exec(fmt.Sprintf(`ALTER TABLE receipts ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, column)); err != nil {
 		return fmt.Errorf("store: receipts: add %s column: %w", column, err)
@@ -1136,32 +1116,9 @@ func ensureClientReceipts(tx *sql.Tx) error {
 	if _, err := tx.Exec(createClientReceiptsSQL); err != nil {
 		return fmt.Errorf("store: client receipts: create table: %w", err)
 	}
-	rows, err := tx.Query(`PRAGMA table_info(client_receipts)`)
+	present, err := tableColumns(tx, "client_receipts")
 	if err != nil {
 		return fmt.Errorf("store: client receipts: table info: %w", err)
-	}
-	present := map[string]bool{}
-	for rows.Next() {
-		var (
-			cid     int
-			name    string
-			typ     string
-			notNull int
-			def     any
-			pk      int
-		)
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
-			rows.Close()
-			return fmt.Errorf("store: client receipts: scan table info: %w", err)
-		}
-		present[strings.ToLower(name)] = true
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("store: client receipts: table info rows: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("store: client receipts: close table info: %w", err)
 	}
 	for column, def := range clientReceiptColumns {
 		if present[column] {
