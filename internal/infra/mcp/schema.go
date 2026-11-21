@@ -239,6 +239,40 @@ type ListRunningOutput struct {
 	Verdict string         `json:"verdict,omitempty"`
 }
 
+// ThreadMessage is one item of a thread history read by t3_thread_read.
+// Position is a monotonic, opaque ordering value the client does not have to
+// interpret. CreatedBy names the actor that produced the item. CreationSource
+// names the ingress that carried it. The two are separate fields so an agent
+// message and a human message keep distinct provenance (T3.236, S4.014).
+type ThreadMessage struct {
+	Position       uint64 `json:"position"`
+	Text           string `json:"text"`
+	CreatedBy      string `json:"createdBy"`
+	CreationSource string `json:"creationSource"`
+}
+
+// ThreadReadOutput is the response of t3_thread_read. The tool reads the newest
+// part of one thread that fits in the character limit and returns it in
+// ascending position order. HasMore is true when older messages remain.
+// EarlierPosition is an opaque cursor for the next call; it is omitted when the
+// whole history fits. CharCount counts the characters actually returned so a
+// client can see why the page ended where it did (T3.236).
+type ThreadReadOutput struct {
+	ThreadID        string          `json:"threadID"`
+	Messages        []ThreadMessage `json:"messages"`
+	CharCount       int             `json:"charCount"`
+	HasMore         bool            `json:"hasMore"`
+	EarlierPosition string          `json:"earlierPosition,omitempty"`
+}
+
+// ThreadReadOutputSchema derives the schema of the opt-in t3_thread_read tool.
+// It is intentionally outside outputSchemaFactories: the nine advertised tools
+// are pinned byte-for-byte by contract_test.go and schema_test.go, so adding a
+// tenth factory would break that contract without changing any handler.
+func ThreadReadOutputSchema() (*jsonschema.Schema, error) {
+	return OutputSchema[ThreadReadOutput]()
+}
+
 // OKOutput is the response of beacon_ack and beacon_cancel_watch.
 type OKOutput struct {
 	OK bool `json:"ok"`

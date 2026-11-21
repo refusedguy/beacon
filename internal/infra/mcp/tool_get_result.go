@@ -595,6 +595,20 @@ func clampExcerpt(s string, limit int) string {
 	return cut
 }
 
+// clampRunes truncates s to at most limit characters. It is the character
+// counterpart of clampExcerpt, which counts bytes. Thread history uses it
+// because the T3.236 ceiling counts characters, not encoded bytes, so a
+// multibyte message cannot consume more than its share of the page.
+func clampRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= limit {
+		return s
+	}
+	return string([]rune(s)[:limit])
+}
+
 // envFailureExcerptSource is the zero-wiring default. It reads the token from
 // BEACON_GITHUB_TOKEN only: GitHub Actions injects GITHUB_TOKEN into every
 // test run, and gating on that would make hermetic tests call the network. A

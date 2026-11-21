@@ -614,6 +614,39 @@ func attachTaskClaim(s *mcpsdk.Server, handler *TaskClaimHandler, outputSchema *
 	}, handler.Handle)
 }
 
+// AttachThreadRead installs t3_thread_read as an opt-in read-only tool. The
+// name is deliberately absent from ToolNames and outputSchemaFactories: the
+// nine advertised tools have a byte-for-byte pinned tools/list contract, so a
+// tenth tool must be attached by a composition root that needs thread history.
+// A nil source leaves the server unchanged, and a nil schema falls back to the
+// derived one, so a broken optional schema cannot suppress the real handler.
+func AttachThreadRead(server *mcpsdk.Server, source ThreadHistorySource, outputSchema *jsonschema.Schema) {
+	if server == nil || source == nil {
+		return
+	}
+	if outputSchema == nil {
+		derived, err := ThreadReadOutputSchema()
+		if err == nil {
+			outputSchema = derived
+		}
+		if outputSchema == nil {
+			outputSchema = &jsonschema.Schema{Type: "object"}
+		}
+	}
+	annotations := mcpsdk.ToolAnnotations{
+		ReadOnlyHint:    true,
+		DestructiveHint: boolPtr(false),
+		IdempotentHint:  true,
+	}
+	server.RemoveTools(ThreadReadToolName)
+	mcpsdk.AddTool(server, &mcpsdk.Tool{
+		Name:         ThreadReadToolName,
+		Description:  "Read a bounded tail of one thread history with an earlierPosition continuation and provenance on every message.",
+		OutputSchema: outputSchema,
+		Annotations:  &annotations,
+	}, NewThreadReadHandler(source).Handle)
+}
+
 // emptySnapshotReader is the minimal dependency used when no SnapshotReader is
 // injected. It is a real SnapshotFunc, not a stub handler: the observability
 // tools still run their own projection over the empty state.

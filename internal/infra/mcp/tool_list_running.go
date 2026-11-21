@@ -276,7 +276,9 @@ func NewListRunningHandler(reader SnapshotReader) *ListRunningHandler {
 }
 
 // encodeEventCursor turns a monotonic event position into an opaque string
-// suitable for Last-Event-ID. Clients never have to interpret it.
+// suitable for Last-Event-ID. Clients never have to interpret it. The opt-in
+// t3_thread_read tool reuses this base64-of-decimal shape for its
+// earlierPosition cursor, so both read tools speak the same continuation form.
 func encodeEventCursor(seq uint64) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatUint(seq, 10)))
 }
