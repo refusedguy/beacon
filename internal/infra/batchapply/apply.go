@@ -470,10 +470,67 @@ func (r *runner) applyClosures(root string, closures map[string]cardClosure) err
 	return nil
 }
 
-// applyMergePlan merges only PRs whose required checks are all PASS. A PR
-// with no checks is doc-only by the repository's paths-ignore rule. The plan
-// itself comes from a research agent; this function re-verifies every gate
-// with gh before acting.
+// requiredCheckOrder is the fixed set of checks a code PR must carry before
+// auto-merge. The order keeps reports and tests deterministic.
+var requiredCheckOrder = []string{"build", "test", "gates", "gates-binary"}
+
+// Hold reasons for a code PR that fails the gate. Both are Russian interface
+// prose, so they follow the language policy above.
+const (
+	holdMissingCheck = "удержан, обязательная проверка отсутствует"
+	holdNotGreen     = "удержан, обязательная проверка не зелёная"
+)
+
+// isRequiredCheck reports whether name is one of the checks this tool gates on.
+func isRequiredCheck(name string) bool {
+	for _, required := range requiredCheckOrder {
+		if name == required {
+			return true
+		}
+	}
+	return false
+}
+
+// greenCheckState accepts only a genuine success. GitHub counts skipped and
+// neutral as satisfying a required check on its side, so this gate refuses to
+// treat either as green. A tool that did not run must not look like a passed
+// check.
+func greenCheckState(state string) bool {
+	return strings.EqualFold(state, "SUCCESS") || strings.EqualFold(state, "PASS")
+}
+
+// evaluateChecks returns an empty string when the reported checks allow a
+// merge. No checks means a doc-only PR under paths-ignore: the workflows did
+// not run, so there is nothing to verify. A non-empty list means a code PR,
+// which must carry every required check in a green state. A missing check and
+// a non-green check are held with different reasons. Every reported check is
+// inspected, so a green group cannot hide one neutral or failed run.
+func evaluateChecks(checks []ghCheck) string {
+	if len(checks) == 0 {
+		return ""
+	}
+	seen := map[string]bool{}
+	for _, c := range checks {
+		if !isRequiredCheck(c.Name) {
+			continue
+		}
+		seen[c.Name] = true
+		if !greenCheckState(c.State) {
+			return holdNotGreen
+		}
+	}
+	for _, name := range requiredCheckOrder {
+		if !seen[name] {
+			return holdMissingCheck
+		}
+	}
+	return ""
+}
+
+// applyMergePlan merges only PRs whose required checks are all present and
+// green. A PR with no checks is doc-only by the repository's paths-ignore rule.
+// The plan itself comes from a research agent; this function re-verifies every
+// gate with gh before acting.
 func (r *runner) applyMergePlan(decisions []mergeDecision) {
 	merged, held := 0, 0
 	for _, d := range decisions {
@@ -498,21 +555,8 @@ func (r *runner) applyMergePlan(decisions []mergeDecision) {
 			held++
 			continue
 		}
-		required := map[string]bool{"build": true, "test": true, "gates": true, "gates-binary": true}
-		green := 0
-		blocked := false
-		for _, c := range checks {
-			if !required[c.Name] {
-				continue
-			}
-			if strings.EqualFold(c.State, "PASS") || strings.EqualFold(c.State, "SUCCESS") {
-				green++
-			} else {
-				blocked = true
-			}
-		}
-		if blocked || (len(checks) > 0 && green < len(required)) {
-			r.printf("PR %d: удержан, обязательные проверки не зелёные\n", d.PR)
+		if reason := evaluateChecks(checks); reason != "" {
+			r.printf("PR %d: %s\n", d.PR, reason)
 			held++
 			continue
 		}

@@ -382,3 +382,65 @@ func hasCyrillic(s string) bool {
 	}
 	return false
 }
+
+// TestEvaluateChecksMergeGate pins the auto-merge gate. A doc-only PR has no
+// checks and passes. A code PR must carry every required check in a green
+// state. Missing and non-green checks are held with different reasons, and
+// GitHub's skipped and neutral states do not count as green. Every reported
+// check is inspected, so a green group cannot hide a neutral run.
+func TestEvaluateChecksMergeGate(t *testing.T) {
+	allGreen := []ghCheck{
+		{Name: "build", State: "SUCCESS"},
+		{Name: "test", State: "SUCCESS"},
+		{Name: "gates", State: "SUCCESS"},
+		{Name: "gates-binary", State: "SUCCESS"},
+	}
+	withState := func(name, state string) []ghCheck {
+		out := append([]ghCheck(nil), allGreen...)
+		for i := range out {
+			if out[i].Name == name {
+				out[i].State = state
+			}
+		}
+		return out
+	}
+
+	cases := []struct {
+		name   string
+		checks []ghCheck
+		want   string
+	}{
+		{"doc-only PR reports no checks", nil, ""},
+		{"empty check list passes", []ghCheck{}, ""},
+		{"all required checks green", allGreen, ""},
+		{"lowercase success is green", []ghCheck{
+			{Name: "build", State: "success"},
+			{Name: "test", State: "PASS"},
+			{Name: "gates", State: "success"},
+			{Name: "gates-binary", State: "pass"},
+		}, ""},
+		{"missing required check is held", []ghCheck{
+			{Name: "build", State: "SUCCESS"},
+			{Name: "test", State: "SUCCESS"},
+			{Name: "gates", State: "SUCCESS"},
+		}, holdMissingCheck},
+		{"only non-required checks is held", []ghCheck{
+			{Name: "e2e", State: "SUCCESS"},
+		}, holdMissingCheck},
+		{"neutral required check is held", withState("gates", "NEUTRAL"), holdNotGreen},
+		{"skipped required check is held", withState("test", "SKIPPED"), holdNotGreen},
+		{"failed required check is held", withState("build", "FAILURE"), holdNotGreen},
+		{"green group cannot hide a neutral run", append(withState("gates", "SUCCESS"),
+			ghCheck{Name: "gates", State: "NEUTRAL"}), holdNotGreen},
+		{"non-required failure does not block", append(append([]ghCheck(nil), allGreen...),
+			ghCheck{Name: "e2e", State: "FAILURE"}), ""},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := evaluateChecks(tc.checks); got != tc.want {
+				t.Fatalf("evaluateChecks() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
