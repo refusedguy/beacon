@@ -66,6 +66,16 @@ type TaskClaimStore interface {
 	Claim(ctx context.Context, in TaskClaimInput, claimedAt string) (TaskClaimOutput, error)
 }
 
+// AgentCardLookup is the read side of a claim store: the card an agent
+// currently holds. Claim records the agent id in the card's Агент field, so
+// that field is the durable cardID -> agentID link; this interface exposes its
+// lookup without widening the write-only TaskClaimStore port. The composition
+// root uses it to bind a Watch that registered without an explicit cardID to
+// the card its agent claimed, so a merged PR can close that card.
+type AgentCardLookup interface {
+	CardIDForAgent(agentID string) string
+}
+
 // TaskClaimHandler validates the input and delegates the atomic step to the
 // store. It owns no card state of its own, so a fresh handler can be built for
 // every server without losing a claim.
@@ -269,6 +279,34 @@ func (s *FileTaskClaimStore) cards() ([]claimCard, error) {
 	}
 	sort.Slice(cards, func(i, j int) bool { return cards[i].ID < cards[j].ID })
 	return cards, nil
+}
+
+// CardIDForAgent returns the card the agent currently holds, or "" when it
+// holds none. Claim writes the agent id into the card's Агент field under the
+// same flock as the status swap, so that field is a durable cardID -> agentID
+// link and no second store is needed. When an agent holds several cards the
+// most recently claimed one wins, which is the card its next Watch is for.
+// A bad or unreadable tasks dir yields no link; the caller keeps the Watch it
+// already registered.
+func (s *FileTaskClaimStore) CardIDForAgent(agentID string) string {
+	agentID = strings.TrimSpace(agentID)
+	if s == nil || agentID == "" || strings.TrimSpace(s.TasksDir) == "" {
+		return ""
+	}
+	cards, err := s.cards()
+	if err != nil {
+		return ""
+	}
+	cardID, latest := "", ""
+	for _, c := range cards {
+		if c.Status != "in_progress" || c.Agent != agentID {
+			continue
+		}
+		if cardID == "" || c.Time > latest {
+			cardID, latest = c.ID, c.Time
+		}
+	}
+	return cardID
 }
 
 func (s *FileTaskClaimStore) lockPath() string {

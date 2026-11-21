@@ -524,6 +524,27 @@ type watchPRInputWithCard struct {
 	CardID string `json:"cardID,omitempty" jsonschema:"card id to close when the PR merges, for example T3.329"`
 }
 
+// claimedCardForNotify resolves the card a Watch should close from the agent
+// that registered it. beacon_task_claim writes the agent id into the card's
+// Агент field, so that field is the durable cardID -> agentID link. The notify
+// target carries the same session id, so a Watch registered without a cardID
+// can still be bound to the claimed card. An absent target, a store without a
+// lookup, or an agent holding no card leaves the Watch unlinked.
+func claimedCardForNotify(store mcp.TaskClaimStore, notify *mcp.WatchPRNotify) string {
+	if notify == nil {
+		return ""
+	}
+	agentID := strings.TrimSpace(notify.Target)
+	if agentID == "" {
+		return ""
+	}
+	lookup, ok := store.(mcp.AgentCardLookup)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(lookup.CardIDForAgent(agentID))
+}
+
 // attachWatchPRWithCardLink installs the real watch_pr handler and records the
 // optional cardID link after a successful registration. A failed link write is
 // logged but does not fail a Watch that is already registered.
@@ -554,6 +575,9 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 			return result, out, err
 		}
 		cardID := strings.TrimSpace(in.CardID)
+		if cardID == "" {
+			cardID = claimedCardForNotify(deps.TaskClaimStore, in.Notify)
+		}
 		if cardID == "" {
 			return result, out, err
 		}
