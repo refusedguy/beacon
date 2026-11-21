@@ -38,6 +38,65 @@ import (
 // importing app (ADR 0005).
 var _ mcp.PrecheckJournal = (*taskcli.Service)(nil)
 
+// deferredCardLinks binds the cibridge CardLinks port to the deferred wiring
+// queue in the composition root. A merged Watch marks its deferred card done;
+// that row is the durable record the wiring acceptance check reads. The store
+// transition is idempotent by (watchID, reason), so a repeated merged
+// observation cannot write the card twice.
+type deferredCardLinks struct {
+	db   *store.DB
+	root string
+}
+
+var _ cibridge.CardLinks = (*deferredCardLinks)(nil)
+
+func (l *deferredCardLinks) CloseMerged(_ context.Context, watchID string, pr int, at time.Time) error {
+	if l == nil || l.db == nil {
+		return nil
+	}
+	rows, err := l.db.ListDeferred("")
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		if row.WatchID != watchID {
+			continue
+		}
+		if _, err := l.db.MarkDeferredDone(row.WatchID, row.Reason); err != nil {
+			return err
+		}
+		if err := closeWiringCard(l.root, pr, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// closeWiringCard flips the deferred card to done and records the merged PR.
+// The confirmation line makes the write idempotent: a repeated merged
+// observation leaves the file unchanged.
+func closeWiringCard(root string, pr int, at time.Time) error {
+	if root == "" || pr <= 0 {
+		return nil
+	}
+	path := filepath.Join(root, "docs", "tasks", fmt.Sprintf("WIRING-%d.md", pr))
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	text := string(raw)
+	if strings.Contains(text, fmt.Sprintf("PR #%d MERGED", pr)) {
+		return nil
+	}
+	text = strings.Replace(text, "Статус: todo", "Статус: done", 1)
+	text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n",
+		pr, at.UTC().Format("2006-01-02"))
+	return os.WriteFile(path, []byte(text), 0o644)
+}
+
 // mcpStateDBName is the SQLite file inside the Beacon state directory
 // (ADR 0011, ADR 0015).
 const mcpStateDBName = "beacon.db"
@@ -1552,7 +1611,8 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
 		WithMerger(cfg.batch).
 		WithAutoRebase(cfg.batch).
-		WithBlockerControl(cfg.db)
+		WithBlockerControl(cfg.db).
+		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root})
 	updated := bridge.Refresh(ctx)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
 		if err := cfg.db.SaveRuntimeStats(withPollerStats(metrics.SnapshotJSON()), time.Now()); err != nil {
