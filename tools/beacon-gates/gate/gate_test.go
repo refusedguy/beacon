@@ -542,7 +542,7 @@ func TestPropertyCheckLinks(t *testing.T) {
 		}
 		linkLine := len(lines) + 1
 		var link string
-		var files map[string]string
+		files := map[string]string{}
 		var want []linkWant
 		switch kind {
 		case 0:
