@@ -4,7 +4,7 @@
 Тип: task
 Владелец файлов: internal/infra/otel/local.go, internal/infra/otel/local_test.go
 Зависимости: 
-Ссылка: 
+Ссылка: PR #854 (43d2788)
 Агент: нет
 Время: нет
 Цель: Привести имена и атрибуты локальных спанов к конвенциям: operation.name, provider.name, tool.name, tool.call.id и tool.type.
