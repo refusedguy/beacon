@@ -46,6 +46,13 @@ type stateStore interface {
 	ObligationStore
 }
 
+// liveWatchSource is the optional store port that includes blocked Watches.
+// stateStore only promises ActiveWatches, so a store that has not been upgraded
+// keeps the legacy alias set.
+type liveWatchSource interface {
+	LiveWatches() ([]Watch, error)
+}
+
 // Fanout applies the registration and fan-out rules. It holds a stateStore and
 // a Clock through their domain ports. The mutex serializes the check-then-act
 // sequence so the alias and limit invariants hold under concurrent calls in
@@ -111,7 +118,18 @@ func (f *Fanout) Subscribe(w Watch, s Subscriber) (Subscription, error) {
 		return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 	}
 
-	existing := findByAlias(active, w.Repo, w.PR, w.HeadSHA)
+	// The alias lookup must include blocked Watches. A repeat registration on
+	// the same SHA otherwise looks new and overwrites the block with a fresh
+	// watching record. The active set still drives every watch limit.
+	live := active
+	if src, ok := f.store.(liveWatchSource); ok {
+		live, err = src.LiveWatches()
+		if err != nil {
+			return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
+		}
+	}
+
+	existing := findByAlias(live, w.Repo, w.PR, w.HeadSHA)
 	newWatch := existing == nil
 
 	target := w

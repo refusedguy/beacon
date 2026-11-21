@@ -748,6 +748,19 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			skipped++
 			continue
 		}
+		obs, ok := observations[w.ID]
+
+		// A moved head invalidates the Watch even when it is blocked. Run this
+		// before the blocked branch so a force-push closes the old Watch and
+		// stages a successor instead of leaving the block in place.
+		if ok {
+			if head := strings.TrimSpace(obs.pr.HeadRefOid); head != "" && head != w.HeadSHA && !isTerminalState(obs.pr.State) {
+				b.handleHeadChanged(w, head, now, cycleID)
+				skipped++
+				continue
+			}
+		}
+
 		// A blocked Watch waits on outside action. Do not publish a retry for
 		// it; only steer the orchestrator so it can assign a FIX agent.
 		if w.Status == domain.StatusBlocked || w.Blocked != nil {
@@ -760,7 +773,6 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			skipped++
 			continue
 		}
-		obs, ok := observations[w.ID]
 		if !ok {
 			skipped++
 			continue
@@ -772,15 +784,6 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		// shared incident on the base branch.
 		if b.rebaseBudgetExhausted(w) {
 			updated += b.blockRebaseExhausted(ctx, w, now, cycleID)
-			skipped++
-			continue
-		}
-
-		// A moved head invalidates the Watch. Apply the domain event so the
-		// old Watch closes with closeReason=head_changed and a successor with
-		// the same subscribers and OrchestratorID is created for the new SHA.
-		if head := strings.TrimSpace(obs.pr.HeadRefOid); head != "" && head != w.HeadSHA && !isTerminalState(obs.pr.State) {
-			b.handleHeadChanged(w, head, now, cycleID)
 			skipped++
 			continue
 		}
