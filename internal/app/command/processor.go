@@ -10,8 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/refusedguy/beacon/internal/infra/channel"
 )
 
 // Effect is both the intent the processor commits and the effect handed to
@@ -103,10 +101,24 @@ func validate(in Effect) error {
 // route the effect without decoding the payload twice.
 const ChannelCommandKind = "channel_command"
 
+// ChannelCommand is the consumer-owned projection of one normalized channel
+// command. The ingress adapter in cmd/beacon maps the concrete channel.Command
+// onto this shape, so this package declares no infra import (ARDH-15). The
+// field names and JSON shape match the ingress type, which keeps the stored
+// effect readable by the existing apply sink.
+type ChannelCommand struct {
+	Actor     string
+	Verb      string
+	Target    string
+	Note      string
+	RequestID string
+}
+
 // ChannelSink adapts a normalized channel command to the durable processor.
-// It implements channel.CommandSink: the ingress hands it a Command, and the
-// processor records the intent and outbox entry before the caller's sink runs
-// the effect (BS.60, WIRING-486).
+// The composition root supplies an adapter that implements channel.CommandSink
+// by mapping the ingress command onto ChannelCommand. The processor records
+// the intent and outbox entry before the caller's sink runs the effect
+// (BS.60, WIRING-486).
 type ChannelSink struct {
 	processor *Processor
 }
@@ -119,7 +131,7 @@ func NewChannelSink(processor *Processor) *ChannelSink {
 // Accept records cmd as an Effect and runs the processor's effect sink. A
 // repeated request id replays the original effect instead of writing another
 // row, so a channel that resends a delivery cannot apply a decision twice.
-func (s *ChannelSink) Accept(ctx context.Context, cmd channel.Command) error {
+func (s *ChannelSink) Accept(ctx context.Context, cmd ChannelCommand) error {
 	if s == nil || s.processor == nil {
 		return ErrNilProcessor
 	}
@@ -142,11 +154,11 @@ func (s *ChannelSink) Accept(ctx context.Context, cmd channel.Command) error {
 // the note is deliberately excluded so a reworded note does not make a second
 // effect. The escape makes the composite unambiguous when a value contains a
 // ':' or a backslash.
-func channelEffectKey(cmd channel.Command) string {
+func channelEffectKey(cmd ChannelCommand) string {
 	if cmd.RequestID != "" {
 		return ChannelCommandKind + ":" + escapeChannelKey(cmd.RequestID)
 	}
-	parts := []string{string(cmd.Actor), cmd.Verb, cmd.Target}
+	parts := []string{cmd.Actor, cmd.Verb, cmd.Target}
 	for i, part := range parts {
 		parts[i] = escapeChannelKey(part)
 	}

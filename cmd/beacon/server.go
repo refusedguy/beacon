@@ -106,7 +106,7 @@ func (r channelSenderResolver) Resolve(_ context.Context, _ string, sender strin
 func buildChannelIngress(cfg channelConfig, outbox appcommand.Outbox, apply appcommand.Sink) (*channel.Ingress, error) {
 	resolver := channelSenderResolver{senders: cfg.Senders}
 	processor := appcommand.New(outbox, apply)
-	return channel.New(cfg.Enabled, resolver, appcommand.NewChannelSink(processor))
+	return channel.New(cfg.Enabled, resolver, &channelCommandSink{inner: appcommand.NewChannelSink(processor)})
 }
 
 // channelApplySink is the effect the processor runs after it commits. It

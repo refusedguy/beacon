@@ -15,6 +15,9 @@ import (
 	"strings"
 	"time"
 
+	// ARDH-15: observe is the documented cross-cutting exception. Metrics are
+	// emitted at the decision sites; a port through every call would add noise
+	// without moving an adapter.
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 

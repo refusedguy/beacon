@@ -184,7 +184,7 @@ func orchestratorDepsFromDB(c *CLI, db *store.DB) (orchestratorDeps, error) {
 		}
 		return out, nil
 	})
-	dbStore := orchestrator.NewDBStore(reader, db)
+	dbStore := newDBOrchestratorStore(reader, db)
 	// The resolver reads merged PRs from the SQLite Watch rows and probes file
 	// refs with local git. It never starts `gh pr view`, so a dependency check
 	// adds no CLI process to the auto-merge gateway.

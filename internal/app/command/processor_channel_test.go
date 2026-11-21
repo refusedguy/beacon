@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
-
-	"github.com/refusedguy/beacon/internal/infra/channel"
 )
 
 // channelTestOutbox is the mock persistence port. It records the committed
@@ -43,7 +41,7 @@ func TestChannelSinkCommitsEffectBeforeApplying(t *testing.T) {
 		return nil
 	})
 	sink := NewChannelSink(proc)
-	in := channel.Command{
+	in := ChannelCommand{
 		Actor: "ses_ch_1", Verb: "approve", Target: "w-7", Note: "looks good", RequestID: "req-9",
 	}
 
@@ -57,7 +55,7 @@ func TestChannelSinkCommitsEffectBeforeApplying(t *testing.T) {
 	if outbox.key != wantKey || outbox.kind != ChannelCommandKind {
 		t.Fatalf("effect = (%q, %q), want (%q, %q)", outbox.key, outbox.kind, wantKey, ChannelCommandKind)
 	}
-	var stored channel.Command
+	var stored ChannelCommand
 	if err := json.Unmarshal(outbox.payload, &stored); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
@@ -77,7 +75,7 @@ func TestChannelSinkReplayRunsNoEffect(t *testing.T) {
 		return nil
 	}))
 
-	if err := sink.Accept(context.Background(), channel.Command{
+	if err := sink.Accept(context.Background(), ChannelCommand{
 		Actor: "ses_ch_2", Verb: "reject", Target: "w-8",
 	}); err != nil {
 		t.Fatalf("Accept: %v", err)
@@ -90,7 +88,7 @@ func TestChannelSinkReplayRunsNoEffect(t *testing.T) {
 func TestChannelSinkKeyDoesNotDependOnNote(t *testing.T) {
 	first := &channelTestOutbox{created: true}
 	second := &channelTestOutbox{created: true}
-	in := channel.Command{Actor: "ses_ch_3", Verb: "pause", Target: "w-9", Note: "first"}
+	in := ChannelCommand{Actor: "ses_ch_3", Verb: "pause", Target: "w-9", Note: "first"}
 	if err := NewChannelSink(New(first, nil)).Accept(context.Background(), in); err != nil {
 		t.Fatalf("first Accept: %v", err)
 	}
@@ -108,7 +106,7 @@ func TestChannelSinkKeyDoesNotDependOnNote(t *testing.T) {
 }
 
 func TestChannelSinkRejectsNilProcessor(t *testing.T) {
-	err := NewChannelSink(nil).Accept(context.Background(), channel.Command{})
+	err := NewChannelSink(nil).Accept(context.Background(), ChannelCommand{})
 	if !errors.Is(err, ErrNilProcessor) {
 		t.Fatalf("error = %v, want ErrNilProcessor", err)
 	}
