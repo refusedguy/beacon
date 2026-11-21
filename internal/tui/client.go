@@ -19,8 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/refusedguy/beacon/internal/domain"
 )
 
 const (
@@ -151,10 +149,11 @@ type Watch struct {
 }
 
 // BlockedInfo is the reason a Watch is paused and the number of fix attempts.
-// Reason is the closed domain code, so an unknown value never reaches the UI.
+// Reason carries one of the domain block codes; the TUI mirrors them locally
+// because the layer matrix forbids importing internal/domain here.
 type BlockedInfo struct {
-	Reason      domain.BlockReason `json:"reason"`
-	FixAttempts int                `json:"fixAttempts"`
+	Reason      string `json:"reason"`
+	FixAttempts int    `json:"fixAttempts"`
 }
 
 // Subscriber is one agent bound to a Watch.
