@@ -306,6 +306,146 @@ func scanCardCorpus(t *testing.T, dir string) ImportStats {
 	return stats
 }
 
+func writeIndexCards(t *testing.T, dir string) {
+	t.Helper()
+	first := fmt.Sprintf(indexTestCard, "T1.1", "internal/a.go, internal/b.go", "T0.1")
+	second := fmt.Sprintf(indexTestCard, "T1.2", "internal/c.go", "нет")
+	if err := os.WriteFile(filepath.Join(dir, "T1.1.md"), []byte(first), 0644); err != nil {
+		t.Fatalf("запись T1.1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "T1.2.md"), []byte(second), 0644); err != nil {
+		t.Fatalf("запись T1.2: %v", err)
+	}
+}
+
+// indexChanges возвращает число строк, изменённых соединением индекса.
+// Повторная сборка без изменений не должна увеличивать этот счётчик.
+func indexChanges(t *testing.T, idx *Index) int {
+	t.Helper()
+	var n int
+	if err := idx.db.QueryRow(`SELECT total_changes()`).Scan(&n); err != nil {
+		t.Fatalf("total_changes: %v", err)
+	}
+	return n
+}
+
+func TestRebuildDirSkipsUnchangedCards(t *testing.T) {
+	dir := t.TempDir()
+	writeIndexCards(t, dir)
+
+	idx := openTestIndex(t)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("первый RebuildDir: %v", err)
+	}
+	before := indexChanges(t, idx)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("повторный RebuildDir: %v", err)
+	}
+	if after := indexChanges(t, idx); after != before {
+		t.Fatalf("неизменившиеся карточки перезаписаны: total_changes %d -> %d", before, after)
+	}
+}
+
+func TestRebuildDirWritesOnlyChangedCard(t *testing.T) {
+	dir := t.TempDir()
+	writeIndexCards(t, dir)
+
+	idx := openTestIndex(t)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("первый RebuildDir: %v", err)
+	}
+
+	cards, err := LoadCards(dir)
+	if err != nil {
+		t.Fatalf("LoadCards: %v", err)
+	}
+	fullStart := indexChanges(t, idx)
+	if _, err := idx.ImportCards(cards); err != nil {
+		t.Fatalf("полная пересборка: %v", err)
+	}
+	fullDelta := indexChanges(t, idx) - fullStart
+
+	path := filepath.Join(dir, "T1.1.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("чтение T1.1: %v", err)
+	}
+	changed := strings.Replace(string(data), "Статус: todo", "Статус: in_progress", 1)
+	if changed == string(data) {
+		t.Fatal("в T1.1 не найдено поле Статус")
+	}
+	if err := os.WriteFile(path, []byte(changed), 0644); err != nil {
+		t.Fatalf("запись T1.1: %v", err)
+	}
+
+	var untouchedStatus, untouchedSum string
+	if err := idx.db.QueryRow(`SELECT status, raw_sha256 FROM cards WHERE id = ?`, "T1.2").
+		Scan(&untouchedStatus, &untouchedSum); err != nil {
+		t.Fatalf("T1.2 до обновления: %v", err)
+	}
+
+	incStart := indexChanges(t, idx)
+	stats, err := idx.RebuildDir(dir)
+	if err != nil {
+		t.Fatalf("инкрементальный RebuildDir: %v", err)
+	}
+	incDelta := indexChanges(t, idx) - incStart
+	if incDelta <= 0 {
+		t.Fatal("изменившаяся карточка не записана")
+	}
+	if incDelta >= fullDelta {
+		t.Fatalf("записано слишком много строк: инкремент %d, полная сборка %d", incDelta, fullDelta)
+	}
+	if want := (ImportStats{Cards: 2, Deps: 1, Owners: 3}); stats != want {
+		t.Fatalf("stats = %+v, ждали %+v", stats, want)
+	}
+
+	var status, sum string
+	if err := idx.db.QueryRow(`SELECT status, raw_sha256 FROM cards WHERE id = ?`, "T1.1").
+		Scan(&status, &sum); err != nil {
+		t.Fatalf("T1.1 после обновления: %v", err)
+	}
+	if status != "in_progress" {
+		t.Fatalf("статус T1.1 = %q, ждали in_progress", status)
+	}
+	if err := idx.db.QueryRow(`SELECT status, raw_sha256 FROM cards WHERE id = ?`, "T1.2").
+		Scan(&status, &sum); err != nil {
+		t.Fatalf("T1.2 после обновления: %v", err)
+	}
+	if status != untouchedStatus || sum != untouchedSum {
+		t.Fatalf("неизменившаяся карточка T1.2 перезаписана: %q/%s -> %q/%s",
+			untouchedStatus, untouchedSum, status, sum)
+	}
+}
+
+func TestRebuildDirRemovesDeletedCards(t *testing.T) {
+	dir := t.TempDir()
+	writeIndexCards(t, dir)
+
+	idx := openTestIndex(t)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("первый RebuildDir: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "T1.2.md")); err != nil {
+		t.Fatalf("удаление T1.2: %v", err)
+	}
+
+	stats, err := idx.RebuildDir(dir)
+	if err != nil {
+		t.Fatalf("RebuildDir после удаления: %v", err)
+	}
+	if want := (ImportStats{Cards: 1, Deps: 1, Owners: 2}); stats != want {
+		t.Fatalf("stats = %+v, ждали %+v", stats, want)
+	}
+	var n int
+	if err := idx.db.QueryRow(`SELECT count(*) FROM cards WHERE id = ?`, "T1.2").Scan(&n); err != nil {
+		t.Fatalf("проверка T1.2: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("удалённая карточка осталась в индексе: %d строк", n)
+	}
+}
+
 func TestRebuildRealCorpus(t *testing.T) {
 	dir := filepath.Join("..", "..", "..", "docs", "tasks")
 	if _, err := os.Stat(dir); err != nil {

@@ -190,15 +190,65 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 	return stats, nil
 }
 
-// RebuildDir загружает все карточки каталога через LoadCards и пересобирает
-// индекс. LoadCards разбирает каждую карточку через ParseCard, поэтому в индекс
-// попадают только корректные карточки.
+// RebuildDir синхронизирует индекс с каталогом карточек. Карточка с тем же
+// raw_sha256, что уже лежит в индексе, не разбирается повторно и не перезаписывается.
+// Удалённые файлы убираются из индекса. Возвращаемая статистика описывает всё
+// содержимое индекса после синхронизации.
+//
+// baseline: docs/research/sqlite-perf-audit.md, топ-10 строка 10. На 931 карточке
+// прежний путь делал DELETE из трёх таблиц и INSERT всех карточек в одной
+// транзакции при каждом вызове. Числового замера выигрыша в отчёте нет, эффект
+// структурный: при неизменившемся корпусе запись в индекс не выполняется.
 func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
-	cards, err := LoadCards(tasksDir)
+	if idx == nil || idx.db == nil {
+		return ImportStats{}, Startupf("индекс не открыт")
+	}
+	entries, err := os.ReadDir(tasksDir)
+	if err != nil {
+		return ImportStats{}, Startupf("каталог карточек %s недоступен: %v", tasksDir, err)
+	}
+
+	stored, err := idx.cardHashes()
 	if err != nil {
 		return ImportStats{}, err
 	}
-	return idx.ImportCards(cards)
+
+	seen := make(map[string]bool, len(entries))
+	changed := make([]pendingCard, 0)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		filePath := filepath.Join(tasksDir, e.Name())
+		data, err := fileAdapter.ReadFile(filePath)
+		if err != nil {
+			return ImportStats{}, Startupf("не прочитана карточка %s: %v", e.Name(), err)
+		}
+		sum := sha256sum(string(data))
+		id := cardIDFromName(e.Name())
+		if id != "" && stored[id] == sum {
+			seen[id] = true
+			continue
+		}
+		card, err := ParseCard(filePath, data)
+		if err != nil {
+			return ImportStats{}, err
+		}
+		changed = append(changed, pendingCard{card: card, sum: sum})
+		seen[card.ID] = true
+	}
+
+	stale := make([]string, 0)
+	for id := range stored {
+		if !seen[id] {
+			stale = append(stale, id)
+		}
+	}
+
+	if err := idx.replaceCards(changed, stale); err != nil {
+		return ImportStats{}, err
+	}
+	return idx.Counts()
 }
 
 // Counts возвращает число строк в cards, deps и owners. Метод нужен командам
@@ -228,6 +278,145 @@ func (idx *Index) Counts() (ImportStats, error) {
 func sha256sum(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+// cardIDFromName выводит ID карточки из имени файла, не разбирая содержимое.
+// Пустая строка означает неподдерживаемое имя: в этом случае RebuildDir
+// вызывает ParseCard, чтобы вернуть обычную ошибку валидации.
+func cardIDFromName(name string) string {
+	id := strings.TrimSuffix(name, ".md")
+	if m := idRE.FindStringSubmatch(id); m != nil {
+		return m[1] + m[2] + "." + m[3]
+	}
+	if dashIDRE.MatchString(id) || dotIDRE.MatchString(id) {
+		return id
+	}
+	return ""
+}
+
+// cardHashes читает сохранённые хеши исходного текста карточек из индекса.
+// По этим хешам RebuildDir решает, какие карточки нужно разобрать заново.
+func (idx *Index) cardHashes() (map[string]string, error) {
+	rows, err := idx.db.Query(`SELECT id, raw_sha256 FROM cards`)
+	if err != nil {
+		return nil, Startupf("не прочитаны хеши индекса: %v", err)
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var id, sum string
+		if err := rows.Scan(&id, &sum); err != nil {
+			return nil, Startupf("не прочитан хеш индекса: %v", err)
+		}
+		out[id] = sum
+	}
+	if err := rows.Err(); err != nil {
+		return nil, Startupf("не дочитаны хеши индекса: %v", err)
+	}
+	return out, nil
+}
+
+// pendingCard это карточка, которую нужно записать в индекс.
+type pendingCard struct {
+	card Card
+	sum  string
+}
+
+// replaceCards применяет точечные изменения в одной транзакции. У каждой
+// изменившейся карточки удаляются старые строки deps и owners, затем вставляются
+// новые. Идентификаторы из stale соответствуют удалённым файлам и убираются из
+// всех трёх таблиц.
+func (idx *Index) replaceCards(changed []pendingCard, stale []string) error {
+	if len(changed) == 0 && len(stale) == 0 {
+		return nil
+	}
+
+	tx, err := idx.db.Begin()
+	if err != nil {
+		return Startupf("не начато обновление индекса: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	delDeps, err := tx.Prepare(`DELETE FROM deps WHERE card_id = ?`)
+	if err != nil {
+		return Startupf("не подготовлено удаление зависимостей: %v", err)
+	}
+	defer delDeps.Close()
+	delOwners, err := tx.Prepare(`DELETE FROM owners WHERE card_id = ?`)
+	if err != nil {
+		return Startupf("не подготовлено удаление владельцев: %v", err)
+	}
+	defer delOwners.Close()
+	delCard, err := tx.Prepare(`DELETE FROM cards WHERE id = ?`)
+	if err != nil {
+		return Startupf("не подготовлено удаление карточки: %v", err)
+	}
+	defer delCard.Close()
+
+	remove := func(id string) error {
+		if _, err := delDeps.Exec(id); err != nil {
+			return Startupf("не удалены зависимости карточки %s: %v", id, err)
+		}
+		if _, err := delOwners.Exec(id); err != nil {
+			return Startupf("не удалены владельцы карточки %s: %v", id, err)
+		}
+		if _, err := delCard.Exec(id); err != nil {
+			return Startupf("не удалена карточка %s: %v", id, err)
+		}
+		return nil
+	}
+	for _, id := range stale {
+		if err := remove(id); err != nil {
+			return err
+		}
+	}
+
+	insCard, err := tx.Prepare(`
+		INSERT INTO cards
+		  (id, type, status, phase, reference, agent, time, title, goal,
+		   context, steps, check_text, acceptance, path, grp, number, raw_sha256)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		return Startupf("не подготовлена вставка карточки: %v", err)
+	}
+	defer insCard.Close()
+	insDep, err := tx.Prepare(`INSERT INTO deps (card_id, dep) VALUES (?, ?)`)
+	if err != nil {
+		return Startupf("не подготовлена вставка зависимости: %v", err)
+	}
+	defer insDep.Close()
+	insOwner, err := tx.Prepare(`INSERT INTO owners (card_id, owner) VALUES (?, ?)`)
+	if err != nil {
+		return Startupf("не подготовлена вставка владельца: %v", err)
+	}
+	defer insOwner.Close()
+
+	for _, p := range changed {
+		c := p.card
+		if err := remove(c.ID); err != nil {
+			return err
+		}
+		if _, err := insCard.Exec(c.ID, c.Type, c.Status, c.Phase, c.Reference,
+			c.Agent, c.Time, c.Title, c.Goal, c.Context, c.Steps, c.Check,
+			c.Acceptance, c.Path, c.Group, c.Number, p.sum); err != nil {
+			return Startupf("не вставлена карточка %s: %v", c.ID, err)
+		}
+		for _, dep := range uniqueStrings(c.Dependencies) {
+			if _, err := insDep.Exec(c.ID, dep); err != nil {
+				return Startupf("не вставлена зависимость карточки %s: %v", c.ID, err)
+			}
+		}
+		for _, owner := range uniqueStrings(c.OwnerFiles) {
+			if _, err := insOwner.Exec(c.ID, owner); err != nil {
+				return Startupf("не вставлен владелец карточки %s: %v", c.ID, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Startupf("не зафиксировано обновление индекса: %v", err)
+	}
+	return nil
 }
 
 // uniqueStrings убирает повторы, сохраняя порядок первого вхождения. Повторные
