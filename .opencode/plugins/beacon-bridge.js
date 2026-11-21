@@ -946,17 +946,31 @@ const adapterCases = [
       assert.ok(reviewSub, "плагин подписан на beacon.review.comment")
       const receiptPath = join(stateDir, "receipts", "obl-t316.1")
       queue.push({ type: "beacon.review.comment" })
-      // Ждём факт, а не фиксированные 30 мс: под CI запись квитанции после
-      // async-claim может занять больше, и жёсткий sleep давал ENOENT.
+      // Ждём полную строку квитанции, а не только существование файла:
+      // между open(path, "wx") и writeFile файл пуст или обрезан, и JSON.parse
+      // даёт SyntaxError. Жёсткий sleep 30 мс к тому же давал ENOENT.
+      // Разбор внутри цикла, stop только после успешного JSON.parse.
       const deadline = Date.now() + POLL_MS + 3000
-      while (Date.now() < deadline && !existsSync(receiptPath)) {
+      let line = null
+      while (Date.now() < deadline) {
+        if (existsSync(receiptPath)) {
+          try {
+            const raw = readFileSync(receiptPath, "utf8").trim()
+            if (raw) {
+              line = JSON.parse(raw)
+              break
+            }
+          } catch {
+            // файл ещё пишется: пустая или обрезанная строка, пробуем снова
+          }
+        }
         await new Promise((tick) => setTimeout(tick, 5))
       }
       stop()
 
+      assert.ok(line, "квитанция obl-t316.1 должна быть записана и разобрана до stop")
       assert.equal(h.calls.length, 1)
       assert.equal(h.calls[0].delivery, "steer")
-      const line = JSON.parse(readFileSync(receiptPath, "utf8").trim())
       assert.equal(line.messageSource, "review")
       assert.equal(line.outcome, "posted")
     },
