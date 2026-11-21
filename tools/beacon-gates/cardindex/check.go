@@ -173,13 +173,23 @@ func gitLogFromProcess(root string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// os.StartProcess chdirs the child into Dir before exec, so a relative
+	// -C root is resolved a second time from that new working directory.
+	// In CI the checkout sits at <workspace>/<repo>; resolving ../.. twice
+	// climbs out of the work tree and git log dies with "not a git
+	// repository". Make the path absolute once and use it for both chdir
+	// and -C so the two agree on the same directory.
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve root %q: %w", root, err)
+	}
 	r, w, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	proc, err := os.StartProcess(git, []string{git, "-C", root, "log", "--format=%s"}, &os.ProcAttr{
-		Dir:   root,
+	proc, err := os.StartProcess(git, []string{git, "-C", absRoot, "log", "--format=%s"}, &os.ProcAttr{
+		Dir:   absRoot,
 		Files: []*os.File{os.Stdin, w, os.Stderr},
 	})
 	if err != nil {
@@ -198,7 +208,7 @@ func gitLogFromProcess(root string) ([]byte, error) {
 		return nil, err
 	}
 	if !state.Success() {
-		return nil, fmt.Errorf("git -C %s log: %s", root, state.String())
+		return nil, fmt.Errorf("git -C %s log: %s", absRoot, state.String())
 	}
 	return out.Bytes(), nil
 }
