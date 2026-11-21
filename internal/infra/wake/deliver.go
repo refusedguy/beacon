@@ -1150,10 +1150,6 @@ type T211SessionRegistry struct {
 	byKey map[T211SessionKey]string
 }
 
-func T211NewSessionRegistry() *T211SessionRegistry {
-	return &T211SessionRegistry{byKey: make(map[T211SessionKey]string)}
-}
-
 func (r *T211SessionRegistry) Add(adapter, target, sessionID string) {
 	if r == nil {
 		return
@@ -1239,10 +1235,6 @@ type T211DeliveryKey struct {
 type T211DeliveryRegistry struct {
 	mu       sync.RWMutex
 	receipts map[T211DeliveryKey]T210Receipt
-}
-
-func T211NewDeliveryRegistry() *T211DeliveryRegistry {
-	return &T211DeliveryRegistry{receipts: make(map[T211DeliveryKey]T210Receipt)}
 }
 
 // ImportReceipts stores unseen (obligationID, attempt) pairs and returns the

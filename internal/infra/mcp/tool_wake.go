@@ -733,20 +733,6 @@ func NewFallbackWakeHandler(sender WakeSender, confirmer ReceiptConfirmer, trace
 	return &WakeHandler{sender: sender, confirmer: confirmer, tracer: tracer, useFallback: true}
 }
 
-// NewCapabilityFallbackWakeHandler adds capability-based target selection to
-// the fallback chain. It keeps the ADR 0037 p1 path intact while the chain
-// drives delivery. The same directory resolves worktree-addressed wakes
-// (ADR 0042 p3), so the chain delivers to the session in the requested worktree.
-func NewCapabilityFallbackWakeHandler(sender WakeSender, confirmer ReceiptConfirmer, tracer TaskTracer, directory AgentDirectory) *WakeHandler {
-	return &WakeHandler{
-		sender:      sender,
-		confirmer:   confirmer,
-		tracer:      tracer,
-		directory:   directory,
-		useFallback: true,
-	}
-}
-
 // Handle adapts Wake to the go-sdk typed tool handler signature. A fallback
 // handler dispatches to WakeWithFallback so the chain is reachable over MCP;
 // all earlier handlers keep the single-delivery Wake path.
