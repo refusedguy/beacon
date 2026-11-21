@@ -1,6 +1,7 @@
 package wake
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -295,5 +296,156 @@ func TestPersistentACPInitializeNegotiatesCapabilities(t *testing.T) {
 	plan := client.DeliveryPlan(ACPDeliveryPolicy{PreferResume: true})
 	if plan.Mode != ACPDeliveryResume {
 		t.Errorf("delivery plan = %+v, want resume", plan)
+	}
+}
+
+// ===== ACP-сервер (T3.279) =====
+
+func TestACPServerSessionList(t *testing.T) {
+	server := NewACPServer()
+	if err := server.AddSession("sess_b", "/work/b"); err != nil {
+		t.Fatalf("AddSession b: %v", err)
+	}
+	if err := server.AddSession("sess_a", "/work/a"); err != nil {
+		t.Fatalf("AddSession a: %v", err)
+	}
+	if err := server.AddSession("sess_b", "/work/b"); err == nil {
+		t.Fatal("duplicate session id was accepted")
+	}
+
+	raw, err := server.Handle(context.Background(), ACPRequest{JSONRPC: "2.0", ID: 1, Method: "session/list"})
+	if err != nil {
+		t.Fatalf("Handle session/list: %v", err)
+	}
+	var result struct {
+		Sessions []ACPServerSession `json:"sessions"`
+	}
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode session/list result: %v", err)
+	}
+	if len(result.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want 2: %s", len(result.Sessions), raw)
+	}
+	if result.Sessions[0].ID != "sess_a" || result.Sessions[1].ID != "sess_b" {
+		t.Errorf("session order = %q, %q, want sess_a, sess_b", result.Sessions[0].ID, result.Sessions[1].ID)
+	}
+	if result.Sessions[0].Cwd != "/work/a" || result.Sessions[1].Cwd != "/work/b" {
+		t.Errorf("cwd values = %+v, want the registered paths", result.Sessions)
+	}
+}
+
+func TestACPServerSessionNewAndLoad(t *testing.T) {
+	server := NewACPServer()
+	raw, err := server.Handle(context.Background(), ACPRequest{
+		JSONRPC: "2.0", ID: 1, Method: "session/new",
+		Params: map[string]any{"cwd": "/work/new"},
+	})
+	if err != nil {
+		t.Fatalf("Handle session/new: %v", err)
+	}
+	var created struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.Unmarshal(raw, &created); err != nil {
+		t.Fatalf("decode session/new result: %v", err)
+	}
+	if created.SessionID == "" {
+		t.Fatalf("session/new result has no id: %s", raw)
+	}
+	sessions := server.Sessions()
+	if len(sessions) != 1 || sessions[0].ID != created.SessionID || sessions[0].Cwd != "/work/new" {
+		t.Fatalf("sessions = %+v, want the created session", sessions)
+	}
+
+	loaded, err := server.Handle(context.Background(), ACPRequest{
+		JSONRPC: "2.0", ID: 2, Method: "session/load",
+		Params: map[string]any{"sessionId": created.SessionID},
+	})
+	if err != nil {
+		t.Fatalf("Handle session/load: %v", err)
+	}
+	if string(bytes.TrimSpace(loaded)) != "{}" {
+		t.Errorf("session/load result = %s, want {}", loaded)
+	}
+
+	_, err = server.Handle(context.Background(), ACPRequest{
+		JSONRPC: "2.0", ID: 3, Method: "session/load",
+		Params: map[string]any{"sessionId": "sess_missing"},
+	})
+	rpcErr, ok := err.(*ACPServerError)
+	if !ok || rpcErr.Code != -32002 {
+		t.Fatalf("unknown session error = %v, want ACP rpc -32002", err)
+	}
+
+	_, err = server.Handle(context.Background(), ACPRequest{JSONRPC: "2.0", ID: 4, Method: "session/prompt"})
+	rpcErr, ok = err.(*ACPServerError)
+	if !ok || rpcErr.Code != -32601 {
+		t.Fatalf("unknown method error = %v, want ACP rpc -32601", err)
+	}
+}
+
+func TestACPServerElicitSendsRequestAndDecodesAnswer(t *testing.T) {
+	fake := &fakeACPTransport{response: []byte(`{"jsonrpc":"2.0","id":1,"result":{"action":"accept","content":{"choice":{"type":"string","value":"yes"}}}}`)}
+	server := &ACPServer{Transport: fake}
+	schema := json.RawMessage(`{"type":"object","properties":{"choice":{"type":"string"}}}`)
+
+	result, err := server.Elicit(context.Background(), "Pick one", schema)
+	if err != nil {
+		t.Fatalf("Elicit: %v", err)
+	}
+	if result.Action != "accept" {
+		t.Errorf("action = %q, want accept", result.Action)
+	}
+	if _, ok := result.Content["choice"]; !ok {
+		t.Errorf("content = %+v, want the choice field", result.Content)
+	}
+	if len(fake.requests) != 1 {
+		t.Fatalf("transport calls = %d, want 1", len(fake.requests))
+	}
+	req := fake.requests[0]
+	if req.JSONRPC != "2.0" || req.ID <= 0 || req.Method != "elicitation/create" {
+		t.Errorf("request = %+v, want a positive id and elicitation/create", req)
+	}
+	params, ok := req.Params.(ACPElicitationParams)
+	if !ok {
+		t.Fatalf("params type = %T, want ACPElicitationParams", req.Params)
+	}
+	if params.Message != "Pick one" || string(params.RequestedSchema) != string(schema) {
+		t.Errorf("params = %+v, want the message and schema passed through", params)
+	}
+}
+
+func TestACPServerElicitHandlesDeclineAndErrors(t *testing.T) {
+	declined := &fakeACPTransport{response: []byte(`{"jsonrpc":"2.0","id":1,"result":{"action":"decline"}}`)}
+	result, err := (&ACPServer{Transport: declined}).Elicit(context.Background(), "Pick one", nil)
+	if err != nil || result.Action != "decline" {
+		t.Fatalf("declined Elicit = %+v, %v; want decline with no error", result, err)
+	}
+	if len(declined.requests) != 1 {
+		t.Fatalf("transport calls = %d, want 1", len(declined.requests))
+	}
+	params := declined.requests[0].Params.(ACPElicitationParams)
+	if string(params.RequestedSchema) != `{"type":"object","properties":{}}` {
+		t.Errorf("default schema = %s, want an empty object schema", params.RequestedSchema)
+	}
+
+	badAction := &fakeACPTransport{response: []byte(`{"jsonrpc":"2.0","id":1,"result":{"action":"maybe"}}`)}
+	if _, err := (&ACPServer{Transport: badAction}).Elicit(context.Background(), "Pick one", nil); err == nil {
+		t.Fatal("unknown elicitation action was accepted")
+	}
+
+	rpcError := &fakeACPTransport{response: []byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no prompt available"}}`)}
+	_, err = (&ACPServer{Transport: rpcError}).Elicit(context.Background(), "Pick one", nil)
+	rpcErr, ok := err.(*ACPServerError)
+	if !ok || rpcErr.Code != -32000 {
+		t.Fatalf("rpc error = %v, want ACP rpc -32000", err)
+	}
+
+	noTransport := &fakeACPTransport{}
+	if _, err := (&ACPServer{Transport: noTransport}).Elicit(context.Background(), "", nil); err == nil {
+		t.Fatal("empty elicitation message was accepted")
+	}
+	if len(noTransport.requests) != 0 {
+		t.Errorf("transport calls = %d, want 0", len(noTransport.requests))
 	}
 }
