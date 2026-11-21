@@ -824,18 +824,34 @@ func (w *SQLVerdictWriter) Publish(ctx context.Context, ref WatchRef, verdict Ve
 			return err
 		}
 		var currentVerdict, currentHead string
-		_ = json.Unmarshal(watch["verdict"], &currentVerdict)
-		_ = json.Unmarshal(watch["headSHA"], &currentHead)
+		if err := json.Unmarshal(watch["verdict"], &currentVerdict); err != nil {
+			return fmt.Errorf("checkall: разбор verdict Watch %s: %w", ref.ID, err)
+		}
+		if err := json.Unmarshal(watch["headSHA"], &currentHead); err != nil {
+			return fmt.Errorf("checkall: разбор headSHA Watch %s: %w", ref.ID, err)
+		}
 		if currentVerdict != string(CheckVerdictWatching) || currentHead != ref.HeadSHA {
 			return nil
 		}
 		var revision uint64
-		_ = json.Unmarshal(watch["revision"], &revision)
+		if err := json.Unmarshal(watch["revision"], &revision); err != nil {
+			return fmt.Errorf("checkall: разбор revision Watch %s: %w", ref.ID, err)
+		}
 		nextRevision := revision + 1
 
-		watch["verdict"], _ = json.Marshal(string(verdict))
-		watch["status"], _ = json.Marshal("notifying")
-		watch["revision"], _ = json.Marshal(nextRevision)
+		verdictJSON, err := json.Marshal(string(verdict))
+		if err != nil {
+			return fmt.Errorf("checkall: сериализация verdict Watch %s: %w", ref.ID, err)
+		}
+		statusJSON, err := json.Marshal("notifying")
+		if err != nil {
+			return fmt.Errorf("checkall: сериализация status Watch %s: %w", ref.ID, err)
+		}
+		revisionJSON, err := json.Marshal(nextRevision)
+		if err != nil {
+			return fmt.Errorf("checkall: сериализация revision Watch %s: %w", ref.ID, err)
+		}
+		watch["verdict"], watch["status"], watch["revision"] = verdictJSON, statusJSON, revisionJSON
 		watch["checks"] = checksPayload
 		updated, err := json.Marshal(watch)
 		if err != nil {
