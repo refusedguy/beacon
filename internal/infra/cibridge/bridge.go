@@ -160,6 +160,14 @@ type CardLinks interface {
 	CloseMerged(ctx context.Context, watchID string, pr int, at time.Time) error
 }
 
+// WorktreeGC removes worktrees that are clean, unlocked and no longer backed
+// by a live Watch. It is a narrow control-plane port declared here so cibridge
+// does not import the worktree adapter (ADR 0005, layers.json). The composition
+// root binds the real collector with its git runner and the live-watch heads.
+// A nil port keeps the old behaviour; a returned error is logged and never
+// changes a terminal verdict.
+type WorktreeGC func(ctx context.Context) (removed int, err error)
+
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider,
 // one Store and the optional control-plane ports, so a refresh is a batched
 // read followed by ordered writes.
@@ -170,6 +178,7 @@ type Bridge struct {
 	merger         domain.Merger
 	control        blockerControl
 	cardLinks      CardLinks
+	gc             WorktreeGC
 	clock          domain.Clock
 	interval       time.Duration
 	waker          domain.WakeDeliverer
@@ -385,6 +394,16 @@ func (b *Bridge) WithCardLinks(c CardLinks) *Bridge {
 		return nil
 	}
 	b.cardLinks = c
+	return b
+}
+
+// WithWorktreeGC binds the collection port. Without one a merged Watch still
+// closes and resolves blockers, but no worktree is collected.
+func (b *Bridge) WithWorktreeGC(fn WorktreeGC) *Bridge {
+	if b == nil {
+		return nil
+	}
+	b.gc = fn
 	return b
 }
 
@@ -1109,13 +1128,34 @@ func (b *Bridge) applyMerged(ctx context.Context, w domain.Watch, obs ciObservat
 // only for a merged verdict, so a hold never reaches it. The port owns the
 // card_links lookup and the card file write. An unbound port only skips the
 // card write, and a port failure is logged without blocking the Watch close or
-// blocker resolution.
-func (b *Bridge) closeLinkedCard(ctx context.Context, w domain.Watch, at time.Time) {
+// blocker resolution. The error is returned so a merged Watch can skip the
+// worktree collection when its card was not closed.
+func (b *Bridge) closeLinkedCard(ctx context.Context, w domain.Watch, at time.Time) error {
 	if b == nil || b.cardLinks == nil || w.ID == "" {
-		return
+		return nil
 	}
 	if err := b.cardLinks.CloseMerged(ctx, w.ID, w.PR, at); err != nil {
 		observe.ActorError("cibridge-card-close", w.ID, err)
+		return err
+	}
+	return nil
+}
+
+// collectWorktrees runs the bound GC port after a merged Watch closes its card.
+// An unset port is a no-op and an error is logged without changing the verdict.
+func (b *Bridge) collectWorktrees(ctx context.Context, w domain.Watch, cycleID string) {
+	if b == nil || b.gc == nil {
+		return
+	}
+	removed, err := b.gc(ctx)
+	if err != nil {
+		observe.ActorError("cibridge-worktree-gc", w.ID, err)
+		return
+	}
+	if removed > 0 {
+		b.cycleEvent(cycleID, "worktree_gc", cycleFields{
+			watchID: w.ID, revision: w.Revision, verdict: domain.VerdictMerged,
+		}, observe.Fields{"removed": removed})
 	}
 }
 
@@ -1137,7 +1177,9 @@ func (b *Bridge) closeWatch(ctx context.Context, w domain.Watch, verdict domain.
 		return 0
 	}
 	if verdict == domain.VerdictMerged {
-		b.closeLinkedCard(ctx, w, now)
+		if err := b.closeLinkedCard(ctx, w, now); err == nil {
+			b.collectWorktrees(ctx, w, cycleID)
+		}
 	}
 	// The terminal verdict is still readable at the new revision, so get_result
 	// can confirm the close without a wake.
