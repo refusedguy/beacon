@@ -601,6 +601,102 @@ PY
     info "self-test ok: p95 по posted, латентность модели отделена, рестарт с нуля обнаруживается"
 }
 
+# --- Итоговый отчёт по SLO ---
+# Сводит пороги из констант выше с худшими значениями по всем прогонам.
+# Вход те же строки ROWS, что и таблица результатов.
+print_slo_report() {
+    local worst_hwm=0 worst_p95=-1 worst_points=0 worst_restart=-1 worst_gh=-1
+    local have_hwm=0 have_p95=0 have_points=0 have_restart=0 have_gh=0
+    local any_blocked=0 any_fail=0
+    local mode run hwm p95 points restart gh status reason
+
+    for row in "${ROWS[@]}"; do
+        IFS='|' read -r mode run hwm p95 points restart gh status reason <<< "$row"
+        if [ "$status" = "BLOCKED" ]; then
+            any_blocked=1
+            continue
+        fi
+        if [ "$status" = "FAIL" ]; then
+            any_fail=1
+        fi
+        if [[ "$hwm" =~ ^[0-9]+$ ]]; then
+            have_hwm=1
+            if [ "$hwm" -gt "$worst_hwm" ]; then worst_hwm="$hwm"; fi
+        fi
+        if [[ "$p95" =~ ^-?[0-9]+$ ]]; then
+            have_p95=1
+            if [ "$p95" -gt "$worst_p95" ]; then worst_p95="$p95"; fi
+        fi
+        if [[ "$points" =~ ^[0-9]+$ ]]; then
+            have_points=1
+            if [ "$points" -gt "$worst_points" ]; then worst_points="$points"; fi
+        fi
+        if [[ "$restart" =~ ^[0-9]+$ ]]; then
+            have_restart=1
+            if [ "$restart" -gt "$worst_restart" ]; then worst_restart="$restart"; fi
+        fi
+        if [[ "$gh" =~ ^[0-9]+$ ]]; then
+            have_gh=1
+            if [ "$gh" -gt "$worst_gh" ]; then worst_gh="$gh"; fi
+        fi
+    done
+
+    # HAVE VALUE LIMIT MODE. MODE: lt, le, range, eq0.
+    slo_cell() {
+        local have="$1" value="$2" limit="$3" mode="$4"
+        if [ "$have" != 1 ]; then
+            printf 'BLOCKED'
+            return
+        fi
+        case "$mode" in
+            lt)    if [ "$value" -lt "$limit" ]; then printf 'PASS'; else printf 'FAIL'; fi ;;
+            le)    if [ "$value" -le "$limit" ]; then printf 'PASS'; else printf 'FAIL'; fi ;;
+            range) if [ "$value" -gt 0 ] && [ "$value" -le "$limit" ]; then printf 'PASS'; else printf 'FAIL'; fi ;;
+            eq0)   if [ "$value" -eq 0 ]; then printf 'PASS'; else printf 'FAIL'; fi ;;
+        esac
+    }
+
+    local hwm_s p95_s points_s restart_s gh_s overall
+    hwm_s="$(slo_cell "$have_hwm" "$worst_hwm" "$HWM_LIMIT_KB" lt)"
+    p95_s="$(slo_cell "$have_p95" "$worst_p95" "$P95_LIMIT_MS" lt)"
+    points_s="$(slo_cell "$have_points" "$worst_points" "$POINT_LIMIT" le)"
+    restart_s="$(slo_cell "$have_restart" "$worst_restart" "$RESTART_LIMIT_MS" range)"
+    gh_s="$(slo_cell "$have_gh" "$worst_gh" 0 eq0)"
+
+    local hwm_d="—" p95_d="—" points_d="—" restart_d="—" gh_d="—"
+    [ "$have_hwm" = 1 ] && hwm_d="$worst_hwm"
+    [ "$have_p95" = 1 ] && p95_d="$worst_p95"
+    [ "$have_points" = 1 ] && points_d="$worst_points"
+    [ "$have_restart" = 1 ] && restart_d="$worst_restart"
+    [ "$have_gh" = 1 ] && gh_d="$worst_gh"
+
+    if [ "$any_fail" = 1 ]; then
+        overall=FAIL
+    elif [ "$any_blocked" = 1 ]; then
+        overall=BLOCKED
+    else
+        overall=PASS
+    fi
+
+    local report
+    report="$( {
+        printf '\n--- Отчёт по SLO ---\n'
+        printf '| SLO метрика | Порог | Худшее значение | Статус |\n'
+        printf '|---|---|---:|---|\n'
+        printf '| VmHWM одного процесса | < %s КБ | %s | %s |\n' "$HWM_LIMIT_KB" "$hwm_d" "$hwm_s"
+        printf '| p95 доставки | < %s мс | %s | %s |\n' "$P95_LIMIT_MS" "$p95_d" "$p95_s"
+        printf '| Поинтов в час | <= %s | %s | %s |\n' "$POINT_LIMIT" "$points_d" "$points_s"
+        printf '| Рестарт процесса | 1..%s мс | %s | %s |\n' "$RESTART_LIMIT_MS" "$restart_d" "$restart_s"
+        printf '| gh --watch | = 0 | %s | %s |\n' "$gh_d" "$gh_s"
+        printf '\nИтог: %s\n' "$overall"
+        printf 'Сверка rate-limit и продолжение счётчика после рестарта учтены в статусе каждой строки.\n'
+    } )"
+    printf '%s\n' "$report"
+    if [ -n "$WORK" ] && [ -d "$WORK" ]; then
+        printf '%s\n' "$report" > "$WORK/slo-report.txt"
+    fi
+}
+
 # --- Основной прогон ---
 
 for tool in python3 awk grep date mktemp; do
@@ -742,6 +838,9 @@ printf 'Поинты/час это экстраполяция из окна на
 printf 'Цель 360 поинтов/час, жёсткий предел %s. p95 только по квитанциям posted.\n' "$POINT_LIMIT"
 printf 'Латентность пробуждения модели лежит в отдельном файле %s/model-wake-* и в таблицу не входит.\n' "$WORK"
 printf 'Сырые данные: %s\n' "$WORK"
+
+print_slo_report
+printf 'Отчёт по SLO: %s/slo-report.txt\n' "$WORK"
 
 has_fail=0
 has_blocked=0
