@@ -604,7 +604,7 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 		&mcpsdk.Implementation{Name: ServerName, Version: ServerVersion},
 		&mcpsdk.ServerOptions{
 			Instructions:              CycleInstructions,
-			SupportedProtocolVersions: LegacyProtocolVersions,
+			SupportedProtocolVersions: append([]string(nil), LegacyProtocolVersions...),
 		},
 	)
 	for _, descriptor := range toolDescriptors {
