@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS cards (
   goal        TEXT NOT NULL,
   context     TEXT NOT NULL,
   steps       TEXT NOT NULL,
-  check       TEXT NOT NULL,
+  check_text  TEXT NOT NULL,
   acceptance  TEXT NOT NULL,
   path        TEXT NOT NULL,
   grp         INTEGER NOT NULL,
@@ -137,7 +137,7 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 	cardStmt, err := tx.Prepare(`
 		INSERT INTO cards
 		  (id, type, status, phase, reference, agent, time, title, goal,
-		   context, steps, check, acceptance, path, grp, number, raw_sha256)
+		   context, steps, check_text, acceptance, path, grp, number, raw_sha256)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return ImportStats{}, Startupf("не подготовлена вставка карточек: %v", err)
