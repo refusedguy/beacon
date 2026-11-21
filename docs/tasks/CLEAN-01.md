@@ -15,6 +15,7 @@
 
 ## Подтверждение
 
+- PR: https://github.com/refusedguy/beacon/pull/1158, ветка `fix/ak1-clean`. База main, потому что ветка `fix/reports-to-tasks` была удалена после влития #1152.
 - Грамматика `CLEAN-[0-9]+` и `ARDH-[0-9]+` и тест `TestIDPatternParsesCleanAndArdhCards` уже лежат в базовой ветке после PR #1152. Дубль не добавлял, в README перечислил оба семейства среди распознаваемых.
 - baseline: на коммите 5772223 `git grep -h '^Статус:' -- docs/tasks` дал done 644, dropped 326, todo 48, in_progress 2. Dry-run `tools/roadmap-sync` до правки дал done 646, dropped 326, todo 20, P0 1, P1 4, P2 15.
 - Счётчики записаны через `tools/roadmap-sync --write`: done 647, dropped 326, todo 19, P1 4, P2 15. Повторный dry-run после записи печатает 0 изменений в строках счётчиков и приоритетов.
