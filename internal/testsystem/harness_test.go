@@ -230,3 +230,19 @@ func TestRegistryAndLibrary(t *testing.T) {
 		t.Fatal("zero-value registry did not accept a scenario")
 	}
 }
+
+// TestSeededRegressionArtery runs the three passes from
+// tests/scenarios/seeded.yaml through the fault controller. The outcomes are
+// read from the traces Runner emitted, so a grep over the spec cannot replace
+// this test. The -v flag puts all four outcomes into the CI job log.
+func TestSeededRegressionArtery(t *testing.T) {
+	spec, err := LoadArterySpec("../../tests/scenarios/seeded.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := RunArtery(spec)
+	t.Logf("%s", result.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+}
