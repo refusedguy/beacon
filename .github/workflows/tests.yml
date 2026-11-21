@@ -1,0 +1,82 @@
+name: Registry check
+
+# T5.63. Проверка схемы реестра в CI по ADR 0022. Отдельный workflow, чтобы не
+# менять существующие гейты в ci.yml. Позитивный прогон читает тестовый конфиг
+# из tools/beacon-gates/gate/config/registry.json. Негативный конфиг пишется во
+# временный каталог runner и обязан завершиться кодом 1.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  registry-check:
+    name: registry-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build beacon
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags="-buildid= -s -w" \
+            -o beacon ./cmd/beacon
+          printf 'build ok binary=beacon\n'
+
+      # Корректный конфиг проходит проверки схемы, лимитов и индекса. Строка
+      # "ok <digest>" подтверждает, что проверка действительно выполнилась.
+      - name: Positive config passes registry check
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=$(./beacon registry check --config tools/beacon-gates/gate/config/registry.json)
+          printf 'positive out=%s\n' "$out"
+          printf '%s\n' "$out" | grep -q '^ok '
+
+      # Неизвестный ключ обязан ронять check. Код 0 означал бы, что проверка
+      # слепа, поэтому job падает на любом исходе кроме 1.
+      - name: Negative config fails registry check
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad="$RUNNER_TEMP/registry-bad.yaml"
+          cat > "$bad" <<'YAML'
+          schema: beacon.agent-registry/v2
+          version: "2"
+          project: beacon-impl-ci
+          roster:
+            - id: executor
+              roles: [executor]
+              capabilities: [watch]
+          bogus_key: typo
+          YAML
+          set +e
+          ./beacon registry check --config "$bad"
+          code=$?
+          set -e
+          printf 'negative exit=%d\n' "$code"
+          if [ "$code" -ne 1 ]; then
+            printf 'negative control failed: bad config exit=%d, want 1\n' "$code" >&2
+            exit 1
+          fi
