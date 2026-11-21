@@ -18,10 +18,11 @@ import (
 
 // toolsListByteBudget is the ceiling for the serialized tools/list result.
 // The budget counts real bytes (method Tirith), not the presence of fields.
-// 16 KiB still fits nine detailed input/output schemas while catching runaway
-// growth in descriptions and schemas. CI logs the measured size next to the
-// ceiling so drift is visible before it becomes a failure.
-const toolsListByteBudget = 16 * 1024
+// ADR 0094 set 16 KiB for eight tools. ADR 0268 raises it to 20 KiB for nine
+// tools with a derived claim schema that carries the handoff fields. The
+// ceiling still catches runaway growth in descriptions and schemas. CI logs
+// the measured size next to it so drift is visible before it becomes a failure.
+const toolsListByteBudget = 20 * 1024
 
 // toolsListByteCount is the exact serialized size of the tools/list response
 // for the contracted nine tools. The budget above is a ceiling; this number is

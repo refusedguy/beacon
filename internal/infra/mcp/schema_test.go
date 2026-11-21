@@ -240,6 +240,7 @@ func TestAllOutputSchemas(t *testing.T) {
 		"beacon_cancel_watch",
 		"beacon_stats",
 		"beacon_defer_wiring",
+		"beacon_task_claim",
 	}
 	if len(schemas) != len(wantTools) {
 		t.Errorf("schema count = %d, want %d", len(schemas), len(wantTools))
@@ -258,6 +259,7 @@ func TestAllOutputSchemas(t *testing.T) {
 	assertSchemaFromType[OKOutput](t, schemas["beacon_cancel_watch"])
 	assertSchemaFromType[StatsOutput](t, schemas["beacon_stats"])
 	assertSchemaFromType[DeferWiringOutput](t, schemas["beacon_defer_wiring"])
+	assertSchemaFromType[TaskClaimOutput](t, schemas["beacon_task_claim"])
 }
 
 // TestWatchPRSchemaExecutorMetadata proves the notify-metadata executor is

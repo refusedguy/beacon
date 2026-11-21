@@ -594,11 +594,15 @@ func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonsche
 
 // attachTaskClaim installs the ninth tool over the handler owned by IDX-05 in
 // tool_task_claim.go. This file adds the registration and the explicit output
-// schema, not the claim logic. A nil schema means derivation failed and go-sdk
-// infers one from the handler's Go output type.
+// schema, not the claim logic. A nil schema means derivation failed; go-sdk
+// panics when a typed handler gets nil, so a permissive object keeps the real
+// handler registered just like the fallback for list_running and stats.
 func attachTaskClaim(s *mcpsdk.Server, handler *TaskClaimHandler, outputSchema *jsonschema.Schema) {
 	if s == nil || handler == nil {
 		return
+	}
+	if outputSchema == nil {
+		outputSchema = &jsonschema.Schema{Type: "object"}
 	}
 	annotations := toolAnnotations["beacon_task_claim"]
 	s.RemoveTools(TaskClaimToolName)

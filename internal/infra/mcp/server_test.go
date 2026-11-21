@@ -48,7 +48,7 @@ func connectTestSession(t *testing.T, deps ...Dependencies) *mcpsdk.ClientSessio
 	return clientSession
 }
 
-func TestToolsListReturnsExactlyEightTools(t *testing.T) {
+func TestToolsListReturnsExactlyNineTools(t *testing.T) {
 	session := connectTestSession(t)
 
 	var got []string
@@ -58,8 +58,8 @@ func TestToolsListReturnsExactlyEightTools(t *testing.T) {
 		}
 		got = append(got, tool.Name)
 	}
-	if len(got) != 8 {
-		t.Fatalf("tools/list returned %d tools (%v), want 8", len(got), got)
+	if len(got) != 9 {
+		t.Fatalf("tools/list returned %d tools (%v), want 9", len(got), got)
 	}
 
 	want := slices.Clone(ToolNames)
@@ -1023,10 +1023,10 @@ func (n *mockParentNotifier) delivered() []ParentNotice {
 	return append([]ParentNotice(nil), n.notices...)
 }
 
-// TestAskChildQuestionKeepsEightTools proves WIRING-490 at the MCP boundary:
+// TestAskChildQuestionKeepsNineTools proves WIRING-490 at the MCP boundary:
 // a child question reaches the parent chat through the injected ports, and the
-// contracted set of eight tools is unchanged by the new wiring.
-func TestAskChildQuestionKeepsEightTools(t *testing.T) {
+// contracted set of nine tools is unchanged by the new wiring.
+func TestAskChildQuestionKeepsNineTools(t *testing.T) {
 	notifier := &mockParentNotifier{}
 	deps := Dependencies{
 		ChildThreads:   mockChildThreadResolver{parentID: "root", name: "Builder", ok: true},
@@ -1055,8 +1055,8 @@ func TestAskChildQuestionKeepsEightTools(t *testing.T) {
 		}
 		names = append(names, tool.Name)
 	}
-	if len(names) != 8 {
-		t.Fatalf("tools/list returned %d tools (%v), want 8", len(names), names)
+	if len(names) != 9 {
+		t.Fatalf("tools/list returned %d tools (%v), want 9", len(names), names)
 	}
 }
 

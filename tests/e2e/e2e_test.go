@@ -57,7 +57,7 @@ var (
 	expectedSet = []string{
 		"beacon_watch_pr", "beacon_wait_result", "beacon_get_result",
 		"beacon_list_running", "beacon_ack", "beacon_cancel_watch", "beacon_stats",
-		"beacon_defer_wiring",
+		"beacon_defer_wiring", "beacon_task_claim",
 	}
 )
 
@@ -182,13 +182,13 @@ func testMCPWithGoSDK(t *testing.T, binary string) {
 	slices.Sort(names)
 	want := slices.Clone(expectedSet)
 	slices.Sort(want)
-	if len(names) != 8 {
+	if len(names) != 9 {
 		t.Fatalf("tools/list вернул %d инструментов: %v", len(names), names)
 	}
 	if !slices.Equal(names, want) {
 		t.Fatalf("tools/list: получено %v, ожидалось %v", names, want)
 	}
-	t.Logf("tools/list: ровно 8 инструментов: %v", names)
+	t.Logf("tools/list: ровно 9 инструментов: %v", names)
 
 	// tools/call goes through the same CommandTransport session. The tool is a
 	// read-only stub in main; we only assert the protocol round trip here.
