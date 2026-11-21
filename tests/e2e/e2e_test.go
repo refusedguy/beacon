@@ -10,8 +10,9 @@
 // Run: bash tests/e2e/run.sh
 //
 // Honesty notes (also in docs/e2e/README.md):
-//  * The wake plugin used in the positive check is a copy of the working T0.3
-//    spike. It is NOT .opencode/plugins/beacon-bridge.js in this repository.
+//  * The positive wake check loads .opencode/plugins/beacon-bridge.js from this
+//    repository. The T0.3 spike copy in fixtures is no longer a source of wake
+//    confirmation; the stub fixture stays as the negative control.
 //  * mcp_go_sdk_CommandTransport proves the protocol and the eight-tool
 //    contract only. live_opencode_full_mcp_cycle calls the real handlers of
 //    `beacon mcp` and reads watchID, revision and verdict from their answers.
@@ -341,6 +342,10 @@ func startServer(t *testing.T, base, pluginPath string) *server {
 		"XDG_DATA_HOME="+filepath.Join(base, "xdg-data"),
 		"XDG_CACHE_HOME="+filepath.Join(base, "xdg-cache"),
 		"XDG_STATE_HOME="+stateHome,
+		// The repository plugin resolves its state dir from ctx.location unless
+		// BEACON_STATE_DIR pins it. Pin the harness dir so its facts land where
+		// collectFacts reads them, the same dir the fixture plugin uses.
+		"BEACON_STATE_DIR="+filepath.Join(stateHome, "beacon"),
 		"OPENCODE_CONFIG="+filepath.Join(project, "opencode.json"),
 		"OPENCODE_DISABLE_AUTOUPDATE=1",
 		"OPENCODE_DISABLE_MODELS_FETCH=1",
@@ -771,10 +776,10 @@ func tail(t *testing.T, path string) string {
 // not the "tests exist in every card" rule from ADR 0010.
 
 // frozenScenarioHash is sha256 of the sorted scenario names joined by "\n",
-// with no trailing newline. Revised when live_wake_via_opencode_api was added:
-// the wake is now also verified on the direct POST /prompt HTTP path, not only
-// through the plugin's events.jsonl poller.
-const frozenScenarioHash = "85303c45e4ba658331746a10d0a6c492bc387daa6a56c730d5bb9bf22af58d01"
+// with no trailing newline. Revised in BCX-55: the wake scenario now loads the
+// repository plugin and is named opencode_wake_with_repo_plugin instead of the
+// fixture-backed opencode_wake_with_reference_plugin.
+const frozenScenarioHash = "0dff4b974123dc348e21ef2f169d8e366c2fedbe8fb0d536d1f257bd68975391"
 
 type e2eScenario struct {
 	name string
@@ -787,7 +792,7 @@ var e2eScenarios = []e2eScenario{
 	{"repo_plugin_skeleton", runRepoPluginSkeleton},
 	{"mcp_go_sdk_CommandTransport", testMCPWithGoSDK},
 	{"mcp_inspector_optional", testInspectorOptional},
-	{"opencode_wake_with_reference_plugin", runWakePositive},
+	{"opencode_wake_with_repo_plugin", runWakePositive},
 	{"live_wake_via_opencode_api", runLiveWakeViaAPI},
 	{"live_opencode_full_mcp_cycle", runLiveMCPCycle},
 	{"negative_control_stub_handler_must_fail", runNegativeControl},
@@ -853,18 +858,15 @@ func runRepoPluginSkeleton(t *testing.T, _ string) {
 	hasPrompt := strings.Contains(string(source), "session.prompt")
 	readsEvents := strings.Contains(string(source), "events.jsonl")
 	t.Logf("repo plugin: session.prompt=%v events.jsonl=%v", hasPrompt, readsEvents)
-	if hasPrompt && readsEvents {
-		t.Log("repo plugin уже содержит wake-логику; прогон всё равно использует эталон из fixtures")
-	} else {
-		t.Log("БЛОКЕР: repo plugin в main — наблюдатель без wake-логики; шаг (e) на нём не пройдёт")
+	if !hasPrompt || !readsEvents {
+		t.Fatalf("repo plugin без wake-логики: session.prompt=%v events.jsonl=%v", hasPrompt, readsEvents)
 	}
-	// No assertion on skeleton state: this stays true after T3.6 lands.
 }
 
 func runWakePositive(t *testing.T, _ string) {
 	t.Helper()
 	facts, info := runWakeScenario(t, newBase(t, "positive"),
-		filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge.js"), "pos")
+		filepath.Join(repoRoot, ".opencode", "plugins", "beacon-bridge.js"), "pos")
 	t.Logf("%s facts=%+v", info, facts)
 	if err := verifyWake(facts); err != nil {
 		t.Fatal(err)
@@ -1068,9 +1070,9 @@ func runLiveMCPCycle(t *testing.T, binary string) {
 	base := newBase(t, "cycle")
 	stateDir := filepath.Join(base, "state", "beacon")
 
-	// A real opencode process with the real reference plugin. The session id
+	// A real opencode process with the repository plugin. The session id
 	// comes from opencode api and is passed as the opaque _meta sessionID.
-	srv := startServer(t, base, filepath.Join(repoRoot, "tests", "e2e", "fixtures", "beacon-bridge.js"))
+	srv := startServer(t, base, filepath.Join(repoRoot, ".opencode", "plugins", "beacon-bridge.js"))
 	defer stopServer(srv)
 	session := newSession(t, srv)
 	waitPluginActive(t, srv)
