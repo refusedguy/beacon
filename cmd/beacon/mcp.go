@@ -31,6 +31,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 	"github.com/refusedguy/beacon/internal/infra/webhook"
+	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 // The app service writes precheck reasons under the same state directory as
@@ -1675,6 +1676,45 @@ func runLadderPass(ctx context.Context, cfg reconcileConfig) {
 	}
 }
 
+// bridgeWorktreeGC binds the cibridge WorktreeGC port to the real collector.
+// Heads are read from the same DB handle the bridge uses, so a Watch that is
+// still watching or blocked protects its worktree at collection time. The
+// current project root is protected as well, so a process never removes the
+// directory it runs from. The bridge declares the port and this composition
+// root owns the adapter, so the layer matrix stays unchanged (ADR 0005).
+func bridgeWorktreeGC(db *store.DB, root string) cibridge.WorktreeGC {
+	return func(ctx context.Context) (int, error) {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if db == nil {
+			return 0, nil
+		}
+		watches, err := db.LiveWatches()
+		if err != nil {
+			return 0, fmt.Errorf("worktree gc: live watches: %w", err)
+		}
+		heads := make(map[string]string, len(watches))
+		for _, w := range watches {
+			if w.HeadSHA == "" {
+				continue
+			}
+			heads[strings.ToLower(w.HeadSHA)] = w.ID
+		}
+		protect := ""
+		if root != "" {
+			if abs, err := filepath.Abs(root); err == nil {
+				protect = abs
+			}
+		}
+		result, err := worktree.Collect(worktree.CommandRunner, heads, protect)
+		if err != nil {
+			return 0, fmt.Errorf("worktree gc: collect: %w", err)
+		}
+		return len(result.Removed), nil
+	}
+}
+
 // ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
 // with domain.EvaluatePR, merges and wakes through the wired ports, the wake
 // ladder advances its due timers and escalation rungs, then the in-process
@@ -1698,7 +1738,8 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithMerger(cfg.batch).
 		WithAutoRebase(cfg.batch).
 		WithBlockerControl(cfg.db).
-		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root})
+		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root}).
+		WithWorktreeGC(bridgeWorktreeGC(cfg.db, cfg.root))
 	updated := bridge.Refresh(ctx)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
 		if err := cfg.db.SaveRuntimeStats(withPollerStats(metrics.SnapshotJSON()), time.Now()); err != nil {
