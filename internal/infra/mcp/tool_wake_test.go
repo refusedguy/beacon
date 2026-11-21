@@ -3709,3 +3709,120 @@ func TestWakeCoreFeaturesIntact(t *testing.T) {
 		t.Errorf("interrupted receipt = %+v, want interrupted", interrupted)
 	}
 }
+
+// fakeRegistryGuard is an in-memory RegistryWakeGuard. It records the ids it
+// was asked about and allows a wake only for the active status, the same rule
+// the production adapter applies to the stored registry row.
+type fakeRegistryGuard struct {
+	statuses map[string]string
+	calls    []string
+}
+
+func (f *fakeRegistryGuard) WakeStatus(executorID string) (string, bool) {
+	f.calls = append(f.calls, executorID)
+	status := f.statuses[executorID]
+	return status, status == "active"
+}
+
+// TestRegistryGuardHoldsStaleWake is the T5.49 acceptance test: a stale row
+// refuses the wake before any side effect and names the stored status on the
+// receipt. No operation, wake window, doorbell or delivery channel is touched.
+func TestRegistryGuardHoldsStaleWake(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	bell := &recordingDoorbell{}
+	guard := &fakeRegistryGuard{statuses: map[string]string{"exec-1": "stale"}}
+	handler := NewWakeHandler(sender).
+		WithDoorbell(bell).
+		WithOperationRegistry(NewMemoryOperationRegistry()).
+		WithRegistryGuard(guard)
+
+	in := WakeInput{
+		Target: "session-1", Executor: "exec-1", Text: "pointer-only",
+		Mailbox: "mailbox-A", Prompt: "long job",
+	}
+	out, err := handler.Wake(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil: a registry refusal is an honest receipt", err)
+	}
+	if out.OK || out.Delivery != DeliveryUnsupported {
+		t.Errorf("receipt = ok %v delivery %q, want false/unsupported", out.OK, out.Delivery)
+	}
+	if out.State != StateHeld {
+		t.Errorf("receipt state = %q, want %q (held)", out.State, StateHeld)
+	}
+	if out.RegistryStatus != "stale" {
+		t.Errorf("registryStatus = %q, want stale", out.RegistryStatus)
+	}
+	if !strings.Contains(out.Reason, "stale") {
+		t.Errorf("reason = %q, want the stale status to be named", out.Reason)
+	}
+	if out.OperationID != "" {
+		t.Errorf("operationId = %q, want empty before a held wake", out.OperationID)
+	}
+	if sender.calls != 0 || bell.calls != 0 {
+		t.Errorf("sender/doorbell calls = %d/%d after a stale wake, want 0/0", sender.calls, bell.calls)
+	}
+	if len(guard.calls) != 1 || guard.calls[0] != "exec-1" {
+		t.Errorf("guard calls = %v, want [exec-1]", guard.calls)
+	}
+}
+
+// TestRegistryGuardAllowsActiveWake proves the same handler delivers to the
+// sender when the registry row is active, and records that status on the
+// receipt. The explicit Target stays the delivery key; Executor is the
+// registry lookup key.
+func TestRegistryGuardAllowsActiveWake(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliveryQueue}
+	guard := &fakeRegistryGuard{statuses: map[string]string{"exec-2": "active"}}
+	handler := NewWakeHandler(sender).WithRegistryGuard(guard)
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "session-2", Executor: "exec-2", Text: "pointer-only",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if !out.OK || out.Delivery != DeliveryQueue {
+		t.Errorf("receipt = ok %v delivery %q, want true/queue", out.OK, out.Delivery)
+	}
+	if out.RegistryStatus != "active" {
+		t.Errorf("registryStatus = %q, want active", out.RegistryStatus)
+	}
+	if out.Reason != "" {
+		t.Errorf("reason = %q, want empty on a delivered wake", out.Reason)
+	}
+	if sender.calls != 1 || sender.lastTarget != "session-2" {
+		t.Errorf("sender calls = %d target = %q, want 1 and session-2", sender.calls, sender.lastTarget)
+	}
+}
+
+// TestRegistryGuardUnknownStatusHoldsWake covers a row that was never synced:
+// an empty status is unknown and denies wake just like stale. The receipt
+// names unknown rather than quoting an empty status.
+func TestRegistryGuardUnknownStatusHoldsWake(t *testing.T) {
+	sender := &fakeWakeSender{delivery: DeliverySteer}
+	guard := &fakeRegistryGuard{statuses: map[string]string{}}
+	handler := NewWakeHandler(sender).WithRegistryGuard(guard)
+
+	out, err := handler.Wake(context.Background(), WakeInput{
+		Target: "session-3", Text: "pointer-only",
+	})
+	if err != nil {
+		t.Fatalf("Wake() error = %v, want nil", err)
+	}
+	if out.OK || out.Delivery != DeliveryUnsupported {
+		t.Errorf("receipt = ok %v delivery %q, want false/unsupported", out.OK, out.Delivery)
+	}
+	if out.RegistryStatus != "" {
+		t.Errorf("registryStatus = %q, want empty for an unknown row", out.RegistryStatus)
+	}
+	if !strings.Contains(out.Reason, "unknown") {
+		t.Errorf("reason = %q, want unknown to be named", out.Reason)
+	}
+	if sender.calls != 0 {
+		t.Errorf("sender calls = %d, want 0", sender.calls)
+	}
+	if len(guard.calls) != 1 || guard.calls[0] != "session-3" {
+		t.Errorf("guard calls = %v, want [session-3] from the explicit target", guard.calls)
+	}
+}

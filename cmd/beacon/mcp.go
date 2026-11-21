@@ -432,7 +432,22 @@ func newMCPServer(deps mcp.Dependencies) *mcpsdk.Server {
 	// The generic server knows no project root. Bind watch_pr here so every
 	// Watch inherits this project's flaky set and layered limits.
 	mcp.AttachWatchPRWithConfig(s, deps, projectRootForConfig())
+	mcp.AttachWake(s, newMCPWakeHandler(deps))
 	return s
+}
+
+// newMCPWakeHandler builds the production wake handler. The registry guard is
+// installed when the composition root supplied the SQLite store, so the CLI
+// rule from registryWakeAllowed decides whether a stale executor may be woken
+// (T5.49). A fake store in a test keeps the pre-feature path. No delivery
+// sender is wired here, so a wake that passes the guard still reports an
+// unsupported delivery until the environment adapter is attached (ADR 0026).
+func newMCPWakeHandler(deps mcp.Dependencies) *mcp.WakeHandler {
+	handler := mcp.NewWakeHandler(nil)
+	if db, ok := deps.Store.(*store.DB); ok {
+		handler.WithRegistryGuard(newWakeRegistryGuard(db, orchestratorProjectKey()))
+	}
+	return handler
 }
 
 // serveMCP starts the stdio transport. Tests replace it to inspect the
