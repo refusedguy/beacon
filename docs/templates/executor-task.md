@@ -210,7 +210,7 @@ executor-task:triage -->
 - Решение владельца: ссылка на сообщение владельца с самим решением, а не пересказ.
 - Ложная premise: путь и символ в `internal/`, где функциональность уже есть, и ссылка на ADR, если решение зафиксировано.
 
-Исполнитель шлёт блокер через `beacon_ack` с `decision="blocked:not_mine"` и непустой причиной, содержащей доказательство. Если obligation ещё нет, он отдаёт тот же блокер с доказательством в отчёте хода оркестратору. Затем он завершает ход по общему правилу `waiting, <watchID>`. Второй PR, повторный коммит и ручное закрытие карточки запрещены: карточку закроет оркестратор по `docs/tasks/CLOSE-PROCEDURE.md`.
+Исполнитель шлёт блокер через `beacon_ack` с `decision="blocked:not_mine"` и непустой причиной, содержащей доказательство. Если obligation ещё нет, он отдаёт тот же блокер с доказательством в отчёте хода оркестратору. Затем он завершает ход по общему правилу `waiting, <watchID>`. Второй PR, повторный коммит и ручное закрытие карточки запрещены: карточку закроет оркестратор по `docs/runbooks/CLOSE-PROCEDURE.md`.
 
 <!-- executor-task:blocker-evidence
 premise-check: before-work
@@ -220,7 +220,7 @@ owner-decision: link-to-owner-message
 false-premise: path-and-symbol-in-internal, adr-ref
 duplicate-pr: forbidden
 manual-close: forbidden
-close-runbook: docs/tasks/CLOSE-PROCEDURE.md
+close-runbook: docs/runbooks/CLOSE-PROCEDURE.md
 executor-task:blocker-evidence -->
 
 ## Отложенная проводка (deferred wiring)
