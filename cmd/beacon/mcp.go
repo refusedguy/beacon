@@ -27,6 +27,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/server"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 	"github.com/refusedguy/beacon/internal/infra/webhook"
@@ -1078,6 +1079,9 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		return fmt.Errorf("mcp: poller: %w", err)
 	}
 	defer stop()
+	if err := publishPollerRuntimeStats(db); err != nil {
+		observe.ActorError("poller-stats", "", err)
+	}
 	if httpErr != nil {
 		// An optional API must never take down the stdio MCP transport.
 		observe.ActorError("httpapi", "", httpErr)
@@ -1096,7 +1100,8 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 }
 
 // pollerLockName is the non-blocking flock file that elects one background
-// poller per state directory.
+// poller per state directory. Its text body holds the PID of the poller owner,
+// so a restarted MCP can tell a live poller from a stale lock.
 const pollerLockName = "beacon-poller.lock"
 
 // pollerLockOpen is the capabilities-gate seam for opening the lock file. The
@@ -1104,26 +1109,151 @@ const pollerLockName = "beacon-poller.lock"
 // directly (ADR 0005).
 var pollerLockOpen = os.OpenFile
 
-// acquirePollerLock takes LOCK_EX|LOCK_NB on <dir>/beacon-poller.lock. A false
-// owned flag means another live process already runs the poller; this process
-// must not start a second loop. The returned function releases the lock.
-func acquirePollerLock(dir string) (func(), bool, error) {
+// pollerProcessAlive checks a PID with signal 0. It is a seam so tests can
+// simulate a dead owner without spawning a real process.
+var pollerProcessAlive = func(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// readPollerPID returns the PID stored in the lock file. A missing file has no
+// owner. A malformed or non-positive body is a stale lock, so it reports zero
+// and no error and the caller replaces it with its own PID.
+func readPollerPID(dir string) (int, error) {
+	data, err := fs.ReadFile(os.DirFS(dir), pollerLockName)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, nil
+	}
+	return pid, nil
+}
+
+// writePollerPID replaces the lock file body with pid. It uses the held file
+// handle, so cmd/beacon never names os.WriteFile (ADR 0005).
+func writePollerPID(f *os.File, pid int) error {
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(f, "%d\n", pid)
+	return err
+}
+
+// pollerLockResult is the outcome of the lock check. owned tells whether this
+// process must start the loop. activePID names the process recorded as the
+// current poller, either this one or a live predecessor.
+type pollerLockResult struct {
+	owned     bool
+	activePID int
+}
+
+// acquirePollerLock takes LOCK_EX|LOCK_NB on <dir>/beacon-poller.lock and
+// checks the recorded PID. A live PID from another process means a poller
+// already runs, so this process stays silent. A missing or dead PID means the
+// lock is stale: this process takes ownership and records its own PID.
+func acquirePollerLock(dir string) (func(), pollerLockResult, error) {
 	path := filepath.Join(dir, pollerLockName)
 	f, err := pollerLockOpen(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return nil, false, err
+		return nil, pollerLockResult{}, err
+	}
+	fail := func(err error) (func(), pollerLockResult, error) {
+		_ = f.Close()
+		return nil, pollerLockResult{}, err
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
-			return nil, false, nil
+			// Another process holds the flock. The PID is best-effort
+			// diagnostic information, not the reason we skip the loop.
+			pid, _ := readPollerPID(dir)
+			if !pollerProcessAlive(pid) {
+				pid = 0
+			}
+			return nil, pollerLockResult{activePID: pid}, nil
 		}
-		return nil, false, err
+		return nil, pollerLockResult{}, err
 	}
-	return func() {
+	pid, err := readPollerPID(dir)
+	if err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return fail(err)
+	}
+	if pid > 0 && pid != os.Getpid() && pollerProcessAlive(pid) {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		_ = f.Close()
-	}, true, nil
+		return nil, pollerLockResult{activePID: pid}, nil
+	}
+	self := os.Getpid()
+	if err := writePollerPID(f, self); err != nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		return fail(err)
+	}
+	release := func() {
+		_ = writePollerPID(f, 0)
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+	return release, pollerLockResult{owned: true, activePID: self}, nil
+}
+
+// pollerMetrics carries the poller gauges published to runtime_stats. The
+// server metric set keeps active and PID together and fixes their JSON names.
+var pollerMetrics = server.NewMetrics()
+
+// publishPollerStatus records the poller state on both diagnostic paths. mcp
+// exposes it in beacon_stats, while runtime_stats carries it to beacon inspect.
+func publishPollerStatus(activePID int) {
+	status := mcp.PollerStatus{Active: activePID > 0, PID: activePID}
+	mcp.SetPollerStatus(status)
+	pollerMetrics.SetPoller(status.Active, status.PID)
+}
+
+// withPollerStats adds the poller gauges to a runtime_stats snapshot. A broken
+// snapshot is replaced by the poller values only, so a corrupt row cannot hide
+// the state of the running poller.
+func withPollerStats(raw []byte) []byte {
+	fields := map[string]json.RawMessage{}
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			fields = map[string]json.RawMessage{}
+		}
+	}
+	encoded, err := json.Marshal(pollerMetrics.Poller())
+	if err != nil {
+		return raw
+	}
+	var gauges map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &gauges); err != nil {
+		return raw
+	}
+	for key, value := range gauges {
+		fields[key] = value
+	}
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return raw
+	}
+	return append(out, '\n')
+}
+
+// publishPollerRuntimeStats writes the current poller state without waiting
+// for the first reconcile pass. A second MCP process with a live poller owner
+// still reports the owner's PID in beacon inspect.
+func publishPollerRuntimeStats(db *store.DB) error {
+	raw, _, _ := db.LoadRuntimeStats()
+	return db.SaveRuntimeStats(withPollerStats(raw), time.Now())
 }
 
 // reconcileConfig bundles the one store handle and the ports the single
@@ -1425,7 +1555,7 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithBlockerControl(cfg.db)
 	updated := bridge.Refresh(ctx)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
-		if err := cfg.db.SaveRuntimeStats(metrics.SnapshotJSON(), time.Now()); err != nil {
+		if err := cfg.db.SaveRuntimeStats(withPollerStats(metrics.SnapshotJSON()), time.Now()); err != nil {
 			observe.ActorError("runtime_stats", "", err)
 		}
 	}
@@ -1468,11 +1598,12 @@ func ReconcileLoop(ctx context.Context, cfg reconcileConfig) {
 // runReconciler starts the loop only when this process owns the poller lock.
 // The returned function cancels and waits for the loop and releases the lock.
 func runReconciler(ctx context.Context, cfg reconcileConfig) (func(), error) {
-	release, owned, err := acquirePollerLock(cfg.dir)
+	release, lock, err := acquirePollerLock(cfg.dir)
 	if err != nil {
 		return nil, err
 	}
-	if !owned {
+	publishPollerStatus(lock.activePID)
+	if !lock.owned {
 		return func() {}, nil
 	}
 	if cfg.onPollerOwner != nil {

@@ -41,6 +41,14 @@ const (
 	// labels, so it adds exactly one series whatever the number of Watches
 	// (BS.49, ADR 0195). The exported name is beacon_rss_bytes.
 	GaugeRSSBytes = "rss_bytes"
+
+	// GaugePollerActive is 1 while a live CI poller owns the lock, 0 otherwise.
+	// The exported name is beacon_poller_active.
+	GaugePollerActive = "poller_active"
+
+	// GaugePollerPID is the PID of the live poller, 0 when none runs. The
+	// exported name is beacon_poller_pid.
+	GaugePollerPID = "poller_pid"
 )
 
 // Footprint budget from ADR 0191 (BS.51). The process must stay below 100 MB
@@ -162,6 +170,14 @@ type Series struct {
 	Duration   DurationStats
 }
 
+// PollerState is the observable state of the single CI poller. The JSON names
+// match the fields beacon inspect reads from runtime_stats. A process runs at
+// most one poller, so these values carry no labels.
+type PollerState struct {
+	Active bool `json:"pollerActive"`
+	PID    int  `json:"pollerPID"`
+}
+
 // Metrics is a low-cardinality metric set. It holds one counter and one
 // duration histogram for every combination of the closed label domains.
 // Every method is safe for concurrent use.
@@ -170,6 +186,7 @@ type Metrics struct {
 	calls     map[seriesKey]uint64
 	durations map[seriesKey]*histogram
 	rssBytes  uint64
+	poller    PollerState
 }
 
 // NewMetrics builds an empty set with every possible series present at zero.
@@ -217,6 +234,30 @@ func (m *Metrics) RSSBytes() uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.rssBytes
+}
+
+// SetPoller publishes the live poller state. An inactive poller has no PID, so
+// a stale PID cannot outlive the poller it named.
+func (m *Metrics) SetPoller(active bool, pid int) {
+	if m == nil {
+		return
+	}
+	if !active || pid < 0 {
+		pid = 0
+	}
+	m.mu.Lock()
+	m.poller = PollerState{Active: active && pid > 0, PID: pid}
+	m.mu.Unlock()
+}
+
+// Poller returns the last published poller state.
+func (m *Metrics) Poller() PollerState {
+	if m == nil {
+		return PollerState{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.poller
 }
 
 // IncCall advances the call counter for attrs by one. Unknown attribute values
@@ -324,6 +365,7 @@ func (m *Metrics) Reset() {
 		h.mu.Unlock()
 	}
 	m.rssBytes = 0
+	m.poller = PollerState{}
 	m.mu.Unlock()
 }
 
@@ -393,20 +435,22 @@ type durationJSON struct {
 }
 
 type metricsJSON struct {
-	Counter   string       `json:"counter"`
-	Histogram string       `json:"histogram"`
-	RSSBytes  uint64       `json:"rssBytes"`
-	Series    []seriesJSON `json:"series"`
+	Counter   string `json:"counter"`
+	Histogram string `json:"histogram"`
+	RSSBytes  uint64 `json:"rssBytes"`
+	PollerState
+	Series []seriesJSON `json:"series"`
 }
 
 // JSON renders every series as one object. The histogram sum is suffixed with
 // seconds so a reader cannot mistake it for milliseconds.
 func (m *Metrics) JSON() []byte {
 	out := metricsJSON{
-		Counter:   CounterCalls,
-		Histogram: HistogramCallDuration,
-		RSSBytes:  m.RSSBytes(),
-		Series:    []seriesJSON{},
+		Counter:     CounterCalls,
+		Histogram:   HistogramCallDuration,
+		RSSBytes:    m.RSSBytes(),
+		PollerState: m.Poller(),
+		Series:      []seriesJSON{},
 	}
 	for _, s := range m.Snapshot() {
 		buckets := make(map[string]uint64, len(durationBounds)+1)
@@ -444,6 +488,17 @@ func (m *Metrics) Prometheus() []byte {
 	fmt.Fprintf(&buf, "# HELP beacon_%s Resident set size of the process in bytes.\n", GaugeRSSBytes)
 	fmt.Fprintf(&buf, "# TYPE beacon_%s gauge\n", GaugeRSSBytes)
 	fmt.Fprintf(&buf, "beacon_%s %d\n", GaugeRSSBytes, m.RSSBytes())
+	poller := m.Poller()
+	active := 0
+	if poller.Active {
+		active = 1
+	}
+	fmt.Fprintf(&buf, "# HELP beacon_%s Whether the CI poller is active.\n", GaugePollerActive)
+	fmt.Fprintf(&buf, "# TYPE beacon_%s gauge\n", GaugePollerActive)
+	fmt.Fprintf(&buf, "beacon_%s %d\n", GaugePollerActive, active)
+	fmt.Fprintf(&buf, "# HELP beacon_%s PID of the CI poller.\n", GaugePollerPID)
+	fmt.Fprintf(&buf, "# TYPE beacon_%s gauge\n", GaugePollerPID)
+	fmt.Fprintf(&buf, "beacon_%s %d\n", GaugePollerPID, poller.PID)
 	for _, s := range m.Snapshot() {
 		labels := labelString(s.Attributes)
 		fmt.Fprintf(&buf, "beacon_%s{%s} %d\n", CounterCalls, labels, s.Calls)
