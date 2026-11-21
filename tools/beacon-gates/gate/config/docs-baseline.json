@@ -175,31 +175,6 @@
       "rule": "DOC-ADR-DUP",
       "path": "docs/adrs/0260-fixer.md",
       "task": "HD-085"
-    },
-    {
-      "rule": "DOC-ADR-STRUCTURE",
-      "path": "docs/adrs/0031-fresh-mcp-features.md",
-      "task": "HD-085"
-    },
-    {
-      "rule": "DOC-ADR-STRUCTURE",
-      "path": "docs/adrs/0032-night-shift-handoff-ideas.md",
-      "task": "HD-085"
-    },
-    {
-      "rule": "DOC-ADR-STRUCTURE",
-      "path": "docs/adrs/0033-graft-report-ideas.md",
-      "task": "HD-085"
-    },
-    {
-      "rule": "DOC-ADR-STRUCTURE",
-      "path": "docs/adrs/0034-web-orchestration-patterns.md",
-      "task": "HD-085"
-    },
-    {
-      "rule": "DOC-ADR-STRUCTURE",
-      "path": "docs/adrs/0067-omnigraph-wave-aw.md",
-      "task": "HD-085"
     }
   ]
 }
