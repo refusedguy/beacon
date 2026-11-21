@@ -388,6 +388,84 @@ func hasCyrillic(s string) bool {
 // state. Missing and non-green checks are held with different reasons, and
 // GitHub's skipped and neutral states do not count as green. Every reported
 // check is inspected, so a green group cannot hide a neutral run.
+// TestCheckRejectsInvalidCardType proves --check fails closed on a Type value
+// outside the generated card's closed set. The batch is checked before any
+// artifact is written, so an invalid Type cannot reach docs/tasks. The valid
+// case is the control: the same run with "task" exits zero.
+func TestCheckRejectsInvalidCardType(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cardType   string
+		wantCode   int
+		wantStderr string
+		wantStdout string
+	}{
+		{
+			name: "spike is rejected", cardType: "spike", wantCode: 1,
+			wantStderr: "недопустимое значение поля type: spike\n",
+			// Validation runs before the check report, so stdout stays empty.
+		},
+		{
+			name: "task is accepted", cardType: "task", wantCode: 0,
+			wantStdout: "valid=1 invalid=0\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			raw := fmt.Sprintf(`{"cards":[{"id":"Q-A4-CARD","type":%q}]}`, tc.cardType)
+			if err := os.WriteFile(filepath.Join(dir, "batch.json"), []byte(raw), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var out, errOut strings.Builder
+			code := Run(Options{Dir: dir, Check: true}, &out, &errOut)
+			if code != tc.wantCode {
+				t.Fatalf("exit code = %d, want %d (stdout=%q stderr=%q)", code, tc.wantCode, out.String(), errOut.String())
+			}
+			if tc.wantStderr != "" && errOut.String() != tc.wantStderr {
+				t.Fatalf("stderr = %q, want %q", errOut.String(), tc.wantStderr)
+			}
+			if got := out.String(); got != tc.wantStdout {
+				t.Fatalf("stdout = %q, want %q", got, tc.wantStdout)
+			}
+			for _, rel := range []string{
+				filepath.Join("docs", "tasks", "Q-A4-CARD.md"),
+				filepath.Join("docs", "adrs", "README.md"),
+				filepath.Join("docs", "FACTS.md"),
+			} {
+				if _, err := os.Stat(filepath.Join(dir, rel)); err == nil {
+					t.Fatalf("--check wrote %s", rel)
+				}
+			}
+		})
+	}
+}
+
+// TestCardFieldProblemsCoversAllFields pins the closed sets for Тип, Фаза and
+// Статус. An empty value is a default and stays valid; a declared value
+// outside its set is reported once with its field name.
+func TestCardFieldProblemsCoversAllFields(t *testing.T) {
+	batches := []batch{{Cards: []card{
+		{ID: "A", Type: "spike", Phase: "P9", Status: "closed"},
+		{ID: "B", Type: "task", Phase: "P0", Status: "todo"},
+		{ID: "C"},
+	}}}
+	got := cardFieldProblems(batches)
+	want := []string{
+		"недопустимое значение поля type: spike\n",
+		"недопустимое значение поля phase: P9\n",
+		"недопустимое значение поля status: closed\n",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("problems = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("problem %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestEvaluateChecksMergeGate(t *testing.T) {
 	allGreen := []ghCheck{
 		{Name: "build", State: "SUCCESS"},
