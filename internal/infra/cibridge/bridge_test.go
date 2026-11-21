@@ -1426,3 +1426,25 @@ func TestAdapterBreakerKeepsWatchWakeCap(t *testing.T) {
 		t.Fatalf("status = %q, want parked by the wake cap", got.Status)
 	}
 }
+
+// TestWakeTextStaleBaseRebaseIncludesReason proves that a stale-base rebase
+// wake carries both the concrete nextCommand and the machine-readable reason.
+// The executor can rebase at once instead of triaging red checks by hand.
+func TestWakeTextStaleBaseRebaseIncludesReason(t *testing.T) {
+	targets := []domain.WakeTarget{{
+		Role:   domain.RoleExecutor,
+		Kind:   domain.WakePointer,
+		Reason: domain.ReasonStaleBaseAfterMainFix,
+	}}
+	obs := ciObservation{base: domain.BaseBranchState{HeadSHA: "main-after-fix"}}
+	text := wakeText(domain.VerdictRebase, obs, targets, "")
+	for _, want := range []string{
+		"git rebase origin/main",
+		"reason: " + domain.ReasonStaleBaseAfterMainFix,
+		"mainHeadSHA=main-after-fix",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("wake text %q missing %q", text, want)
+		}
+	}
+}

@@ -706,6 +706,8 @@ func snapshotFor(w domain.Watch, obs ciObservation, now time.Time) domain.Snapsh
 		NoChecksSince:    w.NoChecksSince,
 		SuitesValid:      true,
 		BaseFailedChecks: obs.base.FailedChecks,
+		BaseHeadSHA:      obs.base.HeadSHA,
+		BaseChecksKnown:  obs.base.ChecksKnown,
 	}
 }
 
@@ -1997,6 +1999,9 @@ func wakeText(verdict domain.Verdict, obs ciObservation, targets []domain.WakeTa
 		}
 	case domain.VerdictRebase:
 		text = "rebase: git fetch origin main && git rebase origin/main && git push --force-with-lease"
+		if reason := wakeReason(targets); reason != "" {
+			text += "; reason: " + reason
+		}
 	case domain.VerdictRecheck:
 		text = "recheck: база main сдвинулась после снимка; повтори проверку CI на свежем main"
 	case domain.VerdictRetry:
@@ -2018,6 +2023,18 @@ func wakeText(verdict domain.Verdict, obs ciObservation, targets []domain.WakeTa
 		text = string(verdict)
 	}
 	return text + mainHeadMarker(obs.base.HeadSHA)
+}
+
+// wakeReason returns the machine-readable reason carried on a wake target. An
+// empty reason leaves the wake text unchanged for older verdicts that do not
+// set one. The first non-empty reason wins when a verdict has several targets.
+func wakeReason(targets []domain.WakeTarget) string {
+	for _, t := range targets {
+		if r := strings.TrimSpace(t.Reason); r != "" {
+			return r
+		}
+	}
+	return ""
 }
 
 // mainHeadMarker appends the main branch head observed for a Watch to the wake
