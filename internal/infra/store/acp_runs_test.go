@@ -25,7 +25,7 @@ func openACPRunStore(t *testing.T) (*DB, string) {
 
 func TestACPRunEmptyStoreDoesNotCreateTable(t *testing.T) {
 	d, _ := openACPRunStore(t)
-	got, found, err := d.GetACPRun("T3.278")
+	_, found, err := d.GetACPRun("T3.278")
 	if err != nil || found {
 		t.Fatalf("GetACPRun on empty store: found=%v err=%v", found, err)
 	}
