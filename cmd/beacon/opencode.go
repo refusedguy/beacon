@@ -128,3 +128,15 @@ func newOpencodePort() (opencodePort, error) {
 	SetServerEnsurer(serverEnsurerFunc(opencode.EnsureServer))
 	return client, nil
 }
+
+// newReadOnlyOpencodePort builds a client from an existing service.json only.
+// It never installs the fallback server starter, so the MCP wake path cannot
+// spawn opencode serve. A missing registration returns an error; callers that
+// treat the port as optional leave the wake ports nil and use their CLI path.
+func newReadOnlyOpencodePort() (opencodePort, error) {
+	cfg, err := opencode.ReadConfig()
+	if err != nil {
+		return nil, err
+	}
+	return opencode.New(cfg, opencodeHTTPDoer)
+}
