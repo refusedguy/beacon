@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // w2bObligationStore is the narrow obligation port in memory. A real SQLite
@@ -281,5 +282,134 @@ func TestW2BRoleFixerWakeTarget(t *testing.T) {
 	}
 	if delivered != fixer {
 		t.Fatalf("refused wakes changed delivery to %q", delivered)
+	}
+}
+
+// fixMetricSink records the counters the wake layer emits. It keeps the test
+// independent of the Recorder and the Prometheus exporter.
+type fixMetricSink struct {
+	counts map[string]uint64
+	events []string
+}
+
+func (s *fixMetricSink) Log(_ observe.Level, event string, _ observe.Fields) {
+	s.events = append(s.events, event)
+}
+
+func (s *fixMetricSink) Inc(name, label string) {
+	if s.counts == nil {
+		s.counts = make(map[string]uint64)
+	}
+	s.counts[name+":"+label]++
+}
+
+func TestATX43FixCounterRisesOnFixerWake(t *testing.T) {
+	sink := &fixMetricSink{}
+	observe.SetDefault(sink)
+	defer observe.SetDefault(nil)
+
+	const (
+		watchID = "atx43-fix"
+		fixer   = "ses_atx43_fixer"
+	)
+	w := domain.Watch{
+		ID: watchID,
+		Subscribers: []domain.Subscriber{
+			{ID: fixer, Role: domain.RoleFixer, FixFor: "ses_atx43_exec", Adapter: AdapterOpenCode},
+		},
+	}
+	d := &recordingWakeDeliverer{fn: func(context.Context, string, domain.WakePayload) error {
+		return nil
+	}}
+	if err := DeliverToSubscriber(context.Background(), d, w, w2bPayload(watchID, fixer, 3), fixer); err != nil {
+		t.Fatalf("DeliverToSubscriber(fixer): %v", err)
+	}
+	if got := sink.counts[observe.CounterFixTotal+":fixer"]; got != 1 {
+		t.Errorf("fix_total{role=fixer} = %d, want 1", got)
+	}
+	found := false
+	for _, event := range sink.events {
+		if event == "fix_delivered" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("fix_delivered event missing: %+v", sink.events)
+	}
+}
+
+func TestATX43FixCounterStaysZeroForExecutorAndFailedWake(t *testing.T) {
+	sink := &fixMetricSink{}
+	observe.SetDefault(sink)
+	defer observe.SetDefault(nil)
+
+	const executor = "ses_atx43_exec"
+	execWatch := domain.Watch{
+		ID: "atx43-exec",
+		Subscribers: []domain.Subscriber{
+			{ID: executor, Role: domain.RoleExecutor, Adapter: AdapterOpenCode},
+		},
+	}
+	ok := &recordingWakeDeliverer{fn: func(context.Context, string, domain.WakePayload) error {
+		return nil
+	}}
+	if err := DeliverToSubscriber(context.Background(), ok, execWatch, w2bPayload(execWatch.ID, executor, 1), executor); err != nil {
+		t.Fatalf("DeliverToSubscriber(executor): %v", err)
+	}
+	if got := sink.counts[observe.CounterFixTotal+":fixer"]; got != 0 {
+		t.Errorf("fix_total after executor wake = %d, want 0", got)
+	}
+
+	const fixer = "ses_atx43_fixer"
+	fixWatch := domain.Watch{
+		ID: "atx43-failed",
+		Subscribers: []domain.Subscriber{
+			{ID: fixer, Role: domain.RoleFixer, FixFor: executor, Adapter: AdapterOpenCode},
+		},
+	}
+	failing := &recordingWakeDeliverer{fn: func(context.Context, string, domain.WakePayload) error {
+		return errors.New("transport refused")
+	}}
+	if err := DeliverToSubscriber(context.Background(), failing, fixWatch, w2bPayload(fixWatch.ID, fixer, 1), fixer); err == nil {
+		t.Fatal("failed delivery must surface the error")
+	}
+	if got := sink.counts[observe.CounterFixTotal+":fixer"]; got != 0 {
+		t.Errorf("fix_total after failed fixer wake = %d, want 0", got)
+	}
+}
+
+// The CI bridge selects DeliverToSubscriber on the production waker. The fix
+// counter must rise there once, not on a replay of the same obligation.
+func TestATX43ProductionWakerCountsFixerOnce(t *testing.T) {
+	sink := &fixMetricSink{}
+	observe.SetDefault(sink)
+	defer observe.SetDefault(nil)
+
+	const (
+		watchID = "atx43-prod"
+		fixer   = "ses_atx43_prod_fixer"
+	)
+	w := domain.Watch{
+		ID: watchID,
+		Subscribers: []domain.Subscriber{
+			{ID: fixer, Role: domain.RoleFixer, FixFor: "ses_atx43_prod_exec", Adapter: AdapterOpenCode},
+		},
+	}
+	p := w2bPayload(watchID, fixer, 7)
+	inner := &adapterDelivererFn{fn: func(context.Context, string, string, domain.WakePayload) error {
+		return nil
+	}}
+	waker := &AdapterDedupDeliverer{Inner: inner, Dedup: NewDeliveryDedup()}
+	if err := waker.DeliverToSubscriber(context.Background(), w, p, fixer); err != nil {
+		t.Fatalf("DeliverToSubscriber(fixer): %v", err)
+	}
+	if got := sink.counts[observe.CounterFixTotal+":fixer"]; got != 1 {
+		t.Errorf("fix_total{role=fixer} = %d, want 1", got)
+	}
+	if err := waker.DeliverToSubscriber(context.Background(), w, p, fixer); err != nil {
+		t.Fatalf("repeated DeliverToSubscriber(fixer): %v", err)
+	}
+	if got := sink.counts[observe.CounterFixTotal+":fixer"]; got != 1 {
+		t.Errorf("fix_total after replay = %d, want 1", got)
 	}
 }
