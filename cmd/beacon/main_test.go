@@ -557,11 +557,12 @@ func (p *t3145BothPort) Prompt(string, string) error { return nil }
 
 func t3145RestorePorts(t *testing.T) {
 	t.Helper()
-	previousLive, previousSpawn, previousDeliver := watchLiveSource, spawnSessionSpawner, deliverTarget
+	previousLive, previousSpawn, previousDeliver, previousEnsurer := watchLiveSource, spawnSessionSpawner, deliverTarget, installedServerEnsurer
 	t.Cleanup(func() {
 		SetLiveSource(previousLive)
 		SetSessionSpawner(previousSpawn)
 		SetDeliveryTarget(previousDeliver)
+		SetServerEnsurer(previousEnsurer)
 	})
 }
 
