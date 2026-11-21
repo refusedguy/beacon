@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -141,4 +142,157 @@ func (r *Registry) Deliver(ctx context.Context, adapter, sessionID string, p dom
 		return fmt.Errorf("wake: registry: no deliverer for adapter %q or fallback %q", adapter, defaultAdapter)
 	}
 	return d.Deliver(ctx, sessionID, p)
+}
+
+// ===== Pi RPC provider (T3.217) =====
+// The provider owns no process. A caller injects one long-lived connection,
+// so the same probe runs against a real Pi socket, a test transport or any
+// other implementation of PiRPCConnection.
+
+// PiRPCCall is one method invocation on a Pi connection. The transport decides
+// how these fields map onto its wire format.
+type PiRPCCall struct {
+	SessionID string `json:"sessionId"`
+	Text      string `json:"text,omitempty"`
+}
+
+// PiRPCReply is the provider-neutral result of one call. A transport decodes
+// wire frames into it; the probe never reads a process stream.
+type PiRPCReply struct {
+	State     string `json:"state"`
+	MessageID string `json:"messageId"`
+	Error     string `json:"error"`
+}
+
+// PiRPCConnection is the injected transport dependency. Its owner controls
+// process and socket lifetime. Call returns one reply for one method, and
+// Close is called by the owner when the connection is no longer needed.
+type PiRPCConnection interface {
+	Call(ctx context.Context, method string, call PiRPCCall) (PiRPCReply, error)
+	Close() error
+}
+
+// PiProbe is the provider interface. Prompt writes into the active turn,
+// Steer writes into a running session and FollowUp queues into a sleeping one.
+// GetState and WaitForIdle expose the state transition W05 checks.
+type PiProbe interface {
+	Prompt(ctx context.Context, sessionID, text string) error
+	Steer(ctx context.Context, sessionID, text string) error
+	FollowUp(ctx context.Context, sessionID, text string) error
+	Abort(ctx context.Context, sessionID string) error
+	GetState(ctx context.Context, sessionID string) (string, error)
+	WaitForIdle(ctx context.Context, sessionID string) error
+}
+
+// PiRPCProbe implements PiProbe over an injected PiRPCConnection. It holds
+// transport as a dependency and never starts a process or opens a socket.
+type PiRPCProbe struct {
+	Conn PiRPCConnection
+}
+
+var _ PiProbe = (*PiRPCProbe)(nil)
+
+func (p *PiRPCProbe) call(ctx context.Context, method, sessionID, text string) (PiRPCReply, error) {
+	if p == nil || p.Conn == nil {
+		return PiRPCReply{}, fmt.Errorf("%w: pi rpc %s: no connection", ErrUnsupported, method)
+	}
+	reply, err := p.Conn.Call(ctx, method, PiRPCCall{SessionID: sessionID, Text: text})
+	if err != nil {
+		return PiRPCReply{}, fmt.Errorf("wake: pi rpc %s: %w", method, err)
+	}
+	if reply.Error != "" {
+		return PiRPCReply{}, fmt.Errorf("wake: pi rpc %s: %s", method, reply.Error)
+	}
+	return reply, nil
+}
+
+func (p *PiRPCProbe) Prompt(ctx context.Context, sessionID, text string) error {
+	_, err := p.call(ctx, "prompt", sessionID, text)
+	return err
+}
+
+func (p *PiRPCProbe) Steer(ctx context.Context, sessionID, text string) error {
+	_, err := p.call(ctx, "steer", sessionID, text)
+	return err
+}
+
+func (p *PiRPCProbe) FollowUp(ctx context.Context, sessionID, text string) error {
+	_, err := p.call(ctx, "followUp", sessionID, text)
+	return err
+}
+
+func (p *PiRPCProbe) Abort(ctx context.Context, sessionID string) error {
+	_, err := p.call(ctx, "abort", sessionID, "")
+	return err
+}
+
+func (p *PiRPCProbe) GetState(ctx context.Context, sessionID string) (string, error) {
+	reply, err := p.call(ctx, "get_state", sessionID, "")
+	if err != nil {
+		return "", err
+	}
+	return reply.State, nil
+}
+
+func (p *PiRPCProbe) WaitForIdle(ctx context.Context, sessionID string) error {
+	_, err := p.call(ctx, "waitForIdle", sessionID, "")
+	return err
+}
+
+// PiDeliveryMode is the ADR 0026 outcome a Pi delivery asks for. Steer writes
+// into the running turn; queue leaves a followUp for a sleeping session.
+type PiDeliveryMode string
+
+const (
+	PiModeQueue PiDeliveryMode = "queue"
+	PiModeSteer PiDeliveryMode = "steer"
+)
+
+// ParsePiDeliveryMode treats an empty value as the default queue mode.
+func ParsePiDeliveryMode(raw string) (PiDeliveryMode, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", string(PiModeQueue):
+		return PiModeQueue, nil
+	case string(PiModeSteer):
+		return PiModeSteer, nil
+	default:
+		return "", fmt.Errorf("wake: pi mode %q: want queue or steer", raw)
+	}
+}
+
+// PiDeliverer adapts a PiProbe to the wake deliverer port. Mode selects the
+// RPC method; the default queue mode uses followUp and is reported as such.
+type PiDeliverer struct {
+	Probe PiProbe
+	Mode  PiDeliveryMode
+}
+
+var _ domain.WakeDeliverer = (*PiDeliverer)(nil)
+
+func (d *PiDeliverer) Deliver(ctx context.Context, sessionID string, p domain.WakePayload) error {
+	text := fmt.Sprintf("beacon wake watch=%s revision=%d verdict=%s obligation=%s",
+		p.WatchID, p.Revision, p.Verdict, p.ObligationID)
+	_, err := d.DeliverText(ctx, sessionID, text)
+	return err
+}
+
+// DeliverText writes one pointer and returns the RPC method used. A nil error
+// means the provider accepted the write; callers report queue versus steer
+// from the mode instead of turning a successful followUp into a failure.
+func (d *PiDeliverer) DeliverText(ctx context.Context, sessionID, text string) (PiDeliveryMode, error) {
+	if d == nil || d.Probe == nil {
+		return PiModeQueue, fmt.Errorf("%w adapter %q: no pi probe", ErrUnsupported, AdapterPi)
+	}
+	mode := d.Mode
+	if mode == "" {
+		mode = PiModeQueue
+	}
+	switch mode {
+	case PiModeQueue:
+		return PiModeQueue, d.Probe.FollowUp(ctx, sessionID, text)
+	case PiModeSteer:
+		return PiModeSteer, d.Probe.Steer(ctx, sessionID, text)
+	default:
+		return PiModeQueue, fmt.Errorf("%w: pi mode %q", ErrUnsupported, mode)
+	}
 }

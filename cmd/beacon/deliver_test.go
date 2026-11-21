@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // promptCall is one recorded call into a stand-in deliveryTarget.
@@ -420,5 +422,247 @@ func TestRunDeliverErrors(t *testing.T) {
 	}
 	if len(tgt.calls) != 0 {
 		t.Fatalf("no error case should write a follow-up, got %+v", tgt.calls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pi RPC adapter with an injected provider (T3.217).
+// ---------------------------------------------------------------------------
+
+type mockPiProbe struct {
+	methods     []string
+	sessions    []string
+	texts       []string
+	deadlines   []bool
+	followUpErr error
+	steerErr    error
+}
+
+func (m *mockPiProbe) record(method string, ctx context.Context, sessionID, text string) {
+	m.methods = append(m.methods, method)
+	m.sessions = append(m.sessions, sessionID)
+	m.texts = append(m.texts, text)
+	_, ok := ctx.Deadline()
+	m.deadlines = append(m.deadlines, ok)
+}
+
+func (m *mockPiProbe) Prompt(ctx context.Context, sessionID, text string) error {
+	m.record("prompt", ctx, sessionID, text)
+	return nil
+}
+
+func (m *mockPiProbe) Steer(ctx context.Context, sessionID, text string) error {
+	m.record("steer", ctx, sessionID, text)
+	return m.steerErr
+}
+
+func (m *mockPiProbe) FollowUp(ctx context.Context, sessionID, text string) error {
+	m.record("followUp", ctx, sessionID, text)
+	return m.followUpErr
+}
+
+func (m *mockPiProbe) Abort(ctx context.Context, sessionID string) error {
+	m.record("abort", ctx, sessionID, "")
+	return nil
+}
+
+func (m *mockPiProbe) GetState(ctx context.Context, sessionID string) (string, error) {
+	m.record("get_state", ctx, sessionID, "")
+	return "processing", nil
+}
+
+func (m *mockPiProbe) WaitForIdle(ctx context.Context, sessionID string) error {
+	m.record("waitForIdle", ctx, sessionID, "")
+	return nil
+}
+
+var _ wake.PiProbe = (*mockPiProbe)(nil)
+
+type mockPiConn struct {
+	methods []string
+	calls   []wake.PiRPCCall
+	reply   wake.PiRPCReply
+	err     error
+}
+
+func (c *mockPiConn) Call(_ context.Context, method string, call wake.PiRPCCall) (wake.PiRPCReply, error) {
+	c.methods = append(c.methods, method)
+	c.calls = append(c.calls, call)
+	if c.err != nil {
+		return wake.PiRPCReply{}, c.err
+	}
+	return c.reply, nil
+}
+
+func (c *mockPiConn) Close() error { return nil }
+
+var _ wake.PiRPCConnection = (*mockPiConn)(nil)
+
+func withPiConfig(t *testing.T, adapter, mode, timeout string) {
+	t.Helper()
+	t.Setenv(deliverAdapterEnv, adapter)
+	t.Setenv(deliverPiModeEnv, mode)
+	t.Setenv(deliverPiTimeoutEnv, timeout)
+}
+
+func withPiProbe(t *testing.T, probe wake.PiProbe) {
+	t.Helper()
+	old := resolvePiProbe
+	t.Cleanup(func() { resolvePiProbe = old })
+	resolvePiProbe = func(deliverAdapterConfig) (wake.PiProbe, error) { return probe, nil }
+}
+
+func piDeliverSnapshot() mcp.StateSnapshot {
+	return mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+		deliverWatch("w-pi", domain.VerdictNeedsInput, deliverSub(domain.RoleExecutor, "pi-session")),
+	}}
+}
+
+func TestPiRPCProbeUsesInjectedConnection(t *testing.T) {
+	conn := &mockPiConn{reply: wake.PiRPCReply{State: "processing", MessageID: "msg-1"}}
+	probe := &wake.PiRPCProbe{Conn: conn}
+
+	if err := probe.FollowUp(context.Background(), "pi-session", "pointer"); err != nil {
+		t.Fatalf("FollowUp: %v", err)
+	}
+	state, err := probe.GetState(context.Background(), "pi-session")
+	if err != nil || state != "processing" {
+		t.Fatalf("GetState = %q/%v, want processing/nil", state, err)
+	}
+	if len(conn.methods) != 2 || conn.methods[0] != "followUp" || conn.methods[1] != "get_state" {
+		t.Fatalf("methods = %v, want followUp then get_state", conn.methods)
+	}
+	if conn.calls[0].SessionID != "pi-session" || conn.calls[0].Text != "pointer" {
+		t.Fatalf("call = %+v, want pi-session/pointer", conn.calls[0])
+	}
+}
+
+func TestPiRPCProbeReportsReplyError(t *testing.T) {
+	probe := &wake.PiRPCProbe{Conn: &mockPiConn{reply: wake.PiRPCReply{Error: "session closed"}}}
+	if err := probe.Steer(context.Background(), "pi-session", "pointer"); err == nil || !strings.Contains(err.Error(), "session closed") {
+		t.Fatalf("Steer error = %v, want the transport reply error", err)
+	}
+}
+
+func TestDeliverPiRPCSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		method   string
+		delivery string
+	}{
+		{name: "queue by default", method: "followUp", delivery: "queue"},
+		{name: "steer mode", mode: "steer", method: "steer", delivery: "steer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &mockPiProbe{}
+			withPiConfig(t, "pi", tc.mode, "2s")
+			withPiProbe(t, probe)
+
+			code, out, errOut := runDeliverWith(t, []string{"w-pi"}, piDeliverSnapshot(), nil, nil)
+			if code != 0 {
+				t.Fatalf("exit = %d, stderr = %q, want 0", code, errOut)
+			}
+			if !strings.Contains(out, "delivery="+tc.delivery) || !strings.Contains(out, "outcome="+tc.delivery) {
+				t.Fatalf("stdout = %q, want %s delivery and outcome", out, tc.delivery)
+			}
+			if len(probe.methods) != 1 || probe.methods[0] != tc.method {
+				t.Fatalf("methods = %v, want one %s call", probe.methods, tc.method)
+			}
+			wantKey := domain.ObligationKey("w-pi", 7, "pi-session")
+			if probe.sessions[0] != "pi-session" || !strings.Contains(probe.texts[0], wantKey) {
+				t.Fatalf("call = %q/%q, want pi-session and obligation %q", probe.sessions[0], probe.texts[0], wantKey)
+			}
+			if !probe.deadlines[0] {
+				t.Fatal("the pi probe did not receive the configured timeout")
+			}
+		})
+	}
+}
+
+func TestDeliverPiRPCErrorIsNotDelivery(t *testing.T) {
+	probe := &mockPiProbe{followUpErr: errors.New("rpc failed")}
+	withPiConfig(t, "pi", "", "")
+	withPiProbe(t, probe)
+
+	code, out, errOut := runDeliverWith(t, []string{"w-pi"}, piDeliverSnapshot(), nil, nil)
+	if code == 0 {
+		t.Fatalf("a failed rpc exited 0, stdout = %q", out)
+	}
+	if !strings.Contains(out, "outcome=indeterminate") || !strings.Contains(out, "delivery=unsupported") {
+		t.Fatalf("stdout = %q, want indeterminate outcome and unsupported delivery", out)
+	}
+	if len(probe.methods) != 1 {
+		t.Fatalf("methods = %v, want one call without retries", probe.methods)
+	}
+	if errOut == "" {
+		t.Fatal("a failed rpc must explain the reason on stderr")
+	}
+}
+
+func TestDeliverPiRPCTimeoutRetriesThenUnsupported(t *testing.T) {
+	probe := &mockPiProbe{followUpErr: context.DeadlineExceeded}
+	withPiConfig(t, "pi", "", "1ms")
+	withPiProbe(t, probe)
+
+	code, out, errOut := runDeliverWith(t, []string{"w-pi"}, piDeliverSnapshot(), nil, nil)
+	if code == 0 {
+		t.Fatalf("a timed out rpc exited 0, stdout = %q", out)
+	}
+	if !strings.Contains(out, "outcome=transport-failed") ||
+		!strings.Contains(out, "attempts=3") ||
+		!strings.Contains(out, "delivery=unsupported") {
+		t.Fatalf("stdout = %q, want transport-failed, three attempts and unsupported", out)
+	}
+	if len(probe.methods) != deliverMaxAttempts {
+		t.Fatalf("methods = %v, want %d attempts", probe.methods, deliverMaxAttempts)
+	}
+	if !probe.deadlines[0] {
+		t.Fatal("the pi probe did not receive the configured timeout")
+	}
+	if errOut == "" {
+		t.Fatal("a timed out rpc must explain the reason on stderr")
+	}
+}
+
+func TestDeliverPiKeepsCurrentTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		adapter string
+		mode    string
+	}{
+		{name: "no adapter"},
+		{name: "other adapter", adapter: "opencode"},
+		{name: "bad mode", adapter: "pi", mode: "bogus"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			probe := &mockPiProbe{}
+			withPiConfig(t, tc.adapter, tc.mode, "")
+			withPiProbe(t, probe)
+
+			tgt := &scriptTarget{}
+			code, out, errOut := runDeliverWith(t, []string{"w-pi"}, piDeliverSnapshot(), nil, tgt)
+			if code != 0 || !strings.Contains(out, "delivery=steer") {
+				t.Fatalf("exit/stdout/stderr = %d/%q/%q, want the current target to steer", code, out, errOut)
+			}
+			if len(tgt.calls) != 1 {
+				t.Fatalf("target calls = %+v, want one call", tgt.calls)
+			}
+			if len(probe.methods) != 0 {
+				t.Fatalf("pi probe was called despite the fallback: %v", probe.methods)
+			}
+		})
+	}
+}
+
+func TestDeliverPiWithoutProviderIsUnsupported(t *testing.T) {
+	withPiConfig(t, "pi", "", "")
+	old := resolvePiProbe
+	t.Cleanup(func() { resolvePiProbe = old })
+	resolvePiProbe = func(deliverAdapterConfig) (wake.PiProbe, error) { return nil, nil }
+
+	code, out, errOut := runDeliverWith(t, []string{"w-pi"}, piDeliverSnapshot(), nil, nil)
+	if code == 0 || !strings.Contains(out, "delivery=unsupported") {
+		t.Fatalf("exit/stdout/stderr = %d/%q/%q, want honest unsupported", code, out, errOut)
 	}
 }
