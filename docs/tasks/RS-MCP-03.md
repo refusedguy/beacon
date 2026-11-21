@@ -23,3 +23,4 @@ baseline: 2026-11-21, origin/main 0198f6b. `git grep -n 'maxItems\|maxBytes' ori
 - Тесты в трёх файлах покрывают пустой ответ, ровно лимит, лимит плюс одна запись, байтовый лимит и isError на MCP-сессии. Дополнительно проверено, что отклонённый list_running сохраняет курсор, а отклонённый get_result не штампует readAt.
 - gofmt применён к шести файлам. go test и go build локально не запускались по правилам репозитория, проверка идёт в CI.
 - PR: https://github.com/refusedguy/beacon/pull/868, ветка fix/t20.
+- Первый прогон CI нашёл неиспользуемую переменную `second` в TestListRunningLimitRefusalKeepsCursor. Теперь тест проверяет, что повторный вызов с тем же курсором не возвращает старые события.

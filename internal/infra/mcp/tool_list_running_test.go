@@ -971,13 +971,16 @@ func TestListRunningByteLimit(t *testing.T) {
 }
 
 // TestListRunningLimitRefusalKeepsCursor proves a refused call cannot consume
-// the client's place in the event stream. The retry with filters still sees
-// the events after the cursor from before the refusal.
+// the client's place in the event stream. The retry with the same cursor still
+// sees the events added after the refusal.
 func TestListRunningLimitRefusalKeepsCursor(t *testing.T) {
 	reader := &snapshotReaderFake{snap: limitWatchSnapshot(2)}
 	handler := NewListRunningHandler(reader)
 	first := callListRunning(t, handler, ListRunningInput{})
 	second := callListRunning(t, handler, ListRunningInput{Cursor: first.Cursor})
+	if len(second.Events) != 0 {
+		t.Fatalf("events on unchanged snapshot = %+v, want none", second.Events)
+	}
 	if handler.cursor != 2 {
 		t.Fatalf("cursor after second call = %d, want 2", handler.cursor)
 	}
