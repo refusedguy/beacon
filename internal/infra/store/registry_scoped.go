@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -164,21 +165,22 @@ func (r *ScopedRegistry) ExecutorCount() (int, error) {
 	return n, err
 }
 
-// scopedWatchBindingColumns is the shared projection for binding reads. The
-// CAST keeps fencing_token readable in both schema variants: an INTEGER in the
-// migration and TEXT in the on-demand table.
+// scopedWatchBindingColumns is the shared projection for binding reads.
+// Migration 0005 stores fencing_token as INTEGER, so this reader and
+// readWatchBindingState scan the same stored value without a CAST (BCX-33).
 const scopedWatchBindingColumns = `watch_id, revision, project_key, agent_id,
-       config_id, CAST(fencing_token AS TEXT), created_at`
+       config_id, fencing_token, created_at`
 
 func scanScopedWatchBinding(scan func(...any) error) (WatchBinding, error) {
 	var b WatchBinding
-	var revision int64
+	var revision, token int64
 	err := scan(&b.WatchID, &revision, &b.ProjectKey, &b.AgentID,
-		&b.ConfigID, &b.FencingToken, &b.CreatedAt)
+		&b.ConfigID, &token, &b.CreatedAt)
 	if err != nil {
 		return WatchBinding{}, err
 	}
 	b.Revision = uint64(revision)
+	b.FencingToken = strconv.FormatInt(token, 10)
 	return b, nil
 }
 

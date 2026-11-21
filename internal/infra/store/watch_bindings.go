@@ -96,9 +96,11 @@ type storedWatchBindings struct {
 }
 
 func readWatchBindingState(q columnQuerier, watchID string) (storedWatchBindings, error) {
+	// Migration 0005 stores fencing_token as INTEGER, so read it in its
+	// stored type instead of casting it on every binding read (BCX-33).
 	query := `
 SELECT project_key, revision, agent_id, config_id,
-       CAST(fencing_token AS INTEGER), subscriber_id, created_at
+       fencing_token, subscriber_id, created_at
 FROM watch_bindings WHERE watch_id = ?`
 
 	rows, err := q.Query(query, watchID)
