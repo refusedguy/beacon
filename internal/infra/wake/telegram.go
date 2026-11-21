@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -23,6 +25,7 @@ const (
 	TelegramChatEnv    = "BEACON_TELEGRAM_CHAT"
 	TelegramAPIBaseEnv = "BEACON_TELEGRAM_API"
 
+	telegramAPIHost        = "api.telegram.org"
 	defaultTelegramAPIBase = "https://api.telegram.org"
 	telegramRequestTimeout = 5 * time.Second
 	telegramMaxRespBytes   = 1 << 20
@@ -35,7 +38,8 @@ var ErrTelegramTransport = errors.New("wake: telegram transport failure")
 
 // TelegramConfig is the boundary between the process environment and the
 // transport. Token and ChatID are secrets and never appear in a log field;
-// APIBase exists only so a test can point the sink at an httptest server.
+// APIBase exists so a test can point the sink at an httptest server, and is
+// checked against an allowlist before a request is built.
 type TelegramConfig struct {
 	Token   string
 	ChatID  string
@@ -67,31 +71,74 @@ func TelegramConfigFromEnv(lookup func(string) string) TelegramConfig {
 // through the Telegram Bot API. All HTTP lives here; the CLI only holds this
 // type behind a port.
 type TelegramNotifySink struct {
-	cfg  TelegramConfig
-	base string
-	doer TelegramDoer
+	cfg          TelegramConfig
+	base         string
+	doer         TelegramDoer
+	baseRejected bool
 }
 
 // NewTelegramNotifySink builds a sink. A missing API base falls back to the
 // public Bot API; a missing doer gets a bounded client so a hung endpoint can
-// never block the reconcile cycle.
+// never block the reconcile cycle. A base naming any host other than the
+// public API or loopback is refused: the token travels in the URL path, so
+// sending it to an address injected through the environment would leak it.
 func NewTelegramNotifySink(cfg TelegramConfig) *TelegramNotifySink {
 	base := strings.TrimRight(strings.TrimSpace(cfg.APIBase), "/")
-	if base == "" {
+	rejected := false
+	switch {
+	case base == "":
 		base = defaultTelegramAPIBase
+	case telegramAPIBaseAllowed(base):
+		// Keep the explicit base: loopback in tests, or the public API.
+	default:
+		base = defaultTelegramAPIBase
+		rejected = true
 	}
 	doer := cfg.Doer
 	if doer == nil {
 		doer = &http.Client{Timeout: telegramRequestTimeout}
 	}
-	return &TelegramNotifySink{cfg: cfg, base: base, doer: doer}
+	return &TelegramNotifySink{cfg: cfg, base: base, doer: doer, baseRejected: rejected}
+}
+
+// telegramAPIBaseAllowed reports whether raw may receive a bot token. Only the
+// public Bot API over https and loopback hosts for tests are allowed. Parsing
+// the hostname also rejects lookalikes such as api.telegram.org.evil.test and
+// userinfo tricks such as https://api.telegram.org@evil.test.
+func telegramAPIBaseAllowed(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if !strings.EqualFold(u.Scheme, "https") && !strings.EqualFold(u.Scheme, "http") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	switch {
+	case host == "":
+		return false
+	case host == telegramAPIHost:
+		return strings.EqualFold(u.Scheme, "https")
+	default:
+		return isLoopbackHost(host)
+	}
+}
+
+// isLoopbackHost recognizes the loopback names used by httptest and local
+// development. net.ParseIP covers every address in 127.0.0.0/8 and ::1.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Configured reports whether proactive notifications have both a token and a
 // destination chat. An unconfigured sink is fail-open: callers get no error and
 // no request is made.
 func (s *TelegramNotifySink) Configured() bool {
-	return s != nil && s.tokenConfigured() && strings.TrimSpace(s.cfg.ChatID) != ""
+	return s != nil && !s.baseRejected && s.tokenConfigured() && strings.TrimSpace(s.cfg.ChatID) != ""
 }
 
 func (s *TelegramNotifySink) tokenConfigured() bool {
@@ -163,13 +210,18 @@ type telegramResponse struct {
 
 // call posts one Bot API method and decodes its envelope. Request and response
 // errors are sanitized: the token lives in the URL and must never reach a log
-// or an error string an operator copies into a ticket.
+// or an error string an operator copies into a ticket. A rejected API base
+// stops the call before a request reaches the transport.
 func (s *TelegramNotifySink) call(ctx context.Context, method string, payload any, out any) error {
+	endpoint := s.base + "/bot" + s.cfg.Token + "/" + method
+	if s.baseRejected {
+		return fmt.Errorf("wake: telegram %s: transport: %w: %s",
+			method, ErrTelegramTransport, s.sanitize("refused endpoint "+endpoint))
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("wake: telegram %s: encode: %w", method, err)
 	}
-	endpoint := s.base + "/bot" + s.cfg.Token + "/" + method
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("wake: telegram %s: request: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))

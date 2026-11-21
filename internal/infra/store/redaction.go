@@ -147,6 +147,10 @@ var (
 	// fine-grained personal access tokens (github_pat_).
 	githubTokenRE = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
 
+	// telegramTokenRE matches a Telegram bot token, <digits>:<35 characters>,
+	// wherever it appears: a URL path, an error string or a stored payload.
+	telegramTokenRE = regexp.MustCompile(`[0-9]+:[A-Za-z0-9_-]{35}`)
+
 	// authHeaderRE matches an Authorization header and its credential, keeping
 	// the header name and dropping the scheme plus value.
 	authHeaderRE = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
@@ -156,14 +160,15 @@ var (
 	urlCredsRE = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
 )
 
-// Redact removes GitHub tokens, Authorization credentials and URL credentials
-// from src. It never mutates src and is safe to call on arbitrary payload
-// bytes or on a log line before the line leaves the process.
+// Redact removes GitHub tokens, Telegram bot tokens, Authorization credentials
+// and URL credentials from src. It never mutates src and is safe to call on
+// arbitrary payload bytes or on a log line before the line leaves the process.
 func Redact(src []byte) []byte {
 	if len(src) == 0 {
 		return append([]byte(nil), src...)
 	}
 	out := githubTokenRE.ReplaceAll(src, []byte(redacted))
+	out = telegramTokenRE.ReplaceAll(out, []byte(redacted))
 	out = authHeaderRE.ReplaceAll(out, []byte("${1}"+redacted))
 	out = urlCredsRE.ReplaceAll(out, []byte("${1}"+redacted+"@"))
 	return out

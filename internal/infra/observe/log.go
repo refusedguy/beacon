@@ -80,19 +80,22 @@ func serverHandlerOptions(level Level) *slog.HandlerOptions {
 // are infrastructure packages, so the filter is duplicated here and applied
 // to the bytes before they reach beacon.mcp.jsonl.
 var (
-	githubTokenRE = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
-	authHeaderRE  = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
-	urlCredsRE    = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
+	githubTokenRE   = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
+	telegramTokenRE = regexp.MustCompile(`[0-9]+:[A-Za-z0-9_-]{35}`)
+	authHeaderRE    = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
+	urlCredsRE      = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
 )
 
-// Redact removes GitHub tokens, Authorization credentials and URL credentials
-// from a log line. It is deliberately byte-based so it catches a secret in a
-// structured field, in a message and in a legacy log.Printf line alike.
+// Redact removes GitHub tokens, Telegram bot tokens, Authorization credentials
+// and URL credentials from a log line. It is deliberately byte-based so it
+// catches a secret in a structured field, in a message and in a legacy
+// log.Printf line alike.
 func Redact(src []byte) []byte {
 	if len(src) == 0 {
 		return append([]byte(nil), src...)
 	}
 	out := githubTokenRE.ReplaceAll(src, []byte("[REDACTED]"))
+	out = telegramTokenRE.ReplaceAll(out, []byte("[REDACTED]"))
 	out = authHeaderRE.ReplaceAll(out, []byte("${1}[REDACTED]"))
 	out = urlCredsRE.ReplaceAll(out, []byte("${1}[REDACTED]@"))
 	return out
