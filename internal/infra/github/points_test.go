@@ -598,23 +598,27 @@ func TestWebhookWithoutIDIsDropped(t *testing.T) {
 }
 
 // TestWebhookConcurrentRedeliverySingleEffect checks that racing deliveries of
-// one event.id produce exactly one effect.
+// one event.id produce exactly one effect. A start barrier releases every
+// goroutine at the same instant, so the race needs no sleep to widen it.
 func TestWebhookConcurrentRedeliverySingleEffect(t *testing.T) {
 	var reads atomic.Int64
 	source := func(ctx context.Context, ev WebhookEvent) (domain.Snapshot, error) {
 		reads.Add(1)
-		time.Sleep(time.Millisecond)
 		return domain.Snapshot{State: "merged"}, nil
 	}
 	p := NewWebhookProcessor(nil, source)
 
 	const n = 16
+	start := make(chan struct{})
+	ready := make(chan struct{}, n)
 	var wg sync.WaitGroup
 	var accepted atomic.Int64
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			ready <- struct{}{}
+			<-start
 			ok, err := p.Handle(context.Background(), WebhookEvent{ID: "evt-race", Type: "pull_request"})
 			if err != nil {
 				t.Errorf("Handle: %v", err)
@@ -624,6 +628,10 @@ func TestWebhookConcurrentRedeliverySingleEffect(t *testing.T) {
 			}
 		}()
 	}
+	for i := 0; i < n; i++ {
+		<-ready
+	}
+	close(start)
 	wg.Wait()
 
 	if got := accepted.Load(); got != 1 {
