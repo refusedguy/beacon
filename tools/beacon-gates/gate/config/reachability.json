@@ -47,27 +47,12 @@
     },
     {
       "rule": "REACH-UNWIRED",
-      "path": "internal/infra/mcp/ACPWaitService",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
-    },
-    {
-      "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/ClaimHandler",
       "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
     },
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/HolderLeaseHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
-    },
-    {
-      "rule": "REACH-UNWIRED",
-      "path": "internal/infra/mcp/MentionWaitService",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
-    },
-    {
-      "rule": "REACH-UNWIRED",
-      "path": "internal/infra/mcp/NewACPWaitService",
       "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
     },
     {
@@ -93,11 +78,6 @@
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/mcp/NewHolderLeaseHandler",
-      "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
-    },
-    {
-      "rule": "REACH-UNWIRED",
-      "path": "internal/infra/mcp/NewMentionWaitService",
       "reason": "wake/claim/wait инструменты MCP подключаются в Waves 6-8"
     },
     {
@@ -133,21 +113,6 @@
     {
       "rule": "REACH-UNWIRED",
       "path": "internal/infra/wake/T210ObservingAdapter",
-      "reason": "T21x-адаптеры подключаются в поток deliver в Wave 7"
-    },
-    {
-      "rule": "REACH-UNWIRED",
-      "path": "internal/infra/wake/T215Adapter",
-      "reason": "T21x-адаптеры подключаются в поток deliver в Wave 7"
-    },
-    {
-      "rule": "REACH-UNWIRED",
-      "path": "internal/infra/wake/T216Bridge",
-      "reason": "T21x-адаптеры подключаются в поток deliver в Wave 7"
-    },
-    {
-      "rule": "REACH-UNWIRED",
-      "path": "internal/infra/wake/T218Adapter",
       "reason": "T21x-адаптеры подключаются в поток deliver в Wave 7"
     }
   ]
