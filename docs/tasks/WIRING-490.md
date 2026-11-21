@@ -1,5 +1,5 @@
 # WIRING-490. Подключить lineage дочерних thread к серверу
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/ws.go, internal/infra/mcp/server.go
@@ -21,9 +21,9 @@ baseline: 2026-11-21, PR #530 влит коммитом c629af0; код пров
 
 BS.69 помечена dropped: в текущем контракте семи инструментов и ses_ нет дочерних thread. Модель целиком лежит в поле OwnerFiles этой карточки, но подключение к серверу и доставку уведомлений делают владельцы internal/infra/server и internal/infra/mcp. Вызов beacon_defer_wiring в этом ходе завершился ошибкой `PERSIST_FAILED: store port is nil`, поэтому карточка создана вручную.
 
-## Подтверждение premise
+## Подтверждение
 
-2026-11-21 после `git fetch origin main` PR #530 уже влит коммитом `c629af0`. Diff PR #530 меняет ровно OwnerFiles карточки и тесты к ним. В `origin/main` есть `ChildThreads` и `ParentNotifier` в `internal/infra/server/ws.go` и `AskChildQuestion` в `internal/infra/mcp/server.go`. Маркера `WIRING:490` в `.beacon/wiring-pending` нет. Отложенная часть подключена, правка OwnerFiles не нужна. Статус остаётся todo по контракту гейта.
+2026-11-21 после `git fetch origin main` свежий origin/main стоит на c716b61. PR [#530](https://github.com/refusedguy/beacon/pull/530) влит коммитом `c629af0`, `gh pr view` отдаёт state MERGED и mergedAt 2026-11-20T17:16:44Z. Diff PR #530 меняет ровно OwnerFiles карточки и тесты к ним. В `origin/main` есть `ChildThreads` и `ParentNotifier` в `internal/infra/server/ws.go:58` и `AskChildQuestion` в `internal/infra/mcp/server.go:224`. Отложенная часть подключена, правка OwnerFiles не нужна. Код не писал, gofmt не применял, чужие файлы, wiring и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done, карточку закрывает PR #530.
 
 ## Шаги
 
