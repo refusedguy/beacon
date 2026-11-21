@@ -1,5 +1,5 @@
 # IDX-01. Схема SQLite индекса карточек и импорт
-Статус: in_progress
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/taskstore/index.go, internal/infra/taskstore/index_test.go
@@ -16,3 +16,7 @@ baseline: Замер 2026-11-21 по docs/tasks: `find -name '*.md' | wc -l` = 9
 Шаги: Спроектировать схему, импортировать все карточки через ParseCard, идемпотентный повторный импорт, тесты на 931 запись.
 Проверка: gofmt, go test в CI.
 Приёмка: Импорт 931 карточки и 950 зависимостей без ошибок, повтор не меняет данные.
+
+## Подтверждение
+
+Проверено 2026-11-21 по `git show origin/main:internal/infra/taskstore/index.go` и `gh pr view 912`. Реализация уже влита в origin/main через PR #912, https://github.com/refusedguy/beacon/pull/912. Merge commit b4dc900c31f4a44e8bd873275b769af89b6a6f48 добавил `internal/infra/taskstore/index.go` и `internal/infra/taskstore/index_test.go`. Схема `indexSchemaSQL` создаёт таблицы `cards`, `deps`, `owners`; `OpenIndex` применяет её идемпотентно, `ImportCards` и `RebuildDir` пересобирают индекс в одной транзакции DELETE+INSERT. Тесты `TestImportCardsWritesRows`, `TestImportCardsIdempotent` и `TestImportCardsDeduplicatesTokens` фиксируют поведение. Повторной реализации не делалось, чтобы не дублировать влитый код. Статус переведён в done.
