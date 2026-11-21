@@ -50,14 +50,13 @@ import (
 )
 
 var (
-	goBin       = envOr("GO_BIN", "/tmp/opencode/go126/bin/go")
-	openBin     = envOr("OPENCODE_BIN", "opencode")
-	repoRoot    = repoRootPath()
-	expectedSet = []string{
-		"beacon_watch_pr", "beacon_wait_result", "beacon_get_result",
-		"beacon_list_running", "beacon_ack", "beacon_cancel_watch", "beacon_stats",
-		"beacon_defer_wiring", "beacon_task_claim", "beacon_task_close", beaconmcp.WakeToolName,
-	}
+	goBin    = envOr("GO_BIN", "/tmp/opencode/go126/bin/go")
+	openBin  = envOr("OPENCODE_BIN", "opencode")
+	repoRoot = repoRootPath()
+	// expectedSet comes from the MCP package so the tools/list contract has
+	// one owner. A new tool registration without a matching name breaks both
+	// assertions below.
+	expectedSet = beaconmcp.AdvertisedToolNames()
 )
 
 func envOr(key, fallback string) string {
@@ -1123,7 +1122,7 @@ func runLiveMCPCycle(t *testing.T, binary string) {
 		names = append(names, tool.Name)
 	}
 	slices.Sort(names)
-	want := append(slices.Clone(beaconmcp.ToolNames), beaconmcp.WakeToolName)
+	want := slices.Clone(expectedSet)
 	slices.Sort(want)
 	if !slices.Equal(names, want) {
 		t.Fatalf("tools/list: получено %v, ожидалось %v", names, want)

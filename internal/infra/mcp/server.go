@@ -243,6 +243,16 @@ var ToolNames = func() []string {
 	return names
 }()
 
+// AdvertisedToolNames returns the exact set of names the production server
+// advertises. It adds the opt-in wake tool to the descriptor-backed ToolNames.
+// Consumers that assert the tools/list contract derive their expected set from
+// this function, so a new registration cannot stay local to one copy.
+func AdvertisedToolNames() []string {
+	names := make([]string, 0, len(ToolNames)+1)
+	names = append(names, ToolNames...)
+	return append(names, WakeToolName)
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // annotationsForKind maps a descriptor's honest annotation class to the SDK

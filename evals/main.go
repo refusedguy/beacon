@@ -35,14 +35,14 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	smoke "github.com/refusedguy/beacon/evals/cmd"
 	"github.com/refusedguy/beacon/internal/domain"
+	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 const (
 	serverName = "beacon"
-	// contractTools задаёт список инструментов в одном месте.
-	// frozenContractToolsHash замораживает его хеш по образцу frozenScenarioHash.
-	// Хеш пересчитан для десяти имён после добавления task_claim и task_close.
+	// frozenContractToolsHash замораживает хеш(names) по образцу frozenScenarioHash.
+	// Имена приходят из internal/infra/mcp, поэтому список живёт в одном месте.
 	frozenContractToolsHash = "ad40be47dea5b2c76a079255bbe46096bf44c15dd2fc3ead61f4d9bd00714442"
 	// passTrials задаёт число прогонов стохастического кейса. Требуем пять из пяти.
 	passTrials = 5
@@ -61,18 +61,9 @@ const (
 	evalRealWakeTarget = "real-wake-proof"
 )
 
-var contractTools = []string{
-	"beacon_watch_pr",
-	"beacon_wait_result",
-	"beacon_get_result",
-	"beacon_list_running",
-	"beacon_ack",
-	"beacon_cancel_watch",
-	"beacon_stats",
-	"beacon_defer_wiring",
-	"beacon_task_claim",
-	"beacon_task_close",
-}
+// The eval server registers the descriptor-backed tools only. It does not
+// attach the opt-in wake tool, so ToolNames is its exact tools/list contract.
+var contractTools = beaconmcp.ToolNames
 
 // evalStatus задаёт трёхзначный статус проверки (ADR 0301). WARN и FAIL не равны:
 // WARN не удерживает прогон от зелёного выхода, FAIL удерживает.
