@@ -1,0 +1,14 @@
+# RS-OBS-01. Корреляционные поля в структурированных логах цикла
+Статус: todo
+Фаза: P3
+Тип: task
+Владелец файлов: internal/infra/observe/log.go, internal/infra/observe/log_test.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: Добавить watchID, obligationID, revision, role, adapter, verdict и attempt в каждую запись цикла и проверить связность по cycleID.
+Контекст: Premise: проверено 2026-11-21, cycleID есть, но остальные идентификаторы в логи цикла не попадают. baseline: `grep -c 'cycleID' internal/infra/observe/log.go` = 0, `grep -rc 'watchID' internal/infra/observe/log.go` = 0. Источник: OpenTelemetry GenAI semantic conventions.
+Шаги: Расширить структуру записи и точки вызова. Не писать ses_... или obligationID в agent.name. Не генерировать conversation.id из UUID или хеша. Добавить тест, который по одному cycleID находит все связанные записи и квитанцию.
+Проверка: gofmt чистый. Тесты в CI. Кардинальность agent.name остаётся низкой.
+Приёмка: По cycleID находится полная цепочка от Watch до доставки. Текст уведомления по умолчанию в лог не пишется.
