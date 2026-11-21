@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS agent_registry (
   capabilities   BLOB NOT NULL DEFAULT '[]',
   config_id      TEXT NOT NULL DEFAULT '',
   status         TEXT NOT NULL DEFAULT 'active',
+  last_seen      INTEGER NOT NULL DEFAULT 0,
+  worktree       TEXT NOT NULL DEFAULT '',
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   PRIMARY KEY (project_key, agent_id)
@@ -99,6 +101,8 @@ type ExecutorRecord struct {
 	Capabilities  []string
 	ConfigID      string
 	Status        string
+	LastSeen      int64
+	Worktree      string
 	CreatedAt     int64
 	UpdatedAt     int64
 }
@@ -133,10 +137,10 @@ type BindResult struct {
 // RegisterResult is the combined outcome of one register call: the executor
 // upsert and the binding write committed in the same transaction.
 type RegisterResult struct {
-	Executor      ExecutorRecord
-	Binding       WatchBinding
-	ExecutorNew   bool
-	BindingNew    bool
+	Executor    ExecutorRecord
+	Binding     WatchBinding
+	ExecutorNew bool
+	BindingNew  bool
 }
 
 // ensureRegistryTables creates both tables inside the caller's transaction.
@@ -145,6 +149,27 @@ func ensureRegistryTables(tx *sql.Tx) error {
 	for _, stmt := range []string{createAgentRegistrySQL, createWatchBindingsSQL} {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("store: registry: create table: %w", err)
+		}
+	}
+	// A table created by migration 0005 predates the sync columns. CREATE TABLE
+	// IF NOT EXISTS cannot add them, and the read paths below select them by
+	// name, so add what is missing here on every write. PRAGMA table_info is a
+	// read and the ALTER runs in the caller's transaction, which makes the
+	// whole guard idempotent and safe against a second writer.
+	for _, col := range []struct{ name, def string }{
+		{"last_seen", "INTEGER NOT NULL DEFAULT 0"},
+		{"worktree", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		has, err := registryHasColumn(tx, col.name)
+		if err != nil {
+			return fmt.Errorf("store: registry: check %s: %w", col.name, err)
+		}
+		if has {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE agent_registry ADD COLUMN %s %s", col.name, col.def)
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("store: registry: add %s: %w", col.name, err)
 		}
 	}
 	return nil
@@ -234,6 +259,10 @@ func executorExists(tx *sql.Tx, e ExecutorRecord) (bool, error) {
 	return true, nil
 }
 
+// upsertExecutorTx refreshes the mutable registration fields. last_seen and
+// worktree are inserted for a new row but are not overwritten on conflict: they
+// belong to the sync pass, and a later register must not erase the last live
+// observation (T5.55).
 func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, error) {
 	found, err := executorExists(tx, e)
 	if err != nil {
@@ -243,8 +272,8 @@ func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, er
 	_, err = tx.Exec(`
 		INSERT INTO agent_registry
 		  (project_key, agent_id, role, runtime, session_id, notify_adapter, notify_target,
-		   capabilities, config_id, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		   capabilities, config_id, status, last_seen, worktree, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(project_key, agent_id) DO UPDATE SET
 		  role           = excluded.role,
 		  runtime        = excluded.runtime,
@@ -257,7 +286,8 @@ func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, er
 		  updated_at     = excluded.updated_at`,
 		stored.ProjectKey, stored.AgentID, stored.Role, stored.Runtime, stored.SessionID,
 		stored.NotifyAdapter, stored.NotifyTarget, encodeCapabilities(stored.Capabilities),
-		stored.ConfigID, stored.Status, stored.CreatedAt, stored.UpdatedAt)
+		stored.ConfigID, stored.Status, stored.LastSeen, stored.Worktree,
+		stored.CreatedAt, stored.UpdatedAt)
 	if err != nil {
 		return UpsertResult{}, fmt.Errorf("store: registry: upsert: %w", err)
 	}
@@ -406,11 +436,12 @@ func (d *DB) Executor(projectKey, agentID string) (ExecutorRecord, bool, error) 
 	var caps []byte
 	err = d.readDB.QueryRow(`
 		SELECT project_key, agent_id, role, runtime, session_id, notify_adapter, notify_target,
-		       capabilities, config_id, status, created_at, updated_at
+		       capabilities, config_id, status, last_seen, worktree, created_at, updated_at
 		FROM agent_registry WHERE project_key = ? AND agent_id = ?`,
 		projectKey, agentID,
 	).Scan(&e.ProjectKey, &e.AgentID, &e.Role, &e.Runtime, &e.SessionID, &e.NotifyAdapter,
-		&e.NotifyTarget, &caps, &e.ConfigID, &e.Status, &e.CreatedAt, &e.UpdatedAt)
+		&e.NotifyTarget, &caps, &e.ConfigID, &e.Status, &e.LastSeen, &e.Worktree,
+		&e.CreatedAt, &e.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ExecutorRecord{}, false, nil
 	}
@@ -463,7 +494,7 @@ func (d *DB) Executors(projectKey string) ([]ExecutorRecord, error) {
 	}
 	rows, err := d.readDB.Query(`
 		SELECT project_key, agent_id, role, runtime, session_id, notify_adapter, notify_target,
-		       capabilities, config_id, status, created_at, updated_at
+		       capabilities, config_id, status, last_seen, worktree, created_at, updated_at
 		FROM agent_registry WHERE project_key = ? ORDER BY agent_id`, projectKey)
 	if err != nil {
 		return nil, err
@@ -475,13 +506,49 @@ func (d *DB) Executors(projectKey string) ([]ExecutorRecord, error) {
 		var caps []byte
 		if err := rows.Scan(&e.ProjectKey, &e.AgentID, &e.Role, &e.Runtime, &e.SessionID,
 			&e.NotifyAdapter, &e.NotifyTarget, &caps, &e.ConfigID, &e.Status,
-			&e.CreatedAt, &e.UpdatedAt); err != nil {
+			&e.LastSeen, &e.Worktree, &e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, err
 		}
 		e.Capabilities = decodeCapabilities(caps)
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// EnsureRegistrySchema brings a registry created by an older migration set up
+// to the current column set. Reads select last_seen and worktree by name, so a
+// caller that only reads an old registry must call this once first. The work
+// runs through the writer, which keeps the ALTER under the store's single
+// writer contract; a second call is a no-op.
+func (d *DB) EnsureRegistrySchema() error {
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		return ensureRegistryTables(tx)
+	})
+}
+
+// SyncExecutor writes the reconciliation outcome of one executor: its status,
+// the UTC nanosecond timestamp of the last live observation and the worktree of
+// the session that was observed. lastSeen is supplied by the caller so a repeat
+// pass with the same observation writes the same values; worktree may be empty
+// for a stale row. The write leaves verdicts and every other column alone.
+func (d *DB) SyncExecutor(projectKey, agentID, status, worktree string, lastSeen int64) error {
+	if strings.TrimSpace(projectKey) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: registry: empty project key")
+	}
+	if strings.TrimSpace(agentID) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: registry: empty agent id")
+	}
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if err := ensureRegistryTables(tx); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`
+			UPDATE agent_registry
+			SET status = ?, last_seen = ?, worktree = ?, updated_at = ?
+			WHERE project_key = ? AND agent_id = ?`,
+			status, lastSeen, worktree, time.Now().UTC().UnixNano(), projectKey, agentID)
+		return err
+	})
 }
 
 // ExecutorCount returns the number of executor rows in one project. A repeated

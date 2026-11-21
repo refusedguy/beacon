@@ -174,6 +174,61 @@ func TestRegistrySyncNeverStartsModel(t *testing.T) {
 	}
 }
 
+type registrySyncTestStore struct {
+	setStatusCalls int
+	syncCalls      int
+	gotWorktree    string
+	gotStatus      string
+	gotLastSeen    int64
+}
+
+func (s *registrySyncTestStore) Entries(string) ([]registryEntry, error) {
+	return []registryEntry{{AgentID: "a", SessionID: "ses-a", Status: registryStatusStale}}, nil
+}
+
+func (s *registrySyncTestStore) SetStatus(string, string, string) error {
+	s.setStatusCalls++
+	return nil
+}
+
+func (s *registrySyncTestStore) SyncExecutor(_, _, status, worktree string, lastSeen int64) error {
+	s.syncCalls++
+	s.gotStatus = status
+	s.gotWorktree = worktree
+	s.gotLastSeen = lastSeen
+	return nil
+}
+
+// TestSyncRegistryWritesObservation covers the T5.55 seam: the store that can
+// write last_seen and worktree gets the live session's directory and one
+// timestamp, while the status-only fallback stays unused.
+func TestSyncRegistryWritesObservation(t *testing.T) {
+	source := registrySessionSourceFunc(func(context.Context) ([]opencode.Session, error) {
+		s := opencode.Session{ID: "ses-a"}
+		s.Location.Directory = "/worktrees/ak2"
+		return []opencode.Session{s}, nil
+	})
+	storePort := &registrySyncTestStore{}
+	if _, err := syncRegistry(context.Background(), source, storePort, "proj"); err != nil {
+		t.Fatalf("syncRegistry: %v", err)
+	}
+	if storePort.syncCalls != 1 {
+		t.Fatalf("SyncExecutor calls = %d, want 1", storePort.syncCalls)
+	}
+	if storePort.setStatusCalls != 0 {
+		t.Fatalf("SetStatus calls = %d, want 0", storePort.setStatusCalls)
+	}
+	if storePort.gotStatus != registryStatusActive {
+		t.Errorf("status = %q, want %q", storePort.gotStatus, registryStatusActive)
+	}
+	if storePort.gotWorktree != "/worktrees/ak2" {
+		t.Errorf("worktree = %q, want /worktrees/ak2", storePort.gotWorktree)
+	}
+	if storePort.gotLastSeen <= 0 {
+		t.Errorf("lastSeen = %d, want a positive timestamp", storePort.gotLastSeen)
+	}
+}
+
 func TestSyncRegistryPropagatesErrors(t *testing.T) {
 	boom := errors.New("boom")
 	okSource := registrySessionSourceFunc(func(context.Context) ([]opencode.Session, error) { return nil, nil })

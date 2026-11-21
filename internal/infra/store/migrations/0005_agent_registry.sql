@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS agent_registry (
   config_id      TEXT NOT NULL DEFAULT '',
   digest         TEXT NOT NULL DEFAULT '',
   capabilities   TEXT NOT NULL DEFAULT '[]',
+  last_seen      INTEGER NOT NULL DEFAULT 0,
+  worktree       TEXT NOT NULL DEFAULT '',
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   PRIMARY KEY (project_key, agent_id)
