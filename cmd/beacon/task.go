@@ -460,52 +460,69 @@ func runTaskDone(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 		return failTask(stderr, taskstore.Validationf("завершение без итога отклонено: задайте --summary"))
 	}
 	id := p.pos[0]
+	lockPath := taskstore.LockPath(cfg.StateDir, cfg.Root)
 
-	lock, err := taskstore.AcquireLock(taskstore.LockPath(cfg.StateDir, cfg.Root), cfg.Root)
-	if err != nil {
-		return failTask(stderr, err)
-	}
-	defer lock.Release()
-
-	cards, err := taskstore.LoadCards(cfg.TasksDir)
-	if err != nil {
-		return failTask(stderr, err)
-	}
-	var target *taskstore.Card
-	for i := range cards {
-		if cards[i].ID == id {
-			target = &cards[i]
-			break
+	// Замок держится только на подготовке карточки. CloseCard берёт тот же
+	// замок сам, поэтому его нельзя вызывать с уже захваченным.
+	var cardPath string
+	err = func() error {
+		lock, err := taskstore.AcquireLock(lockPath, cfg.Root)
+		if err != nil {
+			return err
 		}
-	}
-	if target == nil {
-		return failTask(stderr, taskstore.Validationf("карточка %s не найдена", id))
-	}
-	if !taskActive(target.Status) {
-		return failTask(stderr, taskstore.Validationf("карточка %s в статусе %s, завершение неприменимо", id, target.Status))
-	}
+		defer lock.Release()
 
-	if !hasEvidence {
-		reason := "завершение без доказательства: задайте --evidence"
-		newText := needsInputText(target.Raw, reason)
+		cards, err := taskstore.LoadCards(cfg.TasksDir)
+		if err != nil {
+			return err
+		}
+		var target *taskstore.Card
+		for i := range cards {
+			if cards[i].ID == id {
+				target = &cards[i]
+				break
+			}
+		}
+		if target == nil {
+			return taskstore.Validationf("карточка %s не найдена", id)
+		}
+		if !taskActive(target.Status) {
+			return taskstore.Validationf("карточка %s в статусе %s, завершение неприменимо", id, target.Status)
+		}
+
+		if !hasEvidence {
+			reason := "завершение без доказательства: задайте --evidence"
+			newText := needsInputText(target.Raw, reason)
+			if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+				return err
+			}
+			return taskstore.Validationf("завершение без доказательства отклонено: карточка %s переведена в needs_input, задайте --evidence", id)
+		}
+
+		// CloseCard управляет полями закрытия, поэтому здесь пишутся только
+		// итог, доказательство и снятие маркера ожидания ввода.
+		newText := setCardField(target.Raw, "Итог", oneLine(report.summary))
+		newText = setCardField(newText, "Доказательство", oneLine(report.evidence))
+		newText = setCardField(newText, "Состояние", "")
+		newText = setCardField(newText, "Вопрос", "")
 		if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
-			return failTask(stderr, err)
+			return err
 		}
-		return failTask(stderr, taskstore.Validationf("завершение без доказательства отклонено: карточка %s переведена в needs_input, задайте --evidence", id))
+		cardPath = target.Path
+		return nil
+	}()
+	if err != nil {
+		return failTask(stderr, err)
 	}
 
-	newText := setCardField(target.Raw, "Статус", "done")
-	newText = setCardField(newText, "Итог", oneLine(report.summary))
-	newText = setCardField(newText, "Доказательство", oneLine(report.evidence))
-	newText = setCardField(newText, "Состояние", "")
-	newText = setCardField(newText, "Вопрос", "")
-	if report.reason != "" {
-		newText = setCardField(newText, "Причина", report.reason)
+	// Канонические поля закрытия пишет CloseCard из taskstore. Флаг
+	// --duplicate-of попадает в «Дубликат», а не в «Дублирует».
+	closeOpts := taskstore.CloseCardOptions{
+		Status:      "done",
+		Reason:      report.reason,
+		DuplicateOf: report.duplicateOf,
 	}
-	if report.duplicateOf != "" {
-		newText = setCardField(newText, "Дублирует", report.duplicateOf)
-	}
-	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+	if err := taskstore.CloseCard(lockPath, cfg.Root, cardPath, closeOpts); err != nil {
 		return failTask(stderr, err)
 	}
 	fmt.Fprintf(stdout, "%s done\n", id)
