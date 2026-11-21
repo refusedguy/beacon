@@ -20,14 +20,17 @@ package main
 // domain.ObligationKey encoder instead of a local copy.
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // deliveryTarget is the narrow port deliver uses to write one result into one
@@ -307,6 +310,100 @@ func (r deliverResult) line() string {
 		r.WatchID, r.Verdict, r.Delivery, r.Attempts)
 }
 
+// ===== Pi RPC adapter selection (T3.217) ====================================
+
+// Config keys for the Pi RPC adapter. An empty adapter keeps the installed
+// target, so an unconfigured CLI keeps the honest unsupported path.
+const (
+	deliverAdapterEnv   = "BEACON_DELIVER_ADAPTER"
+	deliverPiModeEnv    = "BEACON_DELIVER_PI_MODE"
+	deliverPiTimeoutEnv = "BEACON_DELIVER_PI_TIMEOUT"
+)
+
+type deliverAdapterConfig struct {
+	Adapter string
+	Mode    wake.PiDeliveryMode
+	Timeout time.Duration
+	Err     error
+}
+
+// resolveDeliverAdapterConfig reads the three keys through the supplied lookup,
+// so tests need no process environment. A bad mode or timeout is an error: the
+// caller keeps the current target instead of guessing a route.
+func resolveDeliverAdapterConfig(lookup func(string) string) deliverAdapterConfig {
+	cfg := deliverAdapterConfig{Adapter: strings.TrimSpace(lookup(deliverAdapterEnv))}
+	mode, err := wake.ParsePiDeliveryMode(lookup(deliverPiModeEnv))
+	if err != nil {
+		cfg.Err = err
+	} else {
+		cfg.Mode = mode
+	}
+	if raw := strings.TrimSpace(lookup(deliverPiTimeoutEnv)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			cfg.Err = fmt.Errorf("beacon deliver: invalid pi timeout %q", raw)
+		} else {
+			cfg.Timeout = d
+		}
+	}
+	return cfg
+}
+
+// piProbeResolver supplies the provider for a config. The default returns no
+// probe: the CLI wires no live Pi connection, so the fallback stays the
+// honest unsupported path. Tests and later wiring install a provider here.
+type piProbeResolver func(deliverAdapterConfig) (wake.PiProbe, error)
+
+var resolvePiProbe piProbeResolver = func(deliverAdapterConfig) (wake.PiProbe, error) {
+	return nil, nil
+}
+
+// piDeliveryTarget adapts a Pi deliverer to the single Prompt port. It maps
+// provider errors onto the ADR 0017 attempt vocabulary before deliverPrompt
+// classifies them.
+type piDeliveryTarget struct {
+	deliverer *wake.PiDeliverer
+	timeout   time.Duration
+}
+
+func (t *piDeliveryTarget) Prompt(sessionID, text string) error {
+	ctx := context.Background()
+	if t.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t.timeout)
+		defer cancel()
+	}
+	mode, err := t.deliverer.DeliverText(ctx, sessionID, text)
+	if err != nil {
+		return mapPiDeliveryError(err)
+	}
+	if mode == wake.PiModeQueue {
+		return fmt.Errorf("pi follow-up queued: %w", errPromptQueued)
+	}
+	return nil
+}
+
+func mapPiDeliveryError(err error) error {
+	switch {
+	case errors.Is(err, wake.ErrUnsupported):
+		return fmt.Errorf("pi unsupported: %w", errPromptUnsupported)
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return fmt.Errorf("pi transport: %w", errTransportFailed)
+	default:
+		return fmt.Errorf("pi rpc: %w", errIndeterminate)
+	}
+}
+
+// chooseDeliveryTarget selects the Pi adapter only when config names it, the
+// config parses and a provider is available. Every other case returns the
+// installed target unchanged.
+func chooseDeliveryTarget(cfg deliverAdapterConfig, probe wake.PiProbe, fallback deliveryTarget) deliveryTarget {
+	if cfg.Err != nil || probe == nil || !strings.EqualFold(strings.TrimSpace(cfg.Adapter), wake.AdapterPi) {
+		return fallback
+	}
+	return &piDeliveryTarget{deliverer: &wake.PiDeliverer{Probe: probe, Mode: cfg.Mode}, timeout: cfg.Timeout}
+}
+
 // runDeliver implements `beacon deliver <watchID>`. It reads one snapshot,
 // checks that the verdict is ready or needs_input, writes the result into the
 // subscriber's live session and prints the honest delivery field. Exit 0 means
@@ -354,7 +451,10 @@ func runDeliver(c *CLI, args []string) int {
 	}
 
 	text := deliverText(w, sub.target)
-	out, attempts := deliverPrompt(deliverTarget, sub.target, text, deliverSleep)
+	cfg := resolveDeliverAdapterConfig(os.Getenv)
+	probe, _ := resolvePiProbe(cfg)
+	target := chooseDeliveryTarget(cfg, probe, deliverTarget)
+	out, attempts := deliverPrompt(target, sub.target, text, deliverSleep)
 	res := deliverResult{
 		WatchID:  w.id,
 		Verdict:  w.verdict,
