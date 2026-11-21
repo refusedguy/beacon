@@ -639,8 +639,9 @@ func TestSQLVerdictWriterPublishesAndStagesObligations(t *testing.T) {
 }
 
 // setWatchPayloadField replaces one field of a stored Watch payload with raw
-// JSON. It lets a test simulate a corrupt internal field without going through
-// the typed store API, which would reject the bad value on write.
+// JSON. The value must be valid JSON of the wrong type: the outer payload has
+// to parse, but the typed Unmarshal of that field must fail. The typed store
+// API would reject the value on write, so the test edits the payload directly.
 func setWatchPayloadField(t *testing.T, db *store.DB, id, field string, value json.RawMessage) {
 	t.Helper()
 	if err := db.Write(context.Background(), func(tx *sql.Tx) error {
@@ -688,11 +689,12 @@ func rawWatchStatus(t *testing.T, db *store.DB, id string) string {
 func TestSQLVerdictWriterRejectsMalformedInternalFields(t *testing.T) {
 	for _, tc := range []struct {
 		field   string
+		value   json.RawMessage
 		wantErr string
 	}{
-		{"verdict", "разбор verdict"},
-		{"headSHA", "разбор headSHA"},
-		{"revision", "разбор revision"},
+		{"verdict", json.RawMessage(`123`), "разбор verdict"},
+		{"headSHA", json.RawMessage(`true`), "разбор headSHA"},
+		{"revision", json.RawMessage(`"bad"`), "разбор revision"},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
 			db, err := store.Open(filepath.Join(t.TempDir(), "beacon.db"))
@@ -715,7 +717,7 @@ func TestSQLVerdictWriterRejectsMalformedInternalFields(t *testing.T) {
 			if err := db.SaveWatch(w); err != nil {
 				t.Fatal(err)
 			}
-			setWatchPayloadField(t, db, w.ID, tc.field, json.RawMessage(`{broken`))
+			setWatchPayloadField(t, db, w.ID, tc.field, tc.value)
 
 			ref := WatchRef{ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA}
 			err = NewSQLVerdictWriter(db).Publish(context.Background(), ref, VerdictReady, nil)
