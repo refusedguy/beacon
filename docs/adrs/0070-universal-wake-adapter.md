@@ -33,9 +33,9 @@ Eval выбран как доказательство по ADR 0061. Заглу�
 ## Последствия
 
 - Из решения выходят пять карточек в `docs/tasks/`. Все со статусом `todo` и ссылкой `ADR 0070`:
-  - T3.179, unit и eval проверка доставки. Владельцы: `internal/infra/wake/deliverer.go`, `internal/infra/wake/deliverer_test.go`, `evals/main.go`.
+  - T3.179, unit и eval проверка доставки. Владельцы: `internal/infra/wake/deliver.go`, `internal/infra/wake/deliver_test.go`, `evals/main.go`.
   - T3.180, адаптер ACP. Владельцы: `internal/infra/wake/acp.go`, `internal/infra/wake/acp_test.go`.
-  - T3.181, адаптер OpenCode. Владельцы: `internal/infra/wake/opencode.go`, `internal/infra/wake/opencode_test.go`.
+  - T3.181, адаптер OpenCode. Владельцы: `internal/infra/wake/deliver.go` и `internal/infra/wake/deliver_test.go`. Тип `OpenCodeDeliverer` лежит в `internal/infra/wake/deliver.go`, отдельного файла адаптера в дереве нет.
   - T3.182, вызов адаптера из CI-моста по терминальному вердикту. Владельцы: `internal/infra/cibridge/bridge.go`, `internal/infra/cibridge/bridge_test.go`.
   - T3.183, project-scoped указатель wake. Владельцы: `.opencode/plugins/beacon-bridge.js`, `tests/adapter/fail-open.test.js`, `tests/e2e/fixtures/beacon-bridge.js`.
 - Project-scoped указатель из T3.183 читается и пишется по тому же правилу, что `stateDir()` в `cmd/beacon/doctor.go`. Явный путь задаёт `BEACON_STATE_DIR`, иначе каталог равен `<XDG_STATE_HOME>/beacon/projects/<имя>-<хеш>`. Плагин берёт путь из `ctx.beaconStateDir` или из того же правила. Два проекта не делят один `wake-pointer.json`.

@@ -56,7 +56,7 @@ Registration-файл `$XDG_STATE_HOME/opencode/service.json` содержит `
 - Список агентов берётся из поля `agent` ответа `session.list`. `GET /api/agent` и `opencode agent list` остаются дополнительными источниками. Вызов `opencode api app.agents`, который сейчас использует `cmd/beacon/agents.go:195`, удаляется карточкой по миграции.
 - `beacon spawn` и `beacon deliver` появляются в dispatch `cmd/beacon/main.go` и в тексте usage. `beacon attach` сохраняет текущий контракт перехода в TUI.
 - Из решения выходят карточки по правилам ADR 0020. Карточки этим ADR не создаются. Владельцы файлов для будущих карточек:
-  - `cmd/beacon/opencode_bridge.go` и `cmd/beacon/opencode_bridge_test.go`: чтение `service.json`, тонкий HTTP-клиент с Basic-авторизацией, fallback-спавн, SSE-читатель с буфером и переподключением, запуск `opencode --server --session`.
+  - `cmd/beacon/opencode.go` и `cmd/beacon/opencode_test.go`: чтение `service.json`, тонкий HTTP-клиент с Basic-авторизацией, fallback-спавн, SSE-читатель с буфером и переподключением, запуск `opencode --server --session`.
   - `cmd/beacon/watch.go` и `cmd/beacon/watch_test.go`: цикл по событиям, JOIN с колонками `WATCH | VERDICT | REVISION | SESSION | AGENT | OPENCODE STATE | ATTENTION`, перечитывание снимка после обрыва.
   - `cmd/beacon/agents.go` и `cmd/beacon/agents_test.go`: замена `opencode api app.agents` на поле `agent` из `session.list`, дополнительные источники `GET /api/agent` и `opencode agent list`, сохранение attention и handoff. Имена агентов в ядро не попадают.
   - `cmd/beacon/spawn.go` и `cmd/beacon/spawn_test.go`: создание сессии с `parentID`, `agent` и metadata, отправка промпта, проверка отсутствия `agent` в теле prompt.
