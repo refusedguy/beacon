@@ -35,12 +35,12 @@ func newCaptureRecorder() *captureRecorder {
 	return &captureRecorder{signal: make(chan Delivery, 8)}
 }
 
-func (r *captureRecorder) Record(_ context.Context, d Delivery) (bool, error) {
+func (r *captureRecorder) Record(_ context.Context, d Delivery) (RecordResult, error) {
 	r.mu.Lock()
 	r.records = append(r.records, d)
 	r.mu.Unlock()
 	r.signal <- d
-	return true, nil
+	return RecordResult{Created: true}, nil
 }
 
 func (r *captureRecorder) wait(t *testing.T) Delivery {
@@ -69,23 +69,23 @@ func newBlockingRecorder() *blockingRecorder {
 	return &blockingRecorder{started: make(chan struct{}), release: make(chan struct{})}
 }
 
-func (r *blockingRecorder) Record(_ context.Context, _ Delivery) (bool, error) {
+func (r *blockingRecorder) Record(_ context.Context, _ Delivery) (RecordResult, error) {
 	close(r.started)
 	<-r.release
-	return true, nil
+	return RecordResult{Created: true}, nil
 }
 
 type claimingRecorder struct {
 	journal *MemoryDeliveryJournal
-	results chan bool
+	results chan RecordResult
 }
 
-func (r *claimingRecorder) Record(ctx context.Context, d Delivery) (bool, error) {
-	claimed, err := r.journal.ClaimDelivery(ctx, DeliveryKey(d.ID), d.At)
+func (r *claimingRecorder) Record(ctx context.Context, d Delivery) (RecordResult, error) {
+	result, err := r.journal.Record(ctx, DeliveryKey(d.ID), d.Payload, d.At)
 	if err == nil {
-		r.results <- claimed
+		r.results <- result
 	}
-	return claimed, err
+	return result, err
 }
 
 type repeatByte byte
@@ -273,7 +273,7 @@ func TestReceiverAcknowledgesBeforeRecording(t *testing.T) {
 }
 
 func TestReceiverRedeliveryIsIdempotent(t *testing.T) {
-	rec := &claimingRecorder{journal: NewMemoryDeliveryJournal(), results: make(chan bool, 4)}
+	rec := &claimingRecorder{journal: NewMemoryDeliveryJournal(), results: make(chan RecordResult, 4)}
 	h := newReceiverHandler(t, testSecret, rec)
 
 	for i := 0; i < 2; i++ {
@@ -284,8 +284,67 @@ func TestReceiverRedeliveryIsIdempotent(t *testing.T) {
 		}
 	}
 	first, second := <-rec.results, <-rec.results
-	if !first || second {
-		t.Fatalf("claims = [%v %v], want [true false]", first, second)
+	if !first.Created || first.Duplicate || first.Conflict {
+		t.Fatalf("first result = %+v, want Created only", first)
+	}
+	if !second.Duplicate || second.Created || second.Conflict {
+		t.Fatalf("repeat result = %+v, want Duplicate only", second)
+	}
+}
+
+func TestReceiverConflictingBodyIsReported(t *testing.T) {
+	rec := &claimingRecorder{journal: NewMemoryDeliveryJournal(), results: make(chan RecordResult, 4)}
+	h := newReceiverHandler(t, testSecret, rec)
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, signedRequest(t, []byte(testSecret), "delivery-change", "workflow_run", workflowRunEventBody))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("first delivery: status = %d, want 202", w.Code)
+	}
+
+	changedBody := strings.Replace(workflowRunEventBody, `"action":"completed"`, `"action":"requested"`, 1)
+	if changedBody == workflowRunEventBody {
+		t.Fatal("test body did not change")
+	}
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, signedRequest(t, []byte(testSecret), "delivery-change", "workflow_run", changedBody))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("conflicting redelivery: status = %d, want 202", w.Code)
+	}
+
+	first, second := <-rec.results, <-rec.results
+	if !first.Created {
+		t.Fatalf("first result = %+v, want Created", first)
+	}
+	if !second.Duplicate || !second.Conflict || second.Created {
+		t.Fatalf("conflicting result = %+v, want Duplicate and Conflict", second)
+	}
+}
+
+func TestReceiverChecksSignatureBeforeDedup(t *testing.T) {
+	rec := &claimingRecorder{journal: NewMemoryDeliveryJournal(), results: make(chan RecordResult, 4)}
+	h := newReceiverHandler(t, testSecret, rec)
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, signedRequest(t, []byte(testSecret), "delivery-sig", "workflow_run", workflowRunEventBody))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("first delivery: status = %d, want 202", w.Code)
+	}
+	if first := <-rec.results; !first.Created {
+		t.Fatalf("first result = %+v, want Created", first)
+	}
+
+	req := newReceiverRequest(t, []byte(testSecret), "delivery-sig", "workflow_run", workflowRunEventBody,
+		"sha256="+strings.Repeat("0", 64))
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("rejected redelivery: status = %d, want 401", w.Code)
+	}
+	select {
+	case result := <-rec.results:
+		t.Fatalf("recorder called before signature check: %+v", result)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

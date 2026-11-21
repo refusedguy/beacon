@@ -811,18 +811,19 @@ func restoreWebhookFilter(db *store.DB) (*webhook.Filter, error) {
 
 // webhookDeliveryRecorder gates a delivery through the restored filter and
 // then writes it to the durable journal. A repeat fails the filter before the
-// write. The uniqueness constraint in RecordDelivery stays the last defence.
+// write. RecordDelivery reports Duplicate and Conflict when a row already
+// exists, and the receiver treats both as success after its 202.
 type webhookDeliveryRecorder struct {
 	filter  *webhook.Filter
 	journal *store.DB
 }
 
-func (r webhookDeliveryRecorder) Record(ctx context.Context, d webhook.Delivery) (bool, error) {
+func (r webhookDeliveryRecorder) Record(ctx context.Context, d webhook.Delivery) (webhook.RecordResult, error) {
 	if r.filter == nil || r.journal == nil {
-		return false, errors.New("webhook: nil delivery filter or journal")
+		return webhook.RecordResult{}, errors.New("webhook: nil delivery filter or journal")
 	}
 	if !r.filter.ClaimDelivery(d.ID) {
-		return false, nil
+		return webhook.RecordResult{Duplicate: true}, nil
 	}
 	result, err := r.journal.RecordDelivery(store.WebhookDelivery{
 		DeliveryID: d.ID,
@@ -831,9 +832,13 @@ func (r webhookDeliveryRecorder) Record(ctx context.Context, d webhook.Delivery)
 		ReceivedAt: d.At.UnixNano(),
 	})
 	if err != nil {
-		return false, err
+		return webhook.RecordResult{}, err
 	}
-	return result.Created, nil
+	return webhook.RecordResult{
+		Created:   result.Created,
+		Duplicate: result.Duplicate,
+		Conflict:  result.Conflict,
+	}, nil
 }
 
 // startWebhookReceiver loads the 0600 secret from the state directory and
