@@ -5,6 +5,7 @@ package domain
 
 import (
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,6 +22,11 @@ const (
 	// as the per-subscriber budget. T1.4's check exercises the 51st subscriber
 	// on one PR and expects LIMIT_EXCEEDED, so the cap is enforced here too.
 	maxSubscribersPerWatch = 50
+
+	// WatchHandleTTL is how long a watchID handle stays usable after issue.
+	// A Watch may keep running past this point (ADR 0019); only the handle goes
+	// stale. A caller holding a stale handle registers again to get a fresh one.
+	WatchHandleTTL = 30 * time.Minute
 )
 
 // Subscription is the result of registering a subscriber on a Watch. Watch is
@@ -200,7 +206,7 @@ func findByAlias(watches []Watch, repo string, pr int, headSHA string) *Watch {
 // the same PR head always maps to one Watch.
 func normalizeWatch(w Watch, known []Watch, now time.Time) Watch {
 	if w.ID == "" || watchIDExists(known, w.ID) {
-		w.ID = watchID(w.Repo, w.PR, w.HeadSHA)
+		w.ID = watchID(w.Repo, w.PR, w.HeadSHA, now)
 	}
 	if w.Status == "" {
 		w.Status = StatusWatching
@@ -214,9 +220,55 @@ func normalizeWatch(w Watch, known []Watch, now time.Time) Watch {
 	return w
 }
 
-func watchID(repo string, pr int, headSHA string) string {
+// watchID builds a handle for the (repo, pr, headSHA) alias. The suffix records
+// the issue time and the lease length so a stale handle can be recognised
+// without a store read. Repo and headSHA keep the same escaping as ObligationKey;
+// '@' and ':' separate the lease fields from the alias and from each other.
+func watchID(repo string, pr int, headSHA string, issuedAt time.Time) string {
 	return "watch:" + obligationKeyEscaper.Replace(repo) + ":" +
-		strconv.Itoa(pr) + ":" + obligationKeyEscaper.Replace(headSHA)
+		strconv.Itoa(pr) + ":" + obligationKeyEscaper.Replace(headSHA) +
+		"@" + strconv.FormatInt(issuedAt.Unix(), 10) +
+		":" + strconv.FormatInt(int64(WatchHandleTTL/time.Second), 10)
+}
+
+// NewWatchHandle is the exported form of watchID. Callers outside domain use it
+// to construct the same handle the fan-out derives for an alias.
+func NewWatchHandle(repo string, pr int, headSHA string, issuedAt time.Time) string {
+	return watchID(repo, pr, headSHA, issuedAt)
+}
+
+// ParseWatchHandle splits the lease suffix off a watchID. ok is false for a
+// legacy handle with no lease and for a malformed suffix, so callers can keep
+// the old behaviour for handles that carry no lifetime.
+func ParseWatchHandle(handle string) (issuedAt time.Time, ttl time.Duration, ok bool) {
+	at := strings.LastIndex(handle, "@")
+	if at < 0 {
+		return time.Time{}, 0, false
+	}
+	lease := handle[at+1:]
+	colon := strings.LastIndex(lease, ":")
+	if colon < 0 {
+		return time.Time{}, 0, false
+	}
+	issuedSec, err := strconv.ParseInt(lease[:colon], 10, 64)
+	if err != nil || issuedSec < 0 {
+		return time.Time{}, 0, false
+	}
+	ttlSec, err := strconv.ParseInt(lease[colon+1:], 10, 64)
+	if err != nil || ttlSec <= 0 {
+		return time.Time{}, 0, false
+	}
+	return time.Unix(issuedSec, 0).UTC(), time.Duration(ttlSec) * time.Second, true
+}
+
+// WatchHandleExpired reports whether handle had expired at now. A handle with
+// no lease never expires, so clients from before the lease keep working.
+func WatchHandleExpired(handle string, now time.Time) bool {
+	issuedAt, ttl, ok := ParseWatchHandle(handle)
+	if !ok {
+		return false
+	}
+	return !now.Before(issuedAt.Add(ttl))
 }
 
 func watchIDExists(watches []Watch, id string) bool {

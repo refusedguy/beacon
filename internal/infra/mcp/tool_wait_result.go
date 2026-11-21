@@ -301,7 +301,7 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 // effect. An empty key keeps the pre-idempotency behaviour for callers that do
 // not send the field.
 type WaitResultInput struct {
-	WatchID         string `json:"watchID" jsonschema:"identifier of the Watch to wait on"`
+	WatchID         string `json:"watchID" jsonschema:"identifier of the Watch to wait on; a leased handle valid for 30 minutes from issue, after which wait_result returns WATCH_EXPIRED and the caller registers again"`
 	TimeoutMs       *int64 `json:"timeoutMs,omitempty" jsonschema:"wait budget in milliseconds; default 50000, capped at 540000"`
 	ClientRequestID string `json:"clientRequestId,omitempty" jsonschema:"idempotency key; a repeat after a broken connection returns the first result without a second effect"`
 	// ContinueOf names the same Watch after a human answer resumed a parked
@@ -1133,6 +1133,13 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 	if in.WatchID == "" {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: watchID is required")
 	}
+	// A handle past its lease is an error, not a watching result. This runs
+	// before the store read so a stale handle never reaches the unknown-watch
+	// branch; that branch keeps its unchanged CodeWatchNotFound contract.
+	if s != nil && domain.WatchHandleExpired(in.WatchID, s.now()) {
+		return WaitResultOutput{}, domain.NewAppError(domain.CodeWatchExpired,
+			"wait_result: watchID handle expired; register again to obtain a fresh handle")
+	}
 	if in.ContinueOf != "" && in.ContinueOf != in.WatchID {
 		return WaitResultOutput{}, domain.NewAppError(domain.CodeInvalidInput, "wait_result: continueOf must name the same Watch")
 	}
@@ -1393,7 +1400,7 @@ func AttachWaitResult(server *mcpsdk.Server, svc *WaitResultService) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_wait_result",
-		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read.",
+		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes from issue; an expired handle returns WATCH_EXPIRED and the caller must register again.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  true,

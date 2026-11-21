@@ -521,6 +521,7 @@ type ErrorCode string
 const (
 	CodeInvalidInput   ErrorCode = "INVALID_INPUT"
 	CodeWatchNotFound  ErrorCode = "WATCH_NOT_FOUND"
+	CodeWatchExpired   ErrorCode = "WATCH_EXPIRED"
 	CodeHeadSHAChanged ErrorCode = "HEAD_SHA_CHANGED"
 	CodeRateLimited    ErrorCode = "RATE_LIMITED"
 	CodeLimitExceeded  ErrorCode = "LIMIT_EXCEEDED"
@@ -549,6 +550,8 @@ func statusForCode(code ErrorCode) int {
 		return 400
 	case CodeWatchNotFound:
 		return 404
+	case CodeWatchExpired:
+		return 410
 	case CodeHeadSHAChanged:
 		return 409
 	case CodeRateLimited, CodeLimitExceeded:
