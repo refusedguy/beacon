@@ -1,0 +1,14 @@
+# Q-A1. Автостарт и диагностика поллера внутри beacon mcp
+Статус: todo
+Фаза: P0
+Тип: task
+Владелец файлов: cmd/beacon/mcp.go, internal/infra/mcp/tool_stats.go, internal/infra/server/metrics.go
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: Поллер стартует внутри beacon mcp в 100 процентов случаев, его состояние видно в stats и inspect.
+Контекст: Premise: после перезапуска и переподключения MCP демон опроса CI не стартовал, его поднимали вручную через nohup. baseline: `ps -eo args | grep 'beacon daemon'` пусто после реконнекта, а MCP отвечал. Требуется проверка живости PID в beacon-poller.lock и поля pollerActive, pollerPID.
+Шаги: Проверить лок и живость PID, стартовать поллер при отсутствии, пробросить pollerActive и pollerPID в beacon_stats и inspect, тесты на мёртвый лок и живой процесс.
+Проверка: gofmt, go test и гейты в CI.
+Приёмка: После переподключения MCP поллер активен без ручных команд, его состояние видно одной командой.
