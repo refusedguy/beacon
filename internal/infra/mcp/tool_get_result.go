@@ -115,9 +115,31 @@ const failureExcerptTableDDL = `CREATE TABLE IF NOT EXISTS failure_excerpts (
 	PRIMARY KEY (watch_id, head_sha, check_name)
 )`
 
+// storeExcerptCache is the capability the store exposes for its own
+// failure_excerpts table. The method names differ from failureExcerptCache so
+// the two ports stay separate; the adapter below bridges them. Keeping the
+// capability duck-typed lets this package avoid importing the store (ADR 0005).
+type storeExcerptCache interface {
+	FailureExcerptGet(ctx context.Context, watchID, headSHA, checkName string) (string, bool, error)
+	FailureExcerptPut(ctx context.Context, watchID, headSHA, checkName, excerpt string) error
+}
+
+type adapterExcerptCache struct {
+	store storeExcerptCache
+}
+
+func (a *adapterExcerptCache) Get(ctx context.Context, watchID, headSHA, checkName string) (string, bool, error) {
+	return a.store.FailureExcerptGet(ctx, watchID, headSHA, checkName)
+}
+
+func (a *adapterExcerptCache) Put(ctx context.Context, watchID, headSHA, checkName, excerpt string) error {
+	return a.store.FailureExcerptPut(ctx, watchID, headSHA, checkName, excerpt)
+}
+
 // sqlFailureExcerptCache implements failureExcerptCache over the store's single
 // writer. The stored text is already redacted, escaped and bounded before it
-// reaches SQLite, so a cache hit needs no further sanitising.
+// reaches SQLite, so a cache hit needs no further sanitising. This fallback
+// serves callers whose store does not expose the cache capability yet.
 type sqlFailureExcerptCache struct {
 	w resultTxWriter
 }
@@ -324,6 +346,9 @@ func (h *GetResultHandler) excerptStore() failureExcerptCache {
 	}
 	if h.excerptCache != nil {
 		return h.excerptCache
+	}
+	if s, ok := h.store.(storeExcerptCache); ok {
+		return &adapterExcerptCache{store: s}
 	}
 	if w, ok := h.store.(resultTxWriter); ok {
 		return newSQLFailureExcerptCache(w)
