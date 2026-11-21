@@ -535,3 +535,103 @@ func TestRunCountsAllCardKinds(t *testing.T) {
 		t.Errorf("priorities = %v, want only P1=1 P2=1", priorities)
 	}
 }
+
+// newADRFixture builds a tree where the index is missing and several ADR
+// files exercise topic extraction, status reading and the duplicate sort.
+func newADRFixture(t *testing.T) (repo, logPath string) {
+	t.Helper()
+	repo = t.TempDir()
+	logPath = filepath.Join(repo, "git-log.txt")
+	writeFixtureFile(t, logPath, "docs: add ADRs\n")
+	adrs := map[string]string{
+		"0002-location.md": "# ADR 2. Расположение проекта\n\nСтатус: accepted\n",
+		"0001-purpose.md":  "# ADR 0001. Назначение и границы проекта\n\nСтатус: accepted\n",
+		"0260-fixer.md":    "# ADR 260: Fixer как отдельная роль подписчика\n\nСтатус: accepted\n",
+		"0260-fix-watch.md": "# ADR 260: Лимит FIX-агентов на заблокированный Watch\n\n" +
+			"Статус: proposed\n",
+		"0267-correlation.md": "# ADR 267: Единая схема корреляции\n\nСтатус: proposed\n",
+		"notes.md":            "# Notes\n\nСтатус: accepted\n",
+		"README.md":           "stale index\n| 0001 | old topic | open |\n",
+	}
+	for name, content := range adrs {
+		writeFixtureFile(t, filepath.Join(repo, "docs", "adrs", name), content)
+	}
+	return repo, logPath
+}
+
+func TestRunWriteGeneratesADRIndex(t *testing.T) {
+	repo, logPath := newADRFixture(t)
+	indexPath := filepath.Join(repo, "docs", "adrs", "README.md")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-repo", repo, "-git-log", logPath, "-write"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "docs/adrs/README.md: create from 5 ADR files") {
+		t.Errorf("creation not reported:\n%s", stdout.String())
+	}
+	index := readFixtureFile(t, indexPath)
+	for _, line := range []string{
+		"| ADR | Тема | Статус |",
+		"| 0001 | Назначение и границы проекта | accepted |",
+		"| 0002 | Расположение проекта | accepted |",
+		"| 0260 | Лимит FIX-агентов на заблокированный Watch | proposed |",
+		"| 0260 | Fixer как отдельная роль подписчика | accepted |",
+		"| 0267 | Единая схема корреляции | proposed |",
+	} {
+		if !strings.Contains(index, line) {
+			t.Errorf("index missing %q:\n%s", line, index)
+		}
+	}
+	if strings.Contains(index, "old topic") || strings.Contains(index, "| 0267 | Notes") {
+		t.Errorf("stale or non-ADR row survived:\n%s", index)
+	}
+	if strings.Index(index, "Лимит FIX") > strings.Index(index, "Fixer как") {
+		t.Errorf("duplicate ADR 0260 rows are out of order:\n%s", index)
+	}
+
+	// A second run must be a no-op for the index.
+	stdout.Reset()
+	code = run([]string{"-repo", repo, "-git-log", logPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("second exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "docs/adrs/README.md:") {
+		t.Errorf("fresh index still reported as stale:\n%s", stdout.String())
+	}
+}
+
+func TestADRIndexDryRunLeavesFileMissing(t *testing.T) {
+	repo, logPath := newADRFixture(t)
+	indexPath := filepath.Join(repo, "docs", "adrs", "README.md")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-repo", repo, "-git-log", logPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "docs/adrs/README.md: create from 5 ADR files") {
+		t.Errorf("creation not reported:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("dry run wrote the index, stat error = %v", err)
+	}
+}
+
+func TestADRIndexSkipsReposWithoutADRs(t *testing.T) {
+	repo, logPath := newFixture(t)
+	indexPath := filepath.Join(repo, "docs", "adrs", "README.md")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-repo", repo, "-git-log", logPath, "-write"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "docs/adrs/README.md:") {
+		t.Errorf("index reported for a tree without ADR files:\n%s", stdout.String())
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("index created in a tree without ADR files, stat error = %v", err)
+	}
+}
