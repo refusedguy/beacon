@@ -161,6 +161,7 @@ func boxHasWord(box, want string) bool {
 		}
 		from = i + len(want)
 	}
+	return false
 }
 
 func isWordRune(r rune) bool {
