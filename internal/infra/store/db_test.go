@@ -3846,3 +3846,249 @@ func TestOperationRejectsInvalidInput(t *testing.T) {
 		t.Fatal("StartOperation accepted unknown operation id")
 	}
 }
+
+// allMigrations is the canonical corpus that startup applies. Keep this list
+// in sync with migrations/*.sql. TestStartupMigrationsMirror fails when a file
+// is added, removed or renamed on either side, so a migration dropped from the
+// fixture breaks the build.
+var allMigrations = []string{
+	"migrations/0001_init.sql",
+	"migrations/0002_watches.sql",
+	"migrations/0003_obligations.sql",
+	"migrations/0004_events.sql",
+	"migrations/0005_agent_registry.sql",
+	"migrations/0006_control_plane.sql",
+}
+
+// migrationFileExclusions records corpus files that are intentionally not
+// applied at startup. An unlisted extra file fails the mirror test.
+var migrationFileExclusions = map[string]string{}
+
+// schemaExclusions documents every object the live instance adds after
+// migrations. Each entry carries the reason it is absent from the corpus.
+// An unlisted runtime object fails TestMigrationFixtureParity.
+type schemaExclusions struct {
+	tables  map[string]string
+	indexes map[string]string
+	columns map[string]map[string]string
+}
+
+var runtimeSchemaExclusions = schemaExclusions{
+	tables: map[string]string{},
+	indexes: map[string]string{
+		"events_by_scope": "ensureEventLog creates the replay index at Open; migration 0004 predates scoped events",
+	},
+	columns: map[string]map[string]string{
+		"events": {
+			"scope": "ensureEventLog adds scope at Open; other components still write the 0004 shape",
+			"type":  "ensureEventLog adds type at Open; other components still write the 0004 shape",
+		},
+	},
+}
+
+func embeddedMigrationSet(t *testing.T) map[string]struct{} {
+	t.Helper()
+	names, err := fs.Glob(migrationFS, "migrations/*.sql")
+	if err != nil {
+		t.Fatalf("glob migrations: %v", err)
+	}
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		set[name] = struct{}{}
+	}
+	return set
+}
+
+// TestStartupMigrationsMirror checks that startup applies exactly
+// allMigrations. A migration missing from the embedded corpus or present
+// without an entry in allMigrations fails the build.
+func TestStartupMigrationsMirror(t *testing.T) {
+	got := embeddedMigrationSet(t)
+	want := make(map[string]struct{}, len(allMigrations))
+	for _, name := range allMigrations {
+		want[name] = struct{}{}
+		if _, err := fs.ReadFile(migrationFS, name); err != nil {
+			t.Errorf("allMigrations lists %s but it is not embedded: %v", name, err)
+		}
+	}
+	for name := range got {
+		if _, ok := want[name]; ok {
+			continue
+		}
+		if reason, ok := migrationFileExclusions[name]; ok {
+			t.Logf("corpus file %s excluded from startup: %s", name, reason)
+			continue
+		}
+		t.Errorf("embedded corpus has %s but allMigrations omits it; add it to allMigrations or record an exclusion with a reason", name)
+	}
+	for name := range want {
+		if _, ok := got[name]; !ok {
+			t.Errorf("allMigrations lists %s but it is not embedded; a migration missing from the fixture must fail the build", name)
+		}
+	}
+}
+
+func schemaTableSet(t *testing.T, db *sql.DB) map[string]struct{} {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(),
+		`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		t.Fatalf("query tables: %v", err)
+	}
+	defer rows.Close()
+	set := map[string]struct{}{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan table name: %v", err)
+		}
+		set[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read tables: %v", err)
+	}
+	return set
+}
+
+func schemaIndexSet(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(),
+		`SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL`)
+	if err != nil {
+		t.Fatalf("query indexes: %v", err)
+	}
+	defer rows.Close()
+	set := map[string]string{}
+	for rows.Next() {
+		var name, body string
+		if err := rows.Scan(&name, &body); err != nil {
+			t.Fatalf("scan index: %v", err)
+		}
+		set[name] = strings.Join(strings.Fields(body), " ")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read indexes: %v", err)
+	}
+	return set
+}
+
+func tableColumnSigs(t *testing.T, db *sql.DB, table string) map[string]string {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `PRAGMA table_info("`+table+`")`)
+	if err != nil {
+		t.Fatalf("table_info(%s): %v", table, err)
+	}
+	defer rows.Close()
+	sigs := map[string]string{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			t.Fatalf("scan table_info(%s): %v", table, err)
+		}
+		sigs[name] = fmt.Sprintf("type=%s notnull=%d default=%q pk=%d", typ, notNull, dflt.String, pk)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read table_info(%s): %v", table, err)
+	}
+	return sigs
+}
+
+// TestMigrationFixtureParity applies allMigrations through the same migrate
+// path startup uses and compares the result with a freshly opened instance.
+// Tables, columns and indexes from the corpus must be present with the same
+// definition. Anything the instance adds on top needs an entry in
+// runtimeSchemaExclusions with a reason.
+func TestMigrationFixtureParity(t *testing.T) {
+	ctx := context.Background()
+
+	fixture := fstest.MapFS{}
+	for _, name := range allMigrations {
+		body, err := fs.ReadFile(migrationFS, name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		fixture[name] = &fstest.MapFile{Data: body}
+	}
+	fixtureDB, err := openPool(filepath.Join(t.TempDir(), "fixture.db"), 1, driverName)
+	if err != nil {
+		t.Fatalf("open fixture db: %v", err)
+	}
+	defer fixtureDB.Close()
+	if _, err := migrate(ctx, fixtureDB, fixture); err != nil {
+		t.Fatalf("apply fixture corpus: %v", err)
+	}
+
+	instance, err := Open(filepath.Join(t.TempDir(), "instance.db"))
+	if err != nil {
+		t.Fatalf("Open instance: %v", err)
+	}
+	defer instance.Close()
+
+	fixtureTables := schemaTableSet(t, fixtureDB)
+	instanceTables := schemaTableSet(t, instance.readDB)
+	for name := range fixtureTables {
+		if _, ok := instanceTables[name]; !ok {
+			t.Errorf("instance schema missing table %s that migrations create", name)
+		}
+	}
+	for name := range instanceTables {
+		if _, ok := fixtureTables[name]; ok {
+			continue
+		}
+		if reason, ok := runtimeSchemaExclusions.tables[name]; ok {
+			t.Logf("table %s excluded from parity: %s", name, reason)
+			continue
+		}
+		t.Errorf("instance has table %s that migrations do not create; add a migration or an exclusion with a reason", name)
+	}
+
+	for name := range fixtureTables {
+		wantCols := tableColumnSigs(t, fixtureDB, name)
+		gotCols := tableColumnSigs(t, instance.readDB, name)
+		for col, wantSig := range wantCols {
+			gotSig, ok := gotCols[col]
+			if !ok {
+				t.Errorf("instance is missing %s.%s from the migration corpus", name, col)
+				continue
+			}
+			if gotSig != wantSig {
+				t.Errorf("%s.%s = %q in instance, %q from migrations", name, col, gotSig, wantSig)
+			}
+		}
+		for col := range gotCols {
+			if _, ok := wantCols[col]; ok {
+				continue
+			}
+			if reason, ok := runtimeSchemaExclusions.columns[name][col]; ok {
+				t.Logf("column %s.%s excluded from parity: %s", name, col, reason)
+				continue
+			}
+			t.Errorf("instance has column %s.%s that migrations do not create; add a migration or an exclusion with a reason", name, col)
+		}
+	}
+
+	fixtureIndexes := schemaIndexSet(t, fixtureDB)
+	instanceIndexes := schemaIndexSet(t, instance.readDB)
+	for name, wantSQL := range fixtureIndexes {
+		gotSQL, ok := instanceIndexes[name]
+		if !ok {
+			t.Errorf("instance schema missing index %s that migrations create", name)
+			continue
+		}
+		if gotSQL != wantSQL {
+			t.Errorf("index %s = %q in instance, %q from migrations", name, gotSQL, wantSQL)
+		}
+	}
+	for name := range instanceIndexes {
+		if _, ok := fixtureIndexes[name]; ok {
+			continue
+		}
+		if reason, ok := runtimeSchemaExclusions.indexes[name]; ok {
+			t.Logf("index %s excluded from parity: %s", name, reason)
+			continue
+		}
+		t.Errorf("instance has index %s that migrations do not create; add a migration or an exclusion with a reason", name)
+	}
+}
