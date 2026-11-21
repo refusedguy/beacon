@@ -1,5 +1,7 @@
 # WIRING-485. Подключить notify router к доставке событий
-Статус: todo
+Premise: проверено 2026-11-21 по свежему origin/main (c716b61). PR #532 влит, commit 930ccb1 лежит в origin/main. Роутер подключён к доставке verdict: newDaemonNotifyRouter строит notify.Router, routeDaemonEvent вызывает Route, daemonWakeRoute передаёт роутер через orchestrator.WakeRoute в NewDaemonWakerWithRoute. Доставка идёт через wake.TargetDeliverer и wake.PromptTargetDeliverer. Дубля нет. Правка только текстовая.
+Статус: done
+baseline: `git rev-parse --short origin/main` = c716b61; `gh pr view 532 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:20:53Z; `git merge-base --is-ancestor 930ccb1 origin/main` = 0; `git grep -n -E 'newDaemonNotifyRouter|routeDaemonEvent|daemonWakeRoute|NewDaemonWakerWithRoute' origin/main -- cmd/beacon internal/app/orchestrator` = daemon.go:68,78,97,430.
 - PR #532 (commit 930ccb1): premise проверен, notify.Router подключён к доставке verdict в рабочем пути. newDaemonNotifyRouter/routeDaemonEvent/daemonWakeRoute в cmd/beacon/daemon.go передают Router через orchestrator.WakeRoute (NewDaemonWakerWithRoute в internal/app/orchestrator/daemon.go) в вызов Router.Route; wake.TargetDeliverer/PromptTargetDeliverer в internal/infra/wake/deliver.go. Дубль не создан.
 Фаза: P5
 Тип: task
@@ -36,6 +38,9 @@ PR: 485
 ## Приёмка
 
 Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
+
+## Подтверждение
+- Premise проверен 2026-11-21 по origin/main (c716b61). PR #532 влит 2026-11-20, commit 930ccb1 лежит в origin/main. `newDaemonNotifyRouter` строит notify.Router в cmd/beacon/daemon.go, `routeDaemonEvent` вызывает Route, `daemonWakeRoute` передаёт роутер через orchestrator.WakeRoute в NewDaemonWakerWithRoute, доставка идёт через wake.TargetDeliverer и wake.PromptTargetDeliverer. Дубля нет. Код не писал, чужие OwnerFiles и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done. Ссылка: https://github.com/refusedguy/beacon/pull/532.
 
 <!-- wiring-card:contract
 beacon_defer_wiring записывает отложенную проводку в durable store и добавляет

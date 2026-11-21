@@ -1,5 +1,7 @@
 # WIRING-486. Подключить channel ingress к серверу и обработчику команд
-Статус: todo
+Premise: проверено 2026-11-21 по свежему origin/main (c716b61). PR #529 влит, commit 28e3494 лежит в origin/main. Проводка применена: buildChannelIngress и channelSenderResolver в cmd/beacon/server.go, upChannelIngress в cmd/beacon/up.go, ChannelSink в internal/app/command/processor.go. Дубля в OwnerFiles нет. Правка только текстовая.
+Статус: done
+baseline: `git rev-parse --short origin/main` = c716b61; `gh pr view 529 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:16:33Z; `git merge-base --is-ancestor 28e3494 origin/main` = 0; `git grep -n -E 'buildChannelIngress|channelSenderResolver|upChannelIngress|ChannelSink' origin/main -- cmd/beacon internal/app/command` = server.go:90,106, up.go:75,189, processor.go.
 Обоснование: проводка уже в main, commit 28e3494 (PR #529) добавил buildChannelIngress и channelSenderResolver в cmd/beacon/server.go, upChannelIngress в cmd/beacon/up.go и ChannelSink в internal/app/command/processor.go. Дубля в OwnerFiles нет, код не писался.
 Фаза: P0
 Тип: task
@@ -39,6 +41,9 @@ PR: 486
 ## Приёмка
 
 Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
+
+## Подтверждение
+- Premise проверен 2026-11-21 по origin/main (c716b61). PR #529 влит 2026-11-20, commit 28e3494 лежит в origin/main. `buildChannelIngress` и `channelSenderResolver` работают в cmd/beacon/server.go, `upChannelIngress` подключает ingress в cmd/beacon/up.go, `appcommand.ChannelSink` передаёт команды в обработчик. Дубля нет. Код не писал, чужие OwnerFiles и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done. Ссылка: https://github.com/refusedguy/beacon/pull/529.
 
 <!-- wiring-card:contract
 beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
