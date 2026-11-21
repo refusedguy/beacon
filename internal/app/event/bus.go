@@ -73,7 +73,7 @@ var (
 type Bus struct {
 	journal Journal
 
-	commitMu sync.Mutex // serializes append + drain so seq and delivery order agree
+	commitMu sync.Mutex // serializes assignSeqs so seq values stay monotonic
 
 	mu         sync.Mutex
 	nextSeq    uint64 // local seq source when journal is nil
@@ -210,9 +210,9 @@ func (tx *Tx) Rollback() {
 }
 
 // Commit persists staged envelopes, then drains them to subscribers. It is
-// safe to call only once; later calls return ErrTxDone. Subscribers must not
-// commit another transaction from inside delivery, because the append+drain
-// section is serialized to keep seq and delivery order consistent.
+// safe to call only once; later calls return ErrTxDone. Seq assignment is
+// serialized to keep order, but delivery runs with the lock released so a
+// subscriber can commit another transaction without deadlocking.
 func (tx *Tx) Commit() error {
 	if tx.done {
 		return ErrTxDone
@@ -223,13 +223,17 @@ func (tx *Tx) Commit() error {
 	}
 
 	b := tx.bus
-	b.commitMu.Lock()
-	defer b.commitMu.Unlock()
+	envs := make([]Envelope, len(tx.staged))
+	copy(envs, tx.staged)
 
-	if err := b.assignSeqs(tx.ctx, tx.staged); err != nil {
+	b.commitMu.Lock()
+	err := b.assignSeqs(tx.ctx, envs)
+	b.commitMu.Unlock()
+	if err != nil {
 		return err
 	}
-	b.drain(tx.ctx, tx.staged)
+
+	b.drain(tx.ctx, envs)
 	return nil
 }
 
