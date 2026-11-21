@@ -448,6 +448,8 @@ func permissiveSchema(s *jsonschema.Schema) *jsonschema.Schema {
 // accepts the JSON its handler emits. The cases cover optional blocks, null
 // maps and empty slices. A forward-compatibility probe adds a field that the
 // current get_result schema does not define and checks that it still passes.
+// wait_result is checked without relaxation: its declared schema covers every
+// field the handler returns, so relaxSchema must not hide a drift there.
 func TestOutputSchemasValidateRealResponses(t *testing.T) {
 	clientSession := connectContractClient(t)
 	tools, _ := listAllTools(t, clientSession)
@@ -462,7 +464,11 @@ func TestOutputSchemasValidateRealResponses(t *testing.T) {
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			t.Fatalf("unmarshal %s output schema: %v", tool.Name, err)
 		}
-		resolved, err := permissiveSchema(&schema).Resolve(nil)
+		candidate := &schema
+		if tool.Name != "beacon_wait_result" {
+			candidate = permissiveSchema(&schema)
+		}
+		resolved, err := candidate.Resolve(nil)
 		if err != nil {
 			t.Fatalf("resolve %s output schema: %v", tool.Name, err)
 		}
@@ -508,8 +514,8 @@ func TestOutputSchemasValidateRealResponses(t *testing.T) {
 		WaitResultOutput: WaitResultOutput{
 			Status: "ready", Verdict: "ready", Revision: 4,
 			Checks: map[string]domain.Check{}, PollAfterMs: &poll,
+			Reason: WaitStopTerminal,
 		},
-		Reason: WaitStopTerminal,
 	})
 
 	// beacon_get_result: failedChecks is an empty slice (not null) when no
@@ -572,6 +578,73 @@ func TestOutputSchemasValidateRealResponses(t *testing.T) {
 	probe["nextCommand"] = ""
 	probe["nextHint"] = "orchestrator merges"
 	check("beacon_get_result", probe)
+}
+
+// TestWaitResultResponseMatchesAdvertisedSchema proves a strict client accepts
+// the reason the wait_result handler returns. The schema here has no relaxation,
+// so a future drift fails this test instead of passing through permissiveSchema.
+func TestWaitResultResponseMatchesAdvertisedSchema(t *testing.T) {
+	clientSession := connectContractClient(t)
+	tools, _ := listAllTools(t, clientSession)
+
+	var raw []byte
+	for _, tool := range tools {
+		if tool.Name != "beacon_wait_result" {
+			continue
+		}
+		var err error
+		raw, err = json.Marshal(tool.OutputSchema)
+		if err != nil {
+			t.Fatalf("marshal wait_result output schema: %v", err)
+		}
+		break
+	}
+	if raw == nil {
+		t.Fatal("no advertised output schema for beacon_wait_result")
+	}
+
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("unmarshal wait_result output schema: %v", err)
+	}
+	if _, ok := schema.Properties["reason"]; !ok {
+		t.Fatal("advertised wait_result schema does not declare reason")
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve wait_result output schema: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		out  WaitReasonOutput
+	}{
+		{
+			name: "no reason",
+			out:  WaitReasonOutput{WaitResultOutput: WaitResultOutput{Status: "watching", Revision: 1}},
+		},
+		{
+			name: "terminal reason",
+			out: WaitReasonOutput{WaitResultOutput: WaitResultOutput{
+				Status: "ready", Verdict: "ready", Revision: 2, Reason: WaitStopTerminal,
+			}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(tc.out)
+			if err != nil {
+				t.Fatalf("marshal response: %v", err)
+			}
+			var instance any
+			if err := json.Unmarshal(payload, &instance); err != nil {
+				t.Fatalf("unmarshal response: %v", err)
+			}
+			if err := resolved.Validate(instance); err != nil {
+				t.Errorf("response %s does not validate against the advertised schema: %v", payload, err)
+			}
+		})
+	}
 }
 
 // toolOutputTemplate is the canonical report shape a Beacon tool prints at the

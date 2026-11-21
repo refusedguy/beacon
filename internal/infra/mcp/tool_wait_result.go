@@ -153,53 +153,42 @@ func (r WaitStopReason) Retryable() bool {
 	return r.valid() && r != WaitStopUnknownSubmission
 }
 
-// WaitReasonOutput is the wait_result response with the stop reason as a real
-// field. It embeds WaitResultOutput so the five byte-stable ADR 0036 §2 fields
-// keep their names and their order; reason is appended last. The typed MCP
-// handler returns this type, so go-sdk derives an output schema that accepts
-// the reason field and tools/call validation does not reject it. schema.go and
-// its AllOutputSchemas factory are untouched.
+// WaitReasonOutput is the named response type of the typed wait_result handler.
+// WaitResultOutput declares reason (BCX-43), so this type adds no second copy of
+// the field. Its derived schema matches the advertised OutputSchema.
 type WaitReasonOutput struct {
 	WaitResultOutput
-	Reason WaitStopReason `json:"reason,omitempty"`
 }
 
-// MarshalJSON keeps the byte-stable five-field prefix of WaitResultOutput and
-// appends reason. Reusing the embedded marshaller keeps one place that owns
-// the field order.
+// MarshalJSON delegates to WaitResultOutput so the byte-stable field order of
+// ADR 0036 §2 lives in one place.
 func (o WaitReasonOutput) MarshalJSON() ([]byte, error) {
-	base := o.WaitResultOutput
-	if o.Reason.valid() {
-		base = withWaitStopReason(base, o.Reason)
-	}
-	return base.MarshalJSON()
+	return o.WaitResultOutput.MarshalJSON()
 }
 
-// waitReasonOutput lifts a reason stamped on a WaitResultOutput into the
-// explicit field of WaitReasonOutput. The reserved Checks key is removed so a
-// client sees the reason once, as a top-level field.
+// waitReasonOutput lifts a reason stamped on a WaitResultOutput into the real
+// Reason field. The reserved Checks key is removed so a client sees the reason
+// once, as a top-level field.
 func waitReasonOutput(out WaitResultOutput) WaitReasonOutput {
 	reason := waitStopReasonOf(out)
-	if reason == "" {
-		return WaitReasonOutput{WaitResultOutput: out}
-	}
-	checks := make(map[string]domain.Check, len(out.Checks))
-	for name, check := range out.Checks {
-		if name != waitStopReasonCheckName {
-			checks[name] = check
+	if reason != "" {
+		checks := make(map[string]domain.Check, len(out.Checks))
+		for name, check := range out.Checks {
+			if name != waitStopReasonCheckName {
+				checks[name] = check
+			}
 		}
+		out.Checks = checks
+		out.Reason = reason
 	}
-	out.Checks = checks
-	return WaitReasonOutput{WaitResultOutput: out, Reason: reason}
+	return WaitReasonOutput{WaitResultOutput: out}
 }
 
 // waitStopReasonCheckName is the reserved Checks key that carries the reason
-// inside the byte-stable WaitResultOutput. WaitResultOutput is owned by
-// schema.go, which this card does not touch, so the reason rides in the map
-// that already belongs to the response. MarshalJSON lifts this entry to the
-// top-level "reason" field and hides it from checks. The value is validated in
-// waitStopReasonOf, so a user check that happens to reuse the key but does not
-// hold a valid reason is emitted as an ordinary check.
+// through service paths returning WaitResultOutput before the handler lifts it
+// into the declared Reason field. MarshalJSON reads either source and hides the
+// key from checks. waitStopReasonOf validates the value, so a user check that
+// reuses the key without a valid reason is emitted as an ordinary check.
 const waitStopReasonCheckName = "_beaconWaitStopReason"
 
 // withWaitStopReason stamps reason onto out without mutating the caller's
@@ -217,11 +206,10 @@ func withWaitStopReason(out WaitResultOutput, reason WaitStopReason) WaitResultO
 	return out
 }
 
-// StopReasonOf reads the stop reason from a wait_result response. It is the
-// public reader for callers outside this package: the reason rides in Checks
-// so schema.go, which this card does not own, stays unchanged. An empty result
-// means the output carries no reason, for example a precheck failure or an
-// event tick.
+// StopReasonOf reads the stop reason from the reserved Checks key. Service
+// paths stamp that key before the handler lifts the value into the declared
+// Reason field. An empty result means the output carries no reason, for example
+// a precheck failure or an event tick.
 func StopReasonOf(out WaitResultOutput) WaitStopReason {
 	return waitStopReasonOf(out)
 }
@@ -251,11 +239,16 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 		name  string
 		value any
 	}
-	// The reason travels in Checks so schema.go need not change. Lift it out
-	// of checks here and append it after pollAfterMs: the five ADR 0036 §2
-	// fields keep their order and their exact bytes when no reason is present.
+	// Reason is declared on WaitResultOutput (BCX-43). Service paths stamp the
+	// reserved Checks key before the handler lifts it into that field, so read
+	// both sources: the real field wins, the key keeps older paths working.
+	// Appending after pollAfterMs keeps the five ADR 0036 §2 fields byte-stable
+	// when no reason is present.
+	reason := o.Reason
+	if reason == "" {
+		reason = waitStopReasonOf(o)
+	}
 	checks := o.Checks
-	reason := waitStopReasonOf(o)
 	if reason != "" {
 		checks = make(map[string]domain.Check, len(o.Checks))
 		for name, check := range o.Checks {
@@ -1407,7 +1400,7 @@ func (s *WaitResultService) now() time.Time {
 
 // Handle adapts the service to the go-sdk typed tool handler signature. The
 // caller id is the opaque sessionID from _meta and is never interpreted. It
-// returns WaitReasonOutput so the derived schema admits the reason field.
+// returns WaitReasonOutput, whose schema matches the advertised one (BCX-43).
 func (s *WaitResultService) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in WaitResultInput) (*mcpsdk.CallToolResult, WaitReasonOutput, error) {
 	subscriberID := ""
 	if id := SessionIDFromRequest(req); id != nil {

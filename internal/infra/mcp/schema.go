@@ -56,6 +56,12 @@ type WaitResultOutput struct {
 	Revision    uint64                  `json:"revision"`
 	Checks      map[string]domain.Check `json:"checks,omitempty"`
 	PollAfterMs *int64                  `json:"pollAfterMs,omitempty"`
+
+	// Reason names why the wait ended (ADR 0046 p3). It is declared on the
+	// advertised output type so a client that validates a response against
+	// OutputSchema accepts the reason the handler returns (BCX-43). The field
+	// is optional, so a response without a reason keeps its previous shape.
+	Reason WaitStopReason `json:"reason,omitempty"`
 }
 
 // FailedCheck is one failed check returned by beacon_get_result.
