@@ -207,7 +207,7 @@ func TestFourDeliveryFailuresIssueOneHumanAlert(t *testing.T) {
 		ev := domain.RevokeEvent(domain.DeliveryRevoke{
 			ObligationID: o.ID, Outcome: domain.OutcomeTransportFailed,
 		}, at)
-		res, err := l.Revoke(ctx, ev.Revoke, ev.At)
+		res, err := l.Revoke(ctx, *ev.Revoke, ev.At)
 		if err != nil {
 			t.Fatalf("Revoke %d: %v", i, err)
 		}
