@@ -1,5 +1,5 @@
 # WIRING-926. Привязать CardLinks port в composition root
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/mcp.go, cmd/beacon/mcp_test.go
@@ -34,3 +34,7 @@ CardLinks port описан в cibridge как узкий интерфейс, ч
 ## Приёмка
 
 Проводка применена, CI зелёный, карточка и отложенная запись переведены в done.
+
+## Подтверждение
+
+PR #951 (commit 6e4b918) влит в origin/main 2026-11-21. Он добавил адаптер deferredCardLinks в cmd/beacon/mcp.go, реализующий cibridge.CardLinks через ListDeferred и MarkDeferredDone, и вызвал bridge.WithCardLinks(&deferredCardLinks{...}) в ReconcilePass. Заголовок PR явно называет WIRING-926. Код лежит в origin/main, OwnerFiles карточки не менял.

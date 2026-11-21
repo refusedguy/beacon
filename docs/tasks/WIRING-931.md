@@ -1,5 +1,5 @@
 # WIRING-931. Подключить beacon index к dispatch CLI
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/main.go, cmd/beacon/catalog.go, cmd/beacon/main_test.go, cmd/beacon/catalog_test.go
@@ -35,3 +35,7 @@ PR: 931
 ## Приёмка
 
 Проводка применена, CI зелёный, карточка и отложенная запись переведены в done.
+
+## Подтверждение
+
+PR #951 (commit 6e4b918) влит в origin/main 2026-11-21. Он добавил case "index" в dispatch, вызов RegisterIndex(runIndex) в init(), запись index в cmd/beacon/catalog.go и имя index в TestT06ListJSONCatalog. Заголовок PR явно называет WIRING-931. Код лежит в origin/main, OwnerFiles карточки не менял.
