@@ -1079,8 +1079,10 @@ func TestWaitResultHandleSkipsWorkWhenTreeAlreadyCancelled(t *testing.T) {
 // end. It keeps the acceptance test inside mcp without importing a sibling
 // infra package (ADR 0005).
 type coalescingCIWaiter struct {
-	mu    sync.Mutex
-	calls map[string]*coalescingCIRound
+	mu      sync.Mutex
+	calls   map[string]*coalescingCIRound
+	joined  atomic.Int32
+	changed chan struct{}
 }
 
 type coalescingCIRound struct {
@@ -1088,12 +1090,43 @@ type coalescingCIRound struct {
 }
 
 func newCoalescingCIWaiter() *coalescingCIWaiter {
-	return &coalescingCIWaiter{calls: make(map[string]*coalescingCIRound)}
+	return &coalescingCIWaiter{
+		calls:   make(map[string]*coalescingCIRound),
+		changed: make(chan struct{}),
+	}
+}
+
+// signalLocked broadcasts the current participant count to every waitJoined
+// caller. The channel is captured under the same lock that closes it, so a
+// caller cannot miss a change between reading the count and waiting.
+func (g *coalescingCIWaiter) signalLocked() {
+	close(g.changed)
+	g.changed = make(chan struct{})
+}
+
+// waitJoined blocks until at least n callers have entered the gate or ctx ends.
+func (g *coalescingCIWaiter) waitJoined(ctx context.Context, n int32) error {
+	for {
+		g.mu.Lock()
+		joined := g.joined.Load()
+		changed := g.changed
+		g.mu.Unlock()
+		if joined >= n {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func (g *coalescingCIWaiter) wait(ctx context.Context, key string, fn func(context.Context) error) error {
 	g.mu.Lock()
 	if round, ok := g.calls[key]; ok {
+		g.joined.Add(1)
+		g.signalLocked()
 		g.mu.Unlock()
 		select {
 		case <-round.done:
@@ -1104,6 +1137,8 @@ func (g *coalescingCIWaiter) wait(ctx context.Context, key string, fn func(conte
 	}
 	round := &coalescingCIRound{done: make(chan struct{})}
 	g.calls[key] = round
+	g.joined.Add(1)
+	g.signalLocked()
 	g.mu.Unlock()
 
 	err := fn(ctx)
@@ -1207,7 +1242,6 @@ func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 	const units = 15
 	var (
 		runs          atomic.Int32
-		entered       atomic.Int32
 		leaderEntered = make(chan struct{})
 		release       = make(chan struct{})
 	)
@@ -1237,24 +1271,22 @@ func TestWaitResultSharedCIWaitCoalescesOneCI(t *testing.T) {
 		go func(i int, svc *WaitResultService) {
 			defer wg.Done()
 			<-start
-			entered.Add(1)
 			results[i].out, results[i].err = svc.Wait(context.Background(), "sub-A",
 				WaitResultInput{WatchID: "watch-1"}, CallerExit{})
 		}(i, svc)
 	}
 	close(start)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for entered.Load() < units && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	waitCtx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := gate.waitJoined(waitCtx, int32(units)); err != nil {
+		t.Fatalf("wait for %d participants: %v", units, err)
 	}
 	select {
 	case <-leaderEntered:
-	case <-time.After(2 * time.Second):
+	case <-waitCtx.Done():
 		t.Fatal("no unit entered the shared CI wait")
 	}
-	// Let the other units join the active round before it is released.
-	time.Sleep(250 * time.Millisecond)
 	if got := runs.Load(); got != 1 {
 		t.Fatalf("expensive CI wait ran %d times before release, want 1", got)
 	}
