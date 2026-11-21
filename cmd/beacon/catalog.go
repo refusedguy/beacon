@@ -5,14 +5,22 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"sort"
 	"text/tabwriter"
 )
 
-// command is one entry of the catalog shared by list and what.
+// commandRunner is the common signature every dispatch target adapts to. A
+// closure reads the current seam variable, so Register* replacements in tests
+// take effect at call time rather than being captured at registration.
+type commandRunner func(c *CLI, args []string) int
+
+// command is one entry of the catalog shared by list and what. The run field
+// dispatches the command but stays out of `beacon list` output.
 type command struct {
 	Name    string `json:"name"`
 	Summary string `json:"summary"`
 	Usage   string `json:"usage"`
+	run     commandRunner
 }
 
 // catalog is the single source of truth for the command names, summaries and
@@ -40,6 +48,20 @@ var catalog = []command{
 	{Name: "why", Summary: "Показать цепочку блокировок карточки", Usage: "beacon why <task>"},
 }
 
+// commands returns the catalog entries enriched with their dispatch runner.
+// catalog stays a plain slice because up.go, human.go and main.go append their
+// entries in init; this helper reads the final value on every call so the
+// metadata and the runner table cannot drift apart.
+func commands() []command {
+	out := make([]command, 0, len(catalog))
+	for _, c := range catalog {
+		c.run = runnerFor[c.Name]
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 func parseFlags(name string, args []string, errOut io.Writer, fs *flag.FlagSet) bool {
 	fs.SetOutput(errOut)
 	fs.Usage = func() {}
@@ -64,7 +86,7 @@ func runList(args []string, out, errOut io.Writer) int {
 
 	switch *format {
 	case "json":
-		if err := json.NewEncoder(out).Encode(catalog); err != nil {
+		if err := json.NewEncoder(out).Encode(commands()); err != nil {
 			fmt.Fprintf(errOut, "beacon list: %v\n", err)
 			return 2
 		}
@@ -72,7 +94,7 @@ func runList(args []string, out, errOut io.Writer) int {
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "NAME\tSUMMARY\tUSAGE")
-		for _, c := range catalog {
+		for _, c := range commands() {
 			fmt.Fprintf(w, "%s\t%s\t%s\n", c.Name, c.Summary, c.Usage)
 		}
 		_ = w.Flush()
@@ -99,7 +121,7 @@ func runWhat(args []string, out, errOut io.Writer) int {
 	}
 
 	name := fs.Arg(0)
-	for _, c := range catalog {
+	for _, c := range commands() {
 		if c.Name == name {
 			fmt.Fprintf(out, "name: %s\nsummary: %s\nusage: %s\n", c.Name, c.Summary, c.Usage)
 			return 0
