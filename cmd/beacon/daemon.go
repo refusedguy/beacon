@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -13,9 +15,11 @@ import (
 	"github.com/refusedguy/beacon/internal/app/notify"
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/app/session"
+	"github.com/refusedguy/beacon/internal/app/tasks"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
@@ -284,6 +288,12 @@ func runDaemon(c *CLI, args []string) int {
 	}
 	defer func() { _ = db.Close() }()
 
+	// The card monitor watches task-card status through tasks.Port and appends
+	// one event per status change (WIRING-487). The adapter lives in cmd because
+	// the layer matrix allows cmd -> internal/app but forbids the reverse edge.
+	root := projectRootForConfig()
+	cardMonitor := newDaemonCardMonitor(db, root)
+
 	// The daemon marks its bound orchestrator session alive in the durable
 	// registry while it runs (WIRING-488). It reuses the store handle opened
 	// above, so no second connection is created.
@@ -310,6 +320,7 @@ func runDaemon(c *CLI, args []string) int {
 		if err := daemonHeartbeat(hb, sessionID); err != nil {
 			fmt.Fprintf(c.errOut, "beacon daemon: heartbeat: %v\n", err)
 		}
+		daemonPollCards(ctx, cardMonitor, db, root)
 		ReconcilePass(ctx, cfg)
 		return 0
 	}
@@ -327,6 +338,13 @@ func runDaemon(c *CLI, args []string) int {
 		runDaemonHeartbeat(ctx, hb, sessionID, daemonHeartbeatInterval)
 	}()
 	defer func() { <-hbDone }()
+
+	cmDone := make(chan struct{})
+	go func() {
+		defer close(cmDone)
+		runDaemonCardMonitor(ctx, cardMonitor, db, root, daemonCardPollInterval)
+	}()
+	defer func() { <-cmDone }()
 
 	<-ctx.Done()
 	return 0
@@ -527,5 +545,131 @@ func daemonGHRunner(c *CLI) orchestrator.GHRunner {
 			reason = string(res.stdout)
 		}
 		return nil, ghError("gh", runResult{stderr: []byte(reason), code: res.code})
+	}
+}
+
+// daemonCardPort is the composition-root adapter for tasks.Port. It reads card
+// status from the task-card files under <root>/docs/tasks and journal events
+// from the state DB the daemon already holds open. The adapter lives in cmd on
+// purpose: the layer matrix allows cmd -> internal/app and cmd -> internal/infra
+// but forbids internal/infra -> internal/app (ADR 0005).
+type daemonCardPort struct {
+	db       *store.DB
+	tasksDir string
+	readFile func(string) ([]byte, error)
+}
+
+// Card implements tasks.Port. A missing file means the card is absent; a parse
+// failure is an error so a malformed card is visible instead of silently
+// treated as a blank baseline.
+func (p *daemonCardPort) Card(_ context.Context, id string) (tasks.Card, bool, error) {
+	path := taskstore.CardPath(p.tasksDir, filepath.Base(strings.TrimSpace(id)))
+	read := p.readFile
+	if read == nil {
+		read = os.ReadFile
+	}
+	raw, err := read(path)
+	if os.IsNotExist(err) {
+		return tasks.Card{}, false, nil
+	}
+	if err != nil {
+		return tasks.Card{}, false, fmt.Errorf("card monitor: read %s: %w", path, err)
+	}
+	card, err := taskstore.ParseCard(path, raw)
+	if err != nil {
+		return tasks.Card{}, false, fmt.Errorf("card monitor: parse %s: %w", path, err)
+	}
+	return tasks.Card{ID: card.ID, Status: card.Status}, true, nil
+}
+
+// EventsAfter implements tasks.Port over the scoped event log. Store seq values
+// are positive int64, so the uint64 cursor narrows safely for a real journal.
+// The store already returns ascending seq greater than cursor; limit caps the
+// page after that filter.
+func (p *daemonCardPort) EventsAfter(_ context.Context, id string, cursor uint64, limit int) ([]tasks.RecordedEvent, error) {
+	out := make([]tasks.RecordedEvent, 0)
+	if p.db == nil {
+		return out, nil
+	}
+	events, err := p.db.ReadAfter(strings.TrimSpace(id), int64(cursor))
+	if err != nil {
+		return nil, fmt.Errorf("card monitor: events for %s: %w", id, err)
+	}
+	for _, ev := range events {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		out = append(out, tasks.RecordedEvent{Seq: uint64(ev.Seq), Type: ev.Type})
+	}
+	return out, nil
+}
+
+// Serialize implements tasks.Port. The monitor never encodes bytes itself.
+func (p *daemonCardPort) Serialize(change tasks.Change) ([]byte, error) {
+	return json.Marshal(change)
+}
+
+// newDaemonCardMonitor builds one Monitor over the daemon's store handle. It is
+// created once per process so the status baseline and replay cursor survive
+// across passes.
+func newDaemonCardMonitor(db *store.DB, root string) *tasks.Monitor {
+	return tasks.NewMonitor(&daemonCardPort{
+		db:       db,
+		tasksDir: filepath.Join(root, "docs", "tasks"),
+	})
+}
+
+// daemonPollCards subscribes the current task cards and polls each once. A
+// status change is appended to the event log under the card id, so one change
+// produces exactly one event. Subscribe is idempotent and Poll leaves state
+// untouched on error, so a restart or a repeat never duplicates an event or
+// resets the baseline.
+func daemonPollCards(ctx context.Context, monitor *tasks.Monitor, db *store.DB, root string) {
+	cards, err := taskstore.LoadCards(filepath.Join(root, "docs", "tasks"))
+	if err != nil {
+		observe.ActorError("card-monitor", "", err)
+		return
+	}
+	for _, card := range cards {
+		id := strings.TrimSpace(card.ID)
+		if id == "" {
+			continue
+		}
+		if err := monitor.Subscribe(id); err != nil {
+			observe.ActorError("card-monitor", id, err)
+			continue
+		}
+		result, err := monitor.Poll(ctx, id)
+		if err != nil {
+			observe.ActorError("card-monitor", id, err)
+			continue
+		}
+		for _, change := range result.Changes {
+			if _, err := db.Append(id, change.Type, change.Payload); err != nil {
+				observe.ActorError("card-monitor", id, err)
+			}
+		}
+	}
+}
+
+// daemonCardPollInterval is the pass cadence of the card monitor. It is a
+// variable so a test can shorten it without waiting the full interval.
+var daemonCardPollInterval = 30 * time.Second
+
+// runDaemonCardMonitor ticks until ctx is done and polls the cards on each
+// tick. A monitor failure is logged and never stops the daemon cycle.
+func runDaemonCardMonitor(ctx context.Context, monitor *tasks.Monitor, db *store.DB, root string, interval time.Duration) {
+	if interval <= 0 {
+		interval = daemonCardPollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			daemonPollCards(ctx, monitor, db, root)
+		}
 	}
 }

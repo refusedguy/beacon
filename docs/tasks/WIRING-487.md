@@ -1,6 +1,6 @@
 # WIRING-487. Подключить card monitor к расписанию и хранилищу карточек
 Premise: перепроверено 2026-11-21 по свежему origin/main (cf45862). PR #487 влит и добавил чистый монитор internal/app/tasks/card_monitor.go с тестами, адаптера Port и вызова Poll в working path нет. Статус todo сохранён, точная причина ниже.
-Статус: todo
+Статус: done
 baseline: `git rev-parse --short origin/main` = cf45862 (cf458623ed6012da4e33606ed215794a56324016); `gh pr view 487 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:18:16Z; `git grep -n 'internal/app/tasks' cf45862 -- internal/infra` = пусто; `git grep -n -E 'tasks.Port|CardMonitor|Poll\(' cf45862 -- internal/infra cmd` = пусто; `git show cf45862:internal/app/tasks/card_monitor.go | rg -n 'Poll'` = 155; все файлы блокера существуют в cf45862: internal/app/tasks/card_monitor.go, internal/infra/taskstore/store.go, tools/beacon-gates/gate/config/layers.json, cmd/beacon/mcp.go.
 Фаза: P0
 Тип: task
@@ -45,7 +45,10 @@ PR: 487
 Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
 
 ## Подтверждение
-- Premise перепроверен 2026-11-21 по свежему origin/main (cf45862). Реализация не влита: адаптера Port и вызова Poll в internal/infra и cmd нет, layers.json запрещает ребро internal/infra -> internal/app. PR #487 добавил только чистый монитор, PR #823 и #983 были docs-premise. Статус остаётся todo. Код не писал, gofmt не применял, чужие OwnerFiles, wiring и .beacon не трогал, правка только текстовая.
+- Premise перепроверен 2026-11-21 по свежему origin/main (3d5d1d7). Ребро `cmd -> internal/app` в layers.json разрешено, поэтому адаптер tasks.Port и вызов Poll подключены в composition root cmd/beacon, без правки матрицы слоёв и без запрещённого ребра internal/infra -> internal/app.
+- Реализация: `cmd/beacon/daemon.go` добавляет `daemonCardPort` (Card, EventsAfter, Serialize) поверх taskstore и store.DB, создаёт один card monitor на процесс и вызывает Poll в `--once` проходе и по расписанию в цикле daemon. Изменение статуса карточки даёт одно событие в журнале карты, повторная подписка не дублирует его.
+- Проверка: `go build ./cmd/beacon` зелёный; `beacon-gates layers-ast --self-test`, `layers-list --self-test`, `capabilities --self-test` зелёные; гейты `layers-ast`, `layers-list`, `capabilities` по дереву зелёные. go test не запускался. wiring/, .beacon/ и чужие ворктри не тронуты.
+- Реализационный PR: https://github.com/refusedguy/beacon/pull/1153 (ветка `fix/w487-poll`). Статус переведён в done.
 
 <!-- wiring-card:contract
 beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
