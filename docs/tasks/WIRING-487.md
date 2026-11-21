@@ -48,6 +48,7 @@ PR: 487
 - Premise перепроверен 2026-11-21 по свежему origin/main (3d5d1d7). Ребро `cmd -> internal/app` в layers.json разрешено, поэтому адаптер tasks.Port и вызов Poll подключены в composition root cmd/beacon, без правки матрицы слоёв и без запрещённого ребра internal/infra -> internal/app.
 - Реализация: `cmd/beacon/daemon.go` добавляет `daemonCardPort` (Card, EventsAfter, Serialize) поверх taskstore и store.DB, создаёт один card monitor на процесс и вызывает Poll в `--once` проходе и по расписанию в цикле daemon. Изменение статуса карточки даёт одно событие в журнале карты, повторная подписка не дублирует его.
 - Проверка: `go build ./cmd/beacon` зелёный; `beacon-gates layers-ast --self-test`, `layers-list --self-test`, `capabilities --self-test` зелёные; гейты `layers-ast`, `layers-list`, `capabilities` по дереву зелёные. go test не запускался. wiring/, .beacon/ и чужие ворктри не тронуты.
+- Реализационный PR: https://github.com/refusedguy/beacon/pull/1153 (ветка `fix/w487-poll`, head `57597c6`). Статус переведён в done.
 
 <!-- wiring-card:contract
 beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
