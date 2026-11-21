@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app/session"
-	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // heartbeatRecorder stands in for the durable session registry and records
@@ -112,20 +111,20 @@ func TestRunDaemonHeartbeatTicksAndStops(t *testing.T) {
 // sessionStoreFake implements session.SessionStore without a database. It
 // records Touch calls so a test can prove the registry reaches the store.
 type sessionStoreFake struct {
-	items   map[string]store.Session
+	items   map[string]session.Session
 	touched []string
 }
 
 func newSessionStoreFake() *sessionStoreFake {
-	return &sessionStoreFake{items: make(map[string]store.Session)}
+	return &sessionStoreFake{items: make(map[string]session.Session)}
 }
 
-func (f *sessionStoreFake) SaveSession(s store.Session) error {
+func (f *sessionStoreFake) SaveSession(s session.Session) error {
 	f.items[s.ID] = s
 	return nil
 }
 
-func (f *sessionStoreFake) GetSession(id string) (store.Session, bool, error) {
+func (f *sessionStoreFake) GetSession(id string) (session.Session, bool, error) {
 	s, ok := f.items[id]
 	return s, ok, nil
 }
@@ -137,7 +136,7 @@ func (f *sessionStoreFake) Touch(id string, _ time.Time) error {
 
 func TestDaemonHeartbeatTouchesThroughRegistry(t *testing.T) {
 	st := newSessionStoreFake()
-	st.items["ses_1"] = store.Session{ID: "ses_1", Status: store.SessionStatusActive}
+	st.items["ses_1"] = session.Session{ID: "ses_1", Status: session.SessionStatusActive}
 	reg := session.NewSessionRegistry(st)
 
 	if err := daemonHeartbeat(reg, "ses_1"); err != nil {
@@ -159,15 +158,15 @@ func TestEnsureDaemonSessionRecordsMissingSession(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("session ses_9 found = %v, err = %v", found, err)
 	}
-	if got.Status != store.SessionStatusActive {
-		t.Fatalf("status = %q, want %q", got.Status, store.SessionStatusActive)
+	if got.Status != session.SessionStatusActive {
+		t.Fatalf("status = %q, want %q", got.Status, session.SessionStatusActive)
 	}
 }
 
 func TestEnsureDaemonSessionKeepsExistingSession(t *testing.T) {
 	st := newSessionStoreFake()
-	st.items["ses_1"] = store.Session{
-		ID: "ses_1", Status: store.SessionStatusIdle,
+	st.items["ses_1"] = session.Session{
+		ID: "ses_1", Status: session.SessionStatusIdle,
 		Metadata: map[string]string{"origin": "spawn"},
 	}
 	reg := session.NewSessionRegistry(st)
@@ -176,7 +175,7 @@ func TestEnsureDaemonSessionKeepsExistingSession(t *testing.T) {
 		t.Fatalf("ensureDaemonSession: %v", err)
 	}
 	got := st.items["ses_1"]
-	if got.Status != store.SessionStatusIdle || got.Metadata["origin"] != "spawn" {
+	if got.Status != session.SessionStatusIdle || got.Metadata["origin"] != "spawn" {
 		t.Fatalf("existing session was rewritten: %+v", got)
 	}
 }

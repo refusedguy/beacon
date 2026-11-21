@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
-	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 // Config задаёт каталоги и корень проекта.
@@ -74,23 +73,23 @@ func (s *Service) List(o ListOptions) (string, error) {
 		o.Format = "table"
 	}
 	if o.Format != "table" && o.Format != "json" {
-		return "", taskstore.Validationf("неизвестный формат %q", o.Format)
+		return "", Validationf("неизвестный формат %q", o.Format)
 	}
 	for _, v := range o.Statuses {
 		if !oneOf(v, "todo", "in_progress", "done", "dropped") {
-			return "", taskstore.Validationf("неизвестный статус %q", v)
+			return "", Validationf("неизвестный статус %q", v)
 		}
 	}
 	for _, v := range o.Phases {
 		if !oneOf(v, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
-			return "", taskstore.Validationf("неизвестная фаза %q", v)
+			return "", Validationf("неизвестная фаза %q", v)
 		}
 	}
-	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	cards, err := LoadCards(s.Cfg.TasksDir)
 	if err != nil {
 		return "", err
 	}
-	out := make([]taskstore.Card, 0, len(cards))
+	out := make([]Card, 0, len(cards))
 	for _, c := range cards {
 		if !matchSet(c.Status, o.Statuses) || !matchSet(c.Phase, o.Phases) || !matchSet(c.Agent, o.Agents) {
 			continue
@@ -99,7 +98,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 			hit := false
 			for _, want := range o.Files {
 				for _, owner := range c.OwnerFiles {
-					if taskstore.PathsConflict(want, owner) {
+					if PathsConflict(want, owner) {
 						hit = true
 						break
 					}
@@ -133,7 +132,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		}
 		b, err := json.MarshalIndent(rows, "", "  ")
 		if err != nil {
-			return "", taskstore.Startupf("не собран JSON: %v", err)
+			return "", Startupf("не собран JSON: %v", err)
 		}
 		return string(b) + "\n", nil
 	}
@@ -146,7 +145,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 			strings.Join(c.OwnerFiles, ", "), c.Title)
 	}
 	if err := tw.Flush(); err != nil {
-		return "", taskstore.Startupf("не собран вывод: %v", err)
+		return "", Startupf("не собран вывод: %v", err)
 	}
 	return sb.String(), nil
 }
@@ -194,20 +193,20 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 		o.Type = "task"
 	}
 	if !oneOf(o.Type, "task", "epic") {
-		return "", "", taskstore.Validationf("неизвестный тип %q", o.Type)
+		return "", "", Validationf("неизвестный тип %q", o.Type)
 	}
 	if !oneOf(o.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
-		return "", "", taskstore.Validationf("неверная или отсутствующая фаза %q", o.Phase)
+		return "", "", Validationf("неверная или отсутствующая фаза %q", o.Phase)
 	}
 	if strings.TrimSpace(o.Title) == "" {
-		return "", "", taskstore.Validationf("не задан заголовок")
+		return "", "", Validationf("не задан заголовок")
 	}
 	if strings.TrimSpace(o.Reference) == "" {
-		return "", "", taskstore.Validationf("не задана ссылка")
+		return "", "", Validationf("не задана ссылка")
 	}
 	owners := splitFlagList(o.OwnerFiles)
 	if len(owners) == 0 {
-		return "", "", taskstore.Validationf("не заданы владельцы файлов")
+		return "", "", Validationf("не заданы владельцы файлов")
 	}
 	deps := strings.TrimSpace(o.Dependencies)
 	if deps == "" {
@@ -216,7 +215,7 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	if deps != "нет" {
 		for _, d := range splitFlagList(deps) {
 			if !idrRE.MatchString(d) {
-				return "", "", taskstore.Validationf("неверный ID зависимости %q", d)
+				return "", "", Validationf("неверный ID зависимости %q", d)
 			}
 		}
 	}
@@ -226,14 +225,14 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	o.Check = defaultText(o.Check)
 	o.Acceptance = defaultText(o.Acceptance)
 
-	lockPath := taskstore.LockPath(s.Cfg.StateDir, s.Cfg.Root)
-	lock, err := taskstore.AcquireLock(lockPath, s.Cfg.Root)
+	lockPath := LockPath(s.Cfg.StateDir, s.Cfg.Root)
+	lock, err := AcquireLock(lockPath, s.Cfg.Root)
 	if err != nil {
 		return "", "", err
 	}
 	defer lock.Release()
 
-	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	cards, err := LoadCards(s.Cfg.TasksDir)
 	if err != nil {
 		return "", "", err
 	}
@@ -245,24 +244,24 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	}
 	group, err := strconv.Atoi(strings.TrimPrefix(o.Phase, "P"))
 	if err != nil {
-		return "", "", taskstore.Validationf("неверная фаза %q", o.Phase)
+		return "", "", Validationf("неверная фаза %q", o.Phase)
 	}
-	counterPath := taskstore.CounterPath(s.Cfg.StateDir, s.Cfg.Root)
-	groups, err := taskstore.ReadCounter(counterPath)
+	counterPath := CounterPath(s.Cfg.StateDir, s.Cfg.Root)
+	groups, err := ReadCounter(counterPath)
 	if err != nil {
 		return "", "", err
 	}
-	n, id := taskstore.NextID(cards, groups, group)
-	filePath := taskstore.CardPath(s.Cfg.TasksDir, id)
+	n, id := NextID(cards, groups, group)
+	filePath := CardPath(s.Cfg.TasksDir, id)
 	if o.DryRun {
 		return id, filePath, nil
 	}
 	content := renderCard(id, o, owners, deps)
-	if err := taskstore.CreateExclusive(filePath, []byte(content)); err != nil {
+	if err := CreateExclusive(filePath, []byte(content)); err != nil {
 		return "", "", err
 	}
 	groups[strconv.Itoa(group)] = n
-	if err := taskstore.WriteCounter(counterPath, groups); err != nil {
+	if err := WriteCounter(counterPath, groups); err != nil {
 		return "", "", err
 	}
 	return id, filePath, nil
@@ -286,15 +285,15 @@ func splitFlagList(v string) []string {
 	return out
 }
 
-func checkOwners(cards []taskstore.Card, owners []string) error {
+func checkOwners(cards []Card, owners []string) error {
 	for _, c := range cards {
 		if c.Status != "todo" && c.Status != "in_progress" {
 			continue
 		}
 		for _, used := range c.OwnerFiles {
 			for _, want := range owners {
-				if taskstore.PathsConflict(used, want) {
-					return taskstore.Validationf("файл %s занят карточкой %s (%s)", want, c.ID, c.Status)
+				if PathsConflict(used, want) {
+					return Validationf("файл %s занят карточкой %s (%s)", want, c.ID, c.Status)
 				}
 			}
 		}
@@ -353,7 +352,7 @@ func CheckLaunch(assignments ...LaunchAssignment) error {
 	for i := range assignments {
 		for j := i + 1; j < len(assignments); j++ {
 			if fa, fb, ok := IntersectingFiles(assignments[i], assignments[j]); ok {
-				return taskstore.Validationf(
+				return Validationf(
 					"запуск отменён: назначения %s и %s пересекаются по файлам %s и %s; снимите конфликт до запуска",
 					assignments[i].Name, assignments[j].Name, fa, fb)
 			}
@@ -367,11 +366,11 @@ func CheckLaunch(assignments ...LaunchAssignment) error {
 // двух активных карточек пересекаются, агенты не стартуют и возвращается
 // ошибка валидации.
 func (s *Service) PlanLaunch(ids ...string) error {
-	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	cards, err := LoadCards(s.Cfg.TasksDir)
 	if err != nil {
 		return err
 	}
-	byID := make(map[string]taskstore.Card, len(cards))
+	byID := make(map[string]Card, len(cards))
 	for _, c := range cards {
 		byID[c.ID] = c
 	}
@@ -379,16 +378,16 @@ func (s *Service) PlanLaunch(ids ...string) error {
 	seen := make(map[string]bool, len(ids))
 	for _, raw := range ids {
 		id := strings.TrimSuffix(strings.TrimSpace(raw), ".md")
-		if !taskstore.IsID(id) {
-			return taskstore.Validationf("неверный ID карточки %q", raw)
+		if !IsID(id) {
+			return Validationf("неверный ID карточки %q", raw)
 		}
 		if seen[id] {
-			return taskstore.Validationf("карточка %s указана дважды", id)
+			return Validationf("карточка %s указана дважды", id)
 		}
 		seen[id] = true
 		c, ok := byID[id]
 		if !ok {
-			return taskstore.Validationf("карточка %s не найдена", id)
+			return Validationf("карточка %s не найдена", id)
 		}
 		if c.Status == "done" || c.Status == "dropped" {
 			continue
@@ -398,20 +397,20 @@ func (s *Service) PlanLaunch(ids ...string) error {
 	return CheckLaunch(assignments...)
 }
 
-func (s *Service) validateReference(ref, typ string, cards []taskstore.Card) error {
+func (s *Service) validateReference(ref, typ string, cards []Card) error {
 	if m := adrRefRE.FindStringSubmatch(ref); m != nil {
 		ok, err := s.adrAccepted(m[1])
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return taskstore.Validationf("ссылка %s: ADR не найден или не принят", ref)
+			return Validationf("ссылка %s: ADR не найден или не принят", ref)
 		}
 		return nil
 	}
 	if idrRE.MatchString(ref) {
 		if typ == "epic" {
-			return taskstore.Validationf("эпик обязан ссылаться на ADR, получено %s", ref)
+			return Validationf("эпик обязан ссылаться на ADR, получено %s", ref)
 		}
 		for _, c := range cards {
 			if c.ID != ref || c.Type != "epic" {
@@ -419,33 +418,33 @@ func (s *Service) validateReference(ref, typ string, cards []taskstore.Card) err
 			}
 			m := adrRefRE.FindStringSubmatch(c.Reference)
 			if m == nil {
-				return taskstore.Validationf("ссылка %s: у эпика нет ссылки на ADR", ref)
+				return Validationf("ссылка %s: у эпика нет ссылки на ADR", ref)
 			}
 			ok, err := s.adrAccepted(m[1])
 			if err != nil {
 				return err
 			}
 			if !ok {
-				return taskstore.Validationf("ссылка %s: ADR эпика не принят", ref)
+				return Validationf("ссылка %s: ADR эпика не принят", ref)
 			}
 			return nil
 		}
-		return taskstore.Validationf("ссылка %s: эпик не найден", ref)
+		return Validationf("ссылка %s: эпик не найден", ref)
 	}
-	return taskstore.Validationf("неизвестная ссылка %q", ref)
+	return Validationf("неизвестная ссылка %q", ref)
 }
 
 func (s *Service) adrAccepted(num string) (bool, error) {
 	matches, err := filepath.Glob(filepath.Join(s.Cfg.ADRDir, num+"-*.md"))
 	if err != nil {
-		return false, taskstore.Startupf("не найден ADR %s: %v", num, err)
+		return false, Startupf("не найден ADR %s: %v", num, err)
 	}
 	if len(matches) == 0 {
 		return false, nil
 	}
 	data, err := os.ReadFile(matches[0])
 	if err != nil {
-		return false, taskstore.Startupf("не прочитан ADR %s: %v", num, err)
+		return false, Startupf("не прочитан ADR %s: %v", num, err)
 	}
 	m := adrStatRE.FindStringSubmatch(string(data))
 	if m == nil {
@@ -485,31 +484,31 @@ type TakeOptions struct {
 func (s *Service) Take(o TakeOptions) (string, error) {
 	id := strings.TrimSpace(o.ID)
 	id = strings.TrimSuffix(id, ".md")
-	if !taskstore.IsID(id) {
-		return "", taskstore.Validationf("неверный ID карточки %q", o.ID)
+	if !IsID(id) {
+		return "", Validationf("неверный ID карточки %q", o.ID)
 	}
 	if strings.TrimSpace(o.Agent) == "" {
-		return "", taskstore.Validationf("не задан агент")
+		return "", Validationf("не задан агент")
 	}
 	when := strings.TrimSpace(o.Time)
 	if when == "" {
 		when = time.Now().UTC().Format(time.RFC3339)
 	}
 	if _, err := time.Parse(time.RFC3339, when); err != nil {
-		return "", taskstore.Validationf("неверное время %q: %v", o.Time, err)
+		return "", Validationf("неверное время %q: %v", o.Time, err)
 	}
 
-	lock, err := taskstore.AcquireLock(taskstore.LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
+	lock, err := AcquireLock(LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
 	if err != nil {
 		return "", err
 	}
 	defer lock.Release()
 
-	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	cards, err := LoadCards(s.Cfg.TasksDir)
 	if err != nil {
 		return "", err
 	}
-	var target *taskstore.Card
+	var target *Card
 	for i := range cards {
 		if cards[i].ID == id {
 			target = &cards[i]
@@ -517,13 +516,13 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 		}
 	}
 	if target == nil {
-		return "", taskstore.Validationf("карточка %s не найдена", id)
+		return "", Validationf("карточка %s не найдена", id)
 	}
 	if target.Status != "todo" {
-		return "", taskstore.Validationf("карточка %s уже взята агентом %s в %s", id, target.Agent, target.Time)
+		return "", Validationf("карточка %s уже взята агентом %s в %s", id, target.Agent, target.Time)
 	}
-	newText := taskstore.ReplaceFields(target.Raw, o.Agent, when)
-	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+	newText := ReplaceFields(target.Raw, o.Agent, when)
+	if err := AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%s in_progress %s %s", id, o.Agent, when), nil
@@ -594,7 +593,7 @@ type Job struct {
 func NewJob(id string) (Job, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return Job{}, taskstore.Validationf("не задан внешний ID задачи")
+		return Job{}, Validationf("не задан внешний ID задачи")
 	}
 	return Job{ID: id, Executor: FallbackChain[0]}, nil
 }
@@ -635,11 +634,11 @@ type RouteResult struct {
 // card whose executor is outside the chain starts from the first rung.
 func (s *Service) RouteRateLimit(id string, upstream error) (RouteResult, error) {
 	if !IsRateLimit(upstream) {
-		return RouteResult{}, taskstore.Validationf("фолбэк вызывается только по 429, получено: %v", upstream)
+		return RouteResult{}, Validationf("фолбэк вызывается только по 429, получено: %v", upstream)
 	}
 	id = strings.TrimSuffix(strings.TrimSpace(id), ".md")
-	if !taskstore.IsID(id) {
-		return RouteResult{}, taskstore.Validationf("неверный ID карточки %q", id)
+	if !IsID(id) {
+		return RouteResult{}, Validationf("неверный ID карточки %q", id)
 	}
 
 	repo := newRateLimitRepo(s.Cfg)
@@ -654,7 +653,7 @@ func (s *Service) RouteRateLimit(id string, upstream error) (RouteResult, error)
 		return RouteResult{}, err
 	}
 	if target.Status != "todo" && target.Status != "in_progress" {
-		return RouteResult{}, taskstore.Validationf("карточка %s в статусе %s, фолбэк неприменим", id, target.Status)
+		return RouteResult{}, Validationf("карточка %s в статусе %s, фолбэк неприменим", id, target.Status)
 	}
 
 	from := target.Agent
@@ -760,7 +759,7 @@ func (h Handoff) Validate() error {
 		{"risk_notes", h.RiskNotes},
 	} {
 		if strings.TrimSpace(field.value) == "" {
-			return taskstore.Validationf("handoff: пустое поле %s", field.name)
+			return Validationf("handoff: пустое поле %s", field.name)
 		}
 	}
 	return nil
@@ -772,10 +771,10 @@ func (h Handoff) Validate() error {
 // полученную передачу вместо всей истории чата.
 func (s *Service) BuildHandoff(id string) (Handoff, error) {
 	id = strings.TrimSuffix(strings.TrimSpace(id), ".md")
-	if !taskstore.IsID(id) {
-		return Handoff{}, taskstore.Validationf("неверный ID карточки %q", id)
+	if !IsID(id) {
+		return Handoff{}, Validationf("неверный ID карточки %q", id)
 	}
-	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	cards, err := LoadCards(s.Cfg.TasksDir)
 	if err != nil {
 		return Handoff{}, err
 	}
@@ -795,7 +794,7 @@ func (s *Service) BuildHandoff(id string) (Handoff, error) {
 		}
 		return h, nil
 	}
-	return Handoff{}, taskstore.Validationf("карточка %s не найдена", id)
+	return Handoff{}, Validationf("карточка %s не найдена", id)
 }
 
 // ---- ADR 0037 п2 / T3.48: возврат wait_result по событию, не по таймауту ----
@@ -976,11 +975,11 @@ func SelfTest(w io.Writer) error {
 	}
 	listCode := func() int {
 		_, err := svc.List(ListOptions{Format: "json"})
-		return taskstore.Code(err)
+		return Code(err)
 	}
 	newCode := func(o NewOptions) int {
 		_, _, err := svc.New(o)
-		return taskstore.Code(err)
+		return Code(err)
 	}
 
 	// Парсер должен упасть на карточке без поля Статус.
@@ -1057,7 +1056,7 @@ func SelfTest(w io.Writer) error {
 	rawBefore, _ := os.ReadFile(inProgress)
 	_, takeErr := svc.Take(TakeOptions{ID: "T2.9", Agent: "agent-y", Time: "2026-11-19T15:00:00Z"})
 	rawAfter, _ := os.ReadFile(inProgress)
-	check("take на in_progress даёт код 1 без изменений", taskstore.Code(takeErr) == 1 && string(rawBefore) == string(rawAfter))
+	check("take на in_progress даёт код 1 без изменений", Code(takeErr) == 1 && string(rawBefore) == string(rawAfter))
 
 	// Два take одной карточки: ровно один успех.
 	for i := 0; i < 20; i++ {
@@ -1071,7 +1070,7 @@ func SelfTest(w io.Writer) error {
 		for j := 0; j < 2; j++ {
 			go func(n int) {
 				_, err := svc.Take(TakeOptions{ID: id, Agent: fmt.Sprintf("agent-%d", n), Time: "2026-11-19T14:03:21Z"})
-				results <- taskstore.Code(err)
+				results <- Code(err)
 			}(j)
 		}
 		a, b := <-results, <-results
@@ -1083,12 +1082,12 @@ func SelfTest(w io.Writer) error {
 	check("гонка take: 20 повторов, ровно один успех", true)
 
 	// Остаток замка с мёртвым PID удаляется.
-	lockPath := taskstore.LockPath(stateDir, root)
+	lockPath := LockPath(stateDir, root)
 	dead := fmt.Sprintf("pid=99999999\nstarted=%s\nroot=%s\n", time.Now().UTC().Format(time.RFC3339), root)
 	if err := os.WriteFile(lockPath, []byte(dead), 0600); err != nil {
 		return err
 	}
-	lock, err := taskstore.AcquireLock(lockPath, root)
+	lock, err := AcquireLock(lockPath, root)
 	check("замок с мёртвым PID перехвачен", err == nil)
 	if err == nil {
 		_ = lock.Release()
@@ -1238,10 +1237,10 @@ func (s *Service) LoadWorkerHistory() (WorkerHistory, error) {
 func (s *Service) RecordWorkerOutcome(o WorkerOutcome) error {
 	worker := strings.TrimSpace(o.Worker)
 	if worker == "" {
-		return taskstore.Validationf("не задан воркер")
+		return Validationf("не задан воркер")
 	}
 	if o.DelayMS < 0 || o.Cost < 0 {
-		return taskstore.Validationf("задержка и стоимость не могут быть отрицательными")
+		return Validationf("задержка и стоимость не могут быть отрицательными")
 	}
 	repo := newWorkerHistoryRepo(s.Cfg)
 	unlock, err := repo.lock()
@@ -1461,7 +1460,7 @@ func (s *Service) HealingAttempts(taskID, check string) (int, error) {
 func (s *Service) DecideHealing(taskID string, f CheckFailure, now time.Time) (HealingDecision, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
-		return HealingDecision{}, taskstore.Validationf("не задана задача healing")
+		return HealingDecision{}, Validationf("не задана задача healing")
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -1590,7 +1589,7 @@ func globMatches(glob, file string) bool {
 	if g == "" || f == "" {
 		return false
 	}
-	if taskstore.PathsConflict(g, f) {
+	if PathsConflict(g, f) {
 		return true
 	}
 	ok, err := doublestar.Match(g, f)
@@ -1604,10 +1603,10 @@ func validateReservationGlobs(globs []string) ([]string, error) {
 		g := strings.ReplaceAll(strings.TrimSpace(raw), "\\", "/")
 		g = strings.TrimSuffix(g, "/")
 		if g == "" {
-			return nil, taskstore.Validationf("пустой glob аренды")
+			return nil, Validationf("пустой glob аренды")
 		}
 		if !doublestar.ValidatePattern(g) {
-			return nil, taskstore.Validationf("неверный glob аренды %q", raw)
+			return nil, Validationf("неверный glob аренды %q", raw)
 		}
 		if !seen[g] {
 			seen[g] = true
@@ -1615,7 +1614,7 @@ func validateReservationGlobs(globs []string) ([]string, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, taskstore.Validationf("не заданы glob-ы аренды")
+		return nil, Validationf("не заданы glob-ы аренды")
 	}
 	return out, nil
 }
@@ -1635,7 +1634,7 @@ func appendUnique(list []string, v string) []string {
 func (s *Service) ReserveFiles(agent string, globs []string, now time.Time) error {
 	agent = strings.TrimSpace(agent)
 	if agent == "" {
-		return taskstore.Validationf("не задан агент аренды")
+		return Validationf("не задан агент аренды")
 	}
 	normalized, err := validateReservationGlobs(globs)
 	if err != nil {
@@ -1674,7 +1673,7 @@ func (s *Service) ReserveFiles(agent string, globs []string, now time.Time) erro
 func (s *Service) ReleaseFiles(agent string, now time.Time) error {
 	agent = strings.TrimSpace(agent)
 	if agent == "" {
-		return taskstore.Validationf("не задан агент аренды")
+		return Validationf("не задан агент аренды")
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -1713,10 +1712,10 @@ func (s *Service) ReleaseFiles(agent string, now time.Time) error {
 func (s *Service) CheckCommit(agent string, files []string, bypass bool, now time.Time) (GuardDecision, error) {
 	agent = strings.TrimSpace(agent)
 	if agent == "" {
-		return GuardDecision{}, taskstore.Validationf("не задан агент коммита")
+		return GuardDecision{}, Validationf("не задан агент коммита")
 	}
 	if len(files) == 0 {
-		return GuardDecision{}, taskstore.Validationf("не заданы файлы коммита")
+		return GuardDecision{}, Validationf("не заданы файлы коммита")
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -1819,7 +1818,7 @@ func (s *Service) ReserveLeases(agent string, globs, worktrees []string, now tim
 	for _, worktree := range worktrees {
 		g := WorktreeGlob(worktree)
 		if g == "" {
-			return taskstore.Validationf("пустой путь ворктри аренды")
+			return Validationf("пустой путь ворктри аренды")
 		}
 		all = append(all, g)
 	}
@@ -1849,7 +1848,7 @@ type precheckState struct {
 func (s *Service) RecordPrecheckFailure(reason string, at time.Time) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
-		return taskstore.Validationf("не задана причина precheck")
+		return Validationf("не задана причина precheck")
 	}
 	if at.IsZero() {
 		at = time.Now().UTC()
@@ -1949,10 +1948,10 @@ func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (Ha
 	taskID = strings.TrimSpace(taskID)
 	step = strings.TrimSpace(step)
 	if taskID == "" {
-		return HandoffJournalEntry{}, taskstore.Validationf("не задана задача журнала handoff")
+		return HandoffJournalEntry{}, Validationf("не задана задача журнала handoff")
 	}
 	if step == "" {
-		return HandoffJournalEntry{}, taskstore.Validationf("не задан шаг журнала handoff")
+		return HandoffJournalEntry{}, Validationf("не задан шаг журнала handoff")
 	}
 	if at.IsZero() {
 		at = time.Now().UTC()
@@ -2079,7 +2078,7 @@ func normalizeFixChecks(checks []string) ([]string, error) {
 	for _, raw := range checks {
 		c := strings.TrimSpace(raw)
 		if c == "" {
-			return nil, taskstore.Validationf("пустая проверка fix-checks")
+			return nil, Validationf("пустая проверка fix-checks")
 		}
 		if !seen[c] {
 			seen[c] = true
@@ -2087,7 +2086,7 @@ func normalizeFixChecks(checks []string) ([]string, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, taskstore.Validationf("не заданы проверки fix-checks")
+		return nil, Validationf("не заданы проверки fix-checks")
 	}
 	sort.Strings(out)
 	return out, nil
@@ -2104,25 +2103,25 @@ func fixChecksKey(source, worktree, agent string, checks []string) string {
 func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) {
 	source := strings.TrimSpace(r.SourceTaskID)
 	if source == "" {
-		return FixChecksResult{}, taskstore.Validationf("не задана исходная задача fix-checks")
+		return FixChecksResult{}, Validationf("не задана исходная задача fix-checks")
 	}
 	agent := strings.TrimSpace(r.Agent)
 	if agent == "" {
-		return FixChecksResult{}, taskstore.Validationf("не задан агент fix-checks")
+		return FixChecksResult{}, Validationf("не задан агент fix-checks")
 	}
 	worktree := filepath.Clean(strings.TrimSpace(r.Worktree))
 	if worktree == "" || worktree == "." {
-		return FixChecksResult{}, taskstore.Validationf("не задан worktree fix-checks")
+		return FixChecksResult{}, Validationf("не задан worktree fix-checks")
 	}
 	info, err := os.Stat(worktree)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return FixChecksResult{}, taskstore.Validationf("worktree %s не существует", worktree)
+			return FixChecksResult{}, Validationf("worktree %s не существует", worktree)
 		}
-		return FixChecksResult{}, taskstore.Startupf("не прочитан worktree %s: %v", worktree, err)
+		return FixChecksResult{}, Startupf("не прочитан worktree %s: %v", worktree, err)
 	}
 	if !info.IsDir() {
-		return FixChecksResult{}, taskstore.Validationf("worktree %s не является каталогом", worktree)
+		return FixChecksResult{}, Validationf("worktree %s не является каталогом", worktree)
 	}
 	checks, err := normalizeFixChecks(r.Checks)
 	if err != nil {
@@ -2152,7 +2151,7 @@ func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) 
 	}
 	for _, t := range st.Tasks {
 		if t.Worktree == worktree && t.Status == FixChecksPending && t.Agent != agent {
-			return FixChecksResult{}, taskstore.Validationf(
+			return FixChecksResult{}, Validationf(
 				"в worktree %s уже работает агент %s по задаче %s; перезапуск агента запрещён",
 				worktree, t.Agent, t.ID)
 		}
@@ -2182,7 +2181,7 @@ func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) 
 func (s *Service) CompleteFixChecks(id string, now time.Time) (FixChecksTask, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return FixChecksTask{}, taskstore.Validationf("не задана задача fix-checks")
+		return FixChecksTask{}, Validationf("не задана задача fix-checks")
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -2210,14 +2209,14 @@ func (s *Service) CompleteFixChecks(id string, now time.Time) (FixChecksTask, er
 		}
 		return st.Tasks[i], nil
 	}
-	return FixChecksTask{}, taskstore.Validationf("задача fix-checks %s не найдена", id)
+	return FixChecksTask{}, Validationf("задача fix-checks %s не найдена", id)
 }
 
 // FixChecksTask читает одну задачу починки по ID.
 func (s *Service) FixChecksTask(id string) (FixChecksTask, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return FixChecksTask{}, taskstore.Validationf("не задана задача fix-checks")
+		return FixChecksTask{}, Validationf("не задана задача fix-checks")
 	}
 	st, err := newFixChecksRepo(s.Cfg).load()
 	if err != nil {
@@ -2228,7 +2227,7 @@ func (s *Service) FixChecksTask(id string) (FixChecksTask, error) {
 			return t, nil
 		}
 	}
-	return FixChecksTask{}, taskstore.Validationf("задача fix-checks %s не найдена", id)
+	return FixChecksTask{}, Validationf("задача fix-checks %s не найдена", id)
 }
 
 // FixChecksTasks возвращает все задачи починки в порядке постановки.
@@ -2245,7 +2244,7 @@ func (s *Service) FixChecksTasks() ([]FixChecksTask, error) {
 func (s *Service) FixChecksForWorktree(worktree string) ([]FixChecksTask, error) {
 	worktree = filepath.Clean(strings.TrimSpace(worktree))
 	if worktree == "" || worktree == "." {
-		return nil, taskstore.Validationf("не задан worktree fix-checks")
+		return nil, Validationf("не задан worktree fix-checks")
 	}
 	st, err := newFixChecksRepo(s.Cfg).load()
 	if err != nil {
@@ -2314,10 +2313,10 @@ type handoffConfirmationState struct {
 func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at time.Time) (HandoffConfirmation, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
-		return HandoffConfirmation{}, taskstore.Validationf("не задана задача подтверждения handoff")
+		return HandoffConfirmation{}, Validationf("не задана задача подтверждения handoff")
 	}
 	if !answer.valid() {
-		return HandoffConfirmation{}, taskstore.Validationf("неизвестный ответ подтверждения handoff %q", answer)
+		return HandoffConfirmation{}, Validationf("неизвестный ответ подтверждения handoff %q", answer)
 	}
 	if at.IsZero() {
 		at = time.Now().UTC()
@@ -2346,7 +2345,7 @@ func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at ti
 func (s *Service) HandoffStatus(taskID string) (HandoffStatus, error) {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" {
-		return HandoffStatus{}, taskstore.Validationf("не задана задача подтверждения handoff")
+		return HandoffStatus{}, Validationf("не задана задача подтверждения handoff")
 	}
 	st, err := newConfirmationRepo(s.Cfg).load()
 	if err != nil {
@@ -2372,10 +2371,10 @@ func (s *Service) HandoffStatus(taskID string) (HandoffStatus, error) {
 
 // CheckCommitLinkage разбирает текст коммита и проверяет связь с milestone.
 // Порты передаёт вызывающий, чтобы проверка не делала I/O.
-func (s *Service) CheckCommitLinkage(message string, ports taskstore.LinkagePorts) taskstore.LinkageVerdict {
-	l := taskstore.ParseLinkage(message)
-	if !taskstore.RequiresLinkage(l.Subject) {
-		return taskstore.LinkageEmpty
+func (s *Service) CheckCommitLinkage(message string, ports LinkagePorts) LinkageVerdict {
+	l := ParseLinkage(message)
+	if !RequiresLinkage(l.Subject) {
+		return LinkageEmpty
 	}
-	return taskstore.CheckLinkage(l, ports)
+	return CheckLinkage(l, ports)
 }

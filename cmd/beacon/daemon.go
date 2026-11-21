@@ -210,7 +210,7 @@ func daemonHeartbeat(hb sessionHeartbeater, sessionID string) error {
 // newDaemonSessionRegistry adapts the daemon's already-open store handle to
 // the session registry. It opens no second connection and owns no schema.
 func newDaemonSessionRegistry(db *store.DB) *session.SessionRegistry {
-	return session.NewSessionRegistry(db)
+	return session.NewSessionRegistry(newSessionDBAdapter(db))
 }
 
 // ensureDaemonSession records the daemon's own session in the durable registry
@@ -529,7 +529,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 		},
 		// The single reconciler owns terminal-state refreshes now.
 		CloseMerged: func(context.Context) error { return nil },
-		Waker: orchestrator.NewDaemonWakerWithRoute(func(id string) (orchestrator.DaemonWatch, error) {
+		Waker: orchestrator.NewDaemonWakerWithBackend(func(id string) (orchestrator.DaemonWatch, error) {
 			w, err := db.Watch(id)
 			if err != nil {
 				return orchestrator.DaemonWatch{}, err
@@ -547,7 +547,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			}
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
-		}, daemonWakeRouteWithGate(wake.PromptTargetDeliverer(&wake.T202API{}), dbClaimSource{db: db})),
+		}, daemonWakeRouteWithGate(wake.PromptTargetDeliverer(&wake.T202API{}), dbClaimSource{db: db}), newDaemonWakeBackend(), wake.SharedDeliveryDedup()),
 	}, db.Close, nil
 }
 

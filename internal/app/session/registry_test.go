@@ -5,18 +5,16 @@ import (
 	"reflect"
 	"testing"
 	"time"
-
-	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // fakeSessionStore records every port call. It never touches a database, so a
 // test can assert which lifecycle method the registry used.
 type fakeSessionStore struct {
-	saved   []store.Session
+	saved   []Session
 	looked  []string
 	touched []touchCall
 
-	want     store.Session
+	want     Session
 	found    bool
 	getErr   error
 	saveErr  error
@@ -28,12 +26,12 @@ type touchCall struct {
 	at time.Time
 }
 
-func (f *fakeSessionStore) SaveSession(s store.Session) error {
+func (f *fakeSessionStore) SaveSession(s Session) error {
 	f.saved = append(f.saved, s)
 	return f.saveErr
 }
 
-func (f *fakeSessionStore) GetSession(id string) (store.Session, bool, error) {
+func (f *fakeSessionStore) GetSession(id string) (Session, bool, error) {
 	f.looked = append(f.looked, id)
 	return f.want, f.found, f.getErr
 }
@@ -64,7 +62,7 @@ func TestRegistryStartSavesSession(t *testing.T) {
 		t.Fatalf("SaveSession calls = %d, want 1", len(f.saved))
 	}
 	got := f.saved[0]
-	if got.ID != "sess-1" || got.Status != store.SessionStatusActive {
+	if got.ID != "sess-1" || got.Status != SessionStatusActive {
 		t.Errorf("saved identity = %+v", got)
 	}
 	if !got.CreatedAt.Equal(now) || !got.LastSeen.Equal(now) {
@@ -94,7 +92,7 @@ func TestRegistryStartRejectsEmptyID(t *testing.T) {
 }
 
 func TestRegistryResumeLoadsSession(t *testing.T) {
-	want := store.Session{ID: "sess-2", Status: store.SessionStatusIdle}
+	want := Session{ID: "sess-2", Status: SessionStatusIdle}
 	f := &fakeSessionStore{want: want, found: true}
 
 	got, found, err := NewSessionRegistry(f).Resume(" sess-2 ")
