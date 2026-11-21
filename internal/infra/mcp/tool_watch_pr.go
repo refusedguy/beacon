@@ -273,16 +273,25 @@ func watchPRMergePolicy(in *WatchPRPolicy) domain.MergePolicy {
 	return policy
 }
 
+// WatchPRRegistrar records one executor registration and its Watch binding in
+// the project registry. The SQLite store implements this port, so this layer
+// passes only neutral values and imports no sibling infra package (ADR 0005).
+// The repo slug is the project key stored on both registry rows.
+type WatchPRRegistrar interface {
+	RegisterWatchExecutor(projectKey, watchID, subscriberID, role, runtime, adapter, target, configID string, revision uint64) error
+}
+
 // WatchPRHandler implements beacon_watch_pr over the domain ports. One handler
 // owns a Fanout, which serializes the check-then-act sequence inside one
 // process; cross-process exclusion remains the daemon's job (ADR 0021).
 type WatchPRHandler struct {
-	store    domain.Store
-	ci       domain.CIProvider
-	clock    domain.Clock
-	fanout   *domain.Fanout
-	bridges  []Bridge
-	blockers BlockerControl
+	store     domain.Store
+	ci        domain.CIProvider
+	clock     domain.Clock
+	fanout    *domain.Fanout
+	bridges   []Bridge
+	blockers  BlockerControl
+	registrar WatchPRRegistrar
 
 	// projectRoot and defaultsLoader carry the layered config into a Watch.
 	// The composition root sets the root; tests replace the loader to run
@@ -328,6 +337,14 @@ func (h *WatchPRHandler) SetBlockerControl(b BlockerControl) {
 	}
 }
 
+// SetRegistry installs the optional executor registrar. A nil argument keeps
+// the older behaviour of writing only the Watch, which is how unit tests run.
+func (h *WatchPRHandler) SetRegistry(r WatchPRRegistrar) {
+	if h != nil {
+		h.registrar = r
+	}
+}
+
 // WithBridges injects the bridges that a watch_pr registration is broadcast
 // to. It returns the receiver so callers can chain it after NewWatchPRHandler.
 // Adding another agent means passing another Bridge here; the core needs no
@@ -356,8 +373,9 @@ func (h *WatchPRHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest
 // change, then upserts the Watch and subscriber through domain.Fanout.
 //
 // An optional in.Executor descriptor is accepted as opaque caller data. The
-// core never interprets its agent name and never uses the descriptor to change
-// subscriber identity, routing or the persisted Watch (T5.31, ADR 0088).
+// core never interprets its agent name and never uses it to change subscriber
+// identity or routing. Its configId is the one descriptor field copied onto the
+// Watch and into the registry binding (T5.31, ADR 0087, ADR 0088).
 //
 // An optional in.OrchestratorID is likewise opaque: it is stored on the Watch
 // and on the registering Subscriber for a later rebind, but it never selects a
@@ -414,6 +432,10 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		return WatchPROutput{}, err
 	}
 
+	configID := ""
+	if in.Executor != nil {
+		configID = in.Executor.ConfigID
+	}
 	w := domain.Watch{
 		Repo:           in.Repo,
 		PR:             in.PR,
@@ -426,6 +448,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		OrchestratorID: in.OrchestratorID,
 		FixFor:         in.FixFor,
 		FixBlockerID:   blockerID,
+		ConfigID:       configID,
 		CreatedAt:      now,
 	}
 	flaky := in.Flaky
@@ -495,6 +518,10 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		updated.FixBlockerID = blockerID
 		changed = true
 	}
+	if configID != "" && updated.ConfigID != configID {
+		updated.ConfigID = configID
+		changed = true
+	}
 	for i := range updated.Subscribers {
 		if updated.Subscribers[i].ID != subscriberID {
 			continue
@@ -520,6 +547,20 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 		}
 		sub.Watch = updated
+	}
+
+	// The registry row is part of registration: registry sync must see the
+	// executor and its Watch binding as soon as watch_pr returns. Calls made
+	// before the descriptor existed write no registry row.
+	if in.Executor != nil && h.registrar != nil {
+		err := h.registrar.RegisterWatchExecutor(
+			w.Repo, sub.Watch.ID, subscriberID, string(in.Role), in.Executor.Runtime,
+			adapter, target, configID, sub.Watch.Revision,
+		)
+		if err != nil {
+			observe.ActorError("watch_pr-registry", sub.Watch.ID, err)
+			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		}
 	}
 
 	// Binding a fixer to its incident and spending one fix attempt happens
@@ -767,6 +808,9 @@ func AttachWatchPRWithConfig(server *mcpsdk.Server, deps Dependencies, projectRo
 	}
 	handler := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
 	handler.SetBlockerControl(deps.Blockers)
+	if registrar, ok := deps.Store.(WatchPRRegistrar); ok {
+		handler.SetRegistry(registrar)
+	}
 	handler.SetProjectRoot(projectRoot)
 	AttachWatchPR(server, handler)
 }

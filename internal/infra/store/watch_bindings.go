@@ -274,6 +274,34 @@ func (d *DB) WriteWatchBinding(e WatchBindingEntry) (WatchBindingWrite, error) {
 	return out, nil
 }
 
+// RegisterWatchExecutor records the executor and Watch binding produced by one
+// watch_pr call (ADR 0088). It adapts the neutral values passed by the MCP
+// boundary to the registry rows and calls RegisterExecutor, which commits both
+// rows in one transaction. A repeat with the same Watch revision writes no new
+// row. The repo slug is the project key, so a registration is visible to the
+// registry reads of the same project.
+func (d *DB) RegisterWatchExecutor(projectKey, watchID, subscriberID, role, runtime, adapter, target, configID string, revision uint64) error {
+	_, err := d.RegisterExecutor(ExecutorRecord{
+		ProjectKey:    projectKey,
+		AgentID:       subscriberID,
+		Role:          role,
+		Runtime:       runtime,
+		SessionID:     subscriberID,
+		NotifyAdapter: adapter,
+		NotifyTarget:  target,
+		ConfigID:      configID,
+		Status:        RegistryStatusActive,
+	}, WatchBinding{
+		WatchID:      watchID,
+		Revision:     revision,
+		ProjectKey:   projectKey,
+		AgentID:      subscriberID,
+		ConfigID:     configID,
+		FencingToken: "0",
+	})
+	return err
+}
+
 // LatestWatchBinding returns the binding with the highest stored revision for
 // a watch. It is the row a wake should address; older revisions are kept for
 // audit but never selected.

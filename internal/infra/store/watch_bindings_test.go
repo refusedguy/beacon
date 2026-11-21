@@ -40,6 +40,51 @@ func watchBindingRowCount(t *testing.T, d *DB, watchID string) int {
 	return n
 }
 
+// TestRegisterWatchExecutorWritesBinding proves the watch_pr store adapter
+// writes the executor row and its Watch binding with the configId. A repeat of
+// the same registration leaves one binding row.
+func TestRegisterWatchExecutorWritesBinding(t *testing.T) {
+	d := newWatchBindingTestDB(t)
+	const (
+		projectKey = "project-a"
+		watchID    = "watch-61"
+		sessionID  = "ses_61"
+		configID   = "cfg-61"
+	)
+	for i := 0; i < 2; i++ {
+		if err := d.RegisterWatchExecutor(projectKey, watchID, sessionID,
+			"executor", "subagent", "opencode", sessionID, configID, 3); err != nil {
+			t.Fatalf("RegisterWatchExecutor(%d): %v", i, err)
+		}
+	}
+
+	binding, found, err := d.WatchBinding(watchID, 3)
+	if err != nil {
+		t.Fatalf("WatchBinding: %v", err)
+	}
+	if !found {
+		t.Fatal("watch binding was not written")
+	}
+	if binding.ProjectKey != projectKey || binding.AgentID != sessionID || binding.ConfigID != configID {
+		t.Errorf("binding = %+v, want project %s, agent %s, config %s",
+			binding, projectKey, sessionID, configID)
+	}
+	if got := watchBindingRowCount(t, d, watchID); got != 1 {
+		t.Errorf("binding rows = %d, want 1", got)
+	}
+
+	executor, found, err := d.Executor(projectKey, sessionID)
+	if err != nil {
+		t.Fatalf("Executor: %v", err)
+	}
+	if !found {
+		t.Fatal("executor row was not written")
+	}
+	if executor.ConfigID != configID || executor.SessionID != sessionID {
+		t.Errorf("executor = %+v, want config %s and session %s", executor, configID, sessionID)
+	}
+}
+
 func TestWriteWatchBindingCreatesDistinctRows(t *testing.T) {
 	d := newWatchBindingTestDB(t)
 

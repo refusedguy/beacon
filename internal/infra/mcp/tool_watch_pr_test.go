@@ -230,6 +230,112 @@ func TestWatchPRExecutorIsOptional(t *testing.T) {
 	assertCode(t, err, domain.CodeInvalidInput)
 }
 
+// recordingRegistrar captures the registry row written by a registration.
+type recordingRegistrar struct {
+	calls        int
+	projectKey   string
+	watchID      string
+	subscriberID string
+	role         string
+	runtime      string
+	adapter      string
+	target       string
+	configID     string
+	revision     uint64
+}
+
+func (r *recordingRegistrar) RegisterWatchExecutor(projectKey, watchID, subscriberID, role, runtime, adapter, target, configID string, revision uint64) error {
+	r.calls++
+	r.projectKey, r.watchID, r.subscriberID = projectKey, watchID, subscriberID
+	r.role, r.runtime, r.adapter, r.target = role, runtime, adapter, target
+	r.configID, r.revision = configID, revision
+	return nil
+}
+
+// TestWatchPRCarriesExecutorConfigID proves the descriptor's configId reaches
+// the stored Watch on creation and on a renewal with a new configuration.
+func TestWatchPRCarriesExecutorConfigID(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	req := sessionReq("ses_config-1")
+
+	created := watchPRTestInput("config-create-sha", domain.RoleExecutor)
+	created.Executor = &WatchPRExecutor{ConfigID: "cfg-created"}
+	first, err := h.Register(context.Background(), req, created)
+	if err != nil {
+		t.Fatalf("Register with configId: %v", err)
+	}
+	w, err := store.Watch(first.WatchID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if w.ConfigID != "cfg-created" {
+		t.Errorf("stored configId = %q, want cfg-created", w.ConfigID)
+	}
+
+	// A renewal on the same head keeps the Watch and applies the new configId.
+	renewed := watchPRTestInput("config-create-sha", domain.RoleExecutor)
+	renewed.Executor = &WatchPRExecutor{ConfigID: "cfg-renewed"}
+	second, err := h.Register(context.Background(), req, renewed)
+	if err != nil {
+		t.Fatalf("renew with configId: %v", err)
+	}
+	if second.WatchID != first.WatchID {
+		t.Fatalf("renew changed watchID: %q -> %q", first.WatchID, second.WatchID)
+	}
+	w, err = store.Watch(second.WatchID)
+	if err != nil {
+		t.Fatalf("Watch after renew: %v", err)
+	}
+	if w.ConfigID != "cfg-renewed" {
+		t.Errorf("renewed configId = %q, want cfg-renewed", w.ConfigID)
+	}
+}
+
+// TestWatchPRWritesRegistryBinding proves a registration with an executor
+// descriptor records the executor, Watch revision and configId. A call made
+// as before the descriptor existed writes no registry row.
+func TestWatchPRWritesRegistryBinding(t *testing.T) {
+	store := newMemStore()
+	h := NewWatchPRHandler(store, nil, &stepClock{t: time.Now()})
+	reg := &recordingRegistrar{}
+	h.SetRegistry(reg)
+
+	in := watchPRTestInput("binding-sha", domain.RoleExecutor)
+	in.Executor = &WatchPRExecutor{
+		ID: "ses_exec-1", Role: "executor", Runtime: "subagent", ConfigID: "cfg-61",
+	}
+	out, err := h.Register(context.Background(), sessionReq("ses_binding-1"), in)
+	if err != nil {
+		t.Fatalf("Register with executor: %v", err)
+	}
+	if reg.calls != 1 {
+		t.Fatalf("registrar calls = %d, want 1", reg.calls)
+	}
+	if reg.watchID != out.WatchID || reg.revision != out.Revision {
+		t.Errorf("binding targets %q rev %d, want %q rev %d",
+			reg.watchID, reg.revision, out.WatchID, out.Revision)
+	}
+	if reg.subscriberID != "ses_binding-1" || reg.configID != "cfg-61" {
+		t.Errorf("binding identity = %q/%q, want ses_binding-1/cfg-61",
+			reg.subscriberID, reg.configID)
+	}
+	if reg.projectKey != in.Repo || reg.role != string(domain.RoleExecutor) || reg.runtime != "subagent" {
+		t.Errorf("binding descriptor = %q/%q/%q", reg.projectKey, reg.role, reg.runtime)
+	}
+	if reg.adapter != "opencode" || reg.target != "ses_delivery-target" {
+		t.Errorf("binding notify = %q/%q", reg.adapter, reg.target)
+	}
+
+	legacy := watchPRTestInput("binding-sha-2", domain.RoleExecutor)
+	if _, err := h.Register(context.Background(), sessionReq("ses_binding-1"), legacy); err != nil {
+		t.Fatalf("Register without executor: %v", err)
+	}
+	if reg.calls != 1 {
+		t.Errorf("legacy call wrote %d registry rows, want 0 more", reg.calls-1)
+	}
+}
+
 // TestWatchPRExecutorAgentNameIsOpaque proves the core does not interpret the
 // descriptor's agent name: changing only that field leaves the Watch and its
 // subscriber identity untouched (T5.31 acceptance, ADR 0088).
