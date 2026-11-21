@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"text/tabwriter"
 )
 
@@ -37,9 +38,9 @@ var catalog = []command{
 	{Name: "gc-worktree", Summary: "Очистить устаревшие worktree", Usage: "beacon gc-worktree [--format table|json] [--apply]"},
 	{Name: "index", Summary: "Пересобрать SQLite-индекс карточек", Usage: "beacon index build [--root <dir>]"},
 	{Name: "init", Summary: "Подготовить проект: хуки, шаблоны и проверка MCP", Usage: "beacon init [--root <dir>] [--force]"},
-	{Name: "inspect", Summary: "Показать состояние вотч, блокеров и привязки оркестратора", Usage: "beacon inspect [<pr|watchID>] [--json]"},
+	{Name: "inspect", Summary: "Показать состояние вотч, блокеров и привязки оркестратора", Usage: "beacon inspect [<pr|watchID>] [--format table|json] [--json]"},
 	{Name: "list", Summary: "Показать каталог команд", Usage: "beacon list [--format table|json]"},
-	{Name: "logs", Summary: "Прочитать структурированные логи проекта", Usage: "beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--json]"},
+	{Name: "logs", Summary: "Прочитать структурированные логи проекта", Usage: "beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--format table|json] [--json]"},
 	{Name: "mcp", Summary: "Запустить MCP-сервер на stdio", Usage: "beacon mcp"},
 	{Name: "reset", Summary: "Очистить состояние control plane проекта", Usage: "beacon reset --yes"},
 	{Name: "task", Summary: "Работа с карточками задач", Usage: "beacon task <list|new|take> [flags]"},
@@ -75,6 +76,31 @@ func parseFlags(name string, args []string, errOut io.Writer, fs *flag.FlagSet) 
 		return false
 	}
 	return true
+}
+
+// commandFormats is the single enumeration of --format values per command.
+// Validation and the format tests read this map, so a command cannot advertise
+// values that the parser rejects.
+var commandFormats = map[string][]string{
+	"inspect": {"table", "json"},
+	"logs":    {"table", "json"},
+	"metrics": {"json", "prometheus"},
+}
+
+// parseCommandFormat validates a --format value against the values allowed for
+// the command. --json is a caller-side alias for json, never a separate format.
+func parseCommandFormat(name, format string, errOut io.Writer, showUsage bool) bool {
+	allowed := commandFormats[name]
+	for _, value := range allowed {
+		if format == value {
+			return true
+		}
+	}
+	fmt.Fprintf(errOut, "beacon %s: неизвестный формат %q, ожидается %s\n", name, format, strings.Join(allowed, " или "))
+	if showUsage {
+		writeUsage(errOut)
+	}
+	return false
 }
 
 func runList(args []string, out, errOut io.Writer) int {
