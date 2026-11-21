@@ -331,3 +331,54 @@ func TestACPAgentRegistryCopiesReturns(t *testing.T) {
 		t.Fatalf("List aliased stored capabilities: %v", got)
 	}
 }
+
+// TestACPAgentRegistryRejectedReRegisterKeepsOldState is a regression case: a
+// re-registration with an empty capability must not drop the old address or
+// capability entries before Upsert rejects the declaration.
+func TestACPAgentRegistryRejectedReRegisterKeepsOldState(t *testing.T) {
+	reg := NewACPAgentRegistry()
+	if err := reg.Register(ACPAgent{Name: "bot", Capabilities: []string{"watch"}, Address: "addr-1"}); err != nil {
+		t.Fatalf("first Register: %v", err)
+	}
+	bad := ACPAgent{Name: "bot", Capabilities: []string{"watch", ""}, Address: "addr-2"}
+	if err := reg.Register(bad); err == nil {
+		t.Fatal("Register accepted an empty capability")
+	}
+
+	if got := reg.FindByCapability("watch"); len(got) != 1 || got[0].Name != "bot" || got[0].Address != "addr-1" {
+		t.Fatalf("FindByCapability(watch) = %v, want [bot@addr-1]", got)
+	}
+	if agent, ok := reg.FindByAddress("addr-1"); !ok || agent.Name != "bot" {
+		t.Fatalf("FindByAddress(addr-1) = %v, %v, want bot", agent, ok)
+	}
+	if _, ok := reg.FindByAddress("addr-2"); ok {
+		t.Fatal("rejected registration claimed the new address")
+	}
+	if got := reg.List(); len(got) != 1 || got[0].Address != "addr-1" {
+		t.Fatalf("List = %v, want one bot@addr-1", got)
+	}
+}
+
+// TestACPAgentRegistryFailedTakeoverKeepsOldOwner is a regression case: a bad
+// declaration from an intruder must not remove the current owner of the
+// address from any of the three views.
+func TestACPAgentRegistryFailedTakeoverKeepsOldOwner(t *testing.T) {
+	reg := NewACPAgentRegistry()
+	if err := reg.Register(ACPAgent{Name: "owner", Capabilities: []string{"watch"}, Address: "shared"}); err != nil {
+		t.Fatalf("Register(owner): %v", err)
+	}
+	bad := ACPAgent{Name: "intruder", Capabilities: []string{"watch", ""}, Address: "shared"}
+	if err := reg.Register(bad); err == nil {
+		t.Fatal("Register accepted an empty capability")
+	}
+
+	if agent, ok := reg.FindByAddress("shared"); !ok || agent.Name != "owner" {
+		t.Fatalf("address owner = %v, %v, want owner", agent, ok)
+	}
+	if got := reg.FindByCapability("watch"); len(got) != 1 || got[0].Name != "owner" {
+		t.Fatalf("FindByCapability(watch) = %v, want [owner]", got)
+	}
+	if got := reg.List(); len(got) != 1 || got[0].Name != "owner" {
+		t.Fatalf("List = %v, want [owner]", got)
+	}
+}
