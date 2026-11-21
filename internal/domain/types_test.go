@@ -29,18 +29,11 @@ type testCI struct{}
 
 func (testCI) PRState(context.Context, string, int) (PRState, error) { return PRState{}, nil }
 
-type testNotifier struct{}
-
-func (testNotifier) Notify(context.Context, Obligation, Pointer) (AttemptOutcome, error) {
-	return OutcomePosted, nil
-}
-
 var (
 	_ Clock           = testClock{}
 	_ WatchStore      = testStore{}
 	_ ObligationStore = testStore{}
 	_ CIProvider      = testCI{}
-	_ Notifier        = testNotifier{}
 	_ error           = (*AppError)(nil)
 )
 
@@ -172,11 +165,6 @@ func TestTypes(t *testing.T) {
 		var c Clock = testClock{}
 		if !c.Now().IsZero() {
 			t.Fatal("Clock.Now must return the test value")
-		}
-		var n Notifier = testNotifier{}
-		outcome, err := n.Notify(context.Background(), Obligation{}, Pointer{})
-		if err != nil || outcome != OutcomePosted {
-			t.Fatalf("Notifier.Notify: outcome=%q err=%v", outcome, err)
 		}
 	})
 }

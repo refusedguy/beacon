@@ -289,7 +289,6 @@ type WatchPRHandler struct {
 	ci        domain.CIProvider
 	clock     domain.Clock
 	fanout    *domain.Fanout
-	bridges   []Bridge
 	blockers  BlockerControl
 	registrar WatchPRRegistrar
 
@@ -343,18 +342,6 @@ func (h *WatchPRHandler) SetRegistry(r WatchPRRegistrar) {
 	if h != nil {
 		h.registrar = r
 	}
-}
-
-// WithBridges injects the bridges that a watch_pr registration is broadcast
-// to. It returns the receiver so callers can chain it after NewWatchPRHandler.
-// Adding another agent means passing another Bridge here; the core needs no
-// change (ADR 0024).
-func (h *WatchPRHandler) WithBridges(bridges ...Bridge) *WatchPRHandler {
-	if h == nil {
-		return nil
-	}
-	h.bridges = append([]Bridge(nil), bridges...)
-	return h
 }
 
 // Handle adapts Register to the go-sdk typed tool handler signature. Domain
@@ -585,13 +572,6 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		"subscriberID": subscriberID, "orchestratorID": in.OrchestratorID, "fixFor": in.FixFor,
 	})
 
-	// One watch_pr call reaches every injected bridge through the same
-	// six-operation port. Each bridge decides whether the work applies to its
-	// agent; the core never names an agent (ADR 0024). Dispatch is best effort:
-	// the persisted Watch is the source of truth and per-agent delivery
-	// reliability belongs to the bridge.
-	h.startBridges(ctx, sub.Watch, s)
-
 	return WatchPROutput{
 		WatchID:     sub.Watch.ID,
 		Revision:    sub.Watch.Revision,
@@ -751,26 +731,6 @@ func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, no
 	return carried, nil
 }
 
-// startBridges broadcasts the Start operation to every injected bridge. The
-// request carries neutral identifiers only, so the same call drives two
-// different agents without a core edit (ADR 0024). Errors are intentionally
-// not propagated: registration has already succeeded in the domain store.
-func (h *WatchPRHandler) startBridges(ctx context.Context, w domain.Watch, s domain.Subscriber) {
-	req := BridgeRequest{
-		WatchID:      w.ID,
-		Repo:         w.Repo,
-		PR:           w.PR,
-		HeadSHA:      w.HeadSHA,
-		SubscriberID: s.ID,
-	}
-	for _, bridge := range h.bridges {
-		if bridge == nil {
-			continue
-		}
-		_, _ = bridge.Start(ctx, req)
-	}
-}
-
 func (h *WatchPRHandler) now() time.Time {
 	if h.clock == nil {
 		return time.Now()
@@ -801,7 +761,7 @@ func AttachWatchPR(server *mcpsdk.Server, handler *WatchPRHandler) {
 // project's layered config. The composition root calls it after
 // NewServerWithDeps so a registration uses this project's flaky set and limits
 // instead of the built-in values. Re-registering the tool is safe: the
-// NewServerWithDeps instance has no bridges or extra wiring to preserve.
+// NewServerWithDeps instance has no extra wiring to preserve.
 func AttachWatchPRWithConfig(server *mcpsdk.Server, deps Dependencies, projectRoot string) {
 	if server == nil {
 		return

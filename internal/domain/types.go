@@ -519,11 +519,6 @@ type OrchestratorBindingStore interface {
 	BoundOrchestrator(projectKey string) (OrchestratorBinding, bool, error)
 }
 
-// Notifier delivers a wake pointer to a subscriber.
-type Notifier interface {
-	Notify(ctx context.Context, o Obligation, p Pointer) (AttemptOutcome, error)
-}
-
 // ErrorCode is one of the contract v2 error codes.
 type ErrorCode string
 
