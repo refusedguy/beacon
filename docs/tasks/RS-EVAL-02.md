@@ -1,5 +1,5 @@
 # RS-EVAL-02. pass^5 для стохастических eval и карантин с сроком
-Статус: in_review
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: evals/main.go, evals/README.md
