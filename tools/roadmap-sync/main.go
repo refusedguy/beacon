@@ -562,7 +562,7 @@ func readCardsWithCommits(repo string, scan gitScan, records []commitRecord, fil
 				c.merged, c.implPR = implementationMerged(id, c.ownerKey, records)
 			}
 		}
-		c.trusted = c.status == statusDone || c.implPR != ""
+		c.trusted = c.status == statusDone || c.merged
 		c.resolved = resolveStatus(c.status, c.merged)
 		cards = append(cards, c)
 	}
