@@ -40,26 +40,8 @@ func ensureEventLog(ctx context.Context, db *sql.DB) error {
 
 // eventLogColumns returns the column names of the events table as seen through
 // db. Used at initialization to make the schema change repeatable.
-func eventLogColumns(ctx context.Context, db *sql.DB) (map[string]struct{}, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(events)`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	cols := make(map[string]struct{})
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, typ string
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
-			return nil, err
-		}
-		cols[name] = struct{}{}
-	}
-	return cols, rows.Err()
+func eventLogColumns(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	return tableColumns(db, "events")
 }
 
 // LogEvent is one committed row of the scoped event log. Seq is assigned by

@@ -61,11 +61,6 @@ INSERT OR IGNORE INTO watch_bindings
 VALUES (?, ?, ?, ?, ?, ?, ?)`
 )
 
-// maxBindingSQLiteInt64 is the largest revision or token that fits a SQLite
-// INTEGER. The check keeps a uint64 from wrapping negative on its way to the
-// driver.
-const maxBindingSQLiteInt64 = int64(^uint64(0) >> 1)
-
 // WatchBindingEntry is one stored watch-to-executor binding. Revision is
 // uint64 in the domain and INTEGER in SQLite; the conversion is guarded.
 // FencingToken defaults to Revision when the caller leaves it at zero.
@@ -98,8 +93,8 @@ func validateWatchBindingEntry(e WatchBindingEntry) error {
 	if strings.TrimSpace(e.AgentID) == "" {
 		return domain.NewAppError(domain.CodeInvalidInput, "store: binding: empty agent id")
 	}
-	if e.Revision > uint64(maxBindingSQLiteInt64) {
-		return domain.NewAppError(domain.CodeInvalidInput, "store: binding: revision out of range")
+	if err := validateRevision(e.Revision); err != nil {
+		return err
 	}
 	if e.FencingToken < 0 {
 		return domain.NewAppError(domain.CodeInvalidInput, "store: binding: negative fencing token")
@@ -122,26 +117,11 @@ type columnQuerier interface {
 // hasWatchBindingColumn detects the schema variant in use. The migration
 // (T5.21) has subscriber_id; an older registry-created table does not.
 func hasWatchBindingColumn(q columnQuerier, name string) (bool, error) {
-	rows, err := q.Query(`PRAGMA table_info(watch_bindings)`)
+	cols, err := tableColumns(q, "watch_bindings")
 	if err != nil {
 		return false, fmt.Errorf("store: binding: table info: %w", err)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, pk int
-		var column, columnType string
-		var defaultValue sql.NullString
-		if err := rows.Scan(&cid, &column, &columnType, &notNull, &defaultValue, &pk); err != nil {
-			return false, fmt.Errorf("store: binding: scan table info: %w", err)
-		}
-		if strings.EqualFold(column, name) {
-			return true, rows.Err()
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return false, err
-	}
-	return false, nil
+	return cols[strings.ToLower(name)], nil
 }
 
 // storedWatchBindings is the current state of one watch, read inside the write
