@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"sort"
@@ -629,10 +630,40 @@ func newEnvFailureExcerptSource() FailureExcerptSource {
 	if base == "" {
 		base = "https://api.github.com"
 	}
+	if !allowedExcerptBase(base) {
+		return nil
+	}
 	return &envFailureExcerptSource{
 		token:  token,
 		base:   strings.TrimRight(base, "/"),
 		client: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+// allowedExcerptBase reports whether base is a host we may send the GitHub
+// token to. Only the public API over HTTPS and loopback for hermetic tests pass.
+// A base that fails this check never becomes a source, so no request carries
+// the token to an arbitrary host. Rejecting userinfo also rules out the
+// "https://api.github.com@evil.example" form of host confusion.
+func allowedExcerptBase(base string) bool {
+	u, err := url.Parse(base)
+	return err == nil && allowedExcerptURL(u)
+}
+
+// allowedExcerptURL is the URL form of allowedExcerptBase. getJSON calls it on
+// the outgoing request so a directly constructed source cannot attach the Bearer
+// token to a host that failed the check.
+func allowedExcerptURL(u *url.URL) bool {
+	if u == nil || u.Host == "" || u.User != nil {
+		return false
+	}
+	switch strings.ToLower(u.Hostname()) {
+	case "api.github.com":
+		return u.Scheme == "https"
+	case "localhost", "127.0.0.1", "::1":
+		return u.Scheme == "http" || u.Scheme == "https"
+	default:
+		return false
 	}
 }
 
@@ -652,6 +683,27 @@ type githubAnnotation struct {
 	Level     string `json:"annotation_level"`
 }
 
+// excerptCheckRunsURL builds the check-runs endpoint. owner, name and headSHA
+// come from the Watch, so PathEscape keeps separators such as ".." inside one
+// path segment instead of letting the caller rewrite the request path. The
+// query uses url.Values so its encoding does not depend on string formatting.
+func excerptCheckRunsURL(base, owner, name, headSHA string) string {
+	q := url.Values{}
+	q.Set("per_page", "100")
+	return fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?%s",
+		base, url.PathEscape(owner), url.PathEscape(name), url.PathEscape(headSHA), q.Encode())
+}
+
+// excerptAnnotationsURL builds the annotations endpoint with the same path
+// escaping as excerptCheckRunsURL. The run ID is numeric, so it needs no
+// escaping; the query still goes through url.Values for one encoding path.
+func excerptAnnotationsURL(base, owner, name string, id int64) string {
+	q := url.Values{}
+	q.Set("per_page", strconv.Itoa(failureExcerptAnnotationCount))
+	return fmt.Sprintf("%s/repos/%s/%s/check-runs/%d/annotations?%s",
+		base, url.PathEscape(owner), url.PathEscape(name), id, q.Encode())
+}
+
 // FailureExcerpt finds the failed CheckRun by name on the Watch's head SHA and
 // reads its annotations through REST. The two endpoints are the REST half of
 // W11-B; a GraphQL checkRun.annotations(first:N) source can be injected instead
@@ -664,7 +716,7 @@ func (s *envFailureExcerptSource) FailureExcerpt(ctx context.Context, repo, head
 	if !ok || owner == "" || name == "" {
 		return "", nil
 	}
-	path := fmt.Sprintf("%s/repos/%s/%s/commits/%s/check-runs?per_page=100", s.base, owner, name, headSHA)
+	path := excerptCheckRunsURL(s.base, owner, name, headSHA)
 	var body struct {
 		CheckRuns []githubCheckRun `json:"check_runs"`
 	}
@@ -682,8 +734,7 @@ func (s *envFailureExcerptSource) FailureExcerpt(ctx context.Context, repo, head
 	if id == 0 {
 		return "", nil
 	}
-	annotationsPath := fmt.Sprintf("%s/repos/%s/%s/check-runs/%d/annotations?per_page=%d",
-		s.base, owner, name, id, failureExcerptAnnotationCount)
+	annotationsPath := excerptAnnotationsURL(s.base, owner, name, id)
 	var annotations []githubAnnotation
 	if err := s.getJSON(ctx, annotationsPath, &annotations); err != nil {
 		return "", err
@@ -691,8 +742,12 @@ func (s *envFailureExcerptSource) FailureExcerpt(ctx context.Context, repo, head
 	return formatAnnotations(annotations), nil
 }
 
-func (s *envFailureExcerptSource) getJSON(ctx context.Context, url string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (s *envFailureExcerptSource) getJSON(ctx context.Context, rawURL string, out any) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || !allowedExcerptURL(u) {
+		return errors.New("github excerpt: disallowed request host")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
