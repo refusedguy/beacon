@@ -80,11 +80,21 @@ type card struct {
 	ownerKey        string
 	duplicateOf     string
 	duplicateSubset bool
+	implPR          string
+	trusted         bool
+}
+
+// commitRecord holds a subject and the paths that commit changed. The path
+// list is what separates an implementation from a docs-only recheck.
+type commitRecord struct {
+	subject string
+	files   []string
 }
 
 type gitScan struct {
 	commits int
 	ids     map[string]bool
+	implPRs map[string]string
 }
 
 type options struct {
@@ -108,14 +118,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	subjects, err := readGitLog(opts.repo, opts.gitLog)
+	records, err := readCommitRecords(opts.repo, opts.gitLog)
 	if err != nil {
 		fmt.Fprintf(stderr, "roadmap-sync: git log: %v\n", err)
 		return 1
 	}
+	subjects := make([]string, 0, len(records))
+	for _, rec := range records {
+		subjects = append(subjects, rec.subject)
+	}
 	scan := scanGitLog(subjects)
 
-	cards, err := readCards(opts.repo, scan.ids)
+	cards, err := readCardsWithCommits(opts.repo, scan, records, opts.gitLog == "")
 	if err != nil {
 		fmt.Fprintf(stderr, "roadmap-sync: cards: %v\n", err)
 		return 1
@@ -167,11 +181,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// readGitLog returns one commit subject per line. The optional file keeps
-// tests and offline runs independent of a git checkout.
-func readGitLog(repo, logFile string) ([]string, error) {
+// commitRecordMarker separates commits in git log output. Git passes the
+// format as a process argument, so the marker is plain ASCII: a NUL byte would
+// terminate the argument early.
+const commitRecordMarker = "@@ROADMAP-COMMIT@@"
+
+// readCommitRecords returns one record per commit. A log file or stdin holds
+// plain subjects and has no path list; in that mode callers fall back to the
+// subject-only signal so fixtures and offline runs keep working.
+func readCommitRecords(repo, logFile string) ([]commitRecord, error) {
 	var data []byte
 	var err error
+	fromGit := false
 	switch {
 	case logFile == "-":
 		data, err = io.ReadAll(os.Stdin)
@@ -179,23 +200,46 @@ func readGitLog(repo, logFile string) ([]string, error) {
 		data, err = readFile(logFile)
 	default:
 		data, err = gitLogFromProcess(repo)
+		fromGit = true
 	}
 	if err != nil {
 		return nil, err
 	}
-	var subjects []string
-	scanner := bufio.NewScanner(bytes.NewReader(data))
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		subjects = append(subjects, scanner.Text())
+	if !fromGit {
+		var records []commitRecord
+		scanner := bufio.NewScanner(bytes.NewReader(data))
+		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			records = append(records, commitRecord{subject: scanner.Text()})
+		}
+		return records, scanner.Err()
 	}
-	return subjects, scanner.Err()
+	return parseCommitRecords(data), nil
 }
 
-// gitLogFromProcess runs git -C <repo> log --format=%s. Starting the process
-// through os instead of os/exec keeps this tool clear of CAP-EXEC-IN-OUTSIDE.
-// That gate has no exception for a new tools/ file, and its exception table is
-// outside this tool's OwnerFiles.
+// parseCommitRecords splits "marker<subject>\n<path>\n..." output into records.
+func parseCommitRecords(data []byte) []commitRecord {
+	var records []commitRecord
+	for _, chunk := range bytes.Split(data, []byte(commitRecordMarker)) {
+		lines := strings.Split(strings.TrimSpace(string(chunk)), "\n")
+		if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+			continue
+		}
+		rec := commitRecord{subject: strings.TrimSpace(lines[0])}
+		for _, line := range lines[1:] {
+			if path := strings.TrimSpace(line); path != "" {
+				rec.files = append(rec.files, path)
+			}
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
+// gitLogFromProcess runs git -C <repo> log with each subject and the paths it
+// changed. Starting the process through os instead of os/exec keeps this tool
+// clear of CAP-EXEC-IN-OUTSIDE. That gate has no exception for a new tools/
+// file, and its exception table is outside this tool's OwnerFiles.
 func gitLogFromProcess(repo string) ([]byte, error) {
 	git, err := findGit()
 	if err != nil {
@@ -206,7 +250,8 @@ func gitLogFromProcess(repo string) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	proc, err := os.StartProcess(git, []string{git, "-C", repo, "log", "--format=%s"}, &os.ProcAttr{
+	args := []string{git, "-C", repo, "log", "--format=" + commitRecordMarker + "%s", "--name-only"}
+	proc, err := os.StartProcess(git, args, &os.ProcAttr{
 		Dir:   repo,
 		Files: []*os.File{os.Stdin, w, os.Stderr},
 	})
@@ -243,19 +288,99 @@ func findGit() (string, error) {
 	return "", errors.New("git not found in PATH")
 }
 
-// scanGitLog collects card IDs only from commits that carry a PR suffix.
+// recheckMarkers are the phrases used by premise refresh commits. A subject
+// carrying one of them, or starting with docs(, never proves implementation.
+var recheckMarkers = []string{
+	"premise rechecked",
+	"baseline refreshed",
+	"keep todo",
+	"refresh",
+}
+
+// isRecheckSubject reports whether a commit subject is a docs-only premise
+// check rather than an implementation. The docs( prefix covers scoped doc
+// commits; the phrases cover rechecks that dropped the prefix.
+func isRecheckSubject(subject string) bool {
+	lower := strings.ToLower(strings.TrimSpace(subject))
+	if strings.HasPrefix(lower, "docs(") {
+		return true
+	}
+	for _, marker := range recheckMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// prNumber returns the PR number from a subject, or an empty string.
+func prNumber(subject string) string {
+	match := prSuffixRe.FindStringSubmatch(subject)
+	if match == nil {
+		return ""
+	}
+	return match[1]
+}
+
+// scanGitLog collects card IDs only from commits that carry a PR suffix and
+// are not docs-only rechecks. The path check needs card OwnerFiles, so it runs
+// later in implementationMerged.
 func scanGitLog(subjects []string) gitScan {
-	scan := gitScan{ids: map[string]bool{}}
+	scan := gitScan{ids: map[string]bool{}, implPRs: map[string]string{}}
 	for _, subject := range subjects {
-		if !prSuffixRe.MatchString(subject) {
+		pr := prNumber(subject)
+		if pr == "" || isRecheckSubject(subject) {
 			continue
 		}
 		scan.commits++
 		for _, id := range cardIDRe.FindAllString(subject, -1) {
 			scan.ids[id] = true
+			if scan.implPRs[id] == "" {
+				scan.implPRs[id] = "#" + pr
+			}
 		}
 	}
 	return scan
+}
+
+// cleanPath normalizes an OwnerFiles or git path for comparison.
+func cleanPath(path string) string {
+	path = filepath.ToSlash(strings.TrimSpace(path))
+	path = strings.TrimPrefix(path, "./")
+	return path
+}
+
+// implementationMerged applies the four conditions from the docs health audit:
+// a PR-suffixed subject naming the card, a non-recheck subject, and a changed
+// OwnerFiles path outside docs/. It returns the PR number of the first match.
+func implementationMerged(id, ownerKey string, records []commitRecord) (bool, string) {
+	owners := ownerFileSet(ownerKey)
+	var wanted []string
+	for path := range owners {
+		clean := cleanPath(path)
+		if clean != "" && !strings.HasPrefix(clean, "docs/") {
+			wanted = append(wanted, clean)
+		}
+	}
+	if len(wanted) == 0 {
+		return false, ""
+	}
+	idRe := regexp.MustCompile(`\b(` + regexp.QuoteMeta(id) + `)\b`)
+	for _, rec := range records {
+		pr := prNumber(rec.subject)
+		if pr == "" || isRecheckSubject(rec.subject) || !idRe.MatchString(rec.subject) {
+			continue
+		}
+		for _, file := range rec.files {
+			clean := cleanPath(file)
+			for _, path := range wanted {
+				if clean == path {
+					return true, "#" + pr
+				}
+			}
+		}
+	}
+	return false, ""
 }
 
 // resolveStatus orders the signals dropped, then done, then todo. An existing
@@ -346,7 +471,9 @@ type doneOwner struct {
 func resolveDuplicateCards(cards []card) {
 	var done []doneOwner
 	for _, c := range cards {
-		if c.resolved == statusDone && c.ownerKey != "" {
+		// Only a trusted done card may seed the duplicate pass. A recheck
+		// commit that shares OwnerFiles must not promote a todo neighbor.
+		if c.resolved == statusDone && c.trusted && c.ownerKey != "" {
 			done = append(done, doneOwner{id: c.id, key: c.ownerKey, files: ownerFileSet(c.ownerKey)})
 		}
 	}
@@ -380,7 +507,16 @@ func resolveDuplicateCards(cards []card) {
 	}
 }
 
+// readCards keeps the subject-only entry point used by offline fixtures.
 func readCards(repo string, mergedIDs map[string]bool) ([]card, error) {
+	scan := gitScan{ids: mergedIDs}
+	return readCardsWithCommits(repo, scan, nil, false)
+}
+
+// readCardsWithCommits resolves a card's merged flag from an explicit Impl-PR
+// or from the four implementation conditions. A log file has no path list, so
+// it falls back to the subject-only signal and keeps fixtures working.
+func readCardsWithCommits(repo string, scan gitScan, records []commitRecord, filesAvailable bool) ([]card, error) {
 	paths, err := filepath.Glob(filepath.Join(repo, "docs", "tasks", "*.md"))
 	if err != nil {
 		return nil, err
@@ -401,17 +537,32 @@ func readCards(repo string, mergedIDs map[string]bool) ([]card, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
+		content := string(data)
 		c := card{
 			id:       id,
 			path:     path,
-			status:   fieldValue(string(data), "Статус"),
-			priority: fieldValue(string(data), "Фаза"),
-			ownerKey: normalizeOwnerFiles(fieldValue(string(data), "Владелец файлов")),
+			status:   fieldValue(content, "Статус"),
+			priority: fieldValue(content, "Фаза"),
+			ownerKey: normalizeOwnerFiles(fieldValue(content, "Владелец файлов")),
+			implPR:   strings.TrimSpace(fieldValue(content, "Impl-PR")),
 		}
 		if c.status != statusDropped && c.status != statusDone {
 			c.status = statusTodo
 		}
-		c.merged = mergedIDs[id]
+		if c.implPR != "" && !strings.HasPrefix(c.implPR, "#") {
+			c.implPR = "#" + c.implPR
+		}
+		if c.implPR != "" {
+			c.merged = true
+		} else if scan.ids[id] {
+			if !filesAvailable {
+				c.merged = true
+				c.implPR = scan.implPRs[id]
+			} else {
+				c.merged, c.implPR = implementationMerged(id, c.ownerKey, records)
+			}
+		}
+		c.trusted = c.status == statusDone || c.implPR != ""
 		c.resolved = resolveStatus(c.status, c.merged)
 		cards = append(cards, c)
 	}
@@ -469,6 +620,9 @@ func applyStatuses(repo string, cards []card, write bool) ([]string, error) {
 			return changes, fmt.Errorf("%s: %w", c.path, err)
 		}
 		updated := replaceStatus(string(data), c.resolved)
+		if c.resolved == statusDone && c.implPR != "" {
+			updated = upsertImplPR(updated, c.implPR)
+		}
 		if err := writeFile(c.path, []byte(updated), 0o644); err != nil {
 			return changes, fmt.Errorf("%s: %w", c.path, err)
 		}
@@ -485,6 +639,29 @@ func replaceStatus(content, status string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// upsertImplPR writes the implementation PR next to the status line. A card
+// that already carries the field keeps its existing value, so a later recheck
+// cannot overwrite the marker of the real implementation.
+func upsertImplPR(content, pr string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "Impl-PR:") {
+			if strings.TrimSpace(strings.TrimPrefix(line, "Impl-PR:")) == "" {
+				lines[i] = "Impl-PR: " + pr
+			}
+			return strings.Join(lines, "\n")
+		}
+	}
+	for i, line := range lines {
+		if strings.HasPrefix(line, "Статус:") {
+			rest := append([]string{"Impl-PR: " + pr}, lines[i+1:]...)
+			lines = append(lines[:i+1], rest...)
+			return strings.Join(lines, "\n")
+		}
+	}
+	return content
 }
 
 func roadmapPath(repo string) string {
