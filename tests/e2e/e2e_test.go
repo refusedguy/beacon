@@ -55,7 +55,7 @@ var (
 	expectedSet = []string{
 		"beacon_watch_pr", "beacon_wait_result", "beacon_get_result",
 		"beacon_list_running", "beacon_ack", "beacon_cancel_watch", "beacon_stats",
-		"beacon_defer_wiring", "beacon_task_claim", beaconmcp.WakeToolName,
+		"beacon_defer_wiring", "beacon_task_claim", "beacon_task_close", beaconmcp.WakeToolName,
 	}
 )
 
