@@ -12,9 +12,9 @@ Pi RPC wake доставляет указатель через выбранны�
 
 CI запускает `go test ./cmd/beacon -run 'TestPiRPCProbe|TestDeliverPiRPC|TestDeliverPi'`. Тесты подключают моковый `wake.PiProbe` и моковый `wake.PiRPCConnection` через слот `resolvePiProbe` в `cmd/beacon/deliver.go`. Реальный процесс не создаётся.
 
-- Успешный RPC: конфиг `BEACON_DELIVER_ADAPTER=pi` вызывает `followUp` по умолчанию и даёт `delivery=queue outcome=queue attempts=1`. Режим `BEACON_DELIVER_PI_MODE=steer` вызывает `steer` и даёт `delivery=steer outcome=steer`.
-- Ошибка провайдера: `rpc failed` даёт `outcome=indeterminate delivery=unsupported` и один вызов без ретраев.
-- Таймаут: `BEACON_DELIVER_PI_TIMEOUT=1ms` и `context.DeadlineExceeded` дают `outcome=transport-failed`, три попытки по ADR 0017 и `delivery=unsupported`.
+- Успешный RPC: конфиг `BEACON_DELIVER_ADAPTER=pi` вызывает `followUp` по умолчанию и даёт в stdout `delivery=queue attempts=1`. Режим `BEACON_DELIVER_PI_MODE=steer` вызывает `steer` и даёт `delivery=steer attempts=1`.
+- Ошибка провайдера: `rpc failed` даёт в stdout `delivery=unsupported`, в stderr `outcome=indeterminate` и один вызов без ретраев.
+- Таймаут: `BEACON_DELIVER_PI_TIMEOUT=1ms` и `context.DeadlineExceeded` дают в stderr `outcome=transport-failed`, в stdout три попытки по ADR 0017 и `delivery=unsupported`.
 - Фолбэк: пустой или чужой адаптер, битый конфиг или отсутствие провайдера оставляют текущий `deliveryTarget`. Незаданный target по-прежнему даёт честный unsupported.
 
 Проверка провайдера на моковом соединении сверяет имена методов `followUp` и `get_state`, sessionID и текст указателя. Это показывает, что RPC-вызовы идут через внедрённый transport, а не через созданный процесс.

@@ -563,8 +563,11 @@ func TestDeliverPiRPCSuccess(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit = %d, stderr = %q, want 0", code, errOut)
 			}
-			if !strings.Contains(out, "delivery="+tc.delivery) || !strings.Contains(out, "outcome="+tc.delivery) {
-				t.Fatalf("stdout = %q, want %s delivery and outcome", out, tc.delivery)
+			if !strings.Contains(out, "delivery="+tc.delivery) {
+				t.Fatalf("stdout = %q, want delivery=%s", out, tc.delivery)
+			}
+			if errOut != "" {
+				t.Fatalf("stderr = %q, want no error for a delivered %s", errOut, tc.delivery)
 			}
 			if len(probe.methods) != 1 || probe.methods[0] != tc.method {
 				t.Fatalf("methods = %v, want one %s call", probe.methods, tc.method)
@@ -589,14 +592,14 @@ func TestDeliverPiRPCErrorIsNotDelivery(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("a failed rpc exited 0, stdout = %q", out)
 	}
-	if !strings.Contains(out, "outcome=indeterminate") || !strings.Contains(out, "delivery=unsupported") {
-		t.Fatalf("stdout = %q, want indeterminate outcome and unsupported delivery", out)
+	if !strings.Contains(out, "delivery=unsupported") {
+		t.Fatalf("stdout = %q, want unsupported delivery", out)
 	}
 	if len(probe.methods) != 1 {
 		t.Fatalf("methods = %v, want one call without retries", probe.methods)
 	}
-	if errOut == "" {
-		t.Fatal("a failed rpc must explain the reason on stderr")
+	if !strings.Contains(errOut, "outcome=indeterminate") {
+		t.Fatalf("stderr = %q, want outcome=indeterminate", errOut)
 	}
 }
 
@@ -609,10 +612,8 @@ func TestDeliverPiRPCTimeoutRetriesThenUnsupported(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("a timed out rpc exited 0, stdout = %q", out)
 	}
-	if !strings.Contains(out, "outcome=transport-failed") ||
-		!strings.Contains(out, "attempts=3") ||
-		!strings.Contains(out, "delivery=unsupported") {
-		t.Fatalf("stdout = %q, want transport-failed, three attempts and unsupported", out)
+	if !strings.Contains(out, "attempts=3") || !strings.Contains(out, "delivery=unsupported") {
+		t.Fatalf("stdout = %q, want three attempts and unsupported delivery", out)
 	}
 	if len(probe.methods) != deliverMaxAttempts {
 		t.Fatalf("methods = %v, want %d attempts", probe.methods, deliverMaxAttempts)
@@ -620,8 +621,8 @@ func TestDeliverPiRPCTimeoutRetriesThenUnsupported(t *testing.T) {
 	if !probe.deadlines[0] {
 		t.Fatal("the pi probe did not receive the configured timeout")
 	}
-	if errOut == "" {
-		t.Fatal("a timed out rpc must explain the reason on stderr")
+	if !strings.Contains(errOut, "outcome=transport-failed") {
+		t.Fatalf("stderr = %q, want outcome=transport-failed", errOut)
 	}
 }
 
