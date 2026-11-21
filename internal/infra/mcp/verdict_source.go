@@ -21,8 +21,9 @@ const verdictSubBuffer = 32
 
 // DBVerdictSource is the production VerdictSource. One instance polls the live
 // watches at a fixed interval and fans every change out to the subscriptions
-// of the affected watchID. Subscribe and Close are safe from any goroutine,
-// and Close never blocks another subscriber.
+// of the affected watchID. With no registered subscriber the loop skips the
+// store read, so an idle server does not hammer LiveWatches. Subscribe and
+// Close are safe from any goroutine, and Close never blocks another subscriber.
 type DBVerdictSource struct {
 	watches  verdictWatchLister
 	interval time.Duration
@@ -50,7 +51,9 @@ var _ VerdictSource = (*DBVerdictSource)(nil)
 
 // NewDBVerdictSource starts one poller over watches. A non-positive interval
 // disables the background loop; callers that use that mode drive pollOnce
-// directly. Stop always releases the loop, so tests can wait for its exit.
+// directly. The background loop reads the store only while at least one
+// subscriber is registered. Stop always releases the loop, so tests can wait
+// for its exit.
 func NewDBVerdictSource(watches verdictWatchLister, interval time.Duration) *DBVerdictSource {
 	s := &DBVerdictSource{
 		watches:  watches,
@@ -76,6 +79,15 @@ func (s *DBVerdictSource) Stop() {
 	<-s.done
 }
 
+// hasSubscribers reports whether any wait_result caller is still listening.
+// The map belongs to the source mutex, so the check is race-free with
+// Subscribe and Close.
+func (s *DBVerdictSource) hasSubscribers() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.subs) > 0
+}
+
 func (s *DBVerdictSource) loop() {
 	defer close(s.done)
 	ticker := time.NewTicker(s.interval)
@@ -85,7 +97,11 @@ func (s *DBVerdictSource) loop() {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			s.pollOnce()
+			// An idle server has nothing to publish. Skipping the read keeps
+			// LiveWatches off the ticker's hot path until a waiter arrives.
+			if s.hasSubscribers() {
+				s.pollOnce()
+			}
 		}
 	}
 }
