@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -46,11 +47,42 @@ func backfillRuntime(role domain.Role) string {
 	return backfillRuntimeSubagent
 }
 
+// registryColumns caches the agent_registry column set for one write
+// transaction. ensureRegistryTables probes four columns in the same
+// transaction, so PRAGMA table_info runs once per write instead of once per
+// probe (BCX-33). A *sql.DB querier is never cached: its callers verify schema
+// changes and must see the live table.
+var (
+	registryColumnsMu   sync.Mutex
+	registryColumnsTx   *sql.Tx
+	registryColumnsData map[string]bool
+)
+
+func registryColumns(q columnQuerier) (map[string]bool, error) {
+	tx, inTx := q.(*sql.Tx)
+	if !inTx {
+		return tableColumns(q, "agent_registry")
+	}
+	registryColumnsMu.Lock()
+	defer registryColumnsMu.Unlock()
+	if registryColumnsTx == tx && registryColumnsData != nil {
+		return registryColumnsData, nil
+	}
+	cols, err := tableColumns(q, "agent_registry")
+	if err != nil {
+		return nil, err
+	}
+	registryColumnsTx = tx
+	registryColumnsData = cols
+	return cols, nil
+}
+
 // registryHasColumn reports whether the live agent_registry schema owns the
 // named column. EnsureRegistrySchema adds the columns read paths use, so a
-// caller can check a table that an older build created (ARDH-02).
+// caller can check a table that an older build created (ARDH-02). Inside one
+// write transaction the column set is read once and reused by every probe.
 func registryHasColumn(q columnQuerier, name string) (bool, error) {
-	cols, err := tableColumns(q, "agent_registry")
+	cols, err := registryColumns(q)
 	if err != nil {
 		return false, fmt.Errorf("store: backfill: table info: %w", err)
 	}
