@@ -2,6 +2,7 @@ package capabilities
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/refusedguy/beacon/tools/beacon-gates/gate"
 )
@@ -50,7 +51,8 @@ func selfTestRun() int {
 	analyseNoExceptions := func(root string) ([]gate.Finding, error) {
 		return analyse(root, gate.Exceptions{})
 	}
-	if !gate.RunFixtures(list, analyseNoExceptions, gate.RemoveFixture) {
+	cleanup := func(root string) { _ = os.RemoveAll(root) }
+	if !gate.RunFixtures(list, analyseNoExceptions, cleanup) {
 		fmt.Println("self-test FAILED: 3 fixtures")
 		return gate.Red
 	}
