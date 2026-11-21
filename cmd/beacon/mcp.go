@@ -211,9 +211,12 @@ func mcpDaemonInterval() time.Duration {
 }
 
 // defaultVerdictPollInterval is the cadence of the single DB-backed verdict
-// poller that feeds beacon_wait_result. It is far shorter than the reconciler's
-// 10s/30s cycle so a waiter sees a verdict shortly after the bridge writes it.
-const defaultVerdictPollInterval = 750 * time.Millisecond
+// poller that feeds beacon_wait_result. It matches the reconciler's quiet 30s
+// cycle: a verdict written by the bridge becomes visible on the next tick, and
+// the poller does not re-read every live Watch several times per second. The
+// source also skips the read entirely while no wait_result subscriber is
+// registered, so an idle MCP server does no polling work at all.
+const defaultVerdictPollInterval = 30 * time.Second
 
 // verdictPollIntervalEnv overrides the poller cadence at the CLI boundary, the
 // same way BEACON_DAEMON_INTERVAL overrides the daemon cycle. A broken value
