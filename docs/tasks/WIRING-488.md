@@ -5,7 +5,7 @@ baseline: 2026-11-21 `git rev-parse --short origin/main` = c716b61 (база в�
 Фаза: P5
 Тип: task
 Владелец файлов: internal/app/session/, cmd/beacon/
-OwnerFiles: internal/app/session/, cmd/beacon/
+OwnerFiles: см. поле «Владелец файлов»
 Зависимости: PR 488
 Ссылка: PR 488
 SourceWatch: watch:refusedguy/beacon:488:ded0892c8e3e57f0d7c47184e0df9f2c3b5562e1
@@ -14,29 +14,13 @@ PR: 488
 Время: нет
 Цель: Подключить store сессий к коду, который создаёт и обновляет сессии.
 Контекст: PR 488 добавляет таблицу sessions и методы SaveSession, GetSession, ListSessions, Touch. Ни один вызывающий код пока не вызывает эти методы. Файлы приложения и команд принадлежат другим агентам этой волны, поэтому PR 488 меняет только store и тесты.
-Шаги: Создать карточку, подключить часть фичи, закрыть долг.
-Проверка: Приложение вызывает SaveSession при старте сессии, GetSession при возобновлении и Touch как heartbeat. Соответствующий CI зелёный.
-Приёмка: Проводка подключена, карточка лежит в PR.
+Шаги: Дождаться мержа PR 488; подключить вызовы store сессий в файлах из поля «Владелец файлов»; зарегистрировать или обновить запись `beacon deferred` для SourceWatch из заголовка карточки.
+Проверка: Приложение вызывает SaveSession при старте сессии, GetSession при возобновлении и Touch как heartbeat; список файлов совпадает с полем «Владелец файлов»; карточка `docs/tasks/WIRING-488.md` лежит в PR 488; локальный гейт `WIRING-*` проходит: статус `todo`, OwnerFiles заполнен, `## Причина` есть; CI зелёный.
+Приёмка: Проводка применена, CI зелёный.
 
 ## Причина
 
 Вызывающий код живёт в internal/app/session/* и cmd/*, которые не входят в OwnerFiles исполнителя BS.66. Вызов `beacon_defer_wiring` вернул `PERSIST_FAILED: defer_wiring: store port is nil`, поэтому запись в `beacon deferred` не создана. Карточка добавлена в PR вручную, чтобы работа не потерялась.
-
-## Шаги
-
-1. Дождаться мержа PR 488.
-2. Подключить вызовы store сессий в файлах из OwnerFiles.
-3. Зарегистрировать или обновить запись `beacon deferred` для SourceWatch из заголовка карточки.
-
-## Проверка
-
-- Список OwnerFiles совпадает с полем «Владелец файлов».
-- Карточка `docs/tasks/WIRING-488.md` лежит в PR 488.
-- Локальный гейт `WIRING-*` проходит: статус `todo`, OwnerFiles заполнен, `## Причина` есть.
-
-## Приёмка
-
-Проводка применена, CI зелёный.
 
 ## Подтверждение
 - Premise перепроверен 2026-11-21 по свежему origin/main (c716b61; база ветки fix/ai5 была 11ce87e). Дубль подтверждён влитыми PR [#531](https://github.com/refusedguy/beacon/pull/531), [#545](https://github.com/refusedguy/beacon/pull/545) и [#552](https://github.com/refusedguy/beacon/pull/552): app-порт SessionStore подключён к старту сессии, к resume и к heartbeat демона. `gh pr view` отдаёт state MERGED для всех трёх, merge commit'ы 67e0401, cd89697 и 832fee5 лежат в origin/main. Код не писал, gofmt не применял, чужие файлы, wiring и .beacon/ не трогал, правка только текстовая. Статус изменён с todo на done, карточку закрывают PR #531, #545 и #552.

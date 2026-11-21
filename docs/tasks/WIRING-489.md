@@ -5,7 +5,7 @@ baseline: замер 2026-11-21 на 5932a6298790173c593235dc8c6b6283447f0c7a, �
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/taskstore/reminders.go, internal/infra/taskstore/reminders_test.go, internal/app/orchestrator/reminders_loop.go, internal/app/orchestrator/reminders_loop_test.go, internal/app/tasks/reminders.go, cmd/beacon/daemon.go, cmd/beacon/reminders_test.go, docs/tasks/WIRING-489.md
-OwnerFiles: internal/infra/taskstore/reminders.go, internal/infra/taskstore/reminders_test.go, internal/app/orchestrator/reminders_loop.go, internal/app/orchestrator/reminders_loop_test.go, internal/app/tasks/reminders.go, cmd/beacon/daemon.go, cmd/beacon/reminders_test.go, docs/tasks/WIRING-489.md
+OwnerFiles: см. поле «Владелец файлов»
 Зависимости: PR 489
 Ссылка: PR 489
 SourceWatch: watch:refusedguy/beacon:489:d106ad77ea40d197a1f380839e5462777728ce81
