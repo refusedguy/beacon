@@ -30,17 +30,19 @@ func main() {
 	dryRun := flag.Bool("dry-run", false, "печатать файлы без записи")
 	check := flag.Bool("check", false, "только проверить JSON и напечатать краткую сводку")
 	mergePlan := flag.Bool("merge-plan", false, "слить PR из merge_decisions после проверки CI")
+	confirmMerge := flag.Bool("confirm-merge", false, "подтвердить слияние PR из merge_decisions")
 	quiet := flag.Bool("quiet", false, "не печатать каждый созданный файл")
 	commit := flag.Bool("commit", false, "git add и commit созданных docs")
 	facts := flag.Bool("facts", false, "печатать индекс чисел и их владельцев")
 	flag.Parse()
 	os.Exit(batchapply.Run(batchapply.Options{
-		Dir:       *dir,
-		DryRun:    *dryRun,
-		Check:     *check,
-		MergePlan: *mergePlan,
-		Quiet:     *quiet,
-		Commit:    *commit,
-		Facts:     *facts,
+		Dir:          *dir,
+		DryRun:       *dryRun,
+		Check:        *check,
+		MergePlan:    *mergePlan,
+		ConfirmMerge: *confirmMerge,
+		Quiet:        *quiet,
+		Commit:       *commit,
+		Facts:        *facts,
 	}, os.Stdout, os.Stderr))
 }
