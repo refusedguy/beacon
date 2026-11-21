@@ -131,6 +131,11 @@ type GetResultOutput struct {
 	// server without an excerpt source, omits it and keeps the stable schema
 	// (W11-B).
 	FailureExcerpt string `json:"failureExcerpt,omitempty"`
+
+	// ConfigID is the Watch's configuration identity from ADR 0087 (T5.36).
+	// It is optional and emitted last, so a Watch without one keeps the exact
+	// previous bytes and field order.
+	ConfigID string `json:"configId,omitempty"`
 }
 
 // TaskDialect is the application-level response form a client can consume.
