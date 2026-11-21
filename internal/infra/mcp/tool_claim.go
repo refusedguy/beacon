@@ -571,25 +571,18 @@ func AttachClaim(server *mcpsdk.Server, handler *ClaimHandler) {
 	if server == nil || handler == nil {
 		return
 	}
-	no := false
 	server.RemoveTools(ClaimToolName, ReleaseToolName)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ClaimToolName,
 		Description: "Claim one task so exactly one owner holds it. A retry with the same idempotencyKey returns the same claim and the same fencingToken; a second owner is rejected until the first calls beacon_release. Present fencingToken and sourceEpoch to beacon_release so a reassigned task or a lease invalidated after a crash cannot be changed by a stale owner; after recovery take a new lease first.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, handler.Handle)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ReleaseToolName,
 		Description: "Explicitly release a task claim. Only the current owner can release; a fencingToken that is stale because the task was reassigned is refused, and a lease whose sourceEpoch was restored after a crash is refused even with a current token. Another owner may claim the task afterwards.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
+		Annotations: attachToolAnnotations(false),
 	}, handler.HandleRelease)
 }
 
@@ -994,43 +987,30 @@ func AttachWorktreeLease(server *mcpsdk.Server, handler *WorktreeLeaseHandler) {
 	if server == nil || handler == nil {
 		return
 	}
-	no := false
 	server.RemoveTools(LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName, HeartbeatWorktreeToolName)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        LeaseWorktreeToolName,
 		Description: "Lease a whole worktree to one owner for a TTL in seconds. The lease returns a fencing token and an expiry. A second owner is refused until the TTL ends or the owner releases it.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
+		Annotations: attachToolAnnotations(false),
 	}, handler.HandleAcquire)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        WriteWorktreeToolName,
 		Description: "Record a result written into a leased worktree. The lease must still be live and the fencing token must be the one the worktree holds. A stale token from an expired or replaced lease is refused.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
+		Annotations: attachToolAnnotations(false),
 	}, handler.HandleWrite)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        HeartbeatWorktreeToolName,
 		Description: "Beat a worktree lease to learn whether it is still held. The result carries a single alive flag: true while the owner and fencing token still match a live lease, false once the lease expired, was released, or was taken by a new owner. Stop on the first false beat and do not write the result again. A beat is read-only and does not extend the TTL; the fencing token is still checked when writing.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  true,
-		},
+		Annotations: attachToolAnnotations(true),
 	}, handler.HandleHeartbeat)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ReleaseWorktreeToolName,
 		Description: "Explicitly release a live worktree lease before its TTL ends. Only the owner holding the current fencing token can release it.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
+		Annotations: attachToolAnnotations(false),
 	}, handler.HandleRelease)
 }
 
@@ -1324,15 +1304,11 @@ func AttachHolderLease(server *mcpsdk.Server, handler *HolderLeaseHandler) {
 	if server == nil || handler == nil {
 		return
 	}
-	no := false
 	server.RemoveTools(ExtendHolderLeaseToolName)
 
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        ExtendHolderLeaseToolName,
 		Description: "Extend a holder lease on an agent or worktree. The caller must be one of the lease holders. A short request never shortens the deadline already granted: the lease keeps the later of its current expiry and now plus ttlSeconds. The holder list is unchanged by an extension.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
+		Annotations: attachToolAnnotations(false),
 	}, handler.HandleExtend)
 }
