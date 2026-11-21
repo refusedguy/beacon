@@ -9,7 +9,9 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,6 +70,14 @@ type ScheduleStore interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// enabledSetter is an optional store capability that flips Enabled and returns
+// the row in one locked operation. Stores that implement it let Pause and
+// Resume stay atomic even when several services share the store. The service
+// uses a Get/Update pair under its own mutex for stores without the capability.
+type enabledSetter interface {
+	SetEnabled(ctx context.Context, id string, enabled bool) (Schedule, error)
+}
+
 var (
 	// ErrScheduleNotFound means no schedule carries the requested ID.
 	ErrScheduleNotFound = errors.New("server: schedule not found")
@@ -95,6 +106,7 @@ func invalid(format string, a ...any) error {
 // store, so a paused schedule is preserved but never dispatched.
 type ScheduleService struct {
 	store ScheduleStore
+	mu    sync.Mutex
 }
 
 // NewScheduleService builds a service over store. A nil store is refused, so a
@@ -149,6 +161,11 @@ func (s *ScheduleService) setEnabled(ctx context.Context, id string, enabled boo
 	if id == "" {
 		return Schedule{}, invalid("server: пустой id расписания")
 	}
+	if setter, ok := s.store.(enabledSetter); ok {
+		return setter.SetEnabled(ctx, id, enabled)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	current, err := s.store.Get(ctx, id)
 	if err != nil {
 		return Schedule{}, err
@@ -170,8 +187,26 @@ func (s *ScheduleService) Delete(ctx context.Context, id string) error {
 	return s.store.Delete(ctx, id)
 }
 
+// scheduleIDSeq keeps generated IDs distinct inside one process even when the
+// clock is fixed or many goroutines create schedules at the same instant.
+var scheduleIDSeq atomic.Uint64
+
+// newScheduleID combines a timestamp, random bytes and a process-local counter.
+// The counter alone wins any same-nanosecond race inside the process; the
+// random part separates IDs from other processes.
+func newScheduleID() string {
+	seq := scheduleIDSeq.Add(1)
+	stamp := time.Now().UnixNano()
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sched-%d-%d", stamp, seq)
+	}
+	return fmt.Sprintf("sched-%d-%s-%d", stamp, hex.EncodeToString(b[:]), seq)
+}
+
 // buildSchedule validates the create input and fills defaults. Validation is a
-// pure function of the input: no clock, file, or socket is read.
+// pure function of the input for caller fields; only the generated ID reads a
+// clock, a counter and random bytes.
 func buildSchedule(in ScheduleCreate) (Schedule, error) {
 	in.ID = strings.TrimSpace(in.ID)
 	in.TaskID = strings.TrimSpace(in.TaskID)
@@ -181,7 +216,7 @@ func buildSchedule(in ScheduleCreate) (Schedule, error) {
 		return Schedule{}, invalid("server: пустой taskID расписания")
 	}
 	if in.ID == "" {
-		in.ID = fmt.Sprintf("sched-%d", time.Now().UnixNano())
+		in.ID = newScheduleID()
 	}
 	if in.Timezone == "" {
 		in.Timezone = "Local"
@@ -255,6 +290,20 @@ func (m *MemoryScheduleStore) Get(_ context.Context, id string) (Schedule, error
 	if !ok {
 		return Schedule{}, fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
 	}
+	return s, nil
+}
+
+// SetEnabled flips Enabled under the store lock, so a concurrent Pause and
+// Resume cannot read the same row and write it back over each other.
+func (m *MemoryScheduleStore) SetEnabled(_ context.Context, id string, enabled bool) (Schedule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.items[id]
+	if !ok {
+		return Schedule{}, fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
+	}
+	s.Enabled = enabled
+	m.items[id] = s
 	return s, nil
 }
 
@@ -348,6 +397,22 @@ func (s *FileScheduleStore) Get(_ context.Context, id string) (Schedule, error) 
 		return Schedule{}, fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
 	}
 	return got, nil
+}
+
+// SetEnabled flips Enabled and persists the row in one locked operation.
+func (s *FileScheduleStore) SetEnabled(_ context.Context, id string, enabled bool) (Schedule, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.items[id]
+	if !ok {
+		return Schedule{}, fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
+	}
+	cur.Enabled = enabled
+	s.items[id] = cur
+	if err := s.save(); err != nil {
+		return Schedule{}, err
+	}
+	return cur, nil
 }
 
 func (s *FileScheduleStore) List(_ context.Context) ([]Schedule, error) {
