@@ -2,6 +2,8 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -49,16 +51,47 @@ type DeliveryJournal interface {
 	ClaimDelivery(ctx context.Context, key string, at time.Time) (claimed bool, err error)
 }
 
-// MemoryDeliveryJournal remembers delivery keys in one process. It converges
-// under concurrent redelivery: exactly one caller can claim a key.
+// MemoryDeliveryJournal remembers delivery keys and body digests in one
+// process. It converges under concurrent redelivery. Exactly one caller can
+// record a key, and later callers learn whether the body changed.
 type MemoryDeliveryJournal struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
+	mu      sync.Mutex
+	seen    map[string]time.Time
+	digests map[string]string
 }
 
 // NewMemoryDeliveryJournal builds an empty delivery journal.
 func NewMemoryDeliveryJournal() *MemoryDeliveryJournal {
-	return &MemoryDeliveryJournal{seen: make(map[string]time.Time)}
+	return &MemoryDeliveryJournal{
+		seen:    make(map[string]time.Time),
+		digests: make(map[string]string),
+	}
+}
+
+// Record records one delivery by key and reports what it did. The same key with
+// the same body is a plain Duplicate; the same key with a different body is a
+// Duplicate and a Conflict. The first body's digest wins, so a conflicting
+// redelivery cannot change the stored outcome.
+func (j *MemoryDeliveryJournal) Record(_ context.Context, key string, body []byte, at time.Time) (RecordResult, error) {
+	if j == nil {
+		return RecordResult{}, errors.New("webhook: nil delivery journal")
+	}
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.seen == nil {
+		j.seen = make(map[string]time.Time)
+	}
+	if j.digests == nil {
+		j.digests = make(map[string]string)
+	}
+	if _, ok := j.seen[key]; ok {
+		return RecordResult{Duplicate: true, Conflict: j.digests[key] != digest}, nil
+	}
+	j.seen[key] = at
+	j.digests[key] = digest
+	return RecordResult{Created: true}, nil
 }
 
 // ClaimDelivery implements DeliveryJournal.

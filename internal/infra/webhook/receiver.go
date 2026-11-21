@@ -41,12 +41,23 @@ type Delivery struct {
 	At      time.Time
 }
 
-// DeliveryRecorder is the minimal journal port the receiver needs. T3.375 adds
-// a durable store-backed implementation; until it lands the adapter in
-// cmd/beacon supplies a process-local journal. A repeated delivery ID must
-// report claimed=false without a second record.
+// RecordResult reports what a delivery recorder did with one delivery. Its
+// three flags mirror store.RecordDeliveryResult without importing infra/store.
+// Created marks the first write, Duplicate marks a repeat with the same body,
+// and Conflict marks a repeat whose body differs from the first.
+type RecordResult struct {
+	Created   bool
+	Duplicate bool
+	Conflict  bool
+}
+
+// DeliveryRecorder is the minimal journal port the receiver needs. The adapter
+// in cmd/beacon supplies a process-local journal today; a store-backed one can
+// replace it without touching the receiver. A repeat reports Duplicate, and a
+// repeat with a changed body also reports Conflict, so the receiver can tell a
+// benign redelivery from a conflicting one.
 type DeliveryRecorder interface {
-	Record(ctx context.Context, d Delivery) (claimed bool, err error)
+	Record(ctx context.Context, d Delivery) (RecordResult, error)
 }
 
 // DeliveryKey names one delivery in an idempotency journal. The store adapter
@@ -151,12 +162,22 @@ func (h *Receiver) record(d Delivery) {
 		return
 	}
 	d.Action = eventAction(parsed, d.Payload)
-	claimed, err := h.recorder.Record(ctx, d)
+	result, err := h.recorder.Record(ctx, d)
 	if err != nil {
 		observe.ActorError("webhook-record", d.ID, err)
 		return
 	}
-	if !claimed {
+	// The 202 was already sent, so a repeat is a success either way. The first
+	// delivery produced the only effect; Duplicate and Conflict both stop the
+	// provider from retrying without publishing again. Conflict is checked
+	// first because it is also a Duplicate.
+	switch {
+	case result.Conflict:
+		observe.Event(observe.LevelInfo, "webhook-conflict", observe.Fields{
+			"delivery": d.ID,
+			"event":    d.Event,
+		})
+	case result.Duplicate:
 		observe.Event(observe.LevelInfo, "webhook-duplicate", observe.Fields{
 			"delivery": d.ID,
 			"event":    d.Event,
