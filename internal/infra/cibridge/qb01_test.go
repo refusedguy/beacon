@@ -78,7 +78,7 @@ func TestQB01CycleChainAndDeliveryOutcomeMetric(t *testing.T) {
 	}
 	state := domain.PRState{
 		State: "OPEN", HeadRefOid: "sha", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN",
-		Checks: map[string]domain.Check{"build": {Conclusion: "FAILURE"}},
+		Checks: map[string]domain.Check{"build": {Conclusion: "FAILURE", Required: true}},
 	}
 
 	sink := &qb01Sink{}
