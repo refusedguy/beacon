@@ -90,9 +90,9 @@ func WithBatchCache(c *Cache) BatchOption {
 	return func(b *BatchProvider) { b.cache = c }
 }
 
-// batchGroup is the slice of singleflight.Group that FetchBatch uses. Keeping
-// the dependency as an interface lets a test substitute a wrapper that observes
-// when every caller has joined the group for a key.
+// batchGroup is the singleflight dependency used by FetchBatch and
+// pingMergeable. Keeping it as an interface lets a test substitute a wrapper
+// that observes when every caller has joined the group for a key.
 type batchGroup interface {
 	Do(key string, fn func() (any, error)) (v any, err error, shared bool)
 }
@@ -109,7 +109,7 @@ type BatchProvider struct {
 	mergeMethod string
 
 	batchSF batchGroup
-	prSF    singleflight.Group
+	prSF    batchGroup
 }
 
 var (
@@ -137,6 +137,7 @@ func NewBatchProvider(graph *Client, rest *RestClient, counter *Counter, opts ..
 		limiter:     rate.NewLimiter(batchRate, batchBurst),
 		mergeMethod: "squash",
 		batchSF:     &singleflight.Group{},
+		prSF:        &singleflight.Group{},
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -235,7 +236,7 @@ func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) 
 			pingKey := prLookupKey(a.Owner, a.Repo, a.PR)
 			if !pings[pingKey] {
 				pings[pingKey] = true
-				b.pingMergeable(ctx, a.Owner, a.Repo, a.PR, &state)
+				_ = b.pingMergeable(ctx, a.Owner, a.Repo, a.PR, &state)
 			}
 		}
 		prs[prLookupKey(a.Owner, a.Repo, a.PR)] = state
@@ -306,7 +307,7 @@ func (b *BatchProvider) PRState(ctx context.Context, repo string, pr int) (domai
 		}
 		mergeable := strings.ToUpper(state.Mergeable)
 		if mergeable == "UNKNOWN" || mergeable == "" {
-			b.pingMergeable(ctx, owner, name, pr, &state)
+			_ = b.pingMergeable(ctx, owner, name, pr, &state)
 		}
 		return state, nil
 	})
@@ -390,7 +391,7 @@ func (b *BatchProvider) mergePRWithState(ctx context.Context, owner, name, repo 
 
 	mergeable := strings.ToUpper(state.Mergeable)
 	if mergeable == "UNKNOWN" || mergeable == "" {
-		b.pingMergeable(ctx, owner, name, pr, &state)
+		_ = b.pingMergeable(ctx, owner, name, pr, &state)
 		mergeable = strings.ToUpper(state.Mergeable)
 	}
 	switch mergeable {
@@ -498,12 +499,14 @@ func (p mergePatch) apply(state *domain.PRState) {
 // closure captured its pointer. A 304, or a reply that still leaves mergeable
 // unset, is retried without If-None-Match: a cached ETag can hide the
 // UNKNOWN -> MERGEABLE transition that makes an otherwise green PR mergeable.
-func (b *BatchProvider) pingMergeable(ctx context.Context, owner, repo string, pr int, state *domain.PRState) {
+// It returns the singleflight shared flag so a test can assert that callers
+// joined one in-flight group.
+func (b *BatchProvider) pingMergeable(ctx context.Context, owner, repo string, pr int, state *domain.PRState) bool {
 	if b.rest == nil || state == nil {
-		return
+		return false
 	}
 	key := "ping:" + prLookupKey(owner, repo, pr)
-	v, _, _ := b.prSF.Do(key, func() (any, error) {
+	v, _, shared := b.prSF.Do(key, func() (any, error) {
 		if err := b.limiter.Wait(ctx); err != nil {
 			return nil, err
 		}
@@ -525,6 +528,7 @@ func (b *BatchProvider) pingMergeable(ctx context.Context, owner, repo string, p
 	if patch, ok := v.(mergePatch); ok {
 		patch.apply(state)
 	}
+	return shared
 }
 
 // parsePRAlias maps one TierBatch PR payload into a PRState. It follows

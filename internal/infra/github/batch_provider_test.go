@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -638,10 +637,11 @@ func TestMergePRWithStateUsesProvidedState(t *testing.T) {
 // TestPingMergeableConcurrentCallersShareResolvedState checks that a second
 // caller joining an in-flight ping still gets its own state updated. The old
 // closure mutated only the leader's pointer and left the follower UNKNOWN.
+// The barrier waits until both callers are registered for the key, then the
+// test asserts both received a shared result.
 func TestPingMergeableConcurrentCallersShareResolvedState(t *testing.T) {
 	counter, _, _ := newTestCounter(t, 0)
 	entered := make(chan struct{})
-	secondEntered := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
 	var gets atomic.Int64
@@ -655,31 +655,31 @@ func TestPingMergeableConcurrentCallersShareResolvedState(t *testing.T) {
 	defer srv.Close()
 
 	provider := NewBatchProvider(nil, newRESTTestClient(t, srv, counter, "test-token"), counter)
+	group := newJoiningBatchGroup(2)
+	provider.prSF = group
 	ctx := context.Background()
 	stateA := domain.PRState{Mergeable: "UNKNOWN"}
 	stateB := domain.PRState{Mergeable: "UNKNOWN"}
-	done := make(chan struct{}, 2)
+	shared := make(chan bool, 2)
 
 	go func() {
-		provider.pingMergeable(ctx, "owner", "repo", 7, &stateA)
-		done <- struct{}{}
+		s := provider.pingMergeable(ctx, "owner", "repo", 7, &stateA)
+		shared <- s
 	}()
 	<-entered
 	go func() {
-		close(secondEntered)
-		provider.pingMergeable(ctx, "owner", "repo", 7, &stateB)
-		done <- struct{}{}
+		s := provider.pingMergeable(ctx, "owner", "repo", 7, &stateB)
+		shared <- s
 	}()
-	<-secondEntered
-	// Give the second caller time to join the in-flight singleflight before the
-	// REST reply is released.
-	for i := 0; i < 8; i++ {
-		runtime.Gosched()
-	}
+	// Both callers are registered while the leader is still blocked in the
+	// server. Releasing earlier lets a late caller start a second request.
+	<-group.all
 	close(release)
-	<-done
-	<-done
+	sA, sB := <-shared, <-shared
 
+	if !sA || !sB {
+		t.Fatalf("pingMergeable shared = (%v,%v), want both callers to share one result", sA, sB)
+	}
 	if stateA.Mergeable != "MERGEABLE" || stateA.MergeStateStatus != "CLEAN" {
 		t.Fatalf("leader state = %+v, want MERGEABLE/CLEAN", stateA)
 	}
