@@ -551,7 +551,6 @@ func newADRFixture(t *testing.T) (repo, logPath string) {
 			"Статус: proposed\n",
 		"0267-correlation.md": "# ADR 267: Единая схема корреляции\n\nСтатус: proposed\n",
 		"notes.md":            "# Notes\n\nСтатус: accepted\n",
-		"README.md":           "stale index\n| 0001 | old topic | open |\n",
 	}
 	for name, content := range adrs {
 		writeFixtureFile(t, filepath.Join(repo, "docs", "adrs", name), content)
@@ -584,8 +583,8 @@ func TestRunWriteGeneratesADRIndex(t *testing.T) {
 			t.Errorf("index missing %q:\n%s", line, index)
 		}
 	}
-	if strings.Contains(index, "old topic") || strings.Contains(index, "| 0267 | Notes") {
-		t.Errorf("stale or non-ADR row survived:\n%s", index)
+	if strings.Contains(index, "Notes") {
+		t.Errorf("non-ADR row survived:\n%s", index)
 	}
 	if strings.Index(index, "Лимит FIX") > strings.Index(index, "Fixer как") {
 		t.Errorf("duplicate ADR 0260 rows are out of order:\n%s", index)
@@ -599,6 +598,29 @@ func TestRunWriteGeneratesADRIndex(t *testing.T) {
 	}
 	if strings.Contains(stdout.String(), "docs/adrs/README.md:") {
 		t.Errorf("fresh index still reported as stale:\n%s", stdout.String())
+	}
+}
+
+func TestRunWriteReplacesStaleADRIndex(t *testing.T) {
+	repo, logPath := newADRFixture(t)
+	indexPath := filepath.Join(repo, "docs", "adrs", "README.md")
+	writeFixtureFile(t, indexPath, "# Beacon. Architecture Decision Records\n\nИндекс:\n\n| ADR | Тема | Статус |\n|---|---|---|\n| 0001 | old topic | open |\n")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"-repo", repo, "-git-log", logPath, "-write"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "docs/adrs/README.md: update from 5 ADR files") {
+		t.Errorf("update not reported:\n%s", stdout.String())
+	}
+	index := readFixtureFile(t, indexPath)
+	if strings.Contains(index, "old topic") {
+		t.Errorf("stale row survived:\n%s", index)
+	}
+	if !strings.Contains(index, "| 0001 | Назначение и границы проекта | accepted |") ||
+		!strings.Contains(index, "| 0267 | Единая схема корреляции | proposed |") {
+		t.Errorf("generated row missing:\n%s", index)
 	}
 }
 
