@@ -33,6 +33,41 @@ const (
 	defaultMaxFiles = 5
 )
 
+// GenAI attribute keys written to local spans. They follow the GenAI semantic
+// conventions and carry identifiers only. Message bodies, tool arguments and
+// token totals stay out of the local export.
+const (
+	AttrOperationName = "gen_ai.operation.name"
+	AttrProviderName  = "gen_ai.provider.name"
+	AttrToolName      = "gen_ai.tool.name"
+	AttrToolCallID    = "gen_ai.tool.call.id"
+	AttrToolType      = "gen_ai.tool.type"
+)
+
+const (
+	// wakeDeliverSpanName is the span the wake delivery path starts for each
+	// attempt. Its obligation_id attribute becomes the GenAI tool call id.
+	wakeDeliverSpanName  = "beacon.wake.deliver"
+	spanAttrObligationID = "obligation_id"
+
+	genAIOperationExecuteTool = "execute_tool"
+	genAIProviderOpenCode     = "opencode"
+	genAIToolWakeOpenCode     = "wake.opencode"
+	genAIToolTypeExtension    = "extension"
+	// GenAI tool spans are named "<operation> <tool name>".
+	genAIWakeSpanName = genAIOperationExecuteTool + " " + genAIToolWakeOpenCode
+)
+
+// contentAttrs are GenAI attributes that carry message text or tool arguments.
+// NO_CONTENT keeps them out of the local export (ADR 0267).
+var contentAttrs = map[string]struct{}{
+	"gen_ai.input.messages":      {},
+	"gen_ai.output.messages":     {},
+	"gen_ai.prompt":              {},
+	"gen_ai.completion":          {},
+	"gen_ai.tool.call.arguments": {},
+}
+
 // Record is one NDJSON line: a finished span in a stable, collector-free
 // shape. Times are UTC and durations are microseconds so line tools can read
 // the file without a decoder.
@@ -62,10 +97,36 @@ func RecordFromSpan(s observe.Span) Record {
 	if len(s.Attrs) > 0 {
 		r.Attrs = make(map[string]string, len(s.Attrs))
 		for _, a := range s.Attrs {
+			if _, content := contentAttrs[a.Key]; content {
+				continue
+			}
 			r.Attrs[a.Key] = a.Value
 		}
 	}
+	fillGenAIAttrs(&r)
 	return r
+}
+
+// fillGenAIAttrs maps the wake delivery span onto the GenAI execute_tool
+// convention. Only identifiers are added: the obligation id correlates the
+// tool call, and no token usage is summed across spans.
+func fillGenAIAttrs(r *Record) {
+	if r == nil || r.Name != wakeDeliverSpanName {
+		return
+	}
+	r.Name = genAIWakeSpanName
+	if r.Attrs == nil {
+		r.Attrs = make(map[string]string, 5)
+	}
+	callID := r.Attrs[spanAttrObligationID]
+	if callID == "" {
+		callID = r.SpanID
+	}
+	r.Attrs[AttrOperationName] = genAIOperationExecuteTool
+	r.Attrs[AttrProviderName] = genAIProviderOpenCode
+	r.Attrs[AttrToolName] = genAIToolWakeOpenCode
+	r.Attrs[AttrToolCallID] = callID
+	r.Attrs[AttrToolType] = genAIToolTypeExtension
 }
 
 // Option tunes a Sink. Zero or negative values are ignored, keeping the

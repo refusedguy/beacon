@@ -283,3 +283,106 @@ func TestReadAllMissingFile(t *testing.T) {
 		t.Fatalf("ReadAll returned %d records for a missing file", len(got))
 	}
 }
+
+func wakeSpan(obligationID string) observe.Span {
+	return observe.Span{
+		Name:  wakeDeliverSpanName,
+		Ctx:   observe.SpanContext{TraceID: [16]byte{1}, SpanID: [8]byte{2}},
+		Start: fixedTime(),
+		End:   fixedTime().Add(time.Millisecond),
+		Attrs: []observe.Attr{
+			observe.String("watchID", "watch:1"),
+			observe.String(spanAttrObligationID, obligationID),
+		},
+	}
+}
+
+func TestWakeSpanUsesGenAIConventions(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, DefaultFileName)
+
+	sink, err := NewSink(path)
+	if err != nil {
+		t.Fatalf("NewSink: %v", err)
+	}
+	defer sink.Close()
+
+	span := wakeSpan("watch:1:7:ses_abc:1")
+	span.Attrs = append(span.Attrs,
+		observe.String("gen_ai.input.messages", "secret wake prompt"),
+		observe.String("gen_ai.tool.call.arguments", "secret tool arguments"),
+	)
+	sink.Emit(span)
+
+	got, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("Read returned %d records, want 1", len(got))
+	}
+	r := got[0]
+	if r.Name != "execute_tool wake.opencode" {
+		t.Fatalf("Name = %q, want %q", r.Name, "execute_tool wake.opencode")
+	}
+	wantAttrs := map[string]string{
+		AttrOperationName: "execute_tool",
+		AttrProviderName:  "opencode",
+		AttrToolName:      "wake.opencode",
+		AttrToolCallID:    "watch:1:7:ses_abc:1",
+		AttrToolType:      "extension",
+	}
+	for key, want := range wantAttrs {
+		if r.Attrs[key] != want {
+			t.Errorf("attrs[%q] = %q, want %q", key, r.Attrs[key], want)
+		}
+	}
+	if r.Attrs["watchID"] != "watch:1" || r.Attrs[spanAttrObligationID] != "watch:1:7:ses_abc:1" {
+		t.Errorf("identifier attrs were lost: %v", r.Attrs)
+	}
+	for _, key := range []string{"gen_ai.input.messages", "gen_ai.tool.call.arguments"} {
+		if _, ok := r.Attrs[key]; ok {
+			t.Errorf("content attr %q reached the export: %v", key, r.Attrs)
+		}
+	}
+	line, err := json.Marshal(r)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+	if strings.Contains(string(line), "secret") {
+		t.Fatalf("message content reached the export: %s", line)
+	}
+}
+
+func TestWakeSpansKeepSeparateCallIDsAndNoTokenSum(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, DefaultFileName)
+
+	sink, err := NewSink(path)
+	if err != nil {
+		t.Fatalf("NewSink: %v", err)
+	}
+	defer sink.Close()
+
+	for _, id := range []string{"obligation:1", "obligation:2"} {
+		sink.Emit(wakeSpan(id))
+	}
+
+	got, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("Read returned %d records, want 2", len(got))
+	}
+	for i, want := range []string{"obligation:1", "obligation:2"} {
+		if got[i].Attrs[AttrToolCallID] != want {
+			t.Errorf("record %d tool.call.id = %q, want %q", i, got[i].Attrs[AttrToolCallID], want)
+		}
+		for key := range got[i].Attrs {
+			if strings.Contains(key, "token") || strings.Contains(key, "usage") {
+				t.Errorf("record %d carries token attribute %q", i, key)
+			}
+		}
+	}
+}
