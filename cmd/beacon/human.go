@@ -25,16 +25,72 @@ func init() {
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
 
-// humanVerbs is the closed set of operator commands. An unknown verb is a
-// usage error, never a request to the server.
-var humanVerbs = map[string]bool{
-	"approve": true,
-	"reject":  true,
-	"rework":  true,
-	"unblock": true,
-	"pause":   true,
-	"resume":  true,
-	"cancel":  true,
+// humanOutcome is a declared outcome of the human gate. The set is closed: an
+// answer outside it is a type error, never free text (RS-CMP-06). The gate
+// outcomes come from ADR 0031 section 6; unblock, pause and cancel are operator
+// additions from ADR 0041.
+type humanOutcome string
+
+const (
+	humanApprove humanOutcome = "approve"
+	humanReject  humanOutcome = "reject"
+	humanRework  humanOutcome = "rework"
+	humanUnblock humanOutcome = "unblock"
+	humanPause   humanOutcome = "pause"
+	humanResume  humanOutcome = "resume"
+	humanCancel  humanOutcome = "cancel"
+)
+
+// humanOutcomes is the closed set of declared gate outcomes. It is both the
+// allow-list used when an answer is parsed and the text shown in a type error.
+var humanOutcomes = []humanOutcome{
+	humanApprove, humanReject, humanRework, humanUnblock,
+	humanPause, humanResume, humanCancel,
+}
+
+// valid reports whether o is one of the declared outcomes.
+func (o humanOutcome) valid() bool {
+	for _, declared := range humanOutcomes {
+		if o == declared {
+			return true
+		}
+	}
+	return false
+}
+
+func (o humanOutcome) String() string { return string(o) }
+
+// outcomeNames renders the allow-list in a stable order for error messages.
+func outcomeNames() string {
+	names := make([]string, 0, len(humanOutcomes))
+	for _, o := range humanOutcomes {
+		names = append(names, string(o))
+	}
+	return strings.Join(names, ", ")
+}
+
+// humanResponse is the typed answer to a human gate question. It is the
+// response schema: cmd parses a raw answer into it and validates every field
+// before a write path runs, so text can never stand in for a decision.
+type humanResponse struct {
+	Outcome humanOutcome `json:"outcome"`
+	Target  string       `json:"target"`
+	Note    string       `json:"note,omitempty"`
+}
+
+// parseHumanResponse validates a raw answer against the response schema. It
+// returns a clear error when the outcome type is unknown or a required field is
+// missing. Callers must call it before decider.Decide or store.Apply.
+func parseHumanResponse(verb, target, note string) (humanResponse, error) {
+	outcome := humanOutcome(strings.TrimSpace(verb))
+	if !outcome.valid() {
+		return humanResponse{}, fmt.Errorf("неизвестный тип ответа %q; допустимые исходы: %s", verb, outcomeNames())
+	}
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return humanResponse{}, fmt.Errorf("в ответе пропущено поле watchID|blockerID")
+	}
+	return humanResponse{Outcome: outcome, Target: target, Note: note}, nil
 }
 
 // humanRunner delegates to the CLI implementation. RegisterHuman replaces it
@@ -206,18 +262,15 @@ func runHuman(c *CLI, args []string) int {
 		writeUsage(c.errOut)
 		return 2
 	}
-	verb, target := strings.TrimSpace(fs.Arg(0)), strings.TrimSpace(fs.Arg(1))
-	if !humanVerbs[verb] {
-		fmt.Fprintf(c.errOut, "beacon human: неизвестное действие %q\n", verb)
+	answer, err := parseHumanResponse(fs.Arg(0), fs.Arg(1), *note)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon human: %v\n", err)
 		writeUsage(c.errOut)
 		return 2
 	}
-	if target == "" {
-		fmt.Fprintf(c.errOut, "beacon human: пустой watchID|blockerID\n")
-		return 2
-	}
+	verb, target := string(answer.Outcome), answer.Target
 
-	req := httpapi.ClientDecision{Verb: verb, Target: target, Note: *note}
+	req := httpapi.ClientDecision{Verb: verb, Target: target, Note: answer.Note}
 	ctx := context.Background()
 	dir, err := humanStateDir()
 	if err != nil {
