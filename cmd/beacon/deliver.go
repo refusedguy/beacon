@@ -30,6 +30,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
@@ -455,6 +456,11 @@ func runDeliver(c *CLI, args []string) int {
 	probe, _ := resolvePiProbe(cfg)
 	target := chooseDeliveryTarget(cfg, probe, deliverTarget)
 	out, attempts := deliverPrompt(target, sub.target, text, deliverSleep)
+	adapter := cfg.Adapter
+	if adapter == "" {
+		adapter = "opencode"
+	}
+	observe.WakeOutcome(adapter, string(out), w.id, w.revision)
 	res := deliverResult{
 		WatchID:  w.id,
 		Verdict:  w.verdict,

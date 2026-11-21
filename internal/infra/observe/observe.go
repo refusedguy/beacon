@@ -72,6 +72,7 @@ const (
 	FieldRole         = "role"
 	FieldFailedChecks = "failedChecks"
 	FieldSource       = "source"
+	FieldOutcome      = "outcome"
 
 	// Content fields. Under the default NO_CONTENT policy the write boundary
 	// removes these and keeps only FieldContentRef, a link to the store that
@@ -530,11 +531,45 @@ const (
 	WakeSourceDaemon = "daemon"
 )
 
+// Wake outcome values recorded by CounterWakeOutcome. The three failure values
+// match the domain attempt outcomes, so a caller that already computed one can
+// pass it straight through.
+const (
+	WakeOutcomePosted          = "posted"
+	WakeOutcomeTransportFailed = "transport-failed"
+	WakeOutcomeIndeterminate   = "indeterminate"
+	WakeOutcomeDuplicate       = "duplicate"
+)
+
+// WakeOutcome records one wake in the adapter+outcome counter. It is the single
+// increment point of CounterWakeOutcome. The legacy wake helpers do not touch
+// that counter, so a call site that predates the label never double counts.
+func WakeOutcome(adapter, outcome, watchID string, revision ...uint64) {
+	s := Default()
+	s.Inc(CounterWakeOutcome, outcomeKey(adapter, outcome))
+	fields := Fields{FieldAdapter: adapter, FieldOutcome: outcome}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	if len(revision) != 0 {
+		fields[FieldRevision] = revision[0]
+	}
+	s.Log(LevelInfo, "wake_outcome", fields)
+}
+
 // WakeDelivered records one wake the host admitted. Callers that do not name
 // their path get the MCP source. The delivery loop uses WakeDeliveredSource
 // so its wakes show "daemon" in the log (T3.417).
 func WakeDelivered(adapter, watchID string, revision ...uint64) {
 	WakeDeliveredSource(adapter, watchID, WakeSourceMCP, revision...)
+}
+
+// WakeDeliveredOutcome is WakeDelivered with an explicit outcome. It keeps the
+// delivered counter and log event unchanged and adds the adapter+outcome
+// counter for callers that already classified the delivery.
+func WakeDeliveredOutcome(adapter, watchID, outcome string, revision ...uint64) {
+	WakeDelivered(adapter, watchID, revision...)
+	WakeOutcome(adapter, outcome, watchID, revision...)
 }
 
 // WakeDeliveredSource records one wake together with the path that admitted
@@ -549,6 +584,15 @@ func WakeDeliveredSource(adapter, watchID, source string, revision ...uint64) {
 		fields[FieldRevision] = revision[0]
 	}
 	s.Log(LevelInfo, "wake_delivered", fields)
+}
+
+// WakeDeliveredSourceOutcome is WakeDeliveredSource with an explicit outcome.
+// It keeps the delivered counter and log event unchanged and adds the
+// adapter+outcome counter, so the outcome reaches metrics without breaking the
+// existing callers of WakeDeliveredSource.
+func WakeDeliveredSourceOutcome(adapter, watchID, source, outcome string, revision ...uint64) {
+	WakeDeliveredSource(adapter, watchID, source, revision...)
+	WakeOutcome(adapter, outcome, watchID, revision...)
 }
 
 // FixDelivered records one wake delivered to a fixer subscriber. Only the
@@ -590,11 +634,12 @@ func WakeSkipped(adapter, watchID, reason string) {
 func WakeDuplicate(watchID string, revision ...uint64) {
 	s := Default()
 	s.Inc(CounterWakeDuplicate, "")
-	fields := Fields{FieldWatchID: watchID}
+	fields := Fields{FieldWatchID: watchID, FieldOutcome: WakeOutcomeDuplicate}
 	if len(revision) != 0 {
 		fields[FieldRevision] = revision[0]
 	}
 	s.Log(LevelInfo, "wake_duplicate", fields)
+	WakeOutcome("", WakeOutcomeDuplicate, watchID, revision...)
 }
 
 // WakeFailed records one wake the host refused or that failed in transport.
@@ -613,6 +658,15 @@ func WakeFailed(adapter, watchID string, err error, revision ...uint64) {
 		fields[FieldRevision] = revision[0]
 	}
 	s.Log(LevelWarn, "wake_error", fields)
+}
+
+// WakeFailedOutcome is WakeFailed with an explicit outcome. The caller has
+// already classified the delivery error as transport-failed or indeterminate,
+// and this helper carries that classification into the adapter+outcome counter
+// while leaving the legacy error counter and log event unchanged.
+func WakeFailedOutcome(adapter, watchID, outcome string, err error, revision ...uint64) {
+	WakeFailed(adapter, watchID, err, revision...)
+	WakeOutcome(adapter, outcome, watchID, revision...)
 }
 
 // RebaseRequested records a pointer asking a subscriber to rebase itself.
