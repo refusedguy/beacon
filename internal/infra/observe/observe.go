@@ -547,6 +547,21 @@ const (
 // increment point of CounterWakeOutcome. The legacy wake helpers do not touch
 // that counter, so a call site that predates the label never double counts.
 func WakeOutcome(adapter, outcome, watchID string, revision ...uint64) {
+	wakeOutcome(adapter, outcome, watchID, nil, revision...)
+}
+
+// WakeOutcomeCorrelated records one wake outcome and stamps the identifiers of
+// the producing cycle onto the same event. Callers that already build a
+// correlated field set pass it here, so a cycleID filter finds the delivery
+// metric record next to the Watch and wake events of one Refresh. It shares the
+// single increment point with WakeOutcome and never adds a second counter.
+func WakeOutcomeCorrelated(adapter, outcome, watchID string, cycle Fields, revision ...uint64) {
+	wakeOutcome(adapter, outcome, watchID, cycle, revision...)
+}
+
+// wakeOutcome is the one implementation behind both spellings. Extra fields are
+// merged last, so the caller's correlation values win over the defaults.
+func wakeOutcome(adapter, outcome, watchID string, extra Fields, revision ...uint64) {
 	s := Default()
 	s.Inc(CounterWakeOutcome, outcomeKey(adapter, outcome))
 	fields := Fields{FieldAdapter: adapter, FieldOutcome: outcome}
@@ -555,6 +570,9 @@ func WakeOutcome(adapter, outcome, watchID string, revision ...uint64) {
 	}
 	if len(revision) != 0 {
 		fields[FieldRevision] = revision[0]
+	}
+	for k, v := range extra {
+		fields[k] = v
 	}
 	s.Log(LevelInfo, "wake_outcome", fields)
 }

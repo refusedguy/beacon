@@ -1689,7 +1689,13 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 			b.breakerRecord(adapter, now, true)
 		}
 		b.recordDelivery(ctx, p.ObligationID, attempt, outcome, now)
-		observe.WakeFailedOutcome(sub.Adapter, w.ID, string(outcome), deliverErr, w.Revision)
+		observe.WakeFailed(sub.Adapter, w.ID, deliverErr, w.Revision)
+		observe.WakeOutcomeCorrelated(sub.Adapter, string(outcome), w.ID, observe.Fields{
+			observe.FieldCycleID:      cycleID,
+			observe.FieldObligationID: p.ObligationID,
+			observe.FieldRole:         string(sub.Role),
+			observe.FieldAttempt:      attempt,
+		}, w.Revision)
 		observe.ActorError("wake", w.ID, deliverErr)
 		log.Printf("cibridge: wake %s: %v", target, deliverErr)
 		if dead {
@@ -1699,7 +1705,13 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 	}
 	b.breakerRecord(adapter, now, false)
 	observe.WakeDuration(sub.Adapter, time.Since(start))
-	observe.WakeDeliveredOutcome(sub.Adapter, w.ID, observe.WakeOutcomePosted, w.Revision)
+	observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
+	observe.WakeOutcomeCorrelated(sub.Adapter, observe.WakeOutcomePosted, w.ID, observe.Fields{
+		observe.FieldCycleID:      cycleID,
+		observe.FieldObligationID: p.ObligationID,
+		observe.FieldRole:         string(sub.Role),
+		observe.FieldAttempt:      attempt,
+	}, w.Revision)
 	b.recordDelivery(ctx, p.ObligationID, attempt, domain.OutcomePosted, now)
 	b.recordWake(w, now, attempt)
 	b.markDelivered(p.ObligationID, now, attempt, "")
