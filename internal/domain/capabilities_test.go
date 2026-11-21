@@ -290,3 +290,74 @@ func TestScopeTokensDoNotAlterRoles(t *testing.T) {
 		}
 	}
 }
+
+func TestParseAddress(t *testing.T) {
+	seat, err := ParseAddress("worker-1@rig-a")
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+	if seat.Member != "worker-1" || seat.Rig != "rig-a" {
+		t.Fatalf("ParseAddress = %+v, want {worker-1 rig-a}", seat)
+	}
+	if seat.String() != "worker-1@rig-a" {
+		t.Fatalf("Seat.String() = %q", seat.String())
+	}
+	if got, err := ParseAddress("  worker-1@rig-a  "); err != nil || got != seat {
+		t.Fatalf("ParseAddress must trim whitespace, got %+v, %v", got, err)
+	}
+}
+
+func TestParseAddressRejectsRoleWideBroadcast(t *testing.T) {
+	// A role name, a wildcard or a bare role is a broadcast-style address. None
+	// names one seat, so none may become a wake target.
+	for _, raw := range []string{
+		"executor@rig-a",   // role name in the member slot
+		"orchestrator@rig", // role name in the member slot
+		"*@rig-a",          // every member of a rig
+		"worker-1@*",       // one member across every rig
+		"executor",         // bare role, no seat
+		"rig-a",            // bare rig
+		"",                 // empty
+		"worker-1",         // missing rig
+		"@rig-a",           // empty member
+		"worker-1@",        // empty rig
+		"a@b@c",            // extra separator
+	} {
+		if _, err := ParseAddress(raw); !errors.Is(err, ErrInvalidAddress) {
+			t.Errorf("ParseAddress(%q) error = %v, want ErrInvalidAddress", raw, err)
+		}
+	}
+}
+
+func TestResolveAddressToSession(t *testing.T) {
+	resolve := func(s Seat) (string, bool) {
+		if s.Member == "worker-1" && s.Rig == "rig-a" {
+			return "ses_occupant123", true
+		}
+		return "", false
+	}
+
+	session, err := ResolveAddress("worker-1@rig-a", resolve)
+	if err != nil {
+		t.Fatalf("ResolveAddress: %v", err)
+	}
+	if session != "ses_occupant123" {
+		t.Fatalf("ResolveAddress = %q, want ses_occupant123", session)
+	}
+
+	// An unoccupied seat, a missing resolver and a resolver that returns a role
+	// name instead of a session are all refused: no broad target is produced.
+	if _, err := ResolveAddress("worker-2@rig-a", resolve); !errors.Is(err, ErrUnresolvedAddress) {
+		t.Errorf("unresolved seat error = %v, want ErrUnresolvedAddress", err)
+	}
+	if _, err := ResolveAddress("worker-1@rig-a", nil); !errors.Is(err, ErrUnresolvedAddress) {
+		t.Errorf("nil resolver error = %v, want ErrUnresolvedAddress", err)
+	}
+	roleResolve := func(Seat) (string, bool) { return "executor", true }
+	if _, err := ResolveAddress("worker-1@rig-a", roleResolve); !errors.Is(err, ErrUnresolvedAddress) {
+		t.Errorf("role-name target error = %v, want ErrUnresolvedAddress", err)
+	}
+	if _, err := ResolveAddress("executor@rig-a", resolve); !errors.Is(err, ErrInvalidAddress) {
+		t.Errorf("role-wide address error = %v, want ErrInvalidAddress", err)
+	}
+}

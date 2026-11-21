@@ -10,6 +10,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -273,4 +274,94 @@ func ParseScopes(values []string) (ScopeMask, error) {
 		m |= s.Flag()
 	}
 	return m, nil
+}
+
+// ---------------------------------------------------------------------------
+// Seat addressing (T3.248).
+//
+// Beacon addresses a wake to one seat, written member@rig. A seat is a concrete
+// position, never a role: the parser rejects role names and wildcards in either
+// component so a caller cannot turn a single-target wake into a role-wide
+// broadcast. An address becomes a wake target only after a caller-supplied
+// resolver maps it to exactly one ses_... session. Beacon keeps no live rig
+// topology, so the resolver is a port rather than a built-in table.
+// ---------------------------------------------------------------------------
+
+const addressSeparator = "@"
+
+var (
+	// ErrInvalidAddress reports a malformed or broadcast-style address.
+	ErrInvalidAddress = errors.New("domain: invalid seat address")
+	// ErrUnresolvedAddress reports a seat no resolver mapped to a session.
+	ErrUnresolvedAddress = errors.New("domain: seat address did not resolve to a session")
+)
+
+// Seat is one member's position on one rig, addressed as member@rig. The zero
+// value is invalid; build one with ParseAddress.
+type Seat struct {
+	Member string
+	Rig    string
+}
+
+// String returns the canonical member@rig form.
+func (s Seat) String() string { return s.Member + addressSeparator + s.Rig }
+
+// validSeatComponent reports whether raw is a single, concrete name. A role
+// name or a wildcard in either slot is a broadcast attempt and is refused, so
+// every valid seat names exactly one member on exactly one rig.
+func validSeatComponent(raw string) bool {
+	if !validIdentityValue(raw) || raw == "*" {
+		return false
+	}
+	if _, isRole := ParseRole(raw); isRole {
+		return false
+	}
+	return true
+}
+
+// Valid reports whether both components of the seat are concrete names.
+func (s Seat) Valid() bool {
+	return validSeatComponent(s.Member) && validSeatComponent(s.Rig)
+}
+
+// ParseAddress parses an external member@rig address. Surrounding whitespace is
+// trimmed, as it is for the other Parse* helpers, but the two components must
+// be exact. Empty components, extra separators, wildcards and role names are
+// rejected as malformed or broadcast-style addresses.
+func ParseAddress(raw string) (Seat, error) {
+	trimmed := strings.TrimSpace(raw)
+	parts := strings.Split(trimmed, addressSeparator)
+	if len(parts) != 2 {
+		return Seat{}, fmt.Errorf("%w: %q must be member@rig", ErrInvalidAddress, raw)
+	}
+	seat := Seat{Member: strings.TrimSpace(parts[0]), Rig: strings.TrimSpace(parts[1])}
+	if !seat.Valid() {
+		return Seat{}, fmt.Errorf("%w: %q is not a concrete member@rig seat", ErrInvalidAddress, raw)
+	}
+	return seat, nil
+}
+
+// SessionResolver maps a concrete Seat to the session occupying it. The bool
+// is false when no session holds the seat. The caller supplies this port
+// because Beacon itself owns no live rig topology.
+type SessionResolver func(Seat) (string, bool)
+
+// ResolveAddress resolves a member@rig address to exactly one concrete session.
+// It parses and validates the address first, then asks resolve for the session.
+// A broadcast-style address, an unresolved seat, a missing resolver or a
+// resolver that returns a non-session id is an error, so the wake never gets a
+// broad target.
+func ResolveAddress(raw string, resolve SessionResolver) (string, error) {
+	seat, err := ParseAddress(raw)
+	if err != nil {
+		return "", err
+	}
+	if resolve == nil {
+		return "", fmt.Errorf("%w: no resolver for %q", ErrUnresolvedAddress, seat)
+	}
+	session, ok := resolve(seat)
+	if !ok || !ValidSessionID(session) {
+		return "", fmt.Errorf("%w: %q", ErrUnresolvedAddress, seat)
+	}
+	return session, nil
 }

@@ -327,3 +327,25 @@ func DeliveryKey(deliveryID IdempotencyValue) string {
 func ScopedKey(namespace string, value IdempotencyValue) string {
 	return IdempotencyKey(namespace, value.String())
 }
+
+// ---------------------------------------------------------------------------
+// Concrete wake session ids (T3.248).
+//
+// A seat address is only a name. Before a wake can use it, the address resolver
+// must produce a concrete session id. ValidSessionID is that boundary check:
+// a role name, a member@rig address or a wildcard never satisfies it, so none
+// can stand in for the single session an obligation is bound to.
+// ---------------------------------------------------------------------------
+
+// SessionIDPrefix is required of every concrete wake session id.
+const SessionIDPrefix = "ses_"
+
+// ValidSessionID reports whether raw is a concrete session id: it carries the
+// ses_ prefix, has content beyond it and satisfies the identity format. It is
+// the boundary check that keeps a role or a seat address from being delivered
+// as if it were a session.
+func ValidSessionID(raw string) bool {
+	return strings.HasPrefix(raw, SessionIDPrefix) &&
+		len(raw) > len(SessionIDPrefix) &&
+		validIdentityValue(raw)
+}
