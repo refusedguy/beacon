@@ -40,6 +40,8 @@ executor-task:lifecycle -->
 
 Задачу выдаёт оркестратор через `beacon_task_claim` с agent ID. Исполнитель получает ID карточки, цель, зависимости, OwnerFiles, режим плана и handoff. Первая выдача помечает карточку `in_progress`, поэтому второй агент не возьмёт ту же карточку.
 
+Инструмент работает в пути `beacon mcp`. Композиционный корень передаёт ему файловое хранилище карточек из `docs/tasks`, поэтому ручной поиск по каталогу не нужен. Если вызов вернул `PERSIST_FAILED`, исполнитель сообщает оркестратору через `beacon_ack` с `decision="blocked:not_mine"` и причиной ошибки. Карточку вручную он не ищет и не открывает.
+
 `docs/tasks/` остаётся источником истины для содержимого карточки, но не единственным путём к задаче. Индекс в state dir пересобирается из карточек командой `beacon index build`. Граф строится из рёбер `blocks`, `depends-on`, `supersedes` и `related` для всех семейств ID: T, RS, WIRING и BS. Цикл на записи отвергается. Не добавляйте зависимость, которая замыкает цикл. Маркер `graphReady` в ответе claim или `beacon_stats` говорит, что граф актуален.
 
 <!-- executor-task:claim
@@ -48,6 +50,7 @@ fields: id, goal, deps, ownerFiles, planMode, handoff, graphReady
 duplicate-issue: fail
 cycle: reject
 manual-done: forbidden
+persist-failed: blocked:not_mine
 executor-task:claim -->
 
 ## Три состояния исполнителя
@@ -239,6 +242,6 @@ executor-task:ttl -->
 
 Тест шаблона лежит в `tests/adapter/executor-template.test.js` и читает этот файл через `node:fs`. Он разбирает маркеры и проверяет четыре условия карточки: `ready` и `watching` не будят, `keep_working`, `rebase` и `retry` будят, текст `waiting, watchID` присутствует, у Beacon нет команды от имени агента. Дополнительно проверяется, что re-run принадлежит агенту и TTL отсутствует.
 
-Блок `executor-task:claim` фиксирует, что задача приходит через `beacon_task_claim`, цикл отвергается и карточку в `done` переводит Beacon при мерже.
+Блок `executor-task:claim` фиксирует, что задача приходит через `beacon_task_claim`, цикл отвергается, при `PERSIST_FAILED` оркестратор получает `blocked:not_mine`, а карточку в `done` переводит Beacon при мерже.
 
 CI подхватывает тест шагом `Test JS adapters` в `.github/workflows/ci.yml`: `find tests/adapter -maxdepth 1 -name '*.test.js' | xargs node --test`. Тест использует только встроенные модули Node.

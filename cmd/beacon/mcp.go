@@ -564,6 +564,14 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 		// The deferred-wiring port was left nil here, so beacon_defer_wiring
 		// answered PERSIST_FAILED. The durable adapter shares this DB handle.
 		DeferWiring: newDurableDeferredStore(db),
+		// IDX-05 requires a card store port for beacon_task_claim. Without it
+		// the handler answers PERSIST_FAILED and the executor gets no card.
+		// The adapter reads cards from the project root and keeps its lock in
+		// the state directory next to the SQLite file.
+		TaskClaimStore: &mcp.FileTaskClaimStore{
+			TasksDir: filepath.Join(projectRootForConfig(), "docs", "tasks"),
+			StateDir: dir,
+		},
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
 			live, err := db.LiveWatches()
 			if err != nil {
