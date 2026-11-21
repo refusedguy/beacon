@@ -169,6 +169,38 @@ func TestTypes(t *testing.T) {
 	})
 }
 
+// TestKnownErrorCodesHaveStatus guards the canonical registry: every code the
+// domain advertises carries a real HTTP status, and no constructor emits 0.
+func TestKnownErrorCodesHaveStatus(t *testing.T) {
+	codes := KnownErrorCodes()
+	if len(codes) < 10 {
+		t.Fatalf("registry has %d codes, want at least 10", len(codes))
+	}
+	seen := make(map[ErrorCode]bool, len(codes))
+	for _, code := range codes {
+		if seen[code] {
+			t.Errorf("duplicate code %s in registry", code)
+		}
+		seen[code] = true
+
+		status := StatusForCode(code)
+		if status < 100 || status > 599 {
+			t.Errorf("StatusForCode(%s) = %d, want a valid HTTP status", code, status)
+		}
+		if got := NewAppError(code, "boom").Status; got != status {
+			t.Errorf("NewAppError(%s).Status = %d, want %d", code, got, status)
+		}
+	}
+	for _, code := range []ErrorCode{CodeRejectDuplicate, CodeWatchExpired} {
+		if !seen[code] {
+			t.Errorf("%s missing from the canonical registry", code)
+		}
+	}
+	if got := NewAppError(ErrorCode("UNREGISTERED"), "boom").Status; got < 100 || got > 599 {
+		t.Errorf("unregistered code got status %d, want a transport fallback", got)
+	}
+}
+
 func TestAppErrorUnwrap(t *testing.T) {
 	cause := errors.New("store down")
 	e := NewAppErrorWithCause(CodePersistFailed, "store down", cause)

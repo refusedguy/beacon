@@ -739,7 +739,7 @@ func (s *Server) bearer(next http.Handler) http.Handler {
 func (s *Server) sameOriginJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ct := strings.ToLower(r.Header.Get("Content-Type")); !strings.HasPrefix(ct, "application/json") {
-			writeError(w, http.StatusUnsupportedMediaType, "INVALID_INPUT", "нужен Content-Type: application/json")
+			writeError(w, http.StatusUnsupportedMediaType, string(domain.CodeInvalidInput), "нужен Content-Type: application/json")
 			return
 		}
 		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !s.sameOrigin(origin) {
@@ -782,6 +782,11 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
+// writeError sends a transport-level error. A code that also exists in the
+// domain registry is passed as string(domain.CodeX), so its meaning has one
+// literal. The remaining codes are httpapi-only strings: this server owns its
+// transport contract and the status is supplied explicitly at each call site,
+// so these are an explicit exception rather than a second error-code type.
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, errorBody{Code: code, Message: message})
 }
@@ -990,18 +995,18 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	var d Decision
 	body := http.MaxBytesReader(w, r.Body, maxRequestBody)
 	if err := json.NewDecoder(body).Decode(&d); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_INPUT", "неверное тело запроса")
+		writeError(w, http.StatusBadRequest, string(domain.CodeInvalidInput), "неверное тело запроса")
 		return
 	}
 	d.Command = strings.ToLower(strings.TrimSpace(d.Command))
 	d.WatchID = strings.TrimSpace(d.WatchID)
 	d.ObligationID = strings.TrimSpace(d.ObligationID)
 	if !validCommands[d.Command] {
-		writeError(w, http.StatusBadRequest, "INVALID_INPUT", "неизвестная команда "+d.Command)
+		writeError(w, http.StatusBadRequest, string(domain.CodeInvalidInput), "неизвестная команда "+d.Command)
 		return
 	}
 	if d.WatchID == "" {
-		writeError(w, http.StatusBadRequest, "INVALID_INPUT", "пустое поле watchID")
+		writeError(w, http.StatusBadRequest, string(domain.CodeInvalidInput), "пустое поле watchID")
 		return
 	}
 	if d.Contract != "" && d.Contract != HumanDecideContract {

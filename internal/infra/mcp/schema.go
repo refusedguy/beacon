@@ -435,23 +435,13 @@ type ErrorShape struct {
 	NewWatchID   string           `json:"newWatchID,omitempty"`
 }
 
-// statusByCode is the contract v2 code to status table. Statuses mirror the
-// domain table in internal/domain so the MCP boundary has its own explicit
-// mapping to assert against.
-var statusByCode = map[domain.ErrorCode]int{
-	domain.CodeInvalidInput:   400,
-	domain.CodeWatchNotFound:  404,
-	domain.CodeHeadSHAChanged: 409,
-	domain.CodeRateLimited:    429,
-	domain.CodeLimitExceeded:  429,
-	domain.CodeCancelled:      410,
-	domain.CodeGone:           410,
-	domain.CodePersistFailed:  503,
-}
-
-// StatusForCode returns the contract status for code, or 0 for an unknown code.
+// StatusForCode returns the contract status for code, or 0 for an unknown
+// code. The domain registry is the single source of truth; this boundary
+// helper exists so MCP code does not reach into the domain table directly.
+// Keeping it as a wrapper also removes the mirror that used to omit codes
+// added after the contract v2 list, such as WATCH_EXPIRED and REJECT_DUPLICATE.
 func StatusForCode(code domain.ErrorCode) int {
-	return statusByCode[code]
+	return domain.StatusForCode(code)
 }
 
 // ToErrorShape converts an error that wraps a *domain.AppError into the MCP

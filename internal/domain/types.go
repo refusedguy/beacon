@@ -579,9 +579,54 @@ type AppError struct {
 	cause        error
 }
 
+// statusByErrorCode is the canonical code registry. It is the only table that
+// maps a domain error code to its HTTP status; boundary packages read it
+// through StatusForCode instead of keeping a mirror. REJECT_DUPLICATE is
+// registered here too, so a code declared in identity.go has one status.
+//
+// Two families stay outside this table by design and set their status in their
+// own constructor: CI_* codes live in infra/github and travel as
+// domain.ErrorCode with a 400 status; RECLAIM_* codes are a separate local type
+// in infra/mcp (ADR 0047) and are never passed to StatusForCode.
+var statusByErrorCode = map[ErrorCode]int{
+	CodeInvalidInput:    400,
+	CodeWatchNotFound:   404,
+	CodeWatchExpired:    410,
+	CodeHeadSHAChanged:  409,
+	CodeRateLimited:     429,
+	CodeLimitExceeded:   429,
+	CodeCancelled:       410,
+	CodeGone:            410,
+	CodePersistFailed:   503,
+	CodeRejectDuplicate: 409,
+}
+
+// StatusForCode returns the contract HTTP status for a registered code, or 0
+// for a code outside the registry. Callers that must never emit status 0 use
+// NewAppError, which supplies a transport fallback for extensions.
+func StatusForCode(code ErrorCode) int {
+	return statusByErrorCode[code]
+}
+
+// KnownErrorCodes lists every code in the canonical registry. The returned
+// slice is a copy, so callers cannot mutate the registry through it.
+func KnownErrorCodes() []ErrorCode {
+	codes := make([]ErrorCode, 0, len(statusByErrorCode))
+	for code := range statusByErrorCode {
+		codes = append(codes, code)
+	}
+	return codes
+}
+
 // NewAppError builds an AppError with the status defined by the contract.
+// Status 0 is not a valid HTTP status, so an unregistered code falls back to
+// 500 instead of reaching a caller as an empty response code.
 func NewAppError(code ErrorCode, message string) *AppError {
-	return &AppError{Code: code, Message: message, Status: statusForCode(code)}
+	status := StatusForCode(code)
+	if status == 0 {
+		status = 500
+	}
+	return &AppError{Code: code, Message: message, Status: status}
 }
 
 // NewAppErrorWithCause builds an AppError that keeps cause reachable through
@@ -591,27 +636,6 @@ func NewAppErrorWithCause(code ErrorCode, message string, cause error) *AppError
 	e := NewAppError(code, message)
 	e.cause = cause
 	return e
-}
-
-func statusForCode(code ErrorCode) int {
-	switch code {
-	case CodeInvalidInput:
-		return 400
-	case CodeWatchNotFound:
-		return 404
-	case CodeWatchExpired:
-		return 410
-	case CodeHeadSHAChanged:
-		return 409
-	case CodeRateLimited, CodeLimitExceeded:
-		return 429
-	case CodeCancelled, CodeGone:
-		return 410
-	case CodePersistFailed:
-		return 503
-	default:
-		return 0
-	}
 }
 
 func (e *AppError) Error() string {

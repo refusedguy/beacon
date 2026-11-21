@@ -42,6 +42,27 @@ func TestStatusForCode(t *testing.T) {
 	}
 }
 
+// TestStatusForCodeUsesDomainRegistry proves the boundary has no private
+// status table: every registered domain code resolves to its domain status.
+func TestStatusForCodeUsesDomainRegistry(t *testing.T) {
+	codes := domain.KnownErrorCodes()
+	if len(codes) == 0 {
+		t.Fatal("empty domain error-code registry")
+	}
+	for _, code := range codes {
+		want := domain.StatusForCode(code)
+		if want == 0 {
+			t.Fatalf("domain registry has no status for %s", code)
+		}
+		if got := StatusForCode(code); got != want {
+			t.Errorf("StatusForCode(%s) = %d, want %d from the domain registry", code, got, want)
+		}
+		if shape, ok := ToErrorShape(domain.NewAppError(code, "boom")); !ok || shape.Status != want {
+			t.Errorf("ToErrorShape(%s) = %+v, ok=%v, want status %d", code, shape, ok, want)
+		}
+	}
+}
+
 func TestToErrorShapeAllCodes(t *testing.T) {
 	tests := []struct {
 		code   domain.ErrorCode
