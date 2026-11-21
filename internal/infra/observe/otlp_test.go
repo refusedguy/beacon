@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -252,6 +253,22 @@ func TestSinkFromConfigGRPCFallsBackLocal(t *testing.T) {
 	}
 	if current := currentActiveExporter(); current != nil {
 		t.Fatal("grpc installed an exporter in a stdlib-only build")
+	}
+}
+
+func TestOTLPExporterGRPCReturnsExplicitError(t *testing.T) {
+	exp, err := NewOTLPExporter(OTLPConfig{
+		Endpoint: "http://127.0.0.1:4317",
+		Protocol: ProtocolGRPC,
+	})
+	if err == nil {
+		t.Fatal("grpc must return an explicit error, not a silent fallback")
+	}
+	if exp != nil {
+		t.Fatalf("grpc returned an exporter %T, want nil", exp)
+	}
+	if !strings.Contains(err.Error(), "grpc") {
+		t.Fatalf("error %q does not name the rejected protocol", err)
 	}
 }
 

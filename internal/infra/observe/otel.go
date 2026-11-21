@@ -36,14 +36,17 @@ const (
 	OTLPEndpointEnv = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	// TracesEndpointEnv names the traces URL directly and wins over the base URL.
 	TracesEndpointEnv = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
-	// OTLPProtocolEnv selects the wire encoding. Valid values are grpc,
-	// http/protobuf and http/json. See normalizeProtocol.
+	// OTLPProtocolEnv selects the wire encoding. Supported values are
+	// http/protobuf and http/json. grpc is recognized but unsupported in this
+	// stdlib-only build: NewOTLPExporter rejects it with an explicit error.
+	// See normalizeProtocol.
 	OTLPProtocolEnv = "OTEL_EXPORTER_OTLP_PROTOCOL"
 
 	// TraceFlagSampled is the sampled bit of the W3C trace flags byte.
 	TraceFlagSampled = 0x01
 
-	// Protocol values accepted by Config.Protocol and OTLPConfig.Protocol.
+	// Protocol values recognized by Config.Protocol and OTLPConfig.Protocol.
+	// ProtocolGRPC is recognized for a clear error, not for export.
 	ProtocolHTTPProtobuf = "http/protobuf"
 	ProtocolHTTPJSON     = "http/json"
 	ProtocolGRPC         = "grpc"
@@ -381,7 +384,8 @@ type OTLPExporter struct {
 }
 
 // NewOTLPExporter validates cfg and returns a ready exporter. An empty endpoint
-// or the gRPC protocol is rejected; callers fall back to local spans for both.
+// or the gRPC protocol returns an explicit error. No supported protocol is
+// silently downgraded: callers that ignore the error keep spans local.
 func NewOTLPExporter(cfg OTLPConfig) (*OTLPExporter, error) {
 	endpoint := strings.TrimSpace(cfg.Endpoint)
 	parsed, err := url.Parse(endpoint)
