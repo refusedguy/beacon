@@ -296,8 +296,7 @@ func runPRCreate(c *CLI, args []string) int {
 	if !parseFlags("pr create", args[1:], c.errOut, fs) {
 		return 2
 	}
-	if *format != "table" && *format != "json" {
-		fmt.Fprintf(c.errOut, "beacon pr create: неизвестный формат %q\n", *format)
+	if !parseFormatFlag(*format, "beacon pr create: неизвестный формат %q\n", c.errOut, false) {
 		return 2
 	}
 

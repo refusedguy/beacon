@@ -222,9 +222,7 @@ func runWatch(c *CLI, args []string) int {
 	if !parseFlags("watch", args, c.errOut, fs) {
 		return 2
 	}
-	if *format != "table" && *format != "json" {
-		fmt.Fprintf(c.errOut, "beacon watch: неизвестный формат %q, ожидается table или json\n", *format)
-		writeUsage(c.errOut)
+	if !parseFormatFlag(*format, "beacon watch: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
 	if *live {
@@ -827,9 +825,7 @@ func runGC(c *CLI, args []string) int {
 	if !parseFlags("gc", args, c.errOut, fs) {
 		return 2
 	}
-	if *format != "table" && *format != "json" {
-		fmt.Fprintf(c.errOut, "beacon gc: неизвестный формат %q, ожидается table или json\n", *format)
-		writeUsage(c.errOut)
+	if !parseFormatFlag(*format, "beacon gc: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
 

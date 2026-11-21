@@ -39,9 +39,7 @@ func runCI(c *CLI, args []string) int {
 		writeUsage(c.errOut)
 		return 2
 	}
-	if *format != "table" && *format != "json" {
-		fmt.Fprintf(c.errOut, "beacon ci check: неизвестный формат %q, ожидается table или json\n", *format)
-		writeUsage(c.errOut)
+	if !parseFormatFlag(*format, "beacon ci check: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
 	// --repo wins over the project config, which wins over the git remote.

@@ -227,9 +227,7 @@ func runOrchestrate(c *CLI, args []string) int {
 	if !parseFlags("orchestrate", args, c.errOut, fs) {
 		return 2
 	}
-	if *format != "table" && *format != "json" {
-		fmt.Fprintf(c.errOut, "beacon orchestrate: неизвестный формат %q, ожидается table или json\n", *format)
-		writeUsage(c.errOut)
+	if !parseFormatFlag(*format, "beacon orchestrate: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
 
