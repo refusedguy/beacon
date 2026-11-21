@@ -379,6 +379,100 @@ func TestHumanDecideGuards(t *testing.T) {
 	}
 }
 
+func TestHumanDecideAppCredentials(t *testing.T) {
+	sink := &stubSink{result: DecisionResult{DecisionID: "journal-9"}}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+	srv.cfg.Credentials = AppCredentials{"app-reports": {"alice"}}
+
+	// The permitted actor uses the same route and keeps the contract echo.
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(
+		`{"command":"approve","watchID":"w1","actor":"alice","appKey":"app-reports","contract":"beacon.human-decide.v1"}`,
+		"http://127.0.0.1:7432",
+	))
+	if w.Code != http.StatusOK {
+		t.Fatalf("разрешённый actor: status %d, body %s", w.Code, w.Body.String())
+	}
+	var got DecisionResult
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.OK || !got.Applied || got.Contract != HumanDecideContract {
+		t.Fatalf("decide result = %+v", got)
+	}
+	if len(sink.calls) != 1 || sink.calls[0].Actor != "alice" {
+		t.Fatalf("sink calls = %+v", sink.calls)
+	}
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"чужой actor", `{"command":"approve","watchID":"w2","actor":"bob","appKey":"app-reports","contract":"beacon.human-decide.v1"}`},
+		{"неизвестный ключ", `{"command":"approve","watchID":"w3","actor":"alice","appKey":"app-unknown","contract":"beacon.human-decide.v1"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			srv.handler().ServeHTTP(w, decideRequest(tc.body, "http://127.0.0.1:7432"))
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "ACTOR_NOT_PERMITTED") {
+				t.Fatalf("body = %s", w.Body.String())
+			}
+		})
+	}
+	if len(sink.calls) != 1 {
+		t.Fatalf("отклонённые команды дошли до sink: %+v", sink.calls)
+	}
+
+	// The version guard runs before the actor check and still wins.
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(
+		`{"command":"approve","watchID":"w4","actor":"bob","appKey":"app-reports","contract":"beacon.human-decide.v9"}`,
+		"http://127.0.0.1:7432",
+	))
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "UNSUPPORTED_CONTRACT") {
+		t.Fatalf("версия контракта: status %d, body %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHumanDecideAppCredentialsViaFakeClient(t *testing.T) {
+	sink := &stubSink{result: DecisionResult{DecisionID: "journal-9"}}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+	srv.cfg.Credentials = AppCredentials{"app-reports": {"alice"}}
+
+	client, err := NewProjectionClient(ClientConn{Host: "127.0.0.1", Port: 7432, Token: "tok"},
+		fakeDoer{fn: func(req *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			srv.handler().ServeHTTP(w, req)
+			return w.Result(), nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	receipt, err := client.Decide(context.Background(), ClientDecision{
+		Verb: "approve", Target: "w1", Actor: "alice", AppKey: "app-reports",
+	})
+	if err != nil {
+		t.Fatalf("разрешённый actor через клиента: %v", err)
+	}
+	if !receipt.OK || receipt.Contract != HumanDecideContract {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+
+	if _, err := client.Decide(context.Background(), ClientDecision{
+		Verb: "approve", Target: "w2", Actor: "bob", AppKey: "app-reports",
+	}); err == nil {
+		t.Fatal("чужой actor должен отвергаться через клиента")
+	}
+	if len(sink.calls) != 1 {
+		t.Fatalf("sink calls = %+v", sink.calls)
+	}
+}
+
 func TestStartWritesConnectionAndCleansUp(t *testing.T) {
 	dir := t.TempDir()
 	srv, err := Start(Config{

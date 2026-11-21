@@ -553,6 +553,9 @@ type ClientDecision struct {
 	Note     string `json:"note,omitempty"`
 	Actor    string `json:"actor,omitempty"`
 	Contract string `json:"contract,omitempty"`
+	// AppKey identifies the calling application. The server checks it against
+	// its credential registry before accepting a decision for Actor.
+	AppKey string `json:"appKey,omitempty"`
 }
 
 // decideWire is the JSON shape of POST /api/v1/human/decide. It is the same
@@ -564,6 +567,7 @@ type decideWire struct {
 	Note     string `json:"note,omitempty"`
 	Actor    string `json:"actor,omitempty"`
 	Contract string `json:"contract,omitempty"`
+	AppKey   string `json:"appKey,omitempty"`
 }
 
 // ClientDecisionReceipt is the server receipt. OK false means the command was
@@ -589,6 +593,7 @@ func (c *ProjectionClient) Decide(ctx context.Context, req ClientDecision) (Clie
 		Note:     req.Note,
 		Actor:    req.Actor,
 		Contract: contract,
+		AppKey:   strings.TrimSpace(req.AppKey),
 	})
 	if err != nil {
 		return ClientDecisionReceipt{}, fmt.Errorf("httpapi: encode decision: %w", err)

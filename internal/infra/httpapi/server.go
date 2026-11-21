@@ -205,6 +205,10 @@ type Decision struct {
 	Note         string `json:"note,omitempty"`
 	Actor        string `json:"actor,omitempty"`
 	Contract     string `json:"contract,omitempty"`
+	// AppKey identifies the application that sent the command. When set, the
+	// server checks that the key is known and that Actor is one of its
+	// permitted actors. An empty value keeps the local TUI path unchanged.
+	AppKey string `json:"appKey,omitempty"`
 }
 
 // DecisionResult is returned for every accepted command. Applied is false on
@@ -225,6 +229,26 @@ type DecisionSink interface {
 	Apply(ctx context.Context, d Decision) (DecisionResult, error)
 }
 
+// AppCredentials binds an application key to the actors that application may
+// answer for. The composition root supplies the map; this transport never
+// issues keys, so T3.275 stays dropped. An app that declares a key can decide
+// only for an actor in that key's list.
+type AppCredentials map[string][]string
+
+// permits reports whether appKey is known and lists actor. An empty or unknown
+// key grants no permission, so a client cannot widen its rights by guessing.
+func (c AppCredentials) permits(appKey, actor string) bool {
+	if appKey == "" {
+		return false
+	}
+	for _, permitted := range c[appKey] {
+		if permitted == actor {
+			return true
+		}
+	}
+	return false
+}
+
 // Config is the set of ports and facts the composition root hands to Start.
 type Config struct {
 	Addr          string
@@ -238,6 +262,9 @@ type Config struct {
 	Provider StateProvider
 	Sink     DecisionSink
 	Events   *EventBus
+	// Credentials lists the permitted actors for each known application key.
+	// A nil map means no external app is configured and appKey is ignored.
+	Credentials AppCredentials
 }
 
 // connectionFile is written next to the state store with mode 0600. The extra
@@ -950,6 +977,14 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	}
 	if d.Contract != "" && d.Contract != HumanDecideContract {
 		writeError(w, http.StatusBadRequest, "UNSUPPORTED_CONTRACT", "неподдерживаемая версия контракта "+d.Contract)
+		return
+	}
+	// An application may answer only for its own actors. A local caller sends
+	// no appKey and keeps the TUI path; a declared key must be known and carry
+	// this actor in its permit list. Without a credential registry there is
+	// nothing to check, so the key is ignored.
+	if d.AppKey != "" && s.cfg.Credentials != nil && !s.cfg.Credentials.permits(d.AppKey, d.Actor) {
+		writeError(w, http.StatusForbidden, "ACTOR_NOT_PERMITTED", "приложение не вправе отвечать за actor "+d.Actor)
 		return
 	}
 
