@@ -1,5 +1,5 @@
 # RS-OBS-03. Метрики цикла и доставки в beacon metrics
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/observe/metrics.go, internal/infra/observe/metrics_test.go
@@ -24,3 +24,6 @@ baseline: `grep -c 'CounterFixersSpawned' internal/infra/observe/metrics.go` = 3
   Исход доставки в метриках отсутствует. Константы счётчиков и ключи меток лежат в internal/infra/observe/observe.go:88-140. Хелперы `WakeDeliveredSource` и `WakeFailed` в observe.go:444-451 и 502-515 принимают адаптер и ошибку, но не исход. Значение исхода вычисляется в internal/infra/cibridge/bridge.go:1070-1077 и 1560-1576 и в cmd/beacon/deliver.go:150-203 через classifyPrompt. Чтобы счётчик по адаптеру и исходу работал, нужно изменить сигнатуры хелперов в observe.go и их вызовы в cibridge/bridge.go и cmd/beacon/deliver.go. Все три файла вне OwnerFiles карточки. Счётчик, объявленный только в metrics.go, не будет увеличиваться и не ответит на вопрос приёмки про transport-failed и третью ступень.
 
   Статус todo сохранён. Код не писал, gofmt не применял, OwnerFiles не менял, дубль не создал, wiring и .beacon не трогал. Блокер возвращён оркестратору: для карточки нужны OwnerFiles с internal/infra/observe/observe.go, internal/infra/cibridge/bridge.go и cmd/beacon/deliver.go либо переформулировка шагов под уже существующие метрики.
+
+## Подтверждение
+- PR #876 MERGED: 2026-11-21 (squash).

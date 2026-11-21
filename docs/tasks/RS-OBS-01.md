@@ -1,5 +1,5 @@
 # RS-OBS-01. Корреляционные поля в структурированных логах цикла
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/observe/log.go, internal/infra/observe/log_test.go
@@ -15,3 +15,6 @@
 
 Premise: проверено повторно 2026-11-21. Поля watchID, revision, role, adapter, verdict и cycleID уже определены константами в internal/infra/observe/observe.go и пишутся в события. Тест связности по cycleID уже есть: TestW2ACycleIDTagsObserveEvents в internal/infra/cibridge/w2a_test.go. Baseline из Контекста подтверждён для OwnerFiles: в log.go нет литерала cycleID и нет упоминаний watchID, кроме одного комментария в строке 64.
 Блокер: структурная запись цикла создаётся в internal/infra/cibridge/bridge.go функцией cycleEvent и её вызовами, а константы полей лежат в internal/infra/observe/observe.go. Оба файла не входят в OwnerFiles карточки. Мои OwnerFiles, internal/infra/observe/log.go и log_test.go, только строят логгер, редактируют секреты, переименовывают cycleID в cycle_id и разбирают fence отчётов. Они не создают запись цикла, поэтому добавить поля и тест связности в них нельзя. Часть запрошенных полей уже есть в main, оставшиеся obligationID и attempt появляются только в cibridge. Нужно решение владельца: передать карточку владельцу cibridge/bridge.go и observe/observe.go или изменить OwnerFiles. Код не писал, gofmt не применял, дубль не создал. Возвращаю точный блокер оркестратору.
+
+## Подтверждение
+- PR #875 MERGED: 2026-11-21 (squash).
