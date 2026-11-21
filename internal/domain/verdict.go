@@ -212,11 +212,20 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	// the retry budget and the rollup: re-running a check on main can never make
 	// it green. Read the raw report before harmless-result filtering, so a base
 	// failure cannot be softened into a retry or a ready verdict by a stale
-	// SUCCESS conclusion on the caller's snapshot.
+	// SUCCESS conclusion on the caller's snapshot. An informational check is
+	// still excluded: required:false cannot block a Watch even when it fails
+	// on main. A check absent from s.Checks stays fail-closed.
+	//
+	// _BASELINE report: the cardindex check failed on the base branch with
+	// required:false and blocked 4 watchdogs (PR 1105, 1190, 1191, 1193).
 	for _, name := range s.Failures {
-		if s.BaseFailedChecks[name] {
-			return VerdictBlocked, wakeOrchestrator(WakePointer)
+		if !s.BaseFailedChecks[name] {
+			continue
 		}
+		if c, observed := s.Checks[name]; observed && !c.Required {
+			continue
+		}
+		return VerdictBlocked, wakeOrchestrator(WakePointer)
 	}
 	failed := realFailures(s)
 	// The rollup counts every check, including informational ones. When the

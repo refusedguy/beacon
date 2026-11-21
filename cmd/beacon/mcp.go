@@ -740,6 +740,13 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 			TasksDir: filepath.Join(projectRootForConfig(), "docs", "tasks"),
 			StateDir: dir,
 		},
+		// beacon_task_close needs the same card store port. Without it the
+		// handler sees nil and answers PERSIST_FAILED, so agents fall back to
+		// the CLI to close their cards.
+		TaskCloseStore: &mcp.FileTaskCloseStore{
+			TasksDir: filepath.Join(projectRootForConfig(), "docs", "tasks"),
+			StateDir: dir,
+		},
 		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
 			live, err := db.LiveWatches()
 			if err != nil {
