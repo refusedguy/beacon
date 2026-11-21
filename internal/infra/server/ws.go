@@ -56,19 +56,9 @@ type ParentNotice struct {
 }
 
 // ParentNotifier delivers a notice to a parent chat. It owns no store and no
-// chat client. The composition root binds the real adapter; a server without
+// chat client. The composition root binds the real function; a server without
 // one builds the notice but does not deliver it.
-type ParentNotifier interface {
-	Notify(ctx context.Context, notice ParentNotice) error
-}
-
-// ParentNotifierFunc adapts a function to ParentNotifier.
-type ParentNotifierFunc func(ctx context.Context, notice ParentNotice) error
-
-// Notify calls f with notice.
-func (f ParentNotifierFunc) Notify(ctx context.Context, notice ParentNotice) error {
-	return f(ctx, notice)
-}
+type ParentNotifier func(ctx context.Context, notice ParentNotice) error
 
 // Errors returned by ChildThreads. Callers use errors.Is to branch on them.
 var (
@@ -183,7 +173,7 @@ func (c *ChildThreads) Ask(ctx context.Context, notifier ParentNotifier, childID
 	if notifier == nil {
 		return notice, nil
 	}
-	if err := notifier.Notify(ctx, notice); err != nil {
+	if err := notifier(ctx, notice); err != nil {
 		return notice, err
 	}
 	return notice, nil

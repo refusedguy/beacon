@@ -26,7 +26,7 @@ type fakeWakeSender struct {
 	lastSource WakeSource
 }
 
-func (f *fakeWakeSender) Deliver(_ context.Context, target, text string, source WakeSource) (Delivery, string) {
+func (f *fakeWakeSender) Deliver(_ context.Context, target, text string, source WakeSource, _ WakeChannel) (Delivery, string) {
 	f.calls++
 	f.lastTarget = target
 	f.lastText = text
@@ -83,7 +83,7 @@ func TestWakeDeliveryModes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sender := &fakeWakeSender{delivery: tc.delivery}
-			handler := NewWakeHandler(sender)
+			handler := NewWakeHandler(sender.Deliver)
 
 			out, err := handler.Wake(context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7"})
 			if err != nil {
@@ -112,7 +112,7 @@ func TestWakeDeliveryModes(t *testing.T) {
 // cannot deliver must answer honestly and must not be counted as success.
 func TestWakeUnsupportedIsNotSuccess(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliveryUnsupported, reason: "no open session channel"}
-	handler := NewWakeHandler(sender)
+	handler := NewWakeHandler(sender.Deliver)
 
 	out, err := handler.Wake(context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7"})
 	if err != nil {
@@ -133,7 +133,7 @@ func TestWakeUnsupportedIsNotSuccess(t *testing.T) {
 // the adapter forgets to supply a reason.
 func TestWakeUnsupportedReasonIsMandatory(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliveryUnsupported}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("Wake() error = %v", err)
 	}
@@ -149,7 +149,7 @@ func TestWakeUnsupportedReasonIsMandatory(t *testing.T) {
 // delivery value and having it read as success.
 func TestWakeUnknownDeliveryIsUnsupported(t *testing.T) {
 	sender := &fakeWakeSender{delivery: Delivery("bogus")}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("Wake() error = %v", err)
 	}
@@ -190,7 +190,7 @@ func TestWakeRejectsMissingInput(t *testing.T) {
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
 			sender := &fakeWakeSender{delivery: DeliverySteer}
-			if _, err := NewWakeHandler(sender).Wake(context.Background(), in); err == nil {
+			if _, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), in); err == nil {
 				t.Fatal("Wake() error = nil, want an invalid-input error")
 			}
 			if sender.calls != 0 {
@@ -204,8 +204,8 @@ func TestWakeRejectsMissingInput(t *testing.T) {
 // the tool into NewServer. A repeated attach must not duplicate the tool.
 func TestAttachWakeRegistersOneTool(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 
 	session := connectWakeServer(t, server)
 	count := 0
@@ -241,7 +241,7 @@ func TestNewServerDoesNotRegisterWake(t *testing.T) {
 // the in-process handler.
 func TestWakeOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -312,7 +312,7 @@ func TestWakeInterruptsWhenHumanNeeded(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sender := &fakeWakeSender{delivery: DeliverySteer}
-			out, err := NewWakeHandler(sender).Wake(context.Background(), tc.in)
+			out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), tc.in)
 			if err != nil {
 				t.Fatalf("Wake() error = %v, want nil", err)
 			}
@@ -346,7 +346,7 @@ func TestWakeInterruptsWhenHumanNeeded(t *testing.T) {
 // stop the wait even when the delivery fields are absent.
 func TestWakeInterruptionWinsOverMissingInput(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{HasPendingQuestion: true})
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{HasPendingQuestion: true})
 	if err != nil {
 		t.Fatalf("Wake() error = %v, want nil", err)
 	}
@@ -366,7 +366,7 @@ func TestWakeInterruptionWinsOverMissingInput(t *testing.T) {
 // the schema from WakeInput; no hand-written JSON is involved.
 func TestWakeSchemaHasHumanFlags(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -396,7 +396,7 @@ func TestWakeSchemaHasHumanFlags(t *testing.T) {
 // and the interruption reason reaches the client, not just the local handler.
 func TestWakeInterruptionOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -435,7 +435,7 @@ func TestWakeInterruptionOverInMemoryTransport(t *testing.T) {
 // the source onto the output so the plugin can put it on the receipt.
 func TestWakeReviewSourceIsSteer(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Target: "session-1",
 		Text:   "obligation-1@7",
 		Source: SourceReview,
@@ -461,7 +461,7 @@ func TestWakeReviewSourceIsSteer(t *testing.T) {
 // working: an omitted source is reported as manual, not as an error or review.
 func TestWakeSourceDefaultsToManual(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("Wake() error = %v, want nil", err)
 	}
@@ -474,7 +474,7 @@ func TestWakeSourceDefaultsToManual(t *testing.T) {
 // boundary. No delivery is attempted for a value nobody defined.
 func TestWakeUnknownSourceIsRejected(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	if _, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	if _, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Target: "s",
 		Text:   "p",
 		Source: WakeSource("bogus"),
@@ -490,7 +490,7 @@ func TestWakeUnknownSourceIsRejected(t *testing.T) {
 // over a review source: a human question interrupts before any delivery.
 func TestWakeReviewSourceDoesNotBreakInterruption(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Target:             "session-1",
 		Text:               "obligation-1@7",
 		Source:             SourceReview,
@@ -514,7 +514,7 @@ func TestWakeReviewSourceDoesNotBreakInterruption(t *testing.T) {
 // so a caller can mark a diff comment as review in the tool call.
 func TestWakeSchemaHasSource(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -543,7 +543,7 @@ func TestWakeSchemaHasSource(t *testing.T) {
 func TestWakeReviewOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	AttachWake(server, NewWakeHandler(sender))
+	AttachWake(server, NewWakeHandler(sender.Deliver))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -578,7 +578,7 @@ func TestWakeReviewOverInMemoryTransport(t *testing.T) {
 // CLI-manager handover after a 429 stays visible in the wake receipt.
 func TestWakeEchoesExecutor(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Target: "session-1", Text: "obligation-1@7", Executor: "hermes",
 	})
 	if err != nil {
@@ -595,7 +595,7 @@ func TestWakeEchoesExecutor(t *testing.T) {
 // TestWakeExecutorOptional keeps older callers working: an omitted executor is
 // empty on the output and does not turn into an invalid-input error.
 func TestWakeExecutorOptional(t *testing.T) {
-	out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).Wake(
+	out, err := NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).Wake(
 		context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("Wake() error = %v, want nil", err)
@@ -608,7 +608,7 @@ func TestWakeExecutorOptional(t *testing.T) {
 // TestWakeExecutorOnRefusalAndInterruption keeps the executor visible on the
 // honest paths too: an unsupported delivery and a human interruption.
 func TestWakeExecutorOnRefusalAndInterruption(t *testing.T) {
-	refusal, err := NewWakeHandler(&fakeWakeSender{delivery: DeliveryUnsupported, reason: "no channel"}).Wake(
+	refusal, err := NewWakeHandler((&fakeWakeSender{delivery: DeliveryUnsupported, reason: "no channel"}).Deliver).Wake(
 		context.Background(), WakeInput{Target: "s", Text: "p", Executor: "gemini"})
 	if err != nil {
 		t.Fatalf("Wake() refusal error = %v", err)
@@ -617,7 +617,7 @@ func TestWakeExecutorOnRefusalAndInterruption(t *testing.T) {
 		t.Errorf("refusal executor=%q ok=%v, want gemini/false", refusal.Executor, refusal.OK)
 	}
 
-	interrupted, err := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).Wake(
+	interrupted, err := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver).Wake(
 		context.Background(), WakeInput{Target: "s", Text: "p", Executor: "gemini", HasPendingQuestion: true})
 	if err != nil {
 		t.Fatalf("Wake() interruption error = %v", err)
@@ -632,7 +632,7 @@ func TestWakeExecutorOnRefusalAndInterruption(t *testing.T) {
 // so a caller can report a fallback handover through the wake tool.
 func TestWakeSchemaHasExecutor(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -660,7 +660,7 @@ func TestWakeSchemaHasExecutor(t *testing.T) {
 // back to the client, not just handled in process.
 func TestWakeExecutorOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -703,7 +703,7 @@ func TestWokeIsNotDerivedFromDelivery(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sender := &fakeWakeSender{delivery: tc.delivery, reason: "no channel"}
-			out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
+			out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{Target: "s", Text: "p"})
 			if err != nil {
 				t.Fatalf("Wake() error = %v", err)
 			}
@@ -730,7 +730,7 @@ func TestWokeIsReportedIndependently(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sender := &fakeWakeSender{delivery: tc.delivery, reason: "no channel"}
-			out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{Target: "s", Text: "p", Woke: true})
+			out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{Target: "s", Text: "p", Woke: true})
 			if err != nil {
 				t.Fatalf("Wake() error = %v", err)
 			}
@@ -747,7 +747,7 @@ func TestWokeIsReportedIndependently(t *testing.T) {
 // TestWokeOnInterruption keeps the fact independent of the ADR 0028 path too:
 // a human interruption sends nothing, yet a reported start is still visible.
 func TestWokeOnInterruption(t *testing.T) {
-	out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).Wake(
+	out, err := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver).Wake(
 		context.Background(), WakeInput{Target: "s", Text: "p", HasPendingQuestion: true, Woke: true})
 	if err != nil {
 		t.Fatalf("Wake() error = %v", err)
@@ -760,7 +760,7 @@ func TestWokeOnInterruption(t *testing.T) {
 // TestWakeSchemaHasWoke proves an MCP client can send the separate woke fact.
 func TestWakeSchemaHasWoke(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -788,7 +788,7 @@ func TestWakeSchemaHasWoke(t *testing.T) {
 // just handled in process.
 func TestWokeOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -843,7 +843,7 @@ func TestWakeSelectsAgentByCapability(t *testing.T) {
 		{Target: "chat-session", Capabilities: []Capability{"chat"}},
 		{Target: "review-session", Capabilities: []Capability{"review", "build"}},
 	}}
-	handler := NewCapabilityWakeHandler(sender, directory)
+	handler := NewCapabilityWakeHandler(sender.Deliver, directory)
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Text:                 "obligation-1@7",
@@ -873,7 +873,7 @@ func TestWakeCapabilityIsNotANameLookup(t *testing.T) {
 		{Target: "worker-7", Capabilities: []Capability{"review"}},
 	}}
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	first, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	first, err := NewCapabilityWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Target:               "favourite-name",
 		Text:                 "p",
 		RequiredCapabilities: []Capability{"review"},
@@ -887,7 +887,7 @@ func TestWakeCapabilityIsNotANameLookup(t *testing.T) {
 
 	directory.candidates[1].Target = "worker-99"
 	renamedSender := &fakeWakeSender{delivery: DeliveryQueue}
-	renamed, err := NewCapabilityWakeHandler(renamedSender, directory).Wake(context.Background(), WakeInput{
+	renamed, err := NewCapabilityWakeHandler(renamedSender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Text:                 "p",
 		RequiredCapabilities: []Capability{"review"},
 	})
@@ -907,7 +907,7 @@ func TestWakeNoCapabilityMatchIsAnHonestRefusal(t *testing.T) {
 	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 		{Target: "chat-session", Capabilities: []Capability{"chat"}},
 	}}
-	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewCapabilityWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Text:                 "p",
 		RequiredCapabilities: []Capability{"review"},
 	})
@@ -929,7 +929,7 @@ func TestWakeNoCapabilityMatchIsAnHonestRefusal(t *testing.T) {
 // is never turned into a guessed name when the environment has no directory.
 func TestWakeCapabilityWithoutDirectoryIsUnsupported(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Text:                 "p",
 		RequiredCapabilities: []Capability{"review"},
 	})
@@ -954,7 +954,7 @@ func TestWakeCapabilityKeepsHumanFlagsFirst(t *testing.T) {
 	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 		{Target: "review-session", Capabilities: []Capability{"review"}},
 	}}
-	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewCapabilityWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Text:                 "p",
 		HasPendingQuestion:   true,
 		RequiredCapabilities: []Capability{"review"},
@@ -978,7 +978,7 @@ func TestWakeCapabilityKeepsBothDeliveryModes(t *testing.T) {
 		directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 			{Target: "review-session", Capabilities: []Capability{"review"}},
 		}}
-		out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		out, err := NewCapabilityWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 			Text:                 "p",
 			RequiredCapabilities: []Capability{"review"},
 		})
@@ -1002,7 +1002,7 @@ func TestWakeWithoutCapabilitiesKeepsExplicitTarget(t *testing.T) {
 	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 		{Target: "capable-session", Capabilities: []Capability{"review"}},
 	}}
-	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewCapabilityWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Target: "named-session",
 		Text:   "p",
 	})
@@ -1021,7 +1021,7 @@ func TestWakeWithoutCapabilitiesKeepsExplicitTarget(t *testing.T) {
 // capability request that drives the new selection path.
 func TestWakeSchemaHasRequiredCapabilities(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -1054,7 +1054,7 @@ func TestWakeCapabilityOverInMemoryTransport(t *testing.T) {
 		{Target: "chat-session", Capabilities: []Capability{"chat"}},
 		{Target: "review-session", Capabilities: []Capability{"review"}},
 	}}
-	AttachWake(server, NewCapabilityWakeHandler(sender, directory))
+	AttachWake(server, NewCapabilityWakeHandler(sender.Deliver, directory))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -1129,7 +1129,7 @@ func TestWakeAddressesByWorktree(t *testing.T) {
 		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
 		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
 	}}
-	handler := NewWorktreeWakeHandler(sender, directory)
+	handler := NewWorktreeWakeHandler(sender.Deliver, directory)
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Text:           "obligation-1@7",
@@ -1160,7 +1160,7 @@ func TestWakeWorktreeSurvivesRestart(t *testing.T) {
 	in := WakeInput{Text: "p", TargetWorktree: "/repo/worktrees/w1"}
 
 	firstSender := &fakeWakeSender{delivery: DeliveryQueue}
-	if _, err := NewWorktreeWakeHandler(firstSender, directory).Wake(context.Background(), in); err != nil {
+	if _, err := NewWorktreeWakeHandler(firstSender.Deliver, directory).Wake(context.Background(), in); err != nil {
 		t.Fatalf("Wake() before restart error = %v, want nil", err)
 	}
 	if firstSender.lastTarget != "session-old" {
@@ -1170,7 +1170,7 @@ func TestWakeWorktreeSurvivesRestart(t *testing.T) {
 	// Same worktree path, a different session id: a restart.
 	directory.candidates[0].Target = "session-new"
 	secondSender := &fakeWakeSender{delivery: DeliveryQueue}
-	if _, err := NewWorktreeWakeHandler(secondSender, directory).Wake(context.Background(), in); err != nil {
+	if _, err := NewWorktreeWakeHandler(secondSender.Deliver, directory).Wake(context.Background(), in); err != nil {
 		t.Fatalf("Wake() after restart error = %v, want nil", err)
 	}
 	if secondSender.lastTarget != "session-new" {
@@ -1186,7 +1186,7 @@ func TestWakeOtherWorktreeDoesNotReceive(t *testing.T) {
 	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
 	}}
-	out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewWorktreeWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Text: "p", TargetWorktree: "/repo/worktrees/w1",
 	})
 	if err != nil {
@@ -1207,7 +1207,7 @@ func TestWakeOtherWorktreeDoesNotReceive(t *testing.T) {
 // never turned into a guessed session id when the environment has no directory.
 func TestWakeWorktreeWithoutDirectoryIsUnsupported(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Text: "p", TargetWorktree: "/repo/worktrees/w1",
 	})
 	if err != nil {
@@ -1231,7 +1231,7 @@ func TestWakeWorktreeKeepsHumanFlagsFirst(t *testing.T) {
 	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
 	}}
-	out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewWorktreeWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Text: "p", TargetWorktree: "/repo/worktrees/w1", HasPendingQuestion: true,
 	})
 	if err != nil {
@@ -1253,7 +1253,7 @@ func TestWakeWorktreeKeepsBothDeliveryModes(t *testing.T) {
 		directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 			{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
 		}}
-		out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+		out, err := NewWorktreeWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 			Text: "p", TargetWorktree: "/repo/worktrees/w1",
 		})
 		if err != nil {
@@ -1272,7 +1272,7 @@ func TestWakeWorktreeKeepsExplicitTarget(t *testing.T) {
 	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
 		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
 	}}
-	out, err := NewWorktreeWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewWorktreeWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Target: "named-session", Text: "p",
 	})
 	if err != nil {
@@ -1295,7 +1295,7 @@ func TestWakeWorktreeWithCapabilities(t *testing.T) {
 		{Target: "review-w1", Capabilities: []Capability{"review"}, WorktreePath: "/repo/worktrees/w1"},
 		{Target: "review-w2", Capabilities: []Capability{"review"}, WorktreePath: "/repo/worktrees/w2"},
 	}}
-	out, err := NewCapabilityWakeHandler(sender, directory).Wake(context.Background(), WakeInput{
+	out, err := NewCapabilityWakeHandler(sender.Deliver, directory).Wake(context.Background(), WakeInput{
 		Text:                 "p",
 		RequiredCapabilities: []Capability{"review"},
 		TargetWorktree:       "/repo/worktrees/w2",
@@ -1312,7 +1312,7 @@ func TestWakeWorktreeWithCapabilities(t *testing.T) {
 // path that drives the new addressing path.
 func TestWakeSchemaHasTargetWorktree(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -1345,7 +1345,7 @@ func TestWakeWorktreeOverInMemoryTransport(t *testing.T) {
 		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
 		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
 	}}
-	AttachWake(server, NewWorktreeWakeHandler(sender, directory))
+	AttachWake(server, NewWorktreeWakeHandler(sender.Deliver, directory))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -1445,7 +1445,7 @@ func TestWakeFallbackConfirmedSteerStops(t *testing.T) {
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true, ChannelQueue: true}}
 	tracer := &fakeTracer{}
 
-	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, confirmer, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7"})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1475,7 +1475,7 @@ func TestWakeFallbackUnconfirmedSteerGoesToNextTurn(t *testing.T) {
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelQueue: true}}
 	tracer := &fakeTracer{}
 
-	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, confirmer, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7"})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1505,7 +1505,7 @@ func TestWakeFallbackExhaustedGoesToTaskTrace(t *testing.T) {
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{}}
 	tracer := &fakeTracer{}
 
-	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, confirmer, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "session-1", Text: "obligation-1@7", Source: SourceReview})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1538,7 +1538,7 @@ func TestWakeFallbackUnsupportedIsNotSuccess(t *testing.T) {
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true, ChannelQueue: true}}
 	tracer := &fakeTracer{}
 
-	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, confirmer, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1566,7 +1566,7 @@ func TestWakeFallbackWithoutConfirmerIsTraced(t *testing.T) {
 	}}
 	tracer := &fakeTracer{}
 
-	out, err := NewFallbackWakeHandler(sender, nil, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, nil, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1586,7 +1586,7 @@ func TestWakeFallbackTracerFailureIsHonest(t *testing.T) {
 	}}
 	tracer := &fakeTracer{err: errors.New("store unavailable")}
 
-	out, err := NewFallbackWakeHandler(sender, &fakeConfirmer{}, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, &fakeConfirmer{}, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1609,7 +1609,7 @@ func TestWakeFallbackKeepsHumanFlagsFirst(t *testing.T) {
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true, ChannelQueue: true}}
 	tracer := &fakeTracer{}
 
-	out, err := NewFallbackWakeHandler(sender, confirmer, tracer).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, confirmer, tracer).WakeWithFallback(
 		context.Background(), WakeInput{Target: "s", Text: "p", HasPendingQuestion: true})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
@@ -1634,7 +1634,7 @@ func TestWakeFallbackKeepsCapabilitySelection(t *testing.T) {
 		{Target: "chat-session", Capabilities: []Capability{"chat"}},
 		{Target: "review-session", Capabilities: []Capability{"review"}},
 	}}
-	handler := NewCapabilityFallbackWakeHandler(sender, confirmer, &fakeTracer{}, directory)
+	handler := NewCapabilityFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}, directory)
 
 	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
 		Text:                 "p",
@@ -1663,7 +1663,7 @@ func TestWakeFallbackKeepsWorktreeSelection(t *testing.T) {
 		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
 		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
 	}}
-	handler := NewCapabilityFallbackWakeHandler(sender, confirmer, &fakeTracer{}, directory)
+	handler := NewCapabilityFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}, directory)
 
 	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
 		Text: "p", TargetWorktree: "/repo/worktrees/w2",
@@ -1688,7 +1688,7 @@ func TestWakeFallbackOverInMemoryTransport(t *testing.T) {
 		ChannelSteer: {delivery: DeliverySteer},
 		ChannelQueue: {delivery: DeliveryQueue},
 	}}
-	AttachWake(server, NewFallbackWakeHandler(sender, &fakeConfirmer{}, &fakeTracer{}))
+	AttachWake(server, NewFallbackWakeHandler(sender.Deliver, &fakeConfirmer{}, &fakeTracer{}))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -1743,7 +1743,7 @@ func TestWakeWithoutWindowDoesNotWait(t *testing.T) {
 	for _, millis := range []int64{0, -1} {
 		sleeper := &recordingSleeper{}
 		sender := &fakeWakeSender{delivery: DeliverySteer}
-		handler := NewWakeHandler(sender).WithWakeSleeper(sleeper)
+		handler := NewWakeHandler(sender.Deliver).WithWakeSleeper(sleeper)
 
 		out, err := handler.Wake(context.Background(), WakeInput{
 			Target: "s", Text: "p", WakeBetweenMillis: millis,
@@ -1766,7 +1766,7 @@ func TestWakeBetweenStaggersFifteenWaiters(t *testing.T) {
 	const windowMillis = int64(1500)
 	window := time.Duration(windowMillis) * time.Millisecond
 	sleeper := &recordingSleeper{}
-	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).WithWakeSleeper(sleeper)
+	handler := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver).WithWakeSleeper(sleeper)
 
 	for i := 0; i < waiters; i++ {
 		out, err := handler.Wake(context.Background(), WakeInput{
@@ -1842,7 +1842,7 @@ func TestWakeBetweenUsesWindowFromContract(t *testing.T) {
 	window := 900 * time.Millisecond
 	sleeper := &recordingSleeper{}
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	handler := NewWakeHandler(sender).
+	handler := NewWakeHandler(sender.Deliver).
 		WithWakeSleeper(sleeper).
 		WithWakePoint(func(got time.Duration) time.Duration {
 			if got != window {
@@ -1870,7 +1870,7 @@ func TestWakeBetweenUsesWindowFromContract(t *testing.T) {
 func TestWakeBetweenHumanFlagsWin(t *testing.T) {
 	sleeper := &recordingSleeper{}
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).WithWakeSleeper(sleeper).Wake(
+	out, err := NewWakeHandler(sender.Deliver).WithWakeSleeper(sleeper).Wake(
 		context.Background(), WakeInput{
 			Target: "s", Text: "p", WakeBetweenMillis: 1500, HasPendingQuestion: true,
 		})
@@ -1889,7 +1889,7 @@ func TestWakeBetweenHumanFlagsWin(t *testing.T) {
 // error, never a delivery after the caller has gone away.
 func TestWakeBetweenCancelledWaitDeliversNothing(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithWakeSleeper(&recordingSleeper{err: context.Canceled})
+	handler := NewWakeHandler(sender.Deliver).WithWakeSleeper(&recordingSleeper{err: context.Canceled})
 
 	_, err := handler.Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", WakeBetweenMillis: 1500,
@@ -1915,7 +1915,7 @@ func TestWakeBetweenFallbackStaggersOnce(t *testing.T) {
 	}}
 	sleeper := &recordingSleeper{}
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelQueue: true}}
-	handler := NewFallbackWakeHandler(sender, confirmer, &fakeTracer{}).WithWakeSleeper(sleeper)
+	handler := NewFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}).WithWakeSleeper(sleeper)
 
 	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
 		Target: "s", Text: "p", WakeBetweenMillis: 900,
@@ -1938,7 +1938,7 @@ func TestWakeBetweenFallbackStaggersOnce(t *testing.T) {
 // window that drives the stagger.
 func TestWakeSchemaHasWakeBetweenMillis(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -1967,7 +1967,7 @@ func TestWakeSchemaHasWakeBetweenMillis(t *testing.T) {
 func TestWakeBetweenOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
 	sleeper := &recordingSleeper{}
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithWakeSleeper(sleeper))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).WithWakeSleeper(sleeper))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -2028,7 +2028,7 @@ func TestWakeReceiptStateIsClosedSet(t *testing.T) {
 // boundary. An invented state is an invalid input and touches no sender.
 func TestWakeUnknownReceiptStateRejected(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	out, err := NewWakeHandler(sender).Wake(context.Background(), WakeInput{
+	out, err := NewWakeHandler(sender.Deliver).Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", State: DeliveryState("bogus"),
 	})
 	if err == nil {
@@ -2065,7 +2065,7 @@ func TestWakeReportsCallerState(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.state), func(t *testing.T) {
-			out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).Wake(
+			out, err := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver).Wake(
 				context.Background(), WakeInput{Target: "s", Text: "p", State: tc.state})
 			if err != nil {
 				t.Fatalf("Wake() error = %v", err)
@@ -2096,7 +2096,7 @@ func TestWakeRefusedIsNotRead(t *testing.T) {
 		t.Error("StateRead reports IsRead=false, want true")
 	}
 
-	out, err := NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).Wake(
+	out, err := NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).Wake(
 		context.Background(), WakeInput{Target: "s", Text: "p", State: StateRefused})
 	if err != nil {
 		t.Fatalf("Wake() error = %v", err)
@@ -2130,7 +2130,7 @@ func TestWakeDefaultsReceiptStateFromDelivery(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := NewWakeHandler(&fakeWakeSender{delivery: tc.sender}).Wake(context.Background(), tc.in)
+			out, err := NewWakeHandler((&fakeWakeSender{delivery: tc.sender}).Deliver).Wake(context.Background(), tc.in)
 			if err != nil {
 				t.Fatalf("Wake() error = %v", err)
 			}
@@ -2151,7 +2151,7 @@ func TestWakeFallbackTraceDefaultsToSpooled(t *testing.T) {
 		ChannelSteer: {delivery: DeliverySteer},
 		ChannelQueue: {delivery: DeliveryQueue},
 	}}
-	out, err := NewFallbackWakeHandler(sender, &fakeConfirmer{}, &fakeTracer{}).WakeWithFallback(
+	out, err := NewFallbackWakeHandler(sender.Deliver, &fakeConfirmer{}, &fakeTracer{}).WakeWithFallback(
 		context.Background(), WakeInput{Target: "s", Text: "p"})
 	if err != nil {
 		t.Fatalf("WakeWithFallback() error = %v", err)
@@ -2166,7 +2166,7 @@ func TestWakeFallbackTraceDefaultsToSpooled(t *testing.T) {
 // echoed on the receipt, not just handled in process.
 func TestWakeStateOverInMemoryTransport(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -2195,7 +2195,7 @@ func TestWakeStateOverInMemoryTransport(t *testing.T) {
 // the environment can report where in its life a message actually is.
 func TestWakeSchemaHasState(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -2235,7 +2235,7 @@ func TestT3_110WakeValidationErrorIsRepairable(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer})
+			handler := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver)
 			_, err := handler.Wake(context.Background(), tc.in)
 			if err == nil {
 				t.Fatal("Wake() error = nil, want a repairable error")
@@ -2269,7 +2269,7 @@ func TestT3_110WakeValidationErrorIsRepairable(t *testing.T) {
 // parameter, and the retried call reaches the sender instead of resending all.
 func TestT3_110RecoveryHintLetsModelFixOneParameterAndContinue(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender)
+	handler := NewWakeHandler(sender.Deliver)
 
 	bad := WakeInput{Target: "session-1", Text: "obligation-1@7", Source: "revie"}
 	_, err := handler.Wake(context.Background(), bad)
@@ -2356,7 +2356,7 @@ func TestT3_110RepairableShapeKeepsADR0009Form(t *testing.T) {
 // pointing the model at the wake window instead of a dead session.
 func TestT3_110CancelledWaitIsRepairable(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithWakeSleeper(&recordingSleeper{err: context.Canceled})
+	handler := NewWakeHandler(sender.Deliver).WithWakeSleeper(&recordingSleeper{err: context.Canceled})
 
 	_, err := handler.Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", WakeBetweenMillis: 1500,
@@ -2612,7 +2612,7 @@ func TestT3_121ConcurrentAckHasSingleWinner(t *testing.T) {
 // handler without one refuses an honest confirmation instead of guessing.
 func TestT3_121WakeHandlerConfirmation(t *testing.T) {
 	ledger, _ := newTestConfirmationLedger()
-	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer}).WithConfirmations(ledger)
+	handler := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver).WithConfirmations(ledger)
 	token, err := ledger.Issue("wake-1", time.Minute)
 	if err != nil {
 		t.Fatalf("Issue() error = %v", err)
@@ -2640,7 +2640,7 @@ func TestT3_121WakeHandlerConfirmation(t *testing.T) {
 // any delivery, and is echoed on a successful receipt.
 func TestT3_124PromptGetsInstantOperationID(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry())
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "session-1",
@@ -2671,7 +2671,7 @@ func TestT3_124PromptGetsInstantOperationID(t *testing.T) {
 // test: a repeated prompt returns the existing id and starts no second task.
 func TestT3_124EqualPromptReusesOperationIDAndStartsNoSecondTask(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry())
 	in := WakeInput{Target: "session-1", Text: "obligation-1@7", Prompt: "review the PR and merge"}
 
 	first, err := handler.Wake(context.Background(), in)
@@ -2713,7 +2713,7 @@ func TestT3_124EqualPromptReusesOperationIDAndStartsNoSecondTask(t *testing.T) {
 // a second task while leaving the prompt content itself untouched.
 func TestT3_124TrimsSurroundingWhitespace(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry())
 
 	first, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p", Prompt: "  build and test\n"})
 	if err != nil {
@@ -2736,7 +2736,7 @@ func TestT3_124TrimsSurroundingWhitespace(t *testing.T) {
 // content, not on a single global operation.
 func TestT3_124DistinctPromptsStartDistinctTasks(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry())
 
 	first, err := handler.Wake(context.Background(), WakeInput{Target: "s", Text: "p1", Prompt: "build the API"})
 	if err != nil {
@@ -2763,7 +2763,7 @@ func TestT3_124DistinctPromptsStartDistinctTasks(t *testing.T) {
 // delivery target changes between calls.
 func TestT3_124DifferentTargetsSamePromptIsOneTask(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry())
 
 	first, err := handler.Wake(context.Background(), WakeInput{Target: "session-A", Text: "p", Prompt: "same job"})
 	if err != nil {
@@ -2790,7 +2790,7 @@ func TestT3_124DuplicateSkipsFallbackChain(t *testing.T) {
 	}}
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
 	tracer := &fakeTracer{}
-	handler := NewFallbackWakeHandler(sender, confirmer, tracer).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewFallbackWakeHandler(sender.Deliver, confirmer, tracer).WithOperationRegistry(NewMemoryOperationRegistry())
 	in := WakeInput{Target: "s", Text: "p", Prompt: "long job"}
 
 	first, err := handler.WakeWithFallback(context.Background(), in)
@@ -2818,7 +2818,7 @@ func TestT3_124DuplicateSkipsFallbackChain(t *testing.T) {
 func TestT3_124DuplicateDoesNotWait(t *testing.T) {
 	sleeper := &recordingSleeper{}
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	handler := NewWakeHandler(sender).
+	handler := NewWakeHandler(sender.Deliver).
 		WithOperationRegistry(NewMemoryOperationRegistry()).
 		WithWakeSleeper(sleeper).
 		WithWakePoint(func(time.Duration) time.Duration { return 0 })
@@ -2849,7 +2849,7 @@ func TestT3_124LegacyCallersKeepTheirOutput(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sender := &fakeWakeSender{delivery: DeliverySteer}
-			handler := NewWakeHandler(sender)
+			handler := NewWakeHandler(sender.Deliver)
 			if tc.withReg {
 				handler = handler.WithOperationRegistry(NewMemoryOperationRegistry())
 			}
@@ -2881,7 +2881,7 @@ func TestT3_124LegacyCallersKeepTheirOutput(t *testing.T) {
 func TestT3_124ConcurrentEqualPromptsStartOneTask(t *testing.T) {
 	const callers = 32
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry())
 	in := WakeInput{Target: "s", Text: "p", Prompt: "one job"}
 
 	type answer struct {
@@ -2927,7 +2927,7 @@ func TestT3_124ConcurrentEqualPromptsStartOneTask(t *testing.T) {
 // schema derived by go-sdk, so a real client can send it.
 func TestT3_124WakeSchemaHasPrompt(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -2956,7 +2956,7 @@ func TestT3_124WakeSchemaHasPrompt(t *testing.T) {
 func TestT3_124OverInMemoryTransport(t *testing.T) {
 	server := NewServer()
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	AttachWake(server, NewWakeHandler(sender).WithOperationRegistry(NewMemoryOperationRegistry()))
+	AttachWake(server, NewWakeHandler(sender.Deliver).WithOperationRegistry(NewMemoryOperationRegistry()))
 	session := connectWakeServer(t, server)
 
 	args := WakeInput{Target: "session-1", Text: "obligation-1@7", Prompt: "build and ship"}
@@ -3051,7 +3051,7 @@ func (r *recordingDoorbell) Ring(msg DoorbellMessage) bool {
 func TestT3_129AddressedWakeRingsListener(t *testing.T) {
 	d := NewDoorbell()
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithDoorbell(d)
+	handler := NewWakeHandler(sender.Deliver).WithDoorbell(d)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := startDoorbellListener(ctx, d, "mailbox-A")
@@ -3087,7 +3087,7 @@ func TestT3_129AddressedWakeRingsListener(t *testing.T) {
 func TestT3_129BroadcastDoesNotRingDoorbell(t *testing.T) {
 	d := NewDoorbell()
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	handler := NewWakeHandler(sender).WithDoorbell(d)
+	handler := NewWakeHandler(sender.Deliver).WithDoorbell(d)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := startDoorbellListener(ctx, d, "mailbox-A")
@@ -3186,7 +3186,7 @@ func TestT3_129LongPollBlocksUntilCancel(t *testing.T) {
 func TestT3_129DuplicatePromptDoesNotRingDoorbell(t *testing.T) {
 	bell := &recordingDoorbell{}
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithDoorbell(bell).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithDoorbell(bell).WithOperationRegistry(NewMemoryOperationRegistry())
 	in := WakeInput{Target: "session-1", Text: "p", Mailbox: "mailbox-A", Prompt: "long job"}
 
 	first, err := handler.Wake(context.Background(), in)
@@ -3222,7 +3222,7 @@ func TestT3_129DuplicatePromptDoesNotRingDoorbell(t *testing.T) {
 // broadcast flag to the port and reports the honest false trigger fact.
 func TestT3_129BroadcastPassesThroughHandler(t *testing.T) {
 	bell := &recordingDoorbell{}
-	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithDoorbell(bell)
+	handler := NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).WithDoorbell(bell)
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", Mailbox: "mailbox-A", Broadcast: true,
@@ -3246,7 +3246,7 @@ func TestT3_129FallbackWakeRingsDoorbell(t *testing.T) {
 		ChannelSteer: {delivery: DeliverySteer},
 	}}
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
-	handler := NewFallbackWakeHandler(sender, confirmer, &fakeTracer{}).WithDoorbell(bell)
+	handler := NewFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}).WithDoorbell(bell)
 
 	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
 		Target: "s", Text: "p", Mailbox: "mailbox-A",
@@ -3268,7 +3268,7 @@ func TestT3_129FallbackWakeRingsDoorbell(t *testing.T) {
 // TestT3_129LegacyCallerWithoutDoorbell keeps an empty trigger fact when no
 // port is attached, so callers written before ADR 0058 p2 are unchanged.
 func TestT3_129LegacyCallerWithoutDoorbell(t *testing.T) {
-	handler := NewWakeHandler(&fakeWakeSender{delivery: DeliverySteer})
+	handler := NewWakeHandler((&fakeWakeSender{delivery: DeliverySteer}).Deliver)
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", Mailbox: "mailbox-A",
 	})
@@ -3310,7 +3310,7 @@ func TestT3_129ConcurrentRingsDoNotLoseMessages(t *testing.T) {
 func TestT3_129OverInMemoryTransport(t *testing.T) {
 	d := NewDoorbell()
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithDoorbell(d))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).WithDoorbell(d))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -3420,7 +3420,7 @@ func TestT3_135GuardDecision(t *testing.T) {
 func TestT3_135TimerTickAloneNeverWakes(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
 	bell := &recordingDoorbell{}
-	handler := NewWakeHandler(sender).WithDoorbell(bell).WithHeartbeatGuard(NewHeartbeatGuard())
+	handler := NewWakeHandler(sender.Deliver).WithDoorbell(bell).WithHeartbeatGuard(NewHeartbeatGuard())
 
 	for i := 0; i < 3; i++ {
 		out, err := handler.Wake(context.Background(), WakeInput{
@@ -3469,7 +3469,7 @@ func TestT3_135TimerTickAloneNeverWakes(t *testing.T) {
 // an unchanged state still wakes when quota should-run is open.
 func TestT3_135QuotaGateReleasesWake(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
-	handler := NewWakeHandler(sender).WithHeartbeatGuard(NewHeartbeatGuard())
+	handler := NewWakeHandler(sender.Deliver).WithHeartbeatGuard(NewHeartbeatGuard())
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", HeartbeatState: "same", QuotaShouldRun: true,
@@ -3494,7 +3494,7 @@ func TestT3_135QuotaGateReleasesWake(t *testing.T) {
 // being treated as a duplicate.
 func TestT3_135HeldTickRegistersNoOperation(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).
+	handler := NewWakeHandler(sender.Deliver).
 		WithOperationRegistry(NewMemoryOperationRegistry()).
 		WithHeartbeatGuard(NewHeartbeatGuard())
 
@@ -3535,7 +3535,7 @@ func TestT3_135HeldTickRegistersNoOperation(t *testing.T) {
 // no guard facts appear on the receipt.
 func TestT3_135LegacyCallerWithoutGuard(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender)
+	handler := NewWakeHandler(sender.Deliver)
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "s", Text: "p", HeartbeatState: "stable", HeartbeatTick: true,
@@ -3561,7 +3561,7 @@ func TestT3_135FallbackRespectsGuard(t *testing.T) {
 		ChannelSteer: {delivery: DeliverySteer},
 	}}
 	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
-	handler := NewFallbackWakeHandler(sender, confirmer, &fakeTracer{}).
+	handler := NewFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}).
 		WithHeartbeatGuard(NewHeartbeatGuard())
 
 	held, err := handler.WakeWithFallback(context.Background(), WakeInput{
@@ -3627,7 +3627,7 @@ func TestT3_135ConcurrentGuardEvaluations(t *testing.T) {
 // CI sees.
 func TestT3_135OverInMemoryTransport(t *testing.T) {
 	server := NewServer()
-	AttachWake(server, NewWakeHandler(&fakeWakeSender{delivery: DeliveryQueue}).WithHeartbeatGuard(NewHeartbeatGuard()))
+	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).WithHeartbeatGuard(NewHeartbeatGuard()))
 	session := connectWakeServer(t, server)
 
 	var inputSchema []byte
@@ -3684,7 +3684,7 @@ func TestT3_135OverInMemoryTransport(t *testing.T) {
 func TestWakeCoreFeaturesIntact(t *testing.T) {
 	bell := &recordingDoorbell{}
 	sender := &fakeWakeSender{delivery: DeliverySteer}
-	handler := NewWakeHandler(sender).WithDoorbell(bell).WithOperationRegistry(NewMemoryOperationRegistry())
+	handler := NewWakeHandler(sender.Deliver).WithDoorbell(bell).WithOperationRegistry(NewMemoryOperationRegistry())
 	in := WakeInput{Target: "session-1", Text: "p", Mailbox: "mailbox-A", Prompt: "long job"}
 
 	first, err := handler.Wake(context.Background(), in)
@@ -3731,7 +3731,7 @@ func TestRegistryGuardHoldsStaleWake(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
 	bell := &recordingDoorbell{}
 	guard := &fakeRegistryGuard{statuses: map[string]string{"exec-1": "stale"}}
-	handler := NewWakeHandler(sender).
+	handler := NewWakeHandler(sender.Deliver).
 		WithDoorbell(bell).
 		WithOperationRegistry(NewMemoryOperationRegistry()).
 		WithRegistryGuard(guard)
@@ -3774,7 +3774,7 @@ func TestRegistryGuardHoldsStaleWake(t *testing.T) {
 func TestRegistryGuardAllowsActiveWake(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliveryQueue}
 	guard := &fakeRegistryGuard{statuses: map[string]string{"exec-2": "active"}}
-	handler := NewWakeHandler(sender).WithRegistryGuard(guard)
+	handler := NewWakeHandler(sender.Deliver).WithRegistryGuard(guard)
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "session-2", Executor: "exec-2", Text: "pointer-only",
@@ -3802,7 +3802,7 @@ func TestRegistryGuardAllowsActiveWake(t *testing.T) {
 func TestRegistryGuardUnknownStatusHoldsWake(t *testing.T) {
 	sender := &fakeWakeSender{delivery: DeliverySteer}
 	guard := &fakeRegistryGuard{statuses: map[string]string{}}
-	handler := NewWakeHandler(sender).WithRegistryGuard(guard)
+	handler := NewWakeHandler(sender.Deliver).WithRegistryGuard(guard)
 
 	out, err := handler.Wake(context.Background(), WakeInput{
 		Target: "session-3", Text: "pointer-only",
