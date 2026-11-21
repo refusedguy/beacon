@@ -31,16 +31,20 @@ var counterLabels = map[string]string{
 	CounterActorErrors:      "",
 }
 
-// Counters for the blocked -> fixer -> unblock path. They live outside the
-// generic counterLabels registry on purpose: that registry is a closed set
-// whose export is covered by a fixed-name test. These two are plain totals and
-// are exported by JSON and Prometheus through extendedCounterNames below.
+// Counters for the blocked -> fixer -> unblock path and for file adapter reads.
+// They live outside the generic counterLabels registry on purpose: that
+// registry is a closed set whose export is covered by a fixed-name test. These
+// plain totals are exported by JSON and Prometheus through extendedCounterNames
+// below.
 const (
-	CounterFixersSpawned   = "fixers_spawned_total"
-	CounterBlocksEscalated = "blocks_escalated_total"
+	CounterFixersSpawned    = "fixers_spawned_total"
+	CounterBlocksEscalated  = "blocks_escalated_total"
+	CounterFileAdapterReads = "file_adapter_reads_total"
 )
 
-var extendedCounterNames = []string{CounterFixersSpawned, CounterBlocksEscalated}
+var extendedCounterNames = []string{
+	CounterFixersSpawned, CounterBlocksEscalated, CounterFileAdapterReads,
+}
 
 // CounterWakeOutcome breaks wakes down by adapter and outcome. It stays outside
 // counterLabels because that registry is a closed set whose JSON shape older
@@ -136,6 +140,13 @@ func BlockEscalated(watchID, reason string) {
 		fields[FieldReason] = reason
 	}
 	s.Log(LevelInfo, "block_escalated", fields)
+}
+
+// FileAdapterRead records one access to the markdown file adapter. The dual-read
+// exit rule uses this total: once it stays at zero for seven days, the index can
+// replace the file path.
+func FileAdapterRead() {
+	Default().Inc(CounterFileAdapterReads, "")
 }
 
 // histogramBounds are the upper bounds of the duration histograms, in seconds.
