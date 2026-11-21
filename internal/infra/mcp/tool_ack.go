@@ -120,8 +120,10 @@ type AckInput struct {
 	// Revision is the task revision carried by the event being acknowledged
 	// (ADR 0036 §5). It is the Watch revision, not the event.id used to dedupe
 	// webhook deliveries in ADR 0034 §4. Zero means the caller did not pin a
-	// revision, so no staleness check is made. A revision older than the one
-	// the Watch has committed is discarded before any write.
+	// revision, so no staleness check is made for a plain ack. A revision older
+	// than the one the Watch has committed is discarded before any write. A
+	// blocked decision must pin the committed revision: zero and mismatched
+	// revisions are discarded (ADR 0155:17).
 	Revision uint64 `json:"revision,omitempty" jsonschema:"Watch revision this ack was given at; an older revision is discarded; not the webhook event.id"`
 	// Decision, when set, is an approve or reject answer that resumes a stopped
 	// agent (ADR 0058 §4), blocked:not_mine, which blocks the Watch with the
@@ -561,7 +563,16 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 		return AckReceipt{}, mapResultReadError(err, "ack: watch")
 	}
 	committed := w.Revision
-	if in.Revision != 0 && in.Revision < committed {
+	reason, isBlocked := blockedDecisionReason(in.Decision)
+	// A blocked decision must pin the exact revision it was decided at. Zero
+	// and mismatched revisions are discarded, so a stale decision cannot move
+	// a Watch (ADR 0155:17). A plain ack may leave Revision unset; when it is
+	// set, only an older event is discarded (ADR 0036 §5).
+	stale := in.Revision != 0 && in.Revision < committed
+	if isBlocked {
+		stale = in.Revision == 0 || in.Revision != committed
+	}
+	if stale {
 		return AckReceipt{Revision: committed}, &StaleRevisionError{Event: in.Revision, Committed: committed}
 	}
 
@@ -570,7 +581,7 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 	}
 
 	var receipt AckReceipt
-	if reason, isBlocked := blockedDecisionReason(in.Decision); isBlocked {
+	if isBlocked {
 		switch reason {
 		case blockedReasonNotMine:
 			rec, applied, err := h.applyBlockedNotMine(in, w, sessionID)
