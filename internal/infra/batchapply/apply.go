@@ -173,6 +173,20 @@ type artifactEntry struct {
 	content string
 }
 
+// derivedArtifact reports whether an artifact is a generated document that
+// stays out of git (IDX-11). Both are rendered for the iteration hash and
+// FACTS.md is printed by --facts, but a --write or --commit run never puts
+// either on disk: their sources are checked in and the documents themselves
+// are listed in .gitignore.
+func derivedArtifact(path string) bool {
+	switch path {
+	case filepath.Join("docs", "FACTS.md"), filepath.Join("docs", "adrs", "README.md"):
+		return true
+	default:
+		return false
+	}
+}
+
 // factEntry pairs a number with the artifact that owns it. Two artifacts that
 // print the same number produce two rows, so a copy can point at a source.
 type factEntry struct {
@@ -905,6 +919,15 @@ func Run(opts Options, out, errOut io.Writer) int {
 		len(batches), len(adrs), len(cards), len(evals), len(closures))
 	r.printf(hashReportFormat, iterationHash(entries))
 	for _, e := range entries {
+		if derivedArtifact(e.path) {
+			// Keep the stdout listing unchanged while leaving the derived
+			// document off disk. The content stays available through --facts
+			// and through the iteration hash printed above.
+			if !r.opts.Quiet {
+				fmt.Fprintln(r.out, " ", e.path)
+			}
+			continue
+		}
 		if err := r.writeFile(root, e.path, e.content); err != nil {
 			r.errf("%v\n", err)
 			return 1
