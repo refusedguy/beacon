@@ -230,6 +230,114 @@ type Bridge struct {
 	// The durable per-Watch wake cap stays separate and keeps its own counter.
 	breakerMu sync.Mutex
 	breakers  map[string]*adapterBreaker
+
+	// deferred holds wakes an OPEN breaker refused. They are replayed once the
+	// adapter can deliver again, so an outage does not drop the pointer. The
+	// durable obligation written for each entry is the trace left after a
+	// restart, when the in-memory queue no longer exists.
+	deferredMu sync.Mutex
+	deferred   map[string][]deferredWake
+	draining   bool
+}
+
+// deferredWake is one wake parked while its adapter breaker was OPEN. The full
+// payload is kept in memory so replay sends the same pointer the first wake
+// would have sent.
+type deferredWake struct {
+	watchID      string
+	revision     uint64
+	subscriberID string
+	adapter      string
+	text         string
+	verdict      domain.Verdict
+	cycleID      string
+	stagedAt     time.Time
+	// watch and subscriber are the exact inputs of the refused wake. Replay
+	// uses them directly, so a store write between the skip and the replay
+	// cannot turn the wake into a different delivery.
+	watch      domain.Watch
+	subscriber domain.Subscriber
+}
+
+// deferredWakeID is the durable marker of one parked wake. It lives in the
+// obligations table, so an OPEN breaker leaves a trace with the watchID and the
+// adapter even when the process restarts before the queue is replayed.
+func deferredWakeID(dw deferredWake) string {
+	return domain.ObligationKey("deferred-wake:"+dw.watchID+":"+dw.adapter, dw.revision, dw.subscriberID)
+}
+
+// breakerFailureID is the durable failure counter of one adapter. A restart
+// used to close every breaker and erase the failures that opened it.
+func breakerFailureID(adapter string) string {
+	return domain.ObligationKey("breaker:"+adapter, 0, "failures")
+}
+
+// breakerFailures returns the number of durable failures recorded for adapter.
+func (b *Bridge) breakerFailures(adapter string) int {
+	o, err := b.store.Obligation(breakerFailureID(adapter))
+	if err != nil {
+		return 0
+	}
+	return len(o.Attempts)
+}
+
+// recordBreakerFailure appends one durable failure to adapter's counter.
+func (b *Bridge) recordBreakerFailure(adapter string, now time.Time) {
+	id := breakerFailureID(adapter)
+	if _, err := b.store.Obligation(id); err != nil {
+		o := domain.Obligation{
+			ID: id, WatchID: adapter, Revision: 0,
+			SubscriberID: "failures", VerdictPointer: domain.VerdictWatching, StagedAt: now,
+		}
+		if err := b.store.SaveObligation(o); err != nil {
+			observe.ActorError("cibridge-breaker-counter", adapter, err)
+			return
+		}
+	}
+	b.markDelivered(id, now, b.breakerFailures(adapter)+1, "")
+}
+
+// clearBreakerFailures resets adapter's durable counter after a probe succeeds.
+func (b *Bridge) clearBreakerFailures(adapter string, now time.Time) {
+	id := breakerFailureID(adapter)
+	if _, err := b.store.Obligation(id); err != nil {
+		return
+	}
+	_ = b.store.SaveObligation(domain.Obligation{
+		ID: id, WatchID: adapter, Revision: 0,
+		SubscriberID: "failures", VerdictPointer: domain.VerdictWatching, StagedAt: now,
+	})
+}
+
+// deferWake parks a wake an OPEN breaker refused. The queue keeps the payload
+// for replay; the obligation is the durable trace of the skipped delivery.
+func (b *Bridge) deferWake(dw deferredWake) {
+	b.deferredMu.Lock()
+	if b.deferred == nil {
+		b.deferred = make(map[string][]deferredWake)
+	}
+	b.deferred[dw.adapter] = append(b.deferred[dw.adapter], dw)
+	b.deferredMu.Unlock()
+
+	o := domain.Obligation{
+		ID: deferredWakeID(dw), WatchID: dw.watchID, Revision: dw.revision,
+		SubscriberID: dw.subscriberID, VerdictPointer: dw.verdict, StagedAt: dw.stagedAt,
+	}
+	if err := b.store.SaveObligation(o); err != nil {
+		observe.ActorError("cibridge-defer-wake", dw.watchID, err)
+	}
+	observe.WakeOutcome(dw.adapter, "deferred", dw.watchID, dw.revision)
+	observe.WakeSkipped(dw.adapter, dw.watchID, "adapter circuit breaker open: wake deferred")
+	log.Printf("cibridge: wake for watch %s deferred: adapter %q circuit breaker open", dw.watchID, dw.adapter)
+}
+
+// takeDeferred removes and returns every wake parked for adapter.
+func (b *Bridge) takeDeferred(adapter string) []deferredWake {
+	b.deferredMu.Lock()
+	defer b.deferredMu.Unlock()
+	pending := b.deferred[adapter]
+	delete(b.deferred, adapter)
+	return pending
 }
 
 // WithTracer binds the tracer used for the per-refresh span. It is optional:
