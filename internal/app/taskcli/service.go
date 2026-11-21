@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -643,25 +642,16 @@ func (s *Service) RouteRateLimit(id string, upstream error) (RouteResult, error)
 		return RouteResult{}, taskstore.Validationf("неверный ID карточки %q", id)
 	}
 
-	lock, err := taskstore.AcquireLock(taskstore.LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
+	repo := newRateLimitRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return RouteResult{}, err
 	}
-	defer lock.Release()
+	defer unlock()
 
-	cards, err := taskstore.LoadCards(s.Cfg.TasksDir)
+	target, err := repo.load(id)
 	if err != nil {
 		return RouteResult{}, err
-	}
-	var target *taskstore.Card
-	for i := range cards {
-		if cards[i].ID == id {
-			target = &cards[i]
-			break
-		}
-	}
-	if target == nil {
-		return RouteResult{}, taskstore.Validationf("карточка %s не найдена", id)
 	}
 	if target.Status != "todo" && target.Status != "in_progress" {
 		return RouteResult{}, taskstore.Validationf("карточка %s в статусе %s, фолбэк неприменим", id, target.Status)
@@ -679,7 +669,7 @@ func (s *Service) RouteRateLimit(id string, upstream error) (RouteResult, error)
 	}
 
 	newText := setCardExecutor(target.Raw, next.Executor, from)
-	if err := taskstore.AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+	if err := repo.save(*target, newText); err != nil {
 		return RouteResult{}, err
 	}
 	return RouteResult{JobID: target.ID, From: from, To: next.Executor,
@@ -1239,28 +1229,9 @@ func SelectWorker(candidates []WorkerCandidate, required []string) (WorkerCandid
 	return RankWorkers(narrowed)[0], true
 }
 
-// workerHistoryPath задаёт файл репозиторий-локальной истории в state dir.
-func (s *Service) workerHistoryPath() string {
-	return filepath.Join(s.Cfg.StateDir, "worker-history.json")
-}
-
 // LoadWorkerHistory читает историю. Отсутствующий файл это пустая история.
 func (s *Service) LoadWorkerHistory() (WorkerHistory, error) {
-	data, err := os.ReadFile(s.workerHistoryPath())
-	if os.IsNotExist(err) {
-		return WorkerHistory{}, nil
-	}
-	if err != nil {
-		return nil, taskstore.Startupf("не прочитана история воркеров: %v", err)
-	}
-	var h WorkerHistory
-	if err := json.Unmarshal(data, &h); err != nil {
-		return nil, taskstore.Startupf("не разобрана история воркеров: %v", err)
-	}
-	if h == nil {
-		h = WorkerHistory{}
-	}
-	return h, nil
+	return newWorkerHistoryRepo(s.Cfg).load()
 }
 
 // RecordWorkerOutcome добавляет одно наблюдение в историю под общим замком.
@@ -1272,12 +1243,13 @@ func (s *Service) RecordWorkerOutcome(o WorkerOutcome) error {
 	if o.DelayMS < 0 || o.Cost < 0 {
 		return taskstore.Validationf("задержка и стоимость не могут быть отрицательными")
 	}
-	lock, err := taskstore.AcquireLock(taskstore.LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
+	repo := newWorkerHistoryRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return err
 	}
-	defer lock.Release()
-	h, err := s.LoadWorkerHistory()
+	defer unlock()
+	h, err := repo.load()
 	if err != nil {
 		return err
 	}
@@ -1291,11 +1263,7 @@ func (s *Service) RecordWorkerOutcome(o WorkerOutcome) error {
 	m.Cost += o.Cost
 	m.Samples++
 	h[worker] = m
-	data, err := json.MarshalIndent(h, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собрана история воркеров: %v", err)
-	}
-	return taskstore.AtomicWrite(s.workerHistoryPath(), append(data, '\n'), 0644)
+	return repo.save(h)
 }
 
 // AttachHistory подставляет метрики из истории в кандидатов по их ключу.
@@ -1443,58 +1411,6 @@ type ciHealingState struct {
 	Journal  []HealingLogEntry `json:"journal"`
 }
 
-func (s *Service) ciHealingPath() string {
-	return filepath.Join(s.Cfg.StateDir, "ci-healing.json")
-}
-
-// Замок состояния healing отделён от общего замка карточек. Общий замок
-// удаляет файл по эвристике stale после чтения; между чтением и удалением
-// другой воркер успевает создать новый файл, и двое входят в критическую
-// секцию одновременно. Для потолка это даёт два одобренных запуска сверх
-// лимита. Flock держит блокировку на открытом дескрипторе, ядро снимает её
-// при завершении процесса, поэтому эвристики и гонки удаления не нужны.
-func (s *Service) lockHealing() (func(), error) {
-	path := filepath.Join(s.Cfg.StateDir, "ci-healing.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, taskstore.Startupf("не открыт замок healing: %v", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, taskstore.Startupf("не взят замок healing: %v", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-func (s *Service) loadHealingState() (ciHealingState, error) {
-	data, err := os.ReadFile(s.ciHealingPath())
-	if os.IsNotExist(err) {
-		return ciHealingState{Attempts: map[string]int{}}, nil
-	}
-	if err != nil {
-		return ciHealingState{}, taskstore.Startupf("не прочитано состояние healing: %v", err)
-	}
-	var st ciHealingState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return ciHealingState{}, taskstore.Startupf("не разобрано состояние healing: %v", err)
-	}
-	if st.Attempts == nil {
-		st.Attempts = map[string]int{}
-	}
-	return st, nil
-}
-
-func (s *Service) saveHealingState(st ciHealingState) error {
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собрано состояние healing: %v", err)
-	}
-	return taskstore.AtomicWrite(s.ciHealingPath(), append(data, '\n'), 0644)
-}
-
 func pruneLaunches(st *ciHealingState, now time.Time) {
 	cutoff := now.Add(-time.Hour)
 	kept := st.Launches[:0]
@@ -1510,7 +1426,7 @@ func healingKey(taskID, check string) string { return taskID + "\x00" + check }
 
 // HealingLog возвращает журнал решений в порядке записи.
 func (s *Service) HealingLog() ([]HealingLogEntry, error) {
-	st, err := s.loadHealingState()
+	st, err := newHealingRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -1519,7 +1435,7 @@ func (s *Service) HealingLog() ([]HealingLogEntry, error) {
 
 // CapSpent возвращает число запусков агента за последний час по всему сервису.
 func (s *Service) CapSpent(now time.Time) (int, error) {
-	st, err := s.loadHealingState()
+	st, err := newHealingRepo(s.Cfg).load()
 	if err != nil {
 		return 0, err
 	}
@@ -1529,7 +1445,7 @@ func (s *Service) CapSpent(now time.Time) (int, error) {
 
 // HealingAttempts возвращает число попыток, уже использованных парой задача/проверка.
 func (s *Service) HealingAttempts(taskID, check string) (int, error) {
-	st, err := s.loadHealingState()
+	st, err := newHealingRepo(s.Cfg).load()
 	if err != nil {
 		return 0, err
 	}
@@ -1554,13 +1470,14 @@ func (s *Service) DecideHealing(taskID string, f CheckFailure, now time.Time) (H
 	class := ClassifyCheck(f)
 	decision := HealingDecision{Class: class, CapLimit: HourlyLaunchCap}
 
-	unlock, err := s.lockHealing()
+	repo := newHealingRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return HealingDecision{}, err
 	}
 	defer unlock()
 
-	st, err := s.loadHealingState()
+	st, err := repo.load()
 	if err != nil {
 		return HealingDecision{}, err
 	}
@@ -1597,7 +1514,7 @@ func (s *Service) DecideHealing(taskID string, f CheckFailure, now time.Time) (H
 		Attempt: decision.Attempt, Action: decision.Action,
 		CapSpent: decision.CapSpent, Reason: decision.Reason, Output: f.Output,
 	})
-	if err := s.saveHealingState(st); err != nil {
+	if err := repo.save(st); err != nil {
 		return HealingDecision{}, err
 	}
 	return decision, nil
@@ -1660,52 +1577,6 @@ type GuardDecision struct {
 type fileReservationState struct {
 	Reservations []FileReservation     `json:"reservations"`
 	Journal      []ReservationLogEntry `json:"journal"`
-}
-
-func (s *Service) reservationPath() string {
-	return filepath.Join(s.Cfg.StateDir, "file-reservations.json")
-}
-
-// Замок аренды отделён от общего замка карточек по той же причине, что и замок
-// healing: общий замок удаляет файл по эвристике stale и допускает гонку между
-// удалением и созданием. Flock держит блокировку на дескрипторе до выхода.
-func (s *Service) lockReservations() (func(), error) {
-	path := filepath.Join(s.Cfg.StateDir, "file-reservations.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, taskstore.Startupf("не открыт замок аренды: %v", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, taskstore.Startupf("не взят замок аренды: %v", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-func (s *Service) loadReservations() (fileReservationState, error) {
-	data, err := os.ReadFile(s.reservationPath())
-	if os.IsNotExist(err) {
-		return fileReservationState{}, nil
-	}
-	if err != nil {
-		return fileReservationState{}, taskstore.Startupf("не прочитана аренда файлов: %v", err)
-	}
-	var st fileReservationState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return fileReservationState{}, taskstore.Startupf("не разобрана аренда файлов: %v", err)
-	}
-	return st, nil
-}
-
-func (s *Service) saveReservations(st fileReservationState) error {
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собрана аренда файлов: %v", err)
-	}
-	return taskstore.AtomicWrite(s.reservationPath(), append(data, '\n'), 0644)
 }
 
 // globMatches сообщает, задевает ли файл glob аренды. Нормализация путей и
@@ -1773,13 +1644,14 @@ func (s *Service) ReserveFiles(agent string, globs []string, now time.Time) erro
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	unlock, err := s.lockReservations()
+	repo := newReservationRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	st, err := s.loadReservations()
+	st, err := repo.load()
 	if err != nil {
 		return err
 	}
@@ -1794,7 +1666,7 @@ func (s *Service) ReserveFiles(agent string, globs []string, now time.Time) erro
 		Time: now.UTC(), Kind: ReservationAcquire, Agent: agent, Globs: normalized,
 		Reason: fmt.Sprintf("агент %s арендовал %d glob-ов", agent, len(normalized)),
 	})
-	return s.saveReservations(st)
+	return repo.save(st)
 }
 
 // ReleaseFiles снимает аренду агента. Снятие пишется в журнал вместе с glob-ами,
@@ -1807,13 +1679,14 @@ func (s *Service) ReleaseFiles(agent string, now time.Time) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	unlock, err := s.lockReservations()
+	repo := newReservationRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	st, err := s.loadReservations()
+	st, err := repo.load()
 	if err != nil {
 		return err
 	}
@@ -1831,7 +1704,7 @@ func (s *Service) ReleaseFiles(agent string, now time.Time) error {
 		Time: now.UTC(), Kind: ReservationRelease, Agent: agent, Globs: released,
 		Reason: fmt.Sprintf("агент %s снял аренду", agent),
 	})
-	return s.saveReservations(st)
+	return repo.save(st)
 }
 
 // CheckCommit проверяет файлы коммита против аренд других агентов. Своя аренда
@@ -1848,13 +1721,14 @@ func (s *Service) CheckCommit(agent string, files []string, bypass bool, now tim
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	unlock, err := s.lockReservations()
+	repo := newReservationRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return GuardDecision{}, err
 	}
 	defer unlock()
 
-	st, err := s.loadReservations()
+	st, err := repo.load()
 	if err != nil {
 		return GuardDecision{}, err
 	}
@@ -1896,7 +1770,7 @@ func (s *Service) CheckCommit(agent string, files []string, bypass bool, now tim
 		Time: now.UTC(), Kind: kind, Agent: agent,
 		Files: decision.Files, Owners: decision.Owners, Reason: decision.Reason,
 	})
-	if err := s.saveReservations(st); err != nil {
+	if err := repo.save(st); err != nil {
 		return GuardDecision{}, err
 	}
 	return decision, nil
@@ -1904,7 +1778,7 @@ func (s *Service) CheckCommit(agent string, files []string, bypass bool, now tim
 
 // Reservations возвращает текущие аренды в порядке записи.
 func (s *Service) Reservations() ([]FileReservation, error) {
-	st, err := s.loadReservations()
+	st, err := newReservationRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -1913,7 +1787,7 @@ func (s *Service) Reservations() ([]FileReservation, error) {
 
 // ReservationLog возвращает журнал аренды в порядке записи.
 func (s *Service) ReservationLog() ([]ReservationLogEntry, error) {
-	st, err := s.loadReservations()
+	st, err := newReservationRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -1970,41 +1844,6 @@ type precheckState struct {
 	Journal []PrecheckLogEntry `json:"journal"`
 }
 
-func (s *Service) precheckPath() string {
-	return filepath.Join(s.Cfg.StateDir, "precheck.json")
-}
-
-func (s *Service) lockPrecheck() (func(), error) {
-	path := filepath.Join(s.Cfg.StateDir, "precheck.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, taskstore.Startupf("не открыт замок precheck: %v", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, taskstore.Startupf("не взят замок precheck: %v", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-func (s *Service) loadPrecheckState() (precheckState, error) {
-	data, err := os.ReadFile(s.precheckPath())
-	if os.IsNotExist(err) {
-		return precheckState{}, nil
-	}
-	if err != nil {
-		return precheckState{}, taskstore.Startupf("не прочитан журнал precheck: %v", err)
-	}
-	var st precheckState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return precheckState{}, taskstore.Startupf("не разобран журнал precheck: %v", err)
-	}
-	return st, nil
-}
-
 // RecordPrecheckFailure пишет причину отказа precheck в журнал. Пустая причина
 // отклоняется: журнал существует, чтобы причина была понятной.
 func (s *Service) RecordPrecheckFailure(reason string, at time.Time) error {
@@ -2015,28 +1854,25 @@ func (s *Service) RecordPrecheckFailure(reason string, at time.Time) error {
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	unlock, err := s.lockPrecheck()
+	repo := newPrecheckRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	st, err := s.loadPrecheckState()
+	st, err := repo.load()
 	if err != nil {
 		return err
 	}
 	st.Journal = append(st.Journal, PrecheckLogEntry{
 		Time: at.UTC(), Outcome: "precheck_failure", Reason: reason,
 	})
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собран журнал precheck: %v", err)
-	}
-	return taskstore.AtomicWrite(s.precheckPath(), append(data, '\n'), 0644)
+	return repo.save(st)
 }
 
 // PrecheckLog возвращает журнал причин precheck в порядке записи.
 func (s *Service) PrecheckLog() ([]PrecheckLogEntry, error) {
-	st, err := s.loadPrecheckState()
+	st, err := newPrecheckRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -2085,53 +1921,6 @@ type handoffJournalState struct {
 	Entries []HandoffJournalEntry `json:"entries"`
 }
 
-func (s *Service) handoffJournalPath() string {
-	return filepath.Join(s.Cfg.StateDir, "handoff-journal.json")
-}
-
-// Замок журнала отделён от общего замка карточек по той же причине, что и замки
-// healing и аренды: общий замок удаляет файл по эвристике stale и допускает
-// гонку между удалением и созданием. Flock держит блокировку на дескрипторе до
-// выхода, поэтому эвристики и гонки удаления не нужны.
-func (s *Service) lockHandoffJournal() (func(), error) {
-	path := filepath.Join(s.Cfg.StateDir, "handoff-journal.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, taskstore.Startupf("не открыт замок журнала handoff: %v", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, taskstore.Startupf("не взят замок журнала handoff: %v", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-func (s *Service) loadHandoffJournal() (handoffJournalState, error) {
-	data, err := os.ReadFile(s.handoffJournalPath())
-	if os.IsNotExist(err) {
-		return handoffJournalState{}, nil
-	}
-	if err != nil {
-		return handoffJournalState{}, taskstore.Startupf("не прочитан журнал handoff: %v", err)
-	}
-	var st handoffJournalState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return handoffJournalState{}, taskstore.Startupf("не разобран журнал handoff: %v", err)
-	}
-	return st, nil
-}
-
-func (s *Service) saveHandoffJournal(st handoffJournalState) error {
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собран журнал handoff: %v", err)
-	}
-	return taskstore.AtomicWrite(s.handoffJournalPath(), append(data, '\n'), 0644)
-}
-
 func handoffJournalBytes(entries []HandoffJournalEntry) int {
 	data, err := json.Marshal(handoffJournalState{Entries: entries})
 	if err != nil {
@@ -2168,13 +1957,14 @@ func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (Ha
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	unlock, err := s.lockHandoffJournal()
+	repo := newHandoffJournalRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return HandoffJournalEntry{}, err
 	}
 	defer unlock()
 
-	st, err := s.loadHandoffJournal()
+	st, err := repo.load()
 	if err != nil {
 		return HandoffJournalEntry{}, err
 	}
@@ -2187,7 +1977,7 @@ func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (Ha
 	}
 	st.Entries = append(st.Entries, entry)
 	st.Entries = pruneHandoffJournal(st.Entries)
-	if err := s.saveHandoffJournal(st); err != nil {
+	if err := repo.save(st); err != nil {
 		return HandoffJournalEntry{}, err
 	}
 	return entry, nil
@@ -2195,7 +1985,7 @@ func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (Ha
 
 // HandoffJournal возвращает записи журнала в порядке записи.
 func (s *Service) HandoffJournal() ([]HandoffJournalEntry, error) {
-	st, err := s.loadHandoffJournal()
+	st, err := newHandoffJournalRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -2207,7 +1997,7 @@ func (s *Service) HandoffJournal() ([]HandoffJournalEntry, error) {
 // несёт только факты о пройденных шагах; BuildHandoff остаётся отдельным
 // контрактом структурированной передачи из пяти полей.
 func (s *Service) RecoverHandoff() (HandoffRecovery, error) {
-	st, err := s.loadHandoffJournal()
+	st, err := newHandoffJournalRepo(s.Cfg).load()
 	if err != nil {
 		return HandoffRecovery{}, err
 	}
@@ -2281,52 +2071,6 @@ type fixChecksState struct {
 	Tasks    []FixChecksTask `json:"tasks"`
 }
 
-func (s *Service) fixChecksPath() string {
-	return filepath.Join(s.Cfg.StateDir, "fix-checks.json")
-}
-
-// Замок fix-checks отделён от общего замка карточек и от замков healing, аренды
-// и handoff: каждый поток пишет свой файл, и общий замок с эвристикой stale
-// не должен связывать независимые состояния.
-func (s *Service) lockFixChecks() (func(), error) {
-	path := filepath.Join(s.Cfg.StateDir, "fix-checks.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, taskstore.Startupf("не открыт замок fix-checks: %v", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, taskstore.Startupf("не взят замок fix-checks: %v", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-func (s *Service) loadFixChecks() (fixChecksState, error) {
-	data, err := os.ReadFile(s.fixChecksPath())
-	if os.IsNotExist(err) {
-		return fixChecksState{}, nil
-	}
-	if err != nil {
-		return fixChecksState{}, taskstore.Startupf("не прочитано состояние fix-checks: %v", err)
-	}
-	var st fixChecksState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return fixChecksState{}, taskstore.Startupf("не разобрано состояние fix-checks: %v", err)
-	}
-	return st, nil
-}
-
-func (s *Service) saveFixChecks(st fixChecksState) error {
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собрано состояние fix-checks: %v", err)
-	}
-	return taskstore.AtomicWrite(s.fixChecksPath(), append(data, '\n'), 0644)
-}
-
 // normalizeFixChecks убирает пустые и повторные проверки и сортирует список,
 // чтобы порядок перечисления не создавал вторую задачу.
 func normalizeFixChecks(checks []string) ([]string, error) {
@@ -2388,13 +2132,14 @@ func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) 
 		r.Now = time.Now().UTC()
 	}
 
-	unlock, err := s.lockFixChecks()
+	repo := newFixChecksRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return FixChecksResult{}, err
 	}
 	defer unlock()
 
-	st, err := s.loadFixChecks()
+	st, err := repo.load()
 	if err != nil {
 		return FixChecksResult{}, err
 	}
@@ -2425,7 +2170,7 @@ func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) 
 		CreatedAt:    r.Now.UTC(),
 	}
 	st.Tasks = append(st.Tasks, task)
-	if err := s.saveFixChecks(st); err != nil {
+	if err := repo.save(st); err != nil {
 		return FixChecksResult{}, err
 	}
 	return FixChecksResult{Task: task, Created: true,
@@ -2442,13 +2187,14 @@ func (s *Service) CompleteFixChecks(id string, now time.Time) (FixChecksTask, er
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	unlock, err := s.lockFixChecks()
+	repo := newFixChecksRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return FixChecksTask{}, err
 	}
 	defer unlock()
 
-	st, err := s.loadFixChecks()
+	st, err := repo.load()
 	if err != nil {
 		return FixChecksTask{}, err
 	}
@@ -2458,7 +2204,7 @@ func (s *Service) CompleteFixChecks(id string, now time.Time) (FixChecksTask, er
 		}
 		if st.Tasks[i].Status != FixChecksDone {
 			st.Tasks[i].Status = FixChecksDone
-			if err := s.saveFixChecks(st); err != nil {
+			if err := repo.save(st); err != nil {
 				return FixChecksTask{}, err
 			}
 		}
@@ -2473,7 +2219,7 @@ func (s *Service) FixChecksTask(id string) (FixChecksTask, error) {
 	if id == "" {
 		return FixChecksTask{}, taskstore.Validationf("не задана задача fix-checks")
 	}
-	st, err := s.loadFixChecks()
+	st, err := newFixChecksRepo(s.Cfg).load()
 	if err != nil {
 		return FixChecksTask{}, err
 	}
@@ -2487,7 +2233,7 @@ func (s *Service) FixChecksTask(id string) (FixChecksTask, error) {
 
 // FixChecksTasks возвращает все задачи починки в порядке постановки.
 func (s *Service) FixChecksTasks() ([]FixChecksTask, error) {
-	st, err := s.loadFixChecks()
+	st, err := newFixChecksRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -2501,7 +2247,7 @@ func (s *Service) FixChecksForWorktree(worktree string) ([]FixChecksTask, error)
 	if worktree == "" || worktree == "." {
 		return nil, taskstore.Validationf("не задан worktree fix-checks")
 	}
-	st, err := s.loadFixChecks()
+	st, err := newFixChecksRepo(s.Cfg).load()
 	if err != nil {
 		return nil, err
 	}
@@ -2563,49 +2309,6 @@ type handoffConfirmationState struct {
 	Entries []HandoffConfirmation `json:"entries"`
 }
 
-func (s *Service) handoffConfirmationPath() string {
-	return filepath.Join(s.Cfg.StateDir, "handoff-confirmations.json")
-}
-
-func (s *Service) lockHandoffConfirmations() (func(), error) {
-	path := filepath.Join(s.Cfg.StateDir, "handoff-confirmations.lock")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, taskstore.Startupf("не открыт замок подтверждений handoff: %v", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, taskstore.Startupf("не взят замок подтверждений handoff: %v", err)
-	}
-	return func() {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		_ = f.Close()
-	}, nil
-}
-
-func (s *Service) loadHandoffConfirmations() (handoffConfirmationState, error) {
-	data, err := os.ReadFile(s.handoffConfirmationPath())
-	if os.IsNotExist(err) {
-		return handoffConfirmationState{}, nil
-	}
-	if err != nil {
-		return handoffConfirmationState{}, taskstore.Startupf("не прочитаны подтверждения handoff: %v", err)
-	}
-	var st handoffConfirmationState
-	if err := json.Unmarshal(data, &st); err != nil {
-		return handoffConfirmationState{}, taskstore.Startupf("не разобраны подтверждения handoff: %v", err)
-	}
-	return st, nil
-}
-
-func (s *Service) saveHandoffConfirmations(st handoffConfirmationState) error {
-	data, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return taskstore.Startupf("не собраны подтверждения handoff: %v", err)
-	}
-	return taskstore.AtomicWrite(s.handoffConfirmationPath(), append(data, '\n'), 0644)
-}
-
 // RecordHandoffAnswer записывает ответ проверки факта продолжения. Допустимы
 // только три ответа ADR 0063; неизвестный ответ и пустая задача отклоняются.
 func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at time.Time) (HandoffConfirmation, error) {
@@ -2619,18 +2322,19 @@ func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at ti
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	unlock, err := s.lockHandoffConfirmations()
+	repo := newConfirmationRepo(s.Cfg)
+	unlock, err := repo.lock()
 	if err != nil {
 		return HandoffConfirmation{}, err
 	}
 	defer unlock()
-	st, err := s.loadHandoffConfirmations()
+	st, err := repo.load()
 	if err != nil {
 		return HandoffConfirmation{}, err
 	}
 	entry := HandoffConfirmation{TaskID: taskID, Answer: answer, At: at.UTC()}
 	st.Entries = append(st.Entries, entry)
-	if err := s.saveHandoffConfirmations(st); err != nil {
+	if err := repo.save(st); err != nil {
 		return HandoffConfirmation{}, err
 	}
 	return entry, nil
@@ -2644,7 +2348,7 @@ func (s *Service) HandoffStatus(taskID string) (HandoffStatus, error) {
 	if taskID == "" {
 		return HandoffStatus{}, taskstore.Validationf("не задана задача подтверждения handoff")
 	}
-	st, err := s.loadHandoffConfirmations()
+	st, err := newConfirmationRepo(s.Cfg).load()
 	if err != nil {
 		return HandoffStatus{}, err
 	}
