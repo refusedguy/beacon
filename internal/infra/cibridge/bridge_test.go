@@ -167,15 +167,23 @@ func TestBridgeHandlesStaleHeadWithHeadChangedEvent(t *testing.T) {
 	}
 	defer db.Close()
 
+	deadline := time.Unix(100, 0)
+	since := deadline.Add(-time.Minute)
 	w := domain.Watch{
-		ID:             "watch:refusedguy/beacon:43:old",
-		Repo:           "refusedguy/beacon",
-		PR:             43,
-		HeadSHA:        "old",
-		BaseRef:        "main",
-		Status:         domain.StatusWatching,
-		Verdict:        domain.VerdictWatching,
-		OrchestratorID: "ses_parent",
+		ID:              "watch:refusedguy/beacon:43:old",
+		Repo:            "refusedguy/beacon",
+		PR:              43,
+		HeadSHA:         "old",
+		BaseRef:         "main",
+		Status:          domain.StatusWatching,
+		Verdict:         domain.VerdictWatching,
+		OrchestratorID:  "ses_parent",
+		BlockerID:       "block-1",
+		FixBlockerID:    "fix-1",
+		DeadlineAt:      deadline,
+		NoChecksSince:   since,
+		NoChecksTimeout: 2 * time.Minute,
+		ConfigID:        "cfg-1",
 		Subscribers: []domain.Subscriber{
 			{ID: "ses_executor", Role: domain.RoleExecutor, Adapter: "opencode"},
 		},
@@ -205,6 +213,16 @@ func TestBridgeHandlesStaleHeadWithHeadChangedEvent(t *testing.T) {
 	}
 	if len(successor.Subscribers) != 1 || successor.Subscribers[0].ID != "ses_executor" {
 		t.Fatalf("successor subscribers = %+v, want the executor carried over", successor.Subscribers)
+	}
+	if !successor.DeadlineAt.Equal(deadline) || !successor.NoChecksSince.Equal(since) ||
+		successor.NoChecksTimeout != 2*time.Minute {
+		t.Fatalf("successor deadline = %v/%v/%v, want %v/%v/%v",
+			successor.DeadlineAt, successor.NoChecksSince, successor.NoChecksTimeout,
+			deadline, since, 2*time.Minute)
+	}
+	if successor.BlockerID != "block-1" || successor.FixBlockerID != "fix-1" || successor.ConfigID != "cfg-1" {
+		t.Fatalf("successor ids = %q/%q/%q, want block-1/fix-1/cfg-1",
+			successor.BlockerID, successor.FixBlockerID, successor.ConfigID)
 	}
 }
 

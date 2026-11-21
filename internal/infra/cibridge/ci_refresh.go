@@ -147,6 +147,7 @@ func snapshotFor(w domain.Watch, obs ciObservation, now time.Time) domain.Snapsh
 		At:               now,
 		DeadlineAt:       w.DeadlineAt,
 		NoChecksSince:    w.NoChecksSince,
+		NoChecksTimeout:  w.NoChecksTimeout,
 		SuitesValid:      true,
 		BaseFailedChecks: obs.base.FailedChecks,
 		BaseHeadSHA:      obs.base.HeadSHA,

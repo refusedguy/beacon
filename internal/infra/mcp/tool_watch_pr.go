@@ -58,6 +58,9 @@ type WatchDefaults struct {
 	MaxRebases       int
 	MaxWakesPerWatch int
 	Flaky            *WatchPRFlaky
+	// NoChecksTimeout bounds the window after registration without any CI
+	// check before the no-checks timeout verdict fires. Zero disables it.
+	NoChecksTimeout time.Duration
 }
 
 // watchPRDefaultsLoader is the process seam for loading the layered config.
@@ -128,6 +131,10 @@ func applyWatchConfigFile(defaults *WatchDefaults, path string) {
 			if n, ok := watchInt(raw); ok && n > 0 {
 				defaults.MaxWakesPerWatch = n
 			}
+		case "nocheckstimeout":
+			if d, ok := watchDuration(raw); ok && d > 0 {
+				defaults.NoChecksTimeout = d
+			}
 		}
 	}
 }
@@ -135,6 +142,26 @@ func applyWatchConfigFile(defaults *WatchDefaults, path string) {
 func normalizeWatchConfigKey(key string) string {
 	return strings.NewReplacer("_", "", "-", "", " ", "").Replace(
 		strings.ToLower(strings.TrimSpace(key)))
+}
+
+// watchDuration accepts a YAML duration string such as "30m" or a numeric
+// millisecond value. Anything else keeps the previous layer's value.
+func watchDuration(raw any) (time.Duration, bool) {
+	switch v := raw.(type) {
+	case string:
+		d, err := time.ParseDuration(strings.TrimSpace(v))
+		return d, err == nil && d > 0
+	case int:
+		return time.Duration(v) * time.Millisecond, v > 0
+	case int64:
+		return time.Duration(v) * time.Millisecond, v > 0
+	case uint64:
+		return time.Duration(v) * time.Millisecond, v > 0
+	case float64:
+		return time.Duration(v) * time.Millisecond, v > 0
+	default:
+		return 0, false
+	}
 }
 
 // watchInt accepts a YAML integer or a quoted integer string. Anything else
@@ -471,6 +498,13 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	w.MergePolicy = watchPRMergePolicy(in.Policy)
 	if in.DeadlineMs != nil && *in.DeadlineMs > 0 {
 		w.DeadlineAt = now.Add(time.Duration(*in.DeadlineMs) * time.Millisecond)
+	}
+	// Starting the clock at registration makes the rule reachable: the first
+	// observation carries both NoChecksSince and NoChecksTimeout into the
+	// verdict engine.
+	w.NoChecksTimeout = defaults.NoChecksTimeout
+	if w.NoChecksTimeout > 0 {
+		w.NoChecksSince = now
 	}
 
 	s := domain.Subscriber{
