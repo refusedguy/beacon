@@ -301,7 +301,7 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 // effect. An empty key keeps the pre-idempotency behaviour for callers that do
 // not send the field.
 type WaitResultInput struct {
-	WatchID         string `json:"watchID" jsonschema:"identifier of the Watch to wait on; a leased handle valid for 30 minutes from issue, after which wait_result returns WATCH_EXPIRED and the caller registers again"`
+	WatchID         string `json:"watchID" jsonschema:"identifier of the Watch to wait on; a handle leased for 30 minutes from issue; after that wait_result returns WATCH_EXPIRED"`
 	TimeoutMs       *int64 `json:"timeoutMs,omitempty" jsonschema:"wait budget in milliseconds; default 50000, capped at 540000"`
 	ClientRequestID string `json:"clientRequestId,omitempty" jsonschema:"idempotency key; a repeat after a broken connection returns the first result without a second effect"`
 	// ContinueOf names the same Watch after a human answer resumed a parked
@@ -1400,7 +1400,7 @@ func AttachWaitResult(server *mcpsdk.Server, svc *WaitResultService) {
 	no := false
 	mcpsdk.AddTool(server, &mcpsdk.Tool{
 		Name:        "beacon_wait_result",
-		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes from issue; an expired handle returns WATCH_EXPIRED and the caller must register again.",
+		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  true,
