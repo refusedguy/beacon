@@ -312,12 +312,12 @@ func gcWorktreeDecision(e worktree.Entry, watchID, status string, statusErr erro
 // gcWorktreeCollect reads Watch heads and git status for every worktree. A
 // locked worktree or one with a live Watch skips the status call: its reason
 // is already decisive and a git failure there must not hide that reason.
-func gcWorktreeCollect() ([]gcWorktreeResult, error) {
+func gcWorktreeCollect(c *CLI) ([]gcWorktreeResult, error) {
 	entries, err := gcWorktreeList()
 	if err != nil {
 		return nil, fmt.Errorf("beacon gc-worktree: список worktree: %w", err)
 	}
-	heads, err := gcWorktreeHeads()
+	heads, err := gcWorktreeHeads(c)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +368,7 @@ func runGCWorktree(c *CLI, args []string) int {
 		return 2
 	}
 
-	plan, err := gcWorktreeCollect()
+	plan, err := gcWorktreeCollect(c)
 	if err != nil {
 		fmt.Fprintln(c.errOut, err)
 		return 2
