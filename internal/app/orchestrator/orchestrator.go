@@ -212,11 +212,11 @@ type MergeOutcome struct {
 	Reason  string
 }
 
-// CheckedMerger is an optional extension of Merger for adapters that own the
-// gh gate and confirmation. A checked adapter reads PR state before deciding to
-// merge and after the merge command returns, then reports one of the three
-// outcomes above. This keeps the race fix on the daemon's existing Merger seam
-// without changing the ports every caller must satisfy.
+// CheckedMerger is an alternate merge port for adapters that own the gh gate
+// and confirmation. A checked adapter reads PR state before deciding to merge
+// and after the merge command returns, then reports one of the three outcomes
+// above. A caller passes it explicitly in Options.CheckedMerger; the two merge
+// guarantees are never mixed by a type assertion on Merger.
 type CheckedMerger interface {
 	MergeChecked(ctx context.Context, repo string, pr int) (MergeOutcome, error)
 }
@@ -247,10 +247,10 @@ type Waker interface {
 	Wake(ctx context.Context, watchID string, revision uint64, verdict string) error
 }
 
-// ReasonWaker is an optional extension for decisions that need to explain
+// ReasonWaker is an alternate wake port for decisions that need to explain
 // themselves. A wait holds on a named dependency, so the subscriber needs the
-// reason, not just the verdict. A Waker that does not implement it still gets
-// the plain verdict and the reason stays on the Action.
+// reason, not just the verdict. A caller passes it explicitly in
+// Options.ReasonWaker; the plain Waker receives only the verdict.
 type ReasonWaker interface {
 	WakeWithReason(ctx context.Context, watchID string, revision uint64, verdict, reason string) error
 }
@@ -285,6 +285,14 @@ type Result struct {
 type Options struct {
 	DryRun   bool
 	Resolver DependencyResolver
+	// CheckedMerger, when set, owns the mergeability gate and the post-merge
+	// state confirmation. It replaces the plain Merger on the merge path. A nil
+	// value keeps the trusted-on-success behaviour of Merger.
+	CheckedMerger CheckedMerger
+	// ReasonWaker, when set, receives the hold reason together with the wake. A
+	// nil value sends only the verdict through Waker and leaves the reason on
+	// the Action.
+	ReasonWaker ReasonWaker
 }
 
 // Run walks the active Watches once. Ready Watches with autor-merge enabled
@@ -382,7 +390,7 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 				Revision: w.Revision,
 				Message:  "left for subscriber wake: " + w.Verdict,
 			})
-			wakeOne(ctx, waker, w, w.Verdict, w.Verdict, &out, &errs)
+			wakeOne(ctx, waker, opts.ReasonWaker, w, w.Verdict, w.Verdict, &out, &errs)
 		}
 	}
 	return out, errors.Join(errs...)
@@ -421,9 +429,10 @@ func handleBlocked(_ context.Context, _ Store, w Watch, resolver DependencyResol
 	observe.FixerSpawned(w.ID)
 }
 
-// mergeOne performs the idempotent merge branch for one ready Watch. A merger
-// that implements CheckedMerger owns the gh mergeability gate and the post-merge
-// state confirmation; a plain Merger is trusted on its success return.
+// mergeOne performs the idempotent merge branch for one ready Watch. A
+// CheckedMerger passed in Options owns the gh mergeability gate and the
+// post-merge state confirmation; without one the Merger is trusted on its
+// success return. The caller chooses the guarantee explicitly.
 func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watch, out *Result, errs *[]error) {
 	started := time.Now()
 	defer func() { observe.MergeDuration(time.Since(started)) }()
@@ -461,7 +470,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		return
 	}
 	observe.MergeAttempt(w.ID, w.PR)
-	if checked, ok := merger.(CheckedMerger); ok {
+	if checked := opts.CheckedMerger; checked != nil {
 		mergeCheckedOne(ctx, st, checked, w, command, out, errs)
 		return
 	}
@@ -545,9 +554,9 @@ func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *R
 
 // wakeOne hands a retry/fail/wait Watch to the installed Waker. A nil Waker is
 // legitimate in this card: the Watch simply stays active for later delivery.
-// The reason is recorded on the Action and passed to a ReasonWaker when the
-// subscriber supports it.
-func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, out *Result, errs *[]error) {
+// The reason is recorded on the Action and passed to an explicit ReasonWaker
+// when the caller supplied one.
+func wakeOne(ctx context.Context, waker Waker, reasonWaker ReasonWaker, w Watch, verdict, reason string, out *Result, errs *[]error) {
 	if waker == nil {
 		observe.WakeSkipped("", w.ID, "no waker installed")
 		return
@@ -570,7 +579,7 @@ func wakeOne(ctx context.Context, waker Waker, w Watch, verdict, reason string, 
 		observe.RebaseRequested(w.ID, w.PR)
 	}
 	var wakeErr error
-	if reasonWaker, ok := waker.(ReasonWaker); ok {
+	if reasonWaker != nil {
 		wakeErr = reasonWaker.WakeWithReason(ctx, w.ID, w.Revision, verdict, reason)
 	} else {
 		wakeErr = waker.Wake(ctx, w.ID, w.Revision, verdict)
