@@ -68,7 +68,7 @@ func TestStatsResponseHasEveryField(t *testing.T) {
 	}
 
 	for _, key := range []string{
-		"pointsThisHour", "budget", "activeWatches", "persist", "loadErrors", "ladder", "version",
+		"pointsThisHour", "budget", "activeWatches", "blocked", "persist", "loadErrors", "ladder", "version",
 		"registeredAgents", "staleAgents", "configId",
 	} {
 		if _, ok := fields[key]; !ok {
@@ -175,6 +175,109 @@ func TestStatsEmptySlicesStayArrays(t *testing.T) {
 	}
 	if out.ActiveWatches != 0 {
 		t.Errorf("activeWatches = %d, want 0", out.ActiveWatches)
+	}
+}
+
+// blockedWatchSnapshot puts two blocked watches on the radar. One carries a
+// blocked status, the other a block record. Both stay in ActiveWatches through
+// LiveWatches, so the active-watch count still includes them.
+func blockedWatchSnapshot() StateSnapshot {
+	snap := sampleSnapshot()
+	byStatus := sampleWatch("b1", domain.VerdictWatching, 0)
+	byStatus.Status = domain.StatusBlocked
+	byRecord := sampleWatch("b2", domain.VerdictWatching, 0)
+	byRecord.Blocked = &domain.BlockedInfo{Reason: "main red"}
+	snap.LiveWatches = append([]domain.Watch{snap.ActiveWatches[0]}, byStatus, byRecord)
+	return snap
+}
+
+func TestStatsBlockedCount(t *testing.T) {
+	cases := []struct {
+		name string
+		snap StateSnapshot
+		want int
+	}{
+		{"no blocked watches", sampleSnapshot(), 0},
+		{"two blocked watches", blockedWatchSnapshot(), 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: tc.snap}))
+
+			if out.Blocked != tc.want {
+				t.Errorf("blocked = %d, want %d", out.Blocked, tc.want)
+			}
+			if out.ActiveWatches != len(tc.snap.RadarWatches()) {
+				t.Errorf("activeWatches = %d, want %d", out.ActiveWatches, len(tc.snap.RadarWatches()))
+			}
+
+			var diagnostic string
+			for _, entry := range out.LoadErrors {
+				if strings.HasPrefix(entry, blockedWatchPrefix) {
+					diagnostic = entry
+				}
+			}
+			if tc.want == 0 {
+				if diagnostic != "" {
+					t.Errorf("blocked diagnostic = %q, want none", diagnostic)
+				}
+				return
+			}
+			if want := fmt.Sprintf("%s%d", blockedWatchPrefix, tc.want); diagnostic != want {
+				t.Errorf("blocked diagnostic = %q, want %q", diagnostic, want)
+			}
+		})
+	}
+}
+
+// TestStatsBlockedInJSONAndSchema proves the count reaches MCP clients as a
+// top-level field and that the derived schema accepts it.
+func TestStatsBlockedInJSONAndSchema(t *testing.T) {
+	schemas, err := AllOutputSchemas()
+	if err != nil {
+		t.Fatalf("AllOutputSchemas: %v", err)
+	}
+	statsSchema := schemas["beacon_stats"]
+	if _, ok := statsSchema.Properties["blocked"]; !ok {
+		t.Fatal("beacon_stats schema has no blocked property")
+	}
+	resolved, err := statsSchema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve stats schema: %v", err)
+	}
+
+	out := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: blockedWatchSnapshot()}))
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal stats output: %v", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal stats fields: %v", err)
+	}
+	blockedRaw, ok := fields["blocked"]
+	if !ok {
+		t.Fatalf("stats output missing blocked field: %s", raw)
+	}
+	var got int
+	if err := json.Unmarshal(blockedRaw, &got); err != nil {
+		t.Fatalf("unmarshal blocked field: %v", err)
+	}
+	if got != 2 {
+		t.Errorf("serialized blocked = %d, want 2: %s", got, raw)
+	}
+
+	var instance map[string]any
+	if err := json.Unmarshal(raw, &instance); err != nil {
+		t.Fatalf("unmarshal stats instance: %v", err)
+	}
+	if err := resolved.Validate(instance); err != nil {
+		t.Fatalf("stats output with blocked fails derived schema: %v", err)
+	}
+	for key := range fields {
+		if _, ok := statsSchema.Properties[key]; !ok {
+			t.Errorf("stats output has field %q not in the derived schema", key)
+		}
 	}
 }
 

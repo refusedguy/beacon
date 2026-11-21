@@ -267,15 +267,19 @@ type LadderInfo struct {
 }
 
 // StatsOutput is the response of beacon_stats. The seven original fields keep
-// their names and types; the registry counters are additive (T5.60).
+// their names and types; the registry counters and blocked are additive
+// (T5.60, T3.440).
 type StatsOutput struct {
-	PointsThisHour int         `json:"pointsThisHour"`
-	Budget         int         `json:"budget"`
-	ActiveWatches  int         `json:"activeWatches"`
-	Persist        PersistInfo `json:"persist"`
-	LoadErrors     []string    `json:"loadErrors"`
-	Ladder         LadderInfo  `json:"ladder"`
-	Version        string      `json:"version"`
+	PointsThisHour int `json:"pointsThisHour"`
+	Budget         int `json:"budget"`
+	ActiveWatches  int `json:"activeWatches"`
+	// Blocked is the number of watches on the radar that carry a blocked
+	// status or a block record. It is zero when no watch is blocked (T3.440).
+	Blocked    int         `json:"blocked"`
+	Persist    PersistInfo `json:"persist"`
+	LoadErrors []string    `json:"loadErrors"`
+	Ladder     LadderInfo  `json:"ladder"`
+	Version    string      `json:"version"`
 	// T5.60: registry counters. A handler without a RegistryStatsReader reports
 	// zero and an empty config id, so the pre-T5.60 contract is unchanged.
 	RegisteredAgents int    `json:"registeredAgents"`
