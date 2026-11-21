@@ -55,12 +55,30 @@ var readEscalations = func(dir string) ([]string, error) {
 // inspectView is the read-only projection returned by `beacon inspect`. Every
 // field comes from one store handle or the escalation journal.
 type inspectView struct {
-	Query        string                      `json:"query,omitempty"`
-	Watches      []domain.Watch              `json:"watches"`
-	Blockers     []domain.BlockerIncident    `json:"blockers"`
-	Orchestrator *domain.OrchestratorBinding `json:"orchestrator,omitempty"`
-	RuntimeStats json.RawMessage             `json:"runtimeStats,omitempty"`
-	Escalations  []string                    `json:"escalations"`
+	Query          string                      `json:"query,omitempty"`
+	Watches        []domain.Watch              `json:"watches"`
+	Blockers       []domain.BlockerIncident    `json:"blockers"`
+	Orchestrator   *domain.OrchestratorBinding `json:"orchestrator,omitempty"`
+	RuntimeStats   json.RawMessage             `json:"runtimeStats,omitempty"`
+	Escalations    []string                    `json:"escalations"`
+	DeliveryLadder []deliveryLadderView        `json:"deliveryLadder,omitempty"`
+}
+
+// deliveryLadderView is one pending obligation's delivery marker. It makes the
+// wake ladder visible in `beacon inspect` without exposing pointer contents.
+type deliveryLadderView struct {
+	ObligationID     string    `json:"obligationID"`
+	WatchID          string    `json:"watchID"`
+	DeliveryRung     int       `json:"deliveryRung"`
+	DeliveryAttempts int       `json:"deliveryAttempts"`
+	NextRetryAt      time.Time `json:"nextRetryAt,omitempty"`
+}
+
+// inspectObligationStore is implemented by stores that can list pending
+// obligations. It is a separate interface so the existing inspect store seam
+// stays unchanged for callers that only read watches and blockers.
+type inspectObligationStore interface {
+	PendingObligations() ([]domain.Obligation, error)
 }
 
 // inspectStore is the slice of the state store the inspect command needs. The
@@ -128,7 +146,10 @@ func runInspect(c *CLI, args []string) int {
 	}
 	defer func() { _ = closeStore() }()
 
-	view := inspectView{Query: query, Watches: []domain.Watch{}, Escalations: []string{}}
+	view := inspectView{
+		Query: query, Watches: []domain.Watch{},
+		Escalations: []string{}, DeliveryLadder: []deliveryLadderView{},
+	}
 	live, err := s.LiveWatches()
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: live watches: %v\n", err)
@@ -160,6 +181,25 @@ func runInspect(c *CLI, args []string) int {
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon inspect: ESCALATIONS.md: %v\n", err)
 		return 2
+	}
+	if ostore, ok := s.(inspectObligationStore); ok {
+		pending, err := ostore.PendingObligations()
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon inspect: obligations: %v\n", err)
+			return 2
+		}
+		for _, o := range pending {
+			if query != "" && o.WatchID != query && !strings.Contains(o.WatchID, query) {
+				continue
+			}
+			view.DeliveryLadder = append(view.DeliveryLadder, deliveryLadderView{
+				ObligationID:     o.ID,
+				WatchID:          o.WatchID,
+				DeliveryRung:     o.DeliveryRung,
+				DeliveryAttempts: o.DeliveryAttempts,
+				NextRetryAt:      o.NextRetryAt,
+			})
+		}
 	}
 
 	if *jsonOut {
@@ -199,6 +239,14 @@ func renderInspectTable(w io.Writer, view inspectView) {
 	for _, b := range view.Blockers {
 		fmt.Fprintf(w, "BLOCKER id=%s repo=%s status=%s checks=%s fixAttempts=%d\n",
 			b.ID, b.Repo, b.Status, strings.Join(b.FailedChecks, ","), b.FixAttempts)
+	}
+	for _, d := range view.DeliveryLadder {
+		next := "-"
+		if !d.NextRetryAt.IsZero() {
+			next = d.NextRetryAt.Format(time.RFC3339)
+		}
+		fmt.Fprintf(w, "DELIVERY obligation=%s watch=%s rung=%d attempts=%d nextRetryAt=%s\n",
+			d.ObligationID, d.WatchID, d.DeliveryRung, d.DeliveryAttempts, next)
 	}
 	if view.Orchestrator != nil {
 		fmt.Fprintf(w, "Orchestrator: %s (%s, %s)\n",

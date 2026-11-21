@@ -76,7 +76,22 @@ const (
 	EventBlock EventKind = "block"
 	// EventUnblock resumes a blocked Watch to watching, clearing the block.
 	EventUnblock EventKind = "unblock"
+	// EventRevoke closes one failed wake delivery. It is the boundary that ties
+	// a retry to the delivery it replaces: the ladder records the revoke,
+	// advances the rung and arms the next attempt. A revoke changes no verdict
+	// and stages no wake by itself.
+	EventRevoke EventKind = "revoke"
 )
+
+// DeliveryRevoke describes one revoked wake delivery. ObligationID names the
+// delivery to close, Outcome is what the adapter observed and At is when the
+// revoke was recorded. Retries are tied to this record, so one incident issues
+// a single human alert even after several failed deliveries.
+type DeliveryRevoke struct {
+	ObligationID string
+	Outcome      AttemptOutcome
+	At           time.Time
+}
 
 // CloseReason is the machine-readable cause stored on a closed Watch.
 type CloseReason string
@@ -112,6 +127,9 @@ type Event struct {
 	// Blocked is used only by EventBlock and carries the block details. It is
 	// copied into the Watch so later caller mutation cannot change the Watch.
 	Blocked *BlockedInfo
+	// Revoke is used only by EventRevoke. It names the failed delivery whose
+	// retry the ladder must arm.
+	Revoke *DeliveryRevoke
 }
 
 // EffectKind identifies a side effect the caller must perform after Transition.
@@ -129,6 +147,9 @@ const (
 	// EffectLogPark writes the full error text and the park reason into the
 	// journal. It is the only effect of parking, so no retry is ever staged.
 	EffectLogPark EffectKind = "log_park"
+	// EffectRevokeDelivery tells the adapter to apply a delivery revoke to the
+	// ladder. It is the only effect of EventRevoke.
+	EffectRevokeDelivery EffectKind = "revoke_delivery"
 )
 
 // Effect describes work deferred to the adapter layer. Transition only returns
@@ -144,6 +165,8 @@ type Effect struct {
 	// reason and the full error text to the journal, which performs the I/O.
 	ParkReason ParkReason
 	ParkError  string
+	// Revoke is used only by EffectRevokeDelivery. It is copied from the event.
+	Revoke *DeliveryRevoke
 }
 
 // Constructors keep callers from building malformed events by hand.
@@ -196,6 +219,13 @@ func UnblockEvent(at time.Time) Event {
 	return Event{Kind: EventUnblock, At: at}
 }
 
+// RevokeEvent builds the event that closes one failed wake delivery. The
+// revoke time is set from at so the caller does not have to fill it twice.
+func RevokeEvent(r DeliveryRevoke, at time.Time) Event {
+	r.At = at
+	return Event{Kind: EventRevoke, Revoke: &r, At: at}
+}
+
 // CanContinueRound reports whether round is a permitted human-answer round.
 // Rounds start at one and stop at MaxContinueRounds.
 func CanContinueRound(round uint64) bool {
@@ -229,6 +259,7 @@ func CanContinueRound(round uint64) bool {
 //	blocked   -> watching  : explicit unblock; block details are cleared (no wake)
 //	blocked   -> closed    : cancel, head_changed or a successful acceptance command
 //	closed    -> closed     : no-op (terminal)
+//	live      -> same       : EventRevoke stages EffectRevokeDelivery and changes no state
 //
 // A successful EventAccept closes a live Watch from any status with
 // CloseReasonAccepted and VerdictAccepted (ADR 0059 §6). That command is the
@@ -289,6 +320,8 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		return blockWatch(w, e)
 	case EventUnblock:
 		return unblockWatch(w, e)
+	case EventRevoke:
+		return revokeDelivery(w, e)
 	default:
 		return next, nil
 	}
@@ -361,6 +394,23 @@ func unblockWatch(w Watch, e Event) (Watch, []Effect) {
 	next.Blocked = nil
 	next.Revision = bumpRevision(w.Revision)
 	return next, nil
+}
+
+// revokeDelivery stages the revoke effect without changing the Watch. A revoke
+// is a delivery fact, not a verdict: it moves no revision, sets no status and
+// wakes nobody on its own. A closed Watch ignores it.
+func revokeDelivery(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed || e.Revoke == nil || e.Revoke.ObligationID == "" {
+		return next, nil
+	}
+	return next, []Effect{{
+		Kind:     EffectRevokeDelivery,
+		WatchID:  w.ID,
+		Revision: w.Revision,
+		Verdict:  w.Verdict,
+		Revoke:   e.Revoke,
+	}}
 }
 
 // acceptWatch closes a live Watch only after the explicit acceptance command

@@ -167,6 +167,114 @@ func TestTransportFailedCappedAtThree(t *testing.T) {
 	}
 }
 
+func TestFourDeliveryFailuresIssueOneHumanAlert(t *testing.T) {
+	ctx := context.Background()
+	d := newTestDB(t)
+	l := newTestLadder(d)
+	o := seedObligation(t, d, "obl-revoke", "watch-revoke")
+	stage(t, l, o)
+
+	// Staging starts at rung 1 with the initial pointer and no retry armed.
+	got, err := d.Obligation(o.ID)
+	if err != nil {
+		t.Fatalf("Obligation after stage: %v", err)
+	}
+	if got.DeliveryRung != 1 || got.DeliveryAttempts != 1 || !got.NextRetryAt.IsZero() {
+		t.Fatalf("staged markers = rung %d attempts %d next %v, want 1/1/zero",
+			got.DeliveryRung, got.DeliveryAttempts, got.NextRetryAt)
+	}
+
+	// The revoke event is the domain boundary that carries a failed delivery
+	// into the ladder: Transition stages one effect and leaves the Watch as is.
+	w := domain.Watch{
+		ID: o.WatchID, Status: domain.StatusNotifying,
+		Verdict: domain.VerdictReady, Revision: 1,
+	}
+	boundary := domain.RevokeEvent(domain.DeliveryRevoke{
+		ObligationID: o.ID, Outcome: domain.OutcomeTransportFailed,
+	}, base)
+	next, effects := domain.Transition(w, boundary)
+	if len(effects) != 1 || effects[0].Kind != domain.EffectRevokeDelivery {
+		t.Fatalf("revoke effects = %+v, want one revoke_delivery", effects)
+	}
+	if next.Status != w.Status || next.Revision != w.Revision {
+		t.Fatalf("revoke changed the watch: %+v", next)
+	}
+
+	alerts, retries := 0, 0
+	for i := 1; i <= 4; i++ {
+		at := base.Add(time.Duration(i) * time.Minute)
+		ev := domain.RevokeEvent(domain.DeliveryRevoke{
+			ObligationID: o.ID, Outcome: domain.OutcomeTransportFailed,
+		}, at)
+		res, err := l.Revoke(ctx, ev.Revoke, ev.At)
+		if err != nil {
+			t.Fatalf("Revoke %d: %v", i, err)
+		}
+		if res.ObligationID != o.ID || res.WatchID != o.WatchID {
+			t.Fatalf("revoke %d ids = %q/%q, want %q/%q", i, res.ObligationID, res.WatchID, o.ID, o.WatchID)
+		}
+		if res.HumanAlert {
+			alerts++
+		}
+		if res.Retry {
+			retries++
+		}
+
+		switch i {
+		case 1:
+			if !res.HumanAlert {
+				t.Fatal("first revoke must notify a human")
+			}
+			if !res.Retry || !res.NextAt.Equal(base.Add(FirstRetryDelay)) {
+				t.Fatalf("first retry = %v/%v, want true/%v", res.Retry, res.NextAt, base.Add(FirstRetryDelay))
+			}
+		case 2:
+			if res.HumanAlert {
+				t.Fatal("second revoke must not notify a human twice")
+			}
+			if !res.Retry || !res.NextAt.Equal(base.Add(SecondRetryDelay)) {
+				t.Fatalf("second retry = %v/%v, want true/%v", res.Retry, res.NextAt, base.Add(SecondRetryDelay))
+			}
+		default:
+			if res.HumanAlert {
+				t.Fatalf("revoke %d must not notify a human twice", i)
+			}
+			if res.Retry {
+				t.Fatalf("revoke %d armed a retry after the cap of %d", i, MaxAttempts)
+			}
+		}
+	}
+
+	if alerts != 1 {
+		t.Fatalf("human alerts = %d, want 1 for four failures", alerts)
+	}
+	if retries != 2 {
+		t.Fatalf("retries = %d, want 2 within cap %d", retries, MaxAttempts)
+	}
+
+	got, err = d.Obligation(o.ID)
+	if err != nil {
+		t.Fatalf("Obligation after revokes: %v", err)
+	}
+	if got.DeliveryRung != MaxAttempts {
+		t.Fatalf("delivery rung = %d, want cap %d", got.DeliveryRung, MaxAttempts)
+	}
+	if got.DeliveryAttempts != 5 {
+		t.Fatalf("delivery attempts = %d, want 5 (initial pointer plus four failure reports)", got.DeliveryAttempts)
+	}
+	if !got.NextRetryAt.IsZero() {
+		t.Fatalf("nextRetryAt = %v, want zero once the cap is spent", got.NextRetryAt)
+	}
+	m, err := l.Position(ctx, o.ID)
+	if err != nil {
+		t.Fatalf("Position: %v", err)
+	}
+	if !m.HumanAlerted {
+		t.Fatal("marker must record that the human was alerted")
+	}
+}
+
 func TestIndeterminateNoRepeats(t *testing.T) {
 	ctx := context.Background()
 	d := newTestDB(t)
