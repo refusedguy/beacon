@@ -1514,7 +1514,7 @@ func orchestratorIDSource(db *store.DB, projectKey, root string) cibridge.Orches
 // wake deliverer. A missing service registration yields nil ports, so the
 // deliverer falls back to its own CLI path instead of faking delivery.
 func opencodeWakePorts() (wake.PromptFunc, wake.SessionActiveFunc) {
-	port, err := newOpencodePort()
+	port, err := newReadOnlyOpencodePort()
 	if err != nil || port == nil {
 		return nil, nil
 	}
