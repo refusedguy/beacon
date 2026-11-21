@@ -248,6 +248,13 @@ type Sink interface {
 	Inc(name, labelValue string)
 }
 
+// sourceSink is an optional extension of Sink for recording the wake source on
+// a metric. Sinks written before the source label was added implement only Sink
+// and keep the adapter-only counter.
+type sourceSink interface {
+	IncSource(name, labelValue, source string)
+}
+
 // histogramSink is optional: a Recorder implements it, a no-op sink does not.
 type histogramSink interface {
 	observeHistogram(name string, seconds float64)
@@ -326,6 +333,15 @@ func (r *Recorder) Inc(name, labelValue string) {
 		return
 	}
 	r.metrics.Inc(name, labelValue)
+}
+
+// IncSource adds one to a counter with a second label through the recorder's
+// metric set.
+func (r *Recorder) IncSource(name, labelValue, source string) {
+	if r == nil || r.metrics == nil {
+		return
+	}
+	r.metrics.IncSource(name, labelValue, source)
 }
 
 func (r *Recorder) observeHistogram(name string, seconds float64) {
@@ -593,11 +609,15 @@ func WakeDeliveredOutcome(adapter, watchID, outcome string, revision ...uint64) 
 }
 
 // WakeDeliveredSource records one wake together with the path that admitted
-// it. The source is a log field only, so metric labels and existing callers
-// keep their current behavior (T3.417).
+// it. The source reaches both the delivered counter and the log event. Sinks
+// that predate the source label fall back to the adapter-only counter.
 func WakeDeliveredSource(adapter, watchID, source string, revision ...uint64) {
 	s := Default()
-	s.Inc(CounterWakeDelivered, adapter)
+	if withSource, ok := s.(sourceSink); ok {
+		withSource.IncSource(CounterWakeDelivered, adapter, source)
+	} else {
+		s.Inc(CounterWakeDelivered, adapter)
+	}
 	cycles.note(func(c *cycleTracker) { c.wakes++ })
 	fields := Fields{FieldAdapter: adapter, FieldWatchID: watchID, FieldSource: source}
 	if len(revision) != 0 {
