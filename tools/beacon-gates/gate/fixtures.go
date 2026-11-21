@@ -1,5 +1,45 @@
 package gate
 
+import "fmt"
+
+// FixtureCase is one self-test check: a synthetic file tree and a predicate
+// over the findings the analyse function returns for it.
+type FixtureCase struct {
+	Files map[string]string
+	Want  func([]Finding) bool
+}
+
+// RunFixtures builds each case in list, runs analyse on the generated tree,
+// checks the findings with the case's Want, then cleans the tree with cleanup.
+// It reports every failing case and returns true only when all cases pass.
+// A nil cleanup falls back to RemoveFixture.
+func RunFixtures(list []FixtureCase, analyse func(string) ([]Finding, error), cleanup func(string)) bool {
+	if cleanup == nil {
+		cleanup = RemoveFixture
+	}
+	ok := true
+	for _, c := range list {
+		root, err := Fixture(c.Files)
+		if err != nil {
+			fmt.Println("self-test FAILED: fixture:", err)
+			ok = false
+			continue
+		}
+		findings, err := analyse(root)
+		cleanup(root)
+		if err != nil {
+			fmt.Println("self-test FAILED: analyse:", err)
+			ok = false
+			continue
+		}
+		if !c.Want(findings) {
+			fmt.Printf("self-test FAILED: unexpected findings: %v\n", findings)
+			ok = false
+		}
+	}
+	return ok
+}
+
 // LayerFixtureModule is the module path used by synthetic layer trees.
 const LayerFixtureModule = "example.com/beacon-fixture"
 

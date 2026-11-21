@@ -21,68 +21,59 @@ const skippedTest = "package demo\n\nimport \"testing\"\n\n" +
 
 const wrongPackageTest = "package other\n"
 
-func checkFixture(files map[string]string, want func([]gate.Finding) bool) bool {
-	root, err := gate.Fixture(files)
-	if err != nil {
-		fmt.Println("self-test FAILED: fixture:", err)
-		return false
-	}
-	defer gate.RemoveFixture(root)
-
-	findings, err := analyse(root)
-	if err != nil {
-		fmt.Println("self-test FAILED: analyse:", err)
-		return false
-	}
-	if !want(findings) {
-		fmt.Printf("self-test FAILED: unexpected findings: %v\n", findings)
-		return false
-	}
-	return true
-}
-
 func selfTestRun() int {
-	ok := true
+	list := []gate.FixtureCase{
+		// A planted exported adapter with no caller must be reported by the
+		// production analyse with the exact symbol key and rule.
+		{
+			Files: map[string]string{
+				"internal/infra/demo/adapter.go": plantedAdapter,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return gate.HasRule(fs, ruleUnwired) && gate.HasRuleAt(fs, ruleUnwired, "internal/infra/demo/DemoAdapter", 0)
+			},
+		},
+		// The same adapter referenced from cmd/ is wired and stays green.
+		{
+			Files: map[string]string{
+				"internal/infra/demo/adapter.go": plantedAdapter,
+				"cmd/beacon/wire.go":             wiredAdapter,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return len(fs) == 0
+			},
+		},
+		// A test disabled by a build tag must be reported.
+		{
+			Files: map[string]string{
+				"internal/infra/demo/adapter_test.go": ignoredTest,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return gate.HasRuleAt(fs, ruleTestIgnore, "internal/infra/demo/adapter_test.go", 0)
+			},
+		},
+		// A skipped test must be reported with its call site line.
+		{
+			Files: map[string]string{
+				"internal/infra/demo/adapter_test.go": skippedTest,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return gate.HasRuleAt(fs, ruleTestSkip, "internal/infra/demo/adapter_test.go", 5)
+			},
+		},
+		// A test in a package that does not match its directory must be reported.
+		{
+			Files: map[string]string{
+				"internal/infra/demo/adapter.go":      "package demo\n",
+				"internal/infra/demo/adapter_test.go": wrongPackageTest,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return gate.HasRuleAt(fs, ruleTestPkg, "internal/infra/demo/adapter_test.go", 0)
+			},
+		},
+	}
 
-	// A planted exported adapter with no caller must be reported by the
-	// production analyse with the exact symbol key and rule.
-	ok = checkFixture(map[string]string{
-		"internal/infra/demo/adapter.go": plantedAdapter,
-	}, func(fs []gate.Finding) bool {
-		return gate.HasRule(fs, ruleUnwired) && gate.HasRuleAt(fs, ruleUnwired, "internal/infra/demo/DemoAdapter", 0)
-	}) && ok
-
-	// The same adapter referenced from cmd/ is wired and stays green.
-	ok = checkFixture(map[string]string{
-		"internal/infra/demo/adapter.go": plantedAdapter,
-		"cmd/beacon/wire.go":             wiredAdapter,
-	}, func(fs []gate.Finding) bool {
-		return len(fs) == 0
-	}) && ok
-
-	// A test disabled by a build tag must be reported.
-	ok = checkFixture(map[string]string{
-		"internal/infra/demo/adapter_test.go": ignoredTest,
-	}, func(fs []gate.Finding) bool {
-		return gate.HasRuleAt(fs, ruleTestIgnore, "internal/infra/demo/adapter_test.go", 0)
-	}) && ok
-
-	// A skipped test must be reported with its call site line.
-	ok = checkFixture(map[string]string{
-		"internal/infra/demo/adapter_test.go": skippedTest,
-	}, func(fs []gate.Finding) bool {
-		return gate.HasRuleAt(fs, ruleTestSkip, "internal/infra/demo/adapter_test.go", 5)
-	}) && ok
-
-	// A test in a package that does not match its directory must be reported.
-	ok = checkFixture(map[string]string{
-		"internal/infra/demo/adapter.go":      "package demo\n",
-		"internal/infra/demo/adapter_test.go": wrongPackageTest,
-	}, func(fs []gate.Finding) bool {
-		return gate.HasRuleAt(fs, ruleTestPkg, "internal/infra/demo/adapter_test.go", 0)
-	}) && ok
-
-	if !ok {
+	if !gate.RunFixtures(list, analyse, gate.RemoveFixture) {
 		fmt.Println("self-test FAILED: 5 fixtures")
 		return gate.Red
 	}
