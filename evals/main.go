@@ -33,6 +33,7 @@ import (
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+	smoke "github.com/refusedguy/beacon/evals/cmd"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
@@ -352,7 +353,10 @@ func run() int {
 	defer cleanup()
 	stateHome := filepath.Join(stateRoot, "state")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	startTimeout := smoke.Duration(smoke.EnvStartTimeout, smoke.DefaultStartTimeout)
+	terminateTimeout := smoke.Duration(smoke.EnvTerminateTimeout, smoke.DefaultTerminateTimeout)
+
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
 
 	cmd := exec.Command(serverBin)
@@ -365,12 +369,25 @@ func run() int {
 		&mcpsdk.Implementation{Name: "beacon-evals", Version: "v0.0.0"},
 		nil,
 	)
-	session, err := client.Connect(ctx, &mcpsdk.CommandTransport{
-		Command:           cmd,
-		TerminateDuration: 2 * time.Second,
-	}, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "eval: CommandTransport подключение: %v\n%s\n", err, stderr.String())
+	var session *mcpsdk.ClientSession
+	// Стартовый smoke: готовность это MCP-handshake в Connect, а не sleep.
+	// Таймаут зафиксирован отдельно от логических eval, поэтому медленный
+	// старт видно как start_timeout и его нельзя починить правкой логики.
+	startup := smoke.Check(ctx, startTimeout, func(connectCtx context.Context) error {
+		connected, err := client.Connect(connectCtx, &mcpsdk.CommandTransport{
+			Command:           cmd,
+			TerminateDuration: terminateTimeout,
+		}, nil)
+		if err != nil {
+			return err
+		}
+		session = connected
+		return nil
+	})
+	if startup.Reason != smoke.ReasonOK {
+		fmt.Fprintf(os.Stderr,
+			"eval: evalserver старт FAIL причина=%s start=%s terminate=%s: %v\n%s\n",
+			startup.Reason, startTimeout, terminateTimeout, startup.Err, stderr.String())
 		return 1
 	}
 	defer func() { _ = session.Close() }()
@@ -1018,6 +1035,14 @@ func run() int {
 	record("PC01_pass5_negative_control",
 		"пять из пяти проходят; один провал из пяти блокирует",
 		pcActual, pcPass)
+
+	// SMOKE: причина стартового таймаута отделена от логического провала.
+	// Запись после eval 10, чтобы счётчик девяти базовых eval в
+	// checkTwoPhaseLocalCIGate не изменился.
+	smokeActual, smokePass := smoke.SelfCheck()
+	record("SMOKE_start_reason",
+		"deadline=start_timeout, error=connect_error, nil=ok",
+		smokeActual, smokePass)
 
 	printTable(results)
 	summary := summarize(results)
