@@ -150,7 +150,7 @@ sequenceDiagram
 
 `internal/domain/verdict.go` считает вердикт чистой функцией над снимком CI. Правила применяются по порядку, первое совпадение побеждает. `Evaluate` используется для прямой проверки, `EvaluatePR` для рабочего цикла CI. Второй отличается двумя вещами: терминальные состояния не будят никого, а падение проверки уже на main даёт `blocked`, а не запрос executor сделать ребейз.
 
-Вердикты: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`. Переходы также используют `needs_input`, `parked` и `accepted`.
+Вердикты: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`. Переходы также используют `needs_input`, `parked` и `accepted`. Оркестратор добавляет вердикт `green_blocked`. Проверки зелёные, но открытый блокер удерживает задачу. Задача освобождает слот оркестратора и ждёт снятия блокера. Полное описание лежит в `GLOSSARY.md`, а значение определено в `internal/domain/verdict.go` функцией `EvaluateGreenBlocked`.
 
 ```mermaid
 stateDiagram-v2
