@@ -59,6 +59,14 @@ type Snapshot struct {
 	// one already present on main; a nil or empty map means no base failure was
 	// observed.
 	BaseFailedChecks map[string]bool
+	// BaseHeadSHA is the base ref OID read from the same batch as the PR. It is
+	// the GraphQL ref.target.oid of the base branch, carried here so a stale
+	// base is machine visible. An empty value disables the stale-base rule.
+	BaseHeadSHA string
+	// BaseChecksKnown reports that the base check state was actually observed.
+	// A nil FailedChecks map from an unknown base is not proof that main is
+	// green, so the stale-base rule requires this flag as well.
+	BaseChecksKnown bool
 	// MergeError is the last merge attempt error reported by the provider. It is
 	// carried for diagnostics; it does not enter the verdict rules.
 	MergeError string
@@ -87,12 +95,20 @@ const (
 // WakeTarget is one action the caller must perform after Evaluate. Role is the
 // subscriber role to wake; an empty Role means the target is an adapter action
 // (WakeRestPin). RerunChecks is populated only for VerdictRetry and lists the
-// failing flaky checks to pass to `gh run rerun --failed`.
+// failing flaky checks to pass to `gh run rerun --failed`. Reason carries the
+// machine-readable cause of an actionable verdict, so a receiver can act
+// without triaging CI by hand. An empty reason keeps older wakes unchanged.
 type WakeTarget struct {
 	Role        Role
 	Kind        WakeKind
 	RerunChecks []string
+	Reason      string
 }
+
+// ReasonStaleBaseAfterMainFix names the rebase whose PR checks stayed red
+// after main was fixed. The PR is behind a base whose checks are green, so a
+// rebase on the current main is the next action, not a manual failure triage.
+const ReasonStaleBaseAfterMainFix = "stale_base_after_main_fix"
 
 // Evaluate computes the verdict and wake targets for s under policy p. The
 // rules are applied in the exact priority order of WORKER-PROMPT §4.6; the
@@ -204,6 +220,18 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	}
 	failed := realFailures(s)
 	if rollup == "FAILURE" || rollup == "ERROR" || len(failed) > 0 {
+		// A PR left behind by a fixed main must rebase, not keep working. The
+		// behindBy signal arrives from the batch as mergeStateStatus=BEHIND;
+		// the base OID and its green rollup come from the same observation.
+		// Requiring all three keeps a PR with an unknown or still broken main
+		// on its existing retry or keep_working path, so this never forces a
+		// rebase of every red PR.
+		if status == "BEHIND" && s.BaseChecksKnown && s.BaseHeadSHA != "" &&
+			len(s.BaseFailedChecks) == 0 {
+			return VerdictRebase, []WakeTarget{{
+				Role: RoleExecutor, Kind: WakePointer, Reason: ReasonStaleBaseAfterMainFix,
+			}}
+		}
 		retry := s
 		retry.Failures = failed
 		if rerun := flakyRetryChecks(retry); len(rerun) > 0 {

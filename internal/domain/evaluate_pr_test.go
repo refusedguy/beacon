@@ -143,6 +143,61 @@ func TestEvaluatePRDecisionTable(t *testing.T) {
 			want: VerdictKeepWorking, wake: prWake(RoleExecutor, WakePointer),
 		},
 		{
+			name: "red checks behind a fixed main rebase with a reason",
+			s: prMutate(func(s *Snapshot) {
+				s.Rollup = "FAILURE"
+				s.Failures = []string{"ci-stable"}
+				s.MergeStateStatus = "BEHIND"
+				s.BaseChecksKnown = true
+				s.BaseHeadSHA = "main-after-fix"
+			}),
+			want: VerdictRebase,
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakePointer, Reason: ReasonStaleBaseAfterMainFix}},
+		},
+		{
+			name: "stale base wins over a flaky retry",
+			s: prMutate(func(s *Snapshot) {
+				s.Rollup = "FAILURE"
+				s.Failures = []string{"ci-flaky"}
+				s.MergeStateStatus = "BEHIND"
+				s.BaseChecksKnown = true
+				s.BaseHeadSHA = "main-after-fix"
+				s.Flaky = FlakyConfig{Names: []string{"*"}, MaxRetries: 3}
+			}),
+			want: VerdictRebase,
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakePointer, Reason: ReasonStaleBaseAfterMainFix}},
+		},
+		{
+			name: "unknown base checks keep working instead of rebasing",
+			s: prMutate(func(s *Snapshot) {
+				s.Rollup = "FAILURE"
+				s.Failures = []string{"ci-stable"}
+				s.MergeStateStatus = "BEHIND"
+				s.BaseHeadSHA = "main-after-fix"
+			}),
+			want: VerdictKeepWorking, wake: prWake(RoleExecutor, WakePointer),
+		},
+		{
+			name: "missing base head keeps working instead of rebasing",
+			s: prMutate(func(s *Snapshot) {
+				s.Rollup = "FAILURE"
+				s.Failures = []string{"ci-stable"}
+				s.MergeStateStatus = "BEHIND"
+				s.BaseChecksKnown = true
+			}),
+			want: VerdictKeepWorking, wake: prWake(RoleExecutor, WakePointer),
+		},
+		{
+			name: "red checks on a clean base keep working, not rebase all PRs",
+			s: prMutate(func(s *Snapshot) {
+				s.Rollup = "FAILURE"
+				s.Failures = []string{"ci-stable"}
+				s.BaseChecksKnown = true
+				s.BaseHeadSHA = "main-after-fix"
+			}),
+			want: VerdictKeepWorking, wake: prWake(RoleExecutor, WakePointer),
+		},
+		{
 			name: "doc-only PR with no checks is ready",
 			s: prMutate(func(s *Snapshot) {
 				s.Rollup = ""

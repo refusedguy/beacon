@@ -279,6 +279,10 @@ func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) 
 			failed[name] = isFailed
 		}
 		base.FailedChecks = failed
+		// Store the base head observed in this batch on the PR. cibridge reads it
+		// into the verdict snapshot so a PR behind a green main gets a rebase
+		// wake with a machine-readable reason instead of keep_working.
+		pr.BaseHeadSHA = batchBaseHeadSHA(base)
 		out[w.ID] = domain.PRSnapshot{PR: pr, Base: base}
 	}
 	return out, nil
@@ -624,6 +628,14 @@ type baseRefPayload struct {
 			StatusCheckRollup *tier2Rollup `json:"statusCheckRollup"`
 		} `json:"target"`
 	} `json:"ref"`
+}
+
+// batchBaseHeadSHA returns the base ref OID read by baseRefFields in the same
+// batch as the PR. The companion behind signal is already carried by the PR
+// selection as mergeStateStatus=BEHIND (GitHub's behindBy > 0), so no extra
+// GraphQL field is needed to tell a stale base from a genuine PR failure.
+func batchBaseHeadSHA(base domain.BaseBranchState) string {
+	return strings.TrimSpace(base.HeadSHA)
 }
 
 // parseBaseRefState reads the failed checks of a base branch. An absent ref or
