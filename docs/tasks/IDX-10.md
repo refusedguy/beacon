@@ -1,5 +1,5 @@
 # IDX-10. Локальный TUI beacon board
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: cmd/beacon/board.go, internal/tui/board.go, go.mod, go.sum
@@ -26,3 +26,7 @@ baseline: 2026-11-21, `ls docs/tasks/*.md | wc -l` = 970 карточек. `grep
 ## Отложенная проводка
 
 Матрица `tools/beacon-gates/gate/config/layers.json` разрешает cmd только к internal/infra, internal/app и internal/domain. Ребро cmd к internal/tui запрещено, поэтому dispatch-ветка `case "board"` в cmd/beacon/main.go и адаптер к tui.Run не входят в OwnerFiles этой карточки. Проводка вынесена в WIRING-карточку через beacon_defer_wiring. Интерактивный запуск появится после её мержа, а текущий PR поставляет готовую модель, рендер и командный слой без сети.
+
+## Подтверждение
+
+Проверено 2026-11-21 по `git log` и `gh pr view`. Реализация влита в origin/main через PR #915, https://github.com/refusedguy/beacon/pull/915. Merge commit a7e447cf627f7bb4119543805544b653f26047b4 добавил cmd/beacon/board.go, internal/tui/board.go и зависимости в go.mod и go.sum. Статус переведён в done.
