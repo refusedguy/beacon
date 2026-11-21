@@ -61,7 +61,7 @@ type CancelEventLog interface {
 	Append(ctx context.Context, e CancelAuditEvent) error
 }
 
-// cancelWatchStore is the part of domain.Store that cancellation needs.
+// cancelWatchStore is the part of domain.WatchStore that cancellation needs.
 type cancelWatchStore interface {
 	Watch(id string) (domain.Watch, error)
 	SaveWatch(w domain.Watch) error

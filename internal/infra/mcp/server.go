@@ -376,6 +376,14 @@ func (d Dependencies) AskChildQuestion(ctx context.Context, childID, question st
 	return notice, nil
 }
 
+// StateStore is the local aggregate of the two narrow domain state ports.
+// Consumers that need both watches and obligations embed it; the concrete
+// store is assembled once in the composition root and passed to every tool.
+type StateStore interface {
+	domain.WatchStore
+	domain.ObligationStore
+}
+
 // Dependencies groups the ports the eight real handlers need. NewServer's
 // zero-dependency form still registers every real handler; handlers that lack a
 // backing port report a domain error instead of pretending to succeed. A
@@ -386,7 +394,7 @@ func (d Dependencies) AskChildQuestion(ctx context.Context, childID, question st
 // builds them from store/github and passes them in; this package never imports
 // a sibling infra package.
 type Dependencies struct {
-	Store   domain.Store
+	Store   StateStore
 	CI      domain.CIProvider
 	Stamper ObligationStamper
 	Writer  WaitResultWriter

@@ -100,8 +100,8 @@ func (m *memStore) PendingObligations() ([]Obligation, error) {
 }
 
 var (
-	_ Store = (*memStore)(nil)
-	_ Clock = fanoutClock{}
+	_ stateStore = (*memStore)(nil)
+	_ Clock      = fanoutClock{}
 )
 
 func newTestFanout(t *testing.T) (*Fanout, *memStore) {

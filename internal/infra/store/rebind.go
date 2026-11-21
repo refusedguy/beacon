@@ -1,4 +1,4 @@
-// Package store is the SQLite implementation of domain.Store.
+// Package store is the SQLite implementation of the domain state ports.
 //
 // This file owns the in-place orchestrator rebind. It stays in the store so the
 // CLI can ask for the operation with plain strings and plain result data,

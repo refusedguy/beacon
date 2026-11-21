@@ -39,21 +39,28 @@ type Subscription struct {
 	Renewed    bool
 }
 
-// Fanout applies the registration and fan-out rules. It holds a Store and a
-// Clock through their domain ports. The mutex serializes the check-then-act
+// stateStore is the local aggregate of the two narrow state ports Fanout needs.
+// The concrete implementation is assembled once in the composition root.
+type stateStore interface {
+	WatchStore
+	ObligationStore
+}
+
+// Fanout applies the registration and fan-out rules. It holds a stateStore and
+// a Clock through their domain ports. The mutex serializes the check-then-act
 // sequence so the alias and limit invariants hold under concurrent calls in
-// one process. A single writer per Store is still assumed; cross-process
+// one process. A single writer per stateStore is still assumed; cross-process
 // exclusion belongs to the daemon's lock (ADR 0021).
 type Fanout struct {
 	mu        sync.Mutex
-	store     Store
+	store     stateStore
 	clock     Clock
 	streamSeq uint64
 }
 
 // NewFanout builds a Fanout over the given ports. A nil clock falls back to
 // the wall clock. A nil store is rejected when Subscribe is called.
-func NewFanout(store Store, clock Clock) *Fanout {
+func NewFanout(store stateStore, clock Clock) *Fanout {
 	if clock == nil {
 		clock = wallClock{}
 	}

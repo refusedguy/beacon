@@ -100,8 +100,16 @@ type WakeLadder interface {
 // port and stays independent of it.
 type OrchestratorIDSource func() string
 
-// liveWatchSource is the narrower alternative to domain.Store.AllWatches. The
-// store adapter excludes closed Watches from LiveWatches; a caller that does
+// stateStore is the local aggregate of the narrow state ports the bridge needs.
+// The concrete store is assembled once in the composition root and passed to
+// every consumer, so the bridge stays independent of the infra store package.
+type stateStore interface {
+	domain.WatchStore
+	domain.ObligationStore
+}
+
+// liveWatchSource is the narrower alternative to domain.WatchStore.AllWatches.
+// The store adapter excludes closed Watches from LiveWatches; a caller that does
 // not implement it still works through AllWatches.
 type liveWatchSource interface {
 	LiveWatches() ([]domain.Watch, error)
@@ -175,7 +183,7 @@ type CardLinks interface {
 type WorktreeGC func(ctx context.Context) (removed int, err error)
 
 // Bridge refreshes active Watches on a ticker. One Bridge owns one CI provider,
-// one Store and the optional control-plane ports, so a refresh is a batched
+// one state store and the optional control-plane ports, so a refresh is a batched
 // read followed by ordered writes.
 type Bridge struct {
 	// The four parts own one responsibility each. They embed *Bridge back so
@@ -186,7 +194,7 @@ type Bridge struct {
 	*wakeDispatcher
 	*readAPI
 
-	store          domain.Store
+	store          stateStore
 	ci             domain.CIProvider
 	batch          domain.BatchCIProvider
 	merger         domain.Merger
@@ -435,7 +443,7 @@ func (b *Bridge) WithEscalationWriter(fn escalationWriter) *Bridge {
 
 // New builds a Bridge. An empty interval falls back to DefaultPollInterval;
 // composition roots that read BEACON_CI_POLL_INTERVAL pass PollInterval().
-func New(store domain.Store, ci domain.CIProvider, clock domain.Clock, interval time.Duration) *Bridge {
+func New(store stateStore, ci domain.CIProvider, clock domain.Clock, interval time.Duration) *Bridge {
 	if interval <= 0 {
 		interval = DefaultPollInterval
 	}

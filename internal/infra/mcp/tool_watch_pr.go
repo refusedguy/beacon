@@ -285,7 +285,7 @@ type WatchPRRegistrar interface {
 // owns a Fanout, which serializes the check-then-act sequence inside one
 // process; cross-process exclusion remains the daemon's job (ADR 0021).
 type WatchPRHandler struct {
-	store     domain.Store
+	store     StateStore
 	ci        domain.CIProvider
 	clock     domain.Clock
 	fanout    *domain.Fanout
@@ -303,7 +303,7 @@ type WatchPRHandler struct {
 // NewWatchPRHandler builds a handler. A nil clock falls back to the wall
 // clock inside domain.NewFanout; a nil CI provider is allowed when callers
 // always supply headSHA.
-func NewWatchPRHandler(store domain.Store, ci domain.CIProvider, clock domain.Clock) *WatchPRHandler {
+func NewWatchPRHandler(store StateStore, ci domain.CIProvider, clock domain.Clock) *WatchPRHandler {
 	return &WatchPRHandler{
 		store:          store,
 		ci:             ci,
