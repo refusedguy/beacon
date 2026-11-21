@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -74,6 +75,20 @@ func NewScopedRegistry(db *DB, scope ProjectScope) (*ScopedRegistry, error) {
 	if db == nil {
 		return nil, domain.NewAppError(domain.CodeInvalidInput,
 			"store: scope: nil database")
+	}
+	// watch_bindings is created by migration 0005 at Open, so the index can be
+	// prepared before the first scoped read. Repeating construction is a no-op
+	// because the DDL is IF NOT EXISTS.
+	if err := db.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`
+			CREATE INDEX IF NOT EXISTS watch_bindings_by_project_watch
+			ON watch_bindings(project_key, watch_id, revision DESC)`)
+		if err != nil {
+			return fmt.Errorf("store: scope: ensure binding index: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return &ScopedRegistry{db: db, scope: scope}, nil
 }
