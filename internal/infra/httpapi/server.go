@@ -120,6 +120,16 @@ type AuditRecord struct {
 type AuditPage struct {
 	Entries []AuditRecord `json:"entries"`
 	Total   int           `json:"total"`
+
+	// Truncated reports that the buffer trimmed at least one older record, so
+	// this page is not the full audit history. The flag describes the buffer
+	// as a whole. A filtered page may still contain every record for its actor
+	// while Truncated is true.
+	Truncated bool `json:"truncated"`
+	// Dropped counts the records the buffer trimmed so far. It tells a consumer
+	// how much history is missing from the snapshot. It stays absent until the
+	// first trim, which keeps the response unchanged for a fresh process.
+	Dropped uint64 `json:"dropped,omitempty"`
 }
 
 // Snapshot is the read-only projection served by /api/v1/snapshot. It is a
@@ -410,6 +420,10 @@ type opsState struct {
 	wakeLatencyMax  float64
 	wakeLatencyLast float64
 	audit           []AuditRecord
+	// auditDropped counts the records the trim removes once audit reaches
+	// maxAuditRecords. It survives the trim, so auditView can tell a consumer
+	// that older history is missing from the snapshot.
+	auditDropped uint64
 }
 
 // observeWake records one wake latency in milliseconds. A negative duration
@@ -445,13 +459,16 @@ func (o *opsState) metricsView() OpsMetrics {
 	return m
 }
 
-// recordAudit appends one command to the bounded audit list.
+// recordAudit appends one command to the bounded audit list. When the list is
+// full it drops the oldest records and counts them, so a later auditView can
+// report that the snapshot is incomplete.
 func (o *opsState) recordAudit(rec AuditRecord) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.audit = append(o.audit, rec)
-	if len(o.audit) > maxAuditRecords {
-		o.audit = append([]AuditRecord(nil), o.audit[len(o.audit)-maxAuditRecords:]...)
+	if overflow := len(o.audit) - maxAuditRecords; overflow > 0 {
+		o.audit = append([]AuditRecord(nil), o.audit[overflow:]...)
+		o.auditDropped += uint64(overflow)
 	}
 }
 
@@ -466,7 +483,12 @@ func (o *opsState) auditView(actor string) AuditPage {
 		}
 		entries = append(entries, rec)
 	}
-	return AuditPage{Entries: entries, Total: len(entries)}
+	return AuditPage{
+		Entries:   entries,
+		Total:     len(entries),
+		Truncated: o.auditDropped > 0,
+		Dropped:   o.auditDropped,
+	}
 }
 
 // Server owns the listener, the bearer token and the connection file. Close
