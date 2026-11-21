@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,9 +13,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -34,6 +37,10 @@ const (
 
 	// healthPollInterval is the pause between health requests.
 	healthPollInterval = 100 * time.Millisecond
+
+	// serveStateFile is the name of the record Beacon writes for a server it
+	// spawned itself. service.json stays the property of the user's OpenCode.
+	serveStateFile = "opencode-serve.json"
 )
 
 // spawnRequest describes the child process to start. port comes from a short
@@ -49,6 +56,12 @@ type spawnRequest struct {
 type spawnedProcess interface {
 	Done() <-chan struct{}
 	Kill() error
+}
+
+// pidProcess is the optional half a real child implements. Tests keep using
+// the smaller spawnedProcess seam, so a missing PID is never a failure.
+type pidProcess interface {
+	PID() int
 }
 
 // serveRunner starts `opencode serve`. Tests replace it so no child process
@@ -77,6 +90,14 @@ func (p *execProcess) Kill() error {
 	return p.cmd.Process.Kill()
 }
 
+// PID returns the OS process id of the child. Zero means it never started.
+func (p *execProcess) PID() int {
+	if p.cmd.Process == nil {
+		return 0
+	}
+	return p.cmd.Process.Pid
+}
+
 // startServeProcess starts opencode with the password in the environment.
 // Output goes to io.Discard so a full pipe cannot block the child.
 func startServeProcess(req spawnRequest) (spawnedProcess, error) {
@@ -92,6 +113,9 @@ func startServeProcess(req spawnRequest) (spawnedProcess, error) {
 	cmd.Env = append(env, "OPENCODE_SERVER_PASSWORD="+req.password)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
+	// The child must not outlive Beacon. SIGTERM is delivered when the parent
+	// dies, so a killed agent cannot leave an orphaned serve behind (Q-A2).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("opencode serve: %w", err)
 	}
@@ -166,10 +190,210 @@ func waitHealthy(ctx context.Context, baseURL, password string, done <-chan stru
 	}
 }
 
-// EnsureServer returns a Config for a live opencode HTTP API. An existing
-// service.json wins. Without it, EnsureServer starts opencode serve on a free
-// loopback port with a fresh password and waits for health (ADR 0060 п3).
+// ServeState is Beacon's own record of a server it spawned. service.json
+// belongs to the user's OpenCode and is never rewritten here. The password is
+// stored with the same 0600 permissions as the registration file so a later
+// call can reuse the server instead of starting a second one.
+type ServeState struct {
+	URL      string `json:"url"`
+	Password string `json:"password"`
+	PID      int    `json:"pid"`
+}
+
+// ensureMu serializes the whole resolve-or-spawn path inside one process. Two
+// concurrent calls must not both decide that no server exists.
+var ensureMu sync.Mutex
+
+func stateHomeDir() (string, error) {
+	if base := os.Getenv("XDG_STATE_HOME"); base != "" {
+		return base, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("не удалось определить домашний каталог: %w", err)
+	}
+	return filepath.Join(home, ".local", "state"), nil
+}
+
+func serveStatePath() (string, error) {
+	base, err := stateHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "beacon", serveStateFile), nil
+}
+
+func serviceRegistrationPath() (string, error) {
+	base, err := stateHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, "opencode", "service.json"), nil
+}
+
+// ReadServeState returns the record of a server spawned by Beacon. The bool is
+// false when no record exists or the file is not valid.
+func ReadServeState() (ServeState, bool) {
+	path, err := serveStatePath()
+	if err != nil {
+		return ServeState{}, false
+	}
+	data, err := readFile(path)
+	if err != nil {
+		return ServeState{}, false
+	}
+	var st ServeState
+	if err := json.Unmarshal(data, &st); err != nil || strings.TrimSpace(st.URL) == "" {
+		return ServeState{}, false
+	}
+	return st, true
+}
+
+// WriteServeState records a spawned server so later calls reuse it.
+func WriteServeState(st ServeState) error {
+	path, err := serveStatePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("opencode serve: каталог состояния: %w", err)
+	}
+	data, err := json.Marshal(st)
+	if err != nil {
+		return fmt.Errorf("opencode serve: сериализация состояния: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("opencode serve: запись состояния: %w", err)
+	}
+	return nil
+}
+
+// ClearServeState removes a stale record. Missing file is not an error.
+func ClearServeState() error {
+	path, err := serveStatePath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("opencode serve: удаление состояния: %w", err)
+	}
+	return nil
+}
+
+// ReadServicePID returns the pid of the user's main OpenCode server from
+// service.json. Zero means the registration has no pid or cannot be read.
+func ReadServicePID() int {
+	path, err := serviceRegistrationPath()
+	if err != nil {
+		return 0
+	}
+	data, err := readFile(path)
+	if err != nil {
+		return 0
+	}
+	var reg struct {
+		PID int `json:"pid"`
+	}
+	if err := json.Unmarshal(data, &reg); err != nil {
+		return 0
+	}
+	return reg.PID
+}
+
+// ProcessAlive mirrors the signal-0 check used elsewhere in Beacon: EPERM
+// still means the process exists, only another user owns it.
+func ProcessAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// TerminateServe asks a server to stop. GC uses SIGTERM so the process can
+// close its listeners before exiting.
+func TerminateServe(pid int) error {
+	if pid <= 0 {
+		return errors.New("opencode serve: неверный pid")
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("opencode serve: SIGTERM pid %d: %w", pid, err)
+	}
+	return nil
+}
+
+// ServeProcess is one `opencode serve --hostname ...` found on this machine.
+// Port comes from the --port argument and is used to protect the live
+// registration even when the pid is absent from service.json.
+type ServeProcess struct {
+	PID  int
+	Port string
+}
+
+// ListServeProcesses scans /proc for running opencode serve processes. It
+// reads only cmdline and never opens a socket or changes a process.
+func ListServeProcesses() ([]ServeProcess, error) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil, fmt.Errorf("opencode serve: чтение /proc: %w", err)
+	}
+	out := make([]ServeProcess, 0)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		data, err := readFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		args := strings.Split(string(data), "\x00")
+		if proc, ok := parseServeCmdline(pid, args); ok {
+			out = append(out, proc)
+		}
+	}
+	return out, nil
+}
+
+// parseServeCmdline decides whether args belong to an opencode serve process.
+// It is pure so the classification can be tested with mocks.
+func parseServeCmdline(pid int, args []string) (ServeProcess, bool) {
+	if len(args) == 0 || !strings.Contains(filepath.Base(args[0]), "opencode") {
+		return ServeProcess{}, false
+	}
+	serve, hostname := false, false
+	port := ""
+	for i, arg := range args {
+		switch arg {
+		case "serve":
+			serve = true
+		case "--hostname":
+			hostname = true
+		case "--port":
+			if i+1 < len(args) {
+				port = args[i+1]
+			}
+		}
+	}
+	if !serve || !hostname {
+		return ServeProcess{}, false
+	}
+	return ServeProcess{PID: pid, Port: port}, true
+}
+
+// EnsureServer returns a Config for a live opencode HTTP API. A server Beacon
+// spawned earlier is reused while its pid is alive, then the user's
+// service.json, and only then a new child on a free loopback port (ADR 0060 п3).
 func EnsureServer(ctx context.Context) (Config, error) {
+	ensureMu.Lock()
+	defer ensureMu.Unlock()
+
+	if st, ok := ReadServeState(); ok && ProcessAlive(st.PID) {
+		return Config{URL: st.URL, Password: st.Password}, nil
+	}
 	if cfg, err := ReadConfig(); err == nil {
 		return cfg, nil
 	}
@@ -192,7 +416,16 @@ func EnsureServer(ctx context.Context) (Config, error) {
 		_ = proc.Kill()
 		return Config{}, err
 	}
-	return Config{URL: baseURL, Password: password}, nil
+	pid := 0
+	if withPID, ok := proc.(pidProcess); ok {
+		pid = withPID.PID()
+	}
+	cfg := Config{URL: baseURL, Password: password}
+	if err := WriteServeState(ServeState{URL: cfg.URL, Password: cfg.Password, PID: pid}); err != nil {
+		_ = proc.Kill()
+		return Config{}, err
+	}
+	return cfg, nil
 }
 
 // Scope-token store (T3.235). A token is a bearer credential bound to one
