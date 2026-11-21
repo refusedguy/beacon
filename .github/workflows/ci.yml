@@ -180,7 +180,7 @@ jobs:
           set -euo pipefail
           bin=tools/beacon-gates/beacon-gates
           "$bin" --list
-          for gate in capabilities layers-ast layers-list; do
+          for gate in capabilities layers-ast layers-list wiring; do
             printf 'self-test gate=%s\n' "$gate"
             "$bin" "$gate" --self-test
           done
@@ -190,7 +190,7 @@ jobs:
         run: |
           set -euo pipefail
           bin=tools/beacon-gates/beacon-gates
-          for gate in capabilities layers-ast layers-list; do
+          for gate in capabilities layers-ast layers-list wiring; do
             printf 'gate gate=%s\n' "$gate"
             "$bin" "$gate"
           done
