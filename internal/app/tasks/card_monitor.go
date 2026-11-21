@@ -84,6 +84,7 @@ type Monitor struct {
 	port  Port
 	limit int
 
+	pollMu  sync.Mutex
 	mu      sync.Mutex
 	states  map[string]*cardState
 	nextSeq uint64
@@ -161,18 +162,27 @@ func (m *Monitor) Poll(ctx context.Context, id string) (PollResult, error) {
 		return PollResult{}, errors.New("tasks: nil card monitor port")
 	}
 
+	// pollMu keeps the poll-to-poll guarantee. m.mu is released before every
+	// port call, so a port callback can re-enter the monitor without deadlock.
+	m.pollMu.Lock()
+	defer m.pollMu.Unlock()
+
+	// Snapshot the stored state under m.mu and work on the copy. No port call
+	// runs while m.mu is held.
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	state, ok := m.states[id]
 	if !ok {
+		m.mu.Unlock()
 		return PollResult{}, fmt.Errorf("%w: %s", ErrNotSubscribed, id)
 	}
+	st := *state
+	m.mu.Unlock()
 
 	snapshot, found, err := m.port.Card(ctx, id)
 	if err != nil {
 		return PollResult{}, fmt.Errorf("tasks: read card %s: %w", id, err)
 	}
-	events, err := m.port.EventsAfter(ctx, id, state.cursor, m.limit)
+	events, err := m.port.EventsAfter(ctx, id, st.cursor, m.limit)
 	if err != nil {
 		return PollResult{}, fmt.Errorf("tasks: read events for %s: %w", id, err)
 	}
@@ -182,7 +192,7 @@ func (m *Monitor) Poll(ctx context.Context, id string) (PollResult, error) {
 	}
 
 	res := PollResult{Events: make([]RecordedEvent, 0, len(events))}
-	cursor := state.cursor
+	cursor := st.cursor
 	for _, ev := range events {
 		if ev.Seq <= cursor {
 			continue
@@ -193,16 +203,18 @@ func (m *Monitor) Poll(ctx context.Context, id string) (PollResult, error) {
 
 	var change Change
 	emit := false
-	if !state.known {
-		state.known = true
-		state.status = snapshot.Status
-	} else if snapshot.Status != state.status {
+	if !st.known {
+		st.known = true
+		st.status = snapshot.Status
+	} else if snapshot.Status != st.status {
+		m.mu.Lock()
 		seq := m.nextSeq + 1
+		m.mu.Unlock()
 		change = Change{
 			CardID: id,
 			Seq:    seq,
 			Type:   EventTypeStatusChanged,
-			From:   state.status,
+			From:   st.status,
 			To:     snapshot.Status,
 		}
 		payload, err := m.port.Serialize(change)
@@ -210,13 +222,22 @@ func (m *Monitor) Poll(ctx context.Context, id string) (PollResult, error) {
 			return PollResult{}, fmt.Errorf("tasks: serialize change for %s: %w", id, err)
 		}
 		change.Payload = payload
-		m.nextSeq = seq
-		state.status = snapshot.Status
 		emit = true
 	}
-	state.cursor = cursor
+	st.cursor = cursor
+
+	// Commit the copy under m.mu. Subscribe or Unsubscribe may have run while
+	// the port calls were in flight, so check the entry again before writing.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.states[id]
+	if !ok {
+		return PollResult{}, fmt.Errorf("%w: %s", ErrNotSubscribed, id)
+	}
 	if emit {
+		m.nextSeq = change.Seq
 		res.Changes = []Change{change}
 	}
+	*cur = st
 	return res, nil
 }
