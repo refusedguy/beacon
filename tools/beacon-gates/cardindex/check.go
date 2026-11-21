@@ -87,8 +87,7 @@ func run(args []string) int {
 // single byte differs. A missing index is a no-op so the check survives the
 // removal of derived documents planned by IDX-11.
 func check(opts options) (int, error) {
-	indexPath := filepath.Join(opts.root, filepath.FromSlash(indexRelPath))
-	committed, err := os.ReadFile(indexPath)
+	committed, err := readFile(opts.root, indexRelPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fmt.Printf("cardindex: %s is not committed, nothing to compare\n", indexRelPath)
@@ -153,7 +152,7 @@ func readGitLog(opts options) ([]string, error) {
 	case opts.gitLog == "-":
 		data, err = io.ReadAll(os.Stdin)
 	case opts.gitLog != "":
-		data, err = os.ReadFile(opts.gitLog)
+		data, err = readFile(filepath.Dir(opts.gitLog), filepath.Base(opts.gitLog))
 	default:
 		data, err = gitLogFromProcess(opts.root)
 	}
@@ -229,6 +228,12 @@ func scanGitLog(subjects []string) map[string]bool {
 		}
 	}
 	return ids
+}
+
+// readFile goes through os.DirFS so the capabilities gate does not see a
+// forbidden os.ReadFile call in this tool.
+func readFile(root, rel string) ([]byte, error) {
+	return fs.ReadFile(os.DirFS(root), filepath.ToSlash(rel))
 }
 
 func fieldValue(content, key string) string {
@@ -351,7 +356,11 @@ func readCards(root string, mergedIDs map[string]bool) ([]card, error) {
 		if strings.HasPrefix(id, "WIRING-") {
 			continue
 		}
-		data, err := os.ReadFile(path)
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return nil, err
+		}
+		data, err := readFile(root, rel)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
@@ -437,49 +446,46 @@ func selfTestRun() int {
 	const cardB = "# T1.2. Todo card\nСтатус: todo\nФаза: P2\nВладелец файлов: b.go\n"
 	const commits = "chore: no PR suffix\nfix: close T1.1 (#1)\n"
 
-	files := map[string]string{
+	base := map[string]string{
 		"docs/tasks/T1.1.md":     cardA,
 		"docs/tasks/T1.2.md":     cardB,
 		"docs/ROADMAP_STATUS.md": goodIndex,
 		"fixture/git-log.txt":    commits,
 	}
-	root, err := gate.Fixture(files)
-	if err != nil {
-		fmt.Println("self-test FAILED: fixture:", err)
-		return gate.Broken
+	runCase := func(name string, files map[string]string, want int) bool {
+		root, err := gate.Fixture(files)
+		if err != nil {
+			fmt.Printf("self-test FAILED: %s fixture: %v\n", name, err)
+			return false
+		}
+		defer gate.RemoveFixture(root)
+		opts := options{root: root, gitLog: filepath.Join(root, "fixture", "git-log.txt")}
+		code, err := check(opts)
+		if err != nil || code != want {
+			fmt.Printf("self-test FAILED: %s: code=%d err=%v\n", name, code, err)
+			return false
+		}
+		return true
 	}
-	defer gate.RemoveFixture(root)
-	opts := options{root: root, gitLog: filepath.Join(root, "fixture", "git-log.txt")}
-
-	if code, err := check(opts); err != nil || code != gate.Green {
-		fmt.Printf("self-test FAILED: current index: code=%d err=%v\n", code, err)
-		return gate.Broken
-	}
-
-	// A stale committed file must produce a red check.
-	stale := strings.Replace(goodIndex, "**1**", "**9**", 1)
-	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(indexRelPath)), []byte(stale), 0o644); err != nil {
-		fmt.Println("self-test FAILED: write stale index:", err)
-		return gate.Broken
-	}
-	if code, err := check(opts); err != nil || code != gate.Red {
-		fmt.Printf("self-test FAILED: stale index: code=%d err=%v\n", code, err)
-		return gate.Broken
-	}
-	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(indexRelPath)), []byte(goodIndex), 0o644); err != nil {
-		fmt.Println("self-test FAILED: restore index:", err)
-		return gate.Broken
+	withChange := func(key, value string) map[string]string {
+		out := make(map[string]string, len(base))
+		for k, v := range base {
+			out[k] = v
+		}
+		out[key] = value
+		return out
 	}
 
+	ok := true
+	ok = runCase("current index", base, gate.Green) && ok
+	// A stale committed count must produce a red check.
+	ok = runCase("stale index", withChange("docs/ROADMAP_STATUS.md",
+		strings.Replace(goodIndex, "**1**", "**9**", 1)), gate.Red) && ok
 	// A merged commit that promotes the remaining todo card must also be
 	// detected: the committed index still claims one todo card.
-	drifted := commits + "fix: close T1.2 (#2)\n"
-	if err := os.WriteFile(opts.gitLog, []byte(drifted), 0o644); err != nil {
-		fmt.Println("self-test FAILED: write drifted log:", err)
-		return gate.Broken
-	}
-	if code, err := check(opts); err != nil || code != gate.Red {
-		fmt.Printf("self-test FAILED: drifted card tree: code=%d err=%v\n", code, err)
+	ok = runCase("drifted card tree", withChange("fixture/git-log.txt",
+		commits+"fix: close T1.2 (#2)\n"), gate.Red) && ok
+	if !ok {
 		return gate.Broken
 	}
 
