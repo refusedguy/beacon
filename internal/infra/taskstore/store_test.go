@@ -52,6 +52,25 @@ func TestParseCardValid(t *testing.T) {
 	}
 }
 
+func TestParseCardResearchLetterID(t *testing.T) {
+	for _, tc := range []struct {
+		file, want string
+		number     int
+	}{
+		{"ATX-R01.md", "ATX-R01", 1},
+		{"ATX-V08.md", "ATX-V08", 8},
+		{"ATX-D03.md", "ATX-D03", 3},
+	} {
+		c, err := ParseCard(tc.file, []byte(validCard))
+		if err != nil {
+			t.Fatalf("ParseCard(%s): %v", tc.file, err)
+		}
+		if c.ID != tc.want || c.Number != tc.number || !IsID(tc.want) {
+			t.Errorf("%s: ID=%q Number=%d IsID=%v", tc.file, c.ID, c.Number, IsID(tc.want))
+		}
+	}
+}
+
 func TestParseCardFromSuffixedName(t *testing.T) {
 	c, err := ParseCard("T3.7-executor-task-template.md", []byte(validCard))
 	if err != nil {

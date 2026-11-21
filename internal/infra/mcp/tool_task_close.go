@@ -169,7 +169,7 @@ type closeLedger struct {
 }
 
 var (
-	closeCardIDRE    = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+$`)
+	closeCardIDRE    = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|[.-][0-9]+)$`)
 	closeFieldLineRE = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
 	closeStatusRE    = regexp.MustCompile(`^Статус:[ \t]*(.*?)[ \t]*$`)
 )

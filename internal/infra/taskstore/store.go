@@ -93,11 +93,16 @@ var (
 	// Parse the common shapes and keep the exact filename as the card id.
 	idRE     = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)[.]([0-9]+)(?:-.*)?$`)
 	dashIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([0-9]+)$`)
+	// letterDashIDRE accepts research-family ids where a letter sits between
+	// the dash and the number, for example ATX-R01 or ATX-V08. The plain
+	// dashIDRE above requires the number directly after the dash, so cards
+	// produced by the backlog-research waves need their own form.
+	letterDashIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([A-Za-z]+)([0-9]+)$`)
 	// dotIDRE accepts an alphabetic prefix followed directly by a dot and a
 	// number, for example BS.1. The idRE above requires a digit before the dot
 	// (T3.123), so families like BS need their own form.
 	dotIDRE    = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
-	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+$`)
+	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|[.-][0-9]+)$`)
 	titleRE    = regexp.MustCompile(`^#\s+[A-Za-z][A-Za-z0-9_.-]*\.\s*(.*)$`)
 	headerRE   = regexp.MustCompile(`^#\s+(.*)$`)
 	fieldRE    = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
@@ -140,6 +145,9 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	case dashIDRE.MatchString(id):
 		d := dashIDRE.FindStringSubmatch(id)
 		number, err = strconv.Atoi(d[2])
+	case letterDashIDRE.MatchString(id):
+		d := letterDashIDRE.FindStringSubmatch(id)
+		number, err = strconv.Atoi(d[3])
 	case dotIDRE.MatchString(id):
 		d := dotIDRE.FindStringSubmatch(id)
 		number, err = strconv.Atoi(d[2])
