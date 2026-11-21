@@ -1,5 +1,5 @@
 # WIRING-486. Подключить channel ingress к серверу и обработчику команд
-Статус: done
+Статус: todo
 Обоснование: проводка уже в main, commit 28e3494 (PR #529) добавил buildChannelIngress и channelSenderResolver в cmd/beacon/server.go, upChannelIngress в cmd/beacon/up.go и ChannelSink в internal/app/command/processor.go. Дубля в OwnerFiles нет, код не писался.
 Фаза: P0
 Тип: task
@@ -14,7 +14,7 @@ PR: 486
 Цель: Подключить отложенную часть фичи после мержа PR 486.
 Контекст: BS.60 добавляет чистый channel.Ingress с портами ActorResolver и CommandSink и тестами на моковых портах. Конструктор, адаптеры портов и флаг opt-in живут в OwnerFiles cmd/beacon и internal/app, которых исполнитель BS.60 не трогал.
 Шаги: Создать карточку, подключить часть фичи, закрыть долг.
-Проверка: Проводка подключена, маркер и карточка лежат в одном PR.
+Проверка: Проводка подключена, карточка лежит в PR.
 Приёмка: Соответствующий CI зелёный, долг `beacon deferred` переведён в done.
 
 ## Причина
@@ -33,7 +33,7 @@ PR: 486
 ## Проверка
 
 - Список OwnerFiles совпадает с полем «Владелец файлов».
-- Маркер `.beacon/wiring-pending` и карточка `docs/tasks/WIRING-486.md` попали в один PR.
+- Карточка `docs/tasks/WIRING-486.md` попала в PR.
 - Локальный гейт `WIRING-*` проходит: статус `todo`, OwnerFiles заполнен, `## Причина` есть.
 
 ## Приёмка
@@ -41,9 +41,10 @@ PR: 486
 Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
 
 <!-- wiring-card:contract
-beacon_defer_wiring из W12-B пишет маркер .beacon/wiring-pending с одной строкой
-"WIRING:<PR>" на каждую отложенную проводку и добавляет эту карточку в тот же PR.
-Гейт локальный и не читает GitHub API: маркер заменяет маркер WIRING: в теле PR.
-Маркер без карточки, карточка без "Статус: todo", пустой OwnerFiles или
-отсутствующая "## Причина" проваливает проверку.
+beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
+эту карточку в тот же PR. Файловый маркер больше не входит в контракт: гейт
+читает только карточки docs/tasks/WIRING-*.md. Старый файл
+.beacon/wiring-pending, если он остался в дереве, гейт игнорирует.
+Карточка без "Статус: todo", пустой OwnerFiles или отсутствующая "## Причина"
+проваливает проверку.
 wiring-card:contract -->

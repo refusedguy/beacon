@@ -1,5 +1,5 @@
 # WIRING-485. Подключить notify router к доставке событий
-Статус: done
+Статус: todo
 - PR #532 (commit 930ccb1): premise проверен, notify.Router подключён к доставке verdict в рабочем пути. newDaemonNotifyRouter/routeDaemonEvent/daemonWakeRoute в cmd/beacon/daemon.go передают Router через orchestrator.WakeRoute (NewDaemonWakerWithRoute в internal/app/orchestrator/daemon.go) в вызов Router.Route; wake.TargetDeliverer/PromptTargetDeliverer в internal/infra/wake/deliver.go. Дубль не создан.
 Фаза: P5
 Тип: task
@@ -36,3 +36,12 @@ PR: 485
 ## Приёмка
 
 Проводка применена, запись в `beacon deferred --format json` имеет `status: done`, CI зелёный.
+
+<!-- wiring-card:contract
+beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
+эту карточку в тот же PR. Файловый маркер больше не входит в контракт: гейт
+читает только карточки docs/tasks/WIRING-*.md. Старый файл
+.beacon/wiring-pending, если он остался в дереве, гейт игнорирует.
+Карточка без "Статус: todo", пустой OwnerFiles или отсутствующая "## Причина"
+проваливает проверку.
+wiring-card:contract -->

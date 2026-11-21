@@ -1,5 +1,5 @@
 # WIRING-490. Подключить lineage дочерних thread к серверу
-Статус: done
+Статус: todo
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/server/ws.go, internal/infra/mcp/server.go
@@ -23,7 +23,7 @@ BS.69 помечена dropped: в текущем контракте семи и
 
 ## Подтверждение premise
 
-2026-11-21 после `git fetch origin main` PR #530 уже влит коммитом `c629af0`. Diff PR #530 меняет ровно OwnerFiles карточки и тесты к ним. В `origin/main` есть `ChildThreads` и `ParentNotifier` в `internal/infra/server/ws.go` и `AskChildQuestion` в `internal/infra/mcp/server.go`. Маркера `WIRING:490` в `.beacon/wiring-pending` нет. Отложенная часть подключена, правка OwnerFiles не нужна. Локальный гейт WIRING-* требует статус todo, но CI его не запускает, поэтому смена статуса не блокирует merge.
+2026-11-21 после `git fetch origin main` PR #530 уже влит коммитом `c629af0`. Diff PR #530 меняет ровно OwnerFiles карточки и тесты к ним. В `origin/main` есть `ChildThreads` и `ParentNotifier` в `internal/infra/server/ws.go` и `AskChildQuestion` в `internal/infra/mcp/server.go`. Маркера `WIRING:490` в `.beacon/wiring-pending` нет. Отложенная часть подключена, правка OwnerFiles не нужна. Статус остаётся todo по контракту гейта.
 
 ## Шаги
 
@@ -40,3 +40,12 @@ BS.69 помечена dropped: в текущем контракте семи и
 ## Приёмка
 
 Проводка применена, запись в `beacon deferred --format json` имеет status done, CI зелёный.
+
+<!-- wiring-card:contract
+beacon_defer_wiring записывает отложенную проводку в durable store и добавляет
+эту карточку в тот же PR. Файловый маркер больше не входит в контракт: гейт
+читает только карточки docs/tasks/WIRING-*.md. Старый файл
+.beacon/wiring-pending, если он остался в дереве, гейт игнорирует.
+Карточка без "Статус: todo", пустой OwnerFiles или отсутствующая "## Причина"
+проваливает проверку.
+wiring-card:contract -->
