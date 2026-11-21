@@ -494,3 +494,107 @@ func TestEscapeKeyComponent(t *testing.T) {
 		t.Error("escaping failed: a separator inside a component is ambiguous")
 	}
 }
+
+func TestParseAddressValid(t *testing.T) {
+	cases := []struct {
+		raw    string
+		member string
+		rig    string
+	}{
+		{"member@rig", "member", "rig"},
+		{"pod-member@rig-alpha", "pod-member", "rig-alpha"},
+	}
+	for _, tc := range cases {
+		addr, err := ParseAddress(tc.raw)
+		if err != nil {
+			t.Fatalf("ParseAddress(%q): %v", tc.raw, err)
+		}
+		if addr.String() != tc.raw {
+			t.Errorf("String = %q, want %q", addr.String(), tc.raw)
+		}
+		if addr.Member() != tc.member {
+			t.Errorf("Member = %q, want %q", addr.Member(), tc.member)
+		}
+		if addr.Rig() != tc.rig {
+			t.Errorf("Rig = %q, want %q", addr.Rig(), tc.rig)
+		}
+		if !addr.Valid() {
+			t.Errorf("address %q reported invalid", tc.raw)
+		}
+	}
+}
+
+func TestParseAddressInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+	}{
+		{"empty", ""},
+		{"no separator", "member"},
+		{"empty member", "@rig"},
+		{"empty rig", "member@"},
+		{"two separators", "member@rig@extra"},
+		{"whitespace in member", "mem ber@rig"},
+		{"whitespace in rig", "member@rig one"},
+		{"control character", "member@rig\x00"},
+		{"over long member", strings.Repeat("m", maxIdentityLen+1) + "@rig"},
+		{"over long rig", "member@" + strings.Repeat("r", maxIdentityLen+1)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, err := ParseAddress(tc.raw)
+			if err == nil {
+				t.Fatalf("ParseAddress(%q) = %q, want error", tc.raw, addr)
+			}
+			if !errors.Is(err, ErrInvalidSeatAddress) {
+				t.Fatalf("error = %v, want ErrInvalidSeatAddress", err)
+			}
+			if addr != "" {
+				t.Fatalf("invalid parse returned address %q", addr)
+			}
+		})
+	}
+}
+
+func TestResolveAddressStableSeat(t *testing.T) {
+	addr, err := ParseAddress("member@rig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	seat, err := ResolveAddress(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := Seat("member@rig"); seat != want {
+		t.Fatalf("seat = %q, want %q", seat, want)
+	}
+	if !seat.Valid() {
+		t.Fatal("resolved seat reported invalid")
+	}
+	// Resolution has no session input. The seat and any owner key built from it
+	// stay the same when the session behind the address changes.
+	for i := 0; i < 3; i++ {
+		got, err := ResolveAddress(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != seat {
+			t.Fatalf("call %d: seat = %q, want %q", i, got, seat)
+		}
+		if key, want := ObligationKey("w1", 3, got.String()), ObligationKey("w1", 3, seat.String()); key != want {
+			t.Fatalf("call %d: owner key changed: %q, want %q", i, key, want)
+		}
+	}
+}
+
+func TestResolveAddressRejectsInvalid(t *testing.T) {
+	for _, raw := range []string{"bad-address", "member@", "@rig", ""} {
+		addr := SeatAddress(raw)
+		if addr.Valid() {
+			t.Errorf("address %q reported valid", raw)
+		}
+		if _, err := ResolveAddress(addr); !errors.Is(err, ErrInvalidSeatAddress) {
+			t.Errorf("ResolveAddress(%q) error = %v, want ErrInvalidSeatAddress", raw, err)
+		}
+	}
+}

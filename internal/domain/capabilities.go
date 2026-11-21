@@ -48,6 +48,20 @@ func ValidRoles() []Role {
 	return out
 }
 
+// Seat is the stable identity of a role slot. It is canonical address text of
+// the form "member@rig". A seat keeps its identity when the agent behind it
+// restarts or changes session, so it can name an obligation owner without
+// binding the owner to a run id. Seat is a value type: equal text yields equal
+// values and a shared map key. The zero value is invalid; get a seat from
+// ResolveAddress.
+type Seat string
+
+// String returns the canonical seat identity text.
+func (s Seat) String() string { return string(s) }
+
+// Valid reports whether s is canonical "member@rig" seat text.
+func (s Seat) Valid() bool { return validSeatText(string(s)) }
+
 // Runtime is the session mode an agent entry runs in.
 type Runtime string
 

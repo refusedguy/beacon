@@ -327,3 +327,79 @@ func DeliveryKey(deliveryID IdempotencyValue) string {
 func ScopedKey(namespace string, value IdempotencyValue) string {
 	return IdempotencyKey(namespace, value.String())
 }
+
+// ---------------------------------------------------------------------------
+// Seat addresses (T3.241).
+//
+// A seat address names a role slot as "member@rig". It carries no session id
+// and no run id, so the same address keeps naming the same seat after an agent
+// restart. Both SeatAddress and Seat are value types: copies compare equal and
+// may be used as map keys.
+// ---------------------------------------------------------------------------
+
+const seatAddressSeparator = '@'
+
+// ErrInvalidSeatAddress reports an address that is not a well-formed
+// "member@rig" pair.
+var ErrInvalidSeatAddress = errors.New("domain: invalid seat address")
+
+// splitSeatAddress splits raw on exactly one '@'. The member part may carry a
+// pod prefix ("pod-member@rig"), but the separator itself is not repeatable.
+func splitSeatAddress(raw string) (member, rig string, ok bool) {
+	at := strings.IndexByte(raw, seatAddressSeparator)
+	if at < 0 || strings.IndexByte(raw[at+1:], seatAddressSeparator) >= 0 {
+		return "", "", false
+	}
+	return raw[:at], raw[at+1:], true
+}
+
+// validSeatText reports whether raw is a well-formed "member@rig" address.
+func validSeatText(raw string) bool {
+	member, rig, ok := splitSeatAddress(raw)
+	return ok && validIdentityValue(member) && validIdentityValue(rig)
+}
+
+// SeatAddress is a validated address of the form "member@rig". It names a Seat
+// without naming the session that currently fills it. SeatAddress is a value
+// type: two addresses with the same text are equal and share a map key. The
+// zero value is invalid; build one with ParseAddress.
+type SeatAddress string
+
+// ParseAddress parses raw as a SeatAddress. It requires exactly one '@' with a
+// non-empty member and rig on either side. Both parts follow the identity
+// value rules: no whitespace, no control characters and at most maxIdentityLen
+// bytes. The member part may include a pod prefix as in "pod-member@rig".
+func ParseAddress(raw string) (SeatAddress, error) {
+	if !validSeatText(raw) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidSeatAddress, raw)
+	}
+	return SeatAddress(raw), nil
+}
+
+// String returns the address text.
+func (a SeatAddress) String() string { return string(a) }
+
+// Valid reports whether a is a well-formed address.
+func (a SeatAddress) Valid() bool { return validSeatText(string(a)) }
+
+// Member returns the member part of the address, including any pod prefix.
+func (a SeatAddress) Member() string {
+	member, _, _ := splitSeatAddress(string(a))
+	return member
+}
+
+// Rig returns the rig part of the address.
+func (a SeatAddress) Rig() string {
+	_, rig, _ := splitSeatAddress(string(a))
+	return rig
+}
+
+// ResolveAddress returns the stable Seat named by address. Resolution reads
+// only the address text. A session id is never part of the result, so changing
+// the session behind an address leaves the seat unchanged.
+func ResolveAddress(address SeatAddress) (Seat, error) {
+	if !address.Valid() {
+		return "", fmt.Errorf("%w: %q", ErrInvalidSeatAddress, address.String())
+	}
+	return Seat(address.String()), nil
+}
