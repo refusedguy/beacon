@@ -24,8 +24,15 @@ func runLogs(c *CLI, args []string) int {
 	watch := fs.String("watch", "", "только записи с этим watchID")
 	pr := fs.Int("pr", 0, "только записи с этим номером PR")
 	errorsOnly := fs.Bool("errors", false, "только ошибки и записи с полем error")
-	jsonOut := fs.Bool("json", false, "вывести каждую запись как компактный JSON-объект")
+	format := fs.String("format", "table", "формат вывода: table или json")
+	jsonAlias := fs.Bool("json", false, "псевдоним --format=json, вывести каждую запись как компактный JSON-объект")
 	if !parseFlags("logs", args, c.errOut, fs) {
+		return 2
+	}
+	if *jsonAlias {
+		*format = "json"
+	}
+	if !parseCommandFormat("logs", *format, c.errOut, false) {
 		return 2
 	}
 	if *tail < 0 {
@@ -43,7 +50,7 @@ func runLogs(c *CLI, args []string) int {
 		WatchID:    *watch,
 		PR:         *pr,
 		OnlyErrors: *errorsOnly,
-		JSON:       *jsonOut,
+		JSON:       *format == "json",
 		OnTruncate: func(dropped int) {
 			fmt.Fprintf(c.errOut, "beacon logs: предупреждение: пропущено %d более старых записей, показаны последние %d (--tail 0 показывает все)\n", dropped, *tail)
 		},

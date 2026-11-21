@@ -116,11 +116,12 @@ func defaultInspectStore(*CLI) (inspectStore, func() error, error) {
 	return db, closeStore, nil
 }
 
-// runInspect implements `beacon inspect [<pr|watchID>] [--json]`. A numeric
-// selector matches the PR number; any other selector matches a Watch id.
+// runInspect implements `beacon inspect [<pr|watchID>] [--format table|json]`.
+// A numeric selector matches the PR number; any other selector matches a Watch id.
 func runInspect(c *CLI, args []string) int {
 	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
-	jsonOut := flags.Bool("json", false, "вывести JSON вместо таблицы")
+	format := flags.String("format", "table", "формат вывода: table или json")
+	jsonAlias := flags.Bool("json", false, "псевдоним --format=json")
 	flags.SetOutput(c.errOut)
 	flags.Usage = func() {}
 	if err := flags.Parse(args); err != nil {
@@ -130,6 +131,12 @@ func runInspect(c *CLI, args []string) int {
 	if flags.NArg() > 1 {
 		fmt.Fprintf(c.errOut, "beacon inspect: лишние аргументы: %v\n", flags.Args())
 		writeUsage(c.errOut)
+		return 2
+	}
+	if *jsonAlias {
+		*format = "json"
+	}
+	if !parseCommandFormat("inspect", *format, c.errOut, false) {
 		return 2
 	}
 	query := flags.Arg(0)
@@ -202,7 +209,7 @@ func runInspect(c *CLI, args []string) int {
 		}
 	}
 
-	if *jsonOut {
+	if *format == "json" {
 		if err := json.NewEncoder(c.out).Encode(view); err != nil {
 			fmt.Fprintf(c.errOut, "beacon inspect: %v\n", err)
 			return 2

@@ -136,7 +136,14 @@ func RegisterMetrics(fn func(*CLI, []string) int) { metricsRunner = fn }
 func runMetrics(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("metrics", flag.ContinueOnError)
 	format := fs.String("format", "json", "формат вывода: json или prometheus")
+	jsonAlias := fs.Bool("json", false, "псевдоним --format=json")
 	if !parseFlags("metrics", args, c.errOut, fs) {
+		return 2
+	}
+	if *jsonAlias {
+		*format = "json"
+	}
+	if !parseCommandFormat("metrics", *format, c.errOut, false) {
 		return 2
 	}
 	metrics := observe.MetricsOf(observe.Default())
@@ -148,9 +155,6 @@ func runMetrics(c *CLI, args []string) int {
 		_, _ = c.out.Write(metrics.JSON())
 	case "prometheus":
 		_, _ = c.out.Write(metrics.Prometheus())
-	default:
-		fmt.Fprintf(c.errOut, "beacon metrics: неизвестный формат %q\n", *format)
-		return 2
 	}
 	return 0
 }
