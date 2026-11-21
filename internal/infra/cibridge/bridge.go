@@ -54,10 +54,10 @@ func PollInterval() time.Duration {
 	return d
 }
 
-// fieldCycleID is the structured field that ties every event of one Refresh
-// to the same cycle. It is defined here because the observe package is shared
-// and this is the only producer that generates cycle ids.
-const fieldCycleID = "cycleID"
+// fieldCycleID is the local alias of the canonical observe field name. The
+// alias keeps cibridge call sites and tests readable while observe stays the
+// single source of truth for log field names.
+const fieldCycleID = observe.FieldCycleID
 
 // escalationFile is the one-line-per-escalation journal. A Watch that hits its
 // wake cap without green CI is parked and its reason is appended here once.
@@ -419,13 +419,52 @@ func (b *Bridge) Run(ctx context.Context) {
 	}
 }
 
-// cycleEvent logs one observe event with the cycle id of the current Refresh.
-func (b *Bridge) cycleEvent(cycleID, event string, fields observe.Fields) {
-	if fields == nil {
-		fields = observe.Fields{}
+// cycleFields carries the correlation identifiers of one Refresh. cycleEvent
+// copies the known ones onto every event, so a single cycleID filter returns
+// the whole chain from Watch observation to delivery receipt. The zero value
+// means the field is not known at that point; no value is ever invented.
+type cycleFields struct {
+	watchID      string
+	obligationID string
+	revision     uint64
+	role         domain.Role
+	adapter      string
+	verdict      domain.Verdict
+	attempt      int
+}
+
+// cycleEvent logs one observe event with the cycle id and the correlation
+// fields of the current Refresh. Fields set by the caller win over the
+// inherited ones, so a narrower call site can refine a value. The map is fresh
+// on every call; the caller's map is never mutated.
+func (b *Bridge) cycleEvent(cycleID, event string, cf cycleFields, fields observe.Fields) {
+	out := observe.Fields{}
+	if cf.watchID != "" {
+		out[observe.FieldWatchID] = cf.watchID
 	}
-	fields[fieldCycleID] = cycleID
-	observe.Event(observe.LevelInfo, event, fields)
+	if cf.obligationID != "" {
+		out[observe.FieldObligationID] = cf.obligationID
+	}
+	if cf.revision != 0 {
+		out[observe.FieldRevision] = cf.revision
+	}
+	if cf.role != "" {
+		out[observe.FieldRole] = string(cf.role)
+	}
+	if cf.adapter != "" {
+		out[observe.FieldAdapter] = cf.adapter
+	}
+	if cf.verdict != "" {
+		out[observe.FieldVerdict] = string(cf.verdict)
+	}
+	if cf.attempt > 0 {
+		out[observe.FieldAttempt] = cf.attempt
+	}
+	for k, v := range fields {
+		out[k] = v
+	}
+	out[fieldCycleID] = cycleID
+	observe.Event(observe.LevelInfo, event, out)
 }
 
 // liveWatches reads the Watches still in the control loop. LiveWatches is
@@ -474,7 +513,7 @@ func (b *Bridge) fetchSnapshots(ctx context.Context, watches []domain.Watch, cyc
 				out[w.ID] = ciObservation{pr: s.PR, base: s.Base}
 			}
 		}
-		b.cycleEvent(cycleID, "ci_points", observe.Fields{"used": used, "budget": budget})
+		b.cycleEvent(cycleID, "ci_points", cycleFields{}, observe.Fields{"used": used, "budget": budget})
 		return out, nil
 	}
 
@@ -526,7 +565,7 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		return 0
 	}
 	observe.PollCycleStart(len(watches))
-	b.cycleEvent(cycleID, "cycle_start", observe.Fields{"watches": len(watches)})
+	b.cycleEvent(cycleID, "cycle_start", cycleFields{}, observe.Fields{observe.FieldWatches: len(watches)})
 
 	observations, err := b.fetchSnapshots(ctx, watches, cycleID)
 	if err != nil {
@@ -582,15 +621,18 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		// One info line per live Watch per cycle. It carries the raw PR state
 		// and the derived verdict, so a Watch that stays watching because the
 		// provider returned an empty state is visible without a debugger.
-		b.cycleEvent(cycleID, "observe", observe.Fields{
-			"watchID": w.ID, "pr": w.PR, "state": obs.pr.State,
+		b.cycleEvent(cycleID, "observe", cycleFields{
+			watchID: w.ID, revision: w.Revision, verdict: verdict,
+		}, observe.Fields{
+			observe.FieldPR: w.PR, "state": obs.pr.State,
 			"headSHA": obs.pr.HeadRefOid, "mergeable": obs.pr.Mergeable,
-			"verdict": string(verdict), "revision": w.Revision,
 		})
 		updated += b.applyVerdict(ctx, w, obs, verdict, targets, now, cycleID)
 	}
 
-	b.cycleEvent(cycleID, "cycle_end", observe.Fields{"updated": updated, "skipped": skipped})
+	b.cycleEvent(cycleID, "cycle_end", cycleFields{}, observe.Fields{
+		observe.FieldUpdated: updated, observe.FieldSkipped: skipped,
+	})
 	return updated
 }
 
@@ -693,7 +735,7 @@ func (b *Bridge) handleHeadChanged(w domain.Watch, head string, now time.Time, c
 	}
 	newID := successorWatchID(current, head)
 	if _, err := b.store.Watch(newID); err == nil {
-		b.cycleEvent(cycleID, "head_successor_exists", observe.Fields{"watchID": newID})
+		b.cycleEvent(cycleID, "head_successor_exists", cycleFields{watchID: newID}, nil)
 		return
 	}
 	next := domain.Watch{
@@ -729,8 +771,8 @@ func (b *Bridge) handleHeadChanged(w domain.Watch, head string, now time.Time, c
 		observe.ActorError("cibridge-head-save", next.ID, err)
 		return
 	}
-	b.cycleEvent(cycleID, "head_changed", observe.Fields{
-		"watchID": current.ID, "newWatchID": newID, "headSHA": head,
+	b.cycleEvent(cycleID, "head_changed", cycleFields{watchID: current.ID}, observe.Fields{
+		"newWatchID": newID, "headSHA": head,
 	})
 	log.Printf("cibridge: %s head %s -> %s (closeReason=%s)", current.ID, current.HeadSHA, head, domain.CloseReasonHeadChanged)
 }
@@ -813,9 +855,9 @@ func (b *Bridge) publishActionable(ctx context.Context, w domain.Watch, obs ciOb
 		b.wakeOne(ctx, next, sub, text, now, cycleID, true)
 	}
 	observe.VerdictPublishedWithChecks(string(verdict), next.ID, next.PR, next.Revision, realFailedNames(obs.pr.Checks))
-	b.cycleEvent(cycleID, "verdict", observe.Fields{
-		"watchID": next.ID, "verdict": string(verdict), "revision": next.Revision,
-	})
+	b.cycleEvent(cycleID, "verdict", cycleFields{
+		watchID: next.ID, revision: next.Revision, verdict: verdict,
+	}, nil)
 	log.Printf("cibridge: %s#%d -> %s revision=%d", next.Repo, next.PR, verdict, next.Revision)
 	return 1
 }
@@ -863,7 +905,9 @@ func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservati
 	if merged {
 		observe.MergeSuccess(w.ID, w.PR)
 		n := b.closeWatch(ctx, w, domain.VerdictMerged, now, cycleID)
-		b.cycleEvent(cycleID, "auto_merge_success", observe.Fields{"watchID": w.ID, "pr": w.PR})
+		b.cycleEvent(cycleID, "auto_merge_success", cycleFields{
+			watchID: w.ID, revision: w.Revision, verdict: domain.VerdictMerged,
+		}, observe.Fields{observe.FieldPR: w.PR})
 		return n
 	}
 	observe.MergeFailure(w.ID, w.PR, err)
@@ -875,22 +919,22 @@ func (b *Bridge) applyMerge(ctx context.Context, w domain.Watch, obs ciObservati
 			w.HeadSHA = newHead
 			retryObs := obs
 			retryObs.pr.HeadRefOid = newHead
-			b.cycleEvent(cycleID, "auto_rebase", observe.Fields{
-				"watchID": w.ID, "pr": w.PR, "headSHA": newHead,
+			b.cycleEvent(cycleID, "auto_rebase", cycleFields{watchID: w.ID}, observe.Fields{
+				observe.FieldPR: w.PR, "headSHA": newHead,
 			})
 			merged, held, reason, err = b.callMerge(ctx, w, retryObs)
 			retried = true
 			if merged {
 				observe.MergeSuccess(w.ID, w.PR)
 				n := b.closeWatch(ctx, w, domain.VerdictMerged, now, cycleID)
-				b.cycleEvent(cycleID, "auto_merge_success", observe.Fields{
-					"watchID": w.ID, "pr": w.PR, "rebase": true,
-				})
+				b.cycleEvent(cycleID, "auto_merge_success", cycleFields{
+					watchID: w.ID, revision: w.Revision, verdict: domain.VerdictMerged,
+				}, observe.Fields{observe.FieldPR: w.PR, "rebase": true})
 				return n
 			}
 			observe.MergeFailure(w.ID, w.PR, err)
-			b.cycleEvent(cycleID, "auto_rebase_retry_failed", observe.Fields{
-				"watchID": w.ID, "pr": w.PR, "reason": reason,
+			b.cycleEvent(cycleID, "auto_rebase_retry_failed", cycleFields{watchID: w.ID}, observe.Fields{
+				observe.FieldPR: w.PR, observe.FieldReason: reason,
 			})
 		} else if rbErr != nil {
 			observe.ActorError("cibridge-autorebase", w.ID, rbErr)
@@ -952,8 +996,10 @@ func (b *Bridge) applyMerged(ctx context.Context, w domain.Watch, obs ciObservat
 	if b.watchFixFor(w) != "" {
 		b.unblockFixed(w)
 	}
-	b.cycleEvent(cycleID, "merged_resolve", observe.Fields{
-		"watchID": w.ID, "blockerID": w.BlockerID, "fixBlockerID": w.FixBlockerID,
+	b.cycleEvent(cycleID, "merged_resolve", cycleFields{
+		watchID: w.ID, revision: w.Revision, verdict: domain.VerdictMerged,
+	}, observe.Fields{
+		observe.FieldBlockerID: w.BlockerID, "fixBlockerID": w.FixBlockerID,
 	})
 	return n
 }
@@ -990,9 +1036,9 @@ func (b *Bridge) closeWatch(ctx context.Context, w domain.Watch, verdict domain.
 		}
 	}
 	observe.VerdictPublished(string(verdict), next.ID, next.PR, next.Revision)
-	b.cycleEvent(cycleID, "watch_closed", observe.Fields{
-		"watchID": next.ID, "verdict": string(verdict), "revision": next.Revision,
-	})
+	b.cycleEvent(cycleID, "watch_closed", cycleFields{
+		watchID: next.ID, revision: next.Revision, verdict: verdict,
+	}, nil)
 	// A terminal verdict used to be silent: every subscriber went to finished
 	// and nobody learned the wave item ended. Push one durable confirmation to
 	// the bound project orchestrator so it can start the next wave. Executors
@@ -1080,9 +1126,10 @@ func (b *Bridge) notifyOrchestratorTerminal(ctx context.Context, w domain.Watch,
 	observe.WakeDelivered(adapter, w.ID, w.Revision)
 	b.recordDelivery(ctx, obligationID, 1, domain.OutcomePosted, now)
 	b.markDelivered(obligationID, now, 1, "")
-	b.cycleEvent(cycleID, "terminal_confirmation", observe.Fields{
-		"watchID": w.ID, "sessionID": session, "verdict": string(verdict),
-	})
+	b.cycleEvent(cycleID, "terminal_confirmation", cycleFields{
+		watchID: w.ID, obligationID: obligationID, revision: w.Revision,
+		role: domain.RoleOrchestrator, adapter: adapter, verdict: verdict,
+	}, observe.Fields{"sessionID": session})
 }
 
 // applyBlocked records a failure already present on the base branch. It moves
@@ -1124,8 +1171,10 @@ func (b *Bridge) applyBlocked(ctx context.Context, w domain.Watch, obs ciObserva
 	if b.notifyBlocked(ctx, next, dedup, now, cycleID) {
 		observe.VerdictPublishedWithChecks(string(domain.VerdictBlocked), next.ID, next.PR, next.Revision, failed)
 	}
-	b.cycleEvent(cycleID, "block", observe.Fields{
-		"watchID": next.ID, "blockerID": next.BlockerID, "failedChecks": failed,
+	b.cycleEvent(cycleID, "block", cycleFields{
+		watchID: next.ID, revision: next.Revision, verdict: domain.VerdictBlocked,
+	}, observe.Fields{
+		observe.FieldBlockerID: next.BlockerID, observe.FieldFailedChecks: failed,
 	})
 	return 1
 }
@@ -1267,9 +1316,10 @@ func (b *Bridge) notifyBlocked(ctx context.Context, w domain.Watch, dedup string
 	b.recordDelivery(ctx, obligationID, 1, domain.OutcomePosted, now)
 	b.markDelivered(dedup, now, 1, "")
 	b.markDelivered(obligationID, now, 1, "")
-	b.cycleEvent(cycleID, "block_escalation", observe.Fields{
-		"watchID": w.ID, "sessionID": sessionID, "incident": dedup,
-	})
+	b.cycleEvent(cycleID, "block_escalation", cycleFields{
+		watchID: w.ID, obligationID: obligationID, revision: w.Revision,
+		role: domain.RoleOrchestrator, adapter: adapter, verdict: domain.VerdictBlocked,
+	}, observe.Fields{"sessionID": sessionID, "incident": dedup})
 	return true
 }
 
@@ -1576,9 +1626,10 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 	b.recordDelivery(ctx, p.ObligationID, attempt, domain.OutcomePosted, now)
 	b.recordWake(w, now, attempt)
 	b.markDelivered(p.ObligationID, now, attempt, "")
-	b.cycleEvent(cycleID, "wake", observe.Fields{
-		"watchID": w.ID, "sessionID": target, "attempt": attempt,
-	})
+	b.cycleEvent(cycleID, "wake", cycleFields{
+		watchID: w.ID, obligationID: p.ObligationID, revision: w.Revision,
+		role: sub.Role, adapter: adapter, verdict: w.Verdict, attempt: attempt,
+	}, observe.Fields{"sessionID": target})
 }
 
 // wakeCap returns the effective wake limit of a Watch. A zero or negative
@@ -1613,8 +1664,8 @@ func (b *Bridge) parkForWakeCap(ctx context.Context, w domain.Watch, cycleID str
 		now.UTC().Format(time.RFC3339), w.ID, wakeCap(w))
 	b.appendEscalation(line)
 	for _, e := range effects {
-		b.cycleEvent(cycleID, "park", observe.Fields{
-			"watchID": parked.ID, "reason": string(e.ParkReason), "error": e.ParkError,
+		b.cycleEvent(cycleID, "park", cycleFields{watchID: parked.ID, revision: parked.Revision}, observe.Fields{
+			observe.FieldReason: string(e.ParkReason), observe.FieldError: e.ParkError,
 		})
 	}
 	log.Printf("cibridge: %s parked: %s", parked.ID, line)
@@ -1704,9 +1755,11 @@ func (b *Bridge) markOrphaned(ctx context.Context, w domain.Watch, sub domain.Su
 	}
 	b.recordDelivery(ctx, id, 1, domain.OutcomePosted, now)
 	b.markDelivered(id, now, 1, "")
-	b.cycleEvent(cycleID, "executor_orphaned", observe.Fields{
-		"watchID": current.ID, "subscriberID": sub.ID, "sessionID": sessionID,
-	})
+	b.cycleEvent(cycleID, "executor_orphaned", cycleFields{
+		watchID: current.ID, obligationID: id, revision: current.Revision,
+		role: domain.RoleOrchestrator, adapter: b.blockedAdapter(current, sessionID),
+		verdict: domain.VerdictBlocked,
+	}, observe.Fields{"subscriberID": sub.ID, "sessionID": sessionID})
 }
 
 // inWorkLastActivity is the newest of the subscriber's own activity stamp and
@@ -1842,9 +1895,11 @@ func (b *Bridge) markInWorkStalled(ctx context.Context, w domain.Watch, sub doma
 	observe.Event(observe.LevelInfo, observe.OrphanEscalated, observe.Fields{
 		observe.FieldWatchID: w.ID, "subscriberID": sub.ID, "sessionID": sessionID, observe.FieldReason: "in_work_stall",
 	})
-	b.cycleEvent(cycleID, "in_work_stall", observe.Fields{
-		"watchID": w.ID, "subscriberID": sub.ID, "sessionID": sessionID, "revision": w.Revision,
-	})
+	b.cycleEvent(cycleID, "in_work_stall", cycleFields{
+		watchID: w.ID, obligationID: id, revision: w.Revision,
+		role: domain.RoleOrchestrator, adapter: b.blockedAdapter(w, sessionID),
+		verdict: domain.VerdictBlocked,
+	}, observe.Fields{"subscriberID": sub.ID, "sessionID": sessionID})
 	return true
 }
 

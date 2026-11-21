@@ -231,3 +231,91 @@ func TestOpenRunLogCreatesUniqueFileEachInitialization(t *testing.T) {
 		t.Errorf("в первом файле %q, ожидалось только \"first\\n\"", raw)
 	}
 }
+
+// TestCycleCorrelationChainByCycleID proves the correlation fields survive the
+// write boundary under the default NO_CONTENT policy. One cycleID selects the
+// Watch event, the verdict and the delivery receipt. A foreign cycleID stays
+// out of the selection. Wake text is dropped and only a content reference is
+// kept, so the receipt carries identifiers but no message body.
+func TestCycleCorrelationChainByCycleID(t *testing.T) {
+	if got := ContentCapture(); got != ContentCaptureNoContent {
+		t.Fatalf("capture mode = %q, want %q by default", got, ContentCaptureNoContent)
+	}
+
+	sink := newCaptureSink()
+	SetDefault(sink)
+	defer SetDefault(nil)
+
+	const cycleID = "20261121T120000.000000000Z-7"
+	chain := []struct {
+		event  string
+		fields Fields
+	}{
+		{"cycle_start", Fields{FieldWatches: 1}},
+		{"observe", Fields{
+			FieldWatchID: "watch:o/r:4:sha", FieldRevision: uint64(3), FieldVerdict: "watching",
+		}},
+		{"verdict", Fields{
+			FieldWatchID: "watch:o/r:4:sha", FieldRevision: uint64(3), FieldVerdict: "ready",
+		}},
+		{"wake", Fields{
+			FieldWatchID: "watch:o/r:4:sha", FieldObligationID: "obligation:1",
+			FieldRevision: uint64(3), FieldRole: "executor", FieldAdapter: "opencode",
+			FieldVerdict: "ready", FieldAttempt: 1,
+			FieldWakeText: "keep_working: конкретные failedChecks: build",
+		}},
+	}
+	for _, e := range chain {
+		Event(LevelInfo, e.event, mergeCycleFields(cycleID, e.fields))
+	}
+	// Negative control: this wake belongs to another cycle and must not join.
+	Event(LevelInfo, "wake", mergeCycleFields("foreign-cycle", Fields{FieldWatchID: "watch:other"}))
+
+	var selected []capturedEvent
+	for _, e := range sink.events {
+		if e.fields[FieldCycleID] == cycleID {
+			selected = append(selected, e)
+		}
+	}
+	if len(selected) != len(chain) {
+		t.Fatalf("selected %d events for %s, want %d: %+v", len(selected), cycleID, len(chain), sink.events)
+	}
+	for i, e := range selected {
+		if e.name != chain[i].event {
+			t.Errorf("selected[%d] = %q, want %q", i, e.name, chain[i].event)
+		}
+	}
+
+	receipt := selected[len(selected)-1]
+	for _, key := range []string{
+		FieldWatchID, FieldObligationID, FieldRevision, FieldRole,
+		FieldAdapter, FieldVerdict, FieldAttempt,
+	} {
+		if _, ok := receipt.fields[key]; !ok {
+			t.Errorf("receipt has no %s: %+v", key, receipt.fields)
+		}
+	}
+	if got := receipt.fields[FieldRole]; got != "executor" {
+		t.Errorf("receipt role = %v, want executor", got)
+	}
+	if got := receipt.fields[FieldAdapter]; got != "opencode" {
+		t.Errorf("receipt adapter = %v, want opencode", got)
+	}
+	if _, ok := receipt.fields[FieldWakeText]; ok {
+		t.Errorf("receipt kept wake text under NO_CONTENT: %+v", receipt.fields)
+	}
+	if got := receipt.fields[FieldContentRef]; got != "withheld" {
+		t.Errorf("receipt contentRef = %v, want withheld", got)
+	}
+}
+
+// mergeCycleFields attaches a cycle id without mutating the caller's map, the
+// same contract cycleEvent uses in cibridge.
+func mergeCycleFields(cycleID string, fields Fields) Fields {
+	out := make(Fields, len(fields)+1)
+	for k, v := range fields {
+		out[k] = v
+	}
+	out[FieldCycleID] = cycleID
+	return out
+}
