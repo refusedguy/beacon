@@ -1395,8 +1395,9 @@ func TestAdapterBreakerIgnoresDeadSessionFailures(t *testing.T) {
 	}
 }
 
-// TestAdapterBreakerKeepsWatchWakeCap proves the durable per-Watch cap still
-// parks a Watch even while the per-adapter breaker permits the delivery.
+// TestAdapterBreakerKeepsWatchWakeCap proves the durable per-subscriber cap still
+// parks a Watch even while the per-adapter breaker permits the delivery. Parking
+// also notifies the subscriber, so the recorded deliveries include that notice.
 func TestAdapterBreakerKeepsWatchWakeCap(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -1418,8 +1419,8 @@ func TestAdapterBreakerKeepsWatchWakeCap(t *testing.T) {
 		WithWaker(waker).WithEscalationWriter(func(string) {})
 	breakerWake(b, w, exec, time.Unix(500, 0), "cycle-cap")
 	breakerWake(b, w, exec, time.Unix(501, 0), "cycle-cap")
-	if got := len(waker.calls); got != 1 {
-		t.Fatalf("deliveries = %d, want 1 before the cap", got)
+	if got := len(waker.calls); got != 2 {
+		t.Fatalf("deliveries = %d, want 1 wake plus 1 park notice", got)
 	}
 	got, err := db.Watch(w.ID)
 	if err != nil {

@@ -156,9 +156,11 @@ func TestW2AAutoMergeConflictBecomesRebase(t *testing.T) {
 	}
 }
 
-// TestW2AWakeCapParksWatch proves the circuit breaker counts durable wake
-// attempts, parks the Watch at the cap and reports one escalation line.
-func TestW2AWakeCapParksWatch(t *testing.T) {
+// TestW2AWakeCapIsPerSubscriber proves one subscriber cannot spend another's
+// wake budget, and that parking writes a structured escalation with the Watch
+// and the incident. With a cap of one, two subscribers both get a wake in the
+// first cycle. The Watch parks only after each has used its own budget.
+func TestW2AWakeCapIsPerSubscriber(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -171,7 +173,7 @@ func TestW2AWakeCapParksWatch(t *testing.T) {
 		Policy: domain.Policy{MaxWakesPerWatch: 1},
 		Subscribers: []domain.Subscriber{
 			{ID: "ses_one", Role: domain.RoleExecutor, Adapter: "opencode"},
-			{ID: "ses_two", Role: domain.RoleExecutor, Adapter: "opencode"},
+			{ID: "ses_two", Role: domain.RoleOrchestrator, Adapter: "opencode"},
 		},
 	}
 	if err := db.SaveWatch(w); err != nil {
@@ -185,21 +187,42 @@ func TestW2AWakeCapParksWatch(t *testing.T) {
 	waker := &recordingWaker{}
 	b := New(db, fakeCI{state: state}, fixedClock{at: time.Unix(1, 0)}, time.Second).
 		WithWaker(waker).WithEscalationWriter(func(line string) { lines = append(lines, line) })
-	if got := b.Refresh(context.Background()); got != 1 {
-		t.Fatalf("Refresh updated %d watches, want 1", got)
-	}
-	got, err := db.Watch(w.ID)
+	ctx := context.Background()
+
+	// One verdict names the executor, the next names the orchestrator. Each
+	// subscriber spends its own budget, so neither cycle parks the Watch.
+	b.wakeOne(ctx, w, w.Subscribers[0], "keep_working: continue", time.Unix(1, 0), "cycle-one", true)
+	b.wakeOne(ctx, w, w.Subscribers[1], "keep_working: continue", time.Unix(1, 0), "cycle-one", true)
+	current, err := db.Watch(w.ID)
 	if err != nil {
 		t.Fatalf("Watch: %v", err)
 	}
-	if got.Status != domain.StatusParked {
-		t.Fatalf("status = %q, want parked", got.Status)
+	if current.Status == domain.StatusParked {
+		t.Fatalf("status after first cycle = parked, want a live Watch")
 	}
-	if len(lines) != 1 || !strings.Contains(lines[0], w.ID) {
-		t.Fatalf("escalations = %v, want one line naming the watch", lines)
+	if got := len(waker.deliveries); got != 2 {
+		t.Fatalf("wakes after first cycle = %d, want one per subscriber", got)
 	}
-	if len(waker.deliveries) != 1 {
-		t.Fatalf("wakes = %d, want 1 before the cap", len(waker.deliveries))
+	if len(lines) != 0 {
+		t.Fatalf("escalations after first cycle = %v, want none", lines)
+	}
+
+	// A second actionable revision spends each subscriber's remaining unit.
+	b.wakeOne(ctx, current, current.Subscribers[0], "keep_working: continue", time.Unix(2, 0), "cycle-two", true)
+	b.wakeOne(ctx, current, current.Subscribers[1], "keep_working: continue", time.Unix(2, 0), "cycle-two", true)
+
+	parked, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if parked.Status != domain.StatusParked {
+		t.Fatalf("status = %q, want parked", parked.Status)
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], w.ID) || !strings.Contains(lines[0], "incident") {
+		t.Fatalf("escalations = %v, want one structured line naming the Watch and incident", lines)
+	}
+	if got := len(waker.deliveries); got != 4 {
+		t.Fatalf("wakes = %d, want 2 verdict wakes plus 2 park notices", got)
 	}
 }
 

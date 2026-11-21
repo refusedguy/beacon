@@ -4,6 +4,7 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -147,6 +148,39 @@ func (p Policy) WakeCap() int {
 // constant.
 func DefaultPolicy() Policy {
 	return Policy{MaxWakesPerWatch: DefaultMaxWakesPerWatch}
+}
+
+// ParkIncidentKey is the stable incident id of one park. It groups the
+// structured escalation and every subscriber notice under the same Watch and
+// reason, so a reader can follow a park without parsing free text.
+func ParkIncidentKey(watchID string, reason ParkReason) string {
+	return "park:" + watchID + ":" + string(reason)
+}
+
+// ParkEscalation is the structured record written when a Watch exhausts its
+// wake budget. WatchID and Incident are always present: a bare text line cannot
+// be correlated with the Watch that parked, which is why the bridge writes this
+// value instead of a sentence. Wakes carries the per-subscriber counts at the
+// moment of parking, so a reader can see which party spent the budget.
+type ParkEscalation struct {
+	WatchID  string         `json:"watchID"`
+	Incident string         `json:"incident"`
+	Reason   string         `json:"reason"`
+	PR       int            `json:"pr"`
+	Revision uint64         `json:"revision"`
+	Wakes    map[string]int `json:"wakes,omitempty"`
+	At       time.Time      `json:"at"`
+}
+
+// Line renders the escalation as one JSON line for the journal. An encode
+// failure cannot happen for these field types; an empty fallback would drop the
+// watchID, so the method returns the minimal record instead.
+func (e ParkEscalation) Line() string {
+	raw, err := json.Marshal(e)
+	if err != nil {
+		return fmt.Sprintf(`{"watchID":%q,"incident":%q}`, e.WatchID, e.Incident)
+	}
+	return string(raw)
 }
 
 // MergePolicy holds the auto-merge settings of a Watch. WaitFor and WaitForMain

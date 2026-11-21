@@ -721,6 +721,10 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	updated, skipped := 0, 0
 	defer func() { observe.PollCycleEnd(updated, skipped, time.Since(start)) }()
 
+	// A parked Watch is absent from the live read. Resume one only after every
+	// subscriber saw its park notice, before polling so it re-enters this cycle.
+	b.resumeParkedAfterNotify(b.clock.Now(), cycleID)
+
 	watches, err := b.liveWatches()
 	if err != nil {
 		observe.ActorError("cibridge", "", err)

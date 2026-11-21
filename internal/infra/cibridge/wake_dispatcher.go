@@ -68,34 +68,55 @@ func (b *wakeDispatcher) markDelivered(id string, at time.Time, attempt int, las
 	_ = b.store.SaveObligation(o)
 }
 
-// wakeCounterID is the durable per-Watch wake counter. It lives in the
-// obligations table, so a process restart cannot reset the circuit breaker.
-func wakeCounterID(w domain.Watch) string {
-	return domain.ObligationKey("wakes:"+w.ID, 0, "count")
+// wakeCounterID is the durable wake counter of one subscriber of a Watch. It
+// lives in the obligations table, so a process restart cannot reset the budget.
+// The subscriber is part of the key: a shared counter spent two units per cycle
+// when EvaluatePR named both an executor and an orchestrator, parking the Watch
+// after three cycles even though neither party had used its own budget.
+func wakeCounterID(w domain.Watch, subscriberID string) string {
+	return domain.ObligationKey("wakes:"+w.ID+":"+subscriberID, 0, "count")
 }
 
-// wakeCount returns the number of wake attempts already recorded for a Watch.
-func (b *wakeDispatcher) wakeCount(w domain.Watch) int {
-	o, err := b.store.Obligation(wakeCounterID(w))
+// wakeCount returns the number of wake attempts already delivered to one
+// subscriber. A background subscriber can no longer consume another party's
+// budget.
+func (b *wakeDispatcher) wakeCount(w domain.Watch, subscriberID string) int {
+	o, err := b.store.Obligation(wakeCounterID(w, subscriberID))
 	if err != nil {
 		return 0
 	}
 	return len(o.Attempts)
 }
 
-// recordWake increments the durable counter after a successful delivery.
-func (b *wakeDispatcher) recordWake(w domain.Watch, now time.Time, attempt int) {
-	id := wakeCounterID(w)
+// recordWake increments one subscriber's durable counter after a successful
+// delivery.
+func (b *wakeDispatcher) recordWake(w domain.Watch, subscriberID string, now time.Time, attempt int) {
+	id := wakeCounterID(w, subscriberID)
 	if _, err := b.store.Obligation(id); err != nil {
 		if err := b.store.SaveObligation(domain.Obligation{
 			ID: id, WatchID: w.ID, Revision: 0,
-			SubscriberID: "count", VerdictPointer: domain.VerdictWatching, StagedAt: now,
+			SubscriberID: subscriberID, VerdictPointer: domain.VerdictWatching, StagedAt: now,
 		}); err != nil {
 			observe.ActorError("cibridge-wake-counter", w.ID, err)
 			return
 		}
 	}
 	b.markDelivered(id, now, attempt, "")
+}
+
+// resetWakeCount clears one subscriber's budget when a notified Watch leaves
+// parked. Without the reset the first wake after the resume would hit the cap
+// again and park the Watch in the same cycle, so the notification would buy no
+// chance to act.
+func (b *wakeDispatcher) resetWakeCount(w domain.Watch, subscriberID string) {
+	id := wakeCounterID(w, subscriberID)
+	o, err := b.store.Obligation(id)
+	if err != nil {
+		return
+	}
+	o.Attempts = nil
+	o.DeliveredAt = time.Time{}
+	_ = b.store.SaveObligation(o)
 }
 
 // Circuit breaker tuning, expressed with Resilience4j's vocabulary. The
@@ -249,7 +270,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		log.Printf("cibridge: skip wake for watch %s: subscriber %q (%v)", w.ID, sub.ID, err)
 		return
 	}
-	if breaker && b.wakeCount(w) >= wakeCap(w) {
+	if breaker && b.wakeCount(w, sub.ID) >= wakeCap(w) {
 		b.parkForWakeCap(ctx, w, cycleID)
 		return
 	}
@@ -271,7 +292,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		b.stage(ctx, o, "", now)
 	}
 	start := time.Now()
-	attempt := b.wakeCount(w) + 1
+	attempt := b.wakeCount(w, sub.ID) + 1
 	var deliverErr error
 	if sw, ok := b.adapterWaker.(interface {
 		DeliverToSubscriber(context.Context, domain.Watch, domain.WakePayload, string) error
@@ -319,7 +340,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		observe.FieldAttempt:      attempt,
 	}, w.Revision)
 	b.recordDelivery(ctx, p.ObligationID, attempt, domain.OutcomePosted, now)
-	b.recordWake(w, now, attempt)
+	b.recordWake(w, sub.ID, now, attempt)
 	b.markDelivered(p.ObligationID, now, attempt, "")
 	b.cycleEvent(cycleID, "wake", cycleFields{
 		watchID: w.ID, obligationID: p.ObligationID, revision: w.Revision,
@@ -338,8 +359,9 @@ func wakeCap(w domain.Watch) int {
 }
 
 // parkForWakeCap parks a Watch that spent its whole wake budget without a
-// green CI verdict and appends one line to ESCALATIONS.md. From then on the
-// Watch is parked and no further wake is delivered.
+// green CI verdict. It writes a structured escalation naming the Watch and the
+// park incident, then notifies every subscriber. The Watch leaves parked only
+// after all those notices were delivered (ATX-32).
 func (b *wakeDispatcher) parkForWakeCap(ctx context.Context, w domain.Watch, cycleID string) {
 	now := b.clock.Now()
 	current, err := b.store.Watch(w.ID)
@@ -355,15 +377,137 @@ func (b *wakeDispatcher) parkForWakeCap(ctx context.Context, w domain.Watch, cyc
 		observe.ActorError("cibridge-park", parked.ID, err)
 		return
 	}
-	line := fmt.Sprintf("%s: watch %s parked after %d wakes without green CI",
-		now.UTC().Format(time.RFC3339), w.ID, wakeCap(w))
+	esc := domain.ParkEscalation{
+		WatchID:  parked.ID,
+		Incident: domain.ParkIncidentKey(parked.ID, domain.ParkReasonBudget),
+		Reason:   string(domain.ParkReasonBudget),
+		PR:       parked.PR,
+		Revision: parked.Revision,
+		Wakes:    make(map[string]int, len(parked.Subscribers)),
+		At:       now,
+	}
+	for _, sub := range parked.Subscribers {
+		esc.Wakes[sub.ID] = b.wakeCount(parked, sub.ID)
+	}
+	line := esc.Line()
 	b.appendEscalation(line)
+	b.notifyPark(ctx, parked, now, cycleID)
 	for _, e := range effects {
 		b.cycleEvent(cycleID, "park", cycleFields{watchID: parked.ID, revision: parked.Revision}, observe.Fields{
 			observe.FieldReason: string(e.ParkReason), observe.FieldError: e.ParkError,
+			"incident": esc.Incident,
 		})
 	}
 	log.Printf("cibridge: %s parked: %s", parked.ID, line)
+}
+
+// parkNoticeID is the durable identity of one subscriber's park notice. The
+// Watch revision scopes a notice set to one park episode, so a later park does
+// not inherit an earlier subscriber's delivery.
+func parkNoticeID(w domain.Watch, subscriberID string) string {
+	return domain.ObligationKey("park:"+w.ID, w.Revision, subscriberID)
+}
+
+// notifyPark delivers one park notice to every subscriber of a parked Watch.
+// An undelivered notice stays that way, so a party that never saw the park
+// keeps the Watch parked instead of letting it vanish from the control loop.
+func (b *wakeDispatcher) notifyPark(ctx context.Context, w domain.Watch, now time.Time, cycleID string) {
+	if b == nil || (b.waker == nil && b.adapterWaker == nil) {
+		return
+	}
+	for _, sub := range w.Subscribers {
+		id := parkNoticeID(w, sub.ID)
+		if o, err := b.store.Obligation(id); err == nil && !o.DeliveredAt.IsZero() {
+			continue
+		} else if err != nil {
+			o := domain.Obligation{
+				ID: id, WatchID: w.ID, Revision: w.Revision,
+				SubscriberID: sub.ID, VerdictPointer: domain.VerdictParked, StagedAt: now,
+			}
+			if err := b.store.SaveObligation(o); err != nil {
+				observe.ActorError("cibridge-park-notice", w.ID, err)
+				continue
+			}
+		}
+		target, err := wakeAddressee(w, w.ID, sub.ID)
+		if err != nil {
+			observe.WakeSkipped(sub.Adapter, w.ID, "park notice target mismatch")
+			continue
+		}
+		p := domain.WakePayload{
+			WatchID: w.ID, ObligationID: id, Revision: w.Revision,
+			Verdict: fmt.Sprintf("parked: watch %s exhausted its wake budget; incident %s",
+				w.ID, domain.ParkIncidentKey(w.ID, domain.ParkReasonBudget)),
+		}
+		var deliverErr error
+		if b.adapterWaker != nil {
+			deliverErr = b.adapterWaker.Deliver(ctx, sub.Adapter, target, p)
+		} else {
+			deliverErr = b.waker.Deliver(ctx, target, p)
+		}
+		if deliverErr != nil {
+			b.recordDelivery(ctx, id, 1, domain.OutcomeTransportFailed, now)
+			observe.WakeFailed(sub.Adapter, w.ID, deliverErr, w.Revision)
+			continue
+		}
+		b.markDelivered(id, now, 1, "")
+		b.cycleEvent(cycleID, "park_notice", cycleFields{
+			watchID: w.ID, obligationID: id, revision: w.Revision,
+			role: sub.Role, adapter: sub.Adapter,
+		}, observe.Fields{"subscriberID": sub.ID, "sessionID": target})
+	}
+}
+
+// allSubscribersNotified reports whether every subscriber of a parked Watch has
+// a delivered park notice for that park revision. A Watch with no subscribers
+// has nobody to inform and stays parked.
+func (b *wakeDispatcher) allSubscribersNotified(w domain.Watch) bool {
+	if len(w.Subscribers) == 0 {
+		return false
+	}
+	for _, sub := range w.Subscribers {
+		o, err := b.store.Obligation(parkNoticeID(w, sub.ID))
+		if err != nil || o.DeliveredAt.IsZero() {
+			return false
+		}
+	}
+	return true
+}
+
+// resumeParkedAfterNotify is the explicit exit from parked. A parked Watch is
+// absent from ActiveWatches and invisible to the orchestrator; once every
+// subscriber saw the park notice, the Watch returns to watching with a fresh
+// per-subscriber budget. A Watch nobody saw stays parked.
+func (b *wakeDispatcher) resumeParkedAfterNotify(now time.Time, cycleID string) {
+	if b == nil || b.store == nil {
+		return
+	}
+	all, err := b.store.AllWatches()
+	if err != nil {
+		return
+	}
+	for i := range all {
+		w := all[i]
+		if w.Status != domain.StatusParked || !b.allSubscribersNotified(w) {
+			continue
+		}
+		resumed, _ := domain.Transition(w, domain.UnparkEvent(now))
+		if resumed.Revision == w.Revision {
+			continue
+		}
+		if err := b.store.SaveWatch(resumed); err != nil {
+			observe.ActorError("cibridge-unpark", w.ID, err)
+			continue
+		}
+		for _, sub := range w.Subscribers {
+			b.resetWakeCount(w, sub.ID)
+		}
+		incident := domain.ParkIncidentKey(w.ID, domain.ParkReasonBudget)
+		b.cycleEvent(cycleID, "unpark", cycleFields{watchID: w.ID, revision: resumed.Revision}, observe.Fields{
+			"incident": incident,
+		})
+		log.Printf("cibridge: %s resumed after all subscribers saw park incident %s", w.ID, incident)
+	}
 }
 
 // appendEscalation writes one deduplicated line to ESCALATIONS.md. The file is
