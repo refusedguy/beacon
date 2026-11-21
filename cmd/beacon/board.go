@@ -13,17 +13,16 @@ import (
 )
 
 // boardRunner is the dispatch seam used by the other commands. The dispatch
-// case for `beacon board` belongs to cmd/beacon/main.go, which is outside this
-// card's OwnerFiles. RegisterBoard lets the wiring owner install the final
-// implementation without editing this file.
+// case for `beacon board` lives in cmd/beacon/main.go. RegisterBoard lets the
+// wiring owner install the interactive implementation.
 var boardRunner = func(c *CLI, args []string) int { return runBoard(c, args) }
 
 // RegisterBoard installs the board command implementation.
 func RegisterBoard(fn func(*CLI, []string) int) { boardRunner = fn }
 
 // boardRow is the local view of one card. The interactive board lives in
-// internal/tui; this file only loads cards and prints the non-interactive
-// table, because the layer matrix forbids cmd from importing internal/tui.
+// internal/tui; this file keeps the plain table runner used by tests and as
+// the default before the adapter is installed.
 type boardRow struct {
 	id     string
 	status string
