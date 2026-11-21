@@ -67,17 +67,25 @@ type Card struct {
 	Reference    string
 	Agent        string
 	Time         string
-	Title        string
-	Goal         string
-	Context      string
-	Steps        string
-	Check        string
-	Acceptance   string
-	Extra        map[string]string
-	Path         string
-	Raw          string
-	Group        int
-	Number       int
+	// Close metadata. These fields are optional in the card markdown and are
+	// written by the atomic close writer in close.go. They stay out of
+	// requiredFields so existing cards parse unchanged.
+	Reason      string
+	DuplicateOf string
+	ClosedBy    string
+	ClosedAt    string
+	Blocker     string
+	Title       string
+	Goal        string
+	Context     string
+	Steps       string
+	Check       string
+	Acceptance  string
+	Extra       map[string]string
+	Path        string
+	Raw         string
+	Group       int
+	Number      int
 }
 
 var (
@@ -192,6 +200,11 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	card.Reference = fields["Ссылка"]
 	card.Agent = fields["Агент"]
 	card.Time = fields["Время"]
+	card.Reason = fields["Причина"]
+	card.DuplicateOf = fields["Дубликат"]
+	card.ClosedBy = fields["Закрыл"]
+	card.ClosedAt = fields["Время закрытия"]
+	card.Blocker = fields["Блокировщик"]
 	card.OwnerFiles = splitList(fields["Владелец файлов"])
 	card.Dependencies = splitList(fields["Зависимости"])
 	card.Goal = fields["Цель"]
@@ -234,7 +247,7 @@ func oneOf(v string, allowed ...string) bool {
 
 var (
 	cardTypes    = []string{"task", "epic", "adr", "doc", "eval"}
-	cardStatuses = []string{"todo", "in_progress", "done", "dropped"}
+	cardStatuses = []string{"todo", "in_progress", "blocked", "done", "dropped", "duplicate"}
 	cardPhases   = []string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}
 )
 

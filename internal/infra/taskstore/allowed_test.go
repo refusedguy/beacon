@@ -34,7 +34,7 @@ func TestValidSetsComplete(t *testing.T) {
 		want []string
 	}{
 		{"types", ValidTypes(), []string{"task", "epic", "adr", "doc", "eval"}},
-		{"statuses", ValidStatuses(), []string{"todo", "in_progress", "done", "dropped"}},
+		{"statuses", ValidStatuses(), []string{"todo", "in_progress", "blocked", "done", "dropped", "duplicate"}},
 		{"phases", ValidPhases(), []string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}},
 	}
 	for _, tc := range cases {
