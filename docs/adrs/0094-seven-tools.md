@@ -36,9 +36,31 @@ ADR 0003 выбирает официальный `github.com/modelcontextprotoco
 Реестр читается через два существующих инструмента без записи состояния:
 
 - `beacon_list_running` возвращает снимок активных Watch, счётчики `watches`, `byVerdict`, `subscribers` и курсор с событиями `WatchEvent`. Terminal-статус отдаёт вердикт без проигрывания старых событий (ADR 0025).
-- `beacon_stats` возвращает `pointsThisHour`, `budget`, `activeWatches`, блоки `persist`, `loadErrors`, `ladder` и `version`.
+- `beacon_stats` возвращает поля, перечисленные в разделе «Поля ответа beacon_stats» ниже. Схема выводится из типа `StatsOutput` в `internal/infra/mcp/schema.go`.
 
 Оба инструмента объявлены `ReadOnlyHint: true` и не пишут `readAt` или `claimedAt`. `beacon_wait_result`, `beacon_get_result`, `beacon_ack` и `beacon_defer_wiring` остаются аддитивными, `beacon_cancel_watch` остаётся единственным деструктивным инструментом. `beacon_task_claim` пишет состояние карточки один раз и не помечает идемпотентность, `beacon_task_close` аддитивный. Порядок имён в `tools/list` частью контракта не является.
+
+### Поля ответа beacon_stats
+
+Ответ содержит одиннадцать полей верхнего уровня. Два из них, `persist` и `ladder`, имеют подполя. Блок ниже перечисляет все поля ответа, включая подполя. Тест `TestStatsDocListsEveryField` в `internal/infra/mcp/stats_doc_contract_test.go` сверяет блок с типом `StatsOutput` и падает, если поле добавлено без правки этого ADR.
+
+<!-- stats-fields:begin
+pointsThisHour
+budget
+activeWatches
+blocked
+persist.seq
+persist.lastError
+loadErrors
+ladder.pending
+ladder.escalated
+version
+registeredAgents
+staleAgents
+configId
+stats-fields:end -->
+
+Семь полей вошли в контракт с момента принятия ADR. Четыре поля добавлены позже и остаются аддитивными. `blocked` считает Watch со статусом `blocked` или с записью о блокировке (T3.440). `registeredAgents`, `staleAgents` и `configId` приходят из реестра (T5.60). Обработчик без порта реестра отдаёт нули и пустой `configId`, поэтому ответ клиентов, не знавших эти поля, не меняется. Диагностика лимита плана, ожидания CI, лимита активных Watch, графа и поллера пишется в `loadErrors` с устойчивыми префиксами, а не в новые поля. Блок `persist` содержит `seq` и `lastError`, блок `ladder` содержит `pending` и `escalated`.
 
 ### Восьмой инструмент (W12-B)
 

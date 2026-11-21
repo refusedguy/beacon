@@ -313,7 +313,9 @@ type LadderInfo struct {
 
 // StatsOutput is the response of beacon_stats. The seven original fields keep
 // their names and types; the registry counters and blocked are additive
-// (T5.60, T3.440).
+// (T5.60, T3.440). docs/adrs/0094-seven-tools.md pins every JSON field of this
+// type. TestStatsDocListsEveryField fails when a field is added without the
+// same change to that ADR, so update both in one edit.
 type StatsOutput struct {
 	PointsThisHour int `json:"pointsThisHour"`
 	Budget         int `json:"budget"`
