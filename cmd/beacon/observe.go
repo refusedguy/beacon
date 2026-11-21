@@ -8,7 +8,10 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
@@ -87,6 +90,18 @@ var metricsServerStart = func(port string, m *observe.Metrics) (func(), error) {
 	}
 	return func() { _ = srv.Close() }, nil
 }
+
+// Shutdown seams. Tests shorten the deadline and install a fake collector so
+// an unconfirmed drain can be exercised without a real OTLP endpoint.
+type shutdownDrainFunc func(context.Context) error
+
+func (f shutdownDrainFunc) Shutdown(ctx context.Context) error { return f(ctx) }
+
+var (
+	shutdownTimeout time.Duration     = orchestrator.DefaultShutdownTimeout
+	shutdownDrain   shutdownDrainFunc = observe.Shutdown
+	osExit                            = os.Exit
+)
 
 // startMetricsEndpoint serves the process metrics at /metrics on loopback for
 // a long-lived command when BEACON_METRICS_PORT is set. An unset port leaves
@@ -216,12 +231,18 @@ func setupObserve(args ...string) func() {
 		observe.SetDefault(observe.NewRecorder(logger, metrics))
 		log.SetOutput(observe.NewLogWriter(logger))
 		stopMetrics := startMetricsEndpoint(metrics, args)
+		var once sync.Once
 		return func() {
-			stopMetrics()
-			observe.FlushCycle()
-			_ = observe.Shutdown(context.Background())
-			log.SetOutput(previousLogOutput)
-			observe.SetDefault(nil)
+			once.Do(func() {
+				stopMetrics()
+				observe.FlushCycle()
+				drainErr := orchestrator.BoundedShutdown(logger, shutdownTimeout, shutdownDrain)
+				log.SetOutput(previousLogOutput)
+				observe.SetDefault(nil)
+				if drainErr != nil {
+					osExit(1)
+				}
+			})
 		}
 	}
 
