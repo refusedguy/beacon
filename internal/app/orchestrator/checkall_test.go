@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -633,6 +635,105 @@ func TestSQLVerdictWriterPublishesAndStagesObligations(t *testing.T) {
 	}
 	if again.Revision != 1 || again.Verdict != domain.VerdictReady {
 		t.Fatalf("repeat changed watch = %+v", again)
+	}
+}
+
+// setWatchPayloadField replaces one field of a stored Watch payload with raw
+// JSON. The value must be valid JSON of the wrong type: the outer payload has
+// to parse, but the typed Unmarshal of that field must fail. The typed store
+// API would reject the value on write, so the test edits the payload directly.
+func setWatchPayloadField(t *testing.T, db *store.DB, id, field string, value json.RawMessage) {
+	t.Helper()
+	if err := db.Write(context.Background(), func(tx *sql.Tx) error {
+		var raw []byte
+		if err := tx.QueryRow(`SELECT payload FROM watches WHERE id = ?`, id).Scan(&raw); err != nil {
+			return err
+		}
+		var watch map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &watch); err != nil {
+			return err
+		}
+		watch[field] = value
+		updated, err := json.Marshal(watch)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`UPDATE watches SET payload = ? WHERE id = ?`, updated, id)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// rawWatchStatus reads the status field directly. A malformed verdict or
+// headSHA makes store.Watch fail, so the assertion must read the raw payload.
+func rawWatchStatus(t *testing.T, db *store.DB, id string) string {
+	t.Helper()
+	var raw []byte
+	if err := db.Write(context.Background(), func(tx *sql.Tx) error {
+		return tx.QueryRow(`SELECT payload FROM watches WHERE id = ?`, id).Scan(&raw)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var watch map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &watch); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	if err := json.Unmarshal(watch["status"], &status); err != nil {
+		t.Fatal(err)
+	}
+	return status
+}
+
+func TestSQLVerdictWriterRejectsMalformedInternalFields(t *testing.T) {
+	for _, tc := range []struct {
+		field   string
+		value   json.RawMessage
+		wantErr string
+	}{
+		{"verdict", json.RawMessage(`123`), "разбор verdict"},
+		{"headSHA", json.RawMessage(`true`), "разбор headSHA"},
+		{"revision", json.RawMessage(`"bad"`), "разбор revision"},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			db, err := store.Open(filepath.Join(t.TempDir(), "beacon.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+
+			w := domain.Watch{
+				ID:      "watch:refusedguy/beacon:9:sha9",
+				Repo:    "refusedguy/beacon",
+				PR:      9,
+				HeadSHA: "sha9",
+				Status:  domain.StatusWatching,
+				Verdict: domain.VerdictWatching,
+				Subscribers: []domain.Subscriber{
+					{ID: "orch-1", Role: domain.RoleOrchestrator},
+				},
+			}
+			if err := db.SaveWatch(w); err != nil {
+				t.Fatal(err)
+			}
+			setWatchPayloadField(t, db, w.ID, tc.field, tc.value)
+
+			ref := WatchRef{ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA}
+			err = NewSQLVerdictWriter(db).Publish(context.Background(), ref, VerdictReady, nil)
+			if err == nil {
+				t.Fatal("Publish accepted a malformed internal field")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Publish error = %q, want it to mention %q", err, tc.wantErr)
+			}
+			if got := rawWatchStatus(t, db, w.ID); got != string(domain.StatusWatching) {
+				t.Fatalf("status = %s, want watching: a malformed field must not write a verdict", got)
+			}
+			if _, err := db.Obligation(obligationKey(w.ID, 1, "orch-1")); err == nil {
+				t.Fatal("malformed field staged an obligation")
+			}
+		})
 	}
 }
 

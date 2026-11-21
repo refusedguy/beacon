@@ -1,5 +1,5 @@
 # ARDH-20. Проверить проглоченные ошибки в оркестраторе
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/orchestrator/checkall.go, internal/app/orchestrator/decision.go
@@ -12,3 +12,6 @@
 Шаги: Добавить проверки ошибок для внутренних Unmarshal с явным решением при битом поле. В decision.go логировать ошибку resolver через observe, не меняя fail closed.
 Проверка: CI зелёный. Тесты на битые поля verdict и headSHA покрывают новую ветку.
 Приёмка: Битые внутренние поля не приводят к тихой записи, ошибка resolver видна в логах.
+
+## Подтверждение
+- PR #1179: https://github.com/refusedguy/beacon/pull/1179. `SQLVerdictWriter.Publish` проверяет три внутренних `Unmarshal` полей `verdict`, `headSHA` и `revision`, а также три `Marshal` обновляемого payload. Каждая ошибка возвращается с именем поля и ID Watch через `%w`. При битом поле запись не выполняется, а ошибка попадает в `Row.Error` и видна в выводе `beacon ci check`. Валидный JSON проходит прежним путём. Тесты в `internal/app/orchestrator/checkall_test.go` подставляют битый JSON в каждое поле и проверяют отказ записи и отсутствие обязательства. Часть про логирование ошибки resolver в `decision.go` не вошла в этот PR: её OwnerFile не был передан исполнителю.
