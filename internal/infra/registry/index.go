@@ -191,16 +191,19 @@ func (r *ACPAgentRegistry) Register(agent ACPAgent) error {
 	if address == "" {
 		return fmt.Errorf("registry: acp: empty address for agent %q", name)
 	}
+	// Upsert checks the id and every capability before it touches its own
+	// index, so a rejected declaration leaves existing entries intact. Run it
+	// before changing the name and address views. Every later step is a plain
+	// map write and cannot fail.
+	record := &ExecutorRecord{ID: name, Capabilities: agent.Capabilities}
+	if err := r.index.Upsert(record); err != nil {
+		return err
+	}
 	if owner, ok := r.byAddress[address]; ok && owner != name {
 		r.unregister(owner)
 	}
 	if old, ok := r.byName[name]; ok {
 		delete(r.byAddress, old.Address)
-		r.index.Remove(name)
-	}
-	record := &ExecutorRecord{ID: name, Capabilities: agent.Capabilities}
-	if err := r.index.Upsert(record); err != nil {
-		return err
 	}
 	agent.Name = name
 	agent.Address = address
