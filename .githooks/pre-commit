@@ -29,6 +29,23 @@ if [ -n "$staged_all" ]; then
   fi
 fi
 
+# Fail-closed проверка сгенерированного индекса карточек. Гейт IDX-04
+# пересобирает индекс из docs/tasks и сравнивает байты с закоммиченной копией.
+# Ошибка или отсутствие инструмента блокирует коммит. Это отдельная проверка:
+# fail-open аренда ниже остаётся без изменений и коммит не блокирует.
+if command -v go >/dev/null 2>&1; then
+  if index_out=$(go run ./tools/beacon-gates/cardindex -root . 2>&1); then
+    :
+  else
+    echo "FORBIDDEN: $index_out" >&2
+    echo "Reason: сгенерированный индекс карточек устарел или не собирается. Обновите его через go run ./tools/roadmap-sync --write." >&2
+    exit 1
+  fi
+else
+  echo "FORBIDDEN: go не найден, нельзя проверить сгенерированный индекс карточек" >&2
+  exit 1
+fi
+
 # Advisory-аренды файлов и ворктри. Guard блокирует только живую чужую аренду:
 # код 3 от beacon task lease check. Нет бинарника, нет стора, сбой чтения или
 # любая другая ошибка пропускают коммит (fail-open).
