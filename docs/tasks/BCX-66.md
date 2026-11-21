@@ -2,7 +2,7 @@
 Статус: todo
 Фаза: P1
 Тип: task
-Владелец файлов: docs/adrs/0213-untitled.md, docs/evals/w21-human-question-revision.md, internal/infra/mcp/tool_wake.go
+Владелец файлов: docs/adrs/0213-human-question-revision-row.md, docs/evals/w21-human-question-revision.md, internal/infra/mcp/tool_wake.go
 Зависимости: 
 Ссылка: ADR 0213
 Агент: нет

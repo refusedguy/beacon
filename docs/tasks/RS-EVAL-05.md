@@ -30,7 +30,7 @@ baseline: `head -20 docs/RULES-CHECK-CONTRACT.md` перечисляет три 
 
   Источник кода выхода: `runRules` в `cmd/beacon/commands.go:49`. Ветка `case key.code != 0, contract.code != 0` (строки 71-72) ставит `status = "warn"` при любом ненулевом коде, включая код 2. Чтобы код 2 давал `status = "broken"`, `blocking: true` и exit 2, нужна правка `cmd/beacon/commands.go`. Файл не входит в OwnerFiles.
 
-  Для полноты согласованности схема в `docs/adrs/0237-untitled.md:11` перечисляет `status pass/warn/fail` и тоже требует обновления или нового ADR. Этот файл не входит в OwnerFiles.
+  Для полноты согласованности схема в `docs/adrs/0237-blocking-findings-and-next-action.md:11` перечисляет `status pass/warn/fail` и тоже требует обновления или нового ADR. Этот файл не входит в OwnerFiles.
 
   Статус todo сохранён. Контракт в OwnerFiles обновлён, `exceptions.go` оставлен без правок ради побайтового совпадения бинарника, чужие файлы, wiring и .beacon не трогал, дубль не создал. Блокер возвращён оркестратору с именами файлов `.github/workflows/ci.yml` и `cmd/beacon/commands.go`.
 
