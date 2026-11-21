@@ -1,4 +1,4 @@
-# ADR 72: Два источника указателей: SpoolSource и McpPullSource
+# ADR 298: Два источника указателей: SpoolSource и McpPullSource
 
 Статус: accepted
 

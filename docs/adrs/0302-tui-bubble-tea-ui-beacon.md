@@ -1,4 +1,4 @@
-# ADR 92: TUI на Bubble Tea как основной UI менеджера Beacon
+# ADR 302: TUI на Bubble Tea как основной UI менеджера Beacon
 
 Статус: proposed
 

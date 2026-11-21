@@ -1,4 +1,4 @@
-# ADR 94: Различие delivery steer и queue при приёме ввода
+# ADR 303: Различие delivery steer и queue при приёме ввода
 
 Статус: accepted
 

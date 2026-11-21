@@ -1,4 +1,4 @@
-# ADR 86: Один общий MCP-сервер Beacon и тонкие адаптеры wake
+# ADR 299: Один общий MCP-сервер Beacon и тонкие адаптеры wake
 
 Статус: accepted
 
