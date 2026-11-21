@@ -43,6 +43,8 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon daemon [--interval 10s|30s] [--once]
   beacon gc [--format table|json] [--apply]
   beacon gc-worktree [--format table|json] [--apply]
+  beacon init [--root <dir>] [--force]
+  beacon index build [--root <dir>]
   beacon deferred [--format table|json]
   beacon workload [--format table|json]
   beacon metrics [--format json|prometheus]
@@ -67,6 +69,13 @@ var spawnCatalogEntry = command{
 func init() {
 	catalog = append(catalog, spawnCatalogEntry)
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
+
+	// RegisterGC and RegisterGCWorktree are installed in gc.go, and
+	// RegisterBoard in board_wire.go. The two commands owned by deferred cards
+	// without their own init are installed here: the dispatch cases below
+	// call the registered seams, never the raw runners.
+	RegisterInit(runInit)
+	RegisterIndex(runIndex)
 }
 
 // runResult holds the output and exit code of a child process.
@@ -278,6 +287,10 @@ func (c *CLI) dispatch(args []string) int {
 		return gcRunner(c, args[1:])
 	case "gc-worktree":
 		return gcWorktreeRunner(c, args[1:])
+	case "init":
+		return initRunner(c, args[1:])
+	case "index":
+		return indexRunner(c, args[1:])
 	case "deferred":
 		return deferredRunner(c, args[1:])
 	case "workload":
