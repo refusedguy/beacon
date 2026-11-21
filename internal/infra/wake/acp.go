@@ -842,3 +842,208 @@ func (c *PersistentACPClient) Close() error {
 	})
 	return err
 }
+
+// ===== ACP-сервер (T3.279) =====
+// Beacon can also sit on the other side of ACP. A host that runs
+// `rig acp serve --to` sees a command as one agent, so Beacon owns the
+// session list and answers session/list itself. This section only adds
+// inbound handling; the client types above stay unchanged.
+
+// ACPServerSession is one active session an ACP host can see.
+type ACPServerSession struct {
+	ID    string `json:"sessionId"`
+	Cwd   string `json:"cwd,omitempty"`
+	Title string `json:"title,omitempty"`
+}
+
+// ACPServerError is a JSON-RPC error from an inbound request. A caller that
+// frames ACP responses maps Code and Message into its error object.
+type ACPServerError struct {
+	Code    int
+	Message string
+}
+
+func (e *ACPServerError) Error() string {
+	return fmt.Sprintf("wake: acp server rpc %d: %s", e.Code, e.Message)
+}
+
+// ACPServer handles inbound ACP requests and keeps the active session list.
+// Transport is only the outbound channel used for server-initiated requests
+// such as elicitation. Framing stays with the caller: Handle takes a decoded
+// ACPRequest and returns the result object to encode.
+type ACPServer struct {
+	Transport ACPTransport
+
+	mu          sync.Mutex
+	sessions    map[string]ACPServerSession
+	nextSession int64
+	nextID      int64
+}
+
+// NewACPServer returns a server with no active sessions.
+func NewACPServer() *ACPServer {
+	return &ACPServer{sessions: make(map[string]ACPServerSession)}
+}
+
+// AddSession registers a session so session/list can report it. The id is
+// opaque to the host; Beacon generates it when it creates a session.
+func (s *ACPServer) AddSession(id, cwd string) error {
+	if s == nil {
+		return fmt.Errorf("wake: acp server: nil")
+	}
+	if strings.TrimSpace(id) == "" {
+		return fmt.Errorf("wake: acp server: empty session id")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sessions == nil {
+		s.sessions = make(map[string]ACPServerSession)
+	}
+	if _, exists := s.sessions[id]; exists {
+		return fmt.Errorf("wake: acp server: duplicate session %q", id)
+	}
+	s.sessions[id] = ACPServerSession{ID: id, Cwd: cwd}
+	return nil
+}
+
+// Sessions returns the active sessions in stable id order. A cancelled or
+// completed turn does not remove a session: only the host ends it.
+func (s *ACPServer) Sessions() []ACPServerSession {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ACPServerSession, 0, len(s.sessions))
+	for _, session := range s.sessions {
+		out = append(out, session)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// Handle dispatches one inbound ACP request. session/list reports the active
+// sessions, session/new creates one and session/load resumes a known one.
+// An unknown method or an unknown session is an ACPServerError, so the caller
+// can frame a JSON-RPC error instead of a successful result.
+func (s *ACPServer) Handle(_ context.Context, req ACPRequest) (json.RawMessage, error) {
+	if s == nil {
+		return nil, fmt.Errorf("wake: acp server: nil")
+	}
+	switch req.Method {
+	case "session/list":
+		return acpEncodeResult(map[string]any{"sessions": s.Sessions()})
+	case "session/new":
+		var params struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := acpDecodeParams(req.Params, &params); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.nextSession++
+		id := fmt.Sprintf("sess_%d", s.nextSession)
+		s.mu.Unlock()
+		if err := s.AddSession(id, params.Cwd); err != nil {
+			return nil, err
+		}
+		return acpEncodeResult(map[string]any{"sessionId": id})
+	case "session/load":
+		var params struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := acpDecodeParams(req.Params, &params); err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		_, exists := s.sessions[params.SessionID]
+		s.mu.Unlock()
+		if !exists {
+			return nil, &ACPServerError{Code: -32002, Message: "Unknown session"}
+		}
+		return acpEncodeResult(struct{}{})
+	default:
+		return nil, &ACPServerError{Code: -32601, Message: "Method not found: " + req.Method}
+	}
+}
+
+func acpDecodeParams(params any, dst any) error {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("wake: acp server: encode params: %w", err)
+	}
+	if err := json.Unmarshal(raw, dst); err != nil {
+		return fmt.Errorf("wake: acp server: decode params: %w", err)
+	}
+	return nil
+}
+
+func acpEncodeResult(value any) (json.RawMessage, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, fmt.Errorf("wake: acp server: encode result: %w", err)
+	}
+	return raw, nil
+}
+
+// ACPElicitationParams asks the host for one set of answers. The schema is
+// passed through as raw JSON: Beacon does not interpret the requested fields.
+type ACPElicitationParams struct {
+	Message         string          `json:"message"`
+	RequestedSchema json.RawMessage `json:"requestedSchema"`
+}
+
+// ACPElicitationResult is the host's answer. Action is accept, decline or
+// cancel; content is only meaningful when the host accepted.
+type ACPElicitationResult struct {
+	Action  string                     `json:"action"`
+	Content map[string]json.RawMessage `json:"content,omitempty"`
+}
+
+// Elicit sends one elicitation/create request to the ACP host and returns its
+// answer. A decline or cancel is a valid answer, not a transport error. The
+// host can ignore an unknown action only by failing, so Beacon rejects it.
+func (s *ACPServer) Elicit(ctx context.Context, message string, schema json.RawMessage) (ACPElicitationResult, error) {
+	if s == nil || s.Transport == nil {
+		return ACPElicitationResult{}, fmt.Errorf("wake: acp server: no transport for elicitation")
+	}
+	if strings.TrimSpace(message) == "" {
+		return ACPElicitationResult{}, fmt.Errorf("wake: acp server: empty elicitation message")
+	}
+	if len(schema) == 0 {
+		schema = json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	s.mu.Lock()
+	s.nextID++
+	id := s.nextID
+	s.mu.Unlock()
+
+	raw, err := s.Transport.Call(ctx, ACPRequest{
+		JSONRPC: "2.0",
+		ID:      id,
+		Method:  "elicitation/create",
+		Params:  ACPElicitationParams{Message: message, RequestedSchema: schema},
+	})
+	if err != nil {
+		return ACPElicitationResult{}, fmt.Errorf("wake: acp elicitation/create: %w", err)
+	}
+	var envelope struct {
+		Result ACPElicitationResult `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return ACPElicitationResult{}, fmt.Errorf("wake: acp elicitation/create: decode: %w", err)
+	}
+	if envelope.Error != nil {
+		return ACPElicitationResult{}, &ACPServerError{Code: envelope.Error.Code, Message: envelope.Error.Message}
+	}
+	switch envelope.Result.Action {
+	case "accept", "decline", "cancel":
+		return envelope.Result, nil
+	default:
+		return ACPElicitationResult{}, fmt.Errorf("wake: acp elicitation/create: unknown action %q", envelope.Result.Action)
+	}
+}
