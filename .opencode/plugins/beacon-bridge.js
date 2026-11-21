@@ -944,13 +944,19 @@ const adapterCases = [
         (sub.types ?? []).includes("beacon.review.comment"),
       )
       assert.ok(reviewSub, "плагин подписан на beacon.review.comment")
+      const receiptPath = join(stateDir, "receipts", "obl-t316.1")
       queue.push({ type: "beacon.review.comment" })
-      await new Promise((tick) => setTimeout(tick, 30))
+      // Ждём факт, а не фиксированные 30 мс: под CI запись квитанции после
+      // async-claim может занять больше, и жёсткий sleep давал ENOENT.
+      const deadline = Date.now() + POLL_MS + 3000
+      while (Date.now() < deadline && !existsSync(receiptPath)) {
+        await new Promise((tick) => setTimeout(tick, 5))
+      }
       stop()
 
       assert.equal(h.calls.length, 1)
       assert.equal(h.calls[0].delivery, "steer")
-      const line = JSON.parse(readFileSync(join(stateDir, "receipts", "obl-t316.1"), "utf8").trim())
+      const line = JSON.parse(readFileSync(receiptPath, "utf8").trim())
       assert.equal(line.messageSource, "review")
       assert.equal(line.outcome, "posted")
     },
