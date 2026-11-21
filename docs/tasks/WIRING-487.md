@@ -1,5 +1,7 @@
 # WIRING-487. Подключить card monitor к расписанию и хранилищу карточек
+Premise: проверено 2026-11-21 по свежему origin/main (c716b61). PR #487 влит и добавил чистый монитор internal/app/tasks/card_monitor.go с тестами. Адаптера Port и вызова Poll в working path нет. Статус todo сохранён, точная причина ниже.
 Статус: todo
+baseline: `git rev-parse --short origin/main` = c716b61; `gh pr view 487 --repo refusedguy/beacon --json state,mergedAt` = MERGED 2026-11-20T17:18:16Z; `git grep -n 'internal/app/tasks' origin/main -- internal/infra` = пусто; `git grep -n -E 'tasks.Port|CardMonitor|Poll\(' origin/main -- internal/infra cmd/beacon` = пусто.
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/server.go, cmd/beacon/task.go, internal/infra/taskstore/store.go, internal/infra/server/scheduler.go
@@ -22,7 +24,7 @@ PR: 487
 
 ## Блокер
 
-- 2026-11-21, premise проверен после `git fetch origin/main` (ee67c1f): чистый монитор лежит в `internal/app/tasks/card_monitor.go`, но адаптера Port, регистрации и вызова Poll нет. `git grep` по origin/main вне `internal/app/tasks/` вернул пустоту. Адаптер в `internal/infra/taskstore/store.go` обязан реализовать `tasks.Port` и импортировать типы `Card`, `RecordedEvent`, `Change`, `Port` из `internal/app/tasks`. Матрица `tools/beacon-gates/gate/config/layers.json` разрешает `internal/infra` только к `internal/domain` и `internal/infra/observe`, ребро в `internal/app` запрещено. Ни один пакет `internal/infra` не импортирует `internal/app/tasks`. Регистрацию монитора и периодический Poll надо добавить в раннер сервера: `cmd/beacon/server.go` вызывает `mcpRunner`, циклы живут в `cmd/beacon/mcp.go`. Файл `server.go` одновременно правит агент по WIRING-486, файл `mcp.go` вне OwnerFiles карточки. Без правки `server.go` проводку закрыть нельзя. Статус todo сохранён, код не писал, gofmt не применял, server.go не трогал. Блокер возвращён оркестратору: для карточки нужны OwnerFiles с `cmd/beacon/server.go` и `cmd/beacon/mcp.go` либо разрешённое ребро `internal/infra` -> `internal/app` в layers.json.
+- 2026-11-21, premise повторен по свежему origin/main (c716b61). PR #487 влит и добавил только чистый монитор internal/app/tasks/card_monitor.go с тестами. Адаптера Port и вызова Poll нет: `git grep` по origin/main в internal/infra и cmd/beacon вернул пустоту. Адаптер в internal/infra/taskstore/store.go обязан реализовать tasks.Port и импортировать типы Card, RecordedEvent, Change и Port из internal/app/tasks. Матрица tools/beacon-gates/gate/config/layers.json разрешает internal/infra только к internal/domain и internal/infra/observe, ребро в internal/app запрещено. Регистрацию монитора и периодический Poll надо добавить в cmd/beacon/mcp.go, где живут mcpRunner и циклы, но mcp.go не входит в OwnerFiles карточки. Конфликт с WIRING-486 снят: PR #529 влит 2026-11-20, server.go больше не правится параллельно. Статус todo сохранён, код не писал, gofmt не применял, чужие OwnerFiles и .beacon/ не тронуты. Блокер возвращён оркестратору: для карточки нужны OwnerFiles с cmd/beacon/mcp.go либо разрешённое ребро internal/infra -> internal/app в layers.json.
 
 ## Шаги
 
