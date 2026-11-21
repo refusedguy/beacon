@@ -65,6 +65,17 @@ const escalationFile = "ESCALATIONS.md"
 // recheck verdict instead of a rebase, so a stale snapshot never ships.
 const mergeHeldRecheck = "recheck"
 
+const (
+	// rebaseCounterSubscriber is the reserved subscriber id of the durable
+	// obligation that records one rebase attempt for a Watch revision. One
+	// obligation per revision keeps the rebase attempt across a process restart.
+	rebaseCounterSubscriber = "rebase-counter"
+
+	// defaultMaxRebases matches the project default in ADR 0259. A Watch with
+	// no explicit budget gets this limit instead of an unbounded retry loop.
+	defaultMaxRebases = 3
+)
+
 var cycleSeq atomic.Uint64
 
 // newCycleID returns a process-unique id for one Refresh. The timestamp keeps
@@ -381,20 +392,111 @@ func (b *Bridge) WithAutoRebase(r Rebaser) *Bridge {
 	return b
 }
 
+// rebaseAttemptID derives the durable counter obligation of one Watch revision.
+// The Watch id and revision are the identity of a rebase attempt; the reserved
+// subscriber id keeps the counter apart from subscriber obligations.
+func rebaseAttemptID(w domain.Watch) string {
+	return domain.ObligationKey(w.ID, w.Revision, rebaseCounterSubscriber)
+}
+
+// rebaseBudget returns the effective budget of a Watch. Zero means the project
+// set no override, so the ADR 0259 default applies.
+func rebaseBudget(w domain.Watch) int {
+	if w.Policy.MaxRebases > 0 {
+		return w.Policy.MaxRebases
+	}
+	return defaultMaxRebases
+}
+
+// rebaseAttempts counts durable rebase attempts recorded for a Watch across its
+// revisions. The store adapter exposes WatchObligations; a store without that
+// port falls back to the in-memory guard and never blocks on a budget it cannot
+// read.
+func (b *Bridge) rebaseAttempts(watchID string) int {
+	if b == nil || b.store == nil {
+		return 0
+	}
+	src, ok := b.store.(activitySource)
+	if !ok {
+		return 0
+	}
+	obligations, err := src.WatchObligations(watchID)
+	if err != nil {
+		return 0
+	}
+	used := 0
+	for _, o := range obligations {
+		if o.SubscriberID == rebaseCounterSubscriber {
+			used++
+		}
+	}
+	return used
+}
+
+// rebaseBudgetExhausted reports whether a Watch has spent its rebase budget.
+// The count is read from the durable obligations, so a restarted process sees
+// the same value.
+func (b *Bridge) rebaseBudgetExhausted(w domain.Watch) bool {
+	return b.rebaseAttempts(w.ID) >= rebaseBudget(w)
+}
+
+// spendRebase charges one rebase attempt to the Watch before the caller
+// performs the rebase. The write goes to the store first, so a crash after the
+// write but before the rebase leaves the count intact. The first result says
+// whether the attempt was recorded; the second says the budget is exhausted.
+func (b *Bridge) spendRebase(w domain.Watch, now time.Time) (allowed, exhausted bool) {
+	if b == nil || b.store == nil {
+		return false, false
+	}
+	key := rebaseAttemptID(w)
+	if _, err := b.store.Obligation(key); err == nil {
+		// This revision already spent its rebase. Durable dedupe replaces the
+		// in-memory guard after a restart.
+		return false, false
+	}
+	if b.rebaseAttempts(w.ID) >= rebaseBudget(w) {
+		return false, true
+	}
+	o := domain.Obligation{
+		ID:             key,
+		WatchID:        w.ID,
+		Revision:       w.Revision,
+		SubscriberID:   rebaseCounterSubscriber,
+		VerdictPointer: domain.VerdictRebase,
+		StagedAt:       now,
+	}
+	if err := b.store.SaveObligation(o); err != nil {
+		observe.ActorError("cibridge-rebase-counter", w.ID, err)
+		return false, false
+	}
+	return true, false
+}
+
 // claimRebase reserves one rebase for (watchID, revision). A second tick that
 // observes the same revision never rebases twice, even when the first rebase
-// or the retry merge failed and the Watch has not moved on yet. Older entries
-// for the same Watch are dropped so the guard stays bounded per Watch.
+// or the retry merge failed and the Watch has not moved on yet. The reservation
+// is durable and the Watch's MaxRebases budget bounds the attempts across its
+// revisions. Older in-memory entries for the same Watch are dropped so the
+// guard stays bounded per Watch.
 func (b *Bridge) claimRebase(w domain.Watch) bool {
 	key := fmt.Sprintf("%s:%d", w.ID, w.Revision)
 	b.rebaseMu.Lock()
-	defer b.rebaseMu.Unlock()
 	if b.rebased == nil {
 		b.rebased = make(map[string]bool)
 	}
-	if b.rebased[key] {
+	seen := b.rebased[key]
+	b.rebaseMu.Unlock()
+	if seen {
 		return false
 	}
+
+	allowed, _ := b.spendRebase(w, b.clock.Now())
+	if !allowed {
+		return false
+	}
+
+	b.rebaseMu.Lock()
+	defer b.rebaseMu.Unlock()
 	prefix := w.ID + ":"
 	for k := range b.rebased {
 		if strings.HasPrefix(k, prefix) {
@@ -403,6 +505,42 @@ func (b *Bridge) claimRebase(w domain.Watch) bool {
 	}
 	b.rebased[key] = true
 	return true
+}
+
+// blockRebaseExhausted parks a Watch that spent its rebase budget. The block
+// joins a shared BlockerIncident on the base branch, so one broken main blocks
+// every affected Watch instead of spending a rebase on each of them.
+func (b *Bridge) blockRebaseExhausted(ctx context.Context, w domain.Watch, now time.Time, cycleID string) int {
+	info := domain.BlockedInfo{
+		Reason:       fmt.Sprintf("rebase budget of %d exhausted", rebaseBudget(w)),
+		FailedChecks: []string{"rebase-budget-exhausted"},
+		Since:        now,
+		BlockedBy:    "cibridge",
+	}
+	next, _ := domain.Transition(w, domain.BlockEvent(info, now))
+	if next.Status != domain.StatusBlocked || next.Blocked == nil {
+		return 0
+	}
+	if err := b.store.SaveWatch(next); err != nil {
+		observe.ActorError("cibridge-rebase-block", next.ID, err)
+		return 0
+	}
+	if b.control != nil {
+		incident, _, err := b.control.GetOrCreateOpenBlocker(next.Repo, baseRefOf(next), info.FailedChecks, next.ID, now)
+		if err != nil {
+			observe.ActorError("cibridge-rebase-blocker", next.ID, err)
+		} else if next.BlockerID != incident.ID {
+			next.BlockerID = incident.ID
+			if err := b.store.SaveWatch(next); err != nil {
+				observe.ActorError("cibridge-rebase-blocker-id", next.ID, err)
+			}
+		}
+	}
+	b.cycleEvent(cycleID, "rebase_budget_exhausted", cycleFields{
+		watchID: next.ID, revision: next.Revision, verdict: domain.VerdictBlocked,
+	}, observe.Fields{observe.FieldBlockerID: next.BlockerID})
+	log.Printf("cibridge: %s#%d blocked, rebase budget exhausted", next.Repo, next.PR)
+	return 1
 }
 
 // WithBlockerControl binds the control-plane port. Wave 3 wires the real
@@ -624,6 +762,16 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			continue
 		}
 
+		// A Watch that spent its rebase budget is parked before the verdict
+		// engine can publish another rebase. The count is durable, so a
+		// restarted process reaches the same decision. The block joins the
+		// shared incident on the base branch.
+		if b.rebaseBudgetExhausted(w) {
+			updated += b.blockRebaseExhausted(ctx, w, now, cycleID)
+			skipped++
+			continue
+		}
+
 		// A moved head invalidates the Watch. Apply the domain event so the
 		// old Watch closes with closeReason=head_changed and a successor with
 		// the same subscribers and OrchestratorID is created for the new SHA.
@@ -652,6 +800,23 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 			observe.FieldPR: w.PR, "state": obs.pr.State,
 			"headSHA": obs.pr.HeadRefOid, "mergeable": obs.pr.Mergeable,
 		})
+
+		// Charge the rebase before publishing its verdict. The write is durable,
+		// so a restart cannot issue the same rebase twice. When the budget is
+		// gone, park the Watch on the shared incident instead.
+		if verdict == domain.VerdictRebase {
+			allowed, exhausted := b.spendRebase(w, now)
+			if exhausted {
+				updated += b.blockRebaseExhausted(ctx, w, now, cycleID)
+				skipped++
+				continue
+			}
+			if !allowed {
+				skipped++
+				continue
+			}
+		}
+
 		updated += b.applyVerdict(ctx, w, obs, verdict, targets, now, cycleID)
 	}
 
