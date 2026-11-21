@@ -925,7 +925,7 @@ func TestAckBlockedNotMine(t *testing.T) {
 	h := NewAckHandler(store, stamper, clock)
 
 	_, out, err := h.Handle(context.Background(), sessionReq("session-blocker"), AckInput{
-		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine),
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine), Revision: w.Revision,
 	})
 	if err != nil || !out.OK {
 		t.Fatalf("blocked ack: out %+v err %v", out, err)
@@ -998,6 +998,57 @@ func TestAckBlockedNotMine(t *testing.T) {
 	}
 }
 
+// TestAckBlockedDecisionRejectsUnpinnedAndFutureRevision covers ATX-35: a
+// blocked decision must pin the committed revision. Zero and future revisions
+// are discarded before a block or a claim is written.
+func TestAckBlockedDecisionRejectsUnpinnedAndFutureRevision(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		revision uint64
+	}{
+		{name: "zero", revision: 0},
+		{name: "future", revision: 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := &stepClock{t: time.Date(2026, 11, 20, 8, 30, 0, 0, time.UTC)}
+			w := resultFixture(domain.VerdictRetry)
+			w.Status = domain.StatusWatching
+			o := resultObligation(w, "session-revision")
+			store := newMemStore()
+			if err := store.SaveWatch(w); err != nil {
+				t.Fatalf("SaveWatch: %v", err)
+			}
+			if err := store.SaveObligation(o); err != nil {
+				t.Fatalf("SaveObligation: %v", err)
+			}
+			stamper := newRecordingStamper()
+			stamper.add(o)
+			h := NewAckHandler(store, stamper, clock)
+
+			receipt, err := h.AckReceipt(context.Background(), AckInput{
+				WatchID: w.ID, ObligationID: o.ID,
+				Decision: string(DecisionBlockedNotMine), Revision: tc.revision,
+			})
+			if !IsStaleRevision(err) {
+				t.Fatalf("revision %d: err = %v, want stale revision", tc.revision, err)
+			}
+			if receipt.Revision != w.Revision {
+				t.Errorf("receipt revision = %d, want committed %d", receipt.Revision, w.Revision)
+			}
+			got, err := store.Watch(w.ID)
+			if err != nil || got.Status != w.Status || got.Revision != w.Revision {
+				t.Errorf("rejected decision changed the Watch: %+v err %v", got, err)
+			}
+			if _, ok := h.blocked.Lookup(w.ID); ok {
+				t.Error("rejected decision recorded a block")
+			}
+			if _, claims := stamper.counts(); claims != 0 {
+				t.Errorf("rejected decision stamped the obligation %d times", claims)
+			}
+		})
+	}
+}
+
 // TestAckBlockedUnknownDecisionDoesNotBlock keeps the blocked family closed.
 // An unknown blocked: reason and an unknown decision are both refused before a
 // block, a Watch write or a claim happens.
@@ -1019,7 +1070,7 @@ func TestAckBlockedUnknownDecisionDoesNotBlock(t *testing.T) {
 			h := NewAckHandler(store, stamper, clock)
 
 			_, _, err := h.Handle(context.Background(), sessionReq("session-blocker"), AckInput{
-				WatchID: w.ID, ObligationID: o.ID, Decision: decision,
+				WatchID: w.ID, ObligationID: o.ID, Decision: decision, Revision: w.Revision,
 			})
 			if err == nil {
 				t.Fatalf("unknown decision %q was accepted", decision)
@@ -1057,7 +1108,7 @@ func TestAckBlockedNotMineIdempotent(t *testing.T) {
 	stamper := newRecordingStamper()
 	stamper.add(o)
 	h := NewAckHandler(store, stamper, clock)
-	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine)}
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine), Revision: w.Revision}
 
 	// AckReceipt has no _meta; the block needs a session, so use the path the
 	// MCP handler takes with the caller's session ID.
@@ -1066,6 +1117,7 @@ func TestAckBlockedNotMineIdempotent(t *testing.T) {
 		t.Fatalf("first block with session: receipt %+v err %v", first, err)
 	}
 	clock.Advance(time.Hour)
+	in.Revision++ // the first block advanced the Watch by one revision
 
 	second, err := h.ackReceiptWithSession(context.Background(), in, "session-second")
 	if err != nil {
@@ -1138,7 +1190,7 @@ func TestAckBlockedResolvedUnblocksWatch(t *testing.T) {
 	store, stamper, h, w, o := blockedAckFixture(t, clock)
 
 	receipt, err := h.AckReceipt(context.Background(), AckInput{
-		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved),
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved), Revision: w.Revision,
 	})
 	if err != nil {
 		t.Fatalf("resolved ack: %v", err)
@@ -1178,13 +1230,14 @@ func TestAckBlockedResolvedUnblocksWatch(t *testing.T) {
 func TestAckBlockedResolvedIdempotent(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)}
 	store, _, h, w, o := blockedAckFixture(t, clock)
-	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved)}
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved), Revision: w.Revision}
 
 	first, err := h.AckReceipt(context.Background(), in)
 	if err != nil || !first.Unblocked {
 		t.Fatalf("first resolve: receipt %+v err %v", first, err)
 	}
 	clock.Advance(time.Hour)
+	in.Revision++ // the first resolve advanced the Watch by one revision
 
 	second, err := h.AckReceipt(context.Background(), in)
 	if err != nil {
@@ -1235,7 +1288,7 @@ func TestAckBlockedResolvedRequiresBlockedWatch(t *testing.T) {
 	h := NewAckHandler(store, stamper, clock)
 
 	_, err := h.AckReceipt(context.Background(), AckInput{
-		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved),
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved), Revision: w.Revision,
 	})
 	if err == nil {
 		t.Fatal("resolve on a Watch that was never blocked was accepted")
@@ -1263,7 +1316,7 @@ func TestAckBlockedResolvedKeepsFixFor(t *testing.T) {
 	}
 
 	if _, err := h.AckReceipt(context.Background(), AckInput{
-		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved),
+		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedResolved), Revision: w.Revision,
 	}); err != nil {
 		t.Fatalf("resolved ack: %v", err)
 	}
@@ -1304,7 +1357,7 @@ func TestAckBlockedEscalationMetric(t *testing.T) {
 	stamper := newRecordingStamper()
 	stamper.add(o)
 	h := NewAckHandler(store, stamper, clock)
-	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine)}
+	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine), Revision: w.Revision}
 
 	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first")
 	if err != nil || !first.Blocked {
@@ -1313,6 +1366,7 @@ func TestAckBlockedEscalationMetric(t *testing.T) {
 	assertCounter(t, metrics, observe.CounterBlocksEscalated, 1)
 
 	clock.Advance(time.Hour)
+	in.Revision++ // the first block advanced the Watch by one revision
 	if _, err := h.ackReceiptWithSession(context.Background(), in, "session-second"); err != nil {
 		t.Fatalf("repeat block: %v", err)
 	}
