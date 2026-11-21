@@ -28,11 +28,27 @@ executor-task:lifecycle -->
 
 | Поле | Источник | Назначение |
 | --- | --- | --- |
-| cardID | карточка задачи в `docs/tasks/` | что делает исполнитель |
+| cardID | ответ `beacon_task_claim` | что делает исполнитель |
+| цель, зависимости, OwnerFiles, режим плана, handoff | ответ `beacon_task_claim` | контекст задачи без поиска по `docs/tasks/` |
+| graphReady | ответ `beacon_task_claim` или `beacon_stats` | граф собран и актуален |
 | sessionID | `_meta["ai.opencode/sessionID"]` или явный `notify.target: "<ses_...>"` | адрес живой сессии для wake |
 | repo, pr, headSHA, baseRef | факт сдачи PR | параметры Watch |
 | watchID | ответ `beacon_watch_pr` | ключ ожидания и отчёта |
 | verdict | `beacon_get_result` | решение о пробуждении |
+
+## Получение задачи через beacon_task_claim
+
+Задачу выдаёт оркестратор через `beacon_task_claim` с agent ID. Исполнитель получает ID карточки, цель, зависимости, OwnerFiles, режим плана и handoff. Первая выдача помечает карточку `in_progress`, поэтому второй агент не возьмёт ту же карточку.
+
+`docs/tasks/` остаётся источником истины для содержимого карточки, но не единственным путём к задаче. Индекс в state dir пересобирается из карточек командой `beacon index build`. Граф строится из рёбер `blocks`, `depends-on`, `supersedes` и `related` для всех семейств ID: T, RS, WIRING и BS. Цикл на записи отвергается. Не добавляйте зависимость, которая замыкает цикл. Маркер `graphReady` в ответе claim или `beacon_stats` говорит, что граф актуален.
+
+<!-- executor-task:claim
+source: beacon_task_claim
+fields: id, goal, deps, ownerFiles, planMode, handoff, graphReady
+duplicate-issue: fail
+cycle: reject
+manual-done: forbidden
+executor-task:claim -->
 
 ## Три состояния исполнителя
 
@@ -71,11 +87,12 @@ keys: docs, tasks, evals
 scattered-paths: fail
 executor-task:artifact-paths -->
 
-## Цикл: register, push PR, finish turn
+## Цикл: claim, register, push PR, finish turn
 
-1. **register.** Вызвать `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"` или `"fixer"` и `notify: { adapter: "opencode", target: "<ses_...>" }`. В `target` идёт РЕАЛЬНЫЙ идентификатор сессии из `_meta["ai.opencode/sessionID"]` или явно переданный `ses_...`. Значение `<cardID>` в `target` запрещено: wake будет доставлен не туда. Повторный вызов с теми же параметрами идемпотентен. Один агент может держать несколько Watch.
-2. **push PR.** Сделать изменения в своём worktree и своей ветке от `origin/main`. Прямые коммиты в `main` запрещены. Локально запускать только `gofmt -w <изменённые_файлы>`. Полные проверки прогоняет GitHub Actions CI на PR, не запускать `go test ./...`, `go build ./...` и `beacon gates` локально. Запушить ветку и открыть PR в `main` командой `gh pr create --base main --head <ветка>`. В отчёте указать номер PR, headSHA и список файлов.
-3. **finish turn.** Завершить ход с отчётом ровно `waiting, <watchID>`, подставив сохранённый `watchID`. Не опрашивать состояние в цикле, не крутить `gh pr checks --watch`, не использовать `sleep` и не ждать вручную. Дальше агент спит до вердикта, который разрешает пробуждение.
+1. **claim.** Получить задачу через `beacon_task_claim`, если оркестратор ещё не выдал её. Сохранить ID, цель, зависимости и OwnerFiles из ответа. Не искать задачу вручную в `docs/tasks/`.
+2. **register.** Вызвать `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"` или `"fixer"` и `notify: { adapter: "opencode", target: "<ses_...>" }`. В `target` идёт РЕАЛЬНЫЙ идентификатор сессии из `_meta["ai.opencode/sessionID"]` или явно переданный `ses_...`. Значение `<cardID>` в `target` запрещено: wake будет доставлен не туда. Повторный вызов с теми же параметрами идемпотентен. Один агент может держать несколько Watch.
+3. **push PR.** Сделать изменения в своём worktree и своей ветке от `origin/main`. Прямые коммиты в `main` запрещены. Локально запускать только `gofmt -w <изменённые_файлы>`. Полные проверки прогоняет GitHub Actions CI на PR, не запускать `go test ./...`, `go build ./...` и `beacon gates` локально. Запушить ветку и открыть PR в `main` командой `gh pr create --base main --head <ветка>`. В отчёте указать номер PR, headSHA и список файлов.
+4. **finish turn.** Завершить ход с отчётом ровно `waiting, <watchID>`, подставив сохранённый `watchID`. Не опрашивать состояние в цикле, не крутить `gh pr checks --watch`, не использовать `sleep` и не ждать вручную. Дальше агент спит до вердикта, который разрешает пробуждение.
 
 ## Документация в том же PR
 
@@ -105,6 +122,8 @@ executor-task:report -->
 ## Вердикты и пробуждение
 
 Авто-мерж включён по умолчанию: Beacon сам мержит зелёный PR по `verdict=ready` (ADR 0072). Исполнитель не получает команды мерж и не вызывает `gh pr merge`.
+
+При терминальном вердикте `merged` Beacon переводит связанную карточку в `done` и пишет ссылку на PR в подтверждение. Исполнитель карточку не закрывает и статус вручную не меняет.
 
 Исполнитель просыпается только когда мерж невозможен: на `keep_working`, `rebase`, `retry` или при ошибке мержа. Ошибка мержа приходит как один из этих вердиктов и не требует нового Watch. Переход `watching` в `watching` не двигает revision и никого не будит.
 
@@ -212,9 +231,14 @@ executor-task:ttl -->
 - Не закрывать чужие карточки в несвязанных PR.
 - Не запускать `batch-apply` без явной команды владельца.
 - Не отправлять PR с изменением кода без обновления документации в том же PR.
+- Не искать задачу вручную в `docs/tasks/` вместо `beacon_task_claim`.
+- Не добавлять зависимость, которая замыкает цикл в графе.
+- Не переводить карточку в `done` вручную: это делает Beacon при `merged`.
 
 ## Самопроверка шаблона
 
 Тест шаблона лежит в `tests/adapter/executor-template.test.js` и читает этот файл через `node:fs`. Он разбирает маркеры и проверяет четыре условия карточки: `ready` и `watching` не будят, `keep_working`, `rebase` и `retry` будят, текст `waiting, watchID` присутствует, у Beacon нет команды от имени агента. Дополнительно проверяется, что re-run принадлежит агенту и TTL отсутствует.
+
+Блок `executor-task:claim` фиксирует, что задача приходит через `beacon_task_claim`, цикл отвергается и карточку в `done` переводит Beacon при мерже.
 
 CI подхватывает тест шагом `Test JS adapters` в `.github/workflows/ci.yml`: `find tests/adapter -maxdepth 1 -name '*.test.js' | xargs node --test`. Тест использует только встроенные модули Node.
