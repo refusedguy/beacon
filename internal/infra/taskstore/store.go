@@ -396,101 +396,83 @@ func CounterPath(stateDir, root string) string {
 	return filepath.Join(stateDir, "task-counter-"+Hash8(root)+".json")
 }
 
-// Lock это захваченный файловый замок.
+// Lock это захваченный файловый замок. Владение определяется блокировкой
+// syscall.Flock на открытом файле, а не самим фактом существования файла.
 type Lock struct {
 	Path string
+	f    *os.File
 }
 
-// AcquireLock захватывает замок через O_CREATE|O_EXCL. До 50 попыток по 100 мс.
+// AcquireLock захватывает замок через syscall.Flock(LOCK_EX|LOCK_NB). Файл
+// служит только точкой встречи: взаимное исключение обеспечивает ядро, поэтому
+// содержимое файла больше не читается для решения о перехвате замка. Это
+// устраняет гонку, когда владелец создавал файл через O_EXCL, а претендент
+// читал его без блокировки и мог удалить чужой замок. До 50 попыток по 100 мс.
 func AcquireLock(lockPath, projectRoot string) (*Lock, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
 		return nil, Startupf("не создан каталог состояния: %v", err)
 	}
-	emptyReads := 0
 	for attempt := 0; attempt < 50; attempt++ {
-		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-		if err == nil {
-			content := fmt.Sprintf("pid=%d\nstarted=%s\nroot=%s\n",
-				os.Getpid(), time.Now().UTC().Format(time.RFC3339), projectRoot)
-			_, werr := f.WriteString(content)
-			if werr == nil {
-				werr = f.Sync()
-			}
-			_ = f.Close()
-			if werr != nil {
-				_ = os.Remove(lockPath)
-				return nil, Startupf("не записан файл замка: %v", werr)
-			}
-			return &Lock{Path: lockPath}, nil
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, Startupf("не открыт замок %s: %v", lockPath, err)
 		}
-		if !errors.Is(err, os.ErrExist) {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = f.Close()
+			if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 			return nil, Startupf("не взят замок %s: %v", lockPath, err)
 		}
-		// Файл создаётся пустым и наполняется следующими вызовами. Читатель не
-		// должен принять пустой замок за остаток после падения, пока владелец
-		// не успел записать PID. Несколько пустых чтений дают ему время.
-		stale, undecided, rerr := lockState(lockPath)
-		if rerr != nil || stale {
-			_ = os.Remove(lockPath)
-			emptyReads = 0
+		// Проверка: пока мы ждали блокировку, файл могли удалить и создать
+		// заново. Убеждаемся, что держим замок на текущем файле пути, иначе
+		// повторяем попытку на новом inode.
+		locked, err := f.Stat()
+		if err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не прочитан файл замка %s: %v", lockPath, err)
+		}
+		current, err := os.Stat(lockPath)
+		if err != nil || !os.SameFile(locked, current) {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
 			continue
 		}
-		if undecided {
-			emptyReads++
-			if emptyReads >= 5 {
-				_ = os.Remove(lockPath)
-				emptyReads = 0
-			}
-		} else {
-			emptyReads = 0
+		// Содержимое пишется под блокировкой одним вызовом: другой владелец
+		// не увидит половинчатую запись. Формат сохранён для совместимости.
+		content := fmt.Sprintf("pid=%d\nstarted=%s\nroot=%s\n",
+			os.Getpid(), time.Now().UTC().Format(time.RFC3339), projectRoot)
+		if err := f.Truncate(0); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не очищен файл замка %s: %v", lockPath, err)
 		}
-		time.Sleep(100 * time.Millisecond)
+		if _, err := f.WriteAt([]byte(content), 0); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не записан файл замка: %v", err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не синхронизирован файл замка: %v", err)
+		}
+		return &Lock{Path: lockPath, f: f}, nil
 	}
 	return nil, Startupf("замок %s занят: исчерпано 50 попыток", lockPath)
-}
-
-// lockState сообщает, можно ли удалить замок. undecided означает, что владелец
-// ещё не записал PID и время, либо файл повреждён.
-func lockState(lockPath string) (stale, undecided bool, err error) {
-	data, err := os.ReadFile(lockPath)
-	if err != nil {
-		return true, false, err
-	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return false, true, nil
-	}
-	pid := 0
-	started := time.Time{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		if v, ok := strings.CutPrefix(line, "pid="); ok {
-			pid, _ = strconv.Atoi(strings.TrimSpace(v))
-		}
-		if v, ok := strings.CutPrefix(line, "started="); ok {
-			started, _ = time.Parse(time.RFC3339, strings.TrimSpace(v))
-		}
-	}
-	if pid <= 0 || started.IsZero() {
-		return false, true, nil
-	}
-	if !processAlive(pid) || time.Since(started) > 30*time.Second {
-		return true, false, nil
-	}
-	return false, false, nil
-}
-
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // Release отпускает замок. Повторное освобождение безопасно.
 func (l *Lock) Release() error {
 	if l == nil || l.Path == "" {
 		return nil
+	}
+	if l.f != nil {
+		_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+		_ = l.f.Close()
+		l.f = nil
 	}
 	err := os.Remove(l.Path)
 	if errors.Is(err, os.ErrNotExist) {
