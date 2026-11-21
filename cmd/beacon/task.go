@@ -781,7 +781,7 @@ func runTaskLeaseCheck(argv []string, stdout, stderr io.Writer, cfg taskcli.Conf
 }
 
 func defaultTaskConfig() (taskcli.Config, error) {
-	root := strings.TrimSpace(os.Getenv("BEACON_ROOT"))
+	root := projectRootFromEnv()
 	if root == "" {
 		root = findProjectRoot()
 	}
