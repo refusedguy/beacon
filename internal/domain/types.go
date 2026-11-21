@@ -264,6 +264,9 @@ type Watch struct {
 	CreatedAt      time.Time        `json:"createdAt"`
 	ClosedAt       time.Time        `json:"closedAt"`
 	CloseReason    string           `json:"closeReason"`
+	// ConfigID records the configuration identity from ADR 0087 at creation
+	// time. Old Watch records carry no value and read back as the zero string.
+	ConfigID string `json:"configId,omitempty"`
 }
 
 // RecordFixAttempt returns a copy of w with one more FIX agent recorded for

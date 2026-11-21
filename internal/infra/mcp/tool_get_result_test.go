@@ -211,6 +211,53 @@ func TestGetResultProjectsContractAndStampsRead(t *testing.T) {
 	}
 }
 
+// TestGetResultEchoesWatchConfigID proves get_result carries the Watch's
+// configuration identity from ADR 0087 (T5.36). A Watch recorded before the
+// field existed reads back as empty and keeps the previous JSON shape, so no
+// live configuration probe is needed to verify the contract.
+func TestGetResultEchoesWatchConfigID(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		configID string
+	}{
+		{name: "recorded config", configID: "ci=stub,gpt=codex"},
+		{name: "old watch", configID: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := resultFixture(domain.VerdictReady)
+			w.ConfigID = tc.configID
+			o := resultObligation(w, "session-C")
+			store := newMemStore()
+			if err := store.SaveWatch(w); err != nil {
+				t.Fatalf("SaveWatch: %v", err)
+			}
+			if err := store.SaveObligation(o); err != nil {
+				t.Fatalf("SaveObligation: %v", err)
+			}
+			stamper := newRecordingStamper()
+			stamper.add(o)
+			h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
+
+			out, err := h.Result(context.Background(), sessionReq("session-C"), GetResultInput{WatchID: w.ID})
+			if err != nil {
+				t.Fatalf("Result: %v", err)
+			}
+			if out.ConfigID != tc.configID {
+				t.Errorf("configId = %q, want %q", out.ConfigID, tc.configID)
+			}
+
+			raw, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal output: %v", err)
+			}
+			wantKey := strings.Contains(string(raw), `"configId":`)
+			if wantKey != (tc.configID != "") {
+				t.Errorf("configId key present = %v, want %v in %s", wantKey, tc.configID != "", raw)
+			}
+		})
+	}
+}
+
 // TestGetResultRetryBudgetWithoutFlakyFailure checks that a watch with no
 // flaky-matched failure reports no retry budget.
 func TestGetResultRetryBudgetWithoutFlakyFailure(t *testing.T) {

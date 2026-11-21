@@ -433,6 +433,7 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 		NextCommand:    command,
 		NextHint:       hint,
 		FailureExcerpt: excerpt,
+		ConfigID:       w.ConfigID,
 	}, nil
 }
 
