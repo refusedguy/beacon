@@ -42,7 +42,7 @@ func loadDocsConfig(path string) (docsConfig, error) {
 }
 
 func isTaskStatus(v string) bool {
-	return v == "todo" || v == "done" || v == "dropped"
+	return v == "todo" || v == "in_progress" || v == "done" || v == "dropped"
 }
 
 func isADRStatus(v string) bool {
@@ -335,6 +335,21 @@ func docsSelfTestRun() int {
 	ok = check(map[string]string{"docs/tasks/GOOD.1.md": goodTask}, docsConfig{},
 		func(fs []gate.Finding) bool { return len(fs) == 0 }) && ok
 
+	// A card taken by beacon task take carries in_progress. ParseCard accepts
+	// that status, so the docs gate must accept it too.
+	ok = check(map[string]string{
+		"docs/tasks/INPROG.1.md": "# INPROG.1. Taken card\nСтатус: in_progress\nФаза: P0\nТип: task\n" +
+			"Владелец файлов: x.go\nЗависимости: \nСсылка: ADR 0001\nАгент: нет\n" +
+			"Время: нет\nЦель: c\nКонтекст: k\nШаги: s\nПроверка: v\nПриёмка: a\n",
+	}, docsConfig{}, func(fs []gate.Finding) bool { return len(fs) == 0 }) && ok
+
+	// Fail closed: a status outside the allowed set still reports.
+	ok = check(map[string]string{
+		"docs/tasks/BADSTATUS.1.md": "# BADSTATUS.1. Bad status\nСтатус: bogus\n",
+	}, docsConfig{}, func(fs []gate.Finding) bool {
+		return gate.HasRule(fs, "DOC-TASK-STATUS")
+	}) && ok
+
 	// Planted defects: wrong heading, no status, missing fields.
 	ok = check(map[string]string{
 		"docs/tasks/BAD.1.md": "# WRONG.1. Broken\nФаза: P0\n",
@@ -368,9 +383,9 @@ func docsSelfTestRun() int {
 	}) && ok
 
 	if !ok {
-		fmt.Println("self-test FAILED: 4 fixtures")
+		fmt.Println("self-test FAILED: 6 fixtures")
 		return gate.Red
 	}
-	fmt.Println("self-test passed: 4 fixtures")
+	fmt.Println("self-test passed: 6 fixtures")
 	return gate.Green
 }
