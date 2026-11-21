@@ -43,7 +43,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0090-untitled.md",
+      "path": "docs/adrs/0090-registry-lifecycle.md",
       "task": "HD-085"
     },
     {
@@ -98,7 +98,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0185-untitled.md",
+      "path": "docs/adrs/0185-mcp-beacon-wake.md",
       "task": "HD-085"
     },
     {
@@ -118,7 +118,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0189-untitled.md",
+      "path": "docs/adrs/0189-internal-scheduler.md",
       "task": "HD-085"
     },
     {
@@ -138,7 +138,7 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0193-untitled.md",
+      "path": "docs/adrs/0193-three-idempotency-keys.md",
       "task": "HD-085"
     },
     {
@@ -148,12 +148,12 @@
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0196-untitled.md",
+      "path": "docs/adrs/0196-terminal-guard-snooze-loop.md",
       "task": "HD-085"
     },
     {
       "rule": "DOC-ADR-DUP",
-      "path": "docs/adrs/0197-untitled.md",
+      "path": "docs/adrs/0197-single-operator-chat-control.md",
       "task": "HD-085"
     },
     {
