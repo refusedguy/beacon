@@ -83,6 +83,10 @@ const (
 	// any artifact reaches disk. The field name is a technical token, the
 	// complaint is Russian interface prose.
 	invalidFieldFormat = "недопустимое значение поля %s: %s\n"
+	// ATX-12: an empty card ID or one carrying "..", "/" or "\" escapes
+	// docs/tasks once it is joined onto a file path. Reject it before any
+	// artifact path is built.
+	invalidCardIDFormat = "недопустимый идентификатор карточки: %s\n"
 )
 
 // Options mirrors the command line of cmd/batch-apply.
@@ -213,6 +217,11 @@ func iterationHash(entries []artifactEntry) string {
 var (
 	nonSlug    = regexp.MustCompile(`[^a-z0-9]+`)
 	factNumber = regexp.MustCompile(`\b[0-9]+(?:\.[0-9]+)?\b`)
+	// cardID accepts the identifiers already used in docs/tasks: an
+	// alphanumeric first character followed by alphanumerics, dots,
+	// underscores or hyphens. A leading separator or a standalone ".." cannot
+	// match, so a valid ID always stays inside the tasks directory.
+	cardID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
 // Generated card fields are closed sets. The values match the cards already
@@ -250,6 +259,37 @@ func cardFieldProblems(batches []batch) []string {
 				if field.value != "" && !allowedValue(field.value, field.allowed) {
 					problems = append(problems, fmt.Sprintf(invalidFieldFormat, field.name, field.value))
 				}
+			}
+		}
+	}
+	return problems
+}
+
+// validCardID reports whether id is safe to use as a docs/tasks file name.
+// Empty IDs, path separators and ".." segments are rejected explicitly before
+// the pattern check, so no identifier can escape the tasks directory when it
+// is passed to filepath.Join.
+func validCardID(id string) bool {
+	if id == "" || strings.Contains(id, "..") || strings.ContainsAny(id, `/\`) {
+		return false
+	}
+	return cardID.MatchString(id)
+}
+
+// cardIDProblems returns one line per card or closure ID that is unsafe to
+// join onto docs/tasks. Both card IDs and closure IDs reach filepath.Join, so
+// both are checked here, before any artifact path is built.
+func cardIDProblems(batches []batch) []string {
+	var problems []string
+	for _, b := range batches {
+		for _, c := range b.Cards {
+			if !validCardID(c.ID) {
+				problems = append(problems, fmt.Sprintf(invalidCardIDFormat, c.ID))
+			}
+		}
+		for _, c := range b.CardClosures {
+			if !validCardID(c.ID) {
+				problems = append(problems, fmt.Sprintf(invalidCardIDFormat, c.ID))
 			}
 		}
 	}
@@ -780,6 +820,15 @@ func Run(opts Options, out, errOut io.Writer) int {
 		r.errf("%s", line)
 	}
 	if len(badFields) > 0 {
+		return 1
+	}
+	// ATX-12: reject unsafe card and closure IDs before they become map keys
+	// and reach filepath.Join in the write loop or applyClosures.
+	badIDs := cardIDProblems(batches)
+	for _, line := range badIDs {
+		r.errf("%s", line)
+	}
+	if len(badIDs) > 0 {
 		return 1
 	}
 	if opts.MergePlan {
