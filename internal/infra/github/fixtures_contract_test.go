@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // TestMain turns on verbose output because CI runs "go test ./..." without -v.
@@ -432,5 +434,52 @@ func TestBehindFixtureChecksBothPolicies(t *testing.T) {
 	}
 	if got[false] != "ready" {
 		t.Errorf("behind requireUpToDate=false verdict = %q, want ready", got[false])
+	}
+}
+
+// TestInformationalFailureDoesNotWakeExecutor proves the verdict engine keeps a
+// failed required:false gate out of the decision. With a separate required gate
+// green, the same observation is ready and wakes only the orchestrator. Marking
+// the failed gate required must restore keep_working and the executor wake.
+func TestInformationalFailureDoesNotWakeExecutor(t *testing.T) {
+	s := domain.Snapshot{
+		State:            "OPEN",
+		HeadSHA:          "abc",
+		WatchHeadSHA:     "abc",
+		Rollup:           "FAILURE",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		SuitesValid:      true,
+		Checks: map[string]domain.Check{
+			"ci-build": {Conclusion: "SUCCESS", Required: true},
+			"ci-info":  {Conclusion: "FAILURE", Required: false},
+		},
+		Failures: []string{"ci-info"},
+	}
+
+	got, wake := domain.EvaluatePR(s, domain.Policy{})
+	if got != domain.VerdictReady {
+		t.Fatalf("informational failure verdict = %q, want %q", got, domain.VerdictReady)
+	}
+	for _, target := range wake {
+		if target.Role == domain.RoleExecutor {
+			t.Fatalf("informational failure woke the executor: %+v", wake)
+		}
+	}
+
+	s.Checks["ci-info"] = domain.Check{Conclusion: "FAILURE", Required: true}
+	got, wake = domain.EvaluatePR(s, domain.Policy{})
+	if got != domain.VerdictKeepWorking {
+		t.Fatalf("required failure verdict = %q, want %q", got, domain.VerdictKeepWorking)
+	}
+	found := false
+	for _, target := range wake {
+		if target.Role == domain.RoleExecutor {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("required failure did not wake the executor: %+v", wake)
 	}
 }

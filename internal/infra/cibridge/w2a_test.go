@@ -179,7 +179,7 @@ func TestW2AWakeCapParksWatch(t *testing.T) {
 	}
 	state := domain.PRState{
 		State: "OPEN", HeadRefOid: "sha", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN",
-		Checks: map[string]domain.Check{"build": {Conclusion: "FAILURE"}},
+		Checks: map[string]domain.Check{"build": {Conclusion: "FAILURE", Required: true}},
 	}
 	var lines []string
 	waker := &recordingWaker{}
