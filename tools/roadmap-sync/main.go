@@ -79,7 +79,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	opts := options{}
 	fs.StringVar(&opts.repo, "repo", ".", "repository root containing docs/tasks")
 	fs.StringVar(&opts.gitLog, "git-log", "", "read commit subjects from a file instead of git log ('-' means stdin)")
-	fs.BoolVar(&opts.write, "write", false, "write card status lines and ROADMAP_STATUS.md (default: dry run)")
+	fs.BoolVar(&opts.write, "write", false, "write card status lines and an existing ROADMAP_STATUS.md (default: dry run)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -103,7 +103,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "roadmap-sync: write: %v\n", err)
 		return 1
 	}
-	roadmapChanges, err := applyRoadmap(opts.repo, counts, priorities, opts.write)
+	roadmapChanges, err := updateRoadmap(opts.repo, counts, priorities, opts.write)
 	if err != nil {
 		fmt.Fprintf(stderr, "roadmap-sync: roadmap: %v\n", err)
 		return 1
@@ -459,12 +459,18 @@ func roadmapPath(repo string) string {
 	return filepath.Join(repo, "docs", "ROADMAP_STATUS.md")
 }
 
-// applyRoadmap rewrites only the three counts and the priority lines. The
-// registry table and the rest of the document stay as they are.
-func applyRoadmap(repo string, counts, priorities map[string]int, write bool) ([]string, error) {
+// updateRoadmap reports the edits that would bring the three counts and the
+// priority lines of ROADMAP_STATUS.md in line with the cards. The document is
+// derived (IDX-11): it is absent from a fresh checkout, so the generator never
+// creates it. An operator can generate a local copy by hand, and --write keeps
+// that copy current. A missing file produces no changes and no error.
+func updateRoadmap(repo string, counts, priorities map[string]int, write bool) ([]string, error) {
 	path := roadmapPath(repo)
 	data, err := readFile(path)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	content := string(data)
