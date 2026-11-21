@@ -657,9 +657,9 @@ func (a *t210FakeAdapter) Observe(_ T210WakePointer, _ T210Receipt) error {
 }
 
 func TestT210BindThroughRegistryAndSkipUnknown(t *testing.T) {
-	sessions := T211NewSessionRegistry()
+	sessions := &T211SessionRegistry{}
 	adapters := T211NewAdapterRegistry()
-	deliveries := T211NewDeliveryRegistry()
+	deliveries := &T211DeliveryRegistry{}
 	a := &t210FakeAdapter{}
 	adapters.Register("bridge-a", a)
 
@@ -687,7 +687,7 @@ func TestT210BindThroughRegistryAndSkipUnknown(t *testing.T) {
 }
 
 func TestT211RegistriesKeepTargetsOpaqueAndImportReceipts(t *testing.T) {
-	sessions := T211NewSessionRegistry()
+	sessions := &T211SessionRegistry{}
 	if !sessions.AddFromMeta("bridge-a", map[string]string{"ai.opencode/sessionID": "ses_meta"}, "t-ignored") {
 		t.Fatal("AddFromMeta rejected a valid _meta")
 	}
@@ -711,7 +711,7 @@ func TestT211RegistriesKeepTargetsOpaqueAndImportReceipts(t *testing.T) {
 		t.Fatal("unknown adapter found")
 	}
 
-	d := T211NewDeliveryRegistry()
+	d := &T211DeliveryRegistry{}
 	batch := []T210Receipt{
 		{ObligationID: "o-1", Attempt: 1, Outcome: T210Delivered},
 		{ObligationID: "o-1", Attempt: 1, Outcome: T210Delivered},
@@ -1107,7 +1107,7 @@ func TestT210DeliverSpanCarriesIdentifiersOnly(t *testing.T) {
 	restore := observe.SetTracer(observe.NewTracer(observe.Config{Enabled: true, SpanSink: rec}))
 	defer restore()
 
-	sessions := T211NewSessionRegistry()
+	sessions := &T211SessionRegistry{}
 	sessions.Add("bridge-span", "t-1", "ses_1")
 	adapters := T211NewAdapterRegistry()
 	adapters.Register("bridge-span", &t210FakeAdapter{})
@@ -1150,7 +1150,7 @@ func TestT210DeliverSpanOnePerAttemptNoOpDefault(t *testing.T) {
 	restore := observe.SetTracer(observe.NewTracer(observe.Config{Enabled: true, SpanSink: rec}))
 	defer restore()
 
-	sessions := T211NewSessionRegistry()
+	sessions := &T211SessionRegistry{}
 	sessions.Add("bridge-repeat", "t-1", "ses_1")
 	adapters := T211NewAdapterRegistry()
 	adapters.Register("bridge-repeat", &t210FakeAdapter{})
@@ -1214,11 +1214,11 @@ func TestT545OldReceiptStillReads(t *testing.T) {
 }
 
 func TestT545DeliverFillsAgentIDFromBoundTarget(t *testing.T) {
-	sessions := T211NewSessionRegistry()
+	sessions := &T211SessionRegistry{}
 	sessions.Add("bridge-45", "t-45", "ses_45")
 	adapters := T211NewAdapterRegistry()
 	adapters.Register("bridge-45", &t210FakeAdapter{})
-	deliveries := T211NewDeliveryRegistry()
+	deliveries := &T211DeliveryRegistry{}
 	p := T210WakePointer{
 		Adapter: "bridge-45", Target: "t-45",
 		WatchID: "watch-45", ObligationID: "o-45", Attempt: 1,

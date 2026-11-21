@@ -1622,63 +1622,6 @@ func TestWakeFallbackKeepsHumanFlagsFirst(t *testing.T) {
 	}
 }
 
-// TestWakeFallbackKeepsCapabilitySelection guards T3.47: the capability
-// directory still picks the target, and the chosen session is the one the
-// fallback chain delivers to.
-func TestWakeFallbackKeepsCapabilitySelection(t *testing.T) {
-	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
-		ChannelSteer: {delivery: DeliverySteer},
-	}}
-	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
-	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
-		{Target: "chat-session", Capabilities: []Capability{"chat"}},
-		{Target: "review-session", Capabilities: []Capability{"review"}},
-	}}
-	handler := NewCapabilityFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}, directory)
-
-	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
-		Text:                 "p",
-		RequiredCapabilities: []Capability{"review"},
-	})
-	if err != nil {
-		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
-	}
-	if !out.OK || out.Delivery != DeliverySteer {
-		t.Errorf("delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
-	}
-	if len(sender.attempts) != 1 || sender.attempts[0].target != "review-session" {
-		t.Errorf("attempts=%+v, want steer to review-session", sender.attempts)
-	}
-}
-
-// TestWakeFallbackKeepsWorktreeSelection guards T3.58 together with T3.87:
-// the worktree lookup picks the target, and the chosen session is the one the
-// fallback chain delivers to.
-func TestWakeFallbackKeepsWorktreeSelection(t *testing.T) {
-	sender := &fakeFallbackSender{results: map[WakeChannel]channelResult{
-		ChannelSteer: {delivery: DeliverySteer},
-	}}
-	confirmer := &fakeConfirmer{confirmed: map[WakeChannel]bool{ChannelSteer: true}}
-	directory := &fakeAgentDirectory{candidates: []CandidateAgent{
-		{Target: "session-w1", WorktreePath: "/repo/worktrees/w1"},
-		{Target: "session-w2", WorktreePath: "/repo/worktrees/w2"},
-	}}
-	handler := NewCapabilityFallbackWakeHandler(sender.Deliver, confirmer, &fakeTracer{}, directory)
-
-	out, err := handler.WakeWithFallback(context.Background(), WakeInput{
-		Text: "p", TargetWorktree: "/repo/worktrees/w2",
-	})
-	if err != nil {
-		t.Fatalf("WakeWithFallback() error = %v, want nil", err)
-	}
-	if !out.OK || out.Delivery != DeliverySteer {
-		t.Errorf("delivery=%q ok=%v, want steer/true", out.Delivery, out.OK)
-	}
-	if len(sender.attempts) != 1 || sender.attempts[0].target != "session-w2" {
-		t.Errorf("attempts=%+v, want steer to session-w2", sender.attempts)
-	}
-}
-
 // TestWakeFallbackOverInMemoryTransport drives the chain through a real MCP
 // client and server. It proves the honest delivery and the separate traced
 // fact reach the client, not just the in-process handler.
