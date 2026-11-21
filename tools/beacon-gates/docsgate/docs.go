@@ -51,6 +51,12 @@ func isADRStatus(v string) bool {
 
 // taskFields lists the front matter every task card carries. The first field
 // is validated separately as a status, so field checks start at the second one.
+//
+// This is a copy of internal/infra/taskstore.requiredFields, not a second
+// definition. layers.json has no allowed edge from tools/beacon-gates to
+// internal/infra, and this nested module has no require on the root module, so
+// docsgate cannot import the canonical list. Keep the order and the text in
+// sync; see ARDH-08.
 func taskFields() []string {
 	return []string{
 		"Статус", "Фаза", "Тип", "Владелец файлов", "Зависимости", "Ссылка",
