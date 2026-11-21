@@ -24,7 +24,7 @@ func runLogs(c *CLI, args []string) int {
 	watch := fs.String("watch", "", "только записи с этим watchID")
 	pr := fs.Int("pr", 0, "только записи с этим номером PR")
 	errorsOnly := fs.Bool("errors", false, "только ошибки и записи с полем error")
-	jsonOut := fs.Bool("json", false, "вывести JSON-строки без форматирования")
+	jsonOut := fs.Bool("json", false, "вывести каждую запись как компактный JSON-объект")
 	if !parseFlags("logs", args, c.errOut, fs) {
 		return 2
 	}

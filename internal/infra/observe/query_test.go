@@ -1,6 +1,7 @@
 package observe
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -57,8 +58,58 @@ func TestReadLogsReturnsAllRecordsOldestFirst(t *testing.T) {
 	if !strings.Contains(lines[0], `"event":"cycle"`) || !strings.Contains(lines[4], `"event":"actor_error"`) {
 		t.Errorf("порядок строк нарушен: %v", lines)
 	}
-	if lines[2] != "plain text line" {
-		t.Errorf("не-JSON строка потеряна: %q", lines[2])
+	if !strings.Contains(lines[2], `"message":"plain text line"`) {
+		t.Errorf("не-JSON строка не упакована в JSON: %q", lines[2])
+	}
+}
+
+func TestReadLogsJSONModeEncodesTextAndJSONSources(t *testing.T) {
+	dir := t.TempDir()
+	logs := filepath.Join(dir, logsDirName)
+	if err := os.MkdirAll(logs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The first line is what slog.NewTextHandler writes when
+	// BEACON_LOG_FORMAT is not json. The second line is what the JSON handler
+	// writes. Both must come back as JSON objects from a --json read.
+	sources := []string{
+		`time=2026-11-21T10:00:00Z level=INFO event=verdict_published watchID=w1 pr=10 verdict=ready`,
+		`{"time":"2026-11-21T10:00:01Z","level":"ERROR","event":"merge_fail","watchID":"w2","pr":11,"error":"refused"}`,
+		`a bare line with no fields`,
+	}
+	path := filepath.Join(logs, "beacon-20261121T100000Z-1.log")
+	if err := os.WriteFile(path, []byte(strings.Join(sources, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lines, err := ReadLogs(dir, LogFilter{JSON: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != len(sources) {
+		t.Fatalf("получено %d строк, ожидалось %d: %v", len(lines), len(sources), lines)
+	}
+
+	var objects []map[string]any
+	for i, line := range lines {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			t.Errorf("строка %d не является JSON: %q: %v", i, line, err)
+			continue
+		}
+		objects = append(objects, obj)
+	}
+	if len(objects) != len(sources) {
+		t.Fatalf("разобрано %d JSON-объектов, ожидалось %d", len(objects), len(sources))
+	}
+	if objects[0]["event"] != "verdict_published" || objects[0]["watchID"] != "w1" {
+		t.Errorf("logfmt-строка не разобрана в поля: %v", objects[0])
+	}
+	if objects[1]["event"] != "merge_fail" || objects[1]["error"] != "refused" {
+		t.Errorf("JSON-строка не сохранена: %v", objects[1])
+	}
+	if objects[2]["message"] != "a bare line with no fields" {
+		t.Errorf("произвольный текст не сохранён в message: %v", objects[2])
 	}
 }
 

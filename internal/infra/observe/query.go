@@ -19,7 +19,7 @@ type LogFilter struct {
 	WatchID    string            // keep records with this watchID; empty keeps all
 	PR         int               // keep records with this pr; zero keeps all
 	OnlyErrors bool              // keep ERROR records and records carrying an error field
-	JSON       bool              // keep records as JSON lines; false renders text lines
+	JSON       bool              // encode every record as a JSON object; false renders text lines
 	OnTruncate func(dropped int) // called when Tail drops older matching records
 }
 
@@ -83,7 +83,7 @@ func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 				continue
 			}
 			if opts.JSON {
-				matched = append(matched, line)
+				matched = append(matched, encodeLogRecordJSON(line))
 			} else {
 				matched = append(matched, formatLogLine(line))
 			}
@@ -162,6 +162,81 @@ func parseLogRecord(line string) (map[string]any, bool) {
 		return nil, false
 	}
 	return record, true
+}
+
+// encodeLogRecordJSON turns one stored line into a JSON object. A JSONL line
+// is already a JSON object and passes through with its numbers and key order
+// intact. slog text-handler lines and plain text are parsed into fields and
+// encoded as objects. The --json stream therefore never mixes formats.
+func encodeLogRecordJSON(line string) string {
+	if _, ok := parseLogRecord(line); ok {
+		return line
+	}
+	record := parseLogFmtLine(line)
+	if encoded, err := json.Marshal(record); err == nil {
+		return string(encoded)
+	}
+	encoded, _ := json.Marshal(map[string]any{"message": line})
+	return string(encoded)
+}
+
+// parseLogFmtLine decodes a slog text-handler line such as
+// `time=... level=INFO event=verdict_published watchID=w1 pr=10`. Quoted values
+// may contain spaces and a backslash escapes the next byte. Tokens without an
+// equals sign are joined into the message field so no text is lost.
+func parseLogFmtLine(line string) map[string]any {
+	record := make(map[string]any)
+	var extra []string
+	for i := 0; i < len(line); {
+		for i < len(line) && line[i] == ' ' {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		keyStart := i
+		for i < len(line) && line[i] != '=' && line[i] != ' ' {
+			i++
+		}
+		if i >= len(line) || line[i] != '=' {
+			extra = append(extra, line[keyStart:i])
+			continue
+		}
+		key := line[keyStart:i]
+		i++ // skip '='
+		valueStart := i
+		var value string
+		if i < len(line) && line[i] == '"' {
+			i++
+			var b strings.Builder
+			for i < len(line) {
+				if line[i] == '\\' && i+1 < len(line) {
+					b.WriteByte(line[i+1])
+					i += 2
+					continue
+				}
+				if line[i] == '"' {
+					i++
+					break
+				}
+				b.WriteByte(line[i])
+				i++
+			}
+			value = b.String()
+		} else {
+			for i < len(line) && line[i] != ' ' {
+				i++
+			}
+			value = line[valueStart:i]
+		}
+		if key != "" {
+			record[key] = value
+		}
+	}
+	if len(extra) > 0 {
+		record["message"] = strings.Join(extra, " ")
+	}
+	return record
 }
 
 // numericField converts a JSON number (or a numeric string) to an int.
