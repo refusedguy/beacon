@@ -56,6 +56,11 @@ const (
 	// projection. The other ingresses (mcp, tui, webhook) belong to other
 	// transports and are not visible here.
 	ingressHTTPAPI = "httpapi"
+
+	// HumanDecideContract is the versioned wire contract of the human-answer
+	// projection. A client may omit the contract field to keep the original
+	// shape working; when present it must equal this value.
+	HumanDecideContract = "beacon.human-decide.v1"
 )
 
 // heartbeatInterval is a variable so a test can shorten it without waiting a
@@ -191,12 +196,15 @@ type StateProvider interface {
 
 // Decision is one human command. ObligationID and Note are optional; Actor is
 // recorded in the journal by the sink, not interpreted by the transport.
+// Contract names the wire contract version; an empty value keeps the original
+// pre-versioning shape valid.
 type Decision struct {
 	Command      string `json:"command"`
 	WatchID      string `json:"watchID"`
 	ObligationID string `json:"obligationID,omitempty"`
 	Note         string `json:"note,omitempty"`
 	Actor        string `json:"actor,omitempty"`
+	Contract     string `json:"contract,omitempty"`
 }
 
 // DecisionResult is returned for every accepted command. Applied is false on
@@ -208,6 +216,7 @@ type DecisionResult struct {
 	Applied    bool   `json:"applied"`
 	DecisionID string `json:"decisionID"`
 	Status     string `json:"status,omitempty"`
+	Contract   string `json:"contract,omitempty"`
 }
 
 // DecisionSink applies one command. Idempotency is owned by Server, so the
@@ -939,6 +948,10 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INVALID_INPUT", "пустое поле watchID")
 		return
 	}
+	if d.Contract != "" && d.Contract != HumanDecideContract {
+		writeError(w, http.StatusBadRequest, "UNSUPPORTED_CONTRACT", "неподдерживаемая версия контракта "+d.Contract)
+		return
+	}
 
 	key := strings.Join([]string{d.Command, d.WatchID, d.ObligationID, d.Note}, "\x00")
 	s.decMu.Lock()
@@ -967,6 +980,7 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	if result.DecisionID == "" {
 		result.DecisionID = key
 	}
+	result.Contract = HumanDecideContract
 	s.decisions[key] = result
 	s.decMu.Unlock()
 	s.ops.recordAudit(AuditRecord{
