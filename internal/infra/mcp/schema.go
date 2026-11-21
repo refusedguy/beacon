@@ -438,6 +438,12 @@ func StatusForCode(code domain.ErrorCode) int {
 // can fall back to a generic protocol error. Code specific fields are carried
 // through unchanged: HEAD_SHA_CHANGED keeps its newWatchID and RATE_LIMITED
 // keeps its retryAfterMs as populated by the rate limit adapter.
+//
+// The live MCP path does not call this converter: handlers return the raw
+// error and go-sdk turns it into an isError text result (ADR 0009 exception).
+// This function and ErrorShape document the target envelope and are covered by
+// schema_test.go. Wiring them into the live path changes the wire contract and
+// needs an owner decision (ARDH-17).
 func ToErrorShape(err error) (ErrorShape, bool) {
 	var appErr *domain.AppError
 	if !errors.As(err, &appErr) || appErr == nil {
