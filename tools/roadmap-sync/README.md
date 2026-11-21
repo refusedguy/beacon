@@ -2,7 +2,7 @@
 
 Reconcile `docs/tasks/*.md` status lines and `docs/ROADMAP_STATUS.md` counts with the commits merged into main.
 
-The tool reads `git log`, keeps only commits with a `(#NNNN)` PR suffix, and extracts card IDs from those subjects. It recognizes `BS.11`, `HD-070`, `T3.235`, `T5.55`, `S1.008`, `UI-01` and `WIRING-001`, plus slugged filenames such as `T4.7-rollback-drill.md`. Commits without a PR suffix do not count as merged.
+The tool reads `git log`, keeps only commits with a `(#NNNN)` PR suffix, and extracts card IDs from those subjects. It recognizes `BS.11`, `HD-070`, `T3.235`, `T5.55`, `S1.008`, `UI-01`, `WIRING-001`, `CLEAN-01` and `ARDH-23`, plus slugged filenames such as `T4.7-rollback-drill.md`. Commits without a PR suffix do not count as merged.
 
 ## Status rules
 
