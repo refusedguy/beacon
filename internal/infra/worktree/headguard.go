@@ -5,6 +5,7 @@
 package worktree
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -17,6 +18,10 @@ type WatchAnchor struct {
 	HeadSHA string
 	Branch  string
 	Dir     string
+	// SessionCommits holds the local commits made in this session.
+	// RecordCheckpoint appends one after each edit and each linter fix.
+	// UndoCheckpoint accepts only commits from this list.
+	SessionCommits []string
 }
 
 // HeadGuardAnswer names the Watch that protected a worktree and the rule
@@ -29,10 +34,11 @@ type HeadGuardAnswer struct {
 // Reasons returned by GuardWatch. A reason travels with the Watch ID so the
 // collector can explain why a worktree was kept.
 const (
-	GuardReasonExactHead    = "head_exact"
-	GuardReasonWatchBranch  = "watch_branch"
-	GuardReasonWatchBinding = "watch_binding"
-	GuardReasonAncestorHead = "head_ancestor"
+	GuardReasonExactHead       = "head_exact"
+	GuardReasonWatchBranch     = "watch_branch"
+	GuardReasonWatchBinding    = "watch_binding"
+	GuardReasonAncestorHead    = "head_ancestor"
+	GuardReasonHeadPredecessor = "head_predecessor"
 )
 
 // GuardWatch returns the live Watch that still protects e and the rule that
@@ -96,8 +102,16 @@ func GuardWatch(run Runner, e Entry, watches []WatchAnchor) (HeadGuardAnswer, bo
 			continue
 		}
 		base, err := run(e.Dir, "merge-base", head, watchHead)
-		if err == nil && sameCommit(base, watchHead) {
+		if err != nil {
+			continue
+		}
+		switch {
+		case sameCommit(base, watchHead):
 			return HeadGuardAnswer{ID: w.ID, Reason: GuardReasonAncestorHead}, true
+		case sameCommit(base, head):
+			// Undo moved the worktree head back to a predecessor of the
+			// recorded Watch head. The Watch still protects this worktree.
+			return HeadGuardAnswer{ID: w.ID, Reason: GuardReasonHeadPredecessor}, true
 		}
 	}
 	return HeadGuardAnswer{}, false
@@ -113,4 +127,159 @@ func sameCommit(a, b string) bool {
 		return false
 	}
 	return strings.HasPrefix(a, b) || strings.HasPrefix(b, a)
+}
+
+// Reasons a checkpoint undo is refused. The first four mirror the aider undo
+// guards. The other two keep undo on a session commit at the branch tip.
+const (
+	UndoReasonNotSession  = "not_session_commit"
+	UndoReasonNotHead     = "not_head"
+	UndoReasonMergeCommit = "merge_commit"
+	UndoReasonDirty       = "dirty_worktree"
+	UndoReasonPushed      = "pushed_commit"
+	UndoReasonGitError    = "git_error"
+)
+
+// UndoResult is the outcome of one checkpoint undo. NewHead holds the parent
+// commit after a successful undo. Reason holds an UndoReason constant when
+// Allowed is false.
+type UndoResult struct {
+	Commit  string
+	NewHead string
+	Allowed bool
+	Reason  string
+}
+
+// RecordCheckpoint appends the current HEAD to the Watch anchor. The caller
+// invokes it after each edit and after each linter fix, so the hash stays with
+// the Watch and undo can tell session commits from pushed history.
+func RecordCheckpoint(run Runner, dir string, anchor *WatchAnchor) error {
+	if anchor == nil {
+		return fmt.Errorf("worktree: checkpoint: nil watch anchor")
+	}
+	if run == nil {
+		run = CommandRunner
+	}
+	out, err := run(dir, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("worktree: checkpoint: rev-parse: %w: %s", err, strings.TrimSpace(out))
+	}
+	head := strings.ToLower(firstLine(out))
+	if len(head) < 7 {
+		return fmt.Errorf("worktree: checkpoint: short head %q", head)
+	}
+	if checkpointContains(anchor.SessionCommits, head) {
+		return nil
+	}
+	anchor.SessionCommits = append(anchor.SessionCommits, head)
+	return nil
+}
+
+// CheckUndo applies the undo guards without changing the repository. commit
+// must belong to this session and be the current HEAD. The tree must be clean,
+// the commit must not be a merge and no origin branch may contain it.
+func CheckUndo(run Runner, dir string, anchor WatchAnchor, commit string) UndoResult {
+	res := UndoResult{Commit: commit}
+	commit = strings.ToLower(strings.TrimSpace(commit))
+	if commit == "" || !checkpointContains(anchor.SessionCommits, commit) {
+		res.Reason = UndoReasonNotSession
+		return res
+	}
+	if run == nil {
+		run = CommandRunner
+	}
+	headOut, err := run(dir, "rev-parse", "HEAD")
+	if err != nil {
+		res.Reason = UndoReasonGitError
+		return res
+	}
+	if !sameCommit(firstLine(headOut), commit) {
+		res.Reason = UndoReasonNotHead
+		return res
+	}
+	parentsOut, err := run(dir, "rev-list", "--parents", "-n", "1", commit)
+	if err != nil {
+		res.Reason = UndoReasonGitError
+		return res
+	}
+	if len(strings.Fields(firstLine(parentsOut))) > 2 {
+		res.Reason = UndoReasonMergeCommit
+		return res
+	}
+	status, err := Status(run, dir)
+	if err != nil {
+		res.Reason = UndoReasonGitError
+		return res
+	}
+	if strings.TrimSpace(status) != "" {
+		res.Reason = UndoReasonDirty
+		return res
+	}
+	branches, err := run(dir, "branch", "--remotes", "--contains", commit)
+	if err != nil {
+		res.Reason = UndoReasonGitError
+		return res
+	}
+	if strings.Contains(branches, "origin/") {
+		res.Reason = UndoReasonPushed
+		return res
+	}
+	res.Allowed = true
+	return res
+}
+
+// UndoCheckpoint restores the files changed by commit to its parent and moves
+// HEAD to that parent. The checkout runs before the soft reset, so both the
+// index and the working tree match the earlier state when HEAD moves.
+func UndoCheckpoint(run Runner, dir string, anchor WatchAnchor, commit string) UndoResult {
+	res := CheckUndo(run, dir, anchor, commit)
+	if !res.Allowed {
+		return res
+	}
+	if run == nil {
+		run = CommandRunner
+	}
+	parentOut, err := run(dir, "rev-parse", commit+"^")
+	if err != nil {
+		res.Allowed = false
+		res.Reason = UndoReasonGitError
+		return res
+	}
+	parent := strings.ToLower(firstLine(parentOut))
+	if len(parent) < 7 {
+		res.Allowed = false
+		res.Reason = UndoReasonGitError
+		return res
+	}
+	if out, err := run(dir, "checkout", parent, "--", "."); err != nil {
+		res.Allowed = false
+		res.Reason = UndoReasonGitError + ": checkout: " + strings.TrimSpace(out)
+		return res
+	}
+	if out, err := run(dir, "reset", "--soft", parent); err != nil {
+		res.Allowed = false
+		res.Reason = UndoReasonGitError + ": reset: " + strings.TrimSpace(out)
+		return res
+	}
+	res.NewHead = parent
+	return res
+}
+
+func firstLine(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if s := strings.TrimSpace(line); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func checkpointContains(list []string, sha string) bool {
+	sha = strings.ToLower(strings.TrimSpace(sha))
+	for _, h := range list {
+		if sameCommit(h, sha) {
+			return true
+		}
+	}
+	return false
 }
