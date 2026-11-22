@@ -132,6 +132,11 @@ func closeWiringCard(root string, pr int, at time.Time) error {
 	if root == "" || pr <= 0 {
 		return nil
 	}
+	lock, err := taskstore.AcquireLock(taskstore.TasksLockPath(filepath.Join(root, "docs", "tasks")), root)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 	path := filepath.Join(root, "docs", "tasks", fmt.Sprintf("WIRING-%d.md", pr))
 	// os.DirFS + fs.ReadFile keeps the read out of cmd's forbidden os.ReadFile
 	// capability (ADR 0005), as in readMCPConnection above.
@@ -160,6 +165,11 @@ func closeLinkedCardFile(root, cardID string, pr int, at time.Time) error {
 	if root == "" || strings.TrimSpace(cardID) == "" || pr <= 0 {
 		return nil
 	}
+	lock, err := taskstore.AcquireLock(taskstore.TasksLockPath(filepath.Join(root, "docs", "tasks")), root)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
 	path := filepath.Join(root, "docs", "tasks", strings.TrimSpace(cardID)+".md")
 	raw, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
 	if errors.Is(err, fs.ErrNotExist) {
