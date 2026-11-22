@@ -195,8 +195,51 @@ func runTaskList(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 	if err != nil {
 		return failTask(stderr, err)
 	}
+	// CBX-02: глиф в списке и поле gated_by читают один и тот же предикат.
+	// JSON-строка сервиса дополняется полем, которое считает gatedByFor,
+	// поэтому список и why не могут разойтись на одном ребре.
+	if p.value("format") == "json" {
+		out = addGatedByToListJSON(out, cfg)
+	}
 	fmt.Fprint(stdout, out)
 	return taskstore.ExitOK
+}
+
+// addGatedByToListJSON добавляет поле gated_by в каждую строку JSON-списка.
+// Исходный вывод сервиса не меняется: при ошибке разбора он возвращается как есть.
+func addGatedByToListJSON(out string, cfg taskcli.Config) string {
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		return out
+	}
+	cards, err := taskstore.LoadCards(cfg.TasksDir)
+	if err != nil {
+		return out
+	}
+	byID := make(map[string]taskstore.Card, len(cards))
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+	for i := range rows {
+		var id string
+		if err := json.Unmarshal(rows[i]["id"], &id); err != nil || id == "" {
+			continue
+		}
+		gates := gatedByFor(id, byID)
+		if gates == nil {
+			gates = []taskstore.GateRef{}
+		}
+		encoded, err := json.Marshal(gates)
+		if err != nil {
+			continue
+		}
+		rows[i]["gated_by"] = encoded
+	}
+	encoded, err := json.MarshalIndent(rows, "", "  ")
+	if err != nil {
+		return out
+	}
+	return string(encoded) + "\n"
 }
 
 func runTaskNew(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
@@ -250,12 +293,16 @@ func runTaskTake(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 // runTaskWhy печатает цепочку блокировок карточки. Цепочка строится по графу
 // рёбер между карточками, а не по тексту статуса.
 func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
-	p, err := parseTaskArgs(argv, nil, nil)
+	p, err := parseTaskArgs(argv, map[string]bool{"format": true}, nil)
 	if err != nil {
 		return failTask(stderr, err)
 	}
 	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
 		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки"))
+	}
+	format := p.value("format")
+	if format != "" && format != "json" {
+		return failTask(stderr, taskstore.Validationf("beacon task why: неверное значение --format %q, ожидается json", format))
 	}
 	cards, err := taskstore.LoadCards(cfg.TasksDir)
 	if err != nil {
@@ -270,8 +317,14 @@ func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int
 		return failTask(stderr, taskstore.Validationf("карточка %s не найдена", id))
 	}
 
-	fmt.Fprintln(stdout, id)
 	chain := whyChain(id, byID)
+	gated := gatedByFor(id, byID)
+	if format == "json" {
+		return writeWhyJSON(stdout, id, chain, gated)
+	}
+
+	fmt.Fprintln(stdout, id)
+	fmt.Fprintf(stdout, "  gated_by: %s\n", formatGateRefs(gated))
 	gates := whyExternalGates(byID[id])
 	if len(chain) == 0 && len(gates) == 0 {
 		fmt.Fprintln(stdout, "  цепочка блокировок не найдена")
@@ -289,6 +342,70 @@ func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int
 		fmt.Fprintf(stdout, "  гейт %d. %s через %s: внешнее состояние %s (Watch)\n",
 			i+1, target, whyExternalKind, whyExternalState(target, cfg))
 	}
+	return taskstore.ExitOK
+}
+
+// gatedByFor строит набор гейтов карточки через единственный предикат
+// taskstore.GatesHolding. Рёбра берутся из тех же полей, что и в whyChain,
+// поэтому глиф списка, заголовок, why и gated_by видят один граф.
+func gatedByFor(id string, byID map[string]taskstore.Card) []taskstore.GateRef {
+	subject, ok := byID[id]
+	if !ok {
+		return nil
+	}
+	deps := make([]taskstore.GateDep, 0)
+	for _, e := range whyEdges(subject) {
+		target, ok := byID[e.to]
+		if !ok {
+			continue
+		}
+		deps = append(deps, taskstore.GateDep{Kind: e.kind, Target: target})
+	}
+	return taskstore.GatesHolding(subject, deps)
+}
+
+// formatGateRefs печатает набор гейтов в текстовом заголовке.
+func formatGateRefs(refs []taskstore.GateRef) string {
+	if len(refs) == 0 {
+		return "пусто"
+	}
+	parts := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		part := ref.ID + " (" + ref.Type + ")"
+		if ref.Reason != "" {
+			part += ": " + ref.Reason
+		}
+		parts = append(parts, part)
+	}
+	return strings.Join(parts, ", ")
+}
+
+type whyJSONStep struct {
+	ID     string `json:"id"`
+	Edge   string `json:"edge"`
+	Status string `json:"status"`
+	Agent  string `json:"agent"`
+}
+
+type whyJSON struct {
+	ID      string              `json:"id"`
+	GatedBy []taskstore.GateRef `json:"gated_by"`
+	Chain   []whyJSONStep       `json:"chain"`
+}
+
+func writeWhyJSON(stdout io.Writer, id string, chain []whyStep, gated []taskstore.GateRef) int {
+	if gated == nil {
+		gated = []taskstore.GateRef{}
+	}
+	steps := make([]whyJSONStep, 0, len(chain))
+	for _, s := range chain {
+		steps = append(steps, whyJSONStep{ID: s.id, Edge: s.edge, Status: s.status, Agent: s.agent})
+	}
+	b, err := json.MarshalIndent(whyJSON{ID: id, GatedBy: gated, Chain: steps}, "", "  ")
+	if err != nil {
+		return taskstore.ExitStartup
+	}
+	fmt.Fprintln(stdout, string(b))
 	return taskstore.ExitOK
 }
 
