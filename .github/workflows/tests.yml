@@ -115,6 +115,16 @@ jobs:
             exit 1
           fi
 
+      # WIRING-1680. Раннер EM-02 пишет отчёт в tmp/eval-results.json в корне
+      # репозитория. Шаг публикует файл как артефакт, чтобы его можно было
+      # скачать из Actions. Путь указан от корня checkout, а не от evals.
+      - name: Upload eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: tmp/eval-results.json
+          if-no-files-found: error
+
       - name: Build beacon
         shell: bash
         run: |
