@@ -1363,3 +1363,83 @@ func TestSharedDeliveryDedupReleasesFailedClaim(t *testing.T) {
 		t.Fatalf("calls = %d, want 2 after a retry", calls)
 	}
 }
+
+// The HTTP port and the CLI fallback must receive the same delivery and
+// resume decision. An idle session resumes; a busy one only parks its input.
+func TestDeliverPassesResumeAndDeliveryToPromptPort(t *testing.T) {
+	type promptCall struct {
+		session  string
+		delivery string
+		resume   bool
+	}
+	var calls []promptCall
+	d := &OpenCodeDeliverer{
+		PromptWithResumeFunc: func(_ context.Context, sid, _, delivery string, resume bool) error {
+			calls = append(calls, promptCall{sid, delivery, resume})
+			return nil
+		},
+		SessionActiveFunc: func(_ context.Context, sid string) (bool, bool, error) {
+			return sid == "ses_busy", true, nil
+		},
+	}
+	for _, sid := range []string{"ses_idle", "ses_busy"} {
+		p := domain.WakePayload{
+			WatchID: "watch-resume", ObligationID: domain.ObligationKey("watch-resume", 1, sid), Revision: 1,
+		}
+		if err := d.Deliver(context.Background(), sid, p); err != nil {
+			t.Fatalf("Deliver(%s): %v", sid, err)
+		}
+	}
+	want := []promptCall{
+		{"ses_idle", wakeDeliverySteer, true},
+		{"ses_busy", wakeDeliveryQueue, false},
+	}
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("prompt calls = %+v, want %+v", calls, want)
+	}
+}
+
+// A failed CLI call must carry stderr into the error so a diagnosis does not
+// depend on a separate journal.
+func TestDeliverCLIKeepsStderrInError(t *testing.T) {
+	d := &OpenCodeDeliverer{
+		Runner: func(context.Context, ...string) ([]byte, error) {
+			return []byte("permission denied"), errors.New("exit status 1")
+		},
+	}
+	err := d.deliverCLI(context.Background(), "ses_test", "text", wakeDeliverySteer, false)
+	if err == nil {
+		t.Fatal("deliverCLI error = nil, want stderr in error")
+	}
+	if !strings.Contains(err.Error(), "permission denied") {
+		t.Fatalf("error = %q, want stderr text", err)
+	}
+}
+
+// stderr must also feed the 404 check, not only the error text.
+func TestDeliverCLIUsesStderrToDetectSessionDead(t *testing.T) {
+	d := &OpenCodeDeliverer{
+		Runner: func(context.Context, ...string) ([]byte, error) {
+			return []byte("error: 404 session not found"), errors.New("exit status 1")
+		},
+	}
+	err := d.deliverCLI(context.Background(), "ses_test", "text", wakeDeliverySteer, false)
+	if !errors.Is(err, ErrSessionDead) {
+		t.Fatalf("error = %v, want ErrSessionDead", err)
+	}
+	if !strings.Contains(err.Error(), "404 session not found") {
+		t.Fatalf("error = %q, want stderr text", err)
+	}
+}
+
+// The real command path must merge stderr into the returned bytes. Output()
+// would leave it in ExitError.Stderr and the caller would lose it.
+func TestHistorySearchRunnerCapturesStderr(t *testing.T) {
+	out, err := defaultHistorySearchRunner(context.Background(), "sh", "-c", "echo boom >&2; exit 1")
+	if err == nil {
+		t.Fatal("runner error = nil, want failure")
+	}
+	if !strings.Contains(string(out), "boom") {
+		t.Fatalf("out = %q, want stderr text", out)
+	}
+}

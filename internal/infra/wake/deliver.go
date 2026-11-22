@@ -35,6 +35,13 @@ import (
 // so Deliver can fall back to the CLI without inventing a second delivery.
 type PromptFunc func(ctx context.Context, sessionID, text, delivery string) error
 
+// PromptWithResumeFunc is the same HTTP port with the resume flag attached.
+// An idle session gets resume=true so the host starts a new turn; a busy one
+// gets resume=false and delivery=queue so its input parks (MEM-03). Keeping
+// the older PromptFunc alongside it lets existing adapters compile until they
+// adopt the new port in MEM-04.
+type PromptWithResumeFunc func(ctx context.Context, sessionID, text, delivery string, resume bool) error
+
 // SessionActiveFunc reports whether sessionID is busy and still alive. A
 // session that no longer exists (HTTP 404) is an error wrapping ErrSessionDead.
 type SessionActiveFunc func(ctx context.Context, sessionID string) (busy bool, alive bool, err error)
@@ -77,6 +84,10 @@ type OpenCodeDeliverer struct {
 	// PromptFunc is the live HTTP port. When set it is tried first, so no
 	// process is spawned for a wake on a service that is already running.
 	PromptFunc PromptFunc
+	// PromptWithResumeFunc is the resume-aware form of the same port. It wins
+	// over PromptFunc when both are set, so the transport gets delivery and
+	// resume from one call. Nil keeps older adapters working unchanged.
+	PromptWithResumeFunc PromptWithResumeFunc
 	// SessionActiveFunc decides queue vs steer before a prompt is sent.
 	SessionActiveFunc SessionActiveFunc
 	// Obligations makes the delivery fact survive a process restart.
@@ -330,8 +341,21 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 		}
 		return d.markDelivered(key, p)
 	}
-	if d.PromptFunc != nil {
-		err := d.PromptFunc(ctx, sessionID, text, delivery)
+	// Both transports must see the same delivery and resume decision. The CLI
+	// fallback carries both in its body. The HTTP port gets them here: use the
+	// resume-aware port when installed, and wrap the legacy one so it keeps
+	// compiling while MEM-04 adopts the new signature.
+	var prompt func(context.Context, string, string, string, bool) error
+	switch {
+	case d.PromptWithResumeFunc != nil:
+		prompt = d.PromptWithResumeFunc
+	case d.PromptFunc != nil:
+		prompt = func(ctx context.Context, sessionID, text, delivery string, _ bool) error {
+			return d.PromptFunc(ctx, sessionID, text, delivery)
+		}
+	}
+	if prompt != nil {
+		err := prompt(ctx, sessionID, text, delivery, resume)
 		switch {
 		case err == nil:
 			return d.markDelivered(key, p)
@@ -367,13 +391,19 @@ func (d *OpenCodeDeliverer) deliverCLI(ctx context.Context, sessionID, text, del
 	if d.Runner != nil {
 		out, err = d.Runner(cliCtx, args...)
 	} else {
-		out, err = exec.CommandContext(cliCtx, "opencode", args...).Output()
+		out, err = exec.CommandContext(cliCtx, "opencode", args...).CombinedOutput()
 	}
 	if err != nil {
-		if sessionNotFound(err, out) {
-			return fmt.Errorf("%w: session %s: %v", ErrSessionDead, sessionID, err)
+		// CombinedOutput keeps stderr in out. Carry it into the error text so
+		// a failed parse or a 404 can be diagnosed from the journal alone.
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			detail = ": " + detail
 		}
-		return fmt.Errorf("wake: opencode api: %w", err)
+		if sessionNotFound(err, out) {
+			return fmt.Errorf("%w: session %s: %v%s", ErrSessionDead, sessionID, err, detail)
+		}
+		return fmt.Errorf("wake: opencode api: %w%s", err, detail)
 	}
 	return verifyAck(out)
 }
@@ -903,7 +933,7 @@ func (a *T202API) run(ctx context.Context, args ...string) ([]byte, error) {
 	if a.T202Runner != nil {
 		return a.T202Runner(ctx, args...)
 	}
-	return exec.CommandContext(ctx, "opencode", args...).Output()
+	return exec.CommandContext(ctx, "opencode", args...).CombinedOutput()
 }
 
 // Prompt admits one session input and returns its message id. mode is the
@@ -1805,7 +1835,7 @@ const (
 var historyANSI = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))`)
 
 func defaultHistorySearchRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).Output()
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
 // runHistorySearch runs one backend. Exit code 1 means no matches for both rg
