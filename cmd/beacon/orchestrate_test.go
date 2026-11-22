@@ -189,14 +189,15 @@ func TestOrchestrateMergeAndRebaseReport(t *testing.T) {
 		t.Fatalf("closed = %q, want [w1]", st.closed)
 	}
 	var result struct {
-		Merged      []int `json:"merged"`
-		NeedsRebase []int `json:"needsRebase"`
+		Merged      []int                    `json:"merged"`
+		NeedsRebase []orchestrator.RebaseRef `json:"needsRebase"`
 	}
 	if err := json.Unmarshal(out.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(result.Merged, []int{42}) || !reflect.DeepEqual(result.NeedsRebase, []int{7}) {
-		t.Fatalf("result = %+v, want merged [42] needsRebase [7]", result)
+	wantRebase := []orchestrator.RebaseRef{{WatchID: "w2", Revision: 1, PR: 7}}
+	if !reflect.DeepEqual(result.Merged, []int{42}) || !reflect.DeepEqual(result.NeedsRebase, wantRebase) {
+		t.Fatalf("result = %+v, want merged [42] needsRebase %+v", result, wantRebase)
 	}
 }
 
