@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,9 +20,14 @@ const attachSessionsFile = "attach-sessions.json"
 // The id outlives a timeout kill, so attach can reopen the same session
 // instead of allocating a new one (ADR 0043 §6). DeadlineAt is the task's hard
 // limit from ADR 0042 §1: reaching it ends the task but never erases the id.
+// Identity records the session id at save time. Resume checks it before
+// opening a session, so a saved record that lost its id cannot open a
+// different one (CCx-10). Records saved before Identity existed keep the old
+// best-effort behaviour.
 type attachSession struct {
 	TaskID     string    `json:"taskID"`
 	SessionID  string    `json:"sessionID"`
+	Identity   string    `json:"identity,omitempty"`
 	DeadlineAt time.Time `json:"deadlineAt,omitempty"`
 	SavedAt    time.Time `json:"savedAt,omitempty"`
 }
@@ -128,7 +134,7 @@ func rememberAttachSession(taskID, sessionID string, now time.Time) error {
 		now = time.Now().UTC()
 	}
 
-	rec := attachSession{TaskID: taskID, SessionID: sessionID, SavedAt: now.UTC()}
+	rec := attachSession{TaskID: taskID, SessionID: sessionID, Identity: sessionID, SavedAt: now.UTC()}
 	if raw := strings.TrimSpace(os.Getenv("BEACON_TASK_DEADLINE")); raw != "" {
 		at, err := time.Parse(time.RFC3339, raw)
 		if err != nil {
@@ -175,25 +181,67 @@ func savedAttachSession(taskID string) (string, error) {
 	return "", nil
 }
 
+// savedAttachIdentity returns the identity recorded with the saved session for
+// taskID. An empty value marks a record saved before Identity existed, so
+// resume keeps its best-effort behaviour (ADR 0043 §6).
+func savedAttachIdentity(taskID string) string {
+	st, err := loadAttachSessions()
+	if err != nil {
+		return ""
+	}
+	key := strings.TrimSpace(taskID)
+	if key == "" {
+		key = st.Last
+	}
+	for _, rec := range st.Sessions {
+		if rec.TaskID == key {
+			return strings.TrimSpace(rec.Identity)
+		}
+	}
+	return ""
+}
+
 // registryResumeSession confirms the saved session id in the durable session
 // registry (WIRING-488). Resume reaches GetSession through the app-layer port,
 // so cmd never opens a database for this lookup. The registry is best effort:
 // when it is absent, reports an error or has no row, attach keeps the id from
 // attach-sessions.json, which ADR 0043 §6 makes the source of truth for resume.
 // A stored id replaces the saved one so both registries converge on one session.
-func registryResumeSession(sessionID string) string {
+//
+// When identity is recorded with the saved session, attach checks it against
+// the saved id and the registry row. A mismatch returns an error, so the caller
+// refuses to open a session built from a substituted id (CCx-10).
+func registryResumeSession(sessionID, identity string) (string, error) {
+	if identity != "" && identity != sessionID {
+		return "", fmt.Errorf("%w: сохранённый identity %q не совпадает с id %q", session.ErrSessionIdentityMismatch, identity, sessionID)
+	}
 	reg := sessionRegistryForSpawn()
 	if reg == nil {
-		return sessionID
+		return sessionID, nil
 	}
-	stored, found, err := reg.Resume(sessionID)
-	if err != nil || !found {
-		return sessionID
+	var (
+		stored session.Session
+		found  bool
+		err    error
+	)
+	if identity != "" {
+		stored, found, err = reg.ResumeIdentified(sessionID)
+	} else {
+		stored, found, err = reg.Resume(sessionID)
+	}
+	if err != nil {
+		if errors.Is(err, session.ErrSessionIdentityMismatch) {
+			return "", err
+		}
+		return sessionID, nil
+	}
+	if !found {
+		return sessionID, nil
 	}
 	if id := strings.TrimSpace(stored.ID); id != "" {
-		return id
+		return id, nil
 	}
-	return sessionID
+	return sessionID, nil
 }
 
 // Journal record kinds used by the fork reverse scan. A compaction record
@@ -282,7 +330,11 @@ func (c *CLI) runAttach(args []string) int {
 			return 2
 		}
 		sessionID = saved
-		sessionID = registryResumeSession(sessionID)
+		sessionID, err = registryResumeSession(sessionID, savedAttachIdentity(taskID))
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon attach: расхождение identity сессии: %v\n", err)
+			return 2
+		}
 	}
 
 	cfg, err := readServiceConfig()

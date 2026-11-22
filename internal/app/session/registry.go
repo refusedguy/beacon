@@ -6,6 +6,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +57,10 @@ var (
 	ErrNoSessionCloser = errors.New("session: store has no session closer")
 	// ErrNoStaleLister means the store cannot list stale sessions.
 	ErrNoStaleLister = errors.New("session: store has no stale session lister")
+	// ErrSessionIdentityMismatch means a registry row belongs to a different
+	// session than the caller asked for. Resuming that row would open another
+	// session than the saved id (CCx-10).
+	ErrSessionIdentityMismatch = errors.New("session: session identity mismatch")
 )
 
 // TaskSessionFinder is the optional port a SessionStore can implement so the
@@ -139,6 +144,21 @@ func (r *SessionRegistry) Resume(id string) (Session, bool, error) {
 		return Session{}, false, ErrEmptyID
 	}
 	return r.store.GetSession(id)
+}
+
+// ResumeIdentified loads id and checks that the row describes that same
+// session. Resume stays best effort for older callers; attach uses this form
+// when the saved record carries an identity (CCx-10). A row with a foreign id
+// returns ErrSessionIdentityMismatch and is not reported as found.
+func (r *SessionRegistry) ResumeIdentified(id string) (Session, bool, error) {
+	stored, found, err := r.Resume(id)
+	if err != nil || !found {
+		return stored, found, err
+	}
+	if strings.TrimSpace(stored.ID) != id {
+		return Session{}, false, fmt.Errorf("%w: requested %q, row %q", ErrSessionIdentityMismatch, id, stored.ID)
+	}
+	return stored, true, nil
 }
 
 // ResumeByTask loads the session spawned for task. Resume alone needs an
