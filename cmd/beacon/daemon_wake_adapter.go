@@ -7,11 +7,15 @@ import (
 	"log"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/infra/observe"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // daemonWakeAdapter is the built-in deliverer the daemon registers. It lives
-// in cmd because it names the wake infra package (ARDH-15 DIP).
+// in cmd because it names the wake infra package (ARDH-15 DIP). Deliver posts
+// through the shared openCodePort and uses the CLI only when no live port is
+// installed (AUD-02).
 type daemonWakeAdapter struct {
 	api *wake.T202API
 }
@@ -39,13 +43,30 @@ func (a *daemonWakeAdapter) Deliver(p wake.T210WakePointer, target wake.T210Targ
 		receipt.Outcome = wake.T210Errored
 		return receipt, err
 	}
-	if a == nil || a.api == nil {
+	if a == nil {
+		receipt.Outcome = wake.T210Errored
+		return receipt, errors.New("daemon: wake adapter is nil")
+	}
+	if port := openCodePort(); port != nil {
+		opts := opencode.StartPromptOptions(p.ObligationID)
+		if err := port.PromptWithOptions(context.Background(), string(target), p.VerdictRef, opts); err != nil {
+			receipt.Outcome = wake.T210Errored
+			return receipt, fmt.Errorf("daemon: HTTP prompt: %w", err)
+		}
+		receipt.Outcome = wake.T210Delivered
+		return receipt, nil
+	}
+	// No live port: the CLI path is the fallback, not a second HTTP attempt.
+	observe.Event(observe.LevelWarn, "daemon_wake_cli_fallback", observe.Fields{
+		"reason": "no live opencode port installed",
+	})
+	if a.api == nil {
 		receipt.Outcome = wake.T210Errored
 		return receipt, errors.New("daemon: wake API is nil")
 	}
 	if _, err := a.api.Prompt(context.Background(), string(target), p.VerdictRef, wake.T202DeliverySteer); err != nil {
 		receipt.Outcome = wake.T210Errored
-		return receipt, err
+		return receipt, fmt.Errorf("daemon: CLI fallback: %w", err)
 	}
 	receipt.Outcome = wake.T210Delivered
 	return receipt, nil
