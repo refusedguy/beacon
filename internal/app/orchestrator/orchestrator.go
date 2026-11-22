@@ -246,6 +246,34 @@ type Store interface {
 	RecordFixAttempt(ctx context.Context, watchID string) error
 }
 
+// WatchCloseConflict reports that a Watch changed after the merge decision.
+// The close is rejected, so the caller must not rewrite the newer record.
+type WatchCloseConflict struct {
+	WatchID string
+	// Revision and HeadSHA are the values the close expected.
+	Revision uint64
+	HeadSHA  string
+	// GotRevision and GotHeadSHA are the values found in the store.
+	GotRevision uint64
+	GotHeadSHA  string
+	// GotStatus is the status found in the store. A head change closes the
+	// Watch with its own reason, so a late merge must not replace that reason.
+	GotStatus string
+}
+
+func (e *WatchCloseConflict) Error() string {
+	return fmt.Sprintf("orchestrator: watch %s close conflict: want revision %d head %s, got revision %d head %s status %s",
+		e.WatchID, e.Revision, e.HeadSHA, e.GotRevision, e.GotHeadSHA, e.GotStatus)
+}
+
+// RevisionedWatchCloser is an optional Store capability. A store that
+// implements it closes a Watch only while the row still matches the revision,
+// head and status the merge decision saw. A store without it keeps the plain
+// CloseWatch path.
+type RevisionedWatchCloser interface {
+	CloseWatchAt(ctx context.Context, watchID string, revision uint64, headSHA string) error
+}
+
 // WatchHolder is an optional Store capability for persisting a dependency
 // hold. A store without it still holds the merge in memory for this pass; the
 // reason just is not visible in beacon_list_running / beacon inspect.
@@ -560,9 +588,15 @@ func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *R
 		observe.ActorError("merge-ledger", w.ID, err)
 		*errs = append(*errs, fmt.Errorf("orchestrator: record merge %s@%d: %w", w.ID, w.Revision, err))
 	}
-	if err := st.CloseWatch(ctx, w.ID); err != nil {
-		observe.ActorError("watch-closer", w.ID, err)
-		*errs = append(*errs, fmt.Errorf("orchestrator: close watch %s: %w", w.ID, err))
+	var closeErr error
+	if closer, ok := st.(RevisionedWatchCloser); ok {
+		closeErr = closer.CloseWatchAt(ctx, w.ID, w.Revision, w.HeadSHA)
+	} else {
+		closeErr = st.CloseWatch(ctx, w.ID)
+	}
+	if closeErr != nil {
+		observe.ActorError("watch-closer", w.ID, closeErr)
+		*errs = append(*errs, fmt.Errorf("orchestrator: close watch %s: %w", w.ID, closeErr))
 	}
 	out.Merged = append(out.Merged, w.PR)
 	out.Actions = append(out.Actions, Action{
