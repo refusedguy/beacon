@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,15 +60,74 @@ type NtfyNotifySink struct {
 	base  string
 	topic string
 	doer  NtfyDoer
+	valid bool
+}
+
+// normalizeNtfyBase validates the endpoint before it can become a request
+// target. Only http and https URLs with a public host are accepted. An empty
+// value uses the public server. The bool reports whether the value is usable.
+func normalizeNtfyBase(raw string) (string, bool) {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if base == "" {
+		return defaultNtfyURL, true
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	host := u.Hostname()
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return "", false
+	}
+	if ip := net.ParseIP(host); ip != nil &&
+		(ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+			ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()) {
+		return "", false
+	}
+	return base, true
+}
+
+// validNtfyTopic accepts the characters ntfy uses in a topic: letters, digits,
+// dash, underscore and dot. Anything else would change the request path.
+func validNtfyTopic(topic string) bool {
+	if topic == "" {
+		return false
+	}
+	for _, r := range topic {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func warnNtfyConfig(name, value string) {
+	observe.Event(observe.LevelWarn, "config.invalid", observe.Fields{
+		"env":   name,
+		"value": value,
+	})
 }
 
 // NewNtfyNotifySink builds a sink. A missing URL falls back to the public ntfy
 // server; a missing doer gets a bounded client so a hung endpoint cannot block
-// the reconcile cycle.
+// the reconcile cycle. An invalid URL or topic is logged and leaves the sink
+// unconfigured, so Notify and Send fail open and no request is made.
 func NewNtfyNotifySink(cfg NtfyConfig) *NtfyNotifySink {
-	base := strings.TrimRight(strings.TrimSpace(cfg.URL), "/")
-	if base == "" {
-		base = defaultNtfyURL
+	base, validURL := normalizeNtfyBase(cfg.URL)
+	topic := strings.TrimSpace(cfg.Topic)
+	validTopic := validNtfyTopic(topic)
+	if strings.TrimSpace(cfg.URL) != "" && !validURL {
+		warnNtfyConfig(NtfyURLEnv, cfg.URL)
+	}
+	if topic != "" && !validTopic {
+		warnNtfyConfig(NtfyTopicEnv, cfg.Topic)
 	}
 	doer := cfg.Doer
 	if doer == nil {
@@ -75,15 +135,16 @@ func NewNtfyNotifySink(cfg NtfyConfig) *NtfyNotifySink {
 	}
 	return &NtfyNotifySink{
 		base:  base,
-		topic: strings.TrimSpace(cfg.Topic),
+		topic: topic,
 		doer:  doer,
+		valid: validURL && validTopic,
 	}
 }
 
-// Configured reports whether a destination topic is set. An unconfigured sink
-// is fail-open: callers get no error and no request is made.
+// Configured reports whether a destination topic is set on a valid sink. An
+// unconfigured sink is fail-open: callers get no error and no request is made.
 func (s *NtfyNotifySink) Configured() bool {
-	return s != nil && s.topic != ""
+	return s != nil && s.valid && s.topic != ""
 }
 
 // Notify implements NotificationSink. The message is redacted before it is
