@@ -101,3 +101,46 @@ func TestMetricsFormatValuesAndJSONAlias(t *testing.T) {
 		})
 	}
 }
+
+// advertisedFormats extracts the values after --format from a catalog Usage
+// string. The catalog writes them as "[--format table|json]".
+func advertisedFormats(usage string) []string {
+	const marker = "--format "
+	i := strings.Index(usage, marker)
+	if i < 0 {
+		return nil
+	}
+	rest := usage[i+len(marker):]
+	if end := strings.IndexByte(rest, ']'); end >= 0 {
+		rest = rest[:end]
+	}
+	return strings.Split(rest, "|")
+}
+
+func TestCatalogFormatsMatchRegistry(t *testing.T) {
+	advertised := map[string][]string{}
+	for _, c := range catalog {
+		if values := advertisedFormats(c.Usage); values != nil {
+			advertised[c.Name] = values
+		}
+	}
+
+	if len(advertised) != len(commandFormats) {
+		t.Fatalf("каталог advertise-ит --format у %d команд, commandFormats содержит %d", len(advertised), len(commandFormats))
+	}
+	for name, values := range advertised {
+		got, ok := commandFormats[name]
+		if !ok {
+			t.Errorf("команда %q advertise-ит --format, но отсутствует в commandFormats", name)
+			continue
+		}
+		if strings.Join(values, ",") != strings.Join(got, ",") {
+			t.Errorf("команда %q: в каталоге %v, в commandFormats %v", name, values, got)
+		}
+	}
+	for name := range commandFormats {
+		if _, ok := advertised[name]; !ok {
+			t.Errorf("commandFormats содержит %q, но каталог не advertise-ит --format", name)
+		}
+	}
+}
