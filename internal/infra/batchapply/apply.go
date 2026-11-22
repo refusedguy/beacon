@@ -102,6 +102,11 @@ const (
 	// stay English as technical terms; the id list is comma separated.
 	staleSkippedFormat  = "StaleSkippedIDs=%s\n"
 	updatedIssuesFormat = "UpdatedIssues=%d\n"
+	// CBX-08: the remaining lists keep the same key style. UpdatedIDs names
+	// the rows whose content changed; the count line above stays unchanged.
+	createdIDsFormat   = "CreatedIDs=%s\n"
+	updatedIDsFormat   = "UpdatedIDs=%s\n"
+	tieKeptLocalFormat = "TieKeptLocalIDs=%s\n"
 )
 
 // CBX-07: an incoming row carries the time its source was changed. A local
@@ -151,6 +156,23 @@ type Options struct {
 	// Force is the explicit overwrite path for a manual run. Automatic
 	// imports leave it false, so a fresh local card is never replaced.
 	Force bool
+	// JSONReport receives the machine-readable import result when set. A nil
+	// writer keeps the text-only contract of existing callers. The report is
+	// always emitted as one JSON object, so a consumer never parses the text
+	// report to learn what the import changed (CBX-08).
+	JSONReport io.Writer
+}
+
+// ImportReport is the machine-readable result of one import. Each list is
+// written even when empty, so a consumer can index it without a nil check.
+// Changes maps an updated id to the field names whose values changed. Created
+// ids carry no changes because their whole content is new.
+type ImportReport struct {
+	CreatedIDs      []string            `json:"CreatedIDs"`
+	UpdatedIDs      []string            `json:"UpdatedIDs"`
+	StaleSkippedIDs []string            `json:"StaleSkippedIDs"`
+	TieKeptLocalIDs []string            `json:"TieKeptLocalIDs"`
+	Changes         map[string][]string `json:"Changes,omitempty"`
 }
 
 type batch struct {
@@ -555,9 +577,14 @@ type runner struct {
 	now      func() time.Time
 	yield    func(time.Duration)
 	commit   func(root string, cards, adrs, evals int) error
-	// staleSkippedIDs and updatedIssues are filled by the two freshness
-	// checks and printed once by Run after the write pass.
+	// The four lists and the change map are filled by the freshness checks
+	// and printed once by Run after the write pass. They back both the text
+	// lines and the JSON report, so the two views can never disagree.
+	createdIDs      []string
+	updatedIDs      []string
 	staleSkippedIDs []string
+	tieKeptLocalIDs []string
+	changes         map[string][]string
 	updatedIssues   int
 }
 
@@ -651,23 +678,50 @@ func (r *runner) writeChunked(root string, entries []artifactEntry, cards, adrs,
 			// CBX-07: recheck in the same window that publishes the file.
 			// A local edit that landed after the prefilter is caught here,
 			// before any byte reaches disk.
-			local, statErr := os.Stat(filepath.Join(root, e.path))
+			path := filepath.Join(root, e.path)
+			local, statErr := os.Stat(path)
 			exists := statErr == nil
-			if exists && !r.opts.Force && !e.updatedAt.IsZero() && staleAgainst(local.ModTime(), e.updatedAt) {
-				r.recordStaleSkipped(e.id)
-				continue
+			var localText string
+			if exists && !e.updatedAt.IsZero() {
+				if raw, err := os.ReadFile(path); err == nil {
+					localText = string(raw)
+				}
+			}
+			if exists && !r.opts.Force && !e.updatedAt.IsZero() {
+				if staleAgainst(local.ModTime(), e.updatedAt) {
+					r.recordStaleSkipped(e.id)
+					continue
+				}
+				// CBX-08: an equal timestamp is never a write. Different text
+				// is a tie: local bytes stay on disk and only auxiliary data
+				// (facts and the ADR index, built from the entry set) merges.
+				// Identical text is a no-op, so a repeat import reports nothing.
+				if local.ModTime().Equal(e.updatedAt) {
+					if localText != e.content {
+						r.recordTieKeptLocal(e.id)
+					}
+					continue
+				}
 			}
 			if !e.updatedAt.IsZero() {
-				if err := r.writeFresh(root, e.path, e.content); err != nil {
+				if err := r.writeFresh(root, e.path, e.content, e.updatedAt); err != nil {
 					return err
 				}
-				if exists && !r.opts.DryRun {
-					r.updatedIssues++
+				if !r.opts.DryRun {
+					if exists {
+						r.recordUpdated(e.id, changedFields(localText, e.content))
+						r.updatedIssues++
+					} else {
+						r.recordCreated(e.id)
+					}
 				}
 				continue
 			}
 			if err := r.writeFile(root, e.path, e.content); err != nil {
 				return err
+			}
+			if !r.opts.DryRun && !exists {
+				r.recordCreated(e.id)
 			}
 		}
 		held := r.now().Sub(started)
@@ -813,6 +867,103 @@ func (r *runner) recordStaleSkipped(id string) {
 	r.staleSkippedIDs = append(r.staleSkippedIDs, id)
 }
 
+// appendUnique keeps one id per list in encounter order. A row is seen at most
+// once in each pass, but the guard makes the report stable if a caller feeds a
+// duplicate id.
+func appendUnique(ids []string, id string) []string {
+	for _, seen := range ids {
+		if seen == id {
+			return ids
+		}
+	}
+	return append(ids, id)
+}
+
+func (r *runner) recordCreated(id string) {
+	r.createdIDs = appendUnique(r.createdIDs, id)
+}
+
+func (r *runner) recordTieKeptLocal(id string) {
+	r.tieKeptLocalIDs = appendUnique(r.tieKeptLocalIDs, id)
+}
+
+// recordUpdated stores one overwritten id and the field names that changed.
+// updatedIssues keeps its CBX-07 count so the existing text line is unchanged.
+func (r *runner) recordUpdated(id string, fields []string) {
+	r.updatedIDs = appendUnique(r.updatedIDs, id)
+	if r.changes == nil {
+		r.changes = map[string][]string{}
+	}
+	r.changes[id] = fields
+}
+
+// changedFields names the lines whose values differ between two rendered
+// documents. Rendered cards, ADRs and evals all use "Name: value" lines, so one
+// comparison covers every artifact type. The result is sorted for a stable
+// report. A line that disappeared is counted too, so a deleted field is not a
+// silent change.
+func changedFields(local, incoming string) []string {
+	parse := func(text string) map[string]string {
+		fields := map[string]string{}
+		for _, line := range strings.Split(text, "\n") {
+			line = strings.TrimSpace(line)
+			i := strings.Index(line, ": ")
+			if i <= 0 {
+				continue
+			}
+			name := strings.TrimSpace(line[:i])
+			if name != "" {
+				fields[name] = strings.TrimSpace(line[i+2:])
+			}
+		}
+		return fields
+	}
+	before, after := parse(local), parse(incoming)
+	seen := map[string]bool{}
+	var out []string
+	for name, value := range after {
+		if before[name] != value && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for name := range before {
+		if _, ok := after[name]; !ok && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// importReport snapshots the four lists and the change map. Empty lists stay
+// empty rather than nil so a JSON consumer can index them directly.
+func (r *runner) importReport() ImportReport {
+	empty := func(ids []string) []string {
+		if ids == nil {
+			return []string{}
+		}
+		return append([]string(nil), ids...)
+	}
+	return ImportReport{
+		CreatedIDs:      empty(r.createdIDs),
+		UpdatedIDs:      empty(r.updatedIDs),
+		StaleSkippedIDs: empty(r.staleSkippedIDs),
+		TieKeptLocalIDs: empty(r.tieKeptLocalIDs),
+		Changes:         r.changes,
+	}
+}
+
+// emitImportReport writes one JSON object when the caller supplied a writer.
+// The text lines and this object come from the same runner fields.
+func (r *runner) emitImportReport() {
+	if r.opts.JSONReport == nil {
+		return
+	}
+	_ = json.NewEncoder(r.opts.JSONReport).Encode(r.importReport())
+}
+
 // prefilterStale drops incoming rows older than the local artifact before any
 // hash, facts or index is built. The same rule runs again per file in
 // writeChunked, so a local edit landing after this pass is still caught.
@@ -835,8 +986,10 @@ func (r *runner) prefilterStale(root string, entries []artifactEntry) []artifact
 
 // writeFresh publishes a timestamped row. The freshness check has already
 // passed, so the never-overwrite rule for untimestamped cards does not apply:
-// a newer incoming row replaces the local file.
-func (r *runner) writeFresh(root, rel, content string) error {
+// a newer incoming row replaces the local file. The file mtime is set to the
+// incoming timestamp so an unchanged row is a no-op on the next import instead
+// of looking stale against the time of its own write.
+func (r *runner) writeFresh(root, rel, content string, updatedAt time.Time) error {
 	path := filepath.Join(root, rel)
 	if !r.opts.Quiet {
 		fmt.Fprintln(r.out, " ", path)
@@ -847,7 +1000,13 @@ func (r *runner) writeFresh(root, rel, content string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return err
+	}
+	if !updatedAt.IsZero() {
+		return os.Chtimes(path, updatedAt, updatedAt)
+	}
+	return nil
 }
 
 func renderADR(a adr) string {
@@ -1368,9 +1527,13 @@ func Run(opts Options, out, errOut io.Writer) int {
 		return 1
 	}
 	if !opts.DryRun {
+		r.printf(createdIDsFormat, strings.Join(r.createdIDs, ","))
+		r.printf(updatedIDsFormat, strings.Join(r.updatedIDs, ","))
 		r.printf(staleSkippedFormat, strings.Join(r.staleSkippedIDs, ","))
+		r.printf(tieKeptLocalFormat, strings.Join(r.tieKeptLocalIDs, ","))
 		r.printf(updatedIssuesFormat, r.updatedIssues)
 	}
+	r.emitImportReport()
 	if err := r.applyClosures(root, closures); err != nil {
 		r.errf("%v\n", err)
 		return 1
