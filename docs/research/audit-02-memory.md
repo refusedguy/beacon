@@ -46,15 +46,15 @@ AGENTS.md требует измерения до выбора подхода. Д
 | Карточка | Направление | OwnerFiles | Зависимости | Волна |
 | --- | --- | --- | --- | --- |
 | MEM-01 | а | `internal/infra/opencode/client.go`, `internal/infra/opencode/client_test.go` | AUTOSP-02 | P0 |
-| MEM-02 | г | `cmd/beacon/watch.go`, `cmd/beacon/agents.go` | AUTOSP-08 | P0 |
+| MEM-02 | г | `cmd/beacon/watch.go`, `cmd/beacon/agents.go` | AUTOSP-08, TUI-03 | P0 |
 | MEM-03 | г | `internal/infra/wake/deliver.go`, `internal/infra/wake/deliver_test.go` | нет | P0 |
-| MEM-04 | а, в | `cmd/beacon/mcp.go`, `cmd/beacon/daemon.go` | AUTOSP-04, AUTOSP-11 | P0 |
+| MEM-04 | а, в | `cmd/beacon/mcp.go`, `cmd/beacon/daemon.go` | AUTOSP-04, AUTOSP-11, TUI-03, TUI-04, PROTO-03 | P0 |
 | MEM-05 | а | `cmd/beacon/gc.go`, `cmd/beacon/gc_test.go` | нет | P1 |
 | MEM-06 | б | `internal/app/taskcli/service.go`, `internal/app/taskcli/service_test.go` | AUTOSP-06 | P1 |
 | MEM-07 | б | `internal/infra/worktree/gc.go` | нет | P0, `dropped` |
 | MEM-08 | docs | `docs/runbooks/observability.md` | нет | P1 |
 
-## Пересечение с audit-01
+## Пересечение с другими батчами
 
 Батч `docs/research/audit-01-batch.json` уже лежит в `origin/main`. Его карточки AUTOSP владеют некоторыми файлами из таблицы выше. Чтобы в одной волне не было двух владельцев файла, MEM-карточки получили зависимости:
 
@@ -62,8 +62,10 @@ AGENTS.md требует измерения до выбора подхода. Д
 - MEM-02 ждёт AUTOSP-08, которая правит `cmd/beacon/agents.go`.
 - MEM-04 ждёт AUTOSP-04 для `cmd/beacon/mcp.go` и AUTOSP-11 для решения о запуске по RSS.
 - MEM-06 ждёт AUTOSP-06 для `internal/app/taskcli/service.go`.
+- MEM-02 ждёт TUI-03 из audit-03, которая правит `cmd/beacon/watch.go`.
+- MEM-04 ждёт TUI-04 и PROTO-03 из audit-03 и audit-04, которые закрепляют `cmd/beacon/mcp.go`.
 
-Зависимости задают последовательные волны. Запускать MEM и AUTOSP с пересекающимися OwnerFiles параллельно нельзя.
+Батчи audit-03 и audit-04 вошли в `origin/main` после первой версии этого аудита. Их ID и файлы проверены по `docs/research/audit-03-batch.json` и `docs/research/audit-04-batch.json`. Зависимости задают последовательные волны. Запускать MEM и AUTOSP с пересекающимися OwnerFiles параллельно нельзя.
 
 OwnerFiles в одной волне не пересекаются. Слои соблюдены: `cmd` меняет только `cmd` и порты `internal/infra`, `internal/app` меняет `internal/app`, инфраструктурные пакеты меняют только свои файлы. Границы layers.json карточки не нарушают.
 
