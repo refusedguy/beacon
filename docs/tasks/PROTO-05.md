@@ -1,5 +1,6 @@
 # PROTO-05. Eval на дрейф контракта и стоимость tools/list
-Статус: todo
+Статус: done
+Premise: PR #1464, коммит aeb250dac07b422e3bdf8be1e89814757217045b, описал eval по дрейфу каталога и размеру tools/list. git merge-base --is-ancestor aeb250dac07b422e3bdf8be1e89814757217045b origin/main вернул 0.
 Фаза: P2
 Тип: eval
 Владелец файлов: docs/evals/orchestrator-workload.md, docs/evals/orchestrator-decision.md

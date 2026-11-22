@@ -1,5 +1,6 @@
 # INTG-03. Добавить CRUD расписаний в SQLite и убрать schedules.json
-Статус: todo
+Статус: done
+Premise: PR #1460, коммит f0af1c579b4064d6622c5515b629ebac000b63b8, добавил CRUD расписаний поверх таблицы schedules в store. git merge-base --is-ancestor f0af1c579b4064d6622c5515b629ebac000b63b8 origin/main вернул 0.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/schedules.go, internal/infra/store/schedules_test.go

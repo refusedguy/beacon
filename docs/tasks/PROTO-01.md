@@ -1,5 +1,6 @@
 # PROTO-01. Закрепить одиннадцать advertised-имен и проверить remote-карту
-Статус: todo
+Статус: done
+Premise: PR #1443, коммит 9483e105fb8c8aec93e9e3ac17436b7f10080086, закрепил один каталог tools/list для контракта и remote-режима. git merge-base --is-ancestor 9483e105fb8c8aec93e9e3ac17436b7f10080086 origin/main вернул 0.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/contract_test.go, tests/e2e/e2e_test.go

@@ -1,5 +1,6 @@
 # BVF-01. Развести конфликты owner_files между пакетами аудитов в одной волне
-Статус: todo
+Статус: done
+Premise: PR #1474, коммит 174307e30cb95d1869fbcb3d132d04507765816f, развёл семь пересечений owner_files между пакетами аудитов. git merge-base --is-ancestor 174307e30cb95d1869fbcb3d132d04507765816f origin/main вернул 0.
 Фаза: P0
 Тип: task
 Владелец файлов: docs/research/audit-01-batch.json, docs/research/audit-02-batch.json, docs/research/audit-03-batch.json, docs/research/audit-04-batch.json

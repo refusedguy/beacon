@@ -1,5 +1,6 @@
 # PROTO-03. Смонтировать аутентифицированный /mcp в один HTTP-сервер
-Статус: todo
+Статус: done
+Premise: PR #1481, коммит 8608917dab33456083ef9f510e8b883e1309a02e, подключил authenticated /mcp к общему HTTP-слушателю через ExtraRoutes. git merge-base --is-ancestor 8608917dab33456083ef9f510e8b883e1309a02e origin/main вернул 0.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/server/mcp.go, internal/infra/mcp/client.go
