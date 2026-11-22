@@ -207,13 +207,24 @@ type DecisionRecord struct {
 // while a different decision for an already answered Watch is a conflict. It
 // is safe for concurrent use.
 type DecisionRegistry struct {
-	mu      sync.Mutex
-	records map[string]DecisionRecord
+	mu       sync.Mutex
+	records  map[string]DecisionRecord
+	inFlight map[string]*decisionFlight
+}
+
+// decisionFlight reserves a watchID while resume runs outside the registry
+// lock. A Decide call that finds an active flight waits on done instead of
+// running resume a second time.
+type decisionFlight struct {
+	done chan struct{}
 }
 
 // NewDecisionRegistry builds an empty decision registry.
 func NewDecisionRegistry() *DecisionRegistry {
-	return &DecisionRegistry{records: make(map[string]DecisionRecord)}
+	return &DecisionRegistry{
+		records:  make(map[string]DecisionRecord),
+		inFlight: make(map[string]*decisionFlight),
+	}
 }
 
 // Lookup returns the decision recorded for watchID. The bool is false when no
@@ -228,33 +239,58 @@ func (r *DecisionRegistry) Lookup(watchID string) (DecisionRecord, bool) {
 	return rec, ok
 }
 
-// Decide records rec for watchID and runs resume at most once. The resume
-// callback runs while the registry lock is held so two concurrent decisions
-// cannot resume the same Watch twice. It returns the stored record and whether
-// resume ran. An identical repeat returns the stored record with applied false;
-// a conflicting decision is refused with CodeInvalidInput.
+// Decide records rec for watchID and runs resume at most once. resume runs
+// without the registry lock, so a callback that calls back into the registry
+// cannot deadlock and Lookup never waits for a delivery. The watchID is
+// reserved under the lock while resume runs; a concurrent Decide for the same
+// watchID waits for that reservation to clear, then reads the recorded result.
+// It returns the stored record and whether resume ran. An identical repeat
+// returns the stored record with applied false; a conflicting decision is
+// refused with CodeInvalidInput.
 func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume func() (uint64, error)) (DecisionRecord, bool, error) {
 	if r == nil {
 		return DecisionRecord{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: decision registry is nil")
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.records == nil {
-		r.records = make(map[string]DecisionRecord)
-	}
-	if existing, ok := r.records[watchID]; ok {
-		if existing.Decision != rec.Decision || existing.DecisionID != rec.DecisionID {
-			return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: a different decision was already recorded for this Watch")
+	for {
+		r.mu.Lock()
+		if r.records == nil {
+			r.records = make(map[string]DecisionRecord)
 		}
-		return existing, false, nil
+		if r.inFlight == nil {
+			r.inFlight = make(map[string]*decisionFlight)
+		}
+		if existing, ok := r.records[watchID]; ok {
+			if existing.Decision != rec.Decision || existing.DecisionID != rec.DecisionID {
+				r.mu.Unlock()
+				return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: a different decision was already recorded for this Watch")
+			}
+			r.mu.Unlock()
+			return existing, false, nil
+		}
+		if flight, ok := r.inFlight[watchID]; ok {
+			r.mu.Unlock()
+			<-flight.done
+			continue
+		}
+		flight := &decisionFlight{done: make(chan struct{})}
+		r.inFlight[watchID] = flight
+		r.mu.Unlock()
+
+		revision, err := resume()
+
+		r.mu.Lock()
+		delete(r.inFlight, watchID)
+		if err != nil {
+			r.mu.Unlock()
+			close(flight.done)
+			return DecisionRecord{}, false, err
+		}
+		rec.Revision = revision
+		r.records[watchID] = rec
+		r.mu.Unlock()
+		close(flight.done)
+		return rec, true, nil
 	}
-	revision, err := resume()
-	if err != nil {
-		return DecisionRecord{}, false, err
-	}
-	rec.Revision = revision
-	r.records[watchID] = rec
-	return rec, true, nil
 }
 
 // failedCheckNames projects the failed checks of an ack onto the string slice

@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1451,5 +1453,138 @@ func TestSQLObligationStamperClaimedAtIdempotent(t *testing.T) {
 	}
 	if stored := load(); !stored.ClaimedAt.Equal(first) {
 		t.Errorf("claimedAt overwritten on repeat: %v", stored.ClaimedAt)
+	}
+}
+
+// TestDecisionRegistryReentrantResume proves a resume callback may call back
+// into the same registry. The old code ran resume under r.mu, so a Lookup from
+// resume deadlocked (CC-04).
+func TestDecisionRegistryReentrantResume(t *testing.T) {
+	r := NewDecisionRegistry()
+	const watchID = "watch-reentrant"
+	rec := DecisionRecord{
+		WatchID:    watchID,
+		Decision:   DecisionApprove,
+		DecisionID: "decision-1",
+		ResumedAt:  time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC),
+	}
+
+	type outcome struct {
+		rec     DecisionRecord
+		applied bool
+		err     error
+	}
+	out := make(chan outcome, 1)
+	go func() {
+		got, applied, err := r.Decide(watchID, rec, func() (uint64, error) {
+			// Reenter the registry while resume runs. This must not deadlock.
+			if _, ok := r.Lookup(watchID); ok {
+				return 0, errors.New("decision recorded before resume finished")
+			}
+			return 42, nil
+		})
+		out <- outcome{got, applied, err}
+	}()
+
+	select {
+	case got := <-out:
+		if got.err != nil {
+			t.Fatalf("Decide: %v", got.err)
+		}
+		if !got.applied || got.rec.Revision != 42 {
+			t.Fatalf("Decide = %+v applied %v, want revision 42 and applied", got.rec, got.applied)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Decide deadlocked on reentrant Lookup")
+	}
+	if stored, ok := r.Lookup(watchID); !ok || stored.Revision != 42 {
+		t.Fatalf("Lookup after Decide = %+v ok %v", stored, ok)
+	}
+	if _, _, err := r.Decide(watchID, DecisionRecord{
+		WatchID: watchID, Decision: DecisionReject, DecisionID: "decision-2",
+	}, func() (uint64, error) {
+		t.Fatal("resume must not run for a conflicting decision")
+		return 0, nil
+	}); err == nil {
+		t.Fatal("conflicting decision was accepted")
+	}
+}
+
+// TestDecisionRegistryParallelDecideResumesOnce proves concurrent Decide calls
+// for one Watch run resume exactly once and observe the same record (CC-04).
+func TestDecisionRegistryParallelDecideResumesOnce(t *testing.T) {
+	r := NewDecisionRegistry()
+	const watchID = "watch-parallel"
+	const callers = 8
+	rec := DecisionRecord{WatchID: watchID, Decision: DecisionApprove, DecisionID: "decision-parallel"}
+
+	entered := make(chan struct{}, callers)
+	release := make(chan struct{})
+	var resumes int32
+
+	type outcome struct {
+		rec     DecisionRecord
+		applied bool
+		err     error
+	}
+	out := make(chan outcome, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			got, applied, err := r.Decide(watchID, rec, func() (uint64, error) {
+				atomic.AddInt32(&resumes, 1)
+				entered <- struct{}{}
+				<-release
+				return 77, nil
+			})
+			out <- outcome{got, applied, err}
+		}()
+	}
+
+	<-entered
+	close(release)
+
+	appliedCount := 0
+	for i := 0; i < callers; i++ {
+		select {
+		case got := <-out:
+			if got.err != nil {
+				t.Fatalf("Decide: %v", got.err)
+			}
+			if got.rec.Revision != 77 || got.rec.Decision != DecisionApprove {
+				t.Fatalf("Decide record = %+v", got.rec)
+			}
+			if got.applied {
+				appliedCount++
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("parallel Decide deadlocked")
+		}
+	}
+	if resumes != 1 {
+		t.Fatalf("resume called %d times, want 1", resumes)
+	}
+	if appliedCount != 1 {
+		t.Fatalf("applied on %d calls, want 1", appliedCount)
+	}
+}
+
+// TestDecisionRegistryResumeErrorReleasesReservation proves a failed resume
+// does not leave the watchID reserved (CC-04).
+func TestDecisionRegistryResumeErrorReleasesReservation(t *testing.T) {
+	r := NewDecisionRegistry()
+	const watchID = "watch-error"
+	rec := DecisionRecord{WatchID: watchID, Decision: DecisionApprove, DecisionID: "decision-error"}
+	wantErr := errors.New("delivery failed")
+	if _, applied, err := r.Decide(watchID, rec, func() (uint64, error) {
+		return 0, wantErr
+	}); !errors.Is(err, wantErr) || applied {
+		t.Fatalf("first Decide applied %v err %v", applied, err)
+	}
+	if _, ok := r.Lookup(watchID); ok {
+		t.Fatal("failed resume recorded a decision")
+	}
+	got, applied, err := r.Decide(watchID, rec, func() (uint64, error) { return 9, nil })
+	if err != nil || !applied || got.Revision != 9 {
+		t.Fatalf("retry Decide = %+v applied %v err %v", got, applied, err)
 	}
 }
