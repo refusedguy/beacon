@@ -168,12 +168,26 @@ func (p githubPRProvider) ListComments(ctx context.Context, repo string, number 
 	return out, nil
 }
 
+// Merge lands a pull request after checking its head SHA and the merge reply.
+// The provider port keeps its single-error contract; the GitHub reason travels
+// inside the error so the caller prints why the merge did not land.
 func (p githubPRProvider) Merge(ctx context.Context, repo string, number int) error {
 	owner, name, err := splitSlug(repo)
 	if err != nil {
 		return err
 	}
-	return p.client.MergePR(ctx, owner, name, number)
+	state, err := p.client.PRState(ctx, owner, name, number)
+	if err != nil {
+		return fmt.Errorf("github pr merge %s#%d: head SHA: %w", repo, number, err)
+	}
+	result, err := p.client.MergePR(ctx, owner, name, number, state.HeadSHA)
+	if err != nil {
+		if result.Reason != "" {
+			return fmt.Errorf("github pr merge %s#%d: %s: %w", repo, number, result.Reason, err)
+		}
+		return fmt.Errorf("github pr merge %s#%d: %w", repo, number, err)
+	}
+	return nil
 }
 
 func splitSlug(repo string) (string, string, error) {
