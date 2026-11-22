@@ -604,3 +604,201 @@ func TestWriteFileNeverOverwritesExistingCard(t *testing.T) {
 		t.Fatalf("existing card changed: got %q, want %q", got, existing)
 	}
 }
+
+// BVF-04. production-валидатор в apply.go уже отклоняет невалидные type,
+// phase, status и id. Здесь проверяются два недостающих правила owner_file:
+// файл обязан существовать в дереве и не может быть закреплён за двумя
+// карточками одной фазы. Generated-документы FACTS.md и adrs/README.md
+// остаются исключением: они пересобираются из исходников и не лежат в git.
+const (
+	missingOwnerFileFormat = "несуществующий owner_file: карточка %s, фаза %s, файл %s\n"
+	overlapOwnerFileFormat = "пересечение owner_files в фазе %s: файл %s, карточки %s и %s\n"
+)
+
+// batchPackProblems объединяет существующую проверку полей с проверкой
+// owner_files. Порядок детерминирован: batchы идут в порядке загрузки,
+// карточки и файлы в порядке объявления. root задаёт каталог дерева, в котором
+// ищутся owner_files.
+func batchPackProblems(root string, batches []batch) []string {
+	problems := append([]string(nil), cardFieldProblems(batches)...)
+	problems = append(problems, cardIDProblems(batches)...)
+	seen := map[string]string{}
+	for _, b := range batches {
+		for _, c := range b.Cards {
+			for _, owner := range c.OwnerFiles {
+				owner = filepath.ToSlash(strings.TrimSpace(owner))
+				if owner == "" || derivedArtifact(owner) {
+					continue
+				}
+				clean := filepath.Clean(owner)
+				if filepath.IsAbs(owner) || clean == ".." || strings.HasPrefix(clean, "../") {
+					problems = append(problems, fmt.Sprintf(missingOwnerFileFormat, c.ID, c.Phase, owner))
+					continue
+				}
+				info, err := os.Stat(filepath.Join(root, filepath.FromSlash(clean)))
+				if err != nil || info.IsDir() {
+					problems = append(problems, fmt.Sprintf(missingOwnerFileFormat, c.ID, c.Phase, owner))
+					continue
+				}
+				key := c.Phase + "\x00" + clean
+				if first, ok := seen[key]; ok {
+					problems = append(problems, fmt.Sprintf(overlapOwnerFileFormat, c.Phase, clean, first, c.ID))
+					continue
+				}
+				seen[key] = c.ID
+			}
+		}
+	}
+	return problems
+}
+
+// TestBatchPackGateRejectsInvalidOwnerFiles проверяет гейт на синтетических
+// пакетах. Валидный пакет проходит; отсутствующий файл, каталог вместо файла,
+// выход за пределы дерева и пересечение внутри фазы отклоняются. Один и тот же
+// файл в разных фазах разрешён: волны идут последовательно.
+func TestBatchPackGateRejectsInvalidOwnerFiles(t *testing.T) {
+	setup := func(t *testing.T) string {
+		t.Helper()
+		root := t.TempDir()
+		for _, rel := range []string{"internal/a.go", "internal/b.go"} {
+			path := filepath.Join(root, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("package internal\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+
+	for _, tc := range []struct {
+		name  string
+		cards []card
+		want  []string
+	}{
+		{
+			name: "valid pack passes",
+			cards: []card{
+				{ID: "A", Phase: "P0", Type: "task", Status: "todo", OwnerFiles: []string{"internal/a.go"}},
+				{ID: "B", Phase: "P0", Type: "task", Status: "todo", OwnerFiles: []string{"internal/b.go"}},
+			},
+		},
+		{
+			name: "missing file rejected",
+			cards: []card{
+				{ID: "A", Phase: "P0", OwnerFiles: []string{"internal/a.go", "internal/gone.go"}},
+			},
+			want: []string{fmt.Sprintf(missingOwnerFileFormat, "A", "P0", "internal/gone.go")},
+		},
+		{
+			name: "directory is not an owner file",
+			cards: []card{
+				{ID: "A", Phase: "P0", OwnerFiles: []string{"internal"}},
+			},
+			want: []string{fmt.Sprintf(missingOwnerFileFormat, "A", "P0", "internal")},
+		},
+		{
+			name: "path outside tree rejected",
+			cards: []card{
+				{ID: "A", Phase: "P0", OwnerFiles: []string{"../../etc/passwd"}},
+			},
+			want: []string{fmt.Sprintf(missingOwnerFileFormat, "A", "P0", "../../etc/passwd")},
+		},
+		{
+			name: "overlap inside one phase rejected",
+			cards: []card{
+				{ID: "A", Phase: "P0", OwnerFiles: []string{"internal/a.go"}},
+				{ID: "B", Phase: "P0", OwnerFiles: []string{"internal/a.go"}},
+			},
+			want: []string{fmt.Sprintf(overlapOwnerFileFormat, "P0", "internal/a.go", "A", "B")},
+		},
+		{
+			name: "same file in different phases allowed",
+			cards: []card{
+				{ID: "A", Phase: "P0", OwnerFiles: []string{"internal/a.go"}},
+				{ID: "B", Phase: "P1", OwnerFiles: []string{"internal/a.go"}},
+			},
+		},
+		{
+			name: "generated docs stay exempt",
+			cards: []card{
+				{ID: "A", Phase: "P0", OwnerFiles: []string{"docs/FACTS.md"}},
+				{ID: "B", Phase: "P0", OwnerFiles: []string{"docs/adrs/README.md"}},
+			},
+		},
+		{
+			name: "existing field validation still runs",
+			cards: []card{
+				{ID: "A", Phase: "P9", Type: "spike", Status: "closed", OwnerFiles: []string{"internal/a.go"}},
+			},
+			want: []string{
+				"недопустимое значение поля type: spike\n",
+				"недопустимое значение поля phase: P9\n",
+				"недопустимое значение поля status: closed\n",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := setup(t)
+			got := batchPackProblems(root, []batch{{Cards: tc.cards}})
+			if len(got) != len(tc.want) {
+				t.Fatalf("problems = %q, want %q", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("problem %d = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestBatchPackGateReadsEveryJSON proves the gate reads every research JSON in
+// a directory instead of one hard-coded file. A Markdown file nearby is not a
+// pack and must be ignored. Both files reach the same validator, so an invalid
+// pack sitting next to a valid one still fails the gate.
+func TestBatchPackGateReadsEveryJSON(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "research")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, filepath.FromSlash("internal/a.go"))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("package internal\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"01-good-batch.json": `{"cards":[{"id":"A","phase":"P0","type":"task","status":"todo","owner_files":["internal/a.go"]}]}`,
+		"02-bad-batch.json":  `{"cards":[{"id":"B","phase":"P0","type":"task","status":"todo","owner_files":["internal/a.go","internal/gone.go"]}]}`,
+		"notes.md":           "not a batch",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	batches, loadProblems := loadBatches(dir)
+	if len(loadProblems) != 0 {
+		t.Fatalf("loadProblems = %q, want none", loadProblems)
+	}
+	if len(batches) != 2 {
+		t.Fatalf("loaded %d batches, want 2", len(batches))
+	}
+	got := batchPackProblems(root, batches)
+	want := []string{
+		fmt.Sprintf(overlapOwnerFileFormat, "P0", "internal/a.go", "A", "B"),
+		fmt.Sprintf(missingOwnerFileFormat, "B", "P0", "internal/gone.go"),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("problems = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("problem %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}

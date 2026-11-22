@@ -77,6 +77,15 @@ jobs:
           set -euo pipefail
           go test ./...
 
+      # BVF-04. Пакеты batch JSON задают содержимое мержа. Невалидные поля,
+      # несуществующий owner_file или два владельца одного файла в фазе
+      # проваливают обязательную проверку test, а не попадают в main.
+      - name: Validate batch packs
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./internal/infra/batchapply -run '^TestBatchPack' -count=1 -v
+
   # BCX-52. e2e возвращается в обязательный путь. tools/list сверяется с
   # общим набором имён из internal/infra/mcp, поэтому расхождение в числе
   # инструментов падает здесь, а не остаётся необязательным предупреждением.
