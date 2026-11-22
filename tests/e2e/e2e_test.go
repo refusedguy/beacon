@@ -1088,8 +1088,12 @@ type cycleDaemon struct {
 }
 
 // decide computes the verdict from observed facts through the real engine.
+// Evaluate applies the compiled-in ShipFacts formula (ADR 0061 item 2): a green
+// rollup without build, audit and tdd/trivial facts stays watching. EvaluatePR
+// deliberately skips that formula, so it cannot serve a daemon whose verdict
+// must follow the observed facts.
 func (d cycleDaemon) decide(w domain.Watch, at time.Time) (domain.Verdict, []domain.WakeTarget) {
-	return domain.EvaluatePR(d.observe(w).snapshot(w, at), w.Policy)
+	return domain.Evaluate(d.observe(w).snapshot(w, at), w.Policy)
 }
 
 // tick is one daemon poll: decide from facts, then commit the verdict, the
