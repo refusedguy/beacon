@@ -1257,3 +1257,171 @@ func Run(opts Options, out, errOut io.Writer) int {
 	}
 	return 0
 }
+
+// CA-08 (docs/research/comp-aider.md, aider/coders/editblock_coder.py:602-630
+// and :82-124): a search/replace block that does not match returns a reason
+// and similar lines instead of a bare refusal. Successful blocks are marked
+// and never sent again. Similar lines are advice only; the edit cascade
+// (CA-03) decides success by exact match and never applies a fuzzy match.
+// Technical tokens stay English, prose stays Russian (HD-053, ADR 0304).
+
+// editSimilarityThreshold is the aider threshold for a "did you mean" line.
+const editSimilarityThreshold = 0.6
+
+// editFailureCategory names why one edit block did not apply. The values are
+// English technical tokens so a caller can branch on them.
+type editFailureCategory string
+
+const (
+	// editCategoryFailedBlock means no file line reached the threshold.
+	editCategoryFailedBlock editFailureCategory = "failed-block"
+	// editCategoryAlreadyApplied means the REPLACE text is already in the file.
+	editCategoryAlreadyApplied editFailureCategory = "already-applied"
+)
+
+// editBlock is one search/replace pair submitted by an agent.
+type editBlock struct {
+	Index   int    `json:"index"`
+	Search  string `json:"search"`
+	Replace string `json:"replace"`
+}
+
+// editBlockResult is the outcome of one block. An applied block has applied
+// true and no category. A failed block has a category and up to limit similar
+// lines as advice.
+type editBlockResult struct {
+	Index    int                 `json:"index"`
+	Applied  bool                `json:"applied"`
+	Category editFailureCategory `json:"category,omitempty"`
+	Similar  []string            `json:"similar,omitempty"`
+}
+
+// editResponse is the structured reply for a batch of blocks. Resend carries
+// only failed-block indexes that need a corrected edit. Applied blocks and
+// already-applied blocks are never resent.
+type editResponse struct {
+	Results []editBlockResult `json:"results"`
+	Resend  []int             `json:"resend"`
+}
+
+// normalizeEditLine collapses whitespace runs to one space and trims the
+// ends. An indent shift or a different number of spaces then compares equal.
+// It is used for scoring and the already-applied check only, never to apply
+// an edit.
+func normalizeEditLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// editLineSimilarity returns a ratio in [0,1] for two lines using the longest
+// common subsequence of their normalized forms. An exact normalized match
+// scores 1; two lines with nothing in common score 0.
+func editLineSimilarity(a, b string) float64 {
+	a, b = normalizeEditLine(a), normalizeEditLine(b)
+	if a == b {
+		return 1
+	}
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for _, ac := range a {
+		for j, bc := range b {
+			if ac == bc {
+				cur[j+1] = prev[j] + 1
+			} else if prev[j+1] >= cur[j] {
+				cur[j+1] = prev[j+1]
+			} else {
+				cur[j+1] = cur[j]
+			}
+		}
+		prev, cur = cur, prev
+		for j := range cur {
+			cur[j] = 0
+		}
+	}
+	return float64(2*prev[len(b)]) / float64(len(a)+len(b))
+}
+
+// similarEditLines returns up to limit file lines whose similarity to any
+// line of target reaches threshold. Lines keep file order and duplicates are
+// removed. A shorter target line contained in a file line scores 1 so a
+// distorted indent still finds its source.
+func similarEditLines(target string, fileLines []string, threshold float64, limit int) []string {
+	targetLines := strings.Split(target, "\n")
+	seen := map[string]bool{}
+	var out []string
+	for _, line := range fileLines {
+		text := strings.TrimRight(line, "\r")
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		best := 0.0
+		for _, want := range targetLines {
+			w := normalizeEditLine(want)
+			if w == "" {
+				continue
+			}
+			score := editLineSimilarity(want, text)
+			if strings.Contains(normalizeEditLine(text), w) {
+				score = 1
+			}
+			if score > best {
+				best = score
+			}
+		}
+		if best >= threshold && !seen[text] {
+			seen[text] = true
+			out = append(out, text)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out
+}
+
+// replaceAlreadyInFile reports whether the REPLACE text is already present
+// in the file after whitespace normalization. Such a block needs no resend.
+func replaceAlreadyInFile(replace, content string) bool {
+	want := normalizeEditLine(replace)
+	if want == "" {
+		return false
+	}
+	return strings.Contains(normalizeEditLine(content), want)
+}
+
+// evaluateEditBlocks builds the structured response for a batch of edit
+// blocks against the target file. A block succeeds when its SEARCH appears in
+// the file after normalization. A block whose REPLACE is already present gets
+// the already-applied category. Every other failure gets the failed-block
+// category and similar lines as advice. Only failed blocks enter Resend.
+func evaluateEditBlocks(blocks []editBlock, content string, threshold float64, similarLimit int) editResponse {
+	if threshold <= 0 {
+		threshold = editSimilarityThreshold
+	}
+	fileLines := strings.Split(content, "\n")
+	normFile := normalizeEditLine(content)
+	resp := editResponse{Results: make([]editBlockResult, 0, len(blocks))}
+	for _, b := range blocks {
+		search := normalizeEditLine(b.Search)
+		if search != "" && strings.Contains(normFile, search) {
+			resp.Results = append(resp.Results, editBlockResult{Index: b.Index, Applied: true})
+			continue
+		}
+		if replaceAlreadyInFile(b.Replace, content) {
+			resp.Results = append(resp.Results, editBlockResult{
+				Index:    b.Index,
+				Category: editCategoryAlreadyApplied,
+			})
+			continue
+		}
+		resp.Results = append(resp.Results, editBlockResult{
+			Index:    b.Index,
+			Category: editCategoryFailedBlock,
+			Similar:  similarEditLines(b.Search, fileLines, threshold, similarLimit),
+		})
+		resp.Resend = append(resp.Resend, b.Index)
+	}
+	return resp
+}
