@@ -1,6 +1,10 @@
 # Beacon: словарь домена
 
-Словарь домена цикла Beacon. Здесь зафиксировано, кто работает над карточкой, кто наблюдает за PR, как executor выходит из работы в ожидание и как оркестратор разбирает блокеры main. Источник истины это код в `internal/domain` и `AGENTS.md`.
+Словарь домена цикла Beacon. Здесь зафиксировано, кто работает над карточкой, кто наблюдает за PR, как executor выходит из работы в ожидание и как оркестратор разбирает блокеры main. Словарь описывает домен, а не код: пути, тайминги и номера ADR собраны в разделе «Ссылки на реализацию».
+
+## Порог ADR
+
+ADR стоит предлагать только когда выполнены все три условия: решение трудно обратить, оно удивительно без контекста и оно стало результатом реального компромисса. Если не выполняется хотя бы одно условие, решение остаётся в глоссарии без ADR.
 
 ## Language
 
@@ -11,7 +15,7 @@
 _Avoid_: worker, coder, subagent
 
 **Orchestrator**:
-Тонкая сессия, которая читает вердикты Watch, ждёт зависимости по `waitFor` и спавнит FIX-агента, когда падение проверки относится к main. Оркестратор не чинит main сам. Мерж по `ready` выполняет `cibridge`.
+Тонкая сессия, которая читает вердикты Watch, ждёт зависимости по `waitFor` и спавнит FIX-агента, когда падение проверки относится к main. Оркестратор не чинит main сам.
 _Avoid_: coordinator, менеджер задач, main
 
 **RoleFixer**:
@@ -33,11 +37,11 @@ _Avoid_: монитор, отслеживание, PR check
 _Avoid_: listener, подписка, consumer
 
 **WorkerPhase**:
-Фаза жизненного цикла воркера, привязанного к Watch. Значения: `waiting`, `in_work`, `blocked`, `orphaned`, `finished`. Хранится на подписчике и переживает рестарт процесса. Нулевое значение невалидно, поэтому незаполненный подписчик никогда не считается живой работой.
+Фаза жизненного цикла воркера, привязанного к Watch. Значения: `waiting`, `in_work`, `blocked`, `orphaned`, `finished`. Хранится на подписчике и переживает рестарт процесса. Незаполненный подписчик никогда не считается живой работой.
 _Avoid_: state, статус сессии, presence
 
 **Verdict**:
-Результат, посчитанный для одной ревизии Watch. Контракт вердиктов живёт в `internal/domain/types.go` в функции `Verdicts`. Значения: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`, `recheck`. Переходы добавляют `needs_input`, `parked` и `accepted`. Оркестратор добавляет `fail`, `wait`, `wait_dependency` и `green_blocked`. Вердикт `green_blocked` означает зелёные проверки при удержанном слоте из-за открытого блокера. Вердикт берётся только из `beacon_get_result`, а не из отчёта сабагента.
+Результат, посчитанный для одной ревизии Watch. Значения: `watching`, `ready`, `rebase`, `retry`, `keep_working`, `timeout`, `merged`, `closed`, `blocked`, `recheck`. Переходы добавляют `needs_input`, `parked` и `accepted`. Оркестратор добавляет `fail`, `wait`, `wait_dependency` и `green_blocked`. Вердикт `green_blocked` означает зелёные проверки при удержанном слоте из-за открытого блокера. Вердикт берётся только из `beacon_get_result`, а не из отчёта сабагента.
 _Avoid_: status, conclusion, результат агента
 
 **Obligation**:
@@ -45,11 +49,11 @@ _Avoid_: status, conclusion, результат агента
 _Avoid_: task, job, квитанция
 
 **Ladder**:
-Лестница пробуждения из ADR 0017, реализована в `internal/infra/ladder`. Ветвится по исходу доставки: `posted` ждёт прочтения без повторов, `transport-failed` повторяет указатель через 5 и 10 минут с джиттером плюс минус 30 секунд и лимитом три попытки, `indeterminate` не повторяется никогда. Через 15 минут после staging наступает проверка доказательств и эскалация. Позиция лежит в `ladder_journal`, поэтому рестарт продолжает с того же шага.
+Лестница пробуждения. Ветвится по исходу доставки: `posted` ждёт прочтения без повторов, `transport-failed` повторяет указатель, `indeterminate` не повторяется никогда. После staging наступает проверка доказательств и эскалация. Позиция сохраняется, поэтому рестарт продолжает с того же шага.
 _Avoid_: retry loop, backoff, cron
 
 **ReconcileLoop**:
-Периодический проход, который читает живое состояние, считает вердикт и применяет побочные действия. В коде это `cibridge.Refresh` по тику опроса CI, по умолчанию раз в 30 секунд, и проход `beacon daemon`, по умолчанию раз в три минуты. Каждый проход получает собственный `cycleID`, который попадает во все его события.
+Периодический проход, который читает живое состояние, считает вердикт и применяет побочные действия. Каждый проход получает собственный `cycleID`, который попадает во все его события.
 _Avoid_: polling, heartbeat, watchdog
 
 ### Информационные проверки
@@ -63,11 +67,11 @@ _Avoid_: optional check, informational gate, мягкая проверка
 _Avoid_: optional, non-blocking flag, мягкий гейт
 
 **Источники `VerdictBlocked`**:
-Правило 5 в `EvaluatePR` (`internal/domain/verdict.go`) даёт блок, когда проверка упала на базовой ветке и не является информационной. Исчерпание бюджета ребейза даёт блок в `blockRebaseExhausted` (`internal/infra/cibridge/bridge.go`) с причиной `rebase-budget-exhausted`. Приложение `applyBlocked` (`internal/infra/cibridge/verdict_applier.go`) публикует блок, пишет `BlockedInfo` и открывает `BlockerIncident`. Источники вне проверок не зависят от `Required`. Информационная проверка исключена только правилом 5.
+Проверка, упавшая на базовой ветке и не являющаяся информационной, даёт блок. Исчерпание бюджета ребейза тоже даёт блок, пишет `BlockedInfo` и открывает `BlockerIncident`. Источники вне проверок не зависят от `Required`. Информационная проверка исключена только правилом базовой ветки.
 _Avoid_: blocked by check, красная проверка, external failure
 
 **Источники `keep_working`**:
-Провал rollup `FAILURE` или `ERROR` без флейковых проверок даёт `keep_working` в `Evaluate` и `EvaluatePR` (`internal/domain/verdict.go`). Ошибка или удержание мержа даёт `keep_working` в `applyMerge` (`internal/infra/cibridge/verdict_applier.go`), когда причина не конфликт после повторной попытки. Источники вне проверок не зависят от `Required`: исчерпание бюджета ребейза и ошибка мержа. Информационная проверка не даёт `keep_working` ни в одном из этих путей.
+Провал rollup `FAILURE` или `ERROR` без флейковых проверок, ошибка или удержание мержа, когда причина не конфликт после повторной попытки. Источники вне проверок не зависят от `Required`: исчерпание бюджета ребейза и ошибка мержа. Информационная проверка не даёт `keep_working` ни в одном из этих путей.
 _Avoid_: failed check, retry forever, жди CI
 
 ### Блокеры и управление
@@ -77,7 +81,7 @@ _Avoid_: failed check, retry forever, жди CI
 _Avoid_: failed check, красный CI, blocker task
 
 **BlockerStore**:
-Порт, который хранит `BlockerIncident` и `OrchestratorBinding`. Методы: `SaveBlocker`, `FindBlocker`, `OpenBlockers`, `ResolveBlocker`, `SaveBinding`, `Binding`, `BindingBySession`. Реализация на SQLite лежит в `internal/infra/store/blockers.go`. Псевдоним `ControlPlaneStore` указывает на тот же порт.
+Порт, который хранит `BlockerIncident` и `OrchestratorBinding`. Методы: `SaveBlocker`, `FindBlocker`, `OpenBlockers`, `ResolveBlocker`, `SaveBinding`, `Binding`, `BindingBySession`. Псевдоним `ControlPlaneStore` указывает на тот же порт.
 _Avoid_: issue tracker, blockade registry, control plane
 
 **OrchestratorBinding**:
@@ -127,17 +131,32 @@ _Avoid_: notification, уведомление, prompt
 ### Экран и оператор
 
 **One Screen**:
-Целевой интерактивный экран Beacon в одном терминале. Объединяет живой снимок, очереди todo и deferred, события, слоты, воркеров, PR и вердикты, блокеры и RSS в одном окне и принимает клавиши оператора. Отличается от статического board: board рендерит фиксированный список карточек через `tui.Run` или `tui.RenderFallback`, а One Screen строится по живому снимку. Источник: `docs/research/audit-03-tui.md:3`.
+Целевой интерактивный экран Beacon в одном терминале. Объединяет живой снимок, очереди todo и deferred, события, слоты, воркеров, PR и вердикты, блокеры и RSS в одном окне и принимает клавиши оператора. Отличается от статического board: board рендерит фиксированный список карточек, а One Screen строится по живому снимку.
 _Avoid_: dashboard, статический board, веб-интерфейс
 
 **Live Projection**:
-Живой снимок `/api/v1/snapshot` плюс поток `/api/v1/events`, спроектированные в экран. В коде это `httpapi.ProjectionClient` в `cmd/beacon/watch.go:499` `watchHTTPPort` и `cmd/beacon/watch.go:551` `renderHTTPSnapshot` при `beacon watch --live`. Экран пересобирает вид по смене revision, а не по таймеру. Противоположность статической проекции board по списку карточек.
+Живой снимок `/api/v1/snapshot` плюс поток `/api/v1/events`, спроектированные в экран. Экран пересобирает вид по смене revision, а не по таймеру. Противоположность статической проекции board по списку карточек.
 _Avoid_: polling, SSE-клиент сам по себе, снимок БД
 
 **Operator Port**:
-Тонкий порт в `cmd/beacon`, через который оператор читает снимок, подписывается на события и отправляет решение. Три метода по `docs/research/audit-03-tui.md:60`: читать снимок, подписываться на события, отправлять решение. Порт удерживает `net/http` и Bubble Tea вне `cmd` и пропускает действия оператора только через verbs сервера. Конкретная Bubble Tea программа остаётся в `internal/tui`.
+Тонкий порт в `cmd/beacon`, через который оператор читает снимок, подписывается на события и отправляет решение. Три метода: читать снимок, подписываться на события, отправлять решение. Порт пропускает действия оператора только через verbs сервера.
 _Avoid_: HTTP-клиент в cmd, прямой tui.Run из cmd, hotkey без verbs
 
 **Hotkey**:
-Клавиша экрана, привязанная к одному из verbs `/api/v1/human/decide`. Сервер принимает ровно восемь: `approve`, `reject`, `context`, `rework`, `pause`, `resume`, `unblock`, `cancel` (`internal/infra/httpapi/server.go:989`). Своих verbs у hotkey нет: spawn и kill не входят в контракт, поэтому TUI-10 помечена dropped. Отказ сервера остаётся в строке статуса и не меняет локальное представление.
+Клавиша экрана, привязанная к одному из verbs `/api/v1/human/decide`. Сервер принимает ровно восемь: `approve`, `reject`, `context`, `rework`, `pause`, `resume`, `unblock`, `cancel`. Своих verbs у hotkey нет: spawn и kill не входят в контракт. Отказ сервера остаётся в строке статуса и не меняет локальное представление.
 _Avoid_: spawn/kill, алиас, локальный verb
+
+## Ссылки на реализацию
+
+Пути кода, тайминги, номера ADR и ссылки на исследования собраны здесь, чтобы определения выше оставались указателем на домен, а не копией кода.
+
+- Verdict: контракт вердиктов, `internal/domain/types.go`, функция `Verdicts`.
+- Ladder: ADR 0017, `internal/infra/ladder`; повтор через 5 и 10 минут с джиттером плюс минус 30 секунд, лимит три попытки, проверка доказательств и эскалация через 15 минут после staging, журнал `ladder_journal`.
+- ReconcileLoop: `cibridge.Refresh`, тик опроса CI по умолчанию раз в 30 секунд; проход `beacon daemon` по умолчанию раз в три минуты.
+- Источники `VerdictBlocked`: правило 5 в `EvaluatePR`, `internal/domain/verdict.go`; `blockRebaseExhausted`, `internal/infra/cibridge/bridge.go`; `applyBlocked`, `internal/infra/cibridge/verdict_applier.go`.
+- Источники `keep_working`: `Evaluate` и `EvaluatePR`, `internal/domain/verdict.go`; `applyMerge`, `internal/infra/cibridge/verdict_applier.go`.
+- BlockerStore: реализация на SQLite, `internal/infra/store/blockers.go`.
+- One Screen: `docs/research/audit-03-tui.md:3`.
+- Live Projection: `httpapi.ProjectionClient`, `cmd/beacon/watch.go:499` (`watchHTTPPort`), `cmd/beacon/watch.go:551` (`renderHTTPSnapshot`), `beacon watch --live`.
+- Operator Port: `docs/research/audit-03-tui.md:60`; `net/http` и Bubble Tea вне `cmd`, конкретная программа в `internal/tui`.
+- Hotkey: `internal/infra/httpapi/server.go:989`; TUI-10 помечена dropped.
