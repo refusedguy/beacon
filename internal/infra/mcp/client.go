@@ -480,3 +480,72 @@ func remoteToolHandler(client *RemoteClient, name string) mcpsdk.ToolHandler {
 		return &result, nil
 	}
 }
+
+// ---------------------------------------------------------------------------
+// CSx-05. Tool transport selection.
+//
+// The remote client above is one implementation of ToolCaller. A local bridge
+// is the other: it satisfies the same call seam with no HTTP doer, so a caller
+// that depends on the interface does not change when the transport switches.
+// ---------------------------------------------------------------------------
+
+// ToolCaller is the narrow call seam shared by RemoteClient and InProcessBridge.
+type ToolCaller interface {
+	CallTool(ctx context.Context, name string, arguments, meta json.RawMessage) (mcpsdk.CallToolResult, error)
+}
+
+// InProcessBridge routes tools/call to a local handler. It is the in-process
+// counterpart of RemoteClient: no base URL, no token, no HTTP doer, so a local
+// call cannot reach the network or increment a remote request counter.
+type InProcessBridge struct {
+	handler InProcessHandler
+}
+
+// NewInProcessBridge builds a bridge over h. A nil handler is rejected so a
+// misconfigured local path fails at construction, not on the first tool call.
+func NewInProcessBridge(h InProcessHandler) (*InProcessBridge, error) {
+	if h == nil {
+		return nil, errors.New("mcp: nil in-process handler")
+	}
+	return &InProcessBridge{handler: h}, nil
+}
+
+// NewInProcessBridgeFunc wraps a function as a bridge handler.
+func NewInProcessBridgeFunc(f InProcessHandleFunc) (*InProcessBridge, error) {
+	return NewInProcessBridge(f)
+}
+
+// CallTool dispatches to the local handler. It mirrors RemoteClient.CallTool
+// with the HTTP hop removed: name and raw arguments go straight to Handle.
+func (b *InProcessBridge) CallTool(ctx context.Context, name string, arguments, meta json.RawMessage) (mcpsdk.CallToolResult, error) {
+	if b == nil || b.handler == nil {
+		return mcpsdk.CallToolResult{}, errors.New("mcp: nil in-process bridge")
+	}
+	if strings.TrimSpace(name) == "" {
+		return mcpsdk.CallToolResult{}, errors.New("mcp: empty tool name")
+	}
+	return b.handler.Handle(ctx, name, arguments, meta)
+}
+
+// LocalMCPConfig selects the tool transport (CSx-05). Remote HTTP is the
+// default: the zero value and Local=false both keep the AttachRemoteTools
+// path. Local=true with a Handler opts into the in-process bridge.
+type LocalMCPConfig struct {
+	Local   bool
+	Handler InProcessHandler
+}
+
+// AttachMCPTools wires exactly one transport for every advertised name. When
+// cfg opts into the local path it registers the in-process handlers; otherwise
+// it keeps the remote forwarders. Only one attach runs, so no name can carry a
+// local and a remote handler at the same time.
+func AttachMCPTools(s *mcpsdk.Server, client *RemoteClient, cfg LocalMCPConfig) error {
+	if cfg.Local {
+		bridge, err := NewInProcessBridge(cfg.Handler)
+		if err != nil {
+			return err
+		}
+		return AttachInProcessTools(s, bridge)
+	}
+	return AttachRemoteTools(s, client)
+}

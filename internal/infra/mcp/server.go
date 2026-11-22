@@ -407,6 +407,108 @@ func init() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// CSx-05. In-process MCP bridge.
+//
+// The SDK's SdkMcpBridge (anthropics/claude-agent-sdk-python 3184360,
+// src/claude_agent_sdk/_internal/sdk_mcp_bridge.py:343-379) dispatches a
+// message straight into a server instance. Beacon keeps that shape behind a
+// narrow port. A local handler receives the tool name and the raw arguments,
+// then returns the same CallToolResult the HTTP client would. The remote path
+// stays the default. The local one is opt-in through LocalMCPConfig.
+// ---------------------------------------------------------------------------
+
+// InProcessHandler is the port an embedding process implements to serve MCP
+// tool calls inside its own address space. It mirrors SdkMcpBridge.handle:
+// name plus raw arguments and meta in, CallToolResult out. No transport is
+// implied, so this layer never imports net/http (ADR 0005).
+type InProcessHandler interface {
+	Handle(ctx context.Context, name string, arguments, meta json.RawMessage) (mcpsdk.CallToolResult, error)
+}
+
+// InProcessHandleFunc adapts a function to InProcessHandler. A test or a
+// composition root can supply the bridge body without declaring a new type.
+type InProcessHandleFunc func(ctx context.Context, name string, arguments, meta json.RawMessage) (mcpsdk.CallToolResult, error)
+
+func (f InProcessHandleFunc) Handle(ctx context.Context, name string, arguments, meta json.RawMessage) (mcpsdk.CallToolResult, error) {
+	if f == nil {
+		return mcpsdk.CallToolResult{}, errors.New("mcp: nil in-process handler function")
+	}
+	return f(ctx, name, arguments, meta)
+}
+
+// AttachInProcessTools replaces the advertised handlers with local ones that
+// delegate to bridge. It walks toolDescriptors, the same list the remote tools
+// come from, so the local name set cannot drift from the advertised one.
+// RemoveTools runs before each AddTool and a duplicate descriptor is rejected.
+// A name therefore has one handler, and repeated calls change nothing.
+func AttachInProcessTools(s *mcpsdk.Server, bridge *InProcessBridge) error {
+	if s == nil {
+		return errors.New("mcp: nil server")
+	}
+	if bridge == nil {
+		return errors.New("mcp: nil in-process bridge")
+	}
+	outputs, err := AllOutputSchemas()
+	if err != nil || outputs == nil {
+		// Same fallback as AttachRemoteTools: a broken optional schema must not
+		// leave a contracted tool unregistered.
+		outputs = map[string]*jsonschema.Schema{
+			"beacon_list_running": {Type: "object"},
+			"beacon_stats":        {Type: "object"},
+		}
+	}
+	seen := make(map[string]struct{}, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		name := descriptor.Name
+		if _, duplicate := seen[name]; duplicate {
+			return fmt.Errorf("mcp: duplicate tool descriptor %q", name)
+		}
+		seen[name] = struct{}{}
+		output := outputs[name]
+		if output == nil {
+			output = &jsonschema.Schema{Type: "object"}
+		}
+		description := remoteToolDescriptions[name]
+		if description == "" {
+			description = descriptor.Description
+		}
+		annotations := toolAnnotations[name]
+		s.RemoveTools(name)
+		s.AddTool(&mcpsdk.Tool{
+			Name:         name,
+			Description:  description,
+			InputSchema:  remoteInputSchema(name),
+			OutputSchema: output,
+			Annotations:  &annotations,
+		}, inProcessToolHandler(bridge, name))
+	}
+	return nil
+}
+
+func inProcessToolHandler(bridge *InProcessBridge, name string) mcpsdk.ToolHandler {
+	return func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
+		var arguments, meta json.RawMessage
+		if req != nil && req.Params != nil {
+			arguments = req.Params.Arguments
+			if len(req.Params.Meta) > 0 {
+				if raw, err := json.Marshal(req.Params.Meta); err == nil {
+					meta = raw
+				}
+			}
+		}
+		result, err := bridge.CallTool(ctx, name, arguments, meta)
+		if err != nil {
+			// A tool failure belongs in Content with IsError set, so the agent
+			// can see why the call failed and correct its next turn.
+			out := &mcpsdk.CallToolResult{}
+			out.SetError(fmt.Errorf("mcp: %s локально: %w", name, err))
+			return out, nil
+		}
+		return &result, nil
+	}
+}
+
 // BlockerControl is the narrow control-plane port the two writing tools need.
 // watch_pr uses AssignFixer to bind a fixer to an incident, ack uses
 // GetOrCreateOpenBlocker and ResolveBlocker to open and close an incident. The
