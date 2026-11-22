@@ -1297,3 +1297,122 @@ func EvaluateGreenBlocked(s Snapshot, p Policy, blockerOpen bool) GreenBlockedVe
 	}
 	return GreenBlockedNone
 }
+
+// ---- SB-03: two-tier advisory classification of infrastructure failures ----
+//
+// SWE-bench keeps a broken environment separate from a bad patch. The eight
+// signatures below mirror swebench/harness/infra_failure.py:28-61. Two
+// properties carry over unchanged. Classification is post-hoc over text the
+// harness already wrote, and it is advisory: a classified Watch keeps its
+// verdict, its wait stop reason and its place in the scoring denominator.
+// Nothing here runs a command, opens a container or drops an instance from a
+// run. The classifier reads only the text it is given and mutates no argument.
+
+// InfraTier is the confidence level of an infrastructure failure. Environment
+// faults cannot plausibly come from patching repository source. Ambiguous
+// faults can come from either the environment or the patch and are reported
+// separately so they are never mistaken for a confirmed environment fault.
+type InfraTier string
+
+const (
+	InfraTierEnvironment InfraTier = "environment"
+	InfraTierAmbiguous   InfraTier = "ambiguous"
+)
+
+// Valid reports whether t is one of the two contract tiers.
+func (t InfraTier) Valid() bool {
+	return t == InfraTierEnvironment || t == InfraTierAmbiguous
+}
+
+// InfraReason names one of the eight SWE-bench signatures. The string values
+// are the wire form written to the wait report and to the journal.
+type InfraReason string
+
+const (
+	InfraReasonBrowserLaunchFailed  InfraReason = "browser_launch_failed"
+	InfraReasonDisplayUnavailable   InfraReason = "display_unavailable"
+	InfraReasonOutOfMemory          InfraReason = "out_of_memory"
+	InfraReasonContainerUnavailable InfraReason = "container_unavailable"
+	InfraReasonNetworkUnreachable   InfraReason = "network_unreachable"
+	InfraReasonMissingModule        InfraReason = "missing_module"
+	InfraReasonNoTestsCollected     InfraReason = "no_tests_collected"
+	InfraReasonTestsTimedOut        InfraReason = "tests_timed_out"
+)
+
+// Valid reports whether r is one of the eight contract reasons.
+func (r InfraReason) Valid() bool {
+	switch r {
+	case InfraReasonBrowserLaunchFailed, InfraReasonDisplayUnavailable,
+		InfraReasonOutOfMemory, InfraReasonContainerUnavailable,
+		InfraReasonNetworkUnreachable, InfraReasonMissingModule,
+		InfraReasonNoTestsCollected, InfraReasonTestsTimedOut:
+		return true
+	default:
+		return false
+	}
+}
+
+// InfraSignature is one ordered signature. Matching is first-hit-wins, so the
+// order is part of the contract: a broad pattern must not shadow a specific
+// one. Pattern is compiled with the multiline flag so an anchored pattern such
+// as ^Killed$ matches a single line inside a longer log.
+type InfraSignature struct {
+	Reason  InfraReason
+	Tier    InfraTier
+	Pattern *regexp.Regexp
+}
+
+// infraSignatures follows the harness order in infra_failure.py:28-61. Five
+// signatures are environment, three are ambiguous.
+var infraSignatures = []InfraSignature{
+	{InfraReasonBrowserLaunchFailed, InfraTierEnvironment, regexp.MustCompile(`(?m)Failed to launch|Failed to connect to the bus`)},
+	{InfraReasonDisplayUnavailable, InfraTierEnvironment, regexp.MustCompile(`(?m)cannot open display|Missing X server|unable to open X display`)},
+	{InfraReasonOutOfMemory, InfraTierEnvironment, regexp.MustCompile(`(?m)Cannot allocate memory|OutOfMemoryError|^Killed$`)},
+	{InfraReasonContainerUnavailable, InfraTierEnvironment, regexp.MustCompile(`(?m)Error response from daemon|Cannot connect to the Docker daemon`)},
+	{InfraReasonNetworkUnreachable, InfraTierEnvironment, regexp.MustCompile(`(?m)Could not resolve host|Temporary failure in name resolution`)},
+	{InfraReasonMissingModule, InfraTierAmbiguous, regexp.MustCompile(`(?m)Cannot find module|MODULE_NOT_FOUND|ModuleNotFoundError`)},
+	{InfraReasonNoTestsCollected, InfraTierAmbiguous, regexp.MustCompile(`(?m)no tests ran|collected 0 items`)},
+	{InfraReasonTestsTimedOut, InfraTierAmbiguous, regexp.MustCompile(`(?m)Timeout error: \d+ seconds exceeded`)},
+}
+
+// InfraSignatures returns the eight signatures in harness order. The returned
+// slice is a copy, so a caller cannot reorder the table that classification
+// depends on.
+func InfraSignatures() []InfraSignature {
+	out := make([]InfraSignature, len(infraSignatures))
+	copy(out, infraSignatures)
+	return out
+}
+
+// ClassifyInfra returns the tier and reason of the first signature matching
+// text, and true when one matched. Empty or unmatched text yields empty values
+// and false. The function is pure: it reads no clock or store, runs no command
+// and changes no verdict or scoring list.
+func ClassifyInfra(text string) (InfraTier, InfraReason, bool) {
+	if text == "" {
+		return "", "", false
+	}
+	for _, signature := range infraSignatures {
+		if signature.Pattern.MatchString(text) {
+			return signature.Tier, signature.Reason, true
+		}
+	}
+	return "", "", false
+}
+
+// InfraFailureRecord is one advisory journal line for a classified Watch. It
+// records what was observed and when. It does not carry a verdict, a stop
+// reason or a denominator decision: the Watch keeps all three.
+type InfraFailureRecord struct {
+	WatchID string
+	Tier    InfraTier
+	Reason  InfraReason
+	At      time.Time
+}
+
+// InfraFailureJournal is the sink for advisory classifications. The port lives
+// in domain so an app adapter can persist records without making infra import
+// a sibling package. A nil journal means classification stays in the report.
+type InfraFailureJournal interface {
+	RecordInfraFailure(InfraFailureRecord)
+}
