@@ -63,6 +63,7 @@ executor-task:design-shapes -->
 | verdict | `beacon_get_result` | решение о пробуждении |
 | tokenBreakdown | `session.TokenBreakdown(ContextSnapshot)` | разбивка контекста по категориям с ценой и остатком |
 | tokenWarning | `session.TokenUsage().Warning` | предупреждение при остатке ниже 1024 токенов |
+| роль файла контекста | editable из OwnerFiles карточки, readonly из остальных файлов в контексте | какая запись разрешена |
 
 ## Учёт токенов контекста
 
@@ -99,6 +100,34 @@ attach: after-confirmation-only
 refusal: remembered, no-repeat
 next-turn: reflected-message
 executor-task:mentions -->
+
+## Роли файлов контекста: editable и readonly
+
+Каждый файл в контексте исполнителя несёт роль. Роль принимает одно из двух значений: `editable` или `readonly`. Роль лежит в записи контекста рядом с путём. Модель видит все файлы контекста, но запись разрешена только в файлы с ролью `editable`.
+
+Источник ролей фиксирован. Значение `editable` исполнитель берёт из поля «Владелец файлов» своей карточки. Значение `readonly` он ставит на остальные файлы, полученные в контексте. Граница правки по-прежнему задаётся OwnerFiles карточки. Добавление роли не меняет правила владения файлами.
+
+Перед записью исполнитель проверяет роль целевого файла. Файл с ролью `readonly` отклоняет запись с кодом ошибки `readonly_file`. Код входит в текст ошибки, чтобы аудит отличал отказ по роли от других отказов. Файл с ролью `editable` принимает запись без дополнительной проверки.
+
+Смена роли работает без перезапуска сессии. Команда повышения переводит файл из `readonly` в `editable` и принимает путь, который существует в репозитории. Команда понижения возвращает файл в `readonly`. Следующая запись после команды использует новую роль.
+
+Проверка ролей считает 20 попыток записи. Десять попыток идут в `editable`, десять в `readonly`. Все десять записей в `editable` проходят, все десять записей в `readonly` отклоняются с кодом `readonly_file`. Повтор после смены роли подтверждает, что файл доступен без перезапуска. Baseline равен одному нарушению на 12 проверенных PR (PR 1448).
+
+Основание: `docs/research/comp-aider.md`, `docs/research/OWNERFILE-DISCIPLINE.md`.
+
+<!-- executor-task:context-roles
+values: editable, readonly
+model-sees: all
+write-allowed: editable-only
+editable-source: card-owner-files
+readonly-source: other-context-files
+deny-code: readonly_file
+promotion: readonly-to-editable, path-must-exist-in-repo, no-session-restart
+acceptance: 10-allowed-10-denied, recheck-after-promotion
+baseline: 1-violation-per-12-prs
+owner-rules: unchanged
+source: CA-11, docs/research/comp-aider.md
+executor-task:context-roles -->
 
 ## Разделение каналов
 
@@ -468,6 +497,7 @@ executor-task:edit-failure -->
 - Не поручать Beacon команды, которые выполняет агент. Beacon только детектирует состояние и шлёт указатель на запись.
 - Не читать внутренние логи и базы агента как источник результата (ADR 0027).
 - Не закрывать чужие карточки в несвязанных PR.
+- Не писать в файл с ролью `readonly`. Запись отклоняется с кодом `readonly_file`.
 - Не запускать `batch-apply` без явной команды владельца.
 - Не отправлять PR с изменением кода без обновления документации в том же PR.
 - Не искать задачу вручную в `docs/tasks/` вместо `beacon_task_claim`.
