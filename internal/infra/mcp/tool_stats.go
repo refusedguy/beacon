@@ -4,6 +4,8 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +55,14 @@ const (
 	// activeWatchLimit is the global active-watch cap from ADR 0093
 	// (maxActiveWatchesGlobal) and T1.4. T5.64 warns at 75% and 90% of it.
 	activeWatchLimit = 200
+	// outcomeSchemaVersionPrefix marks the schema version of the disjoint
+	// outcome report inside loadErrors. The derived beacon_stats schema is
+	// pinned by ADR 0094, so the report rides in the diagnostic array like the
+	// graph and poller signals instead of adding a field to StatsOutput.
+	outcomeSchemaVersionPrefix = "outcome schema version: "
+	// outcomeListPrefix marks one outcome ID list. The body is name=id,id,...
+	// with IDs in sorted order so an unchanged snapshot produces equal bytes.
+	outcomeListPrefix = "outcome ids: "
 )
 
 // Plan limit levels reported in the stats response. A zero PlanLimitInfo uses
@@ -263,6 +273,11 @@ type StatsHandler struct {
 	registry   RegistryStatsReader
 	graph      GraphIndexReader
 	watchLimit *watchLimitLatch
+	// outcomeReport opts into the disjoint outcome report. A handler without
+	// it keeps the exact pre-SB-12 response, so existing callers and tests are
+	// not changed by the new projection. The composition root turns it on when
+	// it wants per-outcome IDs in the stats response.
+	outcomeReport bool
 }
 
 // NewStatsHandler builds the handler. Pass handler.Handle to mcpsdk.AddTool
@@ -283,6 +298,14 @@ func (h *StatsHandler) SetRegistryStatsReader(r RegistryStatsReader) {
 // verify is never advertised as current.
 func (h *StatsHandler) SetGraphIndexReader(r GraphIndexReader) {
 	h.graph = r
+}
+
+// SetOutcomeReportEnabled opts the handler into the disjoint outcome report.
+// Off by default: a server that has not opted in keeps its previous loadErrors
+// bytes. The report is computed from the same snapshot as the counters, never
+// from a second store.
+func (h *StatsHandler) SetOutcomeReportEnabled(enabled bool) {
+	h.outcomeReport = enabled
 }
 
 // planLimitInfo computes the warning from used and budget. A missing or
@@ -382,6 +405,163 @@ func notifyingWatches(radar []domain.Watch) uint64 {
 	return n
 }
 
+// outcomeLists returns the eight report lists in emission order. The same
+// order drives the wire form and its parser, so a name cannot drift between
+// the producer and the reader.
+func outcomeLists(r *OutcomeReport) []struct {
+	name string
+	ids  *[]string
+} {
+	return []struct {
+		name string
+		ids  *[]string
+	}{
+		{"completed_ids", &r.CompletedIDs},
+		{"incomplete_ids", &r.IncompleteIDs},
+		{"resolved_ids", &r.ResolvedIDs},
+		{"unresolved_ids", &r.UnresolvedIDs},
+		{"error_ids", &r.ErrorIDs},
+		{"empty_patch_ids", &r.EmptyPatchIDs},
+		{"infra_failure_ids", &r.InfraFailureIDs},
+		{"ambiguous_failure_ids", &r.AmbiguousFailureIDs},
+	}
+}
+
+// mainOutcome is the one main list a Watch belongs to. The cases are
+// exhaustive. A Watch without a PR never produced a patch to evaluate, so it
+// is incomplete regardless of its verdict.
+func mainOutcome(w domain.Watch) string {
+	if w.PR == 0 {
+		return "incomplete_ids"
+	}
+	switch w.Verdict {
+	case domain.VerdictReady, domain.VerdictMerged, domain.VerdictAccepted, domain.VerdictGreenBlocked:
+		return "resolved_ids"
+	case domain.VerdictFail, domain.VerdictRetry, domain.VerdictRebase,
+		domain.VerdictKeepWorking, domain.VerdictTimeout, domain.VerdictBlocked,
+		domain.VerdictRecheck, domain.VerdictNeedsInput:
+		return "unresolved_ids"
+	case domain.VerdictClosed:
+		return "completed_ids"
+	default:
+		return "incomplete_ids"
+	}
+}
+
+// infraFailure reads an infrastructure failure from the block record. The
+// domain has no dedicated block reason for it, so a failed check whose name
+// carries "infra" or "flaky" is the signal. The classification is additive.
+func infraFailure(w domain.Watch) bool {
+	if w.Blocked == nil {
+		return false
+	}
+	for _, check := range w.Blocked.FailedChecks {
+		name := strings.ToLower(check)
+		if strings.Contains(name, "infra") || strings.Contains(name, "flaky") {
+			return true
+		}
+	}
+	return false
+}
+
+// errorOutcome reports a Watch whose run ended in an error. A blocked status
+// or block record is an error too. Like every failure class, it is additive.
+func errorOutcome(w domain.Watch) bool {
+	switch w.Verdict {
+	case domain.VerdictFail, domain.VerdictTimeout, domain.VerdictBlocked:
+		return true
+	}
+	return w.Status == domain.StatusBlocked || w.Blocked != nil
+}
+
+// classifyOutcomes builds the disjoint outcome report from one radar slice.
+// Every Watch enters exactly one main list. Failure classes are additive: a
+// Watch classified as an infrastructure failure stays in its main list, so a
+// classification never changes a denominator. Lists are sorted so a repeated
+// call with unchanged state produces byte-identical entries.
+func classifyOutcomes(watches []domain.Watch) OutcomeReport {
+	report := OutcomeReport{SchemaVersion: StatsOutcomeSchemaVersion}
+	for _, w := range watches {
+		if w.ID == "" {
+			continue
+		}
+		main := mainOutcome(w)
+		for _, list := range outcomeLists(&report) {
+			if list.name == main {
+				*list.ids = append(*list.ids, w.ID)
+				break
+			}
+		}
+		if w.PR == 0 {
+			report.EmptyPatchIDs = append(report.EmptyPatchIDs, w.ID)
+		}
+		if infraFailure(w) {
+			report.InfraFailureIDs = append(report.InfraFailureIDs, w.ID)
+		}
+		if errorOutcome(w) && !infraFailure(w) {
+			report.ErrorIDs = append(report.ErrorIDs, w.ID)
+		}
+		if w.Blocked != nil && w.Blocked.Reason == domain.BlockReasonNotMine {
+			report.AmbiguousFailureIDs = append(report.AmbiguousFailureIDs, w.ID)
+		}
+	}
+	for _, list := range outcomeLists(&report) {
+		sort.Strings(*list.ids)
+	}
+	return report
+}
+
+// entries renders the report as deterministic loadErrors entries. The schema
+// version comes first, then every non-empty list in a fixed order. Empty
+// lists are omitted so an unchanged snapshot produces byte-identical entries.
+func (r OutcomeReport) entries() []string {
+	entries := []string{fmt.Sprintf("%s%d", outcomeSchemaVersionPrefix, r.SchemaVersion)}
+	for _, list := range outcomeLists(&r) {
+		if len(*list.ids) == 0 {
+			continue
+		}
+		entries = append(entries, outcomeListPrefix+list.name+"="+strings.Join(*list.ids, ","))
+	}
+	return entries
+}
+
+// OutcomeReportFrom reads the report back from a stats response. It is the one
+// typed reader for the wire form, so a metrics consumer reads the same lists
+// instead of recomputing the classification. The bool is false when the
+// response carries no outcome schema version.
+func OutcomeReportFrom(out StatsOutput) (OutcomeReport, bool) {
+	report := OutcomeReport{}
+	found := false
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, outcomeSchemaVersionPrefix) {
+			version, err := strconv.Atoi(strings.TrimPrefix(entry, outcomeSchemaVersionPrefix))
+			if err == nil {
+				report.SchemaVersion = version
+				found = true
+			}
+			continue
+		}
+		if !strings.HasPrefix(entry, outcomeListPrefix) {
+			continue
+		}
+		name, ids, ok := strings.Cut(strings.TrimPrefix(entry, outcomeListPrefix), "=")
+		if !ok {
+			continue
+		}
+		for _, list := range outcomeLists(&report) {
+			if list.name != name {
+				continue
+			}
+			if ids != "" {
+				*list.ids = append(*list.ids, strings.Split(ids, ",")...)
+			}
+			found = true
+			break
+		}
+	}
+	return report, found
+}
+
 // Handle copies the values already present in a state snapshot into the stats
 // response. Blocked reports the number of watches with a blocked status or a
 // block record. It appends a plan-limit warning to loadErrors when a
@@ -459,6 +639,13 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 			graph = domain.GraphStatus{}
 		}
 		loadErrors = append(loadErrors, fmt.Sprintf("%s%t", graphReadyPrefix, graph.Ready()))
+	}
+
+	// SB-12: publish the disjoint outcome report from the same radar slice that
+	// feeds the counters. Emission is opt-in, so a handler that has not enabled
+	// it keeps its previous loadErrors bytes; the projection itself is pure.
+	if h.outcomeReport {
+		loadErrors = append(loadErrors, classifyOutcomes(radar).entries()...)
 	}
 
 	out := StatsOutput{
