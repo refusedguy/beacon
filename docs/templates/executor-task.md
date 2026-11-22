@@ -50,6 +50,33 @@ scope: no-protocol-change
 source: pstack/skills/architect/SKILL.md:9, PSKX-01
 executor-task:design-shapes -->
 
+## Новое требование как исходное предположение
+
+Когда требование приходит в уже существующий дизайн, исполнитель не приклеивает его к готовой форме. Он перепроектирует затронутую часть так, будто новое требование с самого начала было заложено как исходное предположение. Приём взят из `pstack/skills/principle-redesign-from-first-principles/SKILL.md:9-15`.
+
+Шаг «Исходное предположение» добавляется в фазу plan рядом с двумя формами проекта. Исполнитель выполняет его по порядку.
+
+1. Перечитать все затронутые файлы целиком, а не только места будущей правки.
+2. Сформулировать, как выглядела бы система с новым требованием с нуля, без оглядки на текущую форму.
+3. Перечислить все места, куда изменение должно распространиться. Список обязательно содержит типы, docs, примеры и обоснование (rationale). Пропущенная категория проваливает фазу plan.
+
+Доставка идёт инкрементально. Временный слой совместимости без срока удаления не принимается: если такой слой нужен, в плане указан коммит или условие его удаления.
+
+Приём не создаёт новый глобальный скилл и не меняет протокол Watch. Он дополняет фазу plan и не заменяет две формы из блока `executor-task:design-shapes`. Приём не дублирует redesign из PSK-01, который действует только внутри протокола кандидатов.
+
+<!-- executor-task:original-assumption
+phase: plan
+step: исходное предположение
+reread: all-affected-files
+from-scratch: design-with-requirement-as-original
+spread: types, docs, examples, rationale
+spread-missing: fail-plan
+delivery: incremental
+temporary-compatibility: requires-removal-date
+scope: no-new-skill, no-watch-protocol-change, not-psk-01
+source: pstack/skills/principle-redesign-from-first-principles/SKILL.md:9-15, PSKX-30
+executor-task:original-assumption -->
+
 ## Входные данные
 
 | Поле | Источник | Назначение |
