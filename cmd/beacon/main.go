@@ -26,7 +26,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon list [--format table|json]
   beacon board [--root <dir>] [--status <status>] [--owner <owner>]  (TUI в терминале, таблица без терминала)
   beacon what <command>
-  beacon doctor
+  beacon doctor [--watch] [--interval <dur>] [--max-ticks <n>] [--session <id>] -- <команда> [аргументы]
   beacon build
   beacon test
   beacon gates [gate] [flags]
@@ -345,8 +345,13 @@ func (c *CLI) dispatch(args []string) int {
 // hasHelpFlag reports whether the command arguments ask for help. It is
 // checked at dispatch so every command, including task and spawn whose flags
 // are parsed by hand, answers --help with its own help on stdout and exit 0.
+// A `--` separator hands the rest of the arguments to an external command, so
+// help flags after it are data, not a request for the top-level command help.
 func hasHelpFlag(args []string) bool {
 	for _, a := range args {
+		if a == "--" {
+			return false
+		}
 		if a == "-h" || a == "--help" {
 			return true
 		}

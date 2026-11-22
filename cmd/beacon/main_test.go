@@ -804,3 +804,50 @@ func TestT3145WireOpenCodePortsReadsServiceFile(t *testing.T) {
 		t.Fatal("delivery port = nil, want the live client")
 	}
 }
+
+// CU-02 / ADR 0049: -h and --help after the `--` separator belong to the
+// external check, not to the top-level command help.
+func TestCU02HasHelpFlagStopsAtSeparator(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"long help before separator", []string{"--help"}, true},
+		{"short help before separator", []string{"-h"}, true},
+		{"help after separator", []string{"--", "--help"}, false},
+		{"short help after separator", []string{"--watch", "--", "-h"}, false},
+		{"check with help flag after separator", []string{"--watch", "--", "check", "--help"}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasHelpFlag(tc.args); got != tc.want {
+				t.Fatalf("hasHelpFlag(%q) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCU02DoctorWatchPassesHelpToCheck(t *testing.T) {
+	c, out, errOut, calls := t06NewCLI(t, func(call t06Call) runResult {
+		return runResult{code: 0}
+	})
+
+	code := c.Run([]string{"doctor", "--watch", "--max-ticks", "1", "--", "check", "--help"})
+	if code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, errOut.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("вызовов %d, хотим 1", len(*calls))
+	}
+	if (*calls)[0].name != "check" {
+		t.Fatalf("внешняя проверка %q, ожидалась check", (*calls)[0].name)
+	}
+	if !reflect.DeepEqual((*calls)[0].args, []string{"--help"}) {
+		t.Fatalf("аргументы проверки %q, ожидались [--help]", (*calls)[0].args)
+	}
+	if strings.Contains(out.String(), "name: doctor") {
+		t.Fatalf("напечатана справка doctor: %q", out.String())
+	}
+}
