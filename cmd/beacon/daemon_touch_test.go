@@ -2,12 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/app/session"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // heartbeatRecorder stands in for the durable session registry and records
@@ -202,5 +208,93 @@ func TestDaemonHeartbeatZeroIntervalUsesDefault(t *testing.T) {
 	}
 	if got := daemonHeartbeatEffectiveInterval(time.Second); got != time.Second {
 		t.Fatalf("effective interval for a positive value = %v, want 1s", got)
+	}
+}
+
+// wakePromptRecorder is the HTTP doer one deliverer uses. It records the
+// request so a test can read the route and body the deliverer sent.
+type wakePromptRecorder struct {
+	calls  int
+	method string
+	path   string
+	body   string
+}
+
+func (r *wakePromptRecorder) Do(req *http.Request) (*http.Response, error) {
+	r.calls++
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.method = req.Method
+	r.path = req.URL.Path
+	r.body = string(data)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Body:       io.NopCloser(strings.NewReader(`{}`)),
+		Header:     http.Header{},
+	}, nil
+}
+
+func TestDaemonWakeDelivererUsesHTTPWithRegistration(t *testing.T) {
+	doer := &wakePromptRecorder{}
+	runnerCalls := 0
+	runner := func(context.Context, ...string) ([]byte, error) {
+		runnerCalls++
+		return nil, errors.New("CLI runner called with a live registration")
+	}
+	deliverer := daemonWakeDeliverer(func() (opencode.Config, error) {
+		return opencode.Config{URL: "http://127.0.0.1:64000", Password: "pw"}, nil
+	}, doer, runner)
+
+	if err := deliverer(context.Background(), "ses_abc", "verdict text"); err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	if runnerCalls != 0 {
+		t.Fatalf("CLI runner called %d times, want 0", runnerCalls)
+	}
+	if doer.calls != 1 {
+		t.Fatalf("HTTP requests = %d, want 1", doer.calls)
+	}
+	if doer.method != http.MethodPost || doer.path != "/api/session/ses_abc/prompt" {
+		t.Fatalf("request = %s %s, want POST /api/session/ses_abc/prompt", doer.method, doer.path)
+	}
+	var body struct {
+		Text     string `json:"text"`
+		Delivery string `json:"delivery"`
+		Resume   bool   `json:"resume"`
+	}
+	if err := json.Unmarshal([]byte(doer.body), &body); err != nil {
+		t.Fatalf("decode body %q: %v", doer.body, err)
+	}
+	if body.Text != "verdict text" || body.Delivery != "steer" || !body.Resume {
+		t.Fatalf("body = %+v, want text=verdict text, delivery=steer, resume=true", body)
+	}
+}
+
+func TestDaemonWakeDelivererMarksCLIFallback(t *testing.T) {
+	noRegistration := errors.New("service.json missing")
+	runnerCalls := 0
+	runner := func(context.Context, ...string) ([]byte, error) {
+		runnerCalls++
+		return nil, errors.New("opencode api failed")
+	}
+	deliverer := daemonWakeDeliverer(func() (opencode.Config, error) {
+		return opencode.Config{}, noRegistration
+	}, nil, runner)
+
+	err := deliverer(context.Background(), "ses_abc", "verdict text")
+	if err == nil {
+		t.Fatal("deliver without a registration returned nil error")
+	}
+	if runnerCalls != 1 {
+		t.Fatalf("CLI runner called %d times, want 1", runnerCalls)
+	}
+	if !strings.Contains(err.Error(), "CLI fallback") {
+		t.Fatalf("error = %q, want a marked CLI fallback", err)
+	}
+	if !errors.Is(err, noRegistration) {
+		t.Fatalf("error = %v, want the registration cause", err)
 	}
 }

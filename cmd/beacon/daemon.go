@@ -19,6 +19,7 @@ import (
 	"github.com/refusedguy/beacon/internal/app/tasks"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 	"github.com/refusedguy/beacon/internal/infra/wake"
@@ -161,6 +162,44 @@ func daemonWakeRoute(deliver wake.TargetDeliverer) orchestrator.WakeRoute {
 	return func(ctx context.Context, w orchestrator.DaemonWatch, _ uint64, verdict, text string) error {
 		router := newDaemonNotifyRouter(w.SubscriberID, deliver)
 		return routeDaemonEvent(ctx, router, verdict, w.SubscriberID, text)
+	}
+}
+
+// daemonWakeDeliverer builds the transport behind one verdict wake. With a
+// service registration it posts through the one HTTP client, so a wake does
+// not fork `opencode api`. Without one it keeps the CLI path and marks its
+// errors as a fallback instead of reporting a delivered HTTP wake (MM-05).
+func daemonWakeDeliverer(
+	discover func() (opencode.Config, error),
+	doer opencode.Doer,
+	runner wake.T202Runner,
+) wake.TargetDeliverer {
+	cli := wake.PromptTargetDeliverer(&wake.T202API{T202Runner: runner})
+	cfg, err := discover()
+	if err == nil {
+		var client *opencode.Client
+		client, err = opencode.New(cfg, doer)
+		if err == nil {
+			return func(ctx context.Context, target, payload string) error {
+				if !strings.HasPrefix(target, "ses_") || len(target) == len("ses_") {
+					return fmt.Errorf("daemon wake: invalid notify target %q", target)
+				}
+				return client.PromptWithOptions(ctx, target, payload, opencode.PromptOptions{
+					Delivery: "steer",
+					Resume:   true,
+				})
+			}
+		}
+	}
+	fallbackErr := err
+	observe.Event(observe.LevelWarn, "daemon_wake_cli_fallback", observe.Fields{
+		"reason": fallbackErr.Error(),
+	})
+	return func(ctx context.Context, target, payload string) error {
+		if err := cli(ctx, target, payload); err != nil {
+			return fmt.Errorf("daemon wake: CLI fallback: %w; HTTP client unavailable: %w", err, fallbackErr)
+		}
+		return nil
 	}
 }
 
@@ -731,7 +770,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			}
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
-		}, daemonWakeRouteWithGate(wake.PromptTargetDeliverer(&wake.T202API{}), gate), newDaemonWakeBackend(), wake.SharedDeliveryDedup()),
+		}, daemonWakeRouteWithGate(daemonWakeDeliverer(opencode.Discover, opencodeHTTPDoer, nil), gate), newDaemonWakeBackend(), wake.SharedDeliveryDedup()),
 	}, db.Close, nil
 }
 
