@@ -165,6 +165,161 @@ func daemonOrderPorts(order *[]string) (DaemonPorts, *daemonSubscribe, *daemonSu
 	return ports, sub, summary
 }
 
+// daemonSchedules is a fake schedule port. MarkTriggered advances the stored
+// row, so a second pass observes the acknowledgement made by the first.
+type daemonSchedules struct {
+	rows    []DaemonDueSchedule
+	listErr error
+	markErr error
+	calls   int
+	marks   []daemonScheduleMark
+	order   *[]string
+}
+
+type daemonScheduleMark struct {
+	id      string
+	nextRun time.Time
+}
+
+func (s *daemonSchedules) ListDue(_ context.Context, now time.Time) ([]DaemonDueSchedule, error) {
+	s.calls++
+	if s.order != nil {
+		*s.order = append(*s.order, "schedules")
+	}
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	out := []DaemonDueSchedule{}
+	for _, row := range s.rows {
+		if row.NextRun.After(now) {
+			continue
+		}
+		out = append(out, row)
+	}
+	return out, nil
+}
+
+func (s *daemonSchedules) MarkTriggered(_ context.Context, id string, nextRun time.Time) error {
+	s.marks = append(s.marks, daemonScheduleMark{id: id, nextRun: nextRun})
+	if s.markErr != nil {
+		return s.markErr
+	}
+	for i := range s.rows {
+		if s.rows[i].ID == id {
+			s.rows[i].NextRun = nextRun
+		}
+	}
+	return nil
+}
+
+// An overdue schedule is marked once, and the next pass sees no due row.
+func TestDaemonDueSchedulesFireOncePerPeriod(t *testing.T) {
+	now := time.Now()
+	sched := &daemonSchedules{rows: []DaemonDueSchedule{{
+		ID: "s-due", NextRun: now.Add(-time.Hour), Interval: time.Hour,
+	}}}
+	check := &daemonCheckAll{}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	ports := daemonPorts(check, orch, &daemonCloser{}, nil, nil)
+	ports.Schedules = sched
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(sched.marks) != 1 || sched.marks[0].id != "s-due" {
+		t.Fatalf("marks = %+v, want exactly one mark for s-due", sched.marks)
+	}
+	if !sched.marks[0].nextRun.After(now) {
+		t.Fatalf("next run %v is not after now %v", sched.marks[0].nextRun, now)
+	}
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(sched.marks) != 1 {
+		t.Fatalf("marks after second pass = %+v, want no repeat", sched.marks)
+	}
+}
+
+// Several missed periods collapse into one future run, not one trigger per
+// missed interval. A row without an interval is skipped.
+func TestDaemonNextRunCollapsesMissedPeriods(t *testing.T) {
+	now := time.Now()
+	next, ok := daemonNextRun(now.Add(-3*time.Hour), time.Hour, now)
+	if !ok || !next.Equal(now.Add(time.Hour)) {
+		t.Fatalf("next run = %v, ok = %v, want %v", next, ok, now.Add(time.Hour))
+	}
+	if _, ok := daemonNextRun(now, 0, now); ok {
+		t.Fatal("a row without a positive interval must not be triggered")
+	}
+	if _, ok := daemonNextRun(time.Time{}, time.Hour, now); ok {
+		t.Fatal("a row without a next run must not be triggered")
+	}
+}
+
+func TestDaemonSkipsScheduleWithoutInterval(t *testing.T) {
+	now := time.Now()
+	sched := &daemonSchedules{rows: []DaemonDueSchedule{{
+		ID: "s-bad", NextRun: now.Add(-time.Hour),
+	}}}
+	ports := daemonPorts(&daemonCheckAll{}, &daemonOrchestrator{
+		custom: func(context.Context, Waker) error { return nil },
+	}, &daemonCloser{}, nil, nil)
+	ports.Schedules = sched
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	if len(sched.marks) != 0 {
+		t.Fatalf("marks = %+v, want none for a row without an interval", sched.marks)
+	}
+}
+
+// A failing schedule port is logged and does not stop the rest of the pass.
+func TestDaemonScheduleErrorDoesNotStopPass(t *testing.T) {
+	sched := &daemonSchedules{listErr: errors.New("schedules boom")}
+	check := &daemonCheckAll{}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	closer := &daemonCloser{}
+	var logs []string
+	ports := daemonPorts(check, orch, closer, nil, func(format string, args ...any) {
+		logs = append(logs, fmt.Sprintf(format, args...))
+	})
+	ports.Schedules = sched
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatalf("daemon must not fall on a schedule error: %v", err)
+	}
+	if orch.calls != 1 || closer.calls != 1 {
+		t.Fatalf("orchestrate/close calls = %d/%d, want 1/1", orch.calls, closer.calls)
+	}
+	if !strings.Contains(strings.Join(logs, "\n"), "daemon: schedules: schedules boom") {
+		t.Fatalf("schedule error not logged: %q", logs)
+	}
+}
+
+// The schedule step sits after subscribe and before orchestration, and does
+// not disturb the order of the existing steps.
+func TestDaemonSchedulesStepRunsBeforeOrchestrate(t *testing.T) {
+	var order []string
+	check := &daemonCheckAll{hook: func() { order = append(order, "checkall") }}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error {
+		order = append(order, "orchestrate")
+		return nil
+	}}
+	closer := &daemonCloser{order: &order}
+	ports := daemonPorts(check, orch, closer, nil, nil)
+	ports.Schedules = &daemonSchedules{order: &order}
+
+	if err := DaemonRun(context.Background(), ports, time.Hour, true); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"checkall", "schedules", "orchestrate", "close-merged"}
+	if !reflect.DeepEqual(order, want) {
+		t.Fatalf("step order = %q, want %q", order, want)
+	}
+}
+
 func TestDaemonOnceRunsOnePass(t *testing.T) {
 	check := &daemonCheckAll{}
 	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}

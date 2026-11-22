@@ -1,9 +1,9 @@
 // Package orchestrator implements the background daemon that drives one
-// automatic pass over Beacon Watches: check CI, enroll the orchestrator on
-// active Watches, merge what is ready, print the workload summary and close
-// Watches whose PR is finished. The loop owns no adapters. The composition
-// root supplies the actions as narrow ports so tests can replace each one
-// with a fake.
+// automatic pass over Beacon Watches: trigger due schedules, check CI, enroll
+// the orchestrator on active Watches, merge what is ready, print the workload
+// summary and close Watches whose PR is finished. The loop owns no adapters.
+// The composition root supplies the actions as narrow ports so tests can
+// replace each one with a fake.
 package orchestrator
 
 import (
@@ -25,25 +25,45 @@ import (
 // environment asks for a different value.
 const DaemonInterval = 3 * time.Minute
 
+// DaemonDueSchedule is one schedule row the daemon can trigger. The adapter
+// that implements DaemonSchedules maps a stored row onto these fields, so the
+// pass sees no spec string and no SQL handle.
+type DaemonDueSchedule struct {
+	ID       string
+	NextRun  time.Time
+	Interval time.Duration
+}
+
+// DaemonSchedules is the schedule port of one daemon pass. ListDue returns the
+// rows whose next_run is at or before now. MarkTriggered moves a row's
+// next_run forward so one period is triggered once, including after a restart.
+type DaemonSchedules interface {
+	ListDue(ctx context.Context, now time.Time) ([]DaemonDueSchedule, error)
+	MarkTriggered(ctx context.Context, id string, nextRun time.Time) error
+}
+
 // DaemonPorts are the actions of one daemon pass.
 //
 // CheckAll lists open PRs, searches for an existing Watch for each one before
 // registering a new one, and publishes the verdict. This is the daemon's
 // "search before create" step: an open PR must reuse its Watch instead of
 // producing a duplicate. Subscribe enrolls the orchestrator on every active
-// Watch before the orchestrator pass. Orchestrate merges ready Watches and
+// Watch before the orchestrator pass. Schedules lists due schedules and marks
+// each trigger once before orchestration. Orchestrate merges ready Watches and
 // hands retry/fail Watches to the Waker. Summary returns the workload snapshot
 // the pass prints after orchestration. Verify reports whether the conditions
 // required to close a card are met. CloseMerged closes Watches whose PR is
 // already merged or closed, but only after Verify passes. CheckAll, Orchestrate
-// and CloseMerged are required. Subscribe, Summary and Verify are optional: a
-// nil port skips that step, and a nil Verify keeps the original close behaviour
-// for older callers. A nil Waker is allowed and simply suppresses wakes. Tracer
-// is optional: a nil tracer uses the process tracer from observe.Current, so a
-// caller that wires nothing keeps the no-op default (T3.394).
+// and CloseMerged are required. Subscribe, Schedules, Summary and Verify are
+// optional: a nil port skips that step, and a nil Verify keeps the original
+// close behaviour for older callers. A nil Waker is allowed and simply
+// suppresses wakes. Tracer is optional: a nil tracer uses the process tracer
+// from observe.Current, so a caller that wires nothing keeps the no-op default
+// (T3.394).
 type DaemonPorts struct {
 	CheckAll    func(ctx context.Context) error
 	Subscribe   func(ctx context.Context) error
+	Schedules   DaemonSchedules
 	Orchestrate func(ctx context.Context, waker Waker) error
 	Summary     func(ctx context.Context) (Workload, error)
 	Verify      func(ctx context.Context) (bool, error)
@@ -57,11 +77,11 @@ type DaemonPorts struct {
 // ctx is cancelled. With once it stops after the first pass, which is what the
 // tests and one-shot invocations use.
 //
-// One pass runs checkall, subscribe, orchestrate, summary, verify and
-// close-merged in that order. Verify gates close-merged: a card whose required
-// checks did not pass stays open. An error from any port is logged and
-// swallowed: one failing step must never bring the daemon down or hide the
-// remaining actions.
+// One pass runs checkall, subscribe, schedules, orchestrate, summary, verify
+// and close-merged in that order. A nil Schedules port skips that step. Verify
+// gates close-merged: a card whose required checks did not pass stays open. An
+// error from any port is logged and swallowed: one failing step must never
+// bring the daemon down or hide the remaining actions.
 func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, once bool) error {
 	if ports.CheckAll == nil || ports.Orchestrate == nil || ports.CloseMerged == nil {
 		return errors.New("daemon: checkall, orchestrate and close-merged ports are required")
@@ -94,6 +114,11 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 		if ports.Subscribe != nil {
 			if err := ports.Subscribe(passCtx); err != nil {
 				logf("daemon: subscribe: %v", err)
+			}
+		}
+		if ports.Schedules != nil {
+			if err := triggerDueSchedules(passCtx, ports.Schedules, time.Now()); err != nil {
+				logf("daemon: schedules: %v", err)
 			}
 		}
 		if err := ports.Orchestrate(passCtx, ports.Waker); err != nil {
@@ -149,6 +174,42 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 			pass()
 		}
 	}
+}
+
+// daemonNextRun moves nextRun forward by whole intervals until it is after
+// now. Missed intervals collapse into one future run, so a daemon that was
+// down for several periods produces one trigger after it comes back. A row
+// with no usable interval is not triggered.
+func daemonNextRun(nextRun time.Time, interval time.Duration, now time.Time) (time.Time, bool) {
+	if nextRun.IsZero() || interval <= 0 {
+		return time.Time{}, false
+	}
+	if nextRun.After(now) {
+		return nextRun, true
+	}
+	elapsed := now.Sub(nextRun)
+	return nextRun.Add(elapsed/interval*interval + interval), true
+}
+
+// triggerDueSchedules acknowledges every due row once. A failed ListDue or
+// MarkTriggered is returned to the caller, which logs it and keeps the rest of
+// the pass. One bad row does not stop the remaining rows from being marked.
+func triggerDueSchedules(ctx context.Context, port DaemonSchedules, now time.Time) error {
+	due, err := port.ListDue(ctx, now)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, s := range due {
+		next, ok := daemonNextRun(s.NextRun, s.Interval, now)
+		if !ok {
+			continue
+		}
+		if err := port.MarkTriggered(ctx, s.ID, next); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // DaemonWatch is the primitive projection of a Watch the daemon's waker reads.
