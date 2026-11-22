@@ -14,10 +14,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	gh "github.com/google/go-github/v93/github"
 )
@@ -32,6 +34,13 @@ const (
 	// failureExcerptLimit is the 2 KB ceiling applied by this adapter as well
 	// as by the MCP boundary, so a caller cannot receive a huge blob.
 	failureExcerptLimit = 2048
+	// failureExcerptSourcePadding is the number of source lines kept on each
+	// side of an annotated line. aider uses loi_pad=3 in its tree context
+	// (aider/linter.py:234-256), so the agent sees the same window.
+	failureExcerptSourcePadding = 3
+	// failureExcerptSourceMaxFile caps the bytes read from one source file. A
+	// failed annotation must not turn into a multi-megabyte read.
+	failureExcerptSourceMaxFile = 256 << 10
 )
 
 // tokenEnvChain is the token lookup order from WORKER-PROMPT §2.
@@ -383,8 +392,108 @@ func failedCheckRunConclusion(conclusion string) bool {
 	return false
 }
 
+// annotationSourceRoot returns the directory annotation paths are resolved
+// against. Beacon runs inside a repository checkout, so the working directory
+// is the default. BEACON_EXCERPT_SOURCE_ROOT can point at another checkout.
+func annotationSourceRoot() string {
+	if root := strings.TrimSpace(os.Getenv("BEACON_EXCERPT_SOURCE_ROOT")); root != "" {
+		return filepath.Clean(root)
+	}
+	return "."
+}
+
+// loadAnnotationSource reads the checked-out file named by a CI annotation.
+// Annotation paths are external input: an absolute path and any path that
+// escapes the source root are rejected. A missing or unreadable file yields an
+// empty string, so a source miss never turns into a failed excerpt.
+func loadAnnotationSource(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || filepath.IsAbs(path) {
+		return ""
+	}
+	clean := filepath.Clean(path)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	f, err := os.Open(filepath.Join(annotationSourceRoot(), clean))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, failureExcerptSourceMaxFile))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// FormatAnnotationSource renders the source window for one annotation. The
+// target line carries a █ marker and the three lines on each side are numbered.
+// Passing source avoids a disk read for callers that already have the file text.
+// An empty source or a line number outside the file yields no window.
+func FormatAnnotationSource(path string, startLine int, source string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || startLine <= 0 {
+		return ""
+	}
+	if source == "" {
+		source = loadAnnotationSource(path)
+	}
+	if source == "" {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(source, "\r\n", "\n"), "\n")
+	if startLine > len(lines) {
+		return ""
+	}
+	first := startLine - failureExcerptSourcePadding
+	if first < 1 {
+		first = 1
+	}
+	last := startLine + failureExcerptSourcePadding
+	if last > len(lines) {
+		last = len(lines)
+	}
+	width := len(strconv.Itoa(last))
+	var b strings.Builder
+	b.WriteString("# Fix any errors below, the annotated line is marked with █.\n")
+	b.WriteString(path)
+	b.WriteString(":\n")
+	for n := first; n <= last; n++ {
+		marker := " "
+		if n == startLine {
+			marker = "█"
+		}
+		digits := strconv.Itoa(n)
+		b.WriteString(marker)
+		b.WriteByte(' ')
+		b.WriteString(strings.Repeat(" ", width-len(digits)))
+		b.WriteString(digits)
+		b.WriteString(" │ ")
+		b.WriteString(lines[n-1])
+		if n < last {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// clampExcerptBytes cuts a string at the 2 KB ceiling without splitting a
+// UTF-8 rune. The █ marker is multibyte, so a plain byte slice can corrupt it.
+func clampExcerptBytes(s string) string {
+	if len(s) <= failureExcerptLimit {
+		return s
+	}
+	s = s[:failureExcerptLimit]
+	for len(s) > 0 && !utf8.ValidString(s) {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
 // formatCheckRunAnnotations renders "path:line: title: message" lines in the
-// order GitHub returned them. Empty fields are skipped, and the byte budget is
+// order GitHub returned them, followed by the marked source window when the
+// annotated file is available. Empty fields are skipped, and the byte budget is
 // enforced here as a second line of defence behind the MCP boundary.
 func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
 	var b strings.Builder
@@ -400,9 +509,11 @@ func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
 		if b.Len() > 0 {
 			b.WriteByte('\n')
 		}
-		if p := strings.TrimSpace(a.GetPath()); p != "" {
-			b.WriteString(p)
-			if line := a.GetStartLine(); line > 0 {
+		path := strings.TrimSpace(a.GetPath())
+		line := int(a.GetStartLine())
+		if path != "" {
+			b.WriteString(path)
+			if line > 0 {
 				b.WriteByte(':')
 				b.WriteString(strconv.Itoa(line))
 			}
@@ -415,13 +526,13 @@ func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
 			}
 		}
 		b.WriteString(message)
+		if source := FormatAnnotationSource(path, line, ""); source != "" {
+			b.WriteByte('\n')
+			b.WriteString(source)
+		}
 		if b.Len() >= failureExcerptLimit {
 			break
 		}
 	}
-	out := b.String()
-	if len(out) > failureExcerptLimit {
-		out = out[:failureExcerptLimit]
-	}
-	return out
+	return clampExcerptBytes(b.String())
 }
