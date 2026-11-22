@@ -968,8 +968,10 @@ func (b *verdictApplier) watchFixFor(w domain.Watch) string {
 	return ""
 }
 
-// unblockFixed resumes the Watch a merged fixer Watch points at. It is the
-// fallback used when no control-plane port is bound.
+// unblockFixed resumes the Watch a merged fixer Watch points at. With a
+// control plane bound it resolves the blocker incident so a later block with
+// the same signature gets a fresh wake. Without the port it applies the domain
+// unblock transition to the single target Watch.
 func (b *verdictApplier) unblockFixed(merged domain.Watch) {
 	fixer := merged
 	if b.watchFixFor(fixer) == "" {
@@ -1002,7 +1004,46 @@ func (b *verdictApplier) unblockFixed(merged domain.Watch) {
 	if target.Status != domain.StatusBlocked || target.Blocked == nil {
 		return
 	}
-	next, _ := domain.Transition(target, domain.UnblockEvent(b.clock.Now()))
+	now := b.clock.Now()
+	if b.control != nil {
+		blockerID := target.BlockerID
+		if blockerID == "" {
+			// A Watch blocked before its incident link was written still
+			// carries the blocked payload. Find its open incident by membership.
+			active, err := b.control.ActiveBlockers()
+			if err != nil {
+				observe.ActorError("cibridge-unblock-blockers", target.ID, err)
+			} else {
+				for _, incident := range active {
+					for _, id := range incident.BlockedWatchIDs {
+						if id == target.ID {
+							blockerID = incident.ID
+							break
+						}
+					}
+					if blockerID != "" {
+						break
+					}
+				}
+			}
+		}
+		if blockerID != "" {
+			unblocked, err := b.control.ResolveBlocker(blockerID, now)
+			if err != nil {
+				observe.ActorError("cibridge-unblock-resolve", target.ID, err)
+				log.Printf("cibridge: unblock resolve %s: %v", target.ID, err)
+				return
+			}
+			ids := make([]string, 0, len(unblocked))
+			for _, unwound := range unblocked {
+				ids = append(ids, unwound.ID)
+			}
+			b.rotateGenerations(ids...)
+			log.Printf("cibridge: %s unblocked by %s#%d via blocker %s", target.ID, fixer.Repo, fixer.PR, blockerID)
+			return
+		}
+	}
+	next, _ := domain.Transition(target, domain.UnblockEvent(now))
 	if next.Revision == target.Revision || next.Status != domain.StatusWatching {
 		return
 	}
