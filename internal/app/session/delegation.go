@@ -77,13 +77,18 @@ type TokenUsage struct {
 // ContextSnapshot is the data a parent passes to a spawned child. The map is
 // copied on construction and on read, so a caller cannot change a snapshot
 // after it has been handed to a child. The zero value is an empty snapshot.
-// ranked holds an optional ranked repository map (CA-01). It is immutable for
-// the same reason as values: each snapshot owns its text. The token fields
-// carry the per-category accounting (CA-07); they are copied on write in the
-// same way and are never exposed as MCP fields.
+// ranked holds an optional ranked repository map (CA-01). attached holds files
+// the parent confirmed from a mention (CA-10). ignored holds mention keys the
+// parent refused, so a later turn does not ask for them again. reflected is the
+// message sent back to the parent on the next turn. The token fields carry the
+// per-category accounting (CA-07). All of them are copied on write and owned by
+// the snapshot, like values; the token fields never appear as MCP fields.
 type ContextSnapshot struct {
 	values       map[string]string
 	ranked       string
+	attached     map[string]string
+	ignored      map[string]bool
+	reflected    string
 	tokens       map[TokenCategory]int
 	maxInput     int
 	costPerToken float64
@@ -95,7 +100,11 @@ func NewContext(values map[string]string) ContextSnapshot {
 	for k, v := range values {
 		cp[k] = v
 	}
-	return ContextSnapshot{values: cp}
+	return ContextSnapshot{
+		values:   cp,
+		attached: make(map[string]string),
+		ignored:  make(map[string]bool),
+	}
 }
 
 // Get returns the value for key and whether the key exists.
@@ -190,10 +199,168 @@ func (c ContextSnapshot) TokenUsage() TokenUsage {
 	return u
 }
 
+// WithAttachedFiles returns a copy of c with paths attached. Each path is
+// stored under its normalized mention key, so a later mention of the same file
+// does not ask for it twice. Empty paths are ignored.
+func (c ContextSnapshot) WithAttachedFiles(paths []string) ContextSnapshot {
+	attached := make(map[string]string, len(c.attached)+len(paths))
+	for k, v := range c.attached {
+		attached[k] = v
+	}
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		attached[mentionKey(p)] = filepath.ToSlash(p)
+	}
+	c.attached = attached
+	return c
+}
+
+// AttachedFiles returns the confirmed file paths sorted by value. The slice is
+// a copy, so a caller cannot mutate the snapshot through it.
+func (c ContextSnapshot) AttachedFiles() []string {
+	out := make([]string, 0, len(c.attached))
+	for _, v := range c.attached {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WithIgnoredMentions returns a copy of c that remembers keys as refused. A
+// refused key is filtered out of later mention requests.
+func (c ContextSnapshot) WithIgnoredMentions(keys []string) ContextSnapshot {
+	ignored := make(map[string]bool, len(c.ignored)+len(keys))
+	for k, v := range c.ignored {
+		ignored[k] = v
+	}
+	for _, k := range keys {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if k != "" {
+			ignored[k] = true
+		}
+	}
+	c.ignored = ignored
+	return c
+}
+
+// IgnoredMentions returns the refused mention keys sorted by value.
+func (c ContextSnapshot) IgnoredMentions() []string {
+	out := make([]string, 0, len(c.ignored))
+	for k := range c.ignored {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// WithReflected returns a copy of c carrying text as the message shown to the
+// parent on the next turn. An empty text clears it.
+func (c ContextSnapshot) WithReflected(text string) ContextSnapshot {
+	c.reflected = text
+	return c
+}
+
+// Reflected returns the message queued for the parent on the next turn.
+func (c ContextSnapshot) Reflected() string { return c.reflected }
+
+// mentionKey normalizes a path or identifier to the key used for matching. It
+// takes the base name, drops the extension and lowercases the result, so
+// "delegation.go", "pkg/delegation.go" and "delegation" all resolve alike.
+func mentionKey(token string) string {
+	base := filepath.Base(filepath.ToSlash(strings.TrimSpace(token)))
+	base = strings.TrimSuffix(base, filepath.Ext(base))
+	return strings.ToLower(base)
+}
+
+// mentionTokenRE matches file paths and identifiers of at least five
+// characters, the same shape aider uses when it scans an answer.
+var mentionTokenRE = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_./-]{4,}`)
+
+// ParseMentions returns the path and identifier tokens found in text, in
+// first-seen order and without duplicates. A trailing dot or slash from prose
+// is trimmed. Tokens shorter than five characters are ignored.
+func ParseMentions(text string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, raw := range mentionTokenRE.FindAllString(text, -1) {
+		token := strings.TrimRight(raw, "./-")
+		if token == "" || seen[token] {
+			continue
+		}
+		seen[token] = true
+		out = append(out, token)
+	}
+	return out
+}
+
+// MatchMentionFiles resolves mention tokens to repository files by name
+// without extension. files are repository-relative paths. A key shared by
+// more than one file is ambiguous and is skipped. The result keeps mention
+// order and contains no duplicate paths.
+func MatchMentionFiles(mentions, files []string) []string {
+	index := make(map[string]string, len(files))
+	ambiguous := make(map[string]bool)
+	for _, f := range files {
+		path := filepath.ToSlash(f)
+		key := mentionKey(path)
+		if prev, ok := index[key]; ok && prev != path {
+			ambiguous[key] = true
+			continue
+		}
+		index[key] = path
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range mentions {
+		key := mentionKey(m)
+		if ambiguous[key] {
+			continue
+		}
+		path, ok := index[key]
+		if !ok || seen[path] {
+			continue
+		}
+		seen[path] = true
+		out = append(out, path)
+	}
+	return out
+}
+
+// MentionChoice is the parent's answer for one resolved mention file.
+type MentionChoice struct {
+	Path   string
+	Accept bool
+}
+
+// reflectedMessage builds the message returned to the parent after a mention
+// decision. It names the attached paths and the refused keys so the next turn
+// can explain both outcomes.
+func reflectedMessage(attached, ignored []string) string {
+	var b strings.Builder
+	if len(attached) > 0 {
+		paths := append([]string(nil), attached...)
+		sort.Strings(paths)
+		b.WriteString("attached mentioned files: " + strings.Join(paths, ", "))
+	}
+	if len(ignored) > 0 {
+		keys := append([]string(nil), ignored...)
+		sort.Strings(keys)
+		if b.Len() > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString("ignored mentions (no repeat request): " + strings.Join(keys, ", "))
+	}
+	return b.String()
+}
+
 // merged returns a new snapshot with other's entries written over c's. The
 // ranked map follows the same rule: a non-empty map from other replaces the
 // inherited one, and an empty one leaves the parent's map intact. Token counts
 // merge by category, while the window and price come from other when set.
+// Attached files and ignored mentions are unioned. A non-empty reflected
+// message from other replaces the inherited one.
 func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	out := c.Entries()
 	for k, v := range other.values {
@@ -218,9 +385,33 @@ func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	if other.costPerToken > 0 {
 		cost = other.costPerToken
 	}
+	attached := make(map[string]string, len(c.attached)+len(other.attached))
+	for k, v := range c.attached {
+		attached[k] = v
+	}
+	for k, v := range other.attached {
+		attached[k] = v
+	}
+	ignored := make(map[string]bool, len(c.ignored)+len(other.ignored))
+	for k, v := range c.ignored {
+		ignored[k] = v
+	}
+	for k, v := range other.ignored {
+		ignored[k] = v
+	}
+	reflected := c.reflected
+	if other.reflected != "" {
+		reflected = other.reflected
+	}
 	return ContextSnapshot{
-		values: out, ranked: ranked, tokens: tokens,
-		maxInput: maxInput, costPerToken: cost,
+		values:       out,
+		ranked:       ranked,
+		attached:     attached,
+		ignored:      ignored,
+		reflected:    reflected,
+		tokens:       tokens,
+		maxInput:     maxInput,
+		costPerToken: cost,
 	}
 }
 
@@ -369,13 +560,63 @@ func (r *Registry) IDs() []ThreadID {
 	return out
 }
 
+// PendingMentionFiles returns the repository files mentioned in text that the
+// thread has neither attached nor refused. text is the card text or the
+// executor answer; files is the repository file list. An unknown thread
+// returns ErrUnknownThread. The result keeps first-seen mention order.
+func (r *Registry) PendingMentionFiles(id ThreadID, text string, files []string) ([]string, error) {
+	t, ok := r.threads[id]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownThread, id)
+	}
+	var out []string
+	for _, path := range MatchMentionFiles(ParseMentions(text), files) {
+		key := mentionKey(path)
+		if t.Context.ignored[key] {
+			continue
+		}
+		if _, attached := t.Context.attached[key]; attached {
+			continue
+		}
+		out = append(out, path)
+	}
+	return out, nil
+}
+
+// ApplyMentionChoices records the parent's decision on the mention files of a
+// thread. Accepted paths are attached to the child's context; refused paths
+// are remembered so they are not offered again. The returned message is the
+// reflected message queued for the next turn. An unknown thread returns
+// ErrUnknownThread.
+func (r *Registry) ApplyMentionChoices(id ThreadID, choices []MentionChoice) (ContextSnapshot, string, error) {
+	t, ok := r.threads[id]
+	if !ok {
+		return ContextSnapshot{}, "", fmt.Errorf("%w: %s", ErrUnknownThread, id)
+	}
+	var attached, ignored []string
+	for _, c := range choices {
+		if c.Accept {
+			attached = append(attached, c.Path)
+		} else {
+			ignored = append(ignored, mentionKey(c.Path))
+		}
+	}
+	message := reflectedMessage(attached, ignored)
+	t.Context = t.Context.WithAttachedFiles(attached).WithIgnoredMentions(ignored).WithReflected(message)
+	r.threads[id] = t
+	return t.Context, message, nil
+}
+
 // ParentNotice is the projection of a child's question into the parent chat.
 // ChildName is included so the parent sees which child asked.
+// ReflectedMessage carries the result of the last mention decision into the
+// next turn (CA-10).
 type ParentNotice struct {
-	ParentID  ThreadID `json:"parentID"`
-	ChildID   ThreadID `json:"childID"`
-	ChildName string   `json:"childName"`
-	Question  string   `json:"question"`
+	ParentID         ThreadID `json:"parentID"`
+	ChildID          ThreadID `json:"childID"`
+	ChildName        string   `json:"childName"`
+	Question         string   `json:"question"`
+	ReflectedMessage string   `json:"reflectedMessage,omitempty"`
 }
 
 // Notifier delivers a notice to a parent chat. The model calls this function
@@ -401,10 +642,11 @@ func (r *Registry) Ask(ctx context.Context, notifier Notifier, childID ThreadID,
 		return ParentNotice{}, fmt.Errorf("%w: %s", ErrNoParent, childID)
 	}
 	notice := ParentNotice{
-		ParentID:  child.ParentID,
-		ChildID:   child.ID,
-		ChildName: child.Name,
-		Question:  question,
+		ParentID:         child.ParentID,
+		ChildID:          child.ID,
+		ChildName:        child.Name,
+		Question:         question,
+		ReflectedMessage: child.Context.Reflected(),
 	}
 	if notifier == nil {
 		return notice, nil

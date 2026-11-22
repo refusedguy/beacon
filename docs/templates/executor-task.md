@@ -82,6 +82,24 @@ warn: below-1024, /drop-or-clear
 mcp-fields: unchanged
 executor-task:token-accounting -->
 
+| упоминания файлов | текст карточки и ответ исполнителя | пути из текста добавляются в контекст после подтверждения |
+
+## Упоминания файлов в контексте потомка
+
+Текст карточки и ответ исполнителя содержат имена файлов и идентификаторы от пяти символов. Модель в `internal/app/session/delegation.go` разбирает эти упоминания и сопоставляет их с файлами репозитория по имени без расширения. Идентификатор, который совпадает с несколькими файлами, не добавляется: он неоднозначен.
+
+Файл попадает в `ContextSnapshot` только после подтверждения. Отказ запоминается в `ignored mentions`, и повторный запрос по тому же ключу не приходит. Решение возвращается reflected-сообщением и попадает в `ParentNotice.ReflectedMessage` на следующем ходу.
+
+Источник: карточка CA-10, `aider/coders/base_coder.py:690-707` и `:1761-1781`.
+
+<!-- executor-task:mentions
+source: card-text-and-answer
+match: basename-without-extension
+attach: after-confirmation-only
+refusal: remembered, no-repeat
+next-turn: reflected-message
+executor-task:mentions -->
+
 ## Разделение каналов
 
 Агент меняет состояние цикла через MCP-инструменты. Это `beacon_watch_pr`, `beacon_ack`, `beacon_cancel_watch`, `beacon_task_claim`, `beacon_task_close` и `beacon_defer_wiring`. Агент зовёт их внутри хода и читает типизированную ошибку в ответе.
