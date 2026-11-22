@@ -1,5 +1,5 @@
 # ATX-M06. Писать канонические поля закрытия в карточку
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/tool_task_close.go, internal/infra/taskstore/close.go
@@ -12,3 +12,8 @@
 Шаги: Вынести запись канонических полей в общий модуль записи, доступный и `taskstore.CloseCard`, и адаптеру MCP. Учесть запрет на импорт соседнего infra: модуль должен жить в слое ниже или быть портом с двумя адаптерами. Передать `reason`, `duplicateOf`, `agentID` и время в вызов записи. Оставить базовые 13 полей без изменения. Покрыть тестом чтение карточки через `taskstore.ParseCard` после MCP-закрытия.
 Проверка: Тест проверяет, что все четыре поля закрытия читаются парсером. Тест на duplicate проверяет каноническое поле `Дубликат`, а не `Дублирует`.
 Приёмка: Карточка после MCP-закрытия содержит причину и доказательство в видимых полях. Ledger остаётся только как ключ идемпотентности.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with AUD-05 (already done). Supporting merged commit 0efa2344ba84 (PR #1469) touches the card OwnerFiles.
+Доказательство: Commit 0efa2344ba84ced85d9dae11d63947613259818c (PR #1469, fix(infra): один лок и формат закрытия карточек (AUD-05) (#1469)) touches OwnerFiles internal/infra/mcp/tool_task_close.go, internal/infra/taskstore/close.go; git merge-base --is-ancestor 0efa2344ba84ced85d9dae11d63947613259818c origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1469 0efa2344ba84
+Время закрытия: 2026-11-22T11:27:01Z

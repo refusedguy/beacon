@@ -1,5 +1,5 @@
 # ATX-W06. Устранить гонку закрытия head с регистрацией Watch
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/cibridge/verdict_applier.go, internal/infra/cibridge/ci_refresh.go, internal/domain/fanout.go, internal/infra/cibridge/bridge_test.go
@@ -12,3 +12,8 @@
 Шаги: Свести оба пути к одному детерминированному IDWatch для алиаса. Вынести закрытие старого Watch и создание преемника в одну транзакцию store с проверкой уникальности активного алиаса. При существующем преемнике объединять подписчиков и обязательства вместо выхода с `head_successor_exists`. Добавить тест с паузой в фейковом store после первого сохранения.
 Проверка: CI зелёный. После гонки ровно один Watch в статусе watching на новый SHA и один набор обязательств. Старый Watch закрыт с причиной `head_changed`.
 Приёмка: Повторная регистрация на новый head не создаёт дубль и не теряет подписчиков.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with AUTOSP-01 (already done). Supporting merged commit 059bbcd4ad85 (PR #1619) touches the card OwnerFiles.
+Доказательство: Commit 059bbcd4ad85ca3590df60b8425ea31e914d3477 (PR #1619, fix(cibridge): persist checks and merge state on watching verdict (#1619)) touches OwnerFiles internal/domain/fanout.go, internal/infra/cibridge/bridge_test.go, internal/infra/cibridge/ci_refresh.go, internal/infra/cibridge/verdict_applier.go; git merge-base --is-ancestor 059bbcd4ad85ca3590df60b8425ea31e914d3477 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1619 059bbcd4ad85
+Время закрытия: 2026-11-22T11:28:03Z

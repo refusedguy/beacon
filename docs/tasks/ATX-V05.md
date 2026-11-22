@@ -1,5 +1,5 @@
 # ATX-V05. Убрать дубль движка вердиктов из checkall
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/orchestrator/checkall.go, internal/app/orchestrator/checkall_test.go, internal/app/orchestrator/checkall_contract_test.go
@@ -12,3 +12,8 @@
 Шаги: Ввести узкий порт, который принимает список проверок и возвращает только факт наличия блокирующего сбоя и его имена. Composition root связывает порт с доменной функцией из ATX-V01. Перевести `VerdictFromChecks` и `FailedChecks` на порт. Обновить тест равенства зеркал вердиктов.
 Проверка: CI зелёный. Список только с optional FAILURE даёт `watching`, `FailedChecks` пуст и публикации нет. Список с required FAILURE даёт `retry` и имя в `FailedChecks`.
 Приёмка: checkall и cibridge принимают одинаковое решение по одному и тому же набору проверок.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with HD-024 (already done). Supporting merged commit 9be6c20b6bb4 (PR #1599) touches the card OwnerFiles.
+Доказательство: Commit 9be6c20b6bb4b333e154c585c20d5b63e627574c (PR #1599, fix(orchestrator): drop informational failures in parallel verdict (VC-06) (#1599)) touches OwnerFiles internal/app/orchestrator/checkall.go, internal/app/orchestrator/checkall_contract_test.go, internal/app/orchestrator/checkall_test.go; git merge-base --is-ancestor 9be6c20b6bb4b333e154c585c20d5b63e627574c origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1599 9be6c20b6bb4
+Время закрытия: 2026-11-22T11:27:01Z

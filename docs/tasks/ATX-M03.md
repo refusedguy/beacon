@@ -1,5 +1,5 @@
 # ATX-M03. Перенести cardID в контрактный вход beacon_watch_pr
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/tool_watch_pr.go, cmd/beacon/mcp.go, internal/infra/mcp/contract_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить необязательное поле `cardID` в `mcp.WatchPRInput` с тем же описанием, что использует обёртка в `cmd`. Убрать локальный тип `watchPRInputWithCard` и регистрацию обработчика в `cmd`, перенеся связь карточки в отдельный хук или колбэк. Обновить золотые константы в том же PR. Проверить, что связь карточки с Watch создаётся как при явном `cardID`, так и через `claimedCardForNotify`.
 Проверка: Контрактный тест и E2E зелёные в CI. Тест registration проверяет, что входная схема рабочего сервера содержит `cardID`.
 Приёмка: Один тип входа для `beacon_watch_pr`. Поведение связи карточки не изменилось для вызовов с `cardID` и без него.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with T2.9 (already done). Supporting merged commit bda51c0fde01 (PR #1602) touches the card OwnerFiles.
+Доказательство: Commit bda51c0fde01ddc2346be95d7927deb5647cdd75 (PR #1602, feat(mcp): wire MEM-04 maintenance into ReconcilePass (#1602)) touches OwnerFiles cmd/beacon/mcp.go, internal/infra/mcp/contract_test.go, internal/infra/mcp/tool_watch_pr.go; git merge-base --is-ancestor bda51c0fde01ddc2346be95d7927deb5647cdd75 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1602 bda51c0fde01
+Время закрытия: 2026-11-22T11:27:01Z

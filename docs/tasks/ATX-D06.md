@@ -1,5 +1,5 @@
 # ATX-D06. Пересобрать ROADMAP_STATUS по текущему дереву
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: docs/ROADMAP_STATUS.md, tools/roadmap-sync/main.go
@@ -12,3 +12,8 @@
 Шаги: Перегенерировать счётчики и дату по текущему SHA. Сверить каждую строку реестра с карточкой в `docs/tasks/`. Добавить проверку, что число в заголовке равно числу строк реестра и что пути OwnerFiles существуют в дереве.
 Проверка: CI зелёный. Повторный прогон generator не меняет файл. Проверка падает на искусственном расхождении счётчика или отсутствующем OwnerFile.
 Приёмка: Baseline SHA совпадает с HEAD. Число todo в заголовке равно числу строк реестра. Несуществующих OwnerFiles нет.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with BCX-04 (already done). Supporting merged commit 5a72ede9882c (PR #1622) touches the card OwnerFiles.
+Доказательство: Commit 5a72ede9882c5882f989f0f89021ecc228b66ec4 (PR #1622, docs(IDX-11): stop committing derived ROADMAP_STATUS.md (#1622)) touches OwnerFiles docs/ROADMAP_STATUS.md, tools/roadmap-sync/main.go; git merge-base --is-ancestor 5a72ede9882c5882f989f0f89021ecc228b66ec4 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1622 5a72ede9882c
+Время закрытия: 2026-11-22T11:27:01Z

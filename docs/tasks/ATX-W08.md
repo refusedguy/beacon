@@ -1,5 +1,5 @@
 # ATX-W08. Не передавать отмену лидера участникам общего CI-ождания
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/store/observability.go, internal/infra/store/observability_test.go
@@ -12,3 +12,8 @@
 Шаги: Создавать для раунда производный ctx с собственным таймаутом, не привязанным к отмене лидера. Уменьшать `waiters` под мьютексом при выходе через `ctx.Done()`. Передавать участникам результат раунда даже после ухода лидера. Добавить тест с отменой лидера внутри `fn` и живым ctx участника, а также проверку `ActiveWaiters` после ухода.
 Проверка: CI зелёный. Участник получает результат `fn` или ошибку раунда, но не `context.Canceled` лидера. Счётчик возвращается к нулю после завершения всех участников.
 Приёмка: Один лидер не может сорвать ожидание остальных, метрика участников соответствует текущему числу ожидающих.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with T1.9 (already done). Supporting merged commit 6325f31b0b4b (PR #1582) touches the card OwnerFiles.
+Доказательство: Commit 6325f31b0b4b086fd112b3a479b4546af44a741e (PR #1582, feat(store): expose SharedGate state through store API (OBS-04) (#1582)) touches OwnerFiles internal/infra/store/observability.go, internal/infra/store/observability_test.go; git merge-base --is-ancestor 6325f31b0b4b086fd112b3a479b4546af44a741e origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1582 6325f31b0b4b
+Время закрытия: 2026-11-22T11:28:03Z

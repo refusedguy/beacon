@@ -1,5 +1,5 @@
 # ATX-R04. Согласовать дедлайты в TestBackgroundTaskWaitUnblocksOnComplete
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/tool_get_result_test.go
@@ -12,3 +12,8 @@
 Шаги: Создать один контекст с таймаутом из `t.Context()` и использовать его для обоих ожиданий. Дождаться регистрации таймера через канал `afterCalled`, продвинуть фейковые часы, вызвать `Complete`, затем прочитать результат из `resCh`. Убрать оба `time.After(time.Second)`.
 Проверка: CI зелёный. В тесте остался один источник дедлайта. Проверка `WaitedMs == 40` сохраняется.
 Приёмка: Тест не зависит от двух независимых реальных таймеров. Лимит ожидания задаётся контекстом теста.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with T2.6 (already done). Supporting merged commit d452e555db69 (PR #1617) touches the card OwnerFiles.
+Доказательство: Commit d452e555db692dfbdcb81f7807902e942b846f82 (PR #1617, fix(mcp): surface failure excerpt fetch errors (EH-02) (#1617)) touches OwnerFiles internal/infra/mcp/tool_get_result_test.go; git merge-base --is-ancestor d452e555db692dfbdcb81f7807902e942b846f82 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1617 d452e555db69
+Время закрытия: 2026-11-22T11:27:01Z

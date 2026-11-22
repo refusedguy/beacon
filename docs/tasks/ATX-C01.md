@@ -1,5 +1,5 @@
 # ATX-C01. Включить required status checks для ветки main
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: .github/workflows/README.md
@@ -12,3 +12,8 @@
 Шаги: Включить защиту ветки main через GitHub API. Добавить обязательные чеки build, test, seed-spec, js-test, gates, cardindex, rules-broken, registry-check, docs, gates-binary. Оставить e2e и ci-provider-probe вне списка. Зафиксировать список и порядок его обновления в `.github/workflows/README.md`.
 Проверка: CI зелёный. `gh api repos/refusedguy/beacon/branches/main/protection --jq .required_status_checks.contexts` возвращает ровно десять перечисленных имён. PR с красным чеком build не мержится в main.
 Приёмка: Красная обязательная проверка блокирует merge. Информационные проверки остаются видимыми, но не блокируют.
+
+Итог: Already landed in PR #1351 (commit 1090ef02cdc538978cee36ae4b989700cf9efd4b): docs(research): разрывы CI и гейтов, карточки ATX-C01..C08 (#1351)
+Доказательство: PR #1351; commit 1090ef02cdc538978cee36ae4b989700cf9efd4b; git merge-base --is-ancestor 1090ef02cdc538978cee36ae4b989700cf9efd4b origin/main exit 0; no duplicate code PR needed.
+Причина: already landed in PR #1351 1090ef02cdc5
+Время закрытия: 2026-11-22T11:27:01Z

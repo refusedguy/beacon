@@ -1,5 +1,5 @@
 # ATX-D01. Закрепить отсутствие дублей номеров ADR
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: tools/beacon-gates/docsgate/docs.go, tools/beacon-gates/gate/config/docs-baseline.json
@@ -12,3 +12,8 @@
 Шаги: Добавить в docsgate self-test или отдельный тест, который группирует файлы по номеру и требует ровно один файл на номер. Держать baseline пустым. Добавить комментарий в конфиг о том, почему исключений нет.
 Проверка: CI зелёный. self-test docsgate проходит. На дереве с искусственным вторым файлом того же номера тест падает с `DOC-ADR-DUP`.
 Приёмка: Повтор номера ловится до мержа. Число строк baseline не растёт.
+
+Итог: Already landed in PR #1321 (commit aed261234e1ee143488e17241c9700d3d196d054): docs(research): ADR and docs index consistency gaps (ATX-D01..D08) (#1321)
+Доказательство: PR #1321; commit aed261234e1ee143488e17241c9700d3d196d054; git merge-base --is-ancestor aed261234e1ee143488e17241c9700d3d196d054 origin/main exit 0; no duplicate code PR needed.
+Причина: already landed in PR #1321 aed261234e1e
+Время закрытия: 2026-11-22T11:27:01Z
