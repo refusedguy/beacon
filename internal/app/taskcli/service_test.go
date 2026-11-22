@@ -2416,3 +2416,138 @@ func TestReapStaleCardsHonorsInjectedTTL(t *testing.T) {
 		t.Fatalf("внедрённый TTL проигнорирован: %+v err=%v", got, err)
 	}
 }
+
+func writeHook(t *testing.T, dir, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func withHooks(e *env) string {
+	dir := filepath.Join(e.cfg.Root, "hooks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		panic(err)
+	}
+	e.cfg.HooksDir = dir
+	e.svc = NewService(e.cfg)
+	return dir
+}
+
+func TestHooksClaimedFiresOnceAfterTake(t *testing.T) {
+	e := newEnv(t)
+	dir := withHooks(e)
+	payload := filepath.Join(dir, "payload.json")
+	writeHook(t, dir, "claimed.sh", "#!/bin/sh\ncat > "+payload+"\n")
+	e.card(t, "T2.30", "todo", "task", "ADR 0001", "internal/app/a/one.go", "нет", "нет")
+
+	out, err := e.svc.Take(TakeOptions{ID: "T2.30", Agent: "agent-1", Time: "2026-11-22T10:00:00Z"})
+	if err != nil || !strings.Contains(out, "in_progress") {
+		t.Fatalf("take: %q err=%v", out, err)
+	}
+	if c := cardByID(t, e, "T2.30"); c.Status != "in_progress" {
+		t.Fatalf("статус карточки: %q", c.Status)
+	}
+
+	raw, err := os.ReadFile(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got hookPayload
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("载荷 хука: %v\n%s", err, raw)
+	}
+	if got.Event != "claimed" || got.CardID != "T2.30" || got.Time != "2026-11-22T10:00:00Z" {
+		t.Fatalf("载荷: %+v", got)
+	}
+
+	entries, err := e.svc.HookLog()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("журнал: %+v err=%v", entries, err)
+	}
+	if entries[0].Event != "claimed" || entries[0].CardID != "T2.30" || len(entries[0].Hooks) != 1 || entries[0].Error != "" {
+		t.Fatalf("запись: %+v", entries[0])
+	}
+}
+
+func TestHooksUnblockedAndClosedEachWriteOneEntry(t *testing.T) {
+	e := newEnv(t)
+	dir := withHooks(e)
+	writeHook(t, dir, "unblocked.sh", "#!/bin/sh\nexit 0\n")
+	writeHook(t, dir, "closed.sh", "#!/bin/sh\nexit 0\n")
+
+	for _, event := range []HookEvent{HookUnblocked, HookClosed} {
+		if err := e.svc.RunHooks(event, "T2.31", "2026-11-22T11:00:00Z"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := e.svc.HookLog()
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("журнал: %+v err=%v", entries, err)
+	}
+	for i, want := range []string{"unblocked", "closed"} {
+		if entries[i].Event != want || entries[i].CardID != "T2.31" || len(entries[i].Hooks) != 1 {
+			t.Fatalf("запись %d: %+v", i, entries[i])
+		}
+	}
+}
+
+func TestFailingHookDoesNotChangeCard(t *testing.T) {
+	e := newEnv(t)
+	dir := withHooks(e)
+	writeHook(t, dir, "claimed.sh", "#!/bin/sh\necho boom >&2\nexit 1\n")
+	e.card(t, "T2.32", "todo", "task", "ADR 0001", "internal/app/a/one.go", "нет", "нет")
+
+	out, err := e.svc.Take(TakeOptions{ID: "T2.32", Agent: "agent-1", Time: "2026-11-22T12:00:00Z"})
+	if err != nil || !strings.Contains(out, "in_progress") {
+		t.Fatalf("take: %q err=%v", out, err)
+	}
+	if c := cardByID(t, e, "T2.32"); c.Status != "in_progress" {
+		t.Fatalf("статус карточки: %q", c.Status)
+	}
+	entries, err := e.svc.HookLog()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("журнал: %+v err=%v", entries, err)
+	}
+	if !strings.Contains(entries[0].Error, "boom") {
+		t.Fatalf("ошибка хука не записана: %+v", entries[0])
+	}
+}
+
+func TestHooksRunInSortedOrder(t *testing.T) {
+	e := newEnv(t)
+	dir := withHooks(e)
+	order := filepath.Join(dir, "order.txt")
+	writeHook(t, dir, "claimed.20.sh", "#!/bin/sh\necho claimed.20 >> "+order+"\n")
+	writeHook(t, dir, "claimed.10.sh", "#!/bin/sh\necho claimed.10 >> "+order+"\n")
+	e.card(t, "T2.33", "todo", "task", "ADR 0001", "internal/app/a/one.go", "нет", "нет")
+
+	if _, err := e.svc.Take(TakeOptions{ID: "T2.33", Agent: "agent-1", Time: "2026-11-22T13:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(order)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "claimed.10\nclaimed.20\n" {
+		t.Fatalf("порядок: %q", raw)
+	}
+	entries, err := e.svc.HookLog()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("журнал: %+v err=%v", entries, err)
+	}
+	if !reflect.DeepEqual(entries[0].Hooks, []string{"claimed.10.sh", "claimed.20.sh"}) {
+		t.Fatalf("список хуков: %+v", entries[0].Hooks)
+	}
+}
+
+func TestHooksDisabledWithoutDir(t *testing.T) {
+	e := newEnv(t)
+	if err := e.svc.RunHooks(HookClaimed, "T2.34", "2026-11-22T14:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := e.svc.HookLog()
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("журнал без каталога хуков: %+v err=%v", entries, err)
+	}
+}
