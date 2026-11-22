@@ -367,6 +367,21 @@ func (i WaitTelemetryInfo) entry() string {
 		waitTelemetryPrefix, i.WaitPercent, i.AvgWorkers, i.Windows)
 }
 
+// notifyingWatches counts watches whose wake is staged for delivery. A
+// notifying watch left watching on an actionable verdict and waits for its
+// subscriber to claim the wake, so the count is the current outbox depth. It
+// reads the same radar slice that feeds beacon_stats, which keeps the published
+// gauge consistent with the reported active-watch count.
+func notifyingWatches(radar []domain.Watch) uint64 {
+	var n uint64
+	for _, w := range radar {
+		if w.Status == domain.StatusNotifying {
+			n++
+		}
+	}
+	return n
+}
+
 // Handle copies the values already present in a state snapshot into the stats
 // response. Blocked reports the number of watches with a blocked status or a
 // block record. It appends a plan-limit warning to loadErrors when a
@@ -377,7 +392,9 @@ func (i WaitTelemetryInfo) entry() string {
 // loadErrors instead of producing invented counters. When a graph index port is
 // bound, the graphReady marker reflects whether the graph is built and current;
 // a failing read also reports false. With no port bound the marker is absent,
-// which callers read as not ready. It performs no write and no model request.
+// which callers read as not ready. It writes no Beacon state and makes no model
+// request, but it does refresh the active_watches and outbox_depth gauges from
+// the same snapshot so the /metrics endpoint cannot drift from beacon_stats.
 // Slices are allocated even when empty so the response always carries an array,
 // never JSON null.
 func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ StatsInput) (*mcpsdk.CallToolResult, StatsOutput, error) {
@@ -389,6 +406,12 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 
 	radar := snap.RadarWatches()
 	activeWatches := len(radar)
+	// Refresh the two point-in-time gauges from the same snapshot the response
+	// is built from. The /metrics endpoint serves observe.Default() in this
+	// process, so each stats call updates what a scrape sees. Deriving both
+	// values here keeps /metrics and beacon_stats from drifting apart.
+	observe.ActiveWatches(uint64(activeWatches))
+	observe.OutboxDepth(notifyingWatches(radar))
 	loadErrors := make([]string, len(snap.LoadErrors))
 	copy(loadErrors, snap.LoadErrors)
 	// T3.440: show blocked watches in stats. The field carries the count; the
