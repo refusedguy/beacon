@@ -249,18 +249,19 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 			}
 			candidates = append(candidates, c)
 		}
-		if in.OrderByPhase {
-			sort.Slice(candidates, func(i, j int) bool {
-				ri, rj := claimPhaseRank(candidates[i].Phase), claimPhaseRank(candidates[j].Phase)
-				if ri != rj {
-					return ri < rj
-				}
-				return candidates[i].ID < candidates[j].ID
-			})
-		}
-		// Without a graph port the historical id order stays authoritative.
-		// A caller without a graph cannot promise dependency or cycle safety.
+		// Phase priority and graph checks travel together. Without a graph the
+		// id order stays authoritative, because the caller cannot promise that
+		// an earlier phase is free of cycles and unresolved dependencies.
 		if s.Graph != nil {
+			if in.OrderByPhase {
+				sort.Slice(candidates, func(i, j int) bool {
+					ri, rj := claimPhaseRank(candidates[i].Phase), claimPhaseRank(candidates[j].Phase)
+					if ri != rj {
+						return ri < rj
+					}
+					return candidates[i].ID < candidates[j].ID
+				})
+			}
 			resolved := claimResolvedStatuses(cards)
 			for _, c := range candidates {
 				if s.Graph.HasCycle(c.ID) {
