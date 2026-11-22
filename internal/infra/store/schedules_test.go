@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -18,6 +20,270 @@ func openScheduleStore(t *testing.T) *DB {
 		}
 	})
 	return d
+}
+
+func assertScheduleEqual(t *testing.T, got, want Schedule) {
+	t.Helper()
+	if got.ID != want.ID || got.Kind != want.Kind || got.Spec != want.Spec ||
+		got.TargetCard != want.TargetCard || !got.NextRun.Equal(want.NextRun) || got.Enabled != want.Enabled {
+		t.Fatalf("schedule = %+v, want %+v", got, want)
+	}
+}
+
+func TestScheduleCRUD(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	base := Schedule{
+		ID: "job", Kind: ScheduleKindInterval, Spec: "15m",
+		TargetCard: "card-a", NextRun: now.Add(time.Hour), Enabled: true,
+	}
+
+	if err := d.CreateSchedule(ctx, base); err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+	got, err := d.GetSchedule(ctx, "job")
+	if err != nil {
+		t.Fatalf("GetSchedule after create: %v", err)
+	}
+	assertScheduleEqual(t, got, base)
+
+	list, err := d.ListSchedules(ctx)
+	if err != nil {
+		t.Fatalf("ListSchedules: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("ListSchedules returned %d rows, want 1: %+v", len(list), list)
+	}
+	assertScheduleEqual(t, list[0], base)
+
+	updated := base
+	updated.Kind = ScheduleKindCron
+	updated.Spec = "0 3 * * *"
+	updated.TargetCard = "card-b"
+	updated.NextRun = now.Add(2 * time.Hour)
+	updated.Enabled = false
+	if err := d.UpdateSchedule(ctx, updated); err != nil {
+		t.Fatalf("UpdateSchedule: %v", err)
+	}
+	got, err = d.GetSchedule(ctx, "job")
+	if err != nil {
+		t.Fatalf("GetSchedule after update: %v", err)
+	}
+	assertScheduleEqual(t, got, updated)
+
+	list, err = d.ListSchedules(ctx)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListSchedules after update = %+v, err = %v", list, err)
+	}
+	assertScheduleEqual(t, list[0], updated)
+
+	if err := d.DeleteSchedule(ctx, "job"); err != nil {
+		t.Fatalf("DeleteSchedule: %v", err)
+	}
+	if _, err := d.GetSchedule(ctx, "job"); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("GetSchedule after delete = %v, want ErrScheduleNotFound", err)
+	}
+	list, err = d.ListSchedules(ctx)
+	if err != nil || len(list) != 0 {
+		t.Fatalf("ListSchedules after delete = %+v, err = %v", list, err)
+	}
+}
+
+func TestCreateScheduleRejectsDuplicate(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	next := time.Now().UTC().Add(time.Hour)
+	first := Schedule{
+		ID: "dup", Kind: ScheduleKindWebhook, Spec: "push",
+		TargetCard: "card-a", NextRun: next, Enabled: true,
+	}
+	if err := d.CreateSchedule(ctx, first); err != nil {
+		t.Fatalf("first CreateSchedule: %v", err)
+	}
+
+	second := first
+	second.Spec = "other"
+	second.TargetCard = "card-b"
+	if err := d.CreateSchedule(ctx, second); !errors.Is(err, ErrScheduleExists) {
+		t.Fatalf("duplicate CreateSchedule = %v, want ErrScheduleExists", err)
+	}
+	got, err := d.GetSchedule(ctx, "dup")
+	if err != nil {
+		t.Fatalf("GetSchedule after duplicate: %v", err)
+	}
+	assertScheduleEqual(t, got, first)
+}
+
+func TestScheduleCRUDUnknownID(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	next := time.Now().UTC().Add(time.Hour)
+	missing := Schedule{
+		ID: "missing", Kind: ScheduleKindInterval, Spec: "1m",
+		TargetCard: "card", NextRun: next, Enabled: true,
+	}
+
+	if _, err := d.GetSchedule(ctx, "missing"); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("GetSchedule unknown = %v, want ErrScheduleNotFound", err)
+	}
+	if err := d.UpdateSchedule(ctx, missing); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("UpdateSchedule unknown = %v, want ErrScheduleNotFound", err)
+	}
+	if err := d.DeleteSchedule(ctx, "missing"); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("DeleteSchedule unknown = %v, want ErrScheduleNotFound", err)
+	}
+	if _, err := d.SetScheduleEnabled(ctx, "missing", false); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("SetScheduleEnabled unknown = %v, want ErrScheduleNotFound", err)
+	}
+	if err := d.DeleteSchedule(ctx, "missing"); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("second DeleteSchedule = %v, want ErrScheduleNotFound", err)
+	}
+}
+
+func TestSetScheduleEnabled(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	overdue := now.Add(-time.Minute)
+	if err := d.CreateSchedule(ctx, Schedule{
+		ID: "switch", Kind: ScheduleKindInterval, Spec: "5m",
+		TargetCard: "card", NextRun: overdue, Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateSchedule: %v", err)
+	}
+
+	row, err := d.SetScheduleEnabled(ctx, "switch", false)
+	if err != nil {
+		t.Fatalf("SetScheduleEnabled(false): %v", err)
+	}
+	if row.ID != "switch" || row.Enabled {
+		t.Fatalf("SetScheduleEnabled(false) returned %+v, want disabled row", row)
+	}
+	got, err := d.GetSchedule(ctx, "switch")
+	if err != nil || got.Enabled {
+		t.Fatalf("GetSchedule after disable = %+v, err = %v", got, err)
+	}
+	due, err := d.DueSchedules(now)
+	if err != nil || len(due) != 0 {
+		t.Fatalf("disabled schedule is due: %+v, err = %v", due, err)
+	}
+
+	row, err = d.SetScheduleEnabled(ctx, "switch", true)
+	if err != nil {
+		t.Fatalf("SetScheduleEnabled(true): %v", err)
+	}
+	if !row.Enabled {
+		t.Fatalf("SetScheduleEnabled(true) returned %+v, want enabled row", row)
+	}
+	got, err = d.GetSchedule(ctx, "switch")
+	if err != nil || !got.Enabled {
+		t.Fatalf("GetSchedule after re-enable = %+v, err = %v", got, err)
+	}
+	due, err = d.DueSchedules(now)
+	if err != nil || len(due) != 1 {
+		t.Fatalf("re-enabled schedule not due: %+v, err = %v", due, err)
+	}
+}
+
+func TestScheduleCRUDPersistAcrossReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "schedules.db")
+	ctx := context.Background()
+	next := time.Now().UTC().Add(time.Hour)
+	d, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := d.CreateSchedule(ctx, Schedule{
+		ID: "keep", Kind: ScheduleKindCron, Spec: "0 3 * * *",
+		TargetCard: "card-a", NextRun: next, Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateSchedule keep: %v", err)
+	}
+	if err := d.CreateSchedule(ctx, Schedule{
+		ID: "remove", Kind: ScheduleKindWebhook, Spec: "push",
+		TargetCard: "card-b", NextRun: next, Enabled: true,
+	}); err != nil {
+		t.Fatalf("CreateSchedule remove: %v", err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+
+	list, err := reopened.ListSchedules(ctx)
+	if err != nil || len(list) != 2 {
+		t.Fatalf("ListSchedules after reopen = %+v, err = %v", list, err)
+	}
+	if list[0].ID != "keep" || list[1].ID != "remove" {
+		t.Fatalf("ListSchedules order = %+v, want keep then remove", list)
+	}
+	if err := reopened.DeleteSchedule(ctx, "remove"); err != nil {
+		t.Fatalf("DeleteSchedule after reopen: %v", err)
+	}
+	changed := Schedule{
+		ID: "keep", Kind: ScheduleKindCron, Spec: "30 4 * * *",
+		TargetCard: "card-c", NextRun: next.Add(time.Hour), Enabled: false,
+	}
+	if err := reopened.UpdateSchedule(ctx, changed); err != nil {
+		t.Fatalf("UpdateSchedule after reopen: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	third, err := Open(path)
+	if err != nil {
+		t.Fatalf("third Open: %v", err)
+	}
+	defer third.Close()
+	got, err := third.GetSchedule(ctx, "keep")
+	if err != nil {
+		t.Fatalf("GetSchedule after second reopen: %v", err)
+	}
+	assertScheduleEqual(t, got, changed)
+	if _, err := third.GetSchedule(ctx, "remove"); !errors.Is(err, ErrScheduleNotFound) {
+		t.Fatalf("deleted schedule survived reopen: %v", err)
+	}
+}
+
+func TestScheduleCRUDValidation(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	next := time.Now().UTC().Add(time.Hour)
+	bad := []Schedule{
+		{Kind: ScheduleKindInterval, Spec: "1m", NextRun: next},
+		{ID: "x", Kind: "timer", Spec: "1m", NextRun: next},
+		{ID: "x", Kind: ScheduleKindInterval, Spec: "1m"},
+	}
+	for _, s := range bad {
+		if err := d.CreateSchedule(ctx, s); err == nil {
+			t.Fatalf("CreateSchedule(%+v) returned no error", s)
+		}
+		if err := d.UpdateSchedule(ctx, s); err == nil {
+			t.Fatalf("UpdateSchedule(%+v) returned no error", s)
+		}
+	}
+	for _, id := range []string{"", "  "} {
+		if _, err := d.GetSchedule(ctx, id); err == nil {
+			t.Fatalf("GetSchedule(%q) returned no error", id)
+		}
+		if err := d.DeleteSchedule(ctx, id); err == nil {
+			t.Fatalf("DeleteSchedule(%q) returned no error", id)
+		}
+		if _, err := d.SetScheduleEnabled(ctx, id, true); err == nil {
+			t.Fatalf("SetScheduleEnabled(%q) returned no error", id)
+		}
+	}
+	list, err := d.ListSchedules(ctx)
+	if err != nil || len(list) != 0 {
+		t.Fatalf("invalid writes wrote rows: %+v, err = %v", list, err)
+	}
 }
 
 func TestDueSchedulesEmptyStore(t *testing.T) {
