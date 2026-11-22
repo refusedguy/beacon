@@ -617,13 +617,17 @@ type apiMessage struct {
 	Finish string `json:"finish"`
 	Error  *struct {
 		Name string `json:"name"`
+		Type string `json:"type"`
 	} `json:"error"`
 }
 
 // waitWakeMessages polls the real /api/session/{id}/message endpoint until the
 // session both received the wake (a user message with the exact token) and
-// continued the turn (an assistant message created at or after that user
-// message). It never invents either fact: both must come from the API.
+// finished the assistant turn it started. A freshly created assistant message
+// still has finish="" and no error: opencode records the terminal finish only
+// when the model response ends. Returning on creation alone would make the
+// success check in runLiveWakeViaAPI race with the model and fail on a turn
+// that had not finished yet. Both facts still come from the API.
 func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeout time.Duration) (apiMessage, apiMessage, []apiMessage) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -647,7 +651,9 @@ func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeou
 		}
 		if user.ID != "" {
 			for _, m := range list {
-				if m.Type == "assistant" && m.Time.Created >= user.Time.Created {
+				// A created assistant turn is not a finished answer. Wait for
+				// the terminal finish so finish and error are final facts.
+				if m.Type == "assistant" && m.Time.Created >= user.Time.Created && m.Finish != "" {
 					assistant = m
 					break
 				}
@@ -665,7 +671,7 @@ func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeou
 	for _, m := range seen {
 		summary = append(summary, fmt.Sprintf("%s:%s", m.Type, m.ID))
 	}
-	t.Fatalf("сессия %s не подтвердила wake за %s: user(token=%q)=%v assistant=%v сообщения=%v",
+	t.Fatalf("сессия %s не подтвердила wake за %s: user(token=%q)=%v assistant(finish)=%v сообщения=%v",
 		sessionID, timeout, token, user.ID != "", assistant.ID != "", summary)
 	return apiMessage{}, apiMessage{}, seen
 }
@@ -955,8 +961,13 @@ func runLiveWakeViaAPI(t *testing.T, _ string) {
 	// produces an assistant turn, so the timestamp alone is not success.
 	// Require a successful finish and fail on a provider error.
 	if assistant.Error != nil {
-		t.Fatalf("live wake: провайдер вернул ошибку: name=%q (assistant=%s)",
-			assistant.Error.Name, assistant.ID)
+		// opencode records provider errors as error.type; name is not always set.
+		reason := assistant.Error.Name
+		if reason == "" {
+			reason = assistant.Error.Type
+		}
+		t.Fatalf("live wake: провайдер вернул ошибку: %q (assistant=%s)",
+			reason, assistant.ID)
 	}
 	switch assistant.Finish {
 	case "stop", "tool-calls", "length":
