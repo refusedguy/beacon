@@ -127,7 +127,7 @@ func (l *SubscriptionLoop) RunPass(ctx context.Context) (int, error) {
 			observe.ActorError("subscription-loop", sub.ID, err)
 			continue
 		}
-		wakes := coalesceSubEvents(events, sub, now)
+		wakes := coalesceSubEvents(events, sub)
 		for _, wake := range wakes {
 			if err := l.waker.Send(ctx, wake); err != nil {
 				observe.ActorError("subscription-loop", sub.ID, err)
@@ -174,11 +174,13 @@ func RunSubscriptionLoop(ctx context.Context, loop *SubscriptionLoop, interval t
 // out of app). Consecutive events within CoalesceWindow of the group's first
 // event, or of LastDeliveryAt when set, fold into one wake. An event outside
 // the window starts a new wake. The newest event's Ref wins, and every wake
-// carries the re-read instruction.
-func coalesceSubEvents(events []SubEvent, sub SubSubscription, now time.Time) []SubWake {
+// carries the re-read instruction. Like the domain implementation it does not
+// discard events whose timestamp sits after the pass clock; batching depends
+// on the interval between events, not on the wall clock at read time.
+func coalesceSubEvents(events []SubEvent, sub SubSubscription) []SubWake {
 	group := make([]SubEvent, 0, len(events))
 	for _, e := range events {
-		if e.SubscriptionID != sub.ID || e.Source != sub.Source || !e.At.Before(sub.ExpiresAt) || e.At.After(now) {
+		if e.SubscriptionID != sub.ID || e.Source != sub.Source || !e.At.Before(sub.ExpiresAt) {
 			continue
 		}
 		group = append(group, e)
