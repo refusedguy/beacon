@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -175,17 +176,64 @@ func (s dbClaimSource) ClaimedAt(watchID string, revision uint64, subscriberID s
 	return time.Time{}
 }
 
+// daemonArtifactVerifier is the wiring-side ArtifactVerifier for slot tokens.
+// It answers whether the artifact behind a wake has appeared: a PR for the
+// watch, or PLAN.md for the card linked to the watch. Both reads reuse handles
+// the daemon already owns, so this adapter opens no new connection.
+type daemonArtifactVerifier struct {
+	db   *store.DB
+	root string
+}
+
+func (v *daemonArtifactVerifier) Verified(ctx context.Context, token orchestrator.SlotToken, artifact orchestrator.SlotArtifact) (bool, error) {
+	if artifact.PR > 0 {
+		if v.db == nil {
+			return false, nil
+		}
+		w, err := v.db.Watch(token.WatchID)
+		if err != nil {
+			return false, err
+		}
+		return w.PR > 0 && w.PR == artifact.PR, nil
+	}
+	if strings.TrimSpace(artifact.Plan) == "" || v.db == nil {
+		return false, nil
+	}
+	card, err := linkedCardID(ctx, v.db, token.WatchID)
+	if err != nil || card == "" {
+		return false, err
+	}
+	path := filepath.Join(v.root, "docs", "tasks", card, "PLAN.md")
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // daemonWakeGate is the second line of wake defence. The slot ledger opens at
 // most one slot per (watchID, revision) in this process, so a repeated
 // completion signal cannot open a second one. The claimedAt check is the
 // durable line: a claim taken before a restart still suppresses the wake.
+// Tokens issued here are kept until a daemon pass verifies their artifact and
+// burns them, so a slot is never held past the work it authorized.
 type daemonWakeGate struct {
-	ledger *orchestrator.SlotLedger
-	claims daemonClaimSource
+	mu       sync.Mutex
+	ledger   *orchestrator.SlotLedger
+	claims   daemonClaimSource
+	verifier orchestrator.ArtifactVerifier
+	tokens   map[string]orchestrator.SlotToken
 }
 
-func newDaemonWakeGate(claims daemonClaimSource) *daemonWakeGate {
-	return &daemonWakeGate{ledger: orchestrator.NewSlotLedger(), claims: claims}
+func newDaemonWakeGate(claims daemonClaimSource, verifier orchestrator.ArtifactVerifier) *daemonWakeGate {
+	return &daemonWakeGate{
+		ledger:   orchestrator.NewSlotLedger(),
+		claims:   claims,
+		verifier: verifier,
+		tokens:   map[string]orchestrator.SlotToken{},
+	}
 }
 
 // claimConsumed reports whether the executor already acknowledged this
@@ -196,18 +244,70 @@ func (g *daemonWakeGate) claimConsumed(w orchestrator.DaemonWatch, revision uint
 }
 
 // open records one slot for a successfully delivered wake. A failed delivery
-// leaves the slot closed, so the next daemon pass may retry it.
+// leaves the slot closed, so the next daemon pass may retry it. The token is
+// retained so a later pass can verify its artifact and burn the slot.
 func (g *daemonWakeGate) open(w orchestrator.DaemonWatch, revision uint64) {
-	g.ledger.Issue(orchestrator.SignalReportToOrchestrator, w.ID, revision, w.PR)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	token, inc := g.ledger.Issue(orchestrator.SignalReportToOrchestrator, w.ID, revision, w.PR)
+	if inc != nil {
+		g.recordIncident(inc)
+		return
+	}
+	if g.tokens == nil {
+		g.tokens = map[string]orchestrator.SlotToken{}
+	}
+	g.tokens[token.Key()] = token
+}
+
+// isLive is the locked read used by the wake route before it opens a slot.
+func (g *daemonWakeGate) isLive(w orchestrator.DaemonWatch, revision uint64) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ledger.IsLive(w.ID, revision)
+}
+
+// burn verifies and extinguishes every live slot token. A verified artifact
+// frees the slot; a missing artifact or a verifier error leaves it held, so
+// the next pass tries again. A burn without a live token is a
+// spawn_without_token incident recorded in observe.
+func (g *daemonWakeGate) burn(ctx context.Context) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.verifier == nil {
+		return
+	}
+	for key, token := range g.tokens {
+		artifact := orchestrator.SlotArtifact{PR: token.PR}
+		if token.PR <= 0 {
+			artifact.Plan = "PLAN.md"
+		}
+		burned, inc := g.ledger.Burn(ctx, token, artifact, g.verifier)
+		if inc != nil {
+			g.recordIncident(inc)
+			continue
+		}
+		if burned {
+			delete(g.tokens, key)
+		}
+	}
+}
+
+func (g *daemonWakeGate) recordIncident(inc *orchestrator.SlotIncident) {
+	observe.Event(observe.LevelWarn, "slot_incident", observe.Fields{
+		"kind":     string(inc.Kind),
+		"watch":    inc.WatchID,
+		"revision": inc.Revision,
+		"detail":   inc.Detail,
+	})
 }
 
 // daemonWakeRouteWithGate wraps daemonWakeRoute with the one-slot gate. The
 // plain route keeps its contract for callers that do not have a store handle.
-func daemonWakeRouteWithGate(deliver wake.TargetDeliverer, claims daemonClaimSource) orchestrator.WakeRoute {
+func daemonWakeRouteWithGate(deliver wake.TargetDeliverer, gate *daemonWakeGate) orchestrator.WakeRoute {
 	route := daemonWakeRoute(deliver)
-	gate := newDaemonWakeGate(claims)
 	return func(ctx context.Context, w orchestrator.DaemonWatch, revision uint64, verdict, text string) error {
-		if gate.claimConsumed(w, revision) || gate.ledger.IsLive(w.ID, revision) {
+		if gate.claimConsumed(w, revision) || gate.isLive(w, revision) {
 			return nil
 		}
 		if err := route(ctx, w, revision, verdict, text); err != nil {
@@ -542,6 +642,11 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 	// handle the other ports use. No second SQLite handle is opened.
 	workload := daemonWorkloadStore(db)
 
+	// The wake gate issues one slot token per delivered wake. A daemon pass
+	// refreshes the watches first, then burns tokens whose PR or PLAN.md has
+	// appeared so a slot is not held forever after the first delivery.
+	gate := newDaemonWakeGate(dbClaimSource{db: db}, &daemonArtifactVerifier{db: db, root: c.root})
+
 	return orchestrator.DaemonPorts{
 		CheckAll: func(ctx context.Context) error {
 			_, err := orchestrator.CheckAll(ctx, orchestrator.Deps{
@@ -550,6 +655,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 				Writer:    orchestrator.NewSQLVerdictWriter(txWriter),
 				ConfigDir: c.root,
 			})
+			gate.burn(ctx)
 			return err
 		},
 		// Subscribe enrolls the orchestrator on every active Watch before the
@@ -592,7 +698,7 @@ func makeDaemonPorts(c *CLI) (orchestrator.DaemonPorts, func() error, error) {
 			}
 			view.Adapter, view.SubscriberID = sub.Adapter, sub.ID
 			return view, nil
-		}, daemonWakeRouteWithGate(wake.PromptTargetDeliverer(&wake.T202API{}), dbClaimSource{db: db}), newDaemonWakeBackend(), wake.SharedDeliveryDedup()),
+		}, daemonWakeRouteWithGate(wake.PromptTargetDeliverer(&wake.T202API{}), gate), newDaemonWakeBackend(), wake.SharedDeliveryDedup()),
 	}, db.Close, nil
 }
 
