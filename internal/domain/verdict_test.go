@@ -67,7 +67,7 @@ func TestEvaluateDecisionTable(t *testing.T) {
 			want: VerdictMerged, wake: allTargets(WakePointer),
 		},
 		{
-			row: 2, name: "head changed creates a successor watch",
+			row: 2, name: "head_changed creates a successor watch",
 			s:    func() Snapshot { s := readySnapshot(); s.HeadSHA = testNew; return s }(),
 			want: VerdictWatching, wake: allTargets(WakeHeadChanged),
 		},
@@ -1494,7 +1494,7 @@ func TestParseReviewerExitCodeDeterministic(t *testing.T) {
 }
 
 // TestEvaluateGreenBlockedDecisionTable covers the two conditions of ADR 0059
-// §3. Only a green PR with an open blocker becomes green-blocked and frees its
+// §3. Only a green PR with an open blocker becomes green_blocked and frees its
 // slot. Every other combination keeps the slot. Case names name the condition.
 func TestEvaluateGreenBlockedDecisionTable(t *testing.T) {
 	red := readySnapshot()
@@ -1552,7 +1552,7 @@ func TestGreenBlockedSlotFollowsBlocker(t *testing.T) {
 	}
 }
 
-// The green-blocked verdict is a distinct scheduling status. It must not
+// The green_blocked verdict is a distinct scheduling status. It must not
 // collide with the CI verdict, the external verdict, a parked Watch, a BLOCKED
 // review verdict or a reviewer exit code, and its journal string must not be
 // the word BLOCKED that those concepts already use.
@@ -1561,24 +1561,24 @@ func TestGreenBlockedIsNotParkOrBlocked(t *testing.T) {
 		reflect.TypeOf(GreenBlocked) == reflect.TypeOf(ExternalPass) ||
 		reflect.TypeOf(GreenBlocked) == reflect.TypeOf(ReviewBlocked) ||
 		reflect.TypeOf(GreenBlocked) == reflect.TypeOf(ReviewerExitReject) {
-		t.Fatal("green-blocked verdict type must differ from other verdict types")
+		t.Fatal("green_blocked verdict type must differ from other verdict types")
 	}
 	if string(GreenBlocked) == string(VerdictParked) ||
 		string(GreenBlocked) == string(ReviewBlocked) ||
 		string(GreenBlocked) == string(VerdictReady) ||
 		string(GreenBlocked) == string(ExternalPass) {
-		t.Fatalf("green-blocked string %q collides with an existing verdict", GreenBlocked)
+		t.Fatalf("green_blocked string %q collides with an existing verdict", GreenBlocked)
 	}
 }
 
-// ReleasesSlot is true only for the green-blocked verdict. The zero value and
+// ReleasesSlot is true only for the green_blocked verdict. The zero value and
 // every other named status keep the slot.
 func TestGreenBlockedReleasesSlotOnlyForHeldVerdict(t *testing.T) {
 	if GreenBlockedNone.ReleasesSlot() {
 		t.Fatal("zero verdict must not free a slot")
 	}
 	if !GreenBlocked.ReleasesSlot() {
-		t.Fatal("green-blocked verdict must free a slot")
+		t.Fatal("green_blocked verdict must free a slot")
 	}
 	if GreenBlockedVerdict("something_else").ReleasesSlot() {
 		t.Fatal("unknown verdict must not free a slot")
@@ -1592,11 +1592,11 @@ func TestEvaluateGreenBlockedDoesNotChangeCIVerdict(t *testing.T) {
 	s := readySnapshot()
 	blocked := EvaluateGreenBlocked(s, Policy{}, true)
 	if string(blocked) == string(VerdictReady) {
-		t.Fatal("green-blocked must not become the ready verdict")
+		t.Fatal("green_blocked must not become the ready verdict")
 	}
 	ciVerdict, _ := Evaluate(s, Policy{})
 	if ciVerdict != VerdictReady {
-		t.Fatalf("Evaluate mutated by green-blocked check: %q, want ready", ciVerdict)
+		t.Fatalf("Evaluate mutated by green_blocked check: %q, want ready", ciVerdict)
 	}
 
 	before := s
