@@ -590,6 +590,64 @@ func TestParseLinkage(t *testing.T) {
 	}
 }
 
+func TestParseLinkageCardIDShapes(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{"letter after dash", "fix(atx): guard (ATX-R01)\n\nСсылка на ADR 0295.", "ATX-R01"},
+		{"compound prefix", "fix(rs): compare (RS-CMP-06)\n\nСсылка на ADR 0295.", "RS-CMP-06"},
+		{"dash digits", "fix(store): legacy (HD-022)\n\nСсылка на ADR 0295.", "HD-022"},
+		{"dot id", "fix(store): legacy (T3.17)\n\nСсылка на ADR 0295.", "T3.17"},
+		{"digit dash letter", "fix(tui): suffix (TUI-07A)\n\nСсылка на ADR 0295.", "TUI-07A"},
+		{"adr ref skipped", "fix(atx): only adr\n\nСсылка на ADR-0295.", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ParseLinkage(c.msg).CardRef; got != c.want {
+				t.Errorf("CardRef = %q, ждали %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestParseLinkageExemptWithoutCard(t *testing.T) {
+	msg := "fix(atx): temporary hook\n\nСсылка на ADR 0295.\nОбоснование: внешний инструмент без карточки"
+	l := ParseLinkage(msg)
+	if l.CardRef != "" {
+		t.Errorf("CardRef = %q, ждали пустую", l.CardRef)
+	}
+	if got := CheckLinkage(l, LinkagePorts{}); got != LinkageExempted {
+		t.Errorf("CheckLinkage = %q, ждали %q", got, LinkageExempted)
+	}
+}
+
+func TestParseLinkageNewCardFormatsLinked(t *testing.T) {
+	ports := LinkagePorts{
+		ValidADR:  func(ref string) bool { return ref == "ADR 0295" },
+		ValidCard: IsID,
+	}
+	cases := []struct {
+		name string
+		msg  string
+	}{
+		{"ATX-R01", "fix(atx): guard (ATX-R01)\n\nСсылка на ADR 0295."},
+		{"RS-CMP-06", "fix(rs): compare (RS-CMP-06)\n\nСсылка на ADR 0295."},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			l := ParseLinkage(c.msg)
+			if !IsID(l.CardRef) {
+				t.Fatalf("CardRef = %q, не валидный ID", l.CardRef)
+			}
+			if got := CheckLinkage(l, ports); got != LinkageLinked {
+				t.Errorf("CheckLinkage = %q, ждали %q", got, LinkageLinked)
+			}
+		})
+	}
+}
+
 func TestRequiresLinkage(t *testing.T) {
 	cases := []struct {
 		subject string
