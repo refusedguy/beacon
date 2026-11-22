@@ -16,6 +16,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	wtinfra "github.com/refusedguy/beacon/internal/infra/worktree"
 )
@@ -411,6 +412,36 @@ func printAgentRows(format string, rows []agentRow, out, errOut io.Writer) int {
 // sandboxes from a local repository and does not fetch from a transport.
 func sandboxCloneArgs(source, dest string) []string {
 	return []string{"clone", "--reference", source, source, dest}
+}
+
+// sandboxWorkspaceRoots reads the workspace roots requested in an agent
+// sandbox command line. A root appears as --root <path> or --root=<path>. The
+// git clone argv built by sandboxCloneArgs keeps its exact shape (CCx-15).
+func sandboxWorkspaceRoots(argv []string) []string {
+	var roots []string
+	for i := 0; i < len(argv); i++ {
+		arg := argv[i]
+		if arg == "--root" && i+1 < len(argv) {
+			if root := strings.TrimSpace(argv[i+1]); root != "" {
+				roots = append(roots, root)
+			}
+			i++
+			continue
+		}
+		if strings.HasPrefix(arg, "--root=") {
+			if root := strings.TrimSpace(strings.TrimPrefix(arg, "--root=")); root != "" {
+				roots = append(roots, root)
+			}
+		}
+	}
+	return roots
+}
+
+// recordSandboxWorkspaceRoots saves the requested roots in session metadata so
+// a later resume can restore them. It returns a new map; the input stays owned
+// by the caller.
+func recordSandboxWorkspaceRoots(metadata map[string]string, argv []string) map[string]string {
+	return session.WithWorkspaceRoots(metadata, sandboxWorkspaceRoots(argv))
 }
 
 // provisionSandbox creates an isolated working copy at dest from source and

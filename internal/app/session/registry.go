@@ -328,3 +328,114 @@ func WithJournalPath(metadata map[string]string, path string) map[string]string 
 	out[MetadataJournalPath] = path
 	return out
 }
+
+// MetadataWorkspaceRoots records the workspace roots a session was created
+// with. Resume uses it to restore only the roots the caller asks for again
+// (CCx-15).
+const MetadataWorkspaceRoots = "ai.beacon/workspaceRoots"
+
+// MetadataReadOnlyRoots records the roots that stay read-only. The list is
+// copied through resume so an explicit read-only setting from an older record
+// survives (CCx-15).
+const MetadataReadOnlyRoots = "ai.beacon/readOnlyRoots"
+
+// WorkspaceRoots reads the saved workspace roots. A missing, blank or empty
+// value reports false, so an old record counts as having no roots.
+func WorkspaceRoots(metadata map[string]string) ([]string, bool) {
+	return decodeRoots(metadata[MetadataWorkspaceRoots])
+}
+
+// ReadOnlyRoots reads the read-only roots saved with the session.
+func ReadOnlyRoots(metadata map[string]string) ([]string, bool) {
+	return decodeRoots(metadata[MetadataReadOnlyRoots])
+}
+
+func decodeRoots(raw string) ([]string, bool) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, false
+	}
+	var roots []string
+	for _, part := range strings.Split(raw, ",") {
+		if root := strings.TrimSpace(part); root != "" {
+			roots = append(roots, root)
+		}
+	}
+	return roots, len(roots) > 0
+}
+
+func encodeRoots(roots []string) string {
+	kept := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if r := strings.TrimSpace(root); r != "" {
+			kept = append(kept, r)
+		}
+	}
+	return strings.Join(kept, ",")
+}
+
+// WithWorkspaceRoots returns a copy of metadata with roots recorded as the
+// workspace roots. Empty entries are dropped. The input map stays owned by the
+// caller.
+func WithWorkspaceRoots(metadata map[string]string, roots []string) map[string]string {
+	out := copySessionMetadata(metadata)
+	encoded := encodeRoots(roots)
+	if encoded == "" {
+		delete(out, MetadataWorkspaceRoots)
+		return out
+	}
+	out[MetadataWorkspaceRoots] = encoded
+	return out
+}
+
+// WithReadOnlyRoots returns a copy of metadata with roots recorded as
+// read-only. The input map stays owned by the caller.
+func WithReadOnlyRoots(metadata map[string]string, roots []string) map[string]string {
+	out := copySessionMetadata(metadata)
+	encoded := encodeRoots(roots)
+	if encoded == "" {
+		delete(out, MetadataReadOnlyRoots)
+		return out
+	}
+	out[MetadataReadOnlyRoots] = encoded
+	return out
+}
+
+// ResumeWorkspaceRoots rebuilds the roots of a resumed session. It keeps only
+// roots that were both saved in the record and requested again, so resume
+// never adds a root the caller did not ask for. The other keys are copied once,
+// which leaves explicit settings from the older record in a single instance.
+func ResumeWorkspaceRoots(saved map[string]string, requested []string) map[string]string {
+	out := copySessionMetadata(saved)
+	savedRoots, ok := WorkspaceRoots(saved)
+	if !ok {
+		delete(out, MetadataWorkspaceRoots)
+		return out
+	}
+	allowed := make(map[string]bool, len(requested))
+	for _, root := range requested {
+		if r := strings.TrimSpace(root); r != "" {
+			allowed[r] = true
+		}
+	}
+	kept := make([]string, 0, len(savedRoots))
+	seen := make(map[string]bool, len(savedRoots))
+	for _, root := range savedRoots {
+		if allowed[root] && !seen[root] {
+			kept = append(kept, root)
+			seen[root] = true
+		}
+	}
+	return WithWorkspaceRoots(out, kept)
+}
+
+// ResumeWorkspace loads id and restores its workspace roots from the saved
+// metadata. Only roots named in requested survive. found is false when the
+// store has no such session.
+func (r *SessionRegistry) ResumeWorkspace(id string, requested []string) (Session, bool, error) {
+	stored, found, err := r.Resume(id)
+	if err != nil || !found {
+		return stored, found, err
+	}
+	stored.Metadata = ResumeWorkspaceRoots(stored.Metadata, requested)
+	return stored, true, nil
+}
