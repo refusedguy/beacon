@@ -6,6 +6,8 @@
 package domain
 
 import (
+	"bytes"
+	"encoding/json"
 	"path"
 	"regexp"
 	"sort"
@@ -971,6 +973,123 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 	}
 	evidence.Verdict = ExternalPass
 	return evidence
+}
+
+// RegradeReasonMissing is the refusal reason for an artifact without a raw
+// check log. No log means there is nothing to recheck, so the gate fails
+// closed instead of reporting a PASS from a half-written artifact.
+const RegradeReasonMissing = "evidence_missing"
+
+// RegradeArtifact is the record saved in a Watch journal when the external
+// checks finish. Regrade reads only this record: it never contacts the agent,
+// the verifier or the CI provider and never changes the Watch. RawLog is the
+// captured check output and is the proof that a run happened, so an artifact
+// without it is refused. Dataset and Split name the reference set the way a
+// run.json names a SWE-bench run, so a later recalculation cannot quietly
+// switch the baseline. ConfigID is the configuration identity at save time.
+// ExternalEvidence keeps the shape SB-01 and SB-02 defined; a regrade never
+// rewrites it.
+type RegradeArtifact struct {
+	WatchID  string           `json:"watchId"`
+	Revision uint64           `json:"revision"`
+	ConfigID string           `json:"configId,omitempty"`
+	Dataset  string           `json:"dataset,omitempty"`
+	Split    string           `json:"split,omitempty"`
+	Declared []string         `json:"declared"`
+	Observed []ExternalCheck  `json:"observed"`
+	RawLog   string           `json:"rawLog"`
+	Evidence ExternalEvidence `json:"evidence"`
+}
+
+// RegradeReference is the baseline a caller wants to grade against. An empty
+// Declared keeps the declaration saved in the artifact. Dataset and Split
+// override the saved names only when set, so changing the reference set is an
+// explicit act that the result records.
+type RegradeReference struct {
+	Dataset  string   `json:"dataset,omitempty"`
+	Split    string   `json:"split,omitempty"`
+	Declared []string `json:"declared,omitempty"`
+}
+
+// RegradeResult is the answer of a regrade. Evidence is recomputed from the
+// saved checks; Stored is the evidence read from the artifact. Matches reports
+// a byte-for-byte equality of their JSON forms. A false Matches means the
+// saved evidence no longer follows from the saved facts, and the caller must
+// not treat the computed verdict as the recorded one.
+type RegradeResult struct {
+	Evidence ExternalEvidence `json:"evidence"`
+	Stored   ExternalEvidence `json:"stored"`
+	Matches  bool             `json:"matches"`
+	WatchID  string           `json:"watchId"`
+	Revision uint64           `json:"revision"`
+	ConfigID string           `json:"configId,omitempty"`
+	Dataset  string           `json:"dataset,omitempty"`
+	Split    string           `json:"split,omitempty"`
+}
+
+// RegradeError is a refusal to regrade. Reason is a stable machine code, so a
+// caller can print evidence_missing verbatim instead of guessing from prose.
+type RegradeError struct {
+	Reason string
+	Detail string
+}
+
+func (e *RegradeError) Error() string {
+	if e.Detail == "" {
+		return "regrade: " + e.Reason
+	}
+	return "regrade: " + e.Reason + ": " + e.Detail
+}
+
+// Regrade recomputes the verdict from an artifact saved earlier. It runs no
+// check, reads no clock and writes no Watch, so the Watch revision and the set
+// of observations stay as they were. A missing raw log is refused with reason
+// evidence_missing. An empty declaration still fails closed through
+// EvaluateExternal.
+func Regrade(a RegradeArtifact) (RegradeResult, error) {
+	return RegradeWithReference(a, RegradeReference{})
+}
+
+// RegradeWithReference recomputes against an explicit reference set. Passing a
+// different Declared list is how a reviewer checks a disputed verdict against
+// another baseline without running anything: the same observations can yield
+// a different verdict, and the result names the baseline that was used.
+func RegradeWithReference(a RegradeArtifact, ref RegradeReference) (RegradeResult, error) {
+	if strings.TrimSpace(a.RawLog) == "" {
+		return RegradeResult{}, &RegradeError{
+			Reason: RegradeReasonMissing,
+			Detail: "watch " + a.WatchID + " has no saved raw log",
+		}
+	}
+	declared := a.Declared
+	if ref.Declared != nil {
+		declared = ref.Declared
+	}
+	result := RegradeResult{
+		Evidence: EvaluateExternal(declared, a.Observed),
+		Stored:   a.Evidence,
+		WatchID:  a.WatchID,
+		Revision: a.Revision,
+		ConfigID: a.ConfigID,
+		Dataset:  a.Dataset,
+		Split:    a.Split,
+	}
+	if ref.Dataset != "" {
+		result.Dataset = ref.Dataset
+	}
+	if ref.Split != "" {
+		result.Split = ref.Split
+	}
+	want, err := json.Marshal(result.Stored)
+	if err != nil {
+		return RegradeResult{}, err
+	}
+	got, err := json.Marshal(result.Evidence)
+	if err != nil {
+		return RegradeResult{}, err
+	}
+	result.Matches = bytes.Equal(got, want)
+	return result, nil
 }
 
 // ReviewerExitCode is the strict exit code of a parsed external reviewer

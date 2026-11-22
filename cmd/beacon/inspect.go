@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ import (
 var (
 	inspectRunner = func(c *CLI, args []string) int { return runInspect(c, args) }
 	resetRunner   = func(c *CLI, args []string) int { return runReset(c, args) }
+	regradeRunner = func(c *CLI, args []string) int { return runRegrade(c, args) }
 )
 
 // RegisterInspect installs the inspect command implementation.
@@ -30,6 +32,9 @@ func RegisterInspect(fn func(*CLI, []string) int) { inspectRunner = fn }
 
 // RegisterReset installs the reset command implementation.
 func RegisterReset(fn func(*CLI, []string) int) { resetRunner = fn }
+
+// RegisterRegrade installs the regrade command implementation.
+func RegisterRegrade(fn func(*CLI, []string) int) { regradeRunner = fn }
 
 // readEscalations reads the escalation journal through a filesystem seam. It
 // is the diagnostics port used by both `inspect` and `orchestrator bind`; the
@@ -287,6 +292,187 @@ func renderInspectTable(w io.Writer, view inspectView) {
 	for _, line := range view.Escalations {
 		fmt.Fprintf(w, "ESCALATED %s\n", line)
 	}
+}
+
+// regradeEventType is the journal event kind that carries a saved external
+// evidence artifact. Other events in the same Watch journal are never treated
+// as evidence.
+const regradeEventType = "regrade.evidence"
+
+// readRegradeArtifact reads one artifact file through an fs.FS seam. File
+// access stays in a port so cmd/beacon never opens a file directly and tests
+// can supply bytes without touching the disk.
+var readRegradeArtifact = func(path string) ([]byte, error) {
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	return fs.ReadFile(os.DirFS(dir), name)
+}
+
+// regradeJournalStore is the journal slice of the state store used by regrade.
+// The concrete *store.DB satisfies it; tests can install a fake through
+// SetInspectStore as long as it implements these two methods.
+type regradeJournalStore interface {
+	Append(scope, eventType string, payload []byte) (int64, error)
+	ReadAfter(scope string, cursor int64) ([]store.LogEvent, error)
+}
+
+// loadRegradeArtifact returns the newest saved artifact for a Watch. A damaged
+// artifact of the right type is an error, not a skip: grading an older event
+// after a corrupt append would hide the damage.
+func loadRegradeArtifact(j regradeJournalStore, watchID string) (domain.RegradeArtifact, bool, error) {
+	events, err := j.ReadAfter(watchID, 0)
+	if err != nil {
+		return domain.RegradeArtifact{}, false, err
+	}
+	var found domain.RegradeArtifact
+	ok := false
+	for _, e := range events {
+		if e.Type != regradeEventType {
+			continue
+		}
+		var a domain.RegradeArtifact
+		if err := json.Unmarshal(e.Payload, &a); err != nil {
+			return domain.RegradeArtifact{}, false, err
+		}
+		found, ok = a, true
+	}
+	return found, ok, nil
+}
+
+// saveRegradeArtifact appends one artifact to the Watch journal. It is the only
+// write in this command: the recomputation path below never writes a Watch,
+// runs a check or advances a revision.
+func saveRegradeArtifact(j regradeJournalStore, a domain.RegradeArtifact) error {
+	if strings.TrimSpace(a.WatchID) == "" {
+		return errors.New("regrade: artifact has no watch id")
+	}
+	payload, err := json.Marshal(a)
+	if err != nil {
+		return err
+	}
+	_, err = j.Append(a.WatchID, regradeEventType, payload)
+	return err
+}
+
+// printRegradeRefusal prints a stable machine reason. A deleted raw log reads
+// as evidence_missing, never as PASS.
+func printRegradeRefusal(c *CLI, format, reason, detail string) {
+	if format == "json" {
+		_ = json.NewEncoder(c.out).Encode(map[string]any{
+			"refused": true, "reason": reason, "detail": detail,
+		})
+		return
+	}
+	fmt.Fprintf(c.out, "REGRADE_REFUSED reason=%s detail=%s\n", reason, detail)
+}
+
+// runRegrade implements `beacon regrade`. With --save it records an artifact
+// in the Watch journal; otherwise it recomputes the verdict from the newest
+// saved artifact alone. It runs no check and changes no Watch state.
+func runRegrade(c *CLI, args []string) int {
+	flags := flag.NewFlagSet("regrade", flag.ContinueOnError)
+	watchID := flags.String("watch", "", "идентификатор Watch, артефакты которого пересчитываются")
+	dataset := flags.String("dataset", "", "набор эталона для переоценки")
+	split := flags.String("split", "", "сплит эталона для переоценки")
+	declared := flags.String("declared", "", "объявленные проверки через запятую")
+	savePath := flags.String("save", "", "путь к JSON-артефакту для сохранения в журнале")
+	format := flags.String("format", "table", "формат вывода: table или json")
+	jsonAlias := flags.Bool("json", false, "псевдоним --format=json")
+	flags.SetOutput(c.errOut)
+	flags.Usage = func() {}
+	if err := flags.Parse(args); err != nil {
+		writeUsage(c.errOut)
+		return 2
+	}
+	if *jsonAlias {
+		*format = "json"
+	}
+	if !parseCommandFormat("regrade", *format, c.errOut, false) {
+		return 2
+	}
+
+	s, closeStore, err := makeInspectStore(c)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon regrade: %v\n", err)
+		return 2
+	}
+	defer func() { _ = closeStore() }()
+	j, ok := s.(regradeJournalStore)
+	if !ok {
+		fmt.Fprintln(c.errOut, "beacon regrade: store does not support the artifact journal")
+		return 2
+	}
+
+	if *savePath != "" {
+		raw, err := readRegradeArtifact(*savePath)
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon regrade: read artifact: %v\n", err)
+			return 2
+		}
+		var a domain.RegradeArtifact
+		if err := json.Unmarshal(raw, &a); err != nil {
+			fmt.Fprintf(c.errOut, "beacon regrade: decode artifact: %v\n", err)
+			return 2
+		}
+		if *watchID != "" {
+			a.WatchID = *watchID
+		}
+		if err := saveRegradeArtifact(j, a); err != nil {
+			fmt.Fprintf(c.errOut, "beacon regrade: save artifact: %v\n", err)
+			return 2
+		}
+		if *format == "json" {
+			_ = json.NewEncoder(c.out).Encode(map[string]any{"saved": true, "watchId": a.WatchID})
+		} else {
+			fmt.Fprintf(c.out, "SAVED watch=%s revision=%d\n", a.WatchID, a.Revision)
+		}
+		return 0
+	}
+
+	if strings.TrimSpace(*watchID) == "" {
+		fmt.Fprintln(c.errOut, "beacon regrade: --watch is required")
+		return 2
+	}
+	a, found, err := loadRegradeArtifact(j, *watchID)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon regrade: load artifact: %v\n", err)
+		return 2
+	}
+	if !found {
+		printRegradeRefusal(c, *format, domain.RegradeReasonMissing, "no saved artifact for watch "+*watchID)
+		return 1
+	}
+	ref := domain.RegradeReference{Dataset: *dataset, Split: *split}
+	if *declared != "" {
+		parts := strings.Split(*declared, ",")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		ref.Declared = parts
+	}
+	result, err := domain.RegradeWithReference(a, ref)
+	if err != nil {
+		var refuse *domain.RegradeError
+		if errors.As(err, &refuse) {
+			printRegradeRefusal(c, *format, refuse.Reason, refuse.Detail)
+			return 1
+		}
+		fmt.Fprintf(c.errOut, "beacon regrade: %v\n", err)
+		return 2
+	}
+	if *format == "json" {
+		if err := json.NewEncoder(c.out).Encode(result); err != nil {
+			fmt.Fprintf(c.errOut, "beacon regrade: %v\n", err)
+			return 2
+		}
+		return 0
+	}
+	fmt.Fprintf(c.out, "REGRADE watch=%s revision=%d verdict=%s matches=%t dataset=%s split=%s config=%s\n",
+		result.WatchID, result.Revision, result.Evidence.Verdict, result.Matches,
+		result.Dataset, result.Split, result.ConfigID)
+	return 0
 }
 
 // runReset implements `beacon reset --yes`. It clears the control-plane rows
