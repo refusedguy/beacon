@@ -348,6 +348,34 @@ func resolvedStatus(status string) bool {
 	return false
 }
 
+// ---- CBX-02: один предикат GATED для всех поверхностей ----
+//
+// GATED НЕ хранится. Он выводится из ребра и статуса цели. Все поверхности
+// (глиф в списке, заголовок карточки, вывод why и поле gated_by) обязаны
+// спрашивать одну и ту же функцию GatesHolding, иначе они расходятся на одном
+// и том же ребре.
+//
+// waits-for-external намеренно отсутствует в GateEdgeKinds: AN-03 владеет
+// внешними гейтами и движок считает их отдельно. conditional-blocks не
+// добавляется здесь: это владение CB-04. Пять типов рёбер и их валидация выше
+// не меняются.
+
+// GateEdgeKinds возвращает канонический набор типов рёбер, цель которых своим
+// статусом решает, держит ли она карточку subject. Возвращается копия.
+func GateEdgeKinds() []string {
+	return []string{"blocks", "depends-on"}
+}
+
+// IsGateEdgeKind сообщает, несёт ли ребро этого типа гейт.
+func IsGateEdgeKind(kind string) bool {
+	for _, known := range GateEdgeKinds() {
+		if kind == known {
+			return true
+		}
+	}
+	return false
+}
+
 // BlockedGraph builds a graph with an edge from each dependency to the card
 // that depends on it. Walking from a changed ID therefore reaches every
 // dependent that the change can affect. Unusable edges are skipped so a bad ID
@@ -466,4 +494,148 @@ func SetCardStatus(raw, status string) string {
 		return strings.Join(lines, "\n")
 	}
 	return raw
+}
+
+// GateRef это гейт, спроектированный для вызывающего: ID карточки, тип
+// ожидания и причина. JSON содержит ровно три ключа, поэтому ни одна
+// поверхность не может добавить четвёртый и разойтись с остальными.
+type GateRef struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
+}
+
+// GateDep это одно ребро-кандидат: тип ребра и карточка-цель.
+type GateDep struct {
+	Kind   string
+	Target Card
+}
+
+// GateReasonMarker разделяет сгенерированное описание гейта и текст причины,
+// который дал автор. Одна константа используется и при записи, и при чтении,
+// поэтому написанное GateDescription всегда возвращается GateReason.
+const GateReasonMarker = "\n\nReason: "
+
+// GateDescription строит описание гейта с общим маркером причины.
+func GateDescription(targetID, reason string) string {
+	desc := "gate blocking " + targetID
+	if strings.TrimSpace(reason) != "" {
+		desc += GateReasonMarker + reason
+	}
+	return desc
+}
+
+// GateReason читает причину, записанную через GateDescription. Возвращает "",
+// если маркера нет. Это чтение текста, а не доказательство происхождения:
+// описание, набранное вручную с этим маркером, тоже даёт причину.
+func GateReason(description string) string {
+	idx := strings.Index(description, GateReasonMarker)
+	if idx < 0 {
+		return ""
+	}
+	return strings.TrimSpace(description[idx+len(GateReasonMarker):])
+}
+
+// closedStatuses это статусы, в которых карточка не удерживает гейт и не может
+// сама быть помечена как GATED.
+var closedStatuses = []string{"done", "dropped", "duplicate"}
+
+func isClosedStatus(status string) bool {
+	for _, s := range closedStatuses {
+		if status == s {
+			return true
+		}
+	}
+	return false
+}
+
+// IsPinned сообщает, закреплена ли карточка. В beacon нет отдельного статуса
+// pinned, поэтому признак лежит в Extra под одним из двух имён.
+func IsPinned(c Card) bool {
+	for _, key := range []string{"pinned", "Закреплена"} {
+		if c.Extra == nil {
+			return false
+		}
+		if strings.EqualFold(strings.TrimSpace(c.Extra[key]), "true") {
+			return true
+		}
+	}
+	return false
+}
+
+// SubjectCanBeGated сообщает, допускает ли собственный статус карточки
+// пометку GATED. Закрытая или закреплённая карточка её не допускает: такие
+// строки движок держит вне ready по причинам, не связанным с гейтом.
+func SubjectCanBeGated(c Card) bool {
+	return !isClosedStatus(c.Status) && !IsPinned(c)
+}
+
+// GateIsHolding сообщает, является ли цель, достигнутая по ребру kind,
+// открытым гейтом, который удерживает subject. Это половина правила про ребро;
+// половину про subject проверяет GatesHolding.
+func GateIsHolding(kind string, target Card) bool {
+	if !IsGateEdgeKind(kind) || !SubjectCanBeGated(target) {
+		return false
+	}
+	// Внешняя цель не является ID карточки и не попадает в gated_by.
+	return !IsExternalGateTarget(target.ID)
+}
+
+// GateKind возвращает тип ожидания гейта. Для гейта без типа отдаётся "gate".
+func GateKind(c Card) string {
+	for _, key := range []string{"await-type", "Тип ожидания"} {
+		if c.Extra != nil {
+			if v := strings.TrimSpace(c.Extra[key]); v != "" {
+				return v
+			}
+		}
+	}
+	return "gate"
+}
+
+// gateDescription возвращает текст, из которого читается причина гейта.
+func gateDescription(c Card) string {
+	if c.Extra != nil {
+		if v := strings.TrimSpace(c.Extra["description"]); v != "" {
+			return v
+		}
+	}
+	return c.Context
+}
+
+// GatesHolding это единственный предикат GATED. Он выбирает из рёбер subject
+// гейты, которые сейчас его удерживают, в порядке появления рёбер. Один ID
+// попадает в результат один раз. Пустой результат отдаётся как nil, чтобы
+// машиночитаемое поле отсутствовало, а не сериализовалось пустым массивом.
+//
+// Любая новая поверхность обязана вызывать эту функцию, а не собирать гейты
+// своим обходом: именно так глиф, заголовок, why и gated_by остаются
+// согласованными на одном ребре.
+func GatesHolding(subject Card, deps []GateDep) []GateRef {
+	if !SubjectCanBeGated(subject) {
+		return nil
+	}
+	var refs []GateRef
+	seen := map[string]bool{}
+	for _, dep := range deps {
+		if !GateIsHolding(dep.Kind, dep.Target) || seen[dep.Target.ID] {
+			continue
+		}
+		seen[dep.Target.ID] = true
+		refs = append(refs, GateRef{
+			ID:     dep.Target.ID,
+			Type:   GateKind(dep.Target),
+			Reason: GateReason(gateDescription(dep.Target)),
+		})
+	}
+	return refs
+}
+
+// GateRefs это алиас для вызовов, которые уже получили набор гейтов: он
+// сохраняет то же правило пустого результата, что и GatesHolding.
+func GateRefs(refs []GateRef) []GateRef {
+	if len(refs) == 0 {
+		return nil
+	}
+	return refs
 }

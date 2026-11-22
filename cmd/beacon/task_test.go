@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -349,6 +350,278 @@ func TestTaskCommandWhyValidation(t *testing.T) {
 				t.Errorf("stdout %q, stderr %q", stdout.String(), stderr.String())
 			}
 		})
+	}
+}
+
+// ---- CBX-02: один предикат GATED для всех поверхностей ----
+
+func cbxCard(id, status string, extra map[string]string) taskstore.Card {
+	if extra == nil {
+		extra = map[string]string{}
+	}
+	return taskstore.Card{ID: id, Status: status, Extra: extra, Context: taskstore.GateDescription(id, "нужен обзор")}
+}
+
+func cbxIDs(refs []taskstore.GateRef) []string {
+	out := make([]string, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, r.ID)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestGatesHoldingPredicate(t *testing.T) {
+	subject := cbxCard("T1.1", "todo", nil)
+	gate := cbxCard("T1.2", "todo", map[string]string{"await-type": "human"})
+
+	refs := taskstore.GatesHolding(subject, []taskstore.GateDep{
+		{Kind: "depends-on", Target: gate},
+	})
+	if len(refs) != 1 || refs[0].ID != "T1.2" {
+		t.Fatalf("открытый гейт: %+v", refs)
+	}
+	if refs[0].Type != "human" || refs[0].Reason != "нужен обзор" {
+		t.Fatalf("type/reason = %q/%q", refs[0].Type, refs[0].Reason)
+	}
+
+	// Закрытый гейт не удерживает.
+	closed := gate
+	closed.Status = "done"
+	if got := taskstore.GatesHolding(subject, []taskstore.GateDep{{Kind: "depends-on", Target: closed}}); len(got) != 0 {
+		t.Fatalf("закрытый гейт дал %+v", got)
+	}
+
+	// Закрытая и закреплённая карточка-субъект не помечаются.
+	for _, status := range []string{"done", "dropped", "duplicate"} {
+		s := subject
+		s.Status = status
+		if got := taskstore.GatesHolding(s, []taskstore.GateDep{{Kind: "depends-on", Target: gate}}); len(got) != 0 {
+			t.Fatalf("субъект %s дал %+v", status, got)
+		}
+	}
+	pinned := subject
+	pinned.Extra = map[string]string{"pinned": "true"}
+	if got := taskstore.GatesHolding(pinned, []taskstore.GateDep{{Kind: "depends-on", Target: gate}}); len(got) != 0 {
+		t.Fatalf("закреплённый субъект дал %+v", got)
+	}
+
+	// waits-for-external и related не являются гейтами здесь: AN-03 и CB-04
+	// владеют этими поверхностями отдельно.
+	for _, kind := range []string{"waits-for-external", "related", "supersedes"} {
+		if got := taskstore.GatesHolding(subject, []taskstore.GateDep{{Kind: kind, Target: gate}}); len(got) != 0 {
+			t.Fatalf("ребро %s дало %+v", kind, got)
+		}
+	}
+
+	// Один ID попадает в набор один раз.
+	dup := taskstore.GatesHolding(subject, []taskstore.GateDep{
+		{Kind: "depends-on", Target: gate},
+		{Kind: "blocks", Target: gate},
+	})
+	if len(dup) != 1 {
+		t.Fatalf("дубль гейта: %+v", dup)
+	}
+}
+
+func TestGateRefJSONHasExactlyThreeKeys(t *testing.T) {
+	b, err := json.Marshal(taskstore.GateRef{ID: "T1.2", Type: "human", Reason: "нужен обзор"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m) != 3 {
+		t.Fatalf("ключей %d, ждали 3: %s", len(m), b)
+	}
+	for _, key := range []string{"id", "type", "reason"} {
+		if _, ok := m[key]; !ok {
+			t.Errorf("нет ключа %q: %s", key, b)
+		}
+	}
+}
+
+func TestGateReasonRoundTrip(t *testing.T) {
+	desc := taskstore.GateDescription("T1.1", "  нужен обзор  ")
+	if got := taskstore.GateReason(desc); got != "нужен обзор" {
+		t.Fatalf("GateReason = %q", got)
+	}
+	if got := taskstore.GateReason("описание без причины"); got != "" {
+		t.Fatalf("GateReason без маркера = %q", got)
+	}
+}
+
+func cbxByID(t *testing.T, dir string) map[string]taskstore.Card {
+	t.Helper()
+	cards, err := taskstore.LoadCards(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]taskstore.Card, len(cards))
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+	return byID
+}
+
+func cbxSurfaceIDs(t *testing.T, dir, id string) (predicate, whyText, whyJSON, listJSON []string) {
+	t.Helper()
+	cfg := whyConfig(dir)
+	byID := cbxByID(t, dir)
+	predicate = cbxIDs(gatedByFor(id, byID))
+
+	var out, errOut bytes.Buffer
+	if code := TaskCommandWithConfig([]string{"task", "why", id}, &out, &errOut, cfg); code != 0 || errOut.Len() != 0 {
+		t.Fatalf("why: код %d stderr %q", code, errOut.String())
+	}
+	text := out.String()
+	var line string
+	for _, l := range strings.Split(text, "\n") {
+		if strings.Contains(l, "gated_by:") {
+			line = l
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("в why нет строки gated_by: %q", text)
+	}
+	if len(predicate) == 0 {
+		if !strings.Contains(line, "пусто") {
+			t.Errorf("gated_by-строка = %q, ждали пусто", line)
+		}
+	} else {
+		for _, refID := range predicate {
+			if !strings.Contains(line, refID) {
+				t.Errorf("в why-строке нет ID %s: %q", refID, line)
+			}
+		}
+		for _, part := range strings.Split(strings.TrimSpace(strings.SplitN(line, "gated_by:", 2)[1]), ", ") {
+			id := strings.SplitN(strings.TrimSpace(part), " (", 2)[0]
+			if id != "" && id != "пусто" {
+				whyText = append(whyText, id)
+			}
+		}
+	}
+	sort.Strings(whyText)
+
+	out.Reset()
+	errOut.Reset()
+	if code := TaskCommandWithConfig([]string{"task", "why", id, "--format", "json"}, &out, &errOut, cfg); code != 0 || errOut.Len() != 0 {
+		t.Fatalf("why json: код %d stderr %q", code, errOut.String())
+	}
+	var w struct {
+		GatedBy []taskstore.GateRef `json:"gated_by"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &w); err != nil {
+		t.Fatalf("why json: %v", err)
+	}
+	whyJSON = cbxIDs(w.GatedBy)
+
+	out.Reset()
+	errOut.Reset()
+	if code := TaskCommandWithConfig([]string{"task", "list", "--format", "json"}, &out, &errOut, cfg); code != 0 || errOut.Len() != 0 {
+		t.Fatalf("list json: код %d stderr %q", code, errOut.String())
+	}
+	var rows []struct {
+		ID      string              `json:"id"`
+		GatedBy []taskstore.GateRef `json:"gated_by"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &rows); err != nil {
+		t.Fatalf("list json: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID == id {
+			listJSON = cbxIDs(row.GatedBy)
+		}
+	}
+	return predicate, whyText, whyJSON, listJSON
+}
+
+func cbxSameSet(t *testing.T, predicate, a, b, c []string) {
+	t.Helper()
+	want := strings.Join(predicate, ",")
+	for name, got := range map[string][]string{"why": a, "whyJSON": b, "listJSON": c} {
+		if strings.Join(got, ",") != want {
+			t.Errorf("%s = %v, предикат = %v", name, got, predicate)
+		}
+	}
+}
+
+func TestGatedBySurfacesAgreeAndClearTogether(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "T1.1", "todo", "", "depends-on:T1.2", "цепочка")
+	writeWhyCard(t, dir, "T1.2", "todo", "alice", "нет", "гейт")
+
+	p, a, b, c := cbxSurfaceIDs(t, dir, "T1.1")
+	if len(p) != 1 || p[0] != "T1.2" {
+		t.Fatalf("открытый гейт: предикат = %v", p)
+	}
+	cbxSameSet(t, p, a, b, c)
+
+	// Закрытие гейта одновременно очищает все поверхности.
+	writeWhyCard(t, dir, "T1.2", "done", "alice", "нет", "гейт")
+	p, a, b, c = cbxSurfaceIDs(t, dir, "T1.1")
+	if len(p) != 0 {
+		t.Fatalf("закрытый гейт: предикат = %v", p)
+	}
+	cbxSameSet(t, p, a, b, c)
+}
+
+func TestGatedByClosedSubjectAndWaitsForEmpty(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "T1.1", "done", "", "depends-on:T1.2", "закрытый субъект")
+	writeWhyCard(t, dir, "T1.2", "todo", "alice", "нет", "гейт")
+	p, a, b, c := cbxSurfaceIDs(t, dir, "T1.1")
+	if len(p) != 0 {
+		t.Fatalf("закрытый субъект: %v", p)
+	}
+	cbxSameSet(t, p, a, b, c)
+
+	dir = t.TempDir()
+	writeWhyCard(t, dir, "T2.1", "todo", "", "waits-for-external gh:pr:42", "внешний гейт")
+	p, a, b, c = cbxSurfaceIDs(t, dir, "T2.1")
+	if len(p) != 0 {
+		t.Fatalf("waits-for-external: %v", p)
+	}
+	cbxSameSet(t, p, a, b, c)
+}
+
+func TestGatedByTwentyGraphsNoDivergence(t *testing.T) {
+	divergences := 0
+	for i := 0; i < 20; i++ {
+		dir := t.TempDir()
+		gateStatus := "todo"
+		if i%3 == 0 {
+			gateStatus = "done"
+		}
+		subjectStatus := "todo"
+		if i%5 == 0 {
+			subjectStatus = "done"
+		}
+		deps := "depends-on:T1.2"
+		if i%4 == 0 {
+			deps = "waits-for-external gh:pr:42"
+		}
+		writeWhyCard(t, dir, "T1.1", subjectStatus, "", deps, "граф")
+		writeWhyCard(t, dir, "T1.2", gateStatus, "alice", "нет", "гейт")
+
+		p, a, b, c := cbxSurfaceIDs(t, dir, "T1.1")
+		want := ""
+		if subjectStatus != "done" && gateStatus != "done" && i%4 != 0 {
+			want = "T1.2"
+		}
+		if strings.Join(p, ",") != want {
+			t.Errorf("граф %d: предикат %v, ждали %q", i, p, want)
+		}
+		if strings.Join(a, ",") != want || strings.Join(b, ",") != want || strings.Join(c, ",") != want {
+			divergences++
+			t.Errorf("граф %d: why=%v whyJSON=%v list=%v, ждали %q", i, a, b, c, want)
+		}
+	}
+	if divergences != 0 {
+		t.Fatalf("расхождений между поверхностями: %d", divergences)
 	}
 }
 
