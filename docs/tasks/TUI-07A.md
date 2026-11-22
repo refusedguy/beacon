@@ -1,5 +1,5 @@
 # TUI-07A. Тест хвоста событий на холодном старте
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/tui/client_test.go, cmd/beacon/watch_w8b_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить в OwnerFiles тест, который поднимает живой экран на тестовом HTTP-сервере с replay и проверяет непустой хвост событий в первом кадре. Использовать снимок с полями points, subscribers и event tail. Не править internal/tui/client.go и cmd/beacon/watch.go: их владелец TUI-03. Если тесту нужен новый файл, добавить его с суффиксом _test.go в OwnerFiles карточки. Локально go test и go build не запускать, проверку оставить CI.
 Проверка: CI зелёный. Тест падает на текущем main до TUI-03 и проходит после его мержа. Production-файлы в OwnerFiles не попали.
 Приёмка: Тест живёт только в тестовых файлах карточки. Поведение хвоста реализует TUI-03.
+
+Итог: Already landed in PR #1610 (commit 27e439970324cd6c6b1abaaf1619159cd8d47240). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1610 merged 2026-11-22T13:59:03+05:00; commit 27e439970324cd6c6b1abaaf1619159cd8d47240; git merge-base --is-ancestor 27e439970324cd6c6b1abaaf1619159cd8d47240 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1610 27e43997
+Время закрытия: 2026-11-22T11:25:31Z

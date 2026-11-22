@@ -1,5 +1,5 @@
 # TUI-03. Свести два HTTP-клиента к одному контракту
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/tui/client.go, cmd/beacon/watch.go
@@ -12,3 +12,8 @@
 Шаги: Выбрать один клиент для обеих команд, а второй оставить как совместимый слой только если без него ломается watch --live. Заменить Points.Limit на budget в рендере либо заполнять limit в провайдере. Добавить role и phase в проекцию Subscriber из client.go:160. Передавать ?replay=N в openEvents и сохранить Last-Event-ID для переподключения. Не добавлять третий клиент.
 Проверка: CI зелёный. Заголовок показывает бюджет без нуля. Хвост событий не пуст на первом кадре при включённом replay. Тесты client_test.go проходят на обоих форматах ответа.
 Приёмка: Один декодер контракта на две команды. Поля points, subscribers и event tail совпадают с серверной проекцией.
+
+Итог: Already landed in PR #1453 (commit 70f11147cacd980a33a56f709fdbcc2ea1ff1461). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1453 merged 2026-11-22T10:27:44+05:00; commit 70f11147cacd980a33a56f709fdbcc2ea1ff1461; git merge-base --is-ancestor 70f11147cacd980a33a56f709fdbcc2ea1ff1461 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1453 70f11147
+Время закрытия: 2026-11-22T11:25:31Z

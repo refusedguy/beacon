@@ -1,5 +1,5 @@
 # MEM-05. Удалять сессии закрытых Watch в beacon gc
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: cmd/beacon/gc.go, cmd/beacon/gc_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить в GC проход по RecentClosedWatches с окном удержания. Собрать sessionID из подписчиков закрытого Watch, исключить id из LiveWatches и id текущей сессии. Вызвать DeleteSession из MEM-01 только при --apply, в dry-run печатать план. Записать результат в отчёт GC и в метрику. Покрыть gc_test.go тестами на активного подписчика, на закрытого и на dry-run.
 Проверка: CI зелёный. Тест с активным Watch не вызывает удаление. Тест с закрытым Watch и --apply вызывает DeleteSession один раз.
 Приёмка: Сессии закрытых Watch удаляются. Живые подписчики и текущая сессия защищены.
+
+Итог: Already landed in PR #1444 (commit b1c647615f0d17bafa30899ad4b77594443aef48). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1444 merged 2026-11-22T09:57:50+05:00; commit b1c647615f0d17bafa30899ad4b77594443aef48; git merge-base --is-ancestor b1c647615f0d17bafa30899ad4b77594443aef48 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1444 b1c64761
+Время закрытия: 2026-11-22T11:25:31Z
