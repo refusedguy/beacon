@@ -219,7 +219,11 @@ type CIFailedLogHandler struct {
 // default env-backed source; a nil cache means no cross-call caching.
 func NewCIFailedLogHandler(store resultStoreReader, source CIFailedLogSource) *CIFailedLogHandler {
 	if source == nil {
-		source = newEnvFailureExcerptSource()
+		// The constructor returns the narrower FailureExcerptSource interface.
+		// Assert the concrete type so the compiler sees FailureLog as well.
+		if env, ok := newEnvFailureExcerptSource().(*envFailureExcerptSource); ok && env != nil {
+			source = env
+		}
 	}
 	return &CIFailedLogHandler{store: store, source: source}
 }
