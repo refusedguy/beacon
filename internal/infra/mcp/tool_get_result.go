@@ -1148,6 +1148,10 @@ type RubricEvaluation struct {
 	// without starting a retry. Other outcomes leave it empty and keep their
 	// previous bytes.
 	LeaseKey string `json:"leaseKey,omitempty"`
+	// NeedsHumanDecision is set only when the iteration budget ran out. It
+	// tells the caller to park the Watch and wait for a human to continue the
+	// run. Every other outcome leaves it false (CV-09).
+	NeedsHumanDecision bool `json:"needsHumanDecision,omitempty"`
 }
 
 // gradeResult grades w against rubric. It reads no clock, does no I/O and never
@@ -1193,6 +1197,7 @@ func gradeResult(w domain.Watch, rubric ResultRubric, iteration int, interrupted
 		ev.ReadyVerdict = w.Verdict
 	case iteration >= maxIterations:
 		ev.Outcome = OutcomeMaxIterationsReached
+		ev.NeedsHumanDecision = true
 	case runFinished:
 		// The run ended yet at least one criterion failed: completed is not
 		// the same as done, and there is no run left to revise.
@@ -1290,10 +1295,38 @@ func failedRequiredCheckNames(w domain.Watch) []string {
 	return names
 }
 
+// resultWatchWriter is the optional write side used to park a Watch whose
+// iteration budget ran out. A composition root that wants parking supplies it;
+// a read-only caller leaves the Watch untouched.
+type resultWatchWriter interface {
+	SaveWatch(domain.Watch) error
+}
+
+// parkForInput moves w to needs_input with the domain transition and saves the
+// result through the optional write side. The transition is idempotent for an
+// already parked Watch and never creates a successor Watch (CV-09).
+func (h *GetResultHandler) parkForInput(w domain.Watch) (domain.Watch, error) {
+	next, effects := domain.Transition(w, domain.NeedsInputEvent(h.clock.Now()))
+	for _, effect := range effects {
+		if effect.Kind == domain.EffectCreateWatch {
+			return w, domain.NewAppError(domain.CodeInvalidInput, "grade_result: parking must not create a new Watch")
+		}
+	}
+	writer, ok := h.store.(resultWatchWriter)
+	if !ok {
+		return next, nil
+	}
+	if err := writer.SaveWatch(next); err != nil {
+		return w, domain.NewAppError(domain.CodePersistFailed, err.Error())
+	}
+	return next, nil
+}
+
 // GradeResult is the separate result check. It re-reads the Watch from the
 // store and grades it against rubric, so its verdict does not depend on how the
-// agent reported the run. Grading stamps no delivery fact: readAt/claimedAt
-// stay owned by the notification path (ADR 0014).
+// agent reported the run. An exhausted budget parks the Watch for a human
+// answer with the domain needs_input event. Grading stamps no delivery fact:
+// readAt/claimedAt stay owned by the notification path (ADR 0014).
 func (h *GetResultHandler) GradeResult(ctx context.Context, watchID string, rubric ResultRubric, iteration int, interrupted bool) (RubricEvaluation, error) {
 	_ = ctx
 	if watchID == "" {
@@ -1306,7 +1339,13 @@ func (h *GetResultHandler) GradeResult(ctx context.Context, watchID string, rubr
 	if err != nil {
 		return RubricEvaluation{}, mapResultReadFailure(h.store, err, "grade_result: watch")
 	}
-	return gradeResult(w, rubric, iteration, interrupted), nil
+	ev := gradeResult(w, rubric, iteration, interrupted)
+	if ev.NeedsHumanDecision {
+		if _, err := h.parkForInput(w); err != nil {
+			return RubricEvaluation{}, err
+		}
+	}
+	return ev, nil
 }
 
 // GradeExternalAction is the ADR 0039 §5 entry point. It grades a task after an

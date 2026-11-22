@@ -729,6 +729,150 @@ func TestGradeResultIterationCap(t *testing.T) {
 	}
 }
 
+// TestGradeResultBudgetExhaustionAsksHuman covers CV-09 at the pure grader: an
+// exhausted budget asks for a human decision, while a satisfied result does not.
+func TestGradeResultBudgetExhaustionAsksHuman(t *testing.T) {
+	ev := gradeResult(resultFixture(domain.VerdictKeepWorking), DefaultResultRubric(), defaultOutcomeIterations, false)
+
+	if ev.Outcome != OutcomeMaxIterationsReached {
+		t.Fatalf("outcome = %q, want %q", ev.Outcome, OutcomeMaxIterationsReached)
+	}
+	if !ev.NeedsHumanDecision {
+		t.Error("exhausted budget did not ask for a human decision")
+	}
+	if ev.ReadyVerdict != "" {
+		t.Errorf("readyVerdict = %q, want empty: a parked run must not open merge", ev.ReadyVerdict)
+	}
+
+	below := gradeResult(resultFixture(domain.VerdictKeepWorking), DefaultResultRubric(), defaultOutcomeIterations-1, false)
+	if below.NeedsHumanDecision {
+		t.Error("budget below the cap asked for a human decision")
+	}
+
+	satisfied := gradeResult(greenWatch(), DefaultResultRubric(), 0, false)
+	if satisfied.NeedsHumanDecision {
+		t.Error("satisfied result asked for a human decision")
+	}
+	if satisfied.ReadyVerdict != domain.VerdictReady {
+		t.Errorf("readyVerdict = %q, want %q", satisfied.ReadyVerdict, domain.VerdictReady)
+	}
+}
+
+// TestGradeResultParksWatchWhenBudgetExhausted checks the handler side of
+// CV-09: the result carries the question flag and the Watch reaches
+// needs_input without creating a successor Watch.
+func TestGradeResultParksWatchWhenBudgetExhausted(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictKeepWorking)
+	o := resultObligation(w, "session-human")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, clock)
+
+	ev, err := h.GradeResult(context.Background(), w.ID, DefaultResultRubric(), defaultOutcomeIterations, false)
+	if err != nil {
+		t.Fatalf("GradeResult: %v", err)
+	}
+	if !ev.NeedsHumanDecision {
+		t.Fatal("result did not carry the question flag")
+	}
+	if ev.ReadyVerdict != "" {
+		t.Errorf("readyVerdict = %q, want empty", ev.ReadyVerdict)
+	}
+
+	parked, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read parked Watch: %v", err)
+	}
+	if parked.Status != domain.StatusNeedsInput || parked.Verdict != domain.VerdictNeedsInput {
+		t.Errorf("parked Watch = %q/%q, want %q/%q", parked.Status, parked.Verdict, domain.StatusNeedsInput, domain.VerdictNeedsInput)
+	}
+	if parked.Revision != w.Revision+1 {
+		t.Errorf("revision = %d, want %d", parked.Revision, w.Revision+1)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("parking created %d Watches, want 1", len(store.watches))
+	}
+}
+
+// TestMaxIterationsAnswerRaisesBudgetAndUnparks is the CV-09 contract: a human
+// answer through ack(continueOf) resumes the same Watch, and a raised budget
+// stops asking for a decision.
+func TestMaxIterationsAnswerRaisesBudgetAndUnparks(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
+	w := resultFixture(domain.VerdictKeepWorking)
+	o := resultObligation(w, "session-answer")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewGetResultHandler(store, stamper, clock)
+
+	first, err := h.GradeResult(context.Background(), w.ID, DefaultResultRubric(), defaultOutcomeIterations, false)
+	if err != nil {
+		t.Fatalf("GradeResult: %v", err)
+	}
+	if !first.NeedsHumanDecision {
+		t.Fatal("first grade did not ask for a human decision")
+	}
+	parked, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read parked Watch: %v", err)
+	}
+	if parked.Status != domain.StatusNeedsInput {
+		t.Fatalf("status = %q, want %q", parked.Status, domain.StatusNeedsInput)
+	}
+
+	ack := NewAckHandler(store, stamper, clock)
+	if _, err := ack.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID,
+	}); err != nil {
+		t.Fatalf("ack continueOf: %v", err)
+	}
+	resumed, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read resumed Watch: %v", err)
+	}
+	if resumed.Status != domain.StatusWatching || resumed.Verdict != domain.VerdictWatching {
+		t.Errorf("answer did not resume the Watch: %q/%q", resumed.Status, resumed.Verdict)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("answer created %d Watches, want 1", len(store.watches))
+	}
+
+	raised := DefaultResultRubric()
+	raised.MaxIterations = defaultOutcomeIterations + 2
+	second, err := h.GradeResult(context.Background(), w.ID, raised, defaultOutcomeIterations, false)
+	if err != nil {
+		t.Fatalf("GradeResult with raised budget: %v", err)
+	}
+	if second.NeedsHumanDecision {
+		t.Error("raised budget still asked for a human decision")
+	}
+	if second.Outcome == OutcomeMaxIterationsReached {
+		t.Error("raised budget still reported an exhausted budget")
+	}
+	final, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read final Watch: %v", err)
+	}
+	if final.Status != domain.StatusWatching {
+		t.Errorf("grading re-parked the Watch: status %q", final.Status)
+	}
+}
+
 // TestGradeResultInterruptedWins proves a caller-driven interruption is never
 // reported as a satisfied result, even when all criteria pass.
 func TestGradeResultInterruptedWins(t *testing.T) {
