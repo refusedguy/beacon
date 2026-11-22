@@ -19,3 +19,4 @@
 - Перед коммитом обновлённого бинарника гейтов собирать его версией Go из go.mod.
 - При изменении версии Go в go.mod бинарник гейтов пересобирается в том же коммите.
 - CI остаётся источником истины: если хеши расходятся, PR красный.
+- При расхождении байтов job `gates-binary` печатает строку `toolchain mismatch: go.mod=<version> runner=<version>`, если версия раннера отличается от версии в `go.mod`. Шаг `Report Go toolchain` печатает до сравнения `go version`, `go env GOTOOLCHAIN GOEXPERIMENT GOVERSION` и версию из `go.mod` через `go list -m -f '{{.GoVersion}}'`.
