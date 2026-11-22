@@ -258,7 +258,7 @@ func CanContinueRound(round uint64) bool {
 //	notifying -> needs_input: same question after an actionable verdict
 //	needs_input -> watching : human answer via ContinueEvent with a valid round
 //	needs_input -> closed   : cancel, head_changed or successful acceptance
-//	needs_input -> needs_input: repeated question or out-of-range answer (no-op)
+//	needs_input -> needs_input: repeated question, out-of-range answer or a CI verdict (no-op)
 //	watching  -> parked    : failed execution step (limit/budget/crash/error)
 //	notifying -> parked    : same failure after an actionable verdict
 //	needs_input -> parked   : same failure while waiting for a human answer
@@ -290,7 +290,10 @@ func CanContinueRound(round uint64) bool {
 // ContinueEvent whose ContinueOf is a different Watch is also a no-op: an
 // answer can never become a new task. A blocked Watch ignores verdicts like a
 // parked one: only an explicit unblock resumes it, so a CI refresh cannot wake
-// subscribers of a Watch that is waiting on outside action.
+// subscribers of a Watch that is waiting on outside action. A needs_input
+// Watch likewise ignores CI verdicts: no verdict can wake its subscribers or
+// close it before the human answers (ADR 0031). A ContinueEvent, cancel, head
+// change, acceptance or park still moves it as listed above.
 //
 // Revision grows only when the verdict changes, including a re-run downgrade
 // to watching at the same SHA. It never grows on watching -> watching. There
@@ -480,9 +483,12 @@ func continueWatch(w Watch, e Event) (Watch, []Effect) {
 	}}
 }
 
+// transitionVerdict ignores a Watch waiting for a human answer. A CI verdict
+// must not move needs_input: the answer resumes the same Watch under ADR 0031,
+// and a terminal verdict would close it before the human replies.
 func transitionVerdict(w Watch, e Event) (Watch, []Effect) {
 	next := cloneWatch(w)
-	if w.Status == StatusClosed || w.Status == StatusParked || w.Status == StatusBlocked || !validVerdict(e.Verdict) {
+	if w.Status == StatusClosed || w.Status == StatusParked || w.Status == StatusBlocked || w.Status == StatusNeedsInput || !validVerdict(e.Verdict) {
 		return next, nil
 	}
 	v := e.Verdict

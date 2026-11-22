@@ -32,12 +32,14 @@ type ciObservation struct {
 
 // fetchSnapshots reads every live Watch once. A BatchCIProvider is used when
 // available so one GraphQL document covers all PRs and their base branches.
-// Without one, the legacy CIProvider is called per Watch.
+// Without one, the legacy CIProvider is called per Watch. Watches parked for a
+// human answer (needs_input) are skipped: a CI verdict must not wake their
+// subscribers or close them before the answer resumes the same Watch (ADR 0031).
 func (b *ciRefresh) fetchSnapshots(ctx context.Context, watches []domain.Watch, cycleID string) (map[string]ciObservation, error) {
 	out := make(map[string]ciObservation, len(watches))
 	candidates := make([]domain.Watch, 0, len(watches))
 	for _, w := range watches {
-		if w.Status != domain.StatusClosed && w.Status != domain.StatusBlocked {
+		if w.Status != domain.StatusClosed && w.Status != domain.StatusBlocked && w.Status != domain.StatusNeedsInput {
 			candidates = append(candidates, w)
 		}
 	}
