@@ -80,10 +80,12 @@ const (
 	// the Watch so the next tick re-checks the dependency instead of dropping
 	// the Watch.
 	VerdictWaitDependency Verdict = "wait_dependency"
-	// VerdictGreenBlocked means checks are green but an orchestrator slot is
-	// held by an open blocker (ADR 0072). It frees no slot until the blocker
-	// closes.
-	VerdictGreenBlocked Verdict = "green_blocked"
+	// VerdictGreenBlocked is the "green but blocked" verdict of ADR 0059 §3:
+	// CI is green and the PR is ready to ship, but an open blocker holds the
+	// run. The run is suspended and frees its execution slot so the scheduler
+	// can start another task while it waits (ADR 0072). It is the same value as
+	// GreenBlocked, the single definition owned by verdict.go.
+	VerdictGreenBlocked Verdict = Verdict(GreenBlocked)
 )
 
 // Verdicts returns every verdict the system can emit, in one place. It is the
