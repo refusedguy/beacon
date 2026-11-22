@@ -517,3 +517,30 @@ executor-task:edit-failure -->
 Блок `executor-task:token-accounting` фиксирует пять категорий токенов, методы учёта и порог предупреждения 1024. Карточка CA-07 проверяет, что сумма по категориям совпадает с эталоном, остаток вычислен по `max_input_tokens` и предупреждение срабатывает на пороге.
 
 CI подхватывает тест шагом `Test JS adapters` в `.github/workflows/ci.yml`: `find tests/adapter -maxdepth 1 -name '*.test.js' | xargs node --test`. Тест использует только встроенные модули Node.
+
+## Объяснение подсистемы одним read-only агентом
+
+На вопрос «как это работает» исполнитель запускает одного агента с правом только на чтение. Это read-only объяснение, а не исправление; объяснение подсистемы за один проход даёт архитектурную картину инженеру, который не знаком с областью. Цель агента — покрыть поток данных и владельцев состояния, а не перечислить функции и файлы.
+
+Агент получает вопрос и грань подсистемы. Он читает код, карточки и ADR, не меняя файлы, и возвращает объяснение без существенной переделки. Один проход означает один ответ: уточняющие итерации и вторая агентская сессия в этом режиме не нужны. Если ответ требует правки кода, агент сообщает об этом и возвращается к обычному циклу с карточкой; смешивать объяснение с исправлением запрещено.
+
+Режим объяснения не создаёт коммит, не меняет файлы и не открывает PR. Он не регистрирует Watch, не вызывает `beacon_task_claim` и не переводит карточку в `done`. Роль `readonly` из блока `executor-task:context-roles` распространяется на все файлы, которые агент видит в этом режиме: запись в них отклоняется. Обычный цикл с OwnerFiles и PR продолжает действовать для задач на изменение.
+
+Источник приёма: `pstack/skills/how/SKILL.md:15-17` (`readonly: true`). Карточка PSKX-08 фиксирует приём в дереве beacon, не создавая новый глобальный скилл и не меняя протокол Watch. Приём не дублирует кандидатов PSK-01, адверсарии PSK-02, TLA Watch PSK-03, CP-01..05 и CM-01..05.
+
+<!-- executor-task:read-only-explain
+trigger: how-question, one-agent
+agent: single, readonly
+passes: one
+audience: engineer-unfamiliar-with-area
+cover: data-flow, state-owners
+not: function-list
+write: forbidden
+commit: none
+pr: none
+watch: none
+mixing-with-fix: forbidden
+role: readonly-from-context-roles
+source: pstack/skills/how/SKILL.md:15-17, PSKX-08
+scope: no-new-skill, no-protocol-change
+executor-task:read-only-explain -->
