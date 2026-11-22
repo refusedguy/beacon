@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -610,6 +611,7 @@ func runDaemon(c *CLI, args []string) int {
 		}
 		errorsBefore := daemonActorErrorCount()
 		daemonPollCards(ctx, cardMonitor, db, root)
+		daemonMaintenance(ctx, db)
 		ReconcilePass(ctx, cfg)
 		if err := daemonReminderNotify(tasks.NewNotifier(daemonReminderStore(db), time.Now))(ctx); err != nil {
 			observe.ActorError("reminder", "", err)
@@ -926,19 +928,60 @@ func newDaemonCardMonitor(db *store.DB, root string) *tasks.Monitor {
 	})
 }
 
+// daemonMaintenance runs the store maintenance the daemon owns. ArchiveRun
+// carries its own schedule guard, and the checkpoint flushes the WAL, so both
+// are safe on the daemon cadence. A failure is reported and never stops the
+// cycle (AUD-12).
+func daemonMaintenance(ctx context.Context, db *store.DB) {
+	if db == nil {
+		return
+	}
+	if _, err := db.ArchiveRun(ctx, time.Now()); err != nil {
+		observe.ActorError("daemon-archive", "", err)
+	}
+	// DB.Checkpoint queries writeDB, whose only connection is held by the
+	// dedicated writer for the process lifetime. A direct call waits forever.
+	// Run the same PRAGMA on that writer so the checkpoint can complete.
+	if err := db.Write(ctx, func(tx *sql.Tx) error {
+		var busy, log, checkpointed int
+		return tx.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").
+			Scan(&busy, &log, &checkpointed)
+	}); err != nil {
+		observe.ActorError("daemon-checkpoint", "", err)
+	}
+}
+
+// daemonCardIDs lists the card ids in tasksDir from file names. It never reads
+// a card body, so the 30-second monitor pass no longer increments the legacy
+// file_adapter_reads_total counter for every card (AUD-12). The card monitor
+// reads each body later through its own uncounted port.
+func daemonCardIDs(tasksDir string) ([]string, error) {
+	entries, err := os.ReadDir(tasksDir)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(entry.Name(), ".md"))
+	}
+	return ids, nil
+}
+
 // daemonPollCards subscribes the current task cards and polls each once. A
 // status change is appended to the event log under the card id, so one change
 // produces exactly one event. Subscribe is idempotent and Poll leaves state
 // untouched on error, so a restart or a repeat never duplicates an event or
 // resets the baseline.
 func daemonPollCards(ctx context.Context, monitor *tasks.Monitor, db *store.DB, root string) {
-	cards, err := taskstore.LoadCards(filepath.Join(root, "docs", "tasks"))
+	ids, err := daemonCardIDs(filepath.Join(root, "docs", "tasks"))
 	if err != nil {
 		observe.ActorError("card-monitor", "", err)
 		return
 	}
-	for _, card := range cards {
-		id := strings.TrimSpace(card.ID)
+	for _, id := range ids {
 		if id == "" {
 			continue
 		}
@@ -976,6 +1019,7 @@ func runDaemonCardMonitor(ctx context.Context, monitor *tasks.Monitor, db *store
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			daemonMaintenance(ctx, db)
 			daemonPollCards(ctx, monitor, db, root)
 		}
 	}
