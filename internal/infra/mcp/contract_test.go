@@ -729,3 +729,194 @@ func TestToolOutputSummaryBeforeJSON(t *testing.T) {
 		t.Fatalf("a template with the JSON fence before the summary must be rejected:\n%s", jsonFirst)
 	}
 }
+
+// remoteCatalogGaps pins the agent tools the remote map does not describe yet.
+// The drift audit records seven remote names against ten descriptor tools
+// (docs/research/audit-04-protocols.md, "Измеренное состояние"). AUD-09 and
+// AUD-10 own client.go; this card owns only the contract test. Remove a name
+// once its remote description and input-schema factory land, so the gap set
+// can only shrink.
+var remoteCatalogGaps = map[string]bool{
+	"beacon_task_claim":   true,
+	"beacon_task_close":   true,
+	"beacon_defer_wiring": true,
+}
+
+// TestOneCatalogIncludesWake pins the advertised catalog used by both the
+// tools/list contract and the E2E assertion. The eleven names come from one
+// catalog: ten descriptor tools plus the opt-in wake tool. A duplicate or a
+// missing name breaks both consumers at once.
+func TestOneCatalogIncludesWake(t *testing.T) {
+	advertised := AdvertisedToolNames()
+	if len(advertised) != 11 || len(advertised) != len(toolDescriptors)+1 {
+		t.Fatalf("advertised catalog = %d names, want 10 descriptors plus %s", len(advertised), WakeToolName)
+	}
+
+	seen := make(map[string]bool, len(advertised))
+	for _, name := range advertised {
+		if name == "" {
+			t.Error("advertised catalog has an empty name")
+			continue
+		}
+		if seen[name] {
+			t.Errorf("advertised catalog repeats %q", name)
+		}
+		seen[name] = true
+	}
+	if !seen[WakeToolName] {
+		t.Errorf("advertised catalog omits %s", WakeToolName)
+	}
+
+	agent := ToolNamesCopy()
+	if len(agent) != len(toolDescriptors) {
+		t.Errorf("agent tool names = %d, descriptors = %d", len(agent), len(toolDescriptors))
+	}
+	for _, name := range agent {
+		if name == WakeToolName {
+			t.Errorf("%s is registered as an agent tool", WakeToolName)
+		}
+		if !seen[name] {
+			t.Errorf("agent tool %q is missing from the advertised catalog", name)
+		}
+	}
+}
+
+// remoteCatalogNames returns the sorted union of names present in either
+// remote table. A name that exists in one table only is drift, so both sides
+// feed the same set.
+func remoteCatalogNames() []string {
+	seen := make(map[string]bool, len(remoteToolDescriptions)+len(remoteInputSchemaFactories))
+	for name := range remoteToolDescriptions {
+		seen[name] = true
+	}
+	for name := range remoteInputSchemaFactories {
+		seen[name] = true
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return names
+}
+
+// remoteCatalogProblems reports names whose remote description or input
+// schema is missing or empty. The live catalog test and the negative control
+// share this function, so adding a name without either entry fails the same
+// check.
+func remoteCatalogProblems(names []string, descriptions map[string]string, factories map[string]func() (*jsonschema.Schema, error)) []string {
+	problems := make([]string, 0)
+	for _, name := range names {
+		if strings.TrimSpace(descriptions[name]) == "" {
+			problems = append(problems, name+": empty remote description")
+		}
+		factory, ok := factories[name]
+		if !ok || factory == nil {
+			problems = append(problems, name+": missing remote input-schema factory")
+			continue
+		}
+		schema, err := factory()
+		if err != nil {
+			problems = append(problems, name+": remote input schema: "+err.Error())
+			continue
+		}
+		raw, err := json.Marshal(schema)
+		if err != nil || len(raw) == 0 || string(raw) == "null" || string(raw) == "{}" {
+			problems = append(problems, name+": empty remote input schema")
+		}
+	}
+	return problems
+}
+
+// TestRemoteCatalogContract ties the remote tables to the same agent catalog
+// the tools/list contract uses. The wake tool stays in the advertised set as
+// an adapter channel and stays out of both remote tables.
+func TestRemoteCatalogContract(t *testing.T) {
+	if !slices.Contains(AdvertisedToolNames(), WakeToolName) {
+		t.Fatalf("advertised catalog omits %s", WakeToolName)
+	}
+	if _, ok := remoteToolDescriptions[WakeToolName]; ok {
+		t.Errorf("%s has a remote description; it is an adapter channel, not an agent tool", WakeToolName)
+	}
+	if _, ok := remoteInputSchemaFactories[WakeToolName]; ok {
+		t.Errorf("%s has a remote input-schema factory; it is an adapter channel, not an agent tool", WakeToolName)
+	}
+
+	agent := ToolNamesCopy()
+	remoteNames := remoteCatalogNames()
+	if len(remoteNames) == 0 {
+		t.Fatal("remote catalog is empty")
+	}
+	for _, name := range remoteNames {
+		if !slices.Contains(agent, name) {
+			t.Errorf("remote name %q is not in the agent catalog", name)
+		}
+	}
+	if problems := remoteCatalogProblems(remoteNames, remoteToolDescriptions, remoteInputSchemaFactories); len(problems) > 0 {
+		t.Errorf("remote catalog drift: %s", strings.Join(problems, "; "))
+	}
+
+	// A new agent tool must gain a complete remote entry or a reasoned gap
+	// entry here. The pinned gaps are the measured 7/10 drift, not permission
+	// to grow it.
+	for _, name := range agent {
+		_, hasDescription := remoteToolDescriptions[name]
+		_, hasFactory := remoteInputSchemaFactories[name]
+		if hasDescription || hasFactory {
+			continue
+		}
+		if !remoteCatalogGaps[name] {
+			t.Errorf("agent tool %q has no remote entry; add its description and factory or pin a reasoned gap", name)
+		}
+	}
+	for name := range remoteCatalogGaps {
+		if slices.Contains(agent, name) {
+			continue
+		}
+		t.Errorf("pinned remote gap %q is no longer an agent tool; remove it from remoteCatalogGaps", name)
+	}
+}
+
+// TestRemoteCatalogRejectsMissingDescriptionAndFactory is the negative
+// control for TestRemoteCatalogContract. It proves the shared validator fails
+// a name added without a description, without a factory or with an empty
+// input schema, while a complete name passes.
+func TestRemoteCatalogRejectsMissingDescriptionAndFactory(t *testing.T) {
+	descriptions := make(map[string]string, len(remoteToolDescriptions)+3)
+	factories := make(map[string]func() (*jsonschema.Schema, error), len(remoteInputSchemaFactories)+3)
+	for name, description := range remoteToolDescriptions {
+		descriptions[name] = description
+	}
+	for name, factory := range remoteInputSchemaFactories {
+		factories[name] = factory
+	}
+
+	descriptions["beacon_no_description"] = "   "
+	factories["beacon_no_description"] = func() (*jsonschema.Schema, error) {
+		return &jsonschema.Schema{Type: "object"}, nil
+	}
+	descriptions["beacon_no_factory"] = "A tool whose input schema factory is missing."
+	descriptions["beacon_no_schema"] = "A tool whose factory returns no schema."
+	factories["beacon_no_schema"] = func() (*jsonschema.Schema, error) { return nil, nil }
+
+	problems := remoteCatalogProblems([]string{
+		"beacon_watch_pr",
+		"beacon_no_description",
+		"beacon_no_factory",
+		"beacon_no_schema",
+	}, descriptions, factories)
+	joined := strings.Join(problems, " | ")
+
+	for _, want := range []string{
+		"beacon_no_description: empty remote description",
+		"beacon_no_factory: missing remote input-schema factory",
+		"beacon_no_schema: empty remote input schema",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("validator missed %q in %q", want, joined)
+		}
+	}
+	if strings.Contains(joined, "beacon_watch_pr") {
+		t.Errorf("complete name was rejected: %q", joined)
+	}
+}
