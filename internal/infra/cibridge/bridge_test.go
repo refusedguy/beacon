@@ -1772,3 +1772,178 @@ func TestResponsibilityPartsAreWired(t *testing.T) {
 		}
 	}
 }
+
+// countingPolicyMerger records merge calls so a hold and a merge are
+// distinguishable through the same Refresh entry point the daemon uses.
+type countingPolicyMerger struct{ calls int }
+
+func (m *countingPolicyMerger) Merge(context.Context, string, int) (bool, bool, string, error) {
+	m.calls++
+	return true, false, "", nil
+}
+
+// policyResolver answers only for refs it knows. An unknown or failed ref
+// stays unresolved, which is the fail-closed contract of the resolver port.
+type policyResolver struct {
+	satisfied map[string]bool
+	failed    map[string]bool
+	refs      []string
+}
+
+func (r *policyResolver) Satisfied(_ context.Context, ref string) (bool, error) {
+	r.refs = append(r.refs, ref)
+	if r.failed[ref] {
+		return false, errors.New("resolver unavailable for " + ref)
+	}
+	return r.satisfied[ref], nil
+}
+
+func policyWatch(t *testing.T, policy domain.MergePolicy) (*store.DB, domain.Watch) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	w := domain.Watch{
+		ID: "watch:o/r:9:sha", Repo: "o/r", PR: 9, HeadSHA: "sha",
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		MergePolicy: policy,
+		Subscribers: []domain.Subscriber{{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	return db, w
+}
+
+func policyBridge(db *store.DB, merger *countingPolicyMerger, resolver DependencyResolver) *Bridge {
+	b := New(db, fakeCI{state: mergeTestState()}, fixedClock{at: time.Unix(1, 0)}, time.Second).
+		WithMerger(merger).WithWaker(&recordingWaker{})
+	return b.WithDependencyResolver(resolver)
+}
+
+// TestMergePolicyHoldsReadyVerdict proves the cibridge merge path cannot
+// bypass a policy hold when CI is green. Each case drives Refresh, reads the
+// Watch back and checks that the merger was never called.
+func TestMergePolicyHoldsReadyVerdict(t *testing.T) {
+	cases := []struct {
+		name       string
+		policy     domain.MergePolicy
+		resolver   *policyResolver
+		wantReason string
+		wantRefs   []string
+	}{
+		{
+			name:       "require approval",
+			policy:     domain.MergePolicy{AutoMerge: true, RequireApproval: true},
+			wantReason: "require_approval",
+		},
+		{
+			name:       "waitFor unresolved",
+			policy:     domain.MergePolicy{AutoMerge: true, WaitFor: []string{"#77"}},
+			resolver:   &policyResolver{},
+			wantReason: "wait_for:#77",
+			wantRefs:   []string{"#77"},
+		},
+		{
+			name:       "waitForMain unresolved",
+			policy:     domain.MergePolicy{AutoMerge: true, WaitForMain: []string{"PR#9"}},
+			resolver:   &policyResolver{},
+			wantReason: "wait_for_main:PR#9",
+			wantRefs:   []string{"PR#9"},
+		},
+		{
+			name:       "waitFor without resolver",
+			policy:     domain.MergePolicy{AutoMerge: true, WaitFor: []string{"#77"}},
+			wantReason: "resolver_unavailable",
+		},
+		{
+			name:       "waitFor resolver error",
+			policy:     domain.MergePolicy{AutoMerge: true, WaitFor: []string{"#77"}},
+			resolver:   &policyResolver{failed: map[string]bool{"#77": true}},
+			wantReason: "wait_for:#77",
+			wantRefs:   []string{"#77"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, w := policyWatch(t, tc.policy)
+			defer db.Close()
+			merger := &countingPolicyMerger{}
+			var resolver DependencyResolver
+			if tc.resolver != nil {
+				resolver = tc.resolver
+			}
+			b := policyBridge(db, merger, resolver)
+			if got := b.Refresh(context.Background()); got != 1 {
+				t.Fatalf("Refresh updated %d watches, want 1", got)
+			}
+			if merger.calls != 0 {
+				t.Fatalf("merge calls = %d, want 0 on a policy hold", merger.calls)
+			}
+			got, err := db.Watch(w.ID)
+			if err != nil {
+				t.Fatalf("Watch: %v", err)
+			}
+			want := domain.Verdict(string(domain.VerdictWaitDependency) + ":" + tc.wantReason)
+			if got.Verdict != want {
+				t.Fatalf("verdict = %q, want %q", got.Verdict, want)
+			}
+			if got.Status != domain.StatusNotifying || got.Revision != 1 {
+				t.Fatalf("status/revision = %q/%d, want notifying/1", got.Status, got.Revision)
+			}
+			if tc.resolver != nil && strings.Join(tc.resolver.refs, ",") != strings.Join(tc.wantRefs, ",") {
+				t.Fatalf("resolved refs = %v, want %v", tc.resolver.refs, tc.wantRefs)
+			}
+			// A repeated hold keeps the same revision and still does not merge.
+			if got := b.Refresh(context.Background()); got != 0 {
+				t.Fatalf("second Refresh updated %d watches, want 0", got)
+			}
+			if merger.calls != 0 {
+				t.Fatalf("merge calls after repeated hold = %d, want 0", merger.calls)
+			}
+		})
+	}
+}
+
+// TestMergePolicyAllowsGreenVerdict proves an empty policy keeps the current
+// merge and that a satisfied resolver releases the hold.
+func TestMergePolicyAllowsGreenVerdict(t *testing.T) {
+	cases := []struct {
+		name     string
+		policy   domain.MergePolicy
+		resolver *policyResolver
+	}{
+		{"no conditions", domain.MergePolicy{AutoMerge: true}, nil},
+		{
+			"satisfied refs",
+			domain.MergePolicy{AutoMerge: true, WaitFor: []string{"#77"}, WaitForMain: []string{"PR#9"}},
+			&policyResolver{satisfied: map[string]bool{"#77": true, "PR#9": true}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db, w := policyWatch(t, tc.policy)
+			defer db.Close()
+			merger := &countingPolicyMerger{}
+			var resolver DependencyResolver
+			if tc.resolver != nil {
+				resolver = tc.resolver
+			}
+			b := policyBridge(db, merger, resolver)
+			if got := b.Refresh(context.Background()); got != 1 {
+				t.Fatalf("Refresh updated %d watches, want 1", got)
+			}
+			if merger.calls != 1 {
+				t.Fatalf("merge calls = %d, want 1", merger.calls)
+			}
+			got, err := db.Watch(w.ID)
+			if err != nil {
+				t.Fatalf("Watch: %v", err)
+			}
+			if got.Status != domain.StatusClosed || got.Verdict != domain.VerdictMerged {
+				t.Fatalf("watch = %q/%q, want closed/merged", got.Status, got.Verdict)
+			}
+		})
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -86,6 +87,58 @@ func (b *verdictApplier) handleHeadChanged(w domain.Watch, head string, now time
 	log.Printf("cibridge: %s head %s -> %s (closeReason=%s)", current.ID, current.HeadSHA, head, domain.CloseReasonHeadChanged)
 }
 
+// DependencyResolver answers whether one waitFor or waitForMain reference is
+// already satisfied. The port is declared here so cibridge never imports the
+// app layer (ADR 0005): the orchestrator resolver satisfies it structurally.
+// An implementation must return an error instead of true when a fact cannot
+// be verified, so a failed resolution holds the merge.
+type DependencyResolver interface {
+	Satisfied(ctx context.Context, ref string) (bool, error)
+}
+
+// mergeResolvers carries the resolver bound to each Bridge. The Bridge fields
+// live in a file outside this card's owner files, so the setter and the value
+// it stores sit next to the gate that reads them.
+var mergeResolvers sync.Map // map[*Bridge]DependencyResolver
+
+// WithDependencyResolver binds the port used to resolve waitFor and
+// waitForMain before an auto-merge. A nil binding clears it: without a
+// resolver every Watch that names a reference stays on wait.
+func (b *Bridge) WithDependencyResolver(r DependencyResolver) *Bridge {
+	if b == nil {
+		return nil
+	}
+	if r == nil {
+		mergeResolvers.Delete(b)
+		return b
+	}
+	mergeResolvers.Store(b, r)
+	return b
+}
+
+// dependencyResolver returns the resolver bound to this Bridge. A Bridge
+// built without the setter may still carry a resolver on one of its existing
+// ports, so those are tried before falling back to nil.
+func (b *verdictApplier) dependencyResolver() DependencyResolver {
+	if b == nil || b.Bridge == nil {
+		return nil
+	}
+	if v, ok := mergeResolvers.Load(b.Bridge); ok {
+		if r, ok := v.(DependencyResolver); ok {
+			return r
+		}
+	}
+	for _, candidate := range []any{b.control, b.merger, b.store, b.ci} {
+		if candidate == nil {
+			continue
+		}
+		if r, ok := candidate.(DependencyResolver); ok {
+			return r
+		}
+	}
+	return nil
+}
+
 // applyVerdict routes one EvaluatePR result to the right follow-up action.
 func (b *verdictApplier) applyVerdict(ctx context.Context, w domain.Watch, obs ciObservation, verdict domain.Verdict, targets []domain.WakeTarget, now time.Time, cycleID string) int {
 	current, err := b.store.Watch(w.ID)
@@ -111,6 +164,9 @@ func (b *verdictApplier) applyVerdict(ctx context.Context, w domain.Watch, obs c
 		return b.applyBlocked(ctx, current, obs, now, cycleID)
 	case domain.VerdictReady:
 		if current.MergePolicy.AutoMerge && b.merger != nil {
+			if reason := b.mergePolicyHold(ctx, current); reason != "" {
+				return b.publishMergeWait(current, obs, now, cycleID, reason)
+			}
 			return b.applyMerge(ctx, current, obs, now, cycleID)
 		}
 		return b.publishActionable(ctx, current, obs, verdict, targets, now, cycleID, "")
@@ -121,6 +177,86 @@ func (b *verdictApplier) applyVerdict(ctx context.Context, w domain.Watch, obs c
 	default:
 		return b.publishActionable(ctx, current, obs, verdict, targets, now, cycleID, "")
 	}
+}
+
+// mergePolicyHold returns the reason the Watch's merge policy keeps a green
+// verdict away from applyMerge, or an empty string when the merge may run.
+// requireApproval is a static hold. waitFor and waitForMain need the resolver
+// port: a missing resolver or a failed resolution keeps the hold, matching
+// the fail-closed rule of the orchestrator gate (ADR 0305).
+func (b *verdictApplier) mergePolicyHold(ctx context.Context, w domain.Watch) string {
+	if w.MergePolicy.RequireApproval {
+		return "require_approval"
+	}
+	if len(w.MergePolicy.WaitFor) == 0 && len(w.MergePolicy.WaitForMain) == 0 {
+		return ""
+	}
+	resolver := b.dependencyResolver()
+	if resolver == nil {
+		return "resolver_unavailable"
+	}
+	for _, ref := range w.MergePolicy.WaitFor {
+		ok, err := resolver.Satisfied(ctx, ref)
+		if err != nil || !ok {
+			return "wait_for:" + ref
+		}
+	}
+	for _, ref := range w.MergePolicy.WaitForMain {
+		ok, err := resolver.Satisfied(ctx, ref)
+		if err != nil || !ok {
+			return "wait_for_main:" + ref
+		}
+	}
+	return ""
+}
+
+// publishMergeWait holds a green Watch whose merge policy is not satisfied.
+// The reason travels in the persisted verdict, so an operator sees why the PR
+// stayed open and the next cycle rechecks the same gate. No merger is called
+// and no subscriber gets work: a dependency hold is nobody's fault.
+func (b *verdictApplier) publishMergeWait(w domain.Watch, obs ciObservation, now time.Time, cycleID, reason string) int {
+	if w.Status == domain.StatusClosed || w.Status == domain.StatusParked || w.Status == domain.StatusBlocked {
+		return 0
+	}
+	if w.Revision == ^uint64(0) {
+		return 0
+	}
+	waitVerdict := domain.Verdict(string(domain.VerdictWaitDependency) + ":" + reason)
+	if w.Verdict == waitVerdict && w.Status == domain.StatusNotifying {
+		return 0
+	}
+	next := w
+	next.Status = domain.StatusNotifying
+	next.Verdict = waitVerdict
+	next.Revision = w.Revision + 1
+	next.Checks = obs.pr.Checks
+	next.Merge = domain.MergeInfo{
+		Mergeable:        obs.pr.Mergeable,
+		MergeStateStatus: obs.pr.MergeStateStatus,
+		ReviewDecision:   obs.pr.ReviewDecision,
+	}
+	if err := b.store.SaveWatch(next); err != nil {
+		observe.ActorError("cibridge-merge-hold", next.ID, err)
+		return 0
+	}
+	for _, sub := range next.Subscribers {
+		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
+		if _, err := b.store.Obligation(id); err != nil {
+			o := domain.Obligation{
+				ID: id, WatchID: next.ID, Revision: next.Revision,
+				SubscriberID: sub.ID, VerdictPointer: waitVerdict, StagedAt: now,
+			}
+			if err := b.store.SaveObligation(o); err != nil {
+				observe.ActorError("cibridge-merge-hold-obligation", next.ID, err)
+				continue
+			}
+		}
+	}
+	observe.VerdictPublished(string(waitVerdict), next.ID, next.PR, next.Revision)
+	b.cycleEvent(cycleID, "merge_held", cycleFields{
+		watchID: next.ID, revision: next.Revision, verdict: waitVerdict,
+	}, observe.Fields{observe.FieldReason: reason})
+	return 1
 }
 
 // publishActionable saves a non-terminal verdict and wakes the subscriber
