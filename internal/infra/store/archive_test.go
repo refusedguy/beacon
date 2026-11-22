@@ -423,9 +423,6 @@ func TestArchiveRunRejectsZeroTime(t *testing.T) {
 
 func TestWatchArchiveSchemaHasAllWatchFields(t *testing.T) {
 	d := openArchiveDB(t)
-	if err := d.ensureWatchArchive(); err != nil {
-		t.Fatalf("ensureWatchArchive: %v", err)
-	}
 	requireTable(t, d.readDB, "watch_archive")
 
 	rows, err := d.readDB.Query(`PRAGMA table_info(watch_archive)`)
