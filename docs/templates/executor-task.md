@@ -293,8 +293,28 @@ executor-task:artifact-paths -->
 
 1. **claim.** Получить задачу через `beacon_task_claim`, если оркестратор ещё не выдал её. Сохранить ID, цель, зависимости и OwnerFiles из ответа. Не искать задачу вручную в `docs/tasks/`.
 2. **register.** Вызвать `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"` или `"fixer"` и `notify: { adapter: "opencode", target: "<ses_...>" }`. В `target` идёт РЕАЛЬНЫЙ идентификатор сессии из `_meta["ai.opencode/sessionID"]` или явно переданный `ses_...`. Значение `<cardID>` в `target` запрещено: wake будет доставлен не туда. Повторный вызов с теми же параметрами идемпотентен. Один агент может держать несколько Watch.
-3. **push PR.** Перед `git worktree add ... origin/main` обязателен `git fetch origin main`: база берётся из свежего `origin/main`. Premise-check через `git merge-base --is-ancestor` делать только после fetch. Устаревшая база даёт ложный premise-check и конфликты. Сделать изменения в своём worktree и своей ветке от `origin/main`. Прямые коммиты в `main` запрещены. Локально запускать только `gofmt -w <изменённые_файлы>`. Полные проверки прогоняет GitHub Actions CI на PR, не запускать `go test ./...`, `go build ./...` и `beacon gates` локально. Запушить ветку и открыть PR в `main` командой `gh pr create --base main --head <ветка>`. В отчёте указать номер PR, headSHA и список файлов.
+3. **push PR.** Перед `git worktree add ... origin/main` обязателен `git fetch origin main`: база берётся из свежего `origin/main`. Premise-check через `git merge-base --is-ancestor` делать только после fetch. Устаревшая база даёт ложный premise-check и конфликты. Сделать изменения в своём worktree и своей ветке от `origin/main`. Прямые коммиты в `main` запрещены. Локально запускать только `gofmt -w <изменённые_файлы>`. Перед пушем запускать синтаксический предпроход по изменённым файлам и не пушить при ошибке. Полные проверки прогоняет GitHub Actions CI на PR, не запускать `go test ./...`, `go build ./...` и `beacon gates` локально. Запушить ветку и открыть PR в `main` командой `gh pr create --base main --head <ветка>`. В отчёте указать номер PR, headSHA и список файлов.
 4. **finish turn.** Завершить ход с отчётом ровно `waiting, <watchID>`, подставив сохранённый `watchID`. Не опрашивать состояние в цикле, не крутить `gh pr checks --watch`, не использовать `sleep` и не ждать вручную. Дальше агент спит до вердикта, который разрешает пробуждение.
+
+## Локальный синтаксический предпроход
+
+Перед пушем исполнитель проверяет синтаксис своих изменённых файлов. Предпроход парсит каждый файл деревом и собирает узлы с ошибкой. Для каждой ошибки он печатает `path:line`. Если найдена хотя бы одна ошибка, исполнитель чинит файл и повторяет предпроход. Исполнитель не пушит файл с ошибкой.
+
+Предпроход не заменяет полные проверки. Он не запускает `go test ./...`, `go build ./...` и `beacon gates`. Полные проверки остаются в GitHub Actions. Локально по-прежнему разрешён только `gofmt -w` на свои `.go`-файлы.
+
+Baseline карточки CA-14: пять опечаток вызвали пять лишних циклов CI. Предпроход останавливает все пять до пуша. Целевое число лишних циклов равно нулю.
+
+<!-- executor-task:syntax-precheck
+scope: changed-files
+parse: syntax-tree
+error-nodes: true
+output: path:line
+on-error: block-push
+full-checks: ci-only
+baseline-extra-ci-runs: 5
+target-extra-ci-runs: 0
+source: CA-14, docs/research/comp-aider.md
+executor-task:syntax-precheck -->
 
 ## Документация в том же PR
 
@@ -588,6 +608,7 @@ executor-task:edit-failure -->
 - Не открывать PR-дубль, когда требование карточки уже закрыто другим изменением.
 - Не возвращать блокер без доказательства: SHA, код `merge-base`, PR или ссылка на решение владельца.
 - Не вставлять полный CI-лог в wake или отчёт вместо ограниченного `failureExcerpt`.
+- Не пушить изменённый файл с синтаксической ошибкой, найденной предпроходом.
 
 ## Самопроверка шаблона
 
