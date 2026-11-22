@@ -13,6 +13,29 @@ const goodWiringCard = "# WIRING-777. Valid card\n" +
 // badWiringCard has all three defects at known lines.
 const badWiringCard = "# WIRING-888. Bad\nСтатус: done\nOwnerFiles: \n"
 
+// toolWiringCard is the shape beacon_defer_wiring writes: Russian field only.
+const toolWiringCard = "# WIRING-999. Tool card\n" +
+	"Статус: todo\n" +
+	"Владелец файлов: docs/b.go\n" +
+	"\n" +
+	"## Причина\n" +
+	" deferred wiring\n"
+
+// templateWiringCard is the shape of the card template: both field names.
+const templateWiringCard = "# WIRING-1000. Template card\n" +
+	"Статус: todo\n" +
+	"OwnerFiles: docs/c.go\n" +
+	"Владелец файлов: docs/c.go\n" +
+	"\n" +
+	"## Причина\n" +
+	" deferred wiring\n"
+
+// emptyBothWiringCard has both owner fields present but empty.
+const emptyBothWiringCard = "# WIRING-1001. Empty owner\n" +
+	"Статус: todo\n" +
+	"OwnerFiles: \n" +
+	"Владелец файлов: \n"
+
 func wiringConfig(t *testing.T) WiringConfig {
 	t.Helper()
 	cfg, err := LoadWiringConfig()
@@ -50,6 +73,35 @@ func TestCheckWiringValidCard(t *testing.T) {
 		"docs/tasks/WIRING-777.md": goodWiringCard,
 	}); len(fs) != 0 {
 		t.Fatalf("valid card produced findings: %v", fs)
+	}
+}
+
+func TestCheckWiringToolCard(t *testing.T) {
+	if fs := wiringFindings(t, map[string]string{
+		"docs/tasks/WIRING-999.md": toolWiringCard,
+	}); len(fs) != 0 {
+		t.Fatalf("beacon_defer_wiring card produced findings: %v", fs)
+	}
+}
+
+func TestCheckWiringTemplateCard(t *testing.T) {
+	if fs := wiringFindings(t, map[string]string{
+		"docs/tasks/WIRING-1000.md": templateWiringCard,
+	}); len(fs) != 0 {
+		t.Fatalf("template card produced findings: %v", fs)
+	}
+}
+
+func TestCheckWiringBothOwnerFieldsEmpty(t *testing.T) {
+	fs := wiringFindings(t, map[string]string{
+		"docs/tasks/WIRING-1001.md": emptyBothWiringCard,
+	})
+	if !HasRule(fs, "WIRING-OWNERFILES") {
+		t.Fatalf("missing WIRING-OWNERFILES in %v", fs)
+	}
+	// The fallback points at the Russian field that is actually present, line 4.
+	if !HasRuleAt(fs, "WIRING-OWNERFILES", "docs/tasks/WIRING-1001.md", 4) {
+		t.Errorf("owner finding at wrong line: %v", fs)
 	}
 }
 
