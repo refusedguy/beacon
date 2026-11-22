@@ -395,19 +395,23 @@ func realFailures(s Snapshot) []string {
 	return out
 }
 
-// InformationalCheckDiagnostics reports the required:false decisions that the
+// InformationalCheckDiagnostics reports the informational decisions that the
 // verdict engine drops without a trace. allInformational is true when at least
 // one check was observed and none of them can block the Watch. ignored lists
-// the failed checks that were filtered out solely because Required is false:
-// they appear in Failures, are present in Checks and have a non-success
-// conclusion. The verdict itself is untouched, and an empty or fully required
-// check set produces no diagnostics.
+// the failed checks that were filtered out solely because they are
+// informational: they appear in Failures, are present in Checks and have a
+// non-success conclusion. Both decisions use the same requiredGate as the
+// verdict engine, so a failed check never looks informational when no check
+// was marked required and the provider cannot tell required checks apart.
+// The verdict itself is untouched, and an empty or fully required check set
+// produces no diagnostics.
 func InformationalCheckDiagnostics(s Snapshot) (allInformational bool, ignored []string) {
 	if len(s.Checks) == 0 {
 		return false, nil
 	}
-	for _, c := range s.Checks {
-		if c.Required {
+	anyRequired := hasRequiredCheck(s)
+	for name, c := range s.Checks {
+		if requiredGate(name, c, anyRequired) {
 			allInformational = false
 			break
 		}
@@ -420,7 +424,7 @@ func InformationalCheckDiagnostics(s Snapshot) (allInformational bool, ignored [
 		}
 		seen[name] = true
 		c, observed := s.Checks[name]
-		if !observed || c.Required || harmlessConclusion(c) {
+		if !observed || requiredGate(name, c, anyRequired) || harmlessConclusion(c) {
 			continue
 		}
 		ignored = append(ignored, name)
