@@ -532,10 +532,10 @@ type watchPRInputWithCard struct {
 
 // claimedCardForNotify resolves the card a Watch should close from the agent
 // that registered it. beacon_task_claim writes the agent id into the card's
-// Агент field, so that field is the durable cardID -> agentID link. The notify
-// target carries the same session id, so a Watch registered without a cardID
-// can still be bound to the claimed card. An absent target, a store without a
-// lookup, or an agent holding no card leaves the Watch unlinked.
+// Агент field, so CardIDForAgent finds the card when notify.Target carries
+// that same id. The CLI boundary meets that condition. A headless session
+// registers with its own sessionID, so the lookup finds no card and the caller
+// logs the missing link instead of guessing one.
 func claimedCardForNotify(store mcp.TaskClaimStore, notify *mcp.WatchPRNotify) string {
 	if notify == nil {
 		return ""
@@ -585,6 +585,10 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 			cardID = claimedCardForNotify(deps.TaskClaimStore, in.Notify)
 		}
 		if cardID == "" {
+			observe.Event(observe.LevelWarn, "watch_pr_card_link_missing", observe.Fields{
+				observe.FieldWatchID: out.WatchID,
+				observe.FieldReason:  "no cardID in watch_pr input and no claimed card matches notify.Target",
+			})
 			return result, out, err
 		}
 		if !taskstore.IsID(cardID) {
@@ -592,7 +596,7 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 				fmt.Errorf("invalid cardID %q", cardID))
 			return result, out, err
 		}
-		linked, linkErr := db.Link(cardID, out.WatchID, in.PR)
+		linked, linkErr := db.LinkCardWatch(cardID, out.WatchID, in.PR)
 		if linkErr == nil && linked.Duplicate &&
 			(linked.Link.WatchID != out.WatchID || linked.Link.PR != in.PR) {
 			// A rebase creates a successor Watch. The first row still points at
@@ -601,7 +605,7 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 			if _, unlinkErr := db.Unlink(cardID); unlinkErr != nil {
 				linkErr = unlinkErr
 			} else {
-				_, linkErr = db.Link(cardID, out.WatchID, in.PR)
+				_, linkErr = db.LinkCardWatch(cardID, out.WatchID, in.PR)
 			}
 		}
 		if linkErr != nil {
