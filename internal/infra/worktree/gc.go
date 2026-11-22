@@ -9,7 +9,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
+
+// HistogramGCDuration is the observe histogram that records one full
+// collection pass. The daemon binds its WorktreeGC port to Collect, so one
+// port call adds exactly one observation. The name is exported so callers and
+// tests read the same series without repeating the literal.
+const HistogramGCDuration = "worktree_gc_duration_seconds"
 
 // Runner runs one git command. An empty dir selects the current working
 // directory. Tests replace Runner so nothing here needs a real repository.
@@ -174,6 +183,9 @@ func cleanDir(dir string) string {
 // if the status check is skipped. A status error or a failed remove keeps the
 // worktree with a reason instead of aborting the whole pass.
 func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Result, error) {
+	start := time.Now()
+	defer func() { observe.Observe(HistogramGCDuration, time.Since(start).Seconds()) }()
+
 	entries, err := List(run)
 	if err != nil {
 		return Result{}, err
