@@ -189,22 +189,43 @@ func (c *PRClient) ListComments(ctx context.Context, owner, repo string, number 
 	return out, nil
 }
 
-// MergePR lands a pull request with a squash merge. It is the write side of
-// the PRProvider port; the orchestrator's legacy gh merger is unchanged.
-func (c *PRClient) MergePR(ctx context.Context, owner, repo string, number int) error {
+// PRMergeResult is the confirmed outcome of a merge call. Merged reports that
+// GitHub confirmed the merge. Reason names a refusal or a missing confirmation.
+// SHA is the merge commit returned by GitHub.
+type PRMergeResult struct {
+	Merged bool
+	Reason string
+	SHA    string
+}
+
+// MergePR lands a pull request with a squash merge and verifies the reply.
+// expectedSHA is the head SHA the caller read before the request; GitHub
+// rejects the merge when the head changed. It is the write side of the
+// PRProvider port; the orchestrator's legacy gh merger is unchanged.
+func (c *PRClient) MergePR(ctx context.Context, owner, repo string, number int, expectedSHA string) (PRMergeResult, error) {
 	if c == nil || c.gh == nil {
-		return errors.New("github: PR client is nil")
+		return PRMergeResult{}, errors.New("github: PR client is nil")
 	}
 	if err := validateRepo(owner, repo); err != nil {
-		return err
+		return PRMergeResult{}, err
 	}
-	_, _, err := c.gh.PullRequests.Merge(ctx, owner, repo, number, "", &gh.PullRequestOptions{
-		MergeMethod: "squash",
-	})
+	opts := &gh.PullRequestOptions{MergeMethod: "squash"}
+	if sha := strings.TrimSpace(expectedSHA); sha != "" {
+		opts.SHA = sha
+	}
+	pr, _, err := c.gh.PullRequests.Merge(ctx, owner, repo, number, "", opts)
 	if err != nil {
-		return fmt.Errorf("github merge PR %s/%s#%d: %w", owner, repo, number, err)
+		return PRMergeResult{Reason: "host refused merge"}, fmt.Errorf("github merge PR %s/%s#%d: %w", owner, repo, number, err)
 	}
-	return nil
+	if pr == nil {
+		return PRMergeResult{Reason: "empty merge response"}, errors.New("github merge PR: empty merge response")
+	}
+	result := PRMergeResult{Merged: pr.GetMerged(), SHA: pr.GetMergeCommitSHA()}
+	if !result.Merged {
+		result.Reason = "merge not confirmed: merged=false"
+		return result, errors.New("github merge PR: " + result.Reason)
+	}
+	return result, nil
 }
 
 func validateRepo(owner, repo string) error {
