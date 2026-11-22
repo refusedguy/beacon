@@ -1665,3 +1665,162 @@ func TestDecisionRegistryResumeErrorReleasesReservation(t *testing.T) {
 		t.Fatalf("retry Decide = %+v applied %v err %v", got, applied, err)
 	}
 }
+
+// TestAckInputSchemaHasReApproveFields proves an MCP client can send the reason
+// and reApprove fields that carry an argued re-approval.
+func TestAckInputSchemaHasReApproveFields(t *testing.T) {
+	schema, err := jsonschema.For[AckInput](nil)
+	if err != nil {
+		t.Fatalf("input schema: %v", err)
+	}
+	raw, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal input schema: %v", err)
+	}
+	for _, field := range []string{"reason", "reApprove"} {
+		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Fatalf("input schema has no %s property: %s", field, raw)
+		}
+	}
+}
+
+// TestAckDecisionReApproveAppendsJournalRow proves the CR-05 contract. The
+// first approval writes one row and resumes once. An argued re-approval with a
+// new decisionID appends a second row that points at the first, leaves the
+// Watch revision alone and resumes nobody. A re-approval without a reason is
+// refused with reason_required. A repeat of an existing decisionID adds no row.
+func TestAckDecisionReApproveAppendsJournalRow(t *testing.T) {
+	store, _, h, w, o, clock := ackDecisionFixture(t)
+	ctx := context.Background()
+	const reason = "operator reviewed the failed checks"
+
+	first, err := h.AckReceipt(ctx, AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-1",
+	})
+	if err != nil || !first.Resumed {
+		t.Fatalf("first approval: receipt %+v err %v", first, err)
+	}
+	round := first.AnswerRound
+
+	second, err := h.AckReceipt(ctx, AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-2",
+		Reason: reason, ReApprove: true,
+	})
+	if err != nil {
+		t.Fatalf("argued re-approval: %v", err)
+	}
+	if !second.OK || second.Resumed {
+		t.Errorf("re-approval = %+v, want ok without a second resume", second)
+	}
+	rows := h.decisions.History(w.ID, round)
+	if len(rows) != 2 {
+		t.Fatalf("journal rows = %d, want 2", len(rows))
+	}
+	if rows[0].DecisionID != "decision-1" || rows[0].PriorCount != 0 {
+		t.Errorf("first row = %+v, want the original approval", rows[0])
+	}
+	row := rows[1]
+	if row.DecisionID != "decision-2" || row.Reason != reason || !row.ReApprove {
+		t.Errorf("second row = %+v, want decision-2 with the reason", row)
+	}
+	if row.PriorBy != "decision-1" || row.PriorCount != 1 || !row.PriorAt.Equal(rows[0].ResumedAt) {
+		t.Errorf("second row prior = %q/%d/%v, want decision-1/1/%v", row.PriorBy, row.PriorCount, row.PriorAt, rows[0].ResumedAt)
+	}
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Revision != w.Revision+1 {
+		t.Errorf("re-approval changed the Watch: %+v err %v", got, err)
+	}
+
+	_, err = h.AckReceipt(ctx, AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-3", ReApprove: true,
+	})
+	if err == nil {
+		t.Fatal("re-approval without a reason was accepted")
+	}
+	assertCode(t, err, domain.CodeInvalidInput)
+	if !bytes.Contains([]byte(err.Error()), []byte("reason_required")) {
+		t.Errorf("error %q does not name reason_required", err.Error())
+	}
+	if rows := h.decisions.History(w.ID, round); len(rows) != 2 {
+		t.Errorf("refused re-approval added a row: %d", len(rows))
+	}
+
+	clock.Advance(time.Hour)
+	repeat, err := h.AckReceipt(ctx, AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-2",
+		Reason: reason, ReApprove: true,
+	})
+	if err != nil {
+		t.Fatalf("repeat re-approval: %v", err)
+	}
+	if !repeat.OK || repeat.Resumed {
+		t.Errorf("repeat re-approval = %+v, want ok without resume", repeat)
+	}
+	if rows := h.decisions.History(w.ID, round); len(rows) != 2 {
+		t.Errorf("repeat re-approval added a row: %d", len(rows))
+	}
+}
+
+// failingClaimStamper fails the claim write so a re-approval can be checked for
+// rollback of its journal row.
+type failingClaimStamper struct {
+	*recordingStamper
+	failClaim bool
+}
+
+func (s *failingClaimStamper) StampClaimed(ctx context.Context, id string, at time.Time) (domain.Obligation, bool, error) {
+	if s.failClaim {
+		return domain.Obligation{}, false, errors.New("claim write failed")
+	}
+	return s.recordingStamper.StampClaimed(ctx, id, at)
+}
+
+// TestAckDecisionReApproveRollsBackWhenClaimFails proves that a failed claim
+// write removes the re-approval row. The first signature stays authoritative
+// and the Watch is not resumed a second time.
+func TestAckDecisionReApproveRollsBackWhenClaimFails(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
+	w := parkedAckWatch()
+	o := resultObligation(w, "session-rollback")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := &failingClaimStamper{recordingStamper: newRecordingStamper()}
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, clock)
+	ctx := context.Background()
+
+	first, err := h.AckReceipt(ctx, AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-1",
+	})
+	if err != nil || !first.Resumed {
+		t.Fatalf("first approval: receipt %+v err %v", first, err)
+	}
+	round := first.AnswerRound
+
+	stamper.failClaim = true
+	if _, err := h.AckReceipt(ctx, AckInput{
+		WatchID: w.ID, ObligationID: o.ID,
+		Decision: string(DecisionApprove), DecisionID: "decision-2",
+		Reason: "reviewed", ReApprove: true,
+	}); err == nil {
+		t.Fatal("re-approval with a failing claim write was accepted")
+	}
+	rows := h.decisions.History(w.ID, round)
+	if len(rows) != 1 || rows[0].DecisionID != "decision-1" {
+		t.Errorf("failed re-approval left %d rows: %+v", len(rows), rows)
+	}
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Revision != w.Revision+1 {
+		t.Errorf("failed re-approval changed the Watch: %+v err %v", got, err)
+	}
+}

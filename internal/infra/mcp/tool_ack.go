@@ -157,6 +157,12 @@ type AckInput struct {
 	// client can name which request was answered. It is optional for a plain
 	// ack.
 	DecisionID string `json:"decisionID,omitempty" jsonschema:"identifier of the pending decision this approve or reject answers"`
+	// Reason explains why an operator re-signs an already answered decision.
+	// It is required together with ReApprove and ignored on a plain ack.
+	Reason string `json:"reason,omitempty" jsonschema:"reason for re-approving an already answered decision; required when reApprove is set"`
+	// ReApprove asks to append a new approval row that references the earlier
+	// one. It does not resume the agent again. An empty Reason is refused.
+	ReApprove bool `json:"reApprove,omitempty" jsonschema:"record an argued re-approval of an answered decision instead of resuming the agent again; requires reason"`
 }
 
 // StaleRevisionError reports an event whose task revision is older than the
@@ -233,6 +239,18 @@ type DecisionRecord struct {
 	// WatchID as the registry key, so a new question on the same Watch is a
 	// new round while a repeat answer stays in the round it answered.
 	Round uint64
+	// Reason explains a re-approval. The operator supplies it when re-signing
+	// an already answered question.
+	Reason string
+	// ReApprove marks a decision that re-signs an answered question. It needs
+	// a reason and it appends a journal row instead of resuming the agent.
+	ReApprove bool
+	// PriorBy names the decision answered by the row this re-approval follows.
+	// PriorAt is the time of that row and PriorCount is the number of rows it
+	// preceded. The first row leaves all three empty.
+	PriorBy    string
+	PriorAt    time.Time
+	PriorCount uint64
 }
 
 // decisionKey identifies one question: the Watch and the revision at which it
@@ -244,14 +262,15 @@ type decisionKey struct {
 }
 
 // DecisionRegistry is the "requires attention" record of ADR 0058 §4. It keeps
-// one decision per question so a repeat decision cannot resume the same agent
-// twice and a later question on the same Watch can still be answered. The
-// first decision wins within a round: an identical repeat is an idempotent
-// no-op, while a different decision for an answered question is a conflict. It
-// is safe for concurrent use.
+// an append-only journal per question so a repeat decision cannot resume the
+// same agent twice and a later question on the same Watch can still be answered.
+// The first row wins within a round: an identical repeat is an idempotent
+// no-op, while a different decision for an answered question is a conflict. A
+// re-approval with a reason appends a row that points at the row it follows.
+// It is safe for concurrent use.
 type DecisionRegistry struct {
 	mu       sync.Mutex
-	records  map[decisionKey]DecisionRecord
+	journal  map[decisionKey][]DecisionRecord
 	inFlight map[decisionKey]*decisionFlight
 }
 
@@ -265,7 +284,7 @@ type decisionFlight struct {
 // NewDecisionRegistry builds an empty decision registry.
 func NewDecisionRegistry() *DecisionRegistry {
 	return &DecisionRegistry{
-		records:  make(map[decisionKey]DecisionRecord),
+		journal:  make(map[decisionKey][]DecisionRecord),
 		inFlight: make(map[decisionKey]*decisionFlight),
 	}
 }
@@ -282,12 +301,13 @@ func (r *DecisionRegistry) Lookup(watchID string) (DecisionRecord, bool) {
 	defer r.mu.Unlock()
 	var latest DecisionRecord
 	found := false
-	for key, rec := range r.records {
-		if key.watchID != watchID {
+	for key, entries := range r.journal {
+		if key.watchID != watchID || len(entries) == 0 {
 			continue
 		}
+		last := entries[len(entries)-1]
 		if !found || key.round > latest.Round {
-			latest = rec
+			latest = last
 			found = true
 		}
 	}
@@ -306,13 +326,18 @@ func (r *DecisionRegistry) LookupDecisionID(watchID, decisionID string) (Decisio
 	defer r.mu.Unlock()
 	var latest DecisionRecord
 	found := false
-	for key, rec := range r.records {
-		if key.watchID != watchID || rec.DecisionID != decisionID {
+	for key, entries := range r.journal {
+		if key.watchID != watchID {
 			continue
 		}
-		if !found || key.round > latest.Round {
-			latest = rec
-			found = true
+		for _, rec := range entries {
+			if rec.DecisionID != decisionID {
+				continue
+			}
+			if !found || key.round > latest.Round {
+				latest = rec
+				found = true
+			}
 		}
 	}
 	return latest, found
@@ -325,9 +350,12 @@ func (r *DecisionRegistry) LookupDecisionID(watchID, decisionID string) (Decisio
 // deadlock and Lookup never waits for a delivery. The round is reserved under
 // the lock while resume runs; a concurrent Decide for the same Watch and round
 // waits for that reservation to clear, then reads the recorded result. It
-// returns the stored record and whether resume ran. An identical repeat
-// returns the stored record with applied false; a conflicting decision in the
-// same round is refused with CodeInvalidInput.
+// returns the stored record and whether resume ran.
+//
+// An identical repeat returns the stored record with applied false; a
+// conflicting decision in the same round is refused with CodeInvalidInput. A
+// re-approval carries ReApprove and a Reason. It appends a row that names the
+// row it follows and does not run resume, so the agent resumes at most once.
 func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume func() (uint64, error)) (DecisionRecord, bool, error) {
 	if r == nil {
 		return DecisionRecord{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: decision registry is nil")
@@ -335,19 +363,37 @@ func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume fun
 	key := decisionKey{watchID: watchID, round: rec.Round}
 	for {
 		r.mu.Lock()
-		if r.records == nil {
-			r.records = make(map[decisionKey]DecisionRecord)
+		if r.journal == nil {
+			r.journal = make(map[decisionKey][]DecisionRecord)
 		}
 		if r.inFlight == nil {
 			r.inFlight = make(map[decisionKey]*decisionFlight)
 		}
-		if existing, ok := r.records[key]; ok {
-			if existing.Decision != rec.Decision || existing.DecisionID != rec.DecisionID {
+		entries := r.journal[key]
+		if len(entries) > 0 {
+			if rec.ReApprove && rec.Reason == "" {
+				r.mu.Unlock()
+				return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: reApprove requires a reason (reason_required)")
+			}
+			for _, entry := range entries {
+				if entry.DecisionID == rec.DecisionID {
+					r.mu.Unlock()
+					return entry, false, nil
+				}
+			}
+			if !rec.ReApprove {
 				r.mu.Unlock()
 				return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: a different decision was already recorded for this Watch")
 			}
+			last := entries[len(entries)-1]
+			next := rec
+			next.PriorBy = last.DecisionID
+			next.PriorAt = last.ResumedAt
+			next.PriorCount = uint64(len(entries))
+			next.Revision = last.Revision
+			r.journal[key] = append(entries, next)
 			r.mu.Unlock()
-			return existing, false, nil
+			return next, false, nil
 		}
 		if flight, ok := r.inFlight[key]; ok {
 			r.mu.Unlock()
@@ -368,11 +414,45 @@ func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume fun
 			return DecisionRecord{}, false, err
 		}
 		rec.Revision = revision
-		r.records[key] = rec
+		r.journal[key] = []DecisionRecord{rec}
 		r.mu.Unlock()
 		close(flight.done)
 		return rec, true, nil
 	}
+}
+
+// History returns every row recorded for watchID in that round, in the order
+// the rows were written. The first row is the original decision; later rows
+// are re-approvals with their prior references.
+func (r *DecisionRegistry) History(watchID string, round uint64) []DecisionRecord {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entries := r.journal[decisionKey{watchID: watchID, round: round}]
+	return append([]DecisionRecord(nil), entries...)
+}
+
+// Restore drops the last journal row written for a re-approval. The caller
+// uses it when the write after the decision fails, so the first signature
+// stays authoritative. Rows that were not re-approvals are left alone.
+func (r *DecisionRegistry) Restore(watchID string, round uint64, decisionID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key := decisionKey{watchID: watchID, round: round}
+	entries := r.journal[key]
+	if len(entries) < 2 {
+		return
+	}
+	last := entries[len(entries)-1]
+	if last.DecisionID != decisionID || !last.ReApprove {
+		return
+	}
+	r.journal[key] = entries[:len(entries)-1]
 }
 
 // failedCheckNames projects the failed checks of an ack onto the string slice
@@ -943,6 +1023,7 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 	}
 
 	var receipt AckReceipt
+	var reApproved bool
 	if isBlocked {
 		switch reason {
 		case blockedReasonNotMine:
@@ -988,7 +1069,7 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 	} else if in.Decision != "" {
 		var rec DecisionRecord
 		var applied bool
-		rec, applied, err = h.applyDecision(in, w, Decision(in.Decision))
+		rec, applied, reApproved, err = h.applyDecision(in, w, Decision(in.Decision))
 		if err != nil {
 			return AckReceipt{}, err
 		}
@@ -1007,6 +1088,13 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 		}
 	}
 	if _, _, err := h.stamper.StampClaimed(ctx, in.ObligationID, h.clock.Now()); err != nil {
+		if reApproved {
+			// The re-approval row was appended before the claim write. A failed
+			// claim leaves the first signature as the only recorded decision.
+			if entry, ok := h.decisions.LookupDecisionID(in.WatchID, in.DecisionID); ok {
+				h.decisions.Restore(in.WatchID, entry.Round, in.DecisionID)
+			}
+		}
 		return AckReceipt{}, err
 	}
 	receipt.OK = true
@@ -1017,13 +1105,19 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 // applyDecision records the human decision and resumes the stopped agent once.
 // A first decision answers a request for attention and needs a Watch parked for
 // input. A repeat is an idempotent no-op even after the Watch left that state;
-// the registry makes it so and refuses a conflicting second answer.
-func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (DecisionRecord, bool, error) {
+// the registry makes it so and refuses a conflicting second answer. A
+// re-approval with a reason appends a journal row instead of resuming again.
+// The third result reports that a row was appended, so the caller can undo it
+// when the later claim write fails.
+func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (DecisionRecord, bool, bool, error) {
 	if !d.Valid() {
-		return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision must be approve or reject")
+		return DecisionRecord{}, false, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision must be approve or reject")
+	}
+	if in.ReApprove && in.Reason == "" {
+		return DecisionRecord{}, false, false, domain.NewAppError(domain.CodeInvalidInput, "ack: reApprove requires a reason (reason_required)")
 	}
 	if h.decisions == nil {
-		return DecisionRecord{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: decision registry is nil")
+		return DecisionRecord{}, false, false, domain.NewAppError(domain.CodePersistFailed, "ack: decision registry is nil")
 	}
 	// A question is identified by the Watch revision at which it was parked.
 	// The first answer runs while that Watch is still needs_input. After the
@@ -1037,7 +1131,7 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 		} else if last, ok := h.decisions.Lookup(in.WatchID); ok {
 			round = last.Round
 		} else {
-			return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision requires a stopped Watch")
+			return DecisionRecord{}, false, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision requires a stopped Watch")
 		}
 	}
 	rec := DecisionRecord{
@@ -1046,14 +1140,22 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 		Decision:   d,
 		ResumedAt:  h.clock.Now(),
 		Round:      round,
+		Reason:     in.Reason,
+		ReApprove:  in.ReApprove,
 	}
-	return h.decisions.Decide(in.WatchID, rec, func() (uint64, error) {
+	before := len(h.decisions.History(in.WatchID, round))
+	rec, applied, err := h.decisions.Decide(in.WatchID, rec, func() (uint64, error) {
 		next, err := h.resumeWatch(w)
 		if err != nil {
 			return 0, err
 		}
 		return next.Revision, nil
 	})
+	if err != nil {
+		return DecisionRecord{}, false, false, err
+	}
+	reApproved := !applied && len(h.decisions.History(in.WatchID, round)) == before+1
+	return rec, applied, reApproved, nil
 }
 
 // applyDefer parks call once per Watch. The first call is stored in the
