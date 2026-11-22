@@ -5,10 +5,13 @@ package worktree
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -230,4 +233,288 @@ func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Resu
 		out.Removed = append(out.Removed, e.Dir)
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// IgnoreSpec: one compiled path spec, mtime-refreshed rules and a per-path
+// cache. Aider keeps service paths and large blobs out of its repo map this
+// way. Beacon's worktree scan and the index build both walk a directory tree,
+// so the guard lives here in infra and cmd/beacon reuses it. See CA-12.
+// ---------------------------------------------------------------------------
+
+const (
+	// IgnoreRefreshInterval is the minimum gap between two reads of a rules
+	// file. A changed mtime is picked up on the first check after the window,
+	// so a change is accepted within one second with the default interval.
+	IgnoreRefreshInterval = time.Second
+
+	// IgnoreMaxContentBytes is the largest file a traversal will open. Larger
+	// files are rejected before ReadFile touches their contents.
+	IgnoreMaxContentBytes int64 = 1 << 20
+)
+
+// defaultIgnorePatterns are the service paths and temporary suffixes aider
+// drops before it reads file contents. A rules file replaces the list.
+var defaultIgnorePatterns = []string{
+	".git/**",
+	"**/.git/**",
+	"node_modules/**",
+	"**/node_modules/**",
+	"vendor/**",
+	"**/vendor/**",
+	".gocache/**",
+	"**/.gocache/**",
+	".gotmp/**",
+	"**/.gotmp/**",
+	"*.tmp",
+	"*.log",
+}
+
+// IgnoreStats is the measurable outcome of the traversals through a spec.
+// ContentReads counts real opens. A repeat walk over an unchanged tree leaves
+// it untouched, which is the check in docs/tasks/CA-12.md.
+type IgnoreStats struct {
+	ContentReads int64
+	CacheHits    int64
+	RuleLoads    int64
+	RuleVersion  uint64
+}
+
+type ignoreEntry struct {
+	version uint64
+	mtime   time.Time
+	size    int64
+	content []byte
+}
+
+// IgnoreSpec holds traversal rules, their mtime and a per-path cache of both
+// the keep decision and the file contents. It is safe for concurrent use.
+type IgnoreSpec struct {
+	rulesPath string
+	interval  time.Duration
+
+	mu           sync.Mutex
+	compiled     []*regexp.Regexp
+	mtime        time.Time
+	loadedAt     time.Time
+	version      uint64
+	entries      map[string]ignoreEntry
+	contentReads int64
+	cacheHits    int64
+	ruleLoads    int64
+}
+
+// NewIgnoreSpec builds a spec with the default patterns. When rulesPath
+// exists, its non-empty and non-comment lines replace the defaults. A missing
+// rules file is not an error.
+func NewIgnoreSpec(rulesPath string) *IgnoreSpec {
+	s := &IgnoreSpec{
+		rulesPath: rulesPath,
+		interval:  IgnoreRefreshInterval,
+		entries:   make(map[string]ignoreEntry),
+	}
+	s.setPatterns(defaultIgnorePatterns)
+	s.refreshRulesLocked(time.Now())
+	return s
+}
+
+// WithInterval overrides the refresh throttle. Tests shorten it to observe a
+// rule change without waiting. Production uses IgnoreRefreshInterval.
+func (s *IgnoreSpec) WithInterval(d time.Duration) *IgnoreSpec {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d > 0 {
+		s.interval = d
+	}
+	return s
+}
+
+// setPatterns compiles raw lines into anchored regexps and bumps version so
+// every cached entry is invalidated on the next access. Caller holds mu.
+func (s *IgnoreSpec) setPatterns(lines []string) {
+	s.compiled = nil
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		s.compiled = append(s.compiled, compileIgnorePattern(line))
+	}
+	s.version++
+}
+
+// compileIgnorePattern turns a slash-separated glob into a regexp. A double
+// star spans separators; a single star and a question mark do not.
+func compileIgnorePattern(pattern string) *regexp.Regexp {
+	p := strings.ReplaceAll(strings.TrimSpace(pattern), "\\", "/")
+	p = strings.TrimPrefix(p, "/")
+	runes := []rune(p)
+	var b strings.Builder
+	b.WriteString("^")
+	for i := 0; i < len(runes); {
+		if runes[i] == '*' && i+1 < len(runes) && runes[i+1] == '*' {
+			b.WriteString(".*")
+			i += 2
+			continue
+		}
+		switch runes[i] {
+		case '*':
+			b.WriteString("[^/]*")
+		case '?':
+			b.WriteString("[^/]")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
+		}
+		i++
+	}
+	b.WriteString("$")
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return regexp.MustCompile("^$")
+	}
+	return re
+}
+
+// refreshRulesLocked reloads the rules file when its mtime moved and at least
+// one interval passed since the last load. Caller holds mu. A missing or
+// unreadable file leaves the current rules in force.
+func (s *IgnoreSpec) refreshRulesLocked(now time.Time) {
+	info, err := os.Stat(s.rulesPath)
+	if err != nil || !info.ModTime().After(s.mtime) {
+		return
+	}
+	if !s.loadedAt.IsZero() && now.Sub(s.loadedAt) < s.interval {
+		return
+	}
+	data, err := os.ReadFile(s.rulesPath)
+	if err != nil {
+		return
+	}
+	s.mtime = info.ModTime()
+	s.loadedAt = now
+	s.ruleLoads++
+	s.setPatterns(strings.Split(string(data), "\n"))
+	s.entries = make(map[string]ignoreEntry)
+}
+
+// relativeIgnorePath maps path to the slash-separated path relative to root.
+func relativeIgnorePath(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		rel = path
+	}
+	rel = strings.ReplaceAll(rel, "\\", "/")
+	return strings.TrimPrefix(rel, "./")
+}
+
+func (s *IgnoreSpec) keepLocked(rel string) bool {
+	for _, re := range s.compiled {
+		if re.MatchString(rel) {
+			return false
+		}
+	}
+	return true
+}
+
+// Keep reports whether path survives the ignore rules. Matching uses the path
+// relative to root with forward slashes.
+func (s *IgnoreSpec) Keep(root, path string) bool {
+	rel := relativeIgnorePath(root, path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshRulesLocked(time.Now())
+	return s.keepLocked(rel)
+}
+
+// ReadFile returns the contents of path when it passes the rules and is at
+// most IgnoreMaxContentBytes. The second result is false for ignored and
+// oversized files. Repeat calls for an unchanged file come from the cache and
+// do not increment ContentReads.
+func (s *IgnoreSpec) ReadFile(root, path string) ([]byte, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, false, err
+	}
+	rel := relativeIgnorePath(root, path)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshRulesLocked(time.Now())
+
+	if entry, ok := s.entries[path]; ok &&
+		entry.version == s.version &&
+		entry.mtime.Equal(info.ModTime()) &&
+		entry.size == info.Size() {
+		s.cacheHits++
+		return entry.content, entry.content != nil, nil
+	}
+
+	if !s.keepLocked(rel) || info.Size() > IgnoreMaxContentBytes {
+		s.entries[path] = ignoreEntry{version: s.version, mtime: info.ModTime(), size: info.Size()}
+		return nil, false, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, false, err
+	}
+	s.contentReads++
+	s.entries[path] = ignoreEntry{
+		version: s.version,
+		mtime:   info.ModTime(),
+		size:    info.Size(),
+		content: data,
+	}
+	return data, true, nil
+}
+
+// Walk visits every file below root and returns the paths that passed the
+// rules and the size limit. A second walk over an unchanged tree performs no
+// additional content reads.
+func (s *IgnoreSpec) Walk(root string) ([]string, error) {
+	var kept []string
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		_, ok, err := s.ReadFile(root, p)
+		if err != nil {
+			return err
+		}
+		if ok {
+			kept = append(kept, p)
+		}
+		return nil
+	})
+	return kept, err
+}
+
+// CountIgnored walks root and counts files rejected by the rules without
+// opening their contents. The index build uses it as a cheap pre-pass.
+func (s *IgnoreSpec) CountIgnored(root string) int {
+	count := 0
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if !s.Keep(root, p) {
+			count++
+		}
+		return nil
+	})
+	return count
+}
+
+// Stats snapshots the counters used by the CA-12 check.
+func (s *IgnoreSpec) Stats() IgnoreStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return IgnoreStats{
+		ContentReads: s.contentReads,
+		CacheHits:    s.cacheHits,
+		RuleLoads:    s.ruleLoads,
+		RuleVersion:  s.version,
+	}
 }
