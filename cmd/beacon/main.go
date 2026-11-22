@@ -24,7 +24,7 @@ const usageText = `beacon — команды сборки и проверки Be
 
 Использование:
   beacon list [--format table|json]
-  beacon board [--root <dir>] [--status <status>] [--owner <owner>]
+  beacon board [--root <dir>] [--status <status>] [--owner <owner>]  (TUI в терминале, таблица без терминала)
   beacon what <command>
   beacon doctor
   beacon build

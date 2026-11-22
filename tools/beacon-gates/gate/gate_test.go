@@ -71,8 +71,9 @@ func TestMatrix(t *testing.T) {
 		t.Fatal("matrix allows an outward dependency")
 	}
 	// Every permission must be one the real tree uses; no dead rows.
-	if len(m.AllowedEdges()) != 4 {
-		t.Fatalf("AllowedEdges = %d, want 4: %v", len(m.AllowedEdges()), m.AllowedEdges())
+	// cmd -> internal/tui is used by the beacon board adapter.
+	if len(m.AllowedEdges()) != 5 {
+		t.Fatalf("AllowedEdges = %d, want 5: %v", len(m.AllowedEdges()), m.AllowedEdges())
 	}
 }
 
