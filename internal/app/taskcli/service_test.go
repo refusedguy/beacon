@@ -723,6 +723,82 @@ func TestCheckLaunchPreStartGate(t *testing.T) {
 	}
 }
 
+func TestAdmitLaunchRefusesInProgressOverlap(t *testing.T) {
+	svc := NewService(Config{})
+	quota := PreflightResult{Allowed: true}
+	active := LaunchAssignment{Name: "T1", Files: []string{"internal/app/a.go"}, Status: "in_progress"}
+	candidate := LaunchAssignment{Name: "T2", Files: []string{"internal/app"}}
+
+	got := svc.AdmitLaunch(quota, 1, 4, active, candidate)
+	if got.Allowed {
+		t.Fatalf("пересечение с in_progress дало %+v, ждали отказ", got)
+	}
+	for _, want := range []string{"in_progress", "T1", "T2", "internal/app/a.go"} {
+		if !strings.Contains(got.Reason, want) {
+			t.Errorf("в причине отказа нет %q: %s", want, got.Reason)
+		}
+	}
+
+	// Активная карточка без пересечения не мешает запуску.
+	free := LaunchAssignment{Name: "T3", Files: []string{"internal/infra/b.go"}, Status: "in_progress"}
+	got = svc.AdmitLaunch(quota, 1, 4, active, free)
+	if !got.Allowed || got.Reason != AdmissionAllowed {
+		t.Fatalf("непересекающиеся назначения дали %+v, ждали запуск", got)
+	}
+
+	// Два уже работающих назначения не являются решением гейта.
+	other := LaunchAssignment{Name: "T4", Files: []string{"internal/app"}, Status: "in_progress"}
+	got = svc.AdmitLaunch(quota, 2, 4, active, other)
+	if !got.Allowed {
+		t.Fatalf("две in_progress карточки дали %+v, ждали запуск", got)
+	}
+
+	// Пересечение двух кандидатов всё ещё блокируется.
+	got = svc.AdmitLaunch(quota, 1, 4,
+		LaunchAssignment{Name: "T5", Files: []string{"a.go"}},
+		LaunchAssignment{Name: "T6", Files: []string{"a.go"}})
+	if got.Allowed || !strings.Contains(got.Reason, "T6") {
+		t.Fatalf("пересечение кандидатов дало %+v, ждали отказ", got)
+	}
+}
+
+func TestAdmitLaunchRefusesQuotaBeforeLaunch(t *testing.T) {
+	svc := NewService(Config{})
+	conflict := LaunchAssignment{Name: "T1", Files: []string{"a.go"}}
+	other := LaunchAssignment{Name: "T2", Files: []string{"a.go"}}
+
+	// Квота проверяется первой: причина квоты важнее конфликта файлов.
+	got := svc.AdmitLaunch(PreflightResult{Reason: "quota_exhausted"}, 1, 4, conflict, other)
+	if got.Allowed || got.Reason != "quota_exhausted" {
+		t.Fatalf("quota_exhausted дал %+v, ждали отказ до запуска", got)
+	}
+	got = svc.AdmitLaunch(PreflightResult{Reason: "quota_unknown"}, 1, 4)
+	if got.Allowed || got.Reason != "quota_unknown" {
+		t.Fatalf("quota_unknown дал %+v, ждали отказ", got)
+	}
+	got = svc.AdmitLaunch(PreflightResult{}, 1, 4, conflict, other)
+	if got.Allowed || got.Reason != AdmissionQuotaExhausted {
+		t.Fatalf("пустая причина квоты дала %+v, ждали quota_exhausted", got)
+	}
+}
+
+func TestAdmitLaunchRefusesWhenSlotsFull(t *testing.T) {
+	svc := NewService(Config{})
+	quota := PreflightResult{Allowed: true}
+	for _, tc := range []struct{ used, total int }{
+		{4, 4}, {5, 4}, {1, 0}, {1, -1},
+	} {
+		got := svc.AdmitLaunch(quota, tc.used, tc.total, LaunchAssignment{Name: "T1", Files: []string{"a.go"}})
+		if got.Allowed || got.Reason != AdmissionSlotsExhausted {
+			t.Errorf("слоты %d/%d дали %+v, ждали %s", tc.used, tc.total, got, AdmissionSlotsExhausted)
+		}
+	}
+	got := svc.AdmitLaunch(quota, 3, 4, LaunchAssignment{Name: "T1", Files: []string{"a.go"}})
+	if !got.Allowed || got.Reason != AdmissionAllowed {
+		t.Fatalf("свободный слот дал %+v, ждали запуск", got)
+	}
+}
+
 func TestPlanLaunchReadsCards(t *testing.T) {
 	e := newEnv(t)
 	e.card(t, "T3.1", "todo", "task", "ADR 0001", "internal/app/a.go", "нет", "нет")
