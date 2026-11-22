@@ -37,6 +37,35 @@ var watchSnapshot = func() (mcp.StateSnapshot, error) {
 	return deps.Snapshot.Snapshot()
 }
 
+// watchSessionSource reads the session list through the one HTTP port. No
+// child process is spawned and no fallback server starter is installed: a
+// missing service registration is an honest error with exit code 2. The exit
+// code stays in the result so tests can still observe the command's status.
+var watchSessionSource = func() ([]opencode.Session, int, error) {
+	port, err := newReadOnlyOpencodePort()
+	if err != nil || port == nil {
+		if err == nil {
+			err = errors.New("opencode service registration missing")
+		}
+		return nil, 2, err
+	}
+	sessions, err := port.Sessions(context.Background())
+	if err != nil {
+		return nil, 2, err
+	}
+	return sessions, 0, nil
+}
+
+// sessionsToWatch keeps only the session fields the table renders. The wire
+// payload is decoded once by opencode.ParseSessions inside the HTTP client.
+func sessionsToWatch(sessions []opencode.Session) []opencodeSession {
+	out := make([]opencodeSession, 0, len(sessions))
+	for _, s := range sessions {
+		out = append(out, opencodeSession{ID: s.ID, Agent: s.Agent, Status: s.Status})
+	}
+	return out
+}
+
 // watchRunner holds the command implementation so the CLI dispatch can call
 // it without depending on the rendering details. RegisterWatch replaces it in
 // tests, mirroring RegisterTask and RegisterMCP in main.go and mcp.go.
@@ -95,21 +124,6 @@ type watchRow struct {
 	// should look at now; "-" means no signal. It is advisory only and never
 	// changes the Beacon verdict (ADR 0017 and ADR 0026).
 	Attention string `json:"attention,omitempty"`
-}
-
-// parseSessions reshapes a session.list payload into the watch table's view.
-// The JSON itself is decoded once by opencode.ParseSessions, which is also the
-// decoder of the HTTP client and of beacon agents (ADR 0092).
-func parseSessions(raw []byte) ([]opencodeSession, error) {
-	decoded, err := opencode.ParseSessions(raw)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]opencodeSession, 0, len(decoded))
-	for _, s := range decoded {
-		out = append(out, opencodeSession{ID: s.ID, Agent: s.Agent, Status: s.Status})
-	}
-	return out, nil
 }
 
 // joinWatches pairs every subscriber with the session whose id equals the
@@ -267,21 +281,13 @@ func runWatch(c *CLI, args []string) int {
 		return 2
 	}
 
-	res := c.run(c.root, "opencode", []string{"api", "session.list"}, nil)
-	if res.code != 0 {
-		reason := strings.TrimSpace(string(res.stderr))
-		if reason == "" {
-			reason = strings.TrimSpace(string(res.stdout))
-		}
-		fmt.Fprintf(c.errOut, "beacon watch: opencode api session.list: %s\n", reason)
-		return res.code
+	rawSessions, exitCode, err := watchSessionSource()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon watch: session list: %v\n", err)
+		return exitCode
 	}
 
-	sessions, err := parseSessions(res.stdout)
-	if err != nil {
-		fmt.Fprintf(c.errOut, "beacon watch: %v\n", err)
-		return 2
-	}
+	sessions := sessionsToWatch(rawSessions)
 
 	rows := joinWatches(snap, sessions)
 	if *wake {
