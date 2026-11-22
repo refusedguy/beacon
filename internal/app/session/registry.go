@@ -28,6 +28,11 @@ const (
 	SessionStatusClosed = "closed"
 )
 
+// DefaultStaleTTL is how old a still-open session must be before
+// ReapStaleSessions treats it as stale. Callers can replace it with
+// SetStaleTTL.
+const DefaultStaleTTL = 24 * time.Hour
+
 // SessionStore is the durable session port. SaveSession records a session,
 // GetSession loads one by id and Touch moves its last-seen time. The adapter
 // in cmd satisfies this interface. Tests install a mock instead.
@@ -46,6 +51,10 @@ var (
 	// Stores that only implement SessionStore keep working for every other
 	// registry method.
 	ErrNoTaskLookup = errors.New("session: store has no task lookup")
+	// ErrNoSessionCloser means the store cannot mark a session closed.
+	ErrNoSessionCloser = errors.New("session: store has no session closer")
+	// ErrNoStaleLister means the store cannot list stale sessions.
+	ErrNoStaleLister = errors.New("session: store has no stale session lister")
 )
 
 // TaskSessionFinder is the optional port a SessionStore can implement so the
@@ -55,19 +64,33 @@ type TaskSessionFinder interface {
 	FindSessionByTask(task string) (Session, bool, error)
 }
 
+// SessionCloser is the optional port a SessionStore can implement to mark a
+// session closed. Keeping it separate leaves SessionStore usable by stores
+// that only save, read and touch sessions.
+type SessionCloser interface {
+	CloseSession(id string, at time.Time) error
+}
+
+// StaleSessionLister is the optional port a SessionStore can implement to
+// list still-open sessions last seen before a cutoff, bounded by limit.
+type StaleSessionLister interface {
+	StaleSessions(before time.Time, limit int) ([]Session, error)
+}
+
 // SessionRegistry drives session lifecycle events through a SessionStore. It
 // reads the current time through now, so a test can pin the clock. The zero
 // value is not ready; use NewSessionRegistry. Do not share one registry across
 // goroutines without a lock.
 type SessionRegistry struct {
-	store SessionStore
-	now   func() time.Time
+	store    SessionStore
+	now      func() time.Time
+	staleTTL time.Duration
 }
 
 // NewSessionRegistry builds a registry backed by s. A nil store is accepted,
 // but every operation then returns ErrNilStore instead of panicking.
 func NewSessionRegistry(s SessionStore) *SessionRegistry {
-	return &SessionRegistry{store: s, now: time.Now}
+	return &SessionRegistry{store: s, now: time.Now, staleTTL: DefaultStaleTTL}
 }
 
 // clock returns the current time from the configured clock, or time.Now on a
@@ -147,6 +170,50 @@ func (r *SessionRegistry) Heartbeat(id string) error {
 		return ErrEmptyID
 	}
 	return r.store.Touch(id, r.clock().UTC())
+}
+
+// SetStaleTTL replaces the age past which a still-open session counts as
+// stale. A non-positive value makes ReapStaleSessions return no rows.
+func (r *SessionRegistry) SetStaleTTL(ttl time.Duration) {
+	if r != nil {
+		r.staleTTL = ttl
+	}
+}
+
+// CloseSession marks id closed at the registry's current time. It needs a
+// store that implements SessionCloser; other stores return
+// ErrNoSessionCloser.
+func (r *SessionRegistry) CloseSession(id string) error {
+	if r == nil || r.store == nil {
+		return ErrNilStore
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ErrEmptyID
+	}
+	closer, ok := r.store.(SessionCloser)
+	if !ok {
+		return ErrNoSessionCloser
+	}
+	return closer.CloseSession(id, r.clock().UTC())
+}
+
+// ReapStaleSessions lists still-open sessions last seen before now minus the
+// stale TTL, bounded by limit. It needs a store that implements
+// StaleSessionLister; other stores return ErrNoStaleLister.
+func (r *SessionRegistry) ReapStaleSessions(limit int) ([]Session, error) {
+	if r == nil || r.store == nil {
+		return nil, ErrNilStore
+	}
+	lister, ok := r.store.(StaleSessionLister)
+	if !ok {
+		return nil, ErrNoStaleLister
+	}
+	if r.staleTTL <= 0 {
+		return []Session{}, nil
+	}
+	before := r.clock().UTC().Add(-r.staleTTL)
+	return lister.StaleSessions(before, limit)
 }
 
 func copySessionMetadata(in map[string]string) map[string]string {

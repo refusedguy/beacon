@@ -160,10 +160,11 @@ func (d *DB) ListSessions() ([]Session, error) {
 	return out, rows.Err()
 }
 
-// FindSessionByTask returns the oldest session whose metadata links it to
-// task. A task line has one spawn session, so the first match in creation
-// order wins. found is false on a store with no such session; the read never
-// creates the table.
+// FindSessionByTask returns the oldest open session whose metadata links it
+// to task. A task line has one spawn session, so the first match in creation
+// order wins. Closed rows are skipped: resuming a task must not hand back the
+// id of a session that was already shut down. found is false on a store with
+// no such session; the read never creates the table.
 func (d *DB) FindSessionByTask(task string) (Session, bool, error) {
 	task = strings.TrimSpace(task)
 	if task == "" {
@@ -174,6 +175,9 @@ func (d *DB) FindSessionByTask(task string) (Session, bool, error) {
 		return Session{}, false, err
 	}
 	for _, s := range all {
+		if s.Status == SessionStatusClosed {
+			continue
+		}
 		if s.Metadata[SessionMetaTaskID] == task {
 			return s, true, nil
 		}
@@ -213,6 +217,82 @@ func (d *DB) Touch(id string, at time.Time) error {
 		}
 		return nil
 	})
+}
+
+// CloseSession marks id as closed at at, or at the current UTC time when at
+// is zero. The first close writes status and last_seen; a later close leaves
+// both untouched. created_at and metadata are never written, so closing a row
+// twice changes nothing and cannot add a second row. It returns an error when
+// no session has that id.
+func (d *DB) CloseSession(id string, at time.Time) error {
+	if d == nil {
+		return errors.New("store: sessions: nil db")
+	}
+	if strings.TrimSpace(id) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: sessions: empty id")
+	}
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	return d.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createSessionsSQL); err != nil {
+			return fmt.Errorf("store: sessions: create table: %w", err)
+		}
+		res, err := tx.Exec(`
+			UPDATE sessions SET
+			  status = ?,
+			  last_seen = CASE WHEN status = ? THEN last_seen ELSE ? END
+			WHERE id = ?`,
+			SessionStatusClosed, SessionStatusClosed, timeToNano(at), id)
+		if err != nil {
+			return fmt.Errorf("store: sessions: close: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: sessions: close rows: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("store: sessions: unknown id %q", id)
+		}
+		return nil
+	})
+}
+
+// StaleSessions returns open sessions last seen strictly before before, in
+// last-seen then id order. Closed rows are excluded, so a second reap pass
+// cannot pick up a session that was already shut down. limit caps the result:
+// a non-positive limit returns no rows. The read never creates the table.
+func (d *DB) StaleSessions(before time.Time, limit int) ([]Session, error) {
+	if d == nil {
+		return nil, errors.New("store: sessions: nil db")
+	}
+	if limit <= 0 {
+		return []Session{}, nil
+	}
+	ctx := context.Background()
+	ok, err := tableExists(ctx, d.readDB, "sessions")
+	if err != nil || !ok {
+		return nil, err
+	}
+	rows, err := d.readDB.QueryContext(ctx, `
+		SELECT id, status, created_at, last_seen, metadata
+		FROM sessions
+		WHERE status != ? AND last_seen < ?
+		ORDER BY last_seen, id
+		LIMIT ?`, SessionStatusClosed, timeToNano(before), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Session{}
+	for rows.Next() {
+		s, err := scanSession(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 // rowScanner is implemented by both *sql.Row and *sql.Rows, so a single
