@@ -60,11 +60,14 @@
 
 ## Своя ветка и PR
 
-1. Ветка от `origin/main`, worktree.
-2. Только свои OwnerFiles.
-3. `git diff --stat` перед `gh pr create`.
-4. `git push -u origin <ветка>`, `gh pr create --base main --head <ветка>`.
-5. Отчёт: PR, headSHA, файлы.
+1. Сначала `git fetch origin main`. База ветки и worktree: свежий `origin/main`.
+2. Ветка от `origin/main`, worktree.
+3. Только свои OwnerFiles.
+4. `git diff --stat` перед `gh pr create`.
+5. `git push -u origin <ветка>`, `gh pr create --base main --head <ветка>`.
+6. Отчёт: PR, headSHA, файлы.
+
+Устаревшая база даёт ложный premise-check и конфликты при ребейзе.
 
 ## Задачи: индекс, граф и claim
 
