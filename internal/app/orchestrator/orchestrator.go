@@ -62,6 +62,12 @@ const (
 	ActionBlockedFixAgent = "blocked-fix-agent"
 	// ActionBlockEscalated records a blocked Watch that exhausted its FIX budget.
 	ActionBlockEscalated = "block-escalated"
+	// ActionApprovalFirst is the approval request for the original attempt,
+	// which runs with a narrow set of extra permissions.
+	ActionApprovalFirst = "approval-first"
+	// ActionApprovalRetry is the approval request for the retry after a
+	// sandbox denial. It runs escalated and carries no extra permissions.
+	ActionApprovalRetry = "approval-retry"
 )
 
 // AutoMergePolicy is the autor-merge policy of one Watch. AutoMerge is a
@@ -309,6 +315,57 @@ type Action struct {
 	Message  string `json:"message,omitempty"`
 }
 
+// ApprovalPermissions are the sandbox permissions an approval would grant for
+// one attempt. Escalations counts RequireEscalated grants; Extra lists any
+// additional permissions. An escalated retry carries one escalation and no
+// Extra, so approval grants exactly what the retry actually runs with.
+type ApprovalPermissions struct {
+	Escalations int      `json:"escalations,omitempty"`
+	Extra       []string `json:"extra,omitempty"`
+}
+
+// ApprovalAction is an approval request bound to one Watch attempt. Keeping it
+// separate from Action lets a caller present the escalated retry for approval
+// in place of the first attempt, which runs with narrower permissions.
+type ApprovalAction struct {
+	Action      string              `json:"action"`
+	WatchID     string              `json:"watchID"`
+	PR          int                 `json:"pr"`
+	Revision    uint64              `json:"revision"`
+	Permissions ApprovalPermissions `json:"permissions"`
+}
+
+// ApprovalActions returns the first-attempt and escalated-retry approval
+// requests for one Watch. The first keeps the caller's narrow Extra
+// permissions and asks for no escalation. After a sandbox denial the retry is
+// rewritten with RequireEscalated and the extra permissions are dropped, so
+// its approval carries one escalation and an empty Extra list
+// (codex-rs/core/src/tools/orchestrator.rs:521-532). The same place in Codex
+// decides whether the retry needs approval at all (:496-506). Beacon had only
+// the single RequireApproval boolean; these two actions make the distinction
+// without widening the MCP tool contract.
+func ApprovalActions(w Watch, narrow []string) (first, retry ApprovalAction) {
+	first = ApprovalAction{
+		Action:   ActionApprovalFirst,
+		WatchID:  w.ID,
+		PR:       w.PR,
+		Revision: w.Revision,
+		Permissions: ApprovalPermissions{
+			Extra: append([]string(nil), narrow...),
+		},
+	}
+	retry = ApprovalAction{
+		Action:   ActionApprovalRetry,
+		WatchID:  w.ID,
+		PR:       w.PR,
+		Revision: w.Revision,
+		Permissions: ApprovalPermissions{
+			Escalations: 1,
+		},
+	}
+	return first, retry
+}
+
 // Result is the outcome of one orchestrate pass. NeedsRebase lists the PRs of
 // retry/fail Watches left for their subscribers; Waiting lists PRs held by an
 // unsatisfied dependency.
@@ -319,6 +376,9 @@ type Result struct {
 	Waiting     []int    `json:"waiting"`
 	NeedsRebase []int    `json:"needsRebase"`
 	Actions     []Action `json:"actions"`
+	// Approvals carries the approval requests emitted on this pass. A retry
+	// Watch yields an escalated-retry approval whose Extra list is empty.
+	Approvals []ApprovalAction `json:"approvals,omitempty"`
 }
 
 // Options configures one pass. DryRun records the actions it would take
@@ -362,6 +422,7 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 		Waiting:     []int{},
 		NeedsRebase: []int{},
 		Actions:     []Action{},
+		Approvals:   []ApprovalAction{},
 	}
 	if st == nil {
 		return out, errors.New("orchestrator: store is nil")
@@ -433,6 +494,13 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 				Revision: w.Revision,
 				Message:  "left for subscriber wake: " + w.Verdict,
 			})
+			// A retry is the attempt that actually runs after a denial. Its
+			// approval must describe the escalated retry, not the narrow first
+			// attempt (codex-rs/core/src/tools/orchestrator.rs:521-532).
+			if strings.EqualFold(strings.TrimSpace(w.Verdict), VerdictRetry) {
+				_, retryApproval := ApprovalActions(w, nil)
+				out.Approvals = append(out.Approvals, retryApproval)
+			}
 			wakeOne(ctx, waker, opts.ReasonWaker, w, w.Verdict, w.Verdict, &out, &errs)
 		}
 	}
