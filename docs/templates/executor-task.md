@@ -475,6 +475,39 @@ protocol-change: none
 source: CP-03, docs/research/comp-cursor-plugins.md
 executor-task:exit-predicate -->
 
+## Журнал решений decisions.tsv
+
+Исполнитель ведёт один файл `decisions.tsv` на задачу. Одна строка файла описывает одно решение. В строке шесть колонок в порядке `ts`, `phase`, `decision`, `why`, `evidence`, `result`.
+
+| Колонка | Содержание |
+| --- | --- |
+| ts | время решения в формате ISO 8601 |
+| phase | фаза жизненного цикла из карты фаз |
+| decision | принятое решение одним предложением |
+| why | причина, по которой выбрано это решение |
+| evidence | указатель на доказательство |
+| result | исход, который агент наблюдал после решения |
+
+Колонка `evidence` содержит указатель, а не описание. Указатель разрешается в SHA коммита, номер PR, путь `file:line` или артефакт. Читатель проверяет решение по указателю.
+
+Исполнитель пишет только в конец файла. Он не переписывает и не удаляет старые строки. Если решение оказалось ошибкой, исполнитель добавляет новую строку. В колонке `decision` новой строки он пишет «перекрывает» и называет решение, которое она отменяет. Старая строка остаётся в файле.
+
+Файл `decisions.tsv` по умолчанию рабочий артефакт. Исполнитель коммитит его только когда ревьюеру нужна история решений. Иначе ревьюеру достаточно указателя на строку в рабочем файле.
+
+Раздел не меняет предикат выхода из раздела «Предикат выхода и строка журнала». CP-03 задаёт строку на ревизию Watch. Этот раздел задаёт файл и колонки для решений в течение задачи. Wake-механизм, `waiting, <watchID>` и число MCP-инструментов не меняются.
+
+<!-- executor-task:decisions-journal
+file: decisions.tsv
+columns: ts, phase, decision, why, evidence, result
+row: one-row-per-decision
+evidence: SHA, PR, file:line, artifact, no-prose
+write: append-only, no-history-edit
+override: new-row-overrides-old, keep-old-row
+commit: working-artifact-by-default, commit-when-reviewer-needs-history
+relation: no-exit-predicate-change, no-protocol-change
+source: PSKX-17, pstack/skills/show-me-your-work/SKILL.md:13-22
+executor-task:decisions-journal -->
+
 ## Вердикты и пробуждение
 
 Авто-мерж включён по умолчанию: Beacon сам мержит зелёный PR по `verdict=ready` (ADR 0072). Исполнитель не получает команды мерж и не вызывает `gh pr merge`.
