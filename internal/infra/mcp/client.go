@@ -391,6 +391,7 @@ var remoteToolDescriptions = map[string]string{
 	"beacon_defer_wiring": "Record a deferred wiring card on the Beacon server.",
 	"beacon_task_claim":   "Claim one todo task card for an agent on the Beacon server.",
 	"beacon_task_close":   "Close one task card with a terminal status on the Beacon server.",
+	"beacon_task_list":    "List free task cards available to claim on the Beacon server.",
 }
 
 var remoteInputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
@@ -404,6 +405,7 @@ var remoteInputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_defer_wiring": func() (*jsonschema.Schema, error) { return jsonschema.For[DeferWiringInput](nil) },
 	"beacon_task_claim":   func() (*jsonschema.Schema, error) { return jsonschema.For[TaskClaimInput](nil) },
 	"beacon_task_close":   func() (*jsonschema.Schema, error) { return jsonschema.For[TaskCloseInput](nil) },
+	"beacon_task_list":    func() (*jsonschema.Schema, error) { return jsonschema.For[TaskListInput](nil) },
 }
 
 func remoteInputSchema(name string) *jsonschema.Schema {
