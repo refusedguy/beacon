@@ -1,5 +1,5 @@
 # CLEAN-05. Разобрать 35 дублирующих ADR и ужать docs baseline
-Статус: todo
+Статус: done
 baseline: замер 2026-11-21, origin/main = 3f575e01. В docs/adrs/ 304 md-файла без README. 34 номера ADR имеют более одного файла, всего 35 лишних файлов; у 0185 три версии. Дубли занимают 642 строки. В docs-baseline.json 35 строк DOC-ADR-DUP и baseline_limit = 40. Owner-decision в main, в GitHub и в research-документах не найдена.
 Фаза: P2
 Тип: task
@@ -56,3 +56,8 @@ baseline: замер 2026-11-21, origin/main = 3f575e01. В docs/adrs/ 304 md-ф
 | 0260 | 176 | `0260-fix-watch.md` | `0260-fixer.md` |
 
 Риск: средний. Удаление 35 файлов убирает 642 строки истории редакций ADR. Если удалить файлы без правки baseline, гейт поднимет DOC-BASELINE-STALE на всех 35 строках, потому что для них не останется findings. Docs job в CI сейчас informational, поэтому required-проверки от этого не сломаются. После ответа владельца нужны три правки одним PR: удалить 35 файлов из таблицы, убрать 35 строк DOC-ADR-DUP из docs-baseline.json, снизить baseline_limit с 40 до 5. Карточка остаётся todo до решения владельца.
+
+Итог: Already landed in PR #1264 and PR #1335. PR #1264 (commit bf4a08ec6e530e02ae35864b9f08412338ff6952) removed the duplicate ADR files and the DOC-ADR-DUP baseline rows. PR #1335 (commit f9a600e7004c4ea05d9e8d387594861877d68e8c) lowered baseline_limit from 40 to 5. The card goal is met in origin/main; no duplicate code needed.
+Доказательство: PR #1264 merged 2026-11-21T22:02:50+05:00; PR #1335 merged 2026-11-22T09:01:49+05:00; commits bf4a08ec6e530e02ae35864b9f08412338ff6952 and f9a600e7004c4ea05d9e8d387594861877d68e8c; git merge-base --is-ancestor exit 0 for both; no open duplicate PR.
+Причина: already landed in PR #1264 bf4a08ec and PR #1335 f9a600e7
+Время закрытия: 2026-11-22T11:29:51Z
