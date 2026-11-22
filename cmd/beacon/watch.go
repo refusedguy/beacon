@@ -243,11 +243,31 @@ func watchIntervalFromEnv() (time.Duration, bool) {
 	return d, true
 }
 
+// watchLiveDeps collects the seams of the HTTP live loop. A caller can pass
+// them to runWatch explicitly instead of replacing package globals. The globals
+// remain the defaults for callers that still use the old substitution seam.
+type watchLiveDeps struct {
+	stateDir       func() (string, error)
+	client         func(httpapi.ClientConn) (watchHTTPPort, error)
+	lifetime       func() (context.Context, context.CancelFunc)
+	reconnectDelay time.Duration
+}
+
+func defaultWatchLiveDeps() watchLiveDeps {
+	return watchLiveDeps{
+		stateDir:       watchHTTPStateDir,
+		client:         watchHTTPClient,
+		lifetime:       watchLiveContext,
+		reconnectDelay: watchReconnectDelay,
+	}
+}
+
 // runWatch is the beacon watch command. Without --live it takes exactly one
 // Beacon snapshot and one `opencode api session.list` call (T3.12). With --live
 // it becomes a long-running, event-driven loop over the SSE subscription
-// (T3.141 / ADR 0060).
-func runWatch(c *CLI, args []string) int {
+// (T3.141 / ADR 0060). The optional deps argument lets a test pass the live
+// seams explicitly; ordinary callers keep the two-argument form.
+func runWatch(c *CLI, args []string, liveDeps ...watchLiveDeps) int {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	interval := fs.Duration("interval", watchIntervalDefault, "период предохранительного перечитывания снимка в живом контуре")
 	live := fs.Bool("live", false, "жить по событиям SSE /api/event вместо одного снимка")
@@ -272,6 +292,9 @@ func runWatch(c *CLI, args []string) int {
 		return 2
 	}
 	if *live {
+		if len(liveDeps) > 0 {
+			return runWatchLiveHTTPWithDeps(c, *interval, *format, *wake, liveDeps[0])
+		}
 		return watchLiveRunner(c, *interval, *format, *wake)
 	}
 
@@ -538,7 +561,7 @@ func runWatchLive(c *CLI, interval time.Duration, format string, wake bool) int 
 // watchLiveRunner is the --live entry point. It is a seam so the legacy loop
 // remains testable; production uses the HTTP projection.
 var watchLiveRunner = func(c *CLI, interval time.Duration, format string, wake bool) int {
-	return runWatchLiveHTTP(c, interval, format, wake)
+	return runWatchLiveHTTPWithDeps(c, interval, format, wake, defaultWatchLiveDeps())
 }
 
 // watchHTTPPort is the whole live dependency: one snapshot and one SSE stream.
@@ -675,12 +698,13 @@ func appendEventTail(tail []string, ev httpapi.ClientEvent, limit int) []string 
 	return tail
 }
 
-// runWatchLiveHTTP is the event-driven loop over /api/v1/events. Each
+// runWatchLiveHTTPWithDeps is the event-driven loop over /api/v1/events. Each
 // subscription starts from a fresh snapshot; every frame, reconnect or
 // interval tick prints a new one. The SSE stream carries no history, so missed
-// events are never replayed (ADR 0025).
-func runWatchLiveHTTP(c *CLI, interval time.Duration, format string, wake bool) int {
-	dir, err := watchHTTPStateDir()
+// events are never replayed (ADR 0025). Its seams arrive in deps so callers do
+// not have to replace package globals.
+func runWatchLiveHTTPWithDeps(c *CLI, interval time.Duration, format string, wake bool, deps watchLiveDeps) int {
+	dir, err := deps.stateDir()
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon watch: --live: state dir: %v\n", err)
 		return 2
@@ -690,13 +714,13 @@ func runWatchLiveHTTP(c *CLI, interval time.Duration, format string, wake bool) 
 		fmt.Fprintf(c.errOut, "beacon watch: --live: connection.json: %v\n", err)
 		return 2
 	}
-	port, err := watchHTTPClient(conn)
+	port, err := deps.client(conn)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon watch: --live: http client: %v\n", err)
 		return 2
 	}
 
-	ctx, cancel := watchLiveContext()
+	ctx, cancel := deps.lifetime()
 	defer cancel()
 
 	var ticks <-chan time.Time
@@ -737,7 +761,7 @@ func runWatchLiveHTTP(c *CLI, interval time.Duration, format string, wake bool) 
 		select {
 		case <-ctx.Done():
 			return 0
-		case <-time.After(watchReconnectDelay):
+		case <-time.After(deps.reconnectDelay):
 		}
 	}
 }

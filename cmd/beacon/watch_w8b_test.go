@@ -76,13 +76,11 @@ func TestW8BRenderHTTPSnapshotJSON(t *testing.T) {
 
 func TestW8BLiveFailsClearlyWithoutConnection(t *testing.T) {
 	dir := t.TempDir()
-	prevDir, prevRunner := watchHTTPStateDir, watchLiveRunner
-	watchHTTPStateDir = func() (string, error) { return dir, nil }
-	watchLiveRunner = runWatchLiveHTTP
-	t.Cleanup(func() { watchHTTPStateDir, watchLiveRunner = prevDir, prevRunner })
+	deps := defaultWatchLiveDeps()
+	deps.stateDir = func() (string, error) { return dir, nil }
 	c, out, errOut, _ := w69CLI(t, nil)
 
-	if code := runWatch(c, []string{"--live"}); code != 2 {
+	if code := runWatch(c, []string{"--live"}, deps); code != 2 {
 		t.Fatalf("code = %d", code)
 	}
 	if out.Len() != 0 || !strings.Contains(errOut.String(), "connection.json") {
@@ -129,35 +127,37 @@ func TestW8BLiveReadsHTTPProjectionOnEvents(t *testing.T) {
 	close(first)
 	port := &w8bPort{snap: w8bSnapshot(), rendered: make(chan struct{}, 16), events: []chan httpapi.ClientEventResult{first}}
 
-	prevDir, prevClient, prevRunner, prevCtx, prevDelay := watchHTTPStateDir, watchHTTPClient, watchLiveRunner, watchLiveContext, watchReconnectDelay
-	watchHTTPStateDir = func() (string, error) { return dir, nil }
-	watchHTTPClient = func(httpapi.ClientConn) (watchHTTPPort, error) { return port, nil }
-	watchLiveRunner = runWatchLiveHTTP
-	watchReconnectDelay = 0
-	ctx, cancel := context.WithCancel(context.Background())
-	watchLiveContext = func() (context.Context, context.CancelFunc) { return ctx, cancel }
-	t.Cleanup(func() {
-		watchHTTPStateDir, watchHTTPClient, watchLiveRunner = prevDir, prevClient, prevRunner
-		watchLiveContext, watchReconnectDelay = prevCtx, prevDelay
-	})
+	// One timeout budget from the test lifetime covers every wait. The loop
+	// gets a context derived from it so cancelling the loop cannot close the
+	// wait context and race the done channel.
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer waitCancel()
+	loopCtx, loopCancel := context.WithCancel(waitCtx)
+	defer loopCancel()
+
+	deps := defaultWatchLiveDeps()
+	deps.stateDir = func() (string, error) { return dir, nil }
+	deps.client = func(httpapi.ClientConn) (watchHTTPPort, error) { return port, nil }
+	deps.lifetime = func() (context.Context, context.CancelFunc) { return loopCtx, loopCancel }
+	deps.reconnectDelay = 0
 
 	c, out, errOut, _ := w69CLI(t, nil)
 	done := make(chan int, 1)
-	go func() { done <- runWatch(c, []string{"--live", "--interval", "0"}) }()
+	go func() { done <- runWatch(c, []string{"--live", "--interval", "0"}, deps) }()
 	for i := 0; i < 3; i++ {
 		select {
 		case <-port.rendered:
-		case <-time.After(2 * time.Second):
+		case <-waitCtx.Done():
 			t.Fatalf("не дождались рендера %d: stderr %q", i, errOut.String())
 		}
 	}
-	cancel()
+	loopCancel()
 	select {
 	case code := <-done:
 		if code != 0 {
 			t.Fatalf("code = %d, stderr %q", code, errOut.String())
 		}
-	case <-time.After(2 * time.Second):
+	case <-waitCtx.Done():
 		t.Fatal("живой цикл не остановился")
 	}
 	if port.calls < 3 {
