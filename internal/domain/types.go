@@ -561,6 +561,18 @@ type Watch struct {
 	Depth *Descent `json:"depth,omitempty"`
 }
 
+// DeferredToolUse is a tool call a defer decision parks for a Watch. ID is the
+// caller's tool-use identifier; Name and Input are the tool to run and its
+// arguments. A call is parked, not dispatched: no wake is sent and no agent is
+// resumed by the decision itself. The ack receipt returns this value, and the
+// ack handler keeps one per Watch, so the caller can read the call after the
+// run stops.
+type DeferredToolUse struct {
+	ID    string          `json:"id"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
+
 // RecordFixAttempt returns a copy of w with one more FIX agent recorded for
 // the current block. A fixer is only spawned for a blocked Watch, so the call
 // is a no-op when w has no Blocked record. The caller persists the returned
