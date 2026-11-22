@@ -127,7 +127,11 @@ func closeSessionViaRegistry(id string) error {
 	if reg == nil {
 		return nil
 	}
-	closer, ok := reg.(sessionCloser)
+	// sessionRegistryForSpawn returns a concrete *session.SessionRegistry, so
+	// box it before probing for the optional MM-01 method. Until that method
+	// lands on the registry the probe fails and the close stays a no-op.
+	var candidate any = reg
+	closer, ok := candidate.(sessionCloser)
 	if !ok {
 		return nil
 	}
@@ -143,7 +147,10 @@ func staleSessionsViaRegistry(limit int) ([]session.Session, error) {
 	if reg == nil {
 		return nil, nil
 	}
-	lister, ok := reg.(staleSessionLister)
+	// Box the concrete registry before probing for the optional MM-01 lister,
+	// the same way closeSessionViaRegistry probes for the closer.
+	var candidate any = reg
+	lister, ok := candidate.(staleSessionLister)
 	if !ok {
 		return nil, nil
 	}
