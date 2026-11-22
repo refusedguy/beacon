@@ -148,8 +148,12 @@ var (
 	githubTokenRE = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
 
 	// telegramTokenRE matches a Telegram bot token, <digits>:<35 characters>,
-	// wherever it appears: a URL path, an error string or a stored payload.
-	telegramTokenRE = regexp.MustCompile(`[0-9]+:[A-Za-z0-9_-]{35}`)
+	// preceded by a delimiter: a URL path, an error string or a stored payload.
+	// A watch ID has the same shape, <repo>:<PR>:<40-char SHA>, so a bare
+	// digits-colon-35 pattern redacts the ID that watch lookup depends on.
+	// The delimiter is captured and restored. A colon or hyphen before the
+	// digits is excluded because it joins the PR number to its predecessor.
+	telegramTokenRE = regexp.MustCompile(`(^|[^0-9A-Za-z:_-])([0-9]+:[A-Za-z0-9_-]{35})`)
 
 	// authHeaderRE matches an Authorization header and its credential, keeping
 	// the header name and dropping the scheme plus value.
@@ -168,7 +172,7 @@ func Redact(src []byte) []byte {
 		return append([]byte(nil), src...)
 	}
 	out := githubTokenRE.ReplaceAll(src, []byte(redacted))
-	out = telegramTokenRE.ReplaceAll(out, []byte(redacted))
+	out = telegramTokenRE.ReplaceAll(out, []byte("${1}"+redacted))
 	out = authHeaderRE.ReplaceAll(out, []byte("${1}"+redacted))
 	out = urlCredsRE.ReplaceAll(out, []byte("${1}"+redacted+"@"))
 	return out

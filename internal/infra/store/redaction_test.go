@@ -84,6 +84,40 @@ func TestRedactSecrets(t *testing.T) {
 	}
 }
 
+// TestRedactKeepsWatchIDIntact guards the ID format built by cibridge:
+// watch:<repo>:<PR>:<40-char SHA>. The PR number followed by the first 35
+// characters of the SHA looks like a Telegram token to a bare
+// digits-colon-35 pattern. Redacting it corrupts the key that watch lookup
+// uses, which makes beacon_get_result fail with WATCH_NOT_FOUND.
+func TestRedactKeepsWatchIDIntact(t *testing.T) {
+	watchID := "watch:refusedguy/beacon:1515:fc46d0b30798739cc1a8519f896be165da49c77d@1795341801:1800"
+	got := string(Redact([]byte(watchID)))
+	if got != watchID {
+		t.Fatalf("watchID changed by redaction: got %q, want %q", got, watchID)
+	}
+	if strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("watchID was redacted: %q", got)
+	}
+}
+
+// TestRedactStillCatchesTelegramTokens proves the delimiter requirement does
+// not weaken redaction for a token in a quote or after a space.
+func TestRedactStillCatchesTelegramTokens(t *testing.T) {
+	token := "123456789:" + strings.Repeat("b", 35)
+	in := `msg="` + token + `" watch=` +
+		"watch:refusedguy/beacon:1515:fc46d0b30798739cc1a8519f896be165da49c77d"
+	got := string(Redact([]byte(in)))
+	if strings.Contains(got, token) {
+		t.Errorf("Telegram token survived redaction: %s", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("no redaction marker: %s", got)
+	}
+	if !strings.Contains(got, "watch:refusedguy/beacon:1515:") {
+		t.Errorf("watchID was redacted with the token: %s", got)
+	}
+}
+
 func TestRedactingWriterStoresRedactedVersionedEvents(t *testing.T) {
 	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
