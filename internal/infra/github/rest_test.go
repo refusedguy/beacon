@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -375,5 +376,149 @@ func TestFailureExcerptNoFailedRunIsEmpty(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("excerpt = %q, want empty for a green run", got)
+	}
+}
+
+// TestMergePullRequestSendsExpectedSHA proves that the head checked by the
+// verdict reaches the PUT body as the merge precondition.
+func TestMergePullRequestSendsExpectedSHA(t *testing.T) {
+	const expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	type mergeBody struct {
+		SHA         string `json:"sha"`
+		MergeMethod string `json:"merge_method"`
+	}
+	var methods, paths []string
+	var bodies []mergeBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, r.Method)
+		paths = append(paths, r.URL.Path)
+		var body mergeBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode merge body: %v", err)
+		}
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"merged":true,"sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
+	}))
+	defer srv.Close()
+
+	rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+	result, err := rc.MergePullRequest(context.Background(), "octo", "demo", 42, "squash", expected)
+	if err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if !result.Merged || result.SHA != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("result = %+v, want confirmed merge", result)
+	}
+	if len(methods) != 1 || methods[0] != http.MethodPut {
+		t.Fatalf("methods = %v, want one PUT", methods)
+	}
+	if len(paths) != 1 || paths[0] != "/repos/octo/demo/pulls/42/merge" {
+		t.Fatalf("paths = %v", paths)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("bodies = %d, want 1", len(bodies))
+	}
+	if bodies[0].SHA != expected {
+		t.Errorf("body sha = %q, want %q", bodies[0].SHA, expected)
+	}
+	if bodies[0].MergeMethod != "squash" {
+		t.Errorf("merge_method = %q, want squash", bodies[0].MergeMethod)
+	}
+}
+
+// TestMergePullRequestHeadMismatchHolds covers a head swapped after the verdict.
+// GitHub answers 409 or 422; both must hold the Watch with a distinct reason and
+// must not trigger another merge attempt.
+func TestMergePullRequestHeadMismatchHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+	}{
+		{name: "conflict", status: http.StatusConflict},
+		{name: "unprocessable", status: http.StatusUnprocessableEntity},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			var sentSHA string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var body struct {
+					SHA string `json:"sha"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Errorf("decode merge body: %v", err)
+				}
+				sentSHA = body.SHA
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, `{"message":"Head branch was modified. Review and try the merge again."}`)
+			}))
+			defer srv.Close()
+
+			rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+			result, err := rc.MergePullRequest(context.Background(), "o", "r", 7, "merge", "stale-head")
+			if err != nil {
+				t.Fatalf("MergePullRequest: %v", err)
+			}
+			if result.Merged {
+				t.Fatal("mismatched head reported a merge")
+			}
+			if result.Reason != MergeHeldHeadMismatch {
+				t.Errorf("reason = %q, want %q", result.Reason, MergeHeldHeadMismatch)
+			}
+			if sentSHA != "stale-head" {
+				t.Errorf("body sha = %q, want stale-head", sentSHA)
+			}
+			if calls != 1 {
+				t.Fatalf("merge calls = %d, want 1 (no retry)", calls)
+			}
+		})
+	}
+}
+
+// TestMergePullRequestWithoutExpectedSHAKeepsRefusedReason pins the legacy
+// contract for callers that have not been wired with a verified head yet.
+func TestMergePullRequestWithoutExpectedSHAKeepsRefusedReason(t *testing.T) {
+	var body struct {
+		SHA string `json:"sha"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode merge body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		fmt.Fprint(w, `{"message":"merge conflict"}`)
+	}))
+	defer srv.Close()
+
+	rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+	result, err := rc.MergePullRequest(context.Background(), "o", "r", 9, "squash")
+	if err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	if result.Merged || result.Reason != "merge_refused" {
+		t.Fatalf("result = %+v, want held merge_refused", result)
+	}
+	if body.SHA != "" {
+		t.Errorf("body sha = %q, want empty when no expected SHA is supplied", body.SHA)
+	}
+}
+
+func TestPingMergeableCapturesHeadSHA(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"number":12,"mergeable":true,"mergeable_state":"clean","head":{"sha":"head-sha"}}`)
+	}))
+	defer srv.Close()
+
+	rc := newRESTTestClient(t, srv, newRESTTestCounter(), "test-token")
+	state, _, err := rc.PingMergeable(context.Background(), "o", "r", 12)
+	if err != nil {
+		t.Fatalf("PingMergeable: %v", err)
+	}
+	if state.HeadSHA != "head-sha" {
+		t.Errorf("HeadSHA = %q, want head-sha", state.HeadSHA)
 	}
 }

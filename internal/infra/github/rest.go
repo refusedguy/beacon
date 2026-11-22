@@ -195,13 +195,16 @@ func (c *RestClient) PingMergeableForce(ctx context.Context, owner, repo string,
 	return MergeState{
 		Mergeable:      pr.Mergeable,
 		MergeableState: pr.GetMergeableState(),
+		HeadSHA:        pr.GetHead().GetSHA(),
 	}, nil
 }
 
-// MergeState is the mergeability snapshot read by a ping.
+// MergeState is the mergeability snapshot read by a ping. HeadSHA is the head
+// observed in the same response, so a caller can pin a merge to what it checked.
 type MergeState struct {
 	Mergeable      *bool
 	MergeableState string
+	HeadSHA        string
 }
 
 // Unknown reports whether GitHub has not computed mergeability yet.
@@ -223,6 +226,7 @@ func (c *RestClient) PingMergeable(ctx context.Context, owner, repo string, numb
 	return MergeState{
 		Mergeable:      pr.Mergeable,
 		MergeableState: pr.GetMergeableState(),
+		HeadSHA:        pr.GetHead().GetSHA(),
 	}, false, nil
 }
 
@@ -235,27 +239,48 @@ type MergeResult struct {
 	SHA    string
 }
 
+// MergeHeldHeadMismatch is the held reason when GitHub rejects a merge because
+// the head changed after the verdict was computed. The Watch needs a fresh CI
+// cycle, not another merge attempt against the new head.
+const MergeHeldHeadMismatch = "head_mismatch"
+
 // MergePullRequest sends PUT /repos/{owner}/{repo}/pulls/{number}/merge with an
 // explicit method. owner and repo always come from the Watch, never from the
-// process working directory. A 405 (not mergeable) or 409 (conflict) maps to a
-// held result; other statuses are returned as errors.
-func (c *RestClient) MergePullRequest(ctx context.Context, owner, repo string, number int, method string) (MergeResult, error) {
+// process working directory. expectedSHA is the head the verdict checked;
+// go-github puts it in the request body so GitHub refuses the merge when the
+// head moved in the meantime. Callers pass it whenever they hold a verified
+// head. The variadic form keeps existing callers that omit it compiling.
+// A 405 maps to merge_refused. A 409 or 422 maps to MergeHeldHeadMismatch when
+// an expected SHA was supplied, and to merge_refused for a bare 409. Other
+// statuses are returned as errors.
+func (c *RestClient) MergePullRequest(ctx context.Context, owner, repo string, number int, method string, expectedSHA ...string) (MergeResult, error) {
 	if owner == "" || repo == "" {
 		return MergeResult{}, fmt.Errorf("merge: owner and repo are required, got %q/%q", owner, repo)
 	}
 	if method == "" {
 		method = "squash"
 	}
-	result, resp, err := c.gh.PullRequests.Merge(ctx, owner, repo, number, "", &gh.PullRequestOptions{MergeMethod: method})
+	opts := &gh.PullRequestOptions{MergeMethod: method}
+	if len(expectedSHA) > 0 {
+		opts.SHA = expectedSHA[0]
+	}
+	result, resp, err := c.gh.PullRequests.Merge(ctx, owner, repo, number, "", opts)
 	if resp != nil && c.counter != nil {
 		c.counter.Observe(resp.Response, restRequestCost)
 	}
 	if err != nil {
 		var ghErr *gh.ErrorResponse
-		if errors.As(err, &ghErr) && ghErr.Response != nil &&
-			(ghErr.Response.StatusCode == http.StatusMethodNotAllowed ||
-				ghErr.Response.StatusCode == http.StatusConflict) {
-			return MergeResult{Reason: "merge_refused"}, nil
+		if errors.As(err, &ghErr) && ghErr.Response != nil {
+			status := ghErr.Response.StatusCode
+			if status == http.StatusMethodNotAllowed || status == http.StatusConflict {
+				if status == http.StatusConflict && opts.SHA != "" {
+					return MergeResult{Reason: MergeHeldHeadMismatch}, nil
+				}
+				return MergeResult{Reason: "merge_refused"}, nil
+			}
+			if status == http.StatusUnprocessableEntity && opts.SHA != "" {
+				return MergeResult{Reason: MergeHeldHeadMismatch}, nil
+			}
 		}
 		return MergeResult{}, fmt.Errorf("REST merge %s/%s#%d: %w", owner, repo, number, err)
 	}
