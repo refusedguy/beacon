@@ -1,5 +1,6 @@
 // MCP endpoint: the asynchronous streamable HTTP transport from the go-sdk,
-// serving the same seven tools as the stdio transport behind a bearer token.
+// serving the same advertised tools as the stdio transport behind a bearer
+// token.
 package server
 
 import (
@@ -12,6 +13,16 @@ import (
 // MCPPath is the path the Beacon MCP endpoint is served at. Callers mount the
 // handler returned by NewMCPHTTPHandler at this path (BS.43, ADR 0189).
 const MCPPath = "/mcp"
+
+// MCPExtraRoutes returns the route table that mounts the MCP endpoint on an
+// existing HTTP listener. The composition root sets httpapi.Config.Token to
+// the same token, so the listener gateway and this handler agree on the bearer
+// value. Keeping the map here lets the cmd layer stay clear of net/http.
+func MCPExtraRoutes(srv *mcpsdk.Server, token string) map[string]http.Handler {
+	return map[string]http.Handler{
+		MCPPath: NewMCPHTTPHandler(srv, token),
+	}
+}
 
 // NewMCPHTTPHandler builds the HTTP handler for the Beacon MCP endpoint.
 //

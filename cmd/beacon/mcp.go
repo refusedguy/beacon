@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1075,9 +1077,25 @@ func lastCycleInfo() httpapi.LastCycle {
 	return cycleInfo
 }
 
+// newMCPBearerToken generates the token the HTTP API gateway and the MCP route
+// share. The connection file publishes it, so a remote client sends the same
+// bearer value to both checks.
+func newMCPBearerToken() (string, error) {
+	buf := make([]byte, 24)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("mcp: bearer token: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
 // startHTTPAPI is called only by the process that owns the poller lock. The
 // returned function stops the server and removes its connection file.
 func startHTTPAPI(_ context.Context, cfg reconcileConfig, bus *httpapi.EventBus) (func(), error) {
+	token, err := newMCPBearerToken()
+	if err != nil {
+		return nil, err
+	}
+	mcpServer := newMCPServer(cfg.deps)
 	srv, err := httpapi.Start(httpapi.Config{
 		Addr:          strings.TrimSpace(os.Getenv(httpapi.AddrEnv)),
 		StateDir:      cfg.dir,
@@ -1085,6 +1103,8 @@ func startHTTPAPI(_ context.Context, cfg reconcileConfig, bus *httpapi.EventBus)
 		ProjectKey:    cfg.projectKey,
 		IsPollerOwner: true,
 		StartedAt:     time.Now(),
+		Token:         token,
+		ExtraRoutes:   server.MCPExtraRoutes(mcpServer, token),
 		Provider: httpStateProvider{
 			db: cfg.db, dir: cfg.dir, projectKey: cfg.projectKey, deps: cfg.deps,
 		},
