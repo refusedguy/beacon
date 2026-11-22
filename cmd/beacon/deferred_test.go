@@ -17,10 +17,12 @@ import (
 // adapter tests use it to check card creation, idempotency and error
 // propagation without a database.
 type fakeDeferredDB struct {
-	mu    sync.Mutex
-	rows  map[string]store.DeferredWiring
-	err   error
-	calls int
+	mu           sync.Mutex
+	rows         map[string]store.DeferredWiring
+	err          error
+	calls        int
+	doneCalls    int
+	statusWrites int
 }
 
 func newFakeDeferredDB() *fakeDeferredDB {
@@ -66,6 +68,32 @@ func (f *fakeDeferredDB) ListDeferred(status string) ([]store.DeferredWiring, er
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// MarkDeferredDone applies the store's transition: todo or claimed moves to
+// done once, and a repeat leaves the row unchanged. statusWrites counts the
+// transitions that actually changed a row.
+func (f *fakeDeferredDB) MarkDeferredDone(watchID, reason string) (store.DeferredWiring, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return store.DeferredWiring{}, f.err
+	}
+	f.doneCalls++
+	k := f.key(watchID, reason)
+	row, ok := f.rows[k]
+	if !ok {
+		return store.DeferredWiring{}, store.ErrDeferredNotFound
+	}
+	if row.Status != store.DeferredStatusDone {
+		if row.Status != store.DeferredStatusTodo && row.Status != store.DeferredStatusClaimed {
+			return store.DeferredWiring{}, store.ErrDeferredWrongStatus
+		}
+		row.Status = store.DeferredStatusDone
+		f.rows[k] = row
+		f.statusWrites++
+	}
+	return row, nil
 }
 
 var _ deferredStoreDB = (*fakeDeferredDB)(nil)
@@ -270,6 +298,154 @@ func TestDeferredDispatchJSON(t *testing.T) {
 	}
 	if cards[0].CardID != "WIRING-77" || cards[0].WatchID != "ses_dispatch_watch" ||
 		cards[0].Status != store.DeferredStatusTodo {
+		t.Fatalf("карточка = %+v", cards[0])
+	}
+}
+
+func TestDeferredDoneMarksOnlyTheWatchRows(t *testing.T) {
+	fake := newFakeDeferredDB()
+	for _, in := range []store.DeferredWiring{
+		{WatchID: "ses_done", PR: 120, Reason: "reason a"},
+		{WatchID: "ses_done", PR: 121, Reason: "reason b"},
+		{WatchID: "ses_other", PR: 122, Reason: "reason c"},
+	} {
+		if _, err := fake.DeferWiring(in); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := newDurableDeferredStore(fake)
+	marked, err := s.MarkDone(context.Background(), "ses_done")
+	if err != nil {
+		t.Fatalf("MarkDone: %v", err)
+	}
+	if marked != 2 {
+		t.Fatalf("MarkDone = %d, ожидалось 2", marked)
+	}
+
+	rows, err := fake.ListDeferred("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		want := store.DeferredStatusTodo
+		if row.WatchID == "ses_done" {
+			want = store.DeferredStatusDone
+		}
+		if row.Status != want {
+			t.Fatalf("строка %q: статус %q, ожидался %q", row.WatchID, row.Status, want)
+		}
+	}
+	if fake.statusWrites != 2 {
+		t.Fatalf("изменений статуса: %d, ожидалось 2", fake.statusWrites)
+	}
+}
+
+func TestDeferredDoneRepeatAndUnknownWatch(t *testing.T) {
+	fake := newFakeDeferredDB()
+	if _, err := fake.DeferWiring(store.DeferredWiring{
+		WatchID: "ses_repeat", PR: 130, Reason: "reason",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newDurableDeferredStore(fake)
+	ctx := context.Background()
+	if _, err := s.MarkDone(ctx, "ses_repeat"); err != nil {
+		t.Fatal(err)
+	}
+	writesAfterFirst := fake.statusWrites
+
+	marked, err := s.MarkDone(ctx, "ses_repeat")
+	if err != nil || marked != 1 {
+		t.Fatalf("повтор: marked = %d, err = %v", marked, err)
+	}
+	if fake.statusWrites != writesAfterFirst {
+		t.Fatalf("повтор изменил статус: %d -> %d", writesAfterFirst, fake.statusWrites)
+	}
+
+	if _, err := s.MarkDone(ctx, "ses_unknown"); !errors.Is(err, store.ErrDeferredNotFound) {
+		t.Fatalf("неизвестный watchID: err = %v, ожидался ErrDeferredNotFound", err)
+	}
+	if fake.statusWrites != writesAfterFirst {
+		t.Fatal("неизвестный watchID изменил store")
+	}
+}
+
+func TestDeferredDoneCLIExitCodes(t *testing.T) {
+	fake := newFakeDeferredDB()
+	if _, err := fake.DeferWiring(store.DeferredWiring{
+		WatchID: "ses_cli_done", PR: 140, Reason: "reason",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	old := makeDeferredDeps
+	makeDeferredDeps = func(*CLI) (deferredDeps, func() error, error) {
+		s := newDurableDeferredStore(fake)
+		return deferredDeps{Writer: s, Done: s}, func() error { return nil }, nil
+	}
+	defer func() { makeDeferredDeps = old }()
+
+	out, errOut := new(bytes.Buffer), new(bytes.Buffer)
+	c := &CLI{out: out, errOut: errOut}
+	for _, args := range [][]string{
+		{"done", "ses_cli_done"},
+		{"done", "ses_cli_done"},
+	} {
+		if code := runDeferred(c, args); code != 0 {
+			t.Fatalf("runDeferred(%v) = %d, stderr = %q", args, code, errOut.String())
+		}
+	}
+	for _, args := range [][]string{
+		{"done"},
+		{"done", "ses_unknown"},
+	} {
+		if code := runDeferred(c, args); code != 2 {
+			t.Fatalf("runDeferred(%v) = %d, ожидался 2, stderr = %q", args, code, errOut.String())
+		}
+	}
+}
+
+// TestDeferredDoneDispatchJSON pins the card's check: the done subcommand
+// works through CLI dispatch and the list shows the new status in JSON.
+func TestDeferredDoneDispatchJSON(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(beaconStateDirEnv, dir)
+	db, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if _, err := db.DeferWiring(store.DeferredWiring{
+		WatchID: "ses_dispatch_done",
+		PR:      150,
+		Title:   "dispatch card",
+		Reason:  "needs wiring",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, errOut := new(bytes.Buffer), new(bytes.Buffer)
+	c := &CLI{out: out, errOut: errOut}
+	if code := c.Run([]string{"deferred", "done", "ses_dispatch_done"}); code != 0 {
+		t.Fatalf("beacon deferred done code = %d, stderr = %q", code, errOut.String())
+	}
+	out.Reset()
+	errOut.Reset()
+	if code := c.Run([]string{"deferred", "--format", "json"}); code != 0 {
+		t.Fatalf("beacon deferred --format json code = %d, stderr = %q", code, errOut.String())
+	}
+
+	var cards []mcp.DeferredWiringCard
+	if err := json.Unmarshal(out.Bytes(), &cards); err != nil {
+		t.Fatalf("JSON output: %v (%q)", err, out.String())
+	}
+	if len(cards) != 1 {
+		t.Fatalf("карточек в JSON: %d, ожидалась 1", len(cards))
+	}
+	if cards[0].WatchID != "ses_dispatch_done" || cards[0].Status != store.DeferredStatusDone {
 		t.Fatalf("карточка = %+v", cards[0])
 	}
 }
