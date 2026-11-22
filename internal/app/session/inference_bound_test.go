@@ -41,7 +41,12 @@ func TestBoundInferenceStopsHangingProvider(t *testing.T) {
 		return "", ctx.Err()
 	})
 	base := time.Date(2026, 11, 22, 0, 0, 0, 0, time.UTC)
-	clock := func() time.Time { return base.Add(time.Second) }
+	var ticks int
+	clock := func() time.Time {
+		t := base.Add(time.Duration(ticks) * time.Second)
+		ticks++
+		return t
+	}
 
 	start := time.Now()
 	answer := BoundInference(context.Background(), provider, clock, nil, InferenceRequest{
