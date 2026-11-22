@@ -363,12 +363,15 @@ func sha256sum(s string) string {
 // cardIDFromName выводит ID карточки из имени файла, не разбирая содержимое.
 // Пустая строка означает неподдерживаемое имя: в этом случае RebuildDir
 // вызывает ParseCard, чтобы вернуть обычную ошибку валидации.
+// Набор форм должен совпадать с ParseCard: иначе RebuildDir не использует
+// хеш-кэш для карточек вроде TUI-07A и ATX-R01 и разбирает их заново.
 func cardIDFromName(name string) string {
 	id := strings.TrimSuffix(name, ".md")
 	if m := idRE.FindStringSubmatch(id); m != nil {
 		return m[1] + m[2] + "." + m[3]
 	}
-	if dashIDRE.MatchString(id) || dotIDRE.MatchString(id) {
+	if dashIDRE.MatchString(id) || letterDashIDRE.MatchString(id) ||
+		digitDashLetterIDRE.MatchString(id) || dotIDRE.MatchString(id) {
 		return id
 	}
 	return ""
