@@ -80,6 +80,10 @@
 
 Правило дополняет контракт глубины в `internal/domain/depth.go`. Там остаются hypothesis, falsifier и evidence.
 
+## Контракт воркера
+
+Обязательные правила исполнителя собраны в `docs/templates/worker-contract.md`. Первая строка каждого kickoff'а требует прочесть этот файл до начала работы. `AGENTS.md` оставляет ссылку на контракт и правила, которые меняет только оркестратор. Новое правило воркера попадает в контракт, а не в `AGENTS.md`. Правила воркера здесь не повторяются.
+
 <!-- CA-09 cache:boundary repo. Граница части с репозиторием. -->
 <!-- Статичная часть дальше описывает worktree, ветку, PR, задачи и слои. -->
 
@@ -95,14 +99,7 @@
 
 ## Своя ветка и PR
 
-1. Сначала `git fetch origin main`. База ветки и worktree: свежий `origin/main`.
-2. Ветка от `origin/main`, worktree.
-3. Только свои OwnerFiles.
-4. `git diff --stat` перед `gh pr create`.
-5. `git push -u origin <ветка>`, `gh pr create --base main --head <ветка>`.
-6. Отчёт: PR, headSHA, файлы.
-
-Устаревшая база даёт ложный premise-check и конфликты при ребейзе.
+Порядок работы с веткой, worktree и PR описан в `docs/templates/worker-contract.md`. Здесь шаги не повторяются.
 
 ### Минимальный diff (PSKX-28)
 
@@ -151,18 +148,15 @@
 
 ## beacon_watch_pr
 
-- `repo: "refusedguy/beacon"`, `pr`, `headSHA`, role: "executor" или role: "fixer".
-- `notify.target`: `ses_...` из `_meta["ai.opencode/sessionID"]` или явный `ses_...`. Никогда `<cardID>`.
-- Ход заканчивается фразой `waiting, <watchID>`.
-- Оркестратор: role: "orchestrator". Вердикт только из `beacon_get_result`.
+Правила регистрации Watch, `notify.target` и фразы завершения хода описаны в `docs/templates/worker-contract.md`. Оркестратор регистрирует Watch с ролью `orchestrator` и читает вердикт только из `beacon_get_result`.
 
 ## Авто-мерж
 
-Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Исключения политики: `requireApproval`, `waitFor`, `waitForMain`. Исполнитель просыпается на `keep_working`, `rebase`, `retry` или ошибке мержа. При `ready` не вызывает `gh pr merge`.
+Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Исключения политики: `requireApproval`, `waitFor`, `waitForMain`. Действие исполнителя при вердиктах описано в `docs/templates/worker-contract.md`.
 
 ## Блокеры main
 
-Красная проверка на `main`: Beacon ставит `blocked`, пишет `BlockerIncident`. Исполнитель видит внешнюю поломку на `origin/main`: `beacon_ack` с `decision="blocked:not_mine"` и причиной. Оркестратор спавнит FIX-агента. main не чиним.
+Красная проверка на `main`: Beacon ставит `blocked`, пишет `BlockerIncident`. Действие исполнителя при внешней поломке описано в `docs/templates/worker-contract.md`. Оркестратор спавнит FIX-агента. main не чиним.
 
 ## Слои
 
@@ -218,6 +212,8 @@ Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Искл�
 ## MCP
 
 Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Десять инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`, `beacon_defer_wiring`, `beacon_task_claim` и `beacon_task_close`. `beacon_task_claim` берёт карточку в работу. `beacon_task_close` закрывает карточку с причиной.
+
+`README.md:50-64` перечисляет девять инструментов и заканчивает таблицу на `beacon_task_claim`. Здесь десять, последний `beacon_task_close`. Разница в одном инструменте, который закрывает карточку с причиной.
 
 `beacon_defer_wiring` вызывай сразу, как только понял, что часть фичи осталась неподключённой (OwnerFiles другого агента). Он возвращает готовую карточку `WIRING-<PR>`, которую надо добавить в свой PR. Не откладывай wiring на «потом»: без карточки работа теряется.
 
