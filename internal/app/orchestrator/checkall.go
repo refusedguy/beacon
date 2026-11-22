@@ -98,6 +98,12 @@ const (
 	configDirName  = ".beacon"
 	configFileName = "config.yaml"
 	configPathEnv  = "BEACON_CONFIG"
+
+	// Artifact path defaults. The executor and orchestrator templates name the
+	// same three values, so the binary and the documented contract stay aligned.
+	defaultPathsDocs  = "docs"
+	defaultPathsTasks = "docs/tasks"
+	defaultPathsEvals = "evals"
 )
 
 // Config is the effective project configuration after the global and project
@@ -109,6 +115,16 @@ type Config struct {
 	SlotsTotal     int         `json:"slotsTotal" yaml:"slotsTotal"`
 	WakeTarget     string      `json:"wakeTarget" yaml:"wakeTarget"`
 	Flaky          FlakyConfig `json:"flaky,omitempty" yaml:"flaky,omitempty"`
+	Paths          PathsConfig `json:"paths,omitempty" yaml:"paths,omitempty"`
+}
+
+// PathsConfig holds the artifact directories shared by the executor and the
+// orchestrator. Each value is relative to the project root. A missing key
+// keeps the default, so a project only overrides the paths it needs.
+type PathsConfig struct {
+	Docs  string `json:"docs" yaml:"docs"`
+	Tasks string `json:"tasks" yaml:"tasks"`
+	Evals string `json:"evals" yaml:"evals"`
 }
 
 // FlakyConfig is the app-layer mirror of the flaky-check settings. Names are
@@ -121,7 +137,15 @@ type FlakyConfig struct {
 
 // DefaultConfig returns the built-in layer, before either YAML file is read.
 func DefaultConfig() Config {
-	return Config{MaxRebases: defaultMaxRebases, SlotsTotal: defaultSlotsTotal}
+	return Config{
+		MaxRebases: defaultMaxRebases,
+		SlotsTotal: defaultSlotsTotal,
+		Paths: PathsConfig{
+			Docs:  defaultPathsDocs,
+			Tasks: defaultPathsTasks,
+			Evals: defaultPathsEvals,
+		},
+	}
 }
 
 // Validate checks the effective configuration. A zero SlotsTotal is valid and
@@ -141,6 +165,13 @@ func (c Config) Validate() error {
 	if c.WakeTarget != "" {
 		if err := ValidateWakeTarget(c.WakeTarget); err != nil {
 			return fmt.Errorf("config: wakeTarget: %w", err)
+		}
+	}
+	for _, path := range []struct{ name, value string }{
+		{"docs", c.Paths.Docs}, {"tasks", c.Paths.Tasks}, {"evals", c.Paths.Evals},
+	} {
+		if strings.TrimSpace(path.value) == "" {
+			return fmt.Errorf("config: paths.%s: пустое значение", path.name)
 		}
 	}
 	return nil
@@ -192,7 +223,8 @@ func globalConfigPath() (string, error) {
 // applyConfigFile reads one YAML file and overlays the keys it contains.
 // Missing files leave the previous layer intact. Keys are normalized so
 // maxRebases, max_rebases and MAX-REBASES all name the same setting; a nested
-// flaky section carries the per-check retry configuration.
+// flaky section carries the per-check retry configuration and a nested paths
+// section carries the artifact directories.
 // fs.ReadFile over os.DirFS keeps file access inside the capabilities gate's
 // infra capability boundary (ADR 0005), the same seam registry_config.go uses.
 func applyConfigFile(cfg *Config, path string) error {
@@ -241,6 +273,10 @@ func applyConfigFile(cfg *Config, path string) error {
 			cfg.WakeTarget = s
 		case "flaky":
 			if err := applyFlakySection(cfg, path, raw); err != nil {
+				return err
+			}
+		case "paths":
+			if err := applyPathsSection(cfg, path, raw); err != nil {
 				return err
 			}
 		default:
@@ -310,6 +346,40 @@ func applyFlakySection(cfg *Config, path string, raw any) error {
 		default:
 			return fmt.Errorf("config: %s: flaky: неизвестный ключ %q", path, key)
 		}
+	}
+	return nil
+}
+
+// applyPathsSection overlays the nested artifact paths. The section is optional
+// on both layers, so a project can override one path without restating the
+// others. An unknown key and an empty value are errors: a typo must not silently
+// leave a default in place, and an empty path would point at the project root.
+func applyPathsSection(cfg *Config, path string, raw any) error {
+	section, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("config: %s: paths: ожидается key: value", path)
+	}
+	for key, value := range section {
+		name := normalizeConfigKey(key)
+		var target *string
+		switch name {
+		case "docs":
+			target = &cfg.Paths.Docs
+		case "tasks":
+			target = &cfg.Paths.Tasks
+		case "evals":
+			target = &cfg.Paths.Evals
+		default:
+			return fmt.Errorf("config: %s: paths: неизвестный ключ %q", path, key)
+		}
+		s, err := configString(path, "paths."+name, value)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(s) == "" {
+			return fmt.Errorf("config: %s: paths.%s: пустое значение", path, name)
+		}
+		*target = s
 	}
 	return nil
 }

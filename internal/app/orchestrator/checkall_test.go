@@ -330,7 +330,7 @@ func TestLoadProjectConfigDefaultsWithoutFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (Config{MaxRebases: 3, SlotsTotal: 4}); !reflect.DeepEqual(got, want) {
+	if want := DefaultConfig(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
 	}
 }
@@ -354,7 +354,11 @@ wakeTarget: 'ses_global_wake'
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{MaxRebases: 7, OrchestratorID: "ses_global", SlotsTotal: 2, WakeTarget: "ses_project_wake"}
+	want := DefaultConfig()
+	want.MaxRebases = 7
+	want.OrchestratorID = "ses_global"
+	want.SlotsTotal = 2
+	want.WakeTarget = "ses_project_wake"
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
 	}
@@ -370,7 +374,9 @@ func TestLoadProjectConfigUsesGlobalWhenProjectAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{MaxRebases: 6, SlotsTotal: 0}
+	want := DefaultConfig()
+	want.MaxRebases = 6
+	want.SlotsTotal = 0
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
 	}
@@ -392,10 +398,9 @@ flaky:
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := Config{
-		MaxRebases: 4, SlotsTotal: 4,
-		Flaky: FlakyConfig{Names: []string{"ci/flaky", "ci/network"}, MaxRetries: 2},
-	}
+	want := DefaultConfig()
+	want.MaxRebases = 4
+	want.Flaky = FlakyConfig{Names: []string{"ci/flaky", "ci/network"}, MaxRetries: 2}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("config = %+v, want %+v", got, want)
 	}
@@ -417,6 +422,75 @@ func TestLoadProjectConfigMergesFlakyLayers(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Flaky.Names, []string{"ci/global"}) || got.Flaky.MaxRetries != 3 {
 		t.Fatalf("flaky = %+v", got.Flaky)
+	}
+}
+
+func TestLoadProjectConfigReadsNestedPathsSection(t *testing.T) {
+	isolateConfig(t)
+	project := t.TempDir()
+	writeConfigFile(t, filepath.Join(project, configDirName, configFileName), `
+paths:
+  docs: custom/docs
+  tasks: custom/tasks
+  evals: custom/evals
+`)
+
+	got, err := LoadProjectConfig(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := PathsConfig{Docs: "custom/docs", Tasks: "custom/tasks", Evals: "custom/evals"}
+	if got.Paths != want {
+		t.Fatalf("paths = %+v, want %+v", got.Paths, want)
+	}
+}
+
+func TestLoadProjectConfigMergesPathsLayers(t *testing.T) {
+	isolateConfig(t)
+	global := filepath.Join(t.TempDir(), "global.yaml")
+	writeConfigFile(t, global, "paths:\n  evals: global/evals\n")
+	t.Setenv(configPathEnv, global)
+
+	project := t.TempDir()
+	writeConfigFile(t, filepath.Join(project, configDirName, configFileName),
+		"paths:\n  tasks: project/tasks\n")
+
+	got, err := LoadProjectConfig(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := PathsConfig{Docs: "docs", Tasks: "project/tasks", Evals: "global/evals"}
+	if got.Paths != want {
+		t.Fatalf("paths = %+v, want %+v", got.Paths, want)
+	}
+}
+
+// TestLoadProjectConfigRejectsInvalidPaths proves the section fails closed. A
+// typo and an empty value are errors that name the field, so a bad config never
+// silently keeps a default path.
+func TestLoadProjectConfigRejectsInvalidPaths(t *testing.T) {
+	cases := []struct {
+		name, body, wantErr string
+	}{
+		{"unknown key", "paths:\n  foo: bar\n", "foo"},
+		{"empty docs", "paths:\n  docs: \"\"\n", "paths.docs"},
+		{"blank tasks", "paths:\n  tasks: \"   \"\n", "paths.tasks"},
+		{"scalar section", "paths: docs\n", "paths: ожидается key: value"},
+		{"non-string value", "paths:\n  tasks: 7\n", "paths.tasks"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateConfig(t)
+			project := t.TempDir()
+			writeConfigFile(t, filepath.Join(project, configDirName, configFileName), tc.body)
+			_, err := LoadProjectConfig(project)
+			if err == nil {
+				t.Fatalf("LoadProjectConfig accepted %q", tc.body)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q must contain %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 
