@@ -1,5 +1,5 @@
 # FTE-04. Завести wiring-карточки для четырёх отложенных PR
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: docs/tasks/WIRING-1460.md, docs/tasks/WIRING-1582.md, docs/tasks/WIRING-1608.md, docs/tasks/WIRING-1612.md
@@ -13,3 +13,7 @@ baseline: git ls-tree origin/main -- docs/tasks/ не содержит WIRING-14
 Шаги: Для каждого PR завести карточку по docs/templates/wiring-card.md. Вызвать beacon_defer_wiring с watchID исходного PR. Сверить, что запись появилась в beacon deferred --format json. Не менять код номеров PR.
 Проверка: beacon deferred --format json содержит четыре записи с нужными номерами PR и статусом todo. Каждая ссылается на существующий файл WIRING-<pr>.md с заполненным OwnerFiles и разделом Причина.
 Приёмка: Четыре записи видимы оркестратору, карточки материализованы в docs/tasks/, индекс обновлён CI.
+
+Причина: Уже влито в origin/main: коммит 79e70595 (PR #1900) добавил docs/tasks/WIRING-1460.md, WIRING-1582.md, WIRING-1608.md, WIRING-1612.md. git merge-base --is-ancestor 79e70595 origin/main дал exit 0. Все четыре карточки материализованы с заполненными OwnerFiles и разделом Причина. Дубль кода не создаём.
+Закрыл: fte04b
+Время закрытия: 2026-11-22T16:30:37Z
