@@ -247,24 +247,19 @@ jobs:
           fi
           printf 'gates binary present path=%s\n' "$bin"
 
+      # BL-05. Все шесть команд из registry проходят self-test из одного
+      # закоммиченного бинарника. tool-contract проверяет описания tools/list
+      # офлайн и больше не запускается через go run.
       - name: Self-test every gate
         shell: bash
         run: |
           set -euo pipefail
           bin=tools/beacon-gates/beacon-gates
           "$bin" --list
-          for gate in capabilities layers-ast layers-list wiring; do
+          for gate in capabilities layers-ast layers-list reachability tool-contract wiring; do
             printf 'self-test gate=%s\n' "$gate"
             "$bin" "$gate" --self-test
           done
-
-      # BCX-51. Гейт tool-contract проверяет описания tools/list офлайн.
-      - name: Self-test tool-contract gate
-        working-directory: tools/beacon-gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          go run . tool-contract --self-test
 
       - name: Run gates on tree
         shell: bash
@@ -291,7 +286,8 @@ jobs:
   # Гейт пересобирает индекс из docs/tasks и сравнивает его байты с
   # закоммиченной копией. Разрешение статусов читает git log, поэтому
   # checkout получает полную историю: fetch-depth 1 ломает пересборку.
-  # Отдельный main package не меняет закоммиченный бинарник гейтов.
+  # BL-05. cardindex и docsgate - отдельные main package. Они не входят в
+  # бинарник beacon-gates и запускаются через go run в своих jobs.
   cardindex:
     name: cardindex
     runs-on: ubuntu-latest

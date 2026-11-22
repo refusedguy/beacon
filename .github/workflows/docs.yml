@@ -28,6 +28,8 @@ jobs:
         with:
           cache: 'false'
 
+      # BL-05. docsgate - отдельный main package, не входит в бинарник
+      # beacon-gates. Проверка запускает его через go run ./docsgate.
       - name: Self-test docs gate on planted bad input
         working-directory: tools/beacon-gates
         shell: bash
