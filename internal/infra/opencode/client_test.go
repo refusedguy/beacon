@@ -502,6 +502,75 @@ func TestCreateSessionErrors(t *testing.T) {
 	})
 }
 
+func TestDeleteSessionSendsDeleteWithPathAndAuth(t *testing.T) {
+	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+		return fakeResponse(`{}`, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	if err := c.DeleteSession(context.Background(), "ses_42"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+
+	reqs := doer.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("ожидался 1 запрос, получено %d", len(reqs))
+	}
+	req := reqs[0]
+	if req.Method != http.MethodDelete || req.URL.Path != "/api/session/ses_42" {
+		t.Fatalf("неверный запрос: %s %s", req.Method, req.URL.Path)
+	}
+	user, pass, ok := req.BasicAuth()
+	if !ok || user != "opencode" || pass != "pw" {
+		t.Fatalf("неверный basic auth: user=%q pass=%q ok=%v", user, pass, ok)
+	}
+}
+
+func TestDeleteSessionEscapesSessionID(t *testing.T) {
+	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+		return fakeResponse(`{}`, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	if err := c.DeleteSession(context.Background(), "s/1"); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	reqs := doer.snapshot()
+	if len(reqs) != 1 || !strings.Contains(reqs[0].URL.EscapedPath(), "%2F") {
+		t.Fatalf("sessionID не экранирован: %+v", reqs)
+	}
+}
+
+func TestDeleteSessionErrors(t *testing.T) {
+	t.Run("404", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			return fakeResponse(`{"error":"session not found"}`, http.StatusNotFound), nil
+		}}
+		c := newTestClient(t, doer)
+		err := c.DeleteSession(context.Background(), "ses_missing")
+		if err == nil {
+			t.Fatal("ожидалась ошибка для 404")
+		}
+		if !strings.Contains(err.Error(), "404") {
+			t.Fatalf("в ошибке нет кода: %v", err)
+		}
+	})
+
+	t.Run("empty session id", func(t *testing.T) {
+		doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
+			t.Fatal("пустой sessionID не должен вызывать HTTP")
+			return nil, nil
+		}}
+		c := newTestClient(t, doer)
+		if err := c.DeleteSession(context.Background(), ""); err == nil {
+			t.Fatal("ожидалась ошибка для пустого sessionID")
+		}
+		if got := len(doer.snapshot()); got != 0 {
+			t.Fatalf("ожидалось 0 HTTP-запросов, получено %d", got)
+		}
+	})
+}
+
 func TestPromptSendsPostWithoutAgent(t *testing.T) {
 	var body []byte
 	doer := &fakeDoer{fn: func(req *http.Request) (*http.Response, error) {
