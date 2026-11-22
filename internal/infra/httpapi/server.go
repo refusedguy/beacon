@@ -179,6 +179,13 @@ type Snapshot struct {
 	// ones. It stays absent when nothing was cut, so the flag is part of the
 	// optional history block rather than a field on every snapshot.
 	RecentWatchesTruncated bool `json:"recentWatchesTruncated,omitempty"`
+
+	// Queue, Slots and Workers are optional. A provider that has no queue
+	// projection leaves them out of the JSON response, so a client that does
+	// not know the fields sees the original shape.
+	Queue   *QueueBlock   `json:"queue,omitempty"`
+	Slots   *SlotBlock    `json:"slots,omitempty"`
+	Workers []WorkerBlock `json:"workers,omitempty"`
 }
 
 // WatchOutcome groups a completed Watch for the history list. It stays a string
@@ -210,6 +217,40 @@ type HourlyStats struct {
 	Points   int `json:"points"`
 	Merges   int `json:"merges"`
 	Blockers int `json:"blockers"`
+}
+
+// QueueBlock is the queue panel of the live screen. Todo holds the ready cards
+// and Deferred holds the cards parked by an earlier cycle. The shape stays
+// transport-owned so a change in the task store does not change the wire
+// contract.
+type QueueBlock struct {
+	Todo     []QueueCard `json:"todo,omitempty"`
+	Deferred []QueueCard `json:"deferred,omitempty"`
+}
+
+// QueueCard is one card in the queue panel. Owner holds the short agent id and
+// Phase holds the card phase. Both stay optional for older cards.
+type QueueCard struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Owner  string `json:"owner,omitempty"`
+	Title  string `json:"title"`
+	Phase  string `json:"phase,omitempty"`
+}
+
+// SlotBlock reports the orchestrator slot capacity shown by the live screen.
+// Total is the configured budget and Used is the number of held slots.
+type SlotBlock struct {
+	Total int `json:"total"`
+	Used  int `json:"used"`
+}
+
+// WorkerBlock is one executor the live screen lists with its role and wake
+// target. A snapshot without a role still decodes with empty strings.
+type WorkerBlock struct {
+	ID     string `json:"id"`
+	Role   string `json:"role,omitempty"`
+	Target string `json:"target,omitempty"`
 }
 
 // SnapshotHistory is the optional history block added to a Snapshot.
