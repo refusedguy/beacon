@@ -601,7 +601,7 @@ func watchOutput(w domain.Watch) WatchOutput {
 	}
 	if w.Blocked != nil {
 		out.Blocked = &BlockedInfoOutput{
-			Reason:       w.Blocked.Reason,
+			Reason:       string(w.Blocked.Reason),
 			FailedChecks: cloneStrings(w.Blocked.FailedChecks),
 			Since:        w.Blocked.Since,
 			BlockedBy:    w.Blocked.BlockedBy,
