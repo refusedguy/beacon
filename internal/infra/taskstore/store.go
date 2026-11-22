@@ -976,8 +976,11 @@ func CheckLinkage(l Linkage, ports LinkagePorts) LinkageVerdict {
 }
 
 var (
-	linkageADRRE  = regexp.MustCompile(`(?i)\bADR[\s-]*([0-9]{4})\b`)
-	linkageCardRE = regexp.MustCompile(`\b[A-Z][A-Z0-9]*[-.][0-9]+(?:\.[0-9]+)?\b`)
+	linkageADRRE = regexp.MustCompile(`(?i)\bADR[\s-]*([0-9]{4})\b`)
+	// ParseLinkage reads card refs from commit text. Use the exactIDRE grammar
+	// so the parser accepts the same ID shapes as card files, including
+	// ATX-R01 and RS-CMP-06. Word boundaries keep refs apart from other text.
+	linkageCardRE = regexp.MustCompile(`\b` + strings.TrimSuffix(strings.TrimPrefix(exactIDRE.String(), "^"), "$") + `\b`)
 	linkageJustRE = regexp.MustCompile(`(?im)^[ \t]*(Обоснование|Исключение|Justification|Exception)[ \t]*:[ \t]*(.+)$`)
 	commitTypeRE  = regexp.MustCompile(`^([a-z]+)(?:\([^)]*\))?[!]?:`)
 )
