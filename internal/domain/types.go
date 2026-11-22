@@ -716,6 +716,71 @@ type WakePayload struct {
 	ObligationID string `json:"obligationID"`
 	Revision     uint64 `json:"revision"`
 	Verdict      string `json:"verdict"`
+	// Origin records where the prompting message came from. It describes the
+	// start of a turn and never identifies the caller on its own.
+	Origin *MessageOrigin `json:"origin,omitempty"`
+	// CorrelationID is the request uuid. A result carries the same uuid as
+	// the prompt that caused it, so two wakes do not swap their results.
+	CorrelationID string `json:"correlationID,omitempty"`
+}
+
+// Validate rejects a pointer that cannot be matched back to its prompt. A
+// wake without a request uuid or an origin kind can still be delivered, but
+// its result cannot be attributed to the message that caused it.
+func (p WakePayload) Validate() error {
+	if p.CorrelationID == "" {
+		return errors.New("wake payload: correlationID is required")
+	}
+	if p.Origin == nil {
+		return errors.New("wake payload: origin is required")
+	}
+	return p.Origin.Validate()
+}
+
+// WithCorrelation returns a copy of p carrying requestUUID as its correlation
+// id. The original pointer stays unchanged for other delivery attempts.
+func (p WakePayload) WithCorrelation(requestUUID string) WakePayload {
+	p.CorrelationID = requestUUID
+	return p
+}
+
+// MessageOriginKind is the discriminator of a prompting message. The
+// discriminator decides classification; a sender name never does.
+type MessageOriginKind string
+
+const (
+	// MessageOriginUser is the only kind treated as a human message.
+	MessageOriginUser MessageOriginKind = "user"
+	// MessageOriginAgent marks a message sent by another agent or service.
+	MessageOriginAgent MessageOriginKind = "agent"
+	// MessageOriginSystem marks a message produced by the harness.
+	MessageOriginSystem MessageOriginKind = "system"
+)
+
+// MessageOrigin mirrors the origin shape of the SDK. From is a routing hint
+// only: a value there never proves who wrote the message.
+type MessageOrigin struct {
+	Kind            MessageOriginKind `json:"kind"`
+	Server          string            `json:"server,omitempty"`
+	From            string            `json:"from,omitempty"`
+	SenderTaskID    string            `json:"senderTaskId,omitempty"`
+	Body            string            `json:"body,omitempty"`
+	VerifiedPeerPID string            `json:"verifiedPeerPid,omitempty"`
+}
+
+// Validate rejects an origin with no discriminator. An unknown kind stays
+// valid data so the message is not dropped; callers classify it as non-human.
+func (o MessageOrigin) Validate() error {
+	if o.Kind == "" {
+		return errors.New("message origin: kind is required")
+	}
+	return nil
+}
+
+// IsHuman reports whether the origin is known to be a human message. Every
+// kind outside the known set, including an empty one, is non-human.
+func (o MessageOrigin) IsHuman() bool {
+	return o.Kind == MessageOriginUser
 }
 
 // WakeDeliverer is the port a thin harness adapter implements to steer a

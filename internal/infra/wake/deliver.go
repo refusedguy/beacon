@@ -481,18 +481,42 @@ func sessionNotFound(err error, out []byte) bool {
 // ObligationKey (p.ObligationID is domain.ObligationKey of this pointer). The
 // adapter keys its durable dedup on it, so a replay after a client restart
 // cannot steer the same obligation twice (RS-WK-02).
+// Origin and correlationID are emitted only when present, so older pointers
+// keep their five-key envelope.
 func Envelope(p domain.WakePayload) string {
 	var buf strings.Builder
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
-	_ = enc.Encode(map[string]any{
+	fields := map[string]any{
 		"id":           p.ObligationID,
 		"watchID":      p.WatchID,
 		"obligationID": p.ObligationID,
 		"revision":     p.Revision,
 		"verdict":      p.Verdict,
-	})
+	}
+	if p.CorrelationID != "" {
+		fields["correlationID"] = p.CorrelationID
+	}
+	if p.Origin != nil && p.Origin.Kind != "" {
+		fields["origin"] = p.Origin
+	}
+	_ = enc.Encode(fields)
 	return "<beacon-event>" + strings.TrimSpace(buf.String()) + "</beacon-event>"
+}
+
+// EnvelopeForRequest renders p with the prompt's uuid attached as its
+// correlation id. Two prompts with different uuids produce different
+// envelopes even when they wake the same session, so each result matches its
+// own prompt.
+func EnvelopeForRequest(p domain.WakePayload, requestUUID string) string {
+	return Envelope(p.WithCorrelation(requestUUID))
+}
+
+// NonHumanOrigin reports whether a message origin is absent or not known to
+// be human. The check reads Kind only: From is a routing hint and is never
+// used as proof of identity.
+func NonHumanOrigin(o *domain.MessageOrigin) bool {
+	return o == nil || !o.IsHuman()
 }
 
 // WatchTarget resolves the orchestrator session that owns a wake pointer. The
