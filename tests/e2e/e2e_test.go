@@ -16,10 +16,12 @@
 //  * mcp_go_sdk_CommandTransport proves the protocol and the eight-tool
 //    contract only. live_opencode_full_mcp_cycle calls the real handlers of
 //    `beacon mcp` and reads watchID, revision and verdict from their answers.
-//  * There is no CI poll daemon in this tree. The verdict in the full cycle is
-//    written into the durable store by an external driver, the way a daemon
-//    would; the verdict read back comes from the real wait_result/get_result
-//    handlers over CommandTransport, never from a value invented in this test.
+//  * The full cycle has no hardcoded verdict driver. cycleDaemon observes CI
+//    facts, runs the real domain engine with the ShipFacts gate (ADR 0061 item
+//    2) and commits the verdict, obligation and wake intent. runLiveMCPCycle
+//    never calls domain.Transition; only the daemon does. The verdict read back
+//    comes from the real wait_result/get_result handlers over CommandTransport,
+//    never from a value invented in the test driver.
 //  * Negative checks install no-op handlers and require the positive
 //    verification to fail. A harness that stays green with a stub is not e2e.
 
@@ -777,8 +779,10 @@ func tail(t *testing.T, path string) string {
 // frozenScenarioHash is sha256 of the sorted scenario names joined by "\n",
 // with no trailing newline. Revised in BCX-55: the wake scenario now loads the
 // repository plugin and is named opencode_wake_with_repo_plugin instead of the
-// fixture-backed opencode_wake_with_reference_plugin.
-const frozenScenarioHash = "0dff4b974123dc348e21ef2f169d8e366c2fedbe8fb0d536d1f257bd68975391"
+// fixture-backed opencode_wake_with_reference_plugin. Revised when
+// verdict_ready_gate_requires_shipfacts entered the set: the ready verdict must
+// come from observed ShipFacts, not a hardcoded driver.
+const frozenScenarioHash = "b8d1fef39b3cb10f066c24f94c00cf5dd2ccbfa2119814184aa0de75670d5a40"
 
 type e2eScenario struct {
 	name string
@@ -794,6 +798,7 @@ var e2eScenarios = []e2eScenario{
 	{"opencode_wake_with_repo_plugin", runWakePositive},
 	{"live_wake_via_opencode_api", runLiveWakeViaAPI},
 	{"live_opencode_full_mcp_cycle", runLiveMCPCycle},
+	{"verdict_ready_gate_requires_shipfacts", runVerdictReadyGateRequiresShipFacts},
 	{"negative_control_stub_handler_must_fail", runNegativeControl},
 }
 
@@ -990,43 +995,153 @@ func callE2ETool[T any](t *testing.T, ctx context.Context, session *mcpsdk.Clien
 	return out
 }
 
-// driveReadyVerdict is the external verdict driver. This tree has no CI poll
-// daemon, so the test plays the daemon's role at the file boundary: it applies
-// the domain verdict transition to the Watch that watch_pr persisted and
-// stages the obligation at the next revision. It never replaces a tool
-// handler. wait_result and get_result read the verdict back from the durable
-// store through their real implementations.
-func driveReadyVerdict(t *testing.T, stateDir, watchID, subscriberID string) (uint64, string) {
-	t.Helper()
-	db, err := store.Open(filepath.Join(stateDir, "beacon.db"))
-	if err != nil {
-		t.Fatalf("open store for verdict driver: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+// --- the full-cycle daemon: the verdict is a result, not a test input -------
 
-	w, err := db.Watch(watchID)
+// observedCI is one poll of external facts a CI daemon would fetch. It carries
+// no verdict. The verdict is computed by domain.EvaluatePR from these facts,
+// so changing the facts changes the verdict.
+type observedCI struct {
+	state      string
+	headSHA    string
+	rollup     string
+	mergeable  string
+	mergeState string
+	review     string
+	checks     map[string]domain.Check
+	failures   []string
+}
+
+// greenObservation is the fact set that legitimately closes the cycle: every
+// required check is green and the three ship facts are observed from check
+// names. This is data about CI, not a stubbed ready verdict.
+func greenObservation(headSHA string) observedCI {
+	green := domain.Check{State: "SUCCESS", Conclusion: "SUCCESS", Required: true}
+	return observedCI{
+		state:      "OPEN",
+		headSHA:    headSHA,
+		rollup:     "SUCCESS",
+		mergeable:  "MERGEABLE",
+		mergeState: "CLEAN",
+		checks: map[string]domain.Check{
+			"ci/build": green,
+			"ci/audit": green,
+			"ci/tests": green,
+		},
+	}
+}
+
+// shipFactsFromChecks derives ShipFacts from observed required green checks.
+// It mirrors the production adapter in internal/infra/mcp/tool_get_result.go
+// (T3.75), which is unexported and cannot be imported from this external test
+// package. Trivial has no observable signal and stays false instead of being
+// invented.
+func shipFactsFromChecks(checks map[string]domain.Check) domain.ShipFacts {
+	var facts domain.ShipFacts
+	for name, check := range checks {
+		if !check.Required {
+			continue
+		}
+		if !strings.EqualFold(check.Conclusion, "SUCCESS") && !strings.EqualFold(check.State, "SUCCESS") {
+			continue
+		}
+		lower := strings.ToLower(name)
+		if strings.Contains(lower, "build") {
+			facts.Build = true
+		}
+		if strings.Contains(lower, "audit") {
+			facts.Audit = true
+		}
+		if strings.Contains(lower, "test") {
+			facts.TDD = true
+		}
+	}
+	return facts
+}
+
+// snapshot assembles a domain.Snapshot from observed facts. The ship facts are
+// filled from the observed checks, so a green rollup alone cannot make a change
+// ready (ADR 0061 item 2).
+func (o observedCI) snapshot(w domain.Watch, at time.Time) domain.Snapshot {
+	return domain.Snapshot{
+		State:            o.state,
+		HeadSHA:          o.headSHA,
+		WatchHeadSHA:     w.HeadSHA,
+		Rollup:           o.rollup,
+		Mergeable:        o.mergeable,
+		MergeStateStatus: o.mergeState,
+		ReviewDecision:   o.review,
+		Checks:           o.checks,
+		Failures:         o.failures,
+		SuitesValid:      true,
+		At:               at,
+		Ship:             shipFactsFromChecks(o.checks),
+	}
+}
+
+// cycleDaemon is the test-side stand-in for the CI poll daemon. It observes
+// facts, runs the real verdict engine, and commits the result atomically. It
+// is the only place in this file that applies domain.Transition: scenarios
+// call tick and never choose a verdict themselves.
+type cycleDaemon struct {
+	db      *store.DB
+	observe func(w domain.Watch) observedCI
+}
+
+// decide computes the verdict from observed facts through the real engine.
+// Evaluate applies the compiled-in ShipFacts formula (ADR 0061 item 2): a green
+// rollup without build, audit and tdd/trivial facts stays watching. EvaluatePR
+// deliberately skips that formula, so it cannot serve a daemon whose verdict
+// must follow the observed facts.
+func (d cycleDaemon) decide(w domain.Watch, at time.Time) (domain.Verdict, []domain.WakeTarget) {
+	return domain.Evaluate(d.observe(w).snapshot(w, at), w.Policy)
+}
+
+// tick is one daemon poll: decide from facts, then commit the verdict, the
+// obligation and the wake intent in one store transaction. It returns the new
+// revision and obligation id so the scenario reads the verdict back through the
+// real MCP handlers.
+func (d cycleDaemon) tick(t *testing.T, watchID, subscriberID string) (uint64, string) {
+	t.Helper()
+	if d.db == nil {
+		t.Fatal("демон: нет store")
+	}
+	w, err := d.db.Watch(watchID)
 	if err != nil {
-		t.Fatalf("watch for verdict driver: %v", err)
+		t.Fatalf("демон: watch: %v", err)
 	}
 	now := time.Now().UTC()
-	next, effects := domain.Transition(w, domain.VerdictEvent(domain.VerdictReady, now))
-	if next.Verdict != domain.VerdictReady || next.Status != domain.StatusNotifying ||
+	verdict, targets := d.decide(w, now)
+	if verdict != domain.VerdictReady {
+		t.Fatalf("демон вычислил verdict=%s из наблюдаемых фактов, ждали ready", verdict)
+	}
+	if len(targets) == 0 {
+		t.Fatal("демон не вернул wake-цель для ready")
+	}
+
+	// Only the daemon applies the transition, with the verdict the engine
+	// computed from facts. The full cycle below never calls it directly.
+	next, effects := domain.Transition(w, domain.VerdictEvent(verdict, now))
+	if next.Verdict != verdict || next.Status != domain.StatusNotifying ||
 		next.Revision <= w.Revision || len(effects) == 0 {
-		t.Fatalf("вердикт не перевёл Watch: до %+v после %+v effects=%v", w, next, effects)
+		t.Fatalf("демон не перевёл Watch: до %+v после %+v effects=%v", w, next, effects)
 	}
 	obligationID := domain.ObligationKey(next.ID, next.Revision, subscriberID)
-	err = db.SaveObligation(domain.Obligation{
-		ID: obligationID, WatchID: next.ID, Revision: next.Revision,
-		SubscriberID: subscriberID, VerdictPointer: next.Verdict, StagedAt: now,
-	})
-	if err != nil {
-		t.Fatalf("stage obligation for verdict driver: %v", err)
+	commit := store.VerdictCommit{
+		Watch: next,
+		Obligation: domain.Obligation{
+			ID: obligationID, WatchID: next.ID, Revision: next.Revision,
+			SubscriberID: subscriberID, VerdictPointer: verdict, StagedAt: now,
+		},
+		Wake: store.WakeIntent{
+			WatchID: next.ID, ObligationID: obligationID,
+			Revision: next.Revision, StagedAt: now,
+		},
 	}
-	if err := db.SaveWatch(next); err != nil {
-		t.Fatalf("save verdict: %v", err)
+	if err := d.db.CommitVerdict(context.Background(), commit); err != nil {
+		t.Fatalf("демон: commit verdict: %v", err)
 	}
-	t.Logf("внешний драйвер вердикта: watch=%s revision %d→%d verdict=%s obligation=%s",
-		watchID, w.Revision, next.Revision, next.Verdict, obligationID)
+	t.Logf("демон полного цикла: watch=%s revision %d→%d verdict=%s (вычислен из фактов) obligation=%s",
+		watchID, w.Revision, next.Revision, verdict, obligationID)
 	return next.Revision, obligationID
 }
 
@@ -1209,8 +1324,18 @@ func runLiveMCPCycle(t *testing.T, binary string) {
 	}
 	t.Logf("отчёт по CycleInstructions доставлен в живую сессию: %q; %s facts=%+v", report, info, facts)
 
-	// External event driver, then the real handlers read the verdict back.
-	revision, obligationID := driveReadyVerdict(t, stateDir, watch.WatchID, session.ID)
+	// The daemon decides from observed CI facts and commits the result; the
+	// real handlers then read the verdict back. This scenario never applies a
+	// transition and never picks a verdict itself.
+	db, err := store.Open(filepath.Join(stateDir, "beacon.db"))
+	if err != nil {
+		t.Fatalf("open store for cycle daemon: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	daemon := cycleDaemon{db: db, observe: func(w domain.Watch) observedCI {
+		return greenObservation(w.HeadSHA)
+	}}
+	revision, obligationID := daemon.tick(t, watch.WatchID, session.ID)
 	wait := callE2ETool[beaconmcp.WaitReasonOutput](t, ctx, mcpSession, "beacon_wait_result", map[string]any{
 		"watchID": watch.WatchID, "timeoutMs": 5000, "clientRequestId": "t3146-" + watch.WatchID,
 	}, meta)
@@ -1271,6 +1396,136 @@ func runLiveMCPCycle(t *testing.T, binary string) {
 	} else {
 		t.Logf("негативный контроль плагина: %s заглушка ожидаемо провалилась: %v", negInfo, err)
 	}
+}
+
+// --- ADR 0061 item 2: ready needs observed ShipFacts -------------------------
+
+// runVerdictReadyGateRequiresShipFacts proves the ready verdict is a function
+// of observed facts. A green rollup with required checks that carry no ship
+// fact must not become ready (regression of T3.72 and T3.78). Every verdict
+// comes from the real engine through the daemon, never from a string comparison
+// in this test.
+func runVerdictReadyGateRequiresShipFacts(t *testing.T, _ string) {
+	t.Helper()
+	base := newBase(t, "shipfacts")
+	stateDir := filepath.Join(base, "state", "beacon")
+	if err := os.MkdirAll(filepath.Join(stateDir, "receipts"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(stateDir, "beacon.db"))
+	if err != nil {
+		t.Fatalf("open store for shipfacts gate: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	now := time.Now().UTC()
+	w := domain.Watch{
+		ID:      "watch-shipfacts-e2e-" + fmt.Sprint(now.UnixNano()),
+		Repo:    "refusedguy/beacon",
+		PR:      141,
+		HeadSHA: "shipfacts-e2e-head",
+		Status:  domain.StatusWatching,
+		Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{
+			ID: "shipfacts-e2e", Role: domain.RoleExecutor,
+			Adapter: "opencode", Target: "shipfacts-e2e",
+		}},
+		Policy:    domain.DefaultPolicy(),
+		CreatedAt: now,
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatalf("save watch for shipfacts gate: %v", err)
+	}
+
+	// Positive: required green checks named build, audit and test give the
+	// engine the ship facts it gates ready on.
+	positive := greenObservation(w.HeadSHA)
+	daemon := cycleDaemon{db: db, observe: func(domain.Watch) observedCI { return positive }}
+	verdict, targets := daemon.decide(w, now)
+	if verdict != domain.VerdictReady || len(targets) == 0 {
+		t.Fatalf("ShipFacts gate: ждали ready с build/audit/test, получили verdict=%s targets=%v", verdict, targets)
+	}
+	t.Logf("ShipFacts gate: наблюдаемые build/audit/test → verdict=%s", verdict)
+
+	// The daemon commits that decision. The stored watch and obligation must
+	// not diverge from what the engine decided: the verdict is the daemon's
+	// result, not a value the scenario wrote.
+	revision, obligationID := daemon.tick(t, w.ID, "shipfacts-e2e")
+	stored, err := db.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read stored watch: %v", err)
+	}
+	if stored.Verdict != verdict || stored.Revision != revision {
+		t.Fatalf("расхождение фактов: демон решил %s@%d, в store %s@%d",
+			verdict, revision, stored.Verdict, stored.Revision)
+	}
+	o, err := db.Obligation(obligationID)
+	if err != nil {
+		t.Fatalf("read obligation: %v", err)
+	}
+	if o.VerdictPointer != verdict {
+		t.Fatalf("расхождение фактов: verdict pointer=%s, решение=%s", o.VerdictPointer, verdict)
+	}
+	t.Logf("расхождение фактов: решение демона и store совпадают: %s@%d", stored.Verdict, stored.Revision)
+
+	// Negative control: same green rollup and required green checks, but their
+	// names carry no ship fact. The engine must not answer ready.
+	negative := positive
+	negative.checks = map[string]domain.Check{
+		"ci/lint": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+		"ci/docs": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+	}
+	negDaemon := cycleDaemon{db: db, observe: func(domain.Watch) observedCI { return negative }}
+	negativeVerdict, _ := negDaemon.decide(w, now)
+	if negativeVerdict == domain.VerdictReady {
+		t.Fatal("негативный контроль ShipFacts: зелёные чеки без ShipFacts дали ready")
+	}
+	t.Logf("негативный контроль ShipFacts: verdict=%s, ожидалось не ready", negativeVerdict)
+
+	// Divergence: one rollup, two different fact sets, two different verdicts.
+	if negativeVerdict == verdict {
+		t.Fatal("расхождение фактов: разные наблюдения дали одинаковый verdict")
+	}
+	t.Logf("расхождение фактов: один зелёный rollup дал %s и %s в зависимости от ShipFacts",
+		verdict, negativeVerdict)
+}
+
+// TestFullCycleDaemonFactDivergence proves the daemon's verdict follows the
+// observed facts. Two observations with the same green rollup but different
+// ship facts must produce different verdicts. A hardcoded verdict driver
+// cannot do this.
+func TestFullCycleDaemonFactDivergence(t *testing.T) {
+	head := "divergence-head"
+	w := domain.Watch{ID: "divergence-watch", HeadSHA: head, Policy: domain.DefaultPolicy()}
+	daemonWith := func(facts map[string]domain.Check) cycleDaemon {
+		o := greenObservation(head)
+		o.checks = facts
+		return cycleDaemon{observe: func(domain.Watch) observedCI { return o }}
+	}
+
+	withFacts := daemonWith(map[string]domain.Check{
+		"ci/build": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+		"ci/audit": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+		"ci/tests": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+	})
+	withoutFacts := daemonWith(map[string]domain.Check{
+		"ci/lint": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+		"ci/docs": {State: "SUCCESS", Conclusion: "SUCCESS", Required: true},
+	})
+
+	now := time.Now().UTC()
+	with, _ := withFacts.decide(w, now)
+	without, _ := withoutFacts.decide(w, now)
+	if with != domain.VerdictReady {
+		t.Fatalf("наблюдение с ShipFacts дало verdict=%s, ждали ready", with)
+	}
+	if without == domain.VerdictReady {
+		t.Fatalf("наблюдение без ShipFacts дало verdict=%s, ждали не ready", without)
+	}
+	if with == without {
+		t.Fatal("расхождение фактов: разные наблюдения дали одинаковый verdict")
+	}
+	t.Logf("расхождение фактов подтверждено: ShipFacts дают %s, их отсутствие даёт %s", with, without)
 }
 
 // --- the suite ---------------------------------------------------------------
