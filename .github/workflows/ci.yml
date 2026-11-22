@@ -77,6 +77,47 @@ jobs:
           set -euo pipefail
           go test ./...
 
+  # BCX-52. e2e возвращается в обязательный путь. tools/list сверяется с
+  # общим набором имён из internal/infra/mcp, поэтому расхождение в числе
+  # инструментов падает здесь, а не остаётся необязательным предупреждением.
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: ./.github/actions/go-runner-setup
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26.x'
+
+      - name: Install opencode 2.3.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=2.3.0
+          work="$RUNNER_TEMP/opencode-install"
+          mkdir -p "$work" "$HOME/.opencode/bin"
+          curl -fsSL "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz" \
+            -o "$work/opencode.tgz"
+          tar -xzf "$work/opencode.tgz" -C "$work"
+          cp "$work/package/bin/opencode" "$HOME/.opencode/bin/opencode"
+          chmod 755 "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          "$HOME/.opencode/bin/opencode" --version
+
+      - name: Run e2e
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.opencode/bin:$PATH"
+          bash tests/e2e/run.sh
+
   # T3.342. Две проверки seed-artery. Первая следит за составом
   # tests/scenarios/seeded.yaml: четыре отказа из S7.011 и прогон
   # healthy -> seeded -> healthy из w25. Вторая гоняет реальный
