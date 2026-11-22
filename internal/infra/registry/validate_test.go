@@ -10,7 +10,7 @@ import (
 func validConfig() map[string]any {
 	return map[string]any{
 		"schema":  "beacon.agent-registry/v1",
-		"version": "1",
+		"version": 1,
 		"project": "beacon",
 		"roster": []any{
 			map[string]any{
@@ -92,6 +92,18 @@ func TestValidateRejectsByField(t *testing.T) {
 		{"empty configuration id", func(c map[string]any) {
 			c["configurations"].([]any)[0].(map[string]any)["id"] = ""
 		}, "configurations[0].id"},
+		{"non-numeric version", func(c map[string]any) { c["version"] = "one" }, "version"},
+		{"unknown version", func(c map[string]any) { c["version"] = 99 }, "version"},
+		{"fractional version", func(c map[string]any) { c["version"] = 1.5 }, "version"},
+		{"dangling alias", func(c map[string]any) {
+			c["configurations"].([]any)[0].(map[string]any)["alias"] = "missing"
+		}, "configurations[0].alias"},
+		{"dangling recommended", func(c map[string]any) {
+			c["configurations"].([]any)[0].(map[string]any)["recommended"] = "missing"
+		}, "configurations[0].recommended"},
+		{"alias as a list", func(c map[string]any) {
+			c["configurations"].([]any)[0].(map[string]any)["alias"] = []any{"build", "missing"}
+		}, "configurations[0].alias"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -107,5 +119,38 @@ func TestValidateRejectsByField(t *testing.T) {
 				t.Fatalf("error %q does not name field %q", err, tc.wantField)
 			}
 		})
+	}
+}
+
+func TestValidateAcceptsIntegerVersionShapes(t *testing.T) {
+	cases := []struct {
+		name  string
+		value any
+	}{
+		{"int", 1},
+		{"int64", int64(2)},
+		{"json.Number", json.Number("1")},
+		{"float64", float64(1)},
+		{"numeric string", "1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validConfig()
+			c["version"] = tc.value
+			if err := Validate(c); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsConfigurationReferences(t *testing.T) {
+	config := validConfig()
+	config["configurations"] = []any{
+		map[string]any{"id": "build", "members": []any{"builder"}},
+		map[string]any{"id": "review", "members": []any{"builder"}, "alias": "build", "recommended": "build"},
+	}
+	if err := Validate(config); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }
