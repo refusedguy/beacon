@@ -795,8 +795,13 @@ type ExternalVerdict string
 const (
 	// ExternalPass means every declared check was observed with exit code 0.
 	ExternalPass ExternalVerdict = "PASS"
-	// ExternalFail means a declared check failed or was not observed. An empty
-	// declaration also fails closed.
+	// ExternalPartial means at least one declared check passed and at least
+	// one failed or was not observed. It reports progress to the orchestrator.
+	// It is not a clear gate: only ExternalPass clears the external check, so
+	// a partial verdict never opens a merge.
+	ExternalPartial ExternalVerdict = "PARTIAL"
+	// ExternalFail means no declared check passed, a malformed declaration was
+	// present, or the declaration was empty. An empty declaration fails closed.
 	ExternalFail ExternalVerdict = "FAIL"
 )
 
@@ -828,16 +833,29 @@ type CheckOutcome struct {
 	TestExitCodeObserved bool   `json:"test_exit_code_observed,omitempty"`
 }
 
+// CheckProgress is the exact pass fraction of the declared checks. Passed
+// counts checks whose deciding exit code was 0 and whose log, when supplied,
+// carried a suite-run marker. Total counts distinct non-empty declared checks.
+// The pair keeps a ratio instead of one bit, so a caller can tell 2/3 from 1/3
+// and choose between a fix and a full rollback by number (SB-08).
+type CheckProgress struct {
+	Passed int `json:"passed"`
+	Total  int `json:"total"`
+}
+
 // ExternalEvidence is the record an adapter writes to disk after the external
-// checks ran. It carries the verdict and every declared check with the codes
-// behind it, so a reviewer can re-check the decision from the on-disk facts
-// alone and see whether the code came from the test command or the wrapper.
-// Nothing the agent reported is part of the record: the verdict
-// is an external check of the result, not the agent's proof (T3.88) and not
-// the compiled-in ship formula (T3.67).
+// checks ran. It carries the verdict, the pass fraction and every declared
+// check with the codes behind it, so a reviewer can re-check the decision from
+// the on-disk facts alone and see whether the code came from the test command
+// or the wrapper. Progress is always filled when the declaration is non-empty,
+// including a 0/N fail, so the orchestrator sees how far a run got. Nothing the
+// agent reported is part of the record: the verdict is an external check of the
+// result, not the agent's proof (T3.88) and not the compiled-in ship formula
+// (T3.67).
 type ExternalEvidence struct {
-	Verdict ExternalVerdict `json:"verdict"`
-	Checks  []CheckOutcome  `json:"checks"`
+	Verdict  ExternalVerdict `json:"verdict"`
+	Progress CheckProgress   `json:"progress"`
+	Checks   []CheckOutcome  `json:"checks"`
 }
 
 // suiteRunMarkers are the positive signals that a test runner executed. The
@@ -906,6 +924,13 @@ type observedExternalCheck struct {
 // the declaration order and drops duplicate names; when a check is observed
 // more than once the first observation wins, and observations for checks that
 // were not declared are ignored.
+//
+// The verdict has three values. All declared checks passing gives PASS. Some
+// passing and some failing gives PARTIAL, with Progress holding the exact
+// passed/total ratio. No check passing, a malformed declaration or an empty
+// declaration gives FAIL. PARTIAL reports progress but never opens a merge:
+// only PASS clears the gate. Progress is filled from the declared panel for
+// every non-empty declaration, including FAIL with 0/N.
 func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvidence {
 	evidence := ExternalEvidence{
 		Verdict: ExternalFail,
@@ -928,12 +953,13 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 	}
 
 	seen := make(map[string]bool, len(declared))
-	allPass := true
+	passed := 0
+	validDeclaration := true
 	for _, name := range declared {
 		if name == "" {
 			// A malformed declaration cannot name a real check, so it
 			// fails the gate instead of being silently dropped.
-			allPass = false
+			validDeclaration = false
 			continue
 		}
 		if seen[name] {
@@ -963,15 +989,24 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 			outcome.Reason = ExternalReasonNoTestsRan
 		}
 		evidence.Checks = append(evidence.Checks, outcome)
-		if !outcome.Passed {
-			allPass = false
+		if outcome.Passed {
+			passed++
 		}
 	}
 
-	if len(evidence.Checks) == 0 || !allPass {
+	evidence.Progress = CheckProgress{Passed: passed, Total: len(evidence.Checks)}
+	total := len(evidence.Checks)
+	if total == 0 || !validDeclaration {
+		// No declared check, or a malformed declaration, fails closed.
 		return evidence
 	}
-	evidence.Verdict = ExternalPass
+	if passed == total {
+		evidence.Verdict = ExternalPass
+		return evidence
+	}
+	if passed > 0 {
+		evidence.Verdict = ExternalPartial
+	}
 	return evidence
 }
 
