@@ -5,9 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -79,25 +77,11 @@ func TestNtfyNotifySinkFailOpenWithoutConfig(t *testing.T) {
 }
 
 func TestNtfyNotifySinkSendsFormattedAndRedactedText(t *testing.T) {
-	var mu sync.Mutex
-	var gotPath, gotMethod, gotContentType string
-	var gotBody []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		gotPath = r.URL.Path
-		gotMethod = r.Method
-		gotContentType = r.Header.Get("Content-Type")
-		gotBody, _ = io.ReadAll(r.Body)
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok")
-	}))
-	defer srv.Close()
-
+	doer := &ntfyFakeDoer{}
 	sink := NewNtfyNotifySink(NtfyConfig{
-		URL:   srv.URL + "/",
+		URL:   "https://ntfy.example.test/",
 		Topic: "beacon-alerts",
-		Doer:  srv.Client(),
+		Doer:  doer,
 	})
 	n := Notification{
 		Kind:     NotifyEscalateHuman,
@@ -109,18 +93,20 @@ func TestNtfyNotifySinkSendsFormattedAndRedactedText(t *testing.T) {
 	if err := sink.Notify(context.Background(), n); err != nil {
 		t.Fatalf("Notify: %v", err)
 	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if gotMethod != http.MethodPost {
-		t.Fatalf("method = %q, want POST", gotMethod)
+	if doer.calls != 1 || doer.req == nil {
+		t.Fatalf("transport calls = %d, want 1", doer.calls)
 	}
-	if gotPath != "/beacon-alerts" {
-		t.Fatalf("path = %q, want /beacon-alerts", gotPath)
+	req := doer.req
+	if req.Method != http.MethodPost {
+		t.Fatalf("method = %q, want POST", req.Method)
 	}
-	if !strings.HasPrefix(gotContentType, "text/plain") {
-		t.Fatalf("content-type = %q, want text/plain", gotContentType)
+	if req.URL.String() != "https://ntfy.example.test/beacon-alerts" {
+		t.Fatalf("url = %q, want public ntfy endpoint", req.URL.String())
 	}
+	if got := req.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Fatalf("content-type = %q, want text/plain", got)
+	}
+	gotBody, _ := io.ReadAll(req.Body)
 	body := string(gotBody)
 	if !strings.Contains(body, "[escalate_human] watch=watch-1 pr=7 revision=3") {
 		t.Fatalf("body = %q, want formatted notification", body)
@@ -130,6 +116,84 @@ func TestNtfyNotifySinkSendsFormattedAndRedactedText(t *testing.T) {
 	}
 	if !strings.Contains(body, "[REDACTED]") {
 		t.Fatalf("body = %q, want redaction marker", body)
+	}
+}
+
+func TestNtfyNotifySinkRejectsUnsafeURL(t *testing.T) {
+	bad := []string{
+		"file:///etc/passwd",
+		"javascript:alert(1)",
+		"ftp://example.test",
+		"example.test/topic",
+		"//example.test",
+		"http://",
+		"http:opaque",
+		"%zz",
+		"http://169.254.169.254/latest/meta-data",
+		"http://127.0.0.1",
+		"http://10.0.0.5",
+		"http://192.168.1.10",
+		"http://[::1]",
+		"http://localhost",
+	}
+	for _, raw := range bad {
+		t.Run(raw, func(t *testing.T) {
+			doer := &ntfyFakeDoer{}
+			sink := NewNtfyNotifySink(NtfyConfig{URL: raw, Topic: "alerts", Doer: doer})
+			if sink.Configured() {
+				t.Fatalf("Configured = true for URL %q", raw)
+			}
+			if err := sink.Send(context.Background(), "hello"); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			if doer.calls != 0 {
+				t.Fatalf("transport calls = %d, want 0 for URL %q", doer.calls, raw)
+			}
+		})
+	}
+}
+
+func TestNtfyNotifySinkAcceptsValidURL(t *testing.T) {
+	for _, raw := range []string{"http://example.test", "https://example.test/base/"} {
+		t.Run(raw, func(t *testing.T) {
+			doer := &ntfyFakeDoer{}
+			sink := NewNtfyNotifySink(NtfyConfig{URL: raw, Topic: "alerts", Doer: doer})
+			if !sink.Configured() {
+				t.Fatalf("Configured = false for URL %q", raw)
+			}
+			if err := sink.Send(context.Background(), "hello"); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			if doer.calls != 1 || doer.req == nil {
+				t.Fatalf("transport calls = %d, want 1", doer.calls)
+			}
+			want := strings.TrimRight(raw, "/") + "/alerts"
+			if got := doer.req.URL.String(); got != want {
+				t.Fatalf("url = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestNtfyNotifySinkRejectsUnsafeTopic(t *testing.T) {
+	for _, topic := range []string{"bad topic", "a/b", "topic\ninject", "a?b", "topic#frag", ""} {
+		t.Run(topic, func(t *testing.T) {
+			doer := &ntfyFakeDoer{}
+			sink := NewNtfyNotifySink(NtfyConfig{
+				URL:   "https://ntfy.example.test",
+				Topic: topic,
+				Doer:  doer,
+			})
+			if sink.Configured() {
+				t.Fatalf("Configured = true for topic %q", topic)
+			}
+			if err := sink.Send(context.Background(), "hello"); err != nil {
+				t.Fatalf("Send: %v", err)
+			}
+			if doer.calls != 0 {
+				t.Fatalf("transport calls = %d, want 0 for topic %q", doer.calls, topic)
+			}
+		})
 	}
 }
 
