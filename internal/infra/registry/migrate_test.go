@@ -3,6 +3,7 @@ package registry
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -150,6 +151,72 @@ func TestMigrateRejectsSchemaDisagreement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Migrate([]byte(tc.config)); err == nil {
 				t.Fatalf("Migrate(%q) accepted a conflicting schema", tc.config)
+			}
+		})
+	}
+}
+
+func TestCheckVersionSchemaAcceptsDecodedMarkers(t *testing.T) {
+	tests := []struct {
+		name   string
+		config map[string]any
+	}{
+		{"yaml int", map[string]any{"version": 2, "schema": "beacon.agent-registry/v2"}},
+		{"int64", map[string]any{"version": int64(2), "schema": "beacon.agent-registry/v2"}},
+		{"json float", map[string]any{"version": float64(2), "schema": "beacon.agent-registry/v2"}},
+		{"json number", map[string]any{"version": json.Number("2"), "schema": "beacon.agent-registry/v2"}},
+		{"legacy string", map[string]any{"version": "2", "schema": "beacon.agent-registry/v2"}},
+		{"absent schema", map[string]any{"version": 2}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := CheckVersionSchema(tc.config); err != nil {
+				t.Errorf("CheckVersionSchema(%v) = %v, want nil", tc.config, err)
+			}
+		})
+	}
+}
+
+func TestCheckVersionSchemaRejectsUnknownVersion(t *testing.T) {
+	tests := []struct {
+		name   string
+		config map[string]any
+	}{
+		{"future int", map[string]any{"version": 99}},
+		{"future string", map[string]any{"version": "99"}},
+		{"zero", map[string]any{"version": 0}},
+		{"negative", map[string]any{"version": -1}},
+		{"fraction", map[string]any{"version": 2.5}},
+		{"non numeric", map[string]any{"version": "two"}},
+		{"missing", map[string]any{"project": "beacon"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckVersionSchema(tc.config)
+			var ve *ValidationError
+			if !errors.As(err, &ve) || ve.Field != "version" {
+				t.Fatalf("CheckVersionSchema(%v) = %v, want version error", tc.config, err)
+			}
+		})
+	}
+}
+
+func TestCheckVersionSchemaRejectsForeignSchema(t *testing.T) {
+	tests := []struct {
+		name   string
+		config map[string]any
+	}{
+		{"other prefix", map[string]any{"version": 2, "schema": "other/v2"}},
+		{"wrong version", map[string]any{"version": 2, "schema": "beacon.agent-registry/v1"}},
+		{"no integer", map[string]any{"version": 2, "schema": "beacon.agent-registry/vX"}},
+		{"not a string", map[string]any{"version": 2, "schema": 2}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CheckVersionSchema(tc.config)
+			var ve *ValidationError
+			if !errors.As(err, &ve) || ve.Field != "schema" {
+				t.Fatalf("CheckVersionSchema(%v) = %v, want schema error", tc.config, err)
 			}
 		})
 	}

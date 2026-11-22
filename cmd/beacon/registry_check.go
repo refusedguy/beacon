@@ -54,6 +54,28 @@ func issueFrom(err error, fallbackField string) registryCheckIssue {
 	return registryCheckIssue{Field: fallbackField, Reason: err.Error()}
 }
 
+// checkGuard runs the secret guard on the decoded config before a validator
+// can echo a field. A ConfigError names the marker that matched, never its
+// value, so the issue is safe to print.
+func checkGuard(config map[string]any, out *[]registryCheckIssue) {
+	if err := registry.GuardDocument(config); err != nil {
+		var ce *registry.ConfigError
+		if errors.As(err, &ce) {
+			*out = append(*out, registryCheckIssue{Field: ce.Field, Reason: ce.Reason})
+			return
+		}
+		*out = append(*out, registryCheckIssue{Field: "config", Reason: err.Error()})
+	}
+}
+
+// checkVersionSchema applies the migration rules to the decoded document so an
+// unknown version or a foreign schema cannot pass the local check.
+func checkVersionSchema(config map[string]any, out *[]registryCheckIssue) {
+	if err := registry.CheckVersionSchema(config); err != nil {
+		*out = append(*out, issueFrom(err, "config"))
+	}
+}
+
 // checkSchema runs the authored-config schema validator.
 func checkSchema(config map[string]any, out *[]registryCheckIssue) {
 	if err := registry.Validate(config); err != nil {
@@ -180,24 +202,23 @@ func registryCheckSortedKeys(m map[string]any) []string {
 // checkIndex rebuilds the derived index from the roster declarations and
 // verifies both directions with the T5.24 check. Building from the same roster
 // that is checked keeps the comparison deterministic and read-only: no stored
-// index or session state is touched (ADR 0089). A roster with no declared
-// capabilities has no index to verify and passes.
+// index or session state is touched (ADR 0089). An empty registry has no index
+// to verify; a non-empty roster is always reconciled, so executors without
+// capabilities fail through CheckCapabilityIndex instead of passing silently.
 func checkIndex(config map[string]any, out *[]registryCheckIssue) {
 	records, err := rosterRecords(config)
 	if err != nil {
 		*out = append(*out, issueFrom(err, "roster"))
 		return
 	}
+	if len(records) == 0 {
+		return
+	}
 	declarations := make(map[string][]string, len(records))
 	build := make([]registry.ExecutorRecord, 0, len(records))
-	declared := 0
 	for _, r := range records {
 		declarations[r.ID] = append([]string(nil), r.Capabilities...)
-		declared += len(r.Capabilities)
 		build = append(build, registry.ExecutorRecord{ID: r.ID, Capabilities: r.Capabilities})
-	}
-	if declared == 0 {
-		return
 	}
 
 	idx, err := registry.BuildCapabilityIndex(build)
@@ -220,7 +241,9 @@ func checkIndex(config map[string]any, out *[]registryCheckIssue) {
 func checkRegistryConfig(config map[string]any) registryCheckResult {
 	res := registryCheckResult{Issues: []registryCheckIssue{}}
 	res.Digest = registry.Digest(config)
+	checkGuard(config, &res.Issues)
 	checkSchema(config, &res.Issues)
+	checkVersionSchema(config, &res.Issues)
 	checkLimits(config, &res.Issues)
 	checkIndex(config, &res.Issues)
 	return res

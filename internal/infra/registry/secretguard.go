@@ -57,6 +57,21 @@ func GuardConfig(data []byte) error {
 		return errors.New("registry: author config: invalid JSON")
 	}
 
+	return guardDecoded(doc)
+}
+
+// GuardDocument checks a config a caller has already decoded into a map. The
+// registry CLI reads agents.yaml with yaml.v3, so this entry point guards the
+// decoded document instead of parsing YAML as JSON. Only marker names are
+// retained, so an error never carries the value behind a secret field.
+func GuardDocument(doc map[string]any) error {
+	return guardDecoded(doc)
+}
+
+// guardDecoded applies the marker rules to a decoded document. GuardConfig and
+// GuardDocument share it so both entry points report the same field and the
+// same priority order.
+func guardDecoded(doc any) error {
 	found := make(map[string]bool, len(secretMarkers))
 	collectMarkers(doc, found)
 	for _, marker := range secretMarkers {
