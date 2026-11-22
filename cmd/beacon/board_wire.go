@@ -26,6 +26,16 @@ func init() {
 	installBoardAdapter()
 }
 
+// tuiRunner is the shared dispatch seam for the two missing live entry points.
+// Both `beacon tui` and `beacon up --tui` call runLiveBoard, the adapter that
+// `beacon board --live` already uses. All three routes reach App.RunLive and
+// keep the plain-text snapshot for a pipe.
+var tuiRunner = func(c *CLI, args []string) int { return runLiveBoard(c, args) }
+
+// RegisterTui installs the live-screen runner. Tests replace it to observe the
+// shared entry point without opening a terminal or an HTTP connection.
+func RegisterTui(fn func(*CLI, []string) int) { tuiRunner = fn }
+
 // runTuiBoard reads the card index, applies the CLI filters and chooses the
 // renderer. A terminal gets the interactive model; a pipe gets the table.
 func runTuiBoard(c *CLI, args []string, stdin *os.File) int {

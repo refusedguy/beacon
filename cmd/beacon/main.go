@@ -25,6 +25,7 @@ const usageText = `beacon — команды сборки и проверки Be
 Использование:
   beacon list [--format table|json]
   beacon board [--root <dir>] [--status <status>] [--owner <owner>]  (TUI в терминале, таблица без терминала)
+  beacon tui [--root <dir>] [--status <status>] [--owner <owner>]  (живой экран в терминале, снимок текстом без TTY)
   beacon what <command>
   beacon doctor [--watch] [--interval <dur>] [--max-ticks <n>] [--session <id>] -- <команда> [аргументы]
   beacon build
@@ -252,6 +253,7 @@ func init() {
 	runnerFor = map[string]commandRunner{
 		"list":         func(c *CLI, args []string) int { return runList(args, c.out, c.errOut) },
 		"board":        func(c *CLI, args []string) int { return boardRunner(c, args) },
+		"tui":          func(c *CLI, args []string) int { return tuiRunner(c, args) },
 		"what":         func(c *CLI, args []string) int { return runWhat(args, c.out, c.errOut) },
 		"doctor":       func(c *CLI, args []string) int { return c.runDoctor(args) },
 		"build":        func(c *CLI, args []string) int { return c.runBuild(args) },
