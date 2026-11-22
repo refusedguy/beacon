@@ -221,6 +221,46 @@ Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Искл�
 
 Источник: `docs/research/research-pstack-skills.md`, строка таблицы `interrogate`; карточка PSK-02.
 
+## Политика действий агента (SB-15)
+
+Проверка действия идёт до запуска. Политика лежит в машиночитаемом виде и не привязана к оболочке. Хук `execute.before` проверяет команды оболочки отдельно. Правила ниже не повторяют его список и не заменяют его.
+
+```yaml
+action_policy:
+  version: 1
+  order: [blocklist_prefix, blocklist_standalone, block_unless_regex]
+  rules:
+    blocklist_prefix:
+      match: prefix
+      values: [nohup]
+    blocklist_standalone:
+      match: exact
+      values: [python]
+    block_unless_regex:
+      command: radare2
+      require: "(^|\\s)-c(\\s|$)"
+  refuse_template: "refuse: {rule} ({form}) {value}. Переформулируйте действие."
+```
+
+Формы правил различаются по тому, что совпадает.
+
+1. `blocklist_prefix` запрещает действие, если оно начинается со значения из `values`. Команда `nohup cmd` попадает под префикс `nohup`.
+2. `blocklist_standalone` запрещает действие, только если оно целиком равно значению из `values`. Отдельное `python` запрещено, `python script.py` разрешено.
+3. `block_unless_regex` запрещает команду из `command`, если её аргументы не подходят под `require`. Команда `radare2 file` запрещена, `radare2 -c cmd file` разрешена.
+
+Проверка идёт по порядку `order` и останавливается на первом совпадении. При совпадении агент получает текст из `refuse_template` с именем правила и формой. Действие не запускается. Агент меняет действие и повторяет проверку. Разрешённое действие не даёт refuse.
+
+Политика не добавляет инструментов MCP и не меняет протокол Watch. Источник: карточка SB-15, `sweagent/sweagent/tools/tools.py:29-72`, `:353-367`, `sweagent/sweagent/agent/agents.py:946-947`.
+
+<!-- SB-15 action-policy
+forms: blocklist-prefix, blocklist-standalone, block-unless-regex
+match: first-match
+refuse: rule-name-and-form, reformulate
+shell-hook: unchanged, not-duplicated
+mcp-tools: unchanged
+source: sweagent tools.py:29-72, agents.py:946-947
+-->
+
 <!-- CA-09 cache:boundary chat. Граница динамической части. -->
 <!-- Дальше идут правила выживания и история потомка. -->
 

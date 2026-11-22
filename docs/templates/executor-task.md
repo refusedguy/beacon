@@ -875,3 +875,26 @@ role: readonly-from-context-roles
 source: pstack/skills/how/SKILL.md:15-17, PSKX-08
 scope: no-new-skill, no-protocol-change
 executor-task:read-only-explain -->
+
+## Политика действий до выполнения (SB-15)
+
+Исполнитель проверяет каждое действие по политике из `AGENTS.md`, раздел «Политика действий агента», до запуска. Политика задана тремя формами: `blocklist_prefix`, `blocklist_standalone` и `block_unless_regex`. Проверка останавливается на первом совпадении и возвращает `refuse` с именем правила. Исполнитель меняет действие и проверяет его снова. Запрещённое действие не доходит до выполнения.
+
+| Действие | Форма правила | Вердикт |
+| --- | --- | --- |
+| `nohup cmd` | `blocklist_prefix`, префикс `nohup` | refuse |
+| отдельное `python` | `blocklist_standalone`, точное совпадение `python` | refuse |
+| `radare2 file` | `block_unless_regex`, флаг `-c` отсутствует | refuse |
+| `radare2 -c cmd file` | `block_unless_regex`, флаг `-c` есть | разрешено |
+
+Политика не дублирует правила хука `execute.before` и не добавляет инструментов MCP. Проверка оболочки работает как раньше.
+
+<!-- executor-task:action-policy
+trigger: before-action
+forms: blocklist-prefix, blocklist-standalone, block-unless-regex
+match: first-match
+refuse: rule-name-and-form, reformulate
+shell-hook: unchanged, no-duplicate
+mcp-tools: unchanged
+source: SB-15, sweagent tools.py:29-72, agents.py:946-947
+executor-task:action-policy -->
