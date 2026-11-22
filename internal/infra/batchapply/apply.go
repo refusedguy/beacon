@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Language policy (HD-053, ADR 0304). Every string this tool emits belongs to
@@ -91,6 +93,19 @@ const (
 	// docs/tasks once it is joined onto a file path. Reject it before any
 	// artifact path is built.
 	invalidCardIDFormat = "недопустимый идентификатор карточки: %s\n"
+	// CBX-06: chunked writes bound the time the shared lock is held. One
+	// progress line is emitted per chunk and one summary line closes the run.
+	// Keys stay English as technical terms; held values are Go durations.
+	chunkProgressFormat = "chunk=%d/%d records=%d held=%s\n"
+	chunkSummaryFormat  = "chunks=%d maxheld=%s\n"
+)
+
+// CBX-06 test seams. The values come from the beads measurement: 250 records
+// per chunk and a 150 ms pause let a concurrent reader take the lock while a
+// 26k import finishes. Tests lower both so a full pass runs in milliseconds.
+var (
+	chunkSize  = 250
+	chunkPause = 150 * time.Millisecond
 )
 
 // Options mirrors the command line of cmd/batch-apply.
@@ -103,6 +118,11 @@ type Options struct {
 	Quiet        bool
 	Commit       bool
 	Facts        bool
+	// ChunkSize overrides chunkSize when positive. ChunkPause overrides
+	// chunkPause when positive. Zero keeps the package default, so a caller
+	// cannot accidentally hold the lock for a whole import.
+	ChunkSize  int
+	ChunkPause time.Duration
 }
 
 type batch struct {
@@ -493,9 +513,40 @@ func renderADRIndex(entries []adrIndexEntry) string {
 // runner keeps the output streams and options together so the pure rendering
 // helpers stay free of I/O state.
 type runner struct {
-	opts Options
-	out  io.Writer
-	err  io.Writer
+	opts     Options
+	out      io.Writer
+	err      io.Writer
+	progress io.Writer
+	now      func() time.Time
+	yield    func(time.Duration)
+	commit   func(root string, cards, adrs, evals int) error
+}
+
+// fillDefaults installs the production seams. Tests replace any of them on
+// the runner they build before calling writeChunked.
+func (r *runner) fillDefaults() {
+	if r.out == nil {
+		r.out = io.Discard
+	}
+	if r.err == nil {
+		r.err = io.Discard
+	}
+	if r.progress == nil {
+		r.progress = r.out
+	}
+	if r.now == nil {
+		r.now = time.Now
+	}
+	if r.yield == nil {
+		r.yield = func(d time.Duration) {
+			if d > 0 {
+				time.Sleep(d)
+			}
+		}
+	}
+	if r.commit == nil {
+		r.commit = commitArtifacts
+	}
 }
 
 func (r *runner) printf(format string, args ...any) {
@@ -504,6 +555,82 @@ func (r *runner) printf(format string, args ...any) {
 
 func (r *runner) errf(format string, args ...any) {
 	fmt.Fprintf(r.err, format, args...)
+}
+
+func (r *runner) effectiveChunkSize() int {
+	if r.opts.ChunkSize > 0 {
+		return r.opts.ChunkSize
+	}
+	return chunkSize
+}
+
+func (r *runner) effectiveChunkPause() time.Duration {
+	if r.opts.ChunkPause > 0 {
+		return r.opts.ChunkPause
+	}
+	return chunkPause
+}
+
+// chunkEntries splits entries into ordered slices of at most size records.
+// Concatenating the result reproduces the input, so artifact order inside a
+// chunk never changes.
+func chunkEntries(entries []artifactEntry, size int) [][]artifactEntry {
+	if size <= 0 {
+		size = 1
+	}
+	var chunks [][]artifactEntry
+	for start := 0; start < len(entries); start += size {
+		end := start + size
+		if end > len(entries) {
+			end = len(entries)
+		}
+		chunks = append(chunks, entries[start:end])
+	}
+	return chunks
+}
+
+// writeChunked writes the artifact set in bounded chunks. Each chunk is
+// committed before the runner yields, so a concurrent reader sees a complete
+// chunk and never half a write. The report records the chunk count and the
+// longest wall time between the first write of a chunk and its commit.
+func (r *runner) writeChunked(root string, entries []artifactEntry, cards, adrs, evals int) error {
+	r.fillDefaults()
+	chunks := chunkEntries(entries, r.effectiveChunkSize())
+	pause := r.effectiveChunkPause()
+	var maxHeld time.Duration
+	for i, c := range chunks {
+		started := r.now()
+		for _, e := range c {
+			if derivedArtifact(e.path) {
+				// Keep the stdout listing unchanged while leaving the derived
+				// document off disk.
+				if !r.opts.Quiet {
+					fmt.Fprintln(r.out, " ", e.path)
+				}
+				continue
+			}
+			if err := r.writeFile(root, e.path, e.content); err != nil {
+				return err
+			}
+		}
+		held := r.now().Sub(started)
+		if held > maxHeld {
+			maxHeld = held
+		}
+		if r.opts.Commit && !r.opts.DryRun {
+			if err := r.commit(root, cards, adrs, evals); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintf(r.progress, chunkProgressFormat, i+1, len(chunks), len(c), held)
+		if i+1 < len(chunks) {
+			r.yield(pause)
+		}
+	}
+	if len(chunks) > 0 {
+		fmt.Fprintf(r.progress, chunkSummaryFormat, len(chunks), maxHeld)
+	}
+	return nil
 }
 
 func slug(s string) string {
@@ -908,6 +1035,18 @@ func commitArtifacts(root string, cards, adrs, evals int) error {
 	if err := add.Run(); err != nil {
 		return err
 	}
+	// CBX-06: a chunk or a closure pass can leave the index clean. git commit
+	// exits 1 in that case, which must not fail an otherwise successful run.
+	staged := exec.Command("git", "diff", "--cached", "--quiet")
+	staged.Dir = root
+	if err := staged.Run(); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) || exit.ExitCode() != 1 {
+			return err
+		}
+	} else {
+		return nil
+	}
 	commit := exec.Command("git", "commit", "-m",
 		fmt.Sprintf("docs: batch apply %d cards, %d ADRs, %d evals", cards, adrs, evals))
 	commit.Dir = root
@@ -918,6 +1057,7 @@ func commitArtifacts(root string, cards, adrs, evals int) error {
 // and subprocess work happens in this infra package, not in cmd.
 func Run(opts Options, out, errOut io.Writer) int {
 	r := &runner{opts: opts, out: out, err: errOut}
+	r.fillDefaults()
 	// ATX-13: a research document never authorizes a merge by itself. Require
 	// the owner flag before any file read or gh call in the merge path.
 	if opts.MergePlan && !opts.ConfirmMerge {
@@ -1099,28 +1239,18 @@ func Run(opts Options, out, errOut io.Writer) int {
 	r.printf(summaryReportFormat,
 		len(batches), len(adrs), len(cards), len(evals), len(closures))
 	r.printf(hashReportFormat, iterationHash(entries))
-	for _, e := range entries {
-		if derivedArtifact(e.path) {
-			// Keep the stdout listing unchanged while leaving the derived
-			// document off disk. The content stays available through --facts
-			// and through the iteration hash printed above.
-			if !r.opts.Quiet {
-				fmt.Fprintln(r.out, " ", e.path)
-			}
-			continue
-		}
-		if err := r.writeFile(root, e.path, e.content); err != nil {
-			r.errf("%v\n", err)
-			return 1
-		}
+	if err := r.writeChunked(root, entries, len(cards), len(adrs), len(evals)); err != nil {
+		r.errf("%v\n", err)
+		return 1
 	}
 	if err := r.applyClosures(root, closures); err != nil {
 		r.errf("%v\n", err)
 		return 1
 	}
-
+	// Closures land after the chunk commits. A final idempotent commit carries
+	// them without holding the lock across the whole write pass.
 	if opts.Commit && !opts.DryRun {
-		if err := commitArtifacts(root, len(cards), len(adrs), len(evals)); err != nil {
+		if err := r.commit(root, len(cards), len(adrs), len(evals)); err != nil {
 			r.errf("%v\n", err)
 			return 1
 		}
