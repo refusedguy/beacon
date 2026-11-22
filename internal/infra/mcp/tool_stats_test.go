@@ -42,6 +42,18 @@ func (f *registryStatsFake) RegistryStats(context.Context) (RegistryStats, error
 	return f.stats, f.err
 }
 
+// ciWaitSnapshotFake is a mock CI gate port. It returns one fixed snapshot and
+// counts calls, so a test can prove the handler reads the gate once per request.
+type ciWaitSnapshotFake struct {
+	snap  CIWaitSnapshot
+	calls int
+}
+
+func (f *ciWaitSnapshotFake) SharedGateSnapshot() CIWaitSnapshot {
+	f.calls++
+	return f.snap
+}
+
 func callStats(t *testing.T, handler *StatsHandler) StatsOutput {
 	t.Helper()
 	result, out, err := handler.Handle(context.Background(), nil, StatsInput{})
@@ -964,5 +976,71 @@ func TestStatsLimitIsToolError(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "200-loadError") || !strings.Contains(string(body), "fewer or shorter loadErrors") {
 		t.Fatalf("tool error text = %s, want the limit and the narrowing hint", body)
+	}
+}
+
+func TestStatsReportsSharedGateSnapshot(t *testing.T) {
+	gate := &ciWaitSnapshotFake{snap: CIWaitSnapshot{
+		Waiters:        map[string]int{"ci:org/repo/7/abc": 2},
+		CombinedRounds: 1,
+	}}
+	handler := NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()})
+	handler.SetSharedGateSnapshotReader(gate)
+	out := callStats(t, handler)
+
+	want := sharedGatePrefix + "activeWaiters=2 combinedRounds=1"
+	if got := sharedGateEntry(out); got != want {
+		t.Errorf("gate entry = %q, want %q", got, want)
+	}
+	signal := out.CIWaitSignal()
+	if !signal.Bound || signal.ActiveWaiters != 2 || signal.CombinedRounds != 1 {
+		t.Errorf("gate signal = %+v, want bound with 2 waiters and 1 combined round", signal)
+	}
+	if gate.calls != 1 {
+		t.Errorf("gate reads = %d, want 1", gate.calls)
+	}
+}
+
+func TestStatsEmptySharedGateSnapshotReportsZeros(t *testing.T) {
+	handler := NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()})
+	handler.SetSharedGateSnapshotReader(&ciWaitSnapshotFake{snap: CIWaitSnapshot{Waiters: map[string]int{}}})
+	out := callStats(t, handler)
+
+	want := sharedGatePrefix + "activeWaiters=0 combinedRounds=0"
+	if got := sharedGateEntry(out); got != want {
+		t.Errorf("gate entry = %q, want %q", got, want)
+	}
+	signal := ReadCIWaitSignal(out)
+	if !signal.Bound || signal.ActiveWaiters != 0 || signal.CombinedRounds != 0 {
+		t.Errorf("gate signal = %+v, want bound with zero waiters and zero rounds", signal)
+	}
+}
+
+func TestStatsWithoutSharedGateReaderKeepsLegacyResponse(t *testing.T) {
+	out := callStats(t, NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()}))
+	if got := sharedGateEntry(out); got != "" {
+		t.Errorf("gate entry = %q, want none", got)
+	}
+	if signal := out.CIWaitSignal(); signal.Bound {
+		t.Errorf("gate signal = %+v, want unbound", signal)
+	}
+}
+
+func TestStatsNilSharedGateReaderRemovesSnapshot(t *testing.T) {
+	handler := NewStatsHandler(&snapshotReaderFake{snap: sampleSnapshot()})
+	handler.SetSharedGateSnapshotReader(&ciWaitSnapshotFake{snap: CIWaitSnapshot{
+		Waiters: map[string]int{"ci:key": 3},
+	}})
+	handler.SetSharedGateSnapshotReader(nil)
+	out := callStats(t, handler)
+	if got := sharedGateEntry(out); got != "" {
+		t.Errorf("gate entry = %q, want none after nil binding", got)
+	}
+}
+
+func TestReadCIWaitSignalFailsClosedOnMalformedEntry(t *testing.T) {
+	out := StatsOutput{LoadErrors: []string{sharedGatePrefix + "activeWaiters=2"}}
+	if signal := ReadCIWaitSignal(out); signal.Bound {
+		t.Errorf("gate signal = %+v, want unbound for a partial entry", signal)
 	}
 }
