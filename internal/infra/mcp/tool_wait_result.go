@@ -529,6 +529,65 @@ func (t *memoryActionTrajectory) Records() []ActionTrajectoryRecord {
 	return out
 }
 
+// TerminalOutcomeRecord is one journal line: which Watch ended with which
+// cause. The cause comes from the SB-05 table, so this adds no second enum.
+type TerminalOutcomeRecord struct {
+	WatchID string
+	Cause   ExitStatusCause
+	At      time.Time
+}
+
+// TerminalOutcomeJournal is the sink for terminal causes. Counts groups the
+// recorded lines by cause, so stats reads the journal and keeps no second
+// counter. The in-memory implementation below is the default.
+type TerminalOutcomeJournal interface {
+	RecordTerminalOutcome(TerminalOutcomeRecord)
+	Records() []TerminalOutcomeRecord
+	Counts() map[ExitStatusCause]int
+}
+
+type memoryTerminalOutcomeJournal struct {
+	mu      sync.Mutex
+	records []TerminalOutcomeRecord
+}
+
+// NewMemoryTerminalOutcomeJournal builds the in-process outcome journal.
+func NewMemoryTerminalOutcomeJournal() TerminalOutcomeJournal {
+	return &memoryTerminalOutcomeJournal{}
+}
+
+func (j *memoryTerminalOutcomeJournal) RecordTerminalOutcome(record TerminalOutcomeRecord) {
+	if j == nil || !record.Cause.valid() {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.records = append(j.records, record)
+}
+
+// Records returns a snapshot of the journal in insertion order.
+func (j *memoryTerminalOutcomeJournal) Records() []TerminalOutcomeRecord {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]TerminalOutcomeRecord, len(j.records))
+	copy(out, j.records)
+	return out
+}
+
+// Counts groups the recorded causes. A cause with no Watch is absent from the
+// map, so a reader never reports a group that was not observed.
+func (j *memoryTerminalOutcomeJournal) Counts() map[ExitStatusCause]int {
+	records := j.Records()
+	out := make(map[ExitStatusCause]int, len(records))
+	for _, record := range records {
+		out[record.Cause]++
+	}
+	return out
+}
+
 // MarshalJSON writes a WaitResultOutput in the fixed order above. encoding/json
 // marshals struct fields in declaration order and map keys in sorted order,
 // but spelling the order out here keeps it a deliberate, testable contract
@@ -1255,6 +1314,7 @@ type WaitResultService struct {
 	precheckJournal  PrecheckJournal
 	infraJournal     domain.InfraFailureJournal
 	actionTrajectory ActionTrajectory
+	terminalJournal  TerminalOutcomeJournal
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -1278,6 +1338,7 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		precheckJournal:  NewMemoryPrecheckJournal(),
 		infraJournal:     NewMemoryInfraFailureJournal(),
 		actionTrajectory: NewMemoryActionTrajectory(),
+		terminalJournal:  NewMemoryTerminalOutcomeJournal(),
 	}
 }
 
@@ -1425,6 +1486,55 @@ func (s *WaitResultService) RecordActionAttempt(rec ActionTrajectoryRecord) {
 		rec.At = s.now()
 	}
 	s.ActionTrajectory().RecordActionAttempt(rec)
+}
+
+// SetTerminalOutcomeJournal installs the sink for terminal causes. A nil
+// argument restores the in-memory journal. A durable sink belongs in the app
+// layer; this package owns only the port and the default.
+func (s *WaitResultService) SetTerminalOutcomeJournal(j TerminalOutcomeJournal) {
+	if s == nil {
+		return
+	}
+	if j == nil {
+		j = NewMemoryTerminalOutcomeJournal()
+	}
+	s.terminalJournal = j
+}
+
+// TerminalOutcomeJournal returns the configured sink. It is never nil for a
+// service built by NewWaitResultService.
+func (s *WaitResultService) TerminalOutcomeJournal() TerminalOutcomeJournal {
+	if s == nil || s.terminalJournal == nil {
+		return NewMemoryTerminalOutcomeJournal()
+	}
+	return s.terminalJournal
+}
+
+// RecordTerminalOutcome writes one cause to the outcome journal and stamps the
+// same cause on out. It leaves partial diff, WaitStopReason, verdict, status
+// and exit code untouched, so the SB-05 rescue path still reads its own fields
+// and the orchestrator wake rules stay the same.
+func (s *WaitResultService) RecordTerminalOutcome(watchID string, cause ExitStatusCause, at time.Time, out WaitResultOutput) WaitResultOutput {
+	if !cause.valid() {
+		return out
+	}
+	if s != nil {
+		if at.IsZero() {
+			at = s.now()
+		}
+		s.TerminalOutcomeJournal().RecordTerminalOutcome(TerminalOutcomeRecord{
+			WatchID: watchID, Cause: cause, At: at,
+		})
+	}
+	// Reuse the SB-05 carry-through with an empty diff. The cause reaches the
+	// wire as exit_cause without a second field in the advertised schema.
+	return WithTerminalFailure(out, cause, "")
+}
+
+// TerminalOutcomeCounts groups the journal by cause. A stats reader calls this
+// instead of maintaining its own counter.
+func (s *WaitResultService) TerminalOutcomeCounts() map[ExitStatusCause]int {
+	return s.TerminalOutcomeJournal().Counts()
 }
 
 // ClassifyInfraText runs the advisory classifier over text the harness already
