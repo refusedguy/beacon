@@ -269,6 +269,20 @@ func (b *wakeDispatcher) openBreaker(s *adapterBreaker, now time.Time) {
 	s.probeInFlight = false
 }
 
+// actionableWakeVerdict reports whether a verdict carries an instruction the
+// subscriber must carry out. Losing one of these pointers leaves the Watch
+// stuck with no owner, so they go out even while the adapter breaker is OPEN.
+// Informational and terminal verdicts keep the breaker protection.
+func actionableWakeVerdict(v domain.Verdict) bool {
+	switch v {
+	case domain.VerdictKeepWorking, domain.VerdictRebase, domain.VerdictRetry,
+		domain.VerdictBlocked, domain.VerdictTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
 // wakeOne validates the address, applies the wake cap, checks the per-adapter
 // circuit breaker, delivers the pointer and records the attempt. A dead-session
 // error marks the subscriber orphaned and escalates to the orchestrator once;
@@ -288,9 +302,12 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		return
 	}
 	adapter := breakerAdapterKey(sub)
-	// A replay (or a forced chaos wake) carries breaker=false. It must not
-	// spend the HALF_OPEN probe slot that the triggering wake already took.
-	if breaker && !b.breakerPermit(adapter, now) {
+	// An actionable verdict must reach its subscriber even when the adapter is
+	// down, so it takes the breaker=false path. A replay or a forced chaos wake
+	// already carries breaker=false and likewise must not spend a HALF_OPEN
+	// probe slot that some other wake owns.
+	useBreaker := breaker && !actionableWakeVerdict(w.Verdict)
+	if useBreaker && !b.breakerPermit(adapter, now) {
 		// An OPEN breaker used to drop the pointer on the floor. Park the wake
 		// with its full payload and count the skip in the durable failure
 		// counter, so the wake is replayed when the adapter can deliver again.
@@ -302,7 +319,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		b.recordBreakerFailure(adapter, now)
 		return
 	}
-	b.drainDeferred(ctx, adapter, w, sub, now, cycleID)
+	b.drainDeferred(ctx, adapter, w, sub, now, cycleID, useBreaker)
 	p := domain.WakePayload{
 		WatchID:      w.ID,
 		ObligationID: domain.ObligationKey(w.ID, w.Revision, sub.ID),
@@ -335,7 +352,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 			// backend failure, so ignoreExceptions keeps the breaker closed.
 			outcome = domain.OutcomeIndeterminate
 			b.breakerIgnore(adapter)
-		} else {
+		} else if useBreaker {
 			b.breakerRecord(adapter, now, true)
 		}
 		b.recordDelivery(ctx, p.ObligationID, attempt, outcome, now)
@@ -353,7 +370,9 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		}
 		return
 	}
-	b.breakerRecord(adapter, now, false)
+	if useBreaker {
+		b.breakerRecord(adapter, now, false)
+	}
 	observe.WakeDuration(sub.Adapter, time.Since(start))
 	observe.WakeDelivered(sub.Adapter, w.ID, w.Revision)
 	observe.WakeOutcomeCorrelated(sub.Adapter, observe.WakeOutcomePosted, w.ID, observe.Fields{
@@ -371,14 +390,24 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 	}, observe.Fields{"sessionID": target})
 }
 
-// drainDeferred replays wakes parked while the adapter breaker was OPEN. It
-// runs after a permit was granted, so the adapter can deliver again. Replays
-// bypass the breaker: the wake that triggered the drain already owns the probe
-// slot, and the parked wakes waited out the open window. A parked wake for the
-// same obligation as the current wake is skipped, since both carry the pointer.
-func (b *wakeDispatcher) drainDeferred(ctx context.Context, adapter string, w domain.Watch, sub domain.Subscriber, now time.Time, cycleID string) {
+// drainDeferred replays parked wakes when a wake is being delivered on the
+// same adapter. permitHeld says that the current wake already owns a breaker
+// permit; otherwise the replay takes and releases its own permit.
+func (b *wakeDispatcher) drainDeferred(ctx context.Context, adapter string, w domain.Watch, sub domain.Subscriber, now time.Time, cycleID string, permitHeld bool) {
+	var current string
+	if w.ID != "" && sub.ID != "" {
+		current = domain.ObligationKey(w.ID, w.Revision, sub.ID)
+	}
+	b.replayDeferred(ctx, adapter, now, cycleID, current, permitHeld)
+}
+
+// replayDeferred replays every parked wake of one adapter. A replay wake has
+// breaker=false, so this method accounts for the permit itself when the caller
+// did not already hold one. Entries that still fail delivery are returned to
+// the queue and the durable marker stays pending for the next Refresh.
+func (b *wakeDispatcher) replayDeferred(ctx context.Context, adapter string, now time.Time, cycleID, skipKey string, permitHeld bool) {
 	b.deferredMu.Lock()
-	if b.draining {
+	if b.draining || len(b.deferred[adapter]) == 0 {
 		b.deferredMu.Unlock()
 		return
 	}
@@ -390,20 +419,64 @@ func (b *wakeDispatcher) drainDeferred(ctx context.Context, adapter string, w do
 		b.deferredMu.Unlock()
 	}()
 
-	current := domain.ObligationKey(w.ID, w.Revision, sub.ID)
+	if !permitHeld && !b.breakerPermit(adapter, now) {
+		return
+	}
+	failed := make([]deferredWake, 0)
 	for _, dw := range b.takeDeferred(adapter) {
-		if domain.ObligationKey(dw.watchID, dw.revision, dw.subscriberID) == current {
+		if skipKey != "" && domain.ObligationKey(dw.watchID, dw.revision, dw.subscriberID) == skipKey {
 			continue
 		}
 		if dw.watch.ID == "" || dw.subscriber.ID == "" {
+			continue
+		}
+		// A marker or delivered pointer from a previous replay wins over a
+		// duplicate queue entry, so the same obligationID is delivered once.
+		if b.deferredDelivered(dw) {
+			b.markDeferredDelivered(dw, now)
 			continue
 		}
 		replayCycle := dw.cycleID
 		if replayCycle == "" {
 			replayCycle = cycleID
 		}
+		before := b.wakeCount(dw.watch, dw.subscriber.ID)
 		b.wakeOne(ctx, dw.watch, dw.subscriber, dw.text, now, replayCycle, false)
+		// A successful delivery advances the durable wake counter even when the
+		// caller never staged an obligation for this revision. That keeps the
+		// marker closed in both production and thin harness setups.
+		if b.deferredDelivered(dw) || b.wakeCount(dw.watch, dw.subscriber.ID) > before {
+			b.markDeferredDelivered(dw, now)
+			continue
+		}
+		failed = append(failed, dw)
 	}
+	if len(failed) > 0 {
+		b.deferredMu.Lock()
+		b.deferred[adapter] = append(failed, b.deferred[adapter]...)
+		b.deferredMu.Unlock()
+	}
+	if !permitHeld {
+		b.breakerRecord(adapter, now, len(failed) > 0)
+	}
+}
+
+// deferredDelivered reports whether a parked wake reached its subscriber. The
+// marker is closed after a successful replay, but the delivery itself lands on
+// the ordinary obligation, so either fact is enough to suppress a duplicate.
+func (b *wakeDispatcher) deferredDelivered(dw deferredWake) bool {
+	if o, err := b.store.Obligation(deferredWakeID(dw)); err == nil && !o.DeliveredAt.IsZero() {
+		return true
+	}
+	id := domain.ObligationKey(dw.watchID, dw.revision, dw.subscriberID)
+	if o, err := b.store.Obligation(id); err == nil && !o.DeliveredAt.IsZero() {
+		return true
+	}
+	return false
+}
+
+func (b *wakeDispatcher) markDeferredDelivered(dw deferredWake, now time.Time) {
+	b.markDelivered(deferredWakeID(dw), now, 1, "")
 }
 
 // wakeCap returns the effective wake limit of a Watch. A zero or negative
