@@ -449,6 +449,12 @@ func (b *BatchProvider) mergeWithRunner(ctx context.Context, owner, repo string,
 			strings.Contains(hint, "failed to merge") || strings.Contains(hint, "head branch was modified") {
 			return false, true, MergeHeldRefused, nil
 		}
+		if strings.Contains(hint, "already in progress") {
+			// GitHub accepted the merge and is still applying it. A second
+			// `gh pr merge` only adds noise, so read the resulting state. The
+			// caller closes the Watch only if state is already MERGED.
+			return b.confirmMerge(ctx, owner+"/"+repo, pr)
+		}
 		return false, false, "", fmt.Errorf("gh merge %s/%s#%d: %w", owner, repo, pr, err)
 	}
 	return b.confirmMerge(ctx, owner+"/"+repo, pr)

@@ -126,6 +126,39 @@ func runGH(ctx context.Context, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, "gh", args...).Output()
 }
 
+// transientErrorPatterns are the error texts gh and net/http use for failures
+// that leave PR state unchanged. Retrying one of these cannot double-merge:
+// the orchestrator ledger still keys the decision on (watchID, revision).
+var transientErrorPatterns = []string{
+	"tls handshake timeout",
+	"eof",
+	"connection reset",
+	"connection refused",
+	"bad gateway",
+	"http 502",
+	"rate limit",
+	"rate_limited",
+}
+
+// IsTransientError reports whether err is a short-lived transport or GitHub
+// failure worth one more attempt. TLS handshake timeouts, EOF, connection
+// resets, HTTP 502 and rate limits match. "Merge already in progress" does
+// not: that merge is running, so the caller confirms state instead of writing
+// again. Keeping the classifier here lets both merge paths share one rule
+// without making infra packages import each other.
+func IsTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	for _, pattern := range transientErrorPatterns {
+		if strings.Contains(text, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
 // throttleError is returned while a PR is in backoff. It deliberately reaches
 // cibridge as an error: publishing a verdict from a stale observation while gh
 // is failing could merge a PR whose checks changed.

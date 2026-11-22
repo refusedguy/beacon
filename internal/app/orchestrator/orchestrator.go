@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"time"
 
 	// ARDH-15: observe is the documented cross-cutting exception. Metrics are
 	// emitted at the decision sites; a port through every call would add noise
 	// without moving an adapter.
+	"github.com/refusedguy/beacon/internal/infra/ghci"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
@@ -476,6 +478,81 @@ func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyRe
 	observe.FixerSpawned(w.ID)
 }
 
+// mergeRetryMaxAttempts counts the first call and every retry. Three attempts
+// keep one transient TLS failure from leaving a ready Watch untouched while
+// bounding the time a single pass can spend on one PR.
+const (
+	mergeRetryMaxAttempts = 3
+	mergeRetryBaseDelay   = 200 * time.Millisecond
+	mergeRetryMaxDelay    = 2 * time.Second
+)
+
+// mergeRetrySleep is a seam for callers and tests that need a bounded pass.
+// Production waits on the context so a shutdown interrupts a backoff.
+var mergeRetrySleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// mergeRetryDelay returns an exponential delay with full jitter. Jitter stops
+// several Watches whose merges failed in the same tick from retrying in
+// lockstep and producing another burst of TLS timeouts.
+func mergeRetryDelay(attempt int) time.Duration {
+	d := mergeRetryBaseDelay << (attempt - 1)
+	if d > mergeRetryMaxDelay {
+		d = mergeRetryMaxDelay
+	}
+	half := d / 2
+	return half + time.Duration(rand.Int63n(int64(half)+1))
+}
+
+// retryTransient calls call until it succeeds, returns a non-transient error,
+// or exhausts the bounded budget. Only errors that ghci classifies as
+// transport-level are retried. A merge refusal or a conflict is never retried.
+func retryTransient[T any](ctx context.Context, call func() (T, error)) (T, error) {
+	var zero T
+	for attempt := 1; attempt <= mergeRetryMaxAttempts; attempt++ {
+		value, err := call()
+		if err == nil || !ghci.IsTransientError(err) {
+			return value, err
+		}
+		if attempt == mergeRetryMaxAttempts {
+			return value, err
+		}
+		if sleepErr := mergeRetrySleep(ctx, mergeRetryDelay(attempt)); sleepErr != nil {
+			return value, sleepErr
+		}
+	}
+	return zero, nil
+}
+
+// recordMergeFailure is the single exit for a merge that failed after its
+// budget. A transient failure earns an explicit WARN event. Without it a
+// Watch still marked ready looks healthy although no retry is left.
+func recordMergeFailure(w Watch, command string, err error, out *Result, errs *[]error) {
+	observe.MergeFailure(w.ID, w.PR, err)
+	observe.ActorError("merger", w.ID, err)
+	if ghci.IsTransientError(err) {
+		observe.Event(observe.LevelWarn, "merge_retry_exhausted", observe.Fields{
+			observe.FieldWatchID: w.ID,
+			observe.FieldPR:      w.PR,
+			observe.FieldError:   err.Error(),
+			"attempts":           mergeRetryMaxAttempts,
+		})
+	}
+	out.Actions = append(out.Actions, Action{
+		Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+		Command: command, Message: err.Error(),
+	})
+	*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
+}
+
 // mergeOne performs the idempotent merge branch for one ready Watch. A
 // CheckedMerger passed in Options owns the gh mergeability gate and the
 // post-merge state confirmation; without one the Merger is trusted on its
@@ -521,14 +598,10 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 		mergeCheckedOne(ctx, st, checked, w, command, out, errs)
 		return
 	}
-	if err := merger.Merge(ctx, w.Repo, w.PR); err != nil {
-		observe.MergeFailure(w.ID, w.PR, err)
-		observe.ActorError("merger", w.ID, err)
-		out.Actions = append(out.Actions, Action{
-			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
-			Command: command, Message: err.Error(),
-		})
-		*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
+	if _, err := retryTransient(ctx, func() (struct{}, error) {
+		return struct{}{}, merger.Merge(ctx, w.Repo, w.PR)
+	}); err != nil {
+		recordMergeFailure(w, command, err, out, errs)
 		return
 	}
 	confirmMerge(ctx, st, w, command, out, errs)
@@ -538,16 +611,12 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 // confirmed MERGE closes the Watch; a held or pending PR is reported without
 // an error so a dirty PR does not produce a multi-line gh hint on every pass.
 func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watch, command string, out *Result, errs *[]error) {
-	outcome, err := merger.MergeChecked(ctx, w.Repo, w.PR)
+	outcome, err := retryTransient(ctx, func() (MergeOutcome, error) {
+		return merger.MergeChecked(ctx, w.Repo, w.PR)
+	})
 	if err != nil {
-		observe.MergeFailure(w.ID, w.PR, err)
-		observe.ActorError("merger", w.ID, err)
 		log.Printf("orchestrator: merge PR %d: %v", w.PR, err)
-		out.Actions = append(out.Actions, Action{
-			Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
-			Command: command, Message: err.Error(),
-		})
-		*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
+		recordMergeFailure(w, command, err, out, errs)
 		return
 	}
 	switch {
