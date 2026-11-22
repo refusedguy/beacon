@@ -220,7 +220,7 @@ func (c *PRClient) MergePR(ctx context.Context, owner, repo string, number int, 
 	if pr == nil {
 		return PRMergeResult{Reason: "empty merge response"}, errors.New("github merge PR: empty merge response")
 	}
-	result := PRMergeResult{Merged: pr.GetMerged(), SHA: pr.GetMergeCommitSHA()}
+	result := PRMergeResult{Merged: pr.GetMerged(), SHA: pr.GetSHA()}
 	if !result.Merged {
 		result.Reason = "merge not confirmed: merged=false"
 		return result, errors.New("github merge PR: " + result.Reason)
