@@ -252,18 +252,120 @@ type WatchEvent struct {
 	Phases map[string]string `json:"phases,omitempty"`
 }
 
+// The beacon_list_running response declares its watch shape in this package.
+// Before BCX-45 the output schema reflected domain.Watch, so a field added to
+// the domain reached tools/list without a decision here. Each DTO below mirrors
+// a domain type field for field. Exposing a new domain field now means editing
+// the DTO, its conversion and the golden schema in the same change.
+type CheckOutput struct {
+	State      string `json:"state"`
+	Conclusion string `json:"conclusion"`
+	Required   bool   `json:"required"`
+	DetailsURL string `json:"detailsUrl"`
+}
+
+type MergeInfoOutput struct {
+	Mergeable        string `json:"mergeable"`
+	MergeStateStatus string `json:"mergeStateStatus"`
+	ReviewDecision   string `json:"reviewDecision"`
+}
+
+type FlakyConfigOutput struct {
+	Names      []string       `json:"names"`
+	MaxRetries int            `json:"maxRetries"`
+	Used       map[string]int `json:"used"`
+}
+
+type PolicyOutput struct {
+	RequireUpToDate  bool `json:"requireUpToDate"`
+	IgnoreReviews    bool `json:"ignoreReviews"`
+	MaxWakesPerWatch int  `json:"maxWakesPerWatch"`
+	MaxRebases       int  `json:"maxRebases,omitempty"`
+}
+
+type MergePolicyOutput struct {
+	AutoMerge       bool     `json:"autoMerge"`
+	RequireApproval bool     `json:"requireApproval"`
+	WaitFor         []string `json:"waitFor"`
+	WaitForMain     []string `json:"waitForMain"`
+}
+
+type SubscriberOutput struct {
+	ID             string             `json:"id"`
+	Role           domain.Role        `json:"role"`
+	Adapter        string             `json:"adapter"`
+	Target         string             `json:"target"`
+	OrchestratorID string             `json:"orchestratorID,omitempty"`
+	FixFor         string             `json:"fixFor,omitempty"`
+	Phase          domain.WorkerPhase `json:"phase,omitempty"`
+	LastWakeAt     time.Time          `json:"lastWakeAt,omitempty"`
+	LastError      string             `json:"lastError,omitempty"`
+	AddedAt        time.Time          `json:"addedAt"`
+	LastActivity   time.Time          `json:"lastActivity"`
+}
+
+type BlockedInfoOutput struct {
+	Reason       string    `json:"reason"`
+	FailedChecks []string  `json:"failedChecks,omitempty"`
+	Since        time.Time `json:"since"`
+	BlockedBy    string    `json:"blockedBy"`
+	FixAttempts  int       `json:"fixAttempts,omitempty"`
+}
+
+type DescentOutput struct {
+	Layer      domain.DepthLayer `json:"layer"`
+	Hypothesis string            `json:"hypothesis,omitempty"`
+	Falsifier  string            `json:"falsifier,omitempty"`
+	Evidence   string            `json:"evidence,omitempty"`
+	Steps      int               `json:"steps"`
+}
+
+// WatchOutput is one watch row of beacon_list_running. It repeats the JSON
+// field names and types of domain.Watch, but the field set lives here. A field
+// added to the domain stays out of tools/list until someone adds it here,
+// converts it and updates the golden schema.
+type WatchOutput struct {
+	ID             string                 `json:"id"`
+	Repo           string                 `json:"repo"`
+	PR             int                    `json:"pr"`
+	HeadSHA        string                 `json:"headSHA"`
+	BaseRef        string                 `json:"baseRef"`
+	Issue          string                 `json:"issue"`
+	Status         domain.Status          `json:"status"`
+	Verdict        domain.Verdict         `json:"verdict"`
+	Blocked        *BlockedInfoOutput     `json:"blocked,omitempty"`
+	Revision       uint64                 `json:"revision"`
+	Checks         map[string]CheckOutput `json:"checks"`
+	Merge          MergeInfoOutput        `json:"merge"`
+	Flaky          FlakyConfigOutput      `json:"flaky"`
+	Policy         PolicyOutput           `json:"policy"`
+	MergePolicy    MergePolicyOutput      `json:"mergePolicy"`
+	Subscribers    []SubscriberOutput     `json:"subscribers"`
+	OrchestratorID string                 `json:"orchestratorID,omitempty"`
+	FixFor         string                 `json:"fixFor,omitempty"`
+	BlockerID      string                 `json:"blockerID,omitempty"`
+	FixBlockerID   string                 `json:"fixBlockerID,omitempty"`
+	DeadlineAt     time.Time              `json:"deadlineAt"`
+	NoChecksSince  time.Time              `json:"noChecksSince"`
+	CreatedAt      time.Time              `json:"createdAt"`
+	ClosedAt       time.Time              `json:"closedAt"`
+	CloseReason    string                 `json:"closeReason"`
+	ConfigID       string                 `json:"configId,omitempty"`
+	Depth          *DescentOutput         `json:"depth,omitempty"`
+}
+
 // ListRunningOutput is the response of beacon_list_running. Status and Cursor
 // replace a replayed history: a subscriber that lost its connection continues
 // from Cursor and receives only WatchEvent values newer than it. Once Status
 // is terminal, Verdict is set and Events is empty, so the verdict is obtained
 // without replaying old events (ADR 0025).
 type ListRunningOutput struct {
-	Counts  WatchCounts    `json:"counts"`
-	Watches []domain.Watch `json:"watches"`
-	Status  string         `json:"status"`
-	Cursor  string         `json:"cursor"`
-	Events  []WatchEvent   `json:"events,omitempty"`
-	Verdict string         `json:"verdict,omitempty"`
+	Counts  WatchCounts   `json:"counts"`
+	Watches []WatchOutput `json:"watches"`
+	Status  string        `json:"status"`
+	Cursor  string        `json:"cursor"`
+	Events  []WatchEvent  `json:"events,omitempty"`
+	Verdict string        `json:"verdict,omitempty"`
 }
 
 // ThreadMessage is one item of a thread history read by t3_thread_read.

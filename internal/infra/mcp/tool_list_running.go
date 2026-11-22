@@ -552,6 +552,128 @@ func subscriberPhases(w domain.Watch) map[string]string {
 	return phases
 }
 
+// watchOutput copies one domain Watch into the explicit MCP DTO. A nil slice
+// or map stays nil so the JSON output keeps the same null values as before.
+// Fields the DTO does not declare are dropped, so a new domain field stays out
+// of tools/list until someone adds it here and updates the golden schema.
+func watchOutput(w domain.Watch) WatchOutput {
+	out := WatchOutput{
+		ID:       w.ID,
+		Repo:     w.Repo,
+		PR:       w.PR,
+		HeadSHA:  w.HeadSHA,
+		BaseRef:  w.BaseRef,
+		Issue:    w.Issue,
+		Status:   w.Status,
+		Verdict:  w.Verdict,
+		Revision: w.Revision,
+		Merge: MergeInfoOutput{
+			Mergeable:        w.Merge.Mergeable,
+			MergeStateStatus: w.Merge.MergeStateStatus,
+			ReviewDecision:   w.Merge.ReviewDecision,
+		},
+		Flaky: FlakyConfigOutput{
+			Names:      cloneStrings(w.Flaky.Names),
+			MaxRetries: w.Flaky.MaxRetries,
+		},
+		Policy: PolicyOutput{
+			RequireUpToDate:  w.Policy.RequireUpToDate,
+			IgnoreReviews:    w.Policy.IgnoreReviews,
+			MaxWakesPerWatch: w.Policy.MaxWakesPerWatch,
+			MaxRebases:       w.Policy.MaxRebases,
+		},
+		MergePolicy: MergePolicyOutput{
+			AutoMerge:       w.MergePolicy.AutoMerge,
+			RequireApproval: w.MergePolicy.RequireApproval,
+			WaitFor:         cloneStrings(w.MergePolicy.WaitFor),
+			WaitForMain:     cloneStrings(w.MergePolicy.WaitForMain),
+		},
+		OrchestratorID: w.OrchestratorID,
+		FixFor:         w.FixFor,
+		BlockerID:      w.BlockerID,
+		FixBlockerID:   w.FixBlockerID,
+		DeadlineAt:     w.DeadlineAt,
+		NoChecksSince:  w.NoChecksSince,
+		CreatedAt:      w.CreatedAt,
+		ClosedAt:       w.ClosedAt,
+		CloseReason:    w.CloseReason,
+		ConfigID:       w.ConfigID,
+	}
+	if w.Blocked != nil {
+		out.Blocked = &BlockedInfoOutput{
+			Reason:       w.Blocked.Reason,
+			FailedChecks: cloneStrings(w.Blocked.FailedChecks),
+			Since:        w.Blocked.Since,
+			BlockedBy:    w.Blocked.BlockedBy,
+			FixAttempts:  w.Blocked.FixAttempts,
+		}
+	}
+	if w.Checks != nil {
+		out.Checks = make(map[string]CheckOutput, len(w.Checks))
+		for name, check := range w.Checks {
+			out.Checks[name] = CheckOutput{
+				State:      check.State,
+				Conclusion: check.Conclusion,
+				Required:   check.Required,
+				DetailsURL: check.DetailsURL,
+			}
+		}
+	}
+	if w.Flaky.Used != nil {
+		out.Flaky.Used = make(map[string]int, len(w.Flaky.Used))
+		for name, used := range w.Flaky.Used {
+			out.Flaky.Used[name] = used
+		}
+	}
+	if w.Subscribers != nil {
+		out.Subscribers = make([]SubscriberOutput, 0, len(w.Subscribers))
+		for _, sub := range w.Subscribers {
+			out.Subscribers = append(out.Subscribers, SubscriberOutput{
+				ID:             sub.ID,
+				Role:           sub.Role,
+				Adapter:        sub.Adapter,
+				Target:         sub.Target,
+				OrchestratorID: sub.OrchestratorID,
+				FixFor:         sub.FixFor,
+				Phase:          sub.Phase,
+				LastWakeAt:     sub.LastWakeAt,
+				LastError:      sub.LastError,
+				AddedAt:        sub.AddedAt,
+				LastActivity:   sub.LastActivity,
+			})
+		}
+	}
+	if w.Depth != nil {
+		out.Depth = &DescentOutput{
+			Layer:      w.Depth.Layer,
+			Hypothesis: w.Depth.Hypothesis,
+			Falsifier:  w.Depth.Falsifier,
+			Evidence:   w.Depth.Evidence,
+			Steps:      w.Depth.Steps,
+		}
+	}
+	return out
+}
+
+// cloneStrings keeps nil nil. A fresh Watch emits null for its optional string
+// lists, so copying with append would change the JSON from null to an empty
+// array.
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
+
+// watchOutputs converts a page of domain watches into DTO rows in order.
+func watchOutputs(in []domain.Watch) []WatchOutput {
+	out := make([]WatchOutput, 0, len(in))
+	for _, w := range in {
+		out = append(out, watchOutput(w))
+	}
+	return out
+}
+
 // Handle reads a snapshot and projects it onto counts, a watch array and a
 // cursor-delimited event stream. Every counter is derived from the returned
 // array, so counts stay consistent with watches for any filter. With an empty
@@ -652,7 +774,7 @@ func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest
 			ByVerdict:   byVerdict,
 			Subscribers: subscribers,
 		},
-		Watches: watches,
+		Watches: watchOutputs(watches),
 		Status:  aggregateStatus(events),
 		Cursor:  encodeEventCursor(uint64(len(events))),
 		Events:  newEvents,

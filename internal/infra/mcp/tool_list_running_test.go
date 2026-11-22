@@ -139,7 +139,7 @@ func TestListRunningKeepsBlockedAndOrphanedOnRadar(t *testing.T) {
 	if out.Counts.Watches != 2 {
 		t.Fatalf("counts.watches = %d, want 2 (blocked Watch must stay on radar)", out.Counts.Watches)
 	}
-	var found *domain.Watch
+	var found *WatchOutput
 	for i := range out.Watches {
 		if out.Watches[i].ID == blocked.ID {
 			found = &out.Watches[i]
