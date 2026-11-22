@@ -458,6 +458,8 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	failed := collectFailedChecks(w)
 	excerpt, excerptTruncated, excerptLogURL := h.attachFailureExcerpts(ctx, w, failed)
 	action, command, hint := nextStepFor(w.Verdict)
+	// The projection fills the seven required fields and the optional ones the
+	// Watch supports. ADR 0094 lists the full field set and each field's purpose.
 	out := GetResultOutput{
 		Status:                  string(w.Status),
 		Verdict:                 string(w.Verdict),

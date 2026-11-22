@@ -103,14 +103,24 @@ const (
 	RetryCommand  = "gh run rerun --failed"
 )
 
-// GetResultOutput is the response of beacon_get_result. The five trailing
-// fields describe the MCP task dialect form and are absent for a plain client
-// whose call finishes before --after. They are chosen at the MCP boundary,
-// never by the domain: ADR 0031 §2 and ADR 0003 keep protocol versions out of
-// the core, and LegacyProtocolVersions still excludes 2026-07-28.
+// GetResultOutput is the response of beacon_get_result. ADR 0094 lists every
+// field and its purpose, so a client can read the contract in one place.
+//
+// The first seven fields are required and appear in every response. The rest
+// are optional and carry the omitempty tag. A client must ignore fields it
+// does not know, since a new optional field may arrive without a version bump.
+//
+// The task dialect fields (resultType, taskId, jobID, taskStatus,
+// pollIntervalMs, instructions) describe the MCP task form. A plain client
+// whose call finishes before --after does not see them. The MCP boundary, not
+// the domain, chooses them: ADR 0031 §2 and ADR 0003 keep protocol versions out
+// of the core, and LegacyProtocolVersions still excludes 2026-07-28.
 //
 // nextAction, nextCommand and nextHint are the self-teaching part of the
-// response: the tool tells the caller the one step that follows this verdict.
+// response. The tool tells the caller the one step that follows this verdict.
+// failureExcerpt, failureExcerptTruncated and failureExcerptLogUrl report
+// failed check output and a link to the full CI log (W11-B, ATX-36). configId
+// carries the Watch configuration identity (ADR 0087, T5.36).
 type GetResultOutput struct {
 	Status       string        `json:"status"`
 	Verdict      string        `json:"verdict"`
