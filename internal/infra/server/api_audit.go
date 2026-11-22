@@ -276,24 +276,27 @@ func decodeAuditCursor(s string) (int, error) {
 }
 
 var (
-	// These patterns match the store's redaction filter. The projection cannot
-	// import the store (both are infra), so it keeps its own copy at the
-	// boundary where entries leave the process.
-	auditTokenRE = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
-	auditAuthRE  = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
-	auditCredRE  = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
+	// These patterns mirror the store's redaction filter for GitHub tokens,
+	// Telegram bot tokens, Authorization credentials and URL credentials.
+	// The projection cannot import the store (both are infra), so it keeps
+	// its own copy at the boundary where entries leave the process.
+	auditTokenRE    = regexp.MustCompile(`(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})`)
+	auditTelegramRE = regexp.MustCompile(`[0-9]+:[A-Za-z0-9_-]{35}`)
+	auditAuthRE     = regexp.MustCompile(`(?i)(authorization["'[:space:]]*[:=]["'[:space:]]*)(?:(?:bearer|token|basic)[[:space:]]+)?[A-Za-z0-9._~+/=-]+`)
+	auditCredRE     = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.-]*://)[^/@[:space:]:]+:[^/@[:space:]]+@`)
 
 	// auditRedacted is the marker that replaces a secret in the export.
 	auditRedacted = "[REDACTED]"
 )
 
-// redactAuditString removes tokens, Authorization credentials and URL
-// credentials from s. It never mutates its input.
+// redactAuditString removes GitHub and Telegram tokens, Authorization
+// credentials and URL credentials from s. It never mutates its input.
 func redactAuditString(s string) string {
 	if s == "" {
 		return s
 	}
 	out := auditTokenRE.ReplaceAllString(s, auditRedacted)
+	out = auditTelegramRE.ReplaceAllString(out, auditRedacted)
 	out = auditAuthRE.ReplaceAllString(out, "${1}"+auditRedacted)
 	return auditCredRE.ReplaceAllString(out, "${1}"+auditRedacted+"@")
 }

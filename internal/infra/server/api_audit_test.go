@@ -193,6 +193,38 @@ func TestAuditPageRedactsTokens(t *testing.T) {
 	}
 }
 
+func TestAuditPageRedactsTelegramBotToken(t *testing.T) {
+	botToken := "123456789:" + strings.Repeat("a", 35)
+	entries := []AuditEntry{{
+		Actor:     "ses_" + botToken,
+		CommandID: "cmd-" + botToken,
+		Action:    "approve " + botToken,
+		Ingress:   AuditIngress(botToken),
+		At:        auditBase,
+	}}
+
+	page, err := NewAuditProjection(&stubAuditReader{entries: entries}).Page(context.Background(), AuditQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), botToken) {
+		t.Fatalf("audit export leaked the Telegram bot token: %s", raw)
+	}
+	got := page.Entries[0]
+	if !strings.Contains(got.Actor, auditRedacted) || !strings.Contains(got.CommandID, auditRedacted) ||
+		!strings.Contains(got.Action, auditRedacted) || !strings.Contains(string(got.Ingress), auditRedacted) {
+		t.Fatalf("redacted entry = %+v, want a marker in every secret-bearing field", got)
+	}
+	if got.Actor == entries[0].Actor || got.CommandID == entries[0].CommandID ||
+		got.Action == entries[0].Action || got.Ingress == entries[0].Ingress {
+		t.Fatal("redaction did not change the source entry")
+	}
+}
+
 func TestAuditReaderError(t *testing.T) {
 	sentinel := errors.New("store down")
 	projection := NewAuditProjection(&stubAuditReader{err: sentinel})
