@@ -733,7 +733,7 @@ func (b *verdictApplier) notifyOrchestratorTerminal(ctx context.Context, w domai
 // orchestrator session once per incident.
 func (b *verdictApplier) applyBlocked(ctx context.Context, w domain.Watch, obs ciObservation, now time.Time, cycleID string) int {
 	base := baseRefOf(w)
-	failed := realFailedNames(obs.pr.Checks)
+	failed := blockingFailedNames(realFailedNames(obs.pr.Checks), obs.pr.Checks)
 	info := domain.BlockedInfo{
 		Reason:       domain.BlockReasonBaseChecksFailed,
 		FailedChecks: failed,
@@ -779,7 +779,7 @@ func (b *verdictApplier) applyBlocked(ctx context.Context, w domain.Watch, obs c
 // stop-and-wait instruction.
 func blockedNotice(w domain.Watch) string {
 	info := w.Blocked
-	checks := strings.Join(info.FailedChecks, ", ")
+	checks := strings.Join(blockingFailedNames(info.FailedChecks, w.Checks), ", ")
 	if checks == "" {
 		checks = "нет"
 	}
@@ -935,7 +935,7 @@ func (b *verdictApplier) handleBlocked(ctx context.Context, w domain.Watch, cycl
 
 	dedup := domain.ObligationKey(w.ID, w.Revision, "blocked")
 	if b.control != nil {
-		incident, _, err := b.control.GetOrCreateOpenBlocker(w.Repo, baseRefOf(w), w.Blocked.FailedChecks, w.ID, now)
+		incident, _, err := b.control.GetOrCreateOpenBlocker(w.Repo, baseRefOf(w), blockingFailedNames(w.Blocked.FailedChecks, w.Checks), w.ID, now)
 		if err != nil {
 			observe.ActorError("cibridge-blocker", w.ID, err)
 		} else {
