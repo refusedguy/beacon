@@ -66,6 +66,48 @@ func TestGoldenFingerprint(t *testing.T) {
 	}
 }
 
+// TestCollidingFieldSetsHaveDistinctFingerprints guards the canonical text
+// against ambiguity. Both scenarios have the same name, seed and steps; only
+// the field layout differs. The old encoder gave both "a=b,c=d", so this test
+// fails before the escaping fix.
+func TestCollidingFieldSetsHaveDistinctFingerprints(t *testing.T) {
+	base := Scenario{Name: "collision", Seed: 0x434f4c4c4953494f}
+	a := base
+	a.Steps = []Command{{Kind: "watch_pr", Fields: map[string]string{"a": "b,c=d"}}}
+	b := base
+	b.Steps = []Command{{Kind: "watch_pr", Fields: map[string]string{"a": "b", "c": "d"}}}
+
+	ra, rb := Run(a), Run(b)
+	if ra.Events[0].String() == rb.Events[0].String() {
+		t.Fatalf("distinct field sets share canonical event text: %q", ra.Events[0].String())
+	}
+	if ra.Fingerprint() == rb.Fingerprint() {
+		t.Fatalf("distinct field sets share fingerprint %s", ra.Fingerprint())
+	}
+}
+
+// TestEncodeFieldsEscapesSeparators checks that keys and values cannot trade
+// separators with each other, including the escape character itself.
+func TestEncodeFieldsEscapesSeparators(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields map[string]string
+		want   string
+	}{
+		{"plain", map[string]string{"a": "b"}, "a=b"},
+		{"value separators", map[string]string{"a": "b,c=d"}, `a=b\,c\=d`},
+		{"key separator", map[string]string{"a,b": "c"}, `a\,b=c`},
+		{"backslash", map[string]string{"a": `b\c`}, `a=b\\c`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := encodeFields(tc.fields); got != tc.want {
+				t.Fatalf("encodeFields = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSeedDrivesTrace checks that changing only the seed changes the random
 // part of the trace (receipts) while leaving command kinds and echoed fields
 // untouched.
