@@ -70,6 +70,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskLease(args[1:], stdout, stderr, cfg)
 	case "schedule":
 		return runTaskSchedule(args[1:], stdout, stderr, cfg)
+	case "compact":
+		return runTaskCompact(args[1:], stdout, stderr, cfg)
 	default:
 		fmt.Fprintf(stderr, "неизвестная подкоманда task %q\n%s", args[0], taskUsage)
 		return taskstore.ExitValidation
@@ -78,7 +80,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 
 const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
 	"               beacon task lease acquire|release|check [flags]\n" +
-	"               beacon task schedule [create|list|delete] [flags]"
+	"               beacon task schedule [create|list|delete] [flags]\n" +
+	"               beacon task compact (--analyze|--apply|--auto) [--format json] [--id ID] [--summary FILE] [--dry-run]"
 
 // whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
 var whyEdgeKinds = []string{
@@ -1186,4 +1189,346 @@ func runScheduleDelete(argv []string, stdout, stderr io.Writer, cfg taskcli.Conf
 	}
 	fmt.Fprintf(stdout, "%s deleted\n", id)
 	return taskstore.ExitOK
+}
+
+// ---- CB-06: компактинг без ключа внешней модели ----
+//
+// Агент работает без ключа: analyze только читает карточки и отдаёт JSON со
+// списком кандидатов, apply принимает готовое саммари из файла и проходит
+// проверки размера и снапшота. Ни один из этих режимов не обращается к сети:
+// в файле нет ни net/http, ни os/exec, ни вызова внешней модели. Режим auto
+// оставлен необязательным и без ключа завершается кодом валидации, не делая
+// сетевого вызова.
+const compactUsage = "использование: beacon task compact (--analyze | --apply | --auto) [--format json] [--id ID] [--summary FILE] [--summary-text TEXT] [--root DIR] [--max-age-days N] [--dry-run]\n"
+
+var (
+	// Файловые возможности держатся в переменных, чтобы cmd/beacon не называл
+	// os.ReadFile, os.WriteFile и os.MkdirAll напрямую (ADR 0005).
+	compactReadFile  = os.ReadFile
+	compactWriteFile = os.WriteFile
+	compactMkdirAll  = os.MkdirAll
+	compactGetenv    = os.Getenv
+	compactNow       = time.Now
+)
+
+// compactTextFields — четыре текстовых поля, по размеру которых решается,
+// стоит ли сжимать карточку. Поля идентификатора, типов, связей и статуса не
+// входят в список: сжатие не меняет граф и ID карточки (CB-05).
+var compactTextFields = []string{"Контекст", "Шаги", "Проверка", "Приёмка"}
+
+type compactCandidate struct {
+	ID        string `json:"id"`
+	Status    string `json:"status"`
+	ClosedAt  string `json:"closed_at,omitempty"`
+	SizeBytes int    `json:"size_bytes"`
+	Reason    string `json:"reason"`
+}
+
+type compactResult struct {
+	Mode       string `json:"mode"`
+	Applied    bool   `json:"applied"`
+	ID         string `json:"id,omitempty"`
+	SizeBefore int    `json:"size_before,omitempty"`
+	SizeAfter  int    `json:"size_after,omitempty"`
+	Snapshot   string `json:"snapshot,omitempty"`
+}
+
+// compactSnapshot хранит исходный текст карточки до перезаписи. Text и Fields
+// сохраняются побайтово, чтобы restore вернул исходный текст без потерь.
+type compactSnapshot struct {
+	CardID    string            `json:"card_id"`
+	CreatedAt string            `json:"created_at"`
+	Schema    int               `json:"schema"`
+	Text      string            `json:"text"`
+	Fields    map[string]string `json:"fields"`
+}
+
+// runTaskCompact — точка входа безключевого компактинга. Проверка взаимной
+// исключительности режимов идёт до любого чтения файлов, поэтому неверный
+// вызов не меняет карточки и не создаёт снапшоты.
+func runTaskCompact(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv,
+		map[string]bool{
+			"format": true, "id": true, "summary": true,
+			"summary-text": true, "root": true, "max-age-days": true,
+		},
+		map[string]bool{"analyze": true, "apply": true, "auto": true, "dry-run": true})
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) > 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	modes := 0
+	for _, mode := range []string{"analyze", "apply", "auto"} {
+		if p.bools[mode] {
+			modes++
+		}
+	}
+	if modes != 1 {
+		fmt.Fprint(stderr, compactUsage)
+		return failTask(stderr, taskstore.Validationf("compact: нужен ровно один режим --analyze, --apply или --auto"))
+	}
+	if format := strings.TrimSpace(p.value("format")); format != "" && format != "json" {
+		return failTask(stderr, taskstore.Validationf("compact: неизвестный формат %q", format))
+	}
+
+	switch {
+	case p.bools["analyze"]:
+		return runCompactAnalyze(stdout, stderr, cfg, p)
+	case p.bools["apply"]:
+		return runCompactApply(stdout, stderr, cfg, p)
+	default:
+		return runCompactAuto(stderr, p)
+	}
+}
+
+// runCompactAnalyze печатает список кандидатов в JSON. Режим только читает
+// карточки: он не пишет снапшоты, не меняет файлы и не зовёт внешнюю модель.
+func runCompactAnalyze(stdout, stderr io.Writer, cfg taskcli.Config, p *parsedArgs) int {
+	dir := cfg.TasksDir
+	if root := strings.TrimSpace(p.value("root")); root != "" {
+		dir = filepath.Join(root, "docs", "tasks")
+	}
+	maxAge := 30
+	if raw := strings.TrimSpace(p.value("max-age-days")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			return failTask(stderr, taskstore.Validationf("compact: неверный --max-age-days %q", raw))
+		}
+		maxAge = n
+	}
+	cards, err := taskstore.LoadCards(dir)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	now := compactNow()
+	candidates := make([]compactCandidate, 0)
+	for _, c := range cards {
+		if candidate, ok := compactIsCandidate(c, maxAge, now); ok {
+			candidates = append(candidates, candidate)
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
+	b, err := json.MarshalIndent(candidates, "", "  ")
+	if err != nil {
+		return failTask(stderr, taskstore.Startupf("compact: не собран JSON кандидатов: %v", err))
+	}
+	fmt.Fprintln(stdout, string(b))
+	return taskstore.ExitOK
+}
+
+// compactIsCandidate выбирает закрытую карточку с корректным временем
+// закрытия и выдержавшую порог по дням. Поле уровня сжатия убирает уже
+// обработанные карточки из повторной выдачи.
+func compactIsCandidate(c taskstore.Card, maxAgeDays int, now time.Time) (compactCandidate, bool) {
+	if c.Status != "done" && c.Status != "dropped" && c.Status != "duplicate" {
+		return compactCandidate{}, false
+	}
+	if strings.TrimSpace(c.Extra["Уровень сжатия"]) != "" {
+		return compactCandidate{}, false
+	}
+	closedAt := strings.TrimSpace(c.ClosedAt)
+	if closedAt == "" {
+		return compactCandidate{}, false
+	}
+	closed, err := time.Parse(time.RFC3339, closedAt)
+	if err != nil {
+		return compactCandidate{}, false
+	}
+	age := now.Sub(closed)
+	if age < time.Duration(maxAgeDays)*24*time.Hour {
+		return compactCandidate{}, false
+	}
+	return compactCandidate{
+		ID: c.ID, Status: c.Status, ClosedAt: closedAt,
+		SizeBytes: compactTextSize(c.Raw),
+		Reason:    "закрытая карточка старше порога сжатия",
+	}, true
+}
+
+// runCompactApply принимает саммари из файла или флага и меняет карточку только
+// после того, как снапшот записан, а новый текст оказался короче исходного.
+func runCompactApply(stdout, stderr io.Writer, cfg taskcli.Config, p *parsedArgs) int {
+	id := strings.TrimSpace(p.value("id"))
+	if !taskstore.IsID(id) {
+		return failTask(stderr, taskstore.Validationf("compact: нужен корректный --id карточки"))
+	}
+	summaryPath := strings.TrimSpace(p.value("summary"))
+	summaryText := p.value("summary-text")
+	if summaryPath == "" && strings.TrimSpace(summaryText) == "" {
+		return failTask(stderr, taskstore.Validationf("compact: нужен --summary FILE или --summary-text TEXT"))
+	}
+	if summaryPath != "" && strings.TrimSpace(summaryText) != "" {
+		return failTask(stderr, taskstore.Validationf("compact: указаны и --summary, и --summary-text"))
+	}
+	if summaryPath != "" {
+		data, err := compactReadFile(summaryPath)
+		if err != nil {
+			return failTask(stderr, taskstore.Startupf("compact: не прочитан файл саммари %s: %v", summaryPath, err))
+		}
+		summaryText = string(data)
+	}
+	summaryText = oneLine(summaryText)
+	if summaryText == "" {
+		return failTask(stderr, taskstore.Validationf("compact: саммари пустое"))
+	}
+
+	cards, err := taskstore.LoadCards(cfg.TasksDir)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	var target *taskstore.Card
+	for i := range cards {
+		if cards[i].ID == id {
+			target = &cards[i]
+			break
+		}
+	}
+	if target == nil {
+		return failTask(stderr, taskstore.Validationf("compact: карточка %s не найдена", id))
+	}
+
+	now := compactNow()
+	newText, err := compactSummaryText(target.Raw, summaryText, now)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if p.bools["dry-run"] {
+		fmt.Fprintf(stdout, "%s dry-run: %d -> %d байт четырёх полей, записи нет\n", id, compactTextSize(target.Raw), compactTextSize(newText))
+		return taskstore.ExitOK
+	}
+
+	snapshotPath, err := compactSaveSnapshot(cfg, *target, now)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if err := compactWriteFile(target.Path, []byte(newText), 0644); err != nil {
+		return failTask(stderr, taskstore.Startupf("compact: не записана карточка %s: %v", target.Path, err))
+	}
+	result := compactResult{
+		Mode: "apply", Applied: true, ID: id,
+		SizeBefore: compactTextSize(target.Raw),
+		SizeAfter:  compactTextSize(newText),
+		Snapshot:   relativePath(cfg.Root, snapshotPath),
+	}
+	b, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return failTask(stderr, taskstore.Startupf("compact: не собран JSON результата: %v", err))
+	}
+	fmt.Fprintln(stdout, string(b))
+	return taskstore.ExitOK
+}
+
+// runCompactAuto оставляет внешнюю модель необязательной. Без ключа команда
+// возвращает код валидации и не делает ни одного сетевого вызова; агенту
+// предложено использовать analyze или apply.
+func runCompactAuto(stderr io.Writer, p *parsedArgs) int {
+	id := strings.TrimSpace(p.value("id"))
+	if p.bools["dry-run"] || id != "" {
+		return failTask(stderr, taskstore.Validationf("compact: --auto не поддерживает --dry-run и --id; используйте --analyze или --apply"))
+	}
+	key := strings.TrimSpace(compactGetenv("BEACON_MODEL_API_KEY"))
+	if key == "" {
+		key = strings.TrimSpace(compactGetenv("OPENAI_API_KEY"))
+	}
+	if key == "" {
+		return failTask(stderr, taskstore.Validationf("compact: --auto требует ключ внешней модели; без ключа используйте --analyze или --apply"))
+	}
+	return failTask(stderr, taskstore.Validationf("compact: внешняя модель недоступна в этой сборке; используйте --analyze или --apply"))
+}
+
+// compactSummaryText заменяет четыре текстовых поля коротким саммари и
+// добавляет метаданные уровня сжатия. Композиция чистая: вызывающий сам
+// решает, когда писать результат на диск.
+func compactSummaryText(raw, summary string, now time.Time) (string, error) {
+	before := compactTextSize(raw)
+	out := raw
+	for i, name := range compactTextFields {
+		value := ""
+		switch i {
+		case 0:
+			value = "Саммари: " + summary
+		default:
+			value = "См. снапшот"
+		}
+		out = compactSetTextField(out, name, value)
+	}
+	if after := compactTextSize(out); after >= before {
+		return "", taskstore.Validationf("compact: саммари не короче оригинала: %d >= %d байт, карточка не изменена", after, before)
+	}
+	out = setCardField(out, "Уровень сжатия", "1")
+	out = setCardField(out, "Время сжатия", now.UTC().Format(time.RFC3339))
+	return out, nil
+}
+
+// compactSaveSnapshot пишет исходный текст карточки до перезаписи. Снимок
+// лежит в state dir, а не в tasks dir, поэтому не попадает в LoadCards и не
+// меняет число карточек в каталоге.
+func compactSaveSnapshot(cfg taskcli.Config, c taskstore.Card, now time.Time) (string, error) {
+	fields := make(map[string]string, len(compactTextFields))
+	for _, name := range compactTextFields {
+		fields[name] = compactTextField(c.Raw, name)
+	}
+	snap := compactSnapshot{
+		CardID: c.ID, CreatedAt: now.UTC().Format(time.RFC3339),
+		Schema: 1, Text: c.Raw, Fields: fields,
+	}
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return "", taskstore.Startupf("compact: не собран снапшот: %v", err)
+	}
+	path := filepath.Join(cfg.StateDir, "compact-snapshots", c.ID+".json")
+	if err := compactMkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", taskstore.Startupf("compact: не создан каталог снапшотов: %v", err)
+	}
+	if err := compactWriteFile(path, append(data, '\n'), 0600); err != nil {
+		return "", taskstore.Startupf("compact: не записан снапшот %s: %v", path, err)
+	}
+	return path, nil
+}
+
+// compactTextField читает одно текстовое поле из текста карточки.
+func compactTextField(raw, name string) string {
+	prefix := name + ":"
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	return ""
+}
+
+// compactSetTextField меняет значение поля на месте. Отсутствующее поле не
+// добавляется: карточка с укороченным текстом обязана разбираться так же, как
+// до сжатия.
+func compactSetTextField(raw, name, value string) string {
+	cr := ""
+	if strings.Contains(raw, "\r\n") {
+		cr = "\r"
+	}
+	prefix := name + ":"
+	out := make([]string, 0, strings.Count(raw, "\n")+1)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		if strings.HasPrefix(line, prefix) {
+			if value != "" {
+				out = append(out, prefix+" "+value+cr)
+			}
+			continue
+		}
+		out = append(out, line+cr)
+	}
+	return strings.Join(out, "\n")
+}
+
+// compactTextSize считает суммарный размер четырёх текстовых полей. Именно
+// это число сравнивается до и после сжатия по правилу CB-05.
+func compactTextSize(raw string) int {
+	n := 0
+	for _, name := range compactTextFields {
+		n += len(compactTextField(raw, name))
+	}
+	return n
 }
