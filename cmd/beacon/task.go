@@ -85,6 +85,16 @@ var whyEdgeKinds = []string{
 	"depends-on", "conflicts-with", "part-of", "derived-from", "supersedes", "same-as",
 }
 
+// whyExternalKind это пятый тип ребра из ADR 0314. Он живёт отдельно от
+// whyEdgeKinds: его цель не ID карточки, а внешний гейт, и он печатается
+// отдельным шагом с состоянием из Watch.
+const whyExternalKind = "waits-for-external"
+
+// whyExternalRE находит внешний гейт в тексте карточки. Формат цели совпадает
+// с taskstore.IsExternalGateTarget, поэтому лишние совпадения отбрасываются
+// при добавлении ребра.
+var whyExternalRE = regexp.MustCompile(`\bwaits-for-external[ \t]*[ :][ \t]*(gh:pr:[0-9]+|gh:run:[A-Za-z0-9_-]+|timer:[A-Za-z0-9_.-]+|human:[A-Za-z0-9_.-]+|bead:[A-Za-z0-9_-]+)`)
+
 // whyCardID повторяет грамматику taskstore.exactIDRE без якорей: буквенный
 // префикс, затем либо -<буквы><цифры> (ATX-R01, RS-CMP-06), либо точка или
 // дефис и номер (T3.17, WIRING-485, BS.1, S1.001). Старый шаблон принимал
@@ -262,7 +272,8 @@ func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int
 
 	fmt.Fprintln(stdout, id)
 	chain := whyChain(id, byID)
-	if len(chain) == 0 {
+	gates := whyExternalGates(byID[id])
+	if len(chain) == 0 && len(gates) == 0 {
 		fmt.Fprintln(stdout, "  цепочка блокировок не найдена")
 		return taskstore.ExitOK
 	}
@@ -274,7 +285,56 @@ func runTaskWhy(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int
 		fmt.Fprintf(stdout, "  %d. %s через %s: держит %s (%s)\n",
 			i+1, step.id, step.edge, holder, step.status)
 	}
+	for i, target := range gates {
+		fmt.Fprintf(stdout, "  гейт %d. %s через %s: внешнее состояние %s (Watch)\n",
+			i+1, target, whyExternalKind, whyExternalState(target, cfg))
+	}
 	return taskstore.ExitOK
+}
+
+// whyExternalGates возвращает уникальные цели внешних гейтов карточки в
+// порядке появления. Ребра читаются из тех же полей, что и внутренние.
+func whyExternalGates(c taskstore.Card) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range whyEdges(c) {
+		if e.kind != whyExternalKind || seen[e.to] {
+			continue
+		}
+		seen[e.to] = true
+		out = append(out, e.to)
+	}
+	return out
+}
+
+// whyExternalState читает состояние внешнего гейта из Watch. Это чтение, а не
+// опрос: новый цикл опроса не запускается. Для gh:pr ребро соответствует
+// Watch с тем же номером PR, для gh:run — Watch с совпадающим HeadSHA или Issue.
+func whyExternalState(target string, cfg taskcli.Config) string {
+	db, err := store.OpenProduction(filepath.Join(cfg.StateDir, mcpStateDBName))
+	if err != nil {
+		return "нет данных Watch"
+	}
+	defer db.Close()
+	watches, err := db.AllWatches()
+	if err != nil {
+		return "нет данных Watch"
+	}
+	for _, w := range watches {
+		switch {
+		case strings.HasPrefix(target, "gh:pr:"):
+			n, err := strconv.Atoi(strings.TrimPrefix(target, "gh:pr:"))
+			if err == nil && w.PR == n {
+				return string(w.Verdict)
+			}
+		case strings.HasPrefix(target, "gh:run:"):
+			id := strings.TrimPrefix(target, "gh:run:")
+			if w.HeadSHA == id || w.Issue == id {
+				return string(w.Verdict)
+			}
+		}
+	}
+	return "нет данных Watch"
 }
 
 // ---- ADR 0056 п5 / T3.126: wait --after SEQ ----
@@ -405,6 +465,15 @@ func whyEdges(c taskstore.Card) []whyEdge {
 	}
 	for _, m := range whyEdgeRE.FindAllStringSubmatch(c.Raw, -1) {
 		add(m[1], m[2])
+	}
+	for _, m := range whyExternalRE.FindAllStringSubmatch(c.Raw, -1) {
+		if taskstore.IsExternalGateTarget(m[1]) {
+			e := whyEdge{kind: whyExternalKind, to: m[1]}
+			if !seen[e] {
+				seen[e] = true
+				edges = append(edges, e)
+			}
+		}
 	}
 	return edges
 }

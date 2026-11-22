@@ -1,19 +1,22 @@
 package taskstore
 
+import "strings"
+
 // EdgeKind задаёт тип ребра в графе карточек. Все рёбра направленные.
 type EdgeKind string
 
 const (
-	EdgeBlocks     EdgeKind = "blocks"
-	EdgeDependsOn  EdgeKind = "depends-on"
-	EdgeSupersedes EdgeKind = "supersedes"
-	EdgeRelated    EdgeKind = "related"
+	EdgeBlocks           EdgeKind = "blocks"
+	EdgeDependsOn        EdgeKind = "depends-on"
+	EdgeSupersedes       EdgeKind = "supersedes"
+	EdgeRelated          EdgeKind = "related"
+	EdgeWaitsForExternal EdgeKind = "waits-for-external"
 )
 
-// ValidEdgeKinds возвращает четыре допустимых типа рёбер. Возвращается копия,
+// ValidEdgeKinds возвращает допустимые типы рёбер. Возвращается копия,
 // изменение которой не меняет канонический набор.
 func ValidEdgeKinds() []EdgeKind {
-	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated}
+	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
 }
 
 // IsValidEdgeKind сообщает, известен ли тип ребра.
@@ -26,7 +29,44 @@ func IsValidEdgeKind(kind EdgeKind) bool {
 	return false
 }
 
-// Edge это одно направленное ребро. From и To это ID карточек любого семейства.
+// IsExternalGateTarget проверяет цель внешнего гейта. Первая версия принимает
+// gh:pr:<номер>, gh:run:<id>, timer:<имя>, human:<имя> и bead:<id>. Цель не
+// является ID карточки, поэтому IsID её не проверяет.
+func IsExternalGateTarget(target string) bool {
+	parts := strings.SplitN(target, ":", 3)
+	switch parts[0] {
+	case "gh":
+		if len(parts) != 3 || parts[2] == "" {
+			return false
+		}
+		switch parts[1] {
+		case "pr":
+			return allDigits(parts[2])
+		case "run":
+			return true
+		}
+		return false
+	case "timer", "human", "bead":
+		return len(parts) == 2 && parts[1] != "" && !strings.Contains(parts[1], ":")
+	}
+	return false
+}
+
+func allDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Edge это одно направленное ребро. From — ID карточки любого семейства. Для
+// четырёх внутренних типов To тоже ID карточки. Для waits-for-external To —
+// цель внешнего гейта вида gh:pr:42 или gh:run:ID.
 type Edge struct {
 	From string
 	To   string
@@ -62,6 +102,7 @@ func (g *Graph) Size() int { return g.count }
 
 // AddEdge добавляет ребро. ID проверяются через IsID, поэтому граф принимает
 // все семейства: T3.17, S1.001, BS.1, RS-MCP-02, WIRING-485 и UI-31.
+// Для waits-for-external вместо IsID проверяется IsExternalGateTarget.
 // Неизвестный тип, петля и ребро, которое замыкает цикл, отклоняются с кодом 1.
 // Повтор того же ребра ничего не меняет.
 func (g *Graph) AddEdge(from, to string, kind EdgeKind) error {
@@ -71,7 +112,11 @@ func (g *Graph) AddEdge(from, to string, kind EdgeKind) error {
 	if !IsID(from) {
 		return Validationf("неверный ID карточки %q", from)
 	}
-	if !IsID(to) {
+	if kind == EdgeWaitsForExternal {
+		if !IsExternalGateTarget(to) {
+			return Validationf("неверная цель внешнего гейта %q", to)
+		}
+	} else if !IsID(to) {
 		return Validationf("неверный ID карточки %q", to)
 	}
 	if from == to {
