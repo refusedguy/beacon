@@ -12,6 +12,7 @@ import (
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 const attachSessionsFile = "attach-sessions.json"
@@ -201,11 +202,49 @@ func savedAttachIdentity(taskID string) string {
 	return ""
 }
 
+// attachRecordForSession finds the saved record whose session id is sessionID.
+// attach-sessions.json is the journal this repair reads. When the state row is
+// gone, the record still carries the id and task line needed to rebuild it.
+func attachRecordForSession(sessionID string) (attachSession, bool, error) {
+	want := strings.TrimSpace(sessionID)
+	if want == "" {
+		return attachSession{}, false, nil
+	}
+	st, err := loadAttachSessions()
+	if err != nil {
+		return attachSession{}, false, err
+	}
+	for _, rec := range st.Sessions {
+		if rec.SessionID == want {
+			return rec, true, nil
+		}
+	}
+	return attachSession{}, false, nil
+}
+
+// restoredAttachSeed builds the state row for a session whose row was lost.
+// The id and task line come from the saved attach record, which ADR 0043 §6
+// makes the source of truth for resume.
+func restoredAttachSeed(rec attachSession) session.Session {
+	metadata := map[string]string{}
+	if task := strings.TrimSpace(rec.TaskID); task != "" {
+		metadata[store.SessionMetaTaskID] = task
+	}
+	return session.Session{
+		ID:        rec.SessionID,
+		Status:    session.SessionStatusActive,
+		CreatedAt: rec.SavedAt,
+		Metadata:  metadata,
+	}
+}
+
 // registryResumeSession confirms the saved session id in the durable session
 // registry (WIRING-488). Resume reaches GetSession through the app-layer port,
 // so cmd never opens a database for this lookup. The registry is best effort:
-// when it is absent, reports an error or has no row, attach keeps the id from
+// when it is absent or reports an error, attach keeps the id from
 // attach-sessions.json, which ADR 0043 §6 makes the source of truth for resume.
+// A clean miss means the state row was lost while the journal still has the
+// id, so attach rebuilds the row from that record and resumes it (CCx-12).
 // A stored id replaces the saved one so both registries converge on one session.
 //
 // When identity is recorded with the saved session, attach checks it against
@@ -236,7 +275,15 @@ func registryResumeSession(sessionID, identity string) (string, error) {
 		return sessionID, nil
 	}
 	if !found {
-		return sessionID, nil
+		rec, ok, recErr := attachRecordForSession(sessionID)
+		if recErr != nil || !ok {
+			return sessionID, nil
+		}
+		rebuilt, rebuildErr := reg.Restore(restoredAttachSeed(rec))
+		if rebuildErr != nil {
+			return sessionID, nil
+		}
+		stored = rebuilt
 	}
 	if id := strings.TrimSpace(stored.ID); id != "" {
 		return id, nil

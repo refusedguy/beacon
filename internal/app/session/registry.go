@@ -161,6 +161,34 @@ func (r *SessionRegistry) ResumeIdentified(id string) (Session, bool, error) {
 	return stored, true, nil
 }
 
+// Restore writes a rebuilt session row and returns it as the resumed session.
+// A caller uses it after Resume reports a clean miss. The saved attach record
+// supplies the id and task line because the state row is gone. Restore copies
+// the metadata and fills missing times from the registry clock. A write error
+// goes back to the caller, which can keep the saved session id.
+func (r *SessionRegistry) Restore(seed Session) (Session, error) {
+	if r == nil || r.store == nil {
+		return Session{}, ErrNilStore
+	}
+	seed.ID = strings.TrimSpace(seed.ID)
+	if seed.ID == "" {
+		return Session{}, ErrEmptyID
+	}
+	if strings.TrimSpace(seed.Status) == "" {
+		seed.Status = SessionStatusActive
+	}
+	now := r.clock().UTC()
+	if seed.CreatedAt.IsZero() {
+		seed.CreatedAt = now
+	}
+	seed.LastSeen = now
+	seed.Metadata = copySessionMetadata(seed.Metadata)
+	if err := r.store.SaveSession(seed); err != nil {
+		return Session{}, err
+	}
+	return seed, nil
+}
+
 // ResumeByTask loads the session spawned for task. Resume alone needs an
 // opaque session id, which a restarted command does not have; task is the
 // stable line the caller knows. found is false when the store has no session
