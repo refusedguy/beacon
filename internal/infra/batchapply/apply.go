@@ -102,6 +102,9 @@ const (
 	// stay English as technical terms; the id list is comma separated.
 	staleSkippedFormat  = "StaleSkippedIDs=%s\n"
 	updatedIssuesFormat = "UpdatedIssues=%d\n"
+	// CCx-24: one violation metric line is emitted only when a write was
+	// refused by a sandbox. An ordinary file error adds no line.
+	sandboxDenialsFormat = "SandboxDenials=%d\n"
 	// CBX-08: the remaining lists keep the same key style. UpdatedIDs names
 	// the rows whose content changed; the count line above stays unchanged.
 	createdIDsFormat   = "CreatedIDs=%s\n"
@@ -577,6 +580,13 @@ type runner struct {
 	now      func() time.Time
 	yield    func(time.Duration)
 	commit   func(root string, cards, adrs, evals int) error
+	// write returns the diagnostics a file writer produced. A nil writer
+	// means os.WriteFile, whose error text is its only output. Tests inject
+	// stdout and stderr text to drive sandbox classification.
+	write func(path string, data []byte) (string, error)
+	// sandboxDenials counts writes classified as sandbox refusals. Run emits
+	// it as a single violation metric line when the count is positive.
+	sandboxDenials int
 	// The four lists and the change map are filled by the freshness checks
 	// and printed once by Run after the write pass. They back both the text
 	// lines and the JSON report, so the two views can never disagree.
@@ -827,6 +837,54 @@ func (r *runner) writeFile(root, rel, content string) error {
 	return r.writeFileMode(root, rel, content, false)
 }
 
+// sandboxDenialError carries the writer output that named a sandbox refusal.
+// Output stays on the error so a caller can report the denial without writing
+// the file again. Err keeps the underlying write error for errors.Is and
+// errors.As.
+type sandboxDenialError struct {
+	Output string
+	Err    error
+}
+
+func (e *sandboxDenialError) Error() string {
+	if e.Err == nil {
+		return "sandbox denied write: " + e.Output
+	}
+	return "sandbox denied write: " + e.Err.Error() + ": " + e.Output
+}
+
+func (e *sandboxDenialError) Unwrap() error { return e.Err }
+
+// sandboxDenialPattern needs a backend marker and a refusal word close together
+// in the writer output. The gap cannot cross a path separator, so a plain
+// "permission denied" for a path under /sandbox/ stays an ordinary error.
+var sandboxDenialPattern = regexp.MustCompile(`(?i)(sandbox|landlock|seccomp|bwrap|apparmor)[^/\n]{0,40}(denied|denial|blocked|refused|violation|not permitted|eperm)|(denied|blocked|refused|violation)[^/\n]{0,40}(sandbox|landlock|seccomp|bwrap|apparmor)`)
+
+// isLikelySandboxDenial reads the joined writer output. A plain permission
+// error from os.WriteFile has no sandbox marker and stays unclassified.
+func isLikelySandboxDenial(output string) bool {
+	return sandboxDenialPattern.MatchString(output)
+}
+
+// classifyWriteError turns a failed write into a sandboxDenialError when its
+// output names a sandbox refusal. Only that type increments the violation
+// counter, and only that type reaches the caller as a classified error.
+func (r *runner) classifyWriteError(output string, err error) error {
+	if !isLikelySandboxDenial(output) {
+		return err
+	}
+	r.sandboxDenials++
+	return &sandboxDenialError{Output: output, Err: err}
+}
+
+// emitSandboxDenials writes one violation metric line when the run saw a
+// sandbox refusal. A run with only ordinary file errors writes no line.
+func (r *runner) emitSandboxDenials() {
+	if r.sandboxDenials > 0 {
+		r.printf(sandboxDenialsFormat, r.sandboxDenials)
+	}
+}
+
 // writeFileMode writes a generated file. overwrite is true only for card
 // closures, which update an existing card in place. New cards keep the
 // never-overwrite rule.
@@ -846,7 +904,18 @@ func (r *runner) writeFileMode(root, rel, content string, overwrite bool) error 
 			return nil // never overwrite an existing card
 		}
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	data := []byte(content)
+	if r.write != nil {
+		output, err := r.write(path, data)
+		if err != nil {
+			return r.classifyWriteError(output, err)
+		}
+		return nil
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return r.classifyWriteError(err.Error(), err)
+	}
+	return nil
 }
 
 // staleAgainst is the one freshness rule shared by the prefilter and the
@@ -1329,6 +1398,8 @@ func commitArtifacts(root string, cards, adrs, evals int) error {
 func Run(opts Options, out, errOut io.Writer) int {
 	r := &runner{opts: opts, out: out, err: errOut}
 	r.fillDefaults()
+	// CCx-24: the violation line still reaches the report when a write fails.
+	defer r.emitSandboxDenials()
 	// ATX-13: a research document never authorizes a merge by itself. Require
 	// the owner flag before any file read or gh call in the merge path.
 	if opts.MergePlan && !opts.ConfirmMerge {
