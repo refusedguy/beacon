@@ -54,7 +54,7 @@ bash scripts/verify-daemon.sh
 | `go build ./...` | Команда завершилась с кодом `0`. |
 | `go test ./...` | Все пакеты прошли тесты, включая `cmd/beacon` и `internal/infra/observe`. |
 | Сборка бинарника | `go build -o ... ./cmd/beacon` создал исполняемый файл. |
-| `beacon mcp` | Официальный клиент go-sdk через `CommandTransport` подключился к дочернему процессу, `initialize` вернул `serverInfo.name=beacon`, `tools/list` вернул ровно семь инструментов. |
+| `beacon mcp` | Официальный клиент go-sdk через `CommandTransport` подключился к дочернему процессу, `initialize` вернул `serverInfo.name=beacon`, число инструментов в `tools/list` совпало с длиной `AdvertisedToolNames`. |
 | `beacon_stats` | `tools/call` прошёл без `isError`, в `structuredContent` есть ключи `activeWatches`, `budget`, `ladder`, `persist`, `version`. |
 | Проект-scoped БД | Файл `<state>/beacon/projects/<name>-<hash>/beacon.db` существует, `PRAGMA quick_check` возвращает `ok`, в базе есть таблицы. Хеш вычисляется по тому же абсолютному пути проекта, что и в коде. |
 | Логи | Два последовательных запуска `beacon metrics` создали два разных файла `beacon-<UTC>-<pid>.log`, и `beacon.latest.log` указывает на каждый новый файл. |
@@ -99,7 +99,7 @@ store SQLite, настоящий движок вердиктов и настоя
 окружении. `FAIL go test ./...` печатает последние строки вывода, по ним видно
 падающий тест.
 
-`MCP_OK server=beacon tools=7 stats_keys=7` означает, что дочерний процесс
+`MCP_OK server=beacon tools=<число из AdvertisedToolNames> stats_keys=<число>` означает, что дочерний процесс
 `beacon mcp` ответил по протоколу и что обработчик `beacon_stats` вернул
 ожидаемую структуру. Ошибка `MCPFAIL` указывает конкретный шаг протокола.
 
@@ -140,7 +140,7 @@ store SQLite, настоящий движок вердиктов и настоя
 `/mnt/projects/beacon-handoff/beacon-impl/worktrees/w439`:
 
 - `bash scripts/verify-beacon.sh` завершился с кодом `0`, все проверки `PASS`.
-  В выводе были `MCP_OK server=beacon tools=7 stats_keys=7`,
+  В выводе были `MCP_OK server=beacon tools=<число из AdvertisedToolNames> stats_keys=7`,
   `DB_OK quick_check=ok tables=7`, `METRICS_OK keys=13`, два новых лог-файла и
   `демон сделал 2 циклов`.
 - `bash scripts/verify-daemon.sh` завершился с кодом `0`, все проверки `PASS`.
