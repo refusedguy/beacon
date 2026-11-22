@@ -4,6 +4,7 @@
 package worktree
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -115,14 +116,26 @@ func Status(run Runner, dir string) (string, error) {
 }
 
 // Remove deletes one worktree with `git worktree remove`. Callers check Status
-// first. There is no --force here, so git refuses to remove a dirty worktree
-// even if a caller skips the check.
+// first. Two local-state guards run before git: the process must not sit inside
+// the target tree, and the tree must hold no files git ignores. There is no
+// --force here, so git refuses to remove a dirty worktree even if a caller
+// skips the check.
 func Remove(run Runner, dir string) error {
 	if run == nil {
 		run = CommandRunner
 	}
 	if strings.TrimSpace(dir) == "" {
 		return fmt.Errorf("worktree: remove: empty dir")
+	}
+	if insideWorktree(dir) {
+		return &BlockedError{Reason: ReasonInsideWorktree, Dir: dir}
+	}
+	// A porcelain status hides ignored files. Codex-style cleanup keeps any
+	// worktree that holds them, because `git worktree remove` deletes them with
+	// no warning. A runner that cannot answer ls-files is treated as having
+	// none; the real git runner answers it on every valid worktree.
+	if ignored, err := IgnoredFiles(run, dir); err == nil && strings.TrimSpace(ignored) != "" {
+		return &BlockedError{Reason: ReasonIgnoredFiles, Dir: dir}
 	}
 	out, err := run("", "worktree", "remove", "--", dir)
 	if err != nil {
@@ -131,18 +144,67 @@ func Remove(run Runner, dir string) error {
 	return nil
 }
 
+// IgnoredFiles runs `git ls-files --others --ignored --exclude-standard -z` in
+// dir. The result is NUL-separated when git finds ignored local files and empty
+// when it does not. Callers keep a worktree with any ignored file.
+func IgnoredFiles(run Runner, dir string) (string, error) {
+	if run == nil {
+		run = CommandRunner
+	}
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("worktree: ignored: empty dir")
+	}
+	out, err := run(dir, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+	if err != nil {
+		return "", fmt.Errorf("worktree: ignored %s: %w: %s", dir, err, strings.TrimSpace(out))
+	}
+	return out, nil
+}
+
+// insideWorktree reports whether the process directory is dir or a descendant
+// of dir. Git cannot remove a worktree that contains its own current directory,
+// so callers keep the tree instead of handing git an impossible removal.
+func insideWorktree(dir string) bool {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return false
+	}
+	cwd, dir = cleanDir(cwd), cleanDir(dir)
+	if cwd == dir {
+		return true
+	}
+	rel, err := filepath.Rel(dir, cwd)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// BlockedError is the error Remove returns when a local-state guard refuses
+// deletion. Reason is the keep reason a collector reports for the tree.
+type BlockedError struct {
+	Reason string
+	Dir    string
+}
+
+func (e *BlockedError) Error() string {
+	return fmt.Sprintf("worktree: remove %s blocked: %s", e.Dir, e.Reason)
+}
+
 // Reasons recorded for a worktree that collection kept. Deferred and changed
 // come from the grace window: a fresh candidate waits, and a change between
 // the two status checks cancels it.
 const (
-	ReasonLocked       = "locked"
-	ReasonActiveWatch  = "active_watch"
-	ReasonStatusError  = "status_error"
-	ReasonDirty        = "dirty"
-	ReasonProtectedDir = "protected_dir"
-	ReasonRemoveError  = "remove_error"
-	ReasonDeferred     = "deferred"
-	ReasonChanged      = "changed"
+	ReasonLocked         = "locked"
+	ReasonActiveWatch    = "active_watch"
+	ReasonStatusError    = "status_error"
+	ReasonDirty          = "dirty"
+	ReasonProtectedDir   = "protected_dir"
+	ReasonRemoveError    = "remove_error"
+	ReasonDeferred       = "deferred"
+	ReasonChanged        = "changed"
+	ReasonIgnoredFiles   = "ignored_files"
+	ReasonInsideWorktree = "inside_worktree"
 )
 
 // Kept is one worktree that collection did not remove.
@@ -251,7 +313,12 @@ func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Resu
 			continue
 		}
 		if err := Remove(run, e.Dir); err != nil {
-			keep(ReasonRemoveError + ":" + err.Error())
+			var blocked *BlockedError
+			if errors.As(err, &blocked) {
+				keep(blocked.Reason)
+			} else {
+				keep(ReasonRemoveError + ":" + err.Error())
+			}
 			continue
 		}
 		out.Removed = append(out.Removed, e.Dir)
