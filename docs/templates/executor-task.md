@@ -67,6 +67,7 @@ executor-task:design-shapes -->
 | tokenBreakdown | `session.TokenBreakdown(ContextSnapshot)` | разбивка контекста по категориям с ценой и остатком |
 | tokenWarning | `session.TokenUsage().Warning` | предупреждение при остатке ниже 1024 токенов |
 | роль файла контекста | editable из OwnerFiles карточки, readonly из остальных файлов в контексте | какая запись разрешена |
+| условие останова | карточка задачи | цель и минимум попыток до останова прогона оптимизации |
 
 ### Пересказ цели до фазы plan
 
@@ -507,6 +508,23 @@ commit: working-artifact-by-default, commit-when-reviewer-needs-history
 relation: no-exit-predicate-change, no-protocol-change
 source: PSKX-17, pstack/skills/show-me-your-work/SKILL.md:13-22
 executor-task:decisions-journal -->
+
+## Условие останова
+
+Задача оптимизации метки получает условие останова до первой итерации. Условие берётся из карточки задачи. Оно задаёт пару полей: цель и минимум попыток. Цель формулирует движение метки выше шума. Минимум попыток это нижняя граница числа итераций.
+
+Удачная ранняя попытка не заканчивает прогон. Исполнитель делает не меньше минимума попыток и только потом проверяет цель. Каждая попытка меняет одно условие и даёт один замер. Результат попытки попадает в журнал попыток из раздела «Журнал попыток» в `docs/perf/README.md`. Исполнитель читает журнал перед каждой следующей попыткой.
+
+Журнал попыток отличается от файла `decisions.tsv` из раздела «Журнал решений decisions.tsv». Первый хранит девять колонок замера и служит оптимизации метки. Второй хранит шесть колонок решения и служит всей задаче. Исполнитель не смешивает эти файлы.
+
+<!-- executor-task:stop-condition
+fields: goal, min-attempts
+lower-bound: min-attempts, independent-of-first-success
+early-success: does-not-stop-run
+per-attempt: one-change, one-measurement
+attempt-journal: docs/perf/README.md, nine-columns, read-before-each-attempt
+decisions-journal: separate, six-columns, unchanged
+executor-task:stop-condition -->
 
 ## Вердикты и пробуждение
 
