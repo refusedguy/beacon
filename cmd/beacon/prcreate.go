@@ -76,23 +76,22 @@ func (g localGitSource) RepoSlug(context.Context) (string, error) {
 	return parseRepoSlug(remote)
 }
 
-// parseRepoSlug turns an origin URL into an owner/name slug. It accepts HTTPS,
-// ssh and scp-style remotes and drops a trailing .git.
+// parseRepoSlug turns an origin URL into an owner/name slug. It runs the URL
+// through github.CanonicalForComparison first, so HTTP credentials and host
+// case do not change the slug, and then extracts the owner and name from the
+// canonical form.
 func parseRepoSlug(remote string) (string, error) {
 	raw := strings.TrimSpace(remote)
 	if raw == "" {
 		return "", fmt.Errorf("git remote origin пустой")
 	}
-	path := raw
+	path := github.CanonicalForComparison(raw)
 	if i := strings.Index(path, "://"); i >= 0 {
 		path = path[i+3:]
 		if slash := strings.Index(path, "/"); slash >= 0 {
 			path = path[slash+1:]
 		}
-	} else if colon := strings.Index(path, ":"); colon >= 0 {
-		path = path[colon+1:]
 	}
-	path = strings.TrimSuffix(path, ".git")
 	path = strings.Trim(path, "/")
 	parts := strings.Split(path, "/")
 	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
