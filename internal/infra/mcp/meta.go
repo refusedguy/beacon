@@ -401,6 +401,24 @@ type UntrustedBody struct {
 	Untrusted bool    `json:"untrusted"`
 }
 
+// VerbatimPromptMetaKey is the session metadata key that marks a spawned
+// session's first prompt as text a client assembled, not text a human typed.
+// The marker travels on the session metadata port, so the prompt text stays
+// exactly as the card supplied it (CSx-11).
+const VerbatimPromptMetaKey = "ai.beacon/verbatimPrompt"
+
+// ClientComposed is the marker value for text a client assembled. The
+// claude-agent-sdk names this client_composed. With the marker set the host
+// delivers the text as data: an @path is never expanded and a slash command
+// never runs (claude-agent-sdk-python src/claude_agent_sdk/types.py:2681-2709).
+const ClientComposed = "client_composed"
+
+// VerbatimPromptMeta returns the metadata entry that marks a first prompt as
+// client-composed. It does not read or rewrite the prompt text.
+func VerbatimPromptMeta() map[string]string {
+	return map[string]string{VerbatimPromptMetaKey: ClientComposed}
+}
+
 // ReadUntrustedBody fetches the body for ref in a separate call and wraps it
 // with the untrusted marker. It never touches the wake prompt. The bytes are
 // copied into a string, so a producer reusing its buffer cannot change the
