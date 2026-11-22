@@ -423,7 +423,6 @@ func (srv *server) api(t *testing.T, method, path, data string) apiResp {
 		}
 		if i+1 < attempts {
 			t.Logf("opencode api %s %s: warm-up 503, retry %d/%d", method, path, i+1, attempts)
-			time.Sleep(200 * time.Millisecond)
 		}
 	}
 	if err != nil {
@@ -606,14 +605,12 @@ func collectFacts(stateDir, id, sessionID string, sse *sseCollector) wakeFacts {
 
 func waitFacts(t *testing.T, stateDir, id, sessionID string, sse *sseCollector, timeout time.Duration) wakeFacts {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		facts := collectFacts(stateDir, id, sessionID, sse)
-		if verifyWake(facts) == nil || time.Now().After(deadline) {
-			return facts
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
+	var facts wakeFacts
+	waitForSignal(t, timeout, func() bool {
+		facts = collectFacts(stateDir, id, sessionID, sse)
+		return verifyWake(facts) == nil
+	})
+	return facts
 }
 
 // newSession creates a session on a live server and returns its real id.
@@ -655,10 +652,9 @@ type apiMessage struct {
 // that had not finished yet. Both facts still come from the API.
 func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeout time.Duration) (apiMessage, apiMessage, []apiMessage) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
 	var seen []apiMessage
 	var user, assistant apiMessage
-	for {
+	ready := waitForSignal(t, timeout, func() bool {
 		resp := srv.api(t, "GET", "/api/session/"+sessionID+"/message", "")
 		// srv.api already unwrapped the envelope's `data` field, so resp.Data
 		// is the array of Session.Message.Info values itself.
@@ -684,13 +680,10 @@ func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeou
 				}
 			}
 		}
-		if user.ID != "" && assistant.ID != "" {
-			return user, assistant, seen
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
+		return user.ID != "" && assistant.ID != ""
+	})
+	if ready {
+		return user, assistant, seen
 	}
 	summary := make([]string, 0, len(seen))
 	for _, m := range seen {
@@ -705,8 +698,8 @@ func waitWakeMessages(t *testing.T, srv *server, sessionID, token string, timeou
 // plugin. The plugin is loaded lazily, so a session must exist first.
 func waitPluginActive(t *testing.T, srv *server) pluginInfo {
 	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
+	var active pluginInfo
+	ready := waitForSignal(t, 20*time.Second, func() bool {
 		listResp := srv.api(t, "GET", "/api/plugin", "")
 		var plugins []pluginInfo
 		if err := json.Unmarshal(listResp.Data, &plugins); err != nil {
@@ -717,11 +710,15 @@ func waitPluginActive(t *testing.T, srv *server) pluginInfo {
 				t.Logf("/api/plugin beacon-bridge: source=%q path=%q status=%q server=%v",
 					p.Source.Type, p.Source.Path, p.State.Status, p.Features.Server)
 				if p.Source.Type == "local" && p.State.Status == "active" && p.Features.Server {
-					return p
+					active = p
+					return true
 				}
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		return false
+	})
+	if ready {
+		return active
 	}
 	t.Fatal("плагин beacon-bridge не появился активным в /api/plugin за 20s")
 	return pluginInfo{}
