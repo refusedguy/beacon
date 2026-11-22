@@ -69,6 +69,39 @@ jobs:
           set -euo pipefail
           go test -mod=mod -tags=eval ./...
 
+      # EM-01. go test собирает только тесты и не вызывает main() из
+      # evals/main.go. Табличный раннер регистрирует 50 именованных кейсов
+      # и печатает итог вида "50 passed, 1 warning, 0 failed". Шаг гонит
+      # раннер и требует нулевое число failed, чтобы регрессия блокировала PR.
+      - name: Run eval suite
+        working-directory: evals
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/eval-suite.log"
+          GOPROXY=off go run -tags=eval . 2>&1 | tee "$log"
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            printf 'eval suite exit=%d\n' "$code" >&2
+            exit "$code"
+          fi
+          summary=$(grep -E '^[0-9]+ passed, [0-9]+ warning, [0-9]+ failed$' "$log" | tail -n 1)
+          if [ -z "$summary" ]; then
+            printf 'eval suite summary line missing\n' >&2
+            exit 1
+          fi
+          printf 'eval suite summary: %s\n' "$summary"
+          passed=$(printf '%s\n' "$summary" | sed -E 's/^([0-9]+) passed.*/\1/')
+          failed=$(printf '%s\n' "$summary" | sed -E 's/.* ([0-9]+) failed$/\1/')
+          if [ "$failed" -ne 0 ]; then
+            printf 'eval suite failed=%s: %s\n' "$failed" "$summary" >&2
+            exit 1
+          fi
+          if [ "$passed" -lt 50 ]; then
+            printf 'eval suite passed=%s, want at least 50: %s\n' "$passed" "$summary" >&2
+            exit 1
+          fi
+
       - name: Build beacon
         shell: bash
         run: |
