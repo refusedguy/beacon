@@ -366,11 +366,56 @@ func (c *Client) CreateSession(ctx context.Context, parentID, agent, title strin
 
 // Prompt posts POST /api/session/:sessionID/prompt. It sends only the text:
 // the v2 route has no agent field, so the agent comes from the session created
-// by CreateSession (ADR 0060 п3/п4).
+// by CreateSession (ADR 0060 п3/п4). Callers that need resume or delivery use
+// PromptWithOptions (ADR 0306).
 func (c *Client) Prompt(ctx context.Context, sessionID, text string) error {
+	return c.PromptWithOptions(ctx, sessionID, text, PromptOptions{})
+}
+
+// PromptOptions are the v2 session.prompt fields the first prompt of a created
+// session needs (ADR 0306). MessageID becomes the body's id field; a repeat of
+// the same id does not start a second turn. Delivery and Resume let a session
+// that finished its turn continue instead of restarting its context.
+type PromptOptions struct {
+	MessageID string
+	Delivery  string
+	Resume    bool
+}
+
+// MessageIDForObligation derives a deterministic messageID from an obligationID.
+// The msg_ prefix keeps it distinct from obligation and watch ids, and the live
+// OpenAPI names the request field id (ADR 0306).
+func MessageIDForObligation(obligationID string) string {
+	return "msg_" + obligationID
+}
+
+// StartPromptOptions is the option set for the first prompt of a session
+// created from an obligation. Sending delivery steer with resume true makes the
+// created session continue its turn (ADR 0306).
+func StartPromptOptions(obligationID string) PromptOptions {
+	return PromptOptions{
+		MessageID: MessageIDForObligation(obligationID),
+		Delivery:  "steer",
+		Resume:    true,
+	}
+}
+
+// PromptWithOptions posts POST /api/session/:sessionID/prompt with the
+// extended v2 body. The agent field stays absent: it comes from the session
+// created by CreateSession (ADR 0060, ADR 0075). Plain Prompt passes empty
+// options, so its body still carries only text.
+func (c *Client) PromptWithOptions(ctx context.Context, sessionID, text string, opts PromptOptions) error {
 	payload := struct {
-		Text string `json:"text"`
-	}{Text: text}
+		ID       string `json:"id,omitempty"`
+		Text     string `json:"text"`
+		Delivery string `json:"delivery,omitempty"`
+		Resume   bool   `json:"resume,omitempty"`
+	}{
+		ID:       opts.MessageID,
+		Text:     text,
+		Delivery: opts.Delivery,
+		Resume:   opts.Resume,
+	}
 	path := "/api/session/" + url.PathEscape(sessionID) + "/prompt"
 	resp, err := c.post(ctx, path, payload)
 	if err != nil {

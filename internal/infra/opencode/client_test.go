@@ -543,6 +543,72 @@ func TestPromptSendsPostWithoutAgent(t *testing.T) {
 	}
 }
 
+func TestStartPromptOptions(t *testing.T) {
+	opts := StartPromptOptions("obligation-42")
+	if opts.MessageID != "msg_obligation-42" {
+		t.Fatalf("MessageID = %q, want msg_obligation-42", opts.MessageID)
+	}
+	if opts.MessageID != MessageIDForObligation("obligation-42") {
+		t.Fatalf("MessageID не детерминирован: %q", opts.MessageID)
+	}
+	if opts.Delivery != "steer" || !opts.Resume {
+		t.Fatalf("стартовые опции = %+v, want delivery=steer resume=true", opts)
+	}
+}
+
+func TestPromptWithOptionsPostsMessageIDDeliveryAndResume(t *testing.T) {
+	var body []byte
+	doer := &fakeDoer{fn: func(req *http.Request) (*http.Response, error) {
+		var err error
+		body, err = io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		return fakeResponse(`{}`, http.StatusOK), nil
+	}}
+	c := newTestClient(t, doer)
+
+	// Один и тот же messageID указывает на одну работу: id выводится из
+	// obligationID, а не создаётся заново при каждом вызове (AUTOSP-02).
+	opts := StartPromptOptions("obligation-42")
+	if err := c.PromptWithOptions(context.Background(), "ses_created", "first turn", opts); err != nil {
+		t.Fatalf("PromptWithOptions: %v", err)
+	}
+
+	reqs := doer.snapshot()
+	if len(reqs) != 1 {
+		t.Fatalf("ожидался 1 запрос, получено %d", len(reqs))
+	}
+	req := reqs[0]
+	if req.Method != http.MethodPost || req.URL.Path != "/api/session/ses_created/prompt" {
+		t.Fatalf("неверный запрос: %s %s", req.Method, req.URL.Path)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("неверный JSON тела: %v (%s)", err, body)
+	}
+	if payload["text"] != "first turn" {
+		t.Fatalf("неверный text: %v", payload["text"])
+	}
+	id, ok := payload["id"].(string)
+	if !ok || id != "msg_obligation-42" {
+		t.Fatalf("id = %v, want msg_obligation-42", payload["id"])
+	}
+	if payload["delivery"] != "steer" {
+		t.Fatalf("delivery = %v, want steer", payload["delivery"])
+	}
+	if payload["resume"] != true {
+		t.Fatalf("resume = %v, want true", payload["resume"])
+	}
+	if _, present := payload["agent"]; present {
+		t.Fatalf("agent не должен присутствовать в теле prompt: %s", body)
+	}
+	if _, present := payload["messageID"]; present {
+		t.Fatalf("поле должно называться id, а не messageID: %s", body)
+	}
+}
+
 func TestPromptEscapesSessionID(t *testing.T) {
 	doer := &fakeDoer{fn: func(*http.Request) (*http.Response, error) {
 		return fakeResponse(`{}`, http.StatusOK), nil
