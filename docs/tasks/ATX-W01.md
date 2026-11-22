@@ -1,5 +1,5 @@
 # ATX-W01. Не удалять обязательства с запланированным повтором при GC
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/store/gc.go, internal/infra/store/gc_test.go
@@ -12,3 +12,7 @@
 Шаги: Включить `NextRetryAt` и максимальный `Attempts[].At` в расчёт последней активности. Считать обязательство молодым, если `NextRetryAt` больше текущего времени. Запретить удаление при ненулевом будущем `NextRetryAt` независимо от ретеншна. Добавить тест с отсутствующей строкой Watch, старым `StagedAt` и будущим `NextRetryAt`.
 Проверка: CI зелёный. Повторный прогон `GCObligations` с тем же `now` не удаляет строку с активным ретраем. Строка без ретрая и со старым временем по-прежнему удаляется.
 Приёмка: Живой ретрай переживает GC, аудит удаления не содержит обязательств с отложенной доставкой.
+
+Причина: Already landed in PR #1642 (commit 4bfa7802508ff04254c6527dcdda4dda5cad8747): fix(store): keep obligations with a pending retry through GC (ATX-W01). git merge-base --is-ancestor 4bfa78025 origin/main exit 0.
+Закрыл: ses_dfcd81a70ffe6MNjcwhRE5cexF
+Время закрытия: 2026-11-22T12:09:10Z
