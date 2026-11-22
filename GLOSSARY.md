@@ -52,6 +52,24 @@ _Avoid_: retry loop, backoff, cron
 Периодический проход, который читает живое состояние, считает вердикт и применяет побочные действия. В коде это `cibridge.Refresh` по тику опроса CI, по умолчанию раз в 30 секунд, и проход `beacon daemon`, по умолчанию раз в три минуты. Каждый проход получает собственный `cycleID`, который попадает во все его события.
 _Avoid_: polling, heartbeat, watchdog
 
+### Информационные проверки
+
+**Информационная проверка**:
+CI-проверка, которая не может заблокировать Watch. Провайдер помечает её как `required: false` в снимке CI, а workflow может задать `continue-on-error: true`. Падение такой проверки не даёт `VerdictBlocked`, `keep_working` и решение `blocked:not_mine`. Её имя не попадает в `failedChecks` в wake, в `BlockedInfo.FailedChecks` и в сигнатуру `BlockerIncident`. Fallback `gh run rerun --failed` тоже исключает её.
+_Avoid_: optional check, informational gate, мягкая проверка
+
+**required:false**:
+Значение обязательности проверки в снимке CI. Домен читает его в `realFailures`, в правиле 5 `EvaluatePR` и при восстановлении rollup. Проверка с `required: false` не считается провалом при расчёте вердикта и не будит executor. Провайдер обязан брать значение из источника обязательности. Батч-провайдер читает `IsRequired`, легаси-провайдер не должен ставить `true` для всех проверок.
+_Avoid_: optional, non-blocking flag, мягкий гейт
+
+**Источники `VerdictBlocked`**:
+Правило 5 в `EvaluatePR` (`internal/domain/verdict.go`) даёт блок, когда проверка упала на базовой ветке и не является информационной. Исчерпание бюджета ребейза даёт блок в `blockRebaseExhausted` (`internal/infra/cibridge/bridge.go`) с причиной `rebase-budget-exhausted`. Приложение `applyBlocked` (`internal/infra/cibridge/verdict_applier.go`) публикует блок, пишет `BlockedInfo` и открывает `BlockerIncident`. Источники вне проверок не зависят от `Required`. Информационная проверка исключена только правилом 5.
+_Avoid_: blocked by check, красная проверка, external failure
+
+**Источники `keep_working`**:
+Провал rollup `FAILURE` или `ERROR` без флейковых проверок даёт `keep_working` в `Evaluate` и `EvaluatePR` (`internal/domain/verdict.go`). Ошибка или удержание мержа даёт `keep_working` в `applyMerge` (`internal/infra/cibridge/verdict_applier.go`), когда причина не конфликт после повторной попытки. Источники вне проверок не зависят от `Required`: исчерпание бюджета ребейза и ошибка мержа. Информационная проверка не даёт `keep_working` ни в одном из этих путей.
+_Avoid_: failed check, retry forever, жди CI
+
 ### Блокеры и управление
 
 **BlockerIncident**:
