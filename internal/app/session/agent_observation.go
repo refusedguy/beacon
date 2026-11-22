@@ -105,11 +105,12 @@ type Agent struct {
 // AgentMatch reports whether a process is the agent a caller is looking for.
 type AgentMatch func(Process) bool
 
-// IsAgentProcess reports whether cmd names a known agent runtime. It matches
-// the first word case-insensitively, so flags and arguments do not matter.
-func IsAgentProcess(cmd string) bool {
+// IsAgentProcess reports whether a process is a known agent runtime. It
+// matches the first word of Cmd case-insensitively, so flags and arguments do
+// not matter. Its signature satisfies AgentMatch.
+func IsAgentProcess(p Process) bool {
 	first := ""
-	if fields := strings.Fields(cmd); len(fields) > 0 {
+	if fields := strings.Fields(p.Cmd); len(fields) > 0 {
 		first = strings.ToLower(fields[0])
 	}
 	switch first {
