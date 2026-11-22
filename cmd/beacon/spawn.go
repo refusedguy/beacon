@@ -132,14 +132,35 @@ const (
 // "ai.opencode/sessionID" used by watch (internal/infra/mcp/meta.go:15).
 const spawnParentEnv = "BEACON_PARENT_SESSION"
 
-// spawnPrompt builds the first message of a new session. It names the task so
-// the agent knows which Beacon card to take; the agent itself is fixed at
-// session creation and is deliberately absent here.
+// spawnClaimInstruction pins a spawned child to one card. It names the claim
+// tool and the exact cardID, so the child takes its own card instead of the
+// first todo card in the store (SL-04).
+func spawnClaimInstruction(cardID string) string {
+	return fmt.Sprintf("Сначала вызови %s с cardID %s и работай только с этой карточкой.", mcp.TaskClaimToolName, cardID)
+}
+
+// spawnPrompt builds the first message of a new session. It names the task and
+// adds an explicit claim instruction, so the exact cardID reaches the child in
+// text. The agent itself is fixed at session creation and is deliberately absent
+// here.
 func spawnPrompt(taskID, title string) string {
+	var prompt string
 	if title != "" {
-		return fmt.Sprintf("Выполни задачу Beacon %s: %s", taskID, title)
+		prompt = fmt.Sprintf("Выполни задачу Beacon %s: %s", taskID, title)
+	} else {
+		prompt = fmt.Sprintf("Выполни задачу Beacon %s", taskID)
 	}
-	return fmt.Sprintf("Выполни задачу Beacon %s", taskID)
+	return prompt + "\n" + spawnClaimInstruction(taskID)
+}
+
+// spawnPromptMatchesMeta reports whether the prompt pins the same card as the
+// session metadata. Metadata without spawnMetaTaskID is left unconstrained.
+func spawnPromptMatchesMeta(prompt string, metadata map[string]string) bool {
+	cardID, ok := metadata[spawnMetaTaskID]
+	if !ok {
+		return true
+	}
+	return strings.Contains(prompt, spawnClaimInstruction(cardID))
 }
 
 // AgentDefinition is the single typed description of a subagent handed to the
@@ -336,7 +357,12 @@ func (c *CLI) runSpawnWithParent(args []string, parentID string) int {
 	// repeat of the same spawn does not start a second turn. delivery steer with
 	// resume true continues the created session instead of restarting its
 	// context (ADR 0060 п3, ADR 0306, ADR 0309).
-	if err := spawner.PromptWithOptions(context.Background(), sessionID, spawnPrompt(taskID, sessionTitle), opencode.StartPromptOptions(taskID)); err != nil {
+	prompt := spawnPrompt(taskID, sessionTitle)
+	if !spawnPromptMatchesMeta(prompt, metadata) {
+		fmt.Fprintln(c.errOut, "beacon spawn: cardID в промпте и метаданных расходятся")
+		return 2
+	}
+	if err := spawner.PromptWithOptions(context.Background(), sessionID, prompt, opencode.StartPromptOptions(taskID)); err != nil {
 		fmt.Fprintf(c.errOut, "beacon spawn: сессия %s создана, но промпт не отправлен: %v\n", sessionID, err)
 		return 2
 	}
