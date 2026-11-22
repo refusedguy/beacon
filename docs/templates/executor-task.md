@@ -795,6 +795,24 @@ scope: comments-and-suppressions
 source: pstack/agents/comment-sicko.md, CP-17
 executor-task:suppression-audit -->
 
+## Предложение по кодификации
+
+Когда исполнитель встречает ограничительный комментарий, он предлагает проверку вместо удаления. Проверкой может быть тип, runtime-проверка, тест или CI-линт. Исполнитель берёт самый дешёвый контроль, который падает на реальный прошлый случай.
+
+Отчёт хода содержит поле `предложение по кодификации`. Поле несёт путь и строку комментария, выбранный контроль и ссылку на случай, где контроль падает. Если контроль найти не удалось, поле сообщает, что комментарий остаётся открытым ограничением. Исполнитель не удаляет комментарий без одобрения владельца. После одобрения он вносит контроль и удаляет комментарий, оставляя ссылку на контроль.
+
+Фраза завершения хода `waiting, watchID` не меняется.
+
+<!-- executor-task:codification-proposal
+trigger: limiting-comment
+field: codification-proposal
+control: type, runtime-check, test, ci-lint
+select: cheapest-control-that-fails-past-case
+approval: before-deletion
+report-phrase: unchanged
+source: pstack/skills/no-comments/SKILL.md:23, PSKX-13
+executor-task:codification-proposal -->
+
 ## Запреты
 
 - Не запускать опрос в цикле вместо завершения хода.
