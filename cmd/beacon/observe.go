@@ -237,6 +237,7 @@ func setupObserve(args ...string) func() {
 		metrics := observe.NewMetrics()
 		observe.SetDefault(observe.NewRecorder(logger, metrics))
 		log.SetOutput(observe.NewLogWriter(logger))
+		observe.ReplayConfigWarnings()
 		stopMetrics := startMetricsEndpoint(metrics, args)
 		var once sync.Once
 		return func() {
