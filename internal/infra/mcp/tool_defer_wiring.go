@@ -116,10 +116,17 @@ func (h *DeferWiringHandler) Defer(ctx context.Context, in DeferWiringInput) (De
 	}
 	key := deferWiringKey(in.WatchID, in.Reason)
 
+	// Hold the lock across the whole operation, including the writer call.
+	// The cache check and the cache write must cover the store write as one
+	// critical section. Otherwise two calls with the same key both miss the
+	// cache, both reach the writer, and the last one to finish overwrites
+	// h.seen while the store keeps the first card. A later call then reads a
+	// card from the cache that differs from the stored row. Serializing here
+	// makes the cached card the same one the store accepted.
 	h.mu.Lock()
-	existing, seen := h.seen[key]
-	h.mu.Unlock()
-	if seen {
+	defer h.mu.Unlock()
+
+	if existing, seen := h.seen[key]; seen {
 		return deferWiringOutput(existing, false), nil
 	}
 
@@ -127,9 +134,7 @@ func (h *DeferWiringHandler) Defer(ctx context.Context, in DeferWiringInput) (De
 	if err != nil {
 		return DeferWiringOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
-	h.mu.Lock()
 	h.seen[key] = card
-	h.mu.Unlock()
 	return deferWiringOutput(card, created), nil
 }
 
