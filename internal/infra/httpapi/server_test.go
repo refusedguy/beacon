@@ -352,7 +352,7 @@ func TestHumanDecideGuards(t *testing.T) {
 			r := decideRequest(body, "")
 			r.Header.Set("Content-Type", "text/plain")
 			return r
-		}(), http.StatusUnsupportedMediaType},
+		}(), http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

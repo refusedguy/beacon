@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // TestWriteErrorResponseFormat pins the bytes of the HTTP API error response.
@@ -46,5 +48,32 @@ func TestWriteErrorResponseFormat(t *testing.T) {
 				t.Fatalf("body = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSameOriginJSONInvalidInputStatus pins the status of the JSON guard on a
+// state-changing POST. INVALID_INPUT is registered as 400 in the domain table,
+// so a wrong Content-Type must return 400 and not 415.
+func TestSameOriginJSONInvalidInputStatus(t *testing.T) {
+	if got := domain.StatusForCode(domain.CodeInvalidInput); got != http.StatusBadRequest {
+		t.Fatalf("registered status for INVALID_INPUT = %d, want %d", got, http.StatusBadRequest)
+	}
+
+	s := &Server{}
+	h := s.sameOriginJSON(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("next handler ran for a non-JSON request")
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/human/decide", nil)
+	req.Header.Set("Content-Type", "text/plain")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	want := "{\"ok\":false,\"code\":\"INVALID_INPUT\",\"message\":\"нужен Content-Type: application/json\"}\n"
+	if got := w.Body.String(); got != want {
+		t.Fatalf("body = %q, want %q", got, want)
 	}
 }

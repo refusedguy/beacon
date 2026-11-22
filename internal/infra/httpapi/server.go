@@ -1087,7 +1087,7 @@ func (s *Server) bearer(next http.Handler) http.Handler {
 func (s *Server) sameOriginJSON(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if ct := strings.ToLower(r.Header.Get("Content-Type")); !strings.HasPrefix(ct, "application/json") {
-			writeError(w, http.StatusUnsupportedMediaType, string(domain.CodeInvalidInput), "нужен Content-Type: application/json")
+			writeError(w, http.StatusBadRequest, string(domain.CodeInvalidInput), "нужен Content-Type: application/json")
 			return
 		}
 		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !s.sameOrigin(origin) {
