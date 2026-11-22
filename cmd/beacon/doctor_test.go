@@ -482,3 +482,76 @@ func TestCU05CheckStateDirFallsBackToExistingStore(t *testing.T) {
 		t.Fatalf("каталог состояния %q, хотим %q", got.detail, legacy)
 	}
 }
+
+// FTE-09: doctor validates the OTEL exporter selector and warns on a typo
+// that would silently fall back to the local sink (eval e11). WARN never
+// blocks, so the exit code stays 0 for every value.
+func TestFTE09CheckOTELExporter(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{"пустое значение", "", doctorPass},
+		{"otlp", "otlp", doctorPass},
+		{"otlp в другом регистре", "OTLP", doctorPass},
+		{"опечатка", "bogus", doctorWarn},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(doctorOTELExporterEnv, tc.value)
+			c, out, errOut, _ := w115CLI(t, nil)
+
+			got := c.checkOTELExporter()
+			if got.status != tc.want {
+				t.Fatalf("статус %q, хотим %q: %s", got.status, tc.want, got.detail)
+			}
+			if !strings.Contains(got.detail, doctorOTELExporterEnv) {
+				t.Fatalf("нет имени переменной в detail: %q", got.detail)
+			}
+
+			code := c.renderDoctorChecks([]checkResult{got})
+			if code != 0 {
+				t.Fatalf("код выхода %d, хотим 0", code)
+			}
+			line := out.String()
+			if !strings.Contains(line, doctorOTELExporterEnv) {
+				t.Fatalf("нет имени переменной в выводе: %q", line)
+			}
+			if tc.want == doctorWarn && !strings.Contains(line, doctorWarn) {
+				t.Fatalf("нет WARN для неверного значения: %q", line)
+			}
+			if tc.want != doctorWarn && strings.Contains(line, doctorWarn) {
+				t.Fatalf("WARN при корректном значении: %q", line)
+			}
+			if errOut.Len() != 0 {
+				t.Fatalf("stderr не пустой: %q", errOut.String())
+			}
+		})
+	}
+}
+
+// FTE-09: the OTEL check runs as part of `beacon doctor`, not only in a unit
+// call. A bad exporter yields a WARN line with the variable name and exit 0.
+func TestFTE09DoctorRunsOTELCheck(t *testing.T) {
+	t.Setenv(doctorOTELExporterEnv, "bogus")
+	t.Setenv(doctorGatesEnv, "")
+	t.Setenv("PATH", t.TempDir())
+	gates := filepath.Join(t.TempDir(), "beacon-gates")
+	if err := os.WriteFile(gates, []byte("binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(doctorGatesEnv, gates)
+	t.Setenv("BEACON_STATE_DIR", t.TempDir())
+
+	c, out, errOut, _ := w115CLI(t, func(w115Call) runResult {
+		return runResult{stdout: []byte("go version go1.27.4 linux/amd64\n")}
+	})
+	if code := c.Run([]string{"doctor"}); code != 0 {
+		t.Fatalf("код выхода %d, stderr %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "otel-exporter: "+doctorWarn) ||
+		!strings.Contains(out.String(), doctorOTELExporterEnv) {
+		t.Fatalf("нет WARN OTEL в выводе doctor: %q", out.String())
+	}
+}
