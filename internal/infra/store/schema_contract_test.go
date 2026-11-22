@@ -33,8 +33,12 @@ func TestWakeIntentWriterDecoderAndFixtureAgree(t *testing.T) {
 		WHERE json_extract(payload, '$.kind') = ?`, wakeIntentKind).Scan(&version, &payload); err != nil {
 		t.Fatalf("read wake row: %v", err)
 	}
-	if version != 2 || version != int(defaultWakeSchemaVersion) {
-		t.Fatalf("row schema_version = %d, want %d", version, defaultWakeSchemaVersion)
+	wantVersion := int(defaultWakeSchemaVersion)
+	if wantVersion != 2 {
+		t.Fatalf("defaultWakeSchemaVersion = %d, want 2", wantVersion)
+	}
+	if version != wantVersion {
+		t.Fatalf("row schema_version = %d, want %d", version, wantVersion)
 	}
 	if string(payload) != wakeIntentGoldenPayload {
 		t.Fatalf("row payload = %s, want %s", payload, wakeIntentGoldenPayload)
