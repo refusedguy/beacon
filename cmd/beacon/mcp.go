@@ -699,7 +699,10 @@ func openProcessStore(dir string) (*store.DB, error) {
 	if err := mcp.EnsureStateDir(dir); err != nil {
 		return nil, err
 	}
-	return store.Open(filepath.Join(dir, mcpStateDBName))
+	// The long-lived process writes secrets (CI payloads, wake tokens) through
+	// this handle. Only OpenProduction installs the redacting driver and the
+	// observed writer, so persist.seq and sqlite-redact stay honest (AUD-04).
+	return store.OpenProduction(filepath.Join(dir, mcpStateDBName))
 }
 
 // buildMCPDependencies wires the seven real MCP tool ports around one DB

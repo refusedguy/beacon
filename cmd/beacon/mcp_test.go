@@ -635,6 +635,52 @@ func TestReadSyncCallConfig(t *testing.T) {
 	}
 }
 
+// TestOpenProcessStoreUsesProductionStore pins AUD-04's first fix: the
+// long-lived MCP process opens its state DB with OpenProduction, so writes go
+// through the observed writer and bound parameters pass through sqlite-redact.
+func TestOpenProcessStoreUsesProductionStore(t *testing.T) {
+	db, err := openProcessStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("openProcessStore: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	before, err := db.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState before write: %v", err)
+	}
+	if before.Seq != 0 {
+		t.Fatalf("initial persist.seq = %d, want 0", before.Seq)
+	}
+
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	if err := db.SaveRuntimeStats([]byte(`{"token":"`+secret+`"}`), time.Now().UTC()); err != nil {
+		t.Fatalf("SaveRuntimeStats: %v", err)
+	}
+
+	after, err := db.PersistState()
+	if err != nil {
+		t.Fatalf("PersistState after write: %v", err)
+	}
+	if after.Seq <= before.Seq {
+		t.Fatalf("persist.seq = %d after one write, want > %d", after.Seq, before.Seq)
+	}
+
+	stored, ok, err := db.LoadRuntimeStats()
+	if err != nil {
+		t.Fatalf("LoadRuntimeStats: %v", err)
+	}
+	if !ok {
+		t.Fatal("runtime_stats row was not saved")
+	}
+	if strings.Contains(string(stored), secret) {
+		t.Fatalf("stored payload kept the token: %s", stored)
+	}
+	if !strings.Contains(string(stored), "[REDACTED]") {
+		t.Fatalf("stored payload has no redaction marker: %s", stored)
+	}
+}
+
 // TestSyncCallThresholdWiredIntoProductionDeps proves the card's link: the
 // composition root puts the single threshold into Dependencies.After, so the
 // production server applies it to its long synchronous calls. Previously After
