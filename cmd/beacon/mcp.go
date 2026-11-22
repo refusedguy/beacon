@@ -1727,7 +1727,7 @@ func orchestratorIDSource(db *store.DB, projectKey, root string) cibridge.Orches
 // opencodeWakePorts adapts the live opencode client to the HTTP ports of the
 // wake deliverer. A missing service registration yields nil ports, so the
 // deliverer falls back to its own CLI path instead of faking delivery.
-func opencodeWakePorts() (wake.PromptFunc, wake.SessionActiveFunc) {
+func opencodeWakePorts() (wake.PromptWithIDFunc, wake.SessionActiveFunc) {
 	port, err := newReadOnlyOpencodePort()
 	if err != nil || port == nil {
 		return nil, nil
@@ -1736,8 +1736,11 @@ func opencodeWakePorts() (wake.PromptFunc, wake.SessionActiveFunc) {
 	if !ok {
 		return nil, nil
 	}
-	prompt := func(ctx context.Context, sessionID, text, delivery string) error {
-		return client.Prompt(ctx, sessionID, text)
+	prompt := func(ctx context.Context, sessionID, text, delivery, obligationID string, resume bool) error {
+		opts := opencode.StartPromptOptions(obligationID)
+		opts.Delivery = delivery
+		opts.Resume = resume
+		return client.PromptWithOptions(ctx, sessionID, text, opts)
 	}
 	active := func(ctx context.Context, sessionID string) (bool, bool, error) {
 		sessions, err := client.Sessions(ctx)
@@ -1762,7 +1765,7 @@ func reconcileWaker(db *store.DB) *wake.Registry {
 	registry := wake.NewRegistry()
 	prompt, active := opencodeWakePorts()
 	registry.Register(wake.AdapterOpenCode, &wake.OpenCodeDeliverer{
-		PromptFunc:        prompt,
+		PromptWithIDFunc:  prompt,
 		SessionActiveFunc: active,
 		Obligations:       db,
 	})

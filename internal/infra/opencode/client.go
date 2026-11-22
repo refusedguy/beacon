@@ -46,6 +46,25 @@ type Doer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
+// StatusError reports a non-2xx HTTP response. The code stays available to
+// callers that classify the response, such as duplicate prompt ids (ADR 0077).
+// Error keeps the text the generic non-2xx error had before this type existed.
+type StatusError struct {
+	Method string
+	Path   string
+	Code   int
+	Status string
+	Body   string
+}
+
+func (e *StatusError) Error() string {
+	body := strings.TrimSpace(e.Body)
+	if body == "" {
+		body = e.Status
+	}
+	return fmt.Sprintf("opencode %s %s: %s: %s", e.Method, e.Path, e.Status, body)
+}
+
 // Client reads the HTTP API at the address from service.json.
 type Client struct {
 	baseURL  string
@@ -247,11 +266,13 @@ func (c *Client) send(ctx context.Context, method, path string, payload any) (*h
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxHTTPBodyBytes))
-		msg := strings.TrimSpace(string(body))
-		if msg == "" {
-			msg = resp.Status
+		return nil, &StatusError{
+			Method: method,
+			Path:   path,
+			Code:   resp.StatusCode,
+			Status: resp.Status,
+			Body:   string(body),
 		}
-		return nil, fmt.Errorf("opencode %s %s: %s: %s", method, path, resp.Status, msg)
 	}
 	return resp, nil
 }
@@ -437,6 +458,13 @@ func (c *Client) PromptWithOptions(ctx context.Context, sessionID, text string, 
 	path := "/api/session/" + url.PathEscape(sessionID) + "/prompt"
 	resp, err := c.post(ctx, path, payload)
 	if err != nil {
+		// ADR 0077: 409 is a duplicate message id, not a failed prompt. A
+		// caller that set an id already owns this turn, so the repeat is a
+		// success. Errors without an id keep their original meaning.
+		var statusErr *StatusError
+		if opts.MessageID != "" && errors.As(err, &statusErr) && statusErr.Code == http.StatusConflict {
+			return nil
+		}
 		return err
 	}
 	defer resp.Body.Close()

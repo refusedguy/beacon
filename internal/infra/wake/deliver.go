@@ -42,6 +42,13 @@ type PromptFunc func(ctx context.Context, sessionID, text, delivery string) erro
 // adopt the new port in MEM-04.
 type PromptWithResumeFunc func(ctx context.Context, sessionID, text, delivery string, resume bool) error
 
+// PromptWithIDFunc is the id-aware HTTP port. obligationID becomes the prompt's
+// message id, so a retried wake is a duplicate instead of a second turn
+// (ADR 0306, ADR 0077). delivery and resume come from the same decision the
+// CLI fallback uses. The adapter, not wake, derives the wire id: wake must not
+// import a sibling infra package (ADR 0005).
+type PromptWithIDFunc func(ctx context.Context, sessionID, text, delivery, obligationID string, resume bool) error
+
 // SessionActiveFunc reports whether sessionID is busy and still alive. A
 // session that no longer exists (HTTP 404) is an error wrapping ErrSessionDead.
 type SessionActiveFunc func(ctx context.Context, sessionID string) (busy bool, alive bool, err error)
@@ -88,6 +95,10 @@ type OpenCodeDeliverer struct {
 	// over PromptFunc when both are set, so the transport gets delivery and
 	// resume from one call. Nil keeps older adapters working unchanged.
 	PromptWithResumeFunc PromptWithResumeFunc
+	// PromptWithIDFunc is the id-aware form of the same port. It wins over
+	// PromptWithResumeFunc and PromptFunc so the adapter can send the message
+	// id. Nil keeps existing adapters working unchanged.
+	PromptWithIDFunc PromptWithIDFunc
 	// SessionActiveFunc decides queue vs steer before a prompt is sent.
 	SessionActiveFunc SessionActiveFunc
 	// Obligations makes the delivery fact survive a process restart.
@@ -342,20 +353,24 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 		return d.markDelivered(key, p)
 	}
 	// Both transports must see the same delivery and resume decision. The CLI
-	// fallback carries both in its body. The HTTP port gets them here: use the
-	// resume-aware port when installed, and wrap the legacy one so it keeps
-	// compiling while MEM-04 adopts the new signature.
-	var prompt func(context.Context, string, string, string, bool) error
+	// fallback carries both in its body. The HTTP port gets them here, and the
+	// id-aware port also gets the obligation id for the prompt's message id.
+	// Older ports are wrapped so they keep working without the id.
+	var prompt func(context.Context, string, string, string, string, bool) error
 	switch {
+	case d.PromptWithIDFunc != nil:
+		prompt = d.PromptWithIDFunc
 	case d.PromptWithResumeFunc != nil:
-		prompt = d.PromptWithResumeFunc
+		prompt = func(ctx context.Context, sessionID, text, delivery string, _ string, resume bool) error {
+			return d.PromptWithResumeFunc(ctx, sessionID, text, delivery, resume)
+		}
 	case d.PromptFunc != nil:
-		prompt = func(ctx context.Context, sessionID, text, delivery string, _ bool) error {
+		prompt = func(ctx context.Context, sessionID, text, delivery string, _ string, _ bool) error {
 			return d.PromptFunc(ctx, sessionID, text, delivery)
 		}
 	}
 	if prompt != nil {
-		err := prompt(ctx, sessionID, text, delivery, resume)
+		err := prompt(ctx, sessionID, text, delivery, p.ObligationID, resume)
 		switch {
 		case err == nil:
 			return d.markDelivered(key, p)
