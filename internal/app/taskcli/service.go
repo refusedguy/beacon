@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 // DefaultLockRetryInterval совпадает с шагом повтора taskstore.AcquireLock.
@@ -143,10 +144,10 @@ func acquireLockWithInterval(lockPath, root string, retry time.Duration) (cardLo
 
 var (
 	adrRefRE = regexp.MustCompile(`^ADR ([0-9]{4})$`)
-	// Cards come from several waves: T3.226, T5.1, S1.001 and UI-31. All of
-	// them are valid identifiers, so the lister must not reject a new wave
-	// just because its prefix differs from the original T<n>.<n> form.
-	idrRE     = regexp.MustCompile(`^[A-Za-z]+[0-9]*[.-][0-9]+$`)
+	// The ID grammar lives in taskstore.IsID and is reached through the
+	// taskcli facade. Cards come from several waves: T3.226, T5.1, S1.001,
+	// ATX-R01 and RS-CMP-06. A local regex rejected the new forms, so the
+	// parsers now share taskstore's contract instead.
 	adrStatRE = regexp.MustCompile(`(?m)^Статус:[ \t]*(.*)$`)
 	// cardStatusLineRE matches the three fields Take writes. The taskstore
 	// copy is private to that package, so taskcli keeps its own here.
@@ -184,7 +185,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		return "", Validationf("beacon task list: неверное значение --format %q, ожидается table или json", o.Format)
 	}
 	for _, v := range o.Statuses {
-		if !oneOf(v, "todo", "in_progress", "done", "dropped") {
+		if !taskstore.IsValidStatus(v) {
 			return "", Validationf("неизвестный статус %q", v)
 		}
 	}
@@ -322,7 +323,7 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	}
 	if deps != "нет" {
 		for _, d := range splitFlagList(deps) {
-			if !idrRE.MatchString(d) {
+			if !IsID(d) {
 				return "", "", Validationf("неверный ID зависимости %q", d)
 			}
 		}
@@ -599,7 +600,7 @@ func (s *Service) validateReference(ref, typ string, cards []Card) error {
 		}
 		return nil
 	}
-	if idrRE.MatchString(ref) {
+	if IsID(ref) {
 		if typ == "epic" {
 			return Validationf("эпик обязан ссылаться на ADR, получено %s", ref)
 		}

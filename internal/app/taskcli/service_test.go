@@ -130,6 +130,66 @@ func TestListTableAndBadFormat(t *testing.T) {
 	}
 }
 
+func TestListUsesTaskstoreStatusContract(t *testing.T) {
+	e := newEnv(t)
+	statuses := taskstore.ValidStatuses()
+	for i, status := range statuses {
+		id := fmt.Sprintf("T2.%d", i+1)
+		e.card(t, id, status, "task", "ADR 0001", fmt.Sprintf("internal/app/%d.go", i+1), "нет", "нет")
+	}
+
+	for _, status := range statuses {
+		out, err := e.svc.List(ListOptions{Format: "json", Statuses: []string{status}})
+		if err != nil {
+			t.Errorf("статус %s из taskstore.ValidStatuses отвергнут: %v", status, err)
+			continue
+		}
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(out), &rows); err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0]["status"] != status {
+			t.Errorf("фильтр %s: %s", status, out)
+		}
+	}
+	if _, err := e.svc.List(ListOptions{Statuses: []string{"closed"}}); taskstore.Code(err) != 1 {
+		t.Fatalf("неизвестный статус должен дать код 1, получил %v", err)
+	}
+}
+
+func TestNewUsesTaskstoreIDContract(t *testing.T) {
+	for _, id := range []string{"ATX-R01", "RS-CMP-06", "T3.17", "WIRING-485", "S1.001"} {
+		if !taskstore.IsID(id) {
+			t.Fatalf("тестовая форма %s не проходит taskstore.IsID", id)
+		}
+		t.Run("зависимость "+id, func(t *testing.T) {
+			e := newEnv(t)
+			o := e.good()
+			o.Dependencies = id + ", T2.9"
+			idNew, _, err := e.svc.New(o)
+			if err != nil {
+				t.Fatalf("зависимость %s отвергнута: %v", id, err)
+			}
+			data, err := os.ReadFile(filepath.Join(e.tasksDir, idNew+".md"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), "Зависимости: "+id+", T2.9") {
+				t.Errorf("зависимость не сохранена: %s", data)
+			}
+		})
+		t.Run("ссылка "+id, func(t *testing.T) {
+			e := newEnv(t)
+			e.card(t, id, "todo", "epic", "ADR 0001", "internal/app/epic.go", "нет", "нет")
+			o := e.good()
+			o.Reference = id
+			if _, _, err := e.svc.New(o); err != nil {
+				t.Fatalf("ссылка на эпик %s отвергнута: %v", id, err)
+			}
+		})
+	}
+}
+
 func TestNewDryRunAndCreate(t *testing.T) {
 	e := newEnv(t)
 	o := e.good()

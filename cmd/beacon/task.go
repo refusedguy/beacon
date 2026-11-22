@@ -85,10 +85,13 @@ var whyEdgeKinds = []string{
 	"depends-on", "conflicts-with", "part-of", "derived-from", "supersedes", "same-as",
 }
 
-// whyCardID — грамматика ID, которую понимает ParseCard. Она совпадает с
-// taskstore.exactIDRE: буквенный префикс, дефис или точка и номер. Поэтому
-// почему-граф видит не только T3.17, но и RS-MCP-02, WIRING-485, BS.1 и S1.001.
-const whyCardID = `[A-Za-z][A-Za-z0-9_-]*[.-][0-9]+`
+// whyCardID повторяет грамматику taskstore.exactIDRE без якорей: буквенный
+// префикс, затем либо -<буквы><цифры> (ATX-R01, RS-CMP-06), либо точка или
+// дефис и номер (T3.17, WIRING-485, BS.1, S1.001). Старый шаблон принимал
+// только цифры после разделителя и не видел рёбра к ATX-R01 и RS-CMP-06.
+// Кандидатов всё равно проверяет taskstore.IsID в whyEdges, поэтому здесь
+// важна полнота, а не строгость.
+const whyCardID = `[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|[.-][0-9]+)`
 
 // whyEdgeRE находит ребро и ID карточки в строке, например
 // "depends-on T3.17", "conflicts-with:RS-MCP-02" или "same-as: BS.1".
@@ -344,7 +347,7 @@ func whyChain(start string, byID map[string]taskstore.Card) []whyStep {
 }
 
 func whyClosed(c taskstore.Card) bool {
-	return c.Status == "done" || c.Status == "dropped"
+	return c.Status == "done" || c.Status == "dropped" || c.Status == "duplicate"
 }
 
 // whyDependents возвращает карточки, которые прямо зависят от id. Это обратные
