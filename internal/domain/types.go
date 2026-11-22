@@ -1297,3 +1297,36 @@ type GraphStatus struct {
 func (g GraphStatus) Ready() bool {
 	return g.Built && g.IndexHash != "" && g.IndexHash == g.SourceHash
 }
+
+// ---- CSx-08: rate-limit event ----
+//
+// The call budget reports a state change before a call is rejected. The
+// planner needs that early signal to slow new spawns. HTTP 429 stays a separate
+// call error (CodeRateLimited); this event only carries budget state.
+
+// RateLimitStatus is the state reported by a rate-limit event. The values
+// mirror allowed, allowed_warning and rejected from the agent SDK.
+type RateLimitStatus string
+
+const (
+	RateLimitAllowed        RateLimitStatus = "allowed"
+	RateLimitAllowedWarning RateLimitStatus = "allowed_warning"
+	RateLimitRejected       RateLimitStatus = "rejected"
+)
+
+// RateLimitEvent is one change in the call budget. Utilization is the used
+// share of the window in [0, 1]. ResetsAt is the refill time; the zero value
+// means the producer did not supply one. A rejected status is a scheduling
+// signal and does not replace the HTTP 429 error path.
+type RateLimitEvent struct {
+	Status      RateLimitStatus `json:"status"`
+	Utilization float64         `json:"utilization"`
+	ResetsAt    time.Time       `json:"resets_at"`
+}
+
+// IsThrottled reports whether the event asks the caller to hold new spawns.
+// Only the warning and rejected states throttle; allowed and unrecognised
+// states do not.
+func (e RateLimitEvent) IsThrottled() bool {
+	return e.Status == RateLimitAllowedWarning || e.Status == RateLimitRejected
+}

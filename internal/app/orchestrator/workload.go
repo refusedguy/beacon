@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // OrchestratorSubscriberID is the stable identity used when the workload
@@ -64,17 +65,18 @@ type WorkloadWatch struct {
 // installed during the pass. SlotsTotal is the configured parallel-slot
 // budget; SlotsUsed is the number of active slots in the same snapshot.
 type Workload struct {
-	Total          int            `json:"total"`
-	Ready          int            `json:"ready"`
-	NeedsAttention int            `json:"needsAttention"`
-	Watching       int            `json:"watching"`
-	Registered     int            `json:"registered"`
-	SlotsTotal     int            `json:"slotsTotal"`
-	SlotsUsed      int            `json:"slotsUsed"`
-	ByVerdict      map[string]int `json:"byVerdict"`
-	ByRole         map[string]int `json:"byRole"`
-	ByProject      map[string]int `json:"byProject"`
-	ByAttention    map[string]int `json:"byAttention"`
+	Total          int               `json:"total"`
+	Ready          int               `json:"ready"`
+	NeedsAttention int               `json:"needsAttention"`
+	Watching       int               `json:"watching"`
+	Registered     int               `json:"registered"`
+	SlotsTotal     int               `json:"slotsTotal"`
+	SlotsUsed      int               `json:"slotsUsed"`
+	RateLimit      WorkloadRateLimit `json:"rateLimit"`
+	ByVerdict      map[string]int    `json:"byVerdict"`
+	ByRole         map[string]int    `json:"byRole"`
+	ByProject      map[string]int    `json:"byProject"`
+	ByAttention    map[string]int    `json:"byAttention"`
 }
 
 // WorkloadStore is the port the command needs from Beacon state: read the
@@ -92,6 +94,80 @@ type WorkloadStore interface {
 // compiles and reports the budget derived from the watch snapshot.
 type SlotBudgetStore interface {
 	SlotBudget(ctx context.Context) (total int, used int, err error)
+}
+
+// Rate-limit statuses mirrored as plain strings so the app layer names no
+// domain type. The values match the domain RateLimitStatus constants.
+const (
+	workloadRateAllowed  = "allowed"
+	workloadRateWarning  = "allowed_warning"
+	workloadRateRejected = "rejected"
+)
+
+// WorkloadRateLimit is the app-layer projection of a rate-limit event.
+// Utilization is the used share of the window in [0, 1]. ResetsAt is the
+// refill time; the zero time means the producer did not supply one. The
+// composition root projects the domain event into this shape because ADR 0005
+// forbids internal/app -> internal/domain.
+type WorkloadRateLimit struct {
+	Status      string    `json:"status"`
+	Utilization float64   `json:"utilization"`
+	ResetsAt    time.Time `json:"resets_at"`
+}
+
+// RateLimitStore is an optional capability for stores that can read the latest
+// rate-limit event. A store without it still compiles and reports no budget
+// signal, so the daemon adapter stays unchanged.
+type RateLimitStore interface {
+	RateLimit(ctx context.Context) (WorkloadRateLimit, error)
+}
+
+// SpawnPlan is the planner's answer for one pass over pending spawns. Allowed
+// and Deferred split the new spawns. RejectedCalls stays zero: the planner
+// holds new work only and never cancels a call already running. HTTP 429 is a
+// separate call error and is not counted here.
+type SpawnPlan struct {
+	Allowed       []string
+	Deferred      []string
+	RejectedCalls int
+	Until         time.Time
+	Reason        string
+}
+
+// SpawnPlanner turns a rate-limit event into a spawn decision. It holds no
+// domain type and reads only the event projected by the composition root.
+type SpawnPlanner struct {
+	limit WorkloadRateLimit
+}
+
+// NewSpawnPlanner creates a planner for one rate-limit event.
+func NewSpawnPlanner(limit WorkloadRateLimit) SpawnPlanner {
+	return SpawnPlanner{limit: limit}
+}
+
+// PlanSpawns splits pending spawn ids into ones that start now and ones that
+// wait. A warning defers every new spawn until ResetsAt and leaves running
+// calls alone. Rejected holds every new spawn. Allowed and unrecognised
+// statuses let the batch through. A warning whose reset time has already
+// passed also lets the batch through.
+func (p SpawnPlanner) PlanSpawns(now time.Time, pending []string) SpawnPlan {
+	plan := SpawnPlan{}
+	switch normalizeToken(p.limit.Status) {
+	case workloadRateWarning:
+		if p.limit.ResetsAt.After(now) {
+			plan.Until = p.limit.ResetsAt
+			plan.Reason = "rate limit warning"
+			plan.Deferred = append([]string(nil), pending...)
+			return plan
+		}
+	case workloadRateRejected:
+		plan.Reason = "rate limit rejected"
+		plan.Deferred = append([]string(nil), pending...)
+		return plan
+	case workloadRateAllowed:
+	}
+	plan.Allowed = append([]string(nil), pending...)
+	return plan
 }
 
 // normalizeToken folds case and surrounding space so verdicts and roles from
@@ -201,6 +277,12 @@ func BuildWorkload(watches []WorkloadWatch) Workload {
 	return out
 }
 
+// SpawnPlan decides the pending spawns against the rate-limit event carried by
+// this report. Callers use one path from the workload snapshot to the planner.
+func (w Workload) SpawnPlan(now time.Time, pending []string) SpawnPlan {
+	return NewSpawnPlanner(w.RateLimit).PlanSpawns(now, pending)
+}
+
 // RunWorkload reads the active Watches, enrolls the orchestrator on every
 // Watch that does not yet carry it and returns the report built from the
 // snapshot read before registration. Keeping the pre-registration snapshot
@@ -232,6 +314,15 @@ func RunWorkload(ctx context.Context, st WorkloadStore) (Workload, error) {
 		if used >= 0 {
 			report.SlotsUsed = used
 		}
+	}
+
+	if rs, ok := st.(RateLimitStore); ok {
+		limit, err := rs.RateLimit(ctx)
+		if err != nil {
+			return Workload{}, fmt.Errorf("workload: rate limit: %w", err)
+		}
+		limit.Status = normalizeToken(limit.Status)
+		report.RateLimit = limit
 	}
 
 	var errs []error
