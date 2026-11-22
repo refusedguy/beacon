@@ -354,7 +354,7 @@ func (h *w9Harness) applyBlock(e w9Event) {
 		return
 	}
 	info := BlockedInfo{
-		Reason:       "ci failed on base",
+		Reason:       BlockReasonBaseChecksFailed,
 		FailedChecks: []string{"ci/test"},
 		Since:        h.clock.at,
 		BlockedBy:    "w9",

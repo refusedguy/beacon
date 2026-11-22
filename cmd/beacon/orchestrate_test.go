@@ -92,7 +92,7 @@ func TestProjectWatchCopiesBlocked(t *testing.T) {
 		ID: "w1", Repo: "refusedguy/beacon", PR: 42, HeadSHA: "abc123",
 		Verdict: domain.VerdictBlocked, Revision: 7,
 		Blocked: &domain.BlockedInfo{
-			Reason:       "чужой тест",
+			Reason:       domain.BlockReasonNotMine,
 			FailedChecks: checks,
 			Since:        time.Unix(1, 0),
 			BlockedBy:    "executor",
@@ -105,7 +105,7 @@ func TestProjectWatchCopiesBlocked(t *testing.T) {
 	if got.Blocked == nil {
 		t.Fatal("projection dropped Watch.Blocked")
 	}
-	if got.Blocked.Reason != "чужой тест" || got.Blocked.BlockedBy != "executor" {
+	if got.Blocked.Reason != string(domain.BlockReasonNotMine) || got.Blocked.BlockedBy != "executor" {
 		t.Fatalf("block context = %+v", got.Blocked)
 	}
 	if got.Blocked.FixAttempts != 2 {

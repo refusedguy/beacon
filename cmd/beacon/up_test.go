@@ -112,7 +112,7 @@ func TestHandleUpCommandIgnoresPlainChat(t *testing.T) {
 
 func TestHandleUpCommandStatusReportsCounts(t *testing.T) {
 	blocked := upTestWatch("watch-2", 8)
-	blocked.Blocked = &domain.BlockedInfo{Reason: "not mine"}
+	blocked.Blocked = &domain.BlockedInfo{Reason: domain.BlockReasonNotMine}
 	status := upFakeStatus{
 		watches:  []domain.Watch{upTestWatch("watch-1", 7), blocked},
 		blockers: []domain.BlockerIncident{{ID: "blocker-1"}},
@@ -133,7 +133,7 @@ func TestHandleUpCommandStatusReportsCounts(t *testing.T) {
 
 func TestHandleUpCommandInspectFindsWatchByPR(t *testing.T) {
 	blocked := upTestWatch("watch-2", 8)
-	blocked.Blocked = &domain.BlockedInfo{Reason: "not mine", FixAttempts: 2}
+	blocked.Blocked = &domain.BlockedInfo{Reason: domain.BlockReasonNotMine, FixAttempts: 2}
 	status := upFakeStatus{watches: []domain.Watch{upTestWatch("watch-1", 7), blocked}}
 	messenger := &upFakeMessenger{}
 	handleUpCommand(context.Background(), messenger, "42", "/inspect 8", status, &upFakeDecisions{}, nil)
@@ -142,7 +142,7 @@ func TestHandleUpCommandInspectFindsWatchByPR(t *testing.T) {
 		t.Fatalf("replies = %d, want 1", len(messenger.texts))
 	}
 	reply := messenger.texts[0]
-	for _, want := range []string{"watch=watch-2", "pr=8", "not mine", "fixAttempts=2", "subscriber=ses_1"} {
+	for _, want := range []string{"watch=watch-2", "pr=8", string(domain.BlockReasonNotMine), "fixAttempts=2", "subscriber=ses_1"} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("reply = %q, want %q", reply, want)
 		}

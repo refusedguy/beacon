@@ -84,6 +84,8 @@ const decisionBlockedPrefix = "blocked:"
 
 // The blocked family is closed: only these reasons are dispatched by the ack
 // path. Any other reason is refused before a Watch or an obligation is written.
+// The values mirror domain.BlockReasonNotMine and domain.BlockReasonResolved,
+// so a decision suffix maps onto the code stored on the block record.
 const (
 	blockedReasonNotMine  = "not_mine"
 	blockedReasonResolved = "resolved"
@@ -276,12 +278,12 @@ func failedCheckNames(in []FailedCheck) []string {
 // Watch; cibridge uses it to steer the blocked notice when the Watch has no
 // orchestrator subscriber. The record is never rebuilt from client data.
 type BlockedWatch struct {
-	WatchID        string        `json:"watchID"`
-	Reason         string        `json:"reason"`
-	FailedChecks   []FailedCheck `json:"failedChecks"`
-	Since          time.Time     `json:"since"`
-	BlockedBy      string        `json:"blockedBy"`
-	OrchestratorID string        `json:"orchestratorID,omitempty"`
+	WatchID        string             `json:"watchID"`
+	Reason         domain.BlockReason `json:"reason"`
+	FailedChecks   []FailedCheck      `json:"failedChecks"`
+	Since          time.Time          `json:"since"`
+	BlockedBy      string             `json:"blockedBy"`
+	OrchestratorID string             `json:"orchestratorID,omitempty"`
 }
 
 // BlockedRegistry keeps one block record per Watch. The first block wins: a
@@ -685,7 +687,7 @@ func (h *AckHandler) applyBlockedNotMine(in AckInput, w domain.Watch, sessionID 
 	now := h.clock.Now()
 	rec := BlockedWatch{
 		WatchID:        in.WatchID,
-		Reason:         blockedReasonNotMine,
+		Reason:         domain.BlockReasonNotMine,
 		FailedChecks:   failed,
 		Since:          now,
 		BlockedBy:      sessionID,

@@ -153,6 +153,16 @@ func (a *App) Run(ctx context.Context, out io.Writer) error {
 	}
 }
 
+// knownBlockReasons mirrors domain.BlockReason for display. The layer matrix
+// keeps the TUI from importing domain, so the UI checks the code locally and
+// leaves an unknown reason out of the dashboard.
+var knownBlockReasons = map[string]bool{
+	"not_mine":                true,
+	"resolved":                true,
+	"base_checks_failed":      true,
+	"rebase_budget_exhausted": true,
+}
+
 // Render builds the dashboard text. Watches are sorted by descending revision
 // so the newest state is always at the top. It reads only its argument and
 // has no side effects, which keeps the cached View stable.
@@ -165,7 +175,7 @@ func Render(s Snapshot) string {
 	})
 	for _, w := range watches {
 		blocked := ""
-		if w.Blocked != nil && w.Blocked.Reason != "" {
+		if w.Blocked != nil && knownBlockReasons[w.Blocked.Reason] {
 			blocked = " blocked=" + w.Blocked.Reason
 		}
 		fmt.Fprintf(&b, "#%d %s %s verdict=%s rev=%d%s\n", w.PR, shortSHA(w.HeadSHA), w.Status, w.Verdict, w.Revision, blocked)

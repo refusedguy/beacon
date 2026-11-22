@@ -242,7 +242,7 @@ func activeSession() *Session {
 func TestClassifyRecoveryAllOutcomes(t *testing.T) {
 	blocked := healthyWatch()
 	blocked.Status = domain.StatusBlocked
-	blocked.Blocked = &domain.BlockedInfo{Reason: "failed checks"}
+	blocked.Blocked = &domain.BlockedInfo{Reason: domain.BlockReasonBaseChecksFailed}
 	terminal := healthyWatch()
 	terminal.Verdict = domain.VerdictMerged
 	closedSession := activeSession()

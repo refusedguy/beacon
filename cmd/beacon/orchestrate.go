@@ -141,7 +141,7 @@ func projectBlocked(b *domain.BlockedInfo) *orchestrator.BlockedInfo {
 		return nil
 	}
 	return &orchestrator.BlockedInfo{
-		Reason:       b.Reason,
+		Reason:       string(b.Reason),
 		FailedChecks: append([]string(nil), b.FailedChecks...),
 		BlockedBy:    b.BlockedBy,
 		FixAttempts:  b.FixAttempts,

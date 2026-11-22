@@ -149,6 +149,8 @@ type Watch struct {
 }
 
 // BlockedInfo is the reason a Watch is paused and the number of fix attempts.
+// Reason carries one of the domain block codes; the TUI mirrors them locally
+// because the layer matrix forbids importing internal/domain here.
 type BlockedInfo struct {
 	Reason      string `json:"reason"`
 	FixAttempts int    `json:"fixAttempts"`

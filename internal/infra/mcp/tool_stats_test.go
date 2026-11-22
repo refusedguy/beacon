@@ -186,7 +186,7 @@ func blockedWatchSnapshot() StateSnapshot {
 	byStatus := sampleWatch("b1", domain.VerdictWatching, 0)
 	byStatus.Status = domain.StatusBlocked
 	byRecord := sampleWatch("b2", domain.VerdictWatching, 0)
-	byRecord.Blocked = &domain.BlockedInfo{Reason: "main red"}
+	byRecord.Blocked = &domain.BlockedInfo{Reason: domain.BlockReasonBaseChecksFailed}
 	snap.LiveWatches = append([]domain.Watch{snap.ActiveWatches[0]}, byStatus, byRecord)
 	return snap
 }

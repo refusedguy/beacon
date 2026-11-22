@@ -361,7 +361,7 @@ func wakeBlockedWatch(id, orchestratorID string, subs ...domain.Subscriber) doma
 		HeadSHA:        "abc",
 		Status:         domain.StatusBlocked,
 		Verdict:        domain.VerdictBlocked,
-		Blocked:        &domain.BlockedInfo{Reason: "not mine", FailedChecks: []string{"gates"}, Since: time.Unix(1, 0), BlockedBy: "ses_executor"},
+		Blocked:        &domain.BlockedInfo{Reason: domain.BlockReasonNotMine, FailedChecks: []string{"gates"}, Since: time.Unix(1, 0), BlockedBy: "ses_executor"},
 		Revision:       9,
 		Subscribers:    subs,
 		OrchestratorID: orchestratorID,

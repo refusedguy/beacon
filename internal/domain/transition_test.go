@@ -198,17 +198,17 @@ func TestTransition(t *testing.T) {
 		// unblock returns it to watching.
 		{
 			name: "watching to blocked on block", status: StatusWatching, verdict: VerdictWatching, headSHA: oldSHA, revision: 3,
-			event:      BlockEvent(BlockedInfo{Reason: "checks failed"}, at),
+			event:      BlockEvent(BlockedInfo{Reason: BlockReasonBaseChecksFailed}, at),
 			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 4,
 		},
 		{
 			name: "notifying to blocked on block", status: StatusNotifying, verdict: VerdictReady, headSHA: oldSHA, revision: 4,
-			event:      BlockEvent(BlockedInfo{Reason: "checks failed"}, at),
+			event:      BlockEvent(BlockedInfo{Reason: BlockReasonBaseChecksFailed}, at),
 			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 5,
 		},
 		{
 			name: "blocked stays blocked on repeated block", status: StatusBlocked, verdict: VerdictBlocked, headSHA: oldSHA, revision: 4,
-			event:      BlockEvent(BlockedInfo{Reason: "again"}, at),
+			event:      BlockEvent(BlockedInfo{Reason: BlockReasonNotMine}, at),
 			wantStatus: StatusBlocked, wantVerdict: VerdictBlocked, wantRevision: 4,
 		},
 		{
@@ -228,8 +228,8 @@ func TestTransition(t *testing.T) {
 		},
 		{
 			name: "cancel from blocked has no effects", status: StatusBlocked, verdict: VerdictBlocked, headSHA: oldSHA, revision: 4,
-			event:            CancelEvent(at),
-			wantStatus:       StatusClosed, wantVerdict: VerdictBlocked, wantRevision: 4,
+			event:      CancelEvent(at),
+			wantStatus: StatusClosed, wantVerdict: VerdictBlocked, wantRevision: 4,
 			wantCloseReason: CloseReasonCancelled, wantClosedAt: at,
 		},
 		// Invalid input and unknown events are total no-ops.
@@ -354,7 +354,7 @@ func TestTransitionBlockDetails(t *testing.T) {
 	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 7)
 	before := cloneWatch(w)
 	info := BlockedInfo{
-		Reason:       "two required checks failed",
+		Reason:       BlockReasonBaseChecksFailed,
 		FailedChecks: []string{"ci/test", "gates"},
 		Since:        at,
 		BlockedBy:    "ci-bridge",
@@ -392,11 +392,11 @@ func TestTransitionBlockDetails(t *testing.T) {
 	}
 
 	// A repeated block is idempotent and keeps the original details.
-	again, effects := Transition(blocked, BlockEvent(BlockedInfo{Reason: "second block"}, at))
+	again, effects := Transition(blocked, BlockEvent(BlockedInfo{Reason: BlockReasonNotMine}, at))
 	if again.Revision != blocked.Revision {
 		t.Errorf("repeated block changed revision: %d -> %d", blocked.Revision, again.Revision)
 	}
-	if again.Blocked == nil || again.Blocked.Reason != "two required checks failed" {
+	if again.Blocked == nil || again.Blocked.Reason != BlockReasonBaseChecksFailed {
 		t.Errorf("repeated block replaced details: %+v", again.Blocked)
 	}
 	if len(effects) != 0 {
@@ -858,6 +858,37 @@ func TestTransitionDoneFlagAndExitDoNotClose(t *testing.T) {
 		next, effects := Transition(w, e)
 		if !reflect.DeepEqual(next, w) || len(effects) != 0 {
 			t.Errorf("event %+v closed the Watch: %+v, effects %+v", e, next, effects)
+		}
+	}
+}
+
+// TestBlockReasonValid covers the closed set: every defined code passes and
+// neither the zero value nor a free-text sentence does (BCX-14).
+func TestBlockReasonValid(t *testing.T) {
+	for _, r := range []BlockReason{
+		BlockReasonNotMine, BlockReasonResolved,
+		BlockReasonBaseChecksFailed, BlockReasonRebaseBudgetExhausted,
+	} {
+		if !r.Valid() {
+			t.Errorf("BlockReason(%q) rejected", r)
+		}
+	}
+	for _, r := range []BlockReason{"", "not mine", "failed checks already present on base branch", "other"} {
+		if r.Valid() {
+			t.Errorf("BlockReason(%q) accepted", r)
+		}
+	}
+}
+
+// TestTransitionRejectsUnknownBlockReason proves the reason is checked on
+// write: a free-text sentence cannot move a Watch into the blocked state.
+func TestTransitionRejectsUnknownBlockReason(t *testing.T) {
+	at := time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)
+	w := transitionWatch(StatusWatching, VerdictWatching, "sha", 3)
+	for _, reason := range []BlockReason{"", "not mine", "failed checks already present on base branch"} {
+		next, effects := Transition(w, BlockEvent(BlockedInfo{Reason: reason, Since: at}, at))
+		if !reflect.DeepEqual(next, w) || len(effects) != 0 {
+			t.Errorf("reason %q blocked the Watch: %+v, effects %+v", reason, next, effects)
 		}
 	}
 }
