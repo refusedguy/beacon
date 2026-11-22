@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -25,13 +26,21 @@ func (f *fakeBacklog) Candidates(context.Context) ([]Issue, error) {
 }
 
 type fakeDelegator struct {
-	calls []Issue
-	byID  map[string]Delegation
-	err   error
+	calls   []Issue
+	byID    map[string]Delegation
+	err     error
+	errByID map[string]error
+	onCall  func(Issue)
 }
 
 func (f *fakeDelegator) Delegate(_ context.Context, issue Issue) (Delegation, error) {
 	f.calls = append(f.calls, issue)
+	if f.onCall != nil {
+		f.onCall(issue)
+	}
+	if err, ok := f.errByID[issue.ID]; ok {
+		return Delegation{}, err
+	}
 	if f.err != nil {
 		return Delegation{}, f.err
 	}
@@ -110,6 +119,14 @@ func newWorker(backlog *fakeBacklog, del *fakeDelegator, watches *fakeWatches, a
 	return New(backlog, del, watches, audit)
 }
 
+func outcomeKinds(out []Outcome) []string {
+	var kinds []string
+	for _, o := range out {
+		kinds = append(kinds, o.Kind)
+	}
+	return kinds
+}
+
 func TestPlanTriageSelection(t *testing.T) {
 	state := State{Handled: map[string]bool{"BS-1": true}}
 	candidates := []Issue{
@@ -174,6 +191,9 @@ func TestWorkerDelegatesAndWatches(t *testing.T) {
 	}
 	if len(res.Watches) != 1 {
 		t.Fatalf("watches = %+v, want one", res.Watches)
+	}
+	if got, want := outcomeKinds(res.Outcomes), []string{OutcomeDelegated}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("outcomes = %v, want %v", got, want)
 	}
 	ref := res.Watches[0]
 	if ref.ID == "" || ref.Role != RoleExecutor || ref.PR != 100 || ref.HeadSHA != "sha-BS-10" {
@@ -295,14 +315,20 @@ func TestWorkerDelegateError(t *testing.T) {
 	w := newWorker(backlog, del, watches, audit)
 
 	res, err := w.Run(context.Background(), State{})
-	if !errors.Is(err, boom) {
-		t.Fatalf("error = %v, want %v", err, boom)
+	if err != nil {
+		t.Fatalf("Run: %v, want the pass to continue after a failed unit", err)
 	}
 	if watches.findCalls != 0 || len(audit.events) != 0 {
 		t.Fatal("a failed delegation touched the watch or audit ports")
 	}
 	if res.State.Handled["BS-40"] {
 		t.Fatal("state marks an issue handled after a failed delegation")
+	}
+	if len(res.Failed) != 1 || res.Failed[0].IssueID != "BS-40" || !strings.Contains(res.Failed[0].Reason, boom.Error()) {
+		t.Fatalf("failed = %+v, want BS-40 with the delegation reason", res.Failed)
+	}
+	if len(res.Outcomes) != 1 || res.Outcomes[0].Kind != OutcomeFailed || !strings.Contains(res.Outcomes[0].Reason, boom.Error()) {
+		t.Fatalf("outcomes = %+v, want one failed row with a reason", res.Outcomes)
 	}
 }
 
@@ -314,8 +340,8 @@ func TestWorkerErrorAfterDelegationStillMarksHandled(t *testing.T) {
 	w := newWorker(backlog, del, watches, audit)
 
 	res, err := w.Run(context.Background(), State{})
-	if err == nil {
-		t.Fatal("Run with a failing audit port returned no error")
+	if err != nil {
+		t.Fatalf("Run: %v, want the pass to continue after a failed unit", err)
 	}
 	if !res.State.Handled["BS-50"] {
 		t.Fatal("state does not mark the delegated issue handled after a later failure")
@@ -325,5 +351,134 @@ func TestWorkerErrorAfterDelegationStillMarksHandled(t *testing.T) {
 	}
 	if len(del.calls) != 1 {
 		t.Fatalf("delegate calls = %d, want 1", len(del.calls))
+	}
+	if len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Reason, "audit down") {
+		t.Fatalf("failed = %+v, want the audit reason", res.Failed)
+	}
+}
+
+func TestWorkerContinuesAfterFailedUnit(t *testing.T) {
+	boom := errors.New("boom")
+	backlog := &fakeBacklog{candidates: []Issue{{ID: "BS-A"}, {ID: "BS-B"}, {ID: "BS-C"}}}
+	del := &fakeDelegator{errByID: map[string]error{"BS-B": boom}}
+	watches := &fakeWatches{}
+	audit := &fakeAudit{}
+	w := newWorker(backlog, del, watches, audit)
+
+	res, err := w.Run(context.Background(), State{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{OutcomeDelegated, OutcomeFailed, OutcomeDelegated}
+	if got := outcomeKinds(res.Outcomes); !reflect.DeepEqual(got, want) {
+		t.Fatalf("outcomes = %v, want %v", got, want)
+	}
+	if len(res.Delegated) != 2 {
+		t.Fatalf("delegated = %+v, want the first and third units", res.Delegated)
+	}
+	if len(res.Failed) != 1 || res.Failed[0].IssueID != "BS-B" || !strings.Contains(res.Failed[0].Reason, boom.Error()) {
+		t.Fatalf("failed = %+v, want BS-B with the boom reason", res.Failed)
+	}
+}
+
+func TestWorkerOutcomeAfterCancellationInFailedUnit(t *testing.T) {
+	boom := errors.New("boom")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backlog := &fakeBacklog{candidates: []Issue{{ID: "BS-A"}, {ID: "BS-B"}, {ID: "BS-C"}}}
+	del := &fakeDelegator{
+		errByID: map[string]error{"BS-B": boom},
+		onCall: func(issue Issue) {
+			if issue.ID == "BS-B" {
+				cancel()
+			}
+		},
+	}
+	watches := &fakeWatches{}
+	audit := &fakeAudit{}
+	w := newWorker(backlog, del, watches, audit)
+
+	res, err := w.Run(ctx, State{})
+	if err != nil {
+		t.Fatalf("Run: %v, want no fatal error after a unit failure", err)
+	}
+	want := []string{OutcomeDelegated, OutcomeFailed, OutcomeNotAttempted}
+	if got := outcomeKinds(res.Outcomes); !reflect.DeepEqual(got, want) {
+		t.Fatalf("outcomes = %v, want %v", got, want)
+	}
+	if len(del.calls) != 2 {
+		t.Fatalf("delegate calls = %+v, want the first two units only", del.calls)
+	}
+	if len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Reason, boom.Error()) {
+		t.Fatalf("failed = %+v, want BS-B with a reason", res.Failed)
+	}
+	if len(res.NotAttempted) != 1 {
+		t.Fatalf("not attempted = %+v, want one row", res.NotAttempted)
+	}
+	notAttempted := res.NotAttempted[0]
+	if notAttempted.IssueID != "BS-C" || notAttempted.Action == "" {
+		t.Fatalf("not attempted = %+v, want BS-C with an action", notAttempted)
+	}
+	if res.Outcomes[2].Reason == "" || res.Outcomes[2].Action != notAttempted.Action {
+		t.Fatalf("not attempted outcome = %+v, want a reason and the action", res.Outcomes[2])
+	}
+}
+
+func TestWorkerCancelAtUnitBoundaryMarksRestNotAttempted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backlog := &fakeBacklog{candidates: []Issue{{ID: "BS-A"}, {ID: "BS-B"}, {ID: "BS-C"}}}
+	del := &fakeDelegator{
+		onCall: func(issue Issue) {
+			if issue.ID == "BS-A" {
+				cancel()
+			}
+		},
+	}
+	watches := &fakeWatches{}
+	audit := &fakeAudit{}
+	w := newWorker(backlog, del, watches, audit)
+
+	res, err := w.Run(ctx, State{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	want := []string{OutcomeDelegated, OutcomeNotAttempted, OutcomeNotAttempted}
+	if got := outcomeKinds(res.Outcomes); !reflect.DeepEqual(got, want) {
+		t.Fatalf("outcomes = %v, want %v", got, want)
+	}
+	if len(del.calls) != 1 {
+		t.Fatalf("delegate calls = %+v, want the first unit only", del.calls)
+	}
+	if len(res.NotAttempted) != 2 || len(res.Failed) != 0 {
+		t.Fatalf("failed=%+v not attempted=%+v, want two not attempted and no failures", res.Failed, res.NotAttempted)
+	}
+}
+
+func TestKernelPriorityMarkerKeepsPlanTriageContract(t *testing.T) {
+	kernel := Issue{ID: "kernel-7", Title: "kernel recovery"}
+	regular := Issue{ID: "BS-9", Title: "regular"}
+	if !IsKernel(kernel) || IsKernel(regular) {
+		t.Fatal("IsKernel did not separate the kernel unit from a regular unit")
+	}
+	backlog := &fakeBacklog{candidates: []Issue{kernel, regular}}
+	plan := PlanTriage(State{}, backlog.candidates)
+	var order []string
+	for _, issue := range plan.ToDelegate {
+		order = append(order, issue.ID)
+	}
+	if want := []string{"kernel-7", "BS-9"}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("plan order = %v, want %v", order, want)
+	}
+
+	audit := &fakeAudit{}
+	del := &fakeDelegator{}
+	w := newWorker(backlog, del, &fakeWatches{}, audit)
+	res, err := w.Run(context.Background(), State{})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(res.Outcomes) != 2 || !res.Outcomes[0].Priority || res.Outcomes[1].Priority {
+		t.Fatalf("outcomes = %+v, want the kernel unit marked as priority", res.Outcomes)
 	}
 }
