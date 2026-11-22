@@ -521,6 +521,12 @@ func TestCBX04EdgeSetsSeparation(t *testing.T) {
 			t.Errorf("%q попал в набор, где его быть не должно", kind)
 		}
 	}
+	if !schedulingSet.has(EdgeKind("reviewed-by")) {
+		t.Error("пользовательский тип не участвует в планирующей проверке")
+	}
+	if schedulingSet.has(EdgeRelated) || schedulingSet.has(EdgeWaitsForExternal) {
+		t.Error("related или внешний гейт попал в планирующий набор")
+	}
 }
 
 func TestConditionalBlocksKeepsKindInTraversalAndJSON(t *testing.T) {

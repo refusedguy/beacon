@@ -65,10 +65,15 @@ func IsBlockingEdgeKind(kind EdgeKind) bool {
 }
 
 // EdgeSet это именованный набор типов рёбер для одного обхода графа.
-// Принадлежность ребра набору задаётся одним фильтром типов.
+// Принадлежность ребра набору задаётся одним фильтром типов. Набор задаётся
+// явным списком либо правилом «все, кроме»: пользовательские типы должны
+// проходить проверку цикла, поэтому планирующий набор исключает только
+// related и внешние гейты.
 type EdgeSet struct {
-	name  string
-	kinds map[EdgeKind]bool
+	name         string
+	kinds        map[EdgeKind]bool
+	excluded     map[EdgeKind]bool
+	includeOther bool
 }
 
 func newEdgeSet(name string, kinds ...EdgeKind) EdgeSet {
@@ -79,16 +84,32 @@ func newEdgeSet(name string, kinds ...EdgeKind) EdgeSet {
 	return set
 }
 
-func (s EdgeSet) has(k EdgeKind) bool { return s.kinds[k] }
+func newEdgeSetExcept(name string, excluded ...EdgeKind) EdgeSet {
+	set := EdgeSet{name: name, excluded: make(map[EdgeKind]bool, len(excluded)), includeOther: true}
+	for _, k := range excluded {
+		set.excluded[k] = true
+	}
+	return set
+}
+
+func (s EdgeSet) has(k EdgeKind) bool {
+	if s.kinds[k] {
+		return true
+	}
+	if s.excluded[k] {
+		return false
+	}
+	return s.includeOther
+}
 
 // blockingSet это блокирующий набор для поиска deadlock. В beads это blocks
 // и conditional-blocks: рёбра, которые действительно удерживают карточку.
 var blockingSet = newEdgeSet("блокирующий", EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks)
 
-// schedulingSet это планирующий набор для проверки мутаций. К блокирующему
-// добавляется ребро иерархии, соответствующее parent-child в beads; в beacon
-// этой роли служит supersedes.
-var schedulingSet = newEdgeSet("планирующий", EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks, EdgeSupersedes)
+// schedulingSet это планирующий набор для проверки мутаций. related и внешние
+// гейты не задают порядок карточек и в наборе не участвуют. Остальные типы,
+// включая пользовательские, проходят проверку цикла.
+var schedulingSet = newEdgeSetExcept("планирующий", EdgeRelated, EdgeWaitsForExternal)
 
 // BlockingEdgeKinds возвращает типы блокирующего набора. related и
 // waits-for-external в него не входят.
@@ -96,7 +117,8 @@ func BlockingEdgeKinds() []EdgeKind {
 	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks}
 }
 
-// SchedulingEdgeKinds возвращает типы планирующего набора.
+// SchedulingEdgeKinds возвращает встроенные типы планирующего набора.
+// Пользовательские типы тоже участвуют в проверке цикла, но не перечисляются.
 func SchedulingEdgeKinds() []EdgeKind {
 	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks, EdgeSupersedes}
 }
