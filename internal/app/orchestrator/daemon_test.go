@@ -1289,3 +1289,98 @@ func TestDaemonWakerWithRouteErrorStaysRetryable(t *testing.T) {
 		t.Fatalf("route calls = %d, want 2 (a failed route is not delivered)", calls)
 	}
 }
+
+// A blocked route must not hold the waker lock. A second Watch reaches its own
+// delivery while the first route is still waiting (CC-03).
+func TestDaemonWakerSlowRouteDoesNotBlockAnotherWatch(t *testing.T) {
+	lookup := func(id string) (DaemonWatch, error) {
+		return DaemonWatch{ID: id, PR: 1, Adapter: WakeDefaultAdapter, SubscriberID: "ses_" + id}, nil
+	}
+	slowEntered := make(chan struct{})
+	release := make(chan struct{}, 1)
+	unblock := func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}
+	defer unblock()
+	route := func(_ context.Context, watch DaemonWatch, _ uint64, _, _ string) error {
+		if watch.ID == "w-slow" {
+			close(slowEntered)
+			<-release
+		}
+		return nil
+	}
+	w := NewDaemonWakerWithRoute(lookup, route)
+
+	slowDone := make(chan error, 1)
+	go func() { slowDone <- w.Wake(context.Background(), "w-slow", 1, VerdictRetry) }()
+	<-slowEntered
+
+	fastDone := make(chan error, 1)
+	go func() { fastDone <- w.Wake(context.Background(), "w-fast", 1, VerdictRetry) }()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("wake for the other Watch: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a blocked route held the waker lock and stalled another Watch")
+	}
+
+	unblock()
+	if err := <-slowDone; err != nil {
+		t.Fatalf("wake for the slow Watch: %v", err)
+	}
+}
+
+// Parallel passes for one obligation must reach the route once. The in-flight
+// reservation covers the delivery window, and the delivered ledger covers the
+// passes that arrive after it (CC-03).
+func TestDaemonWakerConcurrentSameObligationDeliveredOnce(t *testing.T) {
+	lookup := func(string) (DaemonWatch, error) {
+		return DaemonWatch{ID: "w-parallel", PR: 11, Adapter: WakeDefaultAdapter, SubscriberID: "ses_parallel"}, nil
+	}
+	delivered := make(chan struct{}, 8)
+	release := make(chan struct{}, 1)
+	unblock := func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}
+	defer unblock()
+	route := func(context.Context, DaemonWatch, uint64, string, string) error {
+		delivered <- struct{}{}
+		<-release
+		return nil
+	}
+	w := NewDaemonWakerWithRoute(lookup, route)
+
+	const n = 8
+	start := make(chan struct{})
+	results := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			results <- w.Wake(context.Background(), "w-parallel", 1, VerdictRetry)
+		}()
+	}
+	close(start)
+
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("no wake reached the route")
+	}
+	unblock()
+	for i := 0; i < n; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("parallel Wake #%d: %v", i+1, err)
+		}
+	}
+	if extra := len(delivered); extra != 0 {
+		t.Fatalf("obligation was delivered %d times, want 1", 1+extra)
+	}
+}

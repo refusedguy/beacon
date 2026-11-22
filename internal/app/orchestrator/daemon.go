@@ -274,6 +274,7 @@ func NewDaemonWaker(lookup DaemonWatchLookup, backend WakeBackend, dedup WakeDed
 		backend:       backend,
 		dedup:         dedup,
 		deliveredKeys: make(map[string]struct{}),
+		inFlight:      make(map[string]struct{}),
 	}
 }
 
@@ -304,11 +305,13 @@ type daemonWaker struct {
 	backend WakeBackend
 	route   WakeRoute
 
-	// mu guards deliveredKeys and the check-deliver-record sequence, so two
-	// concurrent passes cannot steer the same obligation twice. deliveredKeys
-	// holds obligation keys already admitted to a subscriber in this process.
+	// mu guards deliveredKeys and inFlight. deliveredKeys holds obligation
+	// keys already admitted to a subscriber in this process. inFlight holds
+	// keys whose delivery is in progress, so parallel passes reserve the key
+	// once and never steer the same obligation twice.
 	mu            sync.Mutex
 	deliveredKeys map[string]struct{}
+	inFlight      map[string]struct{}
 
 	// dedup is the wake-identity ledger shared with the CI bridge. It stops
 	// the bridge and the daemon from admitting the same obligation twice in
@@ -427,40 +430,59 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	// A Watch whose verdict did not change keeps its revision, so every daemon
 	// pass builds the same pointer. The obligation key folds watchID, revision
 	// and subscriber into one string, which is exactly the unit that must be
-	// delivered once. Check and record under the same lock as the delivery.
+	// delivered once. Reserve the key under the lock, deliver without the lock,
+	// then record the result under the lock again. A slow route or backend must
+	// not stall a wake for another Watch (CC-03).
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if w.deliveredKeys == nil {
 		w.deliveredKeys = make(map[string]struct{})
 	}
+	if w.inFlight == nil {
+		w.inFlight = make(map[string]struct{})
+	}
 	if daemonWakeAlreadyExists(w, pointer.ObligationID) {
+		w.mu.Unlock()
+		return nil
+	}
+	if _, busy := w.inFlight[pointer.ObligationID]; busy {
+		w.mu.Unlock()
 		return nil
 	}
 	if w.dedup != nil && w.dedup.Seen(pointer.ObligationID) {
 		observe.WakeDuplicate(watchID, revision)
+		w.mu.Unlock()
 		return nil
 	}
+	w.inFlight[pointer.ObligationID] = struct{}{}
+	w.mu.Unlock()
+
+	var deliverErr error
+	record := false
 	if w.route != nil {
-		if err := w.route(ctx, watch, revision, verdict, text); err != nil {
-			return err
-		}
+		deliverErr = w.route(ctx, watch, revision, verdict, text)
+		record = deliverErr == nil
 	} else {
 		receipt, ok := w.backend.Deliver(ctx, pointer)
-		if !ok {
-			return fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
-		}
-		if receipt.Outcome == WakeErrored {
-			return fmt.Errorf("daemon: wake %s: %s", watchID, receipt.Outcome)
-		}
-		if !daemonWakeIsDelivered(receipt.Outcome) {
-			return nil
+		switch {
+		case !ok:
+			deliverErr = fmt.Errorf("daemon: no wake adapter %q for watch %s", adapter, watchID)
+		case receipt.Outcome == WakeErrored:
+			deliverErr = fmt.Errorf("daemon: wake %s: %s", watchID, receipt.Outcome)
+		case daemonWakeIsDelivered(receipt.Outcome):
+			record = true
 		}
 	}
-	w.deliveredKeys[pointer.ObligationID] = struct{}{}
-	if w.dedup != nil {
-		w.dedup.Claim(pointer.ObligationID)
+
+	w.mu.Lock()
+	delete(w.inFlight, pointer.ObligationID)
+	if record {
+		w.deliveredKeys[pointer.ObligationID] = struct{}{}
+		if w.dedup != nil {
+			w.dedup.Claim(pointer.ObligationID)
+		}
 	}
-	return nil
+	w.mu.Unlock()
+	return deliverErr
 }
 
 // ---------------------------------------------------------------------------
