@@ -1200,10 +1200,10 @@ func TestW158BindRepoWorktreeProvisionsGitWorktree(t *testing.T) {
 	if out.Len() != 0 || errOut.Len() != 0 {
 		t.Fatalf("неожиданный вывод: out=%q err=%q", out.String(), errOut.String())
 	}
-	if len(*calls) != 1 {
-		t.Fatalf("вызовов раннера %d, ожидался 1", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("вызовов раннера %d, ожидалось 2 (fetch и worktree add)", len(*calls))
 	}
-	call := (*calls)[0]
+	call := (*calls)[1]
 	if call.name != "git" || call.dir != "/srv/repoA.git" {
 		t.Fatalf("раннер вызвал %q в %q, ожидался git в репозитории", call.name, call.dir)
 	}
@@ -1235,8 +1235,8 @@ func TestW158TaskCanBindSeveralReposWithDistinctWorktrees(t *testing.T) {
 	if b1.Branch == b2.Branch {
 		t.Fatalf("два репозитория получили одну ветку %q", b1.Branch)
 	}
-	if len(*calls) != 2 {
-		t.Fatalf("вызовов git %d, ожидалось 2", len(*calls))
+	if len(*calls) != 4 {
+		t.Fatalf("вызовов git %d, ожидалось 4 (fetch и worktree add на каждый репозиторий)", len(*calls))
 	}
 }
 
@@ -1256,8 +1256,56 @@ func TestW158BindIsIdempotent(t *testing.T) {
 	if !reflect.DeepEqual(b1, b2) {
 		t.Fatalf("повтор изменил связку: %+v против %+v", b1, b2)
 	}
+	if len(*calls) != 2 {
+		t.Fatalf("повтор вызвал git %d раз, ожидалось 2 (fetch и worktree add только при первой связке)", len(*calls))
+	}
+	fetchCalls := 0
+	for _, call := range *calls {
+		if len(call.args) > 0 && call.args[0] == "fetch" {
+			fetchCalls++
+		}
+	}
+	if fetchCalls != 1 {
+		t.Fatalf("команд fetch %d, ожидалась 1", fetchCalls)
+	}
+}
+
+func TestW158BindFetchesOriginMainBeforeWorktreeAdd(t *testing.T) {
+	w133State(t)
+	c, _, _, calls := w68CLI(t, func(w68Call) runResult { return runResult{} })
+	wt := filepath.Join(t.TempDir(), "wt")
+
+	if _, err := c.bindRepoWorktree("T3.158", "/srv/repoA.git", wt); err != nil {
+		t.Fatal(err)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("вызовов раннера %d, ожидалось 2", len(*calls))
+	}
+	fetch, worktree := (*calls)[0], (*calls)[1]
+	if fetch.name != "git" || fetch.dir != "/srv/repoA.git" || !reflect.DeepEqual(fetch.args, []string{"fetch", "origin", "main"}) {
+		t.Fatalf("первый вызов %+v, ожидался git fetch origin main", fetch)
+	}
+	if worktree.name != "git" || len(worktree.args) < 2 || worktree.args[0] != "worktree" || worktree.args[1] != "add" {
+		t.Fatalf("второй вызов %+v, ожидался git worktree add", worktree)
+	}
+}
+
+func TestW158FetchFailureSkipsWorktreeAdd(t *testing.T) {
+	w133State(t)
+	c, _, _, calls := w68CLI(t, func(call w68Call) runResult {
+		if len(call.args) > 0 && call.args[0] == "fetch" {
+			return runResult{code: 128, stderr: []byte("fatal: unable to fetch\n")}
+		}
+		return runResult{}
+	})
+
+	if _, err := c.bindRepoWorktree("T1", "/srv/repo.git", "/tmp/wt"); err == nil {
+		t.Fatal("ошибка fetch проигнорирована")
+	} else if !strings.Contains(err.Error(), "fetch") {
+		t.Fatalf("в ошибке нет причины fetch: %v", err)
+	}
 	if len(*calls) != 1 {
-		t.Fatalf("повтор вызвал git %d раз, ожидался 1", len(*calls))
+		t.Fatalf("раннер вызван %d раз, ожидался 1 (только fetch)", len(*calls))
 	}
 }
 
@@ -1305,7 +1353,10 @@ func TestW158BindRejectsEmptyInput(t *testing.T) {
 
 func TestW158BindGitFailureDoesNotPersist(t *testing.T) {
 	dir := w133State(t)
-	c, _, _, _ := w68CLI(t, func(w68Call) runResult {
+	c, _, _, _ := w68CLI(t, func(call w68Call) runResult {
+		if len(call.args) > 0 && call.args[0] == "fetch" {
+			return runResult{}
+		}
 		return runResult{code: 128, stderr: []byte("fatal: worktree already exists\n")}
 	})
 
@@ -1414,7 +1465,7 @@ func TestW158RunAgentsBindsRepoAndPrintsJSON(t *testing.T) {
 	if got.TaskID != "T3.158" || got.Worktree != wt || got.Branch == "" {
 		t.Fatalf("связка в JSON: %+v", got)
 	}
-	if len(*calls) != 1 || (*calls)[0].name != "git" {
+	if len(*calls) != 2 || (*calls)[0].name != "git" || (*calls)[1].name != "git" {
 		t.Fatalf("git не вызван через раннер: %+v", *calls)
 	}
 }
