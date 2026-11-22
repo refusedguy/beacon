@@ -740,15 +740,77 @@ func openProcessStore(dir string) (*store.DB, error) {
 	return store.OpenProduction(filepath.Join(dir, mcpStateDBName))
 }
 
-// buildMCPDependencies wires the seven real MCP tool ports around one DB
-// handle. The optional points reader comes from the process' GitHub batch
-// provider, so beacon_stats reports the real hourly budget instead of a
-// process-local zero. The snapshot reads LiveWatches, which includes blocked
-// Watches, and surfaces the last saved runtime-stats payload as diagnostics.
+// fileGraphIndex is the production GraphIndexReader. It keeps one index handle
+// so the source directory bound by the first rebuild stays available to every
+// later read. The reader opens lazily, so a process that never asks for graph
+// readiness never opens the index. A failed open leaves a zero Index in place
+// and GraphStatus reports a read error instead of the no-reader fallback.
+type fileGraphIndex struct {
+	dir  string
+	once sync.Once
+	idx  *taskstore.Index
+}
+
+func newFileGraphIndex(dir string) *fileGraphIndex {
+	return &fileGraphIndex{dir: dir}
+}
+
+func (g *fileGraphIndex) index() *taskstore.Index {
+	g.once.Do(func() {
+		root := projectRootForConfig()
+		idx, err := taskstore.OpenIndex(taskstore.IndexPath(g.dir, root))
+		if err != nil {
+			g.idx = &taskstore.Index{}
+			return
+		}
+		_, _ = idx.RebuildDir(filepath.Join(root, "docs", "tasks"))
+		g.idx = idx
+	})
+	return g.idx
+}
+
+// GraphStatus compares the stored card digest with the live docs/tasks
+// directory. A card edited after the rebuild changes the source digest, so the
+// marker turns stale until the index is rebuilt again.
+func (g *fileGraphIndex) GraphStatus(ctx context.Context) (domain.GraphStatus, error) {
+	return g.index().GraphStatus(ctx)
+}
+
+// buildMCPDependencies wires the real MCP tool ports around one DB handle. The
+// optional points reader comes from the process' GitHub batch provider, so
+// beacon_stats reports the real hourly budget instead of a process-local zero.
+// The snapshot reads LiveWatches, which includes blocked Watches, and surfaces
+// the last saved runtime-stats payload as diagnostics. The three ADR 0314 ports
+// are bound here: the task index proves graphReady, the registry adapter reads
+// the same snapshot, and one generation ledger serves claim and ack.
 func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mcp.Dependencies {
 	// One stateless Ladder over the one store handle. The same instance backs
 	// the read/claim decorators, the bridge wake path and the stats projection.
 	lad := ladder.New(db)
+	graph := newFileGraphIndex(dir)
+	snapshot := mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
+		live, err := db.LiveWatches()
+		if err != nil {
+			return mcp.StateSnapshot{}, err
+		}
+		pointsUsed, pointBudget := pointsValue(points)
+		pending, escalated := ladderCounts(db)
+		snap := mcp.StateSnapshot{
+			ActiveWatches:   live,
+			LiveWatches:     live,
+			PointsThisHour:  pointsUsed,
+			Budget:          pointBudget,
+			LadderPending:   pending,
+			LadderEscalated: escalated,
+			Version:         mcp.ServerVersion,
+		}
+		if raw, ok, err := db.LoadRuntimeStats(); err != nil {
+			snap.LoadErrors = append(snap.LoadErrors, "runtime_stats: "+err.Error())
+		} else if ok && len(raw) > 0 {
+			snap.LoadErrors = append(snap.LoadErrors, fmt.Sprintf("runtime_stats: %d bytes", len(raw)))
+		}
+		return snap, nil
+	})
 	return mcp.Dependencies{
 		Store:   db,
 		Stamper: ladderStamper{ObligationStamper: mcp.NewSQLObligationStamper(db), ladder: lad},
@@ -785,29 +847,10 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 			TasksDir: filepath.Join(projectRootForConfig(), "docs", "tasks"),
 			StateDir: dir,
 		},
-		Snapshot: mcp.SnapshotFunc(func() (mcp.StateSnapshot, error) {
-			live, err := db.LiveWatches()
-			if err != nil {
-				return mcp.StateSnapshot{}, err
-			}
-			pointsUsed, pointBudget := pointsValue(points)
-			pending, escalated := ladderCounts(db)
-			snap := mcp.StateSnapshot{
-				ActiveWatches:   live,
-				LiveWatches:     live,
-				PointsThisHour:  pointsUsed,
-				Budget:          pointBudget,
-				LadderPending:   pending,
-				LadderEscalated: escalated,
-				Version:         mcp.ServerVersion,
-			}
-			if raw, ok, err := db.LoadRuntimeStats(); err != nil {
-				snap.LoadErrors = append(snap.LoadErrors, "runtime_stats: "+err.Error())
-			} else if ok && len(raw) > 0 {
-				snap.LoadErrors = append(snap.LoadErrors, fmt.Sprintf("runtime_stats: %d bytes", len(raw)))
-			}
-			return snap, nil
-		}),
+		Snapshot:            snapshot,
+		GraphIndexReader:    graph,
+		RegistryStatsReader: mcp.NewSnapshotRegistryStats(snapshot),
+		GenerationLedger:    orchestrator.NewClaimGeneration(),
 	}
 }
 

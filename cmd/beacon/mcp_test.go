@@ -1063,3 +1063,50 @@ func TestReconcilePassCallsAutoSpawnOnce(t *testing.T) {
 		t.Fatalf("spawn calls = %d, ids = %#v, want one call for T9.1", calls, ids)
 	}
 }
+
+// TestADR0314PortsWiredIntoProductionDeps proves the composition root binds the
+// three ports ADR 0314 added to mcp.Dependencies. Without them graphReady stays
+// no-reader and an agent cannot tell a fresh graph from a missing one.
+func TestADR0314PortsWiredIntoProductionDeps(t *testing.T) {
+	root := autoSpawnTestRoot(t)
+	card := filepath.Join(root, "docs", "tasks", "T1.1.md")
+	autoSpawnTestCard(t, root, "T1.1", "todo", "cmd/beacon/mcp.go")
+	t.Setenv(beaconProjectRootEnv, root)
+
+	deps, closeStore, err := openMCPDependenciesInDir(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = closeStore() }()
+
+	if deps.GraphIndexReader == nil {
+		t.Fatal("mcp.Dependencies.GraphIndexReader не привязан: graphReady останется no-reader")
+	}
+	if deps.RegistryStatsReader == nil {
+		t.Fatal("mcp.Dependencies.RegistryStatsReader не привязан")
+	}
+	if deps.GenerationLedger == nil {
+		t.Fatal("mcp.Dependencies.GenerationLedger не привязан")
+	}
+
+	ctx := context.Background()
+	status, err := deps.GraphIndexReader.GraphStatus(ctx)
+	if err != nil {
+		t.Fatalf("GraphStatus: %v", err)
+	}
+	if !status.Ready() {
+		t.Fatalf("GraphStatus свежего индекса = %+v, ожидался Ready", status)
+	}
+
+	// Правка карточки без пересборки индекса делает источник устаревшим.
+	if err := os.WriteFile(card, []byte("# T1.1. Test card\n\nСтатус: done\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, err = deps.GraphIndexReader.GraphStatus(ctx)
+	if err != nil {
+		t.Fatalf("GraphStatus после правки карточки: %v", err)
+	}
+	if status.Ready() {
+		t.Fatalf("GraphStatus после правки без пересборки = %+v, ожидался stale", status)
+	}
+}
