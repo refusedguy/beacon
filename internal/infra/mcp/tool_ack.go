@@ -45,6 +45,13 @@
 // rules, and the handler stores them under the session ID from _meta. A
 // session-scoped update stays in that session. Tool permissions are a different
 // axis from MergePolicy, which decides how a Watch merges.
+//
+// A decision=defer ack parks a tool call as result data for the Watch (CSx-03).
+// The call carries a name and its input. A repeat defer for the same Watch is
+// an idempotent no-op that cannot park a second call. Unlike approve and
+// reject, defer never resumes the agent: the caller owns the decision about
+// the parked call. The fields stay out of AckInput so the byte-pinned
+// tools/list schema is unchanged.
 package mcp
 
 import (
@@ -83,6 +90,10 @@ const (
 	// the block on the Watch named by the ack once a fix is confirmed. Like the
 	// not_mine reason it is handled outside Valid and never resumes an agent.
 	DecisionBlockedResolved Decision = "blocked:resolved"
+	// DecisionDefer parks the caller's tool call on the Watch as result data
+	// (CSx-03). It is handled outside Valid: a defer never resumes the stopped
+	// agent. The caller decides what to do with the parked call.
+	DecisionDefer Decision = "defer"
 )
 
 // decisionBlockedPrefix marks the blocked decision family. A decision with this
@@ -196,6 +207,13 @@ type AckReceipt struct {
 	// blocked Watch. A repeat leaves it false because a Watch unblocks at most
 	// once.
 	Unblocked bool `json:"unblocked,omitempty"`
+	// Deferred is true when this ack parked a tool call for the first time. A
+	// repeat defer for the same Watch leaves it false and returns the original
+	// call in DeferredToolUse.
+	Deferred bool `json:"deferred,omitempty"`
+	// DeferredToolUse is the call parked by a defer decision. It is the same
+	// record on a repeat, so the caller sees one call per Watch.
+	DeferredToolUse *domain.DeferredToolUse `json:"deferred_tool_use,omitempty"`
 }
 
 // DecisionRecord is one decision applied to a stopped Watch. ResumedAt is the
@@ -384,6 +402,53 @@ func (r *BlockedRegistry) Unblock(watchID string) {
 	delete(r.records, watchID)
 }
 
+// DeferredRegistry keeps one parked tool call per Watch. The first defer wins:
+// a repeat returns the original record with applied false, so a second ack
+// cannot park a second call or move the first one. It is safe for concurrent
+// use.
+type DeferredRegistry struct {
+	mu      sync.Mutex
+	records map[string]domain.DeferredToolUse
+}
+
+// NewDeferredRegistry builds an empty deferred-call registry.
+func NewDeferredRegistry() *DeferredRegistry {
+	return &DeferredRegistry{records: make(map[string]domain.DeferredToolUse)}
+}
+
+// Lookup returns the call parked for watchID. The bool is false when the Watch
+// has no parked call.
+func (r *DeferredRegistry) Lookup(watchID string) (domain.DeferredToolUse, bool) {
+	if r == nil {
+		return domain.DeferredToolUse{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	call, ok := r.records[watchID]
+	return call, ok
+}
+
+// Park stores call for watchID once. A repeat returns the original call with
+// applied false. The call is copied, so a later mutation of the caller's value
+// cannot change what the Watch recorded.
+func (r *DeferredRegistry) Park(watchID string, call domain.DeferredToolUse) (domain.DeferredToolUse, bool) {
+	if r == nil {
+		return domain.DeferredToolUse{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.records == nil {
+		r.records = make(map[string]domain.DeferredToolUse)
+	}
+	if existing, ok := r.records[watchID]; ok {
+		return existing, false
+	}
+	stored := call
+	stored.Input = append(json.RawMessage(nil), call.Input...)
+	r.records[watchID] = stored
+	return stored, true
+}
+
 // ContinuationRegistry counts human-answer rounds per Watch. A round is
 // consumed only when an ack with continueOf is accepted, and the count never
 // passes domain.MaxContinueRounds (ADR 0031 §3). It is safe for concurrent use.
@@ -503,6 +568,9 @@ type AckHandler struct {
 	continuations *ContinuationRegistry
 	decisions     *DecisionRegistry
 	blocked       *BlockedRegistry
+	// deferred holds the parked tool call per Watch for CSx-03. A repeat defer
+	// returns the first call instead of parking a second one.
+	deferred *DeferredRegistry
 	// permissions holds the per-session permission state for CS-02. Instances
 	// built before this port was added keep their ack behaviour; a nil
 	// permission registry skips the control-channel fields.
@@ -528,6 +596,7 @@ func NewAckHandler(store resultStoreReader, stamper ObligationStamper, clock dom
 		continuations: NewContinuationRegistry(),
 		decisions:     NewDecisionRegistry(),
 		blocked:       NewBlockedRegistry(),
+		deferred:      NewDeferredRegistry(),
 		permissions:   NewPermissionRegistry(),
 	}
 }
@@ -556,6 +625,15 @@ func (h *AckHandler) SetDecisionRegistry(r *DecisionRegistry) {
 func (h *AckHandler) SetBlockedRegistry(r *BlockedRegistry) {
 	if h != nil && r != nil {
 		h.blocked = r
+	}
+}
+
+// SetDeferredRegistry shares the parked-call registry with a composition root,
+// so other tools can observe which Watches carry a deferred call. A nil
+// argument leaves the handler's own registry in place.
+func (h *AckHandler) SetDeferredRegistry(r *DeferredRegistry) {
+	if h != nil && r != nil {
+		h.deferred = r
 	}
 }
 
@@ -660,6 +738,38 @@ func permissionControlFromRequest(req *mcpsdk.CallToolRequest) (domain.Permissio
 	return fields.SetPermissionMode, fields.PermissionUpdates
 }
 
+// deferredControlFields are the CSx-03 fields carried alongside a beacon_ack
+// with decision=defer. They stay out of AckInput so the byte-pinned tools/list
+// input schema does not change: the SDK derives that schema from the typed
+// input. The fields are read from the raw request arguments instead.
+type deferredControlFields struct {
+	ToolCallID string          `json:"deferredToolCallID"`
+	ToolName   string          `json:"deferredToolName"`
+	ToolInput  json.RawMessage `json:"deferredToolInput"`
+}
+
+// deferredCallFromRequest reads the parked call from the raw request arguments.
+// A missing or malformed value yields an empty call, so an absent field cannot
+// park a nameless tool. The caller validates the name before any write.
+func deferredCallFromRequest(req *mcpsdk.CallToolRequest) domain.DeferredToolUse {
+	if req == nil || req.Params == nil || req.Params.Arguments == nil {
+		return domain.DeferredToolUse{}
+	}
+	raw, err := json.Marshal(req.Params.Arguments)
+	if err != nil {
+		return domain.DeferredToolUse{}
+	}
+	var fields deferredControlFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return domain.DeferredToolUse{}
+	}
+	return domain.DeferredToolUse{
+		ID:    fields.ToolCallID,
+		Name:  fields.ToolName,
+		Input: fields.ToolInput,
+	}
+}
+
 // Handle adapts Ack to the go-sdk typed tool handler signature and returns the
 // shared ok-only response. The response carries no verdict: a caller still has
 // to call beacon_get_result or beacon_wait_result to read one (ADR 0028). A
@@ -689,7 +799,8 @@ func (h *AckHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in
 			return nil, OKOutput{}, err
 		}
 	}
-	receipt, err := h.ackReceiptWithSession(ctx, in, sessionID)
+	parked := deferredCallFromRequest(req)
+	receipt, err := h.ackReceiptWithSession(ctx, in, sessionID, parked)
 	if err != nil && !IsStaleRevision(err) {
 		return nil, OKOutput{}, err
 	}
@@ -726,8 +837,10 @@ func (h *AckHandler) AckReceipt(ctx context.Context, in AckInput) (AckReceipt, e
 
 // ackReceiptWithSession is the ack path with the caller's opaque session ID from
 // _meta. The session is used only by a blocked:not_mine decision, as BlockedBy;
-// plain acks, approve/reject decisions and blocked:resolved ignore it.
-func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, sessionID string) (AckReceipt, error) {
+// plain acks, approve/reject decisions and blocked:resolved ignore it. The
+// optional parked call is the CSx-03 defer payload read from the raw request;
+// it is accepted only when the decision is defer.
+func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, sessionID string, parked ...domain.DeferredToolUse) (AckReceipt, error) {
 	if in.WatchID == "" || in.ObligationID == "" {
 		return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: watchID and obligationID are required")
 	}
@@ -793,6 +906,21 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 		default:
 			return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: unknown blocked decision reason: "+reason)
 		}
+	} else if in.Decision == string(DecisionDefer) {
+		var call domain.DeferredToolUse
+		if len(parked) > 0 {
+			call = parked[0]
+		}
+		stored, applied, err := h.applyDefer(in, call)
+		if err != nil {
+			return AckReceipt{}, err
+		}
+		receipt = AckReceipt{
+			Decision:        DecisionDefer,
+			DecisionID:      in.DecisionID,
+			Deferred:        applied,
+			DeferredToolUse: &stored,
+		}
 	} else if in.Decision != "" {
 		var rec DecisionRecord
 		var applied bool
@@ -851,6 +979,22 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 		}
 		return next.Revision, nil
 	})
+}
+
+// applyDefer parks call once per Watch. The first call is stored in the
+// registry and returned with applied true. A repeat returns the stored call
+// with applied false and writes nothing. No Watch transition runs, so status,
+// verdict and revision stay put and no agent is resumed. The caller owns the
+// parked call and decides what to do with it.
+func (h *AckHandler) applyDefer(in AckInput, call domain.DeferredToolUse) (domain.DeferredToolUse, bool, error) {
+	if call.Name == "" {
+		return domain.DeferredToolUse{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: defer requires a tool name")
+	}
+	if h.deferred == nil {
+		return domain.DeferredToolUse{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: deferred registry is nil")
+	}
+	stored, applied := h.deferred.Park(in.WatchID, call)
+	return stored, applied, nil
 }
 
 // applyBlockedNotMine records a blocked:not_mine classification and blocks the
