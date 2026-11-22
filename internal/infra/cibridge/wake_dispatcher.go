@@ -800,12 +800,30 @@ func (b *wakeDispatcher) markInWorkStalled(ctx context.Context, w domain.Watch, 
 	return true
 }
 
+// blockingFailedNames keeps only the failed checks that can block a merge. An
+// informational check (Required: false) cannot block, so it must not appear in
+// keep_working or retry wake text as a check to fix or re-run. This is the
+// wake-side application of the single fail-fact rule from ATX-V01. A name
+// absent from the map stays in the list: the verdict layer treats a failure
+// without per-check detail as fail-closed, so dropping it would hide a real
+// blocking failure.
+func blockingFailedNames(names []string, checks map[string]domain.Check) []string {
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		if c, observed := checks[name]; observed && !c.Required {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
 // wakeText builds the self-teaching instruction carried in a wake pointer.
 // Each verdict names the concrete next action so a receiver cannot answer with
 // an empty rebase or a blind re-run. The observed main head is appended so two
 // checks with different upstream heads produce different wakes (ADR 0155).
 func wakeText(verdict domain.Verdict, obs ciObservation, targets []domain.WakeTarget, mergeErr string) string {
-	failed := realFailedNames(obs.pr.Checks)
+	failed := blockingFailedNames(realFailedNames(obs.pr.Checks), obs.pr.Checks)
 	var text string
 	switch verdict {
 	case domain.VerdictKeepWorking:
