@@ -78,6 +78,31 @@ func TestAttachResumeRepairsMissingSessionRow(t *testing.T) {
 	}
 }
 
+// A record that carries an identity uses ResumeIdentified. A missing row must
+// still rebuild from the journal, so the identity path keeps the repair.
+func TestAttachResumeRepairsMissingRowWithIdentity(t *testing.T) {
+	const saved = "sess-identified"
+	t313Service(t, "http://127.0.0.1:4096")
+	t395WriteSessions(t, attachSessionState{
+		Sessions: []attachSession{{TaskID: "T9.9", SessionID: saved, Identity: saved}},
+		Last:     "T9.9",
+	})
+	st := newAttachRepairStore()
+	attachRepairInstallRegistry(t, session.NewSessionRegistry(st))
+
+	c, _, errOut, calls := t313CLI(t, func(t313Call) runResult { return runResult{code: 0} })
+	if code := c.runAttach([]string{"--resume"}); code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+	}
+	if len(st.saves) != 1 {
+		t.Fatalf("SaveSession calls = %d, want 1 restored row", len(st.saves))
+	}
+	wantArgs := []string{"--server", "http://127.0.0.1:4096", "--session", saved}
+	if len(*calls) != 1 || !reflect.DeepEqual((*calls)[0].args, wantArgs) {
+		t.Fatalf("calls = %+v, want one attach to %q", *calls, wantArgs)
+	}
+}
+
 func TestAttachResumeRestoreWriteErrorKeepsSavedID(t *testing.T) {
 	saved := attachResumeSetup(t)
 	st := newAttachRepairStore()
