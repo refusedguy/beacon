@@ -182,6 +182,9 @@ type ClientSnapshot struct {
 	Watches      []ClientWatch      `json:"watches"`
 	Attention    []string           `json:"attention"`
 	Escalations  []string           `json:"escalations"`
+	// EventTail holds the newest replayed event lines when the server sends
+	// them. The field stays optional so an older projection still decodes.
+	EventTail []string `json:"eventTail"`
 }
 
 // UnmarshalJSON keeps attention and escalations readable whether the server
