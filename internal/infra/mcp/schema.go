@@ -75,6 +75,12 @@ type FailedCheck struct {
 	// It is optional so a response from a caller without an excerpt source
 	// keeps its previous wire shape (W11-B).
 	FailureExcerpt string `json:"failureExcerpt,omitempty"`
+	// FailureExcerptUnavailable reports that the excerpt source failed for this
+	// check. An empty FailureExcerpt alone cannot separate a failed fetch from
+	// a check with no annotations, so the flag is emitted only on failure
+	// (EH-02). It is optional to keep the wire shape stable for callers that
+	// never configure a source.
+	FailureExcerptUnavailable bool `json:"failureExcerptUnavailable,omitempty"`
 }
 
 // MergeSnapshot is the merge block of beacon_get_result.
@@ -158,6 +164,12 @@ type GetResultOutput struct {
 	// FailureExcerptLogURL links to the check run whose excerpt was cut, so the
 	// agent can read the full CI log. It is set only when an excerpt is present.
 	FailureExcerptLogURL string `json:"failureExcerptLogUrl,omitempty"`
+
+	// FailureExcerptUnavailable reports that at least one check's excerpt fetch
+	// failed, so the aggregate is incomplete. The matching failedChecks entry
+	// carries the per-check flag (EH-02). Optional for wire stability: a Watch
+	// whose caller has no excerpt source never sets it.
+	FailureExcerptUnavailable bool `json:"failureExcerptUnavailable,omitempty"`
 
 	// ConfigID is the Watch's configuration identity from ADR 0087 (T5.36).
 	// It is optional and emitted last, so a Watch without one keeps the exact

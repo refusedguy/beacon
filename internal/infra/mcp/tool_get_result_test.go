@@ -1633,16 +1633,19 @@ func TestTerminalVerdictTimeoutIsNotRetryableWait(t *testing.T) {
 // --- W11-B: failure excerpts ------------------------------------------------
 
 // fakeExcerptSource returns a canned excerpt and counts calls per check name.
+// errByName lets a test make one check's fetch fail while others still succeed.
 type fakeExcerptSource struct {
-	mu     sync.Mutex
-	byName map[string]string
-	calls  map[string]int
+	mu        sync.Mutex
+	byName    map[string]string
+	errByName map[string]error
+	calls     map[string]int
 }
 
 func newFakeExcerptSource(answers map[string]string) *fakeExcerptSource {
 	return &fakeExcerptSource{
-		byName: answers,
-		calls:  map[string]int{},
+		byName:    answers,
+		errByName: map[string]error{},
+		calls:     map[string]int{},
 	}
 }
 
@@ -1650,7 +1653,7 @@ func (s *fakeExcerptSource) FailureExcerpt(_ context.Context, _, _, checkName st
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls[checkName]++
-	return s.byName[checkName], nil
+	return s.byName[checkName], s.errByName[checkName]
 }
 
 func (s *fakeExcerptSource) callCount(checkName string) int {
@@ -1913,6 +1916,76 @@ func TestFailureExcerptCacheAvoidsSecondFetch(t *testing.T) {
 	}
 }
 
+// TestFailureExcerptSourceErrorIsVisible proves a failed fetch is reported to
+// the agent instead of looking like a check with no annotations (EH-02). The
+// flag appears on the failed check and in the aggregate, and survives a repeat
+// read because a failed fetch is never cached as an empty success.
+func TestFailureExcerptSourceErrorIsVisible(t *testing.T) {
+	src := newFakeExcerptSource(map[string]string{"ci/failure": ""})
+	src.errByName["ci/failure"] = errors.New("github excerpt: status 500")
+	h, w := excerptTestHandler(t, src, nil)
+	req := sessionReq("session-E")
+	for i := 0; i < 2; i++ {
+		out, err := h.Result(context.Background(), req, GetResultInput{WatchID: w.ID})
+		if err != nil {
+			t.Fatalf("Result %d: %v", i, err)
+		}
+		if !out.FailureExcerptUnavailable {
+			t.Errorf("read %d: aggregate did not report the failed fetch", i)
+		}
+		if out.FailureExcerpt != "" {
+			t.Errorf("read %d: aggregate excerpt = %q, want empty", i, out.FailureExcerpt)
+		}
+		for _, fc := range out.FailedChecks {
+			switch fc.Name {
+			case "ci/failure":
+				if !fc.FailureExcerptUnavailable {
+					t.Errorf("read %d: ci/failure lost the unavailability flag", i)
+				}
+			case "ci/flaky":
+				if fc.FailureExcerptUnavailable {
+					t.Errorf("read %d: check without annotations got the flag", i)
+				}
+			}
+		}
+	}
+	if got := src.callCount("ci/failure"); got != 2 {
+		t.Errorf("source calls = %d, want 2 (a failed fetch is not cached)", got)
+	}
+}
+
+// TestFailureExcerptUnavailableOptionalKeepsStableSchema pins the new flag as
+// optional and absent from a response with no configured source (EH-02).
+func TestFailureExcerptUnavailableOptionalKeepsStableSchema(t *testing.T) {
+	schema, err := OutputSchema[GetResultOutput]()
+	if err != nil {
+		t.Fatalf("OutputSchema: %v", err)
+	}
+	if _, ok := schema.Properties["failureExcerptUnavailable"]; !ok {
+		t.Fatal("get_result schema is missing failureExcerptUnavailable")
+	}
+	for _, required := range schema.Required {
+		if required == "failureExcerptUnavailable" {
+			t.Fatal("failureExcerptUnavailable must be optional, not required")
+		}
+	}
+	h, w := excerptTestHandler(t, nil, nil)
+	out, err := h.Result(context.Background(), sessionReq("session-E"), GetResultInput{WatchID: w.ID})
+	if err != nil {
+		t.Fatalf("Result: %v", err)
+	}
+	if out.FailureExcerptUnavailable {
+		t.Error("no-source response set the unavailability flag")
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), `"failureExcerptUnavailable"`) {
+		t.Errorf("optional field present without a source: %s", raw)
+	}
+}
+
 // TestFailureExcerptOptionalKeepsStableSchema pins the W9-C contract: the new
 // field is present in the derived schema but not required, and a response from
 // a server with no source omits it entirely.
@@ -1992,6 +2065,36 @@ func TestEnvFailureExcerptSource(t *testing.T) {
 	}
 	if len(paths) != 2 {
 		t.Errorf("REST paths = %v, want two calls", paths)
+	}
+}
+
+// TestEnvFailureExcerptSourceRejectsEmptyMetadata pins EH-02's change to the
+// zero-wiring source: missing fields are errors that name the field, not a
+// silent empty excerpt. A missing check run with valid metadata stays empty.
+func TestEnvFailureExcerptSourceRejectsEmptyMetadata(t *testing.T) {
+	src := &envFailureExcerptSource{client: &http.Client{}}
+	cases := []struct {
+		name, repo, headSHA, checkName, field string
+	}{
+		{"repo", "", "sha", "ci/failure", "repo"},
+		{"headSHA", "o/r", "", "ci/failure", "headSHA"},
+		{"checkName", "o/r", "sha", "", "checkName"},
+		{"repo format", "not-a-repo", "sha", "ci/failure", "owner/name"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := src.FailureExcerpt(context.Background(), tc.repo, tc.headSHA, tc.checkName)
+			if err == nil {
+				t.Fatalf("FailureExcerpt = %q, nil; want error naming %q", got, tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("error = %q, want it to name %q", err, tc.field)
+			}
+		})
+	}
+	var nilSource *envFailureExcerptSource
+	if _, err := nilSource.FailureExcerpt(context.Background(), "o/r", "sha", "ci/failure"); err == nil {
+		t.Error("nil source returned no error")
 	}
 }
 

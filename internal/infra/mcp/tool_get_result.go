@@ -464,25 +464,26 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 
 	failed := collectFailedChecks(w)
-	excerpt, excerptTruncated, excerptLogURL := h.attachFailureExcerpts(ctx, w, failed)
+	excerpt, excerptTruncated, excerptLogURL, excerptUnavailable := h.attachFailureExcerpts(ctx, w, failed)
 	action, command, hint := nextStepFor(w.Verdict)
 	// The projection fills the seven required fields and the optional ones the
 	// Watch supports. ADR 0094 lists the full field set and each field's purpose.
 	out := GetResultOutput{
-		Status:                  string(w.Status),
-		Verdict:                 string(w.Verdict),
-		Revision:                w.Revision,
-		Merge:                   MergeSnapshot{Mergeable: w.Merge.Mergeable, MergeStateStatus: w.Merge.MergeStateStatus},
-		FailedChecks:            failed,
-		ObligationID:            obligationID,
-		RetryBudget:             remainingRetryBudget(w, failed),
-		NextAction:              action,
-		NextCommand:             command,
-		NextHint:                hint,
-		FailureExcerpt:          excerpt,
-		FailureExcerptTruncated: excerptTruncated,
-		FailureExcerptLogURL:    excerptLogURL,
-		ConfigID:                w.ConfigID,
+		Status:                    string(w.Status),
+		Verdict:                   string(w.Verdict),
+		Revision:                  w.Revision,
+		Merge:                     MergeSnapshot{Mergeable: w.Merge.Mergeable, MergeStateStatus: w.Merge.MergeStateStatus},
+		FailedChecks:              failed,
+		ObligationID:              obligationID,
+		RetryBudget:               remainingRetryBudget(w, failed),
+		NextAction:                action,
+		NextCommand:               command,
+		NextHint:                  hint,
+		FailureExcerpt:            excerpt,
+		FailureExcerptTruncated:   excerptTruncated,
+		FailureExcerptLogURL:      excerptLogURL,
+		FailureExcerptUnavailable: excerptUnavailable,
+		ConfigID:                  w.ConfigID,
 	}
 
 	// Refuse before the read stamp: a response the caller never receives must
@@ -510,19 +511,23 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 // with no source configured the response is byte-for-byte the old shape.
 
 // attachFailureExcerpts fills each failed check's excerpt and returns the
-// aggregate bounded at failureExcerptLimit plus a truncation flag and a link to
-// the full CI log. A cache hit never calls the source; a miss calls it exactly
-// once and stores the answer, including an empty one, so a check with no
-// annotations is not re-fetched on the next poll. The truncation marker lives
-// in the cached string, so a cache hit keeps the flag too.
-func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.Watch, failed []FailedCheck) (string, bool, string) {
+// aggregate bounded at failureExcerptLimit plus a truncation flag, a link to
+// the full CI log and a flag reporting that at least one source fetch failed
+// (EH-02). A cache hit never calls the source; a miss calls it once and stores
+// a successful answer, including an empty one, so a check with no annotations
+// is not re-fetched on the next poll. A failed fetch is never stored: an empty
+// cached string would look like a check with no annotations and would erase the
+// unavailability flag on the next poll. The truncation marker lives in the
+// cached string, so a cache hit keeps that flag too.
+func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.Watch, failed []FailedCheck) (string, bool, string, bool) {
 	if h == nil || h.excerptSource == nil || len(failed) == 0 {
-		return "", false, ""
+		return "", false, "", false
 	}
 	cache := h.excerptStore()
 	var agg strings.Builder
 	truncated := false
 	logURL := ""
+	unavailable := false
 	for i := range failed {
 		name := failed[i].Name
 		excerpt, ok, err := cacheGet(ctx, cache, w.ID, w.HeadSHA, name)
@@ -534,11 +539,15 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 			raw, fetchErr := h.excerptSource.FailureExcerpt(ctx, w.Repo, w.HeadSHA, name)
 			if fetchErr != nil {
 				observe.ActorError("get_result-excerpt", w.ID, fetchErr)
+				failed[i].FailureExcerptUnavailable = true
+				unavailable = true
 				raw = ""
 			}
 			excerpt = sanitizeExcerpt(raw, failureExcerptLimit)
-			if putErr := cachePut(ctx, cache, w.ID, w.HeadSHA, name, excerpt); putErr != nil {
-				observe.ActorError("get_result-excerpt-cache", w.ID, putErr)
+			if fetchErr == nil {
+				if putErr := cachePut(ctx, cache, w.ID, w.HeadSHA, name, excerpt); putErr != nil {
+					observe.ActorError("get_result-excerpt-cache", w.ID, putErr)
+				}
 			}
 		}
 		failed[i].FailureExcerpt = excerpt
@@ -565,7 +574,7 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 	if aggregate != "" && logURL == "" && len(failed) > 0 {
 		logURL = failed[0].DetailsURL
 	}
-	return aggregate, truncated, logURL
+	return aggregate, truncated, logURL, unavailable
 }
 
 // excerptWasTruncated reports whether an excerpt carries the truncation marker.
@@ -769,12 +778,23 @@ func excerptAnnotationsURL(base, owner, name string, id int64) string {
 // W11-B; a GraphQL checkRun.annotations(first:N) source can be injected instead
 // by supplying another FailureExcerptSource.
 func (s *envFailureExcerptSource) FailureExcerpt(ctx context.Context, repo, headSHA, checkName string) (string, error) {
-	if s == nil || s.client == nil || repo == "" || headSHA == "" || checkName == "" {
-		return "", nil
+	// A missing field is a failed request, not a check without annotations.
+	// Return an error so the caller can tell the two apart (EH-02).
+	if s == nil || s.client == nil {
+		return "", errors.New("github excerpt: source is not configured")
+	}
+	if repo == "" {
+		return "", errors.New("github excerpt: missing repo")
+	}
+	if headSHA == "" {
+		return "", errors.New("github excerpt: missing headSHA")
+	}
+	if checkName == "" {
+		return "", errors.New("github excerpt: missing checkName")
 	}
 	owner, name, ok := strings.Cut(repo, "/")
 	if !ok || owner == "" || name == "" {
-		return "", nil
+		return "", fmt.Errorf("github excerpt: repo %q is not owner/name", repo)
 	}
 	path := excerptCheckRunsURL(s.base, owner, name, headSHA)
 	var body struct {
@@ -792,6 +812,8 @@ func (s *envFailureExcerptSource) FailureExcerpt(ctx context.Context, repo, head
 		break
 	}
 	if id == 0 {
+		// No failed check run matches, so there are no annotations to read.
+		// This is a successful empty answer, unlike the validation errors above.
 		return "", nil
 	}
 	annotationsPath := excerptAnnotationsURL(s.base, owner, name, id)
