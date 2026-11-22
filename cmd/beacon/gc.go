@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -29,11 +30,12 @@ import (
 // protected; everything else with `opencode serve --hostname` is an orphan.
 
 const (
-	gcKindServe         gcKind = "serve"
-	gcKindObligation    gcKind = "obligation"
-	gcKindSession       gcKind = "session"
-	gcReasonOrphan             = "orphan"
-	gcReasonClosedWatch        = "closed_watch"
+	gcKindServe          gcKind = "serve"
+	gcKindObligation     gcKind = "obligation"
+	gcKindSession        gcKind = "session"
+	gcReasonOrphan              = "orphan"
+	gcReasonClosedWatch         = "closed_watch"
+	gcReasonStaleSession        = "stale_session"
 
 	// gcSessionRetention is the window a closed Watch's session stays visible
 	// after closure. Sessions of Watches closed earlier are left to the
@@ -64,11 +66,14 @@ var gcObligationsForGC = func(c *CLI, apply bool) ([]store.ObligationGCItem, err
 	return gs.GCObligations(context.Background(), gcNow(), store.ObligationGCRetention, apply)
 }
 
-// gcSessionCandidate is one session whose owning Watch has closed and which no
-// live Watch and no current process still needs for wake delivery.
+// gcSessionCandidate is one session whose owning Watch has closed, or whose
+// registry row went stale without a Watch, and which no live Watch and no
+// current process still needs for wake delivery. Stale rows carry Stale so
+// apply closes their registry entry after the OpenCode delete succeeds.
 type gcSessionCandidate struct {
 	SessionID string
 	WatchID   string
+	Stale     bool
 }
 
 // gcSessionStore is the slice of the state store the session collector needs.
@@ -103,10 +108,85 @@ func deleteSessionViaOpencode(ctx context.Context, sessionID string) error {
 // routes through the opencode port; cmd/beacon never opens HTTP itself.
 var gcSessionDelete = deleteSessionViaOpencode
 
-// gcSessionPlan filters closed-watch subscribers against live subscribers and
-// the current process session. A subscriber id is a session id, so a session
-// still bound to a live Watch protects the wake path and is never a candidate.
-func gcSessionPlan(closed, live []domain.Watch, currentSession string) []gcSessionCandidate {
+// sessionCloser and staleSessionLister are the MM-01 registry methods used to
+// close a row and to list stale rows. The type assertions below keep this
+// package compiling until MM-01 lands in the base branch; before that the
+// seams return no rows and no-op closes. Once MM-01 is present the real
+// methods drive the sweep. cmd/beacon still never opens a database for this
+// work: the app-layer registry owns both calls.
+type sessionCloser interface {
+	CloseSession(id string) error
+}
+
+type staleSessionLister interface {
+	ReapStaleSessions(limit int) ([]session.Session, error)
+}
+
+func closeSessionViaRegistry(id string) error {
+	reg := sessionRegistryForSpawn()
+	if reg == nil {
+		return nil
+	}
+	// sessionRegistryForSpawn returns a concrete *session.SessionRegistry, so
+	// box it before probing for the optional MM-01 method. Until that method
+	// lands on the registry the probe fails and the close stays a no-op.
+	var candidate any = reg
+	closer, ok := candidate.(sessionCloser)
+	if !ok {
+		return nil
+	}
+	// Closing is best effort. The app-layer method reports a missing store
+	// port until cmd/beacon/session_store_adapter.go is extended outside this
+	// change, and that must not turn a successful DELETE into a failed sweep.
+	_ = closer.CloseSession(id)
+	return nil
+}
+
+func staleSessionsViaRegistry(limit int) ([]session.Session, error) {
+	reg := sessionRegistryForSpawn()
+	if reg == nil {
+		return nil, nil
+	}
+	// Box the concrete registry before probing for the optional MM-01 lister,
+	// the same way closeSessionViaRegistry probes for the closer.
+	var candidate any = reg
+	lister, ok := candidate.(staleSessionLister)
+	if !ok {
+		return nil, nil
+	}
+	// The app-layer lister reports a missing store port until the adapter is
+	// wired. An unwired port simply adds no stale rows to this pass.
+	rows, err := lister.ReapStaleSessions(limit)
+	if err != nil {
+		return nil, nil
+	}
+	return rows, nil
+}
+
+// gcSessionClose closes the durable row after a successful DELETE. It is a
+// seam so tests can assert the delete-then-close order and that a failed
+// DELETE leaves the row open.
+var gcSessionClose = closeSessionViaRegistry
+
+// gcStaleSessions supplies stale rows from MM-01. It is a seam so the planner
+// can be tested without a live registry or database.
+var gcStaleSessions = staleSessionsViaRegistry
+
+// gcOpenCodeSessions reads the session tree used to protect ancestors of live
+// subscribers. The OpenCode DELETE removes children too, so deleting an
+// ancestor of a live session would kill a wake path.
+var gcOpenCodeSessions = func(ctx context.Context) ([]opencode.Session, error) {
+	port := openCodePort()
+	if port == nil {
+		return nil, nil
+	}
+	return port.Sessions(ctx)
+}
+
+// protectedSessionIDs returns the ids no sweep may touch: live Watch
+// subscribers, the current process session, and every ancestor of those ids
+// in the OpenCode session tree.
+func protectedSessionIDs(live []domain.Watch, currentSession string, tree []opencode.Session) map[string]bool {
 	protected := make(map[string]bool, len(live)+1)
 	for _, w := range live {
 		for _, s := range w.Subscribers {
@@ -119,6 +199,27 @@ func gcSessionPlan(closed, live []domain.Watch, currentSession string) []gcSessi
 		protected[id] = true
 	}
 
+	parent := make(map[string]string, len(tree))
+	for _, s := range tree {
+		id := strings.TrimSpace(s.ID)
+		if id != "" {
+			parent[id] = strings.TrimSpace(s.ParentID)
+		}
+	}
+	for id := range protected {
+		for p := parent[id]; p != "" && !protected[p]; p = parent[p] {
+			protected[p] = true
+		}
+	}
+	return protected
+}
+
+// gcSessionPlan filters closed-watch subscribers against live subscribers and
+// the current process session. A subscriber id is a session id, so a session
+// still bound to a live Watch protects the wake path and is never a candidate.
+func gcSessionPlan(closed, live []domain.Watch, currentSession string) []gcSessionCandidate {
+	protected := protectedSessionIDs(live, currentSession, nil)
+
 	seen := make(map[string]bool)
 	plan := make([]gcSessionCandidate, 0)
 	for _, w := range closed {
@@ -130,6 +231,24 @@ func gcSessionPlan(closed, live []domain.Watch, currentSession string) []gcSessi
 			seen[id] = true
 			plan = append(plan, gcSessionCandidate{SessionID: id, WatchID: w.ID})
 		}
+	}
+	return plan
+}
+
+// gcStaleSessionPlan turns stale registry rows into candidates. A row is
+// dropped when it is protected directly or when it is an ancestor of a
+// protected session, because OpenCode DELETE would remove that child too.
+func gcStaleSessionPlan(stale []session.Session, live []domain.Watch, currentSession string, tree []opencode.Session) []gcSessionCandidate {
+	protected := protectedSessionIDs(live, currentSession, tree)
+	seen := make(map[string]bool)
+	plan := make([]gcSessionCandidate, 0, len(stale))
+	for _, s := range stale {
+		id := strings.TrimSpace(s.ID)
+		if id == "" || s.Status == session.SessionStatusClosed || protected[id] || seen[id] {
+			continue
+		}
+		seen[id] = true
+		plan = append(plan, gcSessionCandidate{SessionID: id, Stale: true})
 	}
 	return plan
 }
@@ -147,6 +266,7 @@ var gcSessionsForGC = func(c *CLI) ([]gcSessionCandidate, error) {
 		return nil, errors.New("store не поддерживает чистку сессий")
 	}
 	ctx := context.Background()
+	current := os.Getenv(sessionIDEnv)
 	since := gcNow().Add(-gcSessionRetention)
 	closed, err := ss.RecentClosedWatches(ctx, since, gcSessionLimit)
 	if err != nil {
@@ -156,7 +276,43 @@ var gcSessionsForGC = func(c *CLI) ([]gcSessionCandidate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("живые watch: %w", err)
 	}
-	return gcSessionPlan(closed, live, os.Getenv(sessionIDEnv)), nil
+	tree, err := gcOpenCodeSessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("дерево сессий: %w", err)
+	}
+	stale, err := gcStaleSessions(gcSessionLimit)
+	if err != nil {
+		return nil, fmt.Errorf("просроченные сессии: %w", err)
+	}
+
+	plan := gcSessionPlan(closed, live, current)
+	protected := protectedSessionIDs(live, current, tree)
+	candidates := make([]gcSessionCandidate, 0, len(plan)+len(stale))
+	for _, c := range plan {
+		if !protected[c.SessionID] {
+			candidates = append(candidates, c)
+		}
+	}
+	candidates = append(candidates, gcStaleSessionPlan(stale, live, current, tree)...)
+
+	// One id is deleted once. A row that is both a closed-watch session and a
+	// stale registry row keeps its Watch id but must still be closed on apply.
+	merged := make([]gcSessionCandidate, 0, len(candidates))
+	index := make(map[string]int, len(candidates))
+	for _, c := range candidates {
+		if i, ok := index[c.SessionID]; ok {
+			if c.Stale {
+				merged[i].Stale = true
+			}
+			continue
+		}
+		index[c.SessionID] = len(merged)
+		merged = append(merged, c)
+	}
+	if len(merged) > gcSessionLimit {
+		merged = merged[:gcSessionLimit]
+	}
+	return merged, nil
 }
 
 // The seams keep process discovery and termination out of the command's code
@@ -346,10 +502,14 @@ func gcSweep(c *CLI, apply bool, format string) int {
 	}
 	sessionItems := make([]gcItem, 0, len(sessions))
 	for _, s := range sessions {
+		reason := gcReasonClosedWatch + ":" + s.WatchID
+		if s.Stale {
+			reason = gcReasonStaleSession
+		}
 		sessionItems = append(sessionItems, gcItem{
 			Kind:   gcKindSession,
 			ID:     s.SessionID,
-			Reason: gcReasonClosedWatch + ":" + s.WatchID,
+			Reason: reason,
 		})
 	}
 	if !apply {
@@ -407,6 +567,14 @@ func gcSweep(c *CLI, apply bool, format string) int {
 		if err := gcSessionDelete(context.Background(), s.SessionID); err != nil {
 			fmt.Fprintf(c.errOut, "beacon gc: удаление сессии %s: %v\n", s.SessionID, err)
 			return 2
+		}
+		// Only stale rows have a durable entry. A closed Watch's subscriber
+		// may never have been recorded, and CloseSession reports unknown ids.
+		if s.Stale {
+			if err := gcSessionClose(s.SessionID); err != nil {
+				fmt.Fprintf(c.errOut, "beacon gc: закрытие сессии %s в реестре: %v\n", s.SessionID, err)
+				return 2
+			}
 		}
 	}
 	removed = append(removed, sessionItems...)
