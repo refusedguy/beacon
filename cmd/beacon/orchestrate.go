@@ -184,11 +184,13 @@ func projectWatch(w domain.Watch) orchestrator.Watch {
 	}
 }
 
-// orchestratorDepsFromDB builds the orchestrator ports from one already-open
-// store handle. Watches come from LiveWatches, which includes blocked Watches
-// and excludes closed ones, so no second status filter is needed here.
-func orchestratorDepsFromDB(c *CLI, db *store.DB) (orchestratorDeps, error) {
-	ghBatch := newGitHubBatch(context.Background(), c)
+// storeResolverPorts builds the store projection and the waitFor resolver from
+// the one store handle the process already opened. The orchestrate command and
+// the cibridge reconcile loop both call it, so a dependency ref resolves the
+// same way in either path. The resolver reads merged PRs from the SQLite Watch
+// rows and probes file refs with local git, so a dependency check starts no
+// `gh pr view` process.
+func storeResolverPorts(c *CLI, db *store.DB) (*dbOrchestratorStore, orchestrator.DependencyResolver) {
 	reader := orchWatchReaderFunc(func(_ context.Context) ([]orchestrator.Watch, error) {
 		live, err := db.LiveWatches()
 		if err != nil {
@@ -201,11 +203,17 @@ func orchestratorDepsFromDB(c *CLI, db *store.DB) (orchestratorDeps, error) {
 		return out, nil
 	})
 	dbStore := newDBOrchestratorStore(reader, db)
-	// The resolver reads merged PRs from the SQLite Watch rows and probes file
-	// refs with local git. It never starts `gh pr view`, so a dependency check
-	// adds no CLI process to the auto-merge gateway.
 	resolver := orchestrator.NewStoreDependencyResolver(
 		filepath.Join(c.root, "docs", "tasks"), cliRunner{c: c}, dbStore)
+	return dbStore, resolver
+}
+
+// orchestratorDepsFromDB builds the orchestrator ports from one already-open
+// store handle. Watches come from LiveWatches, which includes blocked Watches
+// and excludes closed ones, so no second status filter is needed here.
+func orchestratorDepsFromDB(c *CLI, db *store.DB) (orchestratorDeps, error) {
+	ghBatch := newGitHubBatch(context.Background(), c)
+	dbStore, resolver := storeResolverPorts(c, db)
 	return orchestratorDeps{
 		Store:    dbStore,
 		Merger:   domainMergeAdapter{merger: ghBatch.provider},

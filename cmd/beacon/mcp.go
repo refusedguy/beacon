@@ -1395,6 +1395,7 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 	ghBatch := newGitHubBatch(ctx, c)
 	deps := buildMCPDependencies(db, dir, ghBatch.provider.PointStats)
 	defer stopVerdictSource(deps.Source)
+	_, resolver := storeResolverPorts(c, db)
 
 	events := httpapi.NewEventBus(0)
 	cfg := reconcileConfig{
@@ -1405,6 +1406,7 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		counter:    ghBatch.counter,
 		projectKey: orchestratorProjectKey(),
 		root:       projectRootForConfig(),
+		resolver:   resolver,
 		events:     events,
 	}
 
@@ -1616,6 +1618,7 @@ type reconcileConfig struct {
 	counter          *github.Counter
 	projectKey       string
 	root             string
+	resolver         orchestrator.DependencyResolver
 	intervalOverride time.Duration
 	// events carries live cycle and decision frames to SSE subscribers. A
 	// config assembled by `beacon daemon` leaves it nil.
@@ -1955,6 +1958,7 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithMerger(cfg.batch).
 		WithAutoRebase(cfg.batch).
 		WithBlockerControl(cfg.db).
+		WithDependencyResolver(cfg.resolver).
 		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root}).
 		WithWorktreeGC(bridgeWorktreeGC(cfg.db, cfg.root))
 	updated := bridge.Refresh(ctx)
