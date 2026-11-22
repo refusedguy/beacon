@@ -29,6 +29,16 @@ func (f *fakeTaskClaimStore) Claim(_ context.Context, in TaskClaimInput, claimed
 	return f.out, f.err
 }
 
+// fakeTaskClaimGraph implements ClaimGraph with a fixed dependency and cycle
+// table, so selection tests do not depend on the graph index on disk.
+type fakeTaskClaimGraph struct {
+	deps   map[string][]string
+	cycles map[string]bool
+}
+
+func (f *fakeTaskClaimGraph) Dependencies(id string) []string { return f.deps[id] }
+func (f *fakeTaskClaimGraph) HasCycle(id string) bool         { return f.cycles[id] }
+
 func claimTestCard(id, phase string, extra ...string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# %s. Test card\n", id)
@@ -55,6 +65,16 @@ func writeClaimTestCard(t *testing.T, dir, id, phase string, extra ...string) st
 	t.Helper()
 	path := filepath.Join(dir, id+".md")
 	if err := os.WriteFile(path, []byte(claimTestCard(id, phase, extra...)), 0644); err != nil {
+		t.Fatalf("write card: %v", err)
+	}
+	return path
+}
+
+func writeClaimTestCardWithStatus(t *testing.T, dir, id, phase, status string) string {
+	t.Helper()
+	text := strings.Replace(claimTestCard(id, phase), "Статус: todo", "Статус: "+status, 1)
+	path := filepath.Join(dir, id+".md")
+	if err := os.WriteFile(path, []byte(text), 0644); err != nil {
 		t.Fatalf("write card: %v", err)
 	}
 	return path
@@ -104,7 +124,7 @@ func TestTaskClaimHandlerReturnsFullContext(t *testing.T) {
 	store := &fakeTaskClaimStore{out: want}
 	h := newTaskClaimHandler(store, func() time.Time { return time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC) })
 
-	got, err := h.Claim(context.Background(), TaskClaimInput{AgentID: "ses_worker", Phase: "P1"})
+	got, err := h.Claim(context.Background(), TaskClaimInput{AgentID: "ses_worker", Phase: "P1", OrderByPhase: true})
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -123,7 +143,7 @@ func TestTaskClaimHandlerReturnsFullContext(t *testing.T) {
 	if got.Handoff != want.Handoff {
 		t.Fatalf("handoff = %+v, want %+v", got.Handoff, want.Handoff)
 	}
-	if store.gotInput.AgentID != "ses_worker" || store.gotInput.Phase != "P1" {
+	if store.gotInput.AgentID != "ses_worker" || store.gotInput.Phase != "P1" || !store.gotInput.OrderByPhase {
 		t.Fatalf("store input = %+v", store.gotInput)
 	}
 	if store.gotAt != want.ClaimedAt {
@@ -290,5 +310,143 @@ func TestFileTaskClaimPhaseFilter(t *testing.T) {
 		t.Fatal("claim with no matching card should fail")
 	} else if code := claimErrorCode(t, err); code != domain.CodeGone {
 		t.Fatalf("no-card code = %s, want GONE", code)
+	}
+}
+
+func TestFileTaskClaimPhasePriorityOverID(t *testing.T) {
+	when := "2026-11-21T12:00:00Z"
+	newStore := func() *FileTaskClaimStore {
+		dir := t.TempDir()
+		writeClaimTestCard(t, dir, "AAA-01", "P2")
+		writeClaimTestCard(t, dir, "ZZZ-01", "P1")
+		return &FileTaskClaimStore{TasksDir: dir, StateDir: dir, Graph: &fakeTaskClaimGraph{}}
+	}
+
+	out, err := newStore().Claim(context.Background(), TaskClaimInput{AgentID: "ses_ids"}, when)
+	if err != nil {
+		t.Fatalf("claim without OrderByPhase: %v", err)
+	}
+	if out.CardID != "AAA-01" {
+		t.Fatalf("claimed %s, want the conservative id order pick AAA-01", out.CardID)
+	}
+
+	out, err = newStore().Claim(context.Background(), TaskClaimInput{AgentID: "ses_phase", OrderByPhase: true}, when)
+	if err != nil {
+		t.Fatalf("claim with OrderByPhase: %v", err)
+	}
+	if out.CardID != "ZZZ-01" {
+		t.Fatalf("claimed %s, want the earlier P1 card", out.CardID)
+	}
+}
+
+func TestFileTaskClaimPhasePriorityNeedsGraph(t *testing.T) {
+	dir := t.TempDir()
+	writeClaimTestCard(t, dir, "AAA-01", "P2")
+	writeClaimTestCard(t, dir, "ZZZ-01", "P1")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+
+	out, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_nograph", OrderByPhase: true}, "2026-11-21T12:00:00Z")
+	if err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if out.CardID != "AAA-01" {
+		t.Fatalf("claimed %s, want the conservative id order without a graph port", out.CardID)
+	}
+}
+
+func TestFileTaskClaimRejectsCyclicCard(t *testing.T) {
+	when := "2026-11-21T12:00:00Z"
+	newStore := func() *FileTaskClaimStore {
+		dir := t.TempDir()
+		writeClaimTestCard(t, dir, "AAA-01", "P0")
+		return &FileTaskClaimStore{
+			TasksDir: dir,
+			StateDir: dir,
+			Graph:    &fakeTaskClaimGraph{cycles: map[string]bool{"AAA-01": true}},
+		}
+	}
+
+	store := newStore()
+	if _, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_cycle"}, when); err == nil {
+		t.Fatal("cyclic candidate was claimed")
+	} else if code := claimErrorCode(t, err); code != domain.CodeGone {
+		t.Fatalf("cyclic candidate code = %s, want GONE", code)
+	}
+	data, err := os.ReadFile(filepath.Join(store.TasksDir, "AAA-01.md"))
+	if err != nil {
+		t.Fatalf("read cyclic card: %v", err)
+	}
+	if !strings.Contains(string(data), "Статус: todo") {
+		t.Fatalf("cyclic card was modified:\n%s", data)
+	}
+
+	withAlternative := t.TempDir()
+	writeClaimTestCard(t, withAlternative, "AAA-01", "P0")
+	writeClaimTestCard(t, withAlternative, "ZZZ-01", "P1")
+	second := &FileTaskClaimStore{
+		TasksDir: withAlternative,
+		StateDir: withAlternative,
+		Graph:    &fakeTaskClaimGraph{cycles: map[string]bool{"AAA-01": true}},
+	}
+	out, err := second.Claim(context.Background(), TaskClaimInput{AgentID: "ses_skip", OrderByPhase: true}, when)
+	if err != nil {
+		t.Fatalf("claim after skipping cycle: %v", err)
+	}
+	if out.CardID != "ZZZ-01" {
+		t.Fatalf("claimed %s, want the non-cyclic card", out.CardID)
+	}
+}
+
+func TestFileTaskClaimDependencyReadiness(t *testing.T) {
+	when := "2026-11-21T12:00:00Z"
+	newStore := func(deps map[string][]string) *FileTaskClaimStore {
+		dir := t.TempDir()
+		writeClaimTestCardWithStatus(t, dir, "DEP-01", "P0", "done")
+		writeClaimTestCard(t, dir, "AAA-01", "P1")
+		writeClaimTestCard(t, dir, "ZZZ-01", "P2")
+		return &FileTaskClaimStore{TasksDir: dir, StateDir: dir, Graph: &fakeTaskClaimGraph{deps: deps}}
+	}
+
+	unresolved := newStore(map[string][]string{"AAA-01": {"MISSING-01"}})
+	out, err := unresolved.Claim(context.Background(), TaskClaimInput{AgentID: "ses_unresolved", OrderByPhase: true}, when)
+	if err != nil {
+		t.Fatalf("claim with unresolved dependency: %v", err)
+	}
+	if out.CardID != "ZZZ-01" {
+		t.Fatalf("claimed %s, want the card without unresolved dependencies", out.CardID)
+	}
+
+	resolved := newStore(map[string][]string{"AAA-01": {"DEP-01.md"}})
+	out, err = resolved.Claim(context.Background(), TaskClaimInput{AgentID: "ses_resolved", OrderByPhase: true}, when)
+	if err != nil {
+		t.Fatalf("claim with resolved dependency: %v", err)
+	}
+	if out.CardID != "AAA-01" {
+		t.Fatalf("claimed %s, want the card whose dependency is done", out.CardID)
+	}
+}
+
+func TestFileTaskClaimDroppedCardUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	writeClaimTestCardWithStatus(t, dir, "AAA-01", "P0", "dropped")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir, Graph: &fakeTaskClaimGraph{}}
+	when := "2026-11-21T12:00:00Z"
+
+	for _, in := range []TaskClaimInput{
+		{AgentID: "ses_pinned", CardID: "AAA-01"},
+		{AgentID: "ses_auto", OrderByPhase: true},
+	} {
+		if _, err := store.Claim(context.Background(), in, when); err == nil {
+			t.Fatalf("dropped card was claimed for %+v", in)
+		} else if code := claimErrorCode(t, err); code != domain.CodeGone {
+			t.Fatalf("dropped card code = %s, want GONE", code)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "AAA-01.md"))
+	if err != nil {
+		t.Fatalf("read dropped card: %v", err)
+	}
+	if !strings.Contains(string(data), "Статус: dropped") {
+		t.Fatalf("dropped card was modified:\n%s", data)
 	}
 }

@@ -35,11 +35,13 @@ const TaskClaimToolName = "beacon_task_claim"
 
 // TaskClaimInput is the argument object of beacon_task_claim. AgentID is the
 // only required field. CardID pins one card; without it the store selects the
-// first todo card. Phase narrows automatic selection.
+// first todo card. Phase narrows automatic selection. OrderByPhase opts into
+// phase-priority selection instead of the historical id order.
 type TaskClaimInput struct {
-	AgentID string `json:"agentID" jsonschema:"identifier of the agent receiving the task; required"`
-	CardID  string `json:"cardID,omitempty" jsonschema:"optional exact card id; without it the next todo card is selected"`
-	Phase   string `json:"phase,omitempty" jsonschema:"optional phase filter for automatic selection, for example P1"`
+	AgentID      string `json:"agentID" jsonschema:"identifier of the agent receiving the task; required"`
+	CardID       string `json:"cardID,omitempty" jsonschema:"optional exact card id; without it the next todo card is selected"`
+	Phase        string `json:"phase,omitempty" jsonschema:"optional phase filter for automatic selection, for example P1"`
+	OrderByPhase bool   `json:"orderByPhase,omitempty" jsonschema:"optional; select the lowest-numbered phase before comparing card ids"`
 }
 
 // TaskClaimOutput is the full context handed to the agent. Status is always
@@ -130,12 +132,25 @@ func TasksLockPath(tasksDir string) string {
 	return filepath.Join(tasksDir, tasksLockName)
 }
 
+// ClaimGraph is the read-only graph port used by automatic selection. The
+// composition root passes it when the task graph is built and current. A nil
+// port keeps the conservative id order, so a caller without a graph never gets
+// a dependency or cycle guarantee it cannot verify.
+type ClaimGraph interface {
+	// Dependencies returns the ids of direct depends-on edges of cardID.
+	Dependencies(cardID string) []string
+	// HasCycle reports whether cardID takes part in a cycle.
+	HasCycle(cardID string) bool
+}
+
 // FileTaskClaimStore is a stdlib-only TaskClaimStore over markdown cards.
 // TasksDir holds the cards and the shared lock. StateDir is kept for wiring
-// compatibility and no longer holds a separate claim lock.
+// compatibility and no longer holds a separate claim lock. Graph is optional
+// and supplies dependency and cycle facts for phase-priority selection.
 type FileTaskClaimStore struct {
 	TasksDir string
 	StateDir string
+	Graph    ClaimGraph
 }
 
 // claimCard is the subset of a card the tool needs. Raw is kept so the status
@@ -224,21 +239,51 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 			return TaskClaimOutput{}, domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("task_claim: card %s not found", cardID))
 		}
 	} else {
+		candidates := make([]claimCard, 0, len(cards))
 		for _, c := range cards {
-			if c.Status != "todo" || (phase != "" && c.Phase != phase) {
+			if !claimStatusAvailable(c.Status) || (phase != "" && c.Phase != phase) {
 				continue
 			}
 			if err := handoffOf(c).Validate(); err != nil {
 				continue
 			}
-			chosen = c
-			break
+			candidates = append(candidates, c)
+		}
+		// Phase priority and graph checks travel together. Without a graph the
+		// id order stays authoritative, because the caller cannot promise that
+		// an earlier phase is free of cycles and unresolved dependencies.
+		if s.Graph != nil {
+			if in.OrderByPhase {
+				sort.Slice(candidates, func(i, j int) bool {
+					ri, rj := claimPhaseRank(candidates[i].Phase), claimPhaseRank(candidates[j].Phase)
+					if ri != rj {
+						return ri < rj
+					}
+					return candidates[i].ID < candidates[j].ID
+				})
+			}
+			resolved := claimResolvedStatuses(cards)
+			for _, c := range candidates {
+				if s.Graph.HasCycle(c.ID) {
+					continue
+				}
+				if !claimDependenciesReady(s.Graph.Dependencies(c.ID), resolved) {
+					continue
+				}
+				chosen = c
+				break
+			}
+		} else if len(candidates) > 0 {
+			chosen = candidates[0]
 		}
 		if chosen.ID == "" {
 			return TaskClaimOutput{}, domain.NewAppError(domain.CodeGone, "task_claim: no todo card available")
 		}
 	}
 
+	if claimStatusDropped(chosen.Status) {
+		return TaskClaimOutput{}, domain.NewAppError(domain.CodeGone, fmt.Sprintf("task_claim: card %s is dropped", chosen.ID))
+	}
 	if chosen.Status != "todo" {
 		return TaskClaimOutput{}, domain.NewAppError(domain.CodeGone, fmt.Sprintf(
 			"task_claim: card %s already in_progress by %s at %s", chosen.ID, chosen.Agent, chosen.Time))
@@ -401,6 +446,51 @@ func validClaimPhase(v string) bool {
 	default:
 		return false
 	}
+}
+
+// claimPhaseOrder is the explicit priority used when OrderByPhase is set. A
+// lower index wins. Cards outside the known phases sort last.
+var claimPhaseOrder = [...]string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}
+
+func claimPhaseRank(phase string) int {
+	phase = strings.TrimSpace(phase)
+	for i, known := range claimPhaseOrder {
+		if strings.EqualFold(phase, known) {
+			return i
+		}
+	}
+	return len(claimPhaseOrder)
+}
+
+func claimStatusDropped(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), "dropped")
+}
+
+func claimStatusAvailable(status string) bool {
+	return strings.TrimSpace(status) == "todo" && !claimStatusDropped(status)
+}
+
+// claimResolvedStatuses treats done and dropped cards as settled dependencies.
+// A dropped card no longer has work behind it, so it cannot hold a claim.
+func claimResolvedStatuses(cards []claimCard) map[string]bool {
+	resolved := make(map[string]bool, len(cards))
+	for _, c := range cards {
+		status := strings.TrimSpace(c.Status)
+		if strings.EqualFold(status, "done") || claimStatusDropped(status) {
+			resolved[c.ID] = true
+		}
+	}
+	return resolved
+}
+
+func claimDependenciesReady(deps []string, resolved map[string]bool) bool {
+	for _, dep := range deps {
+		dep = strings.TrimSuffix(strings.TrimSpace(dep), ".md")
+		if dep == "" || !resolved[dep] {
+			return false
+		}
+	}
+	return true
 }
 
 // planModeOf follows the card template: an empty field means fast, and only
