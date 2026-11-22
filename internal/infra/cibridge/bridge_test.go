@@ -563,7 +563,7 @@ func TestBridgeWakesOrchestratorOnBlockedWatch(t *testing.T) {
 	for _, want := range []string{
 		"нужен FIX-агент",
 		"refusedguy/beacon#61",
-		"two required checks failed outside executor's diff",
+		string(domain.BlockReasonBaseChecksFailed),
 		"ci/test",
 		"gates",
 		w.ID,

@@ -142,7 +142,7 @@ func TestHandleUpCommandInspectFindsWatchByPR(t *testing.T) {
 		t.Fatalf("replies = %d, want 1", len(messenger.texts))
 	}
 	reply := messenger.texts[0]
-	for _, want := range []string{"watch=watch-2", "pr=8", "not mine", "fixAttempts=2", "subscriber=ses_1"} {
+	for _, want := range []string{"watch=watch-2", "pr=8", string(domain.BlockReasonNotMine), "fixAttempts=2", "subscriber=ses_1"} {
 		if !strings.Contains(reply, want) {
 			t.Fatalf("reply = %q, want %q", reply, want)
 		}
