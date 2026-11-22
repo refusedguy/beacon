@@ -322,10 +322,20 @@ func (d *DB) ResolveBlockersByBaseGreen(repo, baseRef string, baseFailed map[str
 		if err := ensureControlPlaneTables(tx); err != nil {
 			return err
 		}
-		rows, err := tx.Query(`
+		query := `
 			SELECT id, payload FROM blocker_incidents
-			WHERE repo = ? AND base_ref = ? AND status = ? ORDER BY created_at`,
-			repo, baseRef, blockerStatusOpen)
+			WHERE repo = ? AND base_ref = ? AND status = ? ORDER BY created_at`
+		args := []any{repo, baseRef, blockerStatusOpen}
+		// Older incidents were written with an empty base_ref before the base
+		// branch was recorded. baseRefOf maps an empty Watch base to main, so
+		// read those rows as main incidents instead of rewriting stored data.
+		if strings.EqualFold(strings.TrimSpace(baseRef), "main") {
+			query = `
+			SELECT id, payload FROM blocker_incidents
+			WHERE repo = ? AND base_ref IN ('main', '') AND status = ? ORDER BY created_at`
+			args = []any{repo, blockerStatusOpen}
+		}
+		rows, err := tx.Query(query, args...)
 		if err != nil {
 			return err
 		}
