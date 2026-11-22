@@ -389,6 +389,15 @@ func stopServer(srv *server) {
 	}
 }
 
+// serverWarmup503 reports the transient 503 opencode returns while its API is
+// still warming up. The CLI exits non-zero and writes the status to stderr, so
+// the combined output is the only place this fact appears.
+func serverWarmup503(out string) bool {
+	return strings.Contains(out, "UnexpectedStatus: 503") ||
+		strings.Contains(out, `"status":503`) ||
+		strings.Contains(out, `"status": 503`)
+}
+
 func (srv *server) api(t *testing.T, method, path, data string) apiResp {
 	t.Helper()
 	args := []string{"api", "--server", srv.url}
@@ -396,11 +405,27 @@ func (srv *server) api(t *testing.T, method, path, data string) apiResp {
 		args = append(args, "-d", data)
 	}
 	args = append(args, method, path)
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, openBin, args...)
-	cmd.Env = append(os.Environ(), "OPENCODE_PASSWORD="+srv.password)
-	out, err := cmd.CombinedOutput()
+	var out []byte
+	var err error
+	// service.json appears before the API starts answering requests. A fresh
+	// server can still return 503 for a few hundred milliseconds. Retry only
+	// that status; any other failure stays a hard error so test facts are not
+	// hidden behind a wait.
+	const attempts = 10
+	for i := 0; i < attempts; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cmd := exec.CommandContext(ctx, openBin, args...)
+		cmd.Env = append(os.Environ(), "OPENCODE_PASSWORD="+srv.password)
+		out, err = cmd.CombinedOutput()
+		cancel()
+		if !serverWarmup503(string(out)) {
+			break
+		}
+		if i+1 < attempts {
+			t.Logf("opencode api %s %s: warm-up 503, retry %d/%d", method, path, i+1, attempts)
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
 	if err != nil {
 		t.Fatalf("opencode api %s %s: %v\n%s", method, path, err, out)
 	}
