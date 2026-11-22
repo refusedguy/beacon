@@ -450,6 +450,72 @@ func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	}
 }
 
+// Phase is the role a thread plays in one delegated run. A plan thread uses the
+// planner model. An execute thread uses the editor model when one is set. CA-21
+// separates the two, so the cheaper model applies edits from a compact brief.
+type Phase string
+
+const (
+	PhasePlan    Phase = "plan"
+	PhaseExecute Phase = "execute"
+)
+
+// PhaseModels names the model used in each phase. Planner writes the plan.
+// Editor is optional. An empty Editor keeps the current spawn contract: the
+// executor inherits the planner's context and runs on Planner.
+type PhaseModels struct {
+	Planner string
+	Editor  string
+}
+
+// ModelFor returns the model assigned to phase. It returns Editor for an
+// execute phase when one is set, and Planner otherwise.
+func (m PhaseModels) ModelFor(phase Phase) string {
+	if phase == PhaseExecute && m.Editor != "" {
+		return m.Editor
+	}
+	return m.Planner
+}
+
+// UsingEditor reports whether a distinct editor model is configured.
+func (m PhaseModels) UsingEditor() bool { return m.Editor != "" }
+
+// PhaseCost holds the accounted model cost of the two phases. Total adds them,
+// so a run report can state the combined spend (CA-21).
+type PhaseCost struct {
+	Plan    float64
+	Execute float64
+}
+
+// Total returns the sum of the plan and execute costs.
+func (c PhaseCost) Total() float64 { return c.Plan + c.Execute }
+
+// ExecutorBrief is the compact handoff from a planner to an executor. Plan is
+// the one structured plan message. OwnerFiles lists the files the executor owns.
+// PlanCost is the planner spend carried into the run report. The brief carries
+// no planner history and no ranked map.
+type ExecutorBrief struct {
+	Plan       string
+	OwnerFiles []string
+	PlanCost   float64
+}
+
+// Messages returns the executor's starting dialog. It holds exactly one
+// message, so a planner's history never enters the executor's context.
+func (b ExecutorBrief) Messages() []Message {
+	return []Message{{Role: RoleUser, Text: b.Plan}}
+}
+
+// extra builds the context entries a brief contributes. It holds the plan text
+// and the owner files, and nothing else.
+func (b ExecutorBrief) extra() ContextSnapshot {
+	ctx := NewContext(map[string]string{"plan": b.Plan})
+	if len(b.OwnerFiles) > 0 {
+		ctx = ctx.WithAttachedFiles(b.OwnerFiles)
+	}
+	return ctx
+}
+
 // Thread is one node in a delegation tree. ParentID is empty for a root. A
 // Thread is returned by value and its snapshot cannot be changed by the caller.
 type Thread struct {
@@ -504,9 +570,9 @@ func (r *Registry) Spawn(parentID, childID ThreadID, name string) (Thread, error
 	return r.SpawnWith(parentID, childID, name, ContextSnapshot{})
 }
 
-// SpawnWith is Spawn with extra entries merged over the parent's snapshot. An
-// extra key with the same name replaces the inherited value.
-func (r *Registry) SpawnWith(parentID, childID ThreadID, name string, extra ContextSnapshot) (Thread, error) {
+// addChild validates a spawn request and records the child. build receives the
+// parent thread and returns the context the child starts with.
+func (r *Registry) addChild(parentID, childID ThreadID, name string, build func(parent Thread) ContextSnapshot) (Thread, error) {
 	if !parentID.Valid() || !childID.Valid() {
 		return Thread{}, fmt.Errorf("%w: empty parent or child id", ErrInvalidThread)
 	}
@@ -525,11 +591,35 @@ func (r *Registry) SpawnWith(parentID, childID ThreadID, name string, extra Cont
 		ID:       childID,
 		Name:     strings.TrimSpace(name),
 		ParentID: parentID,
-		Context:  parent.Context.merged(extra),
+		Context:  build(parent),
 	}
 	r.threads[childID] = t
 	r.children[parentID] = append(r.children[parentID], childID)
 	return t, nil
+}
+
+// SpawnWith is Spawn with extra entries merged over the parent's snapshot. An
+// extra key with the same name replaces the inherited value.
+func (r *Registry) SpawnWith(parentID, childID ThreadID, name string, extra ContextSnapshot) (Thread, error) {
+	return r.addChild(parentID, childID, name, func(parent Thread) ContextSnapshot {
+		return parent.Context.merged(extra)
+	})
+}
+
+// SpawnExecutor adds an executor child under parentID. It selects the phase
+// model and builds the child's context from brief. When models has no editor
+// model, the child inherits the planner's context with the plan merged in,
+// which is the current contract. With an editor model, the child gets only the
+// plan and the owner files from the brief. No planner context or history is
+// copied into the executor. Errors mirror SpawnWith.
+func (r *Registry) SpawnExecutor(parentID, childID ThreadID, name string, models PhaseModels, brief ExecutorBrief) (Thread, error) {
+	return r.addChild(parentID, childID, name, func(parent Thread) ContextSnapshot {
+		ctx := brief.extra()
+		if !models.UsingEditor() {
+			ctx = parent.Context.merged(ctx)
+		}
+		return ctx
+	})
 }
 
 // SpawnWithRankedMap adds a child under parentID and attaches a ranked map of
