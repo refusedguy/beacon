@@ -1156,6 +1156,22 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		updated += b.applyVerdict(ctx, w, obs, verdict, targets, now, cycleID)
 	}
 
+	// A green base releases every blocker incident on that branch without
+	// waiting for a Watch to merge. Run this after the loop: handleBlocked on a
+	// blocked Watch would otherwise recreate an incident resolved earlier in
+	// the same cycle. The guard is fail-closed, so an unknown base does nothing.
+	for id, obs := range observations {
+		if !obs.base.ChecksKnown || len(obs.base.FailedChecks) != 0 {
+			continue
+		}
+		for i := range watches {
+			if watches[i].ID == id {
+				b.resolveBaseGreenBlockers(watches[i], obs, now, cycleID)
+				break
+			}
+		}
+	}
+
 	b.cycleEvent(cycleID, "cycle_end", cycleFields{}, observe.Fields{
 		observe.FieldUpdated: updated, observe.FieldSkipped: skipped,
 	})

@@ -296,6 +296,41 @@ func TestResolveBlockersByBaseGreen(t *testing.T) {
 	}
 }
 
+// TestBlockerSignatureIgnoresInformationalChecks pins the signature rule: e2e
+// and ci-provider-probe run with continue-on-error, so they must not open a
+// second incident or keep an incident open when only they fail on base.
+func TestBlockerSignatureIgnoresInformationalChecks(t *testing.T) {
+	d := openControlPlaneTestDB(t)
+	now := time.Now().UTC()
+
+	withInfo, created, err := d.GetOrCreateOpenBlocker("org/repo", "main",
+		[]string{"build", "e2e", "ci-provider-probe", "test"}, "w-info", now)
+	if err != nil {
+		t.Fatalf("GetOrCreateOpenBlocker with informational checks: %v", err)
+	}
+	if !created {
+		t.Fatal("first incident created=false, want true")
+	}
+	withoutInfo, created, err := d.GetOrCreateOpenBlocker("org/repo", "main",
+		[]string{"build", "test"}, "w-plain", now)
+	if err != nil {
+		t.Fatalf("GetOrCreateOpenBlocker without informational checks: %v", err)
+	}
+	if created || withoutInfo.ID != withInfo.ID {
+		t.Fatalf("informational checks changed the incident: created=%v, id=%s, want %s",
+			created, withoutInfo.ID, withInfo.ID)
+	}
+
+	resolved, err := d.ResolveBlockersByBaseGreen("org/repo", "main",
+		map[string]bool{"e2e": true, "ci-provider-probe": true}, now)
+	if err != nil {
+		t.Fatalf("ResolveBlockersByBaseGreen: %v", err)
+	}
+	if len(resolved) != 1 || resolved[0].ID != withInfo.ID {
+		t.Fatalf("resolved = %+v, want only %s", resolved, withInfo.ID)
+	}
+}
+
 func TestOrchestratorBindingAndRuntimeStats(t *testing.T) {
 	d := openControlPlaneTestDB(t)
 	now := time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)

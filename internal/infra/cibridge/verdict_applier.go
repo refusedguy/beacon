@@ -493,6 +493,34 @@ func (b *verdictApplier) applyMerge(ctx context.Context, w domain.Watch, obs ciO
 	return b.publishActionable(ctx, stored, obs, verdict, targets, now, cycleID, mergeErr)
 }
 
+// resolveBaseGreenBlockers releases incidents on w's base branch when the
+// provider observed that branch's checks. Merged Watches pass a partial failure
+// map; the Refresh caller passes one only when the whole base is green. An
+// observation without ChecksKnown is fail-closed: no incident is resolved on an
+// unknown base. Every Watch attached to a resolved incident is unblocked by the
+// store, and its generation is rotated so an old claim cannot continue.
+func (b *verdictApplier) resolveBaseGreenBlockers(w domain.Watch, obs ciObservation, now time.Time, cycleID string) {
+	if b == nil || b.control == nil || !obs.base.ChecksKnown {
+		return
+	}
+	incidents, err := b.control.ResolveBlockersByBaseGreen(w.Repo, baseRefOf(w), obs.base.FailedChecks, now)
+	if err != nil {
+		observe.ActorError("cibridge-base-green", w.ID, err)
+		return
+	}
+	if len(incidents) == 0 {
+		return
+	}
+	ids := make([]string, 0)
+	for _, incident := range incidents {
+		ids = append(ids, incident.BlockedWatchIDs...)
+	}
+	b.rotateGenerations(ids...)
+	b.cycleEvent(cycleID, "base_green_resolve", cycleFields{
+		watchID: w.ID, revision: w.Revision,
+	}, observe.Fields{"incidents": len(incidents), "unblocked": len(ids)})
+}
+
 // applyMerged handles a PR GitHub reports as MERGED. It closes the Watch and
 // resolves every blocker incident attached to it or to its base branch, which
 // unblocks all related Watches in one store transaction.
@@ -514,15 +542,7 @@ func (b *verdictApplier) applyMerged(ctx context.Context, w domain.Watch, obs ci
 				b.rotateGenerations(ids...)
 			}
 		}
-		// Resolve by base green only when the provider actually observed the
-		// base checks. An empty FailedChecks map from a single-PR provider means
-		// "unknown", not "green": treating it as green would close incidents that
-		// a different Watch is still waiting on.
-		if obs.base.ChecksKnown {
-			if _, err := b.control.ResolveBlockersByBaseGreen(w.Repo, baseRefOf(w), obs.base.FailedChecks, now); err != nil {
-				observe.ActorError("cibridge-base-green", w.ID, err)
-			}
-		}
+		b.resolveBaseGreenBlockers(w, obs, now, cycleID)
 	} else {
 		b.unblockFixed(w)
 	}
