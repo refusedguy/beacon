@@ -813,6 +813,27 @@ func sameSnapshot(a, b map[string]string) bool {
 	return true
 }
 
+// mergeCardBody возвращает карточку со всеми обязательными полями. MergeTrees
+// читает карточки через ParseCard, поэтому тестовые файлы должны проходить
+// обычную валидацию пакета.
+func mergeCardBody(title, deps string) string {
+	return fmt.Sprintf(`# %s
+Статус: todo
+Фаза: P2
+Тип: task
+Владелец файлов: internal/infra/taskstore/store.go
+Зависимости: %s
+Ссылка: ADR 0003
+Цель: цель
+Контекст: контекст
+Шаги: шаги
+Проверка: проверка
+Приёмка: приёмка
+Агент: нет
+Время: нет
+`, title, deps)
+}
+
 func TestReplaceIDTokenKeepsLongerIDs(t *testing.T) {
 	text := "# T3.17. Заголовок\nСсылка: T3.17.k9x2 и T3.17\n"
 	got := replaceIDToken(text, "T3.17", "T3.17.abc")
@@ -827,10 +848,10 @@ func TestReplaceIDTokenKeepsLongerIDs(t *testing.T) {
 
 func TestMergeTreesResolvesDuplicateID(t *testing.T) {
 	left, right := t.TempDir(), t.TempDir()
-	leftBody := "# T3.17. Левая карточка\nЗависимости: T3.20\n"
-	leftDep := "# T3.20. Левая зависимость\nЗависимости: T3.17\n"
-	rightBody := "# T3.17. Правая карточка\nЗависимости: T3.30\n"
-	rightDep := "# T3.30. Правая зависимость\nЗависимости: T3.17\n"
+	leftBody := mergeCardBody("T3.17. Левая карточка", "T3.20")
+	leftDep := mergeCardBody("T3.20. Левая зависимость", "T3.17")
+	rightBody := mergeCardBody("T3.17. Правая карточка", "T3.30")
+	rightDep := mergeCardBody("T3.30. Правая зависимость", "T3.17")
 	writeMergeCard(t, left, "T3.17.md", leftBody)
 	writeMergeCard(t, left, "T3.20.md", leftDep)
 	writeMergeCard(t, right, "T3.17.md", rightBody)
@@ -894,8 +915,8 @@ func TestMergeTreesResolvesDuplicateID(t *testing.T) {
 
 func TestMergeTreesDryRunLeavesFilesUntouched(t *testing.T) {
 	left, right := t.TempDir(), t.TempDir()
-	writeMergeCard(t, left, "T3.17.md", "# T3.17. Левая\n")
-	writeMergeCard(t, right, "T3.17.md", "# T3.17. Правая\n")
+	writeMergeCard(t, left, "T3.17.md", mergeCardBody("T3.17. Левая", ""))
+	writeMergeCard(t, right, "T3.17.md", mergeCardBody("T3.17. Правая", ""))
 	beforeLeft, beforeRight := snapshotCards(t, left), snapshotCards(t, right)
 
 	report, err := MergeTrees([]string{left, right}, DefaultIDConfig(), true)
@@ -915,8 +936,8 @@ func TestMergeTreesDryRunLeavesFilesUntouched(t *testing.T) {
 
 func TestMergeTreesIdempotent(t *testing.T) {
 	left, right := t.TempDir(), t.TempDir()
-	writeMergeCard(t, left, "T3.17.md", "# T3.17. Левая\n")
-	writeMergeCard(t, right, "T3.17.md", "# T3.17. Правая\nЗависимости: T3.17\n")
+	writeMergeCard(t, left, "T3.17.md", mergeCardBody("T3.17. Левая", ""))
+	writeMergeCard(t, right, "T3.17.md", mergeCardBody("T3.17. Правая", "T3.17"))
 
 	first, err := MergeTrees([]string{left, right}, DefaultIDConfig(), false)
 	if err != nil {
@@ -940,8 +961,8 @@ func TestMergeTreesIdempotent(t *testing.T) {
 
 func TestMergeTreesUniqueIDsDoNotMigrate(t *testing.T) {
 	left, right := t.TempDir(), t.TempDir()
-	leftBody := "# T3.17. Левая\n"
-	rightBody := "# T3.18. Правая\n"
+	leftBody := mergeCardBody("T3.17. Левая", "")
+	rightBody := mergeCardBody("T3.18. Правая", "")
 	writeMergeCard(t, left, "T3.17.md", leftBody)
 	writeMergeCard(t, right, "T3.18.md", rightBody)
 
