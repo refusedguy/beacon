@@ -83,7 +83,7 @@
       "type": "task",
       "owner_files": [
         "internal/infra/server/mcp.go",
-        "cmd/beacon/mcp.go"
+        "internal/infra/mcp/client.go"
       ],
       "deps": [
         "PROTO-02"

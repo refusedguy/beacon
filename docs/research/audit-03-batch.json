@@ -80,7 +80,7 @@
       "id": "TUI-04",
       "title": "Добавить очередь, слоты и RSS в снимок проекции",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
         "internal/infra/httpapi/server.go",

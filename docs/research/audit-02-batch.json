@@ -18,7 +18,7 @@
       "id": "MEM-01",
       "title": "Добавить удаление сессии в HTTP-клиент opencode",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P1",
       "type": "task",
       "owner_files": [
         "internal/infra/opencode/client.go",
@@ -40,11 +40,11 @@
       "id": "MEM-02",
       "title": "Перевести beacon watch и beacon agents на общий HTTP-порт opencode",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P1",
       "type": "task",
       "owner_files": [
         "cmd/beacon/watch.go",
-        "cmd/beacon/agents.go"
+        "cmd/beacon/opencode.go"
       ],
       "deps": [
         "AUTOSP-08",
@@ -129,7 +129,7 @@
       "id": "MEM-06",
       "title": "Добавить TTL-reaper для карточек in_progress без живого Watch",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
         "internal/app/taskcli/service.go",
