@@ -5,6 +5,8 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -61,6 +63,10 @@ var (
 	// session than the caller asked for. Resuming that row would open another
 	// session than the saved id (CCx-10).
 	ErrSessionIdentityMismatch = errors.New("session: session identity mismatch")
+	// ErrSessionRevisionChanged means a session record changed between two
+	// reads of its registry. A caller must not open a session chosen from a
+	// record that moved while it was being read (CC-05).
+	ErrSessionRevisionChanged = errors.New("session: revision changed between reads")
 )
 
 // TaskSessionFinder is the optional port a SessionStore can implement so the
@@ -271,6 +277,16 @@ func copySessionMetadata(in map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// SessionRevision returns a stable signature of a session record. The caller
+// passes the record's fields in a fixed order. Equal records give the same
+// revision, and a change to any field gives a different one. Callers take the
+// revision before and after a read so they can refuse a record that changed in
+// between (CC-05).
+func SessionRevision(fields ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(fields, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 // MetadataCompactionCutoff is the metadata key that records the journal index
