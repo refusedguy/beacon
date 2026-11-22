@@ -81,8 +81,9 @@ type TokenUsage struct {
 // the parent confirmed from a mention (CA-10). ignored holds mention keys the
 // parent refused, so a later turn does not ask for them again. reflected is the
 // message sent back to the parent on the next turn. The token fields carry the
-// per-category accounting (CA-07). All of them are copied on write and owned by
-// the snapshot, like values; the token fields never appear as MCP fields.
+// per-category accounting (CA-07) and budget is the requested token budget for
+// the map (CA-02). All are copied on write and owned by the snapshot, like
+// values; the token fields never appear as MCP fields.
 type ContextSnapshot struct {
 	values       map[string]string
 	ranked       string
@@ -92,6 +93,7 @@ type ContextSnapshot struct {
 	tokens       map[TokenCategory]int
 	maxInput     int
 	costPerToken float64
+	budget       int
 }
 
 // NewContext copies values into a snapshot. A nil map gives an empty snapshot.
@@ -355,12 +357,39 @@ func reflectedMessage(attached, ignored []string) string {
 	return b.String()
 }
 
+// WithMapBudget returns a copy of c carrying a requested token budget for the
+// ranked map. A non-positive budget clears the override. The receiver is not
+// changed.
+func (c ContextSnapshot) WithMapBudget(budget int) ContextSnapshot {
+	if budget < 0 {
+		budget = 0
+	}
+	c.budget = budget
+	return c
+}
+
+// MapBudget returns the requested token budget for the ranked map. Zero means
+// the CA-01 default applies.
+func (c ContextSnapshot) MapBudget() int { return c.budget }
+
+// ContextTokens returns the full token cost of the snapshot and the child
+// history. The caller compares it with the model's max_input_tokens before
+// handing the context to a child. The budget is not counted: only the text
+// the child receives costs tokens.
+func (c ContextSnapshot) ContextTokens(history []Message) int {
+	n := CountTokens(c.ranked)
+	for _, value := range c.values {
+		n += CountTokens(value)
+	}
+	return n + TokensOf(history)
+}
+
 // merged returns a new snapshot with other's entries written over c's. The
 // ranked map follows the same rule: a non-empty map from other replaces the
 // inherited one, and an empty one leaves the parent's map intact. Token counts
-// merge by category, while the window and price come from other when set.
-// Attached files and ignored mentions are unioned. A non-empty reflected
-// message from other replaces the inherited one.
+// merge by category, while the window, price and a positive map budget come
+// from other when set. Attached files and ignored mentions are unioned. A
+// non-empty reflected message from other replaces the inherited one.
 func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	out := c.Entries()
 	for k, v := range other.values {
@@ -403,6 +432,10 @@ func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	if other.reflected != "" {
 		reflected = other.reflected
 	}
+	budget := c.budget
+	if other.budget > 0 {
+		budget = other.budget
+	}
 	return ContextSnapshot{
 		values:       out,
 		ranked:       ranked,
@@ -412,6 +445,7 @@ func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 		tokens:       tokens,
 		maxInput:     maxInput,
 		costPerToken: cost,
+		budget:       budget,
 	}
 }
 
@@ -499,10 +533,22 @@ func (r *Registry) SpawnWith(parentID, childID ThreadID, name string, extra Cont
 
 // SpawnWithRankedMap adds a child under parentID and attaches a ranked map of
 // the repository built from taskText. The graph is read from root/internal;
-// budget is the approximate token budget for the rendered map. A non-positive
-// budget uses RankedMapTokenBudget. Errors from SpawnWith are passed through.
+// budget is the requested token budget for the rendered map. A new child has
+// an empty chat, so MapBudgetFor applies the wider empty-chat budget. Errors
+// from SpawnWith are passed through.
 func (r *Registry) SpawnWithRankedMap(parentID, childID ThreadID, name, root, taskText string, budget int) (Thread, error) {
-	extra := NewContext(nil).WithRankedMap(BuildRankedMap(root, taskText, budget))
+	return r.SpawnWithRankedMapInContext(parentID, childID, name, root, taskText, budget, 0)
+}
+
+// SpawnWithRankedMapInContext is SpawnWithRankedMap with an explicit context
+// window. The window caps the empty-chat budget at window-4096. A non-positive
+// window leaves the budget uncapped.
+func (r *Registry) SpawnWithRankedMapInContext(parentID, childID ThreadID, name, root, taskText string, budget, contextWindow int) (Thread, error) {
+	effective := MapBudgetFor(budget, contextWindow, true)
+	extra := NewContext(nil).WithMapBudget(effective)
+	if effective > 0 {
+		extra = extra.WithRankedMap(BuildRankedMap(root, taskText, effective))
+	}
 	return r.SpawnWith(parentID, childID, name, extra)
 }
 
@@ -672,6 +718,74 @@ var (
 // owns the adaptive budget policy; this value is the CA-01 baseline of 1024
 // tokens.
 const RankedMapTokenBudget = 1024
+
+// Budget rules from aider/repomap.py:122-132 and :666-703. An empty chat gets
+// a wider map because no history competes with it for the context window.
+const (
+	rankedMapEmptyMultiplier = 8
+	rankedMapReserve         = 4096
+	rankedMapTolerance       = 0.15
+	rankedMapSampleThreshold = 200
+	rankedMapSampleEvery     = 100
+	rankedMapMaxTags         = 5
+)
+
+// MapBudgetFor returns the ranked-map token budget. A chat with history keeps
+// the requested budget. An empty chat gets min(requested*8, window-4096).
+// The reserve caps both cases when the caller supplies a context window, so
+// the map cannot crowd out the model request. A non-positive request falls
+// back to RankedMapTokenBudget. A window of 4096 or less leaves no room and
+// returns zero.
+func MapBudgetFor(requested, contextWindow int, emptyChat bool) int {
+	if requested <= 0 {
+		requested = RankedMapTokenBudget
+	}
+	budget := requested
+	if emptyChat {
+		budget = requested * rankedMapEmptyMultiplier
+	}
+	if contextWindow > 0 {
+		room := contextWindow - rankedMapReserve
+		if room <= 0 {
+			return 0
+		}
+		if budget > room {
+			budget = room
+		}
+	}
+	return budget
+}
+
+// EstimateMapTokens estimates the token cost of a rendered map. Maps of at
+// least 200 bytes are sampled every 100th line and the sampled token count is
+// scaled by the byte-length ratio, as in aider/repomap.py:89-101. Shorter maps
+// are counted in full. The estimate guides the tag search; the final check
+// uses the full count.
+func EstimateMapTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	if len(text) < rankedMapSampleThreshold {
+		return CountTokens(text)
+	}
+	lines := strings.Split(text, "\n")
+	sampledTokens, sampledBytes := 0, 0
+	for i, line := range lines {
+		if i%rankedMapSampleEvery != 0 {
+			continue
+		}
+		sampledTokens += CountTokens(line)
+		sampledBytes += len(line) + 1
+	}
+	if sampledBytes == 0 {
+		return CountTokens(text)
+	}
+	estimate := sampledTokens * len(text) / sampledBytes
+	if estimate < 1 {
+		return 1
+	}
+	return estimate
+}
 
 var (
 	rankedIdentRE = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*`)
@@ -945,10 +1059,10 @@ func (g *rankedGraph) ranks() []float64 {
 	return current
 }
 
-// BuildRankedMap renders a ranked repository map for taskText. The first
-// section lists tagged files by descending rank, then files with no tags.
-// Rendering stops when the approximate token budget is spent; four characters
-// per token is the estimate used for the cut.
+// BuildRankedMap renders a ranked repository map for taskText within budget.
+// The first section lists tagged files by descending rank, then files with no
+// tags. A tag-count binary search and a rank-ordered line cut keep the map
+// inside the requested token budget (CA-02).
 func BuildRankedMap(root, taskText string, budget int) string {
 	g := newRankedGraph(root, taskText)
 	if len(g.files) == 0 {
@@ -957,7 +1071,6 @@ func BuildRankedMap(root, taskText string, budget int) string {
 	if budget <= 0 {
 		budget = RankedMapTokenBudget
 	}
-	limit := budget * 4
 	scores := g.ranks()
 	order := make([]int, len(g.files))
 	for i := range order {
@@ -974,25 +1087,92 @@ func BuildRankedMap(root, taskText string, budget int) string {
 	for _, m := range rankedIdentRE.FindAllString(taskText, -1) {
 		mentioned[m] = true
 	}
+	return rankedMapForBudget(g, order, mentioned, budget)
+}
+
+// renderRankedMap renders order with at most tagLimit tags per file and at
+// most fileLimit lines. Tagged files come first, then files with no tags.
+// rankedTags puts mentioned definitions ahead of the rest, so a smaller
+// tagLimit drops the lowest-ranked tags first.
+func renderRankedMap(g *rankedGraph, order []int, mentioned map[string]bool, tagLimit, fileLimit int) string {
 	var b strings.Builder
-	for pass := 0; pass < 2; pass++ {
+	written := 0
+	for pass := 0; pass < 2 && written < fileLimit; pass++ {
 		for _, i := range order {
-			if b.Len() >= limit {
-				return b.String()
+			if written >= fileLimit {
+				break
 			}
 			rf := g.files[i]
 			if (len(rf.defs) == 0) != (pass == 1) {
 				continue
 			}
 			line := rf.rel
-			if tags := rankedTags(rf.defs, mentioned); len(tags) > 0 {
+			tags := rankedTags(rf.defs, mentioned)
+			if tagLimit < len(tags) {
+				tags = tags[:tagLimit]
+			}
+			if len(tags) > 0 {
 				line += ": " + strings.Join(tags, ", ")
 			}
 			b.WriteString(line)
 			b.WriteByte('\n')
+			written++
 		}
 	}
 	return b.String()
+}
+
+// rankedMapForBudget picks the largest tag count that fits the budget, then
+// drops the lowest-ranked files if the path lines alone are too large. It
+// binary searches the tag list as in aider/repomap.py:666-703 and checks the
+// full token count against a 15% error (repomap.py:689-696). The sampled
+// estimate only guides the search, so a sampling error cannot push the map
+// past the upper bound.
+func rankedMapForBudget(g *rankedGraph, order []int, mentioned map[string]bool, budget int) string {
+	all := len(order)
+
+	lo, hi := 0, rankedMapMaxTags
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if EstimateMapTokens(renderRankedMap(g, order, mentioned, mid, all)) <= budget {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	tags := hi
+	if tags < 0 {
+		tags = 0
+	}
+
+	files := all
+	if EstimateMapTokens(renderRankedMap(g, order, mentioned, 0, all)) > budget {
+		fLo, fHi := 0, all
+		for fLo <= fHi {
+			fMid := (fLo + fHi) / 2
+			if EstimateMapTokens(renderRankedMap(g, order, mentioned, 0, fMid)) <= budget {
+				fLo = fMid + 1
+			} else {
+				fHi = fMid - 1
+			}
+		}
+		files = fHi
+		if files < 0 {
+			files = 0
+		}
+	}
+
+	text := renderRankedMap(g, order, mentioned, tags, files)
+	limit := int(float64(budget) * (1 + rankedMapTolerance))
+	for CountTokens(text) > limit && tags > 0 {
+		tags--
+		text = renderRankedMap(g, order, mentioned, tags, files)
+	}
+	for CountTokens(text) > limit && files > 0 {
+		files--
+		text = renderRankedMap(g, order, mentioned, tags, files)
+	}
+	return text
 }
 
 // rankedTags picks up to five definitions for a file. Definitions named in
