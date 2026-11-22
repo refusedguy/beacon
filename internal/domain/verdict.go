@@ -830,6 +830,20 @@ const (
 // reason, so the on-disk JSON of an ordinary run keeps its original shape.
 const ExternalReasonNoTestsRan = "no_tests_ran"
 
+// ExternalReasonEvidenceMismatch is the CheckOutcome reason for a check whose
+// deciding exit code and log statuses describe different runs: the code is
+// non-zero while the parsed log has no FAILED or ERROR line. A patch can print
+// its own PASSED lines from a conftest hook, so the log alone cannot prove the
+// run. The contradiction is recorded on the check instead of being hidden
+// behind a plain fail (SB-10).
+const ExternalReasonEvidenceMismatch = "evidence_mismatch"
+
+// LogStatusMap counts the status tokens parsed from a check log. Keys are the
+// words a runner prints (PASSED, FAILED, ERROR, SKIPPED, XFAIL, XPASS), upper
+// cased. A nil map means no status line was parsed, which the evidence records
+// through CheckOutcome.StatusMapObserved.
+type LogStatusMap map[string]int
+
 // CheckOutcome is one declared check in the on-disk evidence. Observed is
 // false when the external verifier produced no exit code for the check, so a
 // missing run stays visible on disk and never passes. Passed is true only for
@@ -840,17 +854,23 @@ const ExternalReasonNoTestsRan = "no_tests_ran"
 // command's exit code and TestExitCodeObserved says whether the adapter
 // reported one. When TestExitCodeObserved is true, Passed and the verdict use
 // TestExitCode and the evidence shows both numbers, so the source of the
-// deciding number is visible from the evidence alone. The new fields are
-// omitted from JSON when nothing extra was reported, which keeps the on-disk
-// shape of older adapters unchanged.
+// deciding number is visible from the evidence alone. StatusMap is the count
+// of status tokens parsed from the log and StatusMapObserved says whether the
+// log carried any. A non-zero deciding code with no FAILED or ERROR in the map
+// sets Reason to evidence_mismatch, so a log that contradicts the code cannot
+// pass as proof of the run (SB-10). The new fields are omitted from JSON when
+// nothing extra was reported, which keeps the on-disk shape of older adapters
+// unchanged.
 type CheckOutcome struct {
-	Name                 string `json:"name"`
-	ExitCode             int    `json:"exit_code"`
-	Observed             bool   `json:"observed"`
-	Passed               bool   `json:"passed"`
-	Reason               string `json:"reason,omitempty"`
-	TestExitCode         int    `json:"test_exit_code,omitempty"`
-	TestExitCodeObserved bool   `json:"test_exit_code_observed,omitempty"`
+	Name                 string       `json:"name"`
+	ExitCode             int          `json:"exit_code"`
+	Observed             bool         `json:"observed"`
+	Passed               bool         `json:"passed"`
+	Reason               string       `json:"reason,omitempty"`
+	TestExitCode         int          `json:"test_exit_code,omitempty"`
+	TestExitCodeObserved bool         `json:"test_exit_code_observed,omitempty"`
+	StatusMap            LogStatusMap `json:"status_map,omitempty"`
+	StatusMapObserved    bool         `json:"status_map_observed,omitempty"`
 }
 
 // CheckProgress is the exact pass fraction of the declared checks. Passed
@@ -914,6 +934,43 @@ func SuiteRan(log string) bool {
 	return false
 }
 
+// logStatusPattern matches the status words verbose pytest and SWE-bench logs
+// print. Counting one match per occurrence keeps a summary line such as
+// "3 failed" from hiding the failures it names. Case is folded because runners
+// print both PASSED and passed.
+var logStatusPattern = regexp.MustCompile(`(?im)\b(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)\b`)
+
+// parseLogStatusMap counts status words in a check log. It is pure and reads
+// only the log string. No matching word gives a nil map, so an absent status
+// map stays distinguishable from one that was parsed and found clean.
+func parseLogStatusMap(log string) LogStatusMap {
+	if log == "" {
+		return nil
+	}
+	matches := logStatusPattern.FindAllStringSubmatch(log, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	counts := make(LogStatusMap, len(matches))
+	for _, match := range matches {
+		if len(match) > 1 {
+			counts[strings.ToUpper(match[1])]++
+		}
+	}
+	return counts
+}
+
+// evidenceConsistent reports whether a deciding exit code and a parsed status
+// map describe the same run. A non-zero exit must be backed by at least one
+// FAILED or ERROR status when a map was parsed. An absent map is not a
+// contradiction: a log without status words says nothing about the run.
+func evidenceConsistent(decidingExit int, statusMap LogStatusMap) bool {
+	if decidingExit == 0 || statusMap == nil {
+		return true
+	}
+	return statusMap["FAILED"] > 0 || statusMap["ERROR"] > 0
+}
+
 // observedExternalCheck keeps the first observation of a declared check. The
 // log and the test exit code travel with the process exit code so the decision
 // uses one consistent record.
@@ -937,10 +994,13 @@ type observedExternalCheck struct {
 // reported one, and the wrapper's process exit code otherwise. A successful
 // cleanup therefore cannot hide a failing test. When the adapter supplies a
 // log, exit code 0 is not enough: the log must also carry a suite-run marker,
-// or the check fails with reason no_tests_ran. A check with no log keeps the
-// exit-code decision so existing adapters do not need to change. Only declared
-// names, observed exit codes and adapter logs enter the decision, so an
-// agent's own claim about its work cannot move the verdict. Evidence keeps
+// or the check fails with reason no_tests_ran. When the log carries status
+// tokens, a non-zero deciding code with no FAILED or ERROR records reason
+// evidence_mismatch, so PASSED lines printed by a patch cannot stand as proof
+// of a run that failed. A check with no log keeps the exit-code decision so
+// existing adapters do not need to change. Only declared names, observed exit
+// codes and adapter logs enter the decision, so an agent's own claim about its
+// work cannot move the verdict. Evidence keeps
 // the declaration order and drops duplicate names; when a check is observed
 // more than once the first observation wins, and observations for checks that
 // were not declared are ignored.
@@ -994,6 +1054,7 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 		if obs.testExitCodeObserved {
 			decidingExit = obs.testExitCode
 		}
+		statusMap := parseLogStatusMap(obs.log)
 		outcome := CheckOutcome{
 			Name:                 name,
 			ExitCode:             obs.exitCode,
@@ -1001,12 +1062,23 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 			Passed:               ok && decidingExit == 0,
 			TestExitCode:         obs.testExitCode,
 			TestExitCodeObserved: ok && obs.testExitCodeObserved,
+			StatusMap:            statusMap,
+			StatusMapObserved:    statusMap != nil,
 		}
 		// A logged check with exit 0 but no suite-run marker did not run
 		// its tests. Fail it with a reason the reviewer can see on disk.
 		if outcome.Passed && obs.log != "" && !SuiteRan(obs.log) {
 			outcome.Passed = false
 			outcome.Reason = ExternalReasonNoTestsRan
+		}
+		// A non-zero code with a parsed log that reports no failures means
+		// the two channels describe different runs. The check already fails
+		// on the code; the reason also records that the log is not proof of
+		// this run (SB-10). An absent status map is left to the exit-code
+		// decision, so SB-01 and SB-02 keep their behavior.
+		if !evidenceConsistent(decidingExit, statusMap) {
+			outcome.Passed = false
+			outcome.Reason = ExternalReasonEvidenceMismatch
 		}
 		evidence.Checks = append(evidence.Checks, outcome)
 		if outcome.Passed {
