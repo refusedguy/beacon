@@ -3173,19 +3173,24 @@ func buildEvalServer(repoRoot string) (string, error) {
 	return out, nil
 }
 
-// findRepoRoot возвращает каталог с go.mod, то есть корень ворктри.
+// findRepoRoot возвращает корень репозитория: каталог с go.mod и .git.
+// Проверка одного go.mod недостаточна, потому что evals является вложенным
+// модулем. Запуск из него иначе принимает evals за корень, и пути артефактов
+// перестают находиться.
 func findRepoRoot() (string, error) {
 	dir, err := os.Getwd()
 	if err != nil {
 		return "", err
 	}
 	for {
-		if info, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil && !info.IsDir() {
+		mod, modErr := os.Stat(filepath.Join(dir, "go.mod"))
+		_, gitErr := os.Stat(filepath.Join(dir, ".git"))
+		if modErr == nil && !mod.IsDir() && gitErr == nil {
 			return dir, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("go.mod не найден выше текущего каталога")
+			return "", fmt.Errorf("корень репозитория с go.mod и .git не найден выше текущего каталога")
 		}
 		dir = parent
 	}

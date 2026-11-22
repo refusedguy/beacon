@@ -22,7 +22,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/refusedguy/beacon/internal/infra/worktree"
+	wtpkg "github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 const (
@@ -188,7 +188,7 @@ func statusOf(ok bool) string {
 // capability. The runner sets the working directory and returns combined
 // output, which keeps error messages identical to the production gc path.
 func gitRun(dir string, args ...string) (string, error) {
-	out, err := worktree.CommandRunner(dir, args...)
+	out, err := wtpkg.CommandRunner(dir, args...)
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out))
 	}
@@ -348,7 +348,7 @@ func run() int {
 			"remove_calls":         len(runnerB.removeCalls),
 			"reason":               reasonB,
 			"watch_head_prefix":    watchHeadPrefix(wLocal.HeadSHA),
-			"worktree_head_prefix": watchHeadPrefix(wt2.HeadSHA),
+			"worktree_head_prefix": watchHeadPrefix(t2.HeadSHA),
 			"local_commit_present": catErr == nil,
 		},
 	})
