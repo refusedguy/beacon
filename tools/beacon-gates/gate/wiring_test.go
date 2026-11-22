@@ -99,7 +99,8 @@ func TestCheckWiringBothOwnerFieldsEmpty(t *testing.T) {
 	if !HasRule(fs, "WIRING-OWNERFILES") {
 		t.Fatalf("missing WIRING-OWNERFILES in %v", fs)
 	}
-	if !HasRuleAt(fs, "WIRING-OWNERFILES", "docs/tasks/WIRING-1001.md", 3) {
+	// The fallback points at the Russian field that is actually present, line 4.
+	if !HasRuleAt(fs, "WIRING-OWNERFILES", "docs/tasks/WIRING-1001.md", 4) {
 		t.Errorf("owner finding at wrong line: %v", fs)
 	}
 }
