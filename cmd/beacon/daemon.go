@@ -176,6 +176,10 @@ func (s dbClaimSource) ClaimedAt(watchID string, revision uint64, subscriberID s
 	return time.Time{}
 }
 
+// planStat is a file seam. The capabilities gate forbids a direct os.Stat
+// call in cmd/beacon (ADR 0005), so the PLAN.md lookup goes through it.
+var planStat = os.Stat
+
 // daemonArtifactVerifier is the wiring-side ArtifactVerifier for slot tokens.
 // It answers whether the artifact behind a wake has appeared: a PR for the
 // watch, or PLAN.md for the card linked to the watch. Both reads reuse handles
@@ -204,7 +208,7 @@ func (v *daemonArtifactVerifier) Verified(ctx context.Context, token orchestrato
 		return false, err
 	}
 	path := filepath.Join(v.root, "docs", "tasks", card, "PLAN.md")
-	if _, err := os.Stat(path); err != nil {
+	if _, err := planStat(path); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
