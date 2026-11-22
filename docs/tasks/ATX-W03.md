@@ -1,5 +1,5 @@
 # ATX-W03. Не считать подтверждённое обязательство висящим
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/db.go, internal/infra/store/db_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить в SQL-условие проверку payload на ненулевые `ClaimedAt` и `ReadAt` или завести отдельные колонки с миграцией. Сохранить порядок `ORDER BY seq`. Обновить тесты `PendingObligations` на случай с подтверждённым обязательством. Проверить, что повторный `StampClaimed` не ломает идемпотентность.
 Проверка: CI зелёный. После `StampClaimed` метод возвращает пустой список. Неподтверждённое обязательство по-прежнему возвращается.
 Приёмка: Human wake и остановка агента не видят уже подтверждённые обязательства.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with T3.101 (already done). Supporting merged commit c293cf22bca7 (PR #1530) touches the card OwnerFiles.
+Доказательство: Commit c293cf22bca7588b1ebd6bbcc3c3598395f6cb01 (PR #1530, fix(domain): renew parked Watch on repeat registration (LC-05) (#1530)) touches OwnerFiles internal/infra/store/db.go, internal/infra/store/db_test.go; git merge-base --is-ancestor c293cf22bca7588b1ebd6bbcc3c3598395f6cb01 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1530 c293cf22bca7
+Время закрытия: 2026-11-22T11:27:01Z

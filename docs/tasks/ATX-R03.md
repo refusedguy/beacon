@@ -1,5 +1,5 @@
 # ATX-R03. Убрать опрос SSE по настенным часам в TestEventsHeartbeat
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/httpapi/server_test.go, internal/infra/httpapi/server.go
@@ -12,3 +12,8 @@
 Шаги: Добавить в `server.go` точку подачи тика heartbeat через канал, по которой тест может вызвать кадр без реального ожидания. Передать контекст с таймаутом из `t.Context()` в чтение SSE. Восстанавливать `heartbeatInterval` через `t.Cleanup`, а не через `defer`. Убрать цикл с `time.Now().Add(2 * time.Second)`.
 Проверка: CI зелёный. В `TestEventsHeartbeat` нет `time.Now()` и нет чтения без контекста. Кадр heartbeat появляется после явного тика.
 Приёмка: Тест завершается по контексту и не зависит от скорости планировщика. Глобальный интервал всегда возвращается к прежнему значению.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with PROTO-02 (already done). Supporting merged commit 680fc3a81df0 (PR #1603) touches the card OwnerFiles.
+Доказательство: Commit 680fc3a81df022907a6f7c2d515c4397b56b1a7a (PR #1603, fix(httpapi): return 400 for INVALID_INPUT content-type guard (EH-03) (#1603)) touches OwnerFiles internal/infra/httpapi/server.go, internal/infra/httpapi/server_test.go; git merge-base --is-ancestor 680fc3a81df022907a6f7c2d515c4397b56b1a7a origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1603 680fc3a81df0
+Время закрытия: 2026-11-22T11:27:01Z

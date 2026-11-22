@@ -1,5 +1,5 @@
 # ATX-V06. Легаси-провайдер не делает informational-проверку обязательной
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/ghci/provider.go, internal/infra/ghci/provider_test.go, internal/infra/github/batch_provider.go
@@ -12,3 +12,8 @@
 Шаги: Заполнять `Required` из доступного признака обязательности. Когда признака нет, оставлять значение неизвестным и не давать verdict `ready` на таких фактах. Добавить тест, где optional FAILURE из легаси-провайдера не даёт `keep_working` и не будит executor.
 Проверка: CI зелёный. Тест провайдера проверяет, что строка `gh pr checks` без данных об обязательности не помечается как required. Тест снимка подтверждает отсутствие `keep_working`.
 Приёмка: Ни один провайдер не превращает informational-проверку в обязательную подстановкой константы.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with T3.175 (already done). Supporting merged commit 3137a74c601d (PR #1415) touches the card OwnerFiles.
+Доказательство: Commit 3137a74c601d55e8634efd99274749b5f1ab26d3 (PR #1415, refactor(verdict): share one PASS/FAIL vocabulary across adapters (#1415)) touches OwnerFiles internal/infra/ghci/provider.go, internal/infra/ghci/provider_test.go, internal/infra/github/batch_provider.go; git merge-base --is-ancestor 3137a74c601d55e8634efd99274749b5f1ab26d3 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1415 3137a74c601d
+Время закрытия: 2026-11-22T11:27:01Z

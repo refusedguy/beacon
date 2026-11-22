@@ -1,5 +1,5 @@
 # ATX-W05. Убрать дубли и устаревшие результаты поллеров WatchOutcome
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/store/db.go, internal/infra/store/db_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить параметр минимальной ревизии и игнорировать строку с `revision <= want`. Сгруппировать ожидающих по ключу в один поллер с общим результатом и отдельными каналами. Требовать ctx с крайним сроком или добавить таймаут простоя для горутины. Обновить тесты `db_test.go` на случай публикации до подписки и двух ожидающих на один ключ.
 Проверка: CI зелёный. Подписка с порогом 2 молчит после ревизии 1 и выдаёт ревизию 2. Два ожидающих на один ключ дают один запрос за такт. `DB.Close` по-прежнему дожидается всех поллеров.
 Приёмка: Один поллер на ключ, результат не старше момента подписки, горутины не живут после закрытия store.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with T3.101 (already done). Supporting merged commit c293cf22bca7 (PR #1530) touches the card OwnerFiles.
+Доказательство: Commit c293cf22bca7588b1ebd6bbcc3c3598395f6cb01 (PR #1530, fix(domain): renew parked Watch on repeat registration (LC-05) (#1530)) touches OwnerFiles internal/infra/store/db.go, internal/infra/store/db_test.go; git merge-base --is-ancestor c293cf22bca7588b1ebd6bbcc3c3598395f6cb01 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1530 c293cf22bca7
+Время закрытия: 2026-11-22T11:27:01Z

@@ -1,5 +1,5 @@
 # ATX-30. Восстановить NoChecksTimeout и переносить дедлайн преемнику
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/domain/verdict.go, internal/domain/types.go, internal/infra/cibridge/bridge.go
@@ -12,3 +12,8 @@
 Шаги: Добавить поле timeout в Watch и конфиг. Заполнять его в snapshotFor. Копировать DeadlineAt и NoChecksSince в преемника вместе с BlockerID, FixBlockerID и ConfigID.
 Проверка: CI зелёный. Тест с заданным NoChecksSince и истёкшим timeout даёт VerdictTimeout. Тест force-push сохраняет DeadlineAt у преемника.
 Приёмка: Таймаут без проверок срабатывает. Преемник наследует все поля дедлайна и блокировок.
+
+Итог: Cardindex resolves done: OwnerFiles overlap with ATX-19 (already done). Supporting merged commit 4cec1d40f6ed (PR #1509) touches the card OwnerFiles.
+Доказательство: Commit 4cec1d40f6ed051a78d8a496ce1bcaf5f93befa3 (PR #1509, fix(verdict): VC-02 use the published CI engine for green_blocked (#1509)) touches OwnerFiles internal/domain/types.go, internal/domain/verdict.go, internal/infra/cibridge/bridge.go; git merge-base --is-ancestor 4cec1d40f6ed051a78d8a496ce1bcaf5f93befa3 origin/main exit 0; duplicate resolved by cardindex rules.
+Причина: already landed in PR #1509 4cec1d40f6ed
+Время закрытия: 2026-11-22T11:27:01Z

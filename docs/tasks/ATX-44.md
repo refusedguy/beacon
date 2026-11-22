@@ -1,5 +1,5 @@
 # ATX-44. Публиковать active_watches и outbox_depth
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/observe/metrics.go, internal/infra/mcp/tool_stats.go
@@ -12,3 +12,8 @@
 Шаги: Вызывать ActiveWatches и OutboxDepth в демоне и MCP на каждом проходе. Связать значения с источниками, которые уже использует beacon_stats, чтобы числа не расходились.
 Проверка: CI зелёный. Тест с активной вотчей видит beacon_active_watches 1 в /metrics. Значения совпадают с beacon_stats.
 Приёмка: Gauge отражают реальное состояние. Расхождение между /metrics и beacon_stats исключено.
+
+Итог: Already landed in PR #1396 (commit 19ca1996b55d2cc54e077f002796a2053d347dda): fix(metrics): publish active_watches and outbox_depth from beacon_stats (ATX-44) (#1396)
+Доказательство: PR #1396; commit 19ca1996b55d2cc54e077f002796a2053d347dda; git merge-base --is-ancestor 19ca1996b55d2cc54e077f002796a2053d347dda origin/main exit 0; no duplicate code PR needed.
+Причина: already landed in PR #1396 19ca1996b55d
+Время закрытия: 2026-11-22T11:27:01Z
