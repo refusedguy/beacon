@@ -14,7 +14,7 @@ bash tests/e2e/run.sh
 
 Файл `e2e_test.go` имеет build tag `//go:build e2e`. Обычный `go test ./...` пропускает его, поэтому в CI без opencode корневой тест не падает.
 
-Токен GitHub не нужен: тест не делает запросов к GitHub. Владелец запускает локально. В CI тот же вызов живёт в отдельной job `e2e` в `.github/workflows/ci.yml` с `continue-on-error: true`: пока прогон не стабилен, он не блокирует merge. Job ставит Go из `go.mod`, Node 26.x и бинарник opencode v2.3.0 из платформенного npm tarball.
+Токен GitHub не нужен: тест не делает запросов к GitHub. Владелец запускает локально. В CI тот же вызов живёт в отдельном workflow `.github/workflows/e2e.yml` с `continue-on-error: true`: прогон не блокирует merge. Workflow ставит Go из `go.mod`, Node 26.x и бинарник opencode v2.3.0 из платформенного npm tarball.
 
 ## Три инструмента, и никаких самописных клиентов
 
@@ -31,7 +31,7 @@ bash tests/e2e/run.sh
 
 | Проверка | Внешний источник факта |
 | --- | --- |
-| `beacon mcp` отвечает на `initialize`, отдаёт ровно 7 инструментов и отвечает на `tools/call` | go-sdk `CommandTransport`, отдельный процесс |
+| `beacon mcp` отвечает на `initialize`, отдаёт каталог `AdvertisedToolNames` и отвечает на `tools/call` | go-sdk `CommandTransport`, отдельный процесс |
 | opencode v2.3.0 грузит плагин | `GET /api/plugin` живого `opencode serve`: `source.type=local`, `features.server=true`, `state.status=active` |
 | указатель в `events.jsonl` будит сессию | `prompt.ok delivery=steer` в логе плагина и `session.execution.started` в подписке плагина (`ctx.event.subscribe` внутри живого opencode) |
 | квитанция записана | `state/beacon/receipts/<id>.wrote` и строка `state=posted` в `receipts.jsonl` |
@@ -39,8 +39,8 @@ bash tests/e2e/run.sh
 
 ## Честные ограничения
 
-1. **Плагин из `fixtures` — эталон, не плагин репозитория.** `tests/e2e/fixtures/beacon-bridge.js` скопирован из рабочего спайка `tmp/p0-wake/proj/.opencode/plugins/beacon-bridge.js` (T0.3). Файл `.opencode/plugins/beacon-bridge.js` в репозитории не менялся. Прогон доказывает, что реальный opencode грузит плагин и будит сессию, но **не доказывает**, что репозиторийский плагин уже умеет будить. Сейчас он каркас: подписан на `session.execution.started` и не вызывает `ctx.session.prompt`. Тест `repo_plugin_skeleton` печатает этот факт как диагностику. Это блокер для проверки шага (e) на продакшн-плагине.
-2. **Семь инструментов — контракт, не поведение.** `NewServer` в `internal/infra/mcp/server.go` регистрирует `stubHandler` для всех семи инструментов. `tools/call beacon_list_running` проверяет только протокольный round trip. Реальные обработчики (`AttachWatchPR` и др.) нигде не собираются в точку входа.
+1. **Плагин репозитория будит сессию.** `runWakePositive` и полный цикл грузят `.opencode/plugins/beacon-bridge.js` из корня репозитория. Плагин читает `events.jsonl`, хранит курсор и вызывает `ctx.session.prompt` с delivery `steer`. Копия `tests/e2e/fixtures/beacon-bridge.js` из спайка T0.3 остаётся в дереве, но больше не подтверждает пробуждение. Негативный контроль ставит `fixtures/beacon-bridge-stub.js` вместо плагина репозитория.
+2. **Общий каталог задаёт контракт инструментов.** `mcp_go_sdk_CommandTransport` сверяет `tools/list` с `AdvertisedToolNames` из `internal/infra/mcp/server.go` и проверяет протокольный round trip. `live_opencode_full_mcp_cycle` вызывает реальные обработчики `beacon mcp` через go-sdk и берёт из ответов `watchID`, revision и вердикт.
 3. **`beacon mcp` сейчас уже в main** (PR #40 влит). Тест собирает бинарник из корня репозитория и объясняет это в логе. Переменная `BEACON_MCP_SRC` позволяет указать другой checkout. Если `cmd/beacon/mcp.go` нигде нет, тест падает с явным сообщением.
 4. **`opencode api` не умеет читать SSE.** Проверено на живом сервере 2.3.0: `opencode api GET /api/event` за 7 с вернул 0 байт, тогда как прямой поток отдавал `server.connected` и heartbeat. Заглушки здесь нет: тест запускает CLI, фиксирует отсутствие кадров отдельной строкой лога и не считает SSE доказанным. Факт пробуждения доказывается подпиской плагина, квитанцией и `prompt.ok`.
 
@@ -59,11 +59,10 @@ bash tests/e2e/run.sh
 
 ## Негативный контроль
 
-Автоматический тест `negative_control_stub_handler_must_fail` ставит `fixtures/beacon-bridge-stub.js` вместо рабочего плагина и требует, чтобы та же самая функция проверки, которая зелёная на эталоне, вернула ошибку. Дополнительно он требует отсутствия квитанции и prompt. Если заглушка проходит проверку, прогон красный и e2e не считается рабочим.
+Автоматический тест `negative_control_stub_handler_must_fail` ставит `fixtures/beacon-bridge-stub.js` вместо плагина репозитория и требует, чтобы та же самая функция проверки, которая зелёная на плагине репозитория, вернула ошибку. Дополнительно он требует отсутствия квитанции и prompt. Если заглушка проходит проверку, прогон красный и e2e не считается рабочим.
 
 ## Что не проверяется
 
-- Реальный GitHub, изменение статуса CI, демон опроса и вычисление вердикта.
-- Поведение обработчиков MCP: в main они заглушки.
-- Работоспособность репозиторийского адаптера: он ещё каркас.
+- Реальный GitHub и изменение статуса CI. Демон опроса в e2e заменяет `cycleDaemon`: он считает вердикт из наблюдаемых фактов через движок домена с проверкой ShipFacts (ADR 0061 п. 2) и атомарно пишет результат в store.
+- Бизнес-результат обработчика в `mcp_go_sdk_CommandTransport`: `tools/call beacon_list_running` проверяет только протокольный round trip. Полный цикл читает реальные ответы обработчиков.
 - Ответ модели. Для факта пробуждения достаточно `session.execution.started`; провайдер в изолированном окружении может отвечать ошибкой, как зафиксировано в `tmp/p0-wake/Results.md`.

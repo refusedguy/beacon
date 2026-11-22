@@ -1,12 +1,12 @@
-// E2E reference plugin, not the repository plugin.
+// Legacy E2E fixture from the T0.3 spike, not the repository plugin.
 //
 // The wake logic below is copied from the working spike at
 // beacon-impl/tmp/p0-wake/proj/.opencode/plugins/beacon-bridge.js (T0.3).
-// The repository plugin at .opencode/plugins/beacon-bridge.js is still a
-// skeleton (T3.1) and does not call ctx.session.prompt. Running this fixture
-// therefore proves that real opencode loads a plugin and wakes a session; it
-// does NOT prove that the repository plugin does so. The e2e suite reports the
-// repository plugin state separately.
+// The e2e suite no longer copies this file into the isolated project. The
+// positive wake scenarios load .opencode/plugins/beacon-bridge.js from this
+// repository, which reads events.jsonl and calls ctx.session.prompt with
+// delivery steer. This fixture stays in the tree as the spike copy. For the
+// negative control the suite installs fixtures/beacon-bridge-stub.js instead.
 //
 // Paths come from XDG_STATE_HOME so the harness can run in an isolated base.
 // This file has no package.json and imports no SDK, like the spike.
