@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -665,5 +666,52 @@ func TestDeliverPiWithoutProviderIsUnsupported(t *testing.T) {
 	code, out, errOut := runDeliverWith(t, []string{"w-pi"}, piDeliverSnapshot(), nil, nil)
 	if code == 0 || !strings.Contains(out, "delivery=unsupported") {
 		t.Fatalf("exit/stdout/stderr = %d/%q/%q, want honest unsupported", code, out, errOut)
+	}
+}
+
+func TestRunDeliverJSON(t *testing.T) {
+	snap := mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+		deliverWatch("w-json", domain.VerdictReady, deliverSub(domain.RoleOrchestrator, "orch-session")),
+	}}
+	code, out, errOut := runDeliverWith(t, []string{"--format", "json", "w-json"}, snap, nil, &scriptTarget{})
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, want 0", code, errOut)
+	}
+	var res deliverResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("decode deliver JSON: %v; output: %q", err, out)
+	}
+	if res.WatchID != "w-json" || res.Verdict != string(domain.VerdictReady) {
+		t.Fatalf("result = %+v, want watchID w-json and verdict ready", res)
+	}
+	if res.Delivery != deliverySteer || res.Outcome != outcomeSteer || res.Attempts != 1 {
+		t.Fatalf("result = %+v, want one steer attempt", res)
+	}
+}
+
+func TestRunDeliverJSONSkippedVerdict(t *testing.T) {
+	snap := mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+		deliverWatch("w-skip", domain.VerdictWatching, deliverSub(domain.RoleOrchestrator, "orch-session")),
+	}}
+	code, out, errOut := runDeliverWith(t, []string{"--format", "json", "w-skip"}, snap, nil, &scriptTarget{})
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q, want 0", code, errOut)
+	}
+	var res deliverResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("decode deliver JSON: %v; output: %q", err, out)
+	}
+	if res.Delivery != deliverySkipped {
+		t.Fatalf("delivery = %q, want skipped", res.Delivery)
+	}
+}
+
+func TestRunDeliverRejectsUnknownFormat(t *testing.T) {
+	snap := mcp.StateSnapshot{ActiveWatches: []domain.Watch{
+		deliverWatch("w-1", domain.VerdictReady, deliverSub(domain.RoleOrchestrator, "orch-session")),
+	}}
+	code, _, errOut := runDeliverWith(t, []string{"--format", "yaml", "w-1"}, snap, nil, &scriptTarget{})
+	if code != 2 || errOut == "" {
+		t.Fatalf("exit/stderr = %d/%q, want 2 and a message", code, errOut)
 	}
 }

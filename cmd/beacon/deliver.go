@@ -21,9 +21,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -132,6 +134,7 @@ const (
 	deliverySteer       deliveryKind = "steer"
 	deliveryQueue       deliveryKind = "queue"
 	deliveryUnsupported deliveryKind = "unsupported"
+	deliverySkipped     deliveryKind = "skipped"
 )
 
 // Prompt reports a write into the running turn as nil. The sentinel errors
@@ -157,6 +160,7 @@ const (
 	outcomeTransportFailed attemptOutcome = "transport-failed"
 	outcomeIndeterminate   attemptOutcome = "indeterminate"
 	outcomeUnsupported     attemptOutcome = "unsupported"
+	outcomeSkipped         attemptOutcome = "skipped"
 )
 
 // classifyPrompt maps a Prompt error to an attempt outcome. An unknown error
@@ -311,6 +315,21 @@ func (r deliverResult) line() string {
 		r.WatchID, r.Verdict, r.Delivery, r.Attempts)
 }
 
+// renderDeliverJSON encodes the result with the field names declared on
+// deliverResult, so a structured caller gets the same fields as the table line.
+func renderDeliverJSON(w io.Writer, r deliverResult) error {
+	return json.NewEncoder(w).Encode(r)
+}
+
+// printDeliverResult writes one result in the requested format.
+func printDeliverResult(format string, w io.Writer, r deliverResult) error {
+	if format == "json" {
+		return renderDeliverJSON(w, r)
+	}
+	_, err := fmt.Fprintln(w, r.line())
+	return err
+}
+
 // ===== Pi RPC adapter selection (T3.217) ====================================
 
 // Config keys for the Pi RPC adapter. An empty adapter keeps the installed
@@ -405,21 +424,25 @@ func chooseDeliveryTarget(cfg deliverAdapterConfig, probe wake.PiProbe, fallback
 	return &piDeliveryTarget{deliverer: &wake.PiDeliverer{Probe: probe, Mode: cfg.Mode}, timeout: cfg.Timeout}
 }
 
-// runDeliver implements `beacon deliver <watchID>`. It reads one snapshot,
-// checks that the verdict is ready or needs_input, writes the result into the
-// subscriber's live session and prints the honest delivery field. Exit 0 means
-// a follow-up was delivered, 1 means the delivery was not achieved, and 2 is a
-// usage or snapshot error.
+// runDeliver implements `beacon deliver [--format table|json] <watchID>`. It
+// reads one snapshot, checks that the verdict is ready or needs_input, writes
+// the result into the subscriber's live session and prints the honest delivery
+// field. Exit 0 means a follow-up was delivered, 1 means the delivery was not
+// achieved, and 2 is a usage or snapshot error.
 func runDeliver(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("deliver", flag.ContinueOnError)
 	fs.SetOutput(c.errOut)
 	fs.Usage = func() {}
+	format := fs.String("format", "table", "формат вывода: table или json")
 	if err := fs.Parse(args); err != nil {
 		writeUsage(c.errOut)
 		return 2
 	}
 	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
-		fmt.Fprintln(c.errOut, "beacon deliver: нужна одна команда: beacon deliver <watchID>")
+		fmt.Fprintln(c.errOut, "beacon deliver: нужна одна команда: beacon deliver [--format table|json] <watchID>")
+		return 2
+	}
+	if !parseFormatFlag(*format, "beacon deliver: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
 	watchID := strings.TrimSpace(fs.Arg(0))
@@ -435,7 +458,15 @@ func runDeliver(c *CLI, args []string) int {
 		return 2
 	}
 	if !actionableVerdict(w.verdict) {
-		fmt.Fprintf(c.out, "watch=%s verdict=%s: доставка не требуется\n", w.id, w.verdict)
+		if *format == "json" {
+			res := deliverResult{WatchID: w.id, Verdict: w.verdict, Delivery: deliverySkipped, Outcome: outcomeSkipped}
+			if err := renderDeliverJSON(c.out, res); err != nil {
+				fmt.Fprintf(c.errOut, "beacon deliver: %v\n", err)
+				return 2
+			}
+		} else {
+			fmt.Fprintf(c.out, "watch=%s verdict=%s: доставка не требуется\n", w.id, w.verdict)
+		}
 		return 0
 	}
 	sub, ok := deliverySubscriber(w)
@@ -446,7 +477,10 @@ func runDeliver(c *CLI, args []string) int {
 			Delivery: deliveryUnsupported,
 			Outcome:  outcomeUnsupported,
 		}
-		fmt.Fprintln(c.out, res.line())
+		if err := printDeliverResult(*format, c.out, res); err != nil {
+			fmt.Fprintf(c.errOut, "beacon deliver: %v\n", err)
+			return 2
+		}
 		fmt.Fprintf(c.errOut, "beacon deliver: у watch %s нет живой сессии для доставки\n", w.id)
 		return 1
 	}
@@ -468,7 +502,10 @@ func runDeliver(c *CLI, args []string) int {
 		Outcome:  out,
 		Attempts: attempts,
 	}
-	fmt.Fprintln(c.out, res.line())
+	if err := printDeliverResult(*format, c.out, res); err != nil {
+		fmt.Fprintf(c.errOut, "beacon deliver: %v\n", err)
+		return 2
+	}
 	if !delivered(out) {
 		fmt.Fprintf(c.errOut, "beacon deliver: доставка не выполнена (outcome=%s)\n", out)
 		return 1

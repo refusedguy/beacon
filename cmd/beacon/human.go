@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +21,7 @@ func init() {
 	catalog = append(catalog, command{
 		Name:    "human",
 		Summary: "Принять решение оператора по вотче или блокеру",
-		Usage:   "beacon human <approve|reject|rework|unblock|pause|resume|cancel> <watchID|blockerID> [--note \"...\"]",
+		Usage:   "beacon human [--format table|json] <approve|reject|rework|unblock|pause|resume|cancel> <watchID|blockerID> [--note \"...\"]",
 	})
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
@@ -245,13 +246,14 @@ func resolveBlocker(db *store.DB, target string, now time.Time) error {
 	return nil
 }
 
-// runHuman is `beacon human <verb> <target> [--note "..."]`. It posts to the
-// server when connection.json names one and falls back to SQLite when there is
-// no listener.
+// runHuman is `beacon human [--format table|json] <verb> <target> [--note "..."]`.
+// It posts to the server when connection.json names one and falls back to
+// SQLite when there is no listener.
 func runHuman(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("human", flag.ContinueOnError)
 	fs.SetOutput(c.errOut)
 	fs.Usage = func() {}
+	format := fs.String("format", "table", "формат вывода: table или json")
 	note := fs.String("note", "", "пояснение к решению оператора")
 	if err := fs.Parse(args); err != nil {
 		writeUsage(c.errOut)
@@ -260,6 +262,9 @@ func runHuman(c *CLI, args []string) int {
 	if fs.NArg() != 2 {
 		fmt.Fprintf(c.errOut, "beacon human: нужны verb и watchID|blockerID\n")
 		writeUsage(c.errOut)
+		return 2
+	}
+	if !parseFormatFlag(*format, "beacon human: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
 	answer, err := parseHumanResponse(fs.Arg(0), fs.Arg(1), *note)
@@ -287,7 +292,17 @@ func runHuman(c *CLI, args []string) int {
 		}
 		receipt, err := decider.Decide(ctx, req)
 		if err == nil {
-			printHumanReceipt(c, verb, target, receipt)
+			state := "ok"
+			if !receipt.Applied {
+				state = "accepted"
+			}
+			if err := printHumanResult(*format, c, humanResult{
+				Verb: verb, Target: target, State: state,
+				Message: receipt.Message, Transport: "http",
+			}); err != nil {
+				fmt.Fprintf(c.errOut, "beacon human: %v\n", err)
+				return 2
+			}
 			return 0
 		}
 		if !errors.Is(err, httpapi.ErrNoServer) {
@@ -309,17 +324,38 @@ func runHuman(c *CLI, args []string) int {
 		fmt.Fprintf(c.errOut, "beacon human: sqlite: %v\n", err)
 		return 2
 	}
-	fmt.Fprintf(c.out, "human: %s %s: applied via sqlite\n", verb, target)
+	if err := printHumanResult(*format, c, humanResult{
+		Verb: verb, Target: target, State: "applied via sqlite", Transport: "sqlite",
+	}); err != nil {
+		fmt.Fprintf(c.errOut, "beacon human: %v\n", err)
+		return 2
+	}
 	return 0
 }
 
-func printHumanReceipt(c *CLI, verb, target string, receipt httpapi.ClientDecisionReceipt) {
-	state := "ok"
-	if !receipt.Applied {
-		state = "accepted"
+// humanResult is the structured outcome of one operator decision. The table
+// rendering keeps the existing prefix; JSON exposes the same fields by name.
+type humanResult struct {
+	Verb      string `json:"verb"`
+	Target    string `json:"target"`
+	State     string `json:"state"`
+	Message   string `json:"message,omitempty"`
+	Transport string `json:"transport"`
+}
+
+// renderHumanJSON encodes the decision result for a structured caller.
+func renderHumanJSON(w io.Writer, r humanResult) error {
+	return json.NewEncoder(w).Encode(r)
+}
+
+// printHumanResult writes one decision result in the requested format.
+func printHumanResult(format string, c *CLI, r humanResult) error {
+	if format == "json" {
+		return renderHumanJSON(c.out, r)
 	}
-	fmt.Fprintf(c.out, "human: %s %s: %s\n", verb, target, state)
-	if receipt.Message != "" {
-		fmt.Fprintf(c.out, "human: %s\n", receipt.Message)
+	fmt.Fprintf(c.out, "human: %s %s: %s\n", r.Verb, r.Target, r.State)
+	if r.Message != "" {
+		fmt.Fprintf(c.out, "human: %s\n", r.Message)
 	}
+	return nil
 }
