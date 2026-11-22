@@ -101,11 +101,15 @@ var (
 	// dashIDRE above requires the number directly after the dash, so cards
 	// produced by the backlog-research waves need their own form.
 	letterDashIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([A-Za-z]+)([0-9]+)$`)
+	// digitDashLetterIDRE accepts split ids where a letter follows the number,
+	// for example TUI-07A. letterDashIDRE above puts the letter before the
+	// number (ATX-R01), so these cards need their own form.
+	digitDashLetterIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)-([0-9]+)([A-Za-z]+)$`)
 	// dotIDRE accepts an alphabetic prefix followed directly by a dot and a
 	// number, for example BS.1. The idRE above requires a digit before the dot
 	// (T3.123), so families like BS need their own form.
 	dotIDRE    = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
-	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|[.-][0-9]+)$`)
+	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|-[0-9]+[A-Za-z]+|[.-][0-9]+)$`)
 	titleRE    = regexp.MustCompile(`^#\s+[A-Za-z][A-Za-z0-9_.-]*\.\s*(.*)$`)
 	headerRE   = regexp.MustCompile(`^#\s+(.*)$`)
 	fieldRE    = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
@@ -151,6 +155,9 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	case letterDashIDRE.MatchString(id):
 		d := letterDashIDRE.FindStringSubmatch(id)
 		number, err = strconv.Atoi(d[3])
+	case digitDashLetterIDRE.MatchString(id):
+		d := digitDashLetterIDRE.FindStringSubmatch(id)
+		number, err = strconv.Atoi(d[2])
 	case dotIDRE.MatchString(id):
 		d := dotIDRE.FindStringSubmatch(id)
 		number, err = strconv.Atoi(d[2])
