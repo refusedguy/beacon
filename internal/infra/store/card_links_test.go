@@ -249,3 +249,81 @@ func TestLinkAndUnlinkConcurrentKeepAtMostOneRow(t *testing.T) {
 		t.Fatalf("concurrent Link and Unlink: want at most 1 row, got %d", rows)
 	}
 }
+
+func TestLinkCardWatchStoresExplicitIDs(t *testing.T) {
+	d := newCardLinkTestDB(t)
+
+	// The session id need not match the agent id written in the card. Only the
+	// explicit cardID and watchID from the responses reach the store.
+	res, err := d.LinkCardWatch("CARD-42", "ses_watch_77", 501)
+	if err != nil {
+		t.Fatalf("LinkCardWatch: %v", err)
+	}
+	if !res.Created || res.Duplicate {
+		t.Fatalf("LinkCardWatch = %+v, want Created only", res)
+	}
+	want := CardLink{CardID: "CARD-42", WatchID: "ses_watch_77", PR: 501}
+	if res.Link != want {
+		t.Fatalf("LinkCardWatch row = %+v, want %+v", res.Link, want)
+	}
+	if got := storedCardLink(t, d, "CARD-42"); got != want {
+		t.Fatalf("stored link = %+v, want %+v", got, want)
+	}
+}
+
+func TestLinkCardWatchRejectsEmptyIDs(t *testing.T) {
+	d := newCardLinkTestDB(t)
+
+	for _, tc := range []struct{ cardID, watchID string }{
+		{"", "watch-9"},
+		{"IDX-09", ""},
+		{"", ""},
+	} {
+		if _, err := d.LinkCardWatch(tc.cardID, tc.watchID, 909); err == nil {
+			t.Fatalf("LinkCardWatch(%q, %q) must fail", tc.cardID, tc.watchID)
+		}
+	}
+	if rows := cardLinkCount(t, d); rows != 0 {
+		t.Fatalf("rejected calls must not create rows, got %d", rows)
+	}
+}
+
+func TestLinkCardWatchConcurrentSamePairCreatesOneRow(t *testing.T) {
+	d := newCardLinkTestDB(t)
+
+	start := make(chan struct{})
+	type callResult struct {
+		res LinkResult
+		err error
+	}
+	results := make(chan callResult, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			<-start
+			res, err := d.LinkCardWatch("IDX-09", "watch-9", 909)
+			results <- callResult{res: res, err: err}
+		}()
+	}
+	close(start)
+
+	created := 0
+	for i := 0; i < 2; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("concurrent LinkCardWatch: %v", r.err)
+		}
+		if r.res.Created {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("want exactly one Created result, got %d", created)
+	}
+	if rows := cardLinkCount(t, d); rows != 1 {
+		t.Fatalf("concurrent LinkCardWatch: want 1 row, got %d", rows)
+	}
+	want := CardLink{CardID: "IDX-09", WatchID: "watch-9", PR: 909}
+	if got := storedCardLink(t, d, "IDX-09"); got != want {
+		t.Fatalf("stored link = %+v, want %+v", got, want)
+	}
+}
