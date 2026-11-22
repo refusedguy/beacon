@@ -721,6 +721,55 @@ func (l *admissionLock) release(parallel bool) {
 	l.mu.Unlock()
 }
 
+// --- CCx-02: recheck budget and deny around the slot wait ------------------
+
+// admissionReason is the decision to start an action and the reason for a
+// refusal. Allowed is true only when the action may enter its body.
+type admissionReason struct {
+	Allowed bool
+	Reason  string
+}
+
+// admissionGuard supplies the two predicates that gate dispatch. BudgetExhausted
+// reports that the wave budget is spent. Denied reports a stop signal such as a
+// start denial. Both are read before a slot is taken and again after the wait,
+// so a change during the wait still stops the action (parallel.rs:328-332,
+// parallel.rs:361-370).
+type admissionGuard struct {
+	BudgetExhausted func() bool
+	Denied          func() bool
+}
+
+// refusal runs both predicates. The first one that fires wins and names the
+// reason. A guard with no predicates never refuses.
+func (g admissionGuard) refusal() admissionReason {
+	if g.BudgetExhausted != nil && g.BudgetExhausted() {
+		return admissionReason{Reason: "budget exhausted"}
+	}
+	if g.Denied != nil && g.Denied() {
+		return admissionReason{Reason: "start denied"}
+	}
+	return admissionReason{Allowed: true}
+}
+
+// admit checks the guard before waiting for a slot and again after the slot is
+// granted. A refusal at either point starts nothing. When the post-wait check
+// refuses, the slot is returned before admit reports the decision.
+func (l *admissionLock) admit(ctx context.Context, action dispatchAction, guard admissionGuard) (func(), admissionReason) {
+	if reason := guard.refusal(); !reason.Allowed {
+		return nil, reason
+	}
+	release, err := l.acquire(ctx, action)
+	if err != nil {
+		return nil, admissionReason{Reason: "slot wait interrupted: " + err.Error()}
+	}
+	if reason := guard.refusal(); !reason.Allowed {
+		release()
+		return nil, reason
+	}
+	return release, admissionReason{Allowed: true}
+}
+
 // ---------------------------------------------------------------------------
 // Skills lock (HD-071)
 // ---------------------------------------------------------------------------
