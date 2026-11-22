@@ -258,6 +258,28 @@ const beaconStateDirEnv = "BEACON_STATE_DIR"
 // os.Getwd() guess for a plugin instance loaded from a worktree (ADR 0069).
 const beaconProjectRootEnv = "BEACON_PROJECT_ROOT"
 
+// legacyProjectRootEnvs are the old names for the project root. They remain
+// readable during migration, but each one warns on use. BEACON_PROJECT_ROOT is
+// the one name every consumer documents.
+var legacyProjectRootEnvs = []string{"BEACON_ROOT", "BEACON_REPO"}
+
+// projectRootFromEnv resolves the project root environment variable for every
+// consumer: doctor, task config and MCP config. The canonical name wins. A
+// legacy name is used only when the canonical name is empty, and always prints
+// a warning. An empty result means the caller falls back to its own detection.
+func projectRootFromEnv() string {
+	root := strings.TrimSpace(os.Getenv(beaconProjectRootEnv))
+	for _, name := range legacyProjectRootEnvs {
+		if raw := strings.TrimSpace(os.Getenv(name)); raw != "" {
+			fmt.Fprintf(os.Stderr, "beacon: %s устарел, используйте %s\n", name, beaconProjectRootEnv)
+			if root == "" {
+				root = raw
+			}
+		}
+	}
+	return root
+}
+
 // stateDir returns the state directory of the project the caller runs in.
 //
 // An explicit project root passed by the caller wins over the root in
@@ -276,7 +298,7 @@ func stateDir(root ...string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	projectRoot := strings.TrimSpace(os.Getenv(beaconProjectRootEnv))
+	projectRoot := projectRootFromEnv()
 	for _, candidate := range root {
 		if trimmed := strings.TrimSpace(candidate); trimmed != "" {
 			projectRoot = trimmed

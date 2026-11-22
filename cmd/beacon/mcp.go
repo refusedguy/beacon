@@ -1661,7 +1661,7 @@ var defaultCIRepo = github.DetectRepoSlug(projectRootForConfig())
 // projectRootForConfig resolves the absolute project root used by the config
 // fallback of the orchestrator-id source.
 func projectRootForConfig() string {
-	root := strings.TrimSpace(os.Getenv(beaconProjectRootEnv))
+	root := projectRootFromEnv()
 	if root != "" {
 		return root
 	}

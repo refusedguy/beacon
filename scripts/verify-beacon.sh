@@ -5,7 +5,19 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="${BEACON_REPO:-$(cd "$SCRIPT_DIR/.." && pwd -P)}"
+# BEACON_PROJECT_ROOT is the single name for the project root. Old names stay
+# readable during migration and warn when they win over the script location.
+if [[ -n "${BEACON_PROJECT_ROOT:-}" ]]; then
+  REPO="$BEACON_PROJECT_ROOT"
+elif [[ -n "${BEACON_ROOT:-}" ]]; then
+  printf 'WARN  BEACON_ROOT устарел, используйте BEACON_PROJECT_ROOT\n' >&2
+  REPO="$BEACON_ROOT"
+elif [[ -n "${BEACON_REPO:-}" ]]; then
+  printf 'WARN  BEACON_REPO устарел, используйте BEACON_PROJECT_ROOT\n' >&2
+  REPO="$BEACON_REPO"
+else
+  REPO="$(cd "$SCRIPT_DIR/.." && pwd -P)"
+fi
 
 GO="${GO:-${GO_BIN:-}}"
 if [[ -z "$GO" || ! -x "$GO" ]]; then
@@ -32,7 +44,7 @@ export GOPROXY="${GOPROXY:-off}"
 export XDG_STATE_HOME="$WORK/state"
 export BEACON_LOG_FORMAT=text
 export BEACON_LOG_LEVEL=debug
-unset BEACON_STATE_DIR BEACON_PROJECT_ROOT BEACON_INIT_EVENT BEACON_INIT_BYPASS || true
+unset BEACON_STATE_DIR BEACON_PROJECT_ROOT BEACON_ROOT BEACON_REPO BEACON_INIT_EVENT BEACON_INIT_BYPASS || true
 
 run_beacon() { (cd "$REPO" && exec "$@"); }
 
