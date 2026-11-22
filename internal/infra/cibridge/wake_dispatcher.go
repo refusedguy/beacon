@@ -2,15 +2,106 @@ package cibridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
+
+// DefaultParallelLimit is the default cap on units that may run at once. It
+// reads the configured concurrency budget from the domain, so the cap has a
+// single source and callers can override it with an explicit limit.
+const DefaultParallelLimit = domain.DefaultSlotsTotal
+
+// UnitStatus is the observable state of one unit in a bounded batch.
+type UnitStatus string
+
+const (
+	UnitDone    UnitStatus = "done"
+	UnitFailed  UnitStatus = "failed"
+	UnitSkipped UnitStatus = "skipped"
+)
+
+// UnitResult carries the status of one bounded unit and its error when the
+// unit failed. A skipped unit was never started and carries no error.
+type UnitResult struct {
+	Status UnitStatus
+	Err    error
+}
+
+// BoundedRun runs work over n indices with at most limit workers. Each worker
+// claims the next index atomically, so no index runs twice. When stopOnError
+// is set, the first error stops new starts and every index not yet claimed is
+// reported as skipped. The result holds one entry per index in input order.
+// A nil context becomes Background; limit <= 0 selects DefaultParallelLimit.
+// The worker must be safe for concurrent calls. BoundedRun waits for every
+// started worker before it returns.
+func BoundedRun(ctx context.Context, n, limit int, stopOnError bool, work func(context.Context, int) error) []UnitResult {
+	if n <= 0 {
+		return []UnitResult{}
+	}
+	results := make([]UnitResult, n)
+	for i := range results {
+		results[i].Status = UnitSkipped
+	}
+	if work == nil {
+		for i := range results {
+			results[i] = UnitResult{Status: UnitFailed, Err: errors.New("cibridge: bounded run: nil worker")}
+		}
+		return results
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 {
+		limit = DefaultParallelLimit
+	}
+	if limit > n {
+		limit = n
+	}
+	var next atomic.Int64
+	next.Store(-1)
+	var stopped atomic.Bool
+	var wg sync.WaitGroup
+	for i := 0; i < limit; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if ctx.Err() != nil || (stopOnError && stopped.Load()) {
+					return
+				}
+				idx := int(next.Add(1))
+				if idx >= n {
+					return
+				}
+				// A sibling may have failed between the check at the top of
+				// the loop and this claim. Leave the claimed index skipped
+				// instead of starting new work after the failure.
+				if stopOnError && stopped.Load() {
+					return
+				}
+				if err := work(ctx, idx); err != nil {
+					results[idx] = UnitResult{Status: UnitFailed, Err: err}
+					if stopOnError {
+						stopped.Store(true)
+					}
+				} else {
+					results[idx] = UnitResult{Status: UnitDone}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
 
 // stage arms the ladder for the obligation behind a wake. The call is
 // idempotent in the ladder, so an at-least-once refresh cannot reset a position
@@ -286,20 +377,23 @@ func actionableWakeVerdict(v domain.Verdict) bool {
 // wakeOne validates the address, applies the wake cap, checks the per-adapter
 // circuit breaker, delivers the pointer and records the attempt. A dead-session
 // error marks the subscriber orphaned and escalates to the orchestrator once;
-// other errors are left pending so a later tick can retry.
-func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscriber, text string, now time.Time, cycleID string, breaker bool) {
+// other errors are left pending so a later tick can retry. The returned error
+// is the delivery error, so a caller that batches wakes can stop new starts
+// after a failure. Skips and parked wakes return nil. Existing callers ignore
+// the value and keep their behavior.
+func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscriber, text string, now time.Time, cycleID string, breaker bool) error {
 	if b.waker == nil && b.adapterWaker == nil {
-		return
+		return nil
 	}
 	target, err := wakeAddressee(w, w.ID, sub.ID)
 	if err != nil || target != sub.ID {
 		observe.WakeSkipped(sub.Adapter, w.ID, "obligation target mismatch")
 		log.Printf("cibridge: skip wake for watch %s: subscriber %q (%v)", w.ID, sub.ID, err)
-		return
+		return nil
 	}
 	if breaker && b.wakeCount(w, sub.ID) >= wakeCap(w) {
 		b.parkForWakeCap(ctx, w, cycleID)
-		return
+		return nil
 	}
 	adapter := breakerAdapterKey(sub)
 	// An actionable verdict must reach its subscriber even when the adapter is
@@ -317,7 +411,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 			cycleID: cycleID, stagedAt: now, watch: w, subscriber: sub,
 		})
 		b.recordBreakerFailure(adapter, now)
-		return
+		return nil
 	}
 	b.drainDeferred(ctx, adapter, w, sub, now, cycleID, useBreaker)
 	p := domain.WakePayload{
@@ -371,7 +465,7 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 			observe.WakeDeliveredOrphan(sub.Adapter, w.ID, w.Revision)
 			b.markOrphaned(ctx, w, sub, now, cycleID)
 		}
-		return
+		return deliverErr
 	}
 	if useBreaker {
 		b.breakerRecord(adapter, now, false)
@@ -391,6 +485,39 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		watchID: w.ID, obligationID: p.ObligationID, revision: w.Revision,
 		role: sub.Role, adapter: adapter, verdict: w.Verdict, attempt: attempt,
 	}, observe.Fields{"sessionID": target})
+	return nil
+}
+
+// WakeUnit is one wake submitted to DeliverWakes.
+type WakeUnit struct {
+	Watch      domain.Watch
+	Subscriber domain.Subscriber
+	Text       string
+	CycleID    string
+	Breaker    bool
+}
+
+// WakeUnitResult is the outcome of one batched wake. Status is done, failed or
+// skipped, and Err carries the delivery error when the status is failed.
+type WakeUnitResult struct {
+	Status UnitStatus
+	Err    error
+}
+
+// DeliverWakes delivers a batch of wakes with at most limit in flight. The
+// first delivery error stops new starts, and wakes not yet started come back
+// as skipped. A limit <= 0 selects DefaultParallelLimit. The now stamp is
+// supplied by the caller so the batch shares one clock reading.
+func (b *wakeDispatcher) DeliverWakes(ctx context.Context, now time.Time, units []WakeUnit, limit int) []WakeUnitResult {
+	statuses := BoundedRun(ctx, len(units), limit, true, func(ctx context.Context, i int) error {
+		u := units[i]
+		return b.wakeOne(ctx, u.Watch, u.Subscriber, u.Text, now, u.CycleID, u.Breaker)
+	})
+	out := make([]WakeUnitResult, len(statuses))
+	for i, s := range statuses {
+		out[i] = WakeUnitResult{Status: s.Status, Err: s.Err}
+	}
+	return out
 }
 
 // drainDeferred replays parked wakes when a wake is being delivered on the

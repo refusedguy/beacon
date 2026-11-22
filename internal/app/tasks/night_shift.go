@@ -16,6 +16,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/refusedguy/beacon/internal/infra/cibridge"
 )
 
 // RoleExecutor is the Watch role registered for delegated work. It is an
@@ -299,53 +301,173 @@ func (w *Worker) Run(ctx context.Context, in State) (Result, error) {
 	return out, nil
 }
 
+// RunBounded performs one triage pass with at most limit delegations in
+// flight. Workers claim the next candidate atomically, so no candidate runs
+// twice. The first failed unit stops new starts: every candidate not yet
+// started is reported as an OutcomeSkipped row and as a NotAttemptedUnit, so
+// the caller can see what the failure prevented. Units already started run to
+// completion before the method returns. A limit <= 0 selects
+// cibridge.DefaultParallelLimit. State still marks every delegated issue as
+// handled, and the Delegator port stays idempotent by issue ID, so a repeat
+// pass with the returned state creates no new delegations.
+func (w *Worker) RunBounded(ctx context.Context, in State, limit int) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out := Result{State: in.Clone()}
+	if w == nil || w.backlog == nil || w.delegator == nil || w.watches == nil || w.audit == nil {
+		return out, ErrNilPorts
+	}
+
+	candidates, err := w.backlog.Candidates(ctx)
+	if err != nil {
+		return out, fmt.Errorf("tasks: night shift: backlog: %w", err)
+	}
+
+	plan := PlanTriage(in, candidates)
+	for _, issue := range plan.Skipped {
+		out.Outcomes = append(out.Outcomes, Outcome{
+			IssueID: issue.ID, Kind: OutcomeSkipped,
+			Reason: "already handled or missing id", Action: "none",
+			Priority: IsKernel(issue),
+		})
+	}
+	skipped := len(plan.Skipped)
+
+	units := make([]unitOutcome, len(plan.ToDelegate))
+	statuses := cibridge.BoundedRun(ctx, len(plan.ToDelegate), limit, true,
+		func(ctx context.Context, i int) error {
+			units[i] = w.triageUnit(ctx, plan.ToDelegate[i])
+			return units[i].err
+		})
+
+	for i, issue := range plan.ToDelegate {
+		u := units[i]
+		switch statuses[i].Status {
+		case cibridge.UnitDone:
+			markHandled(&out.State, issue.ID)
+			out.Delegated = append(out.Delegated, u.delegation)
+			out.Watches = append(out.Watches, u.watch)
+			out.Outcomes = append(out.Outcomes, Outcome{
+				IssueID: issue.ID, Kind: OutcomeDelegated, Priority: IsKernel(issue),
+			})
+		case cibridge.UnitFailed:
+			if u.delegated {
+				markHandled(&out.State, issue.ID)
+				out.Delegated = append(out.Delegated, u.delegation)
+			}
+			reason := statuses[i].Err.Error()
+			out.Failed = append(out.Failed, Failure{IssueID: issue.ID, Reason: reason})
+			out.Outcomes = append(out.Outcomes, Outcome{
+				IssueID: issue.ID, Kind: OutcomeFailed, Reason: reason,
+				Action: "inspect reason and retry in the next pass", Priority: IsKernel(issue),
+			})
+		default:
+			reason := "not started after a failed unit"
+			if err := ctx.Err(); err != nil {
+				reason = err.Error()
+			}
+			out.NotAttempted = append(out.NotAttempted, NotAttemptedUnit{
+				IssueID: issue.ID, Action: NotAttemptedAction,
+			})
+			out.Outcomes = append(out.Outcomes, Outcome{
+				IssueID: issue.ID, Kind: OutcomeSkipped, Reason: reason,
+				Action: NotAttemptedAction, Priority: IsKernel(issue),
+			})
+			skipped++
+		}
+	}
+	out.Skipped = skipped
+	return out, nil
+}
+
+// unitOutcome is the private contribution of one issue. RunBounded collects
+// these in a per-index slice so concurrent workers never touch shared result
+// state, then merges them in input order.
+type unitOutcome struct {
+	issue      Issue
+	delegation Delegation
+	watch      WatchRef
+	delegated  bool
+	err        error
+}
+
+// markHandled records one issue in the durable state snapshot.
+func markHandled(s *State, id string) {
+	if s.Handled == nil {
+		s.Handled = make(map[string]bool)
+	}
+	s.Handled[id] = true
+}
+
 // triageIssue delegates one issue, follows its PR and records the actions. It
 // marks the issue handled as soon as delegation succeeds so a later failure in
 // the same pass cannot cause a second delegation on retry.
 func (w *Worker) triageIssue(ctx context.Context, issue Issue, out *Result) error {
+	u := w.triageUnit(ctx, issue)
+	if u.delegated {
+		markHandled(&out.State, issue.ID)
+		out.Delegated = append(out.Delegated, u.delegation)
+	}
+	if u.err != nil {
+		return u.err
+	}
+	out.Watches = append(out.Watches, u.watch)
+	return nil
+}
+
+// triageUnit performs the port calls of one issue without touching shared
+// result state. A successful delegation is always reported through delegated,
+// even when a later audit, PR or watch step fails, so retry idempotency holds.
+func (w *Worker) triageUnit(ctx context.Context, issue Issue) unitOutcome {
+	u := unitOutcome{issue: issue}
 	delegation, err := w.delegator.Delegate(ctx, issue)
 	if err != nil {
-		return fmt.Errorf("tasks: night shift: delegate %s: %w", issue.ID, err)
+		u.err = fmt.Errorf("tasks: night shift: delegate %s: %w", issue.ID, err)
+		return u
 	}
-	if out.State.Handled == nil {
-		out.State.Handled = make(map[string]bool)
-	}
-	out.State.Handled[issue.ID] = true
-	out.Delegated = append(out.Delegated, delegation)
+	u.delegation = delegation
+	u.delegated = true
 
 	if err := w.audit.Record(ctx, AuditEvent{
 		IssueID: issue.ID,
 		Action:  AuditDelegated,
 		Detail:  delegation.TaskID,
 	}); err != nil {
-		return fmt.Errorf("tasks: night shift: audit delegate %s: %w", issue.ID, err)
+		u.err = fmt.Errorf("tasks: night shift: audit delegate %s: %w", issue.ID, err)
+		return u
 	}
 
 	if !delegation.PR.valid() {
-		return fmt.Errorf("tasks: night shift: delegate %s: invalid PR %+v", issue.ID, delegation.PR)
+		u.err = fmt.Errorf("tasks: night shift: delegate %s: invalid PR %+v", issue.ID, delegation.PR)
+		return u
 	}
 	ref, found, err := w.watches.Find(ctx, delegation.PR)
 	if err != nil {
-		return fmt.Errorf("tasks: night shift: find watch %s: %w", issue.ID, err)
+		u.err = fmt.Errorf("tasks: night shift: find watch %s: %w", issue.ID, err)
+		return u
 	}
 	action := AuditWatchFound
 	if !found {
 		ref, err = w.watches.Register(ctx, delegation.PR, RoleExecutor)
 		if err != nil {
-			return fmt.Errorf("tasks: night shift: register watch %s: %w", issue.ID, err)
+			u.err = fmt.Errorf("tasks: night shift: register watch %s: %w", issue.ID, err)
+			return u
 		}
 		action = AuditWatchRegistered
 	}
 	if ref.ID == "" {
-		return fmt.Errorf("tasks: night shift: watch %s: empty watchID", issue.ID)
+		u.err = fmt.Errorf("tasks: night shift: watch %s: empty watchID", issue.ID)
+		return u
 	}
 	if err := w.audit.Record(ctx, AuditEvent{
 		IssueID: issue.ID,
 		Action:  action,
 		Detail:  ref.ID,
 	}); err != nil {
-		return fmt.Errorf("tasks: night shift: audit watch %s: %w", issue.ID, err)
+		u.err = fmt.Errorf("tasks: night shift: audit watch %s: %w", issue.ID, err)
+		return u
 	}
-	out.Watches = append(out.Watches, ref)
-	return nil
+	u.watch = ref
+	return u
 }
