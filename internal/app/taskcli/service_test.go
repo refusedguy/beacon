@@ -2225,3 +2225,134 @@ func TestConcurrentHandoffAnswersAreAllKept(t *testing.T) {
 		t.Fatalf("записано %d ответов, ждали %d", len(st.Answers), n)
 	}
 }
+
+func reaperTestTime() time.Time {
+	return time.Date(2026, 11, 20, 14, 10, 0, 0, time.UTC)
+}
+
+func cardByID(t *testing.T, e *env, id string) Card {
+	t.Helper()
+	cards, err := LoadCards(e.tasksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cards {
+		if c.ID == id {
+			return c
+		}
+	}
+	t.Fatalf("карточка %s не найдена", id)
+	return Card{}
+}
+
+func TestReapStaleCardsKeepsLiveWatch(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.10", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-19T14:03:21Z")
+
+	got, err := e.svc.ReapStaleCards(ReapOptions{
+		Now:        reaperTestTime(),
+		Agent:      "reaper-test",
+		WatchAlive: func(cardID string) (bool, error) { return cardID == "T2.10", nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scanned != 1 || len(got.Reaped) != 0 || len(got.Skipped) != 1 || got.Skipped[0] != "T2.10" {
+		t.Fatalf("результат прохода: %+v", got)
+	}
+	if c := cardByID(t, e, "T2.10"); c.Status != "in_progress" || c.Agent != "agent-1" {
+		t.Fatalf("живая карточка изменена: %+v", c)
+	}
+	log, err := e.svc.ReaperLog()
+	if err != nil || len(log) != 0 {
+		t.Fatalf("журнал для живой карточки: %+v err=%v", log, err)
+	}
+}
+
+func TestReapStaleCardsFreesDeadWorker(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.11", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-19T14:03:21Z")
+
+	got, err := e.svc.ReapStaleCards(ReapOptions{Now: reaperTestTime(), Agent: "reaper-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scanned != 1 || len(got.Reaped) != 1 || got.Reaped[0] != "T2.11" || len(got.Skipped) != 0 {
+		t.Fatalf("результат прохода: %+v", got)
+	}
+	c := cardByID(t, e, "T2.11")
+	if c.Status != "todo" || c.Agent != "нет" || c.Time != "нет" {
+		t.Fatalf("карточка не освобождена: %+v", c)
+	}
+	log, err := e.svc.ReaperLog()
+	if err != nil || len(log) != 1 || log[0].CardID != "T2.11" || log[0].Agent != "reaper-test" {
+		t.Fatalf("журнал: %+v err=%v", log, err)
+	}
+	if _, err := e.svc.Take(TakeOptions{
+		ID: "T2.11", Agent: "agent-2", Time: "2026-11-20T14:11:00Z",
+	}); err != nil {
+		t.Fatalf("освобождённую карточку нельзя взять повторно: %v", err)
+	}
+}
+
+func TestReapStaleCardsIsIdempotent(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.12", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-19T14:03:21Z")
+
+	first, err := e.svc.ReapStaleCards(ReapOptions{Now: reaperTestTime(), Agent: "reaper-test"})
+	if err != nil || len(first.Reaped) != 1 {
+		t.Fatalf("первый проход: %+v err=%v", first, err)
+	}
+	second, err := e.svc.ReapStaleCards(ReapOptions{Now: reaperTestTime(), Agent: "reaper-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Scanned != 0 || len(second.Reaped) != 0 {
+		t.Fatalf("второй проход изменил карточку: %+v", second)
+	}
+	log, err := e.svc.ReaperLog()
+	if err != nil || len(log) != 1 {
+		t.Fatalf("журнал после двух проходов: %+v err=%v", log, err)
+	}
+}
+
+func TestReapStaleCardsSkipsLiveProcessAndFreshCard(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.13", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-19T14:03:21Z")
+	e.card(t, "T2.14", "in_progress", "task", "ADR 0001", "internal/app/a/two.go",
+		"agent-2", "2026-11-20T13:55:00Z")
+
+	got, err := e.svc.ReapStaleCards(ReapOptions{
+		Now:          reaperTestTime(),
+		Agent:        "reaper-test",
+		ProcessAlive: func(cardID string) (bool, error) { return cardID == "T2.13", nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scanned != 2 || len(got.Reaped) != 0 || len(got.Skipped) != 2 {
+		t.Fatalf("результат прохода: %+v", got)
+	}
+	for _, id := range []string{"T2.13", "T2.14"} {
+		if c := cardByID(t, e, id); c.Status != "in_progress" {
+			t.Fatalf("карточка %s изменена: %+v", id, c)
+		}
+	}
+}
+
+func TestReapStaleCardsHonorsInjectedTTL(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.15", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-20T13:55:00Z")
+
+	got, err := e.svc.ReapStaleCards(ReapOptions{
+		Now: reaperTestTime(), TTL: 5 * time.Minute, Agent: "reaper-test",
+	})
+	if err != nil || len(got.Reaped) != 1 || got.Reaped[0] != "T2.15" {
+		t.Fatalf("внедрённый TTL проигнорирован: %+v err=%v", got, err)
+	}
+}

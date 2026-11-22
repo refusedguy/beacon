@@ -148,6 +148,9 @@ var (
 	// just because its prefix differs from the original T<n>.<n> form.
 	idrRE     = regexp.MustCompile(`^[A-Za-z]+[0-9]*[.-][0-9]+$`)
 	adrStatRE = regexp.MustCompile(`(?m)^Статус:[ \t]*(.*)$`)
+	// cardStatusLineRE matches the three fields Take writes. The taskstore
+	// copy is private to that package, so taskcli keeps its own here.
+	cardStatusLineRE = regexp.MustCompile(`^(Статус|Агент|Время):[ \t]*(.*?)[ \t]*$`)
 )
 
 type jsonCard struct {
@@ -714,6 +717,202 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s in_progress %s %s", id, o.Agent, when), nil
+}
+
+// ---- MEM-06: TTL-reaper для карточек in_progress ----
+//
+// LeaseTTL внизу файла защищает только glob-аренды. Карточка in_progress
+// живёт отдельно. Если процесс воркера умер, её статус остаётся in_progress
+// навсегда и слот не освобождается. ReapStaleCards возвращает такие карточки
+// в todo. Карточки с живым Watch reaper пропускает. Проверку жизни приносит
+// функция-аргумент, поэтому сервис не знает про store и card_links.
+
+// CardLeaseTTL — возраст, после которого карточка in_progress считается
+// оставленной. Значение отделено от LeaseTTL, чтобы смена срока аренды glob-ов
+// не меняла срок жизни карточек.
+const CardLeaseTTL = 30 * time.Minute
+
+// ReapOptions задаёт внедряемые часы, TTL и порты проверки живой работы.
+// Пустое Now означает time.Now().UTC(), неположительный TTL означает CardLeaseTTL.
+// Нулевой порт означает отсутствие жизни, так тесты моделируют мёртвый воркер.
+type ReapOptions struct {
+	Now   time.Time
+	TTL   time.Duration
+	Agent string // подпись агента, который запустил reaper, для журнала
+	// WatchAlive сообщает, что карточка всё ещё связана с живым Watch.
+	WatchAlive func(cardID string) (bool, error)
+	// ProcessAlive сообщает, что у карточки жив процесс воркера.
+	ProcessAlive func(cardID string) (bool, error)
+}
+
+// ReapResult — результат одного прохода reaper.
+type ReapResult struct {
+	Scanned int      // число карточек in_progress, рассмотренных в проходе
+	Reaped  []string // ID карточек, переведённых в todo
+	Skipped []string // ID карточек, у которых есть живой Watch или процесс
+}
+
+// ReaperLogEntry — одна запись журнала: факт возврата карточки в слот.
+type ReaperLogEntry struct {
+	Time    time.Time `json:"time"`
+	CardID  string    `json:"cardID"`
+	Agent   string    `json:"agent"`
+	TakenAt string    `json:"takenAt"`
+	Reason  string    `json:"reason"`
+}
+
+// reaperState хранит журнал reaper в каталоге состояния репозитория.
+type reaperState struct {
+	Journal []ReaperLogEntry `json:"journal"`
+}
+
+// reaperRepo owns reaper-journal.json. The private flock keeps two concurrent
+// reaper passes from writing the same card twice.
+type reaperRepo struct {
+	fileState[reaperState]
+}
+
+func newReaperRepo(cfg Config) reaperRepo {
+	return reaperRepo{fileState[reaperState]{
+		stateDir:    cfg.StateDir,
+		root:        cfg.Root,
+		file:        "reaper-journal.json",
+		lockFile:    "reaper-journal.lock",
+		readErr:     "не прочитан журнал reaper: %v",
+		parseErr:    "не разобран журнал reaper: %v",
+		writeErr:    "не собран журнал reaper: %v",
+		lockOpenErr: "не открыт замок журнала reaper: %v",
+		lockTakeErr: "не взят замок журнала reaper: %v",
+	}}
+}
+
+// ReapStaleCards переводит в todo карточки in_progress, у которых истёк TTL и
+// нет живого Watch или процесса. Проход идемпотентен: после возврата карточка
+// имеет статус todo и больше не попадает в выборку, поэтому повторный вызов
+// не пишет вторую запись в журнал.
+func (s *Service) ReapStaleCards(o ReapOptions) (ReapResult, error) {
+	now := o.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	ttl := o.TTL
+	if ttl <= 0 {
+		ttl = CardLeaseTTL
+	}
+
+	lock, err := s.acquireLock()
+	if err != nil {
+		return ReapResult{}, err
+	}
+	defer lock.Release()
+
+	cards, err := LoadCards(s.Cfg.TasksDir)
+	if err != nil {
+		return ReapResult{}, err
+	}
+
+	out := ReapResult{Reaped: []string{}, Skipped: []string{}}
+	var freed []ReaperLogEntry
+	for _, c := range cards {
+		if c.Status != "in_progress" {
+			continue
+		}
+		out.Scanned++
+		takenAt, err := time.Parse(time.RFC3339, strings.TrimSpace(c.Time))
+		if err != nil || !now.After(takenAt.Add(ttl)) {
+			out.Skipped = append(out.Skipped, c.ID)
+			continue
+		}
+		if alive, err := liveness(o.WatchAlive, c.ID); err != nil {
+			return out, err
+		} else if alive {
+			out.Skipped = append(out.Skipped, c.ID)
+			continue
+		}
+		if alive, err := liveness(o.ProcessAlive, c.ID); err != nil {
+			return out, err
+		} else if alive {
+			out.Skipped = append(out.Skipped, c.ID)
+			continue
+		}
+
+		if err := AtomicWrite(c.Path, []byte(releaseCardFields(c.Raw)), 0644); err != nil {
+			return out, err
+		}
+		out.Reaped = append(out.Reaped, c.ID)
+		freed = append(freed, ReaperLogEntry{
+			Time:    now,
+			CardID:  c.ID,
+			Agent:   o.Agent,
+			TakenAt: c.Time,
+			Reason: fmt.Sprintf("карточка %s освобождена reaper: старше %s, живого Watch и процесса нет",
+				c.ID, ttl),
+		})
+	}
+
+	if len(freed) > 0 {
+		repo := newReaperRepo(s.Cfg)
+		unlock, err := repo.lock()
+		if err != nil {
+			return out, err
+		}
+		defer unlock()
+		st, err := repo.load()
+		if err != nil {
+			return out, err
+		}
+		st.Journal = append(st.Journal, freed...)
+		if err := repo.save(st); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// liveness вызывает порт проверки жизни. Отсутствие порта означает, что
+// жизни нет. В продакшене порт подключает адаптер MEM-04.
+func liveness(port func(string) (bool, error), cardID string) (bool, error) {
+	if port == nil {
+		return false, nil
+	}
+	return port(cardID)
+}
+
+// releaseCardFields возвращает три поля Take в исходное состояние. Остальные
+// строки карточки не меняются, поэтому JSON и метаданные сохраняются.
+func releaseCardFields(raw string) string {
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		cr := ""
+		if strings.HasSuffix(line, "\r") {
+			cr = "\r"
+			line = strings.TrimSuffix(line, "\r")
+		}
+		fm := cardStatusLineRE.FindStringSubmatch(line)
+		if fm == nil {
+			continue
+		}
+		switch fm[1] {
+		case "Статус":
+			lines[i] = "Статус: todo" + cr
+		case "Агент":
+			lines[i] = "Агент: нет" + cr
+		case "Время":
+			lines[i] = "Время: нет" + cr
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ReaperLog возвращает записи журнала в порядке записи.
+func (s *Service) ReaperLog() ([]ReaperLogEntry, error) {
+	st, err := newReaperRepo(s.Cfg).load()
+	if err != nil {
+		return nil, err
+	}
+	return append([]ReaperLogEntry(nil), st.Journal...), nil
 }
 
 // ---- ADR 0031 §4 / Q-report 2.3: цепочка фолбэка агентов при 429 ----
