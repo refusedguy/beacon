@@ -36,7 +36,7 @@ var catalog = []command{
 	{Name: "build", Summary: "Собрать воспроизводимый бинарник beacon", Usage: "beacon build"},
 	{Name: "ci", Summary: "Опросить открытые PR через CI-провайдер", Usage: "beacon ci check --all"},
 	{Name: "daemon", Summary: "Запустить фоновый цикл оркестратора", Usage: "beacon daemon [--interval] [--once]"},
-	{Name: "deferred", Summary: "Показать отложенные wiring-карточки", Usage: "beacon deferred [--format table|json]"},
+	{Name: "deferred", Summary: "Показать отложенные wiring-карточки", Usage: "beacon deferred [--format table|json] | beacon deferred done <watchID>"},
 	{Name: "deliver", Summary: "Доставить результат по Watch в живую сессию", Usage: "beacon deliver <watchID>"},
 	{Name: "doctor", Summary: "Проверить версию Go, beacon-gates и каталог состояния или следить за внешним условием", Usage: "beacon doctor [--watch] [--interval 2s] [--session <id>] [--max-ticks <n>] [-- <команда>]"},
 	{Name: "gates", Summary: "Передать аргументы бинарнику beacon-gates", Usage: "beacon gates [gate] [flags]"},
