@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -20,6 +19,7 @@ import (
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"github.com/refusedguy/beacon/internal/infra/hookrun"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
@@ -135,9 +135,7 @@ func (s *Service) RunHooks(event HookEvent, cardID, when string) error {
 	entry := HookLogEntry{Event: string(event), CardID: cardID, Time: when, Hooks: []string{}}
 	for _, name := range names {
 		entry.Hooks = append(entry.Hooks, name)
-		cmd := exec.Command(filepath.Join(dir, name))
-		cmd.Stdin = strings.NewReader(string(body))
-		out, runErr := cmd.CombinedOutput()
+		out, runErr := hookrun.Run(filepath.Join(dir, name), string(body))
 		if runErr == nil {
 			continue
 		}
