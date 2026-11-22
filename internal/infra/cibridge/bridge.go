@@ -185,6 +185,77 @@ type CardLinks interface {
 	CloseMerged(ctx context.Context, watchID string, pr int, at time.Time) error
 }
 
+// CardUnlockSource reports which cards became ready after a card was closed.
+// It is an optional refinement of CardLinks. A close adapter that also
+// implements it lets the bridge publish one card_unlocked event per released
+// card. A CardLinks without it keeps the close-only path.
+type CardUnlockSource interface {
+	UnlockedByClose(ctx context.Context, watchID string, at time.Time) ([]string, error)
+}
+
+// cardUnlockEvent is the journal event for one card released by a close.
+const cardUnlockEvent = "card_unlocked"
+
+// fieldUnlockedCard names the card released by a card_unlocked event.
+const fieldUnlockedCard = "cardID"
+
+// unlockingCardLinks wraps a CardLinks so a successful close publishes the
+// cards it released. WithCardLinks and New install the wrapper, so
+// verdict_applier keeps calling the same CloseMerged port. A repeated merged
+// observation closes the card again without adding journal entries.
+type unlockingCardLinks struct {
+	CardLinks
+	source CardUnlockSource
+
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+// wrapCardLinks installs the unlock wrapper only when the close adapter can
+// report released cards. Other adapters pass through unchanged.
+func wrapCardLinks(c CardLinks) CardLinks {
+	if c == nil {
+		return nil
+	}
+	source, ok := c.(CardUnlockSource)
+	if !ok || source == nil {
+		return c
+	}
+	return &unlockingCardLinks{CardLinks: c, source: source, seen: make(map[string]bool)}
+}
+
+func (d *unlockingCardLinks) CloseMerged(ctx context.Context, watchID string, pr int, at time.Time) error {
+	if err := d.CardLinks.CloseMerged(ctx, watchID, pr, at); err != nil {
+		return err
+	}
+	d.publishUnlocks(ctx, watchID, pr, at)
+	return nil
+}
+
+func (d *unlockingCardLinks) publishUnlocks(ctx context.Context, watchID string, pr int, at time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.seen[watchID] {
+		return
+	}
+	cards, err := d.source.UnlockedByClose(ctx, watchID, at)
+	if err != nil {
+		observe.ActorError("cibridge-card-unlocks", watchID, err)
+		return
+	}
+	d.seen[watchID] = true
+	for _, cardID := range cards {
+		if strings.TrimSpace(cardID) == "" {
+			continue
+		}
+		observe.Event(observe.LevelInfo, cardUnlockEvent, observe.Fields{
+			observe.FieldWatchID: watchID,
+			observe.FieldPR:      pr,
+			fieldUnlockedCard:    cardID,
+		})
+	}
+}
+
 // WorktreeGC removes worktrees that are clean, unlocked and no longer backed
 // by a live Watch. It is a narrow control-plane port declared here so cibridge
 // does not import the worktree adapter (ADR 0005). The composition root binds
@@ -676,12 +747,13 @@ func (b *Bridge) WithBlockerControl(c blockerControl) *Bridge {
 }
 
 // WithCardLinks binds the card-closing port. Without one a merged Watch still
-// closes and resolves blockers, but no task card is marked done.
+// closes and resolves blockers, but no task card is marked done. An adapter
+// that also implements CardUnlockSource publishes the cards it released.
 func (b *Bridge) WithCardLinks(c CardLinks) *Bridge {
 	if b == nil {
 		return nil
 	}
-	b.cardLinks = c
+	b.cardLinks = wrapCardLinks(c)
 	return b
 }
 
@@ -735,7 +807,7 @@ func New(store stateStore, ci domain.CIProvider, clock domain.Clock, interval ti
 		b.control = c
 	}
 	if c, ok := store.(CardLinks); ok {
-		b.cardLinks = c
+		b.cardLinks = wrapCardLinks(c)
 	}
 	return b
 }
