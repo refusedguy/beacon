@@ -105,3 +105,21 @@ _Avoid_: done, finished, closed
 **Wake**:
 Указатель просыпания, который доставляется подписчику при изменении состояния Watch. Несёт только `watchID`, `obligationID`, `revision` и текст инструкции, никогда полный результат проверки.
 _Avoid_: notification, уведомление, prompt
+
+### Экран и оператор
+
+**One Screen**:
+Целевой интерактивный экран Beacon в одном терминале. Объединяет живой снимок, очереди todo и deferred, события, слоты, воркеров, PR и вердикты, блокеры и RSS в одном окне и принимает клавиши оператора. Отличается от статического board: board рендерит фиксированный список карточек через `tui.Run` или `tui.RenderFallback`, а One Screen строится по живому снимку. Источник: `docs/research/audit-03-tui.md:3`.
+_Avoid_: dashboard, статический board, веб-интерфейс
+
+**Live Projection**:
+Живой снимок `/api/v1/snapshot` плюс поток `/api/v1/events`, спроектированные в экран. В коде это `httpapi.ProjectionClient` в `cmd/beacon/watch.go:499` `watchHTTPPort` и `cmd/beacon/watch.go:551` `renderHTTPSnapshot` при `beacon watch --live`. Экран пересобирает вид по смене revision, а не по таймеру. Противоположность статической проекции board по списку карточек.
+_Avoid_: polling, SSE-клиент сам по себе, снимок БД
+
+**Operator Port**:
+Тонкий порт в `cmd/beacon`, через который оператор читает снимок, подписывается на события и отправляет решение. Три метода по `docs/research/audit-03-tui.md:60`: читать снимок, подписываться на события, отправлять решение. Порт удерживает `net/http` и Bubble Tea вне `cmd` и пропускает действия оператора только через verbs сервера. Конкретная Bubble Tea программа остаётся в `internal/tui`.
+_Avoid_: HTTP-клиент в cmd, прямой tui.Run из cmd, hotkey без verbs
+
+**Hotkey**:
+Клавиша экрана, привязанная к одному из verbs `/api/v1/human/decide`. Сервер принимает ровно восемь: `approve`, `reject`, `context`, `rework`, `pause`, `resume`, `unblock`, `cancel` (`internal/infra/httpapi/server.go:989`). Своих verbs у hotkey нет: spawn и kill не входят в контракт, поэтому TUI-10 помечена dropped. Отказ сервера остаётся в строке статуса и не меняет локальное представление.
+_Avoid_: spawn/kill, алиас, локальный verb
