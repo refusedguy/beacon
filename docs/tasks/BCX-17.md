@@ -1,5 +1,5 @@
 # BCX-17. Собрать имена правил гейтов в одном реестре
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: tools/beacon-gates/gate/gate.go, tools/beacon-gates/gate/tool_contract.go, tools/beacon-gates/gate/config/permanent.json, tools/beacon-gates/gate/config/baseline.json
@@ -12,3 +12,8 @@
 Шаги: Собрать все имена в один реестр или добавить проверку уникальности и известности на записи Finding.Rule. Перевести inline-строки и ключи конфигов на реестр. Добавить тест на неизвестное имя правила.
 Проверка: CI зелёный. Тест отвергает неизвестное или повторное имя правила. Конфиги используют только имена из реестра.
 Приёмка: Новое правило гейта нельзя завести опечаткой. Все способа объявления дают один список имён.
+
+Итог: Already landed in PR #1405 (commit 823d852b4569ea208a0257d4b5a2d87a08b67646). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1405 merged 2026-11-22T10:32:13+05:00; commit 823d852b4569ea208a0257d4b5a2d87a08b67646; git merge-base --is-ancestor 823d852b4569ea208a0257d4b5a2d87a08b67646 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1405 823d852b
+Время закрытия: 2026-11-22T11:24:28Z

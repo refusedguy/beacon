@@ -1,5 +1,5 @@
 # BCX-04. Пересобрать ROADMAP_STATUS после исправления merge signal
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: docs/ROADMAP_STATUS.md, tools/roadmap-sync/main.go
@@ -12,3 +12,8 @@
 Шаги: Дождаться исправления merge signal в BCX-01. Запустить roadmap-sync --write. Генерировать дату снимка из git, а не вручную. Сверить приоритеты P0 3, P1 2, P8 50 с расчётом инструмента.
 Проверка: CI зелёный. Повторный dry run roadmap-sync не предлагает изменений. Дата в заголовке совпадает с датой head коммита.
 Приёмка: ROADMAP_STATUS PRINT 569 done, 326 dropped, 0 todo на текущем снимке и не расходится со следующим dry run.
+
+Итог: Already landed in PR #1392 (commit 9b23dbbcb33ed795edd842ccf353c03f90080356). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1392 merged 2026-11-21T23:09:40+05:00; commit 9b23dbbcb33ed795edd842ccf353c03f90080356; git merge-base --is-ancestor 9b23dbbcb33ed795edd842ccf353c03f90080356 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1392 9b23dbbc
+Время закрытия: 2026-11-22T11:24:28Z

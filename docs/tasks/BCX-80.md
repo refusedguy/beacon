@@ -1,5 +1,5 @@
 # BCX-80. Убрать env-переменные, которые production не читает
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: cmd/beacon/checkall_test.go, cmd/beacon/doctor.go, cmd/beacon/mcp.go
@@ -12,3 +12,8 @@
 Шаги: Удалить тестовую переменную или переименовать её так, чтобы она не выглядела как production config. Переместить BEACON_GATES в раздел инструментов разработчика или удалить. Обновить центральную таблицу из BCX-75.
 Проверка: CI зелёный. Поиск по коду не находит env, объявленных только в тестах, без пометки test-only. Таблица env отражает 실제 consumer.
 Приёмка: Каждая переменная в документации имеет реального production-потребителя или помечена test-only.
+
+Итог: Already landed in PR #1347 (commit 6a1c5d5103b90677a515b00674c35a0f79511bd3). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1347 merged 2026-11-22T09:29:09+05:00; commit 6a1c5d5103b90677a515b00674c35a0f79511bd3; git merge-base --is-ancestor 6a1c5d5103b90677a515b00674c35a0f79511bd3 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1347 6a1c5d51
+Время закрытия: 2026-11-22T11:24:28Z

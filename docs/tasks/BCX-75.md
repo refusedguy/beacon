@@ -1,5 +1,5 @@
 # BCX-75. Описать 21 production-переменную в эксплуатационной документации
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: README.md, docs/runbooks/observability.md, docs/runbooks/verification.md
@@ -12,3 +12,8 @@
 Шаги: Создать центральную таблицу env с default, валидацией, consumer и риском. Перенести туда البيانات из cards и research. Добавить проверку, что каждая переменная из.cmd/internal/tools.has запись в таблице или разрешённое исключение.
 Проверка: CI зелёный. Таблица содержит все production-переменные. Проверка не находит неописанных переменных.
 Приёмка: Оператор находит любую рабочую переменную в одном документе.
+
+Итог: Already landed in PR #1340 (commit 8d4ed897c5fa180432579f6dbd4111fd7c41947a). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1340 merged 2026-11-21T22:53:34+05:00; commit 8d4ed897c5fa180432579f6dbd4111fd7c41947a; git merge-base --is-ancestor 8d4ed897c5fa180432579f6dbd4111fd7c41947a origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1340 8d4ed897
+Время закрытия: 2026-11-22T11:24:28Z

@@ -1,5 +1,5 @@
 # BCX-35. Добавить составные индексы под горячие предикаты
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/store/schedules.go, internal/infra/store/receipts.go, internal/infra/store/blockers.go, internal/infra/store/registry_scoped.go, internal/infra/store/db.go
@@ -12,3 +12,8 @@
 Шаги: Добавить индексы (enabled, next_run), (outcome), (status, created_at), (project_key, watch_id), (peer_name, state, created_at), (queue, created_at, id). Проверить планы запросов до и после на тестовом наборе. Учесть стоимость записи в индексы.
 Проверка: CI зелёный. Планы шести запросов используют новые индексы. Тест миграции на непустой базе проходит.
 Приёмка: Ни один из шести предикатов не вызывает полное сканирование растущей таблицы.
+
+Итог: Already landed in PR #1419 (commit 3a08fa9698217a4bf38e6a12c24f487bef97da7d). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1419 merged 2026-11-22T09:09:26+05:00; commit 3a08fa9698217a4bf38e6a12c24f487bef97da7d; git merge-base --is-ancestor 3a08fa9698217a4bf38e6a12c24f487bef97da7d origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1419 3a08fa96
+Время закрытия: 2026-11-22T11:24:28Z
