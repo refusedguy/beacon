@@ -155,14 +155,16 @@ func ensureLogsDir(dir string) (string, error) {
 		return "", fmt.Errorf("observe: пустой каталог логов")
 	}
 	logsDir := filepath.Join(dir, logsDirName)
-	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+	if err := os.MkdirAll(logsDir, 0o700); err != nil {
 		return "", fmt.Errorf("observe: каталог логов: %w", err)
 	}
 	return logsDir, nil
 }
 
-// openFreshLog creates a timestamped file under logsDir. It never changes a
-// symlink: whether a link moves is the caller's decision.
+// openFreshLog creates a timestamped file under logsDir with owner-only mode.
+// Its writer applies Redact, so short commands get the same filter as the
+// server log. It never changes a symlink: whether a link moves is the caller's
+// decision.
 func openFreshLog(logsDir string, now time.Time, pid int) (*RunLog, error) {
 	stamp := now.UTC().Format("20060102T150405.000000000Z")
 	base := fmt.Sprintf("beacon-%s-%d", stamp, pid)
@@ -172,21 +174,22 @@ func openFreshLog(logsDir string, now time.Time, pid int) (*RunLog, error) {
 			name = fmt.Sprintf("%s-%d.log", base, n)
 		}
 		path := filepath.Join(logsDir, name)
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if errors.Is(err, os.ErrExist) {
 			continue
 		}
 		if err != nil {
 			return nil, fmt.Errorf("observe: открыть лог: %w", err)
 		}
-		return &RunLog{Path: path, out: f, close: f.Close}, nil
+		return &RunLog{Path: path, out: &redactingWriter{w: f}, close: f.Close}, nil
 	}
 }
 
 // OpenCLILog opens a fresh log for a short command (task, doctor, logs,
-// inspect, gates). It deliberately leaves beacon.latest.log and
-// beacon.mcp.latest.log alone so a one-shot command cannot hide the log of the
-// long-lived MCP server from an operator following the link.
+// inspect, gates). The file is owner-only and its writer redacts secrets.
+// It deliberately leaves beacon.latest.log and beacon.mcp.latest.log alone so a
+// one-shot command cannot hide the log of the long-lived MCP server from an
+// operator following the link.
 func OpenCLILog(dir string) (*RunLog, error) {
 	logsDir, err := ensureLogsDir(dir)
 	if err != nil {
@@ -210,7 +213,7 @@ func OpenServerLog(dir string) (*RunLog, error) {
 
 	// Create the active file before linking it: both links must resolve even
 	// before the first record is written.
-	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err != nil {
+	if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err != nil {
 		return nil, fmt.Errorf("observe: открыть лог сервера: %w", err)
 	} else {
 		_ = f.Close()
