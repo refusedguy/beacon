@@ -5,6 +5,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -728,4 +729,140 @@ func errorEnvelopeFrom(err error) (ErrorShape, recoveryMeta, bool) {
 func ToErrorShape(err error) (ErrorShape, bool) {
 	base, _, ok := errorEnvelopeFrom(err)
 	return base, ok
+}
+
+// The multi-agent tool model (CCx-22). Codex carries a namespace into a tool
+// description and keeps the encrypted marker on parameters when it substitutes
+// a child tool's schema. Beacon's advertised tools stay flat, so these helpers
+// build descriptions only. Nothing here feeds outputSchemaFactories.
+const (
+	namespaceKeyword = "namespace"
+	encryptedKeyword = "encrypted"
+)
+
+// NamespacedTool is one child tool inside a tool namespace. Schema is the
+// parameter schema of that child tool.
+type NamespacedTool struct {
+	Name   string             `json:"name"`
+	Schema *jsonschema.Schema `json:"schema,omitempty"`
+}
+
+// ToolNamespace groups child tools under a name in a tool description. The
+// namespace is additive metadata: a client that ignores the custom keyword
+// keeps the flat ten-tool contract.
+type ToolNamespace struct {
+	Name  string           `json:"name"`
+	Tools []NamespacedTool `json:"tools,omitempty"`
+}
+
+// setSchemaExtra writes a custom keyword on s without touching validation.
+func setSchemaExtra(s *jsonschema.Schema, key string, value any) {
+	if s == nil {
+		return
+	}
+	if s.Extra == nil {
+		s.Extra = make(map[string]any)
+	}
+	s.Extra[key] = value
+}
+
+// schemaExtra reads a custom keyword from s. A schema that travelled through
+// JSON holds the value as a generic map, so the typed and decoded forms are
+// both accepted.
+func schemaExtra[T any](s *jsonschema.Schema, key string) (T, bool) {
+	var zero T
+	if s == nil || s.Extra == nil {
+		return zero, false
+	}
+	raw, ok := s.Extra[key]
+	if !ok {
+		return zero, false
+	}
+	if typed, ok := raw.(T); ok {
+		return typed, true
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return zero, false
+	}
+	var out T
+	if err := json.Unmarshal(data, &out); err != nil {
+		return zero, false
+	}
+	return out, true
+}
+
+// SetToolNamespace attaches a namespace description to a tool schema. The
+// namespace lives in a custom keyword, so the validation rules and the shape
+// of the advertised tool are unchanged.
+func SetToolNamespace(s *jsonschema.Schema, ns ToolNamespace) {
+	setSchemaExtra(s, namespaceKeyword, ns)
+}
+
+// ToolNamespaceOf returns the namespace attached to a tool schema, if any.
+func ToolNamespaceOf(s *jsonschema.Schema) (ToolNamespace, bool) {
+	return schemaExtra[ToolNamespace](s, namespaceKeyword)
+}
+
+// MarkParameterEncrypted marks one property of s as encrypted. An encrypted
+// argument must reach a spawned agent unchanged (CCx-22). The bool reports
+// whether the named property exists.
+func MarkParameterEncrypted(s *jsonschema.Schema, name string) bool {
+	if s == nil || s.Properties == nil || s.Properties[name] == nil {
+		return false
+	}
+	setSchemaExtra(s.Properties[name], encryptedKeyword, true)
+	return true
+}
+
+// ParameterEncrypted reports whether property name of s carries the encrypted
+// marker.
+func ParameterEncrypted(s *jsonschema.Schema, name string) bool {
+	if s == nil || s.Properties == nil {
+		return false
+	}
+	encrypted, ok := schemaExtra[bool](s.Properties[name], encryptedKeyword)
+	return ok && encrypted
+}
+
+// cloneToolSchema copies a schema through its JSON form. The library restores
+// custom keywords into Extra during unmarshal; PropertyOrder needs an explicit
+// copy because it is not part of the JSON form.
+func cloneToolSchema(s *jsonschema.Schema) (*jsonschema.Schema, error) {
+	if s == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		return nil, err
+	}
+	var out jsonschema.Schema
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	out.PropertyOrder = append([]string(nil), s.PropertyOrder...)
+	return &out, nil
+}
+
+// SubstituteToolSchema returns a copy of override that inherits the namespace
+// and the encrypted parameter markers of base. Parameters introduced only by
+// override keep their own markers. Without the copy, an encrypted argument is
+// substituted as a plain one and never reaches the spawned agent (CCx-22).
+func SubstituteToolSchema(base, override *jsonschema.Schema) (*jsonschema.Schema, error) {
+	out, err := cloneToolSchema(override)
+	if err != nil || out == nil {
+		return out, err
+	}
+	if ns, ok := ToolNamespaceOf(base); ok {
+		SetToolNamespace(out, ns)
+	}
+	for name, prop := range out.Properties {
+		if prop == nil || base == nil || base.Properties[name] == nil {
+			continue
+		}
+		if encrypted, ok := schemaExtra[bool](base.Properties[name], encryptedKeyword); ok && encrypted {
+			setSchemaExtra(prop, encryptedKeyword, true)
+		}
+	}
+	return out, nil
 }
