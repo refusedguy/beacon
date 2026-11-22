@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -19,13 +20,15 @@ func mockServeGC(t *testing.T) (*bytes.Buffer, *bytes.Buffer, *[]int, *int) {
 	oldState, oldClear, oldKill := gcServeState, gcServeClear, gcServeKill
 	oldAlive, oldRead, oldWrite := gcProcessAlive, gcReadState, gcWriteState
 	oldObligations := gcObligationsForGC
-	oldSessions, oldDelete := gcSessionsForGC, gcSessionDelete
+	oldSessions, oldDelete, oldClose := gcSessionsForGC, gcSessionDelete, gcSessionClose
+	oldStale, oldTree := gcStaleSessions, gcOpenCodeSessions
 	t.Cleanup(func() {
 		gcServeList, gcServicePID, gcServiceCfg = oldList, oldPID, oldCfg
 		gcServeState, gcServeClear, gcServeKill = oldState, oldClear, oldKill
 		gcProcessAlive, gcReadState, gcWriteState = oldAlive, oldRead, oldWrite
 		gcObligationsForGC = oldObligations
-		gcSessionsForGC, gcSessionDelete = oldSessions, oldDelete
+		gcSessionsForGC, gcSessionDelete, gcSessionClose = oldSessions, oldDelete, oldClose
+		gcStaleSessions, gcOpenCodeSessions = oldStale, oldTree
 	})
 
 	// Obligations and session candidates need the state store; the serve
@@ -307,6 +310,8 @@ func TestGCSessionsCollectorUsesRetentionWindowAndEnv(t *testing.T) {
 	makeInspectStore = func(*CLI) (inspectStore, func() error, error) {
 		return f, func() error { return nil }, nil
 	}
+	gcStaleSessions = func(int) ([]session.Session, error) { return nil, nil }
+	gcOpenCodeSessions = func(context.Context) ([]opencode.Session, error) { return nil, nil }
 
 	got, err := gcSessionsForGC(&CLI{})
 	if err != nil {
@@ -382,5 +387,149 @@ func TestGCSessionsDeleteFailureFailsSweep(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "удаление сессии ses_closed") {
 		t.Fatalf("stderr = %q", errOut.String())
+	}
+}
+
+// mockStaleSessionGC records both the OpenCode delete and the registry close
+// so the tests can assert their order and that a failed delete leaves the row
+// open.
+func mockStaleSessionGC(t *testing.T, candidates ...gcSessionCandidate) (*bytes.Buffer, *bytes.Buffer, *[]string, *[]string) {
+	t.Helper()
+	out, errOut, _, _ := mockServeGC(t)
+	oldSessions, oldDelete, oldClose := gcSessionsForGC, gcSessionDelete, gcSessionClose
+	t.Cleanup(func() { gcSessionsForGC, gcSessionDelete, gcSessionClose = oldSessions, oldDelete, oldClose })
+	gcSessionsForGC = func(*CLI) ([]gcSessionCandidate, error) { return candidates, nil }
+	deletes := make([]string, 0, len(candidates))
+	closes := make([]string, 0, len(candidates))
+	gcSessionDelete = func(_ context.Context, id string) error {
+		deletes = append(deletes, id)
+		return nil
+	}
+	gcSessionClose = func(id string) error {
+		closes = append(closes, id)
+		return nil
+	}
+	return out, errOut, &deletes, &closes
+}
+
+// TestGCSessionsStaleDryRunReportsReason checks that a stale row is planned
+// with the stale_session reason and that a dry run never deletes or closes.
+func TestGCSessionsStaleDryRunReportsReason(t *testing.T) {
+	out, errOut, deletes, closes := mockStaleSessionGC(t, gcSessionCandidate{SessionID: "ses_stale", Stale: true})
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--format", "json"}); code != 0 {
+		t.Fatalf("dry run code = %d, stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "stale_session") || !strings.Contains(got, "ses_stale") {
+		t.Fatalf("dry run out = %q", got)
+	}
+	if len(*deletes) != 0 || len(*closes) != 0 {
+		t.Fatalf("dry run deletes = %v closes = %v", *deletes, *closes)
+	}
+}
+
+// TestGCStalePlanSkipsLiveSubscriber checks that a stale row belonging to a
+// live subscriber is never a candidate.
+func TestGCStalePlanSkipsLiveSubscriber(t *testing.T) {
+	live := []domain.Watch{gcWatchWithSubscribers("w1", "ses_live")}
+	stale := []session.Session{{ID: "ses_live"}, {ID: "ses_dead"}}
+	plan := gcStaleSessionPlan(stale, live, "", nil)
+	if len(plan) != 1 || plan[0].SessionID != "ses_dead" || !plan[0].Stale {
+		t.Fatalf("plan = %+v, want only ses_dead as stale", plan)
+	}
+}
+
+// TestGCStalePlanSkipsAncestorOfLiveSubscriber checks the session tree rule:
+// OpenCode DELETE removes children, so an ancestor of a live subscriber must
+// stay out of the plan even when its own registry row went stale.
+func TestGCStalePlanSkipsAncestorOfLiveSubscriber(t *testing.T) {
+	live := []domain.Watch{gcWatchWithSubscribers("w1", "ses_child")}
+	tree := []opencode.Session{
+		{ID: "ses_grand"},
+		{ID: "ses_parent", ParentID: "ses_grand"},
+		{ID: "ses_child", ParentID: "ses_parent"},
+	}
+	stale := []session.Session{{ID: "ses_grand"}, {ID: "ses_parent"}, {ID: "ses_other"}}
+	plan := gcStaleSessionPlan(stale, live, "", tree)
+	if len(plan) != 1 || plan[0].SessionID != "ses_other" {
+		t.Fatalf("plan = %+v, want only ses_other", plan)
+	}
+}
+
+// TestGCSessionsStaleDeleteFailureLeavesRowOpen checks that a rejected DELETE
+// never reaches the registry close.
+func TestGCSessionsStaleDeleteFailureLeavesRowOpen(t *testing.T) {
+	out, errOut, deletes, closes := mockStaleSessionGC(t, gcSessionCandidate{SessionID: "ses_stale", Stale: true})
+	gcSessionDelete = func(context.Context, string) error { return errors.New("403") }
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--apply"}); code != 2 {
+		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	}
+	if len(*deletes) != 1 || len(*closes) != 0 {
+		t.Fatalf("deletes = %v closes = %v, want delete only and no close", *deletes, *closes)
+	}
+}
+
+// TestGCSessionsStaleApplyClosesAfterDelete checks the apply order: the
+// registry row closes only after a successful OpenCode delete.
+func TestGCSessionsStaleApplyClosesAfterDelete(t *testing.T) {
+	out, errOut, deletes, closes := mockStaleSessionGC(t, gcSessionCandidate{SessionID: "ses_stale", Stale: true})
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--format", "json", "--apply"}); code != 0 {
+		t.Fatalf("apply code = %d, stderr = %s", code, errOut.String())
+	}
+	if len(*deletes) != 1 || (*deletes)[0] != "ses_stale" || len(*closes) != 1 || (*closes)[0] != "ses_stale" {
+		t.Fatalf("deletes = %v closes = %v, want ses_stale in both", *deletes, *closes)
+	}
+	if !strings.Contains(out.String(), "stale_session") {
+		t.Fatalf("apply out = %q", out.String())
+	}
+}
+
+// TestGCSessionsForGCDedupesSources checks that an id found both in a closed
+// Watch and in the stale registry is deleted once, and keeps the Watch id so
+// the dry-run report stays accurate.
+func TestGCSessionsForGCDedupesSources(t *testing.T) {
+	oldNow, oldFactory := gcNow, makeInspectStore
+	oldStale, oldTree := gcStaleSessions, gcOpenCodeSessions
+	t.Cleanup(func() {
+		gcNow, makeInspectStore, gcStaleSessions, gcOpenCodeSessions = oldNow, oldFactory, oldStale, oldTree
+	})
+	fixed := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	gcNow = func() time.Time { return fixed }
+	t.Setenv(sessionIDEnv, "ses_current")
+	f := &fakeGCSessionStore{
+		closed: []domain.Watch{gcWatchWithSubscribers("w1", "ses_dup")},
+	}
+	makeInspectStore = func(*CLI) (inspectStore, func() error, error) {
+		return f, func() error { return nil }, nil
+	}
+	gcStaleSessions = func(int) ([]session.Session, error) {
+		return []session.Session{{ID: "ses_dup"}, {ID: "ses_only_stale"}}, nil
+	}
+	gcOpenCodeSessions = func(context.Context) ([]opencode.Session, error) { return nil, nil }
+
+	got, err := gcSessionsForGC(&CLI{})
+	if err != nil {
+		t.Fatalf("gcSessionsForGC: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("candidates = %+v, want 2 unique ids", got)
+	}
+	seen := map[string]bool{}
+	for _, c := range got {
+		if seen[c.SessionID] {
+			t.Fatalf("candidates = %+v, duplicate id %s", got, c.SessionID)
+		}
+		seen[c.SessionID] = true
+	}
+	if !seen["ses_dup"] || !seen["ses_only_stale"] {
+		t.Fatalf("candidates = %+v, want ses_dup and ses_only_stale", got)
+	}
+	for _, c := range got {
+		if c.SessionID == "ses_dup" && (!c.Stale || c.WatchID != "w1") {
+			t.Fatalf("candidate %+v, want merged stale row with WatchID w1", c)
+		}
 	}
 }
