@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -145,19 +146,43 @@ type Config struct {
 	SpanSink SpanSink
 }
 
+// WarnConfig reports an environment value that the reader replaced with a
+// default. The standard logger reaches stderr before the composition root
+// installs the log writer, then reaches the same rotating log as the other
+// legacy log.Printf calls. The operator sees the variable name and the value
+// that was ignored.
+func WarnConfig(env, value, reason string) {
+	msg := fmt.Sprintf("beacon: неверный %s=%q", env, value)
+	if reason != "" {
+		msg += ": " + reason
+	}
+	log.Print(msg)
+}
+
 // ConfigFromEnv reads the Beacon flag, the exporter name and the standard OTLP
 // environment variables. The flag is strict so an accidental "1" cannot enable
-// tracing. An empty protocol means http/protobuf.
+// tracing. An empty protocol means http/protobuf. An unsupported exporter or
+// protocol produces a warning and keeps the local sink.
 func ConfigFromEnv() Config {
 	endpoint := strings.TrimSpace(os.Getenv(OTLPEndpointEnv))
 	if direct := strings.TrimSpace(os.Getenv(TracesEndpointEnv)); direct != "" {
 		endpoint = direct
 	}
+	exporter := strings.TrimSpace(os.Getenv(ExporterEnv))
+	if exporter != "" && !strings.EqualFold(exporter, "otlp") {
+		WarnConfig(ExporterEnv, exporter, "поддерживается только otlp, используется локальный sink")
+	}
+	protocolRaw := strings.TrimSpace(os.Getenv(OTLPProtocolEnv))
+	switch strings.ToLower(protocolRaw) {
+	case "", "http/protobuf", "http/json", "json", ProtocolGRPC:
+	default:
+		WarnConfig(OTLPProtocolEnv, protocolRaw, "неизвестный протокол, используется "+ProtocolHTTPProtobuf)
+	}
 	return Config{
 		Enabled:  strings.EqualFold(strings.TrimSpace(os.Getenv(EnabledEnv)), "true"),
-		Exporter: strings.TrimSpace(os.Getenv(ExporterEnv)),
+		Exporter: exporter,
 		Endpoint: endpoint,
-		Protocol: normalizeProtocol(os.Getenv(OTLPProtocolEnv)),
+		Protocol: normalizeProtocol(protocolRaw),
 	}
 }
 
