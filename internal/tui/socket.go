@@ -38,6 +38,8 @@ var (
 // Command is one verb an agent may send through the control socket.
 type Command string
 
+// Lifecycle commands drive the Beacon watch and obligation lifecycle. The
+// composition root handles them, not the human-decide route.
 const (
 	CmdAck     Command = "ack"
 	CmdCancel  Command = "cancel"
@@ -45,9 +47,35 @@ const (
 	CmdRelease Command = "release"
 )
 
+// Decision commands mirror the verbs the human-decide route accepts in
+// internal/infra/httpapi/server.go. They let an agent send the same decision
+// an operator sends with a hotkey. Only the wire vocabulary lives here. The
+// key mapping and the receipt display stay in the interactive app, so the
+// agent channel never depends on operator hotkeys. CmdCancel above is the
+// cancel verb of this set as well.
+const (
+	CmdApprove Command = "approve"
+	CmdReject  Command = "reject"
+	CmdContext Command = "context"
+	CmdRework  Command = "rework"
+	CmdPause   Command = "pause"
+	CmdResume  Command = "resume"
+	CmdUnblock Command = "unblock"
+)
+
+// DecisionCommands lists the eight human-decide verbs in the order the
+// server declares them. Callers can use it for help text and validation
+// without restating the strings.
+var DecisionCommands = []Command{
+	CmdApprove, CmdReject, CmdContext, CmdRework,
+	CmdPause, CmdResume, CmdUnblock, CmdCancel,
+}
+
 func validCommand(c Command) bool {
 	switch c {
-	case CmdAck, CmdCancel, CmdClaim, CmdRelease:
+	case CmdAck, CmdCancel, CmdClaim, CmdRelease,
+		CmdApprove, CmdReject, CmdContext, CmdRework,
+		CmdPause, CmdResume, CmdUnblock:
 		return true
 	}
 	return false
