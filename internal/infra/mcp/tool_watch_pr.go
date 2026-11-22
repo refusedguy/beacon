@@ -741,18 +741,28 @@ type liveWatchSource interface {
 	LiveWatches() ([]domain.Watch, error)
 }
 
-// closeSuperseded closes every live Watch on (repo, pr) whose head differs
-// from headSHA and returns the subscribers to carry to the successor. A blocked
-// Watch counts as live: a force-push must close it instead of leaving the block
-// behind. It reuses the domain state machine so closeReason and ClosedAt follow
-// T1.2.
+// unclosedWatchSource is the optional store port that returns every Watch that
+// is not closed, including needs_input and parked. closeSuperseded uses it so
+// a force-push also closes a Watch waiting for a human. A store without it
+// falls back to the narrower live or active set.
+type unclosedWatchSource interface {
+	UnclosedWatches() ([]domain.Watch, error)
+}
+
+// closeSuperseded closes every unclosed Watch on (repo, pr) whose head differs
+// from headSHA and returns the subscribers to carry to the successor. A blocked,
+// needs_input or parked Watch counts as live: a force-push must close it instead
+// of leaving a second Watch on the same alias. It reuses the domain state machine
+// so closeReason and ClosedAt follow T1.2.
 func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, now time.Time) ([]domain.Subscriber, error) {
 	if h.store == nil {
 		return nil, domain.NewAppError(domain.CodePersistFailed, "watch_pr: store is nil")
 	}
 	var watches []domain.Watch
 	var err error
-	if src, ok := h.store.(liveWatchSource); ok {
+	if src, ok := h.store.(unclosedWatchSource); ok {
+		watches, err = src.UnclosedWatches()
+	} else if src, ok := h.store.(liveWatchSource); ok {
 		watches, err = src.LiveWatches()
 	} else {
 		watches, err = h.store.ActiveWatches()
