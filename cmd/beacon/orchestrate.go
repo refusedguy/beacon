@@ -244,7 +244,7 @@ func defaultOrchestratorDeps(c *CLI) (orchestratorDeps, func() error, error) {
 
 // runOrchestrate implements `beacon orchestrate [--dry-run] [--format table|json]`.
 // It makes one pass over live Watches, prints the actions and returns the
-// PRs that need a rebase in the NeedsRebase field of the report.
+// rebase refs that need a subscriber wake in the NeedsRebase field of the report.
 func runOrchestrate(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("orchestrate", flag.ContinueOnError)
 	dryRun := fs.Bool("dry-run", false, "печатать действия без вызова gh и мержа")
@@ -297,8 +297,8 @@ func renderOrchestratorTable(w io.Writer, result orchestrator.Result) {
 	fmt.Fprintf(w, "MERGED: %d\n", len(result.Merged))
 	fmt.Fprintf(w, "SKIPPED: %d\n", len(result.Skipped))
 	fmt.Fprintf(w, "NEEDS REBASE: %d\n", len(result.NeedsRebase))
-	for _, pr := range result.NeedsRebase {
-		fmt.Fprintf(w, "REBASE pr=%d\n", pr)
+	for _, reb := range result.NeedsRebase {
+		fmt.Fprintf(w, "REBASE watch=%s pr=%d revision=%d\n", reb.WatchID, reb.PR, reb.Revision)
 	}
 }
 

@@ -773,16 +773,25 @@ func ApprovalActions(w Watch, narrow []string) (first, retry ApprovalAction) {
 	return first, retry
 }
 
-// Result is the outcome of one orchestrate pass. NeedsRebase lists the PRs of
-// retry/fail Watches left for their subscribers; Waiting lists PRs held by an
-// unsatisfied dependency.
+// RebaseRef addresses one rebase left for a subscriber. It carries the Watch
+// and revision so a consumer can call beacon_get_result for that exact rebase
+// and read its nextAction, instead of guessing from the PR number alone.
+type RebaseRef struct {
+	WatchID  string `json:"watchID"`
+	Revision uint64 `json:"revision"`
+	PR       int    `json:"pr"`
+}
+
+// Result is the outcome of one orchestrate pass. NeedsRebase lists the rebase
+// refs of retry/fail Watches left for their subscribers; Waiting lists PRs
+// held by an unsatisfied dependency.
 type Result struct {
-	DryRun      bool     `json:"dryRun"`
-	Merged      []int    `json:"merged"`
-	Skipped     []int    `json:"skipped,omitempty"`
-	Waiting     []int    `json:"waiting"`
-	NeedsRebase []int    `json:"needsRebase"`
-	Actions     []Action `json:"actions"`
+	DryRun      bool        `json:"dryRun"`
+	Merged      []int       `json:"merged"`
+	Skipped     []int       `json:"skipped,omitempty"`
+	Waiting     []int       `json:"waiting"`
+	NeedsRebase []RebaseRef `json:"needsRebase"`
+	Actions     []Action    `json:"actions"`
 	// Approvals carries the approval requests emitted on this pass. A retry
 	// Watch yields an escalated-retry approval whose Extra list is empty.
 	Approvals []ApprovalAction `json:"approvals,omitempty"`
@@ -865,7 +874,7 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 		DryRun:      opts.DryRun,
 		Merged:      []int{},
 		Waiting:     []int{},
-		NeedsRebase: []int{},
+		NeedsRebase: []RebaseRef{},
 		Actions:     []Action{},
 		Approvals:   []ApprovalAction{},
 	}
@@ -931,7 +940,11 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 				})
 			}
 		case needsWake(w.Verdict):
-			out.NeedsRebase = append(out.NeedsRebase, w.PR)
+			out.NeedsRebase = append(out.NeedsRebase, RebaseRef{
+				WatchID:  w.ID,
+				Revision: w.Revision,
+				PR:       w.PR,
+			})
 			out.Actions = append(out.Actions, Action{
 				Action:   ActionNeedsRebase,
 				WatchID:  w.ID,
