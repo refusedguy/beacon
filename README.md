@@ -90,6 +90,27 @@ flowchart LR
 
 В режиме Code Mode инструменты доступны как `tools.beacon.<name>` после `search({ query: "beacon", namespace: "beacon" })`.
 
+## Таблица соответствий адаптеров
+
+Beacon использует адаптер opencode. Другие harness дают те же шаги под другими именами. Агент читает таблицу один раз за сессию и сопоставляет каждый шаг с тем, что доступно в адаптере.
+
+| шаг | доступен | замена |
+| --- | --- | --- |
+| Выдача задачи через `beacon_task_claim` | да | тот же вызов MCP |
+| Инструменты через Code Mode | да | `tools.beacon.<name>` после `search({ query: "beacon", namespace: "beacon" })` |
+| Просмотр карточек в TUI | да | `beacon board`, а без TUI табличный вывод на `tabwriter` |
+| Проверка состояния PR в цикле | нет | Watch и `waiting, <watchID>`, вердикт из `beacon_get_result` |
+| Встроенный PR-инструмент | нет | `gh pr create` и `gh pr view` в своей ветке |
+| Cloud agents и automations | нет | локальный цикл сабагента по Watch |
+
+Для шага, которого нет в адаптере, агент пишет одну строку и продолжает работу.
+
+`Skipped in <adapter>: <step>. <reason>.`
+
+Формат приходит из `pstack/docs/harness/claude-code.md:59-61`. Там строка выглядит как `Skipped in Claude Code: <step>. <reason>.`. В beacon имя адаптера меняется на `opencode`. Пример: `Skipped in opencode: cloud agents. No cloud runner in this harness.`
+
+После строки пропуска агент переходит к следующему шагу. Он не останавливается, не задаёт вопрос владельцу и не повторяет попытку. Причина пропуска записана в той же строке, отдельный отчёт не нужен.
+
 ## Цикл сабагента
 
 ```mermaid
