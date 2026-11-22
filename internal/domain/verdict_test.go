@@ -1130,20 +1130,20 @@ func TestEvaluateExternalDecisionTable(t *testing.T) {
 			},
 		},
 		{
-			name:     "one failing exit fails the whole gate",
+			name:     "one failing exit gives a partial gate",
 			declared: []string{"build", "audit"},
 			observed: []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "audit", ExitCode: 2}},
-			want:     ExternalFail,
+			want:     ExternalPartial,
 			checks: []CheckOutcome{
 				{Name: "build", ExitCode: 0, Observed: true, Passed: true},
 				{Name: "audit", ExitCode: 2, Observed: true, Passed: false},
 			},
 		},
 		{
-			name:     "missing observation fails and stays visible",
+			name:     "missing observation stays visible as a partial gate",
 			declared: []string{"build", "audit"},
 			observed: []ExternalCheck{{Name: "build", ExitCode: 0}},
-			want:     ExternalFail,
+			want:     ExternalPartial,
 			checks: []CheckOutcome{
 				{Name: "build", ExitCode: 0, Observed: true, Passed: true},
 				{Name: "audit", ExitCode: 0, Observed: false, Passed: false},
@@ -1208,6 +1208,74 @@ func TestEvaluateExternalDecisionTable(t *testing.T) {
 	}
 }
 
+// TestEvaluateExternalPartialProgress pins the SB-08 contract: a run where
+// part of the declared panel passed reports PARTIAL with the exact fraction,
+// an all-failed panel reports FAIL with 0/N, and an empty panel fails closed.
+// The name of a failing check stays in the evidence either way.
+func TestEvaluateExternalPartialProgress(t *testing.T) {
+	tests := []struct {
+		name       string
+		declared   []string
+		observed   []ExternalCheck
+		want       ExternalVerdict
+		progress   CheckProgress
+		failedInEv string
+	}{
+		{
+			name:     "two of three checks pass",
+			declared: []string{"a", "b", "c"},
+			observed: []ExternalCheck{
+				{Name: "a", ExitCode: 0},
+				{Name: "b", ExitCode: 0},
+				{Name: "c", ExitCode: 1},
+			},
+			want:       ExternalPartial,
+			progress:   CheckProgress{Passed: 2, Total: 3},
+			failedInEv: "c",
+		},
+		{
+			name:     "all three checks fail",
+			declared: []string{"a", "b", "c"},
+			observed: []ExternalCheck{
+				{Name: "a", ExitCode: 1},
+				{Name: "b", ExitCode: 1},
+				{Name: "c", ExitCode: 1},
+			},
+			want:     ExternalFail,
+			progress: CheckProgress{Passed: 0, Total: 3},
+		},
+		{
+			name:     "empty declaration fails closed",
+			declared: nil,
+			observed: nil,
+			want:     ExternalFail,
+			progress: CheckProgress{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EvaluateExternal(tt.declared, tt.observed)
+			if got.Verdict != tt.want {
+				t.Errorf("verdict = %q, want %q", got.Verdict, tt.want)
+			}
+			if got.Progress != tt.progress {
+				t.Errorf("progress = %+v, want %+v", got.Progress, tt.progress)
+			}
+			if tt.failedInEv != "" {
+				visible := false
+				for _, outcome := range got.Checks {
+					if outcome.Name == tt.failedInEv && !outcome.Passed {
+						visible = true
+					}
+				}
+				if !visible {
+					t.Errorf("failed check %q missing from evidence: %+v", tt.failedInEv, got.Checks)
+				}
+			}
+		})
+	}
+}
+
 // The evidence is the record an adapter writes to disk. Its JSON shape pins
 // the contract: the verdict plus the exit code of every declared check, with
 // a missing run recorded as observed=false so it cannot look like a pass.
@@ -1223,7 +1291,7 @@ func TestExternalEvidenceJSON(t *testing.T) {
 				[]string{"build", "audit"},
 				[]ExternalCheck{{Name: "audit", ExitCode: 0}, {Name: "build", ExitCode: 0}},
 			),
-			want: `{"verdict":"PASS","checks":[{"name":"build","exit_code":0,"observed":true,"passed":true},{"name":"audit","exit_code":0,"observed":true,"passed":true}]}`,
+			want: `{"verdict":"PASS","progress":{"passed":2,"total":2},"checks":[{"name":"build","exit_code":0,"observed":true,"passed":true},{"name":"audit","exit_code":0,"observed":true,"passed":true}]}`,
 		},
 		{
 			name: "fail records the failing exit code and the missing check",
@@ -1231,12 +1299,12 @@ func TestExternalEvidenceJSON(t *testing.T) {
 				[]string{"build", "audit"},
 				[]ExternalCheck{{Name: "build", ExitCode: 7}},
 			),
-			want: `{"verdict":"FAIL","checks":[{"name":"build","exit_code":7,"observed":true,"passed":false},{"name":"audit","exit_code":0,"observed":false,"passed":false}]}`,
+			want: `{"verdict":"FAIL","progress":{"passed":0,"total":2},"checks":[{"name":"build","exit_code":7,"observed":true,"passed":false},{"name":"audit","exit_code":0,"observed":false,"passed":false}]}`,
 		},
 		{
 			name: "empty panel serializes checks as an empty array",
 			in:   EvaluateExternal(nil, nil),
-			want: `{"verdict":"FAIL","checks":[]}`,
+			want: `{"verdict":"FAIL","progress":{"passed":0,"total":0},"checks":[]}`,
 		},
 	}
 	for _, tc := range cases {
@@ -1302,8 +1370,8 @@ func TestEvaluateExternalDependsOnlyOnExternalFacts(t *testing.T) {
 		"CompletionResult": reflect.TypeOf(CompletionResult{}),
 	}
 	evidenceType := reflect.TypeOf(ExternalEvidence{})
-	if evidenceType.NumField() != 2 {
-		t.Fatalf("ExternalEvidence has %d fields, want 2", evidenceType.NumField())
+	if evidenceType.NumField() != 3 {
+		t.Fatalf("ExternalEvidence has %d fields, want 3", evidenceType.NumField())
 	}
 	for i := 0; i < evidenceType.NumField(); i++ {
 		field := evidenceType.Field(i)
@@ -1338,8 +1406,8 @@ func TestEvaluateExternalIgnoresAgentReportedState(t *testing.T) {
 // The canonical journal strings are pinned. Changing one breaks a recorded
 // external verdict on disk.
 func TestExternalCanonicalStrings(t *testing.T) {
-	if string(ExternalPass) != "PASS" || string(ExternalFail) != "FAIL" {
-		t.Fatalf("verdict strings = %q, %q", ExternalPass, ExternalFail)
+	if string(ExternalPass) != "PASS" || string(ExternalPartial) != "PARTIAL" || string(ExternalFail) != "FAIL" {
+		t.Fatalf("verdict strings = %q, %q, %q", ExternalPass, ExternalPartial, ExternalFail)
 	}
 }
 
