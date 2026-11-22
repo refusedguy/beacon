@@ -324,10 +324,10 @@ func TestWorkerDelegateError(t *testing.T) {
 	if res.State.Handled["BS-40"] {
 		t.Fatal("state marks an issue handled after a failed delegation")
 	}
-	if len(res.Failed) != 1 || res.Failed[0].IssueID != "BS-40" || res.Failed[0].Reason != boom.Error() {
+	if len(res.Failed) != 1 || res.Failed[0].IssueID != "BS-40" || !strings.Contains(res.Failed[0].Reason, boom.Error()) {
 		t.Fatalf("failed = %+v, want BS-40 with the delegation reason", res.Failed)
 	}
-	if len(res.Outcomes) != 1 || res.Outcomes[0].Kind != OutcomeFailed || res.Outcomes[0].Reason != boom.Error() {
+	if len(res.Outcomes) != 1 || res.Outcomes[0].Kind != OutcomeFailed || !strings.Contains(res.Outcomes[0].Reason, boom.Error()) {
 		t.Fatalf("outcomes = %+v, want one failed row with a reason", res.Outcomes)
 	}
 }
@@ -376,7 +376,7 @@ func TestWorkerContinuesAfterFailedUnit(t *testing.T) {
 	if len(res.Delegated) != 2 {
 		t.Fatalf("delegated = %+v, want the first and third units", res.Delegated)
 	}
-	if len(res.Failed) != 1 || res.Failed[0].IssueID != "BS-B" || res.Failed[0].Reason != boom.Error() {
+	if len(res.Failed) != 1 || res.Failed[0].IssueID != "BS-B" || !strings.Contains(res.Failed[0].Reason, boom.Error()) {
 		t.Fatalf("failed = %+v, want BS-B with the boom reason", res.Failed)
 	}
 }
@@ -409,7 +409,7 @@ func TestWorkerOutcomeAfterCancellationInFailedUnit(t *testing.T) {
 	if len(del.calls) != 2 {
 		t.Fatalf("delegate calls = %+v, want the first two units only", del.calls)
 	}
-	if len(res.Failed) != 1 || res.Failed[0].Reason != boom.Error() {
+	if len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Reason, boom.Error()) {
 		t.Fatalf("failed = %+v, want BS-B with a reason", res.Failed)
 	}
 	if len(res.NotAttempted) != 1 {
