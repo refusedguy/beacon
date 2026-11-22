@@ -554,6 +554,28 @@ attempt-journal: docs/perf/README.md, nine-columns, read-before-each-attempt
 decisions-journal: separate, six-columns, unchanged
 executor-task:stop-condition -->
 
+## Причина решения
+
+Когда исполнитель отвечает на вопрос «почему так было решено», он заполняет три поля.
+
+| Поле | Содержание |
+| --- | --- |
+| Ссылка на record | Указатель на коммит, PR или ADR, где автор зафиксировал решение. |
+| Вывод агента | Собственное умозаключение с пометкой «вывод агента». Не подменяет слова автора. |
+| Источник не отвечает | Строка «источник не отвечает», если в record нет ответа. |
+
+Исполнитель не выдаёт свой вывод за цитату. Если источник не отвечает, исполнитель пишет «источник не отвечает» и не добавляет версию от себя. Правило относится к ответам, телам PR и документам. Оно не меняет протокол Watch и число MCP-инструментов. Источник: `pstack/skills/why/SKILL.md:9`, карточка PSKX-20.
+
+<!-- executor-task:decision-reason
+fields: source-reference, agent-inference, source-silent
+inference-label: вывод агента
+silent-label: источник не отвечает
+source-ref: commit, PR, ADR
+scope: answers, pr-body, docs
+protocol-change: none
+source: pstack/skills/why/SKILL.md:9, PSKX-20
+executor-task:decision-reason -->
+
 ## Вердикты и пробуждение
 
 Авто-мерж включён по умолчанию: Beacon сам мержит зелёный PR по `verdict=ready` (ADR 0072). Исполнитель не получает команды мерж и не вызывает `gh pr merge`.
