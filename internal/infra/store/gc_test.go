@@ -153,6 +153,60 @@ func TestGCObligationsKeepsLiveAndRecent(t *testing.T) {
 	}
 }
 
+// TestGCObligationsKeepsLiveRetry checks that retry data protects an obligation
+// whose Watch row is gone and whose StagedAt is old. A future NextRetryAt and a
+// recent attempt must both survive collection; a row with neither is erased.
+func TestGCObligationsKeepsLiveRetry(t *testing.T) {
+	d, now := gcObligationTestDB(t)
+	old := now.Add(-72 * time.Hour)
+
+	live := gcObligationTestObligation("o-live-retry", "gone-watch", old)
+	live.NextRetryAt = now.Add(2 * time.Hour)
+	retried := gcObligationTestObligation("o-recent-retry", "gone-watch-2", old)
+	retried.NextRetryAt = now.Add(-time.Hour)
+	attempted := gcObligationTestObligation("o-recent-attempt", "gone-watch-3", old)
+	attempted.Attempts = []domain.Attempt{{N: 1, At: now.Add(-2 * time.Hour), Channel: "s1", Outcome: domain.OutcomePosted}}
+	stale := gcObligationTestObligation("o-stale", "gone-watch-4", old)
+
+	for _, o := range []domain.Obligation{live, retried, attempted, stale} {
+		if err := d.SaveObligation(o); err != nil {
+			t.Fatalf("SaveObligation(%s): %v", o.ID, err)
+		}
+	}
+
+	plan, err := d.GCObligations(context.Background(), now, ObligationGCRetention, false)
+	if err != nil {
+		t.Fatalf("GCObligations dry run: %v", err)
+	}
+	if got := gcObligationPlanIDs(plan); !equalStrings(got, []string{"o-stale"}) {
+		t.Fatalf("plan = %v, want [o-stale]", got)
+	}
+
+	applied, err := d.GCObligations(context.Background(), now, ObligationGCRetention, true)
+	if err != nil {
+		t.Fatalf("GCObligations apply: %v", err)
+	}
+	if got := gcObligationPlanIDs(applied); !equalStrings(got, []string{"o-stale"}) {
+		t.Fatalf("applied = %v, want [o-stale]", got)
+	}
+	for _, o := range []domain.Obligation{live, retried, attempted} {
+		if _, err := d.Obligation(o.ID); err != nil {
+			t.Errorf("collector removed protected %s: %v", o.ID, err)
+		}
+	}
+	if _, err := d.Obligation(stale.ID); err == nil {
+		t.Error("o-stale still present after apply")
+	}
+
+	again, err := d.GCObligations(context.Background(), now, ObligationGCRetention, false)
+	if err != nil {
+		t.Fatalf("second GCObligations: %v", err)
+	}
+	if len(again) != 0 {
+		t.Fatalf("second pass = %v, want empty", gcObligationPlanIDs(again))
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

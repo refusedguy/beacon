@@ -111,6 +111,11 @@ func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Du
 		if err := json.Unmarshal(payload, &o); err != nil {
 			return nil, fmt.Errorf("store: gc-obligations: decode %s: %w", id, err)
 		}
+		// A scheduled retry keeps the obligation alive even after the retention
+		// window has passed and the Watch row is gone.
+		if !o.NextRetryAt.IsZero() && o.NextRetryAt.After(now) {
+			continue
+		}
 		reason := "closed"
 		if st.archived {
 			reason = "archived"
@@ -150,11 +155,18 @@ func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Du
 
 // obligationLastActivity returns the newest timestamp written on an obligation.
 // It is the fallback reference for an obligation whose Watch row is gone.
+// Retry and delivery-attempt timestamps count as activity, so a recent retry
+// extends the retention window.
 func obligationLastActivity(o domain.Obligation) time.Time {
 	last := o.StagedAt
-	for _, at := range []time.Time{o.DeliveredAt, o.ClaimedAt, o.ReadAt, o.EscalatedAt} {
+	for _, at := range []time.Time{o.DeliveredAt, o.ClaimedAt, o.ReadAt, o.EscalatedAt, o.NextRetryAt} {
 		if at.After(last) {
 			last = at
+		}
+	}
+	for _, a := range o.Attempts {
+		if a.At.After(last) {
+			last = a.At
 		}
 	}
 	return utcOrZero(last)
