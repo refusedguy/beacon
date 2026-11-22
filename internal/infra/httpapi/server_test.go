@@ -839,11 +839,32 @@ func TestAuditRedaction(t *testing.T) {
 	ghp := "ghp_" + strings.Repeat("a", 36)
 	tg := "123456789:" + strings.Repeat("b", 35)
 
-	sink := &stubSink{result: DecisionResult{DecisionID: ghp}}
+	// The sink echoes a token into the command so the audit record carries a
+	// secret in every free-text field.
+	sink := &stubSink{result: DecisionResult{DecisionID: ghp, Command: "approve " + tg}}
 	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
 
+	// A command that carries a token is rejected. The error must not echo it.
 	body := `{"command":"approve ` + tg + `","watchID":"` + tg + `","actor":"` + ghp + `"}`
 	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(body, "http://127.0.0.1:7432"))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("decide status = %d, body %s", w.Code, w.Body.String())
+	}
+	var errBody errorBody
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatal(err)
+	}
+	if errBody.Code != string(domain.CodeInvalidInput) {
+		t.Fatalf("error code = %q, body %s", errBody.Code, w.Body.String())
+	}
+	if !strings.Contains(errBody.Message, "[REDACTED]") || strings.Contains(errBody.Message, tg) {
+		t.Fatalf("token leaked in 400 body: %s", w.Body.String())
+	}
+
+	// A valid decision records one audit entry with the secrets still in it.
+	body = `{"command":"approve","watchID":"` + tg + `","actor":"` + ghp + `"}`
+	w = httptest.NewRecorder()
 	srv.handler().ServeHTTP(w, decideRequest(body, "http://127.0.0.1:7432"))
 	if w.Code != http.StatusOK {
 		t.Fatalf("decide status = %d, body %s", w.Code, w.Body.String())

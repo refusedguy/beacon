@@ -1327,7 +1327,7 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	d.WatchID = strings.TrimSpace(d.WatchID)
 	d.ObligationID = strings.TrimSpace(d.ObligationID)
 	if !validCommands[d.Command] {
-		writeError(w, http.StatusBadRequest, string(domain.CodeInvalidInput), "неизвестная команда "+d.Command)
+		writeError(w, http.StatusBadRequest, string(domain.CodeInvalidInput), "неизвестная команда "+redactAuditField(d.Command))
 		return
 	}
 	if d.WatchID == "" {
