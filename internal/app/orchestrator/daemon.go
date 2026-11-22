@@ -32,7 +32,21 @@ type DaemonDueSchedule struct {
 	ID       string
 	NextRun  time.Time
 	Interval time.Duration
+	// Expr and Timezone carry a cron row's trigger definition. The daemon must
+	// resolve the next fire from the expression, not by adding a fixed period:
+	// a missed daily run stays one run at the next matching wall-clock time.
+	Expr     string
+	Timezone string
 }
+
+// DaemonCronNext resolves a cron row to its next fire time. The composition
+// root supplies the parser from the scheduler service; a nil function keeps
+// interval-only callers working (FTE-16).
+type DaemonCronNext func(expr, timezone string, after time.Time) (time.Time, error)
+
+// DaemonIntent records the outbox intent for one triggered schedule. A nil
+// function keeps older callers unchanged.
+type DaemonIntent func(ctx context.Context, scheduleID string, at time.Time) error
 
 // DaemonUnit is one ordered line of the per-unit report. Status is the outcome
 // kind the night-shift worker recorded. Reason explains a failed unit and
@@ -77,6 +91,8 @@ type DaemonPorts struct {
 	CheckAll    func(ctx context.Context) error
 	Subscribe   func(ctx context.Context) error
 	Schedules   DaemonSchedules
+	CronNext    DaemonCronNext
+	Intent      DaemonIntent
 	Orchestrate func(ctx context.Context, waker Waker) error
 	Summary     func(ctx context.Context) (Workload, error)
 	UnitReport  func(ctx context.Context) ([]DaemonUnit, error)
@@ -131,7 +147,7 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 			}
 		}
 		if ports.Schedules != nil {
-			if err := triggerDueSchedules(passCtx, ports.Schedules, time.Now()); err != nil {
+			if err := triggerDueSchedules(passCtx, ports.Schedules, time.Now(), ports.CronNext, ports.Intent); err != nil {
 				logf("daemon: schedules: %v", err)
 			}
 		}
@@ -206,10 +222,20 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 
 // daemonNextRun moves nextRun forward by whole intervals until it is after
 // now. Missed intervals collapse into one future run, so a daemon that was
-// down for several periods produces one trigger after it comes back. A row
-// with no usable interval is not triggered.
-func daemonNextRun(nextRun time.Time, interval time.Duration, now time.Time) (time.Time, bool) {
-	if nextRun.IsZero() || interval <= 0 {
+// down for several periods produces one trigger after it comes back. A cron
+// row supplies its resolved fire time as cronNext; that single value wins over
+// interval arithmetic. A row with no usable trigger is not triggered.
+func daemonNextRun(nextRun time.Time, interval time.Duration, now time.Time, cronNext ...time.Time) (time.Time, bool) {
+	if nextRun.IsZero() {
+		return time.Time{}, false
+	}
+	if len(cronNext) > 0 && !cronNext[0].IsZero() {
+		if cronNext[0].After(now) {
+			return cronNext[0], true
+		}
+		return time.Time{}, false
+	}
+	if interval <= 0 {
 		return time.Time{}, false
 	}
 	if nextRun.After(now) {
@@ -222,19 +248,39 @@ func daemonNextRun(nextRun time.Time, interval time.Duration, now time.Time) (ti
 // triggerDueSchedules acknowledges every due row once. A failed ListDue or
 // MarkTriggered is returned to the caller, which logs it and keeps the rest of
 // the pass. One bad row does not stop the remaining rows from being marked.
-func triggerDueSchedules(ctx context.Context, port DaemonSchedules, now time.Time) error {
+// A successful mark also records its outbox intent through ports.Intent.
+func triggerDueSchedules(ctx context.Context, port DaemonSchedules, now time.Time, cronNext DaemonCronNext, intent DaemonIntent) error {
 	due, err := port.ListDue(ctx, now)
 	if err != nil {
 		return err
 	}
 	var firstErr error
 	for _, s := range due {
-		next, ok := daemonNextRun(s.NextRun, s.Interval, now)
+		var cronAt time.Time
+		if s.Expr != "" && cronNext != nil {
+			resolved, err := cronNext(s.Expr, s.Timezone, now)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			cronAt = resolved
+		}
+		next, ok := daemonNextRun(s.NextRun, s.Interval, now, cronAt)
 		if !ok {
 			continue
 		}
-		if err := port.MarkTriggered(ctx, s.ID, next); err != nil && firstErr == nil {
-			firstErr = err
+		if err := port.MarkTriggered(ctx, s.ID, next); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if intent != nil {
+			if err := intent(ctx, s.ID, next); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr

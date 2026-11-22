@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -227,7 +228,7 @@ func buildSchedule(in ScheduleCreate) (Schedule, error) {
 	if err := validateExpr(in.Kind, in.Expr); err != nil {
 		return Schedule{}, err
 	}
-	next, err := firstRunAt(in.Kind, in.Expr, time.Now())
+	next, err := firstRunAt(in.Kind, in.Expr, in.Timezone, time.Now())
 	if err != nil {
 		return Schedule{}, err
 	}
@@ -237,11 +238,10 @@ func buildSchedule(in ScheduleCreate) (Schedule, error) {
 	}, nil
 }
 
-// firstRunAt computes the first storage-valid run time for a schedule. The
-// planner that evaluates cron expressions lives in internal/app and is not
-// wired yet (ADR 0314), so cron uses the next minute boundary as a safe first
-// evaluation point and mark is due immediately. Intervals are exact.
-func firstRunAt(kind Kind, expr string, now time.Time) (time.Time, error) {
+// firstRunAt computes the first storage-valid run time for a schedule. A cron
+// expression resolves to its next matching minute in the schedule's timezone
+// (FTE-16, ADR 0314). Intervals are exact and mark is due immediately.
+func firstRunAt(kind Kind, expr, timezone string, now time.Time) (time.Time, error) {
 	switch kind {
 	case KindInterval:
 		d, err := time.ParseDuration(expr)
@@ -250,7 +250,7 @@ func firstRunAt(kind Kind, expr string, now time.Time) (time.Time, error) {
 		}
 		return now.Add(d), nil
 	case KindCron:
-		return now.Truncate(time.Minute).Add(time.Minute), nil
+		return CronNextRun(expr, timezone, now)
 	case KindMark:
 		return now, nil
 	default:
@@ -270,8 +270,8 @@ func validateExpr(kind Kind, expr string) error {
 		}
 		return nil
 	case KindCron:
-		if n := len(strings.Fields(expr)); n != 5 {
-			return invalid("server: cron %q: нужно 5 полей, получено %d", expr, n)
+		if _, err := parseCron(expr); err != nil {
+			return invalid("server: cron %q: %v", expr, err)
 		}
 		return nil
 	case KindMark:
@@ -282,6 +282,200 @@ func validateExpr(kind Kind, expr string) error {
 	default:
 		return invalid("server: неизвестный вид расписания %q", kind)
 	}
+}
+
+// cronSpec is the parsed form of a five-field cron expression. Each field is
+// the set of allowed values; domAny and dowAny record the wildcard form, which
+// matters because POSIX cron ORs the two day fields when both are restricted.
+type cronSpec struct {
+	minute map[int]struct{}
+	hour   map[int]struct{}
+	dom    map[int]struct{}
+	month  map[int]struct{}
+	dow    map[int]struct{}
+	domAny bool
+	dowAny bool
+}
+
+var (
+	cronMonths = map[string]int{
+		"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+		"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+	}
+	cronDays = map[string]int{
+		"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6,
+	}
+)
+
+// parseCronField expands one cron field into its set of allowed values. It
+// accepts a single value, a range, a list, and a step on either a value or a
+// range. Names are accepted for month and day-of-week fields.
+func parseCronField(field string, lo, hi int, names map[string]int) (map[int]struct{}, bool, error) {
+	any := field == "*"
+	out := make(map[int]struct{})
+	for _, item := range strings.Split(field, ",") {
+		if item == "" {
+			return nil, false, errors.New("пустое поле cron")
+		}
+		part, stepText, hasStep := strings.Cut(item, "/")
+		step := 1
+		if hasStep {
+			n, err := strconv.Atoi(stepText)
+			if err != nil || n <= 0 {
+				return nil, false, fmt.Errorf("неверный шаг cron %q", stepText)
+			}
+			step = n
+		}
+		first, last := 0, 0
+		switch {
+		case part == "*":
+			first, last = lo, hi
+		case strings.Contains(part, "-"):
+			low, high, found := strings.Cut(part, "-")
+			if !found {
+				return nil, false, fmt.Errorf("неверный диапазон cron %q", part)
+			}
+			var err error
+			first, err = cronValue(low, lo, hi, names)
+			if err != nil {
+				return nil, false, err
+			}
+			last, err = cronValue(high, lo, hi, names)
+			if err != nil {
+				return nil, false, err
+			}
+			if first > last {
+				return nil, false, fmt.Errorf("диапазон cron %q идёт назад", part)
+			}
+		default:
+			v, err := cronValue(part, lo, hi, names)
+			if err != nil {
+				return nil, false, err
+			}
+			first, last = v, v
+		}
+		for v := first; v <= last; v += step {
+			out[v] = struct{}{}
+		}
+	}
+	return out, any, nil
+}
+
+func cronValue(text string, lo, hi int, names map[string]int) (int, error) {
+	if names != nil {
+		if v, ok := names[strings.ToLower(text)]; ok {
+			return v, nil
+		}
+	}
+	v, err := strconv.Atoi(text)
+	if err != nil || v < lo || v > hi {
+		return 0, fmt.Errorf("неверное значение cron %q", text)
+	}
+	return v, nil
+}
+
+// parseCron parses and validates a five-field cron expression. It is pure and
+// reads no clock, so creation can reject a bad expression before any write.
+func parseCron(expr string) (cronSpec, error) {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return cronSpec{}, fmt.Errorf("нужно 5 полей, получено %d", len(fields))
+	}
+	minute, _, err := parseCronField(fields[0], 0, 59, nil)
+	if err != nil {
+		return cronSpec{}, fmt.Errorf("минуты: %w", err)
+	}
+	hour, _, err := parseCronField(fields[1], 0, 23, nil)
+	if err != nil {
+		return cronSpec{}, fmt.Errorf("часы: %w", err)
+	}
+	dom, domAny, err := parseCronField(fields[2], 1, 31, nil)
+	if err != nil {
+		return cronSpec{}, fmt.Errorf("день месяца: %w", err)
+	}
+	month, _, err := parseCronField(fields[3], 1, 12, cronMonths)
+	if err != nil {
+		return cronSpec{}, fmt.Errorf("месяц: %w", err)
+	}
+	dow, dowAny, err := parseCronField(fields[4], 0, 7, cronDays)
+	if err != nil {
+		return cronSpec{}, fmt.Errorf("день недели: %w", err)
+	}
+	// Some cron dialects use 7 for Sunday. Normalize it to 0 so both spellings
+	// produce the same fire time.
+	if v, ok := dow[7]; ok {
+		delete(dow, 7)
+		dow[0] = v
+	}
+	return cronSpec{
+		minute: minute, hour: hour, dom: dom, month: month, dow: dow,
+		domAny: domAny, dowAny: dowAny,
+	}, nil
+}
+
+// cronDayMatches applies the POSIX day rule. A wildcard day matches anything;
+// when both days are restricted, either one may match.
+func cronDayMatches(spec cronSpec, day time.Time) bool {
+	_, domMatch := spec.dom[day.Day()]
+	_, dowMatch := spec.dow[int(day.Weekday())]
+	switch {
+	case spec.domAny && spec.dowAny:
+		return true
+	case spec.domAny:
+		return dowMatch
+	case spec.dowAny:
+		return domMatch
+	default:
+		return domMatch || dowMatch
+	}
+}
+
+// cronNextAfter walks calendar days in loc and returns the first minute that
+// matches spec strictly after after. Walking by day keeps the search bounded
+// to a few thousand iterations even for a rare expression.
+func cronNextAfter(spec cronSpec, loc *time.Location, after time.Time) time.Time {
+	local := after.In(loc)
+	start := time.Date(local.Year(), local.Month(), local.Day(), local.Hour(), local.Minute(), 0, 0, loc).Add(time.Minute)
+	lastYear := start.Year() + 5
+	for day := start; day.Year() <= lastYear; day = day.AddDate(0, 0, 1) {
+		if _, ok := spec.month[int(day.Month())]; !ok || !cronDayMatches(spec, day) {
+			continue
+		}
+		for hour := 0; hour < 24; hour++ {
+			if _, ok := spec.hour[hour]; !ok {
+				continue
+			}
+			for minute := 0; minute < 60; minute++ {
+				if _, ok := spec.minute[minute]; !ok {
+					continue
+				}
+				candidate := time.Date(day.Year(), day.Month(), day.Day(), hour, minute, 0, 0, loc)
+				if !candidate.Before(start) {
+					return candidate
+				}
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// CronNextRun resolves a five-field cron expression to its next fire time in
+// timezone, strictly after after. The returned time carries that location, so
+// the caller can persist it and hand the same instant to the daemon.
+func CronNextRun(expr, timezone string, after time.Time) (time.Time, error) {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		return time.Time{}, invalid("server: неверный часовой пояс %q: %v", timezone, err)
+	}
+	spec, err := parseCron(expr)
+	if err != nil {
+		return time.Time{}, invalid("server: cron %q: %v", expr, err)
+	}
+	next := cronNextAfter(spec, loc, after)
+	if next.IsZero() {
+		return time.Time{}, invalid("server: cron %q не имеет следующего срабатывания", expr)
+	}
+	return next, nil
 }
 
 // ---- ScheduleStore implementations ----

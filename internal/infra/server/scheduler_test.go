@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/server"
 )
@@ -427,5 +428,133 @@ func TestSchedulerHandlerRejectsEmptyToken(t *testing.T) {
 	}
 	if _, err := server.NewSchedulerHandler(svc, "  "); err == nil {
 		t.Fatal("empty token accepted")
+	}
+}
+
+// FTE-16: a daily expression resolves to its wall-clock hour, not to the next
+// minute boundary after creation.
+func TestCronNextRunFixedTime(t *testing.T) {
+	after := time.Date(2026, time.November, 22, 10, 15, 0, 0, time.UTC)
+	got, err := server.CronNextRun("0 9 * * *", "UTC", after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, time.November, 23, 9, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+	if got.Location() != time.UTC {
+		t.Fatalf("location = %v, want UTC", got.Location())
+	}
+}
+
+// A fire before the matching hour stays on the same calendar day.
+func TestCronNextRunSameDayBeforeHour(t *testing.T) {
+	after := time.Date(2026, time.November, 22, 8, 30, 0, 0, time.UTC)
+	got, err := server.CronNextRun("0 9 * * *", "UTC", after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, time.November, 22, 9, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+}
+
+// The timezone shifts the UTC instant while keeping the local wall clock.
+func TestCronNextRunTimezone(t *testing.T) {
+	after := time.Date(2026, time.November, 22, 10, 0, 0, 0, time.UTC)
+	got, err := server.CronNextRun("0 9 * * *", "Asia/Tokyo", after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Hour() != 9 || got.Minute() != 0 {
+		t.Fatalf("local time = %v, want 09:00", got)
+	}
+	if got.Location().String() != "Asia/Tokyo" {
+		t.Fatalf("location = %v, want Asia/Tokyo", got.Location())
+	}
+	wantUTC := time.Date(2026, time.November, 23, 0, 0, 0, 0, time.UTC)
+	if !got.UTC().Equal(wantUTC) {
+		t.Fatalf("next run in UTC = %v, want %v", got.UTC(), wantUTC)
+	}
+}
+
+// Lists, ranges and steps expand into real fire times, including weekdays.
+func TestCronNextRunStepListAndRange(t *testing.T) {
+	// Monday 2026-11-23 09:07 UTC -> next matching minute is 09:15.
+	after := time.Date(2026, time.November, 23, 9, 7, 0, 0, time.UTC)
+	got, err := server.CronNextRun("*/15 9-17 * * 1-5", "UTC", after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, time.November, 23, 9, 15, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+}
+
+// A long downtime still yields exactly one future run, never one per missed
+// day. This is the daemon's "missed interval does not duplicate" premise.
+func TestCronNextRunAfterMissedDays(t *testing.T) {
+	after := time.Date(2026, time.November, 2, 12, 0, 0, 0, time.UTC)
+	got, err := server.CronNextRun("0 9 * * *", "UTC", after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, time.November, 3, 9, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+}
+
+// Bad expressions are rejected at creation, before anything is persisted.
+func TestScheduleCreateRejectsInvalidCron(t *testing.T) {
+	svc := newService(t, newMockStore())
+	exprs := []string{
+		"* * *",
+		"60 9 * * *",
+		"0 24 * * *",
+		"0 9 0 * *",
+		"0 9 * 13 *",
+		"0 9 * * 8",
+		"0 9 * * * *",
+		"every morning",
+		"0 9 * * MON-FRI/0",
+	}
+	for _, expr := range exprs {
+		t.Run(expr, func(t *testing.T) {
+			_, err := svc.Schedule(context.Background(), server.ScheduleCreate{
+				TaskID: "T", Kind: server.KindCron, Expr: expr, Timezone: "UTC",
+			})
+			if !server.IsValidation(err) {
+				t.Fatalf("error = %v, want ValidationError", err)
+			}
+		})
+	}
+}
+
+// A created cron schedule carries the resolved fire time, not the next minute.
+func TestScheduleCreateCronUsesFixedTime(t *testing.T) {
+	got, err := newService(t, newMockStore()).Schedule(context.Background(), server.ScheduleCreate{
+		TaskID: "T", Kind: server.KindCron, Expr: "0 9 * * *", Timezone: "UTC",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NextRunAt.IsZero() {
+		t.Fatal("NextRunAt is zero")
+	}
+	if got.NextRunAt.Hour() != 9 || got.NextRunAt.Minute() != 0 || got.NextRunAt.Second() != 0 {
+		t.Fatalf("NextRunAt = %v, want 09:00:00", got.NextRunAt)
+	}
+	if !got.NextRunAt.After(time.Now()) {
+		t.Fatalf("NextRunAt = %v, want a future time", got.NextRunAt)
+	}
+}
+
+func TestCronNextRunRejectsInvalidTimezone(t *testing.T) {
+	if _, err := server.CronNextRun("0 9 * * *", "Mars/Phobos", time.Now()); !server.IsValidation(err) {
+		t.Fatalf("error = %v, want ValidationError", err)
 	}
 }
