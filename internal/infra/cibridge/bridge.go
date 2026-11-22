@@ -8,6 +8,7 @@ package cibridge
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -348,6 +349,60 @@ func deferredWakeID(dw deferredWake) string {
 	return domain.ObligationKey("deferred-wake:"+dw.watchID+":"+dw.adapter, dw.revision, dw.subscriberID)
 }
 
+// deferredWakeRecord is the durable form of one parked wake. The marker
+// obligation keeps it as JSON in an attempt channel, so a restarted Bridge can
+// rebuild the exact text, Watch and Subscriber the OPEN breaker refused.
+type deferredWakeRecord struct {
+	WatchID      string            `json:"watchID"`
+	Revision     uint64            `json:"revision"`
+	SubscriberID string            `json:"subscriberID"`
+	Adapter      string            `json:"adapter"`
+	Text         string            `json:"text"`
+	Verdict      domain.Verdict    `json:"verdict"`
+	CycleID      string            `json:"cycleID"`
+	StagedAt     time.Time         `json:"stagedAt"`
+	Watch        domain.Watch      `json:"watch"`
+	Subscriber   domain.Subscriber `json:"subscriber"`
+}
+
+// deferredMarkerPrefix is the marker namespace as ObligationKey stores it: the
+// colon inside the watchID component is escaped with a backslash.
+const deferredMarkerPrefix = "deferred-wake\\:"
+
+// deferredRecordPrefix marks an attempt channel as a parked wake payload. A
+// marker written before this field existed has no such channel and is skipped
+// on restore instead of producing an empty replay.
+const deferredRecordPrefix = "deferred-wake-v1:"
+
+func encodeDeferredWake(dw deferredWake) (string, error) {
+	raw, err := json.Marshal(deferredWakeRecord{
+		WatchID: dw.watchID, Revision: dw.revision, SubscriberID: dw.subscriberID,
+		Adapter: dw.adapter, Text: dw.text, Verdict: dw.verdict,
+		CycleID: dw.cycleID, StagedAt: dw.stagedAt,
+		Watch: dw.watch, Subscriber: dw.subscriber,
+	})
+	if err != nil {
+		return "", err
+	}
+	return deferredRecordPrefix + string(raw), nil
+}
+
+func decodeDeferredWake(channel string) (deferredWake, error) {
+	if !strings.HasPrefix(channel, deferredRecordPrefix) {
+		return deferredWake{}, fmt.Errorf("cibridge: not a deferred wake record")
+	}
+	var r deferredWakeRecord
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(channel, deferredRecordPrefix)), &r); err != nil {
+		return deferredWake{}, err
+	}
+	return deferredWake{
+		watchID: r.WatchID, revision: r.Revision, subscriberID: r.SubscriberID,
+		adapter: r.Adapter, text: r.Text, verdict: r.Verdict,
+		cycleID: r.CycleID, stagedAt: r.StagedAt,
+		watch: r.Watch, subscriber: r.Subscriber,
+	}, nil
+}
+
 // breakerFailureID is the durable failure counter of one adapter. A restart
 // used to close every breaker and erase the failures that opened it.
 func breakerFailureID(adapter string) string {
@@ -391,8 +446,9 @@ func (b *Bridge) clearBreakerFailures(adapter string, now time.Time) {
 	})
 }
 
-// deferWake parks a wake an OPEN breaker refused. The queue keeps the payload
-// for replay; the obligation is the durable trace of the skipped delivery.
+// deferWake parks a wake an OPEN breaker refused. The in-memory queue drives
+// the next permit; the obligation carries the full payload so a restarted
+// Bridge can rebuild the queue and replay the same pointer.
 func (b *Bridge) deferWake(dw deferredWake) {
 	b.deferredMu.Lock()
 	if b.deferred == nil {
@@ -401,16 +457,74 @@ func (b *Bridge) deferWake(dw deferredWake) {
 	b.deferred[dw.adapter] = append(b.deferred[dw.adapter], dw)
 	b.deferredMu.Unlock()
 
-	o := domain.Obligation{
-		ID: deferredWakeID(dw), WatchID: dw.watchID, Revision: dw.revision,
-		SubscriberID: dw.subscriberID, VerdictPointer: dw.verdict, StagedAt: dw.stagedAt,
+	encoded, err := encodeDeferredWake(dw)
+	if err != nil {
+		observe.ActorError("cibridge-defer-wake-encode", dw.watchID, err)
+	} else {
+		o := domain.Obligation{
+			ID: deferredWakeID(dw), WatchID: dw.watchID, Revision: dw.revision,
+			SubscriberID: dw.subscriberID, VerdictPointer: dw.verdict, StagedAt: dw.stagedAt,
+			Attempts: []domain.Attempt{{N: 0, Channel: encoded}},
+		}
+		if err := b.store.SaveObligation(o); err != nil {
+			observe.ActorError("cibridge-defer-wake", dw.watchID, err)
+		}
 	}
-	if err := b.store.SaveObligation(o); err != nil {
-		observe.ActorError("cibridge-defer-wake", dw.watchID, err)
+	observe.WakeOutcomeCorrelated(dw.adapter, "deferred", dw.watchID, observe.Fields{
+		observe.FieldCycleID: dw.cycleID,
+	}, dw.revision)
+	observe.WakeSkipped(dw.adapter, dw.watchID,
+		fmt.Sprintf("adapter circuit breaker open: wake deferred (cycleID=%s)", dw.cycleID))
+	b.cycleEvent(dw.cycleID, "wake_deferred", cycleFields{
+		watchID: dw.watchID, revision: dw.revision, verdict: dw.verdict,
+		adapter: dw.adapter, role: dw.subscriber.Role,
+	}, observe.Fields{observe.FieldCycleID: dw.cycleID})
+	log.Printf("cibridge: wake for watch %s deferred in cycle %s: adapter %q circuit breaker open",
+		dw.watchID, dw.cycleID, dw.adapter)
+}
+
+// restoreDeferred rebuilds the in-memory queue from the durable markers. A
+// marker whose wake was already delivered is gone from PendingObligations, so
+// a restart cannot replay a pointer the subscriber already received.
+func (b *Bridge) restoreDeferred() {
+	if b == nil || b.store == nil {
+		return
 	}
-	observe.WakeOutcome(dw.adapter, "deferred", dw.watchID, dw.revision)
-	observe.WakeSkipped(dw.adapter, dw.watchID, "adapter circuit breaker open: wake deferred")
-	log.Printf("cibridge: wake for watch %s deferred: adapter %q circuit breaker open", dw.watchID, dw.adapter)
+	all, err := b.store.PendingObligations()
+	if err != nil {
+		observe.ActorError("cibridge-deferred-restore", "", err)
+		return
+	}
+	for _, o := range all {
+		if !strings.HasPrefix(o.ID, deferredMarkerPrefix) {
+			continue
+		}
+		for _, a := range o.Attempts {
+			dw, err := decodeDeferredWake(a.Channel)
+			if err != nil {
+				continue
+			}
+			if dw.watch.ID == "" || dw.subscriber.ID == "" {
+				continue
+			}
+			b.deferredMu.Lock()
+			if b.deferred == nil {
+				b.deferred = make(map[string][]deferredWake)
+			}
+			dup := false
+			for _, existing := range b.deferred[dw.adapter] {
+				if deferredWakeID(existing) == deferredWakeID(dw) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				b.deferred[dw.adapter] = append(b.deferred[dw.adapter], dw)
+			}
+			b.deferredMu.Unlock()
+			break
+		}
+	}
 }
 
 // takeDeferred removes and returns every wake parked for adapter.
@@ -809,7 +923,25 @@ func New(store stateStore, ci domain.CIProvider, clock domain.Clock, interval ti
 	if c, ok := store.(CardLinks); ok {
 		b.cardLinks = wrapCardLinks(c)
 	}
+	b.restoreDeferred()
 	return b
+}
+
+// replayDeferredOnRefresh gives every adapter with parked wakes a chance to
+// deliver them when the breaker permits. Replaying here bounds the outage: the
+// queue no longer waits for a fresh verdict on the same Watch to drain.
+func (b *Bridge) replayDeferredOnRefresh(ctx context.Context, now time.Time, cycleID string) {
+	b.deferredMu.Lock()
+	adapters := make([]string, 0, len(b.deferred))
+	for adapter, queue := range b.deferred {
+		if len(queue) > 0 {
+			adapters = append(adapters, adapter)
+		}
+	}
+	b.deferredMu.Unlock()
+	for _, adapter := range adapters {
+		b.replayDeferred(ctx, adapter, now, cycleID, "", false)
+	}
 }
 
 type wallClock struct{}
@@ -909,14 +1041,19 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 	// deeper wake hook nest under it (T3.394).
 	ctx, end := b.spanTracer().Start(ctx, "beacon.ci.refresh")
 	defer end()
-	cycleID := newCycleID(b.clock.Now())
+	now := b.clock.Now()
+	cycleID := newCycleID(now)
 	start := time.Now()
 	updated, skipped := 0, 0
 	defer func() { observe.PollCycleEnd(updated, skipped, time.Since(start)) }()
 
+	// Replay parked wakes before polling. The breaker may have recovered since
+	// the last verdict, and no new verdict is needed to drain the queue.
+	b.replayDeferredOnRefresh(ctx, now, cycleID)
+
 	// A parked Watch is absent from the live read. Resume one only after every
 	// subscriber saw its park notice, before polling so it re-enters this cycle.
-	b.resumeParkedAfterNotify(b.clock.Now(), cycleID)
+	b.resumeParkedAfterNotify(now, cycleID)
 
 	watches, err := b.liveWatches()
 	if err != nil {
@@ -933,7 +1070,6 @@ func (b *Bridge) Refresh(ctx context.Context) int {
 		log.Printf("cibridge: batch: %v", err)
 		return 0
 	}
-	now := b.clock.Now()
 
 	for i := range watches {
 		w := watches[i]
