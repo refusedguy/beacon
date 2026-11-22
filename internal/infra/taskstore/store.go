@@ -497,20 +497,31 @@ func AcquireLock(lockPath, projectRoot string) (*Lock, error) {
 }
 
 // Release отпускает замок. Повторное освобождение безопасно.
+// Файл удаляется только когда путь всё ещё указывает на inode этого
+// дескриптора. Проверка и удаление идут под удержанным Flock: пока лок
+// удержан, другой процесс не может взять его на том же inode.
 func (l *Lock) Release() error {
 	if l == nil || l.Path == "" {
 		return nil
 	}
+	var removeErr error
 	if l.f != nil {
+		// Сначала сверяем inode, потом снимаем Flock. Иначе между UNLOCK и
+		// Remove другой процесс возьмёт замок на старом inode, а Remove
+		// разлинкует путь и пустит третьего владельца на новый inode.
+		locked, statErr := l.f.Stat()
+		if statErr == nil {
+			if current, err := os.Stat(l.Path); err == nil && os.SameFile(locked, current) {
+				if err := os.Remove(l.Path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					removeErr = err
+				}
+			}
+		}
 		_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
 		_ = l.f.Close()
 		l.f = nil
 	}
-	err := os.Remove(l.Path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
+	return removeErr
 }
 
 type counterFile struct {
