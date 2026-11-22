@@ -287,6 +287,10 @@ func cloneSteps(in []Command) []Command {
 	return out
 }
 
+// encodeFields returns the canonical, sorted key=value form of fields. Keys and
+// values are escaped so every field set has one encoding. Without escaping,
+// {"a": "b,c=d"} and {"a": "b", "c": "d"} both produce "a=b,c=d" and share a
+// fingerprint.
 func encodeFields(fields map[string]string) string {
 	keys := make([]string, 0, len(fields))
 	for k := range fields {
@@ -298,11 +302,24 @@ func encodeFields(fields map[string]string) string {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		b.WriteString(k)
+		writeEscaped(&b, k)
 		b.WriteByte('=')
-		b.WriteString(fields[k])
+		writeEscaped(&b, fields[k])
 	}
 	return b.String()
+}
+
+// writeEscaped writes s with the canonical form's own characters escaped:
+// backslash first, then the comma and equals separators. Escaping the escape
+// character keeps the encoding injective for arbitrary keys and values.
+func writeEscaped(b *strings.Builder, s string) {
+	for _, c := range s {
+		switch c {
+		case '\\', ',', '=':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
 }
 
 // --- Seeded regression artery (BCX-54, ADR 0214) ---
