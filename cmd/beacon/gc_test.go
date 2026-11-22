@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
@@ -16,18 +19,23 @@ func mockServeGC(t *testing.T) (*bytes.Buffer, *bytes.Buffer, *[]int, *int) {
 	oldState, oldClear, oldKill := gcServeState, gcServeClear, gcServeKill
 	oldAlive, oldRead, oldWrite := gcProcessAlive, gcReadState, gcWriteState
 	oldObligations := gcObligationsForGC
+	oldSessions, oldDelete := gcSessionsForGC, gcSessionDelete
 	t.Cleanup(func() {
 		gcServeList, gcServicePID, gcServiceCfg = oldList, oldPID, oldCfg
 		gcServeState, gcServeClear, gcServeKill = oldState, oldClear, oldKill
 		gcProcessAlive, gcReadState, gcWriteState = oldAlive, oldRead, oldWrite
 		gcObligationsForGC = oldObligations
+		gcSessionsForGC, gcSessionDelete = oldSessions, oldDelete
 	})
 
-	// Obligations need the state store; the serve collector tests do not, so
-	// keep the seam quiet here and cover it in TestGCObligationsCollectsClosedWatch.
+	// Obligations and session candidates need the state store; the serve
+	// collector tests do not, so keep both seams quiet here and cover them in
+	// their own tests below.
 	gcObligationsForGC = func(*CLI, bool) ([]store.ObligationGCItem, error) {
 		return nil, nil
 	}
+	gcSessionsForGC = func(*CLI) ([]gcSessionCandidate, error) { return nil, nil }
+	gcSessionDelete = func(context.Context, string) error { return nil }
 
 	killed := make([]int, 0)
 	cleared := 0
@@ -229,5 +237,150 @@ func TestQA2GCListFailure(t *testing.T) {
 	c := &CLI{out: out, errOut: errOut}
 	if code := runGCWithServe(c, []string{"--apply"}); code != 2 {
 		t.Fatalf("code = %d, want 2", code)
+	}
+}
+
+func gcWatchWithSubscribers(id string, ids ...string) domain.Watch {
+	subs := make([]domain.Subscriber, 0, len(ids))
+	for _, sid := range ids {
+		subs = append(subs, domain.Subscriber{ID: sid})
+	}
+	return domain.Watch{ID: id, Subscribers: subs}
+}
+
+// TestGCSessionPlanProtectsLiveAndCurrentSession covers the protection rule:
+// a subscriber of a live Watch and the process's own session stay alive, and a
+// session shared by two closed Watches is planned once.
+func TestGCSessionPlanProtectsLiveAndCurrentSession(t *testing.T) {
+	closed := []domain.Watch{
+		gcWatchWithSubscribers("w1", "ses_closed", "ses_live", "ses_current"),
+		gcWatchWithSubscribers("w2", "ses_closed", "ses_second"),
+	}
+	live := []domain.Watch{gcWatchWithSubscribers("w3", "ses_live")}
+	plan := gcSessionPlan(closed, live, "ses_current")
+	if len(plan) != 2 {
+		t.Fatalf("plan = %+v, want 2 candidates", plan)
+	}
+	if plan[0].SessionID != "ses_closed" || plan[0].WatchID != "w1" ||
+		plan[1].SessionID != "ses_second" || plan[1].WatchID != "w2" {
+		t.Fatalf("plan = %+v, want ses_closed/w1 and ses_second/w2", plan)
+	}
+}
+
+// fakeGCSessionStore is the inspect store slice the session collector reads.
+type fakeGCSessionStore struct {
+	closed []domain.Watch
+	live   []domain.Watch
+	since  time.Time
+	limit  int
+}
+
+func (f *fakeGCSessionStore) RecentClosedWatches(_ context.Context, since time.Time, limit int) ([]domain.Watch, error) {
+	f.since, f.limit = since, limit
+	return f.closed, nil
+}
+
+func (f *fakeGCSessionStore) LiveWatches() ([]domain.Watch, error) { return f.live, nil }
+
+func (f *fakeGCSessionStore) ActiveBlockers() ([]domain.BlockerIncident, error) { return nil, nil }
+
+func (f *fakeGCSessionStore) BoundOrchestrator(string) (domain.OrchestratorBinding, bool, error) {
+	return domain.OrchestratorBinding{}, false, nil
+}
+
+func (f *fakeGCSessionStore) LoadRuntimeStats() ([]byte, bool, error) { return nil, false, nil }
+
+// TestGCSessionsCollectorUsesRetentionWindowAndEnv verifies the store call:
+// the window comes from gcNow, and the current session id comes from the
+// environment the daemon uses for its own session.
+func TestGCSessionsCollectorUsesRetentionWindowAndEnv(t *testing.T) {
+	oldNow, oldFactory := gcNow, makeInspectStore
+	fixed := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	gcNow = func() time.Time { return fixed }
+	t.Cleanup(func() { gcNow, makeInspectStore = oldNow, oldFactory })
+	t.Setenv(sessionIDEnv, "ses_current")
+
+	f := &fakeGCSessionStore{
+		closed: []domain.Watch{gcWatchWithSubscribers("w1", "ses_closed", "ses_current")},
+		live:   []domain.Watch{gcWatchWithSubscribers("w2", "ses_live")},
+	}
+	makeInspectStore = func(*CLI) (inspectStore, func() error, error) {
+		return f, func() error { return nil }, nil
+	}
+
+	got, err := gcSessionsForGC(&CLI{})
+	if err != nil {
+		t.Fatalf("gcSessionsForGC: %v", err)
+	}
+	if len(got) != 1 || got[0].SessionID != "ses_closed" || got[0].WatchID != "w1" {
+		t.Fatalf("candidates = %+v, want only ses_closed/w1", got)
+	}
+	if !f.since.Equal(fixed.Add(-gcSessionRetention)) || f.limit != gcSessionLimit {
+		t.Fatalf("store call since = %v limit = %d", f.since, f.limit)
+	}
+}
+
+func mockSessionGC(t *testing.T, candidates ...gcSessionCandidate) (*bytes.Buffer, *bytes.Buffer, *[]string) {
+	t.Helper()
+	out, errOut, _, _ := mockServeGC(t)
+	gcServeList = func() ([]opencode.ServeProcess, error) { return nil, nil }
+	gcServeState = func() (opencode.ServeState, bool) { return opencode.ServeState{}, false }
+	gcSessionsForGC = func(*CLI) ([]gcSessionCandidate, error) { return candidates, nil }
+	deletes := make([]string, 0, len(candidates))
+	gcSessionDelete = func(_ context.Context, id string) error {
+		deletes = append(deletes, id)
+		return nil
+	}
+	return out, errOut, &deletes
+}
+
+// TestGCSessionsDryRunListsWithoutDeleting checks that a dry run reports the
+// candidate as a session item and never calls the deleter.
+func TestGCSessionsDryRunListsWithoutDeleting(t *testing.T) {
+	out, errOut, deletes := mockSessionGC(t, gcSessionCandidate{SessionID: "ses_closed", WatchID: "w1"})
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--format", "json"}); code != 0 {
+		t.Fatalf("dry run code = %d, stderr = %s", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, `"mode":"dry-run"`) || !strings.Contains(got, `"removed":1`) ||
+		!strings.Contains(got, `"kind":"session"`) || !strings.Contains(got, "ses_closed") {
+		t.Fatalf("dry run out = %q", got)
+	}
+	if len(*deletes) != 0 {
+		t.Fatalf("dry run deleted %v", *deletes)
+	}
+}
+
+// TestGCSessionsApplyDeletesClosedOnce checks the --apply contract: each
+// candidate is deleted exactly once and reported as removed.
+func TestGCSessionsApplyDeletesClosedOnce(t *testing.T) {
+	out, errOut, deletes := mockSessionGC(t,
+		gcSessionCandidate{SessionID: "ses_closed", WatchID: "w1"},
+		gcSessionCandidate{SessionID: "ses_second", WatchID: "w2"},
+	)
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--format", "json", "--apply"}); code != 0 {
+		t.Fatalf("apply code = %d, stderr = %s", code, errOut.String())
+	}
+	if len(*deletes) != 2 || (*deletes)[0] != "ses_closed" || (*deletes)[1] != "ses_second" {
+		t.Fatalf("deletes = %v, want each session once", *deletes)
+	}
+	got := out.String()
+	if !strings.Contains(got, `"mode":"applied"`) || !strings.Contains(got, `"removed":2`) ||
+		!strings.Contains(got, "ses_closed") || !strings.Contains(got, "ses_second") {
+		t.Fatalf("apply out = %q", got)
+	}
+}
+
+func TestGCSessionsDeleteFailureFailsSweep(t *testing.T) {
+	out, errOut, _ := mockSessionGC(t, gcSessionCandidate{SessionID: "ses_closed", WatchID: "w1"})
+	gcSessionDelete = func(context.Context, string) error { return errors.New("403") }
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCWithServe(c, []string{"--apply"}); code != 2 {
+		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "удаление сессии ses_closed") {
+		t.Fatalf("stderr = %q", errOut.String())
 	}
 }
