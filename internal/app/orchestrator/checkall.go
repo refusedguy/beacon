@@ -51,6 +51,21 @@ func CheckVerdicts() []Verdict {
 	return []Verdict{CheckVerdictWatching, CheckVerdictReady, CheckVerdictRetry}
 }
 
+// VerdictValidator reports whether a verdict belongs to the domain contract.
+// ADR 0005 forbids internal/app from importing internal/domain, so the check
+// arrives as a narrow function port. The default reads the mirror set that
+// verdict_contract_test.go compares with domain.Verdicts().
+type VerdictValidator func(Verdict) bool
+
+func validCheckVerdict(v Verdict) bool {
+	for _, known := range CheckVerdicts() {
+		if v == known {
+			return true
+		}
+	}
+	return false
+}
+
 // ValidateWakeTarget checks that a notify target can address an OpenCode
 // session. The orchestrator subscriber of a Watch is the wake recipient, so a
 // target without a session id cannot receive a verdict pointer.
@@ -801,12 +816,13 @@ type TxWriter interface {
 type SQLVerdictWriter struct {
 	writer TxWriter
 	now    func() time.Time
+	valid  VerdictValidator
 }
 
 var _ VerdictWriter = (*SQLVerdictWriter)(nil)
 
 func NewSQLVerdictWriter(w TxWriter) *SQLVerdictWriter {
-	return &SQLVerdictWriter{writer: w, now: time.Now}
+	return &SQLVerdictWriter{writer: w, now: time.Now, valid: validCheckVerdict}
 }
 
 func (w *SQLVerdictWriter) Publish(ctx context.Context, ref WatchRef, verdict Verdict, checks []Check) error {
@@ -815,6 +831,13 @@ func (w *SQLVerdictWriter) Publish(ctx context.Context, ref WatchRef, verdict Ve
 	}
 	if verdict == CheckVerdictWatching {
 		return nil
+	}
+	valid := w.valid
+	if valid == nil {
+		valid = validCheckVerdict
+	}
+	if !valid(verdict) {
+		return fmt.Errorf("checkall: вердикт %q вне доменного контракта", verdict)
 	}
 	checksPayload, err := checksPayload(checks)
 	if err != nil {
