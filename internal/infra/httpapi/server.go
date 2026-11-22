@@ -70,11 +70,23 @@ const (
 	// projection. A client may omit the contract field to keep the original
 	// shape working; when present it must equal this value.
 	HumanDecideContract = "beacon.human-decide.v1"
+
+	// EventContract is the versioned wire contract of the typed SSE envelope.
+	// Every typed payload carries a contract field, and a value other than this
+	// one is rejected before it reaches the bus. The legacy frames without a
+	// contract keep working, so an older subscriber sees the same stream.
+	EventContract = "beacon.events.v1"
 )
 
 // heartbeatInterval is a variable so a test can shorten it without waiting a
 // real quarter minute for the keepalive comment. The production value is 15s.
 var heartbeatInterval = 15 * time.Second
+
+// maxPatchesPerSnapshot bounds a patch chain. A producer must publish a full
+// snapshot after this many patches so a newcomer never has to replay an
+// unbounded sequence of deltas. It is a variable so a test can shorten the
+// chain without emitting hundreds of frames.
+var maxPatchesPerSnapshot = 32
 
 // PointStats is the hourly point budget already computed by the CI provider.
 type PointStats struct {
@@ -293,6 +305,11 @@ type Config struct {
 	// Credentials lists the permitted actors for each known application key.
 	// A nil map means no external app is configured and appKey is ignored.
 	Credentials AppCredentials
+	// ExtraRoutes mounts additional handlers on this listener, behind the same
+	// bearer gateway. The composition root uses it to share one HTTP server
+	// with another ingress. A nil map leaves the route table unchanged, so no
+	// extra path is exposed by default.
+	ExtraRoutes map[string]http.Handler
 }
 
 // connectionFile is written next to the state store with mode 0600. The extra
@@ -315,6 +332,151 @@ type Event struct {
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
+// EventName is the discriminated name of a typed SSE event. The set is closed:
+// the three patch names follow the domain objects the stream describes, and
+// the snapshot name carries the full state those patches extend. A name from
+// outside this set cannot be published through PublishTyped or decoded into a
+// TypedEvent, so a subscriber never has to guess what a frame means.
+type EventName string
+
+const (
+	EventSnapshot        EventName = "snapshot"
+	EventWatchPatch      EventName = "watch.patch"
+	EventObligationPatch EventName = "obligation.patch"
+	EventVerdictPatch    EventName = "verdict.patch"
+)
+
+var validEventNames = map[EventName]bool{
+	EventSnapshot:        true,
+	EventWatchPatch:      true,
+	EventObligationPatch: true,
+	EventVerdictPatch:    true,
+}
+
+// PatchOp is one RFC 6902 JSON Patch operation. Value is kept raw so the
+// transport does not reinterpret a JSON literal before the subscriber does.
+type PatchOp struct {
+	Op    string          `json:"op"`
+	Path  string          `json:"path"`
+	Value json.RawMessage `json:"value,omitempty"`
+}
+
+// PatchPayload is the typed delta between two snapshots. BaseID names the
+// snapshot event this patch extends, so a subscriber can tell a stale chain
+// from a current one without reading the whole snapshot again.
+type PatchPayload struct {
+	Contract string    `json:"contract"`
+	BaseID   uint64    `json:"baseID"`
+	Ops      []PatchOp `json:"ops"`
+}
+
+// SnapshotPayload is the typed full state. A producer sends one of these at
+// the start of a stream and at most once per maxPatchesPerSnapshot patches.
+type SnapshotPayload struct {
+	Contract string   `json:"contract"`
+	Snapshot Snapshot `json:"snapshot"`
+}
+
+// TypedEvent is the decoded form of an SSE frame. Exactly one of Snapshot and
+// Patch is set for a name in the closed set. A subscriber reads this instead
+// of parsing Event.Payload by hand.
+type TypedEvent struct {
+	ID       uint64
+	Name     EventName
+	Contract string
+	WatchID  string
+	Snapshot *Snapshot
+	Patch    *PatchPayload
+}
+
+var validPatchOps = map[string]bool{
+	"add": true, "remove": true, "replace": true,
+	"move": true, "copy": true, "test": true,
+}
+
+// Typed stream errors. Callers use errors.Is to tell a contract violation from
+// a snapshot the producer still owes the stream.
+var (
+	ErrUnknownEventName = errors.New("httpapi: unknown event name")
+	ErrInvalidPayload   = errors.New("httpapi: invalid event payload")
+	ErrSnapshotDue      = errors.New("httpapi: snapshot due before more patches")
+)
+
+func validateEventName(name EventName) error {
+	if !validEventNames[name] {
+		return fmt.Errorf("%w: %q", ErrUnknownEventName, name)
+	}
+	return nil
+}
+
+// validatePayload checks the shape of a typed payload before it enters the
+// bus. A snapshot must name the current contract; a patch must name it, carry
+// at least one operation, and use a valid operation and a non-empty path.
+func validatePayload(name EventName, raw []byte) error {
+	if err := validateEventName(name); err != nil {
+		return err
+	}
+	if name == EventSnapshot {
+		var p SnapshotPayload
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return fmt.Errorf("%w: snapshot: %v", ErrInvalidPayload, err)
+		}
+		if p.Contract != EventContract {
+			return fmt.Errorf("%w: snapshot contract %q", ErrInvalidPayload, p.Contract)
+		}
+		return nil
+	}
+	var p PatchPayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("%w: patch: %v", ErrInvalidPayload, err)
+	}
+	if p.Contract != EventContract {
+		return fmt.Errorf("%w: patch contract %q", ErrInvalidPayload, p.Contract)
+	}
+	if len(p.Ops) == 0 {
+		return fmt.Errorf("%w: patch has no operations", ErrInvalidPayload)
+	}
+	for _, op := range p.Ops {
+		if !validPatchOps[op.Op] {
+			return fmt.Errorf("%w: patch op %q", ErrInvalidPayload, op.Op)
+		}
+		if strings.TrimSpace(op.Path) == "" {
+			return fmt.Errorf("%w: patch op %q has no path", ErrInvalidPayload, op.Op)
+		}
+	}
+	return nil
+}
+
+// DecodeTypedEvent turns an SSE frame into its typed form. A name outside the
+// closed set and a payload of the wrong shape are both explicit errors, so a
+// subscriber can reject a bad frame instead of quietly ignoring it.
+func DecodeTypedEvent(e Event) (TypedEvent, error) {
+	name := EventName(e.Type)
+	if err := validateEventName(name); err != nil {
+		return TypedEvent{}, err
+	}
+	if err := validatePayload(name, e.Payload); err != nil {
+		return TypedEvent{}, err
+	}
+	out := TypedEvent{ID: e.ID, Name: name, WatchID: e.WatchID}
+	if name == EventSnapshot {
+		var p SnapshotPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return TypedEvent{}, fmt.Errorf("%w: snapshot: %v", ErrInvalidPayload, err)
+		}
+		out.Contract = p.Contract
+		out.Snapshot = &p.Snapshot
+		return out, nil
+	}
+	var p PatchPayload
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		return TypedEvent{}, fmt.Errorf("%w: patch: %v", ErrInvalidPayload, err)
+	}
+	out.Contract = p.Contract
+	out.Patch = &p
+	return out, nil
+}
+
 // EventBus keeps a bounded ring of recent events and fans live events out to
 // SSE subscribers. Slow subscribers drop live frames but can replay them from
 // the ring with Last-Event-ID.
@@ -325,6 +487,12 @@ type EventBus struct {
 	capacity int
 	subs     map[chan Event]struct{}
 	closed   bool
+
+	// The typed stream keeps a snapshot anchor. Patches count against the cap
+	// until the next full snapshot resets them, and a patch may name the anchor
+	// in its BaseID so a subscriber can spot a stale chain.
+	patchesSinceSnapshot uint64
+	lastSnapshotID       uint64
 }
 
 // NewEventBus builds a bus holding at most capacity events. A non-positive
@@ -337,10 +505,16 @@ func NewEventBus(capacity int) *EventBus {
 }
 
 // Publish assigns an id and a timestamp, then stores the event and offers it
-// to every live subscriber without blocking on a slow one.
+// to every live subscriber without blocking on a slow one. The legacy path
+// accepts any name, so existing publishers keep their frames unchanged.
 func (b *EventBus) Publish(e Event) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.publishLocked(e)
+}
+
+// publishLocked stores and fans out one frame. The caller must hold b.mu.
+func (b *EventBus) publishLocked(e Event) {
 	if b.closed {
 		return
 	}
@@ -360,6 +534,55 @@ func (b *EventBus) Publish(e Event) {
 		default:
 		}
 	}
+}
+
+// PublishTyped validates a typed name and payload, enforces the snapshot
+// cadence, and then publishes an ordinary frame. The wire shape stays the
+// same, so existing SSE subscribers and the /api/v1/ contract do not change.
+// A payload of *PatchPayload gets BaseID filled from the current snapshot so
+// a subscriber can always tell which full state a delta extends.
+func (b *EventBus) PublishTyped(name EventName, payload any) error {
+	if err := validateEventName(name); err != nil {
+		return err
+	}
+	if patch, ok := payload.(*PatchPayload); ok {
+		copyPatch := *patch
+		copyPatch.BaseID = b.LastSnapshotID()
+		payload = &copyPatch
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("%w: marshal: %v", ErrInvalidPayload, err)
+	}
+	if err := validatePayload(name, raw); err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return errors.New("httpapi: event bus is closed")
+	}
+	if name == EventSnapshot {
+		b.patchesSinceSnapshot = 0
+		b.lastSnapshotID = b.next + 1
+	} else {
+		if b.patchesSinceSnapshot >= maxPatchesPerSnapshot {
+			return fmt.Errorf("%w: %d patches since snapshot", ErrSnapshotDue, b.patchesSinceSnapshot)
+		}
+		b.patchesSinceSnapshot++
+	}
+	b.publishLocked(Event{Type: string(name), Payload: raw})
+	return nil
+}
+
+// LastSnapshotID is the id of the most recent full snapshot on this bus. Zero
+// means no typed snapshot has been published yet. A producer passes it as the
+// BaseID of a patch, or lets PublishTyped fill it in.
+func (b *EventBus) LastSnapshotID() uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastSnapshotID
 }
 
 // Subscribe returns a live event channel and the function that removes it.
@@ -778,6 +1001,9 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/snapshot", s.handleSnapshot)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 	mux.Handle("POST /api/v1/human/decide", s.sameOriginJSON(http.HandlerFunc(s.handleDecide)))
+	for path, h := range s.cfg.ExtraRoutes {
+		mux.Handle(path, h)
+	}
 	return s.bearer(mux)
 }
 

@@ -834,3 +834,205 @@ func TestAuditActorIngress(t *testing.T) {
 		t.Fatalf("audit без токена = %d, ожидался 401", w.Code)
 	}
 }
+
+func TestTypedEventClosedNameSet(t *testing.T) {
+	for _, name := range []EventName{EventSnapshot, EventWatchPatch, EventObligationPatch, EventVerdictPatch} {
+		if err := validateEventName(name); err != nil {
+			t.Fatalf("name %q rejected: %v", name, err)
+		}
+	}
+
+	unknown := EventName("watch.destroyed")
+	bus := NewEventBus(10)
+	patch := &PatchPayload{
+		Contract: EventContract,
+		Ops:      []PatchOp{{Op: "replace", Path: "/status", Value: json.RawMessage(`"ready"`)}},
+	}
+	if err := bus.PublishTyped(unknown, patch); !errors.Is(err, ErrUnknownEventName) {
+		t.Fatalf("PublishTyped unknown name = %v", err)
+	}
+	if _, err := DecodeTypedEvent(Event{Type: string(unknown), Payload: json.RawMessage(`{}`)}); !errors.Is(err, ErrUnknownEventName) {
+		t.Fatalf("DecodeTypedEvent unknown name = %v", err)
+	}
+	if got := len(bus.Last(10)); got != 0 {
+		t.Fatalf("unknown name published %d frames", got)
+	}
+}
+
+func TestTypedEventPayloadValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		ev   Event
+		want error
+	}{
+		{"snapshot wrong contract", Event{Type: string(EventSnapshot), Payload: json.RawMessage(`{"contract":"v9","snapshot":{}}`)}, ErrInvalidPayload},
+		{"snapshot malformed", Event{Type: string(EventSnapshot), Payload: json.RawMessage(`{`)}, ErrInvalidPayload},
+		{"patch wrong contract", Event{Type: string(EventWatchPatch), Payload: json.RawMessage(`{"contract":"v9","ops":[{"op":"add","path":"/x"}]}`)}, ErrInvalidPayload},
+		{"patch no ops", Event{Type: string(EventWatchPatch), Payload: json.RawMessage(`{"contract":"beacon.events.v1","ops":[]}`)}, ErrInvalidPayload},
+		{"patch bad op", Event{Type: string(EventVerdictPatch), Payload: json.RawMessage(`{"contract":"beacon.events.v1","ops":[{"op":"explode","path":"/x"}]}`)}, ErrInvalidPayload},
+		{"patch empty path", Event{Type: string(EventObligationPatch), Payload: json.RawMessage(`{"contract":"beacon.events.v1","ops":[{"op":"add","path":"  "}]}`)}, ErrInvalidPayload},
+		{"patch malformed", Event{Type: string(EventWatchPatch), Payload: json.RawMessage(`{`)}, ErrInvalidPayload},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := DecodeTypedEvent(tc.ev); !errors.Is(err, tc.want) {
+				t.Fatalf("DecodeTypedEvent = %v, want %v", err, tc.want)
+			}
+		})
+	}
+
+	bus := NewEventBus(10)
+	valid := []struct {
+		name string
+		ev   Event
+	}{
+		{"snapshot", Event{Type: string(EventSnapshot), Payload: json.RawMessage(`{"contract":"beacon.events.v1","snapshot":{"liveWatches":[]}}`)}},
+		{"patch", Event{Type: string(EventVerdictPatch), Payload: json.RawMessage(`{"contract":"beacon.events.v1","baseID":1,"ops":[{"op":"replace","path":"/liveWatches/0/status","value":"ready"}]}`)}},
+	}
+	for _, tc := range valid {
+		if err := bus.PublishTyped(EventName(tc.ev.Type), tc.ev.Payload); err != nil {
+			t.Fatalf("PublishTyped %s: %v", tc.name, err)
+		}
+	}
+
+	frames := bus.Last(2)
+	gotSnapshot, err := DecodeTypedEvent(frames[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotSnapshot.Name != EventSnapshot || gotSnapshot.Contract != EventContract || gotSnapshot.Snapshot == nil {
+		t.Fatalf("snapshot = %+v", gotSnapshot)
+	}
+	gotPatch, err := DecodeTypedEvent(frames[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPatch.Name != EventVerdictPatch || gotPatch.Patch == nil || gotPatch.Patch.BaseID != 1 {
+		t.Fatalf("patch = %+v", gotPatch)
+	}
+	if len(gotPatch.Patch.Ops) != 1 || gotPatch.Patch.Ops[0].Op != "replace" {
+		t.Fatalf("patch ops = %+v", gotPatch.Patch.Ops)
+	}
+}
+
+func TestTypedEventSnapshotCadence(t *testing.T) {
+	previous := maxPatchesPerSnapshot
+	maxPatchesPerSnapshot = 2
+	defer func() { maxPatchesPerSnapshot = previous }()
+
+	bus := NewEventBus(20)
+	snap := SnapshotPayload{Contract: EventContract, Snapshot: Snapshot{}}
+	patch := func() *PatchPayload {
+		return &PatchPayload{
+			Contract: EventContract,
+			Ops:      []PatchOp{{Op: "replace", Path: "/status", Value: json.RawMessage(`"ready"`)}},
+		}
+	}
+	if err := bus.PublishTyped(EventSnapshot, snap); err != nil {
+		t.Fatal(err)
+	}
+	base := bus.LastSnapshotID()
+	if base != 1 {
+		t.Fatalf("lastSnapshotID = %d, want 1", base)
+	}
+	for i := 0; i < maxPatchesPerSnapshot; i++ {
+		if err := bus.PublishTyped(EventWatchPatch, patch()); err != nil {
+			t.Fatalf("patch %d: %v", i, err)
+		}
+	}
+	if err := bus.PublishTyped(EventWatchPatch, patch()); !errors.Is(err, ErrSnapshotDue) {
+		t.Fatalf("patch after cap = %v, want %v", err, ErrSnapshotDue)
+	}
+
+	last, err := DecodeTypedEvent(bus.Last(1)[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if last.Patch == nil || last.Patch.BaseID != base {
+		t.Fatalf("patch anchor = %+v, want %d", last.Patch, base)
+	}
+
+	if err := bus.PublishTyped(EventSnapshot, snap); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.PublishTyped(EventVerdictPatch, patch()); err != nil {
+		t.Fatal(err)
+	}
+	if got := bus.LastSnapshotID(); got != base+3 {
+		t.Fatalf("lastSnapshotID after reset = %d, want %d", got, base+3)
+	}
+}
+
+func TestEventsReplayAfterTypedPatch(t *testing.T) {
+	bus := NewEventBus(10)
+	if err := bus.PublishTyped(EventSnapshot, SnapshotPayload{Contract: EventContract, Snapshot: Snapshot{}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.PublishTyped(EventWatchPatch, &PatchPayload{
+		Contract: EventContract,
+		Ops:      []PatchOp{{Op: "replace", Path: "/liveWatches/0/status", Value: json.RawMessage(`"ready"`)}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(t, stubProvider{}, &stubSink{}, bus)
+	httpSrv := httptest.NewServer(srv.handler())
+	defer httpSrv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, httpSrv.URL+"/api/v1/events", nil)
+	authorized(req)
+	req.Header.Set("Last-Event-ID", "1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	frame := readFrame(t, bufio.NewReader(resp.Body))
+	if frame["id"] != "2" || frame["event"] != string(EventWatchPatch) {
+		t.Fatalf("replayed frame = %v", frame)
+	}
+	var envelope Event
+	if err := json.Unmarshal([]byte(frame["data"]), &envelope); err != nil {
+		t.Fatal(err)
+	}
+	typed, err := DecodeTypedEvent(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typed.ID != 2 || typed.Patch == nil || typed.Patch.BaseID != 1 {
+		t.Fatalf("typed replay = %+v", typed)
+	}
+}
+
+func TestExtraRoutesShareBearerGateway(t *testing.T) {
+	srv := newTestServer(t, stubProvider{}, &stubSink{}, NewEventBus(0))
+	srv.cfg.ExtraRoutes = map[string]http.Handler{
+		"/probe": http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTeapot)
+		}),
+	}
+
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/probe", nil)))
+	if w.Code != http.StatusTeapot {
+		t.Fatalf("extra route status = %d", w.Code)
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/probe", nil))
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("extra route without token = %d, want 401", w.Code)
+	}
+}
+
+func TestMCPPathIsNotMountedByDefault(t *testing.T) {
+	srv := newTestServer(t, stubProvider{}, &stubSink{}, NewEventBus(0))
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodPost, "/mcp", nil)))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("POST /mcp status = %d, want 404", w.Code)
+	}
+}
