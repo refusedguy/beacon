@@ -24,9 +24,9 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
-// daemonIntervalEnv overrides the default pass interval without a flag. It is
-// kept for the deprecated in-process daemon seam; the unified loop uses the
-// adaptive github.Interval unless --interval is given explicitly.
+// daemonIntervalEnv overrides the pass interval when --interval is absent.
+// The daemon loop and the in-process MCP seam both read it, so one setting
+// controls the cadence in either mode.
 const daemonIntervalEnv = "BEACON_DAEMON_INTERVAL"
 
 // daemonIntervalDefault is the value passed to --interval when the flag is
@@ -37,6 +37,22 @@ const daemonIntervalDefault = 0
 // daemonIntervalDescription is the single description of that default. The
 // flag help and the CLI usage text reuse it, and README.md mirrors it.
 const daemonIntervalDescription = "0 = адаптивный 10s/30s"
+
+// daemonIntervalFromEnv reads BEACON_DAEMON_INTERVAL. An empty value leaves
+// the flag default in place. A bad value is reported and ignored so a typo
+// cannot stop the loop.
+func daemonIntervalFromEnv() (time.Duration, bool) {
+	raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv))
+	if raw == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		observe.WarnConfig(daemonIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
+		return 0, false
+	}
+	return d, true
+}
 
 // daemonActorErrorCount reads the actor error counter of the process. The
 // reconciler reports a failed pass through observe.ActorError instead of a
@@ -477,6 +493,19 @@ func runDaemon(c *CLI, args []string) int {
 	if *interval < 0 {
 		fmt.Fprintf(c.errOut, "beacon daemon: интервал не может быть отрицательным\n")
 		return 2
+	}
+	// An explicit --interval wins over the env override. Without one, the env
+	// value sets the cadence before the adaptive default applies.
+	intervalExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "interval" {
+			intervalExplicit = true
+		}
+	})
+	if !intervalExplicit {
+		if fromEnv, ok := daemonIntervalFromEnv(); ok {
+			*interval = fromEnv
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
