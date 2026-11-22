@@ -21,8 +21,6 @@ type command struct {
 }
 
 // registry names each subcommand exactly once. Names match source directories.
-// cardindex and docsgate are separate main packages and are not commands in
-// this binary. CI runs them with go run in their own jobs (BL-05).
 var registry = []command{
 	{"capabilities", "capabilities used outside internal/infra", capabilities.Run, capabilities.SelfTestRun},
 	{"layers-ast", "layer edges from go/parser, cross-checked with go list", layersast.Run, layersast.SelfTestRun},
