@@ -8,6 +8,7 @@ package domain
 import (
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -110,6 +111,15 @@ type WakeTarget struct {
 // after main was fixed. The PR is behind a base whose checks are green, so a
 // rebase on the current main is the next action, not a manual failure triage.
 const ReasonStaleBaseAfterMainFix = "stale_base_after_main_fix"
+
+// The two diagnostics that make a silent required:false decision visible.
+// The verdict engine stays pure and never logs. An adapter emits these events
+// at Watch registration, so an operator can explain a red PR that never moves
+// without reading the exclusion rules in this file.
+const (
+	EventInformationalChecksOnly     = "informational_checks_only"
+	EventInformationalFailureIgnored = "informational_failure_ignored"
+)
 
 // Evaluate computes the verdict and wake targets for s under policy p. The
 // rules are applied in the exact priority order of WORKER-PROMPT §4.6; the
@@ -383,6 +393,44 @@ func realFailures(s Snapshot) []string {
 		out = append(out, name)
 	}
 	return out
+}
+
+// InformationalCheckDiagnostics reports the informational decisions that the
+// verdict engine drops without a trace. allInformational is true when at least
+// one check was observed and none of them can block the Watch. ignored lists
+// the failed checks that were filtered out solely because they are
+// informational: they appear in Failures, are present in Checks and have a
+// non-success conclusion. Both decisions use the same requiredGate as the
+// verdict engine, so a failed check never looks informational when no check
+// was marked required and the provider cannot tell required checks apart.
+// The verdict itself is untouched, and an empty or fully required check set
+// produces no diagnostics.
+func InformationalCheckDiagnostics(s Snapshot) (allInformational bool, ignored []string) {
+	if len(s.Checks) == 0 {
+		return false, nil
+	}
+	anyRequired := hasRequiredCheck(s)
+	for name, c := range s.Checks {
+		if requiredGate(name, c, anyRequired) {
+			allInformational = false
+			break
+		}
+		allInformational = true
+	}
+	seen := make(map[string]bool, len(s.Failures))
+	for _, name := range s.Failures {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		c, observed := s.Checks[name]
+		if !observed || requiredGate(name, c, anyRequired) || harmlessConclusion(c) {
+			continue
+		}
+		ignored = append(ignored, name)
+	}
+	sort.Strings(ignored)
+	return allInformational, ignored
 }
 
 // harmlessConclusion reports whether a listed check actually passed, including

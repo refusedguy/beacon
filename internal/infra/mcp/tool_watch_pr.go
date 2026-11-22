@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -608,6 +609,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		"watchID": sub.Watch.ID, "pr": in.PR, "role": string(in.Role),
 		"subscriberID": subscriberID, "orchestratorID": in.OrchestratorID, "fixFor": in.FixFor,
 	})
+	h.reportInformationalChecks(ctx, in, sub.Watch.ID)
 
 	return WatchPROutput{
 		WatchID:     sub.Watch.ID,
@@ -732,6 +734,55 @@ func (h *WatchPRHandler) resolveHead(ctx context.Context, in WatchPRInput) (stri
 			"watch_pr: CI provider returned an empty head SHA")
 	}
 	return state.HeadRefOid, state.BaseRefName, nil
+}
+
+// reportInformationalChecks makes a required:false decision visible at Watch
+// registration. A red check with Required=false is dropped from the verdict on
+// purpose, so until now a Watch could stay in watching with no log line to
+// explain it. Both events carry an error field so `beacon logs --errors` finds
+// them even though the record level is WARN. A provider failure is ignored:
+// diagnostics must never refuse a registration.
+func (h *WatchPRHandler) reportInformationalChecks(ctx context.Context, in WatchPRInput, watchID string) {
+	if h.ci == nil {
+		return
+	}
+	state, err := h.ci.PRState(ctx, in.Repo, in.PR)
+	if err != nil {
+		return
+	}
+	all, ignored := domain.InformationalCheckDiagnostics(domain.Snapshot{
+		Checks:   state.Checks,
+		Failures: failedCheckNamesFromChecks(state.Checks),
+	})
+	if all {
+		observe.Event(observe.LevelWarn, domain.EventInformationalChecksOnly, observe.Fields{
+			observe.FieldWatchID: watchID,
+			observe.FieldError:   "all observed checks are informational (required:false)",
+		})
+	}
+	for _, name := range ignored {
+		observe.Event(observe.LevelWarn, domain.EventInformationalFailureIgnored, observe.Fields{
+			observe.FieldWatchID: watchID,
+			observe.FieldError:   "failed informational check excluded from verdict: " + name,
+			"check":              name,
+		})
+	}
+}
+
+// failedCheckNamesFromChecks derives the failure list from an observed check
+// set. A provider reports one Check per context, so the names are the keys.
+// The name stays distinct from failedCheckNames in tool_ack.go, which takes a
+// different input type in the same package.
+func failedCheckNamesFromChecks(checks map[string]domain.Check) []string {
+	names := make([]string, 0, len(checks))
+	for name, c := range checks {
+		if domain.NormalizeConclusion(c.Conclusion) == "FAILURE" ||
+			domain.NormalizeConclusion(c.State) == "FAILURE" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // liveWatchSource is the optional store port that includes blocked Watches.
