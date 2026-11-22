@@ -694,7 +694,7 @@ func TestListRunningWatchOutputFields(t *testing.T) {
 	}
 
 	frozen := []string{
-		"baseRef", "blockerID", "blocked", "checks", "closeReason", "closedAt",
+		"baseRef", "blocked", "blockerID", "checks", "closeReason", "closedAt",
 		"configId", "createdAt", "deadlineAt", "depth", "fixBlockerID", "fixFor",
 		"flaky", "headSHA", "id", "issue", "merge", "mergePolicy",
 		"noChecksSince", "orchestratorID", "policy", "pr", "repo", "revision",
