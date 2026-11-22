@@ -261,8 +261,12 @@ func TestRunRetryAndFailAreLeftForWake(t *testing.T) {
 	if len(merger.calls) != 0 {
 		t.Fatalf("retry/fail must not be merged: %+v", merger.calls)
 	}
-	if !reflect.DeepEqual(result.NeedsRebase, []int{11, 12}) {
-		t.Fatalf("needs rebase = %v, want [11 12]", result.NeedsRebase)
+	wantRebase := []RebaseRef{
+		{WatchID: "w1", Revision: 1, PR: 11},
+		{WatchID: "w2", Revision: 2, PR: 12},
+	}
+	if !reflect.DeepEqual(result.NeedsRebase, wantRebase) {
+		t.Fatalf("needs rebase = %+v, want %+v", result.NeedsRebase, wantRebase)
 	}
 	wantWakes := []wakeCall{{"w1", 1, VerdictRetry}, {"w2", 2, VerdictFail}}
 	if !reflect.DeepEqual(waker.calls, wantWakes) {
