@@ -890,12 +890,16 @@ func (h *AckHandler) Decide(ctx context.Context, in AckInput, decision Decision,
 }
 
 // continueWatch applies the domain continue transition to the same Watch. It
-// consumes one answer round before touching the Watch, so a refused round
-// leaves both the Watch and the obligation unchanged. The domain transition
-// never emits EffectCreateWatch; that invariant is checked here as well.
+// checks that the Watch is still parked before reserving an answer round, so a
+// refused answer leaves the round, the Watch and the obligation unchanged. The
+// domain transition never emits EffectCreateWatch; that invariant is checked
+// here as well.
 func (h *AckHandler) continueWatch(in AckInput, w domain.Watch) error {
 	if in.ContinueOf != in.WatchID {
 		return domain.NewAppError(domain.CodeInvalidInput, "ack: continueOf must name the same Watch")
+	}
+	if w.Status != domain.StatusNeedsInput {
+		return domain.NewAppError(domain.CodeLimitExceeded, "ack: Watch is not parked for input")
 	}
 	round, err := h.continuations.Next(in.WatchID)
 	if err != nil {
