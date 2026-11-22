@@ -708,14 +708,34 @@ type PRState struct {
 	BaseHeadSHA string `json:"baseHeadSHA,omitempty"`
 }
 
+// WakeSubagentMessage is the nested content a subagent produced. The two
+// parent identifiers attribute the text and reasoning to the tool call and
+// agent that spawned it, so a caller can match a nested message to its parent.
+type WakeSubagentMessage struct {
+	Text            string `json:"text,omitempty"`
+	Reasoning       string `json:"reasoning,omitempty"`
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	ParentAgentID   string `json:"parent_agent_id,omitempty"`
+}
+
+// WakeForwardConfig controls what nested subagent content a wake carries. The
+// zero value forwards nothing, so an adapter that does not opt in keeps the
+// pointer-only envelope. MaxTextRunes bounds each nested text field.
+type WakeForwardConfig struct {
+	ForwardSubagentText bool `json:"forwardSubagentText"`
+	MaxTextRunes        int  `json:"maxTextRunes,omitempty"`
+}
+
 // WakePayload is the minimal pointer payload a verdict source hands to a wake
 // adapter. It carries identifiers only, never check bodies or PR text.
-// The name differs from the WakePointer kind value in verdict.go.
+// Nested is optional subagent content, rendered only when the delivery config
+// opts in. The name differs from the WakePointer kind value in verdict.go.
 type WakePayload struct {
-	WatchID      string `json:"watchID"`
-	ObligationID string `json:"obligationID"`
-	Revision     uint64 `json:"revision"`
-	Verdict      string `json:"verdict"`
+	WatchID      string               `json:"watchID"`
+	ObligationID string               `json:"obligationID"`
+	Revision     uint64               `json:"revision"`
+	Verdict      string               `json:"verdict"`
+	Nested       *WakeSubagentMessage `json:"nested,omitempty"`
 }
 
 // WakeDeliverer is the port a thin harness adapter implements to steer a

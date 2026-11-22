@@ -80,6 +80,12 @@ const (
 	// opencodeCLITimeout bounds every fallback `opencode api` call. A hung CLI
 	// must not hold a wake forever when the HTTP port is not configured.
 	opencodeCLITimeout = 10 * time.Second
+
+	// subagentMessageTag wraps the one nested message a forwarding wake adds.
+	subagentMessageTag = "beacon-subagent-message"
+	// defaultMaxNestedTextRunes bounds nested text when a caller opts in without
+	// setting a limit, so a long reasoning trace cannot grow the wake unbounded.
+	defaultMaxNestedTextRunes = 2000
 )
 
 // OpenCodeDeliverer posts a wake pointer to an existing OpenCode session.
@@ -114,6 +120,10 @@ type OpenCodeDeliverer struct {
 	// keeps today's envelope untouched (T3.344). A set policy scans the text
 	// at the context-pack boundary before any transport call.
 	ExportPolicy *domain.ExportPolicy
+	// SubagentText opts into forwarding nested subagent text and reasoning.
+	// The zero value keeps the default: the pointer-only envelope, with no
+	// nested message (CSx-14). MaxTextRunes bounds each nested text field.
+	SubagentText domain.WakeForwardConfig
 
 	mu   sync.Mutex
 	seen map[wakeDeliveryKey]struct{}
@@ -341,6 +351,9 @@ func (d *OpenCodeDeliverer) Deliver(ctx context.Context, sessionID string, p dom
 	}
 
 	text := Envelope(p)
+	if d.SubagentText.ForwardSubagentText {
+		text = EnvelopeWithSubagent(p, d.SubagentText.MaxTextRunes)
+	}
 	if d.ExportPolicy != nil {
 		findings := domain.ScanExport(domain.BoundaryContextPack, strings.Split(text, "\n"), *d.ExportPolicy)
 		if len(findings) > 0 {
@@ -493,6 +506,45 @@ func Envelope(p domain.WakePayload) string {
 		"verdict":      p.Verdict,
 	})
 	return "<beacon-event>" + strings.TrimSpace(buf.String()) + "</beacon-event>"
+}
+
+// EnvelopeWithSubagent renders the pointer and, when the payload carries a
+// nested subagent message, appends exactly one nested block. The block carries
+// the parent_tool_use_id and parent_agent_id beside the text and reasoning, so
+// a caller can attribute the nested content to the call that spawned it. Both
+// text fields are truncated to maxRunes to keep the wake bounded. A payload
+// without Nested renders the same envelope as Envelope, with zero nested
+// messages.
+func EnvelopeWithSubagent(p domain.WakePayload, maxRunes int) string {
+	base := Envelope(p)
+	if p.Nested == nil {
+		return base
+	}
+	parentAgentID := p.Nested.ParentAgentID
+	nested := domain.WakeSubagentMessage{
+		Text:            truncateRunes(p.Nested.Text, maxRunes),
+		Reasoning:       truncateRunes(p.Nested.Reasoning, maxRunes),
+		ParentToolUseID: p.Nested.ParentToolUseID,
+		ParentAgentID:   parentAgentID,
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(nested)
+	return base + "<" + subagentMessageTag + ">" + strings.TrimSpace(buf.String()) + "</" + subagentMessageTag + ">"
+}
+
+// truncateRunes cuts s to at most max runes. It works on runes, not bytes, so a
+// multi-byte character is never split. A non-positive limit uses the default.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		max = defaultMaxNestedTextRunes
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max])
 }
 
 // WatchTarget resolves the orchestrator session that owns a wake pointer. The
