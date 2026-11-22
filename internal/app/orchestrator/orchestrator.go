@@ -9,10 +9,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
+	pathpkg "path"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +71,9 @@ const (
 	// ActionApprovalRetry is the approval request for the retry after a
 	// sandbox denial. It runs escalated and carries no extra permissions.
 	ActionApprovalRetry = "approval-retry"
+	// ActionSandboxDenied records one operation refused by the selected
+	// sandbox mode. The Message carries the deciding rule (CCx-06).
+	ActionSandboxDenied = "sandbox-denied"
 )
 
 // AutoMergePolicy is the autor-merge policy of one Watch. AutoMerge is a
@@ -88,6 +93,10 @@ type AutoMergePolicy struct {
 	// MCP wire contract and existing callers are unchanged. When set, it takes
 	// precedence over the bool and governs all five approval categories.
 	Approval *ApprovalSpec `json:"approval,omitempty"`
+	// Sandbox selects the execution restriction for the run. It is optional so
+	// existing config files and the MCP wire contract stay unchanged. A nil
+	// value means unrestricted access (CCx-06).
+	Sandbox *SandboxPolicy `json:"sandbox,omitempty"`
 }
 
 // DefaultAutoMergePolicy is the zero-configuration policy: automatic merging
@@ -104,6 +113,220 @@ func (p AutoMergePolicy) Allows() bool {
 		return false
 	}
 	return !p.approvalRequired(ApprovalMerge) && len(p.WaitFor) == 0 && len(p.WaitForMain) == 0
+}
+
+// ---- CCx-06: sandbox modes ----
+//
+// Codex keeps execution restrictions in one SandboxPolicy with four variants
+// (codex-rs/protocol/src/protocol.rs:1293-1341). Beacon had no such type:
+// AutoMergePolicy decides only merges and git clone --reference gives repo
+// isolation without an access mode. These types name the four modes and tie
+// each one to a write decision and a network decision. They live in app, so
+// they do not import domain and do not grow the MCP tool set.
+
+// sandboxMergeTarget is the repo-relative ref a merge writes. A merge is a
+// write operation even though it does not touch the working tree, so the
+// sandbox write check runs on this path before the merger is called.
+const sandboxMergeTarget = "git/refs/heads"
+
+// SandboxMode is one named execution restriction. A run selects a mode in its
+// startup config; the mode then decides write and network access.
+type SandboxMode string
+
+const (
+	// SandboxDangerFullAccess allows every write and every network request.
+	SandboxDangerFullAccess SandboxMode = "danger-full-access"
+	// SandboxReadOnly denies every write and every network request.
+	SandboxReadOnly SandboxMode = "read-only"
+	// SandboxExternal hands execution to an external sandbox. Beacon itself
+	// performs no direct write and no direct network request.
+	SandboxExternal SandboxMode = "external-sandbox"
+	// SandboxWorkspaceWrite allows writes inside the workspace roots. Network
+	// access is off unless the policy overrides it.
+	SandboxWorkspaceWrite SandboxMode = "workspace-write"
+)
+
+// SandboxModes returns the four modes in a stable order.
+func SandboxModes() []SandboxMode {
+	return []SandboxMode{
+		SandboxDangerFullAccess, SandboxReadOnly, SandboxExternal, SandboxWorkspaceWrite,
+	}
+}
+
+// ValidateSandboxMode rejects a name outside the four modes. An unknown mode
+// must fail at config load instead of falling through to full access.
+func ValidateSandboxMode(mode SandboxMode) error {
+	for _, known := range SandboxModes() {
+		if mode == known {
+			return nil
+		}
+	}
+	return fmt.Errorf("orchestrator: unknown sandbox mode %q", string(mode))
+}
+
+// UnmarshalJSON validates the mode while the startup config is parsed, so a
+// typo cannot silently become an unrestricted run.
+func (m *SandboxMode) UnmarshalJSON(data []byte) error {
+	var name string
+	if err := json.Unmarshal(data, &name); err != nil {
+		return fmt.Errorf("orchestrator: sandbox mode: %w", err)
+	}
+	mode := SandboxMode(strings.TrimSpace(name))
+	if err := ValidateSandboxMode(mode); err != nil {
+		return err
+	}
+	*m = mode
+	return nil
+}
+
+// SandboxPolicy is the configured restriction for one run. Mode selects the
+// behaviour. WritableRoots narrows workspace-write; an empty list means the
+// whole workspace. NetworkAccess overrides the mode default only when set.
+type SandboxPolicy struct {
+	Mode          SandboxMode `json:"mode"`
+	WritableRoots []string    `json:"writableRoots,omitempty"`
+	NetworkAccess *bool       `json:"networkAccess,omitempty"`
+}
+
+// DefaultSandboxPolicy keeps the historical behaviour of runs that declare no
+// sandbox. A missing config must not change any existing verdict.
+func DefaultSandboxPolicy() SandboxPolicy {
+	return SandboxPolicy{Mode: SandboxDangerFullAccess}
+}
+
+// Validate checks the mode and every writable root. A root must be a clean
+// relative path inside the workspace, so an escape cannot widen the mode.
+func (p SandboxPolicy) Validate() error {
+	if err := ValidateSandboxMode(p.Mode); err != nil {
+		return err
+	}
+	for _, root := range p.WritableRoots {
+		clean, err := cleanWorkspacePath(root)
+		if err != nil {
+			return fmt.Errorf("orchestrator: sandbox writable root %q: %w", root, err)
+		}
+		if clean == "." {
+			return fmt.Errorf("orchestrator: sandbox writable root %q: use an empty list for the whole workspace", root)
+		}
+	}
+	return nil
+}
+
+// SandboxCheck is one access decision. Reason names the rule that decided it,
+// so a denial can be reported without guessing which flag won.
+type SandboxCheck struct {
+	Operation string      `json:"operation"`
+	Path      string      `json:"path,omitempty"`
+	Mode      SandboxMode `json:"mode"`
+	Allowed   bool        `json:"allowed"`
+	Reason    string      `json:"reason"`
+}
+
+// CheckWrite decides whether path may be written under this policy. An
+// absolute path and any path escaping the workspace are denied in every mode,
+// including danger-full-access, because Beacon records repo-relative paths.
+func (p SandboxPolicy) CheckWrite(path string) SandboxCheck {
+	check := SandboxCheck{Operation: "write", Path: path, Mode: p.Mode}
+	clean, pathErr := cleanWorkspacePath(path)
+	if pathErr != nil {
+		check.Reason = "invalid path: " + pathErr.Error()
+		return check
+	}
+	switch p.Mode {
+	case SandboxDangerFullAccess:
+		check.Allowed, check.Reason = true, "mode: danger-full-access"
+	case SandboxReadOnly, SandboxExternal:
+		check.Reason = "mode: " + string(p.Mode) + " denies writes"
+	case SandboxWorkspaceWrite:
+		if len(p.WritableRoots) == 0 {
+			check.Allowed, check.Reason = true, "whole workspace"
+			break
+		}
+		for _, root := range p.WritableRoots {
+			cleanRoot, err := cleanWorkspacePath(root)
+			if err != nil || cleanRoot == "." {
+				continue
+			}
+			if clean == cleanRoot || strings.HasPrefix(clean, cleanRoot+"/") {
+				check.Allowed = true
+				check.Reason = "writable root: " + cleanRoot
+				break
+			}
+		}
+		if !check.Allowed {
+			check.Reason = "path outside writable roots"
+		}
+	default:
+		check.Reason = "unknown sandbox mode: " + string(p.Mode)
+	}
+	return check
+}
+
+// CheckNetwork decides whether a network request may be made under this
+// policy. Only danger-full-access allows network by default; an explicit
+// NetworkAccess overrides the mode for the other three.
+func (p SandboxPolicy) CheckNetwork() SandboxCheck {
+	check := SandboxCheck{Operation: "network", Mode: p.Mode}
+	if ValidateSandboxMode(p.Mode) != nil {
+		check.Reason = "unknown sandbox mode: " + string(p.Mode)
+		return check
+	}
+	check.Allowed = p.Mode == SandboxDangerFullAccess
+	check.Reason = "mode: " + string(p.Mode)
+	if check.Allowed {
+		check.Reason += " allows network"
+	} else {
+		check.Reason += " denies network"
+	}
+	if p.NetworkAccess != nil {
+		check.Allowed = *p.NetworkAccess
+		if check.Allowed {
+			check.Reason = "networkAccess override allows network"
+		} else {
+			check.Reason = "networkAccess override denies network"
+		}
+	}
+	return check
+}
+
+// ErrSandboxDenied marks a refused write or network request. Callers can use
+// errors.Is to tell a sandbox refusal from a transport or merge error.
+var ErrSandboxDenied = errors.New("orchestrator: sandbox denied")
+
+// AuthorizeWrite returns nil when path may be written and wraps
+// ErrSandboxDenied with the deciding reason otherwise.
+func (p SandboxPolicy) AuthorizeWrite(path string) error {
+	check := p.CheckWrite(path)
+	if check.Allowed {
+		return nil
+	}
+	return fmt.Errorf("%w: write %q: %s", ErrSandboxDenied, path, check.Reason)
+}
+
+// AuthorizeNetwork returns nil when a network request may be made and wraps
+// ErrSandboxDenied with the deciding reason otherwise.
+func (p SandboxPolicy) AuthorizeNetwork() error {
+	check := p.CheckNetwork()
+	if check.Allowed {
+		return nil
+	}
+	return fmt.Errorf("%w: network: %s", ErrSandboxDenied, check.Reason)
+}
+
+func cleanWorkspacePath(path string) (string, error) {
+	p := strings.TrimSpace(strings.ReplaceAll(path, "\\", "/"))
+	p = strings.TrimPrefix(p, "./")
+	if p == "" {
+		return "", errors.New("empty path")
+	}
+	if strings.HasPrefix(p, "/") {
+		return "", fmt.Errorf("absolute path %q", path)
+	}
+	clean := pathpkg.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, "../") {
+		return "", fmt.Errorf("path %q escapes workspace", path)
+	}
+	return clean, nil
 }
 
 // ---- CC-03: declarative approval policy ----
@@ -536,6 +759,15 @@ type Watch struct {
 	Source Source
 }
 
+// SandboxPolicy resolves the effective sandbox restriction for this Watch.
+// A Watch without a declared policy keeps the unrestricted default.
+func (w Watch) SandboxPolicy() SandboxPolicy {
+	if w.Policy == nil || w.Policy.Sandbox == nil {
+		return DefaultSandboxPolicy()
+	}
+	return *w.Policy.Sandbox
+}
+
 func (w Watch) autoMergeAllowed() bool {
 	if w.Policy == nil {
 		return DefaultAutoMergePolicy().Allows()
@@ -850,6 +1082,10 @@ type Options struct {
 	// nil, so their verdicts are unchanged (CCx-05).
 	NetworkApprover NetworkApprover
 	NetworkSpec     *NetworkSpec
+	// Sandbox is the startup-selected restriction. When set, a network
+	// operation is refused before approval if the mode forbids network. A nil
+	// value leaves every existing call path unchanged (CCx-06).
+	Sandbox *SandboxPolicy
 }
 
 // Run walks the active Watches once. Ready Watches with autor-merge enabled
@@ -1065,6 +1301,11 @@ func retryTransient[T any](ctx context.Context, call func() (T, error)) (T, erro
 // a no-op, which keeps every existing call path free of approvals (CCx-05).
 func withNetworkApproval[T any](ctx context.Context, opts Options, call func() (T, error)) (T, error) {
 	var zero T
+	if opts.Sandbox != nil {
+		if err := opts.Sandbox.AuthorizeNetwork(); err != nil {
+			return zero, err
+		}
+	}
 	if opts.NetworkApprover == nil || opts.NetworkSpec == nil {
 		return call()
 	}
@@ -1132,6 +1373,15 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 	}
 
 	command := fmt.Sprintf("gh pr merge %d --squash --delete-branch", w.PR)
+	if err := w.SandboxPolicy().AuthorizeWrite(sandboxMergeTarget); err != nil {
+		observe.ActorError("sandbox", w.ID, err)
+		out.Actions = append(out.Actions, Action{
+			Action: ActionSandboxDenied, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
+			Message: err.Error(),
+		})
+		*errs = append(*errs, fmt.Errorf("orchestrator: sandbox for PR %d: %w", w.PR, err))
+		return
+	}
 	if opts.DryRun {
 		out.Actions = append(out.Actions, Action{
 			Action: ActionDryRun, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
