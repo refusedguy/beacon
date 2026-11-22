@@ -27,8 +27,17 @@ func TestVerdictMirrorsMatchDomain(t *testing.T) {
 			t.Errorf("domain contract misses %q", v)
 		}
 	}
-	if got, want := string(domain.GreenBlocked), string(domain.VerdictGreenBlocked); got != want {
-		t.Errorf("green blocked values differ: verdict.go %q, contract %q", got, want)
+	// VC-01: green_blocked has one definition, domain.GreenBlocked. The
+	// Verdict contract mirrors that value instead of repeating the literal,
+	// and ReleasesSlot is the single source of its slot-freeing semantics.
+	if got, want := string(domain.GreenBlocked), "green_blocked"; got != want {
+		t.Errorf("green_blocked value = %q, want %q", got, want)
+	}
+	if got, want := string(domain.VerdictGreenBlocked), string(domain.GreenBlocked); got != want {
+		t.Errorf("contract green_blocked = %q, domain = %q", got, want)
+	}
+	if !domain.GreenBlocked.ReleasesSlot() {
+		t.Error("green_blocked must free the execution slot while the blocker is open")
 	}
 
 	// Every string the app can emit as a verdict must be in the contract.
