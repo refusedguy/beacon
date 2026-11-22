@@ -28,11 +28,14 @@ var (
 	ErrScheduleExists   = errors.New("store: schedules: schedule already exists")
 )
 
-// The three kinds of schedule the scheduler understands.
+// The kinds of schedule the scheduler understands. The port calls a
+// mark-triggered schedule "mark"; the store keeps it as "webhook" so reads
+// return one canonical value for both spellings.
 const (
 	ScheduleKindInterval = "interval"
 	ScheduleKindCron     = "cron"
 	ScheduleKindWebhook  = "webhook"
+	ScheduleKindMark     = "mark"
 )
 
 // Schedule is one persisted schedule row. NextRun is the absolute time at
@@ -63,10 +66,20 @@ CREATE TABLE IF NOT EXISTS schedules (
 CREATE INDEX IF NOT EXISTS schedules_by_enabled_next_run ON schedules(enabled, next_run);
 `
 
+// normalizeScheduleKind maps a port-facing kind to its canonical stored form.
+// "mark" and "webhook" are two spellings of the same schedule kind, so both
+// are stored as "webhook" and reads always return that single value.
+func normalizeScheduleKind(kind string) string {
+	if kind == ScheduleKindMark {
+		return ScheduleKindWebhook
+	}
+	return kind
+}
+
 // validScheduleKind reports whether kind is one of the supported schedule
-// kinds.
+// kinds, after normalizing the port-facing spelling.
 func validScheduleKind(kind string) bool {
-	switch kind {
+	switch normalizeScheduleKind(kind) {
 	case ScheduleKindInterval, ScheduleKindCron, ScheduleKindWebhook:
 		return true
 	default:
@@ -82,6 +95,7 @@ func (d *DB) SaveSchedule(s Schedule) error {
 	if d == nil {
 		return errors.New("store: schedules: nil db")
 	}
+	s.Kind = normalizeScheduleKind(s.Kind)
 	if err := validateSchedule(s); err != nil {
 		return err
 	}
@@ -274,6 +288,7 @@ func (d *DB) CreateSchedule(ctx context.Context, s Schedule) error {
 	if d == nil {
 		return errors.New("store: schedules: nil db")
 	}
+	s.Kind = normalizeScheduleKind(s.Kind)
 	if err := validateSchedule(s); err != nil {
 		return err
 	}
@@ -359,6 +374,7 @@ func (d *DB) UpdateSchedule(ctx context.Context, s Schedule) error {
 	if d == nil {
 		return errors.New("store: schedules: nil db")
 	}
+	s.Kind = normalizeScheduleKind(s.Kind)
 	if err := validateSchedule(s); err != nil {
 		return err
 	}
