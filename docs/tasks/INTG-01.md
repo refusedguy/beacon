@@ -1,5 +1,6 @@
 # INTG-01. Зарегистрировать serverRunner в диспетчере команд
-Статус: todo
+Статус: done
+Premise: PR #1450, коммит 851d533e4f3240d64445a596e3d25997af43024f, зарегистрировал сервер в dispatch и каталоге. git merge-base --is-ancestor 851d533e4f3240d64445a596e3d25997af43024f origin/main вернул 0.
 Фаза: P1
 Тип: task
 Владелец файлов: cmd/beacon/main.go, cmd/beacon/server_test.go

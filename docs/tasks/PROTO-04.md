@@ -1,5 +1,6 @@
 # PROTO-04. Зафиксировать разделение каналов в шаблонах агентов
-Статус: todo
+Статус: done
+Premise: PR #1463, коммит fd7286b0cb31c6485e49932d9d2501d6c769e805, исправил разделение каналов в шаблонах агентов. git merge-base --is-ancestor fd7286b0cb31c6485e49932d9d2501d6c769e805 origin/main вернул 0.
 Фаза: P2
 Тип: doc
 Владелец файлов: docs/templates/executor-task.md, docs/templates/orchestrator-task.md

@@ -1,5 +1,6 @@
 # PROTO-02. Ввести типизированную SSE-обёртку для событий Watch
-Статус: todo
+Статус: done
+Premise: PR #1445, коммит 554e2306706bca76cc521399d45112b0707473a8, добавил типизированную обёртку SSE для /api/v1/events и EventContract. git merge-base --is-ancestor 554e2306706bca76cc521399d45112b0707473a8 origin/main вернул 0.
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/httpapi/server.go, internal/infra/httpapi/server_test.go

@@ -1,5 +1,6 @@
 # BVF-04. Проверять batch-пакеты в CI до их применения
-Статус: todo
+Статус: done
+Premise: PR #1475, коммит 85eefb4309a0558d9f969d466b605f7877117216, добавил проверку owner_file в валидатор batch-паков и включил её в обязательный тест в CI. git merge-base --is-ancestor 85eefb4309a0558d9f969d466b605f7877117216 origin/main вернул 0.
 Фаза: P3
 Тип: task
 Владелец файлов: internal/infra/batchapply/apply_test.go, .github/workflows/ci.yml
