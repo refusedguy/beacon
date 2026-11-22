@@ -2,6 +2,7 @@ package taskcli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -2586,6 +2587,133 @@ func TestDeferWritesDateAndStatus(t *testing.T) {
 	c = cardByID(t, e, "T2.36")
 	if strings.TrimSpace(c.Extra[deferUntilField]) != deferForever {
 		t.Fatalf("бессрочная отложка не записана: %+v", c)
+	}
+}
+
+func reclaimField(t *testing.T, err error) string {
+	t.Helper()
+	var fe *ReclaimFieldError
+	if !errors.As(err, &fe) {
+		t.Fatalf("ожидалась ReclaimFieldError, получено %T: %v", err, err)
+	}
+	return fe.Field
+}
+
+func TestReclaimRejectsOverCapBeforeRead(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.20", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-19T14:03:21Z")
+	reads := 0
+	e.svc.loadCards = func(dir string) ([]Card, error) {
+		reads++
+		return LoadCards(dir)
+	}
+	ids := make([]string, 0, MaxReclaimIDs+1)
+	for i := 0; i <= MaxReclaimIDs; i++ {
+		ids = append(ids, fmt.Sprintf("T2.%d", i))
+	}
+	got, err := e.svc.ReapStaleCards(ReapOptions{
+		Now: reaperTestTime(), Agent: "reaper-test", IDs: ids,
+	})
+	if err == nil || reclaimField(t, err) != "ids" {
+		t.Fatalf("ожидалась ошибка поля ids, получено %+v err=%v", got, err)
+	}
+	if reads != 0 {
+		t.Fatalf("карточки прочитаны до валидации: %d", reads)
+	}
+}
+
+func TestReclaimFieldErrorsNameFields(t *testing.T) {
+	cases := []struct {
+		name string
+		req  ReclaimRequest
+		want string
+	}{
+		{"empty agent", ReclaimRequest{Agent: "   "}, "agent"},
+		{"empty id item", ReclaimRequest{Agent: "reaper-test", IDs: []string{"T2.1", "  "}}, "ids"},
+		{"negative age", ReclaimRequest{Agent: "reaper-test", OlderThan: -time.Second}, "older_than"},
+		{"long agent", ReclaimRequest{Agent: strings.Repeat("a", MaxReclaimAgentBytes+1)}, "agent"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateReclaimRequest(tc.req)
+			if err == nil || reclaimField(t, err) != tc.want {
+				t.Fatalf("поле ошибки: хотим %q, получили err=%v", tc.want, err)
+			}
+		})
+	}
+	if err := ValidateReclaimRequest(ReclaimRequest{Agent: strings.Repeat("a", MaxReclaimAgentBytes)}); err != nil {
+		t.Fatalf("исполнитель длиной %d байт должен проходить: %v", MaxReclaimAgentBytes, err)
+	}
+}
+
+func TestReclaimSharedCutoffAcrossPaths(t *testing.T) {
+	req := ReclaimRequest{
+		Agent:     "reaper-test",
+		OlderThan: 5 * time.Minute,
+		IDs:       []string{"T2.1", "T2.2", "T2.1"},
+	}
+	wantCutoff := reaperTestTime().Add(-5 * time.Minute)
+	// Три вызова моделируют один запрос из CLI, MCP и daemon.
+	for i := 0; i < 3; i++ {
+		plan, err := prepareReclaim(req, reaperTestTime())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plan.Cutoff.Equal(wantCutoff) {
+			t.Fatalf("путь %d: срез %s, хотим %s", i, plan.Cutoff, wantCutoff)
+		}
+		if len(plan.IDs) != 2 || !plan.wants("T2.1") || !plan.wants("T2.2") || plan.wants("T2.3") {
+			t.Fatalf("путь %d: набор ID %+v", i, plan.IDs)
+		}
+	}
+}
+
+func TestReapStaleCardsHonorsIDFilter(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.21", "in_progress", "task", "ADR 0001", "internal/app/a/one.go",
+		"agent-1", "2026-11-19T14:03:21Z")
+	e.card(t, "T2.22", "in_progress", "task", "ADR 0001", "internal/app/a/two.go",
+		"agent-2", "2026-11-19T14:03:21Z")
+
+	got, err := e.svc.ReapStaleCards(ReapOptions{
+		Now: reaperTestTime(), Agent: "reaper-test",
+		IDs: []string{"T2.21", "T2.21"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scanned != 1 || len(got.Reaped) != 1 || got.Reaped[0] != "T2.21" {
+		t.Fatalf("фильтр ID проигнорирован: %+v", got)
+	}
+	if c := cardByID(t, e, "T2.22"); c.Status != "in_progress" {
+		t.Fatalf("карточка вне фильтра изменена: %+v", c)
+	}
+	log, err := e.svc.ReaperLog()
+	if err != nil || len(log) != 1 || log[0].CardID != "T2.21" {
+		t.Fatalf("журнал: %+v err=%v", log, err)
+	}
+}
+
+func TestReapStaleCardsRejectsLongAgentBeforeJournal(t *testing.T) {
+	e := newEnv(t)
+	reads := 0
+	e.svc.loadCards = func(dir string) ([]Card, error) {
+		reads++
+		return LoadCards(dir)
+	}
+	got, err := e.svc.ReapStaleCards(ReapOptions{
+		Now: reaperTestTime(), Agent: strings.Repeat("a", MaxReclaimAgentBytes+1),
+	})
+	if err == nil || reclaimField(t, err) != "agent" {
+		t.Fatalf("ожидалась ошибка поля agent, получено %+v err=%v", got, err)
+	}
+	if reads != 0 {
+		t.Fatalf("карточки прочитаны до валидации: %d", reads)
+	}
+	log, err := e.svc.ReaperLog()
+	if err != nil || len(log) != 0 {
+		t.Fatalf("журнал записан при неверном запросе: %+v err=%v", log, err)
 	}
 }
 

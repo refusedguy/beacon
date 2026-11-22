@@ -86,6 +86,18 @@ type Service struct {
 	// recheckMu сериализует post-commit recheck, чтобы два параллельных
 	// закрытия не писали отчёт и счётчик одновременно.
 	recheckMu sync.Mutex
+
+	// loadCards читает карточки. Тесты подменяют его, чтобы считать чтения
+	// и доказать, что неверный запрос отклонён до первого чтения.
+	loadCards func(string) ([]Card, error)
+}
+
+// loadReapCards читает карточки через подменяемый в тестах порт.
+func (s *Service) loadReapCards(tasksDir string) ([]Card, error) {
+	if s.loadCards != nil {
+		return s.loadCards(tasksDir)
+	}
+	return LoadCards(tasksDir)
 }
 
 // NewService создаёт сервис с конфигурацией.
@@ -972,12 +984,16 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 const CardLeaseTTL = 30 * time.Minute
 
 // ReapOptions задаёт внедряемые часы, TTL и порты проверки живой работы.
-// Пустое Now означает time.Now().UTC(), неположительный TTL означает CardLeaseTTL.
+// Пустое Now означает time.Now().UTC(), нулевой TTL означает CardLeaseTTL.
+// Отрицательный TTL отклоняется общим валидатором запроса.
 // Нулевой порт означает отсутствие жизни, так тесты моделируют мёртвый воркер.
 type ReapOptions struct {
 	Now   time.Time
-	TTL   time.Duration
-	Agent string // подпись агента, который запустил reaper, для журнала
+	TTL   time.Duration // возраст, после которого карточка считается оставленной
+	Agent string        // подпись агента, который запустил reaper, для журнала
+	// IDs — фильтр карточек. Пустой список означает все карточки.
+	// Длина исходного списка проверяется до дедупликации.
+	IDs []string
 	// WatchAlive сообщает, что карточка всё ещё связана с живым Watch.
 	WatchAlive func(cardID string) (bool, error)
 	// ProcessAlive сообщает, что у карточки жив процесс воркера.
@@ -1071,20 +1087,119 @@ func newReaperRepo(cfg Config) reaperRepo {
 	return reaperRepo{newFileRepo[reaperState](cfg, fileRepoSpecs.reaper)}
 }
 
-// ReapStaleCards переводит в todo карточки in_progress, у которых истёк TTL и
-// нет живого Watch или процесса. Проход идемпотентен: после возврата карточка
-// имеет статус todo и больше не попадает в выборку, поэтому повторный вызов
-// не пишет вторую запись в журнал.
-func (s *Service) ReapStaleCards(o ReapOptions) (ReapResult, error) {
-	now := o.Now
+// ---- CBX-15: общий контракт запроса освобождения аренды ----
+//
+// CLI, MCP и daemon собирают ReclaimRequest и вызывают prepareReclaim.
+// Валидация и счёт времени живут в одной точке, поэтому отказ и срез
+// совпадают для всех путей вызова.
+
+const (
+	// MaxReclaimIDs — предел исходного списка ID до дедупликации.
+	MaxReclaimIDs = 20
+	// MaxReclaimAgentBytes — предел длины исполнителя из-за VARCHAR(255).
+	MaxReclaimAgentBytes = 255
+)
+
+// ReclaimFieldError называет поле запроса, которое не прошло проверку.
+// Ошибка оборачивает Validationf, поэтому код выхода остаётся ошибкой
+// пользовательского ввода.
+type ReclaimFieldError struct {
+	Field string
+	err   error
+}
+
+func (e *ReclaimFieldError) Error() string { return e.err.Error() }
+func (e *ReclaimFieldError) Unwrap() error { return e.err }
+
+func reclaimFieldError(field, format string, a ...any) error {
+	return &ReclaimFieldError{Field: field, err: Validationf(format, a...)}
+}
+
+// ReclaimRequest — общий контракт запроса reclaim. Валидация не читает данные.
+type ReclaimRequest struct {
+	Agent     string        // исполнитель: непустой после обрезки, не длиннее 255 байт
+	OlderThan time.Duration // возраст: неотрицательный, ноль означает CardLeaseTTL
+	IDs       []string      // исходный фильтр ID: не более 20 элементов, без пустых
+}
+
+// ValidateReclaimRequest проверяет запрос и не читает карточки. Первая
+// обнаруженная ошибка содержит имя поля. Cap считается по исходному списку
+// до дедупликации.
+func ValidateReclaimRequest(r ReclaimRequest) error {
+	if strings.TrimSpace(r.Agent) == "" {
+		return reclaimFieldError("agent", "не задан исполнитель reclaim")
+	}
+	if len(r.Agent) > MaxReclaimAgentBytes {
+		return reclaimFieldError("agent", "исполнитель длиннее %d байт: %d", MaxReclaimAgentBytes, len(r.Agent))
+	}
+	if r.OlderThan < 0 {
+		return reclaimFieldError("older_than", "возраст не может быть отрицательным: %s", r.OlderThan)
+	}
+	if len(r.IDs) > MaxReclaimIDs {
+		return reclaimFieldError("ids", "запрошено %d ID, максимум %d до дедупликации", len(r.IDs), MaxReclaimIDs)
+	}
+	for _, id := range r.IDs {
+		if strings.TrimSpace(id) == "" {
+			return reclaimFieldError("ids", "пустой элемент фильтра ID")
+		}
+	}
+	return nil
+}
+
+// reclaimPlan — проверенный запрос, готовый к чтению карточек. Cutoff
+// вычисляется один раз и используется во всех путях вызова.
+type reclaimPlan struct {
+	Now    time.Time
+	Cutoff time.Time
+	Agent  string
+	IDs    map[string]bool // nil означает отсутствие фильтра
+}
+
+// prepareReclaim валидирует запрос и строит план. Карточки не читаются.
+func prepareReclaim(r ReclaimRequest, now time.Time) (reclaimPlan, error) {
+	if err := ValidateReclaimRequest(r); err != nil {
+		return reclaimPlan{}, err
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
 		now = now.UTC()
 	}
-	ttl := o.TTL
-	if ttl <= 0 {
-		ttl = CardLeaseTTL
+	age := r.OlderThan
+	if age == 0 {
+		age = CardLeaseTTL
+	}
+	plan := reclaimPlan{
+		Now:    now,
+		Cutoff: now.Add(-age),
+		Agent:  r.Agent,
+	}
+	if len(r.IDs) > 0 {
+		plan.IDs = make(map[string]bool, len(r.IDs))
+		for _, id := range r.IDs {
+			plan.IDs[strings.TrimSpace(id)] = true
+		}
+	}
+	return plan, nil
+}
+
+// reclaimRequestFromOptions преобразует options сервиса в общий запрос.
+func reclaimRequestFromOptions(o ReapOptions) ReclaimRequest {
+	return ReclaimRequest{Agent: o.Agent, OlderThan: o.TTL, IDs: o.IDs}
+}
+
+func (p reclaimPlan) wants(id string) bool {
+	return p.IDs == nil || p.IDs[id]
+}
+
+// ReapStaleCards переводит в todo карточки in_progress, у которых истёк TTL и
+// нет живого Watch или процесса. Проход идемпотентен: после возврата карточка
+// имеет статус todo и больше не попадает в выборку, поэтому повторный вызов
+// не пишет вторую запись в журнал.
+func (s *Service) ReapStaleCards(o ReapOptions) (ReapResult, error) {
+	plan, err := prepareReclaim(reclaimRequestFromOptions(o), o.Now)
+	if err != nil {
+		return ReapResult{}, err
 	}
 
 	lock, err := s.acquireLock()
@@ -1093,7 +1208,7 @@ func (s *Service) ReapStaleCards(o ReapOptions) (ReapResult, error) {
 	}
 	defer lock.Release()
 
-	cards, err := LoadCards(s.Cfg.TasksDir)
+	cards, err := s.loadReapCards(s.Cfg.TasksDir)
 	if err != nil {
 		return ReapResult{}, err
 	}
@@ -1101,12 +1216,12 @@ func (s *Service) ReapStaleCards(o ReapOptions) (ReapResult, error) {
 	out := ReapResult{Reaped: []string{}, Skipped: []string{}}
 	var freed []ReaperLogEntry
 	for _, c := range cards {
-		if c.Status != "in_progress" {
+		if c.Status != "in_progress" || !plan.wants(c.ID) {
 			continue
 		}
 		out.Scanned++
 		takenAt, err := time.Parse(time.RFC3339, strings.TrimSpace(c.Time))
-		if err != nil || !now.After(takenAt.Add(ttl)) {
+		if err != nil || !plan.Cutoff.After(takenAt) {
 			out.Skipped = append(out.Skipped, c.ID)
 			continue
 		}
@@ -1128,12 +1243,12 @@ func (s *Service) ReapStaleCards(o ReapOptions) (ReapResult, error) {
 		}
 		out.Reaped = append(out.Reaped, c.ID)
 		freed = append(freed, ReaperLogEntry{
-			Time:    now,
+			Time:    plan.Now,
 			CardID:  c.ID,
-			Agent:   o.Agent,
+			Agent:   plan.Agent,
 			TakenAt: c.Time,
 			Reason: fmt.Sprintf("карточка %s освобождена reaper: старше %s, живого Watch и процесса нет",
-				c.ID, ttl),
+				c.ID, plan.Now.Sub(plan.Cutoff)),
 		})
 	}
 
