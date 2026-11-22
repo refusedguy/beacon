@@ -175,6 +175,12 @@ func testMCPWithGoSDK(t *testing.T, binary string) {
 	if !slices.Equal(names, want) {
 		t.Fatalf("tools/list: получено %v, ожидалось %v", names, want)
 	}
+	// PROTO-01: expectedSet comes from AdvertisedToolNames, so the eleventh
+	// name is part of the shared catalog rather than a local E2E copy. Pin it
+	// here to catch a future switch back to a ten-name literal.
+	if !slices.Contains(expectedSet, beaconmcp.WakeToolName) {
+		t.Fatalf("общий каталог не содержит %s: %v", beaconmcp.WakeToolName, expectedSet)
+	}
 	t.Logf("tools/list: ровно %d инструментов: %v", len(names), names)
 
 	// tools/call goes through the same CommandTransport session. The tool is a
