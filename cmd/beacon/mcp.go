@@ -1020,12 +1020,34 @@ type humanDecisionSink struct {
 	db       *store.DB
 	registry *wake.Registry
 	events   *httpapi.EventBus
+	// acks is shared across requests. The decision and continuation registries
+	// inside it keep a repeat answer a no-op and refuse a conflicting second
+	// answer, the same way the local `beacon human` path does.
+	acks *mcp.AckHandler
+}
+
+// newHumanDecisionSink builds a sink with one ack handler for the process. The
+// handler carries the in-memory decision registries, so it must outlive a
+// single request.
+func newHumanDecisionSink(db *store.DB, registry *wake.Registry, events *httpapi.EventBus) humanDecisionSink {
+	return humanDecisionSink{
+		db: db, registry: registry, events: events,
+		acks: mcp.NewAckHandler(db, mcp.NewSQLObligationStamper(db), nil),
+	}
 }
 
 func (s humanDecisionSink) Apply(ctx context.Context, d httpapi.Decision) (httpapi.DecisionResult, error) {
 	result := httpapi.DecisionResult{Command: d.Command, WatchID: d.WatchID}
 	if s.db == nil {
 		return result, errors.New("httpapi: store недоступен")
+	}
+	// The transport rejects unknown verbs before they reach the sink. Keep the
+	// guard here as well so a direct caller cannot journal a command that has
+	// no effect.
+	switch d.Command {
+	case "approve", "reject", "context", "rework", "pause", "resume", "unblock", "cancel", "force_retry_merge":
+	default:
+		return result, fmt.Errorf("httpapi: неизвестная команда %s", d.Command)
 	}
 	w, err := s.db.Watch(d.WatchID)
 	if err != nil {
@@ -1078,6 +1100,16 @@ func (s humanDecisionSink) Apply(ctx context.Context, d httpapi.Decision) (httpa
 		if err := s.db.SaveWatch(w); err != nil {
 			return result, err
 		}
+	case "approve", "reject", "rework", "context":
+		if err := s.applyAckDecision(ctx, d, w); err != nil {
+			return result, err
+		}
+		// The ack resumes the same Watch and stamps its obligation. Read it
+		// again so the reported status and the wake carry the new revision.
+		w, err = s.db.Watch(d.WatchID)
+		if err != nil {
+			return result, err
+		}
 	}
 	result.Status = string(w.Status) + "/" + string(w.Verdict)
 
@@ -1091,6 +1123,44 @@ func (s humanDecisionSink) Apply(ctx context.Context, d httpapi.Decision) (httpa
 		})
 	}
 	return result, nil
+}
+
+// applyAckDecision resumes a parked Watch through the same ack port the local
+// `beacon human` path uses. approve and reject carry a decision, rework and
+// context continue the parked task on the same Watch. The note correlates the
+// answer with the request, and continueOf always names the Watch read from the
+// store so no successor Watch is created (ADR 0061 §4).
+func (s humanDecisionSink) applyAckDecision(ctx context.Context, d httpapi.Decision, w domain.Watch) error {
+	obligations, err := s.db.WatchObligations(w.ID)
+	if err != nil {
+		return err
+	}
+	if len(obligations) == 0 {
+		return fmt.Errorf("httpapi: watch %s has no obligation", w.ID)
+	}
+	obligationID := d.ObligationID
+	if obligationID == "" {
+		obligationID = obligations[0].ID
+	}
+	in := mcp.AckInput{
+		WatchID:      w.ID,
+		ObligationID: obligationID,
+		DecisionID:   d.Note,
+	}
+	handler := s.acks
+	if handler == nil {
+		handler = mcp.NewAckHandler(s.db, mcp.NewSQLObligationStamper(s.db), nil)
+	}
+	switch d.Command {
+	case "approve":
+		_, err = handler.Decide(ctx, in, mcp.DecisionApprove, d.Note)
+	case "reject":
+		_, err = handler.Decide(ctx, in, mcp.DecisionReject, d.Note)
+	case "rework", "context":
+		in.ContinueOf = w.ID
+		err = handler.Ack(ctx, in)
+	}
+	return err
 }
 
 // wake steers the executor and orchestrator subscribers of the affected Watch.
@@ -1184,9 +1254,7 @@ func startHTTPAPI(_ context.Context, cfg reconcileConfig, bus *httpapi.EventBus)
 		Provider: httpStateProvider{
 			db: cfg.db, dir: cfg.dir, projectKey: cfg.projectKey, deps: cfg.deps,
 		},
-		Sink: humanDecisionSink{
-			db: cfg.db, registry: reconcileWaker(cfg.db), events: bus,
-		},
+		Sink:   newHumanDecisionSink(cfg.db, reconcileWaker(cfg.db), bus),
 		Events: bus,
 	})
 	if err != nil {

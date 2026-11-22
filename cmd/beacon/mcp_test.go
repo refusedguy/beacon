@@ -19,6 +19,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // stubMCPDaemon replaces the in-process daemon for MCP tests that only care
@@ -1108,5 +1109,146 @@ func TestADR0314PortsWiredIntoProductionDeps(t *testing.T) {
 	}
 	if status.Ready() {
 		t.Fatalf("GraphStatus после правки без пересборки = %+v, ожидался stale", status)
+	}
+}
+
+// fte08WakeDeliverer records every wake the HTTP sink sends. The registry
+// calls it synchronously, so no lock is needed.
+type fte08WakeDeliverer struct {
+	payloads []domain.WakePayload
+}
+
+func (d *fte08WakeDeliverer) Deliver(_ context.Context, _ string, p domain.WakePayload) error {
+	d.payloads = append(d.payloads, p)
+	return nil
+}
+
+// FTE-08: the HTTP decision sink must resume a parked Watch through the same
+// ack port the local `beacon human` path uses. The same Watch stays in place,
+// its revision advances by one, the obligation keeps its claimedAt, and the
+// subscribers receive a wake.
+func TestFTE08HumanDecisionSinkResumesNeedsInputWatch(t *testing.T) {
+	dir := t.TempDir()
+	seed, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watch := domain.Watch{
+		ID:       "w-fte08",
+		Repo:     "o/r",
+		PR:       7,
+		HeadSHA:  "sha",
+		Status:   domain.StatusNeedsInput,
+		Verdict:  domain.VerdictNeedsInput,
+		Revision: 7,
+		Subscribers: []domain.Subscriber{
+			{ID: "ses-exec", Role: domain.RoleExecutor, Adapter: wake.AdapterOpenCode, Target: "ses-exec"},
+		},
+	}
+	if err := seed.SaveWatch(watch); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	obligation := domain.Obligation{
+		ID:             domain.ObligationKey(watch.ID, watch.Revision, "ses-exec"),
+		WatchID:        watch.ID,
+		Revision:       watch.Revision,
+		SubscriberID:   "ses-exec",
+		VerdictPointer: watch.Verdict,
+		StagedAt:       time.Now(),
+	}
+	if err := seed.SaveObligation(obligation); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatalf("close seed store: %v", err)
+	}
+
+	db, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	deliverer := &fte08WakeDeliverer{}
+	registry := wake.NewRegistry()
+	registry.Register(wake.AdapterOpenCode, deliverer)
+	sink := newHumanDecisionSink(db, registry, nil)
+
+	res, err := sink.Apply(context.Background(), httpapi.Decision{
+		Command: "approve", WatchID: watch.ID, Note: "human-answer-1",
+	})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if res.Status != "watching/watching" {
+		t.Fatalf("status = %q, want watching/watching", res.Status)
+	}
+	if res.DecisionID == "" {
+		t.Fatal("decision was not journaled")
+	}
+
+	got, err := db.Watch(watch.ID)
+	if err != nil {
+		t.Fatalf("read Watch after answer: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Verdict != domain.VerdictWatching {
+		t.Fatalf("answer did not resume the same Watch: status %q verdict %q", got.Status, got.Verdict)
+	}
+	if got.Revision != watch.Revision+1 {
+		t.Fatalf("revision = %d, want %d", got.Revision, watch.Revision+1)
+	}
+	watches, err := db.AllWatches()
+	if err != nil {
+		t.Fatalf("AllWatches: %v", err)
+	}
+	if len(watches) != 1 || watches[0].ID != watch.ID {
+		t.Fatalf("answer created a successor Watch: %+v", watches)
+	}
+	obligations, err := db.WatchObligations(watch.ID)
+	if err != nil {
+		t.Fatalf("WatchObligations: %v", err)
+	}
+	if len(obligations) != 1 || obligations[0].ClaimedAt.IsZero() {
+		t.Fatalf("answer lost the obligation intention: %+v", obligations)
+	}
+	if len(deliverer.payloads) != 1 {
+		t.Fatalf("wakes = %d, want 1", len(deliverer.payloads))
+	}
+	p := deliverer.payloads[0]
+	if p.WatchID != watch.ID || p.Verdict != "human:approve" || p.Revision != watch.Revision+1 {
+		t.Fatalf("wake payload = %+v", p)
+	}
+
+	// The same answer repeated on the same sink is a no-op. The shared ack
+	// handler records the decision once, so the revision must not move again.
+	if _, err := sink.Apply(context.Background(), httpapi.Decision{
+		Command: "approve", WatchID: watch.ID, Note: "human-answer-1",
+	}); err != nil {
+		t.Fatalf("repeat approve: %v", err)
+	}
+	again, err := db.Watch(watch.ID)
+	if err != nil {
+		t.Fatalf("read Watch after repeat: %v", err)
+	}
+	if again.Revision != got.Revision || again.Status != domain.StatusWatching {
+		t.Fatalf("repeat moved the Watch: revision %d status %q", again.Revision, again.Status)
+	}
+}
+
+func TestFTE08HumanDecisionSinkRejectsUnknownCommand(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openProcessStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	sink := newHumanDecisionSink(db, nil, nil)
+	res, err := sink.Apply(context.Background(), httpapi.Decision{Command: "bogus", WatchID: "w-1"})
+	if err == nil {
+		t.Fatal("unknown command was accepted")
+	}
+	if res.DecisionID != "" {
+		t.Fatalf("unknown command reached the journal: decisionID %q", res.DecisionID)
 	}
 }
