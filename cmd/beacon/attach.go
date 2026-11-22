@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
@@ -193,6 +194,50 @@ func registryResumeSession(sessionID string) string {
 		return id
 	}
 	return sessionID
+}
+
+// Journal record kinds used by the fork reverse scan. A compaction record
+// replaces the history before it; a message record belongs to the tail a fork
+// keeps verbatim.
+const (
+	attachJournalMessage    = "message"
+	attachJournalCompaction = "compaction"
+)
+
+// attachJournalRecord is one entry in a session journal. A compaction carries
+// its replacement text and a window number. Both fields must be present for
+// the record to stop a reverse scan (docs/research/comp-codex.md, CC-05).
+type attachJournalRecord struct {
+	Kind      string
+	Text      string
+	Window    int
+	HasWindow bool
+}
+
+// completeCompaction reports whether e is a usable fork cutoff.
+func (e attachJournalRecord) completeCompaction() bool {
+	return e.Kind == attachJournalCompaction && strings.TrimSpace(e.Text) != "" && e.HasWindow
+}
+
+// forkHistory scans the journal from the end and stops at the newest complete
+// compaction. It returns that compaction and the records written after it, so
+// a fork inherits the frozen prefix and the new tail instead of the whole
+// journal. An incomplete compaction is skipped and the scan continues toward
+// the start. When no complete compaction exists, all records are returned.
+// A cutoff recorded in session metadata bounds the scan to that index.
+func forkHistory(metadata map[string]string, journal []attachJournalRecord) (*attachJournalRecord, []attachJournalRecord) {
+	last := len(journal) - 1
+	if cutoff, ok := session.CompactionCutoff(metadata); ok && cutoff >= 0 && cutoff < len(journal) {
+		last = cutoff
+	}
+	for i := last; i >= 0; i-- {
+		if !journal[i].completeCompaction() {
+			continue
+		}
+		compaction := journal[i]
+		return &compaction, append([]attachJournalRecord(nil), journal[i+1:]...)
+	}
+	return nil, append([]attachJournalRecord(nil), journal...)
 }
 
 // parseAttachArgs accepts the original `attach <sessionID>` plus the resume
