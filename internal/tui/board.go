@@ -38,6 +38,36 @@ type Filters struct {
 	Owner  string
 }
 
+// maxEventLines bounds the event tail kept in the model. The screen shows a
+// short history, so an old frame never grows the model without limit.
+const maxEventLines = 12
+
+// CommandFunc handles one line of operator input. App passes a bound
+// App.Command, which keeps one parser for the text and interactive front ends.
+type CommandFunc func(line string) error
+
+// SnapshotMsg carries a refreshed projection into the live board. Revision
+// guards the panels: a refresh without a new revision leaves them unchanged.
+type SnapshotMsg struct {
+	Snap     Snapshot
+	Revision uint64
+	Err      error
+}
+
+// EventMsg carries one SSE frame into the event tail. A repeated ID is dropped
+// so a replayed frame does not paint the same line twice.
+type EventMsg struct {
+	ID   string
+	Line string
+}
+
+// CommandMsg carries the outcome of an operator command. An error means the
+// server refused the command and is shown in the status line.
+type CommandMsg struct {
+	Line string
+	Err  error
+}
+
 // depGraph is a small dependency graph built from the card index. It keeps
 // only edges between cards that are present in the index, and traversal uses
 // a visited set so a malformed index cannot produce an endless walk.
@@ -113,6 +143,19 @@ type Model struct {
 	quitting  bool
 	width     int
 	height    int
+
+	// Live state. Zero values leave the static board untouched.
+	live        bool
+	snap        Snapshot
+	revision    uint64
+	lastErr     error
+	events      []string
+	lastEventID string
+	statusLine  string
+	watchCursor int
+	command     CommandFunc
+	input       string
+	editing     bool
 }
 
 // NewModel builds a board from a card list. The filter options are sorted
@@ -127,6 +170,73 @@ func NewModel(cards []Card) Model {
 	m.applyFilters()
 	return m
 }
+
+// NewLiveModel builds the one-screen board from a projection and the card
+// index. The command handler runs when the operator finishes a command line.
+func NewLiveModel(cards []Card, snap Snapshot, revision uint64, lastErr error, command CommandFunc) Model {
+	m := NewModel(cards)
+	m.live = true
+	m.command = command
+	m.applySnapshot(snap, revision, lastErr)
+	return m
+}
+
+// applySnapshot advances the panels only for a newer revision. A failed read
+// keeps the last projection but records the error for the header.
+func (m *Model) applySnapshot(snap Snapshot, revision uint64, lastErr error) {
+	if revision > m.revision {
+		m.snap = snap
+		m.revision = revision
+		m.lastErr = lastErr
+		if m.watchCursor >= len(snap.LiveWatches) {
+			m.watchCursor = len(snap.LiveWatches) - 1
+		}
+		if m.watchCursor < 0 {
+			m.watchCursor = 0
+		}
+		return
+	}
+	if lastErr != nil {
+		m.lastErr = lastErr
+	}
+}
+
+// pushEvent appends one frame to the tail and drops a repeated frame ID.
+func (m *Model) pushEvent(id, line string) {
+	if line == "" || (id != "" && id == m.lastEventID) {
+		return
+	}
+	if id == "" && len(m.events) > 0 && m.events[len(m.events)-1] == line {
+		return
+	}
+	if id != "" {
+		m.lastEventID = id
+	}
+	m.events = append(m.events, line)
+	if len(m.events) > maxEventLines {
+		m.events = append([]string(nil), m.events[len(m.events)-maxEventLines:]...)
+	}
+}
+
+// SelectedWatch returns the watch under the watch cursor, if any.
+func (m Model) SelectedWatch() (Watch, bool) {
+	if len(m.snap.LiveWatches) == 0 {
+		return Watch{}, false
+	}
+	if m.watchCursor < 0 || m.watchCursor >= len(m.snap.LiveWatches) {
+		return Watch{}, false
+	}
+	return m.snap.LiveWatches[m.watchCursor], true
+}
+
+// Status returns the last command result shown in the header.
+func (m Model) Status() string { return m.statusLine }
+
+// EventTail returns the bounded event tail in display order.
+func (m Model) EventTail() []string { return append([]string(nil), m.events...) }
+
+// Revision returns the revision of the snapshot on screen.
+func (m Model) Revision() uint64 { return m.revision }
 
 func uniqueField(cards []Card, field func(Card) string) []string {
 	set := map[string]bool{}
@@ -195,15 +305,34 @@ func (m Model) Selected() (Card, bool) {
 // Init satisfies tea.Model. The board has no background work.
 func (m Model) Init() tea.Cmd { return nil }
 
-// Update moves the cursor, cycles filters and toggles the graph. Every other
-// message is ignored so window resizes do not lose the current selection.
+// Update moves the cursor, cycles filters, selects a watch and runs commands.
+// Live messages only change the panels whose data advanced.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case SnapshotMsg:
+		m.applySnapshot(msg.Snap, msg.Revision, msg.Err)
+		if msg.Err != nil {
+			m.statusLine = "обновление: " + msg.Err.Error()
+		}
+		return m, nil
+	case EventMsg:
+		m.pushEvent(msg.ID, msg.Line)
+		return m, nil
+	case CommandMsg:
+		if msg.Err != nil {
+			m.statusLine = "отказ: " + msg.Err.Error()
+		} else {
+			m.statusLine = "выполнено: " + msg.Line
+		}
+		return m, nil
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
 	case tea.KeyMsg:
+		if m.editing {
+			return m.updateInput(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
@@ -216,6 +345,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.filtered)-1 {
 				m.cursor++
 			}
+		case "left", "h":
+			if m.watchCursor > 0 {
+				m.watchCursor--
+			}
+		case "right", "l":
+			if m.watchCursor < len(m.snap.LiveWatches)-1 {
+				m.watchCursor++
+			}
+		case ":":
+			m.editing = true
+			m.input = ""
+			return m, nil
 		case "s":
 			m.statusIdx++
 			if m.statusIdx >= len(m.statuses) {
@@ -239,6 +380,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateInput collects one command line and passes it to the bound CommandFunc
+// on Enter. The refusal comes back as a CommandMsg and stays in the header.
+func (m Model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter":
+		line := strings.TrimSpace(m.input)
+		m.input = ""
+		m.editing = false
+		if line == "" {
+			return m, nil
+		}
+		if m.command == nil {
+			return m, func() tea.Msg {
+				return CommandMsg{Line: line, Err: fmt.Errorf("tui: command handler not set")}
+			}
+		}
+		run := m.command
+		return m, func() tea.Msg {
+			return CommandMsg{Line: line, Err: run(line)}
+		}
+	case "backspace", "ctrl+h":
+		runes := []rune(m.input)
+		if len(runes) > 0 {
+			m.input = string(runes[:len(runes)-1])
+		}
+	case "esc":
+		m.editing = false
+		m.input = ""
+	default:
+		for _, r := range msg.Runes {
+			if r >= 32 && r != 127 {
+				m.input += string(r)
+			}
+		}
+	}
+	return m, nil
+}
+
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205")).Padding(0, 1)
 	metaStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
@@ -249,9 +428,24 @@ var (
 	helpStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1)
 )
 
-// View renders the table, the detail pane, the graph and the key hints. The
-// table is capped so the lower panes stay visible on a short terminal.
+// View renders the live one-screen dashboard, or the static card board when
+// no snapshot is attached. Both paths use the same model and Card contract.
 func (m Model) View() string {
+	if !m.live {
+		return m.cardView()
+	}
+	var b strings.Builder
+	b.WriteString(m.liveHeader())
+	b.WriteString("\n")
+	b.WriteString(m.cardView())
+	b.WriteString("\n")
+	b.WriteString(m.livePanels())
+	return b.String()
+}
+
+// cardView renders the table, the detail pane, the graph and the key hints.
+// The table is capped so the lower panes stay visible on a short terminal.
+func (m Model) cardView() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("beacon board"))
 	b.WriteString("\n")
@@ -308,6 +502,131 @@ func (m Model) View() string {
 	b.WriteString("\n\n")
 	b.WriteString(helpStyle.Render("j/k или ↑/↓ выбор   s статус   o владелец   g граф   esc сброс   q выход"))
 	return b.String()
+}
+
+func (m Model) liveHeader() string {
+	s := m.snap
+	points := fmt.Sprintf("%d/%d", s.PointStats.Used, s.PointStats.Limit)
+	if s.PointStats.Limit == 0 {
+		points = fmt.Sprintf("%d (бюджет %d)", s.PointStats.Used, s.PointStats.Budget)
+	}
+	header := fmt.Sprintf("beacon | points %s | watches %d | rev %d", points, len(s.LiveWatches), m.revision)
+	if m.lastErr != nil {
+		header += " | ошибка обновления: " + oneLine(m.lastErr.Error())
+	}
+	if m.statusLine != "" {
+		header += " | " + oneLine(m.statusLine)
+	}
+	return headStyle.Render(header)
+}
+
+func (m Model) livePanels() string {
+	var b strings.Builder
+	b.WriteString(boxStyle.Render("ВОТЧИ\n" + m.watchLines()))
+	b.WriteString("\n")
+	b.WriteString(boxStyle.Render("БЛОКЕРЫ\n" + m.blockerLines()))
+	b.WriteString("\n")
+	b.WriteString(boxStyle.Render("ОЧЕРЕДЬ\n" + m.queueLines()))
+	b.WriteString("\n")
+	b.WriteString(boxStyle.Render("СОБЫТИЯ\n" + m.eventLines()))
+	b.WriteString("\n")
+	b.WriteString(boxStyle.Render("ПАМЯТЬ\n" + m.memoryLines()))
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("j/k карточки   ←/→ вотчи   : команда (approve w1)   q выход"))
+	if m.editing {
+		b.WriteString("\n")
+		b.WriteString(selStyle.Render("> " + m.input + "_"))
+	}
+	return b.String()
+}
+
+func (m Model) watchLines() string {
+	watches := m.snap.LiveWatches
+	if len(watches) == 0 {
+		return "(нет вотчей)"
+	}
+	limit := m.listLimit(len(watches))
+	var b strings.Builder
+	for i := 0; i < limit; i++ {
+		w := watches[i]
+		blocked := ""
+		if w.Blocked != nil && knownBlockReasons[w.Blocked.Reason] {
+			blocked = " blocked=" + w.Blocked.Reason
+		}
+		mark := "  "
+		if i == m.watchCursor {
+			mark = "> "
+		}
+		fmt.Fprintf(&b, "%s#%d %s %s verdict=%s rev=%d%s\n", mark, w.PR, shortSHA(w.HeadSHA), w.Status, w.Verdict, w.Revision, blocked)
+		for _, sub := range w.Subscribers {
+			fmt.Fprintf(&b, "    %s фаза=%s\n", sub.ID, oneLine(sub.Phase))
+		}
+	}
+	if b.Len() == 0 {
+		return "(нет вотчей)"
+	}
+	if limit < len(watches) {
+		fmt.Fprintf(&b, "… ещё %d", len(watches)-limit)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func (m Model) blockerLines() string {
+	var lines []string
+	for _, inc := range m.snap.BlockerIncidents {
+		lines = append(lines, fmt.Sprintf("%s %s: %s", inc.ID, inc.Kind, oneLine(inc.Reason)))
+	}
+	for _, esc := range m.snap.Escalations {
+		lines = append(lines, "escalation "+esc)
+	}
+	for _, loadErr := range m.snap.LoadErrors {
+		lines = append(lines, "load error "+loadErr)
+	}
+	if len(lines) == 0 {
+		return "(нет)"
+	}
+	return strings.Join(lines[:m.listLimit(len(lines))], "\n")
+}
+
+func (m Model) queueLines() string {
+	var lines []string
+	for _, card := range m.cards {
+		switch strings.ToLower(card.Status) {
+		case "todo", "deferred":
+			lines = append(lines, card.ID+" "+oneLine(card.Title))
+		}
+	}
+	if len(lines) == 0 {
+		return "(пусто)"
+	}
+	return strings.Join(lines[:m.listLimit(len(lines))], "\n")
+}
+
+func (m Model) eventLines() string {
+	if len(m.events) == 0 {
+		return "(пусто)"
+	}
+	limit := m.listLimit(len(m.events))
+	return strings.Join(m.events[len(m.events)-limit:], "\n")
+}
+
+func (m Model) memoryLines() string {
+	cycle := m.snap.LastCycle
+	return fmt.Sprintf("RSS: нет данных в снимке | цикл обновлено=%d за %d мс", cycle.WatchesUpdated, cycle.DurationMs)
+}
+
+func (m Model) listLimit(total int) int {
+	if total <= 0 {
+		return 0
+	}
+	limit := total
+	if m.height > 0 && limit > m.height/4 {
+		limit = m.height / 4
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	return limit
 }
 
 func filterLabel(value string) string {
