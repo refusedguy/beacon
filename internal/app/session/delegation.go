@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ThreadID names a thread. The server owns ID creation and this model treats
@@ -1239,4 +1240,144 @@ func TokenBreakdown(c ContextSnapshot) string {
 		b.WriteByte('\n')
 	}
 	return b.String()
+}
+
+// RefreshMode selects how a ranked map is rebuilt when a child context is
+// prepared (CA-20). The four values match aider's --map-refresh flag
+// (aider/repomap.py:585-627).
+type RefreshMode string
+
+const (
+	// RefreshManual returns the last map and never builds a new one.
+	RefreshManual RefreshMode = "manual"
+	// RefreshFiles reuses the map while the file set and budget stay the same.
+	RefreshFiles RefreshMode = "files"
+	// RefreshAlways builds a map on every refresh.
+	RefreshAlways RefreshMode = "always"
+	// RefreshAuto reuses the map only after a slow build.
+	RefreshAuto RefreshMode = "auto"
+
+	// AutoRefreshThreshold is the build time above which auto starts caching.
+	AutoRefreshThreshold = time.Second
+
+	defaultRefreshMode = RefreshAuto
+)
+
+// NormalizeRefreshMode returns mode when it names one of the four policies and
+// RefreshAuto otherwise. Callers use it at the CLI boundary where a user string
+// first enters the model.
+func NormalizeRefreshMode(mode RefreshMode) RefreshMode {
+	switch mode {
+	case RefreshManual, RefreshFiles, RefreshAlways, RefreshAuto:
+		return mode
+	default:
+		return defaultRefreshMode
+	}
+}
+
+// MapRefreshKey identifies one ranked map build. ChatFiles and Files are
+// repository-relative paths. Signatures holds a content or mtime fingerprint
+// for each entry in Files, so a changed file changes the key. Budget is the
+// requested token budget. Mentions holds the mentioned files and identifiers
+// that personalize an auto build.
+type MapRefreshKey struct {
+	ChatFiles  []string
+	Files      []string
+	Signatures []string
+	Budget     int
+	Mentions   []string
+}
+
+// string renders a stable key. Every policy keys on the file sets, their
+// signatures and the budget. Auto adds the mentions because aider personalizes
+// an auto map with them (aider/repomap.py:592-597).
+func (k MapRefreshKey) string(mode RefreshMode) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "budget=%d", k.Budget)
+	b.WriteString("|chat=")
+	b.WriteString(sortedJoin(k.ChatFiles))
+	b.WriteString("|files=")
+	b.WriteString(sortedJoin(k.Files))
+	b.WriteString("|signatures=")
+	b.WriteString(sortedJoin(k.Signatures))
+	if mode == RefreshAuto {
+		b.WriteString("|mentions=")
+		b.WriteString(sortedJoin(k.Mentions))
+	}
+	return b.String()
+}
+
+// sortedJoin sorts a copy of parts and joins it with commas. The caller's slice
+// keeps its order.
+func sortedJoin(parts []string) string {
+	sorted := append([]string(nil), parts...)
+	sort.Strings(sorted)
+	return strings.Join(sorted, ",")
+}
+
+// MapBuildFunc builds a ranked map and reports how long the build took. The
+// caller owns the clock, so the cache reads no time of its own.
+type MapBuildFunc func() (text string, elapsed time.Duration)
+
+// RankedMapCache holds the last map and the maps built for earlier keys. It owns
+// no clock and performs no I/O. The caller persists it when the policy must
+// survive a process restart.
+type RankedMapCache struct {
+	mode      RefreshMode
+	lastMap   string
+	lastBuild time.Duration
+	cache     map[string]string
+}
+
+// NewRankedMapCache creates a cache for mode. An unknown mode selects auto.
+func NewRankedMapCache(mode RefreshMode) RankedMapCache {
+	return RankedMapCache{mode: NormalizeRefreshMode(mode)}
+}
+
+// Mode returns the active refresh policy.
+func (c *RankedMapCache) Mode() RefreshMode { return c.mode }
+
+// SetMode changes the refresh policy. Cached maps stay in place.
+func (c *RankedMapCache) SetMode(mode RefreshMode) { c.mode = NormalizeRefreshMode(mode) }
+
+// LastMap returns the most recent map, or an empty string before the first
+// build. Manual mode returns this value without building.
+func (c *RankedMapCache) LastMap() string { return c.lastMap }
+
+// LastBuild returns the measured duration of the most recent build.
+func (c *RankedMapCache) LastBuild() time.Duration { return c.lastBuild }
+
+// Len returns the number of distinct keys held in the cache.
+func (c *RankedMapCache) Len() int { return len(c.cache) }
+
+// Seed sets the last map without a build. Callers use it to give manual mode a
+// starting map.
+func (c *RankedMapCache) Seed(text string) { c.lastMap = text }
+
+// Refresh returns a ranked map for key and reports whether it built one.
+// Manual returns the last map without a build. Files reuses a map for an
+// unchanged key. Always builds on every call. Auto reuses a map only when the
+// previous build took longer than AutoRefreshThreshold, as in
+// aider/repomap.py:601-615. The builder is optional; without one, no map is
+// built and the last map is returned.
+func (c *RankedMapCache) Refresh(key MapRefreshKey, build MapBuildFunc) (string, bool) {
+	c.mode = NormalizeRefreshMode(c.mode)
+	if c.mode == RefreshManual || build == nil {
+		return c.lastMap, false
+	}
+	if c.cache == nil {
+		c.cache = make(map[string]string)
+	}
+	reuse := c.mode == RefreshFiles || (c.mode == RefreshAuto && c.lastBuild > AutoRefreshThreshold)
+	cacheKey := key.string(c.mode)
+	if reuse {
+		if text, ok := c.cache[cacheKey]; ok {
+			return text, false
+		}
+	}
+	text, elapsed := build()
+	c.lastBuild = elapsed
+	c.lastMap = text
+	c.cache[cacheKey] = text
+	return text, true
 }
