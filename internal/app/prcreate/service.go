@@ -15,12 +15,12 @@ const RoleExecutor = "executor"
 type ErrorCode string
 
 const (
-	CodeInvalidInput       ErrorCode = "INVALID_INPUT"
-	CodeProviderNotBound   ErrorCode = "PROVIDER_NOT_BOUND"
-	CodeGitFailed          ErrorCode = "GIT_FAILED"
-	CodeCardFailed         ErrorCode = "CARD_FAILED"
-	CodeCreateFailed       ErrorCode = "CREATE_FAILED"
-	CodeWatchFailed        ErrorCode = "WATCH_FAILED"
+	CodeInvalidInput     ErrorCode = "INVALID_INPUT"
+	CodeProviderNotBound ErrorCode = "PROVIDER_NOT_BOUND"
+	CodeGitFailed        ErrorCode = "GIT_FAILED"
+	CodeCardFailed       ErrorCode = "CARD_FAILED"
+	CodeCreateFailed     ErrorCode = "CREATE_FAILED"
+	CodeWatchFailed      ErrorCode = "WATCH_FAILED"
 )
 
 // Error is one workflow failure with a stable code.
@@ -70,10 +70,10 @@ type WatchInput struct {
 
 // WatchResult is the neutral registration result.
 type WatchResult struct {
-	WatchID   string
-	Revision  uint64
-	Status    string
-	Verdict   string
+	WatchID  string
+	Revision uint64
+	Status   string
+	Verdict  string
 }
 
 // Watcher registers the Watch through domain.Fanout. cmd adapts the existing
@@ -85,11 +85,11 @@ type Watcher interface {
 // Notice is an identifier-only pointer handed to the wake registry after the
 // Watch exists. No PR text crosses this boundary.
 type Notice struct {
-	Adapter    string
-	SessionID  string
-	WatchID    string
-	Revision   uint64
-	Verdict    string
+	Adapter   string
+	SessionID string
+	WatchID   string
+	Revision  uint64
+	Verdict   string
 }
 
 // Waker delivers one Notice through the shared adapter registry.
@@ -118,21 +118,21 @@ type Input struct {
 
 // Result is the observable outcome of one create run.
 type Result struct {
-	Provider      string `json:"provider"`
-	Repo          string `json:"repo"`
-	HeadRef       string `json:"headRef"`
-	HeadSHA       string `json:"headSHA"`
-	BaseRef       string `json:"baseRef"`
-	Title         string `json:"title"`
-	Body          string `json:"body"`
-	PR            int    `json:"pr,omitempty"`
-	URL           string `json:"url,omitempty"`
-	WatchID       string `json:"watchID,omitempty"`
-	WatchStatus   string `json:"watchStatus,omitempty"`
-	WatchVerdict  string `json:"watchVerdict,omitempty"`
-	Revision      uint64 `json:"revision,omitempty"`
-	DryRun        bool   `json:"dryRun"`
-	WakeError     string `json:"wakeError,omitempty"`
+	Provider     string `json:"provider"`
+	Repo         string `json:"repo"`
+	HeadRef      string `json:"headRef"`
+	HeadSHA      string `json:"headSHA"`
+	BaseRef      string `json:"baseRef"`
+	Title        string `json:"title"`
+	Body         string `json:"body"`
+	PR           int    `json:"pr,omitempty"`
+	URL          string `json:"url,omitempty"`
+	WatchID      string `json:"watchID,omitempty"`
+	WatchStatus  string `json:"watchStatus,omitempty"`
+	WatchVerdict string `json:"watchVerdict,omitempty"`
+	Revision     uint64 `json:"revision,omitempty"`
+	DryRun       bool   `json:"dryRun"`
+	WakeError    string `json:"wakeError,omitempty"`
 }
 
 // Service composes the four ports and a set of named PR providers. A Service
@@ -144,6 +144,8 @@ type Service struct {
 	waker     Waker
 	providers map[string]PRProvider
 	fallback  string
+	diff      DiffSource
+	models    []Model
 }
 
 // New builds a Service. A nil git or card source is allowed when the caller
@@ -184,6 +186,48 @@ func (s *Service) WithDefault(name string) *Service {
 		s.fallback = strings.TrimSpace(name)
 	}
 	return s
+}
+
+// WithDiffSource binds the local diff source used to describe PRs. Without it
+// the service keeps resolving text from the card only.
+func (s *Service) WithDiffSource(d DiffSource) *Service {
+	if s != nil {
+		s.diff = d
+	}
+	return s
+}
+
+// WithModels sets the ordered model chain. The first model whose window fits
+// the prompt and that answers successfully wins; the card stays the fallback.
+func (s *Service) WithModels(models ...Model) *Service {
+	if s != nil {
+		s.models = append([]Model(nil), models...)
+	}
+	return s
+}
+
+// resolveGeneratedText tries the model chain over the local diff and fills the
+// still-empty PR fields. It returns without changes when generation is not
+// wired, the diff is empty, or every model was skipped or failed, so the caller
+// keeps the card as fallback. Explicit flags are never overwritten.
+func (s *Service) resolveGeneratedText(ctx context.Context, out *Result, card Card) {
+	if s.diff == nil || len(s.models) == 0 {
+		return
+	}
+	d, err := s.diff.Diff(ctx, out.BaseRef, out.HeadRef)
+	if err != nil || strings.TrimSpace(d.Patch) == "" {
+		return
+	}
+	text, ok := GenerateFromDiff(ctx, DiffPrompt(d, card), s.models)
+	if !ok {
+		return
+	}
+	if out.Title == "" {
+		out.Title = text.Title
+	}
+	if out.Body == "" {
+		out.Body = text.Body
+	}
 }
 
 // Run performs one create-and-subscribe pass. DryRun stops after all inputs
@@ -342,7 +386,22 @@ func (s *Service) resolveText(ctx context.Context, in *Input, out *Result) error
 	if out.Title != "" && out.Body != "" {
 		return nil
 	}
+
 	id := strings.TrimSpace(in.CardID)
+	var card Card
+	var cardErr error
+	haveCard := false
+	if id != "" && s.cards != nil {
+		card, cardErr = s.cards.Card(ctx, id)
+		haveCard = cardErr == nil
+	}
+
+	// The diff describes the actual change, so it is tried before the card.
+	s.resolveGeneratedText(ctx, out, card)
+	if out.Title != "" && out.Body != "" {
+		return nil
+	}
+
 	if id == "" {
 		if out.Title == "" {
 			return fail(CodeInvalidInput, "нужен --title или --card")
@@ -352,9 +411,8 @@ func (s *Service) resolveText(ctx context.Context, in *Input, out *Result) error
 	if s.cards == nil {
 		return fail(CodeCardFailed, "источник карточек не подключён")
 	}
-	card, err := s.cards.Card(ctx, id)
-	if err != nil {
-		return fail(CodeCardFailed, "карточка %s: %v", id, err)
+	if !haveCard {
+		return fail(CodeCardFailed, "карточка %s: %v", id, cardErr)
 	}
 	if out.Title == "" {
 		out.Title = strings.TrimSpace(card.Title)
