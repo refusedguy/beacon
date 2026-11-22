@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -136,6 +137,59 @@ func (s *dbOrchestratorStore) CloseWatch(ctx context.Context, watchID string) er
 	w.Verdict = domain.VerdictMerged
 	w.CloseReason = "merged"
 	return s.db.SaveWatch(w)
+}
+
+// CloseWatchAt closes a Watch only while its row still matches the revision,
+// head and status the merge decision saw. A head change closes the old Watch
+// with its own reason before a late merge confirmation arrives, so the merge
+// gets a conflict instead of replacing that reason with "merged". The compare
+// and the write share one transaction on the store's single writer.
+func (s *dbOrchestratorStore) CloseWatchAt(ctx context.Context, watchID string, revision uint64, headSHA string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("orchestrator: watch store is nil")
+	}
+	return s.db.Write(ctx, func(tx *sql.Tx) error {
+		var payload []byte
+		if err := tx.QueryRow(`SELECT payload FROM watches WHERE id = ?`, watchID).Scan(&payload); err != nil {
+			return fmt.Errorf("orchestrator: load watch %s for close: %w", watchID, err)
+		}
+		var w domain.Watch
+		if err := json.Unmarshal(payload, &w); err != nil {
+			return fmt.Errorf("orchestrator: decode watch %s for close: %w", watchID, err)
+		}
+		conflict := func() error {
+			return &orchestrator.WatchCloseConflict{
+				WatchID: watchID, Revision: revision, HeadSHA: headSHA,
+				GotRevision: w.Revision, GotHeadSHA: w.HeadSHA, GotStatus: string(w.Status),
+			}
+		}
+		wantStatus := string(w.Status)
+		if w.Revision != revision || w.HeadSHA != headSHA || w.Status == domain.StatusClosed {
+			return conflict()
+		}
+		w.Status = domain.StatusClosed
+		w.Verdict = domain.VerdictMerged
+		w.CloseReason = "merged"
+		next, err := json.Marshal(w)
+		if err != nil {
+			return fmt.Errorf("orchestrator: encode watch %s for close: %w", watchID, err)
+		}
+		res, err := tx.Exec(`
+			UPDATE watches SET status = ?, payload = ?
+			WHERE id = ? AND status = ? AND revision = ? AND head_sha = ?`,
+			string(domain.StatusClosed), next, watchID, wantStatus, revision, headSHA)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return conflict()
+		}
+		return nil
+	})
 }
 
 // MergedPR implements MergedPRReader from the Watch rows the process already
