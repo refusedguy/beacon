@@ -316,10 +316,13 @@ type PR struct {
 	HeadSHA string
 }
 
-// Check is one normalized status check conclusion.
+// Check is one normalized status check conclusion. Required is nil when the
+// provider did not report the flag. An unknown value never makes a check
+// mandatory in the Watch payload.
 type Check struct {
 	Name       string
 	Conclusion string
+	Required   *bool
 }
 
 // WatchRef is the small projection of a Beacon Watch this pass needs.
@@ -694,6 +697,7 @@ type checkNode struct {
 	Conclusion string `json:"conclusion"`
 	Status     string `json:"status"`
 	State      string `json:"state"`
+	IsRequired *bool  `json:"isRequired"`
 }
 
 func checkFromNode(raw json.RawMessage) (Check, bool) {
@@ -719,7 +723,7 @@ func checkFromNode(raw json.RawMessage) (Check, bool) {
 			conclusion = n.Status
 		}
 	}
-	return Check{Name: name, Conclusion: normalizeConclusion(conclusion)}, true
+	return Check{Name: name, Conclusion: normalizeConclusion(conclusion), Required: n.IsRequired}, true
 }
 
 // normalizeConclusion is the app-layer mirror of domain.NormalizeConclusion.
@@ -747,16 +751,21 @@ func BuildChecksQuery(prs []PR) string {
 		owner, name := splitRepo(pr.Repo)
 		fmt.Fprintf(&b, "  p%d: repository(owner:%s, name:%s) {\n", i, strconv.Quote(owner), strconv.Quote(name))
 		fmt.Fprintf(&b, "    pullRequest(number:%d) {\n", pr.Number)
-		b.WriteString(`      statusCheckRollup {
+		required := "isRequired(pullRequestNumber:" + strconv.Itoa(pr.Number) + ")"
+		// A second inline fragment per type keeps the original projections
+		// byte-identical for the query contract guard. GraphQL merges the two.
+		fmt.Fprintf(&b, `      statusCheckRollup {
         contexts(first:50) {
           nodes {
             __typename
             ... on CheckRun { name conclusion status }
+            ... on CheckRun { %s }
             ... on StatusContext { context state }
+            ... on StatusContext { %s }
           }
         }
       }
-`)
+`, required, required)
 		b.WriteString("    }\n  }\n")
 	}
 	b.WriteString("}\n")
@@ -949,10 +958,14 @@ func checksPayload(checks []Check) (json.RawMessage, error) {
 		if name == "" {
 			continue
 		}
+		required := false
+		if c.Required != nil {
+			required = *c.Required
+		}
 		rows[name] = map[string]any{
 			"state":      c.Conclusion,
 			"conclusion": c.Conclusion,
-			"required":   true,
+			"required":   required,
 			"detailsUrl": "",
 		}
 	}
