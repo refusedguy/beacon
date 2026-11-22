@@ -1231,6 +1231,113 @@ func TestFileScheduleStorePersists(t *testing.T) {
 	}
 }
 
+// FTE-02: адаптер над таблицей schedules. Проверки из eval
+// intg-control-plane-integrity: Create читается через Get и виден в List,
+// повторный Create возвращает ошибку, удалённое расписание пропадает из List.
+// Дополнительно проверяется чтение после повторного открытия store.
+func TestSQLScheduleStoreOverSQLite(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, mcpStateDBName)
+	ctx := context.Background()
+
+	db1, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	s1 := newSQLScheduleStore(db1)
+	next := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	in := server.Schedule{
+		ID: "s1", TaskID: "BS.32", Kind: server.KindMark, Expr: "deploy",
+		Enabled: true, NextRunAt: next,
+	}
+	if err := s1.Create(ctx, in); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := s1.Create(ctx, in); !errors.Is(err, server.ErrScheduleExists) {
+		t.Fatalf("повторный create: got %v, want ErrScheduleExists", err)
+	}
+	got, err := s1.Get(ctx, "s1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.ID != "s1" || got.TaskID != "BS.32" || got.Kind != server.KindMark || got.Expr != "deploy" || !got.Enabled {
+		t.Fatalf("get после create: %+v", got)
+	}
+	if !got.NextRunAt.Equal(next) {
+		t.Fatalf("next run: got %v want %v", got.NextRunAt, next)
+	}
+	rows, err := s1.List(ctx)
+	if err != nil || len(rows) != 1 || rows[0].ID != "s1" {
+		t.Fatalf("list: %+v, %v", rows, err)
+	}
+	paused, err := s1.SetEnabled(ctx, "s1", false)
+	if err != nil || paused.Enabled {
+		t.Fatalf("pause: %+v, %v", paused, err)
+	}
+	resumed, err := s1.SetEnabled(ctx, "s1", true)
+	if err != nil || !resumed.Enabled {
+		t.Fatalf("resume: %+v, %v", resumed, err)
+	}
+	if err := db1.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	// Повторное открытие store должно видеть записанное расписание.
+	db2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer db2.Close()
+	s2 := newSQLScheduleStore(db2)
+	got2, err := s2.Get(ctx, "s1")
+	if err != nil || got2.TaskID != "BS.32" {
+		t.Fatalf("get после повторного открытия: %+v, %v", got2, err)
+	}
+	rows2, err := s2.List(ctx)
+	if err != nil || len(rows2) != 1 || rows2[0].ID != "s1" {
+		t.Fatalf("list после повторного открытия: %+v, %v", rows2, err)
+	}
+	if err := s2.Delete(ctx, "s1"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := s2.Delete(ctx, "s1"); !errors.Is(err, server.ErrScheduleNotFound) {
+		t.Fatalf("повторный delete: got %v, want ErrScheduleNotFound", err)
+	}
+	rows3, err := s2.List(ctx)
+	if err != nil || len(rows3) != 0 {
+		t.Fatalf("list после delete: %+v, %v", rows3, err)
+	}
+}
+
+// FTE-02: production-путь CLI пишет в SQLite, а не в schedules.json.
+func TestTaskScheduleUsesSQLiteStore(t *testing.T) {
+	dir := t.TempDir()
+	cfg := taskcli.Config{StateDir: dir, Root: dir}
+
+	var out, errOut bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "schedule", "create",
+		"--id", "cli1", "--task-id", "BS.32", "--kind", "interval", "--expr", "15m", "--timezone", "UTC"}, &out, &errOut, cfg)
+	if code != 0 || !strings.Contains(out.String(), "cli1 scheduled") {
+		t.Fatalf("create: код %d stdout %q stderr %q", code, out.String(), errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "schedules.json")); !os.IsNotExist(err) {
+		t.Fatalf("schedules.json создан: %v", err)
+	}
+
+	db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	rows, err := db.ListSchedules(context.Background())
+	if err != nil {
+		t.Fatalf("ListSchedules: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != "cli1" || rows[0].TargetCard != "BS.32" || rows[0].Spec != "15m" {
+		t.Fatalf("сохранённые строки: %+v", rows)
+	}
+}
+
 // ---- CB-06: компактинг без ключа ----
 
 // writeCompactCard пишет валидную карточку с четырьмя длинными текстовыми

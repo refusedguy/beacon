@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1036,14 +1037,118 @@ func findProjectRoot() string {
 	return cwd
 }
 
-// ---- ADR 0189 / ADR 0192 / BS.32: управление расписаниями ----
+// ---- ADR 0189 / ADR 0192 / BS.32 / FTE-02: управление расписаниями ----
 //
-// CLI не открывает SQLite. Он говорит с внутренним API через порт
-// ScheduleStore; пока BS.33 не влит, порт реализован JSON-файлом в state dir.
-// Тесты подменяют эту точку входа моковым стором.
+// CLI говорит с внутренним API через порт server.ScheduleStore. В production
+// порт реализован адаптером поверх таблицы schedules в process store (INTG-03).
+// Файловый FileScheduleStore остаётся только в тестах. Тесты также подменяют
+// scheduleStoreFor моковым стором, чтобы не открывать SQLite.
+
+// sqlScheduleStore адаптирует таблицу schedules к порту server.ScheduleStore.
+// У порта есть поля Timezone, LastRun и CreatedAt, которых нет в схеме таблицы.
+// При чтении они возвращаются нулевыми, планировщику они не нужны.
+type sqlScheduleStore struct {
+	db *store.DB
+}
+
+var _ server.ScheduleStore = (*sqlScheduleStore)(nil)
+
+func newSQLScheduleStore(db *store.DB) *sqlScheduleStore {
+	return &sqlScheduleStore{db: db}
+}
+
+// portToStore переводит значение порта в строку таблицы. Store сам нормализует
+// вид mark в webhook, поэтому Kind копируется как есть.
+func portToStore(s server.Schedule) store.Schedule {
+	return store.Schedule{
+		ID:         s.ID,
+		Kind:       string(s.Kind),
+		Spec:       s.Expr,
+		TargetCard: s.TaskID,
+		NextRun:    s.NextRunAt,
+		Enabled:    s.Enabled,
+	}
+}
+
+// storeToPort переводит строку таблицы в значение порта. Store хранит вид mark
+// как webhook, поэтому при чтении возвращается исходное имя вида.
+func storeToPort(s store.Schedule) server.Schedule {
+	kind := s.Kind
+	if kind == store.ScheduleKindWebhook {
+		kind = string(server.KindMark)
+	}
+	return server.Schedule{
+		ID:        s.ID,
+		TaskID:    s.TargetCard,
+		Kind:      server.Kind(kind),
+		Expr:      s.Spec,
+		Enabled:   s.Enabled,
+		NextRunAt: s.NextRun,
+	}
+}
+
+func mapScheduleErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	switch {
+	case errors.Is(err, store.ErrScheduleExists):
+		return fmt.Errorf("%w: %v", server.ErrScheduleExists, err)
+	case errors.Is(err, store.ErrScheduleNotFound):
+		return fmt.Errorf("%w: %v", server.ErrScheduleNotFound, err)
+	default:
+		return err
+	}
+}
+
+func (s *sqlScheduleStore) Create(ctx context.Context, in server.Schedule) error {
+	return mapScheduleErr(s.db.CreateSchedule(ctx, portToStore(in)))
+}
+
+func (s *sqlScheduleStore) Get(ctx context.Context, id string) (server.Schedule, error) {
+	got, err := s.db.GetSchedule(ctx, id)
+	if err != nil {
+		return server.Schedule{}, mapScheduleErr(err)
+	}
+	return storeToPort(got), nil
+}
+
+func (s *sqlScheduleStore) List(ctx context.Context) ([]server.Schedule, error) {
+	rows, err := s.db.ListSchedules(ctx)
+	if err != nil {
+		return nil, mapScheduleErr(err)
+	}
+	out := make([]server.Schedule, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, storeToPort(row))
+	}
+	return out, nil
+}
+
+func (s *sqlScheduleStore) Update(ctx context.Context, in server.Schedule) error {
+	return mapScheduleErr(s.db.UpdateSchedule(ctx, portToStore(in)))
+}
+
+func (s *sqlScheduleStore) Delete(ctx context.Context, id string) error {
+	return mapScheduleErr(s.db.DeleteSchedule(ctx, id))
+}
+
+// SetEnabled реализует необязательный capability порта enabledSetter: пауза и
+// возобновление меняют флаг одной записью в store.
+func (s *sqlScheduleStore) SetEnabled(ctx context.Context, id string, enabled bool) (server.Schedule, error) {
+	got, err := s.db.SetScheduleEnabled(ctx, id, enabled)
+	if err != nil {
+		return server.Schedule{}, mapScheduleErr(err)
+	}
+	return storeToPort(got), nil
+}
 
 var scheduleStoreFor = func(cfg taskcli.Config) (server.ScheduleStore, error) {
-	return server.NewFileScheduleStore(filepath.Join(cfg.StateDir, "schedules.json"))
+	db, err := openProcessStore(cfg.StateDir)
+	if err != nil {
+		return nil, fmt.Errorf("beacon task schedule: открыть store: %w", err)
+	}
+	return newSQLScheduleStore(db), nil
 }
 
 func scheduleService(cfg taskcli.Config) (*server.ScheduleService, error) {
