@@ -52,7 +52,7 @@ const (
 	// sessionIDMetaKey: ключ, под которым get_result ищет идентификатор
 	// вызывающего в _meta. Значение непрозрачно для ядра (ADR 0001).
 	sessionIDMetaKey = "ai.opencode/sessionID"
-	evalSessionID    = "beacon-evals-session"
+	evalSessionID    = "ses_eval_session"
 	// evalWakeSessionID — сессия, которую будит wake-указатель в eval 12.
 	evalWakeSessionID = "ses_eval_wake"
 	// eval 15 поднимает отдельный Watch, идентификаторы которого выдаёт
@@ -383,12 +383,14 @@ func evalFlakyQuarantine(repoRoot string) (string, bool) {
 	tooLong := []flakyEntry{{caseName: "long", added: base, expires: base.AddDate(0, 0, flakyMaxDays+1)}}
 	expired := []flakyEntry{{caseName: "old", added: base.AddDate(0, 0, -20), expires: base.AddDate(0, 0, -15)}}
 
-	_, manyBad := checkFlakyQuarantine(tooMany, now)
-	_, longBad := checkFlakyQuarantine(tooLong, now)
-	_, expiredBad := checkFlakyQuarantine(expired, now)
-	if !manyBad || !longBad || !expiredBad {
+	// checkFlakyQuarantine возвращает ok=true, когда нарушений нет. Поэтому
+	// негативный контроль сработал только при ok=false на всех трёх наборах.
+	_, manyOK := checkFlakyQuarantine(tooMany, now)
+	_, longOK := checkFlakyQuarantine(tooLong, now)
+	_, expiredOK := checkFlakyQuarantine(expired, now)
+	if manyOK || longOK || expiredOK {
 		return fmt.Sprintf("негативный контроль не сработал: лимит=%t срок=%t просрочка=%t",
-			manyBad, longBad, expiredBad), false
+			manyOK, longOK, expiredOK), false
 	}
 	return actual + "; негативные контроли сработали", true
 }
