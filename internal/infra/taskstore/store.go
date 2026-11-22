@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"path"
 	"path/filepath"
@@ -108,8 +110,14 @@ var (
 	// dotIDRE accepts an alphabetic prefix followed directly by a dot and a
 	// number, for example BS.1. The idRE above requires a digit before the dot
 	// (T3.123), so families like BS need their own form.
-	dotIDRE    = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
-	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|-[0-9]+[A-Za-z]+|[.-][0-9]+)$`)
+	dotIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*)[.]([0-9]+)$`)
+	// hashIDRE accepts the adaptive hash form T<g>.<n>.<base36>, for example
+	// T3.17.k9x2. Two dots keep it disjoint from idRE and dotIDRE, so every
+	// previously valid id still parses through its original branch.
+	hashIDRE = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9_-]*?)([0-9]+)[.]([0-9]+)[.]([0-9a-z]+)$`)
+	// exactIDRE is the single grammar for IsID and commit-linkage parsing.
+	// The last alternative adds the hash form without widening any old one.
+	exactIDRE  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|-[0-9]+[A-Za-z]+|[.-][0-9]+|[.][0-9]+[.][0-9a-z]+)$`)
 	titleRE    = regexp.MustCompile(`^#\s+[A-Za-z][A-Za-z0-9_.-]*\.\s*(.*)$`)
 	headerRE   = regexp.MustCompile(`^#\s+(.*)$`)
 	fieldRE    = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
@@ -149,6 +157,12 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 			return card, Validationf("%s: неверный номер фазы в ID", name)
 		}
 		number, err = strconv.Atoi(m[3])
+	case hashIDRE.MatchString(id):
+		h := hashIDRE.FindStringSubmatch(id)
+		group, err = strconv.Atoi(h[2])
+		if err == nil {
+			number, err = strconv.Atoi(h[3])
+		}
 	case dashIDRE.MatchString(id):
 		d := dashIDRE.FindStringSubmatch(id)
 		number, err = strconv.Atoi(d[2])
@@ -574,6 +588,124 @@ func NextID(cards []Card, groups map[string]int, group int) (int, string) {
 	return n, fmt.Sprintf("T%d.%d", group, n)
 }
 
+// Настройки адаптивной длины хеш-ID. Порог определен здесь и нигде больше:
+// и формула, и выдача ID читают одно и то же значение.
+const (
+	DefaultCollisionThreshold = 0.25
+	MinIDLength               = 3
+	MaxIDLength               = 8
+	IDAlphabetBase            = 36
+	IDNonceAttempts           = 10
+)
+
+// IDConfig задаёт параметры выдачи хеш-ID. Zero value означает настройки по
+// умолчанию, поэтому вызывающий не обязан заполнять все поля.
+type IDConfig struct {
+	CollisionThreshold float64
+	MinLength          int
+	MaxLength          int
+	Base               int
+	NonceAttempts      int
+}
+
+// DefaultIDConfig возвращает единственный источник значений по умолчанию.
+func DefaultIDConfig() IDConfig {
+	return IDConfig{
+		CollisionThreshold: DefaultCollisionThreshold,
+		MinLength:          MinIDLength,
+		MaxLength:          MaxIDLength,
+		Base:               IDAlphabetBase,
+		NonceAttempts:      IDNonceAttempts,
+	}
+}
+
+func (c IDConfig) normalized() IDConfig {
+	d := DefaultIDConfig()
+	if c.CollisionThreshold <= 0 || c.CollisionThreshold >= 1 {
+		c.CollisionThreshold = d.CollisionThreshold
+	}
+	if c.MinLength <= 0 {
+		c.MinLength = d.MinLength
+	}
+	if c.MaxLength <= 0 || c.MaxLength < c.MinLength {
+		c.MaxLength = d.MaxLength
+	}
+	if c.Base < 2 {
+		c.Base = d.Base
+	}
+	if c.NonceAttempts <= 0 {
+		c.NonceAttempts = d.NonceAttempts
+	}
+	return c
+}
+
+// AdaptiveIDLength выбирает минимальную длину L, при которой вероятность
+// коллизии по границе дня рождения для cardCount ID не превышала порог:
+// 1 - exp(-N^2/(2*Base^L)) <= CollisionThreshold. Если порог не достигнут к
+// максимуму, возвращается максимум.
+func AdaptiveIDLength(cardCount int, cfg IDConfig) int {
+	cfg = cfg.normalized()
+	if cardCount < 0 {
+		cardCount = 0
+	}
+	n := float64(cardCount)
+	for L := cfg.MinLength; L <= cfg.MaxLength; L++ {
+		total := math.Pow(float64(cfg.Base), float64(L))
+		prob := 1.0 - math.Exp(-n*n/(2.0*total))
+		if prob <= cfg.CollisionThreshold {
+			return L
+		}
+	}
+	return cfg.MaxLength
+}
+
+// base36Digest кодирует SHA-256 в нижнем регистре base36.
+func base36Digest(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return new(big.Int).SetBytes(sum[:]).Text(36)
+}
+
+// MintID выдаёт уникальный ID для одной карточки пачки. claimed содержит ID,
+// уже розданные текущей пачке, но ещё не записанные на диск. Nonce входит в
+// хеш, поэтому две карточки с одинаковыми видимыми полями получают разные ID.
+func MintID(group, number, cardCount int, seed string, claimed map[string]bool, cfg IDConfig) (string, error) {
+	cfg = cfg.normalized()
+	if claimed == nil {
+		claimed = make(map[string]bool)
+	}
+	length := AdaptiveIDLength(cardCount, cfg)
+	for L := length; L <= cfg.MaxLength; L++ {
+		for nonce := 0; nonce < cfg.NonceAttempts; nonce++ {
+			digest := base36Digest(strconv.Itoa(group), strconv.Itoa(number), seed, strconv.Itoa(L), strconv.Itoa(nonce))
+			if len(digest) < L {
+				continue
+			}
+			id := fmt.Sprintf("T%d.%d.%s", group, number, digest[:L])
+			if claimed[id] {
+				continue
+			}
+			claimed[id] = true
+			return id, nil
+		}
+	}
+	return "", Validationf("не удалось выдать уникальный ID для группы %d", group)
+}
+
+// MintBatch выдаёт ID для пачки карточек с общим claimed. Каждая карточка
+// получает свой номер, поэтому одинаковые заголовки не дают одинаковых ID.
+func MintBatch(group, cardCount int, seeds []string, cfg IDConfig) ([]string, error) {
+	claimed := make(map[string]bool, len(seeds))
+	ids := make([]string, 0, len(seeds))
+	for i, seed := range seeds {
+		id, err := MintID(group, i+1, cardCount, seed, claimed, cfg)
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
 // IDCollision это ID, который встретился в нескольких worktree с разным
 // содержимым карточки.
 type IDCollision struct {
@@ -597,7 +729,8 @@ type CollisionReport struct {
 // Замер от 2026-11-22: 316 worktree с docs/tasks, 369242 записи карточек,
 // 1228 уникальных ID, 1226 ID в нескольких worktree, 234 ID с разным
 // содержимым. Четыре из них в формате T<g>.<n>: T3.241, T3.284, T3.393, T5.52.
-// Хеш-суффикс не введён: exactIDRE и ATX-R01 требуют старый формат ID.
+// Новые ID выдаются через MintID с хеш-суффиксом T<g>.<n>.<base36>; старый
+// формат T<g>.<n> продолжает читаться через NextID и не ломает exactIDRE.
 func MeasureIDCollisions(roots ...string) (CollisionReport, error) {
 	report := CollisionReport{}
 	seenRoots := make(map[string]bool)

@@ -2,6 +2,7 @@ package taskstore
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -664,5 +665,106 @@ func TestRequiresLinkage(t *testing.T) {
 		if got := RequiresLinkage(c.subject); got != c.want {
 			t.Errorf("RequiresLinkage(%q) = %v, ждали %v", c.subject, got, c.want)
 		}
+	}
+}
+
+func TestAdaptiveIDLength(t *testing.T) {
+	cfg := DefaultIDConfig()
+	prob := func(n, length int) float64 {
+		total := math.Pow(float64(cfg.Base), float64(length))
+		return 1.0 - math.Exp(-float64(n*n)/(2.0*total))
+	}
+	for _, n := range []int{100, 1000, 10000} {
+		got := AdaptiveIDLength(n, cfg)
+		if got < cfg.MinLength || got > cfg.MaxLength {
+			t.Fatalf("AdaptiveIDLength(%d) = %d вне диапазона", n, got)
+		}
+		if prob(n, got) > cfg.CollisionThreshold {
+			t.Errorf("AdaptiveIDLength(%d) = %d, вероятность %.4f выше порога %.2f", n, got, prob(n, got), cfg.CollisionThreshold)
+		}
+		if got > cfg.MinLength && prob(n, got-1) <= cfg.CollisionThreshold {
+			t.Errorf("AdaptiveIDLength(%d) = %d не минимальна: длина %d уже даёт %.4f", n, got, got-1, prob(n, got-1))
+		}
+	}
+	if AdaptiveIDLength(100, DefaultIDConfig()) != 3 {
+		t.Fatal("AdaptiveIDLength(100) должен быть 3")
+	}
+	if AdaptiveIDLength(1000, DefaultIDConfig()) != 5 {
+		t.Fatal("AdaptiveIDLength(1000) должен быть 5")
+	}
+	if AdaptiveIDLength(10000, DefaultIDConfig()) != 6 {
+		t.Fatal("AdaptiveIDLength(10000) должен быть 6")
+	}
+
+	strict := DefaultIDConfig()
+	strict.CollisionThreshold = 0.001
+	if got := AdaptiveIDLength(1000, strict); got <= AdaptiveIDLength(1000, cfg) {
+		t.Errorf("более строгий порог не увеличил длину: %d", got)
+	}
+}
+
+func TestMintBatchUniqueAndReadable(t *testing.T) {
+	cfg := DefaultIDConfig()
+	seeds := make([]string, 100)
+	for i := range seeds {
+		seeds[i] = "одинаковый заголовок"
+	}
+	ids, err := MintBatch(3, len(seeds), seeds, cfg)
+	if err != nil {
+		t.Fatalf("MintBatch: %v", err)
+	}
+	if len(ids) != 100 {
+		t.Fatalf("MintBatch вернул %d ID, ждали 100", len(ids))
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if seen[id] {
+			t.Fatalf("повторный ID в пачке: %s", id)
+		}
+		seen[id] = true
+		if !IsID(id) || !hashIDRE.MatchString(id) {
+			t.Errorf("MintBatch выдал нечитаемый ID %q", id)
+		}
+	}
+	card, err := ParseCard(filepath.Join(t.TempDir(), ids[0]+".md"), []byte(validCard))
+	if err != nil {
+		t.Fatalf("ParseCard(%s): %v", ids[0], err)
+	}
+	if card.ID != ids[0] || card.Group != 3 || card.Number != 1 {
+		t.Fatalf("ParseCard = %q, group %d, number %d", card.ID, card.Group, card.Number)
+	}
+}
+
+func TestMintIDUsesNonce(t *testing.T) {
+	cfg := DefaultIDConfig()
+	claimed := make(map[string]bool)
+	first, err := MintID(3, 17, 100, "одинаковые поля", claimed, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := MintID(3, 17, 100, "одинаковые поля", claimed, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatalf("nonce не разделил одинаковые карточки: %s", first)
+	}
+	if !IsID(first) || !IsID(second) {
+		t.Fatalf("нечитаемые ID: %s, %s", first, second)
+	}
+}
+
+func TestLegacyIDsStillParse(t *testing.T) {
+	for _, id := range []string{"T3.17", "T5.1", "TUI-07A", "ATX-R01", "BS.1", "RS-CMP-06"} {
+		if !IsID(id) {
+			t.Errorf("IsID(%q) = false", id)
+		}
+	}
+	card, err := ParseCard(filepath.Join(t.TempDir(), "T3.17.md"), []byte(validCard))
+	if err != nil {
+		t.Fatalf("ParseCard(T3.17): %v", err)
+	}
+	if card.ID != "T3.17" || card.Group != 3 || card.Number != 17 {
+		t.Fatalf("T3.17 = %q, group %d, number %d", card.ID, card.Group, card.Number)
 	}
 }
