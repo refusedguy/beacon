@@ -122,17 +122,17 @@ func (p AutoMergePolicy) Allows() bool {
 type ApprovalCategory string
 
 const (
-	ApprovalMerge      ApprovalCategory = "merge"
-	ApprovalAction     ApprovalCategory = "action"
-	ApprovalRules      ApprovalCategory = "rules"
-	ApprovalWorktree   ApprovalCategory = "worktree"
-	ApprovalEscalation ApprovalCategory = "escalation"
+	ApprovalMerge          ApprovalCategory = "merge"
+	ApprovalCategoryAction ApprovalCategory = "action"
+	ApprovalRules          ApprovalCategory = "rules"
+	ApprovalWorktree       ApprovalCategory = "worktree"
+	ApprovalEscalation     ApprovalCategory = "escalation"
 )
 
 // ApprovalCategories returns all categories in a stable order.
 func ApprovalCategories() []ApprovalCategory {
 	return []ApprovalCategory{
-		ApprovalMerge, ApprovalAction, ApprovalRules, ApprovalWorktree, ApprovalEscalation,
+		ApprovalMerge, ApprovalCategoryAction, ApprovalRules, ApprovalWorktree, ApprovalEscalation,
 	}
 }
 
