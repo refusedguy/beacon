@@ -1,6 +1,47 @@
 package ghci
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+)
+
+const (
+	testViewJSON   = `{"state":"OPEN","headRefOid":"abc123","baseRefName":"main"}`
+	testChecksJSON = `[{"name":"build","state":"PASS","link":"https://example.test/build"}]`
+)
+
+// testGHRunner counts gh invocations and routes view and checks to payloads.
+// fail toggles a transient checks failure without rebuilding the provider.
+func testGHRunner(calls *int, fail *bool) Runner {
+	return func(_ context.Context, args ...string) ([]byte, error) {
+		*calls = *calls + 1
+		if len(args) >= 2 && args[1] == "view" {
+			return []byte(testViewJSON), nil
+		}
+		if *fail {
+			return nil, errors.New("exit status 1")
+		}
+		return []byte(testChecksJSON), nil
+	}
+}
+
+func assertThrottled(t *testing.T, p *Provider, ctx context.Context, repo string, pr int, calls int, wantFails int) throttleError {
+	t.Helper()
+	_, err := p.PRState(ctx, repo, pr)
+	var te throttleError
+	if !errors.As(err, &te) {
+		t.Fatalf("PRState in backoff: err=%v, want throttleError", err)
+	}
+	if te.fails != wantFails {
+		t.Errorf("throttleError.fails = %d, want %d", te.fails, wantFails)
+	}
+	if te.wait <= 0 {
+		t.Errorf("throttleError.wait = %s, want positive", te.wait)
+	}
+	return te
+}
 
 func TestGhCheckConclusion(t *testing.T) {
 	cases := map[string]string{
@@ -14,5 +55,115 @@ func TestGhCheckConclusion(t *testing.T) {
 		if got := ghCheckConclusion(in); got != want {
 			t.Errorf("ghCheckConclusion(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestProviderBackoffJitterSpreadsRetries is the acceptance check for CV-03.
+// Two providers fail at the same instant but different jitter delays make one
+// eligible while the other is still waiting.
+func TestProviderBackoffJitterSpreadsRetries(t *testing.T) {
+	now := time.Unix(100, 0)
+	fail := true
+	callsA, callsB := 0, 0
+	mk := func(jitter func() time.Duration, calls *int) *Provider {
+		return New(Config{
+			Backoff: 10 * time.Second, MaxBackoff: 60 * time.Second,
+			Now: func() time.Time { return now },
+			Run: testGHRunner(calls, &fail), Jitter: jitter,
+		})
+	}
+	a := mk(func() time.Duration { return time.Second }, &callsA)
+	b := mk(func() time.Duration { return 4 * time.Second }, &callsB)
+	ctx := context.Background()
+
+	if _, err := a.PRState(ctx, "o/r", 1); err == nil || callsA != 2 {
+		t.Fatalf("first failure A: err=%v ghCalls=%d, want error/2", err, callsA)
+	}
+	if _, err := b.PRState(ctx, "o/r", 1); err == nil || callsB != 2 {
+		t.Fatalf("first failure B: err=%v ghCalls=%d, want error/2", err, callsB)
+	}
+
+	now = now.Add(12 * time.Second)
+	if _, err := a.PRState(ctx, "o/r", 1); err == nil || callsA != 4 {
+		t.Fatalf("A at its deadline: err=%v ghCalls=%d, want error/4", err, callsA)
+	}
+	te := assertThrottled(t, b, ctx, "o/r", 1, callsB, 1)
+	if te.wait != 2*time.Second {
+		t.Errorf("B wait = %s, want 2s", te.wait)
+	}
+	if callsB != 2 {
+		t.Errorf("B ghCalls = %d, want 2 while it waits", callsB)
+	}
+}
+
+// TestProviderBackoffWithoutJitterKeepsCeiling is the negative control. Zero
+// jitter reproduces the old doubling schedule and the maxBackoff cap.
+func TestProviderBackoffWithoutJitterKeepsCeiling(t *testing.T) {
+	now := time.Unix(200, 0)
+	fail, calls := true, 0
+	p := New(Config{
+		Backoff: 5 * time.Second, MaxBackoff: 12 * time.Second,
+		Now:    func() time.Time { return now },
+		Run:    testGHRunner(&calls, &fail),
+		Jitter: func() time.Duration { return 0 },
+	})
+	ctx := context.Background()
+
+	if _, err := p.PRState(ctx, "o/r", 2); err == nil || calls != 2 {
+		t.Fatalf("first failure: err=%v ghCalls=%d, want error/2", err, calls)
+	}
+	now = now.Add(4 * time.Second)
+	assertThrottled(t, p, ctx, "o/r", 2, calls, 1)
+	if calls != 2 {
+		t.Errorf("ghCalls inside first backoff = %d, want 2", calls)
+	}
+	now = now.Add(time.Second)
+	if _, err := p.PRState(ctx, "o/r", 2); err == nil || calls != 4 {
+		t.Fatalf("after 5s: err=%v ghCalls=%d, want error/4", err, calls)
+	}
+	now = now.Add(10 * time.Second)
+	if _, err := p.PRState(ctx, "o/r", 2); err == nil || calls != 6 {
+		t.Fatalf("after doubled 10s: err=%v ghCalls=%d, want error/6", err, calls)
+	}
+	now = now.Add(11 * time.Second)
+	assertThrottled(t, p, ctx, "o/r", 2, calls, 3)
+	if calls != 6 {
+		t.Errorf("ghCalls before capped deadline = %d, want 6", calls)
+	}
+	now = now.Add(time.Second)
+	if _, err := p.PRState(ctx, "o/r", 2); err == nil || calls != 8 {
+		t.Fatalf("after capped 12s: err=%v ghCalls=%d, want error/8", err, calls)
+	}
+}
+
+// TestProviderBackoffRecoveryClearsErrors moved here from the cibridge suite.
+// A success after the backoff clears both the error count and the wait.
+func TestProviderBackoffRecoveryClearsErrors(t *testing.T) {
+	now := time.Unix(300, 0)
+	fail, calls := true, 0
+	p := New(Config{
+		Backoff: 5 * time.Second, MaxBackoff: 20 * time.Second,
+		Now:    func() time.Time { return now },
+		Run:    testGHRunner(&calls, &fail),
+		Jitter: func() time.Duration { return 0 },
+	})
+	ctx := context.Background()
+
+	if _, err := p.PRState(ctx, "o/r", 3); err == nil || calls != 2 {
+		t.Fatalf("first failure: err=%v ghCalls=%d, want error/2", err, calls)
+	}
+	now = now.Add(6 * time.Second)
+	if _, err := p.PRState(ctx, "o/r", 3); err == nil || calls != 4 {
+		t.Fatalf("second failure: err=%v ghCalls=%d, want error/4", err, calls)
+	}
+
+	fail = false
+	now = now.Add(11 * time.Second)
+	state, err := p.PRState(ctx, "o/r", 3)
+	if err != nil || calls != 6 || len(state.Checks) != 1 {
+		t.Fatalf("recovery: err=%v ghCalls=%d checks=%d, want nil/6/1", err, calls, len(state.Checks))
+	}
+	if _, err := p.PRState(ctx, "o/r", 3); err != nil || calls != 6 {
+		t.Fatalf("recovery cache hit: err=%v ghCalls=%d, want nil/6", err, calls)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -26,6 +27,9 @@ const (
 	// further failure doubles it up to maxBackoff.
 	defaultBackoff = 5 * time.Second
 	maxBackoff     = 60 * time.Second
+	// maxJitter bounds the random wait added to a backoff deadline. Two
+	// providers that see the same failure then retry at different times.
+	maxJitter = time.Second
 )
 
 // Runner is the only external dependency of Provider: the authenticated gh
@@ -35,6 +39,8 @@ type Runner func(ctx context.Context, args ...string) ([]byte, error)
 
 // Config tunes Provider. Zero fields get the defaults above, so
 // &ghci.Provider{} and ghci.New(ghci.Config{}) behave the same in production.
+// Jitter adds a bounded random wait to the backoff deadline and is injectable
+// so tests can fix the delay.
 type Config struct {
 	CacheTTL    time.Duration
 	MinInterval time.Duration
@@ -42,6 +48,7 @@ type Config struct {
 	MaxBackoff  time.Duration
 	Now         func() time.Time
 	Run         Runner
+	Jitter      func() time.Duration
 }
 
 // prEntry is the per-PR state kept by Provider for the lifetime of the process.
@@ -74,6 +81,7 @@ type Provider struct {
 	maxBackoff  time.Duration
 	now         func() time.Time
 	run         Runner
+	jitter      func() time.Duration
 }
 
 var _ domain.CIProvider = (*Provider)(nil)
@@ -88,6 +96,7 @@ func New(cfg Config) *Provider {
 		maxBackoff:  cfg.MaxBackoff,
 		now:         cfg.Now,
 		run:         cfg.Run,
+		jitter:      cfg.Jitter,
 	}
 }
 
@@ -120,10 +129,19 @@ func (p *Provider) defaults() {
 	if p.run == nil {
 		p.run = runGH
 	}
+	if p.jitter == nil {
+		p.jitter = defaultJitter
+	}
 }
 
 func runGH(ctx context.Context, args ...string) ([]byte, error) {
 	return exec.CommandContext(ctx, "gh", args...).Output()
+}
+
+// defaultJitter returns a random wait in [0, maxJitter]. The seam in Config
+// lets tests fix the value and compare two providers with different delays.
+func defaultJitter() time.Duration {
+	return time.Duration(rand.Int64N(int64(maxJitter) + 1))
 }
 
 // transientErrorPatterns are the error texts gh and net/http use for failures
@@ -219,7 +237,8 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 		return cached, nil
 	}
 	// A concurrent caller already owns this PR, or the minimum interval or
-	// backoff has not elapsed. Do not start a second gh process.
+	// backoff has not elapsed. Do not start a second gh process. Waiting here
+	// is not another failure, so consecutiveErrors stays put.
 	if e.inFlight || now.Before(e.nextAllowed) {
 		fails, next, cached := e.consecutiveErrors, e.nextAllowed, e.cached
 		p.mu.Unlock()
@@ -240,6 +259,8 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 	if callErr != nil {
 		// TLS handshake timeouts and `gh ...: exit status 1` are transient.
 		// One failure doubles the wait up to the cap; a success clears it.
+		// Jitter is added to the deadline only, so repeated doubling still
+		// respects maxBackoff and a zero jitter keeps the old timing.
 		e.consecutiveErrors++
 		if e.backoff <= 0 {
 			e.backoff = p.backoff
@@ -249,7 +270,7 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 				e.backoff = p.maxBackoff
 			}
 		}
-		e.nextAllowed = now.Add(e.backoff)
+		e.nextAllowed = now.Add(e.backoff + p.jitter())
 		consecutive = e.consecutiveErrors
 		p.mu.Unlock()
 		return domain.PRState{}, callErr
