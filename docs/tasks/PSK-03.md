@@ -1,5 +1,5 @@
 # PSK-03. Формальная модель жизненного цикла Watch
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: docs/design/watch-state-machine.tla, docs/design/watch-state-machine.md, scripts/verify-watch-model.sh
@@ -12,3 +12,7 @@
 Шаги: Написать `docs/design/watch-state-machine.tla` с переменными watch, revision, verdict, subscriber и mergeLedger. Записать каждый переход из `internal/domain/verdict.go` отдельным действием с меткой. Записать INVARIANT для каждого правила из предыдущего абзаца. Собрать `scripts/verify-watch-model.sh`, который запускает TLC на фиксированной версии инструмента и печатает счётчик состояний и путь до нарушения. Добавить в `docs/design/watch-state-machine.md` описание границ модели, параметров и команд воспроизведения. Для каждого найденного нарушения сверить путь с `internal/domain/verdict.go` и `internal/infra/cibridge/verdict_applier.go`.
 Проверка: `bash scripts/verify-watch-model.sh` завершается кодом 0 на текущей модели. На контрольной правке, которая убирает проверку уже сделанного мержа, скрипт завершается ненулевым кодом и печатает путь до нарушения. После отката контрольной правки скрипт снова зелёный. Модель не импортируется в Go-код и не меняет `go.mod`.
 Приёмка: Все три инварианта проверены TLC, и для каждого показано, что модель умеет находить нарушение. Документ называет границы проверки и версию инструмента. Добавление модели не меняет число MCP-инструментов, протокол Watch и required-проверки CI.
+
+Причина: Already landed in main via PR #1908, commit 7c4c7e98 (docs(design): формальная модель Watch с проверкой TLC). `git merge-base --is-ancestor 7c4c7e98 origin/main` exit 0. main contains all three OwnerFiles with invariants TypeOK NoDoubleMerge NoSilentVerdictChange BlockLiftedOnlyAfterResolve and control patches double-merge/silent-verdict/early-unblock. Duplicate PR #1915 closed after rebase add/add conflict showed the files already in main.
+Закрыл: ses_dfbf972ddffeA60A6vqU7lmC5a
+Время закрытия: 2026-11-22T16:20:35Z
