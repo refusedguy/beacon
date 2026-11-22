@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	_ "modernc.org/sqlite"
 )
 
@@ -34,6 +35,11 @@ const (
 
 	// metaSchemaVersion mirrors user_version for readers that prefer a row.
 	metaSchemaVersion = "schema_version"
+
+	// HistogramDBLockWait names the write-lock wait histogram. The observe
+	// registry creates a histogram by name on first use, so this series reaches
+	// beacon inspect and the Prometheus exporter without a label.
+	HistogramDBLockWait = "db_lock_wait_seconds"
 )
 
 var (
@@ -76,12 +82,42 @@ type DB struct {
 	// writeCount counts committed writer transactions. Tests use it to assert
 	// that one observed Write costs one transaction, not two.
 	writeCount atomic.Int64
+
+	// lockWait sums the time writes spent waiting for the single writer and
+	// the SQLite write lock. It has no labels, so it adds one fixed series.
+	lockWait lockWaitStats
 }
 
 type writeJob struct {
-	ctx context.Context
-	fn  func(*sql.Tx) error
-	err chan error
+	ctx   context.Context
+	fn    func(*sql.Tx) error
+	err   chan error
+	start time.Time
+}
+
+// lockWaitStats is the count and the summed seconds of write-lock waits.
+// The writer records one observation per job; a reader may ask at any time.
+type lockWaitStats struct {
+	mu    sync.Mutex
+	count uint64
+	sum   float64
+}
+
+func (s *lockWaitStats) observe(seconds float64) {
+	if seconds < 0 {
+		return
+	}
+	s.mu.Lock()
+	s.count++
+	s.sum += seconds
+	s.mu.Unlock()
+}
+
+// Stats returns a point-in-time copy of the count and the sum in seconds.
+func (s *lockWaitStats) Stats() (uint64, float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count, s.sum
 }
 
 var (
@@ -304,7 +340,7 @@ func (d *DB) rawWrite(ctx context.Context, fn func(*sql.Tx) error) error {
 		return errClosed
 	}
 
-	job := writeJob{ctx: ctx, fn: fn, err: make(chan error, 1)}
+	job := writeJob{ctx: ctx, fn: fn, err: make(chan error, 1), start: time.Now()}
 	select {
 	case d.writeCh <- job:
 	case <-ctx.Done():
@@ -348,6 +384,9 @@ func (d *DB) runJob(job writeJob) {
 		job.err <- err
 		return
 	}
+	// The window from the write request to a live transaction covers both the
+	// queue wait for the single writer and the busy_timeout wait in BeginTx.
+	d.recordLockWait(job.start)
 	defer tx.Rollback()
 	if err := job.fn(tx); err != nil {
 		job.err <- err
@@ -360,10 +399,27 @@ func (d *DB) runJob(job writeJob) {
 	job.err <- commitErr
 }
 
+// recordLockWait publishes one wait to the local stats and to the process-wide
+// observe sink. The sink may be a no-op before the composition root installs a
+// Recorder; the local stats still keep the measurement available to callers.
+func (d *DB) recordLockWait(start time.Time) {
+	if start.IsZero() {
+		return
+	}
+	seconds := time.Since(start).Seconds()
+	d.lockWait.observe(seconds)
+	observe.Observe(HistogramDBLockWait, seconds)
+}
+
 // WriteCount reports how many writer transactions have committed. It is an
 // observability counter used to prove the observed write path stays at one
 // transaction per Write (BCX-37).
 func (d *DB) WriteCount() int64 { return d.writeCount.Load() }
+
+// LockWaitStats reports the count and the summed seconds of write-lock waits.
+// The count includes writes whose transaction failed to commit, because the
+// wait happened before that outcome was known.
+func (d *DB) LockWaitStats() (uint64, float64) { return d.lockWait.Stats() }
 
 // migrate applies each migrations/NNNN_name.sql once. Schema version and SQL
 // body commit in the same transaction, so a failed migration never advances

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // corpusV1 is the fixed pre-migration fixture: schema version 1 with state
@@ -323,6 +325,83 @@ func TestTwoConcurrentWritersAreSerialized(t *testing.T) {
 	}
 	if count != wantWrites {
 		t.Errorf("watches = %d, want %d", count, wantWrites)
+	}
+}
+
+func TestWriteLockWaitHistogramRecordsTwoWriters(t *testing.T) {
+	metrics := observe.NewMetrics()
+	previous := observe.Default()
+	observe.SetDefault(observe.NewRecorder(nil, metrics))
+	defer observe.SetDefault(previous)
+
+	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- d.Write(context.Background(), func(tx *sql.Tx) error {
+			close(entered)
+			<-release
+			return nil
+		})
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first writer did not enter its transaction")
+	}
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- d.Write(context.Background(), func(tx *sql.Tx) error {
+			return nil
+		})
+	}()
+
+	// Let the second write queue behind the transaction the first writer holds.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+
+	for i, done := range []chan error{firstDone, secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("writer %d: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("writer %d did not finish", i)
+		}
+	}
+
+	count, sum := d.LockWaitStats()
+	if count < 1 {
+		t.Errorf("write lock wait count = %d, want >= 1", count)
+	}
+	if sum <= 0 {
+		t.Errorf("write lock wait sum = %v, want > 0", sum)
+	}
+
+	var got struct {
+		Histograms map[string]struct {
+			Count uint64  `json:"count"`
+			Sum   float64 `json:"sum"`
+		} `json:"histograms"`
+	}
+	if err := json.Unmarshal(metrics.JSON(), &got); err != nil {
+		t.Fatalf("metrics JSON: %v", err)
+	}
+	h, ok := got.Histograms[HistogramDBLockWait]
+	if !ok {
+		t.Fatalf("histogram %q missing from metrics JSON: %v", HistogramDBLockWait, got.Histograms)
+	}
+	if h.Count < 1 || h.Sum <= 0 {
+		t.Errorf("%s = count %d sum %v, want count >= 1 and sum > 0", HistogramDBLockWait, h.Count, h.Sum)
 	}
 }
 
