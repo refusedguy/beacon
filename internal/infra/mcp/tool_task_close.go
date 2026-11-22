@@ -1,18 +1,19 @@
 // Package mcp hosts Beacon's MCP server built on the official go-sdk.
 //
 // This file implements beacon_task_close. An agent closes one named card with
-// a terminal status and a short reason. The call is idempotent by
-// (cardID, status, reason): a repeat with the same three values returns ok
-// without another write, and a repeat with a different status or reason is
-// refused. A card held in_progress by another agent can only be closed by
-// that agent.
+// a terminal status and a short reason. The call is idempotent by the close
+// decision (cardID, status, reason, duplicateOf, agentID): a repeat with the
+// same values returns ok without another write, and a repeat that changes any
+// of them is refused with a machine-readable conflict. A field missing from a
+// partial close is filled in, so a retry after an interrupted write succeeds.
+// A card held in_progress by another agent can only be closed by that agent.
 //
 // The store is a port so the handler stays testable. FileTaskCloseStore is the
 // stdlib-only adapter: it reads markdown cards, holds the shared tasks flock
 // over the check and the write, and writes the same six close fields that
 // taskstore.CloseCard writes. AUD-05 removed the sidecar ledger so the card is
-// the only source of truth: the idempotency key (cardID, status, reason) is
-// read from the .md fields instead of a separate JSON file.
+// the only source of truth: the idempotency key is read from the .md fields
+// instead of a separate JSON file.
 package mcp
 
 import (
@@ -143,20 +144,29 @@ type FileTaskCloseStore struct {
 }
 
 // closeCard is the subset of a card the tool reads. Raw is kept so the close
-// write changes nothing else in the file. Reason is the .md field that carries
-// the idempotency key together with Status.
+// write changes nothing else in the file. The set flags say which close fields
+// the card actually has, so a partially written ledger can be completed on a
+// repeat instead of being treated as a conflict.
 type closeCard struct {
-	ID     string
-	Path   string
-	Raw    string
-	Status string
-	Agent  string
-	Reason string
+	ID             string
+	Path           string
+	Raw            string
+	Status         string
+	Agent          string // in_progress owner from Агент, distinct from Закрыл
+	Reason         string
+	ReasonSet      bool
+	DuplicateOf    string
+	DuplicateOfSet bool
+	ClosedBy       string
+	ClosedBySet    bool
+	ClosedAt       string
+	ClosedAtSet    bool
 }
 
 // closeRecord holds the close fields written to the card in the same order as
 // taskstore.CloseCard: Статус, Блокировщик, Причина, Дубликат, Закрыл,
-// Время закрытия. The pair (Status, Reason) is the idempotency key.
+// Время закрытия. The idempotency key is Status, Reason, DuplicateOf and
+// AgentID. ClosedAt is a timestamp stamped by the caller, not part of the key.
 type closeRecord struct {
 	Status      string
 	Reason      string
@@ -233,17 +243,29 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 		return TaskCloseOutput{}, domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("task_close: card %s not found", cardID))
 	}
 
-	// The card is the only ledger: Status plus Причина carry the idempotency
-	// key, so a close made through taskstore and one made here share it.
+	// The card is the only ledger: its close fields carry the idempotency key,
+	// so a close made through taskstore and one made here share it.
 	if taskCloseTerminal(chosen.Status) {
-		if chosen.Status != status || chosen.Reason != reason {
+		if closeReplayDiffers(chosen, status, reason, duplicateOf, agentID) {
 			return TaskCloseOutput{}, closeConflict(fmt.Sprintf(
-				"task_close: card %s was already closed as %s with reason %q", cardID, chosen.Status, chosen.Reason))
+				"task_close: card %s was already closed as %s with reason %q, duplicateOf %q, by %q",
+				cardID, chosen.Status, chosen.Reason, chosen.DuplicateOf, chosen.ClosedBy))
 		}
-		// A matching replay stays ok=true. Legacy cards written before AUD-05
-		// have only the status line, so fill in the missing close fields.
-		if !mdHasCloseFields(chosen.Raw) {
-			rec := closeRecord{Status: status, Reason: reason, DuplicateOf: duplicateOf, AgentID: agentID, ClosedAt: strings.TrimSpace(closedAt)}
+		// A matching replay stays ok=true. A close interrupted between writing
+		// the fields and renaming the file can leave some of them missing, so
+		// fill the gaps. Keep the recorded time when present: a retry must not
+		// move it.
+		rec := closeRecord{
+			Status:      status,
+			Reason:      reason,
+			DuplicateOf: duplicateOf,
+			AgentID:     agentID,
+			ClosedAt:    strings.TrimSpace(closedAt),
+		}
+		if chosen.ClosedAtSet {
+			rec.ClosedAt = chosen.ClosedAt
+		}
+		if closeReplayNeedsFill(chosen, rec) {
 			if err := s.writeCloseFields(chosen, rec); err != nil {
 				return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 			}
@@ -366,16 +388,24 @@ func closeManagedKey(line string) (string, bool) {
 	return "", false
 }
 
-// mdHasCloseFields detects a legacy close that wrote only the status line.
-func mdHasCloseFields(raw string) bool {
-	have := 0
-	for _, line := range strings.Split(raw, "\n") {
-		key, known := closeManagedKey(strings.TrimSuffix(line, "\r"))
-		if known && key != "Статус" {
-			have++
-		}
-	}
-	return have > 0
+// closeReplayDiffers reports whether a replay changes any field of the close
+// decision. A field absent from a partial ledger is unset, so the replay may
+// fill it rather than conflict.
+func closeReplayDiffers(c closeCard, status, reason, duplicateOf, agentID string) bool {
+	return c.Status != status ||
+		(c.ReasonSet && c.Reason != reason) ||
+		(c.DuplicateOfSet && c.DuplicateOf != duplicateOf) ||
+		(c.ClosedBySet && c.ClosedBy != agentID)
+}
+
+// closeReplayNeedsFill reports whether the card lacks a field that the replay
+// would write. A complete card is left untouched so its close time does not
+// move on an idempotent repeat.
+func closeReplayNeedsFill(c closeCard, rec closeRecord) bool {
+	return (rec.Reason != "" && !c.ReasonSet) ||
+		(rec.DuplicateOf != "" && !c.DuplicateOfSet) ||
+		(rec.AgentID != "" && !c.ClosedBySet) ||
+		(rec.ClosedAt != "" && !c.ClosedAtSet)
 }
 
 // cards reads and parses every card, skipping malformed files. The result is
@@ -411,9 +441,9 @@ func (s *FileTaskCloseStore) lockPath() string {
 	return TasksLockPath(s.TasksDir)
 }
 
-// parseCloseCard reads the status, owner and reason fields the close check
-// needs. A malformed card is skipped by the lister and reported as missing
-// when pinned.
+// parseCloseCard reads the status, owner and close fields the check needs.
+// A malformed card is skipped by the lister and reported as missing when
+// pinned. Presence flags separate an absent field from an empty one.
 func parseCloseCard(filePath string, data []byte) (closeCard, error) {
 	id := strings.TrimSuffix(filepath.Base(filePath), ".md")
 	if !closeCardIDRE.MatchString(id) {
@@ -436,6 +466,16 @@ func parseCloseCard(filePath string, data []byte) (closeCard, error) {
 			c.Agent = strings.TrimSpace(fm[2])
 		case "Причина":
 			c.Reason = strings.TrimSpace(fm[2])
+			c.ReasonSet = true
+		case "Дубликат":
+			c.DuplicateOf = strings.TrimSpace(fm[2])
+			c.DuplicateOfSet = true
+		case "Закрыл":
+			c.ClosedBy = strings.TrimSpace(fm[2])
+			c.ClosedBySet = true
+		case "Время закрытия":
+			c.ClosedAt = strings.TrimSpace(fm[2])
+			c.ClosedAtSet = true
 		}
 	}
 	if c.Status == "" {
