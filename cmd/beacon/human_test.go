@@ -365,3 +365,73 @@ func TestNeedsInputContinueOfSameWatchChangedQuestion(t *testing.T) {
 		t.Fatalf("stale answer reached the store: %d", store.calls)
 	}
 }
+
+// FTE-07: the CLI must accept all nine verbs the server and the live screen
+// accept. The two gap verbs are context and force_retry_merge.
+func TestFTE07ParsesAllNineGateVerbs(t *testing.T) {
+	verbs := []struct {
+		verb    string
+		outcome humanOutcome
+	}{
+		{"approve", humanApprove},
+		{"reject", humanReject},
+		{"context", humanContext},
+		{"rework", humanRework},
+		{"pause", humanPause},
+		{"resume", humanResume},
+		{"unblock", humanUnblock},
+		{"cancel", humanCancel},
+		{"force_retry_merge", humanForceRetryMerge},
+	}
+	if len(humanOutcomes) != len(verbs) {
+		t.Fatalf("humanOutcomes = %d, want %d", len(humanOutcomes), len(verbs))
+	}
+	for _, tc := range verbs {
+		resp, err := parseHumanResponse(tc.verb, "w-1", "operator note")
+		if err != nil {
+			t.Errorf("parse %q: %v", tc.verb, err)
+			continue
+		}
+		if resp.Outcome != tc.outcome {
+			t.Errorf("parse %q: outcome = %q, want %q", tc.verb, resp.Outcome, tc.outcome)
+		}
+		if resp.Note != "operator note" {
+			t.Errorf("parse %q: note = %q, want it preserved", tc.verb, resp.Note)
+		}
+	}
+}
+
+func TestFTE07HumanPostsNewVerbsWithNote(t *testing.T) {
+	for _, verb := range []string{"context", "force_retry_merge"} {
+		c, decider, store := w8bHumanHarness(t, true)
+		code := runHuman(c, []string{"--note", "operator note", verb, "w-1"})
+		if code != 0 {
+			t.Errorf("runHuman %s: code = %d", verb, code)
+		}
+		if decider.calls != 1 || decider.req.Verb != verb || decider.req.Note != "operator note" {
+			t.Errorf("runHuman %s: request = %+v, calls = %d", verb, decider.req, decider.calls)
+		}
+		if store.calls != 0 {
+			t.Errorf("runHuman %s: unexpected sqlite call %d", verb, store.calls)
+		}
+	}
+}
+
+func TestFTE07CatalogUsageListsAllVerbs(t *testing.T) {
+	var usage string
+	found := false
+	for _, entry := range catalog {
+		if entry.Name == "human" {
+			usage, found = entry.Usage, true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("human missing from catalog")
+	}
+	for _, outcome := range humanOutcomes {
+		if !strings.Contains(usage, string(outcome)) {
+			t.Errorf("catalog usage missing verb %q: %s", outcome, usage)
+		}
+	}
+}
