@@ -60,6 +60,11 @@ func TestParseCardResearchLetterID(t *testing.T) {
 		{"ATX-R01.md", "ATX-R01", 1},
 		{"ATX-V08.md", "ATX-V08", 8},
 		{"ATX-D03.md", "ATX-D03", 3},
+		// A letter after the number is a separate shape. Keep both forms working.
+		{"TUI-07A.md", "TUI-07A", 7},
+		{"TUI-07B.md", "TUI-07B", 7},
+		{"TUI-07C.md", "TUI-07C", 7},
+		{"T3.284.md", "T3.284", 284},
 	} {
 		c, err := ParseCard(tc.file, []byte(validCard))
 		if err != nil {
