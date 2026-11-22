@@ -24,7 +24,7 @@
 GO=/tmp/opencode/go126/bin/go bash evals/run.sh
 ```
 
-Юнит-тесты модели статусов запускаются в модуле evals:
+Юнит-тесты модели статусов можно запустить локально для диагностики:
 
 ```bash
 cd evals && GO=/tmp/opencode/go126/bin/go go test -tags=eval .
@@ -37,7 +37,12 @@ Eval-код лежит в отдельном модуле `github.com/refusedguy
 (`evals/go.mod` с `replace` на родительский модуль). Корневой `go test ./...`
 в него не заходит, а гейт слоёв не считает evals производственным пакетом.
 Файлы имеют build tag `eval`, поэтому сборка обычных пакетов их тоже не видит.
-`evals/run.sh` остаётся единственной командой запуска.
+`evals/run.sh` остаётся локальной диагностикой полного набора сценариев.
+Обязательный прогон идёт в джобе `registry-check` workflow
+`.github/workflows/tests.yml`: шаг `Test evals module` выполняет
+`go test -tags=eval ./...` в каталоге `evals`. Шаг `Go directives match across
+modules` сверяет директиву `go` в `go.mod`, `tools/beacon-gates/go.mod` и
+`evals/go.mod`. Расхождение версий блокирует merge PR.
 
 ## Как устроен прогон
 
