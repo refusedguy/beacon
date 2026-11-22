@@ -109,9 +109,17 @@ func parseFlags(name string, args []string, errOut io.Writer, fs *flag.FlagSet) 
 // Validation and the format tests read this map, so a command cannot advertise
 // values that the parser rejects.
 var commandFormats = map[string][]string{
-	"inspect": {"table", "json"},
-	"logs":    {"table", "json"},
-	"metrics": {"json", "prometheus"},
+	"agents":      {"table", "json"},
+	"deferred":    {"table", "json"},
+	"gc":          {"table", "json"},
+	"gc-worktree": {"table", "json"},
+	"human":       {"table", "json"},
+	"inspect":     {"table", "json"},
+	"list":        {"table", "json"},
+	"logs":        {"table", "json"},
+	"metrics":     {"json", "prometheus"},
+	"watch":       {"table", "json"},
+	"workload":    {"table", "json"},
 }
 
 // parseCommandFormat validates a --format value against the values allowed for
@@ -136,6 +144,9 @@ func runList(args []string, out, errOut io.Writer) int {
 	if !parseFlags("list", args, errOut, fs) {
 		return taskstore.ExitValidation
 	}
+	if !parseCommandFormat("list", *format, errOut, true) {
+		return taskstore.ExitValidation
+	}
 
 	switch *format {
 	case "json":
@@ -144,7 +155,7 @@ func runList(args []string, out, errOut io.Writer) int {
 			return taskstore.ExitStartup
 		}
 		return taskstore.ExitOK
-	case "table":
+	default:
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "NAME\tSUMMARY\tUSAGE")
 		for _, c := range commands() {
@@ -152,10 +163,6 @@ func runList(args []string, out, errOut io.Writer) int {
 		}
 		_ = w.Flush()
 		return taskstore.ExitOK
-	default:
-		fmt.Fprintf(errOut, "beacon list: неизвестный формат %q, ожидается table или json\n", *format)
-		writeUsage(errOut)
-		return taskstore.ExitValidation
 	}
 }
 
