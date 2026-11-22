@@ -51,7 +51,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -1430,4 +1432,325 @@ func AttachWaitResult(server *mcpsdk.Server, svc *WaitResultService) {
 		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
 		Annotations: attachToolAnnotations(true),
 	}, svc.Handle)
+}
+
+// ---- CBX-11: CAS-based concurrent gate waiter registration ----
+//
+// When a phase closes, several callers can register as waiters on the next
+// gate at the same time. A plain read-modify-write loses registrations, and a
+// retry without a pause can starve every caller but one. The registrar below
+// reads a versioned gate snapshot, writes with compare-and-swap, and on a
+// version miss waits with a doubling backoff jittered over [d/2, d). The retry
+// budget is a number of attempts, not wall-clock time, so a slow server does
+// not shorten it. A busy answer with Retry-After is distinguished from an
+// ordinary version miss and honours the server hint. Re-registering the same
+// waiter leaves a single record.
+
+// GateWaiterSnapshot is one versioned gate. Version changes only on a
+// successful write, so a reader holding version v can commit while the gate
+// still has version v and must retry otherwise.
+type GateWaiterSnapshot struct {
+	Version uint64
+	Waiters map[string]struct{}
+}
+
+// Clone returns a deep copy. Callers never mutate the stored waiter set in
+// place, so a failed CAS cannot leave a partial record behind.
+func (g GateWaiterSnapshot) Clone() GateWaiterSnapshot {
+	out := GateWaiterSnapshot{Version: g.Version, Waiters: make(map[string]struct{}, len(g.Waiters))}
+	for id := range g.Waiters {
+		out.Waiters[id] = struct{}{}
+	}
+	return out
+}
+
+// GateBusyError reports a busy gate. RetryAfter is the server hint; zero means
+// the server did not supply one and the caller falls back to its own backoff.
+type GateBusyError struct {
+	RetryAfter time.Duration
+}
+
+func (e *GateBusyError) Error() string { return "gate busy" }
+
+// GateWaiterStore is the storage port used by the registrar. Both methods may
+// return a *GateBusyError; the registrar treats that separately from a version
+// miss.
+type GateWaiterStore interface {
+	Gate(id string) (GateWaiterSnapshot, error)
+	CompareAndSwapGate(id string, expected uint64, next GateWaiterSnapshot) (bool, error)
+}
+
+// MemoryGateWaiterStore is an in-memory CAS store safe for concurrent use. It
+// is the default store when the composition root has no durable gate. The
+// optional delay and sleep let a test inject server latency without blocking
+// the test process.
+type MemoryGateWaiterStore struct {
+	mu      sync.Mutex
+	gates   map[string]GateWaiterSnapshot
+	delay   time.Duration
+	sleepFn func(context.Context, time.Duration) error
+}
+
+// NewMemoryGateWaiterStore builds an empty store.
+func NewMemoryGateWaiterStore() *MemoryGateWaiterStore {
+	return &MemoryGateWaiterStore{gates: make(map[string]GateWaiterSnapshot)}
+}
+
+// SetDelay injects per-operation server latency. A nil sleep means the delay
+// is applied with time.Sleep; a test can inject a virtual clock instead.
+func (m *MemoryGateWaiterStore) SetDelay(d time.Duration, sleep func(context.Context, time.Duration) error) {
+	if m == nil {
+		return
+	}
+	m.delay = d
+	m.sleepFn = sleep
+}
+
+func (m *MemoryGateWaiterStore) pause(ctx context.Context) error {
+	if m == nil || m.delay <= 0 {
+		return nil
+	}
+	if m.sleepFn != nil {
+		return m.sleepFn(ctx, m.delay)
+	}
+	select {
+	case <-time.After(m.delay):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Gate returns a deep copy of the gate. An unknown gate has version zero and
+// an empty waiter set.
+func (m *MemoryGateWaiterStore) Gate(id string) (GateWaiterSnapshot, error) {
+	if m == nil {
+		return GateWaiterSnapshot{}, domain.NewAppError(domain.CodePersistFailed, "gate store is nil")
+	}
+	if err := m.pause(context.Background()); err != nil {
+		return GateWaiterSnapshot{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.gates[id]
+	if !ok {
+		return GateWaiterSnapshot{Waiters: make(map[string]struct{})}, nil
+	}
+	return g.Clone(), nil
+}
+
+// CompareAndSwapGate writes next only while the stored version still matches
+// expected. On success it advances the version by one.
+func (m *MemoryGateWaiterStore) CompareAndSwapGate(id string, expected uint64, next GateWaiterSnapshot) (bool, error) {
+	if m == nil {
+		return false, domain.NewAppError(domain.CodePersistFailed, "gate store is nil")
+	}
+	if err := m.pause(context.Background()); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.gates[id]
+	if !ok {
+		cur = GateWaiterSnapshot{Waiters: make(map[string]struct{})}
+	}
+	if cur.Version != expected {
+		return false, nil
+	}
+	next.Version = expected + 1
+	m.gates[id] = next.Clone()
+	return true, nil
+}
+
+// Snapshot returns a deep copy of a gate for inspection. An unknown gate has
+// version zero and an empty waiter set.
+func (m *MemoryGateWaiterStore) Snapshot(id string) GateWaiterSnapshot {
+	if m == nil {
+		return GateWaiterSnapshot{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.gates[id]
+	if !ok {
+		return GateWaiterSnapshot{Waiters: make(map[string]struct{})}
+	}
+	return g.Clone()
+}
+
+// Defaults for the registrar. They mirror the beads gate registration: twenty
+// attempts, a 10 ms base and a 400 ms cap.
+const (
+	DefaultGateMaxAttempts = 20
+	DefaultGateBaseDelay   = 10 * time.Millisecond
+	DefaultGateMaxDelay    = 400 * time.Millisecond
+)
+
+// GateRegisterResult reports what one registration did. Attempts counts the
+// rounds actually spent, including busy waits and version misses.
+type GateRegisterResult struct {
+	Registered bool
+	Attempts   int
+}
+
+// GateWaiterRegistrar registers waiters on a versioned gate with CAS.
+type GateWaiterRegistrar struct {
+	Store       GateWaiterStore
+	MaxAttempts int
+	BaseDelay   time.Duration
+	MaxDelay    time.Duration
+	sleep       func(context.Context, time.Duration) error
+	jitter      func() float64
+}
+
+// NewGateWaiterRegistrar builds a registrar over store with the default retry
+// budget and backoff. Callers may override the exported fields before use.
+func NewGateWaiterRegistrar(store GateWaiterStore) *GateWaiterRegistrar {
+	return &GateWaiterRegistrar{
+		Store:       store,
+		MaxAttempts: DefaultGateMaxAttempts,
+		BaseDelay:   DefaultGateBaseDelay,
+		MaxDelay:    DefaultGateMaxDelay,
+		sleep:       sleepWithContext,
+		jitter:      rand.Float64,
+	}
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// SetSleep replaces the wait function. Tests inject a recorder to observe the
+// backoff and the Retry-After without sleeping.
+func (r *GateWaiterRegistrar) SetSleep(fn func(context.Context, time.Duration) error) {
+	if r != nil && fn != nil {
+		r.sleep = fn
+	}
+}
+
+// SetJitter replaces the jitter source. It must return a value in [0, 1).
+func (r *GateWaiterRegistrar) SetJitter(fn func() float64) {
+	if r != nil && fn != nil {
+		r.jitter = fn
+	}
+}
+
+// busyDelay distinguishes a busy answer from any other error.
+func busyDelay(err error) (time.Duration, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var busy *GateBusyError
+	if errors.As(err, &busy) {
+		return busy.RetryAfter, true
+	}
+	return 0, false
+}
+
+// jitteredDelay maps d to [d/2, d) using a jitter value in [0, 1).
+func jitteredDelay(d time.Duration, jitter func() float64) time.Duration {
+	v := jitter()
+	if v < 0 {
+		v = 0
+	}
+	if v >= 1 {
+		v = 0
+	}
+	return d/2 + time.Duration(float64(d)/2*v)
+}
+
+// Register adds waiterID to gateID. A waiter already present is a no-op that
+// reports one attempt and keeps one record. A version miss costs one attempt
+// and a jittered backoff; a busy answer costs one attempt and honours
+// Retry-After. Registration fails only when the attempt budget is exhausted or
+// the store returns a non-busy error.
+func (r *GateWaiterRegistrar) Register(ctx context.Context, gateID, waiterID string) (GateRegisterResult, error) {
+	if r == nil || r.Store == nil {
+		return GateRegisterResult{}, domain.NewAppError(domain.CodeInvalidInput, "gate registrar: store is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	max := r.MaxAttempts
+	if max <= 0 {
+		max = DefaultGateMaxAttempts
+	}
+	base := r.BaseDelay
+	if base <= 0 {
+		base = DefaultGateBaseDelay
+	}
+	limit := r.MaxDelay
+	if limit <= 0 {
+		limit = DefaultGateMaxDelay
+	}
+	jitter := r.jitter
+	if jitter == nil {
+		jitter = rand.Float64
+	}
+	sleep := r.sleep
+	if sleep == nil {
+		sleep = sleepWithContext
+	}
+
+	delay := base
+	for attempt := 1; attempt <= max; attempt++ {
+		snap, err := r.Store.Gate(gateID)
+		if err != nil {
+			if hint, busy := busyDelay(err); busy {
+				wait := hint
+				if wait <= 0 {
+					wait = jitteredDelay(delay, jitter)
+				}
+				if werr := sleep(ctx, wait); werr != nil {
+					return GateRegisterResult{Attempts: attempt}, werr
+				}
+				continue
+			}
+			return GateRegisterResult{Attempts: attempt}, err
+		}
+		if _, exists := snap.Waiters[waiterID]; exists {
+			return GateRegisterResult{Registered: true, Attempts: attempt}, nil
+		}
+		next := snap.Clone()
+		if next.Waiters == nil {
+			next.Waiters = make(map[string]struct{})
+		}
+		next.Waiters[waiterID] = struct{}{}
+		ok, err := r.Store.CompareAndSwapGate(gateID, snap.Version, next)
+		if err != nil {
+			if hint, busy := busyDelay(err); busy {
+				wait := hint
+				if wait <= 0 {
+					wait = jitteredDelay(delay, jitter)
+				}
+				if werr := sleep(ctx, wait); werr != nil {
+					return GateRegisterResult{Attempts: attempt}, werr
+				}
+				continue
+			}
+			return GateRegisterResult{Attempts: attempt}, err
+		}
+		if ok {
+			return GateRegisterResult{Registered: true, Attempts: attempt}, nil
+		}
+		// Version miss: double the delay with jitter over [d/2, d).
+		if werr := sleep(ctx, jitteredDelay(delay, jitter)); werr != nil {
+			return GateRegisterResult{Attempts: attempt}, werr
+		}
+		if delay < limit {
+			delay *= 2
+			if delay > limit {
+				delay = limit
+			}
+		}
+	}
+	return GateRegisterResult{Attempts: max}, domain.NewAppError(domain.CodeLimitExceeded,
+		"gate registrar: attempt budget exhausted for gate "+gateID)
 }

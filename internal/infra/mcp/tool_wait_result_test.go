@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1947,5 +1949,228 @@ func TestOutputSchemaWaitReasonOutputAdmitsReason(t *testing.T) {
 		if _, ok := schema.Properties[name]; !ok {
 			t.Errorf("WaitReasonOutput schema missing property %q", name)
 		}
+	}
+}
+
+// ---- CBX-11: CAS gate waiter registration ----
+
+// recordingSleep captures the delays the registrar asks for. It never sleeps,
+// so a test can inject a 500 ms hint or backoff without stalling the suite.
+type recordingSleep struct {
+	mu    sync.Mutex
+	calls []time.Duration
+}
+
+func (s *recordingSleep) fn(_ context.Context, d time.Duration) error {
+	s.mu.Lock()
+	s.calls = append(s.calls, d)
+	s.mu.Unlock()
+	runtime.Gosched()
+	return nil
+}
+
+func (s *recordingSleep) durations() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.calls...)
+}
+
+func TestGateWaiterRegistrarConcurrent(t *testing.T) {
+	store := NewMemoryGateWaiterStore()
+	reg := NewGateWaiterRegistrar(store)
+	rec := &recordingSleep{}
+	reg.SetSleep(rec.fn)
+	const n = 20
+	results := make([]GateRegisterResult, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			waiter := fmt.Sprintf("waiter-%02d", i)
+			results[i], errs[i] = reg.Register(context.Background(), "phase-gate", waiter)
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("waiter %d: %v", i, errs[i])
+		}
+		if !results[i].Registered {
+			t.Fatalf("waiter %d was not registered", i)
+		}
+		if results[i].Attempts < 1 || results[i].Attempts > DefaultGateMaxAttempts {
+			t.Fatalf("waiter %d attempts=%d out of range", i, results[i].Attempts)
+		}
+	}
+	snap := store.Snapshot("phase-gate")
+	if len(snap.Waiters) != n {
+		t.Fatalf("waiters=%d want %d: lost registrations", len(snap.Waiters), n)
+	}
+	for i := 0; i < n; i++ {
+		if _, ok := snap.Waiters[fmt.Sprintf("waiter-%02d", i)]; !ok {
+			t.Fatalf("waiter %d missing from gate", i)
+		}
+	}
+}
+
+func TestGateWaiterRegistrarDedup(t *testing.T) {
+	store := NewMemoryGateWaiterStore()
+	reg := NewGateWaiterRegistrar(store)
+	for i := 0; i < 2; i++ {
+		res, err := reg.Register(context.Background(), "gate", "waiter")
+		if err != nil || !res.Registered {
+			t.Fatalf("register %d: result=%+v err=%v", i, res, err)
+		}
+	}
+	snap := store.Snapshot("gate")
+	if len(snap.Waiters) != 1 {
+		t.Fatalf("waiters=%d want one record", len(snap.Waiters))
+	}
+	if snap.Version != 1 {
+		t.Fatalf("version=%d want 1; dedup should not write", snap.Version)
+	}
+}
+
+// casFailStore always misses CAS, so every attempt pays a version-miss backoff.
+type casFailStore struct {
+	failN int
+}
+
+func (s *casFailStore) Gate(string) (GateWaiterSnapshot, error) {
+	return GateWaiterSnapshot{Waiters: map[string]struct{}{}}, nil
+}
+
+func (s *casFailStore) CompareAndSwapGate(string, uint64, GateWaiterSnapshot) (bool, error) {
+	if s.failN > 0 {
+		s.failN--
+		return false, nil
+	}
+	return true, nil
+}
+
+func TestGateWaiterRegistrarBackoffAndAttemptBound(t *testing.T) {
+	reg := NewGateWaiterRegistrar(&casFailStore{failN: 100})
+	reg.MaxAttempts = 4
+	reg.BaseDelay = 10 * time.Millisecond
+	reg.MaxDelay = 25 * time.Millisecond
+	reg.SetJitter(func() float64 { return 0.5 })
+	rec := &recordingSleep{}
+	reg.SetSleep(rec.fn)
+
+	res, err := reg.Register(context.Background(), "gate", "waiter")
+	if err == nil {
+		t.Fatal("expected attempt exhaustion")
+	}
+	var app *domain.AppError
+	if !errors.As(err, &app) || app.Code != domain.CodeLimitExceeded {
+		t.Fatalf("err=%v want LIMIT_EXCEEDED", err)
+	}
+	if res.Attempts != 4 {
+		t.Fatalf("attempts=%d want 4", res.Attempts)
+	}
+	// Jitter 0.5 gives [d/2, d): 7.5ms, 15ms, then the 25ms cap twice.
+	want := []time.Duration{7500000, 15000000, 18750000, 18750000}
+	if got := rec.durations(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("backoff=%v want %v", got, want)
+	}
+}
+
+// busyGateStore returns a busy answer with a Retry-After hint on the first
+// read, then delegates to a real store.
+type busyGateStore struct {
+	inner *MemoryGateWaiterStore
+	calls int
+	hint  time.Duration
+}
+
+func (s *busyGateStore) Gate(id string) (GateWaiterSnapshot, error) {
+	s.calls++
+	if s.calls == 1 {
+		return GateWaiterSnapshot{}, &GateBusyError{RetryAfter: s.hint}
+	}
+	return s.inner.Gate(id)
+}
+
+func (s *busyGateStore) CompareAndSwapGate(id string, expected uint64, next GateWaiterSnapshot) (bool, error) {
+	return s.inner.CompareAndSwapGate(id, expected, next)
+}
+
+func TestGateWaiterRegistrarBusyHonoursRetryAfter(t *testing.T) {
+	inner := NewMemoryGateWaiterStore()
+	reg := NewGateWaiterRegistrar(&busyGateStore{inner: inner, hint: 500 * time.Millisecond})
+	rec := &recordingSleep{}
+	reg.SetSleep(rec.fn)
+
+	res, err := reg.Register(context.Background(), "gate", "waiter")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Registered || res.Attempts != 2 {
+		t.Fatalf("result=%+v want registered in two attempts", res)
+	}
+	if got := rec.durations(); len(got) != 1 || got[0] != 500*time.Millisecond {
+		t.Fatalf("busy sleeps=%v want one 500ms hint", got)
+	}
+	if got := len(inner.Snapshot("gate").Waiters); got != 1 {
+		t.Fatalf("waiters=%d want 1", got)
+	}
+}
+
+func TestGateWaiterRegistrarSlowServerStillCompletes(t *testing.T) {
+	store := NewMemoryGateWaiterStore()
+	// The 500 ms per operation is virtual: the store calls the injected sleep
+	// and the test returns at once. A time-based retry budget would time out;
+	// an attempt-based one still registers every waiter.
+	store.SetDelay(500*time.Millisecond, func(context.Context, time.Duration) error { return nil })
+	reg := NewGateWaiterRegistrar(store)
+	rec := &recordingSleep{}
+	reg.SetSleep(rec.fn)
+	const n = 20
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = reg.Register(context.Background(), "slow-gate", fmt.Sprintf("w-%02d", i))
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("waiter %d: %v", i, err)
+		}
+	}
+	if got := len(store.Snapshot("slow-gate").Waiters); got != n {
+		t.Fatalf("waiters=%d want %d", got, n)
+	}
+}
+
+type errGateStore struct{ err error }
+
+func (s errGateStore) Gate(string) (GateWaiterSnapshot, error) {
+	return GateWaiterSnapshot{}, s.err
+}
+
+func (s errGateStore) CompareAndSwapGate(string, uint64, GateWaiterSnapshot) (bool, error) {
+	return false, s.err
+}
+
+func TestGateWaiterRegistrarPropagatesStoreError(t *testing.T) {
+	want := errors.New("store down")
+	reg := NewGateWaiterRegistrar(errGateStore{err: want})
+	if _, err := reg.Register(context.Background(), "gate", "waiter"); !errors.Is(err, want) {
+		t.Fatalf("err=%v want the store error", err)
+	}
+}
+
+func TestGateWaiterRegistrarHonoursContextCancellation(t *testing.T) {
+	reg := NewGateWaiterRegistrar(&casFailStore{failN: 100})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := reg.Register(ctx, "gate", "waiter"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v want context.Canceled", err)
 	}
 }
