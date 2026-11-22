@@ -8,16 +8,15 @@
 // that agent.
 //
 // The store is a port so the handler stays testable. FileTaskCloseStore is the
-// stdlib-only adapter: it reads markdown cards, holds an exclusive flock over
-// the check and the write, and swaps the status line with an atomic rename.
-// The reason and the duplicate target live in a sidecar ledger under StateDir,
-// so the card keeps the 13 fields the taskstore parser and doc gate accept.
+// stdlib-only adapter: it reads markdown cards, holds the shared tasks flock
+// over the check and the write, and writes the same six close fields that
+// taskstore.CloseCard writes. AUD-05 removed the sidecar ledger so the card is
+// the only source of truth: the idempotency key (cardID, status, reason) is
+// read from the .md fields instead of a separate JSON file.
 package mcp
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -136,47 +135,51 @@ func (h *TaskCloseHandler) Close(ctx context.Context, in TaskCloseInput) (TaskCl
 }
 
 // FileTaskCloseStore is a stdlib-only TaskCloseStore over markdown cards.
-// TasksDir holds the cards. StateDir holds the lock and the close ledger and
-// defaults to TasksDir when empty.
+// TasksDir holds the cards and the shared lock. StateDir is kept for wiring
+// compatibility; close no longer keeps a sidecar there.
 type FileTaskCloseStore struct {
 	TasksDir string
 	StateDir string
 }
 
-// closeCard is the subset of a card the tool reads. Raw is kept so the status
-// swap changes nothing else in the file.
+// closeCard is the subset of a card the tool reads. Raw is kept so the close
+// write changes nothing else in the file. Reason is the .md field that carries
+// the idempotency key together with Status.
 type closeCard struct {
 	ID     string
 	Path   string
 	Raw    string
 	Status string
 	Agent  string
+	Reason string
 }
 
-// closeRecord is one close in the sidecar ledger. The idempotency key is the
-// pair (Status, Reason) stored per cardID; the other fields are audit data.
+// closeRecord holds the close fields written to the card in the same order as
+// taskstore.CloseCard: Статус, Блокировщик, Причина, Дубликат, Закрыл,
+// Время закрытия. The pair (Status, Reason) is the idempotency key.
 type closeRecord struct {
-	Status      string `json:"status"`
-	Reason      string `json:"reason"`
-	DuplicateOf string `json:"duplicateOf,omitempty"`
-	AgentID     string `json:"agentID"`
-	ClosedAt    string `json:"closedAt"`
-}
-
-// closeLedger is the on-disk map of cardID to its close record.
-type closeLedger struct {
-	Cards map[string]closeRecord `json:"cards"`
+	Status      string
+	Reason      string
+	DuplicateOf string
+	AgentID     string
+	ClosedAt    string
 }
 
 var (
 	closeCardIDRE    = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*(?:-[A-Za-z]+[0-9]+|[.-][0-9]+)$`)
 	closeFieldLineRE = regexp.MustCompile(`^([\p{L}][\p{L}\p{N} ]{0,40}):[ \t]*(.*)$`)
-	closeStatusRE    = regexp.MustCompile(`^Статус:[ \t]*(.*?)[ \t]*$`)
 )
 
-// Close takes the flock first, then reads and writes the cards and the ledger.
+// closeManagedFields is the close format of taskstore/close.go. The order and
+// the names must stay identical so a card closed through MCP is
+// indistinguishable from a card closed by taskstore.CloseCard.
+var closeManagedFields = []string{
+	"Статус", "Блокировщик", "Причина", "Дубликат", "Закрыл", "Время закрытия",
+}
+
+// Close takes the shared tasks flock first, then reads and writes the card.
 // The lock makes the existence, ownership and idempotency checks authoritative
-// against a concurrent claim or close.
+// against a concurrent claim, close or taskstore writer.
 func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, closedAt string) (TaskCloseOutput, error) {
 	if err := ctx.Err(); err != nil {
 		return TaskCloseOutput{}, err
@@ -230,19 +233,18 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 		return TaskCloseOutput{}, domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("task_close: card %s not found", cardID))
 	}
 
-	ledger, err := readCloseLedger(s.ledgerPath())
-	if err != nil {
-		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
-	}
-	if rec, ok := ledger.Cards[cardID]; ok {
-		if rec.Status != status || rec.Reason != reason {
+	// The card is the only ledger: Status plus Причина carry the idempotency
+	// key, so a close made through taskstore and one made here share it.
+	if taskCloseTerminal(chosen.Status) {
+		if chosen.Status != status || chosen.Reason != reason {
 			return TaskCloseOutput{}, closeConflict(fmt.Sprintf(
-				"task_close: card %s was already closed as %s with reason %q", cardID, rec.Status, rec.Reason))
+				"task_close: card %s was already closed as %s with reason %q", cardID, chosen.Status, chosen.Reason))
 		}
-		// A matching replay is ok. Re-apply the status when an earlier call
-		// wrote the ledger but failed before the card rename.
-		if chosen.Status != status {
-			if err := s.writeStatus(chosen, status); err != nil {
+		// A matching replay stays ok=true. Legacy cards written before AUD-05
+		// have only the status line, so fill in the missing close fields.
+		if !mdHasCloseFields(chosen.Raw) {
+			rec := closeRecord{Status: status, Reason: reason, DuplicateOf: duplicateOf, AgentID: agentID, ClosedAt: strings.TrimSpace(closedAt)}
+			if err := s.writeCloseFields(chosen, rec); err != nil {
 				return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 			}
 		}
@@ -265,10 +267,6 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 		return TaskCloseOutput{}, domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf(
 			"task_close: card %s is in_progress by %s, not %s", cardID, chosen.Agent, agentID))
 	}
-	if taskCloseTerminal(chosen.Status) {
-		return TaskCloseOutput{}, closeConflict(fmt.Sprintf(
-			"task_close: card %s is already %s", cardID, chosen.Status))
-	}
 
 	rec := closeRecord{
 		Status:      status,
@@ -277,20 +275,107 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 		AgentID:     agentID,
 		ClosedAt:    strings.TrimSpace(closedAt),
 	}
-	ledger.Cards[cardID] = rec
-	if err := writeCloseLedger(s.ledgerPath(), ledger); err != nil {
-		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
-	}
-	if err := s.writeStatus(chosen, status); err != nil {
+	if err := s.writeCloseFields(chosen, rec); err != nil {
 		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
 	return TaskCloseOutput{OK: true, CardID: cardID, Status: status}, nil
 }
 
-// writeStatus rewrites only the Status line and keeps the rest byte for byte,
-// including CRLF endings, then replaces the card in one atomic rename.
-func (s *FileTaskCloseStore) writeStatus(card closeCard, status string) error {
-	return writeCloseFile(card.Path, []byte(replaceCloseStatus(card.Raw, status)))
+// writeCloseFields writes all close fields in one atomic rename, under the same
+// shared lock that claim and taskstore hold.
+func (s *FileTaskCloseStore) writeCloseFields(card closeCard, rec closeRecord) error {
+	return writeCloseFile(card.Path, []byte(applyCloseFields(card.Raw, rec)))
+}
+
+// applyCloseFields mirrors taskstore.ApplyCloseFields so both writers produce
+// identical card fields. Existing lines are replaced in place, missing fields
+// are inserted before the first "## " section, and empty values drop the line.
+func applyCloseFields(raw string, rec closeRecord) string {
+	values := map[string]string{
+		"Статус":         rec.Status,
+		"Блокировщик":    "",
+		"Причина":        rec.Reason,
+		"Дубликат":       rec.DuplicateOf,
+		"Закрыл":         rec.AgentID,
+		"Время закрытия": rec.ClosedAt,
+	}
+
+	cr := ""
+	if strings.Contains(raw, "\r\n") {
+		cr = "\r"
+	}
+	lines := strings.Split(raw, "\n")
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(lines)+len(closeManagedFields))
+	insertAt := -1
+	for _, line := range lines {
+		if insertAt < 0 && strings.HasPrefix(line, "## ") {
+			insertAt = len(out)
+		}
+		lineCR := ""
+		body := line
+		if strings.HasSuffix(line, "\r") {
+			lineCR = "\r"
+			body = strings.TrimSuffix(line, "\r")
+		}
+		key, known := closeManagedKey(body)
+		if !known {
+			out = append(out, line)
+			continue
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		value := values[key]
+		if value == "" {
+			continue
+		}
+		out = append(out, key+": "+value+lineCR)
+	}
+
+	missing := make([]string, 0, len(closeManagedFields))
+	for _, key := range closeManagedFields {
+		if !seen[key] && values[key] != "" {
+			missing = append(missing, key+": "+values[key]+cr)
+		}
+	}
+	if len(missing) > 0 {
+		if insertAt < 0 {
+			insertAt = len(out)
+		}
+		tail := append([]string(nil), out[insertAt:]...)
+		out = append(out[:insertAt:insertAt], missing...)
+		out = append(out, tail...)
+	}
+	return strings.Join(out, "\n")
+}
+
+// closeManagedKey reports whether a line is one of the managed close fields.
+func closeManagedKey(line string) (string, bool) {
+	colon := strings.IndexByte(line, ':')
+	if colon < 0 {
+		return "", false
+	}
+	key := strings.TrimSpace(line[:colon])
+	for _, managed := range closeManagedFields {
+		if key == managed {
+			return managed, true
+		}
+	}
+	return "", false
+}
+
+// mdHasCloseFields detects a legacy close that wrote only the status line.
+func mdHasCloseFields(raw string) bool {
+	have := 0
+	for _, line := range strings.Split(raw, "\n") {
+		key, known := closeManagedKey(strings.TrimSuffix(line, "\r"))
+		if known && key != "Статус" {
+			have++
+		}
+	}
+	return have > 0
 }
 
 // cards reads and parses every card, skipping malformed files. The result is
@@ -320,24 +405,15 @@ func (s *FileTaskCloseStore) cards() ([]closeCard, error) {
 	return cards, nil
 }
 
+// lockPath is the same path claim and taskstore use; StateDir no longer holds
+// a separate close lock.
 func (s *FileTaskCloseStore) lockPath() string {
-	return filepath.Join(s.stateDir(), ".beacon-task-close.lock")
+	return TasksLockPath(s.TasksDir)
 }
 
-func (s *FileTaskCloseStore) ledgerPath() string {
-	return filepath.Join(s.stateDir(), ".beacon-task-close.json")
-}
-
-func (s *FileTaskCloseStore) stateDir() string {
-	dir := strings.TrimSpace(s.StateDir)
-	if dir == "" {
-		return s.TasksDir
-	}
-	return dir
-}
-
-// parseCloseCard reads the two fields the ownership check needs. A malformed
-// card is skipped by the lister and reported as missing when pinned.
+// parseCloseCard reads the status, owner and reason fields the close check
+// needs. A malformed card is skipped by the lister and reported as missing
+// when pinned.
 func parseCloseCard(filePath string, data []byte) (closeCard, error) {
 	id := strings.TrimSuffix(filepath.Base(filePath), ".md")
 	if !closeCardIDRE.MatchString(id) {
@@ -358,55 +434,14 @@ func parseCloseCard(filePath string, data []byte) (closeCard, error) {
 			c.Status = strings.TrimSpace(fm[2])
 		case "Агент":
 			c.Agent = strings.TrimSpace(fm[2])
+		case "Причина":
+			c.Reason = strings.TrimSpace(fm[2])
 		}
 	}
 	if c.Status == "" {
 		return closeCard{}, fmt.Errorf("task_close: card %s has no status", id)
 	}
 	return c, nil
-}
-
-// replaceCloseStatus rewrites only the Status line of a card.
-func replaceCloseStatus(raw, status string) string {
-	lines := strings.Split(raw, "\n")
-	for i, line := range lines {
-		cr := ""
-		if strings.HasSuffix(line, "\r") {
-			cr = "\r"
-			line = strings.TrimSuffix(line, "\r")
-		}
-		if closeStatusRE.MatchString(line) {
-			lines[i] = "Статус: " + status + cr
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-// readCloseLedger loads the sidecar ledger. A missing file is an empty ledger.
-func readCloseLedger(path string) (closeLedger, error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return closeLedger{Cards: map[string]closeRecord{}}, nil
-	}
-	if err != nil {
-		return closeLedger{}, err
-	}
-	var ledger closeLedger
-	if err := json.Unmarshal(data, &ledger); err != nil {
-		return closeLedger{}, err
-	}
-	if ledger.Cards == nil {
-		ledger.Cards = map[string]closeRecord{}
-	}
-	return ledger, nil
-}
-
-func writeCloseLedger(path string, ledger closeLedger) error {
-	data, err := json.MarshalIndent(ledger, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeCloseFile(path, append(data, '\n'))
 }
 
 // closeConflict has the 409 status of other conflicts. It uses the duplicate

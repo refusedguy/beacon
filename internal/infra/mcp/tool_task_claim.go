@@ -119,9 +119,20 @@ func (h *TaskClaimHandler) Claim(ctx context.Context, in TaskClaimInput) (TaskCl
 	return h.store.Claim(ctx, in, when)
 }
 
+// tasksLockName is the single lock file of the tasks directory (AUD-05).
+// taskstore declared the same name for its writers; the value is repeated here
+// because the layer matrix forbids internal/infra -> internal/infra imports.
+const tasksLockName = ".beacon-tasks.lock"
+
+// TasksLockPath is the shared lock path for every card writer: taskstore,
+// beacon_task_claim and beacon_task_close all flock this one file.
+func TasksLockPath(tasksDir string) string {
+	return filepath.Join(tasksDir, tasksLockName)
+}
+
 // FileTaskClaimStore is a stdlib-only TaskClaimStore over markdown cards.
-// TasksDir holds the cards; StateDir holds the lock file and defaults to
-// TasksDir when empty.
+// TasksDir holds the cards and the shared lock. StateDir is kept for wiring
+// compatibility and no longer holds a separate claim lock.
 type FileTaskClaimStore struct {
 	TasksDir string
 	StateDir string
@@ -310,11 +321,7 @@ func (s *FileTaskClaimStore) CardIDForAgent(agentID string) string {
 }
 
 func (s *FileTaskClaimStore) lockPath() string {
-	dir := strings.TrimSpace(s.StateDir)
-	if dir == "" {
-		dir = s.TasksDir
-	}
-	return filepath.Join(dir, ".beacon-task-claim.lock")
+	return TasksLockPath(s.TasksDir)
 }
 
 // parseClaimCard reads the top-level fields of one card. A malformed card is
