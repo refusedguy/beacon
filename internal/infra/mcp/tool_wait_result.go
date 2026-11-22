@@ -85,9 +85,11 @@ const (
 // canonical order is status, verdict, revision, checks, pollAfterMs; the
 // MarshalJSON method below is the single place that emits them. ADR 0046 p3
 // appends one more field, reason, after the five fixed ones. SB-03 appends two
-// advisory fields, infra_tier and infra_reason, after reason. Nothing is
-// reordered, so an output that carries none of the appended fields still
-// serialises to the exact bytes the ADR 0036 §2 contract locks.
+// advisory fields, infra_tier and infra_reason, after reason. SB-05 appends
+// exit_cause and partial_diff after those, so a task that died before PR
+// creation can hand its saved work to one following turn. Nothing is reordered,
+// so an output that carries none of the appended fields still serialises to the
+// exact bytes the ADR 0036 §2 contract locks.
 const (
 	waitResultFieldStatus      = "status"
 	waitResultFieldVerdict     = "verdict"
@@ -97,6 +99,8 @@ const (
 	waitResultFieldReason      = "reason"
 	waitResultFieldInfraTier   = "infra_tier"
 	waitResultFieldInfraReason = "infra_reason"
+	waitResultFieldExitCause   = "exit_cause"
+	waitResultFieldPartialDiff = "partial_diff"
 )
 
 // WaitStopReason is why a wait ended (ADR 0046 p3). The five values are
@@ -201,11 +205,15 @@ const waitStopReasonCheckName = "_beaconWaitStopReason"
 // SB-03 uses the same carry-through pattern for the two advisory fields. A
 // classification stamped on a WaitResultOutput rides in Checks until the
 // handler marshals it into the top-level infra_tier and infra_reason fields.
-// The keys are reserved; a user check that reuses one with an invalid value
-// stays an ordinary check.
+// SB-05 carries exit_cause and partial_diff the same way: the adapter stamps
+// them from the last trajectory step on a terminal error, and MarshalJSON
+// lifts them into top-level fields. The keys are reserved; a user check that
+// reuses one with an invalid value stays an ordinary check.
 const (
 	waitInfraTierCheckName   = "_beaconInfraTier"
 	waitInfraReasonCheckName = "_beaconInfraReason"
+	waitExitCauseCheckName   = "_beaconExitCause"
+	waitPartialDiffCheckName = "_beaconPartialDiff"
 )
 
 // withWaitStopReason stamps reason onto out without mutating the caller's
@@ -286,6 +294,83 @@ func infraReasonOf(out WaitResultOutput) domain.InfraReason {
 	return reason
 }
 
+// ExitStatusCause names why a task died before it could open a PR. The values
+// mirror the terminal causes of the task's exit_status table: context, cost,
+// timeout, api, environment and unknown. An empty cause marks a trajectory
+// that ended with no exit_status. The cause is advisory: it never replaces a
+// WaitStopReason or its exit code, so all five reasons and codes stay intact
+// (BCX-11).
+type ExitStatusCause string
+
+const (
+	ExitStatusContext     ExitStatusCause = "context"
+	ExitStatusCost        ExitStatusCause = "cost"
+	ExitStatusTimeout     ExitStatusCause = "timeout"
+	ExitStatusAPI         ExitStatusCause = "api"
+	ExitStatusEnvironment ExitStatusCause = "environment"
+	ExitStatusUnknown     ExitStatusCause = "unknown"
+)
+
+func (c ExitStatusCause) valid() bool {
+	switch c {
+	case ExitStatusContext, ExitStatusCost, ExitStatusTimeout,
+		ExitStatusAPI, ExitStatusEnvironment, ExitStatusUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// NeedsRetry reports whether a trajectory with this cause must run again. An
+// empty cause means the task ended with no exit_status. Such a trajectory is
+// incomplete: the batch removes it before a repeat instead of counting it as
+// a finished submission. A recorded cause is terminal and is not retried
+// blindly. Source: comp-swebench, run_batch.py:376-409.
+func NeedsRetry(cause ExitStatusCause) bool {
+	return cause == ""
+}
+
+// WithTerminalFailure stamps the terminal cause and the saved partial diff on
+// out without mutating the caller's Checks map. The adapter calls it with the
+// diff from the last trajectory step when the runtime dies before PR creation.
+// An invalid cause or an empty diff leaves that stamp unset. The stamp is
+// advisory: it changes neither out.Verdict nor the wait stop reason.
+func WithTerminalFailure(out WaitResultOutput, cause ExitStatusCause, partialDiff string) WaitResultOutput {
+	if !cause.valid() && partialDiff == "" {
+		return out
+	}
+	checks := make(map[string]domain.Check, len(out.Checks)+2)
+	for name, check := range out.Checks {
+		checks[name] = check
+	}
+	if cause.valid() {
+		checks[waitExitCauseCheckName] = domain.Check{State: string(cause), Conclusion: string(cause)}
+	}
+	if partialDiff != "" {
+		checks[waitPartialDiffCheckName] = domain.Check{State: partialDiff, Conclusion: partialDiff}
+	}
+	out.Checks = checks
+	return out
+}
+
+// FailureCauseOf reads the terminal cause stamped on out. An empty result
+// means the output carries no cause, for example a wait that ended without a
+// terminal task failure.
+func FailureCauseOf(out WaitResultOutput) ExitStatusCause {
+	cause := ExitStatusCause(out.Checks[waitExitCauseCheckName].State)
+	if !cause.valid() {
+		return ""
+	}
+	return cause
+}
+
+// PartialDiffOf reads the saved partial diff stamped on out. An empty result
+// means the output carries no saved work. A restarted session reads this value
+// from the wait journal and opens the PR from it in one following turn.
+func PartialDiffOf(out WaitResultOutput) string {
+	return out.Checks[waitPartialDiffCheckName].State
+}
+
 // MarshalJSON writes a WaitResultOutput in the fixed order above. encoding/json
 // marshals struct fields in declaration order and map keys in sorted order,
 // but spelling the order out here keeps it a deliberate, testable contract
@@ -301,19 +386,23 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 	// both sources: the real field wins, the key keeps older paths working.
 	// Appending after pollAfterMs keeps the five ADR 0036 §2 fields byte-stable
 	// when no reason is present. SB-03 appends the advisory tier and reason
-	// after reason, on the same omitempty rule.
+	// after reason, on the same omitempty rule. SB-05 appends the terminal
+	// exit cause and the saved partial diff after those, also omitempty.
 	reason := o.Reason
 	if reason == "" {
 		reason = waitStopReasonOf(o)
 	}
 	infraTier := infraTierOf(o)
 	infraReason := infraReasonOf(o)
+	exitCause := FailureCauseOf(o)
+	partialDiff := PartialDiffOf(o)
 	checks := o.Checks
-	if reason != "" || infraTier != "" || infraReason != "" {
+	if reason != "" || infraTier != "" || infraReason != "" || exitCause != "" || partialDiff != "" {
 		checks = make(map[string]domain.Check, len(o.Checks))
 		for name, check := range o.Checks {
 			switch name {
-			case waitStopReasonCheckName, waitInfraTierCheckName, waitInfraReasonCheckName:
+			case waitStopReasonCheckName, waitInfraTierCheckName, waitInfraReasonCheckName,
+				waitExitCauseCheckName, waitPartialDiffCheckName:
 				continue
 			}
 			checks[name] = check
@@ -339,6 +428,12 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 	}
 	if infraReason != "" {
 		fields = append(fields, field{name: waitResultFieldInfraReason, value: infraReason})
+	}
+	if exitCause != "" {
+		fields = append(fields, field{name: waitResultFieldExitCause, value: exitCause})
+	}
+	if partialDiff != "" {
+		fields = append(fields, field{name: waitResultFieldPartialDiff, value: partialDiff})
 	}
 
 	var buf bytes.Buffer
