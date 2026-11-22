@@ -139,9 +139,17 @@ type Snapshot struct {
 	LiveWatches      []Watch   `json:"liveWatches"`
 	BlockerIncidents []Blocker `json:"blockerIncidents"`
 	PointStats       Points    `json:"pointStats"`
+	Metrics          Metrics   `json:"metrics"`
 	Escalations      []string  `json:"escalations"`
 	LoadErrors       []string  `json:"loadErrors"`
 	LastCycle        Cycle     `json:"lastCycle"`
+}
+
+// Metrics is the optional runtime block of the snapshot. The server sends
+// rssBytes as a number. An older snapshot leaves the field at zero, and the
+// board prints its fallback instead of a byte count.
+type Metrics struct {
+	RSSBytes uint64 `json:"rssBytes"`
 }
 
 // Watch is one live row of the dashboard table.

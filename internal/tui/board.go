@@ -612,7 +612,14 @@ func (m Model) watchLines() string {
 		}
 		fmt.Fprintf(&b, "%s#%d %s %s verdict=%s rev=%d%s\n", mark, w.PR, shortSHA(w.HeadSHA), w.Status, w.Verdict, w.Revision, blocked)
 		for _, sub := range w.Subscribers {
-			fmt.Fprintf(&b, "    %s фаза=%s\n", sub.ID, oneLine(sub.Phase))
+			line := fmt.Sprintf("    %s фаза=%s", sub.ID, oneLine(sub.Phase))
+			if role := oneLine(sub.Role); role != "" {
+				line += " роль=" + role
+			}
+			if target := oneLine(sub.Target); target != "" {
+				line += " target=" + target
+			}
+			b.WriteString(line + "\n")
 		}
 	}
 	if b.Len() == 0 {
@@ -665,7 +672,11 @@ func (m Model) eventLines() string {
 
 func (m Model) memoryLines() string {
 	cycle := m.snap.LastCycle
-	return fmt.Sprintf("RSS: нет данных в снимке | цикл обновлено=%d за %d мс", cycle.WatchesUpdated, cycle.DurationMs)
+	rss := "нет данных в снимке"
+	if bytes := m.snap.Metrics.RSSBytes; bytes > 0 {
+		rss = fmt.Sprintf("%.1f MiB (%d байт)", float64(bytes)/(1<<20), bytes)
+	}
+	return fmt.Sprintf("RSS: %s | цикл обновлено=%d за %d мс", rss, cycle.WatchesUpdated, cycle.DurationMs)
 }
 
 func (m Model) listLimit(total int) int {
