@@ -590,3 +590,208 @@ func RunArtery(spec ArterySpec) (ArteryResult, error) {
 	}
 	return result, nil
 }
+
+// --- Self-contained replay trajectory (SB-04) ---
+
+// TrajectorySchema is the version tag written into every snapshot. Replay
+// refuses a snapshot captured by a different schema, so a change in step
+// semantics cannot silently produce a different trace.
+const TrajectorySchema = "beacon-trajectory/v1"
+
+// RunConfig is the configuration that produced a run. It travels inside the
+// snapshot so replay can check compatibility without a live worktree, agent or
+// environment. Replay holds the settings a replay run uses; this mirrors a
+// ReplayModelConfig that replaces the live provider during replay.
+type RunConfig struct {
+	Schema      string            `yaml:"schema"`
+	Environment string            `yaml:"environment"`
+	Replay      map[string]string `yaml:"replay,omitempty"`
+}
+
+// CurrentConfig returns the configuration this build captures in a snapshot.
+// The replay settings name the stub model, so a replayed run has no provider or
+// network dependency.
+func CurrentConfig() RunConfig {
+	return RunConfig{
+		Schema:      TrajectorySchema,
+		Environment: "stub",
+		Replay:      map[string]string{"model": "replay"},
+	}
+}
+
+// WatchCheck is one check recorded with a completed watch. It carries only the
+// observable fields; the verdict and revision keep their existing format.
+type WatchCheck struct {
+	Name       string `yaml:"name"`
+	Conclusion string `yaml:"conclusion"`
+	Required   bool   `yaml:"required,omitempty"`
+}
+
+// WatchOutcome is the verdict side of a completed watch copied into a
+// trajectory. Adding a snapshot does not change how verdict or revision are
+// stored in the journal; it only makes them available to a replay in a clean
+// environment.
+type WatchOutcome struct {
+	Verdict  string       `yaml:"verdict"`
+	Revision int          `yaml:"revision"`
+	Checks   []WatchCheck `yaml:"checks,omitempty"`
+}
+
+// Trajectory is a self-contained snapshot of one completed run. It holds the
+// config, the ordered actions, the recorded result and the watch outcome in one
+// value. A journal persists only the bytes from Marshal; ReplayResult and
+// RestoreSubmission read those bytes back with no worktree, agent or external
+// artifact. Scenario keeps the name, seed and actions; Result is the outcome
+// recorded at capture time and is used only by Verify.
+type Trajectory struct {
+	Config   RunConfig    `yaml:"config"`
+	Scenario Scenario     `yaml:"scenario"`
+	Result   Result       `yaml:"result"`
+	Watch    WatchOutcome `yaml:"watch"`
+}
+
+// NewTrajectory captures a completed run. scenario and result must come from
+// the same Run call; cfg and outcome describe the environment and verdict that
+// surrounded it. Empty fields in cfg are filled with the current defaults.
+// Every slice and map is copied so later caller mutation cannot change the
+// snapshot.
+func NewTrajectory(cfg RunConfig, scenario Scenario, result Result, outcome WatchOutcome) Trajectory {
+	if cfg.Schema == "" {
+		cfg.Schema = TrajectorySchema
+	}
+	if cfg.Environment == "" {
+		cfg.Environment = "stub"
+	}
+	if cfg.Replay == nil {
+		cfg.Replay = map[string]string{"model": "replay"}
+	}
+	return Trajectory{
+		Config: cloneRunConfig(cfg),
+		Scenario: Scenario{
+			Name:  scenario.Name,
+			Seed:  scenario.Seed,
+			Steps: cloneSteps(scenario.Steps),
+		},
+		Result: cloneResult(result),
+		Watch:  cloneWatchOutcome(outcome),
+	}
+}
+
+// Marshal serializes t to YAML bytes for journal storage. This package never
+// opens a file: the caller persists the bytes and later passes them to
+// ParseTrajectory when the run must be replayed.
+func (t Trajectory) Marshal() ([]byte, error) {
+	data, err := yaml.Marshal(t)
+	if err != nil {
+		return nil, fmt.Errorf("testsystem: marshal trajectory: %w", err)
+	}
+	return data, nil
+}
+
+// ParseTrajectory reads trajectory bytes from a journal and validates them. A
+// schema or missing-action error is returned before any caller can replay the
+// snapshot.
+func ParseTrajectory(data []byte) (Trajectory, error) {
+	var t Trajectory
+	if err := yaml.Unmarshal(data, &t); err != nil {
+		return Trajectory{}, fmt.Errorf("testsystem: parse trajectory: %w", err)
+	}
+	if err := t.compatible(); err != nil {
+		return Trajectory{}, err
+	}
+	return t, nil
+}
+
+// compatible reports whether this build can replay t. It checks the schema tag
+// and the presence of recorded actions. It deliberately ignores Result, so a
+// snapshot whose result artifact was lost is still replayable.
+func (t Trajectory) compatible() error {
+	if t.Config.Schema != TrajectorySchema {
+		return fmt.Errorf("testsystem: trajectory schema %q incompatible with %q", t.Config.Schema, TrajectorySchema)
+	}
+	if len(t.Scenario.Steps) == 0 {
+		return fmt.Errorf("testsystem: trajectory %q has no recorded actions", t.Scenario.Name)
+	}
+	return nil
+}
+
+// ReplayResult runs only the recorded actions in a fresh Runner. It reads
+// nothing but t: the runner is stateless and performs no external I/O, so this
+// is a replay in a clean environment. An incompatible snapshot is rejected
+// before any action runs.
+func (t Trajectory) ReplayResult() (Result, error) {
+	if err := t.compatible(); err != nil {
+		return Result{}, err
+	}
+	return Run(t.Scenario), nil
+}
+
+// Verify replays the snapshot and checks the fresh trace against the result
+// recorded at capture time. It returns an error when the recorded result is
+// missing or no longer matches the replayed trace.
+func (t Trajectory) Verify() error {
+	if t.Result.Scenario != t.Scenario.Name || t.Result.Seed != t.Scenario.Seed {
+		return fmt.Errorf("testsystem: trajectory %q: recorded result identity drifted", t.Scenario.Name)
+	}
+	got, err := t.ReplayResult()
+	if err != nil {
+		return err
+	}
+	if want := t.Result.Fingerprint(); got.Fingerprint() != want {
+		return fmt.Errorf("testsystem: trajectory %q: replay fingerprint %s, recorded %s", t.Scenario.Name, got.Fingerprint(), want)
+	}
+	return nil
+}
+
+// Submission is the artifact a completed run produces: the canonical trace and
+// its fingerprint. It is the beacon counterpart of an extracted prediction.
+type Submission struct {
+	Trace       string `yaml:"trace"`
+	Fingerprint string `yaml:"fingerprint"`
+}
+
+// RestoreSubmission rebuilds the submission from t alone, without reading the
+// recorded Result. Re-running the captured actions in a fresh Runner yields the
+// canonical trace; the fingerprint is derived from it. This recovers a result
+// whose stored artifact was lost, as long as the journal kept the snapshot.
+func (t Trajectory) RestoreSubmission() (Submission, error) {
+	if err := t.compatible(); err != nil {
+		return Submission{}, err
+	}
+	result := Run(t.Scenario)
+	return Submission{Trace: result.String(), Fingerprint: result.Fingerprint()}, nil
+}
+
+// MatchesResult reports whether a restored submission equals the result t
+// recorded at capture time.
+func (t Trajectory) MatchesResult(s Submission) bool {
+	return s.Fingerprint == t.Result.Fingerprint()
+}
+
+func cloneRunConfig(in RunConfig) RunConfig {
+	out := in
+	if in.Replay != nil {
+		out.Replay = make(map[string]string, len(in.Replay))
+		for k, v := range in.Replay {
+			out.Replay[k] = v
+		}
+	}
+	return out
+}
+
+func cloneResult(in Result) Result {
+	out := Result{Scenario: in.Scenario, Seed: in.Seed, Events: make([]Event, len(in.Events))}
+	for i, ev := range in.Events {
+		out.Events[i] = Event{Seq: ev.Seq, Kind: ev.Kind, Receipt: ev.Receipt, Fields: cloneFields(ev.Fields)}
+	}
+	return out
+}
+
+func cloneWatchOutcome(in WatchOutcome) WatchOutcome {
+	out := WatchOutcome{Verdict: in.Verdict, Revision: in.Revision}
+	if in.Checks != nil {
+		out.Checks = make([]WatchCheck, len(in.Checks))
+		copy(out.Checks, in.Checks)
+	}
+	return out
+}
