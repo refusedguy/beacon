@@ -39,10 +39,17 @@
 // previous owner's generation live, and the next swap would skip the row
 // because the stale claim still matches. The stamp is applied on the same
 // successful path as the unblock, so a repeat resolve cannot rotate it twice.
+//
+// A beacon_ack can also carry a tool-permission mode switch and rule updates
+// (CS-02). These are control-channel data: the domain validates the mode and the
+// rules, and the handler stores them under the session ID from _meta. A
+// session-scoped update stays in that session. Tool permissions are a different
+// axis from MergePolicy, which decides how a Watch merges.
 package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -420,6 +427,62 @@ func (r *ContinuationRegistry) Rounds(watchID string) uint64 {
 	return r.rounds[watchID]
 }
 
+// PermissionRegistry keeps one SessionPermission per session ID. The key is the
+// opaque session from _meta, so a session-scoped update writes only that
+// session's record and never leaks into another. It is safe for concurrent use.
+type PermissionRegistry struct {
+	mu     sync.Mutex
+	states map[string]domain.SessionPermission
+}
+
+// NewPermissionRegistry builds an empty permission registry.
+func NewPermissionRegistry() *PermissionRegistry {
+	return &PermissionRegistry{states: make(map[string]domain.SessionPermission)}
+}
+
+// Lookup returns the state stored for sessionID. The bool is false when the
+// session has no state yet.
+func (r *PermissionRegistry) Lookup(sessionID string) (domain.SessionPermission, bool) {
+	if r == nil {
+		return domain.SessionPermission{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	state, ok := r.states[sessionID]
+	return state, ok
+}
+
+// Apply switches mode and appends rule updates to one session's state. Every
+// command is validated before the state is written, so a rejected mode or an
+// incomplete update leaves the stored state untouched. The caller supplies a
+// domain function that returns the next state; the registry writes it only on
+// success. SessionID comes from _meta and is never taken from client input.
+func (r *PermissionRegistry) Apply(sessionID string, apply func(domain.SessionPermission) (domain.SessionPermission, error)) (domain.SessionPermission, error) {
+	if r == nil {
+		return domain.SessionPermission{}, domain.NewAppError(domain.CodePersistFailed, "ack: permission registry is nil")
+	}
+	if sessionID == "" {
+		return domain.SessionPermission{}, domain.NewAppError(domain.CodeInvalidInput, "ack: permission change requires sessionID from _meta")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.states == nil {
+		r.states = make(map[string]domain.SessionPermission)
+	}
+	next, err := apply(r.states[sessionID])
+	if err != nil {
+		return domain.SessionPermission{}, err
+	}
+	if next.SessionID != sessionID {
+		return domain.SessionPermission{}, domain.NewAppError(domain.CodeInvalidInput, "ack: permission change targeted another session")
+	}
+	if next.Mode == "" {
+		next.Mode = domain.PermissionModeDefault
+	}
+	r.states[sessionID] = next
+	return next, nil
+}
+
 // ackWatchWriter is the optional write side a composition root can supply to
 // persist the resumed Watch. The read port alone stays unchanged: a store that
 // cannot write a Watch still gets the idempotency and round checks, but the
@@ -440,7 +503,11 @@ type AckHandler struct {
 	continuations *ContinuationRegistry
 	decisions     *DecisionRegistry
 	blocked       *BlockedRegistry
-	blockers      BlockerControl
+	// permissions holds the per-session permission state for CS-02. Instances
+	// built before this port was added keep their ack behaviour; a nil
+	// permission registry skips the control-channel fields.
+	permissions *PermissionRegistry
+	blockers    BlockerControl
 	// generations stamps a fresh generation on every Watch a resolve unblocks.
 	// It is optional so handlers built before the port was added keep their
 	// idempotency and block behaviour unchanged; a nil store simply skips the
@@ -461,6 +528,7 @@ func NewAckHandler(store resultStoreReader, stamper ObligationStamper, clock dom
 		continuations: NewContinuationRegistry(),
 		decisions:     NewDecisionRegistry(),
 		blocked:       NewBlockedRegistry(),
+		permissions:   NewPermissionRegistry(),
 	}
 }
 
@@ -488,6 +556,14 @@ func (h *AckHandler) SetDecisionRegistry(r *DecisionRegistry) {
 func (h *AckHandler) SetBlockedRegistry(r *BlockedRegistry) {
 	if h != nil && r != nil {
 		h.blocked = r
+	}
+}
+
+// SetPermissionRegistry shares the per-session permission state with a
+// composition root. A nil argument leaves the handler's own registry in place.
+func (h *AckHandler) SetPermissionRegistry(r *PermissionRegistry) {
+	if h != nil && r != nil {
+		h.permissions = r
 	}
 }
 
@@ -523,9 +599,66 @@ func (h *AckHandler) rotateGenerations(watchIDs ...string) {
 	}
 }
 
+// ApplyPermissionChange switches one session's mode and applies its rule updates
+// on the control channel. Mode and rules live in domain data; the handler holds
+// no per-mode branch. The registry validates and writes all or nothing, so a
+// rejected update cannot leave a partial rule behind. sessionID comes from
+// _meta, which keeps a session-scoped change inside its own session.
+func (h *AckHandler) ApplyPermissionChange(sessionID string, mode domain.PermissionMode, updates []domain.PermissionUpdate) (domain.SessionPermission, error) {
+	if h == nil || h.permissions == nil {
+		return domain.SessionPermission{}, domain.NewAppError(domain.CodePersistFailed, "ack: permission registry is nil")
+	}
+	return h.permissions.Apply(sessionID, func(state domain.SessionPermission) (domain.SessionPermission, error) {
+		if mode != "" {
+			cmd := domain.SetPermissionMode{SessionID: sessionID, Mode: mode}
+			next, err := state.ApplyMode(cmd)
+			if err != nil {
+				return domain.SessionPermission{}, err
+			}
+			state = next
+		}
+		if len(updates) > 0 {
+			next, err := state.ApplyUpdates(sessionID, updates)
+			if err != nil {
+				return domain.SessionPermission{}, err
+			}
+			state = next
+		}
+		return state, nil
+	})
+}
+
 type ackWallClock struct{}
 
 func (ackWallClock) Now() time.Time { return time.Now() }
+
+// permissionControlFields are the CS-02 control fields carried alongside a
+// beacon_ack. They stay out of AckInput so the byte-pinned tools/list input
+// schema does not change: the SDK derives that schema from the typed input.
+// The fields are read from the raw request arguments instead.
+type permissionControlFields struct {
+	SetPermissionMode domain.PermissionMode     `json:"setPermissionMode"`
+	PermissionUpdates []domain.PermissionUpdate `json:"permissionUpdates"`
+}
+
+// permissionControlFromRequest reads the permission control fields from the raw
+// request arguments. An absent or malformed value yields no change: the fields
+// are optional extensions, and an unknown shape must not turn a plain ack into
+// an error. Validation of a present value happens in the domain, before a write.
+func permissionControlFromRequest(req *mcpsdk.CallToolRequest) (domain.PermissionMode, []domain.PermissionUpdate) {
+	if req == nil || req.Params == nil || req.Params.Arguments == nil {
+		return "", nil
+	}
+	raw, err := json.Marshal(req.Params.Arguments)
+	if err != nil {
+		return "", nil
+	}
+	var fields permissionControlFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return "", nil
+	}
+	return fields.SetPermissionMode, fields.PermissionUpdates
+}
 
 // Handle adapts Ack to the go-sdk typed tool handler signature and returns the
 // shared ok-only response. The response carries no verdict: a caller still has
@@ -537,10 +670,24 @@ func (ackWallClock) Now() time.Time { return time.Now() }
 // AckReceipt. A blocked:not_mine decision takes the session ID from req's _meta
 // and names it as the blocker in the block record. A blocked:resolved decision
 // needs no session: it clears the block on the Watch named by the ack.
+//
+// The raw request may also carry setPermissionMode and permissionUpdates. Those
+// are control-channel fields (CS-02): they switch the calling session's mode and
+// append validated rule updates before the ack is stamped. They are read from
+// the raw arguments so the byte-pinned tools/list input schema stays unchanged.
 func (h *AckHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in AckInput) (*mcpsdk.CallToolResult, OKOutput, error) {
 	var sessionID string
 	if id := SessionIDFromRequest(req); id != nil {
 		sessionID = *id
+	}
+	// Permission control is applied before the ack write. The domain validates
+	// mode and updates first, so an incomplete update writes no state and also
+	// prevents the ack from being stamped on that path.
+	mode, updates := permissionControlFromRequest(req)
+	if mode != "" || len(updates) > 0 {
+		if _, err := h.ApplyPermissionChange(sessionID, mode, updates); err != nil {
+			return nil, OKOutput{}, err
+		}
 	}
 	receipt, err := h.ackReceiptWithSession(ctx, in, sessionID)
 	if err != nil && !IsStaleRevision(err) {
