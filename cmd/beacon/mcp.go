@@ -125,6 +125,18 @@ func linkedCardID(ctx context.Context, db *store.DB, watchID string) (string, er
 // directly (ADR 0005), as in init.go.
 var wiringCardWriteFile = os.WriteFile
 
+// mergedCloseOptions builds the canonical close fields shared with the CLI and
+// MCP close paths. An explicit timestamp keeps repeated merged observations
+// byte for byte identical.
+func mergedCloseOptions(at time.Time) taskstore.CloseCardOptions {
+	return taskstore.CloseCardOptions{
+		Status:   "done",
+		Reason:   "already_landed",
+		ClosedBy: "beacon",
+		ClosedAt: at.UTC().Format(time.RFC3339),
+	}
+}
+
 // closeWiringCard flips the deferred card to done and records the merged PR.
 // The confirmation line makes the write idempotent: a repeated merged
 // observation leaves the file unchanged.
@@ -146,7 +158,10 @@ func closeWiringCard(root string, pr int, at time.Time) error {
 	if strings.Contains(text, fmt.Sprintf("PR #%d MERGED", pr)) {
 		return nil
 	}
-	text = strings.Replace(text, "Статус: todo", "Статус: done", 1)
+	text, err = taskstore.ApplyCloseFields(text, mergedCloseOptions(at))
+	if err != nil {
+		return err
+	}
 	text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n",
 		pr, at.UTC().Format("2006-01-02"))
 	return wiringCardWriteFile(path, []byte(text), 0o644)
@@ -154,8 +169,9 @@ func closeWiringCard(root string, pr int, at time.Time) error {
 
 // closeLinkedCardFile flips the card linked to a merged Watch to done. The PR
 // marker makes the write idempotent: a repeated merged observation leaves the
-// card unchanged. setCardField owns the field edit, so the result still parses
-// with taskstore.LoadCards.
+// card unchanged. taskstore.ApplyCloseFields owns the close fields, so the
+// result matches the CLI and MCP close paths. Only Состояние and Вопрос stay
+// outside that contract and are cleared separately.
 func closeLinkedCardFile(root, cardID string, pr int, at time.Time) error {
 	if root == "" || strings.TrimSpace(cardID) == "" || pr <= 0 {
 		return nil
@@ -173,7 +189,10 @@ func closeLinkedCardFile(root, cardID string, pr int, at time.Time) error {
 	if strings.Contains(text, marker) {
 		return nil
 	}
-	text = setCardField(text, "Статус", "done")
+	text, err = taskstore.ApplyCloseFields(text, mergedCloseOptions(at))
+	if err != nil {
+		return err
+	}
 	text = setCardField(text, "Состояние", "")
 	text = setCardField(text, "Вопрос", "")
 	text += fmt.Sprintf("\n## Подтверждение\n- %s: %s (squash).\n",
