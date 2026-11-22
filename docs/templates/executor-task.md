@@ -931,3 +931,23 @@ shell-hook: unchanged, no-duplicate
 mcp-tools: unchanged
 source: SB-15, sweagent tools.py:29-72, agents.py:946-947
 executor-task:action-policy -->
+
+## Три бюджета времени действия (SB-14)
+
+Исполнитель считает время каждого действия по трём бюджетам. Команда получает 30 секунд, установка 300 секунд, вся серия действий 1800 секунд. Исполнитель сравнивает время действия с лимитом его вида в одной точке проверки и называет бюджет, который исчерпан. Источник: карточка SB-14, `sweagent/sweagent/tools/tools.py:139-152`, `sweagent/sweagent/agent/agents.py:958-991`.
+
+Три последовательных таймаута команды прерывают сессию с причиной `exit_command_timeout`. Успешная команда обнуляет счётчик. Таймаут установки и исчерпание общего времени останавливают серию с первой проверки, без ожидания третьего случая. Причина остановки всегда называется по бюджету. Исполнитель не читает логи, чтобы её узнать.
+
+Бюджет действия не меняет контракт ожидания. `beacon_wait_result` продолжает возвращать прежний `reason` и код 143. Информационный таймаут не становится блокером main и не вызывает `beacon_ack decision="blocked:not_mine"`. `WaitStopReason` и его коды выхода остаются без изменений.
+
+<!-- executor-task:action-budgets
+budgets: command-30s, install-300s, total-1800s
+check: single, elapsed-vs-kind-limit
+consecutive: 3 -> exit_command_timeout
+success: reset
+install-total: immediate-stop
+reason: name-the-budget, no-log-reading
+wait_result: unchanged, code-143
+informational: not-main-blocker
+source: SB-14, sweagent/tools.py:139-152, agents.py:958-991
+executor-task:action-budgets -->

@@ -2022,3 +2022,135 @@ func (r *GateWaiterRegistrar) Register(ctx context.Context, gateID, waiterID str
 	return GateRegisterResult{Attempts: max}, domain.NewAppError(domain.CodeLimitExceeded,
 		"gate registrar: attempt budget exhausted for gate "+gateID)
 }
+
+// ---- SB-14: three time budgets for one agent action ----
+//
+// An action has three independent limits: one command, one install and the
+// whole series. sweagent sets them in sweagent/tools/tools.py:139-152 and
+// agent/agents.py:958-991. The stop reason names the budget that ran out, so
+// nobody reads logs to explain a stop. This model stays separate from
+// WaitStopReason. An action timeout is informational and never blocks main.
+
+// ActionBudget names the limit that ended an action.
+type ActionBudget string
+
+const (
+	ActionBudgetCommand ActionBudget = "command"
+	ActionBudgetInstall ActionBudget = "install"
+	ActionBudgetTotal   ActionBudget = "total"
+)
+
+// ActionTimeBudgets holds the three limits. A zero disables a budget so a
+// caller can turn one off without changing the others.
+type ActionTimeBudgets struct {
+	Command time.Duration
+	Install time.Duration
+	Total   time.Duration
+}
+
+// DefaultActionTimeBudgets returns the sweagent limits. One command gets 30
+// seconds, an install gets 300 and the whole series gets 1800.
+func DefaultActionTimeBudgets() ActionTimeBudgets {
+	return ActionTimeBudgets{
+		Command: 30 * time.Second,
+		Install: 300 * time.Second,
+		Total:   1800 * time.Second,
+	}
+}
+
+// Exceeded reports whether elapsed broke the limit for kind. An unknown kind
+// or a disabled limit returns false. This is the single check point for the
+// three budgets.
+func (b ActionTimeBudgets) Exceeded(kind ActionBudget, elapsed time.Duration) bool {
+	var limit time.Duration
+	switch kind {
+	case ActionBudgetCommand:
+		limit = b.Command
+	case ActionBudgetInstall:
+		limit = b.Install
+	case ActionBudgetTotal:
+		limit = b.Total
+	default:
+		return false
+	}
+	return limit > 0 && elapsed > limit
+}
+
+// ActionStopReason names why a series stopped. It is a new type, so
+// WaitStopReason and the wait_result exit codes keep their contract.
+type ActionStopReason string
+
+const (
+	StopCommandTimeout ActionStopReason = "exit_command_timeout"
+	StopInstallTimeout ActionStopReason = "exit_install_timeout"
+	StopTotalTimeout   ActionStopReason = "exit_total_timeout"
+)
+
+// MaxConsecutiveCommandTimeouts is the sweagent rule. Three command timeouts
+// in a row end the run.
+const MaxConsecutiveCommandTimeouts = 3
+
+// ActionTimeoutTracker counts consecutive command timeouts and records why a
+// series stopped. A successful command clears the count. An install or total
+// timeout stops the series on the first hit. A mutex guards the state because
+// one agent can run more than one action at a time.
+type ActionTimeoutTracker struct {
+	mu          sync.Mutex
+	consecutive int
+	stopReason  ActionStopReason
+}
+
+// RecordTimeout adds one timeout of kind. A command timeout stops the series
+// after three in a row. An install or total timeout stops it at once.
+func (t *ActionTimeoutTracker) RecordTimeout(kind ActionBudget) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopReason != "" {
+		return
+	}
+	switch kind {
+	case ActionBudgetCommand:
+		t.consecutive++
+		if t.consecutive >= MaxConsecutiveCommandTimeouts {
+			t.stopReason = StopCommandTimeout
+		}
+	case ActionBudgetInstall:
+		t.stopReason = StopInstallTimeout
+	case ActionBudgetTotal:
+		t.stopReason = StopTotalTimeout
+	}
+}
+
+// RecordSuccess clears the consecutive command timeout count. A later timeout
+// starts a fresh count, so three unrelated timeouts do not end the series.
+func (t *ActionTimeoutTracker) RecordSuccess() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.consecutive = 0
+}
+
+// StopReason returns why the series stopped, or empty while it still runs.
+func (t *ActionTimeoutTracker) StopReason() ActionStopReason {
+	if t == nil {
+		return ""
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopReason
+}
+
+// ConsecutiveTimeouts returns the current run of command timeouts.
+func (t *ActionTimeoutTracker) ConsecutiveTimeouts() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.consecutive
+}
