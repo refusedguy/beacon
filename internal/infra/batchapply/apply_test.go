@@ -1,6 +1,7 @@
 package batchapply
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -1271,4 +1272,250 @@ func TestRunForceOverwriteReportsUpdatedIssues(t *testing.T) {
 	if !strings.Contains(out.String(), "StaleSkippedIDs=\n") {
 		t.Fatalf("report missing empty stale list: %q", out.String())
 	}
+}
+
+// CBX-08. Every change the import makes is visible in a machine-readable
+// report. The three-row fixture distinguishes a created row, a stale row and
+// an equal-timestamp tie with different text. A second import must not change
+// any file or create anything.
+
+// TestImportReportSeparatesCreatedStaleAndTie is the acceptance case from the
+// card. The local text of the stale and tie rows stays byte-for-byte the same;
+// the created row lands on disk. The JSON report is read as a struct, not as
+// parsed text, and the second import leaves all three files untouched.
+func TestImportReportSeparatesCreatedStaleAndTie(t *testing.T) {
+	root := newRunRepo(t)
+	base := time.Unix(1000, 0)
+	dir := t.TempDir()
+
+	tieRel := filepath.Join("docs", "tasks", "CBX08-TIE.md")
+	staleRel := filepath.Join("docs", "tasks", "CBX08-OLD.md")
+	newRel := filepath.Join("docs", "tasks", "CBX08-NEW.md")
+	const tieLocal = "# CBX08-TIE. локальный текст\nСтатус: done\n"
+	const staleLocal = "# CBX08-OLD. локальный текст\nСтатус: done\n"
+	writeAt := func(rel, text string, when time.Time) string {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, when, when); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	tiePath := writeAt(tieRel, tieLocal, base)
+	stalePath := writeAt(staleRel, staleLocal, base.Add(time.Second))
+
+	stamp := func(delta time.Duration) string {
+		return base.Add(delta).Format(time.RFC3339Nano)
+	}
+	raw := fmt.Sprintf(`{"cards":[
+		{"id":"CBX08-OLD","title":"incoming old","updated_at":%q},
+		{"id":"CBX08-TIE","title":"incoming tie","updated_at":%q},
+		{"id":"CBX08-NEW","title":"incoming new","updated_at":%q}
+	]}`, stamp(-time.Second), stamp(0), stamp(0))
+	if err := os.WriteFile(filepath.Join(dir, "batch.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	var jsonOut strings.Builder
+	var out, errOut strings.Builder
+	code := Run(Options{Dir: dir, Quiet: true, JSONReport: &jsonOut}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("first run exit = %d, stderr = %q", code, errOut.String())
+	}
+	for _, want := range []string{
+		"CreatedIDs=CBX08-NEW\n",
+		"UpdatedIDs=\n",
+		"StaleSkippedIDs=CBX08-OLD\n",
+		"TieKeptLocalIDs=CBX08-TIE\n",
+		"UpdatedIssues=0\n",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("text report missing %q: %q", want, out.String())
+		}
+	}
+
+	var report ImportReport
+	if err := json.Unmarshal([]byte(jsonOut.String()), &report); err != nil {
+		t.Fatalf("JSON report is not valid: %v\n%s", err, jsonOut.String())
+	}
+	if len(report.CreatedIDs) != 1 || report.CreatedIDs[0] != "CBX08-NEW" {
+		t.Fatalf("CreatedIDs = %q, want [CBX08-NEW]", report.CreatedIDs)
+	}
+	if len(report.StaleSkippedIDs) != 1 || report.StaleSkippedIDs[0] != "CBX08-OLD" {
+		t.Fatalf("StaleSkippedIDs = %q, want [CBX08-OLD]", report.StaleSkippedIDs)
+	}
+	if len(report.TieKeptLocalIDs) != 1 || report.TieKeptLocalIDs[0] != "CBX08-TIE" {
+		t.Fatalf("TieKeptLocalIDs = %q, want [CBX08-TIE]", report.TieKeptLocalIDs)
+	}
+	if len(report.UpdatedIDs) != 0 {
+		t.Fatalf("UpdatedIDs = %q, want empty", report.UpdatedIDs)
+	}
+
+	for _, tc := range []struct{ path, want string }{
+		{tiePath, tieLocal}, {stalePath, staleLocal},
+	} {
+		got, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Fatalf("local text changed: got %q, want %q", got, tc.want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, newRel)); err != nil {
+		t.Fatalf("created row missing: %v", err)
+	}
+
+	newBytes, err := os.ReadFile(filepath.Join(root, newRel))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var secondJSON strings.Builder
+	var secondOut, secondErr strings.Builder
+	code = Run(Options{Dir: dir, Quiet: true, JSONReport: &secondJSON}, &secondOut, &secondErr)
+	if code != 0 {
+		t.Fatalf("second run exit = %d, stderr = %q", code, secondErr.String())
+	}
+	var second ImportReport
+	if err := json.Unmarshal([]byte(secondJSON.String()), &second); err != nil {
+		t.Fatalf("second JSON report is not valid: %v", err)
+	}
+	if len(second.CreatedIDs) != 0 {
+		t.Fatalf("second CreatedIDs = %q, want empty", second.CreatedIDs)
+	}
+	for _, tc := range []struct{ path, want string }{
+		{tiePath, tieLocal},
+		{stalePath, staleLocal},
+		{filepath.Join(root, newRel), string(newBytes)},
+	} {
+		got, err := os.ReadFile(tc.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != tc.want {
+			t.Fatalf("second import changed %s: %q", tc.path, got)
+		}
+	}
+}
+
+// TestImportReportRecordsUpdatedFields proves an overwritten row names the
+// fields that changed and that the file mtime becomes the incoming timestamp,
+// so the same row is not reported again on the next import.
+func TestImportReportRecordsUpdatedFields(t *testing.T) {
+	root := newRunRepo(t)
+	base := time.Unix(1000, 0)
+	rel := filepath.Join("docs", "tasks", "CBX08-UPD.md")
+	path := writeImportFixture(t, root, rel, "# CBX08-UPD. local\nСтатус: todo\nЦель: старая\n", base)
+
+	dir := t.TempDir()
+	raw := fmt.Sprintf(`{"cards":[{"id":"CBX08-UPD","title":"incoming","status":"done","goal":"новая","updated_at":%q}]}`,
+		base.Add(time.Second).Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(dir, "batch.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	var jsonOut strings.Builder
+	var out, errOut strings.Builder
+	if code := Run(Options{Dir: dir, Quiet: true, JSONReport: &jsonOut}, &out, &errOut); code != 0 {
+		t.Fatalf("first run exit = %d, stderr = %q", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "UpdatedIDs=CBX08-UPD\n") {
+		t.Fatalf("text report missing update: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "UpdatedIssues=1\n") {
+		t.Fatalf("text report missing count: %q", out.String())
+	}
+	var report ImportReport
+	if err := json.Unmarshal([]byte(jsonOut.String()), &report); err != nil {
+		t.Fatalf("JSON report is not valid: %v", err)
+	}
+	if len(report.UpdatedIDs) != 1 || report.UpdatedIDs[0] != "CBX08-UPD" {
+		t.Fatalf("UpdatedIDs = %q, want [CBX08-UPD]", report.UpdatedIDs)
+	}
+	for _, field := range []string{"Статус", "Цель"} {
+		found := false
+		for _, got := range report.Changes["CBX08-UPD"] {
+			if got == field {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("Changes missing %q: %q", field, report.Changes["CBX08-UPD"])
+		}
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "# CBX08-UPD. incoming") {
+		t.Fatalf("updated row did not land: %q", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(base.Add(time.Second)) {
+		t.Fatalf("mtime = %v, want %v", info.ModTime(), base.Add(time.Second))
+	}
+
+	var secondJSON strings.Builder
+	var secondOut, secondErr strings.Builder
+	if code := Run(Options{Dir: dir, Quiet: true, JSONReport: &secondJSON}, &secondOut, &secondErr); code != 0 {
+		t.Fatalf("second run exit = %d, stderr = %q", code, secondErr.String())
+	}
+	var second ImportReport
+	if err := json.Unmarshal([]byte(secondJSON.String()), &second); err != nil {
+		t.Fatalf("second JSON report is not valid: %v", err)
+	}
+	if len(second.UpdatedIDs) != 0 {
+		t.Fatalf("second UpdatedIDs = %q, want empty", second.UpdatedIDs)
+	}
+	again, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(got) {
+		t.Fatalf("second import changed the file: %q", again)
+	}
+}
+
+// TestChangedFieldsNamesOnlyDifferentLines pins the field comparison used in
+// the update report. An unchanged line is not a change; a removed line is.
+func TestChangedFieldsNamesOnlyDifferentLines(t *testing.T) {
+	local := "Статус: todo\nЦель: старая\nФаза: P3\n"
+	incoming := "Статус: done\nЦель: старая\n"
+	got := changedFields(local, incoming)
+	want := []string{"Статус", "Фаза"}
+	if len(got) != len(want) {
+		t.Fatalf("changedFields = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("changedFields = %q, want %q", got, want)
+		}
+	}
+}
+
+func writeImportFixture(t *testing.T, root, rel, text string, when time.Time) string {
+	t.Helper()
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, when, when); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
