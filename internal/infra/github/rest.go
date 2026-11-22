@@ -41,18 +41,19 @@ const (
 	// failureExcerptSourceMaxFile caps the bytes read from one source file. A
 	// failed annotation must not turn into a multi-megabyte read.
 	failureExcerptSourceMaxFile = 256 << 10
-	// excerptSignalMarkers are case-insensitive substrings that mark a line as
-	// carrying diagnostic signal. When a long message is reduced, these lines
-	// are kept before ordinary context so an error at the end of a log is not
-	// lost to tail truncation (CA-22). The █ entry keeps a marked source line.
-	excerptSignalMarkers = [...]string{
-		"panic", "fatal", "error", "failure", "failed", "exception",
-		"sigsegv", "stack overflow", "█",
-	}
 	// excerptContextLineLimit caps one non-signal line while compressing a
 	// long message, so a single verbose line cannot consume the byte budget.
 	excerptContextLineLimit = 160
 )
+
+// excerptSignalMarkers are case-insensitive substrings that mark a line as
+// carrying diagnostic signal. When a long message is reduced, these lines
+// are kept before ordinary context so an error at the end of a log is not
+// lost to tail truncation (CA-22). The █ entry keeps a marked source line.
+var excerptSignalMarkers = [...]string{
+	"panic", "fatal", "error", "failure", "failed", "exception",
+	"sigsegv", "stack overflow", "█",
+}
 
 // tokenEnvChain is the token lookup order from WORKER-PROMPT §2.
 var tokenEnvChain = [...]string{"BEACON_GITHUB_TOKEN", "GITHUB_TOKEN"}
