@@ -11,6 +11,7 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -645,4 +646,205 @@ func rankedTags(defs []string, mentioned map[string]bool) []string {
 		}
 	}
 	return tags
+}
+
+// Role is the author of one dialog message. The assistant role marks a valid
+// cut point for head/tail compaction (CA-06): a split never lands inside an
+// assistant turn.
+type Role string
+
+const (
+	RoleSystem    Role = "system"
+	RoleUser      Role = "user"
+	RoleAssistant Role = "assistant"
+)
+
+// Message is one turn in a child's dialog history. Text is copied by value,
+// so a caller cannot mutate history through a slice element after the fact.
+type Message struct {
+	Role Role
+	Text string
+}
+
+// CountTokens estimates how many model tokens text costs. It is a pure
+// heuristic: every whitespace word costs one token and each extra four bytes
+// cost one more. Real tokenization belongs at the model boundary; this
+// counter only has to be deterministic so budget checks are reproducible.
+func CountTokens(text string) int {
+	n := 0
+	for _, word := range strings.Fields(text) {
+		n += 1 + len(word)/4
+	}
+	return n
+}
+
+// TokensOf sums the estimated token cost of a message slice.
+func TokensOf(msgs []Message) int {
+	n := 0
+	for _, m := range msgs {
+		n += CountTokens(m.Text)
+	}
+	return n
+}
+
+// HistoryFingerprint identifies the exact contents of a history at one point
+// in time. Compaction captures it before the (possibly slow) head summarizing
+// and checks it again before applying the result.
+type HistoryFingerprint [sha256.Size]byte
+
+// Fingerprint hashes role and text of every message in order. Length prefixes
+// keep two different message sequences from colliding.
+func Fingerprint(msgs []Message) HistoryFingerprint {
+	h := sha256.New()
+	for _, m := range msgs {
+		fmt.Fprintf(h, "%d:%s%d:%s", len(m.Role), m.Role, len(m.Text), m.Text)
+	}
+	var fp HistoryFingerprint
+	copy(fp[:], h.Sum(nil))
+	return fp
+}
+
+// CompressFunc summarizes the head of a history into text within a token
+// budget. The caller supplies the model call; this package stays pure and
+// performs no network or store I/O.
+type CompressFunc func(ctx context.Context, prefix string, head []Message, budget int) (string, error)
+
+// CompactOptions configures a budgeted compaction. Zero fields take the
+// defaults below. Budget is the only required field; without it a compaction
+// is a no-op that copies the history.
+type CompactOptions struct {
+	Budget       int
+	TailMessages int
+	TailShare    float64
+	Reserve      int
+	MaxDepth     int
+	Prefix       string
+}
+
+const (
+	defaultTailMessages = 10
+	defaultTailShare    = 0.5
+	defaultReserve      = 512
+	defaultMaxDepth     = 3
+)
+
+func (o CompactOptions) normalized() CompactOptions {
+	if o.TailMessages <= 0 {
+		o.TailMessages = defaultTailMessages
+	}
+	if o.TailShare <= 0 || o.TailShare >= 1 {
+		o.TailShare = defaultTailShare
+	}
+	if o.Reserve < 0 {
+		o.Reserve = defaultReserve
+	}
+	if o.MaxDepth <= 0 {
+		o.MaxDepth = defaultMaxDepth
+	}
+	return o
+}
+
+// Compaction is a prepared result. It is not applied to any history until
+// Apply verifies that the history still matches the fingerprint taken when
+// the compaction was prepared.
+type Compaction struct {
+	fp     HistoryFingerprint
+	result []Message
+	// Tokens is the estimated token cost of result.
+	Tokens int
+	// Depth is how many times the head was summarized, at most MaxDepth.
+	Depth int
+}
+
+// assistantBoundary moves start back to the nearest assistant message so a
+// cut never lands inside an assistant turn. When no assistant message exists
+// at or before start, the original start is kept.
+func assistantBoundary(msgs []Message, start int) int {
+	if start <= 0 || start >= len(msgs) {
+		return start
+	}
+	for i := start; i >= 0; i-- {
+		if msgs[i].Role == RoleAssistant {
+			return i
+		}
+	}
+	return start
+}
+
+// PrepareCompaction builds a compaction for msgs. It preserves the trailing
+// messages verbatim, moves the cut to an assistant boundary, summarizes the
+// head within the budget minus tail and reserve, and repeats summarization at
+// most MaxDepth times. It does not modify msgs.
+func PrepareCompaction(ctx context.Context, msgs []Message, opt CompactOptions, summarize CompressFunc) (Compaction, error) {
+	fp := Fingerprint(msgs)
+	opt = opt.normalized()
+	c := Compaction{fp: fp}
+
+	total := TokensOf(msgs)
+	if opt.Budget <= 0 || total <= opt.Budget {
+		c.result = append([]Message(nil), msgs...)
+		c.Tokens = total
+		return c, nil
+	}
+
+	tailStart := len(msgs) - opt.TailMessages
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	tailStart = assistantBoundary(msgs, tailStart)
+	tail := append([]Message(nil), msgs[tailStart:]...)
+
+	// The tail owns at most TailShare of the budget. Drop its oldest entries
+	// first so the most recent messages always survive verbatim.
+	tailBudget := int(float64(opt.Budget) * opt.TailShare)
+	for TokensOf(tail) > tailBudget && len(tail) > 0 {
+		tail = tail[1:]
+	}
+	if len(tail) == 0 {
+		return c, nil
+	}
+
+	head := msgs[:tailStart]
+	headBudget := opt.Budget - TokensOf(tail) - opt.Reserve
+	if headBudget <= 0 || len(head) == 0 || summarize == nil {
+		c.result = tail
+		c.Tokens = TokensOf(tail)
+		return c, nil
+	}
+
+	summary := ""
+	current := head
+	for depth := 0; depth < opt.MaxDepth; depth++ {
+		text, err := summarize(ctx, opt.Prefix, current, headBudget)
+		if err != nil {
+			return Compaction{}, err
+		}
+		summary = text
+		c.Depth = depth + 1
+		if CountTokens(summary) <= headBudget {
+			break
+		}
+		current = []Message{{Role: RoleSystem, Text: summary}}
+	}
+
+	result := make([]Message, 0, len(tail)+1)
+	if summary != "" && CountTokens(summary)+TokensOf(tail) <= opt.Budget {
+		result = append(result, Message{Role: RoleSystem, Text: summary})
+	}
+	result = append(result, tail...)
+	c.result = result
+	c.Tokens = TokensOf(result)
+	return c, nil
+}
+
+// Apply commits a prepared compaction. It returns the compacted history and
+// ok=true only when current still matches the fingerprint captured at
+// PrepareCompaction time. A changed history returns ok=false and leaves the
+// caller's data untouched, so a slow summarization cannot overwrite newer
+// turns.
+func (c Compaction) Apply(current []Message) ([]Message, bool) {
+	if Fingerprint(current) != c.fp {
+		return nil, false
+	}
+	return append([]Message(nil), c.result...), true
 }
