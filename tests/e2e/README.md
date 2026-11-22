@@ -20,45 +20,51 @@ sha256(sort(names).join("\n"))
 ```
 
 Замороженное значение лежит в константе `frozenScenarioHash`. Оно пересмотрено
-20 ноября 2026 в карточке T3.146 (ADR 0061) после явного изменения набора:
+в BCX-55 и BCX-59 после явного изменения набора:
 
 ```
-10243acbe29965cac6288c2cd06464a511d4ae9701468bd0c9dd7987e30002b3
+b8d1fef39b3cb10f066c24f94c00cf5dd2ccbfa2119814184aa0de75670d5a40
 ```
 
-Хеш пересмотрен в карточке T3.146 (ADR 0061): в набор добавлен сценарий
-полного MCP-цикла на живом opencode. На момент записи в наборе шесть сценариев:
+BCX-55 переключил сценарий пробуждения на плагин репозитория. BCX-59 добавил
+проверку вердикта `ready` по фактам ShipFacts. На момент записи в наборе восемь
+сценариев:
 
 | Имя | Что делает |
 | --- | --- |
 | `repo_plugin_skeleton` | диагностика каркаса плагина в репозитории |
 | `mcp_go_sdk_CommandTransport` | MCP `initialize`, `tools/list`, `tools/call` через go-sdk |
 | `mcp_inspector_optional` | опциональный MCP Inspector |
-| `opencode_wake_with_reference_plugin` | пробуждение сессии эталонным плагином из `fixtures` |
-| `live_opencode_full_mcp_cycle` | полный цикл `initialize` → `tools/list` (7) → `watch_pr` → `wait_result` → `get_result` → `ack` → отчёт по `CycleInstructions` на живом opencode с эталонным плагином; реальные обработчики поверх go-sdk `CommandTransport` |
+| `opencode_wake_with_repo_plugin` | пробуждение сессии плагином репозитория `.opencode/plugins/beacon-bridge.js` |
+| `live_wake_via_opencode_api` | пробуждение живой сессии через `POST /api/session/{id}/prompt` с delivery `steer`, без участия плагина |
+| `live_opencode_full_mcp_cycle` | полный цикл `initialize` → `tools/list` по каталогу `AdvertisedToolNames` → `watch_pr` → `wait_result` → `get_result` → `ack` → отчёт по `CycleInstructions` на живом opencode с плагином репозитория; реальные обработчики поверх go-sdk `CommandTransport` |
+| `verdict_ready_gate_requires_shipfacts` | вердикт `ready` требует фактов ShipFacts из наблюдаемого CI, а не захардкоженного драйвера |
 | `negative_control_stub_handler_must_fail` | заглушка обязана провалить ту же проверку |
 
-### Полный цикл (T3.146)
+### Полный цикл (T3.146, BCX-55, BCX-59)
 
-Сценарий поднимает отдельный `opencode serve` с эталонным плагином из
-`fixtures`, создаёт сессию через `opencode api POST /api/session` и 확인ляет
+Сценарий поднимает отдельный `opencode serve` с плагином репозитория
+`.opencode/plugins/beacon-bridge.js`, создаёт сессию через `opencode api POST /api/session` и 확인ляет
 плагин через `opencode api GET /api/plugin`. `watchID` берётся из ответа
 реального `beacon_watch_pr`, а `sessionID` живой сессии передаётся в `_meta`.
 Отчёт `waiting, watchID` из `CycleInstructions` пишется в `events.jsonl`, и
 загруженный плагин доставляет его в ту же сессию: факт доставки подтверждается
 `prompt.ok`, подпиской плагина и квитанцией.
 
-Демона опроса CI в этом дереве нет, поэтому вердикт в хранилище записывает
-внешний драйвер сценария через доменный переход `domain.Transition`. Он не
-подменяет обработчик: `beacon_wait_result` и `beacon_get_result` читают вердикт
-из постоянного store через реальные реализации и возвращают его по
-`CommandTransport`. `beacon_ack` оставляет `readAt` и `claimedAt` в obligation;
-оба факта читаются из store снаружи после цикла.
+Демон опроса CI в e2e представлен `cycleDaemon`. Он наблюдает факты, прогоняет
+их через реальный движок `domain.Evaluate` с проверкой ShipFacts (ADR 0061 п. 2)
+и атомарно записывает вердикт, obligation и wake-намерение в store. Сценарии
+вызывают `tick` и сами вердикт не выбирают. `beacon_wait_result` и
+`beacon_get_result` читают вердикт из постоянного store через реальные
+обработчики и возвращают его по `CommandTransport`. `beacon_ack` оставляет
+`readAt` и `claimedAt` в obligation; оба факта читаются из store снаружи после
+цикла.
 
 Негативный контроль сценария двойной: пустой `repo` в `beacon_watch_pr`
 обязан дать ошибку (заглушка ответила бы `ok: true`), а та же проверка
-пробуждения с `fixtures/beacon-bridge-stub.js` обязана провалиться. Восьмого
-инструмента `summary` нет: отчёт это строка завершения обхода, а не вызов MCP.
+пробуждения с `fixtures/beacon-bridge-stub.js` обязана провалиться. Отчёт
+`waiting, watchID` является строкой завершения обхода, а не вызовом MCP. Каталог
+инструментов задаёт `AdvertisedToolNames`, и `tools/list` сверяется с ним.
 
 ## Проверка и отказ
 
@@ -77,7 +83,7 @@ sha256(sort(names).join("\n"))
 
 ## CI
 
-Прогон идёт в джобе `e2e` из `.github/workflows/ci.yml` через `bash tests/e2e/run.sh`,
+Прогон идёт в workflow `.github/workflows/e2e.yml` через `bash tests/e2e/run.sh`,
 то есть `go test -tags=e2e ./tests/e2e -count=1 -v`. Обе тестовые функции
 попадают в этот вызов. У джобы стоит `continue-on-error: true`: нарушение
 заморозки проваливает саму джобу, но по текущей конфигурации не блокирует merge.
