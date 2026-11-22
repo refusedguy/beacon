@@ -25,7 +25,7 @@ func init() {
 	catalog = append(catalog, command{
 		Name:    "up",
 		Summary: "Автономный цикл Beacon: ReconcileLoop, статус и команды Telegram",
-		Usage:   "beacon up [--interval 2s] [--once]",
+		Usage:   "beacon up [--interval 2s] [--once] [--channels] [--tui]",
 	})
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
@@ -174,6 +174,7 @@ func runUp(c *CLI, args []string) int {
 	interval := fs.Duration("interval", upIntervalDefault, "интервал опроса Telegram и вывода статуса")
 	once := fs.Bool("once", false, "один проход ReconcilePass и выход")
 	channels := fs.Bool("channels", channelsCfg.Enabled, "принимать команды из внешнего канала")
+	tui := fs.Bool("tui", false, "открыть живой экран вместо цикла статуса")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		writeUsage(c.errOut)
 		return 2
@@ -251,6 +252,13 @@ func runUp(c *CLI, args []string) int {
 		return 2
 	}
 	defer stopLoop()
+
+	// `beacon up --tui` enters the same live adapter as `beacon tui` and
+	// `beacon board --live`. The reconciler above publishes connection.json,
+	// so the adapter can render a snapshot before this command returns.
+	if *tui {
+		return tuiRunner(c, nil)
+	}
 
 	if *once {
 		errorsBefore := daemonActorErrorCount()
