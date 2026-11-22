@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 func openScheduleStore(t *testing.T) *DB {
@@ -514,5 +516,75 @@ func TestSaveScheduleValidation(t *testing.T) {
 	due, err := d.DueSchedules(now.Add(time.Second))
 	if err != nil || len(due) != 0 {
 		t.Fatalf("invalid saves wrote a row: %+v, err=%v", due, err)
+	}
+}
+
+func TestScheduleKindMarkStoredAsWebhook(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	next := time.Now().UTC().Add(time.Hour)
+	mark := Schedule{
+		ID: "mark", Kind: ScheduleKindMark, Spec: "push",
+		TargetCard: "card", NextRun: next, Enabled: true,
+	}
+
+	if err := d.CreateSchedule(ctx, mark); err != nil {
+		t.Fatalf("CreateSchedule(mark): %v", err)
+	}
+	got, err := d.GetSchedule(ctx, "mark")
+	if err != nil {
+		t.Fatalf("GetSchedule after create: %v", err)
+	}
+	if got.Kind != ScheduleKindWebhook {
+		t.Fatalf("created kind = %q, want %q", got.Kind, ScheduleKindWebhook)
+	}
+	list, err := d.ListSchedules(ctx)
+	if err != nil {
+		t.Fatalf("ListSchedules: %v", err)
+	}
+	if len(list) != 1 || list[0].Kind != ScheduleKindWebhook {
+		t.Fatalf("ListSchedules = %+v, want one webhook row", list)
+	}
+
+	saved := mark
+	saved.ID = "mark-save"
+	if err := d.SaveSchedule(saved); err != nil {
+		t.Fatalf("SaveSchedule(mark): %v", err)
+	}
+	got, err = d.GetSchedule(ctx, saved.ID)
+	if err != nil || got.Kind != ScheduleKindWebhook {
+		t.Fatalf("saved mark read back as %+v, err=%v", got, err)
+	}
+
+	updated := mark
+	updated.Kind = ScheduleKindMark
+	updated.Spec = "updated"
+	if err := d.UpdateSchedule(ctx, updated); err != nil {
+		t.Fatalf("UpdateSchedule(mark): %v", err)
+	}
+	got, err = d.GetSchedule(ctx, "mark")
+	if err != nil || got.Kind != ScheduleKindWebhook || got.Spec != "updated" {
+		t.Fatalf("updated mark read back as %+v, err=%v", got, err)
+	}
+}
+
+func TestUnknownScheduleKindIsInvalidInput(t *testing.T) {
+	d := openScheduleStore(t)
+	ctx := context.Background()
+	next := time.Now().UTC().Add(time.Hour)
+	bad := Schedule{ID: "x", Kind: "timer", Spec: "1m", NextRun: next, Enabled: true}
+
+	for name, write := range map[string]func() error{
+		"SaveSchedule":   func() error { return d.SaveSchedule(bad) },
+		"CreateSchedule": func() error { return d.CreateSchedule(ctx, bad) },
+		"UpdateSchedule": func() error { return d.UpdateSchedule(ctx, bad) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := write()
+			var appErr *domain.AppError
+			if !errors.As(err, &appErr) || appErr.Code != domain.CodeInvalidInput {
+				t.Fatalf("%s error = %v, want AppError/%s", name, err, domain.CodeInvalidInput)
+			}
+		})
 	}
 }
