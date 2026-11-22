@@ -1,6 +1,6 @@
 # CLI-менеджер OpenCode поверх Beacon
 
-Это проектное предложение. Оно не меняет карточки и ADR. Ссылки на локальные файлы даны относительно корня `feat/w46`, коммит `c081e9b62f72c8e421918092f30bc72c5b2c82d6`. Версия установленного бинарника: `opencode v2.3.0` (`opencode --version`). Исходники OpenCode ниже взяты с ветки `dev`, поэтому в конце раздела «API для управления» отмечено расхождение между v1-документацией и текущими маршрутами.
+Это проектное предложение. Оно не меняет карточки и ADR. Ссылки на локальные файлы даны относительно корня `feat/w46`, коммит `c081e9b62f72c8e421918092f30bc72c5b2c82d6`. Версия установленного бинарника: `opencode v2.3.0` (`opencode --version`). Исходники OpenCode ниже взяты с ветки `dev`. Контракт API сверен с живой версией `2.3.2` из `$XDG_STATE_HOME/opencode/service.json` и вынесен в отдельный раздел «Фактический контракт живой версии 2.3.2».
 
 ## Что умеет opencode serve
 
@@ -26,13 +26,26 @@ t3code проверяет версию через health-ответ `client.serv
 
 - `GET /api/session` список сессий; `POST /api/session` создаёт сессию с полями `parentID`, `title`, `agent`, `model`, `location.directory`, `permissions`, `metadata` ([session.ts](https://github.com/anomalyco/opencode/blob/dev/packages/protocol/src/groups/session.ts), [server.mdx](https://github.com/anomalyco/opencode/blob/dev/services/site/src/docs/v1/content/server.mdx)).
 - `POST /api/session/:sessionID/prompt` отправляет сообщение. Тело текущего маршрута: `id`, `text`, `files`, `agents`, `metadata`, `delivery`, `resume`. Поля `agent` и `model` в теле отсутствуют, агента задают при создании сессии ([session.ts](https://github.com/anomalyco/opencode/blob/dev/packages/protocol/src/groups/session.ts)).
-- v1-документация описывает тот же вызов как `POST /session/:id/message` с необязательными `agent`, `noReply`, `system`, `tools` и обязательными `parts`, плюс `POST /session/:id/prompt_async`, который возвращает `204 No Content` ([server.mdx](https://github.com/anomalyco/opencode/blob/dev/services/site/src/docs/v1/content/server.mdx)). t3code на SDK v2 вызывает `client.session.promptAsync({ sessionID, agent, parts })` ([OpenCodeAdapter.ts:3187](https://github.com/pingdotgg/t3code/blob/eee05575ebd514db36f61d7eb05d2258a10c96bd/apps/server/src/provider/Layers/OpenCodeAdapter.ts#L3187)). Это расхождение версий. Для нового кода надёжнее задавать агента в `POST /api/session`, а не в каждой отправке.
+- Асинхронность уже встроена в `session.prompt`, отдельного асинхронного маршрута в живой версии нет. Агента задают при создании сессии, а не в теле каждого промпта. Поля и источник перечислены в разделе «Фактический контракт живой версии 2.3.2» ниже.
 - `GET /api/event` это SSE-поток с необязательным параметром `types`. Первым приходит `server.connected`. Поток живой: нет повтора прошедших событий и нет автопереподключения, медленный потребитель переполняет поток и получает ошибку ([event.ts](https://github.com/anomalyco/opencode/blob/dev/packages/protocol/src/groups/event.ts), [client docs](https://opencode.ai/docs/build/client/#stream-events)). Beacon зафиксировал это же ограничение в ADR 0025 (`docs/adrs/0025-status-and-cursor.md:11`).
 - `session.status` это эфемерное событие со значением `idle`, `retry` или `busy`; `session.idle` помечено deprecated, а терминальные исходы приходят в событиях `session.execution.*` ([session-status-event.ts](https://github.com/anomalyco/opencode/blob/dev/packages/schema/src/session-status-event.ts)). Плагин Beacon уже подписан на `session.execution.started` (`.opencode/plugins/beacon-bridge.js:35`).
 - Состояние всех сессий доступно снимком: `client.session.status(undefined)` возвращает карту `sessionID -> status`, а `client.session.get({ sessionID })` читает одну сессию ([OpenCodeAdapter.ts:1173](https://github.com/pingdotgg/t3code/blob/eee05575ebd514db36f61d7eb05d2258a10c96bd/apps/server/src/provider/Layers/OpenCodeAdapter.ts#L1173), [OpenCodeAdapter.ts:1655](https://github.com/pingdotgg/t3code/blob/eee05575ebd514db36f61d7eb05d2258a10c96bd/apps/server/src/provider/Layers/OpenCodeAdapter.ts#L1655)). Это запасной путь на случай потери SSE-соединения.
 - `app.agents()` отдаёт список агентов ([sdk.mdx](https://github.com/anomalyco/opencode/blob/dev/services/site/src/docs/v1/content/sdk.mdx), [opencodeRuntime.ts:892](https://github.com/pingdotgg/t3code/blob/eee05575ebd514db36f61d7eb05d2258a10c96bd/apps/server/src/provider/opencodeRuntime.ts#L892)). Дополнительно t3code разбирает вывод `opencode agent list` ([opencodeRuntime.ts:355](https://github.com/pingdotgg/t3code/blob/eee05575ebd514db36f61d7eb05d2258a10c96bd/apps/server/src/provider/opencodeRuntime.ts#L355)).
 - Дочерние сессии: v1-документация даёт `GET /session/:id/children` ([server.mdx](https://github.com/anomalyco/opencode/blob/dev/services/site/src/docs/v1/content/server.mdx)), текущий маршрут вместо отдельного эндпоинта использует `parentID` при создании ([session.ts](https://github.com/anomalyco/opencode/blob/dev/packages/protocol/src/groups/session.ts)). t3code вызывает `client.session.children()` ([OpenCodeAdapter.ts:789](https://github.com/pingdotgg/t3code/blob/eee05575ebd514db36f61d7eb05d2258a10c96bd/apps/server/src/provider/Layers/OpenCodeAdapter.ts#L789)). Не стоит строить CLI на недокументированном в текущей версии маршруте.
 - Перевод сессии в `opencode api` доступен без собственного HTTP-клиента: `opencode api session.list`, `opencode api 'GET /api/event'` и так далее (вывод `opencode api --help`).
+
+### Фактический контракт живой версии 2.3.2
+
+Версия взята из поля `version` файла `$XDG_STATE_HOME/opencode/service.json`. Спецификация получена запросом `GET http://127.0.0.1:49374/openapi.json` с Basic-авторизацией `opencode:<password>` из того же файла. Проверка зафиксирована в [отчёте по направлению 1](https://github.com/refusedguy/beacon/blob/main/docs/research/research-dir1-autospawn.md#L34-L42) и [файле карточек](https://github.com/refusedguy/beacon/blob/main/docs/research/research-dir1-autospawn-batch.json).
+
+| Маршрут | Поля тела |
+| --- | --- |
+| `POST /api/session` | `parentID`, `agent`, `model`, `location`, `metadata`, `permissions` |
+| `POST /api/session/{sessionID}/prompt` | `id`, `text`, `files`, `agents`, `skills`, `metadata`, `delivery`, `resume` |
+
+Описание `session.prompt` в спецификации: «Durably admit one session input and schedule agent-loop execution unless resume is false». Асинхронность встроена в метод, отдельный асинхронный вызов не нужен. Поля `delivery` и `resume` управляют доставкой и продолжением сессии ([session.ts](https://github.com/anomalyco/opencode/blob/dev/packages/protocol/src/groups/session.ts), [отчёт по направлению 1](https://github.com/refusedguy/beacon/blob/main/docs/research/research-dir1-autospawn.md#L34-L42)).
+
+В `opencode run --help` живой версии перечислены `--file, -f`, `--session, -s`, `--fork`, `--worktree, -w`, `--format json`, `--archived`, `--auto`. Для скриптов нужны `--session`, `--worktree` и `--format json` ([отчёт по направлению 1](https://github.com/refusedguy/beacon/blob/main/docs/research/research-dir1-autospawn.md#L34-L42)).
 
 ## Как спавнить сабагентов
 
