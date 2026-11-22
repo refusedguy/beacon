@@ -1,5 +1,5 @@
 # AUTOSP-11. Памятный гейт перед запуском раннера
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/server/metrics.go, internal/infra/server/metrics_test.go
@@ -12,3 +12,8 @@
 Шаги: Подготовить метод, который возвращает решение о запуске на основе FootprintCheck и текущего числа Watch. Добавить тест metrics_test.go на порог и на отсутствие readRSS. Не менять формат метрик.
 Проверка: CI зелёный. При превышении порога метод возвращает отказ. При недоступном RSS решение консервативно.
 Приёмка: Автоспавнер может вызвать гейт до старта раннера и удержать слот.
+
+Итог: Already landed in #1437 (95843cb669ef62ac7214dc3ff01f9bb84e0818e5). No duplicate code needed.
+Доказательство: PR #1437 commit 95843cb669ef62ac7214dc3ff01f9bb84e0818e5 merge-base --is-ancestor 95843cb669ef62ac7214dc3ff01f9bb84e0818e5 origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1437 95843cb
+Время закрытия: 2026-11-22T11:29:08Z

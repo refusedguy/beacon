@@ -1,5 +1,5 @@
 # AUD-14. Синхронизировать ROADMAP_STATUS с деревом карточек
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: docs/ROADMAP_STATUS.md
@@ -12,3 +12,8 @@
 Шаги: Пересобрать счётчики через roadmap-sync --write или beacon index build и записать актуальные значения в docs/ROADMAP_STATUS.md. Проверить, что dry run roadmap-sync не предлагает изменений. Не переводить чужие карточки в done вручную.
 Проверка: CI зелёный. Проверка cardindex на main проходит. Пересборка из docs/tasks даёт те же числа, что записаны в ROADMAP_STATUS.md.
 Приёмка: Только docs/ROADMAP_STATUS.md. Не трогать файлы из AUD-13.
+
+Итог: Already landed in #1428 (f33f139d8db346dc3e2b5310d85d20864ed5d297). No duplicate code needed.
+Доказательство: PR #1428 commit f33f139d8db346dc3e2b5310d85d20864ed5d297 merge-base --is-ancestor f33f139d8db346dc3e2b5310d85d20864ed5d297 origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1428 f33f139
+Время закрытия: 2026-11-22T11:29:08Z
