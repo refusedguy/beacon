@@ -75,6 +75,7 @@ const (
 	FieldFailedChecks = "failedChecks"
 	FieldSource       = "source"
 	FieldOutcome      = "outcome"
+	FieldOrphan       = "orphan"
 
 	// Content fields. Under the default NO_CONTENT policy the write boundary
 	// removes these and keeps only FieldContentRef, a link to the store that
@@ -656,6 +657,32 @@ func WakeDeliveredOutcome(adapter, watchID, outcome string, revision ...uint64) 
 // it. The source reaches both the delivered counter and the log event. Sinks
 // that predate the source label fall back to the adapter-only counter.
 func WakeDeliveredSource(adapter, watchID, source string, revision ...uint64) {
+	wakeDelivered(adapter, watchID, source, false, revision...)
+}
+
+// WakeDeliveredOrphan records a wake addressed to a session that no longer
+// exists. It keeps the wake_delivered event and adds orphan=true, so an
+// operator sees the flag in the same event as the other deliveries. The
+// dedicated counter is owned by OrphanWake, which runs where the subscriber is
+// marked orphaned.
+func WakeDeliveredOrphan(adapter, watchID string, revision ...uint64) {
+	wakeDelivered(adapter, watchID, WakeSourceMCP, true, revision...)
+}
+
+// OrphanWake records one wake whose addressee no longer exists. The watch id
+// goes to the structured log only. The counter is a plain total, so no session
+// id reaches a metric name or label.
+func OrphanWake(watchID string) {
+	s := Default()
+	s.Inc(CounterOrphanWake, "")
+	fields := Fields{}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	s.Log(LevelInfo, "orphan_wake", fields)
+}
+
+func wakeDelivered(adapter, watchID, source string, orphan bool, revision ...uint64) {
 	s := Default()
 	if withSource, ok := s.(sourceSink); ok {
 		withSource.IncSource(CounterWakeDelivered, adapter, source)
@@ -664,6 +691,9 @@ func WakeDeliveredSource(adapter, watchID, source string, revision ...uint64) {
 	}
 	cycles.note(func(c *cycleTracker) { c.wakes++ })
 	fields := Fields{FieldAdapter: adapter, FieldWatchID: watchID, FieldSource: source}
+	if orphan {
+		fields[FieldOrphan] = true
+	}
 	if len(revision) != 0 {
 		fields[FieldRevision] = revision[0]
 	}
