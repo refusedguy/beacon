@@ -58,17 +58,13 @@ func runIndexBuild(c *CLI, args []string) int {
 	}
 	defer func() { _ = idx.Close() }()
 
-	if _, err := idx.RebuildDir(filepath.Join(projectRoot, "docs", "tasks")); err != nil {
-		fmt.Fprintf(c.errOut, "beacon index build: %v\n", err)
-		return 2
-	}
-
-	counts, err := idx.Counts()
+	stats, err := idx.RebuildDirTimed(filepath.Join(projectRoot, "docs", "tasks"))
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon index build: %v\n", err)
 		return 2
 	}
-	fmt.Fprintf(c.out, "beacon index build: cards=%d deps=%d owners=%d\n",
-		counts.Cards, counts.Deps, counts.Owners)
+
+	fmt.Fprintf(c.out, "beacon index build: cards=%d deps=%d owners=%d duration_ms=%d\n",
+		stats.Cards, stats.Deps, stats.Owners, stats.Duration.Milliseconds())
 	return 0
 }

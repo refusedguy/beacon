@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	_ "modernc.org/sqlite"
@@ -115,9 +116,10 @@ func (idx *Index) Close() error {
 
 // ImportStats это итог одной сборки индекса.
 type ImportStats struct {
-	Cards  int
-	Deps   int
-	Owners int
+	Cards    int
+	Deps     int
+	Owners   int
+	Duration time.Duration
 }
 
 // ImportCards пересобирает индекс из cards. Все строки удаляются и вставляются
@@ -201,10 +203,9 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 // Удалённые файлы убираются из индекса. Возвращаемая статистика описывает всё
 // содержимое индекса после синхронизации.
 //
-// baseline: docs/research/sqlite-perf-audit.md, топ-10 строка 10. На 931 карточке
-// прежний путь делал DELETE из трёх таблиц и INSERT всех карточек в одной
-// транзакции при каждом вызове. Числового замера выигрыша в отчёте нет, эффект
-// структурный: при неизменившемся корпусе запись в индекс не выполняется.
+// Раньше путь делал DELETE из трёх таблиц и INSERT всех карточек в одной
+// транзакции при каждом вызове. Сейчас при неизменившемся корпусе запись в
+// индекс не выполняется.
 func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 	if idx == nil || idx.db == nil {
 		return ImportStats{}, Startupf("индекс не открыт")
@@ -256,6 +257,17 @@ func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 	}
 	idx.tasksDir = tasksDir
 	return idx.Counts()
+}
+
+// RebuildDirTimed вызывает RebuildDir и заполняет Duration в возвращаемой
+// статистике. Замер на текущем дереве карточек записан в docs/perf/README.md.
+// Отдельный метод сохраняет RebuildDir совместимым с вызывающими кодом, который
+// сравнивает ImportStats целиком.
+func (idx *Index) RebuildDirTimed(tasksDir string) (ImportStats, error) {
+	start := time.Now()
+	stats, err := idx.RebuildDir(tasksDir)
+	stats.Duration = time.Since(start)
+	return stats, err
 }
 
 // Counts возвращает число строк в cards, deps и owners. Метод нужен командам
