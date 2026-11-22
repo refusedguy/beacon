@@ -57,6 +57,7 @@ type TaskClaimOutput struct {
 	OwnerFiles   []string       `json:"ownerFiles"`
 	PlanMode     string         `json:"planMode"`
 	ClaimedAt    string         `json:"claimedAt"`
+	GraphReady   bool           `json:"graphReady"`
 	Handoff      domain.Handoff `json:"handoff"`
 }
 
@@ -84,6 +85,16 @@ type AgentCardLookup interface {
 type TaskClaimHandler struct {
 	store TaskClaimStore
 	now   func() time.Time
+	graph GraphIndexReader
+}
+
+// SetGraphIndexReader binds the optional graph index port. A handler without
+// one reports graphReady=false, so an agent never trusts a graph it cannot
+// verify. The composition root supplies the shared taskstore index.
+func (h *TaskClaimHandler) SetGraphIndexReader(r GraphIndexReader) {
+	if h != nil {
+		h.graph = r
+	}
 }
 
 // NewTaskClaimHandler builds a handler over the given store.
@@ -118,7 +129,17 @@ func (h *TaskClaimHandler) Claim(ctx context.Context, in TaskClaimInput) (TaskCl
 		return TaskClaimOutput{}, domain.NewAppError(domain.CodeInvalidInput, "task_claim: agentID is required")
 	}
 	when := h.now().UTC().Format(time.RFC3339)
-	return h.store.Claim(ctx, in, when)
+	out, err := h.store.Claim(ctx, in, when)
+	if err != nil {
+		return TaskClaimOutput{}, err
+	}
+	if h.graph != nil {
+		status, err := h.graph.GraphStatus(ctx)
+		if err == nil {
+			out.GraphReady = status.Ready()
+		}
+	}
+	return out, nil
 }
 
 // tasksLockName is the single lock file of the tasks directory (AUD-05).

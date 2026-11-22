@@ -29,6 +29,16 @@ func (f *fakeTaskClaimStore) Claim(_ context.Context, in TaskClaimInput, claimed
 	return f.out, f.err
 }
 
+// claimGraphReaderFake is a fake GraphIndexReader for the claim graphReady test.
+type claimGraphReaderFake struct {
+	status domain.GraphStatus
+	err    error
+}
+
+func (f *claimGraphReaderFake) GraphStatus(context.Context) (domain.GraphStatus, error) {
+	return f.status, f.err
+}
+
 // fakeTaskClaimGraph implements ClaimGraph with a fixed dependency and cycle
 // table, so selection tests do not depend on the graph index on disk.
 type fakeTaskClaimGraph struct {
@@ -148,6 +158,37 @@ func TestTaskClaimHandlerReturnsFullContext(t *testing.T) {
 	}
 	if store.gotAt != want.ClaimedAt {
 		t.Fatalf("claimedAt = %q, want %q", store.gotAt, want.ClaimedAt)
+	}
+}
+
+func TestTaskClaimHandlerGraphReady(t *testing.T) {
+	base := TaskClaimOutput{CardID: "IDX-05", Status: "in_progress"}
+	fresh := domain.GraphStatus{Built: true, IndexHash: "h", SourceHash: "h"}
+	stale := domain.GraphStatus{Built: true, IndexHash: "old", SourceHash: "new"}
+
+	tests := []struct {
+		name   string
+		reader GraphIndexReader
+		want   bool
+	}{
+		{"no reader", nil, false},
+		{"fresh graph", &claimGraphReaderFake{status: fresh}, true},
+		{"stale graph", &claimGraphReaderFake{status: stale}, false},
+		{"read error", &claimGraphReaderFake{status: fresh, err: errors.New("index closed")}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &fakeTaskClaimStore{out: base}
+			h := newTaskClaimHandler(store, func() time.Time { return time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC) })
+			h.SetGraphIndexReader(tc.reader)
+			got, err := h.Claim(context.Background(), TaskClaimInput{AgentID: "ses_worker"})
+			if err != nil {
+				t.Fatalf("Claim: %v", err)
+			}
+			if got.GraphReady != tc.want {
+				t.Fatalf("GraphReady = %t, want %t", got.GraphReady, tc.want)
+			}
+		})
 	}
 }
 
