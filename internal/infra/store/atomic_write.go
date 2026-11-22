@@ -19,15 +19,52 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// wakeSchemaVersion is the version of the reader-visible wake-intent payload.
+type wakeSchemaVersion int
+
 const (
 	// wakeIntentKind marks the journal row that carries the staged wake request.
 	wakeIntentKind = "wake-intent"
 
-	// defaultWakeSchemaVersion is the current event payload format from ADR 0012.
-	// It is the journal row version, not the SQLite user_version. A caller can
+	// wakeSchemaV2 is the payload format from ADR 0012 that readers decode today.
+	wakeSchemaV2 wakeSchemaVersion = 2
+
+	// defaultWakeSchemaVersion is stamped on rows written by CommitVerdict. It
+	// is the journal row version, not the SQLite user_version. A caller can
 	// override it when it commits with a newer decoder.
-	defaultWakeSchemaVersion = 2
+	defaultWakeSchemaVersion = wakeSchemaV2
 )
+
+// wakeReaderFields lists the payload fields a reader consumes. DecodeEvent in
+// redaction.go reads kind and message. Every other payload field is raw: it is
+// stored for diagnostics and does not select a decoder.
+type wakeReaderFields struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+}
+
+// wakeSchemaByReaderFields is the bump ledger. Each reader format has one
+// version. When a reader starts using a new field, add a higher version here
+// and a golden fixture for that version. Do not change an existing entry,
+// because old readers still decode rows written with that version.
+var wakeSchemaByReaderFields = map[wakeReaderFields]wakeSchemaVersion{
+	{Kind: wakeIntentKind}: defaultWakeSchemaVersion,
+}
+
+// wakeSchemaVersionForPayload derives the row version from the fields a reader
+// can observe. A raw field left for diagnostics leaves the version unchanged.
+// A reader-visible change without a ledger entry fails closed.
+func wakeSchemaVersionForPayload(payload []byte) (wakeSchemaVersion, error) {
+	var fields wakeReaderFields
+	if err := json.Unmarshal(payload, &fields); err != nil {
+		return 0, fmt.Errorf("store: wake schema: decode reader fields: %w", err)
+	}
+	version, ok := wakeSchemaByReaderFields[fields]
+	if !ok {
+		return 0, fmt.Errorf("store: wake schema: no version for reader fields %+v", fields)
+	}
+	return version, nil
+}
 
 // WakeIntent is the staged marker: the request to wake the subscriber of one
 // obligation. It is written with the verdict, never after it (ADR 0017).
@@ -117,7 +154,11 @@ func CommitVerdictTx(tx *sql.Tx, c VerdictCommit) error {
 	}
 	version := c.SchemaVersion
 	if version == 0 {
-		version = defaultWakeSchemaVersion
+		derived, err := wakeSchemaVersionForPayload(wakePayload)
+		if err != nil {
+			return err
+		}
+		version = int(derived)
 	}
 	// json_extract reads only the rows this function writes. Legacy rows from
 	// the migration corpus may carry arbitrary bytes, which compare as NULL.
