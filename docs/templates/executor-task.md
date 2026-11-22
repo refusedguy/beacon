@@ -129,6 +129,29 @@ owner-rules: unchanged
 source: CA-11, docs/research/comp-aider.md
 executor-task:context-roles -->
 
+## Приоритетные файлы перед ранжированными тегами
+
+Контекст потомка начинается с фиксированного списка приоритетных файлов. Список идёт до ранжированных тегов, полученных по частоте упоминаний. aider держит такой список корневых файлов в `aider/special.py:3-177`, отбирает их из всех файлов репозитория в `special.py:184-203` и ставит в начало списка тегов в `aider/repomap.py:656-662`. Список не зависит от частоты упоминаний.
+
+В beacon приоритетные файлы: `README`, `go.mod`, `AGENTS.md` и workflow-файлы `.github/workflows/*.yml`. Без этого списка файлы попадают в контекст только потому, что их читает человек. При нулевом бюджете ranked-теги отсутствуют, и приоритетные файлы теряются.
+
+Исполнитель добавляет приоритетные файлы в начало контекста. Файл, который уже попал в контекст через упоминание или другую категорию, в основной ranked-список не добавляется. Так контекст не содержит дублей. Роль `AGENTS.md` как источника правил не меняется: файл остаётся в приоритетном списке и по-прежнему задаёт правила агента.
+
+Проверка берёт 10 задач с бюджетом 1024 токена. В каждом контексте присутствуют `go.mod`, `AGENTS.md` и один workflow-файл, без дублей. При бюджете 0 присутствует `AGENTS.md`. Baseline равен 0 из 10.
+
+Основание: карточка CA-19, `docs/research/comp-aider.md`, дополнение к CA-01.
+
+<!-- executor-task:priority-files
+files: README, go.mod, AGENTS.md, .github/workflows/*.yml
+position: before-ranked-tags
+frequency-independent: true
+dedupe: skip-files-already-in-context
+agents-md-role: rules-source, unchanged
+acceptance: 10-of-10-at-1024, agents-md-at-zero-budget, no-duplicates
+baseline: 0-of-10
+source: CA-19, docs/research/comp-aider.md
+executor-task:priority-files -->
+
 ## Разделение каналов
 
 Агент меняет состояние цикла через MCP-инструменты. Это `beacon_watch_pr`, `beacon_ack`, `beacon_cancel_watch`, `beacon_task_claim`, `beacon_task_close` и `beacon_defer_wiring`. Агент зовёт их внутри хода и читает типизированную ошибку в ответе.
