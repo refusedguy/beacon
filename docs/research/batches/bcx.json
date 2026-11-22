@@ -36,12 +36,12 @@
       "id": "BCX-02",
       "title": "Развести 34 дублированных номера ADR и обновить ссылки в карточках",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "docs/adrs/README.md",
         "docs/adrs/0091-checked-stop.md",
-        "docs/adrs/0091-mcp.md",
+        "docs/adrs/0095-cli-opencode-api.md",
         "docs/tasks/T5.52.md"
       ],
       "deps": [],
@@ -100,11 +100,11 @@
       "id": "BCX-05",
       "title": "Генерировать индекс ADR из файлов вместо ручного списка",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "docs/adrs/README.md",
-        "tools/beacon-gates/gate/docsgate/docs.go"
+        "tools/beacon-gates/docsgate/docs.go"
       ],
       "deps": [],
       "adr": "",
@@ -124,8 +124,8 @@
       "type": "task",
       "owner_files": [
         "docs/adrs/0240-rule-check-without-full-review.md",
-        "docs/adrs/0090-honest-delivery-unchanged-ladder.md",
-        "tools/beacon-gates/gate/docsgate/docs.go"
+        "docs/adrs/0090-registry-lifecycle.md",
+        "tools/beacon-gates/docsgate/docs.go"
       ],
       "deps": [],
       "adr": "",
@@ -201,12 +201,11 @@
     {
       "id": "BCX-10",
       "title": "Определить статус research-отчётов в git",
-      "status": "todo",
+      "status": "dropped",
       "phase": "P3",
       "type": "task",
       "owner_files": [
-        ".gitignore",
-        "docs/research/"
+        ".gitignore"
       ],
       "deps": [],
       "adr": "",
@@ -214,9 +213,9 @@
       "time": "",
       "goal": "Явно решить, хранятся ли research-отчёты в репозитории или остаются временными.",
       "context": "Источник: docs/research/docs-health-audit.md, таблица 7 строка 10. git ls-files docs/research возвращает 0. Каталог не игнорируется, но отчёты не добавлены. В снимке отчёта семь файлов. Базовый замер и приоритет из отчёта: P3.",
-      "steps": "Выбрать политику с владельцем. Если отчёты нужны, закоммитить их отдельным коммитом. Если временные, добавить docs/research/ в .gitignore и сделать правило явным.",
+      "steps": "DROP. Политика уже зафиксирована в main: .gitignore содержит docs/research/ с комментарием «(BCX-10)» и правилом «Новые отчёты не коммитятся и не показываются в git status». Уже закоммиченные отчёты остаются в истории. Решение принято, работа дублирует сделанное. Выбрать политику с владельцем. Если отчёты нужны, закоммитить их отдельным коммитом. Если временные, добавить docs/research/ в .gitignore и сделать правило явным.",
       "check": "CI зелёный. git status в чистом дереве не показывает docs/research как неотслеживаемые, если выбрана политика ignore.",
-      "acceptance": "Политика зафиксирована в .gitignore или в коммите. Новый research-отчёт не создаёт шум в git status."
+      "acceptance": "DROP. Политика уже зафиксирована в main: .gitignore содержит docs/research/ с комментарием «(BCX-10)» и правилом «Новые отчёты не коммитятся и не показываются в git status». Уже закоммиченные отчёты остаются в истории. Решение принято, работа дублирует сделанное. Политика зафиксирована в .gitignore или в коммите. Новый research-отчёт не создаёт шум в git status."
     },
     {
       "id": "BCX-11",
@@ -243,14 +242,14 @@
       "id": "BCX-12",
       "title": "Собрать вердикты в один контракт и сделать app-зеркала производными",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "internal/domain/types.go",
         "internal/app/orchestrator/checkall.go",
         "internal/app/orchestrator/orchestrator.go",
         "internal/infra/mcp/schema.go",
-        "docs/GLOSSARY.md"
+        "GLOSSARY.md"
       ],
       "deps": [],
       "adr": "ADR 0005",
@@ -266,7 +265,7 @@
       "id": "BCX-13",
       "title": "Решить судьбу кодов stop_uncertain и ACTOR_NOT_PERMITTED",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "cmd/beacon/registry_stop.go",
@@ -311,11 +310,11 @@
       "id": "BCX-15",
       "title": "Объединить шесть определений кодов ошибок и две таблицы статусов",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P6",
       "type": "task",
       "owner_files": [
         "internal/domain/types.go",
-        "internal/infra/server/http/error.go",
+        "internal/infra/httpapi/error_format_test.go",
         "internal/infra/httpapi/server.go",
         "internal/infra/mcp/schema.go"
       ],
@@ -422,10 +421,10 @@
       "id": "BCX-20",
       "title": "Добавить green_blocked в списки вердиктов документации",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
-        "docs/GLOSSARY.md",
+        "GLOSSARY.md",
         "README.md",
         "internal/domain/verdict.go"
       ],
@@ -464,7 +463,7 @@
       "id": "BCX-22",
       "title": "Сделать --help рабочим для каждой команды",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "cmd/beacon/catalog.go",
@@ -550,7 +549,7 @@
       "id": "BCX-26",
       "title": "Унифицировать коды выхода для ошибок валидации",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "internal/infra/taskstore/store.go",
@@ -571,7 +570,7 @@
       "id": "BCX-27",
       "title": "Гарантировать JSON на выходе logs --json",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
         "cmd/beacon/logs.go",
@@ -591,7 +590,7 @@
       "id": "BCX-28",
       "title": "Свести три описания --interval и исправить daemon --once",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P6",
       "type": "task",
       "owner_files": [
         "cmd/beacon/daemon.go",
@@ -676,7 +675,7 @@
       "id": "BCX-32",
       "title": "Привести пять определений DDL registry к одному каноническому",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "internal/infra/store/migrations/0005_agent_registry.sql",
@@ -739,7 +738,7 @@
       "id": "BCX-35",
       "title": "Добавить составные индексы под горячие предикаты",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P6",
       "type": "task",
       "owner_files": [
         "internal/infra/store/schedules.go",
@@ -762,7 +761,7 @@
       "id": "BCX-36",
       "title": "Убрать N+1 и полные чтения в горячих путях store",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "internal/infra/store/db.go",
@@ -783,7 +782,7 @@
       "id": "BCX-37",
       "title": "Сделать запись данных и progress одной транзакцией",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "internal/infra/store/observability.go",
@@ -824,7 +823,7 @@
       "id": "BCX-39",
       "title": "Настроить WAL checkpoint и ограничить рост файла",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "internal/infra/store/db.go"
@@ -887,7 +886,7 @@
       "id": "BCX-42",
       "title": "Подключить или явно закрыть t3_thread_read",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/server.go",
@@ -929,7 +928,7 @@
       "id": "BCX-44",
       "title": "Зафиксировать добавочные поля stats в ADR",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P7",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/schema.go",
@@ -950,7 +949,7 @@
       "id": "BCX-45",
       "title": "Защитить MCP-контракт от домино-изменений домена",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/schema.go",
@@ -972,7 +971,7 @@
       "id": "BCX-46",
       "title": "Документировать одиннадцать добавочных полей get_result",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/schema.go",
@@ -1035,7 +1034,7 @@
       "id": "BCX-49",
       "title": "Устранить конфликт wake-конструкторов с ADR 0263",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/tool_wake.go",
@@ -1077,7 +1076,7 @@
       "id": "BCX-51",
       "title": "Подключить офлайн-гейт tool-contract к CLI и CI",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "tools/beacon-gates/main.go",
@@ -1098,7 +1097,7 @@
       "id": "BCX-52",
       "title": "Свести три списка имён MCP к одному и вернуть e2e в обязательные",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "tests/e2e/e2e_test.go",
@@ -1140,7 +1139,7 @@
       "id": "BCX-54",
       "title": "Реализовать живой прогон seeded regression artery",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "tests/scenarios/seeded.yaml",
@@ -1162,7 +1161,7 @@
       "id": "BCX-55",
       "title": "Грузить реальный плагин репозитория в живом e2e",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
         "tests/e2e/e2e_test.go",
@@ -1183,7 +1182,7 @@
       "id": "BCX-56",
       "title": "Добавить живой тест dedup после рестарта",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
         "tests/chaos/duplicate-delivery_test.go",
@@ -1225,10 +1224,10 @@
       "id": "BCX-58",
       "title": "Добавить живой тест registry с двумя проектами",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P2",
       "type": "task",
       "owner_files": [
-        "internal/infra/registry/",
+        "internal/infra/registry/index.go",
         ".github/workflows/ci.yml",
         "cmd/beacon/registry_sync.go"
       ],
@@ -1308,7 +1307,7 @@
       "id": "BCX-62",
       "title": "Привести ADR 0094, 0263 и AGENTS.md к одному контракту MCP",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "docs/adrs/0094-seven-tools.md",
@@ -1330,7 +1329,7 @@
       "id": "BCX-63",
       "title": "Разрешить или запретить свой TUI и снять дубли proposed ADR",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "docs/adrs/0060-cli-adapter-boundary-and-live-loop.md",
@@ -1352,7 +1351,7 @@
       "id": "BCX-64",
       "title": "Определить статус wake вне MCP и сделать проверку ADR 0026 достижимой",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/tool_wake.go",
@@ -1374,11 +1373,11 @@
       "id": "BCX-65",
       "title": "Развести дубли номеров ADR 0086, 0089, 0091, 0094, 0095",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "docs/adrs/README.md",
-        "docs/adrs/0086-mcp-beacon-wake.md",
+        "docs/adrs/0089-capability-index.md",
         "docs/adrs/0086-project-scoped-agent-registry.md",
         "docs/adrs/0094-seven-tools.md"
       ],
@@ -1396,7 +1395,7 @@
       "id": "BCX-66",
       "title": "Реализовать или пересмотреть ADR 0213 о версионированном вопросе",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "docs/adrs/0213-human-question-revision-row.md",
@@ -1458,7 +1457,7 @@
       "id": "BCX-69",
       "title": "Убрать второй формат ошибки в internal/infra/mcp",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P8",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/schema.go",
@@ -1484,7 +1483,7 @@
       "owner_files": [
         "docs/adrs/README.md",
         "docs/adrs/0060-cli-adapter-boundary-and-live-loop.md",
-        "docs/adrs/0070-*.md"
+        "docs/adrs/0070-universal-wake-adapter.md"
       ],
       "deps": [],
       "adr": "",
@@ -1500,7 +1499,7 @@
       "id": "BCX-71",
       "title": "Проверять адрес BEACON_GITHUB_API и связать его с основным клиентом",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "internal/infra/mcp/tool_get_result.go",
@@ -1521,7 +1520,7 @@
       "id": "BCX-72",
       "title": "Задокументировать BEACON_CHANNEL_SENDERS и закрыть слэш-команды ingress",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "cmd/beacon/server.go",
@@ -1580,7 +1579,7 @@
       "id": "BCX-75",
       "title": "Описать 21 production-переменную в эксплуатационной документации",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "README.md",
@@ -1601,7 +1600,7 @@
       "id": "BCX-76",
       "title": "Свести три имени корня проекта к одному",
       "status": "todo",
-      "phase": "P1",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "scripts/verify-beacon.sh",
@@ -1665,7 +1664,7 @@
       "id": "BCX-79",
       "title": "Исправить состояние OTEL_EXPORTER_OTLP_PROTOCOL=grpc",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P3",
       "type": "task",
       "owner_files": [
         "internal/infra/observe/otel.go",
@@ -1685,7 +1684,7 @@
       "id": "BCX-80",
       "title": "Убрать env-переменные, которые production не читает",
       "status": "todo",
-      "phase": "P2",
+      "phase": "P5",
       "type": "task",
       "owner_files": [
         "cmd/beacon/checkall_test.go",
@@ -1706,7 +1705,7 @@
       "id": "BCX-81",
       "title": "Поставить автоматическую уборку сирот opencode serve",
       "status": "todo",
-      "phase": "P0",
+      "phase": "P4",
       "type": "task",
       "owner_files": [
         "cmd/beacon/gc.go",
@@ -1733,7 +1732,7 @@
         ".opencode/plugins/beacon-project/index.js",
         ".opencode/agents/issue-scout.md",
         "AGENTS.md",
-        "docs/research/process-leak-mechanism.md"
+        ".opencode/settings.json"
       ],
       "deps": [],
       "adr": "",
