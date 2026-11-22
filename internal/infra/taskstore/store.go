@@ -58,6 +58,10 @@ func Code(err error) int {
 	if errors.As(err, &ee) {
 		return ee.Code
 	}
+	var re *ReservedIDError
+	if errors.As(err, &re) {
+		return ExitValidation
+	}
 	return ExitStartup
 }
 
@@ -1053,6 +1057,13 @@ func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) 
 				continue
 			}
 			newPath := filepath.Join(loc.root, "docs", "tasks", newName+".md")
+			stateDir, stateErr := StateDir()
+			if stateErr != nil {
+				return report, stateErr
+			}
+			if err := AssertIDAvailable(filepath.Dir(newPath), ReservedIDsPath(stateDir, loc.root), newName); err != nil {
+				return report, err
+			}
 			if err := AtomicWrite(newPath, []byte(content), 0644); err != nil {
 				return report, err
 			}
@@ -1067,8 +1078,169 @@ func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) 
 	return report, nil
 }
 
-// CreateExclusive создаёт файл карточки. Занятый ID даёт ошибку валидации, код 1.
+// reservedIDsPrefix задаёт имя журнала забронированных ID в state dir.
+// Журнал лежит рядом со счётчиком и ключуется хешем корня проекта.
+const reservedIDsPrefix = "reserved-ids-"
+
+// ReservedID — одна запись журнала: ID карточки и время её закрытия.
+type ReservedID struct {
+	ID       string `json:"id"`
+	ClosedAt string `json:"closed_at"`
+}
+
+type reservedIDsFile struct {
+	IDs []ReservedID `json:"ids"`
+}
+
+// ReservedIDError — typed ошибка повторного использования ID. Kind принимает
+// два значения: "taken", когда живая карточка ещё есть, и "expired", когда ID
+// занесён в журнал. ClosedAt хранит время закрытия из журнала, поэтому повтор
+// брони или записи возвращает ту же ошибку: истёкшая идемпотентность.
+type ReservedIDError struct {
+	ID       string
+	ClosedAt string
+	Kind     string
+}
+
+func (e *ReservedIDError) Error() string {
+	if e.Kind == "taken" {
+		return fmt.Sprintf("ID занят: карточка %s уже существует", e.ID)
+	}
+	return fmt.Sprintf("истёк: ID %s забронирован", e.ID)
+}
+
+// ReservedIDsPath возвращает путь журнала забронированных ID проекта.
+func ReservedIDsPath(stateDir, root string) string {
+	return filepath.Join(stateDir, reservedIDsPrefix+Hash8(root)+".json")
+}
+
+// ReadReservedIDs читает журнал одним вызовом. Отсутствующий файл равен
+// пустому журналу: старые проекты не получают ошибок при первом чтении.
+func ReadReservedIDs(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return make(map[string]string), nil
+	}
+	if err != nil {
+		return nil, Startupf("не прочитан журнал ID %s: %v", path, err)
+	}
+	var file reservedIDsFile
+	if err := json.Unmarshal(data, &file); err != nil {
+		return nil, Startupf("журнал ID %s повреждён: %v", path, err)
+	}
+	ids := make(map[string]string, len(file.IDs))
+	for _, item := range file.IDs {
+		if item.ID == "" {
+			continue
+		}
+		ids[item.ID] = item.ClosedAt
+	}
+	return ids, nil
+}
+
+// WriteReservedIDs пишет журнал через временный файл и переименование.
+// Записи сортируются по ID, поэтому два процесса с одинаковым набором
+// получают побайтово одинаковый файл.
+func WriteReservedIDs(path string, ids map[string]string) error {
+	keys := make([]string, 0, len(ids))
+	for id := range ids {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	file := reservedIDsFile{IDs: make([]ReservedID, 0, len(keys))}
+	for _, id := range keys {
+		file.IDs = append(file.IDs, ReservedID{ID: id, ClosedAt: ids[id]})
+	}
+	data, err := json.MarshalIndent(file, "", "  ")
+	if err != nil {
+		return Startupf("не собран журнал ID: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return Startupf("не создан каталог состояния: %v", err)
+	}
+	return AtomicWrite(path, data, 0600)
+}
+
+// AssertIDAvailable проверяет ID перед create, import или rename. Журнал
+// читается один раз. Живая карточка имеет приоритет перед записью журнала:
+// она даёт "ID занят", а не "истёк".
+func AssertIDAvailable(tasksDir, journalPath, id string) error {
+	reserved, err := ReadReservedIDs(journalPath)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(CardPath(tasksDir, id)); statErr == nil {
+		return &ReservedIDError{ID: id, Kind: "taken"}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return Startupf("не проверена карточка %s: %v", id, statErr)
+	}
+	if closedAt, ok := reserved[id]; ok {
+		return &ReservedIDError{ID: id, ClosedAt: closedAt, Kind: "expired"}
+	}
+	return nil
+}
+
+// ReserveID заносит ID в журнал под тем же замком, что и запись карточки.
+// Повторная бронь идемпотентна: возвращается та же ошибка "истёк" с прежним
+// временем закрытия, журнал не меняется.
+func ReserveID(tasksDir, stateDir, root, id, closedAt string) error {
+	lock, err := AcquireLock(TasksLockPath(tasksDir), root)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	journal := ReservedIDsPath(stateDir, root)
+	ids, err := ReadReservedIDs(journal)
+	if err != nil {
+		return err
+	}
+	if previous, ok := ids[id]; ok {
+		return &ReservedIDError{ID: id, ClosedAt: previous, Kind: "expired"}
+	}
+	ids[id] = closedAt
+	return WriteReservedIDs(journal, ids)
+}
+
+// projectRootFromTasksDir восстанавливает корень проекта из каталога
+// карточек. В обычном дереве это <root>/docs/tasks. Для временных каталогов
+// тестов корнем остаётся сам каталог карточек, чтобы ключ журнала был стабильным.
+func projectRootFromTasksDir(tasksDir string) string {
+	docs := filepath.Dir(tasksDir)
+	if filepath.Base(docs) == "docs" {
+		return filepath.Dir(docs)
+	}
+	return tasksDir
+}
+
+// CreateExclusive создаёт файл карточки. Занятая живая карточка или
+// забронированный ID дают ошибку валидации, код 1. Проверка журнала и
+// создание идут под одним замком каталога карточек.
 func CreateExclusive(filePath string, data []byte) error {
+	tasksDir := filepath.Dir(filePath)
+	id := strings.TrimSuffix(filepath.Base(filePath), ".md")
+	stateDir, err := StateDir()
+	if err != nil {
+		return err
+	}
+	root := projectRootFromTasksDir(tasksDir)
+	lock, err := AcquireLock(TasksLockPath(tasksDir), root)
+	if err != nil {
+		return err
+	}
+	if err := AssertIDAvailable(tasksDir, ReservedIDsPath(stateDir, root), id); err != nil {
+		_ = lock.Release()
+		return err
+	}
+	createErr := createExclusiveRaw(filePath, data)
+	releaseErr := lock.Release()
+	if createErr != nil {
+		return createErr
+	}
+	return releaseErr
+}
+
+// createExclusiveRaw создаёт файл через O_EXCL без проверки журнала.
+func createExclusiveRaw(filePath string, data []byte) error {
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if errors.Is(err, os.ErrExist) {
 		return Validationf("ID занят: файл %s уже существует", filepath.Base(filePath))
@@ -1083,7 +1255,7 @@ func CreateExclusive(filePath string, data []byte) error {
 	_ = f.Close()
 	if werr != nil {
 		_ = os.Remove(filePath)
-		return Startupf("не записан файл %s: %v", filePath, err)
+		return Startupf("не записан файл %s: %v", filePath, werr)
 	}
 	return SyncDir(filepath.Dir(filePath))
 }

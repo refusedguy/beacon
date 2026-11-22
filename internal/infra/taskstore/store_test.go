@@ -1,11 +1,13 @@
 package taskstore
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -978,5 +980,119 @@ func TestMergeTreesUniqueIDsDoNotMigrate(t *testing.T) {
 	}
 	if got := snapshotCards(t, right); len(got) != 1 || got["T3.18.md"] != rightBody {
 		t.Fatalf("правый корень изменился: %+v", got)
+	}
+}
+
+func TestReservedIDJournalAndIdempotency(t *testing.T) {
+	tmp := t.TempDir()
+	tasksDir := filepath.Join(tmp, "docs", "tasks")
+	if err := os.MkdirAll(tasksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(tmp, "state")
+	journal := ReservedIDsPath(stateDir, tmp)
+
+	if err := AssertIDAvailable(tasksDir, journal, "T3.900"); err != nil {
+		t.Fatalf("свободный ID должен проходить: %v", err)
+	}
+	if err := ReserveID(tasksDir, stateDir, tmp, "T3.900", "2026-11-22T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	err := ReserveID(tasksDir, stateDir, tmp, "T3.900", "2026-11-22T11:00:00Z")
+	var re *ReservedIDError
+	if !errors.As(err, &re) || re.Kind != "expired" || re.ClosedAt != "2026-11-22T10:00:00Z" {
+		t.Fatalf("повторная бронь должна быть идемпотентной: %v", err)
+	}
+	if Code(err) != ExitValidation {
+		t.Fatalf("код повторной брони = %d, ждали 1", Code(err))
+	}
+	err = AssertIDAvailable(tasksDir, journal, "T3.900")
+	if !errors.As(err, &re) || re.Kind != "expired" || !strings.Contains(err.Error(), "истёк") {
+		t.Fatalf("забронированный ID должен давать истёк: %v", err)
+	}
+	if entries, _ := os.ReadDir(tasksDir); len(entries) != 0 {
+		t.Fatalf("журнал изменил каталог карточек: %v", entries)
+	}
+}
+
+func TestAssertIDAvailableLiveCardWins(t *testing.T) {
+	tmp := t.TempDir()
+	tasksDir := filepath.Join(tmp, "docs", "tasks")
+	if err := os.MkdirAll(tasksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(tmp, "state")
+	if err := ReserveID(tasksDir, stateDir, tmp, "T3.901", "2026-11-22T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(CardPath(tasksDir, "T3.901"), []byte(validCard), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := AssertIDAvailable(tasksDir, ReservedIDsPath(stateDir, tmp), "T3.901")
+	var re *ReservedIDError
+	if !errors.As(err, &re) || re.Kind != "taken" || !strings.Contains(err.Error(), "ID занят") {
+		t.Fatalf("живая карточка должна давать ID занят: %v", err)
+	}
+}
+
+func TestCreateExclusiveRejectsReservedID(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "xdg"))
+	tasksDir := filepath.Join(tmp, "docs", "tasks")
+	if err := os.MkdirAll(tasksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	stateDir, err := StateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ReserveID(tasksDir, stateDir, tmp, "T3.902", "2026-11-22T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	cardFile := CardPath(tasksDir, "T3.902")
+	createErr := CreateExclusive(cardFile, []byte(validCard))
+	var re *ReservedIDError
+	if !errors.As(createErr, &re) || re.Kind != "expired" {
+		t.Fatalf("create забронированного ID: %v", createErr)
+	}
+	if _, statErr := os.Stat(cardFile); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("карточка создана для забронированного ID: %v", statErr)
+	}
+	if entries, _ := os.ReadDir(tasksDir); len(entries) != 0 {
+		t.Fatalf("число файлов в docs/tasks изменилось: %v", entries)
+	}
+}
+
+func TestCreateExclusiveConcurrentOnce(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "xdg"))
+	tasksDir := filepath.Join(tmp, "docs", "tasks")
+	if err := os.MkdirAll(tasksDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	cardFile := CardPath(tasksDir, "T3.903")
+	const attempts = 20
+	results := make([]error, attempts)
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i] = CreateExclusive(cardFile, []byte(validCard))
+		}(i)
+	}
+	wg.Wait()
+	created := 0
+	for _, err := range results {
+		if err == nil {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("успешных create = %d, ждали 1; ошибки: %v", created, results)
+	}
+	entries, _ := os.ReadDir(tasksDir)
+	if len(entries) != 1 {
+		t.Fatalf("файлов в каталоге карточек = %d, ждали 1: %v", len(entries), entries)
 	}
 }
