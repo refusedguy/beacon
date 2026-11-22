@@ -413,11 +413,11 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 // Decide owns the FIX-attempt cap: below the cap the Watch asks for another FIX
 // agent; at the cap the Watch is escalated to a human. There is no direct fixer
 // spawn in this process, so one BLOCKED_FIX_AGENT decision is one reported
-// attempt. The pass never persists an attempt: a three-minute tick would charge
-// one per tick without a fixer actually running. The switch in RunWithResolver
-// calls this once per Watch, which keeps a single decision from emitting the
-// metric twice.
-func handleBlocked(_ context.Context, _ Store, w Watch, resolver DependencyResolver, opts Options, out *Result, _ *[]error) {
+// attempt. The attempt is persisted on the Watch's block record so Decide sees
+// the budget close: without the write BlockedInfo.FixAttempts stays zero and
+// the Watch asks for a FIX agent forever. The switch in RunWithResolver calls
+// this once per Watch, which keeps a single decision from charging twice.
+func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyResolver, opts Options, out *Result, errs *[]error) {
 	d := Decide(w, resolver, CIState{})
 	if d.Kind == DecisionNotifyOrchestrator && d.Reason == ReasonEscalateHuman {
 		observe.BlockEscalated(w.ID, ReasonEscalateHuman)
@@ -437,8 +437,14 @@ func handleBlocked(_ context.Context, _ Store, w Watch, resolver DependencyResol
 	if opts.DryRun {
 		return
 	}
-	// The metric records the decision, not a persisted counter increment.
-	// Persisting belongs to the path that actually spawns a fixer.
+	// The block record is the sole budget Decide reads. Charge the attempt
+	// here, where the FIX agent decision is emitted, so the third spawn closes
+	// the cycle and the next pass escalates to a human. A failed write is
+	// reported, not hidden: a lost charge would keep the loop spinning.
+	if err := st.RecordFixAttempt(ctx, w.ID); err != nil {
+		observe.ActorError("fix-attempt", w.ID, err)
+		*errs = append(*errs, fmt.Errorf("orchestrator: record fix attempt %s: %w", w.ID, err))
+	}
 	observe.FixerSpawned(w.ID)
 }
 
