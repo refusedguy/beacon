@@ -44,7 +44,16 @@ const (
 	// excerptContextLineLimit caps one non-signal line while compressing a
 	// long message, so a single verbose line cannot consume the byte budget.
 	excerptContextLineLimit = 160
+	// outputConfirmationTokens is the price above which command output is held
+	// for confirmation instead of entering a wake silently. The 1024 boundary
+	// matches the context warning threshold: a block that could spend the
+	// whole remaining warning budget must be accepted explicitly.
+	outputConfirmationTokens = 1024
 )
+
+// OutputConfirmationPrompt asks before measured command output is added to
+// the chat. The caller fills the token count from OutputStats.
+const OutputConfirmationPrompt = "Add %d tokens of command output to the chat?"
 
 // excerptSignalMarkers are case-insensitive substrings that mark a line as
 // carrying diagnostic signal. When a long message is reduced, these lines
@@ -501,6 +510,64 @@ func clampExcerptBytes(s string) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+// OutputStats measures command output before it is considered for a wake.
+// Tokens use the deterministic whitespace-word heuristic so the same text
+// always produces the same price and the same confirmation question.
+type OutputStats struct {
+	Bytes  int
+	Lines  int
+	Tokens int
+}
+
+// MeasureOutput reports the byte, line and estimated token cost of output.
+// One whitespace word costs one token and every four bytes in that word cost
+// one more. This is the heuristic used by the session context counter, so the
+// confirmation prompt and the token breakdown agree.
+func MeasureOutput(output string) OutputStats {
+	lines := 0
+	if output != "" {
+		lines = strings.Count(output, "\n")
+		if !strings.HasSuffix(output, "\n") {
+			lines++
+		}
+	}
+	tokens := 0
+	for _, word := range strings.Fields(output) {
+		tokens += 1 + len(word)/4
+	}
+	return OutputStats{Bytes: len(output), Lines: lines, Tokens: tokens}
+}
+
+// ConfirmationPrompt renders the question for a measured output.
+func (s OutputStats) ConfirmationPrompt() string {
+	return fmt.Sprintf(OutputConfirmationPrompt, s.Tokens)
+}
+
+// WakeOutput is the insertion decision for command output. Text is empty when
+// the output is held. Stats always describe the original output, so a held
+// block still reports its line and token cost to the executor.
+type WakeOutput struct {
+	Text              string
+	Stats             OutputStats
+	NeedsConfirmation bool
+}
+
+// PrepareWakeOutput gates output before it enters a wake. Failed check output
+// is always inserted as a fragment no larger than failureExcerptLimit, which
+// keeps the failure path automatic and bounded. Other output above
+// outputConfirmationTokens is held until confirmed, and a refusal inserts
+// nothing. The decision never changes a Watch verdict.
+func PrepareWakeOutput(output string, failed, confirmed bool) WakeOutput {
+	stats := MeasureOutput(output)
+	if failed {
+		return WakeOutput{Text: clampExcerptBytes(output), Stats: stats}
+	}
+	if stats.Tokens > outputConfirmationTokens && !confirmed {
+		return WakeOutput{Stats: stats, NeedsConfirmation: true}
+	}
+	return WakeOutput{Text: output, Stats: stats}
 }
 
 // isExcerptSignal reports whether a line carries an error or panic marker.
