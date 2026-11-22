@@ -1,5 +1,5 @@
 # ARDH-21. Свести два формата ошибки HTTP к одному типу
-Статус: in_progress
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/server/http/error.go, internal/infra/httpapi/server.go
@@ -13,6 +13,9 @@
 Проверка: CI зелёный. Тесты HTTP ответов проходят без изменения ожидаемого тела.
 Приёмка: Один тип ошибки и одна функция записи, формат ответа не изменился.
 
+Причина: PR #1186 влит в origin/main, merge commit ef029392bf9971e6305d3a2beda141377f0f92ad, git merge-base --is-ancestor exit 0. Premise снята CLEAN-02, формат httpapi зафиксирован error_format_test.go.
+Закрыл: нет
+Время закрытия: 2026-11-22T10:39:55Z
 ## Причина
 Карточка написана по коммиту d3b1bfb. Тогда `internal/infra/server/http/error.go` содержал `Code`, `Error`, `CodeOf` и `WriteError`. Коммит d4f7b326 (CLEAN-02) удалил пакет `httproute` как неиспользуемый. В `origin/main` на коммите b9937c01 этого файла нет. Второго формата ошибки тоже нет. Остался только `httpapi.errorBody` с полями `ok`, `code` и `message`.
 
