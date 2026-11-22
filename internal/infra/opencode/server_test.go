@@ -116,6 +116,93 @@ func TestEnsureServerUsesExistingConfig(t *testing.T) {
 	}
 }
 
+func TestEnsureServerReusesReadyServeState(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	var probes atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != healthPath {
+			http.NotFound(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != authUser || pass != "serve-secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		probes.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if err := WriteServeState(ServeState{
+		URL: srv.URL, Password: "serve-secret", PID: os.Getpid(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	installStartServer(t, func(spawnRequest) (spawnedProcess, error) {
+		called = true
+		return nil, errors.New("спавн не должен вызываться")
+	})
+
+	cfg, err := EnsureServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureServer: %v", err)
+	}
+	if called {
+		t.Fatal("spawn вызван при готовом сервере из serve state")
+	}
+	if cfg.URL != srv.URL || cfg.Password != "serve-secret" {
+		t.Fatalf("неверный конфиг: %+v", cfg)
+	}
+	if n := probes.Load(); n == 0 {
+		t.Fatal("health-probe не вызван для serve state")
+	}
+}
+
+func TestEnsureServerDropsUnreadyServeState(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	// PID жив, но API отдаёт 503: старую запись нельзя переиспользовать.
+	stale := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer stale.Close()
+
+	if err := WriteServeState(ServeState{
+		URL: stale.URL, Password: "stale-secret", PID: os.Getpid(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	callCount := 0
+	installStartServer(t, func(req spawnRequest) (spawnedProcess, error) {
+		callCount++
+		if _, ok := ReadServeState(); ok {
+			t.Error("serve state не удалён до спавна")
+		}
+		return startHealthServer(t, req, nil), nil
+	})
+
+	cfg, err := EnsureServer(context.Background())
+	if err != nil {
+		t.Fatalf("EnsureServer: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("spawn вызван %d раз, ожидался 1", callCount)
+	}
+	if cfg.URL == stale.URL || cfg.Password == "stale-secret" {
+		t.Fatalf("возвращён неготовый сервер: %+v", cfg)
+	}
+
+	st, ok := ReadServeState()
+	if !ok || st.URL != cfg.URL {
+		t.Fatalf("serve state не обновлён после спавна: %+v, ok=%v", st, ok)
+	}
+}
+
 func TestEnsureServerSpawnsOnMissingConfig(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 

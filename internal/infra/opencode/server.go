@@ -38,6 +38,11 @@ const (
 	// healthPollInterval is the pause between health requests.
 	healthPollInterval = 100 * time.Millisecond
 
+	// reuseProbeTimeout bounds one readiness probe of a server found in
+	// opencode-serve.json. A live pid with a dead HTTP API must fail fast so
+	// EnsureServer can drop the stale record and spawn a fresh server (MM-03).
+	reuseProbeTimeout = 2 * time.Second
+
 	// serveStateFile is the name of the record Beacon writes for a server it
 	// spawned itself. service.json stays the property of the user's OpenCode.
 	serveStateFile = "opencode-serve.json"
@@ -164,6 +169,30 @@ func healthReady(ctx context.Context, baseURL, password string) bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// reuseProbe checks a recorded server before EnsureServer reuses it. A refused
+// connection is ambiguous: the process is alive but its listener may still be
+// starting, so dropping the record would spawn a duplicate server. Keep such a
+// record and reuse it. An HTTP error or a stalled listener proves the recorded
+// endpoint is unusable, so the caller drops the record and spawns a fresh
+// server (MM-03).
+func reuseProbe(ctx context.Context, baseURL, password string) (ready, keep bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+healthPath, nil)
+	if err != nil {
+		return false, false
+	}
+	req.SetBasicAuth(authUser, password)
+	resp, err := healthDoer.Do(req)
+	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return false, true
+		}
+		return false, false
+	}
+	defer resp.Body.Close()
+	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+	return ok, ok
 }
 
 // waitHealthy polls until the server answers, the process exits, ctx ends,
@@ -367,7 +396,15 @@ func EnsureServer(ctx context.Context) (Config, error) {
 	defer ensureMu.Unlock()
 
 	if st, ok := ReadServeState(); ok && ProcessAlive(st.PID) {
-		return Config{URL: st.URL, Password: st.Password}, nil
+		probeCtx, cancel := context.WithTimeout(ctx, reuseProbeTimeout)
+		ready, keep := reuseProbe(probeCtx, st.URL, st.Password)
+		cancel()
+		if ready || keep {
+			return Config{URL: st.URL, Password: st.Password}, nil
+		}
+		// The pid is alive but the HTTP API answered with an error or stalled.
+		// Drop the stale record and fall through to Discover and spawn (MM-03).
+		_ = ClearServeState()
 	}
 	if cfg, err := Discover(); err == nil {
 		return cfg, nil
