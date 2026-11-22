@@ -472,6 +472,38 @@ func TestTransitionNeedsInputParksWatch(t *testing.T) {
 	}
 }
 
+// TestTransitionNeedsInputIgnoresVerdict covers LC-01: a CI verdict on a Watch
+// parked for a human answer changes no status, verdict or revision, stages no
+// wake and creates no obligation. A terminal verdict must not close the Watch
+// before the human answers; the answer then resumes the same Watch.
+func TestTransitionNeedsInputIgnoresVerdict(t *testing.T) {
+	at := time.Date(2026, 11, 22, 1, 0, 0, 0, time.UTC)
+	verdicts := []Verdict{
+		VerdictReady, VerdictRetry, VerdictKeepWorking, VerdictWatching,
+		VerdictMerged, VerdictClosed,
+	}
+	for _, v := range verdicts {
+		t.Run(string(v), func(t *testing.T) {
+			parked := transitionWatch(StatusNeedsInput, VerdictNeedsInput, "sha", 5)
+			next, effects := Transition(parked, VerdictEvent(v, at))
+			if !reflect.DeepEqual(next, parked) {
+				t.Errorf("verdict %q changed the Watch: %+v, want %+v", v, next, parked)
+			}
+			if len(effects) != 0 {
+				t.Errorf("verdict %q staged effects %+v, want none", v, effects)
+			}
+
+			resumed, effects := Transition(next, ContinueEvent("w1", 1, at))
+			if resumed.Status != StatusWatching || resumed.Revision != parked.Revision+1 {
+				t.Errorf("answer after %q = %+v, want watching at revision %d", v, resumed, parked.Revision+1)
+			}
+			if len(effects) != 1 || effects[0].Kind != EffectContinueWatch || effects[0].WatchID != "w1" {
+				t.Errorf("answer after %q: effects = %+v, want one continue_watch on w1", v, effects)
+			}
+		})
+	}
+}
+
 // TestTransitionContinueResumesSameWatch proves the human answer resumes the
 // parked Watch and emits no successor Watch (T3.21 acceptance: no new task).
 func TestTransitionContinueResumesSameWatch(t *testing.T) {
