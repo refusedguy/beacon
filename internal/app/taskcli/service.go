@@ -414,13 +414,19 @@ func checkOwners(cards []Card, owners []string) error {
 // он случился. Агент в работе изолирован по ADR 0021, поэтому общий файл в
 // двух назначениях недопустим даже при разных ветках.
 
-// LaunchAssignment — одно назначение перед запуском: имя назначения и границы
-// файлов, которые оно будет менять. Путь может быть файлом или каталогом;
-// границы сравниваются по сегментам.
+// LaunchAssignment — одно назначение перед запуском: имя назначения, границы
+// файлов, которые оно будет менять, и статус карточки. Путь может быть файлом
+// или каталогом; границы сравниваются по сегментам. Статус «in_progress»
+// означает, что агент уже работает с этими файлами: такое назначение не может
+// быть кандидатом на новый запуск и блокирует пересекающихся кандидатов.
 type LaunchAssignment struct {
-	Name  string
-	Files []string
+	Name   string
+	Files  []string
+	Status string
 }
+
+// isInProgress сообщает, занято ли назначение активным агентом.
+func (a LaunchAssignment) isInProgress() bool { return a.Status == "in_progress" }
 
 // IntersectingFiles статически сравнивает границы файлов двух назначений и
 // возвращает первую пересекающуюся пару. Третий результат false, если файлы
@@ -465,6 +471,84 @@ func CheckLaunch(assignments ...LaunchAssignment) error {
 	return nil
 }
 
+// PreflightResult — уже наблюдённое решение PreflightGuard. Сервис сам не читает
+// GitHub и не открывает БД: вызывающий передаёт готовый ответ, полученный на
+// границе. Поля совпадают с github.PreflightDecision, но не создают зависимости
+// app → infra.
+type PreflightResult struct {
+	Allowed bool
+	Reason  string
+}
+
+// AdmissionDecision — единый ответ гейта запуска для автоспавнера. Allowed
+// означает, что все проверки пройдены; при отказе в Reason лежит причина.
+type AdmissionDecision struct {
+	Allowed bool
+	Reason  string
+}
+
+const (
+	// AdmissionAllowed — причина разрешённого запуска.
+	AdmissionAllowed = "запуск допущен"
+	// AdmissionSlotsExhausted — все слоты заняты, свободного нет.
+	AdmissionSlotsExhausted = "slots_exhausted"
+	// AdmissionQuotaExhausted — причина отказа, если PreflightGuard не дал причину.
+	AdmissionQuotaExhausted = "quota_exhausted"
+)
+
+// AdmitLaunch объединяет проверки допуска в один вызов. Порядок проверок:
+// квота PreflightGuard, свободные слоты, пересечение файлов с активными
+// in_progress. Первый отказ завершает решение, поэтому запуск не доходит ни до
+// старта агента, ни до чтения карточек внутри сервиса.
+func (s *Service) AdmitLaunch(preflight PreflightResult, slotsUsed, slotsTotal int, assignments ...LaunchAssignment) AdmissionDecision {
+	if !preflight.Allowed {
+		reason := preflight.Reason
+		if reason == "" {
+			reason = AdmissionQuotaExhausted
+		}
+		return AdmissionDecision{Reason: reason}
+	}
+	if slotsTotal <= 0 || slotsUsed >= slotsTotal {
+		return AdmissionDecision{Reason: AdmissionSlotsExhausted}
+	}
+	if err := checkAdmissionConflicts(assignments); err != nil {
+		return AdmissionDecision{Reason: err.Error()}
+	}
+	return AdmissionDecision{Allowed: true, Reason: AdmissionAllowed}
+}
+
+// checkAdmissionConflicts проверяет назначения перед запуском. Пересечение
+// кандидата с активной in_progress карточкой отменяет запуск с отдельной
+// причиной; пересечение двух кандидатов остаётся проверкой CheckLaunch. Два
+// уже работающих назначения решением гейта не являются и пропускаются.
+func checkAdmissionConflicts(assignments []LaunchAssignment) error {
+	for i := range assignments {
+		for j := i + 1; j < len(assignments); j++ {
+			fa, fb, ok := IntersectingFiles(assignments[i], assignments[j])
+			if !ok {
+				continue
+			}
+			activeI, activeJ := assignments[i].isInProgress(), assignments[j].isInProgress()
+			if activeI && activeJ {
+				continue
+			}
+			if activeI || activeJ {
+				active, candidate := assignments[i], assignments[j]
+				if activeJ {
+					active, candidate = assignments[j], assignments[i]
+				}
+				return Validationf(
+					"запуск отменён: карточка %s пересекается по файлам %s и %s с активной in_progress карточкой %s",
+					candidate.Name, fa, fb, active.Name)
+			}
+			return Validationf(
+				"запуск отменён: назначения %s и %s пересекаются по файлам %s и %s; снимите конфликт до запуска",
+				assignments[i].Name, assignments[j].Name, fa, fb)
+		}
+	}
+	return nil
+}
+
 // PlanLaunch читает карточки и применяет проверку до запуска к их агентам.
 // Карточки в статусе done или dropped освобождают свои файлы. Если владельцы
 // двух активных карточек пересекаются, агенты не стартуют и возвращается
@@ -496,7 +580,7 @@ func (s *Service) PlanLaunch(ids ...string) error {
 		if c.Status == "done" || c.Status == "dropped" {
 			continue
 		}
-		assignments = append(assignments, LaunchAssignment{Name: id, Files: c.OwnerFiles})
+		assignments = append(assignments, LaunchAssignment{Name: id, Files: c.OwnerFiles, Status: c.Status})
 	}
 	return CheckLaunch(assignments...)
 }
