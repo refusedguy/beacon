@@ -25,6 +25,7 @@ var counterLabels = map[string]string{
 	CounterWakeDelivered:    LabelAdapter,
 	CounterWakeErrors:       LabelAdapter,
 	CounterWakeSkipped:      "",
+	CounterWakeDuplicate:    "",
 	CounterRebaseRequests:   "",
 	CounterDependencyWaits:  "",
 	CounterBlocks:           "",
