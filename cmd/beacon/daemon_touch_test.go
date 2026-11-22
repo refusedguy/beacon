@@ -13,7 +13,6 @@ import (
 
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
-	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // heartbeatRecorder stands in for the durable session registry and records
