@@ -63,6 +63,10 @@ const (
 	// outcomeListPrefix marks one outcome ID list. The body is name=id,id,...
 	// with IDs in sorted order so an unchanged snapshot produces equal bytes.
 	outcomeListPrefix = "outcome ids: "
+	// sharedGatePrefix marks the process-wide CI gate snapshot inside
+	// loadErrors. The stats schema is fixed in schema.go, so the gate counts use
+	// the diagnostic channel like the graph and poller signals.
+	sharedGatePrefix = "shared gate: "
 )
 
 // Plan limit levels reported in the stats response. A zero PlanLimitInfo uses
@@ -184,6 +188,23 @@ type GraphIndexReader interface {
 	GraphStatus(ctx context.Context) (domain.GraphStatus, error)
 }
 
+// CIWaitSnapshot is a point-in-time view of the process-wide CI gate. Waiters
+// maps each active key to the number of callers joined on it. CombinedRounds
+// counts the rounds where a second caller joined a key. The shape matches the
+// store snapshot, so an adapter can copy it without importing infra/store.
+type CIWaitSnapshot struct {
+	Waiters        map[string]int
+	CombinedRounds int
+}
+
+// SharedGateSnapshotReader is the optional read-only port for the process-wide
+// CI gate. A handler without one leaves the stats response byte-identical to
+// the form from before FTE-03. A composition root that owns the gate binds an
+// adapter with SetSharedGateSnapshotReader.
+type SharedGateSnapshotReader interface {
+	SharedGateSnapshot() CIWaitSnapshot
+}
+
 // SnapshotRegistryStats adapts the Registry projection already carried by a
 // StateSnapshot (T5.29) to RegistryStatsReader. A wiring layer whose snapshot
 // reader fills Registry can pass this adapter to SetRegistryStatsReader.
@@ -272,6 +293,7 @@ type StatsHandler struct {
 	reader     SnapshotReader
 	registry   RegistryStatsReader
 	graph      GraphIndexReader
+	sharedGate SharedGateSnapshotReader
 	watchLimit *watchLimitLatch
 	// outcomeReport opts into the disjoint outcome report. A handler without
 	// it keeps the exact pre-SB-12 response, so existing callers and tests are
@@ -298,6 +320,13 @@ func (h *StatsHandler) SetRegistryStatsReader(r RegistryStatsReader) {
 // verify is never advertised as current.
 func (h *StatsHandler) SetGraphIndexReader(r GraphIndexReader) {
 	h.graph = r
+}
+
+// SetSharedGateSnapshotReader binds the optional process-wide CI gate port.
+// Passing nil removes the snapshot. A handler with no port emits no gate
+// diagnostic, so older readers see the same loadErrors bytes as before.
+func (h *StatsHandler) SetSharedGateSnapshotReader(r SharedGateSnapshotReader) {
+	h.sharedGate = r
 }
 
 // SetOutcomeReportEnabled opts the handler into the disjoint outcome report.
@@ -616,6 +645,17 @@ func (h *StatsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, _ 
 		loadErrors = append(loadErrors, fmt.Sprintf("%spollerActive=%t pollerPID=%d",
 			pollerStatsPrefix, status.Active, status.PID))
 	}
+	// FTE-03: publish the process-wide CI gate from the optional port. The two
+	// counts ride in loadErrors because StatsOutput is pinned by ADR 0094.
+	if h.sharedGate != nil {
+		gate := h.sharedGate.SharedGateSnapshot()
+		active := 0
+		for _, waiters := range gate.Waiters {
+			active += waiters
+		}
+		loadErrors = append(loadErrors, fmt.Sprintf("%sactiveWaiters=%d combinedRounds=%d",
+			sharedGatePrefix, active, gate.CombinedRounds))
+	}
 
 	var registry RegistryStats
 	if h.registry != nil {
@@ -825,3 +865,59 @@ func pollerStatsEntry(out StatsOutput) string {
 	}
 	return ""
 }
+
+// CIWaitSignal is the typed form of the CI gate diagnostic. Bound is false
+// when no reader was wired, so the two counts carry no meaning in that case.
+type CIWaitSignal struct {
+	Bound          bool
+	ActiveWaiters  int
+	CombinedRounds int
+}
+
+// sharedGateEntry returns the gate diagnostic in a stats response, if any.
+func sharedGateEntry(out StatsOutput) string {
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, sharedGatePrefix) {
+			return entry
+		}
+	}
+	return ""
+}
+
+// ReadCIWaitSignal lifts the gate diagnostic into a typed signal. A missing or
+// malformed entry fails closed with Bound false, so no caller reports gate
+// state that the stats response did not actually carry.
+func ReadCIWaitSignal(out StatsOutput) CIWaitSignal {
+	entry := strings.TrimPrefix(sharedGateEntry(out), sharedGatePrefix)
+	if entry == "" {
+		return CIWaitSignal{}
+	}
+	signal := CIWaitSignal{}
+	for _, field := range strings.Fields(entry) {
+		name, value, ok := strings.Cut(field, "=")
+		if !ok {
+			return CIWaitSignal{}
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil || n < 0 {
+			return CIWaitSignal{}
+		}
+		switch name {
+		case "activeWaiters":
+			signal.ActiveWaiters = n
+		case "combinedRounds":
+			signal.CombinedRounds = n
+		default:
+			return CIWaitSignal{}
+		}
+	}
+	if !strings.Contains(entry, "activeWaiters=") || !strings.Contains(entry, "combinedRounds=") {
+		return CIWaitSignal{}
+	}
+	signal.Bound = true
+	return signal
+}
+
+// CIWaitSignal is the field-like read of the CI gate snapshot on a stats
+// response. Callers use out.CIWaitSignal() instead of parsing loadErrors.
+func (o StatsOutput) CIWaitSignal() CIWaitSignal { return ReadCIWaitSignal(o) }
