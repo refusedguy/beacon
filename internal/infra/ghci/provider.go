@@ -3,6 +3,7 @@ package ghci
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os/exec"
@@ -42,6 +43,12 @@ const (
 // status 1 failures that motivated the pacing.
 type Runner func(ctx context.Context, args ...string) ([]byte, error)
 
+// Classifier reports whether a gh error can disappear on retry. True keeps the
+// existing backoff path. False marks the request as permanent, so Provider
+// reports the error once instead of doubling the wait on a request that cannot
+// change. The seam lives in Config so tests can replace the production rule.
+type Classifier func(err error) bool
+
 // Config tunes Provider. Zero fields get the defaults above, so
 // &ghci.Provider{} and ghci.New(ghci.Config{}) behave the same in production.
 // Jitter adds a bounded random wait to the backoff deadline and is injectable
@@ -57,6 +64,7 @@ type Config struct {
 	Now                  func() time.Time
 	Run                  Runner
 	Jitter               func() time.Duration
+	Classify             Classifier
 }
 
 // prEntry is the per-PR state kept by Provider for the lifetime of the process.
@@ -92,6 +100,7 @@ type Provider struct {
 	now                  func() time.Time
 	run                  Runner
 	jitter               func() time.Duration
+	classify             Classifier
 }
 
 var _ domain.CIProvider = (*Provider)(nil)
@@ -108,6 +117,7 @@ func New(cfg Config) *Provider {
 		now:                  cfg.Now,
 		run:                  cfg.Run,
 		jitter:               cfg.Jitter,
+		classify:             cfg.Classify,
 	}
 }
 
@@ -145,6 +155,9 @@ func (p *Provider) defaults() {
 	}
 	if p.jitter == nil {
 		p.jitter = defaultJitter
+	}
+	if p.classify == nil {
+		p.classify = isRetryableGH
 	}
 }
 
@@ -189,6 +202,67 @@ func IsTransientError(err error) bool {
 		}
 	}
 	return false
+}
+
+// permanentGHPatterns are the gh CLI answers that repeat unchanged: bad
+// credentials, missing scopes, absent repositories and malformed arguments or
+// output. Retrying them only adds calls and a growing wait.
+var permanentGHPatterns = []string{
+	"authentication",
+	"bad credentials",
+	"not authenticated",
+	"401",
+	"403",
+	"404",
+	"422",
+	"could not resolve",
+	"not found",
+	"invalid argument",
+	"unknown flag",
+	"validation failed",
+	"decode",
+}
+
+// isRetryableGH is the production classifier. Transient transport errors and
+// the documented `exit status 1` keep retrying. Everything else that matches a
+// permanent pattern is reported once. Unknown errors keep the old retry path
+// rather than being silently classified as permanent.
+func isRetryableGH(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsTransientError(err) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	for _, pattern := range permanentGHPatterns {
+		if strings.Contains(text, pattern) {
+			return false
+		}
+	}
+	return true
+}
+
+// permanentError marks a classified error so PRState can skip backoff. It
+// keeps the gh error reachable through Unwrap for callers that inspect it.
+type permanentError struct {
+	cause error
+}
+
+func (e *permanentError) Error() string { return e.cause.Error() }
+func (e *permanentError) Unwrap() error { return e.cause }
+
+func isPermanentError(err error) bool {
+	var permanent *permanentError
+	return errors.As(err, &permanent)
+}
+
+// classifyError applies the configured classifier at the gh boundary.
+func (p *Provider) classifyError(err error) error {
+	if err == nil || p.classify == nil || p.classify(err) {
+		return err
+	}
+	return &permanentError{cause: err}
 }
 
 // throttleError is returned while a PR is in backoff. It deliberately reaches
@@ -293,6 +367,13 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 	e.inFlight = false
 	now = p.now()
 	if callErr != nil {
+		// A permanent gh answer will not change on retry. Leave the pacing
+		// state untouched so one bad credential or argument cannot push the
+		// PR into a 60s backoff that hides every later observation.
+		if isPermanentError(callErr) {
+			p.mu.Unlock()
+			return domain.PRState{}, callErr
+		}
 		// TLS handshake timeouts and `gh ...: exit status 1` are transient.
 		// One failure doubles the wait up to the cap; a success clears it.
 		// Jitter is added to the deadline only, so repeated doubling still
@@ -337,7 +418,7 @@ func (p *Provider) fetch(ctx context.Context, repo string, pr int) (domain.PRSta
 	view, err := p.run(ctx, "pr", "view", prArg, "--repo", repo, "--json",
 		"headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision")
 	if err != nil {
-		return domain.PRState{}, fmt.Errorf("gh pr view: %w", err)
+		return domain.PRState{}, p.classifyError(fmt.Errorf("gh pr view: %w", err))
 	}
 	var raw struct {
 		HeadRefOid       string `json:"headRefOid"`
@@ -349,7 +430,7 @@ func (p *Provider) fetch(ctx context.Context, repo string, pr int) (domain.PRSta
 		ReviewDecision   string `json:"reviewDecision"`
 	}
 	if err := json.Unmarshal(view, &raw); err != nil {
-		return domain.PRState{}, fmt.Errorf("gh pr view decode: %w", err)
+		return domain.PRState{}, p.classifyError(fmt.Errorf("gh pr view decode: %w", err))
 	}
 
 	checksOut, err := p.run(ctx, "pr", "checks", prArg, "--repo", repo, "--json",
@@ -363,7 +444,7 @@ func (p *Provider) fetch(ctx context.Context, repo string, pr int) (domain.PRSta
 				MergeStateStatus: raw.MergeStateStatus, ReviewDecision: raw.ReviewDecision,
 			}, nil
 		}
-		return domain.PRState{}, fmt.Errorf("gh pr checks: %w", err)
+		return domain.PRState{}, p.classifyError(fmt.Errorf("gh pr checks: %w", err))
 	}
 	var rows []struct {
 		Name  string `json:"name"`
@@ -371,7 +452,7 @@ func (p *Provider) fetch(ctx context.Context, repo string, pr int) (domain.PRSta
 		Link  string `json:"link"`
 	}
 	if err := json.Unmarshal(checksOut, &rows); err != nil {
-		return domain.PRState{}, fmt.Errorf("gh pr checks decode: %w", err)
+		return domain.PRState{}, p.classifyError(fmt.Errorf("gh pr checks decode: %w", err))
 	}
 
 	checks := make(map[string]domain.Check, len(rows))
