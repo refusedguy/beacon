@@ -35,14 +35,58 @@ func (id ThreadID) Valid() bool { return strings.TrimSpace(string(id)) != "" }
 // String returns the wire form of the ID.
 func (id ThreadID) String() string { return string(id) }
 
+// TokenCategory names one bucket of a child's input context. The five values
+// mirror the /tokens breakdown in aider (aider/commands.py:445-532): the
+// system prompt, the dialog history, the repository map, files the child may
+// edit and files it may only read.
+type TokenCategory string
+
+const (
+	TokenSystem   TokenCategory = "system"
+	TokenHistory  TokenCategory = "history"
+	TokenRepoMap  TokenCategory = "repo-map"
+	TokenEditable TokenCategory = "editable"
+	TokenReadOnly TokenCategory = "read-only"
+
+	// TokenWarnThreshold is the remaining-window size below which a context
+	// is considered tight. aider warns here and suggests /drop or /clear
+	// (aider/commands.py:538-551).
+	TokenWarnThreshold = 1024
+)
+
+// TokenCategories lists the buckets in report order. A context may leave any
+// bucket unset; unset buckets count as zero.
+var TokenCategories = []TokenCategory{
+	TokenSystem, TokenHistory, TokenRepoMap, TokenEditable, TokenReadOnly,
+}
+
+// TokenUsage is the accounted breakdown of one context snapshot. Total is the
+// sum of the per-category counts. Remaining is MaxInput minus Total, clamped
+// at zero. Warning is non-empty exactly when a positive MaxInput leaves fewer
+// than TokenWarnThreshold tokens. Cost values the whole input at the price
+// carried by the snapshot.
+type TokenUsage struct {
+	Counts    map[TokenCategory]int
+	Total     int
+	MaxInput  int
+	Remaining int
+	Cost      float64
+	Warning   string
+}
+
 // ContextSnapshot is the data a parent passes to a spawned child. The map is
 // copied on construction and on read, so a caller cannot change a snapshot
 // after it has been handed to a child. The zero value is an empty snapshot.
 // ranked holds an optional ranked repository map (CA-01). It is immutable for
-// the same reason as values: each snapshot owns its text.
+// the same reason as values: each snapshot owns its text. The token fields
+// carry the per-category accounting (CA-07); they are copied on write in the
+// same way and are never exposed as MCP fields.
 type ContextSnapshot struct {
-	values map[string]string
-	ranked string
+	values       map[string]string
+	ranked       string
+	tokens       map[TokenCategory]int
+	maxInput     int
+	costPerToken float64
 }
 
 // NewContext copies values into a snapshot. A nil map gives an empty snapshot.
@@ -83,9 +127,73 @@ func (c ContextSnapshot) WithRankedMap(text string) ContextSnapshot {
 // empty string means the parent did not attach a map.
 func (c ContextSnapshot) RankedMap() string { return c.ranked }
 
+// WithTokenCount returns a copy of c recording count tokens for category.
+// Negative counts clamp to zero. The receiver is not changed.
+func (c ContextSnapshot) WithTokenCount(category TokenCategory, count int) ContextSnapshot {
+	if count < 0 {
+		count = 0
+	}
+	if c.tokens == nil {
+		c.tokens = make(map[TokenCategory]int, len(TokenCategories))
+	}
+	c.tokens[category] = count
+	return c
+}
+
+// WithMaxInputTokens returns a copy of c carrying the model input window. A
+// non-positive value means the window is unknown. The receiver is not changed.
+func (c ContextSnapshot) WithMaxInputTokens(max int) ContextSnapshot {
+	if max < 0 {
+		max = 0
+	}
+	c.maxInput = max
+	return c
+}
+
+// WithInputCostPerToken returns a copy of c carrying the price used to value
+// the input. A negative price clamps to zero. The receiver is not changed.
+func (c ContextSnapshot) WithInputCostPerToken(price float64) ContextSnapshot {
+	if price < 0 {
+		price = 0
+	}
+	c.costPerToken = price
+	return c
+}
+
+// TokenUsage computes the per-category token breakdown for c. Total is the
+// sum of every category, Remaining is the unused window under max_input_tokens
+// and Warning fires below TokenWarnThreshold. It never mutates c.
+func (c ContextSnapshot) TokenUsage() TokenUsage {
+	u := TokenUsage{Counts: make(map[TokenCategory]int, len(TokenCategories))}
+	for _, category := range TokenCategories {
+		n := c.tokens[category]
+		if n < 0 {
+			n = 0
+		}
+		u.Counts[category] = n
+		u.Total += n
+	}
+	u.MaxInput = c.maxInput
+	if c.maxInput > 0 {
+		u.Remaining = c.maxInput - u.Total
+		if u.Remaining < 0 {
+			u.Remaining = 0
+		}
+		if u.Remaining < TokenWarnThreshold {
+			u.Warning = fmt.Sprintf(
+				"warning: %d tokens remaining (threshold %d); use /drop or /clear",
+				u.Remaining, TokenWarnThreshold,
+			)
+		}
+	}
+	u.Cost = float64(u.Total) * c.costPerToken
+	return u
+}
+
 // merged returns a new snapshot with other's entries written over c's. The
 // ranked map follows the same rule: a non-empty map from other replaces the
-// inherited one, and an empty one leaves the parent's map intact.
+// inherited one, and an empty one leaves the parent's map intact. Token counts
+// merge by category, while the window and price come from other when set.
 func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	out := c.Entries()
 	for k, v := range other.values {
@@ -95,7 +203,25 @@ func (c ContextSnapshot) merged(other ContextSnapshot) ContextSnapshot {
 	if other.ranked != "" {
 		ranked = other.ranked
 	}
-	return ContextSnapshot{values: out, ranked: ranked}
+	tokens := make(map[TokenCategory]int, len(TokenCategories))
+	for _, category := range TokenCategories {
+		tokens[category] = c.tokens[category]
+		if n, ok := other.tokens[category]; ok {
+			tokens[category] = n
+		}
+	}
+	maxInput := c.maxInput
+	if other.maxInput > 0 {
+		maxInput = other.maxInput
+	}
+	cost := c.costPerToken
+	if other.costPerToken > 0 {
+		cost = other.costPerToken
+	}
+	return ContextSnapshot{
+		values: out, ranked: ranked, tokens: tokens,
+		maxInput: maxInput, costPerToken: cost,
+	}
 }
 
 // Thread is one node in a delegation tree. ParentID is empty for a root. A
@@ -847,4 +973,28 @@ func (c Compaction) Apply(current []Message) ([]Message, bool) {
 		return nil, false
 	}
 	return append([]Message(nil), c.result...), true
+}
+
+// TokenBreakdown renders the diagnostic /tokens report for c. It prints every
+// category with its token count and cost, then the total, the input window,
+// the remaining tokens and the warning when the window is tight. It is a pure
+// formatter: a CLI command can print the returned text, and nothing here
+// performs I/O or changes any declared MCP field.
+func TokenBreakdown(c ContextSnapshot) string {
+	u := c.TokenUsage()
+	var b strings.Builder
+	for _, category := range TokenCategories {
+		n := u.Counts[category]
+		fmt.Fprintf(&b, "%s: %d tokens (%.4f)\n", category, n, float64(n)*c.costPerToken)
+	}
+	fmt.Fprintf(&b, "total: %d tokens (%.4f)\n", u.Total, u.Cost)
+	if u.MaxInput > 0 {
+		fmt.Fprintf(&b, "max_input_tokens: %d\n", u.MaxInput)
+		fmt.Fprintf(&b, "remaining: %d tokens\n", u.Remaining)
+	}
+	if u.Warning != "" {
+		b.WriteString(u.Warning)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
