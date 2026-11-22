@@ -71,7 +71,9 @@ func defaultSessionRegistry() *session.SessionRegistry {
 		if err != nil {
 			return
 		}
-		db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+		// Session metadata can carry tokens. Only OpenProduction installs the
+		// redacting driver, so this handle must not fall back to plain Open (SE-03).
+		db, err := store.OpenProduction(filepath.Join(dir, mcpStateDBName))
 		if err == nil {
 			spawnSessionDB = session.NewSessionRegistry(newSessionDBAdapter(db))
 		}
@@ -278,7 +280,9 @@ func acpRunStoreForSpawn() ACPRunStore {
 		if err != nil {
 			return
 		}
-		db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+		// ACP results are JSON with free-form text. OpenProduction redacts
+		// every bound value before it reaches SQLite (SE-03).
+		db, err := store.OpenProduction(filepath.Join(dir, mcpStateDBName))
 		if err == nil {
 			spawnACPRunDB = db
 		}
@@ -433,7 +437,9 @@ func defaultSpawnStats() spawnStatsStore {
 		if err != nil {
 			return
 		}
-		db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+		// runtime_stats stores payload text from the spawned runner. The
+		// redacting driver on OpenProduction keeps tokens out of the file (SE-03).
+		db, err := store.OpenProduction(filepath.Join(dir, mcpStateDBName))
 		if err == nil {
 			spawnStatsDB = db
 		}
