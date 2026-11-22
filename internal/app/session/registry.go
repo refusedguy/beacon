@@ -254,3 +254,29 @@ func WithCompactionCutoff(metadata map[string]string, index int) map[string]stri
 	out[MetadataCompactionCutoff] = strconv.Itoa(index)
 	return out
 }
+
+// MetadataJournalPath is the metadata key that records the file path of the
+// journal a session writes. Resume appends to that file so one session keeps a
+// single journal across restarts.
+const MetadataJournalPath = "ai.beacon/journalPath"
+
+// JournalPath reads the recorded journal file path. A missing or blank value
+// reports false, so the caller can report a session that has no journal yet.
+func JournalPath(metadata map[string]string) (string, bool) {
+	path, ok := metadata[MetadataJournalPath]
+	if !ok || strings.TrimSpace(path) == "" {
+		return "", false
+	}
+	return path, true
+}
+
+// WithJournalPath returns a copy of metadata with path recorded as the journal
+// file path. The input map stays owned by the caller.
+func WithJournalPath(metadata map[string]string, path string) map[string]string {
+	out := make(map[string]string, len(metadata)+1)
+	for k, v := range metadata {
+		out[k] = v
+	}
+	out[MetadataJournalPath] = path
+	return out
+}
