@@ -1,6 +1,6 @@
 # ADR 312: Полная проверка MergePolicy в cibridge до авто-мержа
 
-Статус: default
+Статус: proposed
 
 ## Контекст
 
