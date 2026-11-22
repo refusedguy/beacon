@@ -3,6 +3,9 @@ package gate
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -249,4 +252,73 @@ func jaccard(a, b map[string]bool) float64 {
 // value, a schema object or true all leave the input schema open.
 func additionalPropertiesFalse(raw json.RawMessage) bool {
 	return strings.TrimSpace(string(raw)) == "false"
+}
+
+// DefaultToolsListSnapshot is the saved response the CLI checks when the
+// caller does not pass -tools-list. The file lives in the tree so a CI runner
+// can check the same bytes on every run.
+const DefaultToolsListSnapshot = "tools/beacon-gates/gate/testdata/tools-list.json"
+
+// readToolsListSnapshot reads a saved response through io/fs. The gates
+// capabilities rule forbids direct os.ReadFile calls in this layer, so this
+// follows the os.DirFS plus fs.ReadFile pattern used by the wiring gate.
+func readToolsListSnapshot(path string) ([]byte, error) {
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	return fs.ReadFile(os.DirFS(dir), name)
+}
+
+// RunToolContract is the CLI entry for the offline tool-contract gate. It
+// reads a saved tools/list response, checks it with CheckToolContract and
+// returns the shared Green or Red verdict. The path comes from -tools-list
+// so CI and local runs can check different snapshots with one binary.
+func RunToolContract(args []string) int {
+	path := DefaultToolsListSnapshot
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-tools-list" || a == "--tools-list":
+			if i+1 >= len(args) {
+				return Brokenf("missing value for %s", a)
+			}
+			i++
+			path = args[i]
+		case strings.HasPrefix(a, "-tools-list=") || strings.HasPrefix(a, "--tools-list="):
+			path = strings.SplitN(a, "=", 2)[1]
+		default:
+			return Brokenf("unknown flag %q", a)
+		}
+	}
+	data, err := readToolsListSnapshot(path)
+	if err != nil {
+		return Brokenf("read tools/list snapshot %s: %v", path, err)
+	}
+	res := CheckToolContract(data)
+	fmt.Println(res.Report())
+	return Finish(res.Findings, 0)
+}
+
+// ToolContractSelfTestRun proves the checker is not vacuous. A valid saved
+// response stays green. A planted response with a bad name, a short
+// description and an open schema reports every rule the gate promises.
+func ToolContractSelfTestRun() int {
+	good := []byte(`{"tools":[{"name":"beacon_stats","description":"Read the running watch statistics and the current budget.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}]}`)
+	res := CheckToolContract(good)
+	if len(res.Findings) != 0 {
+		fmt.Printf("self-test FAILED: valid tools/list produced findings: %v\n", res.Findings)
+		return Red
+	}
+
+	bad := []byte(`{"tools":[{"name":"bad name","description":"Short.","inputSchema":{"type":"object","properties":{},"additionalProperties":true}}]}`)
+	res = CheckToolContract(bad)
+	for _, rule := range []string{ToolNameFormatRule, ToolDescShortRule, ToolAdditionalPropsRule} {
+		if !HasRule(res.Findings, rule) {
+			fmt.Printf("self-test FAILED: rule %s not reported: %v\n", rule, res.Findings)
+			return Red
+		}
+	}
+	fmt.Println("self-test passed: valid tools/list green, planted defects caught")
+	return Green
 }

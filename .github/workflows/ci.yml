@@ -226,6 +226,14 @@ jobs:
             "$bin" "$gate" --self-test
           done
 
+      # BCX-51. Гейт tool-contract проверяет описания tools/list офлайн.
+      - name: Self-test tool-contract gate
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run . tool-contract --self-test
+
       - name: Run gates on tree
         shell: bash
         run: |
