@@ -1050,3 +1050,21 @@ wait_result: unchanged, code-143
 informational: not-main-blocker
 source: SB-14, sweagent/tools.py:139-152, agents.py:958-991
 executor-task:action-budgets -->
+
+## Временные артефакты и очистка
+
+Снимки, записи, логи и токены живут вне репозитория. Исполнитель не коммитит временные артефакты. Секрет не попадает в diff, тело PR или текст комментария. Токен не передаётся дочернему агенту. Если узкая недостающая возможность требует токен, координатор использует его сам и не показывает значение воркеру.
+
+Очистка вызывается в конце каждого прогона. Исполнитель знает, что очистка в конце каждого прогона обязательна и при досрочном выходе. Временные снимки, записи и логи удаляются по политике хранения. Артефакты живут только столько, сколько разрешает политика. Очистка control adapter выполняется всегда.
+
+Правило не меняет протокол Watch, число MCP-инструментов и текст отчёта. Источник: карточка CP-21, `pstack/automations/benny/FOR_AGENTS.md:34`, `pstack/automations/benny/skills/reproduce-and-fix-issues/SKILL.md:30`, `:122`, `:310`.
+
+<!-- executor-task:artifacts-cleanup
+location: outside-repository
+no-commit: captures, recordings, logs, tokens
+token: narrow-missing-capability-only, not-shown-to-worker, not-passed-to-child
+cleanup: every-run, end-of-run, control-adapter, early-exit
+retention: policy-limited
+protocol-change: none
+source: CP-21, benny FOR_AGENTS.md:34, reproduce-and-fix-issues/SKILL.md:30,122,310
+executor-task:artifacts-cleanup -->
