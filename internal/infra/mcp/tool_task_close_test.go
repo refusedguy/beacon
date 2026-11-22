@@ -511,3 +511,149 @@ func TestFileTaskCloseRespectsCancelledContext(t *testing.T) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
 }
+
+func TestFileTaskCloseRepeatConflictsOnChangedAgentID(t *testing.T) {
+	store, dir := taskCloseTestStore(t)
+	path := writeTaskCloseTestCard(t, dir, "IDX-05", "todo", "нет")
+	first := TaskCloseInput{CardID: "IDX-05", Status: "done", Reason: "fixed", AgentID: "ses_worker"}
+	if _, err := store.Close(context.Background(), first, taskCloseFixedAt); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+
+	replays := []TaskCloseInput{
+		{CardID: "IDX-05", Status: "done", Reason: "fixed", AgentID: "ses_other"},
+		{CardID: "IDX-05", Status: "done", Reason: "fixed"},
+	}
+	for _, replay := range replays {
+		_, err := store.Close(context.Background(), replay, taskCloseFixedAt)
+		appErr := taskCloseAppError(t, err)
+		if appErr.Code != domain.CodeRejectDuplicate || appErr.Status != 409 {
+			t.Fatalf("code/status = %s/%d, want REJECT_DUPLICATE/409", appErr.Code, appErr.Status)
+		}
+	}
+
+	text := readTaskCloseCard(t, path)
+	assertCardHas(t, text, "Закрыл: ses_worker")
+	if strings.Contains(text, "ses_other") {
+		t.Fatalf("foreign closer was written:\n%s", text)
+	}
+}
+
+func TestFileTaskCloseRepeatConflictsOnChangedDuplicateOf(t *testing.T) {
+	store, dir := taskCloseTestStore(t)
+	path := writeTaskCloseTestCard(t, dir, "IDX-05", "todo", "нет")
+	writeTaskCloseTestCard(t, dir, "IDX-98", "todo", "нет")
+	writeTaskCloseTestCard(t, dir, "IDX-99", "todo", "нет")
+
+	first := TaskCloseInput{
+		CardID: "IDX-05", Status: "duplicate", Reason: "same bug",
+		DuplicateOf: "IDX-99", AgentID: "ses_worker",
+	}
+	if _, err := store.Close(context.Background(), first, taskCloseFixedAt); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+
+	replay := first
+	replay.DuplicateOf = "IDX-98"
+	_, err := store.Close(context.Background(), replay, taskCloseFixedAt)
+	appErr := taskCloseAppError(t, err)
+	if appErr.Code != domain.CodeRejectDuplicate || appErr.Status != 409 {
+		t.Fatalf("code/status = %s/%d, want REJECT_DUPLICATE/409", appErr.Code, appErr.Status)
+	}
+
+	text := readTaskCloseCard(t, path)
+	assertCardHas(t, text, "Дубликат: IDX-99")
+	if strings.Contains(text, "IDX-98") {
+		t.Fatalf("conflicting duplicate target was written:\n%s", text)
+	}
+}
+
+func TestFileTaskCloseRepeatWithDuplicateFieldsIsIdempotent(t *testing.T) {
+	store, dir := taskCloseTestStore(t)
+	path := writeTaskCloseTestCard(t, dir, "IDX-05", "todo", "нет")
+	writeTaskCloseTestCard(t, dir, "IDX-99", "todo", "нет")
+	in := TaskCloseInput{
+		CardID: "IDX-05", Status: "duplicate", Reason: "same bug",
+		DuplicateOf: "IDX-99", AgentID: "ses_worker",
+	}
+
+	for i := 1; i <= 2; i++ {
+		out, err := store.Close(context.Background(), in, taskCloseFixedAt)
+		if err != nil {
+			t.Fatalf("close %d: %v", i, err)
+		}
+		if !out.OK || out.Status != "duplicate" {
+			t.Fatalf("close %d output = %+v", i, out)
+		}
+	}
+
+	text := readTaskCloseCard(t, path)
+	for _, want := range []string{
+		"Статус: duplicate",
+		"Причина: same bug",
+		"Дубликат: IDX-99",
+		"Закрыл: ses_worker",
+		"Время закрытия: " + taskCloseFixedAt,
+	} {
+		if n := strings.Count(text, want); n != 1 {
+			t.Errorf("%q written %d times, want 1:\n%s", want, n, text)
+		}
+	}
+}
+
+func TestFileTaskCloseRepeatAfterPartialWriteCompletesCard(t *testing.T) {
+	store, dir := taskCloseTestStore(t)
+	path := filepath.Join(dir, "IDX-05.md")
+	partial := "# IDX-05. Test card\nСтатус: done\nПричина: fixed\nТип: task\n## Details\nbody line\n"
+	if err := os.WriteFile(path, []byte(partial), 0644); err != nil {
+		t.Fatalf("write partial card: %v", err)
+	}
+
+	in := TaskCloseInput{CardID: "IDX-05", Status: "done", Reason: "fixed", AgentID: "ses_worker"}
+	out, err := store.Close(context.Background(), in, taskCloseFixedAt)
+	if err != nil {
+		t.Fatalf("replay after partial write: %v", err)
+	}
+	if !out.OK {
+		t.Fatal("ok = false after a partial write")
+	}
+
+	text := readTaskCloseCard(t, path)
+	assertCardHas(t, text,
+		"Статус: done", "Причина: fixed", "Закрыл: ses_worker",
+		"Время закрытия: "+taskCloseFixedAt, "body line")
+	if n := strings.Count(text, "Причина: fixed"); n != 1 {
+		t.Fatalf("Причина written %d times after fill:\n%s", n, text)
+	}
+
+	// A later replay must not move the close time that was just filled in.
+	if _, err := store.Close(context.Background(), in, "2027-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("second replay: %v", err)
+	}
+	text = readTaskCloseCard(t, path)
+	assertCardHas(t, text, "Время закрытия: "+taskCloseFixedAt)
+	if strings.Contains(text, "2027-01-01") {
+		t.Fatalf("close time moved on replay:\n%s", text)
+	}
+}
+
+func TestFileTaskClosePartialWriteStillConflictsOnChangedReason(t *testing.T) {
+	store, dir := taskCloseTestStore(t)
+	path := filepath.Join(dir, "IDX-05.md")
+	partial := "# IDX-05. Test card\nСтатус: done\nПричина: first\nТип: task\n"
+	if err := os.WriteFile(path, []byte(partial), 0644); err != nil {
+		t.Fatalf("write partial card: %v", err)
+	}
+
+	_, err := store.Close(context.Background(), TaskCloseInput{
+		CardID: "IDX-05", Status: "done", Reason: "second", AgentID: "ses_worker",
+	}, taskCloseFixedAt)
+	appErr := taskCloseAppError(t, err)
+	if appErr.Code != domain.CodeRejectDuplicate || appErr.Status != 409 {
+		t.Fatalf("code/status = %s/%d, want REJECT_DUPLICATE/409", appErr.Code, appErr.Status)
+	}
+	assertCardHas(t, readTaskCloseCard(t, path), "Причина: first")
+	if strings.Contains(readTaskCloseCard(t, path), "second") {
+		t.Fatalf("conflicting reason was written to a partial card")
+	}
+}
