@@ -4,7 +4,7 @@
 // thing in the same tree the local gate can see:
 //
 //   - docs/tasks/WIRING-<PR>.md, a card with "Статус: todo", a non-empty
-//     "OwnerFiles" field and a "## Причина" section.
+//     owner field ("OwnerFiles" or "Владелец файлов") and a "## Причина" section.
 //
 // The card is the whole contract. beacon_defer_wiring adds it to the PR and
 // records the deferral in the durable store, so the gate reads no marker file.
@@ -20,6 +20,11 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// ownerFieldFallback is the field name beacon_defer_wiring writes into the
+// cards it creates. CheckWiring prefers the configured field and falls back
+// to this one, so tool cards and template cards pass the same gate.
+const ownerFieldFallback = "Владелец файлов"
 
 // WiringConfig is the wiring section of config/baseline.json. It is embedded
 // into the committed binary, so changing it requires a binary rebuild.
@@ -111,6 +116,16 @@ func CheckWiring(root string, cfg WiringConfig) ([]Finding, error) {
 			})
 		}
 		v, line = FieldValue(c.lines, cfg.OwnerField)
+		if v == "" {
+			// beacon_defer_wiring writes the human-readable name instead of
+			// the configured one. Accept it when the configured field is
+			// absent or empty; the template writes both, so it is fine too.
+			// Using the fallback's line also keeps an empty-fields finding
+			// pointed at the field that is actually present.
+			if alt, altLine := FieldValue(c.lines, ownerFieldFallback); altLine != 0 {
+				v, line = alt, altLine
+			}
+		}
 		if line == 0 {
 			line = 1
 		}
@@ -183,6 +198,8 @@ func WiringSelfTestRun() int {
 
 	goodCard := "# WIRING-777. Valid card\nСтатус: todo\nOwnerFiles: docs/a.go\n" +
 		"## Причина\n deferred wiring\n"
+	toolCard := "# WIRING-999. Tool card\nСтатус: todo\nВладелец файлов: docs/b.go\n" +
+		"## Причина\n deferred wiring\n"
 	badCard := "# WIRING-888. Bad\nСтатус: done\nOwnerFiles: \n"
 
 	hasAllDefects := func(fs []Finding) bool {
@@ -196,6 +213,11 @@ func WiringSelfTestRun() int {
 	// Positive control: a complete card and no marker is green.
 	ok = check(map[string]string{
 		"docs/tasks/WIRING-777.md": goodCard,
+	}, func(fs []Finding) bool { return len(fs) == 0 }) && ok
+
+	// A card from beacon_defer_wiring uses the Russian owner field name.
+	ok = check(map[string]string{
+		"docs/tasks/WIRING-999.md": toolCard,
 	}, func(fs []Finding) bool { return len(fs) == 0 }) && ok
 
 	// Planted defects: wrong status, empty OwnerFiles, missing reason section.
@@ -221,9 +243,9 @@ func WiringSelfTestRun() int {
 	}, hasAllDefects) && ok
 
 	if !ok {
-		fmt.Println("self-test FAILED: 5 fixtures")
+		fmt.Println("self-test FAILED: 6 fixtures")
 		return Red
 	}
-	fmt.Println("self-test passed: 5 fixtures")
+	fmt.Println("self-test passed: 6 fixtures")
 	return Green
 }
