@@ -770,16 +770,17 @@ func deferredCallFromRequest(req *mcpsdk.CallToolRequest) domain.DeferredToolUse
 	}
 }
 
-// Handle adapts Ack to the go-sdk typed tool handler signature and returns the
-// shared ok-only response. The response carries no verdict: a caller still has
-// to call beacon_get_result or beacon_wait_result to read one (ADR 0028). A
-// stale-revision event (ADR 0036 §5) is discarded with ok:false and no error;
-// the fixed revision itself is available from AckReceipt. The ok-only shape is
-// unchanged for ordinary acks and for acks that carry a decision: the decision
-// receipt, including whether the agent resumed, is available from Decide or
-// AckReceipt. A blocked:not_mine decision takes the session ID from req's _meta
-// and names it as the blocker in the block record. A blocked:resolved decision
-// needs no session: it clears the block on the Watch named by the ack.
+// Handle adapts Ack to the go-sdk typed tool handler signature and returns an
+// ok response. A plain ack keeps the byte-identical {"ok":true} shape because
+// the decision fields have omitempty. A decision ack also carries resumed,
+// resumeRevision, blocked and unblocked from AckReceipt, so the caller sees
+// which effect the first application had. The response carries no verdict: a
+// caller still has to call beacon_get_result or beacon_wait_result to read one
+// (ADR 0028). A stale-revision event (ADR 0036 §5) is discarded with ok:false
+// and no error; the fixed revision itself is available from AckReceipt. A
+// blocked:not_mine decision takes the session ID from req's _meta and names it
+// as the blocker in the block record. A blocked:resolved decision needs no
+// session: it clears the block on the Watch named by the ack.
 //
 // The raw request may also carry setPermissionMode and permissionUpdates. Those
 // are control-channel fields (CS-02): they switch the calling session's mode and
@@ -804,7 +805,13 @@ func (h *AckHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in
 	if err != nil && !IsStaleRevision(err) {
 		return nil, OKOutput{}, err
 	}
-	return nil, OKOutput{OK: receipt.OK}, nil
+	return nil, OKOutput{
+		OK:             receipt.OK,
+		Resumed:        receipt.Resumed,
+		ResumeRevision: receipt.ResumeRevision,
+		Blocked:        receipt.Blocked,
+		Unblocked:      receipt.Unblocked,
+	}, nil
 }
 
 // Ack validates that the obligation belongs to the Watch, then stamps
