@@ -11,6 +11,7 @@ package event
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -24,6 +25,40 @@ type Envelope struct {
 	Type          string `json:"type"`
 	SchemaVersion int    `json:"schema_version"`
 	Payload       []byte `json:"payload"`
+}
+
+// Hook lifecycle envelope constants. They mirror the SDK's HookEventMessage:
+// a system message with subtype hook_started or hook_response and a
+// hook_event_name identifying the hook.
+const (
+	// EventTypeHook is the Envelope.Type used for mirrored hook phases.
+	EventTypeHook = "hook"
+	// HookEventScope is the Envelope.Scope used for mirrored hook phases.
+	HookEventScope = "hooks"
+	// HookEventSchemaVersion is the payload schema version for hook events.
+	HookEventSchemaVersion = 1
+
+	// HookPhaseStarted is emitted before a hook callback runs.
+	HookPhaseStarted = "hook_started"
+	// HookPhaseResponse is emitted after a hook callback returns.
+	HookPhaseResponse = "hook_response"
+)
+
+// HookPayload is the JSON payload of a hook Envelope. hook_event_name and
+// Phase let an observer order the two phases without reading logs; Outcome
+// and Error describe a completed call.
+type HookPayload struct {
+	HookEventName string `json:"hook_event_name"`
+	Phase         string `json:"phase"`
+	Outcome       string `json:"outcome,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// HookEventConfig controls mirroring of hook lifecycle phases into the event
+// stream. IncludeHookEvents is false by default, so an existing stream is
+// unchanged until a caller opts in.
+type HookEventConfig struct {
+	IncludeHookEvents bool `json:"include_hook_events"`
 }
 
 // Journal is the minimal persistence port the bus needs. BS.11 supplies the
@@ -73,6 +108,8 @@ var (
 type Bus struct {
 	journal Journal
 
+	hookEvents HookEventConfig
+
 	commitMu sync.Mutex // serializes assignSeqs so seq values stay monotonic
 
 	mu         sync.Mutex
@@ -92,6 +129,21 @@ type subscription struct {
 // values from a local counter.
 func NewBus(journal Journal) *Bus {
 	return &Bus{journal: journal}
+}
+
+// SetIncludeHookEvents enables or disables hook phase mirroring on the bus.
+// The option is off by default; callers opt in before running hooks.
+func (b *Bus) SetIncludeHookEvents(enabled bool) {
+	b.mu.Lock()
+	b.hookEvents.IncludeHookEvents = enabled
+	b.mu.Unlock()
+}
+
+// includeHookEvents reports whether hook phases should be mirrored.
+func (b *Bus) includeHookEvents() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.hookEvents.IncludeHookEvents
 }
 
 // Subscribe registers a subscriber and returns a function that removes it.
@@ -180,6 +232,50 @@ func (tx *Tx) Emit(env Envelope) error {
 	}
 	tx.staged = append(tx.staged, env)
 	return nil
+}
+
+// MirrorHook runs fn and, when hook mirroring is enabled on the bus, stages a
+// hook_started envelope before the call and a hook_response envelope after it.
+// Both envelopes use EventTypeHook and carry a HookPayload. Mirroring is
+// best-effort: a staging failure never changes the callback error. With the
+// option off the call is a plain fn() and the stream is unchanged.
+func (tx *Tx) MirrorHook(hookEventName string, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if tx == nil || !tx.bus.includeHookEvents() {
+		return fn()
+	}
+
+	started, _ := json.Marshal(HookPayload{
+		HookEventName: hookEventName,
+		Phase:         HookPhaseStarted,
+	})
+	_ = tx.Emit(Envelope{
+		Scope:         HookEventScope,
+		Type:          EventTypeHook,
+		SchemaVersion: HookEventSchemaVersion,
+		Payload:       started,
+	})
+
+	err := fn()
+	response := HookPayload{
+		HookEventName: hookEventName,
+		Phase:         HookPhaseResponse,
+		Outcome:       "success",
+	}
+	if err != nil {
+		response.Outcome = "error"
+		response.Error = err.Error()
+	}
+	payload, _ := json.Marshal(response)
+	_ = tx.Emit(Envelope{
+		Scope:         HookEventScope,
+		Type:          EventTypeHook,
+		SchemaVersion: HookEventSchemaVersion,
+		Payload:       payload,
+	})
+	return err
 }
 
 // Savepoint returns a marker for the current end of the staged batch. Pass it
