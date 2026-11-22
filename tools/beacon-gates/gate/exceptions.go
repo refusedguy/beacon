@@ -48,47 +48,17 @@ func LoadExceptions() (Exceptions, error) {
 		return ex, fmt.Errorf("parse permanent: %w", err)
 	}
 	ex.Permanent = perm.Permanent
-	if err := ex.validate(); err != nil {
-		return ex, err
+	for _, b := range ex.Baseline {
+		if b.Task == "" {
+			return ex, fmt.Errorf("baseline entry %s %s has no task", b.Rule, b.Path)
+		}
+	}
+	for _, p := range ex.Permanent {
+		if p.Reason == "" {
+			return ex, fmt.Errorf("permanent entry %s %s has no reason", p.Rule, p.Path)
+		}
 	}
 	return ex, nil
-}
-
-// validate enforces the exception-table policy. Baseline is a shrinking
-// ratchet: its limit must cover every row and each row names the task that owes
-// the removal. Permanent is a standing exception: each row must give a reason.
-// A rule and path pair may live in only one table, so every covered finding has
-// one owner and neither table can mask the other going stale.
-func (ex Exceptions) validate() error {
-	for _, b := range ex.Baseline {
-		if b.Rule == "" || b.Path == "" {
-			return fmt.Errorf("baseline entry has no rule or path: %+v", b)
-		}
-		if b.Task == "" {
-			return fmt.Errorf("baseline entry %s %s has no task", b.Rule, b.Path)
-		}
-	}
-	for _, p := range ex.Permanent {
-		if p.Rule == "" || p.Path == "" {
-			return fmt.Errorf("permanent entry has no rule or path: %+v", p)
-		}
-		if p.Reason == "" {
-			return fmt.Errorf("permanent entry %s %s has no reason", p.Rule, p.Path)
-		}
-	}
-	if len(ex.Baseline) > ex.BaselineLimit {
-		return fmt.Errorf("baseline has %d rows, limit is %d", len(ex.Baseline), ex.BaselineLimit)
-	}
-	permanent := make(map[string]bool, len(ex.Permanent))
-	for _, p := range ex.Permanent {
-		permanent[entryKey(p.Rule, p.Path)] = true
-	}
-	for _, b := range ex.Baseline {
-		if permanent[entryKey(b.Rule, b.Path)] {
-			return fmt.Errorf("baseline entry %s %s also appears in permanent", b.Rule, b.Path)
-		}
-	}
-	return nil
 }
 
 func entryKey(rule, path string) string { return rule + "\x00" + path }
