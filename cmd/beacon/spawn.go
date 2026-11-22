@@ -142,6 +142,97 @@ func spawnPrompt(taskID, title string) string {
 	return fmt.Sprintf("Выполни задачу Beacon %s", taskID)
 }
 
+// AgentDefinition is the single typed description of a subagent handed to the
+// runtime when a session is initialized. Role, model, tool set and step budget
+// live in one structure, so two parallel workers built from the same
+// definition are told apart only by their agent_id. The definition travels in
+// session metadata, the initialization channel used by CreateSession, and
+// never in a command argument. The agent_id is assigned from the card id at
+// spawn time, so attribution does not depend on the order tool events arrive
+// (CS-03).
+type AgentDefinition struct {
+	AgentID   string   `json:"agent_id"`
+	Role      string   `json:"role"`
+	Model     string   `json:"model,omitempty"`
+	Tools     []string `json:"tools,omitempty"`
+	StepLimit int      `json:"step_limit,omitempty"`
+}
+
+const (
+	// agentDefinitionMetaKey carries the serialized AgentDefinition in the
+	// session metadata passed to CreateSession.
+	agentDefinitionMetaKey = "ai.beacon/agent.definition"
+	// agentIDMetaKey carries the opaque agent_id on every spawned session so
+	// tool events and step messages can attribute parallel workers.
+	agentIDMetaKey = "ai.beacon/agent_id"
+	// defaultAgentModel is used when a definition does not pin a model.
+	defaultAgentModel = "inherit"
+)
+
+// agentIDForCard derives a stable, opaque agent id from a card id. Two cards
+// always produce different ids and a repeat of the same card reuses its id, so
+// parallel agents stay distinguishable regardless of message order.
+func agentIDForCard(cardID string) string {
+	return "agent:" + strings.TrimSpace(cardID)
+}
+
+// newAgentDefinition builds one definition with defaults filled in. Callers
+// set the optional model, tools and step budget on the returned value.
+func newAgentDefinition(agentID, role string) AgentDefinition {
+	return AgentDefinition{AgentID: agentID, Role: role, Model: defaultAgentModel}
+}
+
+// agentDefinitions is the process-local registry of named definitions. The
+// composition root adds entries through RegisterAgentDefinition; an unknown
+// --agent keeps the legacy metadata shape and attaches no definition.
+var agentDefinitions = struct {
+	sync.RWMutex
+	defs map[string]AgentDefinition
+}{defs: make(map[string]AgentDefinition)}
+
+// RegisterAgentDefinition adds or replaces one named definition. It is the
+// only writer of the registry, so two callers cannot race to define a role.
+func RegisterAgentDefinition(def AgentDefinition) {
+	role := strings.TrimSpace(def.Role)
+	if role == "" {
+		return
+	}
+	agentDefinitions.Lock()
+	agentDefinitions.defs[role] = def
+	agentDefinitions.Unlock()
+}
+
+// resolveAgentDefinition returns the registered definition for a role, or nil.
+func resolveAgentDefinition(role string) *AgentDefinition {
+	agentDefinitions.RLock()
+	def, ok := agentDefinitions.defs[strings.TrimSpace(role)]
+	agentDefinitions.RUnlock()
+	if !ok {
+		return nil
+	}
+	return &def
+}
+
+// attachAgentDefinition writes a definition into session metadata, the
+// initialization channel used by CreateSession. Both the serialized structure
+// and the agent_id are added, so a consumer never parses tool arguments to
+// learn which parallel worker produced an event.
+func attachAgentDefinition(metadata map[string]string, def *AgentDefinition) map[string]string {
+	if def == nil {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	payload, err := json.Marshal(def)
+	if err != nil {
+		return metadata
+	}
+	metadata[agentDefinitionMetaKey] = string(payload)
+	metadata[agentIDMetaKey] = def.AgentID
+	return metadata
+}
+
 // verbatimPromptMeta marks a spawned session's first prompt as client-composed
 // when --verbatim is set. The marker goes through the session metadata port,
 // not the prompt text. A card title with @/etc/passwd stays the literal string
@@ -226,6 +317,9 @@ func (c *CLI) runSpawnWithParent(args []string, parentID string) int {
 		metadata[spawnMetaTitle] = sessionTitle
 	}
 	metadata = verbatimPromptMeta(metadata, p.bools["verbatim"])
+	// A registered definition travels through the initialization channel, not
+	// the command line. An unknown --agent keeps the legacy metadata shape.
+	metadata = attachAgentDefinition(metadata, resolveAgentDefinition(agentID))
 
 	sessionID, err := spawner.CreateSession(parentID, agentID, sessionTitle, metadata)
 	if err != nil {
@@ -457,6 +551,7 @@ type acpSessionStats struct {
 	TaskID    string            `json:"taskId"`
 	SessionID string            `json:"sessionId"`
 	Runner    string            `json:"runner"`
+	AgentID   string            `json:"agent_id,omitempty"`
 	Title     string            `json:"title,omitempty"`
 	Updates   []json.RawMessage `json:"updates"`
 }
@@ -496,7 +591,7 @@ func streamACPSession(ctx context.Context, rt wake.WorkerRuntime, sessionID, tas
 	if statsSink == nil {
 		statsSink = defaultSpawnStats()
 	}
-	stats := &acpSessionStats{TaskID: taskID, SessionID: sessionID, Runner: runner, Title: title}
+	stats := &acpSessionStats{TaskID: taskID, SessionID: sessionID, Runner: runner, AgentID: agentIDForCard(taskID), Title: title}
 	snapshot := func() json.RawMessage {
 		payload, err := json.Marshal(stats)
 		if err != nil {
@@ -518,7 +613,8 @@ func streamACPSession(ctx context.Context, rt wake.WorkerRuntime, sessionID, tas
 			if eventSink != nil {
 				event, err := json.Marshal(map[string]any{
 					"taskId": taskID, "sessionId": update.SessionID,
-					"runner": runner, "update": update.Update,
+					"agent_id": stats.AgentID,
+					"runner":   runner, "update": update.Update,
 				})
 				if err == nil {
 					eventSink.Publish(httpapi.Event{

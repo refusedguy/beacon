@@ -2182,7 +2182,13 @@ func autoSpawnStartSession(ctx context.Context, cfg reconcileConfig, cardID, tit
 	if title != "" {
 		metadata[spawnMetaTitle] = title
 	}
-	sessionID, err := spawner.CreateSession(parentID, "", title, metadata)
+	// The agent_id is derived from the card id, so a parallel worker is
+	// attributed without relying on the order in which tool events arrive. The
+	// definition goes through the initialization channel, not a CLI argument.
+	agentID := agentIDForCard(cardID)
+	def := newAgentDefinition(agentID, "executor")
+	metadata = attachAgentDefinition(metadata, &def)
+	sessionID, err := spawner.CreateSession(parentID, agentID, title, metadata)
 	if err != nil || strings.TrimSpace(sessionID) == "" {
 		if err == nil {
 			err = errors.New("auto-spawn: empty session id")
