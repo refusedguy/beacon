@@ -5,6 +5,7 @@
 package testsystem
 
 import (
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -228,5 +229,26 @@ func TestRegistryAndLibrary(t *testing.T) {
 	zero.Add(s)
 	if r, ok := zero.Get(s.Name); !ok || Run(r).Fingerprint() != got.Fingerprint() {
 		t.Fatal("zero-value registry did not accept a scenario")
+	}
+}
+
+// TestSeededRegressionArtery runs the three passes from
+// tests/scenarios/seeded.yaml through the fault controller. The outcomes are
+// read from the traces Runner emitted, so a grep over the spec cannot replace
+// this test. The -v flag puts all four outcomes into the CI job log.
+func TestSeededRegressionArtery(t *testing.T) {
+	const path = "../../tests/scenarios/seeded.yaml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read artery spec %s: %v", path, err)
+	}
+	spec, err := ParseArterySpec(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := RunArtery(spec)
+	t.Logf("%s", result.String())
+	if err != nil {
+		t.Fatal(err)
 	}
 }

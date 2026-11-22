@@ -2,11 +2,13 @@
 // tests. It drives stub executors over a fixed command sequence and returns a
 // fully deterministic event trace.
 //
-// The harness performs no external I/O. It never opens a network connection,
-// starts a process, reads the clock, the environment or the filesystem. Every
-// value in a Result comes from the Scenario (name, seed and steps) alone. That
-// makes a trace safe to record as a golden fingerprint and to replay inside an
-// eval: the same seed always yields the same events, on any Go version.
+// Runner performs no external I/O. It never opens a network connection, starts
+// a process, reads the clock or the environment. Every value in a Result comes
+// from the Scenario (name, seed and steps) alone. That makes a trace safe to
+// record as a golden fingerprint and to replay inside an eval: the same seed
+// always yields the same events, on any Go version. Parsing an artery spec is
+// pure too: ParseArterySpec takes the spec bytes from its caller and reads no
+// file, so the package as a whole stays free of the FILE capability.
 //
 // A typical eval imports the package, pulls a ready scenario from NewLibrary
 // and asserts on the fingerprint:
@@ -29,6 +31,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Command is one step of a Scenario. Kind names the stub action (for example
@@ -299,4 +303,273 @@ func encodeFields(fields map[string]string) string {
 		b.WriteString(fields[k])
 	}
 	return b.String()
+}
+
+// --- Seeded regression artery (BCX-54, ADR 0214) ---
+
+// SeedIDs is the seed list of one artery run. The YAML spelling "none" means
+// an empty list: a healthy pass injects no faults.
+type SeedIDs []string
+
+// UnmarshalYAML accepts both a list of seed ids and the scalar "none".
+func (s *SeedIDs) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode && (node.Value == "none" || node.Value == "") {
+		*s = nil
+		return nil
+	}
+	var ids []string
+	if err := node.Decode(&ids); err != nil {
+		return fmt.Errorf("testsystem: seed list must be a list of ids or none: %w", err)
+	}
+	*s = ids
+	return nil
+}
+
+// SeedSpec is one injectable failure from docs/tasks/S7.011.md. Value is the
+// numeric seed and Code is the fault code the controller puts in the trace.
+type SeedSpec struct {
+	ID     string `yaml:"id"`
+	Fault  string `yaml:"fault"`
+	Source string `yaml:"source"`
+	Value  uint64 `yaml:"value"`
+	Code   uint64 `yaml:"code"`
+	Marker string `yaml:"marker"`
+}
+
+// RunSpec is one pass of the artery. Expect is "pass" or "fail_at_expect".
+// ExpectMarker names the marker a failing pass must actually emit.
+type RunSpec struct {
+	Name         string  `yaml:"name"`
+	Seed         SeedIDs `yaml:"seed"`
+	Expect       string  `yaml:"expect"`
+	ExpectMarker string  `yaml:"expect_marker,omitempty"`
+}
+
+// ArterySpec is the part of tests/scenarios/seeded.yaml the controller reads.
+// The four faults and the three passes come from the file, not from Go
+// literals, so editing the spec changes what CI executes.
+type ArterySpec struct {
+	Schema          string            `yaml:"schema"`
+	Sources         map[string]string `yaml:"sources"`
+	Seeds           []SeedSpec        `yaml:"seeds"`
+	Runs            []RunSpec         `yaml:"runs"`
+	NegativeControl RunSpec           `yaml:"negative_control"`
+}
+
+// ParseArterySpec parses and validates the seeded-regression spec bytes. It
+// reads no file: the caller supplies the contents, which keeps the FILE
+// capability out of this package and its gates.
+func ParseArterySpec(data []byte) (ArterySpec, error) {
+	var spec ArterySpec
+	if err := yaml.Unmarshal(data, &spec); err != nil {
+		return ArterySpec{}, fmt.Errorf("testsystem: parse artery spec: %w", err)
+	}
+	if err := spec.validate(); err != nil {
+		return ArterySpec{}, err
+	}
+	return spec, nil
+}
+
+func (a ArterySpec) validate() error {
+	if len(a.Seeds) != 4 {
+		return fmt.Errorf("testsystem: artery spec has %d seeds, want 4", len(a.Seeds))
+	}
+	byID := make(map[string]SeedSpec, len(a.Seeds))
+	for _, s := range a.Seeds {
+		if s.ID == "" || s.Marker == "" || s.Value == 0 || s.Code == 0 {
+			return fmt.Errorf("testsystem: incomplete seed spec: %+v", s)
+		}
+		if _, exists := byID[s.ID]; exists {
+			return fmt.Errorf("testsystem: duplicate seed id %q", s.ID)
+		}
+		byID[s.ID] = s
+	}
+	want := []string{"healthy", "seeded", "healthy_again"}
+	if len(a.Runs) != len(want) {
+		return fmt.Errorf("testsystem: artery spec has %d runs, want %d", len(a.Runs), len(want))
+	}
+	for i, name := range want {
+		if a.Runs[i].Name != name {
+			return fmt.Errorf("testsystem: run %d is %q, want %q", i, a.Runs[i].Name, name)
+		}
+	}
+	if a.Runs[0].Expect != "pass" || len(a.Runs[0].Seed) != 0 {
+		return fmt.Errorf("testsystem: healthy run must pass without seeds")
+	}
+	seeded := a.Runs[1]
+	if seeded.Expect != "fail_at_expect" || seeded.ExpectMarker == "" {
+		return fmt.Errorf("testsystem: seeded run must fail at an expected marker")
+	}
+	seen := make(map[string]bool, len(seeded.Seed))
+	for _, id := range seeded.Seed {
+		if _, ok := byID[id]; !ok {
+			return fmt.Errorf("testsystem: seeded run names unknown seed %q", id)
+		}
+		seen[id] = true
+	}
+	if len(seen) != len(byID) {
+		return fmt.Errorf("testsystem: seeded run injects %d of %d faults", len(seen), len(byID))
+	}
+	if a.Runs[2].Expect != "pass" || len(a.Runs[2].Seed) != 0 {
+		return fmt.Errorf("testsystem: healthy_again run must pass without seeds")
+	}
+	if len(a.NegativeControl.Seed) != 0 || a.NegativeControl.Expect != "no_diagnostic_value" {
+		return fmt.Errorf("testsystem: negative control must run without seeds and expect no diagnostic value")
+	}
+	return nil
+}
+
+// FaultController builds scenarios that inject the spec's faults. It holds no
+// mutable state: the same ids always yield the same commands.
+type FaultController struct {
+	seeds map[string]SeedSpec
+}
+
+// NewFaultController validates spec and indexes its seeds by id.
+func NewFaultController(spec ArterySpec) (*FaultController, error) {
+	if err := spec.validate(); err != nil {
+		return nil, err
+	}
+	c := &FaultController{seeds: make(map[string]SeedSpec, len(spec.Seeds))}
+	for _, s := range spec.Seeds {
+		c.seeds[s.ID] = s
+	}
+	return c, nil
+}
+
+// Inject returns a scenario whose trace carries one diagnostic event per seed.
+// Runner emits the events. The controller only adds fault commands, so a pass
+// can fail only through an observed diagnostic in the trace.
+func (c *FaultController) Inject(ids []string) (Scenario, error) {
+	steps := []Command{
+		{Kind: "watch_pr", Fields: map[string]string{"repo": "refusedguy/beacon", "pr": "1145"}},
+		{Kind: "wait_result", Fields: map[string]string{"watch": "artery"}},
+	}
+	seed := uint64(0x4152544552595f30) // "ARTERY_0"
+	for _, id := range ids {
+		s, ok := c.seeds[id]
+		if !ok {
+			return Scenario{}, fmt.Errorf("testsystem: unknown seed id %q", id)
+		}
+		seed = mixSeed(seed, s.Value^s.Code)
+		steps = append(steps, Command{Kind: "fault." + id, Fields: map[string]string{
+			"fault":      s.ID,
+			"fault_code": strconv.FormatUint(s.Code, 10),
+			"marker":     s.Marker,
+			"diagnostic": "true",
+		}})
+	}
+	steps = append(steps, Command{Kind: "ack", Fields: map[string]string{"obligation": "artery"}})
+	return Scenario{Name: "artery", Seed: seed, Steps: steps}, nil
+}
+
+func mixSeed(acc, value uint64) uint64 {
+	acc ^= value + 0x9e3779b97f4a7c15 + (acc << 6) + (acc >> 2)
+	return acc
+}
+
+// RunOutcome is the observable result of one pass. Pass and Failed come from
+// the events Runner emitted, never from a counter inside the controller.
+type RunOutcome struct {
+	Name        string
+	Pass        bool
+	Failed      bool
+	Marker      string
+	Faults      []string
+	Fingerprint string
+}
+
+func (o RunOutcome) String() string {
+	return fmt.Sprintf("artery run %s: pass=%t fail=%t marker=%s faults=%d fingerprint=%s",
+		o.Name, o.Pass, o.Failed, o.Marker, len(o.Faults), o.Fingerprint)
+}
+
+func outcomeFrom(result Result) RunOutcome {
+	out := RunOutcome{Name: result.Scenario}
+	for _, ev := range result.Events {
+		if ev.Fields["diagnostic"] != "true" {
+			continue
+		}
+		out.Failed = true
+		out.Faults = append(out.Faults, ev.Fields["fault"])
+		if out.Marker == "" {
+			out.Marker = ev.Fields["marker"]
+		}
+	}
+	out.Pass = !out.Failed
+	out.Fingerprint = result.Fingerprint()
+	return out
+}
+
+// ArteryResult holds the three passes and the negative control.
+type ArteryResult struct {
+	Runs            []RunOutcome
+	NegativeControl RunOutcome
+}
+
+// String renders every outcome so a CI log shows the actual runs.
+func (r ArteryResult) String() string {
+	var b strings.Builder
+	for _, out := range r.Runs {
+		b.WriteString(out.String())
+		b.WriteByte('\n')
+	}
+	b.WriteString(r.NegativeControl.String())
+	b.WriteByte('\n')
+	return b.String()
+}
+
+// RunArtery executes healthy -> seeded -> healthy_again as three real passes
+// through Runner. It returns an error when any observed outcome breaks the
+// spec's expectation. grep over the YAML is not part of this check.
+func RunArtery(spec ArterySpec) (ArteryResult, error) {
+	controller, err := NewFaultController(spec)
+	if err != nil {
+		return ArteryResult{}, err
+	}
+	var result ArteryResult
+	for _, run := range spec.Runs {
+		scenario, err := controller.Inject(run.Seed)
+		if err != nil {
+			return result, err
+		}
+		out := outcomeFrom(Run(scenario))
+		out.Name = run.Name
+		result.Runs = append(result.Runs, out)
+		switch run.Expect {
+		case "pass":
+			if !out.Pass || out.Marker != "" {
+				return result, fmt.Errorf("testsystem: artery %s expected pass, got fail marker %q", run.Name, out.Marker)
+			}
+		case "fail_at_expect":
+			if !out.Failed {
+				return result, fmt.Errorf("testsystem: artery %s did not fail on an injected fault", run.Name)
+			}
+			if out.Marker != run.ExpectMarker {
+				return result, fmt.Errorf("testsystem: artery %s failed at %q, want %q", run.Name, out.Marker, run.ExpectMarker)
+			}
+			if len(out.Faults) != len(spec.Seeds) {
+				return result, fmt.Errorf("testsystem: artery %s observed %d faults, want %d", run.Name, len(out.Faults), len(spec.Seeds))
+			}
+		default:
+			return result, fmt.Errorf("testsystem: artery %s has unknown expect %q", run.Name, run.Expect)
+		}
+	}
+	controlScenario, err := controller.Inject(spec.NegativeControl.Seed)
+	if err != nil {
+		return result, err
+	}
+	control := outcomeFrom(Run(controlScenario))
+	control.Name = "negative_control"
+	result.NegativeControl = control
+	if !control.Pass || control.Marker != "" {
+		return result, fmt.Errorf("testsystem: negative control produced diagnostic value %q", control.Marker)
+	}
+	if result.Runs[0].Fingerprint != control.Fingerprint {
+		return result, fmt.Errorf("testsystem: negative control trace differs from healthy trace")
+	}
+	if result.Runs[0].Fingerprint != result.Runs[2].Fingerprint {
+		return result, fmt.Errorf("testsystem: healthy and healthy_again traces differ")
+	}
+	return result, nil
 }
