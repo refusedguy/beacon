@@ -34,6 +34,18 @@ type DaemonDueSchedule struct {
 	Interval time.Duration
 }
 
+// DaemonUnit is one ordered line of the per-unit report. Status is the outcome
+// kind the night-shift worker recorded. Reason explains a failed unit and
+// Action tells the caller what to do with a unit that was not started. Priority
+// marks a kernel recovery unit.
+type DaemonUnit struct {
+	ID       string
+	Status   string
+	Priority bool
+	Reason   string
+	Action   string
+}
+
 // DaemonSchedules is the schedule port of one daemon pass. ListDue returns the
 // rows whose next_run is at or before now. MarkTriggered moves a row's
 // next_run forward so one period is triggered once, including after a restart.
@@ -56,7 +68,8 @@ type DaemonSchedules interface {
 // already merged or closed, but only after Verify passes. CheckAll, Orchestrate
 // and CloseMerged are required. Subscribe, Schedules, Summary and Verify are
 // optional: a nil port skips that step, and a nil Verify keeps the original
-// close behaviour for older callers. A nil Waker is allowed and simply
+// close behaviour for older callers. UnitReport is optional: a nil port omits
+// the per-unit lines from the pass log. A nil Waker is allowed and simply
 // suppresses wakes. Tracer is optional: a nil tracer uses the process tracer
 // from observe.Current, so a caller that wires nothing keeps the no-op default
 // (T3.394).
@@ -66,6 +79,7 @@ type DaemonPorts struct {
 	Schedules   DaemonSchedules
 	Orchestrate func(ctx context.Context, waker Waker) error
 	Summary     func(ctx context.Context) (Workload, error)
+	UnitReport  func(ctx context.Context) ([]DaemonUnit, error)
 	Verify      func(ctx context.Context) (bool, error)
 	CloseMerged func(ctx context.Context) error
 	Waker       Waker
@@ -134,6 +148,20 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 				// comparable with the CLI report.
 				logf("daemon: summary: total=%d ready=%d needsAttention=%d watching=%d registered=%d",
 					report.Total, report.Ready, report.NeedsAttention, report.Watching, report.Registered)
+			}
+		}
+		// The ordered per-unit report follows the workload summary. Each unit
+		// carries its own status, reason and action, so one failed unit does
+		// not hide the fate of the rest of the batch.
+		if ports.UnitReport != nil {
+			units, err := ports.UnitReport(passCtx)
+			if err != nil {
+				logf("daemon: unit report: %v", err)
+			} else {
+				for _, unit := range units {
+					logf("daemon: unit: id=%s status=%s priority=%t reason=%q action=%q",
+						unit.ID, unit.Status, unit.Priority, unit.Reason, unit.Action)
+				}
 			}
 		}
 		// Verify is the gate before the final transition. A card closes only

@@ -75,6 +75,53 @@ type AuditEvent struct {
 	Detail  string
 }
 
+// Outcome kinds are the closed set of per-issue results a pass reports. The
+// worker and the daemon report use the same strings, so one row reads the same
+// at both ends.
+const (
+	OutcomeDelegated    = "delegated"
+	OutcomeFailed       = "failed"
+	OutcomeNotAttempted = "not_attempted"
+	OutcomeSkipped      = "skipped"
+)
+
+// NotAttemptedAction is the action recorded for a unit the pass did not start
+// because its context was cancelled at the unit boundary.
+const NotAttemptedAction = "rerun in the next pass after cancellation"
+
+// KernelPrefix marks a recovery unit that a caller schedules before the rest.
+// PlanTriage keeps its input-order contract, so the marker only annotates the
+// report and never reorders the plan.
+const KernelPrefix = "KERNEL-"
+
+// IsKernel reports whether issue carries the kernel priority marker.
+func IsKernel(issue Issue) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(issue.ID)), KernelPrefix)
+}
+
+// Outcome is one ordered line of a triage pass report. Reason explains a
+// failed unit; Action tells the caller what to do with a unit that was not
+// started. Priority marks a kernel unit scheduled ahead of the rest.
+type Outcome struct {
+	IssueID  string
+	Kind     string
+	Reason   string
+	Action   string
+	Priority bool
+}
+
+// Failure is one unit whose delegate, watch or audit step failed.
+type Failure struct {
+	IssueID string
+	Reason  string
+}
+
+// NotAttemptedUnit is one unit the pass did not start after cancellation.
+type NotAttemptedUnit struct {
+	IssueID string
+	Action  string
+}
+
 // State is the durable record of issues already handled. The worker copies it
 // on every pass and never mutates the snapshot it is given. A zero State
 // handles every candidate.
@@ -160,10 +207,13 @@ type AuditWriter interface {
 // a successful delegation the Result still carries that mark, so the caller
 // can persist partial progress and avoid a second delegation.
 type Result struct {
-	Delegated []Delegation
-	Watches   []WatchRef
-	Skipped   int
-	State     State
+	Delegated    []Delegation
+	Watches      []WatchRef
+	Skipped      int
+	State        State
+	Outcomes     []Outcome          // ordered, one row per candidate
+	Failed       []Failure          // failed units with their reason
+	NotAttempted []NotAttemptedUnit // units not started after cancellation
 }
 
 // ErrNilPorts is reported when a pass needs a port that was not connected.
@@ -188,9 +238,11 @@ func New(backlog Backlog, delegator Delegator, watches WatchRegistry, audit Audi
 // every action. It returns a new State that marks every delegated issue as
 // handled, so repeating the pass with that state delegates nothing.
 //
-// A backlog read failure is fatal. A failure on one issue aborts the pass and
-// is returned as an error; issues already delegated in this pass stay marked in
-// the returned Result.State.
+// A backlog read failure is fatal and is returned as an error. A failure on one
+// issue is recorded as a failed outcome and the pass moves to the next issue.
+// Cancellation is checked only at the boundary of a unit; work already started
+// is never interrupted. When cancellation is observed, the current and all
+// remaining units are recorded as not attempted with the action to take.
 func (w *Worker) Run(ctx context.Context, in State) (Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -207,10 +259,42 @@ func (w *Worker) Run(ctx context.Context, in State) (Result, error) {
 
 	plan := PlanTriage(in, candidates)
 	out.Skipped = len(plan.Skipped)
-	for _, issue := range plan.ToDelegate {
-		if err := w.triageIssue(ctx, issue, &out); err != nil {
-			return out, err
+	for _, issue := range plan.Skipped {
+		out.Outcomes = append(out.Outcomes, Outcome{
+			IssueID: issue.ID, Kind: OutcomeSkipped,
+			Reason: "already handled or missing id", Action: "none",
+			Priority: IsKernel(issue),
+		})
+	}
+	for i, issue := range plan.ToDelegate {
+		// The only cancellation check in the pass sits at the unit boundary.
+		// A unit that has begun runs to completion even if ctx is cancelled.
+		if err := ctx.Err(); err != nil {
+			for _, rest := range plan.ToDelegate[i:] {
+				out.NotAttempted = append(out.NotAttempted, NotAttemptedUnit{
+					IssueID: rest.ID, Action: NotAttemptedAction,
+				})
+				out.Outcomes = append(out.Outcomes, Outcome{
+					IssueID: rest.ID, Kind: OutcomeNotAttempted,
+					Reason: err.Error(), Action: NotAttemptedAction,
+					Priority: IsKernel(rest),
+				})
+			}
+			return out, nil
 		}
+		if err := w.triageIssue(ctx, issue, &out); err != nil {
+			out.Failed = append(out.Failed, Failure{IssueID: issue.ID, Reason: err.Error()})
+			out.Outcomes = append(out.Outcomes, Outcome{
+				IssueID: issue.ID, Kind: OutcomeFailed,
+				Reason: err.Error(), Action: "inspect reason and retry in the next pass",
+				Priority: IsKernel(issue),
+			})
+			continue
+		}
+		out.Outcomes = append(out.Outcomes, Outcome{
+			IssueID: issue.ID, Kind: OutcomeDelegated,
+			Priority: IsKernel(issue),
+		})
 	}
 	return out, nil
 }
