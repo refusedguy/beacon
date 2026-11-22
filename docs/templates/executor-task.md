@@ -61,6 +61,8 @@ executor-task:design-shapes -->
 | repo, pr, headSHA, baseRef | факт сдачи PR | параметры Watch |
 | watchID | ответ `beacon_watch_pr` | ключ ожидания и отчёта |
 | verdict | `beacon_get_result` | решение о пробуждении |
+| failureExcerpt, failureExcerptTruncated, failureExcerptLogUrl | `beacon_get_result` | вывод упавшего теста и ссылка на полный лог |
+| failedChecks[].failureExcerpt, failureExcerptUnavailable | `beacon_get_result` | вывод и доступность источника для одной проверки |
 | tokenBreakdown | `session.TokenBreakdown(ContextSnapshot)` | разбивка контекста по категориям с ценой и остатком |
 | tokenWarning | `session.TokenUsage().Warning` | предупреждение при остатке ниже 1024 токенов |
 | роль файла контекста | editable из OwnerFiles карточки, readonly из остальных файлов в контексте | какая запись разрешена |
@@ -399,11 +401,13 @@ executor-task:informational-checks -->
 
 ## Триаж красного вердикта
 
-На вердикте `retry` исполнитель не чинит код вслепую. Он классифицирует причину, сравнив `failedChecks` со своим diff, и только потом решает, что делать (ADR 0072, ADR 0155). Классификация уходит wake'ом оркестратору, а не вопросом владельцу.
+На вердикте `retry` исполнитель не чинит код вслепую. Он читает вывод упавшего теста из `failureExcerpt`, сравнивает `failedChecks` со своим diff и только потом решает, что делать (ADR 0072, ADR 0155). Классификация уходит wake'ом оркестратору, а не вопросом владельцу.
 
 <!-- executor-task:triage
 source: beacon_get_result.failedChecks
 fields: name, conclusion, detailsUrl, required, flakyMatched
+excerpt: beacon_get_result.failureExcerpt
+excerpt-flags: failureExcerptTruncated, failureExcerptLogUrl, failureExcerptUnavailable
 compare: git diff <baseRef>..HEAD
 own-diff: fix-branch-and-push-new-headSHA
 foreign-or-flaky: blocked:not_mine
@@ -414,7 +418,7 @@ executor-task:triage -->
 
 Процедура:
 
-1. Прочитать снимок `beacon_get_result`. В ответе есть `failedChecks` с полями `name`, `conclusion`, `detailsUrl`, `required` и `flakyMatched`. Полные логи не нужны.
+1. Прочитать снимок `beacon_get_result`. В ответе есть `failedChecks` с полями `name`, `conclusion`, `detailsUrl`, `required` и `flakyMatched` и необязательный вывод упавшего теста `failureExcerpt`. Полный лог нужен только при `failureExcerptTruncated: true`.
 2. Сверить `failedChecks` со своим diff: `git status --short` и `git diff <baseRef>..HEAD` в своём worktree. Проверка считается твоей, когда её причина лежит в файлах, которые ты менял в этой ветке.
 3. Выбрать причину и отослать wake подписчику `role=orchestrator` на том же Watch.
    - Причина вне твоего diff или красный `main` на последнем коммите: флейк или чужая поломка, `decision="blocked:not_mine"`.
@@ -423,6 +427,41 @@ executor-task:triage -->
 4. Завершить ход. Wake оркестратору не означает готовность PR. Мерж делает только оркестратор после своего `beacon_get_result` с `verdict=ready`.
 
 Не чинить `main` самому, не пушить в `main` и не править файлы вне своего worktree.
+
+## Вывод упавшего теста в wake
+
+Wake по-прежнему несёт вердикт и указатель на проверку. Вывод упавшего теста приходит в том же снимке `beacon_get_result`, рядом с `failedChecks`. Исполнитель читает его до классификации причины.
+
+| Поле | Где | Назначение |
+| --- | --- | --- |
+| `failedChecks[].failureExcerpt` | запись проверки | короткий очищенный вывод этой проверки |
+| `failedChecks[].failureExcerptUnavailable` | запись проверки | источник вывода не ответил для этой проверки |
+| `failureExcerpt` | ответ целиком | суммарный вывод упавших проверок, не более 2 КБ |
+| `failureExcerptTruncated` | ответ целиком | вывод обрезан по лимиту |
+| `failureExcerptLogUrl` | ответ целиком | ссылка на полный лог проверки |
+
+Поля необязательны. Без источника вывода ответ сохраняет прежнюю форму. Отсутствие вывода не означает, что проверка прошла.
+
+Порядок чтения:
+
+1. Взять `failureExcerpt` из ответа или из записи `failedChecks` нужной проверки. Это и есть вывод упавшего теста. Он уже ограничен 2 КБ и очищен на границе MCP.
+2. Если `failureExcerptTruncated` равен `true` или фрагмент заканчивается на `...[truncated]`, открыть `failureExcerptLogUrl` и дочитать полный лог. Без этого флага полный лог не нужен.
+3. Если `failureExcerptUnavailable` равен `true`, источник вывода недоступен. Причину определять по `name`, `conclusion` и `detailsUrl`, а блокирующий характер проверки по `required`. Отсутствие вывода само по себе не повод для `blocked:not_mine`.
+4. Сверить вывод со своим diff по правилу триажа. Вывод указывает на файл и строку, но не заменяет `git diff <baseRef>..HEAD`.
+5. Классификацию и вердикты не менять. `required: false` и `continue-on-error: true` остаются информационными проверками. Ограничение вывода задаёт Beacon, исполнитель не вставляет полные логи в wake и отчёт.
+
+Основание: карточка CA-05 и `docs/research/comp-aider.md`. Порог проверки: не менее 7 починок с первой попытки из 10 при baseline, измеренном отдельно.
+
+<!-- executor-task:test-output
+source: beacon_get_result.failureExcerpt
+per-check: failedChecks[].failureExcerpt
+aggregate-limit: 2KB
+truncated-marker: ...[truncated]
+full-log: failureExcerptLogUrl
+unavailable: failureExcerptUnavailable
+classification: unchanged
+verdicts: unchanged
+executor-task:test-output -->
 
 ## От красной команды к минимальному репро
 
@@ -548,6 +587,7 @@ executor-task:edit-failure -->
 - Не переводить карточку в `done` вручную: это делает Beacon при `merged`.
 - Не открывать PR-дубль, когда требование карточки уже закрыто другим изменением.
 - Не возвращать блокер без доказательства: SHA, код `merge-base`, PR или ссылка на решение владельца.
+- Не вставлять полный CI-лог в wake или отчёт вместо ограниченного `failureExcerpt`.
 
 ## Самопроверка шаблона
 
@@ -558,6 +598,8 @@ executor-task:edit-failure -->
 Блок `executor-task:repro-hypotheses` фиксирует четыре шага после красной команды, тег `[DEBUG-...]` с обязательным удалением и замер baseline для perf-регрессий. Проверка карточки CM-02 ищет в шаблоне `load-bearing`, четыре шага и тег отладочных логов. Контракт гипотезы в `internal/domain/depth.go` шаблон не дублирует.
 
 Блок `executor-task:token-accounting` фиксирует пять категорий токенов, методы учёта и порог предупреждения 1024. Карточка CA-07 проверяет, что сумма по категориям совпадает с эталоном, остаток вычислен по `max_input_tokens` и предупреждение срабатывает на пороге.
+
+Блок `executor-task:test-output` фиксирует поля вывода упавшего теста, лимит 2 КБ, флаг обрезки, ссылку на полный лог и сохранение классификации и вердиктов.
 
 CI подхватывает тест шагом `Test JS adapters` в `.github/workflows/ci.yml`: `find tests/adapter -maxdepth 1 -name '*.test.js' | xargs node --test`. Тест использует только встроенные модули Node.
 
