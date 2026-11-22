@@ -622,10 +622,12 @@ type gcWorktreeResult struct {
 // reasons. Removed counts the removal set: candidates in a dry run, deletions
 // after apply.
 type gcWorktreeReport struct {
-	Mode    string             `json:"mode"`
-	Removed int                `json:"removed"`
-	Kept    int                `json:"kept"`
-	Items   []gcWorktreeResult `json:"items"`
+	Mode      string             `json:"mode"`
+	Removed   int                `json:"removed"`
+	Kept      int                `json:"kept"`
+	Items     []gcWorktreeResult `json:"items"`
+	CollectMS int64              `json:"collect_ms"`
+	ApplyMS   int64              `json:"apply_ms"`
 }
 
 var (
@@ -770,13 +772,15 @@ func runGCWorktree(c *CLI, args []string) int {
 		return 2
 	}
 
+	collectStart := time.Now()
 	plan, err := gcWorktreeCollect(c)
+	collectMS := time.Since(collectStart).Milliseconds()
 	if err != nil {
 		fmt.Fprintln(c.errOut, err)
 		return 2
 	}
 
-	report := gcWorktreeReport{Mode: "dry-run", Items: plan}
+	report := gcWorktreeReport{Mode: "dry-run", Items: plan, CollectMS: collectMS}
 	for _, item := range plan {
 		if item.Status == "remove" {
 			report.Removed++
@@ -787,6 +791,7 @@ func runGCWorktree(c *CLI, args []string) int {
 
 	failed := false
 	if *apply {
+		applyStart := time.Now()
 		report.Mode = "applied"
 		report.Removed = 0
 		for i, item := range plan {
@@ -804,6 +809,7 @@ func runGCWorktree(c *CLI, args []string) int {
 			report.Items[i].Status = "removed"
 			report.Removed++
 		}
+		report.ApplyMS = time.Since(applyStart).Milliseconds()
 	}
 
 	if *format == "json" {
