@@ -234,7 +234,7 @@ var toolDescriptors = []toolDescriptor{
 		OutputType:  taskClaimOutputSchema,
 		Kind:        kindAdditiveOnce,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
-			attachTaskClaim(s, NewTaskClaimHandler(deps.TaskClaimStore), schemas[TaskClaimToolName])
+			attachTaskClaim(s, deps, schemas[TaskClaimToolName])
 		},
 	},
 	{
@@ -749,13 +749,19 @@ func attachStats(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonschema.S
 }
 
 // attachTaskClaim installs the ninth tool over the handler owned by IDX-05 in
-// tool_task_claim.go. This file adds the registration and the explicit output
-// schema, not the claim logic. A nil schema means derivation failed; go-sdk
-// panics when a typed handler gets nil, so a permissive object keeps the real
-// handler registered just like the fallback for list_running and stats.
-func attachTaskClaim(s *mcpsdk.Server, handler *TaskClaimHandler, outputSchema *jsonschema.Schema) {
-	if s == nil || handler == nil {
+// tool_task_claim.go. It builds the handler from deps so the graph index port
+// reaches the claim path and graphReady reflects a verified index (AUD-04
+// part3). This file adds the registration and the explicit output schema, not
+// the claim logic. A nil schema means derivation failed; go-sdk panics when a
+// typed handler gets nil, so a permissive object keeps the real handler
+// registered just like the fallback for list_running and stats.
+func attachTaskClaim(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonschema.Schema) {
+	if s == nil {
 		return
+	}
+	handler := NewTaskClaimHandler(deps.TaskClaimStore)
+	if deps.GraphIndexReader != nil {
+		handler.SetGraphIndexReader(deps.GraphIndexReader)
 	}
 	if outputSchema == nil {
 		outputSchema = &jsonschema.Schema{Type: "object"}
