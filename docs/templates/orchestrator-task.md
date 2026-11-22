@@ -212,6 +212,24 @@ orchestrator-task:informational-checks -->
 
 На каждой волне оркестратор читает `beacon deferred --format json` до запуска новых агентов. Запись содержит `watchID`, `pr`, `title`, `reason`, `ownerFiles` и `status`. Wiring-карточки со `status: todo` ставятся в очередь ПЕРВЫМИ, до остальных задач волны: проводка закрывает долг предыдущего Watch и дешевле новой фичи. Карточка берётся из `docs/tasks/WIRING-<pr>.md` по шаблону `docs/templates/wiring-card.md` и проходит обычный чек из четырёх пунктов. Задачу волны оркестратор выдаёт через `beacon_task_claim`.
 
+## Аудит worktree перед чисткой
+
+Оркестратор пишет в выдачу задачи поле «Закреплённые worktree» со списком путей, которые надо сохранить. Путь в этом списке не кандидат на удаление ни при каком вердикте Watch. Список берётся из закреплённых чатов, а не из автоматической метки `safe`.
+
+Перед любой чисткой оркестратор снимает аудит только на чтение. Список worktree он берёт из `git worktree list --porcelain`. Аудит классифицирует каждый путь по размеру, возрасту, состоянию мержа, незакоммиченным правкам и состоянию PR. Аудит только читает состояние и не содержит команд удаления. Его результат это совет, а не разрешение на удаление.
+
+Метка `wip:N` означает N незакоммиченных правок. Оркестратор показывает эти правки и запрашивает решение владельца. Удалять `wip:N` без решения владельца запрещено. Закреплённый чат побеждает метку `safe`: активный чат сохраняется вместе со своим worktree.
+
+<!-- orchestrator-task:worktree-audit
+field: закреплённые worktree
+source: git worktree list --porcelain
+mode: read-only, advice-not-permission
+classify: size, age, merge-state, uncommitted-edits, pr-state
+pinned-chat: overrides-safe-label
+wip: show-edits, require-owner-decision
+no-removal-commands: true
+orchestrator-task:worktree-audit -->
+
 ## Чек перед ручным мержем
 
 Мерж разрешён только после вызова `beacon_get_result` с `verdict=ready`. Ни idle-отчёт, ни фраза в чате, ни зелёный CI сами по себе не дают права на мерж. Инструмент возвращает снимок с полями status, verdict, revision, merge{mergeable, mergeStateStatus}, failedChecks, obligationID, retryBudget. Вызов additive и пишет readAt, поэтому прочтение результата останавливает лестницу пробуждения.
