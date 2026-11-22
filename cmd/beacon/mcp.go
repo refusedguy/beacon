@@ -2386,8 +2386,10 @@ func autoSpawnStartSession(ctx context.Context, cfg reconcileConfig, cardID, tit
 // ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
 // with domain.EvaluatePR, merges and wakes through the wired ports, the wake
 // ladder advances its due timers and escalation rungs, then the in-process
-// counters are saved to runtime_stats. It returns the number of watches the
-// bridge updated.
+// counters are saved to runtime_stats. It also records the cycle duration in
+// the run_duration_seconds histogram, because the daemon reaches this pass
+// instead of orchestrator.RunWithResolver (PF-06). It returns the number of
+// watches the bridge updated.
 func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 	started := time.Now()
 	runLadderPass(ctx, cfg)
@@ -2414,6 +2416,10 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithWorktreeGC(bridgeWorktreeGC(cfg.db, cfg.root))
 	updated := bridge.Refresh(ctx)
 	reconcileMaintenance(ctx, cfg)
+	// This reconciler cycle is the daemon's real pass. Observe its duration
+	// before the snapshot is saved so this cycle's runtime_stats already
+	// carries the point (PF-06). RunEnd owns the histogram write.
+	observe.RunEnd(observe.CycleStats{Duration: time.Since(started)}, nil)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
 		if err := cfg.db.SaveRuntimeStats(withPollerStats(metrics.SnapshotJSON()), time.Now()); err != nil {
 			observe.ActorError("runtime_stats", "", err)
