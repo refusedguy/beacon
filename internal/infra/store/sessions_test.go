@@ -235,3 +235,163 @@ func TestSaveSessionValidation(t *testing.T) {
 		t.Fatalf("invalid saves wrote rows: %+v, err=%v", all, err)
 	}
 }
+
+func TestCloseSessionIsIdempotent(t *testing.T) {
+	d := openSessionStore(t)
+	created := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+	want := Session{
+		ID:        "ses_close",
+		Status:    SessionStatusActive,
+		CreatedAt: created,
+		LastSeen:  created,
+		Metadata:  map[string]string{"kind": "executor"},
+	}
+	if err := d.SaveSession(want); err != nil {
+		t.Fatalf("SaveSession: %v", err)
+	}
+	first := created.Add(time.Hour)
+	if err := d.CloseSession(want.ID, first); err != nil {
+		t.Fatalf("first CloseSession: %v", err)
+	}
+	got, found, err := d.GetSession(want.ID)
+	if err != nil || !found {
+		t.Fatalf("GetSession after close: found=%v err=%v", found, err)
+	}
+	if got.Status != SessionStatusClosed {
+		t.Fatalf("status = %q, want %q", got.Status, SessionStatusClosed)
+	}
+	if !got.CreatedAt.Equal(created) {
+		t.Fatalf("created_at = %v, want %v", got.CreatedAt, created)
+	}
+	if !got.LastSeen.Equal(first) {
+		t.Fatalf("last_seen = %v, want %v", got.LastSeen, first)
+	}
+	if !reflect.DeepEqual(got.Metadata, want.Metadata) {
+		t.Fatalf("metadata = %v, want %v", got.Metadata, want.Metadata)
+	}
+
+	second := first.Add(time.Hour)
+	if err := d.CloseSession(want.ID, second); err != nil {
+		t.Fatalf("second CloseSession: %v", err)
+	}
+	got, found, err = d.GetSession(want.ID)
+	if err != nil || !found {
+		t.Fatalf("GetSession after second close: found=%v err=%v", found, err)
+	}
+	if got.Status != SessionStatusClosed || !got.CreatedAt.Equal(created) ||
+		!got.LastSeen.Equal(first) || !reflect.DeepEqual(got.Metadata, want.Metadata) {
+		t.Fatalf("second close changed the row: %+v", got)
+	}
+	all, err := d.ListSessions()
+	if err != nil || len(all) != 1 {
+		t.Fatalf("second close left %d rows, err=%v", len(all), err)
+	}
+	if err := d.CloseSession("ses_missing", second); err == nil {
+		t.Fatal("CloseSession on unknown id returned no error")
+	}
+}
+
+func TestStaleSessionsFiltersAndLimits(t *testing.T) {
+	d := openSessionStore(t)
+	before := time.Date(2026, 6, 7, 8, 9, 10, 0, time.UTC)
+	sessions := []Session{
+		{ID: "ses_old1", Status: SessionStatusActive, CreatedAt: before.Add(-3 * time.Hour), LastSeen: before.Add(-3 * time.Hour), Metadata: map[string]string{"n": "1"}},
+		{ID: "ses_old2", Status: SessionStatusIdle, CreatedAt: before.Add(-2 * time.Hour), LastSeen: before.Add(-2 * time.Hour), Metadata: map[string]string{"n": "2"}},
+		{ID: "ses_fresh", Status: SessionStatusActive, CreatedAt: before.Add(2 * time.Hour), LastSeen: before.Add(time.Hour), Metadata: map[string]string{"n": "3"}},
+		{ID: "ses_edge", Status: SessionStatusActive, CreatedAt: before.Add(-time.Hour), LastSeen: before, Metadata: map[string]string{"n": "4"}},
+		{ID: "ses_shut", Status: SessionStatusActive, CreatedAt: before.Add(-4 * time.Hour), LastSeen: before.Add(-4 * time.Hour), Metadata: map[string]string{"n": "5"}},
+	}
+	for _, s := range sessions {
+		if err := d.SaveSession(s); err != nil {
+			t.Fatalf("SaveSession(%s): %v", s.ID, err)
+		}
+	}
+	if err := d.CloseSession("ses_shut", before.Add(-time.Minute)); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+
+	ids := func(rows []Session) []string {
+		out := make([]string, 0, len(rows))
+		for _, row := range rows {
+			out = append(out, row.ID)
+		}
+		return out
+	}
+	got, err := d.StaleSessions(before, 10)
+	if err != nil {
+		t.Fatalf("StaleSessions: %v", err)
+	}
+	if want := []string{"ses_old1", "ses_old2"}; !reflect.DeepEqual(ids(got), want) {
+		t.Fatalf("stale ids = %v, want %v", ids(got), want)
+	}
+	got, err = d.StaleSessions(before, 1)
+	if err != nil {
+		t.Fatalf("StaleSessions with limit: %v", err)
+	}
+	if want := []string{"ses_old1"}; !reflect.DeepEqual(ids(got), want) {
+		t.Fatalf("limited stale ids = %v, want %v", ids(got), want)
+	}
+	got, err = d.StaleSessions(before, 0)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("zero limit returned %v, err=%v", ids(got), err)
+	}
+}
+
+func TestStaleSessionsEmptyStore(t *testing.T) {
+	d := openSessionStore(t)
+	got, err := d.StaleSessions(time.Now(), 10)
+	if err != nil {
+		t.Fatalf("StaleSessions on empty store: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("empty store returned %d sessions", len(got))
+	}
+	ok, err := tableExists(context.Background(), d.readDB, "sessions")
+	if err != nil {
+		t.Fatalf("tableExists: %v", err)
+	}
+	if ok {
+		t.Fatal("read created the sessions table")
+	}
+}
+
+func TestFindSessionByTaskSkipsClosed(t *testing.T) {
+	d := openSessionStore(t)
+	base := time.Date(2026, 7, 8, 9, 10, 11, 0, time.UTC)
+	open := Session{
+		ID:        "ses_task_open",
+		Status:    SessionStatusActive,
+		CreatedAt: base,
+		LastSeen:  base,
+		Metadata:  map[string]string{SessionMetaTaskID: "T-MM01"},
+	}
+	shut := Session{
+		ID:        "ses_task_shut",
+		Status:    SessionStatusActive,
+		CreatedAt: base.Add(time.Hour),
+		LastSeen:  base.Add(time.Hour),
+		Metadata:  map[string]string{SessionMetaTaskID: "T-MM01"},
+	}
+	for _, s := range []Session{open, shut} {
+		if err := d.SaveSession(s); err != nil {
+			t.Fatalf("SaveSession(%s): %v", s.ID, err)
+		}
+	}
+	if err := d.CloseSession(shut.ID, base.Add(2*time.Hour)); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	got, found, err := d.FindSessionByTask("T-MM01")
+	if err != nil || !found {
+		t.Fatalf("FindSessionByTask: found=%v err=%v", found, err)
+	}
+	if got.ID != open.ID {
+		t.Fatalf("session = %+v, want open row %s", got, open.ID)
+	}
+	if err := d.CloseSession(open.ID, base.Add(2*time.Hour)); err != nil {
+		t.Fatalf("CloseSession: %v", err)
+	}
+	_, found, err = d.FindSessionByTask("T-MM01")
+	if err != nil || found {
+		t.Fatalf("all rows closed: found=%v err=%v", found, err)
+	}
+}
