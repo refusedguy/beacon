@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/worktree"
@@ -28,9 +29,17 @@ import (
 // protected; everything else with `opencode serve --hostname` is an orphan.
 
 const (
-	gcKindServe      gcKind = "serve"
-	gcKindObligation gcKind = "obligation"
-	gcReasonOrphan          = "orphan"
+	gcKindServe         gcKind = "serve"
+	gcKindObligation    gcKind = "obligation"
+	gcKindSession       gcKind = "session"
+	gcReasonOrphan             = "orphan"
+	gcReasonClosedWatch        = "closed_watch"
+
+	// gcSessionRetention is the window a closed Watch's session stays visible
+	// after closure. Sessions of Watches closed earlier are left to the
+	// store's own archive, which owns the longer history.
+	gcSessionRetention = 24 * time.Hour
+	gcSessionLimit     = 200
 )
 
 // gcObligationStore is the slice of the state store the collector needs. The
@@ -53,6 +62,101 @@ var gcObligationsForGC = func(c *CLI, apply bool) ([]store.ObligationGCItem, err
 		return nil, errors.New("store не поддерживает чистку обязательств")
 	}
 	return gs.GCObligations(context.Background(), gcNow(), store.ObligationGCRetention, apply)
+}
+
+// gcSessionCandidate is one session whose owning Watch has closed and which no
+// live Watch and no current process still needs for wake delivery.
+type gcSessionCandidate struct {
+	SessionID string
+	WatchID   string
+}
+
+// gcSessionStore is the slice of the state store the session collector needs.
+// The concrete *store.DB implements it; tests install a fake with the same
+// methods.
+type gcSessionStore interface {
+	RecentClosedWatches(ctx context.Context, since time.Time, limit int) ([]domain.Watch, error)
+	LiveWatches() ([]domain.Watch, error)
+}
+
+// sessionDeleter is the opencode port method that removes a session. MEM-01
+// adds DeleteSession to the client and to the live port. The type assertion
+// keeps this package compiling until that change lands, and turns a missing
+// method into a clear --apply error instead of a wrong deletion.
+type sessionDeleter interface {
+	DeleteSession(ctx context.Context, sessionID string) error
+}
+
+func deleteSessionViaOpencode(ctx context.Context, sessionID string) error {
+	port := openCodePort()
+	if port == nil {
+		return errors.New("gc: opencode port не подключён")
+	}
+	deleter, ok := port.(sessionDeleter)
+	if !ok {
+		return errors.New("gc: opencode port не поддерживает удаление сессий")
+	}
+	return deleter.DeleteSession(ctx, sessionID)
+}
+
+// gcSessionDelete is the single seam tests replace with a recorder. Production
+// routes through the opencode port; cmd/beacon never opens HTTP itself.
+var gcSessionDelete = deleteSessionViaOpencode
+
+// gcSessionPlan filters closed-watch subscribers against live subscribers and
+// the current process session. A subscriber id is a session id, so a session
+// still bound to a live Watch protects the wake path and is never a candidate.
+func gcSessionPlan(closed, live []domain.Watch, currentSession string) []gcSessionCandidate {
+	protected := make(map[string]bool, len(live)+1)
+	for _, w := range live {
+		for _, s := range w.Subscribers {
+			if id := strings.TrimSpace(s.ID); id != "" {
+				protected[id] = true
+			}
+		}
+	}
+	if id := strings.TrimSpace(currentSession); id != "" {
+		protected[id] = true
+	}
+
+	seen := make(map[string]bool)
+	plan := make([]gcSessionCandidate, 0)
+	for _, w := range closed {
+		for _, s := range w.Subscribers {
+			id := strings.TrimSpace(s.ID)
+			if id == "" || protected[id] || seen[id] {
+				continue
+			}
+			seen[id] = true
+			plan = append(plan, gcSessionCandidate{SessionID: id, WatchID: w.ID})
+		}
+	}
+	return plan
+}
+
+// gcSessionsForGC opens the state store and applies the retention window. The
+// store supplies the rows; gcSessionPlan owns the protection rule.
+var gcSessionsForGC = func(c *CLI) ([]gcSessionCandidate, error) {
+	s, closeStore, err := makeInspectStore(c)
+	if err != nil {
+		return nil, fmt.Errorf("store: %w", err)
+	}
+	defer func() { _ = closeStore() }()
+	ss, ok := s.(gcSessionStore)
+	if !ok {
+		return nil, errors.New("store не поддерживает чистку сессий")
+	}
+	ctx := context.Background()
+	since := gcNow().Add(-gcSessionRetention)
+	closed, err := ss.RecentClosedWatches(ctx, since, gcSessionLimit)
+	if err != nil {
+		return nil, fmt.Errorf("закрытые watch: %w", err)
+	}
+	live, err := ss.LiveWatches()
+	if err != nil {
+		return nil, fmt.Errorf("живые watch: %w", err)
+	}
+	return gcSessionPlan(closed, live, os.Getenv(sessionIDEnv)), nil
 }
 
 // The seams keep process discovery and termination out of the command's code
@@ -232,6 +336,26 @@ func gcSweep(c *CLI, apply bool, format string) int {
 		plan = append(plan, obligationItems...)
 	}
 
+	// Sessions of closed Watches are candidates only after their subscriber
+	// ids are checked against live Watches and the current session. A dry run
+	// lists them; --apply deletes exactly the listed ids once each.
+	sessions, err := gcSessionsForGC(c)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc: сессии закрытых watch: %v\n", err)
+		return 2
+	}
+	sessionItems := make([]gcItem, 0, len(sessions))
+	for _, s := range sessions {
+		sessionItems = append(sessionItems, gcItem{
+			Kind:   gcKindSession,
+			ID:     s.SessionID,
+			Reason: gcReasonClosedWatch + ":" + s.WatchID,
+		})
+	}
+	if !apply {
+		plan = append(plan, sessionItems...)
+	}
+
 	if !apply {
 		if format == "json" {
 			if err := renderGCJSON(c.out, gcResult{Mode: "dry-run", Removed: len(plan), Items: plan}); err != nil {
@@ -279,6 +403,13 @@ func gcSweep(c *CLI, apply bool, format string) int {
 		})
 	}
 	removed = append(removed, obligationItems...)
+	for _, s := range sessions {
+		if err := gcSessionDelete(context.Background(), s.SessionID); err != nil {
+			fmt.Fprintf(c.errOut, "beacon gc: удаление сессии %s: %v\n", s.SessionID, err)
+			return 2
+		}
+	}
+	removed = append(removed, sessionItems...)
 	if removed == nil {
 		removed = []gcItem{}
 	}
