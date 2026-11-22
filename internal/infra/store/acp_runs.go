@@ -239,6 +239,9 @@ func (d *DB) TransitionACPRun(task string, to ACPRunState, sessionID string, res
 	return changed, err
 }
 
+// nullJSON binds a JSON value as bytes. A DB opened with OpenProduction runs
+// every bound string and byte slice through sqlite-redact, so result payloads
+// reach the file without raw tokens even though this helper does no Redact call.
 func nullJSON(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return nil

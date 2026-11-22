@@ -301,7 +301,9 @@ func runTaskWait(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 		return failTask(stderr, taskstore.Validationf("неверная позиция --after %q: нужно неотрицательное число", raw))
 	}
 
-	db, err := store.Open(filepath.Join(cfg.StateDir, mcpStateDBName))
+	// This read loads stored event payloads. OpenProduction keeps the same
+	// redacting guarantee the long-lived MCP process has (SE-03).
+	db, err := store.OpenProduction(filepath.Join(cfg.StateDir, mcpStateDBName))
 	if err != nil {
 		return failTask(stderr, err)
 	}
