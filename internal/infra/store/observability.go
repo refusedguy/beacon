@@ -69,6 +69,20 @@ CREATE TABLE IF NOT EXISTS wake_observations (
 );
 `
 
+// journal_load_state caches how far PersistStats has scanned the event journal
+// and which rows were damaged. A stats read then parses only rows it has not
+// seen, instead of replaying the whole journal (OBS-03). One row holds the
+// cursor and the accumulated load errors as JSON.
+const createJournalLoadStateSQL = `
+CREATE TABLE IF NOT EXISTS journal_load_state (
+  id          INTEGER PRIMARY KEY CHECK (id = 1),
+  last_seq    INTEGER NOT NULL DEFAULT 0,
+  load_errors TEXT NOT NULL DEFAULT '[]'
+);
+INSERT OR IGNORE INTO journal_load_state (id, last_seq, load_errors)
+VALUES (1, 0, '[]');
+`
+
 // PersistState is the persist{seq,lastError} block of beacon_stats. FailedSince
 // is when the last failed write was recorded; it is zero while the last write
 // succeeded. The JSON names match the stats contract.
@@ -129,6 +143,11 @@ var (
 	_ SingleWriter = (*ObservedPersist)(nil)
 	_ SingleWriter = writeFunc(nil)
 )
+
+// journalLoadMu serializes the incremental journal scan. The scan advances a
+// cached cursor and appends to its error list, so two concurrent stats reads
+// must not race over that state.
+var journalLoadMu sync.Mutex
 
 // ObservedPersist wraps a single writer and keeps persist_progress honest.
 type ObservedPersist struct {
@@ -457,15 +476,130 @@ func (d *DB) LoadEvents() ([]JournalEvent, []LoadError, error) {
 	return events, loadErrors, nil
 }
 
+// journalLoadCache is the persisted result of the last journal scan. lastSeq
+// is the highest event seq already parsed; loadErrors holds the damaged rows
+// found so far. A store with no cache has a zero lastSeq and no errors, so the
+// first scan starts at seq 0.
+type journalLoadCache struct {
+	lastSeq    int64
+	loadErrors []LoadError
+}
+
+// readJournalLoadCache reads the cached cursor and damaged rows. A store that
+// never ran a scan reports zero lastSeq and no errors.
+func (d *DB) readJournalLoadCache() (journalLoadCache, error) {
+	ok, err := tableExists(context.Background(), d.readDB, "journal_load_state")
+	if err != nil || !ok {
+		return journalLoadCache{}, err
+	}
+	var (
+		cache journalLoadCache
+		raw   string
+	)
+	err = d.readDB.QueryRow(`
+		SELECT last_seq, load_errors FROM journal_load_state WHERE id = 1`,
+	).Scan(&cache.lastSeq, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return journalLoadCache{}, nil
+	}
+	if err != nil {
+		return journalLoadCache{}, err
+	}
+	cache.loadErrors = []LoadError{}
+	if err := json.Unmarshal([]byte(raw), &cache.loadErrors); err != nil {
+		return journalLoadCache{}, err
+	}
+	return cache, nil
+}
+
+// writeJournalLoadCache stores the advanced cursor and accumulated damaged
+// rows. It writes through the raw writer, so a stats read never advances the
+// observed persist seq and never changes persist_progress or events.
+func (d *DB) writeJournalLoadCache(cache journalLoadCache) error {
+	encoded, err := json.Marshal(cache.loadErrors)
+	if err != nil {
+		return err
+	}
+	return d.rawWrite(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createJournalLoadStateSQL); err != nil {
+			return fmt.Errorf("store: journal load state: create table: %w", err)
+		}
+		_, err := tx.Exec(`
+			INSERT INTO journal_load_state (id, last_seq, load_errors)
+			VALUES (1, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET
+			  last_seq = MAX(journal_load_state.last_seq, excluded.last_seq),
+			  load_errors = excluded.load_errors`, cache.lastSeq, string(encoded))
+		return err
+	})
+}
+
+// scanJournalLoadErrors parses only event rows newer than the cached cursor.
+// LoadEvents stays the full-journal path for callers that need the events;
+// beacon_stats only needs the damaged rows, so it does not replay good rows on
+// every call. The rows cursor is closed before the cache write so a read does
+// not hold a connection while writing.
+func (d *DB) scanJournalLoadErrors() ([]LoadError, error) {
+	journalLoadMu.Lock()
+	defer journalLoadMu.Unlock()
+
+	cache, err := d.readJournalLoadCache()
+	if err != nil {
+		return nil, err
+	}
+	lastSeq := cache.lastSeq
+	loadErrors := make([]LoadError, 0, len(cache.loadErrors))
+	loadErrors = append(loadErrors, cache.loadErrors...)
+	scanned := false
+
+	if err := func() error {
+		rows, err := d.readDB.Query(`
+			SELECT seq, payload FROM events WHERE seq > ? ORDER BY seq`, lastSeq)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				seq     int64
+				payload []byte
+			)
+			if err := rows.Scan(&seq, &payload); err != nil {
+				return err
+			}
+			scanned = true
+			if seq > lastSeq {
+				lastSeq = seq
+			}
+			var probe any
+			if err := json.Unmarshal(payload, &probe); err != nil {
+				loadErrors = append(loadErrors, LoadError{Line: seq, Reason: err.Error()})
+			}
+		}
+		return rows.Err()
+	}(); err != nil {
+		return nil, err
+	}
+
+	if scanned {
+		next := journalLoadCache{lastSeq: lastSeq, loadErrors: loadErrors}
+		if err := d.writeJournalLoadCache(next); err != nil {
+			return nil, err
+		}
+	}
+	return loadErrors, nil
+}
+
 // PersistStats is the read method for beacon_stats. It forms persist and
-// loadErrors and never writes: no read path touches persist_progress or
-// events.
+// loadErrors. Damaged rows come from an incremental journal scan that is cached
+// in the store, so a stats read does not replay the whole event journal
+// (OBS-03). The scan never touches persist_progress and never advances seq.
 func (d *DB) PersistStats() (PersistState, []LoadError, error) {
 	state, err := d.PersistState()
 	if err != nil {
 		return PersistState{}, nil, err
 	}
-	_, loadErrors, err := d.LoadEvents()
+	loadErrors, err := d.scanJournalLoadErrors()
 	if err != nil {
 		return PersistState{}, nil, err
 	}
