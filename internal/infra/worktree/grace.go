@@ -1,6 +1,9 @@
 package worktree
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 // DefaultGrace is how long a clean candidate must stay unchanged before a
 // second status check allows removal. The window gives an agent time to write
@@ -70,4 +73,54 @@ func (g Guard) Check(c Candidate) GraceOutcome {
 		return GraceRemoveErr
 	}
 	return GraceRemoved
+}
+
+// OwnerLease keeps one worktree stable between the moment a collector checks
+// it and the moment it removes it. A handoff that changes a Watch binding
+// takes the same lease for its owner, so the two actors cannot swap the target
+// mid-check. The zero value is ready to use and safe for concurrent callers.
+// Keys are cleaned paths, so two spellings of one directory contend for one
+// slot.
+type OwnerLease struct {
+	mu   sync.Mutex
+	held map[string]string
+}
+
+// Acquire takes dir for owner. It returns a release function and true when the
+// slot was free. A busy slot returns nil and false; the caller must leave the
+// worktree alone. Release is idempotent.
+func (l *OwnerLease) Acquire(dir, owner string) (func(), bool) {
+	dir = cleanDir(dir)
+	if dir == "" {
+		return nil, false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.held == nil {
+		l.held = make(map[string]string)
+	}
+	if _, busy := l.held[dir]; busy {
+		return nil, false
+	}
+	l.held[dir] = owner
+	released := false
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		if l.held[dir] == owner {
+			delete(l.held, dir)
+		}
+	}, true
+}
+
+// OwnerLeases is the process-wide registry used by collection and by handoff.
+var OwnerLeases OwnerLease
+
+// AcquireOwnerLease takes the process-wide lease on dir for owner.
+func AcquireOwnerLease(dir, owner string) (func(), bool) {
+	return OwnerLeases.Acquire(dir, owner)
 }

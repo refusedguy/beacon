@@ -1,7 +1,7 @@
 // Package worktree lists, inspects and removes git worktrees for beacon gc.
 // This file keeps the Watch protection rule that survives a head change. The
-// collector in gc.go still calls WatchIDForHead directly; wiring this guard
-// into collection belongs to the card that owns gc.go.
+// collector in gc.go turns its Watch input into anchors and calls GuardWatch,
+// so a Watch whose HEAD moved after registration still protects its worktree.
 package worktree
 
 import (
@@ -22,6 +22,25 @@ type WatchAnchor struct {
 	// RecordCheckpoint appends one after each edit and each linter fix.
 	// UndoCheckpoint accepts only commits from this list.
 	SessionCommits []string
+}
+
+// AnchorsFromHeads converts the legacy head-to-Watch map into WatchAnchors.
+// A map carries only the recorded head, so branch, binding and session
+// commits stay empty. Sorting the keys gives GuardWatch a stable order.
+func AnchorsFromHeads(heads map[string]string) []WatchAnchor {
+	if len(heads) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(heads))
+	for sha := range heads {
+		keys = append(keys, sha)
+	}
+	sort.Strings(keys)
+	anchors := make([]WatchAnchor, 0, len(keys))
+	for _, sha := range keys {
+		anchors = append(anchors, WatchAnchor{ID: heads[sha], HeadSHA: sha})
+	}
+	return anchors
 }
 
 // HeadGuardAnswer names the Watch that protected a worktree and the rule
