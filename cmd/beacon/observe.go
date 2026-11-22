@@ -218,6 +218,9 @@ func installOTLPExporter(args []string) {
 // log and leaves those links alone, so a one-shot command cannot hide the
 // server log from an operator following beacon.mcp.latest.log.
 func setupObserve(args ...string) func() {
+	// setupObserve is the only production reader of the capture env key. Set
+	// the mode before the logger and span sinks can emit an event.
+	observe.SetContentCapture(observe.ParseContentCaptureMode(os.Getenv(observe.ContentCaptureEnv)))
 	installOTLPExporter(args)
 	rawLevel := os.Getenv(beaconLogLevelEnv)
 	level, ok := observe.ParseLevel(rawLevel)

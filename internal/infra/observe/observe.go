@@ -113,8 +113,9 @@ const (
 )
 
 // ContentCaptureEnv is the configuration key whose value is parsed by
-// ParseContentCaptureMode. The composition root reads it once and installs the
-// result with SetContentCapture.
+// ParseContentCaptureMode. The CLI composition root reads it once in
+// setupObserve and installs the result with SetContentCapture before the
+// logger starts.
 const ContentCaptureEnv = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT"
 
 // ParseContentCaptureMode maps a configuration value onto a capture mode.
