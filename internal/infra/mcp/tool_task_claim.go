@@ -334,6 +334,10 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 			"task_claim: card %s already in_progress by %s at %s", chosen.ID, chosen.Agent, chosen.Time))
 	}
 
+	planMode, err := planModeOf(chosen.PlanMode)
+	if err != nil {
+		return TaskClaimOutput{}, err
+	}
 	out := TaskClaimOutput{
 		CardID:       chosen.ID,
 		Title:        chosen.Title,
@@ -342,7 +346,7 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 		Goal:         chosen.Goal,
 		Dependencies: append([]string(nil), chosen.Dependencies...),
 		OwnerFiles:   append([]string(nil), chosen.OwnerFiles...),
-		PlanMode:     planModeOf(chosen.PlanMode),
+		PlanMode:     planMode,
 		ClaimedAt:    when,
 		Handoff:      handoffOf(chosen),
 	}
@@ -538,13 +542,19 @@ func claimDependenciesReady(deps []string, resolved map[string]bool) bool {
 	return true
 }
 
-// planModeOf follows the card template: an empty field means fast, and only
-// the literal "full" opts into the full plan mode.
-func planModeOf(v string) string {
-	if strings.EqualFold(strings.TrimSpace(v), "full") {
-		return "full"
+// planModeOf follows the card template. An empty field and "fast" mean fast,
+// and "full" opts into the full plan mode. Both values ignore case. Any other
+// value is an invalid input, so a typo never turns into a silent fast claim.
+func planModeOf(v string) (string, error) {
+	mode := strings.TrimSpace(v)
+	switch {
+	case mode == "" || strings.EqualFold(mode, "fast"):
+		return "fast", nil
+	case strings.EqualFold(mode, "full"):
+		return "full", nil
+	default:
+		return "", domain.NewAppError(domain.CodeInvalidInput, fmt.Sprintf("task_claim: unknown plan mode %q", v))
 	}
-	return "fast"
 }
 
 func handoffOf(c claimCard) domain.Handoff {

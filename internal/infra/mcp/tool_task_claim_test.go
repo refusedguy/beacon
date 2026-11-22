@@ -310,16 +310,22 @@ func TestFileTaskClaimConcurrentAgentsGetDifferentCards(t *testing.T) {
 
 func TestFileTaskClaimPlanMode(t *testing.T) {
 	dir := t.TempDir()
-	writeClaimTestCard(t, dir, "IDX-05", "P1", "Режим плана: full")
-	writeClaimTestCard(t, dir, "IDX-06", "P1")
+	writeClaimTestCard(t, dir, "IDX-01", "P1", "Режим плана: full")
+	writeClaimTestCard(t, dir, "IDX-02", "P1")
+	writeClaimTestCard(t, dir, "IDX-03", "P1", "Режим плана: FULL")
+	writeClaimTestCard(t, dir, "IDX-04", "P1", "Режим плана: Fast")
+	writeClaimTestCard(t, dir, "IDX-05", "P1", "Режим плана: ful")
+	writeClaimTestCard(t, dir, "IDX-06", "P1", "Режим плана: FUL")
 	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
 
 	for _, tc := range []struct {
 		id   string
 		want string
 	}{
-		{"IDX-05", "full"},
-		{"IDX-06", "fast"},
+		{"IDX-01", "full"},
+		{"IDX-02", "fast"},
+		{"IDX-03", "full"},
+		{"IDX-04", "fast"},
 	} {
 		out, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_plan", CardID: tc.id}, "2026-11-21T12:00:00Z")
 		if err != nil {
@@ -327,6 +333,25 @@ func TestFileTaskClaimPlanMode(t *testing.T) {
 		}
 		if out.PlanMode != tc.want {
 			t.Fatalf("%s planMode = %q, want %q", tc.id, out.PlanMode, tc.want)
+		}
+	}
+
+	// A rejected plan mode must leave the card untouched, so the agent can fix
+	// the typo and claim it again.
+	for _, id := range []string{"IDX-05", "IDX-06"} {
+		_, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_bad", CardID: id}, "2026-11-21T12:00:00Z")
+		if code := claimErrorCode(t, err); code != domain.CodeInvalidInput {
+			t.Fatalf("claim %s code = %s, want INVALID_INPUT", id, code)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, id+".md"))
+		if err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		if !strings.Contains(string(data), "Статус: todo") {
+			t.Fatalf("%s changed status after a rejected claim:\n%s", id, data)
+		}
+		if strings.Contains(string(data), "Агент: ses_bad") {
+			t.Fatalf("%s recorded the rejected agent:\n%s", id, data)
 		}
 	}
 }
