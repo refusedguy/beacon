@@ -239,7 +239,7 @@ func humanJSONHarness(t *testing.T, withConnection bool) (*CLI, *bytes.Buffer, *
 }
 
 func TestW8BHumanJSONHTTP(t *testing.T) {
-	c, out, errOut, _ := humanJSONHarness(t, true)
+	c, out, errOut := humanJSONHarness(t, true)
 	if code := runHuman(c, []string{"--format", "json", "approve", "w-json"}); code != 0 {
 		t.Fatalf("code = %d, stderr = %s", code, errOut.String())
 	}
@@ -253,7 +253,7 @@ func TestW8BHumanJSONHTTP(t *testing.T) {
 }
 
 func TestW8BHumanJSONSQLite(t *testing.T) {
-	c, out, errOut, _ := humanJSONHarness(t, false)
+	c, out, errOut := humanJSONHarness(t, false)
 	if code := runHuman(c, []string{"--format", "json", "unblock", "b-json"}); code != 0 {
 		t.Fatalf("code = %d, stderr = %s", code, errOut.String())
 	}
