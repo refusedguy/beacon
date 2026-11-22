@@ -81,3 +81,72 @@ func TestChecksQueryAgainstGitHub(t *testing.T) {
 		t.Fatalf("GraphQL response has no p0 alias:\n%s", out)
 	}
 }
+
+// TestBuildChecksQueryRequestsRequired guards the source of Check.Required.
+// Without isRequired every payload check would look informational.
+func TestBuildChecksQueryRequestsRequired(t *testing.T) {
+	query := BuildChecksQuery([]PR{{Repo: "refusedguy/beacon", Number: 340}})
+	want := "isRequired(pullRequestNumber:340)"
+	if !strings.Contains(query, want) {
+		t.Fatalf("query misses %q:\n%s", want, query)
+	}
+}
+
+// TestCheckFromNodeKeepsRequired checks the provider to Check step. A missing
+// isRequired field stays nil so the writer can treat it as unknown.
+func TestCheckFromNodeKeepsRequired(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		name string
+		raw  string
+		want *bool
+	}{
+		{"required", `{"__typename":"CheckRun","name":"build","isRequired":true}`, &yes},
+		{"informational", `{"__typename":"CheckRun","name":"info","isRequired":false}`, &no},
+		{"unknown", `{"__typename":"StatusContext","context":"lint","state":"FAILURE"}`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := checkFromNode([]byte(tc.raw))
+			if !ok {
+				t.Fatalf("checkFromNode rejected %s", tc.raw)
+			}
+			if (got.Required == nil) != (tc.want == nil) {
+				t.Fatalf("Required = %v, want %v", got.Required, tc.want)
+			}
+			if tc.want != nil && *got.Required != *tc.want {
+				t.Fatalf("Required = %v, want %v", *got.Required, *tc.want)
+			}
+		})
+	}
+}
+
+// TestChecksPayloadKeepsRequired checks the writer step. The payload must
+// carry both values from the provider, and an unknown source must not become
+// mandatory.
+func TestChecksPayloadKeepsRequired(t *testing.T) {
+	yes, no := true, false
+	raw, err := checksPayload([]Check{
+		{Name: "build", Conclusion: "SUCCESS", Required: &yes},
+		{Name: "info", Conclusion: "FAILURE", Required: &no},
+		{Name: "unknown", Conclusion: "SUCCESS"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows map[string]struct {
+		Required bool `json:"required"`
+	}
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows["build"].Required != true {
+		t.Errorf("required check lost its flag: %s", raw)
+	}
+	if rows["info"].Required != false {
+		t.Errorf("informational check became required: %s", raw)
+	}
+	if rows["unknown"].Required != false {
+		t.Errorf("unknown source became required: %s", raw)
+	}
+}
