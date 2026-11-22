@@ -162,15 +162,16 @@ func isLogFileName(name string) bool {
 		(strings.HasSuffix(name, ".log") || strings.HasSuffix(name, ".jsonl"))
 }
 
-// matchLogLine applies the field filters to one line. A line that is not a
-// JSON object cannot match a field filter.
+// matchLogLine applies the field filters to one line. Both JSONL records and
+// slog text-handler lines are parsed, so field filters such as --errors work
+// regardless of BEACON_LOG_FORMAT.
 func matchLogLine(line string, opts LogFilter) bool {
 	if opts.WatchID == "" && opts.PR == 0 && !opts.OnlyErrors {
 		return true
 	}
 	record, ok := parseLogRecord(line)
 	if !ok {
-		return false
+		record = parseLogFmtLine(line)
 	}
 	if opts.WatchID != "" {
 		got, _ := record[FieldWatchID].(string)
