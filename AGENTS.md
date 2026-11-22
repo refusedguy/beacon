@@ -274,6 +274,10 @@ Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools
 
 Все тексты, которые ты пишешь (ответы, docs, README, PR body, commit messages, комментарии), пропускай через правила скилла `unslop`: без em dashes, простые слова, активный залог, одна мысль на предложение, без заполняющих фраз и без «rule of three». Загрузи скилл `unslop` перед написанием любой прозы.
 
+## Аудит подавлений не заменяет unslop
+
+unslop правит прозу: ответы, docs, README, тела PR, commit messages и комментарии. Второй проход, аудит подавлений из `docs/templates/executor-task.md`, читает код: комментарии и подавления правил линтера. Это разные проходы. unslop меняет текст. Аудит подавлений даёт только отчёт и не меняет файлы. Пометка `MUST KILL` из отчёта уходит в обычный цикл с OwnerFiles. Источник: карточка CP-17 и `pstack/agents/comment-sicko.md`.
+
 ## Коммиты
 
 `refusedguy <refusedguy@users.noreply.github.com>`, без `-c`, без `git add .`. Только свои файлы.
