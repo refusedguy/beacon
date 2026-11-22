@@ -40,7 +40,9 @@ type Schedule struct {
 
 // createSchedulesSQL is issued on first use by every method that can create
 // the table. A store that has never written a schedule simply has no table,
-// which DueSchedules treats as "nothing is due".
+// which DueSchedules treats as "nothing is due". The index serves the
+// (enabled, next_run) predicate and the next_run, id order of DueSchedules;
+// an existing database gets it on the next schedule write.
 const createSchedulesSQL = `
 CREATE TABLE IF NOT EXISTS schedules (
   id          TEXT PRIMARY KEY,
@@ -50,6 +52,7 @@ CREATE TABLE IF NOT EXISTS schedules (
   next_run    INTEGER NOT NULL,
   enabled     INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS schedules_by_enabled_next_run ON schedules(enabled, next_run);
 `
 
 // validScheduleKind reports whether kind is one of the supported schedule

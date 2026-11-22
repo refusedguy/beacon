@@ -983,6 +983,10 @@ var createInboxSQL = []string{
 	   lease_until   INTEGER NOT NULL DEFAULT 0,
 	   created_at    INTEGER NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS inbox_by_peer_state ON inbox_messages(peer_name, state)`,
+	// InboxClaim and InboxMessages order by created_at after the same two
+	// equality predicates. A separate index keeps the old one intact on
+	// databases that already have it.
+	`CREATE INDEX IF NOT EXISTS inbox_by_peer_state_created ON inbox_messages(peer_name, state, created_at)`,
 }
 
 // InboxMessage is one durable message for a called session's inbox. Its
@@ -2216,6 +2220,9 @@ var createQueueTablesSQL = []string{
 	   lease_until   INTEGER NOT NULL DEFAULT 0,
 	   created_at    INTEGER NOT NULL)`,
 	`CREATE INDEX IF NOT EXISTS queue_tasks_by_queue ON queue_tasks(queue, state, created_at, id)`,
+	// Reads that filter on queue and sort by created_at cannot use the leading
+	// state column of the index above. This one keeps a queue scan ordered.
+	`CREATE INDEX IF NOT EXISTS queue_tasks_by_queue_created ON queue_tasks(queue, created_at, id)`,
 	`CREATE TABLE IF NOT EXISTS queue_fence_counters (
 	   id         INTEGER PRIMARY KEY CHECK (id = 1),
 	   last_token INTEGER NOT NULL)`,

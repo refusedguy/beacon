@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS receipts (
   UNIQUE (obligation_id, attempt)
 );
 CREATE INDEX IF NOT EXISTS receipts_by_obligation ON receipts(obligation_id, seq);
+CREATE INDEX IF NOT EXISTS receipts_by_outcome ON receipts(outcome);
 `
 
 // Receipt is one whole line of receipts.jsonl. The wire shape is

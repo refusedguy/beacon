@@ -42,6 +42,13 @@ func ensureControlPlaneTables(tx *sql.Tx) error {
 	if _, err := tx.Exec(string(body)); err != nil {
 		return fmt.Errorf("store: control plane: ensure tables: %w", err)
 	}
+	// ActiveBlockers filters by status and orders by created_at. The lookup
+	// index from migration 0006 starts with repo, so it cannot serve that read.
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS blocker_incidents_by_status_created
+		ON blocker_incidents(status, created_at)`); err != nil {
+		return fmt.Errorf("store: control plane: ensure blocker status index: %w", err)
+	}
 	return nil
 }
 
