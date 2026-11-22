@@ -1,6 +1,7 @@
 package taskstore
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,7 @@ func testGraph(t *testing.T, edges ...Edge) *Graph {
 }
 
 func TestEdgeKinds(t *testing.T) {
-	want := []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
+	want := []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
 	got := ValidEdgeKinds()
 	if len(got) != len(want) {
 		t.Fatalf("ValidEdgeKinds = %v, ждали %v", got, want)
@@ -472,5 +473,104 @@ func TestGraphCycleReportKeepsAddEdgeRejection(t *testing.T) {
 	}
 	if got := g.CycleReport(); len(got.Cycles) != 0 {
 		t.Fatalf("граф с запретом цикла дал отчёт: %+v", got)
+	}
+}
+
+// ---- CB-04: третий блокирующий тип ребра ----
+
+func TestConditionalBlocksIsBlocking(t *testing.T) {
+	for _, kind := range []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks} {
+		if !IsBlockingEdgeKind(kind) {
+			t.Errorf("%q не отнесён к блокирующим", kind)
+		}
+	}
+	for _, kind := range []EdgeKind{EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal, "conflicts-with"} {
+		if IsBlockingEdgeKind(kind) {
+			t.Errorf("%q отнесён к блокирующим", kind)
+		}
+	}
+}
+
+func TestConditionalBlocksKeepsKindInTraversalAndJSON(t *testing.T) {
+	g := testGraph(t, Edge{From: "T3.1", To: "T3.2", Kind: EdgeConditionalBlocks})
+	tr := g.BlockedTraverse("T3.1", 0)
+	if len(tr.Visited) != 2 || tr.Visited[1] != "T3.2" {
+		t.Fatalf("BlockedTraverse = %+v", tr)
+	}
+	if len(tr.Edges) != 1 || tr.Edges[0].Kind != EdgeConditionalBlocks {
+		t.Fatalf("тип ребра в обходе = %+v, ждали conditional-blocks", tr.Edges)
+	}
+	data, err := json.Marshal(tr.Edges[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `"kind":"conditional-blocks"`; !strings.Contains(string(data), want) {
+		t.Fatalf("сериализация = %s, ждали %s", data, want)
+	}
+}
+
+func TestConditionalBlocksCycleRejectedByAddEdge(t *testing.T) {
+	g := testGraph(t,
+		Edge{From: "T3.1", To: "T3.2", Kind: EdgeConditionalBlocks},
+		Edge{From: "T3.2", To: "T3.3", Kind: EdgeDependsOn},
+	)
+	err := g.AddEdge("T3.3", "T3.1", EdgeConditionalBlocks)
+	if err == nil {
+		t.Fatal("цикл через conditional-blocks не отклонён")
+	}
+	if Code(err) != ExitValidation || !strings.Contains(err.Error(), "цикл") {
+		t.Fatalf("ошибка = %q, код = %d", err, Code(err))
+	}
+	if g.Size() != 2 {
+		t.Fatalf("граф изменился при ошибке: Size = %d", g.Size())
+	}
+}
+
+func TestConditionalBlocksBlocksUntilSourceCloses(t *testing.T) {
+	blocker := Card{ID: "T3.1", Status: "todo"}
+	subject := Card{ID: "T3.2", Status: "blocked", Dependencies: []string{"conditional-blocks:T3.1"}}
+	cards := []Card{blocker, subject}
+
+	g := BlockedGraph(cards)
+	if got := g.BlockedTraverse("T3.1", 0).Visited; len(got) != 2 || got[1] != "T3.2" {
+		t.Fatalf("зависимый не достигнут: %v", got)
+	}
+	ready := func() int {
+		n := 0
+		for _, d := range RecheckDecisions(cards, map[string]bool{"T3.2": true}) {
+			if d.Want == "todo" {
+				n++
+			}
+		}
+		return n
+	}
+	if got := ready(); got != 0 {
+		t.Fatalf("готовых до закрытия = %d, ждали 0", got)
+	}
+
+	cards[0].Status = "done"
+	if got := ready(); got != 1 {
+		t.Fatalf("готовых после закрытия = %d, ждали 1", got)
+	}
+	if got := StaleBlocked(cards); len(got) != 1 || got[0] != "T3.2" {
+		t.Fatalf("устаревший blocked = %v, ждали [T3.2]", got)
+	}
+}
+
+func TestConditionalBlocksPreservesOtherEdgeKinds(t *testing.T) {
+	c := Card{ID: "T3.2", Dependencies: []string{"T3.1", "depends-on:T3.3", "conditional-blocks:T3.4", "supersedes:T3.5"}}
+	got := blockingDeps(c)
+	want := []blockedDep{
+		{kind: EdgeBlocks, id: "T3.1"},
+		{kind: EdgeDependsOn, id: "T3.3"},
+		{kind: EdgeConditionalBlocks, id: "T3.4"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("blockingDeps = %v, ждали %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("deps[%d] = %+v, ждали %+v", i, got[i], want[i])
+		}
 	}
 }

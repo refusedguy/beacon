@@ -10,11 +10,12 @@ import (
 type EdgeKind string
 
 const (
-	EdgeBlocks           EdgeKind = "blocks"
-	EdgeDependsOn        EdgeKind = "depends-on"
-	EdgeSupersedes       EdgeKind = "supersedes"
-	EdgeRelated          EdgeKind = "related"
-	EdgeWaitsForExternal EdgeKind = "waits-for-external"
+	EdgeBlocks            EdgeKind = "blocks"
+	EdgeDependsOn         EdgeKind = "depends-on"
+	EdgeConditionalBlocks EdgeKind = "conditional-blocks"
+	EdgeSupersedes        EdgeKind = "supersedes"
+	EdgeRelated           EdgeKind = "related"
+	EdgeWaitsForExternal  EdgeKind = "waits-for-external"
 )
 
 // MaxEdgeKindLen задаёт предел длины типа ребра. Значение выведено из ширины
@@ -26,7 +27,7 @@ const MaxEdgeKindLen = 32
 // изменение которой не меняет канонический набор. Проекты могут добавлять
 // свои типы через EdgeKind, не расширяя этот список.
 func ValidEdgeKinds() []EdgeKind {
-	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
+	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
 }
 
 // IsValidEdgeKind сообщает, можно ли записать тип ребра. Как и в beads,
@@ -48,6 +49,19 @@ func IsWellKnownEdgeKind(kind EdgeKind) bool {
 		}
 	}
 	return false
+}
+
+// IsBlockingEdgeKind сообщает, удерживает ли ребро карточку заблокированной,
+// пока источник не закрыт. Жёстко блокируют три отношения: blocks,
+// depends-on и conditional-blocks. Supersedes, related и внешние гейты
+// готовность карточки не определяют.
+func IsBlockingEdgeKind(kind EdgeKind) bool {
+	switch kind {
+	case EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks:
+		return true
+	default:
+		return false
+	}
 }
 
 // IsExternalGateTarget проверяет цель внешнего гейта. Первая версия принимает
@@ -86,12 +100,14 @@ func allDigits(s string) bool {
 }
 
 // Edge это одно направленное ребро. From — ID карточки любого семейства. Для
-// четырёх внутренних типов To тоже ID карточки. Для waits-for-external To —
-// цель внешнего гейта вида gh:pr:42 или gh:run:ID.
+// пяти внутренних типов To тоже ID карточки. Для waits-for-external To —
+// цель внешнего гейта вида gh:pr:42 или gh:run:ID. Поле Kind сериализуется
+// как строка, поэтому conditional-blocks сохраняет свою идентичность в выводе
+// графа и не превращается в blocks.
 type Edge struct {
-	From string
-	To   string
-	Kind EdgeKind
+	From string   `json:"from"`
+	To   string   `json:"to"`
+	Kind EdgeKind `json:"kind"`
 }
 
 // Traversal это результат обхода графа. Visited содержит каждый узел один раз
@@ -187,6 +203,18 @@ func (g *Graph) reaches(start, target string) bool {
 // предела обход останавливается и Truncated принимает значение true.
 // limit <= 0 снимает ограничение.
 func (g *Graph) Traverse(start string, limit int) Traversal {
+	return g.traverse(start, limit, nil)
+}
+
+// BlockedTraverse обходит граф только по блокирующим рёбрам. Условное ребро
+// conditional-blocks проходит этот фильтр наравне с blocks и depends-on,
+// поэтому расчёт готовности видит его как жёсткую блокировку.
+func (g *Graph) BlockedTraverse(start string, limit int) Traversal {
+	return g.traverse(start, limit, IsBlockingEdgeKind)
+}
+
+// traverse это общий обход. Фильтр nil пропускает все типы рёбер.
+func (g *Graph) traverse(start string, limit int, include func(EdgeKind) bool) Traversal {
 	result := Traversal{Start: start}
 	if !IsID(start) {
 		return result
@@ -198,6 +226,9 @@ func (g *Graph) Traverse(start string, limit int) Traversal {
 		cur := queue[0]
 		queue = queue[1:]
 		for _, e := range g.out[cur] {
+			if include != nil && !include(e.Kind) {
+				continue
+			}
 			if seen[e.To] {
 				continue
 			}
@@ -373,14 +404,13 @@ func resolvedStatus(status string) bool {
 // и том же ребре.
 //
 // waits-for-external намеренно отсутствует в GateEdgeKinds: AN-03 владеет
-// внешними гейтами и движок считает их отдельно. conditional-blocks не
-// добавляется здесь: это владение CB-04. Пять типов рёбер и их валидация выше
-// не меняются.
+// внешними гейтами и движок считает их отдельно. CB-04 добавляет
+// conditional-blocks в общий gate-код наравне с blocks.
 
 // GateEdgeKinds возвращает канонический набор типов рёбер, цель которых своим
 // статусом решает, держит ли она карточку subject. Возвращается копия.
 func GateEdgeKinds() []string {
-	return []string{"blocks", "depends-on"}
+	return []string{"blocks", "depends-on", string(EdgeConditionalBlocks)}
 }
 
 // IsGateEdgeKind сообщает, несёт ли ребро этого типа гейт.
@@ -393,8 +423,43 @@ func IsGateEdgeKind(kind string) bool {
 	return false
 }
 
-// BlockedGraph builds a graph with an edge from each dependency to the card
-// that depends on it. Walking from a changed ID therefore reaches every
+// blockedDep это одна зависимость карточки с её типом. Голый ID в поле
+// Зависимости сохраняет прежний тип blocks. Запись conditional-blocks:T3.1
+// задаёт условную блокировку и сохраняет этот тип в рёбрах графа.
+type blockedDep struct {
+	kind EdgeKind
+	id   string
+}
+
+// blockingDeps разбирает зависимости карточки. Префикс с известным
+// блокирующим типом меняет тип ребра, но не меняет саму цель.
+func blockingDeps(c Card) []blockedDep {
+	var out []blockedDep
+	for _, raw := range c.Dependencies {
+		dep := strings.TrimSpace(raw)
+		if dep == "" {
+			continue
+		}
+		kind := EdgeBlocks
+		if prefix, target, ok := strings.Cut(dep, ":"); ok {
+			candidate := EdgeKind(strings.TrimSpace(prefix))
+			if IsWellKnownEdgeKind(candidate) && !IsBlockingEdgeKind(candidate) {
+				continue
+			}
+			if IsBlockingEdgeKind(candidate) {
+				kind = candidate
+				dep = strings.TrimSpace(target)
+			}
+		}
+		if dep != "" {
+			out = append(out, blockedDep{kind: kind, id: dep})
+		}
+	}
+	return out
+}
+
+// BlockedGraph builds a graph with a blocking edge from each dependency to the
+// card that depends on it. Walking from a changed ID therefore reaches every
 // dependent that the change can affect. Unusable edges are skipped so a bad ID
 // in one card does not hide the rest of the graph.
 func BlockedGraph(cards []Card) *Graph {
@@ -404,12 +469,11 @@ func BlockedGraph(cards []Card) *Graph {
 		known[c.ID] = true
 	}
 	for _, c := range cards {
-		for _, raw := range c.Dependencies {
-			dep := strings.TrimSpace(raw)
-			if dep == "" || !known[dep] {
+		for _, dep := range blockingDeps(c) {
+			if !known[dep.id] {
 				continue
 			}
-			_ = g.AddEdge(dep, c.ID, EdgeBlocks)
+			_ = g.AddEdge(dep.id, c.ID, dep.kind)
 		}
 	}
 	return g
@@ -462,12 +526,8 @@ func RecheckDecisions(cards []Card, scope map[string]bool) []BlockedDecision {
 			continue
 		}
 		want := "todo"
-		for _, raw := range c.Dependencies {
-			dep := strings.TrimSpace(raw)
-			if dep == "" {
-				continue
-			}
-			blocker, ok := byID[dep]
+		for _, dep := range blockingDeps(c) {
+			blocker, ok := byID[dep.id]
 			if !ok || !resolvedStatus(blocker.Status) {
 				want = "blocked"
 				break
