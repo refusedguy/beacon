@@ -163,6 +163,15 @@ type Config struct {
 	SpanSink SpanSink
 }
 
+// configWarnings holds messages emitted before the composition root installs
+// the log writer. Package init calls ConfigFromEnv before main, so its warnings
+// would otherwise reach only stderr. WarnConfig buffers each message until
+// ReplayConfigWarnings forwards it to the observe log.
+var configWarnings struct {
+	mu      sync.Mutex
+	pending []string
+}
+
 // WarnConfig reports an environment value that the reader replaced with a
 // default. The standard logger reaches stderr before the composition root
 // installs the log writer, then reaches the same rotating log as the other
@@ -173,7 +182,24 @@ func WarnConfig(env, value, reason string) {
 	if reason != "" {
 		msg += ": " + reason
 	}
+	configWarnings.mu.Lock()
+	configWarnings.pending = append(configWarnings.pending, msg)
+	configWarnings.mu.Unlock()
 	log.Print(msg)
+}
+
+// ReplayConfigWarnings forwards buffered warnings through the standard logger,
+// which the composition root has just pointed at the observe log. It drains the
+// buffer so a later replay does not emit the same warning twice. Callers invoke
+// it right after installing the log writer, not from package init.
+func ReplayConfigWarnings() {
+	configWarnings.mu.Lock()
+	pending := configWarnings.pending
+	configWarnings.pending = nil
+	configWarnings.mu.Unlock()
+	for _, msg := range pending {
+		log.Print(msg)
+	}
 }
 
 // ConfigFromEnv reads the Beacon flag, the exporter name and the standard OTLP
