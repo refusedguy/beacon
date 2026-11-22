@@ -239,7 +239,7 @@ var toolDescriptors = []toolDescriptor{
 	},
 	{
 		Name:        "beacon_ack",
-		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
+		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok.",
 		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
 		Kind:        kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
@@ -423,7 +423,7 @@ func attachAckWithPolicy(s *mcpsdk.Server, handler *AckHandler, policy ToolPolic
 	s.RemoveTools("beacon_ack")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:        "beacon_ack",
-		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
+		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok.",
 		Annotations: attachToolAnnotations(true),
 	}, (&autoAllowAck{handler: handler, policy: policy}).Handle)
 }

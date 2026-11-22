@@ -476,9 +476,23 @@ func ThreadReadOutputSchema() (*jsonschema.Schema, error) {
 	return OutputSchema[ThreadReadOutput]()
 }
 
-// OKOutput is the response of beacon_ack and beacon_cancel_watch.
+// OKOutput is the response of beacon_ack and beacon_cancel_watch. A plain ack
+// marshals to exactly {"ok":true}: the decision fields have omitempty and stay
+// absent. A decision ack also reports which effect it applied, so the caller
+// can tell the first application from a repeat without reading the Watch.
 type OKOutput struct {
 	OK bool `json:"ok"`
+	// Resumed is true only when this ack resumed a stopped agent. A repeat of
+	// the same decision leaves it false.
+	Resumed bool `json:"resumed,omitempty"`
+	// ResumeRevision is the Watch revision after the resume. It is zero when
+	// this ack applied no decision.
+	ResumeRevision uint64 `json:"resumeRevision,omitempty"`
+	// Blocked is true when this ack applied a blocked:not_mine decision.
+	Blocked bool `json:"blocked,omitempty"`
+	// Unblocked is true when this ack applied a blocked:resolved decision to a
+	// blocked Watch.
+	Unblocked bool `json:"unblocked,omitempty"`
 }
 
 // DeferWiringOutput is the response of beacon_defer_wiring (W12-B). Created is

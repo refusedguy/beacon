@@ -906,19 +906,26 @@ func TestAckDecisionStaleRevisionDiscarded(t *testing.T) {
 	}
 }
 
-// TestAckDecisionHandleStaysOkOnly proves the decision keeps the ADR 0028
-// response contract: the MCP tool still returns ok-only with no verdict. The
-// decision detail is read from the receipt, not from the tool response.
+// TestAckDecisionHandleStaysOkOnly proves the ADR 0028 response still carries
+// no verdict. A decision ack now also reports the effect it applied: resumed
+// and resumeRevision. A plain ack keeps the ok-only shape.
 func TestAckDecisionHandleStaysOkOnly(t *testing.T) {
-	_, _, h, w, o, _ := ackDecisionFixture(t)
+	store, _, h, w, o, _ := ackDecisionFixture(t)
 	_, out, err := h.Handle(context.Background(), nil, AckInput{
 		WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionApprove), DecisionID: "decision-1",
 	})
 	if err != nil {
 		t.Fatalf("Handle with decision: %v", err)
 	}
-	if !out.OK {
-		t.Fatal("Handle with decision did not return ok")
+	if !out.OK || !out.Resumed {
+		t.Fatalf("Handle with decision: out %+v, want ok and resumed", out)
+	}
+	got, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read Watch after decision: %v", err)
+	}
+	if out.ResumeRevision != got.Revision {
+		t.Errorf("resumeRevision = %d, want committed Watch revision %d", out.ResumeRevision, got.Revision)
 	}
 	body, err := json.Marshal(out)
 	if err != nil {
@@ -928,8 +935,9 @@ func TestAckDecisionHandleStaysOkOnly(t *testing.T) {
 	if err := json.Unmarshal(body, &fields); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if len(fields) != 1 || fields["ok"] != true {
-		t.Errorf("decision ack response = %s, want only ok:true", body)
+	if len(fields) != 3 || fields["ok"] != true || fields["resumed"] != true ||
+		fields["resumeRevision"] != float64(got.Revision) {
+		t.Errorf("decision ack response = %s, want ok:true, resumed:true, resumeRevision:%d", body, got.Revision)
 	}
 }
 
@@ -1028,6 +1036,9 @@ func TestAckBlockedNotMine(t *testing.T) {
 	if !ok || stamped.ClaimedAt.IsZero() {
 		t.Error("blocked ack did not record the intention with claimedAt")
 	}
+	if !out.Blocked {
+		t.Errorf("blocked ack output = %+v, want blocked:true", out)
+	}
 	body, err := json.Marshal(out)
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
@@ -1036,8 +1047,8 @@ func TestAckBlockedNotMine(t *testing.T) {
 	if err := json.Unmarshal(body, &fields); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if len(fields) != 1 || fields["ok"] != true {
-		t.Errorf("blocked ack response = %s, want only ok:true", body)
+	if len(fields) != 2 || fields["ok"] != true || fields["blocked"] != true {
+		t.Errorf("blocked ack response = %s, want ok:true, blocked:true", body)
 	}
 }
 
