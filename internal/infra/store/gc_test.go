@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -204,6 +206,150 @@ func TestGCObligationsKeepsLiveRetry(t *testing.T) {
 	}
 	if len(again) != 0 {
 		t.Fatalf("second pass = %v, want empty", gcObligationPlanIDs(again))
+	}
+}
+
+// TestGCObligationsSkipsCandidateChangedAfterPlan covers the window between
+// the collector's snapshot and the apply transaction. A second store handle
+// changes the candidate in that window; the collector must leave the row in
+// place and report the item as skipped.
+func TestGCObligationsSkipsCandidateChangedAfterPlan(t *testing.T) {
+	now := time.Date(2026, time.January, 1, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-72 * time.Hour)
+
+	cases := []struct {
+		name         string
+		missing      bool
+		wantRevision uint64
+		interfere    func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation)
+	}{
+		{
+			name:         "unchanged candidate is erased",
+			wantRevision: 1,
+		},
+		{
+			name: "watch becomes live again",
+			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
+				w.Status = domain.StatusWatching
+				w.ClosedAt = time.Time{}
+				if err := other.SaveWatch(w); err != nil {
+					t.Fatalf("SaveWatch(live): %v", err)
+				}
+			},
+		},
+		{
+			name: "watch close time moves",
+			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
+				w.ClosedAt = now.Add(-time.Hour)
+				if err := other.SaveWatch(w); err != nil {
+					t.Fatalf("SaveWatch(recent): %v", err)
+				}
+			},
+		},
+		{
+			name:         "obligation revision changes",
+			wantRevision: 2,
+			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
+				o.Revision = 2
+				payload, err := json.Marshal(o)
+				if err != nil {
+					t.Fatalf("Marshal: %v", err)
+				}
+				if err := other.Write(context.Background(), func(tx *sql.Tx) error {
+					_, err := tx.Exec(`UPDATE obligations SET revision = ?, payload = ? WHERE id = ?`, o.Revision, payload, o.ID)
+					return err
+				}); err != nil {
+					t.Fatalf("Write(revision): %v", err)
+				}
+			},
+		},
+		{
+			name:    "missing watch appears",
+			missing: true,
+			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
+				w.Status = domain.StatusWatching
+				w.ClosedAt = time.Time{}
+				if err := other.SaveWatch(w); err != nil {
+					t.Fatalf("SaveWatch(new): %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.db")
+			d, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer d.Close()
+			other, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open second handle: %v", err)
+			}
+			defer other.Close()
+
+			w := gcObligationTestWatch("w-race", domain.StatusClosed, old, closeReasonMerged)
+			o := gcObligationTestObligation("o-race", w.ID, old)
+			if !tc.missing {
+				if err := d.SaveWatch(w); err != nil {
+					t.Fatalf("SaveWatch: %v", err)
+				}
+			}
+			if err := d.SaveObligation(o); err != nil {
+				t.Fatalf("SaveObligation: %v", err)
+			}
+
+			plan, err := d.GCObligations(context.Background(), now, ObligationGCRetention, false)
+			if err != nil {
+				t.Fatalf("GCObligations dry run: %v", err)
+			}
+			wantReason := "closed"
+			if tc.missing {
+				wantReason = "missing"
+			}
+			if len(plan) != 1 || plan[0].ID != o.ID || plan[0].Reason != wantReason {
+				t.Fatalf("plan = %+v, want one %s item with reason %s", plan, o.ID, wantReason)
+			}
+
+			prev := gcBetweenPlanAndApply
+			gcBetweenPlanAndApply = func() {
+				if tc.interfere != nil {
+					tc.interfere(t, other, w, o)
+				}
+			}
+			t.Cleanup(func() { gcBetweenPlanAndApply = prev })
+
+			applied, err := d.GCObligations(context.Background(), now, ObligationGCRetention, true)
+			if err != nil {
+				t.Fatalf("GCObligations apply: %v", err)
+			}
+			wantSkipped := tc.interfere != nil
+			if len(applied) != 1 || applied[0].ID != o.ID || applied[0].Skipped != wantSkipped {
+				t.Fatalf("applied = %+v, want one %s item with skipped=%v", applied, o.ID, wantSkipped)
+			}
+
+			got, getErr := d.Obligation(o.ID)
+			if wantSkipped {
+				if getErr != nil {
+					t.Fatalf("changed obligation was erased: %v", getErr)
+				}
+				if got.Revision != tc.wantRevision {
+					t.Fatalf("revision = %d, want %d", got.Revision, tc.wantRevision)
+				}
+				if _, err := d.ObligationErase(o.ID); err == nil {
+					t.Error("skipped obligation got an erase record")
+				}
+				return
+			}
+			if getErr == nil {
+				t.Fatalf("unchanged obligation still present: %+v", got)
+			}
+			if _, err := d.ObligationErase(o.ID); err != nil {
+				t.Fatalf("missing erase record: %v", err)
+			}
+		})
 	}
 }
 
