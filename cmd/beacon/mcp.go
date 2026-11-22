@@ -1944,7 +1944,14 @@ func reconcileMaintenance(ctx context.Context, cfg reconcileConfig) {
 	if _, err := cfg.db.ArchiveRun(ctx, time.Now()); err != nil {
 		observe.ActorError("archive", "", err)
 	}
-	if err := cfg.db.Checkpoint(ctx); err != nil {
+	// DB.Checkpoint queries writeDB, whose only connection is held by the
+	// dedicated writer for the process lifetime. A direct call waits forever.
+	// Run the same PRAGMA on that writer so the checkpoint can complete.
+	if err := cfg.db.Write(ctx, func(tx *sql.Tx) error {
+		var busy, log, checkpointed int
+		return tx.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").
+			Scan(&busy, &log, &checkpointed)
+	}); err != nil {
 		observe.ActorError("checkpoint", "", err)
 	}
 
