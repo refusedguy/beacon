@@ -64,6 +64,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskNeedsInput(args[1:], stdout, stderr, cfg)
 	case "why":
 		return runTaskWhy(args[1:], stdout, stderr, cfg)
+	case "ready":
+		return runTaskReady(args[1:], stdout, stderr, cfg)
 	case "wait":
 		return runTaskWait(args[1:], stdout, stderr, cfg)
 	case "check-launch":
@@ -82,7 +84,7 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 	}
 }
 
-const taskUsage = "использование: beacon task list|new|take|defer|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
+const taskUsage = "использование: beacon task list|new|take|defer|done|needs-input|why|ready|wait|check-launch|--self-test [flags]\n" +
 	"               beacon task defer <ID> --until RFC3339|YYYY-MM-DD [--forever]\n" +
 	"               beacon task lease acquire|release|check [flags]\n" +
 	"               beacon task schedule [create|list|delete] [flags]\n" +
@@ -454,6 +456,155 @@ func writeWhyJSON(stdout io.Writer, id string, chain []whyStep, gated []taskstor
 		return taskstore.ExitStartup
 	}
 	fmt.Fprintln(stdout, string(b))
+	return taskstore.ExitOK
+}
+
+// ---- CBX-16: объяснение ready-очереди ----
+//
+// readyExplainView отдаёт оператору причины готовности вместо одного булева
+// признака. ready содержит карточки без открытых блокировщиков. blocked
+// содержит карточки с хотя бы одним открытым блокировщиком. Три списка
+// зависимостей разделяют закрытые, закреплённые и открытые цели блокирующих
+// рёбер.
+
+type readyDep struct {
+	ID     string `json:"id"`
+	Type   string `json:"type"`
+	Reason string `json:"reason"`
+}
+
+type readyExplainEntry struct {
+	ID                 string     `json:"id"`
+	ResolvedBlockers   []readyDep `json:"resolvedBlockers"`
+	PinnedDependencies []readyDep `json:"pinnedDependencies"`
+	OpenDependencies   []readyDep `json:"openDependencies"`
+}
+
+type readyExplainView struct {
+	Ready   []readyExplainEntry `json:"ready"`
+	Blocked []readyExplainEntry `json:"blocked"`
+}
+
+// buildReadyExplain читает карточки один раз и строит объяснение ready-очереди.
+// Рёбра приходят из того же whyEdges, что и why, поэтому объяснение и gated_by
+// видят один граф. В объяснение попадают только блокирующие типы рёбер:
+// parent-child (part-of) и related отсекаются через taskstore.IsGateEdgeKind.
+// Неизвестная цель ребра пропускается, не обрывая построение остальной очереди.
+func buildReadyExplain(tasksDir string) (readyExplainView, error) {
+	cards, err := taskstore.LoadCards(tasksDir)
+	if err != nil {
+		return readyExplainView{}, err
+	}
+	byID := make(map[string]taskstore.Card, len(cards))
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+
+	view := readyExplainView{
+		Ready:   []readyExplainEntry{},
+		Blocked: []readyExplainEntry{},
+	}
+	for _, c := range cards {
+		// В ready-очередь попадают только карточки, которые ещё можно взять:
+		// закрытые и закреплённые держит SubjectCanBeGated, а in_progress уже
+		// работает агент. Карточки в статусе blocked остаются видимыми.
+		if c.Status == "in_progress" || !taskstore.SubjectCanBeGated(c) {
+			continue
+		}
+		entry := readyExplainEntry{
+			ID:                 c.ID,
+			ResolvedBlockers:   []readyDep{},
+			PinnedDependencies: []readyDep{},
+			OpenDependencies:   []readyDep{},
+		}
+		seen := map[string]bool{}
+		for _, e := range whyEdges(c) {
+			if !taskstore.IsGateEdgeKind(e.kind) || seen[e.to] {
+				continue
+			}
+			seen[e.to] = true
+			target, ok := byID[e.to]
+			if !ok {
+				continue
+			}
+			dep := readyDep{
+				ID:     target.ID,
+				Type:   taskstore.GateKind(target),
+				Reason: taskstore.GateReason(taskstore.GateDescription(target)),
+			}
+			switch {
+			case whyClosed(target):
+				entry.ResolvedBlockers = append(entry.ResolvedBlockers, dep)
+			case taskstore.IsPinned(target):
+				entry.PinnedDependencies = append(entry.PinnedDependencies, dep)
+			default:
+				entry.OpenDependencies = append(entry.OpenDependencies, dep)
+			}
+		}
+		sortReadyDeps(entry.ResolvedBlockers)
+		sortReadyDeps(entry.PinnedDependencies)
+		sortReadyDeps(entry.OpenDependencies)
+		if len(entry.OpenDependencies) == 0 {
+			view.Ready = append(view.Ready, entry)
+		} else {
+			view.Blocked = append(view.Blocked, entry)
+		}
+	}
+	sort.Slice(view.Ready, func(i, j int) bool { return view.Ready[i].ID < view.Ready[j].ID })
+	sort.Slice(view.Blocked, func(i, j int) bool { return view.Blocked[i].ID < view.Blocked[j].ID })
+	return view, nil
+}
+
+func sortReadyDeps(deps []readyDep) {
+	sort.Slice(deps, func(i, j int) bool { return deps[i].ID < deps[j].ID })
+}
+
+func readyDepIDs(deps []readyDep) string {
+	if len(deps) == 0 {
+		return "-"
+	}
+	ids := make([]string, 0, len(deps))
+	for _, d := range deps {
+		ids = append(ids, d.ID)
+	}
+	return strings.Join(ids, ",")
+}
+
+// runTaskReady печатает объяснение ready-очереди. JSON содержит оба раздела и
+// все три списка зависимостей для каждой записи, поэтому повторный вызов даёт
+// побайтово тот же результат.
+func runTaskReady(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"format": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) > 0 {
+		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
+	}
+	format := p.value("format")
+	if format != "" && format != "table" && format != "json" {
+		return failTask(stderr, taskstore.Validationf("beacon task ready: неверное значение --format %q, ожидается table или json", format))
+	}
+	view, err := buildReadyExplain(cfg.TasksDir)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if format == "json" {
+		b, err := json.MarshalIndent(view, "", "  ")
+		if err != nil {
+			return failTask(stderr, taskstore.Startupf("не собран JSON ready: %v", err))
+		}
+		fmt.Fprintln(stdout, string(b))
+		return taskstore.ExitOK
+	}
+	for _, e := range view.Ready {
+		fmt.Fprintf(stdout, "READY %s resolved=%s pinned=%s open=%s\n",
+			e.ID, readyDepIDs(e.ResolvedBlockers), readyDepIDs(e.PinnedDependencies), readyDepIDs(e.OpenDependencies))
+	}
+	for _, e := range view.Blocked {
+		fmt.Fprintf(stdout, "BLOCKED %s resolved=%s pinned=%s open=%s\n",
+			e.ID, readyDepIDs(e.ResolvedBlockers), readyDepIDs(e.PinnedDependencies), readyDepIDs(e.OpenDependencies))
+	}
 	return taskstore.ExitOK
 }
 

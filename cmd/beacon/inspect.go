@@ -67,6 +67,7 @@ type inspectView struct {
 	Orchestrator   *domain.OrchestratorBinding `json:"orchestrator,omitempty"`
 	RuntimeStats   json.RawMessage             `json:"runtimeStats,omitempty"`
 	GraphReady     *graphReadyView             `json:"graphReady,omitempty"`
+	Ready          *readyExplainView           `json:"ready,omitempty"`
 	Escalations    []string                    `json:"escalations"`
 	DeliveryLadder []deliveryLadderView        `json:"deliveryLadder,omitempty"`
 }
@@ -118,6 +119,16 @@ func SetInspectStore(fn inspectStoreFactory) {
 	makeInspectStore = fn
 }
 
+// loadReadyExplainForInspect builds the ready-queue explanation from task
+// cards. It is a seam so tests can inject a fixed view without touching disk.
+var loadReadyExplainForInspect = func() (readyExplainView, error) {
+	cfg, err := defaultTaskConfig()
+	if err != nil {
+		return readyExplainView{}, err
+	}
+	return buildReadyExplain(cfg.TasksDir)
+}
+
 func defaultInspectStore(*CLI) (inspectStore, func() error, error) {
 	deps, closeStore, err := openMCPDependencies()
 	if err != nil {
@@ -137,6 +148,7 @@ func runInspect(c *CLI, args []string) int {
 	flags := flag.NewFlagSet("inspect", flag.ContinueOnError)
 	format := flags.String("format", "table", "формат вывода: table или json")
 	jsonAlias := flags.Bool("json", false, "псевдоним --format=json")
+	readyQuery := flags.Bool("ready", false, "показать объяснение ready-очереди карточек")
 	flags.SetOutput(c.errOut)
 	flags.Usage = func() {}
 	if err := flags.Parse(args); err != nil {
@@ -231,6 +243,14 @@ func runInspect(c *CLI, args []string) int {
 			})
 		}
 	}
+	if *readyQuery {
+		ready, err := loadReadyExplainForInspect()
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon inspect: ready: %v\n", err)
+			return 2
+		}
+		view.Ready = &ready
+	}
 
 	if *format == "json" {
 		if err := json.NewEncoder(c.out).Encode(view); err != nil {
@@ -288,6 +308,16 @@ func renderInspectTable(w io.Writer, view inspectView) {
 	}
 	if len(view.RuntimeStats) > 0 {
 		fmt.Fprintf(w, "RUNTIME_STATS %s\n", string(view.RuntimeStats))
+	}
+	if view.Ready != nil {
+		for _, e := range view.Ready {
+			fmt.Fprintf(w, "READY %s resolved=%s pinned=%s open=%s\n",
+				e.ID, readyDepIDs(e.ResolvedBlockers), readyDepIDs(e.PinnedDependencies), readyDepIDs(e.OpenDependencies))
+		}
+		for _, e := range view.Blocked {
+			fmt.Fprintf(w, "BLOCKED %s resolved=%s pinned=%s open=%s\n",
+				e.ID, readyDepIDs(e.ResolvedBlockers), readyDepIDs(e.PinnedDependencies), readyDepIDs(e.OpenDependencies))
+		}
 	}
 	for _, line := range view.Escalations {
 		fmt.Fprintf(w, "ESCALATED %s\n", line)
