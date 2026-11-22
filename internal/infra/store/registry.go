@@ -14,10 +14,11 @@
 // r03) and may never be empty.
 //
 // A watch binding ties one Watch revision to the executor registered with it.
-// Its key is (watch_id, revision): two calls for the same revision collapse
-// into one row, while a new revision gets its own row and never rewrites an
-// older one (T5.25). Both writes run in one transaction, so a register call
-// cannot leave an executor without its binding, or the reverse.
+// Its key is (project_key, watch_id, revision): two calls for the same revision
+// in one project collapse into one row, while a new revision or a second
+// project gets its own row and never rewrites an older one (T5.25, BCX-34).
+// Both writes run in one transaction, so a register call cannot leave an
+// executor without its binding, or the reverse.
 package store
 
 import (
@@ -26,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -57,6 +59,106 @@ func createRegistrySchema(tx *sql.Tx) error {
 	}
 	if _, err := tx.Exec(string(ddl)); err != nil {
 		return fmt.Errorf("store: registry: create schema: %w", err)
+	}
+	return ensureWatchBindingProjectKey(tx)
+}
+
+// watchBindingPKColumns returns the primary key columns of watch_bindings in
+// key order. PRAGMA table_info reports the order in the pk field, starting at 1.
+func watchBindingPKColumns(q columnQuerier) ([]string, error) {
+	rows, err := q.Query(`PRAGMA table_info(watch_bindings)`)
+	if err != nil {
+		return nil, err
+	}
+	type keyColumn struct {
+		order int
+		name  string
+	}
+	var key []keyColumn
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if pk > 0 {
+			key = append(key, keyColumn{order: pk, name: strings.ToLower(name)})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	sort.Slice(key, func(i, j int) bool { return key[i].order < key[j].order })
+	out := make([]string, len(key))
+	for i, col := range key {
+		out[i] = col.name
+	}
+	return out, nil
+}
+
+// ensureWatchBindingProjectKey rebuilds watch_bindings when an older table
+// still keys rows by (watch_id, revision). That key lets an INSERT OR IGNORE
+// drop the second project's row, so project isolation depends on write order.
+// The guard rejects a rebuild when stored rows collide on the new key.
+func ensureWatchBindingProjectKey(tx *sql.Tx) error {
+	pk, err := watchBindingPKColumns(tx)
+	if err != nil {
+		return fmt.Errorf("store: registry: binding primary key: %w", err)
+	}
+	if len(pk) == 3 && pk[0] == "project_key" && pk[1] == "watch_id" && pk[2] == "revision" {
+		return nil
+	}
+	var duplicates int
+	if err := tx.QueryRow(`
+		SELECT count(*) FROM (
+		  SELECT 1 FROM watch_bindings
+		  GROUP BY project_key, watch_id, revision HAVING count(*) > 1
+		)`).Scan(&duplicates); err != nil {
+		return fmt.Errorf("store: registry: binding duplicate check: %w", err)
+	}
+	if duplicates > 0 {
+		return fmt.Errorf("store: registry: watch_bindings has %d duplicate (project_key, watch_id, revision) rows", duplicates)
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS watch_bindings_by_agent`); err != nil {
+		return fmt.Errorf("store: registry: drop old binding index: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE watch_bindings RENAME TO watch_bindings_old_pk`); err != nil {
+		return fmt.Errorf("store: registry: rename binding table: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE watch_bindings (
+		  project_key   TEXT NOT NULL CHECK (length(project_key) > 0),
+		  watch_id      TEXT NOT NULL,
+		  revision      INTEGER NOT NULL,
+		  agent_id      TEXT NOT NULL,
+		  config_id     TEXT NOT NULL,
+		  fencing_token INTEGER NOT NULL,
+		  subscriber_id TEXT NOT NULL,
+		  created_at    INTEGER NOT NULL,
+		  PRIMARY KEY (project_key, watch_id, revision)
+		)`); err != nil {
+		return fmt.Errorf("store: registry: rebuild binding table: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO watch_bindings
+		  (project_key, watch_id, revision, agent_id, config_id,
+		   fencing_token, subscriber_id, created_at)
+		SELECT project_key, watch_id, revision, agent_id, config_id,
+		       fencing_token, subscriber_id, created_at
+		FROM watch_bindings_old_pk`); err != nil {
+		return fmt.Errorf("store: registry: copy binding rows: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE watch_bindings_old_pk`); err != nil {
+		return fmt.Errorf("store: registry: drop old binding table: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS watch_bindings_by_agent
+		ON watch_bindings(project_key, agent_id)`); err != nil {
+		return fmt.Errorf("store: registry: rebuild binding index: %w", err)
 	}
 	return nil
 }
@@ -104,7 +206,7 @@ type UpsertResult struct {
 }
 
 // BindResult reports what a binding write did. Created is false when a row
-// with the same (watch_id, revision) already existed.
+// with the same (project_key, watch_id, revision) already existed.
 type BindResult struct {
 	Binding WatchBinding
 	Created bool
@@ -300,10 +402,11 @@ func upsertExecutorTx(tx *sql.Tx, e ExecutorRecord, now int64) (UpsertResult, er
 
 func bindWatchTx(tx *sql.Tx, b WatchBinding, now int64) (BindResult, error) {
 	res, err := tx.Exec(`
-		INSERT OR IGNORE INTO watch_bindings
+		INSERT INTO watch_bindings
 		  (watch_id, revision, project_key, agent_id, config_id, fencing_token,
 		   subscriber_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(project_key, watch_id, revision) DO NOTHING`,
 		b.WatchID, int64(b.Revision), b.ProjectKey, b.AgentID,
 		b.ConfigID, b.FencingToken, b.AgentID, now)
 	if err != nil {
@@ -319,8 +422,9 @@ func bindWatchTx(tx *sql.Tx, b WatchBinding, now int64) (BindResult, error) {
 	} else {
 		if err := tx.QueryRow(`
 			SELECT project_key, agent_id, config_id, fencing_token, created_at
-			FROM watch_bindings WHERE watch_id = ? AND revision = ?`,
-			b.WatchID, int64(b.Revision),
+			FROM watch_bindings
+			WHERE project_key = ? AND watch_id = ? AND revision = ?`,
+			b.ProjectKey, b.WatchID, int64(b.Revision),
 		).Scan(&b.ProjectKey, &b.AgentID, &b.ConfigID, &b.FencingToken, &b.CreatedAt); err != nil {
 			return BindResult{}, fmt.Errorf("store: binding: read existing: %w", err)
 		}
@@ -351,8 +455,9 @@ func (d *DB) UpsertExecutor(e ExecutorRecord) (UpsertResult, error) {
 	return out, nil
 }
 
-// BindWatch writes one watch binding. The (watch_id, revision) key makes the
-// write idempotent: a repeat inserts nothing and reports Created=false.
+// BindWatch writes one watch binding. The (project_key, watch_id, revision) key
+// makes the write idempotent within a project: a repeat inserts nothing and
+// reports Created=false, while the same watch in another project gets its row.
 func (d *DB) BindWatch(b WatchBinding) (BindResult, error) {
 	if err := validateBinding(b); err != nil {
 		return BindResult{}, err

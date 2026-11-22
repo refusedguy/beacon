@@ -200,9 +200,9 @@ func scanScopedWatchBinding(scan func(...any) error) (WatchBinding, error) {
 }
 
 // WatchBinding returns the binding for one watch revision in this project.
-// The project_key predicate matters because the underlying reads in
-// registry.go and watch_bindings.go are keyed by watch id alone: without it a
-// caller could follow a watch that belongs to another project.
+// The project_key predicate matches the (project_key, watch_id, revision) key
+// used by the write paths in registry.go and watch_bindings.go, so the same
+// watch in another project stays invisible here (BCX-34).
 func (r *ScopedRegistry) WatchBinding(watchID string, revision uint64) (WatchBinding, bool, error) {
 	if err := requireScope(r.scope); err != nil {
 		return WatchBinding{}, false, err
