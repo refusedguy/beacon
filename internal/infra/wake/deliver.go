@@ -442,8 +442,9 @@ func isObligationMissing(err error) bool {
 	return errors.As(err, &appErr) && appErr.Code == domain.CodeWatchNotFound
 }
 
-// sessionNotFound maps a 404 from either port to the typed ErrSessionDead. The
-// text check keeps a transport that only reports a status honest.
+// sessionNotFound maps a 404 or 409 from either port to the typed ErrSessionDead.
+// The text check keeps a transport that only reports a status honest, and reads
+// stderr through out so a CLI fallback that only printed the status is caught.
 func sessionNotFound(err error, out []byte) bool {
 	if errors.Is(err, ErrSessionDead) {
 		return true
@@ -452,7 +453,7 @@ func sessionNotFound(err error, out []byte) bool {
 	if err != nil {
 		msg += " " + err.Error()
 	}
-	return strings.Contains(msg, "404") || strings.Contains(strings.ToLower(msg), "not found")
+	return strings.Contains(msg, "404") || strings.Contains(msg, "409") || strings.Contains(strings.ToLower(msg), "not found")
 }
 
 // Envelope renders the pointer into the host's wake text. Every field is
