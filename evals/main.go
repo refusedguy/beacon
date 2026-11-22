@@ -3571,7 +3571,7 @@ func runWakeEvalSet(ctx context.Context, o wakeObserver) []evalResult {
 			name:     "wake/" + s.ID + "_" + s.Name,
 			expected: s.Expect,
 			actual:   actual,
-			pass:     pass,
+			status:   statusOf(pass),
 		})
 	}
 	return results
