@@ -2,7 +2,7 @@
 Статус: todo
 Фаза: P1
 Тип: task
-Владелец файлов: internal/app/orchestrator/store.go, internal/app/orchestrator/store_test.go
+Владелец файлов: internal/app/orchestrator/store.go, internal/app/orchestrator/dependency_card_test.go
 Зависимости: 
 Ссылка: docs/research/BEACON-EXPLAINER-3.html, аудит fix/c18-a17
 Агент: нет
