@@ -206,6 +206,8 @@ func TestReportFormatContract(t *testing.T) {
 		{"renumber", renumberReportFormat, []any{7, 265}, "перенумеровать ADR 7 в 265\n"},
 		{"skip", skipReportFormat, []any{"bad.json: неверный JSON"}, "пропуск bad.json: неверный JSON\n"},
 		{"warn", warnReportFormat, []any{"docs/tasks/W5-42.md"}, "предупреждение: не найдена цель закрытия docs/tasks/W5-42.md\n"},
+		{"stale skipped", staleSkippedFormat, []any{"W5-42,ADR-7"}, "StaleSkippedIDs=W5-42,ADR-7\n"},
+		{"updated issues", updatedIssuesFormat, []any{1}, "UpdatedIssues=1\n"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,6 +304,8 @@ func TestLanguagePolicy(t *testing.T) {
 		fmt.Sprintf(checkReportFormat, 3, 1),
 		fmt.Sprintf(summaryReportFormat, 2, 3, 4, 5, 6),
 		fmt.Sprintf(mergeReportFormat, 2, 1),
+		fmt.Sprintf(staleSkippedFormat, "W5-42,ADR-7"),
+		fmt.Sprintf(updatedIssuesFormat, 1),
 	}
 	for _, line := range structured {
 		if hasCyrillic(line) {
@@ -1020,5 +1024,251 @@ func TestChunkPauseAllowsReader(t *testing.T) {
 		if d != 0 {
 			t.Fatalf("zero-pause yield got %s, want 0", d)
 		}
+	}
+}
+
+// CBX-07. A timestamped incoming row never replaces a fresher local file.
+// The same rule runs in the prefilter and again before publish, so a local
+// edit that lands between the two passes is still rejected. Force is the only
+// path that overwrites, and it records the update in the report.
+
+// TestParseUpdatedAtAndStaleAgainst pins the single rule both passes share.
+func TestParseUpdatedAtAndStaleAgainst(t *testing.T) {
+	base := time.Unix(1000, 0)
+	cases := []struct {
+		name      string
+		raw       string
+		local     time.Time
+		wantTime  time.Time
+		wantStale bool
+	}{
+		{"no timestamp", "", base, time.Time{}, false},
+		{"invalid timestamp", "not-a-date", base, time.Time{}, false},
+		{"older incoming is stale", base.Add(-time.Second).Format(time.RFC3339Nano), base, base.Add(-time.Second), true},
+		{"newer incoming is fresh", base.Add(time.Second).Format(time.RFC3339Nano), base, base.Add(time.Second), false},
+		{"equal is fresh", base.Format(time.RFC3339Nano), base, base, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseUpdatedAt(tc.raw)
+			if !got.Equal(tc.wantTime) {
+				t.Fatalf("parseUpdatedAt(%q) = %v, want %v", tc.raw, got, tc.wantTime)
+			}
+			if stale := staleAgainst(tc.local, got); stale != tc.wantStale {
+				t.Fatalf("staleAgainst() = %v, want %v", stale, tc.wantStale)
+			}
+		})
+	}
+}
+
+// TestPrefilterStaleDropsOlderRows proves the first pass removes rows older
+// than their local artifact while keeping fresh and untimestamped ones.
+func TestPrefilterStaleDropsOlderRows(t *testing.T) {
+	root := t.TempDir()
+	base := time.Unix(1000, 0)
+	writeLocal := func(rel string) {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("local\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, base, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeLocal(filepath.Join("docs", "tasks", "OLD.md"))
+	writeLocal(filepath.Join("docs", "tasks", "NEW.md"))
+
+	entries := []artifactEntry{
+		{path: filepath.Join("docs", "tasks", "OLD.md"), id: "OLD", updatedAt: base.Add(-time.Second)},
+		{path: filepath.Join("docs", "tasks", "NEW.md"), id: "NEW", updatedAt: base.Add(time.Second)},
+		{path: filepath.Join("docs", "tasks", "PLAIN.md"), id: "PLAIN"},
+	}
+	r := &runner{opts: Options{Quiet: true}, out: io.Discard, err: io.Discard}
+	kept := r.prefilterStale(root, entries)
+	if len(kept) != 2 || kept[0].id != "NEW" || kept[1].id != "PLAIN" {
+		t.Fatalf("kept = %+v, want NEW and PLAIN", kept)
+	}
+	if len(r.staleSkippedIDs) != 1 || r.staleSkippedIDs[0] != "OLD" {
+		t.Fatalf("staleSkippedIDs = %q, want [OLD]", r.staleSkippedIDs)
+	}
+}
+
+// TestRecheckStaleRejectsLocalEditBetweenPasses reproduces the race: the row
+// is fresh at prefilter time, a local edit lands before publish, and the
+// second pass refuses to write. The local text stays byte-for-byte the same.
+func TestRecheckStaleRejectsLocalEditBetweenPasses(t *testing.T) {
+	dir := t.TempDir()
+	rel := filepath.Join("docs", "tasks", "W1.md")
+	path := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const localText = "# W1\nlocal edit\n"
+	if err := os.WriteFile(path, []byte(localText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Unix(1000, 0)
+	if err := os.Chtimes(path, base, base); err != nil {
+		t.Fatal(err)
+	}
+	incoming := base.Add(time.Second)
+
+	edited := localText + "fresh edit\n"
+	mutated := false
+	now := func() time.Time {
+		if !mutated {
+			mutated = true
+			if err := os.WriteFile(path, []byte(edited), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			later := base.Add(2 * time.Second)
+			if err := os.Chtimes(path, later, later); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return base
+	}
+
+	entries := []artifactEntry{{
+		path: rel, content: "# W1\nincoming row\n", id: "W1", updatedAt: incoming,
+	}}
+	r := &runner{opts: Options{Quiet: true}, out: io.Discard, now: now}
+	kept := r.prefilterStale(dir, entries)
+	if len(kept) != 1 {
+		t.Fatalf("prefilter dropped the row: %+v", r.staleSkippedIDs)
+	}
+	if err := r.writeChunked(dir, kept, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != edited {
+		t.Fatalf("local file changed: got %q, want %q", got, edited)
+	}
+	if len(r.staleSkippedIDs) != 1 || r.staleSkippedIDs[0] != "W1" {
+		t.Fatalf("staleSkippedIDs = %q, want [W1]", r.staleSkippedIDs)
+	}
+	if r.updatedIssues != 0 {
+		t.Fatalf("updatedIssues = %d, want 0", r.updatedIssues)
+	}
+}
+
+// newRunRepo builds a throwaway git tree so Run resolves rootDir() to it and
+// never writes into the real repository during a write test.
+func newRunRepo(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "batch@example.com")
+	git("config", "user.name", "batch")
+	if err := os.MkdirAll(filepath.Join(root, "docs", "adrs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// TestRunStaleRejectionIsRepeatable runs the stale scenario ten times. Each
+// run keeps the local bytes intact and reports exactly one skipped id.
+func TestRunStaleRejectionIsRepeatable(t *testing.T) {
+	root := newRunRepo(t)
+	rel := filepath.Join("docs", "tasks", "CBX07.md")
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const localText = "# CBX07. local\nСтатус: done\n"
+	base := time.Unix(1000, 0)
+	dir := t.TempDir()
+	raw := fmt.Sprintf(`{"cards":[{"id":"CBX07","title":"incoming","updated_at":%q}]}`,
+		base.Add(-time.Second).Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(dir, "batch.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	for i := 0; i < 10; i++ {
+		if err := os.WriteFile(path, []byte(localText), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		later := base.Add(time.Duration(i+1) * time.Second)
+		if err := os.Chtimes(path, later, later); err != nil {
+			t.Fatal(err)
+		}
+		var out, errOut strings.Builder
+		code := Run(Options{Dir: dir, Quiet: true}, &out, &errOut)
+		if code != 0 {
+			t.Fatalf("run %d: exit = %d, stderr = %q", i, code, errOut.String())
+		}
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != localText {
+			t.Fatalf("run %d: local file changed: %q", i, got)
+		}
+		if !strings.Contains(out.String(), "StaleSkippedIDs=CBX07\n") {
+			t.Fatalf("run %d: missing stale line: %q", i, out.String())
+		}
+		if !strings.Contains(out.String(), "UpdatedIssues=0\n") {
+			t.Fatalf("run %d: missing update line: %q", i, out.String())
+		}
+	}
+}
+
+// TestRunForceOverwriteReportsUpdatedIssues proves the explicit flag is the
+// only overwrite path and that a successful overwrite is counted once.
+func TestRunForceOverwriteReportsUpdatedIssues(t *testing.T) {
+	root := newRunRepo(t)
+	rel := filepath.Join("docs", "tasks", "CBX07.md")
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Unix(1000, 0)
+	if err := os.WriteFile(path, []byte("# CBX07. old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, base, base); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	raw := fmt.Sprintf(`{"cards":[{"id":"CBX07","title":"incoming","updated_at":%q}]}`,
+		base.Add(2*time.Second).Format(time.RFC3339Nano))
+	if err := os.WriteFile(filepath.Join(dir, "batch.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	var out, errOut strings.Builder
+	code := Run(Options{Dir: dir, Force: true, Quiet: true}, &out, &errOut)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "# CBX07. incoming") || strings.Contains(string(got), "old") {
+		t.Fatalf("forced overwrite did not land: %q", got)
+	}
+	if !strings.Contains(out.String(), "UpdatedIssues=1\n") {
+		t.Fatalf("report missing update: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "StaleSkippedIDs=\n") {
+		t.Fatalf("report missing empty stale list: %q", out.String())
 	}
 }

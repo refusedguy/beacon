@@ -98,7 +98,18 @@ const (
 	// Keys stay English as technical terms; held values are Go durations.
 	chunkProgressFormat = "chunk=%d/%d records=%d held=%s\n"
 	chunkSummaryFormat  = "chunks=%d maxheld=%s\n"
+	// CBX-07: a stale row is named in the report and never published. Keys
+	// stay English as technical terms; the id list is comma separated.
+	staleSkippedFormat  = "StaleSkippedIDs=%s\n"
+	updatedIssuesFormat = "UpdatedIssues=%d\n"
 )
+
+// CBX-07: an incoming row carries the time its source was changed. A local
+// artifact is fresh when its file mtime is later than that time. Rows without
+// a timestamp are never judged stale, so existing batches keep their meaning.
+// The value is a string because research JSON uses RFC3339 and the field is
+// optional; parseUpdatedAt parses it once into time.Time for comparison.
+const updatedAtLayout = time.RFC3339Nano
 
 // CBX-06 test seams. The values come from the beads measurement: 250 records
 // per chunk and a 150 ms pause let a concurrent reader take the lock while a
@@ -107,6 +118,20 @@ var (
 	chunkSize  = 250
 	chunkPause = 150 * time.Millisecond
 )
+
+// parseUpdatedAt turns an optional RFC3339 timestamp into a time. An empty or
+// malformed value yields the zero time, which means "no timestamp" and never
+// makes a row stale.
+func parseUpdatedAt(raw string) time.Time {
+	if strings.TrimSpace(raw) == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(updatedAtLayout, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
 
 // Options mirrors the command line of cmd/batch-apply.
 type Options struct {
@@ -123,6 +148,9 @@ type Options struct {
 	// cannot accidentally hold the lock for a whole import.
 	ChunkSize  int
 	ChunkPause time.Duration
+	// Force is the explicit overwrite path for a manual run. Automatic
+	// imports leave it false, so a fresh local card is never replaced.
+	Force bool
 }
 
 type batch struct {
@@ -142,6 +170,7 @@ type adr struct {
 	Context      string `json:"context"`
 	Decision     string `json:"decision"`
 	Consequences string `json:"consequences"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
 type card struct {
@@ -160,6 +189,7 @@ type card struct {
 	Steps      string   `json:"steps"`
 	Check      string   `json:"check"`
 	Acceptance string   `json:"acceptance"`
+	UpdatedAt  string   `json:"updated_at"`
 }
 
 type evalCase struct {
@@ -167,6 +197,7 @@ type evalCase struct {
 	Scenario        string   `json:"scenario"`
 	Assertions      []string `json:"assertions"`
 	NegativeControl string   `json:"negative_control"`
+	UpdatedAt       string   `json:"updated_at"`
 }
 
 type mergeDecision struct {
@@ -217,6 +248,10 @@ type ghPRFiles struct {
 type artifactEntry struct {
 	path    string
 	content string
+	// id names this artifact in the stale report. updatedAt is the parsed
+	// incoming timestamp; the zero value means the row has no freshness rule.
+	id        string
+	updatedAt time.Time
 }
 
 // derivedArtifact reports whether an artifact is a generated document that
@@ -520,6 +555,10 @@ type runner struct {
 	now      func() time.Time
 	yield    func(time.Duration)
 	commit   func(root string, cards, adrs, evals int) error
+	// staleSkippedIDs and updatedIssues are filled by the two freshness
+	// checks and printed once by Run after the write pass.
+	staleSkippedIDs []string
+	updatedIssues   int
 }
 
 // fillDefaults installs the production seams. Tests replace any of them on
@@ -606,6 +645,24 @@ func (r *runner) writeChunked(root string, entries []artifactEntry, cards, adrs,
 				// document off disk.
 				if !r.opts.Quiet {
 					fmt.Fprintln(r.out, " ", e.path)
+				}
+				continue
+			}
+			// CBX-07: recheck in the same window that publishes the file.
+			// A local edit that landed after the prefilter is caught here,
+			// before any byte reaches disk.
+			local, statErr := os.Stat(filepath.Join(root, e.path))
+			exists := statErr == nil
+			if exists && !r.opts.Force && !e.updatedAt.IsZero() && staleAgainst(local.ModTime(), e.updatedAt) {
+				r.recordStaleSkipped(e.id)
+				continue
+			}
+			if !e.updatedAt.IsZero() {
+				if err := r.writeFresh(root, e.path, e.content); err != nil {
+					return err
+				}
+				if exists && !r.opts.DryRun {
+					r.updatedIssues++
 				}
 				continue
 			}
@@ -734,6 +791,61 @@ func (r *runner) writeFileMode(root, rel, content string, overwrite bool) error 
 		if _, err := os.Stat(path); err == nil {
 			return nil // never overwrite an existing card
 		}
+	}
+	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// staleAgainst is the one freshness rule shared by the prefilter and the
+// pre-publish recheck. A row without a timestamp has no rule; a local file
+// whose mtime is later than the incoming timestamp wins.
+func staleAgainst(localMod, incoming time.Time) bool {
+	return !incoming.IsZero() && localMod.After(incoming)
+}
+
+// recordStaleSkipped keeps one id per artifact in encounter order so the
+// report stays reproducible and a duplicate row cannot name an id twice.
+func (r *runner) recordStaleSkipped(id string) {
+	for _, seen := range r.staleSkippedIDs {
+		if seen == id {
+			return
+		}
+	}
+	r.staleSkippedIDs = append(r.staleSkippedIDs, id)
+}
+
+// prefilterStale drops incoming rows older than the local artifact before any
+// hash, facts or index is built. The same rule runs again per file in
+// writeChunked, so a local edit landing after this pass is still caught.
+func (r *runner) prefilterStale(root string, entries []artifactEntry) []artifactEntry {
+	if r.opts.Force {
+		return entries
+	}
+	kept := make([]artifactEntry, 0, len(entries))
+	for _, e := range entries {
+		if !e.updatedAt.IsZero() {
+			if info, err := os.Stat(filepath.Join(root, e.path)); err == nil && staleAgainst(info.ModTime(), e.updatedAt) {
+				r.recordStaleSkipped(e.id)
+				continue
+			}
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
+// writeFresh publishes a timestamped row. The freshness check has already
+// passed, so the never-overwrite rule for untimestamped cards does not apply:
+// a newer incoming row replaces the local file.
+func (r *runner) writeFresh(root, rel, content string) error {
+	path := filepath.Join(root, rel)
+	if !r.opts.Quiet {
+		fmt.Fprintln(r.out, " ", path)
+	}
+	if r.opts.DryRun {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
 }
@@ -1196,22 +1308,34 @@ func Run(opts Options, out, errOut io.Writer) int {
 	for _, n := range nums {
 		a := adrs[n]
 		entries = append(entries, artifactEntry{
-			path:    filepath.Join("docs", "adrs", fmt.Sprintf("%04d-%s.md", n, slug(a.Title))),
-			content: renderADR(a),
+			path:      filepath.Join("docs", "adrs", fmt.Sprintf("%04d-%s.md", n, slug(a.Title))),
+			content:   renderADR(a),
+			id:        fmt.Sprintf("ADR-%d", n),
+			updatedAt: parseUpdatedAt(a.UpdatedAt),
 		})
 	}
 	for _, id := range ids {
+		c := cards[id]
 		entries = append(entries, artifactEntry{
-			path:    filepath.Join("docs", "tasks", id+".md"),
-			content: renderCard(cards[id]),
+			path:      filepath.Join("docs", "tasks", id+".md"),
+			content:   renderCard(c),
+			id:        c.ID,
+			updatedAt: parseUpdatedAt(c.UpdatedAt),
 		})
 	}
 	for _, name := range names {
+		e := evals[name]
 		entries = append(entries, artifactEntry{
-			path:    filepath.Join("docs", "evals", slug(name)+".md"),
-			content: renderEval(evals[name]),
+			path:      filepath.Join("docs", "evals", slug(name)+".md"),
+			content:   renderEval(e),
+			id:        e.Name,
+			updatedAt: parseUpdatedAt(e.UpdatedAt),
 		})
 	}
+
+	// CBX-07: remove rows older than their local artifact before the hash,
+	// facts and index are built. writeChunked repeats the same rule per file.
+	entries = r.prefilterStale(root, entries)
 
 	facts := collectFacts(entries, declaredFacts)
 	factsDoc := renderFacts(facts)
@@ -1242,6 +1366,10 @@ func Run(opts Options, out, errOut io.Writer) int {
 	if err := r.writeChunked(root, entries, len(cards), len(adrs), len(evals)); err != nil {
 		r.errf("%v\n", err)
 		return 1
+	}
+	if !opts.DryRun {
+		r.printf(staleSkippedFormat, strings.Join(r.staleSkippedIDs, ","))
+		r.printf(updatedIssuesFormat, r.updatedIssues)
 	}
 	if err := r.applyClosures(root, closures); err != nil {
 		r.errf("%v\n", err)
