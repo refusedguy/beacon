@@ -364,6 +364,24 @@ func (c *Client) CreateSession(ctx context.Context, parentID, agent, title strin
 	return session, nil
 }
 
+// DeleteSession sends DELETE /api/session/:sessionID so a closed Watch does not
+// leave its session in the OpenCode SQLite store (MEM-01). The guard rejects an
+// empty id before a request: DELETE /api/session/ could target more than one
+// session. A missing session is an error, so the GC can report it instead of
+// counting an unknown id as removed.
+func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("opencode DELETE /api/session: пустой sessionID")
+	}
+	path := "/api/session/" + url.PathEscape(sessionID)
+	resp, err := c.send(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
 // Prompt posts POST /api/session/:sessionID/prompt. It sends only the text:
 // the v2 route has no agent field, so the agent comes from the session created
 // by CreateSession (ADR 0060 п3/п4). Callers that need resume or delivery use
