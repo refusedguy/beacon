@@ -8,6 +8,8 @@
 | --- | --- |
 | Коммитить или пушить в main | Ветка от origin/main, worktree, PR |
 | `go test ./...`, `go build ./...`, `beacon gates` локально | GitHub Actions CI на PR; локально только `gofmt -w` на свои .go |
+| `grep -r`, `grep -R`, `find /` | `rg <шаблон> <явный каталог>`; хук плагина отклоняет эти команды |
+| Research-агенту вызывать `execute` или `tools.beacon.*` | Профиль `issue-scout` запрещает `execute`, `beacon_*` и `subagent`; для GitHub использовать webfetch |
 | `gh pr checks --watch`, `sleep` в цикле | `waiting, <watchID>` и сон |
 | Править чужую карточку или чужие OwnerFiles | Только своё поле «Владелец файлов»; задачу получаем через `beacon_task_claim`, статус карточки меняет Beacon при мерже |
 | Добавлять зависимость, которая замыкает цикл | Граф отвергает цикл на записи |
@@ -15,6 +17,12 @@
 | `batch-apply` без команды владельца | Ждать команды владельца |
 | Закрывать чужие карточки в чужом PR | Не трогать |
 | `notify.target: "<cardID>"` | Реальный `ses_...` |
+
+## Граница инструмента
+
+Плагин `beacon-project` ставит хук `ctx.tool.hook("execute.before")`. Хук отклоняет `grep -r`, `grep -R`, `find /`, локальные `go test`, `go build` и `beacon gates` до запуска команды. В сообщении указана замена: `rg` с явным каталогом или CI на PR. Переменная `BEACON_SHELL_GUARD=warn` включает режим наблюдения без блокировки. Режим по умолчанию блокирует команду.
+
+Профиль `issue-scout` запрещает research-агенту `execute`, `beacon_*`, `subagent`, `edit`, `shell` и `write`. Запрет `execute` и `beacon_*` нужен вместе: при запрете только `execute` инструменты Beacon становятся прямыми.
 
 ## Измерение до выбора
 
