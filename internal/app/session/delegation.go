@@ -1561,3 +1561,102 @@ func (c *RankedMapCache) Refresh(key MapRefreshKey, build MapBuildFunc) (string,
 	c.cache[cacheKey] = text
 	return text, true
 }
+
+// PromptSegment is one ordered part of a child's model request. ID is stable
+// across calls and Text is the part's content. A provider caches a prefix only
+// when its bytes repeat, so a caller builds a segment with a fixed ID and the
+// same Text on every call to keep that part cacheable (CA-09).
+type PromptSegment struct {
+	ID   string
+	Text string
+}
+
+// CachePoint names the segment where a cacheable prefix ends. The three values
+// match aider's three cache_control boundaries: system or examples, repo or
+// readonly, and chat files (aider/coders/chat_chunks.py:5-26, :28-55).
+type CachePoint string
+
+const (
+	CacheSystem CachePoint = "system"
+	CacheRepo   CachePoint = "repo"
+	CacheChat   CachePoint = "chat"
+
+	// MaxCachePoints is the provider cap on cache_control boundaries. A
+	// request never carries more than three cache points (CA-09).
+	MaxCachePoints = 3
+)
+
+// KeepaliveConfig controls the optional prefix-warming request. A zero value
+// is disabled, so no background request is sent until a caller sets Enabled.
+// aider sends one request with a single output token every five minutes over
+// the cacheable prefix (aider/coders/base_coder.py:1340-1392).
+type KeepaliveConfig struct {
+	Enabled         bool
+	Interval        time.Duration
+	MaxOutputTokens int
+}
+
+const (
+	DefaultKeepaliveInterval        = 5 * time.Minute
+	DefaultKeepaliveMaxOutputTokens = 1
+)
+
+// Normalize fills the interval and output cap with defaults when unset. It
+// never turns keepalive on, so a disabled config stays disabled.
+func (k KeepaliveConfig) Normalize() KeepaliveConfig {
+	if k.Interval <= 0 {
+		k.Interval = DefaultKeepaliveInterval
+	}
+	if k.MaxOutputTokens <= 0 {
+		k.MaxOutputTokens = DefaultKeepaliveMaxOutputTokens
+	}
+	return k
+}
+
+// CachePlan is the cache layout for one assembled prompt. Points holds the
+// cacheable segment IDs in prompt order and has at most MaxCachePoints entries.
+// Keepalive is zero and off unless a caller enables it.
+type CachePlan struct {
+	Points    []string
+	Keepalive KeepaliveConfig
+}
+
+// BuildCachePlan assigns cache points to the prompt's segments. roles maps a
+// segment ID to the CachePoint placed at its end. Segments are visited in
+// order. Only segments with a non-empty role are kept, and each ID appears
+// once. The result stops at MaxCachePoints so one request stays inside the
+// provider cap. An enabled keepalive gets its defaults; a disabled one is
+// copied as given.
+func BuildCachePlan(segments []PromptSegment, roles map[string]CachePoint, keepalive KeepaliveConfig) CachePlan {
+	seen := make(map[string]bool)
+	points := make([]string, 0, MaxCachePoints)
+	for _, s := range segments {
+		if len(points) >= MaxCachePoints {
+			break
+		}
+		role, ok := roles[s.ID]
+		if !ok || role == "" || seen[s.ID] {
+			continue
+		}
+		seen[s.ID] = true
+		points = append(points, s.ID)
+	}
+	if keepalive.Enabled {
+		keepalive = keepalive.Normalize()
+	}
+	return CachePlan{Points: points, Keepalive: keepalive}
+}
+
+// PrefixFingerprint hashes the ID and text of the given segments in order.
+// Length prefixes keep two different segment sequences from colliding. A
+// caller compares fingerprints across calls to prove the cacheable prefix is
+// byte-identical before it sends a request (CA-09).
+func PrefixFingerprint(segments []PromptSegment) [sha256.Size]byte {
+	h := sha256.New()
+	for _, s := range segments {
+		fmt.Fprintf(h, "%d:%s%d:%s", len(s.ID), s.ID, len(s.Text), s.Text)
+	}
+	var fp [sha256.Size]byte
+	copy(fp[:], h.Sum(nil))
+	return fp
+}
