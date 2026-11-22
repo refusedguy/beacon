@@ -54,24 +54,28 @@ func TestStatsGraphReadyFreshAndStale(t *testing.T) {
 		status    domain.GraphStatus
 		wantEntry string
 		wantReady bool
+		wantSrc   GraphReadySource
 	}{
 		{
 			name:      "fresh index",
 			status:    domain.GraphStatus{Built: true, IndexHash: "abc", SourceHash: "abc"},
 			wantEntry: graphReadyPrefix + "true",
 			wantReady: true,
+			wantSrc:   GraphReadyFresh,
 		},
 		{
 			name:      "stale index",
 			status:    domain.GraphStatus{Built: true, IndexHash: "old", SourceHash: "abc"},
 			wantEntry: graphReadyPrefix + "false",
 			wantReady: false,
+			wantSrc:   GraphReadyStale,
 		},
 		{
 			name:      "missing index",
 			status:    domain.GraphStatus{},
 			wantEntry: graphReadyPrefix + "false",
 			wantReady: false,
+			wantSrc:   GraphReadyStale,
 		},
 	}
 	for _, tc := range cases {
@@ -87,6 +91,16 @@ func TestStatsGraphReadyFreshAndStale(t *testing.T) {
 			}
 			if got := graphReady(out); got != tc.wantReady {
 				t.Errorf("graphReady = %t, want %t (loadErrors %v)", got, tc.wantReady, out.LoadErrors)
+			}
+			signal := ReadGraphReady(out)
+			if signal.Ready != tc.wantReady {
+				t.Errorf("ReadGraphReady.Ready = %t, want %t (loadErrors %v)", signal.Ready, tc.wantReady, out.LoadErrors)
+			}
+			if signal.Source != tc.wantSrc {
+				t.Errorf("ReadGraphReady.Source = %q, want %q (loadErrors %v)", signal.Source, tc.wantSrc, out.LoadErrors)
+			}
+			if got := out.GraphReady(); got != signal {
+				t.Errorf("out.GraphReady() = %+v, want %+v", got, signal)
 			}
 			if fake.calls != 1 {
 				t.Errorf("graph index reads = %d, want 1", fake.calls)
@@ -107,6 +121,10 @@ func TestStatsGraphReadyFailsClosed(t *testing.T) {
 		}
 		if got := graphReadyEntry(out); got != "" {
 			t.Errorf("graphReady entry = %q with no reader, want no entry", got)
+		}
+		signal := ReadGraphReady(out)
+		if signal.Ready || signal.Source != GraphReadyNoReader {
+			t.Errorf("ReadGraphReady = %+v with no reader, want not ready and source %q", signal, GraphReadyNoReader)
 		}
 	})
 
@@ -129,5 +147,39 @@ func TestStatsGraphReadyFailsClosed(t *testing.T) {
 		if !found {
 			t.Errorf("no %q diagnostic in loadErrors %v", graphIndexErrorPrefix, out.LoadErrors)
 		}
+		signal := ReadGraphReady(out)
+		if signal.Ready || signal.Source != GraphReadyReadError {
+			t.Errorf("ReadGraphReady = %+v after a failed read, want not ready and source %q", signal, GraphReadyReadError)
+		}
 	})
+}
+
+// TestGraphReadyLegacyMarkerStillReadable proves the string marker remains a
+// compatible output. An older reader that only parses loadErrors still sees
+// the same entry, while the typed signal reports the same readiness.
+func TestGraphReadyLegacyMarkerStillReadable(t *testing.T) {
+	cases := []struct {
+		name      string
+		entry     string
+		wantReady bool
+		wantSrc   GraphReadySource
+	}{
+		{"ready marker", graphReadyPrefix + "true", true, GraphReadyFresh},
+		{"not ready marker", graphReadyPrefix + "false", false, GraphReadyStale},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := StatsOutput{LoadErrors: []string{tc.entry}}
+			if got := graphReadyEntry(out); got != tc.entry {
+				t.Errorf("graphReadyEntry = %q, want %q", got, tc.entry)
+			}
+			signal := ReadGraphReady(out)
+			if signal.Ready != tc.wantReady || signal.Source != tc.wantSrc {
+				t.Errorf("ReadGraphReady = %+v, want ready %t and source %q", signal, tc.wantReady, tc.wantSrc)
+			}
+			if got := out.GraphReady(); got != signal {
+				t.Errorf("out.GraphReady() = %+v, want %+v", got, signal)
+			}
+		})
+	}
 }

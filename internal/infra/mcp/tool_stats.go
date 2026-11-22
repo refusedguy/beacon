@@ -551,7 +551,8 @@ func blockedWatchCount(watches []domain.Watch) int {
 
 // graphReadyEntry returns the graph readiness marker present in a stats
 // response, if any. Callers and tests read the marker through this helper so
-// they do not depend on its position in loadErrors.
+// they do not depend on its position in loadErrors. The string stays as a
+// compatible output for readers built before the typed signal existed.
 func graphReadyEntry(out StatsOutput) string {
 	for _, entry := range out.LoadErrors {
 		if strings.HasPrefix(entry, graphReadyPrefix) {
@@ -561,11 +562,70 @@ func graphReadyEntry(out StatsOutput) string {
 	return ""
 }
 
+// GraphReadySource explains why a readiness signal has its value. The four
+// cases are exhaustive: a bound reader proved the graph current, it proved the
+// graph stale, it could not be read, or no reader was bound at all.
+type GraphReadySource string
+
+const (
+	GraphReadyFresh     GraphReadySource = "fresh"
+	GraphReadyStale     GraphReadySource = "stale"
+	GraphReadyNoReader  GraphReadySource = "no-reader"
+	GraphReadyReadError GraphReadySource = "read-error"
+)
+
+// GraphReadySignal is the typed form of the graph readiness marker. Ready is
+// true only when a bound reader proved the graph is built and current. The
+// Source field lets a caller tell a stale graph from an unverifiable one
+// without parsing loadErrors.
+type GraphReadySignal struct {
+	Ready  bool
+	Source GraphReadySource
+}
+
+// graphIndexErrorSeen reports whether a failed graph read left a diagnostic in
+// the response. The marker alone cannot distinguish a stale graph from a read
+// that failed; the diagnostic can.
+func graphIndexErrorSeen(out StatsOutput) bool {
+	for _, entry := range out.LoadErrors {
+		if strings.HasPrefix(entry, graphIndexErrorPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadGraphReady lifts the legacy graphReady string into a typed signal. A
+// missing marker or a failed read both fail closed: Ready stays false and the
+// Source names the reason. The string marker is kept in loadErrors so older
+// readers that parse it keep working during the transition.
+func ReadGraphReady(out StatsOutput) GraphReadySignal {
+	entry := graphReadyEntry(out)
+	if entry == "" {
+		if graphIndexErrorSeen(out) {
+			return GraphReadySignal{Source: GraphReadyReadError}
+		}
+		return GraphReadySignal{Source: GraphReadyNoReader}
+	}
+	if entry != graphReadyPrefix+"true" {
+		if graphIndexErrorSeen(out) {
+			return GraphReadySignal{Source: GraphReadyReadError}
+		}
+		return GraphReadySignal{Source: GraphReadyStale}
+	}
+	return GraphReadySignal{Ready: true, Source: GraphReadyFresh}
+}
+
+// GraphReady is the field-like read of graph readiness on a stats response.
+// Callers use out.GraphReady().Ready instead of scanning a string array.
+func (o StatsOutput) GraphReady() GraphReadySignal { return ReadGraphReady(o) }
+
 // graphReady reports whether the stats response advertises a current graph.
-// A response with no marker is not ready, so a caller built before IDX-09
-// never mistakes silence for a green signal.
+// It is the boolean shorthand over the typed signal. A response with no marker
+// is not ready, so a caller built before IDX-09 never mistakes silence for a
+// green signal.
 func graphReady(out StatsOutput) bool {
-	return graphReadyEntry(out) == graphReadyPrefix+"true"
+	return ReadGraphReady(out).Ready
 }
 
 // pollerStatsEntry returns the poller diagnostic in a stats response, if any.
