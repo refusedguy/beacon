@@ -2,12 +2,52 @@ package taskcli
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
+
+const (
+	// stateWriteAttempts counts the first try and four retries. The four waits
+	// between them are 0.1, 0.2, 0.4 and 0.8 seconds.
+	stateWriteAttempts  = 5
+	stateWriteBaseDelay = 100 * time.Millisecond
+)
+
+// temporaryLockError reports whether err is a transient lock condition. Only
+// these errors are retried, so a permanent error reaches the caller on the
+// first attempt instead of being hidden by the wrapper.
+func temporaryLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.EWOULDBLOCK) ||
+		errors.Is(err, syscall.EAGAIN) ||
+		errors.Is(err, syscall.EINTR) ||
+		errors.Is(err, os.ErrPermission)
+}
+
+// retryTemporaryWrite calls op until it succeeds, reports a permanent error or
+// runs out of attempts. The sleep argument lets a test observe the delays
+// without waiting. Callers pass the same state on every attempt, so a retry
+// keeps the result idempotent.
+func retryTemporaryWrite(op func() error, sleep func(time.Duration)) error {
+	var err error
+	for attempt := 0; attempt < stateWriteAttempts; attempt++ {
+		if attempt > 0 {
+			sleep(stateWriteBaseDelay << (attempt - 1))
+		}
+		err = op()
+		if err == nil || !temporaryLockError(err) {
+			return err
+		}
+	}
+	return err
+}
 
 // fileState owns the path, the lock and the JSON load/save of one state file.
 // Decision rules stay in the service; this type only moves bytes.
@@ -54,11 +94,19 @@ func (r fileState[T]) lock() (func(), error) {
 	}
 
 	path := filepath.Join(r.stateDir, r.lockFile)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	var f *os.File
+	err := retryTemporaryWrite(func() error {
+		var err error
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+		return err
+	}, time.Sleep)
 	if err != nil {
 		return nil, taskstore.Startupf(r.lockOpenErr, err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	err = retryTemporaryWrite(func() error {
+		return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	}, time.Sleep)
+	if err != nil {
 		_ = f.Close()
 		return nil, taskstore.Startupf(r.lockTakeErr, err)
 	}
@@ -100,5 +148,8 @@ func (r fileState[T]) save(st T) error {
 	if err != nil {
 		return taskstore.Startupf(r.writeErr, err)
 	}
-	return taskstore.AtomicWrite(r.path(), append(data, '\n'), 0644)
+	payload := append(data, '\n')
+	return retryTemporaryWrite(func() error {
+		return taskstore.AtomicWrite(r.path(), payload, 0644)
+	}, time.Sleep)
 }
