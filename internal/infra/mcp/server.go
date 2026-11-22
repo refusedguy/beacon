@@ -98,6 +98,11 @@ const CycleInstructions = `Beacon cycle protocol:
 4. Read state with beacon_wait_result and beacon_get_result. Mark content read with beacon_ack.
 5. The orchestrator merges only after beacon_get_result returns verdict=ready, idempotently by (watchID, revision). An idle child report is not done.
 6. Close a finished or superseded watch with beacon_cancel_watch. beacon_list_running and beacon_stats are read-only.
+7. Claim a todo card with beacon_task_claim before you work on it. The first claim marks the card in_progress and returns its context.
+8. Close a card with beacon_task_close using a terminal status and a reason. A repeat with the same values changes nothing.
+9. Record deferred wiring with beacon_defer_wiring when part of the work needs another agent's files.
+
+Ten tools: beacon_watch_pr, beacon_wait_result, beacon_get_result, beacon_list_running, beacon_ack, beacon_cancel_watch, beacon_stats, beacon_defer_wiring, beacon_task_claim, beacon_task_close.
 
 Self-teaching next action: beacon_get_result returns nextAction, nextCommand and nextHint. Branch on nextAction, not on prose.
   keep_working - do not rebase an unchanged head; fix only the failedChecks returned by beacon_get_result.
