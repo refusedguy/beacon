@@ -59,12 +59,15 @@ jobs:
 
       # BL-04. Модуль evals не входит в корневой ./... и имеет build tag eval.
       # Отдельный шаг делает его тест обязательной проверкой PR.
+      # evals заменяет родительский модуль через replace, поэтому eval-тесты
+      # собирают внутренние пакеты, которым нужны lumberjack.v2 и yaml.v3.
+      # Их сумм нет в evals/go.sum, и -mod=mod даёт go добавить их при прогоне.
       - name: Test evals module
         working-directory: evals
         shell: bash
         run: |
           set -euo pipefail
-          go test -tags=eval ./...
+          go test -mod=mod -tags=eval ./...
 
       - name: Build beacon
         shell: bash

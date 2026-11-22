@@ -40,7 +40,9 @@ Eval-код лежит в отдельном модуле `github.com/refusedguy
 `evals/run.sh` остаётся локальной диагностикой полного набора сценариев.
 Обязательный прогон идёт в джобе `registry-check` workflow
 `.github/workflows/tests.yml`: шаг `Test evals module` выполняет
-`go test -tags=eval ./...` в каталоге `evals`. Шаг `Go directives match across
+`go test -mod=mod -tags=eval ./...` в каталоге `evals`. Флаг `-mod=mod` нужен,
+потому что evals заменяет родительский модуль, а его go.sum пока не содержит
+сумм внутренних зависимостей lumberjack.v2 и yaml.v3. Шаг `Go directives match across
 modules` сверяет директиву `go` в `go.mod`, `tools/beacon-gates/go.mod` и
 `evals/go.mod`. Расхождение версий блокирует merge PR.
 
