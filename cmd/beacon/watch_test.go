@@ -12,6 +12,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 type w69Call struct {
@@ -39,6 +40,23 @@ func w69CLI(t *testing.T, respond func(w69Call) runResult) (*CLI, *bytes.Buffer,
 			return respond(call)
 		},
 	}
+	previous := watchSessionSource
+	watchSessionSource = func() ([]opencode.Session, int, error) {
+		res := c.run(c.root, "opencode", []string{"api", "session.list"}, nil)
+		if res.code != 0 {
+			reason := strings.TrimSpace(string(res.stderr))
+			if reason == "" {
+				reason = strings.TrimSpace(string(res.stdout))
+			}
+			return nil, res.code, errors.New(reason)
+		}
+		sessions, err := opencode.ParseSessions(res.stdout)
+		if err != nil {
+			return nil, 2, err
+		}
+		return sessions, 0, nil
+	}
+	t.Cleanup(func() { watchSessionSource = previous })
 	return c, out, errOut, calls
 }
 
