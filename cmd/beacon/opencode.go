@@ -20,11 +20,13 @@ type opencodeReader interface {
 // opencodePort is the one port through which every OpenCode call in cmd/beacon
 // goes. It carries both the read routes and the write routes. There is no
 // second write port: spawn, deliver and wake all resolve the same installed
-// object (ADR 0092).
+// object (ADR 0092). PromptWithOptions is the write route spawn uses for the
+// first message of a created session (ADR 0060 п3, ADR 0309).
 type opencodePort interface {
 	opencodeReader
 	CreateSession(parentID, agent, title string, metadata map[string]string) (string, error)
 	Prompt(sessionID, text string) error
+	PromptWithOptions(ctx context.Context, sessionID, text string, opts opencode.PromptOptions) error
 }
 
 // livePort is the single adapter from the context-aware HTTP client to the
@@ -64,6 +66,13 @@ func (p *livePort) CreateSession(parentID, agent, title string, metadata map[str
 // Prompt posts one message into an existing session.
 func (p *livePort) Prompt(sessionID, text string) error {
 	return p.client.Prompt(context.Background(), sessionID, text)
+}
+
+// PromptWithOptions posts one message with the v2 id, delivery and resume
+// fields. Spawn uses it so the first prompt of a created session continues its
+// turn instead of starting a second context (ADR 0306, ADR 0309).
+func (p *livePort) PromptWithOptions(ctx context.Context, sessionID, text string, opts opencode.PromptOptions) error {
+	return p.client.PromptWithOptions(ctx, sessionID, text, opts)
 }
 
 // serverEnsurer and its shims are kept only so older stand-in tests still
@@ -120,6 +129,7 @@ func openCodePort() opencodePort { return installedOpenCodePort }
 func SetSessionCreator(c interface {
 	CreateSession(string, string, string, map[string]string) (string, error)
 	Prompt(string, string) error
+	PromptWithOptions(context.Context, string, string, opencode.PromptOptions) error
 }) {
 	if c == nil {
 		SetSessionSpawner(nil)

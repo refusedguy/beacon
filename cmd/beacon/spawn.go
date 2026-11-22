@@ -15,23 +15,26 @@ import (
 
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
 // sessionSpawner is the narrow port used by beacon spawn. CreateSession creates
 // an OpenCode session with the orchestrator's parentID, the agent id, a title
-// and the metadata that links the new session to beacon watch. Prompt sends one
-// text message to that session after it exists.
+// and the metadata that links the new session to beacon watch. PromptWithOptions
+// sends the first text message with a deterministic id, delivery steer and
+// resume true, so the new session continues its turn (ADR 0306, ADR 0309).
 //
-// The agent belongs to CreateSession, not to Prompt: in the v2 prompt route the
-// body has no agent field (ADR 0060 п3, docs/design/opencode-cli-manager.md:28).
+// The agent belongs to CreateSession, not to the prompt: in the v2 prompt route
+// the body has no agent field (ADR 0060 п3, docs/design/opencode-cli-manager.md:28).
 // Keeping the two calls on one port makes that boundary testable without a live
-// server. The production implementation is the thin HTTP client of T3.144 and
-// is installed by T3.145; tests install a stand-in with SetSessionSpawner.
+// server. The production implementation is the single OpenCode client installed
+// by SetOpenCodePort; tests install a stand-in with SetSessionSpawner.
 type sessionSpawner interface {
 	CreateSession(parentID, agent, title string, metadata map[string]string) (id string, err error)
 	Prompt(sessionID, text string) error
+	PromptWithOptions(ctx context.Context, sessionID, text string, opts opencode.PromptOptions) error
 }
 
 // spawnSessionSpawner is the installed port. It stays nil until production
@@ -138,12 +141,22 @@ func spawnPrompt(taskID, title string) string {
 	return fmt.Sprintf("Выполни задачу Beacon %s", taskID)
 }
 
-// runSpawn implements `beacon spawn <taskID> [--agent id] [--title ...]` and
-// `beacon spawn --runtime acp [taskID] [--runner name]`. The default path
-// creates a child session through the injected port; --runtime acp starts a
-// long-lived ACP runner instead and stays attached to its session/update
-// stream. No HTTP server or TUI is opened here (ADR 0060 п3 and п5).
+// runSpawn is the CLI wrapper for `beacon spawn`. It reads the parent session
+// from BEACON_PARENT_SESSION when a shell sets it and delegates to
+// runSpawnWithParent (ADR 0309). The variable is no longer required: an
+// orchestrator that calls the command in-process passes the parent directly.
 func (c *CLI) runSpawn(args []string) int {
+	return c.runSpawnWithParent(args, strings.TrimSpace(os.Getenv(spawnParentEnv)))
+}
+
+// runSpawnWithParent implements `beacon spawn <taskID> [--agent id] [--title ...]`
+// and `beacon spawn --runtime acp [taskID] [--runner name]` with an explicit
+// parentID. A daemon calls this seam without preparing process environment.
+// The default path creates a child session through the injected port; --runtime
+// acp starts a long-lived ACP runner instead and stays attached to its
+// session/update stream. An empty parentID creates a root session. No HTTP
+// server or TUI is opened here (ADR 0060 п3 and п5, ADR 0309).
+func (c *CLI) runSpawnWithParent(args []string, parentID string) int {
 	if hasHelpFlag(args) {
 		writeCommandHelp(c.out, "spawn")
 		return 0
@@ -169,17 +182,12 @@ func (c *CLI) runSpawn(args []string) int {
 	case "", "default", "session":
 		// Legacy path: create an OpenCode session through the injected port.
 	case "acp":
-		return c.runSpawnACP(taskID, strings.TrimSpace(p.value("title")), strings.TrimSpace(p.value("runner")))
+		return c.runSpawnACP(parentID, taskID, strings.TrimSpace(p.value("title")), strings.TrimSpace(p.value("runner")))
 	default:
 		fmt.Fprintf(c.errOut, "beacon spawn: неподдерживаемый runtime %q (доступен: acp)\n", runtime)
 		return 2
 	}
 
-	parentID := strings.TrimSpace(os.Getenv(spawnParentEnv))
-	if parentID == "" {
-		fmt.Fprintf(c.errOut, "beacon spawn: не задан parentID оркестратора (%s)\n", spawnParentEnv)
-		return 2
-	}
 	spawner := spawnSessionSpawner
 	if spawner == nil {
 		fmt.Fprintln(c.errOut, "beacon spawn: порт создания сессий не подключён")
@@ -204,7 +212,11 @@ func (c *CLI) runSpawn(args []string) int {
 		return 2
 	}
 
-	if err := spawner.Prompt(sessionID, spawnPrompt(taskID, sessionTitle)); err != nil {
+	// The first prompt carries a deterministic id derived from the task, so a
+	// repeat of the same spawn does not start a second turn. delivery steer with
+	// resume true continues the created session instead of restarting its
+	// context (ADR 0060 п3, ADR 0306, ADR 0309).
+	if err := spawner.PromptWithOptions(context.Background(), sessionID, spawnPrompt(taskID, sessionTitle), opencode.StartPromptOptions(taskID)); err != nil {
 		fmt.Fprintf(c.errOut, "beacon spawn: сессия %s создана, но промпт не отправлен: %v\n", sessionID, err)
 		return 2
 	}
@@ -505,8 +517,11 @@ func streamACPSession(ctx context.Context, rt wake.WorkerRuntime, sessionID, tas
 // result.
 //
 // The session id is printed before the prompt so the caller can watch the
-// stream while the worker is still running.
-func (c *CLI) runSpawnACP(taskID, title, runner string) int {
+// stream while the worker is still running. parentID is accepted explicitly so
+// every spawn entry point carries the same seam; the ACP path itself is
+// unchanged (ADR 0309).
+func (c *CLI) runSpawnACP(parentID, taskID, title, runner string) int {
+	_ = parentID // The ACP runner owns its session; it needs no OpenCode parent.
 	factory := spawnACPRuntimeFactory
 	if factory == nil {
 		fmt.Fprintln(c.errOut, "beacon spawn: ACP-раннер не подключён")

@@ -112,6 +112,10 @@ func (c *t3152Creator) Prompt(sessionID, text string) error {
 	return nil
 }
 
+func (c *t3152Creator) PromptWithOptions(context.Context, string, string, opencode.PromptOptions) error {
+	return nil
+}
+
 // t3152Ensurer is a stand-in for the T3.151 fallback starter. It returns a
 // registration as if it had spawned opencode serve on a free port.
 type t3152Ensurer struct {
