@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestPlanWaveWithoutGiants covers a wave where every change stays below the
@@ -123,5 +127,149 @@ func TestPlanWaveEmpty(t *testing.T) {
 	plan := planWave(nil)
 	if !plan.Valid || len(plan.Steps) != 0 || plan.Reason != "" {
 		t.Fatalf("empty wave = %+v, want valid with no steps", plan)
+	}
+}
+
+// TestAdmissionLockParallelShareSlotAndExclusiveWaits covers the admission
+// contract. Two parallel actions run together, and the exclusive action waits
+// for both of them before it starts.
+func TestAdmissionLockParallelShareSlotAndExclusiveWaits(t *testing.T) {
+	lock := newAdmissionLock()
+	ctx := context.Background()
+	hold := make(chan struct{})
+	parallelStarted := make(chan string, 2)
+	var started int32
+
+	var parallelWG sync.WaitGroup
+	for _, card := range []string{"P1", "P2"} {
+		parallelWG.Add(1)
+		go func(card string) {
+			defer parallelWG.Done()
+			release, err := lock.acquire(ctx, dispatchAction{Card: card, SupportsParallel: true})
+			if err != nil {
+				t.Errorf("parallel %s acquire: %v", card, err)
+				return
+			}
+			defer release()
+			atomic.AddInt32(&started, 1)
+			parallelStarted <- card
+			<-hold
+		}(card)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-parallelStarted:
+		case <-time.After(time.Second):
+			t.Fatal("two parallel actions did not share the admission slot")
+		}
+	}
+
+	exclusiveStarted := make(chan string, 1)
+	exclusiveDone := make(chan struct{})
+	go func() {
+		defer close(exclusiveDone)
+		release, err := lock.acquire(ctx, dispatchAction{Card: "E"})
+		if err != nil {
+			t.Errorf("exclusive acquire: %v", err)
+			return
+		}
+		defer release()
+		atomic.AddInt32(&started, 1)
+		exclusiveStarted <- "E"
+	}()
+
+	select {
+	case <-exclusiveStarted:
+		t.Fatal("exclusive action started while parallel actions held the slot")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(hold)
+	parallelWG.Wait()
+
+	select {
+	case <-exclusiveStarted:
+	case <-time.After(time.Second):
+		t.Fatal("exclusive action did not start after parallel actions released")
+	}
+	<-exclusiveDone
+
+	if got := atomic.LoadInt32(&started); got != 3 {
+		t.Fatalf("started actions = %d, want 3", got)
+	}
+}
+
+// TestAdmissionLockCanceledBeforeAcquireStartsNothing covers the first
+// cancellation check. An action with an already canceled context never enters
+// its body.
+func TestAdmissionLockCanceledBeforeAcquireStartsNothing(t *testing.T) {
+	lock := newAdmissionLock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	started := 0
+	release, err := lock.acquire(ctx, dispatchAction{Card: "P1", SupportsParallel: true})
+	if err == nil {
+		release()
+		started++
+	}
+	if started != 0 {
+		t.Fatalf("started actions = %d, want 0 for a canceled context", started)
+	}
+}
+
+// TestAdmissionLockCancelWhileWaitingStartsNothing covers cancellation while
+// another action owns the slot. The waiter leaves without starting its body,
+// and the parallel action still finishes after the slot is released.
+func TestAdmissionLockCancelWhileWaitingStartsNothing(t *testing.T) {
+	lock := newAdmissionLock()
+	ctx := context.Background()
+	hold := make(chan struct{})
+	parallelStarted := make(chan string, 1)
+	parallelDone := make(chan struct{})
+
+	go func() {
+		defer close(parallelDone)
+		release, err := lock.acquire(ctx, dispatchAction{Card: "P1", SupportsParallel: true})
+		if err != nil {
+			t.Errorf("parallel acquire: %v", err)
+			return
+		}
+		defer release()
+		parallelStarted <- "P1"
+		<-hold
+	}()
+	select {
+	case <-parallelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("parallel action did not enter its slot")
+	}
+
+	waitCtx, cancel := context.WithCancel(ctx)
+	exclusiveDone := make(chan struct{})
+	var started int32
+	go func() {
+		defer close(exclusiveDone)
+		release, err := lock.acquire(waitCtx, dispatchAction{Card: "E"})
+		if err != nil {
+			return
+		}
+		defer release()
+		atomic.AddInt32(&started, 1)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-exclusiveDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled waiter did not leave the admission wait")
+	}
+
+	close(hold)
+	<-parallelDone
+	if got := atomic.LoadInt32(&started); got != 0 {
+		t.Fatalf("started actions = %d, want 0 after cancellation", got)
 	}
 }

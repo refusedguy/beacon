@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
@@ -621,6 +622,103 @@ func planWave(items []giantWork) wavePlan {
 		})
 	}
 	return plan
+}
+
+// --- CC-01: per-action parallelism and admission lock ---------------------
+
+// dispatchAction is one action dispatched in a wave. SupportsParallel states
+// whether the action may hold a slot together with other parallel actions.
+// An action without the flag owns the slot and gets exclusive access to the
+// files the wave shares.
+type dispatchAction struct {
+	Card             string
+	SupportsParallel bool
+}
+
+// admissionLock grants dispatch slots. Parallel actions share one slot, and
+// every other action holds the slot alone. Waiting is interruptible: a canceled
+// context releases the waiter without starting the action.
+type admissionLock struct {
+	mu      sync.Mutex
+	readers int
+	writer  bool
+	writers int
+	changed chan struct{}
+}
+
+func newAdmissionLock() *admissionLock {
+	return &admissionLock{changed: make(chan struct{})}
+}
+
+// acquire waits for a slot and returns the function that releases it. The
+// context is checked before the wait and again after the slot is granted, so a
+// canceled action never starts. A pending exclusive action blocks new parallel
+// actions from entering.
+func (l *admissionLock) acquire(ctx context.Context, action dispatchAction) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if action.SupportsParallel {
+		for {
+			l.mu.Lock()
+			if !l.writer && l.writers == 0 {
+				l.readers++
+				l.mu.Unlock()
+				break
+			}
+			changed := l.changed
+			l.mu.Unlock()
+			select {
+			case <-changed:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	} else {
+		l.mu.Lock()
+		l.writers++
+		l.mu.Unlock()
+		defer func() {
+			l.mu.Lock()
+			l.writers--
+			l.mu.Unlock()
+		}()
+		for {
+			l.mu.Lock()
+			if !l.writer && l.readers == 0 {
+				l.writer = true
+				l.mu.Unlock()
+				break
+			}
+			changed := l.changed
+			l.mu.Unlock()
+			select {
+			case <-changed:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		l.release(action.SupportsParallel)
+		return nil, err
+	}
+	return func() { l.release(action.SupportsParallel) }, nil
+}
+
+// release returns the slot and wakes every waiter. The broadcast channel is
+// replaced under the mutex, so a waiter cannot miss a state change between
+// reading the channel and starting to wait on it.
+func (l *admissionLock) release(parallel bool) {
+	l.mu.Lock()
+	if parallel {
+		l.readers--
+	} else {
+		l.writer = false
+	}
+	close(l.changed)
+	l.changed = make(chan struct{})
+	l.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------
