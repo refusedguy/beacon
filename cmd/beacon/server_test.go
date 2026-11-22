@@ -89,3 +89,43 @@ func TestServerRunnerRefusesSecondStartWithClearError(t *testing.T) {
 		t.Fatalf("stderr = %q, want the holder pid", out.String())
 	}
 }
+
+func TestServerRegisteredInRunnerFor(t *testing.T) {
+	if runnerFor["server"] == nil {
+		t.Fatal("runnerFor has no server entry, so beacon server is not dispatchable")
+	}
+}
+
+func TestDispatchServerReachesServerRunner(t *testing.T) {
+	t.Setenv(beaconStateDirEnv, t.TempDir())
+
+	lease := &recordingLease{}
+	acquirer := &fakeLeaseAcquirer{handle: lease}
+	stubServerLease(t, acquirer)
+
+	prev := mcpRunner
+	mcpCalls := 0
+	mcpRunner = func(io.Writer) int {
+		mcpCalls++
+		return 37
+	}
+	t.Cleanup(func() { mcpRunner = prev })
+
+	var out, errOut bytes.Buffer
+	c := &CLI{out: &out, errOut: &errOut}
+	if code := c.dispatch([]string{"server"}); code != 37 {
+		t.Fatalf("dispatch(server) exit code = %d, want 37, stderr = %q", code, errOut.String())
+	}
+	if mcpCalls != 1 {
+		t.Fatalf("mcpRunner called %d times, want 1", mcpCalls)
+	}
+	if len(acquirer.dirs) != 1 {
+		t.Fatalf("Acquire dirs = %v, want the one state dir", acquirer.dirs)
+	}
+	if lease.releases != 1 {
+		t.Fatalf("Release called %d times, want 1", lease.releases)
+	}
+	if strings.Contains(errOut.String(), "неизвестная подкоманда") {
+		t.Fatalf("stderr = %q, want no unknown-command error", errOut.String())
+	}
+}

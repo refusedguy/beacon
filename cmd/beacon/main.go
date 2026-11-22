@@ -72,8 +72,17 @@ var spawnCatalogEntry = command{
 	Usage:   "beacon spawn <taskID> [--agent id] [--title ...]",
 }
 
+// serverCatalogEntry registers server in the command catalog. It lives here
+// rather than in catalog.go because catalog.go is outside this card's file
+// ownership; the init append keeps `beacon list` and runnerFor in sync.
+var serverCatalogEntry = command{
+	Name:    "server",
+	Summary: "Запустить HTTP-сервер Beacon с лизингом единственного экземпляра",
+	Usage:   "beacon server",
+}
+
 func init() {
-	catalog = append(catalog, spawnCatalogEntry)
+	catalog = append(catalog, spawnCatalogEntry, serverCatalogEntry)
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 
 	// RegisterGC and RegisterGCWorktree are installed in gc.go, and
@@ -251,6 +260,7 @@ func init() {
 		"task":         func(c *CLI, args []string) int { return taskRunner(args, c.out, c.errOut) },
 		"why":          func(c *CLI, args []string) int { return taskRunner(append([]string{"why"}, args...), c.out, c.errOut) },
 		"mcp":          func(c *CLI, args []string) int { return mcpRunner(c.errOut) },
+		"server":       func(c *CLI, args []string) int { return serverRunner(c.errOut) },
 		"orchestrate":  func(c *CLI, args []string) int { return orchestratorRunner(c, args) },
 		"orchestrator": func(c *CLI, args []string) int { return orchestratorCommandRunner(c, args) },
 		"agents":       func(c *CLI, args []string) int { return c.runAgents(args) },
