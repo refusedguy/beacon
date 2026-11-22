@@ -321,6 +321,38 @@ type Result struct {
 	Actions     []Action `json:"actions"`
 }
 
+// NetworkSpec describes the network request an operation is about to make.
+// A nil spec means the operation is local, so it needs no approval. The merge
+// call is the only network request in the decision path today; the caller
+// supplies a spec explicitly so a Watch without one produces zero approvals.
+type NetworkSpec struct {
+	Method string
+	Host   string
+	Path   string
+}
+
+// CancelProxy aborts the in-flight network operation. The handle hands it to
+// the operation before launch so cancellation is not lost when the operation
+// fails. Cancel is safe to call more than once.
+type CancelProxy interface {
+	Cancel()
+}
+
+// ApprovalHandle finalizes one network approval. Finish records the final
+// result, including an error, exactly once after the operation returns.
+// Cancel proxies cancellation to the in-flight operation.
+type ApprovalHandle interface {
+	CancelProxy
+	Finish(result error)
+}
+
+// NetworkApprover starts network approval before an operation launches and
+// returns the handle that finalizes it after the result is known. An
+// implementation returns a nil handle when the spec needs no approval.
+type NetworkApprover interface {
+	Approve(ctx context.Context, spec NetworkSpec) (ApprovalHandle, error)
+}
+
 // Options configures one pass. DryRun records the actions it would take
 // without calling the Merger, writing the ledger or closing any Watch.
 // Resolver supplies the dependency facts; a nil Resolver leaves every Watch
@@ -336,6 +368,12 @@ type Options struct {
 	// nil value sends only the verdict through Waker and leaves the reason on
 	// the Action.
 	ReasonWaker ReasonWaker
+	// NetworkApprover and NetworkSpec add a network approval around the merge
+	// call. Both must be set for approval to happen: an absent spec means no
+	// network request and produces zero approvals. Existing callers leave both
+	// nil, so their verdicts are unchanged (CCx-05).
+	NetworkApprover NetworkApprover
+	NetworkSpec     *NetworkSpec
 }
 
 // Run walks the active Watches once. Ready Watches with autor-merge enabled
@@ -532,6 +570,32 @@ func retryTransient[T any](ctx context.Context, call func() (T, error)) (T, erro
 	return zero, nil
 }
 
+// withNetworkApproval runs call with approval started before launch and
+// finalized after the result. Approve happens before call; Finish runs once
+// on both success and error. When call fails the cancellation proxy is
+// invoked so the in-flight request is aborted. A missing approver or spec is
+// a no-op, which keeps every existing call path free of approvals (CCx-05).
+func withNetworkApproval[T any](ctx context.Context, opts Options, call func() (T, error)) (T, error) {
+	var zero T
+	if opts.NetworkApprover == nil || opts.NetworkSpec == nil {
+		return call()
+	}
+	handle, err := opts.NetworkApprover.Approve(ctx, *opts.NetworkSpec)
+	if err != nil {
+		return zero, fmt.Errorf("orchestrator: network approval: %w", err)
+	}
+	if handle == nil {
+		return call()
+	}
+	var callErr error
+	defer func() { handle.Finish(callErr) }()
+	value, callErr := call()
+	if callErr != nil {
+		handle.Cancel()
+	}
+	return value, callErr
+}
+
 // recordMergeFailure is the single exit for a merge that failed after its
 // budget. A transient failure earns an explicit WARN event. Without it a
 // Watch still marked ready looks healthy although no retry is left.
@@ -595,11 +659,13 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 	}
 	observe.MergeAttempt(w.ID, w.PR)
 	if checked := opts.CheckedMerger; checked != nil {
-		mergeCheckedOne(ctx, st, checked, w, command, out, errs)
+		mergeCheckedOne(ctx, st, checked, opts, w, command, out, errs)
 		return
 	}
-	if _, err := retryTransient(ctx, func() (struct{}, error) {
-		return struct{}{}, merger.Merge(ctx, w.Repo, w.PR)
+	if _, err := withNetworkApproval(ctx, opts, func() (struct{}, error) {
+		return retryTransient(ctx, func() (struct{}, error) {
+			return struct{}{}, merger.Merge(ctx, w.Repo, w.PR)
+		})
 	}); err != nil {
 		recordMergeFailure(w, command, err, out, errs)
 		return
@@ -610,9 +676,11 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 // mergeCheckedOne turns one checked outcome into state changes. Only a
 // confirmed MERGE closes the Watch; a held or pending PR is reported without
 // an error so a dirty PR does not produce a multi-line gh hint on every pass.
-func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, w Watch, command string, out *Result, errs *[]error) {
-	outcome, err := retryTransient(ctx, func() (MergeOutcome, error) {
-		return merger.MergeChecked(ctx, w.Repo, w.PR)
+func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, opts Options, w Watch, command string, out *Result, errs *[]error) {
+	outcome, err := withNetworkApproval(ctx, opts, func() (MergeOutcome, error) {
+		return retryTransient(ctx, func() (MergeOutcome, error) {
+			return merger.MergeChecked(ctx, w.Repo, w.PR)
+		})
 	})
 	if err != nil {
 		log.Printf("orchestrator: merge PR %d: %v", w.PR, err)
