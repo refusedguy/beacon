@@ -88,12 +88,19 @@ pass 'бинарник beacon собран'
 section "MCP: beacon mcp и beacon_stats"
 mkdir -p "$WORK/mcpcheck"
 cp "$REPO/evals/go.sum" "$WORK/mcpcheck/go.sum"
+go_version="$(awk '$1 == "go" { print $2; exit }' "$REPO/go.mod")"
+sdk_version="$(awk '$1 == "github.com/modelcontextprotocol/go-sdk" { print $2; exit }' "$REPO/evals/go.mod")"
+if [[ -z "$go_version" || -z "$sdk_version" ]]; then
+  fail 'версии для mcp-клиента не прочитаны' "go=$go_version sdk=$sdk_version"
+  printf '\nИТОГ: %d проверок провалено\n' "$FAILURES" >&2
+  exit 1
+fi
 cat > "$WORK/mcpcheck/go.mod" <<EOF
 module verifybeacon
 
-go 1.26.0
+go $go_version
 
-require github.com/modelcontextprotocol/go-sdk v1.8.0
+require github.com/modelcontextprotocol/go-sdk $sdk_version
 EOF
 cat > "$WORK/mcpcheck/main.go" <<'GOEOF'
 package main
@@ -104,6 +111,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -115,8 +123,12 @@ func die(format string, args ...any) {
 }
 
 func main() {
-	if len(os.Args) != 3 {
-		die("нужны путь к бинарнику beacon и каталог проекта")
+	if len(os.Args) != 4 {
+		die("нужны путь к бинарнику beacon, каталог проекта и ожидаемое число инструментов")
+	}
+	expectedTools, err := strconv.Atoi(os.Args[3])
+	if err != nil {
+		die("ожидаемое число инструментов: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -139,8 +151,8 @@ func main() {
 	if err != nil {
 		die("tools/list: %v", err)
 	}
-	if len(tools.Tools) != 7 {
-		die("tools/list вернул %d инструментов, ожидалось 7", len(tools.Tools))
+	if len(tools.Tools) != expectedTools {
+		die("tools/list вернул %d инструментов, ожидалось %d", len(tools.Tools), expectedTools)
 	}
 	found := false
 	for _, tool := range tools.Tools {
@@ -175,10 +187,31 @@ func main() {
 	fmt.Printf("MCP_OK server=%s tools=%d stats_keys=%d\n", init.ServerInfo.Name, len(tools.Tools), len(obj))
 }
 GOEOF
-if (cd "$WORK/mcpcheck" && GOFLAGS=-mod=mod "$GO" run . "$WORK/beacon" "$REPO" >"$WORK/mcp.out" 2>"$WORK/mcp.err"); then
-  pass "MCP $(cat "$WORK/mcp.out")"
-else
-  fail 'MCP beacon_stats' "$(cat "$WORK/mcp.err"; tail -n 10 "$WORK/mcp.out")"
+dump_dir="$(mktemp -d "$REPO/.verify-advertised.XXXXXX")"
+trap 'rm -rf "$WORK" "$dump_dir"' EXIT
+cat > "$dump_dir/main.go" <<'GOEOF'
+package main
+
+import (
+	"fmt"
+
+	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
+)
+
+func main() {
+	fmt.Println(len(beaconmcp.AdvertisedToolNames()))
+}
+GOEOF
+expected_tools="$(cd "$REPO" && "$GO" run "$dump_dir/main.go" 2>"$WORK/dump.err")" || {
+  fail 'дамп AdvertisedToolNames' "$(cat "$WORK/dump.err")"
+  expected_tools=""
+}
+if [[ -n "$expected_tools" ]]; then
+  if (cd "$WORK/mcpcheck" && GOFLAGS=-mod=mod "$GO" run . "$WORK/beacon" "$REPO" "$expected_tools" >"$WORK/mcp.out" 2>"$WORK/mcp.err"); then
+    pass "MCP $(cat "$WORK/mcp.out")"
+  else
+    fail 'MCP beacon_stats' "$(cat "$WORK/mcp.err"; tail -n 10 "$WORK/mcp.out")"
+  fi
 fi
 
 section "Проект-scoped состояние"
