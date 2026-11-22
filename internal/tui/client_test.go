@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -207,6 +208,79 @@ func TestEventsParseFramesAndResumeWithLastEventID(t *testing.T) {
 	}
 	if len(resumed) != 1 || !strings.Contains(string(resumed[0].Data), "4") {
 		t.Errorf("resumed events = %+v, want data carrying Last-Event-ID 4", resumed)
+	}
+}
+
+// TestColdStartEventTail checks that a cold live screen asks for a replay tail
+// and receives a non-empty one. Before TUI-03 the first event request carried
+// no replay parameter, so this test failed; the merged client sends it.
+func TestColdStartEventTail(t *testing.T) {
+	var mu sync.Mutex
+	var replay, lastID string
+	client, _ := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case snapshotPath:
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"pointStats":{"used":7,"budget":500},"liveWatches":[{"id":"w1","pr":42,"subscribers":[{"id":"ses-1","role":"executor","target":"w1","phase":"watching"}]}]}`)
+		case eventsPath:
+			mu.Lock()
+			replay = r.URL.Query().Get("replay")
+			lastID = r.Header.Get("Last-Event-ID")
+			mu.Unlock()
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				t.Error("server writer is not a flusher")
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			flusher.Flush()
+			fmt.Fprint(w, "id: 11\nevent: watch.updated\ndata: {\"watchID\":\"w1\"}\n\n")
+			fmt.Fprint(w, "id: 12\nevent: blocker.opened\ndata: {\"id\":\"b1\"}\n\n")
+			flusher.Flush()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	snap, err := client.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.PointStats.Used != 7 || snap.PointStats.Limit != 500 {
+		t.Errorf("points = %+v, want 7/500", snap.PointStats)
+	}
+	if len(snap.LiveWatches) != 1 || len(snap.LiveWatches[0].Subscribers) != 1 {
+		t.Fatalf("watches = %+v, want one watch with a subscriber", snap.LiveWatches)
+	}
+	sub := snap.LiveWatches[0].Subscribers[0]
+	if sub.ID != "ses-1" || sub.Role != "executor" || sub.Target != "w1" {
+		t.Errorf("subscriber = %+v, want role executor and target w1", sub)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	events, err := collectEvents(ctx, client.Events(ctx))
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) < 2 {
+		t.Fatalf("event tail = %+v, want both replay frames", events)
+	}
+	if events[0].ID != "11" || events[1].ID != "12" {
+		t.Errorf("event tail = %+v, want ids 11 and 12", events)
+	}
+	if line := eventLine(events[0]); line == "" {
+		t.Error("first replay frame produced an empty tail line")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if replay != strconv.Itoa(eventReplayCount) {
+		t.Errorf("cold replay = %q, want %d", replay, eventReplayCount)
+	}
+	if lastID != "" {
+		t.Errorf("cold request sent Last-Event-ID %q, want none", lastID)
 	}
 }
 
