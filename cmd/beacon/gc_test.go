@@ -572,7 +572,9 @@ func gcCompactSeams(t *testing.T, commits []gcCompactCommit, head string, applie
 func TestGCCompactRefusesOutOfOrderDates(t *testing.T) {
 	commits := gcCompactFixture()
 	commits[2].Date = commits[2].Date.Add(-30 * 24 * time.Hour)
-	cutoff := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	// Commit 2 gets an old date but keeps its late position in history. The
+	// cutoff must place commit 1 on the recent side for the dates to cross.
+	cutoff := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
 
 	plan := gcCompactBuild(commits, cutoff, "hash-4", "hash-4")
 	if plan.Reason != gcCompactReasonOutOfOrder {
@@ -589,7 +591,7 @@ func TestGCCompactRefusesOutOfOrderDates(t *testing.T) {
 	gcCompactSeams(t, commits, "hash-4", &applied)
 	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
 	c := &CLI{out: out, errOut: errOut}
-	if code := runGCCompact(c, []string{"--cutoff", "2026-11-02T12:00:00Z", "--format", "json"}); code != 2 {
+	if code := runGCCompact(c, []string{"--cutoff", "2026-11-01T12:00:00Z", "--format", "json"}); code != 2 {
 		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
 	}
 	if applied != 0 {
