@@ -461,7 +461,10 @@ func TestGCStalePlanSkipsAncestorOfLiveSubscriber(t *testing.T) {
 // never reaches the registry close.
 func TestGCSessionsStaleDeleteFailureLeavesRowOpen(t *testing.T) {
 	out, errOut, deletes, closes := mockStaleSessionGC(t, gcSessionCandidate{SessionID: "ses_stale", Stale: true})
-	gcSessionDelete = func(context.Context, string) error { return errors.New("403") }
+	gcSessionDelete = func(_ context.Context, id string) error {
+		*deletes = append(*deletes, id)
+		return errors.New("403")
+	}
 	c := &CLI{out: out, errOut: errOut}
 	if code := runGCWithServe(c, []string{"--apply"}); code != 2 {
 		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
