@@ -556,6 +556,92 @@ func NextID(cards []Card, groups map[string]int, group int) (int, string) {
 	return n, fmt.Sprintf("T%d.%d", group, n)
 }
 
+// IDCollision это ID, который встретился в нескольких worktree с разным
+// содержимым карточки.
+type IDCollision struct {
+	ID    string
+	Roots []string
+}
+
+// CollisionReport это результат замера коллизий последовательных ID между
+// ветками. Duplicates считает все ID, встречающиеся более чем в одном корне.
+// Collisions оставляет только те, где содержимое карточек различается.
+type CollisionReport struct {
+	Worktrees  int
+	Cards      int
+	Duplicates int
+	Collisions []IDCollision
+}
+
+// MeasureIDCollisions сканирует docs/tasks в каждом корне и считает повторы ID
+// между worktree. Формат ID не меняется: T%d.%d остаётся валидным.
+//
+// Замер от 2026-11-22: 316 worktree с docs/tasks, 369242 записи карточек,
+// 1228 уникальных ID, 1226 ID в нескольких worktree, 234 ID с разным
+// содержимым. Четыре из них в формате T<g>.<n>: T3.241, T3.284, T3.393, T5.52.
+// Хеш-суффикс не введён: exactIDRE и ATX-R01 требуют старый формат ID.
+func MeasureIDCollisions(roots ...string) (CollisionReport, error) {
+	report := CollisionReport{}
+	seenRoots := make(map[string]bool)
+	owners := make(map[string]map[string]string)
+	for _, root := range roots {
+		tasksDir := filepath.Join(root, "docs", "tasks")
+		entries, err := os.ReadDir(tasksDir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return report, Startupf("не прочитан каталог карточек %s: %v", tasksDir, err)
+		}
+		if !seenRoots[root] {
+			seenRoots[root] = true
+			report.Worktrees++
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+				continue
+			}
+			id := strings.TrimSuffix(entry.Name(), ".md")
+			if !IsID(id) {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(tasksDir, entry.Name()))
+			if err != nil {
+				return report, Startupf("не прочитана карточка %s: %v", entry.Name(), err)
+			}
+			sum := sha256.Sum256(data)
+			if owners[id] == nil {
+				owners[id] = make(map[string]string)
+			}
+			owners[id][root] = hex.EncodeToString(sum[:])
+			report.Cards++
+		}
+	}
+	for id, byRoot := range owners {
+		if len(byRoot) < 2 {
+			continue
+		}
+		report.Duplicates++
+		hashes := make(map[string]bool, len(byRoot))
+		for _, h := range byRoot {
+			hashes[h] = true
+		}
+		if len(hashes) < 2 {
+			continue
+		}
+		collisionRoots := make([]string, 0, len(byRoot))
+		for root := range byRoot {
+			collisionRoots = append(collisionRoots, root)
+		}
+		sort.Strings(collisionRoots)
+		report.Collisions = append(report.Collisions, IDCollision{ID: id, Roots: collisionRoots})
+	}
+	sort.Slice(report.Collisions, func(i, j int) bool {
+		return report.Collisions[i].ID < report.Collisions[j].ID
+	})
+	return report, nil
+}
+
 // CreateExclusive создаёт файл карточки. Занятый ID даёт ошибку валидации, код 1.
 func CreateExclusive(filePath string, data []byte) error {
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
