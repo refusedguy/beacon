@@ -430,7 +430,7 @@ func CounterNames() []string {
 
 // HistogramNames returns the known histogram names in stable order.
 func HistogramNames() []string {
-	return []string{HistogramMerge, HistogramPollCycle, HistogramRun, HistogramWake, HistogramWakeDeferredAge}
+	return []string{HistogramMerge, HistogramPollCycle, HistogramRetryOpen, HistogramRun, HistogramWake, HistogramWakeDeferredAge}
 }
 
 // JSON renders every metric as a JSON object. An unlabeled counter is a

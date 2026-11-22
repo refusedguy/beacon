@@ -233,6 +233,7 @@ const (
 	HistogramWake            = "wake_duration_seconds"
 	HistogramRun             = "run_duration_seconds"
 	HistogramWakeDeferredAge = "wake_deferred_age_seconds"
+	HistogramRetryOpen       = "retry_open_duration_seconds"
 )
 
 // Label keys of the labelled counters.
@@ -811,6 +812,19 @@ func WakeFailed(adapter, watchID string, err error, revision ...uint64) {
 func WakeFailedOutcome(adapter, watchID, outcome string, err error, revision ...uint64) {
 	WakeFailed(adapter, watchID, err, revision...)
 	WakeOutcome(adapter, outcome, watchID, revision...)
+}
+
+// RetryOpen records the wait between a failed wake delivery and the next ladder
+// rung of its obligation. The wait goes to an unlabelled duration histogram, so
+// no watch id or session id becomes a metric label and cardinality stays fixed.
+// The watch id stays in the log event only.
+func RetryOpen(watchID string, d time.Duration) {
+	Observe(HistogramRetryOpen, d.Seconds())
+	fields := Fields{FieldDuration: d.String()}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	Event(LevelDebug, "retry_open", fields)
 }
 
 // RebaseRequested records a pointer asking a subscriber to rebase itself.
