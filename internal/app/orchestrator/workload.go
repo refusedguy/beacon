@@ -64,6 +64,7 @@ type WorkloadWatch struct {
 // role and project. Registered counts the new orchestrator subscriptions
 // installed during the pass. SlotsTotal is the configured parallel-slot
 // budget; SlotsUsed is the number of active slots in the same snapshot.
+// Skipped counts units a bounded pass did not start after a failure.
 type Workload struct {
 	Total          int               `json:"total"`
 	Ready          int               `json:"ready"`
@@ -72,6 +73,7 @@ type Workload struct {
 	Registered     int               `json:"registered"`
 	SlotsTotal     int               `json:"slotsTotal"`
 	SlotsUsed      int               `json:"slotsUsed"`
+	Skipped        int               `json:"skipped"`
 	RateLimit      WorkloadRateLimit `json:"rateLimit"`
 	ByVerdict      map[string]int    `json:"byVerdict"`
 	ByRole         map[string]int    `json:"byRole"`
@@ -120,6 +122,13 @@ type WorkloadRateLimit struct {
 // signal, so the daemon adapter stays unchanged.
 type RateLimitStore interface {
 	RateLimit(ctx context.Context) (WorkloadRateLimit, error)
+}
+
+// SkippedStore is an optional capability for stores that expose the number of
+// units the last bounded pass did not start after a failure. A store without
+// it still compiles and the workload report shows zero.
+type SkippedStore interface {
+	SkippedUnits(ctx context.Context) (int, error)
 }
 
 // SpawnPlan is the planner's answer for one pass over pending spawns. Allowed
@@ -323,6 +332,14 @@ func RunWorkload(ctx context.Context, st WorkloadStore) (Workload, error) {
 		}
 		limit.Status = normalizeToken(limit.Status)
 		report.RateLimit = limit
+	}
+
+	if ss, ok := st.(SkippedStore); ok {
+		skipped, err := ss.SkippedUnits(ctx)
+		if err != nil {
+			return Workload{}, fmt.Errorf("workload: skipped units: %w", err)
+		}
+		report.Skipped = skipped
 	}
 
 	var errs []error
