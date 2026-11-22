@@ -57,3 +57,13 @@ No overlap and no duplicate card were found. All 12 PRs map to distinct cards, a
 - Violations: 1.
 - Cross-PR file overlaps: 0.
 - Duplicate card claims: 0.
+
+## Typed context-file roles (CA-11)
+
+The PR 1448 violation shows that the edit boundary lives only in prose. A context entry has no field that separates the card's own files from the other files passed to the executor. The audit catches the breach after the PR, not at write time.
+
+aider handles the same problem with two sets, `abs_fnames` and `abs_read_only_fnames` (`aider/commands.py:1328-1397`). The model sees both sets but edits only the first. The `/read-only` command moves a file into the read-only set. The `/add` command promotes it back when the path exists in the repository.
+
+CA-11 adds a role to the context entry. The `editable` role comes from the card's OwnerFiles. The `readonly` role covers every other file passed to the executor. A write checks the role first and returns the `readonly_file` code on refusal. A promotion command changes the role to `editable` without restarting the session. Ownership rules stay the same, and the card's OwnerFiles remains the only source of the edit boundary.
+
+Acceptance counts 20 writes, ten to `editable` and ten to `readonly`. All ten `readonly` writes are refused with the role code, all ten `editable` writes pass, and the role change takes effect at once. The baseline is one violation in 12 reviewed PRs.
