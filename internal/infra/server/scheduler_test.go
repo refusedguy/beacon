@@ -166,6 +166,28 @@ func TestScheduleCreateValidation(t *testing.T) {
 	}
 }
 
+func TestScheduleCreateSetsNextRunAt(t *testing.T) {
+	cases := []struct {
+		name string
+		in   server.ScheduleCreate
+	}{
+		{"interval", server.ScheduleCreate{TaskID: "T", Kind: server.KindInterval, Expr: "15m", Timezone: "UTC"}},
+		{"cron", server.ScheduleCreate{TaskID: "T", Kind: server.KindCron, Expr: "0 9 * * *", Timezone: "UTC"}},
+		{"mark", server.ScheduleCreate{TaskID: "T", Kind: server.KindMark, Expr: "deploy", Timezone: "UTC"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := newService(t, newMockStore()).Schedule(context.Background(), tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.NextRunAt.IsZero() {
+				t.Fatalf("NextRunAt is zero for %s", tc.name)
+			}
+		})
+	}
+}
+
 // List returns every schedule ordered by ID, including paused ones.
 func TestScheduleList(t *testing.T) {
 	store := newMockStore()
@@ -233,6 +255,9 @@ func TestScheduleResume(t *testing.T) {
 	}
 	if !got.Enabled || got.TaskID != "T" {
 		t.Fatalf("resume: %+v", got)
+	}
+	if _, err := newService(t, store).Resume(context.Background(), "  "); !server.IsValidation(err) {
+		t.Fatalf("empty id error = %v, want ValidationError", err)
 	}
 }
 
@@ -366,6 +391,23 @@ func TestSchedulerHandler(t *testing.T) {
 	if len(payload.Schedules) != 1 || payload.Schedules[0].Enabled {
 		t.Fatalf("list after pause = %+v", payload.Schedules)
 	}
+	pausedField := payload.Schedules[0]
+
+	if rec := do(http.MethodPost, server.ScheduleResumePath, `{"id":"s1"}`, true); rec.Code != http.StatusOK {
+		t.Fatalf("resume status = %d body %s", rec.Code, rec.Body.String())
+	}
+	listRec = do(http.MethodGet, server.ScheduleListPath, "", true)
+	if err := json.Unmarshal(listRec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Schedules) != 1 || !payload.Schedules[0].Enabled {
+		t.Fatalf("list after resume = %+v", payload.Schedules)
+	}
+	if got := payload.Schedules[0]; got.TaskID != pausedField.TaskID || got.Kind != pausedField.Kind ||
+		got.Expr != pausedField.Expr || !got.NextRunAt.Equal(pausedField.NextRunAt) {
+		t.Fatalf("resume changed the trigger: before %+v after %+v", pausedField, got)
+	}
+
 	if rec := do(http.MethodDelete, server.ScheduleDeletePath+"?id=s1", "", true); rec.Code != http.StatusOK {
 		t.Fatalf("delete status = %d body %s", rec.Code, rec.Body.String())
 	}

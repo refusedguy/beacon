@@ -227,10 +227,35 @@ func buildSchedule(in ScheduleCreate) (Schedule, error) {
 	if err := validateExpr(in.Kind, in.Expr); err != nil {
 		return Schedule{}, err
 	}
+	next, err := firstRunAt(in.Kind, in.Expr, time.Now())
+	if err != nil {
+		return Schedule{}, err
+	}
 	return Schedule{
 		ID: in.ID, TaskID: in.TaskID, Kind: in.Kind, Expr: in.Expr,
-		Timezone: in.Timezone, Enabled: true,
+		Timezone: in.Timezone, Enabled: true, NextRunAt: next,
 	}, nil
+}
+
+// firstRunAt computes the first storage-valid run time for a schedule. The
+// planner that evaluates cron expressions lives in internal/app and is not
+// wired yet (ADR 0314), so cron uses the next minute boundary as a safe first
+// evaluation point and mark is due immediately. Intervals are exact.
+func firstRunAt(kind Kind, expr string, now time.Time) (time.Time, error) {
+	switch kind {
+	case KindInterval:
+		d, err := time.ParseDuration(expr)
+		if err != nil {
+			return time.Time{}, invalid("server: интервал %q: %v", expr, err)
+		}
+		return now.Add(d), nil
+	case KindCron:
+		return now.Truncate(time.Minute).Add(time.Minute), nil
+	case KindMark:
+		return now, nil
+	default:
+		return time.Time{}, invalid("server: неизвестный вид расписания %q", kind)
+	}
 }
 
 func validateExpr(kind Kind, expr string) error {
@@ -451,6 +476,7 @@ const (
 	SchedulePath       = "/internal/scheduler/schedule"
 	ScheduleListPath   = "/internal/scheduler/list"
 	SchedulePausePath  = "/internal/scheduler/pause"
+	ScheduleResumePath = "/internal/scheduler/resume"
 	ScheduleDeletePath = "/internal/scheduler/delete"
 )
 
@@ -487,6 +513,7 @@ func (h *SchedulerHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+SchedulePath, h.handleCreate)
 	mux.HandleFunc("GET "+ScheduleListPath, h.handleList)
 	mux.HandleFunc("POST "+SchedulePausePath, h.handlePause)
+	mux.HandleFunc("POST "+ScheduleResumePath, h.handleResume)
 	mux.HandleFunc("DELETE "+ScheduleDeletePath, h.handleDelete)
 }
 
@@ -555,6 +582,19 @@ func (h *SchedulerHandler) handlePause(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeScheduleJSON(w, http.StatusOK, map[string]any{"ok": true, "schedule": paused})
+}
+
+func (h *SchedulerHandler) handleResume(w http.ResponseWriter, r *http.Request) {
+	in, ok := decodeScheduleRequest(w, r)
+	if !ok {
+		return
+	}
+	resumed, err := h.svc.Resume(r.Context(), in.ID)
+	if err != nil {
+		writeScheduleError(w, http.StatusNotFound, "SCHEDULE_FAILED", err.Error())
+		return
+	}
+	writeScheduleJSON(w, http.StatusOK, map[string]any{"ok": true, "schedule": resumed})
 }
 
 func (h *SchedulerHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
