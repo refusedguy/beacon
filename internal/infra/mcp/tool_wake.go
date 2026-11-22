@@ -708,6 +708,11 @@ func (h *WakeHandler) applyWakeWindow(ctx context.Context, in WakeInput) error {
 	return nil
 }
 
+// The wake handlers in this group stay unregistered by design. ADR 0263 fixes
+// the MCP tool contract at seven names and forbids silent wake registration.
+// Adding a tool name needs a separate ADR, not a later wave. These constructors
+// are a permanent boundary, not work deferred to Waves 6-8.
+//
 // NewWakeHandler builds a handler over sender. A nil sender is allowed here and
 // is reported as unsupported at call time, so a misconfigured environment
 // cannot fake a successful delivery. Callers that only have a sender keep the
@@ -1805,9 +1810,11 @@ func guardedWake(in WakeInput, d HeartbeatDecision) WakeOutput {
 	}, d, true)
 }
 
-// AttachWake registers the real wake tool on a server. NewServer keeps the
-// contracted stub set and does not call this function; registration is a
-// separate integration task.
+// AttachWake registers the real wake tool on a server. NewServer does not call
+// it: ADR 0263 fixes the MCP contract at seven names and forbids silent wake
+// registration. The constructor stays for callers that hold an explicit
+// WakeHandler; adding a tool name still needs a separate ADR. This is a
+// permanent boundary, not a deferred Wave 6-8 task.
 func AttachWake(server *mcpsdk.Server, handler *WakeHandler) {
 	if server == nil || handler == nil {
 		return
