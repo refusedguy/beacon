@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 // WatchReader supplies the active Watches projected onto the orchestrator's
@@ -69,8 +71,12 @@ type CommandRunner interface {
 var ErrRefMissing = errors.New("orchestrator: dependency ref missing on main")
 
 var (
-	dependencyPRRef   = regexp.MustCompile(`(?i)^(?:pr\s*#|pr/|pr-|#)(\d+)$`)
-	dependencyCardRef = regexp.MustCompile(`(?i)^t\d+\.\d+$`)
+	dependencyPRRef = regexp.MustCompile(`(?i)^(?:pr\s*#|pr/|pr-|#)(\d+)$`)
+	// dependencyIDLike matches slash-free, letter-led strings that carry a
+	// digit and use only card ID characters. A valid taskstore ID of this
+	// shape is a card ref. An invalid one is rejected instead of becoming a
+	// git path. Real paths carry a separator or have no numeric group.
+	dependencyIDLike = regexp.MustCompile(`(?i)^[a-z][a-z0-9_.-]*[0-9][a-z0-9_.-]*$`)
 )
 
 // MergedPRReader answers whether a pull request already reached main. The
@@ -168,7 +174,7 @@ func (r *FileDependencyResolver) Satisfied(ctx context.Context, ref string) (boo
 	if m := dependencyPRRef.FindStringSubmatch(ref); m != nil {
 		return r.prMerged(ctx, m[1])
 	}
-	if dependencyCardRef.MatchString(ref) {
+	if taskstore.IsID(ref) {
 		status, err := r.cardDone(ref)
 		if err != nil {
 			return false, err
@@ -177,6 +183,9 @@ func (r *FileDependencyResolver) Satisfied(ctx context.Context, ref string) (boo
 			return false, &DependencyCardNotFoundError{Ref: ref}
 		}
 		return status == DependencyCardDone, nil
+	}
+	if dependencyIDLike.MatchString(ref) {
+		return false, fmt.Errorf("orchestrator: dependency %q looks like a card ID but is not a valid one", ref)
 	}
 	return r.existsOnMain(ctx, ref)
 }

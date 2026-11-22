@@ -92,3 +92,57 @@ func TestDecideDependencyCardStates(t *testing.T) {
 		})
 	}
 }
+
+func TestSatisfiedRoutesEveryCardIDToCardStore(t *testing.T) {
+	ids := []string{"T3.100", "ARDH-08", "ATX-R01", "BS.1", "S1.001"}
+	dir := t.TempDir()
+	for _, id := range ids {
+		writeDependencyCard(t, dir, id, "# "+id+"\nСтатус: done\n")
+	}
+	runner := &fakeRunner{}
+	r := &FileDependencyResolver{DocsDir: dir, Runner: runner}
+
+	for _, id := range ids {
+		ok, err := r.Satisfied(context.Background(), id)
+		if err != nil || !ok {
+			t.Fatalf("Satisfied(%q) = %t, %v, want true", id, ok, err)
+		}
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("card refs must not reach git: %+v", runner.calls)
+	}
+}
+
+func TestSatisfiedRejectsInvalidCardLikeRef(t *testing.T) {
+	runner := &fakeRunner{}
+	r := &FileDependencyResolver{DocsDir: t.TempDir(), Runner: runner}
+
+	for _, ref := range []string{"T3.24x", "T3..4", "T3.4.5", "T3.abc"} {
+		ok, err := r.Satisfied(context.Background(), ref)
+		if ok || err == nil {
+			t.Fatalf("Satisfied(%q) = %t, %v, want explicit rejection", ref, ok, err)
+		}
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("invalid card refs must not reach git: %+v", runner.calls)
+	}
+}
+
+func TestSatisfiedKeepsGitPaths(t *testing.T) {
+	const present = "internal/app/orchestrator/store.go"
+	runner := &fakeRunner{
+		out: map[string][]byte{
+			runnerKey("git", "show", "main:"+present): []byte("package orchestrator"),
+		},
+	}
+	r := &FileDependencyResolver{DocsDir: t.TempDir(), Runner: runner}
+
+	ok, err := r.Satisfied(context.Background(), present)
+	if err != nil || !ok {
+		t.Fatalf("Satisfied(%q) = %t, %v, want true", present, ok, err)
+	}
+	wantCall := runnerCall{"git", []string{"show", "main:" + present}}
+	if len(runner.calls) != 1 || !reflect.DeepEqual(runner.calls[0], wantCall) {
+		t.Fatalf("git calls = %+v, want %+v", runner.calls, wantCall)
+	}
+}
