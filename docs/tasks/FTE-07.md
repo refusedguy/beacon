@@ -1,5 +1,5 @@
 # FTE-07. Принять context и force_retry_merge в beacon human
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: cmd/beacon/human.go, cmd/beacon/human_test.go, cmd/beacon/catalog.go
@@ -13,3 +13,16 @@ baseline: humanOutcomes в cmd/beacon/human.go:47 перечисляет сем�
 Шаги: Добавить humanContext и humanForceRetryMerge в humanOutcome и humanOutcomes. Обновить Usage в cmd/beacon/human.go:24. Покрыть тестом разбора всех девяти verbs и отрицательным тестом неизвестного глагола. Проверить, что note по-прежнему сохраняется.
 Проверка: beacon human context <watchID> --note "..." возвращает код 0. beacon human force_retry_merge <watchID> возвращает код 0. Неизвестный verb возвращает код 2 без записи. Список humanOutcomes совпадает с validCommands сервера.
 Приёмка: Набор verbs CLI совпадает с сервером, CI зелёный.
+
+## Подтверждение
+
+PR: https://github.com/refusedguy/beacon/pull/1907
+
+Шаги карточки выполнены в PR #1907, ветка `fix/fte07`, head SHA `590a59bb26e0c8a5e86aeacdca22b6fab360aceb`. Изменены `cmd/beacon/human.go` и `cmd/beacon/human_test.go`. В `humanOutcome` добавлены `humanContext` и `humanForceRetryMerge`, оба вошли в `humanOutcomes` и в строку Usage. Тест разбирает все девять глаголов и проверяет note. Неизвестный глагол по-прежнему даёт код 2 без записи.
+
+PR влит 2026-11-22T16:13:39Z, merge commit `981eac3f333d5b0f8553d046aca91477d17f89d9`. `git merge-base --is-ancestor 981eac3f333d5b0f8553d046aca91477d17f89d9 origin/main` вернул 0. Повторного PR с кодом не открывал.
+
+Причина: карточка уже закрыта влитым PR #1907. Дубль кода не нужен.
+
+Закрыл: ses_dfbf9c158ffe9CphyI88r6OuSj
+Время закрытия: 2026-11-22T21:15:00Z
