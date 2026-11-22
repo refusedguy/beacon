@@ -14,7 +14,6 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,9 +168,6 @@ func (h *PRCloseDupHandler) liveWatch(repo string, pr int) (domain.Watch, bool, 
 	snap, err := h.snapshot.Snapshot()
 	if err != nil {
 		return domain.Watch{}, false, err
-	}
-	if snap == nil {
-		return domain.Watch{}, false, errors.New("pr_close_dup: nil snapshot")
 	}
 	for _, w := range snap.RadarWatches() {
 		if w.Repo == repo && w.PR == pr && w.Status != domain.StatusClosed {
