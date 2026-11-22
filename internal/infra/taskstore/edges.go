@@ -17,14 +17,31 @@ const (
 	EdgeWaitsForExternal EdgeKind = "waits-for-external"
 )
 
-// ValidEdgeKinds возвращает допустимые типы рёбер. Возвращается копия,
-// изменение которой не меняет канонический набор.
+// MaxEdgeKindLen задаёт предел длины типа ребра. Значение выведено из ширины
+// колонки VARCHAR(32) в схемах миграций: тип длиннее колонки стал бы фильтром,
+// который ничего не находит.
+const MaxEdgeKindLen = 32
+
+// ValidEdgeKinds возвращает встроенные типы рёбер. Возвращается копия,
+// изменение которой не меняет канонический набор. Проекты могут добавлять
+// свои типы через EdgeKind, не расширяя этот список.
 func ValidEdgeKinds() []EdgeKind {
 	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
 }
 
-// IsValidEdgeKind сообщает, известен ли тип ребра.
+// IsValidEdgeKind сообщает, можно ли записать тип ребра. Как и в beads,
+// принимается любая непустая строка не длиннее MaxEdgeKindLen. Проверка
+// длины происходит до записи в граф.
 func IsValidEdgeKind(kind EdgeKind) bool {
+	if kind == "" {
+		return false
+	}
+	return len(kind) <= MaxEdgeKindLen
+}
+
+// IsWellKnownEdgeKind сообщает, входит ли тип во встроенный набор. Он нужен в
+// пользовательских командах, где произвольный тип намеренно запрещён.
+func IsWellKnownEdgeKind(kind EdgeKind) bool {
 	for _, known := range ValidEdgeKinds() {
 		if kind == known {
 			return true
@@ -107,11 +124,11 @@ func (g *Graph) Size() int { return g.count }
 // AddEdge добавляет ребро. ID проверяются через IsID, поэтому граф принимает
 // все семейства: T3.17, S1.001, BS.1, RS-MCP-02, WIRING-485 и UI-31.
 // Для waits-for-external вместо IsID проверяется IsExternalGateTarget.
-// Неизвестный тип, петля и ребро, которое замыкает цикл, отклоняются с кодом 1.
-// Повтор того же ребра ничего не меняет.
+// Пустой или слишком длинный тип, петля и ребро, которое замыкает цикл,
+// отклоняются с кодом 1. Повтор того же ребра ничего не меняет.
 func (g *Graph) AddEdge(from, to string, kind EdgeKind) error {
 	if !IsValidEdgeKind(kind) {
-		return Validationf("неизвестный тип ребра %q", kind)
+		return Validationf("тип ребра %q пустой или длиннее %d символов", kind, MaxEdgeKindLen)
 	}
 	if !IsID(from) {
 		return Validationf("неверный ID карточки %q", from)
