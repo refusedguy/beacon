@@ -58,6 +58,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon pr create [--title ...] [--body ...] [--card T3.xxx] [--dry-run]
   beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--json]
   beacon inspect [<pr|watchID>] [--json]
+  beacon regrade [--watch <id>] [--dataset <name>] [--split <name>] [--declared <a,b>] [--save <file>] [--format table|json]
   beacon human <approve|reject|rework|unblock|pause|resume|cancel> <watchID|blockerID> [--note "..."]
   beacon reset --yes
 
@@ -82,8 +83,17 @@ var serverCatalogEntry = command{
 	Usage:   "beacon server",
 }
 
+// regradeCatalogEntry registers the artifact-only verdict recomputation. It
+// lives here because catalog.go is outside this card's file ownership; the
+// append keeps `beacon list` in stable name order.
+var regradeCatalogEntry = command{
+	Name:    "regrade",
+	Summary: "Пересчитать вердикт по сохранённым доказательствам Watch без повторного прогона",
+	Usage:   "beacon regrade [--watch <id>] [--dataset <name>] [--split <name>] [--declared <a,b>] [--save <file>] [--format table|json]",
+}
+
 func init() {
-	catalog = append(catalog, spawnCatalogEntry, serverCatalogEntry)
+	catalog = append(catalog, spawnCatalogEntry, serverCatalogEntry, regradeCatalogEntry)
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 
 	// RegisterGC and RegisterGCWorktree are installed in gc.go, and
@@ -283,6 +293,7 @@ func init() {
 		"pr":           func(c *CLI, args []string) int { return prcreateRunner(c, args) },
 		"logs":         func(c *CLI, args []string) int { return logsRunner(c, args) },
 		"inspect":      func(c *CLI, args []string) int { return inspectRunner(c, args) },
+		"regrade":      func(c *CLI, args []string) int { return regradeRunner(c, args) },
 		"human":        func(c *CLI, args []string) int { return humanRunner(c, args) },
 		"reset":        func(c *CLI, args []string) int { return resetRunner(c, args) },
 		"up":           func(c *CLI, args []string) int { return upRunner(c, args) },
