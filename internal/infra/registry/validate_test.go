@@ -92,7 +92,7 @@ func TestValidateRejectsByField(t *testing.T) {
 		{"empty configuration id", func(c map[string]any) {
 			c["configurations"].([]any)[0].(map[string]any)["id"] = ""
 		}, "configurations[0].id"},
-		{"string version", func(c map[string]any) { c["version"] = "1" }, "version"},
+		{"non-numeric version", func(c map[string]any) { c["version"] = "one" }, "version"},
 		{"unknown version", func(c map[string]any) { c["version"] = 99 }, "version"},
 		{"fractional version", func(c map[string]any) { c["version"] = 1.5 }, "version"},
 		{"dangling alias", func(c map[string]any) {
@@ -131,6 +131,7 @@ func TestValidateAcceptsIntegerVersionShapes(t *testing.T) {
 		{"int64", int64(2)},
 		{"json.Number", json.Number("1")},
 		{"float64", float64(1)},
+		{"numeric string", "1"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

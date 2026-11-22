@@ -9,6 +9,7 @@ import (
 	"math"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -214,8 +215,8 @@ func validateID(at string, v any) error {
 }
 
 // validateVersion accepts the integer shapes a YAML or JSON decoder produces
-// and rejects strings, which migrate.go also refuses. Only the versions
-// published in migrate.go are known, so an unlisted number fails closed.
+// and the numeric strings migrate.go also accepts. Only the versions published
+// in migrate.go are known, so an unlisted number fails closed.
 func validateVersion(at string, v any) error {
 	var n int
 	switch x := v.(type) {
@@ -234,6 +235,12 @@ func validateVersion(at string, v any) error {
 			return invalid(at, "must be an integer without a fractional part")
 		}
 		n = int(x)
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(x))
+		if err != nil {
+			return invalid(at, "must be an integer")
+		}
+		n = parsed
 	default:
 		return invalid(at, "must be an integer")
 	}
