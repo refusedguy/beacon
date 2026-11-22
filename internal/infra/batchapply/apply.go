@@ -692,11 +692,14 @@ func (r *runner) writeChunked(root string, entries []artifactEntry, cards, adrs,
 					r.recordStaleSkipped(e.id)
 					continue
 				}
-				// CBX-08: equal timestamps with different text are a tie.
-				// The local text stays on disk; only auxiliary data (facts
-				// and the ADR index, built from the entry set) is merged.
-				if local.ModTime().Equal(e.updatedAt) && localText != e.content {
-					r.recordTieKeptLocal(e.id)
+				// CBX-08: an equal timestamp is never a write. Different text
+				// is a tie: local bytes stay on disk and only auxiliary data
+				// (facts and the ADR index, built from the entry set) merges.
+				// Identical text is a no-op, so a repeat import reports nothing.
+				if local.ModTime().Equal(e.updatedAt) {
+					if localText != e.content {
+						r.recordTieKeptLocal(e.id)
+					}
 					continue
 				}
 			}
