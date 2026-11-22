@@ -99,6 +99,21 @@ func check(opts options) (int, error) {
 		return gate.Broken, fmt.Errorf("read %s: %w", indexRelPath, err)
 	}
 
+	// A shallow clone hides the merged commits that promote todo cards to
+	// done. Counting from that history produces a smaller, wrong total, so
+	// report the cause instead of a misleading index diff.
+	if opts.gitLog == "" {
+		shallow, err := isShallowHistory(opts.root)
+		if err != nil {
+			return gate.Broken, fmt.Errorf("history depth: %w", err)
+		}
+		if shallow {
+			fmt.Fprintf(os.Stderr, "cardindex: history is shallow; git log misses merged commits and the card count is wrong\n")
+			fmt.Fprintf(os.Stderr, "cardindex: fetch the full history with git fetch --unshallow or set fetch-depth: 0 in CI\n")
+			return gate.Red, nil
+		}
+	}
+
 	subjects, err := readGitLog(opts)
 	if err != nil {
 		return gate.Broken, fmt.Errorf("git log: %w", err)
@@ -172,6 +187,32 @@ func readGitLog(opts options) ([]string, error) {
 }
 
 func gitLogFromProcess(root string) ([]byte, error) {
+	return runGit(root, "log", "--format=%s")
+}
+
+// isShallowHistory reports whether git sees a truncated commit history. The
+// card count depends on commit subjects, so a shallow clone cannot answer the
+// question this gate asks.
+func isShallowHistory(root string) (bool, error) {
+	out, err := runGit(root, "rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return false, err
+	}
+	answer := strings.TrimSpace(string(out))
+	switch answer {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected --is-shallow-repository output %q", answer)
+	}
+}
+
+// runGit runs a git subcommand in root and returns its stdout. os.StartProcess
+// keeps these commands clear of the capability gate that forbids os/exec in
+// tools/.
+func runGit(root string, args ...string) ([]byte, error) {
 	git, err := findGit()
 	if err != nil {
 		return nil, err
@@ -191,7 +232,7 @@ func gitLogFromProcess(root string) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	proc, err := os.StartProcess(gitPath, []string{gitPath, "log", "--format=%s"}, &os.ProcAttr{
+	proc, err := os.StartProcess(gitPath, append([]string{gitPath}, args...), &os.ProcAttr{
 		Dir:   absRoot,
 		Files: []*os.File{os.Stdin, w, os.Stderr},
 	})
@@ -211,7 +252,7 @@ func gitLogFromProcess(root string) ([]byte, error) {
 		return nil, err
 	}
 	if !state.Success() {
-		return nil, fmt.Errorf("git log in %s: %s", absRoot, state.String())
+		return nil, fmt.Errorf("git %s in %s: %s", strings.Join(args, " "), absRoot, state.String())
 	}
 	return out.Bytes(), nil
 }
@@ -498,10 +539,41 @@ func selfTestRun() int {
 	// detected: the committed index still claims one todo card.
 	ok = runCase("drifted card tree", withChange("fixture/git-log.txt",
 		commits+"fix: close T1.2 (#2)\n"), gate.Red) && ok
+
+	// The depth guard must distinguish a full repository from a shallow
+	// clone before the count runs. A fake .git tree is enough because git
+	// decides shallow from the presence of the shallow file.
+	depthCase := func(name string, files map[string]string, want bool) bool {
+		root, err := gate.Fixture(files)
+		if err != nil {
+			fmt.Printf("self-test FAILED: %s fixture: %v\n", name, err)
+			return false
+		}
+		defer gate.RemoveFixture(root)
+		shallow, err := isShallowHistory(root)
+		if err != nil || shallow != want {
+			fmt.Printf("self-test FAILED: %s: shallow=%v want=%v err=%v\n", name, shallow, want, err)
+			return false
+		}
+		return true
+	}
+	gitBase := map[string]string{
+		".git/HEAD":          "ref: refs/heads/main\n",
+		".git/config":        "[core]\n\trepositoryformatversion = 0\n",
+		".git/objects/.keep": "",
+		".git/refs/.keep":    "",
+	}
+	shallowFiles := make(map[string]string, len(gitBase)+1)
+	for k, v := range gitBase {
+		shallowFiles[k] = v
+	}
+	shallowFiles[".git/shallow"] = "0000000000000000000000000000000000000000\n"
+	ok = depthCase("full history", gitBase, false) && ok
+	ok = depthCase("shallow history", shallowFiles, true) && ok
 	if !ok {
 		return gate.Broken
 	}
 
-	fmt.Println("self-test ok: current index green, stale index red, drifted card tree red")
+	fmt.Println("self-test ok: current index green, stale index red, drifted card tree red, shallow history detected")
 	return gate.Green
 }
