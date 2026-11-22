@@ -54,6 +54,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -82,9 +84,10 @@ const (
 // bytes and a prefix-cache keyed by the response prefix does not burn. The
 // canonical order is status, verdict, revision, checks, pollAfterMs; the
 // MarshalJSON method below is the single place that emits them. ADR 0046 p3
-// appends one more field, reason, after the five fixed ones. Nothing is
-// reordered, so an output that carries no reason still serialises to the exact
-// bytes the ADR 0036 §2 contract locks.
+// appends one more field, reason, after the five fixed ones. SB-03 appends two
+// advisory fields, infra_tier and infra_reason, after reason. Nothing is
+// reordered, so an output that carries none of the appended fields still
+// serialises to the exact bytes the ADR 0036 §2 contract locks.
 const (
 	waitResultFieldStatus      = "status"
 	waitResultFieldVerdict     = "verdict"
@@ -92,6 +95,8 @@ const (
 	waitResultFieldChecks      = "checks"
 	waitResultFieldPollAfterMs = "pollAfterMs"
 	waitResultFieldReason      = "reason"
+	waitResultFieldInfraTier   = "infra_tier"
+	waitResultFieldInfraReason = "infra_reason"
 )
 
 // WaitStopReason is why a wait ended (ADR 0046 p3). The five values are
@@ -193,6 +198,16 @@ func waitReasonOutput(out WaitResultOutput) WaitReasonOutput {
 // reuses the key without a valid reason is emitted as an ordinary check.
 const waitStopReasonCheckName = "_beaconWaitStopReason"
 
+// SB-03 uses the same carry-through pattern for the two advisory fields. A
+// classification stamped on a WaitResultOutput rides in Checks until the
+// handler marshals it into the top-level infra_tier and infra_reason fields.
+// The keys are reserved; a user check that reuses one with an invalid value
+// stays an ordinary check.
+const (
+	waitInfraTierCheckName   = "_beaconInfraTier"
+	waitInfraReasonCheckName = "_beaconInfraReason"
+)
+
 // withWaitStopReason stamps reason onto out without mutating the caller's
 // Checks map. An empty or unknown reason leaves out untouched.
 func withWaitStopReason(out WaitResultOutput, reason WaitStopReason) WaitResultOutput {
@@ -231,6 +246,46 @@ func waitStopReasonOf(out WaitResultOutput) WaitStopReason {
 	return reason
 }
 
+// WithInfraClassification stamps tier and reason onto out without mutating the
+// caller's Checks map. Invalid values leave out untouched, so a caller cannot
+// inject an arbitrary tier or reason through the reserved keys. The stamp is
+// advisory: it changes neither out.Verdict nor the wait stop reason.
+func WithInfraClassification(out WaitResultOutput, tier domain.InfraTier, reason domain.InfraReason) WaitResultOutput {
+	if !tier.Valid() || !reason.Valid() {
+		return out
+	}
+	checks := make(map[string]domain.Check, len(out.Checks)+2)
+	for name, check := range out.Checks {
+		checks[name] = check
+	}
+	checks[waitInfraTierCheckName] = domain.Check{State: string(tier), Conclusion: string(tier)}
+	checks[waitInfraReasonCheckName] = domain.Check{State: string(reason), Conclusion: string(reason)}
+	out.Checks = checks
+	return out
+}
+
+// InfraClassificationOf reads the advisory tier and reason stamped on out.
+// Empty values mean the output carries no classification.
+func InfraClassificationOf(out WaitResultOutput) (domain.InfraTier, domain.InfraReason) {
+	return infraTierOf(out), infraReasonOf(out)
+}
+
+func infraTierOf(out WaitResultOutput) domain.InfraTier {
+	tier := domain.InfraTier(out.Checks[waitInfraTierCheckName].State)
+	if !tier.Valid() {
+		return ""
+	}
+	return tier
+}
+
+func infraReasonOf(out WaitResultOutput) domain.InfraReason {
+	reason := domain.InfraReason(out.Checks[waitInfraReasonCheckName].State)
+	if !reason.Valid() {
+		return ""
+	}
+	return reason
+}
+
 // MarshalJSON writes a WaitResultOutput in the fixed order above. encoding/json
 // marshals struct fields in declaration order and map keys in sorted order,
 // but spelling the order out here keeps it a deliberate, testable contract
@@ -245,18 +300,23 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 	// reserved Checks key before the handler lifts it into that field, so read
 	// both sources: the real field wins, the key keeps older paths working.
 	// Appending after pollAfterMs keeps the five ADR 0036 §2 fields byte-stable
-	// when no reason is present.
+	// when no reason is present. SB-03 appends the advisory tier and reason
+	// after reason, on the same omitempty rule.
 	reason := o.Reason
 	if reason == "" {
 		reason = waitStopReasonOf(o)
 	}
+	infraTier := infraTierOf(o)
+	infraReason := infraReasonOf(o)
 	checks := o.Checks
-	if reason != "" {
+	if reason != "" || infraTier != "" || infraReason != "" {
 		checks = make(map[string]domain.Check, len(o.Checks))
 		for name, check := range o.Checks {
-			if name != waitStopReasonCheckName {
-				checks[name] = check
+			switch name {
+			case waitStopReasonCheckName, waitInfraTierCheckName, waitInfraReasonCheckName:
+				continue
 			}
+			checks[name] = check
 		}
 	}
 
@@ -273,6 +333,12 @@ func (o WaitResultOutput) MarshalJSON() ([]byte, error) {
 	}
 	if reason != "" {
 		fields = append(fields, field{name: waitResultFieldReason, value: reason})
+	}
+	if infraTier != "" {
+		fields = append(fields, field{name: waitResultFieldInfraTier, value: infraTier})
+	}
+	if infraReason != "" {
+		fields = append(fields, field{name: waitResultFieldInfraReason, value: infraReason})
 	}
 
 	var buf bytes.Buffer
@@ -669,6 +735,43 @@ func (j *memoryPrecheckJournal) Records() []PrecheckFailureRecord {
 	return out
 }
 
+// InfraFailureJournalReader is the in-process advisory journal with read-back
+// for diagnostics and tests. The domain port stays write-only so a durable
+// app-layer adapter has no extra methods to implement.
+type InfraFailureJournalReader interface {
+	domain.InfraFailureJournal
+	Records() []domain.InfraFailureRecord
+}
+
+// NewMemoryInfraFailureJournal builds the in-process advisory journal. A
+// service built by NewWaitResultService already has one.
+func NewMemoryInfraFailureJournal() InfraFailureJournalReader {
+	return &memoryInfraFailureJournal{}
+}
+
+type memoryInfraFailureJournal struct {
+	mu      sync.Mutex
+	records []domain.InfraFailureRecord
+}
+
+func (j *memoryInfraFailureJournal) RecordInfraFailure(record domain.InfraFailureRecord) {
+	if j == nil {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.records = append(j.records, record)
+}
+
+// Records returns the classifications in insertion order.
+func (j *memoryInfraFailureJournal) Records() []domain.InfraFailureRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]domain.InfraFailureRecord, len(j.records))
+	copy(out, j.records)
+	return out
+}
+
 // capabilityTask is one node of the cancellation tree. reason is set when the
 // context is cancelled and is delivered to the node's wait.
 type capabilityTask struct {
@@ -897,6 +1000,7 @@ type WaitResultService struct {
 	ciGate          SharedCIWaiter
 	precheckReason  string
 	precheckJournal PrecheckJournal
+	infraJournal    domain.InfraFailureJournal
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -918,6 +1022,7 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		ciWait:          sharedCIWaitNoop,
 		ciGate:          directCIWait,
 		precheckJournal: NewMemoryPrecheckJournal(),
+		infraJournal:    NewMemoryInfraFailureJournal(),
 	}
 }
 
@@ -1008,6 +1113,70 @@ func (s *WaitResultService) PrecheckJournal() PrecheckJournal {
 		return NewMemoryPrecheckJournal()
 	}
 	return s.precheckJournal
+}
+
+// SetInfraFailureJournal installs the sink for advisory classifications. A nil
+// argument restores the in-memory journal. A durable sink belongs in the app
+// layer; this package owns only the port and the default.
+func (s *WaitResultService) SetInfraFailureJournal(j domain.InfraFailureJournal) {
+	if s == nil {
+		return
+	}
+	if j == nil {
+		j = NewMemoryInfraFailureJournal()
+	}
+	s.infraJournal = j
+}
+
+// InfraFailureJournal returns the configured advisory sink. It is never nil for
+// a service built by NewWaitResultService.
+func (s *WaitResultService) InfraFailureJournal() domain.InfraFailureJournal {
+	if s == nil || s.infraJournal == nil {
+		return NewMemoryInfraFailureJournal()
+	}
+	return s.infraJournal
+}
+
+// ClassifyInfraText runs the advisory classifier over text the harness already
+// wrote, records the result in the Watch journal and stamps the tier and reason
+// on out. It never changes out.Status, out.Verdict or the wait stop reason, and
+// it never removes a Watch from a scoring list. Unmatched text returns out
+// untouched.
+func (s *WaitResultService) ClassifyInfraText(watchID, text string, at time.Time, out WaitResultOutput) WaitResultOutput {
+	tier, reason, ok := domain.ClassifyInfra(text)
+	if !ok {
+		return out
+	}
+	if s != nil {
+		if at.IsZero() {
+			at = s.now()
+		}
+		s.InfraFailureJournal().RecordInfraFailure(domain.InfraFailureRecord{
+			WatchID: watchID, Tier: tier, Reason: reason, At: at,
+		})
+	}
+	return WithInfraClassification(out, tier, reason)
+}
+
+// classifyChecks joins the conclusions of the observed checks in name order and
+// classifies them. Sorting makes the first-hit-wins rule deterministic when
+// more than one check carries a signature. No obligation write or verdict
+// decision depends on this result.
+func (s *WaitResultService) classifyChecks(watchID string, checks map[string]domain.Check, out WaitResultOutput, at time.Time) WaitResultOutput {
+	if len(checks) == 0 {
+		return out
+	}
+	names := make([]string, 0, len(checks))
+	for name := range checks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, name := range names {
+		b.WriteString(checks[name].Conclusion)
+		b.WriteByte('\n')
+	}
+	return s.ClassifyInfraText(watchID, b.String(), at, out)
 }
 
 // precheckFailureOutput is the wait_result response that carries the precheck
@@ -1388,6 +1557,10 @@ func (s *WaitResultService) deliver(ctx context.Context, watchID string, status 
 		Checks:      checks,
 		PollAfterMs: &ms,
 	}
+	// SB-03: a failed check can carry an infrastructure signature. Classify it
+	// over the text already in Checks, journal it and add the advisory fields.
+	// The verdict, the readAt write and the stop reason are already fixed above.
+	out = s.classifyChecks(watchID, checks, out, at)
 	// A delivered verdict is the terminal stop (ADR 0046 p3). The reason rides
 	// on the response without changing the readAt write or the field order.
 	return withWaitStopReason(out, WaitStopTerminal), nil
