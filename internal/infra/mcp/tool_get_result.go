@@ -543,7 +543,7 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 				unavailable = true
 				raw = ""
 			}
-			excerpt = sanitizeExcerpt(raw, failureExcerptLimit)
+			excerpt = sanitizeExcerpt(prepareWakeExcerpt(raw), failureExcerptLimit)
 			if fetchErr == nil {
 				if putErr := cachePut(ctx, cache, w.ID, w.HeadSHA, name, excerpt); putErr != nil {
 					observe.ActorError("get_result-excerpt-cache", w.ID, putErr)
@@ -567,7 +567,7 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 		agg.WriteString(": ")
 		agg.WriteString(excerpt)
 	}
-	aggregate := clampExcerpt(agg.String(), failureExcerptLimit)
+	aggregate := prepareWakeExcerpt(agg.String())
 	if excerptWasTruncated(aggregate) {
 		truncated = true
 	}
@@ -580,6 +580,17 @@ func (h *GetResultHandler) attachFailureExcerpts(ctx context.Context, w domain.W
 // excerptWasTruncated reports whether an excerpt carries the truncation marker.
 func excerptWasTruncated(excerpt string) bool {
 	return strings.HasSuffix(excerpt, failureExcerptTruncatedMarker)
+}
+
+// prepareWakeExcerpt applies the CA-24 output gate to a failed check's text at
+// the point where it enters a wake. github.PrepareWakeOutput is the canonical
+// gate, but ADR 0005 keeps sibling infra packages apart, so the mcp package
+// mirrors the failed-check branch here. Failed output is always inserted as a
+// fragment bounded at failureExcerptLimit. The confirmation branch belongs to
+// the wake path and never applies to get_result. Verdicts and check
+// classification stay unchanged.
+func prepareWakeExcerpt(output string) string {
+	return clampExcerpt(output, failureExcerptLimit)
 }
 
 func cacheGet(ctx context.Context, c failureExcerptCache, watchID, headSHA, name string) (string, bool, error) {
