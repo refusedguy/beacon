@@ -30,15 +30,15 @@ type command struct {
 // catalog is the single source of truth for the command names, summaries and
 // usage strings. Both list and what read this slice.
 var catalog = []command{
-	{Name: "agents", Summary: "Показать агентов OpenCode в режиме subagent или all", Usage: "beacon agents [--format table|json]"},
-	{Name: "attach", Summary: "Подключиться к сессии через фоновый сервис OpenCode", Usage: "beacon attach <sessionID>"},
+	{Name: "agents", Summary: "Показать агентов OpenCode в режиме subagent или all", Usage: "beacon agents [--format table|json] [--route] [--handoff <taskID>] [--to <sessionID>] [--task <taskID>] [--repo <repo>] [--worktree <dir>]"},
+	{Name: "attach", Summary: "Подключиться к сессии через фоновый сервис OpenCode или возобновить сохранённую сессию", Usage: "beacon attach <sessionID> | beacon attach --resume [<taskID>]"},
 	{Name: "board", Summary: "Показать локальную доску карточек", Usage: "beacon board [--root <dir>] [--status <status>] [--owner <owner>]"},
 	{Name: "build", Summary: "Собрать воспроизводимый бинарник beacon", Usage: "beacon build"},
 	{Name: "ci", Summary: "Опросить открытые PR через CI-провайдер", Usage: "beacon ci check --all"},
 	{Name: "daemon", Summary: "Запустить фоновый цикл оркестратора", Usage: "beacon daemon [--interval] [--once]"},
 	{Name: "deferred", Summary: "Показать отложенные wiring-карточки", Usage: "beacon deferred [--format table|json]"},
 	{Name: "deliver", Summary: "Доставить результат по Watch в живую сессию", Usage: "beacon deliver <watchID>"},
-	{Name: "doctor", Summary: "Проверить версию Go, beacon-gates и каталог состояния", Usage: "beacon doctor"},
+	{Name: "doctor", Summary: "Проверить версию Go, beacon-gates и каталог состояния или следить за внешним условием", Usage: "beacon doctor [--watch] [--interval 2s] [--session <id>] [--max-ticks <n>] [-- <команда>]"},
 	{Name: "gates", Summary: "Передать аргументы бинарнику beacon-gates", Usage: "beacon gates [gate] [flags]"},
 	{Name: "gc", Summary: "Очистить завершённые сессии Beacon", Usage: "beacon gc [--format table|json] [--apply]"},
 	{Name: "gc-worktree", Summary: "Очистить устаревшие worktree", Usage: "beacon gc-worktree [--format table|json] [--apply]"},
@@ -56,7 +56,7 @@ var catalog = []command{
 	{Name: "reset", Summary: "Очистить состояние control plane проекта", Usage: "beacon reset --yes"},
 	{Name: "task", Summary: "Работа с карточками задач", Usage: "beacon task <list|new|take> [flags]"},
 	{Name: "test", Summary: "Запустить тесты проекта через go test ./...", Usage: "beacon test"},
-	{Name: "watch", Summary: "Показать вотчи Beacon с вердиктами и сессиями OpenCode", Usage: "beacon watch [--interval 2s] [--format table|json]"},
+	{Name: "watch", Summary: "Показать вотчи Beacon с вердиктами и сессиями OpenCode, в живом режиме по событиям SSE", Usage: "beacon watch [--interval 2s] [--format table|json] [--live] [--wake]"},
 	{Name: "what", Summary: "Показать описание одной команды", Usage: "beacon what <command>"},
 	{Name: "why", Summary: "Показать цепочку блокировок карточки", Usage: "beacon why <task>"},
 	{Name: "workload", Summary: "Показать нагрузку оркестратора", Usage: "beacon workload [--format table|json]"},
