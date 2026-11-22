@@ -397,9 +397,23 @@ func Hash8(root string) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
-// LockPath возвращает путь файлового замка.
+// tasksLockName — имя единственного замка каталога карточек. AUD-05 сводит
+// три лока (taskstore, claim и close) к одному файлу в docs/tasks; адаптеры в
+// internal/infra/mcp повторяют это имя, потому что слои не разрешают импорт
+// internal/infra -> internal/infra.
+const tasksLockName = ".beacon-tasks.lock"
+
+// TasksLockPath возвращает путь общего замка каталога карточек. Все операции
+// с карточками держат этот один файл в своём адаптере.
+func TasksLockPath(tasksDir string) string {
+	return filepath.Join(tasksDir, tasksLockName)
+}
+
+// LockPath возвращает путь того же общего замка. Карточки всегда лежат в
+// docs/tasks под корнем проекта, поэтому путь вычисляется из root; stateDir
+// сохранён в сигнатуре для совместимости с вызывающими.
 func LockPath(stateDir, root string) string {
-	return filepath.Join(stateDir, "task-"+Hash8(root)+".lock")
+	return TasksLockPath(filepath.Join(root, "docs", "tasks"))
 }
 
 // CounterPath возвращает путь файла счётчика ID.
@@ -516,10 +530,15 @@ func ReadCounter(counterPath string) (map[string]int, error) {
 }
 
 // WriteCounter пишет счётчик через временный файл и переименование.
+// AUD-05 перенёс общий замок в docs/tasks, поэтому каталог состояния больше
+// не создаётся как побочный эффект захвата замка: создаём его явно.
 func WriteCounter(counterPath string, groups map[string]int) error {
 	data, err := json.Marshal(counterFile{Groups: groups})
 	if err != nil {
 		return Startupf("не собран счётчик: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(counterPath), 0700); err != nil {
+		return Startupf("не создан каталог состояния: %v", err)
 	}
 	return AtomicWrite(counterPath, data, 0600)
 }
