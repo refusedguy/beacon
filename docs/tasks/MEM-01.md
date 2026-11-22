@@ -1,5 +1,5 @@
 # MEM-01. Добавить удаление сессии в HTTP-клиент opencode
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/opencode/client.go, internal/infra/opencode/client_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить DeleteSession(ctx, sessionID) с методом DELETE на путь /api/session/<id>, basic auth и ограничением тела ошибки через maxHTTPBodyBytes. Не менять сигнатуру Prompt: её расширяет AUTOSP-02. Покрыть тестами в client_test.go успешный DELETE, 404 и пустой sessionID.
 Проверка: CI зелёный. В client.go есть DeleteSession и вызов DELETE. Тест проверяет путь и обработку 404. Вызовов go build и go test локально нет.
 Приёмка: Сессия удаляется через HTTP. Изменения в Prompt не дублируют AUTOSP-02.
+
+Итог: Already landed in PR #1462 (commit 9e5d3b91d0f9bb15ff090c711bae7beada07ae3f). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1462 merged 2026-11-22T10:01:00+05:00; commit 9e5d3b91d0f9bb15ff090c711bae7beada07ae3f; git merge-base --is-ancestor 9e5d3b91d0f9bb15ff090c711bae7beada07ae3f origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1462 9e5d3b91
+Время закрытия: 2026-11-22T11:25:31Z

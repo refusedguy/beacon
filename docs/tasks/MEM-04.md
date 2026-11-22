@@ -1,5 +1,5 @@
 # MEM-04. Подключить ArchiveRun, Checkpoint, FootprintCheck и реaper к циклу
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: cmd/beacon/mcp.go, cmd/beacon/daemon.go
@@ -12,3 +12,8 @@
 Шаги: В ReconcilePass вызвать cfg.db.ArchiveRun, затем cfg.db.Checkpoint и затем решение AUTOSP-11 о запуске, а при его отсутствии server.FootprintCheck с pollerMetrics, числом активных Watch и server.ProcessRSSBytes. Ошибки архива и checkpoint писать через observe.ActorError, цикл не останавливать. Передавать delivery и resume из PromptFunc в обновлённый Client.Prompt из MEM-01. Вызвать ReapStaleCards из MEM-06 один раз за проход. Сохранить вызовы в ветке --once в cmd/beacon/daemon.go, чтобы одиночный проход делал ту же работу.
 Проверка: CI зелёный. В mcp.go есть вызовы ArchiveRun, Checkpoint и FootprintCheck. Замыкание prompt передаёт оба поля. Тест --once видит один проход архива и один checkpoint.
 Приёмка: Цикл поддерживает архив и WAL и печатает предупреждение о RSS. Адаптеры MEM-01 и MEM-03 подключены без второго HTTP-порта.
+
+Итог: Already landed in PR #1602 (commit bda51c0fde01ddc2346be95d7927deb5647cdd75). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1602 merged 2026-11-22T15:36:03+05:00; commit bda51c0fde01ddc2346be95d7927deb5647cdd75; git merge-base --is-ancestor bda51c0fde01ddc2346be95d7927deb5647cdd75 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1602 bda51c0f
+Время закрытия: 2026-11-22T11:25:31Z

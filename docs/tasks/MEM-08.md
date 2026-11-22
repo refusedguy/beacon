@@ -1,5 +1,5 @@
 # MEM-08. Описать бюджет памяти и новый GC в ранбуке наблюдаемости
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: doc
 Владелец файлов: docs/runbooks/observability.md
@@ -12,3 +12,8 @@
 Шаги: Добавить раздел с порогами, именем метрики rss_bytes и порядком действий при предупреждении. Описать, как отличить удаление сессии закрытого Watch от ошибки 404. Указать, что замер baseline обязателен до изменения кода.
 Проверка: CI зелёный. В ранбуке есть пороги, метрика и порядок проверки GC.
 Приёмка: Оператор видит путь от предупреждения до конкретного Watch и сессии.
+
+Итог: Already landed in PR #1451 (commit 8fc00ad63dc2997b062d01cd99beb548e38a0074). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1451 merged 2026-11-22T09:58:08+05:00; commit 8fc00ad63dc2997b062d01cd99beb548e38a0074; git merge-base --is-ancestor 8fc00ad63dc2997b062d01cd99beb548e38a0074 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1451 8fc00ad6
+Время закрытия: 2026-11-22T11:25:31Z
