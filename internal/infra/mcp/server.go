@@ -198,7 +198,7 @@ var toolDescriptors = []toolDescriptor{
 			if deps.GenerationLedger != nil {
 				handler.SetGenerationStore(deps.GenerationLedger)
 			}
-			AttachAck(s, handler)
+			attachAckWithPolicy(s, handler, deps.ToolPolicy)
 		},
 	},
 	{
@@ -274,6 +274,105 @@ func AdvertisedToolNames() []string {
 // used by the init check and the MCP client (ARDH-22).
 func ToolNamesCopy() []string {
 	return slices.Clone(ToolNames)
+}
+
+// ToolPolicy separates the two tool lists the Claude Agent SDK keeps apart
+// (CSx-04; types.py:2433-2453 and :2522-2527 of anthropics/claude-agent-sdk-python
+// at 3184360). disallowedTools removes names from the advertised set, while
+// allowedTools marks names that run without a permission request. Beacon used
+// to derive both from toolDescriptors, so narrowing one silently narrowed the
+// other. The two lists are now independent: limiting tools/list never changes
+// the ack decision rule, and an auto-allowed tool stays advertised unless it is
+// also disallowed.
+type ToolPolicy struct {
+	allowedTools    []string
+	disallowedTools []string
+}
+
+// NewToolPolicy builds a policy from the auto-allowed and unavailable tool
+// names. Both slices are cloned so a caller cannot mutate the policy after a
+// server has been built from it (ARDH-22). An empty disallowed list advertises
+// every declared tool; an empty allowed list keeps ack's human-decision path.
+func NewToolPolicy(allowedTools, disallowedTools []string) ToolPolicy {
+	return ToolPolicy{
+		allowedTools:    slices.Clone(allowedTools),
+		disallowedTools: slices.Clone(disallowedTools),
+	}
+}
+
+// availableToolNames returns the declared names minus the policy's
+// disallowedTools. With no disallowed names it returns a full copy of the
+// declared set, so the byte-pinned tools/list contract is unchanged.
+func (p ToolPolicy) availableToolNames() []string {
+	names := ToolNamesCopy()
+	if len(p.disallowedTools) == 0 {
+		return names
+	}
+	blocked := make(map[string]struct{}, len(p.disallowedTools))
+	for _, name := range p.disallowedTools {
+		blocked[name] = struct{}{}
+	}
+	kept := names[:0]
+	for _, name := range names {
+		if _, found := blocked[name]; !found {
+			kept = append(kept, name)
+		}
+	}
+	return kept
+}
+
+// AutoAllowDecision reports the decision and reason for an ack that targets a
+// tool in allowedTools. The third result is false when the tool still needs a
+// human decision, which keeps the plain ack contract for every other tool.
+func (p ToolPolicy) AutoAllowDecision(toolName string) (decision, reason string, ok bool) {
+	for _, name := range p.allowedTools {
+		if name == toolName {
+			return string(DecisionApprove), "allowedTools:" + name, true
+		}
+	}
+	return "", "", false
+}
+
+// ackToolMetaKey is the _meta key a caller uses to name the tool being
+// acknowledged. It is parsed only at the MCP boundary; the core never sees it.
+const ackToolMetaKey = "io.beacon/ackTool"
+
+// autoAllowAck wraps the real ack handler so an ack for a tool in allowedTools
+// is resolved without a human decision (CSx-04). A request that already carries
+// a decision or a continueOf keeps its original meaning. The auto-allowed
+// reason travels in decisionID so the recorded decision names its source.
+type autoAllowAck struct {
+	handler *AckHandler
+	policy  ToolPolicy
+}
+
+func (a autoAllowAck) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in AckInput) (*mcpsdk.CallToolResult, OKOutput, error) {
+	if in.Decision == "" && in.ContinueOf == "" && req != nil && req.Params != nil && req.Params.Meta != nil {
+		if raw, present := req.Params.Meta[ackToolMetaKey]; present {
+			if toolName, isString := raw.(string); isString {
+				if decision, reason, ok := a.policy.AutoAllowDecision(toolName); ok {
+					in.Decision = decision
+					in.DecisionID = reason
+				}
+			}
+		}
+	}
+	return a.handler.Handle(ctx, req, in)
+}
+
+// attachAckWithPolicy installs the real ack tool with the auto-allow wrapper.
+// The description and annotations match AttachAck so the tools/list contract
+// stays byte-identical; only the handler gains the policy rule.
+func attachAckWithPolicy(s *mcpsdk.Server, handler *AckHandler, policy ToolPolicy) {
+	if s == nil || handler == nil {
+		return
+	}
+	s.RemoveTools("beacon_ack")
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:        "beacon_ack",
+		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
+		Annotations: attachToolAnnotations(true),
+	}, (&autoAllowAck{handler: handler, policy: policy}).Handle)
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -490,6 +589,11 @@ type Dependencies struct {
 	// falls back to BuildVersion, the binary's build artifact. The description
 	// of beacon_stats is the one place the version reaches tools/list.
 	Version string
+
+	// ToolPolicy carries the two independent tool lists from CSx-04. Its zero
+	// value advertises every declared tool and leaves ack's human decisions
+	// untouched, which preserves the existing tools/list contract.
+	ToolPolicy ToolPolicy
 }
 
 // CapabilityScopeRegistry owns one cancellation scope per calling agent
@@ -662,7 +766,20 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 			SupportedProtocolVersions: LegacyProtocolVersionsCopy(),
 		},
 	)
+	// The available set is the declared names minus the policy's
+	// disallowedTools. Registration is the only place tools/list is built, so
+	// skipping a name here both hides it from tools/list and makes a call to it
+	// an unknown-tool error (CSx-04). With the zero policy every declared tool
+	// is registered and the byte-pinned contract is unchanged.
+	available := deps.ToolPolicy.availableToolNames()
+	advertised := make(map[string]struct{}, len(available))
+	for _, name := range available {
+		advertised[name] = struct{}{}
+	}
 	for _, descriptor := range toolDescriptors {
+		if _, ok := advertised[descriptor.Name]; !ok {
+			continue
+		}
 		annotations := toolAnnotations[descriptor.Name]
 		mcpsdk.AddTool(s, &mcpsdk.Tool{Name: descriptor.Name, Annotations: &annotations}, stubHandler)
 	}
@@ -685,6 +802,9 @@ func NewServerWithDeps(deps Dependencies) *mcpsdk.Server {
 	}
 
 	for _, descriptor := range toolDescriptors {
+		if _, ok := advertised[descriptor.Name]; !ok {
+			continue
+		}
 		descriptor.Handler(s, deps, schemas, version)
 	}
 	return s
