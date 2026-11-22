@@ -1932,6 +1932,64 @@ func bridgeWorktreeGC(db *store.DB, root string) cibridge.WorktreeGC {
 	}
 }
 
+// reconcileMaintenance runs the durable housekeeping of one pass: archive
+// closed watches, checkpoint the WAL, publish the footprint gauges and return
+// abandoned in_progress cards to the queue (MEM-04). A failure in one piece is
+// reported through observe and never stops the cycle. Both daemon modes reach
+// this helper because --once calls ReconcilePass as well as the loop.
+func reconcileMaintenance(ctx context.Context, cfg reconcileConfig) {
+	if cfg.db == nil {
+		return
+	}
+	if _, err := cfg.db.ArchiveRun(ctx, time.Now()); err != nil {
+		observe.ActorError("archive", "", err)
+	}
+	if err := cfg.db.Checkpoint(ctx); err != nil {
+		observe.ActorError("checkpoint", "", err)
+	}
+
+	watches, watchErr := cfg.db.LiveWatches()
+	activeWatches := len(watches)
+	if watchErr != nil {
+		observe.ActorError("live-watches", "", watchErr)
+	}
+	warn := func(format string, args ...any) {
+		observe.ActorError("footprint", "", fmt.Errorf(format, args...))
+	}
+	// CheckLaunchFootprint is the AUTOSP-11 launch decision. It publishes the
+	// RSS gauge through FootprintCheck and calls warn only when the process is
+	// over budget, so an unreadable RSS reading stays informational.
+	server.CheckLaunchFootprint(pollerMetrics, activeWatches, server.ProcessRSSBytes, warn)
+	if watchErr != nil {
+		return
+	}
+
+	// A card with a live Watch still has a worker. The reaper needs that fact
+	// from the bridge, so map each live Watch back to its linked card before
+	// releasing leases. An incomplete map skips the reaper for this pass.
+	liveCards := make(map[string]bool, len(watches))
+	for _, w := range watches {
+		cardID, err := linkedCardID(ctx, cfg.db, w.ID)
+		if err != nil {
+			observe.ActorError("card-liveness", w.ID, err)
+			return
+		}
+		if cardID != "" {
+			liveCards[cardID] = true
+		}
+	}
+	svc := taskcli.NewService(taskcli.Config{
+		TasksDir: filepath.Join(cfg.root, "docs", "tasks"),
+		StateDir: cfg.dir,
+		Root:     cfg.root,
+	})
+	if _, err := svc.ReapStaleCards(taskcli.ReapOptions{
+		WatchAlive: func(cardID string) (bool, error) { return liveCards[cardID], nil },
+	}); err != nil {
+		observe.ActorError("reaper", "", err)
+	}
+}
+
 // ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
 // with domain.EvaluatePR, merges and wakes through the wired ports, the wake
 // ladder advances its due timers and escalation rungs, then the in-process
@@ -1958,6 +2016,7 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root}).
 		WithWorktreeGC(bridgeWorktreeGC(cfg.db, cfg.root))
 	updated := bridge.Refresh(ctx)
+	reconcileMaintenance(ctx, cfg)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
 		if err := cfg.db.SaveRuntimeStats(withPollerStats(metrics.SnapshotJSON()), time.Now()); err != nil {
 			observe.ActorError("runtime_stats", "", err)
