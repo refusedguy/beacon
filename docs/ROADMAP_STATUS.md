@@ -2,12 +2,14 @@
 
 Триаж `docs/tasks/` по состоянию main после Waves 1–4 (2026-11-20).
 
-Дата пересчёта: 2026-11-21
-Baseline SHA: a67afaf02961837b47ae3d7a7acd5b3985bf3be2
+Дата пересчёта: 2026-11-22
+Baseline SHA: c7f1729da08ed65c083606a0df0bc4e13dfd025c
 
 - Закрыто done: **665**
 - Переведено dropped: **326**
 - Осталось реальных todo: **1**
+
+Три числа выше считает cardindex. Он учитывает карточки из коммитов с номером PR и дубли по OwnerFiles. Сырой счёт ниже считает только строки `Статус:` и в гейт не входит.
 
 ## Приоритеты
 - P2: 1
@@ -18,12 +20,12 @@ Baseline SHA: a67afaf02961837b47ae3d7a7acd5b3985bf3be2
 
 | Статус | Файлов |
 |---|---|
-| done | 673 |
+| done | 764 |
 | dropped | 326 |
-| todo | 146 |
-| in_progress | 1 |
+| todo | 112 |
+| in_progress | 4 |
 
-Фазы среди todo: P0 32, P1 75, P2 35, P3 4.
+Фазы среди todo: P0 22, P1 61, P2 26, P3 3.
 
 Команда: `git grep -l '^Статус: done\|^Статус: todo\|^Статус: dropped\|^Статус: in_progress' <baseline> -- 'docs/tasks/*.md'`
 
