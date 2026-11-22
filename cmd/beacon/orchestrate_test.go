@@ -503,3 +503,40 @@ func TestGenerateFindingIDStableAcrossCallOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestCLIRunnerKeepsFullGHDiagnostic guards the merge path. gh puts the real
+// refusal reason after its header, so a merge error cut at the first line
+// hides why the merge failed from the merge adapter.
+func TestCLIRunnerKeepsFullGHDiagnostic(t *testing.T) {
+	c, _, _, _ := t06NewCLI(t, func(call t06Call) runResult {
+		return runResult{
+			code:   1,
+			stderr: []byte("gh: merging PR 42 failed\nauthorization denied for token\ncheck the token scopes"),
+		}
+	})
+	r := cliRunner{c: c}
+	_, err := r.Run(context.Background(), "gh", "pr", "merge", "42", "--repo", "refusedguy/beacon")
+	if err == nil {
+		t.Fatal("want an error from a failed gh merge")
+	}
+	msg := err.Error()
+	for _, want := range []string{"authorization denied for token", "check the token scopes"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error = %q, want it to contain %q", msg, want)
+		}
+	}
+}
+
+// TestGHErrorStaysOneLineForDaemonLog guards the other policy in the same
+// package. The daemon logs ghError once per tick, so its text must stay on a
+// single line even when stderr has several.
+func TestGHErrorStaysOneLineForDaemonLog(t *testing.T) {
+	res := runResult{code: 1, stderr: []byte("gh: merging PR 42 failed\nauthorization denied\ncheck the token scopes")}
+	msg := ghError("gh", res).Error()
+	if strings.ContainsAny(msg, "\r\n") {
+		t.Fatalf("daemon error must stay on one line, got %q", msg)
+	}
+	if !strings.Contains(msg, "gh: merging PR 42 failed") {
+		t.Fatalf("error = %q, want the first diagnostic line", msg)
+	}
+}

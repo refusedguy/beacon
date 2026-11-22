@@ -63,8 +63,9 @@ func firstLine(s string) string {
 	return oneLine(s)
 }
 
-// ghError builds a single-line error from a failed child process. oneLine is
-// the package helper in task.go; firstLine drops the multi-line gh hints.
+// ghError builds a single-line error from a failed child process. The daemon
+// logs these errors once per tick and needs the compact form. Merge callers
+// that need gh's full diagnostic use ghErrorFull instead.
 func ghError(what string, res runResult) error {
 	reason := firstLine(string(res.stderr))
 	if reason == "" {
@@ -74,6 +75,21 @@ func ghError(what string, res runResult) error {
 		reason = fmt.Sprintf("exit %d", res.code)
 	}
 	return fmt.Errorf("%s: %s", what, reason)
+}
+
+// ghErrorFull builds an error that keeps every gh diagnostic line. gh prints
+// the refusal reason after its header, so an error cut at the first line hides
+// the cause from the merge adapter. stderr wins; stdout is the fallback only
+// when stderr carries no text.
+func ghErrorFull(what string, res runResult) error {
+	reason := string(res.stderr)
+	if oneLine(reason) == "" {
+		reason = string(res.stdout)
+	}
+	if oneLine(reason) == "" {
+		reason = fmt.Sprintf("exit %d", res.code)
+	}
+	return fmt.Errorf("%s: %s", what, strings.TrimRight(reason, "\r\n"))
 }
 
 // cliRunner adapts the CLI child-process seam to the Runner port of the
@@ -91,7 +107,7 @@ func (r cliRunner) Run(ctx context.Context, name string, args ...string) ([]byte
 	if res.code == 0 {
 		return res.stdout, nil
 	}
-	return res.stdout, ghError(fmt.Sprintf("%s %s", name, strings.Join(args, " ")), res)
+	return res.stdout, ghErrorFull(fmt.Sprintf("%s %s", name, strings.Join(args, " ")), res)
 }
 
 // domainMergeAdapter bridges the domain merger to the orchestrator's
