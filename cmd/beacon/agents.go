@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -179,24 +180,29 @@ func (c *CLI) runAgents(args []string) int {
 		return 2
 	}
 
-	// opencode v2.3.0 не знает app.agents и возвращает Operation not found
-	// (ADR 0060). Вызов сохраняется для совместимости со старыми версиями, но
-	// рабочим источником становится поле agent ответа session.list.
-	res := c.run(c.root, "opencode", []string{"api", "app.agents"}, nil)
-	rows, err := parseAgentRows(res.stdout)
-	if res.code != 0 || err != nil || len(rows) == 0 {
-		res = c.run(c.root, "opencode", []string{"api", "session.list"}, nil)
-		if res.code != 0 {
-			fmt.Fprintln(c.errOut, "beacon agents: не удалось получить список агентов через opencode api session.list")
-			if msg := strings.TrimSpace(string(res.stderr)); msg != "" {
-				fmt.Fprintf(c.errOut, "  %s\n", msg)
+	var err error
+	rows, fromHTTP := agentRowsOverHTTP()
+	if !fromHTTP {
+		// Honest fallback for builds with no registered HTTP port: the legacy
+		// `opencode api` child process is used and reported through errOut.
+		// opencode v2.3.0 does not know app.agents, so session.list is the
+		// working source there (ADR 0060).
+		res := c.run(c.root, "opencode", []string{"api", "app.agents"}, nil)
+		rows, err = parseAgentRows(res.stdout)
+		if res.code != 0 || err != nil || len(rows) == 0 {
+			res = c.run(c.root, "opencode", []string{"api", "session.list"}, nil)
+			if res.code != 0 {
+				fmt.Fprintln(c.errOut, "beacon agents: не удалось получить список агентов через opencode api session.list")
+				if msg := strings.TrimSpace(string(res.stderr)); msg != "" {
+					fmt.Fprintf(c.errOut, "  %s\n", msg)
+				}
+				return 2
 			}
-			return 2
-		}
-		rows, err = parseAgentRowsFromSessions(res.stdout)
-		if err != nil {
-			fmt.Fprintf(c.errOut, "beacon agents: не удалось разобрать ответ opencode api: %v\n", err)
-			return 2
+			rows, err = parseAgentRowsFromSessions(res.stdout)
+			if err != nil {
+				fmt.Fprintf(c.errOut, "beacon agents: не удалось разобрать ответ opencode api: %v\n", err)
+				return 2
+			}
 		}
 	}
 
@@ -222,6 +228,62 @@ func (c *CLI) runAgents(args []string) int {
 	attachStaleTasks(rows, stales, now)
 
 	return printAgentRows(*format, rows, c.out, c.errOut)
+}
+
+// agentRowsOverHTTP reads agents through the one read-only opencode HTTP port.
+// It never spawns a child process or starts a fallback server. When no port is
+// registered it returns ok=false, so runAgents can take the legacy path and
+// say why (AUD-12).
+func agentRowsOverHTTP() ([]agentRow, bool) {
+	port, err := newReadOnlyOpencodePort()
+	if err != nil || port == nil {
+		return nil, false
+	}
+	ctx := context.Background()
+	if agents, err := port.ListAgents(ctx); err == nil {
+		if rows := agentRowsFromAgents(agents); len(rows) > 0 {
+			return rows, true
+		}
+	}
+	// opencode v2.3.0 answers /api/agent with an error or an empty list. The
+	// session agent field is the working source there (ADR 0060).
+	sessions, err := port.Sessions(ctx)
+	if err != nil {
+		return nil, false
+	}
+	return agentRowsFromSessions(sessions), true
+}
+
+// agentRowsFromAgents maps the HTTP agent list to printable rows and keeps only
+// subagent/all modes, the same filter parseAgentRows applies.
+func agentRowsFromAgents(agents []opencode.Agent) []agentRow {
+	rows := make([]agentRow, 0, len(agents))
+	for _, a := range agents {
+		if !subagentModes[a.Mode] {
+			continue
+		}
+		rows = append(rows, agentRow{ID: a.ID, Name: a.Name, Mode: a.Mode})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows
+}
+
+// agentRowsFromSessions maps HTTP sessions to one row per distinct agent. The
+// agent string is the ID and the name so attention and stale matching keep
+// working the same way as with the legacy session.list path.
+func agentRowsFromSessions(sessions []opencode.Session) []agentRow {
+	seen := make(map[string]bool, len(sessions))
+	rows := make([]agentRow, 0, len(sessions))
+	for _, s := range sessions {
+		agent := strings.TrimSpace(s.Agent)
+		if agent == "" || seen[agent] {
+			continue
+		}
+		seen[agent] = true
+		rows = append(rows, agentRow{ID: agent, Name: agent})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
+	return rows
 }
 
 // rawAgent is the shape of one entry in the app.agents response.
