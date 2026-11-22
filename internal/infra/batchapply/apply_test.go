@@ -2,11 +2,13 @@ package batchapply
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1518,4 +1520,80 @@ func writeImportFixture(t *testing.T, root, rel, text string, when time.Time) st
 		t.Fatal(err)
 	}
 	return path
+}
+
+// TestWriteChunkedKeepsDeltaAfterFailedWrite proves the CC-04 delta stops at
+// the first failure. The second file never reaches disk, so neither the runner
+// nor the report names it.
+func TestWriteChunkedKeepsDeltaAfterFailedWrite(t *testing.T) {
+	dir := t.TempDir()
+	entries := []artifactEntry{
+		{path: filepath.Join("docs", "tasks", "CC04-FIRST.md"), content: "first"},
+		{path: filepath.Join("docs", "tasks", "CC04-SECOND.md"), content: "second"},
+		{path: filepath.Join("docs", "tasks", "CC04-THIRD.md"), content: "third"},
+	}
+	failPath := filepath.Join(dir, entries[1].path)
+	r := &runner{
+		opts: Options{Quiet: true},
+		out:  io.Discard,
+		write: func(path string, data []byte) (string, error) {
+			if path == failPath {
+				return "sandbox denied", errors.New("write refused")
+			}
+			return "", nil
+		},
+	}
+	if err := r.writeChunked(dir, entries, 0, 0, 0); err == nil {
+		t.Fatal("writeChunked succeeded, want failure on the second file")
+	}
+	want := []string{entries[0].path}
+	if !reflect.DeepEqual(r.writtenPaths, want) {
+		t.Fatalf("writtenPaths = %q, want %q", r.writtenPaths, want)
+	}
+	if got := r.importReport().WrittenPaths; !reflect.DeepEqual(got, want) {
+		t.Fatalf("report WrittenPaths = %q, want %q", got, want)
+	}
+}
+
+// TestRunReportsPartialWritesOnFailure is the CC-04 acceptance case through
+// Run. The second card's path is a directory, so publishing it fails after the
+// first card reached disk. The text line and the JSON report both name only
+// the first path.
+func TestRunReportsPartialWritesOnFailure(t *testing.T) {
+	root := newRunRepo(t)
+	dir := t.TempDir()
+
+	failRel := filepath.Join("docs", "tasks", "CC04-BBB.md")
+	if err := os.MkdirAll(filepath.Join(root, failRel), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	raw := fmt.Sprintf(`{"cards":[
+		{"id":"CC04-AAA","title":"first","updated_at":%q},
+		{"id":"CC04-BBB","title":"second","updated_at":%q}
+	]}`, future, future)
+	if err := os.WriteFile(filepath.Join(dir, "batch.json"), []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+
+	var jsonOut, out, errOut strings.Builder
+	code := Run(Options{Dir: dir, Quiet: true, JSONReport: &jsonOut}, &out, &errOut)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr = %q", code, errOut.String())
+	}
+	wantPath := filepath.Join("docs", "tasks", "CC04-AAA.md")
+	if want := "WrittenPaths=" + wantPath + "\n"; !strings.Contains(out.String(), want) {
+		t.Fatalf("text report missing %q: %q", want, out.String())
+	}
+	var report ImportReport
+	if err := json.Unmarshal([]byte(jsonOut.String()), &report); err != nil {
+		t.Fatalf("JSON report is not valid: %v\n%s", err, jsonOut.String())
+	}
+	if len(report.WrittenPaths) != 1 || report.WrittenPaths[0] != wantPath {
+		t.Fatalf("WrittenPaths = %q, want [%s]", report.WrittenPaths, wantPath)
+	}
+	if _, err := os.Stat(filepath.Join(root, wantPath)); err != nil {
+		t.Fatalf("first card missing on disk: %v", err)
+	}
 }

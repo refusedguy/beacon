@@ -110,6 +110,10 @@ const (
 	createdIDsFormat   = "CreatedIDs=%s\n"
 	updatedIDsFormat   = "UpdatedIDs=%s\n"
 	tieKeptLocalFormat = "TieKeptLocalIDs=%s\n"
+	// CC-04: the partial write delta names every path that reached disk before
+	// the run ended. The line is emitted on success, on dry runs and on the
+	// error path, so a failed batch still says which files it created.
+	writtenPathsFormat = "WrittenPaths=%s\n"
 )
 
 // CBX-07: an incoming row carries the time its source was changed. A local
@@ -169,12 +173,15 @@ type Options struct {
 // ImportReport is the machine-readable result of one import. Each list is
 // written even when empty, so a consumer can index it without a nil check.
 // Changes maps an updated id to the field names whose values changed. Created
-// ids carry no changes because their whole content is new.
+// ids carry no changes because their whole content is new. WrittenPaths is the
+// CC-04 delta: the paths that reached disk before the run ended. It stays
+// populated when a later write fails.
 type ImportReport struct {
 	CreatedIDs      []string            `json:"CreatedIDs"`
 	UpdatedIDs      []string            `json:"UpdatedIDs"`
 	StaleSkippedIDs []string            `json:"StaleSkippedIDs"`
 	TieKeptLocalIDs []string            `json:"TieKeptLocalIDs"`
+	WrittenPaths    []string            `json:"WrittenPaths"`
 	Changes         map[string][]string `json:"Changes,omitempty"`
 }
 
@@ -596,6 +603,13 @@ type runner struct {
 	tieKeptLocalIDs []string
 	changes         map[string][]string
 	updatedIssues   int
+	// writtenPaths is the CC-04 delta. It holds one relative path per file
+	// written before the run ended, in write order. A later failed write does
+	// not clear it, so the error path still reports what reached disk.
+	writtenPaths []string
+	// reportEmitted keeps the JSON report to one object per run. Error paths
+	// emit it too, so the guard prevents a second object after a success.
+	reportEmitted bool
 }
 
 // fillDefaults installs the production seams. Tests replace any of them on
@@ -894,6 +908,7 @@ func (r *runner) writeFileMode(root, rel, content string, overwrite bool) error 
 		fmt.Fprintln(r.out, " ", path)
 	}
 	if r.opts.DryRun {
+		r.recordWritten(rel)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -910,11 +925,13 @@ func (r *runner) writeFileMode(root, rel, content string, overwrite bool) error 
 		if err != nil {
 			return r.classifyWriteError(output, err)
 		}
+		r.recordWritten(rel)
 		return nil
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return r.classifyWriteError(err.Error(), err)
 	}
+	r.recordWritten(rel)
 	return nil
 }
 
@@ -946,6 +963,12 @@ func appendUnique(ids []string, id string) []string {
 		}
 	}
 	return append(ids, id)
+}
+
+// recordWritten adds one relative path to the CC-04 delta. A duplicate write
+// of the same path is recorded once, as with the id lists above.
+func (r *runner) recordWritten(rel string) {
+	r.writtenPaths = appendUnique(r.writtenPaths, rel)
 }
 
 func (r *runner) recordCreated(id string) {
@@ -1020,17 +1043,24 @@ func (r *runner) importReport() ImportReport {
 		UpdatedIDs:      empty(r.updatedIDs),
 		StaleSkippedIDs: empty(r.staleSkippedIDs),
 		TieKeptLocalIDs: empty(r.tieKeptLocalIDs),
+		WrittenPaths:    empty(r.writtenPaths),
 		Changes:         r.changes,
 	}
 }
 
-// emitImportReport writes one JSON object when the caller supplied a writer.
-// The text lines and this object come from the same runner fields.
-func (r *runner) emitImportReport() {
-	if r.opts.JSONReport == nil {
+// emitReport writes the CC-04 delta line and, when the caller supplied a
+// writer, one JSON object. It runs on success and on failure, so a partial
+// batch still names the files it created. The guard keeps both outputs to one
+// copy per run when an error path calls it after a success.
+func (r *runner) emitReport() {
+	if r.reportEmitted {
 		return
 	}
-	_ = json.NewEncoder(r.opts.JSONReport).Encode(r.importReport())
+	r.reportEmitted = true
+	r.printf(writtenPathsFormat, strings.Join(r.writtenPaths, ","))
+	if r.opts.JSONReport != nil {
+		_ = json.NewEncoder(r.opts.JSONReport).Encode(r.importReport())
+	}
 }
 
 // prefilterStale drops incoming rows older than the local artifact before any
@@ -1064,6 +1094,7 @@ func (r *runner) writeFresh(root, rel, content string, updatedAt time.Time) erro
 		fmt.Fprintln(r.out, " ", path)
 	}
 	if r.opts.DryRun {
+		r.recordWritten(rel)
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -1072,6 +1103,9 @@ func (r *runner) writeFresh(root, rel, content string, updatedAt time.Time) erro
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return err
 	}
+	// The bytes are on disk now. Record them before Chtimes, so a timestamp
+	// failure still leaves the delta describing the file that was written.
+	r.recordWritten(rel)
 	if !updatedAt.IsZero() {
 		return os.Chtimes(path, updatedAt, updatedAt)
 	}
@@ -1594,6 +1628,7 @@ func Run(opts Options, out, errOut io.Writer) int {
 		len(batches), len(adrs), len(cards), len(evals), len(closures))
 	r.printf(hashReportFormat, iterationHash(entries))
 	if err := r.writeChunked(root, entries, len(cards), len(adrs), len(evals)); err != nil {
+		r.emitReport()
 		r.errf("%v\n", err)
 		return 1
 	}
@@ -1604,8 +1639,9 @@ func Run(opts Options, out, errOut io.Writer) int {
 		r.printf(tieKeptLocalFormat, strings.Join(r.tieKeptLocalIDs, ","))
 		r.printf(updatedIssuesFormat, r.updatedIssues)
 	}
-	r.emitImportReport()
+	r.emitReport()
 	if err := r.applyClosures(root, closures); err != nil {
+		r.emitReport()
 		r.errf("%v\n", err)
 		return 1
 	}
