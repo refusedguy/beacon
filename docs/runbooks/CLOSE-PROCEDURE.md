@@ -1,6 +1,6 @@
 # Процедура закрытия застрявших карточек
 
-Runbook для оркестратора. Описывает, как закрыть карточку, у которой не будет терминального вердикта `merged`, и как запросить решение владельца. Команды работают с карточками в `docs/tasks/*.md` и не требуют PR. Основание: ADR 0020, ADR 0051, ADR 0094, ADR 0268, ADR 0270.
+Runbook для оркестратора. Описывает, как закрыть карточку, у которой не будет терминального вердикта `merged`, и как запросить решение владельца. Команды меняют карточки в `docs/tasks/*.md`. Доставка закрытой карточки в `main` описана ниже. Основание: ADR 0020, ADR 0051, ADR 0094, ADR 0268, ADR 0270.
 
 ## Когда применять
 
@@ -14,6 +14,39 @@ Runbook для оркестратора. Описывает, как закрыт
 Сигнал приходит от исполнителя вместе с доказательством. Оркестратор читает его через `beacon_get_result` или из отчёта хода. Блокер без проверяемого доказательства не закрывает карточку: оркестратор вызывает `beacon task needs-input` с вопросом.
 
 Процедура не отменяет общий запрет на ручное закрытие при обычном цикле. Beacon по-прежнему закрывает карточки при `merged`. Здесь закрытие делает оркестратор, потому что ждать вердикта не от чего.
+
+## Доставка статуса в main
+
+`beacon task done`, `beacon_task_close` и автозакрытие на merge пишут карточку в рабочем дереве. Ни один из этих путей не создаёт коммит и PR. Пока правку не принёс PR, `origin/main` хранит прежний статус `todo`. CI и оркестратор читают старую карточку.
+
+Замер от `8a766a5d`: 17 карточек имели `done` только в рабочем дереве, всего было изменено 79 файлов `docs/tasks/`. Проверку расхождения выполняют для каждой закрытой карточки до завершения хода.
+
+Выбранный способ доставки это docs-PR по образцу ветки 6b скилла `beacon-executor`. Отдельный коммит оркестратора после `merged` не используется, потому что коммит без PR не проходит CI и не попадает в `main`.
+
+### Проверка расхождения
+
+Команда ловит карточку, у которой статус изменён только в дереве:
+
+```bash
+git fetch origin main
+git diff --name-only origin/main -- docs/tasks/<CARD>.md
+git show origin/main:docs/tasks/<CARD>.md | rg '^Статус:'
+rg '^Статус:' docs/tasks/<CARD>.md
+```
+
+Первая команда должна вывести `docs/tasks/<CARD>.md`. Статус в дереве должен быть `done`, `dropped`, `blocked` или `duplicate`. Статус `todo` или `in_progress` в `origin/main` означает, что доставка не выполнена. Пустой вывод `git diff` означает, что правка уже в `main` и отдельный PR не нужен.
+
+### PR с закрытой карточкой
+
+1. Закрыть карточку с непустыми `--summary` и `--evidence`. Для `beacon_task_close` те же SHA и номер PR идут в `reason`.
+2. Создать worktree: `git worktree add --lock -b fix/close-<CARD> worktrees/close-<CARD> origin/main`.
+3. Скопировать закрытую карточку из общего дерева в worktree: `cp <root>/docs/tasks/<CARD>.md <worktree>/docs/tasks/<CARD>.md`.
+4. Закоммитить только `docs/tasks/<CARD>.md`, запушить ветку и открыть `gh pr create --base main --head fix/close-<CARD>`. Кода в этом PR нет.
+5. Зарегистрировать Watch на PR с `autoMerge: true` по правилам скилла `beacon-executor`. Мерж делает Beacon после зелёных проверок.
+
+Если PR с кодом ещё нет, этот PR остаётся единственным способом доставить статус. В `evidence` указывают полный SHA и результат `git merge-base --is-ancestor <SHA> origin/main` с кодом 0. Номер будущего PR добавлять не нужно. Когда PR с кодом уже есть, его номер пишут в `evidence` и в заголовок PR с карточкой.
+
+Если при регистрации Watch в логе появилось `watch_pr_card_link_missing` или `watch_pr-card-link`, связь «карточка → Watch» не записана. Такой Watch не закроет карточку при `merged`. Закрыть карточку вручную по этой процедуре и доставить её docs-PR. На автозакрытие рассчитывать нельзя.
 
 ## Две команды
 
@@ -98,6 +131,8 @@ commands: beacon task done --summary --evidence, beacon task needs-input --quest
 reasons: already-merged, duplicate-or-foreign-pr, owner-decision, false-premise
 requirement-checked-before-close: true
 evidence-required: true
+delivery: docs-pr-branch-6b
+divergence-check: git-diff-origin-main
 tool: beacon_task_close
 adr: 0270
 golden: tools/list names, size, sha256
