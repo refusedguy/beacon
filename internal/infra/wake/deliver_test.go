@@ -1432,6 +1432,23 @@ func TestDeliverCLIUsesStderrToDetectSessionDead(t *testing.T) {
 	}
 }
 
+// A 409 in stderr must map to ErrSessionDead too. The status is only in the
+// captured output, so this also proves the CLI fallback keeps stderr.
+func TestDeliverCLIUsesStderrToDetect409(t *testing.T) {
+	d := &OpenCodeDeliverer{
+		Runner: func(context.Context, ...string) ([]byte, error) {
+			return []byte("error: HTTP 409 conflict"), errors.New("exit status 1")
+		},
+	}
+	err := d.deliverCLI(context.Background(), "ses_test", "text", wakeDeliverySteer, false)
+	if !errors.Is(err, ErrSessionDead) {
+		t.Fatalf("error = %v, want ErrSessionDead", err)
+	}
+	if !strings.Contains(err.Error(), "409 conflict") {
+		t.Fatalf("error = %q, want stderr text", err)
+	}
+}
+
 // The real command path must merge stderr into the returned bytes. Output()
 // would leave it in ExitError.Stderr and the caller would lose it.
 func TestHistorySearchRunnerCapturesStderr(t *testing.T) {
