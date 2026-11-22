@@ -39,36 +39,50 @@ jobs:
     # прогон, не обрезая ни один из восьми живых сценариев.
     timeout-minutes: 5
     continue-on-error: true
+    env:
+      # Одна версия для ключа кэша и установки бинарника.
+      OPENCODE_VERSION: '2.3.0'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: false
+        uses: ./.github/actions/go-runner-setup
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: '26.x'
 
-      # npm-пакет opencode-ai 2.3.0 не существует, а @opencode/cli 2.3.0
-      # требует postinstall, который npm 12 блокирует. Прямое извлечение
-      # бинарника из платформенного tarball проверено локально: opencode v2.3.0.
-      - name: Install opencode 2.3.0
+      # npm-пакет opencode-ai не существует, а @opencode/cli требует
+      # postinstall, который npm 12 блокирует. Прямое извлечение бинарника
+      # из платформенного tarball проверено локально. Бинарник кэшируем
+      # по версии, чтобы повторный прогон не ходил в сеть.
+      - name: Cache opencode binary
+        id: cache-opencode
+        uses: actions/cache@v4
+        with:
+          path: ~/.opencode/bin/opencode
+          key: opencode-${{ runner.os }}-x64-${{ env.OPENCODE_VERSION }}
+
+      - name: Install opencode
+        if: steps.cache-opencode.outputs.cache-hit != 'true'
         shell: bash
         run: |
           set -euo pipefail
-          version=2.3.0
+          version="$OPENCODE_VERSION"
           work="$RUNNER_TEMP/opencode-install"
           mkdir -p "$work" "$HOME/.opencode/bin"
-          curl -fsSL "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz" \
+          curl -fsSL --max-time 60 "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz" \
             -o "$work/opencode.tgz"
           tar -xzf "$work/opencode.tgz" -C "$work"
           cp "$work/package/bin/opencode" "$HOME/.opencode/bin/opencode"
           chmod 755 "$HOME/.opencode/bin/opencode"
+
+      - name: Add opencode to PATH
+        shell: bash
+        run: |
+          set -euo pipefail
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           "$HOME/.opencode/bin/opencode" --version
 
