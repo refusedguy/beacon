@@ -110,6 +110,8 @@ type evalResult struct {
 	expected string
 	actual   string
 	status   evalStatus
+	suite    string
+	duration int64 // duration_ms в отчёте; фактический замер добавляет EM-03.
 }
 
 // evalSummary считает итог по трём статусам. Используется и печатью сводки,
@@ -118,6 +120,93 @@ type evalSummary struct {
 	passed int
 	warned int
 	failed int
+}
+
+// Машиночитаемый отчёт прогона. Поля name, expected, actual и status
+// обязательны для каждой записи. suite разделяет протокольные кейсы и
+// wake-сценарии. duration_ms пока равен нулю: замер длительности приходит
+// в EM-03, но поле уже есть в формате, чтобы файлы можно было сравнивать.
+type evalReportResult struct {
+	Name       string `json:"name"`
+	Expected   string `json:"expected"`
+	Actual     string `json:"actual"`
+	Status     string `json:"status"`
+	Suite      string `json:"suite"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+type evalReportSummary struct {
+	Passed int `json:"passed"`
+	Warned int `json:"warned"`
+	Failed int `json:"failed"`
+}
+
+type evalReport struct {
+	Results []evalReportResult `json:"results"`
+	Summary evalReportSummary  `json:"summary"`
+}
+
+// statusValue возвращает машиныное значение статуса из множества
+// pass/warn/fail. Человеческая таблица продолжает печатать PASS/WARN/FAIL.
+func statusValue(s evalStatus) string {
+	switch s {
+	case statusPass:
+		return "pass"
+	case statusWarn:
+		return "warn"
+	default:
+		return "fail"
+	}
+}
+
+// suiteOf относит кейс к suite по префиксу имени. wake/... попадает в
+// отдельный suite, остальные кейсы идут в core.
+func suiteOf(name string) string {
+	if i := strings.IndexByte(name, '/'); i > 0 {
+		return name[:i]
+	}
+	return "core"
+}
+
+// writeEvalReport сериализует результаты и сводку в eval-results.json.
+// Файл пишется в tmp/ корня репозитория: этот каталог в .gitignore, файл
+// переживает выход процесса и его может забрать шаг загрузки артефакта CI.
+func writeEvalReport(repoRoot string, results []evalResult, summary evalSummary) (string, error) {
+	report := evalReport{
+		Results: make([]evalReportResult, 0, len(results)),
+		Summary: evalReportSummary{
+			Passed: summary.passed,
+			Warned: summary.warned,
+			Failed: summary.failed,
+		},
+	}
+	for _, r := range results {
+		suite := r.suite
+		if suite == "" {
+			suite = suiteOf(r.name)
+		}
+		report.Results = append(report.Results, evalReportResult{
+			Name:       r.name,
+			Expected:   r.expected,
+			Actual:     r.actual,
+			Status:     statusValue(r.status),
+			Suite:      suite,
+			DurationMS: r.duration,
+		})
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(repoRoot, "tmp")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "eval-results.json")
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func summarize(results []evalResult) evalSummary {
@@ -322,10 +411,16 @@ func main() {
 func run() int {
 	results := make([]evalResult, 0, 48)
 	record := func(name, expected, actual string, ok bool) {
-		results = append(results, evalResult{name: name, expected: expected, actual: actual, status: statusOf(ok)})
+		results = append(results, evalResult{
+			name: name, expected: expected, actual: actual,
+			status: statusOf(ok), suite: suiteOf(name),
+		})
 	}
 	recordStatus := func(name, expected, actual string, status evalStatus) {
-		results = append(results, evalResult{name: name, expected: expected, actual: actual, status: status})
+		results = append(results, evalResult{
+			name: name, expected: expected, actual: actual,
+			status: status, suite: suiteOf(name),
+		})
 	}
 
 	repoRoot, err := findRepoRoot()
@@ -1059,6 +1154,17 @@ func run() int {
 	printTable(results)
 	summary := summarize(results)
 	fmt.Printf("\n%d passed, %d warning, %d failed\n", summary.passed, summary.warned, summary.failed)
+
+	// EM-02: машиночитаемый отчёт рядом с человеческой таблицей. Ошибка
+	// записи приравнивается к провалу прогона: без файла нечем сравнивать
+	// прогоны и нечего загружать как артефакт.
+	reportPath, err := writeEvalReport(repoRoot, results, summary)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "eval: write report: %v\n", err)
+		return 1
+	}
+	fmt.Printf("eval report: %s\n", reportPath)
+
 	if summary.blocks() {
 		return 1
 	}
@@ -3577,6 +3683,7 @@ func runWakeEvalSet(ctx context.Context, o wakeObserver) []evalResult {
 			expected: s.Expect,
 			actual:   actual,
 			status:   statusOf(pass),
+			suite:    "wake",
 		})
 	}
 	return results
