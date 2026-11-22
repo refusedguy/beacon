@@ -258,6 +258,14 @@ func (c *CLI) checkStateDir() checkResult {
 	}
 	info, err := os.Stat(path)
 	if err != nil {
+		// A store created before the project-scoped layout still lives at the
+		// path derived from the environment. Report that directory when it is
+		// present instead of calling an existing store broken. CU-05.
+		if legacy, legacyErr := stateDir(); legacyErr == nil && legacy != path {
+			if legacyInfo, statErr := os.Stat(legacy); statErr == nil && legacyInfo.IsDir() {
+				return checkResult{"state", doctorPass, legacy}
+			}
+		}
 		return checkResult{"state", doctorBroken, fmt.Sprintf("%s: %v", path, err)}
 	}
 	if !info.IsDir() {

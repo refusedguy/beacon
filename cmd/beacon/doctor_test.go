@@ -454,3 +454,31 @@ func TestCU05CheckStateDirUsesCLIRoot(t *testing.T) {
 		t.Fatalf("использован корень из окружения: %q", fromEnv)
 	}
 }
+
+// CU-05: doctor still reports a store created before the project-scoped layout
+// when the CLI root has no state directory of its own.
+func TestCU05CheckStateDirFallsBackToExistingStore(t *testing.T) {
+	legacyHome := t.TempDir()
+	cliRoot := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", "")
+	t.Setenv("BEACON_PROJECT_ROOT", "")
+	t.Setenv("XDG_STATE_HOME", legacyHome)
+
+	legacy, err := stateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, _, _ := w115CLI(t, nil)
+	c.root = cliRoot
+	got := c.checkStateDir()
+	if got.status != doctorPass {
+		t.Fatalf("статус %q, хотим %q: %s", got.status, doctorPass, got.detail)
+	}
+	if got.detail != legacy {
+		t.Fatalf("каталог состояния %q, хотим %q", got.detail, legacy)
+	}
+}
