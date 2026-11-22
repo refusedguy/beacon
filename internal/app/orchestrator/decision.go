@@ -38,6 +38,10 @@ const (
 	// DecisionSourceError means the rules source could not be resolved, so the
 	// check could not run. It fails closed: no merge, no retry and no wake.
 	DecisionSourceError DecisionKind = "SOURCE_ERROR"
+	// DecisionApprovalPolicyError means the declarative approval policy did not
+	// parse or one of its examples failed. It fails closed: no merge and no
+	// approval is granted from a document the loader rejected.
+	DecisionApprovalPolicyError DecisionKind = "APPROVAL_POLICY_ERROR"
 )
 
 const (
@@ -58,6 +62,9 @@ const (
 	// ReasonDependencyCardNotFound is the DEPENDENCY_NOT_FOUND reason. The
 	// broken refs are kept in Decision.Refs.
 	ReasonDependencyCardNotFound = "dependency_card_not_found"
+	// ReasonApprovalPolicyInvalid is the APPROVAL_POLICY_ERROR reason. The
+	// parse or example error is kept in Decision.ApprovalError.
+	ReasonApprovalPolicyInvalid = "approval_policy_invalid"
 )
 
 // DefaultGeneratedFilePatterns lists the Beacon artifacts that tooling owns.
@@ -150,6 +157,9 @@ type Decision struct {
 	SourceRef string `json:"sourceRef,omitempty"`
 	// SourceError carries the resolver error when Kind is SOURCE_ERROR.
 	SourceError string `json:"sourceError,omitempty"`
+	// ApprovalError carries the parse or example error when Kind is
+	// APPROVAL_POLICY_ERROR.
+	ApprovalError string `json:"approvalError,omitempty"`
 	// Depth carries the depth.look-below decision for this outcome. It is nil
 	// for outcomes that did not reach a descent, so existing decisions keep
 	// their wire shape.
@@ -298,9 +308,18 @@ func Decide(w Watch, deps DependencyResolver, ci CIState) Decision {
 		return d
 	}
 
+	// A declarative policy is validated before any merge decision. A bad
+	// example rejects the document, so no approval can be granted from it.
+	if _, approvalErr := MergeApprovalAllowed(w.Policy, w.Policy.approvalEnvironment(), files); approvalErr != nil {
+		d.Kind = DecisionApprovalPolicyError
+		d.Reason = ReasonApprovalPolicyInvalid
+		d.ApprovalError = approvalErr.Error()
+		return d
+	}
+
 	verdict := decisionVerdict(w, ci)
 	switch {
-	case verdict == VerdictReady && decisionAutoMergeAllowed(w.Policy):
+	case verdict == VerdictReady && decisionAutoMergeAllowed(w.Policy, files):
 		d.Kind = DecisionMerge
 		d.Reason = VerdictReady
 	case verdict == VerdictRetry:
@@ -414,15 +433,20 @@ func decisionVerdict(w Watch, ci CIState) string {
 
 // decisionAutoMergeAllowed checks only the explicit hold-backs. WaitFor and
 // WaitForMain are not treated as permanent denials here: they have just been
-// resolved above, and a satisfied dependency must not block the merge.
-func decisionAutoMergeAllowed(p *AutoMergePolicy) bool {
+// resolved above, and a satisfied dependency must not block the merge. A
+// declarative policy can auto-approve the changed paths; the legacy bool cannot.
+func decisionAutoMergeAllowed(p *AutoMergePolicy, files []string) bool {
 	if p == nil {
 		return true
 	}
 	if p.AutoMerge != nil && !*p.AutoMerge {
 		return false
 	}
-	return !p.RequireApproval
+	if !p.approvalRequired(ApprovalMerge) {
+		return true
+	}
+	allowed, err := MergeApprovalAllowed(p, p.approvalEnvironment(), files)
+	return err == nil && allowed
 }
 
 func decisionHoldReason(verdict string, p *AutoMergePolicy) string {
@@ -430,14 +454,35 @@ func decisionHoldReason(verdict string, p *AutoMergePolicy) string {
 		if p.AutoMerge != nil && !*p.AutoMerge {
 			return "auto_merge_disabled"
 		}
-		if p.RequireApproval {
-			return "require_approval"
+		if p.approvalRequired(ApprovalMerge) {
+			return approvalHoldReason(p)
 		}
 	}
 	if verdict != "" {
 		return "verdict=" + verdict
 	}
 	return "verdict="
+}
+
+// ActionApprovalAllowed checks one non-merge approval category. Merge approval
+// and action approval are separate decisions: a Watch may auto-merge while an
+// executor step still needs a human. The legacy RequireApproval bool never
+// gates an action, so existing callers are unaffected.
+func ActionApprovalAllowed(p *AutoMergePolicy, category ApprovalCategory, environmentID, path string) (allowed bool, reason string, err error) {
+	if category == ApprovalMerge {
+		return false, "use MergeApprovalAllowed for merge approval", nil
+	}
+	if p == nil || !p.approvalRequired(category) {
+		return true, "", nil
+	}
+	policy, err := p.approvalPolicy()
+	if err != nil {
+		return false, ReasonApprovalPolicyInvalid, err
+	}
+	if !Approve(policy, category, environmentID, path) {
+		return false, "require_approval_action:" + string(category), nil
+	}
+	return true, "", nil
 }
 
 // ---- HD-019 / ADR 0295: task completion audit ----

@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/rand"
 	"strings"
+	"sync"
 	"time"
 
 	// ARDH-15: observe is the documented cross-cutting exception. Metrics are
@@ -76,6 +77,11 @@ type AutoMergePolicy struct {
 	RequireApproval bool     `json:"requireApproval"`
 	WaitFor         []string `json:"waitFor,omitempty"`
 	WaitForMain     []string `json:"waitForMain,omitempty"`
+	// Approval is the declarative approval policy. It is optional. A nil value
+	// keeps the legacy RequireApproval bool as the only merge hold-back, so the
+	// MCP wire contract and existing callers are unchanged. When set, it takes
+	// precedence over the bool and governs all five approval categories.
+	Approval *ApprovalSpec `json:"approval,omitempty"`
 }
 
 // DefaultAutoMergePolicy is the zero-configuration policy: automatic merging
@@ -91,7 +97,402 @@ func (p AutoMergePolicy) Allows() bool {
 	if p.AutoMerge != nil && !*p.AutoMerge {
 		return false
 	}
-	return !p.RequireApproval && len(p.WaitFor) == 0 && len(p.WaitForMain) == 0
+	return !p.approvalRequired(ApprovalMerge) && len(p.WaitFor) == 0 && len(p.WaitForMain) == 0
+}
+
+// ---- CC-03: declarative approval policy ----
+//
+// Beacon replaces the single approval bool with five categories, a small
+// declarative rule language with checked examples, and an approval cache keyed
+// by (environment, category, path). The legacy RequireApproval bool remains on
+// the wire for compatibility. The Approval field is the opt-in declarative
+// replacement. Nothing here imports domain or grows the MCP tool set.
+
+// ApprovalCategory names one independent approval decision. Codex keeps five
+// flags in GranularApprovalConfig; Beacon keeps the five decisions it actually
+// makes. Merge holds an auto-merge, action holds an executor step, rules holds
+// an edit to policy files, worktree holds a checkout bind and escalation holds
+// a ping to a human.
+type ApprovalCategory string
+
+const (
+	ApprovalMerge      ApprovalCategory = "merge"
+	ApprovalAction     ApprovalCategory = "action"
+	ApprovalRules      ApprovalCategory = "rules"
+	ApprovalWorktree   ApprovalCategory = "worktree"
+	ApprovalEscalation ApprovalCategory = "escalation"
+)
+
+// ApprovalCategories returns all categories in a stable order.
+func ApprovalCategories() []ApprovalCategory {
+	return []ApprovalCategory{
+		ApprovalMerge, ApprovalAction, ApprovalRules, ApprovalWorktree, ApprovalEscalation,
+	}
+}
+
+func (c ApprovalCategory) known() bool {
+	for _, all := range ApprovalCategories() {
+		if c == all {
+			return true
+		}
+	}
+	return false
+}
+
+// RuleExample is one asserted outcome attached to a prefix rule. Allow true
+// means the path is auto-approved; false means it needs approval.
+type RuleExample struct {
+	Path  string `json:"path"`
+	Allow bool   `json:"allow"`
+}
+
+// PrefixRule is the Beacon analogue of Codex prefix_rule. A path is governed
+// when it starts with one of Match and with none of NotMatch. A governed path
+// is auto-approved. Source records the file and line that declared the rule,
+// so a failed example points at the text to fix.
+type PrefixRule struct {
+	Category ApprovalCategory `json:"category"`
+	Match    []string         `json:"match"`
+	NotMatch []string         `json:"notMatch,omitempty"`
+	Examples []RuleExample    `json:"examples,omitempty"`
+	Source   string           `json:"source"`
+}
+
+// ApprovalPolicy is a parsed rule document. ParseApprovalPolicy validates every
+// example before it returns a policy.
+type ApprovalPolicy struct {
+	Rules []PrefixRule `json:"rules"`
+}
+
+// ApprovalSpec is the opt-in declarative replacement for RequireApproval.
+// Categories maps a category to whether it requires approval. An absent key
+// falls back to RequireApproval for merge and to false for the other
+// categories. PolicyText overrides DefaultApprovalPolicyText when set.
+type ApprovalSpec struct {
+	Categories    map[ApprovalCategory]bool `json:"categories,omitempty"`
+	PolicyText    string                    `json:"policyText,omitempty"`
+	EnvironmentID string                    `json:"environmentID,omitempty"`
+}
+
+// DefaultApprovalPolicyText is the embedded rule document. It lives here
+// rather than in a new file so the change stays inside the card's OwnerFiles.
+// The parser rejects the document at load time if any example disagrees with
+// the rules it belongs to.
+const DefaultApprovalPolicyText = `# Beacon declarative approval policy.
+# category <name>: merge, action, rules, worktree, escalation.
+# rule <match-prefix> [!not-match-prefix]...: a governed path is auto-approved.
+# example <path> allow|deny: asserted at load; a bad example rejects the policy.
+
+category merge
+rule docs/tasks/,docs/evals/,evals/reports/
+example docs/tasks/CC-03.md allow
+example docs/evals/w20-policy-pinned.md allow
+example evals/reports/2026/report.md allow
+example internal/app/orchestrator/orchestrator.go deny
+
+category action
+rule cmd/beacon/,internal/app/orchestrator/
+example cmd/beacon/orchestrate.go allow
+example internal/app/orchestrator/decision.go allow
+example internal/infra/mcp/tool_watch_pr.go deny
+
+category rules
+rule .beacon/config.json,.beacon/config.yaml
+example .beacon/config.json allow
+example .beacon/config.yaml allow
+example internal/app/orchestrator/orchestrator.go deny
+
+category worktree
+rule .git/worktrees/
+example .git/worktrees/cc-03-approval allow
+example docs/evals/w20-policy-pinned.md deny
+
+category escalation
+rule docs/tasks/,evals/reports/
+example docs/tasks/AUD-01.md allow
+example evals/reports/2026/report.md allow
+example cmd/beacon/orchestrate.go deny
+`
+
+// ParseApprovalPolicy parses a declarative policy and validates its examples.
+// A malformed directive or a wrong example returns an error and no policy, so
+// a bad document cannot reach a live merge.
+func ParseApprovalPolicy(text string) (ApprovalPolicy, error) {
+	policy := ApprovalPolicy{Rules: []PrefixRule{}}
+	current := ApprovalCategory("")
+	last := -1
+	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	for i, raw := range lines {
+		lineNo := i + 1
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		switch fields[0] {
+		case "category":
+			if len(fields) != 2 {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: category needs one name", lineNo)
+			}
+			cat := ApprovalCategory(strings.ToLower(fields[1]))
+			if !cat.known() {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: unknown category %q", lineNo, fields[1])
+			}
+			current = cat
+			last = -1
+		case "rule":
+			if current == "" {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: rule before category", lineNo)
+			}
+			if len(fields) < 2 {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: rule needs a match prefix", lineNo)
+			}
+			rule := PrefixRule{Category: current, Source: fmt.Sprintf("policy:%d", lineNo), Examples: []RuleExample{}}
+			for _, token := range fields[1:] {
+				if strings.HasPrefix(token, "!") {
+					prefix := strings.TrimSpace(strings.TrimPrefix(token, "!"))
+					if prefix == "" {
+						return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: empty not-match prefix", lineNo)
+					}
+					rule.NotMatch = append(rule.NotMatch, prefix)
+					continue
+				}
+				for _, prefix := range strings.Split(token, ",") {
+					if prefix = strings.TrimSpace(prefix); prefix != "" {
+						rule.Match = append(rule.Match, prefix)
+					}
+				}
+			}
+			if len(rule.Match) == 0 {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: rule needs a match prefix", lineNo)
+			}
+			policy.Rules = append(policy.Rules, rule)
+			last = len(policy.Rules) - 1
+		case "example":
+			if last < 0 {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: example before rule", lineNo)
+			}
+			if len(fields) != 3 {
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: example needs a path and allow or deny", lineNo)
+			}
+			var allow bool
+			switch strings.ToLower(fields[2]) {
+			case "allow":
+				allow = true
+			case "deny":
+				allow = false
+			default:
+				return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: example outcome %q must be allow or deny", lineNo, fields[2])
+			}
+			policy.Rules[last].Examples = append(policy.Rules[last].Examples, RuleExample{Path: fields[1], Allow: allow})
+		default:
+			return ApprovalPolicy{}, fmt.Errorf("orchestrator: approval policy line %d: unknown directive %q", lineNo, fields[0])
+		}
+	}
+	if err := ValidateApprovalExamples(policy); err != nil {
+		return ApprovalPolicy{}, err
+	}
+	return policy, nil
+}
+
+// ValidateApprovalExamples runs every example through its own rule. It returns
+// the first disagreement with the rule's Source and path, so a wrong example
+// can be fixed at the line that declares it.
+func ValidateApprovalExamples(policy ApprovalPolicy) error {
+	for _, rule := range policy.Rules {
+		for _, example := range rule.Examples {
+			got := ruleAllows(rule, example.Path)
+			if got != example.Allow {
+				return fmt.Errorf("orchestrator: approval example %q in %s: got allow=%v, want %v",
+					example.Path, rule.Source, got, example.Allow)
+			}
+		}
+	}
+	return nil
+}
+
+// Approve reports whether the policy auto-approves path for category. No rule
+// matches means approval is required. The environment is part of the cache key
+// and the audit record; rule matching itself is path based.
+func Approve(policy ApprovalPolicy, category ApprovalCategory, environmentID, path string) bool {
+	for _, rule := range policy.Rules {
+		if rule.Category == category && ruleAllows(rule, path) {
+			return true
+		}
+	}
+	return false
+}
+
+func ruleAllows(rule PrefixRule, p string) bool {
+	p = normalizeApprovalPath(p)
+	matched := false
+	for _, prefix := range rule.Match {
+		if hasApprovalPrefix(p, normalizeApprovalPath(prefix)) {
+			matched = true
+			break
+		}
+	}
+	if !matched {
+		return false
+	}
+	for _, prefix := range rule.NotMatch {
+		if hasApprovalPrefix(p, normalizeApprovalPath(prefix)) {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeApprovalPath(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, "\\", "/"))
+	p = strings.TrimPrefix(p, "./")
+	p = strings.TrimPrefix(p, "/")
+	return strings.TrimSuffix(p, "/")
+}
+
+func hasApprovalPrefix(p, prefix string) bool {
+	prefix = strings.TrimSuffix(prefix, "/")
+	if prefix == "" {
+		return true
+	}
+	return p == prefix || strings.HasPrefix(p, prefix+"/")
+}
+
+// ApprovalKey identifies one approval record. Environment and category keep a
+// path decision in one config from leaking into another config or category.
+type ApprovalKey struct {
+	EnvironmentID string
+	Category      ApprovalCategory
+	Path          string
+}
+
+// String returns a collision-safe key. NUL cannot occur in the fields, so no
+// pair of distinct keys can share a string.
+func (k ApprovalKey) String() string {
+	return k.EnvironmentID + "\x00" + string(k.Category) + "\x00" + k.Path
+}
+
+// ApprovalCache stores approval decisions by (environment, category, path).
+// It is the Beacon analogue of Codex's patch approval cache key. One mutex
+// guards the map because one cache is shared by concurrent Watches.
+type ApprovalCache struct {
+	mu      sync.Mutex
+	allowed map[string]bool
+}
+
+// NewApprovalCache returns an empty cache.
+func NewApprovalCache() *ApprovalCache {
+	return &ApprovalCache{allowed: map[string]bool{}}
+}
+
+// Lookup returns the cached decision and whether the key was present.
+func (c *ApprovalCache) Lookup(key ApprovalKey) (allowed bool, ok bool) {
+	if c == nil {
+		return false, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	allowed, ok = c.allowed[key.String()]
+	return allowed, ok
+}
+
+// Remember stores one decision under key.
+func (c *ApprovalCache) Remember(key ApprovalKey, allowed bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.allowed == nil {
+		c.allowed = map[string]bool{}
+	}
+	c.allowed[key.String()] = allowed
+}
+
+// Len reports the number of stored decisions.
+func (c *ApprovalCache) Len() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.allowed)
+}
+
+// Resolve returns a cached decision when present, otherwise it evaluates the
+// policy and remembers the result. Two different paths produce two records.
+func (c *ApprovalCache) Resolve(policy ApprovalPolicy, category ApprovalCategory, environmentID, path string) bool {
+	key := ApprovalKey{EnvironmentID: environmentID, Category: category, Path: path}
+	if allowed, ok := c.Lookup(key); ok {
+		return allowed
+	}
+	allowed := Approve(policy, category, environmentID, path)
+	c.Remember(key, allowed)
+	return allowed
+}
+
+func (p *AutoMergePolicy) approvalRequired(category ApprovalCategory) bool {
+	if p == nil {
+		return false
+	}
+	if p.Approval != nil {
+		if value, ok := p.Approval.Categories[category]; ok {
+			return value
+		}
+		if category == ApprovalMerge {
+			return p.RequireApproval
+		}
+		return false
+	}
+	return category == ApprovalMerge && p.RequireApproval
+}
+
+func (p *AutoMergePolicy) approvalEnvironment() string {
+	if p != nil && p.Approval != nil {
+		return p.Approval.EnvironmentID
+	}
+	return ""
+}
+
+func (p *AutoMergePolicy) approvalPolicy() (ApprovalPolicy, error) {
+	text := DefaultApprovalPolicyText
+	if p != nil && p.Approval != nil && strings.TrimSpace(p.Approval.PolicyText) != "" {
+		text = p.Approval.PolicyText
+	}
+	return ParseApprovalPolicy(text)
+}
+
+// MergeApprovalAllowed applies the declarative policy to a merge. The legacy
+// bool path always requires approval when set. The declarative path parses the
+// document, validates its examples, and requires approval for any changed path
+// the policy does not auto-approve. An empty change list fails closed.
+func MergeApprovalAllowed(p *AutoMergePolicy, environmentID string, changedFiles []string) (bool, error) {
+	if p == nil || !p.approvalRequired(ApprovalMerge) {
+		return true, nil
+	}
+	if p.Approval == nil {
+		return false, nil
+	}
+	policy, err := p.approvalPolicy()
+	if err != nil {
+		return false, err
+	}
+	if len(changedFiles) == 0 {
+		return false, nil
+	}
+	for _, file := range changedFiles {
+		if !Approve(policy, ApprovalMerge, environmentID, file) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func approvalHoldReason(p *AutoMergePolicy) string {
+	if p != nil && p.Approval != nil {
+		return "require_approval_merge"
+	}
+	return "require_approval"
 }
 
 // DependencyResolver answers whether one free-form dependency reference is
@@ -153,8 +554,14 @@ func (w Watch) canAutoMerge(ctx context.Context, resolver DependencyResolver) (v
 	if policy.AutoMerge != nil && !*policy.AutoMerge {
 		return "", "auto_merge_disabled", nil
 	}
-	if policy.RequireApproval {
-		return "", "require_approval", nil
+	if policy.approvalRequired(ApprovalMerge) {
+		allowed, err := MergeApprovalAllowed(&policy, policy.approvalEnvironment(), w.ChangedFiles)
+		if err != nil {
+			return "", "approval_policy_invalid", fmt.Errorf("orchestrator: approval policy: %w", err)
+		}
+		if !allowed {
+			return "", approvalHoldReason(&policy), nil
+		}
 	}
 	if len(policy.WaitFor) == 0 && len(policy.WaitForMain) == 0 {
 		return VerdictReady, "", nil
