@@ -15,6 +15,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/wake"
@@ -141,6 +142,24 @@ func spawnPrompt(taskID, title string) string {
 	return fmt.Sprintf("Выполни задачу Beacon %s", taskID)
 }
 
+// verbatimPromptMeta marks a spawned session's first prompt as client-composed
+// when --verbatim is set. The marker goes through the session metadata port,
+// not the prompt text. A card title with @/etc/passwd stays the literal string
+// the caller supplied, and building the prompt reads no file. The flag is off
+// by default, so existing spawns keep their current metadata.
+func verbatimPromptMeta(metadata map[string]string, verbatim bool) map[string]string {
+	if !verbatim {
+		return metadata
+	}
+	if metadata == nil {
+		metadata = make(map[string]string)
+	}
+	for key, value := range mcp.VerbatimPromptMeta() {
+		metadata[key] = value
+	}
+	return metadata
+}
+
 // runSpawn is the CLI wrapper for `beacon spawn`. It reads the parent session
 // from BEACON_PARENT_SESSION when a shell sets it and delegates to
 // runSpawnWithParent (ADR 0309). The variable is no longer required: an
@@ -165,7 +184,7 @@ func (c *CLI) runSpawnWithParent(args []string, parentID string) int {
 	// first one, while spawn accepts flags both before and after the taskID.
 	// parseTaskArgs is the existing parser with that shape (cmd/beacon/task.go).
 	p, err := parseTaskArgs(args, map[string]bool{
-		"agent": true, "title": true, "runtime": true, "runner": true,
+		"agent": true, "title": true, "runtime": true, "runner": true, "verbatim": true,
 	}, nil)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon spawn: %v\n", err)
@@ -182,6 +201,12 @@ func (c *CLI) runSpawnWithParent(args []string, parentID string) int {
 	case "", "default", "session":
 		// Legacy path: create an OpenCode session through the injected port.
 	case "acp":
+		// The ACP runtime has no session metadata port, so it cannot carry the
+		// client_composed marker. Fail instead of accepting a flag with no effect.
+		if p.bools["verbatim"] {
+			fmt.Fprintln(c.errOut, "beacon spawn: --verbatim не поддерживается runtime acp")
+			return 2
+		}
 		return c.runSpawnACP(parentID, taskID, strings.TrimSpace(p.value("title")), strings.TrimSpace(p.value("runner")))
 	default:
 		fmt.Fprintf(c.errOut, "beacon spawn: неподдерживаемый runtime %q (доступен: acp)\n", runtime)
@@ -200,6 +225,7 @@ func (c *CLI) runSpawnWithParent(args []string, parentID string) int {
 	if sessionTitle != "" {
 		metadata[spawnMetaTitle] = sessionTitle
 	}
+	metadata = verbatimPromptMeta(metadata, p.bools["verbatim"])
 
 	sessionID, err := spawner.CreateSession(parentID, agentID, sessionTitle, metadata)
 	if err != nil {
