@@ -21,13 +21,38 @@ const minGoVersion = "1.26.0"
 
 var goVersionPattern = regexp.MustCompile(`go([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
 
-// checkResult statuses use the same uppercase register as the rules report in
-// commands.go and RULES-CHECK-CONTRACT.md: PASS, WARN, FAIL, BROKEN. A healthy
-// doctor check prints OK; a failed one prints FAIL and makes doctor exit 1.
+// Doctor statuses are the four verdicts of RULES-CHECK-CONTRACT.md:9. The
+// human output and these constants use the same uppercase register as the
+// rules report in commands.go. Per RULES-CHECK-CONTRACT.md:19, FAIL and BROKEN
+// block while PASS and WARN do not. A blocking check makes doctor exit 1.
+const (
+	doctorPass   = "PASS"
+	doctorWarn   = "WARN"
+	doctorFail   = "FAIL"
+	doctorBroken = "BROKEN"
+)
+
 type checkResult struct {
 	name   string
 	status string
 	detail string
+}
+
+// doctorStatusBlocks is the one blocking rule for every doctor status.
+func doctorStatusBlocks(status string) bool {
+	return status == doctorFail || status == doctorBroken
+}
+
+// renderDoctorChecks prints every check and returns the doctor exit code.
+func (c *CLI) renderDoctorChecks(checks []checkResult) int {
+	code := 0
+	for _, ch := range checks {
+		fmt.Fprintf(c.out, "%s: %s %s\n", ch.name, ch.status, ch.detail)
+		if doctorStatusBlocks(ch.status) {
+			code = 1
+		}
+	}
+	return code
 }
 
 func (c *CLI) runDoctor(args []string) int {
@@ -50,17 +75,7 @@ func (c *CLI) runDoctor(args []string) int {
 	}
 
 	checks := []checkResult{c.checkGo(), c.checkGates(), c.checkStateDir()}
-	failed := false
-	for _, ch := range checks {
-		fmt.Fprintf(c.out, "%s: %s %s\n", ch.name, ch.status, ch.detail)
-		if ch.status == "FAIL" {
-			failed = true
-		}
-	}
-	if failed {
-		return 1
-	}
-	return 0
+	return c.renderDoctorChecks(checks)
 }
 
 // splitDoctorWatch separates a trailing `-- <command...>` from doctor's own
@@ -178,13 +193,13 @@ func (c *CLI) runDoctorWatch(spec doctorWatchSpec) int {
 func (c *CLI) checkGo() checkResult {
 	res := c.run(c.root, "go", []string{"version"}, nil)
 	if res.code != 0 {
-		return checkResult{"go", "FAIL", "не удалось выполнить go version: " + strings.TrimSpace(string(res.stderr))}
+		return checkResult{"go", doctorBroken, "не удалось выполнить go version: " + strings.TrimSpace(string(res.stderr))}
 	}
 
 	line := strings.TrimSpace(string(res.stdout))
 	m := goVersionPattern.FindStringSubmatch(line)
 	if m == nil {
-		return checkResult{"go", "FAIL", "не удалось разобрать вывод go version: " + line}
+		return checkResult{"go", doctorBroken, "не удалось разобрать вывод go version: " + line}
 	}
 
 	major, _ := strconv.Atoi(m[1])
@@ -192,32 +207,32 @@ func (c *CLI) checkGo() checkResult {
 	version := m[0]
 
 	if major < 1 || (major == 1 && minor < 26) {
-		return checkResult{"go", "FAIL", fmt.Sprintf("%s: требуется >= %s (ADR 0015)", version, minGoVersion)}
+		return checkResult{"go", doctorFail, fmt.Sprintf("%s: требуется >= %s (ADR 0015)", version, minGoVersion)}
 	}
-	return checkResult{"go", "OK", version}
+	return checkResult{"go", doctorPass, version}
 }
 
 func (c *CLI) checkGates() checkResult {
 	path, err := findGates(c.root)
 	if err != nil {
-		return checkResult{"beacon-gates", "FAIL", err.Error()}
+		return checkResult{"beacon-gates", doctorBroken, err.Error()}
 	}
-	return checkResult{"beacon-gates", "OK", path}
+	return checkResult{"beacon-gates", doctorPass, path}
 }
 
 func (c *CLI) checkStateDir() checkResult {
 	path, err := stateDir()
 	if err != nil {
-		return checkResult{"state", "FAIL", err.Error()}
+		return checkResult{"state", doctorBroken, err.Error()}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
-		return checkResult{"state", "FAIL", fmt.Sprintf("%s: %v", path, err)}
+		return checkResult{"state", doctorBroken, fmt.Sprintf("%s: %v", path, err)}
 	}
 	if !info.IsDir() {
-		return checkResult{"state", "FAIL", path + ": не каталог"}
+		return checkResult{"state", doctorFail, path + ": не каталог"}
 	}
-	return checkResult{"state", "OK", path}
+	return checkResult{"state", doctorPass, path}
 }
 
 // doctorGatesEnv is a developer-tool override for `beacon doctor` only. No
