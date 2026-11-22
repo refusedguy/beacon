@@ -17,7 +17,8 @@
     {
       "id": "MEM-01",
       "title": "Добавить удаление сессии в HTTP-клиент opencode",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1462 9e5d3b91d0f9bb15ff090c711bae7beada07ae3f (merge-base --is-ancestor origin/main exit 0); DeleteSession added to opencode HTTP client",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -39,7 +40,8 @@
     {
       "id": "MEM-02",
       "title": "Перевести beacon watch и beacon agents на общий HTTP-порт opencode",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1588 5b1f470d45446f736a90cba9035b9097111750be (merge-base --is-ancestor origin/main exit 0); beacon watch reads sessions through newReadOnlyOpencodePort",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -62,7 +64,8 @@
     {
       "id": "MEM-03",
       "title": "Не терять delivery и resume и возвращать stderr в wake-транспорте",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1455 254267c2394dfdb4bc2eeb772ddeaa791b15c989 (merge-base --is-ancestor origin/main exit 0); PromptWithResumeFunc, CombinedOutput; follow-up PR #1473 55e88825d2a9d0ddfce877e3c4280d48bbab5833 for 409",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -108,7 +111,8 @@
     {
       "id": "MEM-05",
       "title": "Удалять сессии закрытых Watch в beacon gc",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1444 b1c647615f0d17bafa30899ad4b77594443aef48 (merge-base --is-ancestor origin/main exit 0); GC deletes sessions of closed watches",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -128,7 +132,8 @@
     {
       "id": "MEM-06",
       "title": "Добавить TTL-reaper для карточек in_progress без живого Watch",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1465 5597372fac5c26150888eb4f627a93dfd19e16ac (merge-base --is-ancestor origin/main exit 0); ReapStaleCards in taskcli service",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -169,7 +174,8 @@
     {
       "id": "MEM-08",
       "title": "Описать бюджет памяти и новый GC в ранбуке наблюдаемости",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1451 8fc00ad63dc2997b062d01cd99beb548e38a0074 (merge-base --is-ancestor origin/main exit 0); Observability runbook describes RSS budget and session GC",
       "phase": "P1",
       "type": "doc",
       "owner_files": [

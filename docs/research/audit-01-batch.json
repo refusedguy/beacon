@@ -24,7 +24,8 @@
     {
       "id": "AUTOSP-01",
       "title": "Закрыть обход политики авто-мержа в cibridge",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1448 e724f0eca86582a9f2353257b06293c18023af89 (merge-base --is-ancestor origin/main exit 0); Policy check before applyMerge in verdict_applier.go",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -44,7 +45,8 @@
     {
       "id": "AUTOSP-02",
       "title": "Промпт headless-сессии с resume и steering delivery",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1441 95c5bd42b7e4df8bf0091df2aded8d2b9bc5f711 (merge-base --is-ancestor origin/main exit 0); Prompt with resume and delivery in opencode client",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -64,7 +66,8 @@
     {
       "id": "AUTOSP-03",
       "title": "Добавить Gemini в реестр ACP-раннеров",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1435 63aada03c1fa287a46c9c4382de47769982c296b (merge-base --is-ancestor origin/main exit 0); gemini registered in acpRuntimes",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -128,7 +131,8 @@
     {
       "id": "AUTOSP-06",
       "title": "Единый гейт запуска перед спавном",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1442 f9c481cd4187010b764ff067cc3cda4b1480908c (merge-base --is-ancestor origin/main exit 0); Unified launch admission gate in taskcli service",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -148,7 +152,8 @@
     {
       "id": "AUTOSP-07",
       "title": "Погашение токена слота после проверки артефакта",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1439 ca302a57bb646a4bfb819be320e88ff506c442ad (merge-base --is-ancestor origin/main exit 0); Slot token burn after artifact verification",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -168,7 +173,8 @@
     {
       "id": "AUTOSP-08",
       "title": "Fetch перед worktree в Go-пути автоспавна",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1438 4c4714ae38b15aac02664c568eeb39eff49c3a93 (merge-base --is-ancestor origin/main exit 0); git fetch before worktree add in Go path",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -188,7 +194,8 @@
     {
       "id": "AUTOSP-09",
       "title": "Явная связь cardID и watchID независимо от agentID",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1436 d0d9fc6fbf103972a8730de75f7b6116797c655f (merge-base --is-ancestor origin/main exit 0); Explicit cardID/watchID link in store",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -208,7 +215,8 @@
     {
       "id": "AUTOSP-10",
       "title": "Eval автоспавна без ручного пинка",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1478 0ef4bf205960391caa95d6f75a540280abc2eb31 (merge-base --is-ancestor origin/main exit 0); Autospawn eval without manual ping",
       "phase": "P2",
       "type": "eval",
       "owner_files": [
@@ -230,7 +238,8 @@
     {
       "id": "AUTOSP-11",
       "title": "Памятный гейт перед запуском раннера",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1437 95843cb669ef62ac7214dc3ff01f9bb84e0818e5 (merge-base --is-ancestor origin/main exit 0); CheckLaunchFootprint and LaunchDecision in metrics.go; caller wiring stays in MEM-04",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -250,7 +259,8 @@
     {
       "id": "AUTOSP-12",
       "title": "Зафиксировать решение и владельцев чисел аудита",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1447 d03c77f3897453931e5cfe45bb54c5c7e09e7078 (merge-base --is-ancestor origin/main exit 0); Audit 01 decisions and number ownership recorded",
       "phase": "P2",
       "type": "doc",
       "owner_files": [

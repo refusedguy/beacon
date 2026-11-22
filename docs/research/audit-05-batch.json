@@ -17,7 +17,8 @@
     {
       "id": "INTG-01",
       "title": "Зарегистрировать serverRunner в диспетчере команд",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1450 851d533e4f3240d64445a596e3d25997af43024f (merge-base --is-ancestor origin/main exit 0); serverRunner registered in runnerFor and catalog",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -37,7 +38,8 @@
     {
       "id": "INTG-02",
       "title": "Сделать реестр генераций долговечным и совместимым с портами",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1456 7de845ba304dcd83ff7997603c69f04eafcd282a (merge-base --is-ancestor origin/main exit 0); Durable generation ledger in claim.go; docs card done via PR #1562 fdaadff528, setter wiring is out of scope",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -57,7 +59,8 @@
     {
       "id": "INTG-03",
       "title": "Добавить CRUD расписаний в SQLite и убрать schedules.json",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1460 f0af1c579b4064d6622c5515b629ebac000b63b8 (merge-base --is-ancestor origin/main exit 0); Schedule CRUD over schedules table; adapter wiring is out of scope",
       "phase": "P1",
       "type": "task",
       "owner_files": [

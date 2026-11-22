@@ -39,7 +39,8 @@
     {
       "id": "TUI-02",
       "title": "Собрать единую Bubble Tea модель по снимку и карточкам",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1446 ce5df17be03ad85b332170bdcf1b18d636fe273d (merge-base --is-ancestor origin/main exit 0); Unified Bubble Tea model over snapshot and cards",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -59,7 +60,8 @@
     {
       "id": "TUI-03",
       "title": "Свести два HTTP-клиента к одному контракту",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1453 70f11147cacd980a33a56f709fdbcc2ea1ff1461 (merge-base --is-ancestor origin/main exit 0); One projection contract, budget and ?replay=64 in TUI client",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -99,7 +101,8 @@
     {
       "id": "TUI-05",
       "title": "Связать клавиши оператора с human-decide",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1454 01816965bfae75bd93da91cd75d8e3622302adaa (merge-base --is-ancestor origin/main exit 0); Eight human-decide verbs on control socket",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -119,7 +122,8 @@
     {
       "id": "TUI-06",
       "title": "Провести ребро матрицы и пересобрать гейт после решения владельца",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1111 9becefcca0086917650d757b0151fc33aa4c0bbd (merge-base --is-ancestor origin/main exit 0); cmd -> internal/tui edge, fixture and rebuilt gate binary; WIRING-915 done, no separate TUI-06 PR",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -161,7 +165,8 @@
     {
       "id": "TUI-07B",
       "title": "Eval-отчёт по RSS живого экрана и отсутствию Node.js",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1476 536fb18494db479c47a25abb17b277fab89ed73d (merge-base --is-ancestor origin/main exit 0); Eval report with VmRSS measurements and Node absence",
       "phase": "P1",
       "type": "eval",
       "owner_files": [
@@ -205,7 +210,8 @@
     {
       "id": "TUI-08",
       "title": "Зафиксировать термины и обновить wiring-карточку",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1452 4284487a1a89575074b5c97d07a9f5dc6d0ae05e (merge-base --is-ancestor origin/main exit 0); Glossary terms and WIRING-915 premise updated",
       "phase": "P1",
       "type": "doc",
       "owner_files": [
