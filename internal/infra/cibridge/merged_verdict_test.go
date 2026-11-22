@@ -67,6 +67,31 @@ func TestMergedSnapshotReachesVerdictEngine(t *testing.T) {
 	}
 }
 
+// TestSnapshotForCarriesNoChecksTimeout pins the production path the verdict
+// rule needs: a Watch with a started no-checks window must reach EvaluatePR
+// with both the start instant and the configured timeout.
+func TestSnapshotForCarriesNoChecksTimeout(t *testing.T) {
+	since := time.Unix(1, 0)
+	w := domain.Watch{
+		ID: "watch:refusedguy/beacon:43:abc", Repo: "refusedguy/beacon", PR: 43,
+		HeadSHA: "abc", Status: domain.StatusWatching,
+		NoChecksSince: since, NoChecksTimeout: time.Minute,
+	}
+	obs := ciObservation{pr: domain.PRState{
+		State: "OPEN", HeadRefOid: "abc", Mergeable: "MERGEABLE",
+		MergeStateStatus: "CLEAN", ReviewDecision: "CHANGES_REQUESTED",
+	}}
+	snap := snapshotFor(w, obs, since.Add(2*time.Minute))
+	if !snap.NoChecksSince.Equal(since) || snap.NoChecksTimeout != time.Minute {
+		t.Fatalf("snapshot no-checks window = %v/%v, want %v/%v",
+			snap.NoChecksSince, snap.NoChecksTimeout, since, time.Minute)
+	}
+	verdict, _ := domain.EvaluatePR(snap, w.Policy)
+	if verdict != domain.VerdictTimeout {
+		t.Fatalf("verdict = %q, want timeout", verdict)
+	}
+}
+
 // TestBridgeRefreshClosesWatchOnMergedBatchSnapshot is the end-to-end guard for
 // the live failure: a batch provider reporting MERGED must close the Watch with
 // closeReason=merged, finish the subscriber and deliver no wake.

@@ -355,9 +355,13 @@ type Watch struct {
 	FixBlockerID   string           `json:"fixBlockerID,omitempty"`
 	DeadlineAt     time.Time        `json:"deadlineAt"`
 	NoChecksSince  time.Time        `json:"noChecksSince"`
-	CreatedAt      time.Time        `json:"createdAt"`
-	ClosedAt       time.Time        `json:"closedAt"`
-	CloseReason    string           `json:"closeReason"`
+	// NoChecksTimeout is the window after NoChecksSince without any CI check
+	// during which the no-checks timeout rule fires. Zero disables the rule.
+	// A head-change successor inherits it with the rest of the deadline state.
+	NoChecksTimeout time.Duration `json:"noChecksTimeout,omitempty"`
+	CreatedAt       time.Time     `json:"createdAt"`
+	ClosedAt        time.Time     `json:"closedAt"`
+	CloseReason     string        `json:"closeReason"`
 	// ConfigID records the configuration identity from ADR 0087 at creation
 	// time. Old Watch records carry no value and read back as the zero string.
 	ConfigID string `json:"configId,omitempty"`
