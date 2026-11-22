@@ -17,7 +17,7 @@ func testGraph(t *testing.T, edges ...Edge) *Graph {
 }
 
 func TestEdgeKinds(t *testing.T) {
-	want := []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated}
+	want := []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeSupersedes, EdgeRelated, EdgeWaitsForExternal}
 	got := ValidEdgeKinds()
 	if len(got) != len(want) {
 		t.Fatalf("ValidEdgeKinds = %v, ждали %v", got, want)
@@ -32,6 +32,97 @@ func TestEdgeKinds(t *testing.T) {
 	}
 	if IsValidEdgeKind("conflicts-with") {
 		t.Error("IsValidEdgeKind принял неизвестный тип")
+	}
+}
+
+func TestIsExternalGateTarget(t *testing.T) {
+	cases := []struct {
+		target string
+		want   bool
+	}{
+		{"gh:pr:42", true},
+		{"gh:pr:1", true},
+		{"gh:run:12345678901", true},
+		{"gh:run:abc-def", true},
+		{"timer:5m", true},
+		{"human:owner", true},
+		{"bead:bd-a1b2", true},
+		{"gh:pr:", false},
+		{"gh:pr:abc", false},
+		{"gh:pr:42:extra", false},
+		{"gh:run:", false},
+		{"gh:other:1", false},
+		{"timer:", false},
+		{"human:owner:extra", false},
+		{"T3.1", false},
+		{"gh:pr:42\n", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsExternalGateTarget(tc.target); got != tc.want {
+			t.Errorf("IsExternalGateTarget(%q) = %t, ждали %t", tc.target, got, tc.want)
+		}
+	}
+}
+
+func TestAddEdgeExternalGate(t *testing.T) {
+	cases := []struct{ from, target string }{
+		{"T3.1", "gh:pr:42"},
+		{"T3.2", "gh:run:ID"},
+		{"T3.3", "timer:5m"},
+		{"T3.4", "human:owner"},
+		{"T3.5", "bead:bd-a1b2"},
+	}
+	g := NewGraph()
+	for _, tc := range cases {
+		if err := g.AddEdge(tc.from, tc.target, EdgeWaitsForExternal); err != nil {
+			t.Fatalf("AddEdge(%s, %s): %v", tc.from, tc.target, err)
+		}
+	}
+	if g.Size() != len(cases) {
+		t.Fatalf("Size = %d, ждали %d", g.Size(), len(cases))
+	}
+	tr := g.TraverseAll("T3.1")
+	if len(tr.Edges) != 1 || tr.Edges[0].Kind != EdgeWaitsForExternal || tr.Edges[0].To != "gh:pr:42" {
+		t.Fatalf("обход внешнего гейта: %+v", tr.Edges)
+	}
+	if len(tr.Visited) != 2 || tr.Visited[1] != "gh:pr:42" {
+		t.Fatalf("Visited = %v, ждали gh:pr:42", tr.Visited)
+	}
+}
+
+func TestAddEdgeExternalGateRejectsBadTarget(t *testing.T) {
+	for _, target := range []string{"T3.2", "gh:pr:", "gh:pr:x", "простое слово"} {
+		g := NewGraph()
+		err := g.AddEdge("T3.1", target, EdgeWaitsForExternal)
+		if err == nil {
+			t.Errorf("AddEdge(T3.1, %q) не отклонил", target)
+			continue
+		}
+		if Code(err) != ExitValidation || !strings.Contains(err.Error(), "гейт") {
+			t.Errorf("ошибка = %q, код = %d", err, Code(err))
+		}
+		if g.Size() != 0 {
+			t.Errorf("граф изменён при ошибке: Size = %d", g.Size())
+		}
+	}
+}
+
+func TestAddEdgeExternalGateKeepsCycleRejection(t *testing.T) {
+	g := testGraph(t,
+		Edge{From: "T3.1", To: "gh:pr:42", Kind: EdgeWaitsForExternal},
+		Edge{From: "T3.1", To: "RS-MCP-02", Kind: EdgeBlocks},
+		Edge{From: "RS-MCP-02", To: "WIRING-485", Kind: EdgeDependsOn},
+	)
+	err := g.AddEdge("WIRING-485", "T3.1", EdgeRelated)
+	if err == nil {
+		t.Fatal("цикл через внутренние рёбра не отклонён")
+	}
+	if Code(err) != ExitValidation || !strings.Contains(err.Error(), "цикл") {
+		t.Errorf("ошибка = %q, код = %d", err, Code(err))
+	}
+	if g.Size() != 3 {
+		t.Fatalf("цикл изменил граф: Size = %d", g.Size())
 	}
 }
 
