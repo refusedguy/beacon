@@ -33,7 +33,7 @@ func TestMapSecuritySeverityMatrix(t *testing.T) {
 }
 
 func TestMapSecuritySeverityRejectsUnknown(t *testing.T) {
-	for _, severity := range []securitySeverity{"", "info", "critical ", "CRITICAL", levelError} {
+	for _, severity := range []securitySeverity{"", "info", "critical ", "CRITICAL", "error"} {
 		m, err := mapSecuritySeverity(severity, severityPolicy{})
 		if err == nil {
 			t.Errorf("mapSecuritySeverity(%q): expected an error for an unknown severity", severity)

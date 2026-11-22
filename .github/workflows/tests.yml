@@ -36,6 +36,39 @@ jobs:
       - name: Set up Go
         uses: ./.github/actions/go-runner-setup
 
+      # BL-04. Три модуля обязаны требовать одну версию Go. Расхождение
+      # ловится здесь, а не при сборке гейтов или eval-раннера.
+      - name: Go directives match across modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          root_go=$(awk '$1 == "go" { print $2; exit }' go.mod)
+          gates_go=$(awk '$1 == "go" { print $2; exit }' tools/beacon-gates/go.mod)
+          evals_go=$(awk '$1 == "go" { print $2; exit }' evals/go.mod)
+          printf 'go directives: root=%s gates=%s evals=%s\n' \
+            "$root_go" "$gates_go" "$evals_go"
+          if [ -z "$root_go" ] || [ -z "$gates_go" ] || [ -z "$evals_go" ]; then
+            printf 'missing go directive in one of the modules\n' >&2
+            exit 1
+          fi
+          if [ "$root_go" != "$gates_go" ] || [ "$root_go" != "$evals_go" ]; then
+            printf 'go directive mismatch: root=%s gates=%s evals=%s\n' \
+              "$root_go" "$gates_go" "$evals_go" >&2
+            exit 1
+          fi
+
+      # BL-04. Модуль evals не входит в корневой ./... и имеет build tag eval.
+      # Отдельный шаг делает его тест обязательной проверкой PR.
+      # evals заменяет родительский модуль через replace, поэтому eval-тесты
+      # собирают внутренние пакеты, которым нужны lumberjack.v2 и yaml.v3.
+      # Их сумм нет в evals/go.sum, и -mod=mod даёт go добавить их при прогоне.
+      - name: Test evals module
+        working-directory: evals
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -mod=mod -tags=eval ./...
+
       - name: Build beacon
         shell: bash
         run: |

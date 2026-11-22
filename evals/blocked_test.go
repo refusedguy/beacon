@@ -56,7 +56,7 @@ func TestBlockDecisionContract(t *testing.T) {
 		t.Errorf("resolve did not restore watching: %s/%s, status=%s, reason=%q",
 			resolvedOut.Action, resolvedOut.Reason, resolved.Status, resolved.Reason)
 	}
-	noop, noopOut := applyBlockDecision(w, decisionBlockedResolved, "")
+	_, noopOut := applyBlockDecision(w, decisionBlockedResolved, "")
 	if noopOut.Action != "noop" || noopOut.Reason != "not_blocked" {
 		t.Errorf("resolve on watching = %s/%s, want noop/not_blocked", noopOut.Action, noopOut.Reason)
 	}
