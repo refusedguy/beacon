@@ -403,6 +403,83 @@ func cleanWorkspacePath(path string) (string, error) {
 	return clean, nil
 }
 
+// ---- CCx-14: read-only from the first shell call after resume ----
+//
+// Codex keeps a resumed session read-only until the human approves the first
+// write attempt (codex-rs/exec/tests/suite/resume.rs:746-824). Beacon kept no
+// resume metadata and tied resume to no sandbox mode, so a resumed executor
+// could write on its first shell call. ResumedSession pins the mode to
+// read-only, applies it before each shell call, and lifts it only after
+// approval. Sessions started without a resume never use ResumeSession, so
+// their behaviour does not change.
+
+// ErrReadOnlyResume marks a write refused because a resumed session has not
+// been approved. It wraps ErrSandboxDenied so a caller can classify the refusal
+// either as a resume gate or as a sandbox denial.
+var ErrReadOnlyResume = fmt.Errorf("%w: resumed session is read-only until approval", ErrSandboxDenied)
+
+// ResumedSession is the metadata Beacon keeps for one resumed session and the
+// gate applied to its re-execution. Mode is read-only until Approve is called.
+// The denials and writes counters are runtime diagnostics, not serialized
+// metadata.
+type ResumedSession struct {
+	ID       string      `json:"id"`
+	Mode     SandboxMode `json:"mode"`
+	Approved bool        `json:"approved"`
+	denials  int
+	writes   int
+}
+
+// ResumeSession builds the metadata for a resumed session. The mode is pinned
+// to read-only whatever restriction the earlier run used, so the first shell
+// call of the re-execution cannot write to disk.
+func ResumeSession(id string) *ResumedSession {
+	return &ResumedSession{ID: id, Mode: SandboxReadOnly}
+}
+
+// ReadOnly reports whether the re-execution still refuses writes.
+func (s *ResumedSession) ReadOnly() bool {
+	return s.Mode == SandboxReadOnly && !s.Approved
+}
+
+// Sandbox returns the restriction applied before each shell call. Approval
+// lifts the read-only window. Protected paths stay denied in both modes.
+func (s *ResumedSession) Sandbox() SandboxPolicy {
+	if s.Approved {
+		return SandboxPolicy{Mode: SandboxDangerFullAccess}
+	}
+	return SandboxPolicy{Mode: s.Mode}
+}
+
+// Approve records human approval on the session metadata and lifts the
+// read-only window. Writes in later shell calls are allowed.
+func (s *ResumedSession) Approve() {
+	s.Approved = true
+}
+
+// BeforeShellCall applies the resumed session's mode before a shell call
+// writes path. While the window is active it returns ErrReadOnlyResume and
+// counts one denial without writing. After approval a passing check counts one
+// write. SandboxPolicy.CheckWrite still denies protected paths after approval.
+func (s *ResumedSession) BeforeShellCall(path string) error {
+	check := s.Sandbox().CheckWrite(path)
+	if check.Allowed {
+		s.writes++
+		return nil
+	}
+	if s.ReadOnly() {
+		s.denials++
+		return fmt.Errorf("%w: write %q: %s", ErrReadOnlyResume, path, check.Reason)
+	}
+	return fmt.Errorf("%w: write %q: %s", ErrSandboxDenied, path, check.Reason)
+}
+
+// Denials returns the number of writes refused in the read-only window.
+func (s *ResumedSession) Denials() int { return s.denials }
+
+// Writes returns the number of writes that passed the gate.
+func (s *ResumedSession) Writes() int { return s.writes }
+
 // ---- CC-03: declarative approval policy ----
 //
 // Beacon replaces the single approval bool with five categories, a small
