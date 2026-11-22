@@ -18,7 +18,9 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/registry"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 	"github.com/refusedguy/beacon/internal/infra/wake"
 )
 
@@ -974,12 +976,15 @@ func autoSpawnCountingSpawner(calls *int, ids *[]string) *autoSpawner {
 	}}
 }
 
-// TestReconcileAutoSpawnNoFreeSlot proves that a full slot budget starts no
-// agent even when a todo card is queued.
+// TestReconcileAutoSpawnNoFreeSlot proves that twelve live cards exhaust the
+// configured budget and start no agent even when a todo card is queued.
 func TestReconcileAutoSpawnNoFreeSlot(t *testing.T) {
-	db := autoSpawnTestDB(t, domain.DefaultSlotsTotal)
+	db := autoSpawnTestDB(t, 0)
 	defer db.Close()
 	root := autoSpawnTestRoot(t)
+	for i := 0; i < registry.DefaultSlotBudget; i++ {
+		autoSpawnTestCard(t, root, fmt.Sprintf("T8.%02d", i), "in_progress", fmt.Sprintf("internal/worker/%02d.go", i))
+	}
 	autoSpawnTestCard(t, root, "T9.1", "todo", "cmd/beacon/mcp.go")
 	calls, ids := 0, []string{}
 	cfg := reconcileConfig{db: db, root: root}
@@ -1062,6 +1067,113 @@ func TestReconcilePassCallsAutoSpawnOnce(t *testing.T) {
 	ReconcilePass(context.Background(), cfg)
 	if calls != 1 || len(ids) != 1 || ids[0] != "T9.1" {
 		t.Fatalf("spawn calls = %d, ids = %#v, want one call for T9.1", calls, ids)
+	}
+}
+
+// TestAutoSpawnSlotsUsedCountsLiveCards proves that live cards occupy slots
+// even when there are no watches at all.
+func TestAutoSpawnSlotsUsedCountsLiveCards(t *testing.T) {
+	cards := make([]taskstore.Card, 5)
+	for i := range cards {
+		cards[i] = taskstore.Card{ID: fmt.Sprintf("L-%d", i), Status: "in_progress"}
+	}
+	if got := autoSpawnSlotsUsed(cards, 0); got != 5 {
+		t.Fatalf("slotsUsed = %d, want 5", got)
+	}
+}
+
+// TestAutoSpawnSlotsUsedCountsLiveTokens proves a live slot token occupies a
+// slot and does not double count a card held by the same agent.
+func TestAutoSpawnSlotsUsedCountsLiveTokens(t *testing.T) {
+	cards := []taskstore.Card{
+		{ID: "L-1", Status: "in_progress"},
+		{ID: "L-2", Status: "reserved"},
+	}
+	if got := autoSpawnSlotsUsed(cards, 6); got != 6 {
+		t.Fatalf("slotsUsed = %d, want 6", got)
+	}
+}
+
+// TestAutoSpawnSlotTotalFromConfig proves the budget comes from SL-01 config
+// instead of the old hardcoded four.
+func TestAutoSpawnSlotTotalFromConfig(t *testing.T) {
+	root := autoSpawnTestRoot(t)
+	if got := autoSpawnSlotTotal(root); got != registry.DefaultSlotBudget {
+		t.Fatalf("default budget = %d, want %d", got, registry.DefaultSlotBudget)
+	}
+	dir := filepath.Join(root, registryConfigDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "schema: beacon.agent-registry/v2\nlimits:\n  max_concurrent_agents: 14\n"
+	if err := os.WriteFile(filepath.Join(dir, registryConfigFile), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := autoSpawnSlotTotal(root); got != 14 {
+		t.Fatalf("configured budget = %d, want 14", got)
+	}
+}
+
+// TestReconcileAutoSpawnNeedsTerminalToken proves that without a live
+// report_to_orchestrator token no agent starts, and one token opens one slot.
+func TestReconcileAutoSpawnNeedsTerminalToken(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "todo", "cmd/beacon/mcp.go")
+	tokens := 0
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root, gate: &autoSpawnGate{
+		liveTokens: func() int { return tokens },
+	}}
+	sp := autoSpawnCountingSpawner(&calls, &ids)
+	if n := reconcileAutoSpawn(context.Background(), cfg, sp); n != 0 || calls != 0 {
+		t.Fatalf("no token: started = %d, calls = %d, want 0", n, calls)
+	}
+	tokens = 1
+	if n := reconcileAutoSpawn(context.Background(), cfg, sp); n != 1 || calls != 1 {
+		t.Fatalf("live token: started = %d, calls = %d, want 1", n, calls)
+	}
+}
+
+// TestReconcileAutoSpawnRespectsMainBlocker proves a failed required check on
+// main closes the gate while an informational check does not.
+func TestReconcileAutoSpawnRespectsMainBlocker(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "todo", "cmd/beacon/mcp.go")
+	blocked := true
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root, gate: &autoSpawnGate{
+		liveTokens:  func() int { return 1 },
+		mainBlocked: func() (bool, error) { return blocked, nil },
+	}}
+	sp := autoSpawnCountingSpawner(&calls, &ids)
+	if n := reconcileAutoSpawn(context.Background(), cfg, sp); n != 0 || calls != 0 {
+		t.Fatalf("required check failed: started = %d, calls = %d, want 0", n, calls)
+	}
+	blocked = false
+	if n := reconcileAutoSpawn(context.Background(), cfg, sp); n != 1 || calls != 1 {
+		t.Fatalf("informational check: started = %d, calls = %d, want 1", n, calls)
+	}
+}
+
+// TestReconcileAutoSpawnPrefersDeferredWiring proves a WIRING card wins over
+// an ordinary todo card that sorts earlier by id.
+func TestReconcileAutoSpawnPrefersDeferredWiring(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "AAA-1", "todo", "cmd/beacon/mcp.go")
+	autoSpawnTestCard(t, root, "WIRING-1608", "todo", "cmd/beacon/main.go")
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root}
+	if n := reconcileAutoSpawn(context.Background(), cfg, autoSpawnCountingSpawner(&calls, &ids)); n != 1 {
+		t.Fatalf("started = %d, want 1", n)
+	}
+	if len(ids) != 1 || ids[0] != "WIRING-1608" {
+		t.Fatalf("ids = %#v, want WIRING-1608", ids)
 	}
 }
 

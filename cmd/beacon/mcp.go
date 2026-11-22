@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/registry"
 	"github.com/refusedguy/beacon/internal/infra/server"
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
@@ -1553,6 +1555,19 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		resolver:   resolver,
 		events:     events,
 		autoSpawn:  &autoSpawner{start: autoSpawnStartSession},
+		gate: &autoSpawnGate{
+			// A stored blocker comes from a failed required check. Informational
+			// checks (required: false) never create one, so they do not close the
+			// gate. The live-token source is issued by the daemon slot ledger and
+			// is wired by the follow-up WIRING card.
+			mainBlocked: func() (bool, error) {
+				blockers, err := db.ActiveBlockers()
+				if err != nil {
+					return false, err
+				}
+				return len(blockers) > 0, nil
+			},
+		},
 	}
 
 	// Only the owner of the non-blocking poller lock starts the single
@@ -1775,6 +1790,19 @@ type reconcileConfig struct {
 	// next queued card. A nil spawner leaves the cycle unchanged. Only the MCP
 	// process assembles a config with one; daemon and up leave it nil.
 	autoSpawn *autoSpawner
+	// gate supplies the two signals that open a spawn slot: a live token from
+	// a report_to_orchestrator terminal signal and a green main branch. A nil
+	// gate or nil function leaves that check unset.
+	gate *autoSpawnGate
+}
+
+// autoSpawnGate is the decision input for one auto-spawn. liveTokens counts
+// slot tokens opened by report_to_orchestrator that are still live. A spawn
+// needs at least one. mainBlocked reports a failed required check on the base
+// branch; informational checks (required: false) do not set it.
+type autoSpawnGate struct {
+	liveTokens  func() int
+	mainBlocked func() (bool, error)
 }
 
 // autoSpawner starts one agent for one selected card. start returns true when
@@ -2157,31 +2185,84 @@ func reconcileMaintenance(ctx context.Context, cfg reconcileConfig) {
 	}
 }
 
+// autoSpawnSlotTotal reads the configured parallel-slot budget (SL-01) from
+// the project's agents.yaml. A missing config or a malformed value falls back
+// to the documented default. The old hardcoded four never reached this code.
+func autoSpawnSlotTotal(root string) int {
+	rc, err := findRegistryConfig(root)
+	if err != nil {
+		return registry.DefaultSlotBudget
+	}
+	configured, err := slotBudgetFromConfig(rc.Path)
+	if err != nil {
+		observe.ActorError("auto-spawn-slot-budget", "", err)
+		return registry.DefaultSlotBudget
+	}
+	total, err := registry.ResolveSlotBudget(configured)
+	if err != nil {
+		observe.ActorError("auto-spawn-slot-budget", "", err)
+		return registry.DefaultSlotBudget
+	}
+	return total
+}
+
+// autoSpawnSlotsUsed counts occupied slots from live work. A Watch is a PR
+// signal, not an agent, so it is not counted. Live cards and live slot tokens
+// both occupy a slot; the larger count wins so one agent is not counted twice.
+func autoSpawnSlotsUsed(cards []taskstore.Card, liveTokens int) int {
+	liveCards := 0
+	for _, c := range cards {
+		if c.Status == "in_progress" || c.Status == "reserved" {
+			liveCards++
+		}
+	}
+	if liveTokens > liveCards {
+		return liveTokens
+	}
+	return liveCards
+}
+
+// autoSpawnSourceRank orders candidate cards by source. Deferred wiring wins,
+// then the card index and graph, then owner questions.
+func autoSpawnSourceRank(id string) int {
+	switch {
+	case strings.HasPrefix(id, "WIRING-"):
+		return 0
+	case strings.HasPrefix(id, "Q-"), strings.HasPrefix(id, "OWNER-"):
+		return 2
+	default:
+		return 1
+	}
+}
+
+func autoSpawnGateIncident(kind, cardID, detail string) {
+	observe.Event(observe.LevelWarn, "auto_spawn_gate", observe.Fields{
+		"kind": kind, "card": cardID, "detail": detail,
+	})
+}
+
 // reconcileAutoSpawn is the minimal slot spawner. One pass starts at most one
-// agent: it needs a free slot from the bridge's live watches and a todo card
-// whose OwnerFiles are not held by an in_progress card. The slot and file
-// decisions come from the AUTOSP-06 admission gate, so the existing reconcile
-// ports decide admission and this helper only selects the card and calls the
-// spawn seam. It returns the number of agents started (0 or 1).
+// agent: it needs a free slot measured in live cards and slot tokens, a live
+// terminal signal, a green main branch and a todo card whose OwnerFiles are not
+// held by an in_progress card. Slot and file admission still come from the
+// AUTOSP-06 gate. It returns the number of agents started (0 or 1).
 func reconcileAutoSpawn(ctx context.Context, cfg reconcileConfig, sp *autoSpawner) int {
 	if sp == nil || sp.start == nil || cfg.db == nil || cfg.root == "" {
 		return 0
 	}
-	watches, err := cfg.db.LiveWatches()
-	if err != nil {
-		observe.ActorError("auto-spawn-live-watches", "", err)
-		return 0
-	}
-	// The domain cap is the default concurrency budget. Live watches are the
-	// slots already taken by running agents.
-	slotsUsed, slotsTotal := len(watches), domain.DefaultSlotsTotal
-
 	tasksDir := filepath.Join(cfg.root, "docs", "tasks")
 	cards, err := taskstore.LoadCards(tasksDir)
 	if err != nil {
 		observe.ActorError("auto-spawn-cards", "", err)
 		return 0
 	}
+
+	liveTokens := 0
+	if cfg.gate != nil && cfg.gate.liveTokens != nil {
+		liveTokens = cfg.gate.liveTokens()
+	}
+	slotsUsed := autoSpawnSlotsUsed(cards, liveTokens)
+	slotsTotal := autoSpawnSlotTotal(cfg.root)
 
 	// Cards in progress hold their files. A todo candidate that touches one of
 	// them cannot take a slot this pass.
@@ -2194,9 +2275,11 @@ func reconcileAutoSpawn(ctx context.Context, cfg reconcileConfig, sp *autoSpawne
 			Name: c.ID, Files: c.OwnerFiles, Status: c.Status,
 		})
 	}
-	var candidate *taskstore.Card
+	// Collect every eligible card, then order by source and ID. The first card
+	// is the one spawn this pass may start.
+	candidates := make([]taskstore.Card, 0, len(cards))
 	for i := range cards {
-		c := &cards[i]
+		c := cards[i]
 		if c.Status != "todo" || len(c.OwnerFiles) == 0 {
 			continue
 		}
@@ -2209,12 +2292,40 @@ func reconcileAutoSpawn(ctx context.Context, cfg reconcileConfig, sp *autoSpawne
 			}
 		}
 		if !conflict {
-			candidate = c
-			break
+			candidates = append(candidates, c)
 		}
 	}
-	if candidate == nil {
+	if len(candidates) == 0 {
 		return 0
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		ri, rj := autoSpawnSourceRank(candidates[i].ID), autoSpawnSourceRank(candidates[j].ID)
+		if ri != rj {
+			return ri < rj
+		}
+		return candidates[i].ID < candidates[j].ID
+	})
+	candidate := &candidates[0]
+
+	// A slot opens only on a live report_to_orchestrator token and a main
+	// branch without a failed required check. A nil gate function leaves that
+	// signal unset; a configured function that refuses closes the gate.
+	if cfg.gate != nil {
+		if cfg.gate.liveTokens != nil && liveTokens <= 0 {
+			autoSpawnGateIncident("no_terminal_token", candidate.ID, "no live report_to_orchestrator slot token")
+			return 0
+		}
+		if cfg.gate.mainBlocked != nil {
+			blocked, err := cfg.gate.mainBlocked()
+			if err != nil {
+				observe.ActorError("auto-spawn-main-check", candidate.ID, err)
+				return 0
+			}
+			if blocked {
+				autoSpawnGateIncident("main_blocked", candidate.ID, "required check failed on main")
+				return 0
+			}
+		}
 	}
 
 	q := github.NewPreflightGuard(cfg.counter).Check(ctx)
@@ -2228,6 +2339,7 @@ func reconcileAutoSpawn(ctx context.Context, cfg reconcileConfig, sp *autoSpawne
 		})...,
 	)
 	if !decision.Allowed {
+		autoSpawnGateIncident("launch_denied", candidate.ID, decision.Reason)
 		observe.ActorError("auto-spawn-denied", candidate.ID, errors.New(decision.Reason))
 		return 0
 	}
