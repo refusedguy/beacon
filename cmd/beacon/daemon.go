@@ -28,6 +28,48 @@ import (
 // adaptive github.Interval unless --interval is given explicitly.
 const daemonIntervalEnv = "BEACON_DAEMON_INTERVAL"
 
+// daemonIntervalDefault is the value passed to --interval when the flag is
+// absent. Zero selects the adaptive cadence from github.Interval: 10s while a
+// Watch changed recently, 30s once it is quiet.
+const daemonIntervalDefault = 0
+
+// daemonIntervalDescription is the single description of that default. The
+// flag help and the CLI usage text reuse it, and README.md mirrors it.
+const daemonIntervalDescription = "0 = адаптивный 10s/30s"
+
+// daemonActorErrorCount reads the actor error counter of the process. The
+// reconciler reports a failed pass through observe.ActorError instead of a
+// return value, so a rising counter is the observable signal of that failure.
+func daemonActorErrorCount() uint64 {
+	metrics := observe.MetricsOf(observe.Default())
+	if metrics == nil {
+		return 0
+	}
+	var snapshot map[string]json.RawMessage
+	if err := json.Unmarshal(metrics.SnapshotJSON(), &snapshot); err != nil {
+		return 0
+	}
+	raw, ok := snapshot[observe.CounterActorErrors]
+	if !ok {
+		return 0
+	}
+	var count uint64
+	if err := json.Unmarshal(raw, &count); err != nil {
+		return 0
+	}
+	return count
+}
+
+// daemonOnceExitCode turns the actor error counts around one pass into a
+// process exit code. New actor errors mean the pass failed, so the command
+// exits with code 1 instead of hiding the failure behind a zero.
+func daemonOnceExitCode(before, after uint64) int {
+	if after > before {
+		return 1
+	}
+	return 0
+}
+
 // daemonRunner holds the command implementation so dispatch stays a one-line
 // wiring change and tests can replace it like the other commands.
 var daemonRunner = func(c *CLI, args []string) int { return runDaemon(c, args) }
@@ -316,12 +358,14 @@ func runDaemonReminders(ctx context.Context, db *store.DB, interval time.Duratio
 	orchestrator.RunNotifyLoop(ctx, daemonReminderNotify(notifier), interval)
 }
 
-// runDaemon implements `beacon daemon [--interval 3m] [--once]`. It runs the
-// same single cibridge cycle `beacon mcp` uses, under the same non-blocking
-// poller lock, so starting both processes cannot produce duplicate wakes.
+// runDaemon implements `beacon daemon`. The pass interval uses
+// daemonIntervalDefault and daemonIntervalDescription, so the flag and the
+// CLI usage text describe the same value. It runs the same single cibridge
+// cycle `beacon mcp` uses, under the same non-blocking poller lock, so
+// starting both processes cannot produce duplicate wakes.
 func runDaemon(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("daemon", flag.ContinueOnError)
-	interval := fs.Duration("interval", 0, "интервал прохода (0 = адаптивный 10s/30s)")
+	interval := fs.Duration("interval", daemonIntervalDefault, "интервал прохода ("+daemonIntervalDescription+")")
 	once := fs.Bool("once", false, "выполнить один проход и выйти")
 	if !parseFlags("daemon", args, c.errOut, fs) {
 		return 2
@@ -392,12 +436,13 @@ func runDaemon(c *CLI, args []string) int {
 		if err := daemonHeartbeat(hb, sessionID); err != nil {
 			fmt.Fprintf(c.errOut, "beacon daemon: heartbeat: %v\n", err)
 		}
+		errorsBefore := daemonActorErrorCount()
 		daemonPollCards(ctx, cardMonitor, db, root)
 		ReconcilePass(ctx, cfg)
 		if err := daemonReminderNotify(tasks.NewNotifier(daemonReminderStore(db), time.Now))(ctx); err != nil {
 			observe.ActorError("reminder", "", err)
 		}
-		return 0
+		return daemonOnceExitCode(errorsBefore, daemonActorErrorCount())
 	}
 
 	stopLoop, err := runReconciler(ctx, cfg)

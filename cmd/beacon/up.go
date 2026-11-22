@@ -219,9 +219,10 @@ func runUp(c *CLI, args []string) int {
 	defer stopLoop()
 
 	if *once {
+		errorsBefore := daemonActorErrorCount()
 		ReconcilePass(ctx, cfg)
 		fmt.Fprint(c.out, renderUpStatus(ctx, status))
-		return 0
+		return daemonOnceExitCode(errorsBefore, daemonActorErrorCount())
 	}
 
 	fmt.Fprintf(c.out, "beacon up: telegram=%s ntfy=%s channels=%s interval=%s\n",

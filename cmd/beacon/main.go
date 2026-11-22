@@ -46,7 +46,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon registry check --config <file>
   beacon deliver <watchID>
   beacon ci check --all [--dry-run] [--repo owner/name] [--format table|json]
-  beacon daemon [--interval 10s|30s] [--once]
+  beacon daemon [--interval ` + daemonIntervalDescription + `] [--once]
   beacon gc [--format table|json] [--apply]
   beacon gc-worktree [--format table|json] [--apply]
   beacon init [--root <dir>] [--force]
