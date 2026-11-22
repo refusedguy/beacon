@@ -55,6 +55,20 @@ const (
 	defaultOTLPTimeout   = 2 * time.Second
 	defaultFlushInterval = 5 * time.Second
 	maxResponseDrain     = 1 << 20
+
+	// Check telemetry uses a fixed key vocabulary and short token values. A
+	// path carries '/', an environment assignment carries '=' and error text
+	// carries spaces, so none of them can pass the token rule below.
+	maxCheckTagLen = 64
+)
+
+// Names of the tags that describe one check. Policy and result are the bounded
+// inputs; an error becomes an outcome token instead of a message.
+const (
+	TagCheckPolicy  = "check.policy"
+	TagCheckResult  = "check.result"
+	TagCheckOutcome = "check.outcome"
+	TagCheckReason  = "check.reason"
 )
 
 // ParseBoolEnv reports whether a boolean environment value is truthy. Every
@@ -92,6 +106,98 @@ type Attr struct {
 
 // String builds a string attribute.
 func String(key, value string) Attr { return Attr{Key: key, Value: value} }
+
+// checkTagKeys is the complete key vocabulary of check telemetry. A caller
+// cannot grow the series with a dynamic key.
+var checkTagKeys = map[string]bool{
+	TagCheckPolicy:            true,
+	TagCheckResult:            true,
+	TagCheckOutcome:           true,
+	TagCheckReason:            true,
+	"beacon.component":        true,
+	"beacon.adapter":          true,
+	"beacon.watch_id":         true,
+	"hook.event_name":         true,
+	"hook.phase":              true,
+	"obligation_id":           true,
+	"process.executable.name": true,
+	"watchID":                 true,
+}
+
+// boundedTagValue accepts short tokens made of letters, digits and a few
+// separators. Paths, environment assignments and free-form error text all use
+// a character outside this set.
+func boundedTagValue(s string) bool {
+	if s == "" || len(s) > maxCheckTagLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
+			c == '.', c == '_', c == '-', c == ':', c == '@':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// BoundCheckTags keeps only known keys with bounded string values. It returns a
+// new map, so the caller's fields are never changed.
+func BoundCheckTags(fields Fields) Fields {
+	out := Fields{}
+	for key, value := range fields {
+		if !checkTagKeys[key] {
+			continue
+		}
+		s, ok := value.(string)
+		if !ok || !boundedTagValue(s) {
+			continue
+		}
+		out[key] = s
+	}
+	return out
+}
+
+// CheckTelemetry builds the low-cardinality fields of one check. The error is
+// reduced to an outcome token, so its text never reaches a metric.
+func CheckTelemetry(policy, result, reason string, err error) Fields {
+	outcome := "ok"
+	if err != nil {
+		outcome = "error"
+	}
+	return BoundCheckTags(Fields{
+		TagCheckPolicy:  policy,
+		TagCheckResult:  result,
+		TagCheckOutcome: outcome,
+		TagCheckReason:  reason,
+	})
+}
+
+// boundedAttrs drops attributes whose key or value is not a bounded token. It
+// runs where spans are serialized, so the JSON and protobuf exporters and the
+// local log sink share one rule.
+func boundedAttrs(in []Attr) []Attr {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Attr, 0, len(in))
+	for _, a := range in {
+		if !boundedTagValue(a.Key) || !boundedTagValue(a.Value) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func boundedSpanName(name string) string {
+	if boundedTagValue(name) {
+		return name
+	}
+	return "beacon.check"
+}
 
 // Hook phase names mirror the event bus subtypes. They are written as span
 // attributes so an observer can reconstruct hook order from spans alone.
@@ -306,12 +412,12 @@ func sinkFromConfig(cfg Config) SpanSink {
 		return observeSink{}
 	}
 	if normalizeProtocol(cfg.Protocol) == ProtocolGRPC {
-		logOTLPFallback("grpc needs an external gRPC dependency", nil)
+		logOTLPFallback("grpc-unsupported", nil)
 		return observeSink{}
 	}
 	exp, err := NewOTLPExporter(OTLPConfig{Endpoint: cfg.Endpoint, Protocol: cfg.Protocol})
 	if err != nil {
-		logOTLPFallback("cannot create OTLP exporter", err)
+		logOTLPFallback("exporter-create-failed", err)
 		return observeSink{}
 	}
 	activeExporterMu.Lock()
@@ -321,11 +427,8 @@ func sinkFromConfig(cfg Config) SpanSink {
 }
 
 func logOTLPFallback(reason string, err error) {
-	fields := Fields{"reason": reason}
-	if err != nil {
-		fields["error"] = err.Error()
-	}
-	Default().Log(LevelWarn, "otel.local_fallback", fields)
+	Default().Log(LevelWarn, "otel.local_fallback",
+		CheckTelemetry("otel", "local_fallback", reason, err))
 }
 
 func (t *traceTracer) Start(ctx context.Context, name string, attrs ...Attr) (context.Context, func()) {
@@ -391,7 +494,7 @@ type observeSink struct{}
 
 func (observeSink) Emit(s Span) {
 	fields := Fields{
-		"span.name":   s.Name,
+		"span.name":   boundedSpanName(s.Name),
 		"trace.id":    hex.EncodeToString(s.Ctx.TraceID[:]),
 		"span.id":     hex.EncodeToString(s.Ctx.SpanID[:]),
 		"duration.us": s.Duration().Microseconds(),
@@ -399,7 +502,7 @@ func (observeSink) Emit(s Span) {
 	if !allZero(s.ParentSpanID[:]) {
 		fields["parent.id"] = hex.EncodeToString(s.ParentSpanID[:])
 	}
-	for _, a := range s.Attrs {
+	for _, a := range boundedAttrs(s.Attrs) {
 		fields[a.Key] = a.Value
 	}
 	Default().Log(LevelInfo, "otel.span", fields)
@@ -516,7 +619,7 @@ func (e *OTLPExporter) runFlusher() {
 			return
 		case <-ticker.C:
 			if err := e.Flush(context.Background()); err != nil {
-				logOTLPFallback("scheduled flush failed", err)
+				logOTLPFallback("scheduled-flush-failed", err)
 			}
 		}
 	}
@@ -547,7 +650,7 @@ func (e *OTLPExporter) Emit(s Span) {
 	e.mu.Unlock()
 	if full {
 		if err := e.Flush(context.Background()); err != nil {
-			logOTLPFallback("flush on full batch failed", err)
+			logOTLPFallback("full-batch-flush-failed", err)
 		}
 	}
 }
@@ -686,6 +789,7 @@ type otlpJSONAnyValue struct {
 
 func otlpJSONRequestFromSpans(spans []Span) otlpJSONRequest {
 	attrs := func(in []Attr) []otlpJSONKeyValue {
+		in = boundedAttrs(in)
 		if len(in) == 0 {
 			return nil
 		}
@@ -704,7 +808,7 @@ func otlpJSONRequestFromSpans(spans []Span) otlpJSONRequest {
 		js := otlpJSONSpan{
 			TraceID:    hex.EncodeToString(s.Ctx.TraceID[:]),
 			SpanID:     hex.EncodeToString(s.Ctx.SpanID[:]),
-			Name:       s.Name,
+			Name:       boundedSpanName(s.Name),
 			StartTime:  strconv.FormatInt(s.Start.UnixNano(), 10),
 			EndTime:    strconv.FormatInt(s.End.UnixNano(), 10),
 			Attributes: attrs(s.Attrs),
@@ -759,10 +863,10 @@ func protoSpan(s Span) []byte {
 	if !allZero(s.ParentSpanID[:]) {
 		b = appendProtoBytes(b, 4, s.ParentSpanID[:])
 	}
-	b = appendProtoString(b, 5, s.Name)
+	b = appendProtoString(b, 5, boundedSpanName(s.Name))
 	b = appendProtoFixed64(b, 7, uint64(s.Start.UnixNano()))
 	b = appendProtoFixed64(b, 8, uint64(s.End.UnixNano()))
-	for _, a := range s.Attrs {
+	for _, a := range boundedAttrs(s.Attrs) {
 		b = appendProtoBytes(b, 9, protoStringAttr(a.Key, a.Value))
 	}
 	status := appendProtoKey(nil, 3, 0)
