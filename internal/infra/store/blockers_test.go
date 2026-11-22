@@ -296,6 +296,62 @@ func TestResolveBlockersByBaseGreen(t *testing.T) {
 	}
 }
 
+// TestResolveBlockersByBaseGreenLegacyEmptyBaseRef pins the legacy read path:
+// incidents written before base_ref was recorded use an empty string, while
+// baseRefOf maps the Watch base to main. Resolving a green main must close them.
+func TestResolveBlockersByBaseGreenLegacyEmptyBaseRef(t *testing.T) {
+	d := openControlPlaneTestDB(t)
+	now := time.Now().UTC()
+
+	legacy, _, err := d.GetOrCreateOpenBlocker("org/repo", "", []string{"build"}, "w-legacy", now)
+	if err != nil {
+		t.Fatalf("legacy blocker: %v", err)
+	}
+	stale, _, err := d.GetOrCreateOpenBlocker("org/repo", "main", []string{"gates"}, "w-stale", now)
+	if err != nil {
+		t.Fatalf("stale blocker: %v", err)
+	}
+	for _, w := range []domain.Watch{
+		{
+			ID: "w-legacy", Status: domain.StatusBlocked, Verdict: domain.VerdictBlocked,
+			BlockerID: legacy.ID,
+			Blocked:   &domain.BlockedInfo{Reason: domain.BlockReasonBaseChecksFailed, FailedChecks: []string{"build"}},
+		},
+		{
+			ID: "w-stale", Status: domain.StatusBlocked, Verdict: domain.VerdictBlocked,
+			BlockerID: stale.ID,
+			Blocked:   &domain.BlockedInfo{Reason: domain.BlockReasonBaseChecksFailed, FailedChecks: []string{"gates"}},
+		},
+	} {
+		if err := d.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch(%s): %v", w.ID, err)
+		}
+	}
+
+	resolved, err := d.ResolveBlockersByBaseGreen("org/repo", "main", map[string]bool{"gates": true}, now)
+	if err != nil {
+		t.Fatalf("ResolveBlockersByBaseGreen: %v", err)
+	}
+	if len(resolved) != 1 || resolved[0].ID != legacy.ID {
+		t.Fatalf("resolved = %+v, want only the legacy incident %s", resolved, legacy.ID)
+	}
+	active, err := d.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers: %v", err)
+	}
+	if len(active) != 1 || active[0].ID != stale.ID {
+		t.Fatalf("ActiveBlockers = %+v, want the still-red incident %s", active, stale.ID)
+	}
+	got, err := d.Watch("w-legacy")
+	if err != nil {
+		t.Fatalf("Watch(w-legacy): %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Blocked != nil || got.BlockerID != "" {
+		t.Fatalf("w-legacy = status %q, blocked %v, blockerID %q; want watching/nil/empty",
+			got.Status, got.Blocked, got.BlockerID)
+	}
+}
+
 // TestBlockerSignatureIgnoresInformationalChecks pins the signature rule: e2e
 // and ci-provider-probe run with continue-on-error, so they must not open a
 // second incident or keep an incident open when only they fail on base.

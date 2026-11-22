@@ -480,9 +480,10 @@ func blockedTestWatch(id string, pr int, subscribers ...domain.Subscriber) domai
 	}
 }
 
-// TestBridgeSkipsBlockedWatch proves that Refresh neither polls CI nor
-// publishes a retry for a blocked Watch, so the executor is never woken with a
-// false retry. The Watch must be read from the real store, whose ActiveWatches
+// TestBridgeSkipsBlockedWatch proves that Refresh polls CI for a blocked Watch
+// but publishes no retry, so the executor is never woken with a false retry.
+// The CI observation is needed to release the incident when the base turns
+// green. The Watch must be read from the real store, whose ActiveWatches
 // excludes StatusBlocked: the bridge has to observe it anyway.
 func TestBridgeSkipsBlockedWatch(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -507,8 +508,8 @@ func TestBridgeSkipsBlockedWatch(t *testing.T) {
 	if got := b.Refresh(context.Background()); got != 0 {
 		t.Fatalf("Refresh updated %d watches, want 0 for a blocked Watch", got)
 	}
-	if ci.calls != 0 {
-		t.Fatalf("CI polled %d times for a blocked Watch, want 0", ci.calls)
+	if ci.calls != 1 {
+		t.Fatalf("CI polled %d times for a blocked Watch, want 1 for base-green observation", ci.calls)
 	}
 	if got := len(waker.deliveries); got != 0 {
 		t.Fatalf("executor received %d wakes, want 0", got)
@@ -620,8 +621,8 @@ func TestBridgeResumesPollingAfterUnblock(t *testing.T) {
 	b := New(db, ci, fixedClock{at: time.Unix(2, 0)}, time.Second).WithWaker(waker)
 	ctx := context.Background()
 
-	if got := b.Refresh(ctx); got != 0 || ci.calls != 0 {
-		t.Fatalf("blocked tick: updated=%d ciCalls=%d, want 0/0", got, ci.calls)
+	if got := b.Refresh(ctx); got != 0 || ci.calls != 1 {
+		t.Fatalf("blocked tick: updated=%d ciCalls=%d, want 0/1", got, ci.calls)
 	}
 
 	current, err := db.Watch(w.ID)
@@ -639,8 +640,8 @@ func TestBridgeResumesPollingAfterUnblock(t *testing.T) {
 	if got := b.Refresh(ctx); got != 1 {
 		t.Fatalf("Refresh after unblock updated %d watches, want 1", got)
 	}
-	if ci.calls != 1 {
-		t.Fatalf("CI polled %d times after unblock, want 1", ci.calls)
+	if ci.calls != 2 {
+		t.Fatalf("CI polled %d times after unblock, want 2 (blocked tick plus unblocked tick)", ci.calls)
 	}
 	got, err := db.Watch(w.ID)
 	if err != nil {
@@ -779,8 +780,8 @@ func TestBridgeUnblocksSourceOnFixerMerge(t *testing.T) {
 	if got.Revision != source.Revision+1 {
 		t.Fatalf("source revision = %d, want %d", got.Revision, source.Revision+1)
 	}
-	if ci.calls[60] != 0 {
-		t.Fatalf("source CI polled %d times in the merge tick, want 0", ci.calls[60])
+	if ci.calls[60] != 1 {
+		t.Fatalf("source CI polled %d times in the merge tick, want 1 for base-green observation", ci.calls[60])
 	}
 	fixed, err := db.Watch(fixerID)
 	if err != nil {
@@ -794,8 +795,8 @@ func TestBridgeUnblocksSourceOnFixerMerge(t *testing.T) {
 	if got := b.Refresh(ctx); got != 1 {
 		t.Fatalf("second Refresh updated %d watches, want 1", got)
 	}
-	if ci.calls[60] != 1 {
-		t.Fatalf("source CI polled %d times after unblock, want 1", ci.calls[60])
+	if ci.calls[60] != 2 {
+		t.Fatalf("source CI polled %d times after unblock, want 2 (merge tick plus polling tick)", ci.calls[60])
 	}
 	got, err = db.Watch(sourceID)
 	if err != nil {

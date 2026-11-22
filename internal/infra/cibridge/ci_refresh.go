@@ -35,11 +35,13 @@ type ciObservation struct {
 // Without one, the legacy CIProvider is called per Watch. Watches parked for a
 // human answer (needs_input) are skipped: a CI verdict must not wake their
 // subscribers or close them before the answer resumes the same Watch (ADR 0031).
+// Blocked Watches stay in the sample. The base-green resolver needs their base
+// observation to release the incident, and the Watch loop keeps them parked.
 func (b *ciRefresh) fetchSnapshots(ctx context.Context, watches []domain.Watch, cycleID string) (map[string]ciObservation, error) {
 	out := make(map[string]ciObservation, len(watches))
 	candidates := make([]domain.Watch, 0, len(watches))
 	for _, w := range watches {
-		if w.Status != domain.StatusClosed && w.Status != domain.StatusBlocked && w.Status != domain.StatusNeedsInput {
+		if w.Status != domain.StatusClosed && w.Status != domain.StatusNeedsInput {
 			candidates = append(candidates, w)
 		}
 	}
