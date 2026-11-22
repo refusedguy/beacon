@@ -270,6 +270,50 @@ func TestCounterAndNextID(t *testing.T) {
 	}
 }
 
+func TestMeasureIDCollisions(t *testing.T) {
+	first := t.TempDir()
+	second := t.TempDir()
+	third := t.TempDir()
+	for _, root := range []string{first, second, third} {
+		if err := os.MkdirAll(filepath.Join(root, "docs", "tasks"), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCard := func(root, name, content string) {
+		t.Helper()
+		p := filepath.Join(root, "docs", "tasks", name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCard(first, "T2.1.md", "одинаково\n")
+	writeCard(second, "T2.1.md", "одинаково\n")
+	writeCard(first, "T2.2.md", "слева\n")
+	writeCard(second, "T2.2.md", "справа\n")
+	writeCard(third, "T3.1.md", "только здесь\n")
+	writeCard(first, "notes.md", "не карточка\n")
+
+	report, err := MeasureIDCollisions(first, second, third, filepath.Join(third, "пусто"))
+	if err != nil {
+		t.Fatalf("MeasureIDCollisions: %v", err)
+	}
+	if report.Worktrees != 3 {
+		t.Errorf("Worktrees = %d, ждали 3", report.Worktrees)
+	}
+	if report.Cards != 5 {
+		t.Errorf("Cards = %d, ждали 5", report.Cards)
+	}
+	if report.Duplicates != 2 {
+		t.Errorf("Duplicates = %d, ждали 2", report.Duplicates)
+	}
+	if len(report.Collisions) != 1 || report.Collisions[0].ID != "T2.2" || len(report.Collisions[0].Roots) != 2 {
+		t.Fatalf("Collisions = %+v, ждали один T2.2 в двух корнях", report.Collisions)
+	}
+	if !IsID("T2.2") {
+		t.Fatal("IsID(T2.2) = false")
+	}
+}
+
 func TestCreateExclusiveAndAtomicWrite(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "T2.1.md")
