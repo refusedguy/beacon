@@ -21,8 +21,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -1314,4 +1316,239 @@ func (d *DB) ClientReceiptCount() (int, error) {
 		return 0, err
 	}
 	return n, nil
+}
+
+// CA-25. Local model-message journal.
+//
+// aider writes a local .aider.llm.history.md with a `ROLE timestamp` header
+// and the message text beneath it (aider/io.py:754-765). A write failure warns
+// and switches the journal off without interrupting the turn. Beacon had no
+// such local artifact: agent logs and transcripts are private state and never
+// become public receipts (ADR 0027). This journal stays a plain local file
+// outside the receipts table, so no entry can be mistaken for a proof.
+
+const defaultMessageJournalMaxBytes int64 = 1 << 20 // 1 MiB
+
+// MessageRole names the side of a model exchange recorded in the journal. The
+// role is written verbatim as the first field of an entry header.
+type MessageRole string
+
+const (
+	MessageRoleUser      MessageRole = "user"
+	MessageRoleAssistant MessageRole = "assistant"
+	MessageRoleSystem    MessageRole = "system"
+	MessageRoleTool      MessageRole = "tool"
+)
+
+// JournalEntry is one message read back from a ModelJournal. At is the UTC
+// time stored in the entry header.
+type JournalEntry struct {
+	Role MessageRole
+	At   time.Time
+	Text string
+}
+
+// ModelJournal is a local append-only journal of model messages (CA-25). Each
+// message occupies a header line `ROLE RFC3339Nano` followed by its text. The
+// file is a debug artifact: it never enters receipts, results or any public
+// proof. A write failure disables the journal for the rest of the process and
+// returns no error to the caller, so a bad path cannot break a turn. Older
+// entries are dropped whole when a new message would cross the size cap.
+type ModelJournal struct {
+	mu       sync.Mutex
+	path     string
+	maxBytes int64
+	disabled bool
+}
+
+// MessageJournal is the name used by callers that describe the artifact by
+// its contents rather than by the model that produced it.
+type MessageJournal = ModelJournal
+
+// NewModelJournal returns a journal writing to path. An optional maxBytes sets
+// the size cap; zero or no argument selects the 1 MiB default. The parent
+// directory is created on the first append.
+func NewModelJournal(path string, maxBytes ...int64) *ModelJournal {
+	limit := defaultMessageJournalMaxBytes
+	if len(maxBytes) > 0 && maxBytes[0] > 0 {
+		limit = maxBytes[0]
+	}
+	return &ModelJournal{path: path, maxBytes: limit}
+}
+
+// NewMessageJournal is an alias for NewModelJournal.
+func NewMessageJournal(path string, maxBytes ...int64) *MessageJournal {
+	return NewModelJournal(path, maxBytes...)
+}
+
+// Path returns the journal file path.
+func (j *ModelJournal) Path() string {
+	if j == nil {
+		return ""
+	}
+	return j.path
+}
+
+// Enabled reports whether the journal still accepts writes.
+func (j *ModelJournal) Enabled() bool {
+	if j == nil {
+		return false
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return !j.disabled
+}
+
+// Disabled reports whether a write failure has switched the journal off.
+func (j *ModelJournal) Disabled() bool { return !j.Enabled() }
+
+// Append records one message with the current UTC timestamp. It returns nil
+// even on a filesystem error: the journal disables itself and the caller's
+// turn continues (CA-25).
+func (j *ModelJournal) Append(role, text string) error {
+	if j == nil {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.disabled {
+		return nil
+	}
+	if err := j.appendLocked(role, text); err != nil {
+		j.disabled = true
+	}
+	return nil
+}
+
+// AppendMessage is a role-typed form of Append.
+func (j *ModelJournal) AppendMessage(role MessageRole, text string) error {
+	return j.Append(string(role), text)
+}
+
+// Entries reads the journal back in write order. A missing file has no
+// entries. Reading does not change the disabled state.
+func (j *ModelJournal) Entries() ([]JournalEntry, error) {
+	if j == nil {
+		return nil, nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	data, err := os.ReadFile(j.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: model journal: read: %w", err)
+	}
+	blocks := splitJournalBlocks(data)
+	out := make([]JournalEntry, 0, len(blocks))
+	for _, b := range blocks {
+		out = append(out, JournalEntry{Role: b.role, At: b.at, Text: b.text})
+	}
+	return out, nil
+}
+
+func (j *ModelJournal) appendLocked(role, text string) error {
+	if strings.TrimSpace(j.path) == "" {
+		return errors.New("store: model journal: empty path")
+	}
+	header := strings.TrimSpace(role) + " " + time.Now().UTC().Format(time.RFC3339Nano)
+	entry := []byte(header + "\n" + strings.TrimRight(text, "\n") + "\n")
+
+	if dir := filepath.Dir(j.path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("store: model journal: create dir: %w", err)
+		}
+	}
+	data, err := os.ReadFile(j.path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("store: model journal: read: %w", err)
+	}
+	if int64(len(data)+len(entry)) > j.maxBytes {
+		data = trimJournal(data, int64(len(entry)), j.maxBytes)
+		if err := os.WriteFile(j.path, data, 0o644); err != nil {
+			return fmt.Errorf("store: model journal: trim: %w", err)
+		}
+	}
+	f, err := os.OpenFile(j.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("store: model journal: open: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(entry); err != nil {
+		return fmt.Errorf("store: model journal: append: %w", err)
+	}
+	return nil
+}
+
+// journalBlock is one stored message together with its raw bytes, so an old
+// entry can be dropped whole when the file is trimmed.
+type journalBlock struct {
+	raw  []byte
+	role MessageRole
+	at   time.Time
+	text string
+}
+
+// splitJournalBlocks reads a journal file into messages. A header is a line
+// with exactly two fields whose second field parses as RFC3339Nano; every
+// line until the next header belongs to the same message. Text before the
+// first header is ignored.
+func splitJournalBlocks(data []byte) []journalBlock {
+	type header struct {
+		start int
+		role  MessageRole
+		at    time.Time
+	}
+	var headers []header
+	for offset := 0; offset < len(data); {
+		end := bytes.IndexByte(data[offset:], '\n')
+		if end < 0 {
+			break
+		}
+		line := string(data[offset : offset+end])
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			if at, err := time.Parse(time.RFC3339Nano, fields[len(fields)-1]); err == nil {
+				role := strings.Join(fields[:len(fields)-1], " ")
+				headers = append(headers, header{start: offset, role: MessageRole(role), at: at})
+			}
+		}
+		offset += end + 1
+	}
+
+	blocks := make([]journalBlock, 0, len(headers))
+	for i, h := range headers {
+		stop := len(data)
+		if i+1 < len(headers) {
+			stop = headers[i+1].start
+		}
+		raw := data[h.start:stop]
+		text := ""
+		if nl := bytes.IndexByte(raw, '\n'); nl >= 0 {
+			text = string(raw[nl+1:])
+		}
+		blocks = append(blocks, journalBlock{
+			raw:  raw,
+			role: h.role,
+			at:   h.at,
+			text: strings.TrimSuffix(text, "\n"),
+		})
+	}
+	return blocks
+}
+
+// trimJournal drops the oldest complete messages until a new entry of add
+// bytes fits under max. It returns data unchanged when the file already fits.
+func trimJournal(data []byte, add, max int64) []byte {
+	if int64(len(data))+add <= max {
+		return data
+	}
+	blocks := splitJournalBlocks(data)
+	out := append([]byte(nil), data...)
+	for int64(len(out))+add > max && len(blocks) > 0 {
+		out = out[len(blocks[0].raw):]
+		blocks = blocks[1:]
+	}
+	return out
 }
