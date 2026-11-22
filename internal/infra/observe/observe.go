@@ -227,10 +227,11 @@ const (
 
 // Histogram names for the durations an operator cares about.
 const (
-	HistogramPollCycle = "poll_cycle_duration_seconds"
-	HistogramMerge     = "merge_duration_seconds"
-	HistogramWake      = "wake_duration_seconds"
-	HistogramRun       = "run_duration_seconds"
+	HistogramPollCycle       = "poll_cycle_duration_seconds"
+	HistogramMerge           = "merge_duration_seconds"
+	HistogramWake            = "wake_duration_seconds"
+	HistogramRun             = "run_duration_seconds"
+	HistogramWakeDeferredAge = "wake_deferred_age_seconds"
 )
 
 // Label keys of the labelled counters.
@@ -558,7 +559,43 @@ const (
 	WakeOutcomeTransportFailed = "transport-failed"
 	WakeOutcomeIndeterminate   = "indeterminate"
 	WakeOutcomeDuplicate       = "duplicate"
+	WakeOutcomeDeferred        = "deferred"
 )
+
+// postedOnce records the obligations whose posted outcome has already been
+// counted. The CI bridge records a posted outcome after every delivery call
+// returns nil, including a wake the dedup ledger coalesced. Counting the second
+// call would present a duplicate as a fresh delivery. The guard sits at the
+// metric boundary, so a caller does not have to know whether the delivery was
+// suppressed. A bounded FIFO keeps memory flat in a long-running daemon.
+var postedOnce = struct {
+	sync.Mutex
+	seen  map[string]struct{}
+	order []string
+}{seen: make(map[string]struct{})}
+
+const postedOnceLimit = 8192
+
+// claimPosted returns false when a posted outcome for id was already counted.
+// An empty id leaves the caller unchanged: only correlated outcomes carry the
+// obligation identity that distinguishes a duplicate from a new delivery.
+func claimPosted(id string) bool {
+	if id == "" {
+		return true
+	}
+	postedOnce.Lock()
+	defer postedOnce.Unlock()
+	if _, ok := postedOnce.seen[id]; ok {
+		return false
+	}
+	postedOnce.seen[id] = struct{}{}
+	postedOnce.order = append(postedOnce.order, id)
+	if len(postedOnce.order) > postedOnceLimit {
+		delete(postedOnce.seen, postedOnce.order[0])
+		postedOnce.order = postedOnce.order[1:]
+	}
+	return true
+}
 
 // WakeOutcome records one wake in the adapter+outcome counter. It is the single
 // increment point of CounterWakeOutcome. The legacy wake helpers do not touch
@@ -579,6 +616,12 @@ func WakeOutcomeCorrelated(adapter, outcome, watchID string, cycle Fields, revis
 // wakeOutcome is the one implementation behind both spellings. Extra fields are
 // merged last, so the caller's correlation values win over the defaults.
 func wakeOutcome(adapter, outcome, watchID string, extra Fields, revision ...uint64) {
+	if outcome == WakeOutcomePosted {
+		id, _ := extra[FieldObligationID].(string)
+		if !claimPosted(id) {
+			return
+		}
+	}
 	s := Default()
 	s.Inc(CounterWakeOutcome, outcomeKey(adapter, outcome))
 	fields := Fields{FieldAdapter: adapter, FieldOutcome: outcome}
@@ -667,6 +710,34 @@ func WakeSkipped(adapter, watchID, reason string) {
 		fields[FieldAdapter] = adapter
 	}
 	s.Log(LevelInfo, "wake_skipped", fields)
+}
+
+// WakeDeferred records one wake parked by an OPEN adapter circuit breaker. It
+// keeps a per-adapter counter for the backlog, stamps the cycle that parked the
+// wake and measures how long the wake waited. Callers that already use the
+// literal "deferred" should use WakeOutcomeDeferred and this helper instead, so
+// a dashboard filtered on known outcomes sees the deferred wakes too.
+func WakeDeferred(adapter, watchID string, stagedAt time.Time, cycle Fields, revision ...uint64) {
+	s := Default()
+	s.Inc(CounterWakeDeferred, adapter)
+	cycles.note(func(c *cycleTracker) { c.wakes++ })
+	fields := Fields{FieldAdapter: adapter, FieldOutcome: WakeOutcomeDeferred}
+	if watchID != "" {
+		fields[FieldWatchID] = watchID
+	}
+	if len(revision) != 0 {
+		fields[FieldRevision] = revision[0]
+	}
+	if !stagedAt.IsZero() {
+		age := time.Since(stagedAt)
+		Observe(HistogramWakeDeferredAge, age.Seconds())
+		fields[FieldDuration] = age.String()
+	}
+	for k, v := range cycle {
+		fields[k] = v
+	}
+	s.Log(LevelInfo, "wake_deferred", fields)
+	WakeOutcome(adapter, WakeOutcomeDeferred, watchID, revision...)
 }
 
 // WakeDuplicate records a wake pointer that the deliverer suppressed because

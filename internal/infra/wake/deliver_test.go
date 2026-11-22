@@ -1460,3 +1460,67 @@ func TestHistorySearchRunnerCapturesStderr(t *testing.T) {
 		t.Fatalf("out = %q, want stderr text", out)
 	}
 }
+
+type outcomeLabelSink struct {
+	counts map[string]uint64
+	labels map[string][]string
+}
+
+func newOutcomeLabelSink() *outcomeLabelSink {
+	return &outcomeLabelSink{counts: make(map[string]uint64), labels: make(map[string][]string)}
+}
+
+func (s *outcomeLabelSink) Log(observe.Level, string, observe.Fields) {}
+
+func (s *outcomeLabelSink) Inc(name, labelValue string) {
+	s.counts[name]++
+	s.labels[name] = append(s.labels[name], labelValue)
+}
+
+// A wake the dedup ledger coalesces must not be reported as posted. The bridge
+// records a posted outcome after every nil return, so the metric boundary keeps
+// one posted per obligation and the duplicate raises its own outcome instead.
+func TestDuplicateWakeDoesNotIncrementPosted(t *testing.T) {
+	sink := newOutcomeLabelSink()
+	observe.SetDefault(sink)
+	defer observe.SetDefault(nil)
+
+	const sessionID = "ses_dup_posted"
+	obligationID := domain.ObligationKey("watch-dup-posted", uint64(time.Now().UnixNano()), sessionID)
+	p := domain.WakePayload{WatchID: "watch-dup-posted", ObligationID: obligationID, Revision: 1, Verdict: "ready"}
+
+	calls := 0
+	bridge := &AdapterDedupDeliverer{
+		Inner: &adapterDelivererFn{fn: func(context.Context, string, string, domain.WakePayload) error {
+			calls++
+			return nil
+		}},
+		Dedup: NewDeliveryDedup(),
+	}
+
+	cycle := observe.Fields{observe.FieldObligationID: obligationID}
+	for i := 0; i < 2; i++ {
+		if err := bridge.Deliver(context.Background(), AdapterOpenCode, sessionID, p); err != nil {
+			t.Fatalf("deliver %d: %v", i, err)
+		}
+		observe.WakeOutcomeCorrelated(AdapterOpenCode, observe.WakeOutcomePosted, p.WatchID, cycle, p.Revision)
+	}
+
+	if calls != 1 {
+		t.Errorf("inner deliver calls = %d, want 1", calls)
+	}
+	got := sink.labels[observe.CounterWakeOutcome]
+	want := map[string]int{":duplicate": 1, "opencode:posted": 1}
+	if len(got) != len(want) {
+		t.Fatalf("wake outcome labels = %v, want one duplicate and one posted", got)
+	}
+	seen := make(map[string]int, len(got))
+	for _, label := range got {
+		seen[label]++
+	}
+	for label, count := range want {
+		if seen[label] != count {
+			t.Errorf("outcome %q = %d, want %d (all labels %v)", label, seen[label], count, got)
+		}
+	}
+}

@@ -79,10 +79,18 @@ var extendedCounterNames = []string{
 // exporter or a change to the existing wake counters.
 const (
 	CounterWakeOutcome  = "wake_outcome_total"
+	CounterWakeDeferred = "wake_deferred_total"
 	LabelAdapterOutcome = "adapter_outcome"
 )
 
-var outcomeCounters = map[string]string{CounterWakeOutcome: LabelAdapterOutcome}
+// CounterWakeDeferred counts wakes parked by an OPEN adapter circuit breaker.
+// It keeps an adapter label so a dashboard can show which transport is holding
+// a backlog. The counter is monotonic and survives cycle boundaries, so a
+// scrape reports the volume of deferrals since the process started.
+var outcomeCounters = map[string]string{
+	CounterWakeOutcome:  LabelAdapterOutcome,
+	CounterWakeDeferred: LabelAdapter,
+}
 
 // outcomeKey joins the two dimensions of CounterWakeOutcome into one label
 // value. The colon cannot appear in an adapter name or an outcome, so the pair
@@ -376,7 +384,7 @@ func CounterNames() []string {
 
 // HistogramNames returns the known histogram names in stable order.
 func HistogramNames() []string {
-	return []string{HistogramMerge, HistogramPollCycle, HistogramRun, HistogramWake}
+	return []string{HistogramMerge, HistogramPollCycle, HistogramRun, HistogramWake, HistogramWakeDeferredAge}
 }
 
 // JSON renders every metric as a JSON object. An unlabeled counter is a
