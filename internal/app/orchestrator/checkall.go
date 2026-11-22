@@ -453,10 +453,20 @@ func CheckAll(ctx context.Context, deps Deps) (Summary, error) {
 	return summary, nil
 }
 
+// informational reports whether the provider explicitly marked a check as
+// non-required. The domain verdict engine drops an explicitly non-required
+// check and stays fail-closed when the flag is absent, so the parallel app
+// engine uses the same rule.
+func informational(c Check) bool {
+	return c.Required != nil && !*c.Required
+}
+
 // VerdictFromChecks applies cibridge's rules: no checks means still watching,
 // a failing or cancelled check asks for retry, all green is ready, and any
 // other pending state keeps the Watch watching. SKIPPED and NEUTRAL count as
-// green, matching the domain's harmless-conclusion rule.
+// green, matching the domain's harmless-conclusion rule. A check marked
+// non-required is informational: it never asks for retry, but it keeps the
+// Watch watching instead of letting the pass publish ready.
 func VerdictFromChecks(checks []Check) Verdict {
 	if len(checks) == 0 {
 		return CheckVerdictWatching
@@ -468,6 +478,9 @@ func VerdictFromChecks(checks []Check) Verdict {
 			continue
 		case "FAILURE", "CANCELLED":
 			allGreen = false
+			if informational(c) {
+				continue
+			}
 			return CheckVerdictRetry
 		default:
 			allGreen = false
@@ -479,10 +492,14 @@ func VerdictFromChecks(checks []Check) Verdict {
 	return CheckVerdictWatching
 }
 
-// FailedChecks returns the sorted names of failing or cancelled checks.
+// FailedChecks returns the sorted names of failing or cancelled checks that
+// can block the Watch. Checks explicitly marked non-required are omitted.
 func FailedChecks(checks []Check) []string {
 	var out []string
 	for _, c := range checks {
+		if informational(c) {
+			continue
+		}
 		canonical := normalizeConclusion(c.Conclusion)
 		if canonical == "FAILURE" || canonical == "CANCELLED" {
 			out = append(out, c.Name)

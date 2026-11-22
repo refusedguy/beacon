@@ -170,6 +170,67 @@ func TestVerdictFromChecks(t *testing.T) {
 	}
 }
 
+// TestVerdictFromChecksRequired guards the parallel verdict engine. A check
+// the provider marked non-required is informational: it cannot ask for retry
+// and it does not enter the Watch's failedChecks. A missing flag stays
+// fail-closed, so a failed check without the bit still blocks.
+func TestVerdictFromChecksRequired(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		name       string
+		checks     []Check
+		want       Verdict
+		wantFailed []string
+	}{
+		{
+			name:       "optional failure only stays watching",
+			checks:     []Check{{Name: "ci-info", Conclusion: "FAILURE", Required: &no}},
+			want:       CheckVerdictWatching,
+			wantFailed: nil,
+		},
+		{
+			name:       "optional cancellation is informational",
+			checks:     []Check{{Name: "ci-info", Conclusion: "CANCELLED", Required: &no}},
+			want:       CheckVerdictWatching,
+			wantFailed: nil,
+		},
+		{
+			name: "required failure still retries",
+			checks: []Check{
+				{Name: "ci-info", Conclusion: "FAILURE", Required: &no},
+				{Name: "ci-build", Conclusion: "FAILURE", Required: &yes},
+			},
+			want:       CheckVerdictRetry,
+			wantFailed: []string{"ci-build"},
+		},
+		{
+			name:       "missing flag stays fail closed",
+			checks:     []Check{{Name: "ci-unknown", Conclusion: "FAILURE"}},
+			want:       CheckVerdictRetry,
+			wantFailed: []string{"ci-unknown"},
+		},
+		{
+			name: "optional green stays ready",
+			checks: []Check{
+				{Name: "ci-info", Conclusion: "SUCCESS", Required: &no},
+				{Name: "ci-build", Conclusion: "SUCCESS", Required: &yes},
+			},
+			want:       CheckVerdictReady,
+			wantFailed: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VerdictFromChecks(tc.checks); got != tc.want {
+				t.Fatalf("verdict = %s, want %s", got, tc.want)
+			}
+			if got := FailedChecks(tc.checks); !reflect.DeepEqual(got, tc.wantFailed) {
+				t.Fatalf("failed checks = %v, want %v", got, tc.wantFailed)
+			}
+		})
+	}
+}
+
 func TestNormalizeConclusionAllowedResultsAreSuccess(t *testing.T) {
 	for _, in := range []string{"SKIPPED", "skipped", "NEUTRAL", "neutral", "SUCCESS"} {
 		if got := normalizeConclusion(in); got != "SUCCESS" {
