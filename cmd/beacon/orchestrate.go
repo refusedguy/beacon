@@ -206,8 +206,12 @@ func storeResolverPorts(c *CLI, db *store.DB) (*dbOrchestratorStore, orchestrato
 		return out, nil
 	})
 	dbStore := newDBOrchestratorStore(reader, db)
-	resolver := orchestrator.NewStoreDependencyResolver(
-		filepath.Join(c.root, "docs", "tasks"), cliRunner{c: c}, dbStore)
+	cfg, err := orchestrator.LoadProjectConfig(c.root)
+	if err != nil {
+		cfg = orchestrator.DefaultConfig()
+	}
+	tasksDir := filepath.Join(c.root, cfg.Paths.Tasks)
+	resolver := orchestrator.NewStoreDependencyResolver(tasksDir, cliRunner{c: c}, dbStore)
 	return dbStore, resolver
 }
 
