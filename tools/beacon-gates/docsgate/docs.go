@@ -42,7 +42,7 @@ func loadDocsConfig(path string) (docsConfig, error) {
 }
 
 func isTaskStatus(v string) bool {
-	return v == "todo" || v == "in_progress" || v == "done" || v == "dropped"
+	return v == "todo" || v == "in_progress" || v == "blocked" || v == "done" || v == "dropped" || v == "duplicate"
 }
 
 func isADRStatus(v string) bool {
