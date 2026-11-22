@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -150,6 +151,10 @@ func (b *verdictApplier) applyVerdict(ctx context.Context, w domain.Watch, obs c
 	if current.HeadSHA != w.HeadSHA {
 		return 0
 	}
+	// Keep the persisted observation so a watching verdict can tell a fresh
+	// CI fact from the one already in the store.
+	persistedChecks := current.Checks
+	persistedMerge := current.Merge
 	current.Checks = obs.pr.Checks
 	current.Merge = domain.MergeInfo{
 		Mergeable:        obs.pr.Mergeable,
@@ -159,6 +164,16 @@ func (b *verdictApplier) applyVerdict(ctx context.Context, w domain.Watch, obs c
 
 	switch verdict {
 	case domain.VerdictWatching:
+		// Watching is not terminal: stage no obligation and wake nobody. The
+		// observations still have to reach the store, or verdict_source never
+		// publishes them and the Watch stays stuck with checks=null. Save only
+		// on a real change, so a repeat with the same checks writes nothing and
+		// leaves the revision alone.
+		if !maps.Equal(persistedChecks, current.Checks) || persistedMerge != current.Merge {
+			if err := b.store.SaveWatch(current); err != nil {
+				observe.ActorError("cibridge-watch-observe", current.ID, err)
+			}
+		}
 		return 0
 	case domain.VerdictBlocked:
 		return b.applyBlocked(ctx, current, obs, now, cycleID)
