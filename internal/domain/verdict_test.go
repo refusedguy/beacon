@@ -1878,3 +1878,294 @@ func TestExplicitRequiredCheckKeepsInformationalDropped(t *testing.T) {
 		}
 	}
 }
+
+// failedHeadSnapshot is a saved observation whose ci check failed on the PR
+// head. The base is unknown until a case sets BaseFailedChecks.
+func failedHeadSnapshot(name string) Snapshot {
+	s := readySnapshot()
+	s.Rollup = "FAILURE"
+	s.Failures = []string{name}
+	s.Checks = map[string]Check{
+		name: {State: "COMPLETED", Conclusion: "FAILURE", Required: true},
+	}
+	return s
+}
+
+// prBlockerCase is one transition of the EvaluatePR blocker priority. Order is
+// the row in the EvaluatePR doc comment. The table expands grouped rows into
+// separate cases so each transition has its own fixture.
+type prBlockerCase struct {
+	order int
+	name  string
+	s     Snapshot
+	p     Policy
+	want  Verdict
+	wake  []WakeTarget
+}
+
+// prPrecedenceStep removes one blocker from a snapshot that trips every row at
+// once and records the new winner.
+type prPrecedenceStep struct {
+	name string
+	s    Snapshot
+	want Verdict
+	wake []WakeTarget
+}
+
+// TestEvaluatePRDecisionTable pins every transition of the published verdict
+// engine on saved snapshots. Every fixture is a value, so no case needs the
+// network or a clock.
+func TestEvaluatePRDecisionTable(t *testing.T) {
+	flaky := failedHeadSnapshot("ci-flaky")
+	flaky.Flaky = FlakyConfig{Names: []string{"ci-*"}, MaxRetries: 2, Used: map[string]int{}}
+
+	stale := failedHeadSnapshot("ci-build")
+	stale.MergeStateStatus = "BEHIND"
+	stale.BaseChecksKnown = true
+	stale.BaseHeadSHA = "base111"
+
+	baseFail := readySnapshot()
+	baseFail.Failures = []string{"ci-build"}
+	baseFail.BaseFailedChecks = map[string]bool{"ci-build": true}
+
+	cases := []prBlockerCase{
+		{
+			order: 1, name: "MERGED is terminal and wakes nobody",
+			s:    func() Snapshot { s := readySnapshot(); s.State = "MERGED"; return s }(),
+			want: VerdictMerged, wake: nil,
+		},
+		{
+			order: 1, name: "CLOSED is terminal and wakes nobody",
+			s:    func() Snapshot { s := readySnapshot(); s.State = "CLOSED"; return s }(),
+			want: VerdictClosed, wake: nil,
+		},
+		{
+			order: 2, name: "moved head wakes only the executor",
+			s:    func() Snapshot { s := readySnapshot(); s.HeadSHA = testNew; return s }(),
+			want: VerdictWatching, wake: []WakeTarget{{Role: RoleExecutor, Kind: WakeHeadChanged}},
+		},
+		{
+			order: 3, name: "DIRTY rebases",
+			s:    func() Snapshot { s := readySnapshot(); s.MergeStateStatus = "DIRTY"; return s }(),
+			want: VerdictRebase, wake: targets(WakePointer, RoleExecutor),
+		},
+		{
+			order: 3, name: "BEHIND with requireUpToDate rebases",
+			s:    func() Snapshot { s := readySnapshot(); s.MergeStateStatus = "BEHIND"; return s }(),
+			p:    Policy{RequireUpToDate: true},
+			want: VerdictRebase, wake: targets(WakePointer, RoleExecutor),
+		},
+		{
+			order: 4, name: "base failure blocks through the orchestrator",
+			s:    baseFail,
+			want: VerdictBlocked, wake: targets(WakePointer, RoleOrchestrator),
+		},
+		{
+			order: 5, name: "flaky failure under budget retries",
+			s:    flaky,
+			want: VerdictRetry,
+			wake: []WakeTarget{{Role: RoleExecutor, RerunChecks: []string{"ci-flaky"}}},
+		},
+		{
+			order: 5, name: "stable failure keeps working",
+			s:    failedHeadSnapshot("ci-stable"),
+			want: VerdictKeepWorking, wake: targets(WakePointer, RoleExecutor),
+		},
+		{
+			order: 5, name: "failure behind a repaired main rebases with a reason",
+			s:    stale,
+			want: VerdictRebase,
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakePointer, Reason: ReasonStaleBaseAfterMainFix}},
+		},
+		{
+			order: 6, name: "clean success is ready",
+			s:    readySnapshot(),
+			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+		},
+		{
+			order: 6, name: "doc-only PR is ready",
+			s:    func() Snapshot { s := readySnapshot(); s.Checks = nil; s.Rollup = ""; return s }(),
+			want: VerdictReady, wake: targets(WakePointer, RoleOrchestrator),
+		},
+		{
+			order: 7, name: "UNKNOWN mergeable pins REST",
+			s:    func() Snapshot { s := readySnapshot(); s.Mergeable = "UNKNOWN"; return s }(),
+			want: VerdictWatching, wake: []WakeTarget{{Kind: WakeRestPin}},
+		},
+		{
+			order: 8, name: "deadline times out through the orchestrator",
+			s: func() Snapshot {
+				s := readySnapshot()
+				s.Rollup = "PENDING"
+				s.At = testAt
+				s.DeadlineAt = testDeadline
+				return s
+			}(),
+			want: VerdictTimeout, wake: targets(WakePointer, RoleOrchestrator),
+		},
+		{
+			order: 9, name: "anything else watches silently",
+			s:    func() Snapshot { s := readySnapshot(); s.Rollup = "PENDING"; return s }(),
+			want: VerdictWatching, wake: nil,
+		},
+	}
+
+	seen := make(map[int]bool, 9)
+	last := 0
+	for _, tc := range cases {
+		if tc.order < last {
+			t.Fatalf("case %q goes from priority %d back to %d", tc.name, last, tc.order)
+		}
+		if tc.order < 1 || tc.order > 9 {
+			t.Fatalf("case %q has priority %d outside 1..9", tc.name, tc.order)
+		}
+		last = tc.order
+		seen[tc.order] = true
+	}
+	for row := 1; row <= 9; row++ {
+		if !seen[row] {
+			t.Fatalf("priority row %d has no case", row)
+		}
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, wake := EvaluatePR(tc.s, tc.p)
+			if got != tc.want {
+				t.Errorf("verdict = %q, want %q", got, tc.want)
+			}
+			if !reflect.DeepEqual(wake, tc.wake) {
+				t.Errorf("wake targets = %#v, want %#v", wake, tc.wake)
+			}
+		})
+	}
+}
+
+// TestEvaluatePRBlockerPrecedence puts several blockers on one snapshot and
+// removes them from the top down. The winner must follow the documented order,
+// so a later blocker can never outrank an earlier one.
+func TestEvaluatePRBlockerPrecedence(t *testing.T) {
+	all := func() Snapshot {
+		s := failedHeadSnapshot("ci-build")
+		s.HeadSHA = testNew
+		s.MergeStateStatus = "DIRTY"
+		s.BaseFailedChecks = map[string]bool{"ci-build": true}
+		s.Mergeable = "UNKNOWN"
+		s.At = testAt
+		s.DeadlineAt = testDeadline
+		return s
+	}
+
+	noHead := all()
+	noHead.HeadSHA = noHead.WatchHeadSHA
+
+	noDirty := noHead
+	noDirty.MergeStateStatus = "CLEAN"
+
+	noBase := noDirty
+	noBase.BaseFailedChecks = nil
+
+	noCI := noBase
+	noCI.Failures = nil
+	noCI.Rollup = "SUCCESS"
+	noCI.Checks = readySnapshot().Checks
+
+	noUnknown := noCI
+	noUnknown.Mergeable = "MERGEABLE"
+	noUnknown.Rollup = "PENDING"
+
+	steps := []prPrecedenceStep{
+		{
+			name: "head change beats every other blocker", s: all(),
+			want: VerdictWatching, wake: []WakeTarget{{Role: RoleExecutor, Kind: WakeHeadChanged}},
+		},
+		{
+			name: "DIRTY beats base failure and CI failure", s: noHead,
+			want: VerdictRebase, wake: targets(WakePointer, RoleExecutor),
+		},
+		{
+			name: "base failure beats CI failure, UNKNOWN and deadline", s: noDirty,
+			want: VerdictBlocked, wake: targets(WakePointer, RoleOrchestrator),
+		},
+		{
+			name: "CI failure beats UNKNOWN and deadline", s: noBase,
+			want: VerdictKeepWorking, wake: targets(WakePointer, RoleExecutor),
+		},
+		{
+			name: "UNKNOWN beats deadline", s: noCI,
+			want: VerdictWatching, wake: []WakeTarget{{Kind: WakeRestPin}},
+		},
+		{
+			name: "deadline wins once earlier rows are clear", s: noUnknown,
+			want: VerdictTimeout, wake: targets(WakePointer, RoleOrchestrator),
+		},
+	}
+
+	for _, tc := range steps {
+		t.Run(tc.name, func(t *testing.T) {
+			got, wake := EvaluatePR(tc.s, Policy{})
+			if got != tc.want {
+				t.Errorf("verdict = %q, want %q", got, tc.want)
+			}
+			if !reflect.DeepEqual(wake, tc.wake) {
+				t.Errorf("wake targets = %#v, want %#v", wake, tc.wake)
+			}
+		})
+	}
+}
+
+// The same failing check on the head and on the base must reach different
+// rows and wake different roles. The head asks its executor to keep working;
+// the base asks the orchestrator to fix main.
+func TestEvaluatePRHeadAndBaseDivergence(t *testing.T) {
+	head := failedHeadSnapshot("ci-build")
+	base := failedHeadSnapshot("ci-build")
+	base.BaseFailedChecks = map[string]bool{"ci-build": true}
+
+	headVerdict, headWake := EvaluatePR(head, Policy{})
+	baseVerdict, baseWake := EvaluatePR(base, Policy{})
+
+	if headVerdict != VerdictKeepWorking {
+		t.Errorf("head failure verdict = %q, want %q", headVerdict, VerdictKeepWorking)
+	}
+	if baseVerdict != VerdictBlocked {
+		t.Errorf("base failure verdict = %q, want %q", baseVerdict, VerdictBlocked)
+	}
+	if want := targets(WakePointer, RoleExecutor); !reflect.DeepEqual(headWake, want) {
+		t.Errorf("head wake = %#v, want %#v", headWake, want)
+	}
+	if want := targets(WakePointer, RoleOrchestrator); !reflect.DeepEqual(baseWake, want) {
+		t.Errorf("base wake = %#v, want %#v", baseWake, want)
+	}
+}
+
+// A caller retries a verdict on the same saved snapshot. Repeated calls must
+// agree and must not change the maps and slices the caller supplied.
+func TestEvaluatePRDeterministicAndPure(t *testing.T) {
+	s := failedHeadSnapshot("ci-build")
+	s.BaseFailedChecks = map[string]bool{"ci-build": true}
+
+	before := s
+	before.Checks = make(map[string]Check, len(s.Checks))
+	for name, check := range s.Checks {
+		before.Checks[name] = check
+	}
+	before.Failures = append([]string(nil), s.Failures...)
+	before.BaseFailedChecks = make(map[string]bool, len(s.BaseFailedChecks))
+	for name, failed := range s.BaseFailedChecks {
+		before.BaseFailedChecks[name] = failed
+	}
+
+	want, wantWake := EvaluatePR(s, Policy{})
+	if want != VerdictBlocked {
+		t.Fatalf("verdict = %q, want %q", want, VerdictBlocked)
+	}
+	for i := 0; i < 10; i++ {
+		got, wake := EvaluatePR(s, Policy{})
+		if got != want || !reflect.DeepEqual(wake, wantWake) {
+			t.Fatalf("call %d = (%q, %#v), want (%q, %#v)", i, got, wake, want, wantWake)
+		}
+	}
+	if !reflect.DeepEqual(s, before) {
+		t.Fatalf("EvaluatePR mutated the snapshot: %+v, want %+v", s, before)
+	}
+}

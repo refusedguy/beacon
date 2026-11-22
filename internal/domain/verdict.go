@@ -190,12 +190,32 @@ func Evaluate(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	return VerdictWatching, nil
 }
 
-// EvaluatePR computes the verdict for the real CI cycle. It deliberately differs
-// from Evaluate in two places: a terminal MERGED/CLOSED wakes nobody (the caller
-// closes all subscribers as finished), and a failure already present on the base
-// branch is blocked immediately so the orchestrator can fix main instead of
-// asking several executors to rebase the same broken base. The rules are pure
-// and applied in strict priority order; the first match wins.
+// EvaluatePR computes the verdict for the real CI cycle. It reads only s and p,
+// performs no I/O and never mutates its arguments. The first matching row wins.
+//
+// The rows below are the Watch blocker priority. cibridge.Refresh applies its
+// own gates before calling this function and keeps the same order. There a moved
+// head replaces the Watch, a blocked Watch waits, a spent rebase budget parks
+// the Watch, and a stalled in_work subscriber is replaced. Then the engine
+// applies these rows:
+//
+//  1. MERGED or CLOSED is terminal and wakes nobody.
+//  2. A moved head watches and wakes only the executor with head_changed.
+//  3. DIRTY, or BEHIND with requireUpToDate, rebases.
+//  4. A failure already on the base branch blocks through the orchestrator.
+//  5. A flaky failure under budget retries. A stable failure keeps working. A
+//     PR left behind a repaired main rebases with a stale_base_after_main_fix
+//     reason.
+//  6. A clean rollup or a doc-only PR reaches ready after the merge and review
+//     gates pass.
+//  7. An UNKNOWN mergeable pins the REST view.
+//  8. A deadline or a no-checks timeout escalates through the orchestrator.
+//  9. Every other state watches silently.
+//
+// A failure on the head and a failure already on the base take different rows.
+// The head failure reaches row 5 and asks its executor to keep working. The base
+// failure stops at row 4 and asks the orchestrator to fix main. That split keeps
+// several executors from rebasing the same broken base.
 func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	// 1-2. Terminal states close every subscriber without waking anyone.
 	switch strings.ToUpper(s.State) {
