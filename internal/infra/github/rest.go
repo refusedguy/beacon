@@ -41,7 +41,20 @@ const (
 	// failureExcerptSourceMaxFile caps the bytes read from one source file. A
 	// failed annotation must not turn into a multi-megabyte read.
 	failureExcerptSourceMaxFile = 256 << 10
+	// failureExcerptLineMax bounds one compressed line. A long log line keeps
+	// its head and tail so a trailing error stays visible (CA-22).
+	failureExcerptLineMax = 512
+	// failureExcerptTailLines is the number of tail signal lines written first.
+	// Both clamps keep leading bytes, so the final errors of a log survive.
+	failureExcerptTailLines = 4
 )
+
+// failureExcerptSignalMarkers are case-insensitive substrings that mark a
+// diagnostic line. Error and panic lines from the tail of a long log must
+// survive size reduction (CA-22).
+var failureExcerptSignalMarkers = [...]string{
+	"error", "panic", "fatal", "exception", "traceback", "fail",
+}
 
 // tokenEnvChain is the token lookup order from WORKER-PROMPT §2.
 var tokenEnvChain = [...]string{"BEACON_GITHUB_TOKEN", "GITHUB_TOKEN"}
@@ -491,6 +504,101 @@ func clampExcerptBytes(s string) string {
 	return s
 }
 
+// failureExcerptIsSignal reports whether a line carries an error marker.
+// The check is case-insensitive so "ERROR", "error" and "panic" all match.
+func failureExcerptIsSignal(line string) bool {
+	lower := strings.ToLower(line)
+	for _, marker := range failureExcerptSignalMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// failureExcerptCompressLine shortens one line to failureExcerptLineMax bytes
+// without splitting a UTF-8 rune. It keeps the head, a "..." separator and the
+// tail. Long log lines usually put the error in the tail, so keeping both ends
+// preserves the marker while the middle is dropped.
+func failureExcerptCompressLine(line string) string {
+	if len(line) <= failureExcerptLineMax {
+		return line
+	}
+	sep := "..."
+	half := (failureExcerptLineMax - len(sep)) / 2
+	head := line[:half]
+	tail := line[len(line)-half:]
+	for len(head) > 0 && !utf8.ValidString(head) {
+		head = head[:len(head)-1]
+	}
+	for len(tail) > 0 && !utf8.ValidString(tail) {
+		tail = tail[1:]
+	}
+	return head + sep + tail
+}
+
+// reduceFailureExcerpt shrinks an oversized excerpt before the hard byte clamp.
+// The byte clamps applied by this adapter and by the MCP boundary both keep the
+// leading bytes and cut the tail, so a plain excerpt loses errors that appear
+// late in a long log (CA-22). This function moves diagnostic lines to the front
+// and compresses the rest, so the final errors are in the part that survives.
+// The wire form stays the same, so the result is still plain excerpt text.
+func reduceFailureExcerpt(s string) string {
+	if len(s) <= failureExcerptLimit {
+		return s
+	}
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	signal := make([]string, 0, len(lines))
+	rest := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if failureExcerptIsSignal(trimmed) {
+			signal = append(signal, trimmed)
+		} else {
+			rest = append(rest, trimmed)
+		}
+	}
+
+	var b strings.Builder
+	writeLine := func(line string) {
+		if line == "" {
+			return
+		}
+		cost := len(line)
+		if b.Len() > 0 {
+			cost++
+		}
+		if b.Len()+cost > failureExcerptLimit {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+
+	// Write the last diagnostic lines first. The head of the final excerpt is
+	// what survives both byte clamps, so the errors at the tail of a long log
+	// land there.
+	start := len(signal) - failureExcerptTailLines
+	if start < 0 {
+		start = 0
+	}
+	for _, line := range signal[start:] {
+		writeLine(failureExcerptCompressLine(line))
+	}
+	for _, line := range signal[:start] {
+		writeLine(failureExcerptCompressLine(line))
+	}
+	for _, line := range rest {
+		writeLine(failureExcerptCompressLine(line))
+	}
+	return b.String()
+}
+
 // formatCheckRunAnnotations renders "path:line: title: message" lines in the
 // order GitHub returned them, followed by the marked source window when the
 // annotated file is available. Empty fields are skipped, and the byte budget is
@@ -534,5 +642,5 @@ func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
 			break
 		}
 	}
-	return clampExcerptBytes(b.String())
+	return clampExcerptBytes(reduceFailureExcerpt(b.String()))
 }
