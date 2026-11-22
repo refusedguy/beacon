@@ -195,6 +195,9 @@ var toolDescriptors = []toolDescriptor{
 			if deps.Continuations != nil {
 				handler.SetContinuationRegistry(deps.Continuations)
 			}
+			if deps.GenerationLedger != nil {
+				handler.SetGenerationStore(deps.GenerationLedger)
+			}
 			AttachAck(s, handler)
 		},
 	},
@@ -213,7 +216,7 @@ var toolDescriptors = []toolDescriptor{
 		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
 		Kind:        kindRead,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, version string) {
-			attachStats(s, deps.Snapshot, schemas["beacon_stats"], version)
+			attachStats(s, deps, schemas["beacon_stats"], version)
 		},
 	},
 	{
@@ -475,6 +478,14 @@ type Dependencies struct {
 	ChildThreads   ChildThreadResolver
 	ParentNotifier ParentNotifier
 
+	// GraphIndexReader and GenerationLedger are the ports from ADR 0314. A nil
+	// graph reader keeps stats honest about an unverified index. A nil ledger
+	// leaves the generation check off. RegistryStatsReader overrides the
+	// snapshot-backed default that stats builds from Snapshot.
+	GraphIndexReader    GraphIndexReader
+	RegistryStatsReader RegistryStatsReader
+	GenerationLedger    GenerationLedger
+
 	// Version is the release stamp passed at server creation. An empty value
 	// falls back to BuildVersion, the binary's build artifact. The description
 	// of beacon_stats is the one place the version reaches tools/list.
@@ -710,13 +721,23 @@ func attachListRunning(s *mcpsdk.Server, reader SnapshotReader, outputSchema *js
 // registers the real handler so the tool never falls back to a stub (T3.59).
 // The version is the build stamp passed at server creation. It changes only the
 // description; the name, order, schema and handler stay fixed.
-func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonschema.Schema, version string) {
+func attachStats(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonschema.Schema, version string) {
 	if s == nil {
 		return
 	}
+	reader := deps.Snapshot
 	if reader == nil {
 		reader = emptySnapshotReader()
 	}
+	handler := NewStatsHandler(reader)
+	if deps.GraphIndexReader != nil {
+		handler.SetGraphIndexReader(deps.GraphIndexReader)
+	}
+	registry := deps.RegistryStatsReader
+	if registry == nil {
+		registry = NewSnapshotRegistryStats(reader)
+	}
+	handler.SetRegistryStatsReader(registry)
 	annotations := toolAnnotations["beacon_stats"]
 	s.RemoveTools("beacon_stats")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
@@ -724,7 +745,7 @@ func attachStats(s *mcpsdk.Server, reader SnapshotReader, outputSchema *jsonsche
 		Description:  DescriptionWithVersion("Report persisted state counters from a read-only snapshot.", version),
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
-	}, NewStatsHandler(reader).Handle)
+	}, handler.Handle)
 }
 
 // attachTaskClaim installs the ninth tool over the handler owned by IDX-05 in
