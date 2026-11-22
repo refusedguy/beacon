@@ -35,6 +35,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	smoke "github.com/refusedguy/beacon/evals/cmd"
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
+	"github.com/refusedguy/beacon/internal/app/taskcli"
 	"github.com/refusedguy/beacon/internal/domain"
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/wake"
@@ -1041,6 +1042,15 @@ func run() int {
 	record("AS01_autospawn_no_manual_ping",
 		"один spawn на терминальный вердикт, одна связь cardID→watchID, ноль сообщений владельцу; повтор и занятый слот не порождают spawn",
 		as01Actual, as01Pass)
+
+	// SL-08: измерение параллельной работы на 12, 14 и 17 слотах. Три числа
+	// считаются разными путями: сессии и карточки из заполнения слота,
+	// slotsUsed из production RunWorkload. Четвёртое число, Watch в снимке,
+	// показывает расхождение, которое описано в research-parallel-slots.md.
+	sl08Actual, sl08Pass := evalSL08ParallelSlots(stateHome)
+	record("SL08_parallel_slot_measurement",
+		"12, 14 и 17 слотов заполнены без отказов гейта; сессии, карточки и slotsUsed равны числу слотов; дубли OwnerFiles отклонены",
+		sl08Actual, sl08Pass)
 
 	// N01-N04: соглашение по именам артефактов из HD-055 (ADR 0304). Harbor
 	// называет workflow, скилл и правило aif-action.md, {skill}/SKILL.md и
@@ -3420,6 +3430,150 @@ func evalAutoSpawnNoManualPing() (string, bool) {
 		negative.spawns == 0 &&
 		other.spawns == 0
 	return actual, ok
+}
+
+// sl08WatchQuota — сколько активных Watch видно в снимке без источника живых
+// заявок. research-parallel-slots.md зафиксировал лимит 4 для Watch и ноль
+// активных Watch при 51 закрытой. Фиксированное число здесь делает расхождение
+// между сессиями и Watch частью результата, а не побочным эффектом окружения.
+const sl08WatchQuota = 4
+
+// sl08Store отдаёт RunWorkload снимок изолированного state dir. Живые заявки
+// приходят из domain.Orchestrator через SlotBudgetStore, видимые Watch
+// ограничены квотой, которую успел записать автоспавнер.
+type sl08Store struct {
+	watches []orchestrator.WorkloadWatch
+	total   int
+	used    int
+}
+
+func (s *sl08Store) ActiveWorkloadWatches(context.Context) ([]orchestrator.WorkloadWatch, error) {
+	return s.watches, nil
+}
+
+func (s *sl08Store) Subscribe(context.Context, orchestrator.WorkloadWatch, orchestrator.WorkloadSubscriber) error {
+	return nil
+}
+
+func (s *sl08Store) SlotBudget(context.Context) (int, int, error) {
+	return s.total, s.used, nil
+}
+
+// sl08FillSlots заполняет target слотов через production-гейт AdmitLaunch и
+// domain.Orchestrator, затем читает slotsUsed через production RunWorkload.
+// Каждый агент получает одну карточку и один непересекающийся OwnerFiles.
+func sl08FillSlots(stateDir string, target int) (string, bool) {
+	start := time.Now()
+	orch, err := domain.NewOrchestrator(fmt.Sprintf("ses_sl08_%d", target), domain.RoleOrchestrator, "sl08-eval", target, nil)
+	if err != nil {
+		return fmt.Sprintf("target=%d: оркестратор: %v", target, err), false
+	}
+	svc := taskcli.NewService(taskcli.Config{StateDir: stateDir, Root: stateDir})
+
+	assignments := make([]taskcli.LaunchAssignment, 0, target)
+	sessions := make([]string, 0, target)
+	claims := make(map[string]string, target)
+	watches := make([]orchestrator.WorkloadWatch, 0, sl08WatchQuota)
+	rejections := 0
+
+	for i := 0; i < target; i++ {
+		sessionID := fmt.Sprintf("ses_sl08_%d_%02d", target, i)
+		cardID := fmt.Sprintf("SL08-E%d-%02d", target, i)
+		ownerFile := fmt.Sprintf("evals/sl08/agent_%02d.go", i)
+		candidate := taskcli.LaunchAssignment{Name: cardID, Files: []string{ownerFile}, Status: "todo"}
+
+		decision := svc.AdmitLaunch(taskcli.PreflightResult{Allowed: true}, orch.SlotsUsed, target,
+			append(slices.Clone(assignments), candidate)...)
+		if !decision.Allowed {
+			rejections++
+			continue
+		}
+		if _, held := claims[sessionID]; held {
+			rejections++
+			continue
+		}
+		watchID := fmt.Sprintf("watch-sl08-%d-%02d", target, i)
+		if err := orch.Register(watchID); err != nil {
+			rejections++
+			continue
+		}
+
+		candidate.Status = "in_progress"
+		assignments = append(assignments, candidate)
+		sessions = append(sessions, sessionID)
+		claims[sessionID] = cardID
+		if len(watches) < sl08WatchQuota {
+			watches = append(watches, orchestrator.WorkloadWatch{
+				ID: watchID, Verdict: "watching", Project: "sl08-eval",
+			})
+		}
+	}
+	fill := time.Since(start)
+
+	report, err := orchestrator.RunWorkload(context.Background(), &sl08Store{
+		watches: watches, total: target, used: orch.SlotsUsed,
+	})
+	if err != nil {
+		return fmt.Sprintf("target=%d: RunWorkload: %v", target, err), false
+	}
+	watchOnly := orchestrator.BuildWorkload(watches)
+
+	// Один агент держит одну карточку: по числу сессий, по числу заявок и по
+	// числу различных cardID. Пересечение OwnerFiles проверяет CheckLaunch.
+	distinctCards := make(map[string]bool, len(claims))
+	for _, cardID := range claims {
+		distinctCards[cardID] = true
+	}
+	waveErr := taskcli.CheckLaunch(assignments...)
+	if len(assignments) == 0 {
+		return fmt.Sprintf("target=%d: ни одного допуска, отказов гейта=%d", target, rejections), false
+	}
+
+	// Негативный контроль: искусственный дубль OwnerFiles. Оба гейта обязаны
+	// отклонить назначение. Если гейт ослабнет, eval красный.
+	dupAssignments := append(slices.Clone(assignments), taskcli.LaunchAssignment{
+		Name: "SL08-DUP", Files: []string{assignments[0].Files[0]}, Status: "todo",
+	})
+	dupErr := taskcli.CheckLaunch(dupAssignments...)
+	// Один свободный слот: отказ может прийти только из проверки OwnerFiles,
+	// а не из исчерпания бюджета.
+	dupDecision := svc.AdmitLaunch(taskcli.PreflightResult{Allowed: true}, target-1, target, dupAssignments...)
+
+	actual := fmt.Sprintf(
+		"target=%d: сессии=%d, карточки=%d (уникальных=%d), slotsUsed=%d/%d, Watch в снимке=%d, отказов гейта=%d, время заполнения=%s; дубль OwnerFiles: CheckLaunch=%t, AdmitLaunch=%t (%s)",
+		target, len(sessions), len(claims), len(distinctCards), report.SlotsUsed, report.SlotsTotal,
+		watchOnly.Total, rejections, fill.Round(time.Microsecond),
+		dupErr != nil, !dupDecision.Allowed, dupDecision.Reason)
+	ok := len(sessions) == target &&
+		len(claims) == target &&
+		len(distinctCards) == target &&
+		report.SlotsUsed == target &&
+		report.SlotsTotal == target &&
+		report.Total == sl08WatchQuota &&
+		watchOnly.SlotsUsed == sl08WatchQuota &&
+		rejections == 0 &&
+		waveErr == nil &&
+		dupErr != nil &&
+		!dupDecision.Allowed
+	return actual, ok
+}
+
+// evalSL08ParallelSlots прогоняет измерение на трёх границах мощности из
+// карточки SL-08. Изолированный каталог создаётся внутри state dir eval-а,
+// поэтому прогон не трогает состояние пользователя.
+func evalSL08ParallelSlots(stateDir string) (string, bool) {
+	dir := filepath.Join(stateDir, "sl08")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "изолированный state dir: " + err.Error(), false
+	}
+	parts := make([]string, 0, 3)
+	ok := true
+	for _, target := range []int{12, 14, 17} {
+		actual, pass := sl08FillSlots(dir, target)
+		parts = append(parts, actual)
+		ok = ok && pass
+	}
+	return strings.Join(parts, " | "), ok
 }
 
 // evalEnv убирает GitHub-токены и подменяет XDG-каталоги на временные, чтобы
