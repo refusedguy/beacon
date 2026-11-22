@@ -128,7 +128,9 @@ func (c *Counter) Add(cost int) int {
 
 // Observe records an HTTP response and the cost read from its body. The
 // x-ratelimit-* headers take priority: when they report a point total, the
-// body cost is ignored. Headers are authoritative for both clients.
+// body cost is ignored. GraphQL headers use the 5000 point scale, so Observe
+// converts them to the local 500 point budget before recording them. REST
+// responses keep the scale they report.
 func (c *Counter) Observe(resp *http.Response, bodyCost int) int {
 	if resp == nil {
 		return c.Add(bodyCost)
@@ -136,9 +138,13 @@ func (c *Counter) Observe(resp *http.Response, bodyCost int) int {
 	if bodyCost < 0 {
 		bodyCost = 0
 	}
+	obs := observeHeaders(resp.Header)
+	if isGraphQLResponse(resp) {
+		obs = scaleGraphQLObservation(obs, resp.Header)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.apply(observeHeaders(resp.Header), bodyCost)
+	c.apply(obs, bodyCost)
 	return c.used
 }
 
@@ -250,6 +256,36 @@ func observeHeaders(h http.Header) observation {
 		}
 	}
 	return o
+}
+
+// isGraphQLResponse reports whether the response came from a GraphQL POST.
+// Both GraphQL clients in this package send POST requests. The resource
+// header is an explicit marker for callers that build responses directly.
+func isGraphQLResponse(resp *http.Response) bool {
+	if strings.EqualFold(headerValue(resp.Header, "x-ratelimit-resource"), "graphql") {
+		return true
+	}
+	return resp.Request != nil && resp.Request.Method == http.MethodPost
+}
+
+// scaleGraphQLObservation converts a reading on the GitHub 5000 point scale
+// to the local budget. A limit at or below the budget needs no conversion.
+func scaleGraphQLObservation(obs observation, h http.Header) observation {
+	if obs.used < 0 {
+		return obs
+	}
+	limit, err := strconv.Atoi(headerValue(h, "x-ratelimit-limit"))
+	if err != nil || limit <= BudgetPerHour {
+		return obs
+	}
+	obs.used = obs.used * BudgetPerHour / limit
+	if obs.used < 0 {
+		obs.used = 0
+	}
+	if obs.used > BudgetPerHour {
+		obs.used = BudgetPerHour
+	}
+	return obs
 }
 
 func headerValue(h http.Header, name string) string {

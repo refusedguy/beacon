@@ -100,6 +100,8 @@ func TestAddCostIncrementsAndSetsLimitFlag(t *testing.T) {
 	}
 }
 
+// TestHeadersOverrideBodyCost pins the REST path. REST headers keep the scale
+// they report, so a 5000 point header still writes 400 into the counter.
 func TestHeadersOverrideBodyCost(t *testing.T) {
 	c, _, _ := newTestCounter(t, 100)
 
@@ -119,6 +121,73 @@ func TestHeadersOverrideBodyCost(t *testing.T) {
 	noHeaders := &http.Response{Header: http.Header{}}
 	if got := c.Observe(noHeaders, 7); got != 407 {
 		t.Fatalf("body cost: Used = %d, want 407", got)
+	}
+}
+
+func graphQLHeaderResponse(limit, remaining int) *http.Response {
+	h := http.Header{}
+	h.Set("x-ratelimit-limit", strconv.Itoa(limit))
+	h.Set("x-ratelimit-remaining", strconv.Itoa(remaining))
+	return &http.Response{Header: h, Request: &http.Request{Method: http.MethodPost}}
+}
+
+func TestGraphQLHeadersUseLocalBudgetScale(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+
+	if got := c.Observe(graphQLHeaderResponse(5000, 4600), 1); got != 40 {
+		t.Fatalf("GraphQL used = %d, want 40 on the local scale", got)
+	}
+	if c.BudgetExhausted() {
+		t.Fatal("BudgetExhausted = true at 4600 of 5000 GraphQL points")
+	}
+	if c.LimitReached() {
+		t.Fatal("LimitReached = true at 4600 of 5000 GraphQL points")
+	}
+	if got := c.Remaining(); got != 460 {
+		t.Fatalf("Remaining = %d, want 460", got)
+	}
+}
+
+func TestGraphQLResourceHeaderUsesLocalBudgetScale(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+
+	h := http.Header{}
+	h.Set("x-ratelimit-resource", "graphql")
+	h.Set("x-ratelimit-limit", "5000")
+	h.Set("x-ratelimit-remaining", "4600")
+	if got := c.Observe(&http.Response{Header: h}, 1); got != 40 {
+		t.Fatalf("GraphQL resource header used = %d, want 40", got)
+	}
+}
+
+func TestGraphQLHeadersExhaustBudgetAtRealLimit(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+
+	if got := c.Observe(graphQLHeaderResponse(5000, 10), 1); got != 499 {
+		t.Fatalf("GraphQL used near limit = %d, want 499", got)
+	}
+	if c.LimitReached() {
+		t.Fatal("LimitReached = true at 4990 of 5000 GraphQL points")
+	}
+	if got := c.Observe(graphQLHeaderResponse(5000, 0), 1); got != 500 {
+		t.Fatalf("GraphQL used at limit = %d, want 500", got)
+	}
+	if !c.BudgetExhausted() || !c.LimitReached() {
+		t.Fatal("budget not exhausted at 5000 of 5000 GraphQL points")
+	}
+}
+
+func TestLaunchGateAllowsAfterGraphQLHeadersOnRemoteScale(t *testing.T) {
+	c, _, _ := newTestCounter(t, 0)
+	gate := NewLaunchGate(c)
+
+	c.Observe(graphQLHeaderResponse(5000, 4600), 1)
+	d := gate.Admit()
+	if !d.Allowed {
+		t.Fatalf("Admit after GraphQL headers = %+v, want allowed", d)
+	}
+	if got := gate.Pending(); got != 0 {
+		t.Fatalf("Pending = %d, want 0", got)
 	}
 }
 
