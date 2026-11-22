@@ -641,9 +641,10 @@ type sharedGateCall struct {
 // SharedGate coalesces concurrent waits on the same key into one wait and
 // warns when a key turns out to be shared. It is safe for concurrent use.
 type SharedGate struct {
-	mu    sync.Mutex
-	calls map[string]*sharedGateCall
-	warnf func(string, ...any)
+	mu             sync.Mutex
+	calls          map[string]*sharedGateCall
+	warnf          func(string, ...any)
+	combinedRounds int
 }
 
 // NewSharedGate returns an empty gate whose warnings go to the standard log.
@@ -682,6 +683,9 @@ func (g *SharedGate) Wait(ctx context.Context, key string, fn SharedGateWait) er
 	if call, ok := g.calls[key]; ok {
 		call.waiters++
 		waiters := call.waiters
+		if waiters == 2 {
+			g.combinedRounds++
+		}
 		warnf := g.warnf
 		done := call.done
 		g.mu.Unlock()
@@ -723,6 +727,31 @@ func (g *SharedGate) ActiveWaiters(key string) int {
 	return 0
 }
 
+// SharedGateSnapshot is a point-in-time view of a gate for diagnostics.
+// Waiters maps each active key to the number of callers joined on it. An empty
+// map means no round is active. CombinedRounds counts the rounds that turned
+// out to be shared, that is rounds where a second caller joined one key.
+type SharedGateSnapshot struct {
+	Waiters        map[string]int
+	CombinedRounds int
+}
+
+// Snapshot returns the active keys of the gate with their waiter counts and
+// the number of combined rounds seen so far. It lets an operator read gate
+// state through the store API instead of parsing WARNING lines (OBS-04).
+func (g *SharedGate) Snapshot() SharedGateSnapshot {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	snapshot := SharedGateSnapshot{
+		Waiters:        make(map[string]int, len(g.calls)),
+		CombinedRounds: g.combinedRounds,
+	}
+	for key, call := range g.calls {
+		snapshot.Waiters[key] = call.waiters
+	}
+	return snapshot
+}
+
 // Shared CI wait (ADR 0037 p3, T3.73).
 //
 // SharedGate on its own is only a mechanism. The process-wide gate below is
@@ -749,4 +778,11 @@ func sharedCIWait() *SharedGate {
 // only guarantees that the wait happened once. A nil ctx becomes Background.
 func SharedCIWait(ctx context.Context, key string, fn SharedGateWait) error {
 	return sharedCIWait().Wait(ctx, key, fn)
+}
+
+// SharedCIWaitSnapshot exposes the process-wide CI gate through the store
+// package. Callers can read active waiters and combined rounds without reading
+// logs (OBS-04). The returned map is a copy and safe for the caller to keep.
+func SharedCIWaitSnapshot() SharedGateSnapshot {
+	return sharedCIWait().Snapshot()
 }
