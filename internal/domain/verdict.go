@@ -294,14 +294,15 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 
 // NormalizeConclusion maps a raw check conclusion or status to one of four
 // canonical states: SUCCESS, FAILURE, CANCELLED and PENDING. Adapters that feed
-// Snapshot.Checks use this single mapping, so the verdict engine never has to
-// re-decide whether PASS, SUCCESSFUL or NEUTRAL mean a passing check. SKIPPED
-// and NEUTRAL are allowed results and normalize to SUCCESS, not to a blocker.
+// Snapshot.Checks use this mapping, so the verdict engine never re-decides
+// whether PASS, SUCCESSFUL or NEUTRAL mean a passing check. CANCELLED and
+// CANCELED deliberately share one value. The app layer mirrors this vocabulary
+// because ADR 0005 forbids an app import of domain.
 func NormalizeConclusion(value string) string {
 	switch strings.ToUpper(strings.TrimSpace(value)) {
 	case "PASS", "SUCCESS", "SUCCESSFUL", "SKIPPED", "NEUTRAL":
 		return "SUCCESS"
-	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED":
+	case "FAIL", "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED":
 		return "FAILURE"
 	case "CANCELLED", "CANCELED":
 		return "CANCELLED"
