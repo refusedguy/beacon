@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -128,6 +129,43 @@ func sortedFailedChecks(in []FailedCheck) []FailedCheck {
 	out := append([]FailedCheck(nil), in...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// IsNotFound keeps the not-found contract for this double. memStore reports an
+// empty selection with a plain sentinel, so the result paths need this
+// classifier to tell it apart from a storage failure.
+func (m *memStore) IsNotFound(err error) bool {
+	return errors.Is(err, errMissing)
+}
+
+// failingResultStore reports a storage failure on every read. It deliberately
+// does not implement resultStoreNotFound: a disk or SQL failure is not an empty
+// selection.
+type failingResultStore struct {
+	err error
+}
+
+func (s *failingResultStore) Watch(string) (domain.Watch, error) {
+	return domain.Watch{}, s.err
+}
+
+func (s *failingResultStore) Obligation(string) (domain.Obligation, error) {
+	return domain.Obligation{}, s.err
+}
+
+// failingObligationStore serves a Watch and fails only the obligation read, so
+// the obligation call site can be checked on its own.
+type failingObligationStore struct {
+	watch domain.Watch
+	err   error
+}
+
+func (s *failingObligationStore) Watch(string) (domain.Watch, error) {
+	return s.watch, nil
+}
+
+func (s *failingObligationStore) Obligation(string) (domain.Obligation, error) {
+	return domain.Obligation{}, s.err
 }
 
 // TestGetResultProjectsContractAndStampsRead covers both verdicts named in the
@@ -415,6 +453,58 @@ func TestGetResultValidation(t *testing.T) {
 	if reads != 0 || claims != 0 {
 		t.Errorf("a rejected call stamped the obligation: read %d claim %d", reads, claims)
 	}
+}
+
+// TestResultReadFailureIsPersistFailed covers the three Watch reads on the
+// result paths. A storage failure keeps PERSIST_FAILED instead of being
+// reported as a missing Watch.
+func TestResultReadFailureIsPersistFailed(t *testing.T) {
+	cause := "store: disk I/O failure"
+	h := NewGetResultHandler(&failingResultStore{err: errors.New(cause)}, newRecordingStamper(), &stepClock{t: time.Now()})
+	ctx := context.Background()
+
+	_, err := h.Result(ctx, sessionReq("session-V"), GetResultInput{WatchID: "w-1"})
+	assertCode(t, err, domain.CodePersistFailed)
+	if !strings.Contains(err.Error(), cause) {
+		t.Errorf("error %q does not keep the cause %q", err.Error(), cause)
+	}
+
+	_, err = h.GradeResult(ctx, "w-1", DefaultResultRubric(), 0, false)
+	assertCode(t, err, domain.CodePersistFailed)
+
+	_, err = h.GradeExternalAction(ctx, "w-1", DefaultResultRubric(), 0, true, false, "lease")
+	assertCode(t, err, domain.CodePersistFailed)
+}
+
+// TestResultObligationReadFailureIsPersistFailed covers the obligation read in
+// get_result. A storage failure there also keeps PERSIST_FAILED.
+func TestResultObligationReadFailureIsPersistFailed(t *testing.T) {
+	w := resultFixture(domain.VerdictReady)
+	cause := "store: obligation disk I/O failure"
+	h := NewGetResultHandler(&failingObligationStore{watch: w, err: errors.New(cause)}, newRecordingStamper(), &stepClock{t: time.Now()})
+
+	_, err := h.Result(context.Background(), sessionReq("session-V"), GetResultInput{WatchID: w.ID})
+	assertCode(t, err, domain.CodePersistFailed)
+	if !strings.Contains(err.Error(), cause) {
+		t.Errorf("error %q does not keep the cause %q", err.Error(), cause)
+	}
+}
+
+// TestResultReadMissingIsWatchNotFound covers the empty-selection case on all
+// three result paths. The plain not-found sentinel still maps to
+// WATCH_NOT_FOUND now that read failures map to PERSIST_FAILED.
+func TestResultReadMissingIsWatchNotFound(t *testing.T) {
+	h := NewGetResultHandler(newMemStore(), newRecordingStamper(), &stepClock{t: time.Now()})
+	ctx := context.Background()
+
+	_, err := h.Result(ctx, sessionReq("session-V"), GetResultInput{WatchID: "missing"})
+	assertCode(t, err, domain.CodeWatchNotFound)
+
+	_, err = h.GradeResult(ctx, "missing", DefaultResultRubric(), 0, false)
+	assertCode(t, err, domain.CodeWatchNotFound)
+
+	_, err = h.GradeExternalAction(ctx, "missing", DefaultResultRubric(), 0, true, false, "lease")
+	assertCode(t, err, domain.CodeWatchNotFound)
 }
 
 // dbTxWriter is a minimal single-writer port over a real in-memory SQLite DB.

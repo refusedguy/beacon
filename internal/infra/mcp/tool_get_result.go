@@ -94,6 +94,14 @@ type resultStoreReader interface {
 	Obligation(id string) (domain.Obligation, error)
 }
 
+// resultStoreNotFound is an optional capability of a read port. A port whose
+// missing row arrives as a plain sentinel implements it so a caller can tell
+// an empty selection from a storage failure. The production store returns an
+// AppError for a missing row and does not implement this interface.
+type resultStoreNotFound interface {
+	IsNotFound(err error) bool
+}
+
 // resultTxWriter is the single-writer port used to stamp a delivery fact. The
 // production store satisfies it with one SQLite transaction per stamp.
 type resultTxWriter interface {
@@ -443,7 +451,7 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	w, err := h.store.Watch(in.WatchID)
 	if err != nil {
 		observe.ActorError("get_result", in.WatchID, err)
-		return GetResultOutput{}, mapResultReadError(err, "get_result: watch")
+		return GetResultOutput{}, mapResultReadFailure(h.store, err, "get_result: watch")
 	}
 
 	caller := SessionIDFromRequest(req)
@@ -452,7 +460,7 @@ func (h *GetResultHandler) Result(ctx context.Context, req *mcpsdk.CallToolReque
 	}
 	obligationID := domain.ObligationKey(w.ID, w.Revision, *caller)
 	if _, err := h.store.Obligation(obligationID); err != nil {
-		return GetResultOutput{}, mapResultReadError(err, "get_result: obligation")
+		return GetResultOutput{}, mapResultReadFailure(h.store, err, "get_result: obligation")
 	}
 
 	failed := collectFailedChecks(w)
@@ -1003,6 +1011,22 @@ func mapResultReadError(err error, what string) error {
 	return domain.NewAppError(domain.CodeWatchNotFound, what+": "+err.Error())
 }
 
+// mapResultReadFailure maps a read error on the get_result, grade_result and
+// grade_external_action paths. A domain error passes through unchanged. An
+// empty selection keeps CodeWatchNotFound when the read port classifies it as
+// missing. Any other read error becomes CodePersistFailed and keeps the cause
+// in the message.
+func mapResultReadFailure(store resultStoreReader, err error, what string) error {
+	var appErr *domain.AppError
+	if errors.As(err, &appErr) {
+		return err
+	}
+	if classifier, ok := store.(resultStoreNotFound); ok && classifier.IsNotFound(err) {
+		return domain.NewAppError(domain.CodeWatchNotFound, what+": "+err.Error())
+	}
+	return domain.NewAppError(domain.CodePersistFailed, what+": "+err.Error())
+}
+
 // --- Result rubric, separate from run completion (ADR 0034 §1) -------------
 //
 // A Watch reaching StatusClosed only says the run ended. Anthropic reports that
@@ -1258,7 +1282,7 @@ func (h *GetResultHandler) GradeResult(ctx context.Context, watchID string, rubr
 	}
 	w, err := h.store.Watch(watchID)
 	if err != nil {
-		return RubricEvaluation{}, mapResultReadError(err, "grade_result: watch")
+		return RubricEvaluation{}, mapResultReadFailure(h.store, err, "grade_result: watch")
 	}
 	return gradeResult(w, rubric, iteration, interrupted), nil
 }
@@ -1279,7 +1303,7 @@ func (h *GetResultHandler) GradeExternalAction(ctx context.Context, watchID stri
 	}
 	w, err := h.store.Watch(watchID)
 	if err != nil {
-		return RubricEvaluation{}, mapResultReadError(err, "grade_external_action: watch")
+		return RubricEvaluation{}, mapResultReadFailure(h.store, err, "grade_external_action: watch")
 	}
 	return gradeExternalAction(w, rubric, iteration, performed, responseLost, leaseKey), nil
 }
