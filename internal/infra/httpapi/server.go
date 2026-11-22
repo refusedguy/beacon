@@ -700,10 +700,32 @@ func (o *opsState) metricsView() OpsMetrics {
 	return m
 }
 
+// redactAuditField masks tokens and credentials in one free-text audit field.
+// It delegates to the byte-based observe.Redact filter already used by the log
+// pipeline, so a secret never survives into the audit export.
+func redactAuditField(s string) string {
+	if s == "" {
+		return s
+	}
+	return string(observe.Redact([]byte(s)))
+}
+
+// redactAuditRecord masks the four free-text fields of a record. Ingress is a
+// fixed marker and At is a timestamp, so neither is transformed.
+func redactAuditRecord(rec AuditRecord) AuditRecord {
+	rec.Actor = redactAuditField(rec.Actor)
+	rec.Command = redactAuditField(rec.Command)
+	rec.WatchID = redactAuditField(rec.WatchID)
+	rec.DecisionID = redactAuditField(rec.DecisionID)
+	return rec
+}
+
 // recordAudit appends one command to the bounded audit list. When the list is
 // full it drops the oldest records and counts them, so a later auditView can
-// report that the snapshot is incomplete.
+// report that the snapshot is incomplete. Records are redacted before they
+// are stored so no secret sits in the in-process buffer.
 func (o *opsState) recordAudit(rec AuditRecord) {
+	rec = redactAuditRecord(rec)
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.audit = append(o.audit, rec)
@@ -734,7 +756,7 @@ func (o *opsState) auditView(actor, cursor string, limit int) (AuditPage, error)
 		if actor != "" && rec.Actor != actor {
 			continue
 		}
-		entries = append(entries, rec)
+		entries = append(entries, redactAuditRecord(rec))
 	}
 	total := len(entries)
 	if offset > total {
@@ -1321,7 +1343,7 @@ func (s *Server) handleDecide(w http.ResponseWriter, r *http.Request) {
 	// this actor in its permit list. Without a credential registry there is
 	// nothing to check, so the key is ignored.
 	if d.AppKey != "" && s.cfg.Credentials != nil && !s.cfg.Credentials.permits(d.AppKey, d.Actor) {
-		writeError(w, http.StatusForbidden, "ACTOR_NOT_PERMITTED", "приложение не вправе отвечать за actor "+d.Actor)
+		writeError(w, http.StatusForbidden, "ACTOR_NOT_PERMITTED", "приложение не вправе отвечать за actor "+redactAuditField(d.Actor))
 		return
 	}
 

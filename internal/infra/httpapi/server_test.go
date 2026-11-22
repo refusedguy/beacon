@@ -835,6 +835,74 @@ func TestAuditActorIngress(t *testing.T) {
 	}
 }
 
+func TestAuditRedaction(t *testing.T) {
+	ghp := "ghp_" + strings.Repeat("a", 36)
+	tg := "123456789:" + strings.Repeat("b", 35)
+
+	sink := &stubSink{result: DecisionResult{DecisionID: ghp}}
+	srv := newTestServer(t, stubProvider{}, sink, NewEventBus(0))
+
+	body := `{"command":"approve ` + tg + `","watchID":"` + tg + `","actor":"` + ghp + `"}`
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(body, "http://127.0.0.1:7432"))
+	if w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d, body %s", w.Code, w.Body.String())
+	}
+
+	w = httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, authorized(httptest.NewRequest(http.MethodGet, "/api/v1/audit", nil)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("audit status = %d, body %s", w.Code, w.Body.String())
+	}
+	var page AuditPage
+	if err := json.Unmarshal(w.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Entries) != 1 {
+		t.Fatalf("audit page = %+v", page)
+	}
+
+	got := page.Entries[0]
+	if strings.Contains(got.Actor, "ghp_") || strings.Contains(got.Command, tg) ||
+		strings.Contains(got.WatchID, tg) || strings.Contains(got.DecisionID, "ghp_") {
+		t.Fatalf("secret survived in audit entry: %+v", got)
+	}
+	if got.Actor != "[REDACTED]" || got.DecisionID != "[REDACTED]" {
+		t.Fatalf("token fields not redacted: %+v", got)
+	}
+	if got.Command != "approve [REDACTED]" || got.WatchID != "[REDACTED]" {
+		t.Fatalf("command and watchID not redacted: %+v", got)
+	}
+	if got.Ingress != ingressHTTPAPI || got.At.IsZero() {
+		t.Fatalf("ingress or time changed: %+v", got)
+	}
+}
+
+func TestAuditForbiddenActorRedaction(t *testing.T) {
+	ghp := "ghp_" + strings.Repeat("a", 36)
+	srv := newTestServer(t, stubProvider{}, &stubSink{}, NewEventBus(0))
+	srv.cfg.Credentials = AppCredentials{"app-reports": {"alice"}}
+
+	w := httptest.NewRecorder()
+	srv.handler().ServeHTTP(w, decideRequest(
+		`{"command":"approve","watchID":"w1","actor":"`+ghp+`","appKey":"app-reports","contract":"beacon.human-decide.v1"}`,
+		"http://127.0.0.1:7432",
+	))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "ACTOR_NOT_PERMITTED") {
+		t.Fatalf("body = %s", body)
+	}
+	if strings.Contains(body, ghp) {
+		t.Fatalf("token leaked in 403 body: %s", body)
+	}
+	if !strings.Contains(body, "[REDACTED]") {
+		t.Fatalf("missing redaction marker in 403 body: %s", body)
+	}
+}
+
 func TestTypedEventClosedNameSet(t *testing.T) {
 	for _, name := range []EventName{EventSnapshot, EventWatchPatch, EventObligationPatch, EventVerdictPatch} {
 		if err := validateEventName(name); err != nil {
