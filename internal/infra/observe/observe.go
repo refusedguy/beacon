@@ -240,6 +240,8 @@ const (
 	LabelVerdict = "verdict"
 	LabelAdapter = "adapter"
 	LabelRole    = "role"
+	LabelMethod  = "method"
+	LabelOutcome = "outcome"
 )
 
 // Sink is the thin port the Beacon cycle calls. Log writes one structured
@@ -902,18 +904,29 @@ func Command(name string, args []string) {
 	})
 }
 
+// Provider outcome values used by the provider_call_total counter. They are
+// fixed strings so the counter keeps three label values and never accepts a
+// watchID or sessionID.
+const (
+	ProviderOutcomeOK    = "ok"
+	ProviderOutcomeError = "error"
+)
+
 // ProviderCall records one CI provider call and its outcome.
 func ProviderCall(adapter, method, watchID string, err error, d time.Duration) {
 	fields := Fields{
 		FieldAdapter: adapter, "method": method, FieldWatchID: watchID,
 		FieldDuration: d.String(),
 	}
+	outcome := ProviderOutcomeOK
 	level := LevelDebug
 	if err != nil {
+		outcome = ProviderOutcomeError
 		level = LevelWarn
 		fields[FieldError] = err.Error()
 		ActorError(adapter, watchID, err)
 	}
+	Default().Inc(CounterProviderCall, providerCallKey(adapter, method, outcome))
 	Default().Log(level, "provider_call", fields)
 }
 

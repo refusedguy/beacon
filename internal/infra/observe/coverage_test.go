@@ -300,3 +300,64 @@ func TestHistogramRecordsDurationsAndExportsThem(t *testing.T) {
 		}
 	}
 }
+
+func TestProviderCallCounterHasThreeFixedLabels(t *testing.T) {
+	m := NewMetrics()
+	m.Inc(CounterProviderCall, providerCallKey("batchci", "FetchBatch", ProviderOutcomeOK))
+	m.Inc(CounterProviderCall, providerCallKey("ghci", "PRState", ProviderOutcomeError))
+
+	var got map[string]any
+	if err := json.Unmarshal(m.JSON(), &got); err != nil {
+		t.Fatalf("невалидный JSON: %v", err)
+	}
+	byValue, ok := got[CounterProviderCall].(map[string]any)
+	if !ok {
+		t.Fatalf("JSON %s = %v, ожидался объект по меткам", CounterProviderCall, got[CounterProviderCall])
+	}
+	if v, ok := byValue[providerCallKey("batchci", "FetchBatch", ProviderOutcomeOK)].(float64); !ok || int(v) != 1 {
+		t.Errorf("JSON %s = %v, ожидалось 1", CounterProviderCall, byValue)
+	}
+
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		"# HELP beacon_provider_call_total",
+		`beacon_provider_call_total{adapter="batchci",method="FetchBatch",outcome="ok"} 1`,
+		`beacon_provider_call_total{adapter="ghci",method="PRState",outcome="error"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus нет %q:\n%s", want, text)
+		}
+	}
+
+	restored := MetricsFromSnapshotJSON(m.SnapshotJSON())
+	var snapGot map[string]any
+	if err := json.Unmarshal(restored.JSON(), &snapGot); err != nil {
+		t.Fatalf("невалидный snapshot JSON: %v", err)
+	}
+	snapByValue, ok := snapGot[CounterProviderCall].(map[string]any)
+	if !ok || snapByValue[providerCallKey("batchci", "FetchBatch", ProviderOutcomeOK)] != float64(1) {
+		t.Errorf("snapshot %s = %v, ожидалось 1", CounterProviderCall, snapGot[CounterProviderCall])
+	}
+}
+
+func TestProviderCallIncrementsCounterWithoutSessionLabels(t *testing.T) {
+	m := NewMetrics()
+	SetDefault(NewRecorder(NewLogger("json", LevelInfo, &bytes.Buffer{}), m))
+	defer SetDefault(nil)
+
+	ProviderCall("batchci", "FetchBatch", "w-secret", nil, time.Millisecond)
+	ProviderCall("ghci", "PRState", "w-secret", errors.New("boom"), time.Millisecond)
+
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		`beacon_provider_call_total{adapter="batchci",method="FetchBatch",outcome="ok"} 1`,
+		`beacon_provider_call_total{adapter="ghci",method="PRState",outcome="error"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus нет %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "w-secret") {
+		t.Errorf("watchID попал в метрики:\n%s", text)
+	}
+}
