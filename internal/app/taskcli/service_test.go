@@ -1733,6 +1733,142 @@ func TestHandoffRecoveryEmptyWithoutJournal(t *testing.T) {
 	}
 }
 
+// ---- CR-03: свежесть события поглощает разрешение на продолжение ----
+
+func TestHandoffContinuationAllowedFreshnessRules(t *testing.T) {
+	cases := []struct {
+		name           string
+		taskID         string
+		journalSeq     handoffSeq
+		eventSeq       handoffSeq
+		journalSession string
+		eventSession   string
+		wantContinue   bool
+	}{
+		{"no-event", "T3.99", presentHandoffSeq(2), presentHandoffSeq(0), "", "", true},
+		{"older-event", "T3.99", presentHandoffSeq(3), presentHandoffSeq(2), "", "", true},
+		{"same-seq", "T3.99", presentHandoffSeq(2), presentHandoffSeq(2), "", "", true},
+		{"newer-continued-event", "T3.99", presentHandoffSeq(2), presentHandoffSeq(3), "", "", false},
+		{"missing-journal-seq", "T3.99", handoffSeq{}, presentHandoffSeq(0), "", "", false},
+		{"corrupt-journal-seq", "T3.99", presentHandoffSeq(0), presentHandoffSeq(0), "", "", false},
+		{"corrupt-event-seq", "T3.99", presentHandoffSeq(2), handoffSeq{}, "", "", false},
+		{"other-session", "T3.99", presentHandoffSeq(2), presentHandoffSeq(0), "s-1", "s-2", false},
+		{"one-session-unknown", "T3.99", presentHandoffSeq(2), presentHandoffSeq(0), "s-1", "", true},
+		{"empty-task", "  ", presentHandoffSeq(2), presentHandoffSeq(0), "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := handoffContinuationAllowed(tc.taskID, tc.journalSeq, tc.eventSeq, tc.journalSession, tc.eventSession)
+			if got != tc.wantContinue {
+				t.Fatalf("continue=%v, ждали %v, причина %q", got, tc.wantContinue, reason)
+			}
+			if got && reason != "" {
+				t.Fatalf("разрешение с причиной %q", reason)
+			}
+			if !got && reason == "" {
+				t.Fatal("отказ без причины")
+			}
+		})
+	}
+}
+
+// putHandoffConfirmation пишет событие подтверждения напрямую, в том числе с
+// повреждённым seq, который нельзя получить через публичный метод.
+func putHandoffConfirmation(t *testing.T, e *env, c HandoffConfirmation) {
+	t.Helper()
+	repo := newConfirmationRepo(e.cfg)
+	unlock, err := repo.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	st, err := repo.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Entries = append(st.Entries, c)
+	if err := repo.save(st); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverHandoffNewerContinuedDropsSteps(t *testing.T) {
+	e := newEnv(t)
+	at := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	for _, step := range []string{"a", "b"} {
+		if _, err := e.svc.AppendHandoffStepForSession("T3.99", "s-1", step, "", at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putHandoffConfirmation(t, e, HandoffConfirmation{
+		Seq: 3, TaskID: "T3.99", Answer: HandoffContinued, At: at, SessionID: "s-1", Continue: true,
+	})
+
+	rec, err := e.svc.RecoverHandoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Continue || len(rec.Steps) != 0 {
+		t.Fatalf("свежее continued не отключило продолжение: %+v", rec)
+	}
+	if rec.Reason == "" || rec.LastSeq != 2 || rec.JournalSeq != 2 || rec.LatestEventSeq != 3 {
+		t.Fatalf("причина или seq восстановления: %+v", rec)
+	}
+	if !rec.HasJournal || rec.Count != 2 || len(rec.Entries) != 2 || rec.SessionID != "s-1" {
+		t.Fatalf("журнал восстановления повреждён: %+v", rec)
+	}
+}
+
+func TestRecoverHandoffWithoutNewerEventKeepsSteps(t *testing.T) {
+	e := newEnv(t)
+	at := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	if _, err := e.svc.AppendHandoffStep("T3.99", "a", "", at); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.AppendHandoffStep("T3.99", "b", "", at); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := e.svc.RecoverHandoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.Continue || !reflect.DeepEqual(rec.Steps, []string{"a", "b"}) || rec.LatestEventSeq != 0 {
+		t.Fatalf("без свежего события поведение изменилось: %+v", rec)
+	}
+}
+
+func TestRecoverHandoffRejectsReorderedAndCorruptSeq(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		events []HandoffConfirmation
+	}{
+		{"reordered", []HandoffConfirmation{
+			{Seq: 4, TaskID: "T3.99", Answer: HandoffContinued},
+			{Seq: 3, TaskID: "T3.99", Answer: HandoffInconclusive},
+		}},
+		{"corrupt", []HandoffConfirmation{{Seq: 0, TaskID: "T3.99", Answer: HandoffContinued}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			at := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+			if _, err := e.svc.AppendHandoffStep("T3.99", "a", "", at); err != nil {
+				t.Fatal(err)
+			}
+			for _, event := range tc.events {
+				event.At = at
+				putHandoffConfirmation(t, e, event)
+			}
+			rec, err := e.svc.RecoverHandoff()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rec.Continue || len(rec.Steps) != 0 || rec.Reason == "" {
+				t.Fatalf("некорректный seq разрешил продолжение: %+v", rec)
+			}
+		})
+	}
+}
+
 func TestHandoffJournalDropsOldestOnCountOverflow(t *testing.T) {
 	e := newEnv(t)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
@@ -2258,6 +2394,34 @@ func TestRecordHandoffAnswerValidatesAndIsolatesTasks(t *testing.T) {
 	got, err := fresh.HandoffStatus("T3.157")
 	if err != nil || !got.Completed || len(got.Answers) != 1 {
 		t.Fatalf("новый сервис: %+v err=%v", got, err)
+	}
+}
+
+func TestRecordHandoffAnswerAppliesFreshnessGate(t *testing.T) {
+	e := newEnv(t)
+	at := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	step, err := e.svc.AppendHandoffStepForSession("T3.157", "s-1", "send-note", "", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer, err := e.svc.RecordHandoffAnswerForSession("T3.157", "s-1", HandoffContinued, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Seq <= step.Seq || answer.SessionID != "s-1" || answer.Continue {
+		t.Fatalf("ответ не связан с сессией или не учёл свежесть: %+v", answer)
+	}
+	rec, err := e.svc.RecoverHandoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Continue || len(rec.Steps) != 0 {
+		t.Fatalf("после continued шаги всё ещё предлагаются: %+v", rec)
+	}
+	// Контракт HandoffStatus не тронут: continued по-прежнему завершает передачу.
+	st, err := e.svc.HandoffStatus("T3.157")
+	if err != nil || !st.Completed || len(st.Answers) != 1 {
+		t.Fatalf("контракт HandoffStatus изменился: %+v err=%v", st, err)
 	}
 }
 

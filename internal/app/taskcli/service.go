@@ -2477,22 +2477,125 @@ func (s *Service) PrecheckLog() ([]PrecheckLogEntry, error) {
 
 // HandoffJournalEntry — одна запись журнала: факт о пройденном шаге передачи.
 // Seq монотонен и не переиспользуется при отбрасывании старых записей.
+// SessionID связывает шаг с получателем, которому можно предложить продолжение.
 type HandoffJournalEntry struct {
-	Seq    uint64    `json:"seq"`
-	Time   time.Time `json:"time"`
-	TaskID string    `json:"taskId"`
-	Step   string    `json:"step"`
-	Note   string    `json:"note"`
+	Seq       uint64    `json:"seq"`
+	Time      time.Time `json:"time"`
+	TaskID    string    `json:"taskId"`
+	Step      string    `json:"step"`
+	Note      string    `json:"note"`
+	SessionID string    `json:"sessionId,omitempty"`
 }
 
 // HandoffRecovery — блок восстановления, который процесс подставляет на старте,
-// прочитав журнал. Entries и Steps идут в порядке записи.
+// прочитав журнал. Entries и Steps идут в порядке записи. Поля HasJournal,
+// Count, LastSeq, Steps и Entries сохраняют прежний JSON-контракт; CR-03
+// добавляет Continue, Reason, JournalSeq, LatestEventSeq и SessionID.
 type HandoffRecovery struct {
 	HasJournal bool                  `json:"hasJournal"`
 	Count      int                   `json:"count"`
 	LastSeq    uint64                `json:"lastSeq"`
 	Steps      []string              `json:"steps"`
 	Entries    []HandoffJournalEntry `json:"entries"`
+	Continue   bool                  `json:"continue"`
+	Reason     string                `json:"reason,omitempty"`
+	JournalSeq uint64                `json:"journalSeq"`
+	// LatestEventSeq — самый свежий seq события подтверждения по задаче. Ноль
+	// означает, что событий ещё не было.
+	LatestEventSeq uint64 `json:"latestEventSeq"`
+	SessionID      string `json:"sessionId,omitempty"`
+}
+
+// handoffSeq — seq с флагом корректности. valid=false означает, что seq
+// отсутствует или повреждён: такое значение всегда запрещает продолжение.
+// Нулевой value при valid=true означает, что событий ещё не было.
+type handoffSeq struct {
+	value uint64
+	valid bool
+}
+
+func presentHandoffSeq(v uint64) handoffSeq { return handoffSeq{value: v, valid: true} }
+
+// handoffContinuationAllowed — чистое правило свежести CR-03. Продолжение
+// разрешено, только когда seq журнала корректен, после шагов не пришло более
+// свежее событие и журнал с событием относятся к одной сессии получателя.
+// Неопределённая доставка не проигрывается вслепую: повреждённый или
+// отсутствующий seq даёт отказ.
+func handoffContinuationAllowed(taskID string, journalSeq, latestEventSeq handoffSeq, journalSession, eventSession string) (bool, string) {
+	if strings.TrimSpace(taskID) == "" {
+		return false, "пустая задача восстановления"
+	}
+	if !journalSeq.valid || journalSeq.value == 0 {
+		return false, "отсутствует или повреждён seq журнала"
+	}
+	if !latestEventSeq.valid {
+		return false, "отсутствует или повреждён seq события"
+	}
+	if journalSession != "" && eventSession != "" && journalSession != eventSession {
+		return false, "событие относится к другой сессии получателя"
+	}
+	if latestEventSeq.value > journalSeq.value {
+		return false, "после шагов журнала пришло более свежее событие"
+	}
+	return true, ""
+}
+
+// handoffJournalSeq возвращает seq последней записи задачи из журнала и сессию
+// получателя. Seq обязан быть ненулевым и строго возрастать: отсутствие,
+// повреждение или перестановка записей дают некорректный seq.
+func handoffJournalSeq(entries []HandoffJournalEntry, taskID string) (handoffSeq, string) {
+	var last uint64
+	found := false
+	session := ""
+	for _, e := range entries {
+		if e.TaskID != taskID {
+			continue
+		}
+		if e.Seq == 0 || (found && e.Seq <= last) {
+			return handoffSeq{}, ""
+		}
+		if session != "" && e.SessionID != "" && session != e.SessionID {
+			return handoffSeq{}, ""
+		}
+		if e.SessionID != "" {
+			session = e.SessionID
+		}
+		last = e.Seq
+		found = true
+	}
+	if !found {
+		return handoffSeq{}, ""
+	}
+	return presentHandoffSeq(last), session
+}
+
+// handoffEventSeq возвращает seq последнего события задачи. Отсутствие событий
+// кодируется корректным нулём. Повреждённый seq, дубль или перестановка событий
+// дают некорректный seq и, значит, отказ в продолжении.
+func handoffEventSeq(entries []HandoffConfirmation, taskID string) (handoffSeq, string) {
+	var last uint64
+	found := false
+	session := ""
+	for _, e := range entries {
+		if e.TaskID != taskID {
+			continue
+		}
+		if e.Seq == 0 || (found && e.Seq <= last) {
+			return handoffSeq{}, ""
+		}
+		if session != "" && e.SessionID != "" && session != e.SessionID {
+			return handoffSeq{}, ""
+		}
+		if e.SessionID != "" {
+			session = e.SessionID
+		}
+		last = e.Seq
+		found = true
+	}
+	if !found {
+		return presentHandoffSeq(0), ""
+	}
+	return presentHandoffSeq(last), session
 }
 
 // Жёсткие лимиты журнала. При переполнении отбрасываются самые старые записи,
@@ -2531,7 +2634,15 @@ func pruneHandoffJournal(entries []HandoffJournalEntry) []HandoffJournalEntry {
 // возвращает записанную запись. Seq растёт монотонно и не сбрасывается при
 // отбрасывании старых записей. Пустая задача или шаг отклоняется.
 func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (HandoffJournalEntry, error) {
+	return s.AppendHandoffStepForSession(taskID, "", step, note, at)
+}
+
+// AppendHandoffStepForSession дописывает шаг, привязанный к сессии получателя.
+// Пустая сессия допустима для старых вызовов, которые не знают получателя:
+// в этом случае свежесть события проверяется только по seq.
+func (s *Service) AppendHandoffStepForSession(taskID, sessionID, step, note string, at time.Time) (HandoffJournalEntry, error) {
 	taskID = strings.TrimSpace(taskID)
+	sessionID = strings.TrimSpace(sessionID)
 	step = strings.TrimSpace(step)
 	if taskID == "" {
 		return HandoffJournalEntry{}, Validationf("не задана задача журнала handoff")
@@ -2559,6 +2670,7 @@ func (s *Service) AppendHandoffStep(taskID, step, note string, at time.Time) (Ha
 	}
 	entry := HandoffJournalEntry{
 		Seq: seq, Time: at.UTC(), TaskID: taskID, Step: step, Note: strings.TrimSpace(note),
+		SessionID: sessionID,
 	}
 	st.Entries = append(st.Entries, entry)
 	st.Entries = pruneHandoffJournal(st.Entries)
@@ -2581,8 +2693,17 @@ func (s *Service) HandoffJournal() ([]HandoffJournalEntry, error) {
 // Пустой журнал даёт HasJournal=false, нулевой LastSeq и пустые срезы. Блок
 // несёт только факты о пройденных шагах; BuildHandoff остаётся отдельным
 // контрактом структурированной передачи из пяти полей.
+//
+// CR-03: шаги задачи предлагаются только когда после них не пришло более
+// свежее событие подтверждения. Событие continued с seq старше seq журнала
+// поглощает разрешение, поэтому Steps остаётся пустым. Entries, Count и
+// LastSeq продолжают отражать сам журнал, а не решение о продолжении.
 func (s *Service) RecoverHandoff() (HandoffRecovery, error) {
 	st, err := newHandoffJournalRepo(s.Cfg).load()
+	if err != nil {
+		return HandoffRecovery{}, err
+	}
+	conf, err := newConfirmationRepo(s.Cfg).load()
 	if err != nil {
 		return HandoffRecovery{}, err
 	}
@@ -2595,8 +2716,33 @@ func (s *Service) RecoverHandoff() (HandoffRecovery, error) {
 	if n := len(st.Entries); n > 0 {
 		out.LastSeq = st.Entries[n-1].Seq
 	}
+
+	allowed := make(map[string]bool)
 	for _, e := range st.Entries {
-		out.Steps = append(out.Steps, e.Step)
+		if _, seen := allowed[e.TaskID]; seen {
+			continue
+		}
+		journalSeq, journalSession := handoffJournalSeq(st.Entries, e.TaskID)
+		eventSeq, eventSession := handoffEventSeq(conf.Entries, e.TaskID)
+		ok, reason := handoffContinuationAllowed(e.TaskID, journalSeq, eventSeq, journalSession, eventSession)
+		allowed[e.TaskID] = ok
+		if !ok && out.Reason == "" {
+			out.Reason = reason
+		}
+		out.JournalSeq = journalSeq.value
+		out.LatestEventSeq = eventSeq.value
+		out.SessionID = journalSession
+	}
+	out.Continue = len(allowed) > 0
+	for _, ok := range allowed {
+		if !ok {
+			out.Continue = false
+		}
+	}
+	for _, e := range st.Entries {
+		if allowed[e.TaskID] {
+			out.Steps = append(out.Steps, e.Step)
+		}
 	}
 	return out, nil
 }
@@ -2873,10 +3019,16 @@ func (a HandoffAnswer) valid() bool {
 }
 
 // HandoffConfirmation — один записанный ответ проверки продолжения передачи.
+// Seq продолжает seq журнала handoff, чтобы событие можно было сравнить с
+// шагами по свежести. SessionID связывает ответ с получателем, Continue
+// фиксирует решение правила CR-03 в момент записи.
 type HandoffConfirmation struct {
-	TaskID string        `json:"taskId"`
-	Answer HandoffAnswer `json:"answer"`
-	At     time.Time     `json:"at"`
+	Seq       uint64        `json:"seq"`
+	TaskID    string        `json:"taskId"`
+	Answer    HandoffAnswer `json:"answer"`
+	At        time.Time     `json:"at"`
+	SessionID string        `json:"sessionId,omitempty"`
+	Continue  bool          `json:"continue"`
 }
 
 // HandoffStatus — наблюдаемое состояние подтверждения одной передачи. Answer
@@ -2897,7 +3049,17 @@ type handoffConfirmationState struct {
 // RecordHandoffAnswer записывает ответ проверки факта продолжения. Допустимы
 // только три ответа ADR 0063; неизвестный ответ и пустая задача отклоняются.
 func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at time.Time) (HandoffConfirmation, error) {
+	return s.RecordHandoffAnswerForSession(taskID, "", answer, at)
+}
+
+// RecordHandoffAnswerForSession записывает ответ с сессией получателя. Seq
+// события продолжает seq журнала задачи, поэтому событие, пришедшее после шагов,
+// всегда имеет больший seq и поглощает разрешение на продолжение. Контракт
+// HandoffStatus при этом не меняется: Completed по-прежнему зависит только от
+// последнего ответа.
+func (s *Service) RecordHandoffAnswerForSession(taskID, sessionID string, answer HandoffAnswer, at time.Time) (HandoffConfirmation, error) {
 	taskID = strings.TrimSpace(taskID)
+	sessionID = strings.TrimSpace(sessionID)
 	if taskID == "" {
 		return HandoffConfirmation{}, Validationf("не задана задача подтверждения handoff")
 	}
@@ -2917,7 +3079,27 @@ func (s *Service) RecordHandoffAnswer(taskID string, answer HandoffAnswer, at ti
 	if err != nil {
 		return HandoffConfirmation{}, err
 	}
-	entry := HandoffConfirmation{TaskID: taskID, Answer: answer, At: at.UTC()}
+
+	var journalEntries []HandoffJournalEntry
+	if journal, jerr := newHandoffJournalRepo(s.Cfg).load(); jerr == nil {
+		journalEntries = journal.Entries
+	}
+	var seq uint64 = 1
+	if n := len(st.Entries); n > 0 {
+		seq = st.Entries[n-1].Seq + 1
+	}
+	for _, e := range journalEntries {
+		if e.TaskID == taskID && e.Seq >= seq {
+			seq = e.Seq + 1
+		}
+	}
+	journalSeq, journalSession := handoffJournalSeq(journalEntries, taskID)
+	allowed, _ := handoffContinuationAllowed(taskID, journalSeq, presentHandoffSeq(seq), journalSession, sessionID)
+
+	entry := HandoffConfirmation{
+		Seq: seq, TaskID: taskID, Answer: answer, At: at.UTC(),
+		SessionID: sessionID, Continue: allowed,
+	}
 	st.Entries = append(st.Entries, entry)
 	if err := repo.save(st); err != nil {
 		return HandoffConfirmation{}, err
