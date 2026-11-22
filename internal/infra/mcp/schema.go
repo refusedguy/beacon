@@ -7,6 +7,7 @@ package mcp
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -81,6 +82,66 @@ type FailedCheck struct {
 	// (EH-02). It is optional to keep the wire shape stable for callers that
 	// never configure a source.
 	FailureExcerptUnavailable bool `json:"failureExcerptUnavailable,omitempty"`
+}
+
+// LinterSeverity is the weight class of one linter remark (CA-15). A fatal
+// remark breaks parsing or execution and belongs in the blocking channel. An
+// informational remark is style only and stays out of the wake path.
+type LinterSeverity string
+
+const (
+	LinterSeverityFatal         LinterSeverity = "fatal"
+	LinterSeverityInformational LinterSeverity = "informational"
+)
+
+// fatalLinterCodes are the flake8 codes aider selects as fatal
+// (aider/linter.py:136-168). E9 is a family prefix, so ClassifyLinterSeverity
+// treats every E9xx code as fatal. The other codes are matched exactly:
+// undefined names (F821, F823, F831), misplaced imports (F406, F407) and
+// break/continue or return errors (F701, F702, F704, F706).
+var fatalLinterCodes = map[string]struct{}{
+	"F821": {}, "F823": {}, "F831": {},
+	"F406": {}, "F407": {},
+	"F701": {}, "F702": {}, "F704": {}, "F706": {},
+}
+
+// ClassifyLinterSeverity maps one linter code to its severity. The rule is a
+// pure function so the local pre-pass and any reporting channel share one
+// decision. Codes outside the fatal set are informational: a remark that
+// cannot break parsing or execution must not wake an executor.
+func ClassifyLinterSeverity(code string) LinterSeverity {
+	normalized := strings.ToUpper(strings.TrimSpace(code))
+	if strings.HasPrefix(normalized, "E9") {
+		return LinterSeverityFatal
+	}
+	if _, ok := fatalLinterCodes[normalized]; ok {
+		return LinterSeverityFatal
+	}
+	return LinterSeverityInformational
+}
+
+// LinterRemark is one finding handed to the local pre-pass before it is
+// routed to a channel.
+type LinterRemark struct {
+	Code    string `json:"code"`
+	Message string `json:"message,omitempty"`
+}
+
+// SplitLinterRemarks partitions linter remarks into a blocking and an
+// informational list. fatalOnly is the local pre-pass flag: when true, only
+// fatal codes reach the blocking channel and every other remark is marked
+// informational, so it is reported without a wake. With fatalOnly false the
+// pre-pass keeps the baseline where every remark is blocking. The failedChecks
+// fields required and flakyMatched are not changed by this split.
+func SplitLinterRemarks(remarks []LinterRemark, fatalOnly bool) (blocking, informational []LinterRemark) {
+	for _, remark := range remarks {
+		if fatalOnly && ClassifyLinterSeverity(remark.Code) != LinterSeverityFatal {
+			informational = append(informational, remark)
+			continue
+		}
+		blocking = append(blocking, remark)
+	}
+	return blocking, informational
 }
 
 // MergeSnapshot is the merge block of beacon_get_result.
