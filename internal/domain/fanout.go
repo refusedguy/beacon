@@ -53,6 +53,15 @@ type liveWatchSource interface {
 	LiveWatches() ([]Watch, error)
 }
 
+// unclosedWatchSource is the optional store port that returns every Watch that
+// is not closed, including needs_input and parked. Alias lookup prefers it so a
+// repeat registration finds a Watch waiting for a human and renews it instead
+// of creating a second Watch. A store without it falls back to the narrower
+// live or active set.
+type unclosedWatchSource interface {
+	UnclosedWatches() ([]Watch, error)
+}
+
 // Fanout applies the registration and fan-out rules. It holds a stateStore and
 // a Clock through their domain ports. The mutex serializes the check-then-act
 // sequence so the alias and limit invariants hold under concurrent calls in
@@ -118,18 +127,24 @@ func (f *Fanout) Subscribe(w Watch, s Subscriber) (Subscription, error) {
 		return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 	}
 
-	// The alias lookup must include blocked Watches. A repeat registration on
-	// the same SHA otherwise looks new and overwrites the block with a fresh
-	// watching record. The active set still drives every watch limit.
-	live := active
-	if src, ok := f.store.(liveWatchSource); ok {
-		live, err = src.LiveWatches()
+	// Alias lookup spans every unclosed Watch. A needs_input or parked Watch
+	// must be found so a restart on the same head renews it and keeps the
+	// human's question instead of creating a second Watch. The active set
+	// still drives every watch limit.
+	lookup := active
+	if src, ok := f.store.(unclosedWatchSource); ok {
+		lookup, err = src.UnclosedWatches()
+		if err != nil {
+			return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
+		}
+	} else if src, ok := f.store.(liveWatchSource); ok {
+		lookup, err = src.LiveWatches()
 		if err != nil {
 			return Subscription{}, NewAppErrorWithCause(CodePersistFailed, err.Error(), err)
 		}
 	}
 
-	existing := findByAlias(live, w.Repo, w.PR, w.HeadSHA)
+	existing := findByAlias(lookup, w.Repo, w.PR, w.HeadSHA)
 	newWatch := existing == nil
 
 	target := w

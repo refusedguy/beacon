@@ -495,3 +495,114 @@ func TestSubscribePreservesStoreErrorCause(t *testing.T) {
 		})
 	}
 }
+
+// unclosedStore models the real DB at this point: ActiveWatches is narrow
+// (watching and notifying), LiveWatches adds blocked, and UnclosedWatches adds
+// needs_input and parked. It lets the alias test fail when the Fanout looks
+// only at the active or live set.
+type unclosedStore struct {
+	*memStore
+}
+
+func (s *unclosedStore) ActiveWatches() ([]Watch, error) {
+	all, err := s.memStore.AllWatches()
+	if err != nil {
+		return nil, err
+	}
+	var out []Watch
+	for _, w := range all {
+		if w.Status == StatusWatching || w.Status == StatusNotifying {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
+func (s *unclosedStore) LiveWatches() ([]Watch, error) {
+	all, err := s.memStore.AllWatches()
+	if err != nil {
+		return nil, err
+	}
+	var out []Watch
+	for _, w := range all {
+		if w.Status == StatusWatching || w.Status == StatusNotifying || w.Status == StatusBlocked {
+			out = append(out, w)
+		}
+	}
+	return out, nil
+}
+
+func (s *unclosedStore) UnclosedWatches() ([]Watch, error) {
+	return s.memStore.ActiveWatches()
+}
+
+var (
+	_ liveWatchSource     = (*unclosedStore)(nil)
+	_ unclosedWatchSource = (*unclosedStore)(nil)
+)
+
+func TestSubscribeRenewsUnclosedWatchOnSameAlias(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  Status
+		verdict Verdict
+	}{
+		{"needs_input", StatusNeedsInput, VerdictNeedsInput},
+		{"parked", StatusParked, VerdictParked},
+		{"blocked", StatusBlocked, VerdictBlocked},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &unclosedStore{memStore: newMemStore()}
+			at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+			f := NewFanout(store, fanoutClock{at: at})
+
+			existing := Watch{
+				ID:          "watch:original",
+				Repo:        "refusedguy/beacon",
+				PR:          42,
+				HeadSHA:     "deadbeef",
+				Status:      tc.status,
+				Verdict:     tc.verdict,
+				Revision:    4,
+				Subscribers: []Subscriber{{ID: "executor", Role: RoleExecutor}},
+			}
+			if err := store.SaveWatch(existing); err != nil {
+				t.Fatalf("seed watch: %v", err)
+			}
+
+			res, err := f.Subscribe(
+				Watch{Repo: existing.Repo, PR: existing.PR, HeadSHA: existing.HeadSHA,
+					Status: StatusWatching, Verdict: VerdictWatching},
+				Subscriber{ID: "executor", Role: RoleExecutor},
+			)
+			if err != nil {
+				t.Fatalf("subscribe: %v", err)
+			}
+			if res.Watch.ID != existing.ID {
+				t.Fatalf("watch ID = %q, want %q", res.Watch.ID, existing.ID)
+			}
+			if res.Watch.Status != tc.status {
+				t.Errorf("status = %q, want %q", res.Watch.Status, tc.status)
+			}
+			if res.Watch.Verdict != tc.verdict {
+				t.Errorf("verdict = %q, want %q", res.Watch.Verdict, tc.verdict)
+			}
+			if !res.Renewed {
+				t.Error("renewed = false, want true")
+			}
+
+			all, err := store.AllWatches()
+			if err != nil {
+				t.Fatalf("all watches: %v", err)
+			}
+			if len(all) != 1 {
+				t.Fatalf("watch count = %d, want 1", len(all))
+			}
+			if len(all[0].Subscribers) != 1 {
+				t.Fatalf("subscriber count = %d, want 1", len(all[0].Subscribers))
+			}
+		})
+	}
+}

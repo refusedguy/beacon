@@ -653,6 +653,16 @@ func (d *DB) LiveWatches() ([]domain.Watch, error) {
 		string(domain.StatusBlocked))
 }
 
+// UnclosedWatches returns every Watch that has not been closed, including
+// needs_input, parked and blocked. Alias lookup uses it so a repeat
+// registration renews a Watch waiting for a human instead of creating a
+// second one. ActiveWatches still drives the watch limits.
+func (d *DB) UnclosedWatches() ([]domain.Watch, error) {
+	return d.queryWatches(`
+		SELECT payload FROM watches WHERE status != ? ORDER BY id`,
+		string(domain.StatusClosed))
+}
+
 // AllWatches returns every Watch, including closed ones.
 func (d *DB) AllWatches() ([]domain.Watch, error) {
 	return d.queryWatches(`SELECT payload FROM watches ORDER BY id`)
