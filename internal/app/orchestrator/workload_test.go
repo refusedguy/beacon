@@ -27,6 +27,19 @@ type fakeWorkloadStore struct {
 
 var _ WorkloadStore = (*fakeWorkloadStore)(nil)
 
+// budgetWorkloadStore adds the optional slot-budget capability to the fake for
+// tests that exercise the budget surfaced by RunWorkload.
+type budgetWorkloadStore struct {
+	*fakeWorkloadStore
+	total int
+	used  int
+	err   error
+}
+
+func (s *budgetWorkloadStore) SlotBudget(context.Context) (int, int, error) {
+	return s.total, s.used, s.err
+}
+
 func (s *fakeWorkloadStore) ActiveWorkloadWatches(context.Context) ([]WorkloadWatch, error) {
 	return s.watches, s.activeErr
 }
@@ -182,7 +195,7 @@ func TestRunWorkloadJSONShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"total", "ready", "needsAttention", "watching", "registered", "byVerdict", "byRole", "byProject"} {
+	for _, key := range []string{"total", "ready", "needsAttention", "watching", "registered", "slotsTotal", "slotsUsed", "byVerdict", "byRole", "byProject"} {
 		if _, ok := decoded[key]; !ok {
 			t.Errorf("json missing key %q in %s", key, raw)
 		}
@@ -218,5 +231,79 @@ func TestRunWorkloadErrors(t *testing.T) {
 	}
 	if report.Total != 1 || report.Ready != 1 || report.Registered != 0 {
 		t.Errorf("report = %+v, want counters kept and no registration", report)
+	}
+}
+
+func TestRunWorkloadExposesSlotBudget(t *testing.T) {
+	cases := []struct {
+		name  string
+		total int
+		used  int
+	}{
+		{"lower boundary", 12, 3},
+		{"upper boundary", 17, 0},
+		{"zero budget", 0, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &budgetWorkloadStore{
+				fakeWorkloadStore: &fakeWorkloadStore{watches: []WorkloadWatch{
+					{ID: "w1", Repo: "org/repo", Verdict: "watching"},
+				}},
+				total: tc.total,
+				used:  tc.used,
+			}
+			report, err := RunWorkload(context.Background(), st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if report.SlotsTotal != tc.total {
+				t.Errorf("slotsTotal = %d, want %d", report.SlotsTotal, tc.total)
+			}
+			if report.SlotsUsed != tc.used {
+				t.Errorf("slotsUsed = %d, want %d", report.SlotsUsed, tc.used)
+			}
+			raw, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			for key, want := range map[string]float64{"slotsTotal": float64(tc.total), "slotsUsed": float64(tc.used)} {
+				got, ok := decoded[key].(float64)
+				if !ok || got != want {
+					t.Errorf("json %s = %v, want %v in %s", key, decoded[key], want, raw)
+				}
+			}
+		})
+	}
+}
+
+func TestRunWorkloadSlotBudgetWithoutCapability(t *testing.T) {
+	st := &fakeWorkloadStore{watches: []WorkloadWatch{
+		{ID: "w1", Repo: "org/repo", Verdict: "watching"},
+		{ID: "w2", Repo: "org/repo", Verdict: "ready"},
+	}}
+	report, err := RunWorkload(context.Background(), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.SlotsUsed != len(st.watches) {
+		t.Errorf("slotsUsed = %d, want %d from the snapshot", report.SlotsUsed, len(st.watches))
+	}
+	if report.SlotsTotal != 0 {
+		t.Errorf("slotsTotal = %d, want 0 without a budget source", report.SlotsTotal)
+	}
+}
+
+func TestRunWorkloadSlotBudgetError(t *testing.T) {
+	st := &budgetWorkloadStore{
+		fakeWorkloadStore: &fakeWorkloadStore{},
+		err:               errors.New("invalid slot budget"),
+	}
+	if _, err := RunWorkload(context.Background(), st); err == nil || !strings.Contains(err.Error(), "invalid slot budget") {
+		t.Errorf("budget error = %v, want wrapped invalid slot budget", err)
 	}
 }

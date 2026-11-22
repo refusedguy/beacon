@@ -183,3 +183,69 @@ func TestValidateLimitsAcceptsDefaults(t *testing.T) {
 		t.Fatalf("ValidateLimits(DefaultLimits()): %v", err)
 	}
 }
+
+func intPtr(n int) *int { return &n }
+
+func TestValidateSlotBudgetAcceptsSupportedValues(t *testing.T) {
+	for _, budget := range []int{SlotBudgetDisabled, SlotBudgetMin, 14, SlotBudgetMax} {
+		if err := ValidateSlotBudget(budget); err != nil {
+			t.Errorf("ValidateSlotBudget(%d): %v", budget, err)
+		}
+	}
+}
+
+func TestValidateSlotBudgetRejectsUnsupportedValues(t *testing.T) {
+	for _, budget := range []int{-1, SlotBudgetMin - 1, SlotBudgetMax + 1, 18, 100} {
+		err := ValidateSlotBudget(budget)
+		if err == nil {
+			t.Errorf("ValidateSlotBudget(%d) accepted", budget)
+			continue
+		}
+		assertLimitError(t, err, "max_concurrent_agents", "must be 0 or in range")
+	}
+}
+
+func TestResolveSlotBudgetUsesDefaultWhenConfigMissing(t *testing.T) {
+	got, err := ResolveSlotBudget(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != DefaultSlotBudget {
+		t.Fatalf("ResolveSlotBudget(nil) = %d, want %d", got, DefaultSlotBudget)
+	}
+	if got < SlotBudgetMin || got > SlotBudgetMax {
+		t.Fatalf("default budget %d outside [%d, %d]", got, SlotBudgetMin, SlotBudgetMax)
+	}
+}
+
+func TestResolveSlotBudgetHonoursConfiguredValue(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured *int
+		want       int
+		wantErr    bool
+	}{
+		{"lower boundary", intPtr(SlotBudgetMin), SlotBudgetMin, false},
+		{"upper boundary", intPtr(SlotBudgetMax), SlotBudgetMax, false},
+		{"zero budget", intPtr(SlotBudgetDisabled), SlotBudgetDisabled, false},
+		{"below range", intPtr(SlotBudgetMin - 1), 0, true},
+		{"above range", intPtr(SlotBudgetMax + 1), 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveSlotBudget(tc.configured)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveSlotBudget(%d) accepted", *tc.configured)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("ResolveSlotBudget(%d) = %d, want %d", *tc.configured, got, tc.want)
+			}
+		})
+	}
+}

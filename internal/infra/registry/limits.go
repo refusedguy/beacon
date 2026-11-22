@@ -21,6 +21,19 @@ const (
 	defaultTimeoutSeconds      = 300
 )
 
+// Parallel slot budget exposed by the orchestrator workload report. The
+// registry's max_concurrent_agents limit keeps its broad range for the agent
+// registry itself; the slot budget is the narrower runtime capacity and shares
+// the same config key. Zero disables capacity, like domain.NewOrchestrator.
+const (
+	SlotBudgetDisabled = 0
+	SlotBudgetMin      = 12
+	SlotBudgetMax      = 17
+
+	// DefaultSlotBudget applies when the config does not set a budget at all.
+	DefaultSlotBudget = SlotBudgetMin
+)
+
 // Limits is the validated limits block of one agent registry config.
 // A value read by ParseLimits is never zero unless zero is in that field's
 // range, because absent keys take the defaults in limitSpecs.
@@ -151,6 +164,49 @@ func ParseLimits(raw map[string]any) (Limits, error) {
 		*spec.target(&parsed) = int(value)
 	}
 	return parsed, nil
+}
+
+// ValidateSlotBudget checks one parallel-slot budget. Zero is a valid "no
+// capacity" configuration; every positive value must sit in [12, 17]. A bad
+// value reports the config key so the caller can reject the configuration.
+func ValidateSlotBudget(budget int) error {
+	if budget == SlotBudgetDisabled {
+		return nil
+	}
+	if budget < SlotBudgetMin || budget > SlotBudgetMax {
+		return limitError("max_concurrent_agents",
+			fmt.Sprintf("must be %d or in range [%d, %d]", SlotBudgetDisabled, SlotBudgetMin, SlotBudgetMax),
+			budget)
+	}
+	return nil
+}
+
+// ParseSlotBudgetValue validates one raw max_concurrent_agents value. Other
+// keys in the limits block are ignored, so a config with unrelated limits does
+// not break the slot budget reader.
+func ParseSlotBudgetValue(raw any) (int, error) {
+	value, err := limitInt(raw)
+	if err != nil {
+		return 0, limitError("max_concurrent_agents", "must be an integer", raw)
+	}
+	budget := int(value)
+	if err := ValidateSlotBudget(budget); err != nil {
+		return 0, err
+	}
+	return budget, nil
+}
+
+// ResolveSlotBudget returns the effective budget for an optional configured
+// value. A nil pointer means the config has no budget, so the documented
+// default applies. A configured value is validated before it is returned.
+func ResolveSlotBudget(configured *int) (int, error) {
+	if configured == nil {
+		return DefaultSlotBudget, nil
+	}
+	if err := ValidateSlotBudget(*configured); err != nil {
+		return 0, err
+	}
+	return *configured, nil
 }
 
 func knownLimitField(field string) bool {
