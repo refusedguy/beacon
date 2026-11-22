@@ -355,12 +355,15 @@ func TestFileTaskCloseConflictsWhenReasonChanges(t *testing.T) {
 		t.Fatalf("first close: %v", err)
 	}
 
-	_, err := store.Close(context.Background(), TaskCloseInput{
+	out, err := store.Close(context.Background(), TaskCloseInput{
 		CardID: "IDX-05", Status: "done", Reason: "second reason", AgentID: "ses_worker",
 	}, taskCloseFixedAt)
 	appErr := taskCloseAppError(t, err)
 	if appErr.Code != domain.CodeRejectDuplicate || appErr.Status != 409 {
 		t.Fatalf("code/status = %s/%d, want REJECT_DUPLICATE/409", appErr.Code, appErr.Status)
+	}
+	if out.OK || out.Created {
+		t.Fatalf("conflicting replay output = %+v, want no OK and no Created", out)
 	}
 
 	text := readTaskCloseCard(t, path)
@@ -614,8 +617,8 @@ func TestFileTaskCloseRepeatAfterPartialWriteCompletesCard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay after partial write: %v", err)
 	}
-	if !out.OK {
-		t.Fatal("ok = false after a partial write")
+	if !out.OK || out.Created {
+		t.Fatalf("output after a partial write = %+v, want OK and Created false", out)
 	}
 
 	text := readTaskCloseCard(t, path)
@@ -655,5 +658,50 @@ func TestFileTaskClosePartialWriteStillConflictsOnChangedReason(t *testing.T) {
 	assertCardHas(t, readTaskCloseCard(t, path), "Причина: first")
 	if strings.Contains(readTaskCloseCard(t, path), "second") {
 		t.Fatalf("conflicting reason was written to a partial card")
+	}
+}
+
+// TestFileTaskCloseCreatedMarksOnlyTheFirstClose proves the output separates a
+// fresh close from an idempotent repeat without changing ok.
+func TestFileTaskCloseCreatedMarksOnlyTheFirstClose(t *testing.T) {
+	store, dir := taskCloseTestStore(t)
+	writeTaskCloseTestCard(t, dir, "IDX-05", "todo", "нет")
+	in := TaskCloseInput{CardID: "IDX-05", Status: "done", Reason: "fixed", AgentID: "ses_worker"}
+
+	first, err := store.Close(context.Background(), in, taskCloseFixedAt)
+	if err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	if !first.OK || !first.Created {
+		t.Fatalf("first close output = %+v, want OK and Created true", first)
+	}
+
+	second, err := store.Close(context.Background(), in, taskCloseFixedAt)
+	if err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if !second.OK || second.Created {
+		t.Fatalf("second close output = %+v, want OK and Created false", second)
+	}
+}
+
+// TestTaskCloseOutputSchemaHasCreatedField proves the advertised schema reflects
+// the new output field while keeping the three original fields.
+func TestTaskCloseOutputSchemaHasCreatedField(t *testing.T) {
+	schema, err := taskCloseOutputSchema()
+	if err != nil {
+		t.Fatalf("taskCloseOutputSchema: %v", err)
+	}
+	created := schema.Properties["created"]
+	if created == nil {
+		t.Fatal("task close output schema has no created property")
+	}
+	if created.Type != "boolean" {
+		t.Fatalf("created schema type = %q, want boolean", created.Type)
+	}
+	for _, field := range []string{"ok", "cardID", "status"} {
+		if schema.Properties[field] == nil {
+			t.Errorf("task close output schema lost %q", field)
+		}
 	}
 }
