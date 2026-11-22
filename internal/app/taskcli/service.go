@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -37,6 +38,10 @@ type Config struct {
 	// вызов идёт через taskstore.AcquireLock с его шагом 100 мс. Тесты ставят
 	// короткий интервал, не меняя production-путь.
 	LockRetryInterval time.Duration
+
+	// HooksDir задаёт каталог сценариев жизненного цикла карточки. Пустое
+	// значение отключает хуки и не создаёт файл журнала.
+	HooksDir string
 }
 
 // Service выполняет list, new и take.
@@ -46,6 +51,140 @@ type Service struct {
 
 // NewService создаёт сервис с конфигурацией.
 func NewService(cfg Config) *Service { return &Service{Cfg: cfg} }
+
+// ---- AN-06: точки расширения на жизненном цикле карточки ----
+//
+// Сценарии лежат в Config.HooksDir и не имеют отношения к .githooks:
+// pre-commit и pre-push остаются нетронутыми. Имя сценария до первой точки
+// совпадает с событием, например claimed.sh или closed. Сценарии одного
+// события запускаются в порядке сортировки имён, поэтому порядок вызовов
+// детерминирован. Один вызов события даёт ровно одну запись в журнал.
+// Ошибка сценария пишется в журнал и не меняет статус карточки.
+
+// HookEvent — событие жизненного цикла карточки.
+type HookEvent string
+
+const (
+	HookClaimed   HookEvent = "claimed"
+	HookUnblocked HookEvent = "unblocked"
+	HookClosed    HookEvent = "closed"
+)
+
+// HookLogEntry — одна запись о вызове сценариев события.
+type HookLogEntry struct {
+	Event  string   `json:"event"`
+	CardID string   `json:"card_id"`
+	Time   string   `json:"time"`
+	Hooks  []string `json:"hooks"`
+	Error  string   `json:"error,omitempty"`
+}
+
+// hookPayload уходит сценарию на stdin.
+type hookPayload struct {
+	Event  string `json:"event"`
+	CardID string `json:"card_id"`
+	Time   string `json:"time"`
+}
+
+// hookFiles возвращает сценарии события в порядке имён.
+func hookFiles(dir string, event HookEvent) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	want := string(event)
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		base := name
+		if i := strings.IndexByte(base, '.'); i >= 0 {
+			base = base[:i]
+		}
+		if base == want {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// RunHooks вызывает сценарии события и пишет одну запись в журнал. Возвращаемая
+// ошибка относится только к журналу, сбой сценария в неё не входит.
+func (s *Service) RunHooks(event HookEvent, cardID, when string) error {
+	dir := strings.TrimSpace(s.Cfg.HooksDir)
+	if dir == "" {
+		return nil
+	}
+	names, err := hookFiles(dir, event)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(hookPayload{Event: string(event), CardID: cardID, Time: when})
+	if err != nil {
+		return err
+	}
+	entry := HookLogEntry{Event: string(event), CardID: cardID, Time: when, Hooks: []string{}}
+	for _, name := range names {
+		entry.Hooks = append(entry.Hooks, name)
+		cmd := exec.Command(filepath.Join(dir, name))
+		cmd.Stdin = strings.NewReader(string(body))
+		out, runErr := cmd.CombinedOutput()
+		if runErr == nil {
+			continue
+		}
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = runErr.Error()
+		}
+		if entry.Error != "" {
+			entry.Error += "; "
+		}
+		entry.Error += name + ": " + msg
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(filepath.Join(s.Cfg.StateDir, "hooks.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "%s\n", line)
+	return err
+}
+
+// HookLog возвращает записи о вызовах хуков в порядке записи.
+func (s *Service) HookLog() ([]HookLogEntry, error) {
+	raw, err := os.ReadFile(filepath.Join(s.Cfg.StateDir, "hooks.jsonl"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var entries []HookLogEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry HookLogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
 
 // cardLock — та часть файлового замка, которая нужна сервису.
 type cardLock interface {
@@ -717,6 +856,9 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 	if err := AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
 		return "", err
 	}
+	// AN-06: хуки идут после успешной записи карточки. Их сбой не откатывает
+	// карточку и не меняет её статус.
+	_ = s.RunHooks(HookClaimed, id, when)
 	return fmt.Sprintf("%s in_progress %s %s", id, o.Agent, when), nil
 }
 
