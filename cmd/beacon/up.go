@@ -135,6 +135,28 @@ func installUpNotifications(sink wake.NotificationSink) func() {
 	return func() { observe.SetDefault(previous) }
 }
 
+// upIntervalEnv overrides the status loop interval when --interval is absent.
+const upIntervalEnv = "BEACON_UP_INTERVAL"
+
+// upIntervalDefault is both the --interval default and the value used when the
+// env value is invalid. A typo cannot stop the loop.
+const upIntervalDefault = 2 * time.Second
+
+// upIntervalFromEnv reads BEACON_UP_INTERVAL. An empty value leaves the flag
+// default in place. A bad value is reported and ignored.
+func upIntervalFromEnv() (time.Duration, bool) {
+	raw := strings.TrimSpace(os.Getenv(upIntervalEnv))
+	if raw == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		observe.WarnConfig(upIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
+		return 0, false
+	}
+	return d, true
+}
+
 // runUp implements `beacon up [--interval 2s] [--once]`. It starts the same
 // single ReconcileLoop as `beacon mcp` and `beacon daemon`, prints a compact
 // status on every tick and serves bot commands from Telegram. There is no
@@ -149,12 +171,24 @@ func runUp(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("up", flag.ContinueOnError)
 	fs.SetOutput(c.errOut)
 	fs.Usage = func() {}
-	interval := fs.Duration("interval", 2*time.Second, "интервал опроса Telegram и вывода статуса")
+	interval := fs.Duration("interval", upIntervalDefault, "интервал опроса Telegram и вывода статуса")
 	once := fs.Bool("once", false, "один проход ReconcilePass и выход")
 	channels := fs.Bool("channels", channelsCfg.Enabled, "принимать команды из внешнего канала")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		writeUsage(c.errOut)
 		return 2
+	}
+	// An explicit --interval wins over the env override.
+	intervalExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "interval" {
+			intervalExplicit = true
+		}
+	})
+	if !intervalExplicit {
+		if fromEnv, ok := upIntervalFromEnv(); ok {
+			*interval = fromEnv
+		}
 	}
 	if *interval <= 0 {
 		fmt.Fprintf(c.errOut, "beacon up: интервал должен быть положительным\n")

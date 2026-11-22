@@ -17,6 +17,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
@@ -205,18 +206,53 @@ func renderLiveTable(w io.Writer, rows []watchRow) {
 	_ = tw.Flush()
 }
 
+// watchIntervalEnv overrides the live re-read interval when --interval is
+// absent.
+const watchIntervalEnv = "BEACON_WATCH_INTERVAL"
+
+// watchIntervalDefault is both the --interval default and the value used when
+// the env value is invalid. A typo cannot stop the loop.
+const watchIntervalDefault = 2 * time.Second
+
+// watchIntervalFromEnv reads BEACON_WATCH_INTERVAL. An empty value leaves the
+// flag default in place. A bad value is reported and ignored.
+func watchIntervalFromEnv() (time.Duration, bool) {
+	raw := strings.TrimSpace(os.Getenv(watchIntervalEnv))
+	if raw == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		observe.WarnConfig(watchIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
+		return 0, false
+	}
+	return d, true
+}
+
 // runWatch is the beacon watch command. Without --live it takes exactly one
 // Beacon snapshot and one `opencode api session.list` call (T3.12). With --live
 // it becomes a long-running, event-driven loop over the SSE subscription
 // (T3.141 / ADR 0060).
 func runWatch(c *CLI, args []string) int {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	interval := fs.Duration("interval", 2*time.Second, "период предохранительного перечитывания снимка в живом контуре")
+	interval := fs.Duration("interval", watchIntervalDefault, "период предохранительного перечитывания снимка в живом контуре")
 	live := fs.Bool("live", false, "жить по событиям SSE /api/event вместо одного снимка")
 	format := fs.String("format", "table", "формат вывода: table или json")
 	wake := fs.Bool("wake", false, "батч событий за 200мс в одно пробуждение сессии")
 	if !parseFlags("watch", args, c.errOut, fs) {
 		return 2
+	}
+	// An explicit --interval wins over the env override.
+	intervalExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "interval" {
+			intervalExplicit = true
+		}
+	})
+	if !intervalExplicit {
+		if fromEnv, ok := watchIntervalFromEnv(); ok {
+			*interval = fromEnv
+		}
 	}
 	if !parseFormatFlag(*format, "beacon watch: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
