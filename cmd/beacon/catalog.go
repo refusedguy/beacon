@@ -45,6 +45,7 @@ var catalog = []command{
 	{Name: "mcp", Summary: "Запустить MCP-сервер на stdio", Usage: "beacon mcp"},
 	{Name: "reset", Summary: "Очистить состояние control plane проекта", Usage: "beacon reset --yes"},
 	{Name: "task", Summary: "Работа с карточками задач", Usage: "beacon task <list|new|take> [flags]"},
+	{Name: "test", Summary: "Запустить тесты проекта через go test ./...", Usage: "beacon test"},
 	{Name: "watch", Summary: "Показать вотчи Beacon с вердиктами и сессиями OpenCode", Usage: "beacon watch [--interval 2s] [--format table|json]"},
 	{Name: "what", Summary: "Показать описание одной команды", Usage: "beacon what <command>"},
 	{Name: "why", Summary: "Показать цепочку блокировок карточки", Usage: "beacon why <task>"},
