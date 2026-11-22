@@ -96,6 +96,11 @@ func init() {
 	catalog = append(catalog, spawnCatalogEntry, serverCatalogEntry, regradeCatalogEntry)
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 
+	// commandFormats lives in catalog.go, outside this card's file ownership.
+	// Registering the value here keeps --format validation and the catalog
+	// format test in sync with the regrade entry above.
+	commandFormats["regrade"] = []string{"table", "json"}
+
 	// RegisterGC and RegisterGCWorktree are installed in gc.go, and
 	// RegisterBoard in board_wire.go. The two commands owned by deferred cards
 	// without their own init are installed here: the dispatch cases below
