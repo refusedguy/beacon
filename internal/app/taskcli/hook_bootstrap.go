@@ -19,8 +19,9 @@ type HookFile struct {
 	CopyFrom   string
 }
 
-// HookFS описывает часть файловой системы, которая нужна bootstrap. Сервис
-// передаёт реализацию на os, тесты подставляют заглушку со счётчиком записей.
+// HookFS описывает часть файловой системы, которая нужна bootstrap. Реализацию
+// поверх os передаёт инфраструктурный слой, тесты подставляют заглушку со
+// счётчиком записей. Пакет app не вызывает os напрямую.
 type HookFS interface {
 	MkdirAll(path string, perm os.FileMode) error
 	Stat(path string) (os.FileInfo, error)
@@ -28,17 +29,6 @@ type HookFS interface {
 	WriteFile(path string, data []byte, perm os.FileMode) error
 	Chmod(path string, perm os.FileMode) error
 }
-
-// OSHookFS адаптирует операционную систему к HookFS.
-type OSHookFS struct{}
-
-func (OSHookFS) MkdirAll(path string, perm os.FileMode) error { return os.MkdirAll(path, perm) }
-func (OSHookFS) Stat(path string) (os.FileInfo, error)        { return os.Stat(path) }
-func (OSHookFS) ReadFile(path string) ([]byte, error)         { return os.ReadFile(path) }
-func (OSHookFS) WriteFile(path string, data []byte, perm os.FileMode) error {
-	return os.WriteFile(path, data, perm)
-}
-func (OSHookFS) Chmod(path string, perm os.FileMode) error { return os.Chmod(path, perm) }
 
 // BootstrapHooks создаёт недостающие файлы каталога хуков. Существующие файлы
 // он не трогает, поэтому повторный вызов ничего не записывает. Возвращается
