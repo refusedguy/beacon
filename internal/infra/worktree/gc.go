@@ -205,7 +205,14 @@ const (
 	ReasonChanged        = "changed"
 	ReasonIgnoredFiles   = "ignored_files"
 	ReasonInsideWorktree = "inside_worktree"
+	ReasonOwnerLease     = "owner_lease"
+	ReasonNoWatches      = "no_watches"
 )
+
+// gcLeaseOwner is the actor Collect uses when it takes an OwnerLease. A
+// handoff holds the same slot under its own owner, so either actor can block
+// the other while a target is being checked and removed.
+const gcLeaseOwner = "worktree-gc"
 
 // Kept is one worktree that collection did not remove.
 type Kept struct {
@@ -266,12 +273,39 @@ func DecideGuard(g Guard, c Candidate) (reason string, removed bool) {
 	}
 }
 
-// Collect removes clean, unlocked worktrees that have no live Watch at their
-// head and are not in protectedDirs. It reuses List, Status and Remove, so List
+// watchInput normalizes the Watch argument Collect accepts. Legacy callers
+// pass a head-to-Watch map, which carries only the recorded head, so their
+// exact-head reason keeps the old active_watch format. New callers pass the
+// full []WatchAnchor set and receive the GuardWatch reason. An explicitly
+// empty set keeps every candidate, the same rule cibridge.ScopeWorktrees uses
+// for an empty closedWatchID. A nil value means the caller supplied no Watch
+// information and preserves the legacy collection pass.
+func watchInput(watches any) (anchors []WatchAnchor, legacy, fullSet bool) {
+	switch v := watches.(type) {
+	case nil:
+		return nil, true, false
+	case map[string]string:
+		return AnchorsFromHeads(v), true, false
+	case []WatchAnchor:
+		return v, false, true
+	default:
+		return nil, true, false
+	}
+}
+
+// Collect removes clean, unlocked worktrees that no live Watch protects and
+// that are not in protectedDirs. It reuses List, Status and Remove, so List
 // always drops the main worktree and Remove can never delete a dirty tree even
 // if the status check is skipped. A status error or a failed remove keeps the
 // worktree with a reason instead of aborting the whole pass.
-func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Result, error) {
+//
+// Collect calls GuardWatch with the Watch anchors it was given. The guard
+// checks an exact head, then the Watch branch and binding, then ancestry, so a
+// worktree whose HEAD moved past a recorded headSHA is kept with reason
+// head_ancestor. An OwnerLease spans the guard check, the status check and the
+// removal; a parallel handoff holding the same directory wins the slot and the
+// collector keeps the tree instead of racing on a swapped target.
+func Collect(run Runner, watches any, protectedDirs ...string) (Result, error) {
 	start := time.Now()
 	defer func() { observe.Observe(HistogramGCDuration, time.Since(start).Seconds()) }()
 
@@ -285,6 +319,7 @@ func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Resu
 			protected[cleanDir(dir)] = true
 		}
 	}
+	anchors, legacy, fullSet := watchInput(watches)
 
 	var out Result
 	for _, e := range entries {
@@ -298,30 +333,47 @@ func Collect(run Runner, heads map[string]string, protectedDirs ...string) (Resu
 		case protected[cleanDir(e.Dir)]:
 			keep(ReasonProtectedDir)
 			continue
-		}
-		if id := WatchIDForHead(heads, e.Head); id != "" {
-			keep(ReasonActiveWatch + ":" + id)
+		case fullSet && len(anchors) == 0:
+			keep(ReasonNoWatches)
 			continue
 		}
-		status, statusErr := Status(run, e.Dir)
-		switch {
-		case statusErr != nil:
-			keep(ReasonStatusError + ":" + statusErr.Error())
-			continue
-		case strings.TrimSpace(status) != "":
-			keep(ReasonDirty)
+
+		release, ok := AcquireOwnerLease(e.Dir, gcLeaseOwner)
+		if !ok {
+			keep(ReasonOwnerLease)
 			continue
 		}
-		if err := Remove(run, e.Dir); err != nil {
-			var blocked *BlockedError
-			if errors.As(err, &blocked) {
-				keep(blocked.Reason)
-			} else {
-				keep(ReasonRemoveError + ":" + err.Error())
+		func() {
+			defer release()
+
+			if answer, guarded := GuardWatch(run, e, anchors); guarded {
+				reason := answer.Reason
+				if legacy && answer.Reason == GuardReasonExactHead {
+					reason = ReasonActiveWatch + ":" + answer.ID
+				}
+				keep(reason)
+				return
 			}
-			continue
-		}
-		out.Removed = append(out.Removed, e.Dir)
+			status, statusErr := Status(run, e.Dir)
+			switch {
+			case statusErr != nil:
+				keep(ReasonStatusError + ":" + statusErr.Error())
+				return
+			case strings.TrimSpace(status) != "":
+				keep(ReasonDirty)
+				return
+			}
+			if err := Remove(run, e.Dir); err != nil {
+				var blocked *BlockedError
+				if errors.As(err, &blocked) {
+					keep(blocked.Reason)
+				} else {
+					keep(ReasonRemoveError + ":" + err.Error())
+				}
+				return
+			}
+			out.Removed = append(out.Removed, e.Dir)
+		}()
 	}
 	return out, nil
 }
