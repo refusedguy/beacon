@@ -6,6 +6,7 @@ package session
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -221,5 +222,35 @@ func copySessionMetadata(in map[string]string) map[string]string {
 	for k, v := range in {
 		out[k] = v
 	}
+	return out
+}
+
+// MetadataCompactionCutoff is the metadata key that records the journal index
+// of the newest complete compaction. A fork uses it to bound its reverse scan.
+const MetadataCompactionCutoff = "compactionCutoff"
+
+// CompactionCutoff reads the recorded fork cutoff. A missing or malformed
+// value reports false, so the caller scans the whole journal instead of
+// trusting a broken record.
+func CompactionCutoff(metadata map[string]string) (int, bool) {
+	raw, ok := metadata[MetadataCompactionCutoff]
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// WithCompactionCutoff returns a copy of metadata with index recorded as the
+// fork cutoff. The input map stays owned by the caller.
+func WithCompactionCutoff(metadata map[string]string, index int) map[string]string {
+	out := make(map[string]string, len(metadata)+1)
+	for k, v := range metadata {
+		out[k] = v
+	}
+	out[MetadataCompactionCutoff] = strconv.Itoa(index)
 	return out
 }
