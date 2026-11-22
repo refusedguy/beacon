@@ -909,3 +909,157 @@ func TestHTTPStateProviderSnapshotHistoryBoundsByTimeAndCount(t *testing.T) {
 		t.Fatalf("SnapshotHistory without store = %+v, %v", empty, err)
 	}
 }
+
+// autoSpawnTestRoot makes a project root with an empty docs/tasks directory.
+func autoSpawnTestRoot(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "docs", "tasks"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	return root
+}
+
+// autoSpawnTestCard writes one valid card into root/docs/tasks.
+func autoSpawnTestCard(t *testing.T, root, id, status, owner string) {
+	t.Helper()
+	raw := fmt.Sprintf(`# %s. Test card
+Статус: %s
+Фаза: P1
+Тип: task
+Владелец файлов: %s
+Зависимости: 
+Ссылка: 
+Агент: нет
+Время: нет
+Цель: цель
+Контекст: контекст
+Шаги: шаги
+Проверка: проверка
+Приёмка: приёмка
+`, id, status, owner)
+	if err := os.WriteFile(filepath.Join(root, "docs", "tasks", id+".md"), []byte(raw), 0o600); err != nil {
+		t.Fatalf("write card %s: %v", id, err)
+	}
+}
+
+// autoSpawnTestDB stores live watches, each one consuming a slot.
+func autoSpawnTestDB(t *testing.T, live int) *store.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	for i := 0; i < live; i++ {
+		w := domain.Watch{
+			ID:      fmt.Sprintf("live-%02d", i),
+			Repo:    "refusedguy/beacon",
+			PR:      i + 1,
+			Status:  domain.StatusWatching,
+			Verdict: domain.VerdictWatching,
+		}
+		if err := db.SaveWatch(w); err != nil {
+			t.Fatalf("SaveWatch %s: %v", w.ID, err)
+		}
+	}
+	return db
+}
+
+func autoSpawnCountingSpawner(calls *int, ids *[]string) *autoSpawner {
+	return &autoSpawner{start: func(_ context.Context, _ reconcileConfig, cardID, _ string) bool {
+		*calls = *calls + 1
+		*ids = append(*ids, cardID)
+		return true
+	}}
+}
+
+// TestReconcileAutoSpawnNoFreeSlot proves that a full slot budget starts no
+// agent even when a todo card is queued.
+func TestReconcileAutoSpawnNoFreeSlot(t *testing.T) {
+	db := autoSpawnTestDB(t, domain.DefaultSlotsTotal)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "todo", "cmd/beacon/mcp.go")
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root}
+	if n := reconcileAutoSpawn(context.Background(), cfg, autoSpawnCountingSpawner(&calls, &ids)); n != 0 {
+		t.Fatalf("started = %d, want 0", n)
+	}
+	if calls != 0 {
+		t.Fatalf("spawn calls = %d, want 0", calls)
+	}
+}
+
+// TestReconcileAutoSpawnStartsOneAgent proves that a free slot and one todo
+// card produce exactly one spawn with the selected card id.
+func TestReconcileAutoSpawnStartsOneAgent(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "todo", "cmd/beacon/mcp.go")
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root}
+	if n := reconcileAutoSpawn(context.Background(), cfg, autoSpawnCountingSpawner(&calls, &ids)); n != 1 {
+		t.Fatalf("started = %d, want 1", n)
+	}
+	if calls != 1 || len(ids) != 1 || ids[0] != "T9.1" {
+		t.Fatalf("spawn calls = %d, ids = %#v, want one call for T9.1", calls, ids)
+	}
+}
+
+// TestReconcileAutoSpawnSkipsBusyOwnerFiles proves that a todo card whose
+// OwnerFiles touch an in_progress card cannot take a slot.
+func TestReconcileAutoSpawnSkipsBusyOwnerFiles(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "in_progress", "cmd/beacon/mcp.go")
+	autoSpawnTestCard(t, root, "T9.2", "todo", "cmd/beacon/mcp.go")
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root}
+	if n := reconcileAutoSpawn(context.Background(), cfg, autoSpawnCountingSpawner(&calls, &ids)); n != 0 {
+		t.Fatalf("started = %d, want 0", n)
+	}
+	if calls != 0 {
+		t.Fatalf("spawn calls = %d, want 0", calls)
+	}
+}
+
+// TestReconcileAutoSpawnPicksFreeCard proves that a conflicting candidate is
+// skipped and the next todo card with free OwnerFiles is started.
+func TestReconcileAutoSpawnPicksFreeCard(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "in_progress", "cmd/beacon/mcp.go")
+	autoSpawnTestCard(t, root, "T9.2", "todo", "cmd/beacon/mcp.go")
+	autoSpawnTestCard(t, root, "T9.3", "todo", "internal/domain/orchestrator.go")
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{db: db, root: root}
+	if n := reconcileAutoSpawn(context.Background(), cfg, autoSpawnCountingSpawner(&calls, &ids)); n != 1 {
+		t.Fatalf("started = %d, want 1", n)
+	}
+	if calls != 1 || len(ids) != 1 || ids[0] != "T9.3" {
+		t.Fatalf("spawn calls = %d, ids = %#v, want one call for T9.3", calls, ids)
+	}
+}
+
+// TestReconcilePassCallsAutoSpawnOnce proves that one reconciler pass reaches
+// the spawn seam exactly once.
+func TestReconcilePassCallsAutoSpawnOnce(t *testing.T) {
+	db := autoSpawnTestDB(t, 0)
+	defer db.Close()
+	root := autoSpawnTestRoot(t)
+	autoSpawnTestCard(t, root, "T9.1", "todo", "cmd/beacon/mcp.go")
+	calls, ids := 0, []string{}
+	cfg := reconcileConfig{
+		dir:       t.TempDir(),
+		db:        db,
+		root:      root,
+		autoSpawn: autoSpawnCountingSpawner(&calls, &ids),
+	}
+	ReconcilePass(context.Background(), cfg)
+	if calls != 1 || len(ids) != 1 || ids[0] != "T9.1" {
+		t.Fatalf("spawn calls = %d, ids = %#v, want one call for T9.1", calls, ids)
+	}
+}
