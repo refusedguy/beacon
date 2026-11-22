@@ -258,6 +258,162 @@ func DefaultMergePolicy() MergePolicy {
 	return MergePolicy{AutoMerge: true}
 }
 
+// PermissionMode is the tool-permission mode of one agent session. The set is
+// closed and stored as data, so a session can switch mode on the control channel
+// without rebuilding the tool handler. The zero value fails closed: an unset
+// mode is never read as a permissive default.
+//
+// PermissionMode and MergePolicy are different axes. MergePolicy decides how a
+// Watch merges. PermissionMode decides which tool calls an agent may make. A
+// merge setting must never grant tool access, so the two types stay separate.
+type PermissionMode string
+
+const (
+	PermissionModeDefault           PermissionMode = "default"
+	PermissionModeAcceptEdits       PermissionMode = "acceptEdits"
+	PermissionModePlan              PermissionMode = "plan"
+	PermissionModeBypassPermissions PermissionMode = "bypassPermissions"
+	PermissionModeDontAsk           PermissionMode = "dontAsk"
+	PermissionModeAuto              PermissionMode = "auto"
+)
+
+// Valid reports whether m is one of the defined modes.
+func (m PermissionMode) Valid() bool {
+	switch m {
+	case PermissionModeDefault, PermissionModeAcceptEdits, PermissionModePlan,
+		PermissionModeBypassPermissions, PermissionModeDontAsk, PermissionModeAuto:
+		return true
+	default:
+		return false
+	}
+}
+
+// PermissionScope is the reach of a rule update. ScopeSession confines an update
+// to one session. The settings scopes name rules that outlive a session and are
+// stored here as opaque identifiers. A session-scoped update never writes to
+// another session's state.
+type PermissionScope string
+
+const (
+	PermissionScopeSession         PermissionScope = "session"
+	PermissionScopeLocalSettings   PermissionScope = "localSettings"
+	PermissionScopeProjectSettings PermissionScope = "projectSettings"
+	PermissionScopeUserSettings    PermissionScope = "userSettings"
+)
+
+// Valid reports whether s is one of the defined scopes.
+func (s PermissionScope) Valid() bool {
+	switch s {
+	case PermissionScopeSession, PermissionScopeLocalSettings,
+		PermissionScopeProjectSettings, PermissionScopeUserSettings:
+		return true
+	default:
+		return false
+	}
+}
+
+// PermissionUpdate is one rule update carried on the control channel. Scope and
+// Tools are mandatory. Mode is optional and narrows the rule to a mode.
+type PermissionUpdate struct {
+	Scope PermissionScope `json:"scope"`
+	Tools []string        `json:"tools"`
+	Mode  PermissionMode  `json:"mode,omitempty"`
+	Deny  bool            `json:"deny,omitempty"`
+}
+
+// Validate rejects an incomplete update before any state is written. All or
+// nothing is deliberate: a partial rule would grant access the caller never
+// asked for. An unknown scope, an empty tool list, an empty tool name or an
+// unknown mode each reject the whole update.
+func (u PermissionUpdate) Validate() error {
+	if !u.Scope.Valid() {
+		return fmt.Errorf("permission update: invalid scope %q", u.Scope)
+	}
+	if len(u.Tools) == 0 {
+		return errors.New("permission update: tools must not be empty")
+	}
+	for _, tool := range u.Tools {
+		if tool == "" {
+			return errors.New("permission update: tool name must not be empty")
+		}
+	}
+	if u.Mode != "" && !u.Mode.Valid() {
+		return fmt.Errorf("permission update: invalid mode %q", u.Mode)
+	}
+	return nil
+}
+
+// AgentPermissionConfig is the permission configuration of an agent. It lives in
+// data so a caller switches Mode on the control channel instead of branching in
+// a handler. It stays separate from MergePolicy for the reason given on
+// PermissionMode.
+type AgentPermissionConfig struct {
+	Mode  PermissionMode     `json:"mode"`
+	Rules []PermissionUpdate `json:"rules,omitempty"`
+}
+
+// SessionPermission is the permission state of one session. SessionID keys the
+// state, so a session-scoped update applies to this record alone.
+type SessionPermission struct {
+	SessionID string             `json:"sessionID"`
+	Mode      PermissionMode     `json:"mode"`
+	Updates   []PermissionUpdate `json:"updates,omitempty"`
+}
+
+// SetPermissionMode is the control command that switches a session's mode during
+// the session. No restart is needed: the command is data on the control channel.
+type SetPermissionMode struct {
+	SessionID string         `json:"sessionID"`
+	Mode      PermissionMode `json:"mode"`
+}
+
+// Validate rejects a mode switch with no session or an unknown mode.
+func (c SetPermissionMode) Validate() error {
+	if c.SessionID == "" {
+		return errors.New("set permission mode: sessionID is required")
+	}
+	if !c.Mode.Valid() {
+		return fmt.Errorf("set permission mode: invalid mode %q", c.Mode)
+	}
+	return nil
+}
+
+// ApplyMode returns a copy of s with the mode switched. It never mutates the
+// caller's state, so a rejected command leaves no partial write.
+func (s SessionPermission) ApplyMode(cmd SetPermissionMode) (SessionPermission, error) {
+	if err := cmd.Validate(); err != nil {
+		return SessionPermission{}, err
+	}
+	if s.SessionID != "" && s.SessionID != cmd.SessionID {
+		return SessionPermission{}, errors.New("set permission mode: sessionID does not match state")
+	}
+	s.SessionID = cmd.SessionID
+	s.Mode = cmd.Mode
+	return s, nil
+}
+
+// ApplyUpdates validates every update before applying any of them, then returns
+// a copy with the updates appended. A session-scoped update stays in the record
+// for sessionID, so it cannot reach another session.
+func (s SessionPermission) ApplyUpdates(sessionID string, updates []PermissionUpdate) (SessionPermission, error) {
+	for _, update := range updates {
+		if err := update.Validate(); err != nil {
+			return SessionPermission{}, err
+		}
+	}
+	if sessionID == "" {
+		return SessionPermission{}, errors.New("permission update: sessionID is required")
+	}
+	if s.SessionID != "" && s.SessionID != sessionID {
+		return SessionPermission{}, errors.New("permission update: sessionID does not match state")
+	}
+	s.SessionID = sessionID
+	if len(updates) > 0 {
+		s.Updates = append(append([]PermissionUpdate(nil), s.Updates...), updates...)
+	}
+	return s, nil
+}
+
 // Subscriber is one party waiting for a Watch result. OrchestratorID is the
 // optional parent session carried by an executor at registration. It is stored
 // as opaque caller data and never selects a wake recipient: blocked wakes keep
