@@ -64,6 +64,169 @@ func HasRuleAt(fs []Finding, rule, path string, line int) bool {
 	return false
 }
 
+// Gate rule names are declared once in this registry. A finding that spells a
+// rule from a literal or by concatenation can carry a typo that the compiler
+// never sees. ValidateRule rejects unknown names, CheckRuleRegistry rejects a
+// name declared twice, and NewFinding performs both checks when it builds a
+// Finding. The baseline and permanent exception tables include only names the
+// registry accepts; ValidateConfigRules checks that invariant.
+const (
+	RuleScanBlind = "SCAN-BLIND"
+
+	RuleDocTaskHeading      = "DOC-TASK-HEADING"
+	RuleDocTaskStatus       = "DOC-TASK-STATUS"
+	RuleDocTaskField        = "DOC-TASK-FIELD"
+	RuleDocAdrHeading       = "DOC-ADR-HEADING"
+	RuleDocAdrStatus        = "DOC-ADR-STATUS"
+	RuleDocAdrStructure     = "DOC-ADR-STRUCTURE"
+	RuleDocAdrDup           = "DOC-ADR-DUP"
+	RuleDocBaselineExceeded = "DOC-BASELINE-EXCEEDED"
+	RuleDocBaselineStale    = "DOC-BASELINE-STALE"
+	RuleDocLinkPath         = "DOC-LINK-PATH"
+	RuleDocLinkAnchor       = "DOC-LINK-ANCHOR"
+
+	RuleLayerForbiddenEdge = "LAYER-FORBIDDEN-EDGE"
+	RuleLayerNoRule        = "LAYER-NO-RULE"
+	RuleLayerUnusedRule    = "LAYER-UNUSED-RULE"
+	RuleLayerDivergence    = "LAYER-DIVERGENCE"
+
+	RuleReachUnwired    = "REACH-UNWIRED"
+	RuleReachTestIgnore = "REACH-TEST-IGNORE"
+	RuleReachTestSkip   = "REACH-TEST-SKIP"
+	RuleReachTestPkg    = "REACH-TEST-PKG"
+	RuleReachTestParse  = "REACH-TEST-PARSE"
+	RuleReachParse      = "REACH-PARSE"
+
+	RuleToolNameFormat      = "TOOL-NAME-FORMAT"
+	RuleToolNameDuplicate   = "TOOL-NAME-DUPLICATE"
+	RuleToolDescShort       = "TOOL-DESC-SHORT"
+	RuleToolParamDesc       = "TOOL-PARAM-DESC"
+	RuleToolRequired        = "TOOL-REQUIRED"
+	RuleToolAdditionalProps = "TOOL-ADDITIONAL-PROPS"
+	RuleToolDescNearDup     = "TOOL-DESC-NEAR-DUP"
+	RuleToolListInvalid     = "TOOL-LIST-INVALID"
+
+	RuleWiringStatus     = "WIRING-STATUS"
+	RuleWiringOwnerFiles = "WIRING-OWNERFILES"
+	RuleWiringReason     = "WIRING-REASON"
+
+	RuleCapBaselineExceeded = "CAP-BASELINE-EXCEEDED"
+	RuleCapBaselineStale    = "CAP-BASELINE-STALE"
+	RuleCapPermanentStale   = "CAP-PERMANENT-STALE"
+)
+
+// allRuleNames is the closed set of fixed names. The capabilities gate also
+// builds CAP-<capability>-IN-<layer> at runtime; KnownRule validates that
+// family against the two lists below.
+var allRuleNames = []string{
+	RuleScanBlind,
+	RuleDocTaskHeading, RuleDocTaskStatus, RuleDocTaskField,
+	RuleDocAdrHeading, RuleDocAdrStatus, RuleDocAdrStructure, RuleDocAdrDup,
+	RuleDocBaselineExceeded, RuleDocBaselineStale, RuleDocLinkPath, RuleDocLinkAnchor,
+	RuleLayerForbiddenEdge, RuleLayerNoRule, RuleLayerUnusedRule, RuleLayerDivergence,
+	RuleReachUnwired, RuleReachTestIgnore, RuleReachTestSkip,
+	RuleReachTestPkg, RuleReachTestParse, RuleReachParse,
+	RuleToolNameFormat, RuleToolNameDuplicate, RuleToolDescShort, RuleToolParamDesc,
+	RuleToolRequired, RuleToolAdditionalProps, RuleToolDescNearDup, RuleToolListInvalid,
+	RuleWiringStatus, RuleWiringOwnerFiles, RuleWiringReason,
+	RuleCapBaselineExceeded, RuleCapBaselineStale, RuleCapPermanentStale,
+}
+
+var knownRules = func() map[string]struct{} {
+	set := make(map[string]struct{}, len(allRuleNames))
+	for _, name := range allRuleNames {
+		set[name] = struct{}{}
+	}
+	return set
+}()
+
+var (
+	capKinds  = []string{"EXEC", "FILE", "NETHTTP", "NETDIAL", "PLUGIN", "REFLECT", "UNSAFE"}
+	capLayers = []string{"DOMAIN", "INFRA", "APP", "CMD", "OUTSIDE"}
+)
+
+func containsName(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// KnownRule reports whether name is a rule the gates accept. It covers the
+// fixed registry and the dynamic CAP-<capability>-IN-<layer> names assembled
+// by the capabilities gate.
+func KnownRule(name string) bool {
+	if _, ok := knownRules[name]; ok {
+		return true
+	}
+	const prefix, sep = "CAP-", "-IN-"
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(name, prefix)
+	i := strings.Index(rest, sep)
+	if i <= 0 || i+len(sep) >= len(rest) {
+		return false
+	}
+	return containsName(capKinds, rest[:i]) && containsName(capLayers, rest[i+len(sep):])
+}
+
+// ValidateRule rejects an empty, unknown or misspelled rule name.
+func ValidateRule(name string) error {
+	if name == "" {
+		return fmt.Errorf("empty gate rule name")
+	}
+	if !KnownRule(name) {
+		return fmt.Errorf("unknown gate rule name %q", name)
+	}
+	return nil
+}
+
+// NewFinding builds a Finding and refuses an unregistered rule name.
+func NewFinding(rule, path string, line int, message string) (Finding, error) {
+	if err := ValidateRule(rule); err != nil {
+		return Finding{}, err
+	}
+	return Finding{Rule: rule, Path: path, Line: line, Message: message}, nil
+}
+
+// CheckRuleRegistry returns every rule name declared twice in allRuleNames.
+func CheckRuleRegistry() []string {
+	var dup []string
+	seen := map[string]bool{}
+	for _, name := range allRuleNames {
+		if seen[name] {
+			dup = append(dup, name)
+			continue
+		}
+		seen[name] = true
+	}
+	return dup
+}
+
+// ValidateConfigRules checks that the embedded exception tables use only
+// registered rule names. A typo in a JSON key would otherwise stop matching
+// findings without any error at load time.
+func ValidateConfigRules() error {
+	ex, err := LoadExceptions()
+	if err != nil {
+		return err
+	}
+	for _, b := range ex.Baseline {
+		if err := ValidateRule(b.Rule); err != nil {
+			return fmt.Errorf("baseline %s %s: %w", b.Rule, b.Path, err)
+		}
+	}
+	for _, p := range ex.Permanent {
+		if err := ValidateRule(p.Rule); err != nil {
+			return fmt.Errorf("permanent %s %s: %w", p.Rule, p.Path, err)
+		}
+	}
+	return nil
+}
+
 // FieldValue returns the trimmed value and 1-based line of the first
 // "Key: value" line in lines, or ("", 0) when the key is absent. The wiring
 // gate and the docs gate use the same field grammar so a card validated by one
@@ -163,7 +326,7 @@ func ParseOptions(args []string) (Options, error) {
 func Finish(fs []Finding, minFindings int) int {
 	if len(fs) < minFindings {
 		fs = append(fs, Finding{
-			Rule:    "SCAN-BLIND",
+			Rule:    RuleScanBlind,
 			Path:    ".",
 			Line:    0,
 			Message: fmt.Sprintf("scan saw %d finding(s), floor is %d", len(fs), minFindings),
@@ -192,10 +355,11 @@ func Brokenf(format string, args ...any) int {
 }
 
 // Rules reported by CheckLinks. A row in config/baseline.json with one of
-// these rules suppresses the matching source file.
+// these rules suppresses the matching source file. The names alias the shared
+// registry so a link rule cannot drift from the rest of the gates.
 const (
-	linkPathRule   = "DOC-LINK-PATH"
-	linkAnchorRule = "DOC-LINK-ANCHOR"
+	linkPathRule   = RuleDocLinkPath
+	linkAnchorRule = RuleDocLinkAnchor
 )
 
 // CheckLinks reports local markdown links whose target file or heading anchor

@@ -11,16 +11,17 @@ import (
 	"strings"
 )
 
-// Rule names reported by CheckToolContract.
+// Rule names reported by CheckToolContract. They alias the shared registry in
+// gate.go, which is the single place where a gate rule name is declared.
 const (
-	ToolNameFormatRule      = "TOOL-NAME-FORMAT"
-	ToolNameDuplicateRule   = "TOOL-NAME-DUPLICATE"
-	ToolDescShortRule       = "TOOL-DESC-SHORT"
-	ToolParamDescRule       = "TOOL-PARAM-DESC"
-	ToolRequiredRule        = "TOOL-REQUIRED"
-	ToolAdditionalPropsRule = "TOOL-ADDITIONAL-PROPS"
-	ToolDescNearDupRule     = "TOOL-DESC-NEAR-DUP"
-	ToolListInvalidRule     = "TOOL-LIST-INVALID"
+	ToolNameFormatRule      = RuleToolNameFormat
+	ToolNameDuplicateRule   = RuleToolNameDuplicate
+	ToolDescShortRule       = RuleToolDescShort
+	ToolParamDescRule       = RuleToolParamDesc
+	ToolRequiredRule        = RuleToolRequired
+	ToolAdditionalPropsRule = RuleToolAdditionalProps
+	ToolDescNearDupRule     = RuleToolDescNearDup
+	ToolListInvalidRule     = RuleToolListInvalid
 )
 
 // toolNamePattern is the name grammar recommended by the MCP specification:
