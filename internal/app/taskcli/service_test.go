@@ -2417,6 +2417,178 @@ func TestReapStaleCardsHonorsInjectedTTL(t *testing.T) {
 	}
 }
 
+// deferredCard создаёт отложенную карточку с указанным значением поля даты.
+func (e *env) deferredCard(t *testing.T, id, until string) string {
+	t.Helper()
+	e.card(t, id, "blocked", "task", "ADR 0001", "internal/app/a/one.go", "нет", "нет")
+	path := filepath.Join(e.tasksDir, id+".md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := strings.Replace(string(raw), "Статус: blocked\n",
+		"Статус: blocked\n"+deferUntilField+": "+until+"\n", 1)
+	if err := os.WriteFile(path, []byte(text), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func deferWakeEnv(t *testing.T, now time.Time) *env {
+	t.Helper()
+	e := newEnv(t)
+	cfg := e.cfg
+	cfg.DeferWakeNow = func() time.Time { return now }
+	e.cfg = cfg
+	e.svc = NewService(cfg)
+	return e
+}
+
+func TestDeferWakeWakesExpiredCardOnReadyRead(t *testing.T) {
+	e := deferWakeEnv(t, time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC))
+	e.deferredCard(t, "T2.30", "2026-11-20T10:00:00Z")
+
+	if _, err := e.svc.List(ListOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	c := cardByID(t, e, "T2.30")
+	if c.Status != "todo" || strings.TrimSpace(c.Extra[deferUntilField]) != "" {
+		t.Fatalf("карточка не проснулась или дата не очищена: %+v", c)
+	}
+	log, err := e.svc.DeferWakeLog()
+	if err != nil || len(log) != 1 || log[0].CardID != "T2.30" || log[0].Action != "wake" {
+		t.Fatalf("журнал пробуждения: %+v err=%v", log, err)
+	}
+}
+
+func TestDeferWakeSkipsCardTakenBetweenSnapshotAndWrite(t *testing.T) {
+	e := deferWakeEnv(t, time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC))
+	e.deferredCard(t, "T2.31", "2026-11-20T10:00:00Z")
+	second := e.deferredCard(t, "T2.32", "2026-11-20T10:00:00Z")
+
+	cfg := e.cfg
+	cfg.DeferWakeReadCard = func(path string) ([]byte, error) {
+		if path != second {
+			return os.ReadFile(path)
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		taken := strings.Replace(string(raw), "Статус: blocked", "Статус: in_progress", 1)
+		if err := os.WriteFile(path, []byte(taken), 0644); err != nil {
+			return nil, err
+		}
+		return []byte(taken), nil
+	}
+	e.cfg = cfg
+	e.svc = NewService(cfg)
+
+	rep, err := e.svc.SweepExpiredDefers(DeferWakeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Scanned != 2 || len(rep.Woken) != 1 || rep.Woken[0] != "T2.31" {
+		t.Fatalf("результат прохода: %+v", rep)
+	}
+	if len(rep.Skipped) != 1 || rep.Skipped[0] != "T2.32" {
+		t.Fatalf("изменённая карточка не пропущена: %+v", rep)
+	}
+	if c := cardByID(t, e, "T2.32"); c.Status != "in_progress" {
+		t.Fatalf("карточка, взятая конкурентом, изменена: %+v", c)
+	}
+}
+
+func TestDeferWakeLeavesIndefiniteDeferral(t *testing.T) {
+	e := deferWakeEnv(t, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	e.deferredCard(t, "T2.33", deferForever)
+
+	for i := 0; i < 10; i++ {
+		rep, err := e.svc.SweepExpiredDefers(DeferWakeOptions{})
+		if err != nil || rep.Scanned != 0 || len(rep.Woken) != 0 {
+			t.Fatalf("проход %d: %+v err=%v", i, rep, err)
+		}
+	}
+	c := cardByID(t, e, "T2.33")
+	if c.Status != "blocked" || strings.TrimSpace(c.Extra[deferUntilField]) != deferForever {
+		t.Fatalf("бессрочная отложка изменена: %+v", c)
+	}
+}
+
+func TestDeferWakeWriteErrorKeepsListAndWarnsOnce(t *testing.T) {
+	e := deferWakeEnv(t, time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC))
+	e.deferredCard(t, "T2.34", "2026-11-20T10:00:00Z")
+
+	cfg := e.cfg
+	cfg.DeferWakeWriteCard = func(path string, data []byte) error {
+		return fmt.Errorf("искусственная ошибка записи")
+	}
+	e.cfg = cfg
+	e.svc = NewService(cfg)
+
+	out, err := e.svc.List(ListOptions{})
+	if err != nil {
+		t.Fatalf("ошибка записи уронила ready-чтение: %v", err)
+	}
+	if !strings.Contains(out, "T2.34") {
+		t.Fatalf("список потерян: %s", out)
+	}
+	if strings.Count(out, "предупреждение:") != 1 {
+		t.Fatalf("ожидалась одна строка предупреждения: %s", out)
+	}
+	if c := cardByID(t, e, "T2.34"); c.Status != "blocked" {
+		t.Fatalf("карточка изменена при ошибке записи: %+v", c)
+	}
+	log, err := e.svc.DeferWakeLog()
+	if err != nil || len(log) != 1 || log[0].Action != "error" {
+		t.Fatalf("ошибка не записана в журнал: %+v err=%v", log, err)
+	}
+}
+
+func TestDeferWakeSecondPassDoesNotChangeFiles(t *testing.T) {
+	e := deferWakeEnv(t, time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC))
+	path := e.deferredCard(t, "T2.35", "2026-11-20T10:00:00Z")
+
+	if _, err := e.svc.SweepExpiredDefers(DeferWakeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := e.svc.SweepExpiredDefers(DeferWakeOptions{})
+	if err != nil || rep.Scanned != 0 || len(rep.Woken) != 0 {
+		t.Fatalf("второй проход: %+v err=%v", rep, err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("второй проход изменил файл:\n%s\n%s", first, second)
+	}
+}
+
+func TestDeferWritesDateAndStatus(t *testing.T) {
+	e := newEnv(t)
+	e.card(t, "T2.36", "todo", "task", "ADR 0001", "internal/app/a/one.go", "нет", "нет")
+
+	if _, err := e.svc.Defer(DeferOptions{ID: "T2.36", Until: "2026-11-30"}); err != nil {
+		t.Fatal(err)
+	}
+	c := cardByID(t, e, "T2.36")
+	if c.Status != "blocked" || strings.TrimSpace(c.Extra[deferUntilField]) != "2026-11-30T00:00:00Z" {
+		t.Fatalf("дата отложки не записана: %+v", c)
+	}
+	if _, err := e.svc.Defer(DeferOptions{ID: "T2.36", Forever: true}); err != nil {
+		t.Fatal(err)
+	}
+	c = cardByID(t, e, "T2.36")
+	if strings.TrimSpace(c.Extra[deferUntilField]) != deferForever {
+		t.Fatalf("бессрочная отложка не записана: %+v", c)
+	}
+}
+
 func writeHook(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0755); err != nil {
