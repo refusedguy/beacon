@@ -7,6 +7,57 @@ import (
 	"strings"
 )
 
+// Fence is one markdown fenced-block delimiter. Open starts the block and
+// Close ends it. A backtick fence uses the same run for both ends.
+type Fence struct {
+	Open  string
+	Close string
+}
+
+// Wrap returns content enclosed in a fenced block. The closing fence always
+// starts on its own line, even when content does not end with a newline.
+func (f Fence) Wrap(content string) string {
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
+	}
+	return f.Open + "\n" + content + f.Close + "\n"
+}
+
+const (
+	minFenceRun = 3
+	maxFenceRun = 12
+)
+
+// ChooseFence returns the shortest backtick fence whose opening run does not
+// start any line in contents. Markdown closes a block with a run of at least
+// as many backticks as the opener, so a run that begins a line inside the
+// content would end the block early. The routine follows aider's choose_fence
+// (aider/coders/base_coder.py:609-635). The bool is false when no safe run fits
+// maxFenceRun; the caller should warn in that case.
+func ChooseFence(contents ...string) (Fence, bool) {
+	maxRun := 0
+	for _, content := range contents {
+		for _, line := range strings.Split(content, "\n") {
+			trimmed := strings.TrimLeft(line, " \t")
+			run := 0
+			for run < len(trimmed) && trimmed[run] == '`' {
+				run++
+			}
+			if run > maxRun {
+				maxRun = run
+			}
+		}
+	}
+	for n := minFenceRun; n <= maxFenceRun; n++ {
+		if n > maxRun {
+			run := strings.Repeat("`", n)
+			return Fence{Open: run, Close: run}, true
+		}
+	}
+	run := strings.Repeat("`", minFenceRun)
+	return Fence{Open: run, Close: run}, false
+}
+
 // FileCardSource reads a task card from <dir>/docs/tasks/<id>.md through an
 // injected reader. cmd supplies os.ReadFile through a seam, so the app layer
 // holds no file capability (ADR 0005).
@@ -100,7 +151,11 @@ func DiffPrompt(d Diff, card Card) string {
 	}
 	fmt.Fprintf(&b, "Base: %s\nHead: %s\n", d.Base, d.Head)
 	b.WriteString("Diff:\n")
-	b.WriteString(d.Patch)
+	fence, safe := ChooseFence(d.Patch)
+	if !safe {
+		b.WriteString("Warning: no safe fence found within the run limit; the diff may break the code block.\n")
+	}
+	b.WriteString(fence.Wrap(d.Patch))
 	return b.String()
 }
 
