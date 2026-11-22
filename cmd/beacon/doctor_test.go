@@ -243,3 +243,76 @@ func TestW115CLIRejectsBadInterval(t *testing.T) {
 		t.Fatalf("нет ошибки max-ticks: %q", errOut2.String())
 	}
 }
+
+// CU-03: doctor prints the four verdicts of RULES-CHECK-CONTRACT.md:9 and
+// blocks only on the verdicts that contract marks as blocking at :19.
+func TestCU03DoctorStatusesAndExitCodes(t *testing.T) {
+	cases := []struct {
+		status string
+		code   int
+	}{
+		{doctorPass, 0},
+		{doctorWarn, 0},
+		{doctorFail, 1},
+		{doctorBroken, 1},
+	}
+	for _, tc := range cases {
+		c, out, errOut, _ := w115CLI(t, nil)
+		checks := []checkResult{{name: "health", status: tc.status, detail: "detail"}}
+		if code := c.renderDoctorChecks(checks); code != tc.code {
+			t.Fatalf("%s: код выхода %d, хотим %d", tc.status, code, tc.code)
+		}
+		if !strings.Contains(out.String(), "health: "+tc.status+" detail") {
+			t.Fatalf("%s: нет строки статуса: %q", tc.status, out.String())
+		}
+		if errOut.Len() != 0 {
+			t.Fatalf("%s: stderr не пустой: %q", tc.status, errOut.String())
+		}
+	}
+}
+
+func TestCU03DoctorVocabularyMatchesContract(t *testing.T) {
+	want := []string{"PASS", "WARN", "FAIL", "BROKEN"}
+	got := []string{doctorPass, doctorWarn, doctorFail, doctorBroken}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("статус %d: %q, хотим %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCU03BrokenBlocksAmongHealthyChecks(t *testing.T) {
+	c, out, _, _ := w115CLI(t, nil)
+	checks := []checkResult{
+		{name: "go", status: doctorPass, detail: "go1.27.4"},
+		{name: "beacon-gates", status: doctorWarn, detail: "нет правил"},
+		{name: "state", status: doctorBroken, detail: "недоступен"},
+	}
+	if code := c.renderDoctorChecks(checks); code != 1 {
+		t.Fatalf("код выхода %d, хотим 1", code)
+	}
+	if !strings.Contains(out.String(), "state: BROKEN недоступен") {
+		t.Fatalf("нет строки BROKEN: %q", out.String())
+	}
+}
+
+func TestCU03CheckGoUsesContractStatuses(t *testing.T) {
+	cases := []struct {
+		name string
+		res  runResult
+		want string
+	}{
+		{"здоровая версия", runResult{stdout: []byte("go version go1.27.4 linux/amd64\n")}, doctorPass},
+		{"старая версия", runResult{stdout: []byte("go version go1.25.7 linux/amd64\n")}, doctorFail},
+		{"инструмент не запустился", runResult{code: 2, stderr: []byte("permission denied\n")}, doctorBroken},
+		{"неразбираемый вывод", runResult{stdout: []byte("unexpected\n")}, doctorBroken},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, _, _ := w115CLI(t, func(w115Call) runResult { return tc.res })
+			if got := c.checkGo().status; got != tc.want {
+				t.Fatalf("статус %q, хотим %q", got, tc.want)
+			}
+		})
+	}
+}
