@@ -411,3 +411,43 @@ func TestACPRoleMatrix(t *testing.T) {
 		}
 	}
 }
+
+// TestBeaconACPDeclarationMatchesSessionArgs проверяет wake-only режим ACP.
+// Beacon не передаёт mcpServers в session/new и session/load, поэтому не должен
+// объявлять capability mcp при initialize. Тест берёт объявление и аргументы
+// сеанса из продакшн-кода и отвергает расхождение между ними.
+func TestBeaconACPDeclarationMatchesSessionArgs(t *testing.T) {
+	declared := wake.BeaconClientCapabilities()
+
+	declaresMCP := false
+	if raw, ok := declared[string(wake.ACPCapMCPTransport)]; ok {
+		declaresMCP, _ = raw.(bool)
+	}
+
+	newParams := wake.ACPSessionNewParams(t.TempDir())
+	loadParams := wake.ACPSessionLoadParams("ses_probe", t.TempDir())
+
+	newServers, ok := newParams["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("session/new: mcpServers имеет тип %T, ожидался срез", newParams["mcpServers"])
+	}
+	loadServers, ok := loadParams["mcpServers"].([]any)
+	if !ok {
+		t.Fatalf("session/load: mcpServers имеет тип %T, ожидался срез", loadParams["mcpServers"])
+	}
+
+	// Расхождением считается объявленный mcp при пустом mcpServers и наоборот.
+	if declaresMCP && (len(newServers) == 0 || len(loadServers) == 0) {
+		t.Fatalf("расхождение: capability mcp объявлен, но mcpServers пуст: new=%v load=%v", newServers, loadServers)
+	}
+	if !declaresMCP && (len(newServers) != 0 || len(loadServers) != 0) {
+		t.Fatalf("расхождение: mcpServers передан без capability mcp: new=%v load=%v", newServers, loadServers)
+	}
+
+	if declaresMCP {
+		t.Fatalf("wake-only режим не должен объявлять capability mcp: %v", declared)
+	}
+	if _, ok := declared[string(wake.ACPCapSessionLoad)]; !ok {
+		t.Fatalf("wake-only режим должен объявлять loadSession: %v", declared)
+	}
+}

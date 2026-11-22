@@ -232,10 +232,12 @@ func (t *ACPHTTPTransport) Call(ctx context.Context, req ACPRequest) ([]byte, er
 type ACPCapability string
 
 const (
-	ACPCapSessionLoad  ACPCapability = "loadSession"
-	ACPCapFork         ACPCapability = "fork"
-	ACPCapModels       ACPCapability = "models"
-	ACPCapModes        ACPCapability = "modes"
+	ACPCapSessionLoad ACPCapability = "loadSession"
+	ACPCapFork        ACPCapability = "fork"
+	ACPCapModels      ACPCapability = "models"
+	ACPCapModes       ACPCapability = "modes"
+	// ACPCapMCPTransport is parsed from an agent declaration. Beacon does not
+	// advertise it in wake-only mode; see beaconClientCapabilities.
 	ACPCapMCPTransport ACPCapability = "mcp"
 )
 
@@ -321,13 +323,33 @@ func parseACPCapabilities(result json.RawMessage) ACPCapabilities {
 }
 
 // beaconClientCapabilities is the non-empty declaration Beacon sends at
-// initialize. Beacon can carry MCP server definitions and drive session
-// resume, so it advertises those; an agent may ignore any it does not use.
+// initialize. Wake delivery is text-only: Beacon inserts the wake through
+// session/prompt and does not pass MCP server definitions to the agent. It
+// advertises session resume, but not the mcp capability, so the declaration
+// agrees with the empty mcpServers sent in session/new and session/load.
 func beaconClientCapabilities() map[string]any {
 	return map[string]any{
-		string(ACPCapSessionLoad):  true,
-		string(ACPCapMCPTransport): true,
+		string(ACPCapSessionLoad): true,
 	}
+}
+
+// BeaconClientCapabilities reports the capabilities Beacon declares in an ACP
+// initialize request. It is exported so a test can compare the declaration
+// with the session arguments. A fresh map is returned on every call.
+func BeaconClientCapabilities() map[string]any {
+	return beaconClientCapabilities()
+}
+
+// ACPSessionNewParams builds the JSON-RPC params Beacon sends in session/new.
+// Wake-only mode passes no MCP server definitions.
+func ACPSessionNewParams(cwd string) map[string]any {
+	return map[string]any{"cwd": cwd, "mcpServers": []any{}}
+}
+
+// ACPSessionLoadParams builds the JSON-RPC params Beacon sends in session/load.
+// Wake-only mode passes no MCP server definitions.
+func ACPSessionLoadParams(sessionID, cwd string) map[string]any {
+	return map[string]any{"sessionId": sessionID, "cwd": cwd, "mcpServers": []any{}}
 }
 
 // ACPDeliveryMode is how Beacon inserts a wake once capabilities are known.
@@ -778,9 +800,7 @@ func (c *PersistentACPClient) DeliverWake(ctx context.Context, sessionID, cwd, t
 
 // NewSession creates a worker session and returns its opaque id.
 func (c *PersistentACPClient) NewSession(ctx context.Context, cwd string) (string, error) {
-	raw, err := c.call(ctx, "session/new", map[string]any{
-		"cwd": cwd, "mcpServers": []any{},
-	})
+	raw, err := c.call(ctx, "session/new", ACPSessionNewParams(cwd))
 	if err != nil {
 		return "", err
 	}
@@ -798,9 +818,7 @@ func (c *PersistentACPClient) NewSession(ctx context.Context, cwd string) (strin
 
 // LoadSession resumes an existing worker session on the same connection.
 func (c *PersistentACPClient) LoadSession(ctx context.Context, sessionID, cwd string) error {
-	_, err := c.call(ctx, "session/load", map[string]any{
-		"sessionId": sessionID, "cwd": cwd, "mcpServers": []any{},
-	})
+	_, err := c.call(ctx, "session/load", ACPSessionLoadParams(sessionID, cwd))
 	return err
 }
 
