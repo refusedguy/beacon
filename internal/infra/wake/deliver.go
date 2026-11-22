@@ -222,6 +222,11 @@ func (d *AdapterDedupDeliverer) deliver(ctx context.Context, adapter, sessionID 
 		ledger = SharedDeliveryDedup()
 	}
 	if !ledger.Claim(p.ObligationID) {
+		// A coalesced wake is not a delivery. The public Deliver methods keep
+		// their nil-on-duplicate contract, so a caller that records a "posted"
+		// outcome for every nil still counts the duplicate. The observe layer
+		// cancels that second count: it records one posted outcome per
+		// obligationID, and the duplicate already raised the duplicate outcome.
 		observe.WakeDuplicate(p.WatchID, p.Revision)
 		return nil
 	}
