@@ -4,12 +4,12 @@
     {
       "name": "night-shift",
       "path": ".opencode/skills/night-shift",
-      "computedHash": "8dec6fbee3da4f48fda77eefe50dd876b113d11a456d45c65d056d903efe2c67"
+      "computedHash": "021a962fdb40ad18e6e39290cd79e71043ee24090879ba66a3dd73b1518e9bd0"
     },
     {
       "name": "red-verdict-triage",
       "path": ".opencode/skills/red-verdict-triage",
-      "computedHash": "4d269eb5dd397243049ed67f16b22127d2a1f67f552efe2067bc99ed50ef49d8"
+      "computedHash": "435d1292c8d03c0866d6f828352d05f7d1b88138afd154eda55ddfc85a9f1e7d"
     }
   ]
 }
