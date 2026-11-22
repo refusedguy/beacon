@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/charmbracelet/bubbletea"
 )
 
 // App holds the last snapshot and the view rendered from it. The View method
@@ -197,4 +199,83 @@ func shortSHA(sha string) string {
 		return sha[:7]
 	}
 	return sha
+}
+
+// LiveModel builds the interactive board from the app's current projection.
+// Operator input goes through Command, so both front ends use the same verbs.
+func (a *App) LiveModel(ctx context.Context, cards []Card) Model {
+	a.mu.Lock()
+	snap, revision, lastErr := a.snap, a.revision, a.lastErr
+	a.mu.Unlock()
+	return NewLiveModel(cards, snap, revision, lastErr, func(line string) error {
+		return a.Command(ctx, line)
+	})
+}
+
+// RunLive opens the one-screen dashboard. It refreshes once, then reads SSE
+// events; the model repaints snapshot panels only when the revision advances.
+// Run stays the text fallback for output without a terminal.
+//
+// Baseline: docs/research/audit-03-tui.md lists 20-30 MiB RSS as a target, not
+// a measurement. TUI-07 owns the actual measurement.
+func (a *App) RunLive(ctx context.Context, cards []Card) error {
+	if err := a.Refresh(ctx); err != nil {
+		return err
+	}
+	program := tea.NewProgram(a.LiveModel(ctx, cards), tea.WithAltScreen())
+
+	go func() {
+		for {
+			stream := a.client.Events(ctx)
+			for result := range stream {
+				if result.Err != nil {
+					break
+				}
+				if id := result.Event.ID; id != "" {
+					program.Send(EventMsg{ID: id, Line: eventLine(result.Event)})
+				}
+				_ = a.Refresh(ctx)
+				a.mu.Lock()
+				snap, revision, lastErr := a.snap, a.revision, a.lastErr
+				a.mu.Unlock()
+				program.Send(SnapshotMsg{Snap: snap, Revision: revision, Err: lastErr})
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+		}
+	}()
+
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			program.Quit()
+		case <-stopped:
+		}
+	}()
+	_, err := program.Run()
+	close(stopped)
+	return err
+}
+
+// eventLine turns one SSE frame into a single line for the event tail.
+func eventLine(e Event) string {
+	typ := strings.TrimSpace(e.Type)
+	if typ == "" {
+		typ = "message"
+	}
+	data := strings.Join(strings.Fields(strings.TrimSpace(string(e.Data))), " ")
+	if data == "" {
+		data = "(пусто)"
+	}
+	if e.ID == "" {
+		return typ + " " + data
+	}
+	return "#" + e.ID + " " + typ + " " + data
 }
