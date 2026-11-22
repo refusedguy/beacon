@@ -6,7 +6,12 @@
 // timestamp it stamps comes from the Event supplied by the caller.
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
 
 // EventKind identifies what happened to a Watch.
 type EventKind string
@@ -54,6 +59,132 @@ const (
 // Watch. A fifth answer may resume the task; a sixth is refused.
 const MaxContinueRounds uint64 = 5
 
+// SessionTranscriptRecord is one persisted line of an agent session.
+// SessionID is the canonical session id, Parent names the subagent's parent
+// session and is empty for the root session. Seq orders records within a
+// session and starts at one. Kind names the event kind and Payload is the
+// serialized event. Records live in the external store so a dead agent can be
+// resumed from a different process (CS-04).
+type SessionTranscriptRecord struct {
+	SessionID string
+	Parent    string
+	Seq       uint64
+	Kind      string
+	Payload   json.RawMessage
+}
+
+// ErrInvalidSessionID reports a resume id that is not a canonical UUID.
+// Materialization refuses it before any directory is created, so a value with
+// a path separator cannot escape the transcript root.
+var ErrInvalidSessionID = fmt.Errorf("domain: invalid session id: want a UUID")
+
+// IsUUID reports whether raw is a canonical 8-4-4-4-12 hexadecimal UUID. The
+// check is strict: each group has the exact length and every byte is a hex
+// digit. It rejects slashes, dots and any other path syntax before the value
+// can be used as a directory name.
+func IsUUID(raw string) bool {
+	if len(raw) != 36 {
+		return false
+	}
+	for i := 0; i < len(raw); i++ {
+		switch i {
+		case 8, 13, 18, 23:
+			if raw[i] != '-' {
+				return false
+			}
+		default:
+			c := raw[i]
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ValidateResumeID applies the CS-04 boundary check to a resume id. A path,
+// an empty id or a non-UUID name is refused. The returned string is the
+// validated id, safe to use as a single path component.
+func ValidateResumeID(raw string) (string, error) {
+	if !IsUUID(raw) || strings.ContainsAny(raw, `/\`) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidSessionID, raw)
+	}
+	return raw, nil
+}
+
+// SessionTranscriptSubkey groups the records of one subagent transcript.
+// Key identifies the child session, Parent is the resuming session and Records
+// are its lines in storage order. listSubkeys is the domain-level operation a
+// store adapter implements to restore subagent transcripts on resume.
+type SessionTranscriptSubkey struct {
+	Key     string
+	Parent  string
+	Records []SessionTranscriptRecord
+}
+
+// ListSessionTranscriptSubkeys groups the child transcripts of parent by child
+// session id. A record belongs to parent when its Parent field names parent; a
+// record with an empty Parent is treated as a legacy child of parent. The root
+// session's own records and records of another parent are skipped. Order is
+// preserved for callers whose input is already sorted by session and sequence.
+// The function is pure: the store adapter turns the result into files.
+func ListSessionTranscriptSubkeys(parent string, records []SessionTranscriptRecord) []SessionTranscriptSubkey {
+	byKey := make(map[string][]SessionTranscriptRecord)
+	var order []string
+	for _, rec := range records {
+		if rec.SessionID == "" || rec.SessionID == parent {
+			continue
+		}
+		if rec.Parent != "" && rec.Parent != parent {
+			continue
+		}
+		if _, seen := byKey[rec.SessionID]; !seen {
+			order = append(order, rec.SessionID)
+		}
+		byKey[rec.SessionID] = append(byKey[rec.SessionID], rec)
+	}
+	out := make([]SessionTranscriptSubkey, 0, len(order))
+	for _, key := range order {
+		out = append(out, SessionTranscriptSubkey{
+			Key:     key,
+			Parent:  parent,
+			Records: byKey[key],
+		})
+	}
+	return out
+}
+
+// MaterializedTranscript is the in-memory result of materializing a session.
+// Root holds the root records and Subkeys holds the child transcripts, so a
+// caller can write JSONL into a temp dir and restore every subagent.
+type MaterializedTranscript struct {
+	SessionID string
+	Root      []SessionTranscriptRecord
+	Subkeys   []SessionTranscriptSubkey
+}
+
+// MaterializeSessionTranscript validates id, then splits records into the root
+// transcript and the subagent subkeys. A non-UUID id fails before any data is
+// read, matching the SDK boundary check. The caller owns the temp directory and
+// must remove it on cancel or error.
+func MaterializeSessionTranscript(id string, records []SessionTranscriptRecord) (MaterializedTranscript, error) {
+	validated, err := ValidateResumeID(id)
+	if err != nil {
+		return MaterializedTranscript{}, err
+	}
+	var root []SessionTranscriptRecord
+	for _, rec := range records {
+		if rec.SessionID == validated {
+			root = append(root, rec)
+		}
+	}
+	return MaterializedTranscript{
+		SessionID: validated,
+		Root:      root,
+		Subkeys:   ListSessionTranscriptSubkeys(validated, records),
+	}, nil
+}
+
 const (
 	// EventVerdict carries the verdict computed by the verdict engine (T1.5).
 	EventVerdict EventKind = "verdict"
@@ -85,6 +216,14 @@ const (
 	// advances the rung and arms the next attempt. A revoke changes no verdict
 	// and stages no wake by itself.
 	EventRevoke EventKind = "revoke"
+	// EventTranscriptRecord appends one line to a session's external transcript
+	// (CS-04). It changes no Watch state and stages no wake; the adapter writes
+	// the record to the store.
+	EventTranscriptRecord EventKind = "transcript_record"
+	// EventResumeTranscript materializes a session's transcript from the
+	// external store after a restart. It changes no Watch state and stages the
+	// materialize effect for the adapter.
+	EventResumeTranscript EventKind = "resume_transcript"
 )
 
 // DeliveryRevoke describes one revoked wake delivery. ObligationID names the
@@ -134,6 +273,11 @@ type Event struct {
 	// Revoke is used only by EventRevoke. It names the failed delivery whose
 	// retry the ladder must arm.
 	Revoke *DeliveryRevoke
+	// Transcript is used only by EventTranscriptRecord and EventResumeTranscript.
+	// It carries the record to persist or the validated resume id.
+	Transcript *SessionTranscriptRecord
+	// ResumeID is the session id validated before materialization.
+	ResumeID string
 }
 
 // EffectKind identifies a side effect the caller must perform after Transition.
@@ -154,6 +298,13 @@ const (
 	// EffectRevokeDelivery tells the adapter to apply a delivery revoke to the
 	// ladder. It is the only effect of EventRevoke.
 	EffectRevokeDelivery EffectKind = "revoke_delivery"
+	// EffectSaveTranscript tells the adapter to persist one transcript record.
+	// It is the only effect of EventTranscriptRecord.
+	EffectSaveTranscript EffectKind = "save_transcript"
+	// EffectMaterializeTranscript tells the adapter to materialize a resumed
+	// session from the store into a temp dir. It is the only effect of
+	// EventResumeTranscript.
+	EffectMaterializeTranscript EffectKind = "materialize_transcript"
 )
 
 // Effect describes work deferred to the adapter layer. Transition only returns
@@ -171,6 +322,10 @@ type Effect struct {
 	ParkError  string
 	// Revoke is used only by EffectRevokeDelivery. It is copied from the event.
 	Revoke *DeliveryRevoke
+	// Transcript carries the record to persist for EffectSaveTranscript, or the
+	// validated session id for EffectMaterializeTranscript.
+	Transcript *SessionTranscriptRecord
+	ResumeID   string
 }
 
 // Constructors keep callers from building malformed events by hand.
@@ -237,6 +392,17 @@ func RevokeEvent(r DeliveryRevoke, at time.Time) Event {
 	return Event{Kind: EventRevoke, Revoke: &r, At: at}
 }
 
+// TranscriptRecordEvent builds the event that persists one transcript line.
+func TranscriptRecordEvent(rec SessionTranscriptRecord, at time.Time) Event {
+	return Event{Kind: EventTranscriptRecord, Transcript: &rec, At: at}
+}
+
+// ResumeTranscriptEvent builds the event that materializes a resumed session.
+// The id is validated when Transition handles the event, not here.
+func ResumeTranscriptEvent(id string, at time.Time) Event {
+	return Event{Kind: EventResumeTranscript, ResumeID: id, At: at}
+}
+
 // CanContinueRound reports whether round is a permitted human-answer round.
 // Rounds start at one and stop at MaxContinueRounds.
 func CanContinueRound(round uint64) bool {
@@ -272,6 +438,8 @@ func CanContinueRound(round uint64) bool {
 //	blocked   -> closed    : cancel, head_changed or a successful acceptance command
 //	closed    -> closed     : no-op (terminal)
 //	live      -> same       : EventRevoke stages EffectRevokeDelivery and changes no state
+//	live      -> same       : EventTranscriptRecord stages EffectSaveTranscript, changes no state
+//	live      -> same       : EventResumeTranscript stages EffectMaterializeTranscript on a valid UUID id
 //
 // A successful EventAccept closes a live Watch from any status with
 // CloseReasonAccepted and VerdictAccepted (ADR 0059 §6). That command is the
@@ -340,6 +508,10 @@ func Transition(w Watch, e Event) (Watch, []Effect) {
 		return unparkParked(w, e)
 	case EventRevoke:
 		return revokeDelivery(w, e)
+	case EventTranscriptRecord:
+		return recordTranscript(w, e)
+	case EventResumeTranscript:
+		return materializeTranscript(w, e)
 	default:
 		return next, nil
 	}
@@ -444,6 +616,48 @@ func revokeDelivery(w Watch, e Event) (Watch, []Effect) {
 		Revision: w.Revision,
 		Verdict:  w.Verdict,
 		Revoke:   e.Revoke,
+	}}
+}
+
+// recordTranscript stages one transcript record for the adapter. It changes no
+// Watch state and emits no wake: transcript persistence is a side effect of the
+// ongoing session, not a verdict. A closed Watch and an empty record are
+// ignored.
+func recordTranscript(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed || e.Transcript == nil || e.Transcript.SessionID == "" {
+		return next, nil
+	}
+	rec := *e.Transcript
+	if rec.Payload != nil {
+		rec.Payload = append(json.RawMessage(nil), rec.Payload...)
+	}
+	return next, []Effect{{
+		Kind:       EffectSaveTranscript,
+		WatchID:    w.ID,
+		Revision:   w.Revision,
+		Transcript: &rec,
+	}}
+}
+
+// materializeTranscript stages transcript materialization after a restart. The
+// resume id is validated here, at the domain boundary, so a path cannot reach
+// the temp directory. An invalid id stages no effect and leaves the Watch
+// unchanged. A closed Watch is likewise ignored.
+func materializeTranscript(w Watch, e Event) (Watch, []Effect) {
+	next := cloneWatch(w)
+	if w.Status == StatusClosed {
+		return next, nil
+	}
+	validated, err := ValidateResumeID(e.ResumeID)
+	if err != nil {
+		return next, nil
+	}
+	return next, []Effect{{
+		Kind:     EffectMaterializeTranscript,
+		WatchID:  w.ID,
+		Revision: w.Revision,
+		ResumeID: validated,
 	}}
 }
 
