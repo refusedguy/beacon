@@ -713,15 +713,26 @@ func proofForPhase(proofs []Proof, phaseID string) (Proof, bool) {
 // an external verifier ran outside the agent. ExitCode is the process exit
 // code: 0 means pass, any other value means fail. The agent's own account of
 // its work is never an input, so it cannot supply or change the exit code.
+//
 // Log is the check output the adapter captured. When the adapter supplies a
 // log, EvaluateExternal requires a suite-run marker in it, so a process that
 // exited 0 without running a test cannot pass. A check without a log keeps
 // the legacy exit-code decision, which lets adapters that do not capture a
 // log keep working.
+//
+// TestExitCode is the exit code of the test command itself, captured before
+// the wrapper runs its cleanup. TestExitCodeObserved is true only when the
+// adapter supplied that separate number. A wrapper can exit 0 after a
+// successful cleanup even when the tests failed, so the test exit code takes
+// precedence over ExitCode in the decision when it was reported. When it was
+// not reported, ExitCode stays the only source of the decision and older
+// adapters keep their behavior.
 type ExternalCheck struct {
-	Name     string
-	ExitCode int
-	Log      string
+	Name                 string
+	ExitCode             int
+	Log                  string
+	TestExitCode         int
+	TestExitCodeObserved bool
 }
 
 // ExternalVerdict is the decision of the external verification gate. It is a
@@ -747,20 +758,31 @@ const ExternalReasonNoTestsRan = "no_tests_ran"
 // CheckOutcome is one declared check in the on-disk evidence. Observed is
 // false when the external verifier produced no exit code for the check, so a
 // missing run stays visible on disk and never passes. Passed is true only for
-// an observed check with exit code 0 and, when a log was supplied, a suite-run
-// marker. Reason is empty except when a check with exit code 0 ran no tests.
+// an observed check whose deciding exit code is 0. When a log was supplied,
+// the log must also carry a suite-run marker or Reason records no_tests_ran.
+//
+// ExitCode is the wrapper's process exit code. TestExitCode is the test
+// command's exit code and TestExitCodeObserved says whether the adapter
+// reported one. When TestExitCodeObserved is true, Passed and the verdict use
+// TestExitCode and the evidence shows both numbers, so the source of the
+// deciding number is visible from the evidence alone. The new fields are
+// omitted from JSON when nothing extra was reported, which keeps the on-disk
+// shape of older adapters unchanged.
 type CheckOutcome struct {
-	Name     string `json:"name"`
-	ExitCode int    `json:"exit_code"`
-	Observed bool   `json:"observed"`
-	Passed   bool   `json:"passed"`
-	Reason   string `json:"reason,omitempty"`
+	Name                 string `json:"name"`
+	ExitCode             int    `json:"exit_code"`
+	Observed             bool   `json:"observed"`
+	Passed               bool   `json:"passed"`
+	Reason               string `json:"reason,omitempty"`
+	TestExitCode         int    `json:"test_exit_code,omitempty"`
+	TestExitCodeObserved bool   `json:"test_exit_code_observed,omitempty"`
 }
 
 // ExternalEvidence is the record an adapter writes to disk after the external
-// checks ran. It carries the verdict and every declared check with the exit
-// code behind it so a reviewer can re-check the decision from the on-disk
-// facts alone. Nothing the agent reported is part of the record: the verdict
+// checks ran. It carries the verdict and every declared check with the codes
+// behind it, so a reviewer can re-check the decision from the on-disk facts
+// alone and see whether the code came from the test command or the wrapper.
+// Nothing the agent reported is part of the record: the verdict
 // is an external check of the result, not the agent's proof (T3.88) and not
 // the compiled-in ship formula (T3.67).
 type ExternalEvidence struct {
@@ -805,10 +827,13 @@ func SuiteRan(log string) bool {
 }
 
 // observedExternalCheck keeps the first observation of a declared check. The
-// log travels with the exit code so the decision uses one consistent record.
+// log and the test exit code travel with the process exit code so the decision
+// uses one consistent record.
 type observedExternalCheck struct {
-	exitCode int
-	log      string
+	exitCode             int
+	log                  string
+	testExitCode         int
+	testExitCodeObserved bool
 }
 
 // EvaluateExternal computes the external verdict and its evidence from the
@@ -819,15 +844,18 @@ type observedExternalCheck struct {
 //
 // The gate fails closed. An empty declaration never passes, because an empty
 // panel is not a clean run. Every declared check must have an observed exit
-// code of 0; a missing observation or any non-zero exit code fails the gate.
-// When the adapter supplies a log, exit code 0 is not enough: the log must
-// also carry a suite-run marker, or the check fails with reason no_tests_ran.
-// A check with no log keeps the exit-code decision so existing adapters do
-// not need to change. Only declared names, observed exit codes and adapter
-// logs enter the decision, so an agent's own claim about its work cannot move
-// the verdict. Evidence keeps the declaration order and drops duplicate
-// names; when a check is observed more than once the first observation wins,
-// and observations for checks that were not declared are ignored.
+// code of 0; a missing observation or any non-zero deciding exit code fails
+// the gate. The deciding code is the test command's exit code when the adapter
+// reported one, and the wrapper's process exit code otherwise. A successful
+// cleanup therefore cannot hide a failing test. When the adapter supplies a
+// log, exit code 0 is not enough: the log must also carry a suite-run marker,
+// or the check fails with reason no_tests_ran. A check with no log keeps the
+// exit-code decision so existing adapters do not need to change. Only declared
+// names, observed exit codes and adapter logs enter the decision, so an
+// agent's own claim about its work cannot move the verdict. Evidence keeps
+// the declaration order and drops duplicate names; when a check is observed
+// more than once the first observation wins, and observations for checks that
+// were not declared are ignored.
 func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvidence {
 	evidence := ExternalEvidence{
 		Verdict: ExternalFail,
@@ -840,7 +868,12 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 	observedBy := make(map[string]observedExternalCheck, len(observed))
 	for _, c := range observed {
 		if _, ok := observedBy[c.Name]; !ok {
-			observedBy[c.Name] = observedExternalCheck{exitCode: c.ExitCode, log: c.Log}
+			observedBy[c.Name] = observedExternalCheck{
+				exitCode:             c.ExitCode,
+				log:                  c.Log,
+				testExitCode:         c.TestExitCode,
+				testExitCodeObserved: c.TestExitCodeObserved,
+			}
 		}
 	}
 
@@ -858,11 +891,20 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 		}
 		seen[name] = true
 		obs, ok := observedBy[name]
+		// The test command's exit code decides when present. The wrapper's
+		// exit code is only the fallback for adapters that do not separate
+		// the test run from its cleanup.
+		decidingExit := obs.exitCode
+		if obs.testExitCodeObserved {
+			decidingExit = obs.testExitCode
+		}
 		outcome := CheckOutcome{
-			Name:     name,
-			ExitCode: obs.exitCode,
-			Observed: ok,
-			Passed:   ok && obs.exitCode == 0,
+			Name:                 name,
+			ExitCode:             obs.exitCode,
+			Observed:             ok,
+			Passed:               ok && decidingExit == 0,
+			TestExitCode:         obs.testExitCode,
+			TestExitCodeObserved: ok && obs.testExitCodeObserved,
 		}
 		// A logged check with exit 0 but no suite-run marker did not run
 		// its tests. Fail it with a reason the reviewer can see on disk.
