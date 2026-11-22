@@ -1,6 +1,7 @@
 package taskstore
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -470,5 +471,120 @@ func TestRebuildRealCorpus(t *testing.T) {
 	}
 	if after := indexSnapshot(t, idx); !reflect.DeepEqual(before, after) {
 		t.Fatalf("повторная сборка изменила индекс")
+	}
+}
+
+func TestGraphStatusFreshIndexIsReady(t *testing.T) {
+	dir := t.TempDir()
+	first := fmt.Sprintf(indexTestCard, "T1.1", "internal/a.go", "нет")
+	second := fmt.Sprintf(indexTestCard, "T1.2", "internal/b.go", "нет")
+	if err := os.WriteFile(filepath.Join(dir, "T1.1.md"), []byte(first), 0644); err != nil {
+		t.Fatalf("запись T1.1: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "T1.2.md"), []byte(second), 0644); err != nil {
+		t.Fatalf("запись T1.2: %v", err)
+	}
+
+	idx := openTestIndex(t)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("RebuildDir: %v", err)
+	}
+	status, err := idx.GraphStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GraphStatus: %v", err)
+	}
+	if !status.Built {
+		t.Fatal("индекс с карточками не отмечен как собранный")
+	}
+	if status.IndexHash == "" || status.IndexHash != status.SourceHash {
+		t.Fatalf("свежий индекс: IndexHash=%q SourceHash=%q", status.IndexHash, status.SourceHash)
+	}
+	if !status.Ready() {
+		t.Fatal("свежий индекс не готов")
+	}
+}
+
+func TestGraphStatusStaleIndexIsNotReady(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T1.1.md")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf(indexTestCard, "T1.1", "internal/a.go", "нет")), 0644); err != nil {
+		t.Fatalf("запись карточки: %v", err)
+	}
+	idx := openTestIndex(t)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("RebuildDir: %v", err)
+	}
+	before, err := idx.GraphStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GraphStatus до изменения: %v", err)
+	}
+	if !before.Ready() {
+		t.Fatalf("индекс до изменения не готов: %+v", before)
+	}
+
+	changed := fmt.Sprintf(indexTestCard, "T1.1", "internal/a.go, internal/b.go", "нет")
+	if err := os.WriteFile(path, []byte(changed), 0644); err != nil {
+		t.Fatalf("изменение карточки: %v", err)
+	}
+	after, err := idx.GraphStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GraphStatus после изменения: %v", err)
+	}
+	if !after.Built {
+		t.Fatal("индекс после изменения карточки не собран")
+	}
+	if after.IndexHash != before.IndexHash {
+		t.Fatalf("IndexHash изменился без пересборки: %q -> %q", before.IndexHash, after.IndexHash)
+	}
+	if after.SourceHash == after.IndexHash {
+		t.Fatalf("устаревший индекс имеет совпадающие хеши: %q", after.SourceHash)
+	}
+	if after.Ready() {
+		t.Fatal("устаревший индекс отмечен как готовый")
+	}
+}
+
+func TestGraphStatusEmptyIndexIsNotReady(t *testing.T) {
+	idx := openTestIndex(t)
+	status, err := idx.GraphStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GraphStatus: %v", err)
+	}
+	if status.Built || status.Ready() {
+		t.Fatalf("пустой индекс отмечен как готовый: %+v", status)
+	}
+}
+
+func TestGraphStatusFollowsLastRebuiltDirectory(t *testing.T) {
+	firstDir := t.TempDir()
+	secondDir := t.TempDir()
+	card := fmt.Sprintf(indexTestCard, "T1.1", "internal/a.go", "нет")
+	if err := os.WriteFile(filepath.Join(firstDir, "T1.1.md"), []byte(card), 0644); err != nil {
+		t.Fatalf("запись первой карточки: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(secondDir, "T1.1.md"), []byte(card+"\n"), 0644); err != nil {
+		t.Fatalf("запись второй карточки: %v", err)
+	}
+
+	idx := openTestIndex(t)
+	if _, err := idx.RebuildDir(firstDir); err != nil {
+		t.Fatalf("первый RebuildDir: %v", err)
+	}
+	status, err := idx.GraphStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GraphStatus после первой сборки: %v", err)
+	}
+	if !status.Ready() {
+		t.Fatalf("индекс после первой сборки не готов: %+v", status)
+	}
+	if _, err := idx.RebuildDir(secondDir); err != nil {
+		t.Fatalf("второй RebuildDir: %v", err)
+	}
+	status, err = idx.GraphStatus(context.Background())
+	if err != nil {
+		t.Fatalf("GraphStatus после второй сборки: %v", err)
+	}
+	if !status.Ready() {
+		t.Fatalf("индекс после второй сборки не готов: %+v", status)
 	}
 }
