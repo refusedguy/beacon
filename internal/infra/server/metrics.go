@@ -37,6 +37,11 @@ const (
 	// is beacon_call_duration_seconds.
 	HistogramCallDuration = "call_duration_seconds"
 
+	// HistogramGraphQLBatch records the wall time of one batched GraphQL
+	// request. The exported name is beacon_graphql_batch_duration_seconds.
+	// One request adds one observation whatever number of aliases it carries.
+	HistogramGraphQLBatch = "graphql_batch_duration_seconds"
+
 	// GaugeRSSBytes is the resident set size of the process in bytes. It has no
 	// labels, so it adds exactly one series whatever the number of Watches
 	// (BS.49, ADR 0195). The exported name is beacon_rss_bytes.
@@ -160,6 +165,53 @@ func (h *histogram) snapshot() DurationStats {
 		Sum:     h.sum,
 		Buckets: append([]uint64(nil), h.buckets...),
 	}
+}
+
+func resetHistogram(h *histogram) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.count = 0
+	h.sum = 0
+	for i := range h.buckets {
+		h.buckets[i] = 0
+	}
+}
+
+// graphQLBatch is process-wide so an adapter that does not carry a *Metrics
+// can still publish one observation per batch. Every exporter reads the same
+// histogram, and the series has no labels, so its size does not grow with the
+// number of Watches, PRs or aliases.
+var graphQLBatch = newHistogram()
+
+// ObserveGraphQLBatch records the wall time of one batched GraphQL request.
+func ObserveGraphQLBatch(d time.Duration) {
+	graphQLBatch.observe(d.Seconds())
+}
+
+// GraphQLBatchDuration returns a point-in-time view of the batch histogram.
+func GraphQLBatchDuration() DurationStats {
+	return graphQLBatch.snapshot()
+}
+
+// ResetGraphQLBatch clears the batch histogram. Tests call it between cases.
+func ResetGraphQLBatch() {
+	resetHistogram(graphQLBatch)
+}
+
+func durationJSONOf(stats DurationStats) durationJSON {
+	buckets := make(map[string]uint64, len(durationBounds)+1)
+	for i, upper := range durationBounds {
+		var count uint64
+		if i < len(stats.Buckets) {
+			count = stats.Buckets[i]
+		}
+		buckets[strconv.FormatFloat(upper, 'f', -1, 64)] = count
+	}
+	buckets["+Inf"] = stats.Count
+	return durationJSON{Count: stats.Count, Sum: stats.Sum, Buckets: buckets}
 }
 
 // Series is one exported sample: a normalised attribute set, its call count
@@ -356,14 +408,11 @@ func (m *Metrics) Reset() {
 		m.calls[key] = 0
 	}
 	for _, h := range m.durations {
-		h.mu.Lock()
-		h.count = 0
-		h.sum = 0
-		for i := range h.buckets {
-			h.buckets[i] = 0
-		}
-		h.mu.Unlock()
+		resetHistogram(h)
 	}
+	// The batch histogram is process-wide, but Reset is the single zero point
+	// callers and tests use before a fresh measurement.
+	ResetGraphQLBatch()
 	m.rssBytes = 0
 	m.poller = PollerState{}
 	m.mu.Unlock()
@@ -470,9 +519,11 @@ type durationJSON struct {
 }
 
 type metricsJSON struct {
-	Counter   string `json:"counter"`
-	Histogram string `json:"histogram"`
-	RSSBytes  uint64 `json:"rssBytes"`
+	Counter          string       `json:"counter"`
+	Histogram        string       `json:"histogram"`
+	GraphQLHistogram string       `json:"graphqlBatchHistogram"`
+	GraphQLBatch     durationJSON `json:"graphqlBatch"`
+	RSSBytes         uint64       `json:"rssBytes"`
 	PollerState
 	Series []seriesJSON `json:"series"`
 }
@@ -481,28 +532,21 @@ type metricsJSON struct {
 // seconds so a reader cannot mistake it for milliseconds.
 func (m *Metrics) JSON() []byte {
 	out := metricsJSON{
-		Counter:     CounterCalls,
-		Histogram:   HistogramCallDuration,
-		RSSBytes:    m.RSSBytes(),
-		PollerState: m.Poller(),
-		Series:      []seriesJSON{},
+		Counter:          CounterCalls,
+		Histogram:        HistogramCallDuration,
+		GraphQLHistogram: HistogramGraphQLBatch,
+		GraphQLBatch:     durationJSONOf(GraphQLBatchDuration()),
+		RSSBytes:         m.RSSBytes(),
+		PollerState:      m.Poller(),
+		Series:           []seriesJSON{},
 	}
 	for _, s := range m.Snapshot() {
-		buckets := make(map[string]uint64, len(durationBounds)+1)
-		for i, upper := range durationBounds {
-			buckets[strconv.FormatFloat(upper, 'f', -1, 64)] = s.Duration.Buckets[i]
-		}
-		buckets["+Inf"] = s.Duration.Count
 		out.Series = append(out.Series, seriesJSON{
-			Signal:  s.Attributes.Signal,
-			Reason:  s.Attributes.Reason,
-			Adapter: s.Attributes.Adapter,
-			Calls:   s.Calls,
-			Duration: durationJSON{
-				Count:   s.Duration.Count,
-				Sum:     s.Duration.Sum,
-				Buckets: buckets,
-			},
+			Signal:   s.Attributes.Signal,
+			Reason:   s.Attributes.Reason,
+			Adapter:  s.Attributes.Adapter,
+			Calls:    s.Calls,
+			Duration: durationJSONOf(s.Duration),
 		})
 	}
 	raw, err := json.MarshalIndent(out, "", "  ")
@@ -520,6 +564,8 @@ func (m *Metrics) Prometheus() []byte {
 	fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", CounterCalls)
 	fmt.Fprintf(&buf, "# HELP beacon_%s Call latency in seconds.\n", HistogramCallDuration)
 	fmt.Fprintf(&buf, "# TYPE beacon_%s histogram\n", HistogramCallDuration)
+	fmt.Fprintf(&buf, "# HELP beacon_%s Wall time of one batched GraphQL request in seconds.\n", HistogramGraphQLBatch)
+	fmt.Fprintf(&buf, "# TYPE beacon_%s histogram\n", HistogramGraphQLBatch)
 	fmt.Fprintf(&buf, "# HELP beacon_%s Resident set size of the process in bytes.\n", GaugeRSSBytes)
 	fmt.Fprintf(&buf, "# TYPE beacon_%s gauge\n", GaugeRSSBytes)
 	fmt.Fprintf(&buf, "beacon_%s %d\n", GaugeRSSBytes, m.RSSBytes())
@@ -547,6 +593,14 @@ func (m *Metrics) Prometheus() []byte {
 		fmt.Fprintf(&buf, "beacon_%s_sum{%s} %g\n", HistogramCallDuration, labels, s.Duration.Sum)
 		fmt.Fprintf(&buf, "beacon_%s_count{%s} %d\n", HistogramCallDuration, labels, s.Duration.Count)
 	}
+	batch := GraphQLBatchDuration()
+	for i, upper := range durationBounds {
+		le := strconv.FormatFloat(upper, 'f', -1, 64)
+		fmt.Fprintf(&buf, "beacon_%s_bucket{le=%q} %d\n", HistogramGraphQLBatch, le, batch.Buckets[i])
+	}
+	fmt.Fprintf(&buf, "beacon_%s_bucket{le=\"+Inf\"} %d\n", HistogramGraphQLBatch, batch.Count)
+	fmt.Fprintf(&buf, "beacon_%s_sum %g\n", HistogramGraphQLBatch, batch.Sum)
+	fmt.Fprintf(&buf, "beacon_%s_count %d\n", HistogramGraphQLBatch, batch.Count)
 	return []byte(buf.String())
 }
 

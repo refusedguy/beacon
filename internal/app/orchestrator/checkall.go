@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/refusedguy/beacon/internal/infra/server"
 )
 
 // Verdict values produced by this pass. This is a mirror of the domain verdict
@@ -653,7 +655,11 @@ func (s *GHSource) Checks(ctx context.Context, prs []PR) (map[int][]Check, error
 		return out, nil
 	}
 
+	// One batched request is one observation, even when the query carries an
+	// alias per PR. The timer covers the gh call only, not response decoding.
+	start := time.Now()
 	raw, err := s.run("api", "graphql", "-f", "query="+BuildChecksQuery(prs))
+	server.ObserveGraphQLBatch(time.Since(start))
 	if err != nil {
 		return nil, fmt.Errorf("gh api graphql: %w", err)
 	}

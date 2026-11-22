@@ -13,8 +13,10 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/server"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -25,6 +27,7 @@ type fakeGH struct {
 	graphQL  []byte
 	listErr  error
 	graphErr error
+	delay    time.Duration
 	calls    [][]string
 }
 
@@ -34,6 +37,9 @@ func (f *fakeGH) run(args ...string) ([]byte, error) {
 		return f.prList, f.listErr
 	}
 	if len(args) >= 2 && args[0] == "api" && args[1] == "graphql" {
+		if f.delay > 0 {
+			time.Sleep(f.delay)
+		}
 		return f.graphQL, f.graphErr
 	}
 	return nil, fmt.Errorf("unexpected gh call: %v", args)
@@ -104,6 +110,60 @@ func TestGHSourceChecksUsesOneGraphQLBatch(t *testing.T) {
 				t.Fatalf("per-PR gh pr checks is forbidden: %v", c)
 			}
 		}
+	}
+}
+
+// TestGHSourceChecksRecordsGraphQLBatchDuration proves a fixture that holds a
+// GraphQL answer for 50 ms produces one observation with a sum close to that
+// wait. One batch with three aliases still yields exactly one observation.
+func TestGHSourceChecksRecordsGraphQLBatchDuration(t *testing.T) {
+	server.ResetGraphQLBatch()
+	t.Cleanup(server.ResetGraphQLBatch)
+
+	gh := &fakeGH{
+		graphQL: []byte(`{
+		  "data": {
+		    "p0": {"pullRequest": {"statusCheckRollup": {"contexts": {"nodes": [
+		      {"__typename":"CheckRun","name":"build","conclusion":"SUCCESS"}
+		    ]}}}},
+		    "p1": {"pullRequest": {"statusCheckRollup": {"contexts": {"nodes": []}}}},
+		    "p2": null
+		  }
+		}`),
+		delay: 50 * time.Millisecond,
+	}
+	src := NewGHSource("refusedguy/beacon", gh.run)
+	prs := []PR{
+		{Repo: "refusedguy/beacon", Number: 3, HeadSHA: "sha3"},
+		{Repo: "refusedguy/beacon", Number: 7, HeadSHA: "sha7"},
+		{Repo: "refusedguy/beacon", Number: 9, HeadSHA: "sha9"},
+	}
+
+	if _, err := src.Checks(context.Background(), prs); err != nil {
+		t.Fatal(err)
+	}
+	stats := server.GraphQLBatchDuration()
+	if stats.Count != 1 {
+		t.Fatalf("graphql batch count = %d, want 1", stats.Count)
+	}
+	if stats.Sum < 0.04 || stats.Sum > 0.20 {
+		t.Fatalf("graphql batch sum = %v s, want 0.04..0.20 s", stats.Sum)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("gh calls = %d, want 1: %v", len(gh.calls), gh.calls)
+	}
+
+	m := server.NewMetrics()
+	text := string(m.Prometheus())
+	if !strings.Contains(text, "beacon_graphql_batch_duration_seconds_count 1") {
+		t.Fatalf("Prometheus output misses the batch count:\n%s", text)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(m.JSON(), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["graphqlBatch"]; !ok {
+		t.Fatalf("JSON metrics miss graphqlBatch: %s", string(m.JSON()))
 	}
 }
 
