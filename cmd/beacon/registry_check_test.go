@@ -155,6 +155,109 @@ func TestCheckRegistryConfigIsRepeatable(t *testing.T) {
 	}
 }
 
+// registryCheckSecretValue must never appear in a negative-case report.
+const registryCheckSecretValue = "s3cr3t-DO-NOT-LOG-9f8e7d6c"
+
+func TestCheckRegistryConfigGuardRejectsYAMLMapSecret(t *testing.T) {
+	config := registryCheckValidConfig()
+	config["token"] = registryCheckSecretValue
+
+	res := checkRegistryConfig(config)
+	if res.OK() {
+		t.Fatal("secret field in decoded YAML map passed the check")
+	}
+	found := false
+	for _, issue := range res.Issues {
+		if issue.Field == "token" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no issue names the token field: %+v", res.Issues)
+	}
+
+	var buf bytes.Buffer
+	if code := registryCheckRunner(res, &buf); code != 1 {
+		t.Fatalf("exit = %d, want 1", code)
+	}
+	if strings.Contains(buf.String(), registryCheckSecretValue) {
+		t.Fatalf("report leaked the secret value: %q", buf.String())
+	}
+}
+
+func TestCheckRegistryConfigRejectsUnknownVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version any
+	}{
+		{"int", 99},
+		{"string", "99"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			config := registryCheckValidConfig()
+			config["version"] = tc.version
+
+			res := checkRegistryConfig(config)
+			if res.OK() {
+				t.Fatalf("version %v passed the check", tc.version)
+			}
+			found := false
+			for _, issue := range res.Issues {
+				if issue.Field == "version" {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("no issue names the version field: %+v", res.Issues)
+			}
+		})
+	}
+}
+
+func TestCheckRegistryConfigRejectsForeignSchema(t *testing.T) {
+	config := registryCheckValidConfig()
+	config["schema"] = "other/v2"
+
+	res := checkRegistryConfig(config)
+	if res.OK() {
+		t.Fatal("foreign schema passed the check")
+	}
+	found := false
+	for _, issue := range res.Issues {
+		if issue.Field == "schema" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no issue names the schema field: %+v", res.Issues)
+	}
+}
+
+func TestCheckRegistryConfigRejectsRosterWithoutCapabilities(t *testing.T) {
+	config := registryCheckValidConfig()
+	config["roster"] = []any{
+		map[string]any{
+			"id":    "exec-1",
+			"roles": []any{"executor"},
+		},
+	}
+
+	res := checkRegistryConfig(config)
+	if res.OK() {
+		t.Fatal("roster without capabilities passed the check")
+	}
+	found := false
+	for _, issue := range res.Issues {
+		if issue.Field == "agent_capabilities" || issue.Field == "capabilities" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no index issue: %+v", res.Issues)
+	}
+}
+
 func TestRegistryCheckRunner(t *testing.T) {
 	t.Run("clean", func(t *testing.T) {
 		res := checkRegistryConfig(registryCheckValidConfig())

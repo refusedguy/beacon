@@ -165,3 +165,45 @@ func TestGuardFile(t *testing.T) {
 		t.Error("GuardFile(missing) = nil, want error")
 	}
 }
+
+func TestGuardDocumentAcceptsYAMLShapedMap(t *testing.T) {
+	// The CLI decodes agents.yaml into map[string]any; integers and nested
+	// lists are the shapes yaml.v3 produces. A valid document must pass.
+	doc := map[string]any{
+		"schema":  "beacon.agent-registry/v2",
+		"version": 2,
+		"roster": []any{
+			map[string]any{"id": "exec-1", "roles": []any{"executor"}, "capabilities": []any{"go"}},
+		},
+	}
+	if err := GuardDocument(doc); err != nil {
+		t.Errorf("GuardDocument(valid YAML map) = %v, want nil", err)
+	}
+}
+
+func TestGuardDocumentRejectsYAMLMapSecret(t *testing.T) {
+	tests := []struct {
+		name      string
+		doc       map[string]any
+		wantField string
+	}{
+		{"field name", map[string]any{"version": 2, "token": secretValue}, "token"},
+		{"nested list", map[string]any{"roster": []any{map[string]any{"password": secretValue}}}, "password"},
+		{"value reference", map[string]any{"credentialFile": "auth.json"}, "auth.json"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := GuardDocument(tc.doc)
+			var ce *ConfigError
+			if !errors.As(err, &ce) {
+				t.Fatalf("GuardDocument error = %v, want *ConfigError", err)
+			}
+			if ce.Field != tc.wantField {
+				t.Errorf("Field = %q, want %q", ce.Field, tc.wantField)
+			}
+			if strings.Contains(err.Error(), secretValue) {
+				t.Errorf("error %q leaked the secret value", err)
+			}
+		})
+	}
+}

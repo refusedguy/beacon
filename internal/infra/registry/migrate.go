@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -87,6 +88,91 @@ func Migrate(config []byte) (Config, error) {
 		return Config{}, fmt.Errorf("registry: unsupported config schema version %d (current %d)",
 			version, CurrentSchemaVersion)
 	}
+}
+
+// CheckVersionSchema validates the version and schema markers of an already
+// decoded registry document. It mirrors readVersion and checkSchema for the
+// map shapes a YAML decoder produces, so a local check can refuse an unknown
+// version or a foreign schema without reading JSON bytes. A numeric string is
+// accepted because Validate still models version as a string; the parsed value
+// decides acceptance.
+func CheckVersionSchema(config map[string]any) error {
+	version, err := decodedVersion(config)
+	if err != nil {
+		return err
+	}
+	switch version {
+	case SchemaV1, SchemaV2:
+	default:
+		return &ValidationError{Field: "version", Reason: fmt.Sprintf("unsupported schema version %d (current %d)", version, CurrentSchemaVersion)}
+	}
+	return decodedSchema(config, version)
+}
+
+// decodedVersion reads a positive integer from the version marker. YAML gives
+// int, JSON gives float64, and the existing decoder-shaped tests use string.
+func decodedVersion(config map[string]any) (int, error) {
+	raw, ok := config["version"]
+	if !ok {
+		return 0, &ValidationError{Field: "version", Reason: "schema version is required"}
+	}
+
+	var version int
+	switch v := raw.(type) {
+	case int:
+		version = v
+	case int64:
+		version = int(v)
+	case float64:
+		if v != math.Trunc(v) {
+			return 0, &ValidationError{Field: "version", Reason: "must be an integer"}
+		}
+		version = int(v)
+	case json.Number:
+		n, err := strconv.Atoi(v.String())
+		if err != nil {
+			return 0, &ValidationError{Field: "version", Reason: "must be an integer"}
+		}
+		version = n
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			return 0, &ValidationError{Field: "version", Reason: "must be an integer"}
+		}
+		version = n
+	default:
+		return 0, &ValidationError{Field: "version", Reason: "must be an integer"}
+	}
+	if version <= 0 {
+		return 0, &ValidationError{Field: "version", Reason: fmt.Sprintf("invalid schema version %d", version)}
+	}
+	return version, nil
+}
+
+// decodedSchema applies the checkSchema rule to a decoded document. An absent
+// schema is allowed; a present one must carry the version prefix and agree
+// with the version marker.
+func decodedSchema(config map[string]any, version int) error {
+	raw, ok := config["schema"]
+	if !ok {
+		return nil
+	}
+	schema, ok := raw.(string)
+	if !ok {
+		return &ValidationError{Field: "schema", Reason: "must be a string"}
+	}
+	prefix := SchemaName + "/v"
+	if !strings.HasPrefix(schema, prefix) {
+		return &ValidationError{Field: "schema", Reason: fmt.Sprintf("unexpected schema %q, want prefix %q", schema, prefix)}
+	}
+	fromSchema, err := strconv.Atoi(strings.TrimPrefix(schema, prefix))
+	if err != nil {
+		return &ValidationError{Field: "schema", Reason: fmt.Sprintf("schema %q has no integer version", schema)}
+	}
+	if fromSchema != version {
+		return &ValidationError{Field: "schema", Reason: fmt.Sprintf("schema %q disagrees with version %d", schema, version)}
+	}
+	return nil
 }
 
 // readVersion requires an explicit positive integer. A config without a
