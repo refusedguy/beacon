@@ -530,10 +530,15 @@ func ReadCounter(counterPath string) (map[string]int, error) {
 }
 
 // WriteCounter пишет счётчик через временный файл и переименование.
+// AUD-05 перенёс общий замок в docs/tasks, поэтому каталог состояния больше
+// не создаётся как побочный эффект захвата замка: создаём его явно.
 func WriteCounter(counterPath string, groups map[string]int) error {
 	data, err := json.Marshal(counterFile{Groups: groups})
 	if err != nil {
 		return Startupf("не собран счётчик: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(counterPath), 0700); err != nil {
+		return Startupf("не создан каталог состояния: %v", err)
 	}
 	return AtomicWrite(counterPath, data, 0600)
 }
