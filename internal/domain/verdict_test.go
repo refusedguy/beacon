@@ -1499,9 +1499,10 @@ func TestParseReviewerExitCodeDeterministic(t *testing.T) {
 func TestEvaluateGreenBlockedDecisionTable(t *testing.T) {
 	red := readySnapshot()
 	red.Rollup = "FAILURE"
-	red.Ship = ShipFacts{}
-	noCI := readySnapshot()
-	noCI.Ship = ShipFacts{}
+	red.Failures = []string{"ci-build"}
+	red.Checks["ci-build"] = Check{State: "COMPLETED", Conclusion: "FAILURE", Required: true}
+	noShip := readySnapshot()
+	noShip.Ship = ShipFacts{}
 	draft := readySnapshot()
 	draft.IsDraft = true
 	cachedWrong := readySnapshot()
@@ -1518,7 +1519,7 @@ func TestEvaluateGreenBlockedDecisionTable(t *testing.T) {
 		{"green without blocker keeps the slot", readySnapshot(), false, GreenBlockedNone, false},
 		{"red with blocker is not green blocked", red, true, GreenBlockedNone, false},
 		{"red without blocker", red, false, GreenBlockedNone, false},
-		{"no CI facts with blocker keeps the slot", noCI, true, GreenBlockedNone, false},
+		{"green without ship facts and blocked frees the slot", noShip, true, GreenBlocked, true},
 		{"draft with blocker is not green", draft, true, GreenBlockedNone, false},
 		{"invalid suite with blocker is not green", cachedWrong, true, GreenBlockedNone, false},
 	}
@@ -1530,6 +1531,49 @@ func TestEvaluateGreenBlockedDecisionTable(t *testing.T) {
 			}
 			if free := got.ReleasesSlot(); free != tt.wantFree {
 				t.Fatalf("ReleasesSlot() = %v, want %v for verdict %q", free, tt.wantFree, got)
+			}
+		})
+	}
+}
+
+// The slot must follow the engine that publishes verdicts for real Watches.
+// EvaluatePR and Evaluate disagree on two observations: a doc-only PR with no
+// checks and no Ship facts, and a failure already present on the base branch.
+// EvaluateGreenBlocked must take the EvaluatePR side in both cases.
+func TestEvaluateGreenBlockedUsesPublishedVerdictEngine(t *testing.T) {
+	docOnly := readySnapshot()
+	docOnly.Checks = nil
+	docOnly.Rollup = ""
+	docOnly.Ship = ShipFacts{}
+
+	withShip := readySnapshot()
+
+	baseFailure := readySnapshot()
+	baseFailure.Failures = []string{"ci-build"}
+	baseFailure.BaseFailedChecks = map[string]bool{"ci-build": true}
+
+	tests := []struct {
+		name      string
+		s         Snapshot
+		wantCI    Verdict
+		wantGreen GreenBlockedVerdict
+	}{
+		{"doc-only PR without ship facts", docOnly, VerdictReady, GreenBlocked},
+		{"ready PR with ship facts", withShip, VerdictReady, GreenBlocked},
+		{"base failure stays blocked", baseFailure, VerdictBlocked, GreenBlockedNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ci, _ := EvaluatePR(tt.s, Policy{})
+			if ci != tt.wantCI {
+				t.Fatalf("EvaluatePR = %q, want %q", ci, tt.wantCI)
+			}
+			got := EvaluateGreenBlocked(tt.s, Policy{}, true)
+			if got != tt.wantGreen {
+				t.Fatalf("EvaluateGreenBlocked = %q, want %q", got, tt.wantGreen)
+			}
+			if tt.wantGreen == GreenBlocked && !got.ReleasesSlot() {
+				t.Fatalf("green_blocked must free the slot")
 			}
 		})
 	}
@@ -1587,16 +1631,16 @@ func TestGreenBlockedReleasesSlotOnlyForHeldVerdict(t *testing.T) {
 
 // Green-blocked is a pure scheduling decision: it does not change the CI
 // verdict, does not set the ready verdict and does not let an agent-provided
-// flag manufacture a green PR. Green comes from Evaluate over CI facts only.
+// flag manufacture a green PR. Green comes from EvaluatePR over CI facts only.
 func TestEvaluateGreenBlockedDoesNotChangeCIVerdict(t *testing.T) {
 	s := readySnapshot()
 	blocked := EvaluateGreenBlocked(s, Policy{}, true)
 	if string(blocked) == string(VerdictReady) {
 		t.Fatal("green_blocked must not become the ready verdict")
 	}
-	ciVerdict, _ := Evaluate(s, Policy{})
+	ciVerdict, _ := EvaluatePR(s, Policy{})
 	if ciVerdict != VerdictReady {
-		t.Fatalf("Evaluate mutated by green_blocked check: %q, want ready", ciVerdict)
+		t.Fatalf("EvaluatePR mutated by green_blocked check: %q, want ready", ciVerdict)
 	}
 
 	before := s

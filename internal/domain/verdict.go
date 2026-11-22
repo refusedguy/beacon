@@ -958,19 +958,22 @@ func (v GreenBlockedVerdict) ReleasesSlot() bool {
 
 // EvaluateGreenBlocked computes the green-but-blocked verdict for one CI
 // observation s under policy p, plus the observed state of the blocking task.
-// The verdict applies only when BOTH conditions hold: Evaluate classifies s as
-// VerdictReady (row 7 of §4.6: green CI, mergeable, valid suites, ship formula
-// satisfied) and the blocker is open. "Green" is therefore the verdict engine's
-// own ready decision over caller-supplied CI facts, not a flag the agent can
-// set, so this verdict does not lift the CI-only verification boundary of
-// ADR 0022. A green PR with no blocker keeps its slot; a red PR with a blocker
-// is not this verdict and keeps its slot too. When the blocker closes, the
-// verdict returns to GreenBlockedNone and the task takes a slot again.
+// The verdict applies only when BOTH conditions hold: EvaluatePR classifies s as
+// VerdictReady (green CI or a doc-only PR, mergeable, valid suites, passing
+// review) and the blocker is open. EvaluatePR is the engine the CI cycle
+// publishes, so a slot is freed for exactly the Watch that CI called ready.
+// The ship formula is not part of this decision: a doc-only PR is ready for the
+// real cycle without Ship facts. "Green" is the engine's own ready decision
+// over caller-supplied CI facts, not a flag the agent can set, so this verdict
+// does not lift the CI-only verification boundary of ADR 0022. A green PR with
+// no blocker keeps its slot; a red PR with a blocker is not this verdict and
+// keeps its slot too. When the blocker closes, the verdict returns to
+// GreenBlockedNone and the task takes a slot again.
 //
 // The function is pure: it runs no check, reads no clock or config, and mutates
 // neither s nor p. The same facts always give the same verdict.
 func EvaluateGreenBlocked(s Snapshot, p Policy, blockerOpen bool) GreenBlockedVerdict {
-	verdict, _ := Evaluate(s, p)
+	verdict, _ := EvaluatePR(s, p)
 	if blockerOpen && verdict == VerdictReady {
 		return GreenBlocked
 	}
