@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
@@ -60,8 +61,17 @@ type inspectView struct {
 	Blockers       []domain.BlockerIncident    `json:"blockers"`
 	Orchestrator   *domain.OrchestratorBinding `json:"orchestrator,omitempty"`
 	RuntimeStats   json.RawMessage             `json:"runtimeStats,omitempty"`
+	GraphReady     *graphReadyView             `json:"graphReady,omitempty"`
 	Escalations    []string                    `json:"escalations"`
 	DeliveryLadder []deliveryLadderView        `json:"deliveryLadder,omitempty"`
+}
+
+// graphReadyView is the typed graph readiness signal lifted from a stored
+// stats response. Source explains a negative Ready, so callers do not parse
+// the legacy graphReady marker out of loadErrors.
+type graphReadyView struct {
+	Ready  bool   `json:"ready"`
+	Source string `json:"source"`
 }
 
 // deliveryLadderView is one pending obligation's delivery marker. It makes the
@@ -186,6 +196,11 @@ func runInspect(c *CLI, args []string) int {
 		return 2
 	} else if ok && json.Valid(raw) {
 		view.RuntimeStats = json.RawMessage(raw)
+		var stats mcp.StatsOutput
+		if err := json.Unmarshal(raw, &stats); err == nil {
+			sig := stats.GraphReady()
+			view.GraphReady = &graphReadyView{Ready: sig.Ready, Source: string(sig.Source)}
+		}
 	}
 	view.Escalations, err = readEscalations(dir)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/mcp"
 )
 
 // fakeInspectStore is the read-only slice of the state store inspect uses. It
@@ -116,6 +117,61 @@ func TestInspectJSONIncludesBoundOrchestrator(t *testing.T) {
 	}
 	if !view.Orchestrator.BoundAt.Equal(s.binding.BoundAt) {
 		t.Errorf("boundAt = %s, want %s", view.Orchestrator.BoundAt, s.binding.BoundAt)
+	}
+}
+
+func TestInspectJSONShowsTypedGraphReady(t *testing.T) {
+	tests := []struct {
+		name       string
+		loadErrors []string
+	}{
+		{"fresh", []string{"graphReady: true"}},
+		{"stale", []string{"graphReady: false"}},
+		{"no reader", nil},
+		{"read error", []string{"graph index: boom"}},
+		{"read error wins over stale marker", []string{"graphReady: false", "graph index: boom"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stats := mcp.StatsOutput{LoadErrors: tc.loadErrors}
+			raw, err := json.Marshal(stats)
+			if err != nil {
+				t.Fatalf("marshal stats: %v", err)
+			}
+			want := stats.GraphReady()
+
+			c, out, errOut, _ := t06NewCLI(t, nil)
+			installFakeInspectStore(t, &fakeInspectStore{stats: raw, statsOK: true})
+			if code := c.Run([]string{"inspect", "--json"}); code != 0 {
+				t.Fatalf("code = %d, stderr: %s", code, errOut.String())
+			}
+
+			var view inspectView
+			if err := json.Unmarshal(out.Bytes(), &view); err != nil {
+				t.Fatalf("decode inspect JSON: %v; output: %q", err, out.String())
+			}
+			if view.GraphReady == nil {
+				t.Fatalf("graphReady field missing: %q", out.String())
+			}
+			if view.GraphReady.Ready != want.Ready || view.GraphReady.Source != string(want.Source) {
+				t.Errorf("graphReady = %+v, want %+v", view.GraphReady, want)
+			}
+		})
+	}
+}
+
+func TestInspectJSONKeepsLegacyGraphReadyMarker(t *testing.T) {
+	c, out, errOut, _ := t06NewCLI(t, nil)
+	installFakeInspectStore(t, &fakeInspectStore{
+		stats:   []byte(`{"loadErrors":["graphReady: true"]}`),
+		statsOK: true,
+	})
+
+	if code := c.Run([]string{"inspect", "--json"}); code != 0 {
+		t.Fatalf("code = %d, stderr: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), `graphReady: true`) {
+		t.Errorf("legacy marker lost from runtimeStats: %q", out.String())
 	}
 }
 
