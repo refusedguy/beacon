@@ -202,6 +202,7 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	status := strings.ToUpper(s.MergeStateStatus)
 	mergeable := strings.ToUpper(s.Mergeable)
 	rollup := strings.ToUpper(s.Rollup)
+	anyRequired := hasRequiredCheck(s)
 
 	// 4. Merge-state blockers route to the executor for a rebase. A fixer may
 	// perform the same repair, so the caller is free to route to either role.
@@ -223,7 +224,7 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 		if !s.BaseFailedChecks[name] {
 			continue
 		}
-		if c, observed := s.Checks[name]; observed && !c.Required {
+		if c, observed := s.Checks[name]; observed && !requiredGate(name, c, anyRequired) {
 			continue
 		}
 		return VerdictBlocked, wakeOrchestrator(WakePointer)
@@ -236,8 +237,8 @@ func EvaluatePR(s Snapshot, p Policy) (Verdict, []WakeTarget) {
 	// check keeps the Watch in watching, an all-green set can reach ready.
 	if len(s.Checks) > 0 && rollup == "FAILURE" && len(failed) == 0 {
 		rollup = "SUCCESS"
-		for _, c := range s.Checks {
-			if !c.Required {
+		for name, c := range s.Checks {
+			if !requiredGate(name, c, anyRequired) {
 				continue
 			}
 			green := NormalizeConclusion(c.Conclusion) == "SUCCESS" ||
@@ -312,13 +313,56 @@ func NormalizeConclusion(value string) string {
 	}
 }
 
+// IsInformationalCheckName reports whether a check is informational by name.
+// ATX-C01 leaves e2e and ci-provider-probe outside the repository's required
+// status checks, so their failures never block a Watch even when the provider
+// cannot tell which checks are required.
+func IsInformationalCheckName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "e2e", "ci-provider-probe":
+		return true
+	default:
+		return false
+	}
+}
+
+// hasRequiredCheck reports whether any observed check carries an explicit
+// required flag. GitHub's isRequired(pullRequestNumber:) answers false for
+// every context when the base branch has no required status checks and no
+// rulesets. Without one true answer the provider cannot tell a deliberately
+// informational check from a check that lost its branch protection.
+func hasRequiredCheck(s Snapshot) bool {
+	for _, c := range s.Checks {
+		if c.Required {
+			return true
+		}
+	}
+	return false
+}
+
+// requiredGate reports whether a check can block the verdict. A check marked
+// required always can. When no observed check was marked required, the
+// observation has no required-check list to trust, so every observed check
+// except the known informational names is treated as required. This keeps a
+// failed build from being silently dropped on a repository without branch
+// protection while preserving the informational-only decision.
+func requiredGate(name string, c Check, anyRequired bool) bool {
+	if c.Required {
+		return true
+	}
+	return !anyRequired && !IsInformationalCheckName(name)
+}
+
 // realFailures returns the failure names that represent an actual failed check.
 // SKIPPED and NEUTRAL conclusions are passes for this decision table even when
 // a caller included them in Failures, so they never trigger a block or retry.
-// A check observed as non-required is informational and is dropped as well.
+// A check explicitly excluded from the required list is informational and is
+// dropped as well. When no required check was observed at all, only the known
+// informational names are dropped.
 func realFailures(s Snapshot) []string {
 	out := make([]string, 0, len(s.Failures))
 	seen := make(map[string]bool, len(s.Failures))
+	anyRequired := hasRequiredCheck(s)
 	for _, name := range s.Failures {
 		if seen[name] {
 			continue
@@ -328,10 +372,9 @@ func realFailures(s Snapshot) []string {
 			continue
 		}
 		c, observed := s.Checks[name]
-		// An explicitly non-required check cannot block the verdict. A check
-		// absent from the map is not informational, so a caller that reports a
-		// failure without per-check detail stays fail-closed.
-		if observed && !c.Required {
+		// A check absent from the map is not informational, so a caller that
+		// reports a failure without per-check detail stays fail-closed.
+		if observed && !requiredGate(name, c, anyRequired) {
 			continue
 		}
 		if harmlessConclusion(c) {

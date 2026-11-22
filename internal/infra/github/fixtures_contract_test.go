@@ -7,8 +7,11 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -481,5 +484,87 @@ func TestInformationalFailureDoesNotWakeExecutor(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("required failure did not wake the executor: %+v", wake)
+	}
+}
+
+// TestNoProtectionProviderFlipsRequiredModels a repository whose base branch
+// has no branch protection. GitHub answers isRequired=false for every context.
+// The provider must still mark the failed build as required so the verdict
+// engine wakes the executor, while the ATX-C01 informational names stay false.
+func TestNoProtectionProviderFlipsRequired(t *testing.T) {
+	const prJSON = `{"pullRequest":{"state":"OPEN","isDraft":false,"headRefOid":"head-sha",` +
+		`"baseRefName":"main","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",` +
+		`"reviewDecision":"APPROVED",` +
+		`"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"FAILURE"}}}]},` +
+		`"statusCheckRollup":{"contexts":{"nodes":[` +
+		`{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"FAILURE",` +
+		`"detailsUrl":"https://ci.example/build","isRequired":false,"checkSuite":{"id":"suite-1"}},` +
+		`{"__typename":"CheckRun","name":"e2e","status":"COMPLETED","conclusion":"FAILURE",` +
+		`"detailsUrl":"https://ci.example/e2e","isRequired":false,"checkSuite":{"id":"suite-1"}},` +
+		`{"__typename":"CheckRun","name":"ci-provider-probe","status":"COMPLETED","conclusion":"FAILURE",` +
+		`"detailsUrl":"https://ci.example/probe","isRequired":false,"checkSuite":{"id":"suite-1"}}` +
+		`],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`
+	const baseJSON = `{"ref":{"target":{"oid":"main-sha","statusCheckRollup":{"contexts":{"nodes":[],` +
+		`"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		batchReply(t, w, req.Query, prJSON, baseJSON, 1)
+	}))
+	defer srv.Close()
+
+	graph := NewClient(srv.URL, "", srv.Client(), nil)
+	provider := NewBatchProvider(graph, nil, nil)
+	watches := []domain.Watch{{
+		ID: "w0", Repo: "acme/widgets", PR: 1, BaseRef: "main", Status: domain.StatusWatching,
+	}}
+	result, err := provider.FetchBatch(context.Background(), watches)
+	if err != nil {
+		t.Fatalf("FetchBatch: %v", err)
+	}
+	snap, ok := result["w0"]
+	if !ok {
+		t.Fatal("missing snapshot for w0")
+	}
+	if !snap.PR.Checks["build"].Required {
+		t.Fatalf("build Required = false, want true without branch protection")
+	}
+	for _, name := range []string{"e2e", "ci-provider-probe"} {
+		if snap.PR.Checks[name].Required {
+			t.Errorf("%s Required = true, want informational", name)
+		}
+	}
+
+	failures := []string{"build", "e2e", "ci-provider-probe"}
+	s := domain.Snapshot{
+		State:            snap.PR.State,
+		HeadSHA:          snap.PR.HeadRefOid,
+		WatchHeadSHA:     "head-sha",
+		Rollup:           "FAILURE",
+		Mergeable:        snap.PR.Mergeable,
+		MergeStateStatus: snap.PR.MergeStateStatus,
+		ReviewDecision:   snap.PR.ReviewDecision,
+		Checks:           snap.PR.Checks,
+		Failures:         failures,
+		SuitesValid:      true,
+	}
+	got, wakes := domain.EvaluatePR(s, domain.Policy{})
+	if got != domain.VerdictKeepWorking {
+		t.Fatalf("no-protection verdict = %q, want %q", got, domain.VerdictKeepWorking)
+	}
+	found := false
+	for _, target := range wakes {
+		if target.Role == domain.RoleExecutor {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no-protection failure did not wake the executor: %+v", wakes)
 	}
 }

@@ -578,11 +578,30 @@ func (b *BatchProvider) parsePRAlias(ctx context.Context, alias Alias, raw json.
 	}
 
 	normalized := make(map[string]domain.Check, len(checks))
+	anyRequired := false
 	for name, check := range checks {
 		mapped := normalizeGitHubCheck(check.Conclusion, check.State)
 		mapped.Required = check.Required
 		mapped.DetailsURL = check.DetailsURL
 		normalized[name] = mapped
+		if check.Required {
+			anyRequired = true
+		}
+	}
+	// GitHub's isRequired(pullRequestNumber:) returns false for every context
+	// when the base branch has no required status checks and no rulesets. In
+	// that case an unqualified false cannot mean "this check was explicitly
+	// excluded", so trust the observed set as the required list. Checks named
+	// in ATX-C01 stay informational. Repositories with protection are left
+	// exactly as GitHub reported them.
+	if !anyRequired && len(normalized) > 0 {
+		for name, check := range normalized {
+			if domain.IsInformationalCheckName(name) {
+				continue
+			}
+			check.Required = true
+			normalized[name] = check
+		}
 	}
 	state := domain.PRState{
 		State:            pr.State,

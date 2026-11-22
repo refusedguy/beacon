@@ -1722,3 +1722,91 @@ func TestEvaluatePRBaseBlamePrecedesConclusionFiltering(t *testing.T) {
 		t.Fatalf("EvaluatePR = %q, %+v; want %q, %+v", got, wakes, VerdictBlocked, want)
 	}
 }
+
+// TestNoProtectionAllNonRequiredBuildFailureWakesExecutor models a repository
+// without branch protection. GitHub reports isRequired=false for every check,
+// so a failed build must still produce keep_working and an executor wake
+// instead of being dropped as informational. The known informational names
+// remain informational in the same observation.
+func TestNoProtectionAllNonRequiredBuildFailureWakesExecutor(t *testing.T) {
+	s := Snapshot{
+		State:            "OPEN",
+		HeadSHA:          "abc",
+		WatchHeadSHA:     "abc",
+		Rollup:           "FAILURE",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		SuitesValid:      true,
+		Checks: map[string]Check{
+			"build":             {State: "COMPLETED", Conclusion: "FAILURE"},
+			"e2e":               {State: "COMPLETED", Conclusion: "FAILURE"},
+			"ci-provider-probe": {State: "COMPLETED", Conclusion: "FAILURE"},
+		},
+		Failures: []string{"build", "e2e", "ci-provider-probe"},
+	}
+	got, wakes := EvaluatePR(s, Policy{})
+	if got != VerdictKeepWorking {
+		t.Fatalf("no-protection build failure verdict = %q, want %q", got, VerdictKeepWorking)
+	}
+	found := false
+	for _, target := range wakes {
+		if target.Role == RoleExecutor {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no-protection build failure did not wake the executor: %+v", wakes)
+	}
+	if names := realFailures(s); !reflect.DeepEqual(names, []string{"build"}) {
+		t.Fatalf("realFailures = %v, want [build]", names)
+	}
+}
+
+// TestInformationalNamesStayInformationalWithoutProtection keeps the ST-01
+// contract when no check is required. An informational-only red rollup never
+// wakes the executor.
+func TestInformationalNamesStayInformationalWithoutProtection(t *testing.T) {
+	s := Snapshot{
+		State:            "OPEN",
+		HeadSHA:          "abc",
+		WatchHeadSHA:     "abc",
+		Rollup:           "FAILURE",
+		Mergeable:        "MERGEABLE",
+		MergeStateStatus: "CLEAN",
+		ReviewDecision:   "APPROVED",
+		SuitesValid:      true,
+		Checks: map[string]Check{
+			"build":             {State: "COMPLETED", Conclusion: "SUCCESS"},
+			"e2e":               {State: "COMPLETED", Conclusion: "FAILURE"},
+			"ci-provider-probe": {State: "COMPLETED", Conclusion: "FAILURE"},
+		},
+		Failures: []string{"e2e", "ci-provider-probe"},
+	}
+	got, wakes := EvaluatePR(s, Policy{})
+	if got != VerdictReady {
+		t.Fatalf("informational-only verdict = %q, want %q", got, VerdictReady)
+	}
+	for _, target := range wakes {
+		if target.Role == RoleExecutor {
+			t.Fatalf("informational-only failure woke the executor: %+v", wakes)
+		}
+	}
+}
+
+// TestExplicitRequiredCheckKeepsInformationalDropped preserves the existing
+// decision when at least one check is explicitly required.
+func TestExplicitRequiredCheckKeepsInformationalDropped(t *testing.T) {
+	s := readySnapshot()
+	s.Checks["ci-info"] = Check{State: "COMPLETED", Conclusion: "FAILURE"}
+	s.Failures = []string{"ci-info"}
+	got, wakes := EvaluatePR(s, Policy{})
+	if got != VerdictReady {
+		t.Fatalf("informational failure with a required gate = %q, want %q", got, VerdictReady)
+	}
+	for _, target := range wakes {
+		if target.Role == RoleExecutor {
+			t.Fatalf("informational failure woke the executor: %+v", wakes)
+		}
+	}
+}
