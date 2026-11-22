@@ -113,6 +113,27 @@ not-replaces-card-goal: true
 source: PSKX-09, pstack/skills/in-your-own-words/SKILL.md:7
 executor-task:restate-goal -->
 
+## Вычитание перед добавлением
+
+Фаза plan начинается с обязательного подшага «Вычитание». Он идёт до выбора двух форм проекта и до описания новых шагов. Исполнитель перечисляет кандидатов на удаление: мёртвые ссылки, неиспользуемые проверки, заглушки и спекулятивные guard'ы. Для каждого кандидата он приводит proof, что объект не используется: вызывающие стороны, результат поиска по репозиторию или запись в PLAN.md. Затем он удаляет найденное и фиксирует в PLAN.md, что стало проще.
+
+План без списка удаления не принимается. Пустой список допустим, только когда proof показывает, что удалять нечего. Исполнитель не добавляет парсеры, guard'ы и валидаторы сверх требования карточки. Спекулятивная проверка без требования и proof не попадает в план.
+
+Подшаг задаёт порядок «сначала удалить, потом добавить». Он не дублирует PSKX-01 (две формы), PSKX-09 (пересказ цели) и CM-01..05. Протокол Watch и число MCP-инструментов не меняются. Источник: карточка PSKX-31, `pstack/skills/principle-subtract-before-you-add/SKILL.md:9-18`.
+
+<!-- executor-task:subtract-first
+phase: plan, first-substep
+order: subtract-before-add
+step: list-removal-candidates, remove-dead-code, record-simplification
+proof-required: per-removed-item
+empty-list: allowed-with-proof
+forbid: speculative-parsers, guards-beyond-spec
+no-list: fail-plan
+not-duplicate: PSKX-01, PSKX-09, CM-01..05
+scope: no-protocol-change
+source: PSKX-31, pstack/skills/principle-subtract-before-you-add/SKILL.md:9-18
+executor-task:subtract-first -->
+
 ## Учёт токенов контекста
 
 Исполнитель видит, сколько токенов занимает каждая часть его промпта. `ContextSnapshot` хранит счётчики по пяти категориям из `/tokens` в aider (`aider/commands.py:445-532`): `system`, `history`, `repo-map`, `editable`, `read-only`. Категорию задаёт `WithTokenCount`, окно `max_input_tokens` задаёт `WithMaxInputTokens`, цену `input_cost_per_token` задаёт `WithInputCostPerToken`. Все три метода возвращают копию снимка и не меняют полученный.
@@ -1021,6 +1042,8 @@ executor-task:manifest-checks -->
 Блок `executor-task:repro-hypotheses` фиксирует четыре шага после красной команды, тег `[DEBUG-...]` с обязательным удалением и замер baseline для perf-регрессий. Проверка карточки CM-02 ищет в шаблоне `load-bearing`, четыре шага и тег отладочных логов. Контракт гипотезы в `internal/domain/depth.go` шаблон не дублирует.
 
 Блок `executor-task:token-accounting` фиксирует пять категорий токенов, методы учёта и порог предупреждения 1024. Карточка CA-07 проверяет, что сумма по категориям совпадает с эталоном, остаток вычислен по `max_input_tokens` и предупреждение срабатывает на пороге.
+
+Блок `executor-task:subtract-first` фиксирует подшаг «Вычитание» как первый в фазе plan, proof для каждого удаления и запрет спекулятивных проверок. Карточка PSKX-31 ищет в шаблоне `подшаг Вычитание` и запрет guard'ов без требования.
 
 Блок `executor-task:test-output` фиксирует поля вывода упавшего теста, лимит 2 КБ, флаг обрезки, ссылку на полный лог и сохранение классификации и вердиктов.
 
