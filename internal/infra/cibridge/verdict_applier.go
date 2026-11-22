@@ -19,7 +19,11 @@ import (
 // are staged there.
 func (b *verdictApplier) handleHeadChanged(w domain.Watch, head string, now time.Time, cycleID string) {
 	current, err := b.store.Watch(w.ID)
-	if err != nil || current.Status == domain.StatusClosed || current.HeadSHA == head {
+	if err != nil {
+		observe.ActorError("cibridge-head-read", w.ID, err)
+		return
+	}
+	if current.Status == domain.StatusClosed || current.HeadSHA == head {
 		return
 	}
 	closed, effects := domain.Transition(current, domain.HeadChangedEvent(head, now))

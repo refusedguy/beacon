@@ -832,6 +832,11 @@ func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, no
 		if err := h.store.SaveWatch(closed); err != nil {
 			return nil, domain.NewAppError(domain.CodePersistFailed, err.Error())
 		}
+		observe.Event(observe.LevelWarn, "watch_pr_superseded", observe.Fields{
+			observe.FieldWatchID: w.ID,
+			observe.FieldError: fmt.Sprintf(
+				"headSHA changed from %s to %s; subscribers carried to successor", w.HeadSHA, headSHA),
+		})
 		if carried == nil {
 			for _, effect := range effects {
 				if effect.Kind == domain.EffectCreateWatch {

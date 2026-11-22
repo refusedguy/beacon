@@ -25,6 +25,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	// ARDH-15: observe is the documented cross-cutting exception. The stale
+	// head skip below must be visible in `beacon logs --errors`, so it emits an
+	// event with a reason instead of returning silently.
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/server"
 )
 
@@ -897,6 +901,10 @@ func (w *SQLVerdictWriter) Publish(ctx context.Context, ref WatchRef, verdict Ve
 			return fmt.Errorf("checkall: разбор headSHA Watch %s: %w", ref.ID, err)
 		}
 		if currentVerdict != string(CheckVerdictWatching) || currentHead != ref.HeadSHA {
+			if currentHead != ref.HeadSHA {
+				observe.ActorError("checkall-head", ref.ID, fmt.Errorf(
+					"headSHA changed from %s to %s; verdict not published", currentHead, ref.HeadSHA))
+			}
 			return nil
 		}
 		var revision uint64
