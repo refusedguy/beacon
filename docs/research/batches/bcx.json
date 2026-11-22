@@ -15,7 +15,7 @@
     {
       "id": "BCX-01",
       "title": "Исключить docs-only recheck из сигнала implementation merged",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -35,7 +35,7 @@
     {
       "id": "BCX-02",
       "title": "Развести 34 дублированных номера ADR и обновить ссылки в карточках",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -57,7 +57,7 @@
     {
       "id": "BCX-03",
       "title": "Закрыть 182 ссылки на несуществующие ADR 0292 до 0322",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -79,7 +79,7 @@
     {
       "id": "BCX-04",
       "title": "Пересобрать ROADMAP_STATUS после исправления merge signal",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -94,7 +94,8 @@
       "context": "Источник: docs/research/docs-health-audit.md, разделы 5 и таблица 7 строка 4. Файл печатает 420 done, 332 dropped, 143 todo и дату 2026-11-20. Dry run roadmap-sync даёт 569 done, 326 dropped, 0 todo и предлагает изменить 49 карточек. Расхождение 149 done. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Дождаться исправления merge signal в BCX-01. Запустить roadmap-sync --write. Генерировать дату снимка из git, а не вручную. Сверить приоритеты P0 3, P1 2, P8 50 с расчётом инструмента.",
       "check": "CI зелёный. Повторный dry run roadmap-sync не предлагает изменений. Дата в заголовке совпадает с датой head коммита.",
-      "acceptance": "ROADMAP_STATUS PRINT 569 done, 326 dropped, 0 todo на текущем снимке и не расходится со следующим dry run."
+      "acceptance": "ROADMAP_STATUS PRINT 569 done, 326 dropped, 0 todo на текущем снимке и не расходится со следующим dry run.",
+      "note": "MERGED PR #1392 9b23dbbcb33ed795edd842ccf353c03f90080356 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-05",
@@ -119,7 +120,7 @@
     {
       "id": "BCX-06",
       "title": "Переименовать 66 файлов ADR с именем untitled",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -140,7 +141,7 @@
     {
       "id": "BCX-07",
       "title": "Сделать docs gate блокирующим после очистки exception таблицы",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -161,7 +162,7 @@
     {
       "id": "BCX-08",
       "title": "Исправить шесть сломанных ссылок в FACTS.md",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -181,7 +182,7 @@
     {
       "id": "BCX-09",
       "title": "Заменить устаревшие оценки объёма в README",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -220,7 +221,7 @@
     {
       "id": "BCX-11",
       "title": "Развести два контракта literals timeout",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -241,7 +242,7 @@
     {
       "id": "BCX-12",
       "title": "Собрать вердикты в один контракт и сделать app-зеркала производными",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -264,7 +265,7 @@
     {
       "id": "BCX-13",
       "title": "Решить судьбу кодов stop_uncertain и ACTOR_NOT_PERMITTED",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -287,7 +288,7 @@
     {
       "id": "BCX-14",
       "title": "Дать BlockedInfo.Reason закрытый набор значений",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -304,12 +305,13 @@
       "context": "Источник: docs/research/error-codes-audit.md, P1 «Причина блокировки не имеет закрытого набора». BlockedInfo.Reason в domain/types.go:191-192 это string. Пишут not_mine (tool_ack.go:643), предложение «failed checks already present on base branch» (cibridge/bridge.go:1096) и «not mine» в тестах. blockedReasonResolved = \"resolved\" (tool_ack.go:83) нигде не пишется. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Ввести тип с закрытыми значениями, включая not_mine, resolved и причины из bridge. Убрать предложение из bridge.go:1096. Обновить потребителей up.go:407, inspect.go:194 и TUI. Привести тесты к продовым значениям.",
       "check": "CI зелёный. Тесты проверяют все значения типа. Ни один потребитель не сравнивает причину с произвольной строкой.",
-      "acceptance": "BlockedInfo.Reason имеет тип и проходит проверку на записи. В логах и UI видны только известные коды."
+      "acceptance": "BlockedInfo.Reason имеет тип и проходит проверку на записи. В логах и UI видны только известные коды.",
+      "note": "MERGED PR #1277 65cb659c63b7f73d3c3bf01c79a36c1a17c2e45f (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-15",
       "title": "Объединить шесть определений кодов ошибок и две таблицы статусов",
-      "status": "todo",
+      "status": "done",
       "phase": "P6",
       "type": "task",
       "owner_files": [
@@ -331,7 +333,7 @@
     {
       "id": "BCX-16",
       "title": "Привести документированные вердикты fail и warn к коду",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -376,7 +378,7 @@
     {
       "id": "BCX-18",
       "title": "Убрать дубль NormalizeConclusion между domain и app",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -393,12 +395,13 @@
       "context": "Источник: docs/research/error-codes-audit.md, P2 «Две копии функции нормализации». domain/verdict.go:244-256 NormalizeConclusion и app/orchestrator/checkall.go:703-713 normalizeConclusion содержат одинаковые списки PASS/SUCCESS/SUCCESSFUL/SKIPPED/NEUTRAL и FAIL/FAILURE/ERROR/TIMED_OUT/ACTION_REQUIRED. Частичные копии в github/batch_provider.go:597 и cibridge/bridge.go:616. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Оставить реализацию в domain и вызывать её из app. Частичные копии заменить маппингом к общему результату. Сохранить осознанную нормализацию CANCELLED и CANCELED.",
       "check": "CI зелёный. Тесты на всех входных значениях проходят через общую функцию. Дубли удалены.",
-      "acceptance": "Изменение списка нормализации в одном месте меняет поведение всех потребителей."
+      "acceptance": "Изменение списка нормализации в одном месте меняет поведение всех потребителей.",
+      "note": "MERGED PR #1415 3137a74c601d55e8634efd99274749b5f1ab26d3 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-19",
       "title": "Привести написание machine-кодов в тестах и документации к продовым",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -415,12 +418,13 @@
       "context": "Источник: docs/research/error-codes-audit.md, P2 «Опечатки и варианты написания». not mine в notify_test.go:364 и up_test.go:115,136,145 вместо not_mine; head changed в docs/gates/G2-canary.md:73 вместо head_changed; green-blocked в verdict_test.go:1497,1555 против green_blocked в коде. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Заменить варианты написания в тестах и документации. Добавить линтер или тест, который находит старые формы в docs и *_test.go. Сохранить WARNING только там, где это префикс более длинной строки.",
       "check": "CI зелёный. Поиск старых форм не даёт совпадений вне разрешённых исключений. Тесты.use machine-коды.",
-      "acceptance": "Один код имеет одно написание в коде, тестах и документации."
+      "acceptance": "Один код имеет одно написание в коде, тестах и документации.",
+      "note": "MERGED PR #1397 145c5bd7af3063cd5498a14177b73ae920781b50 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-20",
       "title": "Добавить green_blocked в списки вердиктов документации",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -436,12 +440,13 @@
       "context": "Источник: docs/research/error-codes-audit.md, P2 «Коды только в тестах» и отдельный случай green_blocked. green_blocked определён в вердикте (verdict.go:883, EvaluateGreenBlocked:910) и используется слотами оркестратора, но отсутствует в обоих списках вердиктов в GLOSSARY.md и README.md. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Добавить green_blocked в оба списка с описанием: зелёные проверки, но слот оркестратора удержан. Сверить с ADR 0072 и политикой авто-мержа. Добавить тест, что все доменные вердикты перечислены в документации.",
       "check": "CI зелёный. Тест сверяет список доменных вердиктов и документацию. green_blocked описан в GLOSSARY.md и README.md.",
-      "acceptance": "Агент видит green_blocked в контракте и понимает, что проверки зелёные, а мерж удержан."
+      "acceptance": "Агент видит green_blocked в контракте и понимает, что проверки зелёные, а мерж удержан.",
+      "note": "MERGED PR #1407 39d04627fffb56b406c498bb2afc46321772a179 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-21",
       "title": "Собрать каталог команд из dispatch и убрать мёртвую up",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -457,12 +462,13 @@
       "context": "Источник: docs/research/cli-ux-audit.md, таблица 5 строка 1. dispatch в main.go:229-293 содержит 27 подкоманд, catalog.go:20-36 плюс три init() дают 18 записей. В каталоге нет test, orchestrate, orchestrator, registry, deliver, ci, daemon, workload, metrics, pr; есть up, который dispatch не знает. beacon what metrics даёт код 2, beacon up даёт неизвестная подкоманда. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Построить каталог из одного источника с dispatch. Подключить up к dispatch или удалить запись и команду. Добавить тест равенства множества каталога и dispatch, включая вложенные подкоманды.",
       "check": "CI зелёный. Тест каталога проходит. beacon what для каждой команды из dispatch возвращает описание и код 0.",
-      "acceptance": "Каталог содержит ровно рабочие команды. Агент может вызвать любую команду, прочитанную из beacon list --format json."
+      "acceptance": "Каталог содержит ровно рабочие команды. Агент может вызвать любую команду, прочитанную из beacon list --format json.",
+      "note": "MERGED PR #1411 f5a17eb6ab57ccae0afe2afcd17ec48210299040 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-22",
       "title": "Сделать --help рабочим для каждой команды",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -479,12 +485,13 @@
       "context": "Источник: docs/research/cli-ux-audit.md, таблица 5 строка 2. parseFlags в catalog.go:38-51 ставит fs.Usage = func(){} и при любой ошибке печатает общий usage в stderr с кодом 2. task и spawn используют parseTaskArgs (task.go:113-147), где --help это неизвестный флаг с кодом 1. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Зарегистрировать fs.Usage для каждого FlagSet. Обработать flag.ErrHelp как код 0 и писать справку в stdout. Ввести единый формат. Обновить README, который рекомендует beacon what как справку.",
       "check": "CI зелёный. Для каждой команды <cmd> --help даёт код 0 и справку в stdout. Тест перебирает все команды.",
-      "acceptance": "Агент получает справку по конкретной команде без общего usage и кода 2."
+      "acceptance": "Агент получает справку по конкретной команде без общего usage и кода 2.",
+      "note": "MERGED PR #1284 006e00da7651c8b4dd146b04b734b395d78fbb67 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-23",
       "title": "Подключить registry list/check/sync и gc к dispatch",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -505,7 +512,7 @@
     {
       "id": "BCX-24",
       "title": "Не печатать результат при ненулевом коде выхода",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -526,7 +533,7 @@
     {
       "id": "BCX-25",
       "title": "Ввести единый --format для всех команд",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -548,7 +555,7 @@
     {
       "id": "BCX-26",
       "title": "Унифицировать коды выхода для ошибок валидации",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -564,12 +571,13 @@
       "context": "Источник: docs/research/cli-ux-audit.md, таблица 5 строка 6. taskstore.ExitValidation в store.go:25 даёт 1; остальной CLI даёт 2 и для валидации. task list --format yaml даёт 1, list даёт 2. ADR 0016 и store.go:22-27 FIX 1 = валидация, 2 = ошибка запуска. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Зафиксировать правило в ADR 0016 или CLI-спецификации. Применить его ко всем раннерам, включая catalog. Добавить тест, который сравнивает код для неверного --format в двух командах.",
       "check": "CI зелёный. Оба вызова неверного --format дают одинаковый код. Тест контракта кодов выхода проходит.",
-      "acceptance": "Пользовательский провал валидации имеют один код во всём CLI."
+      "acceptance": "Пользовательский провал валидации имеют один код во всём CLI.",
+      "note": "MERGED PR #1285 2ad5f5a6c2709b6f83a89feb6911fa323522eebf (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-27",
       "title": "Гарантировать JSON на выходе logs --json",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -589,7 +597,7 @@
     {
       "id": "BCX-28",
       "title": "Свести три описания --interval и исправить daemon --once",
-      "status": "todo",
+      "status": "done",
       "phase": "P6",
       "type": "task",
       "owner_files": [
@@ -606,12 +614,13 @@
       "context": "Источник: docs/research/cli-ux-audit.md, таблица 5 строка 8. README.md:202 обещает три минуты, usageText:42 пишет 10s|30s, комментарий daemon.go:172 пишет 3m; код daemon.go:177 использует 0 как адаптивные 10s/30s. daemon --once всегда возвращает 0 (daemon.go:238-244). up.go:143 имеет --once, но up не подключён к dispatch. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Вынести default в одну константу и использовать её в коде, usage и README. Передавать результат ReconcilePass в код выхода. После BCX-23 проверить up --once.",
       "check": "CI зелёный. Тест daemon --once даёт ненулевой код при неудачном проходе. Три источника описания совпадают.",
-      "acceptance": "Интервал имеет одно описание. Неудачный проход меняет код выхода."
+      "acceptance": "Интервал имеет одно описание. Неудачный проход меняет код выхода.",
+      "note": "MERGED PR #1301 e437af7bc9d386ac34e9d8f90438e88ae4be2729 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-29",
       "title": "Централизовать ошибки CLI и убрать двойной префикс",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -632,7 +641,7 @@
     {
       "id": "BCX-30",
       "title": "Добавить машинный формат командам с ад-hoc выводом",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -649,12 +658,13 @@
       "context": "Источник: docs/research/cli-ux-audit.md, таблица 5 строка 10. deliverResult в deliver.go:298-306 имеет JSON-теги, но runDeliver печатает res.line(). human.go:263-272, registry_stop.go:268-272, inspect.go:187-217 и workload.go:160-169 печатают строки. inspect --json на пустом состоянии даёт blockers: null вместо []. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Добавить --format json и кодировать структуру в deliver, human, inspect, doctor, workload. В inspect превращать nil в пустой массив по образцу agents.go:334-336 и registry_list.go:93-95.",
       "check": "CI зелёный. Тесты кодирования для всех пяти команд. inspect --json на пустом состоянии даёт blockers: [].",
-      "acceptance": "Потребитель получает стабильный JSON без дополнительной ветки для null."
+      "acceptance": "Потребитель получает стабильный JSON без дополнительной ветки для null.",
+      "note": "MERGED PR #1305 99e7e193684ffcb4e280bacb488348e901b649c8 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-31",
       "title": "Добавить миграцию 0007 вместо правки применённой 0005",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -674,7 +684,7 @@
     {
       "id": "BCX-32",
       "title": "Привести пять определений DDL registry к одному каноническому",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -695,7 +705,7 @@
     {
       "id": "BCX-33",
       "title": "Кэшировать схему и убрать разные CAST для fencing_token",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -716,7 +726,7 @@
     {
       "id": "BCX-34",
       "title": "Включить project_key в PRIMARY KEY watch_bindings",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -732,12 +742,13 @@
       "context": "Источник: docs/research/sqlite-perf-audit.md, топ-10 строка 4. registry.go:71-84 и watch_bindings.go:34-48 задают ключ (watch_id, revision) без project_key. Запись через INSERT OR IGNORE, scoped-чтение фильтрует по project_key (registry_scoped.go:185-216). Вторая запись молча отбрасывается. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Спроектировать миграцию с новым PRIMARY KEY (project_key, watch_id, revision). Проверить уникальность существующих данных до пересборки. Убрать OR IGNORE там, где коллизия должна быть ошибкой. Добавить тест с двумя проектами.",
       "check": "CI зелёный. Тест двух проектов с одинаковым watchID сохраняет обе записи. Миграция на реальных данных проходит.",
-      "acceptance": "Изоляция проектов по watch_bindings не зависит от порядка записи."
+      "acceptance": "Изоляция проектов по watch_bindings не зависит от порядка записи.",
+      "note": "MERGED PR #1298 2e19434cb76768967973901e921c150acc0afdcd (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-35",
       "title": "Добавить составные индексы под горячие предикаты",
-      "status": "todo",
+      "status": "done",
       "phase": "P6",
       "type": "task",
       "owner_files": [
@@ -755,12 +766,13 @@
       "context": "Источник: docs/research/sqlite-perf-audit.md, топ-10 строка 5. schedules.go:121-122 ищет enabled = 1 AND next_run <= ? без индекса. receipts.go:561 делает count(*) WHERE outcome = ?. blockers.go:365 сортирует по created_at вне префикса existing индекса. registry_scoped.go:234-236,262-265 фильтрует project_key и watch_id. db.go:860,928,2294 сортирует inbox и queue_tasks по created_at. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Добавить индексы (enabled, next_run), (outcome), (status, created_at), (project_key, watch_id), (peer_name, state, created_at), (queue, created_at, id). Проверить планы запросов до и после на тестовом наборе. Учесть стоимость записи в индексы.",
       "check": "CI зелёный. Планы шести запросов используют новые индексы. Тест миграции на непустой базе проходит.",
-      "acceptance": "Ни один из шести предикатов не вызывает полное сканирование растущей таблицы."
+      "acceptance": "Ни один из шести предикатов не вызывает полное сканирование растущей таблицы.",
+      "note": "MERGED PR #1419 3a08fa9698217a4bf38e6a12c24f487bef97da7d (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-36",
       "title": "Убрать N+1 и полные чтения в горячих путях store",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -776,12 +788,13 @@
       "context": "Источник: docs/research/sqlite-perf-audit.md, топ-10 строка 6. InboxClaim в db.go:857-890 делает SELECT и по UPDATE на сообщение. ArchiveClosedWatches в archive.go:91-135 читает и декодирует все закрытые Watch. ActiveWatches, LiveWatches, AllWatches декодируют payload на каждом вызове. BackfillRegistry в backfill_registry.go:91-165 проходит все Watch. ArchivedWatch вызывает ensureWatchArchive из обычного чтения. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Заменить пошаговые UPDATE на UPDATE ... WHERE key IN (...). Добавить LIMIT и курсор для backfill. Фильтровать по времени в SQL. Подготовить таблицы один раз при Open, а не из readout. Измерить время под writer до и после.",
       "check": "CI зелёный. Тест на наборе из тысячи Watch показывает меньшее число запросов. Чтение архива не захватывает writer.",
-      "acceptance": "Число UPDATE в цикле фиксировано и не растёт линейно. Обычное чтение не вызывает DDL."
+      "acceptance": "Число UPDATE в цикле фиксировано и не растёт линейно. Обычное чтение не вызывает DDL.",
+      "note": "MERGED PR #1303 d900322eeeae399ade7de6baf01894d5e128617f (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-37",
       "title": "Сделать запись данных и progress одной транзакцией",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -796,12 +809,13 @@
       "context": "Источник: docs/research/sqlite-perf-audit.md, топ-10 строка 7. observability.go:153-196 на каждую запись тратит две транзакции: данные и persist_progress. Обе выполняют CREATE TABLE IF NOT EXISTS. Progress не атомарен с данными, сбой оставляет счётчик позади. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Создать таблицы один раз при Open. Перенести обновление progress в транзакцию данных или писать счётчик пачкой. Сверить семантику ack с ADR 0067. Добавить тест на сбой между операциями.",
       "check": "CI зелёный. Тест проверяет одну транзакцию на запись. Progress не отстаёт после искусственного сбоя.",
-      "acceptance": "Число writer-транзакций на запись уменьшено вдвое. Счётчик не расходится с данными."
+      "acceptance": "Число writer-транзакций на запись уменьшено вдвое. Счётчик не расходится с данными.",
+      "note": "MERGED PR #1310 231ad3a8b8c4fcb04e775d51123b67b48092c551 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-38",
       "title": "Убрать двойной индекс журнала и добавить удержание",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -822,7 +836,7 @@
     {
       "id": "BCX-39",
       "title": "Настроить WAL checkpoint и ограничить рост файла",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -841,7 +855,7 @@
     {
       "id": "BCX-40",
       "title": "Перейти к инкрементальному обновлению индекса карточек",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -862,7 +876,7 @@
     {
       "id": "BCX-41",
       "title": "Выбрать один контракт MCP для main и зафиксировать решение",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -885,7 +899,7 @@
     {
       "id": "BCX-42",
       "title": "Подключить или явно закрыть t3_thread_read",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -906,7 +920,7 @@
     {
       "id": "BCX-43",
       "title": "Объявить поле reason в advertised схеме wait_result",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -927,7 +941,7 @@
     {
       "id": "BCX-44",
       "title": "Зафиксировать добавочные поля stats в ADR",
-      "status": "todo",
+      "status": "done",
       "phase": "P7",
       "type": "task",
       "owner_files": [
@@ -948,7 +962,7 @@
     {
       "id": "BCX-45",
       "title": "Защитить MCP-контракт от домино-изменений домена",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -991,7 +1005,7 @@
     {
       "id": "BCX-47",
       "title": "Описать поле executor в контракте watch_pr",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1012,7 +1026,7 @@
     {
       "id": "BCX-48",
       "title": "Запретить случайную регистрацию claim и lease инструментов",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1054,7 +1068,7 @@
     {
       "id": "BCX-50",
       "title": "Свери eval-контракт инструментов с сервером",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1118,7 +1132,7 @@
     {
       "id": "BCX-53",
       "title": "Убрать гонку записи квитанции в beacon-bridge.js",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -1306,7 +1320,7 @@
     {
       "id": "BCX-62",
       "title": "Привести ADR 0094, 0263 и AGENTS.md к одному контракту MCP",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -1372,7 +1386,7 @@
     {
       "id": "BCX-65",
       "title": "Развести дубли номеров ADR 0086, 0089, 0091, 0094, 0095",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -1394,7 +1408,7 @@
     {
       "id": "BCX-66",
       "title": "Реализовать или пересмотреть ADR 0213 о версионированном вопросе",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -1415,7 +1429,7 @@
     {
       "id": "BCX-67",
       "title": "Снять блокер ADR 0214 или уточнить статус решения",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1477,7 +1491,7 @@
     {
       "id": "BCX-70",
       "title": "Обновить ссылки на удалённые файлы в двенадцати ADR",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1498,7 +1512,7 @@
     {
       "id": "BCX-71",
       "title": "Проверять адрес BEACON_GITHUB_API и связать его с основным клиентом",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -1519,7 +1533,7 @@
     {
       "id": "BCX-72",
       "title": "Задокументировать BEACON_CHANNEL_SENDERS и закрыть слэш-команды ingress",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -1540,7 +1554,7 @@
     {
       "id": "BCX-73",
       "title": "Проверять хост BEACON_TELEGRAM_API",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
