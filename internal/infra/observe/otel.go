@@ -93,6 +93,33 @@ type Attr struct {
 // String builds a string attribute.
 func String(key, value string) Attr { return Attr{Key: key, Value: value} }
 
+// Hook phase names mirror the event bus subtypes. They are written as span
+// attributes so an observer can reconstruct hook order from spans alone.
+const (
+	HookPhaseStarted  = "hook_started"
+	HookPhaseResponse = "hook_response"
+)
+
+// HookAttrs builds the span attributes for a mirrored hook phase. Callers
+// attach them to a span named for the hook event, so the observer sees both
+// the name and the phase without reading logs.
+func HookAttrs(hookEventName, phase string) []Attr {
+	return []Attr{
+		String("hook.event_name", hookEventName),
+		String("hook.phase", phase),
+	}
+}
+
+// HookStartedAttrs builds attributes for the start of a hook callback.
+func HookStartedAttrs(hookEventName string) []Attr {
+	return HookAttrs(hookEventName, HookPhaseStarted)
+}
+
+// HookResponseAttrs builds attributes for the completion of a hook callback.
+func HookResponseAttrs(hookEventName string) []Attr {
+	return HookAttrs(hookEventName, HookPhaseResponse)
+}
+
 // SpanContext carries W3C trace identifiers. Child tracers read it from the
 // context passed to Start, which is how a span becomes a child without a
 // package-level parent stack.
