@@ -97,15 +97,18 @@ func TestProviderBackoffJitterSpreadsRetries(t *testing.T) {
 }
 
 // TestProviderBackoffWithoutJitterKeepsCeiling is the negative control. Zero
-// jitter reproduces the old doubling schedule and the maxBackoff cap.
+// jitter reproduces the old doubling schedule and the maxBackoff cap. The
+// retry budget is raised because this test needs four failures to reach the
+// capped deadline, while CV-08 caps production at three.
 func TestProviderBackoffWithoutJitterKeepsCeiling(t *testing.T) {
 	now := time.Unix(200, 0)
 	fail, calls := true, 0
 	p := New(Config{
 		Backoff: 5 * time.Second, MaxBackoff: 12 * time.Second,
-		Now:    func() time.Time { return now },
-		Run:    testGHRunner(&calls, &fail),
-		Jitter: func() time.Duration { return 0 },
+		MaxConsecutiveErrors: 10,
+		Now:                  func() time.Time { return now },
+		Run:                  testGHRunner(&calls, &fail),
+		Jitter:               func() time.Duration { return 0 },
 	})
 	ctx := context.Background()
 
@@ -166,4 +169,91 @@ func TestProviderBackoffRecoveryClearsErrors(t *testing.T) {
 	if _, err := p.PRState(ctx, "o/r", 3); err != nil || calls != 6 {
 		t.Fatalf("recovery cache hit: err=%v ghCalls=%d, want nil/6", err, calls)
 	}
+}
+
+// TestProviderRetryBudgetExhausted proves the default budget of three failed
+// observations stops gh polling. The third failure returns a distinct error
+// and a fourth call starts no gh process. Jitter is fixed at zero so the
+// deadline math stays deterministic.
+func TestProviderRetryBudgetExhausted(t *testing.T) {
+	now := time.Unix(400, 0)
+	calls, fail := 0, true
+	p := New(Config{
+		Now:    func() time.Time { return now },
+		Run:    testGHRunner(&calls, &fail),
+		Jitter: func() time.Duration { return 0 },
+	})
+	ctx := context.Background()
+
+	for i, step := range []time.Duration{0, 5 * time.Second, 10 * time.Second} {
+		now = now.Add(step)
+		_, err := p.PRState(ctx, "o/r", 11)
+		if err == nil {
+			t.Fatalf("failure %d: got nil error, want a transient error", i+1)
+		}
+		var exhausted BudgetExhaustedError
+		wantExhausted := i == 2
+		if got := errors.As(err, &exhausted); got != wantExhausted {
+			t.Fatalf("failure %d: errors.As(BudgetExhaustedError) = %v, want %v (err=%v)", i+1, got, wantExhausted, err)
+		}
+	}
+	if calls != 6 {
+		t.Fatalf("gh calls after three failures = %d, want 6", calls)
+	}
+
+	_, err := p.PRState(ctx, "o/r", 11)
+	var exhausted BudgetExhaustedError
+	if !errors.As(err, &exhausted) {
+		t.Fatalf("fourth PRState error = %v, want BudgetExhaustedError", err)
+	}
+	if exhausted.Repo != "o/r" || exhausted.PR != 11 || exhausted.Fails != 3 {
+		t.Fatalf("exhaustion = %+v, want repo o/r, pr 11, fails 3", exhausted)
+	}
+	if calls != 6 {
+		t.Fatalf("fourth PRState started gh: calls = %d, want 6", calls)
+	}
+}
+
+// TestProviderRetryBudgetResetsOnSuccess is the negative control: a success
+// after two failures clears the count, so the budget is not carried over.
+func TestProviderRetryBudgetResetsOnSuccess(t *testing.T) {
+	now := time.Unix(500, 0)
+	calls, fail := 0, true
+	p := New(Config{
+		Now:    func() time.Time { return now },
+		Run:    testGHRunner(&calls, &fail),
+		Jitter: func() time.Duration { return 0 },
+	})
+	ctx := context.Background()
+
+	failAt := func(step time.Duration, wantExhausted bool) {
+		t.Helper()
+		now = now.Add(step)
+		_, err := p.PRState(ctx, "o/r", 12)
+		if err == nil {
+			t.Fatal("PRState returned nil error, want a failure")
+		}
+		var exhausted BudgetExhaustedError
+		if got := errors.As(err, &exhausted); got != wantExhausted {
+			t.Fatalf("errors.As(BudgetExhaustedError) = %v, want %v (err=%v)", got, wantExhausted, err)
+		}
+	}
+
+	failAt(0, false)
+	failAt(5*time.Second, false)
+
+	fail = false
+	now = now.Add(10 * time.Second)
+	state, err := p.PRState(ctx, "o/r", 12)
+	if err != nil {
+		t.Fatalf("PRState after recovery: %v", err)
+	}
+	if state.HeadRefOid != "abc123" {
+		t.Fatalf("PRState after recovery: head = %q, want abc123", state.HeadRefOid)
+	}
+
+	fail = true
+	failAt(2*time.Second, false) // count 1 after reset
+	failAt(5*time.Second, false) // count 2 after reset, still under budget
+	failAt(10*time.Second, true) // count 3 reaches the budget
 }

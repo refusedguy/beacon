@@ -30,6 +30,11 @@ const (
 	// maxJitter bounds the random wait added to a backoff deadline. Two
 	// providers that see the same failure then retry at different times.
 	maxJitter = time.Second
+	// defaultMaxConsecutiveErrors is the retry budget. After this many failed
+	// observations in a row the provider stops calling gh for the PR and
+	// returns BudgetExhaustedError. The limit belongs to the retry rule, not
+	// to each caller's configuration.
+	defaultMaxConsecutiveErrors = 3
 )
 
 // Runner is the only external dependency of Provider: the authenticated gh
@@ -46,9 +51,12 @@ type Config struct {
 	MinInterval time.Duration
 	Backoff     time.Duration
 	MaxBackoff  time.Duration
-	Now         func() time.Time
-	Run         Runner
-	Jitter      func() time.Duration
+	// MaxConsecutiveErrors caps failed observations before the provider
+	// refuses to call gh again. Zero selects defaultMaxConsecutiveErrors.
+	MaxConsecutiveErrors int
+	Now                  func() time.Time
+	Run                  Runner
+	Jitter               func() time.Duration
 }
 
 // prEntry is the per-PR state kept by Provider for the lifetime of the process.
@@ -59,6 +67,7 @@ type prEntry struct {
 	inFlight          bool
 	consecutiveErrors int
 	backoff           time.Duration
+	exhausted         bool
 }
 
 // Provider adapts the authenticated `gh` CLI to domain.CIProvider. The
@@ -75,13 +84,14 @@ type Provider struct {
 	mu      sync.Mutex
 	entries map[string]*prEntry
 
-	cacheTTL    time.Duration
-	minInterval time.Duration
-	backoff     time.Duration
-	maxBackoff  time.Duration
-	now         func() time.Time
-	run         Runner
-	jitter      func() time.Duration
+	cacheTTL             time.Duration
+	minInterval          time.Duration
+	backoff              time.Duration
+	maxBackoff           time.Duration
+	maxConsecutiveErrors int
+	now                  func() time.Time
+	run                  Runner
+	jitter               func() time.Duration
 }
 
 var _ domain.CIProvider = (*Provider)(nil)
@@ -90,13 +100,14 @@ var _ domain.CIProvider = (*Provider)(nil)
 // the production defaults.
 func New(cfg Config) *Provider {
 	return &Provider{
-		cacheTTL:    cfg.CacheTTL,
-		minInterval: cfg.MinInterval,
-		backoff:     cfg.Backoff,
-		maxBackoff:  cfg.MaxBackoff,
-		now:         cfg.Now,
-		run:         cfg.Run,
-		jitter:      cfg.Jitter,
+		cacheTTL:             cfg.CacheTTL,
+		minInterval:          cfg.MinInterval,
+		backoff:              cfg.Backoff,
+		maxBackoff:           cfg.MaxBackoff,
+		maxConsecutiveErrors: cfg.MaxConsecutiveErrors,
+		now:                  cfg.Now,
+		run:                  cfg.Run,
+		jitter:               cfg.Jitter,
 	}
 }
 
@@ -122,6 +133,9 @@ func (p *Provider) defaults() {
 	}
 	if p.maxBackoff < p.backoff {
 		p.maxBackoff = p.backoff
+	}
+	if p.maxConsecutiveErrors <= 0 {
+		p.maxConsecutiveErrors = defaultMaxConsecutiveErrors
 	}
 	if p.now == nil {
 		p.now = time.Now
@@ -195,6 +209,21 @@ func (e throttleError) Error() string {
 		e.repo, e.pr, e.fails, e.wait)
 }
 
+// BudgetExhaustedError reports that a PR has reached maxConsecutiveErrors
+// failed observations in a row. The provider stops calling gh for that PR.
+// Callers can identify it with errors.As. It reaches cibridge as an error, so
+// no verdict is published from a stale observation.
+type BudgetExhaustedError struct {
+	Repo  string
+	PR    int
+	Fails int
+}
+
+func (e BudgetExhaustedError) Error() string {
+	return fmt.Sprintf("ghci: %s#%d: retry budget exhausted after %d consecutive errors",
+		e.Repo, e.PR, e.Fails)
+}
+
 // PRState returns the current PR state, served from the short-lived cache when
 // possible. A call that would be too soon for the same PR is skipped: while in
 // backoff it reports a throttle error, otherwise it returns the cached state.
@@ -206,12 +235,14 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 	key := fmt.Sprintf("%s#%d", repo, pr)
 
 	consecutive := 0
+	exhausted := false
 	defer func() {
 		level := observe.LevelDebug
 		fields := observe.Fields{
 			observe.FieldAdapter: "ghci", "method": "PRState", "repo": repo,
 			observe.FieldPR: pr, observe.FieldDuration: p.now().Sub(started).String(),
-			"consecutive_errors": consecutive,
+			"consecutive_errors":     consecutive,
+			"retry_budget_exhausted": exhausted,
 		}
 		if err != nil {
 			level = observe.LevelWarn
@@ -228,6 +259,11 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 		p.entries[key] = e
 	}
 	consecutive = e.consecutiveErrors
+	exhausted = e.exhausted
+	if exhausted {
+		p.mu.Unlock()
+		return domain.PRState{}, BudgetExhaustedError{Repo: repo, PR: pr, Fails: e.consecutiveErrors}
+	}
 
 	// One fresh observation serves every Watch on this PR and several ticks.
 	// This is the batch optimisation: no gh process is started on a cache hit.
@@ -262,6 +298,16 @@ func (p *Provider) PRState(ctx context.Context, repo string, pr int) (state doma
 		// Jitter is added to the deadline only, so repeated doubling still
 		// respects maxBackoff and a zero jitter keeps the old timing.
 		e.consecutiveErrors++
+		consecutive = e.consecutiveErrors
+		if e.consecutiveErrors >= p.maxConsecutiveErrors {
+			// The budget belongs to the retry rule. Past this point there is
+			// no nextAllowed to wait for: gh is not called again for this PR.
+			e.exhausted = true
+			exhausted = true
+			e.nextAllowed = time.Time{}
+			p.mu.Unlock()
+			return domain.PRState{}, BudgetExhaustedError{Repo: repo, PR: pr, Fails: e.consecutiveErrors}
+		}
 		if e.backoff <= 0 {
 			e.backoff = p.backoff
 		} else if e.backoff < p.maxBackoff {
