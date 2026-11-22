@@ -19,9 +19,10 @@ Workflow-level `concurrency` с группой `${{ github.workflow }}-${{ githu
 
 ## ci.yml
 
-Основная проверка из пяти независимых джоб на чистой Ubuntu: `build`, `test`, `js-test`, `gates`, `e2e`. У `build`, `test` и `gates` лимит 10 минут, у `e2e` 20 минут.
+Основная проверка включает джобы на чистой Ubuntu: `build`, `test`, `js-test`, `gates`, `e2e`. У `build`, `test` и `gates` лимит 10 минут, у `e2e` 20 минут.
 
-- `build` компилирует `beacon` из `./cmd/beacon` воспроизводимыми флагами: `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false`, `-ldflags="-buildid= -s -w"`. Джоба показывает, что проект собирается.
+- `build` компилирует `beacon` из `./cmd/beacon`. Флаги сборки лежат в блоке `env` workflow в переменных `BEACON_BUILD_FLAGS` и `BEACON_BUILD_LDFLAGS`. Шаги сборки берут флаги оттуда и не повторяют их. Джоба печатает SHA-256 собранного файла и отдаёт его джобе `rules-broken` через output `beacon_sha256`.
+- `rules-broken` собирает `beacon` с теми же флагами и сравнивает свой SHA-256 со значением из `build`. Расхождение хешей делает джобу красной. Так проверка находит невоспроизводимую сборку между джобами.
 - `test` запускает `go test ./...` в корневом модуле и отдельно в модуле гейтов `tools/beacon-gates`. Второй шаг нужен, потому что вложенный модуль не попадает в `./...` корня.
 - `js-test` запускает `node --test` по всем найденным JS-тестам: адаптеры в `tests/adapter`, `SKILL_test.js` в `.opencode/skills` и тесты агентов в `.opencode/agents`. Отдельный `setup-node` не нужен: Node предустановлен на `ubuntu-latest`. JS-тесты вынесены из `test`, чтобы Go-тесты и JS-тесты не зависели друг от друга.
 - `gates` берёт закоммиченный бинарник `tools/beacon-gates/beacon-gates`. Для каждого из трёх гейтов (`layers-list`, `layers-ast`, `capabilities`) джоба запускает `--self-test` с посаженным нарушением, затем прогоняет сами гейты по дереву. Код выхода доходит до CI без изменений: 0 зелёный, 1 нашёл нарушение, 2 не смог запуститься.
@@ -39,5 +40,5 @@ Workflow-level `concurrency` с группой `${{ github.workflow }}-${{ githu
 - Красный `test` значит, что упал тест. Смотреть лог шага Test root module или Test gates module.
 - Красный `js-test` значит, что упал JS-тест. Смотреть лог шага Test JS adapters.
 - Красный `gates` значит, что гейт нашёл нарушение с кодом 1 или не запустился с кодом 2. Код 2 у self-test означает поломку самого инструмента.
-- Красный `gates-binary` значит, что исходники гейтов изменились, а бинарник нет. Пересобрать его командой `cd tools/beacon-gates && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-buildid= -s -w" -o beacon-gates .` и закоммитить обновлённый файл.
+- Красный `gates-binary` значит, что исходники гейтов изменились, а бинарник нет. Команда пересборки напечатана в сообщении джобы. Флаги сборки `beacon` определены в блоке `env` в `ci.yml` и `tests.yml`.
 - Красный `e2e` не блокирует мерж: джоба помечена `continue-on-error`. Смотреть лог шага Run e2e; лимит джобы 20 минут.
