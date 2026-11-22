@@ -438,6 +438,25 @@ executor-task:checkpoints -->
 waiting, watchID
 executor-task:report -->
 
+## Предикат выхода и строка журнала
+
+Предикат выхода входит в контракт Watch. Это проверяемое условие, которое агент записывает до первой итерации. Агент держит предикат неизменным на всех ревизиях ветки и во всех ребазах цепочки. Вердикт или плато не ослабляют предикат.
+
+На каждой ревизии агент пишет одну строку журнала. В строке три поля: изменение, наблюдение, решение. Изменение называет правку или действие шага. Наблюдение называет факт, который агент увидел на этой ревизии. Решение называет следующий шаг и его связь с предикатом.
+
+Следующий шаг агент берёт из поля `nextAction` ответа `beacon_get_result`, когда ответ есть. До ответа шаг следует из предиката. Другие источники шаг не задают. Плато, при котором условие не приблизилось к предикату, остаётся наблюдением. Плато не переводит Watch в готовность.
+
+Wake-механизм и правило `waiting, <watchID>` не меняются. Вердикт агент берёт только из `beacon_get_result`.
+
+<!-- executor-task:exit-predicate
+predicate: verifiable-condition, set-before-first-iteration, unchanged-across-revisions
+journal: one-line-per-revision, fields change-observation-decision
+plateau: observation-only, no-ready, no-weakening
+next-step-source: beacon_get_result.nextAction
+protocol-change: none
+source: CP-03, docs/research/comp-cursor-plugins.md
+executor-task:exit-predicate -->
+
 ## Вердикты и пробуждение
 
 Авто-мерж включён по умолчанию: Beacon сам мержит зелёный PR по `verdict=ready` (ADR 0072). Исполнитель не получает команды мерж и не вызывает `gh pr merge`.
