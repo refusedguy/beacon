@@ -73,7 +73,7 @@ func TestListWithBacklink(t *testing.T) {
 		f := newBacklinkFixture(t)
 		writeBacklinkFile(t, filepath.Join(f.admin, "gitdir"), f.wtDir+"/.git\n")
 
-		got, err := ListWithBacklink(&backlinkGit{listing: f.listing, admin: f.admin})
+		got, err := ListWithBacklink((&backlinkGit{listing: f.listing, admin: f.admin}).run)
 		if err != nil {
 			t.Fatalf("ListWithBacklink() error = %v", err)
 		}
@@ -92,7 +92,7 @@ func TestListWithBacklink(t *testing.T) {
 		writeBacklinkFile(t, filepath.Join(oldDir, ".git"), "gitdir: somewhere\n")
 		writeBacklinkFile(t, filepath.Join(f.admin, "gitdir"), oldDir+"/.git\n")
 
-		got, err := ListWithBacklink(&backlinkGit{listing: f.listing, admin: f.admin})
+		got, err := ListWithBacklink((&backlinkGit{listing: f.listing, admin: f.admin}).run)
 		if err != nil {
 			t.Fatalf("ListWithBacklink() error = %v", err)
 		}
@@ -103,7 +103,7 @@ func TestListWithBacklink(t *testing.T) {
 
 	t.Run("missing backlink file drops the entry", func(t *testing.T) {
 		f := newBacklinkFixture(t)
-		got, err := ListWithBacklink(&backlinkGit{listing: f.listing, admin: f.admin})
+		got, err := ListWithBacklink((&backlinkGit{listing: f.listing, admin: f.admin}).run)
 		if err != nil {
 			t.Fatalf("ListWithBacklink() error = %v", err)
 		}
@@ -116,7 +116,7 @@ func TestListWithBacklink(t *testing.T) {
 		f := newBacklinkFixture(t)
 		writeBacklinkFile(t, filepath.Join(f.admin, "gitdir"), filepath.Join(f.wtDir, "gone", ".git")+"\n")
 
-		got, err := ListWithBacklink(&backlinkGit{listing: f.listing, admin: f.admin})
+		got, err := ListWithBacklink((&backlinkGit{listing: f.listing, admin: f.admin}).run)
 		if err != nil {
 			t.Fatalf("ListWithBacklink() error = %v", err)
 		}
@@ -133,7 +133,7 @@ func TestListWithBacklink(t *testing.T) {
 			admin:     f.admin,
 			gitDirErr: errors.New("exit status 128"),
 		}
-		got, err := ListWithBacklink(run)
+		got, err := ListWithBacklink(run.run)
 		if err != nil {
 			t.Fatalf("ListWithBacklink() error = %v", err)
 		}
