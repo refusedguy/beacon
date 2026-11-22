@@ -252,7 +252,7 @@ var (
 var (
 	allowedCardTypes    = []string{"task", "adr", "eval", "doc"}
 	allowedCardPhases   = []string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}
-	allowedCardStatuses = []string{"todo", "done", "dropped"}
+	allowedCardStatuses = []string{"todo", "in_progress", "blocked", "done", "dropped", "duplicate"}
 )
 
 func allowedValue(value string, allowed []string) bool {
