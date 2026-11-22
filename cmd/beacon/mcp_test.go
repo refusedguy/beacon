@@ -909,3 +909,108 @@ func TestHTTPStateProviderSnapshotHistoryBoundsByTimeAndCount(t *testing.T) {
 		t.Fatalf("SnapshotHistory without store = %+v, %v", empty, err)
 	}
 }
+
+// ---- AUTOSP-04: auto-spawn on a terminal wave signal ----
+
+type autoSpawnRecordingWaker struct {
+	payloads []domain.WakePayload
+}
+
+func (w *autoSpawnRecordingWaker) Deliver(_ context.Context, _, _ string, p domain.WakePayload) error {
+	w.payloads = append(w.payloads, p)
+	return nil
+}
+
+func TestAutoSpawnNoFreeSlotHoldsTheWave(t *testing.T) {
+	a := newAutoSpawnCoordinator()
+	launches := 0
+	var holds []string
+	a.slots = func() (int, int) { return domain.DefaultSlotsTotal, domain.DefaultSlotsTotal }
+	a.launch = func(context.Context, autoSpawnSignal) (string, string, error) {
+		launches++
+		return "ses-from-full", "ATX-01", nil
+	}
+	a.record = func(kind, _ string) { holds = append(holds, kind) }
+
+	a.run(context.Background(), autoSpawnSignal{WatchID: "watch-full", Revision: 1, PR: 10})
+
+	if launches != 0 {
+		t.Fatalf("launches = %d, want 0 when every slot is used", launches)
+	}
+	if len(holds) != 1 || holds[0] != "no_slot" {
+		t.Fatalf("holds = %v, want [no_slot]", holds)
+	}
+}
+
+func TestAutoSpawnTerminalSignalSpawnsOnce(t *testing.T) {
+	a := newAutoSpawnCoordinator()
+	launches := 0
+	a.slots = func() (int, int) { return 0, domain.DefaultSlotsTotal }
+	a.launch = func(_ context.Context, sig autoSpawnSignal) (string, string, error) {
+		launches++
+		return "ses-" + sig.WatchID, "ATX-02", nil
+	}
+	a.record = func(kind, detail string) { t.Errorf("unexpected hold kind=%q detail=%q", kind, detail) }
+
+	sig := autoSpawnSignal{WatchID: "watch-closed", Revision: 7, PR: 42}
+	a.run(context.Background(), sig)
+	a.run(context.Background(), sig) // the same (watchID, revision) is the same signal
+	if launches != 1 {
+		t.Fatalf("launches = %d, want exactly 1 for one terminal signal", launches)
+	}
+	if len(a.live) != 1 || !a.live["watch-closed@7"] {
+		t.Fatalf("live tokens = %v, want one key watch-closed@7", a.live)
+	}
+}
+
+func TestAutoSpawnRedMainHoldsTheWave(t *testing.T) {
+	a := newAutoSpawnCoordinator()
+	launches := 0
+	a.mainRed = func(context.Context) bool { return true }
+	a.slots = func() (int, int) { return 0, domain.DefaultSlotsTotal }
+	a.launch = func(context.Context, autoSpawnSignal) (string, string, error) {
+		launches++
+		return "ses-red", "ATX-03", nil
+	}
+	var holds []string
+	a.record = func(kind, _ string) { holds = append(holds, kind) }
+
+	a.run(context.Background(), autoSpawnSignal{WatchID: "watch-red", Revision: 2})
+
+	if launches != 0 {
+		t.Fatalf("launches = %d, want 0 on a red main branch", launches)
+	}
+	if len(holds) != 1 || holds[0] != "main_red" {
+		t.Fatalf("holds = %v, want [main_red]", holds)
+	}
+}
+
+func TestAutoSpawnSignalWatcherCapturesOnlyTerminalAck(t *testing.T) {
+	inner := &autoSpawnRecordingWaker{}
+	w := &autoSpawnSignalWatcher{Inner: inner}
+	notice := "terminal_ack: watchID=watch-9, pr=refusedguy/beacon#88, verdict=closed, closeReason=closed, revision=5, nextAction: report_to_orchestrator, nextHint: wave item done; proceed to next wave"
+	if err := w.Deliver(context.Background(), "opencode", "ses_orchestrator", domain.WakePayload{
+		WatchID: "watch-9", Revision: 5, Verdict: notice,
+	}); err != nil {
+		t.Fatalf("Deliver terminal: %v", err)
+	}
+	if err := w.Deliver(context.Background(), "opencode", "ses_executor", domain.WakePayload{
+		WatchID: "watch-10", Revision: 6, Verdict: "keep_working: resume the failed checks",
+	}); err != nil {
+		t.Fatalf("Deliver non-terminal: %v", err)
+	}
+	if len(inner.payloads) != 2 {
+		t.Fatalf("inner deliveries = %d, want 2 (delivery is unchanged)", len(inner.payloads))
+	}
+	got := w.drain()
+	if len(got) != 1 {
+		t.Fatalf("signals = %+v, want exactly one terminal signal", got)
+	}
+	want := autoSpawnSignal{WatchID: "watch-9", Revision: 5, PR: 88}
+	if got[0] != want {
+		t.Fatalf("signal = %+v, want %+v", got[0], want)
+	}
+	if again := w.drain(); len(again) != 0 {
+		t.Fatalf("second drain = %+v, want empty", again)
+	}
+}

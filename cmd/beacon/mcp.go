@@ -1442,6 +1442,7 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		resolver:   resolver,
 		events:     events,
 	}
+	cfg.auto = newReconcileAutoSpawner(cfg)
 
 	// Only the owner of the non-blocking poller lock starts the single
 	// background cycle and the loopback HTTP API. A second MCP process serves
@@ -1659,6 +1660,9 @@ type reconcileConfig struct {
 	// onPollerOwner runs once when this process wins the poller lock. runMCP
 	// uses it to start the loopback API only on the owning process.
 	onPollerOwner func(context.Context)
+	// auto opens one execution slot per terminal wave signal. A nil value
+	// disables auto-spawn, which leaves daemon and unit tests side-effect free.
+	auto *autoSpawnCoordinator
 }
 
 // githubBatch is the real CI provider plus the shared point counter.
@@ -2033,6 +2037,266 @@ func reconcileMaintenance(ctx context.Context, cfg reconcileConfig) {
 	}
 }
 
+// ---- AUTOSP-04: open one execution slot per terminal wave signal ----
+
+// autoSpawnSignal is one terminal completion signal delivered to the project
+// orchestrator. WatchID and Revision form the (watchID, revision) idempotency
+// key of domain.SlotToken, so a repeated signal cannot open a second slot.
+type autoSpawnSignal struct {
+	WatchID  string
+	Revision uint64
+	PR       int
+}
+
+// autoSpawnLaunch performs the effectful half of one spawn: claim one card,
+// run its launch gate, bind a worktree, start a session and link the card to
+// the Watch that freed the slot. It returns the session and card identifiers.
+type autoSpawnLaunch func(ctx context.Context, sig autoSpawnSignal) (sessionID, cardID string, err error)
+
+// autoSpawnCoordinator opens at most one slot per terminal signal. The domain
+// SlotLedger owns the one-signal-one-spawn rule. This type owns ordering and
+// the external ports, so a test can drive every decision without CI or a
+// hosting service.
+type autoSpawnCoordinator struct {
+	mu      sync.Mutex
+	ledger  *orchestrator.SlotLedger
+	live    map[string]bool
+	slots   func() (used, total int)
+	mainRed func(context.Context) bool
+	launch  autoSpawnLaunch
+	record  func(kind, detail string)
+}
+
+func newAutoSpawnCoordinator() *autoSpawnCoordinator {
+	return &autoSpawnCoordinator{ledger: orchestrator.NewSlotLedger()}
+}
+
+// run consumes one signal. A rejected signal leaves its token live, so the
+// next pass cannot retry the same wave item into a second spawn.
+func (a *autoSpawnCoordinator) run(ctx context.Context, sig autoSpawnSignal) {
+	if a == nil || strings.TrimSpace(sig.WatchID) == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.ledger == nil {
+		a.ledger = orchestrator.NewSlotLedger()
+	}
+	token, inc := a.ledger.Issue(orchestrator.SignalReportToOrchestrator, sig.WatchID, sig.Revision, sig.PR)
+	if inc != nil {
+		a.note(string(inc.Kind), inc.Detail)
+		return
+	}
+	if token.WatchID == "" {
+		return
+	}
+	if a.mainRed != nil && a.mainRed(ctx) {
+		a.note("main_red", "active main blocker incidents; slot held for "+token.Key())
+		return
+	}
+	used, total := len(a.live), domain.DefaultSlotsTotal
+	if a.slots != nil {
+		used, total = a.slots()
+	}
+	if total <= 0 || used >= total {
+		a.note("no_slot", fmt.Sprintf("used=%d total=%d", used, total))
+		return
+	}
+	if a.launch == nil {
+		return
+	}
+	sessionID, cardID, err := a.launch(ctx, sig)
+	if err != nil || strings.TrimSpace(sessionID) == "" {
+		a.note("launch_failed", autoSpawnErr(err))
+		return
+	}
+	if a.live == nil {
+		a.live = map[string]bool{}
+	}
+	a.live[token.Key()] = true
+	observe.Event(observe.LevelInfo, "auto_spawn_started", observe.Fields{
+		observe.FieldWatchID: sig.WatchID, "revision": sig.Revision,
+		"card": cardID, "session": sessionID, "pr": sig.PR, "slot": token.Key(),
+	})
+}
+
+func (a *autoSpawnCoordinator) note(kind, detail string) {
+	if a.record != nil {
+		a.record(kind, detail)
+		return
+	}
+	observe.Event(observe.LevelWarn, "auto_spawn_hold", observe.Fields{
+		"kind": kind, "detail": detail,
+	})
+}
+
+func autoSpawnErr(err error) string {
+	if err == nil {
+		return "empty sessionID"
+	}
+	return err.Error()
+}
+
+// autoSpawnSignalWatcher wraps the bridge waker. It records terminal_ack wakes
+// without changing delivery: the inner deliverer still sees the same payload.
+// The caller drains the signals after Refresh, so one cycle opens one slot.
+type autoSpawnSignalWatcher struct {
+	mu      sync.Mutex
+	Inner   domain.AdapterWakeDeliverer
+	signals []autoSpawnSignal
+}
+
+var _ domain.AdapterWakeDeliverer = (*autoSpawnSignalWatcher)(nil)
+
+func (w *autoSpawnSignalWatcher) Deliver(ctx context.Context, adapter, sessionID string, p domain.WakePayload) error {
+	w.capture(p)
+	if w.Inner == nil {
+		return nil
+	}
+	return w.Inner.Deliver(ctx, adapter, sessionID, p)
+}
+
+// DeliverToSubscriber keeps the watch-aware path the production adapter
+// provides. Dropping it would make the bridge fall back to plain Deliver and
+// lose fixer wake accounting (ATX-43).
+func (w *autoSpawnSignalWatcher) DeliverToSubscriber(ctx context.Context, watch domain.Watch, p domain.WakePayload, subscriberID string) error {
+	w.capture(p)
+	if sw, ok := w.Inner.(interface {
+		DeliverToSubscriber(context.Context, domain.Watch, domain.WakePayload, string) error
+	}); ok {
+		return sw.DeliverToSubscriber(ctx, watch, p, subscriberID)
+	}
+	if w.Inner == nil {
+		return nil
+	}
+	target, err := wake.SubscriberTarget(watch, p.WatchID, subscriberID)
+	if err != nil {
+		return err
+	}
+	adapter := ""
+	for _, sub := range watch.Subscribers {
+		if sub.ID == target {
+			adapter = sub.Adapter
+			break
+		}
+	}
+	return w.Inner.Deliver(ctx, adapter, target, p)
+}
+
+func (w *autoSpawnSignalWatcher) capture(p domain.WakePayload) {
+	if !strings.Contains(p.Verdict, "nextAction: "+orchestrator.SignalReportToOrchestrator) {
+		return
+	}
+	w.mu.Lock()
+	w.signals = append(w.signals, autoSpawnSignal{
+		WatchID: p.WatchID, Revision: p.Revision, PR: autoSpawnPR(p.Verdict),
+	})
+	w.mu.Unlock()
+}
+
+func (w *autoSpawnSignalWatcher) drain() []autoSpawnSignal {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := w.signals
+	w.signals = nil
+	return out
+}
+
+// autoSpawnPR reads pr=<repo>#<number> from a terminal notice. A notice with
+// no parseable PR yields zero; the slot token still keys on watch and revision.
+func autoSpawnPR(notice string) int {
+	i := strings.Index(notice, "pr=")
+	if i < 0 {
+		return 0
+	}
+	rest := notice[i+len("pr="):]
+	j := strings.Index(rest, "#")
+	if j < 0 {
+		return 0
+	}
+	rest = rest[j+1:]
+	n := 0
+	for n < len(rest) && rest[n] >= '0' && rest[n] <= '9' {
+		n++
+	}
+	pr, err := strconv.Atoi(rest[:n])
+	if err != nil {
+		return 0
+	}
+	return pr
+}
+
+// newReconcileAutoSpawner builds the production port for the MCP reconciler.
+// A nil claim store leaves the launch unable to claim, so no agent starts.
+func newReconcileAutoSpawner(cfg reconcileConfig) *autoSpawnCoordinator {
+	a := newAutoSpawnCoordinator()
+	a.mainRed = func(ctx context.Context) bool {
+		if cfg.db == nil {
+			return false
+		}
+		active, err := cfg.db.ActiveBlockers()
+		return err == nil && len(active) > 0
+	}
+	a.launch = func(ctx context.Context, sig autoSpawnSignal) (string, string, error) {
+		return launchAutoSpawn(ctx, cfg, sig)
+	}
+	return a
+}
+
+// launchAutoSpawn claims one ready card, runs its launch gate, binds a
+// worktree after the fetch performed by bindRepoWorktree, starts one session
+// through the installed spawner and links the card to the finished Watch.
+func launchAutoSpawn(ctx context.Context, cfg reconcileConfig, sig autoSpawnSignal) (string, string, error) {
+	if cfg.deps.TaskClaimStore == nil {
+		return "", "", errors.New("auto-spawn: claim store is nil")
+	}
+	agentID := "autospawn-" + sig.WatchID
+	out, err := cfg.deps.TaskClaimStore.Claim(ctx, mcp.TaskClaimInput{AgentID: agentID},
+		time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return "", "", err
+	}
+	cardID := strings.TrimSpace(out.CardID)
+	if cardID == "" {
+		return "", "", errors.New("auto-spawn: claim returned no card")
+	}
+	svc := taskcli.NewService(taskcli.Config{
+		TasksDir: filepath.Join(cfg.root, "docs", "tasks"),
+		StateDir: cfg.dir,
+		Root:     cfg.root,
+	})
+	if err := svc.PlanLaunch(cardID); err != nil {
+		return "", cardID, err
+	}
+	cli := &CLI{out: io.Discard, errOut: io.Discard, run: realRunner, root: cfg.root}
+	if _, err := cli.bindRepoWorktree(cardID, defaultCIRepo, ""); err != nil {
+		return "", cardID, err
+	}
+	spawner := spawnSessionSpawner
+	if spawner == nil {
+		return "", cardID, errors.New("auto-spawn: session spawner is nil")
+	}
+	parent := orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)()
+	sessionID, err := spawner.CreateSession(parent, "executor", cardID, map[string]string{spawnMetaTaskID: cardID})
+	if err != nil {
+		return "", cardID, err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return "", cardID, errors.New("auto-spawn: create session returned empty id")
+	}
+	if err := spawner.PromptWithOptions(ctx, sessionID, spawnPrompt(cardID, ""),
+		opencode.StartPromptOptions(cardID)); err != nil {
+		return sessionID, cardID, err
+	}
+	if cfg.db != nil {
+		if _, err := cfg.db.LinkCardWatch(cardID, sig.WatchID, sig.PR); err != nil {
+			observe.ActorError("auto-spawn-card-link", cardID, err)
+		}
+	}
+	return sessionID, cardID, nil
+}
+
 // ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
 // with domain.EvaluatePR, merges and wakes through the wired ports, the wake
 // ladder advances its due timers and escalation rungs, then the in-process
@@ -2045,11 +2309,12 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		recordCycle(started, 0)
 		return 0
 	}
-	bridge := cibridge.New(cfg.db, cfg.batch, cfg.deps.Clock, 0)
-	bridge.WithWaker(&wake.AdapterDedupDeliverer{
+	signals := &autoSpawnSignalWatcher{Inner: &wake.AdapterDedupDeliverer{
 		Inner: reconcileWaker(cfg.db),
 		Dedup: wake.SharedDeliveryDedup(),
-	}).
+	}}
+	bridge := cibridge.New(cfg.db, cfg.batch, cfg.deps.Clock, 0)
+	bridge.WithWaker(signals).
 		WithReader(cfg.deps.Stamper).
 		WithLadder(bridgeLadder{l: ladder.New(cfg.db)}).
 		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
@@ -2060,6 +2325,11 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root}).
 		WithWorktreeGC(bridgeWorktreeGC(cfg.db, cfg.root))
 	updated := bridge.Refresh(ctx)
+	if cfg.auto != nil && ctx.Err() == nil {
+		for _, sig := range signals.drain() {
+			cfg.auto.run(ctx, sig)
+		}
+	}
 	reconcileMaintenance(ctx, cfg)
 	if metrics := observe.MetricsOf(observe.Default()); metrics != nil {
 		if err := cfg.db.SaveRuntimeStats(withPollerStats(metrics.SnapshotJSON()), time.Now()); err != nil {
