@@ -88,6 +88,42 @@ func DialectFromRequest(req *mcpsdk.CallToolRequest) TaskDialect {
 	return DialectPlain
 }
 
+// InterruptReceiptFromRequest reports whether the caller advertised the
+// interrupt_receipt_v1 capability before asking to cancel a Watch. It reads the
+// same two paths as DialectFromRequest: extension metadata on the request and
+// experimental capabilities from the initialize handshake. A caller that
+// declares capabilities without the flag is treated as unsupported so the
+// cancel is refused instead of being silently dropped. A caller that declares
+// nothing keeps the legacy behaviour and still receives a receipt.
+func InterruptReceiptFromRequest(req *mcpsdk.CallToolRequest) bool {
+	if req == nil {
+		return true
+	}
+	declared := false
+	if req.Params != nil && req.Params.Meta != nil {
+		if raw, ok := req.Params.Meta[clientCapabilitiesMetaKey]; ok {
+			declared = true
+			var caps struct {
+				Extensions map[string]json.RawMessage `json:"extensions"`
+			}
+			if b, err := json.Marshal(raw); err == nil && json.Unmarshal(b, &caps) == nil {
+				if _, ok := caps.Extensions[interruptReceiptCapability]; ok {
+					return true
+				}
+			}
+		}
+	}
+	if req.Session != nil {
+		if params := req.Session.InitializeParams(); params != nil && params.Capabilities != nil {
+			declared = true
+			if _, ok := params.Capabilities.Experimental[interruptReceiptCapability]; ok {
+				return true
+			}
+		}
+	}
+	return !declared
+}
+
 // CycleInstructions is delivered to clients in the MCP handshake. The agent
 // cycle lives here, not in a separate tool (WORKER-PROMPT §4.1).
 const CycleInstructions = `Beacon cycle protocol:
