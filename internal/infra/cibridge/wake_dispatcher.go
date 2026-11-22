@@ -366,6 +366,9 @@ func (b *wakeDispatcher) wakeOne(ctx context.Context, w domain.Watch, sub domain
 		observe.ActorError("wake", w.ID, deliverErr)
 		log.Printf("cibridge: wake %s: %v", target, deliverErr)
 		if dead {
+			// The addressee is gone. Flag the delivery event and mark the
+			// subscriber orphaned; OrphanWake counts it once in markOrphaned.
+			observe.WakeDeliveredOrphan(sub.Adapter, w.ID, w.Revision)
 			b.markOrphaned(ctx, w, sub, now, cycleID)
 		}
 		return
@@ -687,6 +690,7 @@ func (b *wakeDispatcher) markOrphaned(ctx context.Context, w domain.Watch, sub d
 		observe.ActorError("cibridge-orphan", current.ID, err)
 		return
 	}
+	observe.OrphanWake(current.ID)
 	sessionID := b.blockedOrchestrator(current)
 	if sessionID == "" {
 		return

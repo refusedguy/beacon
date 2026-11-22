@@ -61,15 +61,17 @@ func splitSourceLabelKey(key string) (adapter, source string, ok bool) {
 // They live outside the generic counterLabels registry on purpose: that
 // registry is a closed set whose export is covered by a fixed-name test. These
 // plain totals are exported by JSON and Prometheus through extendedCounterNames
-// below.
+// below. CounterOrphanWake has no labels, so a dead session id never becomes a
+// metric label.
 const (
 	CounterFixersSpawned    = "fixers_spawned_total"
 	CounterBlocksEscalated  = "blocks_escalated_total"
 	CounterFileAdapterReads = "file_adapter_reads_total"
+	CounterOrphanWake       = "orphan_wake_total"
 )
 
 var extendedCounterNames = []string{
-	CounterFixersSpawned, CounterBlocksEscalated, CounterFileAdapterReads,
+	CounterFixersSpawned, CounterBlocksEscalated, CounterFileAdapterReads, CounterOrphanWake,
 }
 
 // CounterWakeOutcome breaks wakes down by adapter and outcome. It stays outside
