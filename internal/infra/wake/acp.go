@@ -427,11 +427,12 @@ var acpRuntimes = map[string]ACPRuntimeCommand{
 	"claude":   {Command: "claude", Args: []string{"--acp"}},
 	"codex":    {Command: "codex", Args: []string{"acp"}},
 	"pi":       {Command: "pi", Args: []string{"--acp"}},
+	"gemini":   {Command: "gemini", Args: []string{"--acp"}},
 }
 
 // ACPRuntimeConfig selects a runner and optionally overrides its command line.
 type ACPRuntimeConfig struct {
-	Runtime string   // logical runner name: opencode, claude, codex, pi
+	Runtime string   // logical runner name: opencode, claude, codex, pi, gemini
 	Command string   // explicit executable; overrides Runtime when set
 	Args    []string // explicit args; overrides the runner defaults when set
 	Dir     string

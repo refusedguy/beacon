@@ -449,3 +449,23 @@ func TestACPServerElicitHandlesDeclineAndErrors(t *testing.T) {
 		t.Errorf("transport calls = %d, want 0", len(noTransport.requests))
 	}
 }
+
+func TestACPGeminiRunnerRegistered(t *testing.T) {
+	command, args, err := ResolveACPRuntimeCommand(ACPRuntimeConfig{Runtime: "gemini"})
+	if err != nil {
+		t.Fatalf("ResolveACPRuntimeCommand(gemini): %v", err)
+	}
+	if command != "gemini" || strings.Join(args, " ") != "--acp" {
+		t.Fatalf("gemini command = (%q, %v), want (gemini, [--acp])", command, args)
+	}
+
+	got := strings.Join(SupportedACPRuntimes(), ",")
+	want := "claude,codex,gemini,opencode,pi"
+	if got != want {
+		t.Fatalf("SupportedACPRuntimes = %s, want %s", got, want)
+	}
+
+	if _, _, err := ResolveACPRuntimeCommand(ACPRuntimeConfig{Runtime: "unknown"}); err == nil {
+		t.Fatal("unknown runner was accepted")
+	}
+}
