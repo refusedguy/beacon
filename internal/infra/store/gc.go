@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,21 +18,41 @@ const ObligationGCRetention = 24 * time.Hour
 
 const gcObligationActor = "beacon-gc"
 
+// gcBetweenPlanAndApply runs once after the collector builds its plan and
+// before the apply phase. Production keeps the empty default; the concurrency
+// test installs a hook that changes the store through a second handle.
+var gcBetweenPlanAndApply = func() {}
+
 // ObligationGCItem is one obligation the collector selected. Reason names the
-// state of the Watch: "closed", "archived" or "missing".
+// state of the Watch: "closed", "archived" or "missing". Skipped is set on
+// apply when the candidate changed after the plan and was left in place.
 type ObligationGCItem struct {
 	ID      string `json:"id"`
 	WatchID string `json:"watchID"`
 	Reason  string `json:"reason"`
+	Skipped bool   `json:"skipped,omitempty"`
 }
 
-// gcWatchState is what the collector knows about a Watch behind an obligation.
-// known distinguishes a Watch still in the active table from one that is gone;
-// a non-live Watch with no close time is known but not yet collectible.
+// gcWatchState is what the collector knew about a Watch when it built the
+// plan. known distinguishes a Watch still in the active table from one that
+// is gone; a non-live Watch with no close time is known but not collectible.
 type gcWatchState struct {
 	known    bool
+	status   domain.Status
 	closedAt time.Time
 	archived bool
+}
+
+// gcCandidate holds a plan row together with the snapshot facts that the apply
+// phase rechecks inside the delete transaction. The snapshot keeps a second
+// process from making a fresh Watch or obligation look collectible.
+type gcCandidate struct {
+	item               ObligationGCItem
+	watchKnown         bool
+	watchArchived      bool
+	watchStatus        domain.Status
+	watchClosedAt      time.Time
+	obligationRevision uint64
 }
 
 // GCObligations selects obligations whose Watch is no longer live and whose
@@ -45,9 +66,12 @@ type gcWatchState struct {
 // obligation's own last activity is the reference. A non-live Watch with no
 // close time is kept, because its state is not proven closed.
 //
-// Every erase goes through EraseObligation, which writes the audit ledger before
-// the delete. A repeated pass therefore finds no erased rows and removes
-// nothing.
+// Apply rechecks each candidate inside the erase transaction. The Watch
+// status, its close time and the obligation revision must still match the
+// snapshot. A changed or newly created row is skipped and reported with
+// Skipped set, so a second process cannot lose an obligation it created after
+// the plan. Every erase still writes the ledger before the delete, which
+// keeps a repeated pass from removing anything.
 func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Duration, apply bool) ([]ObligationGCItem, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -77,14 +101,14 @@ func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Du
 		if liveIDs[w.ID] {
 			continue
 		}
-		states[w.ID] = gcWatchState{known: true, closedAt: utcOrZero(w.ClosedAt)}
+		states[w.ID] = gcWatchState{known: true, status: w.Status, closedAt: utcOrZero(w.ClosedAt)}
 	}
 	archived, err := d.ArchivedWatches()
 	if err != nil {
 		return nil, fmt.Errorf("store: gc-obligations: archive: %w", err)
 	}
 	for _, w := range archived {
-		states[w.ID] = gcWatchState{known: true, closedAt: utcOrZero(w.ClosedAt), archived: true}
+		states[w.ID] = gcWatchState{known: true, status: w.Status, closedAt: utcOrZero(w.ClosedAt), archived: true}
 	}
 
 	rows, err := d.readDB.QueryContext(ctx, `SELECT id, watch_id, payload FROM obligations ORDER BY seq`)
@@ -93,7 +117,7 @@ func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Du
 	}
 	defer rows.Close()
 
-	plan := make([]ObligationGCItem, 0)
+	plan := make([]gcCandidate, 0)
 	for rows.Next() {
 		var id, watchID string
 		var payload []byte
@@ -133,7 +157,14 @@ func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Du
 		if now.Sub(ref) < retention {
 			continue
 		}
-		plan = append(plan, ObligationGCItem{ID: id, WatchID: watchID, Reason: reason})
+		plan = append(plan, gcCandidate{
+			item:               ObligationGCItem{ID: id, WatchID: watchID, Reason: reason},
+			watchKnown:         st.known,
+			watchArchived:      st.archived,
+			watchStatus:        st.status,
+			watchClosedAt:      st.closedAt,
+			obligationRevision: o.Revision,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("store: gc-obligations: rows: %w", err)
@@ -142,15 +173,105 @@ func (d *DB) GCObligations(ctx context.Context, now time.Time, retention time.Du
 		return nil, fmt.Errorf("store: gc-obligations: close rows: %w", err)
 	}
 	if !apply {
-		return plan, nil
+		items := make([]ObligationGCItem, len(plan))
+		for i := range plan {
+			items[i] = plan[i].item
+		}
+		return items, nil
 	}
 
-	for _, item := range plan {
-		if _, err := d.EraseObligation(ctx, item.ID, gcObligationActor, "gc:"+item.Reason, now); err != nil {
-			return nil, fmt.Errorf("store: gc-obligations: erase %s: %w", item.ID, err)
+	gcBetweenPlanAndApply()
+	items := make([]ObligationGCItem, 0, len(plan))
+	for _, cand := range plan {
+		erased, err := gcEraseIfUnchanged(ctx, d, cand, now)
+		if err != nil {
+			return nil, fmt.Errorf("store: gc-obligations: erase %s: %w", cand.item.ID, err)
 		}
+		item := cand.item
+		item.Skipped = !erased
+		items = append(items, item)
 	}
-	return plan, nil
+	return items, nil
+}
+
+// gcEraseIfUnchanged rechecks one candidate and erases it in the same writer
+// transaction. A Watch or obligation that changed after the plan leaves the
+// row in place and returns false. The ledger write and delete mirror
+// EraseObligation so an erase always keeps its audit record.
+func gcEraseIfUnchanged(ctx context.Context, d *DB, cand gcCandidate, at time.Time) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	erased := false
+	err := d.Write(ctx, func(tx *sql.Tx) error {
+		var payload []byte
+		err := tx.QueryRowContext(ctx, `SELECT payload FROM obligations WHERE id = ?`, cand.item.ID).Scan(&payload)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read obligation: %w", err)
+		}
+		var o domain.Obligation
+		if err := json.Unmarshal(payload, &o); err != nil {
+			return fmt.Errorf("decode obligation: %w", err)
+		}
+		if o.Revision != cand.obligationRevision {
+			return nil
+		}
+
+		var watchPayload []byte
+		found := false
+		archived := false
+		err = tx.QueryRowContext(ctx, `SELECT payload FROM watches WHERE id = ?`, cand.item.WatchID).Scan(&watchPayload)
+		if err == nil {
+			found = true
+		} else if errors.Is(err, sql.ErrNoRows) {
+			err = tx.QueryRowContext(ctx, `SELECT payload FROM watch_archive WHERE id = ?`, cand.item.WatchID).Scan(&watchPayload)
+			if err == nil {
+				found = true
+				archived = true
+			}
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read watch: %w", err)
+		}
+		if found != cand.watchKnown || archived != cand.watchArchived {
+			return nil
+		}
+		if found {
+			var w domain.Watch
+			if err := json.Unmarshal(watchPayload, &w); err != nil {
+				return fmt.Errorf("decode watch: %w", err)
+			}
+			if w.Status != cand.watchStatus || !utcOrZero(w.ClosedAt).Equal(cand.watchClosedAt) {
+				return nil
+			}
+		}
+
+		if _, err := tx.Exec(createObligationEraseLedgerSQL); err != nil {
+			return fmt.Errorf("create ledger: %w", err)
+		}
+		var ledgerID string
+		err = tx.QueryRowContext(ctx, `SELECT id FROM obligation_erase_ledger WHERE id = ?`, cand.item.ID).Scan(&ledgerID)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("read ledger: %w", err)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO obligation_erase_ledger (id, actor, reason, erased_at, payload)
+			VALUES (?, ?, ?, ?, ?)`, cand.item.ID, gcObligationActor, "gc:"+cand.item.Reason, timeToNano(at), payload); err != nil {
+			return fmt.Errorf("record ledger: %w", err)
+		}
+		if _, err := tx.Exec(`DELETE FROM obligations WHERE id = ?`, cand.item.ID); err != nil {
+			return fmt.Errorf("delete obligation: %w", err)
+		}
+		erased = true
+		return nil
+	})
+	return erased, err
 }
 
 // obligationLastActivity returns the newest timestamp written on an obligation.
