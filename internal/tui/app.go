@@ -97,28 +97,60 @@ func (a *App) Decide(ctx context.Context, d Decision) error {
 	return a.Refresh(ctx)
 }
 
+// humanVerb pairs one server decide verb with its one-key shortcut. This list
+// mirrors validCommands in internal/infra/httpapi/server.go. The TUI layer
+// cannot import the server, so one list drives validation, hotkeys and help.
+// Spawn and kill are absent because the server does not accept them.
+type humanVerb struct {
+	verb string
+	key  string
+}
+
+var humanVerbs = []humanVerb{
+	{verb: "approve", key: "a"},
+	{verb: "reject", key: "d"},
+	{verb: "context", key: "c"},
+	{verb: "rework", key: "w"},
+	{verb: "pause", key: "p"},
+	{verb: "resume", key: "u"},
+	{verb: "unblock", key: "b"},
+	{verb: "cancel", key: "x"},
+	{verb: "force_retry_merge", key: "f"},
+}
+
+// validHumanVerb reports whether the server accepts v. Checking before POST
+// keeps unknown verbs and unsupported verbs such as spawn out of the request.
+func validHumanVerb(v string) bool {
+	for _, h := range humanVerbs {
+		if v == h.verb {
+			return true
+		}
+	}
+	return false
+}
+
 // Command parses one line of dashboard input. "ack" is the familiar name for
-// the server's "approve" verb; the other names map to the verbs themselves.
+// the server's "approve" verb. Every verb is checked against humanVerbs before
+// a request, so a refused verb never reaches the server.
 func (a *App) Command(ctx context.Context, line string) error {
 	fields := strings.Fields(strings.TrimSpace(line))
 	if len(fields) == 0 {
 		return nil
 	}
-	switch fields[0] {
-	case "r", "refresh":
+	verb := fields[0]
+	if verb == "r" || verb == "refresh" {
 		return a.Refresh(ctx)
-	case "ack", "approve", "reject", "rework", "pause", "resume", "unblock", "cancel":
-		if len(fields) < 2 {
-			return errors.New("tui: command needs a watch id")
-		}
-		verb := fields[0]
-		if verb == "ack" {
-			verb = "approve"
-		}
-		return a.Decide(ctx, Decision{Command: verb, WatchID: fields[1]})
-	default:
+	}
+	if verb == "ack" {
+		verb = "approve"
+	}
+	if !validHumanVerb(verb) {
 		return fmt.Errorf("tui: unknown command %q", fields[0])
 	}
+	if len(fields) < 2 {
+		return errors.New("tui: command needs a watch id")
+	}
+	return a.Decide(ctx, Decision{Command: verb, WatchID: fields[1]})
 }
 
 // Run refreshes once, draws the dashboard, then redraws on every SSE event.
