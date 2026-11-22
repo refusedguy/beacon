@@ -168,16 +168,6 @@ func filterFailedChecks(in []FailedCheck, name string) []FailedCheck {
 	return out
 }
 
-// failedCheckNames returns the eligible names in stable order so the spend
-// adapter writes the same counter set on every call.
-func failedCheckNames(in []FailedCheck) []string {
-	out := make([]string, 0, len(in))
-	for _, fc := range in {
-		out = append(out, fc.Name)
-	}
-	return out
-}
-
 // rerunIdempotencyKey reuses the domain obligation key with a rerun namespace.
 // The triple (watchID, revision, runID) is injective, so two runs on the same
 // Watch revision never share a spend slot.
