@@ -470,7 +470,7 @@ func (b *Bridge) deferWake(dw deferredWake) {
 			observe.ActorError("cibridge-defer-wake", dw.watchID, err)
 		}
 	}
-	observe.WakeOutcomeCorrelated(dw.adapter, "deferred", dw.watchID, observe.Fields{
+	observe.WakeDeferred(dw.adapter, dw.watchID, dw.stagedAt, observe.Fields{
 		observe.FieldCycleID: dw.cycleID,
 	}, dw.revision)
 	observe.WakeSkipped(dw.adapter, dw.watchID,
