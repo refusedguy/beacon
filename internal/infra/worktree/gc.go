@@ -131,7 +131,9 @@ func Remove(run Runner, dir string) error {
 	return nil
 }
 
-// Reasons recorded for a worktree that collection kept.
+// Reasons recorded for a worktree that collection kept. Deferred and changed
+// come from the grace window: a fresh candidate waits, and a change between
+// the two status checks cancels it.
 const (
 	ReasonLocked       = "locked"
 	ReasonActiveWatch  = "active_watch"
@@ -139,6 +141,8 @@ const (
 	ReasonDirty        = "dirty"
 	ReasonProtectedDir = "protected_dir"
 	ReasonRemoveError  = "remove_error"
+	ReasonDeferred     = "deferred"
+	ReasonChanged      = "changed"
 )
 
 // Kept is one worktree that collection did not remove.
@@ -178,6 +182,26 @@ func WatchIDForHead(heads map[string]string, head string) string {
 
 func cleanDir(dir string) string {
 	return filepath.Clean(strings.TrimSpace(dir))
+}
+
+// DecideGuard translates all five Guard outcomes into a report decision.
+// Reason is empty only for a successful removal. A caller writes Removed into
+// its own count and maps the reason into its report.
+func DecideGuard(g Guard, c Candidate) (reason string, removed bool) {
+	switch g.Check(c) {
+	case GraceDeferred:
+		return ReasonDeferred, false
+	case GraceChanged:
+		return ReasonChanged, false
+	case GraceStatusErr:
+		return ReasonStatusError, false
+	case GraceRemoveErr:
+		return ReasonRemoveError, false
+	case GraceRemoved:
+		return "", true
+	default:
+		return ReasonStatusError, false
+	}
 }
 
 // Collect removes clean, unlocked worktrees that have no live Watch at their

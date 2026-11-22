@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeGit answers the three git calls that gc.go makes. It records removals so
@@ -379,4 +380,80 @@ func TestCollect(t *testing.T) {
 		assertRemoved(t, res)
 		assertKept(t, res, map[string]string{})
 	})
+}
+
+func TestDecideGuard(t *testing.T) {
+	base := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	candidate := Candidate{Dir: "/candidate", ObservedAt: base, Status: ""}
+
+	tests := []struct {
+		name        string
+		now         time.Time
+		nextStatus  string
+		statusErr   error
+		removeErr   error
+		wantReason  string
+		wantRemoved bool
+		wantRemoves int
+	}{
+		{
+			name:       "fresh candidate defers without removing",
+			now:        base.Add(10 * time.Second),
+			nextStatus: "",
+			wantReason: ReasonDeferred,
+		},
+		{
+			name:       "change between checks cancels removal",
+			now:        base.Add(DefaultGrace),
+			nextStatus: " M file.go\n",
+			wantReason: ReasonChanged,
+		},
+		{
+			name:       "status error keeps the candidate",
+			now:        base.Add(DefaultGrace),
+			statusErr:  errors.New("status failed"),
+			wantReason: ReasonStatusError,
+		},
+		{
+			name:        "remove error keeps the candidate",
+			now:         base.Add(DefaultGrace),
+			nextStatus:  "",
+			removeErr:   errors.New("remove failed"),
+			wantReason:  ReasonRemoveError,
+			wantRemoves: 1,
+		},
+		{
+			name:        "unchanged after the window removes once",
+			now:         base.Add(DefaultGrace),
+			nextStatus:  "",
+			wantRemoved: true,
+			wantRemoves: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			removes := 0
+			g := Guard{
+				Grace: DefaultGrace,
+				Now:   func() time.Time { return tt.now },
+				Status: func(string) (string, error) {
+					return tt.nextStatus, tt.statusErr
+				},
+				Remove: func(string) error {
+					removes++
+					return tt.removeErr
+				},
+			}
+
+			reason, removed := DecideGuard(g, candidate)
+
+			if reason != tt.wantReason || removed != tt.wantRemoved {
+				t.Fatalf("DecideGuard() = (%q, %v), want (%q, %v)", reason, removed, tt.wantReason, tt.wantRemoved)
+			}
+			if removes != tt.wantRemoves {
+				t.Fatalf("Remove calls = %d, want %d", removes, tt.wantRemoves)
+			}
+		})
+	}
 }

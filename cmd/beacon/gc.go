@@ -620,6 +620,12 @@ type gcWorktreeResult struct {
 	Branch string `json:"branch,omitempty"`
 	Status string `json:"status"`
 	Reason string `json:"reason"`
+
+	// observedAt and firstStatus are the first clean sighting. They travel
+	// from collection to apply so the Guard can compare against the same
+	// snapshot instead of a fresh one. They are not part of the JSON report.
+	observedAt  time.Time
+	firstStatus string
 }
 
 // gcWorktreeReport is the JSON form of both a dry run and an apply. Items holds
@@ -735,10 +741,17 @@ func gcWorktreeCollect(c *CLI) ([]gcWorktreeResult, error) {
 		watchID := watchIDForHead(heads, e.Head)
 		var status string
 		var statusErr error
+		var observedAt time.Time
 		if !e.Locked && watchID == "" {
 			status, statusErr = gcWorktreeStatus(e.Dir)
+			if statusErr == nil && strings.TrimSpace(status) == "" {
+				observedAt = time.Now()
+			}
 		}
-		plan = append(plan, gcWorktreeDecision(e, watchID, status, statusErr))
+		item := gcWorktreeDecision(e, watchID, status, statusErr)
+		item.observedAt = observedAt
+		item.firstStatus = status
+		plan = append(plan, item)
 	}
 	return plan, nil
 }
@@ -803,16 +816,44 @@ func runGCWorktree(c *CLI, args []string) int {
 			if item.Status != "remove" {
 				continue
 			}
-			if err := gcWorktreeRemove(item.Dir); err != nil {
+			// The second check reads the same injected seam as collection. A
+			// changed or unreadable status cancels the candidate before any
+			// removal, and both reasons go into the report.
+			current, statusErr := gcWorktreeStatus(item.Dir)
+			if statusErr != nil {
 				report.Items[i].Status = "kept"
-				report.Items[i].Reason = gcReasonRemoveError + ":" + err.Error()
+				report.Items[i].Reason = worktree.ReasonStatusError + ":" + statusErr.Error()
 				report.Kept++
-				failed = true
-				fmt.Fprintf(c.errOut, "beacon gc-worktree: удаление %s: %v\n", item.Dir, err)
 				continue
 			}
-			report.Items[i].Status = "removed"
-			report.Removed++
+			if current != item.firstStatus {
+				report.Items[i].Status = "kept"
+				report.Items[i].Reason = worktree.ReasonChanged
+				report.Kept++
+				continue
+			}
+			candidate := worktree.Candidate{
+				Dir:        item.Dir,
+				ObservedAt: item.observedAt,
+				Status:     item.firstStatus,
+			}
+			guard := worktree.NewGuard(
+				func(string) (string, error) { return current, nil },
+				gcWorktreeRemove,
+			)
+			reason, removed := worktree.DecideGuard(guard, candidate)
+			if removed {
+				report.Items[i].Status = "removed"
+				report.Removed++
+				continue
+			}
+			report.Items[i].Status = "kept"
+			report.Items[i].Reason = reason
+			report.Kept++
+			if reason == worktree.ReasonRemoveError {
+				failed = true
+				fmt.Fprintf(c.errOut, "beacon gc-worktree: удаление %s: вторая проверка отклонила каталог\n", item.Dir)
+			}
 		}
 		report.ApplyMS = time.Since(applyStart).Milliseconds()
 	}
