@@ -2925,3 +2925,122 @@ func TestRecheckDoesNotChangeHookBehavior(t *testing.T) {
 		t.Fatalf("recheck изменил журнал хуков: %+v err=%v", entries, err)
 	}
 }
+
+// ---- ADR 0041 п6 / HD-022: журнал precheck и связь коммита ----
+
+func TestRecordPrecheckFailureRejectsEmptyReason(t *testing.T) {
+	e := newEnv(t)
+	for _, reason := range []string{"", "   ", "\t\n"} {
+		if err := e.svc.RecordPrecheckFailure(reason, time.Time{}); taskstore.Code(err) != 1 {
+			t.Errorf("причина %q: код %d, err=%v", reason, taskstore.Code(err), err)
+		}
+	}
+	log, err := e.svc.PrecheckLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) != 0 {
+		t.Fatalf("отклонённая причина попала в журнал: %+v", log)
+	}
+}
+
+func TestRecordPrecheckFailureWritesUTCEntry(t *testing.T) {
+	e := newEnv(t)
+	local := time.FixedZone("test", 3*60*60)
+	at := time.Date(2026, 11, 20, 15, 0, 0, 0, local)
+	want := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := e.svc.RecordPrecheckFailure("  проверка не прошла  ", at); err != nil {
+		t.Fatal(err)
+	}
+	log, err := e.svc.PrecheckLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) != 1 {
+		t.Fatalf("в журнале %d записей, ждали 1", len(log))
+	}
+	got := log[0]
+	if got.Outcome != "precheck_failure" || got.Reason != "проверка не прошла" {
+		t.Errorf("запись: %+v", got)
+	}
+	if !got.Time.Equal(want) || got.Time.Location() != time.UTC {
+		t.Errorf("время %v (%v), ждали %v UTC", got.Time, got.Time.Location(), want)
+	}
+}
+
+func TestPrecheckLogReturnsEntriesInOrderAndCopiesSlice(t *testing.T) {
+	e := newEnv(t)
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	reasons := []string{"первая причина", "вторая причина", "третья причина"}
+	for _, reason := range reasons {
+		if err := e.svc.RecordPrecheckFailure(reason, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log, err := e.svc.PrecheckLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log) != len(reasons) {
+		t.Fatalf("в журнале %d записей, ждали %d", len(log), len(reasons))
+	}
+	for i, reason := range reasons {
+		if log[i].Reason != reason {
+			t.Errorf("запись %d: причина %q, ждали %q", i, log[i].Reason, reason)
+		}
+	}
+
+	log[0].Reason = "подмена"
+	log[0].Outcome = "подмена"
+	log = append(log, PrecheckLogEntry{Reason: "лишняя"})
+
+	again, err := e.svc.PrecheckLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != len(reasons) || again[0].Reason != reasons[0] || again[0].Outcome != "precheck_failure" {
+		t.Fatalf("изменение копии затронуло хранилище: %+v", again)
+	}
+}
+
+func TestCheckCommitLinkageDelegatesForFeatAndFix(t *testing.T) {
+	e := newEnv(t)
+	ports := LinkagePorts{
+		ValidADR:  func(ref string) bool { return ref == "ADR 0041" },
+		ValidCard: func(ref string) bool { return ref == "TG-06" },
+	}
+	withRefs := "Ссылка на ADR 0041 и карточка TG-06."
+	cases := []struct {
+		name    string
+		message string
+		ports   LinkagePorts
+		want    LinkageVerdict
+	}{
+		{"chore", "chore: обновить README", ports, LinkageEmpty},
+		{"без типа коммита", "обновление документации", ports, LinkageEmpty},
+		{"feat с валидными ссылками", "feat(taskcli): журнал precheck\n\n" + withRefs, ports, taskstore.LinkageLinked},
+		{"fix с валидными ссылками", "fix(taskcli): вернуть копию журнала\n\n" + withRefs, ports, taskstore.LinkageLinked},
+		{
+			"feat с недействительной ссылкой",
+			"feat(taskcli): журнал precheck\n\n" + withRefs,
+			LinkagePorts{
+				ValidADR:  func(ref string) bool { return false },
+				ValidCard: func(ref string) bool { return true },
+			},
+			taskstore.LinkageMissing,
+		},
+		{
+			"feat с обоснованием",
+			"feat(taskcli): без карточки\n\nОбоснование: внешний инструмент",
+			ports,
+			taskstore.LinkageExempted,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := e.svc.CheckCommitLinkage(tc.message, tc.ports); got != tc.want {
+				t.Errorf("вердикт %q, ждали %q", got, tc.want)
+			}
+		})
+	}
+}
