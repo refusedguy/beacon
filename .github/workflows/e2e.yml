@@ -14,7 +14,9 @@ on:
     paths:
       - 'tests/e2e/**'
       - 'tests/scenarios/**'
+      - 'internal/domain/**'
       - 'internal/infra/mcp/**'
+      - 'internal/infra/store/**'
       - '.opencode/plugins/**'
       - 'cmd/beacon/**'
       - 'go.mod'
@@ -34,7 +36,7 @@ jobs:
     name: e2e
     runs-on: ubuntu-latest
     # Замер: медиана 90 с, максимум 104 с. Пять минут запирают зависший
-    # прогон, не обрезая ни один из семи живых сценариев.
+    # прогон, не обрезая ни один из восьми живых сценариев.
     timeout-minutes: 5
     continue-on-error: true
     steps:
