@@ -157,6 +157,29 @@ eval-специфичную точку входа `evals/cmd/evalserver`: она
 | `PC01_pass5_negative_control` | Проверяет гейт `passGate` на двух наборах прогонов | пять из пяти проходят, один провал из пяти блокирует |
 | `R01_accepted_skip` | Фиксирует принятый пропуск: `headSHA` задан заглушкой, поэтому сетевой `CIProvider` не опрашивается | `WARN` без блока; строка видна в таблице и в сводке, код выхода не меняет |
 | `AS01_autospawn_no_manual_ping` | Собирает снимок с терминальным вердиктом, свободным слотом и todo-карточкой и считает spawn по реальным `SignalReportToOrchestrator` и `SlotLedger` | один spawn на вердикт, одна связь `cardID→watchID`, ноль сообщений владельцу; повтор сигнала и занятый слот spawn не дают |
+| `SL08_parallel_slot_measurement` | Заполняет 12, 14 и 17 слотов через `taskcli.AdmitLaunch`, `domain.Orchestrator` и `orchestrator.RunWorkload` | сессии, карточки и `slotsUsed` равны числу слотов; отказов гейта нет; дубли OwnerFiles отклонены; видно расхождение с Watch |
+
+`SL08_parallel_slot_measurement` заполняет 12, 14 и 17 слотов в изолированном
+state dir раннера. Каждый агент получает свою карточку и свой OwnerFiles.
+Допуск идёт через production `taskcli.AdmitLaunch`, слоты считает
+`domain.Orchestrator`, а `slotsUsed` читается через production
+`orchestrator.RunWorkload`. В колонке `ACTUAL` видны четыре числа: сессии,
+карточки, `slotsUsed` и Watch в снимке. Watch ограничены константой
+`sl08WatchQuota = 4`, поэтому расхождение с числом сессий остаётся видимым.
+Это то же расхождение, которое зафиксировано в
+`docs/research/research-parallel-slots.md`: команда workload считала Watch, а
+не запущенных агентов.
+
+Проверка на каждой границе: три числа равны числу слотов, отказов гейта ноль,
+все OwnerFiles различны. Негативный контроль добавляет назначение с чужим
+OwnerFiles. `CheckLaunch` и `AdmitLaunch` обязаны отклонить его при свободном
+слоте. Если гейт перестанет видеть пересечение, eval красный. Время заполнения
+печатается в той же строке `ACTUAL`.
+
+Ограничение: eval не запускает настоящие OpenCode-сессии и не открывает живой
+store. Сессии и карточки живут в памяти раннера. Production-кодом здесь есть
+гейт допуска, доменный оркестратор и `RunWorkload`. Время заполнения измеряет
+работу этой модели, а не старт агентов. Живую точку входа проверяет `tests/e2e`.
 
 `AS01_autospawn_no_manual_ping` измеряет число spawn на один терминальный
 вердикт (ADR 0306, AUTOSP-10). Снимок зафиксирован: Watch в терминальном
@@ -569,13 +592,14 @@ workflow или вместо Beacon-пути принять Harbor-имя, ке�
 ### Список инструментов
 
 `contractTools` в `evals/main.go` задаёт список инструментов в одном месте.
-`contractToolCount` удалён: счётчик берётся как `len(contractTools)`. Восемь имён
-по контракту включают `beacon_defer_wiring`. `contractToolsHash` сортирует имена,
+`contractToolCount` удалён: счётчик берётся как `len(contractTools)`. Одиннадцать
+имён по контракту включают `beacon_defer_wiring`, `beacon_task_claim`,
+`beacon_task_close` и `beacon_task_list`. `contractToolsHash` сортирует имена,
 соединяет их переводом строки и считает SHA-256. Замороженное значение лежит в
 `frozenContractToolsHash` по образцу `frozenScenarioHash`:
 
 ```
-b0a23b5455360b807e3fd34e9260d170e4e259988262f6ac5ff6fb4aaa877c67
+f54cb3e7d5c174fa646e6f404c3b8052549d0bf9bcf0ae1d8d05ef78351516e4
 ```
 
 `CT01_contract_tools_frozen` сравнивает вычисленный хеш с замороженным. Правка
