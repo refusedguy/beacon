@@ -61,6 +61,26 @@ executor-task:design-shapes -->
 | repo, pr, headSHA, baseRef | факт сдачи PR | параметры Watch |
 | watchID | ответ `beacon_watch_pr` | ключ ожидания и отчёта |
 | verdict | `beacon_get_result` | решение о пробуждении |
+| tokenBreakdown | `session.TokenBreakdown(ContextSnapshot)` | разбивка контекста по категориям с ценой и остатком |
+| tokenWarning | `session.TokenUsage().Warning` | предупреждение при остатке ниже 1024 токенов |
+
+## Учёт токенов контекста
+
+Исполнитель видит, сколько токенов занимает каждая часть его промпта. `ContextSnapshot` хранит счётчики по пяти категориям из `/tokens` в aider (`aider/commands.py:445-532`): `system`, `history`, `repo-map`, `editable`, `read-only`. Категорию задаёт `WithTokenCount`, окно `max_input_tokens` задаёт `WithMaxInputTokens`, цену `input_cost_per_token` задаёт `WithInputCostPerToken`. Все три метода возвращают копию снимка и не меняют полученный.
+
+Метод `TokenUsage` возвращает счётчики, сумму `Total`, остаток `Remaining` и предупреждение `Warning`. Сумма равна сложению всех категорий. Остаток равен `max_input_tokens - total`, ограничен нулю снизу. Предупреждение появляется, когда остаток меньше 1024 токенов, и советует `/drop` или `/clear` (`aider/commands.py:538-551`). Когда окно неизвестно (`max_input_tokens <= 0`), остаток и предупреждение не печатаются.
+
+Диагностическая команда печатает текст из `TokenBreakdown`: по строке на категорию с числом токенов и ценой, затем сумму, окно, остаток и предупреждение. Счётчики копируются при создании и чтении, как и остальные поля снимка. Объявленные MCP-поля формат не меняет.
+
+<!-- executor-task:token-accounting
+categories: system, history, repo-map, editable, read-only
+api: WithTokenCount, WithMaxInputTokens, WithInputCostPerToken
+usage: TokenUsage, TokenBreakdown
+total: sum-of-categories
+remaining: max_input_tokens-minus-total, clamped-at-zero
+warn: below-1024, /drop-or-clear
+mcp-fields: unchanged
+executor-task:token-accounting -->
 
 ## Разделение каналов
 
@@ -378,5 +398,7 @@ executor-task:ttl -->
 Блок `executor-task:claim` фиксирует, что задача приходит через `beacon_task_claim`, цикл отвергается, при `PERSIST_FAILED` оркестратор получает `blocked:not_mine`, а карточку в `done` переводит Beacon при мерже.
 
 Блок `executor-task:repro-hypotheses` фиксирует четыре шага после красной команды, тег `[DEBUG-...]` с обязательным удалением и замер baseline для perf-регрессий. Проверка карточки CM-02 ищет в шаблоне `load-bearing`, четыре шага и тег отладочных логов. Контракт гипотезы в `internal/domain/depth.go` шаблон не дублирует.
+
+Блок `executor-task:token-accounting` фиксирует пять категорий токенов, методы учёта и порог предупреждения 1024. Карточка CA-07 проверяет, что сумма по категориям совпадает с эталоном, остаток вычислен по `max_input_tokens` и предупреждение срабатывает на пороге.
 
 CI подхватывает тест шагом `Test JS adapters` в `.github/workflows/ci.yml`: `find tests/adapter -maxdepth 1 -name '*.test.js' | xargs node --test`. Тест использует только встроенные модули Node.
