@@ -81,6 +81,130 @@ export async function registerShellGuard(ctx) {
   }
 }
 
+// CS-01. XS-01 из docs/research/comp-claude-sdk.md. SDK несёт типизированный
+// вход PreToolUse/PostToolUse и решение permissionDecision, а fail-closed
+// проверку способности ставит до регистрации (_internal/query.py:396-409).
+// Здесь тот же контракт поверх хуков OpenCode. guard из BCX-82 остаётся
+// отдельным execute.before и не меняет своё поведение.
+export const TOOL_LIFECYCLE_EVENTS = Object.freeze({
+  pre: "PreToolUse",
+  post: "PostToolUse",
+})
+
+export const PERMISSION_DECISIONS = Object.freeze(["allow", "deny", "ask", "defer"])
+export const ON_FAILURE_MODES = Object.freeze(["continue", "block"])
+
+const REQUIRED_TOOL_EVENTS = Object.freeze([
+  TOOL_LIFECYCLE_EVENTS.pre,
+  TOOL_LIFECYCLE_EVENTS.post,
+])
+
+export function toolLifecycleInput(event, phase) {
+  const raw = event ?? {}
+  const typed = {
+    event: phase,
+    tool_name: raw.tool ?? raw.toolName ?? raw.name ?? "",
+    tool_input: raw.input ?? raw.toolInput ?? {},
+    tool_use_id: raw.toolUseId ?? raw.tool_use_id ?? raw.id ?? "",
+    agent_id: raw.agentId ?? raw.agent_id ?? "",
+    agent_type: raw.agentType ?? raw.agent_type ?? "",
+  }
+  if (phase === TOOL_LIFECYCLE_EVENTS.post) {
+    typed.tool_response = raw.toolResponse ?? raw.tool_response ?? raw.response ?? null
+    typed.duration_ms = Number(raw.durationMs ?? raw.duration_ms ?? 0) || 0
+  }
+  return typed
+}
+
+export function normalizePermissionDecision(decision = {}) {
+  const permissionDecision = decision.permissionDecision ?? decision.decision ?? "allow"
+  if (!PERMISSION_DECISIONS.includes(permissionDecision)) {
+    throw new Error(`CS-01: unknown permissionDecision ${permissionDecision}`)
+  }
+  const normalized = { permissionDecision }
+  if (decision.reason) normalized.reason = decision.reason
+  if (Object.hasOwn(decision, "updatedInput")) normalized.updatedInput = decision.updatedInput
+  if (decision.additionalContext) normalized.additionalContext = decision.additionalContext
+  return normalized
+}
+
+export function decidePreToolUse(event) {
+  const typed = toolLifecycleInput(event, TOOL_LIFECYCLE_EVENTS.pre)
+  const hit = findShellGuardHit(typed.tool_name, typed.tool_input)
+  if (!hit) return { permissionDecision: "allow" }
+  const message = `CS-01: ${hit.id} is denied here. Use ${hit.replacement}.`
+  // Тот же режим наблюдения, что и в BCX-82: warn блокировку не применяет.
+  if (process.env.BEACON_SHELL_GUARD === "warn") {
+    return { permissionDecision: "allow", additionalContext: message }
+  }
+  return { permissionDecision: "deny", reason: message, additionalContext: message }
+}
+
+export function decidePostToolUse(event) {
+  // Ответ инструмента уже получен, решение deny здесь бесполезно. Типизированный
+  // вход остаётся доступным разработчику плагина через toolLifecycleInput.
+  toolLifecycleInput(event, TOOL_LIFECYCLE_EVENTS.post)
+  return { permissionDecision: "allow" }
+}
+
+export function toolHookCapability(ctx) {
+  const hook = ctx?.tool?.hook
+  if (typeof hook !== "function") return { supported: false, events: [] }
+  const advertised = ctx.tool.supportedEvents ?? ctx.tool.hookEvents ?? ctx.tool.events
+  if (!Array.isArray(advertised)) {
+    return { supported: true, events: [...REQUIRED_TOOL_EVENTS] }
+  }
+  const missing = REQUIRED_TOOL_EVENTS.filter((name) => !advertised.includes(name))
+  return { supported: missing.length === 0, events: advertised }
+}
+
+export function assertFailClosedCapability(ctx, onFailure) {
+  if (onFailure !== "block") return
+  const capability = toolHookCapability(ctx)
+  if (!capability.supported) {
+    throw new Error(
+      "CS-01: host cannot enforce onFailure=block for PreToolUse/PostToolUse",
+    )
+  }
+}
+
+export async function registerToolLifecycle(ctx, options = {}) {
+  const onFailure = options.onFailure ?? process.env.BEACON_TOOL_HOOK_ON_FAILURE ?? "continue"
+  if (!ON_FAILURE_MODES.includes(onFailure)) {
+    throw new Error(`CS-01: unknown onFailure mode ${onFailure}`)
+  }
+  // Проверка способности идёт до регистрации: при block старый хост не
+  // превращает guard в наблюдателя, а получает ошибку запуска.
+  assertFailClosedCapability(ctx, onFailure)
+  const capability = toolHookCapability(ctx)
+  if (!capability.supported) return null
+
+  let pre = null
+  let post = null
+  try {
+    pre = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.pre, (event) =>
+      normalizePermissionDecision(decidePreToolUse(event)),
+    )
+    post = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.post, (event) =>
+      normalizePermissionDecision(decidePostToolUse(event)),
+    )
+  } catch (error) {
+    await post?.dispose?.()
+    await pre?.dispose?.()
+    if (onFailure === "block") throw error
+    return null
+  }
+
+  return {
+    onFailure,
+    capability,
+    async dispose() {
+      await post?.dispose?.()
+      await pre?.dispose?.()
+    },
+  }
+}
+
 export const beaconProject = Plugin.define({
   id: "beacon-project",
   async setup(ctx) {
@@ -92,8 +216,10 @@ export const beaconProject = Plugin.define({
     const mcp = await registerBeaconMcp(ctx, root)
     const context = await installProjectContext(ctx, root, locationInfo(ctx))
     const guard = await registerShellGuard(ctx)
+    const lifecycle = await registerToolLifecycle(ctx)
 
     return async () => {
+      await lifecycle?.dispose?.()
       await guard?.dispose?.()
       await context?.()
       await mcp?.registration?.dispose?.()
