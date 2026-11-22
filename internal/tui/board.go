@@ -333,6 +333,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.editing {
 			return m.updateInput(msg)
 		}
+		if verb, ok := verbForKey(msg.String()); ok {
+			return m.runVerb(verb)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			m.quitting = true
@@ -357,6 +360,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.editing = true
 			m.input = ""
 			return m, nil
+		case "r":
+			return m.runLine("r", "refresh")
 		case "s":
 			m.statusIdx++
 			if m.statusIdx >= len(m.statuses) {
@@ -380,6 +385,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// verbForKey finds the decide verb bound to a single key. The keys come from
+// humanVerbs, so the screen and the parser share one verb list.
+func verbForKey(key string) (string, bool) {
+	for _, h := range humanVerbs {
+		if h.key == key {
+			return h.verb, true
+		}
+	}
+	return "", false
+}
+
+// runVerb sends one decide verb to the selected watch. The WatchID comes from
+// the visible cursor, so one keystroke replaces a typed command line.
+func (m Model) runVerb(verb string) (tea.Model, tea.Cmd) {
+	w, ok := m.SelectedWatch()
+	if !ok {
+		return m, func() tea.Msg {
+			return CommandMsg{Line: verb, Err: fmt.Errorf("tui: no watch selected")}
+		}
+	}
+	line := verb + " " + w.ID
+	return m.runLine(line, line)
+}
+
+// runLine passes a prepared line to the bound CommandFunc. The result returns
+// as a CommandMsg, which puts the receipt or the refusal in the status line.
+func (m Model) runLine(line, label string) (tea.Model, tea.Cmd) {
+	if m.command == nil {
+		return m, func() tea.Msg {
+			return CommandMsg{Line: label, Err: fmt.Errorf("tui: command handler not set")}
+		}
+	}
+	run := m.command
+	return m, func() tea.Msg {
+		return CommandMsg{Line: label, Err: run(line)}
+	}
+}
+
 // updateInput collects one command line and passes it to the bound CommandFunc
 // on Enter. The refusal comes back as a CommandMsg and stays in the header.
 func (m Model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -391,15 +434,7 @@ func (m Model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if line == "" {
 			return m, nil
 		}
-		if m.command == nil {
-			return m, func() tea.Msg {
-				return CommandMsg{Line: line, Err: fmt.Errorf("tui: command handler not set")}
-			}
-		}
-		run := m.command
-		return m, func() tea.Msg {
-			return CommandMsg{Line: line, Err: run(line)}
-		}
+		return m.runLine(line, line)
 	case "backspace", "ctrl+h":
 		runes := []rune(m.input)
 		if len(runes) > 0 {
@@ -520,6 +555,20 @@ func (m Model) liveHeader() string {
 	return headStyle.Render(header)
 }
 
+// helpVerbs renders the one-key shortcuts in short rows from humanVerbs. The
+// help cannot promise a verb that the parser rejects.
+func helpVerbs() []string {
+	rows := []string{"", ""}
+	for i, h := range humanVerbs {
+		row := i / 5
+		if rows[row] != "" {
+			rows[row] += "  "
+		}
+		rows[row] += h.key + " " + h.verb
+	}
+	return rows
+}
+
 func (m Model) livePanels() string {
 	var b strings.Builder
 	b.WriteString(boxStyle.Render("ВОТЧИ\n" + m.watchLines()))
@@ -532,7 +581,11 @@ func (m Model) livePanels() string {
 	b.WriteString("\n")
 	b.WriteString(boxStyle.Render("ПАМЯТЬ\n" + m.memoryLines()))
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("j/k карточки   ←/→ вотчи   : команда (approve w1)   q выход"))
+	b.WriteString(helpStyle.Render("j/k карточки   ←/→ вотчи   r обновить   : команда   q выход"))
+	for _, row := range helpVerbs() {
+		b.WriteString("\n")
+		b.WriteString(helpStyle.Render(row))
+	}
 	if m.editing {
 		b.WriteString("\n")
 		b.WriteString(selStyle.Render("> " + m.input + "_"))
