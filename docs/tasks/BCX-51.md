@@ -1,5 +1,5 @@
 # BCX-51. Подключить офлайн-гейт tool-contract к CLI и CI
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: tools/beacon-gates/main.go, tools/beacon-gates/gate/tool_contract.go, .github/workflows/ci.yml
@@ -12,3 +12,8 @@
 Шаги: Зарегистрировать подкоманду tool-contract в main.go. Добавить вызов в CI как обязательную или информационную проверку по решению владельца. Заменить синтетическую фикстуру реальным снимком инструментов. Проверить текущий main на наличие подкоманды.
 Проверка: CI зелёный. beacon-gates tool-contract запускается и проверяет реальный снимок. В workflow есть вызов проверки.
 Приёмка: Проверка качества описаний tools/list имеет точку входа и работает в CI.
+
+Итог: Already landed in PR #1315 (commit 93497d6a115fbbda3f191a45c1f2a0dad010c0c5). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1315 merged 2026-11-22T09:07:49+05:00; commit 93497d6a115fbbda3f191a45c1f2a0dad010c0c5; git merge-base --is-ancestor 93497d6a115fbbda3f191a45c1f2a0dad010c0c5 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1315 93497d6a
+Время закрытия: 2026-11-22T11:24:28Z

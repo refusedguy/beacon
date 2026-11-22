@@ -1,5 +1,5 @@
 # BCX-63. Разрешить или запретить свой TUI и снять дубли proposed ADR
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: docs/adrs/0060-cli-adapter-boundary-and-live-loop.md, internal/tui/app.go, tools/beacon-gates/gate/config/layers.json, cmd/beacon/main.go
@@ -12,3 +12,8 @@
 Шаги: Проверить premise на текущем main. При разрешении снять запрет в ADR 0060, закрыть дубли proposed ADR, подключить WIRING-493 и WIRING-915 и разрешить ребро в layers.json. При запрете удалить internal/tui и закрыть обе wiring-карточки как dropped.
 Проверка: CI зелёный. Код и ADR согласованы. Дубли proposed ADR закрыты или объединены. Ребро в layers.json соответствует выбору.
 Приёмка: Решение по TUI зафиксировано и не оставляет мёртвый код или запрещённое ребро.
+
+Итог: Already landed in PR #1328 (commit 3607970ecc343f8e6740a11070340f4bafec79ed). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1328 merged 2026-11-21T22:52:51+05:00; commit 3607970ecc343f8e6740a11070340f4bafec79ed; git merge-base --is-ancestor 3607970ecc343f8e6740a11070340f4bafec79ed origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1328 3607970e
+Время закрытия: 2026-11-22T11:24:28Z

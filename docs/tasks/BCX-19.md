@@ -1,5 +1,5 @@
 # BCX-19. Привести написание machine-кодов в тестах и документации к продовым
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/wake/notify_test.go, cmd/beacon/up_test.go, docs/gates/G2-canary.md, internal/domain/verdict_test.go
@@ -12,3 +12,8 @@
 Шаги: Заменить варианты написания в тестах и документации. Добавить линтер или тест, который находит старые формы в docs и *_test.go. Сохранить WARNING только там, где это префикс более длинной строки.
 Проверка: CI зелёный. Поиск старых форм не даёт совпадений вне разрешённых исключений. Тесты.use machine-коды.
 Приёмка: Один код имеет одно написание в коде, тестах и документации.
+
+Итог: Already landed in PR #1397 (commit 145c5bd7af3063cd5498a14177b73ae920781b50). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1397 merged 2026-11-22T09:41:31+05:00; commit 145c5bd7af3063cd5498a14177b73ae920781b50; git merge-base --is-ancestor 145c5bd7af3063cd5498a14177b73ae920781b50 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1397 145c5bd7
+Время закрытия: 2026-11-22T11:24:28Z

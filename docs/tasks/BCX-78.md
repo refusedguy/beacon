@@ -1,5 +1,5 @@
 # BCX-78. Сообщать о неверном значении Пятнадцати переменных вместо тихого default
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: cmd/beacon/attach.go, cmd/beacon/mcp.go, internal/infra/observe/otel.go
@@ -12,3 +12,8 @@
 Шаги: Разделить переменные на две группы: таймауты с осознанным fallback и данные, где fallback недопустим. Для всех добавить предупреждение в лог с именем переменной и значением. Для BEACON_TASK_DEADLINE сделать ошибку или явный отказ записи.
 Проверка: CI зелёный. Тест проверяет предупреждение для каждой переменной. BEACON_TASK_DEADLINE с битым значением не пишет задачу без дедлайна.
 Приёмка: Ошибка конфига видна в логах. Данные не сохраняются с тихо потерянным дедлайном.
+
+Итог: Already landed in PR #1338 (commit 3540ff43a975b0b619056260818ceb6b59dc3d29). Fix is in origin/main; no duplicate code needed.
+Доказательство: PR #1338 merged 2026-11-22T09:05:03+05:00; commit 3540ff43a975b0b619056260818ceb6b59dc3d29; git merge-base --is-ancestor 3540ff43a975b0b619056260818ceb6b59dc3d29 origin/main exit 0; no open duplicate PR.
+Причина: already landed in PR #1338 3540ff43
+Время закрытия: 2026-11-22T11:24:28Z
