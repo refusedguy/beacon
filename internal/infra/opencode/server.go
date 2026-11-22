@@ -171,6 +171,30 @@ func healthReady(ctx context.Context, baseURL, password string) bool {
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
+// reuseProbe checks a recorded server before EnsureServer reuses it. A refused
+// connection is ambiguous: the process is alive but its listener may still be
+// starting, so dropping the record would spawn a duplicate server. Keep such a
+// record and reuse it. An HTTP error or a stalled listener proves the recorded
+// endpoint is unusable, so the caller drops the record and spawns a fresh
+// server (MM-03).
+func reuseProbe(ctx context.Context, baseURL, password string) (ready, keep bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+healthPath, nil)
+	if err != nil {
+		return false, false
+	}
+	req.SetBasicAuth(authUser, password)
+	resp, err := healthDoer.Do(req)
+	if err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return false, true
+		}
+		return false, false
+	}
+	defer resp.Body.Close()
+	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
+	return ok, ok
+}
+
 // waitHealthy polls until the server answers, the process exits, ctx ends,
 // or the 30 second budget runs out.
 func waitHealthy(ctx context.Context, baseURL, password string, done <-chan struct{}) error {
@@ -373,13 +397,13 @@ func EnsureServer(ctx context.Context) (Config, error) {
 
 	if st, ok := ReadServeState(); ok && ProcessAlive(st.PID) {
 		probeCtx, cancel := context.WithTimeout(ctx, reuseProbeTimeout)
-		ready := healthReady(probeCtx, st.URL, st.Password)
+		ready, keep := reuseProbe(probeCtx, st.URL, st.Password)
 		cancel()
-		if ready {
+		if ready || keep {
 			return Config{URL: st.URL, Password: st.Password}, nil
 		}
-		// The pid is alive but the HTTP API is not answering. Drop the stale
-		// record and fall through to Discover and spawn (MM-03).
+		// The pid is alive but the HTTP API answered with an error or stalled.
+		// Drop the stale record and fall through to Discover and spawn (MM-03).
 		_ = ClearServeState()
 	}
 	if cfg, err := Discover(); err == nil {
