@@ -182,16 +182,70 @@ func (m *SandboxMode) UnmarshalJSON(data []byte) error {
 // SandboxPolicy is the configured restriction for one run. Mode selects the
 // behaviour. WritableRoots narrows workspace-write; an empty list means the
 // whole workspace. NetworkAccess overrides the mode default only when set.
+// ReadOnlySubpaths and ProtectedNames stay denied even inside a writable root.
 type SandboxPolicy struct {
-	Mode          SandboxMode `json:"mode"`
-	WritableRoots []string    `json:"writableRoots,omitempty"`
-	NetworkAccess *bool       `json:"networkAccess,omitempty"`
+	Mode             SandboxMode `json:"mode"`
+	WritableRoots    []string    `json:"writableRoots,omitempty"`
+	NetworkAccess    *bool       `json:"networkAccess,omitempty"`
+	ReadOnlySubpaths []string    `json:"readOnlySubpaths,omitempty"`
+	ProtectedNames   []string    `json:"protectedNames,omitempty"`
 }
 
 // DefaultSandboxPolicy keeps the historical behaviour of runs that declare no
 // sandbox. A missing config must not change any existing verdict.
 func DefaultSandboxPolicy() SandboxPolicy {
 	return SandboxPolicy{Mode: SandboxDangerFullAccess}
+}
+
+// DefaultProtectedNames are service directory names denied in every mode.
+// Codex calls these protected_metadata_names and uses them to stop a write
+// from replacing its own control files (protocol.rs:1343-1359).
+func DefaultProtectedNames() []string {
+	return []string{".codex", ".git"}
+}
+
+// DefaultReadOnlySubpaths are repo-relative prefixes denied in every mode,
+// even when a writable root contains them. Codex calls these
+// read_only_subpaths (protocol.rs:1343-1359).
+func DefaultReadOnlySubpaths() []string {
+	return []string{".git/hooks"}
+}
+
+func (p SandboxPolicy) protectedNames() []string {
+	if len(p.ProtectedNames) > 0 {
+		return p.ProtectedNames
+	}
+	return DefaultProtectedNames()
+}
+
+func (p SandboxPolicy) readOnlySubpaths() []string {
+	if len(p.ReadOnlySubpaths) > 0 {
+		return p.ReadOnlySubpaths
+	}
+	return DefaultReadOnlySubpaths()
+}
+
+// protectedPathReason returns the deciding rule when clean must stay
+// read-only. A protected name matches any path component, so a nested path
+// such as .git/hooks/x cannot reach a hook through a writable root.
+func (p SandboxPolicy) protectedPathReason(clean string) string {
+	for _, name := range p.protectedNames() {
+		for _, component := range strings.Split(clean, "/") {
+			if component == name {
+				return "protected path component: " + name
+			}
+		}
+	}
+	for _, sub := range p.readOnlySubpaths() {
+		cleanSub, err := cleanWorkspacePath(sub)
+		if err != nil || cleanSub == "." {
+			continue
+		}
+		if clean == cleanSub || strings.HasPrefix(clean, cleanSub+"/") {
+			return "read-only subpath: " + cleanSub
+		}
+	}
+	return ""
 }
 
 // Validate checks the mode and every writable root. A root must be a clean
@@ -209,6 +263,21 @@ func (p SandboxPolicy) Validate() error {
 			return fmt.Errorf("orchestrator: sandbox writable root %q: use an empty list for the whole workspace", root)
 		}
 	}
+	for _, name := range p.ProtectedNames {
+		clean, err := cleanWorkspacePath(name)
+		if err != nil || clean != name || strings.Contains(clean, "/") {
+			return fmt.Errorf("orchestrator: sandbox protected name %q: must be a single path component", name)
+		}
+	}
+	for _, sub := range p.ReadOnlySubpaths {
+		clean, err := cleanWorkspacePath(sub)
+		if err != nil {
+			return fmt.Errorf("orchestrator: sandbox read-only subpath %q: %w", sub, err)
+		}
+		if clean == "." {
+			return fmt.Errorf("orchestrator: sandbox read-only subpath %q: use an empty list for none", sub)
+		}
+	}
 	return nil
 }
 
@@ -223,13 +292,18 @@ type SandboxCheck struct {
 }
 
 // CheckWrite decides whether path may be written under this policy. An
-// absolute path and any path escaping the workspace are denied in every mode,
-// including danger-full-access, because Beacon records repo-relative paths.
+// absolute path, any path escaping the workspace and any protected path are
+// denied in every mode, including danger-full-access, because Beacon records
+// repo-relative paths and must not let a write replace its own control files.
 func (p SandboxPolicy) CheckWrite(path string) SandboxCheck {
 	check := SandboxCheck{Operation: "write", Path: path, Mode: p.Mode}
 	clean, pathErr := cleanWorkspacePath(path)
 	if pathErr != nil {
 		check.Reason = "invalid path: " + pathErr.Error()
+		return check
+	}
+	if reason := p.protectedPathReason(clean); reason != "" {
+		check.Reason = reason
 		return check
 	}
 	switch p.Mode {
