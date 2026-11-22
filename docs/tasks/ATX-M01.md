@@ -1,5 +1,5 @@
 # ATX-M01. Покрыть beacon_task_close тестами обработчика
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/infra/mcp/tool_task_close_test.go
@@ -12,3 +12,8 @@
 Шаги: Создать `tool_task_close_test.go`. Проверить обязательные поля и четыре допустимых статуса. Проверить отказ от закрытия чужой карточки `in_progress`. Проверить повтор с теми же значениями и конфликт при изменённом `reason`. Проверить битый ledger, перенос CRLF и требование `duplicateOf`. Использовать временные каталоги и фиксированные часы через `newTaskCloseHandler`. Локально запускать только `gofmt -w`, прогон тестов оставить CI.
 Проверка: В PR зелёная джоба `test`. Новые тесты падают при удалении любой проверки из `Close` и `Close`.
 Приёмка: Файл тестов существует. Каждый случай из «Шагов» имеет отдельный тест с проверкой результата и содержимого карточки.
+
+Итог: Already landed in PR #1638 (commit 42c96f97456e70ecf04f237d30ef3cc4b106e91d): test(mcp): cover beacon_task_close handler and store (ATX-M01)
+Доказательство: PR #1638; commit 42c96f97456e70ecf04f237d30ef3cc4b106e91d; git merge-base --is-ancestor 42c96f97456e70ecf04f237d30ef3cc4b106e91d origin/main exit 0; internal/infra/mcp/tool_task_close_test.go now exists and covers handler input, ownership, repeat calls and the disk write.
+Причина: already landed in PR #1638 42c96f97456e
+Время закрытия: 2026-11-22T11:53:03Z

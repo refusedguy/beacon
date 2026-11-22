@@ -1,5 +1,5 @@
 # ATX-R07. Перевести хелперы ожидания TUI на контекст теста
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/tui/socket_test.go, internal/tui/client_test.go
@@ -12,3 +12,8 @@
 Шаги: Создать общий хелпер ожидания, который принимает `t.Context()` и явный таймаут. Перевести на него `nextEvent` и `nextRequest`. В каждом тесте задавать дедлайн через `context.WithTimeout` и отменять его через `t.Cleanup`. Убрать `time.After(2 * time.Second)` из обоих файлов.
 Проверка: CI зелёный. В `socket_test.go` и `client_test.go` нет `time.After(2 * time.Second)`. Все тесты TUI завершаются по общему контексту.
 Приёмка: Время ожидания задаётся тестом. Один общий хелпер исключает расхождение между сокетными и HTTP-тестами.
+
+Итог: Already landed in PR #1639 (commit e3179ca123cd04405825772ef55f83fbdd2a91df): test(tui): wait helpers bounded by t.Context (ATX-R07)
+Доказательство: PR #1639; commit e3179ca123cd04405825772ef55f83fbdd2a91df; git merge-base --is-ancestor e3179ca123cd04405825772ef55f83fbdd2a91df origin/main exit 0; socket_test.go and client_test.go have no time.After(2 * time.Second) left; the wait helpers take a context deadline from the test.
+Причина: already landed in PR #1639 e3179ca123cd
+Время закрытия: 2026-11-22T11:53:03Z
