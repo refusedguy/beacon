@@ -161,14 +161,14 @@ func rememberAttachSession(taskID, sessionID string, now time.Time) error {
 	return saveAttachSessions(st)
 }
 
-// savedAttachSession returns the session id saved for taskID. With an empty
-// taskID it uses the last task recorded by rememberAttachSession. A deadline
-// in the past does not hide the id: the task ended, but the session remains
-// the one to resume (ADR 0043 §6).
-func savedAttachSession(taskID string) (string, error) {
+// savedAttachRecord returns the session record saved for taskID. With an empty
+// taskID it uses the last task recorded by rememberAttachSession. The whole
+// record is needed to judge a registry candidate: the task and the time the id
+// was saved are compared with the row found in the registry (CCx-13).
+func savedAttachRecord(taskID string) (attachSession, error) {
 	st, err := loadAttachSessions()
 	if err != nil {
-		return "", err
+		return attachSession{}, err
 	}
 	key := strings.TrimSpace(taskID)
 	if key == "" {
@@ -176,30 +176,38 @@ func savedAttachSession(taskID string) (string, error) {
 	}
 	for _, rec := range st.Sessions {
 		if rec.TaskID == key && rec.SessionID != "" {
-			return rec.SessionID, nil
+			return rec, nil
 		}
 	}
-	return "", nil
+	return attachSession{}, nil
 }
 
-// savedAttachIdentity returns the identity recorded with the saved session for
-// taskID. An empty value marks a record saved before Identity existed, so
-// resume keeps its best-effort behaviour (ADR 0043 §6).
-func savedAttachIdentity(taskID string) string {
-	st, err := loadAttachSessions()
-	if err != nil {
-		return ""
+// savedAttachSession returns the session id saved for taskID. A deadline in
+// the past does not hide the id: the task ended, but the session remains the
+// one to resume (ADR 0043 §6).
+func savedAttachSession(taskID string) (string, error) {
+	rec, err := savedAttachRecord(taskID)
+	return rec.SessionID, err
+}
+
+// attachCandidateFits reports whether a registry row belongs to the session
+// the caller asked to resume. A row without an id cannot open anything. When
+// the row names a task, that task must match the task in attach-sessions.json.
+// When the row has a last-event time, it must not predate the moment the id
+// was saved; an older row describes a different session. Rows written before
+// those fields existed lack them and stay usable, so attach keeps working
+// with older state (CCx-13).
+func attachCandidateFits(candidate session.Session, requested attachSession) bool {
+	if strings.TrimSpace(candidate.ID) == "" {
+		return false
 	}
-	key := strings.TrimSpace(taskID)
-	if key == "" {
-		key = st.Last
+	if task := strings.TrimSpace(candidate.Metadata[spawnMetaTaskID]); task != "" && task != requested.TaskID {
+		return false
 	}
-	for _, rec := range st.Sessions {
-		if rec.TaskID == key {
-			return strings.TrimSpace(rec.Identity)
-		}
+	if !candidate.LastSeen.IsZero() && !requested.SavedAt.IsZero() && candidate.LastSeen.Before(requested.SavedAt) {
+		return false
 	}
-	return ""
+	return true
 }
 
 // attachRecordForSession finds the saved record whose session id is sessionID.
@@ -245,12 +253,14 @@ func restoredAttachSeed(rec attachSession) session.Session {
 // attach-sessions.json, which ADR 0043 §6 makes the source of truth for resume.
 // A clean miss means the state row was lost while the journal still has the
 // id, so attach rebuilds the row from that record and resumes it (CCx-12).
-// A stored id replaces the saved one so both registries converge on one session.
-//
-// When identity is recorded with the saved session, attach checks it against
-// the saved id and the registry row. A mismatch returns an error, so the caller
-// refuses to open a session built from a substituted id (CCx-10).
-func registryResumeSession(sessionID, identity string) (string, error) {
+// A stored id replaces the saved one only when the row fits the requested
+// session. When identity is recorded with the saved session, attach checks it
+// against the saved id and the registry row first. An identity mismatch
+// returns an error, so the caller refuses to open a session built from a
+// substituted id (CCx-10, CCx-13).
+func registryResumeSession(requested attachSession) (string, error) {
+	sessionID := requested.SessionID
+	identity := strings.TrimSpace(requested.Identity)
 	if identity != "" && identity != sessionID {
 		return "", fmt.Errorf("%w: сохранённый identity %q не совпадает с id %q", session.ErrSessionIdentityMismatch, identity, sessionID)
 	}
@@ -284,6 +294,9 @@ func registryResumeSession(sessionID, identity string) (string, error) {
 			return sessionID, nil
 		}
 		stored = rebuilt
+	}
+	if !attachCandidateFits(stored, requested) {
+		return sessionID, nil
 	}
 	if id := strings.TrimSpace(stored.ID); id != "" {
 		return id, nil
@@ -363,12 +376,12 @@ func (c *CLI) runAttach(args []string) int {
 	}
 
 	if resume {
-		saved, err := savedAttachSession(taskID)
+		saved, err := savedAttachRecord(taskID)
 		if err != nil {
 			fmt.Fprintf(c.errOut, "beacon attach: не удалось прочитать сохранённую сессию (%v); запустите: beacon attach <sessionID>\n", err)
 			return 2
 		}
-		if saved == "" {
+		if saved.SessionID == "" {
 			if taskID == "" {
 				fmt.Fprintln(c.errOut, "beacon attach: сохранённой сессии нет; запустите: beacon attach <sessionID>")
 			} else {
@@ -376,8 +389,7 @@ func (c *CLI) runAttach(args []string) int {
 			}
 			return 2
 		}
-		sessionID = saved
-		sessionID, err = registryResumeSession(sessionID, savedAttachIdentity(taskID))
+		sessionID, err = registryResumeSession(saved)
 		if err != nil {
 			fmt.Fprintf(c.errOut, "beacon attach: расхождение identity сессии: %v\n", err)
 			return 2
