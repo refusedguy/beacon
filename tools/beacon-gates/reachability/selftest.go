@@ -73,10 +73,41 @@ func selfTestRun() int {
 		},
 	}
 
-	if !gate.RunFixtures(list, analyse, gate.RemoveFixture) {
-		fmt.Println("self-test FAILED: 5 fixtures")
+	// Run applies reachability exceptions after analyse. Mirror that order so
+	// the self-test covers suppression and liveness, not just the raw analyse.
+	analyseNoExceptions := func(root string) ([]gate.Finding, error) {
+		fs, err := analyse(root)
+		if err != nil {
+			return nil, err
+		}
+		return gate.Exceptions{}.Apply(fs, root), nil
+	}
+	// A permanent row for a file no fixture creates must surface as stale.
+	analyseWithStale := func(root string) ([]gate.Finding, error) {
+		fs, err := analyse(root)
+		if err != nil {
+			return nil, err
+		}
+		ex := gate.Exceptions{Permanent: []gate.PermanentEntry{
+			{Rule: ruleUnwired, Path: "internal/infra/demo/GhostAdapter"},
+		}}
+		return ex.Apply(fs, root), nil
+	}
+	staleList := []gate.FixtureCase{
+		{
+			Files: map[string]string{
+				"internal/infra/demo/adapter.go": plantedAdapter,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return gate.HasRule(fs, "CAP-PERMANENT-STALE")
+			},
+		},
+	}
+
+	if !gate.RunFixtures(list, analyseNoExceptions, gate.RemoveFixture) || !gate.RunFixtures(staleList, analyseWithStale, gate.RemoveFixture) {
+		fmt.Println("self-test FAILED: 6 fixtures")
 		return gate.Red
 	}
-	fmt.Println("self-test passed: 5 fixtures")
+	fmt.Println("self-test passed: 6 fixtures")
 	return gate.Green
 }

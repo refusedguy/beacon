@@ -51,11 +51,32 @@ func selfTestRun() int {
 	analyseNoExceptions := func(root string) ([]gate.Finding, error) {
 		return analyse(root, gate.Exceptions{})
 	}
+	// One permanent row matches the planted finding and suppresses it. A
+	// second row names a file the fixture never creates, so Apply reports it
+	// as stale instead of letting the exception table rot unnoticed.
+	analyseWithExceptions := func(root string) ([]gate.Finding, error) {
+		ex := gate.Exceptions{Permanent: []gate.PermanentEntry{
+			{Rule: "CAP-EXEC-IN-DOMAIN", Path: "internal/domain/plant.go"},
+			{Rule: "CAP-EXEC-IN-DOMAIN", Path: "internal/domain/ghost.go"},
+		}}
+		return analyse(root, ex)
+	}
+	exceptionList := []gate.FixtureCase{
+		{
+			Files: map[string]string{
+				"internal/domain/plant.go": plantedExec,
+			},
+			Want: func(fs []gate.Finding) bool {
+				return !gate.HasRule(fs, "CAP-EXEC-IN-DOMAIN") &&
+					gate.HasRule(fs, "CAP-PERMANENT-STALE")
+			},
+		},
+	}
 	cleanup := func(root string) { _ = os.RemoveAll(root) }
-	if !gate.RunFixtures(list, analyseNoExceptions, cleanup) {
-		fmt.Println("self-test FAILED: 3 fixtures")
+	if !gate.RunFixtures(list, analyseNoExceptions, cleanup) || !gate.RunFixtures(exceptionList, analyseWithExceptions, cleanup) {
+		fmt.Println("self-test FAILED: 4 fixtures")
 		return gate.Red
 	}
-	fmt.Println("self-test passed: 3 fixtures")
+	fmt.Println("self-test passed: 4 fixtures")
 	return gate.Green
 }

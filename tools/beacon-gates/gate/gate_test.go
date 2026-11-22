@@ -128,6 +128,18 @@ func TestExceptionsApply(t *testing.T) {
 	if got := bad.Apply(nil, "."); !HasRule(got, "CAP-BASELINE-EXCEEDED") || !HasRule(got, "CAP-BASELINE-STALE") {
 		t.Fatalf("baseline ratchet and liveness not enforced: %v", got)
 	}
+
+	// A permanent row covers its matching finding and is marked seen, so Apply
+	// does not also report that row as stale.
+	perm := Exceptions{Permanent: []PermanentEntry{{Rule: "R", Path: "p"}}}
+	if got := perm.Apply([]Finding{{Rule: "R", Path: "p"}}, "."); len(got) != 0 {
+		t.Fatalf("permanent row did not suppress its finding: %v", got)
+	}
+	// The same row with no matching finding must be reported as stale instead
+	// of silently rotting in the exception table.
+	if got := perm.Apply(nil, "."); !HasRule(got, "CAP-PERMANENT-STALE") {
+		t.Fatalf("stale permanent row not reported: %v", got)
+	}
 }
 
 // Property tests draw every value from a deterministic stream. A failure
