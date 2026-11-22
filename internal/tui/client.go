@@ -32,6 +32,15 @@ const (
 
 	// reconnectDelay is the pause before a dropped event stream is reopened.
 	reconnectDelay = time.Second
+
+	// eventReplayCount seeds a cold stream with the tail of the event buffer.
+	// The server caps replay at maxReplay and ignores it when Last-Event-ID is
+	// present, so reconnect still resumes from the last frame the client saw.
+	eventReplayCount = 64
+
+	// defaultPointLimit matches the fallback beacon watch --live prints when
+	// the server omits the budget.
+	defaultPointLimit = 500
 )
 
 var (
@@ -156,10 +165,13 @@ type BlockedInfo struct {
 	FixAttempts int    `json:"fixAttempts"`
 }
 
-// Subscriber is one agent bound to a Watch.
+// Subscriber is one agent bound to a Watch. Role and Target come from the
+// server projection; Phase stays optional for older snapshots.
 type Subscriber struct {
-	ID    string `json:"id"`
-	Phase string `json:"phase"`
+	ID     string `json:"id"`
+	Role   string `json:"role"`
+	Target string `json:"target"`
+	Phase  string `json:"phase"`
 }
 
 // Blocker is one open incident shown above the table.
@@ -170,11 +182,48 @@ type Blocker struct {
 	Session string `json:"session"`
 }
 
-// Points is the hourly budget reported by the CI provider.
+// Points is the hourly budget reported by the CI provider. The server sends
+// used and budget; other projections send used and limit. Both spellings end
+// up in the same fields so the dashboard never prints a zero denominator.
 type Points struct {
 	Used   int `json:"used"`
 	Limit  int `json:"limit"`
 	Budget int `json:"budget"`
+}
+
+// UnmarshalJSON reads either budget or limit as the hourly cap. It mirrors the
+// decoder beacon watch --live uses, including the fallback when neither value
+// is present.
+func (p *Points) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Used           int `json:"used"`
+		Points         int `json:"points"`
+		PointsUsed     int `json:"pointsUsed"`
+		PointsThisHour int `json:"pointsThisHour"`
+		Limit          int `json:"limit"`
+		Budget         int `json:"budget"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	p.Used = firstNonZero(raw.Used, raw.Points, raw.PointsUsed, raw.PointsThisHour)
+	p.Budget = firstNonZero(raw.Budget, raw.Limit)
+	p.Limit = firstNonZero(raw.Limit, raw.Budget)
+	if p.Limit <= 0 {
+		p.Limit = defaultPointLimit
+		p.Budget = defaultPointLimit
+	}
+	return nil
+}
+
+// firstNonZero returns the first positive value in order.
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 // Cycle is the most recent completed reconciler pass.
@@ -287,8 +336,8 @@ type EventResult struct {
 	Err   error
 }
 
-// Events subscribes to GET /api/v1/events. The last seen id is sent as
-// Last-Event-ID on a resubscribe, so the server replays only the missed frames.
+// Events subscribes to GET /api/v1/events. A cold start asks for a replay tail;
+// a resubscribe sends Last-Event-ID so the server returns only missed frames.
 // Cancel ctx to stop the goroutine and close the channel.
 func (c *Client) Events(ctx context.Context) <-chan EventResult {
 	out := make(chan EventResult)
@@ -315,7 +364,14 @@ func (c *Client) Events(ctx context.Context) <-chan EventResult {
 }
 
 func (c *Client) openEvents(ctx context.Context) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+eventsPath, nil)
+	u, err := url.Parse(c.baseURL + eventsPath)
+	if err != nil {
+		return nil, fmt.Errorf("tui: events endpoint: %w", err)
+	}
+	query := u.Query()
+	query.Set("replay", strconv.Itoa(eventReplayCount))
+	u.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("tui: %w", err)
 	}
