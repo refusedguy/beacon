@@ -4,7 +4,9 @@
 package registry
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -60,11 +62,16 @@ func Validate(config map[string]any) error {
 	if err := validateKeys(config, rootKeys, ""); err != nil {
 		return err
 	}
-	for _, name := range []string{"schema", "version", "project"} {
+	for _, name := range []string{"schema", "project"} {
 		if v, ok := config[name]; ok {
 			if _, ok := v.(string); !ok {
 				return invalid(name, "must be a string")
 			}
+		}
+	}
+	if v, ok := config["version"]; ok {
+		if err := validateVersion("version", v); err != nil {
+			return err
 		}
 	}
 	if raw, ok := config["roster"]; ok {
@@ -98,6 +105,12 @@ func Validate(config map[string]any) error {
 		if err != nil {
 			return err
 		}
+		ids := make(map[string]struct{}, len(entries))
+		for _, e := range entries {
+			if id, ok := entryID(e).(string); ok {
+				ids[id] = struct{}{}
+			}
+		}
 		for _, e := range entries {
 			if err := validateKeys(e.obj, configurationKeys, e.at); err != nil {
 				return err
@@ -108,6 +121,16 @@ func Validate(config map[string]any) error {
 			if members, ok := e.obj["members"]; ok {
 				if _, ok := toStringSlice(members); !ok {
 					return invalid(field(e.at, "members"), "must be a list of configuration ids")
+				}
+			}
+			if alias, ok := e.obj["alias"]; ok {
+				if err := validateConfigRef(field(e.at, "alias"), alias, ids); err != nil {
+					return err
+				}
+			}
+			if recommended, ok := e.obj["recommended"]; ok {
+				if err := validateConfigRef(field(e.at, "recommended"), recommended, ids); err != nil {
+					return err
 				}
 			}
 		}
@@ -186,6 +209,50 @@ func validateID(at string, v any) error {
 	s, ok := v.(string)
 	if !ok || strings.TrimSpace(s) == "" {
 		return invalid(at, "must be a non-empty string")
+	}
+	return nil
+}
+
+// validateVersion accepts the integer shapes a YAML or JSON decoder produces
+// and rejects strings, which migrate.go also refuses. Only the versions
+// published in migrate.go are known, so an unlisted number fails closed.
+func validateVersion(at string, v any) error {
+	var n int
+	switch x := v.(type) {
+	case int:
+		n = x
+	case int64:
+		n = int(x)
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return invalid(at, "must be an integer")
+		}
+		n = int(i)
+	case float64:
+		if x != math.Trunc(x) {
+			return invalid(at, "must be an integer without a fractional part")
+		}
+		n = int(x)
+	default:
+		return invalid(at, "must be an integer")
+	}
+	if n != SchemaV1 && n != SchemaV2 {
+		return invalid(at, "unknown schema version %d", n)
+	}
+	return nil
+}
+
+// validateConfigRef checks that a preset reference names exactly one existing
+// configuration id. A preset resolves to a single id, so a list is not a valid
+// reference even when every item is known.
+func validateConfigRef(at string, v any, ids map[string]struct{}) error {
+	name, ok := v.(string)
+	if !ok || strings.TrimSpace(name) == "" {
+		return invalid(at, "must name exactly one configuration id")
+	}
+	if _, ok := ids[name]; !ok {
+		return invalid(at, "must name an existing configuration id %q", name)
 	}
 	return nil
 }
