@@ -399,9 +399,10 @@ type PartialResult struct {
 	Cursor string `json:"cursor"`
 }
 
-// RepairableErrorShape is the ADR 0009 error envelope plus the three ADR 0046
-// recovery fields. Embedding ErrorShape keeps the six original fields intact;
-// nothing in ADR 0009 or schema.go is changed.
+// RepairableErrorShape is the ADR 0046 repair contract: the six-field ADR 0009
+// ErrorShape plus three recovery fields. It is not a second error format. Both
+// shapes come from the one conversion core in schema.go, so the six original
+// fields are built once and stay identical (BCX-69).
 type RepairableErrorShape struct {
 	ErrorShape
 	Retryable    bool          `json:"retryable"`
@@ -433,6 +434,16 @@ func (e *RecoveryError) Unwrap() error {
 	return e.AppError
 }
 
+// RecoveryFields exposes the ADR 0046 repair metadata to the one conversion
+// core in schema.go. The accessor keeps wake details in this file while the
+// generic envelope stays free of wake-specific types.
+func (e *RecoveryError) RecoveryFields() (bool, string, PartialResult) {
+	if e == nil {
+		return false, "", PartialResult{}
+	}
+	return e.Retryable, e.RecoveryHint, e.Partial
+}
+
 // Stable cursors name the input position a repairable wake error reached. The
 // model fixes that one field and continues from its offset.
 const (
@@ -450,22 +461,21 @@ func repairableError(base *domain.AppError, retryable bool, hint, cursor string)
 }
 
 // ToRepairableErrorShape converts an error into the repairable envelope. It
-// reuses ToErrorShape so the six ADR 0009 fields are unchanged, then adds the
-// three recovery fields when err carries a RecoveryError. The bool is false
-// when err carries no AppError, matching ToErrorShape.
+// reads the same conversion core as ToErrorShape, so the six ADR 0009 fields
+// are built once. The three ADR 0046 fields are a separate documented contract
+// layered on that base. The bool is false when err carries no AppError,
+// matching ToErrorShape.
 func ToRepairableErrorShape(err error) (RepairableErrorShape, bool) {
-	base, ok := ToErrorShape(err)
+	base, meta, ok := errorEnvelopeFrom(err)
 	if !ok {
 		return RepairableErrorShape{}, false
 	}
-	shape := RepairableErrorShape{ErrorShape: base}
-	var recovery *RecoveryError
-	if errors.As(err, &recovery) {
-		shape.Retryable = recovery.Retryable
-		shape.RecoveryHint = recovery.RecoveryHint
-		shape.Partial = recovery.Partial
-	}
-	return shape, true
+	return RepairableErrorShape{
+		ErrorShape:   base,
+		Retryable:    meta.retryable,
+		RecoveryHint: meta.recoveryHint,
+		Partial:      meta.partial,
+	}, true
 }
 
 // Interruption reasons are fixed strings so tests and callers can rely on the

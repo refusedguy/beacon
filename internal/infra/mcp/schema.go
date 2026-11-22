@@ -464,6 +464,55 @@ func StatusForCode(code domain.ErrorCode) int {
 	return domain.StatusForCode(code)
 }
 
+// recoveryMeta holds the ADR 0046 repair fields that extend the six-field
+// ADR 0009 envelope. The conversion core below produces it. No second
+// converter builds these fields, so the package has one error-shape pipeline.
+type recoveryMeta struct {
+	retryable    bool
+	recoveryHint string
+	partial      PartialResult
+}
+
+// recoveryCarrier is implemented by errors that carry repair metadata. The
+// conversion core reads the fields through this interface, so schema.go does
+// not import the wake-specific RecoveryError type (ADR 0009, ADR 0046).
+type recoveryCarrier interface {
+	RecoveryFields() (bool, string, PartialResult)
+}
+
+// errorEnvelopeFrom is the one place that walks an error chain and builds the
+// error shape. It resolves the AppError and its status once. When the chain
+// also carries repair metadata, it returns those fields next to the six-field
+// base. Both public converters read from here, so there is no duplicate
+// conversion (BCX-69).
+func errorEnvelopeFrom(err error) (ErrorShape, recoveryMeta, bool) {
+	var appErr *domain.AppError
+	if !errors.As(err, &appErr) || appErr == nil {
+		return ErrorShape{}, recoveryMeta{}, false
+	}
+
+	status := StatusForCode(appErr.Code)
+	if status == 0 {
+		status = appErr.Status
+	}
+
+	base := ErrorShape{
+		OK:           false,
+		Code:         appErr.Code,
+		Message:      appErr.Message,
+		Status:       status,
+		RetryAfterMs: appErr.RetryAfterMs,
+		NewWatchID:   appErr.NewWatchID,
+	}
+
+	var meta recoveryMeta
+	var carrier recoveryCarrier
+	if errors.As(err, &carrier) {
+		meta.retryable, meta.recoveryHint, meta.partial = carrier.RecoveryFields()
+	}
+	return base, meta, true
+}
+
 // ToErrorShape converts an error that wraps a *domain.AppError into the MCP
 // error envelope. The bool is false when err carries no AppError, so callers
 // can fall back to a generic protocol error. Code specific fields are carried
@@ -476,22 +525,6 @@ func StatusForCode(code domain.ErrorCode) int {
 // schema_test.go. Wiring them into the live path changes the wire contract and
 // needs an owner decision (ARDH-17).
 func ToErrorShape(err error) (ErrorShape, bool) {
-	var appErr *domain.AppError
-	if !errors.As(err, &appErr) || appErr == nil {
-		return ErrorShape{}, false
-	}
-
-	status := StatusForCode(appErr.Code)
-	if status == 0 {
-		status = appErr.Status
-	}
-
-	return ErrorShape{
-		OK:           false,
-		Code:         appErr.Code,
-		Message:      appErr.Message,
-		Status:       status,
-		RetryAfterMs: appErr.RetryAfterMs,
-		NewWatchID:   appErr.NewWatchID,
-	}, true
+	base, _, ok := errorEnvelopeFrom(err)
+	return base, ok
 }
