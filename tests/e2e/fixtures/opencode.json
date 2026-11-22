@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "opencode/glm-5.3-flash-free",
+  "model": "{env:BEACON_E2E_MODEL}",
   "experimental": {
     "location_idle_timeout": false
   }
