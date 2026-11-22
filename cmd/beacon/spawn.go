@@ -11,6 +11,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
@@ -305,12 +306,87 @@ var spawnACPLifetime = func() (context.Context, context.CancelFunc) {
 
 // spawnACPRunnerEnv overrides the --runner flag. BEACON_ACP_COMMAND and
 // BEACON_ACP_ARGS replace the runner command line entirely, so any harness
-// can route ACP through a wrapper.
+// can route ACP through a wrapper. BEACON_ACP_COMMAND accepts an absolute path
+// or one of the supported runner names: a bare executable found on PATH would
+// let the environment silently pick a different binary (BCX-74).
 const (
 	spawnACPRunnerEnv  = "BEACON_ACP_RUNNER"
 	spawnACPCommandEnv = "BEACON_ACP_COMMAND"
 	spawnACPArgsEnv    = "BEACON_ACP_ARGS"
 )
+
+// validACPCommand reports whether an environment supplied executable may
+// replace the runner. An absolute path is an explicit choice by the operator;
+// a bare name is only safe when it is a runner beacon already knows.
+func validACPCommand(command string) bool {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return true
+	}
+	if filepath.IsAbs(command) {
+		return true
+	}
+	for _, name := range wake.SupportedACPRuntimes() {
+		if command == name {
+			return true
+		}
+	}
+	return false
+}
+
+// splitACPArgs splits an ACP argument string on whitespace. Single and double
+// quotes group text into one argument and are removed from the value, so an
+// argument that contains spaces can be passed without a shell (BCX-74).
+func splitACPArgs(s string) ([]string, error) {
+	var args []string
+	var cur strings.Builder
+	var quote rune
+	inQuote, started := false, false
+	for _, r := range s {
+		switch {
+		case inQuote:
+			if r == quote {
+				inQuote = false
+				continue
+			}
+			cur.WriteRune(r)
+		case r == '\'' || r == '"':
+			inQuote, quote, started = true, r, true
+		case unicode.IsSpace(r):
+			if started {
+				args = append(args, cur.String())
+				cur.Reset()
+				started = false
+			}
+		default:
+			cur.WriteRune(r)
+			started = true
+		}
+	}
+	if inQuote {
+		return nil, fmt.Errorf("acp args: unclosed %c quote", quote)
+	}
+	if started {
+		args = append(args, cur.String())
+	}
+	return args, nil
+}
+
+// validateACPEnv checks the ACP environment overrides before the runner
+// starts. Invalid values are reported instead of silently changing which
+// executable beacon launches (BCX-74).
+func validateACPEnv() error {
+	command := strings.TrimSpace(os.Getenv(spawnACPCommandEnv))
+	if command != "" && !validACPCommand(command) {
+		return fmt.Errorf("%s must be an absolute path or a supported runner name, got %q", spawnACPCommandEnv, command)
+	}
+	if args := strings.TrimSpace(os.Getenv(spawnACPArgsEnv)); args != "" {
+		if _, err := splitACPArgs(args); err != nil {
+			return fmt.Errorf("%s: %w", spawnACPArgsEnv, err)
+		}
+	}
+	return nil
+}
 
 func spawnACPConfig(runner string) wake.ACPRuntimeConfig {
 	runner = strings.TrimSpace(runner)
@@ -321,11 +397,13 @@ func spawnACPConfig(runner string) wake.ACPRuntimeConfig {
 		runner = "opencode"
 	}
 	cfg := wake.ACPRuntimeConfig{Runtime: runner}
-	if command := strings.TrimSpace(os.Getenv(spawnACPCommandEnv)); command != "" {
+	if command := strings.TrimSpace(os.Getenv(spawnACPCommandEnv)); validACPCommand(command) {
 		cfg.Command = command
 	}
 	if args := strings.TrimSpace(os.Getenv(spawnACPArgsEnv)); args != "" {
-		cfg.Args = strings.Fields(args)
+		if parsed, err := splitACPArgs(args); err == nil {
+			cfg.Args = parsed
+		}
 	}
 	return cfg
 }
@@ -426,6 +504,10 @@ func (c *CLI) runSpawnACP(taskID, title, runner string) int {
 	factory := spawnACPRuntimeFactory
 	if factory == nil {
 		fmt.Fprintln(c.errOut, "beacon spawn: ACP-раннер не подключён")
+		return 2
+	}
+	if err := validateACPEnv(); err != nil {
+		fmt.Fprintf(c.errOut, "beacon spawn: %v\n", err)
 		return 2
 	}
 
