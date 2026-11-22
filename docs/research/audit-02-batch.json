@@ -85,7 +85,7 @@
     {
       "id": "MEM-04",
       "title": "Подключить ArchiveRun, Checkpoint, FootprintCheck и реaper к циклу",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [

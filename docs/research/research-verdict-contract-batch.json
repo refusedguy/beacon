@@ -16,7 +16,7 @@
     {
       "id": "VC-01",
       "title": "Свести два типа green_blocked с одной семантикой слота",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -36,7 +36,7 @@
     {
       "id": "VC-02",
       "title": "Считать green_blocked тем же движком, что публикует вердикт",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -76,7 +76,7 @@
     {
       "id": "VC-04",
       "title": "Публиковать вердикт через доменный переход вместо локального CAS",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -95,7 +95,7 @@
     {
       "id": "VC-05",
       "title": "Сохранять Required из проверки вместо константы true",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -115,7 +115,7 @@
     {
       "id": "VC-06",
       "title": "Нормализовать заключения в FailedChecks так же, как в VerdictFromChecks",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [

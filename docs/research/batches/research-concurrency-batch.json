@@ -6,7 +6,7 @@
     {
       "id": "CC-01",
       "title": "Убрать unlink по пути из Lock.Release",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -25,7 +25,7 @@
     {
       "id": "CC-02",
       "title": "Сделать быстрый кэш defer_wiring согласованным со store",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -44,7 +44,7 @@
     {
       "id": "CC-03",
       "title": "Не держать мьютекс daemonWaker на доставке wake",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -63,7 +63,7 @@
     {
       "id": "CC-04",
       "title": "Вынести resume из-под лока DecisionRegistry",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -82,7 +82,7 @@
     {
       "id": "CC-05",
       "title": "Не держать мьютекс ReminderStore на внешней доставке",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

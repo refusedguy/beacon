@@ -16,7 +16,7 @@
     {
       "id": "ST5-01",
       "title": "Принять blocked и duplicate в docs-gate",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -35,7 +35,7 @@
     {
       "id": "ST5-02",
       "title": "Принять статусы taskstore в batch-apply",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -55,7 +55,7 @@
     {
       "id": "ST5-03",
       "title": "Видеть новые форматы ID в связи коммита",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

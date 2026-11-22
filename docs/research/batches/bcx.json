@@ -357,7 +357,7 @@
     {
       "id": "BCX-17",
       "title": "Собрать имена правил гейтов в одном реестре",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [

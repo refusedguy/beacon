@@ -6,7 +6,7 @@
     {
       "id": "EC-01",
       "title": "Привести документацию e2e и заголовки фикстур к текущему набору",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -28,7 +28,7 @@
     {
       "id": "EC-02",
       "title": "Убрать устаревший блокер из README хаос-теста",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -47,7 +47,7 @@
     {
       "id": "EC-03",
       "title": "Пускать e2e в PR на изменения домена и store",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -66,7 +66,7 @@
     {
       "id": "EC-04",
       "title": "Запретить чужой источник сборки и вернуть проверку фактов в обязательную джобу",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -85,7 +85,7 @@
     {
       "id": "EC-05",
       "title": "Добавить негативный контроль модели и авторизации в живой wake",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

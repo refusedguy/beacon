@@ -111,7 +111,7 @@
     {
       "id": "AUTOSP-05",
       "title": "Выбор карточки по индексу и графу без циклов",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [

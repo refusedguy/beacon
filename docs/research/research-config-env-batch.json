@@ -6,7 +6,7 @@
     {
       "id": "CE-01",
       "title": "Подключить OTEL_INSTRUMENTATION_GENAI_CAPTURE_CONTENT к границе процесса",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -27,7 +27,7 @@
     {
       "id": "CE-02",
       "title": "Подключить BEACON_DAEMON_INTERVAL к команде beacon daemon",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -46,7 +46,7 @@
     {
       "id": "CE-03",
       "title": "Ограничить адрес и топик env-уведомлений ntfy",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -66,7 +66,7 @@
     {
       "id": "CE-04",
       "title": "Дать интервалам долгоживущих команд env-эквивалент",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

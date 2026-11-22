@@ -7,7 +7,7 @@
     {
       "id": "TI-01",
       "title": "Перенести проверку owner_files batch-пакета из теста в production",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -28,7 +28,7 @@
     {
       "id": "TI-02",
       "title": "Покрыть self-test'ами подавление находок и CAP-PERMANENT-STALE",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -50,7 +50,7 @@
     {
       "id": "TI-03",
       "title": "Задать timeout-minutes для джобы js-test",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -69,7 +69,7 @@
     {
       "id": "TI-04",
       "title": "Устранить коллизии канонического текста fingerprints в testsystem",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

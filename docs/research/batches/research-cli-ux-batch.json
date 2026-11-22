@@ -6,7 +6,7 @@
     {
       "id": "CU-01",
       "title": "Описать рабочие флаги в каталоге команд",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -27,7 +27,7 @@
     {
       "id": "CU-02",
       "title": "Не перехватывать help-флаги после разделителя аргументов",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -48,7 +48,7 @@
     {
       "id": "CU-03",
       "title": "Привести статусы doctor к контракту проверок",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -69,7 +69,7 @@
     {
       "id": "CU-04",
       "title": "Собрать все значения --format в один реестр",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -90,7 +90,7 @@
     {
       "id": "CU-05",
       "title": "Углубить и покрыть тестами проверки doctor",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
