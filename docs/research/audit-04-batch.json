@@ -38,7 +38,8 @@
     {
       "id": "PROTO-01",
       "title": "Закрепить одиннадцать advertised-имен и проверить remote-карту",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1443 9483e105fb8c8aec93e9e3ac17436b7f10080086 (merge-base --is-ancestor origin/main exit 0); One advertised tool catalog in contract and e2e tests",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -58,7 +59,8 @@
     {
       "id": "PROTO-02",
       "title": "Ввести типизированную SSE-обёртку для событий Watch",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1445 554e2306706bca76cc521399d45112b0707473a8 (merge-base --is-ancestor origin/main exit 0); Typed SSE envelope for watch events",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -78,7 +80,8 @@
     {
       "id": "PROTO-03",
       "title": "Смонтировать аутентифицированный /mcp в один HTTP-сервер",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1481 8608917dab33456083ef9f510e8b883e1309a02e (merge-base --is-ancestor origin/main exit 0); Authenticated /mcp mounted on the shared HTTP listener",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -100,7 +103,8 @@
     {
       "id": "PROTO-04",
       "title": "Зафиксировать разделение каналов в шаблонах агентов",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1463 fd7286b0cb31c6485e49932d9d2501d6c769e805 (merge-base --is-ancestor origin/main exit 0); Channel split documented in agent templates",
       "phase": "P2",
       "type": "doc",
       "owner_files": [
@@ -122,7 +126,8 @@
     {
       "id": "PROTO-05",
       "title": "Eval на дрейф контракта и стоимость tools/list",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1464 aeb250dac07b422e3bdf8be1e89814757217045b (merge-base --is-ancestor origin/main exit 0); Catalog drift and tools/list size eval documented",
       "phase": "P2",
       "type": "eval",
       "owner_files": [
@@ -163,7 +168,8 @@
     {
       "id": "PROTO-07",
       "title": "Поднять graphReady до типизированного сигнала",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1457 058f943014719b3daf64b4479398feeffbe21068 (merge-base --is-ancestor origin/main exit 0); GraphReadySignal in tool_stats.go; docs card done via PR #1562 fdaadff528",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -183,7 +189,8 @@
     {
       "id": "PROTO-08",
       "title": "Привязать registryListSource в composition root или убрать команду",
-      "status": "todo",
+      "status": "done",
+      "note": "MERGED PR #1449 daa93aa5cd82ccea3e688e299ecf2f7e7d692c1b (merge-base --is-ancestor origin/main exit 0); registryListSource bound to current project; docs card done via PR #1562 fdaadff528",
       "phase": "P2",
       "type": "task",
       "owner_files": [
