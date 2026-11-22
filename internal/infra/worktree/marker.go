@@ -5,6 +5,7 @@
 package worktree
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -21,8 +22,12 @@ const (
 	MarkerDir = "worktree-markers"
 	// DefaultMarkerTTL is how long a marker stays valid without a touch.
 	DefaultMarkerTTL = 30 * time.Minute
-	markerDirPerm    = 0o700
-	markerFilePerm   = 0o600
+	// MarkerVersion is the current on-disk schema version of Marker. Readers
+	// reject records with any other version, including legacy records written
+	// before versioning that decode to zero.
+	MarkerVersion  = 1
+	markerDirPerm  = 0o700
+	markerFilePerm = 0o600
 )
 
 // ErrMarkerOwnerConflict reports that a different agent already owns the
@@ -50,10 +55,16 @@ func (e *OwnerConflictError) Is(target error) bool {
 // to another writer.
 var errMarkerExists = errors.New("worktree: marker: path already exists")
 
+// ErrMarkerVersion reports a marker whose on-disk schema version this reader
+// does not support. Callers use errors.Is to tell it from other read errors.
+var ErrMarkerVersion = errors.New("worktree: marker: unsupported version")
+
 // Marker is the durable record that an agent is working in a worktree.
-// Path is the worktree directory the marker belongs to, AgentID identifies
-// the agent, and UpdatedAt is the last touch time in UTC.
+// Version is the schema version stamped on every write. Path is the worktree
+// directory the marker belongs to, AgentID identifies the agent, and UpdatedAt
+// is the last touch time in UTC.
 type Marker struct {
+	Version   int       `json:"version"`
 	Path      string    `json:"path"`
 	AgentID   string    `json:"agentID"`
 	UpdatedAt time.Time `json:"updatedAt"`
@@ -79,7 +90,7 @@ func WriteMarker(storeDir, worktreeDir, agentID string, now time.Time) (Marker, 
 	if agentID == "" {
 		return Marker{}, fmt.Errorf("worktree: marker: empty agentID")
 	}
-	m := Marker{Path: cleanDir(worktreeDir), AgentID: agentID, UpdatedAt: now.UTC()}
+	m := Marker{Version: MarkerVersion, Path: cleanDir(worktreeDir), AgentID: agentID, UpdatedAt: now.UTC()}
 	data, err := json.Marshal(m)
 	if err != nil {
 		return Marker{}, err
@@ -164,8 +175,9 @@ func replaceMarker(path string, data []byte) error {
 }
 
 // ReadMarker loads the marker for worktreeDir. A missing marker returns
-// ok=false and no error. A corrupt marker is an error, not a silent miss, so
-// the collector cannot treat broken state as an unlocked worktree.
+// ok=false and no error. A corrupt marker, a record with an unknown field, or
+// a record whose version differs from MarkerVersion is an error, not a silent
+// miss, so the collector cannot treat unreadable state as an unlocked worktree.
 func ReadMarker(storeDir, worktreeDir string) (Marker, bool, error) {
 	path := MarkerPath(storeDir, worktreeDir)
 	data, err := os.ReadFile(path)
@@ -176,8 +188,13 @@ func ReadMarker(storeDir, worktreeDir string) (Marker, bool, error) {
 		return Marker{}, false, fmt.Errorf("worktree: marker: read: %w", err)
 	}
 	var m Marker
-	if err := json.Unmarshal(data, &m); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&m); err != nil {
 		return Marker{}, false, fmt.Errorf("worktree: marker: %s: %w", path, err)
+	}
+	if m.Version != MarkerVersion {
+		return Marker{}, false, fmt.Errorf("worktree: marker: %s: %w: got %d, want %d", path, ErrMarkerVersion, m.Version, MarkerVersion)
 	}
 	return m, true, nil
 }
@@ -196,7 +213,7 @@ func TouchMarker(storeDir, worktreeDir, agentID string, now time.Time) (Marker, 
 	if strings.TrimSpace(m.AgentID) != "" {
 		agentID = m.AgentID
 	}
-	m = Marker{Path: cleanDir(worktreeDir), AgentID: agentID, UpdatedAt: now.UTC()}
+	m = Marker{Version: MarkerVersion, Path: cleanDir(worktreeDir), AgentID: agentID, UpdatedAt: now.UTC()}
 	data, err := json.Marshal(m)
 	if err != nil {
 		return Marker{}, err
