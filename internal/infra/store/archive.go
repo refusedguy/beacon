@@ -89,9 +89,16 @@ func archiveClosedWatchesTx(tx *sql.Tx, now time.Time) (int, error) {
 		return 0, fmt.Errorf("store: archive: create table: %w", err)
 	}
 
+	// Filter by close time in SQL so a Watch still inside the retention window
+	// is never decoded. The extra second absorbs julianday's coarse precision;
+	// archiveEligible below stays the authority on what actually moves.
+	cutoff := now.Add(-ClosedWatchRetention).Add(time.Second).UTC().Format(time.RFC3339Nano)
 	rows, err := tx.Query(`
-		SELECT id, payload FROM watches WHERE status = ? ORDER BY id`,
-		string(domain.StatusClosed))
+		SELECT id, payload FROM watches
+		WHERE status = ?
+		  AND julianday(json_extract(payload, '$.closedAt')) <= julianday(?)
+		ORDER BY id`,
+		string(domain.StatusClosed), cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -381,18 +388,9 @@ func timeToNano(t time.Time) int64 {
 	return t.UnixNano()
 }
 
-func (d *DB) ensureWatchArchive() error {
-	return d.Write(context.Background(), func(tx *sql.Tx) error {
-		_, err := tx.Exec(createWatchArchiveSQL)
-		return err
-	})
-}
-
-// ArchivedWatch loads one archived Watch by its watchID.
+// ArchivedWatch loads one archived Watch by its watchID. The archive table is
+// created once at Open, so this read path never acquires the writer for DDL.
 func (d *DB) ArchivedWatch(id string) (domain.Watch, error) {
-	if err := d.ensureWatchArchive(); err != nil {
-		return domain.Watch{}, err
-	}
 	var payload []byte
 	err := d.readDB.QueryRow(`SELECT payload FROM watch_archive WHERE id = ?`, id).Scan(&payload)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -404,11 +402,9 @@ func (d *DB) ArchivedWatch(id string) (domain.Watch, error) {
 	return decodeWatch(payload)
 }
 
-// ArchivedWatches returns every Watch in the archive, ordered by id.
+// ArchivedWatches returns every Watch in the archive, ordered by id. The table
+// is created once at Open, so this read path never acquires the writer for DDL.
 func (d *DB) ArchivedWatches() ([]domain.Watch, error) {
-	if err := d.ensureWatchArchive(); err != nil {
-		return nil, err
-	}
 	return d.queryWatches(`SELECT payload FROM watch_archive ORDER BY id`)
 }
 

@@ -171,6 +171,15 @@ func open(path, drv string, production bool) (*DB, error) {
 		}
 	}
 
+	// The watch archive is prepared here, at store initialization. ArchivedWatch
+	// and ArchivedWatches are read paths; creating the table from them made an
+	// ordinary read acquire the single writer to run DDL.
+	if _, err := writeDB.ExecContext(ctx, createWatchArchiveSQL); err != nil {
+		writeDB.Close()
+		readDB.Close()
+		return nil, fmt.Errorf("store: archive table: %w", err)
+	}
+
 	conn, err := writeDB.Conn(ctx)
 	if err != nil {
 		writeDB.Close()
@@ -966,6 +975,9 @@ func (d *DB) JournalRecords(ctx context.Context, taskID string) ([]JournalRecord
 const (
 	inboxStatePending  = "pending"
 	inboxStateInflight = "inflight"
+	// inboxClaimBatchSize caps the IN list so a claim stays below SQLite's
+	// bound-parameter limit even when a peer has thousands of pending messages.
+	inboxClaimBatchSize = 400
 )
 
 // createInboxSQL owns the durable inbox from ADR 0039 §6. Like task_starts and
@@ -1109,6 +1121,7 @@ func (d *DB) InboxClaim(peerName string, now time.Time, ttl time.Duration) ([]In
 			return err
 		}
 		var out []InboxMessage
+		var keys []string
 		for rows.Next() {
 			var m InboxMessage
 			var key string
@@ -1116,6 +1129,7 @@ func (d *DB) InboxClaim(peerName string, now time.Time, ttl time.Duration) ([]In
 				rows.Close()
 				return err
 			}
+			keys = append(keys, key)
 			out = append(out, m)
 		}
 		rowsErr := rows.Err()
@@ -1123,13 +1137,28 @@ func (d *DB) InboxClaim(peerName string, now time.Time, ttl time.Duration) ([]In
 		if rowsErr != nil {
 			return rowsErr
 		}
-		for _, m := range out {
+		// One UPDATE per message held the single writer for one statement per
+		// row. Batch the keys into capped IN lists instead; the rows are the
+		// same pending set the SELECT just returned.
+		for start := 0; start < len(keys); start += inboxClaimBatchSize {
+			end := start + inboxClaimBatchSize
+			if end > len(keys) {
+				end = len(keys)
+			}
+			batch := keys[start:end]
+			args := make([]any, 0, len(batch)+2)
+			args = append(args, inboxStateInflight, leaseUntil)
+			for _, key := range batch {
+				args = append(args, key)
+			}
+			placeholders := strings.TrimRight(strings.Repeat("?,", len(batch)), ",")
 			if _, err := tx.Exec(`
-				UPDATE inbox_messages SET state = ?, lease_until = ? WHERE key = ?`,
-				inboxStateInflight, leaseUntil,
-				InboxKey(m.WatchID, m.Revision, m.SubscriberID)); err != nil {
+				UPDATE inbox_messages SET state = ?, lease_until = ? WHERE key IN (`+placeholders+`)`,
+				args...); err != nil {
 				return err
 			}
+		}
+		for _, m := range out {
 			m.State = inboxStateInflight
 			m.LeaseUntil = leaseUntil
 			claimed = append(claimed, m)
