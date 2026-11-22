@@ -420,6 +420,41 @@ func FootprintCheck(m *Metrics, activeWatches int, readRSS RSSReader, warn func(
 	return over
 }
 
+// Reasons returned with a LaunchDecision. A caller writes the reason to
+// observe when it holds a slot.
+const (
+	LaunchReasonOK         = "ok"
+	LaunchReasonRSSUnknown = "rss_unavailable"
+	LaunchReasonFootprint  = "footprint_exceeded"
+)
+
+// LaunchDecision is the answer of the gate a caller runs before starting a
+// runner. Allow is false when the process cannot prove it has memory to spare.
+// Reason gives the caller a short token for observe.
+type LaunchDecision struct {
+	Allow  bool
+	Reason string
+}
+
+// CheckLaunchFootprint decides whether a new runner may start. It uses
+// FootprintCheck to publish rss_bytes and to compare the footprint with the
+// budget. A missing reader or an unreadable RSS denies the launch, so the
+// caller keeps the slot instead of starting another runner on a guess.
+func CheckLaunchFootprint(m *Metrics, activeWatches int, readRSS RSSReader, warn func(string, ...any)) LaunchDecision {
+	if readRSS == nil {
+		return LaunchDecision{Reason: LaunchReasonRSSUnknown}
+	}
+	bytes, ok := readRSS()
+	if !ok {
+		return LaunchDecision{Reason: LaunchReasonRSSUnknown}
+	}
+	cached := func() (uint64, bool) { return bytes, true }
+	if FootprintCheck(m, activeWatches, cached, warn) {
+		return LaunchDecision{Reason: LaunchReasonFootprint}
+	}
+	return LaunchDecision{Allow: true, Reason: LaunchReasonOK}
+}
+
 type seriesJSON struct {
 	Signal   string       `json:"signal"`
 	Reason   string       `json:"reason"`
