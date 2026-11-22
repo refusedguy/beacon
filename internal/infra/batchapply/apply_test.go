@@ -467,6 +467,56 @@ func TestCardFieldProblemsCoversAllFields(t *testing.T) {
 	}
 }
 
+// TestCardFieldProblemsAcceptsCanonicalStatuses proves every status from the
+// taskstore canon passes cardFieldProblems. An existing batch with an
+// in_progress, blocked or duplicate card must validate. A value outside the
+// canon still produces one invalidField line.
+func TestCardFieldProblemsAcceptsCanonicalStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   []string
+	}{
+		{status: "todo"},
+		{status: "in_progress"},
+		{status: "blocked"},
+		{status: "done"},
+		{status: "dropped"},
+		{status: "duplicate"},
+		{status: "closed", want: []string{"недопустимое значение поля status: closed\n"}},
+	} {
+		t.Run(tc.status, func(t *testing.T) {
+			batches := []batch{{Cards: []card{
+				{ID: "A", Type: "task", Phase: "P0", Status: tc.status},
+			}}}
+			got := cardFieldProblems(batches)
+			if len(got) != len(tc.want) {
+				t.Fatalf("problems = %q, want %q", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("problem %d = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestAllowedCardStatusesBaseline compares the local copy with the taskstore
+// canon measured at six statuses. A change to either set must update this
+// baseline, so the divergence becomes visible without importing
+// internal/infra/taskstore across the layer boundary.
+func TestAllowedCardStatusesBaseline(t *testing.T) {
+	baseline := []string{"todo", "in_progress", "blocked", "done", "dropped", "duplicate"}
+	if len(allowedCardStatuses) != len(baseline) {
+		t.Fatalf("allowedCardStatuses = %q (%d values), want %d: %q", allowedCardStatuses, len(allowedCardStatuses), len(baseline), baseline)
+	}
+	for i := range baseline {
+		if allowedCardStatuses[i] != baseline[i] {
+			t.Fatalf("allowedCardStatuses[%d] = %q, want %q", i, allowedCardStatuses[i], baseline[i])
+		}
+	}
+}
+
 func TestEvaluateChecksMergeGate(t *testing.T) {
 	allGreen := []ghCheck{
 		{Name: "build", State: "SUCCESS"},
