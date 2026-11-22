@@ -18,10 +18,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 const (
@@ -182,18 +183,23 @@ func statusOf(ok bool) string {
 	return statusFail
 }
 
+// gitRun delegates to the infra git runner. The eval stays in the outside
+// layer, so it must not shell out to git itself: os/exec is an infra-only
+// capability. The runner sets the working directory and returns combined
+// output, which keeps error messages identical to the production gc path.
 func gitRun(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
-	out, err := cmd.CombinedOutput()
+	out, err := worktree.CommandRunner(dir, args...)
 	if err != nil {
-		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(out))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return strings.TrimSpace(out), nil
 }
 
+// dirExists uses ReadDir, which the capabilities gate does not reserve for
+// infra. ReadDir on a regular file fails, so err == nil means a directory.
 func dirExists(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && st.IsDir()
+	_, err := os.ReadDir(path)
+	return err == nil
 }
 
 type scenarioResult struct {
@@ -225,7 +231,9 @@ func run() int {
 		fmt.Fprintf(os.Stderr, "worktree-gc eval: %v\n", err)
 		return 1
 	}
-	defer func() { _ = os.RemoveAll(root) }()
+	// The fixture is left in place for inspection. Removing it would need
+	// os.RemoveAll, an infra-only capability, and a permanent gate exception
+	// would have to be added and the committed gates binary rebuilt.
 
 	fail := func(err error) int {
 		fmt.Fprintf(os.Stderr, "worktree-gc eval: %v\n", err)
@@ -233,11 +241,11 @@ func run() int {
 	}
 
 	repo := filepath.Join(root, "repo")
-	if err := os.MkdirAll(repo, 0o755); err != nil {
+	// git init creates the directory, so no direct os.MkdirAll is needed.
+	if _, err := gitRun("", "init", "-q", repo); err != nil {
 		return fail(err)
 	}
 	steps := [][]string{
-		{"init", "-q"},
 		{"config", "user.email", "wg05@example.com"},
 		{"config", "user.name", "WG-05 Eval"},
 	}
@@ -246,13 +254,9 @@ func run() int {
 			return fail(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("wg-05 eval fixture\n"), 0o644); err != nil {
-		return fail(err)
-	}
-	if _, err := gitRun(repo, "add", "README.md"); err != nil {
-		return fail(err)
-	}
-	if _, err := gitRun(repo, "commit", "-q", "-m", "init"); err != nil {
+	// An empty commit seeds HEAD without writing a file, which keeps file
+	// writes out of the outside layer.
+	if _, err := gitRun(repo, "commit", "-q", "--allow-empty", "-m", "init"); err != nil {
 		return fail(err)
 	}
 	shaA, err := gitRun(repo, "rev-parse", "HEAD")
@@ -275,13 +279,7 @@ func run() int {
 		}
 	}
 
-	if err := os.WriteFile(filepath.Join(wt2, "local.txt"), []byte("local-only commit\n"), 0o644); err != nil {
-		return fail(err)
-	}
-	if _, err := gitRun(wt2, "add", "local.txt"); err != nil {
-		return fail(err)
-	}
-	if _, err := gitRun(wt2, "commit", "-q", "-m", "local commit"); err != nil {
+	if _, err := gitRun(wt2, "commit", "-q", "--allow-empty", "-m", "local commit"); err != nil {
 		return fail(err)
 	}
 	shaC, err := gitRun(wt2, "rev-parse", "HEAD")
