@@ -131,6 +131,48 @@ func TestT3142SpawnSendsAgentAtCreation(t *testing.T) {
 	}
 }
 
+// TestSL04PromptPinsCardID checks that the child's first message names the
+// exact card and the claim tool, both with and without a title (SL-04).
+func TestSL04PromptPinsCardID(t *testing.T) {
+	cases := []struct {
+		name  string
+		title string
+	}{
+		{"with title", "Card title"},
+		{"without title", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prompt := spawnPrompt("T3.142", tc.title)
+			if !strings.Contains(prompt, "T3.142") {
+				t.Errorf("prompt %q does not name the card", prompt)
+			}
+			if !strings.Contains(prompt, "beacon_task_claim") {
+				t.Errorf("prompt %q does not name the claim tool", prompt)
+			}
+			if !strings.Contains(prompt, "cardID") {
+				t.Errorf("prompt %q does not name the cardID argument", prompt)
+			}
+		})
+	}
+}
+
+// TestSL04PromptMatchesMeta checks the guard that ties the prompt to the
+// session metadata. A mismatched card fails the check; metadata with no card id
+// does not constrain the prompt.
+func TestSL04PromptMatchesMeta(t *testing.T) {
+	meta := map[string]string{spawnMetaTaskID: "T3.142"}
+	if !spawnPromptMatchesMeta(spawnPrompt("T3.142", "Card title"), meta) {
+		t.Error("matching prompt and metadata reported a mismatch")
+	}
+	if spawnPromptMatchesMeta(spawnPrompt("T4.999", "Other card"), meta) {
+		t.Error("mismatched prompt and metadata reported a match")
+	}
+	if !spawnPromptMatchesMeta("any prompt", map[string]string{}) {
+		t.Error("metadata without a card id must not constrain the prompt")
+	}
+}
+
 // TestT3142SpawnWithoutAgentStillSeparatesThePorts checks that an omitted
 // --agent is passed to CreateSession as empty and never leaks into Prompt.
 func TestT3142SpawnWithoutAgentStillSeparatesThePorts(t *testing.T) {
