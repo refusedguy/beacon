@@ -3944,9 +3944,12 @@ type schemaExclusions struct {
 }
 
 var runtimeSchemaExclusions = schemaExclusions{
-	tables: map[string]string{},
+	tables: map[string]string{
+		"watch_archive": "createWatchArchiveSQL creates the archive table at Open; the migration corpus predates runtime archive creation",
+	},
 	indexes: map[string]string{
-		"events_by_scope": "ensureEventLog creates the replay index at Open; migration 0004 predates scoped events",
+		"events_by_scope":         "ensureEventLog creates the replay index at Open; migration 0004 predates scoped events",
+		"watch_archive_closed_at": "createWatchArchiveSQL creates the closed_at index at Open; the migration corpus predates runtime archive creation",
 	},
 	columns: map[string]map[string]string{
 		"events": {
