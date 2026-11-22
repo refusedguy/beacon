@@ -464,6 +464,32 @@ type StatsOutput struct {
 	ConfigID         string `json:"configId"`
 }
 
+// StatsOutcomeSchemaVersion is the version of the disjoint outcome report
+// published by beacon_stats. Version 2 keeps every Watch in exactly one main
+// list and records failure classes as additive lists (SWE-bench reporting.py).
+const StatsOutcomeSchemaVersion = 2
+
+// OutcomeReport is the run outcome derived from one Beacon snapshot. The eight
+// ID lists follow swebench/harness/reporting.py:35-46 and :139-160. A Watch
+// belongs to exactly one of the four main lists: completed, incomplete,
+// resolved or unresolved. The four failure lists are additive. A classified
+// Watch stays in its main list, so classification never changes a denominator.
+//
+// The report is a projection, not a second store. It is rendered once into the
+// stats response and read back from there by OutcomeReportFrom, which keeps
+// beacon_stats and any metrics reader on the same values.
+type OutcomeReport struct {
+	SchemaVersion       int      `json:"schemaVersion"`
+	CompletedIDs        []string `json:"completed_ids"`
+	IncompleteIDs       []string `json:"incomplete_ids"`
+	ResolvedIDs         []string `json:"resolved_ids"`
+	UnresolvedIDs       []string `json:"unresolved_ids"`
+	ErrorIDs            []string `json:"error_ids"`
+	EmptyPatchIDs       []string `json:"empty_patch_ids"`
+	InfraFailureIDs     []string `json:"infra_failure_ids"`
+	AmbiguousFailureIDs []string `json:"ambiguous_failure_ids"`
+}
+
 // OutputSchema derives the JSON schema for T from its Go type. This is the
 // same reflection based inference go-sdk uses when it registers a typed tool
 // handler, so an output schema can never drift from its struct definition.
