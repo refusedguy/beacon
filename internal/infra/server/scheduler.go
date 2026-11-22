@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,6 +71,17 @@ type ScheduleStore interface {
 	Delete(ctx context.Context, id string) error
 }
 
+// IntentOutbox records one durable intention that a schedule must run. The
+// composition root supplies the store, so the server owns no SQL and no file
+// format. Commit reports whether the key was newly written; a repeated key is
+// not an error, so a restart never queues a second intention for the same run.
+type IntentOutbox interface {
+	Commit(ctx context.Context, key, kind string, payload []byte) (bool, error)
+}
+
+// ScheduleIntentKind labels the outbox row written for a new schedule.
+const ScheduleIntentKind = "schedule_intent"
+
 // enabledSetter is an optional store capability that flips Enabled and returns
 // the row in one locked operation. Stores that implement it let Pause and
 // Resume stay atomic even when several services share the store. The service
@@ -105,20 +117,28 @@ func invalid(format string, a ...any) error {
 // clock to decide whether a task runs: pausing only flips Enabled through the
 // store, so a paused schedule is preserved but never dispatched.
 type ScheduleService struct {
-	store ScheduleStore
-	mu    sync.Mutex
+	store  ScheduleStore
+	outbox IntentOutbox
+	mu     sync.Mutex
 }
 
 // NewScheduleService builds a service over store. A nil store is refused, so a
 // misconfigured composition root fails at startup rather than on first use.
-func NewScheduleService(store ScheduleStore) (*ScheduleService, error) {
+// The optional outbox records the run intention; callers that do not dispatch
+// schedules can omit it and keep the original behaviour.
+func NewScheduleService(store ScheduleStore, outbox ...IntentOutbox) (*ScheduleService, error) {
 	if store == nil {
 		return nil, errors.New("server: nil schedule store")
 	}
-	return &ScheduleService{store: store}, nil
+	var intent IntentOutbox
+	if len(outbox) > 0 {
+		intent = outbox[0]
+	}
+	return &ScheduleService{store: store, outbox: intent}, nil
 }
 
-// Schedule validates in and persists a new, enabled schedule.
+// Schedule validates in and persists a new, enabled schedule. When an outbox
+// is wired, it also records one intention for the schedule's first run.
 func (s *ScheduleService) Schedule(ctx context.Context, in ScheduleCreate) (Schedule, error) {
 	built, err := buildSchedule(in)
 	if err != nil {
@@ -126,6 +146,16 @@ func (s *ScheduleService) Schedule(ctx context.Context, in ScheduleCreate) (Sche
 	}
 	if err := s.store.Create(ctx, built); err != nil {
 		return Schedule{}, err
+	}
+	if s.outbox != nil {
+		payload, err := json.Marshal(built)
+		if err != nil {
+			return Schedule{}, err
+		}
+		key := ScheduleIntentKind + ":" + built.ID
+		if _, err := s.outbox.Commit(ctx, key, ScheduleIntentKind, payload); err != nil {
+			return Schedule{}, err
+		}
 	}
 	return built, nil
 }
@@ -221,13 +251,14 @@ func buildSchedule(in ScheduleCreate) (Schedule, error) {
 	if in.Timezone == "" {
 		in.Timezone = "Local"
 	}
-	if _, err := time.LoadLocation(in.Timezone); err != nil {
+	loc, err := time.LoadLocation(in.Timezone)
+	if err != nil {
 		return Schedule{}, invalid("server: неверный часовой пояс %q: %v", in.Timezone, err)
 	}
 	if err := validateExpr(in.Kind, in.Expr); err != nil {
 		return Schedule{}, err
 	}
-	next, err := firstRunAt(in.Kind, in.Expr, time.Now())
+	next, err := firstRunAt(in.Kind, in.Expr, time.Now(), loc)
 	if err != nil {
 		return Schedule{}, err
 	}
@@ -237,11 +268,151 @@ func buildSchedule(in ScheduleCreate) (Schedule, error) {
 	}, nil
 }
 
-// firstRunAt computes the first storage-valid run time for a schedule. The
-// planner that evaluates cron expressions lives in internal/app and is not
-// wired yet (ADR 0314), so cron uses the next minute boundary as a safe first
-// evaluation point and mark is due immediately. Intervals are exact.
-func firstRunAt(kind Kind, expr string, now time.Time) (time.Time, error) {
+// Five-field cron support. The fields are minute, hour, day of month, month and
+// day of week. The parser is pure and lives here so infra needs no dependency
+// on the app-layer planner (ADR 0314, ADR 0005). It supports "*", lists, ranges,
+// steps and any combination of them.
+type cronSpec struct {
+	minute []bool
+	hour   []bool
+	dom    []bool
+	month  []bool
+	dow    []bool
+	domAny bool
+	dowAny bool
+}
+
+func (c cronSpec) matches(t time.Time) bool {
+	day := c.dom[t.Day()] && c.dow[int(t.Weekday())]
+	// Unix cron uses OR between day-of-month and day-of-week when both fields
+	// are restricted, and AND when either field is "*".
+	if !c.domAny && !c.dowAny {
+		day = c.dom[t.Day()] || c.dow[int(t.Weekday())]
+	}
+	return c.minute[t.Minute()] && c.hour[t.Hour()] && c.month[int(t.Month())] && day
+}
+
+func parseCron(expr string) (cronSpec, error) {
+	fields := strings.Fields(expr)
+	if len(fields) != 5 {
+		return cronSpec{}, fmt.Errorf("нужно 5 полей, получено %d", len(fields))
+	}
+	var spec cronSpec
+	var err error
+	if spec.minute, err = parseCronField(fields[0], 0, 59); err != nil {
+		return cronSpec{}, fmt.Errorf("минуты: %w", err)
+	}
+	if spec.hour, err = parseCronField(fields[1], 0, 23); err != nil {
+		return cronSpec{}, fmt.Errorf("часы: %w", err)
+	}
+	if spec.dom, err = parseCronField(fields[2], 1, 31); err != nil {
+		return cronSpec{}, fmt.Errorf("день месяца: %w", err)
+	}
+	if spec.month, err = parseCronField(fields[3], 1, 12); err != nil {
+		return cronSpec{}, fmt.Errorf("месяц: %w", err)
+	}
+	if spec.dow, err = parseCronField(fields[4], 0, 7); err != nil {
+		return cronSpec{}, fmt.Errorf("день недели: %w", err)
+	}
+	// Cron treats 7 as an alias for Sunday.
+	if spec.dow[7] {
+		spec.dow[0] = true
+	}
+	spec.domAny = fields[2] == "*"
+	spec.dowAny = fields[4] == "*"
+	return spec, nil
+}
+
+// parseCronField parses one field into a lookup slice indexed by field value.
+func parseCronField(field string, min, max int) ([]bool, error) {
+	allowed := make([]bool, max+1)
+	for _, part := range strings.Split(field, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, errors.New("пустое поле")
+		}
+		base, step := part, 1
+		if i := strings.IndexByte(part, '/'); i >= 0 {
+			base = part[:i]
+			n, err := strconv.Atoi(part[i+1:])
+			if err != nil || n <= 0 {
+				return nil, fmt.Errorf("неверный шаг %q", part[i+1:])
+			}
+			step = n
+		}
+		lo, hi := min, max
+		if base != "*" {
+			if strings.Contains(base, "-") {
+				bounds := strings.Split(base, "-")
+				if len(bounds) != 2 {
+					return nil, fmt.Errorf("неверный диапазон %q", base)
+				}
+				start, err := strconv.Atoi(bounds[0])
+				if err != nil {
+					return nil, fmt.Errorf("неверное значение %q", bounds[0])
+				}
+				end, err := strconv.Atoi(bounds[1])
+				if err != nil {
+					return nil, fmt.Errorf("неверное значение %q", bounds[1])
+				}
+				lo, hi = start, end
+			} else {
+				n, err := strconv.Atoi(base)
+				if err != nil {
+					return nil, fmt.Errorf("неверное значение %q", base)
+				}
+				lo, hi = n, n
+			}
+		}
+		if lo < min || hi > max || lo > hi {
+			return nil, fmt.Errorf("значение %d-%d вне диапазона %d-%d", lo, hi, min, max)
+		}
+		for v := lo; v <= hi; v += step {
+			allowed[v] = true
+		}
+	}
+	return allowed, nil
+}
+
+// maxCronMinutes bounds the search for an impossible expression such as
+// "0 0 30 2 *", which has no matching date in a Gregorian calendar.
+const maxCronMinutes = 5 * 366 * 24 * 60
+
+func nextCronAfter(spec cronSpec, loc *time.Location, after time.Time) (time.Time, bool) {
+	t := after.In(loc).Truncate(time.Minute).Add(time.Minute)
+	for i := 0; i < maxCronMinutes; i++ {
+		if spec.matches(t) {
+			return t, true
+		}
+		t = t.Add(time.Minute)
+	}
+	return time.Time{}, false
+}
+
+// NextCronRun parses a five-field cron expression and returns the first firing
+// strictly after at in timezone. It is the pure entry point for callers that
+// need a fixed wall-clock time in a named zone, including the daemon adapter
+// that advances a missed interval without duplicating it.
+func NextCronRun(expr, timezone string, at time.Time) (time.Time, error) {
+	spec, err := parseCron(expr)
+	if err != nil {
+		return time.Time{}, invalid("server: cron %q: %v", expr, err)
+	}
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		return time.Time{}, invalid("server: часовой пояс %q: %v", timezone, err)
+	}
+	next, ok := nextCronAfter(spec, loc, at)
+	if !ok {
+		return time.Time{}, invalid("server: cron %q: нет подходящего времени за 5 лет", expr)
+	}
+	return next, nil
+}
+
+// firstRunAt computes the first storage-valid run time for a schedule. Cron
+// uses the parsed expression in the schedule's zone, interval arithmetic stays
+// exact and mark is due immediately.
+func firstRunAt(kind Kind, expr string, now time.Time, loc *time.Location) (time.Time, error) {
 	switch kind {
 	case KindInterval:
 		d, err := time.ParseDuration(expr)
@@ -250,7 +421,15 @@ func firstRunAt(kind Kind, expr string, now time.Time) (time.Time, error) {
 		}
 		return now.Add(d), nil
 	case KindCron:
-		return now.Truncate(time.Minute).Add(time.Minute), nil
+		spec, err := parseCron(expr)
+		if err != nil {
+			return time.Time{}, invalid("server: cron %q: %v", expr, err)
+		}
+		next, ok := nextCronAfter(spec, loc, now)
+		if !ok {
+			return time.Time{}, invalid("server: cron %q: нет подходящего времени за 5 лет", expr)
+		}
+		return next, nil
 	case KindMark:
 		return now, nil
 	default:
@@ -270,8 +449,8 @@ func validateExpr(kind Kind, expr string) error {
 		}
 		return nil
 	case KindCron:
-		if n := len(strings.Fields(expr)); n != 5 {
-			return invalid("server: cron %q: нужно 5 полей, получено %d", expr, n)
+		if _, err := parseCron(expr); err != nil {
+			return invalid("server: cron %q: %v", expr, err)
 		}
 		return nil
 	case KindMark:
