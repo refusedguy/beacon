@@ -57,9 +57,10 @@ type Tier1Observation struct {
 }
 
 // NeedsTier2 reports whether the transition from prev to curr needs the
-// tier-2 contexts fetch. Tier-2 runs on a rollup or merge-state change or when
-// a tracked field reads UNKNOWN. A first observation with an empty prev and no
-// UNKNOWN is not a change, so it does not by itself trigger tier-2.
+// tier-2 contexts fetch. Tier-2 runs on a rollup, merge-state, or head SHA
+// change, or when a tracked field reads UNKNOWN. A first observation with an
+// empty prev and no UNKNOWN is not a change, so it does not by itself trigger
+// tier-2.
 func NeedsTier2(prev, curr Tier1Observation) bool {
 	if isUnknown(curr.Rollup) || isUnknown(curr.Mergeable) || isUnknown(curr.MergeStateStatus) {
 		return true
@@ -68,7 +69,8 @@ func NeedsTier2(prev, curr Tier1Observation) bool {
 		return false
 	}
 	return !strings.EqualFold(prev.Rollup, curr.Rollup) ||
-		!strings.EqualFold(prev.MergeStateStatus, curr.MergeStateStatus)
+		!strings.EqualFold(prev.MergeStateStatus, curr.MergeStateStatus) ||
+		prev.HeadSHA != curr.HeadSHA
 }
 
 func isUnknown(value string) bool {

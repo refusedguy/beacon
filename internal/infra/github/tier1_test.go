@@ -388,6 +388,8 @@ func TestNeedsTier2unknownAndChanges(t *testing.T) {
 		{name: "mergeable unknown", prev: clean, curr: Tier1Observation{Rollup: "SUCCESS", Mergeable: "UNKNOWN", MergeStateStatus: "CLEAN"}, want: true},
 		{name: "merge state unknown", prev: clean, curr: Tier1Observation{Rollup: "SUCCESS", Mergeable: "MERGEABLE", MergeStateStatus: "UNKNOWN"}, want: true},
 		{name: "rollup unknown", prev: clean, curr: Tier1Observation{Rollup: "UNKNOWN", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"}, want: true},
+		{name: "head sha changed with stable state", prev: Tier1Observation{Rollup: "SUCCESS", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", HeadSHA: "old"}, curr: Tier1Observation{Rollup: "SUCCESS", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", HeadSHA: "new"}, want: true},
+		{name: "head sha unchanged", prev: Tier1Observation{Rollup: "SUCCESS", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", HeadSHA: "same"}, curr: Tier1Observation{Rollup: "SUCCESS", Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN", HeadSHA: "same"}, want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
