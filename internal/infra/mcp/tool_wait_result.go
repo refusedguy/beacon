@@ -41,6 +41,14 @@
 // only names the return that already happened; the event and approval boundary
 // of ADR 0037 is unchanged, and needs_input still parks without a read write.
 //
+// SB-16 adds a bounded requery for three fixable agent action errors: a
+// malformed action, a blocked action and a shell syntax error. Each error has
+// its own response template and all three share a budget of three attempts.
+// Corrected attempts go to a trajectory sink, never to the visible wait result
+// or its stop reasons. An exhausted budget ends the run with exit_format; an
+// API or environment error ends it at once. The wake rule and the red-check
+// retry budget stay unchanged.
+//
 // The tool is deliberately not registered in NewServer; wiring it into the
 // server is a separate integration task. AttachWaitResult is the hook that task
 // will call.
@@ -369,6 +377,156 @@ func FailureCauseOf(out WaitResultOutput) ExitStatusCause {
 // from the wait journal and opens the PR from it in one following turn.
 func PartialDiffOf(out WaitResultOutput) string {
 	return out.Checks[waitPartialDiffCheckName].State
+}
+
+// ---- SB-16: limited requery after a fixable agent action error ----
+//
+// SWE-agent gives a model up to max_requeries attempts to correct three action
+// errors: a malformed action, a blocked action and a shell syntax error
+// (sweagent/agent/agents.py:149-161, :1062-1125). Each error gets its own
+// response template. The corrected attempt goes to the trajectory, not to the
+// visible message history. After the budget is spent the run ends with
+// exit_format (:1211-1218). An API or environment error is not a fixable action
+// error: it ends the run at once with its own exit status.
+//
+// This budget is separate from the red-check retry budget of
+// domain.FlakyConfig and from every WaitStopReason value. It changes no verdict
+// and no wake rule. A format error the agent fixes itself costs no orchestrator
+// slot.
+
+// ActionErrorKind names an agent action error the model can correct after a
+// requery prompt. The three values mirror the three retry branches of
+// forward_with_handling in sweagent. API, environment and runtime errors are
+// not action errors and never enter this loop.
+type ActionErrorKind string
+
+const (
+	ActionFormatError   ActionErrorKind = "action_format"
+	ActionBlockedAction ActionErrorKind = "blocked_action"
+	ActionCommandSyntax ActionErrorKind = "command_syntax"
+)
+
+func (k ActionErrorKind) valid() bool {
+	switch k {
+	case ActionFormatError, ActionBlockedAction, ActionCommandSyntax:
+		return true
+	default:
+		return false
+	}
+}
+
+// Fixable reports whether the model can correct this error by answering a
+// requery prompt. Only the three action errors are fixable.
+func (k ActionErrorKind) Fixable() bool { return k.valid() }
+
+// MaxActionRequeries is the shared requery budget for one run. The same counter
+// covers all three action errors (sweagent max_requeries = 3). It is not
+// domain.FlakyConfig.MaxRetries, which counts red CI checks.
+const MaxActionRequeries = 3
+
+// ActionFormatExitStatus is the terminal outcome after the requery budget is
+// exhausted. It is an exit status of the agent run, not a WaitStopReason.
+const ActionFormatExitStatus = "exit_format"
+
+// ActionRequeryTemplate returns the separate response prompt for one fixable
+// action error. The prompt names the error, includes the rejected output and
+// the error message, and asks for one corrected action. It carries no verdict
+// and no wake instruction. An error outside the three kinds returns an empty
+// template, so the caller ends the run instead of requerying.
+func ActionRequeryTemplate(kind ActionErrorKind, output, message string) string {
+	const head = "The last action was rejected. Send one corrected action only."
+	switch kind {
+	case ActionFormatError:
+		return head + " The action could not be parsed as a tool call.\nRejected output:\n" + output + "\nError: " + message
+	case ActionBlockedAction:
+		return head + " The action used a command on the blocklist. Replace the blocked command.\nRejected output:\n" + output + "\nError: " + message
+	case ActionCommandSyntax:
+		return head + " The shell command has a syntax error. Fix the syntax.\nRejected output:\n" + output + "\nError: " + message
+	default:
+		return ""
+	}
+}
+
+// ActionRequeryOutcome is the decision for one failed agent action. Requery is
+// true only for a fixable error inside the budget. ExitStatus is set when the
+// run ends: exit_format after the budget is spent, or the caller's own status
+// for an error that cannot be fixed by a requery. Attempt is the 1-based
+// requery number, or the number of requeries already spent at exit.
+type ActionRequeryOutcome struct {
+	Requery    bool
+	Attempt    int
+	Template   string
+	ExitStatus string
+}
+
+// DecideActionRequery spends one step of the action error budget. A fixable
+// error inside the budget returns a requery with its own template. The next
+// fixable error after the budget returns exit_format. Any other error returns
+// the supplied exit status and no requery, so an API or environment failure
+// ends the run at once.
+func DecideActionRequery(kind ActionErrorKind, priorRequeries int, output, message, exitStatus string) ActionRequeryOutcome {
+	if !kind.Fixable() {
+		return ActionRequeryOutcome{ExitStatus: exitStatus}
+	}
+	if priorRequeries >= MaxActionRequeries {
+		return ActionRequeryOutcome{ExitStatus: ActionFormatExitStatus, Attempt: priorRequeries}
+	}
+	return ActionRequeryOutcome{
+		Requery:  true,
+		Attempt:  priorRequeries + 1,
+		Template: ActionRequeryTemplate(kind, output, message),
+	}
+}
+
+// ActionTrajectoryRecord is one corrected attempt kept outside the visible
+// message history. A requery writes here only: the attempt never reaches a
+// WaitResultOutput field, a Check, a verdict or a WaitStopReason.
+type ActionTrajectoryRecord struct {
+	Kind     ActionErrorKind
+	Attempt  int
+	Output   string
+	Message  string
+	Template string
+	At       time.Time
+}
+
+// ActionTrajectory is the sink for corrected attempts. It adds a read-back to
+// the write port so tests and diagnostics can inspect what was saved. The app
+// layer supplies durable storage; the in-memory sink below is the default.
+type ActionTrajectory interface {
+	RecordActionAttempt(ActionTrajectoryRecord)
+	Records() []ActionTrajectoryRecord
+}
+
+// NewMemoryActionTrajectory builds the in-process trajectory sink.
+func NewMemoryActionTrajectory() ActionTrajectory {
+	return &memoryActionTrajectory{}
+}
+
+type memoryActionTrajectory struct {
+	mu      sync.Mutex
+	records []ActionTrajectoryRecord
+}
+
+func (t *memoryActionTrajectory) RecordActionAttempt(rec ActionTrajectoryRecord) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.records = append(t.records, rec)
+}
+
+// Records returns the corrected attempts in insertion order.
+func (t *memoryActionTrajectory) Records() []ActionTrajectoryRecord {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]ActionTrajectoryRecord, len(t.records))
+	copy(out, t.records)
+	return out
 }
 
 // MarshalJSON writes a WaitResultOutput in the fixed order above. encoding/json
@@ -1082,20 +1240,21 @@ func directCIWait(ctx context.Context, _ string, fn func(context.Context) error)
 // the caller supplies the departure signals, the verdict subscription and the
 // transactional writer through ports.
 type WaitResultService struct {
-	store           waitResultStore
-	writer          WaitResultWriter
-	source          VerdictSource
-	clock           domain.Clock
-	after           func(time.Duration) <-chan time.Time
-	departures      func(*mcpsdk.CallToolRequest) CallerExit
-	idempotency     WaitResultIdempotencyStore
-	starts          *waitStartRegistry
-	capability      func(*mcpsdk.CallToolRequest) *CapabilityContext
-	ciWait          func(context.Context) error
-	ciGate          SharedCIWaiter
-	precheckReason  string
-	precheckJournal PrecheckJournal
-	infraJournal    domain.InfraFailureJournal
+	store            waitResultStore
+	writer           WaitResultWriter
+	source           VerdictSource
+	clock            domain.Clock
+	after            func(time.Duration) <-chan time.Time
+	departures       func(*mcpsdk.CallToolRequest) CallerExit
+	idempotency      WaitResultIdempotencyStore
+	starts           *waitStartRegistry
+	capability       func(*mcpsdk.CallToolRequest) *CapabilityContext
+	ciWait           func(context.Context) error
+	ciGate           SharedCIWaiter
+	precheckReason   string
+	precheckJournal  PrecheckJournal
+	infraJournal     domain.InfraFailureJournal
+	actionTrajectory ActionTrajectory
 }
 
 // NewWaitResultService builds a service. A nil clock falls back to the wall
@@ -1107,17 +1266,18 @@ func NewWaitResultService(store waitResultStore, writer WaitResultWriter, source
 		clock = waitResultWallClock{}
 	}
 	return &WaitResultService{
-		store:           store,
-		writer:          writer,
-		source:          source,
-		clock:           clock,
-		after:           time.After,
-		idempotency:     NewMemoryWaitResultIdempotency(),
-		starts:          newWaitStartRegistry(),
-		ciWait:          sharedCIWaitNoop,
-		ciGate:          directCIWait,
-		precheckJournal: NewMemoryPrecheckJournal(),
-		infraJournal:    NewMemoryInfraFailureJournal(),
+		store:            store,
+		writer:           writer,
+		source:           source,
+		clock:            clock,
+		after:            time.After,
+		idempotency:      NewMemoryWaitResultIdempotency(),
+		starts:           newWaitStartRegistry(),
+		ciWait:           sharedCIWaitNoop,
+		ciGate:           directCIWait,
+		precheckJournal:  NewMemoryPrecheckJournal(),
+		infraJournal:     NewMemoryInfraFailureJournal(),
+		actionTrajectory: NewMemoryActionTrajectory(),
 	}
 }
 
@@ -1230,6 +1390,41 @@ func (s *WaitResultService) InfraFailureJournal() domain.InfraFailureJournal {
 		return NewMemoryInfraFailureJournal()
 	}
 	return s.infraJournal
+}
+
+// SetActionTrajectory installs the sink for corrected action attempts. A nil
+// argument restores the in-memory trajectory. A durable sink belongs in the
+// app layer; this package owns only the interface and the default.
+func (s *WaitResultService) SetActionTrajectory(t ActionTrajectory) {
+	if s == nil {
+		return
+	}
+	if t == nil {
+		t = NewMemoryActionTrajectory()
+	}
+	s.actionTrajectory = t
+}
+
+// ActionTrajectory returns the configured sink. It is never nil for a service
+// built by NewWaitResultService.
+func (s *WaitResultService) ActionTrajectory() ActionTrajectory {
+	if s == nil || s.actionTrajectory == nil {
+		return NewMemoryActionTrajectory()
+	}
+	return s.actionTrajectory
+}
+
+// RecordActionAttempt writes a corrected attempt to the trajectory. It stamps
+// the time when the record has none. It never touches the visible wait result,
+// so a requery costs no orchestrator slot and opens no new obligation.
+func (s *WaitResultService) RecordActionAttempt(rec ActionTrajectoryRecord) {
+	if s == nil {
+		return
+	}
+	if rec.At.IsZero() {
+		rec.At = s.now()
+	}
+	s.ActionTrajectory().RecordActionAttempt(rec)
 }
 
 // ClassifyInfraText runs the advisory classifier over text the harness already
