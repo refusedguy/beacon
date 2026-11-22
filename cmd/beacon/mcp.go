@@ -1441,6 +1441,7 @@ func runMCP(ctx context.Context, cli ...*CLI) error {
 		root:       projectRootForConfig(),
 		resolver:   resolver,
 		events:     events,
+		autoSpawn:  &autoSpawner{start: autoSpawnStartSession},
 	}
 
 	// Only the owner of the non-blocking poller lock starts the single
@@ -1659,6 +1660,18 @@ type reconcileConfig struct {
 	// onPollerOwner runs once when this process wins the poller lock. runMCP
 	// uses it to start the loopback API only on the owning process.
 	onPollerOwner func(context.Context)
+	// autoSpawn is the one seam the reconciler calls per pass to start the
+	// next queued card. A nil spawner leaves the cycle unchanged. Only the MCP
+	// process assembles a config with one; daemon and up leave it nil.
+	autoSpawn *autoSpawner
+}
+
+// autoSpawner starts one agent for one selected card. start returns true when
+// the session and its first prompt were created. Splitting the decision from
+// the start keeps slot counting and OwnerFiles admission testable without a
+// live OpenCode server.
+type autoSpawner struct {
+	start func(ctx context.Context, cfg reconcileConfig, cardID, title string) bool
 }
 
 // githubBatch is the real CI provider plus the shared point counter.
@@ -2033,6 +2046,114 @@ func reconcileMaintenance(ctx context.Context, cfg reconcileConfig) {
 	}
 }
 
+// reconcileAutoSpawn is the minimal slot spawner. One pass starts at most one
+// agent: it needs a free slot from the bridge's live watches and a todo card
+// whose OwnerFiles are not held by an in_progress card. The slot and file
+// decisions come from the AUTOSP-06 admission gate, so the existing reconcile
+// ports decide admission and this helper only selects the card and calls the
+// spawn seam. It returns the number of agents started (0 or 1).
+func reconcileAutoSpawn(ctx context.Context, cfg reconcileConfig, sp *autoSpawner) int {
+	if sp == nil || sp.start == nil || cfg.db == nil || cfg.root == "" {
+		return 0
+	}
+	watches, err := cfg.db.LiveWatches()
+	if err != nil {
+		observe.ActorError("auto-spawn-live-watches", "", err)
+		return 0
+	}
+	// The domain cap is the default concurrency budget. Live watches are the
+	// slots already taken by running agents.
+	slotsUsed, slotsTotal := len(watches), domain.DefaultSlotsTotal
+
+	tasksDir := filepath.Join(cfg.root, "docs", "tasks")
+	cards, err := taskstore.LoadCards(tasksDir)
+	if err != nil {
+		observe.ActorError("auto-spawn-cards", "", err)
+		return 0
+	}
+
+	// Cards in progress hold their files. A todo candidate that touches one of
+	// them cannot take a slot this pass.
+	active := make([]taskcli.LaunchAssignment, 0, len(cards))
+	for _, c := range cards {
+		if c.Status != "in_progress" || len(c.OwnerFiles) == 0 {
+			continue
+		}
+		active = append(active, taskcli.LaunchAssignment{
+			Name: c.ID, Files: c.OwnerFiles, Status: c.Status,
+		})
+	}
+	var candidate *taskstore.Card
+	for i := range cards {
+		c := &cards[i]
+		if c.Status != "todo" || len(c.OwnerFiles) == 0 {
+			continue
+		}
+		ca := taskcli.LaunchAssignment{Name: c.ID, Files: c.OwnerFiles, Status: c.Status}
+		conflict := false
+		for _, a := range active {
+			if _, _, ok := taskcli.IntersectingFiles(a, ca); ok {
+				conflict = true
+				break
+			}
+		}
+		if !conflict {
+			candidate = c
+			break
+		}
+	}
+	if candidate == nil {
+		return 0
+	}
+
+	q := github.NewPreflightGuard(cfg.counter).Check(ctx)
+	decision := taskcli.NewService(taskcli.Config{
+		TasksDir: tasksDir, StateDir: cfg.dir, Root: cfg.root,
+	}).AdmitLaunch(
+		taskcli.PreflightResult{Allowed: q.Allowed, Reason: q.Reason},
+		slotsUsed, slotsTotal,
+		append(active, taskcli.LaunchAssignment{
+			Name: candidate.ID, Files: candidate.OwnerFiles, Status: candidate.Status,
+		})...,
+	)
+	if !decision.Allowed {
+		observe.ActorError("auto-spawn-denied", candidate.ID, errors.New(decision.Reason))
+		return 0
+	}
+	if !sp.start(ctx, cfg, candidate.ID, candidate.Title) {
+		return 0
+	}
+	return 1
+}
+
+// autoSpawnStartSession creates the child session and sends the first prompt.
+// It reuses the spawn port and the same deterministic prompt options as the
+// beacon spawn command, so an auto-started agent follows the normal path.
+func autoSpawnStartSession(ctx context.Context, cfg reconcileConfig, cardID, title string) bool {
+	spawner := spawnSessionSpawner
+	if spawner == nil {
+		return false
+	}
+	parentID := orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)()
+	metadata := map[string]string{spawnMetaTaskID: cardID}
+	if title != "" {
+		metadata[spawnMetaTitle] = title
+	}
+	sessionID, err := spawner.CreateSession(parentID, "", title, metadata)
+	if err != nil || strings.TrimSpace(sessionID) == "" {
+		if err == nil {
+			err = errors.New("auto-spawn: empty session id")
+		}
+		observe.ActorError("auto-spawn-create", cardID, err)
+		return false
+	}
+	if err := spawner.PromptWithOptions(ctx, sessionID, spawnPrompt(cardID, title), opencode.StartPromptOptions(cardID)); err != nil {
+		observe.ActorError("auto-spawn-prompt", cardID, err)
+		return false
+	}
+	return true
+}
+
 // ReconcilePass runs one cycle: cibridge reads LiveWatches, derives verdicts
 // with domain.EvaluatePR, merges and wakes through the wired ports, the wake
 // ladder advances its due timers and escalation rungs, then the in-process
@@ -2041,6 +2162,9 @@ func reconcileMaintenance(ctx context.Context, cfg reconcileConfig) {
 func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 	started := time.Now()
 	runLadderPass(ctx, cfg)
+	if cfg.autoSpawn != nil {
+		reconcileAutoSpawn(ctx, cfg, cfg.autoSpawn)
+	}
 	if cfg.db == nil || cfg.batch == nil {
 		recordCycle(started, 0)
 		return 0
