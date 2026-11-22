@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -197,6 +198,8 @@ type HTTPDoer interface {
 // RemoteClient forwards tools/call to the Beacon server. It holds no watches,
 // no obligations and no store handle: the server owns all of that state.
 type RemoteClient struct {
+	// mu protects baseURL and token while a reconnect swaps the endpoint.
+	mu      sync.RWMutex
 	baseURL string
 	token   string
 	doer    HTTPDoer
@@ -220,19 +223,51 @@ func NewRemoteClient(ep RemoteEndpoint, doer HTTPDoer) (*RemoteClient, error) {
 	}, nil
 }
 
-// Connection returns the endpoint this client was built for.
+// Connection returns the endpoint this client currently uses.
 func (c *RemoteClient) Connection() RemoteEndpoint {
 	if c == nil {
 		return RemoteEndpoint{}
 	}
+	c.mu.RLock()
+	baseURL, token := c.baseURL, c.token
+	c.mu.RUnlock()
 	// The base URL is the only place the address is stored; parse it back so a
 	// caller can report the exact endpoint without keeping a second copy.
-	host, port, err := net.SplitHostPort(strings.TrimSuffix(strings.TrimPrefix(c.baseURL, "http://"), remoteMCPPath))
+	host, port, err := net.SplitHostPort(strings.TrimSuffix(strings.TrimPrefix(baseURL, "http://"), remoteMCPPath))
 	if err != nil {
-		return RemoteEndpoint{Token: c.token}
+		return RemoteEndpoint{Token: token}
 	}
 	n, _ := strconv.Atoi(port)
-	return RemoteEndpoint{Host: host, Port: n, Token: c.token}
+	return RemoteEndpoint{Host: host, Port: n, Token: token}
+}
+
+// ReloadEndpoint swaps the address and token used by CallTool. A validation
+// failure leaves the current endpoint in place, so a bad configuration cannot
+// break a client that was working. The doer and request counter stay the same.
+func (c *RemoteClient) ReloadEndpoint(ep RemoteEndpoint) error {
+	if c == nil {
+		return errors.New("mcp: nil remote client")
+	}
+	if err := ep.Validate(); err != nil {
+		return err
+	}
+	baseURL := "http://" + ep.Address() + remoteMCPPath
+	c.mu.Lock()
+	c.baseURL = baseURL
+	c.token = ep.Token
+	c.mu.Unlock()
+	return nil
+}
+
+// ReloadFrom reads <dir>/connection.json and installs it. This is the
+// reconnect path for the single remote endpoint: the process and the client
+// handle stay alive while the address changes.
+func (c *RemoteClient) ReloadFrom(dir string) error {
+	ep, err := LoadRemoteEndpoint(dir)
+	if err != nil {
+		return err
+	}
+	return c.ReloadEndpoint(ep)
 }
 
 type remoteRPCRequest struct {
@@ -265,6 +300,9 @@ func (c *RemoteClient) CallTool(ctx context.Context, name string, arguments, met
 	if strings.TrimSpace(name) == "" {
 		return mcpsdk.CallToolResult{}, errors.New("mcp: empty tool name")
 	}
+	c.mu.RLock()
+	baseURL, token := c.baseURL, c.token
+	c.mu.RUnlock()
 	params := map[string]any{"name": name}
 	if remoteValidRaw(arguments) {
 		params["arguments"] = arguments
@@ -282,13 +320,13 @@ func (c *RemoteClient) CallTool(ctx context.Context, name string, arguments, met
 		return mcpsdk.CallToolResult{}, fmt.Errorf("mcp: encode tools/call: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL, bytes.NewReader(payload))
 	if err != nil {
 		return mcpsdk.CallToolResult{}, fmt.Errorf("mcp: tools/call request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	if token := strings.TrimSpace(c.token); token != "" {
+	if token := strings.TrimSpace(token); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
@@ -548,4 +586,73 @@ func AttachMCPTools(s *mcpsdk.Server, client *RemoteClient, cfg LocalMCPConfig) 
 		return AttachInProcessTools(s, bridge)
 	}
 	return AttachRemoteTools(s, client)
+}
+
+// ---------------------------------------------------------------------------
+// CSx-06. Transport adapters for the opt-in MCP control tools.
+//
+// These three names are intentionally absent from remoteToolDescriptions and
+// remoteInputSchemaFactories: TestRemoteContractCoversEveryTool pins those maps
+// to the advertised ToolNames. A separate attach path keeps the control tools
+// opt-in and leaves the byte-pinned tools/list contract untouched.
+// ---------------------------------------------------------------------------
+
+func derivedInputSchema[T any]() *jsonschema.Schema {
+	s, err := jsonschema.For[T](nil)
+	if err != nil || s == nil || s.Type != "object" {
+		return &jsonschema.Schema{Type: "object"}
+	}
+	return s
+}
+
+func mcpControlInputSchema(name string) *jsonschema.Schema {
+	switch name {
+	case MCPStatusToolName:
+		return derivedInputSchema[MCPStatusInput]()
+	case MCPReconnectToolName:
+		return derivedInputSchema[MCPServerNameInput]()
+	case MCPToggleToolName:
+		return derivedInputSchema[MCPToggleInput]()
+	default:
+		return &jsonschema.Schema{Type: "object"}
+	}
+}
+
+func attachMCPControlTransports(s *mcpsdk.Server, handlerFor func(string) mcpsdk.ToolHandler) error {
+	if s == nil {
+		return errors.New("mcp: nil server")
+	}
+	for _, name := range mcpControlToolNames {
+		annotations := mcpControlToolAnnotations[name]
+		s.RemoveTools(name)
+		s.AddTool(&mcpsdk.Tool{
+			Name:         name,
+			Description:  mcpControlToolDescriptions[name],
+			InputSchema:  mcpControlInputSchema(name),
+			OutputSchema: mcpControlOutputSchema(name),
+			Annotations:  &annotations,
+		}, handlerFor(name))
+	}
+	return nil
+}
+
+// AttachRemoteMCPStatusTools forwards the three opt-in control tools to a
+// remote Beacon server. It never touches the advertised tool set.
+func AttachRemoteMCPStatusTools(s *mcpsdk.Server, client *RemoteClient) error {
+	if client == nil {
+		return errors.New("mcp: nil remote client")
+	}
+	return attachMCPControlTransports(s, func(name string) mcpsdk.ToolHandler {
+		return remoteToolHandler(client, name)
+	})
+}
+
+// AttachInProcessMCPStatusTools serves the same three names over a local bridge.
+func AttachInProcessMCPStatusTools(s *mcpsdk.Server, bridge *InProcessBridge) error {
+	if bridge == nil {
+		return errors.New("mcp: nil in-process bridge")
+	}
+	return attachMCPControlTransports(s, func(name string) mcpsdk.ToolHandler {
+		return inProcessToolHandler(bridge, name)
+	})
 }

@@ -1084,3 +1084,377 @@ func RunWithDeps(ctx context.Context, deps Dependencies) error {
 func Run(ctx context.Context) error {
 	return RunWithDeps(ctx, Dependencies{})
 }
+
+// ---------------------------------------------------------------------------
+// CSx-06. MCP connection introspection and live server switching.
+//
+// The Claude Agent SDK reports McpServerStatus with name, error and tools and
+// exposes reconnect and toggle control calls (types.py:1023-1060,
+// client.py:395-417 and 471-502 of anthropics/claude-agent-sdk-python at
+// 3184360). Beacon keeps that shape behind three opt-in tools. The names stay
+// out of toolDescriptors: the advertised tools/list is byte-pinned, so a
+// composition root that needs introspection attaches these tools by an explicit
+// call. Without that call the contract is unchanged.
+// ---------------------------------------------------------------------------
+
+// MCP status values mirror the SDK status set. They are plain strings because
+// the status tool reports them at the MCP boundary, not inside the domain.
+const (
+	MCPStatusConnected = "connected"
+	MCPStatusFailed    = "failed"
+	MCPStatusNeedsAuth = "needs-auth"
+	MCPStatusPending   = "pending"
+	MCPStatusDisabled  = "disabled"
+)
+
+// Names of the three opt-in control tools. Keeping them as constants makes the
+// local, remote and in-process attach paths use the same names.
+const (
+	MCPStatusToolName    = "get_mcp_status"
+	MCPReconnectToolName = "reconnect_mcp"
+	MCPToggleToolName    = "toggle_mcp"
+)
+
+// mcpControlToolNames is the ordered set the three attach paths register.
+var mcpControlToolNames = []string{MCPStatusToolName, MCPReconnectToolName, MCPToggleToolName}
+
+// MCPServerState is one row of the MCP status snapshot. Error is always
+// present so a client can distinguish a healthy server from a failed one
+// without special handling for a missing field.
+type MCPServerState struct {
+	Name   string   `json:"name"`
+	Status string   `json:"status"`
+	Error  string   `json:"error"`
+	Tools  []string `json:"tools"`
+}
+
+// MCPServerOptions carries the initial state of a registered MCP server.
+// Restore re-adds this server's tools after a reconnect; a nil value means the
+// caller manages tool re-registration itself.
+type MCPServerOptions struct {
+	Status  string
+	Error   string
+	Restore func(*mcpsdk.Server)
+}
+
+type mcpServerEntry struct {
+	state   MCPServerState
+	restore func(*mcpsdk.Server)
+}
+
+// MCPServerRegistry is the single owner of MCP connection state in the
+// process. The status tool projects it and the two control tools mutate only
+// through its methods, so no state is kept in a handler or a package global.
+type MCPServerRegistry struct {
+	mu      sync.RWMutex
+	order   []string
+	servers map[string]*mcpServerEntry
+}
+
+// NewMCPServerRegistry builds an empty registry.
+func NewMCPServerRegistry() *MCPServerRegistry {
+	return &MCPServerRegistry{servers: make(map[string]*mcpServerEntry)}
+}
+
+// Register adds a server or updates its metadata. The first registration fixes
+// the order used by Snapshot; a later one only changes the state. Tools are
+// cloned so a caller cannot change the snapshot by editing its input slice.
+func (r *MCPServerRegistry) Register(name string, tools []string, opts MCPServerOptions) error {
+	if r == nil {
+		return errors.New("mcp: nil MCP server registry")
+	}
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return errors.New("mcp: empty MCP server name")
+	}
+	status := strings.TrimSpace(opts.Status)
+	if status == "" {
+		status = MCPStatusPending
+	}
+	entry := &mcpServerEntry{
+		state: MCPServerState{
+			Name:   trimmed,
+			Status: status,
+			Error:  opts.Error,
+			Tools:  append([]string(nil), tools...),
+		},
+		restore: opts.Restore,
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.servers == nil {
+		r.servers = make(map[string]*mcpServerEntry)
+	}
+	if _, exists := r.servers[trimmed]; !exists {
+		r.order = append(r.order, trimmed)
+	}
+	r.servers[trimmed] = entry
+	return nil
+}
+
+// Snapshot returns a fresh copy of every server state in registration order.
+func (r *MCPServerRegistry) Snapshot() []MCPServerState {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]MCPServerState, 0, len(r.order))
+	for _, name := range r.order {
+		entry := r.servers[name]
+		if entry == nil {
+			continue
+		}
+		row := entry.state
+		row.Tools = append([]string(nil), entry.state.Tools...)
+		out = append(out, row)
+	}
+	return out
+}
+
+// StateOf returns a copy of one server state. Unknown names report false.
+func (r *MCPServerRegistry) StateOf(name string) (MCPServerState, bool) {
+	if r == nil {
+		return MCPServerState{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry := r.servers[strings.TrimSpace(name)]
+	if entry == nil {
+		return MCPServerState{}, false
+	}
+	row := entry.state
+	row.Tools = append([]string(nil), entry.state.Tools...)
+	return row, true
+}
+
+// SetStatus updates one server. It never creates one: a control call must name
+// a server that was registered first.
+func (r *MCPServerRegistry) SetStatus(name, status, errText string) error {
+	if r == nil {
+		return errors.New("mcp: nil MCP server registry")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry := r.servers[strings.TrimSpace(name)]
+	if entry == nil {
+		return fmt.Errorf("mcp: unknown MCP server %q", name)
+	}
+	entry.state.Status = status
+	entry.state.Error = errText
+	return nil
+}
+
+func (r *MCPServerRegistry) restoreOf(name string) func(*mcpsdk.Server) {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry := r.servers[strings.TrimSpace(name)]
+	if entry == nil {
+		return nil
+	}
+	return entry.restore
+}
+
+// MCPControl binds the registry to the server whose tools a disconnect removes
+// and a reconnect restores. A nil Server keeps the status and state operations
+// but skips tool-list changes, so a caller can use the status tool alone.
+type MCPControl struct {
+	Server   *mcpsdk.Server
+	Registry *MCPServerRegistry
+}
+
+// NewMCPControl builds a control handle with a real registry.
+func NewMCPControl(s *mcpsdk.Server, registry *MCPServerRegistry) *MCPControl {
+	if registry == nil {
+		registry = NewMCPServerRegistry()
+	}
+	return &MCPControl{Server: s, Registry: registry}
+}
+
+// MCPStatusInput takes no arguments; every configured server is reported.
+type MCPStatusInput struct{}
+
+// MCPStatusOutput is the response of get_mcp_status.
+type MCPStatusOutput struct {
+	Servers []MCPServerState `json:"servers"`
+	Total   int              `json:"total"`
+}
+
+// MCPServerNameInput names one server for reconnect_mcp.
+type MCPServerNameInput struct {
+	Name string `json:"name" jsonschema:"name of the MCP server"`
+}
+
+// MCPReconnectOutput reports the state after a reconnect.
+type MCPReconnectOutput struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Tools  int    `json:"tools"`
+}
+
+// MCPToggleInput drives toggle_mcp. Enabled false disconnects the server; true
+// connects or reconnects it.
+type MCPToggleInput struct {
+	Name    string `json:"name" jsonschema:"name of the MCP server"`
+	Enabled bool   `json:"enabled" jsonschema:"true to connect, false to disconnect"`
+}
+
+// MCPToggleOutput reports the state after a toggle. Changed is false for a
+// repeated disconnect or connect, which makes the operation idempotent.
+type MCPToggleOutput struct {
+	Name    string `json:"name"`
+	Status  string `json:"status"`
+	Changed bool   `json:"changed"`
+}
+
+type mcpStatusHandler struct{ control *MCPControl }
+
+func (h *mcpStatusHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, _ MCPStatusInput) (*mcpsdk.CallToolResult, MCPStatusOutput, error) {
+	if h == nil || h.control == nil || h.control.Registry == nil {
+		return nil, MCPStatusOutput{}, errors.New("mcp: nil MCP control registry")
+	}
+	servers := h.control.Registry.Snapshot()
+	return nil, MCPStatusOutput{Servers: servers, Total: len(servers)}, nil
+}
+
+type mcpReconnectHandler struct{ control *MCPControl }
+
+func (h *mcpReconnectHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, in MCPServerNameInput) (*mcpsdk.CallToolResult, MCPReconnectOutput, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return nil, MCPReconnectOutput{}, domain.NewAppError(domain.CodeInvalidInput, "reconnect_mcp: name is required")
+	}
+	if h == nil || h.control == nil || h.control.Registry == nil {
+		return nil, MCPReconnectOutput{}, errors.New("mcp: nil MCP control registry")
+	}
+	state, ok := h.control.Registry.StateOf(name)
+	if !ok {
+		return nil, MCPReconnectOutput{}, domain.NewAppError(domain.CodeInvalidInput, "reconnect_mcp: unknown server "+name)
+	}
+	if h.control.Server != nil {
+		if restore := h.control.Registry.restoreOf(name); restore != nil {
+			restore(h.control.Server)
+		}
+	}
+	if err := h.control.Registry.SetStatus(name, MCPStatusConnected, ""); err != nil {
+		return nil, MCPReconnectOutput{}, err
+	}
+	return nil, MCPReconnectOutput{Name: name, Status: MCPStatusConnected, Tools: len(state.Tools)}, nil
+}
+
+type mcpToggleHandler struct{ control *MCPControl }
+
+func (h *mcpToggleHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, in MCPToggleInput) (*mcpsdk.CallToolResult, MCPToggleOutput, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return nil, MCPToggleOutput{}, domain.NewAppError(domain.CodeInvalidInput, "toggle_mcp: name is required")
+	}
+	if h == nil || h.control == nil || h.control.Registry == nil {
+		return nil, MCPToggleOutput{}, errors.New("mcp: nil MCP control registry")
+	}
+	state, ok := h.control.Registry.StateOf(name)
+	if !ok {
+		return nil, MCPToggleOutput{}, domain.NewAppError(domain.CodeInvalidInput, "toggle_mcp: unknown server "+name)
+	}
+	if in.Enabled {
+		if h.control.Server != nil {
+			if restore := h.control.Registry.restoreOf(name); restore != nil {
+				restore(h.control.Server)
+			}
+		}
+		if err := h.control.Registry.SetStatus(name, MCPStatusConnected, ""); err != nil {
+			return nil, MCPToggleOutput{}, err
+		}
+		return nil, MCPToggleOutput{Name: name, Status: MCPStatusConnected, Changed: state.Status != MCPStatusConnected}, nil
+	}
+	// A second disconnect changes nothing and still succeeds, so a client can
+	// retry the call without tracking whether it already went through.
+	changed := state.Status != MCPStatusDisabled
+	if h.control.Server != nil && len(state.Tools) > 0 {
+		h.control.Server.RemoveTools(state.Tools...)
+	}
+	if err := h.control.Registry.SetStatus(name, MCPStatusDisabled, ""); err != nil {
+		return nil, MCPToggleOutput{}, err
+	}
+	return nil, MCPToggleOutput{Name: name, Status: MCPStatusDisabled, Changed: changed}, nil
+}
+
+// mcpControlToolAnnotations keeps the opt-in tools out of toolAnnotations,
+// which the byte-pinned advertised set derives from.
+var mcpControlToolAnnotations = map[string]mcpsdk.ToolAnnotations{
+	MCPStatusToolName:    {ReadOnlyHint: true, DestructiveHint: boolPtr(false), IdempotentHint: true},
+	MCPReconnectToolName: {DestructiveHint: boolPtr(false), IdempotentHint: true},
+	MCPToggleToolName:    {DestructiveHint: boolPtr(true), IdempotentHint: true},
+}
+
+// mcpControlToolDescriptions is shared by the local, remote and in-process
+// attach paths so one name has the same description on every transport.
+var mcpControlToolDescriptions = map[string]string{
+	MCPStatusToolName:    "Return every configured MCP server with name, status, error and tools.",
+	MCPReconnectToolName: "Reconnect one MCP server without restarting the process.",
+	MCPToggleToolName:    "Enable or disconnect one MCP server without restarting the process.",
+}
+
+// derivedOutputSchema converts a Go output type into an explicit schema. A
+// derivation failure falls back to a permissive object so the real tool is
+// registered instead of leaving the name uncallable.
+func derivedOutputSchema[T any]() *jsonschema.Schema {
+	s, err := OutputSchema[T]()
+	if err != nil || s == nil {
+		return &jsonschema.Schema{Type: "object"}
+	}
+	return s
+}
+
+func mcpControlOutputSchema(name string) *jsonschema.Schema {
+	switch name {
+	case MCPStatusToolName:
+		return derivedOutputSchema[MCPStatusOutput]()
+	case MCPReconnectToolName:
+		return derivedOutputSchema[MCPReconnectOutput]()
+	case MCPToggleToolName:
+		return derivedOutputSchema[MCPToggleOutput]()
+	default:
+		return &jsonschema.Schema{Type: "object"}
+	}
+}
+
+// AttachMCPStatusTools installs the three opt-in introspection tools on s. The
+// call is idempotent: each name is removed before it is added again.
+func AttachMCPStatusTools(s *mcpsdk.Server, control *MCPControl) error {
+	if s == nil {
+		return errors.New("mcp: nil server")
+	}
+	if control == nil {
+		return errors.New("mcp: nil MCP control")
+	}
+	statusAnnotations := mcpControlToolAnnotations[MCPStatusToolName]
+	reconnectAnnotations := mcpControlToolAnnotations[MCPReconnectToolName]
+	toggleAnnotations := mcpControlToolAnnotations[MCPToggleToolName]
+
+	s.RemoveTools(MCPStatusToolName)
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:         MCPStatusToolName,
+		Description:  mcpControlToolDescriptions[MCPStatusToolName],
+		OutputSchema: mcpControlOutputSchema(MCPStatusToolName),
+		Annotations:  &statusAnnotations,
+	}, (&mcpStatusHandler{control: control}).Handle)
+	s.RemoveTools(MCPReconnectToolName)
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:         MCPReconnectToolName,
+		Description:  mcpControlToolDescriptions[MCPReconnectToolName],
+		OutputSchema: mcpControlOutputSchema(MCPReconnectToolName),
+		Annotations:  &reconnectAnnotations,
+	}, (&mcpReconnectHandler{control: control}).Handle)
+	s.RemoveTools(MCPToggleToolName)
+	mcpsdk.AddTool(s, &mcpsdk.Tool{
+		Name:         MCPToggleToolName,
+		Description:  mcpControlToolDescriptions[MCPToggleToolName],
+		OutputSchema: mcpControlOutputSchema(MCPToggleToolName),
+		Annotations:  &toggleAnnotations,
+	}, (&mcpToggleHandler{control: control}).Handle)
+	return nil
+}
