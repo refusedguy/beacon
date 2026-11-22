@@ -220,13 +220,18 @@ func (c *CLI) checkStateDir() checkResult {
 	return checkResult{"state", "OK", path}
 }
 
-// findGates prefers an explicit path, then PATH, then the built binary in the
-// module tree. T0.5 owns the tools/beacon-gates directory.
+// doctorGatesEnv is a developer-tool override for `beacon doctor` only. No
+// daemon, MCP tool or CI path reads it, so it is not a production setting.
+// Operators can rely on PATH or the built binary in tools/beacon-gates.
+const doctorGatesEnv = "BEACON_GATES"
+
+// findGates prefers an explicit developer override, then PATH, then the built
+// binary in the module tree. T0.5 owns the tools/beacon-gates directory.
 func findGates(root string) (string, error) {
-	if path := os.Getenv("BEACON_GATES"); path != "" {
+	if path := os.Getenv(doctorGatesEnv); path != "" {
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
-			return "", fmt.Errorf("BEACON_GATES=%s: файл не найден", path)
+			return "", fmt.Errorf("%s=%s: файл не найден", doctorGatesEnv, path)
 		}
 		return path, nil
 	}
