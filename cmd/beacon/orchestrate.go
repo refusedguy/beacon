@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -255,6 +256,10 @@ func runOrchestrate(c *CLI, args []string) int {
 	if !parseFormatFlag(*format, "beacon orchestrate: неизвестный формат %q, ожидается table или json\n", c.errOut, true) {
 		return 2
 	}
+
+	// CCx-08: remove stale config rules once and leave a no-clobber marker.
+	// A migration error is reported but never fails the orchestration pass.
+	runConfigMigration(c)
 
 	deps, closeStore, err := makeOrchestratorDeps(c)
 	if err != nil {
@@ -912,4 +917,190 @@ func verifySkillsLock(root string) ([]skillsLockFinding, error) {
 		}
 	}
 	return findings, nil
+}
+
+// ---------------------------------------------------------------------------
+// One-time config rule migration (CCx-08)
+// ---------------------------------------------------------------------------
+
+const (
+	configMigrationVersion = 1
+	configMigrationMarker  = ".config-migration"
+	configMigrationRules   = "config-rules.json"
+)
+
+// configRule is one record of the rules document. Deprecated records are
+// removed by the one-time migration.
+type configRule struct {
+	Name       string `json:"name"`
+	Deprecated bool   `json:"deprecated,omitempty"`
+}
+
+type configRules struct {
+	Version int          `json:"version"`
+	Rules   []configRule `json:"rules"`
+}
+
+// configMigrationResult reports the two observable effects of one pass. Both
+// fields stay false when the marker is already present.
+type configMigrationResult struct {
+	RulesCleaned  bool
+	MarkerCreated bool
+}
+
+// File-system seams keep the forbidden os calls out of cmd/beacon (ADR 0005)
+// and let tests simulate a second process or a failed write.
+var (
+	configMigrationReadFile = func(path string) ([]byte, error) {
+		return fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	}
+	configMigrationStat       = os.Stat
+	configMigrationCreateTemp = os.CreateTemp
+	configMigrationRename     = os.Rename
+	configMigrationLink       = os.Link
+	configMigrationRemove     = os.Remove
+)
+
+// configMarkerPresent reports whether the one-time marker already exists.
+func configMarkerPresent(dir string) (bool, error) {
+	_, err := configMigrationStat(filepath.Join(dir, configMigrationMarker))
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// cleanConfigRules drops deprecated records. When nothing is stale it returns
+// the original bytes, so the config check keeps its read-only reporting mode.
+func cleanConfigRules(raw []byte) ([]byte, bool, error) {
+	var doc configRules
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, false, fmt.Errorf("некорректный JSON правил: %w", err)
+	}
+	kept := doc.Rules[:0]
+	removed := 0
+	for _, rule := range doc.Rules {
+		if rule.Deprecated {
+			removed++
+			continue
+		}
+		kept = append(kept, rule)
+	}
+	if removed == 0 {
+		return raw, false, nil
+	}
+	doc.Rules = kept
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(out, '\n'), true, nil
+}
+
+// writeConfigMigrationTemp writes data to a fresh temp file in dir. The caller
+// links or renames the returned path, then removes it.
+func writeConfigMigrationTemp(dir string, data []byte) (string, error) {
+	f, err := configMigrationCreateTemp(dir, ".config-migration-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = configMigrationRemove(name)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = configMigrationRemove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+// replaceConfigRules publishes cleaned rules through a temp file and an atomic
+// rename, so a reader never sees a half-written document.
+func replaceConfigRules(path string, data []byte) error {
+	tmp, err := writeConfigMigrationTemp(filepath.Dir(path), data)
+	if err != nil {
+		return err
+	}
+	if err := configMigrationRename(tmp, path); err != nil {
+		_ = configMigrationRemove(tmp)
+		return err
+	}
+	return nil
+}
+
+// writeConfigMarker creates the marker with no-clobber semantics. A process
+// that loses the race gets fs.ErrExist and reports MarkerCreated=false, which
+// the caller treats as success.
+func writeConfigMarker(path string) (bool, error) {
+	content := []byte(fmt.Sprintf("version=%d\n", configMigrationVersion))
+	tmp, err := writeConfigMigrationTemp(filepath.Dir(path), content)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = configMigrationRemove(tmp) }()
+	if err := configMigrationLink(tmp, path); err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// migrateConfigOnce removes stale rules one time and records the pass with a
+// no-clobber marker in dir. The rules file stays byte-identical when it has no
+// stale entries. A second process that observes the marker exits without
+// touching either file.
+func migrateConfigOnce(dir string) (configMigrationResult, error) {
+	present, err := configMarkerPresent(dir)
+	if err != nil {
+		return configMigrationResult{}, err
+	}
+	if present {
+		return configMigrationResult{}, nil
+	}
+
+	rulesPath := filepath.Join(dir, configMigrationRules)
+	var changed bool
+	raw, err := configMigrationReadFile(rulesPath)
+	if err == nil {
+		cleaned, didChange, cleanErr := cleanConfigRules(raw)
+		if cleanErr != nil {
+			return configMigrationResult{}, cleanErr
+		}
+		if didChange {
+			if err := replaceConfigRules(rulesPath, cleaned); err != nil {
+				return configMigrationResult{}, err
+			}
+			changed = true
+		}
+	} else if !os.IsNotExist(err) {
+		return configMigrationResult{}, err
+	}
+
+	created, err := writeConfigMarker(filepath.Join(dir, configMigrationMarker))
+	if err != nil {
+		return configMigrationResult{}, err
+	}
+	return configMigrationResult{RulesCleaned: changed, MarkerCreated: created}, nil
+}
+
+// runConfigMigration applies the one-time migration before an orchestration
+// pass. A failure is reported but does not stop the pass: the config check
+// keeps its read-only reporting mode (CCx-08).
+func runConfigMigration(c *CLI) {
+	dir, err := stateDir()
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon orchestrate: config migration: %v\n", err)
+		return
+	}
+	if _, err := migrateConfigOnce(dir); err != nil {
+		fmt.Fprintf(c.errOut, "beacon orchestrate: config migration: %v\n", err)
+	}
 }
