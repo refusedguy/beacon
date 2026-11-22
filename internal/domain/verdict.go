@@ -7,6 +7,7 @@ package domain
 
 import (
 	"path"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -669,9 +670,15 @@ func proofForPhase(proofs []Proof, phaseID string) (Proof, bool) {
 // an external verifier ran outside the agent. ExitCode is the process exit
 // code: 0 means pass, any other value means fail. The agent's own account of
 // its work is never an input, so it cannot supply or change the exit code.
+// Log is the check output the adapter captured. When the adapter supplies a
+// log, EvaluateExternal requires a suite-run marker in it, so a process that
+// exited 0 without running a test cannot pass. A check without a log keeps
+// the legacy exit-code decision, which lets adapters that do not capture a
+// log keep working.
 type ExternalCheck struct {
 	Name     string
 	ExitCode int
+	Log      string
 }
 
 // ExternalVerdict is the decision of the external verification gate. It is a
@@ -689,15 +696,22 @@ const (
 	ExternalFail ExternalVerdict = "FAIL"
 )
 
+// ExternalReasonNoTestsRan is the CheckOutcome reason for a check that exited
+// 0 without a suite-run marker in its log. A passing check has an empty
+// reason, so the on-disk JSON of an ordinary run keeps its original shape.
+const ExternalReasonNoTestsRan = "no_tests_ran"
+
 // CheckOutcome is one declared check in the on-disk evidence. Observed is
 // false when the external verifier produced no exit code for the check, so a
 // missing run stays visible on disk and never passes. Passed is true only for
-// an observed check with exit code 0.
+// an observed check with exit code 0 and, when a log was supplied, a suite-run
+// marker. Reason is empty except when a check with exit code 0 ran no tests.
 type CheckOutcome struct {
 	Name     string `json:"name"`
 	ExitCode int    `json:"exit_code"`
 	Observed bool   `json:"observed"`
 	Passed   bool   `json:"passed"`
+	Reason   string `json:"reason,omitempty"`
 }
 
 // ExternalEvidence is the record an adapter writes to disk after the external
@@ -711,6 +725,49 @@ type ExternalEvidence struct {
 	Checks  []CheckOutcome  `json:"checks"`
 }
 
+// suiteRunMarkers are the positive signals that a test runner executed. The
+// list mirrors SUITE_RAN in SWE-bench and adds the "passed" and "Ran N tests"
+// forms used by pytest and unittest. Every count must be non-zero: a runner
+// that starts and immediately loses its browser still prints a summary such
+// as "Executed 0 of 0", and reading a zero count as evidence would turn a
+// suite that never ran into a clean run.
+var suiteRunMarkers = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)Executed [1-9][0-9]* of [0-9]+`),
+	regexp.MustCompile(`(?m)TOTAL: [1-9][0-9]* (?:SUCCESS|FAILED)`),
+	regexp.MustCompile(`(?m)[1-9][0-9]* passing`),
+	regexp.MustCompile(`(?m)[1-9][0-9]* passed`),
+	regexp.MustCompile(`(?m)Tests:\s+[1-9][0-9]*`),
+	regexp.MustCompile(`(?m)Test Suites:\s+(?:[0-9]+ \w+, )*[1-9][0-9]* total`),
+	regexp.MustCompile(`(?m)^# tests [1-9][0-9]*`),
+	regexp.MustCompile(`(?m)^Ran [1-9][0-9]* tests?`),
+	regexp.MustCompile(`(?m)[1-9][0-9]* specs?, [0-9]+ failures?`),
+	regexp.MustCompile(`(?m)': ok$`),
+}
+
+// SuiteRan reports whether a check log carries evidence that a test runner
+// actually executed tests. An empty log reports no run. The function is pure
+// and uses only the log string, so it cannot be swayed by an agent's claim
+// about its work. Adapters may call it before writing evidence, and
+// EvaluateExternal calls it on the log the adapter supplied.
+func SuiteRan(log string) bool {
+	if log == "" {
+		return false
+	}
+	for _, marker := range suiteRunMarkers {
+		if marker.MatchString(log) {
+			return true
+		}
+	}
+	return false
+}
+
+// observedExternalCheck keeps the first observation of a declared check. The
+// log travels with the exit code so the decision uses one consistent record.
+type observedExternalCheck struct {
+	exitCode int
+	log      string
+}
+
 // EvaluateExternal computes the external verdict and its evidence from the
 // checks Beacon declared and the exit codes an external verifier observed. It
 // is pure: it runs no process, reads no clock and writes no file. An adapter
@@ -720,11 +777,14 @@ type ExternalEvidence struct {
 // The gate fails closed. An empty declaration never passes, because an empty
 // panel is not a clean run. Every declared check must have an observed exit
 // code of 0; a missing observation or any non-zero exit code fails the gate.
-// Only declared names and observed exit codes enter the decision, so an
-// agent's own claim about its work cannot move the verdict. Evidence keeps
-// the declaration order and drops duplicate names; when a check is observed
-// more than once the first exit code wins, and observations for checks that
-// were not declared are ignored.
+// When the adapter supplies a log, exit code 0 is not enough: the log must
+// also carry a suite-run marker, or the check fails with reason no_tests_ran.
+// A check with no log keeps the exit-code decision so existing adapters do
+// not need to change. Only declared names, observed exit codes and adapter
+// logs enter the decision, so an agent's own claim about its work cannot move
+// the verdict. Evidence keeps the declaration order and drops duplicate
+// names; when a check is observed more than once the first observation wins,
+// and observations for checks that were not declared are ignored.
 func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvidence {
 	evidence := ExternalEvidence{
 		Verdict: ExternalFail,
@@ -734,10 +794,10 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 		return evidence
 	}
 
-	exitBy := make(map[string]int, len(observed))
+	observedBy := make(map[string]observedExternalCheck, len(observed))
 	for _, c := range observed {
-		if _, ok := exitBy[c.Name]; !ok {
-			exitBy[c.Name] = c.ExitCode
+		if _, ok := observedBy[c.Name]; !ok {
+			observedBy[c.Name] = observedExternalCheck{exitCode: c.ExitCode, log: c.Log}
 		}
 	}
 
@@ -754,12 +814,18 @@ func EvaluateExternal(declared []string, observed []ExternalCheck) ExternalEvide
 			continue
 		}
 		seen[name] = true
-		exit, ok := exitBy[name]
+		obs, ok := observedBy[name]
 		outcome := CheckOutcome{
 			Name:     name,
-			ExitCode: exit,
+			ExitCode: obs.exitCode,
 			Observed: ok,
-			Passed:   ok && exit == 0,
+			Passed:   ok && obs.exitCode == 0,
+		}
+		// A logged check with exit 0 but no suite-run marker did not run
+		// its tests. Fail it with a reason the reviewer can see on disk.
+		if outcome.Passed && obs.log != "" && !SuiteRan(obs.log) {
+			outcome.Passed = false
+			outcome.Reason = ExternalReasonNoTestsRan
 		}
 		evidence.Checks = append(evidence.Checks, outcome)
 		if !outcome.Passed {
