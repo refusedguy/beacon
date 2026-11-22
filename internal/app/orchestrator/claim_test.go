@@ -2,8 +2,53 @@ package orchestrator
 
 import (
 	"errors"
+	"sync"
 	"testing"
 )
+
+// memGenerationStore is a test store whose state lives outside the ledger, so
+// dropping one ledger and building another from the same store models a process
+// restart. The mutex keeps the fake safe for the ledger's own locking.
+type memGenerationStore struct {
+	mu      sync.Mutex
+	state   GenerationState
+	loadErr error
+	saveErr error
+}
+
+func (s *memGenerationStore) Load() (GenerationState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return GenerationState{}, s.loadErr
+	}
+	return cloneGenerationState(s.state), nil
+}
+
+func (s *memGenerationStore) Save(state GenerationState) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	s.state = cloneGenerationState(state)
+	return nil
+}
+
+func cloneGenerationState(in GenerationState) GenerationState {
+	out := GenerationState{
+		Seq:    in.Seq,
+		Rows:   make(map[string]ClaimRow, len(in.Rows)),
+		Owners: make(map[string]Generation, len(in.Owners)),
+	}
+	for taskID, row := range in.Rows {
+		out.Rows[taskID] = row
+	}
+	for ownerID, generation := range in.Owners {
+		out.Owners[ownerID] = generation
+	}
+	return out
+}
 
 // TestClaimGenerationResolveRotatesAndStalesOldClaim is the acceptance check
 // for T3.457: a blocked:resolved must change the row's generation and make the
@@ -146,5 +191,129 @@ func TestClaimGenerationSnapshotIsCopy(t *testing.T) {
 	current, _ := ledger.Snapshot("watch:D1")
 	if current.Status != row.Status || current.ClaimedBy != row.ClaimedBy {
 		t.Fatalf("ledger mutated through snapshot: %+v", current)
+	}
+}
+
+// TestClaimGenerationSurvivesReopen is the INTG-02 acceptance check. It proves
+// a ledger rebuilt from a store restores its state, that a rotation performed
+// after the reopen invalidates a generation issued before it, and that the
+// rotation itself is persisted for the next reopen.
+func TestClaimGenerationSurvivesReopen(t *testing.T) {
+	store := &memGenerationStore{}
+	first, err := NewClaimGenerationWithStore(store)
+	if err != nil {
+		t.Fatalf("new ledger: %v", err)
+	}
+	row, err := first.EnterInProgress("watch:R1", "owner-A")
+	if err != nil {
+		t.Fatalf("enter in_progress: %v", err)
+	}
+	issued := row.Generation
+	if issued == "" {
+		t.Fatal("no generation issued")
+	}
+
+	// Reopen from the same store and discard the old ledger. This is the
+	// restart the audit found missing: state must come back, not reset.
+	second, err := NewClaimGenerationWithStore(store)
+	if err != nil {
+		t.Fatalf("reopen ledger: %v", err)
+	}
+	if got := second.GenerationFor("owner-A"); got != issued {
+		t.Fatalf("owner generation after reopen = %q, want %q", got, issued)
+	}
+	restored, ok := second.Snapshot("watch:R1")
+	if !ok || restored.Generation != issued || restored.Status != ClaimInProgress {
+		t.Fatalf("row after reopen = %+v, want in_progress at %q", restored, issued)
+	}
+	if _, err := second.Claim("watch:R1", issued); err != nil {
+		t.Fatalf("restored live claim: %v", err)
+	}
+
+	// Rotate after the reopen. The generation issued before the recreate is no
+	// longer accepted, and the row returns to pending at the fresh generation.
+	rotated, applied := second.ResolveBlocked("watch:R1")
+	if !applied || rotated == "" || rotated == issued {
+		t.Fatalf("rotation after reopen = %q/%v, want a fresh generation", rotated, applied)
+	}
+	if _, err := second.Claim("watch:R1", issued); !IsStaleClaim(err) {
+		t.Fatalf("pre-restart generation accepted after rotation: %v", err)
+	}
+	if second.Valid("watch:R1", issued) {
+		t.Fatal("pre-restart generation still valid after rotation")
+	}
+	pending, _ := second.Snapshot("watch:R1")
+	if pending.Status != ClaimPending || pending.ClaimedBy != "" || pending.Generation != rotated {
+		t.Fatalf("row after rotation = %+v, want pending at %q", pending, rotated)
+	}
+
+	// A third reopen must see the rotation, so durability is not just in memory.
+	third, err := NewClaimGenerationWithStore(store)
+	if err != nil {
+		t.Fatalf("second reopen: %v", err)
+	}
+	if _, err := third.Claim("watch:R1", issued); !IsStaleClaim(err) {
+		t.Fatalf("pre-restart generation accepted after second reopen: %v", err)
+	}
+	if got := third.GenerationFor("owner-A"); got != rotated {
+		t.Fatalf("owner generation after second reopen = %q, want %q", got, rotated)
+	}
+}
+
+// TestClaimGenerationNoDoubleRotationAfterReopen proves ResolveBlocked stays
+// idempotent across a reopen: a pending row is left alone and the owner's
+// generation is not rotated a second time.
+func TestClaimGenerationNoDoubleRotationAfterReopen(t *testing.T) {
+	store := &memGenerationStore{}
+	first, err := NewClaimGenerationWithStore(store)
+	if err != nil {
+		t.Fatalf("new ledger: %v", err)
+	}
+	if _, err := first.EnterInProgress("watch:R2", "owner-B"); err != nil {
+		t.Fatalf("enter in_progress: %v", err)
+	}
+	rotated, applied := first.ResolveBlocked("watch:R2")
+	if !applied || rotated == "" {
+		t.Fatalf("first resolve = %q/%v", rotated, applied)
+	}
+
+	reopened, err := NewClaimGenerationWithStore(store)
+	if err != nil {
+		t.Fatalf("reopen ledger: %v", err)
+	}
+	again, reapplied := reopened.ResolveBlocked("watch:R2")
+	if reapplied || again != "" {
+		t.Fatalf("repeat resolve after reopen = %q/%v, want no-op", again, reapplied)
+	}
+	row, _ := reopened.Snapshot("watch:R2")
+	if row.Generation != rotated || row.Status != ClaimPending {
+		t.Fatalf("repeat resolve moved row: %+v, want pending at %q", row, rotated)
+	}
+	if got := reopened.GenerationFor("owner-B"); got != rotated {
+		t.Fatalf("repeat rotate changed owner generation: %q, want %q", got, rotated)
+	}
+}
+
+// TestClaimGenerationWithStoreLoadError proves a broken store fails the
+// constructor instead of quietly starting with an empty ledger.
+func TestClaimGenerationWithStoreLoadError(t *testing.T) {
+	store := &memGenerationStore{loadErr: errors.New("disk gone")}
+	ledger, err := NewClaimGenerationWithStore(store)
+	if err == nil || ledger != nil {
+		t.Fatalf("new ledger with failing store = %v/%v, want error", ledger, err)
+	}
+}
+
+// TestClaimGenerationSaveErrSurfacesPersistenceFailure proves a failed write is
+// observable even though the generation-port methods cannot return an error.
+func TestClaimGenerationSaveErrSurfacesPersistenceFailure(t *testing.T) {
+	store := &memGenerationStore{saveErr: errors.New("read-only")}
+	ledger, err := NewClaimGenerationWithStore(store)
+	if err != nil {
+		t.Fatalf("new ledger: %v", err)
+	}
+	ledger.IssueFor("owner-C")
+	if got := ledger.SaveErr(); got == nil {
+		t.Fatal("SaveErr is nil after a failed save")
 	}
 }
