@@ -4,6 +4,7 @@
 package taskcli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,9 +51,25 @@ type Config struct {
 	RecheckWriteCard func(path string, data []byte) error
 }
 
+// GateWaiterRegistrar — app-порт конкурентной регистрации ожидающих на гейте
+// (CBX-11). Инфраструктурная реализация использует CAS с джиттерованным
+// backoff. Значение по умолчанию ничего не делает, поэтому существующие
+// вызывающие RunHooks не меняют поведение.
+type GateWaiterRegistrar interface {
+	Register(ctx context.Context, gateID, waiterID string) error
+}
+
+type noopGateWaiterRegistrar struct{}
+
+func (noopGateWaiterRegistrar) Register(context.Context, string, string) error { return nil }
+
 // Service выполняет list, new и take.
 type Service struct {
 	Cfg Config
+
+	// gateWaiters регистрирует ожидающего на гейте при событии unblocked.
+	// Пустое значение означает no-op.
+	gateWaiters GateWaiterRegistrar
 
 	// recheckMu сериализует post-commit recheck, чтобы два параллельных
 	// закрытия не писали отчёт и счётчик одновременно.
@@ -60,7 +77,33 @@ type Service struct {
 }
 
 // NewService создаёт сервис с конфигурацией.
-func NewService(cfg Config) *Service { return &Service{Cfg: cfg} }
+func NewService(cfg Config) *Service {
+	return &Service{Cfg: cfg, gateWaiters: noopGateWaiterRegistrar{}}
+}
+
+// SetGateWaiterRegistrar ставит порт регистрации ожидающих. Пустой аргумент
+// возвращает no-op.
+func (s *Service) SetGateWaiterRegistrar(reg GateWaiterRegistrar) {
+	if s == nil {
+		return
+	}
+	if reg == nil {
+		reg = noopGateWaiterRegistrar{}
+	}
+	s.gateWaiters = reg
+}
+
+// RegisterGateWaiter регистрирует ожидающего на гейте через установленный порт.
+func (s *Service) RegisterGateWaiter(ctx context.Context, gateID, waiterID string) error {
+	if s == nil {
+		return nil
+	}
+	reg := s.gateWaiters
+	if reg == nil {
+		reg = noopGateWaiterRegistrar{}
+	}
+	return reg.Register(ctx, gateID, waiterID)
+}
 
 // ---- AN-06: точки расширения на жизненном цикле карточки ----
 //
@@ -124,6 +167,11 @@ func hookFiles(dir string, event HookEvent) ([]string, error) {
 // RunHooks вызывает сценарии события и пишет одну запись в журнал. Возвращаемая
 // ошибка относится только к журналу, сбой сценария в неё не входит.
 func (s *Service) RunHooks(event HookEvent, cardID, when string) error {
+	if event == HookUnblocked {
+		if err := s.RegisterGateWaiter(context.Background(), "gate:unblocked", cardID); err != nil {
+			return err
+		}
+	}
 	dir := strings.TrimSpace(s.Cfg.HooksDir)
 	if dir == "" {
 		return nil
