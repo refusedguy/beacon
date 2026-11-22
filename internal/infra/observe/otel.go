@@ -51,9 +51,10 @@ const (
 	ProtocolHTTPJSON     = "http/json"
 	ProtocolGRPC         = "grpc"
 
-	defaultBatchSize   = 64
-	defaultOTLPTimeout = 2 * time.Second
-	maxResponseDrain   = 1 << 20
+	defaultBatchSize     = 64
+	defaultOTLPTimeout   = 2 * time.Second
+	defaultFlushInterval = 5 * time.Second
+	maxResponseDrain     = 1 << 20
 )
 
 // ParseBoolEnv reports whether a boolean environment value is truthy. Every
@@ -373,28 +374,38 @@ func (r *SpanRecorder) Spans() []Span {
 
 // OTLPConfig configures the dependency-free OTLP/HTTP exporter. Endpoint is a
 // collector base URL; the exporter posts to /v1/traces unless Endpoint already
-// ends with that path. Client and BatchSize are optional seams for tests.
+// ends with that path. Client, BatchSize and Interval are optional seams for
+// tests. Interval sets how often a partial batch is sent; a non-positive value
+// uses defaultFlushInterval.
 type OTLPConfig struct {
 	Endpoint  string
 	Protocol  string
 	Client    *http.Client
 	BatchSize int
 	Timeout   time.Duration
+	Interval  time.Duration
 }
 
 // OTLPExporter batches finished spans and posts them to an OTLP/HTTP collector.
-// It implements SpanSink, so installing it never changes Tracer.Start. An
-// unreachable collector only produces a warning in the local log; the command
-// that emitted the span keeps running.
+// It implements SpanSink, so installing it never changes Tracer.Start. A full
+// batch is posted from Emit; a partial batch is posted by a background ticker
+// every Interval, so a long-lived process never waits for Shutdown to deliver
+// its spans. An unreachable collector only produces a warning in the local
+// log; the command that emitted the span keeps running.
 type OTLPExporter struct {
 	endpoint  string
 	protocol  string
 	client    *http.Client
 	batchSize int
+	interval  time.Duration
 
 	mu     sync.Mutex
 	batch  []Span
 	closed bool
+
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewOTLPExporter validates cfg and returns a ready exporter. An empty endpoint
@@ -422,12 +433,40 @@ func NewOTLPExporter(cfg OTLPConfig) (*OTLPExporter, error) {
 	if size <= 0 {
 		size = defaultBatchSize
 	}
-	return &OTLPExporter{
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = defaultFlushInterval
+	}
+	exp := &OTLPExporter{
 		endpoint:  endpoint,
 		protocol:  protocol,
 		client:    client,
 		batchSize: size,
-	}, nil
+		interval:  interval,
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+	}
+	go exp.runFlusher()
+	return exp, nil
+}
+
+// runFlusher posts a partial batch on every tick until Shutdown stops it. Emit
+// keeps ownership of the full-batch path, so this goroutine only drains spans
+// that would otherwise sit in the buffer until process exit.
+func (e *OTLPExporter) runFlusher() {
+	defer close(e.doneCh)
+	ticker := time.NewTicker(e.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			if err := e.Flush(context.Background()); err != nil {
+				logOTLPFallback("scheduled flush failed", err)
+			}
+		}
+	}
 }
 
 // tracesURL returns the full OTLP traces endpoint, adding /v1/traces to a base
@@ -440,8 +479,10 @@ func (e *OTLPExporter) tracesURL() string {
 	return base + "/v1/traces"
 }
 
-// Emit buffers a finished span and posts the batch once it is full. Overflow
-// never blocks the caller longer than the configured HTTP timeout.
+// Emit buffers a finished span and posts the batch once it is full. A partial
+// batch is left for the background ticker, so Emit never waits on the collector
+// unless the batch just filled up. In that case the request is bounded by the
+// configured HTTP timeout.
 func (e *OTLPExporter) Emit(s Span) {
 	e.mu.Lock()
 	if e.closed {
@@ -491,10 +532,13 @@ func (e *OTLPExporter) Flush(ctx context.Context) error {
 	return nil
 }
 
-// Shutdown flushes the remaining batch and closes idle connections. Callers
-// invoke it on process exit. A dead collector returns an error; the CLI treats
-// that unconfirmed drain as a failed shutdown and exits nonzero.
+// Shutdown stops the background flusher, flushes the remaining batch and closes
+// idle connections. Callers invoke it on process exit. A dead collector returns
+// an error; the CLI treats that unconfirmed drain as a failed shutdown and exits
+// nonzero. Repeated calls are safe and keep the closed guard for Emit.
 func (e *OTLPExporter) Shutdown(ctx context.Context) error {
+	e.stopOnce.Do(func() { close(e.stopCh) })
+	<-e.doneCh
 	err := e.Flush(ctx)
 	e.mu.Lock()
 	e.closed = true
