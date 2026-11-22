@@ -3,8 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // scopedRegistryListReader is a test reader bound to one project. It refuses
@@ -34,7 +39,7 @@ func (r scopedRegistryListReader) Executors() ([]registryListEntry, error) {
 func runRegistryListForTest(t *testing.T, reader registryListReader, args ...string) (int, string, string) {
 	t.Helper()
 	prev := registryListSource
-	registryListSource = func() (registryListReader, error) { return reader, nil }
+	registryListSource = func(string) (registryListReader, error) { return reader, nil }
 	t.Cleanup(func() { registryListSource = prev })
 	var out, errOut bytes.Buffer
 	c := &CLI{out: &out, errOut: &errOut}
@@ -162,6 +167,12 @@ func TestRegistryListReaderError(t *testing.T) {
 }
 
 func TestRegistryListUnwiredReaderRefuses(t *testing.T) {
+	prev := registryListSource
+	registryListSource = func(string) (registryListReader, error) {
+		return nil, errors.New("registry reader not connected")
+	}
+	t.Cleanup(func() { registryListSource = prev })
+
 	var out, errOut bytes.Buffer
 	c := &CLI{out: &out, errOut: &errOut}
 	if code := runRegistryList(c, nil); code == 0 {
@@ -169,6 +180,57 @@ func TestRegistryListUnwiredReaderRefuses(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "not connected") {
 		t.Fatalf("unwired error should say the reader is not connected: %q", errOut.String())
+	}
+}
+
+// TestRegistryListSourceScopedToCurrentProject checks the real read path, not
+// the test double. Two projects share one database; the default source must
+// return only the rows of the project it was built for.
+func TestRegistryListSourceScopedToCurrentProject(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv(beaconStateDirEnv, state)
+	root := t.TempDir()
+
+	dir, err := stateDir(root)
+	if err != nil {
+		t.Fatalf("stateDir: %v", err)
+	}
+	db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	key, err := projectStateKey(root)
+	if err != nil {
+		t.Fatalf("projectStateKey: %v", err)
+	}
+	for _, rec := range []store.ExecutorRecord{
+		{ProjectKey: key, AgentID: "mine", Role: "executor", Capabilities: []string{"go"}, ConfigID: "cfg-mine"},
+		{ProjectKey: "other-project", AgentID: "theirs", Role: "fixer", Capabilities: []string{"review"}, ConfigID: "cfg-theirs"},
+	} {
+		if _, err := db.UpsertExecutor(rec); err != nil {
+			t.Fatalf("UpsertExecutor(%s): %v", rec.AgentID, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reader, err := registryListSource(root)
+	if err != nil {
+		t.Fatalf("registryListSource: %v", err)
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		defer closer.Close()
+	}
+	entries, err := reader.Executors()
+	if err != nil {
+		t.Fatalf("Executors: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1: %+v", len(entries), entries)
+	}
+	if entries[0].ID != "mine" || entries[0].Project != key {
+		t.Fatalf("entry = %+v, want the current project's row only", entries[0])
 	}
 }
 
