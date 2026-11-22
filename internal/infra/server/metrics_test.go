@@ -294,3 +294,56 @@ func TestFootprintCheckAtFifteenWatches(t *testing.T) {
 		t.Errorf("при неизвестном RSS получены предупреждения: %v", warnings)
 	}
 }
+
+func TestCheckLaunchFootprintDecidesAtThreshold(t *testing.T) {
+	over := func() (uint64, bool) { return uint64(FootprintLimitBytes) + 1, true }
+	under := func() (uint64, bool) { return uint64(FootprintLimitBytes) - 1, true }
+
+	m := NewMetrics()
+	got := CheckLaunchFootprint(m, FootprintWatchThreshold, over, nil)
+	if got.Allow {
+		t.Fatal("при превышении порога запуск должен быть запрещён")
+	}
+	if got.Reason != LaunchReasonFootprint {
+		t.Errorf("причина отказа = %q, ожидалось %q", got.Reason, LaunchReasonFootprint)
+	}
+	if value := m.RSSBytes(); value != uint64(FootprintLimitBytes)+1 {
+		t.Errorf("rss_bytes = %d, ожидалось %d", value, uint64(FootprintLimitBytes)+1)
+	}
+
+	got = CheckLaunchFootprint(m, FootprintWatchThreshold, under, nil)
+	if !got.Allow {
+		t.Fatal("ниже лимита запуск должен быть разрешён")
+	}
+	if got.Reason != LaunchReasonOK {
+		t.Errorf("причина = %q, ожидалось %q", got.Reason, LaunchReasonOK)
+	}
+
+	got = CheckLaunchFootprint(m, FootprintWatchThreshold-1, over, nil)
+	if !got.Allow {
+		t.Fatal("при 14 вотчах запуск должен быть разрешён")
+	}
+}
+
+func TestCheckLaunchFootprintWithoutReadRSS(t *testing.T) {
+	unreadable := func() (uint64, bool) { return 0, false }
+	cases := []struct {
+		name   string
+		reader RSSReader
+	}{
+		{name: "nil reader", reader: nil},
+		{name: "unreadable RSS", reader: unreadable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewMetrics()
+			got := CheckLaunchFootprint(m, FootprintWatchThreshold, tc.reader, nil)
+			if got.Allow {
+				t.Fatal("без RSS запуск должен быть запрещён")
+			}
+			if got.Reason != LaunchReasonRSSUnknown {
+				t.Errorf("причина = %q, ожидалось %q", got.Reason, LaunchReasonRSSUnknown)
+			}
+		})
+	}
+}
