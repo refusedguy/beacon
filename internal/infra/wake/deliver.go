@@ -185,6 +185,13 @@ type AdapterDedupDeliverer struct {
 var _ domain.AdapterWakeDeliverer = (*AdapterDedupDeliverer)(nil)
 
 func (d *AdapterDedupDeliverer) Deliver(ctx context.Context, adapter, sessionID string, p domain.WakePayload) error {
+	return d.deliver(ctx, adapter, sessionID, p, nil)
+}
+
+// deliver admits one wake identity and runs onDelivered only after the inner
+// deliverer accepted the pointer. The callback carries no role: the watch-aware
+// caller decides which counter a delivered wake raises.
+func (d *AdapterDedupDeliverer) deliver(ctx context.Context, adapter, sessionID string, p domain.WakePayload, onDelivered func()) error {
 	if d == nil || d.Inner == nil {
 		return nil
 	}
@@ -200,7 +207,36 @@ func (d *AdapterDedupDeliverer) Deliver(ctx context.Context, adapter, sessionID 
 		ledger.Release(p.ObligationID)
 		return err
 	}
+	if onDelivered != nil {
+		onDelivered()
+	}
 	return nil
+}
+
+// DeliverToSubscriber is the watch-aware entry point the CI bridge selects
+// when the waker implements it. It resolves the one subscriber from the Watch,
+// then counts a wake admitted to a fixer (ATX-43). No caller-supplied role or
+// session can stand in for that subscriber. A duplicate wake returns before
+// the callback, so the fix counter sees only admitted deliveries.
+func (d *AdapterDedupDeliverer) DeliverToSubscriber(ctx context.Context, w domain.Watch, p domain.WakePayload, subscriberID string) error {
+	if d == nil || d.Inner == nil {
+		return nil
+	}
+	target, err := SubscriberTarget(w, p.WatchID, subscriberID)
+	if err != nil {
+		return err
+	}
+	if want := domain.ObligationKey(p.WatchID, p.Revision, target); p.ObligationID != want {
+		return fmt.Errorf("wake: obligation %q does not belong to subscriber %q of watch %s", p.ObligationID, target, p.WatchID)
+	}
+	adapter := ""
+	for _, sub := range w.Subscribers {
+		if sub.ID == target {
+			adapter = sub.Adapter
+			break
+		}
+	}
+	return d.deliver(ctx, adapter, target, p, func() { recordFixerDelivery(w, target) })
 }
 
 // Deliver emits a <beacon-event> envelope with only identifiers. The host's
@@ -451,7 +487,9 @@ func SubscriberTarget(w domain.Watch, watchID, addressee string) (string, error)
 
 // DeliverToSubscriber wakes exactly one subscriber of w. Both the address and
 // the obligation come from the same subscriber.ID, so a wake for one party can
-// never be steered into another party's session.
+// never be steered into another party's session. A wake admitted to a fixer
+// increments the fix counter; executor and orchestrator wakes keep the shared
+// delivery counter only (ATX-43, ADR 0260).
 func DeliverToSubscriber(ctx context.Context, d domain.WakeDeliverer, w domain.Watch, p domain.WakePayload, subscriberID string) error {
 	if d == nil {
 		return fmt.Errorf("wake: deliver to subscriber: deliverer is nil")
@@ -463,7 +501,24 @@ func DeliverToSubscriber(ctx context.Context, d domain.WakeDeliverer, w domain.W
 	if want := domain.ObligationKey(p.WatchID, p.Revision, target); p.ObligationID != want {
 		return fmt.Errorf("wake: obligation %q does not belong to subscriber %q of watch %s", p.ObligationID, target, p.WatchID)
 	}
-	return d.Deliver(ctx, target, p)
+	if err := d.Deliver(ctx, target, p); err != nil {
+		return err
+	}
+	recordFixerDelivery(w, target)
+	return nil
+}
+
+// recordFixerDelivery counts a wake that reached a fixer subscriber. It runs
+// only after the deliverer admitted the pointer, so a refused or failed wake
+// never raises fix_total. The role comes from the Watch subscriber that owns
+// the resolved target, never from a caller-supplied value.
+func recordFixerDelivery(w domain.Watch, target string) {
+	for _, sub := range w.Subscribers {
+		if sub.ID == target && sub.Role == domain.RoleFixer {
+			observe.FixDelivered(w.ID)
+			return
+		}
+	}
 }
 
 // DeliverToAddress wakes the single session a member@rig address resolves to.
