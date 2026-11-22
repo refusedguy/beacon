@@ -101,13 +101,53 @@ func outcomeKey(adapter, outcome string) string {
 	return adapter + ":" + outcome
 }
 
+// CounterProviderCall breaks CI provider calls down by adapter, method and
+// outcome. It stays outside counterLabels because that registry is a closed
+// set whose JSON shape older consumers rely on. The three values share one
+// JSON key, adapter:method:outcome, the way wake_outcome_total packs its two
+// dimensions. Prometheus expands the key into three labels. None of the three
+// values is a session id or a watch id, so cardinality stays fixed.
+const CounterProviderCall = "provider_call_total"
+
+// multiLabelCounters lists the Prometheus label names of counters whose values
+// are packed into one JSON key. The order matches the packed values.
+var multiLabelCounters = map[string][]string{
+	CounterProviderCall: {LabelAdapter, LabelMethod, LabelOutcome},
+}
+
+const multiLabelSep = ":"
+
+// providerCallKey packs the three provider call labels into one key. Adapter,
+// method and outcome names never contain the separator, so the triple stays
+// unambiguous.
+func providerCallKey(adapter, method, outcome string) string {
+	return adapter + multiLabelSep + method + multiLabelSep + outcome
+}
+
+// splitMultiLabelKey expands a packed key. The boolean is false when the key
+// does not carry exactly n parts, which keeps a malformed key from becoming a
+// wrong series.
+func splitMultiLabelKey(key string, n int) ([]string, bool) {
+	parts := strings.Split(key, multiLabelSep)
+	if len(parts) != n {
+		return nil, false
+	}
+	return parts, true
+}
+
 // counterLabelKey resolves the label of a counter from both registries. Unknown
 // names have no label and are exported as plain totals.
 func counterLabelKey(name string) string {
 	if label, ok := counterLabels[name]; ok {
 		return label
 	}
-	return outcomeCounters[name]
+	if label, ok := outcomeCounters[name]; ok {
+		return label
+	}
+	if labels, ok := multiLabelCounters[name]; ok && len(labels) != 0 {
+		return labels[0]
+	}
+	return ""
 }
 
 // Gauges are point-in-time values, not monotonic totals. A scrape sees them as
@@ -256,6 +296,10 @@ func NewMetrics() *Metrics {
 		m.values[name] = 0
 	}
 	for name := range outcomeCounters {
+		m.values[name] = 0
+		m.labelled[name] = make(map[string]uint64)
+	}
+	for name := range multiLabelCounters {
 		m.values[name] = 0
 		m.labelled[name] = make(map[string]uint64)
 	}
@@ -414,6 +458,13 @@ func (m *Metrics) JSON() []byte {
 			out[name] = m.values[name]
 		}
 		for name := range outcomeCounters {
+			byValue := make(map[string]uint64)
+			for k, v := range m.labelled[name] {
+				byValue[k] = v
+			}
+			out[name] = byValue
+		}
+		for name := range multiLabelCounters {
 			byValue := make(map[string]uint64)
 			for k, v := range m.labelled[name] {
 				byValue[k] = v
@@ -581,6 +632,37 @@ func (m *Metrics) Prometheus() []byte {
 		sort.Strings(keys)
 		for _, k := range keys {
 			fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, label, escapeLabel(k), values[k])
+		}
+	}
+	multiNames := make([]string, 0, len(multiLabelCounters))
+	for name := range multiLabelCounters {
+		multiNames = append(multiNames, name)
+	}
+	sort.Strings(multiNames)
+	for _, name := range multiNames {
+		labels := multiLabelCounters[name]
+		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)
+		fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", name)
+		values := m.labelled[name]
+		keys := make([]string, 0, len(values))
+		for k := range values {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			parts, ok := splitMultiLabelKey(k, len(labels))
+			if !ok {
+				fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, labels[0], escapeLabel(k), values[k])
+				continue
+			}
+			var labelText strings.Builder
+			for i, label := range labels {
+				if i != 0 {
+					labelText.WriteByte(',')
+				}
+				fmt.Fprintf(&labelText, "%s=\"%s\"", label, escapeLabel(parts[i]))
+			}
+			fmt.Fprintf(&buf, "beacon_%s{%s} %d\n", name, labelText.String(), values[k])
 		}
 	}
 	for _, name := range GaugeNames() {
