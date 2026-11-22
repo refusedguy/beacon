@@ -556,6 +556,9 @@ func (p *t3145BothPort) CreateSession(parentID, agent, title string, metadata ma
 	return "sess-wired", nil
 }
 func (p *t3145BothPort) Prompt(string, string) error { return nil }
+func (p *t3145BothPort) PromptWithOptions(context.Context, string, string, opencode.PromptOptions) error {
+	return nil
+}
 
 func t3145RestorePorts(t *testing.T) {
 	t.Helper()

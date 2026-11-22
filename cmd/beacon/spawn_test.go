@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
 // t3142CreateCall and t3142PromptCall record the two halves of the port so a
@@ -22,14 +25,21 @@ type t3142PromptCall struct {
 	text      string
 }
 
-// t3142Spawner is a stand-in for the HTTP client of T3.144. It never touches a
+type t3142PromptOptionsCall struct {
+	sessionID string
+	text      string
+	opts      opencode.PromptOptions
+}
+
+// t3142Spawner is a stand-in for the one OpenCode client. It never touches a
 // network or a process; it only records calls and returns configured results.
 type t3142Spawner struct {
-	id        string
-	createErr error
-	promptErr error
-	creates   []t3142CreateCall
-	prompts   []t3142PromptCall
+	id            string
+	createErr     error
+	promptErr     error
+	creates       []t3142CreateCall
+	prompts       []t3142PromptCall
+	promptOptions []t3142PromptOptionsCall
 }
 
 func (s *t3142Spawner) CreateSession(parentID, agent, title string, metadata map[string]string) (string, error) {
@@ -42,6 +52,11 @@ func (s *t3142Spawner) CreateSession(parentID, agent, title string, metadata map
 
 func (s *t3142Spawner) Prompt(sessionID, text string) error {
 	s.prompts = append(s.prompts, t3142PromptCall{sessionID, text})
+	return s.promptErr
+}
+
+func (s *t3142Spawner) PromptWithOptions(_ context.Context, sessionID, text string, opts opencode.PromptOptions) error {
+	s.promptOptions = append(s.promptOptions, t3142PromptOptionsCall{sessionID, text, opts})
 	return s.promptErr
 }
 
@@ -94,10 +109,10 @@ func TestT3142SpawnSendsAgentAtCreation(t *testing.T) {
 		t.Errorf("metadata = %#v, want %#v", create.metadata, wantMeta)
 	}
 
-	if len(spawner.prompts) != 1 {
-		t.Fatalf("Prompt calls = %d, want 1", len(spawner.prompts))
+	if len(spawner.promptOptions) != 1 {
+		t.Fatalf("PromptWithOptions calls = %d, want 1", len(spawner.promptOptions))
 	}
-	prompt := spawner.prompts[0]
+	prompt := spawner.promptOptions[0]
 	if prompt.sessionID != "sess-42" {
 		t.Errorf("prompt sessionID = %q, want sess-42", prompt.sessionID)
 	}
@@ -106,6 +121,9 @@ func TestT3142SpawnSendsAgentAtCreation(t *testing.T) {
 	}
 	if strings.Contains(prompt.text, "builder") || strings.Contains(prompt.text, `"agent"`) {
 		t.Errorf("prompt %q must not carry the agent", prompt.text)
+	}
+	if want := opencode.StartPromptOptions("T3.142"); prompt.opts != want {
+		t.Errorf("prompt options = %+v, want %+v", prompt.opts, want)
 	}
 
 	if got := out.String(); got != "sess-42\n" {
@@ -127,8 +145,8 @@ func TestT3142SpawnWithoutAgentStillSeparatesThePorts(t *testing.T) {
 	if len(spawner.creates) != 1 || spawner.creates[0].agent != "" {
 		t.Fatalf("creates = %#v, want one call with empty agent", spawner.creates)
 	}
-	if len(spawner.prompts) != 1 {
-		t.Fatalf("prompts = %d, want 1", len(spawner.prompts))
+	if len(spawner.promptOptions) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(spawner.promptOptions))
 	}
 	if _, ok := spawner.creates[0].metadata[spawnMetaTitle]; ok {
 		t.Error("title metadata present without --title")
@@ -145,7 +163,6 @@ func TestT3142SpawnRejectsBadInput(t *testing.T) {
 	}{
 		{"no task", nil, "parent-1", &t3142Spawner{id: "s"}, "beacon spawn: нужна одна команда"},
 		{"two tasks", []string{"T1", "T2"}, "parent-1", &t3142Spawner{id: "s"}, "beacon spawn: нужна одна команда"},
-		{"no parent", []string{"T3.142"}, "", &t3142Spawner{id: "s"}, "не задан parentID"},
 		{"no port", []string{"T3.142"}, "parent-1", nil, "порт создания сессий не подключён"},
 	}
 	for _, tc := range cases {
@@ -160,6 +177,54 @@ func TestT3142SpawnRejectsBadInput(t *testing.T) {
 				t.Errorf("stderr = %q, want %q", errOut.String(), tc.stderr)
 			}
 		})
+	}
+}
+
+// TestAS202SpawnWithExplicitParent proves that a daemon can spawn without
+// preparing process environment: the parent travels as a parameter and reaches
+// CreateSession, and the first prompt carries a deterministic id with steer
+// and resume.
+func TestAS202SpawnWithExplicitParent(t *testing.T) {
+	spawner := &t3142Spawner{id: "sess-202"}
+	t3142Install(t, spawner)
+	t.Setenv(spawnParentEnv, "")
+	c, out, errOut := t3142CLI()
+
+	code := c.runSpawnWithParent([]string{"T3.142"}, "ses_parent")
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+	}
+	if len(spawner.creates) != 1 || spawner.creates[0].parentID != "ses_parent" {
+		t.Fatalf("creates = %#v, want one call with parent ses_parent", spawner.creates)
+	}
+	if len(spawner.promptOptions) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(spawner.promptOptions))
+	}
+	opts := spawner.promptOptions[0].opts
+	if opts.MessageID != "msg_T3.142" || opts.Delivery != "steer" || !opts.Resume {
+		t.Errorf("prompt options = %+v, want msg_T3.142, delivery steer, resume true", opts)
+	}
+	if got := out.String(); got != "sess-202\n" {
+		t.Errorf("stdout = %q, want session id line", got)
+	}
+}
+
+// TestAS202RunSpawnWithoutEnvKeepsCLIWorking checks that the CLI wrapper no
+// longer requires BEACON_PARENT_SESSION and still prints the session id.
+func TestAS202RunSpawnWithoutEnvKeepsCLIWorking(t *testing.T) {
+	spawner := &t3142Spawner{id: "sess-cli"}
+	t3142Install(t, spawner)
+	t.Setenv(spawnParentEnv, "")
+	c, out, errOut := t3142CLI()
+
+	if code := c.runSpawn([]string{"T3.142"}); code != 0 {
+		t.Fatalf("exit = %d, stderr = %q", code, errOut.String())
+	}
+	if len(spawner.creates) != 1 || spawner.creates[0].parentID != "" {
+		t.Fatalf("creates = %#v, want one call with empty parent", spawner.creates)
+	}
+	if got := out.String(); got != "sess-cli\n" {
+		t.Errorf("stdout = %q, want session id line", got)
 	}
 }
 
