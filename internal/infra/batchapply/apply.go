@@ -71,11 +71,15 @@ const (
 	// HD-066 (ADR 0307): the iteration report carries the SHA-256 of the
 	// artifact set. The next refinement reads it as previous_artifact_hash and
 	// can verify what changed. The key stays English as a technical term.
-	hashReportFormat     = "hash=%s\n"
-	mergeReportFormat    = "merged=%d held=%d\n"
-	renumberReportFormat = "перенумеровать ADR %d в %d\n"
-	skipReportFormat     = "пропуск %s\n"
-	warnReportFormat     = "предупреждение: не найдена цель закрытия %s\n"
+	hashReportFormat  = "hash=%s\n"
+	mergeReportFormat = "merged=%d held=%d\n"
+	// ATX-13: a merge decision records the JSON file that declared it and the
+	// SHA-256 of that file. The digest ties the decision to one research input.
+	decisionReportFormat  = "PR %d: решение %s, источник %s, hash=%s\n"
+	confirmRequiredFormat = "--merge-plan требует флага --confirm-merge\n"
+	renumberReportFormat  = "перенумеровать ADR %d в %d\n"
+	skipReportFormat      = "пропуск %s\n"
+	warnReportFormat      = "предупреждение: не найдена цель закрытия %s\n"
 	// HD-088 (ADR 0313): a number with no source has no owner and breaks the
 	// card. The line is Russian prose, so it keeps the interface scope.
 	factProblemFormat = "число без владельца: %s\n"
@@ -91,13 +95,14 @@ const (
 
 // Options mirrors the command line of cmd/batch-apply.
 type Options struct {
-	Dir       string
-	DryRun    bool
-	Check     bool
-	MergePlan bool
-	Quiet     bool
-	Commit    bool
-	Facts     bool
+	Dir          string
+	DryRun       bool
+	Check        bool
+	MergePlan    bool
+	ConfirmMerge bool
+	Quiet        bool
+	Commit       bool
+	Facts        bool
 }
 
 type batch struct {
@@ -150,6 +155,15 @@ type mergeDecision struct {
 	Reason string `json:"reason"`
 }
 
+// sourceDecision pairs a research decision with the file that declared it.
+// The hash is computed over the raw JSON bytes, so any edit to the source
+// changes the digest and the report points at a different input.
+type sourceDecision struct {
+	decision mergeDecision
+	source   string
+	hash     string
+}
+
 type cardClosure struct {
 	ID       string `json:"id"`
 	PR       int    `json:"pr"`
@@ -168,6 +182,14 @@ type fact struct {
 type ghCheck struct {
 	Name  string `json:"name"`
 	State string `json:"state"`
+}
+
+// ghPRFiles is the part of gh pr view --json files this gate reads. GitHub
+// reports repository-relative paths in the path field.
+type ghPRFiles struct {
+	Files []struct {
+		Path string `json:"path"`
+	} `json:"files"`
 }
 
 // artifactEntry pairs a rendered document with its path relative to the repo
@@ -532,6 +554,37 @@ func loadBatches(dir string) ([]batch, []string) {
 	return out, problems
 }
 
+// loadMergeDecisions collects merge decisions from every research JSON and
+// keeps the source file plus the digest of its raw bytes. A malformed file is
+// reported and skipped, so one bad batch cannot block the rest of the plan.
+func loadMergeDecisions(dir string) ([]sourceDecision, []string) {
+	var problems []string
+	paths, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		return nil, []string{err.Error()}
+	}
+	sort.Strings(paths)
+	var out []sourceDecision
+	for _, p := range paths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", filepath.Base(p), err))
+			continue
+		}
+		var b batch
+		if err := json.Unmarshal(raw, &b); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: неверный JSON (%v)", filepath.Base(p), err))
+			continue
+		}
+		sum := sha256.Sum256(raw)
+		hash := hex.EncodeToString(sum[:])
+		for _, d := range b.MergeDecisions {
+			out = append(out, sourceDecision{decision: d, source: filepath.Base(p), hash: hash})
+		}
+	}
+	return out, problems
+}
+
 func (r *runner) writeFile(root, rel, content string) error {
 	return r.writeFileMode(root, rel, content, false)
 }
@@ -690,6 +743,9 @@ var requiredCheckOrder = []string{"build", "test", "gates", "gates-binary"}
 const (
 	holdMissingCheck = "удержан, обязательная проверка отсутствует"
 	holdNotGreen     = "удержан, обязательная проверка не зелёная"
+	// ATX-13: a code PR with no reported checks is held. The old rule read
+	// "no checks reported" as proof of a doc-only PR and merged it.
+	holdNoChecks = "удержан, список проверок пуст"
 )
 
 // isRequiredCheck reports whether name is one of the checks this tool gates on.
@@ -711,11 +767,11 @@ func greenCheckState(state string) bool {
 }
 
 // evaluateChecks returns an empty string when the reported checks allow a
-// merge. No checks means a doc-only PR under paths-ignore: the workflows did
-// not run, so there is nothing to verify. A non-empty list means a code PR,
-// which must carry every required check in a green state. A missing check and
-// a non-green check are held with different reasons. Every reported check is
-// inspected, so a green group cannot hide one neutral or failed run.
+// merge. It judges only the checks it receives. An empty list passes here;
+// evaluateMergeGate decides whether that empty list belongs to a doc-only PR.
+// A non-empty list must carry every required check in a green state. A missing
+// check and a non-green check are held with different reasons. Every reported
+// check is inspected, so a green group cannot hide one neutral or failed run.
 func evaluateChecks(checks []ghCheck) string {
 	if len(checks) == 0 {
 		return ""
@@ -738,46 +794,103 @@ func evaluateChecks(checks []ghCheck) string {
 	return ""
 }
 
-// applyMergePlan merges only PRs whose required checks are all present and
-// green. A PR with no checks is doc-only by the repository's paths-ignore rule.
-// The plan itself comes from a research agent; this function re-verifies every
-// gate with gh before acting.
-func (r *runner) applyMergePlan(decisions []mergeDecision) {
-	merged, held := 0, 0
-	for _, d := range decisions {
-		if d.Action != "merge" {
-			r.printf("PR %d: %s (%s)\n", d.PR, d.Action, d.Reason)
+// docOnlyPR reports whether every changed file is documentation. A path under
+// docs/ or a Markdown file counts as a document. Any other path means the PR
+// changes code and needs the full check set. An empty list is not doc-only.
+func docOnlyPR(paths []string) bool {
+	if len(paths) == 0 {
+		return false
+	}
+	for _, p := range paths {
+		path := filepath.ToSlash(strings.TrimSpace(p))
+		if strings.HasPrefix(path, "docs/") || strings.EqualFold(filepath.Ext(path), ".md") {
 			continue
 		}
-		cmd := exec.Command("gh", "pr", "checks", fmt.Sprint(d.PR), "--json", "name,state")
+		return false
+	}
+	return true
+}
+
+// evaluateMergeGate adds the ATX-13 rule to evaluateChecks. An empty check
+// list is allowed only when the changed files prove the PR is doc-only. A code
+// PR with no checks is held instead of merged on an error string from gh.
+func evaluateMergeGate(checks []ghCheck, docOnly bool) string {
+	if docOnly {
+		return ""
+	}
+	if len(checks) == 0 {
+		return holdNoChecks
+	}
+	return evaluateChecks(checks)
+}
+
+// changedFiles reads the paths a PR changes. The gate uses files, not the text
+// of a gh error, to decide whether a PR is doc-only.
+func (r *runner) changedFiles(pr int) ([]string, error) {
+	cmd := exec.Command("gh", "pr", "view", fmt.Sprint(pr), "--json", "files")
+	raw, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	var payload ghPRFiles
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0, len(payload.Files))
+	for _, f := range payload.Files {
+		paths = append(paths, f.Path)
+	}
+	return paths, nil
+}
+
+// applyMergePlan merges only PRs whose changed files and checks allow it. A
+// doc-only PR may have no checks; a code PR must carry every required check in
+// a green state. The plan comes from research, so every decision is logged with
+// the hash of the JSON that declared it and re-verified with gh before acting.
+func (r *runner) applyMergePlan(decisions []sourceDecision) {
+	merged, held := 0, 0
+	for _, d := range decisions {
+		r.printf(decisionReportFormat, d.decision.PR, d.decision.Action, d.source, d.hash)
+		if d.decision.Action != "merge" {
+			r.printf("PR %d: %s (%s)\n", d.decision.PR, d.decision.Action, d.decision.Reason)
+			continue
+		}
+		paths, err := r.changedFiles(d.decision.PR)
+		if err != nil {
+			r.printf("PR %d: удержан, список файлов недоступен: %v\n", d.decision.PR, err)
+			held++
+			continue
+		}
+		docOnly := docOnlyPR(paths)
+		cmd := exec.Command("gh", "pr", "checks", fmt.Sprint(d.decision.PR), "--json", "name,state")
 		raw, err := cmd.Output()
 		if err != nil {
 			if ee, ok := err.(*exec.ExitError); ok && strings.Contains(string(ee.Stderr), "no checks reported") {
-				raw = []byte("[]") // doc-only PR under paths-ignore
+				raw = []byte("[]") // no reported checks, not proof of a doc-only PR
 			} else {
-				r.printf("PR %d: удержан, проверки недоступны: %v\n", d.PR, err)
+				r.printf("PR %d: удержан, проверки недоступны: %v\n", d.decision.PR, err)
 				held++
 				continue
 			}
 		}
 		var checks []ghCheck
 		if err := json.Unmarshal(raw, &checks); err != nil {
-			r.printf("PR %d: удержан, неверный JSON проверок\n", d.PR)
+			r.printf("PR %d: удержан, неверный JSON проверок\n", d.decision.PR)
 			held++
 			continue
 		}
-		if reason := evaluateChecks(checks); reason != "" {
-			r.printf("PR %d: %s\n", d.PR, reason)
+		if reason := evaluateMergeGate(checks, docOnly); reason != "" {
+			r.printf("PR %d: %s\n", d.decision.PR, reason)
 			held++
 			continue
 		}
-		mergeCmd := exec.Command("gh", "pr", "merge", fmt.Sprint(d.PR), "--squash", "--delete-branch")
+		mergeCmd := exec.Command("gh", "pr", "merge", fmt.Sprint(d.decision.PR), "--squash", "--delete-branch")
 		if out, err := mergeCmd.CombinedOutput(); err != nil {
-			r.printf("PR %d: слияние не удалось: %s\n", d.PR, strings.TrimSpace(string(out)))
+			r.printf("PR %d: слияние не удалось: %s\n", d.decision.PR, strings.TrimSpace(string(out)))
 			held++
 			continue
 		}
-		r.printf("PR %d: MERGED\n", d.PR)
+		r.printf("PR %d: MERGED\n", d.decision.PR)
 		merged++
 	}
 	r.printf(mergeReportFormat, merged, held)
@@ -805,6 +918,12 @@ func commitArtifacts(root string, cards, adrs, evals int) error {
 // and subprocess work happens in this infra package, not in cmd.
 func Run(opts Options, out, errOut io.Writer) int {
 	r := &runner{opts: opts, out: out, err: errOut}
+	// ATX-13: a research document never authorizes a merge by itself. Require
+	// the owner flag before any file read or gh call in the merge path.
+	if opts.MergePlan && !opts.ConfirmMerge {
+		r.errf(confirmRequiredFormat)
+		return 2
+	}
 	if opts.Dir == "" {
 		r.errf("--dir обязателен\n")
 		return 2
@@ -845,9 +964,9 @@ func Run(opts Options, out, errOut io.Writer) int {
 		return 1
 	}
 	if opts.MergePlan {
-		var decisions []mergeDecision
-		for _, b := range batches {
-			decisions = append(decisions, b.MergeDecisions...)
+		decisions, mergeProblems := loadMergeDecisions(opts.Dir)
+		for _, p := range mergeProblems {
+			r.errf(skipReportFormat, p)
 		}
 		r.applyMergePlan(decisions)
 		return 0
