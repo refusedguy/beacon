@@ -222,7 +222,9 @@ func syncRegistry(ctx context.Context, source registrySessionSource, storePort r
 	observedAt := time.Now().UTC().UnixNano()
 	writer, hasWriter := storePort.(registrySyncWriter)
 	updates := reconcileStale(entries, liveIDs)
+	changed := make(map[string]bool, len(updates))
 	for _, u := range updates {
+		changed[u.AgentID] = true
 		var err error
 		if hasWriter {
 			err = writer.SyncExecutor(projectKey, u.AgentID, u.Status, worktreeByAgent[u.AgentID], observedAt)
@@ -231,6 +233,26 @@ func syncRegistry(ctx context.Context, source registrySessionSource, storePort r
 		}
 		if err != nil {
 			return registrySyncResult{}, fmt.Errorf("registry sync: set %s to %s: %w", u.AgentID, u.Status, err)
+		}
+	}
+
+	// A live observation is fresh even when the status did not change. The
+	// status loop above already wrote worktree and last_seen for changed rows,
+	// so refresh only the remaining rows that have a live session. This is
+	// scoped to one project: entries come from storePort.Entries(projectKey),
+	// so a pass for project A never touches project B's observation columns.
+	if hasWriter {
+		for _, e := range entries {
+			if changed[e.AgentID] {
+				continue
+			}
+			worktree, live := worktreeByAgent[e.AgentID]
+			if !live {
+				continue
+			}
+			if err := writer.SyncExecutor(projectKey, e.AgentID, e.Status, worktree, observedAt); err != nil {
+				return registrySyncResult{}, fmt.Errorf("registry sync: observe %s: %w", e.AgentID, err)
+			}
 		}
 	}
 
