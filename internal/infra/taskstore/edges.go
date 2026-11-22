@@ -330,3 +330,140 @@ func (g *Graph) Edges() []Edge {
 func (g *Graph) CycleReport() CycleReport {
 	return CanonicalCycleReport(g.Edges())
 }
+
+// ---- CBX-01: post-commit recheck of dependent blocked flags ----
+//
+// A dependent card holds a "blocked" status while any of its dependencies is
+// unresolved. Two writers that read the same snapshot can both leave the flag
+// set after their commits. The helpers below read a fresh card set and compute
+// the flag again. They never run inside a close transaction.
+
+// resolvedStatus reports whether a status means a card no longer blocks the
+// cards that depend on it.
+func resolvedStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "done", "dropped", "duplicate":
+		return true
+	}
+	return false
+}
+
+// BlockedGraph builds a graph with an edge from each dependency to the card
+// that depends on it. Walking from a changed ID therefore reaches every
+// dependent that the change can affect. Unusable edges are skipped so a bad ID
+// in one card does not hide the rest of the graph.
+func BlockedGraph(cards []Card) *Graph {
+	g := NewGraph()
+	known := make(map[string]bool, len(cards))
+	for _, c := range cards {
+		known[c.ID] = true
+	}
+	for _, c := range cards {
+		for _, raw := range c.Dependencies {
+			dep := strings.TrimSpace(raw)
+			if dep == "" || !known[dep] {
+				continue
+			}
+			_ = g.AddEdge(dep, c.ID, EdgeBlocks)
+		}
+	}
+	return g
+}
+
+// DependentsOf returns every card that transitively depends on one of ids.
+// The result is sorted and has no duplicates. The start IDs themselves are not
+// included.
+func DependentsOf(g *Graph, ids []string) []string {
+	seen := map[string]bool{}
+	for _, raw := range ids {
+		start := strings.TrimSpace(raw)
+		if start == "" {
+			continue
+		}
+		for _, visited := range g.TraverseAll(start).Visited {
+			if visited != start {
+				seen[visited] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// BlockedDecision is one card's current status and the status it should hold
+// after a recheck against the current graph.
+type BlockedDecision struct {
+	ID      string
+	Current string
+	Want    string
+}
+
+// RecheckDecisions computes the desired status for each card in scope. Only
+// todo and blocked cards take part, so in-progress and closed cards keep their
+// meaning. The decision works both ways: unresolved dependencies want blocked,
+// and a blocked card with only resolved dependencies wants todo.
+func RecheckDecisions(cards []Card, scope map[string]bool) []BlockedDecision {
+	byID := make(map[string]Card, len(cards))
+	for _, c := range cards {
+		byID[c.ID] = c
+	}
+	decisions := make([]BlockedDecision, 0, len(scope))
+	for _, c := range cards {
+		if !scope[c.ID] || (c.Status != "todo" && c.Status != "blocked") {
+			continue
+		}
+		want := "todo"
+		for _, raw := range c.Dependencies {
+			dep := strings.TrimSpace(raw)
+			if dep == "" {
+				continue
+			}
+			blocker, ok := byID[dep]
+			if !ok || !resolvedStatus(blocker.Status) {
+				want = "blocked"
+				break
+			}
+		}
+		decisions = append(decisions, BlockedDecision{ID: c.ID, Current: c.Status, Want: want})
+	}
+	return decisions
+}
+
+// StaleBlocked returns IDs of cards whose status disagrees with the current
+// graph. An empty result means every blocked flag agrees with its blockers.
+func StaleBlocked(cards []Card) []string {
+	scope := make(map[string]bool, len(cards))
+	for _, c := range cards {
+		scope[c.ID] = true
+	}
+	var out []string
+	for _, d := range RecheckDecisions(cards, scope) {
+		if d.Current != d.Want {
+			out = append(out, d.ID)
+		}
+	}
+	return out
+}
+
+// SetCardStatus returns raw with its Статус line replaced by status. CRLF line
+// endings are preserved. A card without a Статус line is left unchanged.
+func SetCardStatus(raw, status string) string {
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		lineCR := ""
+		if strings.HasSuffix(line, "\r") {
+			lineCR = "\r"
+			line = strings.TrimSuffix(line, "\r")
+		}
+		if !strings.HasPrefix(line, "Статус:") {
+			continue
+		}
+		lines[i] = "Статус: " + status + lineCR
+		return strings.Join(lines, "\n")
+	}
+	return raw
+}

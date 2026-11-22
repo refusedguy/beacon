@@ -2551,3 +2551,205 @@ func TestHooksDisabledWithoutDir(t *testing.T) {
 		t.Fatalf("журнал без каталога хуков: %+v err=%v", entries, err)
 	}
 }
+
+// ---- CBX-01: post-commit recheck of dependent blocked flags ----
+
+func (e *env) depCard(t *testing.T, id, status, deps string) {
+	t.Helper()
+	text := fmt.Sprintf("# %s. Тест\nСтатус: %s\nФаза: P2\nТип: task\n"+
+		"Владелец файлов: internal/app/%s.go\nЗависимости: %s\nСсылка: ADR 0001\n"+
+		"Агент: нет\nВремя: нет\nЦель: ц\nКонтекст: к\nШаги: ш\nПроверка: п\nПриёмка: пр\n",
+		id, status, strings.ToLower(id), deps)
+	if err := os.WriteFile(filepath.Join(e.tasksDir, id+".md"), []byte(text), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (e *env) markDone(t *testing.T, id string) {
+	t.Helper()
+	c := cardByID(t, e, id)
+	updated := strings.Replace(c.Raw, "Статус: "+c.Status, "Статус: done", 1)
+	if err := os.WriteFile(c.Path, []byte(updated), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hasID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRecheckBlockedConvergesAfterParallelClosers(t *testing.T) {
+	e := newEnv(t)
+	e.depCard(t, "T9.1", "todo", "нет")
+	e.depCard(t, "T9.2", "todo", "нет")
+	e.depCard(t, "T9.3", "blocked", "T9.1, T9.2")
+
+	// Оба блокировщика публикуются до того, как recheck читает граф.
+	e.markDone(t, "T9.1")
+	e.markDone(t, "T9.2")
+
+	rep := e.svc.RecheckBlocked([]string{"T9.1", "T9.2"}, reaperTestTime())
+	if !hasID(rep.Changed, "T9.3") || len(rep.Failed) != 0 {
+		t.Fatalf("отчёт: %+v", rep)
+	}
+	if c := cardByID(t, e, "T9.3"); c.Status != "todo" {
+		t.Fatalf("зависимая карточка осталась %q, ждали todo", c.Status)
+	}
+	cards, err := LoadCards(e.tasksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale := taskstore.StaleBlocked(cards); len(stale) != 0 {
+		t.Fatalf("карточки с устаревшим флагом: %v", stale)
+	}
+}
+
+func TestRecheckBlockedTwoClosersReturnTogether(t *testing.T) {
+	e := newEnv(t)
+	e.depCard(t, "T9.14", "todo", "нет")
+	e.depCard(t, "T9.15", "todo", "нет")
+	e.depCard(t, "T9.16", "blocked", "T9.14, T9.15")
+
+	e.markDone(t, "T9.14")
+	e.markDone(t, "T9.15")
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, id := range []string{"T9.14", "T9.15"} {
+		wg.Add(1)
+		go func(blocker string) {
+			defer wg.Done()
+			<-start
+			e.svc.RecheckBlocked([]string{blocker}, reaperTestTime())
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+
+	if c := cardByID(t, e, "T9.16"); c.Status != "todo" {
+		t.Fatalf("зависимая карточка %q, ждали todo", c.Status)
+	}
+	cards, err := LoadCards(e.tasksDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale := taskstore.StaleBlocked(cards); len(stale) != 0 {
+		t.Fatalf("карточки с устаревшим флагом: %v", stale)
+	}
+}
+
+func TestRecheckBlockedIsIdempotent(t *testing.T) {
+	e := newEnv(t)
+	e.depCard(t, "T9.4", "done", "нет")
+	e.depCard(t, "T9.5", "blocked", "T9.4")
+
+	first := e.svc.RecheckBlocked([]string{"T9.4"}, reaperTestTime())
+	if !hasID(first.Changed, "T9.5") {
+		t.Fatalf("первый проход ничего не изменил: %+v", first)
+	}
+	path := cardByID(t, e, "T9.5").Path
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := e.svc.RecheckBlocked([]string{"T9.4"}, reaperTestTime())
+	if len(second.Changed) != 0 || len(second.Failed) != 0 {
+		t.Fatalf("повторный проход изменил файлы: %+v", second)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("повторный проход перезаписал файл: %q -> %q", before, after)
+	}
+}
+
+func TestRecheckBlockedSetsFlagWhenBlockerAlive(t *testing.T) {
+	e := newEnv(t)
+	e.depCard(t, "T9.6", "todo", "нет")
+	e.depCard(t, "T9.7", "todo", "T9.6")
+
+	rep := e.svc.RecheckBlocked([]string{"T9.6"}, reaperTestTime())
+	if !hasID(rep.Changed, "T9.7") {
+		t.Fatalf("живой блокировщик не поднял флаг: %+v", rep)
+	}
+	if c := cardByID(t, e, "T9.7"); c.Status != "blocked" {
+		t.Fatalf("статус карточки %q, ждали blocked", c.Status)
+	}
+}
+
+func TestRecheckReportCountsFiftyPasses(t *testing.T) {
+	e := newEnv(t)
+	e.depCard(t, "T9.8", "done", "нет")
+	e.depCard(t, "T9.9", "blocked", "T9.8")
+
+	for i := 0; i < 50; i++ {
+		rep := e.svc.RecheckBlocked([]string{"T9.8"}, reaperTestTime())
+		if len(rep.Failed) != 0 {
+			t.Fatalf("проход %d дал ошибку записи: %+v", i, rep)
+		}
+	}
+	entries, err := e.svc.RecheckLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 50 {
+		t.Fatalf("записей в отчёте %d, ждали 50", len(entries))
+	}
+	count, err := e.svc.RecheckCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 50 {
+		t.Fatalf("счётчик %d, ждали 50", count)
+	}
+}
+
+func TestRecheckWriteFailureIsReportedNotReturned(t *testing.T) {
+	e := newEnv(t)
+	e.depCard(t, "T9.10", "done", "нет")
+	e.depCard(t, "T9.11", "blocked", "T9.10")
+	failPath := cardByID(t, e, "T9.11").Path
+	e.cfg.RecheckWriteCard = func(path string, data []byte) error {
+		if path == failPath {
+			return fmt.Errorf("искусственная ошибка архива")
+		}
+		return taskstore.AtomicWrite(path, data, 0644)
+	}
+	e.svc = NewService(e.cfg)
+
+	rep := e.svc.RecheckBlocked([]string{"T9.10"}, reaperTestTime())
+	if !hasID(rep.Failed, "T9.11") || len(rep.Changed) != 0 {
+		t.Fatalf("отчёт об ошибке: %+v", rep)
+	}
+	entries, err := e.svc.RecheckLog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || !hasID(entries[0].Failed, "T9.11") {
+		t.Fatalf("журнал: %+v", entries)
+	}
+	if c := cardByID(t, e, "T9.11"); c.Status != "blocked" {
+		t.Fatalf("карточка изменилась при ошибке записи: %q", c.Status)
+	}
+}
+
+func TestRecheckDoesNotChangeHookBehavior(t *testing.T) {
+	e := newEnv(t)
+	dir := withHooks(e)
+	writeHook(t, dir, "unblocked.sh", "#!/bin/sh\nexit 0\n")
+	e.depCard(t, "T9.12", "done", "нет")
+	e.depCard(t, "T9.13", "blocked", "T9.12")
+
+	e.svc.RecheckBlocked([]string{"T9.12"}, reaperTestTime())
+	entries, err := e.svc.HookLog()
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("recheck изменил журнал хуков: %+v err=%v", entries, err)
+	}
+}
