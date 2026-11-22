@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -1232,14 +1233,14 @@ func TestAckBlockedNotMineIdempotent(t *testing.T) {
 
 	// AckReceipt has no _meta; the block needs a session, so use the path the
 	// MCP handler takes with the caller's session ID.
-	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first")
+	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first", ackControlFields{})
 	if err != nil || !first.Blocked {
 		t.Fatalf("first block with session: receipt %+v err %v", first, err)
 	}
 	clock.Advance(time.Hour)
 	in.Revision++ // the first block advanced the Watch by one revision
 
-	second, err := h.ackReceiptWithSession(context.Background(), in, "session-second")
+	second, err := h.ackReceiptWithSession(context.Background(), in, "session-second", ackControlFields{})
 	if err != nil {
 		t.Fatalf("repeat block: %v", err)
 	}
@@ -1479,7 +1480,7 @@ func TestAckBlockedEscalationMetric(t *testing.T) {
 	h := NewAckHandler(store, stamper, clock)
 	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine), Revision: w.Revision}
 
-	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first")
+	first, err := h.ackReceiptWithSession(context.Background(), in, "session-first", ackControlFields{})
 	if err != nil || !first.Blocked {
 		t.Fatalf("first block with session: receipt %+v err %v", first, err)
 	}
@@ -1487,7 +1488,7 @@ func TestAckBlockedEscalationMetric(t *testing.T) {
 
 	clock.Advance(time.Hour)
 	in.Revision++ // the first block advanced the Watch by one revision
-	if _, err := h.ackReceiptWithSession(context.Background(), in, "session-second"); err != nil {
+	if _, err := h.ackReceiptWithSession(context.Background(), in, "session-second", ackControlFields{}); err != nil {
 		t.Fatalf("repeat block: %v", err)
 	}
 	assertCounter(t, metrics, observe.CounterBlocksEscalated, 1)
@@ -1666,9 +1667,10 @@ func TestDecisionRegistryResumeErrorReleasesReservation(t *testing.T) {
 	}
 }
 
-// TestAckInputSchemaHasReApproveFields proves an MCP client can send the reason
-// and reApprove fields that carry an argued re-approval.
-func TestAckInputSchemaHasReApproveFields(t *testing.T) {
+// TestAckReApproveFieldsStayOutOfInputSchema proves the CR-05 fields reach the
+// handler through the raw request without changing the byte-pinned tools/list
+// input schema.
+func TestAckReApproveFieldsStayOutOfInputSchema(t *testing.T) {
 	schema, err := jsonschema.For[AckInput](nil)
 	if err != nil {
 		t.Fatalf("input schema: %v", err)
@@ -1678,9 +1680,16 @@ func TestAckInputSchemaHasReApproveFields(t *testing.T) {
 		t.Fatalf("marshal input schema: %v", err)
 	}
 	for _, field := range []string{"reason", "reApprove"} {
-		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
-			t.Fatalf("input schema has no %s property: %s", field, raw)
+		if bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Fatalf("input schema picked up %s: %s", field, raw)
 		}
+	}
+	req := &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+		Arguments: json.RawMessage(`{"reason":"reviewed","reApprove":true}`),
+	}}
+	got := reApproveFromRequest(req)
+	if !got.ReApprove || got.Reason != "reviewed" {
+		t.Errorf("reApproveFromRequest = %+v, want reason reviewed and reApprove true", got)
 	}
 }
 
@@ -1694,20 +1703,19 @@ func TestAckDecisionReApproveAppendsJournalRow(t *testing.T) {
 	ctx := context.Background()
 	const reason = "operator reviewed the failed checks"
 
-	first, err := h.AckReceipt(ctx, AckInput{
+	first, err := h.ackReceiptWithSession(ctx, AckInput{
 		WatchID: w.ID, ObligationID: o.ID,
 		Decision: string(DecisionApprove), DecisionID: "decision-1",
-	})
+	}, "", ackControlFields{})
 	if err != nil || !first.Resumed {
 		t.Fatalf("first approval: receipt %+v err %v", first, err)
 	}
 	round := first.AnswerRound
 
-	second, err := h.AckReceipt(ctx, AckInput{
+	second, err := h.ackReceiptWithSession(ctx, AckInput{
 		WatchID: w.ID, ObligationID: o.ID,
 		Decision: string(DecisionApprove), DecisionID: "decision-2",
-		Reason: reason, ReApprove: true,
-	})
+	}, "", ackControlFields{reApprove: reApproveFields{Reason: reason, ReApprove: true}})
 	if err != nil {
 		t.Fatalf("argued re-approval: %v", err)
 	}
@@ -1733,10 +1741,10 @@ func TestAckDecisionReApproveAppendsJournalRow(t *testing.T) {
 		t.Errorf("re-approval changed the Watch: %+v err %v", got, err)
 	}
 
-	_, err = h.AckReceipt(ctx, AckInput{
+	_, err = h.ackReceiptWithSession(ctx, AckInput{
 		WatchID: w.ID, ObligationID: o.ID,
-		Decision: string(DecisionApprove), DecisionID: "decision-3", ReApprove: true,
-	})
+		Decision: string(DecisionApprove), DecisionID: "decision-3",
+	}, "", ackControlFields{reApprove: reApproveFields{ReApprove: true}})
 	if err == nil {
 		t.Fatal("re-approval without a reason was accepted")
 	}
@@ -1749,11 +1757,10 @@ func TestAckDecisionReApproveAppendsJournalRow(t *testing.T) {
 	}
 
 	clock.Advance(time.Hour)
-	repeat, err := h.AckReceipt(ctx, AckInput{
+	repeat, err := h.ackReceiptWithSession(ctx, AckInput{
 		WatchID: w.ID, ObligationID: o.ID,
 		Decision: string(DecisionApprove), DecisionID: "decision-2",
-		Reason: reason, ReApprove: true,
-	})
+	}, "", ackControlFields{reApprove: reApproveFields{Reason: reason, ReApprove: true}})
 	if err != nil {
 		t.Fatalf("repeat re-approval: %v", err)
 	}
@@ -1798,21 +1805,20 @@ func TestAckDecisionReApproveRollsBackWhenClaimFails(t *testing.T) {
 	h := NewAckHandler(store, stamper, clock)
 	ctx := context.Background()
 
-	first, err := h.AckReceipt(ctx, AckInput{
+	first, err := h.ackReceiptWithSession(ctx, AckInput{
 		WatchID: w.ID, ObligationID: o.ID,
 		Decision: string(DecisionApprove), DecisionID: "decision-1",
-	})
+	}, "", ackControlFields{})
 	if err != nil || !first.Resumed {
 		t.Fatalf("first approval: receipt %+v err %v", first, err)
 	}
 	round := first.AnswerRound
 
 	stamper.failClaim = true
-	if _, err := h.AckReceipt(ctx, AckInput{
+	if _, err := h.ackReceiptWithSession(ctx, AckInput{
 		WatchID: w.ID, ObligationID: o.ID,
 		Decision: string(DecisionApprove), DecisionID: "decision-2",
-		Reason: "reviewed", ReApprove: true,
-	}); err == nil {
+	}, "", ackControlFields{reApprove: reApproveFields{Reason: "reviewed", ReApprove: true}}); err == nil {
 		t.Fatal("re-approval with a failing claim write was accepted")
 	}
 	rows := h.decisions.History(w.ID, round)

@@ -157,12 +157,6 @@ type AckInput struct {
 	// client can name which request was answered. It is optional for a plain
 	// ack.
 	DecisionID string `json:"decisionID,omitempty" jsonschema:"identifier of the pending decision this approve or reject answers"`
-	// Reason explains why an operator re-signs an already answered decision.
-	// It is required together with ReApprove and ignored on a plain ack.
-	Reason string `json:"reason,omitempty" jsonschema:"reason for re-approving an already answered decision; required when reApprove is set"`
-	// ReApprove asks to append a new approval row that references the earlier
-	// one. It does not resume the agent again. An empty Reason is refused.
-	ReApprove bool `json:"reApprove,omitempty" jsonschema:"record an argued re-approval of an answered decision instead of resuming the agent again; requires reason"`
 }
 
 // StaleRevisionError reports an event whose task revision is older than the
@@ -907,6 +901,39 @@ func deferredCallFromRequest(req *mcpsdk.CallToolRequest) domain.DeferredToolUse
 	}
 }
 
+// reApproveFields are the CR-05 fields carried alongside a beacon_ack decision.
+// They stay out of AckInput so the byte-pinned tools/list input schema does not
+// change, as with the CS-02 and CSx-03 control fields.
+type reApproveFields struct {
+	Reason    string `json:"reason"`
+	ReApprove bool   `json:"reApprove"`
+}
+
+// ackControlFields bundles the optional control payloads read from the raw
+// request. A typed caller without a raw request passes the zero value.
+type ackControlFields struct {
+	parked    domain.DeferredToolUse
+	reApprove reApproveFields
+}
+
+// reApproveFromRequest reads the argued re-approval fields from the raw request
+// arguments. A missing or malformed value yields no re-approval, so an absent
+// field cannot change a decision.
+func reApproveFromRequest(req *mcpsdk.CallToolRequest) reApproveFields {
+	if req == nil || req.Params == nil || req.Params.Arguments == nil {
+		return reApproveFields{}
+	}
+	raw, err := json.Marshal(req.Params.Arguments)
+	if err != nil {
+		return reApproveFields{}
+	}
+	var fields reApproveFields
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return reApproveFields{}
+	}
+	return fields
+}
+
 // Handle adapts Ack to the go-sdk typed tool handler signature and returns an
 // ok response. A plain ack keeps the byte-identical {"ok":true} shape because
 // the decision fields have omitempty. A decision ack also carries resumed,
@@ -937,8 +964,11 @@ func (h *AckHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in
 			return nil, OKOutput{}, err
 		}
 	}
-	parked := deferredCallFromRequest(req)
-	receipt, err := h.ackReceiptWithSession(ctx, in, sessionID, parked)
+	control := ackControlFields{
+		parked:    deferredCallFromRequest(req),
+		reApprove: reApproveFromRequest(req),
+	}
+	receipt, err := h.ackReceiptWithSession(ctx, in, sessionID, control)
 	if err != nil && !IsStaleRevision(err) {
 		return nil, OKOutput{}, err
 	}
@@ -976,15 +1006,16 @@ func (h *AckHandler) Ack(ctx context.Context, in AckInput) error {
 // It carries no session ID: a blocked:not_mine decision needs one from _meta,
 // so callers that want to block should use Handle or ackReceiptWithSession.
 func (h *AckHandler) AckReceipt(ctx context.Context, in AckInput) (AckReceipt, error) {
-	return h.ackReceiptWithSession(ctx, in, "")
+	return h.ackReceiptWithSession(ctx, in, "", ackControlFields{})
 }
 
 // ackReceiptWithSession is the ack path with the caller's opaque session ID from
 // _meta. The session is used only by a blocked:not_mine decision, as BlockedBy;
 // plain acks, approve/reject decisions and blocked:resolved ignore it. The
-// optional parked call is the CSx-03 defer payload read from the raw request;
-// it is accepted only when the decision is defer.
-func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, sessionID string, parked ...domain.DeferredToolUse) (AckReceipt, error) {
+// control fields carry the CSx-03 parked call and the CR-05 re-approval reason,
+// both read from the raw request. The parked call is accepted only when the
+// decision is defer.
+func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, sessionID string, control ackControlFields) (AckReceipt, error) {
 	if in.WatchID == "" || in.ObligationID == "" {
 		return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: watchID and obligationID are required")
 	}
@@ -1052,10 +1083,7 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 			return AckReceipt{}, domain.NewAppError(domain.CodeInvalidInput, "ack: unknown blocked decision reason: "+reason)
 		}
 	} else if in.Decision == string(DecisionDefer) {
-		var call domain.DeferredToolUse
-		if len(parked) > 0 {
-			call = parked[0]
-		}
+		call := control.parked
 		stored, applied, err := h.applyDefer(in, call)
 		if err != nil {
 			return AckReceipt{}, err
@@ -1069,7 +1097,7 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 	} else if in.Decision != "" {
 		var rec DecisionRecord
 		var applied bool
-		rec, applied, reApproved, err = h.applyDecision(in, w, Decision(in.Decision))
+		rec, applied, reApproved, err = h.applyDecision(in, w, Decision(in.Decision), control.reApprove)
 		if err != nil {
 			return AckReceipt{}, err
 		}
@@ -1109,11 +1137,11 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 // re-approval with a reason appends a journal row instead of resuming again.
 // The third result reports that a row was appended, so the caller can undo it
 // when the later claim write fails.
-func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (DecisionRecord, bool, bool, error) {
+func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision, reApprove reApproveFields) (DecisionRecord, bool, bool, error) {
 	if !d.Valid() {
 		return DecisionRecord{}, false, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision must be approve or reject")
 	}
-	if in.ReApprove && in.Reason == "" {
+	if reApprove.ReApprove && reApprove.Reason == "" {
 		return DecisionRecord{}, false, false, domain.NewAppError(domain.CodeInvalidInput, "ack: reApprove requires a reason (reason_required)")
 	}
 	if h.decisions == nil {
@@ -1140,8 +1168,8 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 		Decision:   d,
 		ResumedAt:  h.clock.Now(),
 		Round:      round,
-		Reason:     in.Reason,
-		ReApprove:  in.ReApprove,
+		Reason:     reApprove.Reason,
+		ReApprove:  reApprove.ReApprove,
 	}
 	before := len(h.decisions.History(in.WatchID, round))
 	rec, applied, err := h.decisions.Decide(in.WatchID, rec, func() (uint64, error) {
