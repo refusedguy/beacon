@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
@@ -786,6 +787,102 @@ func (l *admissionLock) admit(ctx context.Context, action dispatchAction, guard 
 		return nil, reason
 	}
 	return release, admissionReason{Allowed: true}
+}
+
+// --- CCx-01: abort-on-drop for wave element dispatch -----------------------
+
+// abortHandle cancels one launched wave element. The element runs on a child
+// of the dispatch context, so a parent that disappears stops it. Calling Abort
+// stops the element before its body finishes. Abort is idempotent.
+type abortHandle struct {
+	card    string
+	ctx     context.Context
+	cancel  context.CancelFunc
+	once    sync.Once
+	aborted atomic.Bool
+}
+
+// Abort stops the element once. Later calls do nothing.
+func (h *abortHandle) Abort() {
+	h.once.Do(func() {
+		h.aborted.Store(true)
+		h.cancel()
+	})
+}
+
+// Aborted reports whether Abort stopped this element.
+func (h *abortHandle) Aborted() bool { return h.aborted.Load() }
+
+// Done closes when the element context ends, by parent cancel or by Abort.
+func (h *abortHandle) Done() <-chan struct{} { return h.ctx.Done() }
+
+// Err reports why the element context ended.
+func (h *abortHandle) Err() error { return h.ctx.Err() }
+
+// launchResult tells the caller whether an element entered its body. A launch
+// that did not start carries the reason and no handle.
+type launchResult struct {
+	Started bool
+	Reason  string
+}
+
+// launchElement admits one wave element and starts its body on a child of the
+// dispatch context. Cancellation is checked before admission and again after
+// the slot is granted, so a parent that disappears around the wait starts
+// nothing. The slot is released and the child is cancelled when the body
+// returns. A work body must honor ctx cancellation, as WaitReady does.
+func launchElement(
+	ctx context.Context,
+	lock *admissionLock,
+	action dispatchAction,
+	guard admissionGuard,
+	work func(context.Context),
+) (*abortHandle, launchResult) {
+	if err := ctx.Err(); err != nil {
+		return nil, launchResult{Reason: "dispatch interrupted: " + err.Error()}
+	}
+	release, admitted := lock.admit(ctx, action, guard)
+	if !admitted.Allowed {
+		return nil, launchResult{Reason: admitted.Reason}
+	}
+	if err := ctx.Err(); err != nil {
+		release()
+		return nil, launchResult{Reason: "dispatch interrupted: " + err.Error()}
+	}
+	child, cancel := context.WithCancel(ctx)
+	h := &abortHandle{card: action.Card, ctx: child, cancel: cancel}
+	go func() {
+		defer release()
+		defer cancel()
+		work(child)
+	}()
+	return h, launchResult{Started: true}
+}
+
+// launchPlan binds one abort handle to every element of every step. Handles
+// are recorded before the next element launches, so a parent cancellation
+// leaves a handle for each element that started. Elements that did not start
+// are omitted. The order matches the plan order.
+func launchPlan(
+	ctx context.Context,
+	lock *admissionLock,
+	plan wavePlan,
+	guard admissionGuard,
+	work func(string, context.Context),
+) []*abortHandle {
+	var handles []*abortHandle
+	for _, step := range plan.Steps {
+		for _, card := range step.Cards {
+			action := dispatchAction{Card: card, SupportsParallel: !step.Sequential}
+			h, result := launchElement(ctx, lock, action, guard, func(child context.Context) {
+				work(card, child)
+			})
+			if result.Started {
+				handles = append(handles, h)
+			}
+		}
+	}
+	return handles
 }
 
 // ---------------------------------------------------------------------------
