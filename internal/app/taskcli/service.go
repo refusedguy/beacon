@@ -14,11 +14,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/bmatcuk/doublestar/v4"
 )
+
+// DefaultLockRetryInterval совпадает с шагом повтора taskstore.AcquireLock.
+const DefaultLockRetryInterval = 100 * time.Millisecond
 
 // Config задаёт каталоги и корень проекта.
 type Config struct {
@@ -26,6 +30,11 @@ type Config struct {
 	StateDir string
 	ADRDir   string
 	Root     string
+
+	// LockRetryInterval задаёт паузу между попытками взять общий файловый
+	// замок. Ноль или отрицательное значение включает значение по умолчанию.
+	// Тесты ставят короткий интервал, не меняя production-путь.
+	LockRetryInterval time.Duration
 }
 
 // Service выполняет list, new и take.
@@ -35,6 +44,104 @@ type Service struct {
 
 // NewService создаёт сервис с конфигурацией.
 func NewService(cfg Config) *Service { return &Service{Cfg: cfg} }
+
+// cardLock — та часть файлового замка, которая нужна сервису.
+type cardLock interface {
+	Release() error
+}
+
+// acquireLock берёт общий замок карточек. При интервале по умолчанию вызов
+// идёт через taskstore, поэтому production-путь не меняется. Короткий
+// интервал включает локальную реализацию с тем же flock и числом попыток.
+func (s *Service) acquireLock() (cardLock, error) {
+	path := LockPath(s.Cfg.StateDir, s.Cfg.Root)
+	interval := s.Cfg.LockRetryInterval
+	if interval <= 0 {
+		interval = DefaultLockRetryInterval
+	}
+	if interval == DefaultLockRetryInterval {
+		return AcquireLock(path, s.Cfg.Root)
+	}
+	return acquireLockWithInterval(path, s.Cfg.Root, interval)
+}
+
+// flockLock удерживает файловый замок через открытый дескриптор.
+type flockLock struct {
+	path string
+	f    *os.File
+}
+
+// Release отпускает flock и удаляет файл замка. Повторное освобождение
+// безопасно, как и у taskstore.Lock.
+func (l *flockLock) Release() error {
+	if l == nil || l.path == "" {
+		return nil
+	}
+	if l.f != nil {
+		_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
+		_ = l.f.Close()
+		l.f = nil
+	}
+	err := os.Remove(l.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+// acquireLockWithInterval повторяет логику taskstore.AcquireLock, но ждёт
+// retry между попытками вместо фиксированных 100 мс. Замок остаётся тем же:
+// flock на открытом файле, проверка inode и 50 попыток.
+func acquireLockWithInterval(lockPath, root string, retry time.Duration) (cardLock, error) {
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
+		return nil, Startupf("не создан каталог состояния: %v", err)
+	}
+	for attempt := 0; attempt < 50; attempt++ {
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return nil, Startupf("не открыт замок %s: %v", lockPath, err)
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			_ = f.Close()
+			if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+				time.Sleep(retry)
+				continue
+			}
+			return nil, Startupf("не взят замок %s: %v", lockPath, err)
+		}
+		locked, err := f.Stat()
+		if err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не прочитан файл замка %s: %v", lockPath, err)
+		}
+		current, err := os.Stat(lockPath)
+		if err != nil || !os.SameFile(locked, current) {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			continue
+		}
+		content := fmt.Sprintf("pid=%d\nstarted=%s\nroot=%s\n",
+			os.Getpid(), time.Now().UTC().Format(time.RFC3339), root)
+		if err := f.Truncate(0); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не очищен файл замка %s: %v", lockPath, err)
+		}
+		if _, err := f.WriteAt([]byte(content), 0); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не записан файл замка: %v", err)
+		}
+		if err := f.Sync(); err != nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return nil, Startupf("не синхронизирован файл замка: %v", err)
+		}
+		return &flockLock{path: lockPath, f: f}, nil
+	}
+	return nil, Startupf("замок %s занят: исчерпано 50 попыток", lockPath)
+}
 
 var (
 	adrRefRE = regexp.MustCompile(`^ADR ([0-9]{4})$`)
@@ -225,8 +332,7 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	o.Check = defaultText(o.Check)
 	o.Acceptance = defaultText(o.Acceptance)
 
-	lockPath := LockPath(s.Cfg.StateDir, s.Cfg.Root)
-	lock, err := AcquireLock(lockPath, s.Cfg.Root)
+	lock, err := s.acquireLock()
 	if err != nil {
 		return "", "", err
 	}
@@ -498,7 +604,7 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 		return "", Validationf("неверное время %q: %v", o.Time, err)
 	}
 
-	lock, err := AcquireLock(LockPath(s.Cfg.StateDir, s.Cfg.Root), s.Cfg.Root)
+	lock, err := s.acquireLock()
 	if err != nil {
 		return "", err
 	}
@@ -1087,7 +1193,7 @@ func SelfTest(w io.Writer) error {
 	if err := os.WriteFile(lockPath, []byte(dead), 0600); err != nil {
 		return err
 	}
-	lock, err := AcquireLock(lockPath, root)
+	lock, err := svc.acquireLock()
 	check("замок с мёртвым PID перехвачен", err == nil)
 	if err == nil {
 		_ = lock.Release()
