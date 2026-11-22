@@ -57,15 +57,9 @@ func testClient(t *testing.T, handler http.Handler) (*Client, <-chan seenRequest
 	return client, seen
 }
 
-func nextRequest(t *testing.T, seen <-chan seenRequest) seenRequest {
+func nextRequest(t *testing.T, ctx context.Context, seen <-chan seenRequest) seenRequest {
 	t.Helper()
-	select {
-	case req := <-seen:
-		return req
-	case <-time.After(2 * time.Second):
-		t.Fatal("server received no request")
-		return seenRequest{}
-	}
+	return waitForValue(t, ctx, seen, "request")
 }
 
 func TestSnapshotReadsProjection(t *testing.T) {
@@ -94,7 +88,10 @@ func TestSnapshotReadsProjection(t *testing.T) {
 	if len(snap.Escalations) != 1 || snap.Escalations[0] != "e1" {
 		t.Errorf("escalations = %v, want [e1]", snap.Escalations)
 	}
-	req := nextRequest(t, seen)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	req := nextRequest(t, ctx, seen)
 	if req.method != http.MethodGet || req.path != snapshotPath || req.auth != "Bearer secret" {
 		t.Errorf("request = %+v, want GET %s with bearer token", req, snapshotPath)
 	}
@@ -123,7 +120,10 @@ func TestDecidePostsCommandToServer(t *testing.T) {
 	if !receipt.OK || !receipt.Applied || receipt.DecisionID != "d1" {
 		t.Errorf("receipt = %+v, want ok applied d1", receipt)
 	}
-	req := nextRequest(t, seen)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	req := nextRequest(t, ctx, seen)
 	if req.method != http.MethodPost || req.path != decidePath {
 		t.Errorf("request = %+v, want POST %s", req, decidePath)
 	}
@@ -148,7 +148,10 @@ func TestDecideRejectsRefusalAndEmptyInput(t *testing.T) {
 	if _, err := client.Decide(context.Background(), Decision{Command: "cancel", WatchID: "w1"}); err == nil {
 		t.Fatal("Decide returned no error for a refused command")
 	}
-	nextRequest(t, seen)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
+	nextRequest(t, ctx, seen)
 
 	if _, err := client.Decide(context.Background(), Decision{WatchID: "w1"}); err == nil {
 		t.Fatal("Decide returned no error for an empty command")
@@ -372,9 +375,12 @@ func TestCommandSendsDecisionAndRefreshes(t *testing.T) {
 	if err := app.Command(context.Background(), "ack w1"); err != nil {
 		t.Fatalf("Command: %v", err)
 	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
 	var decisions, snapshots int
 	for i := 0; i < 2; i++ {
-		req := nextRequest(t, seen)
+		req := nextRequest(t, ctx, seen)
 		switch req.path {
 		case decidePath:
 			decisions++
