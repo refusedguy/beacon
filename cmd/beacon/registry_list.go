@@ -5,7 +5,7 @@ package main
 // The command prints the executors registered for one project with their role,
 // capabilities and config id. The registry is read through a narrow port that
 // is bound to a single project when it is built (store.NewScopedRegistry in the
-// wiring layer, T5.29). The port has no project argument and no write method,
+// command's own source). The port has no project argument and no write method,
 // so this command cannot widen its own scope. The renderer is pure, so both
 // formats and the empty-registry case are tested without a live daemon.
 // Dispatch registration in cmd/beacon/main.go is outside these OwnerFiles.
@@ -15,9 +15,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
+
+	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // registryListEntry is one registry row reduced to what the command prints.
@@ -38,11 +43,93 @@ type registryListReader interface {
 	Executors() ([]registryListEntry, error)
 }
 
-// registryListSource is the wiring seam. The wiring layer installs a reader
-// bound to the current project. The default refuses rather than returning an
-// unscoped reader that could list every project.
-var registryListSource = func() (registryListReader, error) {
-	return nil, fmt.Errorf("registry reader not connected")
+// dbRegistryListReader adapts the scoped store reader to the command's narrow
+// port. It owns the database handle it opens and closes it after the read.
+type dbRegistryListReader struct {
+	db     *store.DB
+	scoped *store.ScopedRegistry
+}
+
+func (r *dbRegistryListReader) Executors() ([]registryListEntry, error) {
+	records, err := r.scoped.Executors()
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]registryListEntry, 0, len(records))
+	for _, rec := range records {
+		entries = append(entries, registryListEntry{
+			Project:      rec.ProjectKey,
+			ID:           rec.AgentID,
+			Role:         rec.Role,
+			Capabilities: rec.Capabilities,
+			Config:       rec.ConfigID,
+		})
+	}
+	return entries, nil
+}
+
+func (r *dbRegistryListReader) Close() error { return r.db.Close() }
+
+// registryListSource is the wiring seam. The default builds a reader bound to
+// the current project. Tests replace the seam with a reader they control. An
+// error is returned when no project can be named, never an unscoped reader
+// that could list every project (T5.29, ADR 0086).
+var registryListSource = func(root string) (registryListReader, error) {
+	return openProjectRegistryListReader(root)
+}
+
+// registryListProjectRoot resolves the same root that stateDir uses for its
+// project-scoped store, so the scope key and the database path agree.
+func registryListProjectRoot(root string) (string, error) {
+	if trimmed := strings.TrimSpace(root); trimmed != "" {
+		return trimmed, nil
+	}
+	if fromEnv := strings.TrimSpace(projectRootFromEnv()); fromEnv != "" {
+		return fromEnv, nil
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("registry list: current directory: %w", err)
+	}
+	return cwd, nil
+}
+
+// openProjectRegistryListReader binds one read-only registry reader to the
+// project the command runs in. The database path and the scope key come from
+// the same root, so a reader cannot reach rows of another project even when
+// several projects share one database file.
+func openProjectRegistryListReader(root string) (registryListReader, error) {
+	projectRoot, err := registryListProjectRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	dir, err := stateDir(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("registry list: state directory: %w", err)
+	}
+	if err := mcp.EnsureStateDir(dir); err != nil {
+		return nil, err
+	}
+	db, err := store.Open(filepath.Join(dir, mcpStateDBName))
+	if err != nil {
+		return nil, fmt.Errorf("registry list: open store: %w", err)
+	}
+	key, err := projectStateKey(projectRoot)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("registry list: project key: %w", err)
+	}
+	scope, err := store.NewProjectScope(key)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("registry list: project scope: %w", err)
+	}
+	scoped, err := store.NewScopedRegistry(db, scope)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("registry list: scoped registry: %w", err)
+	}
+	return &dbRegistryListReader{db: db, scoped: scoped}, nil
 }
 
 // registryListRunner lets the wiring layer install the command without this
@@ -113,10 +200,13 @@ func runRegistryList(c *CLI, args []string) int {
 	if !parseFlags("registry list", args, c.errOut, fs) {
 		return 2
 	}
-	reader, err := registryListSource()
+	reader, err := registryListSource(c.root)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "%v\n", cliError("registry list", err))
 		return 2
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		defer closer.Close()
 	}
 	entries, err := reader.Executors()
 	if err != nil {
