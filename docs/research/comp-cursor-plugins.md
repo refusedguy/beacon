@@ -22,7 +22,7 @@
 
 Слов `deep module`, `grilling` и `VL` в клоне нет. Ближайшие механизмы такие. Deep module это `architect` плюс типы и чистый классификатор в `watch-pr`. Grilling это `interrogate`. Цикл это Ralph stop hook и `autonomous-run`. Ниже разобраны именно они, без выдумывания терминов.
 
-## 2. Пять приёмов с подтверждением по строкам
+## 2. Шесть приёмов с подтверждением по строкам
 
 ### CP-01. Вердикт как чистый модуль: типы, приоритет, фейки
 
@@ -64,6 +64,12 @@ CP-04 предлагает добавить эти три проверки в `n
 
 CP-05 предлагает добавить это правило в описание ревью и в `red-verdict-triage`. Комментарий ревью становится блокирующим только с воспроизводимой командой и наблюдаемым выводом. Судья из другого вендора остаётся опцией, не обязательной проверкой.
 
+### CP-16. Обзор PR по ценности для ревьюера
+
+`pr-review-canvas/skills/pr-review-canvas/SKILL.md:27-33` запрещает показывать файлы в алфавитном порядке или по дереву. Три секции идут в фиксированном порядке: core logic, wiring and integration, boilerplate and mechanical. Core logic идёт первой, boilerplate только списком имён без inline diff. Строки `:35-39` требуют короткий псевдокод рядом с diff, когда change труден для чтения, и не требуют его для простой правки. Строки `:41-45` требуют трассировки одного маленького реалистичного входа по старому и новому пути с указанием места расхождения. Строки `:47-51` предлагают необязательные метки Subtle, Breaking, Race condition и Perf. Строки `:53-60` требуют писать, почему изменилось, а не что изменилось.
+
+У beacon описание ревью ограничено сопоставлением Harbor в `AGENTS.md:115` и двумя строками таблицы аналогов в `README.md:339-348`. Правил о порядке секций diff и о псевдокоде в дереве нет. CP-16 добавляет порядок секций, псевдокод для трудного change и разбор одного входа в `docs/templates/executor-task.md`. AGENTS.md не входит в OwnerFiles карточки, поэтому правило трёх секций записано в шаблоне исполнителя.
+
 ## 3. Карточки
 
 | ID | Приём | Приоритет | Ссылка |
@@ -73,6 +79,7 @@ CP-05 предлагает добавить это правило в описа�
 | CP-03 | Предикат выхода и журнал на итерацию | P2 | `docs/tasks/CP-03.md` |
 | CP-04 | Заморозка координат и доверенный маркер в ночной смене | P1 | `docs/tasks/CP-04.md` |
 | CP-05 | Находка выживает только с доказанным прогоном | P1 | `docs/tasks/CP-05.md` |
+| CP-16 | Обзор PR по ценности для ревьюера, а не по дереву файлов | P2 | `docs/tasks/CP-16.md` |
 
 Карточки не назначают OwnerFiles в коде. Владельцы файлов в них помечены как кандидаты и требуют отдельного решения до выдачи задачи.
 
@@ -94,5 +101,5 @@ CP-05 предлагает добавить это правило в описа�
 - `pstack/agents/poteto-agent.md`, `pstack/agents/comment-sicko.md`.
 - `pstack/automations/benny/FOR_AGENTS.md` и оба SKILL.md с references и templates.
 - `advisor/hooks/`, `continual-learning/hooks/`, `ralph-loop/hooks/`.
-- `orchestrate/skills/orchestrate/SKILL.md`, `create-plugin/rules/plugin-quality-gates.mdc`, `cursor-team-kit/rules/`.
+- `orchestrate/skills/orchestrate/SKILL.md`, `create-plugin/rules/plugin-quality-gates.mdc`, `cursor-team-kit/rules/`, `pr-review-canvas/skills/pr-review-canvas/SKILL.md`.
 - Beacon: `README.md`, `AGENTS.md`, `internal/domain/types.go`, `.opencode/skills/night-shift/`, `.opencode/skills/red-verdict-triage/`, `docs/adrs/0022-ci-only-verification.md`, по `origin/main` `2d34645b54f45d84dba3a595350f17f8658759da`.

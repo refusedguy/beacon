@@ -363,6 +363,25 @@ executor-task:docs-sync -->
 
 Правило относится к заново сгенерированному тексту: карточкам, телам PR и документам. Уже опубликованные PR не меняются.
 
+## Обзор PR по ценности для ревьюера
+
+Описание PR показывает изменения в порядке ценности для ревьюера. Исполнитель не печатает файлы в алфавитном порядке и не следует дереву каталогов. Он делит описание на три секции в фиксированном порядке: `core logic`, `wiring and integration`, `boilerplate and mechanical`. Core logic идёт первой. Boilerplate содержит только список имён без inline diff.
+
+Когда change труден для чтения, исполнитель добавляет короткий псевдокод рядом с diff. Псевдокод передаёт намерение и порядок шагов, а не копию кода. Для простой правки псевдокод не нужен.
+
+Исполнитель трассирует один конкретный вход. Маленький реалистичный пример проходит по старому и новому пути, и исполнитель называет место расхождения. Метки `Subtle`, `Breaking`, `Race condition` и `Perf` отделяют неожиданное. Метки необязательны. Текст объясняет, почему изменилось поведение, а не только что изменилось.
+
+<!-- executor-task:review-value
+order: core logic, wiring and integration, boilerplate and mechanical
+no-tree-order: true
+boilerplate: names-only, no-inline-diff
+pseudocode: hard-to-read-change, optional-for-simple-edits
+input-trace: one-small-realistic-input, name-divergence-point
+labels: Subtle, Breaking, Race condition, Perf, optional
+explain: why-not-only-what
+source: CP-16, docs/research/comp-cursor-plugins.md
+executor-task:review-value -->
+
 ## Контрольные точки правки и отмена
 
 Исполнитель коммитит сразу после каждой правки и сразу после исправления линтера. Один коммит на правку даёт контрольную точку, к которой можно вернуться без работы с запушенной историей. Хеш каждого такого коммита попадает в `SessionCommits` якоря Watch рядом с другим состоянием worktree. Для записи хеша исполнитель вызывает `RecordCheckpoint`, для возврата `UndoCheckpoint` из `internal/infra/worktree/headguard.go`.
