@@ -1213,8 +1213,10 @@ func projectRootFromTasksDir(tasksDir string) string {
 }
 
 // CreateExclusive создаёт файл карточки. Занятая живая карточка или
-// забронированный ID дают ошибку валидации, код 1. Проверка журнала и
-// создание идут под одним замком каталога карточек.
+// забронированный ID дают ошибку валидации, код 1. Вызывающий уже держит
+// общий замок каталога карточек: Service.New берёт его перед записью.
+// Повторный захват того же замка здесь ждал бы сам себя и истратил 50 попыток.
+// Журнал и создание карточки поэтому идут под одним замком вызывающего.
 func CreateExclusive(filePath string, data []byte) error {
 	tasksDir := filepath.Dir(filePath)
 	id := strings.TrimSuffix(filepath.Base(filePath), ".md")
@@ -1223,20 +1225,10 @@ func CreateExclusive(filePath string, data []byte) error {
 		return err
 	}
 	root := projectRootFromTasksDir(tasksDir)
-	lock, err := AcquireLock(TasksLockPath(tasksDir), root)
-	if err != nil {
-		return err
-	}
 	if err := AssertIDAvailable(tasksDir, ReservedIDsPath(stateDir, root), id); err != nil {
-		_ = lock.Release()
 		return err
 	}
-	createErr := createExclusiveRaw(filePath, data)
-	releaseErr := lock.Release()
-	if createErr != nil {
-		return createErr
-	}
-	return releaseErr
+	return createExclusiveRaw(filePath, data)
 }
 
 // createExclusiveRaw создаёт файл через O_EXCL без проверки журнала.
