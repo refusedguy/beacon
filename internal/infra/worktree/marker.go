@@ -25,6 +25,31 @@ const (
 	markerFilePerm   = 0o600
 )
 
+// ErrMarkerOwnerConflict reports that a different agent already owns the
+// marker for a worktree. Callers use errors.Is to separate a refused bind from
+// other write errors.
+var ErrMarkerOwnerConflict = errors.New("worktree: marker: owned by another agent")
+
+// OwnerConflictError carries the owner of an existing marker and the agent
+// whose bind was refused. It satisfies errors.Is against ErrMarkerOwnerConflict.
+type OwnerConflictError struct {
+	Path      string
+	Owner     string
+	Requested string
+}
+
+func (e *OwnerConflictError) Error() string {
+	return fmt.Sprintf("worktree: marker: %s owned by %q; bind by %q refused", e.Path, e.Owner, e.Requested)
+}
+
+func (e *OwnerConflictError) Is(target error) bool {
+	return target == ErrMarkerOwnerConflict
+}
+
+// errMarkerExists is the internal signal that the atomic publish lost the race
+// to another writer.
+var errMarkerExists = errors.New("worktree: marker: path already exists")
+
 // Marker is the durable record that an agent is working in a worktree.
 // Path is the worktree directory the marker belongs to, AgentID identifies
 // the agent, and UpdatedAt is the last touch time in UTC.
@@ -42,9 +67,10 @@ func MarkerPath(storeDir, worktreeDir string) string {
 	return filepath.Join(storeDir, MarkerDir, fmt.Sprintf("%x.json", sum[:8]))
 }
 
-// WriteMarker creates or replaces the marker for worktreeDir. The file is
-// written with 0600 in a 0700 directory so other local users cannot read the
-// recorded agent identity.
+// WriteMarker binds worktreeDir to agentID. The first bind publishes the
+// marker with an atomic no-clobber operation. A bind by the same agent is a
+// no-op and leaves the existing record untouched. A bind by a different agent
+// returns ErrMarkerOwnerConflict instead of replacing the owner.
 func WriteMarker(storeDir, worktreeDir, agentID string, now time.Time) (Marker, error) {
 	if strings.TrimSpace(worktreeDir) == "" {
 		return Marker{}, fmt.Errorf("worktree: marker: empty worktree dir")
@@ -62,10 +88,79 @@ func WriteMarker(storeDir, worktreeDir, agentID string, now time.Time) (Marker, 
 	if err := os.MkdirAll(filepath.Dir(path), markerDirPerm); err != nil {
 		return Marker{}, fmt.Errorf("worktree: marker: mkdir: %w", err)
 	}
-	if err := os.WriteFile(path, append(data, '\n'), markerFilePerm); err != nil {
-		return Marker{}, fmt.Errorf("worktree: marker: write: %w", err)
+	switch err := writeMarkerNoClobber(path, append(data, '\n')); {
+	case err == nil:
+		return m, nil
+	case errors.Is(err, errMarkerExists):
+		existing, ok, readErr := ReadMarker(storeDir, worktreeDir)
+		if readErr != nil {
+			return Marker{}, readErr
+		}
+		if ok && existing.AgentID == agentID {
+			return existing, nil
+		}
+		return Marker{}, &OwnerConflictError{Path: path, Owner: existing.AgentID, Requested: agentID}
+	default:
+		return Marker{}, err
 	}
-	return m, nil
+}
+
+// createMarkerTemp writes data to a temp file in the marker directory and
+// returns its path. os.CreateTemp uses O_CREATE|O_EXCL, so two writers never
+// share a temp file. Callers remove the returned path when done.
+func createMarkerTemp(dir, prefix string, data []byte) (string, error) {
+	tmp, err := os.CreateTemp(dir, prefix)
+	if err != nil {
+		return "", fmt.Errorf("worktree: marker: temp: %w", err)
+	}
+	name := tmp.Name()
+	if err := tmp.Chmod(markerFilePerm); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return "", fmt.Errorf("worktree: marker: chmod: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return "", fmt.Errorf("worktree: marker: write temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return "", fmt.Errorf("worktree: marker: close temp: %w", err)
+	}
+	return name, nil
+}
+
+// writeMarkerNoClobber publishes data at path only when path does not exist.
+// os.Link creates the final name atomically and fails with EEXIST when another
+// bind won the race, which is what gives the worktree a single owner.
+func writeMarkerNoClobber(path string, data []byte) error {
+	name, err := createMarkerTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-", data)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(name)
+	if err := os.Link(name, path); err != nil {
+		if os.IsExist(err) {
+			return errMarkerExists
+		}
+		return fmt.Errorf("worktree: marker: publish: %w", err)
+	}
+	return nil
+}
+
+// replaceMarker atomically replaces an existing marker. The temp file lives in
+// the same directory, so the rename cannot cross filesystems.
+func replaceMarker(path string, data []byte) error {
+	name, err := createMarkerTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-", data)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(name)
+	if err := os.Rename(name, path); err != nil {
+		return fmt.Errorf("worktree: marker: replace: %w", err)
+	}
+	return nil
 }
 
 // ReadMarker loads the marker for worktreeDir. A missing marker returns
@@ -88,16 +183,29 @@ func ReadMarker(storeDir, worktreeDir string) (Marker, bool, error) {
 }
 
 // TouchMarker refreshes UpdatedAt for an existing marker. A missing marker is
-// created with the supplied agentID. An existing marker keeps its agentID.
+// bound through WriteMarker, so its creation follows the no-clobber path. An
+// existing marker keeps its agentID: a touch never replaces the owner.
 func TouchMarker(storeDir, worktreeDir, agentID string, now time.Time) (Marker, error) {
 	m, ok, err := ReadMarker(storeDir, worktreeDir)
 	if err != nil {
 		return Marker{}, err
 	}
-	if ok && strings.TrimSpace(m.AgentID) != "" {
+	if !ok {
+		return WriteMarker(storeDir, worktreeDir, agentID, now)
+	}
+	if strings.TrimSpace(m.AgentID) != "" {
 		agentID = m.AgentID
 	}
-	return WriteMarker(storeDir, worktreeDir, agentID, now)
+	m = Marker{Path: cleanDir(worktreeDir), AgentID: agentID, UpdatedAt: now.UTC()}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return Marker{}, err
+	}
+	path := MarkerPath(storeDir, worktreeDir)
+	if err := replaceMarker(path, append(data, '\n')); err != nil {
+		return Marker{}, err
+	}
+	return m, nil
 }
 
 // MarkerValid reports whether a marker still protects its worktree. A marker

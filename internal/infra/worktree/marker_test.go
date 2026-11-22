@@ -1,8 +1,10 @@
 package worktree
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -153,5 +155,144 @@ func TestMarkerPathIsStableAndDistinct(t *testing.T) {
 	}
 	if other := MarkerPath(store, filepath.Join(t.TempDir(), "other")); other == first {
 		t.Fatal("два worktree получили один маркер")
+	}
+}
+
+func markerFileCount(t *testing.T, store string) int {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(store, MarkerDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+// Two agents binding the same worktree at once must not both win. One takes
+// ownership, the other gets a conflict, and the winner keeps the marker.
+func TestWriteMarkerConcurrentBindHasSingleOwner(t *testing.T) {
+	store := t.TempDir()
+	wt := filepath.Join(t.TempDir(), "wt")
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, agentID := range []string{"ses_first", "ses_second"} {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			_, err := WriteMarker(store, wt, id, markerNow)
+			results <- err
+		}(agentID)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var wins, refusals int
+	for err := range results {
+		switch {
+		case err == nil:
+			wins++
+		case errors.Is(err, ErrMarkerOwnerConflict):
+			refusals++
+		default:
+			t.Fatalf("неожиданная ошибка bind: %v", err)
+		}
+	}
+	if wins != 1 || refusals != 1 {
+		t.Fatalf("bind: успех %d, отказ %d; ожидалось 1 и 1", wins, refusals)
+	}
+
+	got, ok, err := ReadMarker(store, wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("маркер не записан после гонки bind")
+	}
+	winner := got.AgentID
+	if winner != "ses_first" && winner != "ses_second" {
+		t.Fatalf("неизвестный владелец %q", winner)
+	}
+	loser := "ses_second"
+	if winner == "ses_second" {
+		loser = "ses_first"
+	}
+	if n := markerFileCount(t, store); n != 1 {
+		t.Fatalf("файлов маркеров %d, ожидалось 1", n)
+	}
+
+	// The loser cannot take over later, even with a fresher timestamp.
+	if _, err := WriteMarker(store, wt, loser, markerNow.Add(time.Hour)); !errors.Is(err, ErrMarkerOwnerConflict) {
+		t.Fatalf("проигравший агент получил владение: %v", err)
+	}
+	after, ok, err := ReadMarker(store, wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || after.AgentID != winner {
+		t.Fatalf("владелец сменился: %+v, ожидался %q", after, winner)
+	}
+	if n := markerFileCount(t, store); n != 1 {
+		t.Fatalf("файлов маркеров после повторного bind %d, ожидалось 1", n)
+	}
+}
+
+// A repeated bind by the same agent keeps one marker and never rewrites it.
+func TestWriteMarkerSameAgentRebindDoesNotOverwrite(t *testing.T) {
+	store := t.TempDir()
+	wt := filepath.Join(t.TempDir(), "wt")
+
+	first, err := WriteMarker(store, wt, "ses_123", markerNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := markerNow.Add(10 * time.Minute)
+	again, err := WriteMarker(store, wt, "ses_123", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("повторный bind перезаписал время: %s, ожидалось %s", again.UpdatedAt, first.UpdatedAt)
+	}
+	got, ok, err := ReadMarker(store, wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got.AgentID != "ses_123" || !got.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("маркер после повторного bind: %+v, ok=%v", got, ok)
+	}
+	if n := markerFileCount(t, store); n != 1 {
+		t.Fatalf("файлов маркеров %d, ожидалось 1", n)
+	}
+}
+
+// A different agent cannot replace an existing owner, and the conflict error
+// names both the owner and the rejected caller.
+func TestWriteMarkerDifferentAgentConflict(t *testing.T) {
+	store := t.TempDir()
+	wt := filepath.Join(t.TempDir(), "wt")
+	if _, err := WriteMarker(store, wt, "ses_owner", markerNow); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := WriteMarker(store, wt, "ses_other", markerNow.Add(time.Minute))
+	if !errors.Is(err, ErrMarkerOwnerConflict) {
+		t.Fatalf("чужой агент не получил отказ: %v", err)
+	}
+	var conflict *OwnerConflictError
+	if !errors.As(err, &conflict) {
+		t.Fatalf("ошибка не несёт владельца: %T", err)
+	}
+	if conflict.Owner != "ses_owner" || conflict.Requested != "ses_other" {
+		t.Fatalf("конфликт: %+v", conflict)
+	}
+	got, ok, err := ReadMarker(store, wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got.AgentID != "ses_owner" || !got.UpdatedAt.Equal(markerNow) {
+		t.Fatalf("маркер после чужого bind: %+v, ok=%v", got, ok)
 	}
 }
