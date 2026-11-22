@@ -615,6 +615,9 @@ type apiMessage struct {
 		Completed int64 `json:"completed"`
 	} `json:"time"`
 	Finish string `json:"finish"`
+	Error  *struct {
+		Name string `json:"name"`
+	} `json:"error"`
 }
 
 // waitWakeMessages polls the real /api/session/{id}/message endpoint until the
@@ -948,10 +951,20 @@ func runLiveWakeViaAPI(t *testing.T, _ string) {
 	user, assistant, all := waitWakeMessages(t, srv, session.ID, token, 30*time.Second)
 	t.Logf("сессия получила wake: user=%s created=%d; агент продолжил: assistant=%s created=%d; всего сообщений=%d",
 		user.ID, user.Time.Created, assistant.ID, assistant.Time.Created, len(all))
-	// Honesty: the configured model may be unavailable in a given environment.
-	// opencode still records the assistant turn; whether it ended in content or
-	// in a provider error is a fact we log, not a success we claim.
-	t.Logf("результат хода: finish=%q", assistant.Finish)
+	// A green wake must mean the model answered. An unavailable model still
+	// produces an assistant turn, so the timestamp alone is not success.
+	// Require a successful finish and fail on a provider error.
+	if assistant.Error != nil {
+		t.Fatalf("live wake: провайдер вернул ошибку: name=%q (assistant=%s)",
+			assistant.Error.Name, assistant.ID)
+	}
+	switch assistant.Finish {
+	case "stop", "tool-calls", "length":
+		t.Logf("результат хода: finish=%q", assistant.Finish)
+	default:
+		t.Fatalf("live wake: ответ модели не успешен: finish=%q (assistant=%s)",
+			assistant.Finish, assistant.ID)
+	}
 
 	// Negative control: a bogus sessionID must not create a false wake.
 	bogusID := "ses_wake_e2e_missing_" + fmt.Sprint(time.Now().UnixNano())
