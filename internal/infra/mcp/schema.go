@@ -635,7 +635,9 @@ func taskClaimOutputSchema() (*jsonschema.Schema, error) {
 
 // taskCloseOutputSchema derives the close output schema from TaskCloseOutput,
 // the type owned by tool_task_close.go. The top-level object stays open to
-// extra fields, and the field schemas stay derived from the Go type.
+// extra fields, and the field schemas stay derived from the Go type. The
+// created flag is reflected from the struct, so no hand-written property is
+// needed here; regenerating the tools/list golden picks it up.
 func taskCloseOutputSchema() (*jsonschema.Schema, error) {
 	s, err := OutputSchema[TaskCloseOutput]()
 	if err != nil {

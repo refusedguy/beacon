@@ -50,11 +50,14 @@ type TaskCloseInput struct {
 }
 
 // TaskCloseOutput confirms the terminal status written to the card. OK is true
-// for both a fresh close and an idempotent repeat.
+// for both a fresh close and an idempotent repeat. Created is true only for the
+// first close: a repeat reports false even when it fills fields left missing by
+// an interrupted write. Callers that ignore Created keep the previous contract.
 type TaskCloseOutput struct {
-	OK     bool   `json:"ok"`
-	CardID string `json:"cardID"`
-	Status string `json:"status"`
+	OK      bool   `json:"ok"`
+	CardID  string `json:"cardID"`
+	Status  string `json:"status"`
+	Created bool   `json:"created"`
 }
 
 func validTaskCloseStatus(v string) bool {
@@ -270,7 +273,10 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 				return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 			}
 		}
-		return TaskCloseOutput{OK: true, CardID: cardID, Status: status}, nil
+		// The card was already closed, even when this call filled missing
+		// fields. Report a repeat so the caller cannot mistake a repair for a
+		// new close.
+		return TaskCloseOutput{OK: true, CardID: cardID, Status: status, Created: false}, nil
 	}
 
 	if status == "duplicate" {
@@ -300,7 +306,7 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 	if err := s.writeCloseFields(chosen, rec); err != nil {
 		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
-	return TaskCloseOutput{OK: true, CardID: cardID, Status: status}, nil
+	return TaskCloseOutput{OK: true, CardID: cardID, Status: status, Created: true}, nil
 }
 
 // writeCloseFields writes all close fields in one atomic rename, under the same
