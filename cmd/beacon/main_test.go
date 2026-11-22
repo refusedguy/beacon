@@ -226,8 +226,8 @@ func TestT06DoctorChecks(t *testing.T) {
 		if !strings.Contains(out.String(), "go: FAIL") || !strings.Contains(out.String(), "1.26") {
 			t.Fatalf("нет FAIL для Go 1.25: %q", out.String())
 		}
-		if !strings.Contains(out.String(), "beacon-gates: OK") || !strings.Contains(out.String(), "state: OK "+wantState) {
-			t.Fatalf("остальные проверки должны быть OK: %q", out.String())
+		if !strings.Contains(out.String(), "beacon-gates: PASS") || !strings.Contains(out.String(), "state: PASS "+wantState) {
+			t.Fatalf("остальные проверки должны быть PASS: %q", out.String())
 		}
 		if errOut.Len() != 0 {
 			t.Fatalf("stderr не пустой: %q", errOut.String())
@@ -247,7 +247,7 @@ func TestT06DoctorChecks(t *testing.T) {
 		if strings.Contains(out.String(), "FAIL") {
 			t.Fatalf("есть FAIL: %q", out.String())
 		}
-		for _, name := range []string{"go: OK", "beacon-gates: OK", "state: OK"} {
+		for _, name := range []string{"go: PASS", "beacon-gates: PASS", "state: PASS"} {
 			if !strings.Contains(out.String(), name) {
 				t.Fatalf("нет строки %s: %q", name, out.String())
 			}
@@ -267,7 +267,7 @@ func TestT06DoctorChecks(t *testing.T) {
 		if code := c.Run([]string{"doctor"}); code != 1 {
 			t.Fatalf("код выхода %d, ожидался 1", code)
 		}
-		if !strings.Contains(out.String(), "go: FAIL") || !strings.Contains(out.String(), "permission denied") {
+		if !strings.Contains(out.String(), "go: BROKEN") || !strings.Contains(out.String(), "permission denied") {
 			t.Fatalf("нет причины отказа: %q", out.String())
 		}
 	})
@@ -283,8 +283,8 @@ func TestT06DoctorChecks(t *testing.T) {
 		if code := c.Run([]string{"doctor"}); code != 1 {
 			t.Fatalf("код выхода %d, ожидался 1", code)
 		}
-		if !strings.Contains(out.String(), "beacon-gates: FAIL") {
-			t.Fatalf("нет FAIL для beacon-gates: %q", out.String())
+		if !strings.Contains(out.String(), "beacon-gates: BROKEN") {
+			t.Fatalf("нет BROKEN для beacon-gates: %q", out.String())
 		}
 	})
 }
