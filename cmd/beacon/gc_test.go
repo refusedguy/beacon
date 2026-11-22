@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -534,5 +535,218 @@ func TestGCSessionsForGCDedupesSources(t *testing.T) {
 		if c.SessionID == "ses_dup" && (!c.Stale || c.WatchID != "w1") {
 			t.Fatalf("candidate %+v, want merged stale row with WatchID w1", c)
 		}
+	}
+}
+
+// gcCompactFixture is five commits in commit order with monotone dates. The
+// first two sit before the cutoff, the last three after it.
+func gcCompactFixture() []gcCompactCommit {
+	base := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	commits := make([]gcCompactCommit, 0, 5)
+	for i := 0; i < 5; i++ {
+		commits = append(commits, gcCompactCommit{
+			Hash:  fmt.Sprintf("hash-%d", i),
+			Date:  base.Add(time.Duration(i) * 24 * time.Hour),
+			Order: i,
+		})
+	}
+	return commits
+}
+
+func gcCompactSeams(t *testing.T, commits []gcCompactCommit, head string, applied *int) {
+	t.Helper()
+	oldRead, oldApply := gcCompactRead, gcCompactApply
+	t.Cleanup(func() { gcCompactRead, gcCompactApply = oldRead, oldApply })
+	gcCompactRead = func(string) ([]gcCompactCommit, string, string, error) { return commits, head, head, nil }
+	gcCompactApply = func(gcCompactPlan) (string, error) {
+		if applied != nil {
+			*applied = *applied + 1
+		}
+		return head, nil
+	}
+}
+
+// TestGCCompactRefusesOutOfOrderDates is the first measurable check: five
+// commits whose dates cross the cutoff against history order produce a refusal
+// with a hint, zero created commits and no apply call.
+func TestGCCompactRefusesOutOfOrderDates(t *testing.T) {
+	commits := gcCompactFixture()
+	commits[2].Date = commits[2].Date.Add(-30 * 24 * time.Hour)
+	// Commit 2 gets an old date but keeps its late position in history. The
+	// cutoff must place commit 1 on the recent side for the dates to cross.
+	cutoff := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	plan := gcCompactBuild(commits, cutoff, "hash-4", "hash-4")
+	if plan.Reason != gcCompactReasonOutOfOrder {
+		t.Fatalf("reason = %q, want %q", plan.Reason, gcCompactReasonOutOfOrder)
+	}
+	if plan.gcCompactCreated() != 0 || len(plan.gcCompactReplays()) != 0 {
+		t.Fatalf("created = %d replays = %v, want 0 and empty", plan.gcCompactCreated(), plan.gcCompactReplays())
+	}
+	if plan.Hint == "" {
+		t.Fatal("refusal has no hint")
+	}
+
+	applied := 0
+	gcCompactSeams(t, commits, "hash-4", &applied)
+	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCCompact(c, []string{"--cutoff", "2026-11-01T12:00:00Z", "--format", "json"}); code != 2 {
+		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	}
+	if applied != 0 {
+		t.Fatalf("apply called %d times on refusal", applied)
+	}
+	got := out.String()
+	if !strings.Contains(got, `"mode":"refusal"`) || !strings.Contains(got, `"created":0`) ||
+		!strings.Contains(got, "не сжимать") {
+		t.Fatalf("out = %q, want refusal, zero created and hint", got)
+	}
+}
+
+// TestGCCompactMonotonicBuildsBaseAndReplays is the second measurable check:
+// one base commit, three replays in commit order, and a result tree that matches
+// the captured headHash byte for byte.
+func TestGCCompactMonotonicBuildsBaseAndReplays(t *testing.T) {
+	commits := gcCompactFixture()
+	cutoff := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+
+	plan := gcCompactBuild(commits, cutoff, "hash-4", "hash-4")
+	if plan.Reason != "" {
+		t.Fatalf("plan refused: %s / %s", plan.Reason, plan.Hint)
+	}
+	if len(plan.Old) != 2 || len(plan.Recent) != 3 {
+		t.Fatalf("old = %d recent = %d, want 2 and 3", len(plan.Old), len(plan.Recent))
+	}
+	if plan.gcCompactCreated() != 4 {
+		t.Fatalf("created = %d, want 4 (one base + three replays)", plan.gcCompactCreated())
+	}
+	replays := plan.gcCompactReplays()
+	want := []string{"hash-2", "hash-3", "hash-4"}
+	if len(replays) != len(want) {
+		t.Fatalf("replays = %v, want %v", replays, want)
+	}
+	for i := range want {
+		if replays[i] != want[i] {
+			t.Fatalf("replays = %v, want %v (commit order)", replays, want)
+		}
+	}
+
+	applied := 0
+	gcCompactSeams(t, commits, "hash-4", &applied)
+	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCCompact(c, []string{
+		"--cutoff", "2026-11-03T00:00:00Z", "--format", "json", "--apply", "--dry-run=false",
+	}); code != 0 {
+		t.Fatalf("code = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	if applied != 1 {
+		t.Fatalf("apply called %d times, want 1", applied)
+	}
+	got := out.String()
+	if !strings.Contains(got, `"mode":"applied"`) || !strings.Contains(got, `"base":1`) ||
+		!strings.Contains(got, `"created":4`) || !strings.Contains(got, `"verified":true`) {
+		t.Fatalf("out = %q, want applied base 1 created 4 verified true", got)
+	}
+}
+
+// TestGCCompactDoubleDryRunDoesNotChangeFiles is the third measurable check:
+// two dry runs produce the same plan and never call apply.
+func TestGCCompactDoubleDryRunDoesNotChangeFiles(t *testing.T) {
+	commits := gcCompactFixture()
+	applied := 0
+	gcCompactSeams(t, commits, "hash-4", &applied)
+
+	outs := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+		c := &CLI{out: out, errOut: errOut}
+		if code := runGCCompact(c, []string{"--cutoff", "2026-11-03T00:00:00Z", "--format", "json"}); code != 0 {
+			t.Fatalf("dry run %d code = %d, stderr = %s", i, code, errOut.String())
+		}
+		outs = append(outs, out.String())
+	}
+	if applied != 0 {
+		t.Fatalf("dry run called apply %d times", applied)
+	}
+	if outs[0] != outs[1] {
+		t.Fatalf("dry runs differ: %q vs %q", outs[0], outs[1])
+	}
+	if !strings.Contains(outs[0], `"mode":"dry-run"`) || !strings.Contains(outs[0], `"created":0`) {
+		t.Fatalf("out = %q, want dry-run with zero created", outs[0])
+	}
+}
+
+func TestGCCompactParseLogKeepsCommitOrder(t *testing.T) {
+	commits, err := gcCompactParseLog("a\t1761936000\nb\t1762022400\n")
+	if err != nil {
+		t.Fatalf("gcCompactParseLog: %v", err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("commits = %+v, want 2", commits)
+	}
+	if commits[0].Order != 0 || commits[1].Order != 1 || commits[0].Hash != "a" || commits[1].Hash != "b" {
+		t.Fatalf("commits = %+v, want a/0 then b/1", commits)
+	}
+	if !commits[0].Date.Before(commits[1].Date) {
+		t.Fatalf("dates = %v, %v, want a before b", commits[0].Date, commits[1].Date)
+	}
+	if _, err := gcCompactParseLog("malformed\n"); err == nil {
+		t.Fatal("malformed log line must fail the plan")
+	}
+}
+
+func TestGCCompactVerifyIsByteExact(t *testing.T) {
+	if !gcCompactVerify("hash-4", "hash-4") {
+		t.Fatal("same tree must verify")
+	}
+	if gcCompactVerify("hash-4", "hash-4\n") {
+		t.Fatal("tree with extra byte must not verify")
+	}
+	if gcCompactVerify("hash-4", "other") {
+		t.Fatal("changed tree must not verify")
+	}
+}
+
+// TestGCCompactRejectsChangedTree checks that a replay which changed data
+// fails the command even though apply itself reported success.
+func TestGCCompactRejectsChangedTree(t *testing.T) {
+	commits := gcCompactFixture()
+	oldRead, oldApply := gcCompactRead, gcCompactApply
+	t.Cleanup(func() { gcCompactRead, gcCompactApply = oldRead, oldApply })
+	gcCompactRead = func(string) ([]gcCompactCommit, string, string, error) {
+		return commits, "hash-4", "hash-4", nil
+	}
+	gcCompactApply = func(gcCompactPlan) (string, error) { return "changed", nil }
+
+	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+	c := &CLI{out: out, errOut: errOut}
+	if code := runGCCompact(c, []string{"--cutoff", "2026-11-03T00:00:00Z", "--apply", "--dry-run=false"}); code != 2 {
+		t.Fatalf("code = %d, want 2; stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "не совпало") {
+		t.Fatalf("stderr = %q, want tree mismatch", errOut.String())
+	}
+}
+
+// TestGCCompactSubcommandReachesPlanner checks that `beacon gc compact` is
+// dispatched through the gc runner without a new top-level command.
+func TestGCCompactSubcommandReachesPlanner(t *testing.T) {
+	commits := gcCompactFixture()
+	applied := 0
+	gcCompactSeams(t, commits, "hash-4", &applied)
+
+	oldRunner := gcRunner
+	t.Cleanup(func() { gcRunner = oldRunner })
+	gcRunner = runGCWithServe
+
+	out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+	c := &CLI{out: out, errOut: errOut}
+	if code := gcRunner(c, []string{"compact", "--cutoff", "2026-11-03T00:00:00Z", "--format", "json"}); code != 0 {
+		t.Fatalf("code = %d, want 0; stderr = %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), `"mode":"dry-run"`) {
+		t.Fatalf("out = %q, want dry-run plan", out.String())
 	}
 }

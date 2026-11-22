@@ -431,6 +431,11 @@ func runGCScheduled(c *CLI, apply bool, format string, interval time.Duration) i
 // orphaned serve processes it found. A positive --interval repeats the sweep
 // every interval, starting with one pass at startup.
 func runGCWithServe(c *CLI, args []string) int {
+	// CBX-12: history compaction is a subcommand of gc. It builds a plan
+	// before any change, so it intercepts before the sweep flags are parsed.
+	if len(args) > 0 && args[0] == "compact" {
+		return runGCCompact(c, args[1:])
+	}
 	fs := flag.NewFlagSet("gc", flag.ContinueOnError)
 	format := fs.String("format", "table", "формат вывода: table или json")
 	apply := fs.Bool("apply", false, "удалить найденные записи и terminate сироты")
@@ -824,4 +829,362 @@ func runGCWorktree(c *CLI, args []string) int {
 		return 2
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// CBX-12: card history compaction. The plan is built before a single file or
+// ref changes. Old commits collapse into one base; recent commits replay in
+// commit order so a child never precedes its parent. Dates decide only which
+// side of the cutoff a commit belongs to. When dates cross the cutoff against
+// history order the plan refuses, prints a hint and creates nothing. headHash
+// is captured when the log is read, and the applied tree is checked against
+// that value, never against the branch head after the rewrite.
+// The collector above stays unchanged.
+// ---------------------------------------------------------------------------
+
+const (
+	gcCompactReasonOutOfOrder  = "out_of_order"
+	gcCompactReasonNoPartition = "no_partition"
+	gcCompactReasonHeadMissing = "head_missing"
+	gcCompactCardPath          = "docs/tasks"
+	gcCompactHint              = "не сжимать: даты коммитов пересекают cutoff не в порядке истории; выровняйте даты или откажитесь от сжатия"
+)
+
+// gcCompactCommit is one commit of the card history. Order is its position in
+// `git log --reverse`: a parent always comes before its child. Date is the
+// author date used only for the cutoff split, never for replay ordering.
+type gcCompactCommit struct {
+	Hash  string
+	Date  time.Time
+	Order int
+}
+
+// gcCompactPlan is the whole plan built before any change. Reason is empty
+// only when the history passed every check.
+type gcCompactPlan struct {
+	Cutoff   time.Time
+	HeadHash string
+	HeadTree string
+	Old      []gcCompactCommit
+	Recent   []gcCompactCommit
+	Reason   string
+	Hint     string
+}
+
+// gcCompactCreated is the number of commits the plan creates: one base for the
+// old history plus one replay per recent commit. A refusal creates nothing.
+func (p gcCompactPlan) gcCompactCreated() int {
+	if p.Reason != "" {
+		return 0
+	}
+	return 1 + len(p.Recent)
+}
+
+// gcCompactReplays returns recent hashes in commit order. A refusal has no
+// replays even when recent commits were collected before the check failed.
+func (p gcCompactPlan) gcCompactReplays() []string {
+	if p.Reason != "" {
+		return []string{}
+	}
+	out := make([]string, 0, len(p.Recent))
+	for _, c := range p.Recent {
+		out = append(out, c.Hash)
+	}
+	return out
+}
+
+// gcCompactSplit partitions by date while keeping commit order inside each
+// half. Replay order comes from these slices, so two commits sharing a date
+// still replay parent first.
+func gcCompactSplit(commits []gcCompactCommit, cutoff time.Time) ([]gcCompactCommit, []gcCompactCommit) {
+	old := make([]gcCompactCommit, 0, len(commits))
+	recent := make([]gcCompactCommit, 0, len(commits))
+	for _, c := range commits {
+		if c.Date.Before(cutoff) {
+			old = append(old, c)
+		} else {
+			recent = append(recent, c)
+		}
+	}
+	return old, recent
+}
+
+// gcCompactBuild is the premise check of the subcommand. It refuses when dates
+// cross the cutoff against history order: every recent commit must follow the
+// last old commit in commit order. headHash is the hash read before any work.
+func gcCompactBuild(commits []gcCompactCommit, cutoff time.Time, headHash, headTree string) gcCompactPlan {
+	p := gcCompactPlan{Cutoff: cutoff, HeadHash: headHash, HeadTree: headTree}
+	if strings.TrimSpace(headHash) == "" {
+		p.Reason = gcCompactReasonHeadMissing
+		p.Hint = "не сжимать: не зафиксирован headHash на момент чтения истории"
+		return p
+	}
+	p.Old, p.Recent = gcCompactSplit(commits, cutoff)
+	if len(p.Old) == 0 || len(p.Recent) == 0 {
+		p.Reason = gcCompactReasonNoPartition
+		p.Hint = "не сжимать: нет коммитов по одну сторону cutoff"
+		return p
+	}
+	lastOld := p.Old[0].Order
+	for _, c := range p.Old {
+		if c.Order > lastOld {
+			lastOld = c.Order
+		}
+	}
+	for _, c := range p.Recent {
+		if c.Order < lastOld {
+			p.Reason = gcCompactReasonOutOfOrder
+			p.Hint = gcCompactHint
+			return p
+		}
+	}
+	return p
+}
+
+// gcCompactParseLog reads `hash<TAB>unix` lines from `git log --reverse` and
+// assigns commit order by line position. A malformed line fails the plan
+// before any ref moves.
+func gcCompactParseLog(out string) ([]gcCompactCommit, error) {
+	commits := make([]gcCompactCommit, 0)
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("gc compact: строка лога %d: %q", i+1, line)
+		}
+		secs, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("gc compact: дата в строке %d: %w", i+1, err)
+		}
+		commits = append(commits, gcCompactCommit{
+			Hash:  strings.TrimSpace(parts[0]),
+			Date:  time.Unix(secs, 0).UTC(),
+			Order: len(commits),
+		})
+	}
+	return commits, nil
+}
+
+// gcCompactVerify compares the applied tree with the tree captured at read
+// time. Byte-for-byte equality is required: a replay that changed a card is
+// a failure even when the rewrite itself succeeded.
+func gcCompactVerify(headTree, resultTree string) bool {
+	return headTree == resultTree
+}
+
+var (
+	// gcCompactGit is the git seam. cmd/beacon never shells out itself; the
+	// infra worktree runner owns the exec.
+	gcCompactGit = worktree.CommandRunner
+
+	// gcCompactRead captures the log, the head commit and its tree before any
+	// change. The tree is the reference for the result check; headHash names
+	// the tip the log was read from.
+	gcCompactRead = func(path string) ([]gcCompactCommit, string, string, error) {
+		headOut, err := gcCompactGit("", "rev-parse", "HEAD")
+		if err != nil {
+			return nil, "", "", fmt.Errorf("gc compact: HEAD: %w: %s", err, strings.TrimSpace(headOut))
+		}
+		headHash := strings.TrimSpace(headOut)
+		headTree, err := gcCompactTree(headHash)
+		if err != nil {
+			return nil, "", "", err
+		}
+		logOut, err := gcCompactGit("", "log", "--reverse", "--format=%H%x09%at", "--", path)
+		if err != nil {
+			return nil, "", "", fmt.Errorf("gc compact: log: %w: %s", err, strings.TrimSpace(logOut))
+		}
+		commits, err := gcCompactParseLog(logOut)
+		if err != nil {
+			return nil, "", "", err
+		}
+		return commits, headHash, headTree, nil
+	}
+)
+
+func gcCompactTree(hash string) (string, error) {
+	out, err := gcCompactGit("", "rev-parse", hash+"^{tree}")
+	if err != nil {
+		return "", fmt.Errorf("gc compact: дерево %s: %w: %s", hash, err, strings.TrimSpace(out))
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func gcCompactCommitTree(tree, parent, message string) (string, error) {
+	args := []string{"-c", "user.name=beacon", "-c", "user.email=beacon@users.noreply.github.com", "commit-tree", tree}
+	if parent != "" {
+		args = append(args, "-p", parent)
+	}
+	args = append(args, "-m", message)
+	out, err := gcCompactGit("", args...)
+	if err != nil {
+		return "", fmt.Errorf("gc compact: commit-tree: %w: %s", err, strings.TrimSpace(out))
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// gcCompactApplyRewrite is the production apply path. It builds one base
+// commit from the oldest old tree, replays recent trees in commit order and
+// moves HEAD only after the plan passed the order check. The resulting tree
+// hash is returned for the headHash comparison.
+var gcCompactApply = func(p gcCompactPlan) (string, error) {
+	if p.Reason != "" || len(p.Old) == 0 {
+		return "", errors.New("gc compact: отказ, применение запрещено")
+	}
+	status, err := gcCompactGit("", "status", "--porcelain")
+	if err != nil {
+		return "", fmt.Errorf("gc compact: status: %w", err)
+	}
+	if strings.TrimSpace(status) != "" {
+		return "", errors.New("gc compact: рабочее дерево не чистое, сжатие отменено")
+	}
+	baseTree, err := gcCompactTree(p.Old[0].Hash)
+	if err != nil {
+		return "", err
+	}
+	parent, err := gcCompactCommitTree(baseTree, "", "gc compact: base")
+	if err != nil {
+		return "", err
+	}
+	for _, c := range p.Recent {
+		tree, err := gcCompactTree(c.Hash)
+		if err != nil {
+			return "", err
+		}
+		parent, err = gcCompactCommitTree(tree, parent, "gc compact: replay "+c.Hash)
+		if err != nil {
+			return "", err
+		}
+	}
+	if out, err := gcCompactGit("", "update-ref", "HEAD", parent); err != nil {
+		return "", fmt.Errorf("gc compact: update-ref: %w: %s", err, strings.TrimSpace(out))
+	}
+	return gcCompactTree(parent)
+}
+
+// gcCompactReport is the single output shape of a refusal, a dry run and an
+// apply. Planned counts what the plan would create; Created counts commits
+// actually written. A refusal and every dry run leave Created at zero.
+type gcCompactReport struct {
+	Mode     string   `json:"mode"`
+	Planned  int      `json:"planned"`
+	Created  int      `json:"created"`
+	HeadHash string   `json:"head_hash"`
+	Base     int      `json:"base"`
+	Replays  []string `json:"replays"`
+	Verified bool     `json:"verified"`
+	Reason   string   `json:"reason,omitempty"`
+	Hint     string   `json:"hint,omitempty"`
+}
+
+func renderGCCompactJSON(w io.Writer, r gcCompactReport) error {
+	return json.NewEncoder(w).Encode(r)
+}
+
+func renderGCCompactTable(w io.Writer, r gcCompactReport) {
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "MODE\tPLANNED\tCREATED\tBASE\tREPLAYS\tVERDICT")
+	verdict := "ok"
+	switch {
+	case r.Reason != "":
+		verdict = r.Reason
+	case r.Mode == "applied" && !r.Verified:
+		verdict = "tree_mismatch"
+	}
+	fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%s\n", r.Mode, r.Planned, r.Created, r.Base, len(r.Replays), verdict)
+	_ = tw.Flush()
+	switch r.Mode {
+	case "refusal":
+		fmt.Fprintf(w, "ОТКАЗ: %s, СОЗДАНО КОММИТОВ: 0\n", r.Reason)
+		if r.Hint != "" {
+			fmt.Fprintf(w, "ПОДСКАЗКА: %s\n", r.Hint)
+		}
+	case "applied":
+		fmt.Fprintf(w, "СОЗДАНО КОММИТОВ: %d, ПРОВЕРКА ДЕРЕВА: %v\n", r.Created, r.Verified)
+	default:
+		fmt.Fprintf(w, "ПЛАН: %d, СОЗДАНО КОММИТОВ: 0 (просмотр без изменений, --apply применит)\n", r.Planned)
+	}
+}
+
+// runGCCompact implements `beacon gc compact --cutoff <RFC3339> [--dry-run]
+// [--apply] [--format table|json]`. The plan always runs first. --apply alone
+// writes commits, and only when the applied tree matches the captured headHash.
+func runGCCompact(c *CLI, args []string) int {
+	fs := flag.NewFlagSet("gc compact", flag.ContinueOnError)
+	cutoffRaw := fs.String("cutoff", "", "граница сжатия в формате RFC3339")
+	format := fs.String("format", "table", "формат вывода: table или json")
+	dryRun := fs.Bool("dry-run", true, "только план, без изменений (по умолчанию)")
+	apply := fs.Bool("apply", false, "применить сжатие после проверки плана")
+	if !parseFlags("gc compact", args, c.errOut, fs) {
+		return 2
+	}
+	if *format != "table" && *format != "json" {
+		fmt.Fprintf(c.errOut, "beacon gc compact: неизвестный формат %q, ожидается table или json\n", *format)
+		writeUsage(c.errOut)
+		return 2
+	}
+	cutoff, err := time.Parse(time.RFC3339, *cutoffRaw)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc compact: cutoff %q: %v\n", *cutoffRaw, err)
+		return 2
+	}
+	commits, headHash, headTree, err := gcCompactRead(gcCompactCardPath)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc compact: %v\n", err)
+		return 2
+	}
+	plan := gcCompactBuild(commits, cutoff, headHash, headTree)
+	report := gcCompactReport{HeadHash: headHash}
+	if plan.Reason != "" {
+		report.Mode = "refusal"
+		report.Reason = plan.Reason
+		report.Hint = plan.Hint
+		if *format == "json" {
+			if err := renderGCCompactJSON(c.out, report); err != nil {
+				fmt.Fprintf(c.errOut, "beacon gc compact: %v\n", err)
+				return 2
+			}
+		} else {
+			renderGCCompactTable(c.out, report)
+		}
+		return 2
+	}
+
+	report.Planned = plan.gcCompactCreated()
+	report.Base = 1
+	report.Replays = plan.gcCompactReplays()
+	render := func() int {
+		if *format == "json" {
+			if err := renderGCCompactJSON(c.out, report); err != nil {
+				fmt.Fprintf(c.errOut, "beacon gc compact: %v\n", err)
+				return 2
+			}
+			return 0
+		}
+		renderGCCompactTable(c.out, report)
+		return 0
+	}
+
+	if *dryRun && !*apply {
+		report.Mode = "dry-run"
+		return render()
+	}
+
+	resultTree, err := gcCompactApply(plan)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon gc compact: применение: %v\n", err)
+		return 2
+	}
+	report.Mode = "applied"
+	report.Created = report.Planned
+	report.Verified = gcCompactVerify(headTree, resultTree)
+	code := render()
+	if !report.Verified {
+		fmt.Fprintf(c.errOut, "beacon gc compact: дерево результата %s не совпало с деревом headHash %s\n", resultTree, headTree)
+		return 2
+	}
+	return code
 }
