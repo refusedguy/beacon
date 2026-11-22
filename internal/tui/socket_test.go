@@ -55,18 +55,26 @@ func sendRequest(t *testing.T, client *ControlClient, req SocketRequest) SocketR
 	return resp
 }
 
-func nextEvent(t *testing.T, client *ControlClient) SocketEvent {
+// waitForValue receives one value from ch before ctx is done. The caller owns
+// the deadline, so a stalled test fails on its own timeout instead of a fixed delay.
+func waitForValue[T any](t *testing.T, ctx context.Context, ch <-chan T, what string) T {
 	t.Helper()
 	select {
-	case ev, ok := <-client.Events():
+	case v, ok := <-ch:
 		if !ok {
-			t.Fatal("events channel closed before an event arrived")
+			t.Fatalf("%s channel closed before a value arrived", what)
 		}
-		return ev
-	case <-time.After(2 * time.Second):
-		t.Fatal("no event arrived")
-		return SocketEvent{}
+		return v
+	case <-ctx.Done():
+		t.Fatalf("no %s before deadline: %v", what, ctx.Err())
+		var zero T
+		return zero
 	}
+}
+
+func nextEvent(t *testing.T, ctx context.Context, client *ControlClient) SocketEvent {
+	t.Helper()
+	return waitForValue(t, ctx, client.Events(), "event")
 }
 
 func TestSocketConnectIsLocalAndRestricted(t *testing.T) {
@@ -179,9 +187,12 @@ func TestSocketEventReachesAttachedAgent(t *testing.T) {
 	// A completed round trip proves the accept loop registered this client.
 	_ = sendRequest(t, client, SocketRequest{ID: "sync", Command: CmdAck, WatchID: "w1"})
 
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
 	want := SocketEvent{Type: "refresh", WatchID: "w1", Data: json.RawMessage(`{"n":1}`)}
 	srv.Publish(want)
-	got := nextEvent(t, client)
+	got := nextEvent(t, ctx, client)
 
 	if got.Type != want.Type || got.WatchID != want.WatchID {
 		t.Fatalf("event metadata = %+v, want %+v", got, want)
@@ -201,11 +212,14 @@ func TestSocketEventReachesEveryAgent(t *testing.T) {
 	_ = sendRequest(t, a, SocketRequest{ID: "a", Command: CmdAck, WatchID: "w1"})
 	_ = sendRequest(t, b, SocketRequest{ID: "b", Command: CmdAck, WatchID: "w1"})
 
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancel)
+
 	srv.Publish(SocketEvent{Type: "refresh"})
-	if got := nextEvent(t, a).Type; got != "refresh" {
+	if got := nextEvent(t, ctx, a).Type; got != "refresh" {
 		t.Errorf("agent a event type = %q", got)
 	}
-	if got := nextEvent(t, b).Type; got != "refresh" {
+	if got := nextEvent(t, ctx, b).Type; got != "refresh" {
 		t.Errorf("agent b event type = %q", got)
 	}
 }
