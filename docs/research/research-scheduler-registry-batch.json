@@ -26,7 +26,7 @@
     {
       "id": "SR-01",
       "title": "Подключить guard, проверку версии и индекса к registry check",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -50,7 +50,7 @@
     {
       "id": "SR-02",
       "title": "Привести тип version и ссылки конфигураций к схеме",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -70,7 +70,7 @@
     {
       "id": "SR-03",
       "title": "Задавать время первого запуска и открыть маршрут Resume",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -90,7 +90,7 @@
     {
       "id": "SR-04",
       "title": "Согласовать словарь видов расписания с портом",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -112,7 +112,7 @@
     {
       "id": "SR-05",
       "title": "Опрашивать просроченные расписания в цикле daemon",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

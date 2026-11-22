@@ -40,7 +40,7 @@
     {
       "id": "PR4-02",
       "title": "Прояснить мост mcpServers в ACP-сеансах",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -60,7 +60,7 @@
     {
       "id": "PR4-03",
       "title": "Дать типизированному graphReady потребителя в CLI",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

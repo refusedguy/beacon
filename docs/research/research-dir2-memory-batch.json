@@ -16,7 +16,7 @@
     {
       "id": "MM-01",
       "title": "Закрывать и истекать строки реестра сессий",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -40,7 +40,7 @@
     {
       "id": "MM-02",
       "title": "Включать просроченные сессии без Watch в план beacon gc",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -63,7 +63,7 @@
     {
       "id": "MM-03",
       "title": "Проверять готовность serve перед переиспользованием записи",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -106,7 +106,7 @@
     {
       "id": "MM-05",
       "title": "Перевести daemon wake route на общий HTTP-клиент",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [

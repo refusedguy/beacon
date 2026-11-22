@@ -6,7 +6,7 @@
     {
       "id": "SE-01",
       "title": "Редактировать поля аудита в httpapi до выдачи",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -26,7 +26,7 @@
     {
       "id": "SE-02",
       "title": "Добавить шаблон Telegram-токена в фильтр аудита",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -46,7 +46,7 @@
     {
       "id": "SE-03",
       "title": "Подключить sqlite-redact ко всем производственным открытиям state DB",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -67,7 +67,7 @@
     {
       "id": "SE-04",
       "title": "Редактировать и закрыть файлы логов коротких команд",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

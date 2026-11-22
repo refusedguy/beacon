@@ -6,7 +6,7 @@
     {
       "id": "EH-01",
       "title": "Различить отсутствующую запись и сбой стора в mapResultReadError",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -26,7 +26,7 @@
     {
       "id": "EH-03",
       "title": "Устранить двойной статус кода INVALID_INPUT в httpapi",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -46,7 +46,7 @@
     {
       "id": "EH-02",
       "title": "Показывать агенту сбой получения failure excerpt",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -68,7 +68,7 @@
     {
       "id": "EH-04",
       "title": "Сохранить диагностику gh в ошибках слияния",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

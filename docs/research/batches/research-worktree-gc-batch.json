@@ -9,7 +9,7 @@
     {
       "id": "WG-01",
       "title": "Не удалять чужие worktree при закрытии одного Watch",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -32,7 +32,7 @@
     {
       "id": "WG-02",
       "title": "Не удалять worktree, чей HEAD ушёл вперёд от Watch",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -53,7 +53,7 @@
     {
       "id": "WG-03",
       "title": "Записывать маркер активного агента при создании worktree",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -75,7 +75,7 @@
     {
       "id": "WG-04",
       "title": "Давать отсрочку и делать вторую проверку перед удалением",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -100,7 +100,7 @@
     {
       "id": "WG-05",
       "title": "Закрепить контракт работы GC eval-тестом",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

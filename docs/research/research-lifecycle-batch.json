@@ -6,7 +6,7 @@
     {
       "id": "LC-01",
       "title": "Не будить подписчиков Watch, которая ждёт ответа человека",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -28,7 +28,7 @@
     {
       "id": "LC-02",
       "title": "Закрывать инцидент блокировки при разблокировке фиксером",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -48,7 +48,7 @@
     {
       "id": "LC-03",
       "title": "Не списывать раунд человеческого ответа до проверки Watch",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -89,7 +89,7 @@
     {
       "id": "LC-05",
       "title": "Не создавать вторую Watch при регистрации на припаркованный алиас",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

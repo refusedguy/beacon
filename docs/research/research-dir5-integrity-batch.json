@@ -18,7 +18,7 @@
     {
       "id": "IN5-01",
       "title": "Закрывать карточки по MERGED под общим замком",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -37,7 +37,7 @@
     {
       "id": "IN5-02",
       "title": "Передавать delivery, resume и messageID в HTTP wake",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -81,7 +81,7 @@
     {
       "id": "IN5-04",
       "title": "Свести закрытие в mcp.go к каноническим полям",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -102,7 +102,7 @@
     {
       "id": "IN5-05",
       "title": "Не искать карточку по notify.Target",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -122,7 +122,7 @@
     {
       "id": "IN5-06",
       "title": "Привязать DependencyResolver к мосту cibridge",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [

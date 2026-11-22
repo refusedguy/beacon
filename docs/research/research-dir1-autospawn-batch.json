@@ -44,7 +44,7 @@
     {
       "id": "AS2-02",
       "title": "Сделать спавн-порт пригодным для вызова из демона",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -180,7 +180,7 @@
     {
       "id": "AS2-08",
       "title": "Зафиксировать фактический контракт OpenCode 2.3.2 в дизайне",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "doc",
       "owner_files": [

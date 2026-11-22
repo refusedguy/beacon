@@ -20,7 +20,7 @@
     {
       "id": "MP-01",
       "title": "Подключить порты наблюдаемости и generation в composition root",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -41,7 +41,7 @@
     {
       "id": "MP-02",
       "title": "Адаптер GraphIndexReader из индекса карточек",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -82,7 +82,7 @@
     {
       "id": "MP-04",
       "title": "Обновить статусы влитых карточек research-батча",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "doc",
       "owner_files": [

@@ -125,7 +125,7 @@
     {
       "id": "GH-01",
       "title": "Передавать ожидаемый head SHA в REST merge",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -165,7 +165,7 @@
     {
       "id": "GH-03",
       "title": "Проверять подтверждение мержа в PRClient.MergePR",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -185,7 +185,7 @@
     {
       "id": "GH-04",
       "title": "Разделить GraphQL и REST в счётчике очков",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -205,7 +205,7 @@
     {
       "id": "GH-05",
       "title": "Обновлять tier-2 при смене head SHA",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

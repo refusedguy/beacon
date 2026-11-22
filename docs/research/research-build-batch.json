@@ -7,7 +7,7 @@
     {
       "id": "BL-01",
       "title": "Сверить локальную проверку MCP с контрактом инструментов",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -27,7 +27,7 @@
     {
       "id": "BL-02",
       "title": "Убрать противоречие между ignore и отслеживанием ROADMAP_STATUS",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -47,7 +47,7 @@
     {
       "id": "BL-03",
       "title": "Свести флаги сборки beacon к одному определению",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -69,7 +69,7 @@
     {
       "id": "BL-04",
       "title": "Подключить модуль evals к обязательной проверке",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -89,7 +89,7 @@
     {
       "id": "BL-05",
       "title": "Разделить контракты гейтов из бинарника и из исходников",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

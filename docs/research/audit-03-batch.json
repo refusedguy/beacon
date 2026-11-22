@@ -19,7 +19,7 @@
     {
       "id": "TUI-01",
       "title": "Подключить живой экран через порт в cmd/beacon",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -81,7 +81,7 @@
     {
       "id": "TUI-04",
       "title": "Добавить очередь, слоты и RSS в снимок проекции",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -143,7 +143,7 @@
     {
       "id": "TUI-07A",
       "title": "Тест хвоста событий на холодном старте",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [

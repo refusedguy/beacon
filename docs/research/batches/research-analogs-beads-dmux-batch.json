@@ -37,7 +37,7 @@
     {
       "id": "AN-02",
       "title": "Событие разблокировки после закрытия карточки",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -59,7 +59,7 @@
     {
       "id": "AN-03",
       "title": "Внешний гейт как тип ребра карточки",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -82,7 +82,7 @@
     {
       "id": "AN-04",
       "title": "Проверка межветвевых коллизий ID до смены схемы ID",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -125,7 +125,7 @@
     {
       "id": "AN-06",
       "title": "Хуки жизненного цикла карточки по образцу dmux",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

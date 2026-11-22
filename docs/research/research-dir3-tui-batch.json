@@ -17,7 +17,7 @@
     {
       "id": "TU3-01",
       "title": "Три точки входа в живой экран",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -39,7 +39,7 @@
     {
       "id": "TU3-02",
       "title": "Одноклавишные verbs оператора на живом экране",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -61,7 +61,7 @@
     {
       "id": "TU3-03",
       "title": "Eval точек входа, hotkeys и бюджета памяти живого экрана",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "eval",
       "owner_files": [
@@ -83,7 +83,7 @@
     {
       "id": "TU3-04",
       "title": "RSS и роли воркеров в панелях живого экрана",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [

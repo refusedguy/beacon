@@ -6,7 +6,7 @@
     {
       "id": "DC-01",
       "title": "Свести статусы batch JSON к карточкам docs/tasks",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -27,7 +27,7 @@
     {
       "id": "DC-02",
       "title": "Научить индекс видеть все семейства карточек",
-      "status": "todo",
+      "status": "done",
       "phase": "P0",
       "type": "task",
       "owner_files": [
@@ -67,7 +67,7 @@
     {
       "id": "DC-04",
       "title": "Привести ADR 0247 к реальным шагам docs.yml",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -87,7 +87,7 @@
     {
       "id": "DC-05",
       "title": "Обновить ADR 0257: схема в коде и команда владельца",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
