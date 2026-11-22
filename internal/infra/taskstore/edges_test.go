@@ -29,9 +29,93 @@ func TestEdgeKinds(t *testing.T) {
 		if !IsValidEdgeKind(want[i]) {
 			t.Errorf("IsValidEdgeKind отклонил %q", want[i])
 		}
+		if !IsWellKnownEdgeKind(want[i]) {
+			t.Errorf("IsWellKnownEdgeKind отклонил встроенный тип %q", want[i])
+		}
 	}
-	if IsValidEdgeKind("conflicts-with") {
-		t.Error("IsValidEdgeKind принял неизвестный тип")
+	if IsWellKnownEdgeKind("conflicts-with") {
+		t.Error("IsWellKnownEdgeKind принял пользовательский тип")
+	}
+}
+
+func TestIsValidEdgeKindLengthBoundary(t *testing.T) {
+	custom := EdgeKind("reviewed-by")
+	if !IsValidEdgeKind(custom) {
+		t.Fatal("IsValidEdgeKind отклонил пользовательский тип reviewed-by")
+	}
+	if IsWellKnownEdgeKind(custom) {
+		t.Error("IsWellKnownEdgeKind принял reviewed-by как встроенный")
+	}
+	limit := strings.Repeat("x", MaxEdgeKindLen)
+	if !IsValidEdgeKind(EdgeKind(limit)) {
+		t.Errorf("IsValidEdgeKind отклонил тип длиной %d", MaxEdgeKindLen)
+	}
+	tooLong := strings.Repeat("x", MaxEdgeKindLen+1)
+	if IsValidEdgeKind(EdgeKind(tooLong)) {
+		t.Errorf("IsValidEdgeKind принял тип длиной %d", MaxEdgeKindLen+1)
+	}
+	if IsValidEdgeKind("") {
+		t.Error("IsValidEdgeKind принял пустой тип")
+	}
+}
+
+func TestAddCustomEdgeKindRoundTrip(t *testing.T) {
+	custom := EdgeKind("reviewed-by")
+	g := NewGraph()
+	if err := g.AddEdge("T3.1", "T3.2", custom); err != nil {
+		t.Fatalf("AddEdge(reviewed-by): %v", err)
+	}
+	if g.Size() != 1 {
+		t.Fatalf("Size = %d, ждали 1", g.Size())
+	}
+	edges := g.Edges()
+	if len(edges) != 1 || edges[0].Kind != custom {
+		t.Fatalf("Edges = %+v, ждали reviewed-by", edges)
+	}
+	tr := g.TraverseAll("T3.1")
+	if len(tr.Edges) != 1 || tr.Edges[0].Kind != custom || tr.Edges[0].To != "T3.2" {
+		t.Fatalf("обход пользовательского типа: %+v", tr.Edges)
+	}
+}
+
+func TestAddEdgeRejectsTooLongKindBeforeWrite(t *testing.T) {
+	tooLong := EdgeKind(strings.Repeat("x", MaxEdgeKindLen+1))
+	g := NewGraph()
+	err := g.AddEdge("T3.1", "T3.2", tooLong)
+	if err == nil {
+		t.Fatal("AddEdge не отклонил тип длиной MaxEdgeKindLen+1")
+	}
+	if Code(err) != ExitValidation || !strings.Contains(err.Error(), "тип ребра") {
+		t.Errorf("ошибка = %q, код = %d", err, Code(err))
+	}
+	if g.Size() != 0 {
+		t.Fatalf("граф изменён при ошибке: Size = %d", g.Size())
+	}
+}
+
+func TestCycleCheckWorksForCustomEdgeKind(t *testing.T) {
+	custom := EdgeKind("reviewed-by")
+	g := testGraph(t,
+		Edge{From: "T3.1", To: "T3.2", Kind: custom},
+		Edge{From: "T3.2", To: "T3.3", Kind: custom},
+	)
+	err := g.AddEdge("T3.3", "T3.1", custom)
+	if err == nil {
+		t.Fatal("цикл через пользовательский тип не отклонён")
+	}
+	if Code(err) != ExitValidation || !strings.Contains(err.Error(), "цикл") {
+		t.Errorf("ошибка = %q, код = %d", err, Code(err))
+	}
+	if g.Size() != 2 {
+		t.Fatalf("цикл изменил граф: Size = %d", g.Size())
+	}
+
+	report := CanonicalCycleReport([]Edge{
+		{From: "T3.1", To: "T3.2", Kind: custom},
+		{From: "T3.2", To: "T3.1", Kind: custom},
+	})
+	if len(report.Cycles) != 1 {
+		t.Fatalf("CanonicalCycleReport = %+v, ждали один цикл", report.Cycles)
 	}
 }
 
@@ -150,7 +234,7 @@ func TestAddEdgeRejectsBadInput(t *testing.T) {
 		kind     EdgeKind
 		want     string
 	}{
-		{"T3.1", "T3.2", "conflicts-with", "тип ребра"},
+		{"T3.1", "T3.2", EdgeKind(""), "тип ребра"},
 		{"pages/readme", "T3.2", EdgeBlocks, "ID"},
 		{"T3.1", "простое слово", EdgeBlocks, "ID"},
 		{"T3.1", "T3.1", EdgeBlocks, "петля"},
