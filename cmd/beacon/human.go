@@ -21,7 +21,7 @@ func init() {
 	catalog = append(catalog, command{
 		Name:    "human",
 		Summary: "Принять решение оператора по вотче или блокеру",
-		Usage:   "beacon human [--format table|json] <approve|reject|rework|unblock|pause|resume|cancel> <watchID|blockerID> [--note \"...\"]",
+		Usage:   "beacon human [--format table|json] <approve|reject|rework|unblock|pause|resume|cancel|context|force_retry_merge> <watchID|blockerID> [--note \"...\"]",
 	})
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
@@ -29,17 +29,20 @@ func init() {
 // humanOutcome is a declared outcome of the human gate. The set is closed: an
 // answer outside it is a type error, never free text (RS-CMP-06). The gate
 // outcomes come from ADR 0031 section 6; unblock, pause and cancel are operator
-// additions from ADR 0041.
+// additions from ADR 0041; context and force_retry_merge mirror the server's
+// validCommands so the CLI accepts every verb the live screen offers.
 type humanOutcome string
 
 const (
-	humanApprove humanOutcome = "approve"
-	humanReject  humanOutcome = "reject"
-	humanRework  humanOutcome = "rework"
-	humanUnblock humanOutcome = "unblock"
-	humanPause   humanOutcome = "pause"
-	humanResume  humanOutcome = "resume"
-	humanCancel  humanOutcome = "cancel"
+	humanApprove         humanOutcome = "approve"
+	humanReject          humanOutcome = "reject"
+	humanRework          humanOutcome = "rework"
+	humanUnblock         humanOutcome = "unblock"
+	humanPause           humanOutcome = "pause"
+	humanResume          humanOutcome = "resume"
+	humanCancel          humanOutcome = "cancel"
+	humanContext         humanOutcome = "context"
+	humanForceRetryMerge humanOutcome = "force_retry_merge"
 )
 
 // humanOutcomes is the closed set of declared gate outcomes. It is both the
@@ -47,6 +50,7 @@ const (
 var humanOutcomes = []humanOutcome{
 	humanApprove, humanReject, humanRework, humanUnblock,
 	humanPause, humanResume, humanCancel,
+	humanContext, humanForceRetryMerge,
 }
 
 // valid reports whether o is one of the declared outcomes.
