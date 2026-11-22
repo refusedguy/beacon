@@ -92,7 +92,9 @@ func ciLogTestWatch(conclusion string) domain.Watch {
 
 func TestCIFailedLogPaginatesFromCache(t *testing.T) {
 	const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	raw := strings.Repeat("a", 4000) + token + strings.Repeat("b", 5000)
+	// Spaces around the token stop the token regex from consuming the run of
+	// b characters as part of its [A-Za-z0-9]{20,} match.
+	raw := strings.Repeat("a", 4000) + " " + token + " " + strings.Repeat("b", 5000)
 
 	src := &fakeCIFailedLogSource{text: raw}
 	cache := newMemoryCIFailedLogCache()
@@ -117,7 +119,7 @@ func TestCIFailedLogPaginatesFromCache(t *testing.T) {
 	if out.FromCache {
 		t.Fatal("first page must come from the source")
 	}
-	if out.TotalBytes != 4000+len("[REDACTED]")+5000 {
+	if out.TotalBytes != 4000+1+len("[REDACTED]")+1+5000 {
 		t.Fatalf("totalBytes = %d, want sanitized length", out.TotalBytes)
 	}
 	if out.LogURL != "https://github.com/owner/repo/runs/1" {
@@ -149,7 +151,9 @@ func TestCIFailedLogPaginatesFromCache(t *testing.T) {
 
 func TestCIFailedLogRedactsToken(t *testing.T) {
 	const token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	raw := strings.Repeat("a", 4000) + token + strings.Repeat("b", 5000)
+	// Spaces around the token stop the token regex from consuming the run of
+	// b characters as part of its [A-Za-z0-9]{20,} match.
+	raw := strings.Repeat("a", 4000) + " " + token + " " + strings.Repeat("b", 5000)
 
 	h := NewCIFailedLogHandler(ciLogTestStore{watch: ciLogTestWatch("FAILURE")}, &fakeCIFailedLogSource{text: raw})
 	h.SetCache(newMemoryCIFailedLogCache())
