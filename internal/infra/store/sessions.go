@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -45,6 +46,21 @@ const (
 // to the task line that created it. The store reads the key without knowing
 // which command wrote it (T3.278).
 const SessionMetaTaskID = "ai.beacon/taskID"
+
+// SessionMetaJournalPath is the metadata key that holds the journal file a
+// session writes. Resume reads the path from the stored session, never from a
+// caller, so a restarted session keeps writing to the same file (CCx-11).
+const SessionMetaJournalPath = "ai.beacon/journalPath"
+
+var (
+	// ErrNoJournalPath means the session has no journal path recorded in its
+	// metadata. Resume cannot continue a journal it does not know about.
+	ErrNoJournalPath = errors.New("store: sessions: no journal path in metadata")
+	// ErrJournalPathMissing means the recorded journal file no longer exists.
+	// Resume reports the loss instead of creating a fresh file with the new
+	// entries only.
+	ErrJournalPathMissing = errors.New("store: sessions: journal path no longer exists")
+)
 
 // createSessionsSQL is issued on first use by every write method. id is the
 // stable key a caller uses to find a session again after a restart.
@@ -196,6 +212,47 @@ func (d *DB) FindSessionByTask(task string) (Session, bool, error) {
 		}
 	}
 	return Session{}, false, nil
+}
+
+// ResumeJournal appends line to the journal file recorded in the session's
+// metadata. The path comes from the stored session, so a resumed session keeps
+// writing to the same file. Resume never creates a new file: a missing path is
+// reported as an error instead. The returned path is the journal that received
+// the line.
+func (d *DB) ResumeJournal(id, line string) (string, error) {
+	if d == nil {
+		return "", errors.New("store: sessions: nil db")
+	}
+	s, found, err := d.GetSession(id)
+	if err != nil {
+		return "", err
+	}
+	if !found {
+		return "", fmt.Errorf("store: sessions: unknown id %q", id)
+	}
+	path, ok := s.Metadata[SessionMetaJournalPath]
+	if !ok || strings.TrimSpace(path) == "" {
+		return "", ErrNoJournalPath
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", ErrJournalPathMissing
+		}
+		return "", fmt.Errorf("store: sessions: stat journal: %w", err)
+	}
+	if info.IsDir() {
+		return "", ErrJournalPathMissing
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		return "", fmt.Errorf("store: sessions: open journal: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line + "\n"); err != nil {
+		return "", fmt.Errorf("store: sessions: append journal: %w", err)
+	}
+	return path, nil
 }
 
 // Touch moves id's last_seen to at, or to the current UTC time when at is
