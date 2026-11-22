@@ -20,6 +20,14 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// ErrScheduleNotFound and ErrScheduleExists mirror the server port's schedule
+// errors. The store layer cannot import server, so they are distinct sentinel
+// values; the wiring adapter in cmd/beacon translates them to the port errors.
+var (
+	ErrScheduleNotFound = errors.New("store: schedules: schedule not found")
+	ErrScheduleExists   = errors.New("store: schedules: schedule already exists")
+)
+
 // The three kinds of schedule the scheduler understands.
 const (
 	ScheduleKindInterval = "interval"
@@ -74,14 +82,8 @@ func (d *DB) SaveSchedule(s Schedule) error {
 	if d == nil {
 		return errors.New("store: schedules: nil db")
 	}
-	if strings.TrimSpace(s.ID) == "" {
-		return domain.NewAppError(domain.CodeInvalidInput, "store: schedules: empty id")
-	}
-	if !validScheduleKind(s.Kind) {
-		return domain.NewAppError(domain.CodeInvalidInput, "store: schedules: invalid kind "+s.Kind)
-	}
-	if s.NextRun.IsZero() {
-		return domain.NewAppError(domain.CodeInvalidInput, "store: schedules: zero next run")
+	if err := validateSchedule(s); err != nil {
+		return err
 	}
 	return d.Write(context.Background(), func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createSchedulesSQL); err != nil {
@@ -206,6 +208,251 @@ func (d *DB) DisableSchedule(id string) error {
 		}
 		return nil
 	})
+}
+
+// validateSchedule checks the fields shared by every write of a full schedule
+// row. Get, Delete and SetEnabled only need an id, so they use validateScheduleID.
+func validateSchedule(s Schedule) error {
+	if err := validateScheduleID(s.ID); err != nil {
+		return err
+	}
+	if !validScheduleKind(s.Kind) {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: schedules: invalid kind "+s.Kind)
+	}
+	if s.NextRun.IsZero() {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: schedules: zero next run")
+	}
+	return nil
+}
+
+func validateScheduleID(id string) error {
+	if strings.TrimSpace(id) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: schedules: empty id")
+	}
+	return nil
+}
+
+// normalizeScheduleCtx keeps QueryRowContext and QueryContext safe when a
+// caller passes a nil context. DB.Write already does this for writes.
+func normalizeScheduleCtx(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+// scheduleRowQuerier is satisfied by both *sql.DB and *sql.Tx, so Get and
+// SetEnabled share the single-row scan without letting the read escape its
+// transaction.
+type scheduleRowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+const selectScheduleSQL = `SELECT id, kind, spec, target_card, next_run, enabled FROM schedules WHERE id = ?`
+
+func scanScheduleRow(ctx context.Context, q scheduleRowQuerier, id string) (Schedule, error) {
+	var s Schedule
+	var nextRun int64
+	var enabled int
+	err := q.QueryRowContext(ctx, selectScheduleSQL, id).Scan(
+		&s.ID, &s.Kind, &s.Spec, &s.TargetCard, &nextRun, &enabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Schedule{}, fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
+	}
+	if err != nil {
+		return Schedule{}, err
+	}
+	s.NextRun = timeFromNano(nextRun)
+	s.Enabled = enabled != 0
+	return s, nil
+}
+
+// CreateSchedule inserts a new schedule. An existing id is refused with
+// ErrScheduleExists, so creating is not an upsert: SaveSchedule remains the
+// explicit replace operation.
+func (d *DB) CreateSchedule(ctx context.Context, s Schedule) error {
+	if d == nil {
+		return errors.New("store: schedules: nil db")
+	}
+	if err := validateSchedule(s); err != nil {
+		return err
+	}
+	ctx = normalizeScheduleCtx(ctx)
+	return d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createSchedulesSQL); err != nil {
+			return fmt.Errorf("store: schedules: create table: %w", err)
+		}
+		res, err := tx.Exec(`
+			INSERT INTO schedules (id, kind, spec, target_card, next_run, enabled)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(id) DO NOTHING`,
+			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), scheduleBoolToInt(s.Enabled))
+		if err != nil {
+			return fmt.Errorf("store: schedules: create: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: schedules: create rows: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: %s", ErrScheduleExists, s.ID)
+		}
+		return nil
+	})
+}
+
+// GetSchedule returns the row with id. An unknown id reports ErrScheduleNotFound.
+func (d *DB) GetSchedule(ctx context.Context, id string) (Schedule, error) {
+	if d == nil {
+		return Schedule{}, errors.New("store: schedules: nil db")
+	}
+	if err := validateScheduleID(id); err != nil {
+		return Schedule{}, err
+	}
+	ctx = normalizeScheduleCtx(ctx)
+	ok, err := tableExists(ctx, d.readDB, "schedules")
+	if err != nil {
+		return Schedule{}, err
+	}
+	if !ok {
+		return Schedule{}, fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
+	}
+	return scanScheduleRow(ctx, d.readDB, id)
+}
+
+// ListSchedules returns every stored row ordered by id. A store with no
+// schedules table returns an empty slice, like DueSchedules.
+func (d *DB) ListSchedules(ctx context.Context) ([]Schedule, error) {
+	if d == nil {
+		return nil, errors.New("store: schedules: nil db")
+	}
+	ctx = normalizeScheduleCtx(ctx)
+	ok, err := tableExists(ctx, d.readDB, "schedules")
+	if err != nil || !ok {
+		return []Schedule{}, err
+	}
+	rows, err := d.readDB.QueryContext(ctx, `
+		SELECT id, kind, spec, target_card, next_run, enabled FROM schedules
+		ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Schedule{}
+	for rows.Next() {
+		var s Schedule
+		var nextRun int64
+		var enabled int
+		if err := rows.Scan(&s.ID, &s.Kind, &s.Spec, &s.TargetCard, &nextRun, &enabled); err != nil {
+			return nil, err
+		}
+		s.NextRun = timeFromNano(nextRun)
+		s.Enabled = enabled != 0
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// UpdateSchedule replaces the whole row for an existing id. An unknown id
+// reports ErrScheduleNotFound, so an update never inserts a new row.
+func (d *DB) UpdateSchedule(ctx context.Context, s Schedule) error {
+	if d == nil {
+		return errors.New("store: schedules: nil db")
+	}
+	if err := validateSchedule(s); err != nil {
+		return err
+	}
+	ctx = normalizeScheduleCtx(ctx)
+	return d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createSchedulesSQL); err != nil {
+			return fmt.Errorf("store: schedules: create table: %w", err)
+		}
+		res, err := tx.Exec(`
+			UPDATE schedules SET kind = ?, spec = ?, target_card = ?, next_run = ?, enabled = ?
+			WHERE id = ?`,
+			s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), scheduleBoolToInt(s.Enabled), s.ID)
+		if err != nil {
+			return fmt.Errorf("store: schedules: update: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: schedules: update rows: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: %s", ErrScheduleNotFound, s.ID)
+		}
+		return nil
+	})
+}
+
+// DeleteSchedule removes id permanently. A second delete reports
+// ErrScheduleNotFound, so deletion is not an idempotent no-op.
+func (d *DB) DeleteSchedule(ctx context.Context, id string) error {
+	if d == nil {
+		return errors.New("store: schedules: nil db")
+	}
+	if err := validateScheduleID(id); err != nil {
+		return err
+	}
+	ctx = normalizeScheduleCtx(ctx)
+	return d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createSchedulesSQL); err != nil {
+			return fmt.Errorf("store: schedules: create table: %w", err)
+		}
+		res, err := tx.Exec(`DELETE FROM schedules WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("store: schedules: delete: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: schedules: delete rows: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
+		}
+		return nil
+	})
+}
+
+// SetScheduleEnabled flips id's Enabled flag and returns the updated row in one
+// write, so a concurrent Pause and Resume cannot read the same row and write it
+// back over each other. An unknown id reports ErrScheduleNotFound.
+func (d *DB) SetScheduleEnabled(ctx context.Context, id string, enabled bool) (Schedule, error) {
+	if d == nil {
+		return Schedule{}, errors.New("store: schedules: nil db")
+	}
+	if err := validateScheduleID(id); err != nil {
+		return Schedule{}, err
+	}
+	ctx = normalizeScheduleCtx(ctx)
+	var out Schedule
+	err := d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(createSchedulesSQL); err != nil {
+			return fmt.Errorf("store: schedules: create table: %w", err)
+		}
+		res, err := tx.Exec(`UPDATE schedules SET enabled = ? WHERE id = ?`,
+			scheduleBoolToInt(enabled), id)
+		if err != nil {
+			return fmt.Errorf("store: schedules: set enabled: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: schedules: set enabled rows: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: %s", ErrScheduleNotFound, id)
+		}
+		row, err := scanScheduleRow(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		out = row
+		return nil
+	})
+	if err != nil {
+		return Schedule{}, err
+	}
+	return out, nil
 }
 
 func scheduleBoolToInt(b bool) int {
