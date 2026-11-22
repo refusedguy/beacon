@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	"github.com/refusedguy/beacon/internal/infra/store"
+	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 const attachSessionsFile = "attach-sessions.json"
@@ -383,6 +385,91 @@ func parseAttachArgs(args []string) (taskID, sessionID string, resume, ok bool) 
 	return "", "", false, false
 }
 
+// attachResumeGit is the git seam at the work-restoration boundary. cmd/beacon
+// never shells out itself (ADR 0005); the shared worktree runner keeps the
+// guard testable and matches the runner used by beacon gc (WIRING-1686).
+var attachResumeGit = worktree.CommandRunner
+
+// attachResumeGitOutput runs one read-only git command and returns its trimmed
+// output. A failing command yields an empty string: the guard is best effort
+// and never blocks resume because git could not be queried.
+func attachResumeGitOutput(dir string, args ...string) string {
+	out, err := attachResumeGit(dir, args...)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+// attachResumeOtherWorktree reports whether the branch is checked out in a
+// worktree other than the current one, together with that worktree's path. It
+// parses `git worktree list --porcelain`; the current worktree is excluded so
+// a normal resume is not mistaken for a takeover (WIRING-1686).
+func attachResumeOtherWorktree(dir, branch string) (bool, string) {
+	if branch == "" || branch == "HEAD" {
+		return false, ""
+	}
+	current := attachResumeGitOutput(dir, "rev-parse", "--show-toplevel")
+	listing := attachResumeGitOutput(dir, "worktree", "list", "--porcelain")
+	want := "refs/heads/" + branch
+	var path string
+	for _, line := range strings.Split(listing, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			path = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		case line == "branch "+want:
+			if path != "" && path != current {
+				return true, path
+			}
+		case line == "":
+			path = ""
+		}
+	}
+	return false, ""
+}
+
+// attachResumeCounts reads the ahead and behind counts for the current branch.
+// The left side of `rev-list --left-right --count <upstream>...HEAD` is commits
+// only on the upstream (behind), the right side is local commits (ahead).
+// A branch without a configured upstream is compared with origin/main.
+func attachResumeCounts(dir string) (ahead, behind int) {
+	upstream := attachResumeGitOutput(dir, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	if upstream == "" {
+		upstream = "origin/main"
+	}
+	fields := strings.Fields(attachResumeGitOutput(dir, "rev-list", "--left-right", "--count", upstream+"...HEAD"))
+	if len(fields) != 2 {
+		return 0, 0
+	}
+	behindN, errBehind := strconv.Atoi(fields[0])
+	aheadN, errAhead := strconv.Atoi(fields[1])
+	if errBehind != nil || errAhead != nil {
+		return 0, 0
+	}
+	return aheadN, behindN
+}
+
+// attachResumeCheck collects the branch facts at the resume boundary and asks
+// worktree.CheckResume how the branch may be opened again (WIRING-1686). It is
+// the caller-side half of the guard: git runs here, the pure decision in
+// internal/infra/worktree/resume_guard.go. Missing facts stay zero so an
+// unrecognised repository degrades to the open decision instead of blocking.
+func attachResumeCheck(dir string) worktree.ResumeAnswer {
+	branch := attachResumeGitOutput(dir, "rev-parse", "--abbrev-ref", "HEAD")
+	wtPath := attachResumeGitOutput(dir, "rev-parse", "--show-toplevel")
+	checkedOutElsewhere, existing := attachResumeOtherWorktree(dir, branch)
+	ahead, behind := attachResumeCounts(dir)
+	return worktree.CheckResume(worktree.ResumeInput{
+		Branch:              branch,
+		Worktree:            wtPath,
+		CheckedOutElsewhere: checkedOutElsewhere,
+		Ahead:               ahead,
+		Behind:              behind,
+		ExistingWorktree:    existing,
+	})
+}
+
 // runAttach implements `beacon attach <sessionID>` and `beacon attach --resume
 // [taskID]`. A plain attach opens the given session and saves its id for later.
 // After a timeout kill, --resume opens that saved session instead of starting
@@ -422,6 +509,19 @@ func (c *CLI) runAttach(args []string) int {
 		if err != nil {
 			fmt.Fprintf(c.errOut, "beacon attach: расхождение identity сессии: %v\n", err)
 			return 2
+		}
+
+		// WIRING-1686: at the work-restoration boundary, ask the pure guard
+		// whether the branch can be opened again. A diverged branch is refused
+		// so local commits are never overwritten; a branch held by another
+		// worktree is reused instead of cloned (CD-02).
+		answer := attachResumeCheck(c.root)
+		switch answer.Decision {
+		case worktree.ResumeRefuse:
+			fmt.Fprintf(c.errOut, "beacon attach: %s\n", answer.Reason)
+			return 2
+		case worktree.ResumeReuse:
+			fmt.Fprintf(c.out, "beacon attach: %s\n", answer.Reason)
 		}
 	}
 
