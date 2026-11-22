@@ -61,18 +61,85 @@ export function findShellGuardHit(tool, input) {
   return SHELL_GUARD_RULES.find((rule) => rule.pattern.test(command)) ?? null
 }
 
+// CSx-12. SDK различает strict_mcp_config и setting_sources
+// (types.py:2477-2482, 2759-2770): пустой список включает изоляцию и оставляет
+// только явно переданную конфигурацию. Здесь та же модель. Источник explicit
+// всегда доверен, а env и project читаются только когда они названы в
+// settingSources. Каждая отвергнутая попытка логируется с именем источника.
+export const SETTING_SOURCE_ENV = "env"
+export const SETTING_SOURCE_PROJECT = "project"
+export const SETTING_SOURCE_EXPLICIT = "explicit"
+export const ALL_SETTING_SOURCES = Object.freeze([
+  SETTING_SOURCE_ENV,
+  SETTING_SOURCE_PROJECT,
+  SETTING_SOURCE_EXPLICIT,
+])
+
+export function readStrictConfig(config = {}) {
+  const strictConfig = config.strictConfig === true
+  const raw = config.settingSources
+  const settingSources = Array.isArray(raw)
+    ? raw.filter((name) => typeof name === "string")
+    : []
+  return Object.freeze({ strictConfig, settingSources })
+}
+
+export function isSettingSourceAllowed(strict, name) {
+  if (!strict.strictConfig) return true
+  if (name === SETTING_SOURCE_EXPLICIT) return true
+  return strict.settingSources.includes(name)
+}
+
+export function readSettingSource(strict, name, read, reject = console.warn) {
+  if (!isSettingSourceAllowed(strict, name)) {
+    reject(`CSx-12: rejected config source ${name} (strictConfig)`)
+    return undefined
+  }
+  return read()
+}
+
+export function shellGuardMode(strict, config = {}, env = process.env, reject) {
+  const fromEnv = readSettingSource(
+    strict,
+    SETTING_SOURCE_ENV,
+    () => env.BEACON_SHELL_GUARD,
+    reject,
+  )
+  if (typeof fromEnv === "string") return fromEnv
+  return readSettingSource(strict, SETTING_SOURCE_EXPLICIT, () => config.shellGuard, reject)
+}
+
+// CSx-12. Фильтр инструментов по источникам. В строгом режиме лишний
+// инструмент из файла проекта отвергается с логированием, поэтому различие
+// числа инструментов между обычным и строгим режимом равно числу отвергнутых.
+export function toolsFromSources(strict, sources = [], reject) {
+  const tools = []
+  for (const source of sources) {
+    const name = source?.name ?? source?.source
+    if (isSettingSourceAllowed(strict, name)) {
+      tools.push(...(source?.tools ?? []))
+    } else {
+      const log = typeof reject === "function" ? reject : console.warn
+      log(`CSx-12: rejected config source ${name} (strictConfig)`)
+    }
+  }
+  return tools
+}
+
 // BCX-82. Режим warn дает неделю наблюдений без слома сессий. Переменная
 // BEACON_SHELL_GUARD=warn пишет предупреждение и пропускает команду. Любое
 // другое значение, включая отсутствие переменной, блокирует команду.
-export async function registerShellGuard(ctx) {
+export async function registerShellGuard(ctx, config = {}) {
   if (typeof ctx?.tool?.hook !== "function") return null
+  const strict = readStrictConfig(config)
+  const mode = shellGuardMode(strict, config)
   try {
     return await ctx.tool.hook("execute.before", (event) => {
       const hit = findShellGuardHit(event?.tool, event?.input)
       if (!hit) return
       const message = `BCX-82: ${hit.id} is blocked here. Use ${hit.replacement}.`
       console.warn(message)
-      if (process.env.BEACON_SHELL_GUARD === "warn") return
+      if (mode === "warn") return
       throw new Error(message)
     })
   } catch {
@@ -159,13 +226,15 @@ export function normalizePermissionDecision(decision = {}) {
   return normalized
 }
 
-export function decidePreToolUse(event) {
+export function decidePreToolUse(event, mode) {
   const typed = toolLifecycleInput(event, TOOL_LIFECYCLE_EVENTS.pre)
   const hit = findShellGuardHit(typed.tool_name, typed.tool_input)
   if (!hit) return { permissionDecision: "allow" }
   const message = `CS-01: ${hit.id} is denied here. Use ${hit.replacement}.`
-  // Тот же режим наблюдения, что и в BCX-82: warn блокировку не применяет.
-  if (process.env.BEACON_SHELL_GUARD === "warn") {
+  // CSx-12. Тот же режим наблюдения, что и в BCX-82, но источник режима
+  // проходит через strictConfig. Без явного режима поведение прежнее.
+  const guardMode = mode === undefined ? shellGuardMode(readStrictConfig()) : mode
+  if (guardMode === "warn") {
     return { permissionDecision: "allow", additionalContext: message }
   }
   return { permissionDecision: "deny", reason: message, additionalContext: message }
@@ -200,6 +269,8 @@ export function assertFailClosedCapability(ctx, onFailure) {
 }
 
 export async function registerToolLifecycle(ctx, options = {}) {
+  const strict = readStrictConfig(options)
+  const guardMode = shellGuardMode(strict, options)
   const onFailure = options.onFailure ?? process.env.BEACON_TOOL_HOOK_ON_FAILURE ?? "continue"
   if (!ON_FAILURE_MODES.includes(onFailure)) {
     throw new Error(`CS-01: unknown onFailure mode ${onFailure}`)
@@ -214,7 +285,7 @@ export async function registerToolLifecycle(ctx, options = {}) {
   let post = null
   try {
     pre = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.pre, (event) =>
-      resolveHookResponse(decidePreToolUse(event)),
+      resolveHookResponse(decidePreToolUse(event, guardMode)),
     )
     post = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.post, (event) =>
       resolveHookResponse(decidePostToolUse(event)),
@@ -244,10 +315,13 @@ export const beaconProject = Plugin.define({
     // не трогает MCP и не пишет в сессии чужого проекта.
     if (!root) return
 
+    // CSx-12. Конфиг плагина - единственный доверенный источник в строгом
+    // режиме. Переменные окружения и файлы проекта фильтруются по settingSources.
+    const config = ctx?.config ?? {}
     const mcp = await registerBeaconMcp(ctx, root)
     const context = await installProjectContext(ctx, root, locationInfo(ctx))
-    const guard = await registerShellGuard(ctx)
-    const lifecycle = await registerToolLifecycle(ctx)
+    const guard = await registerShellGuard(ctx, config)
+    const lifecycle = await registerToolLifecycle(ctx, config)
 
     return async () => {
       await lifecycle?.dispose?.()

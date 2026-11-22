@@ -95,6 +95,99 @@ func LoadRemoteEndpoint(dir string) (RemoteEndpoint, error) {
 	return ep, nil
 }
 
+// CSx-12. Источники конфигурации MCP. SDK задаёт strict_mcp_config и
+// settingSources (types.py:2477-2482, 2759-2770): пустой список отключает
+// файлы проекта и окружение. Здесь explicit всегда доверен, а env и project
+// читаются только когда они названы в SettingSources.
+type SettingSource string
+
+const (
+	SettingSourceExplicit SettingSource = "explicit"
+	SettingSourceProject  SettingSource = "project"
+	SettingSourceEnv      SettingSource = "env"
+
+	remoteEndpointEnvHost  = "BEACON_MCP_HOST"
+	remoteEndpointEnvPort  = "BEACON_MCP_PORT"
+	remoteEndpointEnvToken = "BEACON_MCP_TOKEN"
+)
+
+// StrictRemoteConfig задаёт строгую изоляцию источников (CSx-12). StrictMcp
+// включает режим, SettingSources задаёт список разрешённых источников.
+// Endpoint из явной конфигурации имеет приоритет и не зависит от каталога
+// проекта или окружения.
+type StrictRemoteConfig struct {
+	StrictMcp      bool
+	SettingSources []SettingSource
+	Endpoint       *RemoteEndpoint
+	RejectLogger   func(source string)
+}
+
+func (c StrictRemoteConfig) allows(source SettingSource) bool {
+	if !c.StrictMcp || source == SettingSourceExplicit {
+		return true
+	}
+	for _, allowed := range c.SettingSources {
+		if allowed == source {
+			return true
+		}
+	}
+	return false
+}
+
+func (c StrictRemoteConfig) reject(source SettingSource) {
+	if c.RejectLogger != nil {
+		c.RejectLogger(string(source))
+	}
+}
+
+// LoadRemoteEndpointStrict возвращает адрес только из разрешённых источников.
+// В строгом режиме каждый источник вне SettingSources отвергается и логируется
+// по имени. Без явного Endpoint режим не падает обратно на файл проекта или
+// окружение, а возвращает typed error: изоляция не зависит от каталога.
+func LoadRemoteEndpointStrict(cfg StrictRemoteConfig, dir string) (RemoteEndpoint, error) {
+	if !cfg.allows(SettingSourceEnv) {
+		cfg.reject(SettingSourceEnv)
+	}
+	if !cfg.allows(SettingSourceProject) {
+		cfg.reject(SettingSourceProject)
+	}
+	if cfg.Endpoint != nil {
+		ep := *cfg.Endpoint
+		if err := ep.Validate(); err != nil {
+			return RemoteEndpoint{}, err
+		}
+		return ep, nil
+	}
+	if cfg.StrictMcp {
+		return RemoteEndpoint{}, fmt.Errorf("%w: strictMcp requires explicit endpoint", ErrRemoteNoConnection)
+	}
+	if cfg.allows(SettingSourceEnv) {
+		if ep, ok := remoteEndpointFromEnv(); ok {
+			return ep, nil
+		}
+	}
+	if cfg.allows(SettingSourceProject) {
+		return LoadRemoteEndpoint(dir)
+	}
+	return RemoteEndpoint{}, ErrRemoteNoConnection
+}
+
+func remoteEndpointFromEnv() (RemoteEndpoint, bool) {
+	host := strings.TrimSpace(os.Getenv(remoteEndpointEnvHost))
+	if host == "" {
+		return RemoteEndpoint{}, false
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(os.Getenv(remoteEndpointEnvPort)))
+	if err != nil {
+		return RemoteEndpoint{}, false
+	}
+	ep := RemoteEndpoint{Host: host, Port: port, Token: os.Getenv(remoteEndpointEnvToken)}
+	if err := ep.Validate(); err != nil {
+		return RemoteEndpoint{}, false
+	}
+	return ep, true
+}
+
 // HTTPDoer is the single HTTP seam. *http.Client implements it; tests pass a
 // fake transport that records the request and returns a canned response.
 type HTTPDoer interface {
