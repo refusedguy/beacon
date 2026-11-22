@@ -103,7 +103,7 @@ func (c *CLI) runDoctor(args []string) int {
 		})
 	}
 
-	checks := []checkResult{c.checkGo(), c.checkGates(), c.checkStateDir()}
+	checks := []checkResult{c.checkGo(), c.checkGates(), c.checkStateDir(), c.checkOTELExporter()}
 	return c.renderDoctorChecks(checks)
 }
 
@@ -272,6 +272,23 @@ func (c *CLI) checkStateDir() checkResult {
 		return checkResult{"state", doctorFail, path + ": не каталог"}
 	}
 	return checkResult{"state", doctorPass, path}
+}
+
+// doctorOTELExporterEnv is the OTLP exporter selector that doctor validates.
+// observe/otel.go owns its runtime meaning. A typo silently falls back to the
+// local slog sink (README.md:253), so doctor prints a WARN (eval e11, FTE-09).
+const doctorOTELExporterEnv = "BEACON_OTEL_EXPORTER"
+
+// checkOTELExporter reports a WARN for a value that would silently fall back
+// to the local slog sink. Empty and "otlp" (any case) are valid, matching
+// observe.ConfigFromEnv. WARN is non-blocking, so the exit code stays 0
+// (RULES-CHECK-CONTRACT.md:19).
+func (c *CLI) checkOTELExporter() checkResult {
+	value := strings.TrimSpace(os.Getenv(doctorOTELExporterEnv))
+	if value == "" || strings.EqualFold(value, "otlp") {
+		return checkResult{"otel-exporter", doctorPass, doctorOTELExporterEnv + "=" + value}
+	}
+	return checkResult{"otel-exporter", doctorWarn, doctorOTELExporterEnv + "=" + value + ": поддерживается только otlp, используется локальный sink"}
 }
 
 // doctorGatesEnv is a developer-tool override for `beacon doctor` only. No
