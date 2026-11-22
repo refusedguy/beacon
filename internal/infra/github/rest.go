@@ -41,6 +41,17 @@ const (
 	// failureExcerptSourceMaxFile caps the bytes read from one source file. A
 	// failed annotation must not turn into a multi-megabyte read.
 	failureExcerptSourceMaxFile = 256 << 10
+	// excerptSignalMarkers are case-insensitive substrings that mark a line as
+	// carrying diagnostic signal. When a long message is reduced, these lines
+	// are kept before ordinary context so an error at the end of a log is not
+	// lost to tail truncation (CA-22). The █ entry keeps a marked source line.
+	excerptSignalMarkers = [...]string{
+		"panic", "fatal", "error", "failure", "failed", "exception",
+		"sigsegv", "stack overflow", "█",
+	}
+	// excerptContextLineLimit caps one non-signal line while compressing a
+	// long message, so a single verbose line cannot consume the byte budget.
+	excerptContextLineLimit = 160
 )
 
 // tokenEnvChain is the token lookup order from WORKER-PROMPT §2.
@@ -491,12 +502,79 @@ func clampExcerptBytes(s string) string {
 	return s
 }
 
-// formatCheckRunAnnotations renders "path:line: title: message" lines in the
-// order GitHub returned them, followed by the marked source window when the
-// annotated file is available. Empty fields are skipped, and the byte budget is
-// enforced here as a second line of defence behind the MCP boundary.
-func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
+// isExcerptSignal reports whether a line carries an error or panic marker.
+// Matching is case-insensitive so a CI log in any case keeps its error lines.
+func isExcerptSignal(line string) bool {
+	lower := strings.ToLower(line)
+	for _, marker := range excerptSignalMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// compressExcerptText reduces a long annotation message to the 2 KB ceiling.
+// Signal lines are kept first, most recent first, then context lines follow in
+// their original order with each one capped in length. The result is clamped on
+// a rune boundary so the █ marker is never split. Short messages pass through
+// unchanged, which preserves the existing wire form for normal CI output.
+func compressExcerptText(s string) string {
+	if len(s) <= failureExcerptLimit {
+		return s
+	}
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	var signal, context []string
+	for _, line := range lines {
+		line = strings.TrimRight(line, " \t")
+		if line == "" {
+			continue
+		}
+		if isExcerptSignal(line) {
+			signal = append(signal, line)
+			continue
+		}
+		if len(line) > excerptContextLineLimit {
+			line = line[:excerptContextLineLimit]
+		}
+		context = append(context, line)
+	}
 	var b strings.Builder
+	write := func(line string) {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+	}
+	// Walk signal lines from the end: the failure case is an error near the
+	// tail of a long log, and it must survive before earlier error mentions.
+	for i := len(signal) - 1; i >= 0; i-- {
+		if b.Len() >= failureExcerptLimit {
+			break
+		}
+		write(signal[i])
+	}
+	for _, line := range context {
+		if b.Len() >= failureExcerptLimit {
+			break
+		}
+		write(line)
+	}
+	return clampExcerptBytes(b.String())
+}
+
+// formatCheckRunAnnotations renders "path:line: title: message" lines followed
+// by the marked source window when the annotated file is available. Empty
+// fields are skipped. When the output exceeds the byte budget, blocks carrying
+// an error or panic marker are emitted first so an error in a late annotation
+// survives. The byte budget is enforced here as a second line of defence behind
+// the MCP boundary.
+func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
+	type excerptBlock struct {
+		text   string
+		signal bool
+	}
+	var blocks []excerptBlock
 	for i, a := range annotations {
 		if i >= failureExcerptAnnotations || a == nil {
 			continue
@@ -506,33 +584,76 @@ func formatCheckRunAnnotations(annotations []*gh.CheckRunAnnotation) string {
 		if message == "" && title == "" {
 			continue
 		}
-		if b.Len() > 0 {
-			b.WriteByte('\n')
-		}
 		path := strings.TrimSpace(a.GetPath())
 		line := int(a.GetStartLine())
+		var head strings.Builder
 		if path != "" {
-			b.WriteString(path)
+			head.WriteString(path)
 			if line > 0 {
-				b.WriteByte(':')
-				b.WriteString(strconv.Itoa(line))
+				head.WriteByte(':')
+				head.WriteString(strconv.Itoa(line))
 			}
-			b.WriteString(": ")
+			head.WriteString(": ")
 		}
 		if title != "" {
-			b.WriteString(title)
+			head.WriteString(title)
 			if message != "" {
-				b.WriteString(": ")
+				head.WriteString(": ")
 			}
 		}
-		b.WriteString(message)
+		head.WriteString(compressExcerptText(message))
+		header := head.String()
+		signal := isExcerptSignal(header)
+		var block strings.Builder
+		block.WriteString(header)
 		if source := FormatAnnotationSource(path, line, ""); source != "" {
-			b.WriteByte('\n')
-			b.WriteString(source)
+			block.WriteByte('\n')
+			block.WriteString(source)
+			signal = signal || isExcerptSignal(source)
 		}
-		if b.Len() >= failureExcerptLimit {
-			break
+		blocks = append(blocks, excerptBlock{text: block.String(), signal: signal})
+	}
+
+	// Keep the original order for a short excerpt. Only a reduced excerpt is
+	// reordered, so the common case is byte-for-byte the old output.
+	total := 0
+	for i, bl := range blocks {
+		if i > 0 {
+			total++
+		}
+		total += len(bl.text)
+	}
+	if total <= failureExcerptLimit {
+		var out strings.Builder
+		for i, bl := range blocks {
+			if i > 0 {
+				out.WriteByte('\n')
+			}
+			out.WriteString(bl.text)
+		}
+		return clampExcerptBytes(out.String())
+	}
+
+	ordered := make([]excerptBlock, 0, len(blocks))
+	for _, bl := range blocks {
+		if bl.signal {
+			ordered = append(ordered, bl)
 		}
 	}
-	return clampExcerptBytes(b.String())
+	for _, bl := range blocks {
+		if !bl.signal {
+			ordered = append(ordered, bl)
+		}
+	}
+	var out strings.Builder
+	for _, bl := range ordered {
+		if out.Len() >= failureExcerptLimit {
+			break
+		}
+		if out.Len() > 0 {
+			out.WriteByte('\n')
+		}
+		out.WriteString(bl.text)
+	}
+	return clampExcerptBytes(out.String())
 }
