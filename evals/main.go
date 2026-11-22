@@ -44,7 +44,7 @@ const (
 	serverName = "beacon"
 	// frozenContractToolsHash замораживает хеш(names) по образцу frozenScenarioHash.
 	// Имена приходят из internal/infra/mcp, поэтому список живёт в одном месте.
-	frozenContractToolsHash = "ad40be47dea5b2c76a079255bbe46096bf44c15dd2fc3ead61f4d9bd00714442"
+	frozenContractToolsHash = "f54cb3e7d5c174fa646e6f404c3b8052549d0bf9bcf0ae1d8d05ef78351516e4"
 	// passTrials задаёт число прогонов стохастического кейса. Требуем пять из пяти.
 	passTrials = 5
 	// evalHeadSHA передаётся явно, чтобы обработчик не ходил в GitHub.
