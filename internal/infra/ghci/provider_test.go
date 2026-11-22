@@ -253,7 +253,9 @@ func TestProviderRetryBudgetResetsOnSuccess(t *testing.T) {
 	}
 
 	fail = true
-	failAt(2*time.Second, false) // count 1 after reset
-	failAt(5*time.Second, false) // count 2 after reset, still under budget
-	failAt(10*time.Second, true) // count 3 reaches the budget
+	// Step past the 20s cache TTL, otherwise the cached success short-circuits
+	// the first failure and returns no error.
+	failAt(21*time.Second, false) // count 1 after reset
+	failAt(5*time.Second, false)  // count 2 after reset, still under budget
+	failAt(10*time.Second, true)  // count 3 reaches the budget
 }
