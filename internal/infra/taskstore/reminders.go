@@ -59,8 +59,9 @@ type ReminderStore struct {
 	load    ReminderLoad
 	deliver ReminderDeliver
 
-	mu   sync.Mutex
-	sent map[string]struct{}
+	mu       sync.Mutex
+	sent     map[string]struct{}
+	inflight map[string]struct{}
 }
 
 var _ ReminderPorts = (*ReminderStore)(nil)
@@ -68,7 +69,12 @@ var _ ReminderPorts = (*ReminderStore)(nil)
 // NewReminderStore builds the adapter. A nil loader returns no tasks; a nil
 // deliverer accepts reminders without sending them.
 func NewReminderStore(load ReminderLoad, deliver ReminderDeliver) *ReminderStore {
-	return &ReminderStore{load: load, deliver: deliver, sent: make(map[string]struct{})}
+	return &ReminderStore{
+		load:     load,
+		deliver:  deliver,
+		sent:     make(map[string]struct{}),
+		inflight: make(map[string]struct{}),
+	}
 }
 
 // OverdueTasks reads the current overdue set through the injected loader.
@@ -79,26 +85,40 @@ func (s *ReminderStore) OverdueTasks(ctx context.Context, at time.Time) ([]Remin
 	return s.load(ctx, at)
 }
 
-// SendReminder delivers a reminder once per task and deadline. The key check,
-// delivery and mark share one lock, so two concurrent passes cannot send the
-// same reminder. A failed delivery leaves the key unmarked and the app notifier
-// retries on its next pass.
+// SendReminder delivers a reminder once per task and deadline. The key check
+// and the in-flight reservation share the lock, so two concurrent passes send
+// the reminder once. Delivery runs without the lock: a slow channel cannot
+// block other reminders, and a callback that reaches the same store cannot
+// deadlock. A failed delivery releases the reservation and leaves the key
+// unmarked, so the app notifier retries on its next pass.
 func (s *ReminderStore) SendReminder(ctx context.Context, reminder Reminder) error {
 	if s == nil {
 		return nil
 	}
 	key := ReminderKey(reminder.TaskID, reminder.DeadlineAt)
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
+	s.mu.Lock()
 	if _, ok := s.sent[key]; ok {
+		s.mu.Unlock()
 		return nil
 	}
-	if s.deliver != nil {
-		if err := s.deliver(ctx, reminder); err != nil {
-			return err
-		}
+	if _, ok := s.inflight[key]; ok {
+		s.mu.Unlock()
+		return nil
 	}
-	s.sent[key] = struct{}{}
-	return nil
+	s.inflight[key] = struct{}{}
+	s.mu.Unlock()
+
+	var err error
+	if s.deliver != nil {
+		err = s.deliver(ctx, reminder)
+	}
+
+	s.mu.Lock()
+	delete(s.inflight, key)
+	if err == nil {
+		s.sent[key] = struct{}{}
+	}
+	s.mu.Unlock()
+	return err
 }
