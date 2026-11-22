@@ -190,6 +190,26 @@ func savedAttachSession(taskID string) (string, error) {
 	return rec.SessionID, err
 }
 
+// attachRegistryRevision signs the saved-session registry by its raw bytes.
+// Any change to a saved record changes the revision. Resume takes it before it
+// reads a record and again before it opens the session. A mismatch means the
+// record moved while the id was being chosen, so attach refuses to open it
+// (CC-05).
+func attachRegistryRevision() (string, error) {
+	path, err := attachSessionsPath()
+	if err != nil {
+		return "", err
+	}
+	data, err := attachReadFile(path)
+	if os.IsNotExist(err) {
+		return session.SessionRevision(""), nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("%s: не удалось прочитать реестр сессий: %w", path, err)
+	}
+	return session.SessionRevision(string(data)), nil
+}
+
 // attachCandidateFits reports whether a registry row belongs to the session
 // the caller asked to resume. A row without an id cannot open anything. When
 // the row names a task, that task must match the task in attach-sessions.json.
@@ -375,7 +395,16 @@ func (c *CLI) runAttach(args []string) int {
 		return 2
 	}
 
+	var resumeRevision string
+
 	if resume {
+		rev, revErr := attachRegistryRevision()
+		if revErr != nil {
+			fmt.Fprintf(c.errOut, "beacon attach: не удалось снять подпись реестра сессий (%v); перечитайте список сессий\n", revErr)
+			return 2
+		}
+		resumeRevision = rev
+
 		saved, err := savedAttachRecord(taskID)
 		if err != nil {
 			fmt.Fprintf(c.errOut, "beacon attach: не удалось прочитать сохранённую сессию (%v); запустите: beacon attach <sessionID>\n", err)
@@ -411,6 +440,18 @@ func (c *CLI) runAttach(args []string) int {
 		}
 		if err := rememberAttachSession(taskID, sessionID, time.Time{}); err != nil {
 			fmt.Fprintf(c.errOut, "beacon attach: сессия %s открыта, но не сохранена для возобновления: %v\n", sessionID, err)
+		}
+	}
+
+	if resume {
+		after, revErr := attachRegistryRevision()
+		if revErr != nil {
+			fmt.Fprintf(c.errOut, "beacon attach: не удалось проверить реестр сессий (%v); перечитайте список сессий\n", revErr)
+			return 2
+		}
+		if after != resumeRevision {
+			fmt.Fprintf(c.errOut, "beacon attach: сессия изменилась между выбором id и подключением (%v); перечитайте список сессий\n", session.ErrSessionRevisionChanged)
+			return 2
 		}
 	}
 
