@@ -592,6 +592,47 @@ func TestAckStaleEventDoesNotResumeParkedWatch(t *testing.T) {
 	}
 }
 
+// TestAckContinueOnWatchingWatchDoesNotConsumeRound rejects an answer for a
+// Watch that is no longer parked, even when the revision is current. The round
+// and the obligation must stay untouched (LC-03).
+func TestAckContinueOnWatchingWatchDoesNotConsumeRound(t *testing.T) {
+	w := parkedAckWatch()
+	w.Status = domain.StatusWatching
+	w.Verdict = domain.VerdictWatching
+	w.Revision = 4
+	o := resultObligation(w, "session-unparked-answer")
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
+
+	_, err := h.AckReceipt(context.Background(), AckInput{
+		WatchID: w.ID, ObligationID: o.ID, ContinueOf: w.ID, Revision: w.Revision,
+	})
+	if err == nil {
+		t.Fatal("continueOf on a watching Watch was accepted")
+	}
+	assertCode(t, err, domain.CodeLimitExceeded)
+
+	got, err := store.Watch(w.ID)
+	if err != nil || got.Status != domain.StatusWatching || got.Revision != w.Revision {
+		t.Errorf("answer changed the Watch: %+v err %v", got, err)
+	}
+	if rounds := h.continuations.Rounds(w.ID); rounds != 0 {
+		t.Errorf("unparked answer consumed %d rounds, want 0", rounds)
+	}
+	_, claims := stamper.counts()
+	if claims != 0 {
+		t.Errorf("unparked answer stamped the obligation %d times", claims)
+	}
+}
+
 // ackDecisionFixture wires a parked Watch and its obligation for a decision
 // test. The Watch is stopped waiting for a human, which is the only state a
 // decision can resume (ADR 0058 §4).
