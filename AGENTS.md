@@ -112,7 +112,7 @@ Beacon мержит зелёный PR по `verdict=ready` (ADR 0072). Искл�
 
 ## MCP
 
-Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Девять инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`, `beacon_defer_wiring` и `beacon_task_claim`. Девятый инструмент зарегистрирован по отдельному ADR.
+Code Mode: `search({ query: "beacon", namespace: "beacon" })`, затем `tools.beacon.<name>`. Десять инструментов: `beacon_watch_pr`, `beacon_wait_result`, `beacon_get_result`, `beacon_list_running`, `beacon_ack`, `beacon_cancel_watch`, `beacon_stats`, `beacon_defer_wiring`, `beacon_task_claim` и `beacon_task_close`. `beacon_task_claim` берёт карточку в работу. `beacon_task_close` закрывает карточку с причиной.
 
 `beacon_defer_wiring` вызывай сразу, как только понял, что часть фичи осталась неподключённой (OwnerFiles другого агента). Он возвращает готовую карточку `WIRING-<PR>`, которую надо добавить в свой PR. Не откладывай wiring на «потом»: без карточки работа теряется.
 
