@@ -155,7 +155,7 @@ const CycleInstructions = `Beacon cycle protocol:
 8. Close a card with beacon_task_close using a terminal status and a reason. A repeat with the same values changes nothing.
 9. Record deferred wiring with beacon_defer_wiring when part of the work needs another agent's files.
 
-Ten tools: beacon_watch_pr, beacon_wait_result, beacon_get_result, beacon_list_running, beacon_ack, beacon_cancel_watch, beacon_stats, beacon_defer_wiring, beacon_task_claim, beacon_task_close.
+Twelve tools: beacon_watch_pr, beacon_wait_result, beacon_get_result, beacon_list_running, beacon_ack, beacon_cancel_watch, beacon_stats, beacon_defer_wiring, beacon_task_claim, beacon_task_close, beacon_task_list, beacon_wake.
 
 Self-teaching next action: beacon_get_result returns nextAction, nextCommand and nextHint. Branch on nextAction, not on prose.
   keep_working - do not rebase an unchanged head; fix only the failedChecks returned by beacon_get_result.
@@ -297,6 +297,15 @@ var toolDescriptors = []toolDescriptor{
 		Kind:        kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
 			attachTaskClose(s, NewTaskCloseHandler(deps.TaskCloseStore), schemas[TaskCloseToolName])
+		},
+	},
+	{
+		Name:        TaskListToolName,
+		Description: taskListDescription,
+		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[TaskListOutput]() },
+		Kind:        kindRead,
+		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
+			attachTaskList(s, deps, schemas[TaskListToolName])
 		},
 	},
 }
@@ -724,6 +733,12 @@ type Dependencies struct {
 	// composition root supplies the store port.
 	TaskCloseStore TaskCloseStore
 
+	// TaskListStore is the read side of the card store behind
+	// beacon_task_list. Nil falls back to a lister over TaskClaimStore, so a
+	// composition root that wires claim gets the list tool without a second
+	// store. The tool never calls GitHub; callers pass excludeOwnerFiles.
+	TaskListStore TaskListStore
+
 	// ChildThreads and ParentNotifier carry the child-thread lineage wiring at
 	// the MCP boundary. Task claim and task close are the two card tools, so the
 	// question route stays a port pair instead of another tool. The composition
@@ -1070,6 +1085,24 @@ func attachTaskClose(s *mcpsdk.Server, handler *TaskCloseHandler, outputSchema *
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, handler.Handle)
+}
+
+// attachTaskList installs beacon_task_list over the handler defined in
+// tool_task_list.go. When no list port is supplied it reuses the file-backed
+// claim store, so the tool reads the same cards as beacon_task_claim without
+// requiring a change in the composition root. A nil output schema keeps the
+// real handler registered with a permissive object.
+func attachTaskList(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonschema.Schema) {
+	if s == nil {
+		return
+	}
+	var store TaskListStore = deps.TaskListStore
+	if store == nil {
+		if claim, ok := deps.TaskClaimStore.(*FileTaskClaimStore); ok {
+			store = &ClaimStoreTaskLister{Claim: claim}
+		}
+	}
+	AttachTaskList(s, NewTaskListHandler(store), outputSchema)
 }
 
 // AttachThreadRead installs t3_thread_read as an opt-in read-only tool. The
