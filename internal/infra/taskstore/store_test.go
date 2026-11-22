@@ -768,3 +768,215 @@ func TestLegacyIDsStillParse(t *testing.T) {
 		t.Fatalf("T3.17 = %q, group %d, number %d", card.ID, card.Group, card.Number)
 	}
 }
+
+func writeMergeCard(t *testing.T, root, name, content string) {
+	t.Helper()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func snapshotCards(t *testing.T, root string) map[string]string {
+	t.Helper()
+	dir := filepath.Join(root, "docs", "tasks")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make(map[string]string)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[e.Name()] = string(data)
+	}
+	return out
+}
+
+func sameSnapshot(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeCardBody возвращает карточку со всеми обязательными полями. MergeTrees
+// читает карточки через ParseCard, поэтому тестовые файлы должны проходить
+// обычную валидацию пакета.
+func mergeCardBody(title, deps string) string {
+	return fmt.Sprintf(`# %s
+Статус: todo
+Фаза: P2
+Тип: task
+Владелец файлов: internal/infra/taskstore/store.go
+Зависимости: %s
+Ссылка: ADR 0003
+Цель: цель
+Контекст: контекст
+Шаги: шаги
+Проверка: проверка
+Приёмка: приёмка
+Агент: нет
+Время: нет
+`, title, deps)
+}
+
+func TestReplaceIDTokenKeepsLongerIDs(t *testing.T) {
+	text := "# T3.17. Заголовок\nСсылка: T3.17.k9x2 и T3.17\n"
+	got := replaceIDToken(text, "T3.17", "T3.17.abc")
+	want := "# T3.17.abc. Заголовок\nСсылка: T3.17.k9x2 и T3.17.abc\n"
+	if got != want {
+		t.Fatalf("replaceIDToken = %q, ждали %q", got, want)
+	}
+	if idRoot("T3.17") != "T3" || idRoot("T3.17.k9x2") != "T3" || idRoot("ATX-04") != "ATX" {
+		t.Fatal("idRoot вернул неожиданное семейство")
+	}
+}
+
+func TestMergeTreesResolvesDuplicateID(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	leftBody := mergeCardBody("T3.17. Левая карточка", "T3.20")
+	leftDep := mergeCardBody("T3.20. Левая зависимость", "T3.17")
+	rightBody := mergeCardBody("T3.17. Правая карточка", "T3.30")
+	rightDep := mergeCardBody("T3.30. Правая зависимость", "T3.17")
+	writeMergeCard(t, left, "T3.17.md", leftBody)
+	writeMergeCard(t, left, "T3.20.md", leftDep)
+	writeMergeCard(t, right, "T3.17.md", rightBody)
+	writeMergeCard(t, right, "T3.30.md", rightDep)
+
+	report, err := MergeTrees([]string{left, right}, DefaultIDConfig(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Roots != 2 || report.Cards != 4 {
+		t.Fatalf("Roots=%d Cards=%d, ждали 2 и 4", report.Roots, report.Cards)
+	}
+	if report.Conflicts != 1 {
+		t.Fatalf("Conflicts=%d, ждали 1", report.Conflicts)
+	}
+	if len(report.Mappings) != 1 {
+		t.Fatalf("Mappings=%+v, ждали одну запись", report.Mappings)
+	}
+	m := report.Mappings[0]
+	if m.OldID != "T3.17" || m.Root != right {
+		t.Fatalf("Mapping=%+v, ждали T3.17 в правом корне", m)
+	}
+	if !hashIDRE.MatchString(m.NewID) || !strings.HasPrefix(m.NewID, "T3.17.") || !IsID(m.NewID) {
+		t.Fatalf("NewID=%q, ждали форму T3.17.<base36>", m.NewID)
+	}
+	if report.DanglingRefs != 0 {
+		t.Fatalf("DanglingRefs=%d, ждали 0", report.DanglingRefs)
+	}
+	if report.DryRun {
+		t.Fatal("DryRun=true в обычном слиянии")
+	}
+
+	leftFiles := snapshotCards(t, left)
+	if len(leftFiles) != 2 || leftFiles["T3.17.md"] != leftBody || leftFiles["T3.20.md"] != leftDep {
+		t.Fatalf("победивший корень изменился: %+v", leftFiles)
+	}
+
+	rightFiles := snapshotCards(t, right)
+	if _, ok := rightFiles["T3.17.md"]; ok {
+		t.Fatal("старый файл T3.17.md остался в правом корне")
+	}
+	newBody, ok := rightFiles[m.NewID+".md"]
+	if !ok {
+		t.Fatalf("новый файл %s.md не создан", m.NewID)
+	}
+	if !strings.Contains(newBody, m.NewID) || strings.Contains(newBody, "Зависимости: T3.17\n") {
+		t.Fatalf("ссылки в переименованной карточке не переписаны: %q", newBody)
+	}
+	if got := rightFiles["T3.30.md"]; !strings.Contains(got, "Зависимости: "+m.NewID+"\n") {
+		t.Fatalf("ссылка в T3.30.md не переписана: %q", got)
+	}
+
+	after, err := MeasureIDCollisions(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Duplicates != 0 {
+		t.Fatalf("Duplicates=%d после слияния, ждали 0", after.Duplicates)
+	}
+}
+
+func TestMergeTreesDryRunLeavesFilesUntouched(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	writeMergeCard(t, left, "T3.17.md", mergeCardBody("T3.17. Левая", ""))
+	writeMergeCard(t, right, "T3.17.md", mergeCardBody("T3.17. Правая", ""))
+	beforeLeft, beforeRight := snapshotCards(t, left), snapshotCards(t, right)
+
+	report, err := MergeTrees([]string{left, right}, DefaultIDConfig(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.DryRun || report.Conflicts != 1 || len(report.Mappings) != 1 {
+		t.Fatalf("report=%+v", report)
+	}
+	if got := snapshotCards(t, left); !sameSnapshot(got, beforeLeft) {
+		t.Fatalf("dry-run изменил левый корень: %+v", got)
+	}
+	if got := snapshotCards(t, right); !sameSnapshot(got, beforeRight) {
+		t.Fatalf("dry-run изменил правый корень: %+v", got)
+	}
+}
+
+func TestMergeTreesIdempotent(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	writeMergeCard(t, left, "T3.17.md", mergeCardBody("T3.17. Левая", ""))
+	writeMergeCard(t, right, "T3.17.md", mergeCardBody("T3.17. Правая", "T3.17"))
+
+	first, err := MergeTrees([]string{left, right}, DefaultIDConfig(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Conflicts != 1 || len(first.Mappings) != 1 {
+		t.Fatalf("первый проход: %+v", first)
+	}
+	before := snapshotCards(t, right)
+	second, err := MergeTrees([]string{left, right}, DefaultIDConfig(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Conflicts != 0 || len(second.Mappings) != 0 {
+		t.Fatalf("второй проход создал новую карту: %+v", second)
+	}
+	if got := snapshotCards(t, right); !sameSnapshot(got, before) {
+		t.Fatalf("второй проход изменил файлы: %+v", got)
+	}
+}
+
+func TestMergeTreesUniqueIDsDoNotMigrate(t *testing.T) {
+	left, right := t.TempDir(), t.TempDir()
+	leftBody := mergeCardBody("T3.17. Левая", "")
+	rightBody := mergeCardBody("T3.18. Правая", "")
+	writeMergeCard(t, left, "T3.17.md", leftBody)
+	writeMergeCard(t, right, "T3.18.md", rightBody)
+
+	report, err := MergeTrees([]string{left, right}, DefaultIDConfig(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Conflicts != 0 || len(report.Mappings) != 0 {
+		t.Fatalf("уникальные ID мигрировали: %+v", report)
+	}
+	if got := snapshotCards(t, left); len(got) != 1 || got["T3.17.md"] != leftBody {
+		t.Fatalf("левый корень изменился: %+v", got)
+	}
+	if got := snapshotCards(t, right); len(got) != 1 || got["T3.18.md"] != rightBody {
+		t.Fatalf("правый корень изменился: %+v", got)
+	}
+}

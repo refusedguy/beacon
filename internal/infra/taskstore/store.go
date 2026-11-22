@@ -793,6 +793,280 @@ func MeasureIDCollisions(roots ...string) (CollisionReport, error) {
 	return report, nil
 }
 
+// IDMapping это одна замена ID при слиянии деревьев. Карточка с OldID в корне
+// Root получила NewID, и все ссылки в этом корне переписаны на NewID.
+type IDMapping struct {
+	OldID string
+	NewID string
+	Root  string
+}
+
+// MergeReport это результат слияния деревьев карточек. Conflicts считает ID,
+// которые встретились больше чем в одном корне. Mappings содержит по одной
+// записи на каждую переименованную карточку. DanglingRefs считает ссылки на
+// несуществующие ID после перезаписи и должен быть нулевым.
+type MergeReport struct {
+	Roots        int
+	Cards        int
+	Conflicts    int
+	Mappings     []IDMapping
+	DanglingRefs int
+	DryRun       bool
+}
+
+// mergeLocated это карточка вместе с её корнем и путём файла.
+type mergeLocated struct {
+	root string
+	path string
+	card Card
+	data string
+}
+
+// idRoot возвращает семейство ID, стабильную часть номера. Примеры: T3.17 и
+// T3.17.k9x2 дают T3, ATX-04 даёт ATX. Корни нужны, чтобы разбирать конфликты
+// по семействам в устойчивом порядке.
+func idRoot(id string) string {
+	if m := hashIDRE.FindStringSubmatch(id); m != nil {
+		return m[1] + m[2]
+	}
+	if m := idRE.FindStringSubmatch(id); m != nil {
+		return m[1] + m[2]
+	}
+	if m := dashIDRE.FindStringSubmatch(id); m != nil {
+		return m[1]
+	}
+	if m := letterDashIDRE.FindStringSubmatch(id); m != nil {
+		return m[1]
+	}
+	if m := digitDashLetterIDRE.FindStringSubmatch(id); m != nil {
+		return m[1]
+	}
+	if m := dotIDRE.FindStringSubmatch(id); m != nil {
+		return m[1]
+	}
+	return id
+}
+
+func isIDTokenChar(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' ||
+		c >= 'A' && c <= 'Z' || c == '_' || c == '-' || c == '.'
+}
+
+// idEndBoundary проверяет, что ID заканчивается перед позицией end. Точка
+// после ID считается знаком препинания, если за ней нет продолжения ID.
+// Так T3.17 в заголовке "# T3.17. Заголовок" заменяется, а префикс T3.17
+// в T3.17.k9x2 не трогается.
+func idEndBoundary(s string, end int) bool {
+	if end >= len(s) {
+		return true
+	}
+	if s[end] == '.' {
+		if end+1 >= len(s) {
+			return true
+		}
+		return !isIDTokenChar(s[end+1])
+	}
+	return !isIDTokenChar(s[end])
+}
+
+// replaceIDToken заменяет oldID только целым токеном. Части длинных ID не
+// меняются, поэтому повторное слияние не удваивает хеш-суффикс.
+func replaceIDToken(text, oldID, newID string) string {
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); {
+		if strings.HasPrefix(text[i:], oldID) &&
+			(i == 0 || !isIDTokenChar(text[i-1])) &&
+			idEndBoundary(text, i+len(oldID)) {
+			b.WriteString(newID)
+			i += len(oldID)
+			continue
+		}
+		b.WriteByte(text[i])
+		i++
+	}
+	return b.String()
+}
+
+// countDanglingIDRefs считает ID-токены, для которых нет карточки в present.
+// Токены, не проходящие IsID, игнорируются.
+func countDanglingIDRefs(contents []string, present map[string]bool) int {
+	total := 0
+	for _, content := range contents {
+		for i := 0; i < len(content); {
+			if !isIDTokenChar(content[i]) {
+				i++
+				continue
+			}
+			j := i
+			for j < len(content) && isIDTokenChar(content[j]) {
+				j++
+			}
+			tok := strings.TrimRight(content[i:j], ".")
+			if IsID(tok) && !present[tok] {
+				total++
+			}
+			i = j
+		}
+	}
+	return total
+}
+
+// MergeTrees объединяет деревья карточек из каталогов root/docs/tasks.
+// Первый проход закрепляет желаемый ID за первым по порядку корнем. Второй
+// проход выдаёт остальным карточкам новый ID через MintID с nonce и заносит
+// замену в отчёт. Ссылки в корне переименованной карточки переписываются на
+// новый ID. В режиме dryRun функция ничего не пишет на диск и только считает
+// отчёт. Повторное слияние тех же деревьев не находит конфликтов и не меняет
+// файлы.
+func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) {
+	report := MergeReport{DryRun: dryRun}
+	ordered := append([]string(nil), roots...)
+	sort.Strings(ordered)
+	report.Roots = len(ordered)
+
+	byID := make(map[string][]mergeLocated)
+	families := make(map[string]bool)
+	claimed := make(map[string]bool)
+	for _, root := range ordered {
+		tasksDir := filepath.Join(root, "docs", "tasks")
+		entries, err := os.ReadDir(tasksDir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return report, Startupf("не прочитан каталог карточек %s: %v", tasksDir, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+				continue
+			}
+			filePath := filepath.Join(tasksDir, entry.Name())
+			data, err := os.ReadFile(filePath)
+			if err != nil {
+				return report, Startupf("не прочитана карточка %s: %v", filePath, err)
+			}
+			card, err := ParseCard(filePath, data)
+			if err != nil {
+				continue
+			}
+			loc := mergeLocated{root: root, path: filePath, card: card, data: string(data)}
+			byID[card.ID] = append(byID[card.ID], loc)
+			families[idRoot(card.ID)] = true
+			claimed[card.ID] = true
+			report.Cards++
+		}
+	}
+
+	// Резервируем желаемый ID за первым корнем. Остальным карточкам того же
+	// ID выдаём новый ID. Общий claimed не даёт двум заменам совпасть.
+	renameByRoot := make(map[string]map[string]string)
+	familyNames := make([]string, 0, len(families))
+	for family := range families {
+		familyNames = append(familyNames, family)
+	}
+	sort.Strings(familyNames)
+	for _, family := range familyNames {
+		for id, locs := range byID {
+			if idRoot(id) != family || len(locs) < 2 {
+				continue
+			}
+			sort.Slice(locs, func(i, j int) bool { return locs[i].root < locs[j].root })
+			winner := locs[0].root
+			hasLoser := false
+			for _, loc := range locs {
+				if loc.root != winner {
+					hasLoser = true
+					break
+				}
+			}
+			if !hasLoser {
+				continue
+			}
+			report.Conflicts++
+			for _, loc := range locs {
+				if loc.root == winner {
+					continue
+				}
+				seed := base36Digest(loc.root, id, loc.data)
+				newID, err := MintID(loc.card.Group, loc.card.Number, report.Cards, seed, claimed, cfg)
+				if err != nil {
+					return report, err
+				}
+				if renameByRoot[loc.root] == nil {
+					renameByRoot[loc.root] = make(map[string]string)
+				}
+				renameByRoot[loc.root][id] = newID
+				report.Mappings = append(report.Mappings, IDMapping{OldID: id, NewID: newID, Root: loc.root})
+			}
+		}
+	}
+	sort.Slice(report.Mappings, func(i, j int) bool {
+		if report.Mappings[i].Root != report.Mappings[j].Root {
+			return report.Mappings[i].Root < report.Mappings[j].Root
+		}
+		return report.Mappings[i].OldID < report.Mappings[j].OldID
+	})
+
+	// Итоговый набор ID по корням: проигравшие старые ID уходят, новые
+	// появляются в том же корне. По этим наборам считаем висячие ссылки.
+	presentByRoot := make(map[string]map[string]bool)
+	for id, locs := range byID {
+		for _, loc := range locs {
+			if presentByRoot[loc.root] == nil {
+				presentByRoot[loc.root] = make(map[string]bool)
+			}
+			presentByRoot[loc.root][id] = true
+		}
+	}
+	for root, renames := range renameByRoot {
+		for oldID, newID := range renames {
+			delete(presentByRoot[root], oldID)
+			presentByRoot[root][newID] = true
+		}
+	}
+
+	finalByRoot := make(map[string][]string)
+	for id, locs := range byID {
+		for _, loc := range locs {
+			content := loc.data
+			newName := id
+			if renames := renameByRoot[loc.root]; renames != nil {
+				if newID, ok := renames[id]; ok {
+					newName = newID
+				}
+				for oldID, newID := range renames {
+					content = replaceIDToken(content, oldID, newID)
+				}
+			}
+			finalByRoot[loc.root] = append(finalByRoot[loc.root], content)
+			if dryRun {
+				continue
+			}
+			if newName == id {
+				if content == loc.data {
+					continue
+				}
+				if err := AtomicWrite(loc.path, []byte(content), 0644); err != nil {
+					return report, err
+				}
+				continue
+			}
+			newPath := filepath.Join(loc.root, "docs", "tasks", newName+".md")
+			if err := AtomicWrite(newPath, []byte(content), 0644); err != nil {
+				return report, err
+			}
+			if err := os.Remove(loc.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return report, Startupf("не удалён старый файл %s: %v", loc.path, err)
+			}
+		}
+	}
+	for root, contents := range finalByRoot {
+		report.DanglingRefs += countDanglingIDRefs(contents, presentByRoot[root])
+	}
+	return report, nil
+}
+
 // CreateExclusive создаёт файл карточки. Занятый ID даёт ошибку валидации, код 1.
 func CreateExclusive(filePath string, data []byte) error {
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
