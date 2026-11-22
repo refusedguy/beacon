@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -20,7 +21,14 @@ func newCardLinkTestDB(t *testing.T) *DB {
 func cardLinkCount(t *testing.T, d *DB) int {
 	t.Helper()
 	var n int
-	if err := d.readDB.QueryRow(`SELECT count(*) FROM card_links`).Scan(&n); err != nil {
+	err := d.readDB.QueryRow(`SELECT count(*) FROM card_links`).Scan(&n)
+	if err != nil {
+		// The table is created lazily on the first accepted Link or Unlink.
+		// A store that only saw rejected calls has no table yet, which means
+		// it holds zero rows.
+		if strings.Contains(err.Error(), "no such table: card_links") {
+			return 0
+		}
 		t.Fatalf("count card links: %v", err)
 	}
 	return n
