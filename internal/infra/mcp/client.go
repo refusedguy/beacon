@@ -295,6 +295,9 @@ var remoteToolDescriptions = map[string]string{
 	"beacon_ack":          "Acknowledge an obligation on the Beacon server.",
 	"beacon_cancel_watch": "Cancel a watch on the Beacon server.",
 	"beacon_stats":        "Report state counters from the Beacon server.",
+	"beacon_defer_wiring": "Record a deferred wiring card on the Beacon server.",
+	"beacon_task_claim":   "Claim one todo task card for an agent on the Beacon server.",
+	"beacon_task_close":   "Close one task card with a terminal status on the Beacon server.",
 }
 
 var remoteInputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
@@ -305,6 +308,9 @@ var remoteInputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
 	"beacon_ack":          func() (*jsonschema.Schema, error) { return jsonschema.For[AckInput](nil) },
 	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return jsonschema.For[CancelWatchInput](nil) },
 	"beacon_stats":        func() (*jsonschema.Schema, error) { return jsonschema.For[StatsInput](nil) },
+	"beacon_defer_wiring": func() (*jsonschema.Schema, error) { return jsonschema.For[DeferWiringInput](nil) },
+	"beacon_task_claim":   func() (*jsonschema.Schema, error) { return jsonschema.For[TaskClaimInput](nil) },
+	"beacon_task_close":   func() (*jsonschema.Schema, error) { return jsonschema.For[TaskCloseInput](nil) },
 }
 
 func remoteInputSchema(name string) *jsonschema.Schema {
@@ -322,8 +328,8 @@ func remoteInputSchema(name string) *jsonschema.Schema {
 	return schema
 }
 
-// AttachRemoteTools replaces the seven local handlers with thin forwards to
-// client. It is idempotent: removing each name before adding it keeps repeated
+// AttachRemoteTools replaces every advertised local handler with a thin forward
+// to client. It is idempotent: removing each name before adding it keeps repeated
 // calls from registering a tool twice. CycleInstructions stay as constructed.
 func AttachRemoteTools(s *mcpsdk.Server, client *RemoteClient) error {
 	if s == nil {

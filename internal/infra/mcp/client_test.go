@@ -275,6 +275,12 @@ func TestAttachRemoteToolsPreservesContract(t *testing.T) {
 		if tool.OutputSchema == nil {
 			t.Errorf("%s: output schema lost", tool.Name)
 		}
+		if tool.Description == "" {
+			t.Errorf("%s: description lost", tool.Name)
+		}
+		if tool.InputSchema == nil {
+			t.Errorf("%s: input schema lost", tool.Name)
+		}
 		if tool.Annotations == nil {
 			t.Errorf("%s: annotations lost", tool.Name)
 			continue
@@ -297,6 +303,47 @@ func TestAttachRemoteToolsPreservesContract(t *testing.T) {
 	init := session.InitializeResult()
 	if init == nil || init.Instructions != CycleInstructions {
 		t.Fatal("cycle instructions were changed by remote wiring")
+	}
+}
+
+// TestRemoteContractCoversEveryTool guards the remote side of the tool contract.
+// toolDescriptors owns the advertised names through ToolNames. Both remote maps
+// must cover exactly that set: a missing name reaches AttachRemoteTools as an
+// empty description and a generic {"type":"object"} input schema.
+func TestRemoteContractCoversEveryTool(t *testing.T) {
+	want := slices.Clone(ToolNames)
+	slices.Sort(want)
+
+	described := make([]string, 0, len(remoteToolDescriptions))
+	for name := range remoteToolDescriptions {
+		described = append(described, name)
+	}
+	slices.Sort(described)
+	if !slices.Equal(described, want) {
+		t.Fatalf("remoteToolDescriptions names = %v, want %v", described, want)
+	}
+
+	factories := make([]string, 0, len(remoteInputSchemaFactories))
+	for name := range remoteInputSchemaFactories {
+		factories = append(factories, name)
+	}
+	slices.Sort(factories)
+	if !slices.Equal(factories, want) {
+		t.Fatalf("remoteInputSchemaFactories names = %v, want %v", factories, want)
+	}
+
+	for _, name := range want {
+		if strings.TrimSpace(remoteToolDescriptions[name]) == "" {
+			t.Errorf("%s: empty remote description", name)
+		}
+		schema, err := remoteInputSchemaFactories[name]()
+		if err != nil {
+			t.Errorf("%s: input schema factory: %v", name, err)
+			continue
+		}
+		if schema == nil || schema.Type != "object" {
+			t.Errorf("%s: input schema is not an object: %+v", name, schema)
+		}
 	}
 }
 
