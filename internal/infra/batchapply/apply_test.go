@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // todoCard mirrors the shape rendered by renderCard. Only the status line and
@@ -849,6 +850,175 @@ func TestBatchPackGateReadsEveryJSON(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("problem %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+// fakeClock returns a clock that advances by step on every read. Tests use it
+// to pin the held duration in the chunk report instead of measuring real time.
+func fakeClock(step time.Duration) func() time.Time {
+	base := time.Unix(0, 0)
+	n := 0
+	return func() time.Time {
+		t := base.Add(step * time.Duration(n))
+		n++
+		return t
+	}
+}
+
+// chunkFixtures builds n distinct card artifacts for chunking tests.
+func chunkFixtures(n int) []artifactEntry {
+	entries := make([]artifactEntry, n)
+	for i := range entries {
+		entries[i] = artifactEntry{
+			path:    fmt.Sprintf("docs/tasks/CBX-T-%04d.md", i),
+			content: "# тест\n",
+		}
+	}
+	return entries
+}
+
+// TestChunkEntriesPreservesOrderAndCount proves a 1000 record import at chunk
+// size 50 yields 20 ordered chunks of at most 50 records. This is the
+// measurable check from CBX-06: no commit is separated by more than 50 writes.
+func TestChunkEntriesPreservesOrderAndCount(t *testing.T) {
+	entries := chunkFixtures(1000)
+	chunks := chunkEntries(entries, 50)
+	if len(chunks) != 20 {
+		t.Fatalf("chunks = %d, want 20", len(chunks))
+	}
+	seen := 0
+	for _, c := range chunks {
+		if len(c) > 50 {
+			t.Fatalf("chunk holds %d records, want at most 50", len(c))
+		}
+		for _, e := range c {
+			if want := entries[seen]; e != want {
+				t.Fatalf("record %d = %+v, want %+v", seen, e, want)
+			}
+			seen++
+		}
+	}
+	if seen != len(entries) {
+		t.Fatalf("emitted %d records, want %d", seen, len(entries))
+	}
+}
+
+// TestChunkedWriteCommitsAndProgress proves the writer commits once per chunk,
+// prints one progress line per chunk plus a summary, and pauses only between
+// chunks. The commit counts are the real batch counts, not placeholders.
+func TestChunkedWriteCommitsAndProgress(t *testing.T) {
+	dir := t.TempDir()
+	entries := chunkFixtures(50)
+	var progress strings.Builder
+	var pauses []time.Duration
+	commits := 0
+	r := &runner{
+		opts:     Options{ChunkSize: 10, ChunkPause: 2 * time.Millisecond, Commit: true, Quiet: true},
+		out:      io.Discard,
+		progress: &progress,
+		now:      fakeClock(time.Millisecond),
+		yield:    func(d time.Duration) { pauses = append(pauses, d) },
+		commit: func(root string, cards, adrs, evals int) error {
+			commits++
+			if root != dir {
+				t.Errorf("commit root = %q, want %q", root, dir)
+			}
+			if cards != 7 || adrs != 3 || evals != 2 {
+				t.Errorf("commit counts = %d/%d/%d, want 7/3/2", cards, adrs, evals)
+			}
+			return nil
+		},
+	}
+	if err := r.writeChunked(dir, entries, 7, 3, 2); err != nil {
+		t.Fatal(err)
+	}
+	if commits != 5 {
+		t.Fatalf("commits = %d, want 5", commits)
+	}
+	lines := strings.Split(strings.TrimSuffix(progress.String(), "\n"), "\n")
+	if len(lines) != 6 {
+		t.Fatalf("progress lines = %d, want 6: %q", len(lines), progress.String())
+	}
+	for i := 0; i < 5; i++ {
+		want := fmt.Sprintf("chunk=%d/%d records=10 held=1ms", i+1, 5)
+		if lines[i] != want {
+			t.Fatalf("progress line %d = %q, want %q", i, lines[i], want)
+		}
+	}
+	if want := "chunks=5 maxheld=1ms"; lines[5] != want {
+		t.Fatalf("summary = %q, want %q", lines[5], want)
+	}
+	if len(pauses) != 4 {
+		t.Fatalf("pauses = %d, want 4", len(pauses))
+	}
+	for _, d := range pauses {
+		if d != 2*time.Millisecond {
+			t.Fatalf("pause = %s, want 2ms", d)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, entries[0].path)); err != nil {
+		t.Fatalf("first artifact missing: %v", err)
+	}
+}
+
+// TestChunkPauseAllowsReader reproduces the beads finding: with a positive
+// pause the writer yields between chunks and a concurrent reader advances;
+// at zero pause the writer never yields and the reader is starved.
+func TestChunkPauseAllowsReader(t *testing.T) {
+	oldSize, oldPause := chunkSize, chunkPause
+	t.Cleanup(func() { chunkSize, chunkPause = oldSize, oldPause })
+	entries := chunkFixtures(1000)
+	dir := t.TempDir()
+
+	run := func(pause time.Duration) (yields, reads int, seen []time.Duration) {
+		chunkSize, chunkPause = 50, pause
+		var progress strings.Builder
+		r := &runner{
+			opts:     Options{DryRun: true, Quiet: true},
+			out:      io.Discard,
+			progress: &progress,
+			now:      fakeClock(time.Microsecond),
+			yield: func(d time.Duration) {
+				yields++
+				seen = append(seen, d)
+				// A reader makes progress only in the window between chunks.
+				if d > 0 {
+					for i := 0; i < 10; i++ {
+						reads++
+					}
+				}
+			},
+		}
+		if err := r.writeChunked(dir, entries, 0, 0, 0); err != nil {
+			t.Fatal(err)
+		}
+		return yields, reads, seen
+	}
+
+	yields, reads, pauses := run(time.Millisecond)
+	if yields != 19 {
+		t.Fatalf("paused yields = %d, want 19", yields)
+	}
+	if reads < 10 {
+		t.Fatalf("reader turns = %d, want at least 10", reads)
+	}
+	for _, d := range pauses {
+		if d != time.Millisecond {
+			t.Fatalf("paused yield got %s, want 1ms", d)
+		}
+	}
+
+	yields, reads, pauses = run(0)
+	if yields != 19 {
+		t.Fatalf("zero-pause yields = %d, want 19", yields)
+	}
+	if reads != 0 {
+		t.Fatalf("zero-pause reader turns = %d, want 0", reads)
+	}
+	for _, d := range pauses {
+		if d != 0 {
+			t.Fatalf("zero-pause yield got %s, want 0", d)
 		}
 	}
 }
