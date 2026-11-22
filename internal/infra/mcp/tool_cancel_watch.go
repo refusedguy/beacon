@@ -156,9 +156,10 @@ func (c *CancelWatcher) Cancel(ctx context.Context, watchID, scope, subscriberID
 
 // CancelWithReceipt applies the same idempotent cancellation as Cancel and also
 // returns the stable receipt of the operation. When receiptSupported is false
-// it refuses before any read or write, so an old host cannot turn a cancel into
-// a silently lost signal. The Watch stays open and no audit row is appended.
-// A repeat with the same Watch, scope and caller returns the same receipt.
+// it refuses before any read or write, so a host that explicitly opted out of
+// receipts gets an error instead of a silently lost signal. The Watch stays
+// open and no audit row is appended. A repeat with the same Watch, scope and
+// caller returns the same receipt.
 func (c *CancelWatcher) CancelWithReceipt(ctx context.Context, watchID, scope, subscriberID string, receiptSupported bool) (string, error) {
 	if !receiptSupported {
 		return "", domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: caller does not support interrupt_receipt_v1; refusing silent cancellation")
@@ -305,9 +306,9 @@ func cancelWatchCallerSessionID(req *mcpsdk.CallToolRequest) string {
 
 // CancelWatchHandler adapts CancelWatcher to a typed MCP tool handler. The
 // caller's subscriber id is the opaque sessionID from _meta. The handler reads
-// interrupt_receipt_v1 support from the request before it closes anything: a
-// caller that declares capabilities without the flag gets an error and an
-// untouched Watch, not a silent cancellation.
+// interrupt_receipt_v1 support from the request before it closes anything. A
+// caller that explicitly declares no receipt support gets an error and an
+// untouched Watch. A caller that omits the flag keeps the legacy cancel path.
 func CancelWatchHandler(svc *CancelWatcher) mcpsdk.ToolHandlerFor[CancelWatchInput, CancelWatchOutput] {
 	return func(ctx context.Context, req *mcpsdk.CallToolRequest, in CancelWatchInput) (*mcpsdk.CallToolResult, CancelWatchOutput, error) {
 		var subscriberID string
