@@ -73,8 +73,25 @@ func sortedChecks(checks []string) []string {
 	return out
 }
 
+// blockerRelevantChecks drops checks that cannot block a merge. e2e and
+// ci-provider-probe run with continue-on-error, so their failures change no
+// verdict. Keeping them out of the incident signature lets a re-registered
+// Watch reuse the same incident instead of opening a second one, and keeps a
+// green base from being mistaken for a still broken one.
+func blockerRelevantChecks(checks []string) []string {
+	out := make([]string, 0, len(checks))
+	for _, check := range checks {
+		if check == "e2e" || check == "ci-provider-probe" {
+			continue
+		}
+		out = append(out, check)
+	}
+	return out
+}
+
 func blockerSignature(failedChecks []string) string {
-	sum := sha256.Sum256([]byte(strings.Join(sortedChecks(failedChecks), "\n")))
+	relevant := sortedChecks(blockerRelevantChecks(failedChecks))
+	sum := sha256.Sum256([]byte(strings.Join(relevant, "\n")))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -295,8 +312,10 @@ func (d *DB) ResolveBlocker(blockerID string, now time.Time) ([]domain.Watch, er
 
 // ResolveBlockersByBaseGreen resolves the open incidents of repo/baseRef whose
 // failed checks are all green on base: a check absent from baseFailed no longer
-// blocks the branch. The incident transition and every Watch unblock happen in
-// one transaction. It returns the incidents that were resolved.
+// blocks the branch. Informational checks are ignored on both sides, so an e2e
+// or ci-provider-probe failure cannot hold an incident open. The incident
+// transition and every Watch unblock happen in one transaction. It returns the
+// incidents that were resolved.
 func (d *DB) ResolveBlockersByBaseGreen(repo, baseRef string, baseFailed map[string]bool, now time.Time) ([]domain.BlockerIncident, error) {
 	var resolved []domain.BlockerIncident
 	err := d.Write(context.Background(), func(tx *sql.Tx) error {
@@ -335,7 +354,7 @@ func (d *DB) ResolveBlockersByBaseGreen(repo, baseRef string, baseFailed map[str
 				return fmt.Errorf("store: blocker %s: decode: %w", c.id, err)
 			}
 			green := true
-			for _, check := range b.FailedChecks {
+			for _, check := range blockerRelevantChecks(b.FailedChecks) {
 				if baseFailed[check] {
 					green = false
 					break

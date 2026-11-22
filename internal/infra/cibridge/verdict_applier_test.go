@@ -95,3 +95,185 @@ func TestApplyVerdictWatchingPersistsObservationsIdempotently(t *testing.T) {
 		t.Fatalf("second applyVerdict wrote the Watch (%d calls), want no write", cs.saves-savesAfterFirst)
 	}
 }
+
+// greenBaseBatchCI reports a fully observed, fully green base for every
+// candidate. The PR state stays OPEN with no checks, so the verdict engine
+// leaves the probe Watch watching and nobody wakes.
+type greenBaseBatchCI struct {
+	head         string
+	checksKnown  bool
+	failedChecks map[string]bool
+}
+
+func (g greenBaseBatchCI) PRState(context.Context, string, int) (domain.PRState, error) {
+	return domain.PRState{}, nil
+}
+
+func (g greenBaseBatchCI) FetchBatch(_ context.Context, watches []domain.Watch) (map[string]domain.PRSnapshot, error) {
+	out := make(map[string]domain.PRSnapshot, len(watches))
+	for _, w := range watches {
+		out[w.ID] = domain.PRSnapshot{
+			PR: domain.PRState{
+				State: "OPEN", HeadRefOid: g.head,
+				Mergeable: "UNKNOWN", MergeStateStatus: "UNKNOWN",
+			},
+			Base: domain.BaseBranchState{
+				BaseRef: "main", HeadSHA: "green-main",
+				ChecksKnown: g.checksKnown, FailedChecks: g.failedChecks,
+			},
+		}
+	}
+	return out, nil
+}
+
+func (g greenBaseBatchCI) PointStats() (int, int) { return 1, 500 }
+
+type recordingGenerations struct{ ids []string }
+
+func (g *recordingGenerations) ResolveBlocked(id string) (string, bool) {
+	g.ids = append(g.ids, id)
+	return "gen-" + id, true
+}
+
+// TestRefreshResolvesBlockerWhenBaseTurnsGreenWithoutMerge reproduces the live
+// incident: a blocker incident is open, a Watch is blocked on it, and the base
+// turns green while no Watch is merged. Refresh must resolve the incident,
+// unblock the Watch and rotate its generation. No MERGED PR is involved.
+func TestRefreshResolvesBlockerWhenBaseTurnsGreenWithoutMerge(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const repo = "refusedguy/beacon"
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	now := time.Unix(2, 0)
+
+	blocked := domain.Watch{
+		ID:   "watch:" + repo + ":1:" + head,
+		Repo: repo, PR: 1, HeadSHA: head,
+		Status: domain.StatusBlocked, Verdict: domain.VerdictBlocked,
+		Blocked: &domain.BlockedInfo{
+			Reason:       domain.BlockReasonBaseChecksFailed,
+			FailedChecks: []string{"build", "e2e", "registry-check", "registry-live", "test"},
+		},
+	}
+	if err := db.SaveWatch(blocked); err != nil {
+		t.Fatalf("seed blocked Watch: %v", err)
+	}
+	incident, _, err := db.GetOrCreateOpenBlocker(repo, "main", blocked.Blocked.FailedChecks, blocked.ID, now)
+	if err != nil {
+		t.Fatalf("GetOrCreateOpenBlocker: %v", err)
+	}
+	blocked.BlockerID = incident.ID
+	if err := db.SaveWatch(blocked); err != nil {
+		t.Fatalf("link blocker: %v", err)
+	}
+
+	probe := domain.Watch{
+		ID:   "watch:" + repo + ":2:" + head,
+		Repo: repo, PR: 2, HeadSHA: head,
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}},
+	}
+	if err := db.SaveWatch(probe); err != nil {
+		t.Fatalf("seed probe Watch: %v", err)
+	}
+
+	gen := &recordingGenerations{}
+	ci := greenBaseBatchCI{head: head, checksKnown: true, failedChecks: map[string]bool{}}
+	b := New(db, ci, fixedClock{at: now}, time.Second).
+		WithWaker(&recordingWaker{}).WithGenerationStore(gen)
+	b.Refresh(context.Background())
+
+	open, err := db.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers: %v", err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open incidents = %d, want 0 after base turned green: %+v", len(open), open)
+	}
+	got, err := db.Watch(blocked.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Blocked != nil || got.BlockerID != "" {
+		t.Fatalf("blocked Watch = status %q, blocked %v, blockerID %q; want watching/nil/empty",
+			got.Status, got.Blocked, got.BlockerID)
+	}
+	if got.Revision != blocked.Revision+1 {
+		t.Fatalf("revision = %d, want %d", got.Revision, blocked.Revision+1)
+	}
+	if len(gen.ids) != 1 || gen.ids[0] != blocked.ID {
+		t.Fatalf("rotated generations = %v, want [%s]", gen.ids, blocked.ID)
+	}
+}
+
+// TestRefreshKeepsBlockerWhenBaseChecksUnknown pins the fail-closed side: a
+// provider that never observed the base must not release a blocker incident.
+func TestRefreshKeepsBlockerWhenBaseChecksUnknown(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	const repo = "refusedguy/beacon"
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	now := time.Unix(2, 0)
+
+	blocked := domain.Watch{
+		ID:   "watch:" + repo + ":1:" + head,
+		Repo: repo, PR: 1, HeadSHA: head,
+		Status: domain.StatusBlocked, Verdict: domain.VerdictBlocked,
+		Blocked: &domain.BlockedInfo{
+			Reason:       domain.BlockReasonBaseChecksFailed,
+			FailedChecks: []string{"build"},
+		},
+	}
+	if err := db.SaveWatch(blocked); err != nil {
+		t.Fatalf("seed blocked Watch: %v", err)
+	}
+	incident, _, err := db.GetOrCreateOpenBlocker(repo, "main", blocked.Blocked.FailedChecks, blocked.ID, now)
+	if err != nil {
+		t.Fatalf("GetOrCreateOpenBlocker: %v", err)
+	}
+	blocked.BlockerID = incident.ID
+	if err := db.SaveWatch(blocked); err != nil {
+		t.Fatalf("link blocker: %v", err)
+	}
+	probe := domain.Watch{
+		ID:   "watch:" + repo + ":2:" + head,
+		Repo: repo, PR: 2, HeadSHA: head,
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{ID: "ses_exec", Role: domain.RoleExecutor, Adapter: "opencode"}},
+	}
+	if err := db.SaveWatch(probe); err != nil {
+		t.Fatalf("seed probe Watch: %v", err)
+	}
+
+	gen := &recordingGenerations{}
+	ci := greenBaseBatchCI{head: head, checksKnown: false, failedChecks: map[string]bool{}}
+	b := New(db, ci, fixedClock{at: now}, time.Second).
+		WithWaker(&recordingWaker{}).WithGenerationStore(gen)
+	b.Refresh(context.Background())
+
+	open, err := db.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers: %v", err)
+	}
+	if len(open) != 1 || open[0].ID != incident.ID {
+		t.Fatalf("open incidents = %+v, want the original incident still open", open)
+	}
+	got, err := db.Watch(blocked.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if got.Status != domain.StatusBlocked {
+		t.Fatalf("status = %q, want blocked", got.Status)
+	}
+	if len(gen.ids) != 0 {
+		t.Fatalf("rotated generations = %v, want none", gen.ids)
+	}
+}
