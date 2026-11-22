@@ -3,13 +3,19 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
+	"github.com/refusedguy/beacon/internal/infra/registry"
+	"gopkg.in/yaml.v3"
 )
 
 // workloadRunner holds the command implementation so CLI dispatch stays a
@@ -64,10 +70,53 @@ func (s *workloadStore) Subscribe(ctx context.Context, w orchestrator.WorkloadWa
 	return s.register(ctx, w, sub)
 }
 
+// budgetedWorkloadStore adds the optional slot-budget capability to the CLI's
+// WorkloadStore. The daemon uses the plain workloadStore and keeps its earlier
+// behaviour; only the workload command resolves the configured budget.
+type budgetedWorkloadStore struct {
+	orchestrator.WorkloadStore
+	budgetFn func(context.Context) (int, int, error)
+}
+
+func (s budgetedWorkloadStore) SlotBudget(ctx context.Context) (int, int, error) {
+	return s.budgetFn(ctx)
+}
+
+// slotBudgetFromConfig reads the optional limits.max_concurrent_agents field
+// from one agents.yaml. A missing file, a missing limits block or a missing
+// key returns nil so the caller applies the documented default. A malformed
+// limits block is an error.
+func slotBudgetFromConfig(path string) (*int, error) {
+	data, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("beacon workload: read %s: %w", path, err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, fmt.Errorf("beacon workload: parse %s: %w", path, err)
+	}
+	limitsMap, ok := doc["limits"].(map[string]any)
+	if !ok {
+		return nil, nil
+	}
+	raw, ok := limitsMap["max_concurrent_agents"]
+	if !ok {
+		return nil, nil
+	}
+	budget, err := registry.ParseSlotBudgetValue(raw)
+	if err != nil {
+		return nil, fmt.Errorf("beacon workload: %s: %w", path, err)
+	}
+	return &budget, nil
+}
+
 // defaultWorkloadDeps opens the same state store the MCP server uses. The
 // projection from the stored Watch happens here in the composition root, so
 // neither cmd nor the app package needs to grow a domain dependency.
-func defaultWorkloadDeps(_ *CLI) (workloadDeps, func() error, error) {
+func defaultWorkloadDeps(c *CLI) (workloadDeps, func() error, error) {
 	deps, closeStore, err := openMCPDependencies()
 	if err != nil {
 		return workloadDeps{}, nil, err
@@ -114,7 +163,30 @@ func defaultWorkloadDeps(_ *CLI) (workloadDeps, func() error, error) {
 			return err
 		},
 	}
-	return workloadDeps{Store: ws}, closeStore, nil
+	rc, err := findRegistryConfig(c.root)
+	if err != nil {
+		_ = closeStore()
+		return workloadDeps{}, nil, err
+	}
+	configured, err := slotBudgetFromConfig(rc.Path)
+	if err != nil {
+		_ = closeStore()
+		return workloadDeps{}, nil, err
+	}
+	return workloadDeps{Store: budgetedWorkloadStore{
+		WorkloadStore: ws,
+		budgetFn: func(ctx context.Context) (int, int, error) {
+			total, err := registry.ResolveSlotBudget(configured)
+			if err != nil {
+				return 0, 0, err
+			}
+			watches, err := ws.ActiveWorkloadWatches(ctx)
+			if err != nil {
+				return 0, 0, err
+			}
+			return total, len(watches), nil
+		},
+	}}, closeStore, nil
 }
 
 // runWorkload implements `beacon workload [--format table|json]`. It does not
@@ -159,6 +231,8 @@ func renderWorkloadTable(w io.Writer, r orchestrator.Workload) {
 	fmt.Fprintf(w, "NEEDS ATTENTION: %d\n", r.NeedsAttention)
 	fmt.Fprintf(w, "WATCHING: %d\n", r.Watching)
 	fmt.Fprintf(w, "REGISTERED ORCHESTRATOR: %d\n", r.Registered)
+	fmt.Fprintf(w, "SLOTS TOTAL: %d\n", r.SlotsTotal)
+	fmt.Fprintf(w, "SLOTS USED: %d\n", r.SlotsUsed)
 	for _, k := range sortedWorkloadKeys(r.ByVerdict) {
 		fmt.Fprintf(w, "VERDICT %s: %d\n", k, r.ByVerdict[k])
 	}

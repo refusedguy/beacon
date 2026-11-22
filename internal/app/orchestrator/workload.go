@@ -61,13 +61,16 @@ type WorkloadWatch struct {
 // Watching the ones still in progress. ByAttention splits NeedsAttention by
 // typed reason. The other maps group the same Watches by verdict, subscriber
 // role and project. Registered counts the new orchestrator subscriptions
-// installed during the pass.
+// installed during the pass. SlotsTotal is the configured parallel-slot
+// budget; SlotsUsed is the number of active slots in the same snapshot.
 type Workload struct {
 	Total          int            `json:"total"`
 	Ready          int            `json:"ready"`
 	NeedsAttention int            `json:"needsAttention"`
 	Watching       int            `json:"watching"`
 	Registered     int            `json:"registered"`
+	SlotsTotal     int            `json:"slotsTotal"`
+	SlotsUsed      int            `json:"slotsUsed"`
 	ByVerdict      map[string]int `json:"byVerdict"`
 	ByRole         map[string]int `json:"byRole"`
 	ByProject      map[string]int `json:"byProject"`
@@ -81,6 +84,14 @@ type Workload struct {
 type WorkloadStore interface {
 	ActiveWorkloadWatches(ctx context.Context) ([]WorkloadWatch, error)
 	Subscribe(ctx context.Context, w WorkloadWatch, sub WorkloadSubscriber) error
+}
+
+// SlotBudgetStore is an optional capability for stores that can resolve the
+// configured parallel-slot budget. Keeping it separate from WorkloadStore
+// leaves the daemon adapter unchanged: a store without this capability still
+// compiles and reports the budget derived from the watch snapshot.
+type SlotBudgetStore interface {
+	SlotBudget(ctx context.Context) (total int, used int, err error)
 }
 
 // normalizeToken folds case and surrounding space so verdicts and roles from
@@ -183,6 +194,10 @@ func BuildWorkload(watches []WorkloadWatch) Workload {
 			out.ByRole[role]++
 		}
 	}
+	// One active Watch holds one orchestrator slot, so the snapshot's length is
+	// the default used count. A store that implements SlotBudgetStore can
+	// override this with a source closer to the live agent inventory.
+	out.SlotsUsed = len(watches)
 	return out
 }
 
@@ -207,6 +222,17 @@ func RunWorkload(ctx context.Context, st WorkloadStore) (Workload, error) {
 		return Workload{}, fmt.Errorf("workload: active watches: %w", err)
 	}
 	report := BuildWorkload(watches)
+
+	if bs, ok := st.(SlotBudgetStore); ok {
+		total, used, err := bs.SlotBudget(ctx)
+		if err != nil {
+			return Workload{}, fmt.Errorf("workload: slot budget: %w", err)
+		}
+		report.SlotsTotal = total
+		if used >= 0 {
+			report.SlotsUsed = used
+		}
+	}
 
 	var errs []error
 	for _, w := range watches {
