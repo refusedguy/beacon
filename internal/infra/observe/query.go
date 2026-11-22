@@ -26,7 +26,8 @@ type LogFilter struct {
 // ReadLogs reads the log files under <dir>/logs and returns the records that
 // match opts. Symlinks (beacon.latest.log and beacon.mcp.latest.log) are
 // skipped so a record is not returned twice through its link. Files are read
-// oldest first by modification time; Tail then keeps the most recent matches.
+// oldest first by modification time; Tail keeps the most recent matches in a
+// bounded buffer, so memory stays at N records no matter how large the logs.
 func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 	if strings.TrimSpace(dir) == "" {
 		return nil, fmt.Errorf("observe: пустой каталог логов")
@@ -69,6 +70,10 @@ func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 	})
 
 	var matched []string
+	var ring *tailBuffer
+	if opts.Tail > 0 {
+		ring = newTailBuffer(opts.Tail)
+	}
 	var scanErr error
 	for _, file := range files {
 		f, err := os.Open(file.path)
@@ -82,10 +87,16 @@ func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 			if line == "" || !matchLogLine(line, opts) {
 				continue
 			}
+			var record string
 			if opts.JSON {
-				matched = append(matched, encodeLogRecordJSON(line))
+				record = encodeLogRecordJSON(line)
 			} else {
-				matched = append(matched, formatLogLine(line))
+				record = formatLogLine(line)
+			}
+			if ring != nil {
+				ring.add(record)
+			} else {
+				matched = append(matched, record)
 			}
 		}
 		// A line longer than the scanner buffer stops Scan and leaves valid
@@ -98,17 +109,50 @@ func ReadLogs(dir string, opts LogFilter) ([]string, error) {
 	if scanErr != nil {
 		return nil, scanErr
 	}
-	if opts.Tail > 0 && len(matched) > opts.Tail {
-		dropped := len(matched) - opts.Tail
-		matched = matched[len(matched)-opts.Tail:]
-		if opts.OnTruncate != nil {
-			opts.OnTruncate(dropped)
-		}
+	var dropped int
+	if ring != nil {
+		matched, dropped = ring.result()
+	}
+	if dropped > 0 && opts.OnTruncate != nil {
+		opts.OnTruncate(dropped)
 	}
 	if matched == nil {
 		return []string{}, nil
 	}
 	return matched, nil
+}
+
+// tailBuffer keeps at most cap records in arrival order. Once full, adding a
+// record drops the oldest one and counts it. Callers use the count to report
+// total truncation through LogFilter.OnTruncate.
+type tailBuffer struct {
+	records []string
+	cap     int
+	start   int
+	dropped int
+}
+
+func newTailBuffer(cap int) *tailBuffer {
+	return &tailBuffer{records: make([]string, 0, cap), cap: cap}
+}
+
+func (b *tailBuffer) add(record string) {
+	if len(b.records) < b.cap {
+		b.records = append(b.records, record)
+		return
+	}
+	b.records[b.start] = record
+	b.start = (b.start + 1) % b.cap
+	b.dropped++
+}
+
+// result returns the kept records oldest first and the number dropped.
+func (b *tailBuffer) result() ([]string, int) {
+	kept := make([]string, 0, len(b.records))
+	for i := 0; i < len(b.records); i++ {
+		kept = append(kept, b.records[(b.start+i)%b.cap])
+	}
+	return kept, b.dropped
 }
 
 // isLogFileName reports whether name is a run log or a server JSONL log,
