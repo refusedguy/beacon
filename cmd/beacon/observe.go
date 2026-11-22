@@ -295,20 +295,23 @@ type observingDeliveryTarget struct {
 }
 
 func (t observingDeliveryTarget) Prompt(sessionID, text string) error {
+	// Count success and failure of this target under one adapter name. The
+	// second argument to the observe helpers is the watch ID, not the session
+	// ID, even though this port calls it sessionID.
+	adapter := t.adapter
+	if adapter == "" {
+		adapter = "opencode"
+	}
 	if t.next == nil {
 		err := fmt.Errorf("delivery: target is nil")
-		observe.WakeFailed(t.adapter, sessionID, err)
+		observe.WakeFailed(adapter, sessionID, err)
 		return err
 	}
 	err := t.next.Prompt(sessionID, text)
 	if err != nil {
-		observe.WakeFailed(t.adapter, sessionID, err)
+		observe.WakeFailed(adapter, sessionID, err)
 		return err
 	}
-	if t.adapter == "" {
-		observe.WakeDelivered("opencode", sessionID)
-	} else {
-		observe.WakeDelivered(t.adapter, sessionID)
-	}
+	observe.WakeDelivered(adapter, sessionID)
 	return nil
 }
