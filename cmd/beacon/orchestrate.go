@@ -629,10 +629,14 @@ func planWave(items []giantWork) wavePlan {
 // dispatchAction is one action dispatched in a wave. SupportsParallel states
 // whether the action may hold a slot together with other parallel actions.
 // An action without the flag owns the slot and gets exclusive access to the
-// files the wave shares.
+// files the wave shares. WaitReady, when set, blocks until the action's runtime
+// reports readiness; it must honor ctx cancellation. It runs before the slot
+// is acquired, so an unready action never holds a slot. A nil WaitReady means
+// the action is ready immediately.
 type dispatchAction struct {
 	Card             string
 	SupportsParallel bool
+	WaitReady        func(context.Context) error
 }
 
 // admissionLock grants dispatch slots. Parallel actions share one slot, and
@@ -652,11 +656,20 @@ func newAdmissionLock() *admissionLock {
 
 // acquire waits for a slot and returns the function that releases it. The
 // context is checked before the wait and again after the slot is granted, so a
-// canceled action never starts. A pending exclusive action blocks new parallel
-// actions from entering.
+// canceled action never starts. If the action has a readiness function, acquire
+// waits on it before touching the slot, so an unready action never holds one.
+// A pending exclusive action blocks new parallel actions from entering.
 func (l *admissionLock) acquire(ctx context.Context, action dispatchAction) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if action.WaitReady != nil {
+		if err := action.WaitReady(ctx); err != nil {
+			return nil, err
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 	}
 	if action.SupportsParallel {
 		for {
