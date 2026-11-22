@@ -984,7 +984,7 @@
     {
       "id": "BCX-46",
       "title": "Документировать одиннадцать добавочных полей get_result",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -1000,7 +1000,8 @@
       "context": "Источник: docs/research/mcp-contract-drift-audit.md, таблица 4 строка 6. schema.go:115-138 определяет resultType, taskId, jobID, taskStatus, pollIntervalMs, instructions, nextAction, nextCommand, nextHint, failureExcerpt, configId. Большинство не перечислены в ADR 0094. Forward-compat зонд в contract_test.go:526-544 добавляет поля без объявления. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Перечислить все поля в ADR или в версионированном приложении схемы. Разделить обязательные и forward-compatible поля. Заменить зонд, который добавляет поля без объявления, на проверку известного набора.",
       "check": "CI зелёный. Тест сверяет набор полей ответа с документацией. Все одиннадцать полей имеют описание.",
-      "acceptance": "Клиент видит полный перечень полей и их назначение в контракте."
+      "acceptance": "Клиент видит полный перечень полей и их назначение в контракте.",
+      "note": "MERGED PR #1299 4dafcf6912b41a07557f5e53a3f905d837fc4689 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-47",
@@ -1047,7 +1048,7 @@
     {
       "id": "BCX-49",
       "title": "Устранить конфликт wake-конструкторов с ADR 0263",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -1063,7 +1064,8 @@
       "context": "Источник: docs/research/mcp-contract-drift-audit.md, таблица 4 строка 9. AttachWake в tool_wake.go:105-107, :1740-1747 определён, не вызывается. 25 вызовов только в тестах по deadcode-audit.md:30. NewCapabilityFallbackWakeHandler и ещё четыре конструктора вынесены в REACH-UNWIRED (reachability.json:75-120) с причиной про Waves 6-8, что противоречит ADR 0263. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Выбрать: удалить мёртвые конструкторы или оставить с причиной, которая ссылается на ADR 0263 и не обещает подключение в будущих волнах. Обновить reachability.json. Добавить проверку, что причина REACH-UNWIRED не противоречит принятому ADR.",
       "check": "CI зелёный. Причины в reachability.json не обещают подключение, запрещённое ADR. Тест на удалённые или помеченные конструкторы проходит.",
-      "acceptance": "Конфиг отложенных символов и ADR говорят одно и то же о wake."
+      "acceptance": "Конфиг отложенных символов и ADR говорят одно и то же о wake.",
+      "note": "MERGED PR #1302 5dc4e1e8d2dbcc6c8d388f041cb72d85451f6522 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-50",
@@ -1089,7 +1091,7 @@
     {
       "id": "BCX-51",
       "title": "Подключить офлайн-гейт tool-contract к CLI и CI",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -1105,12 +1107,13 @@
       "context": "Источник: docs/research/mcp-contract-drift-audit.md, раздел 2.4 и главная находка 2. HEAD d3b1bfb1 добавил CheckToolContract и девять тестов. tools/beacon-gates/main.go:24-29 регистрирует только capabilities, layers-ast, layers-list, reachability. В .github, scripts, docs/gates и docs/runbooks упоминаний tool-contract нет. Фикстура в tool_contract_test.go:17-57 синтетическая, не реальный tools/list. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Зарегистрировать подкоманду tool-contract в main.go. Добавить вызов в CI как обязательную или информационную проверку по решению владельца. Заменить синтетическую фикстуру реальным снимком инструментов. Проверить текущий main на наличие подкоманды.",
       "check": "CI зелёный. beacon-gates tool-contract запускается и проверяет реальный снимок. В workflow есть вызов проверки.",
-      "acceptance": "Проверка качества описаний tools/list имеет точку входа и работает в CI."
+      "acceptance": "Проверка качества описаний tools/list имеет точку входа и работает в CI.",
+      "note": "MERGED PR #1315 93497d6a115fbbda3f191a45c1f2a0dad010c0c5 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-52",
       "title": "Свести три списка имён MCP к одному и вернуть e2e в обязательные",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -1127,7 +1130,8 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, раздел 1 и таблица итог строка 1. expectedSet в tests/e2e, beaconmcp.ToolNames и evals/main.go три отдельных списка. Лог /tmp/opencode/e2e-1112.log:265 tools/list вернул 10 имён, :287 ожидалось девять, :294-304 два теста упали. Исправление f5c77e25 в ветке. eval в CI не запускается. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Экспортировать набор имён из internal/infra/mcp и использовать в обоих е2е-вызовах и в evals. Удалить len(names) != 9 и числовые константы. Добавить unit-тест в mcp. Снять continue-on-error с джобы e2e после стабилизации. Исправить frozenScenarioHash и копию в tests/e2e/README.md одним коммитом.",
       "check": "CI зелёный. Джоба e2e обязательна. Тест в internal/infra/mcp ловит новую регистрацию без правки контракта. Хеши в коде и README совпадают.",
-      "acceptance": "Регистрация инструмента без правки общего списка падает в обычной джобе test."
+      "acceptance": "Регистрация инструмента без правки общего списка падает в обычной джобе test.",
+      "note": "MERGED PR #1322 50223cf0a878e5dd3182a875739568ca3e4f1642 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-53",
@@ -1152,7 +1156,7 @@
     {
       "id": "BCX-54",
       "title": "Реализовать живой прогон seeded regression artery",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -1169,12 +1173,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, раздел «Три падения» 3 и таблица строка 3. docs/evals/w25-seed-regression-artery.md требует трёх прогонов. ADR 0214 не считает покрытие одними impl-тестами. Коммит 63cffc79 (PR #1145) добавил seeded.yaml и internal/testsystem, но CI-шаг seed-spec в ak2-run2.log:194-208 только grep-проверяет имена и запускает три модельных теста. Fault controller нет. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Реализовать fault controller для четырёх отказов из S7.011: lost baton, late event, pruned cursor, duplicate clientRequestId. Запускать три прогона в одной джобе и требоватьhealthy pass, seeded fail на ожидаемом маркере, healthy_again pass. Сохранить негативный контроль. Не принимать grep-проверку как замену.",
       "check": "CI зелёный. Лог джобы показывает три прогона с ожидаемыми исходами. Без seed диагностического значения нет.",
-      "acceptance": "Пара сценариев по ADR 0214 выполнена живым прогоном, а не проверкой текста спецификации."
+      "acceptance": "Пара сценариев по ADR 0214 выполнена живым прогоном, а не проверкой текста спецификации.",
+      "note": "MERGED PR #1323 a95678fe0f5708bfb8cb24a3cd6090c48abd1ecb (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-55",
       "title": "Грузить реальный плагин репозитория в живом e2e",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1190,12 +1195,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 4 и раздел «Живой зонд». opencode_wake_with_reference_plugin использует плагин, скопированный из спайка T0.3. Реальный .opencode/plugins/beacon-bridge.js в живом сервере не грузится. Спецификация docs/evals/e01-e2e-repo-plugin-not-fixture.md не реализована. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Написать сценарий из e01-e2e-repo-plugin-not-fixture.md. Поднимать сервер с плагином репозитория. Проверить prompt.ok delivery=steer, session.execution.started и запись квитанции от реального плагина. Оставить эталон только как негативный контроль.",
       "check": "CI зелёный. Новый сценарий в наборе семи с обновлённым frozenScenarioHash. Живой лог показывает вызовы реального плагина.",
-      "acceptance": "Доставка wake подтверждена на том коде, который используют пользователи."
+      "acceptance": "Доставка wake подтверждена на том коде, который используют пользователи.",
+      "note": "MERGED PR #1324 397d87bda6306c633d7d2505a4ca4e97d0ef99f7 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-56",
       "title": "Добавить живой тест dedup после рестарта",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1211,12 +1217,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 5 и раздел «Живой зонд». Chaos на реальном store проверяет двойную доставку одним эффектом, но лестница и эскалация там фейки (duplicate-delivery_test.go:30-33, :122-124). eval 18_w09_receipt_outcomes работает на фейковом хосте. rs-wake-dedup-across-restart.md остаётся текстом. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Построить сценарий с реальным указателем сессии: доставить steer, перезапустить процесс, повторить событие. Утверждать один вызов session.prompt и одну квитанцию. Не использовать фейковый хост как доказательство.",
       "check": "CI зелёный. Живой сценарий регистрирует ровно один steer после рестарта. Негативный контроль показывает дубль без защиты.",
-      "acceptance": "Идемпотентность доставки подтверждена на реальном store и живом адаптере."
+      "acceptance": "Идемпотентность доставки подтверждена на реальном store и живом адаптере.",
+      "note": "MERGED PR #1337 151fa9877cbec70ccac53f0333a80e0baac188b9 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-57",
       "title": "Написать сценарий human-decide с продолжением той же Watch",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1232,12 +1239,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 6. Сценарий needs_input_continue_of_same_watch из ADR 0061 пункт 4 не написан. Есть только cmd/beacon/human_test.go и спецификации W21 и E05. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Собрать сценарий: Watch получает needs_input, агент отвечает human approve, ta же Watch продолжается с тем же watchID. Проверить, что не создаётся новая Watch и обязательство не теряется. Добавить негатив с изменившимся вопросом.",
       "check": "CI зелёный. Живой сценарий проходит и видит тот же watchID до и после ответа. Негатив с изменённым вопросом отклоняется.",
-      "acceptance": "Продолжение после ответа человека работает на одной Watch и подтверждено е2е."
+      "acceptance": "Продолжение после ответа человека работает на одной Watch и подтверждено е2е.",
+      "note": "MERGED PR #1334 44f9e53de41ef4705b88edd9bf54bf7a3a28d7d3 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-58",
       "title": "Добавить живой тест registry с двумя проектами",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1253,12 +1261,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 7. Есть unit-тесты registry, модельные eval OW02 и OW03, джоба registry-check на origin/main проверяет конфиг позитивом и негативом. Живого теста с двумя проектами в одном сервере и реальными сессиями нет. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Поднять сервер с двумя проектами и разными watchID. Проверить, что реестр разделяет сессии и что sync не вызывает wake по stale. Добавить негатив с пересекающимися именами агентов.",
       "check": "CI зелёный. Живой сценарий с двумя проектами проходит. Негатив с stale не инициирует wake.",
-      "acceptance": "Граница проекта подтверждена на реальных сессиях, а не только на конфиге."
+      "acceptance": "Граница проекта подтверждена на реальных сессиях, а не только на конфиге.",
+      "note": "MERGED PR #1336 b990b5180842edb282ceb3b0bd365e014449da01 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-59",
       "title": "Заменить внешний драйвер вердикта демоном полного цикла",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1273,12 +1282,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 8. live_opencode_full_mcp_cycle пишет вердикт через domain.Transition из внешнего драйвера (e2e_test.go:976-1014). Демона нет. Гейт ShipFacts из ADR 0061 пункт 2 не написан. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Вынести решение в демон и проверять, что цикл watch, register, wait, get, ack завершается без внешнего вызова Transition. Написать гейт ShipFacts по ADR 0061. Добавить тест на расхождение фактов.",
       "check": "CI зелёный. Тест полного цикла не вызывает domain.Transition напрямую. Гейт ShipFacts присутствует в наборе.",
-      "acceptance": "Вердикт цикла вычисляется демоном из наблюдаемых фактов."
+      "acceptance": "Вердикт цикла вычисляется демоном из наблюдаемых фактов.",
+      "note": "MERGED PR #1355 83436479ba44c8c2f6cd44e4fb6a43059a2e92e3 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-60",
       "title": "Проверить ACP wake sequence живым адаптером",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1294,12 +1304,13 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 9. acp_smoke_test.go только делает initialize, session/new, session/load. Сценарии W06 и W07 описаны только в документах. session/prompt, session/resume и роль клиента против агента не проверяются живым адаптером. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Вызвать session/prompt через ACP и проверить доставку steer. Проверить resume и матрицу ролей из W07. Добавить негатив с неверной ролью.",
       "check": "CI зелёный. Живой ACP-сценарий проходит prompt и resume. Матрица ролей покрыта тестом.",
-      "acceptance": "ACP подтверждён как канал wake, а не только как handshake."
+      "acceptance": "ACP подтверждён как канал wake, а не только как handshake.",
+      "note": "MERGED PR #1319 b8c81e1fb5fcba66db422978272c67dd78bf5cd3 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-61",
       "title": "Добавить живые тесты Board TUI, GC и shutdown",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1315,7 +1326,8 @@
       "context": "Источник: docs/research/e2e-coverage-audit.md, таблица строка 10. Есть unit-тесты TUI с фейковым сокетом, lifecycle и watch GC, спецификации U01-U04 и E10. Нет прогона TUI против сервера, kill на середине wait_result и проверки старого PID. crash_recovery_durable_store_no_old_pid из ADR 0061 пункт 5 не написан. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Поднять сервер и подключить TUI к живому сокету. Измерить первый кадр и RSS. Убить сервис во время wait_result и проверить, что старый PID и lease не читаются. Добавить сценарий crash recovery по ADR 0061.",
       "check": "CI зелёный. Три живых сценария проходят. Замеры первого кадра и RSS записаны в карточку или отчёт.",
-      "acceptance": "TUI, GC и shutdown подтверждены на живом сервере, а не на фейковом сокете."
+      "acceptance": "TUI, GC и shutdown подтверждены на живом сервере, а не на фейковом сокете.",
+      "note": "MERGED PR #1312 7089eae5d5d8d014b9888cdb41cfda2d043371f9 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-62",
@@ -1342,7 +1354,7 @@
     {
       "id": "BCX-63",
       "title": "Разрешить или запретить свой TUI и снять дубли proposed ADR",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -1359,12 +1371,13 @@
       "context": "Источник: docs/research/adr-consistency-audit.md, таблица строка 2. ADR 0060 прямо пишет «Свой TUI или веб-интерфейс не создаётся». В main есть internal/tui/app.go, client.go, socket.go. Ребро cmd к internal/tui запрещено в layers.json:17-22, dispatch board отсутствует. Восемь ADR про TUI со статусом proposed дублируют два текста. WIRING-493 и WIRING-915 требуют снять ограничения; коммит f5b1d7d4 не предок main. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Проверить premise на текущем main. При разрешении снять запрет в ADR 0060, закрыть дубли proposed ADR, подключить WIRING-493 и WIRING-915 и разрешить ребро в layers.json. При запрете удалить internal/tui и закрыть обе wiring-карточки как dropped.",
       "check": "CI зелёный. Код и ADR согласованы. Дубли proposed ADR закрыты или объединены. Ребро в layers.json соответствует выбору.",
-      "acceptance": "Решение по TUI зафиксировано и не оставляет мёртвый код или запрещённое ребро."
+      "acceptance": "Решение по TUI зафиксировано и не оставляет мёртвый код или запрещённое ребро.",
+      "note": "MERGED PR #1328 3607970ecc343f8e6740a11070340f4bafec79ed (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-64",
       "title": "Определить статус wake вне MCP и сделать проверку ADR 0026 достижимой",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -1381,7 +1394,8 @@
       "context": "Источник: docs/research/adr-consistency-audit.md, таблица строка 3. tool_wake.go содержит Delivery*, NewHeartbeatGuard, ToRepairableErrorShape, но NewServer не вызывает AttachWake. ADR 0263 запрещает регистрацию. ADR 0026 требует обязательное delivery и живой прогон с агентом, вернувшим queued. Живая проверка недостижима на main. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Выбрать: зарегистрировать wake и выполнить живой тест ADR 0026, либо перевести ADR 0026 и 0059 в состояние с явной оговоркой, что доставка живёт вне MCP и проверяется другим путём. Обновить карточки, которые ссылаются на живую проверку.",
       "check": "CI зелёный. ADR описывает достижимый способ проверки. Тест, предписанный ADR, запускается в CI или помечен как заменённый.",
-      "acceptance": "ADR 0026 не требует недостижимую проверку. Статус доставки честно отражён в документации."
+      "acceptance": "ADR 0026 не требует недостижимую проверку. Статус доставки честно отражён в документации.",
+      "note": "MERGED PR #1331 b6cefb28ea6c3c0506a165520525bd0cc048525b (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-65",
@@ -1449,7 +1463,7 @@
     {
       "id": "BCX-68",
       "title": "Добавить команду test в каталог beacon",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1465,12 +1479,13 @@
       "context": "Источник: docs/research/adr-consistency-audit.md, таблица строка 7. Dispatch содержит test в main.go:242, но catalog.go его не перечисляет. Агент читает каталог через beacon list --format json и не видит test. ADR называет каталог источником команд. Связано с BCX-21. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Добавить test в catalog и ortho в генератор каталога из BCX-21. Добавить тест, который сверяет catalog и dispatch. Обновить docs/adrs/0016-build-system.md при изменении контракта.",
       "check": "CI зелёный. beacon list --format json содержит test. Тест равенства каталога и dispatch проходит.",
-      "acceptance": "Каталог перечисляет все команды, включая test."
+      "acceptance": "Каталог перечисляет все команды, включая test.",
+      "note": "MERGED PR #1332 a59acd23ee5f443a213ee400528747d3fca2a83f (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-69",
       "title": "Убрать второй формат ошибки в internal/infra/mcp",
-      "status": "todo",
+      "status": "done",
       "phase": "P8",
       "type": "task",
       "owner_files": [
@@ -1486,7 +1501,8 @@
       "context": "Источник: docs/research/adr-consistency-audit.md, таблица строка 8 и раздел 0009. ADR 0009 предписывает единый error shape из шести полей и запрещает Result[T]. ToErrorShape в schema.go:393 соблюдает контракт, но RepairableErrorShape в tool_wake.go:392 расширяет конверт до девяти полей: retryable, recoveryHint, partial. Второй формат в том же пакете. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Выбрать: вынести repairable-поля в отдельный контракт с ADR или свести их к шести полям через метаданные. Убрать дубль конверта. Обновить ADR 0009. Связать с BCX-64 по судьбе wake.",
       "check": "CI зелёный. Тест проверяет один error shape на границе MCP. ADR описывает оба варианта или их отсутствие.",
-      "acceptance": "В internal/infra/mcp нет двух несовместимых форматов ошибки."
+      "acceptance": "В internal/infra/mcp нет двух несовместимых форматов ошибки.",
+      "note": "MERGED PR #1329 8da24238d8d041b2e84f4f9591f0a785101948da (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-70",
@@ -1573,7 +1589,7 @@
     {
       "id": "BCX-74",
       "title": "Проверять BEACON_ACP_COMMAND и BEACON_ACP_ARGS",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1587,12 +1603,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 4. spawn.go:249-269: BEACON_ACP_RUNNER default opencode, BEACON_ACP_COMMAND и BEACON_ACP_ARGS полностью заменяют command line. strings.Fields не понимает кавычки. Оболочки нет, но env определяет исполняемый файл. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Проверять, что команда является разрешённым исполняемым файлом, или требовать абсолютный путь и явное согласие. Заменить strings.Fields на разбор с кавычками или документировать ограничение. Добавить тест на команду с пробелами в аргументе.",
       "check": "CI зелёный. Тест на неразрешённую команду даёт ошибку. Аргумент с пробелом передаётся как одно значение или ограничение документировано.",
-      "acceptance": "Env не может тихо подменить runner. Способ передачи аргументов описан."
+      "acceptance": "Env не может тихо подменить runner. Способ передачи аргументов описан.",
+      "note": "MERGED PR #1333 acce7fe9c968347339b1c1df5da93ad69ade6b2b (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-75",
       "title": "Описать 21 production-переменную в эксплуатационной документации",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -1608,12 +1625,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 5 и раздел «Env в коде, но нет в документации». 21 production-переменная не названа в README или runbook, включая BEACON_CHANNEL_SENDERS, BEACON_TELEGRAM_TOKEN, BEACON_ROOT, BEACON_TASK_DEADLINE, BEACON_METRICS_PORT, таймауты MCP и BEACON_MCP_REMOTE. Центральной таблицы env нет. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Создать центральную таблицу env с default, валидацией, consumer и риском. Перенести туда البيانات из cards и research. Добавить проверку, что каждая переменная из.cmd/internal/tools.has запись в таблице или разрешённое исключение.",
       "check": "CI зелёный. Таблица содержит все production-переменные. Проверка не находит неописанных переменных.",
-      "acceptance": "Оператор находит любую рабочую переменную в одном документе."
+      "acceptance": "Оператор находит любую рабочую переменную в одном документе.",
+      "note": "MERGED PR #1340 8d4ed897c5fa180432579f6dbd4111fd7c41947a (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-76",
       "title": "Свести три имени корня проекта к одному",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -1630,12 +1648,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 6 и раздел «Разные default» пункт 4. BEACON_REPO читают scripts/verify-beacon.sh:8 и verify-daemon.sh:8; BEACON_ROOT в task.go:700; BEACON_PROJECT_ROOT в doctor.go:249 и mcp.go:1143. Единого приоритета нет. BEACON_REPO описан в docs/runbooks/verification.md:16, но в Go-коде отсутствует. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Выбрать каноническое имя и приоритет. Перевести скрипты и плагин на него, оставить остальные как deprecated alias с предупреждением. Обновить runbook. Добавить тест на согласованный root во всех потребителях.",
       "check": "CI зелёный. Все consumer получают одинаковый root. Устаревшие имена либо удалены, либо выдают предупреждение.",
-      "acceptance": "Конфликт имён корня устранён, и документ описывает один приоритет."
+      "acceptance": "Конфликт имён корня устранён, и документ описывает один приоритет.",
+      "note": "MERGED PR #1348 f7049b4850c04edce68e22c29d1b982253c4ad4c (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-77",
       "title": "Унифицировать разбор булевых env-переменных",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1651,12 +1670,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 7. server.go:79-86 и mcp.go:384-389 нормализуют регистр и пробелы; otel.go:157 использует EqualFold только для регистра; mcp.go:173-176 для BEACON_INIT_BYPASS не нормализует ничего. TRUE или ' 1' дают тихий precheck failure. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Вынести общую функцию parseBoolEnv в отдельный пакет. Применить ко всем булевым переменным, включая BEACON_INIT_BYPASS и BEACON_OTEL_ENABLED. Добавить табличный тест на регистр и пробелы.",
       "check": "CI зелёный. Табличный тест проходит для всех четырёх форм. Ни одна переменная не зависит от регистра по-своему.",
-      "acceptance": "Оператор может писать TRUE и ' 1' без тихого изменения поведения."
+      "acceptance": "Оператор может писать TRUE и ' 1' без тихого изменения поведения.",
+      "note": "MERGED PR #1349 2f4a2a471f4e6a8beeb2023a090d8a3be5bb12f8 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-78",
       "title": "Сообщать о неверном значении Пятнадцати переменных вместо тихого default",
-      "status": "todo",
+      "status": "done",
       "phase": "P2",
       "type": "task",
       "owner_files": [
@@ -1672,12 +1692,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 8 и раздел «Отсутствие валидации». Пятнадцать переменных при неверном значении работают с default без сообщения: BEACON_LOG_FORMAT, BEACON_DAEMON_INTERVAL, BEACON_VERDICT_POLL_INTERVAL, BEACON_SYNC_CALL_TIMEOUT, BEACON_INIT_EVENT_TIMEOUT, BEACON_TASK_DEADLINE, BEACON_OTEL_EXPORTER и другие. attach.go:154-159 молча игнорирует неверный дедлайн. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Разделить переменные на две группы: таймауты с осознанным fallback и данные, где fallback недопустим. Для всех добавить предупреждение в лог с именем переменной и значением. Для BEACON_TASK_DEADLINE сделать ошибку или явный отказ записи.",
       "check": "CI зелёный. Тест проверяет предупреждение для каждой переменной. BEACON_TASK_DEADLINE с битым значением не пишет задачу без дедлайна.",
-      "acceptance": "Ошибка конфига видна в логах. Данные не сохраняются с тихо потерянным дедлайном."
+      "acceptance": "Ошибка конфига видна в логах. Данные не сохраняются с тихо потерянным дедлайном.",
+      "note": "MERGED PR #1338 3540ff43a975b0b619056260818ceb6b59dc3d29 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-79",
       "title": "Исправить состояние OTEL_EXPORTER_OTLP_PROTOCOL=grpc",
-      "status": "todo",
+      "status": "done",
       "phase": "P3",
       "type": "task",
       "owner_files": [
@@ -1692,12 +1713,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 9. observe/otel.go:38-39 называет grpc допустимым значением. normalizeProtocol (:40) принимает его, но NewOTLPExporter (:367-369) отвергает и включает local fallback. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Либо реализовать grpc-экспорт, либо убрать grpc из списка допустимых значений и документации. Добавить тест, что объявленное значение приводит к реальному экспорту или к явной ошибке, а не к тихому fallback.",
       "check": "CI зелёный. Тест на grpc даёт ожидаемый результат. Документация и код перечисляют одинаковые протоколы.",
-      "acceptance": "Документация не обещает работающий экспорт, который молча отключается."
+      "acceptance": "Документация не обещает работающий экспорт, который молча отключается.",
+      "note": "MERGED PR #1343 88a830d99fb04cf101372322cebaf1416a06afc0 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-80",
       "title": "Убрать env-переменные, которые production не читает",
-      "status": "todo",
+      "status": "done",
       "phase": "P5",
       "type": "task",
       "owner_files": [
@@ -1713,12 +1735,13 @@
       "context": "Источник: docs/research/config-env-audit.md, итог строка 10. BEACON_WAKE_TARGET живёт только в checkall_test.go:85,120,158 и установлен в ses_ignored_env; настоящий wakeTarget приходит из Config через BEACON_CONFIG. BEACON_GATES читается только doctor.go:221 и не влияет на прод. Базовый замер и приоритет из отчёта: P2.",
       "steps": "Удалить тестовую переменную или переименовать её так, чтобы она не выглядела как production config. Переместить BEACON_GATES в раздел инструментов разработчика или удалить. Обновить центральную таблицу из BCX-75.",
       "check": "CI зелёный. Поиск по коду не находит env, объявленных только в тестах, без пометки test-only. Таблица env отражает 실제 consumer.",
-      "acceptance": "Каждая переменная в документации имеет реального production-потребителя или помечена test-only."
+      "acceptance": "Каждая переменная в документации имеет реального production-потребителя или помечена test-only.",
+      "note": "MERGED PR #1347 6a1c5d5103b90677a515b00674c35a0f79511bd3 (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-81",
       "title": "Поставить автоматическую уборку сирот opencode serve",
-      "status": "todo",
+      "status": "done",
       "phase": "P4",
       "type": "task",
       "owner_files": [
@@ -1734,12 +1757,13 @@
       "context": "Источник: docs/research/process-leak-rootcause.md, RC-2 и RC-3, меры 3; process-leak-mechanism.md находка 3 и мера (c). За два часа около двадцати процессов opencode serve и 22 дочерних beacon mcp, владелец убил вручную; предыдущий инцидент 37 серверов и 29 сирот. В старом коде не было Pdeathsig, записи PID и проверки живости; gc не был подключён к dispatch. Базовый замер: ~20 процессов за 2 часа, порог тревоги больше двух живых серверов. Базовый замер и приоритет из отчёта: P0.",
       "steps": "Проверить текущий main: коммит PR 887 добавил Pdeathsig в server.go:118, запись opencode-serve.json (:193-269), переиспользование живого PID (:390-429) и gc в dispatch. Если это уже есть, ограничить работу настройкой регулярного запуска beacon gc --apply через cron или timer с интервалом 10 минут. Перед включением --apply выполнить dry run и сверить список. GC должен пропускать PID и порт из service.json и opencode-serve.json. Добавить отчёт о числе сирот в ночную смену.",
       "check": "CI зелёный. В конфигурации владельца есть timer или cron. Dry run gc не помечает защищённые PID. Проверка после недели работы показывает ноль сирот.",
-      "acceptance": "Сироты убираются автоматически. Порог тревоги срабатывает при более чем двух живых серверах."
+      "acceptance": "Сироты убираются автоматически. Порог тревоги срабатывает при более чем двух живых серверах.",
+      "note": "MERGED PR #1339 05e0018b19864cc171bd45b01ac0e2ada3ea0ebf (merge-base --is-ancestor origin/main exit 0)"
     },
     {
       "id": "BCX-82",
       "title": "Ограничить tools.beacon и безопасный shell на границе инструмента",
-      "status": "todo",
+      "status": "done",
       "phase": "P1",
       "type": "task",
       "owner_files": [
@@ -1756,7 +1780,8 @@
       "context": "Источник: docs/research/process-leak-mechanism.md, находки 1, 4, 5 и меры (a), (b); process-leak-rootcause.md RC-1, RC-4, RC-5. Каждый вызов tools.beacon.* поднимает beacon mcp, который спавнит opencode serve; 20 вызовов дают около 20 процессов. issue-scout.md:1-14 запрещает edit, shell, write, но не execute и beacon_*. Плагин регистрирует MCP для каждой сессии с корнем проекта. .opencode/settings.json:3-16 содержит PreToolUse, но нет доказательства, что OpenCode 2.3.2 его читает. Базовый замер и приоритет из отчёта: P1.",
       "steps": "Создать профиль beacon-researcher с deny для execute, beacon_*, edit, shell, subagent и allow для webfetch. Запретить и execute, и beacon_*, иначе инструменты станут прямыми. Настроить скиллы research и night-shift на запуск только этим профилем. Написать плагин OpenCode с ctx.tool.hook(execute.before), который отклоняет grep -r, grep -R, find /, go test, go build, beacon gates. Неделю писать предупреждение в лог перед включением deny. Не трогать opencode.json в этом PR.",
       "check": "CI зелёный. Тестовая сессия показывает, что research-агент не видит execute и beacon_*. Хук отклоняет запрещённые команды и называет замену rg с явным каталогом.",
-      "acceptance": "Research-роль не может запустить цепочку spawn через MCP. Рекурсивный поиск и локальные гейты останавливаются на границе инструмента, а не текстом в AGENTS.md."
+      "acceptance": "Research-роль не может запустить цепочку spawn через MCP. Рекурсивный поиск и локальные гейты останавливаются на границе инструмента, а не текстом в AGENTS.md.",
+      "note": "MERGED PR #1353 c35c727900f30da652fee0c6bfdb450e95e72a54 (merge-base --is-ancestor origin/main exit 0)"
     }
   ]
 }
