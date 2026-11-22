@@ -6,13 +6,16 @@
 package taskstore
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
+	"github.com/refusedguy/beacon/internal/domain"
 	_ "modernc.org/sqlite"
 )
 
@@ -59,8 +62,11 @@ CREATE INDEX IF NOT EXISTS owners_by_owner ON owners(owner);
 `
 
 // Index это открытый индекс карточек. Все записи идут через одно соединение.
+// tasksDir запоминается последней успешной сборкой и нужен GraphStatus, чтобы
+// сравнить индекс с текущим каталогом карточек.
 type Index struct {
-	db *sql.DB
+	db       *sql.DB
+	tasksDir string
 }
 
 // IndexPath возвращает путь файла индекса в state dir. Суффикс от Hash8(root)
@@ -248,6 +254,7 @@ func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 	if err := idx.replaceCards(changed, stale); err != nil {
 		return ImportStats{}, err
 	}
+	idx.tasksDir = tasksDir
 	return idx.Counts()
 }
 
@@ -271,6 +278,79 @@ func (idx *Index) Counts() (ImportStats, error) {
 		}
 	}
 	return stats, nil
+}
+
+// GraphStatus implements the GraphIndexReader port over the index without
+// importing the MCP package. IndexHash is the digest of the cards stored in
+// the index. SourceHash is the digest of the directory used in the last
+// successful rebuild. When that directory is unknown, SourceHash stays empty
+// and domain.GraphStatus.Ready remains false.
+func (idx *Index) GraphStatus(_ context.Context) (domain.GraphStatus, error) {
+	if idx == nil || idx.db == nil {
+		return domain.GraphStatus{}, Startupf("индекс не открыт")
+	}
+	stored, err := idx.cardHashes()
+	if err != nil {
+		return domain.GraphStatus{}, err
+	}
+	status := domain.GraphStatus{
+		Built:     len(stored) > 0,
+		IndexHash: cardSetHash(stored),
+	}
+	if idx.tasksDir == "" {
+		return status, nil
+	}
+	source, err := dirCardHashes(idx.tasksDir)
+	if err != nil {
+		return status, err
+	}
+	status.SourceHash = cardSetHash(source)
+	return status, nil
+}
+
+// cardSetHash builds a stable digest over id and raw-text hash pairs. Sorting
+// by id makes the digest independent of SQLite row order and directory order.
+func cardSetHash(hashes map[string]string) string {
+	ids := make([]string, 0, len(hashes))
+	for id := range hashes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	h := sha256.New()
+	for _, id := range ids {
+		h.Write([]byte(id))
+		h.Write([]byte(":"))
+		h.Write([]byte(hashes[id]))
+		h.Write([]byte("\n"))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// dirCardHashes reads the markdown cards in tasksDir the same way RebuildDir
+// does: directories and non-markdown files are ignored and the id comes from
+// the file name. A name with no supported id falls back to the file name,
+// which is the id ParseCard assigns to such cards.
+func dirCardHashes(tasksDir string) (map[string]string, error) {
+	entries, err := os.ReadDir(tasksDir)
+	if err != nil {
+		return nil, Startupf("каталог карточек %s недоступен: %v", tasksDir, err)
+	}
+	out := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		data, err := fileAdapter.ReadFile(filepath.Join(tasksDir, e.Name()))
+		if err != nil {
+			return nil, Startupf("не прочитана карточка %s: %v", e.Name(), err)
+		}
+		id := cardIDFromName(e.Name())
+		if id == "" {
+			id = strings.TrimSuffix(e.Name(), ".md")
+		}
+		out[id] = sha256sum(string(data))
+	}
+	return out, nil
 }
 
 // sha256sum возвращает шестнадцатеричный хеш исходного текста карточки.
