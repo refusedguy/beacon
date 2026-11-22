@@ -228,7 +228,8 @@ func TestGCObligationsSkipsCandidateChangedAfterPlan(t *testing.T) {
 			wantRevision: 1,
 		},
 		{
-			name: "watch becomes live again",
+			name:         "watch becomes live again",
+			wantRevision: 1,
 			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
 				w.Status = domain.StatusWatching
 				w.ClosedAt = time.Time{}
@@ -238,7 +239,8 @@ func TestGCObligationsSkipsCandidateChangedAfterPlan(t *testing.T) {
 			},
 		},
 		{
-			name: "watch close time moves",
+			name:         "watch close time moves",
+			wantRevision: 1,
 			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
 				w.ClosedAt = now.Add(-time.Hour)
 				if err := other.SaveWatch(w); err != nil {
@@ -264,8 +266,9 @@ func TestGCObligationsSkipsCandidateChangedAfterPlan(t *testing.T) {
 			},
 		},
 		{
-			name:    "missing watch appears",
-			missing: true,
+			name:         "missing watch appears",
+			missing:      true,
+			wantRevision: 1,
 			interfere: func(t *testing.T, other *DB, w domain.Watch, o domain.Obligation) {
 				w.Status = domain.StatusWatching
 				w.ClosedAt = time.Time{}
