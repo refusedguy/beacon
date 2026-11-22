@@ -67,6 +67,33 @@ Baseline снят поиском по явным каталогам и живы�
 - `PreflightGuard` в `internal/infra/github/points.go:433`, методы `Check` и `Send` в `:441` и `:458`, читают живую квоту и отказывают при `quota_exhausted` и `quota_unknown`.
 - Правило HD-011 уже реализовано в `.opencode/plugins/beacon-bridge.js` функцией `checkFetchBeforeWorktree`. В Go-пути `cmd/beacon/agents.go:1003` оно не подключено. Это wiring, а не новая проверка.
 
+## Решение и владельцы чисел
+
+Карточка AUTOSP-12 сохраняет выводы аудита в проверяемом виде. Ниже зафиксированы решения ADR 0306 и 0307 и владельцы чисел, на которых эти решения основаны. Каждое число приведено вместе с источником, как требует `AGENTS.md:19-27`: решение принимается после измерения или со ссылкой на уже снятый замер.
+
+### Владельцы чисел
+
+| Число | Что обозначает | Владелец | Источник |
+| --- | --- | --- | --- |
+| 4 | `DefaultSlotsTotal`, бюджет слотов по умолчанию | `internal/domain/orchestrator.go:17` | константа `const DefaultSlotsTotal = 4` |
+| 30 | период `ReconcileLoop` по умолчанию, секунды | `GLOSSARY.md:52` | определение `ReconcileLoop` в глоссарии |
+| 2.3.2 | версия сервера OpenCode | живой `GET /openapi.json` | раздел «Живой контракт OpenCode» выше |
+| 0 | совпадений по `auto-spawn`, вызовов `Burn` вне тестов, раннеров Gemini, поля `prompt_async` | `rg` по `cmd` и `internal` плюс живой OpenAPI | раздел «Метод и baseline» выше |
+| 12 | число находок и карточек пакета | этот отчёт, «Таблица находок» | AUTOSP-01 ... AUTOSP-12 |
+
+Сверка с исходниками на `origin/main`: константа `DefaultSlotsTotal = 4` стоит в `internal/domain/orchestrator.go:17`, фраза про 30 секунд стоит в `GLOSSARY.md:52`. Числа 2.3.2 и 0 получены с живого API и поиском по явным каталогам, поэтому их владельцем остаётся этот отчёт, а не конкретная строка кода. Если код в ветках AUTOSP-01 или AUTOSP-04 сдвинет указанные file:line, таблицу нужно пересверить до закрытия карточки.
+
+### Решения ADR
+
+- ADR 0306, «Автоспавн в цикле Beacon по сигналу завершения волны». Измерение: поиск по `cmd` и `internal` дал 0 совпадений по `auto-spawn`, `SlotLedger.Burn` не вызывается рабочим кодом. Решение: порт `AutoSpawner` в `ReconcilePass`, флаг `--auto-spawn` в `beacon up`, выбор карточки через индекс и граф, проход гейтов и связь cardID с watchID до запуска раннера. Источник измерения: раздел «Метод и baseline» и находки AUTOSP-04, AUTOSP-05, AUTOSP-07 этой таблицы.
+- ADR 0307, «Полная проверка MergePolicy в cibridge до авто-мержа». Измерение: `internal/infra/cibridge/verdict_applier.go:106-109` проверяет только `MergePolicy.AutoMerge`, поля `RequireApproval`, `WaitFor` и `WaitForMain` описаны в `internal/domain/types.go:244-249`. Решение: проверять все условия до вызова `applyMerge` и удерживать PR на `wait`, если резолвер отсутствует. Источник измерения: находка AUTOSP-01.
+
+### Проверка связей
+
+- Каждая из 12 находок в таблице выше имеет ссылку на карточку AUTOSP в колонке «Карточка».
+- Все 12 карточек `docs/research/audit-01-batch.json` упоминают этот отчёт в своём описании, а общий `source_reports` указывает на `docs/research/audit-01-autospawn.md`.
+- Все 12 значений `facts` в `docs/research/audit-01-batch.json` имеют непустой `source`. Числа 4, 30, 2.3.2 и 0 разнесены по владельцам в таблице выше.
+
 ## Пакет для batch-apply
 
 Файл `docs/research/audit-01-batch.json` содержит 12 карточек, 2 ADR, 1 eval и 12 фактов. ID карточек идут от AUTOSP-01 до AUTOSP-12. owner_files داخل волны не пересекаются. Каждый путь существует на `origin/main` 80d3b0ce. Типы ограничены множеством task, doc и eval, фазы P0, P1 и P2, статусы только todo. Слои соблюдены: файлы `cmd` остаются в `cmd`, файлы `internal` остаются в `internal`, импорт `cmd` в `internal/tui` не вводится.
