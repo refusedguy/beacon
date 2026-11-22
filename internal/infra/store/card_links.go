@@ -109,6 +109,22 @@ func (d *DB) Link(cardID, watchID string, pr int) (LinkResult, error) {
 	return out, nil
 }
 
+// LinkCardWatch stores a link from the cardID returned by task claim and the
+// watchID returned by watch_pr. Both identifiers come from those responses,
+// so a headless session whose sessionID differs from the agent id in the card
+// still links the right card. LinkCardWatch checks both identifiers before it
+// delegates to Link, which keeps one row per card even when callers race. The
+// CardIDForAgent lookup stays as the fallback at the CLI boundary.
+func (d *DB) LinkCardWatch(cardID, watchID string, pr int) (LinkResult, error) {
+	if err := validateCardLinkID(cardID); err != nil {
+		return LinkResult{}, err
+	}
+	if strings.TrimSpace(watchID) == "" {
+		return LinkResult{}, domain.NewAppError(domain.CodeInvalidInput, "store: card link: empty watch id")
+	}
+	return d.Link(cardID, watchID, pr)
+}
+
 // Unlink removes the link for one card. A card with no link is a no-op. The
 // delete goes through the single writer, so a concurrent Link either happens
 // first and is removed, or happens after and remains as the only row.
