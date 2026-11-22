@@ -15,6 +15,7 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 type t06Call struct {
@@ -177,25 +178,26 @@ func TestRegistryDispatchUsesSameTable(t *testing.T) {
 
 func TestT06BadInputWritesUsageToStderr(t *testing.T) {
 	cases := []struct {
-		name    string
-		args    []string
-		wantErr string
+		name     string
+		args     []string
+		wantErr  string
+		wantCode int
 	}{
-		{"нет аргументов", nil, "Использование:"},
-		{"неизвестная подкоманда", []string{"nope"}, "неизвестная подкоманда"},
-		{"неизвестный флаг list", []string{"list", "--bogus"}, "flag provided but not defined"},
-		{"неизвестный формат", []string{"list", "--format", "yaml"}, "неизвестный формат"},
-		{"лишний аргумент", []string{"what", "build", "extra"}, "нужна одна команда"},
-		{"неизвестная команда what", []string{"what", "nope"}, "неизвестная команда"},
-		{"неизвестный флаг build", []string{"build", "--bogus"}, "flag provided but not defined"},
-		{"неизвестный флаг doctor", []string{"doctor", "--bogus"}, "flag provided but not defined"},
+		{"нет аргументов", nil, "Использование:", taskstore.ExitStartup},
+		{"неизвестная подкоманда", []string{"nope"}, "неизвестная подкоманда", taskstore.ExitStartup},
+		{"неизвестный флаг list", []string{"list", "--bogus"}, "flag provided but not defined", taskstore.ExitValidation},
+		{"неизвестный формат", []string{"list", "--format", "yaml"}, "неизвестный формат", taskstore.ExitValidation},
+		{"лишний аргумент", []string{"what", "build", "extra"}, "нужна одна команда", taskstore.ExitValidation},
+		{"неизвестная команда what", []string{"what", "nope"}, "неизвестная команда", taskstore.ExitValidation},
+		{"неизвестный флаг build", []string{"build", "--bogus"}, "flag provided but not defined", taskstore.ExitStartup},
+		{"неизвестный флаг doctor", []string{"doctor", "--bogus"}, "flag provided but not defined", taskstore.ExitStartup},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c, out, errOut, _ := t06NewCLI(t, t06NoChild(t))
-			if code := c.Run(tc.args); code != 2 {
-				t.Fatalf("код выхода %d, ожидался 2", code)
+			if code := c.Run(tc.args); code != tc.wantCode {
+				t.Fatalf("код выхода %d, ожидался %d", code, tc.wantCode)
 			}
 			if out.Len() != 0 {
 				t.Fatalf("stdout не пустой: %q", out.String())

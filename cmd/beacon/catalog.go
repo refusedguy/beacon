@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+
+	"github.com/refusedguy/beacon/internal/infra/taskstore"
 )
 
 // commandRunner is the common signature every dispatch target adapts to. A
@@ -123,16 +125,16 @@ func runList(args []string, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	format := fs.String("format", "table", "формат вывода")
 	if !parseFlags("list", args, errOut, fs) {
-		return 2
+		return taskstore.ExitValidation
 	}
 
 	switch *format {
 	case "json":
 		if err := json.NewEncoder(out).Encode(commands()); err != nil {
 			fmt.Fprintf(errOut, "beacon list: %v\n", err)
-			return 2
+			return taskstore.ExitStartup
 		}
-		return 0
+		return taskstore.ExitOK
 	case "table":
 		w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "NAME\tSUMMARY\tUSAGE")
@@ -140,11 +142,11 @@ func runList(args []string, out, errOut io.Writer) int {
 			fmt.Fprintf(w, "%s\t%s\t%s\n", c.Name, c.Summary, c.Usage)
 		}
 		_ = w.Flush()
-		return 0
+		return taskstore.ExitOK
 	default:
 		fmt.Fprintf(errOut, "beacon list: неизвестный формат %q, ожидается table или json\n", *format)
 		writeUsage(errOut)
-		return 2
+		return taskstore.ExitValidation
 	}
 }
 
@@ -155,24 +157,24 @@ func runWhat(args []string, out, errOut io.Writer) int {
 	err := fs.Parse(args)
 	if errors.Is(err, flag.ErrHelp) {
 		writeCommandHelp(out, "what")
-		return 0
+		return taskstore.ExitOK
 	}
 	if err != nil {
 		writeUsage(errOut)
-		return 2
+		return taskstore.ExitValidation
 	}
 	if fs.NArg() != 1 {
 		fmt.Fprintln(errOut, "beacon what: нужна одна команда")
 		writeUsage(errOut)
-		return 2
+		return taskstore.ExitValidation
 	}
 
 	name := fs.Arg(0)
 	if writeCommandHelp(out, name) {
-		return 0
+		return taskstore.ExitOK
 	}
 
 	fmt.Fprintf(errOut, "beacon what: неизвестная команда %q\n", name)
 	writeUsage(errOut)
-	return 2
+	return taskstore.ExitValidation
 }
