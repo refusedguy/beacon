@@ -657,13 +657,13 @@ func TestGCCompactDoubleDryRunDoesNotChangeFiles(t *testing.T) {
 	gcCompactSeams(t, commits, "hash-4", &applied)
 
 	outs := make([]string, 0, 2)
-	c := &CLI{out: &bytes.Buffer{}, errOut: &bytes.Buffer{}}
 	for i := 0; i < 2; i++ {
-		c.out.Reset()
+		out, errOut := &bytes.Buffer{}, &bytes.Buffer{}
+		c := &CLI{out: out, errOut: errOut}
 		if code := runGCCompact(c, []string{"--cutoff", "2026-11-03T00:00:00Z", "--format", "json"}); code != 0 {
-			t.Fatalf("dry run %d code = %d, stderr = %s", i, code, c.errOut.String())
+			t.Fatalf("dry run %d code = %d, stderr = %s", i, code, errOut.String())
 		}
-		outs = append(outs, c.out.String())
+		outs = append(outs, out.String())
 	}
 	if applied != 0 {
 		t.Fatalf("dry run called apply %d times", applied)
