@@ -73,6 +73,47 @@ func TestServerLogRedactsSecrets(t *testing.T) {
 	}
 }
 
+// TestCLILogRedactsSecretsAndRestrictsMode proves a short command's log applies
+// the server filter and is readable only by its owner.
+func TestCLILogRedactsSecretsAndRestrictsMode(t *testing.T) {
+	run, err := OpenCLILog(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenCLILog: %v", err)
+	}
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	if _, err := run.Writer().Write([]byte("token " + secret + "\n")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := run.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	data, err := os.ReadFile(run.Path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if bytes.Contains(data, []byte(secret)) {
+		t.Errorf("token reached %s: %s", run.Path, data)
+	}
+	if !bytes.Contains(data, []byte("[REDACTED]")) {
+		t.Errorf("no redaction marker in CLI log: %s", data)
+	}
+	info, err := os.Stat(run.Path)
+	if err != nil {
+		t.Fatalf("stat log: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("log mode = %o, want 600", got)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(run.Path))
+	if err != nil {
+		t.Fatalf("stat logs dir: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Errorf("logs dir mode = %o, want 700", got)
+	}
+}
+
 func TestTextHandlerIsReadableAndKeepsAttributes(t *testing.T) {
 	buf := new(bytes.Buffer)
 	rec := NewRecorder(NewLogger("text", LevelInfo, buf), NewMetrics())
