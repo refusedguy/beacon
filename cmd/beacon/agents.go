@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/opencode"
+	wtinfra "github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 // agentsServiceHint is printed when the background OpenCode service has not
@@ -949,6 +950,29 @@ func saveRepoWorktrees(st repoWorktreeState) error {
 	return repoWorktreeWriteFile(path, append(data, '\n'), 0o600)
 }
 
+// bindingAgentID is the identity written to a worktree marker. BEACON_AGENT is
+// the same source runTaskTake uses; the task ID is the fallback for callers
+// that bind a worktree before claiming a card.
+func bindingAgentID(taskID string) string {
+	if id := strings.TrimSpace(os.Getenv("BEACON_AGENT")); id != "" {
+		return id
+	}
+	return taskID
+}
+
+// touchBindingMarker records that an agent is using a bound worktree. The
+// marker lives in Beacon state beside the registry, so the collector can read
+// it without trusting the registry or scanning worktree directories. A touch
+// creates the marker on first use and refreshes its timestamp afterwards.
+func touchBindingMarker(worktreeDir, agentID string) error {
+	store, err := stateDir()
+	if err != nil {
+		return err
+	}
+	_, err = wtinfra.TouchMarker(store, worktreeDir, agentID, time.Now().UTC())
+	return err
+}
+
 // findRepoWorktree returns the binding for a task/repo pair, if any.
 func findRepoWorktree(st repoWorktreeState, taskID, repo string) (repoWorktree, bool) {
 	for _, b := range st.Bindings {
@@ -999,6 +1023,9 @@ func (c *CLI) bindRepoWorktree(taskID, repo, worktree string) (repoWorktree, err
 		return repoWorktree{}, err
 	}
 	if b, ok := findRepoWorktree(st, taskID, repo); ok {
+		if err := touchBindingMarker(b.Worktree, bindingAgentID(taskID)); err != nil {
+			return repoWorktree{}, err
+		}
 		return b, nil
 	}
 
@@ -1033,6 +1060,9 @@ func (c *CLI) bindRepoWorktree(taskID, repo, worktree string) (repoWorktree, err
 	if err := saveRepoWorktrees(st); err != nil {
 		return repoWorktree{}, err
 	}
+	if err := touchBindingMarker(worktree, bindingAgentID(taskID)); err != nil {
+		return repoWorktree{}, err
+	}
 	return b, nil
 }
 
@@ -1050,6 +1080,9 @@ func updateRepoWorktree(taskID, repo string, fn func(*repoWorktree) error) (repo
 				return repoWorktree{}, err
 			}
 			if err := saveRepoWorktrees(st); err != nil {
+				return repoWorktree{}, err
+			}
+			if err := touchBindingMarker(st.Bindings[i].Worktree, bindingAgentID(taskID)); err != nil {
 				return repoWorktree{}, err
 			}
 			return st.Bindings[i], nil
