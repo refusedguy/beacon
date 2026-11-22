@@ -32,6 +32,11 @@ type DaemonDueSchedule struct {
 	ID       string
 	NextRun  time.Time
 	Interval time.Duration
+	// NextCron is supplied by the adapter for cron rows. It returns the next
+	// firing strictly after now in the schedule's timezone. When set, it wins
+	// over interval arithmetic: a fixed wall-clock time is kept and missed
+	// intervals collapse into one future run.
+	NextCron func(now time.Time) (time.Time, error)
 }
 
 // DaemonUnit is one ordered line of the per-unit report. Status is the outcome
@@ -74,9 +79,12 @@ type DaemonSchedules interface {
 // from observe.Current, so a caller that wires nothing keeps the no-op default
 // (T3.394).
 type DaemonPorts struct {
-	CheckAll    func(ctx context.Context) error
-	Subscribe   func(ctx context.Context) error
-	Schedules   DaemonSchedules
+	CheckAll  func(ctx context.Context) error
+	Subscribe func(ctx context.Context) error
+	Schedules DaemonSchedules
+	// Intent records one durable intention for a schedule that is about to
+	// fire, before the row's next_run is advanced. A nil port records nothing.
+	Intent      func(ctx context.Context, schedule DaemonDueSchedule, at time.Time) error
 	Orchestrate func(ctx context.Context, waker Waker) error
 	Summary     func(ctx context.Context) (Workload, error)
 	UnitReport  func(ctx context.Context) ([]DaemonUnit, error)
@@ -131,7 +139,7 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 			}
 		}
 		if ports.Schedules != nil {
-			if err := triggerDueSchedules(passCtx, ports.Schedules, time.Now()); err != nil {
+			if err := triggerDueSchedules(passCtx, ports.Schedules, ports.Intent, time.Now()); err != nil {
 				logf("daemon: schedules: %v", err)
 			}
 		}
@@ -219,19 +227,41 @@ func daemonNextRun(nextRun time.Time, interval time.Duration, now time.Time) (ti
 	return nextRun.Add(elapsed/interval*interval + interval), true
 }
 
+// daemonNextRunWith resolves the next run for one due row. A cron row carries a
+// NextCron callback that knows the expression and its timezone; its result is
+// handed to the same collapse rule so a restart after several missed periods
+// produces one future firing. Rows without the callback use interval arithmetic.
+func daemonNextRunWith(s DaemonDueSchedule, now time.Time) (time.Time, bool) {
+	if s.NextCron == nil {
+		return daemonNextRun(s.NextRun, s.Interval, now)
+	}
+	next, err := s.NextCron(now)
+	if err != nil || next.IsZero() || !next.After(now) {
+		return time.Time{}, false
+	}
+	return next, true
+}
+
 // triggerDueSchedules acknowledges every due row once. A failed ListDue or
 // MarkTriggered is returned to the caller, which logs it and keeps the rest of
-// the pass. One bad row does not stop the remaining rows from being marked.
-func triggerDueSchedules(ctx context.Context, port DaemonSchedules, now time.Time) error {
+// the pass. One bad row does not stop the remaining rows from being marked. The
+// intent port runs before MarkTriggered, so an acknowledged row always has a
+// matching durable intention.
+func triggerDueSchedules(ctx context.Context, port DaemonSchedules, intent func(context.Context, DaemonDueSchedule, time.Time) error, now time.Time) error {
 	due, err := port.ListDue(ctx, now)
 	if err != nil {
 		return err
 	}
 	var firstErr error
 	for _, s := range due {
-		next, ok := daemonNextRun(s.NextRun, s.Interval, now)
+		next, ok := daemonNextRunWith(s, now)
 		if !ok {
 			continue
+		}
+		if intent != nil {
+			if err := intent(ctx, s, next); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 		if err := port.MarkTriggered(ctx, s.ID, next); err != nil && firstErr == nil {
 			firstErr = err

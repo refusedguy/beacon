@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/infra/server"
 )
@@ -427,5 +428,149 @@ func TestSchedulerHandlerRejectsEmptyToken(t *testing.T) {
 	}
 	if _, err := server.NewSchedulerHandler(svc, "  "); err == nil {
 		t.Fatal("empty token accepted")
+	}
+}
+
+// A five-field expression fires at a fixed wall-clock time. "0 9 * * *" at
+// ten in the morning resolves to nine the next day, not the next minute.
+func TestNextCronRunFixedTime(t *testing.T) {
+	at := time.Date(2024, time.January, 2, 10, 0, 0, 0, time.UTC)
+	got, err := server.NextCronRun("0 9 * * *", "UTC", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2024, time.January, 3, 9, 0, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+	if got.Hour() != 9 || got.Minute() != 0 {
+		t.Fatalf("fixed time not kept: %v", got)
+	}
+}
+
+// Timezone is part of the firing time: the same expression in Tokyo resolves
+// to a different instant than in UTC.
+func TestNextCronRunTimezone(t *testing.T) {
+	at := time.Date(2024, time.January, 1, 0, 0, 0, 0, time.UTC)
+	got, err := server.NextCronRun("30 8 * * *", "Asia/Tokyo", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2024, time.January, 1, 23, 30, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+	if got.Location().String() != "Asia/Tokyo" || got.Hour() != 8 || got.Minute() != 30 {
+		t.Fatalf("local wall clock not kept: %v", got)
+	}
+}
+
+// Lists, ranges and steps all narrow the set of matching minutes.
+func TestNextCronRunStepsAndRanges(t *testing.T) {
+	at := time.Date(2024, time.January, 5, 17, 45, 0, 0, time.UTC) // Friday
+	got, err := server.NextCronRun("*/15 9-17 * * 1-5", "UTC", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2024, time.January, 8, 9, 0, 0, 0, time.UTC) // next Monday
+	if !got.Equal(want) {
+		t.Fatalf("next run = %v, want %v", got, want)
+	}
+}
+
+// Values outside a field's range, wrong field counts and non-numeric tokens are
+// refused before a schedule is persisted.
+func TestNextCronRunRejectsInvalidExpression(t *testing.T) {
+	cases := []string{
+		"0 9 * *",
+		"60 9 * * *",
+		"0 24 * * *",
+		"0 9 0 * *",
+		"0 9 * 13 *",
+		"0 9 * * 8",
+		"*/0 * * * *",
+		"0 9 * * MON",
+	}
+	for _, expr := range cases {
+		t.Run(expr, func(t *testing.T) {
+			if _, err := server.NextCronRun(expr, "UTC", time.Now()); err == nil {
+				t.Fatalf("invalid cron %q accepted", expr)
+			}
+		})
+	}
+}
+
+// Creation uses the parsed expression, so NextRunAt lands on the fixed hour
+// and minute in the requested zone. The existing fixture only checked that the
+// value was non-zero.
+func TestScheduleCreateCronUsesFixedTime(t *testing.T) {
+	got, err := newService(t, newMockStore()).Schedule(context.Background(), server.ScheduleCreate{
+		TaskID: "T", Kind: server.KindCron, Expr: "0 9 * * *", Timezone: "UTC",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NextRunAt.IsZero() || got.NextRunAt.Hour() != 9 || got.NextRunAt.Minute() != 0 {
+		t.Fatalf("cron NextRunAt = %v, want 09:00 UTC", got.NextRunAt)
+	}
+	if got.NextRunAt.Location().String() != "UTC" {
+		t.Fatalf("cron timezone = %s", got.NextRunAt.Location())
+	}
+}
+
+func TestScheduleCreateRejectsInvalidCron(t *testing.T) {
+	svc := newService(t, newMockStore())
+	_, err := svc.Schedule(context.Background(), server.ScheduleCreate{
+		TaskID: "T", Kind: server.KindCron, Expr: "61 9 * * *", Timezone: "UTC",
+	})
+	if !server.IsValidation(err) {
+		t.Fatalf("invalid cron error = %v, want ValidationError", err)
+	}
+}
+
+// intentOutbox is the outbox port used by the creation test. It records one
+// row per key and refuses a second commit for the same key.
+type intentOutbox struct {
+	commits map[string]bool
+	kind    string
+	calls   int
+	payload []byte
+}
+
+func (o *intentOutbox) Commit(_ context.Context, key, kind string, payload []byte) (bool, error) {
+	if o.commits == nil {
+		o.commits = make(map[string]bool)
+	}
+	if o.commits[key] {
+		return false, nil
+	}
+	o.commits[key] = true
+	o.kind = kind
+	o.payload = append([]byte(nil), payload...)
+	o.calls++
+	return true, nil
+}
+
+func TestScheduleCreateRecordsIntentOutbox(t *testing.T) {
+	outbox := &intentOutbox{}
+	svc, err := server.NewScheduleService(newMockStore(), outbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.Schedule(context.Background(), server.ScheduleCreate{
+		ID: "s1", TaskID: "T", Kind: server.KindCron, Expr: "0 9 * * *", Timezone: "UTC",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbox.calls != 1 || outbox.kind != server.ScheduleIntentKind {
+		t.Fatalf("outbox calls = %d, kind = %q", outbox.calls, outbox.kind)
+	}
+	wantKey := server.ScheduleIntentKind + ":" + got.ID
+	if !outbox.commits[wantKey] {
+		t.Fatalf("outbox key %q missing: %+v", wantKey, outbox.commits)
+	}
+	if !strings.Contains(string(outbox.payload), got.ID) {
+		t.Fatalf("payload = %s, want schedule %s", outbox.payload, got.ID)
 	}
 }
