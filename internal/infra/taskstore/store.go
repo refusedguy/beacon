@@ -80,17 +80,23 @@ type Card struct {
 	ClosedBy    string
 	ClosedAt    string
 	Blocker     string
-	Title       string
-	Goal        string
-	Context     string
-	Steps       string
-	Check       string
-	Acceptance  string
-	Extra       map[string]string
-	Path        string
-	Raw         string
-	Group       int
-	Number      int
+	// Compaction metadata. These fields are optional in the card markdown and
+	// are written by CompactCard. They stay out of requiredFields so existing
+	// cards parse unchanged. Level 0 or empty means the card is not compacted.
+	CompactLevel  string
+	CompactedAt   string
+	CompactCommit string
+	Title         string
+	Goal          string
+	Context       string
+	Steps         string
+	Check         string
+	Acceptance    string
+	Extra         map[string]string
+	Path          string
+	Raw           string
+	Group         int
+	Number        int
 }
 
 var (
@@ -237,6 +243,9 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	card.ClosedBy = fields["Закрыл"]
 	card.ClosedAt = fields["Время закрытия"]
 	card.Blocker = fields["Блокировщик"]
+	card.CompactLevel = fields["Уровень сжатия"]
+	card.CompactedAt = fields["Время сжатия"]
+	card.CompactCommit = fields["Хеш коммита"]
 	card.OwnerFiles = splitList(fields["Владелец файлов"])
 	card.Dependencies = splitList(fields["Зависимости"])
 	card.Goal = fields["Цель"]
@@ -1420,4 +1429,320 @@ func ParseLinkage(message string) Linkage {
 func RequiresLinkage(subject string) bool {
 	m := commitTypeRE.FindStringSubmatch(strings.TrimSpace(subject))
 	return m != nil && (m[1] == "feat" || m[1] == "fix")
+}
+
+// CB-05. Обратимое сжатие закрытых карточек. Снапшот исходного текста пишется
+// до публикации нового текста карточки, поэтому при любой ошибке записи
+// карточка остаётся прежней, а restore возвращает побайтово исходный текст.
+
+// Уровни сжатия. Уровень 2 требует уже выполненного уровня 1.
+const (
+	CompactLevelNone = "0"
+	CompactLevel1    = "1"
+	CompactLevel2    = "2"
+)
+
+// DefaultCompactMinAgeDays это порог возраста закрытой карточки по умолчанию.
+const DefaultCompactMinAgeDays = 30
+
+// compactMarker подставляется в поля, которые не несут саммари. Одно поле
+// несёт весь текст сжатия, остальные три помечаются этим коротким маркером.
+const compactMarker = "-"
+
+// CompactableFields это четыре текстовых поля, размер которых сравнивается при
+// сжатии. Заголовок, ID, статус, зависимости и метаданные не изменяются.
+var CompactableFields = []string{"Контекст", "Шаги", "Проверка", "Приёмка"}
+
+var compactFieldOrder = []string{
+	"Уровень сжатия", "Время сжатия", "Хеш коммита",
+}
+
+// CompactOptions задаёт параметры операции сжатия. Now и MinAgeDays нужны
+// тестам: нулевое Now значит текущее время, неположительное MinAgeDays равно
+// порог по умолчанию.
+type CompactOptions struct {
+	Level      string
+	Summary    string
+	CommitHash string
+	Now        time.Time
+	MinAgeDays int
+}
+
+// CompactResult считает размер исходных четырёх полей и размер после сжатия.
+type CompactResult struct {
+	OriginalBytes int
+	CompactBytes  int
+	SnapshotPath  string
+}
+
+// CardSnapshot хранит исходный текст карточки до перезаписи.
+type CardSnapshot struct {
+	ID        string `json:"id"`
+	Level     string `json:"level"`
+	Raw       string `json:"raw"`
+	CreatedAt string `json:"created_at"`
+	Commit    string `json:"commit,omitempty"`
+}
+
+// CompactRefusalComment даёт текст отказа, когда сжатие не уменьшает размер.
+func CompactRefusalComment(originalBytes, compactBytes int) string {
+	return fmt.Sprintf("сжатие отклонено: новый текст %d байт не короче исходного %d байт", compactBytes, originalBytes)
+}
+
+// CheckCompactEligibility проверяет, что карточку можно сжать. Требования:
+// закрытый статус, заполненное Время закрытия, порог по дням и нужный уровень.
+func CheckCompactEligibility(card Card, o CompactOptions) error {
+	if !IsCloseStatus(card.Status) {
+		return Validationf("beacon task compact: карточка %s не закрыта (Статус: %s)", card.ID, card.Status)
+	}
+	closedRaw := strings.TrimSpace(card.ClosedAt)
+	if closedRaw == "" {
+		return Validationf("beacon task compact: у карточки %s нет поля Время закрытия", card.ID)
+	}
+	closed, err := time.Parse(time.RFC3339, closedRaw)
+	if err != nil {
+		return Validationf("beacon task compact: неверное Время закрытия у %s: %v", card.ID, err)
+	}
+	now := o.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	minDays := o.MinAgeDays
+	if minDays <= 0 {
+		minDays = DefaultCompactMinAgeDays
+	}
+	if now.Sub(closed) < time.Duration(minDays)*24*time.Hour {
+		return Validationf("beacon task compact: карточка %s закрыта менее %d дней назад", card.ID, minDays)
+	}
+	switch o.Level {
+	case CompactLevel1:
+	case CompactLevel2:
+		if card.CompactLevel != CompactLevel1 {
+			return Validationf("beacon task compact: уровень 2 требует сначала уровень 1 (текущий %q)", card.CompactLevel)
+		}
+	default:
+		return Validationf("beacon task compact: неверный уровень сжатия %q", o.Level)
+	}
+	return nil
+}
+
+// extractFields собирает значения полей верхнего уровня без I/O.
+func extractFields(raw string) map[string]string {
+	fields := make(map[string]string)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		fm := fieldRE.FindStringSubmatch(line)
+		if fm != nil {
+			fields[fm[1]] = strings.TrimSpace(fm[2])
+		}
+	}
+	return fields
+}
+
+// setManagedFields заменяет значения управляемых полей на месте. Строки с
+// пустым значением удаляются, отсутствующие поля вставляются перед первым
+// разделом «## ». Порядок строк и переводы строк вне полей сохраняются.
+func setManagedFields(raw string, order []string, values map[string]string) string {
+	cr := ""
+	if strings.Contains(raw, "\r\n") {
+		cr = "\r"
+	}
+	lines := strings.Split(raw, "\n")
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(lines)+len(order))
+	insertAt := -1
+	for _, line := range lines {
+		if insertAt < 0 && strings.HasPrefix(line, "## ") {
+			insertAt = len(out)
+		}
+		lineCR := ""
+		body := line
+		if strings.HasSuffix(body, "\r") {
+			lineCR = "\r"
+			body = strings.TrimSuffix(body, "\r")
+		}
+		colon := strings.IndexByte(body, ':')
+		if colon < 0 {
+			out = append(out, line)
+			continue
+		}
+		key := strings.TrimSpace(body[:colon])
+		value, managed := values[key]
+		if !managed {
+			out = append(out, line)
+			continue
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if value == "" {
+			continue
+		}
+		out = append(out, key+": "+value+lineCR)
+	}
+	missing := make([]string, 0, len(order))
+	for _, key := range order {
+		if !seen[key] && values[key] != "" {
+			missing = append(missing, key+": "+values[key]+cr)
+		}
+	}
+	if len(missing) > 0 {
+		if insertAt < 0 {
+			insertAt = len(out)
+		}
+		tail := append([]string(nil), out[insertAt:]...)
+		out = append(out[:insertAt:insertAt], missing...)
+		out = append(out, tail...)
+	}
+	return strings.Join(out, "\n")
+}
+
+// ApplyCompact строит новый текст карточки без I/O. Отказ из-за размера
+// возвращает исходный текст и ошибку: вызывающий не публикует изменение.
+func ApplyCompact(raw string, o CompactOptions) (string, CompactResult, error) {
+	res := CompactResult{}
+	fields := extractFields(raw)
+	for _, key := range CompactableFields {
+		res.OriginalBytes += len(fields[key])
+	}
+	summary := strings.TrimSpace(o.Summary)
+	if summary == "" {
+		return "", res, Validationf("beacon task compact: нужно непустое саммари (--summary)")
+	}
+	res.CompactBytes = len(summary)
+	for i := 1; i < len(CompactableFields); i++ {
+		res.CompactBytes += len(compactMarker)
+	}
+	if res.CompactBytes >= res.OriginalBytes {
+		return "", res, Validationf("beacon task compact: %s", CompactRefusalComment(res.OriginalBytes, res.CompactBytes))
+	}
+	when := o.Now
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	values := make(map[string]string, len(CompactableFields)+len(compactFieldOrder))
+	for i, key := range CompactableFields {
+		if i == 0 {
+			values[key] = summary
+		} else {
+			values[key] = compactMarker
+		}
+	}
+	values["Уровень сжатия"] = o.Level
+	values["Время сжатия"] = when.UTC().Format(time.RFC3339)
+	values["Хеш коммита"] = strings.TrimSpace(o.CommitHash)
+	newRaw := setManagedFields(raw, compactFieldOrder, values)
+	return newRaw, res, nil
+}
+
+const compactSnapshotDir = ".beacon-snapshots"
+
+// SnapshotPath возвращает путь снапшота карточки для заданного уровня.
+func SnapshotPath(tasksDir, id, level string) string {
+	return filepath.Join(tasksDir, compactSnapshotDir, id+"."+level+".json")
+}
+
+func writeSnapshotData(path string, snap CardSnapshot) error {
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return Startupf("не кодирован снапшот: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return Startupf("не создан каталог снапшотов: %v", err)
+	}
+	return atomicWrite(path, append(data, '\n'), 0600, nil)
+}
+
+// ReadSnapshot читает исходный текст карточки из снапшота уровня.
+func ReadSnapshot(tasksDir, id, level string) (string, error) {
+	path := SnapshotPath(tasksDir, id, level)
+	data, err := fileAdapter.ReadFile(path)
+	if err != nil {
+		return "", Startupf("не прочитан снапшот %s: %v", path, err)
+	}
+	var snap CardSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return "", Startupf("неверный снапшот %s: %v", path, err)
+	}
+	if snap.Raw == "" {
+		return "", Validationf("пустой снапшот %s", path)
+	}
+	return snap.Raw, nil
+}
+
+// CompactCard сжимает карточку. Снапшот пишется хуком beforePublish прямо
+// перед переименованием, поэтому ошибка архивации оставляет карточку нетронутой.
+func CompactCard(lockPath, projectRoot, cardPath string, o CompactOptions) (CompactResult, error) {
+	lock, err := AcquireLock(lockPath, projectRoot)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	defer lock.Release()
+
+	data, err := fileAdapter.ReadFile(cardPath)
+	if err != nil {
+		return CompactResult{}, Startupf("не прочитана карточка %s: %v", cardPath, err)
+	}
+	card, err := ParseCard(cardPath, data)
+	if err != nil {
+		return CompactResult{}, err
+	}
+	if err := CheckCompactEligibility(card, o); err != nil {
+		return CompactResult{}, err
+	}
+	newText, res, err := ApplyCompact(string(data), o)
+	if err != nil {
+		return res, err
+	}
+	when := o.Now
+	if when.IsZero() {
+		when = time.Now().UTC()
+	}
+	snap := CardSnapshot{
+		ID: card.ID, Level: o.Level, Raw: string(data),
+		CreatedAt: when.UTC().Format(time.RFC3339), Commit: strings.TrimSpace(o.CommitHash),
+	}
+	snapPath := SnapshotPath(filepath.Dir(cardPath), card.ID, o.Level)
+	if err := atomicWrite(cardPath, []byte(newText), 0644, func() error {
+		return writeSnapshotData(snapPath, snap)
+	}); err != nil {
+		return res, err
+	}
+	res.SnapshotPath = snapPath
+	return res, nil
+}
+
+// RestoreCard возвращает карточку текст из снапшота. Пустой level берёт уровень
+// из самой карточки. Возвращается использованный уровень.
+func RestoreCard(lockPath, projectRoot, cardPath, level string) (string, error) {
+	lock, err := AcquireLock(lockPath, projectRoot)
+	if err != nil {
+		return "", err
+	}
+	defer lock.Release()
+
+	data, err := fileAdapter.ReadFile(cardPath)
+	if err != nil {
+		return "", Startupf("не прочитана карточка %s: %v", cardPath, err)
+	}
+	card, err := ParseCard(cardPath, data)
+	if err != nil {
+		return "", err
+	}
+	use := strings.TrimSpace(level)
+	if use == "" {
+		use = card.CompactLevel
+	}
+	if use == "" || use == CompactLevelNone {
+		return "", Validationf("beacon task restore: карточка %s не сжата", card.ID)
+	}
+	raw, err := ReadSnapshot(filepath.Dir(cardPath), card.ID, use)
+	if err != nil {
+		return "", err
+	}
+	if err := AtomicWrite(cardPath, []byte(raw), 0644); err != nil {
+		return "", err
+	}
+	return use, nil
 }

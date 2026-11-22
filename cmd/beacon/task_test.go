@@ -1521,3 +1521,203 @@ func TestCompactDryRunAutoAndValidation(t *testing.T) {
 		}
 	}
 }
+
+// CB-05. Хранилище снапшотов и команда restore. Команда compact живёт в CB-06,
+// поэтому здесь проверяется API taskstore и возврат текста через restore.
+
+func cb05TestCfg(t *testing.T) (taskcli.Config, string) {
+	t.Helper()
+	root := t.TempDir()
+	tasksDir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(tasksDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := taskcli.Config{
+		TasksDir: tasksDir,
+		ADRDir:   filepath.Join(root, "docs", "adrs"),
+		StateDir: filepath.Join(root, "state"),
+		Root:     root,
+	}
+	return cfg, tasksDir
+}
+
+func cb05CardRaw(status, closedAt string, fieldLen int) string {
+	blob := strings.Repeat("x", fieldLen)
+	stamp := ""
+	if closedAt != "" {
+		stamp = "Время закрытия: " + closedAt + "\n"
+	}
+	return fmt.Sprintf("# CB.1. Old card\n"+
+		"Статус: %s\nФаза: P2\nТип: task\n"+
+		"Владелец файлов: net\nЗависимости: CB.2\nСсылка: net\n"+
+		"Цель: short goal\nКонтекст: %s\nШаги: %s\nПроверка: %s\nПриёмка: %s\n"+
+		"Агент: net\nВремя: net\n%s",
+		status, blob, blob, blob, blob, stamp)
+}
+
+func cb05WriteCard(t *testing.T, tasksDir, raw string) string {
+	t.Helper()
+	path := filepath.Join(tasksDir, "CB.1.md")
+	if err := os.WriteFile(path, []byte(raw), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func cb05Options(level, summary, commit string) taskstore.CompactOptions {
+	return taskstore.CompactOptions{
+		Level: level, Summary: summary, CommitHash: commit,
+		Now:        time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+		MinAgeDays: 30,
+	}
+}
+
+func TestCB05CompactStoreAndRestoreRoundTrip(t *testing.T) {
+	cfg, tasksDir := cb05TestCfg(t)
+	original := cb05CardRaw("done", "2026-01-01T00:00:00Z", 500)
+	path := cb05WriteCard(t, tasksDir, original)
+
+	res, err := taskstore.CompactCard(taskstore.TasksLockPath(tasksDir), cfg.Root, path,
+		cb05Options("1", "short", "deadbeef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OriginalBytes != 2000 || res.CompactBytes != 8 {
+		t.Fatalf("размеры: %+v", res)
+	}
+
+	compacted, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(compacted)
+	for _, want := range []string{"Уровень сжатия: 1", "Время сжатия: 2026-03-01T00:00:00Z", "Хеш коммита: deadbeef"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("нет метаданных %q: %s", want, text)
+		}
+	}
+	if !strings.Contains(text, "Контекст: short\n") || !strings.Contains(text, "Зависимости: CB.2\n") {
+		t.Fatalf("сжатие изменило поля или граф: %s", text)
+	}
+	if strings.Contains(text, "xxxxx") {
+		t.Fatalf("старый текст остался в карточке: %s", text)
+	}
+
+	snap, err := taskstore.ReadSnapshot(tasksDir, "CB.1", "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap != original {
+		t.Fatalf("снапшот не совпадает с оригиналом: %d против %d байт", len(snap), len(original))
+	}
+
+	var out, errOut bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "restore", "CB.1"}, &out, &errOut, cfg)
+	if code != 0 || errOut.Len() != 0 {
+		t.Fatalf("restore: код %d stderr %q", code, errOut.String())
+	}
+	restored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != original {
+		t.Fatalf("restore не вернул побайтово исходный текст: %d против %d", len(restored), len(original))
+	}
+}
+
+func TestCB05RefusalKeepsCard(t *testing.T) {
+	cfg, tasksDir := cb05TestCfg(t)
+	original := cb05CardRaw("done", "2026-01-01T00:00:00Z", 500)
+	path := cb05WriteCard(t, tasksDir, original)
+
+	_, err := taskstore.CompactCard(taskstore.TasksLockPath(tasksDir), cfg.Root, path,
+		cb05Options("1", strings.Repeat("b", 2100), ""))
+	if err == nil || !strings.Contains(err.Error(), "сжатие отклонено") {
+		t.Fatalf("ожидался отказ, получено %v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != original {
+		t.Fatal("карточка изменилась при отказе")
+	}
+	if _, err := os.Stat(taskstore.SnapshotPath(tasksDir, "CB.1", "1")); !os.IsNotExist(err) {
+		t.Fatalf("снапшот создан при отказе: %v", err)
+	}
+}
+
+func TestCB05Eligibility(t *testing.T) {
+	cases := []struct {
+		name   string
+		status string
+		closed string
+		level  string
+		want   string
+	}{
+		{"открытая", "todo", "2026-01-01T00:00:00Z", "1", "не закрыта"},
+		{"без времени закрытия", "done", "", "1", "Время закрытия"},
+		{"слишком свежая", "done", "2026-02-25T00:00:00Z", "1", "менее 30 дней"},
+		{"уровень 2 без уровня 1", "done", "2026-01-01T00:00:00Z", "2", "требует сначала уровень 1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, tasksDir := cb05TestCfg(t)
+			path := cb05WriteCard(t, tasksDir, cb05CardRaw(tc.status, tc.closed, 500))
+			_, err := taskstore.CompactCard(taskstore.TasksLockPath(tasksDir), cfg.Root, path,
+				cb05Options(tc.level, "short", ""))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ожидалось %q, получено %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestCB05Tier2AfterTier1(t *testing.T) {
+	cfg, tasksDir := cb05TestCfg(t)
+	original := cb05CardRaw("done", "2026-01-01T00:00:00Z", 500)
+	path := cb05WriteCard(t, tasksDir, original)
+
+	if _, err := taskstore.CompactCard(taskstore.TasksLockPath(tasksDir), cfg.Root, path,
+		cb05Options("1", "short", "")); err != nil {
+		t.Fatal(err)
+	}
+	afterTier1, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := taskstore.CompactCard(taskstore.TasksLockPath(tasksDir), cfg.Root, path,
+		cb05Options("2", "x", "")); err != nil {
+		t.Fatal(err)
+	}
+
+	snap, err := taskstore.ReadSnapshot(tasksDir, "CB.1", "2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap != string(afterTier1) {
+		t.Fatal("снапшот уровня 2 не хранит состояние после уровня 1")
+	}
+
+	var out, errOut bytes.Buffer
+	if code := TaskCommandWithConfig([]string{"task", "restore", "CB.1"}, &out, &errOut, cfg); code != 0 {
+		t.Fatalf("restore уровня 2: код %d stderr %q", code, errOut.String())
+	}
+	restored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(restored) != string(afterTier1) {
+		t.Fatal("restore уровня 2 не вернул состояние после уровня 1")
+	}
+	if code := TaskCommandWithConfig([]string{"task", "restore", "CB.1", "--level", "1"}, &out, &errOut, cfg); code != 0 {
+		t.Fatalf("restore уровня 1: код %d stderr %q", code, errOut.String())
+	}
+	final, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(final) != original {
+		t.Fatal("restore уровня 1 не вернул исходный текст")
+	}
+}

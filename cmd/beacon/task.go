@@ -72,6 +72,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskSchedule(args[1:], stdout, stderr, cfg)
 	case "compact":
 		return runTaskCompact(args[1:], stdout, stderr, cfg)
+	case "restore":
+		return runTaskRestore(args[1:], stdout, stderr, cfg)
 	default:
 		fmt.Fprintf(stderr, "неизвестная подкоманда task %q\n%s", args[0], taskUsage)
 		return taskstore.ExitValidation
@@ -81,7 +83,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
 	"               beacon task lease acquire|release|check [flags]\n" +
 	"               beacon task schedule [create|list|delete] [flags]\n" +
-	"               beacon task compact (--analyze|--apply|--auto) [--format json] [--id ID] [--summary FILE] [--dry-run]"
+	"               beacon task compact (--analyze|--apply|--auto) [--format json] [--id ID] [--summary FILE] [--dry-run]\n" +
+	"               beacon task restore <ID> [--level 1|2]"
 
 // whyEdgeKinds это ребра графа карточек из ADR 0045 п6.
 var whyEdgeKinds = []string{
@@ -178,6 +181,26 @@ func parseTaskArgs(argv []string, values, bools map[string]bool) (*parsedArgs, e
 func failTask(stderr io.Writer, err error) int {
 	fmt.Fprintln(stderr, err.Error())
 	return taskstore.Code(err)
+}
+
+// runTaskRestore возвращает карточку исходный текст из снапшота CB-05.
+// Пустой --level берёт уровень сжатия из самой карточки.
+func runTaskRestore(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"level": true}, nil)
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 1 || !taskstore.IsID(p.pos[0]) {
+		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки"))
+	}
+	id := p.pos[0]
+	cardPath := taskstore.CardPath(cfg.TasksDir, id)
+	level, err := taskstore.RestoreCard(taskstore.TasksLockPath(cfg.TasksDir), cfg.Root, cardPath, p.value("level"))
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintf(stdout, "%s restored from level %s snapshot\n", id, level)
+	return taskstore.ExitOK
 }
 
 func runTaskList(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
