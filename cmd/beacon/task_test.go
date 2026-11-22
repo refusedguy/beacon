@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/refusedguy/beacon/internal/app/taskcli"
 	"github.com/refusedguy/beacon/internal/infra/server"
@@ -1227,5 +1228,296 @@ func TestFileScheduleStorePersists(t *testing.T) {
 	got, err := storeB.Get(context.Background(), "s1")
 	if err != nil || got.ID != "s1" || got.TaskID != "BS.32" || !got.Enabled {
 		t.Fatalf("после перезапуска: %+v, %v", got, err)
+	}
+}
+
+// ---- CB-06: компактинг без ключа ----
+
+// writeCompactCard пишет валидную карточку с четырьмя длинными текстовыми
+// полями. closedAt пустое означает открытую карточку.
+func writeCompactCard(t *testing.T, dir, id, status, closedAt string) string {
+	t.Helper()
+	body := fmt.Sprintf(`# %s. Карточка для сжатия
+Тип: task
+Статус: %s
+Фаза: P2
+Владелец файлов: cmd/beacon/task.go
+Зависимости: нет
+Ссылка: ADR 0001
+Цель: Проверить компактинг
+Контекст: %s
+Шаги: %s
+Проверка: %s
+Приёмка: %s
+Агент: тест
+Время: 2026-01-01T00:00:00Z
+Время закрытия: %s
+`, id, status,
+		strings.Repeat("контекст ", 24),
+		strings.Repeat("шаг ", 24),
+		strings.Repeat("проверка ", 24),
+		strings.Repeat("приёмка ", 24),
+		closedAt)
+	path := filepath.Join(dir, id+".md")
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func compactTestConfig(root string) taskcli.Config {
+	return taskcli.Config{
+		TasksDir: filepath.Join(root, "docs", "tasks"),
+		ADRDir:   filepath.Join(root, "docs", "adrs"),
+		StateDir: filepath.Join(root, "state"),
+		Root:     root,
+	}
+}
+
+// withCompactNow фиксирует часы, чтобы порог по дням и время сжатия не
+// зависели от момента запуска теста.
+func withCompactNow(t *testing.T, tm time.Time) {
+	t.Helper()
+	prev := compactNow
+	compactNow = func() time.Time { return tm }
+	t.Cleanup(func() { compactNow = prev })
+}
+
+func TestCompactAnalyzeIsReadOnlyJSON(t *testing.T) {
+	withCompactNow(t, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
+	root := t.TempDir()
+	cfg := compactTestConfig(root)
+	if err := os.MkdirAll(cfg.TasksDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	writeCompactCard(t, cfg.TasksDir, "T1.1", "done", "2020-01-01T00:00:00Z")
+	openPath := writeCompactCard(t, cfg.TasksDir, "T1.2", "in_progress", "2020-01-01T00:00:00Z")
+	before, err := os.ReadFile(openPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "compact", "--analyze", "--format", "json"}, &stdout, &stderr, cfg)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("analyze: код %d stderr %q", code, stderr.String())
+	}
+	var candidates []compactCandidate
+	if err := json.Unmarshal(stdout.Bytes(), &candidates); err != nil {
+		t.Fatalf("analyze вернул не JSON: %v, вывод %q", err, stdout.String())
+	}
+	if len(candidates) != 1 || candidates[0].ID != "T1.1" {
+		t.Fatalf("кандидаты: %+v", candidates)
+	}
+	if candidates[0].SizeBytes <= 0 {
+		t.Fatalf("не посчитан размер полей: %+v", candidates[0])
+	}
+	after, err := os.ReadFile(openPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("analyze изменил карточку: %q", after)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "compact-snapshots")); !os.IsNotExist(err) {
+		t.Fatalf("analyze создал снапшоты: %v", err)
+	}
+}
+
+func TestCompactModesAreMutuallyExclusive(t *testing.T) {
+	root := t.TempDir()
+	cfg := compactTestConfig(root)
+	if err := os.MkdirAll(cfg.TasksDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := writeCompactCard(t, cfg.TasksDir, "T2.1", "done", "2020-01-01T00:00:00Z")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "compact", "--analyze", "--apply", "--id", "T2.1", "--summary-text", "x"}, &stdout, &stderr, cfg)
+	if code != taskstore.ExitValidation || stdout.Len() != 0 || stderr.Len() == 0 {
+		t.Fatalf("два режима: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("карточка изменена при ошибке валидации: %q", after)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "compact-snapshots")); !os.IsNotExist(err) {
+		t.Fatalf("снапшот создан при ошибке валидации: %v", err)
+	}
+}
+
+func TestCompactApplyFromSummaryFileWithoutKey(t *testing.T) {
+	withCompactNow(t, time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
+	root := t.TempDir()
+	cfg := compactTestConfig(root)
+	if err := os.MkdirAll(cfg.TasksDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := writeCompactCard(t, cfg.TasksDir, "T3.17", "done", "2020-01-01T00:00:00Z")
+	original, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	summaryPath := filepath.Join(root, "summary.txt")
+	if err := os.WriteFile(summaryPath, []byte("Короткое саммари для агента"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Пустое окружение ключей: apply работает без внешней модели.
+	t.Setenv("BEACON_MODEL_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "compact", "--apply", "--id", "T3.17", "--summary", summaryPath}, &stdout, &stderr, cfg)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("apply: код %d stderr %q", code, stderr.String())
+	}
+	var result compactResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("apply вернул не JSON: %v, вывод %q", err, stdout.String())
+	}
+	if !result.Applied || result.ID != "T3.17" || result.SizeAfter >= result.SizeBefore {
+		t.Fatalf("результат: %+v", result)
+	}
+	applied, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(applied) == string(original) {
+		t.Fatal("карточка не изменена")
+	}
+	for _, want := range []string{"Уровень сжатия: 1", "Время сжатия: 2026-02-01T00:00:00Z", "Саммари: Короткое саммари для агента"} {
+		if !strings.Contains(string(applied), want) {
+			t.Errorf("в карточке нет %q: %q", want, applied)
+		}
+	}
+	for _, gone := range []string{"Контекст: контекст", "Шаги: шаг", "Проверка: проверка", "Приёмка: приёмка"} {
+		if strings.Contains(string(applied), gone) {
+			t.Errorf("поле не сжато %q: %q", gone, applied)
+		}
+	}
+
+	// Снапшот содержит исходный текст побайтово до перезаписи.
+	snapPath := filepath.Join(cfg.StateDir, "compact-snapshots", "T3.17.json")
+	data, err := os.ReadFile(snapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap compactSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatalf("снапшот не JSON: %v", err)
+	}
+	if snap.Text != string(original) || snap.CardID != "T3.17" || snap.Schema != 1 {
+		t.Fatalf("снапшот: %+v", snap)
+	}
+	for _, name := range compactTextFields {
+		if snap.Fields[name] == "" {
+			t.Errorf("в снапшоте нет поля %s", name)
+		}
+	}
+
+	// Сжатая карточка обязана разбираться основным парсером.
+	cards, err := taskstore.LoadCards(cfg.TasksDir)
+	if err != nil {
+		t.Fatalf("карточка после сжатия не разбирается: %v", err)
+	}
+	if len(cards) != 1 || cards[0].Extra["Уровень сжатия"] != "1" {
+		t.Fatalf("карточки после сжатия: %+v", cards)
+	}
+
+	// Повторный analyze не выдаёт уже сжатую карточку.
+	stdout.Reset()
+	stderr.Reset()
+	code = TaskCommandWithConfig([]string{"task", "compact", "--analyze", "--format", "json"}, &stdout, &stderr, cfg)
+	if code != 0 || strings.Contains(stdout.String(), "T3.17") {
+		t.Fatalf("сжатая карточка выдана повторно: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestCompactApplyRefusesLongerSummary(t *testing.T) {
+	root := t.TempDir()
+	cfg := compactTestConfig(root)
+	if err := os.MkdirAll(cfg.TasksDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := writeCompactCard(t, cfg.TasksDir, "T4.1", "done", "2020-01-01T00:00:00Z")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("очень длинное саммари ", 40)
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "compact", "--apply", "--id", "T4.1", "--summary-text", long}, &stdout, &stderr, cfg)
+	if code != taskstore.ExitValidation || stdout.Len() != 0 {
+		t.Fatalf("длинное саммари: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "не короче") {
+		t.Errorf("нет причины отказа: %q", stderr.String())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("карточка изменена при отказе: %q", after)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "compact-snapshots")); !os.IsNotExist(err) {
+		t.Fatalf("снапшот создан при отказе: %v", err)
+	}
+}
+
+func TestCompactDryRunAutoAndValidation(t *testing.T) {
+	root := t.TempDir()
+	cfg := compactTestConfig(root)
+	if err := os.MkdirAll(cfg.TasksDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := writeCompactCard(t, cfg.TasksDir, "T5.1", "done", "2020-01-01T00:00:00Z")
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "compact", "--apply", "--id", "T5.1", "--summary-text", "коротко", "--dry-run"}, &stdout, &stderr, cfg)
+	if code != 0 || !strings.Contains(stdout.String(), "dry-run") {
+		t.Fatalf("dry-run: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("dry-run изменил карточку: %q", after)
+	}
+
+	t.Setenv("BEACON_MODEL_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	stdout.Reset()
+	stderr.Reset()
+	code = TaskCommandWithConfig([]string{"task", "compact", "--auto"}, &stdout, &stderr, cfg)
+	if code != taskstore.ExitValidation || !strings.Contains(stderr.String(), "--auto") {
+		t.Fatalf("auto без ключа: код %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+
+	for _, argv := range [][]string{
+		{"task", "compact"},
+		{"task", "compact", "--analyze", "--format", "yaml"},
+		{"task", "compact", "--analyze", "--max-age-days", "плохо"},
+		{"task", "compact", "--apply"},
+		{"task", "compact", "--apply", "--id", "T5.1"},
+		{"task", "compact", "--apply", "--id", "T5.1", "--summary-text", "x", "лишний"},
+	} {
+		stdout.Reset()
+		stderr.Reset()
+		code := TaskCommandWithConfig(argv, &stdout, &stderr, cfg)
+		if code != taskstore.ExitValidation || stdout.Len() != 0 || stderr.Len() == 0 {
+			t.Errorf("%v: код %d stdout %q stderr %q", argv, code, stdout.String(), stderr.String())
+		}
 	}
 }
