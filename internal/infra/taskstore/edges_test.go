@@ -491,6 +491,38 @@ func TestConditionalBlocksIsBlocking(t *testing.T) {
 	}
 }
 
+func TestCBX04EdgeSetsSeparation(t *testing.T) {
+	blocking := BlockingEdgeKinds()
+	scheduling := SchedulingEdgeKinds()
+	if len(blocking) != 3 {
+		t.Fatalf("блокирующий набор = %v, ждали ровно 3 типа", blocking)
+	}
+	if len(scheduling) != 4 {
+		t.Fatalf("планирующий набор = %v, ждали ровно 4 типа", scheduling)
+	}
+	in := func(kinds []EdgeKind, kind EdgeKind) bool {
+		for _, k := range kinds {
+			if k == kind {
+				return true
+			}
+		}
+		return false
+	}
+	for _, kind := range []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks} {
+		if !in(blocking, kind) || !in(scheduling, kind) {
+			t.Errorf("%q пропал из блокирующего или планирующего набора", kind)
+		}
+	}
+	if !in(scheduling, EdgeSupersedes) {
+		t.Error("supersedes не в планирующем наборе")
+	}
+	for _, kind := range []EdgeKind{EdgeRelated, EdgeWaitsForExternal} {
+		if in(blocking, kind) || in(scheduling, kind) {
+			t.Errorf("%q попал в набор, где его быть не должно", kind)
+		}
+	}
+}
+
 func TestConditionalBlocksKeepsKindInTraversalAndJSON(t *testing.T) {
 	g := testGraph(t, Edge{From: "T3.1", To: "T3.2", Kind: EdgeConditionalBlocks})
 	tr := g.BlockedTraverse("T3.1", 0)
@@ -522,6 +554,33 @@ func TestConditionalBlocksCycleRejectedByAddEdge(t *testing.T) {
 		t.Fatalf("ошибка = %q, код = %d", err, Code(err))
 	}
 	if g.Size() != 2 {
+		t.Fatalf("граф изменился при ошибке: Size = %d", g.Size())
+	}
+}
+
+func TestCBX04DeadlockUsesBlockingSet(t *testing.T) {
+	// A blocks B, B supersedes C, C related A. Supersedes играет роль
+	// parent-child из beads. related добавляется первым, чтобы путь A..C
+	// ещё не существовал.
+	g := testGraph(t,
+		Edge{From: "T3.3", To: "T3.1", Kind: EdgeRelated},
+		Edge{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+		Edge{From: "T3.2", To: "T3.3", Kind: EdgeSupersedes},
+	)
+	if cycles := g.DeadlockReport().Cycles; len(cycles) != 0 {
+		t.Fatalf("deadlock-отчёт = %v, ждали ноль циклов", cycles)
+	}
+	err := g.AddEdge("T3.3", "T3.1", EdgeBlocks)
+	if err == nil {
+		t.Fatal("добавление C blocks A не отклонено планирующей проверкой")
+	}
+	if Code(err) != ExitValidation {
+		t.Errorf("код = %d, ждали %d", Code(err), ExitValidation)
+	}
+	if !strings.Contains(err.Error(), "планирующий") {
+		t.Errorf("ошибка %q не называет набор рёбер", err.Error())
+	}
+	if g.Size() != 3 {
 		t.Fatalf("граф изменился при ошибке: Size = %d", g.Size())
 	}
 }
@@ -572,5 +631,35 @@ func TestConditionalBlocksPreservesOtherEdgeKinds(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("deps[%d] = %+v, ждали %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestCBX04RelatedOnlyCycleAccepted(t *testing.T) {
+	g := testGraph(t,
+		Edge{From: "T4.1", To: "T4.2", Kind: EdgeRelated},
+		Edge{From: "T4.2", To: "T4.3", Kind: EdgeRelated},
+	)
+	if err := g.AddEdge("T4.3", "T4.1", EdgeRelated); err != nil {
+		t.Fatalf("related-путь отклонён: %v", err)
+	}
+	if g.Size() != 3 {
+		t.Fatalf("Size = %d, ждали 3", g.Size())
+	}
+	if cycles := g.DeadlockReport().Cycles; len(cycles) != 0 {
+		t.Fatalf("deadlock по related = %v, ждали ноль", cycles)
+	}
+}
+
+func TestCBX04DeadlockCyclesFindsBlockingCycle(t *testing.T) {
+	g := NewGraph()
+	add := func(from, to string, kind EdgeKind) {
+		g.out[from] = append(g.out[from], Edge{From: from, To: to, Kind: kind})
+		g.count++
+	}
+	add("T5.1", "T5.2", EdgeBlocks)
+	add("T5.2", "T5.3", EdgeDependsOn)
+	add("T5.3", "T5.1", EdgeBlocks)
+	if got := len(g.DeadlockReport().Cycles); got != 1 {
+		t.Fatalf("DeadlockCycles = %d, ждали 1 цикл из блокирующих рёбер", got)
 	}
 }

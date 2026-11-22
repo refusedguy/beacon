@@ -64,6 +64,43 @@ func IsBlockingEdgeKind(kind EdgeKind) bool {
 	}
 }
 
+// EdgeSet это именованный набор типов рёбер для одного обхода графа.
+// Принадлежность ребра набору задаётся одним фильтром типов.
+type EdgeSet struct {
+	name  string
+	kinds map[EdgeKind]bool
+}
+
+func newEdgeSet(name string, kinds ...EdgeKind) EdgeSet {
+	set := EdgeSet{name: name, kinds: make(map[EdgeKind]bool, len(kinds))}
+	for _, k := range kinds {
+		set.kinds[k] = true
+	}
+	return set
+}
+
+func (s EdgeSet) has(k EdgeKind) bool { return s.kinds[k] }
+
+// blockingSet это блокирующий набор для поиска deadlock. В beads это blocks
+// и conditional-blocks: рёбра, которые действительно удерживают карточку.
+var blockingSet = newEdgeSet("блокирующий", EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks)
+
+// schedulingSet это планирующий набор для проверки мутаций. К блокирующему
+// добавляется ребро иерархии, соответствующее parent-child в beads; в beacon
+// этой роли служит supersedes.
+var schedulingSet = newEdgeSet("планирующий", EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks, EdgeSupersedes)
+
+// BlockingEdgeKinds возвращает типы блокирующего набора. related и
+// waits-for-external в него не входят.
+func BlockingEdgeKinds() []EdgeKind {
+	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks}
+}
+
+// SchedulingEdgeKinds возвращает типы планирующего набора.
+func SchedulingEdgeKinds() []EdgeKind {
+	return []EdgeKind{EdgeBlocks, EdgeDependsOn, EdgeConditionalBlocks, EdgeSupersedes}
+}
+
 // IsExternalGateTarget проверяет цель внешнего гейта. Первая версия принимает
 // gh:pr:<номер>, gh:run:<id>, timer:<имя>, human:<имя> и bead:<id>. Цель не
 // является ID карточки, поэтому IsID её не проверяет.
@@ -140,8 +177,9 @@ func (g *Graph) Size() int { return g.count }
 // AddEdge добавляет ребро. ID проверяются через IsID, поэтому граф принимает
 // все семейства: T3.17, S1.001, BS.1, RS-MCP-02, WIRING-485 и UI-31.
 // Для waits-for-external вместо IsID проверяется IsExternalGateTarget.
-// Пустой или слишком длинный тип, петля и ребро, которое замыкает цикл,
-// отклоняются с кодом 1. Повтор того же ребра ничего не меняет.
+// Пустой или слишком длинный тип, петля и ребро, которое замыкает цикл
+// в планирующем наборе, отклоняются с кодом 1. Повтор того же ребра ничего
+// не меняет.
 func (g *Graph) AddEdge(from, to string, kind EdgeKind) error {
 	if !IsValidEdgeKind(kind) {
 		return Validationf("тип ребра %q пустой или длиннее %d символов", kind, MaxEdgeKindLen)
@@ -164,8 +202,8 @@ func (g *Graph) AddEdge(from, to string, kind EdgeKind) error {
 			return nil
 		}
 	}
-	if g.reaches(to, from) {
-		return Validationf("цикл: %s -> %s замыкает путь", from, to)
+	if g.reachesInSet(to, from, schedulingSet) {
+		return Validationf("цикл в наборе рёбер %q: %s -> %s замыкает путь", schedulingSet.name, from, to)
 	}
 	e := Edge{From: from, To: to, Kind: kind}
 	g.out[from] = append(g.out[from], e)
@@ -173,9 +211,10 @@ func (g *Graph) AddEdge(from, to string, kind EdgeKind) error {
 	return nil
 }
 
-// reaches сообщает, достижим ли target из start по существующим рёбрам.
-// Посещённые узлы хранятся в множестве, поэтому цикл в графе не вызовет зацикливание.
-func (g *Graph) reaches(start, target string) bool {
+// reachesInSet сообщает, достижим ли target из start по рёбрам набора set.
+// Посещённые узлы хранятся в множестве, поэтому цикл в графе не вызовет
+// зацикливание. Обход рёбер и фильтр типов общие для всех наборов.
+func (g *Graph) reachesInSet(start, target string, set EdgeSet) bool {
 	if start == target {
 		return true
 	}
@@ -185,6 +224,9 @@ func (g *Graph) reaches(start, target string) bool {
 		cur := queue[0]
 		queue = queue[1:]
 		for _, e := range g.out[cur] {
+			if !set.has(e.Kind) {
+				continue
+			}
 			if e.To == target {
 				return true
 			}
@@ -195,6 +237,27 @@ func (g *Graph) reaches(start, target string) bool {
 		}
 	}
 	return false
+}
+
+// EdgesInSet возвращает рёбра графа, относящиеся к набору set. Порядок
+// результата не определён: рёбра приходят из карты, как и в Edges.
+func (g *Graph) EdgesInSet(set EdgeSet) []Edge {
+	out := make([]Edge, 0, g.count)
+	for _, list := range g.out {
+		for _, e := range list {
+			if set.has(e.Kind) {
+				out = append(out, e)
+			}
+		}
+	}
+	return out
+}
+
+// DeadlockReport возвращает канонический отчёт о циклах в блокирующем наборе
+// рёбер. Планирующие рёбра, related и внешние гейты в отчёт не попадают.
+// Каноническую форму задаёт CBX-03, здесь выбирается только набор рёбер.
+func (g *Graph) DeadlockReport() CycleReport {
+	return CanonicalCycleReport(g.EdgesInSet(blockingSet))
 }
 
 // Traverse обходит ребра от start в ширину. UNION означает, что найденный узел
