@@ -99,6 +99,37 @@ const REQUIRED_TOOL_EVENTS = Object.freeze([
   TOOL_LIFECYCLE_EVENTS.post,
 ])
 
+// CSx-01. SDK асинхронный выход хука несёт `async_` и `asyncTimeout`
+// (types.py:800-812), а матчер ограничивает отложенный вызов 60 секундами
+// (types.py:879-904). Хук возвращается сразу, долгий колбэк не держит вызов
+// инструмента, а его срок ограничен значением MATCHER_TIMEOUT_MS.
+export const MATCHER_TIMEOUT_MS = 60_000
+
+// AsyncHook разбирает асинхронную форму ответа и отвергает asyncTimeout,
+// который превышает срок матчера. Синхронный ответ без `async_` не меняется.
+export function AsyncHook(response = {}, matcherTimeoutMs = MATCHER_TIMEOUT_MS) {
+  if (response?.async_ !== true && response?.async !== true) return null
+  const asyncTimeout = Number(response.asyncTimeout)
+  if (!Number.isFinite(asyncTimeout) || asyncTimeout <= 0) {
+    throw new Error("CSx-01: asyncTimeout must be a positive number of milliseconds")
+  }
+  if (asyncTimeout > matcherTimeoutMs) {
+    throw new Error(
+      `CSx-01: asyncTimeout ${asyncTimeout} exceeds matcher timeout ${matcherTimeoutMs}`,
+    )
+  }
+  return Object.freeze({ async_: true, asyncTimeout })
+}
+
+// resolveHookResponse сохраняет синхронный путь по умолчанию: только
+// ответ с `async_: true` получает асинхронную форму, остальные идут через
+// обычную нормализацию permissionDecision.
+export function resolveHookResponse(response, matcherTimeoutMs = MATCHER_TIMEOUT_MS) {
+  const deferred = AsyncHook(response, matcherTimeoutMs)
+  if (deferred) return deferred
+  return normalizePermissionDecision(response)
+}
+
 export function toolLifecycleInput(event, phase) {
   const raw = event ?? {}
   const typed = {
@@ -183,10 +214,10 @@ export async function registerToolLifecycle(ctx, options = {}) {
   let post = null
   try {
     pre = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.pre, (event) =>
-      normalizePermissionDecision(decidePreToolUse(event)),
+      resolveHookResponse(decidePreToolUse(event)),
     )
     post = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.post, (event) =>
-      normalizePermissionDecision(decidePostToolUse(event)),
+      resolveHookResponse(decidePostToolUse(event)),
     )
   } catch (error) {
     await post?.dispose?.()
