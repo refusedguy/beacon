@@ -364,6 +364,10 @@ var watchLiveContext = func() (context.Context, context.CancelFunc) {
 // interruptible by the lifetime context.
 var watchReconnectDelay = 50 * time.Millisecond
 
+// eventTailMax bounds the replay lines carried in one live snapshot. The board
+// keeps a short tail too, so both screens show a comparable amount of history.
+const eventTailMax = 12
+
 // markAttention fills the ADR 0058 п6 column. A row asks for attention when its
 // Beacon verdict is needs_input (a task parked for a human) or when an open
 // attention request names its agent or its watch. The earliest request wins and
@@ -628,21 +632,47 @@ func renderHTTPSnapshot(w io.Writer, snap httpapi.ClientSnapshot, format string)
 	}
 	fmt.Fprintf(w, "ATTENTION: %s\n", joinDash(snap.Attention))
 	fmt.Fprintf(w, "ESCALATIONS: %s\n", joinDash(snap.Escalations))
+	fmt.Fprintf(w, "EVENTS: %s\n", joinDash(snap.EventTail))
 	return nil
 }
 
-// watchHTTPRender is one refresh from the HTTP projection.
-func watchHTTPRender(ctx context.Context, c *CLI, port watchHTTPPort, format string) int {
+// watchHTTPRender is one refresh from the HTTP projection. tail holds the
+// newest replayed event lines and is attached to the snapshot so the human
+// layout and the JSON form carry the same cold-start history.
+func watchHTTPRender(ctx context.Context, c *CLI, port watchHTTPPort, format string, tail []string) int {
 	snap, err := port.Snapshot(ctx)
 	if err != nil {
 		fmt.Fprintf(c.errOut, "beacon watch: snapshot: %v\n", err)
 		return 2
 	}
+	snap.EventTail = tail
 	if err := renderHTTPSnapshot(c.out, snap, format); err != nil {
 		fmt.Fprintf(c.errOut, "beacon watch: %v\n", err)
 		return 2
 	}
 	return 0
+}
+
+// appendEventTail formats one SSE frame and keeps at most limit lines, oldest
+// first. It mirrors the board's event line so both live views read the same way.
+func appendEventTail(tail []string, ev httpapi.ClientEvent, limit int) []string {
+	typ := strings.TrimSpace(ev.Type)
+	if typ == "" {
+		typ = "message"
+	}
+	data := strings.Join(strings.Fields(strings.TrimSpace(string(ev.Data))), " ")
+	if data == "" {
+		data = "(пусто)"
+	}
+	line := typ + " " + data
+	if id := strings.TrimSpace(ev.ID); id != "" {
+		line = "#" + id + " " + line
+	}
+	tail = append(tail, line)
+	if len(tail) > limit {
+		tail = tail[len(tail)-limit:]
+	}
+	return tail
 }
 
 // runWatchLiveHTTP is the event-driven loop over /api/v1/events. Each
@@ -677,12 +707,13 @@ func runWatchLiveHTTP(c *CLI, interval time.Duration, format string, wake bool) 
 	}
 
 	_ = wake // batching belongs to the legacy wake path, not this projection.
+	var tail []string
 	for {
 		if ctx.Err() != nil {
 			return 0
 		}
 		events := port.Events(ctx)
-		if code := watchHTTPRender(ctx, c, port, format); code != 0 {
+		if code := watchHTTPRender(ctx, c, port, format, tail); code != 0 {
 			return code
 		}
 		disconnected := false
@@ -690,14 +721,17 @@ func runWatchLiveHTTP(c *CLI, interval time.Duration, format string, wake bool) 
 			select {
 			case <-ctx.Done():
 				return 0
-			case _, ok := <-events:
+			case result, ok := <-events:
 				if !ok {
 					disconnected = true
 					continue
 				}
-				_ = watchHTTPRender(ctx, c, port, format)
+				if result.Err == nil {
+					tail = appendEventTail(tail, result.Event, eventTailMax)
+				}
+				_ = watchHTTPRender(ctx, c, port, format, tail)
 			case <-ticks:
-				_ = watchHTTPRender(ctx, c, port, format)
+				_ = watchHTTPRender(ctx, c, port, format, tail)
 			}
 		}
 		select {

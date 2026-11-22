@@ -143,6 +143,9 @@ type Snapshot struct {
 	Escalations      []string  `json:"escalations"`
 	LoadErrors       []string  `json:"loadErrors"`
 	LastCycle        Cycle     `json:"lastCycle"`
+	// EventTail carries the newest replayed event lines, oldest first. An
+	// older server omits the field, so a partial response leaves it empty.
+	EventTail []string `json:"eventTail"`
 }
 
 // Metrics is the optional runtime block of the snapshot. The server sends
