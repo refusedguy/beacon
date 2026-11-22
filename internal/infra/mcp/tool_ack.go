@@ -198,6 +198,11 @@ type AckReceipt struct {
 	// ResumeRevision is the Watch revision after the resume. It is zero when
 	// no decision was applied.
 	ResumeRevision uint64 `json:"resumeRevision,omitempty"`
+	// AnswerRound is the Watch revision at which the answered question was
+	// asked. A repeat answer keeps the round of that question, so a caller can
+	// tell which question the decision belongs to. It is zero for an ack that
+	// carried no decision.
+	AnswerRound uint64 `json:"answerRound,omitempty"`
 	// Blocked is true when this ack applied a blocked:not_mine decision. A
 	// repeated block leaves it false because a Watch is blocked at most once.
 	Blocked bool `json:"blocked,omitempty"`
@@ -224,17 +229,30 @@ type DecisionRecord struct {
 	Decision   Decision
 	ResumedAt  time.Time
 	Revision   uint64
+	// Round is the Watch revision at which the question was asked. It joins
+	// WatchID as the registry key, so a new question on the same Watch is a
+	// new round while a repeat answer stays in the round it answered.
+	Round uint64
+}
+
+// decisionKey identifies one question: the Watch and the revision at which it
+// was parked for input. A new question carries a new Watch revision and hence
+// a new key; a repeat answer keeps the key of the question it answers.
+type decisionKey struct {
+	watchID string
+	round   uint64
 }
 
 // DecisionRegistry is the "requires attention" record of ADR 0058 §4. It keeps
-// one decision per Watch so a repeat decision cannot resume the same agent
-// twice. The first decision wins: an identical repeat is an idempotent no-op,
-// while a different decision for an already answered Watch is a conflict. It
+// one decision per question so a repeat decision cannot resume the same agent
+// twice and a later question on the same Watch can still be answered. The
+// first decision wins within a round: an identical repeat is an idempotent
+// no-op, while a different decision for an answered question is a conflict. It
 // is safe for concurrent use.
 type DecisionRegistry struct {
 	mu       sync.Mutex
-	records  map[string]DecisionRecord
-	inFlight map[string]*decisionFlight
+	records  map[decisionKey]DecisionRecord
+	inFlight map[decisionKey]*decisionFlight
 }
 
 // decisionFlight reserves a watchID while resume runs outside the registry
@@ -247,44 +265,83 @@ type decisionFlight struct {
 // NewDecisionRegistry builds an empty decision registry.
 func NewDecisionRegistry() *DecisionRegistry {
 	return &DecisionRegistry{
-		records:  make(map[string]DecisionRecord),
-		inFlight: make(map[string]*decisionFlight),
+		records:  make(map[decisionKey]DecisionRecord),
+		inFlight: make(map[decisionKey]*decisionFlight),
 	}
 }
 
-// Lookup returns the decision recorded for watchID. The bool is false when no
-// decision was recorded yet.
+// Lookup returns the decision from the latest round recorded for watchID. The
+// bool is false when no decision was recorded yet. A fresh answer that arrives
+// after the Watch left needs_input falls back to this round when its DecisionID
+// is unknown.
 func (r *DecisionRegistry) Lookup(watchID string) (DecisionRecord, bool) {
 	if r == nil {
 		return DecisionRecord{}, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	rec, ok := r.records[watchID]
-	return rec, ok
+	var latest DecisionRecord
+	found := false
+	for key, rec := range r.records {
+		if key.watchID != watchID {
+			continue
+		}
+		if !found || key.round > latest.Round {
+			latest = rec
+			found = true
+		}
+	}
+	return latest, found
 }
 
-// Decide records rec for watchID and runs resume at most once. resume runs
-// without the registry lock, so a callback that calls back into the registry
-// cannot deadlock and Lookup never waits for a delivery. The watchID is
-// reserved under the lock while resume runs; a concurrent Decide for the same
-// watchID waits for that reservation to clear, then reads the recorded result.
-// It returns the stored record and whether resume ran. An identical repeat
-// returns the stored record with applied false; a conflicting decision is
-// refused with CodeInvalidInput.
+// LookupDecisionID finds the round answered by decisionID on watchID. A repeat
+// of an older answer carries the same DecisionID, so it lands back in that
+// round even after later rounds were answered. When an ID was reused by more
+// than one round, the latest round wins.
+func (r *DecisionRegistry) LookupDecisionID(watchID, decisionID string) (DecisionRecord, bool) {
+	if r == nil {
+		return DecisionRecord{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var latest DecisionRecord
+	found := false
+	for key, rec := range r.records {
+		if key.watchID != watchID || rec.DecisionID != decisionID {
+			continue
+		}
+		if !found || key.round > latest.Round {
+			latest = rec
+			found = true
+		}
+	}
+	return latest, found
+}
+
+// Decide records rec for watchID at rec.Round and runs resume at most once.
+// The round is the Watch revision at which the question was asked, so a later
+// question on the same Watch is a different round. resume runs without the
+// registry lock, so a callback that calls back into the registry cannot
+// deadlock and Lookup never waits for a delivery. The round is reserved under
+// the lock while resume runs; a concurrent Decide for the same Watch and round
+// waits for that reservation to clear, then reads the recorded result. It
+// returns the stored record and whether resume ran. An identical repeat
+// returns the stored record with applied false; a conflicting decision in the
+// same round is refused with CodeInvalidInput.
 func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume func() (uint64, error)) (DecisionRecord, bool, error) {
 	if r == nil {
 		return DecisionRecord{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: decision registry is nil")
 	}
+	key := decisionKey{watchID: watchID, round: rec.Round}
 	for {
 		r.mu.Lock()
 		if r.records == nil {
-			r.records = make(map[string]DecisionRecord)
+			r.records = make(map[decisionKey]DecisionRecord)
 		}
 		if r.inFlight == nil {
-			r.inFlight = make(map[string]*decisionFlight)
+			r.inFlight = make(map[decisionKey]*decisionFlight)
 		}
-		if existing, ok := r.records[watchID]; ok {
+		if existing, ok := r.records[key]; ok {
 			if existing.Decision != rec.Decision || existing.DecisionID != rec.DecisionID {
 				r.mu.Unlock()
 				return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: a different decision was already recorded for this Watch")
@@ -292,26 +349,26 @@ func (r *DecisionRegistry) Decide(watchID string, rec DecisionRecord, resume fun
 			r.mu.Unlock()
 			return existing, false, nil
 		}
-		if flight, ok := r.inFlight[watchID]; ok {
+		if flight, ok := r.inFlight[key]; ok {
 			r.mu.Unlock()
 			<-flight.done
 			continue
 		}
 		flight := &decisionFlight{done: make(chan struct{})}
-		r.inFlight[watchID] = flight
+		r.inFlight[key] = flight
 		r.mu.Unlock()
 
 		revision, err := resume()
 
 		r.mu.Lock()
-		delete(r.inFlight, watchID)
+		delete(r.inFlight, key)
 		if err != nil {
 			r.mu.Unlock()
 			close(flight.done)
 			return DecisionRecord{}, false, err
 		}
 		rec.Revision = revision
-		r.records[watchID] = rec
+		r.records[key] = rec
 		r.mu.Unlock()
 		close(flight.done)
 		return rec, true, nil
@@ -940,6 +997,7 @@ func (h *AckHandler) ackReceiptWithSession(ctx context.Context, in AckInput, ses
 			DecisionID:     rec.DecisionID,
 			Resumed:        applied,
 			ResumeRevision: rec.Revision,
+			AnswerRound:    rec.Round,
 		}
 	}
 
@@ -967,17 +1025,27 @@ func (h *AckHandler) applyDecision(in AckInput, w domain.Watch, d Decision) (Dec
 	if h.decisions == nil {
 		return DecisionRecord{}, false, domain.NewAppError(domain.CodePersistFailed, "ack: decision registry is nil")
 	}
-	// A repeat decision is idempotent even though the Watch already left the
-	// stopped state, so look at the registry before the status guard. Decide
-	// returns the stored record with applied=false for that repeat.
-	if _, already := h.decisions.Lookup(in.WatchID); !already && w.Status != domain.StatusNeedsInput {
-		return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision requires a stopped Watch")
+	// A question is identified by the Watch revision at which it was parked.
+	// The first answer runs while that Watch is still needs_input. After the
+	// resume the Watch has moved past the question, so a repeat uses the round
+	// of the answer it repeats instead of the new Watch revision. A new
+	// question therefore passes the status guard in its own round.
+	round := w.Revision
+	if w.Status != domain.StatusNeedsInput {
+		if answered, ok := h.decisions.LookupDecisionID(in.WatchID, in.DecisionID); ok {
+			round = answered.Round
+		} else if last, ok := h.decisions.Lookup(in.WatchID); ok {
+			round = last.Round
+		} else {
+			return DecisionRecord{}, false, domain.NewAppError(domain.CodeInvalidInput, "ack: decision requires a stopped Watch")
+		}
 	}
 	rec := DecisionRecord{
 		DecisionID: in.DecisionID,
 		WatchID:    in.WatchID,
 		Decision:   d,
 		ResumedAt:  h.clock.Now(),
+		Round:      round,
 	}
 	return h.decisions.Decide(in.WatchID, rec, func() (uint64, error) {
 		next, err := h.resumeWatch(w)

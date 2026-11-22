@@ -821,6 +821,72 @@ func TestAckDecisionConflictRejected(t *testing.T) {
 	}
 }
 
+// TestAckDecisionSecondQuestionSameWatch proves a human can answer a second
+// question on the same Watch (CV-14). The repeat of an earlier answer stays a
+// no-op, and each round reports the question it answered in answerRound.
+func TestAckDecisionSecondQuestionSameWatch(t *testing.T) {
+	store, stamper, h, w, o, clock := ackDecisionFixture(t)
+	ctx := context.Background()
+
+	first, err := h.Decide(ctx, AckInput{WatchID: w.ID, ObligationID: o.ID}, DecisionApprove, "decision-1")
+	if err != nil || !first.Resumed {
+		t.Fatalf("first decision: receipt %+v err %v", first, err)
+	}
+	if first.AnswerRound != w.Revision {
+		t.Errorf("first answerRound = %d, want %d", first.AnswerRound, w.Revision)
+	}
+
+	// The agent asks another question in the same Watch at a later revision.
+	secondQuestion := w
+	secondQuestion.Status = domain.StatusNeedsInput
+	secondQuestion.Verdict = domain.VerdictNeedsInput
+	secondQuestion.Revision = w.Revision + 5
+	if err := store.SaveWatch(secondQuestion); err != nil {
+		t.Fatalf("SaveWatch second question: %v", err)
+	}
+
+	second, err := h.Decide(ctx, AckInput{WatchID: w.ID, ObligationID: o.ID}, DecisionReject, "decision-2")
+	if err != nil {
+		t.Fatalf("second decision: %v", err)
+	}
+	if !second.OK || !second.Resumed {
+		t.Fatalf("second decision = %+v, want ok and resumed", second)
+	}
+	if second.AnswerRound != secondQuestion.Revision {
+		t.Errorf("second answerRound = %d, want %d", second.AnswerRound, secondQuestion.Revision)
+	}
+	if second.DecisionID != "decision-2" || second.Decision != DecisionReject {
+		t.Errorf("second decision = %+v, want reject/decision-2", second)
+	}
+
+	// A repeat of the first answer stays a no-op after the second round.
+	clock.Advance(time.Hour)
+	repeat, err := h.Decide(ctx, AckInput{WatchID: w.ID, ObligationID: o.ID}, DecisionApprove, "decision-1")
+	if err != nil {
+		t.Fatalf("repeat first decision: %v", err)
+	}
+	if !repeat.OK || repeat.Resumed {
+		t.Errorf("repeat first decision = %+v, want ok without resume", repeat)
+	}
+	if repeat.AnswerRound != first.AnswerRound {
+		t.Errorf("repeat answerRound = %d, want %d", repeat.AnswerRound, first.AnswerRound)
+	}
+
+	got, err := store.Watch(w.ID)
+	if err != nil {
+		t.Fatalf("read Watch: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Revision != secondQuestion.Revision+1 {
+		t.Errorf("Watch after second decision = %+v, want watching at %d", got, secondQuestion.Revision+1)
+	}
+	if len(store.watches) != 1 {
+		t.Errorf("second question created %d Watches, want 1", len(store.watches))
+	}
+	if stamped, ok := stamper.snapshot(o.ID); !ok || stamped.ClaimedAt.IsZero() {
+		t.Error("decision ack did not stamp claimedAt")
+	}
+}
+
 // TestAckDecisionRequiresStoppedWatch keeps a decision scoped to an agent that
 // actually stopped. A live Watch cannot be resumed and is left untouched.
 func TestAckDecisionRequiresStoppedWatch(t *testing.T) {
