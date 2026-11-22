@@ -72,7 +72,7 @@ func TestBranchSlugSkipsOccupiedSuffix(t *testing.T) {
 
 func TestPlanWorktreeReusesCheckedOutBranch(t *testing.T) {
 	branch := "feature/fix"
-	existing := []Worktree{
+	existing := []SlugWorktree{
 		{Name: "cd10", Branch: "refs/heads/" + branch},
 	}
 	plan := PlanWorktree(branch, []string{"cd10"}, existing)
@@ -85,7 +85,7 @@ func TestPlanWorktreeReusesCheckedOutBranch(t *testing.T) {
 }
 
 func TestPlanWorktreeCreatesSlugWhenBranchIsFree(t *testing.T) {
-	existing := []Worktree{
+	existing := []SlugWorktree{
 		{Name: "cd10", Branch: "feature/other"},
 	}
 	plan := PlanWorktree("repo/feature/fix", []string{}, existing)
@@ -106,13 +106,13 @@ func TestPlanWorktreeCreatesSlugWhenBranchIsFree(t *testing.T) {
 func TestPlanWorktreeIgnoresInputOrder(t *testing.T) {
 	branch := "repo/feature/fix"
 	taken := []string{"fix", "other"}
-	existing := []Worktree{
+	existing := []SlugWorktree{
 		{Name: "aa", Branch: "one/branch"},
 		{Name: "zz", Branch: "two/branch"},
 	}
 
 	want := PlanWorktree(branch, taken, existing)
-	got := PlanWorktree(branch, []string{"other", "fix"}, []Worktree{existing[1], existing[0]})
+	got := PlanWorktree(branch, []string{"other", "fix"}, []SlugWorktree{existing[1], existing[0]})
 	if got != want {
 		t.Fatalf("plan changed with input order: %+v vs %+v", got, want)
 	}
@@ -120,12 +120,12 @@ func TestPlanWorktreeIgnoresInputOrder(t *testing.T) {
 
 func TestPlanWorktreePicksSmallestNameOnReuseTie(t *testing.T) {
 	branch := "feature/fix"
-	existing := []Worktree{
+	existing := []SlugWorktree{
 		{Name: "zeta", Branch: branch},
 		{Name: "alpha", Branch: branch},
 	}
 	want := WorktreePlan{Name: "alpha", Action: WorktreeReuse}
-	for _, order := range [][]Worktree{existing, []Worktree{existing[1], existing[0]}} {
+	for _, order := range [][]SlugWorktree{existing, []SlugWorktree{existing[1], existing[0]}} {
 		if got := PlanWorktree(branch, nil, order); got != want {
 			t.Errorf("plan = %+v, want %+v", got, want)
 		}
