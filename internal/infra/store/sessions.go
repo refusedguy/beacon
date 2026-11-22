@@ -20,6 +20,19 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// sessionStore is the minimal port the storage conformance suite exercises.
+// The SQLite *DB and any alternative adapter implement the same operations, so
+// one named set of contracts certifies every adapter without copying tests.
+type sessionStore interface {
+	SaveSession(s Session) error
+	GetSession(id string) (Session, bool, error)
+	ListSessions() ([]Session, error)
+	FindSessionByTask(task string) (Session, bool, error)
+	Touch(id string, at time.Time) error
+	CloseSession(id string, at time.Time) error
+	DeleteSession(id string) error
+}
+
 // Status values a caller normally writes to a session. The store only
 // requires a non-empty status so a caller can carry its own state machine.
 const (
@@ -314,4 +327,26 @@ func scanSession(row rowScanner) (Session, error) {
 		return Session{}, fmt.Errorf("store: sessions: decode metadata: %w", err)
 	}
 	return s, nil
+}
+
+// DeleteSession removes id. A missing id or a store that never wrote a
+// session is a no-op, so repeated deletes converge on the same state.
+func (d *DB) DeleteSession(id string) error {
+	if d == nil {
+		return errors.New("store: sessions: nil db")
+	}
+	if strings.TrimSpace(id) == "" {
+		return domain.NewAppError(domain.CodeInvalidInput, "store: sessions: empty id")
+	}
+	ctx := context.Background()
+	ok, err := tableExists(ctx, d.readDB, "sessions")
+	if err != nil || !ok {
+		return err
+	}
+	return d.Write(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM sessions WHERE id = ?`, id); err != nil {
+			return fmt.Errorf("store: sessions: delete: %w", err)
+		}
+		return nil
+	})
 }
