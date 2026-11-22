@@ -8,7 +8,7 @@ Beacon следит за пулл-реквестами и будит агент�
 
 ## Из чего состоит Beacon
 
-Один общий MCP-сервер на Go и тонкие плагины-адаптеры. Сервер живёт в `cmd/beacon mcp`, построен на официальном go-sdk и отдаёт ровно девять инструментов. Он не знает имён агентов и не вызывает CLI агентов напрямую. Вся работа с хостом идёт через плагин. Код собирается Go 1.26.0, версия зафиксирована в `go.mod` и проверяется `beacon doctor`.
+Один общий MCP-сервер на Go и тонкие плагины-адаптеры. Сервер живёт в `cmd/beacon mcp`, построен на официальном go-sdk и отдаёт ровно девять инструментов. Он не знает имён агентов и не вызывает CLI агентов напрямую. Вся работа с хостом идёт через плагин. Код собирается Go 1.26.0, версия зафиксирована в `go.mod` и проверяется `beacon doctor`. Порог лежит в константе `minGoVersion` (`cmd/beacon/doctor.go:22`), поэтому `go.mod`, документация и проверка ссылаются на одно значение.
 
 Плагин лежит в `.opencode/plugins/beacon-bridge.js`. Он проектозависим. Корень проекта плагин берёт из `ctx.location.project.canonical`, а не из текущего каталога процесса. Это важно для worktree, где `ctx.location.directory` указывает на каталог worktree, а канонический корень другой. Состояние лежит в `~/.local/state/beacon/projects/<key>`, где `<key>` это имя папки и первые восемь символов SHA-256 абсолютного пути. Два разных проекта в одном сервере OpenCode получают два разных state.
 
@@ -276,7 +276,7 @@ Beacon читает настройки из окружения через `os.Ge
 | --- | --- | --- | --- | --- |
 | `BEACON_HTTP_ADDR` | `127.0.0.1:0` | `net.SplitHostPort`, `Atoi(port)`, хост принудительно `127.0.0.1` | `cmd/beacon/mcp.go:752`, `httpapi/server.go:35,489` | опечатка роняет старт HTTP API |
 | `BEACON_WEBHOOK_ADDR` | `127.0.0.1:8788` | хост loopback, порт числовой; ошибка optional receiver не роняет MCP | `cmd/beacon/mcp.go:803`, `webhook/receiver.go:28` | низкий |
-| `BEACON_GATES` | пусто, затем `PATH`, затем `tools/beacon-gates/beacon-gates` | `os.Stat`, файл обязан существовать и не быть каталогом | `cmd/beacon/doctor.go:221-228` | только `doctor`, в проде не читается |
+| `BEACON_GATES` | пусто, затем `PATH`, затем `tools/beacon-gates/beacon-gates` | `os.Stat`, файл обязан существовать, не быть каталогом и иметь бит исполнения | `cmd/beacon/doctor.go:285-293` | только `doctor`, в проде не читается |
 | `BEACON_SESSION_ID` | пусто | `TrimSpace`, формат `ses_` не проверяется | `cmd/beacon/orchestrator.go:25,108`, `daemon.go:219` | неверный ID меняет привязку оркестратора |
 | `BEACON_PARENT_SESSION` | пусто | `TrimSpace` | `cmd/beacon/spawn.go:119,164`, `prcreate.go:35,306` | неверная адресация wake или PR-подписчика |
 | `BEACON_TASK_ID` | пусто | `TrimSpace`, формат карточки не проверяется | `cmd/beacon/attach.go:274` | низкий |

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -314,5 +316,169 @@ func TestCU03CheckGoUsesContractStatuses(t *testing.T) {
 				t.Fatalf("статус %q, хотим %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// CU-05: doctor compares the reported Go version with the threshold value
+// that go.mod and README.md publish, including the patch component.
+func TestCU05CheckGoThreshold(t *testing.T) {
+	cases := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{"ровно порог", "go version go1.26.0 linux/amd64\n", doctorPass},
+		{"патч выше", "go version go1.26.1 linux/amd64\n", doctorPass},
+		{"младше порога", "go version go1.25.9 linux/amd64\n", doctorFail},
+		{"старшая ветка", "go version go1.27.4 linux/amd64\n", doctorPass},
+		{"вывод без патча", "go version go1.26 linux/amd64\n", doctorPass},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, _, _ := w115CLI(t, func(w115Call) runResult {
+				return runResult{stdout: []byte(tc.output)}
+			})
+			got := c.checkGo()
+			if got.status != tc.want {
+				t.Fatalf("статус %q, хотим %q: %s", got.status, tc.want, got.detail)
+			}
+		})
+	}
+}
+
+func TestCU05BelowGoVersionComparesPatch(t *testing.T) {
+	cases := []struct {
+		name                 string
+		major, minor, patch  int
+		wantMajor, wantMinor int
+		wantPatch            int
+		want                 bool
+	}{
+		{"патч ниже порога", 1, 26, 0, 1, 26, 1, true},
+		{"патч равен порогу", 1, 26, 1, 1, 26, 1, false},
+		{"патч выше порога", 1, 26, 2, 1, 26, 1, false},
+		{"младшая минорная ветка", 1, 25, 9, 1, 26, 0, true},
+		{"старшая мажорная ветка", 2, 0, 0, 1, 26, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := belowGoVersion(tc.major, tc.minor, tc.patch, tc.wantMajor, tc.wantMinor, tc.wantPatch)
+			if got != tc.want {
+				t.Fatalf("ниже порога: %v, хотим %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// CU-05: a candidate beacon-gates file without the execute bit cannot get PASS.
+func TestCU05CheckGatesRejectsNonExecutable(t *testing.T) {
+	cases := []struct {
+		name string
+		// setup places a non-executable file and returns its path.
+		setup func(t *testing.T, c *CLI) string
+	}{
+		{
+			name: "переопределение BEACON_GATES",
+			setup: func(t *testing.T, c *CLI) string {
+				path := filepath.Join(t.TempDir(), "beacon-gates")
+				if err := os.WriteFile(path, []byte("binary"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				t.Setenv(doctorGatesEnv, path)
+				return path
+			},
+		},
+		{
+			name: "собранный бинарник в корне проекта",
+			setup: func(t *testing.T, c *CLI) string {
+				path := filepath.Join(c.root, "tools", "beacon-gates", "beacon-gates")
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("binary"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, _, _ := w115CLI(t, nil)
+			t.Setenv(doctorGatesEnv, "")
+			t.Setenv("PATH", t.TempDir())
+			path := tc.setup(t, c)
+			got := c.checkGates()
+			if got.status == doctorPass {
+				t.Fatalf("%s: неисполняемый файл получил PASS", path)
+			}
+			if !strings.Contains(got.detail, "не исполняемый") {
+				t.Fatalf("%s: нет причины отказа: %q", path, got.detail)
+			}
+		})
+	}
+}
+
+// CU-05: the state check uses the CLI project root, not a root from the
+// environment, so both checks in one doctor run describe the same project.
+func TestCU05CheckStateDirUsesCLIRoot(t *testing.T) {
+	envRoot := t.TempDir()
+	cliRoot := t.TempDir()
+	stateHome := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", "")
+	t.Setenv("BEACON_PROJECT_ROOT", envRoot)
+	t.Setenv("XDG_STATE_HOME", stateHome)
+
+	want, err := stateDir(cliRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(want, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, _, _ := w115CLI(t, nil)
+	c.root = cliRoot
+	got := c.checkStateDir()
+	if got.status != doctorPass {
+		t.Fatalf("статус %q, хотим %q: %s", got.status, doctorPass, got.detail)
+	}
+	if got.detail != want {
+		t.Fatalf("каталог состояния %q, хотим %q", got.detail, want)
+	}
+	fromEnv, err := stateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.detail == fromEnv {
+		t.Fatalf("использован корень из окружения: %q", fromEnv)
+	}
+}
+
+// CU-05: doctor still reports a store created before the project-scoped layout
+// when the CLI root has no state directory of its own.
+func TestCU05CheckStateDirFallsBackToExistingStore(t *testing.T) {
+	legacyHome := t.TempDir()
+	cliRoot := t.TempDir()
+	t.Setenv("BEACON_STATE_DIR", "")
+	t.Setenv("BEACON_PROJECT_ROOT", "")
+	t.Setenv("XDG_STATE_HOME", legacyHome)
+
+	legacy, err := stateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c, _, _, _ := w115CLI(t, nil)
+	c.root = cliRoot
+	got := c.checkStateDir()
+	if got.status != doctorPass {
+		t.Fatalf("статус %q, хотим %q: %s", got.status, doctorPass, got.detail)
+	}
+	if got.detail != legacy {
+		t.Fatalf("каталог состояния %q, хотим %q", got.detail, legacy)
 	}
 }

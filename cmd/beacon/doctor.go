@@ -17,9 +17,38 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 )
 
-const minGoVersion = "1.26.0"
+// minGoVersion is the single Go threshold doctor checks. It carries the same
+// value as go.mod and README.md, so a version bump changes one place. CU-05.
+const minGoVersion = "go1.26.0"
 
 var goVersionPattern = regexp.MustCompile(`go([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
+
+// parseGoVersion reads a version from a `go version` line or from
+// minGoVersion. Both carry the `go` prefix, so one parser serves both.
+func parseGoVersion(s string) (major, minor, patch int, ok bool) {
+	m := goVersionPattern.FindStringSubmatch(s)
+	if m == nil {
+		return 0, 0, 0, false
+	}
+	major, _ = strconv.Atoi(m[1])
+	minor, _ = strconv.Atoi(m[2])
+	if m[3] != "" {
+		patch, _ = strconv.Atoi(m[3])
+	}
+	return major, minor, patch, true
+}
+
+// belowGoVersion compares a version against the threshold component by
+// component, including the patch that the old numeric literal ignored.
+func belowGoVersion(major, minor, patch, wantMajor, wantMinor, wantPatch int) bool {
+	if major != wantMajor {
+		return major < wantMajor
+	}
+	if minor != wantMinor {
+		return minor < wantMinor
+	}
+	return patch < wantPatch
+}
 
 // Doctor statuses are the four verdicts of RULES-CHECK-CONTRACT.md:9. The
 // human output and these constants use the same uppercase register as the
@@ -201,13 +230,15 @@ func (c *CLI) checkGo() checkResult {
 	if m == nil {
 		return checkResult{"go", doctorBroken, "не удалось разобрать вывод go version: " + line}
 	}
-
-	major, _ := strconv.Atoi(m[1])
-	minor, _ := strconv.Atoi(m[2])
 	version := m[0]
 
-	if major < 1 || (major == 1 && minor < 26) {
-		return checkResult{"go", doctorFail, fmt.Sprintf("%s: требуется >= %s (ADR 0015)", version, minGoVersion)}
+	major, minor, patch, parsed := parseGoVersion(line)
+	wantMajor, wantMinor, wantPatch, thresholdOK := parseGoVersion(minGoVersion)
+	if !parsed || !thresholdOK {
+		return checkResult{"go", doctorBroken, "не удалось разобрать порог Go: " + minGoVersion}
+	}
+	if belowGoVersion(major, minor, patch, wantMajor, wantMinor, wantPatch) {
+		return checkResult{"go", doctorFail, fmt.Sprintf("%s: требуется >= %s (ADR 0015)", version, strings.TrimPrefix(minGoVersion, "go"))}
 	}
 	return checkResult{"go", doctorPass, version}
 }
@@ -221,12 +252,20 @@ func (c *CLI) checkGates() checkResult {
 }
 
 func (c *CLI) checkStateDir() checkResult {
-	path, err := stateDir()
+	path, err := stateDir(c.root)
 	if err != nil {
 		return checkResult{"state", doctorBroken, err.Error()}
 	}
 	info, err := os.Stat(path)
 	if err != nil {
+		// A store created before the project-scoped layout still lives at the
+		// path derived from the environment. Report that directory when it is
+		// present instead of calling an existing store broken. CU-05.
+		if legacy, legacyErr := stateDir(); legacyErr == nil && legacy != path {
+			if legacyInfo, statErr := os.Stat(legacy); statErr == nil && legacyInfo.IsDir() {
+				return checkResult{"state", doctorPass, legacy}
+			}
+		}
 		return checkResult{"state", doctorBroken, fmt.Sprintf("%s: %v", path, err)}
 	}
 	if !info.IsDir() {
@@ -248,6 +287,9 @@ func findGates(root string) (string, error) {
 		if err != nil || info.IsDir() {
 			return "", fmt.Errorf("%s=%s: файл не найден", doctorGatesEnv, path)
 		}
+		if info.Mode()&0o111 == 0 {
+			return "", fmt.Errorf("%s=%s: файл не исполняемый", doctorGatesEnv, path)
+		}
 		return path, nil
 	}
 
@@ -259,6 +301,9 @@ func findGates(root string) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return "", errors.New("beacon-gates не найден")
+	}
+	if info.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("%s: файл не исполняемый", path)
 	}
 	return path, nil
 }
