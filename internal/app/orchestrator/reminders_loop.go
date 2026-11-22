@@ -33,12 +33,18 @@ func RunNotifyLoop(ctx context.Context, notify NotifyFunc, interval time.Duratio
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	runNotifyLoop(ctx, notify, ticker.C)
+}
 
+// runNotifyLoop calls notify for each value on ticks until ctx is done. It
+// takes the tick source as a parameter so a test can drive it without waiting
+// on the clock.
+func runNotifyLoop(ctx context.Context, notify NotifyFunc, ticks <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-ticks:
 			if err := notify(ctx); err != nil {
 				observe.ActorError("reminder-loop", "", err)
 			}
