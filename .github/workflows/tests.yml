@@ -79,7 +79,20 @@ jobs:
         run: |
           set -uo pipefail
           log="$RUNNER_TEMP/eval-suite.log"
-          GOPROXY=off go run -tags=eval . 2>&1 | tee "$log"
+          # Раннер берёт корень репозитория и собирает evalserver командой
+          # GO build ./cmd/evalserver из этого корня. Пакет лежит в
+          # evals/cmd/evalserver, поэтому прямой путь из корня не находится.
+          # Обёртка меняет каталог только на дочернюю сборку сервера.
+          # Остальные пути раннера остаются корневыми.
+          go_wrapper="$RUNNER_TEMP/eval-go"
+          cat > "$go_wrapper" <<'EOF'
+          #!/usr/bin/env bash
+          cd "$EVALS_MODULE_DIR" || exit 1
+          exec go "$@"
+          EOF
+          chmod +x "$go_wrapper"
+          export EVALS_MODULE_DIR="$PWD"
+          GO="$go_wrapper" GOPROXY=off go run -tags=eval . 2>&1 | tee "$log"
           code=${PIPESTATUS[0]}
           if [ "$code" -ne 0 ]; then
             printf 'eval suite exit=%d\n' "$code" >&2
