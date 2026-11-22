@@ -965,6 +965,21 @@ func worktreeAddArgs(branch, worktree string) []string {
 	return []string{"worktree", "add", "-b", branch, worktree}
 }
 
+// fetchOriginMain refreshes origin/main through the injected runner before a
+// worktree branches from it (HD-011, ADR 0306). A failed fetch stops the bind
+// so the branch never starts from a stale ref.
+func (c *CLI) fetchOriginMain(repo string) error {
+	res := c.run(repo, "git", []string{"fetch", "origin", "main"}, nil)
+	if res.code != 0 {
+		msg := strings.TrimSpace(string(res.stderr))
+		if msg == "" {
+			msg = fmt.Sprintf("git завершился с кодом %d", res.code)
+		}
+		return fmt.Errorf("git fetch origin main не удался: %s", msg)
+	}
+	return nil
+}
+
 // bindRepoWorktree binds taskID to repo and allocates a separate worktree with
 // its own branch. An existing binding is returned unchanged, so a retry cannot
 // create a second checkout. An explicit worktree path lets callers place the
@@ -997,6 +1012,10 @@ func (c *CLI) bindRepoWorktree(taskID, repo, worktree string) (repoWorktree, err
 		if b.Worktree == worktree {
 			return repoWorktree{}, fmt.Errorf("worktree %s уже занят задачей %s", worktree, b.TaskID)
 		}
+	}
+
+	if err := c.fetchOriginMain(repo); err != nil {
+		return repoWorktree{}, err
 	}
 
 	branch := taskWorktreeBranch(taskID, repo)
