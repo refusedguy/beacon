@@ -9,7 +9,7 @@
 | Фаза | Вход | Выход | Владелец | Артефакт |
 | --- | --- | --- | --- | --- |
 | explore | карточка и вопрос владельца | найденные факты | исследователь | research-файл |
-| plan | research-файл | шаги и зависимости | исполнитель | PLAN.md |
+| plan | research-файл | шаги, зависимости и две формы | исполнитель | PLAN.md с таблицей владельцев |
 | improve | готовый план | пробелы и правки плана | оркестратор | запись ревью |
 | implement | просмотренный план | изменения в ветке | исполнитель | diff в PR |
 | verify | изменения в PR | результат проверок | CI | отчёт проверок |
@@ -23,6 +23,32 @@ phases: explore, plan, improve, implement, verify, commit, rules-check
 fields: input, output, owner, artifact
 no-artifact: fail
 executor-task:lifecycle -->
+
+## Форма проекта до кода
+
+Для нетривиального изменения, которое пересекает границу функции, исполнитель готовит две формы проекта до фазы implement. Форма задаётся типами, сигнатурами и границами модулей. Приём взят из `pstack/skills/architect/SKILL.md:9`, где требуется набросать две разные формы до кода.
+
+Две формы попадают в `PLAN.md` на фазе plan. Первая форма описывает типы, сигнатуры и границы. Вторая даёт другую структуру, а не другие имена. Для каждой формы исполнитель заполняет таблицу состояния и владельца.
+
+| Форма | Состояние | Владелец состояния |
+| --- | --- | --- |
+| A | состояние A1 | модуль X |
+| B | состояние B1 | модуль Y |
+
+Владелец состояния один для каждого состояния. Состояние с двумя владельцами или без владельца не годится. Исполнитель выбирает форму с меньшим числом владельцев. Если владельцев поровну, он берёт форму, где вызывающий знает меньше. Выбор и причина записываются в `PLAN.md`.
+
+Сравнение обязательно для фазы plan. `PLAN.md` без двух форм и таблиц владельцев проваливает фазу plan по правилу `no-artifact: fail`. Правило не действует на правки, которые не пересекают границу функции. Протокол Watch и число MCP-инструментов не меняются. Источник: карточка PSKX-01 и `pstack/skills/architect/SKILL.md:9`.
+
+<!-- executor-task:design-shapes
+trigger: non-trivial, crosses-function-boundary
+artifact: PLAN.md, phase plan
+shapes: two, types-signatures-boundaries
+owner-table: state, exactly-one-owner-per-state
+select: fewer-owners, then less-caller-knowledge
+no-comparison: fail-plan
+scope: no-protocol-change
+source: pstack/skills/architect/SKILL.md:9, PSKX-01
+executor-task:design-shapes -->
 
 ## Входные данные
 
