@@ -95,11 +95,8 @@ type tracePayload struct {
 
 var traceKinds = map[string]bool{"wake": true, "ack": true, "retry": true}
 
-func traceKind(ev store.JournalEvent, payload tracePayload) string {
+func traceKind(payload tracePayload) string {
 	kind := strings.TrimSpace(payload.Kind)
-	if kind == "" {
-		kind = strings.TrimSpace(ev.Type)
-	}
 	if kind == "wake-intent" {
 		return "wake"
 	}
@@ -125,7 +122,7 @@ func collectTrace(events []store.JournalEvent, session string, since time.Time) 
 				continue
 			}
 		}
-		kind := traceKind(ev, payload)
+		kind := traceKind(payload)
 		if !traceKinds[kind] {
 			continue
 		}

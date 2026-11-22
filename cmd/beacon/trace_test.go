@@ -43,7 +43,6 @@ func traceFixture(watchID, kind, reason, source string, revision int64, at time.
 		kind, reason, source, revision, watchID)
 	return store.JournalEvent{
 		WatchID:       watchID,
-		Type:          kind,
 		SchemaVersion: 4,
 		Payload:       json.RawMessage(payload),
 		CreatedAt:     at.UnixNano(),
