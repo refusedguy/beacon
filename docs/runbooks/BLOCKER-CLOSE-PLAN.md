@@ -1,6 +1,6 @@
 # План закрытия 14 карточек-блокеров цикла CLEAN и ARDH
 
-Дата: 2026-11-21. Основание: `docs/research/task-lifecycle-brainstorm.md`, `docs/runbooks/CLOSE-PROCEDURE.md` и поля «Подтверждение» в самих карточках. Реализации и доказательства собраны из текста карточек и истории коммитов. Статусы карточек не правились вручную, индекс не трогался, тесты и сборки не запускались.
+Дата: 2026-11-21. Основание: `docs/runbooks/CLOSE-PROCEDURE.md` и поля «Подтверждение» в самих карточках. Реализации и доказательства собраны из текста карточек и истории коммитов. Статусы карточек не правились вручную, индекс не трогался, тесты и сборки не запускались.
 
 ## Сейчас происходит
 
@@ -111,7 +111,7 @@ beacon task needs-input CLEAN-16 \
 Команды идут по одной. Повторный `done` на уже закрытой карточке получает отказ без записи. Если карточка уже в `done`, её пропускают.
 
 <!-- blocker-close-plan
-source: docs/research/task-lifecycle-brainstorm.md, docs/runbooks/CLOSE-PROCEDURE.md
+source: docs/runbooks/CLOSE-PROCEDURE.md
 cards: ARDH-04, ARDH-08, ARDH-21, ARDH-22, CLEAN-05, CLEAN-06, CLEAN-08, CLEAN-10, CLEAN-11, CLEAN-12, CLEAN-13, CLEAN-14, CLEAN-15, CLEAN-16
 done-now: 9
 needs-input: 5
