@@ -974,6 +974,9 @@ func run() int {
 		bridgeErr == nil && sb.Delivery == "steer" && sb.Outcome == "posted" &&
 			sb.BlockedOutcome == "transport-failed" && sb.Calls == 1)
 
+	// W09 работает на фейковом хосте и не доказывает повтор указателя после
+	// рестарта. Живое доказательство лежит в chaos-тесте
+	// TestSteerDedupAcrossRestart (tests/chaos/duplicate-delivery_test.go).
 	ro := bridge.ReceiptOutcomes
 	record("18_w09_receipt_outcomes",
 		"posted и transport-failed с режимом 0600, повтор не меняет квитанцию",
