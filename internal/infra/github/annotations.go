@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 const annotationsQuery = `query FailureExcerpts($owner: String!, $repo: String!, $sha: GitObjectID!, $checkName: String!) {
@@ -156,8 +155,9 @@ type graphQLCheckRun struct {
 }
 
 // formatGraphQLAnnotations renders at most failureExcerptAnnotations lines as
-// "path:line: title: message". The byte check runs on every line so a large
-// annotation cannot push the result past the shared ceiling.
+// "path:line: title: message", followed by the marked source window when the
+// annotated file is available. The byte check runs on every annotation so a
+// large excerpt cannot push the result past the shared ceiling.
 func formatGraphQLAnnotations(suites []graphQLCheckSuite) string {
 	var b strings.Builder
 	lines := 0
@@ -165,7 +165,7 @@ func formatGraphQLAnnotations(suites []graphQLCheckSuite) string {
 		for _, run := range suite.CheckRuns.Nodes {
 			for _, annotation := range run.Annotations.Nodes {
 				if lines >= failureExcerptAnnotations || b.Len() >= failureExcerptLimit {
-					return b.String()
+					return clampExcerptBytes(b.String())
 				}
 				line := formatGraphQLAnnotation(annotation)
 				if line == "" {
@@ -175,18 +175,15 @@ func formatGraphQLAnnotations(suites []graphQLCheckSuite) string {
 					b.WriteByte('\n')
 				}
 				b.WriteString(line)
+				if source := FormatAnnotationSource(strings.TrimSpace(annotation.Path), annotation.StartLine, ""); source != "" {
+					b.WriteByte('\n')
+					b.WriteString(source)
+				}
 				lines++
 			}
 		}
 	}
-	out := b.String()
-	if len(out) > failureExcerptLimit {
-		out = out[:failureExcerptLimit]
-		for len(out) > 0 && !utf8.ValidString(out) {
-			out = out[:len(out)-1]
-		}
-	}
-	return out
+	return clampExcerptBytes(b.String())
 }
 
 func formatGraphQLAnnotation(a graphQLAnnotation) string {
