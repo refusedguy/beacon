@@ -36,6 +36,23 @@ executor-task:lifecycle -->
 | watchID | ответ `beacon_watch_pr` | ключ ожидания и отчёта |
 | verdict | `beacon_get_result` | решение о пробуждении |
 
+## Разделение каналов
+
+Агент меняет состояние цикла через MCP-инструменты. Это `beacon_watch_pr`, `beacon_ack`, `beacon_cancel_watch`, `beacon_task_claim`, `beacon_task_close` и `beacon_defer_wiring`. Агент зовёт их внутри хода и читает типизированную ошибку в ответе.
+
+Для диагностики агент запускает CLI-команды `beacon inspect`, `beacon watch` и `beacon board`. Они показывают состояние Watch, карточек и графа. Агент не ищет состояние в логах вручную и не ждёт в bash.
+
+Пробуждение приходит как Wake. Beacon доставляет Wake, агент его не запрашивает. После Wake агент читает результат через `beacon_get_result`. Вердикт из этого ответа определяет следующее действие. Квитанция доставки и текст отчёта вердиктом не являются.
+
+Основание: `docs/research/audit-04-protocols.md`, раздел а.
+
+<!-- executor-task:channels
+state-change: mcp
+diagnostics: cli (beacon inspect, beacon watch, beacon board)
+wake: beacon delivers, agent does not poll
+result: beacon_get_result after wake
+executor-task:channels -->
+
 ## Получение задачи через beacon_task_claim
 
 Задачу выдаёт оркестратор через `beacon_task_claim` с agent ID. Исполнитель получает ID карточки, цель, зависимости, OwnerFiles, режим плана и handoff. Первая выдача помечает карточку `in_progress`, поэтому второй агент не возьмёт ту же карточку.

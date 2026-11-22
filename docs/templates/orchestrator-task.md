@@ -4,6 +4,23 @@
 
 Основание: WORKER-PROMPT §4.7 и §13, ADR 0001, ADR 0019, ADR 0021, ADR 0072, ADR 0258. Оркестратор тонкий: он не чинит main сам, а реагирует на сигнал и запускает FIX-агента.
 
+## Разделение каналов
+
+Оркестратор меняет состояние цикла через MCP-инструменты. Это `beacon_task_claim`, `beacon_watch_pr`, `beacon_ack` и `beacon_cancel_watch`. Он зовёт их внутри хода и читает типизированную ошибку в ответе. Закрытие карточки по блокеру с доказательством идёт через CLI и описано отдельно.
+
+Для диагностики оркестратор запускает CLI-команды `beacon inspect`, `beacon watch` и `beacon board`. Он не ищет состояние в логах вручную и не ждёт в bash.
+
+Пробуждение приходит как Wake. Beacon доставляет Wake подписчикам Watch. Оркестратор читает вердикт через `beacon_get_result`. Исполнитель после Wake тоже читает результат через `beacon_get_result`. Вердикт из этого ответа определяет следующее действие. Квитанция доставки, прочтение результата и текст `<subagent>`-отчёта вердиктом не являются.
+
+Основание: `docs/research/audit-04-protocols.md`, раздел а.
+
+<!-- orchestrator-task:channels
+state-change: mcp
+diagnostics: cli (beacon inspect, beacon watch, beacon board)
+wake: beacon delivers, orchestrator reads verdict via beacon_get_result
+result: beacon_get_result after wake for executor
+orchestrator-task:channels -->
+
 ## Карта жизненного цикла карточки
 
 Оркестратор ведёт карточку через те же семь фаз, что и исполнитель. У каждой фазы есть вход, выход, владелец и артефакт. Фаза без артефакта проваливает карточку.
