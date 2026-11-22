@@ -280,6 +280,51 @@ func TestTaskCommandWhyIgnoresBlockedText(t *testing.T) {
 	}
 }
 
+func TestTaskCommandWhyNewIDForms(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "ATX-R01", "in_progress", "holder-atx", "нет", "цепочка")
+	writeWhyCard(t, dir, "RS-CMP-06", "in_progress", "holder-rs", "нет", "цепочка")
+	writeWhyCard(t, dir, "T9.1", "todo", "", "depends-on:ATX-R01", "цепочка")
+	writeWhyCard(t, dir, "T9.2", "todo", "", "depends-on:RS-CMP-06", "цепочка")
+
+	for _, tc := range []struct{ start, target, holder string }{
+		{"T9.1", "ATX-R01", "holder-atx"},
+		{"T9.2", "RS-CMP-06", "holder-rs"},
+	} {
+		var stdout, stderr bytes.Buffer
+		code := TaskCommandWithConfig([]string{"task", "why", tc.start}, &stdout, &stderr, whyConfig(dir))
+		if code != 0 || stderr.Len() != 0 {
+			t.Fatalf("why %s: код %d, stderr %q", tc.start, code, stderr.String())
+		}
+		out := stdout.String()
+		for _, want := range []string{tc.target, tc.holder, "через depends-on"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("why %s: в выводе нет %q: %q", tc.start, want, out)
+			}
+		}
+	}
+}
+
+func TestTaskCommandWhyTreatsDuplicateAsClosed(t *testing.T) {
+	dir := t.TempDir()
+	writeWhyCard(t, dir, "T5.1", "todo", "", "T5.2", "цепочка")
+	writeWhyCard(t, dir, "T5.2", "duplicate", "holder-dup", "T5.3", "цепочка")
+	writeWhyCard(t, dir, "T5.3", "todo", "", "нет", "цепочка")
+
+	var stdout, stderr bytes.Buffer
+	code := TaskCommandWithConfig([]string{"task", "why", "T5.1"}, &stdout, &stderr, whyConfig(dir))
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("код %d, stderr %q", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "T5.2") {
+		t.Errorf("дубликат попал в цепочку: %q", out)
+	}
+	if !strings.Contains(out, "цепочка блокировок не найдена") {
+		t.Errorf("нет сообщения о пустой цепочке: %q", out)
+	}
+}
+
 func TestTaskCommandWhyValidation(t *testing.T) {
 	dir := t.TempDir()
 	writeWhyCard(t, dir, "T4.1", "todo", "", "нет", "цепочка")
