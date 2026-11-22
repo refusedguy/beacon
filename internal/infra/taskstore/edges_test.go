@@ -274,3 +274,119 @@ func TestTraverseUnknownStart(t *testing.T) {
 		t.Fatalf("обход от неизвестного ID: %+v", tr)
 	}
 }
+
+func cycleKey(cycles [][]string) string {
+	parts := make([]string, len(cycles))
+	for i, c := range cycles {
+		parts[i] = "[" + strings.Join(c, ",") + "]"
+	}
+	return strings.Join(parts, "|")
+}
+
+func TestCanonicalCycleReportStableJSON(t *testing.T) {
+	edges := []Edge{
+		{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+		{From: "T3.2", To: "T3.3", Kind: EdgeDependsOn},
+		{From: "T3.3", To: "T3.1", Kind: EdgeRelated},
+		{From: "T3.1", To: "T3.2", Kind: EdgeSupersedes}, // параллельное ребро
+		{From: "T3.4", To: "T3.5", Kind: EdgeBlocks},
+		{From: "T3.5", To: "T3.6", Kind: EdgeDependsOn},
+		{From: "T3.6", To: "T3.4", Kind: EdgeRelated},
+		{From: "T3.7", To: "T3.8", Kind: EdgeBlocks},
+		{From: "T3.8", To: "T3.9", Kind: EdgeDependsOn},
+		{From: "T3.9", To: "T3.7", Kind: EdgeRelated},
+		{From: "T3.2", To: "T3.5", Kind: EdgeSupersedes},
+		{From: "T3.9", To: "T3.2", Kind: EdgeRelated},
+	}
+	if len(edges) != 12 {
+		t.Fatalf("ожидали 12 рёбер, получили %d", len(edges))
+	}
+	reversed := make([]Edge, len(edges))
+	for i, e := range edges {
+		reversed[len(edges)-1-i] = e
+	}
+
+	a := CanonicalCycleReport(edges)
+	b := CanonicalCycleReport(reversed)
+	ja, err := a.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb, err := b.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ja) != string(jb) {
+		t.Fatalf("JSON зависит от порядка рёбер:\n%s\n%s", ja, jb)
+	}
+	want := "[T3.1,T3.2,T3.3]|[T3.4,T3.5,T3.6]|[T3.7,T3.8,T3.9]"
+	if got := cycleKey(a.Cycles); got != want {
+		t.Fatalf("циклы = %s, ждали %s", got, want)
+	}
+}
+
+func TestCanonicalCycleReportCollapsesParallelEdges(t *testing.T) {
+	edges := []Edge{
+		{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+		{From: "T3.1", To: "T3.2", Kind: EdgeDependsOn},
+		{From: "T3.2", To: "T3.1", Kind: EdgeRelated},
+	}
+	r := CanonicalCycleReport(edges)
+	if got, want := cycleKey(r.Cycles), "[T3.1,T3.2]"; got != want {
+		t.Fatalf("циклы = %s, ждали %s", got, want)
+	}
+}
+
+func TestCanonicalCycleReportRotationIsOneEntry(t *testing.T) {
+	forward := []Edge{
+		{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+		{From: "T3.2", To: "T3.3", Kind: EdgeBlocks},
+		{From: "T3.3", To: "T3.1", Kind: EdgeBlocks},
+	}
+	rotated := []Edge{
+		{From: "T3.2", To: "T3.3", Kind: EdgeBlocks},
+		{From: "T3.3", To: "T3.1", Kind: EdgeBlocks},
+		{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+	}
+	both := append(append([]Edge(nil), forward...), rotated...)
+	for _, edges := range [][]Edge{forward, rotated, both} {
+		r := CanonicalCycleReport(edges)
+		if got, want := cycleKey(r.Cycles), "[T3.1,T3.2,T3.3]"; got != want {
+			t.Fatalf("циклы = %s, ждали %s", got, want)
+		}
+	}
+}
+
+func TestCanonicalCycleReportEmptyForAcyclic(t *testing.T) {
+	edges := []Edge{
+		{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+		{From: "T3.2", To: "T3.3", Kind: EdgeDependsOn},
+		{From: "T3.1", To: "T3.3", Kind: EdgeSupersedes},
+	}
+	a := CanonicalCycleReport(edges)
+	b := CanonicalCycleReport([]Edge{edges[2], edges[0], edges[1]})
+	ja, err := a.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jb, err := b.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(ja) != string(jb) || string(ja) != `{"cycles":[]}` {
+		t.Fatalf("пустой отчёт = %s и %s, ждали {\"cycles\":[]}", ja, jb)
+	}
+}
+
+func TestGraphCycleReportKeepsAddEdgeRejection(t *testing.T) {
+	g := testGraph(t,
+		Edge{From: "T3.1", To: "T3.2", Kind: EdgeBlocks},
+		Edge{From: "T3.2", To: "T3.3", Kind: EdgeDependsOn},
+	)
+	if err := g.AddEdge("T3.3", "T3.1", EdgeRelated); err == nil {
+		t.Fatal("AddEdge должен отклонять цикл")
+	}
+	if got := g.CycleReport(); len(got.Cycles) != 0 {
+		t.Fatalf("граф с запретом цикла дал отчёт: %+v", got)
+	}
+}

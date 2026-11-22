@@ -1,6 +1,10 @@
 package taskstore
 
-import "strings"
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+)
 
 // EdgeKind задаёт тип ребра в графе карточек. Все рёбра направленные.
 type EdgeKind string
@@ -196,4 +200,133 @@ func (g *Graph) Traverse(start string, limit int) Traversal {
 // TraverseAll обходит граф с пределом по умолчанию.
 func (g *Graph) TraverseAll(start string) Traversal {
 	return g.Traverse(start, DefaultTraversalLimit)
+}
+
+// CycleReport это канонический отчёт о простых циклах. Каждый цикл — список ID,
+// повёрнутый так, что первым идёт минимальный ID. Список циклов отсортирован,
+// поэтому порядок рёбер на входе не влияет на результат.
+type CycleReport struct {
+	Cycles [][]string `json:"cycles"`
+}
+
+// JSON возвращает байтовое представление отчёта для JSON-ответа. Порядок полей
+// и циклов фиксирован, поэтому два отчёта одного графа совпадают побайтово.
+func (r CycleReport) JSON() ([]byte, error) {
+	return json.Marshal(r)
+}
+
+// CanonicalCycleReport строит канонический отчёт по списку рёбер. Функция
+// чистая: не меняет вход и не зависит от порядка рёбер. Параллельные рёбра
+// (одинаковые from/to) схлопываются, корни и соседи сортируются, каждый цикл
+// поворачивается к минимальному ID и разворачивается в каноническое направление.
+func CanonicalCycleReport(edges []Edge) CycleReport {
+	adj := make(map[string]map[string]bool)
+	nodes := make(map[string]bool)
+	for _, e := range edges {
+		nodes[e.From] = true
+		nodes[e.To] = true
+		if adj[e.From] == nil {
+			adj[e.From] = make(map[string]bool)
+		}
+		adj[e.From][e.To] = true
+	}
+
+	roots := make([]string, 0, len(nodes))
+	for id := range nodes {
+		roots = append(roots, id)
+	}
+	sort.Strings(roots)
+
+	neighbors := make(map[string][]string, len(roots))
+	for _, from := range roots {
+		list := make([]string, 0, len(adj[from]))
+		for to := range adj[from] {
+			list = append(list, to)
+		}
+		sort.Strings(list)
+		neighbors[from] = list
+	}
+
+	cycles := make([][]string, 0)
+	seen := make(map[string]bool)
+	var walk func(start, cur string, path []string, onPath map[string]bool)
+	walk = func(start, cur string, path []string, onPath map[string]bool) {
+		for _, next := range neighbors[cur] {
+			if next == start {
+				cycle := canonicalCycle(path)
+				key := strings.Join(cycle, "\x00")
+				if !seen[key] {
+					seen[key] = true
+					cycles = append(cycles, cycle)
+				}
+				continue
+			}
+			// Начало пути должно быть минимальным ID в цикле.
+			if next < start || onPath[next] {
+				continue
+			}
+			onPath[next] = true
+			walk(start, next, append(path, next), onPath)
+			delete(onPath, next)
+		}
+	}
+	for _, start := range roots {
+		walk(start, start, []string{start}, map[string]bool{start: true})
+	}
+	sort.Slice(cycles, func(i, j int) bool {
+		return compareIDs(cycles[i], cycles[j]) < 0
+	})
+	return CycleReport{Cycles: cycles}
+}
+
+// canonicalCycle приводит путь к канонической форме: первый ID минимален
+// (гарантируется обходом), между прямым и обратным направлением берётся
+// лексикографически меньшее.
+func canonicalCycle(path []string) []string {
+	forward := append([]string(nil), path...)
+	backward := make([]string, len(path))
+	backward[0] = path[0]
+	for i := 1; i < len(path); i++ {
+		backward[i] = path[len(path)-i]
+	}
+	if compareIDs(backward, forward) < 0 {
+		return backward
+	}
+	return forward
+}
+
+// compareIDs сравнивает списки ID лексикографически.
+func compareIDs(a, b []string) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] < b[i] {
+			return -1
+		}
+		if a[i] > b[i] {
+			return 1
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	return 0
+}
+
+// Edges возвращает все рёбра графа. Порядок результата не определён: рёбра
+// приходят из карты. Для отчёта используйте CycleReport, который сортирует.
+func (g *Graph) Edges() []Edge {
+	out := make([]Edge, 0, g.count)
+	for _, list := range g.out {
+		out = append(out, list...)
+	}
+	return out
+}
+
+// CycleReport возвращает канонический отчёт о циклах графа. Граф, построенный
+// через AddEdge, ацикличен, поэтому отчёт пуст; функция остаётся удобной точкой
+// входа для JSON-ответа и для графов, загруженных из внешнего источника.
+func (g *Graph) CycleReport() CycleReport {
+	return CanonicalCycleReport(g.Edges())
 }
