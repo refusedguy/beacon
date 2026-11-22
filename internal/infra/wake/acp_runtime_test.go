@@ -52,7 +52,7 @@ func TestW10AResolveACPRuntimeCommand(t *testing.T) {
 }
 
 func TestW10ASupportedACPRuntimes(t *testing.T) {
-	want := []string{"claude", "codex", "opencode", "pi"}
+	want := []string{"claude", "codex", "gemini", "opencode", "pi"}
 	if got := SupportedACPRuntimes(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("SupportedACPRuntimes = %v, want %v", got, want)
 	}
