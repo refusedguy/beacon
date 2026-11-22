@@ -532,6 +532,33 @@ wake: keep_working, rebase, retry
 nowake: ready, watching, merged, closed, timeout
 executor-task:verdicts -->
 
+## Исправление неверного действия до терминального отказа
+
+Три ошибки действия агент исправляет сам, без слота оркестратора: неверный формат действия, запрещённое действие и синтаксис команды. Для каждой ошибки агент получает отдельный шаблон ответа. Шаблон называет причину и просит прислать одно исправленное действие.
+
+| Ошибка | Код | Шаблон ответа |
+| --- | --- | --- |
+| неверный формат действия | `action_format` | `ActionRequeryTemplate(ActionFormatError)` |
+| запрещённое действие | `blocked_action` | `ActionRequeryTemplate(ActionBlockedAction)` |
+| синтаксис команды | `command_syntax` | `ActionRequeryTemplate(ActionCommandSyntax)` |
+
+Бюджет равен трём повторам: константа `MaxActionRequeries` в `internal/infra/mcp/tool_wait_result.go`. Счётчик общий для трёх ошибок. Четвёртая ошибка подряд заканчивает прогон с терминальным исходом `exit_format`. Исправленная попытка попадает в траекторию через `ActionTrajectory`, но не попадает в видимую историю сообщений и не меняет `WaitResultOutput`, вердикт или `WaitStopReason`.
+
+Ошибка API, среды или рантайма не исправляется повтором. Такой исход заканчивает прогон сразу со своим кодом, например `exit_api` или `exit_environment_error`, и не расходует бюджет повторов.
+
+Бюджет повторов действия не равен бюджету повторов красных проверок `FlakyConfig.MaxRetries` и не добавляет значений в `WaitStopReason`. Правило пробуждения не меняется: агент просыпается только на `keep_working`, `rebase` и `retry`. Ошибка формата действия, которую агент исправил сам, не расходует слот оркестратора.
+
+<!-- executor-task:action-requery
+errors: action_format, blocked_action, command_syntax
+templates: per-error, ActionRequeryTemplate
+budget: MaxActionRequeries, 3, shared-counter
+terminal: exit_format
+trajectory: ActionTrajectory, not-visible-history
+separate-from: FlakyConfig.MaxRetries, WaitStopReason
+wake: unchanged, keep_working-rebase-retry
+source: SB-16, docs/research/comp-swebench.md, sweagent/agent/agents.py
+executor-task:action-requery -->
+
 ## Действие после retry
 
 Вердикт `retry` требует классификации до конца хода. Исполнитель читает `failedChecks` через `beacon_get_result` и сверяет их со своим diff. Отвечать `waiting, <watchID>` сразу после retry запрещено. Такой ответ оставляет задачу без владельца и повторяет инцидент 334, где агент дважды ответил waiting и не написал blocked.
