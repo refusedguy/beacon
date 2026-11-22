@@ -567,7 +567,7 @@ func (b *EventBus) PublishTyped(name EventName, payload any) error {
 		b.patchesSinceSnapshot = 0
 		b.lastSnapshotID = b.next + 1
 	} else {
-		if b.patchesSinceSnapshot >= maxPatchesPerSnapshot {
+		if b.patchesSinceSnapshot >= uint64(maxPatchesPerSnapshot) {
 			return fmt.Errorf("%w: %d patches since snapshot", ErrSnapshotDue, b.patchesSinceSnapshot)
 		}
 		b.patchesSinceSnapshot++
