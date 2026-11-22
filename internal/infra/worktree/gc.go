@@ -4,6 +4,8 @@
 package worktree
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -608,4 +610,171 @@ func (s *IgnoreSpec) Stats() IgnoreStats {
 		RuleLoads:    s.ruleLoads,
 		RuleVersion:  s.version,
 	}
+}
+
+// ---------------------------------------------------------------------------
+// File checkpoints (CSx-10). A checkpoint copies the files of one worktree at
+// a message boundary. The copy lives outside the worktree, so a GC pass never
+// deletes it with the directory. A rewind writes the recorded bytes back to
+// the worktree and runs no git command, so the branch and the commit history
+// stay unchanged. A repeated rewind converges to the same file contents.
+// ---------------------------------------------------------------------------
+
+// fileCheckpointDir is the folder under the store root that holds snapshots.
+const fileCheckpointDir = "file-checkpoints"
+
+// FileCheckpointStore keeps named snapshots of worktree files on disk. It is
+// safe for concurrent use. The root must sit outside every managed worktree.
+type FileCheckpointStore struct {
+	root string
+	mu   sync.Mutex
+}
+
+// NewFileCheckpointStore builds a store rooted at root. Callers pass a state
+// directory, never a path inside a worktree, so GC cannot remove saved files.
+func NewFileCheckpointStore(root string) *FileCheckpointStore {
+	return &FileCheckpointStore{root: filepath.Clean(root)}
+}
+
+// SaveFileCheckpoint copies every kept file of worktreeDir into a directory
+// named for messageID, scoped by a hash of the worktree path so two worktrees
+// never share a snapshot. The ignore rules skip service paths and ignored
+// files. Saving the same messageID twice converges to the same bytes. The
+// returned id is opaque and is the argument to RewindFiles.
+func (s *FileCheckpointStore) SaveFileCheckpoint(worktreeDir, messageID string) (string, error) {
+	if s == nil || strings.TrimSpace(s.root) == "" {
+		return "", fmt.Errorf("worktree: fileCheckpoint: empty store root")
+	}
+	if strings.TrimSpace(worktreeDir) == "" || strings.TrimSpace(messageID) == "" {
+		return "", fmt.Errorf("worktree: fileCheckpoint: empty worktree or message id")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	id := filepath.Join(fileCheckpointScope(worktreeDir), fileCheckpointKey(messageID))
+	dest := filepath.Join(s.root, fileCheckpointDir, id)
+	if err := os.RemoveAll(dest); err != nil {
+		return "", fmt.Errorf("worktree: fileCheckpoint: clear %s: %w", dest, err)
+	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", fmt.Errorf("worktree: fileCheckpoint: mkdir %s: %w", dest, err)
+	}
+
+	spec := NewIgnoreSpec("")
+	err := filepath.WalkDir(worktreeDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			if path == cleanDir(worktreeDir) {
+				return nil
+			}
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() || d.Name() == ".git" || !spec.Keep(worktreeDir, path) {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(worktreeDir, path)
+		if err != nil {
+			return err
+		}
+		target, ok := safeFileJoin(dest, rel)
+		if !ok {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
+	if err != nil {
+		return "", fmt.Errorf("worktree: fileCheckpoint: walk %s: %w", worktreeDir, err)
+	}
+	return id, nil
+}
+
+// RewindFiles restores the files recorded by checkpointID into worktreeDir.
+// Only file bytes are written. No git command runs, so a rewind never changes
+// the branch or the commit history. A repeat overwrites the same bytes and is
+// idempotent at the content level. Files that were not in the checkpoint are
+// left in place rather than deleted.
+func (s *FileCheckpointStore) RewindFiles(worktreeDir, checkpointID string) error {
+	if s == nil || strings.TrimSpace(s.root) == "" {
+		return fmt.Errorf("worktree: rewindFiles: empty store root")
+	}
+	if strings.TrimSpace(worktreeDir) == "" || strings.TrimSpace(checkpointID) == "" {
+		return fmt.Errorf("worktree: rewindFiles: empty worktree or checkpoint id")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	src, ok := safeFileJoin(filepath.Join(s.root, fileCheckpointDir), checkpointID)
+	if !ok {
+		return fmt.Errorf("worktree: rewindFiles: checkpoint id escapes store: %q", checkpointID)
+	}
+	info, err := os.Stat(src)
+	if err != nil || !info.IsDir() {
+		return fmt.Errorf("worktree: rewindFiles: no checkpoint %q", checkpointID)
+	}
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || !d.Type().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target, ok := safeFileJoin(worktreeDir, rel)
+		if !ok {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, data, 0o644)
+	})
+}
+
+// fileCheckpointScope derives a stable, path-safe scope from the worktree
+// directory so two worktrees never read or write the same snapshot.
+func fileCheckpointScope(worktreeDir string) string {
+	sum := sha256.Sum256([]byte(cleanDir(worktreeDir)))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// fileCheckpointKey turns a message id into a path-safe directory name.
+func fileCheckpointKey(messageID string) string {
+	sum := sha256.Sum256([]byte(messageID))
+	return hex.EncodeToString(sum[:])
+}
+
+// safeFileJoin joins rel under base and refuses paths that escape base. It
+// keeps both a stored checkpoint id and a file path from reaching outside the
+// directory the caller chose.
+func safeFileJoin(base, rel string) (string, bool) {
+	rel = filepath.Clean(rel)
+	if rel == "." || filepath.IsAbs(rel) || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	joined := filepath.Join(base, rel)
+	check, err := filepath.Rel(filepath.Clean(base), joined)
+	if err != nil || check == ".." || strings.HasPrefix(check, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return joined, true
 }

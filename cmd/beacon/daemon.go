@@ -24,6 +24,7 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/store"
 	"github.com/refusedguy/beacon/internal/infra/taskstore"
 	"github.com/refusedguy/beacon/internal/infra/wake"
+	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
 // daemonIntervalEnv overrides the pass interval when --interval is absent.
@@ -1023,4 +1024,48 @@ func runDaemonCardMonitor(ctx context.Context, monitor *tasks.Monitor, db *store
 			daemonPollCards(ctx, monitor, db, root)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Agent file checkpoints (CSx-10). The daemon owns the state dir that holds
+// the snapshots. All file I/O stays in the worktree infra package; cmd only
+// passes paths and reports a failure to the actor metric.
+// ---------------------------------------------------------------------------
+
+// fileCheckpointRoot returns the store root for agent file checkpoints. It
+// lives under the daemon state dir, outside every managed worktree, so a GC
+// pass never deletes a saved copy together with its worktree directory.
+func fileCheckpointRoot(stateDir string) string {
+	return filepath.Join(stateDir, "agent-file-checkpoints")
+}
+
+// checkpointAgentFiles snapshots the files of worktreeDir at one message
+// boundary. messageID is the stable identifier of the message that triggered
+// the snapshot; saving the same id twice converges to the same bytes. The
+// returned id is the argument to rewindFileCheckpoint.
+func checkpointAgentFiles(stateDir, worktreeDir, messageID string) (string, error) {
+	if strings.TrimSpace(stateDir) == "" || strings.TrimSpace(worktreeDir) == "" || strings.TrimSpace(messageID) == "" {
+		return "", fmt.Errorf("beacon daemon: fileCheckpoint: empty state dir, worktree or message id")
+	}
+	store := worktree.NewFileCheckpointStore(fileCheckpointRoot(stateDir))
+	id, err := store.SaveFileCheckpoint(worktreeDir, messageID)
+	if err != nil {
+		observe.ActorError("fileCheckpoint", "", err)
+	}
+	return id, err
+}
+
+// rewindFileCheckpoint restores the files recorded by checkpointID into
+// worktreeDir. It runs no git command, so the branch and the commit history
+// are unchanged. A repeat rewind writes the same bytes.
+func rewindFileCheckpoint(stateDir, worktreeDir, checkpointID string) error {
+	if strings.TrimSpace(stateDir) == "" || strings.TrimSpace(worktreeDir) == "" || strings.TrimSpace(checkpointID) == "" {
+		return fmt.Errorf("beacon daemon: rewindFiles: empty state dir, worktree or checkpoint id")
+	}
+	store := worktree.NewFileCheckpointStore(fileCheckpointRoot(stateDir))
+	if err := store.RewindFiles(worktreeDir, checkpointID); err != nil {
+		observe.ActorError("rewindFiles", "", err)
+		return err
+	}
+	return nil
 }
