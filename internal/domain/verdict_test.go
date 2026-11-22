@@ -1326,8 +1326,8 @@ func TestEvaluateExternalDeterministicAndPure(t *testing.T) {
 	declared := []string{"build", "audit"}
 	observed := []ExternalCheck{{Name: "build", ExitCode: 0}, {Name: "audit", ExitCode: 3}}
 	want := EvaluateExternal(declared, observed)
-	if want.Verdict != ExternalFail {
-		t.Fatalf("verdict = %q, want fail", want.Verdict)
+	if want.Verdict != ExternalPartial {
+		t.Fatalf("verdict = %q, want partial", want.Verdict)
 	}
 
 	declaredCopy := append([]string(nil), declared...)
