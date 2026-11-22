@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMetricsIncrementUnlabeledAndLabelledCounters(t *testing.T) {
@@ -364,5 +365,65 @@ func TestStartMetricsServerDisabledAndInvalidPort(t *testing.T) {
 	}
 	if _, err := StartMetricsServer("не-порт", NewMetrics()); err == nil {
 		t.Error("невалидный порт должен отклоняться")
+	}
+}
+
+func TestRetryOpenHistogramExportsBucketsSumAndCount(t *testing.T) {
+	previous := Default()
+	defer SetDefault(previous)
+
+	m := NewMetrics()
+	SetDefault(NewRecorder(nil, m))
+	RetryOpen("w1", 2*time.Second)
+
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		"# TYPE beacon_retry_open_duration_seconds histogram",
+		`beacon_retry_open_duration_seconds_bucket{le="1"} 0`,
+		`beacon_retry_open_duration_seconds_bucket{le="5"} 1`,
+		`beacon_retry_open_duration_seconds_bucket{le="+Inf"} 1`,
+		"beacon_retry_open_duration_seconds_sum 2",
+		"beacon_retry_open_duration_seconds_count 1",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("в Prometheus-выводе нет %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "watchID") || strings.Contains(text, "sessionID") {
+		t.Errorf("в метрике есть высококардинальная метка:\n%s", text)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(m.JSON(), &got); err != nil {
+		t.Fatalf("невалидный JSON метрик: %v", err)
+	}
+	hist, ok := got["histograms"].(map[string]any)
+	if !ok {
+		t.Fatalf("нет histograms: %v", got)
+	}
+	retry, ok := hist[HistogramRetryOpen].(map[string]any)
+	if !ok {
+		t.Fatalf("нет гистограммы %s: %v", HistogramRetryOpen, hist)
+	}
+	if retry["count"] != float64(1) || retry["sum"] != float64(2) {
+		t.Errorf("%s count/sum = %v/%v, ожидалось 1/2", HistogramRetryOpen, retry["count"], retry["sum"])
+	}
+	buckets, ok := retry["buckets"].(map[string]any)
+	if !ok || buckets["1"] != float64(0) || buckets["5"] != float64(1) || buckets["+Inf"] != float64(1) {
+		t.Errorf("%s buckets = %v", HistogramRetryOpen, retry["buckets"])
+	}
+}
+
+func TestRetryOpenHistogramRegisteredAtZero(t *testing.T) {
+	m := NewMetrics()
+	text := string(m.Prometheus())
+	for _, want := range []string{
+		"# TYPE beacon_retry_open_duration_seconds histogram",
+		"beacon_retry_open_duration_seconds_bucket{le=\"+Inf\"} 0",
+		"beacon_retry_open_duration_seconds_count 0",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("свежая метрика не содержит %q:\n%s", want, text)
+		}
 	}
 }
