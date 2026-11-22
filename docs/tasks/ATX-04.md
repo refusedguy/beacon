@@ -1,5 +1,5 @@
 # ATX-04. Внедрить источник тиков в TestRunDaemonHeartbeatTicksAndStops
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: cmd/beacon/daemon_touch_test.go, cmd/beacon/daemon.go
@@ -12,3 +12,8 @@
 Шаги: Заменить параметр interval на ticks <-chan time.Time. Продакшен создаёт time.NewTicker, тест посылает два тика вручную. Проверку отсутствия тика сделать через select с default после подтверждения выхода горутины через done. Убрать time.Sleep(20ms).
 Проверка: CI зелёный. В тесте нет time.Sleep и нет опроса snapshot с интервалом 1 мс.
 Приёмка: Тест управляет тиками вручную. Отсутствие тика проверяется после выхода горутины.
+
+Итог: Already landed in PR #1211 (commit ecf63c3a79406684d85adae3e9cd6fac55e86f6b): ATX-04: deterministic daemon heartbeat ticks
+Доказательство: PR #1211; commit ecf63c3a79406684d85adae3e9cd6fac55e86f6b; git merge-base --is-ancestor ecf63c3a79406684d85adae3e9cd6fac55e86f6b origin/main exit 0; TestRunDaemonHeartbeatTicksAndStops drives ticks through a channel of time.Time, sends two ticks manually and has no time.Sleep in the file.
+Причина: already landed in PR #1211 ecf63c3a7940
+Время закрытия: 2026-11-22T11:47:55Z
