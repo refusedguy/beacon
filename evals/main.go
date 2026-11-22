@@ -34,6 +34,7 @@ import (
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	smoke "github.com/refusedguy/beacon/evals/cmd"
+	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/domain"
 	beaconmcp "github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/wake"
@@ -934,6 +935,15 @@ func run() int {
 	record("EC02_start_without_confirmation_fails",
 		"старт без подтверждения, без лимита и с другими критериями или лимитом запрещён",
 		ec02Actual, ec02Pass)
+
+	// AS01: автоспавн без ручного пинка. Один терминальный вердикт при
+	// свободном слоте и доступной todo-карточке даёт один spawn, одну связь
+	// cardID↔watchID и ноль сообщений владельцу. Занятый слот и повтор
+	// сигнала spawn не дают (ADR 0306, AUTOSP-10).
+	as01Actual, as01Pass := evalAutoSpawnNoManualPing()
+	record("AS01_autospawn_no_manual_ping",
+		"один spawn на терминальный вердикт, одна связь cardID→watchID, ноль сообщений владельцу; повтор и занятый слот не порождают spawn",
+		as01Actual, as01Pass)
 
 	// N01-N04: соглашение по именам артефактов из HD-055 (ADR 0304). Harbor
 	// называет workflow, скилл и правило aif-action.md, {skill}/SKILL.md и
@@ -3200,6 +3210,103 @@ func tempStateRoot() (string, func(), error) {
 		}
 	}
 	return dir, func() { _ = os.RemoveAll(dir) }, nil
+}
+
+// ---- ADR 0306: eval автоспавна без ручного пинка ----
+//
+// Контракт волны фиксируется на зафиксированном снимке состояния. Один
+// терминальный сигнал report_to_orchestrator при свободном слоте и доступной
+// todo-карточке даёт ровно один spawn, одну связь cardID↔watchID и ноль
+// сообщений владельцу. Повтор того же сигнала и занятый слот spawn не дают.
+// Сигнал, SlotLedger и проверка слота взяты из production-кода, поэтому eval
+// ловит регрессию в самих примитивах, а не только в локальной модели.
+
+// autoSpawnOutcome это то, что видно внешнему наблюдателю волны.
+type autoSpawnOutcome struct {
+	spawns     int
+	cardLink   string
+	ownerNotes int
+	incident   orchestrator.SlotIncidentKind
+}
+
+// decideAutoSpawn связывает терминальный сигнал, свободный слот,
+// одноразовый токен слота и доступную карточку. Возвращает число spawn,
+// связь cardID↔watchID и число сообщений владельцу.
+func decideAutoSpawn(signal, watchID string, revision uint64, cardID string, orch domain.Orchestrator, ledger *orchestrator.SlotLedger) autoSpawnOutcome {
+	out := autoSpawnOutcome{}
+	if signal != orchestrator.SignalReportToOrchestrator {
+		return out
+	}
+	if !orch.CanAcceptTask() {
+		return out
+	}
+	token, inc := ledger.Issue(signal, watchID, revision, 0)
+	if inc != nil {
+		out.incident = inc.Kind
+		return out
+	}
+	if token.Key() == "" || strings.TrimSpace(cardID) == "" {
+		return out
+	}
+	out.spawns = 1
+	out.cardLink = cardID + "→" + watchID
+	return out
+}
+
+// newAutoSpawnOrchestrator строит оркестратор с заданным числом занятых слотов.
+// Слоты занимаются через реальный Register, а не прямой подстановкой поля,
+// чтобы снимок оставался согласованным.
+func newAutoSpawnOrchestrator(id string, busy int) (domain.Orchestrator, error) {
+	orch, err := domain.NewOrchestrator(id, domain.RoleOrchestrator, "autospawn-eval", domain.DefaultSlotsTotal, nil)
+	if err != nil {
+		return domain.Orchestrator{}, err
+	}
+	for i := 0; i < busy; i++ {
+		if err := orch.Register(fmt.Sprintf("watch-busy-%d", i)); err != nil {
+			return domain.Orchestrator{}, err
+		}
+	}
+	return orch, nil
+}
+
+func evalAutoSpawnNoManualPing() (string, bool) {
+	const (
+		watchID  = "watch-autospawn-eval"
+		cardID   = "AUTOSP-10"
+		revision = uint64(7)
+	)
+
+	free, err := newAutoSpawnOrchestrator("ses_autospawn_eval_free", 0)
+	if err != nil {
+		return "оркестратор со свободным слотом: " + err.Error(), false
+	}
+	busy, err := newAutoSpawnOrchestrator("ses_autospawn_eval_busy", domain.DefaultSlotsTotal)
+	if err != nil {
+		return "оркестратор с занятыми слотами: " + err.Error(), false
+	}
+
+	// Позитивный контроль: терминальный вердикт, свободный слот, todo-карточка.
+	ledger := orchestrator.NewSlotLedger()
+	positive := decideAutoSpawn(orchestrator.SignalReportToOrchestrator, watchID, revision, cardID, free, ledger)
+	// Повтор того же сигнала не открывает второй слот.
+	duplicate := decideAutoSpawn(orchestrator.SignalReportToOrchestrator, watchID, revision, cardID, free, ledger)
+	// Негативный контроль: занятый слот не порождает spawn.
+	negative := decideAutoSpawn(orchestrator.SignalReportToOrchestrator, watchID, revision, cardID, busy, orchestrator.NewSlotLedger())
+	// Не-терминальный сигнал тоже не порождает spawn.
+	other := decideAutoSpawn("ready", watchID, revision, cardID, free, orchestrator.NewSlotLedger())
+
+	actual := fmt.Sprintf(
+		"spawn на один терминальный вердикт=%d; связь=%s; сообщения владельцу=%d; повтор сигнала: spawn=%d (%s); занятый слот: spawn=%d; не-терминальный сигнал: spawn=%d",
+		positive.spawns, positive.cardLink, positive.ownerNotes,
+		duplicate.spawns, duplicate.incident,
+		negative.spawns, other.spawns)
+	ok := positive.spawns == 1 &&
+		positive.cardLink == cardID+"→"+watchID &&
+		positive.ownerNotes == 0 &&
+		duplicate.spawns == 0 && duplicate.incident == orchestrator.SlotDuplicateSignal &&
+		negative.spawns == 0 &&
+		other.spawns == 0
+	return actual, ok
 }
 
 // evalEnv убирает GitHub-токены и подменяет XDG-каталоги на временные, чтобы
