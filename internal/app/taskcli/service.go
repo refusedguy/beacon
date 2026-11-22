@@ -150,6 +150,20 @@ type hookPayload struct {
 	Time   string `json:"time"`
 }
 
+// hookRunTimeout ограничивает режимы Sync и Gate. Notify его не использует.
+const hookRunTimeout = 5 * time.Second
+
+// hookModeForEvent выбирает режим запуска для события карточки. Claimed и
+// closed ждут завершения сценария, unblocked передаёт его вывод по строкам.
+func hookModeForEvent(event HookEvent) hookrun.Mode {
+	switch event {
+	case HookUnblocked:
+		return hookrun.Gate
+	default:
+		return hookrun.Sync
+	}
+}
+
 // hookFiles возвращает сценарии события в порядке имён.
 func hookFiles(dir string, event HookEvent) ([]string, error) {
 	entries, err := os.ReadDir(dir)
@@ -202,9 +216,15 @@ func (s *Service) RunHooks(event HookEvent, cardID, when string) error {
 		return err
 	}
 	entry := HookLogEntry{Event: string(event), CardID: cardID, Time: when, Hooks: []string{}}
+	mode := hookModeForEvent(event)
 	for _, name := range names {
 		entry.Hooks = append(entry.Hooks, name)
-		out, runErr := hookrun.Run(filepath.Join(dir, name), string(body))
+		res := hookrun.Execute(hookrun.OSRunner{}, mode, hookrun.Spec{
+			Path:    filepath.Join(dir, name),
+			Stdin:   string(body),
+			Timeout: hookRunTimeout,
+		})
+		out, runErr := res.Output, res.Err
 		if runErr == nil {
 			continue
 		}
