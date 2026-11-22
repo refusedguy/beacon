@@ -28,8 +28,12 @@ func TestConfigFromEnvFlagAndExporter(t *testing.T) {
 		{"true", "true", true},
 		{"mixed case", "TRUE", true},
 		{"padded", " true ", true},
-		{"one is not true", "1", false},
-		{"garbage", "yes", false},
+		{"one", "1", true},
+		{"yes", "yes", true},
+		{"on", " ON ", true},
+		{"false", "false", false},
+		{"zero", "0", false},
+		{"garbage", "maybe", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -43,6 +47,34 @@ func TestConfigFromEnvFlagAndExporter(t *testing.T) {
 				t.Fatalf("Exporter = %q, want otlp", cfg.Exporter)
 			}
 		})
+	}
+}
+
+// TestParseBoolEnv pins the one truthiness rule every Beacon boolean variable
+// shares. Case and surrounding whitespace must not change a value (BCX-77).
+func TestParseBoolEnv(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want bool
+	}{
+		{"1", true},
+		{"TRUE", true},
+		{" Yes ", true},
+		{"\ton\n", true},
+		{"true", true},
+		{"yes", true},
+		{"on", true},
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"no", false},
+		{"off", false},
+		{"maybe", false},
+	}
+	for _, tt := range tests {
+		if got := ParseBoolEnv(tt.raw); got != tt.want {
+			t.Errorf("ParseBoolEnv(%q) = %v, want %v", tt.raw, got, tt.want)
+		}
 	}
 }
 

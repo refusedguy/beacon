@@ -12,6 +12,7 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/channel"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/server"
 )
 
@@ -77,12 +78,7 @@ func channelConfigFromEnv(lookup func(string) string) (channelConfig, error) {
 }
 
 func channelEnabledValue(raw string) bool {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
+	return observe.ParseBoolEnv(raw)
 }
 
 // channelSenderResolver is the concrete ActorResolver. It maps an external
