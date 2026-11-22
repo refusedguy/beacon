@@ -49,6 +49,17 @@ type Config struct {
 	// Пустое значение означает обычную запись через taskstore.AtomicWrite.
 	// Тесты подставляют сюда writers с искусственной ошибкой.
 	RecheckWriteCard func(path string, data []byte) error
+
+	// DeferWakeNow фиксирует часы пробуждения по дате отложки. Пустое значение
+	// означает time.Now().UTC(). Тесты ставят фиксированное время.
+	DeferWakeNow func() time.Time
+	// DeferWakeReadCard заменяет повторное чтение карточки перед записью.
+	// Пустое значение означает os.ReadFile. Тесты моделируют конкурента,
+	// который взял карточку между снимком и записью.
+	DeferWakeReadCard func(path string) ([]byte, error)
+	// DeferWakeWriteCard заменяет запись карточки при пробуждении. Пустое
+	// значение означает AtomicWrite. Тесты подставляют writers с ошибкой.
+	DeferWakeWriteCard func(path string, data []byte) error
 }
 
 // GateWaiterRegistrar — app-порт конкурентной регистрации ожидающих на гейте
@@ -389,6 +400,17 @@ func (s *Service) List(o ListOptions) (string, error) {
 			return "", Validationf("неизвестная фаза %q", v)
 		}
 	}
+	// CBX-05: ready-чтение сначала просыпает датированные отложки. Ошибка
+	// отдельной записи не роняет список, она даёт одну строку предупреждения
+	// и запись в журнал.
+	wake, err := s.SweepExpiredDefers(DeferWakeOptions{})
+	if err != nil {
+		return "", err
+	}
+	warning := ""
+	if len(wake.Failed) > 0 {
+		warning = fmt.Sprintf("предупреждение: пробуждение по дате не удалось для %d карточки, см. журнал\n", len(wake.Failed))
+	}
 	cards, err := LoadCards(s.Cfg.TasksDir)
 	if err != nil {
 		return "", err
@@ -438,7 +460,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		if err != nil {
 			return "", Startupf("не собран JSON: %v", err)
 		}
-		return string(b) + "\n", nil
+		return string(b) + "\n" + warning, nil
 	}
 	var sb strings.Builder
 	tw := tabwriter.NewWriter(&sb, 0, 2, 2, ' ', 0)
@@ -451,7 +473,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 	if err := tw.Flush(); err != nil {
 		return "", Startupf("не собран вывод: %v", err)
 	}
-	return sb.String(), nil
+	return sb.String() + warning, nil
 }
 
 func oneOf(v string, allowed ...string) bool {
@@ -885,6 +907,12 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 		return "", Validationf("неверное время %q: %v", o.Time, err)
 	}
 
+	// CBX-05: карточку с истёкшей датой отложки нельзя взять как blocked.
+	// Sweep работает под своим замком до того, как take возьмёт общий замок.
+	if _, err := s.SweepExpiredDefers(DeferWakeOptions{}); err != nil {
+		return "", err
+	}
+
 	lock, err := s.acquireLock()
 	if err != nil {
 		return "", err
@@ -1112,6 +1140,315 @@ func (s *Service) ReaperLog() ([]ReaperLogEntry, error) {
 		return nil, err
 	}
 	return append([]ReaperLogEntry(nil), st.Journal...), nil
+}
+
+// ---- CBX-05: ленивое пробуждение датированных отложек ----
+//
+// Отложка живёт в поле «Дата отложки» карточки. В beacon нет отдельного
+// статуса deferred, поэтому отложенная карточка получает статус blocked.
+// Дата в прошлом возвращает её в todo перед ready-чтением и перед take.
+// Запись без даты ("бессрочно") никогда не просыпается.
+
+const deferUntilField = "Дата отложки"
+
+// deferForever помечает отложку без даты. Такая карточка остаётся blocked
+// при любом числе проходов sweep.
+const deferForever = "бессрочно"
+
+// DeferOptions задаёт карточку и срок отложки. Forever пишет отложку без даты.
+type DeferOptions struct {
+	ID      string
+	Until   string
+	Forever bool
+}
+
+// Defer пишет срок отложки и переводит карточку в blocked. Дата принимается
+// в RFC3339 или в форме YYYY-MM-DD. Вторая форма означает полночь UTC.
+func (s *Service) Defer(o DeferOptions) (string, error) {
+	id := strings.TrimSuffix(strings.TrimSpace(o.ID), ".md")
+	if !IsID(id) {
+		return "", Validationf("неверный ID карточки %q", o.ID)
+	}
+	until := deferForever
+	if !o.Forever {
+		when, err := parseDeferUntil(o.Until)
+		if err != nil {
+			return "", err
+		}
+		if when.IsZero() {
+			return "", Validationf("нужна дата отложки или флаг --forever")
+		}
+		until = when.Format(time.RFC3339)
+	}
+
+	lock, err := s.acquireLock()
+	if err != nil {
+		return "", err
+	}
+	defer lock.Release()
+
+	cards, err := LoadCards(s.Cfg.TasksDir)
+	if err != nil {
+		return "", err
+	}
+	var target *Card
+	for i := range cards {
+		if cards[i].ID == id {
+			target = &cards[i]
+			break
+		}
+	}
+	if target == nil {
+		return "", Validationf("карточка %s не найдена", id)
+	}
+	if oneOf(target.Status, "done", "dropped", "duplicate") {
+		return "", Validationf("карточка %s закрыта со статусом %s", id, target.Status)
+	}
+	text := rewriteDeferFields(target.Raw, "blocked", until)
+	if err := AtomicWrite(target.Path, []byte(text), 0644); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s deferred %s", id, until), nil
+}
+
+// parseDeferUntil разбирает значение поля «Дата отложки». Пустое значение и
+// "бессрочно" дают нулевое время, то есть отложку без авто-пробуждения.
+func parseDeferUntil(value string) (time.Time, error) {
+	v := strings.TrimSpace(value)
+	if v == "" || v == deferForever {
+		return time.Time{}, nil
+	}
+	if when, err := time.Parse(time.RFC3339, v); err == nil {
+		return when.UTC(), nil
+	}
+	when, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return time.Time{}, Validationf("неверная дата отложки %q: ожидается RFC3339, YYYY-MM-DD или %s", value, deferForever)
+	}
+	return when.UTC(), nil
+}
+
+// rewriteDeferFields меняет статус и срок отложки одной правкой текста. Остальные
+// поля и переводы строк, включая CRLF, сохраняются.
+func rewriteDeferFields(raw, status, until string) string {
+	lines := strings.Split(raw, "\n")
+	hasStatus, hasDate := false, false
+	for _, line := range lines {
+		name, _, found := strings.Cut(strings.TrimSuffix(line, "\r"), ":")
+		if !found {
+			continue
+		}
+		switch strings.TrimSpace(name) {
+		case "Статус":
+			hasStatus = true
+		case deferUntilField:
+			hasDate = true
+		}
+	}
+
+	out := make([]string, 0, len(lines)+1)
+	for _, line := range lines {
+		cr := ""
+		if strings.HasSuffix(line, "\r") {
+			cr = "\r"
+			line = strings.TrimSuffix(line, "\r")
+		}
+		name, _, found := strings.Cut(line, ":")
+		replaced := false
+		if found {
+			switch strings.TrimSpace(name) {
+			case "Статус":
+				out = append(out, "Статус: "+status+cr)
+				replaced = true
+				if !hasDate {
+					out = append(out, deferUntilField+": "+until+cr)
+					hasDate = true
+				}
+			case deferUntilField:
+				out = append(out, deferUntilField+": "+until+cr)
+				replaced = true
+			}
+		}
+		if !replaced {
+			out = append(out, line+cr)
+		}
+	}
+	if !hasStatus {
+		out = append([]string{"Статус: " + status}, out...)
+	}
+	if !hasDate {
+		out = append(out, deferUntilField+": "+until)
+	}
+	return strings.Join(out, "\n")
+}
+
+// DeferWakeOptions задаёт часы и операции чтения и записи для одного прохода
+// пробуждения. Пустые поля берутся из Config или из обычных файловых вызовов.
+type DeferWakeOptions struct {
+	Now       time.Time
+	ReadCard  func(path string) ([]byte, error)
+	WriteCard func(path string, data []byte) error
+}
+
+// DeferWakeReport считает карточки одного прохода. Failed содержит ID, чью
+// запись не удалось выполнить. Такие карточки остаются отложенными.
+type DeferWakeReport struct {
+	Scanned int
+	Woken   []string
+	Skipped []string
+	Failed  []string
+}
+
+// DeferWakeLogEntry фиксирует одно действие пробуждения или одну ошибку записи.
+type DeferWakeLogEntry struct {
+	Time   time.Time `json:"time"`
+	CardID string    `json:"cardID"`
+	Action string    `json:"action"`
+	Reason string    `json:"reason"`
+}
+
+type deferWakeState struct {
+	Journal []DeferWakeLogEntry `json:"journal"`
+}
+
+type deferWakeRepo struct {
+	fileState[deferWakeState]
+}
+
+func newDeferWakeRepo(cfg Config) deferWakeRepo {
+	return deferWakeRepo{fileState[deferWakeState]{
+		stateDir:    cfg.StateDir,
+		root:        cfg.Root,
+		file:        "defer-wake-journal.json",
+		lockFile:    "defer-wake-journal.lock",
+		readErr:     "не прочитан журнал пробуждения: %v",
+		parseErr:    "не разобран журнал пробуждения: %v",
+		writeErr:    "не собран журнал пробуждения: %v",
+		lockOpenErr: "не открыт замок журнала пробуждения: %v",
+		lockTakeErr: "не взят замок журнала пробуждения: %v",
+	}}
+}
+
+// SweepExpiredDefers возвращает в todo карточки с истёкшей датой отложки.
+// Перед записью он читает файл заново и сравнивает статус и дату со снимком.
+// Карточка, которую успели изменить между снимком и записью, пропускается.
+// Ошибки отдельных записей попадают в журнал и не прерывают проход.
+func (s *Service) SweepExpiredDefers(o DeferWakeOptions) (DeferWakeReport, error) {
+	rep := DeferWakeReport{Woken: []string{}, Skipped: []string{}, Failed: []string{}}
+
+	now := o.Now
+	if now.IsZero() && s.Cfg.DeferWakeNow != nil {
+		now = s.Cfg.DeferWakeNow()
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	read := o.ReadCard
+	if read == nil {
+		read = s.Cfg.DeferWakeReadCard
+	}
+	if read == nil {
+		read = os.ReadFile
+	}
+	write := o.WriteCard
+	if write == nil {
+		write = s.Cfg.DeferWakeWriteCard
+	}
+	if write == nil {
+		write = func(path string, data []byte) error { return AtomicWrite(path, data, 0644) }
+	}
+
+	lock, err := s.acquireLock()
+	if err != nil {
+		return rep, err
+	}
+	defer lock.Release()
+
+	cards, err := LoadCards(s.Cfg.TasksDir)
+	if err != nil {
+		return rep, err
+	}
+	var entries []DeferWakeLogEntry
+	for _, c := range cards {
+		until, err := parseDeferUntil(c.Extra[deferUntilField])
+		if err != nil || until.IsZero() {
+			continue
+		}
+		rep.Scanned++
+		if now.Before(until) {
+			rep.Skipped = append(rep.Skipped, c.ID)
+			continue
+		}
+
+		current, err := read(c.Path)
+		if err != nil {
+			rep.Failed = append(rep.Failed, c.ID)
+			entries = append(entries, DeferWakeLogEntry{
+				Time: now, CardID: c.ID, Action: "error", Reason: err.Error(),
+			})
+			continue
+		}
+		fresh, err := taskstore.ParseCard(c.Path, current)
+		if err != nil {
+			rep.Failed = append(rep.Failed, c.ID)
+			entries = append(entries, DeferWakeLogEntry{
+				Time: now, CardID: c.ID, Action: "error", Reason: err.Error(),
+			})
+			continue
+		}
+		freshUntil, err := parseDeferUntil(fresh.Extra[deferUntilField])
+		if err != nil || freshUntil.IsZero() || !freshUntil.Equal(until) || fresh.Status != c.Status {
+			rep.Skipped = append(rep.Skipped, c.ID)
+			continue
+		}
+
+		text := rewriteDeferFields(string(current), "todo", "")
+		if err := write(c.Path, []byte(text)); err != nil {
+			rep.Failed = append(rep.Failed, c.ID)
+			entries = append(entries, DeferWakeLogEntry{
+				Time: now, CardID: c.ID, Action: "error", Reason: err.Error(),
+			})
+			continue
+		}
+		rep.Woken = append(rep.Woken, c.ID)
+		entries = append(entries, DeferWakeLogEntry{
+			Time: now, CardID: c.ID, Action: "wake",
+			Reason: fmt.Sprintf("дата отложки %s истекла", until.Format(time.RFC3339)),
+		})
+	}
+
+	if len(entries) > 0 {
+		s.appendDeferWakeLog(entries)
+	}
+	return rep, nil
+}
+
+// appendDeferWakeLog пишет журнал под отдельным замком. Сбой журнала не меняет
+// результат прохода: карточки уже записаны, а список остаётся доступным.
+func (s *Service) appendDeferWakeLog(entries []DeferWakeLogEntry) {
+	repo := newDeferWakeRepo(s.Cfg)
+	unlock, err := repo.lock()
+	if err != nil {
+		return
+	}
+	defer unlock()
+	st, err := repo.load()
+	if err != nil {
+		return
+	}
+	st.Journal = append(st.Journal, entries...)
+	_ = repo.save(st)
+}
+
+// DeferWakeLog возвращает записи журнала в порядке записи.
+func (s *Service) DeferWakeLog() ([]DeferWakeLogEntry, error) {
+	st, err := newDeferWakeRepo(s.Cfg).load()
+	if err != nil {
+		return nil, err
+	}
+	return append([]DeferWakeLogEntry(nil), st.Journal...), nil
 }
 
 // ---- ADR 0031 §4 / Q-report 2.3: цепочка фолбэка агентов при 429 ----

@@ -56,6 +56,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 		return runTaskNew(args[1:], stdout, stderr, cfg)
 	case "take":
 		return runTaskTake(args[1:], stdout, stderr, cfg)
+	case "defer":
+		return runTaskDefer(args[1:], stdout, stderr, cfg)
 	case "done":
 		return runTaskDone(args[1:], stdout, stderr, cfg)
 	case "needs-input":
@@ -80,7 +82,8 @@ func TaskCommandWithConfig(args []string, stdout, stderr io.Writer, cfg taskcli.
 	}
 }
 
-const taskUsage = "использование: beacon task list|new|take|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
+const taskUsage = "использование: beacon task list|new|take|defer|done|needs-input|why|wait|check-launch|--self-test [flags]\n" +
+	"               beacon task defer <ID> --until RFC3339|YYYY-MM-DD [--forever]\n" +
 	"               beacon task lease acquire|release|check [flags]\n" +
 	"               beacon task schedule [create|list|delete] [flags]\n" +
 	"               beacon task compact (--analyze|--apply|--auto) [--format json] [--id ID] [--summary FILE] [--dry-run]\n" +
@@ -308,6 +311,25 @@ func runTaskTake(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) in
 	}
 	out, err := taskcli.NewService(cfg).Take(taskcli.TakeOptions{
 		ID: p.pos[0], Agent: agent, Time: p.value("time"),
+	})
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	fmt.Fprintln(stdout, out)
+	return taskstore.ExitOK
+}
+
+// runTaskDefer откладывает карточку до даты или на неопределённый срок.
+func runTaskDefer(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
+	p, err := parseTaskArgs(argv, map[string]bool{"until": true}, map[string]bool{"forever": true})
+	if err != nil {
+		return failTask(stderr, err)
+	}
+	if len(p.pos) != 1 {
+		return failTask(stderr, taskstore.Validationf("нужен ровно один ID карточки"))
+	}
+	out, err := taskcli.NewService(cfg).Defer(taskcli.DeferOptions{
+		ID: p.pos[0], Until: p.value("until"), Forever: p.bools["forever"],
 	})
 	if err != nil {
 		return failTask(stderr, err)
