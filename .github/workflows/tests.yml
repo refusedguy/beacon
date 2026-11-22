@@ -14,6 +14,12 @@ on:
 permissions:
   contents: read
 
+# BL-03. Те же флаги сборки beacon, что и в ci.yml. Шаг сборки ссылается на
+# общее определение и не повторяет строку флагов.
+env:
+  BEACON_BUILD_FLAGS: '-trimpath -buildvcs=false'
+  BEACON_BUILD_LDFLAGS: '-buildid= -s -w'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -34,12 +40,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go build \
-            -trimpath \
-            -buildvcs=false \
-            -ldflags="-buildid= -s -w" \
+          CGO_ENABLED=0 go build $BEACON_BUILD_FLAGS \
+            -ldflags="$BEACON_BUILD_LDFLAGS" \
             -o beacon ./cmd/beacon
-          printf 'build ok binary=beacon\n'
+          beacon_sha=$(sha256sum beacon | cut -d' ' -f1)
+          printf 'build ok binary=beacon sha256=%s\n' "$beacon_sha"
 
       # Корректный конфиг проходит проверки схемы, лимитов и индекса. Строка
       # "ok <digest>" подтверждает, что проверка действительно выполнилась.

@@ -18,6 +18,12 @@ on:
 permissions:
   contents: read
 
+# BL-03. Флаги воспроизводимой сборки beacon определены один раз на workflow.
+# Джобы, которые собирают beacon, не повторяют строку флагов в шагах.
+env:
+  BEACON_BUILD_FLAGS: '-trimpath -buildvcs=false'
+  BEACON_BUILD_LDFLAGS: '-buildid= -s -w'
+
 # В PR новый push отменяет устаревший прогон. На main отмены нет: каждый
 # коммит должен дойти до вердикта, иначе required check останется без результата.
 concurrency:
@@ -29,6 +35,8 @@ jobs:
     name: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      beacon_sha256: ${{ steps.build-beacon.outputs.sha256 }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,15 +45,16 @@ jobs:
         uses: ./.github/actions/go-runner-setup
 
       - name: Build beacon
+        id: build-beacon
         shell: bash
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go build \
-            -trimpath \
-            -buildvcs=false \
-            -ldflags="-buildid= -s -w" \
+          CGO_ENABLED=0 go build $BEACON_BUILD_FLAGS \
+            -ldflags="$BEACON_BUILD_LDFLAGS" \
             -o beacon ./cmd/beacon
-          printf 'build ok binary=beacon\n'
+          beacon_sha=$(sha256sum beacon | cut -d' ' -f1)
+          printf 'build ok binary=beacon sha256=%s\n' "$beacon_sha"
+          printf 'sha256=%s\n' "$beacon_sha" >> "$GITHUB_OUTPUT"
 
   test:
     name: test
@@ -314,6 +323,7 @@ jobs:
   # иначе зелёные проверки скрывают отказ. Не объединяем её с gates.
   rules-broken:
     name: rules-broken
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -323,15 +333,23 @@ jobs:
       - name: Set up Go
         uses: ./.github/actions/go-runner-setup
 
-      - name: Build beacon
+      - name: Build beacon and compare hash with build job
         shell: bash
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.beacon_sha256 }}
         run: |
           set -euo pipefail
-          CGO_ENABLED=0 go build \
-            -trimpath \
-            -buildvcs=false \
-            -ldflags="-buildid= -s -w" \
+          CGO_ENABLED=0 go build $BEACON_BUILD_FLAGS \
+            -ldflags="$BEACON_BUILD_LDFLAGS" \
             -o beacon ./cmd/beacon
+          beacon_sha=$(sha256sum beacon | cut -d' ' -f1)
+          printf 'build ok binary=beacon sha256=%s\n' "$beacon_sha"
+          printf 'build job sha256=%s\n' "$EXPECTED_SHA256"
+          if [ "$beacon_sha" != "$EXPECTED_SHA256" ]; then
+            printf 'beacon hash mismatch: build=%s rules-broken=%s\n' \
+              "$EXPECTED_SHA256" "$beacon_sha" >&2
+            exit 1
+          fi
 
       - name: Run rules gate
         shell: bash
