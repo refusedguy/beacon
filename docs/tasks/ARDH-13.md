@@ -1,5 +1,5 @@
 # ARDH-13. Убрать capability-интерфейсы с type assertion там, где меняется гарантия
-Статус: in_progress
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/app/orchestrator/orchestrator.go, internal/infra/cibridge/bridge.go, internal/domain/types.go
@@ -15,6 +15,9 @@
 
 baseline: docs/research/solid-gof-audit.md, разделы OCP и LSP, дата 2026-11-21. Замер точек: 7 capability-интерфейсов и `WithWaker(any)` с type switch, 9 проверок типа по `internal/`. Способ: `rg` по `internal/`, код не запускался.
 
+Причина: PR #1174 влит в origin/main, merge commit e9d114010ab244307cce29823431c10faea2c4b5, git merge-base --is-ancestor exit 0. Код и тесты оркестратора в main.
+Закрыл: нет
+Время закрытия: 2026-11-22T10:39:55Z
 ## Выполнено в этом PR
 
 - `CheckedMerger`. В `mergeOne` проверка `merger.(CheckedMerger)` заменена явным полем `Options.CheckedMerger`. Различие между trusted `Merger` и checked merge сохранено: без явной передачи работает обычный `Merger`. Рабочие адаптеры не реализуют `MergeChecked`, поэтому поведение проды не меняется.
