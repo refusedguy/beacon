@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -928,9 +929,9 @@ func newDaemonCardMonitor(db *store.DB, root string) *tasks.Monitor {
 }
 
 // daemonMaintenance runs the store maintenance the daemon owns. ArchiveRun
-// carries its own schedule guard, and Checkpoint flushes the WAL, so both are
-// safe on the daemon cadence. A failure is reported and never stops the cycle
-// (AUD-12).
+// carries its own schedule guard, and the checkpoint flushes the WAL, so both
+// are safe on the daemon cadence. A failure is reported and never stops the
+// cycle (AUD-12).
 func daemonMaintenance(ctx context.Context, db *store.DB) {
 	if db == nil {
 		return
@@ -938,7 +939,14 @@ func daemonMaintenance(ctx context.Context, db *store.DB) {
 	if _, err := db.ArchiveRun(ctx, time.Now()); err != nil {
 		observe.ActorError("daemon-archive", "", err)
 	}
-	if err := db.Checkpoint(ctx); err != nil {
+	// DB.Checkpoint queries writeDB, whose only connection is held by the
+	// dedicated writer for the process lifetime. A direct call waits forever.
+	// Run the same PRAGMA on that writer so the checkpoint can complete.
+	if err := db.Write(ctx, func(tx *sql.Tx) error {
+		var busy, log, checkpointed int
+		return tx.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").
+			Scan(&busy, &log, &checkpointed)
+	}); err != nil {
 		observe.ActorError("daemon-checkpoint", "", err)
 	}
 }
