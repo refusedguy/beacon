@@ -1,5 +1,5 @@
 # AUD-03. Сохранять stderr в CLI-фолбэке и распознавать 404/409
-Статус: todo
+Статус: done
 Фаза: P0
 Тип: task
 Владелец файлов: internal/infra/wake/deliver.go, internal/infra/wake/deliver_test.go
@@ -12,3 +12,8 @@
 Шаги: Заменить Output() на CombinedOutput() в deliverCLI и T202API.run. Добавить разбор stderr на 404/409 в sessionNotFound. Обновить тесты на случай с ошибкой в stderr и на коды 404/409.
 Проверка: CI зелёный. Тест подтверждает, что stderr попадает в out и что 404/409 из stderr трактуются как sessionNotFound.
 Приёмка: Изменения только в OwnerFiles карточки. Уже существующие newReadOnlyOpencodePort, FileTaskClaimStore, FileTaskCloseStore, card_links и поддержку ATX-R01 не переделывать.
+
+Итог: Already landed in #1473 (55e88825d2a9d0ddfce877e3c4280d48bbab5833). No duplicate code needed.
+Доказательство: PR #1473 commit 55e88825d2a9d0ddfce877e3c4280d48bbab5833 merge-base --is-ancestor 55e88825d2a9d0ddfce877e3c4280d48bbab5833 origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1473 55e8882
+Время закрытия: 2026-11-22T11:29:08Z

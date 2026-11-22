@@ -1,5 +1,5 @@
 # AUD-08. Не принимать не-T карточки за пути файлов git
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/orchestrator/store.go, internal/app/orchestrator/dependency_card_test.go
@@ -12,3 +12,8 @@
 Шаги: Перед трактовкой строки как git-пути проверять taskstore.IsID. Если строка похожа на ID карточки, но невалидна, отвергать её явно. Добавить тесты на ARDH-08, ATX-R01, BS.1, S1.001 и на настоящий путь файла.
 Проверка: CI зелёный. Тесты подтверждают, что не-T карточки не становятся путями git и что настоящие пути проходят.
 Приёмка: Изменения только в OwnerFiles карточки. Уже существующие newReadOnlyOpencodePort, FileTaskClaimStore, FileTaskCloseStore, card_links и поддержку ATX-R01 не переделывать.
+
+Итог: Already landed in #1611 (e0f70e5c7ef79918bd79012750802b23b91750e8). No duplicate code needed.
+Доказательство: PR #1611 commit e0f70e5c7ef79918bd79012750802b23b91750e8 merge-base --is-ancestor e0f70e5c7ef79918bd79012750802b23b91750e8 origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1611 e0f70e5
+Время закрытия: 2026-11-22T11:29:08Z

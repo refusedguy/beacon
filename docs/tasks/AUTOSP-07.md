@@ -1,5 +1,5 @@
 # AUTOSP-07. Погашение токена слота после проверки артефакта
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: cmd/beacon/daemon.go, cmd/beacon/daemon_wake_adapter_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить в daemonWakeGate вызов Burn с ArtifactVerifier, который проверяет наличие PR по watch или PLAN.md по карточке. Вызывать проверку в проходе демона после Refresh. Ошибка проверки оставляет токен живым. Инцидент spawn_without_token писать в observe.
 Проверка: CI зелёный. Тест с подтверждённым артефактом снимает слот. Тест с отсутствующим артефактом сохраняет слот. Тест с ошибкой verifier не гасит токен.
 Приёмка: Лимит в четыре слота сохраняется в долгом работе демона.
+
+Итог: Already landed in #1439 (ca302a57bb646a4bfb819be320e88ff506c442ad). No duplicate code needed.
+Доказательство: PR #1439 commit ca302a57bb646a4bfb819be320e88ff506c442ad merge-base --is-ancestor ca302a57bb646a4bfb819be320e88ff506c442ad origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1439 ca302a5
+Время закрытия: 2026-11-22T11:29:08Z

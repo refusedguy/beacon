@@ -1,5 +1,5 @@
 # AUTOSP-06. Единый гейт запуска перед спавном
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/taskcli/service.go, internal/app/taskcli/service_test.go
@@ -12,3 +12,8 @@
 Шаги: Расширить LaunchAssignment полем статуса и добавить проверку пересечения с активными in_progress. Добавить метод, который принимает решения PreflightGuard и счётчик слотов и возвращает причину отказа. Не читать GitHub и не открывать БД внутри сервиса. Обновить тесты service_test.go.
 Проверка: CI зелёный. Тест на пересечение с in_progress отказывает. Тест с quota_exhausted отказывает до запуска. Тест с полным лимитом слотов отказывает.
 Приёмка: Автоспавнер вызывает один метод и получает решение Allowed с причиной.
+
+Итог: Already landed in #1442 (f9c481cd4187010b764ff067cc3cda4b1480908c). No duplicate code needed.
+Доказательство: PR #1442 commit f9c481cd4187010b764ff067cc3cda4b1480908c merge-base --is-ancestor f9c481cd4187010b764ff067cc3cda4b1480908c origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1442 f9c481c
+Время закрытия: 2026-11-22T11:29:08Z

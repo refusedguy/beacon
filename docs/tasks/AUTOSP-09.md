@@ -1,5 +1,5 @@
 # AUTOSP-09. Явная связь cardID и watchID независимо от agentID
-Статус: todo
+Статус: done
 Фаза: P2
 Тип: task
 Владелец файлов: internal/infra/store/card_links.go, internal/infra/store/card_links_test.go
@@ -12,3 +12,8 @@
 Шаги: Добавить метод, который принимает cardID и watchID из ответов claim и watch, сохраняет вызов Link и возвращает LinkResult. Оставить CardIDForAgent как запасной путь. Проверить непустые cardID и watchID. Обновить тесты card_links_test.go на гонку двух вызовов.
 Проверка: CI зелёный. Два параллельных вызова дают одну строку. Пустые идентификаторы отвергаются.
 Приёмка: При несовпадении agentID и sessionID карточка закрывается по связанному Watch.
+
+Итог: Already landed in #1436 (d0d9fc6fbf103972a8730de75f7b6116797c655f). No duplicate code needed.
+Доказательство: PR #1436 commit d0d9fc6fbf103972a8730de75f7b6116797c655f merge-base --is-ancestor d0d9fc6fbf103972a8730de75f7b6116797c655f origin/main exit 0; no open duplicate PR.
+Причина: already landed in #1436 d0d9fc6
+Время закрытия: 2026-11-22T11:29:08Z
