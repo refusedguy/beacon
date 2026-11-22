@@ -56,6 +56,7 @@ executor-task:design-shapes -->
 | --- | --- | --- |
 | cardID | ответ `beacon_task_claim` | что делает исполнитель |
 | цель, зависимости, OwnerFiles, режим плана, handoff | ответ `beacon_task_claim` | контекст задачи без поиска по `docs/tasks/` |
+| пересказ цели | исполнитель на основе цели пользователя | три элемента до шагов плана: цель, проблема, smallest change |
 | graphReady | ответ `beacon_task_claim` или `beacon_stats` | граф собран и актуален |
 | sessionID | `_meta["ai.opencode/sessionID"]` или явный `notify.target: "<ses_...>"` | адрес живой сессии для wake |
 | repo, pr, headSHA, baseRef | факт сдачи PR | параметры Watch |
@@ -66,6 +67,23 @@ executor-task:design-shapes -->
 | tokenBreakdown | `session.TokenBreakdown(ContextSnapshot)` | разбивка контекста по категориям с ценой и остатком |
 | tokenWarning | `session.TokenUsage().Warning` | предупреждение при остатке ниже 1024 токенов |
 | роль файла контекста | editable из OwnerFiles карточки, readonly из остальных файлов в контексте | какая запись разрешена |
+
+### Пересказ цели до фазы plan
+
+Исполнитель пересказывает цель пользователя и решаемую проблему своими словами до фазы plan. Пересказ содержит три элемента: цель, проблема и smallest change. smallest change называет минимальное изменение, которое устраняет проблему.
+
+Пересказ цели попадает в `PLAN.md` до шагов плана. `PLAN.md` без пересказа цели не проходит проверку артефакта фазы plan. Пересказ дополняет цель карточки, а не заменяет её.
+
+Если пользователь не подтвердил пересказ, исполнитель продолжает работу с допущением. Он помечает допущение в `PLAN.md` рядом с пересказом.
+
+<!-- executor-task:restate-goal
+placement: PLAN.md, before-steps
+elements: goal, problem, smallest-change
+unconfirmed: continue-with-marked-assumption
+artifact-check: no-restatement-fail-plan
+not-replaces-card-goal: true
+source: PSKX-09, pstack/skills/in-your-own-words/SKILL.md:7
+executor-task:restate-goal -->
 
 ## Учёт токенов контекста
 
