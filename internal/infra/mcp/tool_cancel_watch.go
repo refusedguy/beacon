@@ -8,8 +8,11 @@ package mcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -29,6 +32,12 @@ const (
 	cancelWatchEventKind     = "cancel"
 	cancelWatchSchemaVersion = 2
 	cancelSubscriberReason   = "subscriber_cancelled"
+
+	// interruptReceiptCapability is the client capability that declares support
+	// for cancel receipts. The SDK names it interrupt_receipt_v1 in the
+	// initialize handshake metadata. A caller that declares capabilities
+	// without it must get an explicit error, not a silent cancel.
+	interruptReceiptCapability = "interrupt_receipt_v1"
 )
 
 // CancelWatchInput is the argument object of beacon_cancel_watch. Scope is
@@ -38,10 +47,21 @@ type CancelWatchInput struct {
 	Scope   string `json:"scope,omitempty" jsonschema:"subscriber or all; all is the default"`
 }
 
-// CancelWatchOutput is the ok-only response of beacon_cancel_watch. The JSON
-// shape matches the shared OKOutput used by beacon_ack (WORKER-PROMPT §4.1).
+// CancelWatchOutput is the response of beacon_cancel_watch. The serialized
+// shape stays identical to the shared OKOutput used by beacon_ack
+// (WORKER-PROMPT §4.1), so the pinned tools/list output schema does not move.
+// The two receipt fields are delivered to MCP callers as text content while
+// in-process callers can read them directly. cancelReceipt is stable for one
+// Watch: a repeat of the same cancel returns the same identifier.
 type CancelWatchOutput struct {
 	OK bool `json:"ok"`
+
+	// CancelReceipt identifies one accepted cancellation.
+	CancelReceipt string `json:"-"`
+
+	// InterruptReceiptSupported records whether the caller advertised
+	// interrupt_receipt_v1 support before the cancel was applied.
+	InterruptReceiptSupported bool `json:"-"`
 }
 
 // CancelAuditEvent is one append-only row in the Watch history. Earlier rows
@@ -127,71 +147,90 @@ type cancelWallClock struct{}
 func (cancelWallClock) Now() time.Time { return time.Now() }
 
 // Cancel closes watchID when scope is all, or removes the calling subscriber
-// when scope is subscriber. Repeating either call is a no-op that returns ok:
-// an already closed Watch stays closed and an already removed subscriber is
-// simply absent. A state change appends one audit event and persists the Watch
-// before returning; no history row is ever deleted.
+// when scope is subscriber. It keeps the pre-receipt signature for callers that
+// do not inspect the receipt. Receipt-aware callers use CancelWithReceipt.
 func (c *CancelWatcher) Cancel(ctx context.Context, watchID, scope, subscriberID string) error {
+	_, err := c.CancelWithReceipt(ctx, watchID, scope, subscriberID, true)
+	return err
+}
+
+// CancelWithReceipt applies the same idempotent cancellation as Cancel and also
+// returns the stable receipt of the operation. When receiptSupported is false
+// it refuses before any read or write, so a host that explicitly opted out of
+// receipts gets an error instead of a silently lost signal. The Watch stays
+// open and no audit row is appended. A repeat with the same Watch, scope and
+// caller returns the same receipt.
+func (c *CancelWatcher) CancelWithReceipt(ctx context.Context, watchID, scope, subscriberID string, receiptSupported bool) (string, error) {
+	if !receiptSupported {
+		return "", domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: caller does not support interrupt_receipt_v1; refusing silent cancellation")
+	}
 	if watchID == "" {
-		return domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: watchID is required")
+		return "", domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: watchID is required")
 	}
 	switch scope {
 	case "", CancelScopeAll:
 		scope = CancelScopeAll
 	case CancelScopeSubscriber:
 		if subscriberID == "" {
-			return domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: subscriber scope needs a caller sessionID")
+			return "", domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: subscriber scope needs a caller sessionID")
 		}
 	default:
-		return domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: scope must be subscriber or all")
+		return "", domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: scope must be subscriber or all")
 	}
 	if c == nil || c.store == nil {
-		return domain.NewAppError(domain.CodePersistFailed, "cancel_watch: store is nil")
+		return "", domain.NewAppError(domain.CodePersistFailed, "cancel_watch: store is nil")
 	}
 
 	w, err := c.store.Watch(watchID)
 	if err != nil {
-		return err
+		return "", err
 	}
+	receipt := cancelReceiptID(w.ID, scope, subscriberID, w.Revision)
 	if w.Status == domain.StatusClosed {
 		// Terminal state. Idempotent repeat: no write and no second event.
-		return nil
+		return receipt, nil
 	}
 
 	now := c.clock.Now()
 	if scope == CancelScopeAll {
-		return c.closeAndRecord(ctx, w, now, CancelAuditEvent{
+		if err := c.closeAndRecord(ctx, w, now, CancelAuditEvent{
 			Kind:     cancelWatchEventKind,
 			WatchID:  w.ID,
 			Scope:    CancelScopeAll,
 			Revision: w.Revision,
 			At:       now,
-		}, domain.CloseReasonCancelled)
+		}, domain.CloseReasonCancelled); err != nil {
+			return "", err
+		}
+		return receipt, nil
 	}
 
 	remaining, found := removeCancelSubscriber(w.Subscribers, subscriberID)
 	if !found {
 		// The subscriber already cancelled. Idempotent repeat.
-		return nil
+		return receipt, nil
 	}
 
 	next := w
 	next.Subscribers = remaining
 	if len(remaining) == 0 {
-		return c.closeAndRecord(ctx, next, now, CancelAuditEvent{
+		if err := c.closeAndRecord(ctx, next, now, CancelAuditEvent{
 			Kind:         cancelWatchEventKind,
 			WatchID:      next.ID,
 			Scope:        CancelScopeSubscriber,
 			SubscriberID: subscriberID,
 			Revision:     next.Revision,
 			At:           now,
-		}, domain.CloseReasonCancelled)
+		}, domain.CloseReasonCancelled); err != nil {
+			return "", err
+		}
+		return receipt, nil
 	}
 
 	if err := c.store.SaveWatch(next); err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return "", domain.NewAppError(domain.CodePersistFailed, err.Error())
 	}
-	return c.events.Append(ctx, CancelAuditEvent{
+	if err := c.events.Append(ctx, CancelAuditEvent{
 		Kind:         cancelWatchEventKind,
 		WatchID:      next.ID,
 		Scope:        CancelScopeSubscriber,
@@ -199,7 +238,20 @@ func (c *CancelWatcher) Cancel(ctx context.Context, watchID, scope, subscriberID
 		Revision:     next.Revision,
 		CloseReason:  cancelSubscriberReason,
 		At:           now,
-	})
+	}); err != nil {
+		return "", err
+	}
+	return receipt, nil
+}
+
+// cancelReceiptID derives a stable identifier from the Watch and the cancel
+// target. A cancel never bumps the Watch revision, so a repeat reads the same
+// values and produces the same identifier. The hash keeps the identifier short
+// and opaque, like the identifier an interrupt receipt carries in the SDK.
+func cancelReceiptID(watchID, scope, subscriberID string, revision uint64) string {
+	seed := watchID + "\x00" + scope + "\x00" + subscriberID + "\x00" + strconv.FormatUint(revision, 10)
+	sum := sha256.Sum256([]byte(seed))
+	return "cr_" + hex.EncodeToString(sum[:8])
 }
 
 // closeAndRecord applies the terminal cancel transition through the domain and
@@ -253,17 +305,33 @@ func cancelWatchCallerSessionID(req *mcpsdk.CallToolRequest) string {
 }
 
 // CancelWatchHandler adapts CancelWatcher to a typed MCP tool handler. The
-// caller's subscriber id is the opaque sessionID from _meta.
+// caller's subscriber id is the opaque sessionID from _meta. The handler reads
+// interrupt_receipt_v1 support from the request before it closes anything. A
+// caller that explicitly declares no receipt support gets an error and an
+// untouched Watch. A caller that omits the flag keeps the legacy cancel path.
 func CancelWatchHandler(svc *CancelWatcher) mcpsdk.ToolHandlerFor[CancelWatchInput, CancelWatchOutput] {
 	return func(ctx context.Context, req *mcpsdk.CallToolRequest, in CancelWatchInput) (*mcpsdk.CallToolResult, CancelWatchOutput, error) {
 		var subscriberID string
 		if in.Scope == CancelScopeSubscriber {
 			subscriberID = cancelWatchCallerSessionID(req)
 		}
-		if err := svc.Cancel(ctx, in.WatchID, in.Scope, subscriberID); err != nil {
+		supported := InterruptReceiptFromRequest(req)
+		receipt, err := svc.CancelWithReceipt(ctx, in.WatchID, in.Scope, subscriberID, supported)
+		if err != nil {
 			return &mcpsdk.CallToolResult{}, CancelWatchOutput{}, err
 		}
-		return &mcpsdk.CallToolResult{}, CancelWatchOutput{OK: true}, nil
+		out := CancelWatchOutput{
+			OK:                        true,
+			CancelReceipt:             receipt,
+			InterruptReceiptSupported: supported,
+		}
+		res := &mcpsdk.CallToolResult{}
+		// The pinned tools/list output schema admits only "ok". Carry the
+		// receipt in text as well so an MCP caller can observe the identifier.
+		res.Content = []mcpsdk.Content{&mcpsdk.TextContent{
+			Text: `{"cancelReceipt":"` + receipt + `","interrupt_receipt_v1":` + strconv.FormatBool(supported) + `}`,
+		}}
+		return res, out, nil
 	}
 }
 

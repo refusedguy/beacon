@@ -88,6 +88,59 @@ func DialectFromRequest(req *mcpsdk.CallToolRequest) TaskDialect {
 	return DialectPlain
 }
 
+// InterruptReceiptFromRequest reports whether the caller can accept a cancel
+// receipt. Absence of the flag keeps the legacy cancel contract: older hosts
+// and the frozen eval suite omit it and still expect ok. A caller that
+// explicitly declares interrupt_receipt_v1 as false cannot deliver the
+// receipt, so it is refused before any write instead of losing the signal.
+func InterruptReceiptFromRequest(req *mcpsdk.CallToolRequest) bool {
+	if req == nil {
+		return true
+	}
+	if req.Params != nil && req.Params.Meta != nil {
+		if v, ok := req.Params.Meta[interruptReceiptCapability]; ok && receiptFalse(v) {
+			return false
+		}
+		if raw, ok := req.Params.Meta[clientCapabilitiesMetaKey]; ok {
+			if receiptFalseInExtensions(raw) {
+				return false
+			}
+		}
+	}
+	if req.Session != nil {
+		if params := req.Session.InitializeParams(); params != nil && params.Capabilities != nil {
+			if v, ok := params.Capabilities.Experimental[interruptReceiptCapability]; ok && receiptFalse(v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// receiptFalse reports an explicit boolean false. Any other value, including a
+// bare presence marker or a JSON object, means the caller accepts a receipt.
+func receiptFalse(v any) bool {
+	b, ok := v.(bool)
+	return ok && !b
+}
+
+// receiptFalseInExtensions reads the per-request extension map the 2026 dialect
+// uses. The extension value is a raw JSON boolean when the caller opts out.
+func receiptFalseInExtensions(raw any) bool {
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return false
+	}
+	var caps struct {
+		Extensions map[string]json.RawMessage `json:"extensions"`
+	}
+	if json.Unmarshal(b, &caps) != nil {
+		return false
+	}
+	v, ok := caps.Extensions[interruptReceiptCapability]
+	return ok && string(v) == "false"
+}
+
 // CycleInstructions is delivered to clients in the MCP handshake. The agent
 // cycle lives here, not in a separate tool (WORKER-PROMPT §4.1).
 const CycleInstructions = `Beacon cycle protocol:
