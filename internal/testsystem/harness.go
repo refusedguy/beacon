@@ -6,9 +6,9 @@
 // a process, reads the clock or the environment. Every value in a Result comes
 // from the Scenario (name, seed and steps) alone. That makes a trace safe to
 // record as a golden fingerprint and to replay inside an eval: the same seed
-// always yields the same events, on any Go version. LoadArterySpec is the one
-// explicit filesystem read: it parses tests/scenarios/seeded.yaml when a
-// caller asks for the seeded-regression artery. The runner itself stays pure.
+// always yields the same events, on any Go version. Parsing an artery spec is
+// pure too: ParseArterySpec takes the spec bytes from its caller and reads no
+// file, so the package as a whole stays free of the FILE capability.
 //
 // A typical eval imports the package, pulls a ready scenario from NewLibrary
 // and asserts on the fingerprint:
@@ -28,7 +28,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -357,15 +356,13 @@ type ArterySpec struct {
 	NegativeControl RunSpec           `yaml:"negative_control"`
 }
 
-// LoadArterySpec parses and validates the seeded-regression spec at path.
-func LoadArterySpec(path string) (ArterySpec, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ArterySpec{}, fmt.Errorf("testsystem: read artery spec %s: %w", path, err)
-	}
+// ParseArterySpec parses and validates the seeded-regression spec bytes. It
+// reads no file: the caller supplies the contents, which keeps the FILE
+// capability out of this package and its gates.
+func ParseArterySpec(data []byte) (ArterySpec, error) {
 	var spec ArterySpec
 	if err := yaml.Unmarshal(data, &spec); err != nil {
-		return ArterySpec{}, fmt.Errorf("testsystem: parse artery spec %s: %w", path, err)
+		return ArterySpec{}, fmt.Errorf("testsystem: parse artery spec: %w", err)
 	}
 	if err := spec.validate(); err != nil {
 		return ArterySpec{}, err

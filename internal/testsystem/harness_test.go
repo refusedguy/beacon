@@ -5,6 +5,7 @@
 package testsystem
 
 import (
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -236,7 +237,12 @@ func TestRegistryAndLibrary(t *testing.T) {
 // read from the traces Runner emitted, so a grep over the spec cannot replace
 // this test. The -v flag puts all four outcomes into the CI job log.
 func TestSeededRegressionArtery(t *testing.T) {
-	spec, err := LoadArterySpec("../../tests/scenarios/seeded.yaml")
+	const path = "../../tests/scenarios/seeded.yaml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read artery spec %s: %v", path, err)
+	}
+	spec, err := ParseArterySpec(data)
 	if err != nil {
 		t.Fatal(err)
 	}
