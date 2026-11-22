@@ -22,9 +22,9 @@ const (
 	defaultWorktreeSlug = "worktree"
 )
 
-// Worktree is one checkout the caller has discovered. Name is the worktree
+// SlugWorktree is one checkout the caller has discovered. Name is the worktree
 // name or path. Branch is the branch checked out there.
-type Worktree struct {
+type SlugWorktree struct {
 	Name   string
 	Branch string
 }
@@ -66,7 +66,7 @@ func BranchSlug(branch string, taken []string) string {
 // a second copy. When several checkouts hold the branch, the smallest name
 // wins and the result does not depend on the input order. Every other
 // checkout name joins taken before the new slug is chosen.
-func PlanWorktree(branch string, taken []string, existing []Worktree) WorktreePlan {
+func PlanWorktree(branch string, taken []string, existing []SlugWorktree) WorktreePlan {
 	branch = strings.TrimSpace(branch)
 	occupied := append([]string(nil), taken...)
 	var reusable []string
