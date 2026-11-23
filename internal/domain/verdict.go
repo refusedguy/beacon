@@ -563,23 +563,32 @@ type ConflictResult struct {
 	Message string       `json:"message,omitempty"`
 }
 
+// dedupInOrder returns the first occurrence of each normalized value in order.
+// norm rewrites a value before the membership test; keep drops unwanted values.
+func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
+	out := make([]T, 0, len(values))
+	seen := make(map[T]bool, len(values))
+	for _, v := range values {
+		v = norm(v)
+		if !keep(v) || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
 // NewConflictResult builds a ConflictResult. Paths are trimmed, empty entries
 // and duplicates are dropped while keeping the caller's order. The Paths
 // slice is always non-nil so an empty conflict serializes as [] rather than
 // null.
 func NewConflictResult(typ ConflictType, paths []string, message string) ConflictResult {
-	out := ConflictResult{Type: typ, Paths: []string{}}
-	seen := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		out.Paths = append(out.Paths, p)
+	return ConflictResult{
+		Type:    typ,
+		Paths:   dedupInOrder(paths, strings.TrimSpace, func(s string) bool { return s != "" }),
+		Message: message,
 	}
-	out.Message = message
-	return out
 }
 
 // Empty reports whether c carries no conflict detail. A zero ConflictResult is
