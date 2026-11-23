@@ -172,16 +172,11 @@ type PiRPCConnection interface {
 	Close() error
 }
 
-// PiProbe is the provider interface. Prompt writes into the active turn,
-// Steer writes into a running session and FollowUp queues into a sleeping one.
-// GetState and WaitForIdle expose the state transition W05 checks.
+// PiProbe is the delivery port. Steer writes into a running session and
+// FollowUp queues into a sleeping one.
 type PiProbe interface {
-	Prompt(ctx context.Context, sessionID, text string) error
 	Steer(ctx context.Context, sessionID, text string) error
 	FollowUp(ctx context.Context, sessionID, text string) error
-	Abort(ctx context.Context, sessionID string) error
-	GetState(ctx context.Context, sessionID string) (string, error)
-	WaitForIdle(ctx context.Context, sessionID string) error
 }
 
 // PiRPCProbe implements PiProbe over an injected PiRPCConnection. It holds

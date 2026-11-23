@@ -447,11 +447,6 @@ func (m *mockPiProbe) record(method string, ctx context.Context, sessionID, text
 	m.deadlines = append(m.deadlines, ok)
 }
 
-func (m *mockPiProbe) Prompt(ctx context.Context, sessionID, text string) error {
-	m.record("prompt", ctx, sessionID, text)
-	return nil
-}
-
 func (m *mockPiProbe) Steer(ctx context.Context, sessionID, text string) error {
 	m.record("steer", ctx, sessionID, text)
 	return m.steerErr
@@ -460,21 +455,6 @@ func (m *mockPiProbe) Steer(ctx context.Context, sessionID, text string) error {
 func (m *mockPiProbe) FollowUp(ctx context.Context, sessionID, text string) error {
 	m.record("followUp", ctx, sessionID, text)
 	return m.followUpErr
-}
-
-func (m *mockPiProbe) Abort(ctx context.Context, sessionID string) error {
-	m.record("abort", ctx, sessionID, "")
-	return nil
-}
-
-func (m *mockPiProbe) GetState(ctx context.Context, sessionID string) (string, error) {
-	m.record("get_state", ctx, sessionID, "")
-	return "processing", nil
-}
-
-func (m *mockPiProbe) WaitForIdle(ctx context.Context, sessionID string) error {
-	m.record("waitForIdle", ctx, sessionID, "")
-	return nil
 }
 
 var _ wake.PiProbe = (*mockPiProbe)(nil)
