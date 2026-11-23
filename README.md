@@ -231,14 +231,14 @@ Executor видит внешнюю поломку и отвечает `beacon_ac
 | `board` | Показать локальную доску карточек | `beacon board [--root <dir>] [--status <status>] [--owner <owner>]` |
 | `build` | Собрать воспроизводимый бинарник beacon | `beacon build` |
 | `ci` | Опросить открытые PR через CI-провайдер | `beacon ci check --all` |
-| `daemon` | Запустить фоновый цикл оркестратора | `beacon daemon [--interval] [--once]` |
+| `daemon` | Запустить фоновый цикл оркестратора | `beacon daemon [--interval 0 = адаптивный 10s/30s] [--once]` |
 | `deferred` | Показать отложенные wiring-карточки | `beacon deferred [--format table\|json] \| beacon deferred done <watchID>` |
 | `deliver` | Доставить результат по Watch в живую сессию | `beacon deliver <watchID>` |
 | `doctor` | Проверить версию Go, beacon-gates и каталог состояния или следить за внешним условием | `beacon doctor [--watch] [--interval 2s] [--session <id>] [--max-ticks <n>] [-- <команда>]` |
 | `gates` | Передать аргументы бинарнику beacon-gates | `beacon gates [gate] [flags]` |
 | `gc` | Очистить завершённые сессии Beacon | `beacon gc [--format table\|json] [--apply]` |
 | `gc-worktree` | Очистить устаревшие worktree | `beacon gc-worktree [--format table\|json] [--apply]` |
-| `human` | Принять решение оператора по вотче или блокеру | `beacon human [--format table\|json] <approve\|reject\|rework\|unblock\|pause\|resume\|cancel\|context\|force_retry_merge> <watchID\|blockerID> [--note \` |
+| `human` | Принять решение оператора по вотче или блокеру | `beacon human [--format table\|json] <approve\|reject\|rework\|unblock\|pause\|resume\|cancel\|context\|force_retry_merge> <watchID\|blockerID> [--note "..."]` |
 | `index` | Пересобрать SQLite-индекс карточек | `beacon index build [--root <dir>]` |
 | `init` | Подготовить проект: хуки, шаблоны и проверка MCP | `beacon init [--root <dir>] [--force]` |
 | `inspect` | Показать состояние вотч, блокеров и привязки оркестратора | `beacon inspect [<pr\|watchID>] [--format table\|json] [--json]` |
