@@ -23,10 +23,20 @@ type BaselineEntry struct {
 }
 
 // PermanentEntry is a standing exception. Every row needs a reason.
+// The optional tree conditions let one table cover both sides of a file
+// split. only_if_exists applies the row when that path exists, and
+// only_if_missing applies it when that path is absent.
 type PermanentEntry struct {
-	Rule   string `json:"rule"`
-	Path   string `json:"path"`
-	Reason string `json:"reason"`
+	Rule          string `json:"rule"`
+	Path          string `json:"path"`
+	Reason        string `json:"reason"`
+	OnlyIfExists  string `json:"only_if_exists,omitempty"`
+	OnlyIfMissing string `json:"only_if_missing,omitempty"`
+}
+
+func existsUnder(root, rel string) bool {
+	_, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel)))
+	return err == nil
 }
 
 type Exceptions struct {
@@ -90,9 +100,16 @@ func (ex Exceptions) Apply(fs []Finding, root string) []Finding {
 		}
 	}
 	for _, p := range ex.Permanent {
-		if activeUnder(root, p.Path) {
-			permanent = append(permanent, p)
+		if !activeUnder(root, p.Path) {
+			continue
 		}
+		if p.OnlyIfExists != "" && !existsUnder(root, p.OnlyIfExists) {
+			continue
+		}
+		if p.OnlyIfMissing != "" && existsUnder(root, p.OnlyIfMissing) {
+			continue
+		}
+		permanent = append(permanent, p)
 	}
 	covered := func(rule, path string) bool {
 		key := entryKey(rule, path)
