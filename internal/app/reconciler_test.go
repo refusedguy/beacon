@@ -308,3 +308,55 @@ func TestWaitingRunAdvancesObservedSHA(t *testing.T) {
 		t.Fatalf("ObservedSHA = %q, want sha2", got.ObservedSHA)
 	}
 }
+
+func TestRebaseNewBaseSHAWithFixedHeadRebasesOnce(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictNeedsRebase, core.Observation{})
+	run := store.runs["r1"]
+	run.ObservedSHA = "sha1"
+	run.ObservedBaseSHA = "base-old"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	scm := newBaseMovingSCM("sha1", "base-new")
+	r.SCM = scm
+
+	for i := 0; i < 4; i++ {
+		if _, err := r.Reconcile(context.Background(), 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if scm.updates != 1 {
+		t.Fatalf("branch updates = %d, want 1", scm.updates)
+	}
+	got := store.runs["r1"]
+	if got.ObservedBaseSHA != "base-new" {
+		t.Fatalf("ObservedBaseSHA = %q, want base-new", got.ObservedBaseSHA)
+	}
+	if got.ObservedSHA != "new-sha1" {
+		t.Fatalf("ObservedSHA = %q, want new-sha1", got.ObservedSHA)
+	}
+}
+
+func TestWakeNewBaseSHAWithFixedHeadWakesOnce(t *testing.T) {
+	r, store, _, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
+		core.Observation{PRNumber: 42, HeadSHA: "sha1", BaseSHA: "base-new", PRState: "open", FailureExcerpt: "panic: boom"})
+	run := store.runs["r1"]
+	run.ObservedSHA = "sha1"
+	run.ObservedBaseSHA = "base-old"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := r.Reconcile(context.Background(), 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(h.wakes) != 1 {
+		t.Fatalf("agent wakes = %d, want 1", len(h.wakes))
+	}
+	got := store.runs["r1"]
+	if got.ObservedBaseSHA != "base-new" {
+		t.Fatalf("ObservedBaseSHA = %q, want base-new", got.ObservedBaseSHA)
+	}
+}

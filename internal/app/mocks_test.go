@@ -344,6 +344,37 @@ func (f *fakeSCM) OpenPR(_ context.Context, head, base, title string) (int, erro
 	return f.foundPR, nil
 }
 
+// baseMovingSCM reports a fixed base SHA and a head that advances only after a
+// successful UpdateBranch. It models a PR whose head is untouched while the
+// base branch moves.
+type baseMovingSCM struct {
+	*fakeSCM
+	head    string
+	baseSHA string
+	updates int
+}
+
+func newBaseMovingSCM(head, baseSHA string) *baseMovingSCM {
+	return &baseMovingSCM{
+		fakeSCM: &fakeSCM{obs: core.Observation{PRNumber: 42, PRState: "open"}},
+		head:    head,
+		baseSHA: baseSHA,
+	}
+}
+
+func (f *baseMovingSCM) Observe(_ context.Context, pr int) (core.Observation, error) {
+	return core.Observation{PRNumber: pr, HeadSHA: f.head, BaseSHA: f.baseSHA, PRState: "open", Behind: true}, nil
+}
+
+func (f *baseMovingSCM) UpdateBranch(_ context.Context, _ int, sha string) (string, error) {
+	f.updates++
+	if f.updateErr != nil {
+		return "", f.updateErr
+	}
+	f.head = "new-" + sha
+	return f.head, nil
+}
+
 type fakePolicy struct{ decision core.MergeDecision }
 
 func (f fakePolicy) Evaluate(core.Observation) core.MergeDecision { return f.decision }

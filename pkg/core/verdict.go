@@ -20,6 +20,7 @@ type CheckResult struct {
 type Observation struct {
 	PRNumber          int
 	HeadSHA           string
+	BaseSHA           string
 	PRState           string
 	Checks            []CheckResult
 	Approvals         int

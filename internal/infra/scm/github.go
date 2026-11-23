@@ -97,6 +97,7 @@ func (g *GitHub) Observe(ctx context.Context, pr int) (core.Observation, error) 
 		return o, err
 	}
 	o.Behind = cmp.GetBehindBy() > 0
+	o.BaseSHA = cmp.GetBaseCommit().GetSHA()
 	return o, nil
 }
 
