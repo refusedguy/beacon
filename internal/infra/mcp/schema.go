@@ -552,8 +552,7 @@ const StatsOutcomeSchemaVersion = 2
 // Watch stays in its main list, so classification never changes a denominator.
 //
 // The report is a projection, not a second store. It is rendered once into the
-// stats response and read back from there by OutcomeReportFrom, which keeps
-// beacon_stats and any metrics reader on the same values.
+// stats response, so beacon_stats and any metrics reader see the same values.
 type OutcomeReport struct {
 	SchemaVersion       int      `json:"schemaVersion"`
 	CompletedIDs        []string `json:"completed_ids"`

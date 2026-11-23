@@ -1935,10 +1935,10 @@ func TestResponsibilityPartsAreWired(t *testing.T) {
 		name  string
 		owner *Bridge
 	}{
-		{"CIRefresh", b.ciRefresh.Bridge},
-		{"VerdictApplier", b.verdictApplier.Bridge},
-		{"WakeDispatcher", b.wakeDispatcher.Bridge},
-		{"ReadAPI", b.readAPI.Bridge},
+		{"ciRefresh", b.ciRefresh.Bridge},
+		{"verdictApplier", b.verdictApplier.Bridge},
+		{"wakeDispatcher", b.wakeDispatcher.Bridge},
+		{"readAPI", b.readAPI.Bridge},
 	}
 	for _, p := range parts {
 		if p.owner != b {

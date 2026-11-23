@@ -220,30 +220,3 @@ func (r *Readiness) MarkReady() { r.ready.Store(true) }
 
 // IsReady reports whether MarkReady has been called.
 func (r *Readiness) IsReady() bool { return r.ready.Load() }
-
-// Health returns the readiness-gated /healthz handler. Before MarkReady a
-// valid request gets 503; afterwards it gets 200. Other paths get 404 and
-// non-GET methods 405, matching the liveness handler this gates. The path is
-// HealthPath so the gate drops into the existing listener without a route
-// change.
-func (r *Readiness) Health() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path != HealthPath {
-			http.NotFound(w, req)
-			return
-		}
-		if req.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if !r.IsReady() {
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			http.Error(w, "not ready\n", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok\n"))
-	})
-}
