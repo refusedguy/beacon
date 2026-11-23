@@ -1,7 +1,7 @@
 ---
 id: EXAMPLE-01
 title: Example task card
-status: available
+status: in_progress
 scope:
   - internal/app/
 depends: []
