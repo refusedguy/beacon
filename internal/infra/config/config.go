@@ -146,8 +146,8 @@ func Load(path string) (Config, error) {
 }
 
 func literalOrEnv(literal, envName string) string {
-	if envName != "" {
-		return os.Getenv(envName)
+	if v := os.Getenv(envName); v != "" {
+		return v
 	}
 	return literal
 }

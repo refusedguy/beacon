@@ -29,6 +29,19 @@ func TestLoadWebhookSecretLiteral(t *testing.T) {
 	}
 }
 
+func TestLoadSecretLiteralFallsBackWhenEnvUnset(t *testing.T) {
+	const envName = "BEACON_TEST_UNSET_SECRET"
+	t.Setenv(envName, "")
+	path := writeConfig(t, "webhook:\n  secret: 'literal-secret'\n  secret_env: "+envName+"\n")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Webhook.Secret != "literal-secret" {
+		t.Fatalf("secret = %q, want literal fallback", c.Webhook.Secret)
+	}
+}
+
 func TestLoadWebhookSecretEnv(t *testing.T) {
 	const envName = "BEACON_TEST_WEBHOOK_SECRET"
 	t.Setenv(envName, "from-env-123")
