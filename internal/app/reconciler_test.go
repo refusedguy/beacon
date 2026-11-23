@@ -25,6 +25,15 @@ func newReconciler(t *testing.T, decision core.Verdict, obs core.Observation) (*
 	}, store, scm, h, src
 }
 
+// behindAwarePolicy mirrors the production policy's behind invariant. A behind
+// observation returns needs_rebase; the same observation without behind passes
+// all criteria and returns merge.
+type behindAwarePolicy struct{}
+
+func (behindAwarePolicy) Evaluate(o core.Observation) core.MergeDecision {
+	return core.Decide(o, nil)
+}
+
 func TestReconcileWaitingCIToAutoRebase(t *testing.T) {
 	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Behind: true})
@@ -417,6 +426,61 @@ func TestWakeNewBaseSHAWithFixedHeadWakesOnce(t *testing.T) {
 	got := store.runs["r1"]
 	if got.ObservedBaseSHA != "base-new" {
 		t.Fatalf("ObservedBaseSHA = %q, want base-new", got.ObservedBaseSHA)
+	}
+}
+
+func TestBehindGreenPRMergesWhenMergeable(t *testing.T) {
+	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", Behind: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+		})
+	r.Policy = behindAwarePolicy{}
+	run := store.runs["r1"]
+	run.ObservedSHA = "sha1"
+	run.ObservedBaseSHA = "base-old"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	decision, err := r.Reconcile(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != core.VerdictMerge {
+		t.Fatalf("verdict = %s, want merge", decision.Verdict)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunMerged || scm.merges != 1 {
+		t.Fatalf("state=%s merges=%d", got.State, scm.merges)
+	}
+	if got.ObservedSHA != "sha2" || got.ObservedBaseSHA != "base-new" {
+		t.Fatalf("observation not refreshed on merge: sha=%q base=%q", got.ObservedSHA, got.ObservedBaseSHA)
+	}
+	if scm.rebases != 0 {
+		t.Fatalf("branch updates = %d, want 0", scm.rebases)
+	}
+}
+
+func TestBehindGreenPRWithConflictDoesNotMerge(t *testing.T) {
+	r, store, scm, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", Behind: true, Conflict: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+		})
+	r.Policy = behindAwarePolicy{}
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if scm.merges != 0 {
+		t.Fatalf("merges = %d, want 0 for a conflicting PR", scm.merges)
+	}
+	if len(h.wakes) == 0 && scm.rebases == 0 {
+		t.Fatal("real conflict took neither the fix nor the rebase path")
+	}
+	if got := store.runs["r1"]; got.State == core.RunMerged {
+		t.Fatal("conflicting PR reached merged")
 	}
 }
 
