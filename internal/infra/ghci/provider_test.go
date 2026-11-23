@@ -321,6 +321,7 @@ func TestTransientGHErrorStillBacksOff(t *testing.T) {
 		Now:        func() time.Time { return now },
 		Backoff:    time.Second,
 		MaxBackoff: time.Minute,
+		Jitter:     func() time.Duration { return 0 },
 		Run: func(context.Context, ...string) ([]byte, error) {
 			return nil, errors.New("gh: exit status 1")
 		},
