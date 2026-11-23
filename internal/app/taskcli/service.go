@@ -1044,13 +1044,13 @@ type fileRepoSpec struct {
 var fileRepoSpecs = struct {
 	confirmation, fixChecks, handoffJournal, precheck, reservation, reaper, deferWake fileRepoSpec
 }{
-	confirmation:   {"handoff-confirmations.json", "handoff-confirmations.lock", "подтверждения handoff", "подтверждений handoff", msgPlural},
-	fixChecks:      {"fix-checks.json", "fix-checks.lock", "состояние fix-checks", "fix-checks", msgNeuter},
-	handoffJournal: {"handoff-journal.json", "handoff-journal.lock", "журнал handoff", "журнала handoff", msgMasculine},
-	precheck:       {"precheck.json", "precheck.lock", "журнал precheck", "precheck", msgMasculine},
-	reservation:    {"file-reservations.json", "file-reservations.lock", "аренда файлов", "аренды", msgFeminine},
-	reaper:         {"reaper-journal.json", "reaper-journal.lock", "журнал reaper", "журнала reaper", msgMasculine},
-	deferWake:      {"defer-wake-journal.json", "defer-wake-journal.lock", "журнал пробуждения", "журнала пробуждения", msgMasculine},
+	confirmation:   fileRepoSpec{"handoff-confirmations.json", "handoff-confirmations.lock", "подтверждения handoff", "подтверждений handoff", msgPlural},
+	fixChecks:      fileRepoSpec{"fix-checks.json", "fix-checks.lock", "состояние fix-checks", "fix-checks", msgNeuter},
+	handoffJournal: fileRepoSpec{"handoff-journal.json", "handoff-journal.lock", "журнал handoff", "журнала handoff", msgMasculine},
+	precheck:       fileRepoSpec{"precheck.json", "precheck.lock", "журнал precheck", "precheck", msgMasculine},
+	reservation:    fileRepoSpec{"file-reservations.json", "file-reservations.lock", "аренда файлов", "аренды", msgFeminine},
+	reaper:         fileRepoSpec{"reaper-journal.json", "reaper-journal.lock", "журнал reaper", "журнала reaper", msgMasculine},
+	deferWake:      fileRepoSpec{"defer-wake-journal.json", "defer-wake-journal.lock", "журнал пробуждения", "журнала пробуждения", msgMasculine},
 }
 
 // newFileRepo builds a fileState from cfg and spec. All nine path and error
