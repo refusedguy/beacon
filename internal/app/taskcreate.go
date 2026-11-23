@@ -3,10 +3,13 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -23,12 +26,19 @@ type PathCommitter interface {
 type BaseRebaser interface {
 	RebaseBase(ctx context.Context, ws core.Workspace, base string) error
 }
+type TaskGraphStore interface {
+	SyncTasks(ctx context.Context, tasks []core.Task) error
+}
+type TaskRemover interface {
+	Remove(ctx context.Context, id core.TaskID) error
+}
+type TaskBatchCreator interface {
+	CreateMany(ctx context.Context, tasks []core.Task) ([]core.Task, error)
+}
 
 // NonFastForwardError marks a push rejected because the remote ref advanced.
 // A caller retries the publish once after rebasing on the latest origin base.
-type NonFastForwardError struct {
-	Err error
-}
+type NonFastForwardError struct{ Err error }
 
 func (e *NonFastForwardError) Error() string {
 	if e.Err == nil {
@@ -40,25 +50,36 @@ func (e *NonFastForwardError) Error() string {
 func (e *NonFastForwardError) Unwrap() error { return e.Err }
 
 type CreateTaskInput struct {
-	Title    string   `json:"title"`
-	Body     string   `json:"body"`
-	Scope    []string `json:"scope"`
-	Depends  []string `json:"depends"`
-	Priority int      `json:"priority"`
+	Title         string           `json:"title"`
+	Body          string           `json:"body"`
+	Scope         []string         `json:"scope"`
+	Depends       []string         `json:"depends"`
+	Priority      int              `json:"priority"`
+	ID            string           `json:"id,omitempty"`
+	Kind          core.TaskKind    `json:"kind,omitempty"`
+	BaseBranch    string           `json:"base_branch,omitempty"`
+	RequireReview core.ReviewMode  `json:"require_review,omitempty"`
+	Plan          []core.ChildSpec `json:"plan,omitempty"`
 }
 
 type CreatedTask struct {
-	ID     string `json:"id"`
-	Path   string `json:"path"`
-	Pushed bool   `json:"pushed"`
+	ID       string        `json:"id"`
+	Path     string        `json:"path"`
+	Pushed   bool          `json:"pushed"`
+	IDs      []string      `json:"ids,omitempty"`
+	Children []CreatedTask `json:"children,omitempty"`
 }
 
-// TaskCreator writes a task card through the source, then commits and pushes
-// docs/tasks so the next dispatch sees the card.
+// TaskCreator writes cards through the source, then commits and pushes them.
+// An epic with a plan expands into deterministic child cards before the epic.
 type TaskCreator struct {
 	Source    TaskSource
 	Workspace PathCommitter
 	Root      core.Workspace
+	Store     TaskGraphStore
+
+	mu      sync.Mutex
+	created map[string][]core.Task
 }
 
 func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTask, error) {
@@ -67,23 +88,68 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	if title == "" {
 		return out, core.Errorf(core.CodeInvalidInput, "task title is required")
 	}
-	id, err := newTaskID()
-	if err != nil {
-		return out, err
+	kind := normalizeKind(in.Kind)
+	epic := kind == core.TaskKindEpic
+	id := core.TaskID(strings.TrimSpace(in.ID))
+	if id == "" && epic {
+		id = epicTaskID(title, in.Plan)
 	}
+	if id == "" {
+		var err error
+		if id, err = newTaskID(); err != nil {
+			return out, err
+		}
+	}
+	children := childTasks(id, in.Plan)
+	key := idempotencyKey(id, children)
+	if epic {
+		if existing, ok := c.lookup(ctx, key, id, children); ok {
+			return c.result(existing), nil
+		}
+	}
+
 	task := core.Task{
-		ID:        id,
-		Title:     title,
-		Body:      strings.TrimSpace(in.Body),
-		Scope:     taskScopes(in.Scope),
-		DependsOn: taskDependencies(in.Depends),
-		Priority:  in.Priority,
-		Status:    core.TaskAvailable,
+		ID: id, Title: title, Body: strings.TrimSpace(in.Body),
+		Scope: taskScopes(in.Scope), DependsOn: taskDependencies(in.Depends),
+		Priority: in.Priority, Status: core.TaskAvailable,
+		Kind: kind, BaseBranch: strings.TrimSpace(in.BaseBranch),
+		RequireReview: normalizeReview(in.RequireReview), Plan: in.Plan,
+		SourceRef: "docs/tasks/" + string(id) + ".md",
 	}
-	created, err := c.Source.Create(ctx, task)
+	if epic {
+		for _, child := range children {
+			task.DependsOn = append(task.DependsOn, child.ID)
+		}
+	}
+	graph := append(append([]core.Task{}, children...), task)
+
+	created, err := c.writeTasks(ctx, graph)
 	if err != nil {
+		c.rollback(ctx, created)
 		return out, err
 	}
+	if c.Store != nil {
+		if err := c.Store.SyncTasks(ctx, created); err != nil {
+			c.rollback(ctx, created)
+			return out, err
+		}
+	}
+	if err := c.publish(ctx, id); err != nil {
+		c.rollback(ctx, created)
+		return out, err
+	}
+	if epic {
+		c.mu.Lock()
+		if c.created == nil {
+			c.created = make(map[string][]core.Task)
+		}
+		c.created[key] = created
+		c.mu.Unlock()
+	}
+	return c.result(created), nil
+}
+
+func (c *TaskCreator) publish(ctx context.Context, id core.TaskID) error {
 	base := c.Root.Base
 	if base == "" {
 		base = c.Root.Branch
@@ -91,30 +157,89 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	if base == "" {
 		base = "main"
 	}
-	publish := func() error {
-		return c.Workspace.CommitPath(ctx, c.Root, "docs/tasks", "beacon: create task "+string(created.ID))
+	commit := func() error {
+		return c.Workspace.CommitPath(ctx, c.Root, "docs/tasks", "beacon: create task "+string(id))
 	}
-	// Bring the local base up to date before committing. The rebase is a no-op
-	// when local already matches origin, so repeated calls stay harmless.
 	if err := c.rebaseBase(ctx, base); err != nil {
-		return out, err
+		return err
 	}
-	if err := publish(); err != nil {
+	if err := commit(); err != nil {
 		var nff *NonFastForwardError
 		if !errors.As(err, &nff) {
-			return out, err
+			return err
 		}
-		// Another card reached origin between the rebase and the push. Sync
-		// once more and retry. CommitPath does not recommit a card that is
-		// already committed, so the retry does not create a second commit.
 		if err := c.rebaseBase(ctx, base); err != nil {
-			return out, err
+			return err
 		}
-		if err := publish(); err != nil {
-			return out, err
-		}
+		return commit()
 	}
-	return CreatedTask{ID: string(created.ID), Path: created.SourceRef, Pushed: true}, nil
+	return nil
+}
+
+func (c *TaskCreator) writeTasks(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
+	if batch, ok := c.Source.(TaskBatchCreator); ok {
+		return batch.CreateMany(ctx, tasks)
+	}
+	out := make([]core.Task, 0, len(tasks))
+	for _, task := range tasks {
+		created, err := c.Source.Create(ctx, task)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, created)
+	}
+	return out, nil
+}
+
+func (c *TaskCreator) rollback(ctx context.Context, tasks []core.Task) {
+	remover, ok := c.Source.(TaskRemover)
+	if !ok {
+		return
+	}
+	for i := len(tasks) - 1; i >= 0; i-- {
+		_ = remover.Remove(ctx, tasks[i].ID)
+	}
+}
+
+func (c *TaskCreator) lookup(ctx context.Context, key string, id core.TaskID, children []core.Task) ([]core.Task, bool) {
+	c.mu.Lock()
+	tasks, ok := c.created[key]
+	c.mu.Unlock()
+	if ok {
+		return tasks, true
+	}
+	available, err := c.Source.ListAvailable(ctx)
+	if err != nil {
+		return nil, false
+	}
+	for _, task := range available {
+		if task.ID != id || task.Kind != core.TaskKindEpic ||
+			strings.Join(childTitles(task.Plan), "\x00") != strings.Join(taskTitles(children), "\x00") {
+			continue
+		}
+		out := make([]core.Task, 0, len(children)+1)
+		for _, child := range children {
+			out = append(out, core.Task{ID: child.ID, SourceRef: "docs/tasks/" + string(child.ID) + ".md"})
+		}
+		return append(out, core.Task{ID: id, SourceRef: "docs/tasks/" + string(id) + ".md"}), true
+	}
+	return nil, false
+}
+
+func (c *TaskCreator) result(created []core.Task) CreatedTask {
+	out := CreatedTask{Pushed: true, IDs: make([]string, 0, len(created))}
+	for _, task := range created {
+		out.IDs = append(out.IDs, string(task.ID))
+	}
+	if len(created) == 0 {
+		return out
+	}
+	last := created[len(created)-1]
+	out.ID, out.Path = string(last.ID), last.SourceRef
+	for _, task := range created[:len(created)-1] {
+		out.Children = append(out.Children, CreatedTask{ID: string(task.ID), Path: task.SourceRef})
+	}
+	return out
 }
 
 func (c *TaskCreator) rebaseBase(ctx context.Context, base string) error {
@@ -123,6 +248,65 @@ func (c *TaskCreator) rebaseBase(ctx context.Context, base string) error {
 		return nil
 	}
 	return rebaser.RebaseBase(ctx, c.Root, base)
+}
+
+func childTasks(epicID core.TaskID, plan []core.ChildSpec) []core.Task {
+	branch := "beacon/" + string(epicID)
+	out := make([]core.Task, 0, len(plan))
+	for i, spec := range plan {
+		out = append(out, core.Task{
+			ID: core.ChildTaskID(epicID, i+1), Title: strings.TrimSpace(spec.Title),
+			Scope: spec.Scope, DependsOn: append([]core.TaskID(nil), spec.Depends...),
+			Priority: spec.Priority, Status: core.TaskAvailable,
+			Kind: core.TaskKindTask, BaseBranch: branch,
+		})
+	}
+	return out
+}
+
+func idempotencyKey(epicID core.TaskID, children []core.Task) string {
+	return string(epicID) + "|" + strings.Join(taskTitles(children), "\x00")
+}
+
+func epicTaskID(title string, plan []core.ChildSpec) core.TaskID {
+	sum := sha256.Sum256([]byte(title + "\x00" + strings.Join(childTitles(plan), "\x00")))
+	return core.TaskID("T-" + time.Now().UTC().Format("20060102") + "-" + hex.EncodeToString(sum[:4]))
+}
+
+func childTitles(specs []core.ChildSpec) []string {
+	out := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		out = append(out, strings.TrimSpace(spec.Title))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func taskTitles(tasks []core.Task) []string {
+	out := make([]string, 0, len(tasks))
+	for _, task := range tasks {
+		out = append(out, strings.TrimSpace(task.Title))
+	}
+	sort.Strings(out)
+	return out
+}
+
+func normalizeKind(kind core.TaskKind) core.TaskKind {
+	if strings.EqualFold(strings.TrimSpace(string(kind)), string(core.TaskKindEpic)) {
+		return core.TaskKindEpic
+	}
+	return core.TaskKindTask
+}
+
+func normalizeReview(mode core.ReviewMode) core.ReviewMode {
+	switch strings.ToLower(strings.TrimSpace(string(mode))) {
+	case string(core.ReviewModeHuman):
+		return core.ReviewModeHuman
+	case string(core.ReviewModeNone):
+		return core.ReviewModeNone
+	default:
+		return core.ReviewModeLLM
+	}
 }
 
 func taskScopes(values []string) []core.ScopePath {
