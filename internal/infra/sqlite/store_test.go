@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -347,5 +348,166 @@ VALUES ('r1', 'T-1', 'waiting_ci', 'head-1', 1, 2)`); err != nil {
 	got, err = store.Get(context.Background(), "r1")
 	if err != nil || got == nil || got.ObservedBaseSHA != "base-1" {
 		t.Fatalf("write after migration = %+v err=%v", got, err)
+	}
+}
+
+func TestRunEventsRecordStateTransitions(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	run := core.NewRun("r1", "T-1", time.Now().UTC().Add(-time.Minute))
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range []core.RunState{core.RunRunning, core.RunWaitingCI, core.RunBlocked} {
+		run.State = state
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Saving without a state change must not pad the timeline.
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	events, err := store.ListRunEvents(ctx, []string{"r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"pending", "running", "waiting_ci", "blocked"}
+	if len(events) != len(want) {
+		t.Fatalf("events = %d, want %d: %+v", len(events), len(want), events)
+	}
+	for i, state := range want {
+		if events[i].State != state || events[i].At.IsZero() || events[i].RunID != "r1" {
+			t.Errorf("event[%d] = %+v, want state %s", i, events[i], state)
+		}
+		if i > 0 && !events[i].At.After(events[i-1].At) {
+			t.Errorf("event[%d] time %s is not after %s", i, events[i].At, events[i-1].At)
+		}
+	}
+}
+
+func TestDecisionsAndSnapshotAreBatched(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	app.SetDecisionSink(store)
+	t.Cleanup(func() { app.SetDecisionSink(nil) })
+
+	first := core.NewRun("r1", "T-1", time.Now().UTC().Add(-2*time.Minute))
+	first.State = core.RunWaitingCI
+	second := core.NewRun("r2", "T-2", time.Now().UTC().Add(-time.Minute))
+	second.State = core.RunMerged
+	for _, run := range []*core.Run{first, second} {
+		if err := store.Save(ctx, run); err != nil {
+			t.Fatal(err)
+		}
+	}
+	app.RecordDecision(ctx, app.Decision{
+		Kind: "dispatch.skip", RunID: "r1", TaskID: "T-1",
+		Verdict: "scope_overlap", Reason: "scope overlaps T-9",
+		Fields: map[string]any{"blocked_by": "T-9"},
+	})
+	app.RecordDecision(ctx, app.Decision{
+		Kind: "transition.merge", RunID: "r2", PRNumber: 42, Action: "merged",
+	})
+	app.RecordDecision(ctx, app.Decision{Kind: "dispatch.candidates"})
+
+	decisions, err := store.ListDecisions(ctx, []string{"r1", "r2"})
+	if err != nil || len(decisions) != 3 {
+		t.Fatalf("decisions = %+v err=%v", decisions, err)
+	}
+	if decisions[0].Verdict != "scope_overlap" || decisions[0].Fields["blocked_by"] != "T-9" || decisions[0].At.IsZero() {
+		t.Fatalf("stored decision = %+v", decisions[0])
+	}
+	events, err := store.ListRunEvents(ctx, []string{"r1", "r2"})
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events = %+v err=%v", events, err)
+	}
+
+	snap, err := (app.SnapshotService{Store: store}).Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Active) != 1 || len(snap.Recent) != 1 {
+		t.Fatalf("snapshot runs = %+v", snap)
+	}
+	active := snap.Active[0]
+	if active.ID != "r1" || len(active.Timeline) != 1 || len(active.Decisions) != 1 {
+		t.Fatalf("active run = %+v", active)
+	}
+	if active.Durations.WaitingCI < 60 {
+		t.Fatalf("waiting_ci duration = %d, want at least 60s", active.Durations.WaitingCI)
+	}
+	m := snap.Metrics
+	if m.SkipCount != 1 || m.Skips["scope_overlap"] != 1 || m.MergeCount != 1 ||
+		m.DispatchCycles != 1 || m.ActiveCount != 1 || m.RecentCount != 1 || m.CIWaitSeconds < 60 {
+		t.Fatalf("metrics = %+v", m)
+	}
+}
+
+func TestRunEventMigrationBackfillsExistingRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	legacy, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+CREATE TABLE runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  pr_number INTEGER NOT NULL DEFAULT 0,
+  head_sha TEXT NOT NULL DEFAULT '',
+  observed_sha TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  parent_session_id TEXT NOT NULL DEFAULT '',
+  workspace_path TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '',
+  scope_json TEXT NOT NULL DEFAULT '[]',
+  blocked_incident_id TEXT NOT NULL DEFAULT '',
+  is_fixer INTEGER NOT NULL DEFAULT 0,
+  rebase_attempts INTEGER NOT NULL DEFAULT 0,
+  fix_attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+INSERT INTO runs (id, task_id, state, created_at, updated_at) VALUES ('r1', 'T-1', 'waiting_ci', 1, 2);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ {
+		store, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events, err := store.ListRunEvents(context.Background(), []string{"r1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 2 || events[0].State != "pending" || events[1].State != "waiting_ci" {
+			t.Fatalf("open %d: backfilled events = %+v", i, events)
+		}
+		run, err := store.Get(context.Background(), "r1")
+		if err != nil || run == nil || run.State != core.RunWaitingCI {
+			t.Fatalf("open %d: run = %+v err=%v", i, run, err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

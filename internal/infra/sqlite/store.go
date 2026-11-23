@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -18,7 +20,9 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	store := &Store{db: db}
+	app.SetDecisionSink(store)
+	return store, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -37,7 +41,22 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var previous string
+	newRun := false
+	err = tx.QueryRowContext(ctx, `SELECT state FROM runs WHERE id=?`, string(r.ID)).Scan(&previous)
+	switch {
+	case err == nil:
+	case err == sql.ErrNoRows:
+		newRun = true
+	default:
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO runs (`+runColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
  state=excluded.state, pr_number=excluded.pr_number, head_sha=excluded.head_sha,
@@ -52,7 +71,46 @@ ON CONFLICT(id) DO UPDATE SET
 		r.ObservedSHA, r.ObservedBaseSHA, r.SessionID, r.ParentSessionID, r.WorkspacePath, r.Branch,
 		string(scope), r.BlockedIncidentID, boolInt(r.IsFixer), r.RebaseAttempts,
 		r.FixAttempts, r.MaxAttempts, r.Reason, r.CreatedAt.UnixNano(), r.UpdatedAt.UnixNano())
-	return err
+	if err != nil {
+		return err
+	}
+	if newRun || previous != string(r.State) {
+		kind, state, at := stateEventKind(r.State), r.State, r.UpdatedAt
+		if newRun {
+			at = r.CreatedAt
+		}
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO run_events (run_id, kind, state, at, head_sha, pr_number, reason) VALUES (?,?,?,?,?,?,?)`,
+			string(r.ID), kind, string(state), at.UnixNano(), r.HeadSHA, r.PRNumber, r.Reason)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// stateEventKind names the timeline entry recorded when a run enters a state.
+func stateEventKind(state core.RunState) string {
+	switch state {
+	case core.RunPending:
+		return "start"
+	case core.RunRunning:
+		return "started"
+	case core.RunWaitingCI:
+		return "checks_pending"
+	case core.RunNeedsRebase:
+		return "behind"
+	case core.RunNeedsAgentFix:
+		return "checks_failed"
+	case core.RunBlocked:
+		return "blocked"
+	case core.RunMerged:
+		return "merged"
+	case core.RunClosed:
+		return "closed"
+	default:
+		return string(state)
+	}
 }
 
 func boolInt(b bool) int {
@@ -162,4 +220,96 @@ func (s *Store) Approved(ctx context.Context, id core.RunID, sha string) (bool, 
 	return n > 0, err
 }
 
+// RecordDecision implements app.DecisionSink.
+func (s *Store) RecordDecision(ctx context.Context, d app.Decision) error {
+	if d.At.IsZero() {
+		d.At = time.Now().UTC()
+	}
+	fields := []byte("{}")
+	if d.Fields != nil {
+		var err error
+		fields, err = json.Marshal(d.Fields)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO decisions (at, cycle_id, kind, run_id, task_id, pr_number, verdict, action, reason, fields_json)
+VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		d.At.UnixNano(), d.CycleID, d.Kind, d.RunID, d.TaskID, d.PRNumber,
+		d.Verdict, d.Action, d.Reason, string(fields))
+	return err
+}
+
+// ListRunEvents returns the timelines of all given runs in one query.
+func (s *Store) ListRunEvents(ctx context.Context, runIDs []string) ([]app.RunEvent, error) {
+	out := []app.RunEvent{}
+	if len(runIDs) == 0 {
+		return out, nil
+	}
+	query, args := inQuery(`SELECT id, run_id, kind, state, at, head_sha, pr_number, reason
+FROM run_events WHERE run_id IN (%s) ORDER BY at, id`, runIDs)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var event app.RunEvent
+		var at int64
+		if err := rows.Scan(&event.ID, &event.RunID, &event.Kind, &event.State,
+			&at, &event.HeadSHA, &event.PRNumber, &event.Reason); err != nil {
+			return nil, err
+		}
+		event.At = time.Unix(0, at).UTC()
+		out = append(out, event)
+	}
+	return out, rows.Err()
+}
+
+const decisionColumns = `id, at, cycle_id, kind, run_id, task_id, pr_number, verdict, action, reason, fields_json`
+
+// ListDecisions returns the decision history of all given runs in one query.
+// Decisions without a run (dispatch skips, candidate counts) are included so
+// their counts reach the snapshot metrics.
+func (s *Store) ListDecisions(ctx context.Context, runIDs []string) ([]app.Decision, error) {
+	out := []app.Decision{}
+	query := `SELECT ` + decisionColumns + ` FROM decisions WHERE run_id = '' ORDER BY at, id`
+	var args []any
+	if len(runIDs) > 0 {
+		query, args = inQuery(`SELECT `+decisionColumns+` FROM decisions
+WHERE run_id IN (%s) OR run_id = '' ORDER BY at, id`, runIDs)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var d app.Decision
+		var at int64
+		var fields string
+		if err := rows.Scan(&d.ID, &at, &d.CycleID, &d.Kind, &d.RunID, &d.TaskID,
+			&d.PRNumber, &d.Verdict, &d.Action, &d.Reason, &fields); err != nil {
+			return nil, err
+		}
+		d.At = time.Unix(0, at).UTC()
+		if err := json.Unmarshal([]byte(fields), &d.Fields); err != nil {
+			return nil, fmt.Errorf("fields_json: %w", err)
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+func inQuery(template string, ids []string) (string, []any) {
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return fmt.Sprintf(template, strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")), args
+}
+
 var _ core.RunStore = (*Store)(nil)
+var _ app.DecisionSink = (*Store)(nil)
+var _ app.SnapshotStore = (*Store)(nil)

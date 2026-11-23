@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { locationInfo, projectRoot } from "./location.js"
 import { registerBeaconMcp } from "./mcp.js"
 import { installProjectContext } from "./context.js"
-import { BeaconStatusRpc, createCliStatusSource } from "./ui.js"
+import { BeaconStatusRpc, createCliStatusSource, normalizeSnapshot } from "./ui.js"
 
 export const SHELL_GUARD_RULES = Object.freeze([
   {
@@ -78,11 +78,13 @@ export const beaconProject = Plugin.define({
     const context = await installProjectContext(ctx, root, locationInfo(ctx))
     const guard = await registerShellGuard(ctx, ctx?.config ?? {})
 
+    // One CLI snapshot feeds every panel. The handler normalizes the same
+    // shape the TUI source uses, so old fields stay available to both.
     const statusSource = createCliStatusSource({ root })
     let statusRpc = null
     try {
       statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
-        snapshot: () => statusSource.snapshot(),
+        snapshot: async () => normalizeSnapshot(await statusSource.snapshot()),
       })
     } catch (error) {
       console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
