@@ -1315,35 +1315,6 @@ func TestWatchOutcomeKeepsInboxWorking(t *testing.T) {
 	}
 }
 
-// TestWatchOutcomeRedactsResult applies ADR 0012 to worker results as it does
-// to inbox payloads (T3.4): a secret in the result never reaches the file.
-func TestWatchOutcomeRedactsResult(t *testing.T) {
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	secret := "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-	if err := d.PublishOutcome(WatchOutcome{Key: "secret-worker", Result: []byte("token " + secret)}); err != nil {
-		t.Fatalf("PublishOutcome: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	ch, err := d.WatchOutcome(ctx, "secret-worker")
-	if err != nil {
-		t.Fatalf("WatchOutcome: %v", err)
-	}
-	select {
-	case o := <-ch:
-		if bytes.Contains(o.Result, []byte("ghp_")) {
-			t.Errorf("delivered outcome kept a raw token: %s", o.Result)
-		}
-	case <-ctx.Done():
-		t.Fatalf("watcher was not woken: %v", ctx.Err())
-	}
-}
-
 // replayScenarioSteps builds a three-step scenario that touches three durable
 // tables: a task start (ADR 0031), an inbox message (ADR 0039) and a journal
 // event (ADR 0036). The steps use the same idempotent SQL the store uses, and
@@ -1629,31 +1600,6 @@ func TestReplayRejectsEmptyInput(t *testing.T) {
 	}
 }
 
-// TestReplayRedactsResult applies ADR 0012 to a scenario result as it does to
-// inbox payloads and worker outcomes: a secret never reaches the file.
-func TestReplayRedactsResult(t *testing.T) {
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	res, err := d.Replay("scenario-secret", nil, []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789"))
-	if err != nil {
-		t.Fatalf("Replay: %v", err)
-	}
-	if bytes.Contains(res.Result, []byte("ghp_")) {
-		t.Errorf("first result kept a raw token: %s", res.Result)
-	}
-	stored, ok, err := d.ScenarioResult("scenario-secret")
-	if err != nil || !ok {
-		t.Fatalf("ScenarioResult: %v, %v; want found", ok, err)
-	}
-	if bytes.Contains(stored, []byte("ghp_")) {
-		t.Errorf("stored result kept a raw token: %s", stored)
-	}
-}
-
 // checkpointWaitSteps writes steps 1..n with a state blob for each one.
 func checkpointWaitSteps(t *testing.T, d *DB, key, taskID string, n int) {
 	t.Helper()
@@ -1925,43 +1871,6 @@ func TestCheckpointWaitRejectsInvalidInput(t *testing.T) {
 	}
 }
 
-// TestCheckpointWaitRedactsState applies ADR 0012 to task state as it does to
-// inbox payloads, outcomes and scenario results: a secret never reaches the
-// file, and resume returns the redacted copy.
-func TestCheckpointWaitRedactsState(t *testing.T) {
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
-	res, err := d.CheckpointWait("wait-secret", "task-1", 1, secret, nil)
-	if err != nil {
-		t.Fatalf("CheckpointWait: %v", err)
-	}
-	if bytes.Contains(res.Checkpoint.State, []byte("ghp_")) {
-		t.Errorf("checkpoint state kept a raw token: %s", res.Checkpoint.State)
-	}
-	if !bytes.Contains(secret, []byte("ghp_")) {
-		t.Fatal("test input lost its secret before the write")
-	}
-	_, state, found, err := d.ResumeWait("wait-secret")
-	if err != nil || !found {
-		t.Fatalf("ResumeWait: found=%v err=%v; want found", found, err)
-	}
-	if bytes.Contains(state, []byte("ghp_")) {
-		t.Errorf("resumed state kept a raw token: %s", state)
-	}
-	stored, found, err := d.WaitCheckpoint("wait-secret")
-	if err != nil || !found {
-		t.Fatalf("WaitCheckpoint: found=%v err=%v; want found", found, err)
-	}
-	if bytes.Contains(stored.State, []byte("ghp_")) {
-		t.Errorf("stored state kept a raw token: %s", stored.State)
-	}
-}
-
 // completionEmit records one delivery of a completion notice. The counter
 // observes the call and the durable row observes the committed effect inside
 // the same transaction as the notice (ADR 0044 feature 5).
@@ -2173,37 +2082,6 @@ func TestNotifyCompletionDistinctEventsEmitSeparately(t *testing.T) {
 	}
 	if n, err := d.CompletionNotificationCount(); err != nil || n != 2 {
 		t.Fatalf("CompletionNotificationCount = %d, %v; want 2", n, err)
-	}
-}
-
-// TestNotifyCompletionRedactsPayload applies ADR 0012 to notice payloads as it
-// does to inbox messages, outcomes and scenario results: a secret never
-// reaches the file and a repeat returns the redacted copy.
-func TestNotifyCompletionRedactsPayload(t *testing.T) {
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	secret := []byte(`{"status":"done","token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`)
-	var emitted int32
-	res, err := d.NotifyCompletion("evt-secret", "task-1", secret, completionEmit(&emitted))
-	if err != nil {
-		t.Fatalf("NotifyCompletion: %v", err)
-	}
-	if bytes.Contains(res.Notification.Payload, []byte("ghp_")) {
-		t.Errorf("returned notice kept a raw token: %s", res.Notification.Payload)
-	}
-	if !bytes.Contains(secret, []byte("ghp_")) {
-		t.Fatal("test input lost its secret before the write")
-	}
-	stored, found, err := d.CompletionNotification("evt-secret")
-	if err != nil || !found {
-		t.Fatalf("CompletionNotification: found=%v err=%v; want found", found, err)
-	}
-	if bytes.Contains(stored.Payload, []byte("ghp_")) {
-		t.Errorf("stored notice kept a raw token: %s", stored.Payload)
 	}
 }
 
@@ -2479,41 +2357,6 @@ func TestTaskLogSurvivesRestart(t *testing.T) {
 	}
 	if !view.HasActivity || view.Activity.Message != "finalizing" {
 		t.Errorf("activity after restart = %+v, want finalizing", view.Activity)
-	}
-}
-
-// TestTaskLogRedactsPayloads applies ADR 0012 to log parts and live activity:
-// a secret never reaches the file, and a repeat returns the redacted copy.
-func TestTaskLogRedactsPayloads(t *testing.T) {
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
-	if err := d.SetLogPart("task-6", LogPartReport, secret); err != nil {
-		t.Fatalf("SetLogPart: %v", err)
-	}
-	if err := d.SetActivity("task-6", string(secret)); err != nil {
-		t.Fatalf("SetActivity: %v", err)
-	}
-	parts, err := d.TaskLogParts("task-6")
-	if err != nil || len(parts) != 1 {
-		t.Fatalf("TaskLogParts = %d, %v; want 1", len(parts), err)
-	}
-	if bytes.Contains(parts[0].Payload, []byte("ghp_")) {
-		t.Errorf("stored part kept a raw token: %s", parts[0].Payload)
-	}
-	act, found, err := d.Activity("task-6")
-	if err != nil || !found {
-		t.Fatalf("Activity: found=%v err=%v; want found", found, err)
-	}
-	if strings.Contains(act.Message, "ghp_") {
-		t.Errorf("stored activity kept a raw token: %q", act.Message)
-	}
-	if !bytes.Contains(secret, []byte("ghp_")) {
-		t.Fatal("test input lost its secret before the write")
 	}
 }
 
@@ -3156,46 +2999,6 @@ func TestQueueFenceTokenMonotonicAcrossRestart(t *testing.T) {
 	}
 }
 
-// TestQueueRedactsPayloads applies ADR 0012 to both an enqueued task and a
-// continuation: a secret must not reach the file or a lease.
-func TestQueueRedactsPayloads(t *testing.T) {
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	secret := []byte(`{"token":"ghp_abcdefghijklmnopqrstuvwxyz0123456789"}`)
-	if err := d.EnqueueQueueTask("q", "t", secret); err != nil {
-		t.Fatalf("EnqueueQueueTask: %v", err)
-	}
-	task, found, err := d.QueueTask("t")
-	if err != nil || !found {
-		t.Fatalf("QueueTask: found=%v err=%v", found, err)
-	}
-	if bytes.Contains(task.Payload, []byte("ghp_")) {
-		t.Errorf("stored task kept a raw token: %s", task.Payload)
-	}
-	lease, found, err := d.LeaseQueueTask("q", "w", time.Now(), time.Minute)
-	if err != nil || !found {
-		t.Fatalf("lease: %+v found=%v err=%v", lease, found, err)
-	}
-	if bytes.Contains(lease.Payload, []byte("ghp_")) {
-		t.Errorf("lease kept a raw token: %s", lease.Payload)
-	}
-	next := &QueueContinuation{Queue: "q2", TaskID: "t2", Payload: secret}
-	if _, err := d.CompleteQueueTask("t", "w", lease.FencingToken, next, nil); err != nil {
-		t.Fatalf("CompleteQueueTask: %v", err)
-	}
-	cont, found, err := d.QueueTask("t2")
-	if err != nil || !found {
-		t.Fatalf("QueueTask t2: found=%v err=%v", found, err)
-	}
-	if bytes.Contains(cont.Payload, []byte("ghp_")) {
-		t.Errorf("stored continuation kept a raw token: %s", cont.Payload)
-	}
-}
-
 func TestQueueRejectsInvalidInput(t *testing.T) {
 	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -3237,29 +3040,6 @@ func TestQueueRejectsInvalidInput(t *testing.T) {
 	tasks, err := d.QueueTasks("q")
 	if err != nil || len(tasks) != 0 {
 		t.Fatalf("QueueTasks after rejected input = %d, %v; want 0", len(tasks), err)
-	}
-}
-
-// TestAcceptTaskRedactsState applies ADR 0012 to the WAL payload: a secret
-// must not reach the file, and a poll returns the redacted copy.
-func TestAcceptTaskRedactsState(t *testing.T) {
-	ctx := context.Background()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	defer d.Close()
-
-	secret := []byte("token ghp_abcdefghijklmnopqrstuvwxyz0123456789")
-	if err := d.AcceptTask(ctx, "task-wal-4", secret, func() error { return nil }); err != nil {
-		t.Fatalf("AcceptTask: %v", err)
-	}
-	s, found, err := d.AcceptedTask("task-wal-4")
-	if err != nil || !found {
-		t.Fatalf("AcceptedTask: found=%v err=%v; want found", found, err)
-	}
-	if bytes.Contains(s.Payload, []byte("ghp_")) {
-		t.Errorf("stored state kept a raw token: %s", s.Payload)
 	}
 }
 
@@ -3967,28 +3747,6 @@ func TestExecuteOperationDefiniteFailureIsRecorded(t *testing.T) {
 	}
 }
 
-func TestOperationReceiptRedactsResultAndSeparatesKeys(t *testing.T) {
-	d := newOperationStore(t)
-	secret := []byte(`token=ghp_` + strings.Repeat("a", 36))
-
-	apply := func(tx *sql.Tx) ([]byte, error) { return secret, nil }
-	first, err := d.ExecuteOperation(domain.OperationID("op-redact"), []byte(`{}`), apply)
-	if err != nil || !first.Created {
-		t.Fatalf("ExecuteOperation = %+v, %v; want Created", first, err)
-	}
-	if bytes.Contains(first.Receipt.Result, []byte("ghp_")) || !bytes.Contains(first.Receipt.Result, []byte("[REDACTED]")) {
-		t.Fatalf("result not redacted: %q", first.Receipt.Result)
-	}
-
-	other, err := d.ExecuteOperation(domain.OperationID("op-other"), []byte(`{}`), apply)
-	if err != nil || !other.Created || other.Receipt.OperationID != domain.OperationID("op-other") {
-		t.Fatalf("other operation = %+v, %v; want separate Created", other, err)
-	}
-	if got, err := d.OperationCount(); err != nil || got != 2 {
-		t.Fatalf("OperationCount = %d, %v; want 2", got, err)
-	}
-}
-
 func TestOperationRejectsInvalidInput(t *testing.T) {
 	d := newOperationStore(t)
 	apply := func(tx *sql.Tx) ([]byte, error) { return nil, nil }
@@ -4260,5 +4018,303 @@ func TestMigrationFixtureParity(t *testing.T) {
 			continue
 		}
 		t.Errorf("instance has index %s that migrations do not create; add a migration or an exclusion with a reason", name)
+	}
+}
+
+// redactionSource names one stored or returned value that must not carry a
+// raw secret. read fetches a fresh copy after the write so every table the
+// scenarios touch is checked through one path (ADR 0012).
+type redactionSource struct {
+	prefix     string
+	quoted     bool
+	fatal      bool
+	wantMarker []byte
+	read       func() []byte
+}
+
+// assertRedacted checks every source for the raw token marker and reports a
+// leak with the caller's message. It preserves one check per stored or
+// returned value so a secret written through any store path cannot escape.
+func assertRedacted(t *testing.T, sources []redactionSource) {
+	t.Helper()
+	for _, src := range sources {
+		got := src.read()
+		if bytes.Contains(got, []byte("ghp_")) ||
+			(len(src.wantMarker) > 0 && !bytes.Contains(got, src.wantMarker)) {
+			if src.quoted {
+				if src.fatal {
+					t.Fatalf("%s: %q", src.prefix, got)
+				}
+				t.Errorf("%s: %q", src.prefix, got)
+				continue
+			}
+			if src.fatal {
+				t.Fatalf("%s: %s", src.prefix, got)
+			}
+			t.Errorf("%s: %s", src.prefix, got)
+		}
+	}
+}
+
+// TestStoreRedaction keeps the eight ADR 0012 scenarios in one table. Each
+// case names its secret source, writes through a different store path, and
+// lists every value that must come back redacted.
+func TestStoreRedaction(t *testing.T) {
+	const secretToken = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	scenarios := []struct {
+		name  string
+		setup func(t *testing.T, d *DB) []redactionSource
+	}{
+		{
+			name: "worker outcome result",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				secret := []byte("token " + secretToken)
+				if err := d.PublishOutcome(WatchOutcome{Key: "secret-worker", Result: secret}); err != nil {
+					t.Fatalf("PublishOutcome: %v", err)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				ch, err := d.WatchOutcome(ctx, "secret-worker")
+				if err != nil {
+					t.Fatalf("WatchOutcome: %v", err)
+				}
+				return []redactionSource{{
+					prefix: "delivered outcome kept a raw token",
+					read: func() []byte {
+						select {
+						case o := <-ch:
+							return o.Result
+						case <-ctx.Done():
+							t.Fatalf("watcher was not woken: %v", ctx.Err())
+							return nil
+						}
+					},
+				}}
+			},
+		},
+		{
+			name: "scenario result",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				res, err := d.Replay("scenario-secret", nil, []byte("token "+secretToken))
+				if err != nil {
+					t.Fatalf("Replay: %v", err)
+				}
+				return []redactionSource{
+					{
+						prefix: "first result kept a raw token",
+						read:   func() []byte { return res.Result },
+					},
+					{
+						prefix: "stored result kept a raw token",
+						read: func() []byte {
+							stored, ok, err := d.ScenarioResult("scenario-secret")
+							if err != nil || !ok {
+								t.Fatalf("ScenarioResult: %v, %v; want found", ok, err)
+							}
+							return stored
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "checkpoint state",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				secret := []byte("token " + secretToken)
+				res, err := d.CheckpointWait("wait-secret", "task-1", 1, secret, nil)
+				if err != nil {
+					t.Fatalf("CheckpointWait: %v", err)
+				}
+				if !bytes.Contains(secret, []byte("ghp_")) {
+					t.Fatal("test input lost its secret before the write")
+				}
+				return []redactionSource{
+					{
+						prefix: "checkpoint state kept a raw token",
+						read:   func() []byte { return res.Checkpoint.State },
+					},
+					{
+						prefix: "resumed state kept a raw token",
+						read: func() []byte {
+							_, state, found, err := d.ResumeWait("wait-secret")
+							if err != nil || !found {
+								t.Fatalf("ResumeWait: found=%v err=%v; want found", found, err)
+							}
+							return state
+						},
+					},
+					{
+						prefix: "stored state kept a raw token",
+						read: func() []byte {
+							stored, found, err := d.WaitCheckpoint("wait-secret")
+							if err != nil || !found {
+								t.Fatalf("WaitCheckpoint: found=%v err=%v; want found", found, err)
+							}
+							return stored.State
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "completion notice payload",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				secret := []byte(`{"status":"done","token":"` + secretToken + `"}`)
+				var emitted int32
+				res, err := d.NotifyCompletion("evt-secret", "task-1", secret, completionEmit(&emitted))
+				if err != nil {
+					t.Fatalf("NotifyCompletion: %v", err)
+				}
+				if !bytes.Contains(secret, []byte("ghp_")) {
+					t.Fatal("test input lost its secret before the write")
+				}
+				return []redactionSource{
+					{
+						prefix: "returned notice kept a raw token",
+						read:   func() []byte { return res.Notification.Payload },
+					},
+					{
+						prefix: "stored notice kept a raw token",
+						read: func() []byte {
+							stored, found, err := d.CompletionNotification("evt-secret")
+							if err != nil || !found {
+								t.Fatalf("CompletionNotification: found=%v err=%v; want found", found, err)
+							}
+							return stored.Payload
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "task log parts and activity",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				secret := []byte("token " + secretToken)
+				if err := d.SetLogPart("task-6", LogPartReport, secret); err != nil {
+					t.Fatalf("SetLogPart: %v", err)
+				}
+				if err := d.SetActivity("task-6", string(secret)); err != nil {
+					t.Fatalf("SetActivity: %v", err)
+				}
+				if !bytes.Contains(secret, []byte("ghp_")) {
+					t.Fatal("test input lost its secret before the write")
+				}
+				return []redactionSource{
+					{
+						prefix: "stored part kept a raw token",
+						read: func() []byte {
+							parts, err := d.TaskLogParts("task-6")
+							if err != nil || len(parts) != 1 {
+								t.Fatalf("TaskLogParts = %d, %v; want 1", len(parts), err)
+							}
+							return parts[0].Payload
+						},
+					},
+					{
+						prefix: "stored activity kept a raw token",
+						quoted: true,
+						read: func() []byte {
+							act, found, err := d.Activity("task-6")
+							if err != nil || !found {
+								t.Fatalf("Activity: found=%v err=%v; want found", found, err)
+							}
+							return []byte(act.Message)
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "queue task and continuation",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				secret := []byte(`{"token":"` + secretToken + `"}`)
+				if err := d.EnqueueQueueTask("q", "t", secret); err != nil {
+					t.Fatalf("EnqueueQueueTask: %v", err)
+				}
+				task, found, err := d.QueueTask("t")
+				if err != nil || !found {
+					t.Fatalf("QueueTask: found=%v err=%v", found, err)
+				}
+				lease, found, err := d.LeaseQueueTask("q", "w", time.Now(), time.Minute)
+				if err != nil || !found {
+					t.Fatalf("lease: %+v found=%v err=%v", lease, found, err)
+				}
+				next := &QueueContinuation{Queue: "q2", TaskID: "t2", Payload: secret}
+				if _, err := d.CompleteQueueTask("t", "w", lease.FencingToken, next, nil); err != nil {
+					t.Fatalf("CompleteQueueTask: %v", err)
+				}
+				return []redactionSource{
+					{
+						prefix: "stored task kept a raw token",
+						read:   func() []byte { return task.Payload },
+					},
+					{
+						prefix: "lease kept a raw token",
+						read:   func() []byte { return lease.Payload },
+					},
+					{
+						prefix: "stored continuation kept a raw token",
+						read: func() []byte {
+							cont, found, err := d.QueueTask("t2")
+							if err != nil || !found {
+								t.Fatalf("QueueTask t2: found=%v err=%v", found, err)
+							}
+							return cont.Payload
+						},
+					},
+				}
+			},
+		},
+		{
+			name: "accepted task state",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				ctx := context.Background()
+				secret := []byte("token " + secretToken)
+				if err := d.AcceptTask(ctx, "task-wal-4", secret, func() error { return nil }); err != nil {
+					t.Fatalf("AcceptTask: %v", err)
+				}
+				return []redactionSource{{
+					prefix: "stored state kept a raw token",
+					read: func() []byte {
+						s, found, err := d.AcceptedTask("task-wal-4")
+						if err != nil || !found {
+							t.Fatalf("AcceptedTask: found=%v err=%v; want found", found, err)
+						}
+						return s.Payload
+					},
+				}}
+			},
+		},
+		{
+			name: "operation receipt result",
+			setup: func(t *testing.T, d *DB) []redactionSource {
+				secret := []byte("token=ghp_" + strings.Repeat("a", 36))
+				apply := func(tx *sql.Tx) ([]byte, error) { return secret, nil }
+				first, err := d.ExecuteOperation(domain.OperationID("op-redact"), []byte(`{}`), apply)
+				if err != nil || !first.Created {
+					t.Fatalf("ExecuteOperation = %+v, %v; want Created", first, err)
+				}
+				other, err := d.ExecuteOperation(domain.OperationID("op-other"), []byte(`{}`), apply)
+				if err != nil || !other.Created || other.Receipt.OperationID != domain.OperationID("op-other") {
+					t.Fatalf("other operation = %+v, %v; want separate Created", other, err)
+				}
+				if got, err := d.OperationCount(); err != nil || got != 2 {
+					t.Fatalf("OperationCount = %d, %v; want 2", got, err)
+				}
+				return []redactionSource{{
+					prefix:     "result not redacted",
+					quoted:     true,
+					fatal:      true,
+					wantMarker: []byte("[REDACTED]"),
+					read:       func() []byte { return first.Receipt.Result },
+				}}
+			},
+		},
+	}
+	for _, tc := range scenarios {
+		t.Run(tc.name, func(t *testing.T) {
+			d := newOperationStore(t)
+			assertRedacted(t, tc.setup(t, d))
+		})
 	}
 }
