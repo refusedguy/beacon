@@ -129,13 +129,22 @@ type AgentTurnResult struct {
 	Reason     string
 }
 
+// maxAgentTurnSeen bounds the dedup window. A tracker that sees a fresh turn on
+// every Stop would otherwise grow for the lifetime of the process. The value
+// matches maxWaitStarts in the MCP wait registry and covers many panes over
+// many turns. A replay of a key that has been evicted is treated as a new
+// delivery.
+const maxAgentTurnSeen = 4096
+
 // AgentTurnTracker converts validated events into session status transitions.
 // It remembers delivered turn ids so a hook that replays an event cannot make
 // the caller write a second transition. One tracker can serve several panes:
-// the dedup key includes the pane id.
+// the dedup key includes the pane id. The window holds at most maxAgentTurnSeen
+// keys, with the oldest key removed first.
 type AgentTurnTracker struct {
-	mu   sync.Mutex
-	seen map[string]struct{}
+	mu    sync.Mutex
+	seen  map[string]struct{}
+	order []string // dedup keys in insertion order, for oldest-first eviction
 }
 
 // NewAgentTurnTracker returns an empty tracker.
@@ -167,6 +176,12 @@ func (t *AgentTurnTracker) Apply(e AgentTurnEvent, paneID string) AgentTurnResul
 		return AgentTurnResult{Reason: AgentTurnDuplicate}
 	}
 	t.seen[key] = struct{}{}
+	t.order = append(t.order, key)
+	if len(t.order) > maxAgentTurnSeen {
+		oldest := t.order[0]
+		t.order = t.order[1:]
+		delete(t.seen, oldest)
+	}
 
 	at := e.Timestamp
 	if at.IsZero() {

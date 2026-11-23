@@ -361,6 +361,56 @@ func TestPRCloseDupKeySeparatesDuplicates(t *testing.T) {
 	}
 }
 
+func TestPRCloseDupBoundsSeen(t *testing.T) {
+	cleanup := newPRCloseDupCleanup()
+	h := prCloseDupTestHandler(cleanup, prCloseDupCI{state: "OPEN"}, prCloseDupSnapshot{})
+
+	closePR := func(pr int) PRCloseDupOutput {
+		t.Helper()
+		out, err := h.Close(context.Background(), PRCloseDupInput{
+			Repo: "refusedguy/beacon", PR: pr, DuplicateOf: pr - 1, Confirm: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	firstPR := 2
+	if out := closePR(firstPR); out.Action != PRCloseDupActionClosed {
+		t.Fatalf("first close = %+v", out)
+	}
+	lastPR := maxPRCloseDupSeen + firstPR
+	for pr := firstPR + 1; pr <= lastPR; pr++ {
+		if out := closePR(pr); out.Action != PRCloseDupActionClosed {
+			t.Fatalf("close %d = %+v", pr, out)
+		}
+	}
+	if len(h.seen) != maxPRCloseDupSeen || len(h.order) != maxPRCloseDupSeen {
+		t.Fatalf("window sizes = seen %d, order %d; want %d", len(h.seen), len(h.order), maxPRCloseDupSeen)
+	}
+	if _, ok := h.seen[prCloseDupKey("refusedguy/beacon", firstPR, firstPR-1)]; ok {
+		t.Fatal("oldest key survived eviction")
+	}
+	if _, ok := h.seen[prCloseDupKey("refusedguy/beacon", lastPR, lastPR-1)]; !ok {
+		t.Fatal("newest key missing after eviction")
+	}
+	closesBefore, heads, branches := cleanup.counts()
+	if closesBefore != maxPRCloseDupSeen+1 || heads != 0 || branches != 0 {
+		t.Fatalf("port calls = closes %d, heads %d, branches %d; want %d/0/0", closesBefore, heads, branches, maxPRCloseDupSeen+1)
+	}
+
+	// A repeat of a key still in the window returns noop without a second write.
+	repeat := closePR(lastPR)
+	if repeat.Action != PRCloseDupActionNoop || repeat.Reason != PRCloseDupReasonAlreadyClosed {
+		t.Fatalf("repeat = %+v", repeat)
+	}
+	closesAfter, _, _ := cleanup.counts()
+	if closesAfter != closesBefore {
+		t.Fatalf("repeat added a close: %d -> %d", closesBefore, closesAfter)
+	}
+}
+
 func TestAttachPRCloseDupMarksToolDestructive(t *testing.T) {
 	ctx := context.Background()
 	serverTransport, clientTransport := mcpsdk.NewInMemoryTransports()

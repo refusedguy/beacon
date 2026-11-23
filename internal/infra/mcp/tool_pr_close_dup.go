@@ -86,18 +86,27 @@ type PRCleanup interface {
 	DeleteBranch(ctx context.Context, repo, branch string) error
 }
 
+// maxPRCloseDupSeen bounds the idempotency window. A long-lived server that
+// closes many distinct PRs would otherwise keep one output per triple for its
+// whole lifetime. PR closes are rare, so 1024 triples cover well more than one
+// server lifetime. For a key older than the window the CI state read is still
+// authoritative: a close the cache forgot is reported as already closed.
+const maxPRCloseDupSeen = 1024
+
 // PRCloseDupHandler implements beacon_pr_close_dup over a cleanup port, the
 // CIProvider and a read-only state snapshot. The seen map is a fast path for a
 // repeat inside one server lifetime; the PR state read is authoritative across
-// restarts.
+// restarts. The map holds at most maxPRCloseDupSeen keys, with the oldest key
+// removed first.
 type PRCloseDupHandler struct {
 	cleanup  PRCleanup
 	ci       domain.CIProvider
 	snapshot SnapshotReader
 	actor    string
 
-	mu   sync.Mutex
-	seen map[string]PRCloseDupOutput
+	mu    sync.Mutex
+	seen  map[string]PRCloseDupOutput
+	order []string // dedup keys in insertion order, for oldest-first eviction
 }
 
 // NewPRCloseDupHandler builds a handler. The actor is the caller label written
@@ -259,7 +268,15 @@ func (h *PRCloseDupHandler) Close(ctx context.Context, in PRCloseDupInput) (PRCl
 	// The close landed. Record it before reporting a branch failure so a retry
 	// cannot close the same PR twice.
 	h.mu.Lock()
-	h.seen[key] = out
+	if _, exists := h.seen[key]; !exists {
+		h.seen[key] = out
+		h.order = append(h.order, key)
+		if len(h.order) > maxPRCloseDupSeen {
+			oldest := h.order[0]
+			h.order = h.order[1:]
+			delete(h.seen, oldest)
+		}
+	}
 	h.mu.Unlock()
 
 	observe.Event(observe.LevelInfo, "pr_close_dup", observe.Fields{

@@ -2,6 +2,7 @@ package observe
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -159,5 +160,66 @@ func TestAgentTurnTrackerZeroValueIsUsable(t *testing.T) {
 	var tracker AgentTurnTracker
 	if result := tracker.Apply(event, "pane-1"); !result.Applied {
 		t.Fatalf("zero value tracker = %+v", result)
+	}
+}
+
+func TestAgentTurnTrackerBoundsSeen(t *testing.T) {
+	tracker := NewAgentTurnTracker()
+	apply := func(turn string) AgentTurnResult {
+		t.Helper()
+		event, err := ParseAgentTurnEvent(stopPayload("pane-1", turn))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tracker.Apply(event, "pane-1")
+	}
+
+	if result := apply("turn-0"); !result.Applied {
+		t.Fatalf("first delivery = %+v", result)
+	}
+	for i := 1; i <= maxAgentTurnSeen; i++ {
+		if result := apply("turn-" + strconv.Itoa(i)); !result.Applied {
+			t.Fatalf("delivery %d = %+v", i, result)
+		}
+	}
+	if len(tracker.seen) != maxAgentTurnSeen || len(tracker.order) != maxAgentTurnSeen {
+		t.Fatalf("window sizes = seen %d, order %d; want %d", len(tracker.seen), len(tracker.order), maxAgentTurnSeen)
+	}
+	if _, ok := tracker.seen["pane-1\x00turn-0"]; ok {
+		t.Fatal("oldest key survived eviction")
+	}
+	newest := "pane-1\x00turn-" + strconv.Itoa(maxAgentTurnSeen)
+	if _, ok := tracker.seen[newest]; !ok {
+		t.Fatal("newest key missing after eviction")
+	}
+
+	// A repeat of a key still in the window produces no second transition.
+	if result := apply("turn-" + strconv.Itoa(maxAgentTurnSeen)); result.Applied || result.Reason != AgentTurnDuplicate {
+		t.Fatalf("repeat of newest key = %+v", result)
+	}
+	if len(tracker.seen) != maxAgentTurnSeen {
+		t.Fatalf("repeat grew seen to %d", len(tracker.seen))
+	}
+
+	// A key older than the window is a new delivery. This is the tradeoff of a
+	// bounded dedup window.
+	if result := apply("turn-0"); !result.Applied {
+		t.Fatalf("evicted key replay = %+v", result)
+	}
+}
+
+func TestAgentTurnTrackerDeduplicatesHookEventNameReplay(t *testing.T) {
+	event, err := ParseAgentTurnEvent([]byte(`{"hook_event_name":"Stop","pane_id":"pane-1","turn_id":"turn-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker := NewAgentTurnTracker()
+	first := tracker.Apply(event, "pane-1")
+	if !first.Applied || first.Reason != AgentTurnApplied {
+		t.Fatalf("first delivery = %+v", first)
+	}
+	second := tracker.Apply(event, "pane-1")
+	if second.Applied || second.Reason != AgentTurnDuplicate || second.Transition != (SessionStatusTransition{}) {
+		t.Fatalf("replayed delivery = %+v", second)
 	}
 }
