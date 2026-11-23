@@ -135,12 +135,8 @@ func newTaskClaimHandler(store TaskClaimStore, now func() time.Time) *TaskClaimH
 
 // Handle adapts Claim to the go-sdk typed tool handler signature. Domain errors
 // pass through unchanged so the MCP boundary can turn them into error shapes.
-func (h *TaskClaimHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in TaskClaimInput) (*mcpsdk.CallToolResult, TaskClaimOutput, error) {
-	out, err := h.Claim(ctx, in)
-	if err != nil {
-		return nil, TaskClaimOutput{}, err
-	}
-	return nil, out, nil
+func (h *TaskClaimHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in TaskClaimInput) (*mcpsdk.CallToolResult, TaskClaimOutput, error) {
+	return typedTool(h.Claim, false)(ctx, req, in)
 }
 
 // Claim validates the agent id, stamps the time and asks the store for one

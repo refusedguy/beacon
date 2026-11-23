@@ -101,12 +101,8 @@ func newTaskCloseHandler(store TaskCloseStore, now func() time.Time) *TaskCloseH
 }
 
 // Handle adapts Close to the go-sdk typed tool handler signature.
-func (h *TaskCloseHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in TaskCloseInput) (*mcpsdk.CallToolResult, TaskCloseOutput, error) {
-	out, err := h.Close(ctx, in)
-	if err != nil {
-		return nil, TaskCloseOutput{}, err
-	}
-	return nil, out, nil
+func (h *TaskCloseHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in TaskCloseInput) (*mcpsdk.CallToolResult, TaskCloseOutput, error) {
+	return typedTool(h.Close, false)(ctx, req, in)
 }
 
 // Close checks the input at the boundary, stamps the time and asks the store

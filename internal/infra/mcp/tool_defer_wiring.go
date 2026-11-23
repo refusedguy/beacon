@@ -80,12 +80,8 @@ func NewDeferWiringHandler(writer DeferWriter) *DeferWiringHandler {
 }
 
 // Handle adapts Defer to the go-sdk typed tool handler signature.
-func (h *DeferWiringHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in DeferWiringInput) (*mcpsdk.CallToolResult, DeferWiringOutput, error) {
-	out, err := h.Defer(ctx, in)
-	if err != nil {
-		return nil, DeferWiringOutput{}, err
-	}
-	return nil, out, nil
+func (h *DeferWiringHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in DeferWiringInput) (*mcpsdk.CallToolResult, DeferWiringOutput, error) {
+	return typedTool(h.Defer, false)(ctx, req, in)
 }
 
 // deferWiringKey is the (watchID, reason) idempotency key. The NUL separator
