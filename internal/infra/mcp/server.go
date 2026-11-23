@@ -179,17 +179,38 @@ const (
 	kindAdditiveOnce
 )
 
+// Tool descriptions live next to the names in toolDescriptors. Every Attach
+// helper and the remote forwarder reuse these strings, so one tool cannot
+// advertise two different descriptions (BP-18). WatchPRDescription is exported
+// because cmd/beacon registers that tool with its own card-link input type.
+const (
+	WatchPRDescription     = "Register or renew a Watch on a pull request head and subscribe the caller."
+	waitResultDescription  = "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED."
+	getResultDescription   = "Read a Watch result without logs and mark its content as read."
+	listRunningDescription = "List running Watches from a read-only state snapshot."
+	ackDescription         = "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok."
+	cancelWatchDescription = "Cancel a Watch or one subscriber; idempotent, history is kept."
+	statsDescription       = "Report persisted state counters from a read-only snapshot."
+	deferWiringDescription = "Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md."
+	taskClaimDescription   = "Atomically claim one todo task card for an agent and return its full context."
+	taskCloseDescription   = "Close one task card with a terminal status and a reason. Idempotent by (cardID, status, reason): a repeat with the same values returns ok without a second write. A card held in_progress by another agent can only be closed by its owner."
+)
+
 // toolDescriptor is the single source of truth for one advertised MCP tool.
 // Its fields feed ToolNames, toolAnnotations and outputSchemaFactories, so a
 // tool cannot be present in some copies and absent from the rest. Handler calls
 // the existing Attach helper; it does not replace the helper with a generic
 // AddTool loop, because ADR 0263 forbids silent registration (ARDH-07).
+// RemoteDescription and InputType replace the two hand-written maps that used
+// to repeat every name in client.go (BP-18).
 type toolDescriptor struct {
-	Name        string
-	Description string
-	OutputType  func() (*jsonschema.Schema, error)
-	Kind        toolKind
-	Handler     func(*mcpsdk.Server, Dependencies, map[string]*jsonschema.Schema, string)
+	Name              string
+	Description       string
+	RemoteDescription string
+	OutputType        func() (*jsonschema.Schema, error)
+	InputType         func() (*jsonschema.Schema, error)
+	Kind              toolKind
+	Handler           func(*mcpsdk.Server, Dependencies, map[string]*jsonschema.Schema, string)
 }
 
 // toolDescriptors lists exactly the advertised tools. Adding a name here is
@@ -198,10 +219,12 @@ type toolDescriptor struct {
 // byte-pinned tools/list contract that an eleventh name would break.
 var toolDescriptors = []toolDescriptor{
 	{
-		Name:        "beacon_watch_pr",
-		Description: "Register or renew a Watch on a pull request head and subscribe the caller.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
-		Kind:        kindAdditive,
+		Name:              "beacon_watch_pr",
+		Description:       WatchPRDescription,
+		RemoteDescription: "Register or renew a watch on the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[WatchPROutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[WatchPRInput](nil) },
+		Kind:              kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			handler := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
 			handler.SetBlockerControl(deps.Blockers)
@@ -209,19 +232,23 @@ var toolDescriptors = []toolDescriptor{
 		},
 	},
 	{
-		Name:        "beacon_wait_result",
-		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
-		Kind:        kindAdditive,
+		Name:              "beacon_wait_result",
+		Description:       waitResultDescription,
+		RemoteDescription: "Wait for a watch result from the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[WaitResultOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[WaitResultInput](nil) },
+		Kind:              kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			AttachWaitResult(s, NewWaitResultServiceFromDeps(deps))
 		},
 	},
 	{
-		Name:        "beacon_get_result",
-		Description: "Read a Watch result without logs and mark its content as read.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
-		Kind:        kindAdditive,
+		Name:              "beacon_get_result",
+		Description:       getResultDescription,
+		RemoteDescription: "Read a watch result from the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[GetResultOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[GetResultInput](nil) },
+		Kind:              kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			handler := NewGetResultHandler(deps.Store, deps.Stamper, deps.Clock)
 			handler.SetAfter(deps.After)
@@ -229,19 +256,23 @@ var toolDescriptors = []toolDescriptor{
 		},
 	},
 	{
-		Name:        "beacon_list_running",
-		Description: "List running Watches from a read-only state snapshot.",
-		OutputType:  listRunningOutputSchema,
-		Kind:        kindRead,
+		Name:              "beacon_list_running",
+		Description:       listRunningDescription,
+		RemoteDescription: "List running watches on the Beacon server.",
+		OutputType:        listRunningOutputSchema,
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[ListRunningInput](nil) },
+		Kind:              kindRead,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
 			attachListRunning(s, deps.Snapshot, schemas["beacon_list_running"])
 		},
 	},
 	{
-		Name:        "beacon_ack",
-		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
-		Kind:        kindAdditive,
+		Name:              "beacon_ack",
+		Description:       ackDescription,
+		RemoteDescription: "Acknowledge an obligation on the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[AckInput](nil) },
+		Kind:              kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			handler := NewAckHandler(deps.Store, deps.Stamper, deps.Clock)
 			handler.SetBlockerControl(deps.Blockers)
@@ -255,55 +286,67 @@ var toolDescriptors = []toolDescriptor{
 		},
 	},
 	{
-		Name:        "beacon_cancel_watch",
-		Description: "Cancel a Watch or one subscriber; idempotent, history is kept.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
-		Kind:        kindDestructive,
+		Name:              "beacon_cancel_watch",
+		Description:       cancelWatchDescription,
+		RemoteDescription: "Cancel a watch on the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[OKOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[CancelWatchInput](nil) },
+		Kind:              kindDestructive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			RegisterCancelWatch(s, NewCancelWatcher(deps.Store, deps.Events, deps.Clock))
 		},
 	},
 	{
-		Name:        "beacon_stats",
-		Description: "Report persisted state counters from a read-only snapshot.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
-		Kind:        kindRead,
+		Name:              "beacon_stats",
+		Description:       statsDescription,
+		RemoteDescription: "Report state counters from the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[StatsOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[StatsInput](nil) },
+		Kind:              kindRead,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, version string) {
 			attachStats(s, deps, schemas["beacon_stats"], version)
 		},
 	},
 	{
-		Name:        "beacon_defer_wiring",
-		Description: "Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md.",
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[DeferWiringOutput]() },
-		Kind:        kindAdditive,
+		Name:              "beacon_defer_wiring",
+		Description:       deferWiringDescription,
+		RemoteDescription: "Record a deferred wiring card on the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[DeferWiringOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[DeferWiringInput](nil) },
+		Kind:              kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			AttachDeferWiring(s, NewDeferWiringHandler(deps.DeferWiring))
 		},
 	},
 	{
-		Name:        TaskClaimToolName,
-		Description: "Atomically claim one todo task card for an agent and return its full context.",
-		OutputType:  taskClaimOutputSchema,
-		Kind:        kindAdditiveOnce,
+		Name:              TaskClaimToolName,
+		Description:       taskClaimDescription,
+		RemoteDescription: "Claim one todo task card for an agent on the Beacon server.",
+		OutputType:        taskClaimOutputSchema,
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[TaskClaimInput](nil) },
+		Kind:              kindAdditiveOnce,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
 			attachTaskClaim(s, deps, schemas[TaskClaimToolName])
 		},
 	},
 	{
-		Name:        TaskCloseToolName,
-		Description: "Close one task card with a terminal status and a reason. Idempotent by (cardID, status, reason): a repeat with the same values returns ok without a second write. A card held in_progress by another agent can only be closed by its owner.",
-		OutputType:  taskCloseOutputSchema,
-		Kind:        kindAdditive,
+		Name:              TaskCloseToolName,
+		Description:       taskCloseDescription,
+		RemoteDescription: "Close one task card with a terminal status on the Beacon server.",
+		OutputType:        taskCloseOutputSchema,
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[TaskCloseInput](nil) },
+		Kind:              kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
 			attachTaskClose(s, NewTaskCloseHandler(deps.TaskCloseStore), schemas[TaskCloseToolName])
 		},
 	},
 	{
-		Name:        TaskListToolName,
-		Description: taskListDescription,
-		OutputType:  func() (*jsonschema.Schema, error) { return OutputSchema[TaskListOutput]() },
-		Kind:        kindRead,
+		Name:              TaskListToolName,
+		Description:       taskListDescription,
+		RemoteDescription: "List free task cards available to claim on the Beacon server.",
+		OutputType:        func() (*jsonschema.Schema, error) { return OutputSchema[TaskListOutput]() },
+		InputType:         func() (*jsonschema.Schema, error) { return jsonschema.For[TaskListInput](nil) },
+		Kind:              kindRead,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, schemas map[string]*jsonschema.Schema, _ string) {
 			attachTaskList(s, deps, schemas[TaskListToolName])
 		},
@@ -432,7 +475,7 @@ func attachAckWithPolicy(s *mcpsdk.Server, handler *AckHandler, policy ToolPolic
 	s.RemoveTools("beacon_ack")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:        "beacon_ack",
-		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok.",
+		Description: ackDescription,
 		Annotations: attachToolAnnotations(true),
 	}, (&autoAllowAck{handler: handler, policy: policy}).Handle)
 }
@@ -531,7 +574,7 @@ func AttachInProcessTools(s *mcpsdk.Server, bridge *InProcessBridge) error {
 		if output == nil {
 			output = &jsonschema.Schema{Type: "object"}
 		}
-		description := remoteToolDescriptions[name]
+		description := descriptor.RemoteDescription
 		if description == "" {
 			description = descriptor.Description
 		}
@@ -999,7 +1042,7 @@ func attachListRunning(s *mcpsdk.Server, reader SnapshotReader, outputSchema *js
 	s.RemoveTools("beacon_list_running")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:         "beacon_list_running",
-		Description:  "List running Watches from a read-only state snapshot.",
+		Description:  listRunningDescription,
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, NewListRunningHandler(reader).Handle)
@@ -1032,7 +1075,7 @@ func attachStats(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonschema.S
 	s.RemoveTools("beacon_stats")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:         "beacon_stats",
-		Description:  DescriptionWithVersion("Report persisted state counters from a read-only snapshot.", version),
+		Description:  DescriptionWithVersion(statsDescription, version),
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, handler.Handle)
@@ -1060,7 +1103,7 @@ func attachTaskClaim(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonsche
 	s.RemoveTools(TaskClaimToolName)
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:         TaskClaimToolName,
-		Description:  "Atomically claim one todo task card for an agent and return its full context.",
+		Description:  taskClaimDescription,
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, handler.Handle)
@@ -1081,7 +1124,7 @@ func attachTaskClose(s *mcpsdk.Server, handler *TaskCloseHandler, outputSchema *
 	s.RemoveTools(TaskCloseToolName)
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:         TaskCloseToolName,
-		Description:  "Close one task card with a terminal status and a reason. Idempotent by (cardID, status, reason): a repeat with the same values returns ok without a second write. A card held in_progress by another agent can only be closed by its owner.",
+		Description:  taskCloseDescription,
 		OutputSchema: outputSchema,
 		Annotations:  &annotations,
 	}, handler.Handle)

@@ -112,7 +112,7 @@ func (d *DB) SaveSchedule(s Schedule) error {
 			  target_card = excluded.target_card,
 			  next_run = excluded.next_run,
 			  enabled = excluded.enabled`,
-			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), scheduleBoolToInt(s.Enabled))
+			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), boolToInt(s.Enabled))
 		if err != nil {
 			return fmt.Errorf("store: schedules: save: %w", err)
 		}
@@ -301,7 +301,7 @@ func (d *DB) CreateSchedule(ctx context.Context, s Schedule) error {
 			INSERT INTO schedules (id, kind, spec, target_card, next_run, enabled)
 			VALUES (?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO NOTHING`,
-			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), scheduleBoolToInt(s.Enabled))
+			s.ID, s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), boolToInt(s.Enabled))
 		if err != nil {
 			return fmt.Errorf("store: schedules: create: %w", err)
 		}
@@ -386,7 +386,7 @@ func (d *DB) UpdateSchedule(ctx context.Context, s Schedule) error {
 		res, err := tx.Exec(`
 			UPDATE schedules SET kind = ?, spec = ?, target_card = ?, next_run = ?, enabled = ?
 			WHERE id = ?`,
-			s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), scheduleBoolToInt(s.Enabled), s.ID)
+			s.Kind, s.Spec, s.TargetCard, timeToNano(s.NextRun), boolToInt(s.Enabled), s.ID)
 		if err != nil {
 			return fmt.Errorf("store: schedules: update: %w", err)
 		}
@@ -447,7 +447,7 @@ func (d *DB) SetScheduleEnabled(ctx context.Context, id string, enabled bool) (S
 			return fmt.Errorf("store: schedules: create table: %w", err)
 		}
 		res, err := tx.Exec(`UPDATE schedules SET enabled = ? WHERE id = ?`,
-			scheduleBoolToInt(enabled), id)
+			boolToInt(enabled), id)
 		if err != nil {
 			return fmt.Errorf("store: schedules: set enabled: %w", err)
 		}
@@ -469,13 +469,6 @@ func (d *DB) SetScheduleEnabled(ctx context.Context, id string, enabled bool) (S
 		return Schedule{}, err
 	}
 	return out, nil
-}
-
-func scheduleBoolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 func timeFromNano(n int64) time.Time {

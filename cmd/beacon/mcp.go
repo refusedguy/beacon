@@ -601,7 +601,7 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 	s.RemoveTools("beacon_watch_pr")
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:        "beacon_watch_pr",
-		Description: "Register or renew a Watch on a pull request head and subscribe the caller.",
+		Description: mcp.WatchPRDescription,
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: &no,
 			IdempotentHint:  true,

@@ -348,33 +348,28 @@ func remoteUnwrapSSE(body []byte) []byte {
 // keeps the same six-step cycle contract (BS.41, BS.44).
 // ---------------------------------------------------------------------------
 
-var remoteToolDescriptions = map[string]string{
-	"beacon_watch_pr":     "Register or renew a watch on the Beacon server.",
-	"beacon_wait_result":  "Wait for a watch result from the Beacon server.",
-	"beacon_get_result":   "Read a watch result from the Beacon server.",
-	"beacon_list_running": "List running watches on the Beacon server.",
-	"beacon_ack":          "Acknowledge an obligation on the Beacon server.",
-	"beacon_cancel_watch": "Cancel a watch on the Beacon server.",
-	"beacon_stats":        "Report state counters from the Beacon server.",
-	"beacon_defer_wiring": "Record a deferred wiring card on the Beacon server.",
-	"beacon_task_claim":   "Claim one todo task card for an agent on the Beacon server.",
-	"beacon_task_close":   "Close one task card with a terminal status on the Beacon server.",
-	"beacon_task_list":    "List free task cards available to claim on the Beacon server.",
-}
+// remoteToolDescriptions and remoteInputSchemaFactories are read-only projections
+// of the descriptor fields. The catalog tests in contract_test.go use them to
+// check that every advertised name has a remote entry; production registration
+// reads the descriptor fields directly. Deriving both tables means a new tool is
+// added in one place, not in three hand-written name lists (BP-18).
+var remoteToolDescriptions = func() map[string]string {
+	out := make(map[string]string, len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		out[descriptor.Name] = descriptor.RemoteDescription
+	}
+	return out
+}()
 
-var remoteInputSchemaFactories = map[string]func() (*jsonschema.Schema, error){
-	"beacon_watch_pr":     func() (*jsonschema.Schema, error) { return jsonschema.For[WatchPRInput](nil) },
-	"beacon_wait_result":  func() (*jsonschema.Schema, error) { return jsonschema.For[WaitResultInput](nil) },
-	"beacon_get_result":   func() (*jsonschema.Schema, error) { return jsonschema.For[GetResultInput](nil) },
-	"beacon_list_running": func() (*jsonschema.Schema, error) { return jsonschema.For[ListRunningInput](nil) },
-	"beacon_ack":          func() (*jsonschema.Schema, error) { return jsonschema.For[AckInput](nil) },
-	"beacon_cancel_watch": func() (*jsonschema.Schema, error) { return jsonschema.For[CancelWatchInput](nil) },
-	"beacon_stats":        func() (*jsonschema.Schema, error) { return jsonschema.For[StatsInput](nil) },
-	"beacon_defer_wiring": func() (*jsonschema.Schema, error) { return jsonschema.For[DeferWiringInput](nil) },
-	"beacon_task_claim":   func() (*jsonschema.Schema, error) { return jsonschema.For[TaskClaimInput](nil) },
-	"beacon_task_close":   func() (*jsonschema.Schema, error) { return jsonschema.For[TaskCloseInput](nil) },
-	"beacon_task_list":    func() (*jsonschema.Schema, error) { return jsonschema.For[TaskListInput](nil) },
-}
+var remoteInputSchemaFactories = func() map[string]func() (*jsonschema.Schema, error) {
+	out := make(map[string]func() (*jsonschema.Schema, error), len(toolDescriptors))
+	for _, descriptor := range toolDescriptors {
+		if descriptor.InputType != nil {
+			out[descriptor.Name] = descriptor.InputType
+		}
+	}
+	return out
+}()
 
 func remoteInputSchema(name string) *jsonschema.Schema {
 	factory, ok := remoteInputSchemaFactories[name]
@@ -410,7 +405,8 @@ func AttachRemoteTools(s *mcpsdk.Server, client *RemoteClient) error {
 			"beacon_stats":        {Type: "object"},
 		}
 	}
-	for _, name := range ToolNames {
+	for _, descriptor := range toolDescriptors {
+		name := descriptor.Name
 		output := outputs[name]
 		if output == nil {
 			output = &jsonschema.Schema{Type: "object"}
@@ -419,7 +415,7 @@ func AttachRemoteTools(s *mcpsdk.Server, client *RemoteClient) error {
 		s.RemoveTools(name)
 		s.AddTool(&mcpsdk.Tool{
 			Name:         name,
-			Description:  remoteToolDescriptions[name],
+			Description:  descriptor.RemoteDescription,
 			InputSchema:  remoteInputSchema(name),
 			OutputSchema: output,
 			Annotations:  &annotations,
