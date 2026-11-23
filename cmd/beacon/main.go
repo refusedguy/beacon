@@ -53,7 +53,7 @@ func wire(path, parentSession string) (*wiring, error) {
 	if err != nil {
 		return nil, err
 	}
-	scmToken := os.Getenv(cfg.SCM.TokenEnv)
+	scmToken := firstNonEmpty(os.Getenv(cfg.SCM.TokenEnv), cfg.SCM.Token)
 	sourceToken := os.Getenv(cfg.TaskSource.TokenEnv)
 	if sourceToken == "" {
 		sourceToken = scmToken

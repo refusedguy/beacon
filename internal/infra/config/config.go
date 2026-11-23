@@ -46,6 +46,7 @@ type SCM struct {
 	Owner    string `yaml:"owner"`
 	Repo     string `yaml:"repo"`
 	TokenEnv string `yaml:"token_env"`
+	Token    string `yaml:"token"`
 	BaseURL  string `yaml:"base_url"`
 }
 
@@ -116,6 +117,7 @@ func Load(path string) (Config, error) {
 	expandNonSecrets(&c)
 	c.Webhook.Secret = literalOrEnv(c.Webhook.Secret, c.Webhook.SecretEnv)
 	c.Notify.TelegramToken = literalOrEnv(c.Notify.TelegramToken, c.Notify.TelegramTokenEnv)
+	c.SCM.Token = literalOrEnv(c.SCM.Token, c.SCM.TokenEnv)
 	if c.StateDB == "" {
 		c.StateDB = ".beacon/state.db"
 	}
