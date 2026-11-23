@@ -484,6 +484,191 @@ func TestBehindGreenPRWithConflictDoesNotMerge(t *testing.T) {
 	}
 }
 
+func epicSource(review core.ReviewMode) *fakeSource {
+	return &fakeSource{tasks: []core.Task{
+		{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic, Status: core.TaskAvailable,
+			BaseBranch: "main", RequireReview: review},
+		{ID: "T-EPIC-01", Title: "Child one", Kind: core.TaskKindTask, Status: core.TaskAvailable,
+			BaseBranch: "beacon/T-EPIC"},
+	}}
+}
+
+func epicRun(t *testing.T, store *fakeStore, id core.RunID, pr int) {
+	t.Helper()
+	run := makeRun(id, pr, core.RunWaitingCI)
+	run.TaskID = "T-EPIC"
+	run.Branch = "beacon/T-EPIC"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestChildPRMergesIntoEpicBranchAndOpensEpicPR(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	child := makeRun("child-1", 42, core.RunWaitingCI)
+	child.TaskID = "T-EPIC-01"
+	child.Branch = "beacon/T-EPIC-01"
+	if err := store.Save(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	store.ready = []core.Task{{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic}}
+	scm := &fakeSCM{
+		obs:     core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"},
+		foundPR: 55,
+	}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+		Harness: &fakeHarness{}, Source: epicSource(core.ReviewModeLLM),
+		Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.runs["child-1"]; got.State != core.RunMerged {
+		t.Fatalf("child state = %s, want merged", got.State)
+	}
+	if store.taskStatus["T-EPIC-01"] != "done" {
+		t.Fatalf("child task status = %q, want done", store.taskStatus["T-EPIC-01"])
+	}
+	if len(scm.openedPRs) != 1 {
+		t.Fatalf("epic PRs opened = %d, want 1", len(scm.openedPRs))
+	}
+	want := openedPR{head: "beacon/T-EPIC", base: "main", title: "Big epic"}
+	if scm.openedPRs[0] != want {
+		t.Fatalf("epic PR = %+v, want %+v", scm.openedPRs[0], want)
+	}
+	epic := store.runs["epic-T-EPIC"]
+	if epic == nil || epic.PRNumber != 55 || epic.State != core.RunWaitingCI {
+		t.Fatalf("epic run = %+v, want waiting_ci on PR 55", epic)
+	}
+}
+
+func TestEpicPROpensOnceWhenChildrenDone(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	store.ready = []core.Task{{ID: "T-EPIC", Title: "Big epic", Kind: core.TaskKindEpic}}
+	scm := &fakeSCM{foundPR: 55}
+	r := &Reconciler{
+		Store: store, SCM: scm, Harness: &fakeHarness{},
+		Source: epicSource(core.ReviewModeNone), Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+
+	if err := r.reconcileEpics(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.reconcileEpics(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(scm.openedPRs) != 1 {
+		t.Fatalf("epic PRs opened = %d, want 1", len(scm.openedPRs))
+	}
+}
+
+func TestEpicLLMReviewIsDefaultAndAutoMergesOnApproval(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	epicRun(t, store, "epic-1", 55)
+	scm := &fakeSCM{obs: core.Observation{PRNumber: 55, HeadSHA: "sha1", PRState: "open"}}
+	h := &fakeHarness{}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+		Harness: h, Source: epicSource(""),
+		Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+
+	decision, err := r.Reconcile(ctx, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != core.VerdictWait || scm.merges != 0 {
+		t.Fatalf("decision=%+v merges=%d, want wait with no merge", decision, scm.merges)
+	}
+	if len(h.sessions) != 1 {
+		t.Fatalf("reviewer sessions = %d, want 1", len(h.sessions))
+	}
+	if !strings.Contains(h.prompts[0], "55") || !strings.Contains(h.prompts[0], "sha1") {
+		t.Fatalf("review prompt = %q, want PR and SHA", h.prompts[0])
+	}
+
+	if err := store.SetApproval(ctx, "epic-1", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	decision, err = r.Reconcile(ctx, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != core.VerdictMerge || scm.merges != 1 {
+		t.Fatalf("decision=%+v merges=%d, want merge", decision, scm.merges)
+	}
+	if len(h.sessions) != 1 {
+		t.Fatalf("reviewer restarted on approval: %d", len(h.sessions))
+	}
+}
+
+func TestEpicHumanReviewWaitsForManualApproval(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	epicRun(t, store, "epic-1", 55)
+	scm := &fakeSCM{obs: core.Observation{PRNumber: 55, HeadSHA: "sha1", PRState: "open"}}
+	h := &fakeHarness{}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+		Harness: h, Source: epicSource(core.ReviewModeHuman),
+		Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+
+	decision, err := r.Reconcile(ctx, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != core.VerdictWait || scm.merges != 0 {
+		t.Fatalf("decision=%+v merges=%d, human gate did not hold", decision, scm.merges)
+	}
+	if len(h.sessions) != 0 {
+		t.Fatalf("human gate spawned %d reviewers", len(h.sessions))
+	}
+	if err := store.SetApproval(ctx, "epic-1", "sha1"); err != nil {
+		t.Fatal(err)
+	}
+	decision, err = r.Reconcile(ctx, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != core.VerdictMerge || scm.merges != 1 {
+		t.Fatalf("decision=%+v merges=%d, want merge after approval", decision, scm.merges)
+	}
+}
+
+func TestEpicReviewNoneSkipsGate(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	epicRun(t, store, "epic-1", 55)
+	scm := &fakeSCM{obs: core.Observation{PRNumber: 55, HeadSHA: "sha1", PRState: "open"}}
+	h := &fakeHarness{}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge}},
+		Harness: h, Source: epicSource(core.ReviewModeNone),
+		Workspace: &fakeWorkspace{}, BaseBranch: "main",
+	}
+
+	decision, err := r.Reconcile(ctx, 55)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Verdict != core.VerdictMerge || scm.merges != 1 {
+		t.Fatalf("decision=%+v merges=%d, want immediate merge", decision, scm.merges)
+	}
+	if len(h.sessions) != 0 {
+		t.Fatalf("none mode spawned %d reviewers", len(h.sessions))
+	}
+}
+
 func TestNeedsAgentFixWithGreenChecksAdvancesToMerged(t *testing.T) {
 	r, store, _, _, _ := newReconciler(t, core.VerdictNeedsRebase,
 		core.Observation{

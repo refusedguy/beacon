@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -83,6 +84,67 @@ func TestRedBaseSpawnsOneFixerAndRecovers(t *testing.T) {
 	incidents, _ := store.ListOpenIncidents(ctx)
 	if len(incidents) != 0 {
 		t.Fatalf("incident not resolved: %+v", incidents)
+	}
+}
+
+func TestRedEpicBranchBlocksChildrenAndSpawnsFixer(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	child := makeRun("child-1", 42, core.RunWaitingCI)
+	child.TaskID = "T-EPIC-01"
+	child.Branch = "beacon/T-EPIC-01"
+	if err := store.Save(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	scm := &fakeSCM{
+		obs: core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open",
+			Checks:         []core.CheckResult{{Name: "ci", State: core.CheckFailure}},
+			FailureExcerpt: "test failed"},
+		base: core.BaseStatus{BaseBranch: "beacon/T-EPIC", HeadSHA: "base1",
+			FailedChecks: []core.CheckResult{{Name: "ci", State: core.CheckFailure, Output: "test failed"}}},
+	}
+	h := &fakeHarness{}
+	r := &Reconciler{
+		Store: store, SCM: scm,
+		Policy:  fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictNeedsAgentFix, Reason: "ci failed"}},
+		Harness: h, Source: epicSource(core.ReviewModeLLM),
+		Workspace: &fakeWorkspace{}, Repo: "o/r", BaseBranch: "main",
+		BaseRedMode: "spawn_fixer", MaxFixTries: 2,
+	}
+
+	if _, err := r.Reconcile(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	incidents, err := store.ListOpenIncidents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incidents) != 1 {
+		t.Fatalf("incidents = %d, want 1", len(incidents))
+	}
+	if incidents[0].BaseBranch != "beacon/T-EPIC" {
+		t.Fatalf("incident base = %q, want beacon/T-EPIC", incidents[0].BaseBranch)
+	}
+	if got := store.runs["child-1"]; got.State != core.RunBlocked {
+		t.Fatalf("child state = %s, want blocked", got.State)
+	}
+	fixers := 0
+	for _, run := range store.runs {
+		if run.IsFixer {
+			fixers++
+		}
+	}
+	if fixers != 1 {
+		t.Fatalf("fixers = %d, want 1", fixers)
+	}
+	found := false
+	for _, prompt := range h.prompts {
+		if strings.Contains(prompt, "beacon/T-EPIC") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("fixer prompt missing epic branch: %v", h.prompts)
 	}
 }
 
