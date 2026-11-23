@@ -5,6 +5,7 @@ import { delimiter, join } from "node:path"
 export const BEACON_SERVER = "beacon"
 export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
+export const HEAD_POLL_MS = 3000
 
 const defaultDeps = {
   env: process.env,
@@ -12,6 +13,11 @@ const defaultDeps = {
   readFileSync: fsReadFileSync,
   execFileSync: defaultExecFileSync,
 }
+
+// Shared HEAD baseline for the watcher. A new registration resets it so one
+// commit triggers exactly one reload.
+let lastHead = null
+let headWatcher = null
 
 function pathBinary(name, deps) {
   for (const dir of (deps.env.PATH ?? "").split(delimiter)) {
@@ -85,23 +91,52 @@ export function beaconCommand(root, deps = defaultDeps) {
   throw new Error("beacon MCP: no beacon binary and no cmd/beacon/main.go in project root")
 }
 
-export function beaconServerConfig(root) {
+export function beaconServerConfig(root, deps = defaultDeps) {
   if (typeof root !== "string" || root.trim() === "") {
     throw new Error("beacon MCP: project root is required")
   }
   return Object.freeze({
     type: "local",
-    command: beaconCommand(root),
+    command: beaconCommand(root, deps),
     cwd: root,
     environment: Object.freeze({ [BEACON_PROJECT_ROOT_ENV]: root }),
     disabled: false,
   })
 }
 
-export async function registerBeaconMcp(ctx, root) {
+function stopHeadWatcher() {
+  if (headWatcher !== null) {
+    headWatcher.clear(headWatcher.handle)
+    headWatcher = null
+  }
+}
+
+function watchHead(ctx, root, deps) {
+  if (deps.env.BEACON_BIN) return
+  stopHeadWatcher()
+  lastHead = currentHead(root, deps)
+  const setTimer = globalThis.setInterval
+  const clearTimer = globalThis.clearInterval
+  const handle = setTimer(() => {
+    const head = currentHead(root, deps)
+    if (!head || head === lastHead) return
+    lastHead = head
+    ;(async () => {
+      try {
+        await ctx.mcp.reload()
+      } catch (error) {
+        console.warn(`beacon MCP: reload after HEAD change failed: ${error.message}`)
+      }
+    })()
+  }, HEAD_POLL_MS)
+  headWatcher = { handle, clear: clearTimer }
+  if (typeof handle?.unref === "function") handle.unref()
+}
+
+export async function registerBeaconMcp(ctx, root, deps = defaultDeps) {
   let current = root
   const registration = await ctx.mcp.transform((editor) => {
-    editor.set(BEACON_SERVER, beaconServerConfig(current))
+    editor.set(BEACON_SERVER, beaconServerConfig(current, deps))
     editor.update(BEACON_SERVER, (server) => {
       server.cwd = current
       server.environment = {
@@ -111,6 +146,8 @@ export async function registerBeaconMcp(ctx, root) {
       server.disabled = false
     })
   })
+
+  watchHead(ctx, root, deps)
 
   return {
     registration,
