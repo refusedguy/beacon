@@ -135,43 +135,6 @@ func (c ContextSnapshot) WithRankedMap(text string) ContextSnapshot {
 	return c
 }
 
-// RankedMap returns the ranked repository map carried by the snapshot. An
-// empty string means the parent did not attach a map.
-func (c ContextSnapshot) RankedMap() string { return c.ranked }
-
-// WithTokenCount returns a copy of c recording count tokens for category.
-// Negative counts clamp to zero. The receiver is not changed.
-func (c ContextSnapshot) WithTokenCount(category TokenCategory, count int) ContextSnapshot {
-	if count < 0 {
-		count = 0
-	}
-	if c.tokens == nil {
-		c.tokens = make(map[TokenCategory]int, len(TokenCategories))
-	}
-	c.tokens[category] = count
-	return c
-}
-
-// WithMaxInputTokens returns a copy of c carrying the model input window. A
-// non-positive value means the window is unknown. The receiver is not changed.
-func (c ContextSnapshot) WithMaxInputTokens(max int) ContextSnapshot {
-	if max < 0 {
-		max = 0
-	}
-	c.maxInput = max
-	return c
-}
-
-// WithInputCostPerToken returns a copy of c carrying the price used to value
-// the input. A negative price clamps to zero. The receiver is not changed.
-func (c ContextSnapshot) WithInputCostPerToken(price float64) ContextSnapshot {
-	if price < 0 {
-		price = 0
-	}
-	c.costPerToken = price
-	return c
-}
-
 // TokenUsage computes the per-category token breakdown for c. Total is the
 // sum of every category, Remaining is the unused window under max_input_tokens
 // and Warning fires below TokenWarnThreshold. It never mutates c.
@@ -220,17 +183,6 @@ func (c ContextSnapshot) WithAttachedFiles(paths []string) ContextSnapshot {
 	return c
 }
 
-// AttachedFiles returns the confirmed file paths sorted by value. The slice is
-// a copy, so a caller cannot mutate the snapshot through it.
-func (c ContextSnapshot) AttachedFiles() []string {
-	out := make([]string, 0, len(c.attached))
-	for _, v := range c.attached {
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // WithIgnoredMentions returns a copy of c that remembers keys as refused. A
 // refused key is filtered out of later mention requests.
 func (c ContextSnapshot) WithIgnoredMentions(keys []string) ContextSnapshot {
@@ -246,16 +198,6 @@ func (c ContextSnapshot) WithIgnoredMentions(keys []string) ContextSnapshot {
 	}
 	c.ignored = ignored
 	return c
-}
-
-// IgnoredMentions returns the refused mention keys sorted by value.
-func (c ContextSnapshot) IgnoredMentions() []string {
-	out := make([]string, 0, len(c.ignored))
-	for k := range c.ignored {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // WithReflected returns a copy of c carrying text as the message shown to the
@@ -367,22 +309,6 @@ func (c ContextSnapshot) WithMapBudget(budget int) ContextSnapshot {
 	}
 	c.budget = budget
 	return c
-}
-
-// MapBudget returns the requested token budget for the ranked map. Zero means
-// the CA-01 default applies.
-func (c ContextSnapshot) MapBudget() int { return c.budget }
-
-// ContextTokens returns the full token cost of the snapshot and the child
-// history. The caller compares it with the model's max_input_tokens before
-// handing the context to a child. The budget is not counted: only the text
-// the child receives costs tokens.
-func (c ContextSnapshot) ContextTokens(history []Message) int {
-	n := CountTokens(c.ranked)
-	for _, value := range c.values {
-		n += CountTokens(value)
-	}
-	return n + TokensOf(history)
 }
 
 // merged returns a new snapshot with other's entries written over c's. The
@@ -606,34 +532,9 @@ func (r *Registry) SpawnWith(parentID, childID ThreadID, name string, extra Cont
 	})
 }
 
-// SpawnExecutor adds an executor child under parentID. It selects the phase
-// model and builds the child's context from brief. When models has no editor
-// model, the child inherits the planner's context with the plan merged in,
-// which is the current contract. With an editor model, the child gets only the
-// plan and the owner files from the brief. No planner context or history is
-// copied into the executor. Errors mirror SpawnWith.
-func (r *Registry) SpawnExecutor(parentID, childID ThreadID, name string, models PhaseModels, brief ExecutorBrief) (Thread, error) {
-	return r.addChild(parentID, childID, name, func(parent Thread) ContextSnapshot {
-		ctx := brief.extra()
-		if !models.UsingEditor() {
-			ctx = parent.Context.merged(ctx)
-		}
-		return ctx
-	})
-}
-
-// SpawnWithRankedMap adds a child under parentID and attaches a ranked map of
-// the repository built from taskText. The graph is read from root/internal;
-// budget is the requested token budget for the rendered map. A new child has
-// an empty chat, so MapBudgetFor applies the wider empty-chat budget. Errors
-// from SpawnWith are passed through.
-func (r *Registry) SpawnWithRankedMap(parentID, childID ThreadID, name, root, taskText string, budget int) (Thread, error) {
-	return r.SpawnWithRankedMapInContext(parentID, childID, name, root, taskText, budget, 0)
-}
-
-// SpawnWithRankedMapInContext is SpawnWithRankedMap with an explicit context
-// window. The window caps the empty-chat budget at window-4096. A non-positive
-// window leaves the budget uncapped.
+// SpawnWithRankedMapInContext adds a child with a ranked map built from taskText
+// and an explicit context window. The window caps the empty-chat budget at
+// window-4096. A non-positive window leaves the budget uncapped.
 func (r *Registry) SpawnWithRankedMapInContext(parentID, childID ThreadID, name, root, taskText string, budget, contextWindow int) (Thread, error) {
 	effective := MapBudgetFor(budget, contextWindow, true)
 	extra := NewContext(nil).WithMapBudget(effective)
@@ -695,53 +596,6 @@ func (r *Registry) IDs() []ThreadID {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
-}
-
-// PendingMentionFiles returns the repository files mentioned in text that the
-// thread has neither attached nor refused. text is the card text or the
-// executor answer; files is the repository file list. An unknown thread
-// returns ErrUnknownThread. The result keeps first-seen mention order.
-func (r *Registry) PendingMentionFiles(id ThreadID, text string, files []string) ([]string, error) {
-	t, ok := r.threads[id]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownThread, id)
-	}
-	var out []string
-	for _, path := range MatchMentionFiles(ParseMentions(text), files) {
-		key := mentionKey(path)
-		if t.Context.ignored[key] {
-			continue
-		}
-		if _, attached := t.Context.attached[key]; attached {
-			continue
-		}
-		out = append(out, path)
-	}
-	return out, nil
-}
-
-// ApplyMentionChoices records the parent's decision on the mention files of a
-// thread. Accepted paths are attached to the child's context; refused paths
-// are remembered so they are not offered again. The returned message is the
-// reflected message queued for the next turn. An unknown thread returns
-// ErrUnknownThread.
-func (r *Registry) ApplyMentionChoices(id ThreadID, choices []MentionChoice) (ContextSnapshot, string, error) {
-	t, ok := r.threads[id]
-	if !ok {
-		return ContextSnapshot{}, "", fmt.Errorf("%w: %s", ErrUnknownThread, id)
-	}
-	var attached, ignored []string
-	for _, c := range choices {
-		if c.Accept {
-			attached = append(attached, c.Path)
-		} else {
-			ignored = append(ignored, mentionKey(c.Path))
-		}
-	}
-	message := reflectedMessage(attached, ignored)
-	t.Context = t.Context.WithAttachedFiles(attached).WithIgnoredMentions(ignored).WithReflected(message)
-	r.threads[id] = t
-	return t.Context, message, nil
 }
 
 // ParentNotice is the projection of a child's question into the parent chat.
@@ -1410,75 +1264,9 @@ func assistantBoundary(msgs []Message, start int) int {
 	return start
 }
 
-// PrepareCompaction builds a compaction for msgs. It preserves the trailing
-// messages verbatim, moves the cut to an assistant boundary, summarizes the
-// head within the budget minus tail and reserve, and repeats summarization at
-// most MaxDepth times. It does not modify msgs.
-func PrepareCompaction(ctx context.Context, msgs []Message, opt CompactOptions, summarize CompressFunc) (Compaction, error) {
-	fp := Fingerprint(msgs)
-	opt = opt.normalized()
-	c := Compaction{fp: fp}
-
-	total := TokensOf(msgs)
-	if opt.Budget <= 0 || total <= opt.Budget {
-		c.result = append([]Message(nil), msgs...)
-		c.Tokens = total
-		return c, nil
-	}
-
-	tailStart := len(msgs) - opt.TailMessages
-	if tailStart < 0 {
-		tailStart = 0
-	}
-	tailStart = assistantBoundary(msgs, tailStart)
-	tail := append([]Message(nil), msgs[tailStart:]...)
-
-	// The tail owns at most TailShare of the budget. Drop its oldest entries
-	// first so the most recent messages always survive verbatim.
-	tailBudget := int(float64(opt.Budget) * opt.TailShare)
-	for TokensOf(tail) > tailBudget && len(tail) > 0 {
-		tail = tail[1:]
-	}
-	if len(tail) == 0 {
-		return c, nil
-	}
-
-	head := msgs[:tailStart]
-	headBudget := opt.Budget - TokensOf(tail) - opt.Reserve
-	if headBudget <= 0 || len(head) == 0 || summarize == nil {
-		c.result = tail
-		c.Tokens = TokensOf(tail)
-		return c, nil
-	}
-
-	summary := ""
-	current := head
-	for depth := 0; depth < opt.MaxDepth; depth++ {
-		text, err := summarize(ctx, opt.Prefix, current, headBudget)
-		if err != nil {
-			return Compaction{}, err
-		}
-		summary = text
-		c.Depth = depth + 1
-		if CountTokens(summary) <= headBudget {
-			break
-		}
-		current = []Message{{Role: RoleSystem, Text: summary}}
-	}
-
-	result := make([]Message, 0, len(tail)+1)
-	if summary != "" && CountTokens(summary)+TokensOf(tail) <= opt.Budget {
-		result = append(result, Message{Role: RoleSystem, Text: summary})
-	}
-	result = append(result, tail...)
-	c.result = result
-	c.Tokens = TokensOf(result)
-	return c, nil
-}
-
 // Apply commits a prepared compaction. It returns the compacted history and
-// ok=true only when current still matches the fingerprint captured at
-// PrepareCompaction time. A changed history returns ok=false and leaves the
+// ok=true only when current still matches the fingerprint captured when the
+// compaction was prepared. A changed history returns ok=false and leaves the
 // caller's data untouched, so a slow summarization cannot overwrite newer
 // turns.
 func (c Compaction) Apply(current []Message) ([]Message, bool) {
@@ -1486,30 +1274,6 @@ func (c Compaction) Apply(current []Message) ([]Message, bool) {
 		return nil, false
 	}
 	return append([]Message(nil), c.result...), true
-}
-
-// TokenBreakdown renders the diagnostic /tokens report for c. It prints every
-// category with its token count and cost, then the total, the input window,
-// the remaining tokens and the warning when the window is tight. It is a pure
-// formatter: a CLI command can print the returned text, and nothing here
-// performs I/O or changes any declared MCP field.
-func TokenBreakdown(c ContextSnapshot) string {
-	u := c.TokenUsage()
-	var b strings.Builder
-	for _, category := range TokenCategories {
-		n := u.Counts[category]
-		fmt.Fprintf(&b, "%s: %d tokens (%.4f)\n", category, n, float64(n)*c.costPerToken)
-	}
-	fmt.Fprintf(&b, "total: %d tokens (%.4f)\n", u.Total, u.Cost)
-	if u.MaxInput > 0 {
-		fmt.Fprintf(&b, "max_input_tokens: %d\n", u.MaxInput)
-		fmt.Fprintf(&b, "remaining: %d tokens\n", u.Remaining)
-	}
-	if u.Warning != "" {
-		b.WriteString(u.Warning)
-		b.WriteByte('\n')
-	}
-	return b.String()
 }
 
 // RefreshMode selects how a ranked map is rebuilt when a child context is
@@ -1599,30 +1363,14 @@ type RankedMapCache struct {
 	cache     map[string]string
 }
 
-// NewRankedMapCache creates a cache for mode. An unknown mode selects auto.
-func NewRankedMapCache(mode RefreshMode) RankedMapCache {
-	return RankedMapCache{mode: NormalizeRefreshMode(mode)}
-}
-
 // Mode returns the active refresh policy.
 func (c *RankedMapCache) Mode() RefreshMode { return c.mode }
 
 // SetMode changes the refresh policy. Cached maps stay in place.
 func (c *RankedMapCache) SetMode(mode RefreshMode) { c.mode = NormalizeRefreshMode(mode) }
 
-// LastMap returns the most recent map, or an empty string before the first
-// build. Manual mode returns this value without building.
-func (c *RankedMapCache) LastMap() string { return c.lastMap }
-
-// LastBuild returns the measured duration of the most recent build.
-func (c *RankedMapCache) LastBuild() time.Duration { return c.lastBuild }
-
 // Len returns the number of distinct keys held in the cache.
 func (c *RankedMapCache) Len() int { return len(c.cache) }
-
-// Seed sets the last map without a build. Callers use it to give manual mode a
-// starting map.
-func (c *RankedMapCache) Seed(text string) { c.lastMap = text }
 
 // Refresh returns a ranked map for key and reports whether it built one.
 // Manual returns the last map without a build. Files reuses a map for an
@@ -1709,44 +1457,4 @@ func (k KeepaliveConfig) Normalize() KeepaliveConfig {
 type CachePlan struct {
 	Points    []string
 	Keepalive KeepaliveConfig
-}
-
-// BuildCachePlan assigns cache points to the prompt's segments. roles maps a
-// segment ID to the CachePoint placed at its end. Segments are visited in
-// order. Only segments with a non-empty role are kept, and each ID appears
-// once. The result stops at MaxCachePoints so one request stays inside the
-// provider cap. An enabled keepalive gets its defaults; a disabled one is
-// copied as given.
-func BuildCachePlan(segments []PromptSegment, roles map[string]CachePoint, keepalive KeepaliveConfig) CachePlan {
-	seen := make(map[string]bool)
-	points := make([]string, 0, MaxCachePoints)
-	for _, s := range segments {
-		if len(points) >= MaxCachePoints {
-			break
-		}
-		role, ok := roles[s.ID]
-		if !ok || role == "" || seen[s.ID] {
-			continue
-		}
-		seen[s.ID] = true
-		points = append(points, s.ID)
-	}
-	if keepalive.Enabled {
-		keepalive = keepalive.Normalize()
-	}
-	return CachePlan{Points: points, Keepalive: keepalive}
-}
-
-// PrefixFingerprint hashes the ID and text of the given segments in order.
-// Length prefixes keep two different segment sequences from colliding. A
-// caller compares fingerprints across calls to prove the cacheable prefix is
-// byte-identical before it sends a request (CA-09).
-func PrefixFingerprint(segments []PromptSegment) [sha256.Size]byte {
-	h := sha256.New()
-	for _, s := range segments {
-		fmt.Fprintf(h, "%d:%s%d:%s", len(s.ID), s.ID, len(s.Text), s.Text)
-	}
-	var fp [sha256.Size]byte
-	copy(fp[:], h.Sum(nil))
-	return fp
 }
