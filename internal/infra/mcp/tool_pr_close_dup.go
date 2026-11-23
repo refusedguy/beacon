@@ -278,19 +278,14 @@ func (h *PRCloseDupHandler) Close(ctx context.Context, in PRCloseDupInput) (PRCl
 // It stays out of toolDescriptors so the pinned tools/list contract does not
 // change; a composition root that wires PRCleanup calls this helper.
 func AttachPRCloseDup(server *mcpsdk.Server, handler *PRCloseDupHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
 	derived, err := OutputSchema[PRCloseDupOutput]()
 	if err != nil || derived == nil {
 		derived = &jsonschema.Schema{Type: "object"}
 	}
-	annotations := mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(true)}
-	server.RemoveTools(PRCloseDupToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         PRCloseDupToolName,
-		Description:  "Close a duplicate pull request and optionally delete its head branch. Dry run by default; confirm performs the close.",
-		OutputSchema: derived,
-		Annotations:  &annotations,
-	}, handler.Handle)
+	registerTool(server, PRCloseDupToolName,
+		"Close a duplicate pull request and optionally delete its head branch. Dry run by default; confirm performs the close.",
+		derived, newToolAnnotations(false, true, false), handler.Handle)
 }

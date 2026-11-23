@@ -202,18 +202,12 @@ func (h *TaskListHandler) List(ctx context.Context, in TaskListInput) (TaskListO
 // schema comes from AllOutputSchemas, so go-sdk never infers one from the
 // handler type. A nil schema keeps the real handler registered.
 func AttachTaskList(server *mcpsdk.Server, handler *TaskListHandler, outputSchema *jsonschema.Schema) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
 	if outputSchema == nil {
 		outputSchema = &jsonschema.Schema{Type: "object"}
 	}
-	annotations := toolAnnotations[TaskListToolName]
-	server.RemoveTools(TaskListToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         TaskListToolName,
-		Description:  taskListDescription,
-		OutputSchema: outputSchema,
-		Annotations:  &annotations,
-	}, handler.Handle)
+	registerTool(server, TaskListToolName, taskListDescription,
+		outputSchema, newToolAnnotations(true, false, false), handler.Handle)
 }

@@ -180,17 +180,12 @@ func ChecksExplainOutputSchema() (*jsonschema.Schema, error) {
 // advertised descriptor stays in the owner's shared wiring PR; this helper is
 // opt-in, like AttachGetResult, so the tool can be exercised on its own.
 func AttachChecksExplain(server *mcpsdk.Server, handler *ChecksExplainHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	annotations := annotationsForKind(kindRead)
-	server.RemoveTools(ChecksExplainToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         ChecksExplainToolName,
-		Description:  "Explain every check on a Watch and whether each one affects the verdict; read-only and never marks the Watch as read.",
-		OutputSchema: mustChecksExplainOutputSchema(),
-		Annotations:  &annotations,
-	}, handler.Handle)
+	registerTool(server, ChecksExplainToolName,
+		"Explain every check on a Watch and whether each one affects the verdict; read-only and never marks the Watch as read.",
+		mustChecksExplainOutputSchema(), newToolAnnotations(true, false, false), handler.Handle)
 }
 
 // mustChecksExplainOutputSchema is safe to call while registering a tool: the

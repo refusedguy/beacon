@@ -300,7 +300,7 @@ func MergeStatusOutputSchema() (*jsonschema.Schema, error) {
 // A nil reader leaves the server unchanged. A nil schema falls back to the
 // derived one, so a broken optional schema cannot suppress the real handler.
 func AttachMergeStatus(server *mcpsdk.Server, reader MergeStatusReader, outputSchema *jsonschema.Schema) {
-	if server == nil || reader == nil {
+	if reader == nil {
 		return
 	}
 	if outputSchema == nil {
@@ -312,16 +312,7 @@ func AttachMergeStatus(server *mcpsdk.Server, reader MergeStatusReader, outputSc
 			outputSchema = &jsonschema.Schema{Type: "object"}
 		}
 	}
-	annotations := mcpsdk.ToolAnnotations{
-		ReadOnlyHint:    true,
-		DestructiveHint: boolPtr(false),
-		IdempotentHint:  true,
-	}
-	server.RemoveTools(MergeStatusToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         MergeStatusToolName,
-		Description:  "Report why a green Watch has not merged and how much wake, rebase and retry budget it has spent.",
-		OutputSchema: outputSchema,
-		Annotations:  &annotations,
-	}, NewMergeStatusHandler(reader).Handle)
+	registerTool(server, MergeStatusToolName,
+		"Report why a green Watch has not merged and how much wake, rebase and retry budget it has spent.",
+		outputSchema, newToolAnnotations(true, false, true), NewMergeStatusHandler(reader).Handle)
 }

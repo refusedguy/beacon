@@ -228,15 +228,10 @@ func mustRerunFailedOutputSchema() *jsonschema.Schema {
 // advertised descriptor stays in the owner's shared wiring PR, like AT-05,
 // because the tools/list contract is byte-pinned to its current names.
 func AttachRerunFailed(server *mcpsdk.Server, handler *RerunFailedHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	annotations := annotationsForKind(kindAdditive)
-	server.RemoveTools(RerunFailedToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         RerunFailedToolName,
-		Description:  "Re-run the failed checks of a Watch through MCP, idempotent by (watchID, revision, runID) and bounded by the flaky retry budget.",
-		OutputSchema: mustRerunFailedOutputSchema(),
-		Annotations:  &annotations,
-	}, handler.Handle)
+	registerTool(server, RerunFailedToolName,
+		"Re-run the failed checks of a Watch through MCP, idempotent by (watchID, revision, runID) and bounded by the flaky retry budget.",
+		mustRerunFailedOutputSchema(), newToolAnnotations(false, false, true), handler.Handle)
 }

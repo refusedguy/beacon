@@ -209,7 +209,7 @@ func (h *ObligationsHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolReque
 // watch reader is allowed and gives revision zero. A nil schema falls back to
 // the derived one.
 func AttachObligations(server *mcpsdk.Server, watches obligationsWatchReader, lister ObligationLister, outputSchema *jsonschema.Schema) {
-	if server == nil || lister == nil {
+	if lister == nil {
 		return
 	}
 	if outputSchema == nil {
@@ -221,16 +221,7 @@ func AttachObligations(server *mcpsdk.Server, watches obligationsWatchReader, li
 			outputSchema = &jsonschema.Schema{Type: "object"}
 		}
 	}
-	annotations := mcpsdk.ToolAnnotations{
-		ReadOnlyHint:    true,
-		DestructiveHint: boolPtr(false),
-		IdempotentHint:  true,
-	}
-	server.RemoveTools("beacon_obligations")
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         "beacon_obligations",
-		Description:  "List the obligations of one Watch for diagnosing obligation not found; read-only and never stamps readAt or claimedAt.",
-		OutputSchema: outputSchema,
-		Annotations:  &annotations,
-	}, NewObligationsHandler(watches, lister).Handle)
+	registerTool(server, "beacon_obligations",
+		"List the obligations of one Watch for diagnosing obligation not found; read-only and never stamps readAt or claimedAt.",
+		outputSchema, newToolAnnotations(true, false, true), NewObligationsHandler(watches, lister).Handle)
 }

@@ -568,22 +568,15 @@ func (h *ClaimHandler) Release(_ context.Context, in ReleaseInput) (ReleaseOutpu
 // contracted stub set and does not call this function; registration is a
 // separate integration task. Repeating the attach leaves one of each tool.
 func AttachClaim(server *mcpsdk.Server, handler *ClaimHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools(ClaimToolName, ReleaseToolName)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        ClaimToolName,
-		Description: "Claim one task so exactly one owner holds it. A retry with the same idempotencyKey returns the same claim and the same fencingToken; a second owner is rejected until the first calls beacon_release. Present fencingToken and sourceEpoch to beacon_release so a reassigned task or a lease invalidated after a crash cannot be changed by a stale owner; after recovery take a new lease first.",
-		Annotations: attachToolAnnotations(true),
-	}, handler.Handle)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        ReleaseToolName,
-		Description: "Explicitly release a task claim. Only the current owner can release; a fencingToken that is stale because the task was reassigned is refused, and a lease whose sourceEpoch was restored after a crash is refused even with a current token. Another owner may claim the task afterwards.",
-		Annotations: attachToolAnnotations(false),
-	}, handler.HandleRelease)
+	registerTool(server, ClaimToolName,
+		"Claim one task so exactly one owner holds it. A retry with the same idempotencyKey returns the same claim and the same fencingToken; a second owner is rejected until the first calls beacon_release. Present fencingToken and sourceEpoch to beacon_release so a reassigned task or a lease invalidated after a crash cannot be changed by a stale owner; after recovery take a new lease first.",
+		nil, newToolAnnotations(false, false, true), handler.Handle)
+	registerTool(server, ReleaseToolName,
+		"Explicitly release a task claim. Only the current owner can release; a fencingToken that is stale because the task was reassigned is refused, and a lease whose sourceEpoch was restored after a crash is refused even with a current token. Another owner may claim the task afterwards.",
+		nil, newToolAnnotations(false, false, false), handler.HandleRelease)
 }
 
 // Worktree lease tool names. They stay out of ToolNames; registration is done
@@ -984,34 +977,21 @@ func (h *WorktreeLeaseHandler) Release(_ context.Context, in WorktreeReleaseInpu
 // the heartbeat. NewServer does not call it; repeating the attach leaves one of
 // each tool.
 func AttachWorktreeLease(server *mcpsdk.Server, handler *WorktreeLeaseHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools(LeaseWorktreeToolName, WriteWorktreeToolName, ReleaseWorktreeToolName, HeartbeatWorktreeToolName)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        LeaseWorktreeToolName,
-		Description: "Lease a whole worktree to one owner for a TTL in seconds. The lease returns a fencing token and an expiry. A second owner is refused until the TTL ends or the owner releases it.",
-		Annotations: attachToolAnnotations(false),
-	}, handler.HandleAcquire)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        WriteWorktreeToolName,
-		Description: "Record a result written into a leased worktree. The lease must still be live and the fencing token must be the one the worktree holds. A stale token from an expired or replaced lease is refused.",
-		Annotations: attachToolAnnotations(false),
-	}, handler.HandleWrite)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        HeartbeatWorktreeToolName,
-		Description: "Beat a worktree lease to learn whether it is still held. The result carries a single alive flag: true while the owner and fencing token still match a live lease, false once the lease expired, was released, or was taken by a new owner. Stop on the first false beat and do not write the result again. A beat is read-only and does not extend the TTL; the fencing token is still checked when writing.",
-		Annotations: attachToolAnnotations(true),
-	}, handler.HandleHeartbeat)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        ReleaseWorktreeToolName,
-		Description: "Explicitly release a live worktree lease before its TTL ends. Only the owner holding the current fencing token can release it.",
-		Annotations: attachToolAnnotations(false),
-	}, handler.HandleRelease)
+	registerTool(server, LeaseWorktreeToolName,
+		"Lease a whole worktree to one owner for a TTL in seconds. The lease returns a fencing token and an expiry. A second owner is refused until the TTL ends or the owner releases it.",
+		nil, newToolAnnotations(false, false, false), handler.HandleAcquire)
+	registerTool(server, WriteWorktreeToolName,
+		"Record a result written into a leased worktree. The lease must still be live and the fencing token must be the one the worktree holds. A stale token from an expired or replaced lease is refused.",
+		nil, newToolAnnotations(false, false, false), handler.HandleWrite)
+	registerTool(server, HeartbeatWorktreeToolName,
+		"Beat a worktree lease to learn whether it is still held. The result carries a single alive flag: true while the owner and fencing token still match a live lease, false once the lease expired, was released, or was taken by a new owner. Stop on the first false beat and do not write the result again. A beat is read-only and does not extend the TTL; the fencing token is still checked when writing.",
+		nil, newToolAnnotations(false, false, true), handler.HandleHeartbeat)
+	registerTool(server, ReleaseWorktreeToolName,
+		"Explicitly release a live worktree lease before its TTL ends. Only the owner holding the current fencing token can release it.",
+		nil, newToolAnnotations(false, false, false), handler.HandleRelease)
 }
 
 // ADR 0049 p6 adds a holder lease over a reclaimable resource: an agent or a
@@ -1301,14 +1281,10 @@ func (h *HolderLeaseHandler) Holders(_ context.Context, in HolderLeaseHoldersInp
 // reclaim-side Install and Holders calls stay daemon-facing. NewServer does not
 // call this function; repeating the attach leaves one extend tool.
 func AttachHolderLease(server *mcpsdk.Server, handler *HolderLeaseHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools(ExtendHolderLeaseToolName)
-
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        ExtendHolderLeaseToolName,
-		Description: "Extend a holder lease on an agent or worktree. The caller must be one of the lease holders. A short request never shortens the deadline already granted: the lease keeps the later of its current expiry and now plus ttlSeconds. The holder list is unchanged by an extension.",
-		Annotations: attachToolAnnotations(false),
-	}, handler.HandleExtend)
+	registerTool(server, ExtendHolderLeaseToolName,
+		"Extend a holder lease on an agent or worktree. The caller must be one of the lease holders. A short request never shortens the deadline already granted: the lease keeps the later of its current expiry and now plus ttlSeconds. The holder list is unchanged by an extension.",
+		nil, newToolAnnotations(false, false, false), handler.HandleExtend)
 }

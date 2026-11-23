@@ -623,17 +623,10 @@ func writeClaimFile(path string, data []byte) error {
 // wiring it into NewServer is the contract card's job, so this helper is not
 // called automatically. A claim changes card state and is not idempotent.
 func AttachTaskClaim(server *mcpsdk.Server, handler *TaskClaimHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools(TaskClaimToolName)
-	no := false
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        TaskClaimToolName,
-		Description: "Atomically claim one todo task card for an agent. Returns the card id, goal, dependencies, owner files, plan mode and a handoff snapshot, and marks the card in_progress.",
-		Annotations: &mcpsdk.ToolAnnotations{
-			DestructiveHint: &no,
-			IdempotentHint:  false,
-		},
-	}, handler.Handle)
+	registerTool(server, TaskClaimToolName,
+		"Atomically claim one todo task card for an agent. Returns the card id, goal, dependencies, owner files, plan mode and a handoff snapshot, and marks the card in_progress.",
+		nil, newToolAnnotations(false, false, false), handler.Handle)
 }

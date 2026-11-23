@@ -1383,15 +1383,12 @@ func (h *GetResultHandler) GradeExternalAction(ctx context.Context, watchID stri
 // AttachGetResult replaces the startup stub with the real tool. Wiring it into
 // NewServer is a separate integration task, so this helper is opt-in.
 func AttachGetResult(server *mcpsdk.Server, handler *GetResultHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools("beacon_get_result")
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        "beacon_get_result",
-		Description: "Read a Watch result without logs and mark its content as read.",
-		Annotations: attachToolAnnotations(true),
-	}, handler.Handle)
+	registerTool(server, "beacon_get_result",
+		"Read a Watch result without logs and mark its content as read.",
+		nil, newToolAnnotations(false, false, true), handler.Handle)
 }
 
 // --- Background task handle: wait, output, notify (ADR 0048 feature 3) -----
@@ -1908,13 +1905,10 @@ func (s *ProtocolTaskStore) GetHandle(ctx context.Context, req *mcpsdk.CallToolR
 // NewServer is a separate integration task, so this helper is not called
 // automatically.
 func AttachTasksGet(server *mcpsdk.Server, store *ProtocolTaskStore) {
-	if server == nil || store == nil {
+	if store == nil {
 		return
 	}
-	server.RemoveTools(TasksGetMethod)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        TasksGetMethod,
-		Description: "Query the state and result of an MCP task without holding a connection.",
-		Annotations: attachToolAnnotations(true),
-	}, store.GetHandle)
+	registerTool(server, TasksGetMethod,
+		"Query the state and result of an MCP task without holding a connection.",
+		nil, newToolAnnotations(false, false, true), store.GetHandle)
 }

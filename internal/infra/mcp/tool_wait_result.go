@@ -1996,15 +1996,12 @@ func (s *WaitResultService) Handle(ctx context.Context, req *mcpsdk.CallToolRequ
 // AttachWaitResult registers the real tool on a server. NewServer keeps the
 // stub; integration chooses when to call this helper.
 func AttachWaitResult(server *mcpsdk.Server, svc *WaitResultService) {
-	if server == nil || svc == nil {
+	if svc == nil {
 		return
 	}
-	server.RemoveTools("beacon_wait_result")
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        "beacon_wait_result",
-		Description: "Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
-		Annotations: attachToolAnnotations(true),
-	}, svc.Handle)
+	registerTool(server, "beacon_wait_result",
+		"Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.",
+		nil, newToolAnnotations(false, false, true), svc.Handle)
 }
 
 // ---- CBX-11: CAS-based concurrent gate waiter registration ----

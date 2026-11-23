@@ -433,11 +433,45 @@ func attachAckWithPolicy(s *mcpsdk.Server, handler *AckHandler, policy ToolPolic
 	mcpsdk.AddTool(s, &mcpsdk.Tool{
 		Name:        "beacon_ack",
 		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok.",
-		Annotations: attachToolAnnotations(true),
+		Annotations: newToolAnnotations(false, false, true),
 	}, (&autoAllowAck{handler: handler, policy: policy}).Handle)
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// newToolAnnotations is the single factory for SDK tool annotations. Every
+// Attach* helper and the descriptor stub table build annotations here, so a
+// tool's declared class cannot drift from its tools/list annotations.
+func newToolAnnotations(readOnly, destructive, idempotent bool) *mcpsdk.ToolAnnotations {
+	return &mcpsdk.ToolAnnotations{
+		ReadOnlyHint:    readOnly,
+		DestructiveHint: boolPtr(destructive),
+		IdempotentHint:  idempotent,
+	}
+}
+
+// registerTool replaces one named tool with its real handler. The nil server
+// check lives here so an Attach* helper needs no server guard of its own.
+// RemoveTools runs before AddTool, which keeps the replacement contract and the
+// tools/list order unchanged. The handler stays typed so mcpsdk.AddTool still
+// derives the input schema from In and wraps the result exactly as before.
+func registerTool[In, Out any](server *mcpsdk.Server, name, description string, schema *jsonschema.Schema, annotations *mcpsdk.ToolAnnotations, handler mcpsdk.ToolHandlerFor[In, Out]) {
+	if server == nil {
+		return
+	}
+	server.RemoveTools(name)
+	tool := &mcpsdk.Tool{
+		Name:        name,
+		Description: description,
+		Annotations: annotations,
+	}
+	// Tool.OutputSchema is an any. Assigning a nil *jsonschema.Schema would make
+	// the interface non-nil and the SDK would try to resolve an empty schema.
+	if schema != nil {
+		tool.OutputSchema = schema
+	}
+	mcpsdk.AddTool(server, tool, handler)
+}
 
 // annotationsForKind maps a descriptor's honest annotation class to the SDK
 // annotations used by the stub registration. DestructiveHint is a pointer in
@@ -445,13 +479,13 @@ func boolPtr(b bool) *bool { return &b }
 func annotationsForKind(kind toolKind) mcpsdk.ToolAnnotations {
 	switch kind {
 	case kindRead:
-		return mcpsdk.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: boolPtr(false)}
+		return *newToolAnnotations(true, false, false)
 	case kindDestructive:
-		return mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(true)}
+		return *newToolAnnotations(false, true, false)
 	case kindAdditiveOnce:
-		return mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(false)}
+		return *newToolAnnotations(false, false, false)
 	default:
-		return mcpsdk.ToolAnnotations{DestructiveHint: boolPtr(false), IdempotentHint: true}
+		return *newToolAnnotations(false, false, true)
 	}
 }
 
@@ -1112,7 +1146,7 @@ func attachTaskList(s *mcpsdk.Server, deps Dependencies, outputSchema *jsonschem
 // A nil source leaves the server unchanged, and a nil schema falls back to the
 // derived one, so a broken optional schema cannot suppress the real handler.
 func AttachThreadRead(server *mcpsdk.Server, source ThreadHistorySource, outputSchema *jsonschema.Schema) {
-	if server == nil || source == nil {
+	if source == nil {
 		return
 	}
 	if outputSchema == nil {
@@ -1124,18 +1158,9 @@ func AttachThreadRead(server *mcpsdk.Server, source ThreadHistorySource, outputS
 			outputSchema = &jsonschema.Schema{Type: "object"}
 		}
 	}
-	annotations := mcpsdk.ToolAnnotations{
-		ReadOnlyHint:    true,
-		DestructiveHint: boolPtr(false),
-		IdempotentHint:  true,
-	}
-	server.RemoveTools(ThreadReadToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         ThreadReadToolName,
-		Description:  "Read a bounded tail of one thread history with an earlierPosition continuation and provenance on every message.",
-		OutputSchema: outputSchema,
-		Annotations:  &annotations,
-	}, NewThreadReadHandler(source).Handle)
+	registerTool(server, ThreadReadToolName,
+		"Read a bounded tail of one thread history with an earlierPosition continuation and provenance on every message.",
+		outputSchema, newToolAnnotations(true, false, true), NewThreadReadHandler(source).Handle)
 }
 
 // emptySnapshotReader is the minimal dependency used when no SnapshotReader is

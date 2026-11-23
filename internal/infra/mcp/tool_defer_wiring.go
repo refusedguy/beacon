@@ -206,13 +206,10 @@ func RenderDeferred(format string, cards []DeferredWiringCard) (string, error) {
 // exactly one beacon_defer_wiring tool; the annotation is additive and
 // idempotent, never read-only or destructive.
 func AttachDeferWiring(server *mcpsdk.Server, handler *DeferWiringHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools("beacon_defer_wiring")
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        "beacon_defer_wiring",
-		Description: "Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md.",
-		Annotations: attachToolAnnotations(true),
-	}, handler.Handle)
+	registerTool(server, "beacon_defer_wiring",
+		"Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md.",
+		nil, newToolAnnotations(false, false, true), handler.Handle)
 }

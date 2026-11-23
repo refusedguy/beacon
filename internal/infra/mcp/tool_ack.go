@@ -1336,13 +1336,10 @@ func LadderStopped(o domain.Obligation) bool {
 // AttachAck replaces the startup stub with the real tool. It registers exactly
 // one ack tool; wiring it into NewServer is a separate integration task.
 func AttachAck(server *mcpsdk.Server, handler *AckHandler) {
-	if server == nil || handler == nil {
+	if handler == nil {
 		return
 	}
-	server.RemoveTools("beacon_ack")
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:        "beacon_ack",
-		Description: "Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
-		Annotations: attachToolAnnotations(true),
-	}, handler.Handle)
+	registerTool(server, "beacon_ack",
+		"Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching.",
+		nil, newToolAnnotations(false, false, true), handler.Handle)
 }

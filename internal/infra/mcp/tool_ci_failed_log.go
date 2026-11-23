@@ -330,23 +330,14 @@ func (h *CIFailedLogHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolReque
 // out of toolDescriptors so the pinned tools/list contract does not change;
 // a composition root that needs paginated logs calls this helper.
 func AttachCIFailedLog(server *mcpsdk.Server, store resultStoreReader, source CIFailedLogSource) {
-	if server == nil || store == nil {
+	if store == nil {
 		return
 	}
 	derived, err := OutputSchema[CIFailedLogOutput]()
 	if err != nil || derived == nil {
 		derived = &jsonschema.Schema{Type: "object"}
 	}
-	annotations := mcpsdk.ToolAnnotations{
-		ReadOnlyHint:    true,
-		DestructiveHint: boolPtr(false),
-		IdempotentHint:  true,
-	}
-	server.RemoveTools(CIFailedLogToolName)
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
-		Name:         CIFailedLogToolName,
-		Description:  "Read a failed check's full log in bounded byte pages with an explicit offset and continuation cursor.",
-		OutputSchema: derived,
-		Annotations:  &annotations,
-	}, NewCIFailedLogHandler(store, source).Handle)
+	registerTool(server, CIFailedLogToolName,
+		"Read a failed check's full log in bounded byte pages with an explicit offset and continuation cursor.",
+		derived, newToolAnnotations(true, false, true), NewCIFailedLogHandler(store, source).Handle)
 }
