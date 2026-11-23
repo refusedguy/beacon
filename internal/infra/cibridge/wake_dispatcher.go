@@ -183,14 +183,11 @@ func (b *wakeDispatcher) wakeCount(w domain.Watch, subscriberID string) int {
 // delivery.
 func (b *wakeDispatcher) recordWake(w domain.Watch, subscriberID string, now time.Time, attempt int) {
 	id := wakeCounterID(w, subscriberID)
-	if _, err := b.store.Obligation(id); err != nil {
-		if err := b.store.SaveObligation(domain.Obligation{
-			ID: id, WatchID: w.ID, Revision: 0,
-			SubscriberID: subscriberID, VerdictPointer: domain.VerdictWatching, StagedAt: now,
-		}); err != nil {
-			observe.ActorError("cibridge-wake-counter", w.ID, err)
-			return
-		}
+	if b.ensureObligation(domain.Obligation{
+		ID: id, WatchID: w.ID, Revision: 0,
+		SubscriberID: subscriberID, VerdictPointer: domain.VerdictWatching, StagedAt: now,
+	}, now, stagingError("cibridge-wake-counter", w.ID)) {
+		return
 	}
 	b.markDelivered(id, now, attempt, "")
 }
@@ -678,17 +675,11 @@ func (b *wakeDispatcher) notifyPark(ctx context.Context, w domain.Watch, now tim
 	}
 	for _, sub := range w.Subscribers {
 		id := parkNoticeID(w, sub.ID)
-		if o, err := b.store.Obligation(id); err == nil && !o.DeliveredAt.IsZero() {
+		if _, stop := b.deliveredOrStage(domain.Obligation{
+			ID: id, WatchID: w.ID, Revision: w.Revision,
+			SubscriberID: sub.ID, VerdictPointer: domain.VerdictParked, StagedAt: now,
+		}, now, stagingError("cibridge-park-notice", w.ID), nil); stop {
 			continue
-		} else if err != nil {
-			o := domain.Obligation{
-				ID: id, WatchID: w.ID, Revision: w.Revision,
-				SubscriberID: sub.ID, VerdictPointer: domain.VerdictParked, StagedAt: now,
-			}
-			if err := b.store.SaveObligation(o); err != nil {
-				observe.ActorError("cibridge-park-notice", w.ID, err)
-				continue
-			}
 		}
 		target, err := wakeAddressee(w, w.ID, sub.ID)
 		if err != nil {
@@ -823,18 +814,14 @@ func (b *wakeDispatcher) markOrphaned(ctx context.Context, w domain.Watch, sub d
 		return
 	}
 	id := domain.ObligationKey("orphan:"+current.ID, 0, sessionID)
-	if o, err := b.store.Obligation(id); err == nil && !o.DeliveredAt.IsZero() {
+	o, stop := b.deliveredOrStage(domain.Obligation{
+		ID: id, WatchID: current.ID, Revision: current.Revision,
+		SubscriberID: sessionID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
+	}, now, stagingError("cibridge-orphan-obligation", current.ID), nil)
+	if stop {
 		return
-	} else if err != nil {
-		o := domain.Obligation{
-			ID: id, WatchID: current.ID, Revision: current.Revision,
-			SubscriberID: sessionID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
-		}
-		if err := b.store.SaveObligation(o); err != nil {
-			return
-		}
-		b.stage(ctx, o, domain.VerdictBlocked, now)
 	}
+	b.stage(ctx, o, domain.VerdictBlocked, now)
 	p := domain.WakePayload{
 		WatchID: current.ID, ObligationID: id, Revision: current.Revision,
 		Verdict: fmt.Sprintf("executor_orphaned: %s, acceptor %s, watchID %s", sub.Role, sub.ID, current.ID),
@@ -933,22 +920,14 @@ func (b *wakeDispatcher) markInWorkStalled(ctx context.Context, w domain.Watch, 
 		return false
 	}
 	id := domain.ObligationKey("inwork-stall:"+w.ID, w.Revision, sub.ID)
-	o, err := b.store.Obligation(id)
-	if err == nil {
-		if !o.DeliveredAt.IsZero() {
-			return false
-		}
-	} else {
-		o = domain.Obligation{
-			ID: id, WatchID: w.ID, Revision: w.Revision,
-			SubscriberID: sub.ID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
-		}
-		if err := b.store.SaveObligation(o); err != nil {
-			observe.ActorError("cibridge-stall-obligation", w.ID, err)
-			return false
-		}
-		b.stage(ctx, o, domain.VerdictBlocked, now)
+	o, stop := b.deliveredOrStage(domain.Obligation{
+		ID: id, WatchID: w.ID, Revision: w.Revision,
+		SubscriberID: sub.ID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
+	}, now, stagingError("cibridge-stall-obligation", w.ID), nil)
+	if stop {
+		return false
 	}
+	b.stage(ctx, o, domain.VerdictBlocked, now)
 	text := fmt.Sprintf("in_work_stalled: subscriber %s (%s) on watch %s revision %d had no head, MCP or commit activity for %s; replacement required",
 		sub.ID, sub.Role, w.ID, w.Revision, b.inWorkTimeout)
 	p := domain.WakePayload{WatchID: w.ID, ObligationID: id, Revision: w.Revision, Verdict: text}
