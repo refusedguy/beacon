@@ -628,7 +628,7 @@ type AckHandler struct {
 	// built before this port was added keep their ack behaviour; a nil
 	// permission registry skips the control-channel fields.
 	permissions *PermissionRegistry
-	blockers    BlockerControl
+	blockers    domain.BlockerIncidents
 	// generations stamps a fresh generation on every Watch a resolve unblocks.
 	// It is optional so handlers built before the port was added keep their
 	// idempotency and block behaviour unchanged; a nil store simply skips the
@@ -663,11 +663,11 @@ func (h *AckHandler) SetContinuationRegistry(r *ContinuationRegistry) {
 	}
 }
 
-// SetBlockerControl injects the durable blocker port. With it installed the
+// SetBlockerIncidents injects the durable incident port. With it installed the
 // SQLite incident is the source of truth for block and unblock, so a process
 // restart cannot forget why a Watch was blocked. A nil argument keeps the
 // legacy in-memory behaviour for callers that have not wired the port yet.
-func (h *AckHandler) SetBlockerControl(b BlockerControl) {
+func (h *AckHandler) SetBlockerIncidents(b domain.BlockerIncidents) {
 	if h != nil {
 		h.blockers = b
 	}

@@ -794,15 +794,20 @@ type Merger interface {
 	Merge(ctx context.Context, repo string, pr int) (merged bool, held bool, reason string, err error)
 }
 
-// BlockerIncidentStore persists blocker incidents and steers their lifecycle.
+// BlockerIncidents persists blocker incidents and steers their lifecycle.
 // GetOrCreateOpenBlocker folds failed checks into one incident and reports
 // whether it created a new one. ResolveBlocker returns the Watches it unblocked.
-type BlockerIncidentStore interface {
+type BlockerIncidents interface {
 	GetOrCreateOpenBlocker(repo, baseRef string, failedChecks []string, watchID string, now time.Time) (BlockerIncident, bool, error)
-	AssignFixer(blockerID, fixerWatchID string) (BlockerIncident, error)
 	ResolveBlocker(blockerID string, now time.Time) ([]Watch, error)
 	ResolveBlockersByBaseGreen(repo, baseRef string, baseFailed map[string]bool, now time.Time) ([]BlockerIncident, error)
 	ActiveBlockers() ([]BlockerIncident, error)
+}
+
+// FixerBinding binds the Watch that repairs an incident. Only watch_pr writes
+// this binding, so it stays separate from the incident lifecycle port.
+type FixerBinding interface {
+	AssignFixer(blockerID, fixerWatchID string) (BlockerIncident, error)
 }
 
 // OrchestratorBindingStore persists the session bound to a project.

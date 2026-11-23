@@ -590,7 +590,8 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 		return
 	}
 	handler := mcp.NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
-	handler.SetBlockerControl(deps.Blockers)
+	handler.SetBlockerIncidents(deps.Blockers)
+	handler.SetFixerBinding(deps.FixerBinding)
 	if registrar, ok := deps.Store.(mcp.WatchPRRegistrar); ok {
 		handler.SetRegistry(registrar)
 	}
@@ -829,8 +830,9 @@ func buildMCPDependencies(db *store.DB, dir string, points func() (int, int)) mc
 		// it the server answers with a ticket carrying a job id rather than
 		// holding the connection open. This is a time bound, not ADR 0026's
 		// delivery field.
-		After:    readSyncCallConfig().after,
-		Blockers: db,
+		After:        readSyncCallConfig().after,
+		Blockers:     db,
+		FixerBinding: db,
 		// The deferred-wiring port was left nil here, so beacon_defer_wiring
 		// answered PERSIST_FAILED. The durable adapter shares this DB handle.
 		DeferWiring: newDurableDeferredStore(db),
@@ -2410,7 +2412,7 @@ func ReconcilePass(ctx context.Context, cfg reconcileConfig) int {
 		WithOrchestratorIDSource(orchestratorIDSource(cfg.db, cfg.projectKey, cfg.root)).
 		WithMerger(cfg.batch).
 		WithAutoRebase(cfg.batch).
-		WithBlockerControl(cfg.db).
+		WithBlockerIncidents(cfg.db).
 		WithDependencyResolver(cfg.resolver).
 		WithCardLinks(&deferredCardLinks{db: cfg.db, root: cfg.root}).
 		WithWorktreeGC(bridgeWorktreeGC(cfg.db, cfg.root))

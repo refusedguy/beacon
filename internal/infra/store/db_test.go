@@ -409,7 +409,8 @@ func TestStorePortAndIdempotency(t *testing.T) {
 	var (
 		_ domain.WatchStore               = (*DB)(nil)
 		_ domain.ObligationStore          = (*DB)(nil)
-		_ domain.BlockerIncidentStore     = (*DB)(nil)
+		_ domain.BlockerIncidents         = (*DB)(nil)
+		_ domain.FixerBinding             = (*DB)(nil)
 		_ domain.OrchestratorBindingStore = (*DB)(nil)
 	)
 

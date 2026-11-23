@@ -204,7 +204,8 @@ var toolDescriptors = []toolDescriptor{
 		Kind:        kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			handler := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
-			handler.SetBlockerControl(deps.Blockers)
+			handler.SetBlockerIncidents(deps.Blockers)
+			handler.SetFixerBinding(deps.FixerBinding)
 			AttachWatchPR(s, handler)
 		},
 	},
@@ -244,7 +245,7 @@ var toolDescriptors = []toolDescriptor{
 		Kind:        kindAdditive,
 		Handler: func(s *mcpsdk.Server, deps Dependencies, _ map[string]*jsonschema.Schema, _ string) {
 			handler := NewAckHandler(deps.Store, deps.Stamper, deps.Clock)
-			handler.SetBlockerControl(deps.Blockers)
+			handler.SetBlockerIncidents(deps.Blockers)
 			if deps.Continuations != nil {
 				handler.SetContinuationRegistry(deps.Continuations)
 			}
@@ -571,18 +572,6 @@ func inProcessToolHandler(bridge *InProcessBridge, name string) mcpsdk.ToolHandl
 	}
 }
 
-// BlockerControl is the narrow control-plane port the two writing tools need.
-// watch_pr uses AssignFixer to bind a fixer to an incident, ack uses
-// GetOrCreateOpenBlocker and ResolveBlocker to open and close an incident. The
-// SQLite adapter in cmd/beacon implements this interface, so this layer never
-// imports internal/infra/store (ADR 0005).
-type BlockerControl interface {
-	GetOrCreateOpenBlocker(repo, baseRef string, failedChecks []string, watchID string, now time.Time) (domain.BlockerIncident, bool, error)
-	AssignFixer(blockerID, fixerWatchID string) (domain.BlockerIncident, error)
-	ResolveBlocker(blockerID string, now time.Time) ([]domain.Watch, error)
-	ActiveBlockers() ([]domain.BlockerIncident, error)
-}
-
 type stubInput struct{}
 
 type stubOutput struct {
@@ -676,10 +665,11 @@ type Dependencies struct {
 	Snapshot SnapshotReader
 	Clock    domain.Clock
 
-	// Blockers is the durable control plane for failed-base-branch incidents.
-	// A nil value keeps the legacy in-memory behaviour for callers that have
-	// not wired the SQLite adapter yet.
-	Blockers BlockerControl
+	// Blockers is the durable incident lifecycle port. A nil value keeps the
+	// legacy in-memory behaviour for callers that have not wired SQLite yet.
+	Blockers domain.BlockerIncidents
+	// FixerBinding binds a fixer Watch to an incident. Only watch_pr writes it.
+	FixerBinding domain.FixerBinding
 
 	// SharedCIWaiter is the gate for the expensive CI wait at the long-poll
 	// entry (ADR 0037 p3). The composition root supplies it so this package

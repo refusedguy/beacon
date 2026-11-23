@@ -131,11 +131,11 @@ func (b *wakeDispatcher) recordDelivery(ctx context.Context, obligationID string
 }
 
 // markDelivered persists a delivery on the obligation itself. The store
-// adapter exposes MarkObligationDelivered; a legacy or test store is updated
-// through SaveObligation. Either way the fact survives a process restart.
+// adapter exposes DeliveryMarker; a legacy or test store is updated through
+// SaveObligation. Either way the fact survives a process restart.
 func (b *wakeDispatcher) markDelivered(id string, at time.Time, attempt int, lastErr string) {
-	if b.control != nil {
-		if err := b.control.MarkObligationDelivered(id, at, attempt, lastErr); err == nil {
+	if b.delivery != nil {
+		if err := b.delivery.MarkObligationDelivered(id, at, attempt, lastErr); err == nil {
 			return
 		}
 	}
