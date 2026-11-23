@@ -19,6 +19,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/cardscan"
 )
 
 // Коды выхода из ADR 0016. Правило действует для каждой команды beacon:
@@ -334,38 +336,34 @@ func splitList(v string) []string {
 // dual-read exit metric sees every access to the legacy source.
 var fileAdapter FileAdapter
 
-// LoadCards читает все карточки каталога и сортирует их по ID.
+// LoadCards читает все карточки каталога и сортирует их по Group, Number и ID.
+// Битая карточка прерывает чтение: этот вызывающий делает строгую проверку.
 func LoadCards(tasksDir string) ([]Card, error) {
-	entries, err := os.ReadDir(tasksDir)
-	if err != nil {
-		return nil, Startupf("каталог карточек %s недоступен: %v", tasksDir, err)
+	less := func(a, b Card) bool {
+		if a.Group != b.Group {
+			return a.Group < b.Group
+		}
+		if a.Number != b.Number {
+			return a.Number < b.Number
+		}
+		return a.ID < b.ID
 	}
-	cards := make([]Card, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		filePath := filepath.Join(tasksDir, e.Name())
-		data, err := fileAdapter.ReadFile(filePath)
-		if err != nil {
-			return nil, Startupf("не прочитана карточка %s: %v", e.Name(), err)
-		}
-		card, err := ParseCard(filePath, data)
-		if err != nil {
-			return nil, err
-		}
-		cards = append(cards, card)
+	cards, err := cardscan.ReadCards(tasksDir, fileAdapter.ReadFile, ParseCard, less, true)
+	if err == nil {
+		return cards, nil
 	}
-	sort.Slice(cards, func(i, j int) bool {
-		if cards[i].Group != cards[j].Group {
-			return cards[i].Group < cards[j].Group
-		}
-		if cards[i].Number != cards[j].Number {
-			return cards[i].Number < cards[j].Number
-		}
-		return cards[i].ID < cards[j].ID
-	})
-	return cards, nil
+	var fault *cardscan.Fault
+	if !errors.As(err, &fault) {
+		return nil, err
+	}
+	switch fault.Kind {
+	case cardscan.FaultDir:
+		return nil, Startupf("каталог карточек %s недоступен: %v", tasksDir, fault.Err)
+	case cardscan.FaultRead:
+		return nil, Startupf("не прочитана карточка %s: %v", filepath.Base(fault.Path), fault.Err)
+	default:
+		return nil, fault.Err
+	}
 }
 
 // NormalizePath приводит путь к каноническому виду для сравнения владельцев.

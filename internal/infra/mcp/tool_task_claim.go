@@ -28,6 +28,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/cardscan"
 )
 
 // TaskClaimToolName is the name AttachTaskClaim registers. It is deliberately
@@ -358,27 +359,11 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 // cards reads and parses every card, skipping malformed files. The result is
 // sorted by id so selection is deterministic across processes.
 func (s *FileTaskClaimStore) cards() ([]claimCard, error) {
-	entries, err := os.ReadDir(s.TasksDir)
+	less := func(a, b claimCard) bool { return a.ID < b.ID }
+	cards, err := cardscan.ReadCards(s.TasksDir, os.ReadFile, parseClaimCard, less, false)
 	if err != nil {
 		return nil, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
-	cards := make([]claimCard, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-			continue
-		}
-		path := filepath.Join(s.TasksDir, e.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		c, err := parseClaimCard(path, data)
-		if err != nil {
-			continue
-		}
-		cards = append(cards, c)
-	}
-	sort.Slice(cards, func(i, j int) bool { return cards[i].ID < cards[j].ID })
 	return cards, nil
 }
 
