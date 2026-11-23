@@ -1,6 +1,3 @@
-import { join } from "node:path"
-import { pathToFileURL } from "node:url"
-
 export const SURVIVAL_KEY = "beacon/survival-rules"
 
 export const SURVIVAL_RULES = [
@@ -16,9 +13,6 @@ export const SURVIVAL_RULES = [
   '10) Fix a failed check when it is in your diff. Otherwise report the blocker in your final message.',
 ].join("\n")
 
-export function agentsFileURI(root) {
-  return pathToFileURL(join(root, "AGENTS.md")).href
-}
 
 export async function ensureSurvivalRules(ctx, sessionID) {
   if (typeof sessionID !== "string" || !sessionID) return false
@@ -37,8 +31,6 @@ export async function ensureSurvivalRules(ctx, sessionID) {
 }
 
 export async function registerProjectHooks(ctx, root) {
-  const agentsURI = agentsFileURI(root)
-
   const contextHook = await ctx.session.hook("context", async (event) => {
     try {
       await ensureSurvivalRules(ctx, event?.sessionID)
@@ -46,13 +38,7 @@ export async function registerProjectHooks(ctx, root) {
     event.system.push({ type: "text", text: `beacon project root=${root}` })
   })
 
-  const promptHook = await ctx.session.hook("prompt", (event) => {
-    event.prompt.files ??= []
-    if (event.prompt.files.some((file) => file?.uri === agentsURI)) return
-    event.prompt.files.push({ uri: agentsURI })
-  })
-
-  return { contextHook, promptHook }
+  return { contextHook }
 }
 
 export async function registerCompactionHook(ctx) {
@@ -74,6 +60,5 @@ export async function installProjectContext(ctx, root) {
   return async () => {
     await compactionHook?.dispose?.()
     await hooks.contextHook?.dispose?.()
-    await hooks.promptHook?.dispose?.()
   }
 }
