@@ -129,14 +129,8 @@ type CLI struct {
 }
 
 // taskRunner delegates to the task command in cmd/beacon/task.go (T0.7).
-// RegisterTask replaces it, for example in tests.
 var taskRunner = func(args []string, out, errOut io.Writer) int {
 	return TaskCommand(append([]string{"task"}, args...), out, errOut)
-}
-
-// RegisterTask installs the task command implementation.
-func RegisterTask(fn func(args []string, out, errOut io.Writer) int) {
-	taskRunner = fn
 }
 
 func main() {
@@ -309,10 +303,6 @@ func init() {
 // returns a verdict and hands it to printRegistryStopVerdict, so the CLI never
 // prints success before the stopped state is saved (ADR 0091).
 var registryRunner = func(c *CLI, args []string) int { return runRegistry(c, args) }
-
-// RegisterRegistry installs the registry command implementation, mirroring
-// RegisterWatch and RegisterTask.
-func RegisterRegistry(fn func(*CLI, []string) int) { registryRunner = fn }
 
 // printRegistryStopVerdict turns one checked-stop verdict into CLI output and
 // an exit code. A refusal and an uncertain stop are different answers. Only a

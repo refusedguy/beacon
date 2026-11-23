@@ -18,13 +18,7 @@ import (
 )
 
 // prcreateRunner holds the command so CLI dispatch stays a one-line case.
-// RegisterPRCreate replaces it in tests, mirroring RegisterWatch.
 var prcreateRunner = func(c *CLI, args []string) int { return runPRCreate(c, args) }
-
-// RegisterPRCreate installs the pr command implementation.
-func RegisterPRCreate(fn func(*CLI, []string) int) {
-	prcreateRunner = fn
-}
 
 // sessionIDMetaKey is the opaque _meta key used by the existing watch_pr
 // handler. A CLI caller has no MCP request, so the wiring builds one carrying
@@ -259,15 +253,6 @@ type prcreateDeps struct {
 type prcreateDepsFactory func(*CLI) (prcreateDeps, error)
 
 var makePRCreateDeps prcreateDepsFactory = defaultPRCreateDeps
-
-// SetPRCreateDeps replaces the dependency factory for tests. Passing nil
-// restores the production wiring.
-func SetPRCreateDeps(fn prcreateDepsFactory) {
-	if fn == nil {
-		fn = defaultPRCreateDeps
-	}
-	makePRCreateDeps = fn
-}
 
 func defaultPRCreateDeps(c *CLI) (prcreateDeps, error) {
 	client, err := github.NewPRClient(context.Background())

@@ -68,7 +68,7 @@ func sessionsToWatch(sessions []opencode.Session) []opencodeSession {
 
 // watchRunner holds the command implementation so the CLI dispatch can call
 // it without depending on the rendering details. RegisterWatch replaces it in
-// tests, mirroring RegisterTask and RegisterMCP in main.go and mcp.go.
+// tests.
 var watchRunner = func(c *CLI, args []string) int { return runWatch(c, args) }
 
 // RegisterWatch installs the watch command implementation.

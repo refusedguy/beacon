@@ -30,12 +30,8 @@ func init() {
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 }
 
-// upRunner is the dispatch seam, like the other command runners. RegisterUp
-// replaces it in tests.
+// upRunner is the dispatch seam, like the other command runners.
 var upRunner = func(c *CLI, args []string) int { return runUp(c, args) }
-
-// RegisterUp installs the up command implementation.
-func RegisterUp(fn func(*CLI, []string) int) { upRunner = fn }
 
 // upStatusPort is the read-only slice of the store the status and inspect
 // replies need. A *store.DB satisfies it; tests pass a fake.

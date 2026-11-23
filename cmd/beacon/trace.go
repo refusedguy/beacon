@@ -29,11 +29,8 @@ func init() {
 	runnerFor["trace"] = func(c *CLI, args []string) int { return traceRunner(c, args) }
 }
 
-// traceRunner is the dispatch seam. RegisterTrace replaces it in tests.
+// traceRunner is the dispatch seam.
 var traceRunner = func(c *CLI, args []string) int { return runTrace(c, args) }
-
-// RegisterTrace installs the trace command implementation.
-func RegisterTrace(fn func(*CLI, []string) int) { traceRunner = fn }
 
 // traceNow is the clock used by --since. Tests pin it to a fixed instant.
 var traceNow = time.Now
@@ -51,15 +48,6 @@ type traceDeps struct {
 type traceDepsFactory func(*CLI) (traceDeps, func() error, error)
 
 var makeTraceDeps traceDepsFactory = defaultTraceDeps
-
-// SetTraceDeps replaces the dependency factory. Passing nil restores the
-// production factory.
-func SetTraceDeps(fn traceDepsFactory) {
-	if fn == nil {
-		fn = defaultTraceDeps
-	}
-	makeTraceDeps = fn
-}
 
 func defaultTraceDeps(_ *CLI) (traceDeps, func() error, error) {
 	dir, err := stateDir()

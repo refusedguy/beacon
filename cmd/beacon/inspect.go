@@ -27,15 +27,6 @@ var (
 	regradeRunner = func(c *CLI, args []string) int { return runRegrade(c, args) }
 )
 
-// RegisterInspect installs the inspect command implementation.
-func RegisterInspect(fn func(*CLI, []string) int) { inspectRunner = fn }
-
-// RegisterReset installs the reset command implementation.
-func RegisterReset(fn func(*CLI, []string) int) { resetRunner = fn }
-
-// RegisterRegrade installs the regrade command implementation.
-func RegisterRegrade(fn func(*CLI, []string) int) { regradeRunner = fn }
-
 // readEscalations reads the escalation journal through a filesystem seam. It
 // is the diagnostics port used by both `inspect` and `orchestrator bind`; the
 // file is optional and a missing journal is an empty result.

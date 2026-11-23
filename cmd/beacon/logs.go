@@ -8,12 +8,9 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
-// logsRunner is the dispatch seam for `beacon logs`. RegisterLogs replaces it
-// in tests like the other command runners.
+// logsRunner is the dispatch seam for `beacon logs`, like the other command
+// runners.
 var logsRunner = func(c *CLI, args []string) int { return runLogs(c, args) }
-
-// RegisterLogs installs the logs command implementation.
-func RegisterLogs(fn func(*CLI, []string) int) { logsRunner = fn }
 
 // runLogs reads the structured log files under the project state directory
 // through the observe port. No file I/O happens here, so the capability gate

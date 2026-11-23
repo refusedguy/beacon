@@ -502,7 +502,7 @@ func runMCPPrecheck(ctx context.Context, cfg initEventConfig) error {
 	}
 }
 
-// mcpRunner serves MCP over stdio. RegisterMCP replaces it, for example in tests.
+// mcpRunner serves MCP over stdio.
 var mcpRunner = func(errOut io.Writer) int {
 	if err := runMCP(context.Background(), newDefaultCLI()); err != nil {
 		fmt.Fprintf(errOut, "beacon mcp: %v\n", err)
@@ -2486,9 +2486,4 @@ func runReconciler(ctx context.Context, cfg reconcileConfig) (func(), error) {
 		<-done
 		release()
 	}, nil
-}
-
-// RegisterMCP installs the mcp command implementation.
-func RegisterMCP(fn func(io.Writer) int) {
-	mcpRunner = fn
 }

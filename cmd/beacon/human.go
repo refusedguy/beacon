@@ -98,12 +98,8 @@ func parseHumanResponse(verb, target, note string) (humanResponse, error) {
 	return humanResponse{Outcome: outcome, Target: target, Note: note}, nil
 }
 
-// humanRunner delegates to the CLI implementation. RegisterHuman replaces it
-// in tests, mirroring RegisterWatch.
+// humanRunner delegates to the CLI implementation.
 var humanRunner = func(c *CLI, args []string) int { return runHuman(c, args) }
-
-// RegisterHuman installs the human command implementation.
-func RegisterHuman(fn func(*CLI, []string) int) { humanRunner = fn }
 
 // humanDecider and humanDecisionStore are the two write paths of this command.
 // The HTTP path is preferred; the store path is used when no server is

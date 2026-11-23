@@ -127,9 +127,6 @@ func startMetricsEndpoint(m *observe.Metrics, args []string) func() {
 // commands so tests can replace it.
 var metricsRunner = func(c *CLI, args []string) int { return runMetrics(c, args) }
 
-// RegisterMetrics installs the metrics command implementation.
-func RegisterMetrics(fn func(*CLI, []string) int) { metricsRunner = fn }
-
 // runMetrics exports the in-process counters as JSON or Prometheus text. The
 // counters belong to the process that recorded them, so a short-lived command
 // sees the counters it touched and a daemon sees its own running totals.

@@ -25,11 +25,8 @@ import (
 const sessionIDEnv = "BEACON_SESSION_ID"
 
 // orchestratorCommandRunner is the dispatch seam for the orchestrator
-// subcommands. RegisterOrchestratorCommand replaces it in tests.
+// subcommands.
 var orchestratorCommandRunner = func(c *CLI, args []string) int { return runOrchestratorCommand(c, args) }
-
-// RegisterOrchestratorCommand installs the orchestrator command implementation.
-func RegisterOrchestratorCommand(fn func(*CLI, []string) int) { orchestratorCommandRunner = fn }
 
 // bindStore is the slice of the state store the bind command needs. The
 // concrete *store.DB implements it; tests install a recording fake.
@@ -42,15 +39,6 @@ type bindStore interface {
 type bindStoreFactory func(*CLI) (bindStore, func() error, error)
 
 var makeBindStore bindStoreFactory = defaultBindStore
-
-// SetBindStore replaces the bind store factory. Passing nil restores the
-// production store.
-func SetBindStore(fn bindStoreFactory) {
-	if fn == nil {
-		fn = defaultBindStore
-	}
-	makeBindStore = fn
-}
 
 func defaultBindStore(*CLI) (bindStore, func() error, error) {
 	dir, err := stateDir()
