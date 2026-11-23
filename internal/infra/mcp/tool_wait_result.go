@@ -713,11 +713,18 @@ type WaitResultIdempotencyStore interface {
 	Record(clientRequestID string, out WaitResultOutput)
 }
 
+// maxIdempotencyResults bounds the clientRequestId index. A long-lived mcp
+// service replays at most this many outcomes. Eviction drops the oldest
+// insertion first, so a key stays replayable until the window passes it.
+const maxIdempotencyResults = 4096
+
 // memoryWaitResultIdempotency is the in-process default. It keeps one result
-// per clientRequestId for the lifetime of the service.
+// per clientRequestId, up to maxIdempotencyResults. The order slice holds keys
+// in insertion order so eviction removes the oldest one first.
 type memoryWaitResultIdempotency struct {
 	mu      sync.Mutex
 	results map[string]WaitResultOutput
+	order   []string // clientRequestIds in insertion order, for oldest-first eviction
 }
 
 // NewMemoryWaitResultIdempotency builds the default in-process store.
@@ -735,9 +742,29 @@ func (m *memoryWaitResultIdempotency) Lookup(clientRequestID string) (WaitResult
 	return cloneWaitResultOutput(out), true
 }
 
+// forgetLocked removes a key from the eviction order. The caller holds m.mu.
+func (m *memoryWaitResultIdempotency) forgetLocked(key string) {
+	for i, k := range m.order {
+		if k == key {
+			copy(m.order[i:], m.order[i+1:])
+			m.order[len(m.order)-1] = ""
+			m.order = m.order[:len(m.order)-1]
+			return
+		}
+	}
+}
+
 func (m *memoryWaitResultIdempotency) Record(clientRequestID string, out WaitResultOutput) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.results[clientRequestID]; !ok {
+		if len(m.results) >= maxIdempotencyResults {
+			oldest := m.order[0]
+			delete(m.results, oldest)
+			m.forgetLocked(oldest)
+		}
+		m.order = append(m.order, clientRequestID)
+	}
 	m.results[clientRequestID] = cloneWaitResultOutput(out)
 }
 

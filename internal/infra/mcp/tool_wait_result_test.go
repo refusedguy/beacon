@@ -502,6 +502,82 @@ func TestWaitResultClientRequestIDIdempotent(t *testing.T) {
 	}
 }
 
+// TestMemoryWaitResultIdempotencyEvictsOldestFirst bounds the clientRequestId
+// index. After maxIdempotencyResults+1 records the first key is gone, the last
+// key replays, and the index holds exactly the cap.
+func TestMemoryWaitResultIdempotencyEvictsOldestFirst(t *testing.T) {
+	store := NewMemoryWaitResultIdempotency()
+	mem, ok := store.(*memoryWaitResultIdempotency)
+	if !ok {
+		t.Fatalf("store type = %T, want *memoryWaitResultIdempotency", store)
+	}
+
+	key := func(i int) string { return fmt.Sprintf("req-%04d", i) }
+	result := func(i int) WaitResultOutput {
+		return WaitResultOutput{Verdict: fmt.Sprintf("verdict-%04d", i), Revision: uint64(i)}
+	}
+	for i := 0; i <= maxIdempotencyResults; i++ {
+		store.Record(key(i), result(i))
+	}
+
+	if got := len(mem.results); got != maxIdempotencyResults {
+		t.Errorf("results size = %d, want %d", got, maxIdempotencyResults)
+	}
+	if _, ok := store.Lookup(key(0)); ok {
+		t.Error("oldest key still replays after eviction")
+	}
+	got, ok := store.Lookup(key(maxIdempotencyResults))
+	if !ok {
+		t.Fatalf("newest key missing after eviction")
+	}
+	if want := result(maxIdempotencyResults); !reflect.DeepEqual(got, want) {
+		t.Errorf("newest result = %+v, want %+v", got, want)
+	}
+
+	mid := maxIdempotencyResults / 2
+	first, ok := store.Lookup(key(mid))
+	if !ok {
+		t.Fatalf("mid-window key missing")
+	}
+	again, ok := store.Lookup(key(mid))
+	if !ok || !reflect.DeepEqual(again, first) {
+		t.Errorf("repeat lookup = %+v/%v, want %+v/true", again, ok, first)
+	}
+}
+
+// TestWaitResultIdempotencyRepeatAfterFillHasNoSecondEffect proves a key inside
+// the eviction window still short-circuits the wait after the index fills: no
+// readAt write, obligation write or subscription.
+func TestWaitResultIdempotencyRepeatAfterFillHasNoSecondEffect(t *testing.T) {
+	svc, store, writer, source, _ := newWaitTestService()
+	mem, ok := svc.idempotency.(*memoryWaitResultIdempotency)
+	if !ok {
+		t.Fatalf("idempotency type = %T, want *memoryWaitResultIdempotency", svc.idempotency)
+	}
+	want := WaitResultOutput{
+		Status:   string(domain.StatusClosed),
+		Verdict:  string(domain.VerdictMerged),
+		Revision: 42,
+	}
+	kept := fmt.Sprintf("req-%04d", maxIdempotencyResults/2)
+	for i := 0; i <= maxIdempotencyResults; i++ {
+		mem.Record(fmt.Sprintf("req-%04d", i), want)
+	}
+
+	got, err := svc.Wait(context.Background(), "sub-A",
+		WaitResultInput{WatchID: "watch-1", ClientRequestID: kept}, CallerExit{})
+	if err != nil {
+		t.Fatalf("cached Wait: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("cached result = %+v, want %+v", got, want)
+	}
+	if len(writer.reads) != 0 || store.obligationWrites != 0 || len(source.subscribed) != 0 {
+		t.Errorf("cached repeat wrote %d readAt, %d obligations, %d subscriptions, want 0/0/0",
+			len(writer.reads), store.obligationWrites, len(source.subscribed))
+	}
+}
+
 // TestWaitResultDistinctClientRequestIDsCreateDistinctEffects shows that the
 // key scopes idempotency: a new clientRequestId runs a new wait and returns its
 // own result.
