@@ -563,23 +563,31 @@ type ConflictResult struct {
 	Message string       `json:"message,omitempty"`
 }
 
+// distinctBy keeps the first occurrence of each non-zero key in input order.
+// It lives here because domain may import only the standard library.
+func distinctBy[T comparable](in []T, key func(T) T) []T {
+	var zero T
+	seen := make(map[T]bool, len(in))
+	out := make([]T, 0, len(in))
+	for _, v := range in {
+		if k := key(v); k != zero && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // NewConflictResult builds a ConflictResult. Paths are trimmed, empty entries
 // and duplicates are dropped while keeping the caller's order. The Paths
 // slice is always non-nil so an empty conflict serializes as [] rather than
 // null.
 func NewConflictResult(typ ConflictType, paths []string, message string) ConflictResult {
-	out := ConflictResult{Type: typ, Paths: []string{}}
-	seen := make(map[string]bool, len(paths))
-	for _, p := range paths {
-		p = strings.TrimSpace(p)
-		if p == "" || seen[p] {
-			continue
-		}
-		seen[p] = true
-		out.Paths = append(out.Paths, p)
+	return ConflictResult{
+		Type:    typ,
+		Paths:   distinctBy(paths, strings.TrimSpace),
+		Message: message,
 	}
-	out.Message = message
-	return out
 }
 
 // Empty reports whether c carries no conflict detail. A zero ConflictResult is

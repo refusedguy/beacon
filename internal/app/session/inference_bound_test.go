@@ -222,3 +222,13 @@ func TestInferenceFormSummaryWithoutFiles(t *testing.T) {
 		t.Fatalf("summary = %q, want the reason alone", got)
 	}
 }
+
+func TestUniqueInferenceFilesTrimsDeduplicatesAndSorts(t *testing.T) {
+	got := strings.Join(uniqueInferenceFiles([]string{" b.go ", "a.go", " b.go", "  "}), ",")
+	if want := "a.go,b.go"; got != want {
+		t.Fatalf("uniqueInferenceFiles = %q, want %q", got, want)
+	}
+	if got := uniqueInferenceFiles(nil); len(got) != 0 {
+		t.Fatalf("uniqueInferenceFiles(nil) = %q, want empty", got)
+	}
+}

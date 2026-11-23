@@ -514,18 +514,24 @@ func (idx *Index) replaceCards(changed []pendingCard, stale []string) error {
 	return nil
 }
 
+// distinctBy keeps the first occurrence of each non-zero key in input order.
+// Empty keys are dropped so blank card tokens never reach the deps and owners
+// tables. The helper is local because infra packages do not import each other.
+func distinctBy[T comparable](in []T, key func(T) T) []T {
+	var zero T
+	seen := make(map[T]bool, len(in))
+	out := make([]T, 0, len(in))
+	for _, v := range in {
+		if k := key(v); k != zero && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // uniqueStrings убирает повторы, сохраняя порядок первого вхождения. Повторные
 // токены в поле карточки не должны ломать первичный ключ таблиц deps и owners.
 func uniqueStrings(values []string) []string {
-	seen := make(map[string]bool, len(values))
-	out := make([]string, 0, len(values))
-	for _, v := range values {
-		v = strings.TrimSpace(v)
-		if v == "" || seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	return out
+	return distinctBy(values, strings.TrimSpace)
 }

@@ -190,18 +190,24 @@ func truncateInferenceInput(text string, limit int) (string, bool) {
 	return text[:limit-len(inferenceTruncationMarker)] + inferenceTruncationMarker, true
 }
 
+// distinctBy keeps the first occurrence of each non-zero key in input order.
+// Blank file names are dropped before the summary reaches the model.
+func distinctBy[T comparable](in []T, key func(T) T) []T {
+	var zero T
+	seen := make(map[T]bool, len(in))
+	out := make([]T, 0, len(in))
+	for _, v := range in {
+		if k := key(v); k != zero && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // uniqueInferenceFiles trims, deduplicates and sorts the file summary.
 func uniqueInferenceFiles(files []string) []string {
-	out := make([]string, 0, len(files))
-	seen := make(map[string]bool, len(files))
-	for _, f := range files {
-		f = strings.TrimSpace(f)
-		if f == "" || seen[f] {
-			continue
-		}
-		seen[f] = true
-		out = append(out, f)
-	}
+	out := distinctBy(files, strings.TrimSpace)
 	sort.Strings(out)
 	return out
 }

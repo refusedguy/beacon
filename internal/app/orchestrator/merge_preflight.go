@@ -5,6 +5,7 @@
 package orchestrator
 
 import (
+	"slices"
 	"sort"
 	"strings"
 )
@@ -120,37 +121,34 @@ func mergeMainLabel(branch string) string {
 	return branch
 }
 
+// distinctBy keeps the first occurrence of each non-zero key in input order.
+// Both callers below need the same trim-and-drop-blank rule, but app packages
+// cannot import a helper from another layer.
+func distinctBy[T comparable](in []T, key func(T) T) []T {
+	var zero T
+	seen := make(map[T]bool, len(in))
+	out := make([]T, 0, len(in))
+	for _, v := range in {
+		if k := key(v); k != zero && !seen[k] {
+			seen[k] = true
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
 // mergeVisibleFiles drops tool-created paths, then sorts and deduplicates the
 // rest so a problem's file list is stable between ticks.
 func mergeVisibleFiles(files, toolPaths []string) []string {
-	ignored := make([]string, 0, len(toolPaths))
-	for _, p := range toolPaths {
-		p = strings.TrimSpace(strings.TrimSuffix(p, "/"))
-		if p != "" {
-			ignored = append(ignored, p)
-		}
-	}
-
-	seen := make(map[string]bool)
-	visible := make([]string, 0, len(files))
-	for _, f := range files {
-		f = strings.TrimSpace(f)
-		if f == "" || seen[f] {
-			continue
-		}
-		hidden := false
-		for _, p := range ignored {
-			if f == p || strings.HasPrefix(f, p+"/") {
-				hidden = true
-				break
-			}
-		}
-		if hidden {
-			continue
-		}
-		seen[f] = true
-		visible = append(visible, f)
-	}
+	ignored := distinctBy(toolPaths, func(p string) string {
+		return strings.TrimSpace(strings.TrimSuffix(p, "/"))
+	})
+	visible := distinctBy(files, strings.TrimSpace)
+	visible = slices.DeleteFunc(visible, func(f string) bool {
+		return slices.ContainsFunc(ignored, func(p string) bool {
+			return f == p || strings.HasPrefix(f, p+"/")
+		})
+	})
 	sort.Strings(visible)
 	return visible
 }

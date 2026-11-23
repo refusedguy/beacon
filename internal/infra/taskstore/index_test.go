@@ -588,3 +588,14 @@ func TestGraphStatusFollowsLastRebuiltDirectory(t *testing.T) {
 		t.Fatalf("индекс после второй сборки не готов: %+v", status)
 	}
 }
+
+func TestUniqueStringsKeepsFirstSeenOrder(t *testing.T) {
+	in := []string{" b.go ", "a.go", " b.go", "  ", "c.go", "a.go "}
+	want := []string{"b.go", "a.go", "c.go"}
+	if got := uniqueStrings(in); !reflect.DeepEqual(got, want) {
+		t.Fatalf("uniqueStrings = %q, want %q", got, want)
+	}
+	if got := uniqueStrings(nil); len(got) != 0 {
+		t.Fatalf("uniqueStrings(nil) = %q, want empty", got)
+	}
+}
