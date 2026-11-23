@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -169,6 +170,119 @@ func TestGitWorktreeCommitPathOnlyStagesPathspec(t *testing.T) {
 	}
 	if got := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD")); got != local {
 		t.Fatalf("second CommitPath() created commit %s", got)
+	}
+}
+
+func TestGitWorktreeCommitPathRetryKeepsSingleCommit(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-RETRY"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cardDir := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cardDir, "T-RETRY.md"), []byte("card\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: create task T-RETRY"); err != nil {
+		t.Fatal(err)
+	}
+	head := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD"))
+
+	// A retry with no new diff must not create a second commit, but still pushes.
+	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: create task T-RETRY"); err != nil {
+		t.Fatalf("retry CommitPath() error = %v", err)
+	}
+	if got := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD")); got != head {
+		t.Fatalf("retry created a commit: HEAD %s -> %s", head, got)
+	}
+	if count := strings.TrimSpace(gitCmd(t, ws.Path, "rev-list", "--count", "--grep=beacon: create task T-RETRY", "HEAD")); count != "1" {
+		t.Fatalf("card commits = %s, want 1", count)
+	}
+}
+
+func TestGitWorktreeRebaseBaseMakesStaleBasePushable(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	root := filepath.Dir(repo)
+	origin := filepath.Join(root, "origin.git")
+
+	// Advance origin/main from a second checkout, leaving the root repo behind.
+	other := filepath.Join(root, "other")
+	gitCmd(t, root, "clone", origin, other)
+	gitCmd(t, other, "config", "user.name", "Test User")
+	gitCmd(t, other, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(other, "remote.txt"), []byte("remote change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, other, "add", "remote.txt")
+	gitCmd(t, other, "commit", "-m", "remote change")
+	gitCmd(t, other, "push", "origin", "main")
+
+	// The card is written before the rebase, as in Create. Git tolerates the
+	// untracked card file since it does not overlap the rebased history.
+	cardDir := filepath.Join(repo, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cardDir, "T-REBASE.md"), []byte("card\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rootWS := core.Workspace{Path: repo, Branch: "main"}
+	if err := wt.RebaseBase(ctx, rootWS, "main"); err != nil {
+		t.Fatalf("RebaseBase() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "remote.txt")); err != nil {
+		t.Fatalf("remote change missing after rebase: %v", err)
+	}
+	if err := wt.CommitPath(ctx, rootWS, "docs/tasks", "beacon: create task T-REBASE"); err != nil {
+		t.Fatalf("CommitPath() error = %v", err)
+	}
+
+	log := gitCmd(t, origin, "log", "--oneline", "-2", "main")
+	if !strings.Contains(log, "create task T-REBASE") || !strings.Contains(log, "remote change") {
+		t.Fatalf("origin/main missing rebased card:\n%s", log)
+	}
+}
+
+func TestGitWorktreeCommitPathReportsNonFastForward(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+	root := filepath.Dir(repo)
+	origin := filepath.Join(root, "origin.git")
+	ws, err := wt.Create(ctx, core.Task{ID: "T-REJECT"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a divergent remote branch from a second checkout.
+	other := filepath.Join(root, "other-reject")
+	gitCmd(t, root, "clone", origin, other)
+	gitCmd(t, other, "config", "user.name", "Test User")
+	gitCmd(t, other, "config", "user.email", "test@example.com")
+	gitCmd(t, other, "checkout", "-b", ws.Branch, "origin/main")
+	if err := os.WriteFile(filepath.Join(other, "divergent.txt"), []byte("other\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, other, "add", "divergent.txt")
+	gitCmd(t, other, "commit", "-m", "divergent change")
+	gitCmd(t, other, "push", "origin", ws.Branch)
+
+	cardDir := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cardDir, "T-REJECT.md"), []byte("card\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err = wt.CommitPath(ctx, ws, "docs/tasks", "beacon: create task T-REJECT")
+	var nff *app.NonFastForwardError
+	if !errors.As(err, &nff) {
+		t.Fatalf("CommitPath() error = %T %v, want *app.NonFastForwardError", err, err)
 	}
 }
 

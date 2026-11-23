@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
@@ -123,8 +124,44 @@ func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error
 	return g.status(ctx, ws.Path)
 }
 
-// CommitPath commits only the given pathspec in the worker worktree and pushes
-// the branch. Agent code is never staged.
+// RebaseBase fetches origin/<base> and rebases the workspace's local branch on
+// it. Publishing a card calls this before committing so a stale local base does
+// not make the push fail as non-fast-forward. A failed rebase is aborted so the
+// workspace is not left mid-rebase on a retry.
+func (g *GitWorktree) RebaseBase(ctx context.Context, ws core.Workspace, base string) error {
+	if err := checkPath(ws.Path); err != nil {
+		return err
+	}
+	if base == "" {
+		base = g.Base
+	}
+	if base == "" {
+		base = "main"
+	}
+	if _, err := g.runInDir(ctx, ws.Path, "fetch", "origin", base); err != nil {
+		return err
+	}
+	if _, err := g.runInDir(ctx, ws.Path, "rebase", "origin/"+base); err != nil {
+		_, _ = g.runInDir(ctx, ws.Path, "rebase", "--abort")
+		return err
+	}
+	return nil
+}
+
+// isNonFastForward recognizes git's stable markers for a push rejected because
+// the remote ref advanced. Git reports "fetch first" when local is behind and
+// "non-fast-forward" when the refs have diverged.
+func isNonFastForward(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "non-fast-forward") ||
+		strings.Contains(msg, "fetch first") ||
+		strings.Contains(msg, "stale info")
+}
+
+// CommitPath commits only the given pathspec in the workspace and pushes the
+// branch. Agent code is never staged. The push runs even when the pathspec has
+// no diff, so a retry after a rejected push still publishes a commit that an
+// earlier attempt already made.
 func (g *GitWorktree) CommitPath(ctx context.Context, ws core.Workspace, pathspec, message string) error {
 	if err := checkPath(ws.Path); err != nil {
 		return err
@@ -133,16 +170,18 @@ func (g *GitWorktree) CommitPath(ctx context.Context, ws core.Workspace, pathspe
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(out) == "" {
-		return nil
-	}
-	if _, err := g.runInDir(ctx, ws.Path, "add", "--", pathspec); err != nil {
-		return err
-	}
-	if _, err := g.runInDir(ctx, ws.Path, "commit", "-m", message, "--", pathspec); err != nil {
-		return err
+	if strings.TrimSpace(out) != "" {
+		if _, err := g.runInDir(ctx, ws.Path, "add", "--", pathspec); err != nil {
+			return err
+		}
+		if _, err := g.runInDir(ctx, ws.Path, "commit", "-m", message, "--", pathspec); err != nil {
+			return err
+		}
 	}
 	_, err = g.runInDir(ctx, ws.Path, "push", "origin", ws.Branch)
+	if err != nil && isNonFastForward(err) {
+		return &app.NonFastForwardError{Err: err}
+	}
 	return err
 }
 
