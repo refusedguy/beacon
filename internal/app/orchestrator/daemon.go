@@ -25,6 +25,12 @@ import (
 // environment asks for a different value.
 const DaemonInterval = 3 * time.Minute
 
+// deliveredKeyRetention is the replay window for obligations of Watches that
+// are no longer active. It mirrors store.ObligationGCRetention (24h). The app
+// layer keeps its own duration so it does not import a storage package for one
+// constant.
+const deliveredKeyRetention = 24 * time.Hour
+
 // DaemonDueSchedule is one schedule row the daemon can trigger. The adapter
 // that implements DaemonSchedules maps a stored row onto these fields, so the
 // pass sees no spec string and no SQL handle.
@@ -93,6 +99,14 @@ type DaemonPorts struct {
 	Waker       Waker
 	Tracer      observe.Tracer
 	Log         func(format string, args ...any)
+}
+
+// DeliveredKeyPruner is an optional capability of a Waker. DaemonRun calls it
+// after the close step so a Waker that remembers delivered obligations can
+// forget keys of Watches that have been inactive for the replay window. A
+// Waker without this capability keeps its previous behaviour.
+type DeliveredKeyPruner interface {
+	PruneDeliveredKeys() int
 }
 
 // DaemonRun runs one pass immediately and then repeats every interval until
@@ -192,6 +206,13 @@ func DaemonRun(ctx context.Context, ports DaemonPorts, interval time.Duration, o
 			if err := ports.CloseMerged(passCtx); err != nil {
 				logf("daemon: close merged: %v", err)
 			}
+		}
+		// The close step is the pass's cleanup point. A Waker that keeps
+		// per-obligation keys can drop the ones whose Watch has not been seen
+		// for the replay window. The capability is optional, so other Waker
+		// implementations are untouched.
+		if pruner, ok := ports.Waker.(DeliveredKeyPruner); ok && pruner != nil {
+			pruner.PruneDeliveredKeys()
 		}
 	}
 
@@ -371,6 +392,18 @@ type daemonWaker struct {
 	deliveredKeys map[string]struct{}
 	inFlight      map[string]struct{}
 
+	// deliveredAt holds the admission time of each obligation key. watchKeys
+	// groups keys by Watch and watchLastSeen is refreshed on every Wake for a
+	// Watch. A Watch unseen for deliveredKeyRetention is treated as closed,
+	// which lets PruneDeliveredKeys forget its keys without touching a live
+	// Watch's repeat suppression.
+	deliveredAt   map[string]time.Time
+	watchKeys     map[string]map[string]struct{}
+	watchLastSeen map[string]time.Time
+
+	// clock makes the 24h window testable without sleeping.
+	clock func() time.Time
+
 	// dedup is the wake-identity ledger shared with the CI bridge. It stops
 	// the bridge and the daemon from admitting the same obligation twice in
 	// one process. A nil ledger disables the cross-supplier guard in tests
@@ -445,6 +478,10 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if w == nil || w.lookup == nil || (w.backend == nil && w.route == nil) {
 		return errors.New("daemon: waker is not configured")
 	}
+	now := time.Now()
+	if w.clock != nil {
+		now = w.clock()
+	}
 	watch, err := w.lookup(watchID)
 	if err != nil {
 		return fmt.Errorf("daemon: watch %s: %w", watchID, err)
@@ -498,6 +535,19 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	if w.inFlight == nil {
 		w.inFlight = make(map[string]struct{})
 	}
+	if w.deliveredAt == nil {
+		w.deliveredAt = make(map[string]time.Time)
+	}
+	if w.watchKeys == nil {
+		w.watchKeys = make(map[string]map[string]struct{})
+	}
+	if w.watchLastSeen == nil {
+		w.watchLastSeen = make(map[string]time.Time)
+	}
+	// A repeat on the same obligation still proves the Watch is live. Refresh
+	// before the dedup checks so a suppressed pass keeps the Watch in the live
+	// set and its keys stay out of the pruner's reach.
+	w.watchLastSeen[watchID] = now
 	if daemonWakeAlreadyExists(w, pointer.ObligationID) {
 		w.mu.Unlock()
 		return nil
@@ -535,12 +585,62 @@ func (w *daemonWaker) Wake(ctx context.Context, watchID string, revision uint64,
 	delete(w.inFlight, pointer.ObligationID)
 	if record {
 		w.deliveredKeys[pointer.ObligationID] = struct{}{}
+		w.deliveredAt[pointer.ObligationID] = now
+		keys := w.watchKeys[watchID]
+		if keys == nil {
+			keys = make(map[string]struct{})
+			w.watchKeys[watchID] = keys
+		}
+		keys[pointer.ObligationID] = struct{}{}
 		if w.dedup != nil {
 			w.dedup.Claim(pointer.ObligationID)
 		}
 	}
 	w.mu.Unlock()
 	return deliverErr
+}
+
+// PruneDeliveredKeys forgets obligation keys of Watches that have not been
+// seen for the replay window. A key is dropped only when both its Watch is
+// inactive and the key itself is older than deliveredKeyRetention, so a live
+// Watch keeps repeat suppression on its current revision. The operation is
+// idempotent: a second call with the same clock removes nothing.
+func (w *daemonWaker) PruneDeliveredKeys() int {
+	if w == nil {
+		return 0
+	}
+	now := time.Now()
+	if w.clock != nil {
+		now = w.clock()
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.deliveredKeys == nil || w.watchLastSeen == nil {
+		return 0
+	}
+	removed := 0
+	for watchID, lastSeen := range w.watchLastSeen {
+		if now.Sub(lastSeen) < deliveredKeyRetention {
+			continue
+		}
+		keys := w.watchKeys[watchID]
+		for key := range keys {
+			if at, ok := w.deliveredAt[key]; ok && now.Sub(at) < deliveredKeyRetention {
+				continue
+			}
+			if _, ok := w.deliveredKeys[key]; ok {
+				delete(w.deliveredKeys, key)
+				removed++
+			}
+			delete(w.deliveredAt, key)
+			delete(keys, key)
+		}
+		if len(keys) == 0 {
+			delete(w.watchKeys, watchID)
+			delete(w.watchLastSeen, watchID)
+		}
+	}
+	return removed
 }
 
 // ---------------------------------------------------------------------------
