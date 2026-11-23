@@ -187,14 +187,10 @@ type activitySource interface {
 	WatchObligations(watchID string) ([]domain.Obligation, error)
 }
 
-// blockerControl is the control-plane subset of the store adapter. It is a
-// domain-shaped port declared here so cibridge does not import internal/infra/store.
-// A store that does not implement it still gets the legacy fixFor unblock path.
-type blockerControl interface {
-	GetOrCreateOpenBlocker(repo, baseRef string, failedChecks []string, watchID string, now time.Time) (domain.BlockerIncident, bool, error)
-	ResolveBlocker(blockerID string, now time.Time) ([]domain.Watch, error)
-	ResolveBlockersByBaseGreen(repo, baseRef string, baseFailed map[string]bool, now time.Time) ([]domain.BlockerIncident, error)
-	ActiveBlockers() ([]domain.BlockerIncident, error)
+// DeliveryMarker persists one wake delivery on the obligation itself. Only the
+// wake dispatcher writes it; incident lifecycle methods do not need this port.
+// A store that does not implement it keeps the SaveObligation fallback.
+type DeliveryMarker interface {
 	MarkObligationDelivered(id string, at time.Time, attempt int, lastErr string) error
 }
 
@@ -334,7 +330,8 @@ type Bridge struct {
 	ci             domain.CIProvider
 	batch          domain.BatchCIProvider
 	merger         domain.Merger
-	control        blockerControl
+	control        domain.BlockerIncidents
+	delivery       DeliveryMarker
 	cardLinks      CardLinks
 	gc             WorktreeGC
 	clock          domain.Clock
@@ -879,10 +876,9 @@ func (b *Bridge) blockRebaseExhausted(ctx context.Context, w domain.Watch, now t
 	return 1
 }
 
-// WithBlockerControl binds the control-plane port. Wave 3 wires the real
-// store; until then a store that implements the methods directly is detected
-// by type assertion in New.
-func (b *Bridge) WithBlockerControl(c blockerControl) *Bridge {
+// WithBlockerIncidents binds the incident lifecycle port. New also detects a
+// store that implements it directly, so callers may omit this setter.
+func (b *Bridge) WithBlockerIncidents(c domain.BlockerIncidents) *Bridge {
 	if b == nil {
 		return nil
 	}
@@ -947,8 +943,11 @@ func New(store stateStore, ci domain.CIProvider, clock domain.Clock, interval ti
 	if m, ok := ci.(domain.Merger); ok {
 		b.merger = m
 	}
-	if c, ok := store.(blockerControl); ok {
+	if c, ok := store.(domain.BlockerIncidents); ok {
 		b.control = c
+	}
+	if m, ok := store.(DeliveryMarker); ok {
+		b.delivery = m
 	}
 	if c, ok := store.(CardLinks); ok {
 		b.cardLinks = wrapCardLinks(c)

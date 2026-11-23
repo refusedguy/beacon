@@ -317,7 +317,8 @@ type WatchPRHandler struct {
 	ci        domain.CIProvider
 	clock     domain.Clock
 	fanout    *domain.Fanout
-	blockers  BlockerControl
+	blockers  domain.BlockerIncidents
+	fixer     domain.FixerBinding
 	registrar WatchPRRegistrar
 
 	// projectRoot and defaultsLoader carry the layered config into a Watch.
@@ -356,11 +357,19 @@ func (h *WatchPRHandler) watchDefaults() WatchDefaults {
 	return h.defaultsLoader(h.projectRoot)
 }
 
-// SetBlockerControl injects the durable blocker port. A nil argument keeps the
-// handler's local-only behaviour, which is how unit tests run without SQLite.
-func (h *WatchPRHandler) SetBlockerControl(b BlockerControl) {
+// SetBlockerIncidents injects the durable incident port. A nil argument keeps
+// the handler's local-only behaviour, which is how unit tests run without SQLite.
+func (h *WatchPRHandler) SetBlockerIncidents(b domain.BlockerIncidents) {
 	if h != nil {
 		h.blockers = b
+	}
+}
+
+// SetFixerBinding injects the port that binds a fixer Watch to an incident.
+// A nil argument keeps the local-only behaviour of a Watch without a binding.
+func (h *WatchPRHandler) SetFixerBinding(b domain.FixerBinding) {
+	if h != nil {
+		h.fixer = b
 	}
 }
 
@@ -591,8 +600,8 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	// Binding a fixer to its incident and spending one fix attempt happens
 	// here and only here. A renewal keeps the attempt count: re-registering the
 	// same agent must not drain the fixer budget or fake a new repair.
-	if in.Role == domain.RoleFixer && blockerID != "" && h.blockers != nil && !sub.Renewed {
-		incident, err := h.blockers.AssignFixer(blockerID, sub.Watch.ID)
+	if in.Role == domain.RoleFixer && blockerID != "" && h.fixer != nil && !sub.Renewed {
+		incident, err := h.fixer.AssignFixer(blockerID, sub.Watch.ID)
 		if err != nil {
 			observe.ActorError("watch_pr-assign-fixer", sub.Watch.ID, err)
 			return WatchPROutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
@@ -893,7 +902,8 @@ func AttachWatchPRWithConfig(server *mcpsdk.Server, deps Dependencies, projectRo
 		return
 	}
 	handler := NewWatchPRHandler(deps.Store, deps.CI, deps.Clock)
-	handler.SetBlockerControl(deps.Blockers)
+	handler.SetBlockerIncidents(deps.Blockers)
+	handler.SetFixerBinding(deps.FixerBinding)
 	if registrar, ok := deps.Store.(WatchPRRegistrar); ok {
 		handler.SetRegistry(registrar)
 	}
