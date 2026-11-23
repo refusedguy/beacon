@@ -21,7 +21,10 @@ const LinkageEmpty = taskstore.LinkageEmpty
 
 func Validationf(format string, a ...any) error { return taskstore.Validationf(format, a...) }
 func Startupf(format string, a ...any) error    { return taskstore.Startupf(format, a...) }
-func Code(err error) int                        { return taskstore.Code(err) }
+func StartupfWithCause(cause error, format string, a ...any) error {
+	return taskstore.StartupfWithCause(cause, format, a...)
+}
+func Code(err error) int { return taskstore.Code(err) }
 
 func LoadCards(tasksDir string) ([]Card, error) { return taskstore.LoadCards(tasksDir) }
 func PathsConflict(a, b string) bool            { return taskstore.PathsConflict(a, b) }

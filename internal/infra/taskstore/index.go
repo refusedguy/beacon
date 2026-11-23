@@ -88,20 +88,20 @@ func OpenIndex(path string) (*Index, error) {
 		return nil, Validationf("путь индекса не задан")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return nil, Startupf("не создан каталог индекса: %v", err)
+		return nil, StartupfWithCause(err, "не создан каталог индекса: %v", err)
 	}
 	db, err := sql.Open(indexDriver, indexDSN(path))
 	if err != nil {
-		return nil, Startupf("не открыт индекс %s: %v", path, err)
+		return nil, StartupfWithCause(err, "не открыт индекс %s: %v", path, err)
 	}
 	db.SetMaxOpenConns(1)
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
-		return nil, Startupf("не доступен индекс %s: %v", path, err)
+		return nil, StartupfWithCause(err, "не доступен индекс %s: %v", path, err)
 	}
 	if _, err := db.Exec(indexSchemaSQL); err != nil {
 		_ = db.Close()
-		return nil, Startupf("не создана схема индекса %s: %v", path, err)
+		return nil, StartupfWithCause(err, "не создана схема индекса %s: %v", path, err)
 	}
 	return &Index{db: db}, nil
 }
@@ -132,13 +132,13 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 
 	tx, err := idx.db.Begin()
 	if err != nil {
-		return ImportStats{}, Startupf("не начата сборка индекса: %v", err)
+		return ImportStats{}, StartupfWithCause(err, "не начата сборка индекса: %v", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	for _, stmt := range []string{`DELETE FROM deps`, `DELETE FROM owners`, `DELETE FROM cards`} {
 		if _, err := tx.Exec(stmt); err != nil {
-			return ImportStats{}, Startupf("не очищена таблица индекса: %v", err)
+			return ImportStats{}, StartupfWithCause(err, "не очищена таблица индекса: %v", err)
 		}
 	}
 
@@ -148,19 +148,19 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 		   context, steps, check_text, acceptance, path, grp, number, raw_sha256)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
-		return ImportStats{}, Startupf("не подготовлена вставка карточек: %v", err)
+		return ImportStats{}, StartupfWithCause(err, "не подготовлена вставка карточек: %v", err)
 	}
 	defer cardStmt.Close()
 
 	depStmt, err := tx.Prepare(`INSERT INTO deps (card_id, dep) VALUES (?, ?)`)
 	if err != nil {
-		return ImportStats{}, Startupf("не подготовлена вставка зависимостей: %v", err)
+		return ImportStats{}, StartupfWithCause(err, "не подготовлена вставка зависимостей: %v", err)
 	}
 	defer depStmt.Close()
 
 	ownerStmt, err := tx.Prepare(`INSERT INTO owners (card_id, owner) VALUES (?, ?)`)
 	if err != nil {
-		return ImportStats{}, Startupf("не подготовлена вставка владельцев: %v", err)
+		return ImportStats{}, StartupfWithCause(err, "не подготовлена вставка владельцев: %v", err)
 	}
 	defer ownerStmt.Close()
 
@@ -174,26 +174,26 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 		if _, err := cardStmt.Exec(id, c.Type, c.Status, c.Phase, c.Reference,
 			c.Agent, c.Time, c.Title, c.Goal, c.Context, c.Steps, c.Check,
 			c.Acceptance, c.Path, c.Group, c.Number, sum); err != nil {
-			return ImportStats{}, Startupf("не вставлена карточка %s: %v", id, err)
+			return ImportStats{}, StartupfWithCause(err, "не вставлена карточка %s: %v", id, err)
 		}
 		stats.Cards++
 
 		for _, dep := range uniqueStrings(c.Dependencies) {
 			if _, err := depStmt.Exec(id, dep); err != nil {
-				return ImportStats{}, Startupf("не вставлена зависимость карточки %s: %v", id, err)
+				return ImportStats{}, StartupfWithCause(err, "не вставлена зависимость карточки %s: %v", id, err)
 			}
 			stats.Deps++
 		}
 		for _, owner := range uniqueStrings(c.OwnerFiles) {
 			if _, err := ownerStmt.Exec(id, owner); err != nil {
-				return ImportStats{}, Startupf("не вставлен владелец карточки %s: %v", id, err)
+				return ImportStats{}, StartupfWithCause(err, "не вставлен владелец карточки %s: %v", id, err)
 			}
 			stats.Owners++
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return ImportStats{}, Startupf("не зафиксирована сборка индекса: %v", err)
+		return ImportStats{}, StartupfWithCause(err, "не зафиксирована сборка индекса: %v", err)
 	}
 	return stats, nil
 }
@@ -212,7 +212,7 @@ func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 	}
 	entries, err := os.ReadDir(tasksDir)
 	if err != nil {
-		return ImportStats{}, Startupf("каталог карточек %s недоступен: %v", tasksDir, err)
+		return ImportStats{}, StartupfWithCause(err, "каталог карточек %s недоступен: %v", tasksDir, err)
 	}
 
 	stored, err := idx.cardHashes()
@@ -229,7 +229,7 @@ func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 		filePath := filepath.Join(tasksDir, e.Name())
 		data, err := fileAdapter.ReadFile(filePath)
 		if err != nil {
-			return ImportStats{}, Startupf("не прочитана карточка %s: %v", e.Name(), err)
+			return ImportStats{}, StartupfWithCause(err, "не прочитана карточка %s: %v", e.Name(), err)
 		}
 		sum := sha256sum(string(data))
 		id := cardIDFromName(e.Name())
@@ -286,7 +286,7 @@ func (idx *Index) Counts() (ImportStats, error) {
 		{`SELECT count(*) FROM owners`, &stats.Owners},
 	} {
 		if err := idx.db.QueryRow(q.query).Scan(q.target); err != nil {
-			return ImportStats{}, Startupf("не прочитан счётчик индекса: %v", err)
+			return ImportStats{}, StartupfWithCause(err, "не прочитан счётчик индекса: %v", err)
 		}
 	}
 	return stats, nil
@@ -345,7 +345,7 @@ func cardSetHash(hashes map[string]string) string {
 func dirCardHashes(tasksDir string) (map[string]string, error) {
 	entries, err := os.ReadDir(tasksDir)
 	if err != nil {
-		return nil, Startupf("каталог карточек %s недоступен: %v", tasksDir, err)
+		return nil, StartupfWithCause(err, "каталог карточек %s недоступен: %v", tasksDir, err)
 	}
 	out := make(map[string]string, len(entries))
 	for _, e := range entries {
@@ -354,7 +354,7 @@ func dirCardHashes(tasksDir string) (map[string]string, error) {
 		}
 		data, err := fileAdapter.ReadFile(filepath.Join(tasksDir, e.Name()))
 		if err != nil {
-			return nil, Startupf("не прочитана карточка %s: %v", e.Name(), err)
+			return nil, StartupfWithCause(err, "не прочитана карточка %s: %v", e.Name(), err)
 		}
 		id := cardIDFromName(e.Name())
 		if id == "" {
@@ -394,19 +394,19 @@ func cardIDFromName(name string) string {
 func (idx *Index) cardHashes() (map[string]string, error) {
 	rows, err := idx.db.Query(`SELECT id, raw_sha256 FROM cards`)
 	if err != nil {
-		return nil, Startupf("не прочитаны хеши индекса: %v", err)
+		return nil, StartupfWithCause(err, "не прочитаны хеши индекса: %v", err)
 	}
 	defer rows.Close()
 	out := make(map[string]string)
 	for rows.Next() {
 		var id, sum string
 		if err := rows.Scan(&id, &sum); err != nil {
-			return nil, Startupf("не прочитан хеш индекса: %v", err)
+			return nil, StartupfWithCause(err, "не прочитан хеш индекса: %v", err)
 		}
 		out[id] = sum
 	}
 	if err := rows.Err(); err != nil {
-		return nil, Startupf("не дочитаны хеши индекса: %v", err)
+		return nil, StartupfWithCause(err, "не дочитаны хеши индекса: %v", err)
 	}
 	return out, nil
 }
@@ -428,35 +428,35 @@ func (idx *Index) replaceCards(changed []pendingCard, stale []string) error {
 
 	tx, err := idx.db.Begin()
 	if err != nil {
-		return Startupf("не начато обновление индекса: %v", err)
+		return StartupfWithCause(err, "не начато обновление индекса: %v", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	delDeps, err := tx.Prepare(`DELETE FROM deps WHERE card_id = ?`)
 	if err != nil {
-		return Startupf("не подготовлено удаление зависимостей: %v", err)
+		return StartupfWithCause(err, "не подготовлено удаление зависимостей: %v", err)
 	}
 	defer delDeps.Close()
 	delOwners, err := tx.Prepare(`DELETE FROM owners WHERE card_id = ?`)
 	if err != nil {
-		return Startupf("не подготовлено удаление владельцев: %v", err)
+		return StartupfWithCause(err, "не подготовлено удаление владельцев: %v", err)
 	}
 	defer delOwners.Close()
 	delCard, err := tx.Prepare(`DELETE FROM cards WHERE id = ?`)
 	if err != nil {
-		return Startupf("не подготовлено удаление карточки: %v", err)
+		return StartupfWithCause(err, "не подготовлено удаление карточки: %v", err)
 	}
 	defer delCard.Close()
 
 	remove := func(id string) error {
 		if _, err := delDeps.Exec(id); err != nil {
-			return Startupf("не удалены зависимости карточки %s: %v", id, err)
+			return StartupfWithCause(err, "не удалены зависимости карточки %s: %v", id, err)
 		}
 		if _, err := delOwners.Exec(id); err != nil {
-			return Startupf("не удалены владельцы карточки %s: %v", id, err)
+			return StartupfWithCause(err, "не удалены владельцы карточки %s: %v", id, err)
 		}
 		if _, err := delCard.Exec(id); err != nil {
-			return Startupf("не удалена карточка %s: %v", id, err)
+			return StartupfWithCause(err, "не удалена карточка %s: %v", id, err)
 		}
 		return nil
 	}
@@ -472,17 +472,17 @@ func (idx *Index) replaceCards(changed []pendingCard, stale []string) error {
 		   context, steps, check_text, acceptance, path, grp, number, raw_sha256)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
-		return Startupf("не подготовлена вставка карточки: %v", err)
+		return StartupfWithCause(err, "не подготовлена вставка карточки: %v", err)
 	}
 	defer insCard.Close()
 	insDep, err := tx.Prepare(`INSERT INTO deps (card_id, dep) VALUES (?, ?)`)
 	if err != nil {
-		return Startupf("не подготовлена вставка зависимости: %v", err)
+		return StartupfWithCause(err, "не подготовлена вставка зависимости: %v", err)
 	}
 	defer insDep.Close()
 	insOwner, err := tx.Prepare(`INSERT INTO owners (card_id, owner) VALUES (?, ?)`)
 	if err != nil {
-		return Startupf("не подготовлена вставка владельца: %v", err)
+		return StartupfWithCause(err, "не подготовлена вставка владельца: %v", err)
 	}
 	defer insOwner.Close()
 
@@ -494,22 +494,22 @@ func (idx *Index) replaceCards(changed []pendingCard, stale []string) error {
 		if _, err := insCard.Exec(c.ID, c.Type, c.Status, c.Phase, c.Reference,
 			c.Agent, c.Time, c.Title, c.Goal, c.Context, c.Steps, c.Check,
 			c.Acceptance, c.Path, c.Group, c.Number, p.sum); err != nil {
-			return Startupf("не вставлена карточка %s: %v", c.ID, err)
+			return StartupfWithCause(err, "не вставлена карточка %s: %v", c.ID, err)
 		}
 		for _, dep := range uniqueStrings(c.Dependencies) {
 			if _, err := insDep.Exec(c.ID, dep); err != nil {
-				return Startupf("не вставлена зависимость карточки %s: %v", c.ID, err)
+				return StartupfWithCause(err, "не вставлена зависимость карточки %s: %v", c.ID, err)
 			}
 		}
 		for _, owner := range uniqueStrings(c.OwnerFiles) {
 			if _, err := insOwner.Exec(c.ID, owner); err != nil {
-				return Startupf("не вставлен владелец карточки %s: %v", c.ID, err)
+				return StartupfWithCause(err, "не вставлен владелец карточки %s: %v", c.ID, err)
 			}
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return Startupf("не зафиксировано обновление индекса: %v", err)
+		return StartupfWithCause(err, "не зафиксировано обновление индекса: %v", err)
 	}
 	return nil
 }

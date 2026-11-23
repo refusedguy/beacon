@@ -67,7 +67,7 @@ func CloseCard(lockPath, projectRoot, cardPath string, o CloseCardOptions) error
 
 	data, err := fileAdapter.ReadFile(cardPath)
 	if err != nil {
-		return Startupf("не прочитана карточка %s: %v", cardPath, err)
+		return StartupfWithCause(err, "не прочитана карточка %s: %v", cardPath, err)
 	}
 	if _, err := ParseCard(filepath.Base(cardPath), data); err != nil {
 		return err

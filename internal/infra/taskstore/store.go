@@ -34,11 +34,15 @@ const (
 
 // ExitError несёт код выхода и причину. Причина печатается в stderr.
 type ExitError struct {
-	Code int
-	Msg  string
+	Code  int
+	Msg   string
+	cause error
 }
 
 func (e *ExitError) Error() string { return e.Msg }
+
+// Unwrap возвращает сохранённую причину. Для ошибки без причины он равен nil.
+func (e *ExitError) Unwrap() error { return e.cause }
 
 // Validationf создаёт ошибку валидации, код 1.
 func Validationf(format string, a ...any) error {
@@ -48,6 +52,14 @@ func Validationf(format string, a ...any) error {
 // Startupf создаёт ошибку запуска, код 2.
 func Startupf(format string, a ...any) error {
 	return &ExitError{Code: ExitStartup, Msg: fmt.Sprintf(format, a...)}
+}
+
+// StartupfWithCause создаёт ошибку запуска, код 2, и сохраняет причину в cause.
+// Формат и аргументы передаются как в Startupf, поэтому Msg не меняется.
+// Причина попадает в cause отдельным аргументом, чтобы errors.Is и errors.As
+// видели исходную ошибку после выхода из адаптера.
+func StartupfWithCause(cause error, format string, a ...any) error {
+	return &ExitError{Code: ExitStartup, Msg: fmt.Sprintf(format, a...), cause: cause}
 }
 
 // Code возвращает код выхода для ошибки. Неожидаемая ошибка считается ошибкой запуска.
@@ -339,7 +351,7 @@ var fileAdapter FileAdapter
 func LoadCards(tasksDir string) ([]Card, error) {
 	entries, err := os.ReadDir(tasksDir)
 	if err != nil {
-		return nil, Startupf("каталог карточек %s недоступен: %v", tasksDir, err)
+		return nil, StartupfWithCause(err, "каталог карточек %s недоступен: %v", tasksDir, err)
 	}
 	cards := make([]Card, 0, len(entries))
 	for _, e := range entries {
@@ -349,7 +361,7 @@ func LoadCards(tasksDir string) ([]Card, error) {
 		filePath := filepath.Join(tasksDir, e.Name())
 		data, err := fileAdapter.ReadFile(filePath)
 		if err != nil {
-			return nil, Startupf("не прочитана карточка %s: %v", e.Name(), err)
+			return nil, StartupfWithCause(err, "не прочитана карточка %s: %v", e.Name(), err)
 		}
 		card, err := ParseCard(filePath, data)
 		if err != nil {
@@ -413,7 +425,7 @@ func StateDir() (string, error) {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "", Startupf("не найден домашний каталог: %v", err)
+		return "", StartupfWithCause(err, "не найден домашний каталог: %v", err)
 	}
 	return filepath.Join(home, ".local", "state", "beacon"), nil
 }
@@ -466,12 +478,12 @@ type Lock struct {
 // читал его без блокировки и мог удалить чужой замок. До 50 попыток по 100 мс.
 func AcquireLock(lockPath, projectRoot string) (*Lock, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
-		return nil, Startupf("не создан каталог состояния: %v", err)
+		return nil, StartupfWithCause(err, "не создан каталог состояния: %v", err)
 	}
 	for attempt := 0; attempt < 50; attempt++ {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
-			return nil, Startupf("не открыт замок %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не открыт замок %s: %v", lockPath, err)
 		}
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			_ = f.Close()
@@ -479,7 +491,7 @@ func AcquireLock(lockPath, projectRoot string) (*Lock, error) {
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
-			return nil, Startupf("не взят замок %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не взят замок %s: %v", lockPath, err)
 		}
 		// Проверка: пока мы ждали блокировку, файл могли удалить и создать
 		// заново. Убеждаемся, что держим замок на текущем файле пути, иначе
@@ -488,7 +500,7 @@ func AcquireLock(lockPath, projectRoot string) (*Lock, error) {
 		if err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не прочитан файл замка %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не прочитан файл замка %s: %v", lockPath, err)
 		}
 		current, err := os.Stat(lockPath)
 		if err != nil || !os.SameFile(locked, current) {
@@ -503,17 +515,17 @@ func AcquireLock(lockPath, projectRoot string) (*Lock, error) {
 		if err := f.Truncate(0); err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не очищен файл замка %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не очищен файл замка %s: %v", lockPath, err)
 		}
 		if _, err := f.WriteAt([]byte(content), 0); err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не записан файл замка: %v", err)
+			return nil, StartupfWithCause(err, "не записан файл замка: %v", err)
 		}
 		if err := f.Sync(); err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не синхронизирован файл замка: %v", err)
+			return nil, StartupfWithCause(err, "не синхронизирован файл замка: %v", err)
 		}
 		return &Lock{Path: lockPath, f: f}, nil
 	}
@@ -559,11 +571,11 @@ func ReadCounter(counterPath string) (map[string]int, error) {
 		return make(map[string]int), nil
 	}
 	if err != nil {
-		return nil, Startupf("не прочитан счётчик %s: %v", counterPath, err)
+		return nil, StartupfWithCause(err, "не прочитан счётчик %s: %v", counterPath, err)
 	}
 	var c counterFile
 	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, Startupf("счётчик %s повреждён: %v", counterPath, err)
+		return nil, StartupfWithCause(err, "счётчик %s повреждён: %v", counterPath, err)
 	}
 	if c.Groups == nil {
 		c.Groups = make(map[string]int)
@@ -577,10 +589,10 @@ func ReadCounter(counterPath string) (map[string]int, error) {
 func WriteCounter(counterPath string, groups map[string]int) error {
 	data, err := json.Marshal(counterFile{Groups: groups})
 	if err != nil {
-		return Startupf("не собран счётчик: %v", err)
+		return StartupfWithCause(err, "не собран счётчик: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(counterPath), 0700); err != nil {
-		return Startupf("не создан каталог состояния: %v", err)
+		return StartupfWithCause(err, "не создан каталог состояния: %v", err)
 	}
 	return AtomicWrite(counterPath, data, 0600)
 }
@@ -757,7 +769,7 @@ func scanCollisionRoot(root string, readFile func(string) ([]byte, error)) colli
 		return res
 	}
 	if err != nil {
-		res.err = Startupf("не прочитан каталог карточек %s: %v", tasksDir, err)
+		res.err = StartupfWithCause(err, "не прочитан каталог карточек %s: %v", tasksDir, err)
 		return res
 	}
 	res.exists = true
@@ -771,7 +783,7 @@ func scanCollisionRoot(root string, readFile func(string) ([]byte, error)) colli
 		}
 		data, err := readFile(filepath.Join(tasksDir, entry.Name()))
 		if err != nil {
-			res.err = Startupf("не прочитана карточка %s: %v", entry.Name(), err)
+			res.err = StartupfWithCause(err, "не прочитана карточка %s: %v", entry.Name(), err)
 			return res
 		}
 		sum := sha256.Sum256(data)
@@ -1007,7 +1019,7 @@ func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) 
 			continue
 		}
 		if err != nil {
-			return report, Startupf("не прочитан каталог карточек %s: %v", tasksDir, err)
+			return report, StartupfWithCause(err, "не прочитан каталог карточек %s: %v", tasksDir, err)
 		}
 		for _, entry := range entries {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
@@ -1016,7 +1028,7 @@ func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) 
 			filePath := filepath.Join(tasksDir, entry.Name())
 			data, err := os.ReadFile(filePath)
 			if err != nil {
-				return report, Startupf("не прочитана карточка %s: %v", filePath, err)
+				return report, StartupfWithCause(err, "не прочитана карточка %s: %v", filePath, err)
 			}
 			card, err := ParseCard(filePath, data)
 			if err != nil {
@@ -1129,7 +1141,7 @@ func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) 
 				return report, err
 			}
 			if err := os.Remove(loc.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return report, Startupf("не удалён старый файл %s: %v", loc.path, err)
+				return report, StartupfWithCause(err, "не удалён старый файл %s: %v", loc.path, err)
 			}
 		}
 	}
@@ -1146,7 +1158,7 @@ func CreateExclusive(filePath string, data []byte) error {
 		return Validationf("ID занят: файл %s уже существует", filepath.Base(filePath))
 	}
 	if err != nil {
-		return Startupf("не создан файл %s: %v", filePath, err)
+		return StartupfWithCause(err, "не создан файл %s: %v", filePath, err)
 	}
 	_, werr := f.Write(data)
 	if werr == nil {
@@ -1155,7 +1167,7 @@ func CreateExclusive(filePath string, data []byte) error {
 	_ = f.Close()
 	if werr != nil {
 		_ = os.Remove(filePath)
-		return Startupf("не записан файл %s: %v", filePath, err)
+		return StartupfWithCause(err, "не записан файл %s: %v", filePath, err)
 	}
 	return SyncDir(filepath.Dir(filePath))
 }
@@ -1174,7 +1186,7 @@ func atomicWrite(filePath string, data []byte, perm os.FileMode, beforePublish f
 	dir := filepath.Dir(filePath)
 	f, err := os.CreateTemp(dir, ".beacon-tmp-")
 	if err != nil {
-		return Startupf("не создан временный файл в %s: %v", dir, err)
+		return StartupfWithCause(err, "не создан временный файл в %s: %v", dir, err)
 	}
 	tmp := f.Name()
 	ok := false
@@ -1185,25 +1197,25 @@ func atomicWrite(filePath string, data []byte, perm os.FileMode, beforePublish f
 	}()
 	if _, err = f.Write(data); err != nil {
 		_ = f.Close()
-		return Startupf("не записан временный файл: %v", err)
+		return StartupfWithCause(err, "не записан временный файл: %v", err)
 	}
 	if err = f.Sync(); err != nil {
 		_ = f.Close()
-		return Startupf("не синхронизирован временный файл: %v", err)
+		return StartupfWithCause(err, "не синхронизирован временный файл: %v", err)
 	}
 	if err = f.Close(); err != nil {
-		return Startupf("не закрыт временный файл: %v", err)
+		return StartupfWithCause(err, "не закрыт временный файл: %v", err)
 	}
 	if err = os.Chmod(tmp, perm); err != nil {
-		return Startupf("не заданы права временного файла: %v", err)
+		return StartupfWithCause(err, "не заданы права временного файла: %v", err)
 	}
 	if beforePublish != nil {
 		if err := beforePublish(); err != nil {
-			return Startupf("транзакция прервана: %v", err)
+			return StartupfWithCause(err, "транзакция прервана: %v", err)
 		}
 	}
 	if err = os.Rename(tmp, filePath); err != nil {
-		return Startupf("не заменён файл %s: %v", filePath, err)
+		return StartupfWithCause(err, "не заменён файл %s: %v", filePath, err)
 	}
 	ok = true
 	return SyncDir(dir)
@@ -1213,11 +1225,11 @@ func atomicWrite(filePath string, data []byte, perm os.FileMode, beforePublish f
 func SyncDir(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
-		return Startupf("не открыт каталог %s: %v", dir, err)
+		return StartupfWithCause(err, "не открыт каталог %s: %v", dir, err)
 	}
 	defer f.Close()
 	if err := f.Sync(); err != nil {
-		return Startupf("не синхронизирован каталог %s: %v", dir, err)
+		return StartupfWithCause(err, "не синхронизирован каталог %s: %v", dir, err)
 	}
 	return nil
 }
@@ -1301,7 +1313,7 @@ func ReadTaskEvents(path string) ([]TaskEvent, error) {
 		return []TaskEvent{}, nil
 	}
 	if err != nil {
-		return nil, Startupf("не прочитана карточка %s: %v", path, err)
+		return nil, StartupfWithCause(err, "не прочитана карточка %s: %v", path, err)
 	}
 	s := string(data)
 	i := strings.Index(s, eventBlockBegin)
@@ -1325,7 +1337,7 @@ func ReadTaskEvents(path string) ([]TaskEvent, error) {
 		}
 		var ev TaskEvent
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			return nil, Startupf("карточка %s: повреждено событие: %v", path, err)
+			return nil, StartupfWithCause(err, "карточка %s: повреждено событие: %v", path, err)
 		}
 		events = append(events, ev)
 	}
@@ -1339,7 +1351,7 @@ func encodeEventBlock(events []TaskEvent) ([]byte, error) {
 	for _, ev := range events {
 		line, err := json.Marshal(ev)
 		if err != nil {
-			return nil, Startupf("не собрано событие: %v", err)
+			return nil, StartupfWithCause(err, "не собрано событие: %v", err)
 		}
 		b.Write(line)
 		b.WriteByte('\n')
@@ -1709,10 +1721,10 @@ func SnapshotPath(tasksDir, id, level string) string {
 func writeSnapshotData(path string, snap CardSnapshot) error {
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return Startupf("не кодирован снапшот: %v", err)
+		return StartupfWithCause(err, "не кодирован снапшот: %v", err)
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return Startupf("не создан каталог снапшотов: %v", err)
+		return StartupfWithCause(err, "не создан каталог снапшотов: %v", err)
 	}
 	return atomicWrite(path, append(data, '\n'), 0600, nil)
 }
@@ -1722,11 +1734,11 @@ func ReadSnapshot(tasksDir, id, level string) (string, error) {
 	path := SnapshotPath(tasksDir, id, level)
 	data, err := fileAdapter.ReadFile(path)
 	if err != nil {
-		return "", Startupf("не прочитан снапшот %s: %v", path, err)
+		return "", StartupfWithCause(err, "не прочитан снапшот %s: %v", path, err)
 	}
 	var snap CardSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return "", Startupf("неверный снапшот %s: %v", path, err)
+		return "", StartupfWithCause(err, "неверный снапшот %s: %v", path, err)
 	}
 	if snap.Raw == "" {
 		return "", Validationf("пустой снапшот %s", path)
@@ -1745,7 +1757,7 @@ func CompactCard(lockPath, projectRoot, cardPath string, o CompactOptions) (Comp
 
 	data, err := fileAdapter.ReadFile(cardPath)
 	if err != nil {
-		return CompactResult{}, Startupf("не прочитана карточка %s: %v", cardPath, err)
+		return CompactResult{}, StartupfWithCause(err, "не прочитана карточка %s: %v", cardPath, err)
 	}
 	card, err := ParseCard(cardPath, data)
 	if err != nil {
@@ -1787,7 +1799,7 @@ func RestoreCard(lockPath, projectRoot, cardPath, level string) (string, error) 
 
 	data, err := fileAdapter.ReadFile(cardPath)
 	if err != nil {
-		return "", Startupf("не прочитана карточка %s: %v", cardPath, err)
+		return "", StartupfWithCause(err, "не прочитана карточка %s: %v", cardPath, err)
 	}
 	card, err := ParseCard(cardPath, data)
 	if err != nil {

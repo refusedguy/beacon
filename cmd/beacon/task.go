@@ -1197,7 +1197,7 @@ func runScheduleList(argv []string, stdout, stderr io.Writer, cfg taskcli.Config
 	if format == "json" {
 		b, err := json.MarshalIndent(items, "", "  ")
 		if err != nil {
-			return failTask(stderr, taskstore.Startupf("не собран JSON расписаний: %v", err))
+			return failTask(stderr, taskstore.StartupfWithCause(err, "не собран JSON расписаний: %v", err))
 		}
 		fmt.Fprintln(stdout, string(b))
 		return taskstore.ExitOK
@@ -1357,7 +1357,7 @@ func runCompactAnalyze(stdout, stderr io.Writer, cfg taskcli.Config, p *parsedAr
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].ID < candidates[j].ID })
 	b, err := json.MarshalIndent(candidates, "", "  ")
 	if err != nil {
-		return failTask(stderr, taskstore.Startupf("compact: не собран JSON кандидатов: %v", err))
+		return failTask(stderr, taskstore.StartupfWithCause(err, "compact: не собран JSON кандидатов: %v", err))
 	}
 	fmt.Fprintln(stdout, string(b))
 	return taskstore.ExitOK
@@ -1410,7 +1410,7 @@ func runCompactApply(stdout, stderr io.Writer, cfg taskcli.Config, p *parsedArgs
 	if summaryPath != "" {
 		data, err := compactReadFile(summaryPath)
 		if err != nil {
-			return failTask(stderr, taskstore.Startupf("compact: не прочитан файл саммари %s: %v", summaryPath, err))
+			return failTask(stderr, taskstore.StartupfWithCause(err, "compact: не прочитан файл саммари %s: %v", summaryPath, err))
 		}
 		summaryText = string(data)
 	}
@@ -1449,7 +1449,7 @@ func runCompactApply(stdout, stderr io.Writer, cfg taskcli.Config, p *parsedArgs
 		return failTask(stderr, err)
 	}
 	if err := compactWriteFile(target.Path, []byte(newText), 0644); err != nil {
-		return failTask(stderr, taskstore.Startupf("compact: не записана карточка %s: %v", target.Path, err))
+		return failTask(stderr, taskstore.StartupfWithCause(err, "compact: не записана карточка %s: %v", target.Path, err))
 	}
 	result := compactResult{
 		Mode: "apply", Applied: true, ID: id,
@@ -1459,7 +1459,7 @@ func runCompactApply(stdout, stderr io.Writer, cfg taskcli.Config, p *parsedArgs
 	}
 	b, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
-		return failTask(stderr, taskstore.Startupf("compact: не собран JSON результата: %v", err))
+		return failTask(stderr, taskstore.StartupfWithCause(err, "compact: не собран JSON результата: %v", err))
 	}
 	fmt.Fprintln(stdout, string(b))
 	return taskstore.ExitOK
@@ -1521,14 +1521,14 @@ func compactSaveSnapshot(cfg taskcli.Config, c taskstore.Card, now time.Time) (s
 	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return "", taskstore.Startupf("compact: не собран снапшот: %v", err)
+		return "", taskstore.StartupfWithCause(err, "compact: не собран снапшот: %v", err)
 	}
 	path := filepath.Join(cfg.StateDir, "compact-snapshots", c.ID+".json")
 	if err := compactMkdirAll(filepath.Dir(path), 0700); err != nil {
-		return "", taskstore.Startupf("compact: не создан каталог снапшотов: %v", err)
+		return "", taskstore.StartupfWithCause(err, "compact: не создан каталог снапшотов: %v", err)
 	}
 	if err := compactWriteFile(path, append(data, '\n'), 0600); err != nil {
-		return "", taskstore.Startupf("compact: не записан снапшот %s: %v", path, err)
+		return "", taskstore.StartupfWithCause(err, "compact: не записан снапшот %s: %v", path, err)
 	}
 	return path, nil
 }

@@ -319,12 +319,12 @@ func (l *flockLock) Release() error {
 // файле, проверка current inode и 50 попыток. Проверка конкуренции не слабеет.
 func acquireLockWithInterval(lockPath, root string, retry time.Duration) (cardLock, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
-		return nil, Startupf("не создан каталог состояния: %v", err)
+		return nil, StartupfWithCause(err, "не создан каталог состояния: %v", err)
 	}
 	for attempt := 0; attempt < 50; attempt++ {
 		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
-			return nil, Startupf("не открыт замок %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не открыт замок %s: %v", lockPath, err)
 		}
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 			_ = f.Close()
@@ -332,13 +332,13 @@ func acquireLockWithInterval(lockPath, root string, retry time.Duration) (cardLo
 				time.Sleep(retry)
 				continue
 			}
-			return nil, Startupf("не взят замок %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не взят замок %s: %v", lockPath, err)
 		}
 		locked, err := f.Stat()
 		if err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не прочитан файл замка %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не прочитан файл замка %s: %v", lockPath, err)
 		}
 		current, err := os.Stat(lockPath)
 		if err != nil || !os.SameFile(locked, current) {
@@ -351,17 +351,17 @@ func acquireLockWithInterval(lockPath, root string, retry time.Duration) (cardLo
 		if err := f.Truncate(0); err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не очищен файл замка %s: %v", lockPath, err)
+			return nil, StartupfWithCause(err, "не очищен файл замка %s: %v", lockPath, err)
 		}
 		if _, err := f.WriteAt([]byte(content), 0); err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не записан файл замка: %v", err)
+			return nil, StartupfWithCause(err, "не записан файл замка: %v", err)
 		}
 		if err := f.Sync(); err != nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 			_ = f.Close()
-			return nil, Startupf("не синхронизирован файл замка: %v", err)
+			return nil, StartupfWithCause(err, "не синхронизирован файл замка: %v", err)
 		}
 		return &flockLock{path: lockPath, f: f}, nil
 	}
@@ -478,7 +478,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		}
 		b, err := json.MarshalIndent(rows, "", "  ")
 		if err != nil {
-			return "", Startupf("не собран JSON: %v", err)
+			return "", StartupfWithCause(err, "не собран JSON: %v", err)
 		}
 		return string(b) + "\n" + warning, nil
 	}
@@ -491,7 +491,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 			strings.Join(c.OwnerFiles, ", "), c.Title)
 	}
 	if err := tw.Flush(); err != nil {
-		return "", Startupf("не собран вывод: %v", err)
+		return "", StartupfWithCause(err, "не собран вывод: %v", err)
 	}
 	return sb.String() + warning, nil
 }
@@ -866,14 +866,14 @@ func (s *Service) validateReference(ref, typ string, cards []Card) error {
 func (s *Service) adrAccepted(num string) (bool, error) {
 	matches, err := filepath.Glob(filepath.Join(s.Cfg.ADRDir, num+"-*.md"))
 	if err != nil {
-		return false, Startupf("не найден ADR %s: %v", num, err)
+		return false, StartupfWithCause(err, "не найден ADR %s: %v", num, err)
 	}
 	if len(matches) == 0 {
 		return false, nil
 	}
 	data, err := os.ReadFile(matches[0])
 	if err != nil {
-		return false, Startupf("не прочитан ADR %s: %v", num, err)
+		return false, StartupfWithCause(err, "не прочитан ADR %s: %v", num, err)
 	}
 	m := adrStatRE.FindStringSubmatch(string(data))
 	if m == nil {
@@ -3097,7 +3097,7 @@ func (s *Service) RequestFixChecks(r FixChecksRequest) (FixChecksResult, error) 
 		if os.IsNotExist(err) {
 			return FixChecksResult{}, Validationf("worktree %s не существует", worktree)
 		}
-		return FixChecksResult{}, Startupf("не прочитан worktree %s: %v", worktree, err)
+		return FixChecksResult{}, StartupfWithCause(err, "не прочитан worktree %s: %v", worktree, err)
 	}
 	if !info.IsDir() {
 		return FixChecksResult{}, Validationf("worktree %s не является каталогом", worktree)
