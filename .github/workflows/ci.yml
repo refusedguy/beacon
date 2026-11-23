@@ -13,7 +13,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  verify:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Root module
+        run: go build ./...
+
+      - name: OpenCode harness module
+        working-directory: harnesses/opencode
+        run: go build ./...
+
+      - name: TUI module
+        working-directory: ui/tui
+        run: |
+          go build ./...
+          rm -f tui
+
+  vet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Root module
+        run: go vet ./...
+
+      - name: OpenCode harness module
+        working-directory: harnesses/opencode
+        run: go vet ./...
+
+      - name: TUI module
+        working-directory: ui/tui
+        run: go vet ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Root module
+        run: go test ./...
+
+      - name: OpenCode harness module
+        working-directory: harnesses/opencode
+        run: go test ./...
+
+      - name: TUI module
+        working-directory: ui/tui
+        run: go test ./...
+
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,23 +91,20 @@ jobs:
       - name: Format check
         run: test -z "$(gofmt -l cmd internal pkg harnesses ui arch_test.go)"
 
-      - name: Core checks
-        run: |
-          go test ./...
-          go vet ./...
-          go build ./...
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.15
 
-      - name: OpenCode harness module
-        working-directory: harnesses/opencode
-        run: |
-          go test ./...
-          go vet ./...
-          go build ./...
+  advisory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: TUI module
-        working-directory: ui/tui
-        run: |
-          go test ./...
-          go vet ./...
-          go build ./...
-          rm -f tui
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Production file size advisory
+        run: bash scripts/ci-advisory.sh

@@ -1,49 +1,79 @@
 version: "2"
 
 linters:
+  default: none
   enable:
     - errcheck
     - govet
     - depguard
+    - funlen
 
-settings:
-  depguard:
+  settings:
+    govet:
+      # The inline analyzer reports false positives on generic calls with the
+      # current toolchain. It is a compiler hint, not a correctness check.
+      disable:
+        - inline
+    depguard:
+      rules:
+        core:
+          files:
+            - "pkg/core/**"
+          allow:
+            - "$gostd"
+          deny:
+            - pkg: "github.com/refusedguy/beacon"
+              desc: "pkg/core must import only the standard library"
+        app:
+          files:
+            - "internal/app/**"
+          allow:
+            - "$gostd"
+            - "github.com/refusedguy/beacon/pkg/core"
+            - "github.com/refusedguy/beacon/internal/app"
+          deny:
+            - pkg: "github.com/refusedguy/beacon/internal/infra"
+              desc: "internal/app must not import infrastructure"
+            - pkg: "github.com/refusedguy/beacon/cmd"
+              desc: "internal/app must not import the composition root"
+        infra-siblings:
+          files:
+            - "internal/infra/**"
+          allow:
+            - "$gostd"
+            - "github.com/refusedguy/beacon/pkg/core"
+            - "github.com/refusedguy/beacon/internal/app"
+            - "github.com/refusedguy/beacon/internal/infra/shared"
+          deny:
+            - pkg: "github.com/refusedguy/beacon/internal/infra/(config|scm|tasksource|policy|harness|notify|sqlite|workspace|planner|mcp|webhook)"
+              desc: "infra adapters must not import sibling adapters"
+        external-modules:
+          files:
+            - "harnesses/**"
+            - "ui/**"
+          deny:
+            - pkg: "github.com/refusedguy/beacon/internal"
+              desc: "external modules must use pkg/core only"
+    funlen:
+      lines: 80
+      statements: 40
+      ignore-comments: true
+
+  exclusions:
+    # Restore the errcheck default exclusions that v1 applied to deferred Close calls.
+    presets:
+      - std-error-handling
     rules:
-      core:
-        files:
-          - "pkg/core/**"
-        allow:
-          - "$gostd"
-        deny:
-          - pkg: "github.com/refusedguy/beacon"
-            desc: "pkg/core must import only the standard library"
-      app:
-        files:
-          - "internal/app/**"
-        allow:
-          - "$gostd"
-          - "github.com/refusedguy/beacon/pkg/core"
-          - "github.com/refusedguy/beacon/internal/app"
-        deny:
-          - pkg: "github.com/refusedguy/beacon/internal/infra"
-            desc: "internal/app must not import infrastructure"
-          - pkg: "github.com/refusedguy/beacon/cmd"
-            desc: "internal/app must not import the composition root"
-      infra-siblings:
-        files:
-          - "internal/infra/**"
-        allow:
-          - "$gostd"
-          - "github.com/refusedguy/beacon/pkg/core"
-          - "github.com/refusedguy/beacon/internal/app"
-          - "github.com/refusedguy/beacon/internal/infra/shared"
-        deny:
-          - pkg: "github.com/refusedguy/beacon/internal/infra/(config|scm|tasksource|policy|harness|notify|sqlite|workspace|planner|mcp|webhook)"
-            desc: "infra adapters must not import sibling adapters"
-      external-modules:
-        files:
-          - "harnesses/**"
-          - "ui/**"
-        deny:
-          - pkg: "github.com/refusedguy/beacon/internal"
-            desc: "external modules must use pkg/core only"
+      - path: '(.+)_test\.go'
+        linters:
+          - funlen
+      # Existing long functions are grandfathered until they are decomposed.
+      - path: 'internal/app/(dispatcher|reconciler|taskcreate)\.go'
+        text: has too many statements
+        linters:
+          - funlen
+      # A deferred rollback error cannot be acted on at the call site.
+      - path: internal/infra/sqlite/tasks.go
+        text: tx.Rollback
+        linters:
+          - errcheck
