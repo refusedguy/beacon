@@ -83,6 +83,8 @@ type frontmatter struct {
 	Kind          string     `yaml:"kind"`
 	BaseBranch    string     `yaml:"base_branch"`
 	RequireReview string     `yaml:"require_review"`
+	WorkerAgent   string     `yaml:"worker_agent"`
+	WorkerPrompt  string     `yaml:"worker_prompt"`
 	Plan          []planSpec `yaml:"plan"`
 }
 
@@ -115,6 +117,8 @@ func parseCard(content, path string) (core.Task, bool) {
 		t.Kind = normalizeKind(fm.Kind)
 		t.BaseBranch = strings.TrimSpace(fm.BaseBranch)
 		t.RequireReview = normalizeReview(fm.RequireReview)
+		t.WorkerAgent = strings.TrimSpace(fm.WorkerAgent)
+		t.WorkerPrompt = strings.TrimSpace(fm.WorkerPrompt)
 		t.Plan = childSpecs(fm.Plan, dir)
 		for _, p := range fm.Scope {
 			t.Scope = append(t.Scope, scopeForPath(p, dir))

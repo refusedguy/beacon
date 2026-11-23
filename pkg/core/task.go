@@ -146,6 +146,8 @@ type Task struct {
 	Kind          TaskKind
 	BaseBranch    string
 	RequireReview ReviewMode
+	WorkerAgent   string
+	WorkerPrompt  string
 	Plan          []ChildSpec
 }
 

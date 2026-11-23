@@ -138,6 +138,13 @@ func redact(s string) string {
 	return s
 }
 
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
 func messageID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
@@ -265,14 +272,8 @@ func (h *Harness) runFor(session string) (core.RunID, bool) {
 
 func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Session, error) {
 	h.init()
-	parent := req.ParentSessionID
-	if parent == "" {
-		parent = h.ParentSessionID
-	}
-	title := req.Task.Title
-	if title == "" {
-		title = "Beacon " + string(req.RunID)
-	}
+	parent := firstNonEmpty(req.ParentSessionID, h.ParentSessionID)
+	title := firstNonEmpty(req.Task.Title, "Beacon "+string(req.RunID))
 	body := map[string]any{
 		"title":     title,
 		"directory": req.Workspace.Path,
@@ -281,8 +282,8 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 	if parent != "" {
 		body["parentID"] = parent
 	}
-	if h.Agent != "" {
-		body["agent"] = h.Agent
+	if agent := firstNonEmpty(strings.TrimSpace(req.Task.WorkerAgent), h.Agent); agent != "" {
+		body["agent"] = agent
 	}
 	if h.Model != "" {
 		body["model"] = h.Model

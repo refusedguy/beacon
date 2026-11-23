@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   priority INTEGER NOT NULL DEFAULT 0,
   scope_json TEXT NOT NULL DEFAULT '[]',
   source_ref TEXT NOT NULL DEFAULT '',
+  worker_agent TEXT NOT NULL DEFAULT '',
+  worker_prompt TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL
 );
 

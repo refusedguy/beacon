@@ -270,5 +270,16 @@ func spawnPrompt(t core.Task, id core.RunID, ws string) string {
 		fmt.Fprintf(&b, "BaseBranch: %s\nOpen the pull request against %s, not the default branch.\n", base, base)
 	}
 	b.WriteString("Implement the task, open a pull request, then call beacon_watch_pr with the run ID and PR number.\n")
+	appendWorkerPrompt(&b, t)
 	return b.String()
+}
+
+// appendWorkerPrompt adds a card's worker_prompt after the global instructions.
+// A task without an override keeps the stock prompt.
+func appendWorkerPrompt(b *strings.Builder, t core.Task) {
+	if override := strings.TrimSpace(t.WorkerPrompt); override != "" {
+		b.WriteString("\nWorker prompt from task card:\n")
+		b.WriteString(override)
+		b.WriteString("\n")
+	}
 }
