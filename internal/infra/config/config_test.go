@@ -3,6 +3,8 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -82,5 +84,40 @@ func TestLoadWebhookSecretEnv(t *testing.T) {
 	}
 	if c.Webhook.Secret != "from-env-123" {
 		t.Fatalf("secret = %q, want %q", c.Webhook.Secret, "from-env-123")
+	}
+}
+
+func TestLoadDefaultWorkerInstructions(t *testing.T) {
+	c, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness.WorkerInstructions != DefaultWorkerInstructions {
+		t.Fatalf("worker instructions = %q, want default %q", c.Harness.WorkerInstructions, DefaultWorkerInstructions)
+	}
+	if !strings.Contains(c.Harness.WorkerInstructions, "go test ./internal/app") ||
+		!strings.Contains(c.Harness.WorkerInstructions, "CI") {
+		t.Fatalf("default lacks weak-PC rule: %q", c.Harness.WorkerInstructions)
+	}
+}
+
+func TestLoadWorkerInstructionsOverride(t *testing.T) {
+	const custom = "Use targeted tests. Full builds run in CI."
+	c, err := Load(writeConfig(t, "harness:\n  worker_instructions: "+strconv.Quote(custom)+"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness.WorkerInstructions != custom {
+		t.Fatalf("worker instructions = %q, want %q", c.Harness.WorkerInstructions, custom)
+	}
+}
+
+func TestLoadEmptyWorkerInstructionsUsesDefault(t *testing.T) {
+	c, err := Load(writeConfig(t, "harness:\n  worker_instructions: \"\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Harness.WorkerInstructions != DefaultWorkerInstructions {
+		t.Fatalf("worker instructions = %q, want default", c.Harness.WorkerInstructions)
 	}
 }
