@@ -66,6 +66,7 @@ type Run struct {
 	PRNumber          int
 	HeadSHA           string
 	ObservedSHA       string
+	ObservedBaseSHA   string
 	SessionID         string
 	ParentSessionID   string
 	WorkspacePath     string
@@ -129,11 +130,21 @@ func (r *Run) Apply(e Event) error {
 	return nil
 }
 
-func (r *Run) ObserveSHA(sha string) bool {
-	if sha == "" || sha == r.ObservedSHA {
+// ObserveSHA records the PR head and, when supplied, the base SHA last seen for
+// the run. It reports whether either value changed.
+func (r *Run) ObserveSHA(sha string, base ...string) bool {
+	if sha == "" {
+		return false
+	}
+	baseSHA := r.ObservedBaseSHA
+	if len(base) > 0 {
+		baseSHA = base[0]
+	}
+	if sha == r.ObservedSHA && baseSHA == r.ObservedBaseSHA {
 		return false
 	}
 	r.ObservedSHA = sha
+	r.ObservedBaseSHA = baseSHA
 	r.UpdatedAt = time.Now().UTC()
 	return true
 }

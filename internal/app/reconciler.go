@@ -68,7 +68,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (core.MergeDecision,
 		if !r.AutoRebase {
 			return core.MergeDecision{Verdict: core.VerdictWait, Reason: "auto_rebase disabled"}, nil
 		}
-		if run.ObservedSHA == obs.HeadSHA {
+		if sameObservation(run, obs) {
 			return decision, nil
 		}
 		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
@@ -81,7 +81,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (core.MergeDecision,
 		}
 		return decision, r.rebase(ctx, run, obs)
 	case core.VerdictNeedsAgentFix:
-		if run.ObservedSHA == obs.HeadSHA {
+		if sameObservation(run, obs) {
 			return decision, nil
 		}
 		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
@@ -121,7 +121,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (core.MergeDecision,
 			if err := run.Apply(core.Event{Kind: core.EvChecksPending, HeadSHA: obs.HeadSHA}); err != nil {
 				return decision, err
 			}
-			if run.ObserveSHA(obs.HeadSHA) {
+			if run.ObserveSHA(obs.HeadSHA, obs.BaseSHA) {
 				return decision, r.Store.Save(ctx, run)
 			}
 			return decision, nil
@@ -183,7 +183,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 		}
 		return r.notify(run, "rebase exhausted", "automatic rebase attempts exhausted")
 	}
-	if run.ObservedSHA == obs.HeadSHA {
+	if sameObservation(run, obs) {
 		return nil
 	}
 	newSHA, err := r.SCM.UpdateBranch(ctx, obs.PRNumber, obs.HeadSHA)
@@ -191,7 +191,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 		if err := run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}); err != nil {
 			return err
 		}
-		run.ObservedSHA = obs.HeadSHA
+		recordObservation(run, obs.HeadSHA, obs.BaseSHA)
 		if err := r.Store.Save(ctx, run); err != nil {
 			return err
 		}
@@ -200,7 +200,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	if err := run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}); err != nil {
 		return err
 	}
-	run.ObservedSHA = newSHA
+	recordObservation(run, newSHA, obs.BaseSHA)
 	return r.Store.Save(ctx, run)
 }
 
@@ -217,7 +217,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		}
 		return r.notify(run, "fix exhausted", "agent fix attempts exhausted")
 	}
-	if run.ObservedSHA == obs.HeadSHA {
+	if sameObservation(run, obs) {
 		return nil
 	}
 	w := core.WakeContext{
@@ -232,7 +232,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 	if err := run.Apply(core.Event{Kind: core.EvAgentFixed, Reason: reason}); err != nil {
 		return err
 	}
-	run.ObservedSHA = obs.HeadSHA
+	recordObservation(run, obs.HeadSHA, obs.BaseSHA)
 	return r.Store.Save(ctx, run)
 }
 
