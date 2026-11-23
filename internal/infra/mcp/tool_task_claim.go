@@ -619,6 +619,57 @@ func writeClaimFile(path string, data []byte) error {
 	return nil
 }
 
+// mergedNoteLine returns the canonical MERGED confirmation line. The text mirrors
+// taskstore.MergedNoteLine and cmd/beacon; the layer matrix forbids mcp from
+// importing taskstore, so the format is repeated and must change everywhere.
+func mergedNoteLine(pr int, at time.Time) string {
+	return fmt.Sprintf("- PR #%d MERGED: %s (squash).", pr, at.UTC().Format("2006-01-02"))
+}
+
+func hasMergedNote(raw string, pr int) bool {
+	return strings.Contains(raw, fmt.Sprintf("PR #%d MERGED", pr))
+}
+
+// WriteMergedNote appends the MERGED confirmation for pr to cardPath while
+// holding the same tasks-directory flock that Claim uses. Read, marker check
+// and atomic rename stay in one critical section, so a repeated observation or
+// a parallel close leaves exactly one line and cannot drop close fields.
+func WriteMergedNote(tasksDir, cardPath string, pr int, at time.Time) error {
+	if strings.TrimSpace(tasksDir) == "" || strings.TrimSpace(cardPath) == "" || pr <= 0 {
+		return domain.NewAppError(domain.CodeInvalidInput, "merged note: tasks dir, card path and pr are required")
+	}
+	lockPath := TasksLockPath(tasksDir)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		_ = lock.Close()
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
+	}
+	defer func() {
+		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = lock.Close()
+	}()
+
+	raw, err := os.ReadFile(cardPath)
+	if err != nil {
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
+	}
+	text := string(raw)
+	if hasMergedNote(text, pr) {
+		return nil
+	}
+	text += "\n## Подтверждение\n" + mergedNoteLine(pr, at) + "\n"
+	if err := writeClaimFile(cardPath, []byte(text)); err != nil {
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
+	}
+	return nil
+}
+
 // AttachTaskClaim registers exactly one beacon_task_claim tool. It is opt-in:
 // wiring it into NewServer is the contract card's job, so this helper is not
 // called automatically. A claim changes card state and is not idempotent.

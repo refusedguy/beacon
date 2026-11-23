@@ -6,6 +6,7 @@
 package taskstore
 
 import (
+	"fmt"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -39,12 +40,28 @@ func IsCloseReason(v string) bool { return slices.Contains(closeReasons, v) }
 // Статус и Дубликат проверяются. Время закрытия при пустом значении ставится
 // в текущее время UTC в формате RFC3339.
 type CloseCardOptions struct {
-	Status      string // обязательный: blocked, done, dropped или duplicate
-	Reason      string // Причина
-	DuplicateOf string // Дубликат, обязателен при Status == "duplicate"
-	ClosedBy    string // Закрыл
-	ClosedAt    string // Время закрытия, RFC3339 UTC
-	Blocker     string // Блокировщик, для blocked
+	Status      string    // обязательный: blocked, done, dropped или duplicate
+	Reason      string    // Причина
+	DuplicateOf string    // Дубликат, обязателен при Status == "duplicate"
+	ClosedBy    string    // Закрыл
+	ClosedAt    string    // Время закрытия, RFC3339 UTC
+	Blocker     string    // Блокировщик, для blocked
+	MergedPR    int       // номер PR для заметки MERGED; ноль отключает заметку
+	MergedAt    time.Time // дата заметки MERGED; нулевое значение означает сейчас
+}
+
+// MergedNoteLine возвращает каноническую строку подтверждения MERGED. Текст
+// совпадает с closeWiringCard и closeLinkedCardFile в cmd/beacon и с
+// mergedNoteLine в mcp: слои запрещают этим пакетам импортировать taskstore,
+// поэтому формат живёт в нескольких местах и меняться должен везде.
+func MergedNoteLine(pr int, at time.Time) string {
+	return fmt.Sprintf("- PR #%d MERGED: %s (squash).", pr, at.UTC().Format("2006-01-02"))
+}
+
+// HasMergedNote сообщает, есть ли в тексте карточки подтверждение для pr.
+// Маркер проверяется до записи, поэтому повторное закрытие не добавляет строку.
+func HasMergedNote(raw string, pr int) bool {
+	return strings.Contains(raw, fmt.Sprintf("PR #%d MERGED", pr))
 }
 
 // managedCloseFields задаёт порядок полей, которые добавляются в карточку,
@@ -155,7 +172,18 @@ func ApplyCloseFields(raw string, o CloseCardOptions) (string, error) {
 		out = append(out[:insertAt:insertAt], missing...)
 		out = append(out, tail...)
 	}
-	return strings.Join(out, "\n"), nil
+	text := strings.Join(out, "\n")
+	// Заметка MERGED пишется тем же вызовом, что и поля закрытия. CloseCard
+	// держит общий лок на протяжении чтения, правки и записи, а маркер делает
+	// повтор безопасным: вторая запись не добавит вторую строку.
+	if o.MergedPR > 0 && !HasMergedNote(text, o.MergedPR) {
+		at := o.MergedAt
+		if at.IsZero() {
+			at = time.Now().UTC()
+		}
+		text += "\n## Подтверждение\n" + MergedNoteLine(o.MergedPR, at) + "\n"
+	}
+	return text, nil
 }
 
 // managedKey возвращает имя поля, если строка — одно из управляемых полей
