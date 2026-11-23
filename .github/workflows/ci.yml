@@ -271,6 +271,18 @@ jobs:
             "$bin" "$gate"
           done
 
+      # ADR 0314. Кандидат на размер и SHA tools/list считается из дескрипторов
+      # и сравнивается с закоммиченным fixtures. Команда никогда не пишет в
+      # contract_test.go: golden остаётся независимым свидетелем.
+      - name: Check tools/list candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd tools/beacon-gates
+          go run ./tools-list-dump --print
+          go run ./tools-list-dump --check
+          go run ./tools-list-dump --self-test
+
       # WIRING-карты остаются в дереве после завершения работы и получают
       # "Статус: done". Гейт требует "todo" и помечает готовые карты находкой.
       # Оставляем прогон информационным, как у docs-гейта.
