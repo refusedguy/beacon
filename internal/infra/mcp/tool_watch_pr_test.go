@@ -146,30 +146,52 @@ func watchPRTestInput(head string, role domain.Role) WatchPRInput {
 	}
 }
 
-// TestWatchPRInputSchemaHasExecutorDescriptor keeps the optional executor
-// descriptor in the derived MCP input schema, so a client can send the
-// executor data before it reports the waiting turn (T5.31, ADR 0088).
-func TestWatchPRInputSchemaHasExecutorDescriptor(t *testing.T) {
+func assertWatchPRInputSchemaField(t *testing.T, schema *jsonschema.Schema, name string, nested ...string) {
+	t.Helper()
+	field, ok := schema.Properties[name]
+	if !ok {
+		t.Fatalf("input schema has no %q property", name)
+	}
+	for _, required := range schema.Required {
+		if required == name {
+			t.Fatalf("%q must stay optional", name)
+		}
+	}
+	props := field.Properties
+	if field.Ref != "" {
+		def, ok := schema.Defs[strings.TrimPrefix(field.Ref, "#/$defs/")]
+		if !ok {
+			t.Fatalf("%q $ref %q has no definition", name, field.Ref)
+		}
+		props = def.Properties
+	}
+	for _, sub := range nested {
+		if _, ok := props[sub]; !ok {
+			t.Errorf("%s descriptor has no %q property", name, sub)
+		}
+	}
+}
+
+// TestWatchPRInputSchemaHasFields keeps the optional executor descriptor and
+// the two compatibility fields in the derived watch_pr input schema
+// (T5.31, ADR 0088).
+func TestWatchPRInputSchemaHasFields(t *testing.T) {
 	schema, err := jsonschema.For[WatchPRInput](nil)
 	if err != nil {
 		t.Fatalf("input schema: %v", err)
 	}
-	executor, ok := schema.Properties["executor"]
-	if !ok {
-		t.Fatal("input schema has no executor property")
+	tests := []struct {
+		name   string
+		nested []string
+	}{
+		{name: "executor", nested: []string{"id", "role", "runtime", "agent", "capabilities", "configId"}},
+		{name: "orchestratorID"},
+		{name: "fixFor"},
 	}
-	props := executor.Properties
-	if executor.Ref != "" {
-		def, ok := schema.Defs[strings.TrimPrefix(executor.Ref, "#/$defs/")]
-		if !ok {
-			t.Fatalf("executor $ref %q has no definition", executor.Ref)
-		}
-		props = def.Properties
-	}
-	for _, field := range []string{"id", "role", "runtime", "agent", "capabilities", "configId"} {
-		if _, ok := props[field]; !ok {
-			t.Errorf("executor descriptor has no %q property", field)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertWatchPRInputSchemaField(t, schema, tt.name, tt.nested...)
+		})
 	}
 }
 
@@ -1068,24 +1090,6 @@ func TestRegisterAndBindFailsOnRegistryError(t *testing.T) {
 	assertCode(t, err, domain.CodePersistFailed)
 }
 
-// TestWatchPRInputSchemaHasOrchestratorID keeps the optional parent session in
-// the derived MCP input schema and out of the required list. A caller written
-// before this field existed still sends a valid watch_pr call.
-func TestWatchPRInputSchemaHasOrchestratorID(t *testing.T) {
-	schema, err := jsonschema.For[WatchPRInput](nil)
-	if err != nil {
-		t.Fatalf("input schema: %v", err)
-	}
-	if _, ok := schema.Properties["orchestratorID"]; !ok {
-		t.Fatal("input schema has no orchestratorID property")
-	}
-	for _, name := range schema.Required {
-		if name == "orchestratorID" {
-			t.Fatal("orchestratorID must stay optional")
-		}
-	}
-}
-
 // TestRegisterStoresOrchestratorID proves the parent session is persisted on
 // both the Watch and the registering Subscriber.
 func TestRegisterStoresOrchestratorID(t *testing.T) {
@@ -1346,21 +1350,6 @@ func TestRegisterFixerFixForOnRenew(t *testing.T) {
 	for _, sub := range w.Subscribers {
 		if sub.ID == "ses_fixer_6" && sub.FixFor != "watch-blocked-6b" {
 			t.Errorf("Subscriber.FixFor after renew = %q, want watch-blocked-6b", sub.FixFor)
-		}
-	}
-}
-
-func TestWatchPRInputSchemaHasFixFor(t *testing.T) {
-	schema, err := jsonschema.For[WatchPRInput](nil)
-	if err != nil {
-		t.Fatalf("input schema: %v", err)
-	}
-	if _, ok := schema.Properties["fixFor"]; !ok {
-		t.Fatal("input schema has no fixFor property")
-	}
-	for _, name := range schema.Required {
-		if name == "fixFor" {
-			t.Fatal("fixFor must stay optional in the schema; role fixer enforces it")
 		}
 	}
 }
