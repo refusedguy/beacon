@@ -21,13 +21,7 @@ import (
 // first claimedAt survives and that a second write was not issued.
 func TestAckSetsClaimedAtOnce(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictReady)
-	o := resultObligation(w, "session-A")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-A")
 	h := NewAckHandler(store, stamper, clock)
 
 	_, out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
@@ -84,14 +78,9 @@ func t14LadderAdvance(o domain.Obligation, outcome domain.AttemptOutcome, at tim
 // readAt and without resuming the ladder.
 func TestAckReadStopsLadder(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictKeepWorking)
-	o := resultObligation(w, "session-L")
-	o.Attempts = []domain.Attempt{{N: 1, At: clock.t, Channel: "s1", Outcome: domain.OutcomeTransportFailed}}
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-L", func(w *domain.Watch, o *domain.Obligation) {
+		o.Attempts = []domain.Attempt{{N: 1, At: clock.t, Channel: "s1", Outcome: domain.OutcomeTransportFailed}}
+	})
 	reader := NewGetResultHandler(store, stamper, clock)
 	acker := NewAckHandler(store, stamper, clock)
 
@@ -130,13 +119,7 @@ func TestAckReadStopsLadder(t *testing.T) {
 // TestAckValidation covers bad input and a mismatched obligation before a
 // stamp is issued.
 func TestAckValidation(t *testing.T) {
-	w := resultFixture(domain.VerdictReady)
-	o := resultObligation(w, "session-V")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-V")
 	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
 
 	if err := h.Ack(context.Background(), AckInput{}); err == nil {
@@ -171,17 +154,7 @@ func TestAckDoesNotChangeVerdict(t *testing.T) {
 	for _, verdict := range []domain.Verdict{domain.VerdictWatching, domain.VerdictReady} {
 		t.Run(string(verdict), func(t *testing.T) {
 			clock := &stepClock{t: time.Date(2026, 11, 19, 14, 0, 0, 0, time.UTC)}
-			w := resultFixture(verdict)
-			o := resultObligation(w, "session-V")
-			store := newMemStore()
-			if err := store.SaveWatch(w); err != nil {
-				t.Fatalf("SaveWatch: %v", err)
-			}
-			if err := store.SaveObligation(o); err != nil {
-				t.Fatalf("SaveObligation: %v", err)
-			}
-			stamper := newRecordingStamper()
-			stamper.add(o)
+			w, o, store, stamper := newAckResultFixture(t, verdict, "session-V")
 			h := NewAckHandler(store, stamper, clock)
 
 			_, out, err := h.Handle(context.Background(), nil, AckInput{WatchID: w.ID, ObligationID: o.ID})
@@ -271,17 +244,7 @@ func TestAckInputSchemaHasContinueOf(t *testing.T) {
 // never creates a second task.
 func TestAckContinueOfResumesSameWatch(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 2, 0, 0, 0, time.UTC)}
-	w := parkedAckWatch()
-	o := resultObligation(w, "session-answer")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictNeedsInput, "session-answer", ackFixtureWithWatch(parkedAckWatch(), "session-answer"))
 	h := NewAckHandler(store, stamper, clock)
 
 	_, out, err := h.Handle(context.Background(), nil, AckInput{
@@ -327,14 +290,7 @@ func TestAckContinueOfResumesSameWatch(t *testing.T) {
 // The sixth answer is refused before the Watch or the obligation changes.
 func TestAckContinueOfRoundLimit(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 3, 0, 0, 0, time.UTC)}
-	w := parkedAckWatch()
-	o := resultObligation(w, "session-limit")
-	store := newMemStore()
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictNeedsInput, "session-limit", ackFixtureWithWatch(parkedAckWatch(), "session-limit"))
 	h := NewAckHandler(store, stamper, clock)
 
 	for round := 1; round <= int(domain.MaxContinueRounds)+1; round++ {
@@ -381,13 +337,7 @@ func TestAckContinueOfRoundLimit(t *testing.T) {
 // task, so a human reply can never start a new Watch.
 func TestAckContinueOfMustNameSameWatch(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 4, 0, 0, 0, time.UTC)}
-	w := parkedAckWatch()
-	o := resultObligation(w, "session-mismatch")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictNeedsInput, "session-mismatch", ackFixtureWithWatch(parkedAckWatch(), "session-mismatch"))
 	h := NewAckHandler(store, stamper, clock)
 
 	_, _, err := h.Handle(context.Background(), nil, AckInput{
@@ -426,18 +376,7 @@ func TestAckInputSchemaHasRevision(t *testing.T) {
 // the Watch revision it was given at, not the webhook event.id of ADR 0034 §4.
 // The ordinary MCP response stays ok-only as T2.23 requires.
 func TestAckReceiptReturnsCommittedRevision(t *testing.T) {
-	w := resultFixture(domain.VerdictReady)
-	w.Revision = 7
-	o := resultObligation(w, "session-revision")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-revision")
 	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
 
 	receipt, err := h.AckReceipt(context.Background(), AckInput{WatchID: w.ID, ObligationID: o.ID})
@@ -474,18 +413,7 @@ func TestAckReceiptReturnsCommittedRevision(t *testing.T) {
 // revision so the caller can retry against it.
 func TestAckDiscardsStaleEventRevision(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 19, 16, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictReady)
-	w.Revision = 7
-	o := resultObligation(w, "session-stale")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-stale")
 	h := NewAckHandler(store, stamper, clock)
 
 	first, err := h.AckReceipt(context.Background(), AckInput{WatchID: w.ID, ObligationID: o.ID, Revision: 7})
@@ -536,14 +464,7 @@ func TestAckDiscardsStaleEventRevision(t *testing.T) {
 // TestAckAcceptsCurrentAndFutureRevision keeps an ack whose event matches or
 // leads the committed revision working, so only an older revision is dropped.
 func TestAckAcceptsCurrentAndFutureRevision(t *testing.T) {
-	w := resultFixture(domain.VerdictReady)
-	w.Revision = 7
-	o := resultObligation(w, "session-current")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-current")
 	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
 
 	for _, revision := range []uint64{7, 9} {
@@ -560,18 +481,11 @@ func TestAckAcceptsCurrentAndFutureRevision(t *testing.T) {
 // TestAckStaleEventDoesNotResumeParkedWatch applies the same revision guard to
 // an answer: a stale continueOf consumes no round and leaves the Watch parked.
 func TestAckStaleEventDoesNotResumeParkedWatch(t *testing.T) {
-	w := parkedAckWatch()
-	w.Revision = 4
-	o := resultObligation(w, "session-stale-answer")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictNeedsInput, "session-stale-answer", func(w *domain.Watch, o *domain.Obligation) {
+		*w = parkedAckWatch()
+		w.Revision = 4
+		*o = resultObligation(*w, "session-stale-answer")
+	})
 	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
 
 	receipt, err := h.AckReceipt(context.Background(), AckInput{
@@ -598,20 +512,13 @@ func TestAckStaleEventDoesNotResumeParkedWatch(t *testing.T) {
 // Watch that is no longer parked, even when the revision is current. The round
 // and the obligation must stay untouched (LC-03).
 func TestAckContinueOnWatchingWatchDoesNotConsumeRound(t *testing.T) {
-	w := parkedAckWatch()
-	w.Status = domain.StatusWatching
-	w.Verdict = domain.VerdictWatching
-	w.Revision = 4
-	o := resultObligation(w, "session-unparked-answer")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictWatching, "session-unparked-answer", func(w *domain.Watch, o *domain.Obligation) {
+		*w = parkedAckWatch()
+		w.Status = domain.StatusWatching
+		w.Verdict = domain.VerdictWatching
+		w.Revision = 4
+		*o = resultObligation(*w, "session-unparked-answer")
+	})
 	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
 
 	_, err := h.AckReceipt(context.Background(), AckInput{
@@ -641,17 +548,7 @@ func TestAckContinueOnWatchingWatchDoesNotConsumeRound(t *testing.T) {
 func ackDecisionFixture(t *testing.T) (*memStore, *recordingStamper, *AckHandler, domain.Watch, domain.Obligation, *stepClock) {
 	t.Helper()
 	clock := &stepClock{t: time.Date(2026, 11, 20, 6, 0, 0, 0, time.UTC)}
-	w := parkedAckWatch()
-	o := resultObligation(w, "session-decision")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictNeedsInput, "session-decision", ackFixtureWithWatch(parkedAckWatch(), "session-decision"))
 	h := NewAckHandler(store, stamper, clock)
 	return store, stamper, h, w, o, clock
 }
@@ -890,13 +787,7 @@ func TestAckDecisionSecondQuestionSameWatch(t *testing.T) {
 // TestAckDecisionRequiresStoppedWatch keeps a decision scoped to an agent that
 // actually stopped. A live Watch cannot be resumed and is left untouched.
 func TestAckDecisionRequiresStoppedWatch(t *testing.T) {
-	w := resultFixture(domain.VerdictReady)
-	o := resultObligation(w, "session-live")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-live")
 	h := NewAckHandler(store, stamper, &stepClock{t: time.Now()})
 
 	_, err := h.Decide(context.Background(), AckInput{
@@ -1027,18 +918,9 @@ func sortedCheckNamesFromInfo(in []string) []string {
 // records the claim. The MCP response stays ok-only.
 func TestAckBlockedNotMine(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictRetry)
-	w.Status = domain.StatusWatching
-	o := resultObligation(w, "session-blocked")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictRetry, "session-blocked", func(w *domain.Watch, o *domain.Obligation) {
+		w.Status = domain.StatusWatching
+	})
 	h := NewAckHandler(store, stamper, clock)
 
 	_, out, err := h.Handle(context.Background(), sessionReq("session-blocker"), AckInput{
@@ -1131,18 +1013,9 @@ func TestAckBlockedDecisionRejectsUnpinnedAndFutureRevision(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := &stepClock{t: time.Date(2026, 11, 20, 8, 30, 0, 0, time.UTC)}
-			w := resultFixture(domain.VerdictRetry)
-			w.Status = domain.StatusWatching
-			o := resultObligation(w, "session-revision")
-			store := newMemStore()
-			if err := store.SaveWatch(w); err != nil {
-				t.Fatalf("SaveWatch: %v", err)
-			}
-			if err := store.SaveObligation(o); err != nil {
-				t.Fatalf("SaveObligation: %v", err)
-			}
-			stamper := newRecordingStamper()
-			stamper.add(o)
+			w, o, store, stamper := newAckResultFixture(t, domain.VerdictRetry, "session-revision", func(w *domain.Watch, o *domain.Obligation) {
+				w.Status = domain.StatusWatching
+			})
 			h := NewAckHandler(store, stamper, clock)
 
 			receipt, err := h.AckReceipt(context.Background(), AckInput{
@@ -1176,17 +1049,7 @@ func TestAckBlockedUnknownDecisionDoesNotBlock(t *testing.T) {
 	for _, decision := range []string{"blocked:other", "maybe", "blocked:"} {
 		t.Run(decision, func(t *testing.T) {
 			clock := &stepClock{t: time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)}
-			w := resultFixture(domain.VerdictRetry)
-			o := resultObligation(w, "session-unknown")
-			store := newMemStore()
-			if err := store.SaveWatch(w); err != nil {
-				t.Fatalf("SaveWatch: %v", err)
-			}
-			if err := store.SaveObligation(o); err != nil {
-				t.Fatalf("SaveObligation: %v", err)
-			}
-			stamper := newRecordingStamper()
-			stamper.add(o)
+			w, o, store, stamper := newAckResultFixture(t, domain.VerdictRetry, "session-unknown")
 			h := NewAckHandler(store, stamper, clock)
 
 			_, _, err := h.Handle(context.Background(), sessionReq("session-blocker"), AckInput{
@@ -1216,17 +1079,7 @@ func TestAckBlockedUnknownDecisionDoesNotBlock(t *testing.T) {
 // or rename the blocker. The first record wins and the Watch is written once.
 func TestAckBlockedNotMineIdempotent(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictRetry)
-	o := resultObligation(w, "session-repeat")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictRetry, "session-repeat")
 	h := NewAckHandler(store, stamper, clock)
 	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine), Revision: w.Revision}
 
@@ -1288,16 +1141,7 @@ func blockedAckFixture(t *testing.T, clock *stepClock) (*memStore, *recordingSta
 	if blocked.Status != domain.StatusBlocked {
 		t.Fatalf("fixture Watch is not blocked: %+v", blocked)
 	}
-	o := resultObligation(blocked, "ses_fixer")
-	store := newMemStore()
-	if err := store.SaveWatch(blocked); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	_, o, store, stamper := newAckResultFixture(t, domain.VerdictRetry, "ses_fixer", ackFixtureWithWatch(blocked, "ses_fixer"))
 	h := NewAckHandler(store, stamper, clock)
 	return store, stamper, h, blocked, o
 }
@@ -1394,17 +1238,7 @@ func TestAckBlockedResolvedIdempotent(t *testing.T) {
 // error and neither the Watch nor the obligation changes.
 func TestAckBlockedResolvedRequiresBlockedWatch(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictReady)
-	o := resultObligation(w, "session-live")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-live")
 	h := NewAckHandler(store, stamper, clock)
 
 	_, err := h.AckReceipt(context.Background(), AckInput{
@@ -1465,17 +1299,7 @@ func TestAckBlockedEscalationMetric(t *testing.T) {
 	defer observe.SetDefault(nil)
 
 	clock := &stepClock{t: time.Date(2026, 11, 20, 11, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictRetry)
-	o := resultObligation(w, "session-metric")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictRetry, "session-metric")
 	h := NewAckHandler(store, stamper, clock)
 	in := AckInput{WatchID: w.ID, ObligationID: o.ID, Decision: string(DecisionBlockedNotMine), Revision: w.Revision}
 
