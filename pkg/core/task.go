@@ -2,6 +2,7 @@
 package core
 
 import (
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -102,15 +103,50 @@ const (
 	TaskDropped   TaskStatus = "dropped"
 )
 
+type TaskKind string
+
+const (
+	TaskKindTask TaskKind = "task"
+	TaskKindEpic TaskKind = "epic"
+)
+
+// ReviewMode selects how an epic pull request is approved before it merges.
+// An unset value means the LLM reviewer.
+type ReviewMode string
+
+const (
+	ReviewModeLLM   ReviewMode = "llm"
+	ReviewModeHuman ReviewMode = "human"
+	ReviewModeNone  ReviewMode = "none"
+)
+
+// ChildSpec is one child declared in an epic's plan.
+type ChildSpec struct {
+	Title    string
+	Scope    []ScopePath
+	Depends  []TaskID
+	Priority int
+}
+
+// ChildTaskID returns the deterministic ID of the index-th child of an epic.
+// Index is 1-based: children are <epic-id>-01, <epic-id>-02 and so on.
+func ChildTaskID(epicID TaskID, index int) TaskID {
+	return TaskID(fmt.Sprintf("%s-%02d", epicID, index))
+}
+
 type Task struct {
-	ID        TaskID
-	Title     string
-	Body      string
-	Priority  int
-	Scope     []ScopePath
-	DependsOn []TaskID
-	Status    TaskStatus
-	SourceRef string
+	ID            TaskID
+	Title         string
+	Body          string
+	Priority      int
+	Scope         []ScopePath
+	DependsOn     []TaskID
+	Status        TaskStatus
+	SourceRef     string
+	Kind          TaskKind
+	BaseBranch    string
+	RequireReview ReviewMode
+	Plan          []ChildSpec
 }
 
 func (t Task) DependsOnID(id TaskID) bool {

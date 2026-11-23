@@ -14,10 +14,18 @@ import (
 )
 
 type Markdown struct {
-	Dir string
+	Dir    string
+	Parser core.EpicParser
 }
 
 func NewMarkdown(dir string) *Markdown { return &Markdown{Dir: dir} }
+
+func (m *Markdown) parser() core.EpicParser {
+	if m.Parser != nil {
+		return m.Parser
+	}
+	return PlanParser{}
+}
 
 func (m *Markdown) ListAvailable(ctx context.Context) ([]core.Task, error) {
 	_ = ctx
@@ -63,15 +71,19 @@ func (m *Markdown) cards() ([]string, error) {
 }
 
 type frontmatter struct {
-	ID        string     `yaml:"id"`
-	Title     string     `yaml:"title"`
-	Status    string     `yaml:"status"`
-	Scope     stringList `yaml:"scope"`
-	Depends   stringList `yaml:"depends"`
-	DependsOn stringList `yaml:"depends_on"`
-	Priority  int        `yaml:"priority"`
-	SourceRef string     `yaml:"source_ref"`
-	Phase     string     `yaml:"phase"`
+	ID            string     `yaml:"id"`
+	Title         string     `yaml:"title"`
+	Status        string     `yaml:"status"`
+	Scope         stringList `yaml:"scope"`
+	Depends       stringList `yaml:"depends"`
+	DependsOn     stringList `yaml:"depends_on"`
+	Priority      int        `yaml:"priority"`
+	SourceRef     string     `yaml:"source_ref"`
+	Phase         string     `yaml:"phase"`
+	Kind          string     `yaml:"kind"`
+	BaseBranch    string     `yaml:"base_branch"`
+	RequireReview string     `yaml:"require_review"`
+	Plan          []planSpec `yaml:"plan"`
 }
 
 func splitFrontmatter(s string) (yamlText, body string, ok bool) {
@@ -100,6 +112,10 @@ func parseCard(content, path string) (core.Task, bool) {
 		t.Title = strings.TrimSpace(fm.Title)
 		t.Status = normalizeStatus(fm.Status)
 		t.Priority = fm.Priority
+		t.Kind = normalizeKind(fm.Kind)
+		t.BaseBranch = strings.TrimSpace(fm.BaseBranch)
+		t.RequireReview = normalizeReview(fm.RequireReview)
+		t.Plan = childSpecs(fm.Plan, dir)
 		for _, p := range fm.Scope {
 			t.Scope = append(t.Scope, scopeForPath(p, dir))
 		}
@@ -180,6 +196,28 @@ func (m *Markdown) findCard(id core.TaskID) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// Children returns the child tasks declared in an epic card's plan. A card
+// that is not an epic has no children and returns an empty slice.
+func (m *Markdown) Children(ctx context.Context, id core.TaskID) ([]core.Task, error) {
+	_ = ctx
+	path, ok := m.findCard(id)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	epic, ok := parseCard(string(b), path)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	if epic.Kind != core.TaskKindEpic {
+		return nil, nil
+	}
+	return m.parser().Children(epic), nil
 }
 
 func (m *Markdown) rewriteStatus(ctx context.Context, id core.TaskID, status string) error {
@@ -264,9 +302,22 @@ func (m *Markdown) Create(ctx context.Context, task core.Task) (core.Task, error
 	if err != nil {
 		return core.Task{}, err
 	}
+	extra, err := yaml.Marshal(epicFields{
+		Kind:          string(task.Kind),
+		BaseBranch:    task.BaseBranch,
+		RequireReview: string(task.RequireReview),
+		Plan:          planSpecs(task.Plan),
+	})
+	if err != nil {
+		return core.Task{}, err
+	}
 	var content strings.Builder
 	content.WriteString("---\n")
 	content.WriteString(fields)
+	if text := strings.TrimSpace(string(extra)); text != "" && text != "{}" {
+		content.WriteString(text)
+		content.WriteString("\n")
+	}
 	content.WriteString("---\n\n")
 	if body := strings.TrimSpace(task.Body); body != "" {
 		content.WriteString(body)
