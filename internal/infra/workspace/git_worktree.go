@@ -83,10 +83,17 @@ func (g *GitWorktree) status(ctx context.Context, path string) (bool, error) {
 func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspace, error) {
 	branch := branchName(task.ID)
 	path := filepath.Join(g.Dir, unsafeBranchChars.ReplaceAllString(string(task.ID), "-"))
+	base := task.BaseBranch
+	if base == "" {
+		base = g.Base
+	}
+	if base == "" {
+		base = "main"
+	}
 	if err := os.MkdirAll(g.Dir, 0o755); err != nil {
 		return core.Workspace{}, err
 	}
-	if _, err := g.run(ctx, "fetch", "origin", g.Base); err != nil {
+	if _, err := g.run(ctx, "fetch", "origin", base); err != nil {
 		return core.Workspace{}, err
 	}
 	if _, err := os.Stat(path); err == nil {
@@ -106,15 +113,15 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	if _, err := g.run(ctx, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
 		_, _ = g.run(ctx, "branch", "-D", branch)
 	}
-	if _, err := g.run(ctx, "worktree", "add", "-b", branch, path, "origin/"+g.Base); err != nil {
+	if _, err := g.run(ctx, "worktree", "add", "-b", branch, path, "origin/"+base); err != nil {
 		return core.Workspace{}, err
 	}
-	base, err := g.run(ctx, "merge-base", "origin/"+g.Base, branch)
+	mergeBase, err := g.run(ctx, "merge-base", "origin/"+base, branch)
 	if err != nil {
 		_, _ = g.run(ctx, "worktree", "remove", path)
 		return core.Workspace{}, err
 	}
-	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(base)}, nil
+	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(mergeBase)}, nil
 }
 
 func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error) {
