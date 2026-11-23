@@ -21,13 +21,19 @@ var (
 	ErrEmptyRequestID = errors.New("session: empty client request id")
 )
 
+// maxQueueSeen bounds the client request ID dedup set. An ID older than this
+// window is no longer remembered, so a retry that late can be queued again.
+// The bound is larger than any real retry window; dedup holds for normal use.
+const maxQueueSeen = 4096
+
 // Queue holds deferred commands grouped by session ID. A client request ID
-// seen once is never queued again, so a client retry cannot create a duplicate.
-// The zero value is ready to use. Callers serialise access from multiple
-// goroutines themselves.
+// seen once is never queued again while it is inside the dedup window. The zero
+// value is ready to use. Callers serialise access from multiple goroutines
+// themselves.
 type Queue struct {
 	bySession map[string][]Pending
 	seen      map[string]struct{}
+	seenOrder []string // client request IDs in insertion order, for oldest-first eviction
 }
 
 // New returns an empty Queue.
@@ -49,7 +55,13 @@ func (q *Queue) Add(sessionID string, cmd Pending) (bool, error) {
 	if _, ok := q.seen[cmd.ClientRequestID]; ok {
 		return false, nil
 	}
+	if len(q.seen) >= maxQueueSeen {
+		oldest := q.seenOrder[0]
+		delete(q.seen, oldest)
+		q.forgetSeen(oldest)
+	}
 	q.seen[cmd.ClientRequestID] = struct{}{}
+	q.seenOrder = append(q.seenOrder, cmd.ClientRequestID)
 	q.bySession[sessionID] = append(q.bySession[sessionID], cmd)
 	return true, nil
 }
@@ -101,5 +113,18 @@ func (q *Queue) ensure() {
 	}
 	if q.seen == nil {
 		q.seen = make(map[string]struct{})
+	}
+}
+
+// forgetSeen removes an ID from the eviction order. The caller serialises
+// access to the Queue.
+func (q *Queue) forgetSeen(id string) {
+	for i, k := range q.seenOrder {
+		if k == id {
+			copy(q.seenOrder[i:], q.seenOrder[i+1:])
+			q.seenOrder[len(q.seenOrder)-1] = ""
+			q.seenOrder = q.seenOrder[:len(q.seenOrder)-1]
+			return
+		}
 	}
 }

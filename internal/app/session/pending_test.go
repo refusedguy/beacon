@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 )
 
@@ -225,5 +226,51 @@ func TestZeroValueQueueIsUsable(t *testing.T) {
 	}
 	if got, ok := q.Pop("ses-a"); !ok || got.ClientRequestID != cmd.ClientRequestID {
 		t.Fatalf("Pop = %+v, %v; want %s", got, ok, cmd.ClientRequestID)
+	}
+}
+
+func TestSeenIsBoundedOldestFirst(t *testing.T) {
+	q := New()
+	for i := 0; i < maxQueueSeen+1; i++ {
+		id := "req-" + strconv.Itoa(i)
+		if _, err := q.Add("ses-a", Pending{ClientRequestID: id, Kind: "question"}); err != nil {
+			t.Fatalf("Add(%s): %v", id, err)
+		}
+	}
+
+	if got := len(q.seen); got != maxQueueSeen {
+		t.Fatalf("seen = %d, want %d", got, maxQueueSeen)
+	}
+	if got := len(q.seenOrder); got != maxQueueSeen {
+		t.Fatalf("seenOrder = %d, want %d", got, maxQueueSeen)
+	}
+	if _, ok := q.seen["req-0"]; ok {
+		t.Fatal("oldest client request ID survived eviction")
+	}
+	if _, ok := q.seen["req-"+strconv.Itoa(maxQueueSeen)]; !ok {
+		t.Fatal("newest client request ID missing")
+	}
+	if got := q.Len("ses-a"); got != maxQueueSeen+1 {
+		t.Fatalf("queue Len = %d, want %d", got, maxQueueSeen+1)
+	}
+}
+
+func TestCancelStillWorksAfterSeenEviction(t *testing.T) {
+	q := New()
+	kept := Pending{ClientRequestID: "kept", Kind: "question"}
+	if _, err := q.Add("ses-a", kept); err != nil {
+		t.Fatalf("Add kept: %v", err)
+	}
+	for i := 0; i < maxQueueSeen; i++ {
+		id := "fill-" + strconv.Itoa(i)
+		if _, err := q.Add("ses-b", Pending{ClientRequestID: id, Kind: "question"}); err != nil {
+			t.Fatalf("Add(%s): %v", id, err)
+		}
+	}
+	if !q.Cancel("ses-a", "kept") {
+		t.Fatal("Cancel failed for a command whose seen ID was evicted")
+	}
+	if got := q.Len("ses-a"); got != 0 {
+		t.Fatalf("Len = %d, want 0 after Cancel", got)
 	}
 }

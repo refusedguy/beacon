@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -421,6 +422,47 @@ func TestChildThreadsReferenceErrors(t *testing.T) {
 	}
 	if err := threads.Spawn("root", "blank", "  "); !errors.Is(err, ErrInvalidThread) {
 		t.Fatalf("blank name error = %v, want ErrInvalidThread", err)
+	}
+}
+
+func TestChildThreadsEvictsOldestFirst(t *testing.T) {
+	threads := NewChildThreads()
+	for i := 0; i < maxChildThreads+1; i++ {
+		if err := threads.Root("t-"+strconv.Itoa(i), "name"); err != nil {
+			t.Fatalf("Root(%d): %v", i, err)
+		}
+	}
+
+	if got := threads.Len(); got != maxChildThreads {
+		t.Fatalf("Len = %d, want %d", got, maxChildThreads)
+	}
+	if _, _, ok := threads.Get("t-0"); ok {
+		t.Fatal("oldest thread survived eviction")
+	}
+	if _, _, ok := threads.Get("t-" + strconv.Itoa(maxChildThreads)); !ok {
+		t.Fatal("newest thread missing")
+	}
+}
+
+func TestChildThreadsSpawnEvictsOldestFirst(t *testing.T) {
+	threads := NewChildThreads()
+	for i := 0; i < maxChildThreads; i++ {
+		if err := threads.Root("t-"+strconv.Itoa(i), "name"); err != nil {
+			t.Fatalf("Root(%d): %v", i, err)
+		}
+	}
+	if err := threads.Spawn("t-1", "child", "child name"); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+
+	if got := threads.Len(); got != maxChildThreads {
+		t.Fatalf("Len = %d, want %d", got, maxChildThreads)
+	}
+	if _, _, ok := threads.Get("t-0"); ok {
+		t.Fatal("oldest thread survived spawn eviction")
+	}
+	if name, parent, ok := threads.Get("child"); !ok || parent != "t-1" || name != "child name" {
+		t.Fatalf("Get(child) = %q, %q, %v", name, parent, ok)
 	}
 }
 
