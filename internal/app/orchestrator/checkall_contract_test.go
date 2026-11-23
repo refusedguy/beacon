@@ -1,11 +1,16 @@
 package orchestrator
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/store"
 )
 
 // checkRunFragment returns the fields of the CheckRun inline fragment. It
@@ -148,5 +153,44 @@ func TestChecksPayloadKeepsRequired(t *testing.T) {
 	}
 	if rows["unknown"].Required != false {
 		t.Errorf("unknown source became required: %s", raw)
+	}
+}
+
+// TestSQLVerdictWriterRejectsOutOfContractVerdict pins the write boundary. A
+// verdict outside the domain contract must be rejected before the Watch is
+// touched: its status stays watching and no obligation is staged.
+func TestSQLVerdictWriterRejectsOutOfContractVerdict(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "beacon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+
+	const head = "sha-ooc"
+	w := domain.Watch{
+		ID:      "watch:refusedguy/beacon:9:" + head,
+		Repo:    "refusedguy/beacon",
+		PR:      9,
+		HeadSHA: head,
+		Status:  domain.StatusWatching,
+		Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{
+			{ID: "orch-1", Role: domain.RoleOrchestrator},
+		},
+	}
+	if err := db.SaveWatch(w); err != nil {
+		t.Fatal(err)
+	}
+
+	ref := WatchRef{ID: w.ID, Repo: w.Repo, PR: w.PR, HeadSHA: w.HeadSHA}
+	err = NewSQLVerdictWriter(db).Publish(context.Background(), ref, Verdict("out_of_contract"), nil)
+	if err == nil || !strings.Contains(err.Error(), "вне доменного контракта") {
+		t.Fatalf("Publish error = %v, want out-of-contract rejection", err)
+	}
+	if got := rawWatchStatus(t, db, w.ID); got != string(domain.StatusWatching) {
+		t.Fatalf("status = %s, want watching: an out-of-contract verdict must not write", got)
+	}
+	if _, err := db.Obligation(obligationKey(w.ID, 1, "orch-1")); err == nil {
+		t.Fatal("out-of-contract verdict staged an obligation")
 	}
 }
