@@ -121,7 +121,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (core.MergeDecision,
 			if err := run.Apply(core.Event{Kind: core.EvChecksPending, HeadSHA: obs.HeadSHA}); err != nil {
 				return decision, err
 			}
-			return decision, r.Store.Save(ctx, run)
+			if run.ObserveSHA(obs.HeadSHA) {
+				return decision, r.Store.Save(ctx, run)
+			}
+			return decision, nil
 		}
 		return decision, nil
 	}
@@ -188,6 +191,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 		if err := run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}); err != nil {
 			return err
 		}
+		run.ObservedSHA = obs.HeadSHA
 		if err := r.Store.Save(ctx, run); err != nil {
 			return err
 		}
@@ -196,7 +200,7 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	if err := run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}); err != nil {
 		return err
 	}
-	run.ObservedSHA = obs.HeadSHA
+	run.ObservedSHA = newSHA
 	return r.Store.Save(ctx, run)
 }
 
