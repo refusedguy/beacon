@@ -70,6 +70,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		}
 		if !obs.Conflict && len(obs.Checks) > 0 && obs.AllRequiredPass(nil) {
 			// Green checks mean the new base commits did not reach the PR scope.
+			if run.State == core.RunNeedsAgentFix {
+				if err := run.Apply(core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA}); err != nil {
+					return decision, err
+				}
+				run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
+				return decision, r.Store.Save(ctx, run)
+			}
 			return decision, nil
 		}
 		if sameObservation(run, obs) {

@@ -419,3 +419,41 @@ func TestWakeNewBaseSHAWithFixedHeadWakesOnce(t *testing.T) {
 		t.Fatalf("ObservedBaseSHA = %q, want base-new", got.ObservedBaseSHA)
 	}
 }
+
+func TestNeedsAgentFixWithGreenChecksAdvancesToMerged(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", Behind: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+		})
+	run := store.runs["r1"]
+	run.State = core.RunNeedsAgentFix
+	run.HeadSHA = "sha1"
+	run.ObservedSHA = "sha1"
+	run.ObservedBaseSHA = "base-old"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunWaitingCI {
+		t.Fatalf("state = %s, want waiting_ci", got.State)
+	}
+	if got.HeadSHA != "sha2" {
+		t.Fatalf("HeadSHA = %q, want sha2", got.HeadSHA)
+	}
+	if got.ObservedSHA != "sha2" {
+		t.Fatalf("ObservedSHA = %q, want sha2", got.ObservedSHA)
+	}
+
+	r.Policy = fakePolicy{decision: core.MergeDecision{Verdict: core.VerdictMerge, Reason: "all criteria passed"}}
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if got = store.runs["r1"]; got.State != core.RunMerged {
+		t.Fatalf("state = %s, want merged", got.State)
+	}
+}
