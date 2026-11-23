@@ -15,11 +15,6 @@ const (
 	ResumeRefuse = "refuse"
 )
 
-// ResumeFacts is the wiring point for the code that restores work from a
-// branch. The owner of that boundary runs git, fills ResumeInput and calls
-// CheckResume. The guard has no git dependency of its own.
-type ResumeFacts func(branch, worktree string) (checkedOutElsewhere bool, ahead, behind int, existingWorktree string, err error)
-
 // ResumeInput holds the facts collected before a branch is opened again.
 // Ahead and behind are the two counts from git rev-list --left-right --count.
 type ResumeInput struct {

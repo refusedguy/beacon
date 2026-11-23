@@ -707,12 +707,3 @@ func GatesHolding(subject Card, deps []GateDep) []GateRef {
 	}
 	return refs
 }
-
-// GateRefs это алиас для вызовов, которые уже получили набор гейтов: он
-// сохраняет то же правило пустого результата, что и GatesHolding.
-func GateRefs(refs []GateRef) []GateRef {
-	if len(refs) == 0 {
-		return nil
-	}
-	return refs
-}

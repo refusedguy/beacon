@@ -133,33 +133,6 @@ func (s *OutboxStore) Commit(ctx context.Context, key, kind string, payload []by
 	return created, nil
 }
 
-// OutboxEntries returns every committed outbox entry in commit order. A reader
-// that drains these can only see effects whose transaction committed.
-func (s *OutboxStore) OutboxEntries() ([]OutboxEntry, error) {
-	if s == nil || s.db == nil {
-		return nil, errors.New("store: outbox: nil db")
-	}
-	ok, err := tableExists(context.Background(), s.db.readDB, "command_outbox")
-	if err != nil || !ok {
-		return nil, err
-	}
-	rows, err := s.db.readDB.Query(`
-		SELECT seq, key, kind, payload, created_at FROM command_outbox ORDER BY seq`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []OutboxEntry
-	for rows.Next() {
-		var e OutboxEntry
-		if err := rows.Scan(&e.Seq, &e.Key, &e.Kind, &e.Payload, &e.CreatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
 // OutboxEntry returns the committed effect for key.
 func (s *OutboxStore) OutboxEntry(key string) (OutboxEntry, bool, error) {
 	if s == nil || s.db == nil {

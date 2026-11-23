@@ -771,33 +771,6 @@ func (c *PersistentACPClient) DeliveryPlan(policy ACPDeliveryPolicy) ACPDelivery
 	return policy.Plan(c.Capabilities())
 }
 
-// DeliverWake inserts text into a session using the negotiated plan. It
-// resumes sessionID when the agent declared session/load, and otherwise starts
-// a fresh session. A missing capability never fails the call: it only changes
-// the delivery mode. The new session id is returned so callers can track the
-// session even after a downgrade.
-func (c *PersistentACPClient) DeliverWake(ctx context.Context, sessionID, cwd, text string, policy ACPDeliveryPolicy) (string, error) {
-	if c == nil {
-		return "", fmt.Errorf("wake: acp client: nil")
-	}
-	target := sessionID
-	if c.DeliveryPlan(policy).Mode == ACPDeliveryResume {
-		if err := c.LoadSession(ctx, target, cwd); err != nil {
-			return "", err
-		}
-	} else {
-		newID, err := c.NewSession(ctx, cwd)
-		if err != nil {
-			return "", err
-		}
-		target = newID
-	}
-	if err := c.Prompt(ctx, target, text); err != nil {
-		return "", err
-	}
-	return target, nil
-}
-
 // NewSession creates a worker session and returns its opaque id.
 func (c *PersistentACPClient) NewSession(ctx context.Context, cwd string) (string, error) {
 	raw, err := c.call(ctx, "session/new", ACPSessionNewParams(cwd))

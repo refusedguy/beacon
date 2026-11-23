@@ -351,15 +351,6 @@ func (u PermissionUpdate) Validate() error {
 	return nil
 }
 
-// AgentPermissionConfig is the permission configuration of an agent. It lives in
-// data so a caller switches Mode on the control channel instead of branching in
-// a handler. It stays separate from MergePolicy for the reason given on
-// PermissionMode.
-type AgentPermissionConfig struct {
-	Mode  PermissionMode     `json:"mode"`
-	Rules []PermissionUpdate `json:"rules,omitempty"`
-}
-
 // SessionPermission is the permission state of one session. SessionID keys the
 // state, so a session-scoped update applies to this record alone.
 type SessionPermission struct {
