@@ -66,16 +66,35 @@ func (b *ciRefresh) fetchSnapshots(ctx context.Context, watches []domain.Watch, 
 		return out, nil
 	}
 
-	for _, w := range candidates {
+	// The fallback reads one distinct PR per call. BoundedRun caps the calls in
+	// flight; each worker writes its own index, and out is filled only after
+	// every worker returns. stopOnError stays false so one bad PR cannot stop
+	// the rest. The ghci provider still owns per-PR singleflight and the GitHub
+	// request limits.
+	const fallbackPRStateLimit = 4
+	type fallbackState struct {
+		state domain.PRState
+		ok    bool
+	}
+	states := make([]fallbackState, len(candidates))
+	BoundedRun(ctx, len(candidates), fallbackPRStateLimit, false, func(ctx context.Context, i int) error {
+		w := candidates[i]
 		callStart := time.Now()
 		state, err := b.ci.PRState(ctx, w.Repo, w.PR)
 		observe.ProviderCall("ghci", "PRState", w.ID, err, time.Since(callStart))
 		if err != nil {
-			log.Printf("cibridge: %s#%d: %v", w.Repo, w.PR, err)
+			log.Printf("cibridge: %s#%d (watch %s): %v", w.Repo, w.PR, w.ID, err)
+			return err
+		}
+		states[i] = fallbackState{state: state, ok: true}
+		return nil
+	})
+	for i, w := range candidates {
+		if !states[i].ok {
 			continue
 		}
 		out[w.ID] = ciObservation{
-			pr:   state,
+			pr:   states[i].state,
 			base: domain.BaseBranchState{BaseRef: baseRefOf(w)},
 		}
 	}
