@@ -17,6 +17,10 @@
 
 Правка LEAK-09 в `agent_turn_event.go` лежит в коммите `8fe21423` на ветке `fix/leak09` и в main не влита. Ветка этой карточки построена от свежего `origin/main`, поэтому откаты не было.
 
+Шаги: Проверить premise по свежему `origin/main`. Получить полный SHA коммита PR 2133. Подтвердить вхождение коммита в main через `git merge-base --is-ancestor`. Сверить код и тесты с критериями приёмки. Не писать дубль кода. Завести новую карточку с причиной `already_landed` и доказательством.
+
+Проверка: `git merge-base --is-ancestor 9179dd5111102e9b7c5502d8400b5c7e2f61c2bd origin/main` вернул 0. `gofmt -w` на трёх OwnerFiles прошёл без изменений. Полные проверки выполняет CI на PR.
+
 Приёмка: Событие `event: "Stop"` и событие `hook_event_name: "Stop"` дают один и тот же переход в idle. Повтор с тем же pane и turn возвращает `AgentTurnDuplicate` и не создаёт второй переход. Событие чужого pane возвращает `AgentTurnForeignPane`. Невалидный JSON возвращает `ErrAgentTurnJSON`. Другие события сессии возвращают `AgentTurnNotStop`. Тест с `%1` в pane проходит. Все перечисленные тесты уже лежат в `internal/infra/observe/agent_turn_event_test.go` в main.
 
 Причина: already_landed
