@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -105,6 +106,19 @@ func (f *fakeStore) ListActive(context.Context) ([]*core.Run, error) {
 		if !r.State.Terminal() {
 			out = append(out, r)
 		}
+	}
+	return out, nil
+}
+func (f *fakeStore) ListRecent(_ context.Context, limit int) ([]*core.Run, error) {
+	var out []*core.Run
+	for _, r := range f.runs {
+		if r.State == core.RunMerged || r.State == core.RunClosed || r.State == core.RunState("dropped") {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

@@ -91,6 +91,7 @@ type RunStore interface {
 	FindByPR(ctx context.Context, pr int) (*Run, error)
 	FindActiveByTask(ctx context.Context, task TaskID) (*Run, error)
 	ListActive(ctx context.Context) ([]*Run, error)
+	ListRecent(ctx context.Context, limit int) ([]*Run, error)
 	ListByIncident(ctx context.Context, incidentID string) ([]*Run, error)
 	ClaimDelivery(ctx context.Context, key string) (bool, error)
 	ReleaseDelivery(ctx context.Context, key string) error
