@@ -3,6 +3,7 @@ package scm
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -178,8 +179,8 @@ func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (
 		return "", err
 	}
 	branch := p.GetHead().GetRef()
-	url := fmt.Sprintf("repos/%s/%s/branches/%s/update", g.Owner, g.Repo, branch)
-	req, err := g.Client.NewRequest(ctx, "PUT", url, map[string]string{"expected_head_sha": expectedSHA})
+	path := fmt.Sprintf("repos/%s/%s/branches/%s/update", g.Owner, g.Repo, url.PathEscape(branch))
+	req, err := g.Client.NewRequest(ctx, "PUT", path, map[string]string{"expected_head_sha": expectedSHA})
 	if err != nil {
 		return "", err
 	}
