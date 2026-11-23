@@ -117,6 +117,47 @@ func TestSpawnSessionAndPromptBodies(t *testing.T) {
 	}
 }
 
+func TestPerTaskAgentOverridesGlobalAgent(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session":
+			rec.addSession(decodeBody(r))
+			_, _ = io.WriteString(w, `{"id":"ses_task"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/prompt"):
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	h := New(srv.URL, "model-x", "global-agent", "")
+	req := testSpawnRequest()
+	req.Task.WorkerAgent = "table-driven-worker"
+	if _, err := h.Spawn(context.Background(), req); err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	if len(rec.sessions) != 1 {
+		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
+	}
+	if got := rec.sessions[0]["agent"]; got != "table-driven-worker" {
+		t.Fatalf("agent = %v, want per-task table-driven-worker", got)
+	}
+
+	rec.sessions = nil
+	plain := testSpawnRequest()
+	if _, err := h.Spawn(context.Background(), plain); err != nil {
+		t.Fatalf("Spawn without override: %v", err)
+	}
+	if len(rec.sessions) != 1 {
+		t.Fatalf("session creates = %d, want 1", len(rec.sessions))
+	}
+	if got := rec.sessions[0]["agent"]; got != "global-agent" {
+		t.Fatalf("agent = %v, want global-agent", got)
+	}
+}
+
 func TestPromptConflictIsAccepted(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/session" {
