@@ -76,14 +76,15 @@ var expectedToolKinds = func() map[string]toolKind {
 	return out
 }()
 
-// listAllTools walks every tools/list page and returns the tools together with
-// the number of bytes produced by serializing each response. Counting every
-// page keeps the "exactly eleven, no twelfth" check honest if the server paginates.
-func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, int) {
+// listAllTools walks every tools/list page once and returns both the advertised
+// tools and the serialized response bytes. The tool checks and the byte checks
+// then read the same pages, including every page a paginating server adds after
+// the first.
+func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, []byte) {
 	t.Helper()
 
 	var tools []*sdkmcp.Tool
-	totalBytes := 0
+	var rawBytes []byte
 	cursor := ""
 	seen := make(map[string]bool)
 
@@ -102,11 +103,11 @@ func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, 
 		if err != nil {
 			t.Fatalf("marshal tools/list response: %v", err)
 		}
-		totalBytes += len(raw)
 
 		tools = append(tools, response.Tools...)
+		rawBytes = append(rawBytes, raw...)
 		if response.NextCursor == "" {
-			return tools, totalBytes
+			return tools, rawBytes
 		}
 		if seen[response.NextCursor] {
 			t.Fatalf("tools/list pagination loop: cursor %q repeated", response.NextCursor)
@@ -116,13 +117,13 @@ func listAllTools(t *testing.T, session *sdkmcp.ClientSession) ([]*sdkmcp.Tool, 
 	}
 }
 
-func TestToolsListContract(t *testing.T) {
-	server := NewServer()
-	client := sdkmcp.NewClient(
-		&sdkmcp.Implementation{Name: "beacon-contract-test", Version: "v0.0.0"},
-		nil,
-	)
+// connectToolsListClient opens a fresh server and client pair over an in-memory
+// transport. The cleanup closes the client before waiting for the server.
+func connectToolsListClient(t *testing.T, name string) *sdkmcp.ClientSession {
+	t.Helper()
 
+	server := NewServer()
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: name, Version: "v0.0.0"}, nil)
 	serverTransport, clientTransport := sdkmcp.NewInMemoryTransports()
 	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
 	if err != nil {
@@ -136,8 +137,14 @@ func TestToolsListContract(t *testing.T) {
 		_ = clientSession.Close()
 		_ = serverSession.Wait()
 	})
+	return clientSession
+}
 
-	tools, responseBytes := listAllTools(t, clientSession)
+func TestToolsListContract(t *testing.T) {
+	clientSession := connectToolsListClient(t, "beacon-contract-test")
+
+	tools, rawBytes := listAllTools(t, clientSession)
+	responseBytes := len(rawBytes)
 
 	names := make([]string, 0, len(tools))
 	for _, tool := range tools {
@@ -204,58 +211,13 @@ func TestToolsListContract(t *testing.T) {
 	}
 }
 
-// toolsListRawBytes opens a fresh server and client pair over its own in-memory
-// transport, walks tools/list and returns the concatenated serialized response
-// bytes. Each call builds a new server, so two calls compare independent
+// toolsListRawBytes opens its own connection, so two calls compare independent
 // connections rather than two reads of the same session.
 func toolsListRawBytes(t *testing.T) []byte {
 	t.Helper()
-
-	server := NewServer()
-	client := sdkmcp.NewClient(
-		&sdkmcp.Implementation{Name: "beacon-stability-test", Version: "v0.0.0"},
-		nil,
-	)
-	serverTransport, clientTransport := sdkmcp.NewInMemoryTransports()
-	serverSession, err := server.Connect(context.Background(), serverTransport, nil)
-	if err != nil {
-		t.Fatalf("connect server: %v", err)
-	}
-	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
-	if err != nil {
-		t.Fatalf("connect client: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = clientSession.Close()
-		_ = serverSession.Wait()
-	})
-
-	var all []byte
-	cursor := ""
-	seen := make(map[string]bool)
-	for {
-		params := &sdkmcp.ListToolsParams{}
-		if cursor != "" {
-			params.Cursor = cursor
-		}
-		response, err := clientSession.ListTools(context.Background(), params)
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		raw, err := json.Marshal(response)
-		if err != nil {
-			t.Fatalf("marshal tools/list response: %v", err)
-		}
-		all = append(all, raw...)
-		if response.NextCursor == "" {
-			return all
-		}
-		if seen[response.NextCursor] {
-			t.Fatalf("tools/list pagination loop: cursor %q repeated", response.NextCursor)
-		}
-		seen[response.NextCursor] = true
-		cursor = response.NextCursor
-	}
+	clientSession := connectToolsListClient(t, "beacon-stability-test")
+	_, rawBytes := listAllTools(t, clientSession)
+	return rawBytes
 }
 
 // TestToolsListStabilityAcrossConnections pins the tools/list listing as a
