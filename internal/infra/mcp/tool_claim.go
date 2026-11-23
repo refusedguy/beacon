@@ -47,7 +47,6 @@ package mcp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strconv"
 	"sync"
@@ -164,10 +163,7 @@ func (e *FencingTokenError) Error() string {
 }
 
 // IsStaleFencingToken reports whether err is a stale fencing-token rejection.
-func IsStaleFencingToken(err error) bool {
-	var stale *FencingTokenError
-	return errors.As(err, &stale)
-}
+func IsStaleFencingToken(err error) bool { return domain.IsErr[*FencingTokenError](err) }
 
 // LeaseInvalidatedError reports a lease issued at a source epoch that has since
 // been restored. The lease is invalid and the worker cannot continue the task
@@ -184,10 +180,7 @@ func (e *LeaseInvalidatedError) Error() string {
 
 // IsLeaseInvalidated reports whether err is a lease-invalidation rejection.
 // It is distinct from IsStaleFencingToken: the token may still be current.
-func IsLeaseInvalidated(err error) bool {
-	var invalid *LeaseInvalidatedError
-	return errors.As(err, &invalid)
-}
+func IsLeaseInvalidated(err error) bool { return domain.IsErr[*LeaseInvalidatedError](err) }
 
 // claimRecord is one held task. Key is the namespaced idempotency key that
 // created the claim; it is the identity of the operation, not of the task.
@@ -677,10 +670,7 @@ func (e *WorktreeLeaseBusyError) Error() string {
 }
 
 // IsWorktreeLeaseBusy reports whether err is a busy-worktree rejection.
-func IsWorktreeLeaseBusy(err error) bool {
-	var busy *WorktreeLeaseBusyError
-	return errors.As(err, &busy)
-}
+func IsWorktreeLeaseBusy(err error) bool { return domain.IsErr[*WorktreeLeaseBusyError](err) }
 
 // WorktreeLeaseExpiredError reports a write or release with no live lease. An
 // expired lease and a never-leased worktree both leave no authority to write.
@@ -693,10 +683,7 @@ func (e *WorktreeLeaseExpiredError) Error() string {
 }
 
 // IsWorktreeLeaseExpired reports whether err is an expired-or-free rejection.
-func IsWorktreeLeaseExpired(err error) bool {
-	var expired *WorktreeLeaseExpiredError
-	return errors.As(err, &expired)
-}
+func IsWorktreeLeaseExpired(err error) bool { return domain.IsErr[*WorktreeLeaseExpiredError](err) }
 
 // WorktreeLeaseStaleError reports a write with a token that no longer matches
 // the worktree. A newer lease was taken since the caller acquired its token,
@@ -711,10 +698,7 @@ func (e *WorktreeLeaseStaleError) Error() string {
 }
 
 // IsStaleWorktreeLease reports whether err is a stale worktree-token rejection.
-func IsStaleWorktreeLease(err error) bool {
-	var stale *WorktreeLeaseStaleError
-	return errors.As(err, &stale)
-}
+func IsStaleWorktreeLease(err error) bool { return domain.IsErr[*WorktreeLeaseStaleError](err) }
 
 // WorktreeLeaseOwnerError reports a write or release by an agent that does not
 // hold the worktree.
@@ -1087,10 +1071,7 @@ func (e *HolderLeaseNotFoundError) Error() string {
 }
 
 // IsHolderLeaseNotFound reports whether err is a missing-or-expired lease.
-func IsHolderLeaseNotFound(err error) bool {
-	var missing *HolderLeaseNotFoundError
-	return errors.As(err, &missing)
-}
+func IsHolderLeaseNotFound(err error) bool { return domain.IsErr[*HolderLeaseNotFoundError](err) }
 
 // HolderLeaseNotHolderError reports an extension requested by an agent that is
 // not in the lease's holder list.
@@ -1104,10 +1085,7 @@ func (e *HolderLeaseNotHolderError) Error() string {
 }
 
 // IsHolderLeaseNotHolder reports whether err is a non-holder rejection.
-func IsHolderLeaseNotHolder(err error) bool {
-	var notHolder *HolderLeaseNotHolderError
-	return errors.As(err, &notHolder)
-}
+func IsHolderLeaseNotHolder(err error) bool { return domain.IsErr[*HolderLeaseNotHolderError](err) }
 
 // holderLeaseRecord is one live holder lease. Holders is a private copy of the
 // installed list and ExpiresAt is the deadline the monotonic rule protects.

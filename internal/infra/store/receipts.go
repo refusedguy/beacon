@@ -748,10 +748,7 @@ func (e *FenceTokenStaleError) Error() string {
 }
 
 // IsStaleFenceToken reports whether err is a stale token rejection.
-func IsStaleFenceToken(err error) bool {
-	var stale *FenceTokenStaleError
-	return errors.As(err, &stale)
-}
+func IsStaleFenceToken(err error) bool { return domain.IsErr[*FenceTokenStaleError](err) }
 
 // EnqueueFenced commits the fence token, the receipt data change and the queue
 // row in one transaction (ADR 0049 §3). A token lower than the task's current

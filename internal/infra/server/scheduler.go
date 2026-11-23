@@ -24,6 +24,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 // Kind selects how a schedule fires. Values mirror the pure planner in
@@ -104,10 +106,7 @@ type ValidationError struct{ Msg string }
 func (e *ValidationError) Error() string { return e.Msg }
 
 // IsValidation reports whether err came from input validation.
-func IsValidation(err error) bool {
-	var v *ValidationError
-	return errors.As(err, &v)
-}
+func IsValidation(err error) bool { return domain.IsErr[*ValidationError](err) }
 
 func invalid(format string, a ...any) error {
 	return &ValidationError{Msg: fmt.Sprintf(format, a...)}
