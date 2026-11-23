@@ -223,26 +223,47 @@ Executor видит внешнюю поломку и отвечает `beacon_ac
 
 Полный каталог доступен через `beacon list --format json`. Справка по конкретной команде это `beacon what <command>`.
 
-| Команда | Что делает |
-| --- | --- |
-| `beacon list` | Показывает каталог команд |
-| `beacon what <command>` | Объясняет одну команду |
-| `beacon doctor`, `beacon build`, `beacon test`, `beacon gates` | Диагностика, сборка, тесты и гейты. Тесты и гейты выполняет CI |
-| `beacon task <list\|new\|take>`, `beacon why <task>` | Работает с карточками задач |
-| `beacon index build` | Пересобирает индекс карточек из `docs/tasks/` в state dir |
-| `beacon board` | Локальный TUI со списком задач, графом и фильтрами по статусу и владельцу |
-| `beacon mcp` | Поднимает MCP-сервер по stdio с реальным store |
-| `beacon orchestrate [--dry-run]` | Один проход оркестратора: вердикты, зависимости, wake |
-| `beacon orchestrator bind [--session <id>] [--dry-run]` | Привязывает сессию оркестратора проекта и печатает дайджест blocked, orphaned и escalated Watch. Сессия берётся из `--session` или `BEACON_SESSION_ID`. Подкоманда `rebind` устарела |
-| `beacon agents`, `beacon workload`, `beacon metrics` | Состояние агентов, нагрузка и метрики |
-| `beacon watch [--live] [--interval 2s]` | Таблица Watch и сессий. `--live` подписывается на SSE |
-| `beacon spawn <taskID>`, `beacon attach <sessionID>`, `beacon deliver <watchID>` | Создание сессии, подключение и доставка результата по Watch |
-| `beacon ci check --all` | Опрашивает открытые PR через CI-провайдер |
-| `beacon daemon [--interval 0 = адаптивный 10s/30s] [--once]` | Фоновый цикл. Интервал прохода по умолчанию: 0 = адаптивный 10s/30s |
-| `beacon pr create` | Открывает PR по карточке |
-| `beacon inspect [<pr\|watchID>] [--json]` | Читает Watch, блокеры, привязку оркестратора, счётчики и журнал эскалаций |
-| `beacon logs [--tail N] [--watch id] [--pr n] [--errors] [--json]` | Читает структурированные логи проекта |
-| `beacon reset --yes` | Очищает строки control plane проекта. Метаданные, квитанции и реестр агентов сохраняются |
+<!-- BEGIN COMMANDS -->
+| Команда | Что делает | Использование |
+| --- | --- | --- |
+| `agents` | Показать агентов OpenCode в режиме subagent или all | `beacon agents [--format table\|json] [--route] [--handoff <taskID>] [--to <sessionID>] [--task <taskID>] [--repo <repo>] [--worktree <dir>]` |
+| `attach` | Подключиться к сессии через фоновый сервис OpenCode или возобновить сохранённую сессию | `beacon attach <sessionID> \| beacon attach --resume [<taskID>]` |
+| `board` | Показать локальную доску карточек | `beacon board [--root <dir>] [--status <status>] [--owner <owner>]` |
+| `build` | Собрать воспроизводимый бинарник beacon | `beacon build` |
+| `ci` | Опросить открытые PR через CI-провайдер | `beacon ci check --all` |
+| `daemon` | Запустить фоновый цикл оркестратора | `beacon daemon [--interval 0 = адаптивный 10s/30s] [--once]` |
+| `deferred` | Показать отложенные wiring-карточки | `beacon deferred [--format table\|json] \| beacon deferred done <watchID>` |
+| `deliver` | Доставить результат по Watch в живую сессию | `beacon deliver <watchID>` |
+| `doctor` | Проверить версию Go, beacon-gates и каталог состояния или следить за внешним условием | `beacon doctor [--watch] [--interval 2s] [--session <id>] [--max-ticks <n>] [-- <команда>]` |
+| `gates` | Передать аргументы бинарнику beacon-gates | `beacon gates [gate] [flags]` |
+| `gc` | Очистить завершённые сессии Beacon | `beacon gc [--format table\|json] [--apply]` |
+| `gc-worktree` | Очистить устаревшие worktree | `beacon gc-worktree [--format table\|json] [--apply]` |
+| `human` | Принять решение оператора по вотче или блокеру | `beacon human [--format table\|json] <approve\|reject\|rework\|unblock\|pause\|resume\|cancel\|context\|force_retry_merge> <watchID\|blockerID> [--note "..."]` |
+| `index` | Пересобрать SQLite-индекс карточек | `beacon index build [--root <dir>]` |
+| `init` | Подготовить проект: хуки, шаблоны и проверка MCP | `beacon init [--root <dir>] [--force]` |
+| `inspect` | Показать состояние вотч, блокеров и привязки оркестратора | `beacon inspect [<pr\|watchID>] [--format table\|json] [--json]` |
+| `list` | Показать каталог команд | `beacon list [--format table\|json] [--markdown]` |
+| `logs` | Прочитать структурированные логи проекта | `beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--format table\|json] [--json]` |
+| `mcp` | Запустить MCP-сервер на stdio | `beacon mcp` |
+| `metrics` | Показать метрики цикла | `beacon metrics [--format json\|prometheus]` |
+| `orchestrate` | Один проход оркестратора: вердикты, зависимости, wake | `beacon orchestrate [--dry-run]` |
+| `orchestrator` | Привязать сессию оркестратора проекта | `beacon orchestrator bind [--session <id>] [--dry-run]` |
+| `pr` | Открыть PR по карточке | `beacon pr create` |
+| `registry` | Управлять реестром сессий проекта | `beacon registry <list\|check\|sync\|stop> [flags]` |
+| `regrade` | Пересчитать вердикт по сохранённым доказательствам Watch без повторного прогона | `beacon regrade [--watch <id>] [--dataset <name>] [--split <name>] [--declared <a,b>] [--save <file>] [--format table\|json]` |
+| `reset` | Очистить состояние control plane проекта | `beacon reset --yes` |
+| `server` | Запустить HTTP-сервер Beacon с лизингом единственного экземпляра | `beacon server` |
+| `spawn` | Создать сессию OpenCode для задачи Beacon и отправить промпт | `beacon spawn <taskID> [--agent id] [--title ...]` |
+| `task` | Работа с карточками задач | `beacon task <list\|new\|take> [flags]` |
+| `test` | Запустить тесты проекта через go test ./... | `beacon test` |
+| `trace` | Показать журнал wake, ack и retry одной сессии за интервал | `beacon trace --session <id> [--since <duration>] [--format table\|json]` |
+| `tui` | Открыть живой экран Beacon | `beacon tui [--root <dir>] [--status <status>] [--owner <owner>]` |
+| `up` | Автономный цикл Beacon: ReconcileLoop, статус и команды Telegram | `beacon up [--interval 2s] [--once] [--channels] [--tui]` |
+| `watch` | Показать вотчи Beacon с вердиктами и сессиями OpenCode, в живом режиме по событиям SSE | `beacon watch [--interval 2s] [--format table\|json] [--live] [--wake]` |
+| `what` | Показать описание одной команды | `beacon what <command>` |
+| `why` | Показать цепочку блокировок карточки | `beacon why <task>` |
+| `workload` | Показать нагрузку оркестратора | `beacon workload [--format table\|json]` |
+<!-- END COMMANDS -->
 
 Счётчики состояния доступны через инструмент MCP `beacon_stats`. Отдельной подкоманды `beacon stats` в CLI нет.
 

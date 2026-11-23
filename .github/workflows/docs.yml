@@ -11,6 +11,7 @@ on:
       - '.github/workflows/docs.yml'
       - 'tools/beacon-gates/gate/**'
       - 'tools/beacon-gates/docsgate/**'
+      - 'cmd/beacon/**'
 
 permissions:
   contents: read
@@ -43,3 +44,13 @@ jobs:
         run: |
           set -euo pipefail
           go run ./docsgate -root ../.. -baseline gate/config/docs-baseline.json
+
+      # TCG-17. README command table is generated from catalog.go; a change to
+      # a command summary or flag usage without a matching README edit fails.
+      - name: Check README command table matches catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./cmd/beacon list --markdown > /tmp/beacon-commands.md
+          awk '/<!-- BEGIN COMMANDS -->/{inside=1; next} /<!-- END COMMANDS -->/{inside=0} inside' README.md > /tmp/readme-commands.md
+          diff -u /tmp/readme-commands.md /tmp/beacon-commands.md
