@@ -94,7 +94,50 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	if err := ensureRunColumns(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("runs migration: %w", err)
+	}
 	return db, nil
+}
+
+// runMigrationColumns are the observation fields added after the initial runs
+// table. Each ALTER is guarded by a table_info check so existing state
+// databases keep their rows.
+var runMigrationColumns = []struct{ name, ddl string }{
+	{"observed_base_sha", "observed_base_sha TEXT NOT NULL DEFAULT ''"},
+}
+
+func ensureRunColumns(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA table_info(runs)`)
+	if err != nil {
+		return err
+	}
+	present := make(map[string]bool)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		present[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, col := range runMigrationColumns {
+		if !present[col.name] {
+			if _, err := db.Exec(`ALTER TABLE runs ADD COLUMN ` + col.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func nowUnix() int64 { return time.Now().UTC().UnixNano() }

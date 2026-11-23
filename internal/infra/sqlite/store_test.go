@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"path/filepath"
 	"testing"
@@ -250,5 +251,101 @@ func TestRunScopeAndIncidentPersistence(t *testing.T) {
 	})
 	if err != nil || again.ID != in.ID {
 		t.Fatalf("incident not idempotent: %+v %v", again, err)
+	}
+}
+
+func TestObservedBaseSHARoundTrip(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	run := core.NewRun("r1", "T-1", time.Now().UTC())
+	run.ObservedSHA = "head-1"
+	run.ObservedBaseSHA = "base-1"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, "r1")
+	if err != nil || got == nil {
+		t.Fatalf("get = %+v err=%v", got, err)
+	}
+	if got.ObservedSHA != "head-1" || got.ObservedBaseSHA != "base-1" {
+		t.Fatalf("bad observed roundtrip: %+v", got)
+	}
+
+	run.ObservedBaseSHA = "base-2"
+	if err := store.Save(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Get(ctx, "r1")
+	if err != nil || got == nil {
+		t.Fatalf("get after update = %+v err=%v", got, err)
+	}
+	if got.ObservedBaseSHA != "base-2" {
+		t.Fatalf("ObservedBaseSHA = %q, want base-2", got.ObservedBaseSHA)
+	}
+}
+
+func TestObservedBaseSHAMigrationPreservesRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	legacy, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = legacy.Exec(`
+CREATE TABLE runs (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  pr_number INTEGER NOT NULL DEFAULT 0,
+  head_sha TEXT NOT NULL DEFAULT '',
+  observed_sha TEXT NOT NULL DEFAULT '',
+  session_id TEXT NOT NULL DEFAULT '',
+  parent_session_id TEXT NOT NULL DEFAULT '',
+  workspace_path TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '',
+  scope_json TEXT NOT NULL DEFAULT '[]',
+  blocked_incident_id TEXT NOT NULL DEFAULT '',
+  is_fixer INTEGER NOT NULL DEFAULT 0,
+  rebase_attempts INTEGER NOT NULL DEFAULT 0,
+  fix_attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  reason TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`INSERT INTO runs (id, task_id, state, observed_sha, created_at, updated_at)
+VALUES ('r1', 'T-1', 'waiting_ci', 'head-1', 1, 2)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	got, err := store.Get(context.Background(), "r1")
+	if err != nil || got == nil {
+		t.Fatalf("get migrated run = %+v err=%v", got, err)
+	}
+	if got.ObservedSHA != "head-1" || got.ObservedBaseSHA != "" {
+		t.Fatalf("bad migrated run: %+v", got)
+	}
+	got.ObservedBaseSHA = "base-1"
+	if err := store.Save(context.Background(), got); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Get(context.Background(), "r1")
+	if err != nil || got == nil || got.ObservedBaseSHA != "base-1" {
+		t.Fatalf("write after migration = %+v err=%v", got, err)
 	}
 }
