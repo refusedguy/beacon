@@ -4072,15 +4072,15 @@ func TestStoreRedaction(t *testing.T) {
 				if err := d.PublishOutcome(WatchOutcome{Key: "secret-worker", Result: secret}); err != nil {
 					t.Fatalf("PublishOutcome: %v", err)
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-				defer cancel()
-				ch, err := d.WatchOutcome(ctx, "secret-worker")
-				if err != nil {
-					t.Fatalf("WatchOutcome: %v", err)
-				}
 				return []redactionSource{{
 					prefix: "delivered outcome kept a raw token",
 					read: func() []byte {
+						ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+						defer cancel()
+						ch, err := d.WatchOutcome(ctx, "secret-worker")
+						if err != nil {
+							t.Fatalf("WatchOutcome: %v", err)
+						}
 						select {
 						case o := <-ch:
 							return o.Result
