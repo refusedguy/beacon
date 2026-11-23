@@ -661,12 +661,12 @@ func TestWakeOneUsesExplicitReasonWaker(t *testing.T) {
 	reasonWaker := &fakeReasonWaker{}
 	w := Watch{ID: "w1", PR: 7, Revision: 3, Verdict: VerdictRetry}
 	out := &Result{}
-	var errs []error
+	errs := &observe.ErrorCollector{}
 
-	wakeOne(context.Background(), waker, reasonWaker, w, VerdictRetry, "ci red", out, &errs)
+	wakeOne(context.Background(), waker, reasonWaker, w, VerdictRetry, "ci red", out, errs)
 
-	if len(errs) != 0 {
-		t.Fatalf("unexpected errors: %v", errs)
+	if err := errs.Error(); err != nil {
+		t.Fatalf("unexpected errors: %v", err)
 	}
 	if len(waker.calls) != 0 {
 		t.Fatalf("plain waker must stay unused: %+v", waker.calls)
@@ -867,9 +867,9 @@ func TestWakeOneNamesOnlyRebaseAsRebase(t *testing.T) {
 
 			waker := &fakeWaker{}
 			out := &Result{}
-			var errs []error
+			errs := &observe.ErrorCollector{}
 			w := Watch{ID: "w1", PR: 7, Revision: 3, Verdict: tc.verdict}
-			wakeOne(context.Background(), waker, nil, w, tc.verdict, "reason", out, &errs)
+			wakeOne(context.Background(), waker, nil, w, tc.verdict, "reason", out, errs)
 
 			assertOrchCounter(t, metrics, observe.CounterRebaseRequests, tc.wantRebase)
 			if len(waker.calls) != 1 {
