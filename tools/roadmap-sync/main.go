@@ -103,6 +103,7 @@ type options struct {
 	repo   string
 	gitLog string
 	write  bool
+	check  bool
 }
 
 func main() {
@@ -113,10 +114,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("roadmap-sync", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	opts := options{}
+	selfTest := false
 	fs.StringVar(&opts.repo, "repo", ".", "repository root containing docs/tasks")
 	fs.StringVar(&opts.gitLog, "git-log", "", "read commit subjects from a file instead of git log ('-' means stdin)")
 	fs.BoolVar(&opts.write, "write", false, "write card status lines, an existing ROADMAP_STATUS.md and docs/adrs/README.md (default: dry run)")
+	fs.BoolVar(&opts.check, "check", false, "exit 1 when a card status line or a roadmap counter diverges from git history")
+	fs.BoolVar(&selfTest, "self-test", false, "run the planted divergence self-test for --check")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if selfTest {
+		return selfTestRun(stdout, stderr)
+	}
+	if opts.check && opts.write {
+		fmt.Fprintln(stderr, "roadmap-sync: --check and --write are mutually exclusive")
 		return 2
 	}
 
@@ -148,7 +159,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "roadmap-sync: roadmap: %v\n", err)
 		return 1
 	}
-	adrChanges, err := updateADRIndex(opts.repo, opts.write)
+	if opts.check {
+		return checkResult(opts, stdout, stderr, changes, roadmapChanges, counts)
+	}
+
+	var adrChanges []string
+	adrChanges, err = updateADRIndex(opts.repo, opts.write)
 	if err != nil {
 		fmt.Fprintf(stderr, "roadmap-sync: adr-index: %v\n", err)
 		return 1
@@ -181,6 +197,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintf(stdout, "priorities (todo only): %s\n", strings.Join(parts, " "))
 	return 0
+}
+
+// checkResult compares the resolved card statuses and the roadmap counters
+// with the tree. The ADR index and a missing ROADMAP_STATUS.md are not part of
+// the comparison: both are derived and absent from a fresh checkout (IDX-11).
+func checkResult(opts options, stdout, stderr io.Writer, changes, roadmapChanges []string, counts map[string]int) int {
+	if opts.gitLog == "" {
+		shallow, err := isShallowHistory(opts.repo)
+		if err != nil {
+			fmt.Fprintf(stderr, "roadmap-sync: history depth: %v\n", err)
+			return 1
+		}
+		if shallow {
+			fmt.Fprintln(stderr, "roadmap-sync: history is shallow; git log misses merged commits")
+			fmt.Fprintln(stderr, "roadmap-sync: fetch the full history with fetch-depth: 0 in CI")
+			return 1
+		}
+	}
+	divergences := make([]string, 0, len(changes)+len(roadmapChanges))
+	divergences = append(divergences, changes...)
+	divergences = append(divergences, roadmapChanges...)
+	if len(divergences) == 0 {
+		fmt.Fprintf(stdout, "roadmap-sync: check ok, done=%d dropped=%d todo=%d\n",
+			counts[statusDone], counts[statusDropped], counts[statusTodo])
+		return 0
+	}
+	fmt.Fprintf(stderr, "roadmap-sync: check failed, %d divergence(s) from git history\n", len(divergences))
+	for _, line := range divergences {
+		fmt.Fprintln(stderr, line)
+	}
+	return 1
 }
 
 // commitRecordMarker separates commits in git log output. Git passes the
@@ -238,11 +285,11 @@ func parseCommitRecords(data []byte) []commitRecord {
 	return records
 }
 
-// gitLogFromProcess runs git -C <repo> log with each subject and the paths it
-// changed. Starting the process through os instead of os/exec keeps this tool
-// clear of CAP-EXEC-IN-OUTSIDE. That gate has no exception for a new tools/
-// file, and its exception table is outside this tool's OwnerFiles.
-func gitLogFromProcess(repo string) ([]byte, error) {
+// runGit starts a git subcommand in repo. Starting the process through os
+// instead of os/exec keeps this tool clear of CAP-EXEC-IN-OUTSIDE. That gate
+// has no exception for a new tools/ file, and its exception table is outside
+// this tool's OwnerFiles.
+func runGit(repo string, args ...string) ([]byte, error) {
 	git, err := findGit()
 	if err != nil {
 		return nil, err
@@ -252,29 +299,51 @@ func gitLogFromProcess(repo string) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	args := []string{git, "-C", repo, "log", "--format=" + commitRecordMarker + "%s", "--name-only"}
-	proc, err := os.StartProcess(git, args, &os.ProcAttr{
+	proc, err := os.StartProcess(git, append([]string{git, "-C", repo}, args...), &os.ProcAttr{
 		Dir:   repo,
 		Files: []*os.File{os.Stdin, w, os.Stderr},
 	})
 	w.Close()
 	if err != nil {
-		return nil, fmt.Errorf("git -C %s log: %w", repo, err)
+		return nil, fmt.Errorf("git -C %s %s: %w", repo, strings.Join(args, " "), err)
 	}
 	var out bytes.Buffer
 	if _, err := io.Copy(&out, r); err != nil {
 		_ = proc.Kill()
 		_, _ = proc.Wait()
-		return nil, fmt.Errorf("git -C %s log: %w", repo, err)
+		return nil, fmt.Errorf("git -C %s %s: %w", repo, strings.Join(args, " "), err)
 	}
 	state, err := proc.Wait()
 	if err != nil {
-		return nil, fmt.Errorf("git -C %s log: %w", repo, err)
+		return nil, fmt.Errorf("git -C %s %s: %w", repo, strings.Join(args, " "), err)
 	}
 	if !state.Success() {
-		return nil, fmt.Errorf("git -C %s log: %s", repo, state.String())
+		return nil, fmt.Errorf("git -C %s %s: %s", repo, strings.Join(args, " "), state.String())
 	}
 	return out.Bytes(), nil
+}
+
+// gitLogFromProcess reads each subject and the paths it changed. A truncated
+// history hides merged commits, so check mode rejects it before comparing.
+func gitLogFromProcess(repo string) ([]byte, error) {
+	return runGit(repo, "log", "--format="+commitRecordMarker+"%s", "--name-only")
+}
+
+// isShallowHistory reports whether git sees a truncated commit history.
+func isShallowHistory(repo string) (bool, error) {
+	out, err := runGit(repo, "rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return false, err
+	}
+	answer := strings.TrimSpace(string(out))
+	switch answer {
+	case "false":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("unexpected --is-shallow-repository output %q", answer)
+	}
 }
 
 func findGit() (string, error) {
@@ -918,4 +987,79 @@ func updateADRIndex(repo string, write bool) ([]string, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return []string{line}, nil
+}
+
+// selfTestRun proves --check is green on a clean tree and red on two planted
+// divergences: a card that git history promotes while its status line stays
+// todo, and a roadmap counter that disagrees with the resolved cards. The
+// fixtures use --git-log, so the test needs no checkout and no network.
+func selfTestRun(stdout, stderr io.Writer) int {
+	root, err := os.MkdirTemp("", "roadmap-sync-selftest-")
+	if err != nil {
+		fmt.Fprintf(stderr, "self-test FAILED: fixture: %v\n", err)
+		return 1
+	}
+	defer os.RemoveAll(root)
+
+	const doneCard = "# T1.1 done\nСтатус: done\nФаза: P1\n"
+	const todoCard = "# T1.2 todo\nСтатус: todo\nФаза: P2\n"
+	const baseLog = "fix: close T1.1 (#1)\n"
+	const staleRoadmap = "# Beacon roadmap status\n\n" +
+		"- Закрыто done: **9**\n" +
+		"- Переведено dropped: **0**\n" +
+		"- Осталось реальных todo: **1**\n\n" +
+		"## Приоритеты\n\n- P2: 1\n"
+
+	base := map[string]string{
+		"git-log.txt":        baseLog,
+		"docs/tasks/T1.1.md": doneCard,
+		"docs/tasks/T1.2.md": todoCard,
+	}
+	withFile := func(extra map[string]string) map[string]string {
+		out := make(map[string]string, len(base)+len(extra))
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
+	runCase := func(name string, files map[string]string, want int) bool {
+		caseRoot := filepath.Join(root, strings.ReplaceAll(name, " ", "-"))
+		for rel, content := range files {
+			path := filepath.Join(caseRoot, rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				fmt.Fprintf(stderr, "self-test FAILED: %s: %v\n", name, err)
+				return false
+			}
+			if err := writeFile(path, []byte(content), 0o644); err != nil {
+				fmt.Fprintf(stderr, "self-test FAILED: %s: %v\n", name, err)
+				return false
+			}
+		}
+		logPath := filepath.Join(caseRoot, "git-log.txt")
+		var out, errOut bytes.Buffer
+		code := run([]string{"-repo", caseRoot, "-git-log", logPath, "-check"}, &out, &errOut)
+		if code != want {
+			fmt.Fprintf(stderr, "self-test FAILED: %s: code=%d want=%d\n%s%s",
+				name, code, want, out.String(), errOut.String())
+			return false
+		}
+		return true
+	}
+
+	ok := true
+	ok = runCase("clean tree", base, 0) && ok
+	ok = runCase("planted status divergence", withFile(map[string]string{
+		"git-log.txt": baseLog + "fix: close T1.2 (#2)\n",
+	}), 1) && ok
+	ok = runCase("planted counter divergence", withFile(map[string]string{
+		"docs/ROADMAP_STATUS.md": staleRoadmap,
+	}), 1) && ok
+	if !ok {
+		return 1
+	}
+	fmt.Fprintln(stdout, "self-test ok: clean tree green, planted status divergence red, planted counter divergence red")
+	return 0
 }
