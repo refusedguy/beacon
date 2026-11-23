@@ -15,6 +15,7 @@ import (
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/channel"
+	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/store"
@@ -145,16 +146,11 @@ const upIntervalDefault = 2 * time.Second
 // upIntervalFromEnv reads BEACON_UP_INTERVAL. An empty value leaves the flag
 // default in place. A bad value is reported and ignored.
 func upIntervalFromEnv() (time.Duration, bool) {
-	raw := strings.TrimSpace(os.Getenv(upIntervalEnv))
-	if raw == "" {
-		return 0, false
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
+	d, ok, raw := cibridge.DurationFromEnv(upIntervalEnv, 0)
+	if !ok && raw != "" {
 		observe.WarnConfig(upIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
-		return 0, false
 	}
-	return d, true
+	return d, ok
 }
 
 // runUp implements `beacon up [--interval 2s] [--once]`. It starts the same

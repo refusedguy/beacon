@@ -15,6 +15,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/httpapi"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -231,16 +232,11 @@ const watchIntervalDefault = 2 * time.Second
 // watchIntervalFromEnv reads BEACON_WATCH_INTERVAL. An empty value leaves the
 // flag default in place. A bad value is reported and ignored.
 func watchIntervalFromEnv() (time.Duration, bool) {
-	raw := strings.TrimSpace(os.Getenv(watchIntervalEnv))
-	if raw == "" {
-		return 0, false
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
+	d, ok, raw := cibridge.DurationFromEnv(watchIntervalEnv, 0)
+	if !ok && raw != "" {
 		observe.WarnConfig(watchIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
-		return 0, false
 	}
-	return d, true
+	return d, ok
 }
 
 // watchLiveDeps collects the seams of the HTTP live loop. A caller can pass

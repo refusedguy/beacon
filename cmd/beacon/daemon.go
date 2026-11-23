@@ -18,6 +18,7 @@ import (
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/app/tasks"
+	"github.com/refusedguy/beacon/internal/infra/cibridge"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
@@ -44,16 +45,11 @@ const daemonIntervalDescription = "0 = адаптивный 10s/30s"
 // the flag default in place. A bad value is reported and ignored so a typo
 // cannot stop the loop.
 func daemonIntervalFromEnv() (time.Duration, bool) {
-	raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv))
-	if raw == "" {
-		return 0, false
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
+	d, ok, raw := cibridge.DurationFromEnv(daemonIntervalEnv, 0)
+	if !ok && raw != "" {
 		observe.WarnConfig(daemonIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
-		return 0, false
 	}
-	return d, true
+	return d, ok
 }
 
 // daemonActorErrorCount reads the actor error counter of the process. The

@@ -36,19 +36,28 @@ const DefaultInWorkTimeout = 20 * time.Minute
 // ciPollIntervalEnv is the operator override for the bridge cadence.
 const ciPollIntervalEnv = "BEACON_CI_POLL_INTERVAL"
 
+// DurationFromEnv reads an environment override for an interval. Empty,
+// malformed and non-positive values return fallback with ok=false, so the
+// caller keeps its flag default or constant. raw is the trimmed value and lets
+// a caller report a rejected override without reading the environment again.
+func DurationFromEnv(env string, fallback time.Duration) (d time.Duration, ok bool, raw string) {
+	raw = strings.TrimSpace(os.Getenv(env))
+	if raw == "" {
+		return fallback, false, raw
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return fallback, false, raw
+	}
+	return d, true, raw
+}
+
 // PollInterval reads BEACON_CI_POLL_INTERVAL. An invalid or non-positive value
 // falls back to DefaultPollInterval so a bad setting cannot restore the hot
 // polling loop. The caller passes the result to New; the bridge itself does
 // not read the environment.
 func PollInterval() time.Duration {
-	raw := strings.TrimSpace(os.Getenv(ciPollIntervalEnv))
-	if raw == "" {
-		return DefaultPollInterval
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		return DefaultPollInterval
-	}
+	d, _, _ := DurationFromEnv(ciPollIntervalEnv, DefaultPollInterval)
 	return d
 }
 

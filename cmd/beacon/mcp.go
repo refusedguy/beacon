@@ -232,14 +232,9 @@ var (
 // it. A broken override falls back to the default so a bad setting cannot stop
 // the loop, but the ignored value reaches the log.
 func mcpDaemonInterval() time.Duration {
-	raw := strings.TrimSpace(os.Getenv(daemonIntervalEnv))
-	if raw == "" {
-		return orchestrator.DaemonInterval
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
+	d, ok, raw := cibridge.DurationFromEnv(daemonIntervalEnv, orchestrator.DaemonInterval)
+	if !ok && raw != "" {
 		observe.WarnConfig(daemonIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
-		return orchestrator.DaemonInterval
 	}
 	return d
 }
@@ -259,14 +254,9 @@ const defaultVerdictPollInterval = 30 * time.Second
 const verdictPollIntervalEnv = "BEACON_VERDICT_POLL_INTERVAL"
 
 func verdictPollInterval() time.Duration {
-	raw := strings.TrimSpace(os.Getenv(verdictPollIntervalEnv))
-	if raw == "" {
-		return defaultVerdictPollInterval
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
+	d, ok, raw := cibridge.DurationFromEnv(verdictPollIntervalEnv, defaultVerdictPollInterval)
+	if !ok && raw != "" {
 		observe.WarnConfig(verdictPollIntervalEnv, raw, "ожидается положительная длительность, используется значение по умолчанию")
-		return defaultVerdictPollInterval
 	}
 	return d
 }
