@@ -64,6 +64,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 	if free := d.inFlightLimit() - len(active); free < limit {
 		limit = free
 	}
+	budget := d.agentBudget(active)
+	logDispatchCandidates(ctx, len(ready), len(active), limit, budget)
 	if limit <= 0 {
 		return out, nil
 	}
@@ -72,18 +74,22 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		return out, err
 	}
 	out.Skipped = skipped
-	budget := d.agentBudget(active)
+	for _, s := range skipped {
+		logDispatchSkip(ctx, s)
+	}
 	for _, task := range chosen {
 		if existing, err := d.Store.FindActiveByTask(ctx, task.ID); err != nil {
 			return out, err
 		} else if existing != nil {
-			out.Skipped = append(out.Skipped, SkippedTask{
+			skip := SkippedTask{
 				TaskID:       task.ID,
 				Code:         SkipActiveRun,
 				BlockedBy:    task.ID,
 				BlockedByRun: existing.ID,
 				Reason:       "already has an active run",
-			})
+			}
+			out.Skipped = append(out.Skipped, skip)
+			logDispatchSkip(ctx, skip)
 			continue
 		}
 		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())
@@ -91,7 +97,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 			run.MaxAttempts = d.MaxAttempts
 		}
 		run.Scope = task.Scope
-		run.ParentSessionID = firstNonEmptyLocal(d.parentSession(ctx), d.ParentSessionID)
+		run.ParentSessionID = firstNonEmptyLocal(parentSession(ctx), d.ParentSessionID)
 		if err := d.Store.Save(ctx, run); err != nil {
 			return out, err
 		}
@@ -155,6 +161,7 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 }
 
 func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task) error {
+	ctx = WithCycleID(ctx, string(run.ID))
 	ws, err := d.Workspace.Create(ctx, task)
 	if err != nil {
 		return fmt.Errorf("workspace: %w", err)
@@ -178,6 +185,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	run.SessionID = session.ID
 	if session.PR != 0 {
 		run.PRNumber = session.PR
+		logTransitionWatchPR(ctx, run.ID, session.PR)
 	}
 	if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
 		return err
@@ -187,6 +195,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		_ = d.Workspace.Remove(ctx, ws)
 		return fmt.Errorf("save: %w", err)
 	}
+	logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
 	if err := d.Source.Claim(ctx, task.ID); err != nil {
 		return err
 	}
@@ -214,13 +223,6 @@ func (d *Dispatcher) agentBudget(active []*core.Run) int {
 	return limit - used
 }
 
-func (d *Dispatcher) parentSession(ctx context.Context) string {
-	if v, ok := ctx.Value(parentSessionKey{}).(string); ok {
-		return v
-	}
-	return ""
-}
-
 func firstNonEmptyLocal(values ...string) string {
 	for _, v := range values {
 		if v != "" {
@@ -228,12 +230,6 @@ func firstNonEmptyLocal(values ...string) string {
 		}
 	}
 	return ""
-}
-
-type parentSessionKey struct{}
-
-func WithParentSession(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, parentSessionKey{}, id)
 }
 
 func spawnPrompt(t core.Task, id core.RunID, ws string) string {
