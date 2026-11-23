@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -57,6 +58,37 @@ func TestManualCloseClosesRun(t *testing.T) {
 	}
 	if len(src.complete) != 0 || h.stops != 1 {
 		t.Fatalf("complete=%v stops=%d", src.complete, h.stops)
+	}
+}
+
+func TestExternalMergeOrCloseNotifiesParentWithState(t *testing.T) {
+	for _, tc := range []struct{ prState, wantState string }{
+		{"merged", "merged"},
+		{"closed", "closed"},
+	} {
+		t.Run(tc.prState, func(t *testing.T) {
+			r, store, _, h := externalReconciler(t, tc.prState, false)
+			run := store.runs["r1"]
+			run.ParentSessionID = "ses_parent"
+			if err := store.Save(context.Background(), run); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := r.Reconcile(context.Background(), 42); err != nil {
+				t.Fatal(err)
+			}
+			if len(h.notifications) != 1 {
+				t.Fatalf("notifications = %d, want 1", len(h.notifications))
+			}
+			got := h.notifications[0]
+			if got.sessionID != "ses_parent" {
+				t.Errorf("sessionID = %q, want ses_parent", got.sessionID)
+			}
+			for _, want := range []string{"42", "r1", tc.wantState} {
+				if !strings.Contains(got.text, want) {
+					t.Errorf("notification text %q missing %q", got.text, want)
+				}
+			}
+		})
 	}
 }
 

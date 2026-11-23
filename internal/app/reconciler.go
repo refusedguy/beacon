@@ -158,6 +158,7 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 	if err := r.Store.Save(ctx, run); err != nil {
 		return err
 	}
+	r.notifyParent(ctx, run, obs.PRNumber, string(run.State))
 	if !run.IsFixer {
 		if err := r.Source.Complete(ctx, run.TaskID); err != nil {
 			return err
@@ -249,6 +250,18 @@ func (r *Reconciler) notify(run *core.Run, subject, body string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return r.Notifier.Notify(ctx, core.Notification{RunID: run.ID, Subject: subject, Body: compact(body)})
+}
+
+// notifyParent drops a quiet line in the orchestrator's session so it learns
+// the merge result without being woken. A missing parent or harness is fine.
+func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, state string) {
+	if run.ParentSessionID == "" || r.Harness == nil {
+		return
+	}
+	text := fmt.Sprintf("Beacon: PR #%d run %s state %s", pr, run.ID, state)
+	if err := r.Harness.NotifyParent(ctx, run.ParentSessionID, text); err != nil {
+		slog.Error("notify parent", "run", run.ID, "error", err)
+	}
 }
 
 func compact(s string) string {

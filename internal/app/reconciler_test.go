@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -127,6 +128,62 @@ func TestReconcileMergeSkipsCardForFixer(t *testing.T) {
 	}
 	if observes != 1 {
 		t.Fatalf("fixer re-observed PR: %v", log.items)
+	}
+}
+
+func TestReconcileMergeNotifiesParentAfterMerge(t *testing.T) {
+	r, store, scm, h, _ := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	run := store.runs["r1"]
+	run.ParentSessionID = "ses_parent"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	log := &callLog{}
+	scm.log = log
+	h.log = log
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	mergeAt, notifyAt := -1, -1
+	for i, entry := range log.items {
+		switch entry {
+		case "merge":
+			if mergeAt < 0 {
+				mergeAt = i
+			}
+		case "notify_parent":
+			if notifyAt < 0 {
+				notifyAt = i
+			}
+		}
+	}
+	if mergeAt < 0 || notifyAt < 0 || notifyAt <= mergeAt {
+		t.Fatalf("notification must follow merge: %v", log.items)
+	}
+	if len(h.notifications) != 1 {
+		t.Fatalf("notifications = %d, want 1", len(h.notifications))
+	}
+	got := h.notifications[0]
+	if got.sessionID != "ses_parent" {
+		t.Errorf("sessionID = %q, want ses_parent", got.sessionID)
+	}
+	for _, want := range []string{"42", "r1", "merged"} {
+		if !strings.Contains(got.text, want) {
+			t.Errorf("notification text %q missing %q", got.text, want)
+		}
+	}
+}
+
+func TestReconcileMergeWithoutParentSkipsNotification(t *testing.T) {
+	r, _, _, h, _ := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.notifications) != 0 {
+		t.Fatalf("notifications = %d, want 0", len(h.notifications))
 	}
 }
 
