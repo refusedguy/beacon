@@ -66,6 +66,7 @@ type fakeStore struct {
 	deliveries map[string]bool
 	approvals  map[string]bool
 	tasks      []core.Task
+	ready      []core.Task
 	taskStatus map[string]string
 	incidents  map[string]*core.BaseIncident
 }
@@ -160,6 +161,9 @@ func (f *fakeStore) SyncTasks(_ context.Context, tasks []core.Task) error {
 	return nil
 }
 func (f *fakeStore) ListReadyTasks(context.Context) ([]core.Task, error) {
+	if f.ready != nil {
+		return f.ready, nil
+	}
 	return f.tasks, nil
 }
 func (f *fakeStore) SetTaskStatus(_ context.Context, taskID core.TaskID, status string) error {

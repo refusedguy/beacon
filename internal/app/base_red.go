@@ -40,10 +40,11 @@ func signature(repo, base string, names []string) string {
 }
 
 func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.Observation, reason string) error {
-	if r.BaseBranch == "" {
+	baseBranch := r.baseBranchFor(ctx, run)
+	if baseBranch == "" {
 		return nil
 	}
-	base, err := r.SCM.BaseBranchStatus(ctx, r.BaseBranch)
+	base, err := r.SCM.BaseBranchStatus(ctx, baseBranch)
 	if err != nil {
 		return err
 	}
@@ -55,8 +56,8 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 		return nil
 	}
 	in, err := r.Store.CreateIncident(ctx, &core.BaseIncident{
-		Repo: r.Repo, BaseBranch: r.BaseBranch,
-		Signature:        signature(r.Repo, r.BaseBranch, prFailed),
+		Repo: r.Repo, BaseBranch: baseBranch,
+		Signature:        signature(r.Repo, baseBranch, prFailed),
 		FailedChecksJSON: sqliteChecks(prFailed),
 	})
 	if err != nil {
@@ -71,6 +72,9 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 			continue
 		}
 		if other.State != core.RunWaitingCI && other.State != core.RunNeedsAgentFix {
+			continue
+		}
+		if r.baseBranchFor(ctx, other) != baseBranch {
 			continue
 		}
 		otherObs, err := r.SCM.Observe(ctx, other.PRNumber)
@@ -125,7 +129,7 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	id := core.RunID(fmt.Sprintf("fix-%s-%d", in.ID, attempt))
 	task := core.Task{
 		ID:    core.TaskID(fmt.Sprintf("FIX-%s-%d", in.ID, attempt)),
-		Title: "Fix red base branch " + r.BaseBranch,
+		Title: "Fix red base branch " + base.BaseBranch,
 		Scope: []core.ScopePath{core.ScopeAll()},
 	}
 	ws, err := r.Workspace.Create(ctx, task)

@@ -17,7 +17,11 @@ type Config struct {
 	RequiredApprovals int
 	Labels            []string
 	CommandGate       string
+	ReviewMode        core.ReviewMode
 }
+
+// ReviewRule gates epic pull requests on review approval.
+type ReviewRule = app.ReviewRule
 
 type Policy struct {
 	criteria []core.Criterion
@@ -36,6 +40,9 @@ func New(cfg Config) *Policy {
 	}
 	if strings.TrimSpace(cfg.CommandGate) != "" {
 		rules = append(rules, CommandRule{Command: cfg.CommandGate})
+	}
+	if cfg.ReviewMode == core.ReviewModeHuman || cfg.ReviewMode == core.ReviewModeLLM {
+		rules = append(rules, ReviewRule{Mode: cfg.ReviewMode})
 	}
 	return &Policy{criteria: rules}
 }

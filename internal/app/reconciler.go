@@ -63,7 +63,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	case core.VerdictNoop:
 		return decision, nil
 	case core.VerdictMerge:
-		return decision, r.merge(ctx, run, obs)
+		return r.mergeIfReviewed(ctx, run, obs, decision)
 	case core.VerdictNeedsRebase:
 		if !r.AutoRebase {
 			return core.MergeDecision{Verdict: core.VerdictWait, Reason: "auto_rebase disabled"}, nil
@@ -81,7 +81,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 				mergeable.Behind = false
 				if merged := r.Policy.Evaluate(mergeable); merged.Verdict == core.VerdictMerge {
 					run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
-					return merged, r.merge(ctx, run, obs)
+					return r.mergeIfReviewed(ctx, run, obs, merged)
 				}
 			}
 			return decision, nil
@@ -150,7 +150,8 @@ func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Eve
 }
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
-	if !run.IsFixer {
+	_, isEpic := r.epicTask(ctx, run.TaskID)
+	if !run.IsFixer && !isEpic {
 		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
 			return err
 		}
@@ -190,6 +191,11 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 		}
 		if err := r.Store.SetTaskStatus(ctx, run.TaskID, "done"); err != nil {
 			return err
+		}
+		if parentEpicID(run.TaskID) != "" {
+			if err := r.reconcileEpics(ctx); err != nil {
+				slog.Error("reconcile epics after child merge", "error", err)
+			}
 		}
 	}
 	return r.cleanupRun(ctx, run)
@@ -257,37 +263,6 @@ func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
 	return r.Dispatcher.agentBudget(active) > 0
 }
 
-func (r *Reconciler) notify(run *core.Run, subject, body string) error {
-	if r.Notifier == nil {
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return r.Notifier.Notify(ctx, core.Notification{RunID: run.ID, Subject: subject, Body: compact(body)})
-}
-
-func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, state string) {
-	if run.ParentSessionID == "" || r.Harness == nil {
-		return
-	}
-	text := fmt.Sprintf("Beacon: PR #%d run %s state %s", pr, run.ID, state)
-	if err := r.Harness.NotifyParent(ctx, run.ParentSessionID, text); err != nil {
-		slog.Error("notify parent", "run", run.ID, "error", err)
-		logTransitionParentNotify(ctx, run.ID, pr, "failed")
-		return
-	}
-	logTransitionParentNotify(ctx, run.ID, pr, "notified")
-}
-
-func compact(s string) string {
-	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", ""))
-	runes := []rune(s)
-	if len(runes) <= 1200 {
-		return s
-	}
-	return string(runes[:1200]) + "\n...[truncated]"
-}
-
 // Run drains change events and polls. One failing PR never stops the loop.
 func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 	ticker := time.NewTicker(r.interval())
@@ -305,6 +280,9 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 		case <-ticker.C:
 			if err := r.checkBaseRecovery(ctx); err != nil {
 				slog.Error("base recovery", "error", err)
+			}
+			if err := r.reconcileEpics(ctx); err != nil {
+				slog.Error("reconcile epics", "error", err)
 			}
 			runs, err := r.Store.ListActive(ctx)
 			if err != nil {

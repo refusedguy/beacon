@@ -143,6 +143,39 @@ func TestEvaluateFailingCommandGateReturnsBlocked(t *testing.T) {
 	}
 }
 
+func TestReviewRuleWaitsForApprovalUnlessSkipped(t *testing.T) {
+	for _, tc := range []struct {
+		mode      core.ReviewMode
+		approvals int
+		want      core.Verdict
+	}{
+		{core.ReviewModeLLM, 0, core.VerdictWait},
+		{core.ReviewModeHuman, 0, core.VerdictWait},
+		{core.ReviewModeLLM, 1, core.VerdictNoop},
+		{core.ReviewModeHuman, 1, core.VerdictNoop},
+		{core.ReviewModeNone, 0, core.VerdictNoop},
+	} {
+		rule := ReviewRule{Mode: tc.mode}
+		got, _ := rule.Evaluate(core.Observation{PRState: "open", Approvals: tc.approvals})
+		if got != tc.want {
+			t.Errorf("mode=%s approvals=%d verdict=%s, want %s", tc.mode, tc.approvals, got, tc.want)
+		}
+	}
+}
+
+func TestConfigReviewModeAddsReviewCriterion(t *testing.T) {
+	for _, mode := range []core.ReviewMode{core.ReviewModeLLM, core.ReviewModeHuman} {
+		got := New(Config{ReviewMode: mode}).Evaluate(core.Observation{PRState: "open"})
+		if got.Verdict != core.VerdictWait || got.Criterion != "review" {
+			t.Errorf("mode=%s decision=%+v, want wait/review", mode, got)
+		}
+	}
+	got := New(Config{ReviewMode: core.ReviewModeNone}).Evaluate(core.Observation{PRState: "open"})
+	if got.Verdict != core.VerdictMerge {
+		t.Fatalf("none mode decision = %+v, want merge", got)
+	}
+}
+
 func TestRulePassReturnsNoopWithEmptyReason(t *testing.T) {
 	obs := core.Observation{
 		PRState:   "open",
