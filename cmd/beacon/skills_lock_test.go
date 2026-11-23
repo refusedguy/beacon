@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -129,5 +130,118 @@ func TestRepoSkillsLockIsCurrent(t *testing.T) {
 	}
 	if len(findings) != 0 {
 		t.Fatalf("skills-lock.json is stale: %v", findings)
+	}
+}
+
+// runSkillsLockForTest drives the command the same way the CLI dispatcher does.
+func runSkillsLockForTest(t *testing.T, root string, args ...string) int {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	cli := &CLI{out: &out, errOut: &errOut, root: root}
+	return cli.runSkillsLock(args)
+}
+
+func readLockBytes(t *testing.T, root string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(root, skillsLockFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func TestWriteSkillsLockIsByteStable(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "one", "name: one\n")
+	writeSkill(t, root, "two", "name: two\n")
+
+	if code := runSkillsLockForTest(t, root, "--write"); code != 0 {
+		t.Fatalf("write exit = %d, want 0", code)
+	}
+	first := readLockBytes(t, root)
+	if code := runSkillsLockForTest(t, root, "--write"); code != 0 {
+		t.Fatalf("second write exit = %d, want 0", code)
+	}
+	second := readLockBytes(t, root)
+	if !bytes.Equal(first, second) {
+		t.Fatalf("second write changed the lock:\n%s\n---\n%s", first, second)
+	}
+	if code := runSkillsLockForTest(t, root, "--check"); code != 0 {
+		t.Fatalf("check after write exit = %d, want 0", code)
+	}
+}
+
+func TestWriteSkillsLockAddsAndRemovesEntries(t *testing.T) {
+	root := t.TempDir()
+	first := writeSkill(t, root, "one", "name: one\n")
+	writeSkill(t, root, "two", "name: two\n")
+	if code := runSkillsLockForTest(t, root, "--write"); code != 0 {
+		t.Fatalf("write exit = %d, want 0", code)
+	}
+
+	if err := os.RemoveAll(filepath.Join(root, filepath.FromSlash(first))); err != nil {
+		t.Fatal(err)
+	}
+	writeSkill(t, root, "three", "name: three\n")
+	if code := runSkillsLockForTest(t, root, "--write"); code != 0 {
+		t.Fatalf("write after skill change exit = %d, want 0", code)
+	}
+
+	var lock skillsLock
+	if err := json.Unmarshal(readLockBytes(t, root), &lock); err != nil {
+		t.Fatal(err)
+	}
+	if lock.Version != skillsLockVersion {
+		t.Fatalf("version = %d, want %d", lock.Version, skillsLockVersion)
+	}
+	names := make(map[string]bool, len(lock.Skills))
+	for _, entry := range lock.Skills {
+		names[entry.Name] = true
+	}
+	if !names["two"] || !names["three"] || names["one"] {
+		t.Fatalf("locked skills = %v, want two and three only", names)
+	}
+}
+
+func TestSkillsLockCheckDetectsDriftAndWriteRepairs(t *testing.T) {
+	root := t.TempDir()
+	first := writeSkill(t, root, "one", "name: one\n")
+	if code := runSkillsLockForTest(t, root, "--write"); code != 0 {
+		t.Fatalf("write exit = %d, want 0", code)
+	}
+	if code := runSkillsLockForTest(t, root, "--check"); code != 0 {
+		t.Fatalf("check exit = %d, want 0", code)
+	}
+
+	// One edited file inside a skill changes its computedHash.
+	extra := filepath.Join(root, filepath.FromSlash(first), "extra.md")
+	if err := os.WriteFile(extra, []byte("edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runSkillsLockForTest(t, root, "--check"); code == 0 {
+		t.Fatal("--check passed with an edited skill file")
+	}
+
+	// A new skill without a lock entry also fails the check.
+	writeSkill(t, root, "two", "name: two\n")
+	if code := runSkillsLockForTest(t, root, "--check"); code == 0 {
+		t.Fatal("--check passed with an unpinned skill")
+	}
+
+	if code := runSkillsLockForTest(t, root, "--write"); code != 0 {
+		t.Fatalf("repair write exit = %d, want 0", code)
+	}
+	if code := runSkillsLockForTest(t, root, "--check"); code != 0 {
+		t.Fatalf("check after repair exit = %d, want 0", code)
+	}
+}
+
+func TestSkillsLockCommandRequiresOneMode(t *testing.T) {
+	root := t.TempDir()
+	writeSkill(t, root, "one", "name: one\n")
+	for _, args := range [][]string{{}, {"--write", "--check"}} {
+		if code := runSkillsLockForTest(t, root, args...); code == 0 {
+			t.Fatalf("exit = 0 for args %v, want non-zero", args)
+		}
 	}
 }

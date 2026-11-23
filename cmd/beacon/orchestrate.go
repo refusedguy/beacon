@@ -1020,6 +1020,57 @@ func verifySkillsLock(root string) ([]skillsLockFinding, error) {
 	return findings, nil
 }
 
+// skillsLockWriteFile is the file capability seam for regenerating the lock.
+// Direct os.WriteFile is forbidden in cmd/beacon (ADR 0005).
+var skillsLockWriteFile = os.WriteFile
+
+// buildSkillsLock recomputes the lock from the skill directories currently on
+// disk. It calls hashSkillDir, so a pinned hash and a generated hash cannot use
+// different algorithms. Entries are sorted by path to keep the output stable.
+func buildSkillsLock(root string) (skillsLock, error) {
+	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(skillsLockDir)))
+	if err != nil {
+		return skillsLock{}, err
+	}
+	lock := skillsLock{Version: skillsLockVersion, Skills: []skillsLockEntry{}}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		rel := skillsLockDir + "/" + entry.Name()
+		hash, err := hashSkillDir(root, rel)
+		if err != nil {
+			return skillsLock{}, err
+		}
+		lock.Skills = append(lock.Skills, skillsLockEntry{
+			Name:         entry.Name(),
+			Path:         rel,
+			ComputedHash: hash,
+		})
+	}
+	sort.Slice(lock.Skills, func(i, j int) bool { return lock.Skills[i].Path < lock.Skills[j].Path })
+	return lock, nil
+}
+
+// writeSkillsLock regenerates and writes skills-lock.json. Indent and trailing
+// newline match the checked-in version 1 format, so two runs over the same
+// skill tree produce a byte-identical file.
+func writeSkillsLock(root string) (skillsLock, error) {
+	lock, err := buildSkillsLock(root)
+	if err != nil {
+		return skillsLock{}, err
+	}
+	data, err := json.MarshalIndent(lock, "", "  ")
+	if err != nil {
+		return skillsLock{}, err
+	}
+	data = append(data, '\n')
+	if err := skillsLockWriteFile(filepath.Join(root, skillsLockFile), data, 0o644); err != nil {
+		return skillsLock{}, err
+	}
+	return lock, nil
+}
+
 // ---------------------------------------------------------------------------
 // One-time config rule migration (CCx-08)
 // ---------------------------------------------------------------------------
