@@ -32,9 +32,59 @@ const (
 )
 
 // ErrTelegramTransport marks a failed Telegram request. Callers use errors.Is
-// to detect transport failures. The original cause stays unwrapped because its
-// text can carry the token from the request URL.
+// to detect transport failures. The cause is kept in a redacted chain because
+// its text can carry the token from the request URL.
 var ErrTelegramTransport = errors.New("wake: telegram transport failure")
+
+// redactedTransportError keeps an HTTP failure out of error text. Both wake
+// transports build request URLs that may hold a credential, so neither Error
+// nor Unwrap may return the original error value. The copied chain below keeps
+// the sentinels that errors.Is needs.
+type redactedTransportError struct {
+	message string
+	chain   error
+}
+
+func (e *redactedTransportError) Error() string { return e.message }
+
+func (e *redactedTransportError) Unwrap() error { return e.chain }
+
+// redactedCause copies one node of the original chain. Is matches the same
+// sentinels as the original node. Error returns sanitized text, and Unwrap
+// returns another redacted node, so errors.As cannot reach the original type.
+type redactedCause struct {
+	message string
+	origin  error
+	next    error
+}
+
+func (e *redactedCause) Error() string { return e.message }
+
+func (e *redactedCause) Is(target error) bool { return errors.Is(e.origin, target) }
+
+func (e *redactedCause) Unwrap() error { return e.next }
+
+// newRedactedTransportError keeps message byte for byte and builds a safe chain
+// from the marker and the original cause. A nil marker is used by transports
+// that have no sentinel of their own.
+func newRedactedTransportError(message string, sanitize func(string) string, marker, cause error) error {
+	return &redactedTransportError{message: message, chain: redactedCauseChain(marker, cause, sanitize)}
+}
+
+func redactedCauseChain(marker, cause error, sanitize func(string) string) error {
+	var next error
+	if cause != nil {
+		next = &redactedCause{
+			message: sanitize(cause.Error()),
+			origin:  cause,
+			next:    redactedCauseChain(nil, errors.Unwrap(cause), sanitize),
+		}
+	}
+	if marker == nil {
+		return next
+	}
+	return &redactedCause{message: marker.Error(), origin: marker, next: next}
+}
 
 // TelegramConfig is the boundary between the process environment and the
 // transport. Token and ChatID are secrets and never appear in a log field;
@@ -215,8 +265,7 @@ type telegramResponse struct {
 func (s *TelegramNotifySink) call(ctx context.Context, method string, payload any, out any) error {
 	endpoint := s.base + "/bot" + s.cfg.Token + "/" + method
 	if s.baseRejected {
-		return fmt.Errorf("wake: telegram %s: transport: %w: %s",
-			method, ErrTelegramTransport, s.sanitize("refused endpoint "+endpoint))
+		return s.transportError(method, "transport", errors.New("refused endpoint "+endpoint))
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -224,27 +273,38 @@ func (s *TelegramNotifySink) call(ctx context.Context, method string, payload an
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("wake: telegram %s: request: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
+		return s.transportError(method, "request", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := s.doer.Do(req)
 	if err != nil {
-		return fmt.Errorf("wake: telegram %s: transport: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
+		return s.transportError(method, "transport", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, telegramMaxRespBytes))
 	if err != nil {
-		return fmt.Errorf("wake: telegram %s: read: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
+		return s.transportError(method, "read", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("wake: telegram %s: status %d: %s", method, resp.StatusCode, s.sanitize(string(raw)))
 	}
 	if err := decodeTelegramResult(raw, out); err != nil {
-		return fmt.Errorf("wake: telegram %s: %w: %s", method, ErrTelegramTransport, s.sanitize(err.Error()))
+		return s.transportError(method, "", err)
 	}
 	return nil
+}
+
+// transportError keeps the old error text and replaces the lost %w cause with
+// a redacted chain. An empty stage renders the decode-error format.
+func (s *TelegramNotifySink) transportError(method, stage string, cause error) error {
+	prefix := "wake: telegram " + method + ": "
+	if stage != "" {
+		prefix += stage + ": "
+	}
+	message := prefix + ErrTelegramTransport.Error() + ": " + s.sanitize(cause.Error())
+	return newRedactedTransportError(message, s.sanitize, ErrTelegramTransport, cause)
 }
 
 // decodeTelegramResult accepts both shapes the Bot API and mocks return: the

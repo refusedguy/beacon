@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/infra/observe"
@@ -229,6 +231,61 @@ func TestTelegramTransportErrorKeepsSentinelAndRedactsToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "[REDACTED]") {
 		t.Fatalf("err = %v, want the redaction marker", err)
+	}
+}
+
+func TestTelegramTransportErrorKeepsCauseSentinelsWithoutLeakingURL(t *testing.T) {
+	const token = "secret-token"
+	cases := []struct {
+		name string
+		leaf error
+		want error
+	}{
+		{"deadline", context.DeadlineExceeded, context.DeadlineExceeded},
+		{"refused", syscall.ECONNREFUSED, syscall.ECONNREFUSED},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cause := &url.Error{
+				Op:  "Post",
+				URL: "http://example.test/bot" + token + "/sendMessage",
+				Err: tc.leaf,
+			}
+			sink := NewTelegramNotifySink(TelegramConfig{
+				Token:   token,
+				ChatID:  "42",
+				APIBase: "http://example.test",
+				Doer:    &failingDoer{err: cause},
+			})
+
+			err := sink.SendText(context.Background(), "42", "hello")
+			if err == nil {
+				t.Fatal("transport failure must return an error")
+			}
+			want := "wake: telegram sendMessage: transport: " +
+				ErrTelegramTransport.Error() + ": " + sink.sanitize(cause.Error())
+			if err.Error() != want {
+				t.Fatalf("err = %q, want %q", err.Error(), want)
+			}
+			if !errors.Is(err, ErrTelegramTransport) {
+				t.Fatalf("err = %v, want ErrTelegramTransport", err)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v in the chain", err, tc.want)
+			}
+			if strings.Contains(err.Error(), token) {
+				t.Fatalf("err leaked the token: %v", err)
+			}
+			var urlErr *url.Error
+			if errors.As(err, &urlErr) {
+				t.Fatalf("errors.As reached url.Error with URL %q", urlErr.URL)
+			}
+			for node := errors.Unwrap(err); node != nil; node = errors.Unwrap(node) {
+				if strings.Contains(node.Error(), token) {
+					t.Fatalf("unwrapped chain leaked the token: %v", node)
+				}
+			}
+		})
 	}
 }
 

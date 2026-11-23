@@ -166,24 +166,31 @@ func (s *NtfyNotifySink) Send(ctx context.Context, text string) error {
 	endpoint := s.base + "/" + url.PathEscape(s.topic)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(clean))
 	if err != nil {
-		return fmt.Errorf("wake: ntfy: request: %s", s.sanitize(err.Error()))
+		return s.transportError("request", err)
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 
 	resp, err := s.doer.Do(req)
 	if err != nil {
-		return fmt.Errorf("wake: ntfy: transport: %s", s.sanitize(err.Error()))
+		return s.transportError("transport", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, ntfyMaxRespBytes))
 	if err != nil {
-		return fmt.Errorf("wake: ntfy: read: %s", s.sanitize(err.Error()))
+		return s.transportError("read", err)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return fmt.Errorf("wake: ntfy: status %d: %s", resp.StatusCode, s.sanitize(string(raw)))
 	}
 	return nil
+}
+
+// transportError keeps the old error text and carries the cause sentinels in a
+// redacted chain. The original error value stays out of Error and Unwrap.
+func (s *NtfyNotifySink) transportError(stage string, cause error) error {
+	message := "wake: ntfy: " + stage + ": " + s.sanitize(cause.Error())
+	return newRedactedTransportError(message, s.sanitize, nil, cause)
 }
 
 func (s *NtfyNotifySink) sanitize(raw string) string {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -222,6 +223,44 @@ func TestNtfyNotifySinkReportsServerError(t *testing.T) {
 	sink = NewNtfyNotifySink(NtfyConfig{Topic: "beacon-alerts", Doer: doer})
 	if err := sink.Notify(context.Background(), Notification{Kind: NotifyBlockerOpened, WatchID: "w1"}); err == nil {
 		t.Fatal("Notify returned nil for a transport error")
+	}
+}
+
+func TestNtfyTransportErrorKeepsCauseSentinelsWithoutLeakingSecret(t *testing.T) {
+	const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+	cause := &url.Error{
+		Op:  "Post",
+		URL: "https://ntfy.example.test/" + secret + "/alerts",
+		Err: context.DeadlineExceeded,
+	}
+	sink := NewNtfyNotifySink(NtfyConfig{
+		URL:   "https://ntfy.example.test",
+		Topic: "alerts",
+		Doer:  &ntfyFakeDoer{err: cause},
+	})
+
+	err := sink.Send(context.Background(), "hello")
+	if err == nil {
+		t.Fatal("transport failure must return an error")
+	}
+	want := "wake: ntfy: transport: " + sink.sanitize(cause.Error())
+	if err.Error() != want {
+		t.Fatalf("err = %q, want %q", err.Error(), want)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("err leaked the secret: %v", err)
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		t.Fatalf("errors.As reached url.Error with URL %q", urlErr.URL)
+	}
+	for node := errors.Unwrap(err); node != nil; node = errors.Unwrap(node) {
+		if strings.Contains(node.Error(), secret) {
+			t.Fatalf("unwrapped chain leaked the secret: %v", node)
+		}
 	}
 }
 
