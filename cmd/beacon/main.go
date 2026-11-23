@@ -5,9 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -54,7 +58,7 @@ func wire(path, parentSession string) (*wiring, error) {
 	if sourceToken == "" {
 		sourceToken = scmToken
 	}
-	harnessToken := os.Getenv(cfg.Harness.TokenEnv)
+	harnessToken := firstNonEmpty(os.Getenv(cfg.Harness.TokenEnv), cfg.Harness.Token)
 	store, err := sqlite.Open(cfg.StateDB)
 	if err != nil {
 		return nil, err
@@ -90,9 +94,10 @@ func wire(path, parentSession string) (*wiring, error) {
 		Source:    source,
 		Planner:   planner.New(planner.Options{ByPath: true, ByDependency: true, Strict: cfg.StrictScope}),
 		Workspace: wt, Harness: h, Store: store,
-		Concurrency: core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
-		StrictScope: cfg.StrictScope,
-		MaxAttempts: cfg.Merge.MaxAttempts,
+		Concurrency:     core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
+		StrictScope:     cfg.StrictScope,
+		MaxAttempts:     cfg.Merge.MaxAttempts,
+		ParentSessionID: firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
 	}
 	ctrl := &app.Control{Store: store, Harness: h, Workspace: wt, OnChange: func(pr int) {
 		select {
@@ -122,9 +127,11 @@ func wire(path, parentSession string) (*wiring, error) {
 }
 
 func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, error) {
+	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
 	switch cfg.Harness.Provider {
 	case "opencode", "":
-		h := opencode.New(cfg.Harness.Endpoint, cfg.Harness.Model, cfg.Harness.Command, token, firstNonEmpty(parent, cfg.Harness.ParentSessionID))
+		h := opencode.New(cfg.Harness.Endpoint, cfg.Harness.Model, cfg.Harness.Command, token, parent)
+		h.ModelRef = resolveModel(cfg, token, parent)
 		return h, nil
 	default:
 		return harness.New(harness.Config{
@@ -132,6 +139,56 @@ func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, err
 			PromptTemplate: cfg.Harness.PromptTemplate,
 		})
 	}
+}
+
+// resolveModel uses the configured model, then BEACON_MODEL, then the model
+// of the orchestrator session so workers run with the user's current choice.
+func resolveModel(cfg config.Config, token, parent string) map[string]string {
+	if v := os.Getenv("BEACON_MODEL"); v != "" {
+		return map[string]string{"providerID": "opencode", "id": v}
+	}
+	if cfg.Harness.Model != "" {
+		return map[string]string{"providerID": "opencode", "id": cfg.Harness.Model}
+	}
+	if parent == "" || token == "" || cfg.Harness.Endpoint == "" {
+		return nil
+	}
+	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil
+	}
+	if user, pass, ok := strings.Cut(token, ":"); ok {
+		req.SetBasicAuth(user, pass)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil
+	}
+	var info struct {
+		Data struct {
+			Model struct {
+				ID         string `json:"id"`
+				ProviderID string `json:"providerID"`
+				Variant    string `json:"variant"`
+			} `json:"model"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Data.Model.ID == "" {
+		return nil
+	}
+	ref := map[string]string{"id": info.Data.Model.ID, "providerID": info.Data.Model.ProviderID}
+	if info.Data.Model.Variant != "" {
+		ref["variant"] = info.Data.Model.Variant
+	}
+	return ref
 }
 
 func firstNonEmpty(values ...string) string {
@@ -146,8 +203,7 @@ func firstNonEmpty(values ...string) string {
 func (w *wiring) close() { _ = w.store.Close() }
 
 func main() {
-	slog := shared.NewLogger(os.Getenv("BEACON_LOG_LEVEL"))
-	_ = slog
+	slog.SetDefault(shared.NewLogger(os.Getenv("BEACON_LOG_LEVEL")))
 	root := &cobra.Command{Use: "beacon", Short: "Parallel AI agent controller"}
 	configPath := root.PersistentFlags().String("config", "", "path to config.yaml")
 

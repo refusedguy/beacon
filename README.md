@@ -51,6 +51,10 @@ priority: 1
 
 Legacy Russian fields such as `Статус:`, `Владелец файлов:` and `Зависимости:` are also accepted. GitHub issues and GitLab issues are supported as alternative task sources.
 
+## Worker model
+
+The OpenCode harness talks to the running OpenCode background server. Set `harness.endpoint` in `.beacon/config.yaml`. Authentication uses either a bearer token or `user:password` in `harness.token`, or in the variable named by `harness.token_env`. The model is resolved in this order: `BEACON_MODEL`, `harness.model`, then the model of the orchestrator session named in `harness.parent_session_id`. Nothing is hardcoded in the binary.
+
 ## Verify
 
 ```sh

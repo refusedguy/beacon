@@ -37,6 +37,7 @@ var (
 type Harness struct {
 	Endpoint        string
 	Model           string
+	ModelRef        map[string]string
 	Agent           string
 	Token           string
 	ParentSessionID string
@@ -137,18 +138,10 @@ func redact(s string) string {
 	return s
 }
 
-func truncate(s string, limit int) string {
-	r := []rune(s)
-	if len(r) <= limit {
-		return s
-	}
-	return string(r[:limit]) + "..."
-}
-
 func messageID(prefix string) string {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
-	return fmt.Sprintf("%s-%s-%d", prefix, hex.EncodeToString(b[:]), time.Now().UnixNano())
+	return fmt.Sprintf("msg_%s_%s_%d", prefix, hex.EncodeToString(b[:]), time.Now().UnixNano())
 }
 
 func prFromText(s string) int {
@@ -179,17 +172,6 @@ func sessionIDFromJSON(data []byte) string {
 	return envelope.Data.ID
 }
 
-func wakeText(w core.WakeContext, limit int) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "correction run=%s pr=%d head=%s rebase=%d fix=%d\n", w.RunID, w.PRNumber, w.HeadSHA, w.RebaseTry, w.FixTry)
-	fmt.Fprintf(&b, "reason: %s\n", w.Reason)
-	if w.Excerpt != "" {
-		fmt.Fprintf(&b, "excerpt: %s\n", truncate(w.Excerpt, limit))
-	}
-	b.WriteString("fix the issue, push, then call beacon_watch_pr again")
-	return b.String()
-}
-
 func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	h.init()
 	var reader io.Reader
@@ -208,7 +190,11 @@ func (h *Harness) do(ctx context.Context, method, path string, body any) ([]byte
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if h.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+h.Token)
+		if user, pass, ok := strings.Cut(h.Token, ":"); ok {
+			req.SetBasicAuth(user, pass)
+		} else {
+			req.Header.Set("Authorization", "Bearer "+h.Token)
+		}
 	}
 	resp, err := h.HTTP.Do(req)
 	if err != nil {
@@ -232,6 +218,11 @@ func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
 		"text":     redact(text),
 		"delivery": "steer",
 		"resume":   true,
+	}
+	if len(h.ModelRef) > 0 {
+		body["model"] = h.ModelRef
+	} else if h.Model != "" {
+		body["model"] = map[string]string{"providerID": "opencode", "id": h.Model}
 	}
 	_, status, err := h.do(ctx, http.MethodPost, path, body)
 	if status == http.StatusConflict {
@@ -269,11 +260,15 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 		title = "Beacon " + string(req.RunID)
 	}
 	body := map[string]any{
-		"parentID":  parent,
 		"title":     title,
-		"agent":     h.Agent,
 		"directory": req.Workspace.Path,
 		"location":  map[string]any{"directory": req.Workspace.Path},
+	}
+	if parent != "" {
+		body["parentID"] = parent
+	}
+	if h.Agent != "" {
+		body["agent"] = h.Agent
 	}
 	if h.Model != "" {
 		body["model"] = h.Model
@@ -287,6 +282,9 @@ func (h *Harness) Spawn(ctx context.Context, req core.SpawnRequest) (core.Sessio
 		return core.Session{}, fmt.Errorf("opencode: missing session id in %s", redact(string(data)))
 	}
 	h.bind(id, req.RunID)
+	if err := h.configureSession(ctx, id, req); err != nil {
+		return core.Session{}, err
+	}
 	if err := h.prompt(ctx, id, req.Prompt, messageID("spawn")); err != nil {
 		return core.Session{}, err
 	}

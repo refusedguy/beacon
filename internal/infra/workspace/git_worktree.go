@@ -24,6 +24,13 @@ type GitWorktree struct {
 }
 
 func New(repo, base, dir string) (*GitWorktree, error) {
+	if !filepath.IsAbs(dir) {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return nil, err
+		}
+		dir = abs
+	}
 	g := &GitWorktree{Repo: repo, Base: base, Dir: dir, Timeout: 60 * time.Second}
 	root, err := g.run(context.Background(), "rev-parse", "--show-toplevel")
 	if err != nil {

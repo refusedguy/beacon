@@ -8,6 +8,7 @@ ui/tui/tui
 /beacon
 bin/
 .opencode/bin/beacon
+.beacon/config.yaml
 .beacon/state.db*
 .beacon/worktrees/
 .beacon/connection.json

@@ -12,14 +12,15 @@ import (
 )
 
 type Dispatcher struct {
-	Source      core.TaskSource
-	Planner     ConflictPlanner
-	Workspace   core.WorkspaceManager
-	Harness     core.AgentHarness
-	Store       core.RunStore
-	Concurrency core.Concurrency
-	StrictScope bool
-	MaxAttempts int
+	Source          core.TaskSource
+	Planner         ConflictPlanner
+	Workspace       core.WorkspaceManager
+	Harness         core.AgentHarness
+	Store           core.RunStore
+	Concurrency     core.Concurrency
+	StrictScope     bool
+	MaxAttempts     int
+	ParentSessionID string
 }
 
 type DispatchResult struct {
@@ -83,12 +84,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 			run.MaxAttempts = d.MaxAttempts
 		}
 		run.Scope = task.Scope
-		run.ParentSessionID = d.parentSession(ctx)
+		run.ParentSessionID = firstNonEmptyLocal(d.parentSession(ctx), d.ParentSessionID)
 		if err := d.Store.Save(ctx, run); err != nil {
 			return out, err
 		}
 		if budget > 0 {
 			if err := d.startOne(ctx, run, task); err != nil {
+				slog.Error("dispatch task", "task", task.ID, "error", err)
 				out.Failures = append(out.Failures, DispatchFailure{task.ID, err})
 				_ = run.Apply(core.Event{Kind: core.EvCancel, Reason: err.Error()})
 				_ = d.Store.Save(ctx, run)
@@ -204,6 +206,15 @@ func (d *Dispatcher) agentBudget(active []*core.Run) int {
 func (d *Dispatcher) parentSession(ctx context.Context) string {
 	if v, ok := ctx.Value(parentSessionKey{}).(string); ok {
 		return v
+	}
+	return ""
+}
+
+func firstNonEmptyLocal(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
 	}
 	return ""
 }

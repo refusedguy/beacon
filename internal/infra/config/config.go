@@ -56,6 +56,7 @@ type Harness struct {
 	Command         string `yaml:"command"`
 	PromptTemplate  string `yaml:"prompt_template"`
 	TokenEnv        string `yaml:"token_env"`
+	Token           string `yaml:"token"`
 	ParentSessionID string `yaml:"parent_session_id"`
 }
 
