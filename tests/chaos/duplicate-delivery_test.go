@@ -213,7 +213,12 @@ func TestIndeterminateNoRetry(t *testing.T) {
 	var receipts []store.Receipt
 	resends := 0
 	deadline := time.Now().Add(proofWindow)
-	for time.Now().Before(deadline) {
+	if runnerDeadline, ok := t.Deadline(); ok && runnerDeadline.Before(deadline) {
+		deadline = runnerDeadline
+	}
+	poll := time.NewTicker(proofWindow / 10)
+	defer poll.Stop()
+	for {
 		if decideResend(o, receipts) {
 			resends++
 			attempt := len(receipts) + 1
@@ -224,7 +229,14 @@ func TestIndeterminateNoRetry(t *testing.T) {
 				Outcome:      domain.OutcomeTransportFailed,
 			})
 		}
-		time.Sleep(proofWindow / 10)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-poll.C:
+		case <-t.Context().Done():
+			t.Fatal("test context ended before the proof window closed")
+		}
 	}
 	if resends != 0 {
 		t.Fatalf("resends = %d, want 0", resends)

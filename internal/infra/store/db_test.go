@@ -364,8 +364,25 @@ func TestWriteLockWaitHistogramRecordsTwoWriters(t *testing.T) {
 		})
 	}()
 
-	// Let the second write queue behind the transaction the first writer holds.
-	time.Sleep(20 * time.Millisecond)
+	// Wait until the second job is in the write queue behind the first writer's
+	// open transaction. The queue length is the observable state; the deadline
+	// comes from the runner, not from a fixed delay.
+	deadline := time.Now().Add(5 * time.Second)
+	if runnerDeadline, ok := t.Deadline(); ok && runnerDeadline.Before(deadline) {
+		deadline = runnerDeadline
+	}
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for len(d.writeCh) == 0 {
+		if !time.Now().Before(deadline) {
+			t.Fatal("second writer did not queue behind the first")
+		}
+		select {
+		case <-poll.C:
+		case <-t.Context().Done():
+			t.Fatal("test context ended before the second writer queued")
+		}
+	}
 	close(release)
 
 	for i, done := range []chan error{firstDone, secondDone} {

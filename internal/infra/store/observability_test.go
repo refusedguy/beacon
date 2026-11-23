@@ -507,13 +507,24 @@ func TestRecordWakeRejectsEmptyObligation(t *testing.T) {
 func waitForActiveWaiters(t *testing.T, g *SharedGate, key string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if g.ActiveWaiters(key) == want {
+	if runnerDeadline, ok := t.Deadline(); ok && runnerDeadline.Before(deadline) {
+		deadline = runnerDeadline
+	}
+	poll := time.NewTicker(time.Millisecond)
+	defer poll.Stop()
+	for {
+		if got := g.ActiveWaiters(key); got == want {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		if !time.Now().Before(deadline) {
+			t.Fatalf("active waiters for %q = %d, want %d", key, g.ActiveWaiters(key), want)
+		}
+		select {
+		case <-poll.C:
+		case <-t.Context().Done():
+			t.Fatalf("active waiters for %q = %d, want %d (test context ended)", key, g.ActiveWaiters(key), want)
+		}
 	}
-	t.Fatalf("active waiters for %q = %d, want %d", key, g.ActiveWaiters(key), want)
 }
 
 // TestSharedGateCoalescesFifteenUnitsOnOneCI is the 15-agents case from the

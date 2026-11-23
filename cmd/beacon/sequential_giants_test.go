@@ -248,10 +248,17 @@ func TestAdmissionLockCancelWhileWaitingStartsNothing(t *testing.T) {
 
 	waitCtx, cancel := context.WithCancel(ctx)
 	exclusiveDone := make(chan struct{})
+	enteredWait := make(chan struct{})
 	var started int32
 	go func() {
 		defer close(exclusiveDone)
-		release, err := lock.acquire(waitCtx, dispatchAction{Card: "E"})
+		release, err := lock.acquire(waitCtx, dispatchAction{
+			Card: "E",
+			WaitReady: func(context.Context) error {
+				close(enteredWait)
+				return nil
+			},
+		})
 		if err != nil {
 			return
 		}
@@ -259,7 +266,13 @@ func TestAdmissionLockCancelWhileWaitingStartsNothing(t *testing.T) {
 		atomic.AddInt32(&started, 1)
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	// The waiter signals from WaitReady, which acquire runs before it touches
+	// the slot. Cancel after that signal instead of guessing at a delay.
+	select {
+	case <-enteredWait:
+	case <-time.After(time.Second):
+		t.Fatal("exclusive action did not enter the admission wait")
+	}
 	cancel()
 	select {
 	case <-exclusiveDone:
