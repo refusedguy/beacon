@@ -16,7 +16,7 @@ harnesses/opencode       separate AgentHarness module for OpenCode HTTP/SSE
 ui/tui                   separate Bubble Tea monitor over loopback HTTP/SSE
 ```
 
-Dependencies point from `cmd` to `internal/infra` to `internal/app` to `pkg/core`. The external modules import only `pkg/core`. `arch_test.go` and `.golangci.yml` enforce these boundaries and a 350-line limit per production file.
+Dependencies point from `cmd` to `internal/infra` to `internal/app` to `pkg/core`. The external modules import only `pkg/core`. `arch_test.go` and `.golangci.yml` enforce these boundaries. The 350-line production-file limit is advisory: `arch_test.go` logs an `ADVISORY` line instead of failing. Treat that as a prompt to decompose the file. `arch_test.go` enforces a cyclomatic complexity limit of 20 per function, with two functions grandfathered pending decomposition.
 
 ## Commands
 
