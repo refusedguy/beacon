@@ -146,30 +146,6 @@ func (l *SubscriptionLoop) RunPass(ctx context.Context) (int, error) {
 	return delivered, nil
 }
 
-// RunSubscriptionLoop ticks until ctx is done, running one pass per tick. A
-// non-positive interval falls back to DefaultReminderInterval. A pass error is
-// reported to the observe seam and never stops the loop.
-func RunSubscriptionLoop(ctx context.Context, loop *SubscriptionLoop, interval time.Duration) {
-	if loop == nil {
-		return
-	}
-	if interval <= 0 {
-		interval = DefaultReminderInterval
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if _, err := loop.RunPass(ctx); err != nil {
-				observe.ActorError("subscription-loop", "", err)
-			}
-		}
-	}
-}
-
 // coalesceSubEvents mirrors domain.CoalesceEvents (ADR 0005 keeps the domain
 // out of app). Consecutive events within CoalesceWindow of the group's first
 // event, or of LastDeliveryAt when set, fold into one wake. An event outside

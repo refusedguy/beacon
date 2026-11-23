@@ -140,38 +140,6 @@ func (c StrictRemoteConfig) reject(source SettingSource) {
 	}
 }
 
-// LoadRemoteEndpointStrict возвращает адрес только из разрешённых источников.
-// В строгом режиме каждый источник вне SettingSources отвергается и логируется
-// по имени. Без явного Endpoint режим не падает обратно на файл проекта или
-// окружение, а возвращает typed error: изоляция не зависит от каталога.
-func LoadRemoteEndpointStrict(cfg StrictRemoteConfig, dir string) (RemoteEndpoint, error) {
-	if !cfg.allows(SettingSourceEnv) {
-		cfg.reject(SettingSourceEnv)
-	}
-	if !cfg.allows(SettingSourceProject) {
-		cfg.reject(SettingSourceProject)
-	}
-	if cfg.Endpoint != nil {
-		ep := *cfg.Endpoint
-		if err := ep.Validate(); err != nil {
-			return RemoteEndpoint{}, err
-		}
-		return ep, nil
-	}
-	if cfg.StrictMcp {
-		return RemoteEndpoint{}, fmt.Errorf("%w: strictMcp requires explicit endpoint", ErrRemoteNoConnection)
-	}
-	if cfg.allows(SettingSourceEnv) {
-		if ep, ok := remoteEndpointFromEnv(); ok {
-			return ep, nil
-		}
-	}
-	if cfg.allows(SettingSourceProject) {
-		return LoadRemoteEndpoint(dir)
-	}
-	return RemoteEndpoint{}, ErrRemoteNoConnection
-}
-
 func remoteEndpointFromEnv() (RemoteEndpoint, bool) {
 	host := strings.TrimSpace(os.Getenv(remoteEndpointEnvHost))
 	if host == "" {

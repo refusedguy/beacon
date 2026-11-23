@@ -286,12 +286,6 @@ func BuildWorkload(watches []WorkloadWatch) Workload {
 	return out
 }
 
-// SpawnPlan decides the pending spawns against the rate-limit event carried by
-// this report. Callers use one path from the workload snapshot to the planner.
-func (w Workload) SpawnPlan(now time.Time, pending []string) SpawnPlan {
-	return NewSpawnPlanner(w.RateLimit).PlanSpawns(now, pending)
-}
-
 // RunWorkload reads the active Watches, enrolls the orchestrator on every
 // Watch that does not yet carry it and returns the report built from the
 // snapshot read before registration. Keeping the pre-registration snapshot

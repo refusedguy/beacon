@@ -760,11 +760,6 @@ type ApprovalCache struct {
 	allowed map[string]bool
 }
 
-// NewApprovalCache returns an empty cache.
-func NewApprovalCache() *ApprovalCache {
-	return &ApprovalCache{allowed: map[string]bool{}}
-}
-
 // Lookup returns the cached decision and whether the key was present.
 func (c *ApprovalCache) Lookup(key ApprovalKey) (allowed bool, ok bool) {
 	if c == nil {

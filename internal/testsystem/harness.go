@@ -608,17 +608,6 @@ type RunConfig struct {
 	Replay      map[string]string `yaml:"replay,omitempty"`
 }
 
-// CurrentConfig returns the configuration this build captures in a snapshot.
-// The replay settings name the stub model, so a replayed run has no provider or
-// network dependency.
-func CurrentConfig() RunConfig {
-	return RunConfig{
-		Schema:      TrajectorySchema,
-		Environment: "stub",
-		Replay:      map[string]string{"model": "replay"},
-	}
-}
-
 // WatchCheck is one check recorded with a completed watch. It carries only the
 // observable fields; the verdict and revision keep their existing format.
 type WatchCheck struct {
@@ -639,10 +628,10 @@ type WatchOutcome struct {
 
 // Trajectory is a self-contained snapshot of one completed run. It holds the
 // config, the ordered actions, the recorded result and the watch outcome in one
-// value. A journal persists only the bytes from Marshal; ReplayResult and
-// RestoreSubmission read those bytes back with no worktree, agent or external
-// artifact. Scenario keeps the name, seed and actions; Result is the outcome
-// recorded at capture time and is used only by Verify.
+// value. A journal persists only the bytes from Marshal; a replay reads those
+// bytes back with no worktree, agent or external artifact. Scenario keeps the
+// name, seed and actions; Result is the outcome recorded at capture time and is
+// used only by Verify.
 type Trajectory struct {
 	Config   RunConfig    `yaml:"config"`
 	Scenario Scenario     `yaml:"scenario"`
@@ -650,56 +639,15 @@ type Trajectory struct {
 	Watch    WatchOutcome `yaml:"watch"`
 }
 
-// NewTrajectory captures a completed run. scenario and result must come from
-// the same Run call; cfg and outcome describe the environment and verdict that
-// surrounded it. Empty fields in cfg are filled with the current defaults.
-// Every slice and map is copied so later caller mutation cannot change the
-// snapshot.
-func NewTrajectory(cfg RunConfig, scenario Scenario, result Result, outcome WatchOutcome) Trajectory {
-	if cfg.Schema == "" {
-		cfg.Schema = TrajectorySchema
-	}
-	if cfg.Environment == "" {
-		cfg.Environment = "stub"
-	}
-	if cfg.Replay == nil {
-		cfg.Replay = map[string]string{"model": "replay"}
-	}
-	return Trajectory{
-		Config: cloneRunConfig(cfg),
-		Scenario: Scenario{
-			Name:  scenario.Name,
-			Seed:  scenario.Seed,
-			Steps: cloneSteps(scenario.Steps),
-		},
-		Result: cloneResult(result),
-		Watch:  cloneWatchOutcome(outcome),
-	}
-}
-
 // Marshal serializes t to YAML bytes for journal storage. This package never
-// opens a file: the caller persists the bytes and later passes them to
-// ParseTrajectory when the run must be replayed.
+// opens a file: the caller persists the bytes and later replays them when the
+// run must be replayed.
 func (t Trajectory) Marshal() ([]byte, error) {
 	data, err := yaml.Marshal(t)
 	if err != nil {
 		return nil, fmt.Errorf("testsystem: marshal trajectory: %w", err)
 	}
 	return data, nil
-}
-
-// ParseTrajectory reads trajectory bytes from a journal and validates them. A
-// schema or missing-action error is returned before any caller can replay the
-// snapshot.
-func ParseTrajectory(data []byte) (Trajectory, error) {
-	var t Trajectory
-	if err := yaml.Unmarshal(data, &t); err != nil {
-		return Trajectory{}, fmt.Errorf("testsystem: parse trajectory: %w", err)
-	}
-	if err := t.compatible(); err != nil {
-		return Trajectory{}, err
-	}
-	return t, nil
 }
 
 // compatible reports whether this build can replay t. It checks the schema tag
@@ -748,24 +696,6 @@ func (t Trajectory) Verify() error {
 type Submission struct {
 	Trace       string `yaml:"trace"`
 	Fingerprint string `yaml:"fingerprint"`
-}
-
-// RestoreSubmission rebuilds the submission from t alone, without reading the
-// recorded Result. Re-running the captured actions in a fresh Runner yields the
-// canonical trace; the fingerprint is derived from it. This recovers a result
-// whose stored artifact was lost, as long as the journal kept the snapshot.
-func (t Trajectory) RestoreSubmission() (Submission, error) {
-	if err := t.compatible(); err != nil {
-		return Submission{}, err
-	}
-	result := Run(t.Scenario)
-	return Submission{Trace: result.String(), Fingerprint: result.Fingerprint()}, nil
-}
-
-// MatchesResult reports whether a restored submission equals the result t
-// recorded at capture time.
-func (t Trajectory) MatchesResult(s Submission) bool {
-	return s.Fingerprint == t.Result.Fingerprint()
 }
 
 func cloneRunConfig(in RunConfig) RunConfig {

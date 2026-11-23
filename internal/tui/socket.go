@@ -63,14 +63,6 @@ const (
 	CmdUnblock Command = "unblock"
 )
 
-// DecisionCommands lists the eight human-decide verbs in the order the
-// server declares them. Callers can use it for help text and validation
-// without restating the strings.
-var DecisionCommands = []Command{
-	CmdApprove, CmdReject, CmdContext, CmdRework,
-	CmdPause, CmdResume, CmdUnblock, CmdCancel,
-}
-
 func validCommand(c Command) bool {
 	switch c {
 	case CmdAck, CmdCancel, CmdClaim, CmdRelease,

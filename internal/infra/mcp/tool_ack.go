@@ -667,41 +667,6 @@ func (h *AckHandler) SetContinuationRegistry(r *ContinuationRegistry) {
 	}
 }
 
-// SetDecisionRegistry shares the attention record with a composition root, so
-// other tools can observe which stopped agents were resumed. A nil argument
-// leaves the handler's own registry in place.
-func (h *AckHandler) SetDecisionRegistry(r *DecisionRegistry) {
-	if h != nil && r != nil {
-		h.decisions = r
-	}
-}
-
-// SetBlockedRegistry shares the block record with a composition root, so other
-// tools can observe which Watches were blocked. A nil argument leaves the
-// handler's own registry in place.
-func (h *AckHandler) SetBlockedRegistry(r *BlockedRegistry) {
-	if h != nil && r != nil {
-		h.blocked = r
-	}
-}
-
-// SetDeferredRegistry shares the parked-call registry with a composition root,
-// so other tools can observe which Watches carry a deferred call. A nil
-// argument leaves the handler's own registry in place.
-func (h *AckHandler) SetDeferredRegistry(r *DeferredRegistry) {
-	if h != nil && r != nil {
-		h.deferred = r
-	}
-}
-
-// SetPermissionRegistry shares the per-session permission state with a
-// composition root. A nil argument leaves the handler's own registry in place.
-func (h *AckHandler) SetPermissionRegistry(r *PermissionRegistry) {
-	if h != nil && r != nil {
-		h.permissions = r
-	}
-}
-
 // SetBlockerControl injects the durable blocker port. With it installed the
 // SQLite incident is the source of truth for block and unblock, so a process
 // restart cannot forget why a Watch was blocked. A nil argument keeps the

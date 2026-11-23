@@ -549,16 +549,6 @@ func (b *Bridge) wakeOne(ctx context.Context, w domain.Watch, sub domain.Subscri
 	b.wakeDispatcher.wakeOne(ctx, w, sub, text, now, cycleID, breaker)
 }
 
-// WithTracer binds the tracer used for the per-refresh span. It is optional:
-// a nil tracer falls back to observe.Current, so a Bridge built without it
-// keeps the process tracer and its no-op default (T3.394).
-func (b *Bridge) WithTracer(t observe.Tracer) *Bridge {
-	if b != nil {
-		b.tracer = t
-	}
-	return b
-}
-
 // WithGenerationStore binds the generation ledger shared with beacon_claim and
 // the ack handler. When a merge or a fixer resolves a blocker, the bridge
 // rotates the generation of every Watch it unblocks so the previous owner's
@@ -651,15 +641,6 @@ func (b *Bridge) WithWaker(w any) *Bridge {
 	case domain.WakeDeliverer:
 		b.waker = v
 	}
-	return b
-}
-
-// WithAdapterWaker binds an adapter-aware wake deliverer explicitly.
-func (b *Bridge) WithAdapterWaker(w domain.AdapterWakeDeliverer) *Bridge {
-	if b == nil {
-		return nil
-	}
-	b.adapterWaker = w
 	return b
 }
 

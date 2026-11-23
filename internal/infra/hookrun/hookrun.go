@@ -4,7 +4,6 @@ package hookrun
 
 import (
 	"context"
-	"fmt"
 	"os/exec"
 	"strings"
 	"time"
@@ -20,19 +19,6 @@ const MatcherTimeout = 60 * time.Second
 type AsyncHook struct {
 	Async        bool
 	AsyncTimeout time.Duration
-}
-
-// NewAsyncHook validates the async form against the matcher deadline. A
-// non-positive timeout or one that exceeds the matcher is rejected, so a slow
-// callback can never outlive the tool call that spawned it.
-func NewAsyncHook(asyncTimeout time.Duration) (AsyncHook, error) {
-	if asyncTimeout <= 0 || asyncTimeout > MatcherTimeout {
-		return AsyncHook{}, fmt.Errorf(
-			"hookrun: asyncTimeout %s out of range (0, %s]",
-			asyncTimeout, MatcherTimeout,
-		)
-	}
-	return AsyncHook{Async: true, AsyncTimeout: asyncTimeout}, nil
 }
 
 // Run executes the script at path, feeds stdin to it, and returns its combined

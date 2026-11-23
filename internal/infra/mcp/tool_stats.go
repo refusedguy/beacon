@@ -554,43 +554,6 @@ func (r OutcomeReport) entries() []string {
 	return entries
 }
 
-// OutcomeReportFrom reads the report back from a stats response. It is the one
-// typed reader for the wire form, so a metrics consumer reads the same lists
-// instead of recomputing the classification. The bool is false when the
-// response carries no outcome schema version.
-func OutcomeReportFrom(out StatsOutput) (OutcomeReport, bool) {
-	report := OutcomeReport{}
-	found := false
-	for _, entry := range out.LoadErrors {
-		if strings.HasPrefix(entry, outcomeSchemaVersionPrefix) {
-			version, err := strconv.Atoi(strings.TrimPrefix(entry, outcomeSchemaVersionPrefix))
-			if err == nil {
-				report.SchemaVersion = version
-				found = true
-			}
-			continue
-		}
-		if !strings.HasPrefix(entry, outcomeListPrefix) {
-			continue
-		}
-		name, ids, ok := strings.Cut(strings.TrimPrefix(entry, outcomeListPrefix), "=")
-		if !ok {
-			continue
-		}
-		for _, list := range outcomeLists(&report) {
-			if list.name != name {
-				continue
-			}
-			if ids != "" {
-				*list.ids = append(*list.ids, strings.Split(ids, ",")...)
-			}
-			found = true
-			break
-		}
-	}
-	return report, found
-}
-
 // Handle copies the values already present in a state snapshot into the stats
 // response. Blocked reports the number of watches with a blocked status or a
 // block record. It appends a plan-limit warning to loadErrors when a

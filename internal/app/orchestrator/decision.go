@@ -464,27 +464,6 @@ func decisionHoldReason(verdict string, p *AutoMergePolicy) string {
 	return "verdict="
 }
 
-// ActionApprovalAllowed checks one non-merge approval category. Merge approval
-// and action approval are separate decisions: a Watch may auto-merge while an
-// executor step still needs a human. The legacy RequireApproval bool never
-// gates an action, so existing callers are unaffected.
-func ActionApprovalAllowed(p *AutoMergePolicy, category ApprovalCategory, environmentID, path string) (allowed bool, reason string, err error) {
-	if category == ApprovalMerge {
-		return false, "use MergeApprovalAllowed for merge approval", nil
-	}
-	if p == nil || !p.approvalRequired(category) {
-		return true, "", nil
-	}
-	policy, err := p.approvalPolicy()
-	if err != nil {
-		return false, ReasonApprovalPolicyInvalid, err
-	}
-	if !Approve(policy, category, environmentID, path) {
-		return false, "require_approval_action:" + string(category), nil
-	}
-	return true, "", nil
-}
-
 // ---- HD-019 / ADR 0295: task completion audit ----
 
 // TaskClosure answers whether one task named in a plan has been closed. It is
