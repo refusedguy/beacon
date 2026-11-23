@@ -244,21 +244,42 @@ func (a *App) LiveModel(ctx context.Context, cards []Card) Model {
 	})
 }
 
+// liveProgram is the part of tea.Program that RunLive drives. Tests replace
+// the constructor to stop a run without a terminal; production uses Bubble Tea.
+type liveProgram interface {
+	Send(tea.Msg)
+	Quit()
+	Run() (tea.Model, error)
+}
+
+var newLiveProgram = func(a *App, ctx context.Context, cards []Card) liveProgram {
+	return tea.NewProgram(a.LiveModel(ctx, cards), tea.WithAltScreen())
+}
+
 // RunLive opens the one-screen dashboard. It refreshes once, then reads SSE
 // events; the model repaints snapshot panels only when the revision advances.
 // Run stays the text fallback for output without a terminal.
 //
+// The event loop owns a child of ctx. Leaving the screen cancels that child
+// and waits for both background goroutines, so polling ends with the UI.
+//
 // Baseline: docs/research/audit-03-tui.md lists 20-30 MiB RSS as a target, not
 // a measurement. TUI-07 owns the actual measurement.
 func (a *App) RunLive(ctx context.Context, cards []Card) error {
+	streamCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	if err := a.Refresh(ctx); err != nil {
 		return err
 	}
-	program := tea.NewProgram(a.LiveModel(ctx, cards), tea.WithAltScreen())
+	program := newLiveProgram(a, ctx, cards)
 
+	var eventsDone sync.WaitGroup
+	eventsDone.Add(1)
 	go func() {
+		defer eventsDone.Done()
 		for {
-			stream := a.client.Events(ctx)
+			stream := a.client.Events(streamCtx)
 			for result := range stream {
 				if result.Err != nil {
 					break
@@ -266,17 +287,17 @@ func (a *App) RunLive(ctx context.Context, cards []Card) error {
 				if id := result.Event.ID; id != "" {
 					program.Send(EventMsg{ID: id, Line: eventLine(result.Event)})
 				}
-				_ = a.Refresh(ctx)
+				_ = a.Refresh(streamCtx)
 				a.mu.Lock()
 				snap, revision, lastErr := a.snap, a.revision, a.lastErr
 				a.mu.Unlock()
 				program.Send(SnapshotMsg{Snap: snap, Revision: revision, Err: lastErr})
 			}
-			if ctx.Err() != nil {
+			if streamCtx.Err() != nil {
 				return
 			}
 			select {
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 				return
 			case <-time.After(reconnectDelay):
 			}
@@ -284,15 +305,30 @@ func (a *App) RunLive(ctx context.Context, cards []Card) error {
 	}()
 
 	stopped := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			close(stopped)
+		})
+	}
+	defer stop()
+
+	var quitDone sync.WaitGroup
+	quitDone.Add(1)
 	go func() {
+		defer quitDone.Done()
 		select {
 		case <-ctx.Done():
 			program.Quit()
 		case <-stopped:
 		}
 	}()
+
 	_, err := program.Run()
-	close(stopped)
+	stop()
+	eventsDone.Wait()
+	quitDone.Wait()
 	return err
 }
 
