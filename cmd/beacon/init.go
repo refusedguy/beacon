@@ -138,7 +138,7 @@ func runInit(f *initFlags) error {
 		TaskSource: config.TaskSource{Provider: source, Dir: "docs/tasks", Owner: r.owner, Repo: r.repo, TokenEnv: tokenEnv},
 		SCM:        config.SCM{Provider: provider, Owner: r.owner, Repo: r.repo, TokenEnv: tokenEnv, BaseURL: baseURL},
 		Harness:    config.Harness{Provider: f.harness, Endpoint: "http://127.0.0.1:4096"},
-		Merge:      config.Merge{RequiredChecks: []string{}, RequiredApprovals: 0, Labels: []string{}, CommandGate: "", AutoRebase: true, MaxAttempts: 3},
+		Merge:      config.Merge{RequiredChecks: []string{}, RequiredApprovals: 0, Labels: []string{}, CommandGate: "", AutoRebase: true, MaxAttempts: 12},
 		OnBaseRed:  config.OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 	path := ".beacon/config.yaml"
