@@ -336,52 +336,108 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if verb, ok := verbForKey(msg.String()); ok {
 			return m.runVerb(verb)
 		}
-		switch msg.String() {
-		case "q", "ctrl+c":
-			m.quitting = true
-			return m, tea.Quit
-		case "up", "k":
-			if m.cursor > 0 {
-				m.cursor--
-			}
-		case "down", "j":
-			if m.cursor < len(m.filtered)-1 {
-				m.cursor++
-			}
-		case "left", "h":
-			if m.watchCursor > 0 {
-				m.watchCursor--
-			}
-		case "right", "l":
-			if m.watchCursor < len(m.snap.LiveWatches)-1 {
-				m.watchCursor++
-			}
-		case ":":
-			m.editing = true
-			m.input = ""
-			return m, nil
-		case "r":
-			return m.runLine("r", "refresh")
-		case "s":
-			m.statusIdx++
-			if m.statusIdx >= len(m.statuses) {
-				m.statusIdx = 0
-			}
-			m.applyFilters()
-		case "o":
-			m.ownerIdx++
-			if m.ownerIdx >= len(m.owners) {
-				m.ownerIdx = 0
-			}
-			m.applyFilters()
-		case "g":
-			m.showGraph = !m.showGraph
-		case "esc":
-			m.statusIdx = 0
-			m.ownerIdx = 0
-			m.applyFilters()
+		if handle, ok := keyHandlers[msg.String()]; ok {
+			return handle(m)
 		}
 	}
+	return m, nil
+}
+
+// keyHandlers binds each board key to a handler that edits a copy of the
+// model. Keys with the same behaviour share a handler. A key outside the map
+// leaves the model unchanged.
+var keyHandlers = map[string]func(Model) (Model, tea.Cmd){
+	"q":      quitBoard,
+	"ctrl+c": quitBoard,
+	"up":     moveCursorUp,
+	"k":      moveCursorUp,
+	"down":   moveCursorDown,
+	"j":      moveCursorDown,
+	"left":   moveWatchLeft,
+	"h":      moveWatchLeft,
+	"right":  moveWatchRight,
+	"l":      moveWatchRight,
+	":":      beginCommand,
+	"r":      refreshBoard,
+	"s":      cycleStatus,
+	"o":      cycleOwner,
+	"g":      toggleGraph,
+	"esc":    resetFilters,
+}
+
+func quitBoard(m Model) (Model, tea.Cmd) {
+	m.quitting = true
+	return m, tea.Quit
+}
+
+func moveCursorUp(m Model) (Model, tea.Cmd) {
+	if m.cursor > 0 {
+		m.cursor--
+	}
+	return m, nil
+}
+
+func moveCursorDown(m Model) (Model, tea.Cmd) {
+	if m.cursor < len(m.filtered)-1 {
+		m.cursor++
+	}
+	return m, nil
+}
+
+func moveWatchLeft(m Model) (Model, tea.Cmd) {
+	if m.watchCursor > 0 {
+		m.watchCursor--
+	}
+	return m, nil
+}
+
+func moveWatchRight(m Model) (Model, tea.Cmd) {
+	if m.watchCursor < len(m.snap.LiveWatches)-1 {
+		m.watchCursor++
+	}
+	return m, nil
+}
+
+func beginCommand(m Model) (Model, tea.Cmd) {
+	m.editing = true
+	m.input = ""
+	return m, nil
+}
+
+func refreshBoard(m Model) (Model, tea.Cmd) {
+	// runLine returns the unchanged model value and the command that delivers
+	// the receipt, so the concrete copy stays in the caller's hands.
+	_, cmd := m.runLine("r", "refresh")
+	return m, cmd
+}
+
+func cycleStatus(m Model) (Model, tea.Cmd) {
+	m.statusIdx++
+	if m.statusIdx >= len(m.statuses) {
+		m.statusIdx = 0
+	}
+	m.applyFilters()
+	return m, nil
+}
+
+func cycleOwner(m Model) (Model, tea.Cmd) {
+	m.ownerIdx++
+	if m.ownerIdx >= len(m.owners) {
+		m.ownerIdx = 0
+	}
+	m.applyFilters()
+	return m, nil
+}
+
+func toggleGraph(m Model) (Model, tea.Cmd) {
+	m.showGraph = !m.showGraph
+	return m, nil
+}
+
+func resetFilters(m Model) (Model, tea.Cmd) {
+	m.statusIdx = 0
+	m.ownerIdx = 0
+	m.applyFilters()
 	return m, nil
 }
 
