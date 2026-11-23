@@ -96,6 +96,75 @@ beacon metrics --format prometheus
 
 Гистограммы времени: `poll_cycle_duration_seconds`, `merge_duration_seconds`, `wake_duration_seconds`, `run_duration_seconds`. В Prometheus они экспортируются обычными наборами `_bucket{le=...}`, `_sum`, `_count`.
 
+## Метрика предотвращённых PR-дублей (CLS-04)
+
+Метрика считает карточки, у которых проверка premise остановила открытие кодового PR. Основной источник это карточка `docs/tasks/<CARD>.md`, поля «Причина» и «Время закрытия». Второй источник это вердикт скрипта CLS-01 для кодовых PR, когда скрипт появится в CI. Код `internal/infra/observe` не меняется: у счётчика нет производителя внутри процесса, а нулевая серия в `/metrics` читалась бы как отсутствие предотвращённых дублей.
+
+Машиночитаемое определение:
+
+```yaml
+premise_duplicate:
+  name: beacon_premise_duplicate_avoided_total
+  type: counter
+  help: Premise outcomes that stopped a duplicate code PR
+  source: card-or-ci
+  idempotency_key: [cardID, sha]
+  card_id_in_labels: false
+  labels:
+    outcome: [already_landed, duplicate, owner_decision, false_premise]
+  excluded_outcomes: [clean]
+```
+
+Единственная метка `outcome` принимает четыре значения. `cardID` остаётся в карточке и в записи проверки, но не в метрике. Число рядов поэтому не растёт с числом карточек.
+
+| Исход CLS-04 | Вердикт CLS-01 | Причина в `CLOSE-PROCEDURE.md` | Маркер в поле «Причина» карточки |
+| --- | --- | --- | --- |
+| `already_landed` | `landed` | уже влито | `already landed`, `Уже влито`, `merge-base --is-ancestor` |
+| `duplicate` | `duplicate` | дубль или чужой PR | `duplicate`, `дубль` |
+| `owner_decision` | нет | решение владельца | `owner decision`, `решение владельца` |
+| `false_premise` | нет | ложная premise | `false premise`, `ложная premise` |
+| `clean` | `clean` | карточка не закрывается | в счётчик не входит |
+
+CLS-01 различает только кодовые PR и даёт вердикты `clean`, `landed`, `duplicate`. Два других исхода приходят из таблицы причин `CLOSE-PROCEDURE.md`. Все четыре исхода имеет один источник: карточка или CI-проверка.
+
+Идемпотентность держится на ключе `(cardID, sha)`. SHA это первый набор из 40 шестнадцатеричных символов в полях «Причина» и «Доказательство». Если SHA нет, ключ равен `cardID`. Повторный замер той же карточки с тем же SHA ряд не увеличивает.
+
+Замер за сутки:
+
+```bash
+git fetch origin main
+CUTOFF=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+rg -N '^Причина:|^Время закрытия:' docs/tasks/ \
+| awk -v cutoff="$CUTOFF" '
+  {
+    p = index($0, ":"); path = substr($0, 1, p-1)
+    rest = substr($0, p+1)
+    q = index(rest, ":"); field = substr(rest, 1, q-1); value = substr(rest, q+1)
+    sub(/^ /, "", value)
+    card = path; sub(/^docs\/tasks\//, "", card); sub(/\.md$/, "", card)
+    if (field == "Время закрытия") closed[card] = value; else reason[card] = value
+  }
+  END {
+    for (card in reason) {
+      if (!(card in closed) || closed[card] < cutoff) continue
+      r = tolower(reason[card])
+      if (r ~ /already[_ ]landed|уже влито|уже в main|fix already merged|merge-base/) o = "already_landed"
+      else if (r ~ /duplicate|дубл/) o = "duplicate"
+      else if (r ~ /owner decision|решение владельца/) o = "owner_decision"
+      else if (r ~ /false premise|ложная premise/) o = "false_premise"
+      else continue
+      sha = "none"
+      if (match(r, /[0-9a-f]{40}/)) sha = substr(r, RSTART, RLENGTH)
+      print o "\t" card "\t" sha
+    }
+  }' \
+| sort -u | cut -f1 | sort | uniq -c
+```
+
+Команда печатает число строк по каждому исходу. `sort -u` убирает повторы по ключу `(cardID, sha)` до подсчёта. Запускайте её в чистом чекауте `origin/main`: чтение идёт из рабочего дерева `docs/tasks/`.
+
+Baseline: замер 2026-11-23 на `79dc1694` с окном 24 часа дал 377 строк `already_landed`, 9 строк `duplicate` и 1 строку `false_premise`. Итого 387 предотвращённых дублей. Исход `clean` в счётчик не входит.
+
 ## Бюджет памяти: предупреждение RSS и уборка сессий
 
 Бюджет памяти задан ADR 0191 и карточкой BS.51. Один процесс должен держать менее 100 MB резидентной памяти, когда активны 15 и более Watch. Пороги лежат в `internal/infra/server/metrics.go`: `FootprintWatchThreshold = 15` и `FootprintLimitBytes = 100 * 1024 * 1024`. Проверка `FootprintCheck` предупреждает только при обоих условиях. Меньше 15 Watch или ровно 100 MB предупреждения не дают.
