@@ -10,7 +10,9 @@ import { execFile as nodeExecFile } from "node:child_process"
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
 import { join } from "node:path"
 import { promisify } from "node:util"
-import { BEACON_PROJECT_ROOT_ENV, beaconCommand } from "./mcp.js"
+import { beaconCommand } from "./mcp.js"
+
+const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 
 const execFileAsync = promisify(nodeExecFile)
 
