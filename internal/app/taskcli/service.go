@@ -79,6 +79,10 @@ func (noopGateWaiterRegistrar) Register(context.Context, string, string) error {
 type Service struct {
 	Cfg Config
 
+	// store is the task-storage port. NewService installs the file adapter;
+	// SetTaskStore replaces it without changing any command contract.
+	store TaskStore
+
 	// gateWaiters регистрирует ожидающего на гейте при событии unblocked.
 	// Пустое значение означает no-op.
 	gateWaiters GateWaiterRegistrar
@@ -102,7 +106,37 @@ func (s *Service) loadReapCards(tasksDir string) ([]Card, error) {
 
 // NewService создаёт сервис с конфигурацией.
 func NewService(cfg Config) *Service {
-	return &Service{Cfg: cfg, gateWaiters: noopGateWaiterRegistrar{}}
+	s := &Service{Cfg: cfg, gateWaiters: noopGateWaiterRegistrar{}}
+	fileStore := NewFileTaskStore(cfg.TasksDir, cfg.Root, nil)
+	fileStore.Acquire = s.acquireLock
+	s.store = fileStore
+	return s
+}
+
+// SetTaskStore подменяет хранилище задач. Пустой аргумент возвращает файловый
+// адаптер, поэтому вызывающему не нужно знать, какой бэкенд стоит по умолчанию.
+func (s *Service) SetTaskStore(store TaskStore) {
+	if s == nil {
+		return
+	}
+	if store == nil {
+		fileStore := NewFileTaskStore(s.Cfg.TasksDir, s.Cfg.Root, nil)
+		fileStore.Acquire = s.acquireLock
+		s.store = fileStore
+		return
+	}
+	s.store = store
+}
+
+// taskStore returns the installed port, creating the file adapter for services
+// assembled without NewService.
+func (s *Service) taskStore() TaskStore {
+	if s != nil && s.store != nil {
+		return s.store
+	}
+	fileStore := NewFileTaskStore(s.Cfg.TasksDir, s.Cfg.Root, nil)
+	fileStore.Acquire = s.acquireLock
+	return fileStore
 }
 
 // RegisterGateWaiter регистрирует ожидающего на гейте через установленный порт.
@@ -432,7 +466,12 @@ func (s *Service) List(o ListOptions) (string, error) {
 	if len(wake.Failed) > 0 {
 		warning = fmt.Sprintf("предупреждение: пробуждение по дате не удалось для %d карточки, см. журнал\n", len(wake.Failed))
 	}
-	cards, err := LoadCards(s.Cfg.TasksDir)
+	var cards []Card
+	if len(o.Statuses) == 1 && o.Statuses[0] == "todo" {
+		cards, err = s.taskStore().ListTodo()
+	} else {
+		cards, err = LoadCards(s.Cfg.TasksDir)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -925,31 +964,7 @@ func (s *Service) Take(o TakeOptions) (string, error) {
 		return "", err
 	}
 
-	lock, err := s.acquireLock()
-	if err != nil {
-		return "", err
-	}
-	defer lock.Release()
-
-	cards, err := LoadCards(s.Cfg.TasksDir)
-	if err != nil {
-		return "", err
-	}
-	var target *Card
-	for i := range cards {
-		if cards[i].ID == id {
-			target = &cards[i]
-			break
-		}
-	}
-	if target == nil {
-		return "", Validationf("карточка %s не найдена", id)
-	}
-	if target.Status != "todo" {
-		return "", Validationf("карточка %s уже взята агентом %s в %s", id, target.Agent, target.Time)
-	}
-	newText := ReplaceFields(target.Raw, o.Agent, when)
-	if err := AtomicWrite(target.Path, []byte(newText), 0644); err != nil {
+	if _, err := s.taskStore().Claim(id, o.Agent, when); err != nil {
 		return "", err
 	}
 	// AN-06: хуки идут после успешной записи карточки. Их сбой не откатывает

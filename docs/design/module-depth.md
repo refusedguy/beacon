@@ -45,6 +45,16 @@ git grep -i -c 'deep module'   -- AGENTS.md README.md GLOSSARY.md docs/templates
 
 Два адаптера. Порт `Deliverer` имеет production адаптер `daemonNotifyDeliverer` в `cmd/beacon/daemon.go:126` и тестовый `recordingDeliverer` в `internal/app/notify/router_test.go:21`. Порт `Resolver` имеет `daemonNotifyResolver` в `cmd/beacon/daemon.go:110` и `RouteTable` в `internal/app/notify/router.go:147`. Seam реальный. Критерий проходит.
 
+## Пример: TaskStore
+
+`internal/app/taskcli/task_store.go` объявляет порт над хранилищем задач. Четыре метода покрывают путь от выбора карточки до закрытия связанного Watch: `ListTodo`, `Claim`, `CloseWithEvidence` и `LinkWatch`. Текущий бэкенд остаётся файловым: `FileTaskStore` вызывает существующие `taskstore.LoadCards`, `ReplaceFields`, `ApplyCloseFields` и общий файловый замок. Поведение команд не меняется.
+
+Тест удаления. Удалим порт. Выбор todo-карточек, запись полей взятия, запись полей закрытия и починка устаревшей связи Watch вернутся в `Service.List`, `Service.Take`, `closeLinkedCardFile`, `closeWiringCard` и обработчик `beacon_watch_pr`. Сложность появится снова в пяти вызывающих. Модуль проходит тест удаления.
+
+Интерфейс как тестовая поверхность. `internal/app/taskcli/task_store_contract_test.go` задаёт один набор проверок и прогоняет его через `runTaskStoreContract`. Тест наблюдает состояние через методы порта и через переданный env-читатель, не через внутренние поля адаптера. Критерий проходит.
+
+Два адаптера. Production-адаптер `FileTaskStore` работает поверх `docs/tasks` и `card_links`. Негативный контроль `FakeTaskStore` держит карточки в памяти. Оба проходят один и тот же контрактный набор. Seam реальный: подмена бэкенда не требует правки claim, watch и merge.
+
 ## Негативный контроль
 
 Правило проверяют тремя прогонами на одном и том же примере, по образцу `in-progress/setup-ts-deep-modules/SKILL.md:79-87`.

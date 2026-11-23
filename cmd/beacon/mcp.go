@@ -57,6 +57,29 @@ type deferredCardLinks struct {
 
 var _ cibridge.CardLinks = (*deferredCardLinks)(nil)
 
+// sqliteWatchLinks is the production WatchLinkWriter behind the TaskStore
+// port. It keeps the card_links table unchanged: one row per card, INSERT OR
+// IGNORE on repeat.
+type sqliteWatchLinks struct{ db *store.DB }
+
+var _ taskcli.WatchLinkWriter = sqliteWatchLinks{}
+
+func (l sqliteWatchLinks) Link(cardID, watchID string, pr int) (taskcli.TaskLink, error) {
+	linked, err := l.db.LinkCardWatch(cardID, watchID, pr)
+	if err != nil {
+		return taskcli.TaskLink{}, err
+	}
+	return taskcli.TaskLink{
+		CardID: linked.Link.CardID, WatchID: linked.Link.WatchID, PR: linked.Link.PR,
+		Created: linked.Created, Duplicate: linked.Duplicate,
+	}, nil
+}
+
+func (l sqliteWatchLinks) Unlink(cardID string) error {
+	_, err := l.db.Unlink(cardID)
+	return err
+}
+
 func (l *deferredCardLinks) CloseMerged(ctx context.Context, watchID string, pr int, at time.Time) error {
 	if l == nil || l.db == nil {
 		return nil
@@ -127,89 +150,31 @@ func linkedCardID(ctx context.Context, db *store.DB, watchID string) (string, er
 // directly (ADR 0005), as in init.go.
 var wiringCardWriteFile = os.WriteFile
 
-// mergedCloseOptions builds the canonical close fields shared with the CLI and
-// MCP close paths. An explicit timestamp keeps repeated merged observations
-// byte for byte identical.
-func mergedCloseOptions(at time.Time) taskstore.CloseCardOptions {
-	return taskstore.CloseCardOptions{
-		Status:   "done",
-		Reason:   "already_landed",
-		ClosedBy: "beacon",
-		ClosedAt: at.UTC().Format(time.RFC3339),
-	}
+// taskPortFor binds the task-store port over one project. The write seam is
+// passed through so the merged-card path still writes through the same
+// capabilities gate as before the port existed.
+func taskPortFor(root string) taskcli.TaskStore {
+	store := taskcli.NewFileTaskStore(filepath.Join(root, "docs", "tasks"), root, nil)
+	store.WriteFile = wiringCardWriteFile
+	return store
 }
 
 // closeWiringCard flips the deferred card to done and records the merged PR.
-// The confirmation line makes the write idempotent: a repeated merged
-// observation leaves the file unchanged.
+// The PR marker in the card makes a repeated merged observation a no-op.
 func closeWiringCard(root string, pr int, at time.Time) error {
 	if root == "" || pr <= 0 {
 		return nil
 	}
-	lock, err := taskstore.AcquireLock(taskstore.TasksLockPath(filepath.Join(root, "docs", "tasks")), root)
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-	path := filepath.Join(root, "docs", "tasks", fmt.Sprintf("WIRING-%d.md", pr))
-	// os.DirFS + fs.ReadFile keeps the read out of cmd's forbidden os.ReadFile
-	// capability (ADR 0005), as in readMCPConnection above.
-	raw, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	text := string(raw)
-	if strings.Contains(text, fmt.Sprintf("PR #%d MERGED", pr)) {
-		return nil
-	}
-	text, err = taskstore.ApplyCloseFields(text, mergedCloseOptions(at))
-	if err != nil {
-		return err
-	}
-	text += fmt.Sprintf("\n## Подтверждение\n- PR #%d MERGED: %s (squash).\n",
-		pr, at.UTC().Format("2006-01-02"))
-	return wiringCardWriteFile(path, []byte(text), 0o644)
+	return taskPortFor(root).CloseWithEvidence(fmt.Sprintf("WIRING-%d", pr), pr, at)
 }
 
-// closeLinkedCardFile flips the card linked to a merged Watch to done. The PR
-// marker makes the write idempotent: a repeated merged observation leaves the
-// card unchanged. taskstore.ApplyCloseFields owns the close fields, so the
-// result matches the CLI and MCP close paths. Only Состояние and Вопрос stay
-// outside that contract and are cleared separately.
+// closeLinkedCardFile flips the card linked to a merged Watch to done. The
+// port owns the close fields, the marker check and the confirmation line.
 func closeLinkedCardFile(root, cardID string, pr int, at time.Time) error {
 	if root == "" || strings.TrimSpace(cardID) == "" || pr <= 0 {
 		return nil
 	}
-	lock, err := taskstore.AcquireLock(taskstore.TasksLockPath(filepath.Join(root, "docs", "tasks")), root)
-	if err != nil {
-		return err
-	}
-	defer lock.Release()
-	path := filepath.Join(root, "docs", "tasks", strings.TrimSpace(cardID)+".md")
-	raw, err := fs.ReadFile(os.DirFS(filepath.Dir(path)), filepath.Base(path))
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	text := string(raw)
-	marker := fmt.Sprintf("PR #%d MERGED", pr)
-	if strings.Contains(text, marker) {
-		return nil
-	}
-	text, err = taskstore.ApplyCloseFields(text, mergedCloseOptions(at))
-	if err != nil {
-		return err
-	}
-	text = setCardField(text, "Состояние", "")
-	text = setCardField(text, "Вопрос", "")
-	text += fmt.Sprintf("\n## Подтверждение\n- %s: %s (squash).\n",
-		marker, at.UTC().Format("2006-01-02"))
-	return wiringCardWriteFile(path, []byte(text), 0o644)
+	return taskPortFor(root).CloseWithEvidence(cardID, pr, at)
 }
 
 // mcpStateDBName is the SQLite file inside the Beacon state directory
@@ -628,19 +593,8 @@ func attachWatchPRWithCardLink(s *mcpsdk.Server, deps mcp.Dependencies, projectR
 				fmt.Errorf("invalid cardID %q", cardID))
 			return result, out, err
 		}
-		linked, linkErr := db.LinkCardWatch(cardID, out.WatchID, in.PR)
-		if linkErr == nil && linked.Duplicate &&
-			(linked.Link.WatchID != out.WatchID || linked.Link.PR != in.PR) {
-			// A rebase creates a successor Watch. The first row still points at
-			// the closed Watch, so move the single link to the live one before
-			// its merged verdict can close the card.
-			if _, unlinkErr := db.Unlink(cardID); unlinkErr != nil {
-				linkErr = unlinkErr
-			} else {
-				_, linkErr = db.LinkCardWatch(cardID, out.WatchID, in.PR)
-			}
-		}
-		if linkErr != nil {
+		links := taskcli.NewFileTaskStore("", projectRoot, sqliteWatchLinks{db: db})
+		if _, linkErr := links.LinkWatch(out.WatchID, cardID, in.PR); linkErr != nil {
 			observe.ActorError("watch_pr-card-link", out.WatchID, linkErr)
 		}
 		return result, out, err
