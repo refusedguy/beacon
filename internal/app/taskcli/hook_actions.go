@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 
 	"github.com/refusedguy/beacon/internal/infra/hookrun"
 )
@@ -50,7 +50,7 @@ func HookActionNames() []HookAction {
 	for name := range hookActions {
 		names = append(names, name)
 	}
-	sort.Slice(names, func(i, j int) bool { return names[i] < names[j] })
+	slices.Sort(names)
 	return names
 }
 

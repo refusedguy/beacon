@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -272,15 +273,6 @@ func ParseCard(filePath string, data []byte) (Card, error) {
 	return card, nil
 }
 
-func oneOf(v string, allowed ...string) bool {
-	for _, a := range allowed {
-		if v == a {
-			return true
-		}
-	}
-	return false
-}
-
 // Допустимые значения полей Тип, Статус и Фаза определены один раз и живут
 // только здесь. ParseCard проверяет их через IsValidType, IsValidStatus и
 // IsValidPhase. Другие подсистемы переиспользуют те же множества через Valid*
@@ -306,13 +298,13 @@ func ValidStatuses() []string { return append([]string(nil), cardStatuses...) }
 func ValidPhases() []string { return append([]string(nil), cardPhases...) }
 
 // IsValidType сообщает, принимает ли ParseCard значение поля Тип.
-func IsValidType(v string) bool { return oneOf(v, cardTypes...) }
+func IsValidType(v string) bool { return slices.Contains(cardTypes, v) }
 
 // IsValidStatus сообщает, принимает ли ParseCard значение поля Статус.
-func IsValidStatus(v string) bool { return oneOf(v, cardStatuses...) }
+func IsValidStatus(v string) bool { return slices.Contains(cardStatuses, v) }
 
 // IsValidPhase сообщает, принимает ли ParseCard значение поля Фаза.
-func IsValidPhase(v string) bool { return oneOf(v, cardPhases...) }
+func IsValidPhase(v string) bool { return slices.Contains(cardPhases, v) }
 
 // splitList разбирает список через запятую. Значение «нет» даёт пустой список.
 func splitList(v string) []string {
