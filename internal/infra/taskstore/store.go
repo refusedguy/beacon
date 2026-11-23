@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -732,6 +733,57 @@ type CollisionReport struct {
 	Collisions []IDCollision
 }
 
+// collisionWorkers is the fixed cap on concurrent root scans.
+const collisionWorkers = 4
+
+// collisionRootResult holds one root's private scan. Results are written by
+// index, so the main goroutine can merge them in root order after wg.Wait.
+type collisionRootResult struct {
+	root   string
+	exists bool
+	cards  int
+	owners map[string]map[string]string
+	err    error
+}
+
+// scanCollisionRoot reads one root into a map owned by a single worker. The
+// readFile argument is a seam for the concurrency test; production passes
+// os.ReadFile.
+func scanCollisionRoot(root string, readFile func(string) ([]byte, error)) collisionRootResult {
+	res := collisionRootResult{root: root, owners: make(map[string]map[string]string)}
+	tasksDir := filepath.Join(root, "docs", "tasks")
+	entries, err := os.ReadDir(tasksDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return res
+	}
+	if err != nil {
+		res.err = Startupf("не прочитан каталог карточек %s: %v", tasksDir, err)
+		return res
+	}
+	res.exists = true
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".md")
+		if !IsID(id) {
+			continue
+		}
+		data, err := readFile(filepath.Join(tasksDir, entry.Name()))
+		if err != nil {
+			res.err = Startupf("не прочитана карточка %s: %v", entry.Name(), err)
+			return res
+		}
+		sum := sha256.Sum256(data)
+		if res.owners[id] == nil {
+			res.owners[id] = make(map[string]string)
+		}
+		res.owners[id][root] = hex.EncodeToString(sum[:])
+		res.cards++
+	}
+	return res
+}
+
 // MeasureIDCollisions сканирует docs/tasks в каждом корне и считает повторы ID
 // между worktree. Формат ID не меняется: T%d.%d остаётся валидным.
 //
@@ -741,40 +793,51 @@ type CollisionReport struct {
 // Новые ID выдаются через MintID с хеш-суффиксом T<g>.<n>.<base36>; старый
 // формат T<g>.<n> продолжает читаться через NextID и не ломает exactIDRE.
 func MeasureIDCollisions(roots ...string) (CollisionReport, error) {
+	return measureIDCollisions(roots, os.ReadFile)
+}
+
+func measureIDCollisions(roots []string, readFile func(string) ([]byte, error)) (CollisionReport, error) {
 	report := CollisionReport{}
+	results := make([]collisionRootResult, len(roots))
+	jobs := make(chan int)
+	workers := collisionWorkers
+	if len(roots) < workers {
+		workers = len(roots)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i] = scanCollisionRoot(roots[i], readFile)
+			}
+		}()
+	}
+	for i := range roots {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
 	seenRoots := make(map[string]bool)
 	owners := make(map[string]map[string]string)
-	for _, root := range roots {
-		tasksDir := filepath.Join(root, "docs", "tasks")
-		entries, err := os.ReadDir(tasksDir)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
+	for _, res := range results {
+		if res.err != nil {
+			return report, res.err
 		}
-		if err != nil {
-			return report, Startupf("не прочитан каталог карточек %s: %v", tasksDir, err)
-		}
-		if !seenRoots[root] {
-			seenRoots[root] = true
+		if res.exists && !seenRoots[res.root] {
+			seenRoots[res.root] = true
 			report.Worktrees++
 		}
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
-				continue
-			}
-			id := strings.TrimSuffix(entry.Name(), ".md")
-			if !IsID(id) {
-				continue
-			}
-			data, err := os.ReadFile(filepath.Join(tasksDir, entry.Name()))
-			if err != nil {
-				return report, Startupf("не прочитана карточка %s: %v", entry.Name(), err)
-			}
-			sum := sha256.Sum256(data)
+		report.Cards += res.cards
+		for id, byRoot := range res.owners {
 			if owners[id] == nil {
 				owners[id] = make(map[string]string)
 			}
-			owners[id][root] = hex.EncodeToString(sum[:])
-			report.Cards++
+			for root, hash := range byRoot {
+				owners[id][root] = hash
+			}
 		}
 	}
 	for id, byRoot := range owners {

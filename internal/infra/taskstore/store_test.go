@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,6 +313,101 @@ func TestMeasureIDCollisions(t *testing.T) {
 	}
 	if !IsID("T2.2") {
 		t.Fatal("IsID(T2.2) = false")
+	}
+}
+
+func TestMeasureIDCollisionsConcurrentOrder(t *testing.T) {
+	roots := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	ids := []string{"T9.1", "T1.1", "T5.1"}
+	for _, root := range roots {
+		if err := os.MkdirAll(filepath.Join(root, "docs", "tasks"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids {
+			body := id + "|" + root + "\n"
+			p := filepath.Join(root, "docs", "tasks", id+".md")
+			if err := os.WriteFile(p, []byte(body), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	only := filepath.Join(roots[0], "docs", "tasks", "T2.2.md")
+	if err := os.WriteFile(only, []byte("только здесь\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := MeasureIDCollisions(roots...)
+	if err != nil {
+		t.Fatalf("MeasureIDCollisions: %v", err)
+	}
+	if report.Worktrees != 3 || report.Cards != 10 || report.Duplicates != 3 {
+		t.Fatalf("report = %+v, ждали 3 корня, 10 карточек и 3 дубля", report)
+	}
+	want := []string{"T1.1", "T5.1", "T9.1"}
+	if len(report.Collisions) != len(want) {
+		t.Fatalf("Collisions = %+v, ждали %v", report.Collisions, want)
+	}
+	for i, id := range want {
+		got := report.Collisions[i]
+		if got.ID != id {
+			t.Errorf("Collisions[%d].ID = %q, ждали %q", i, got.ID, id)
+		}
+		if len(got.Roots) != 3 {
+			t.Fatalf("Collisions[%d].Roots = %v, ждали 3 корня", i, got.Roots)
+		}
+		for j := 1; j < len(got.Roots); j++ {
+			if got.Roots[j-1] > got.Roots[j] {
+				t.Errorf("Roots не отсортированы: %v", got.Roots)
+			}
+		}
+	}
+}
+
+func TestMeasureIDCollisionsReadCap(t *testing.T) {
+	roots := make([]string, 12)
+	for i := range roots {
+		root := t.TempDir()
+		dir := filepath.Join(root, "docs", "tasks")
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		name := fmt.Sprintf("T%d.1", i+1)
+		if err := os.WriteFile(filepath.Join(dir, name+".md"), []byte("тело\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		roots[i] = root
+	}
+
+	var active, peak atomic.Int32
+	release := make(chan struct{})
+	timer := time.NewTimer(50 * time.Millisecond)
+	defer timer.Stop()
+	go func() {
+		<-timer.C
+		close(release)
+	}()
+	hook := func(p string) ([]byte, error) {
+		n := active.Add(1)
+		defer active.Add(-1)
+		for {
+			cur := peak.Load()
+			if n <= cur || peak.CompareAndSwap(cur, n) {
+				break
+			}
+		}
+		<-release
+		return os.ReadFile(p)
+	}
+
+	report, err := measureIDCollisions(roots, hook)
+	if err != nil {
+		t.Fatalf("measureIDCollisions: %v", err)
+	}
+	if report.Worktrees != len(roots) || report.Cards != len(roots) {
+		t.Fatalf("report = %+v, ждали %d корней и столько же карточек", report, len(roots))
+	}
+	if got := peak.Load(); got < 2 || got > collisionWorkers {
+		t.Fatalf("одновременных чтений = %d, ждали от 2 до %d", got, collisionWorkers)
 	}
 }
 
