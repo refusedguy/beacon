@@ -23,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: ./.github/actions/go-runner-setup
@@ -44,6 +46,29 @@ jobs:
         run: |
           set -euo pipefail
           go run ./docsgate -root ../.. -baseline gate/config/docs-baseline.json
+
+      - name: Self-test verification registry on planted covered-file change
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          git clone --quiet --no-hardlinks . "$tmp/repo"
+          cd "$tmp/repo"
+          printf '\n# negative control\n' >> scripts/verify-beacon.sh
+          git -c user.name=ci -c user.email=ci@example.invalid commit -qam 'negative control'
+          if bash scripts/verification-registry.sh --check >"$tmp/check.log" 2>&1; then
+            cat "$tmp/check.log" >&2
+            echo 'negative control: check unexpectedly passed' >&2
+            exit 1
+          fi
+          echo 'negative control: check failed as expected'
+
+      - name: Verification registry sync commit is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verification-registry.sh --check
 
       # TCG-17. README command table is generated from catalog.go; a change to
       # a command summary or flag usage without a matching README edit fails.

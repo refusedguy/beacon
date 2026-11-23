@@ -53,10 +53,16 @@ bash scripts/verify-daemon.sh
 
 Для каждой проверки runbook хранит запись покрытия. Запись содержит файлы и функции, которые проверка наблюдает, границы её применения, команду запуска и commit синхронизации. Commit синхронизации задаёт коммит, на котором проверку последний раз сверили с кодом. Новый commit записывают только после новой сверки.
 
+<!-- BEGIN VERIFICATION REGISTRY -->
 | Проверка | Файлы и функции | Границы | Команда | Commit синхронизации |
 | --- | --- | --- | --- | --- |
-| `verify-beacon.sh` | `scripts/verify-beacon.sh`, сборка и тесты `./...`, `beacon mcp`, `beacon_stats`, `beacon metrics`, проект-scoped `beacon.db`, логи, `beacon daemon` | весь репозиторий, изолированный каталог прогона, подменённый `gh` без реальных PR | `bash scripts/verify-beacon.sh` | `935201f757d4bca3f357ec4aaa31baafb63e4a66` |
-| `verify-daemon.sh` | `scripts/verify-daemon.sh`, `domain.Evaluate`, `orchestrator.Run`, `SaveWatch`, таблица `orchestrator_merges`, вызовы `gh pr merge` | реальный бинарник и store SQLite, заглушка `gh`, PR 901 и 902, без обращения к GitHub | `bash scripts/verify-daemon.sh` | `935201f757d4bca3f357ec4aaa31baafb63e4a66` |
+| `verify-beacon.sh` | paths: `scripts/verify-beacon.sh,cmd/beacon/mcp.go,internal/app/orchestrator/orchestrator.go`; сборка и тесты `./...`, `beacon mcp`, `beacon_stats`, `beacon metrics`, проект-scoped `beacon.db`, логи, `beacon daemon` | весь репозиторий, изолированный каталог прогона, подменённый `gh` без реальных PR | `bash scripts/verify-beacon.sh` | `bcfafe85530c5517cf2e2bc7d3cea2f46764738e` |
+| `verify-daemon.sh` | paths: `scripts/verify-daemon.sh,internal/domain/verdict.go,internal/app/orchestrator/orchestrator.go,internal/infra/store/db.go`; `domain.Evaluate`, `orchestrator.Run`, `SaveWatch`, таблица `orchestrator_merges`, вызовы `gh pr merge` | реальный бинарник и store SQLite, заглушка `gh`, PR 901 и 902, без обращения к GitHub | `bash scripts/verify-daemon.sh` | `84ea126860cf6dd02fcaff6f05551f9a6cfbc3c6` |
+<!-- END VERIFICATION REGISTRY -->
+
+Колонка «Файлы и функции» начинается с метки `paths:` и списка путей через запятую внутри обратных кавычек. Парсер читает только этот список. Остальной текст колонки описывает функции и команды и к разбору отношения не имеет.
+
+`bash scripts/verification-registry.sh --refresh` считает ожидаемый commit как последний коммит, задевший любой путь из списка, и записывает его в колонку «Commit синхронизации». Повторный запуск ничего не меняет. `bash scripts/verification-registry.sh --check` возвращает `1` при расхождении записанного и ожидаемого commit. Шаг в `.github/workflows/docs.yml` запускает `--check` с полной историей `git`.
 
 Проверку нельзя считать актуальной, если покрываемый файл изменился после commit синхронизации. Сначала нужно заново сверить проверку с кодом, затем записать новый commit.
 
