@@ -253,6 +253,7 @@ Executor видит внешнюю поломку и отвечает `beacon_ac
 | `regrade` | Пересчитать вердикт по сохранённым доказательствам Watch без повторного прогона | `beacon regrade [--watch <id>] [--dataset <name>] [--split <name>] [--declared <a,b>] [--save <file>] [--format table\|json]` |
 | `reset` | Очистить состояние control plane проекта | `beacon reset --yes` |
 | `server` | Запустить HTTP-сервер Beacon с лизингом единственного экземпляра | `beacon server` |
+| `skills-lock` | Пересчитать или проверить skills-lock.json по снимкам скиллов | `beacon skills-lock [--write \| --check]` |
 | `spawn` | Создать сессию OpenCode для задачи Beacon и отправить промпт | `beacon spawn <taskID> [--agent id] [--title ...]` |
 | `task` | Работа с карточками задач | `beacon task <list\|new\|take> [flags]` |
 | `test` | Запустить тесты проекта через go test ./... | `beacon test` |
