@@ -82,6 +82,11 @@ func (g *GitHubIssues) Complete(ctx context.Context, id core.TaskID) error {
 	return err
 }
 
+// MarkInWorkspace is a no-op: GitHub issues are updated through the API.
+func (g *GitHubIssues) MarkInWorkspace(context.Context, core.TaskID, string, string) error {
+	return nil
+}
+
 func issueNumber(id core.TaskID) (int, error) {
 	s := strings.TrimPrefix(string(id), "GH-")
 	n, err := strconv.Atoi(s)

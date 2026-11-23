@@ -7,11 +7,32 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
+type callLog struct{ items []string }
+
+func (l *callLog) add(entry string) {
+	if l != nil {
+		l.items = append(l.items, entry)
+	}
+}
+
+type markCall struct {
+	id     core.TaskID
+	path   string
+	status string
+}
+
+type commitCall struct {
+	pathspec string
+	message  string
+}
+
 type fakeSource struct {
 	tasks       []core.Task
 	claimed     []core.TaskID
 	complete    []core.TaskID
 	completeErr error
+	marked      []markCall
+	log         *callLog
 }
 
 func (f *fakeSource) ListAvailable(context.Context) ([]core.Task, error) { return f.tasks, nil }
@@ -24,6 +45,11 @@ func (f *fakeSource) Complete(_ context.Context, id core.TaskID) error {
 		return f.completeErr
 	}
 	f.complete = append(f.complete, id)
+	return nil
+}
+func (f *fakeSource) MarkInWorkspace(_ context.Context, id core.TaskID, path, status string) error {
+	f.marked = append(f.marked, markCall{id: id, path: path, status: status})
+	f.log.add("mark:" + status)
 	return nil
 }
 
@@ -156,7 +182,11 @@ func (f *fakeStore) UpdateIncident(_ context.Context, in *core.BaseIncident) err
 	return nil
 }
 
-type fakeWorkspace struct{ removed int }
+type fakeWorkspace struct {
+	removed int
+	commits []commitCall
+	log     *callLog
+}
 
 func (f *fakeWorkspace) Create(_ context.Context, t core.Task) (core.Workspace, error) {
 	return core.Workspace{Path: "/ws/" + string(t.ID), Branch: "beacon/" + string(t.ID)}, nil
@@ -168,6 +198,11 @@ func (f *fakeWorkspace) Remove(_ context.Context, _ core.Workspace) error {
 }
 func (f *fakeWorkspace) HasChanges(context.Context, core.Workspace, string) (bool, error) {
 	return false, nil
+}
+func (f *fakeWorkspace) CommitPath(_ context.Context, _ core.Workspace, pathspec, message string) error {
+	f.commits = append(f.commits, commitCall{pathspec: pathspec, message: message})
+	f.log.add("commit:" + pathspec)
+	return nil
 }
 
 type fakeHarness struct {
@@ -197,16 +232,29 @@ func (f *fakeHarness) Events() <-chan core.HarnessEvent {
 }
 
 type fakeSCM struct {
-	obs       core.Observation
-	obsByPR   map[int]core.Observation
-	base      core.BaseStatus
-	rebases   int
-	merges    int
-	foundPR   int
-	updateErr error
+	obs        core.Observation
+	obsByPR    map[int]core.Observation
+	observeSeq []core.Observation
+	observeN   int
+	base       core.BaseStatus
+	rebases    int
+	merges     int
+	mergeSHA   string
+	foundPR    int
+	updateErr  error
+	log        *callLog
 }
 
 func (f *fakeSCM) Observe(_ context.Context, pr int) (core.Observation, error) {
+	f.log.add("observe")
+	if len(f.observeSeq) > 0 {
+		i := f.observeN
+		if i >= len(f.observeSeq) {
+			i = len(f.observeSeq) - 1
+		}
+		f.observeN++
+		return f.observeSeq[i], nil
+	}
 	if o, ok := f.obsByPR[pr]; ok {
 		return o, nil
 	}
@@ -219,8 +267,10 @@ func (f *fakeSCM) UpdateBranch(_ context.Context, _ int, sha string) (string, er
 	f.rebases++
 	return "new-" + sha, nil
 }
-func (f *fakeSCM) Merge(context.Context, int, string, string) error {
+func (f *fakeSCM) Merge(_ context.Context, _ int, sha string, _ string) error {
+	f.mergeSHA = sha
 	f.merges++
+	f.log.add("merge")
 	return nil
 }
 func (f *fakeSCM) BaseBranchStatus(context.Context, string) (core.BaseStatus, error) {

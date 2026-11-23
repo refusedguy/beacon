@@ -242,3 +242,9 @@ func (m *Markdown) Claim(ctx context.Context, id core.TaskID) error {
 func (m *Markdown) Complete(ctx context.Context, id core.TaskID) error {
 	return m.rewriteStatus(ctx, id, "done")
 }
+
+// MarkInWorkspace rewrites the card inside a worker workspace so the status change
+// travels in the worker pull request.
+func (m *Markdown) MarkInWorkspace(ctx context.Context, id core.TaskID, workspacePath, status string) error {
+	return NewMarkdown(filepath.Join(workspacePath, "docs", "tasks")).rewriteStatus(ctx, id, status)
+}

@@ -123,6 +123,29 @@ func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error
 	return g.status(ctx, ws.Path)
 }
 
+// CommitPath commits only the given pathspec in the worker worktree and pushes
+// the branch. Agent code is never staged.
+func (g *GitWorktree) CommitPath(ctx context.Context, ws core.Workspace, pathspec, message string) error {
+	if err := checkPath(ws.Path); err != nil {
+		return err
+	}
+	out, err := g.runInDir(ctx, ws.Path, "status", "--porcelain", "--", pathspec)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(out) == "" {
+		return nil
+	}
+	if _, err := g.runInDir(ctx, ws.Path, "add", "--", pathspec); err != nil {
+		return err
+	}
+	if _, err := g.runInDir(ctx, ws.Path, "commit", "-m", message, "--", pathspec); err != nil {
+		return err
+	}
+	_, err = g.runInDir(ctx, ws.Path, "push", "origin", ws.Branch)
+	return err
+}
+
 func (g *GitWorktree) HasChanges(ctx context.Context, ws core.Workspace, base string) (bool, error) {
 	if err := checkPath(ws.Path); err != nil {
 		return false, err

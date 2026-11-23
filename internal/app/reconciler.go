@@ -128,6 +128,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (core.MergeDecision,
 }
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
+	if !run.IsFixer {
+		if err := r.Source.MarkInWorkspace(ctx, run.TaskID, run.WorkspacePath, "done"); err != nil {
+			return err
+		}
+		ws := core.Workspace{Path: run.WorkspacePath, Branch: run.Branch}
+		message := "beacon: complete task " + string(run.TaskID)
+		if err := r.Workspace.CommitPath(ctx, ws, "docs/tasks", message); err != nil {
+			return err
+		}
+		fresh, err := r.SCM.Observe(ctx, obs.PRNumber)
+		if err != nil {
+			return err
+		}
+		obs.HeadSHA = fresh.HeadSHA
+	}
 	key := fmt.Sprintf("merge:%d:%s", obs.PRNumber, obs.HeadSHA)
 	if err := r.SCM.Merge(ctx, obs.PRNumber, obs.HeadSHA, string(run.TaskID)); err != nil {
 		return err

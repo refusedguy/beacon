@@ -73,6 +73,23 @@ func TestTwoPoolConcurrency(t *testing.T) {
 	}
 }
 
+func TestDispatchMarksCardInWorkspace(t *testing.T) {
+	store := newFakeStore()
+	src := &fakeSource{tasks: []core.Task{{ID: "T-MARK", Status: core.TaskAvailable}}}
+	d := &Dispatcher{
+		Source: src, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.marked) != 1 || src.marked[0].id != "T-MARK" ||
+		src.marked[0].path != "/ws/T-MARK" || src.marked[0].status != "in_progress" {
+		t.Fatalf("bad MarkInWorkspace call: %+v", src.marked)
+	}
+}
+
 func TestDispatchDoesNotRetryActiveTask(t *testing.T) {
 	store := newFakeStore()
 	tasks := twentyTasks()
