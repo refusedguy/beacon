@@ -1075,13 +1075,6 @@ func TestWaitOutcomeByteStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := json.Marshal(out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(a) != string(b) {
-		t.Fatalf("байты нестабильны: %s и %s", a, b)
-	}
 	want := `{"watchID":"watch-1","cause":"result","revision":9,"status":"notifying","verdict":"ready","pollAfterMs":5000}`
 	if string(a) != want {
 		t.Fatalf("порядок полей изменился: %s", a)

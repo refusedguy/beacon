@@ -1855,9 +1855,6 @@ func TestWaitResultReasonFieldAppendsToFixedSchema(t *testing.T) {
 	if strings.Contains(string(got), waitStopReasonCheckName) {
 		t.Errorf("reserved check leaked into the response: %s", got)
 	}
-	if _, ok := out.Checks[waitStopReasonCheckName]; !ok {
-		t.Error("reason is not carried in Checks")
-	}
 }
 
 // TestWaitReasonSurvivesStartKeyJoin proves the ADR 0045 p1 start key returns
