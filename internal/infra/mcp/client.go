@@ -433,6 +433,14 @@ func AttachRemoteTools(s *mcpsdk.Server, client *RemoteClient) error {
 	if client == nil {
 		return errors.New("mcp: nil remote client")
 	}
+	return registerForwardedTools(s, ToolNames,
+		func(name string) string { return remoteToolDescriptions[name] },
+		func(name string) mcpsdk.ToolHandler { return toolHandler(client, name, "через сервер") })
+}
+
+// registerForwardedTools prepares and registers the schemas shared by both
+// transports. schemaLookup supplies the per-transport description.
+func registerForwardedTools(s *mcpsdk.Server, names []string, schemaLookup func(name string) string, handlerFactory func(name string) mcpsdk.ToolHandler) error {
 	outputs, err := AllOutputSchemas()
 	if err != nil || outputs == nil {
 		// Same fallback as NewServerWithDeps: a broken optional schema must not
@@ -442,7 +450,7 @@ func AttachRemoteTools(s *mcpsdk.Server, client *RemoteClient) error {
 			"beacon_stats":        {Type: "object"},
 		}
 	}
-	for _, name := range ToolNames {
+	for _, name := range names {
 		output := outputs[name]
 		if output == nil {
 			output = &jsonschema.Schema{Type: "object"}
@@ -451,16 +459,17 @@ func AttachRemoteTools(s *mcpsdk.Server, client *RemoteClient) error {
 		s.RemoveTools(name)
 		s.AddTool(&mcpsdk.Tool{
 			Name:         name,
-			Description:  remoteToolDescriptions[name],
+			Description:  schemaLookup(name),
 			InputSchema:  remoteInputSchema(name),
 			OutputSchema: output,
 			Annotations:  &annotations,
-		}, remoteToolHandler(client, name))
+		}, handlerFactory(name))
 	}
 	return nil
 }
 
-func remoteToolHandler(client *RemoteClient, name string) mcpsdk.ToolHandler {
+// toolHandler keeps the exact error text of each transport through errPrefix.
+func toolHandler(caller ToolCaller, name, errPrefix string) mcpsdk.ToolHandler {
 	return func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
 		var arguments, meta json.RawMessage
 		if req != nil && req.Params != nil {
@@ -471,12 +480,12 @@ func remoteToolHandler(client *RemoteClient, name string) mcpsdk.ToolHandler {
 				}
 			}
 		}
-		result, err := client.CallTool(ctx, name, arguments, meta)
+		result, err := caller.CallTool(ctx, name, arguments, meta)
 		if err != nil {
 			// A tool failure belongs in Content with IsError set, so the agent
 			// can see why the call failed and correct its next turn.
 			out := &mcpsdk.CallToolResult{}
-			out.SetError(fmt.Errorf("mcp: %s через сервер: %w", name, err))
+			out.SetError(fmt.Errorf("mcp: %s %s: %w", name, errPrefix, err))
 			return out, nil
 		}
 		return &result, nil

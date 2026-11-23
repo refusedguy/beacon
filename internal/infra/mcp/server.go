@@ -511,64 +511,25 @@ func AttachInProcessTools(s *mcpsdk.Server, bridge *InProcessBridge) error {
 	if bridge == nil {
 		return errors.New("mcp: nil in-process bridge")
 	}
-	outputs, err := AllOutputSchemas()
-	if err != nil || outputs == nil {
-		// Same fallback as AttachRemoteTools: a broken optional schema must not
-		// leave a contracted tool unregistered.
-		outputs = map[string]*jsonschema.Schema{
-			"beacon_list_running": {Type: "object"},
-			"beacon_stats":        {Type: "object"},
-		}
-	}
+	names := make([]string, 0, len(toolDescriptors))
 	seen := make(map[string]struct{}, len(toolDescriptors))
+	descriptions := make(map[string]string, len(toolDescriptors))
 	for _, descriptor := range toolDescriptors {
 		name := descriptor.Name
 		if _, duplicate := seen[name]; duplicate {
 			return fmt.Errorf("mcp: duplicate tool descriptor %q", name)
 		}
 		seen[name] = struct{}{}
-		output := outputs[name]
-		if output == nil {
-			output = &jsonschema.Schema{Type: "object"}
-		}
+		names = append(names, name)
 		description := remoteToolDescriptions[name]
 		if description == "" {
 			description = descriptor.Description
 		}
-		annotations := toolAnnotations[name]
-		s.RemoveTools(name)
-		s.AddTool(&mcpsdk.Tool{
-			Name:         name,
-			Description:  description,
-			InputSchema:  remoteInputSchema(name),
-			OutputSchema: output,
-			Annotations:  &annotations,
-		}, inProcessToolHandler(bridge, name))
+		descriptions[name] = description
 	}
-	return nil
-}
-
-func inProcessToolHandler(bridge *InProcessBridge, name string) mcpsdk.ToolHandler {
-	return func(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, error) {
-		var arguments, meta json.RawMessage
-		if req != nil && req.Params != nil {
-			arguments = req.Params.Arguments
-			if len(req.Params.Meta) > 0 {
-				if raw, err := json.Marshal(req.Params.Meta); err == nil {
-					meta = raw
-				}
-			}
-		}
-		result, err := bridge.CallTool(ctx, name, arguments, meta)
-		if err != nil {
-			// A tool failure belongs in Content with IsError set, so the agent
-			// can see why the call failed and correct its next turn.
-			out := &mcpsdk.CallToolResult{}
-			out.SetError(fmt.Errorf("mcp: %s локально: %w", name, err))
-			return out, nil
-		}
-		return &result, nil
-	}
+	return registerForwardedTools(s, names,
+		func(name string) string { return descriptions[name] },
+		func(name string) mcpsdk.ToolHandler { return toolHandler(bridge, name, "локально") })
 }
 
 // BlockerControl is the narrow control-plane port the two writing tools need.
