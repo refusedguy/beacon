@@ -231,6 +231,20 @@ func (h *Harness) prompt(ctx context.Context, session, text, id string) error {
 	return err
 }
 
+// NotifyParent queues a quiet, redacted message in the parent session's inbox.
+func (h *Harness) NotifyParent(ctx context.Context, sessionID, text string) error {
+	if sessionID == "" {
+		return nil
+	}
+	path := "/api/session/" + url.PathEscape(sessionID) + "/prompt"
+	body := map[string]any{
+		"id": messageID("notify"), "text": redact(text),
+		"delivery": "queue", "resume": false,
+	}
+	_, _, err := h.do(ctx, http.MethodPost, path, body)
+	return err
+}
+
 func (h *Harness) bind(session string, run core.RunID) {
 	if session == "" || run == "" {
 		return

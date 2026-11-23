@@ -205,11 +205,18 @@ func (f *fakeWorkspace) CommitPath(_ context.Context, _ core.Workspace, pathspec
 	return nil
 }
 
+type parentNotification struct {
+	sessionID string
+	text      string
+}
+
 type fakeHarness struct {
-	sessions []string
-	wakes    []core.WakeContext
-	stops    int
-	events   chan core.HarnessEvent
+	sessions      []string
+	wakes         []core.WakeContext
+	stops         int
+	notifications []parentNotification
+	log           *callLog
+	events        chan core.HarnessEvent
 }
 
 func (f *fakeHarness) Spawn(_ context.Context, req core.SpawnRequest) (core.Session, error) {
@@ -223,6 +230,11 @@ func (f *fakeHarness) Wake(_ context.Context, _ string, w core.WakeContext) erro
 func (f *fakeHarness) Stop(context.Context, string) error { f.stops++; return nil }
 func (f *fakeHarness) IsAlive(context.Context, string) (bool, error) {
 	return true, nil
+}
+func (f *fakeHarness) NotifyParent(_ context.Context, sessionID, text string) error {
+	f.notifications = append(f.notifications, parentNotification{sessionID: sessionID, text: text})
+	f.log.add("notify_parent")
+	return nil
 }
 func (f *fakeHarness) Events() <-chan core.HarnessEvent {
 	if f.events == nil {

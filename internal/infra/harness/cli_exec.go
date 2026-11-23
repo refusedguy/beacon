@@ -90,9 +90,10 @@ func (c *CLIExec) Wake(ctx context.Context, sessionID string, w core.WakeContext
 	return err
 }
 
-func (c *CLIExec) Stop(context.Context, string) error            { return nil }
-func (c *CLIExec) IsAlive(context.Context, string) (bool, error) { return false, nil }
-func (c *CLIExec) Events() <-chan core.HarnessEvent              { return c.events }
+func (c *CLIExec) Stop(context.Context, string) error                 { return nil }
+func (c *CLIExec) IsAlive(context.Context, string) (bool, error)      { return false, nil }
+func (c *CLIExec) NotifyParent(context.Context, string, string) error { return nil }
+func (c *CLIExec) Events() <-chan core.HarnessEvent                   { return c.events }
 
 func (c *CLIExec) emit(id core.RunID) {
 	if c.events == nil {

@@ -23,6 +23,7 @@ func (r *Reconciler) finalizeExternal(ctx context.Context, run *core.Run, obs co
 	if err := r.Store.Save(ctx, run); err != nil {
 		return err
 	}
+	r.notifyParent(ctx, run, run.PRNumber, string(run.State))
 	if merged && !run.IsFixer {
 		if err := r.Source.Complete(ctx, run.TaskID); err != nil {
 			slog.Error("complete externally merged task", "run", run.ID, "error", err)

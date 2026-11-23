@@ -62,6 +62,7 @@ type AgentHarness interface {
 	Wake(ctx context.Context, sessionID string, wake WakeContext) error
 	Stop(ctx context.Context, sessionID string) error
 	IsAlive(ctx context.Context, sessionID string) (bool, error)
+	NotifyParent(ctx context.Context, sessionID, text string) error
 	Events() <-chan HarnessEvent
 }
 

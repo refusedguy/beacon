@@ -240,6 +240,45 @@ func TestWatchIdleEmitsIdleEvent(t *testing.T) {
 	}
 }
 
+func TestNotifyParentUsesQueueDeliveryWithoutResume(t *testing.T) {
+	rec := &recorder{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/session/ses_parent/prompt" {
+			rec.addPrompt(decodeBody(r))
+			_, _ = io.WriteString(w, `{}`)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	h := New(srv.URL)
+	secret := "ghp_" + strings.Repeat("a", 30)
+	if err := h.NotifyParent(context.Background(), "ses_parent", "Beacon: PR #42 run r1 state merged token="+secret); err != nil {
+		t.Fatalf("NotifyParent: %v", err)
+	}
+	prompt := rec.lastPrompt()
+	if prompt == nil {
+		t.Fatal("no prompt captured")
+	}
+	if prompt["delivery"] != "queue" {
+		t.Errorf("delivery = %v, want queue", prompt["delivery"])
+	}
+	if prompt["resume"] != false {
+		t.Errorf("resume = %v, want false", prompt["resume"])
+	}
+	if id, ok := prompt["id"].(string); !ok || !strings.HasPrefix(id, "msg_") {
+		t.Errorf("id = %v, want msg_ prefix", prompt["id"])
+	}
+	text, _ := prompt["text"].(string)
+	if strings.Contains(text, secret) {
+		t.Error("notification leaked secret")
+	}
+	if !strings.Contains(text, "[REDACTED]") {
+		t.Error("notification missing redaction marker")
+	}
+}
+
 func TestStopAndIsAlive(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/session/ses_42" {
