@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"strings"
@@ -70,15 +71,28 @@ func newDurableDeferredStore(db deferredStoreDB) *durableDeferredStore {
 	return &durableDeferredStore{db: db}
 }
 
+// errNilDeferredStore is the shared nil-store signal for the deferred adapter.
+// Every method maps it to the message its callers already receive.
+var errNilDeferredStore = errors.New("beacon deferred: store is nil")
+
+// store returns the deferred queue or the shared nil-store signal.
+func (s *durableDeferredStore) store() (deferredStoreDB, error) {
+	if s == nil || s.db == nil {
+		return nil, errNilDeferredStore
+	}
+	return s.db, nil
+}
+
 // DeferWiring stores one card. The store keeps the first row for a (watchID,
 // reason) key. A stored timestamp equal to the one sent here means this call
 // inserted the row. Any other timestamp means an earlier call won.
 func (s *durableDeferredStore) DeferWiring(_ context.Context, card mcp.DeferredWiringCard) (bool, error) {
-	if s == nil || s.db == nil {
+	db, err := s.store()
+	if err != nil {
 		return false, fmt.Errorf("beacon deferred: store is nil")
 	}
 	at := time.Now().UTC().UnixNano()
-	stored, err := s.db.DeferWiring(store.DeferredWiring{
+	stored, err := db.DeferWiring(store.DeferredWiring{
 		WatchID:    card.WatchID,
 		PR:         card.PR,
 		Title:      card.Title,
@@ -96,10 +110,11 @@ func (s *durableDeferredStore) DeferWiring(_ context.Context, card mcp.DeferredW
 // the lifecycle status (todo, claimed or done), so the CLI shows that status
 // rather than the presentation status a card gets when it is first created.
 func (s *durableDeferredStore) DeferredWirings(_ context.Context) ([]mcp.DeferredWiringCard, error) {
-	if s == nil || s.db == nil {
+	db, err := s.store()
+	if err != nil {
 		return nil, fmt.Errorf("beacon deferred: store is nil")
 	}
-	rows, err := s.db.ListDeferred("")
+	rows, err := db.ListDeferred("")
 	if err != nil {
 		return nil, err
 	}
@@ -123,13 +138,14 @@ func (s *durableDeferredStore) DeferredWirings(_ context.Context) ([]mcp.Deferre
 // CLI can report an unknown watchID as code 2. The store transition is
 // idempotent, so repeating this on an already done Watch changes no row.
 func (s *durableDeferredStore) MarkDone(_ context.Context, watchID string) (int, error) {
-	if s == nil || s.db == nil {
+	db, err := s.store()
+	if err != nil {
 		return 0, fmt.Errorf("beacon deferred: store is nil")
 	}
 	if strings.TrimSpace(watchID) == "" {
 		return 0, fmt.Errorf("beacon deferred: empty watch id")
 	}
-	rows, err := s.db.ListDeferred("")
+	rows, err := db.ListDeferred("")
 	if err != nil {
 		return 0, err
 	}
@@ -138,7 +154,7 @@ func (s *durableDeferredStore) MarkDone(_ context.Context, watchID string) (int,
 		if row.WatchID != watchID {
 			continue
 		}
-		if _, err := s.db.MarkDeferredDone(row.WatchID, row.Reason); err != nil {
+		if _, err := db.MarkDeferredDone(row.WatchID, row.Reason); err != nil {
 			return marked, err
 		}
 		marked++

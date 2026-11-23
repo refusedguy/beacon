@@ -69,6 +69,15 @@ func randomSuffix() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// guard returns ErrPromptFileWrite when the store has no filesystem. Each
+// method pairs that error with its own zero value.
+func (s *PromptFileStore) guard() error {
+	if s == nil || s.fs == nil {
+		return ErrPromptFileWrite
+	}
+	return nil
+}
+
 // PromptDelivery is the result of preparing a prompt for a launch. When
 // UsedFile is true, Command reads and removes Path and Inline is empty. When
 // it is false, the write failed and Inline carries the escaped prompt for the
@@ -117,8 +126,8 @@ func (s *PromptFileStore) fileName(slug string) (string, error) {
 // combines a sanitized slug, a UTC timestamp and a random suffix, so two
 // writes for the same slug never share a path.
 func (s *PromptFileStore) Write(prompt, slug string) (string, error) {
-	if s == nil || s.fs == nil {
-		return "", ErrPromptFileWrite
+	if err := s.guard(); err != nil {
+		return "", err
 	}
 	name, err := s.fileName(slug)
 	if err != nil {
@@ -134,8 +143,8 @@ func (s *PromptFileStore) Write(prompt, slug string) (string, error) {
 // ReadAndDelete returns the exact bytes of the file and removes it. It removes
 // the file even when the read fails, so a failed read leaves no trace on disk.
 func (s *PromptFileStore) ReadAndDelete(path string) ([]byte, error) {
-	if s == nil || s.fs == nil {
-		return nil, ErrPromptFileWrite
+	if err := s.guard(); err != nil {
+		return nil, err
 	}
 	data, readErr := s.fs.Read(path)
 	removeErr := s.fs.Remove(path)
@@ -151,8 +160,8 @@ func (s *PromptFileStore) ReadAndDelete(path string) ([]byte, error) {
 // Cleanup removes every prompt file whose name starts with the slug prefix.
 // It returns the number of files removed. Files for other slugs stay in place.
 func (s *PromptFileStore) Cleanup(slug string) (int, error) {
-	if s == nil || s.fs == nil {
-		return 0, ErrPromptFileWrite
+	if err := s.guard(); err != nil {
+		return 0, err
 	}
 	prefix := s.prefix(slug)
 	names, err := s.fs.Names(s.dir)

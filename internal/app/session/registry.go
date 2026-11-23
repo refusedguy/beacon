@@ -114,17 +114,28 @@ func (r *SessionRegistry) clock() time.Time {
 	return time.Now()
 }
 
+// guard checks that the registry has a store and that id is usable. It returns
+// the trimmed id so a store call never sees a value that skipped the check.
+// Each method returns its own zero value with the error from this pair.
+func (r *SessionRegistry) guard(id string) (string, error) {
+	if r == nil || r.store == nil {
+		return "", ErrNilStore
+	}
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "", ErrEmptyID
+	}
+	return id, nil
+}
+
 // Start records a new session under id. An empty status becomes active. Both
 // CreatedAt and LastSeen get the current time; the store keeps CreatedAt on a
 // later save. Metadata is copied so a caller cannot change the saved row by
 // editing its map afterwards.
 func (r *SessionRegistry) Start(id, status string, metadata map[string]string) error {
-	if r == nil || r.store == nil {
-		return ErrNilStore
-	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return ErrEmptyID
+	id, err := r.guard(id)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(status) == "" {
 		status = SessionStatusActive
@@ -142,12 +153,9 @@ func (r *SessionRegistry) Start(id, status string, metadata map[string]string) e
 // Resume loads the session with id. found is false when the store has no such
 // session. It never creates one.
 func (r *SessionRegistry) Resume(id string) (Session, bool, error) {
-	if r == nil || r.store == nil {
-		return Session{}, false, ErrNilStore
-	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return Session{}, false, ErrEmptyID
+	id, err := r.guard(id)
+	if err != nil {
+		return Session{}, false, err
 	}
 	return r.store.GetSession(id)
 }
@@ -173,13 +181,11 @@ func (r *SessionRegistry) ResumeIdentified(id string) (Session, bool, error) {
 // the metadata and fills missing times from the registry clock. A write error
 // goes back to the caller, which can keep the saved session id.
 func (r *SessionRegistry) Restore(seed Session) (Session, error) {
-	if r == nil || r.store == nil {
-		return Session{}, ErrNilStore
+	id, err := r.guard(seed.ID)
+	if err != nil {
+		return Session{}, err
 	}
-	seed.ID = strings.TrimSpace(seed.ID)
-	if seed.ID == "" {
-		return Session{}, ErrEmptyID
-	}
+	seed.ID = id
 	if strings.TrimSpace(seed.Status) == "" {
 		seed.Status = SessionStatusActive
 	}
@@ -200,12 +206,9 @@ func (r *SessionRegistry) Restore(seed Session) (Session, error) {
 // stable line the caller knows. found is false when the store has no session
 // for that task. The registry never creates one here.
 func (r *SessionRegistry) ResumeByTask(task string) (Session, bool, error) {
-	if r == nil || r.store == nil {
-		return Session{}, false, ErrNilStore
-	}
-	task = strings.TrimSpace(task)
-	if task == "" {
-		return Session{}, false, ErrEmptyID
+	task, err := r.guard(task)
+	if err != nil {
+		return Session{}, false, err
 	}
 	finder, ok := r.store.(TaskSessionFinder)
 	if !ok {
@@ -217,12 +220,9 @@ func (r *SessionRegistry) ResumeByTask(task string) (Session, bool, error) {
 // Heartbeat moves the last-seen time of id to now. A live session writes this
 // while it runs; the store leaves the other fields alone.
 func (r *SessionRegistry) Heartbeat(id string) error {
-	if r == nil || r.store == nil {
-		return ErrNilStore
-	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return ErrEmptyID
+	id, err := r.guard(id)
+	if err != nil {
+		return err
 	}
 	return r.store.Touch(id, r.clock().UTC())
 }
@@ -239,12 +239,9 @@ func (r *SessionRegistry) SetStaleTTL(ttl time.Duration) {
 // store that implements SessionCloser; other stores return
 // ErrNoSessionCloser.
 func (r *SessionRegistry) CloseSession(id string) error {
-	if r == nil || r.store == nil {
-		return ErrNilStore
-	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return ErrEmptyID
+	id, err := r.guard(id)
+	if err != nil {
+		return err
 	}
 	closer, ok := r.store.(SessionCloser)
 	if !ok {
@@ -257,8 +254,10 @@ func (r *SessionRegistry) CloseSession(id string) error {
 // stale TTL, bounded by limit. It needs a store that implements
 // StaleSessionLister; other stores return ErrNoStaleLister.
 func (r *SessionRegistry) ReapStaleSessions(limit int) ([]Session, error) {
-	if r == nil || r.store == nil {
-		return nil, ErrNilStore
+	// This method has no session id. The non-empty placeholder keeps guard's
+	// empty-id check from firing, so the old nil-store behaviour is unchanged.
+	if _, err := r.guard("stale"); err != nil {
+		return nil, err
 	}
 	lister, ok := r.store.(StaleSessionLister)
 	if !ok {

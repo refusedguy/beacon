@@ -30,15 +30,28 @@ CREATE TABLE IF NOT EXISTS orchestrator_merges (
 // Active Watches come from the injected reader; the ledger and the cancellation
 // use the same SQLite file through its single-writer connection.
 type dbOrchestratorStore struct {
-	reader orchestrator.WatchReader
-	db     *store.DB
+	reader  orchestrator.WatchReader
+	storeDB *store.DB
 }
 
 // newDBOrchestratorStore builds the production Store. reader projects the
 // domain Watches and db is the state file that holds the ledger and the event
 // log.
 func newDBOrchestratorStore(reader orchestrator.WatchReader, db *store.DB) *dbOrchestratorStore {
-	return &dbOrchestratorStore{reader: reader, db: db}
+	return &dbOrchestratorStore{reader: reader, storeDB: db}
+}
+
+// errNilOrchestratorDB is the shared nil-database signal. Every method maps it
+// to the message its callers already receive, so no error text changes.
+var errNilOrchestratorDB = errors.New("orchestrator: store is nil")
+
+// db returns the state database or the shared nil-store signal. Callers keep
+// their own return type and error message around this pair.
+func (s *dbOrchestratorStore) db() (*store.DB, error) {
+	if s == nil || s.storeDB == nil {
+		return nil, errNilOrchestratorDB
+	}
+	return s.storeDB, nil
 }
 
 var (
@@ -59,11 +72,12 @@ func (s *dbOrchestratorStore) ActiveWatches(ctx context.Context) ([]orchestrator
 // store.DB exposes writes but no generic read port, so the SELECT runs inside
 // Write on the same single-writer connection; the statement is read-only.
 func (s *dbOrchestratorStore) WasMerged(ctx context.Context, watchID string, revision uint64) (bool, error) {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return false, fmt.Errorf("orchestrator: merge store is nil")
 	}
 	var found bool
-	err := s.db.Write(ctx, func(tx *sql.Tx) error {
+	err = db.Write(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createOrchestratorMergeLedgerSQL); err != nil {
 			return err
 		}
@@ -83,10 +97,11 @@ func (s *dbOrchestratorStore) WasMerged(ctx context.Context, watchID string, rev
 // RecordMerge inserts (watchID, revision) into the ledger. A repeat is a
 // no-op, so the ledger itself is idempotent under redelivery.
 func (s *dbOrchestratorStore) RecordMerge(ctx context.Context, watchID string, revision uint64) error {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return fmt.Errorf("orchestrator: merge store is nil")
 	}
-	return s.db.Write(ctx, func(tx *sql.Tx) error {
+	return db.Write(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createOrchestratorMergeLedgerSQL); err != nil {
 			return err
 		}
@@ -102,11 +117,12 @@ func (s *dbOrchestratorStore) RecordMerge(ctx context.Context, watchID string, r
 // on the block record and an unblock clears it with the rest of the record.
 // A Watch that was unblocked between projection and this call is left alone.
 func (s *dbOrchestratorStore) RecordFixAttempt(ctx context.Context, watchID string) error {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return fmt.Errorf("orchestrator: fix attempt store is nil")
 	}
 	_ = ctx
-	w, err := s.db.Watch(watchID)
+	w, err := db.Watch(watchID)
 	if err != nil {
 		return fmt.Errorf("orchestrator: load watch %s for fix attempt: %w", watchID, err)
 	}
@@ -114,7 +130,7 @@ func (s *dbOrchestratorStore) RecordFixAttempt(ctx context.Context, watchID stri
 	if next.Blocked == nil {
 		return nil
 	}
-	return s.db.SaveWatch(next)
+	return db.SaveWatch(next)
 }
 
 // CloseWatch marks a Watch closed as merged. The periodic pass must not route
@@ -122,11 +138,12 @@ func (s *dbOrchestratorStore) RecordFixAttempt(ctx context.Context, watchID stri
 // the hosting service actually merged. Setting the three fields directly keeps
 // the audit reason honest; a Watch that is already closed is left untouched.
 func (s *dbOrchestratorStore) CloseWatch(ctx context.Context, watchID string) error {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return fmt.Errorf("orchestrator: watch store is nil")
 	}
 	_ = ctx
-	w, err := s.db.Watch(watchID)
+	w, err := db.Watch(watchID)
 	if err != nil {
 		return fmt.Errorf("orchestrator: load watch %s for close: %w", watchID, err)
 	}
@@ -136,7 +153,7 @@ func (s *dbOrchestratorStore) CloseWatch(ctx context.Context, watchID string) er
 	w.Status = domain.StatusClosed
 	w.Verdict = domain.VerdictMerged
 	w.CloseReason = "merged"
-	return s.db.SaveWatch(w)
+	return db.SaveWatch(w)
 }
 
 // CloseWatchAt closes a Watch only while its row still matches the revision,
@@ -145,10 +162,11 @@ func (s *dbOrchestratorStore) CloseWatch(ctx context.Context, watchID string) er
 // gets a conflict instead of replacing that reason with "merged". The compare
 // and the write share one transaction on the store's single writer.
 func (s *dbOrchestratorStore) CloseWatchAt(ctx context.Context, watchID string, revision uint64, headSHA string) error {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return fmt.Errorf("orchestrator: watch store is nil")
 	}
-	return s.db.Write(ctx, func(tx *sql.Tx) error {
+	return db.Write(ctx, func(tx *sql.Tx) error {
 		var payload []byte
 		if err := tx.QueryRow(`SELECT payload FROM watches WHERE id = ?`, watchID).Scan(&payload); err != nil {
 			return fmt.Errorf("orchestrator: load watch %s for close: %w", watchID, err)
@@ -197,11 +215,12 @@ func (s *dbOrchestratorStore) CloseWatchAt(ctx context.Context, watchID string, 
 // more than the retention window ago still satisfies a waitFor reference. No
 // hosting-service call is made here.
 func (s *dbOrchestratorStore) MergedPR(ctx context.Context, pr int) (bool, error) {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return false, errors.New("orchestrator: merge store is nil")
 	}
 	_ = ctx
-	all, err := s.db.AllWatches()
+	all, err := db.AllWatches()
 	if err != nil {
 		return false, fmt.Errorf("orchestrator: watches for PR %d: %w", pr, err)
 	}
@@ -210,7 +229,7 @@ func (s *dbOrchestratorStore) MergedPR(ctx context.Context, pr int) (bool, error
 			return true, nil
 		}
 	}
-	archived, err := s.db.ArchivedWatches()
+	archived, err := db.ArchivedWatches()
 	if err != nil {
 		return false, fmt.Errorf("orchestrator: archived watches for PR %d: %w", pr, err)
 	}
@@ -227,11 +246,12 @@ func (s *dbOrchestratorStore) MergedPR(ctx context.Context, pr int) (bool, error
 // through the same store handle they already read, and no obligation is staged:
 // an unsatisfied dependency is nobody's fault and wakes nobody (ADR 0158).
 func (s *dbOrchestratorStore) HoldWatch(ctx context.Context, watchID, verdict string) error {
-	if s == nil || s.db == nil {
+	db, err := s.db()
+	if err != nil {
 		return errors.New("orchestrator: watch store is nil")
 	}
 	_ = ctx
-	w, err := s.db.Watch(watchID)
+	w, err := db.Watch(watchID)
 	if err != nil {
 		return fmt.Errorf("orchestrator: load watch %s for dependency hold: %w", watchID, err)
 	}
@@ -239,5 +259,5 @@ func (s *dbOrchestratorStore) HoldWatch(ctx context.Context, watchID, verdict st
 		return nil
 	}
 	w.Verdict = domain.Verdict(verdict)
-	return s.db.SaveWatch(w)
+	return db.SaveWatch(w)
 }
