@@ -1,5 +1,9 @@
 package mcp
 
+// ToolCatalog is the single declarative source for the tool permissions in
+// opencode.json. Running go generate rewrites those permissions from it.
+//go:generate go run ../../../cmd/beacon-gen -out ../../../opencode.json
+
 // ToolSpec describes one MCP tool for consumers such as a permissions generator.
 type ToolSpec struct {
 	Name             string
