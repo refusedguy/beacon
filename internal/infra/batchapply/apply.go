@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -479,103 +478,9 @@ func renderFacts(facts []factEntry) string {
 	return b.String()
 }
 
-// adrIndexHeader is the fixed prose above the generated table. It is kept
-// byte-for-byte from the hand-maintained index so regeneration changes only
-// the rows.
-const adrIndexHeader = "# Beacon. Architecture Decision Records\n\n" +
-	"Это каталог решений, согласованных с владельцем. Каждый ADR фиксирует одно решение, причину и последствия. Решения в этом каталоге обязательны для implementation.\n\n" +
-	"Статусы решений:\n\n" +
-	"- `accepted` владелец согласился явно.\n" +
-	"- `default` я предложил, владелец не возразил. Может быть переопределно до гейта G0.\n" +
-	"- `open` решение ещё не принято, ждёт отчёта или вопроса.\n" +
-	"- `proposed` решение предложено, ожидает решения владельца.\n\n" +
-	"Индекс:\n\n" +
-	"| ADR | Тема | Статус |\n|---|---|---|\n"
-
-// adrIndexEntry is one row of the generated ADR index. Number comes from the
-// file name, Title from its heading and Status from its Статус line.
-type adrIndexEntry struct {
-	number int
-	title  string
-	status string
-}
-
-var (
-	adrFileName = regexp.MustCompile(`^([0-9]{4})-.*\.md$`)
-	adrTitle    = regexp.MustCompile(`(?m)^# ADR\s+[0-9]+\s*[.:]\s*(.+?)\s*$`)
-	adrStatus   = regexp.MustCompile(`(?m)^Статус:\s*([^\s]+)`)
-)
-
-// scanADRIndex reads every numbered ADR file and merges the ADRs produced by
-// this iteration. Incoming ADRs win over a file with the same number, so the
-// index reflects the artifacts about to be written. Duplicate numbers survive
-// because each file gets its own row.
-func scanADRIndex(root string, incoming map[int]adr) ([]adrIndexEntry, error) {
-	dir := filepath.Join(root, "docs", "adrs")
-	names, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	seen := map[adrIndexEntry]bool{}
-	var entries []adrIndexEntry
-	for _, name := range names {
-		if name.IsDir() {
-			continue
-		}
-		match := adrFileName.FindStringSubmatch(name.Name())
-		if match == nil {
-			continue
-		}
-		number, err := strconv.Atoi(match[1])
-		if err != nil {
-			continue
-		}
-		if _, replaced := incoming[number]; replaced {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, name.Name()))
-		if err != nil {
-			return nil, err
-		}
-		entry := adrIndexEntry{number: number}
-		if title := adrTitle.FindSubmatch(raw); title != nil {
-			entry.title = string(title[1])
-		}
-		if status := adrStatus.FindSubmatch(raw); status != nil {
-			entry.status = string(status[1])
-		}
-		if !seen[entry] {
-			seen[entry] = true
-			entries = append(entries, entry)
-		}
-	}
-	for number, a := range incoming {
-		status := a.Status
-		if status == "" {
-			status = "accepted"
-		}
-		entries = append(entries, adrIndexEntry{number: number, title: a.Title, status: status})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].number != entries[j].number {
-			return entries[i].number < entries[j].number
-		}
-		return entries[i].title < entries[j].title
-	})
-	return entries, nil
-}
-
-// renderADRIndex writes docs/adrs/README.md from the scanned entries. Rows
-// stay in number order so a rerun with the same inputs writes the same bytes.
-func renderADRIndex(entries []adrIndexEntry) string {
-	var b strings.Builder
-	b.WriteString(adrIndexHeader)
-	for _, e := range entries {
-		fmt.Fprintf(&b, "| %04d | %s | %s |\n", e.number, e.title, e.status)
-	}
-	return b.String()
-}
+// The ADR index preamble and renderer live in tools/roadmap-sync and
+// docs/templates/adr-index-header.md. batchapply writes ADR source files and
+// docs/FACTS.md only; it no longer derives the gitignored ADR index.
 
 // runner keeps the output streams and options together so the pure rendering
 // helpers stay free of I/O state.
@@ -1597,8 +1502,8 @@ func Run(opts Options, out, errOut io.Writer) int {
 		})
 	}
 
-	// CBX-07: remove rows older than their local artifact before the hash,
-	// facts and index are built. writeChunked repeats the same rule per file.
+	// CBX-07: remove rows older than their local artifact before the hash and
+	// facts are built. writeChunked repeats the same rule per file.
 	entries = r.prefilterStale(root, entries)
 
 	facts := collectFacts(entries, declaredFacts)
@@ -1610,18 +1515,6 @@ func Run(opts Options, out, errOut io.Writer) int {
 	entries = append(entries, artifactEntry{
 		path:    filepath.Join("docs", "FACTS.md"),
 		content: factsDoc,
-	})
-
-	// Q-A4: the ADR index is generated from the numbered ADR files plus the
-	// ADRs in this batch. The index is no longer maintained by hand.
-	indexEntries, err := scanADRIndex(root, adrs)
-	if err != nil {
-		r.errf("%v\n", err)
-		return 1
-	}
-	entries = append(entries, artifactEntry{
-		path:    filepath.Join("docs", "adrs", "README.md"),
-		content: renderADRIndex(indexEntries),
 	})
 
 	r.printf(summaryReportFormat,

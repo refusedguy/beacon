@@ -12,6 +12,7 @@ on:
       - 'tools/beacon-gates/gate/**'
       - 'tools/beacon-gates/docsgate/**'
       - 'cmd/beacon/**'
+      - 'tools/roadmap-sync/**'
 
 permissions:
   contents: read
@@ -54,3 +55,29 @@ jobs:
           go run ./cmd/beacon list --markdown > /tmp/beacon-commands.md
           awk '/<!-- BEGIN COMMANDS -->/{inside=1; next} /<!-- END COMMANDS -->/{inside=0} inside' README.md > /tmp/readme-commands.md
           diff -u /tmp/readme-commands.md /tmp/beacon-commands.md
+
+      # The ADR index is gitignored (IDX-11), so a git diff cannot see drift.
+      # Generate it, then verify it through the exit code of --adr-check.
+      - name: Build ADR index
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./tools/roadmap-sync --adr-write
+
+      - name: Check ADR index is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run ./tools/roadmap-sync --adr-check
+
+      - name: Self-test that ADR index drift fails the check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp docs/adrs/README.md "$RUNNER_TEMP/adr-index.orig"
+          printf '\n<!-- planted drift -->\n' >> docs/adrs/README.md
+          if go run ./tools/roadmap-sync --adr-check; then
+            echo "adr-check passed with planted drift" >&2
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/adr-index.orig" docs/adrs/README.md

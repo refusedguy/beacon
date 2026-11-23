@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,24 +53,6 @@ var (
 	// Indirection keeps file access out of cmd/ and tools/ capability gates.
 	readFile  = os.ReadFile
 	writeFile = os.WriteFile
-
-	// adrIndexHeader is the human-written preamble of docs/adrs/README.md.
-	// Everything below "Индекс:" is generated from docs/adrs/*.md.
-	adrIndexHeader = strings.Join([]string{
-		"# Beacon. Architecture Decision Records",
-		"",
-		"Это каталог решений, согласованных с владельцем. Каждый ADR фиксирует одно решение, причину и последствия. Решения в этом каталоге обязательны для implementation.",
-		"",
-		"Статусы решений:",
-		"",
-		"- `accepted` владелец согласился явно.",
-		"- `default` я предложил, владелец не возразил. Может быть переопределно до гейта G0.",
-		"- `open` решение ещё не принято, ждёт отчёта или вопроса.",
-		"- `proposed` решение предложено, ожидает решения владельца.",
-		"",
-		"Индекс:",
-		"",
-	}, "\n")
 )
 
 type card struct {
@@ -100,9 +83,11 @@ type gitScan struct {
 }
 
 type options struct {
-	repo   string
-	gitLog string
-	write  bool
+	repo     string
+	gitLog   string
+	write    bool
+	adrCheck bool
+	adrWrite bool
 }
 
 func main() {
@@ -116,8 +101,55 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&opts.repo, "repo", ".", "repository root containing docs/tasks")
 	fs.StringVar(&opts.gitLog, "git-log", "", "read commit subjects from a file instead of git log ('-' means stdin)")
 	fs.BoolVar(&opts.write, "write", false, "write card status lines, an existing ROADMAP_STATUS.md and docs/adrs/README.md (default: dry run)")
+	fs.BoolVar(&opts.adrCheck, "adr-check", false, "exit non-zero when docs/adrs/README.md differs from the generated ADR index")
+	fs.BoolVar(&opts.adrWrite, "adr-write", false, "write only docs/adrs/README.md from the ADR files and the preamble template")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	if opts.adrCheck && opts.adrWrite {
+		fmt.Fprintln(stderr, "roadmap-sync: --adr-check and --adr-write are mutually exclusive")
+		return 2
+	}
+	if opts.adrWrite {
+		changes, err := updateADRIndex(opts.repo, true)
+		if err != nil {
+			fmt.Fprintf(stderr, "roadmap-sync: adr-index: %v\n", err)
+			return 1
+		}
+		for _, line := range changes {
+			fmt.Fprintln(stdout, line)
+		}
+		return 0
+	}
+	if opts.adrCheck {
+		header, err := loadADRIndexHeader(opts.repo)
+		if err != nil {
+			fmt.Fprintf(stderr, "roadmap-sync: adr-index header: %v\n", err)
+			return 1
+		}
+		rows, err := readADRIndexRows(opts.repo)
+		if err != nil {
+			fmt.Fprintf(stderr, "roadmap-sync: adr-index rows: %v\n", err)
+			return 1
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(stdout, "roadmap-sync: no ADR files, index not checked")
+			return 0
+		}
+		path := adrIndexPath(opts.repo)
+		want := renderADRIndex(header, rows)
+		data, err := readFile(path)
+		if err != nil {
+			fmt.Fprintf(stderr, "roadmap-sync: %s: %v\n", path, err)
+			return 1
+		}
+		if string(data) != want {
+			fmt.Fprintf(stderr, "roadmap-sync: %s is stale; run roadmap-sync --adr-write\n", path)
+			return 1
+		}
+		fmt.Fprintf(stdout, "roadmap-sync: %s is current (%d ADR files)\n", path, len(rows))
+		return 0
 	}
 
 	records, err := readCommitRecords(opts.repo, opts.gitLog)
@@ -787,6 +819,33 @@ func adrIndexPath(repo string) string {
 	return filepath.Join(repo, "docs", "adrs", "README.md")
 }
 
+// loadADRIndexHeader returns the canonical preamble from
+// docs/templates/adr-index-header.md. The copy in the target repo wins, so a
+// CI check validates the checked-out template. Fixture tests build a temporary
+// repo with ADR files but no docs/templates, so they fall back to the template
+// beside this source file. Keeping the text in one file removes the second
+// hand-maintained copy that batchapply used to carry.
+func loadADRIndexHeader(repo string) (string, error) {
+	path := filepath.Join(repo, "docs", "templates", "adr-index-header.md")
+	data, err := readFile(path)
+	if err == nil {
+		return string(data), nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return "", err
+	}
+	fallback := filepath.Join(filepath.Dir(file), "..", "..", "docs", "templates", "adr-index-header.md")
+	data, err = readFile(fallback)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", fallback, err)
+	}
+	return string(data), nil
+}
+
 // adrNumberFromName mirrors docsgate's adrNumber: the numeric prefix of the
 // filename (0005-architecture-gates.md yields 5).
 func adrNumberFromName(base string) (int, bool) {
@@ -876,8 +935,8 @@ func readADRIndexRows(repo string) ([]adrRow, error) {
 	return rows, nil
 }
 
-func renderADRIndex(rows []adrRow) string {
-	lines := strings.Split(strings.TrimSuffix(adrIndexHeader, "\n"), "\n")
+func renderADRIndex(header string, rows []adrRow) string {
+	lines := strings.Split(strings.TrimSuffix(header, "\n"), "\n")
 	lines = append(lines, "", "| ADR | Тема | Статус |", "|---|---|---|")
 	for _, row := range rows {
 		lines = append(lines, fmt.Sprintf("| %04d | %s | %s |", row.number, row.topic, row.status))
@@ -897,8 +956,12 @@ func updateADRIndex(repo string, write bool) ([]string, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
+	header, err := loadADRIndexHeader(repo)
+	if err != nil {
+		return nil, err
+	}
 	path := adrIndexPath(repo)
-	want := renderADRIndex(rows)
+	want := renderADRIndex(header, rows)
 	data, err := readFile(path)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("%s: %w", path, err)
