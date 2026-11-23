@@ -52,6 +52,8 @@ var (
 	// Indirection keeps file access out of cmd/ and tools/ capability gates.
 	readFile  = os.ReadFile
 	writeFile = os.WriteFile
+	mkdirAll  = os.MkdirAll
+	removeAll = os.RemoveAll
 
 	// adrIndexHeader is the human-written preamble of docs/adrs/README.md.
 	// Everything below "Индекс:" is generated from docs/adrs/*.md.
@@ -999,7 +1001,7 @@ func selfTestRun(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "self-test FAILED: fixture: %v\n", err)
 		return 1
 	}
-	defer os.RemoveAll(root)
+	defer removeAll(root)
 
 	const doneCard = "# T1.1 done\nСтатус: done\nФаза: P1\n"
 	const todoCard = "# T1.2 todo\nСтатус: todo\nФаза: P2\n"
@@ -1029,7 +1031,7 @@ func selfTestRun(stdout, stderr io.Writer) int {
 		caseRoot := filepath.Join(root, strings.ReplaceAll(name, " ", "-"))
 		for rel, content := range files {
 			path := filepath.Join(caseRoot, rel)
-			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			if err := mkdirAll(filepath.Dir(path), 0o755); err != nil {
 				fmt.Fprintf(stderr, "self-test FAILED: %s: %v\n", name, err)
 				return false
 			}
