@@ -79,6 +79,7 @@ type ScmGateway interface {
 	Merge(ctx context.Context, pr int, expectedSHA string, title string) error
 	BaseBranchStatus(ctx context.Context, baseBranch string) (BaseStatus, error)
 	FindOpenPRByBranch(ctx context.Context, branch string) (int, error)
+	OpenPR(ctx context.Context, head, base, title string) (int, error)
 }
 
 type MergePolicy interface {

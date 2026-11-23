@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,6 +88,43 @@ func TestDispatchMarksCardInWorkspace(t *testing.T) {
 	if len(src.marked) != 1 || src.marked[0].id != "T-MARK" ||
 		src.marked[0].path != "/ws/T-MARK" || src.marked[0].status != "in_progress" {
 		t.Fatalf("bad MarkInWorkspace call: %+v", src.marked)
+	}
+}
+
+func TestDispatchTellsChildAgentTheBaseBranch(t *testing.T) {
+	store := newFakeStore()
+	tasks := []core.Task{
+		{ID: "T-CHILD", Status: core.TaskAvailable, BaseBranch: "beacon/T-EPIC", Scope: []core.ScopePath{core.ScopeFile("child.go")}},
+		{ID: "T-PLAIN", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("plain.go")}},
+	}
+	h := &fakeHarness{}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Harness: h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 2, MaxActiveAgents: 2},
+	}
+	if _, err := d.Dispatch(context.Background(), 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.prompts) != 2 {
+		t.Fatalf("prompts = %d, want 2", len(h.prompts))
+	}
+	promptFor := func(id core.TaskID) string {
+		for _, p := range h.prompts {
+			if strings.Contains(p, "Task: "+string(id)+" ") {
+				return p
+			}
+		}
+		return ""
+	}
+	child := promptFor("T-CHILD")
+	if !strings.Contains(child, "BaseBranch: beacon/T-EPIC") ||
+		!strings.Contains(child, "Open the pull request against beacon/T-EPIC") {
+		t.Fatalf("child prompt missing base branch: %s", child)
+	}
+	plain := promptFor("T-PLAIN")
+	if strings.Contains(plain, "BaseBranch:") {
+		t.Fatalf("plain prompt carries a base branch: %s", plain)
 	}
 }
 

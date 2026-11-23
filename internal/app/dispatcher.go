@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -236,5 +237,11 @@ func WithParentSession(ctx context.Context, id string) context.Context {
 }
 
 func spawnPrompt(t core.Task, id core.RunID, ws string) string {
-	return fmt.Sprintf("Run ID: %s\nTask: %s (%s)\nWorkspace: %s\nImplement the task, open a pull request, then call beacon_watch_pr with the run ID and PR number.\n", id, t.ID, t.Title, ws)
+	var b strings.Builder
+	fmt.Fprintf(&b, "Run ID: %s\nTask: %s (%s)\nWorkspace: %s\n", id, t.ID, t.Title, ws)
+	if base := strings.TrimSpace(t.BaseBranch); base != "" {
+		fmt.Fprintf(&b, "BaseBranch: %s\nOpen the pull request against %s, not the default branch.\n", base, base)
+	}
+	b.WriteString("Implement the task, open a pull request, then call beacon_watch_pr with the run ID and PR number.\n")
+	return b.String()
 }
