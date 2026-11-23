@@ -1013,6 +1013,62 @@ type reaperState struct {
 	Journal []ReaperLogEntry `json:"journal"`
 }
 
+// stateMsgForm holds the passive-participle endings shared by the read, parse
+// and write errors of one fileState. Russian participles agree with the
+// subject in gender and number, so each subject shape keeps its own triple.
+type stateMsgForm struct {
+	read  string
+	parse string
+	write string
+}
+
+var (
+	msgMasculine = stateMsgForm{"прочитан", "разобран", "собран"}
+	msgFeminine  = stateMsgForm{"прочитана", "разобрана", "собрана"}
+	msgNeuter    = stateMsgForm{"прочитано", "разобрано", "собрано"}
+	msgPlural    = stateMsgForm{"прочитаны", "разобраны", "собраны"}
+)
+
+// fileRepoSpec carries the file names and the Russian message pieces for one
+// fileState repository. The form stays separate from the subject so the
+// participle case survives an edit to either.
+type fileRepoSpec struct {
+	file        string
+	lockFile    string
+	subject     string       // nominative subject for read, parse and write
+	lockSubject string       // genitive subject after "замок"
+	form        stateMsgForm // Russian message form
+}
+
+// fileRepoSpecs is the single table of settings for the seven fileState repos.
+var fileRepoSpecs = struct {
+	confirmation, fixChecks, handoffJournal, precheck, reservation, reaper, deferWake fileRepoSpec
+}{
+	confirmation:   fileRepoSpec{"handoff-confirmations.json", "handoff-confirmations.lock", "подтверждения handoff", "подтверждений handoff", msgPlural},
+	fixChecks:      fileRepoSpec{"fix-checks.json", "fix-checks.lock", "состояние fix-checks", "fix-checks", msgNeuter},
+	handoffJournal: fileRepoSpec{"handoff-journal.json", "handoff-journal.lock", "журнал handoff", "журнала handoff", msgMasculine},
+	precheck:       fileRepoSpec{"precheck.json", "precheck.lock", "журнал precheck", "precheck", msgMasculine},
+	reservation:    fileRepoSpec{"file-reservations.json", "file-reservations.lock", "аренда файлов", "аренды", msgFeminine},
+	reaper:         fileRepoSpec{"reaper-journal.json", "reaper-journal.lock", "журнал reaper", "журнала reaper", msgMasculine},
+	deferWake:      fileRepoSpec{"defer-wake-journal.json", "defer-wake-journal.lock", "журнал пробуждения", "журнала пробуждения", msgMasculine},
+}
+
+// newFileRepo builds a fileState from cfg and spec. All nine path and error
+// fields come from the spec, so a new repo only needs one table row.
+func newFileRepo[T any](cfg Config, spec fileRepoSpec) fileState[T] {
+	return fileState[T]{
+		stateDir:    cfg.StateDir,
+		root:        cfg.Root,
+		file:        spec.file,
+		lockFile:    spec.lockFile,
+		readErr:     "не " + spec.form.read + " " + spec.subject + ": %v",
+		parseErr:    "не " + spec.form.parse + " " + spec.subject + ": %v",
+		writeErr:    "не " + spec.form.write + " " + spec.subject + ": %v",
+		lockOpenErr: "не открыт замок " + spec.lockSubject + ": %v",
+		lockTakeErr: "не взят замок " + spec.lockSubject + ": %v",
+	}
+}
+
 // reaperRepo owns reaper-journal.json. The private flock keeps two concurrent
 // reaper passes from writing the same card twice.
 type reaperRepo struct {
@@ -1020,17 +1076,7 @@ type reaperRepo struct {
 }
 
 func newReaperRepo(cfg Config) reaperRepo {
-	return reaperRepo{fileState[reaperState]{
-		stateDir:    cfg.StateDir,
-		root:        cfg.Root,
-		file:        "reaper-journal.json",
-		lockFile:    "reaper-journal.lock",
-		readErr:     "не прочитан журнал reaper: %v",
-		parseErr:    "не разобран журнал reaper: %v",
-		writeErr:    "не собран журнал reaper: %v",
-		lockOpenErr: "не открыт замок журнала reaper: %v",
-		lockTakeErr: "не взят замок журнала reaper: %v",
-	}}
+	return reaperRepo{newFileRepo[reaperState](cfg, fileRepoSpecs.reaper)}
 }
 
 // ReapStaleCards переводит в todo карточки in_progress, у которых истёк TTL и
@@ -1336,17 +1382,7 @@ type deferWakeRepo struct {
 }
 
 func newDeferWakeRepo(cfg Config) deferWakeRepo {
-	return deferWakeRepo{fileState[deferWakeState]{
-		stateDir:    cfg.StateDir,
-		root:        cfg.Root,
-		file:        "defer-wake-journal.json",
-		lockFile:    "defer-wake-journal.lock",
-		readErr:     "не прочитан журнал пробуждения: %v",
-		parseErr:    "не разобран журнал пробуждения: %v",
-		writeErr:    "не собран журнал пробуждения: %v",
-		lockOpenErr: "не открыт замок журнала пробуждения: %v",
-		lockTakeErr: "не взят замок журнала пробуждения: %v",
-	}}
+	return deferWakeRepo{newFileRepo[deferWakeState](cfg, fileRepoSpecs.deferWake)}
 }
 
 // SweepExpiredDefers возвращает в todo карточки с истёкшей датой отложки.
