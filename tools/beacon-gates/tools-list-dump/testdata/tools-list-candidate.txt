@@ -1,0 +1,11 @@
+beacon_ack	Record the intention to claim one obligation by stamping claimedAt; idempotent. This is an acknowledgement, not a result: read the verdict with beacon_get_result or beacon_wait_result. With decision=approve or decision=reject it resumes a stopped agent once in the same Watch. With decision=blocked:not_mine it blocks the Watch, recording the failed checks and the calling session as blocker. With decision=blocked:resolved it clears a confirmed block and returns the Watch to watching. The response reports resumed, resumeRevision, blocked and unblocked when a decision was applied; a plain ack returns only ok.
+beacon_cancel_watch	Cancel a Watch or one subscriber; idempotent, history is kept.
+beacon_defer_wiring	Record a deferred wiring card for a PR, idempotent by (watchID, reason). Returns cardID, created, status and the ready markdown for docs/tasks/WIRING-<pr>.md.
+beacon_get_result	Read a Watch result without logs and mark its content as read.
+beacon_list_running	List running Watches from a read-only state snapshot.
+beacon_stats	Report persisted state counters from a read-only snapshot.
+beacon_task_claim	Atomically claim one todo task card for an agent and return its full context.
+beacon_task_close	Close one task card with a terminal status and a reason. Idempotent by (cardID, status, reason): a repeat with the same values returns ok without a second write. A card held in_progress by another agent can only be closed by its owner.
+beacon_task_list	List free task cards available for an agent to claim. Returns todo cards with no agent, ordered by phase then id, without changing card state.
+beacon_wait_result	Bounded long-poll for a Watch result; a terminal verdict marks the caller's obligation read. The watchID is a leased handle valid for 30 minutes; an expired handle returns WATCH_EXPIRED.
+beacon_watch_pr	Register or renew a Watch on a pull request head and subscribe the caller.
