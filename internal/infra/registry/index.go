@@ -10,6 +10,8 @@ package registry
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -85,11 +87,7 @@ func (idx *CapabilityIndex) remove(id string) {
 // An unknown capability returns an empty slice.
 func (idx *CapabilityIndex) Executors(capability string) []string {
 	members := idx.byCapability[capability]
-	ids := make([]string, 0, len(members))
-	for id := range members {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
+	ids := slices.Sorted(maps.Keys(members))
 	return ids
 }
 

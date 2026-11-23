@@ -2,6 +2,8 @@ package taskstore
 
 import (
 	"encoding/json"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -279,11 +281,7 @@ func CanonicalCycleReport(edges []Edge) CycleReport {
 		adj[e.From][e.To] = true
 	}
 
-	roots := make([]string, 0, len(nodes))
-	for id := range nodes {
-		roots = append(roots, id)
-	}
-	sort.Strings(roots)
+	roots := slices.Sorted(maps.Keys(nodes))
 
 	neighbors := make(map[string][]string, len(roots))
 	for _, from := range roots {
@@ -495,11 +493,7 @@ func DependentsOf(g *Graph, ids []string) []string {
 			}
 		}
 	}
-	out := make([]string, 0, len(seen))
-	for id := range seen {
-		out = append(out, id)
-	}
-	sort.Strings(out)
+	out := slices.Sorted(maps.Keys(seen))
 	return out
 }
 

@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 
 	"github.com/refusedguy/beacon/internal/app/orchestrator"
 	"github.com/refusedguy/beacon/internal/infra/mcp"
@@ -250,10 +251,6 @@ func renderWorkloadJSON(w io.Writer, r orchestrator.Workload) error {
 
 // sortedWorkloadKeys keeps the table output stable for a given set of buckets.
 func sortedWorkloadKeys(m map[string]int) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(m))
 	return keys
 }

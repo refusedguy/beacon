@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -420,11 +422,7 @@ func (m *Metrics) Reset() {
 
 // CounterNames returns the known counter names in stable order.
 func CounterNames() []string {
-	names := make([]string, 0, len(counterLabels))
-	for name := range counterLabels {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := slices.Sorted(maps.Keys(counterLabels))
 	return names
 }
 
@@ -615,11 +613,7 @@ func (m *Metrics) Prometheus() []byte {
 		fmt.Fprintf(&buf, "# TYPE beacon_%s counter\n", name)
 		fmt.Fprintf(&buf, "beacon_%s %d\n", name, m.values[name])
 	}
-	outcomeNames := make([]string, 0, len(outcomeCounters))
-	for name := range outcomeCounters {
-		outcomeNames = append(outcomeNames, name)
-	}
-	sort.Strings(outcomeNames)
+	outcomeNames := slices.Sorted(maps.Keys(outcomeCounters))
 	for _, name := range outcomeNames {
 		label := outcomeCounters[name]
 		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)
@@ -634,11 +628,7 @@ func (m *Metrics) Prometheus() []byte {
 			fmt.Fprintf(&buf, "beacon_%s{%s=\"%s\"} %d\n", name, label, escapeLabel(k), values[k])
 		}
 	}
-	multiNames := make([]string, 0, len(multiLabelCounters))
-	for name := range multiLabelCounters {
-		multiNames = append(multiNames, name)
-	}
-	sort.Strings(multiNames)
+	multiNames := slices.Sorted(maps.Keys(multiLabelCounters))
 	for _, name := range multiNames {
 		labels := multiLabelCounters[name]
 		fmt.Fprintf(&buf, "# HELP beacon_%s Beacon counter %s.\n", name, name)

@@ -5,6 +5,8 @@
 package domain
 
 import (
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -172,11 +174,7 @@ func CoalesceEvents(events []ExternalEvent, subs map[string]EventSubscription, a
 		bySub[e.SubscriptionID] = append(bySub[e.SubscriptionID], e)
 	}
 
-	ids := make([]string, 0, len(bySub))
-	for id := range bySub {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
+	ids := slices.Sorted(maps.Keys(bySub))
 
 	var wakes []WakeRequest
 	for _, id := range ids {

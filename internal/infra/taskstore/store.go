@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -970,11 +972,7 @@ func MergeTrees(roots []string, cfg IDConfig, dryRun bool) (MergeReport, error) 
 	// Резервируем желаемый ID за первым корнем. Остальным карточкам того же
 	// ID выдаём новый ID. Общий claimed не даёт двум заменам совпасть.
 	renameByRoot := make(map[string]map[string]string)
-	familyNames := make([]string, 0, len(families))
-	for family := range families {
-		familyNames = append(familyNames, family)
-	}
-	sort.Strings(familyNames)
+	familyNames := slices.Sorted(maps.Keys(families))
 	for _, family := range familyNames {
 		for id, locs := range byID {
 			if idRoot(id) != family || len(locs) < 2 {

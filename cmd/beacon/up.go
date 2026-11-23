@@ -5,8 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -452,11 +454,7 @@ func renderUpStatus(ctx context.Context, st upStatusPort) string {
 			attention++
 		}
 	}
-	keys := make([]string, 0, len(counts))
-	for key := range counts {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(counts))
 	parts := make([]string, 0, len(keys))
 	for _, key := range keys {
 		parts = append(parts, fmt.Sprintf("%s=%d", key, counts[key]))

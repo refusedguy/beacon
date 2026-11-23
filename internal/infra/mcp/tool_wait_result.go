@@ -61,8 +61,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1566,11 +1567,7 @@ func (s *WaitResultService) classifyChecks(watchID string, checks map[string]dom
 	if len(checks) == 0 {
 		return out
 	}
-	names := make([]string, 0, len(checks))
-	for name := range checks {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := slices.Sorted(maps.Keys(checks))
 	var b strings.Builder
 	for _, name := range names {
 		b.WriteString(checks[name].Conclusion)

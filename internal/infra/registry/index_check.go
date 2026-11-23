@@ -7,6 +7,8 @@ package registry
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -82,11 +84,7 @@ func checkIndexEntryCount(index map[string][]string) int {
 // checkSortedKeys returns the keys of set in byte order, so a check never
 // depends on map iteration order.
 func checkSortedKeys(set map[string][]string) []string {
-	keys := make([]string, 0, len(set))
-	for key := range set {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(set))
 	return keys
 }
 

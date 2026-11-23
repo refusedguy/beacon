@@ -28,7 +28,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -292,11 +293,7 @@ func cloneSteps(in []Command) []Command {
 // {"a": "b,c=d"} and {"a": "b", "c": "d"} both produce "a=b,c=d" and share a
 // fingerprint.
 func encodeFields(fields map[string]string) string {
-	keys := make([]string, 0, len(fields))
-	for k := range fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(fields))
 	var b strings.Builder
 	for i, k := range keys {
 		if i > 0 {

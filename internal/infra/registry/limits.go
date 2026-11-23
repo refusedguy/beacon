@@ -7,8 +7,9 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
-	"sort"
+	"slices"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
@@ -135,11 +136,7 @@ func ParseLimits(raw map[string]any) (Limits, error) {
 		return parsed, nil
 	}
 
-	keys := make([]string, 0, len(raw))
-	for key := range raw {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(raw))
 	for _, key := range keys {
 		if !knownLimitField(key) {
 			return Limits{}, limitError(key, "unknown field", nil)

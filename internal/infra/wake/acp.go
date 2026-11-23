@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os/exec"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -463,11 +465,7 @@ type ACPRuntimeConfig struct {
 
 // SupportedACPRuntimes returns the configured runner names in stable order.
 func SupportedACPRuntimes() []string {
-	names := make([]string, 0, len(acpRuntimes))
-	for name := range acpRuntimes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
+	names := slices.Sorted(maps.Keys(acpRuntimes))
 	return names
 }
 

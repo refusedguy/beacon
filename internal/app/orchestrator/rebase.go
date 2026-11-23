@@ -8,7 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -411,11 +412,7 @@ func (r *Rebaser) unmergedFiles(ctx context.Context, dir string) []string {
 			}
 		}
 	}
-	files := make([]string, 0, len(set))
-	for name := range set {
-		files = append(files, name)
-	}
-	sort.Strings(files)
+	files := slices.Sorted(maps.Keys(set))
 	return files
 }
 

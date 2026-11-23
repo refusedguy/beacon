@@ -6,6 +6,8 @@ package worktree
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -31,11 +33,7 @@ func AnchorsFromHeads(heads map[string]string) []WatchAnchor {
 	if len(heads) == 0 {
 		return nil
 	}
-	keys := make([]string, 0, len(heads))
-	for sha := range heads {
-		keys = append(keys, sha)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(heads))
 	anchors := make([]WatchAnchor, 0, len(keys))
 	for _, sha := range keys {
 		anchors = append(anchors, WatchAnchor{ID: heads[sha], HeadSHA: sha})

@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1557,16 +1559,8 @@ func Run(opts Options, out, errOut io.Writer) int {
 		nums = append(nums, n)
 	}
 	sort.Ints(nums)
-	ids := make([]string, 0, len(cards))
-	for id := range cards {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	names := make([]string, 0, len(evals))
-	for n := range evals {
-		names = append(names, n)
-	}
-	sort.Strings(names)
+	ids := slices.Sorted(maps.Keys(cards))
+	names := slices.Sorted(maps.Keys(evals))
 
 	var entries []artifactEntry
 	for _, n := range nums {

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -582,11 +584,7 @@ func whyClosed(c taskstore.Card) bool {
 // каждая карточка попадает в результат один раз. Обхода нет, поэтому циклы
 // здесь невозможны; обрыв циклов при прямом ходе остаётся в whyChain.
 func whyDependents(id string, byID map[string]taskstore.Card) []whyStep {
-	ids := make([]string, 0, len(byID))
-	for key := range byID {
-		ids = append(ids, key)
-	}
-	sort.Strings(ids)
+	ids := slices.Sorted(maps.Keys(byID))
 	var out []whyStep
 	for _, key := range ids {
 		c := byID[key]

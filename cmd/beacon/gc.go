@@ -7,10 +7,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -689,11 +690,7 @@ func watchIDForHead(heads map[string]string, head string) string {
 	if len(head) < 7 {
 		return ""
 	}
-	keys := make([]string, 0, len(heads))
-	for sha := range heads {
-		keys = append(keys, sha)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(heads))
 	for _, sha := range keys {
 		if strings.HasPrefix(sha, head) {
 			return heads[sha]

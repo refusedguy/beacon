@@ -17,7 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/refusedguy/beacon/internal/infra/registry"
@@ -191,11 +192,7 @@ func rosterRecord(obj map[string]any, key string) (rosterEntry, error) {
 }
 
 func registryCheckSortedKeys(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
+	out := slices.Sorted(maps.Keys(m))
 	return out
 }
 

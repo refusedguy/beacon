@@ -8,6 +8,8 @@ package observe
 import (
 	"context"
 	"log/slog"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -360,11 +362,7 @@ func (r *Recorder) observeHistogram(name string, seconds float64) {
 // eventAttrs flattens a field set into slog attributes in sorted key order.
 // Sorting makes text output stable enough to read and to assert in tests.
 func eventAttrs(event string, fields Fields) []any {
-	keys := make([]string, 0, len(fields))
-	for k := range fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
+	keys := slices.Sorted(maps.Keys(fields))
 	attrs := make([]any, 0, len(keys)*2+2)
 	attrs = append(attrs, FieldEvent, event)
 	for _, k := range keys {

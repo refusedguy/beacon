@@ -7,6 +7,8 @@ package tui
 import (
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -247,10 +249,7 @@ func uniqueField(cards []Card, field func(Card) string) []string {
 	}
 	out := make([]string, 0, len(set)+1)
 	out = append(out, "")
-	for value := range set {
-		out = append(out, value)
-	}
-	sort.Strings(out[1:])
+	out = append(out, slices.Sorted(maps.Keys(set))...)
 	return out
 }
 

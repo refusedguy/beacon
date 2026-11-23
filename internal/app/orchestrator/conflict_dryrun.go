@@ -8,7 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -103,11 +104,7 @@ func FallbackChangedFiles(behind, ahead int, ours, theirs []string) DryRunResult
 			set[n] = true
 		}
 	}
-	changed := make([]string, 0, len(set))
-	for name := range set {
-		changed = append(changed, name)
-	}
-	sort.Strings(changed)
+	changed := slices.Sorted(maps.Keys(set))
 	return DryRunResult{Changed: changed, Diverged: true}
 }
 

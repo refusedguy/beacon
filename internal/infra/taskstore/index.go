@@ -10,9 +10,10 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -323,11 +324,7 @@ func (idx *Index) GraphStatus(_ context.Context) (domain.GraphStatus, error) {
 // cardSetHash builds a stable digest over id and raw-text hash pairs. Sorting
 // by id makes the digest independent of SQLite row order and directory order.
 func cardSetHash(hashes map[string]string) string {
-	ids := make([]string, 0, len(hashes))
-	for id := range hashes {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
+	ids := slices.Sorted(maps.Keys(hashes))
 	h := sha256.New()
 	for _, id := range ids {
 		h.Write([]byte(id))
