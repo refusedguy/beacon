@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -2172,5 +2173,133 @@ func TestGateWaiterRegistrarHonoursContextCancellation(t *testing.T) {
 	cancel()
 	if _, err := reg.Register(ctx, "gate", "waiter"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v want context.Canceled", err)
+	}
+}
+
+// assertJournalRing checks the shared ring contract: capacity is fixed, the
+// oldest insertions are gone and the newest is still present.
+func assertJournalRing[T any](t *testing.T, records []T, keyOf func(T) string, first, last string) {
+	t.Helper()
+	if len(records) != maxJournalRecords {
+		t.Fatalf("records = %d, want %d", len(records), maxJournalRecords)
+	}
+	if got := keyOf(records[0]); got != first {
+		t.Errorf("oldest kept = %q, want %q", got, first)
+	}
+	if got := keyOf(records[len(records)-1]); got != last {
+		t.Errorf("newest = %q, want %q", got, last)
+	}
+	for _, rec := range records {
+		if key := keyOf(rec); key == "key-0" || key == "key-1" {
+			t.Fatalf("evicted key %q still present", key)
+		}
+	}
+}
+
+func TestWaitResultMemoryJournalsAreBounded(t *testing.T) {
+	const extra = 2
+	total := maxJournalRecords + extra
+	key := func(i int) string { return fmt.Sprintf("key-%d", i) }
+	first, last := key(extra), key(total-1)
+
+	t.Run("action trajectory", func(t *testing.T) {
+		j := &memoryActionTrajectory{}
+		for i := 0; i < total; i++ {
+			j.RecordActionAttempt(ActionTrajectoryRecord{
+				Kind: ActionFormatError, Attempt: i, Output: key(i),
+			})
+		}
+		assertJournalRing(t, j.Records(), func(r ActionTrajectoryRecord) string { return r.Output }, first, last)
+	})
+
+	t.Run("terminal outcome", func(t *testing.T) {
+		j := &memoryTerminalOutcomeJournal{}
+		for i := 0; i < total; i++ {
+			j.RecordTerminalOutcome(TerminalOutcomeRecord{WatchID: key(i), Cause: ExitStatusTimeout})
+		}
+		assertJournalRing(t, j.Records(), func(r TerminalOutcomeRecord) string { return r.WatchID }, first, last)
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		j := &memoryCancelJournal{}
+		for i := 0; i < total; i++ {
+			j.RecordCancellation(CancellationRecord{Owner: "cap", TaskID: key(i), Reason: CancelCallerCancelled})
+		}
+		assertJournalRing(t, j.Records(), func(r CancellationRecord) string { return r.TaskID }, first, last)
+	})
+
+	t.Run("precheck", func(t *testing.T) {
+		j := &memoryPrecheckJournal{}
+		for i := 0; i < total; i++ {
+			if err := j.RecordPrecheckFailure(key(i), time.Now()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		assertJournalRing(t, j.Records(), func(r PrecheckFailureRecord) string { return r.Reason }, first, last)
+	})
+
+	t.Run("infra failure", func(t *testing.T) {
+		j := &memoryInfraFailureJournal{}
+		for i := 0; i < total; i++ {
+			j.RecordInfraFailure(domain.InfraFailureRecord{WatchID: key(i)})
+		}
+		assertJournalRing(t, j.Records(), func(r domain.InfraFailureRecord) string { return r.WatchID }, first, last)
+	})
+}
+
+func TestWaitResultTerminalOutcomeCountsSurviveEviction(t *testing.T) {
+	const extra = 2
+	total := maxJournalRecords + extra
+	j := NewMemoryTerminalOutcomeJournal()
+	for i := 0; i < total; i++ {
+		cause := ExitStatusUnknown
+		if i < extra {
+			cause = ExitStatusContext
+		}
+		j.RecordTerminalOutcome(TerminalOutcomeRecord{WatchID: fmt.Sprintf("w-%d", i), Cause: cause})
+	}
+	counts := j.Counts()
+	if got := counts[ExitStatusContext]; got != extra {
+		t.Errorf("evicted cause count = %d, want %d", got, extra)
+	}
+	if got := counts[ExitStatusUnknown]; got != total-extra {
+		t.Errorf("kept cause count = %d, want %d", got, total-extra)
+	}
+	if got := len(j.Records()); got != maxJournalRecords {
+		t.Fatalf("records = %d, want %d", got, maxJournalRecords)
+	}
+	for _, r := range j.Records() {
+		if r.Cause == ExitStatusContext {
+			t.Fatal("evicted cause still present in records")
+		}
+	}
+}
+
+func TestWaitResultTrajectoryExcerptKeepsTailAtUTF8Boundary(t *testing.T) {
+	output := strings.Repeat("x", 10) + "よ" + strings.Repeat("z", failureExcerptLimit-2)
+	message := strings.Repeat("m", 10) + "世" + strings.Repeat("w", failureExcerptLimit-2)
+	j := &memoryActionTrajectory{}
+	j.RecordActionAttempt(ActionTrajectoryRecord{
+		Kind: ActionFormatError, Output: output, Message: message,
+	})
+	records := j.Records()
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	for _, tc := range []struct {
+		name, got, tail string
+	}{
+		{"output", records[0].Output, "zz"},
+		{"message", records[0].Message, "ww"},
+	} {
+		if len(tc.got) > failureExcerptLimit {
+			t.Errorf("%s = %d bytes, want <= %d", tc.name, len(tc.got), failureExcerptLimit)
+		}
+		if !utf8.ValidString(tc.got) {
+			t.Errorf("%s is not valid UTF-8", tc.name)
+		}
+		if !strings.HasSuffix(tc.got, tc.tail) {
+			t.Errorf("%s lost its tail: %q", tc.name, tc.got)
+		}
 	}
 }

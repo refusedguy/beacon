@@ -66,6 +66,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -478,6 +479,37 @@ func DecideActionRequery(kind ActionErrorKind, priorRequeries int, output, messa
 	}
 }
 
+// maxJournalRecords is the shared ceiling for the five in-memory wait_result
+// journals: action trajectory, terminal outcomes, cancellation, precheck and
+// infra failure. Each keeps the newest entries and drops the oldest insertion
+// first, so no journal grows for the lifetime of the service. The value matches
+// maxWaitStarts, the other bounded index in this file. Event counters live
+// beside the records and still cover every write.
+const maxJournalRecords = 4096
+
+// boundJournalRecords returns records with at most maxJournalRecords entries,
+// keeping the newest ones. The caller holds the journal lock when reassigning.
+func boundJournalRecords[T any](records []T) []T {
+	if len(records) > maxJournalRecords {
+		return records[len(records)-maxJournalRecords:]
+	}
+	return records
+}
+
+// clampJournalExcerpt cuts s to at most failureExcerptLimit bytes at a UTF-8
+// boundary and keeps the tail, where the end of a failed command is most
+// useful. It applies only to journal fields, never to the tool response.
+func clampJournalExcerpt(s string) string {
+	if len(s) <= failureExcerptLimit {
+		return s
+	}
+	start := len(s) - failureExcerptLimit
+	for start > 0 && !utf8.ValidString(s[start:]) {
+		start++
+	}
+	return s[start:]
+}
+
 // ActionTrajectoryRecord is one corrected attempt kept outside the visible
 // message history. A requery writes here only: the attempt never reaches a
 // WaitResultOutput field, a Check, a verdict or a WaitStopReason.
@@ -512,9 +544,11 @@ func (t *memoryActionTrajectory) RecordActionAttempt(rec ActionTrajectoryRecord)
 	if t == nil {
 		return
 	}
+	rec.Output = clampJournalExcerpt(rec.Output)
+	rec.Message = clampJournalExcerpt(rec.Message)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.records = append(t.records, rec)
+	t.records = boundJournalRecords(append(t.records, rec))
 }
 
 // Records returns the corrected attempts in insertion order.
@@ -549,11 +583,12 @@ type TerminalOutcomeJournal interface {
 type memoryTerminalOutcomeJournal struct {
 	mu      sync.Mutex
 	records []TerminalOutcomeRecord
+	counts  map[ExitStatusCause]int // every recorded cause, including evicted records
 }
 
 // NewMemoryTerminalOutcomeJournal builds the in-process outcome journal.
 func NewMemoryTerminalOutcomeJournal() TerminalOutcomeJournal {
-	return &memoryTerminalOutcomeJournal{}
+	return &memoryTerminalOutcomeJournal{counts: make(map[ExitStatusCause]int)}
 }
 
 func (j *memoryTerminalOutcomeJournal) RecordTerminalOutcome(record TerminalOutcomeRecord) {
@@ -562,7 +597,11 @@ func (j *memoryTerminalOutcomeJournal) RecordTerminalOutcome(record TerminalOutc
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.records = append(j.records, record)
+	if j.counts == nil {
+		j.counts = make(map[ExitStatusCause]int)
+	}
+	j.counts[record.Cause]++
+	j.records = boundJournalRecords(append(j.records, record))
 }
 
 // Records returns a snapshot of the journal in insertion order.
@@ -577,13 +616,18 @@ func (j *memoryTerminalOutcomeJournal) Records() []TerminalOutcomeRecord {
 	return out
 }
 
-// Counts groups the recorded causes. A cause with no Watch is absent from the
-// map, so a reader never reports a group that was not observed.
+// Counts groups every recorded cause, including records already evicted from
+// the ring. The counter is separate from the journal, so eviction changes only
+// the detail records, never the totals. A cause with no Watch is absent.
 func (j *memoryTerminalOutcomeJournal) Counts() map[ExitStatusCause]int {
-	records := j.Records()
-	out := make(map[ExitStatusCause]int, len(records))
-	for _, record := range records {
-		out[record.Cause]++
+	if j == nil {
+		return map[ExitStatusCause]int{}
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make(map[ExitStatusCause]int, len(j.counts))
+	for cause, n := range j.counts {
+		out[cause] = n
 	}
 	return out
 }
@@ -981,7 +1025,7 @@ func NewMemoryCancelJournal() CancelJournal { return &memoryCancelJournal{} }
 func (j *memoryCancelJournal) RecordCancellation(r CancellationRecord) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.records = append(j.records, r)
+	j.records = boundJournalRecords(append(j.records, r))
 }
 
 // Records returns a snapshot of the journal in insertion order.
@@ -1032,9 +1076,9 @@ type memoryPrecheckJournal struct {
 func (j *memoryPrecheckJournal) RecordPrecheckFailure(reason string, at time.Time) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.records = append(j.records, PrecheckFailureRecord{
+	j.records = boundJournalRecords(append(j.records, PrecheckFailureRecord{
 		Outcome: PrecheckFailureOutcome, Reason: reason, At: at,
-	})
+	}))
 	return nil
 }
 
@@ -1072,7 +1116,7 @@ func (j *memoryInfraFailureJournal) RecordInfraFailure(record domain.InfraFailur
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.records = append(j.records, record)
+	j.records = boundJournalRecords(append(j.records, record))
 }
 
 // Records returns the classifications in insertion order.
