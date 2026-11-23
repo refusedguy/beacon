@@ -45,7 +45,7 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	var previous string
 	newRun := false
 	err = tx.QueryRowContext(ctx, `SELECT state FROM runs WHERE id=?`, string(r.ID)).Scan(&previous)
