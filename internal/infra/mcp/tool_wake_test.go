@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -2147,6 +2148,15 @@ func newTestConfirmationLedger() (*ConfirmationLedger, *confirmationClock) {
 	return ledger, clock
 }
 
+// requireConfirmationGone checks that a resolved confirmation no longer holds
+// a record. A repeat with the same id must not find the old token.
+func requireConfirmationGone(t *testing.T, ledger *ConfirmationLedger, id string) {
+	t.Helper()
+	if state, ok := ledger.State(id); ok {
+		t.Errorf("record of %s = %q, want it removed", id, state)
+	}
+}
+
 // TestT3_121AckVerifiesTokenStateAndDeadline is the acceptance core: Ack
 // rejects a stale token, then verifies the pending state and the unexpired
 // deadline in one transaction before recording the ack.
@@ -2176,17 +2186,13 @@ func TestT3_121AckVerifiesTokenStateAndDeadline(t *testing.T) {
 	if err := ledger.Ack("task-1", token); err != nil {
 		t.Fatalf("Ack(current token, inside deadline) error = %v, want nil", err)
 	}
-	if state, _ := ledger.State("task-1"); state != ConfirmationAcked {
-		t.Errorf("state after Ack = %q, want %q", state, ConfirmationAcked)
-	}
+	requireConfirmationGone(t, ledger, "task-1")
 
 	again := ledger.Ack("task-1", token)
-	if !errors.As(again, &rejection) || rejection.Reason != confirmationReasonState {
-		t.Errorf("second Ack = %v, want a non-pending rejection", again)
+	if !errors.As(again, &rejection) || rejection.Reason != confirmationReasonNotFound {
+		t.Errorf("second Ack = %v, want an unknown confirmation rejection", again)
 	}
-	if state, _ := ledger.State("task-1"); state != ConfirmationAcked {
-		t.Errorf("state after second Ack = %q, want %q unchanged", state, ConfirmationAcked)
-	}
+	requireConfirmationGone(t, ledger, "task-1")
 
 	if err := ledger.Ack("missing", token); !IsConfirmationRejected(err) {
 		t.Errorf("Ack(unknown id) error = %v, want a rejection", err)
@@ -2212,9 +2218,7 @@ func TestT3_121FailVerifiesTokenStateAndDeadline(t *testing.T) {
 	if err := ledger.Fail("task-1", token); err != nil {
 		t.Fatalf("Fail(current token) error = %v, want nil", err)
 	}
-	if state, _ := ledger.State("task-1"); state != ConfirmationFailed {
-		t.Errorf("state after Fail = %q, want %q", state, ConfirmationFailed)
-	}
+	requireConfirmationGone(t, ledger, "task-1")
 	if err := ledger.Ack("task-1", token); !IsConfirmationRejected(err) {
 		t.Errorf("Ack after Fail error = %v, want a rejection", err)
 	}
@@ -2238,9 +2242,7 @@ func TestT3_121ExpiredDeadlineRejectedWithoutReaper(t *testing.T) {
 	if !IsConfirmationExpired(expired) {
 		t.Fatalf("Ack(past deadline) error = %v, want the deadline rejection", expired)
 	}
-	if state, _ := ledger.State("task-1"); state != ConfirmationExpired {
-		t.Errorf("state after expired Ack = %q, want %q", state, ConfirmationExpired)
-	}
+	requireConfirmationGone(t, ledger, "task-1")
 
 	// Recovery reissues the id in place of a reaper sweep.
 	reissued, err := ledger.Issue("task-1", time.Minute)
@@ -2329,9 +2331,7 @@ func TestT3_121ConcurrentAckHasSingleWinner(t *testing.T) {
 	if successes != 1 {
 		t.Errorf("successful Acks = %d, want exactly 1 of %d", successes, racers)
 	}
-	if state, _ := ledger.State("task-1"); state != ConfirmationAcked {
-		t.Errorf("state = %q, want %q", state, ConfirmationAcked)
-	}
+	requireConfirmationGone(t, ledger, "task-1")
 }
 
 // TestT3_121WakeHandlerConfirmation wires the ledger into the wake handler. A
@@ -2347,9 +2347,7 @@ func TestT3_121WakeHandlerConfirmation(t *testing.T) {
 	if err := handler.ConfirmDelivery("wake-1", token); err != nil {
 		t.Fatalf("ConfirmDelivery() error = %v, want nil", err)
 	}
-	if state, _ := ledger.State("wake-1"); state != ConfirmationAcked {
-		t.Errorf("state = %q, want %q", state, ConfirmationAcked)
-	}
+	requireConfirmationGone(t, ledger, "wake-1")
 	if err := handler.FailDelivery("wake-1", token); !IsConfirmationRejected(err) {
 		t.Errorf("FailDelivery() after ack error = %v, want a rejection", err)
 	}
@@ -2357,6 +2355,126 @@ func TestT3_121WakeHandlerConfirmation(t *testing.T) {
 	without := NewWakeHandler(nil)
 	if err := without.ConfirmDelivery("wake-1", token); !IsConfirmationRejected(err) {
 		t.Errorf("ConfirmDelivery() without a ledger error = %v, want a rejection", err)
+	}
+}
+
+// TestLEAK05ResolvedConfirmationsAreRemoved covers both ways a confirmation
+// leaves the ledger. A final Ack or Fail removes it, and a deadline that passes
+// before the worker confirms removes it too. A repeat with the same id gets an
+// unknown confirmation rejection instead of checking the old token.
+func TestLEAK05ResolvedConfirmationsAreRemoved(t *testing.T) {
+	confirmations := []struct {
+		name    string
+		confirm func(*ConfirmationLedger, string, string) error
+	}{
+		{name: "ack", confirm: (*ConfirmationLedger).Ack},
+		{name: "fail", confirm: (*ConfirmationLedger).Fail},
+	}
+
+	for _, tc := range confirmations {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("final", func(t *testing.T) {
+				ledger, _ := newTestConfirmationLedger()
+				token, err := ledger.Issue("wake-1", time.Minute)
+				if err != nil {
+					t.Fatalf("Issue() error = %v", err)
+				}
+				if err := tc.confirm(ledger, "wake-1", token); err != nil {
+					t.Fatalf("confirm() error = %v, want nil", err)
+				}
+				requireConfirmationGone(t, ledger, "wake-1")
+				if len(ledger.records) != 0 || len(ledger.order) != 0 {
+					t.Errorf("ledger holds %d records and %d order entries after a final state", len(ledger.records), len(ledger.order))
+				}
+
+				err = tc.confirm(ledger, "wake-1", token)
+				var rejection *ConfirmationError
+				if !errors.As(err, &rejection) || rejection.Reason != confirmationReasonNotFound {
+					t.Errorf("repeat confirm() = %v, want reason %q", err, confirmationReasonNotFound)
+				}
+			})
+
+			t.Run("expired", func(t *testing.T) {
+				ledger, clock := newTestConfirmationLedger()
+				token, err := ledger.Issue("wake-1", time.Minute)
+				if err != nil {
+					t.Fatalf("Issue() error = %v", err)
+				}
+				clock.Advance(2 * time.Minute)
+
+				err = tc.confirm(ledger, "wake-1", token)
+				if !IsConfirmationExpired(err) {
+					t.Fatalf("confirm() after deadline = %v, want the deadline rejection", err)
+				}
+				requireConfirmationGone(t, ledger, "wake-1")
+				if len(ledger.records) != 0 || len(ledger.order) != 0 {
+					t.Errorf("ledger holds %d records and %d order entries after expiry", len(ledger.records), len(ledger.order))
+				}
+
+				err = ledger.Ack("wake-1", token)
+				var rejection *ConfirmationError
+				if !errors.As(err, &rejection) || rejection.Reason != confirmationReasonNotFound {
+					t.Errorf("Ack() with the old token = %v, want reason %q", err, confirmationReasonNotFound)
+				}
+			})
+		})
+	}
+}
+
+// TestLEAK05LedgerEvictsOldestWhenFull proves the live set is bounded. A repeat
+// Issue of a pending id keeps its token. Once the cap is full, the oldest
+// pending record is evicted and can be issued again with a fresh token.
+func TestLEAK05LedgerEvictsOldestWhenFull(t *testing.T) {
+	ledger, _ := newTestConfirmationLedger()
+
+	const extra = 3
+	total := maxConfirmations + extra
+	for i := 0; i < total; i++ {
+		if _, err := ledger.Issue(fmt.Sprintf("wake-%d", i), time.Minute); err != nil {
+			t.Fatalf("Issue(wake-%d) error = %v", i, err)
+		}
+	}
+	if got := len(ledger.records); got != maxConfirmations {
+		t.Fatalf("ledger size = %d, want %d", got, maxConfirmations)
+	}
+	if got := len(ledger.order); got != len(ledger.records) {
+		t.Fatalf("order size = %d, want one entry per record (%d)", got, len(ledger.records))
+	}
+
+	for i := 0; i < extra; i++ {
+		requireConfirmationGone(t, ledger, fmt.Sprintf("wake-%d", i))
+	}
+	newest := fmt.Sprintf("wake-%d", total-1)
+	if state, ok := ledger.State(newest); !ok || state != ConfirmationPending {
+		t.Errorf("state of the newest id = %q, present = %t", state, ok)
+	}
+
+	if _, err := ledger.Issue(newest, time.Minute); !IsConfirmationRejected(err) {
+		t.Errorf("repeat Issue() error = %v, want a rejection for the pending id", err)
+	}
+	if got := len(ledger.records); got != maxConfirmations {
+		t.Errorf("ledger size after repeat Issue = %d, want %d", got, maxConfirmations)
+	}
+
+	token, err := ledger.Issue("wake-0", time.Minute)
+	if err != nil {
+		t.Fatalf("Issue(evicted id) error = %v, want nil", err)
+	}
+	if got := len(ledger.records); got != maxConfirmations {
+		t.Errorf("ledger size after reissue = %d, want %d", got, maxConfirmations)
+	}
+	if got := len(ledger.order); got != len(ledger.records) {
+		t.Errorf("order size after reissue = %d, want %d", got, len(ledger.records))
+	}
+	if err := ledger.Ack("wake-0", token); err != nil {
+		t.Fatalf("Ack(reissued token) error = %v, want nil", err)
+	}
+	requireConfirmationGone(t, ledger, "wake-0")
+	if got := len(ledger.records); got != maxConfirmations-1 {
+		t.Errorf("ledger size after Ack = %d, want %d", got, maxConfirmations-1)
+	}
+	if got := len(ledger.order); got != len(ledger.records) {
+		t.Errorf("order size after Ack = %d, want %d", got, len(ledger.records))
 	}
 }
 

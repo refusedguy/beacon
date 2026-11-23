@@ -1234,18 +1234,25 @@ const (
 func IsConfirmationRejected(err error) bool { return domain.IsErr[*ConfirmationError](err) }
 
 // IsConfirmationExpired reports whether err is the deadline rejection. The
-// state is set to expired by the same transaction that returns this error.
+// expired record is removed by the same transaction that returns this error.
 func IsConfirmationExpired(err error) bool {
 	var rejection *ConfirmationError
 	return errors.As(err, &rejection) && rejection.Reason == confirmationReasonExpired
 }
 
+// maxConfirmations bounds the number of live wake confirmations. Expired and
+// finalized confirmations are removed as soon as they are resolved, so the cap
+// only has to carry pending ones.
+const maxConfirmations = 4096
+
 // ConfirmationLedger holds wake confirmations. Every mutation holds one write
 // lock and does the token, state and deadline checks before touching state, so
-// the verification is linearizable and needs no background reaper.
+// the verification is linearizable and needs no background reaper. order keeps
+// insertion order, oldest first, so a full ledger can evict one pending record.
 type ConfirmationLedger struct {
 	mu       sync.Mutex
 	records  map[string]Confirmation
+	order    []string
 	now      func() time.Time
 	newToken func() (string, error)
 }
@@ -1257,6 +1264,20 @@ func NewConfirmationLedger() *ConfirmationLedger {
 		records:  make(map[string]Confirmation),
 		now:      time.Now,
 		newToken: newConfirmationToken,
+	}
+}
+
+// forget removes a record and its place in the eviction order. Callers hold
+// l.mu.
+func (l *ConfirmationLedger) forget(id string) {
+	delete(l.records, id)
+	for i, candidate := range l.order {
+		if candidate == id {
+			copy(l.order[i:], l.order[i+1:])
+			l.order[len(l.order)-1] = ""
+			l.order = l.order[:len(l.order)-1]
+			return
+		}
 	}
 }
 
@@ -1273,7 +1294,7 @@ func newConfirmationToken() (string, error) {
 // Issue records a pending confirmation for id and returns its random token.
 // ttl <= 0 means no deadline. A still-pending, unexpired id is not reissued, so
 // a second call cannot silently replace the token a caller is holding. An
-// expired id may be reissued; that is the recovery path in place of a reaper.
+// expired or finalized id may be issued again with a fresh token.
 func (l *ConfirmationLedger) Issue(id string, ttl time.Duration) (string, error) {
 	if id == "" {
 		return "", &ConfirmationError{ID: id, Reason: confirmationReasonNotFound}
@@ -1287,23 +1308,32 @@ func (l *ConfirmationLedger) Issue(id string, ttl time.Duration) (string, error)
 	defer l.mu.Unlock()
 
 	now := l.now()
-	if rec, ok := l.records[id]; ok && rec.State == ConfirmationPending &&
-		(rec.Deadline.IsZero() || now.Before(rec.Deadline)) {
-		return "", &ConfirmationError{ID: id, Reason: confirmationReasonIssued}
+	if rec, ok := l.records[id]; ok {
+		if rec.State == ConfirmationPending &&
+			(rec.Deadline.IsZero() || now.Before(rec.Deadline)) {
+			return "", &ConfirmationError{ID: id, Reason: confirmationReasonIssued}
+		}
+		l.forget(id)
+	}
+	if len(l.records) >= maxConfirmations {
+		l.forget(l.order[0])
 	}
 	rec := Confirmation{ID: id, Token: token, State: ConfirmationPending}
 	if ttl > 0 {
 		rec.Deadline = now.Add(ttl)
 	}
 	l.records[id] = rec
+	l.order = append(l.order, id)
 	return token, nil
 }
 
 // decide is the single transaction shared by Ack and Fail. Token, pending
-// state and unexpired deadline are all checked under one write lock before any
-// state is written. An expired deadline is recorded inside that transaction,
-// so no reaper goroutine is needed to observe it.
-func (l *ConfirmationLedger) decide(id, token string, final ConfirmationState) error {
+// state and unexpired deadline are all checked under one write lock. An
+// expired deadline or a final confirmation removes the record in that same
+// transaction, so no reaper goroutine is needed and the ledger does not grow.
+// A later call with the same id is rejected as unknown rather than checking an
+// old token.
+func (l *ConfirmationLedger) decide(id, token string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -1312,34 +1342,33 @@ func (l *ConfirmationLedger) decide(id, token string, final ConfirmationState) e
 		return &ConfirmationError{ID: id, Reason: confirmationReasonNotFound}
 	}
 	if !rec.Deadline.IsZero() && !l.now().Before(rec.Deadline) {
-		rec.State = ConfirmationExpired
-		l.records[id] = rec
+		l.forget(id)
 		return &ConfirmationError{ID: id, Reason: confirmationReasonExpired}
 	}
 	if rec.State != ConfirmationPending {
+		l.forget(id)
 		return &ConfirmationError{ID: id, Reason: confirmationReasonState}
 	}
 	if subtle.ConstantTimeCompare([]byte(rec.Token), []byte(token)) != 1 {
 		return &ConfirmationError{ID: id, Reason: confirmationReasonToken}
 	}
-	rec.State = final
-	l.records[id] = rec
+	l.forget(id)
 	return nil
 }
 
 // Ack confirms a delivery in one transaction. It rejects a stale token, a
 // confirmation that is no longer pending, and an expired deadline.
 func (l *ConfirmationLedger) Ack(id, token string) error {
-	return l.decide(id, token, ConfirmationAcked)
+	return l.decide(id, token)
 }
 
 // Fail marks a delivery as failed under the same three checks as Ack.
 func (l *ConfirmationLedger) Fail(id, token string) error {
-	return l.decide(id, token, ConfirmationFailed)
+	return l.decide(id, token)
 }
 
-// State reports the current state of a confirmation. It exists so a test can
-// observe the result of a transaction without reaching into the private map.
+// State reports the live state of a confirmation. An expired or finalized id
+// reports false because its record is removed in the deciding transaction.
 func (l *ConfirmationLedger) State(id string) (ConfirmationState, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
