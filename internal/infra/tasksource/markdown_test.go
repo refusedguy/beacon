@@ -36,6 +36,61 @@ phase: P2
 Body line.
 `
 
+func TestMarkdownCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "docs", "tasks")
+	s := NewMarkdown(dir)
+	task := core.Task{
+		ID:        "T-20261123-abcdef12",
+		Title:     "Add task creation tool",
+		Body:      "Create a card in one call.",
+		Scope:     []core.ScopePath{core.ScopeFile("internal/app/a.go"), core.ScopePattern("internal/**/*.go"), core.ScopeDir("internal/infra/")},
+		DependsOn: []core.TaskID{"E2E-03"},
+		Priority:  11,
+	}
+
+	created, err := s.Create(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(dir, string(task.ID)+".md")
+	if created.SourceRef != wantPath || created.Status != core.TaskAvailable {
+		t.Fatalf("created = %+v", created)
+	}
+	b, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"id: T-20261123-abcdef12", "status: available", "priority: 11", "E2E-03", "internal/app/a.go"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("card missing %q:\n%s", want, b)
+		}
+	}
+	if !strings.Contains(string(b), "internal/infra/") {
+		t.Errorf("card lost the directory scope:\n%s", b)
+	}
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	got := tasks[0]
+	if got.ID != task.ID || got.Title != task.Title || got.Priority != 11 || len(got.DependsOn) != 1 {
+		t.Fatalf("parsed task = %+v", got)
+	}
+	if got.Body != task.Body {
+		t.Fatalf("body = %q", got.Body)
+	}
+	if len(got.Scope) != 3 || !got.Scope[1].CoversPath("internal/infra/mcp/server.go") ||
+		!got.Scope[2].CoversPath("internal/infra/mcp/server.go") {
+		t.Fatalf("scope = %v", got.Scope)
+	}
+	if _, err := s.Create(context.Background(), task); err == nil {
+		t.Fatal("second Create overwrote the card")
+	}
+}
+
 func TestMarkdownLegacyLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "archive")

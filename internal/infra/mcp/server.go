@@ -1,4 +1,4 @@
-// Package mcp exposes the five thin controller tools to agents.
+// Package mcp exposes five worker tools and one orchestrator tool to agents.
 package mcp
 
 import (
@@ -14,11 +14,12 @@ import (
 )
 
 type Services struct {
-	Dispatcher *app.Dispatcher
-	Control    *app.Control
-	Status     app.StatusService
-	Wait       app.WaitService
-	Remote     func(ctx context.Context, action, runID string, pr int, sha string) error
+	Dispatcher  *app.Dispatcher
+	Control     *app.Control
+	Status      app.StatusService
+	Wait        app.WaitService
+	TaskCreator *app.TaskCreator
+	Remote      func(ctx context.Context, action, runID string, pr int, sha string) error
 }
 
 type DispatchArgs struct {
@@ -42,6 +43,14 @@ type ControlArgs struct {
 	RunID  string `json:"run_id"`
 	SHA    string `json:"sha"`
 	PR     int    `json:"pr"`
+}
+
+type CreateTaskArgs struct {
+	Title    string   `json:"title"`
+	Body     string   `json:"body"`
+	Scope    []string `json:"scope"`
+	Depends  []string `json:"depends"`
+	Priority int      `json:"priority"`
 }
 
 func NewServer(sv Services) *msdk.Server {
@@ -123,6 +132,18 @@ func NewServer(sv Services) *msdk.Server {
 			return nil, nil, core.Errorf(core.CodeInvalidInput, "unknown action %q", a.Action)
 		}
 		return textResult("ok"), nil, nil
+	})
+	msdk.AddTool(s, &msdk.Tool{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only."}, func(ctx context.Context, _ *msdk.CallToolRequest, a CreateTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskCreator == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task creator is not configured")
+		}
+		created, err := sv.TaskCreator.Create(ctx, app.CreateTaskInput{
+			Title: a.Title, Body: a.Body, Scope: a.Scope, Depends: a.Depends, Priority: a.Priority,
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return jsonResult(created), nil, nil
 	})
 	return s
 }

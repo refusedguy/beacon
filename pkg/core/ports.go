@@ -7,6 +7,7 @@ type TaskSource interface {
 	Claim(ctx context.Context, id TaskID) error
 	Complete(ctx context.Context, id TaskID) error
 	MarkInWorkspace(ctx context.Context, id TaskID, workspacePath, status string) error
+	Create(ctx context.Context, task Task) (Task, error)
 }
 
 type Workspace struct {

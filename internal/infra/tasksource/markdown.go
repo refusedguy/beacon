@@ -248,3 +248,47 @@ func (m *Markdown) Complete(ctx context.Context, id core.TaskID) error {
 func (m *Markdown) MarkInWorkspace(ctx context.Context, id core.TaskID, workspacePath, status string) error {
 	return NewMarkdown(filepath.Join(workspacePath, "docs", "tasks")).rewriteStatus(ctx, id, status)
 }
+
+// Create writes a new card with available status. It refuses to overwrite an
+// existing card with the same ID.
+func (m *Markdown) Create(ctx context.Context, task core.Task) (core.Task, error) {
+	_ = ctx
+	fields, err := marshalFields(cardFields{
+		ID:       string(task.ID),
+		Title:    task.Title,
+		Status:   string(core.TaskAvailable),
+		Scope:    scopeValues(task.Scope),
+		Depends:  dependencyValues(task.DependsOn),
+		Priority: task.Priority,
+	})
+	if err != nil {
+		return core.Task{}, err
+	}
+	var content strings.Builder
+	content.WriteString("---\n")
+	content.WriteString(fields)
+	content.WriteString("---\n\n")
+	if body := strings.TrimSpace(task.Body); body != "" {
+		content.WriteString(body)
+		content.WriteString("\n")
+	}
+	path := filepath.Join(m.Dir, string(task.ID)+".md")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return core.Task{}, err
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return core.Task{}, err
+	}
+	if _, err := f.WriteString(content.String()); err != nil {
+		_ = f.Close()
+		return core.Task{}, err
+	}
+	if err := f.Close(); err != nil {
+		return core.Task{}, err
+	}
+	created := task
+	created.Status = core.TaskAvailable
+	created.SourceRef = path
+	return created, nil
+}
