@@ -8,7 +8,9 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func openTestIndex(t *testing.T) *Index {
@@ -258,6 +260,195 @@ func TestRebuildDirParsesMarkdown(t *testing.T) {
 	}
 	if dep != "T0.1" {
 		t.Fatalf("dep = %q, ждали T0.1", dep)
+	}
+}
+
+// TestRebuildDirWorkerCapAndOrder checks that read and parse stay at four
+// workers, that results follow directory order, and that the index matches a
+// sequential import. Hooks block the first four reads and parses so both caps
+// are observed, and release the first four parses in reverse order.
+func TestRebuildDirWorkerCapAndOrder(t *testing.T) {
+	const cardsCount = 12
+	dir := t.TempDir()
+	for i := 1; i <= cardsCount; i++ {
+		name := fmt.Sprintf("T9.%02d.md", i)
+		id := fmt.Sprintf("T9.%02d", i)
+		card := fmt.Sprintf(indexTestCard, id,
+			fmt.Sprintf("internal/%02d.go", i), fmt.Sprintf("T0.%d", i))
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(card), 0644); err != nil {
+			t.Fatalf("запись %s: %v", name, err)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("каталог карточек: %v", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	slot := make(map[string]int, len(names))
+	for i, name := range names {
+		slot[name] = i
+	}
+
+	idx := openTestIndex(t)
+
+	var mu sync.Mutex
+	activeReads, maxReads := 0, 0
+	activeParses, maxParses := 0, 0
+	parseDone := make([]int, 0, rebuildWorkers)
+	changedIDs := make([]string, 0, cardsCount)
+	writeCalls := 0
+
+	readRelease := make(chan struct{})
+	parseRelease := make(chan struct{})
+	var readOnce, parseOnce sync.Once
+	started := [rebuildWorkers]chan struct{}{}
+	for i := range started {
+		started[i] = make(chan struct{})
+	}
+	wait := func(ch <-chan struct{}) error {
+		select {
+		case <-ch:
+			return nil
+		case <-time.After(3 * time.Second):
+			return fmt.Errorf("барьер не открыт за 3s")
+		}
+	}
+
+	readFile := func(path string) ([]byte, error) {
+		mu.Lock()
+		activeReads++
+		if activeReads > maxReads {
+			maxReads = activeReads
+		}
+		first := activeReads == rebuildWorkers
+		mu.Unlock()
+		if first {
+			readOnce.Do(func() { close(readRelease) })
+		}
+		if err := wait(readRelease); err != nil {
+			return nil, err
+		}
+		data, err := os.ReadFile(path)
+		mu.Lock()
+		activeReads--
+		mu.Unlock()
+		return data, err
+	}
+
+	parseCard := func(path string, data []byte) (Card, error) {
+		i, ok := slot[filepath.Base(path)]
+		if !ok {
+			return Card{}, fmt.Errorf("неизвестная карточка %s", path)
+		}
+		mu.Lock()
+		activeParses++
+		if activeParses > maxParses {
+			maxParses = activeParses
+		}
+		first := activeParses == rebuildWorkers
+		mu.Unlock()
+		if first {
+			parseOnce.Do(func() { close(parseRelease) })
+		}
+		if i < len(started) {
+			close(started[i])
+			if i+1 < len(started) {
+				if err := wait(started[i+1]); err != nil {
+					return Card{}, err
+				}
+			}
+		}
+		if err := wait(parseRelease); err != nil {
+			return Card{}, err
+		}
+		card, err := ParseCard(path, data)
+		mu.Lock()
+		if i < len(started) {
+			parseDone = append(parseDone, i)
+		}
+		activeParses--
+		mu.Unlock()
+		return card, err
+	}
+
+	write := func(changed []pendingCard, stale []string) error {
+		mu.Lock()
+		writeCalls++
+		for _, p := range changed {
+			changedIDs = append(changedIDs, p.card.ID)
+		}
+		mu.Unlock()
+		return idx.replaceCards(changed, stale)
+	}
+
+	stats, err := idx.rebuildDir(dir, readFile, parseCard, write)
+	if err != nil {
+		t.Fatalf("rebuildDir: %v", err)
+	}
+	if want := (ImportStats{Cards: cardsCount, Deps: cardsCount, Owners: cardsCount}); stats != want {
+		t.Fatalf("stats = %+v, ждали %+v", stats, want)
+	}
+
+	mu.Lock()
+	reads, parses := maxReads, maxParses
+	done := append([]int(nil), parseDone...)
+	gotIDs := append([]string(nil), changedIDs...)
+	calls := writeCalls
+	mu.Unlock()
+	if reads != rebuildWorkers {
+		t.Fatalf("максимум одновременных чтений = %d, ждали %d", reads, rebuildWorkers)
+	}
+	if parses != rebuildWorkers {
+		t.Fatalf("максимум одновременных ParseCard = %d, ждали %d", parses, rebuildWorkers)
+	}
+	if calls != 1 {
+		t.Fatalf("replaceCards вызван %d раз, ждали 1", calls)
+	}
+	wantDone := []int{3, 2, 1, 0}
+	if !reflect.DeepEqual(done, wantDone) {
+		t.Fatalf("порядок завершения первых разборов = %v, ждали %v", done, wantDone)
+	}
+	wantIDs := make([]string, 0, len(names))
+	for _, name := range names {
+		wantIDs = append(wantIDs, cardIDFromName(name))
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("порядок changed = %v, ждали %v", gotIDs, wantIDs)
+	}
+
+	ref := openTestIndex(t)
+	cards := make([]Card, 0, len(names))
+	for _, name := range names {
+		path := filepath.Join(dir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("чтение %s: %v", name, err)
+		}
+		card, err := ParseCard(path, data)
+		if err != nil {
+			t.Fatalf("ParseCard %s: %v", name, err)
+		}
+		cards = append(cards, card)
+	}
+	if _, err := ref.ImportCards(cards); err != nil {
+		t.Fatalf("последовательный импорт: %v", err)
+	}
+	before, want := indexSnapshot(t, idx), indexSnapshot(t, ref)
+	if !reflect.DeepEqual(before, want) {
+		t.Fatalf("индекс расходится с последовательным:\nparallel: %v\nsequential: %v", before, want)
+	}
+	changes := indexChanges(t, idx)
+	if _, err := idx.RebuildDir(dir); err != nil {
+		t.Fatalf("повторный RebuildDir: %v", err)
+	}
+	if got := indexChanges(t, idx); got != changes {
+		t.Fatalf("повторная сборка изменила индекс: total_changes %d -> %d", changes, got)
+	}
+	if got := indexSnapshot(t, idx); !reflect.DeepEqual(got, before) {
+		t.Fatalf("повторная сборка изменила снимок индекса")
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
@@ -198,15 +199,66 @@ func (idx *Index) ImportCards(cards []Card) (ImportStats, error) {
 	return stats, nil
 }
 
+// rebuildWorkers is the fixed cap on concurrent card reads and parses.
+const rebuildWorkers = 4
+
+// rebuildCardResult holds one file's private work. A worker writes only its
+// own slot, so the main goroutine merges results in directory order after
+// wg.Wait. SQLite keeps a single writer.
+type rebuildCardResult struct {
+	sum     string
+	id      string
+	card    Card
+	changed bool
+	err     error
+}
+
+// rebuildCard reads and parses one card. Unchanged cards are skipped before
+// ParseCard, as in the sequential pass. The readFile and parseCard arguments
+// are seams for the concurrency test.
+func rebuildCard(name, path string, stored map[string]string,
+	readFile func(string) ([]byte, error),
+	parseCard func(string, []byte) (Card, error)) rebuildCardResult {
+	res := rebuildCardResult{id: cardIDFromName(name)}
+	data, err := readFile(path)
+	if err != nil {
+		res.err = Startupf("не прочитана карточка %s: %v", name, err)
+		return res
+	}
+	res.sum = sha256sum(string(data))
+	if res.id != "" && stored[res.id] == res.sum {
+		return res
+	}
+	card, err := parseCard(path, data)
+	if err != nil {
+		res.err = err
+		return res
+	}
+	res.card = card
+	res.changed = true
+	res.id = card.ID
+	return res
+}
+
 // RebuildDir синхронизирует индекс с каталогом карточек. Карточка с тем же
 // raw_sha256, что уже лежит в индексе, не разбирается повторно и не перезаписывается.
 // Удалённые файлы убираются из индекса. Возвращаемая статистика описывает всё
 // содержимое индекса после синхронизации.
 //
-// Раньше путь делал DELETE из трёх таблиц и INSERT всех карточек в одной
-// транзакции при каждом вызове. Сейчас при неизменившемся корпусе запись в
-// индекс не выполняется.
+// Чтение и разбор идут четырьмя воркерами. Порядок результатов фиксируется
+// позицией в срезе, а запись в индекс выполняется одним вызовом replaceCards
+// после wg.Wait. При неизменившемся корпусе запись в индекс не выполняется.
 func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
+	return idx.rebuildDir(tasksDir,
+		func(path string) ([]byte, error) { return fileAdapter.ReadFile(path) },
+		ParseCard,
+		idx.replaceCards)
+}
+
+func (idx *Index) rebuildDir(tasksDir string,
+	readFile func(string) ([]byte, error),
+	parseCard func(string, []byte) (Card, error),
+	replaceCards func([]pendingCard, []string) error) (ImportStats, error) {
 	if idx == nil || idx.db == nil {
 		return ImportStats{}, Startupf("индекс не открыт")
 	}
@@ -220,29 +272,46 @@ func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 		return ImportStats{}, err
 	}
 
-	seen := make(map[string]bool, len(entries))
-	changed := make([]pendingCard, 0)
+	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
 		}
-		filePath := filepath.Join(tasksDir, e.Name())
-		data, err := fileAdapter.ReadFile(filePath)
-		if err != nil {
-			return ImportStats{}, Startupf("не прочитана карточка %s: %v", e.Name(), err)
+		names = append(names, e.Name())
+	}
+
+	results := make([]rebuildCardResult, len(names))
+	jobs := make(chan int)
+	workers := rebuildWorkers
+	if len(names) < workers {
+		workers = len(names)
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i] = rebuildCard(names[i], filepath.Join(tasksDir, names[i]), stored, readFile, parseCard)
+			}
+		}()
+	}
+	for i := range names {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	seen := make(map[string]bool, len(names))
+	changed := make([]pendingCard, 0, len(names))
+	for _, res := range results {
+		if res.err != nil {
+			return ImportStats{}, res.err
 		}
-		sum := sha256sum(string(data))
-		id := cardIDFromName(e.Name())
-		if id != "" && stored[id] == sum {
-			seen[id] = true
-			continue
+		seen[res.id] = true
+		if res.changed {
+			changed = append(changed, pendingCard{card: res.card, sum: res.sum})
 		}
-		card, err := ParseCard(filePath, data)
-		if err != nil {
-			return ImportStats{}, err
-		}
-		changed = append(changed, pendingCard{card: card, sum: sum})
-		seen[card.ID] = true
 	}
 
 	stale := make([]string, 0)
@@ -252,7 +321,7 @@ func (idx *Index) RebuildDir(tasksDir string) (ImportStats, error) {
 		}
 	}
 
-	if err := idx.replaceCards(changed, stale); err != nil {
+	if err := replaceCards(changed, stale); err != nil {
 		return ImportStats{}, err
 	}
 	idx.tasksDir = tasksDir
