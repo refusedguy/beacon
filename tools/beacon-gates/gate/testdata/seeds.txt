@@ -1,4 +1,0 @@
-# Property-test seed replay file.
-# Format: "<property> <int64 seed>", one per line.
-# Seeds are appended automatically when a property fails. They replay before
-# the fixed master stream so a regression never needs manual reconstruction.

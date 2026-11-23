@@ -1,6 +1,0 @@
--- user_version 7: bring registry tables created before the 0005 edits up to
--- the current column set (BCX-31). SQLite has no conditional ADD COLUMN and
--- cannot change a column default without rebuilding the table, so this
--- migration runs in Go. See codeMigrations and migrateRegistryColumns in
--- internal/infra/store/db.go. This file keeps version 7 in the embedded
--- corpus; applyMigration skips its comment-only body.

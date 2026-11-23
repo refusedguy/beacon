@@ -1,0 +1,43 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestLoadWebhookSecretLiteral(t *testing.T) {
+	path := writeConfig(t, "webhook:\n  enabled: true\n  secret: 'p$ss{w0rd'\n")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Webhook.Enabled {
+		t.Fatal("webhook.enabled not loaded")
+	}
+	if c.Webhook.Secret != "p$ss{w0rd" {
+		t.Fatalf("secret = %q, want %q", c.Webhook.Secret, "p$ss{w0rd")
+	}
+}
+
+func TestLoadWebhookSecretEnv(t *testing.T) {
+	const envName = "BEACON_TEST_WEBHOOK_SECRET"
+	t.Setenv(envName, "from-env-123")
+	path := writeConfig(t, "webhook:\n  secret: 'unused-literal'\n  secret_env: "+envName+"\n")
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Webhook.Secret != "from-env-123" {
+		t.Fatalf("secret = %q, want %q", c.Webhook.Secret, "from-env-123")
+	}
+}

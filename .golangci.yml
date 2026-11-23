@@ -1,0 +1,49 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - depguard
+
+settings:
+  depguard:
+    rules:
+      core:
+        files:
+          - "pkg/core/**"
+        allow:
+          - "$gostd"
+        deny:
+          - pkg: "github.com/refusedguy/beacon"
+            desc: "pkg/core must import only the standard library"
+      app:
+        files:
+          - "internal/app/**"
+        allow:
+          - "$gostd"
+          - "github.com/refusedguy/beacon/pkg/core"
+          - "github.com/refusedguy/beacon/internal/app"
+        deny:
+          - pkg: "github.com/refusedguy/beacon/internal/infra"
+            desc: "internal/app must not import infrastructure"
+          - pkg: "github.com/refusedguy/beacon/cmd"
+            desc: "internal/app must not import the composition root"
+      infra-siblings:
+        files:
+          - "internal/infra/**"
+        allow:
+          - "$gostd"
+          - "github.com/refusedguy/beacon/pkg/core"
+          - "github.com/refusedguy/beacon/internal/app"
+          - "github.com/refusedguy/beacon/internal/infra/shared"
+        deny:
+          - pkg: "github.com/refusedguy/beacon/internal/infra/(config|scm|tasksource|policy|harness|notify|sqlite|workspace|planner|mcp|webhook)"
+            desc: "infra adapters must not import sibling adapters"
+      external-modules:
+        files:
+          - "harnesses/**"
+          - "ui/**"
+        deny:
+          - pkg: "github.com/refusedguy/beacon/internal"
+            desc: "external modules must use pkg/core only"

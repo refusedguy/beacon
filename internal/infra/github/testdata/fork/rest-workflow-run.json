@@ -1,9 +1,0 @@
-{
-  "id": 900001,
-  "name": "ci",
-  "head_sha": "1111111111111111111111111111111111111111",
-  "status": "completed",
-  "conclusion": "success",
-  "html_url": "https://github.com/acme/widgets/actions/runs/900001",
-  "pull_requests": []
-}

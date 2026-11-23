@@ -1,34 +1,25 @@
-// W1-E. Компактный контекст и anti-compaction правила (ADR 0069, ADR 0072).
-//
-// Карточки больше не загружаются, за файлами не следим. В сессию пишется один
-// стабильный ключ с фиксированной шпаргалкой: после сжатия контекста правила
-// остаются в instructions и не копируются при повторах. Хук compaction
-// перезаписывает тот же ключ, если хост его поддерживает.
-
 import { join, resolve, sep } from "node:path"
 import { pathToFileURL } from "node:url"
 
 export const SURVIVAL_KEY = "beacon/survival-rules"
 
 export const SURVIVAL_RULES = [
-  '1) Работаешь строго в своём worktree и своей ветке. Коммит/пуш в main запрещён.',
-  '2) Локально НЕ запускаешь go test ./..., go build ./..., beacon gates (слабый ПК, всё крутит GitHub Actions CI). Локально только gofmt -w на свои .go файлы.',
-  '3) Меняешь ТОЛЬКО файлы из своего OwnerFiles. Чужие файлы и карточки docs/tasks/ не трогаешь.',
-  '4) Запрещено gh pr checks --watch или sleep в цикле.',
-  '5) После gh pr create вызываешь beacon_watch_pr с role: "executor" и своим реальным ses_..., завершаешь ход фразой waiting, <watchID>.',
-  '6) При пробуждении читаешь beacon_get_result, чинишь ТОЛЬКО перечисленные failedChecks; если падение из-за main, вызываешь beacon_ack с decision="blocked:not_mine".',
-  '7) Информационные проверки (required: false, continue-on-error: true) НЕ блокеры. По ним не вызывай blocked:not_mine и не спавни FIX-агента.',
-  '8) Если часть фичи осталась неподключённой, сразу вызови beacon_defer_wiring и добавь возвращённую карточку WIRING-<PR> в свой PR.',
-  '9) Прозу пиши по скиллу unslop: без em dashes, простые слова, активный залог, без filler и rule of three.',
-  '10) Если main красный по required-проверке, НЕ спавни новых сабентов. Дождись FIX-агента и зелёного main. Информационные проверки main не ломают.',
+  '1) Work in your own worktree and branch. Never push directly to main.',
+  '2) Edit only the files listed in Scope: of your task card.',
+  '3) Run gofmt -w on changed Go files, then targeted go test for changed packages. Full go test ./... and go vet ./... run in CI on weak machines.',
+  '4) Use rg -n PATTERN <explicit-directory>. Do not grep -r the whole tree or find /.',
+  '5) Use only these five MCP tools: beacon_dispatch, beacon_watch_pr, beacon_status, beacon_wait, beacon_control. No other Beacon tool exists.',
+  '6) After opening a pull request, call beacon_watch_pr with your real run ID and PR number.',
+  '7) Use beacon_wait to wait and beacon_status to inspect. No gh pr checks --watch and no sleep loop.',
+  '8) Use beacon_control only for approve, unblock, cancel and retry on a run.',
+  '9) Write prose with unslop: no em dashes, simple words, active voice, no filler.',
+  '10) Fix a failed check when it is in your diff. Otherwise report the blocker in your final message.',
 ].join("\n")
 
 export function agentsFileURI(root) {
   return pathToFileURL(join(root, "AGENTS.md")).href
 }
 
-// Сессия относится к локации плагина по каталогу worktree или каноническому
-// каталогу проекта. Сессии другого проекта не получают правила.
 export function belongsToLocation(ctx, session) {
   const location = ctx?.location
   const expected = location?.directory || location?.project?.canonical
@@ -76,13 +67,10 @@ export async function syncSurvivalRules(ctx, sessions) {
 export async function registerProjectHooks(ctx, root) {
   const agentsURI = agentsFileURI(root)
 
-  // Метка нужна только в исходящем вызове, в историю она не попадает.
   const contextHook = await ctx.session.hook("context", (event) => {
     event.system.push({ type: "text", text: `beacon project root=${root}` })
   })
 
-  // prompt-хук работает до admission и добавляет AGENTS.md файлом.
-  // Повтор промпта не должен добавлять вторую копию файла.
   const promptHook = await ctx.session.hook("prompt", (event) => {
     event.prompt.files ??= []
     if (event.prompt.files.some((file) => file?.uri === agentsURI)) return
@@ -92,8 +80,6 @@ export async function registerProjectHooks(ctx, root) {
   return { contextHook, promptHook }
 }
 
-// Старый хост может не знать хук compaction. Неизвестное имя должно
-// проглатываться: плагин продолжает работать без перезаписи правил.
 export async function registerCompactionHook(ctx) {
   try {
     return await ctx.session.hook("compaction", async (event) => {
@@ -105,7 +91,7 @@ export async function registerCompactionHook(ctx) {
         }
         await syncSurvivalRules(ctx, await listSessions(ctx))
       } catch {
-        // Fail-open: ошибка перезаписи не ломает сжатие.
+        return
       }
     })
   } catch {
@@ -113,12 +99,10 @@ export async function registerCompactionHook(ctx) {
   }
 }
 
-export async function installProjectContext(ctx, root /*, locationInfo */) {
+export async function installProjectContext(ctx, root) {
   try {
     await syncSurvivalRules(ctx, await listSessions(ctx))
-  } catch {
-    // Fail-open: старый хост без ctx.location или session.list.
-  }
+  } catch {}
 
   const hooks = await registerProjectHooks(ctx, root)
   const compactionHook = await registerCompactionHook(ctx)

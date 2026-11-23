@@ -1,12 +1,3 @@
-// T3.176. Точка входа локального плагина Beacon (ADR 0069, решение 1).
-// Плагин лежит в .opencode/plugins и загружается автоматически, без записи
-// в глобальный opencode.json. Серверная часть объявляется через Plugin.define
-// и экспортируется по умолчанию.
-//
-// BCX-82. Запрет рекурсивного поиска и локальных гейтов стоит на границе
-// инструмента. Текст в AGENTS.md ничего не блокирует, поэтому решение живёт
-// здесь, в хуке execute.before.
-
 import { Plugin } from "@opencode/plugin"
 import { locationInfo, projectRoot } from "./location.js"
 import { registerBeaconMcp } from "./mcp.js"
@@ -24,19 +15,9 @@ export const SHELL_GUARD_RULES = Object.freeze([
     replacement: "rg -n PATTERN <explicit-directory>",
   },
   {
-    id: "local go test",
-    pattern: /(?:^|[;&|]\s*)go\s+test\b/,
-    replacement: "GitHub Actions CI on the PR",
-  },
-  {
-    id: "local go build",
-    pattern: /(?:^|[;&|]\s*)go\s+build\b/,
-    replacement: "GitHub Actions CI on the PR",
-  },
-  {
-    id: "local beacon gates",
-    pattern: /(?:^|[;&|]\s*)beacon\s+gates\b/,
-    replacement: "GitHub Actions CI on the PR",
+    id: "direct push to main",
+    pattern: /\bgit\s+push\b[^\n|;&]*\b(?:main|master)\b/,
+    replacement: "push to your own branch and open a pull request",
   },
 ])
 
@@ -61,249 +42,26 @@ export function findShellGuardHit(tool, input) {
   return SHELL_GUARD_RULES.find((rule) => rule.pattern.test(command)) ?? null
 }
 
-// CSx-12. SDK различает strict_mcp_config и setting_sources
-// (types.py:2477-2482, 2759-2770): пустой список включает изоляцию и оставляет
-// только явно переданную конфигурацию. Здесь та же модель. Источник explicit
-// всегда доверен, а env и project читаются только когда они названы в
-// settingSources. Каждая отвергнутая попытка логируется с именем источника.
-export const SETTING_SOURCE_ENV = "env"
-export const SETTING_SOURCE_PROJECT = "project"
-export const SETTING_SOURCE_EXPLICIT = "explicit"
-export const ALL_SETTING_SOURCES = Object.freeze([
-  SETTING_SOURCE_ENV,
-  SETTING_SOURCE_PROJECT,
-  SETTING_SOURCE_EXPLICIT,
-])
-
-export function readStrictConfig(config = {}) {
-  const strictConfig = config.strictConfig === true
-  const raw = config.settingSources
-  const settingSources = Array.isArray(raw)
-    ? raw.filter((name) => typeof name === "string")
-    : []
-  return Object.freeze({ strictConfig, settingSources })
-}
-
-export function isSettingSourceAllowed(strict, name) {
-  if (!strict.strictConfig) return true
-  if (name === SETTING_SOURCE_EXPLICIT) return true
-  return strict.settingSources.includes(name)
-}
-
-export function readSettingSource(strict, name, read, reject = console.warn) {
-  if (!isSettingSourceAllowed(strict, name)) {
-    reject(`CSx-12: rejected config source ${name} (strictConfig)`)
-    return undefined
-  }
-  return read()
-}
-
-export function shellGuardMode(strict, config = {}, env = process.env, reject) {
-  const fromEnv = readSettingSource(
-    strict,
-    SETTING_SOURCE_ENV,
-    () => env.BEACON_SHELL_GUARD,
-    reject,
-  )
+export function guardMode(config = {}, env = process.env) {
+  const fromEnv = env.BEACON_SHELL_GUARD
   if (typeof fromEnv === "string") return fromEnv
-  return readSettingSource(strict, SETTING_SOURCE_EXPLICIT, () => config.shellGuard, reject)
+  return config.shellGuard
 }
 
-// CSx-12. Фильтр инструментов по источникам. В строгом режиме лишний
-// инструмент из файла проекта отвергается с логированием, поэтому различие
-// числа инструментов между обычным и строгим режимом равно числу отвергнутых.
-export function toolsFromSources(strict, sources = [], reject) {
-  const tools = []
-  for (const source of sources) {
-    const name = source?.name ?? source?.source
-    if (isSettingSourceAllowed(strict, name)) {
-      tools.push(...(source?.tools ?? []))
-    } else {
-      const log = typeof reject === "function" ? reject : console.warn
-      log(`CSx-12: rejected config source ${name} (strictConfig)`)
-    }
-  }
-  return tools
-}
-
-// BCX-82. Режим warn дает неделю наблюдений без слома сессий. Переменная
-// BEACON_SHELL_GUARD=warn пишет предупреждение и пропускает команду. Любое
-// другое значение, включая отсутствие переменной, блокирует команду.
 export async function registerShellGuard(ctx, config = {}) {
   if (typeof ctx?.tool?.hook !== "function") return null
-  const strict = readStrictConfig(config)
-  const mode = shellGuardMode(strict, config)
+  const mode = guardMode(config)
   try {
     return await ctx.tool.hook("execute.before", (event) => {
       const hit = findShellGuardHit(event?.tool, event?.input)
       if (!hit) return
-      const message = `BCX-82: ${hit.id} is blocked here. Use ${hit.replacement}.`
+      const message = `${hit.id} is blocked here. Use ${hit.replacement}.`
       console.warn(message)
       if (mode === "warn") return
       throw new Error(message)
     })
   } catch {
-    // Fail-open: старый хост без tool.hook продолжает работу.
     return null
-  }
-}
-
-// CS-01. XS-01 из docs/research/comp-claude-sdk.md. SDK несёт типизированный
-// вход PreToolUse/PostToolUse и решение permissionDecision, а fail-closed
-// проверку способности ставит до регистрации (_internal/query.py:396-409).
-// Здесь тот же контракт поверх хуков OpenCode. guard из BCX-82 остаётся
-// отдельным execute.before и не меняет своё поведение.
-export const TOOL_LIFECYCLE_EVENTS = Object.freeze({
-  pre: "PreToolUse",
-  post: "PostToolUse",
-})
-
-export const PERMISSION_DECISIONS = Object.freeze(["allow", "deny", "ask", "defer"])
-export const ON_FAILURE_MODES = Object.freeze(["continue", "block"])
-
-const REQUIRED_TOOL_EVENTS = Object.freeze([
-  TOOL_LIFECYCLE_EVENTS.pre,
-  TOOL_LIFECYCLE_EVENTS.post,
-])
-
-// CSx-01. SDK асинхронный выход хука несёт `async_` и `asyncTimeout`
-// (types.py:800-812), а матчер ограничивает отложенный вызов 60 секундами
-// (types.py:879-904). Хук возвращается сразу, долгий колбэк не держит вызов
-// инструмента, а его срок ограничен значением MATCHER_TIMEOUT_MS.
-export const MATCHER_TIMEOUT_MS = 60_000
-
-// AsyncHook разбирает асинхронную форму ответа и отвергает asyncTimeout,
-// который превышает срок матчера. Синхронный ответ без `async_` не меняется.
-export function AsyncHook(response = {}, matcherTimeoutMs = MATCHER_TIMEOUT_MS) {
-  if (response?.async_ !== true && response?.async !== true) return null
-  const asyncTimeout = Number(response.asyncTimeout)
-  if (!Number.isFinite(asyncTimeout) || asyncTimeout <= 0) {
-    throw new Error("CSx-01: asyncTimeout must be a positive number of milliseconds")
-  }
-  if (asyncTimeout > matcherTimeoutMs) {
-    throw new Error(
-      `CSx-01: asyncTimeout ${asyncTimeout} exceeds matcher timeout ${matcherTimeoutMs}`,
-    )
-  }
-  return Object.freeze({ async_: true, asyncTimeout })
-}
-
-// resolveHookResponse сохраняет синхронный путь по умолчанию: только
-// ответ с `async_: true` получает асинхронную форму, остальные идут через
-// обычную нормализацию permissionDecision.
-export function resolveHookResponse(response, matcherTimeoutMs = MATCHER_TIMEOUT_MS) {
-  const deferred = AsyncHook(response, matcherTimeoutMs)
-  if (deferred) return deferred
-  return normalizePermissionDecision(response)
-}
-
-export function toolLifecycleInput(event, phase) {
-  const raw = event ?? {}
-  const typed = {
-    event: phase,
-    tool_name: raw.tool ?? raw.toolName ?? raw.name ?? "",
-    tool_input: raw.input ?? raw.toolInput ?? {},
-    tool_use_id: raw.toolUseId ?? raw.tool_use_id ?? raw.id ?? "",
-    agent_id: raw.agentId ?? raw.agent_id ?? "",
-    agent_type: raw.agentType ?? raw.agent_type ?? "",
-  }
-  if (phase === TOOL_LIFECYCLE_EVENTS.post) {
-    typed.tool_response = raw.toolResponse ?? raw.tool_response ?? raw.response ?? null
-    typed.duration_ms = Number(raw.durationMs ?? raw.duration_ms ?? 0) || 0
-  }
-  return typed
-}
-
-export function normalizePermissionDecision(decision = {}) {
-  const permissionDecision = decision.permissionDecision ?? decision.decision ?? "allow"
-  if (!PERMISSION_DECISIONS.includes(permissionDecision)) {
-    throw new Error(`CS-01: unknown permissionDecision ${permissionDecision}`)
-  }
-  const normalized = { permissionDecision }
-  if (decision.reason) normalized.reason = decision.reason
-  if (Object.hasOwn(decision, "updatedInput")) normalized.updatedInput = decision.updatedInput
-  if (decision.additionalContext) normalized.additionalContext = decision.additionalContext
-  return normalized
-}
-
-export function decidePreToolUse(event, mode) {
-  const typed = toolLifecycleInput(event, TOOL_LIFECYCLE_EVENTS.pre)
-  const hit = findShellGuardHit(typed.tool_name, typed.tool_input)
-  if (!hit) return { permissionDecision: "allow" }
-  const message = `CS-01: ${hit.id} is denied here. Use ${hit.replacement}.`
-  // CSx-12. Тот же режим наблюдения, что и в BCX-82, но источник режима
-  // проходит через strictConfig. Без явного режима поведение прежнее.
-  const guardMode = mode === undefined ? shellGuardMode(readStrictConfig()) : mode
-  if (guardMode === "warn") {
-    return { permissionDecision: "allow", additionalContext: message }
-  }
-  return { permissionDecision: "deny", reason: message, additionalContext: message }
-}
-
-export function decidePostToolUse(event) {
-  // Ответ инструмента уже получен, решение deny здесь бесполезно. Типизированный
-  // вход остаётся доступным разработчику плагина через toolLifecycleInput.
-  toolLifecycleInput(event, TOOL_LIFECYCLE_EVENTS.post)
-  return { permissionDecision: "allow" }
-}
-
-export function toolHookCapability(ctx) {
-  const hook = ctx?.tool?.hook
-  if (typeof hook !== "function") return { supported: false, events: [] }
-  const advertised = ctx.tool.supportedEvents ?? ctx.tool.hookEvents ?? ctx.tool.events
-  if (!Array.isArray(advertised)) {
-    return { supported: true, events: [...REQUIRED_TOOL_EVENTS] }
-  }
-  const missing = REQUIRED_TOOL_EVENTS.filter((name) => !advertised.includes(name))
-  return { supported: missing.length === 0, events: advertised }
-}
-
-export function assertFailClosedCapability(ctx, onFailure) {
-  if (onFailure !== "block") return
-  const capability = toolHookCapability(ctx)
-  if (!capability.supported) {
-    throw new Error(
-      "CS-01: host cannot enforce onFailure=block for PreToolUse/PostToolUse",
-    )
-  }
-}
-
-export async function registerToolLifecycle(ctx, options = {}) {
-  const strict = readStrictConfig(options)
-  const guardMode = shellGuardMode(strict, options)
-  const onFailure = options.onFailure ?? process.env.BEACON_TOOL_HOOK_ON_FAILURE ?? "continue"
-  if (!ON_FAILURE_MODES.includes(onFailure)) {
-    throw new Error(`CS-01: unknown onFailure mode ${onFailure}`)
-  }
-  // Проверка способности идёт до регистрации: при block старый хост не
-  // превращает guard в наблюдателя, а получает ошибку запуска.
-  assertFailClosedCapability(ctx, onFailure)
-  const capability = toolHookCapability(ctx)
-  if (!capability.supported) return null
-
-  let pre = null
-  let post = null
-  try {
-    pre = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.pre, (event) =>
-      resolveHookResponse(decidePreToolUse(event, guardMode)),
-    )
-    post = await ctx.tool.hook(TOOL_LIFECYCLE_EVENTS.post, (event) =>
-      resolveHookResponse(decidePostToolUse(event)),
-    )
-  } catch (error) {
-    await post?.dispose?.()
-    await pre?.dispose?.()
-    if (onFailure === "block") throw error
-    return null
-  }
-
-  return {
-    onFailure,
-    capability,
-    async dispose() {
-      await post?.dispose?.()
-      await pre?.dispose?.()
-    },
   }
 }
 
@@ -311,20 +69,13 @@ export const beaconProject = Plugin.define({
   id: "beacon-project",
   async setup(ctx) {
     const root = projectRoot(ctx)
-    // Старый хост без ctx.location оставляет поведение fail-open: плагин
-    // не трогает MCP и не пишет в сессии чужого проекта.
     if (!root) return
 
-    // CSx-12. Конфиг плагина - единственный доверенный источник в строгом
-    // режиме. Переменные окружения и файлы проекта фильтруются по settingSources.
-    const config = ctx?.config ?? {}
     const mcp = await registerBeaconMcp(ctx, root)
     const context = await installProjectContext(ctx, root, locationInfo(ctx))
-    const guard = await registerShellGuard(ctx, config)
-    const lifecycle = await registerToolLifecycle(ctx, config)
+    const guard = await registerShellGuard(ctx, ctx?.config ?? {})
 
     return async () => {
-      await lifecycle?.dispose?.()
       await guard?.dispose?.()
       await context?.()
       await mcp?.registration?.dispose?.()

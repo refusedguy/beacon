@@ -29,3 +29,13 @@ docs/ROADMAP_STATUS.md
 # Новые отчёты не коммитятся и не показываются в git status.
 # Уже закоммиченные отчёты остаются в истории; нужный отчёт добавляют через git add -f.
 docs/research/
+
+# Beacon runtime state
+.beacon/state.db*
+.beacon/worktrees/
+.beacon/connection.json
+.beacon/*.lock
+
+ui/tui/tui
+
+.opencode/bin/beacon

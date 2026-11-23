@@ -1,106 +1,125 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/spf13/cobra"
+
+	"github.com/refusedguy/beacon/internal/infra/config"
+	"github.com/refusedguy/beacon/internal/infra/sqlite"
+	"github.com/refusedguy/beacon/internal/infra/workspace"
+	"github.com/refusedguy/beacon/pkg/core"
 )
 
-func (c *CLI) runBuild(args []string) int {
-	fs := flag.NewFlagSet("build", flag.ContinueOnError)
-	if !parseFlags("build", args, c.errOut, fs) {
-		return 2
-	}
-
-	output := filepath.Join(c.root, "bin", "beacon")
-	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
-		fmt.Fprintf(c.errOut, "beacon build: %v\n", err)
-		return 2
-	}
-
-	buildArgs := []string{
-		"build",
-		"-trimpath",
-		"-buildvcs=false",
-		"-ldflags=-buildid= -s -w",
-		"-o", output,
-		"./cmd/beacon",
-	}
-	res := c.run(c.root, "go", buildArgs, []string{"CGO_ENABLED=0"})
-	emit(res, c.out, c.errOut)
-	return res.code
-}
-
-func (c *CLI) runTest(args []string) int {
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	if !parseFlags("test", args, c.errOut, fs) {
-		return 2
-	}
-
-	res := c.run(c.root, "go", []string{"test", "./..."}, nil)
-	emit(res, c.out, c.errOut)
-	return res.code
-}
-
-// runRules is the separate read-only rules gate. It checks the canonical rule
-// sources and prints an aif-gate-result fence. It never writes to the checkout.
-func (c *CLI) runRules(args []string) int {
-	fs := flag.NewFlagSet("rules", flag.ContinueOnError)
-	root := fs.String("root", c.root, "каталог проекта для проверки правил")
-	if !parseFlags("rules", args, c.errOut, fs) {
-		return 2
-	}
-
-	// grep only reads the rule sources and writes nothing. Keeping the call
-	// behind the runner leaves file IO out of cmd/beacon.
-	key := c.run(*root, "grep", []string{"-q", "beacon/survival-rules", "AGENTS.md"}, nil)
-	contract := c.run(*root, "grep", []string{"-q", ".", "docs/RULES-CHECK-CONTRACT.md"}, nil)
-
-	// Machine and human parts of the report share one uppercase register:
-	// PASS, WARN, FAIL, BROKEN (RULES-CHECK-CONTRACT.md).
-	status := "PASS"
-	blocking := false
-	exit := 0
-	blockers := "[]"
-	switch {
-	case key.code == 2 || contract.code == 2:
-		// Код 2 означает, что инструмент не смог выполнить проверку.
-		// Передаём его наружу без преобразования в WARN и ставим блокирующий
-		// вердикт BROKEN по контракту RULES-CHECK-CONTRACT.md.
-		status = "BROKEN"
-		blocking = true
-		exit = 2
-		blockers = `[{"id":"R-TOOL-BROKEN","severity":"error","file":".","summary":"rules gate завершился кодом 2: не удалось выполнить проверку правил"}]`
-	case key.code == 1:
-		status = "FAIL"
-		blocking = true
-		exit = 1
-		blockers = `[{"id":"R-SURVIVAL-KEY","severity":"error","file":"AGENTS.md","summary":"AGENTS.md не задаёт стабильный ключ beacon/survival-rules"}]`
-	case contract.code != 0:
-		status = "WARN"
-	}
-
-	fmt.Fprintf(c.out, "verdict: %s\n", status)
-	fmt.Fprint(c.out, "affected files: 2\n")
-	fmt.Fprintf(c.out, "blocking: %t\n", blocking)
-	fmt.Fprintf(c.out,
-		"```aif-gate-result\n{\"schema_version\":1,\"gate\":\"rules\",\"status\":%q,\"blocking\":%t,\"blockers\":%s,\"affected_files\":[\"AGENTS.md\",\"docs/RULES-CHECK-CONTRACT.md\"],\"suggested_next\":null}\n```\n",
-		status, blocking, blockers)
-	return exit
-}
-
-func (c *CLI) runGates(args []string) int {
-	if len(args) > 0 && args[0] == "rules" {
-		return c.runRules(args[1:])
-	}
-	path, err := findGates(c.root)
+func wireReadOnly(path string) (config.Config, *sqlite.Store, *workspace.GitWorktree, error) {
+	cfg, err := config.Load(path)
 	if err != nil {
-		fmt.Fprintln(c.errOut, "beacon gates:", err)
-		return 2
+		return config.Config{}, nil, nil, err
 	}
+	store, err := sqlite.Open(cfg.StateDB)
+	if err != nil {
+		return config.Config{}, nil, nil, err
+	}
+	root, err := filepath.Abs(".")
+	if err != nil {
+		store.Close()
+		return config.Config{}, nil, nil, err
+	}
+	wt, err := workspace.New(root, cfg.BaseBranch, cfg.WorkspaceDir)
+	if err != nil {
+		store.Close()
+		return config.Config{}, nil, nil, err
+	}
+	return cfg, store, wt, nil
+}
 
-	res := c.run(c.root, path, args, nil)
-	emit(res, c.out, c.errOut)
-	return res.code
+func newDispatchCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "dispatch [n]",
+		Short: "Start up to n non-overlapping tasks",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			n := 1
+			if len(args) == 1 {
+				if _, err := fmt.Sscan(args[0], &n); err != nil {
+					return err
+				}
+			}
+			w, err := wire(*configPath, "")
+			if err != nil {
+				return err
+			}
+			defer w.close()
+			res, err := w.dispatcher.Dispatch(cmd.Context(), n)
+			if err != nil {
+				return err
+			}
+			return printJSON(res)
+		},
+	}
+}
+
+func newStatusCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Print active runs",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			_, store, _, err := wireReadOnly(*configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			runs, err := store.ListActive(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return printJSON(runs)
+		},
+	}
+}
+
+func newGCCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "gc",
+		Short: "Remove worktrees that no active run uses",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, store, wt, err := wireReadOnly(*configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			runs, err := store.ListActive(cmd.Context())
+			if err != nil {
+				return err
+			}
+			inUse := make(map[string]bool)
+			for _, r := range runs {
+				if r.WorkspacePath != "" {
+					inUse[filepath.Clean(r.WorkspacePath)] = true
+				}
+			}
+			entries, err := os.ReadDir(cfg.WorkspaceDir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				path := filepath.Join(cfg.WorkspaceDir, e.Name())
+				if inUse[filepath.Clean(path)] {
+					continue
+				}
+				if err := wt.ForceRemove(cmd.Context(), core.Workspace{Path: path}); err != nil {
+					fmt.Fprintln(os.Stderr, "gc:", err)
+				}
+			}
+			return nil
+		},
+	}
 }
