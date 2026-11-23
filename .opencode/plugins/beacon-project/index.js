@@ -72,6 +72,8 @@ export const beaconProject = Plugin.define({
     const root = projectRoot(ctx)
     if (!root) return
 
+    // Record the server config for the operator's manual attach. This does not
+    // register an MCP server with OpenCode, so no daemon starts per session.
     const mcp = await registerBeaconMcp(ctx, root)
     const context = await installProjectContext(ctx, root, locationInfo(ctx))
     const guard = await registerShellGuard(ctx, ctx?.config ?? {})
