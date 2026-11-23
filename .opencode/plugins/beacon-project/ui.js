@@ -1,16 +1,18 @@
 // Beacon status panel for the OpenCode TUI sidebar.
 //
-// The panel depends only on the BeaconStatusSource contract below. Two sources
-// implement it here: CliStatusSource spawns the beacon binary and is used by the
-// server plugin, while RpcStatusSource reaches that server code from the TUI.
-// External modules are imported lazily inside setup so this file stays loadable
-// by plain `node --test` without OpenCode's peer dependencies installed.
+// The panel depends only on the BeaconStatusSource contract below. Three sources
+// exist here: CliStatusSource spawns the beacon binary, RpcStatusSource reaches
+// the server plugin, and createStatusSource combines them so a missing RPC
+// never blanks the panel. External modules are imported lazily inside setup so
+// this file stays loadable by plain `node --test` without OpenCode's peer
+// dependencies installed.
 
 import { execFile as nodeExecFile } from "node:child_process"
 import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
 import { join } from "node:path"
 import { promisify } from "node:util"
 import { beaconCommand } from "./mcp.js"
+import { projectRoot } from "./location.js"
 
 const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 
@@ -19,6 +21,11 @@ const execFileAsync = promisify(nodeExecFile)
 export const REFRESH_MS = 5000
 export const RPC_TIMEOUT_MS = 10000
 export const BEACON_STATUS_RPC_ID = "beacon.project.status"
+
+// Fixed widths keep every rendered line inside the sidebar.
+export const PANEL_WIDTH = 44
+export const TITLE_WIDTH = 30
+export const REASON_WIDTH = 30
 
 /**
  * @typedef {Object} Run
@@ -238,108 +245,159 @@ export class RpcStatusSource {
   }
 }
 
+// The server plugin may run in another process or may never register the RPC.
+// Trying the RPC first keeps the cheap path, while the local CLI keeps the
+// first render live when the RPC call is missing or fails.
+export function createStatusSource(ctx, { root, deps = {} } = {}) {
+  const resolvedRoot = root ?? projectRoot(ctx) ?? process.cwd()
+  const cli = createCliStatusSource({ root: resolvedRoot, deps })
+  const rpc = typeof ctx?.client?.rpc === "function" ? new RpcStatusSource(ctx) : null
+  return {
+    async snapshot() {
+      if (rpc) {
+        try {
+          return await rpc.snapshot()
+        } catch {
+          // Fall through to the CLI. The panel shows runs, not an RPC error.
+        }
+      }
+      return cli.snapshot()
+    },
+  }
+}
+
 export function errorMessage(error) {
   if (error instanceof Error) return error.message
   if (error && typeof error === "object" && typeof error.message === "string") return error.message
   return String(error)
 }
 
-function shortSha(sha) {
-  return sha ? sha.slice(0, 7) : ""
+// Each state gets one marker and one color. The view applies the color to the
+// whole line, so the marker reads as a colored status indicator.
+const STATE_STYLE = Object.freeze({
+  pending: Object.freeze({ marker: "○", fg: "#9ca3af" }),
+  running: Object.freeze({ marker: "●", fg: "#4ade80" }),
+  waiting_ci: Object.freeze({ marker: "◐", fg: "#60a5fa" }),
+  needs_rebase: Object.freeze({ marker: "◆", fg: "#fbbf24" }),
+  needs_agent_fix: Object.freeze({ marker: "◆", fg: "#fbbf24" }),
+  blocked: Object.freeze({ marker: "▲", fg: "#f87171" }),
+  merged: Object.freeze({ marker: "✔", fg: "#4ade80" }),
+  closed: Object.freeze({ marker: "✖", fg: "#9ca3af" }),
+})
+const DEFAULT_STYLE = Object.freeze({ marker: "·", fg: "#9ca3af" })
+const ERROR_FG = "#f87171"
+
+function styleFor(state) {
+  return STATE_STYLE[str(state).toLowerCase()] ?? DEFAULT_STYLE
 }
 
-export function formatAge(value, now = Date.now()) {
-  if (!value) return "?"
-  const time = Date.parse(value)
-  if (Number.isNaN(time)) return "?"
-  const seconds = Math.max(0, Math.floor((now - time) / 1000))
-  if (seconds < 60) return `${seconds}s`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
-  return `${Math.floor(seconds / 86400)}d`
+export function truncate(value, width) {
+  const text = str(value)
+  if (text.length <= width) return text
+  if (width <= 1) return text.slice(0, width)
+  return `${text.slice(0, width - 1)}…`
 }
 
-function formatAttempts(run) {
-  const parts = []
-  if (run.maxAttempts) parts.push(`max ${run.maxAttempts}`)
-  if (run.rebaseAttempts) parts.push(`rebase ${run.rebaseAttempts}`)
-  if (run.fixAttempts) parts.push(`fix ${run.fixAttempts}`)
-  return parts.length ? parts.join(" ") : "0"
+export function shortTaskID(value) {
+  const id = str(value)
+  if (!id) return "-"
+  return id.length > 10 ? id.slice(-8) : id
 }
 
-function formatRunLines(run) {
-  const pr = run.pr ? ` PR #${run.pr}` : ""
-  const sha = shortSha(run.sha)
-  const lines = [`${run.state}  ${run.taskID}  ${run.title}${pr}${sha ? ` ${sha}` : ""}`]
-  lines.push(`  task ${run.taskID || "-"}  ·  attempts ${formatAttempts(run)}  ·  age ${formatAge(run.updatedAt)}`)
-  if (run.reason) lines.push(`  reason: ${run.reason}`)
-  return lines
+function runLineItems(run) {
+  const style = styleFor(run.state)
+  const title = run.title && run.title !== run.taskID ? truncate(run.title, TITLE_WIDTH) : ""
+  const head = [`${style.marker} ${shortTaskID(run.taskID)}`, title].filter(Boolean).join(" ")
+  const pr = run.pr ? `PR #${run.pr}` : ""
+  const reason = run.reason ? truncate(run.reason, REASON_WIDTH) : ""
+  const detail = [pr, reason].filter(Boolean).join("  ")
+  const items = [{ text: head, fg: style.fg }]
+  if (detail) items.push({ text: `  ${detail}` })
+  return items
 }
 
-// Pure view model. The TUI renders these lines; tests assert on them directly.
-export function renderSnapshotLines(snapshot = EMPTY_SNAPSHOT, error = null) {
-  if (error) return [`Beacon status unavailable: ${error}`]
+// Pure view model. Each item carries the text and an optional foreground color.
+// The TUI renders the items; tests assert on the exact text of every line.
+export function snapshotLineItems(snapshot = EMPTY_SNAPSHOT, error = null) {
+  if (error) return [{ text: `Beacon status unavailable: ${error}`, fg: ERROR_FG }]
   const view = normalizeSnapshot(snapshot)
-  const rule = "─".repeat(44)
-  const lines = ["Beacon", rule]
-  if (view.active.length === 0) lines.push("No active runs")
-  else view.active.forEach((run) => lines.push(...formatRunLines(run)))
-  lines.push(rule, "Recent")
-  if (view.recent.length === 0) lines.push("No recent runs")
-  else view.recent.forEach((run) => lines.push(...formatRunLines(run)))
-  return lines
+  const rule = "─".repeat(PANEL_WIDTH)
+  const items = [{ text: "Beacon" }, { text: rule }]
+  if (view.active.length === 0) items.push({ text: "No active runs" })
+  else view.active.forEach((run) => items.push(...runLineItems(run)))
+  items.push({ text: rule }, { text: "Recent" })
+  if (view.recent.length === 0) items.push({ text: "No recent runs" })
+  else view.recent.forEach((run) => items.push(...runLineItems(run)))
+  return items
 }
 
-// Definition compatible with @opencode/plugin/tui. Plugin.define is an identity
-// function, so the plain object is already a valid Definition.
-export default {
-  id: "beacon-project-status",
-  async setup(ctx) {
-    const [{ createComponent, createElement, insert, setProp }, { createSignal, onCleanup }] = await Promise.all([
-      import("@opentui/solid"),
-      import("solid-js"),
-    ])
-    const source = new RpcStatusSource(ctx)
+export function renderSnapshotLines(snapshot = EMPTY_SNAPSHOT, error = null) {
+  return snapshotLineItems(snapshot, error).map((item) => item.text)
+}
 
-    function BeaconSidebarView() {
-      const [snapshot, setSnapshot] = createSignal(EMPTY_SNAPSHOT)
-      const [error, setError] = createSignal(null)
-      let stopped = false
+async function setup(ctx) {
+  const [{ createComponent, createElement, insert, setProp }, { createSignal, onCleanup }] = await Promise.all([
+    import("@opentui/solid"),
+    import("solid-js"),
+  ])
+  const source = createStatusSource(ctx)
 
-      const refresh = async () => {
-        if (stopped) return
-        try {
-          const next = await source.snapshot()
-          if (!stopped) {
-            setSnapshot(next ?? EMPTY_SNAPSHOT)
-            setError(null)
-          }
-        } catch (cause) {
-          if (!stopped) setError(errorMessage(cause))
-        }
+  function BeaconView() {
+    const [items, setItems] = createSignal(snapshotLineItems(EMPTY_SNAPSHOT))
+    let stopped = false
+
+    const refresh = async () => {
+      if (stopped) return
+      try {
+        const next = await source.snapshot()
+        if (!stopped) setItems(snapshotLineItems(next ?? EMPTY_SNAPSHOT))
+      } catch (cause) {
+        if (!stopped) setItems(snapshotLineItems(EMPTY_SNAPSHOT, errorMessage(cause)))
       }
-      void refresh()
-      const timer = setInterval(() => void refresh(), REFRESH_MS)
-      onCleanup(() => {
-        stopped = true
-        clearInterval(timer)
-      })
-
-      const box = createElement("box")
-      setProp(box, "flexDirection", "column")
-      insert(box, () => renderSnapshotLines(snapshot(), error()).map((line) => {
-        const text = createElement("text")
-        setProp(text, "wrapMode", "none")
-        insert(text, line)
-        return text
-      }))
-      return box
     }
-
-    const dispose = ctx.ui.slot({
-      append: "sidebar.content",
-      render: () => createComponent(BeaconSidebarView, {}),
+    void refresh()
+    const timer = setInterval(() => void refresh(), REFRESH_MS)
+    onCleanup(() => {
+      stopped = true
+      clearInterval(timer)
     })
-    return () => dispose?.()
-  },
+
+    const box = createElement("box")
+    setProp(box, "flexDirection", "column")
+    insert(box, () => items().map((item) => {
+      const text = createElement("text")
+      setProp(text, "wrapMode", "none")
+      setProp(text, "selectable", false)
+      if (item.fg) setProp(text, "fg", item.fg)
+      insert(text, item.text)
+      return text
+    }))
+    return box
+  }
+
+  const render = () => createComponent(BeaconView, {})
+  const disposeSidebar = ctx.ui.slot({ append: "sidebar.content", render })
+  const disposeFooter = ctx.ui.slot({ append: "home.footer.status", render })
+  return () => {
+    disposeSidebar?.()
+    disposeFooter?.()
+  }
 }
+
+export const beaconStatusDefinition = { id: "beacon-project-status", setup }
+
+export function defineBeaconStatusPlugin(Plugin) {
+  return Plugin.define(beaconStatusDefinition)
+}
+
+// @opencode/plugin/tui defines Plugin.define. The dynamic import with an
+// identity fallback keeps this module loadable by node --test, where the TUI
+// peer dependencies are not installed.
+let Plugin
+try {
+  ;({ Plugin } = await import("@opencode/plugin/tui"))
+} catch {
+  Plugin = { define: (definition) => definition }
+}
+
+export default defineBeaconStatusPlugin(Plugin)

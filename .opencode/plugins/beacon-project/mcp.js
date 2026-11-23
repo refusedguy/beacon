@@ -14,6 +14,11 @@ const defaultDeps = {
   execFileSync: defaultExecFileSync,
 }
 
+// One registration per canonical project root. The operator attaches the MCP
+// server manually. Registration here only records the config for that attach.
+// It never starts, reloads or restarts a daemon.
+const registrations = new Map()
+
 function pathBinary(name, deps) {
   for (const dir of (deps.env.PATH ?? "").split(delimiter)) {
     if (!dir) continue
@@ -102,17 +107,26 @@ export function beaconServerConfig(root, deps = defaultDeps) {
   })
 }
 
+export function registeredBeaconConfig(root) {
+  return registrations.get(root)?.config ?? null
+}
+
+// ctx keeps the plugin setup signature. The function does not call ctx.mcp.
 export async function registerBeaconMcp(ctx, root, deps = defaultDeps) {
-  const registration = await ctx.mcp.transform((editor) => {
-    editor.set(BEACON_SERVER, beaconServerConfig(root, deps))
-    editor.update(BEACON_SERVER, (server) => {
-      server.cwd = root
-      server.environment = {
-        ...(server.environment ?? {}),
-        [BEACON_PROJECT_ROOT_ENV]: root,
-      }
-      server.disabled = false
-    })
+  if (typeof root !== "string" || root.trim() === "") {
+    throw new Error("beacon MCP: project root is required")
+  }
+  const existing = registrations.get(root)
+  if (existing) return existing
+
+  const config = beaconServerConfig(root, deps)
+  const registration = Object.freeze({
+    server: BEACON_SERVER,
+    config,
+    async dispose() {
+      if (registrations.get(root) === registration) registrations.delete(root)
+    },
   })
-  return { registration }
+  registrations.set(root, registration)
+  return registration
 }
