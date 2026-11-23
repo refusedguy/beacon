@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/domain/projection"
 	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
@@ -88,18 +89,30 @@ var heartbeatInterval = 15 * time.Second
 // chain without emitting hundreds of frames.
 var maxPatchesPerSnapshot = 32
 
-// PointStats is the hourly point budget already computed by the CI provider.
-type PointStats struct {
-	Used   int `json:"used"`
-	Budget int `json:"budget"`
-}
+// The projection package owns the UI-facing shapes. These aliases keep the
+// transport and its callers on one definition while the domain values stay in
+// this adapter.
+type (
+	PointStats   = projection.PointStats
+	LastCycle    = projection.LastCycle
+	WatchOutcome = projection.WatchOutcome
 
-// LastCycle is the most recent completed reconciler pass.
-type LastCycle struct {
-	At             time.Time `json:"at,omitempty"`
-	WatchesUpdated int       `json:"watchesUpdated"`
-	DurationMs     int64     `json:"durationMs"`
-}
+	WatchHistory    = projection.WatchHistory
+	HourlyStats     = projection.HourlyStats
+	QueueBlock      = projection.QueueBlock
+	QueueCard       = projection.QueueCard
+	SlotBlock       = projection.SlotBlock
+	WorkerBlock     = projection.WorkerBlock
+	SnapshotHistory = projection.SnapshotHistory
+
+	Snapshot = projection.Snapshot[domain.Watch, domain.BlockerIncident, domain.OrchestratorBinding]
+)
+
+const (
+	OutcomeMerged    = projection.OutcomeMerged
+	OutcomeClosed    = projection.OutcomeClosed
+	OutcomeEscalated = projection.OutcomeEscalated
+)
 
 // VersionInfo is the response of GET /api/v1/version. It reports the same
 // build facts as /api/v1/health without requiring a provider read.
@@ -156,109 +169,6 @@ type AuditPage struct {
 	Dropped uint64 `json:"dropped,omitempty"`
 }
 
-// Snapshot is the read-only projection served by /api/v1/snapshot. It is a
-// transport-owned shape built from domain values, never a live store object.
-type Snapshot struct {
-	LiveWatches       []domain.Watch              `json:"liveWatches"`
-	BlockerIncidents  []domain.BlockerIncident    `json:"blockerIncidents"`
-	BoundOrchestrator *domain.OrchestratorBinding `json:"boundOrchestrator,omitempty"`
-	Escalations       []string                    `json:"escalations"`
-	PointStats        PointStats                  `json:"pointStats"`
-	Metrics           json.RawMessage             `json:"metrics"`
-	LastCycle         LastCycle                   `json:"lastCycle"`
-	LoadErrors        []string                    `json:"loadErrors"`
-
-	// RecentWatches and HourlyStats are optional. A provider that does not
-	// implement HistorySource leaves both fields out of the JSON response, so
-	// an older client sees the same shape as before they were added.
-	RecentWatches []WatchHistory `json:"recentWatches,omitempty"`
-	HourlyStats   *HourlyStats   `json:"hourlyStats,omitempty"`
-
-	// RecentWatchesTruncated is true when the provider returned more than
-	// maxRecentWatches completed Watches and the transport kept only the newest
-	// ones. It stays absent when nothing was cut, so the flag is part of the
-	// optional history block rather than a field on every snapshot.
-	RecentWatchesTruncated bool `json:"recentWatchesTruncated,omitempty"`
-
-	// Queue, Slots and Workers are optional. A provider that has no queue
-	// projection leaves them out of the JSON response, so a client that does
-	// not know the fields sees the original shape.
-	Queue   *QueueBlock   `json:"queue,omitempty"`
-	Slots   *SlotBlock    `json:"slots,omitempty"`
-	Workers []WorkerBlock `json:"workers,omitempty"`
-}
-
-// WatchOutcome groups a completed Watch for the history list. It stays a string
-// so the OpenAPI enum does not change when the domain gains new verdicts.
-type WatchOutcome string
-
-const (
-	OutcomeMerged    WatchOutcome = "merged"
-	OutcomeClosed    WatchOutcome = "closed"
-	OutcomeEscalated WatchOutcome = "escalated"
-)
-
-// WatchHistory is one completed Watch projected for a future UI. It is a
-// transport-owned shape and never a live domain.Watch, so the wire contract
-// stays stable when the domain struct grows.
-type WatchHistory struct {
-	ID          string       `json:"id"`
-	Repo        string       `json:"repo"`
-	PR          int          `json:"pr"`
-	HeadSHA     string       `json:"headSHA"`
-	Outcome     WatchOutcome `json:"outcome"`
-	ClosedAt    time.Time    `json:"closedAt"`
-	CloseReason string       `json:"closeReason,omitempty"`
-}
-
-// HourlyStats is the last hour's activity. Points come from the CI provider's
-// budget, merges from completed Watches and blockers from the active incidents.
-type HourlyStats struct {
-	Points   int `json:"points"`
-	Merges   int `json:"merges"`
-	Blockers int `json:"blockers"`
-}
-
-// QueueBlock is the queue panel of the live screen. Todo holds the ready cards
-// and Deferred holds the cards parked by an earlier cycle. The shape stays
-// transport-owned so a change in the task store does not change the wire
-// contract.
-type QueueBlock struct {
-	Todo     []QueueCard `json:"todo,omitempty"`
-	Deferred []QueueCard `json:"deferred,omitempty"`
-}
-
-// QueueCard is one card in the queue panel. Owner holds the short agent id and
-// Phase holds the card phase. Both stay optional for older cards.
-type QueueCard struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	Owner  string `json:"owner,omitempty"`
-	Title  string `json:"title"`
-	Phase  string `json:"phase,omitempty"`
-}
-
-// SlotBlock reports the orchestrator slot capacity shown by the live screen.
-// Total is the configured budget and Used is the number of held slots.
-type SlotBlock struct {
-	Total int `json:"total"`
-	Used  int `json:"used"`
-}
-
-// WorkerBlock is one executor the live screen lists with its role and wake
-// target. A snapshot without a role still decodes with empty strings.
-type WorkerBlock struct {
-	ID     string `json:"id"`
-	Role   string `json:"role,omitempty"`
-	Target string `json:"target,omitempty"`
-}
-
-// SnapshotHistory is the optional history block added to a Snapshot.
-type SnapshotHistory struct {
-	RecentWatches []WatchHistory `json:"recentWatches"`
-	HourlyStats   HourlyStats    `json:"hourlyStats"`
-}
-
 // HistorySource is an optional port layered on StateProvider. The transport
 // never opens SQLite itself. The composition root decides whether history is
 // available and implements this method on the value it passes as Provider.
@@ -270,45 +180,19 @@ type HistorySource interface {
 	SnapshotHistory(ctx context.Context) (SnapshotHistory, error)
 }
 
-// StateProvider supplies the projection. The transport only calls Snapshot.
-type StateProvider interface {
-	Snapshot(ctx context.Context) (Snapshot, error)
-}
+// The three ports live in projection. Aliases keep the transport and the
+// composition root on the same interfaces a future UI will implement.
+type (
+	StateProvider = projection.StateProvider[Snapshot]
+	DecisionSink  = projection.DecisionSink[Decision, DecisionResult]
+	EventSource   = projection.EventSource[Event]
 
-// Decision is one human command. ObligationID and Note are optional; Actor is
-// recorded in the journal by the sink, not interpreted by the transport.
-// Contract names the wire contract version; an empty value keeps the original
-// pre-versioning shape valid.
-type Decision struct {
-	Command      string `json:"command"`
-	WatchID      string `json:"watchID"`
-	ObligationID string `json:"obligationID,omitempty"`
-	Note         string `json:"note,omitempty"`
-	Actor        string `json:"actor,omitempty"`
-	Contract     string `json:"contract,omitempty"`
-	// AppKey identifies the application that sent the command. When set, the
-	// server checks that the key is known and that Actor is one of its
-	// permitted actors. An empty value keeps the local TUI path unchanged.
-	AppKey string `json:"appKey,omitempty"`
-}
+	Decision       = projection.Decision
+	DecisionResult = projection.DecisionResult
+)
 
-// DecisionResult is returned for every accepted command. Applied is false on
-// an idempotent repeat so a client can tell a fresh effect from a cached one.
-type DecisionResult struct {
-	OK         bool   `json:"ok"`
-	Command    string `json:"command"`
-	WatchID    string `json:"watchID"`
-	Applied    bool   `json:"applied"`
-	DecisionID string `json:"decisionID"`
-	Status     string `json:"status,omitempty"`
-	Contract   string `json:"contract,omitempty"`
-}
-
-// DecisionSink applies one command. Idempotency is owned by Server, so the
-// sink sees a given decision at most once per process lifetime.
-type DecisionSink interface {
-	Apply(ctx context.Context, d Decision) (DecisionResult, error)
-}
+// The bus is the single adapter behind EventSource.
+var _ EventSource = (*EventBus)(nil)
 
 // AppCredentials binds an application key to the actors that application may
 // answer for. The composition root supplies the map; this transport never
@@ -363,15 +247,8 @@ type connectionFile struct {
 	Version string `json:"version"`
 }
 
-// Event is one SSE frame. ID is assigned by the bus and doubles as the
-// Last-Event-ID a client sends on reconnect.
-type Event struct {
-	ID      uint64          `json:"id"`
-	Type    string          `json:"type"`
-	At      time.Time       `json:"at"`
-	WatchID string          `json:"watchID,omitempty"`
-	Payload json.RawMessage `json:"payload,omitempty"`
-}
+// Event is the projection frame the bus publishes. ID is assigned by the bus.
+type Event = projection.Event
 
 // EventName is the discriminated name of a typed SSE event. The set is closed:
 // the three patch names follow the domain objects the stream describes, and
