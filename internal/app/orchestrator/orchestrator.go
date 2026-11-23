@@ -752,12 +752,19 @@ func (k ApprovalKey) String() string {
 	return k.EnvironmentID + "\x00" + string(k.Category) + "\x00" + k.Path
 }
 
+// maxApprovalCache bounds the number of cached approval decisions. A decision
+// older than this window is re-evaluated by Resolve. Eviction drops the oldest
+// insertion first, so a key inside the window keeps its (environment, category,
+// path) decision.
+const maxApprovalCache = 4096
+
 // ApprovalCache stores approval decisions by (environment, category, path).
 // It is the Beacon analogue of Codex's patch approval cache key. One mutex
 // guards the map because one cache is shared by concurrent Watches.
 type ApprovalCache struct {
 	mu      sync.Mutex
 	allowed map[string]bool
+	order   []string // keys in insertion order, for oldest-first eviction
 }
 
 // Lookup returns the cached decision and whether the key was present.
@@ -771,7 +778,22 @@ func (c *ApprovalCache) Lookup(key ApprovalKey) (allowed bool, ok bool) {
 	return allowed, ok
 }
 
-// Remember stores one decision under key.
+// forgetApprovalLocked removes a key from the eviction order. The caller holds
+// c.mu.
+func (c *ApprovalCache) forgetApprovalLocked(key string) {
+	for i, k := range c.order {
+		if k == key {
+			copy(c.order[i:], c.order[i+1:])
+			c.order[len(c.order)-1] = ""
+			c.order = c.order[:len(c.order)-1]
+			return
+		}
+	}
+}
+
+// Remember stores one decision under key. A repeat overwrites the decision
+// without moving the key in the eviction order, so re-approving one path cannot
+// push other paths out of the window early.
 func (c *ApprovalCache) Remember(key ApprovalKey, allowed bool) {
 	if c == nil {
 		return
@@ -781,7 +803,16 @@ func (c *ApprovalCache) Remember(key ApprovalKey, allowed bool) {
 	if c.allowed == nil {
 		c.allowed = map[string]bool{}
 	}
-	c.allowed[key.String()] = allowed
+	k := key.String()
+	if _, ok := c.allowed[k]; !ok {
+		if len(c.allowed) >= maxApprovalCache {
+			oldest := c.order[0]
+			delete(c.allowed, oldest)
+			c.forgetApprovalLocked(oldest)
+		}
+		c.order = append(c.order, k)
+	}
+	c.allowed[k] = allowed
 }
 
 // Len reports the number of stored decisions.

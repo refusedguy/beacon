@@ -76,6 +76,11 @@ type childThread struct {
 	parentID string
 }
 
+// maxChildThreads bounds the thread reference store. The oldest reference is
+// evicted first when a new root or child arrives at capacity. The store is only
+// used by the WS transport, which is disabled by default.
+const maxChildThreads = 4096
+
 // ChildThreads holds the thread references the server owns. It records each
 // child's parent and name, then projects a child's question into a notice for
 // the parent chat. It reads no clock, store or network. The only I/O is the
@@ -84,6 +89,7 @@ type childThread struct {
 type ChildThreads struct {
 	mu      sync.RWMutex
 	threads map[string]childThread
+	order   []string // thread IDs in insertion order, for oldest-first eviction
 }
 
 // NewChildThreads builds an empty reference store.
@@ -93,6 +99,30 @@ func (c *ChildThreads) init() {
 	if c.threads == nil {
 		c.threads = make(map[string]childThread)
 	}
+}
+
+// forgetThreadLocked removes an ID from the eviction order. The caller holds
+// c.mu for writing.
+func (c *ChildThreads) forgetThreadLocked(id string) {
+	for i, k := range c.order {
+		if k == id {
+			copy(c.order[i:], c.order[i+1:])
+			c.order[len(c.order)-1] = ""
+			c.order = c.order[:len(c.order)-1]
+			return
+		}
+	}
+}
+
+// evictOldestLocked makes room for one new reference. The caller holds c.mu for
+// writing and has checked that the new ID is not already present.
+func (c *ChildThreads) evictOldestLocked() {
+	if len(c.threads) < maxChildThreads {
+		return
+	}
+	oldest := c.order[0]
+	delete(c.threads, oldest)
+	c.forgetThreadLocked(oldest)
 }
 
 // Root records a thread with no parent. An empty id returns ErrInvalidThread
@@ -108,7 +138,9 @@ func (c *ChildThreads) Root(id, name string) error {
 	if _, exists := c.threads[id]; exists {
 		return ErrDuplicateThread
 	}
+	c.evictOldestLocked()
 	c.threads[id] = childThread{name: strings.TrimSpace(name)}
+	c.order = append(c.order, id)
 	return nil
 }
 
@@ -128,7 +160,9 @@ func (c *ChildThreads) Spawn(parentID, childID, name string) error {
 	if _, exists := c.threads[childID]; exists {
 		return ErrDuplicateThread
 	}
+	c.evictOldestLocked()
 	c.threads[childID] = childThread{name: strings.TrimSpace(name), parentID: parentID}
+	c.order = append(c.order, childID)
 	return nil
 }
 
