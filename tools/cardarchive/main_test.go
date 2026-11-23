@@ -2,91 +2,78 @@ package main
 
 import (
 	"bytes"
-	"strings"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
-func TestEmitRendersClosedCardsInIDOrder(t *testing.T) {
-	in := "T2|done|reason-b\n" +
-		"OPEN|todo|skip me\n" +
-		"A1|dropped|closed early\n" +
-		"\n"
-	var out bytes.Buffer
-	n, err := emit(strings.NewReader(in), &out)
+func TestClosedDoneWithReason(t *testing.T) {
+	content := "# T2.2. Output schemas\nСтатус: done\nПричина: migrated\n"
+	id, status, detail, ok := closed("T2.2.md", content)
+	if !ok || id != "T2.2" || status != "done" || detail != "migrated" {
+		t.Fatalf("unexpected card: %q %q %q ok=%v", id, status, detail, ok)
+	}
+}
+
+func TestClosedSkipsOpenAndMissingStatus(t *testing.T) {
+	if _, _, _, ok := closed("x.md", "# X. Topic\nСтатус: todo\n"); ok {
+		t.Fatal("open card must be skipped")
+	}
+	if _, _, _, ok := closed("x.md", "# X. Topic\n"); ok {
+		t.Fatal("card without status must be skipped")
+	}
+}
+
+func TestClosedFallbackToFirstLine(t *testing.T) {
+	_, status, detail, ok := closed("BCX-05.md", "# BCX-05. Topic\nСтатус: dropped\n")
+	if !ok || status != "dropped" || detail != "# BCX-05. Topic" {
+		t.Fatalf("first-line fallback failed: %q %q ok=%v", status, detail, ok)
+	}
+}
+
+func TestClosedIDFromFilename(t *testing.T) {
+	id, _, _, _ := closed("T4.7-rollback-drill.md", "no heading\nСтатус: done\n")
+	if id != "T4.7-rollback-drill" {
+		t.Fatalf("filename fallback id: %q", id)
+	}
+}
+
+func TestClosedSanitizesDetail(t *testing.T) {
+	_, _, detail, _ := closed("A.md", "# A. T\nСтатус: done\nПричина: a | b\rc\n")
+	if detail != "a / b c" {
+		t.Fatalf("sanitized detail: %q", detail)
+	}
+}
+
+func TestGenerateSortedIdempotentAndSkipsOpen(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("T2.md", "# T2. Second\nСтатус: done\nПричина: reason-b\n")
+	write("A1.md", "# A1. First\nСтатус: dropped\n")
+	write("OPEN.md", "# OPEN. Open\nСтатус: todo\n")
+	write("ARCHIVE.md", "stale archive content\n")
+
+	got, err := generate(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "A1 | dropped | closed early\nT2 | done | reason-b\n"
-	if got := out.String(); got != want {
-		t.Fatalf("emit: got %q want %q", got, want)
+	want := "A1 | dropped | # A1. First\nT2 | done | reason-b\n"
+	if string(got) != want {
+		t.Fatalf("generate: got %q want %q", got, want)
 	}
-	if n != 2 {
-		t.Fatalf("card count: got %d want 2", n)
-	}
-}
-
-func TestEmitSanitizesDetail(t *testing.T) {
-	var out bytes.Buffer
-	if _, err := emit(strings.NewReader("A|done|a | b\r\nc\n"), &out); err != nil {
+	again, err := generate(root)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := out.String(), "A | done | a / b c\n"; got != want {
-		t.Fatalf("sanitized detail: got %q want %q", got, want)
-	}
-}
-
-func TestEmitSkipsMalformedLines(t *testing.T) {
-	in := "A|done\n" +
-		"|done|no id\n" +
-		"B|in-progress|skip\n" +
-		"B|done|keep\n"
-	var out bytes.Buffer
-	if _, err := emit(strings.NewReader(in), &out); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := out.String(), "B | done | keep\n"; got != want {
-		t.Fatalf("malformed lines: got %q want %q", got, want)
-	}
-}
-
-func TestEmitIsDeterministicAcrossInputOrders(t *testing.T) {
-	inputs := []string{
-		"B|done|b\nA|dropped|a\n",
-		"A|dropped|a\nB|done|b\n",
-	}
-	var outputs []string
-	for _, in := range inputs {
-		var out bytes.Buffer
-		if _, err := emit(strings.NewReader(in), &out); err != nil {
-			t.Fatal(err)
-		}
-		outputs = append(outputs, out.String())
-	}
-	if outputs[0] != outputs[1] {
-		t.Fatalf("input order changed output: %q vs %q", outputs[0], outputs[1])
-	}
-}
-
-func TestEmitIsIdempotent(t *testing.T) {
-	in := "Z|done|z\nA|dropped|a\n"
-	var first, second bytes.Buffer
-	if _, err := emit(strings.NewReader(in), &first); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := emit(strings.NewReader(in), &second); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(first.Bytes(), second.Bytes()) {
-		t.Fatal("emit is not byte-idempotent")
-	}
-}
-
-func TestSelfTestPassesOnFixtures(t *testing.T) {
-	var out bytes.Buffer
-	if err := selfTest(&out); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out.String(), "cardarchive self-test ok: 3 cards") {
-		t.Fatalf("self-test output: %q", out.String())
+	if !bytes.Equal(got, again) {
+		t.Fatal("generate is not byte-idempotent")
 	}
 }
