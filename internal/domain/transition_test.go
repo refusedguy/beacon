@@ -472,15 +472,16 @@ func TestTransitionNeedsInputParksWatch(t *testing.T) {
 	}
 }
 
-// TestTransitionNeedsInputIgnoresVerdict covers LC-01: a CI verdict on a Watch
-// parked for a human answer changes no status, verdict or revision, stages no
-// wake and creates no obligation. A terminal verdict must not close the Watch
-// before the human answers; the answer then resumes the same Watch.
+// TestTransitionNeedsInputIgnoresVerdict covers LC-01 and VCI-07: every valid
+// CI verdict leaves a Watch parked for a human answer untouched. No status,
+// verdict or revision changes, no wake is staged and no obligation is created.
+// A terminal verdict must not close the Watch before the human answers; the
+// answer then resumes the same Watch.
 func TestTransitionNeedsInputIgnoresVerdict(t *testing.T) {
 	at := time.Date(2026, 11, 22, 1, 0, 0, 0, time.UTC)
 	verdicts := []Verdict{
-		VerdictReady, VerdictRetry, VerdictKeepWorking, VerdictWatching,
-		VerdictMerged, VerdictClosed,
+		VerdictReady, VerdictRebase, VerdictRetry, VerdictKeepWorking,
+		VerdictTimeout, VerdictWatching, VerdictMerged, VerdictClosed,
 	}
 	for _, v := range verdicts {
 		t.Run(string(v), func(t *testing.T) {
