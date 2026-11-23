@@ -1,7 +1,7 @@
 ---
 id: EXAMPLE-01
 title: Signal reconciliation after an operator retry
-status: in_progress
+status: done
 scope:
   - internal/app/
 depends: []
