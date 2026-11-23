@@ -13,13 +13,15 @@ import (
 // the writer output produces a classified error and one violation metric line.
 func TestWriteFileModeClassifiesSandboxDenial(t *testing.T) {
 	baseErr := errors.New("write failed")
-	output := "sandbox denied write: operation not permitted"
+	writerOut := "sandbox denied write: operation not permitted"
 	var report bytes.Buffer
 	r := &runner{
-		opts: Options{Quiet: true},
-		out:  &report,
-		write: func(string, []byte) (string, error) {
-			return output, baseErr
+		opts:   Options{Quiet: true},
+		output: output{out: &report},
+		writeGate: writeGate{
+			write: func(string, []byte) (string, error) {
+				return writerOut, baseErr
+			},
 		},
 	}
 
@@ -28,8 +30,8 @@ func TestWriteFileModeClassifiesSandboxDenial(t *testing.T) {
 	if !errors.As(err, &denial) {
 		t.Fatalf("error = %v, want *sandboxDenialError", err)
 	}
-	if denial.Output != output {
-		t.Errorf("Output = %q, want %q", denial.Output, output)
+	if denial.Output != writerOut {
+		t.Errorf("Output = %q, want %q", denial.Output, writerOut)
 	}
 	if !errors.Is(err, baseErr) {
 		t.Errorf("error does not wrap the write error: %v", err)
@@ -49,13 +51,15 @@ func TestWriteFileModeClassifiesSandboxDenial(t *testing.T) {
 // error outside the denial type and leaves the violation metric at zero.
 func TestWriteFileModeLeavesPermissionErrorUnclassified(t *testing.T) {
 	baseErr := os.ErrPermission
-	output := "open /tmp/sandbox/docs/tasks/CCx-24.md: permission denied"
+	writerOut := "open /tmp/sandbox/docs/tasks/CCx-24.md: permission denied"
 	var report bytes.Buffer
 	r := &runner{
-		opts: Options{Quiet: true},
-		out:  &report,
-		write: func(string, []byte) (string, error) {
-			return output, baseErr
+		opts:   Options{Quiet: true},
+		output: output{out: &report},
+		writeGate: writeGate{
+			write: func(string, []byte) (string, error) {
+				return writerOut, baseErr
+			},
 		},
 	}
 
@@ -105,14 +109,16 @@ func TestWriteFileModeWritesOnSuccess(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "CCx-24.md")
 	var written []byte
 	r := &runner{
-		opts: Options{Quiet: true},
-		out:  &bytes.Buffer{},
-		write: func(gotPath string, data []byte) (string, error) {
-			if gotPath != path {
-				t.Errorf("path = %q, want %q", gotPath, path)
-			}
-			written = append([]byte(nil), data...)
-			return "", nil
+		opts:   Options{Quiet: true},
+		output: output{out: &bytes.Buffer{}},
+		writeGate: writeGate{
+			write: func(gotPath string, data []byte) (string, error) {
+				if gotPath != path {
+					t.Errorf("path = %q, want %q", gotPath, path)
+				}
+				written = append([]byte(nil), data...)
+				return "", nil
+			},
 		},
 	}
 

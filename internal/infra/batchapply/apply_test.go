@@ -150,7 +150,7 @@ func TestApplyClosuresWritesAndIsIdempotent(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			r := &runner{out: io.Discard, err: io.Discard}
+			r := &runner{output: output{out: io.Discard, err: io.Discard}}
 			c := cardClosure{
 				ID: "W5-42", PR: 106, Status: status,
 				Reason: "дублирует W3-A", MergedAt: "2026-11-20",
@@ -650,7 +650,7 @@ func TestWriteFileNeverOverwritesExistingCard(t *testing.T) {
 	if err := os.WriteFile(path, []byte(existing), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	r := &runner{out: io.Discard, err: io.Discard}
+	r := &runner{output: output{out: io.Discard, err: io.Discard}}
 	if err := r.writeFile(root, rel, "# W1. Replacement\n"); err != nil {
 		t.Fatal(err)
 	}
@@ -921,20 +921,24 @@ func TestChunkedWriteCommitsAndProgress(t *testing.T) {
 	var pauses []time.Duration
 	commits := 0
 	r := &runner{
-		opts:     Options{ChunkSize: 10, ChunkPause: 2 * time.Millisecond, Commit: true, Quiet: true},
-		out:      io.Discard,
-		progress: &progress,
-		now:      fakeClock(time.Millisecond),
-		yield:    func(d time.Duration) { pauses = append(pauses, d) },
-		commit: func(root string, cards, adrs, evals int) error {
-			commits++
-			if root != dir {
-				t.Errorf("commit root = %q, want %q", root, dir)
-			}
-			if cards != 7 || adrs != 3 || evals != 2 {
-				t.Errorf("commit counts = %d/%d/%d, want 7/3/2", cards, adrs, evals)
-			}
-			return nil
+		opts: Options{ChunkSize: 10, ChunkPause: 2 * time.Millisecond, Commit: true, Quiet: true},
+		output: output{
+			out:      io.Discard,
+			progress: &progress,
+		},
+		writeGate: writeGate{
+			now:   fakeClock(time.Millisecond),
+			yield: func(d time.Duration) { pauses = append(pauses, d) },
+			commit: func(root string, cards, adrs, evals int) error {
+				commits++
+				if root != dir {
+					t.Errorf("commit root = %q, want %q", root, dir)
+				}
+				if cards != 7 || adrs != 3 || evals != 2 {
+					t.Errorf("commit counts = %d/%d/%d, want 7/3/2", cards, adrs, evals)
+				}
+				return nil
+			},
 		},
 	}
 	if err := r.writeChunked(dir, entries, 7, 3, 2); err != nil {
@@ -982,19 +986,23 @@ func TestChunkPauseAllowsReader(t *testing.T) {
 		chunkSize, chunkPause = 50, pause
 		var progress strings.Builder
 		r := &runner{
-			opts:     Options{DryRun: true, Quiet: true},
-			out:      io.Discard,
-			progress: &progress,
-			now:      fakeClock(time.Microsecond),
-			yield: func(d time.Duration) {
-				yields++
-				seen = append(seen, d)
-				// A reader makes progress only in the window between chunks.
-				if d > 0 {
-					for i := 0; i < 10; i++ {
-						reads++
+			opts: Options{DryRun: true, Quiet: true},
+			output: output{
+				out:      io.Discard,
+				progress: &progress,
+			},
+			writeGate: writeGate{
+				now: fakeClock(time.Microsecond),
+				yield: func(d time.Duration) {
+					yields++
+					seen = append(seen, d)
+					// A reader makes progress only in the window between chunks.
+					if d > 0 {
+						for i := 0; i < 10; i++ {
+							reads++
+						}
 					}
-				}
+				},
 			},
 		}
 		if err := r.writeChunked(dir, entries, 0, 0, 0); err != nil {
@@ -1090,7 +1098,10 @@ func TestPrefilterStaleDropsOlderRows(t *testing.T) {
 		{path: filepath.Join("docs", "tasks", "NEW.md"), id: "NEW", updatedAt: base.Add(time.Second)},
 		{path: filepath.Join("docs", "tasks", "PLAIN.md"), id: "PLAIN"},
 	}
-	r := &runner{opts: Options{Quiet: true}, out: io.Discard, err: io.Discard}
+	r := &runner{
+		opts:   Options{Quiet: true},
+		output: output{out: io.Discard, err: io.Discard},
+	}
 	kept := r.prefilterStale(root, entries)
 	if len(kept) != 2 || kept[0].id != "NEW" || kept[1].id != "PLAIN" {
 		t.Fatalf("kept = %+v, want NEW and PLAIN", kept)
@@ -1139,7 +1150,11 @@ func TestRecheckStaleRejectsLocalEditBetweenPasses(t *testing.T) {
 	entries := []artifactEntry{{
 		path: rel, content: "# W1\nincoming row\n", id: "W1", updatedAt: incoming,
 	}}
-	r := &runner{opts: Options{Quiet: true}, out: io.Discard, now: now}
+	r := &runner{
+		opts:      Options{Quiet: true},
+		output:    output{out: io.Discard},
+		writeGate: writeGate{now: now},
+	}
 	kept := r.prefilterStale(dir, entries)
 	if len(kept) != 1 {
 		t.Fatalf("prefilter dropped the row: %+v", r.staleSkippedIDs)
@@ -1534,13 +1549,15 @@ func TestWriteChunkedKeepsDeltaAfterFailedWrite(t *testing.T) {
 	}
 	failPath := filepath.Join(dir, entries[1].path)
 	r := &runner{
-		opts: Options{Quiet: true},
-		out:  io.Discard,
-		write: func(path string, data []byte) (string, error) {
-			if path == failPath {
-				return "sandbox denied", errors.New("write refused")
-			}
-			return "", nil
+		opts:   Options{Quiet: true},
+		output: output{out: io.Discard},
+		writeGate: writeGate{
+			write: func(path string, data []byte) (string, error) {
+				if path == failPath {
+					return "sandbox denied", errors.New("write refused")
+				}
+				return "", nil
+			},
 		},
 	}
 	if err := r.writeChunked(dir, entries, 0, 0, 0); err == nil {
