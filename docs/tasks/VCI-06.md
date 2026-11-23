@@ -7,6 +7,7 @@ Premise: проверено 2026-11-23 по свежему `origin/main` `e589b3
 Тип: task
 Владелец файлов: internal/app/orchestrator/daemon.go, internal/infra/cibridge/wake_dispatcher.go, internal/app/tasks/night_shift.go, internal/domain/types.go
 Зависимости: CR-01, SL-01, SL-02
+Шаги: Сверить свежий origin/main. Проверить merge-коммиты через git merge-base --is-ancestor. Прочитать код и тесты на HEAD. Закрыть карточку с доказательством в отдельном docs PR. Зарегистрировать Watch с автослиянием.
 Ссылка: https://github.com/refusedguy/beacon/pull/1565, https://github.com/refusedguy/beacon/pull/1988; бэклог `/tmp/opencode/backlog/04-verdict-ci.md`; границы `/tmp/opencode/backlog/17-concurrency.md`
 Агент: vci06-executor
 Время: 2026-11-23T06:32:55Z
