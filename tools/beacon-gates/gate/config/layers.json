@@ -5,6 +5,7 @@
     {"name": "internal/infra/observe", "rank": 0},
     {"name": "internal/infra", "rank": 1},
     {"name": "tools/beacon-gates", "rank": 1},
+    {"name": "tools/cardarchive", "rank": 1},
     {"name": "tools/roadmap-sync", "rank": 1},
     {"name": "internal/app", "rank": 2},
     {"name": "internal/tui", "rank": 2},
