@@ -82,6 +82,59 @@ func TestTaskCreatorCreatesAndCommits(t *testing.T) {
 	}
 }
 
+func TestTaskCreatorRebasesBeforePublishing(t *testing.T) {
+	src := &recordingSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	if _, err := creator.Create(context.Background(), CreateTaskInput{Title: "Card"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ws.rebases) != 1 || ws.rebases[0] != "main" {
+		t.Fatalf("rebases = %v, want one rebase onto main", ws.rebases)
+	}
+	if len(src.log.items) != 1 || src.log.items[0] != "create:"+string(src.created.ID) {
+		t.Fatalf("source log = %v", src.log.items)
+	}
+	if len(ws.log.items) != 2 || ws.log.items[0] != "rebase:main" || ws.log.items[1] != "commit:docs/tasks" {
+		t.Fatalf("workspace call order = %v", ws.log.items)
+	}
+}
+
+func TestTaskCreatorRetriesPushAfterNonFastForward(t *testing.T) {
+	src := &recordingSource{fakeSource: &fakeSource{log: &callLog{}}}
+	ws := &fakeWorkspace{log: &callLog{}, rejectFirst: true}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Base: "main", Branch: "work"}}
+
+	got, err := creator.Create(context.Background(), CreateTaskInput{Title: "Retry card"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Pushed {
+		t.Fatalf("result = %+v, want pushed", got)
+	}
+	if ws.pushes != 2 {
+		t.Fatalf("push attempts = %d, want 2", ws.pushes)
+	}
+	if len(ws.rebases) != 2 || ws.rebases[0] != "main" || ws.rebases[1] != "main" {
+		t.Fatalf("rebases = %v, want a pre-push and a retry rebase onto main", ws.rebases)
+	}
+}
+
+func TestTaskCreatorStopsWhenRebaseFails(t *testing.T) {
+	src := &recordingSource{fakeSource: &fakeSource{log: &callLog{}}}
+	want := errors.New("fetch failed")
+	ws := &fakeWorkspace{log: &callLog{}, rebaseBaseErr: want}
+	creator := &TaskCreator{Source: src, Workspace: ws, Root: core.Workspace{Path: "/root", Branch: "main"}}
+
+	if _, err := creator.Create(context.Background(), CreateTaskInput{Title: "Card"}); !errors.Is(err, want) {
+		t.Fatalf("error = %v, want %v", err, want)
+	}
+	if ws.pushes != 0 {
+		t.Fatalf("push attempts = %d, want 0 after a failed rebase", ws.pushes)
+	}
+}
+
 func TestTaskCreatorRejectsEmptyTitle(t *testing.T) {
 	src := &recordingSource{fakeSource: &fakeSource{log: &callLog{}}}
 	ws := &fakeWorkspace{log: &callLog{}}

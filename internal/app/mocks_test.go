@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -183,9 +184,13 @@ func (f *fakeStore) UpdateIncident(_ context.Context, in *core.BaseIncident) err
 }
 
 type fakeWorkspace struct {
-	removed int
-	commits []commitCall
-	log     *callLog
+	removed       int
+	commits       []commitCall
+	log           *callLog
+	pushes        int
+	rebases       []string
+	rejectFirst   bool
+	rebaseBaseErr error
 }
 
 func (f *fakeWorkspace) Create(_ context.Context, t core.Task) (core.Workspace, error) {
@@ -202,6 +207,19 @@ func (f *fakeWorkspace) HasChanges(context.Context, core.Workspace, string) (boo
 func (f *fakeWorkspace) CommitPath(_ context.Context, _ core.Workspace, pathspec, message string) error {
 	f.commits = append(f.commits, commitCall{pathspec: pathspec, message: message})
 	f.log.add("commit:" + pathspec)
+	f.pushes++
+	if f.rejectFirst && f.pushes == 1 {
+		return &NonFastForwardError{Err: errors.New("remote ref advanced")}
+	}
+	return nil
+}
+
+func (f *fakeWorkspace) RebaseBase(_ context.Context, _ core.Workspace, base string) error {
+	if f.rebaseBaseErr != nil {
+		return f.rebaseBaseErr
+	}
+	f.rebases = append(f.rebases, base)
+	f.log.add("rebase:" + base)
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,6 +16,28 @@ import (
 type PathCommitter interface {
 	CommitPath(ctx context.Context, ws core.Workspace, pathspec, message string) error
 }
+
+// BaseRebaser is an optional workspace capability. GitWorktree implements it
+// so publishing a card syncs a stale local base with origin before pushing.
+// Fakes that implement it let tests observe the rebase and the push retry.
+type BaseRebaser interface {
+	RebaseBase(ctx context.Context, ws core.Workspace, base string) error
+}
+
+// NonFastForwardError marks a push rejected because the remote ref advanced.
+// A caller retries the publish once after rebasing on the latest origin base.
+type NonFastForwardError struct {
+	Err error
+}
+
+func (e *NonFastForwardError) Error() string {
+	if e.Err == nil {
+		return "push rejected as non-fast-forward"
+	}
+	return "push rejected as non-fast-forward: " + e.Err.Error()
+}
+
+func (e *NonFastForwardError) Unwrap() error { return e.Err }
 
 type CreateTaskInput struct {
 	Title    string   `json:"title"`
@@ -61,10 +84,45 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 	if err != nil {
 		return out, err
 	}
-	if err := c.Workspace.CommitPath(ctx, c.Root, "docs/tasks", "beacon: create task "+string(created.ID)); err != nil {
+	base := c.Root.Base
+	if base == "" {
+		base = c.Root.Branch
+	}
+	if base == "" {
+		base = "main"
+	}
+	publish := func() error {
+		return c.Workspace.CommitPath(ctx, c.Root, "docs/tasks", "beacon: create task "+string(created.ID))
+	}
+	// Bring the local base up to date before committing. The rebase is a no-op
+	// when local already matches origin, so repeated calls stay harmless.
+	if err := c.rebaseBase(ctx, base); err != nil {
 		return out, err
 	}
+	if err := publish(); err != nil {
+		var nff *NonFastForwardError
+		if !errors.As(err, &nff) {
+			return out, err
+		}
+		// Another card reached origin between the rebase and the push. Sync
+		// once more and retry. CommitPath does not recommit a card that is
+		// already committed, so the retry does not create a second commit.
+		if err := c.rebaseBase(ctx, base); err != nil {
+			return out, err
+		}
+		if err := publish(); err != nil {
+			return out, err
+		}
+	}
 	return CreatedTask{ID: string(created.ID), Path: created.SourceRef, Pushed: true}, nil
+}
+
+func (c *TaskCreator) rebaseBase(ctx context.Context, base string) error {
+	rebaser, ok := c.Workspace.(BaseRebaser)
+	if !ok {
+		return nil
+	}
+	return rebaser.RebaseBase(ctx, c.Root, base)
 }
 
 func taskScopes(values []string) []core.ScopePath {
