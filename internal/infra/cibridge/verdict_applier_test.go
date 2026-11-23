@@ -277,3 +277,109 @@ func TestRefreshKeepsBlockerWhenBaseChecksUnknown(t *testing.T) {
 		t.Fatalf("rotated generations = %v, want none", gen.ids)
 	}
 }
+
+// TestUnblockFixedFreesNextWake reproduces the red-light ticket. A blocked Watch
+// keeps an open incident whose wake dedup key was already delivered. Resolving
+// the incident must clear ActiveBlockers, and the next block with the same
+// signature must open a fresh incident instance that delivers a new wake.
+func TestUnblockFixedFreesNextWake(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	const repo = "refusedguy/beacon"
+	const head = "abc9a799a08f0c90de8675d4dbe74d9628324f8f"
+	firstAt := time.Unix(2, 0)
+	nextAt := time.Unix(3, 0)
+
+	source := domain.Watch{
+		ID:   "watch:" + repo + ":60:" + head,
+		Repo: repo, PR: 60, HeadSHA: head,
+		Status: domain.StatusWatching, Verdict: domain.VerdictWatching,
+		Subscribers: []domain.Subscriber{{
+			ID: "ses_orchestrator", Role: domain.RoleOrchestrator, Adapter: "opencode",
+		}},
+	}
+	if err := db.SaveWatch(source); err != nil {
+		t.Fatalf("seed source Watch: %v", err)
+	}
+
+	fixer := fixerTestWatch("watch:"+repo+":70:fix", 70)
+	fs := &fixerStore{DB: db, links: map[string]string{fixer.ID: source.ID}}
+
+	gen := &recordingGenerations{}
+	waker := &recordingWaker{}
+	b := New(fs, nil, fixedClock{at: firstAt}, time.Second).
+		WithWaker(waker).WithGenerationStore(gen)
+
+	obs := ciObservation{pr: domain.PRState{
+		State: "OPEN", HeadRefOid: head,
+		Checks: map[string]domain.Check{
+			"build": {Conclusion: "FAILURE", Required: true},
+		},
+	}}
+
+	if got := b.verdictApplier.applyBlocked(ctx, source, obs, firstAt, "cycle-1"); got != 1 {
+		t.Fatalf("first applyBlocked updated %d watches, want 1", got)
+	}
+	open, err := db.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("open incidents after block = %d, want 1", len(open))
+	}
+	first := open[0]
+	if len(waker.deliveries) != 1 {
+		t.Fatalf("wakes after first block = %d, want 1", len(waker.deliveries))
+	}
+	blocked, err := db.Watch(source.ID)
+	if err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	if blocked.BlockerID != first.ID {
+		t.Fatalf("BlockerID = %q, want %q", blocked.BlockerID, first.ID)
+	}
+
+	b.verdictApplier.unblockFixed(fixer)
+
+	open, err = db.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers after unblock: %v", err)
+	}
+	if len(open) != 0 {
+		t.Fatalf("open incidents after unblockFixed = %d, want 0: %+v", len(open), open)
+	}
+	got, err := db.Watch(source.ID)
+	if err != nil {
+		t.Fatalf("Watch after unblock: %v", err)
+	}
+	if got.Status != domain.StatusWatching || got.Blocked != nil || got.BlockerID != "" {
+		t.Fatalf("source after unblock = status %q, blocked %v, blockerID %q; want watching/nil/empty",
+			got.Status, got.Blocked, got.BlockerID)
+	}
+	if len(gen.ids) != 1 || gen.ids[0] != source.ID {
+		t.Fatalf("rotated generations = %v, want [%s]", gen.ids, source.ID)
+	}
+
+	if n := b.verdictApplier.applyBlocked(ctx, got, obs, nextAt, "cycle-2"); n != 1 {
+		t.Fatalf("repeat applyBlocked updated %d watches, want 1", n)
+	}
+	open, err = db.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers after repeat: %v", err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("open incidents after repeat block = %d, want 1", len(open))
+	}
+	if !open[0].CreatedAt.After(first.CreatedAt) {
+		t.Fatalf("repeat incident created at %v, want a fresh instance after %v",
+			open[0].CreatedAt, first.CreatedAt)
+	}
+	if len(waker.deliveries) != 2 {
+		t.Fatalf("wakes after repeat block = %d, want 2", len(waker.deliveries))
+	}
+}

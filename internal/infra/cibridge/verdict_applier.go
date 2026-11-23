@@ -731,6 +731,14 @@ func (b *verdictApplier) notifyOrchestratorTerminal(ctx context.Context, w domai
 	}, observe.Fields{"sessionID": session})
 }
 
+// blockerWakeDedup builds the wake dedup key for one incident instance. Incident
+// IDs are content-addressed by signature, so resolving an incident and blocking
+// again on the same signature reuses the ID. The creation instant separates the
+// fresh instance from the resolved one, so its wake is not dropped as a repeat.
+func blockerWakeDedup(incident domain.BlockerIncident) string {
+	return domain.ObligationKey("blocker:"+incident.ID, uint64(incident.CreatedAt.UnixNano()), "wake")
+}
+
 // applyBlocked records a failure already present on the base branch. It moves
 // the Watch to StatusBlocked/VerdictBlocked through BlockEvent, folds the
 // failed checks into a durable BlockerIncident and steers exactly one
@@ -758,7 +766,7 @@ func (b *verdictApplier) applyBlocked(ctx context.Context, w domain.Watch, obs c
 		if err != nil {
 			observe.ActorError("cibridge-blocker", next.ID, err)
 		} else {
-			dedup = domain.ObligationKey("blocker:"+incident.ID, 0, "wake")
+			dedup = blockerWakeDedup(incident)
 			if next.BlockerID != incident.ID {
 				next.BlockerID = incident.ID
 				if err := b.store.SaveWatch(next); err != nil {
@@ -943,7 +951,7 @@ func (b *verdictApplier) handleBlocked(ctx context.Context, w domain.Watch, cycl
 		if err != nil {
 			observe.ActorError("cibridge-blocker", w.ID, err)
 		} else {
-			dedup = domain.ObligationKey("blocker:"+incident.ID, 0, "wake")
+			dedup = blockerWakeDedup(incident)
 			if w.BlockerID != incident.ID {
 				w.BlockerID = incident.ID
 				if err := b.store.SaveWatch(w); err != nil {

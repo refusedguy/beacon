@@ -528,3 +528,49 @@ func TestResetControlPlaneState(t *testing.T) {
 		t.Errorf("repeated reset: %v", err)
 	}
 }
+
+// TestResolveBlockerThenReblockOpensFreshInstance pins the wake dedup premise.
+// Incident IDs are content-addressed by signature, so resolving an incident and
+// blocking on the same signature reuses the ID. The reopened instance must still
+// be distinguishable by its creation instant, which cibridge puts in the wake
+// dedup key.
+func TestResolveBlockerThenReblockOpensFreshInstance(t *testing.T) {
+	d := openControlPlaneTestDB(t)
+	firstAt := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	nextAt := firstAt.Add(time.Minute)
+
+	first, created, err := d.GetOrCreateOpenBlocker("org/repo", "main", []string{"build"}, "w1", firstAt)
+	if err != nil {
+		t.Fatalf("GetOrCreateOpenBlocker: %v", err)
+	}
+	if !created {
+		t.Fatal("first call created=false, want true")
+	}
+	if _, err := d.ResolveBlocker(first.ID, firstAt.Add(time.Second)); err != nil {
+		t.Fatalf("ResolveBlocker: %v", err)
+	}
+
+	again, created, err := d.GetOrCreateOpenBlocker("org/repo", "main", []string{"build"}, "w2", nextAt)
+	if err != nil {
+		t.Fatalf("second GetOrCreateOpenBlocker: %v", err)
+	}
+	if !created {
+		t.Fatal("reblock after resolve created=false, want a fresh incident")
+	}
+	if again.ID != first.ID {
+		t.Fatalf("reblock ID = %s, want content-addressed %s", again.ID, first.ID)
+	}
+	if again.Status != domain.BlockerStatusOpen || !again.ResolvedAt.IsZero() {
+		t.Fatalf("reblock incident = %+v, want open with no resolution", again)
+	}
+	if !again.CreatedAt.After(first.CreatedAt) {
+		t.Fatalf("reblock created at %v, want later than %v", again.CreatedAt, first.CreatedAt)
+	}
+	active, err := d.ActiveBlockers()
+	if err != nil {
+		t.Fatalf("ActiveBlockers: %v", err)
+	}
+	if len(active) != 1 || active[0].ID != first.ID {
+		t.Fatalf("ActiveBlockers = %+v, want the reopened incident", active)
+	}
+}
