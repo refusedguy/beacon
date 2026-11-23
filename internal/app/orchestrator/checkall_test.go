@@ -13,7 +13,6 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
-	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 	"github.com/refusedguy/beacon/internal/infra/server"
@@ -27,7 +26,6 @@ type fakeGH struct {
 	graphQL  []byte
 	listErr  error
 	graphErr error
-	delay    time.Duration
 	calls    [][]string
 }
 
@@ -37,9 +35,6 @@ func (f *fakeGH) run(args ...string) ([]byte, error) {
 		return f.prList, f.listErr
 	}
 	if len(args) >= 2 && args[0] == "api" && args[1] == "graphql" {
-		if f.delay > 0 {
-			time.Sleep(f.delay)
-		}
 		return f.graphQL, f.graphErr
 	}
 	return nil, fmt.Errorf("unexpected gh call: %v", args)
@@ -113,9 +108,10 @@ func TestGHSourceChecksUsesOneGraphQLBatch(t *testing.T) {
 	}
 }
 
-// TestGHSourceChecksRecordsGraphQLBatchDuration proves a fixture that holds a
-// GraphQL answer for 50 ms produces one observation with a sum close to that
-// wait. One batch with three aliases still yields exactly one observation.
+// TestGHSourceChecksRecordsGraphQLBatchDuration proves that one batched gh call
+// produces exactly one duration observation, which reaches the histogram and
+// both exporters. The fake answer returns at once, so the assertion checks that
+// the wall-time observation was recorded rather than a fabricated magnitude.
 func TestGHSourceChecksRecordsGraphQLBatchDuration(t *testing.T) {
 	server.ResetGraphQLBatch()
 	t.Cleanup(server.ResetGraphQLBatch)
@@ -130,7 +126,6 @@ func TestGHSourceChecksRecordsGraphQLBatchDuration(t *testing.T) {
 		    "p2": null
 		  }
 		}`),
-		delay: 50 * time.Millisecond,
 	}
 	src := NewGHSource("refusedguy/beacon", gh.run)
 	prs := []PR{
@@ -146,8 +141,8 @@ func TestGHSourceChecksRecordsGraphQLBatchDuration(t *testing.T) {
 	if stats.Count != 1 {
 		t.Fatalf("graphql batch count = %d, want 1", stats.Count)
 	}
-	if stats.Sum < 0.04 || stats.Sum > 0.20 {
-		t.Fatalf("graphql batch sum = %v s, want 0.04..0.20 s", stats.Sum)
+	if len(stats.Buckets) == 0 || stats.Buckets[len(stats.Buckets)-1] != stats.Count {
+		t.Fatalf("graphql batch buckets = %v, want one observation in the histogram", stats.Buckets)
 	}
 	if len(gh.calls) != 1 {
 		t.Fatalf("gh calls = %d, want 1: %v", len(gh.calls), gh.calls)

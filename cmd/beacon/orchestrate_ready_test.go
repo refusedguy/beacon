@@ -91,10 +91,12 @@ func TestAdmissionLockWaitReadyCanceledStartsNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var started atomic.Int32
 
+	readyEntered := make(chan struct{})
 	action := dispatchAction{
 		Card:             "DELAYED",
 		SupportsParallel: true,
 		WaitReady: func(ctx context.Context) error {
+			close(readyEntered)
 			<-ctx.Done()
 			return ctx.Err()
 		},
@@ -111,7 +113,13 @@ func TestAdmissionLockWaitReadyCanceledStartsNothing(t *testing.T) {
 		started.Add(1)
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	// Cancel only after the readiness wait has started. The signal proves the
+	// action reached WaitReady, so the test no longer guesses at a delay.
+	select {
+	case <-readyEntered:
+	case <-time.After(time.Second):
+		t.Fatal("readiness wait did not start")
+	}
 	cancel()
 	select {
 	case <-done:
