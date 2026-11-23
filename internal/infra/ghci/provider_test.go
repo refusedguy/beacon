@@ -259,3 +259,110 @@ func TestProviderRetryBudgetResetsOnSuccess(t *testing.T) {
 	failAt(5*time.Second, false)  // count 2 after reset, still under budget
 	failAt(10*time.Second, true)  // count 3 reaches the budget
 }
+
+func TestIsRetryableGH(t *testing.T) {
+	cases := map[string]bool{
+		"gh: 401 Bad credentials":              false,
+		"gh: 403 Resource not accessible":      false,
+		"gh: 404 Not Found":                    false,
+		"gh: invalid argument --repo":          false,
+		"gh pr view decode: unexpected end":    false,
+		"gh: tls handshake timeout":            true,
+		"gh: bad gateway (HTTP 502)":           true,
+		"gh: API rate limit exceeded":          true,
+		"gh pr view: gh: exit status 1":        true,
+		"gh pr view: gh: something unexpected": true,
+	}
+	for text, want := range cases {
+		if got := isRetryableGH(errors.New(text)); got != want {
+			t.Errorf("isRetryableGH(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+func TestPermanentGHErrorKeepsBackoffState(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	calls := 0
+	p := New(Config{
+		Now:        func() time.Time { return now },
+		Backoff:    time.Second,
+		MaxBackoff: time.Minute,
+		Run: func(context.Context, ...string) ([]byte, error) {
+			calls++
+			return nil, errors.New("gh: 401 Bad credentials (requires authentication)")
+		},
+	})
+
+	_, err := p.PRState(context.Background(), "o/r", 7)
+	if err == nil {
+		t.Fatal("PRState returned nil error for a permanent gh failure")
+	}
+	if !isPermanentError(err) {
+		t.Errorf("error %q was not classified as permanent", err)
+	}
+	e := p.entries["o/r#7"]
+	if e.consecutiveErrors != 0 {
+		t.Errorf("consecutiveErrors = %d, want 0", e.consecutiveErrors)
+	}
+	if e.backoff != 0 {
+		t.Errorf("backoff = %s, want 0", e.backoff)
+	}
+	if !e.nextAllowed.IsZero() {
+		t.Errorf("nextAllowed = %s, want zero", e.nextAllowed)
+	}
+	if calls != 1 {
+		t.Errorf("gh calls = %d, want 1", calls)
+	}
+}
+
+func TestTransientGHErrorStillBacksOff(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	p := New(Config{
+		Now:        func() time.Time { return now },
+		Backoff:    time.Second,
+		MaxBackoff: time.Minute,
+		Jitter:     func() time.Duration { return 0 },
+		Run: func(context.Context, ...string) ([]byte, error) {
+			return nil, errors.New("gh: exit status 1")
+		},
+	})
+
+	_, err := p.PRState(context.Background(), "o/r", 8)
+	if err == nil {
+		t.Fatal("PRState returned nil error for a transient gh failure")
+	}
+	if isPermanentError(err) {
+		t.Errorf("transient error %q was classified as permanent", err)
+	}
+	e := p.entries["o/r#8"]
+	if e.consecutiveErrors != 1 {
+		t.Errorf("consecutiveErrors = %d, want 1", e.consecutiveErrors)
+	}
+	if e.backoff != time.Second {
+		t.Errorf("backoff = %s, want 1s", e.backoff)
+	}
+	if want := now.Add(time.Second); !e.nextAllowed.Equal(want) {
+		t.Errorf("nextAllowed = %s, want %s", e.nextAllowed, want)
+	}
+}
+
+func TestConfiguredClassifierOverridesDefault(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	p := New(Config{
+		Now:     func() time.Time { return now },
+		Backoff: time.Second,
+		Run: func(context.Context, ...string) ([]byte, error) {
+			return nil, errors.New("gh: exit status 1")
+		},
+		Classify: func(error) bool { return false },
+	})
+
+	_, err := p.PRState(context.Background(), "o/r", 9)
+	if err == nil || !isPermanentError(err) {
+		t.Fatalf("custom classifier was not applied: err = %v", err)
+	}
+	e := p.entries["o/r#9"]
+	if e.consecutiveErrors != 0 || e.backoff != 0 || !e.nextAllowed.IsZero() {
+		t.Errorf("pacing state changed on a custom permanent error: %+v", e)
+	}
+}
