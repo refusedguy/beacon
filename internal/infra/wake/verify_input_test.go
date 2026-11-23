@@ -6,30 +6,6 @@ import (
 	"testing"
 )
 
-// fakeInputPaneCapture returns scripted pane snapshots. It never starts tmux.
-type fakeInputPaneCapture struct {
-	frames []string
-	err    error
-	calls  int
-	target string
-}
-
-func (f *fakeInputPaneCapture) Capture(ctx context.Context, target string) (string, error) {
-	f.calls++
-	f.target = target
-	if f.err != nil {
-		return "", f.err
-	}
-	i := f.calls - 1
-	if i >= len(f.frames) {
-		i = len(f.frames) - 1
-	}
-	if i < 0 {
-		return "", nil
-	}
-	return f.frames[i], nil
-}
-
 func TestVerifyInputBoxStates(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -106,7 +82,12 @@ func TestVerifyInputBoxStates(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			capture := &fakeInputPaneCapture{frames: []string{tc.frame}}
+			calls, target := 0, ""
+			capture := func(_ context.Context, pane string) (string, error) {
+				calls++
+				target = pane
+				return tc.frame, nil
+			}
 			got, err := VerifyInputBox(context.Background(), capture, "%42", tc.want)
 			if err != nil {
 				t.Fatalf("VerifyInputBox: %v", err)
@@ -114,8 +95,8 @@ func TestVerifyInputBoxStates(t *testing.T) {
 			if got != tc.state {
 				t.Fatalf("state = %q, want %q (frame %q)", got, tc.state, tc.frame)
 			}
-			if capture.calls != 1 || capture.target != "%42" {
-				t.Fatalf("capture calls = %d, target = %q; want 1 call on %q", capture.calls, capture.target, "%42")
+			if calls != 1 || target != "%42" {
+				t.Fatalf("capture calls = %d, target = %q; want 1 call on %q", calls, target, "%42")
 			}
 		})
 	}
@@ -123,7 +104,7 @@ func TestVerifyInputBoxStates(t *testing.T) {
 
 func TestVerifyInputBoxCaptureFailure(t *testing.T) {
 	boom := errors.New("pane gone")
-	capture := &fakeInputPaneCapture{err: boom}
+	capture := func(context.Context, string) (string, error) { return "", boom }
 
 	got, err := VerifyInputBox(context.Background(), capture, "%42", "")
 	if !errors.Is(err, boom) {
@@ -141,27 +122,5 @@ func TestVerifyInputBoxNilCapturer(t *testing.T) {
 	}
 	if got != InputNotReady {
 		t.Fatalf("state = %q, want %q", got, InputNotReady)
-	}
-}
-
-func TestPaneCaptureFuncAdapter(t *testing.T) {
-	called := false
-	capture := PaneCaptureFunc(func(ctx context.Context, target string) (string, error) {
-		called = true
-		if target != "%7" {
-			t.Fatalf("target = %q, want %%7", target)
-		}
-		return "> █\n", nil
-	})
-
-	got, err := VerifyInputBox(context.Background(), capture, "%7", "")
-	if err != nil {
-		t.Fatalf("VerifyInputBox: %v", err)
-	}
-	if !called {
-		t.Fatal("adapted capture function was not called")
-	}
-	if got != InputReady {
-		t.Fatalf("state = %q, want %q", got, InputReady)
 	}
 }

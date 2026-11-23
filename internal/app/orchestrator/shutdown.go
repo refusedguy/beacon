@@ -18,17 +18,12 @@ import (
 // for at most this long.
 const DefaultShutdownTimeout = 5 * time.Second
 
-// Drainer flushes pending work before the process exits. Both
-// observe.Shutdown and the OTLP exporter satisfy it.
-type Drainer interface {
-	Shutdown(context.Context) error
-}
-
 // BoundedShutdown runs drain under a deadline and returns nil only when the
-// drain is confirmed. A drain error or an expired deadline returns a
-// descriptive error so the caller can exit nonzero. The reason is logged once
-// through logger when it is not nil.
-func BoundedShutdown(logger *slog.Logger, timeout time.Duration, drain Drainer) error {
+// drain is confirmed. drain flushes pending work before the process exits;
+// both observe.Shutdown and the OTLP exporter supply it as a function. A drain
+// error or an expired deadline returns a descriptive error so the caller can
+// exit nonzero. The reason is logged once through logger when it is not nil.
+func BoundedShutdown(logger *slog.Logger, timeout time.Duration, drain func(context.Context) error) error {
 	if timeout <= 0 {
 		timeout = DefaultShutdownTimeout
 	}
@@ -36,7 +31,7 @@ func BoundedShutdown(logger *slog.Logger, timeout time.Duration, drain Drainer) 
 	defer cancel()
 
 	done := make(chan error, 1)
-	go func() { done <- drain.Shutdown(ctx) }()
+	go func() { done <- drain(ctx) }()
 
 	select {
 	case err := <-done:

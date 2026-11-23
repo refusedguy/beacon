@@ -8,27 +8,6 @@ import (
 	"unicode/utf8"
 )
 
-// PaneCapturer is the read-only port input verification needs. It returns the
-// visible text of one tmux pane. The tmux implementation belongs to the
-// pane-capture layer (CapturePane); callers adapt it with PaneCaptureFunc so
-// this file never issues capture-pane itself. Tests supply a fake.
-type PaneCapturer interface {
-	Capture(ctx context.Context, target string) (string, error)
-}
-
-// PaneCaptureFunc adapts a capture function to PaneCapturer. It lets a caller
-// wire the existing pane-capture layer without a second implementation:
-//
-//	PaneCaptureFunc(func(ctx context.Context, target string) (string, error) {
-//		return CapturePane(ctx, runner, target)
-//	})
-type PaneCaptureFunc func(ctx context.Context, target string) (string, error)
-
-// Capture implements PaneCapturer.
-func (f PaneCaptureFunc) Capture(ctx context.Context, target string) (string, error) {
-	return f(ctx, target)
-}
-
 // ErrNoPaneCapturer means verification was asked to run without a capturer.
 var ErrNoPaneCapturer = errors.New("wake: no pane capturer for input verification")
 
@@ -50,15 +29,17 @@ var inputCursorMarkers = [...]string{"▌", "█", "▏", "❚"}
 var inputPromptMarkers = [...]string{"❯", "›", "»", "⏵", "➜", ">"}
 
 // VerifyInputBox checks the target pane through capture and reports whether
-// its input box is ready. want is the exact text expected in the box; pass an
-// empty string to require an empty box, which is the state after Enter or a
-// clean prompt before typing. A non-empty want must match a whole word, so
-// "ship" is not accepted as part of "relationship".
-func VerifyInputBox(ctx context.Context, capture PaneCapturer, target, want string) (InputBoxState, error) {
+// its input box is ready. capture returns the visible text of one pane; the
+// tmux implementation belongs to the pane-capture layer (CapturePane), so this
+// file never issues capture-pane itself. want is the exact text expected in the
+// box; pass an empty string to require an empty box, which is the state after
+// Enter or a clean prompt before typing. A non-empty want must match a whole
+// word, so "ship" is not accepted as part of "relationship".
+func VerifyInputBox(ctx context.Context, capture func(context.Context, string) (string, error), target, want string) (InputBoxState, error) {
 	if capture == nil {
 		return InputNotReady, ErrNoPaneCapturer
 	}
-	frame, err := capture.Capture(ctx, target)
+	frame, err := capture(ctx, target)
 	if err != nil {
 		return InputNotReady, err
 	}

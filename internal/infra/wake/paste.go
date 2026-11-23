@@ -35,20 +35,15 @@ type PasteSender interface {
 	Submit(ctx context.Context, target string) error
 }
 
-// PastePaneGuard confirms that target still refers to the pane a buffer was
-// prepared for. A changed pane returns false with a nil error. The pane layer
-// that owns pane identity supplies this seam; wake only asks the question.
-type PastePaneGuard interface {
-	PaneMatches(ctx context.Context, target, paneID string) (bool, error)
-}
-
 // PasteInserter performs a two-step insertion: load the buffer, wait, then
 // send Enter as a separate action. Keeping the two steps apart means the
 // submit step has no text to add and a pane swap stops the insertion before
-// any text is written.
+// any text is written. Guard confirms that target still refers to the pane a
+// buffer was prepared for; a changed pane returns false with a nil error. The
+// pane layer that owns pane identity supplies it; wake only asks the question.
 type PasteInserter struct {
 	Sender PasteSender
-	Guard  PastePaneGuard
+	Guard  func(ctx context.Context, target, paneID string) (bool, error)
 	// Delay waits between the buffer write and Enter. Tests inject a no-op;
 	// production uses PasteSubmitDelay. A nil Delay uses the default.
 	Delay func(ctx context.Context) error
@@ -56,7 +51,7 @@ type PasteInserter struct {
 
 // NewPasteInserter builds an inserter over the given transport and guard. The
 // guard may be nil when no pane layer is present yet.
-func NewPasteInserter(sender PasteSender, guard PastePaneGuard) *PasteInserter {
+func NewPasteInserter(sender PasteSender, guard func(context.Context, string, string) (bool, error)) *PasteInserter {
 	return &PasteInserter{Sender: sender, Guard: guard}
 }
 
@@ -72,7 +67,7 @@ func (p *PasteInserter) InsertTwoStep(ctx context.Context, target, paneID, text 
 		return ErrPasteNoSender
 	}
 	if p.Guard != nil {
-		match, err := p.Guard.PaneMatches(ctx, target, paneID)
+		match, err := p.Guard(ctx, target, paneID)
 		if err != nil {
 			return fmt.Errorf("wake: check pane %s on %s: %w", paneID, target, err)
 		}

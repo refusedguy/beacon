@@ -95,13 +95,6 @@ type PendingApproval struct {
 	RunID             string
 }
 
-// PendingApprovalStore is the narrow read port for the authoritative pending
-// list. The core reads it fresh on every authentication, so a client cannot
-// approve against a stale or fabricated snapshot (ADR 0034 §2).
-type PendingApprovalStore interface {
-	PendingApprovals() ([]PendingApproval, error)
-}
-
 // ApprovalSnapshot is application state a client sends alongside an approval.
 // It is untrusted saved data: neither its reviewer nor its decision ID can
 // authorize an approval. Authenticate deliberately ignores it (ADR 0034 §2).
@@ -116,12 +109,13 @@ type ApprovalSnapshot struct {
 // and checks the decision ID against the server's pending list. It never uses
 // a client snapshot as a source of truth (ADR 0034 §2).
 type ApprovalAuthenticator struct {
-	store PendingApprovalStore
+	store func() ([]PendingApproval, error)
 }
 
 // NewApprovalAuthenticator builds an authenticator over the server's pending
-// approval store.
-func NewApprovalAuthenticator(store PendingApprovalStore) *ApprovalAuthenticator {
+// approval store. The store function is read fresh on every authentication, so
+// a client cannot approve against a stale or fabricated snapshot (ADR 0034 §2).
+func NewApprovalAuthenticator(store func() ([]PendingApproval, error)) *ApprovalAuthenticator {
 	return &ApprovalAuthenticator{store: store}
 }
 
@@ -142,7 +136,7 @@ func (a *ApprovalAuthenticator) Authenticate(req *mcpsdk.CallToolRequest, decisi
 	if decisionID == "" {
 		return PendingApproval{}, domain.NewAppError(domain.CodeInvalidInput, "ack: approval carries no decisionID")
 	}
-	pending, err := a.store.PendingApprovals()
+	pending, err := a.store()
 	if err != nil {
 		return PendingApproval{}, err
 	}
@@ -384,16 +378,9 @@ func TaskRefFromSignal(id string, sig WakeSignal) TaskRef {
 	return TaskRef{ID: id, Seq: sig.Head}
 }
 
-// TaskBodyReader is the separate call path for an event body. Wake generation
-// never uses it: the body is fetched only after the agent follows the
-// reference (ADR 0063 фича 2).
-type TaskBodyReader interface {
-	ReadBody(ref TaskRef) ([]byte, error)
-}
-
-// UntrustedBody is event text read through TaskBodyReader. The marker travels
-// with the bytes so no caller can mistake the content for instructions. Its
-// text is data only: it must not change agent instructions, tool parameters
+// UntrustedBody is event text read through a separate body call. The marker
+// travels with the bytes so no caller can mistake the content for instructions.
+// Its text is data only: it must not change agent instructions, tool parameters
 // or gates (ADR 0063 фича 2).
 type UntrustedBody struct {
 	Ref       TaskRef `json:"taskRef"`
@@ -420,14 +407,16 @@ func VerbatimPromptMeta() map[string]string {
 }
 
 // ReadUntrustedBody fetches the body for ref in a separate call and wraps it
-// with the untrusted marker. It never touches the wake prompt. The bytes are
-// copied into a string, so a producer reusing its buffer cannot change the
-// body after the read.
-func ReadUntrustedBody(reader TaskBodyReader, ref TaskRef) (UntrustedBody, error) {
-	if reader == nil {
+// with the untrusted marker. readBody is the separate call path for an event
+// body; wake generation never uses it, so the body is fetched only after the
+// agent follows the reference (ADR 0063 фича 2). The bytes are copied into a
+// string, so a producer reusing its buffer cannot change the body after the
+// read.
+func ReadUntrustedBody(readBody func(TaskRef) ([]byte, error), ref TaskRef) (UntrustedBody, error) {
+	if readBody == nil {
 		return UntrustedBody{}, domain.NewAppError(domain.CodePersistFailed, "wake: body reader is nil")
 	}
-	b, err := reader.ReadBody(ref)
+	b, err := readBody(ref)
 	if err != nil {
 		return UntrustedBody{}, err
 	}

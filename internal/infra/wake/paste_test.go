@@ -38,20 +38,7 @@ func (f *pasteFakeSender) Submit(_ context.Context, target string) error {
 	return f.subErr
 }
 
-type pasteFakeGuard struct {
-	matches bool
-	err     error
-	checks  int
-	seen    []string
-}
-
-func (g *pasteFakeGuard) PaneMatches(_ context.Context, _, paneID string) (bool, error) {
-	g.checks++
-	g.seen = append(g.seen, paneID)
-	return g.matches, g.err
-}
-
-func pasteTestInserter(sender PasteSender, guard PastePaneGuard) *PasteInserter {
+func pasteTestInserter(sender PasteSender, guard func(context.Context, string, string) (bool, error)) *PasteInserter {
 	p := NewPasteInserter(sender, guard)
 	p.Delay = func(context.Context) error { return nil }
 	return p
@@ -144,7 +131,12 @@ func TestInsertTwoStepMultilineTextStaysInBuffer(t *testing.T) {
 
 func TestInsertTwoStepPaneChangedWritesNothing(t *testing.T) {
 	sender := &pasteFakeSender{}
-	guard := &pasteFakeGuard{matches: false}
+	checks, seen := 0, []string(nil)
+	guard := func(_ context.Context, _, paneID string) (bool, error) {
+		checks++
+		seen = append(seen, paneID)
+		return false, nil
+	}
 	p := pasteTestInserter(sender, guard)
 
 	err := p.InsertTwoStep(context.Background(), "pane-1", "ses_new", "hello")
@@ -157,15 +149,15 @@ func TestInsertTwoStepPaneChangedWritesNothing(t *testing.T) {
 	if len(sender.submits) != 0 {
 		t.Fatalf("pane changed but Enter was sent: %v", sender.submits)
 	}
-	if guard.checks != 1 || !reflect.DeepEqual(guard.seen, []string{"ses_new"}) {
-		t.Fatalf("guard checks = %d, seen = %v", guard.checks, guard.seen)
+	if checks != 1 || !reflect.DeepEqual(seen, []string{"ses_new"}) {
+		t.Fatalf("guard checks = %d, seen = %v", checks, seen)
 	}
 }
 
 func TestInsertTwoStepGuardErrorWritesNothing(t *testing.T) {
 	wantErr := errors.New("pane layer down")
 	sender := &pasteFakeSender{}
-	p := pasteTestInserter(sender, &pasteFakeGuard{err: wantErr})
+	p := pasteTestInserter(sender, func(context.Context, string, string) (bool, error) { return false, wantErr })
 
 	err := p.InsertTwoStep(context.Background(), "pane-1", "ses_1", "hello")
 	if !errors.Is(err, wantErr) {

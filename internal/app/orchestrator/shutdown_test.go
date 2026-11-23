@@ -10,22 +10,16 @@ import (
 	"time"
 )
 
-type stubDrainer struct {
-	fn func(context.Context) error
-}
-
-func (s stubDrainer) Shutdown(ctx context.Context) error { return s.fn(ctx) }
-
 func testLogger(buf *bytes.Buffer) *slog.Logger {
 	return slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 func TestBoundedShutdownConfirmedDrainPassesDeadline(t *testing.T) {
 	var seen context.Context
-	drain := stubDrainer{fn: func(ctx context.Context) error {
+	drain := func(ctx context.Context) error {
 		seen = ctx
 		return nil
-	}}
+	}
 
 	if err := BoundedShutdown(nil, time.Second, drain); err != nil {
 		t.Fatalf("подтверждённый дренаж вернул ошибку: %v", err)
@@ -41,7 +35,7 @@ func TestBoundedShutdownConfirmedDrainPassesDeadline(t *testing.T) {
 func TestBoundedShutdownDrainErrorFailsWithReason(t *testing.T) {
 	want := errors.New("collector down")
 	var buf bytes.Buffer
-	drain := stubDrainer{fn: func(context.Context) error { return want }}
+	drain := func(context.Context) error { return want }
 
 	err := BoundedShutdown(testLogger(&buf), time.Second, drain)
 	if !errors.Is(err, want) {
@@ -54,10 +48,10 @@ func TestBoundedShutdownDrainErrorFailsWithReason(t *testing.T) {
 
 func TestBoundedShutdownTimeoutFailsWithReason(t *testing.T) {
 	var buf bytes.Buffer
-	drain := stubDrainer{fn: func(ctx context.Context) error {
+	drain := func(ctx context.Context) error {
 		<-ctx.Done()
 		return ctx.Err()
-	}}
+	}
 
 	start := time.Now()
 	err := BoundedShutdown(testLogger(&buf), 30*time.Millisecond, drain)
@@ -78,10 +72,10 @@ func TestBoundedShutdownTimeoutFailsWithReason(t *testing.T) {
 
 func TestBoundedShutdownDefaultTimeoutWhenNonPositive(t *testing.T) {
 	var seen context.Context
-	drain := stubDrainer{fn: func(ctx context.Context) error {
+	drain := func(ctx context.Context) error {
 		seen = ctx
 		return nil
-	}}
+	}
 
 	if err := BoundedShutdown(nil, 0, drain); err != nil {
 		t.Fatalf("дренаж с таймаутом по умолчанию вернул ошибку: %v", err)

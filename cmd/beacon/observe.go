@@ -93,14 +93,10 @@ var metricsServerStart = func(port string, m *observe.Metrics) (func(), error) {
 
 // Shutdown seams. Tests shorten the deadline and install a fake collector so
 // an unconfirmed drain can be exercised without a real OTLP endpoint.
-type shutdownDrainFunc func(context.Context) error
-
-func (f shutdownDrainFunc) Shutdown(ctx context.Context) error { return f(ctx) }
-
 var (
-	shutdownTimeout time.Duration     = orchestrator.DefaultShutdownTimeout
-	shutdownDrain   shutdownDrainFunc = observe.Shutdown
-	osExit                            = os.Exit
+	shutdownTimeout time.Duration               = orchestrator.DefaultShutdownTimeout
+	shutdownDrain   func(context.Context) error = observe.Shutdown
+	osExit                                      = os.Exit
 )
 
 // startMetricsEndpoint serves the process metrics at /metrics on loopback for

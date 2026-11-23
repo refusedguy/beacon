@@ -136,18 +136,20 @@ func TestSessionIDFromRequestAbsentMetaDoesNotBreak(t *testing.T) {
 	}
 }
 
-// memPendingApprovalStore is the authoritative pending list the server holds.
-// calls records how many times the core read it, so a test can prove the read
-// happens on every authentication instead of trusting a cached value.
-type memPendingApprovalStore struct {
+// pendingCalls is the authoritative pending list a test supplies. calls records
+// how many times the core read it, so a test can prove the read happens on every
+// authentication instead of trusting a cached value.
+type pendingCalls struct {
 	pending []PendingApproval
 	err     error
 	calls   int
 }
 
-func (s *memPendingApprovalStore) PendingApprovals() ([]PendingApproval, error) {
-	s.calls++
-	return s.pending, s.err
+func pendingStore(s *pendingCalls) func() ([]PendingApproval, error) {
+	return func() ([]PendingApproval, error) {
+		s.calls++
+		return s.pending, s.err
+	}
 }
 
 func requestFromSession(sessionID string) *mcpsdk.CallToolRequest {
@@ -157,11 +159,11 @@ func requestFromSession(sessionID string) *mcpsdk.CallToolRequest {
 // TestAuthenticateApprovalAcceptsAuthorizedReviewer proves that the matching
 // reviewer and decision ID return the pending record, including its RunID.
 func TestAuthenticateApprovalAcceptsAuthorizedReviewer(t *testing.T) {
-	store := &memPendingApprovalStore{pending: []PendingApproval{
+	store := &pendingCalls{pending: []PendingApproval{
 		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
 		{DecisionID: "d2", ReviewerSessionID: "bob", RunID: "run-2"},
 	}}
-	auth := NewApprovalAuthenticator(store)
+	auth := NewApprovalAuthenticator(pendingStore(store))
 
 	got, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{})
 	if err != nil {
@@ -179,10 +181,10 @@ func TestAuthenticateApprovalAcceptsAuthorizedReviewer(t *testing.T) {
 // approval from a session that is not authorized for the decision is rejected
 // and no pending approval is returned.
 func TestAuthenticateApprovalRejectsForeignReviewer(t *testing.T) {
-	store := &memPendingApprovalStore{pending: []PendingApproval{
+	store := &pendingCalls{pending: []PendingApproval{
 		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
 	}}
-	auth := NewApprovalAuthenticator(store)
+	auth := NewApprovalAuthenticator(pendingStore(store))
 
 	got, err := auth.Authenticate(requestFromSession("mallory"), "d1", ApprovalSnapshot{})
 	if err == nil {
@@ -197,10 +199,10 @@ func TestAuthenticateApprovalRejectsForeignReviewer(t *testing.T) {
 // TestAuthenticateApprovalRejectsUnknownDecisionID proves the decision ID is
 // checked against the pending list, not taken from the client at face value.
 func TestAuthenticateApprovalRejectsUnknownDecisionID(t *testing.T) {
-	store := &memPendingApprovalStore{pending: []PendingApproval{
+	store := &pendingCalls{pending: []PendingApproval{
 		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
 	}}
-	auth := NewApprovalAuthenticator(store)
+	auth := NewApprovalAuthenticator(pendingStore(store))
 
 	if _, err := auth.Authenticate(requestFromSession("alice"), "d-forbidden", ApprovalSnapshot{}); err == nil {
 		t.Error("an unknown decisionID was accepted")
@@ -214,10 +216,10 @@ func TestAuthenticateApprovalRejectsUnknownDecisionID(t *testing.T) {
 // decision, yet the real request session is foreign, so the approval is
 // rejected. The authoritative reviewer comes from the request _meta.
 func TestAuthenticateApprovalIgnoresClientSnapshot(t *testing.T) {
-	store := &memPendingApprovalStore{pending: []PendingApproval{
+	store := &pendingCalls{pending: []PendingApproval{
 		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
 	}}
-	auth := NewApprovalAuthenticator(store)
+	auth := NewApprovalAuthenticator(pendingStore(store))
 	forged := ApprovalSnapshot{ReviewerSessionID: "alice", DecisionID: "d1", RunID: "run-1"}
 
 	if _, err := auth.Authenticate(requestFromSession("mallory"), "d1", forged); err == nil {
@@ -230,10 +232,10 @@ func TestAuthenticateApprovalIgnoresClientSnapshot(t *testing.T) {
 // TestAuthenticateApprovalRequiresReviewerAndDecisionID covers missing
 // authoritative inputs before any pending lookup can succeed.
 func TestAuthenticateApprovalRequiresReviewerAndDecisionID(t *testing.T) {
-	store := &memPendingApprovalStore{pending: []PendingApproval{
+	store := &pendingCalls{pending: []PendingApproval{
 		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
 	}}
-	auth := NewApprovalAuthenticator(store)
+	auth := NewApprovalAuthenticator(pendingStore(store))
 
 	if _, err := auth.Authenticate(nil, "d1", ApprovalSnapshot{}); err == nil {
 		t.Error("an approval with no reviewer sessionID was accepted")
@@ -251,7 +253,7 @@ func TestAuthenticateApprovalRequiresReviewerAndDecisionID(t *testing.T) {
 // instead of being mistaken for an absent decision.
 func TestAuthenticateApprovalStoreError(t *testing.T) {
 	want := errors.New("store unavailable")
-	auth := NewApprovalAuthenticator(&memPendingApprovalStore{err: want})
+	auth := NewApprovalAuthenticator(pendingStore(&pendingCalls{err: want}))
 
 	if _, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{}); !errors.Is(err, want) {
 		t.Errorf("Authenticate() error = %v, want the store error", err)
@@ -262,10 +264,10 @@ func TestAuthenticateApprovalStoreError(t *testing.T) {
 // read from the store each time, so a decision removed since the last call is
 // no longer approvable.
 func TestAuthenticateApprovalReadsPendingOnEveryCall(t *testing.T) {
-	store := &memPendingApprovalStore{pending: []PendingApproval{
+	store := &pendingCalls{pending: []PendingApproval{
 		{DecisionID: "d1", ReviewerSessionID: "alice", RunID: "run-1"},
 	}}
-	auth := NewApprovalAuthenticator(store)
+	auth := NewApprovalAuthenticator(pendingStore(store))
 
 	if _, err := auth.Authenticate(requestFromSession("alice"), "d1", ApprovalSnapshot{}); err != nil {
 		t.Fatalf("first Authenticate() error = %v", err)
@@ -575,42 +577,45 @@ func TestWakeReferenceComesFromSignalHead(t *testing.T) {
 	}
 }
 
-// countingBodyReader records the separate body read so a test can prove the
-// wake is built without touching the body.
-type countingBodyReader struct {
+// bodyReadState records the separate body read so a test can prove the wake is
+// built without touching the body.
+type bodyReadState struct {
 	calls int
 	ref   TaskRef
 	body  []byte
 	err   error
 }
 
-func (r *countingBodyReader) ReadBody(ref TaskRef) ([]byte, error) {
-	r.calls++
-	r.ref = ref
-	return r.body, r.err
+func bodyReader(s *bodyReadState) func(TaskRef) ([]byte, error) {
+	return func(ref TaskRef) ([]byte, error) {
+		s.calls++
+		s.ref = ref
+		return s.body, s.err
+	}
 }
 
 // TestBodyIsReadBySeparateCall is the acceptance check that wake generation
 // and body reading are two different calls: building the prompt reads nothing,
 // and only the later read asks the store for the body.
 func TestBodyIsReadBySeparateCall(t *testing.T) {
-	reader := &countingBodyReader{body: []byte("event body")}
+	state := &bodyReadState{body: []byte("event body")}
+	reader := bodyReader(state)
 	ref := TaskRef{ID: "task-2", Seq: 4}
 
 	prompt, err := NewWakePrompt(ref)
 	if err != nil {
 		t.Fatalf("NewWakePrompt: %v", err)
 	}
-	if reader.calls != 0 {
-		t.Fatalf("body read %d times while building the wake, want 0", reader.calls)
+	if state.calls != 0 {
+		t.Fatalf("body read %d times while building the wake, want 0", state.calls)
 	}
 
 	body, err := ReadUntrustedBody(reader, prompt.Ref)
 	if err != nil {
 		t.Fatalf("ReadUntrustedBody: %v", err)
 	}
-	if reader.calls != 1 || reader.ref != ref {
-		t.Errorf("body read calls = %d, last ref = %+v, want 1 call for %+v", reader.calls, reader.ref, ref)
+	if state.calls != 1 || state.ref != ref {
+		t.Errorf("body read calls = %d, last ref = %+v, want 1 call for %+v", state.calls, state.ref, ref)
 	}
 	if body.Text != "event body" {
 		t.Errorf("body text = %q, want %q", body.Text, "event body")
@@ -622,7 +627,7 @@ func TestBodyIsReadBySeparateCall(t *testing.T) {
 func TestUntrustedBodyIsMarkedAndCopied(t *testing.T) {
 	buf := []byte("original body")
 	ref := TaskRef{ID: "task-3", Seq: 2}
-	body, err := ReadUntrustedBody(&countingBodyReader{body: buf}, ref)
+	body, err := ReadUntrustedBody(bodyReader(&bodyReadState{body: buf}), ref)
 	if err != nil {
 		t.Fatalf("ReadUntrustedBody: %v", err)
 	}
@@ -653,7 +658,7 @@ func TestReadUntrustedBodyPropagatesErrors(t *testing.T) {
 	}
 
 	want := errors.New("store unavailable")
-	if _, err := ReadUntrustedBody(&countingBodyReader{err: want}, ref); !errors.Is(err, want) {
+	if _, err := ReadUntrustedBody(bodyReader(&bodyReadState{err: want}), ref); !errors.Is(err, want) {
 		t.Errorf("ReadUntrustedBody error = %v, want the reader error", err)
 	}
 }
@@ -666,14 +671,14 @@ func TestJournalBodyReaderReadsReferencedRecord(t *testing.T) {
 	sigTwo := bus.Publish([]byte("second body"))
 	reader := NewJournalBodyReader(bus)
 
-	one, err := ReadUntrustedBody(reader, TaskRefFromSignal("t", sigOne))
+	one, err := ReadUntrustedBody(reader.ReadBody, TaskRefFromSignal("t", sigOne))
 	if err != nil {
 		t.Fatalf("read first body: %v", err)
 	}
 	if one.Text != "first body" {
 		t.Errorf("first body = %q, want %q", one.Text, "first body")
 	}
-	two, err := ReadUntrustedBody(reader, TaskRefFromSignal("t", sigTwo))
+	two, err := ReadUntrustedBody(reader.ReadBody, TaskRefFromSignal("t", sigTwo))
 	if err != nil {
 		t.Fatalf("read second body: %v", err)
 	}
