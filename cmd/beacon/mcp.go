@@ -1620,15 +1620,9 @@ const pollerLockName = "beacon-poller.lock"
 // directly (ADR 0005).
 var pollerLockOpen = os.OpenFile
 
-// pollerProcessAlive checks a PID with signal 0. It is a seam so tests can
-// simulate a dead owner without spawning a real process.
-var pollerProcessAlive = func(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
+// pollerProcessAlive is a seam so tests can simulate a dead owner without
+// spawning a real process. Production uses the shared domain check (ATX-14).
+var pollerProcessAlive = domain.ProcessAlive
 
 // readPollerPID returns the PID stored in the lock file. A missing file has no
 // owner. A malformed or non-positive body is a stale lock, so it reports zero

@@ -5,13 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -314,18 +312,10 @@ const (
 // It is a variable so tests can freeze time; production uses time.Now.
 var currentTime = time.Now
 
-// processAlive checks one recorded PID with signal 0. The kernel reports
-// whether the process exists without delivering a signal, so this neither
-// enumerates processes nor starts ps (ADR 0036 §4). EPERM still means the
-// process is alive but owned by another user. The variable is replaceable in
-// tests; production uses the same syscall the taskstore lock uses.
-var processAlive = func(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
-}
+// processAlive is a replaceable probe for one recorded PID. Production uses
+// the shared domain check; tests replace the variable to simulate a dead owner
+// without spawning a real process (ADR 0036 §4, ATX-14).
+var processAlive = domain.ProcessAlive
 
 // parseProcStatStartTime extracts field 22 (starttime, in clock ticks) from the
 // contents of /proc/<pid>/stat. Field 2 (comm) is parenthesized and may itself

@@ -19,6 +19,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/domain"
 )
 
 const (
@@ -153,14 +155,9 @@ func anotherInstanceError(stateDir string) error {
 }
 
 // processAlive reports whether pid names a process that currently exists.
-// Signal 0 performs no signal delivery, only the existence check. EPERM means
-// the process exists but belongs to another user, which still counts as alive.
+// It delegates to the shared domain check (ADR 0036 §4, ATX-14).
 func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return domain.ProcessAlive(pid)
 }
 
 const (

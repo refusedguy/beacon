@@ -304,14 +304,10 @@ func ReadServicePID() int {
 	return cfg.PID
 }
 
-// ProcessAlive mirrors the signal-0 check used elsewhere in Beacon: EPERM
-// still means the process exists, only another user owns it.
+// ProcessAlive reports whether pid names a process that currently exists.
+// It delegates to the shared domain check (ADR 0036 §4, ATX-14).
 func ProcessAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return domain.ProcessAlive(pid)
 }
 
 // TerminateServe asks a server to stop. GC uses SIGTERM so the process can
