@@ -1,13 +1,13 @@
 # CBX-01. Пересчёт заблокированности после коммита для гонок двух снятий блокировщика
 
-Статус: todo
+Статус: done
 Фаза: P1
 Тип: task
 Владелец файлов: internal/app/taskcli/service.go, internal/infra/taskstore/edges.go, internal/app/taskcli/service_test.go
 Зависимости: 
 Ссылка: https://github.com/gastownhall/beads (коммит 78624109904655d7a4609f27d34eb0982cd8963f)
-Агент: нет
-Время: нет
+Агент: ses_df8ef6902ffejXXmuxOsjLQts1
+Время: 2026-11-23T06:22:57Z
 Baseline: beads: gastownhall/beads#6716, два закрытия карточек-братьев оставляли зависимую скрытой до ручного recompute; в beacon после закрытия карточки нет ни одного пересчёта dependent-карточек.
 
 Цель: Не давать зависимой карточке навсегда оставаться скрытой, когда два блокировщика сняты параллельно.
@@ -19,3 +19,7 @@ Baseline: beads: gastownhall/beads#6716, два закрытия карточе�
 Проверка: Измеримая. Два блокировщика B1 и B2 снимаются двумя параллельными вызовами закрытия; после возврата обоих вызовов dependent-карточка A имеет снятый флаг заблокированности, число карточек с устаревшим флагом равно нулю. Повторный пересчёт тех же ID не меняет файлы. Один вычисляемый recheck на 50 закрытий подряд даёт 50 записей в отчёте и ноль ошибок записи. При искусственной ошибке архива закрытие возвращает успех, а в логе ровно одна строка с ID A.
 
 Приёмка: AN-02 остаётся владельцем каскада разблокировки; карточка добавляет только post-commit recheck. Существующие nextAction и хуки не меняются.
+
+Причина: Код карточки влит в main через PR #1742 https://github.com/refusedguy/beacon/pull/1742, merge commit bfa4ada4c3a9cfb75844e64f8d5a014efd326148. Проверка git merge-base --is-ancestor bfa4ada4c3a9cfb75844e64f8d5a014efd326148 origin/main вернула exit 0. Коммит изменил все три OwnerFiles: internal/app/taskcli/service.go, internal/infra/taskstore/edges.go, internal/app/taskcli/service_test.go. Ложный claim без cardID в открытом PR #2264 (TCG-06, только internal/infra/store/db_test.go) снят.
+Закрыл: ses_df8ef6902ffejXXmuxOsjLQts1
+Время закрытия: 2026-11-23T06:34:52Z
