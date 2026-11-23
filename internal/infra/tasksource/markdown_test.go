@@ -256,6 +256,179 @@ func TestNormalizeStatus(t *testing.T) {
 	}
 }
 
+const epicCard = `---
+id: T-EPIC
+title: Big epic
+status: available
+kind: epic
+base_branch: main
+require_review: human
+scope:
+  - internal/app/
+depends: [T-BASE]
+priority: 5
+plan:
+  - title: Foo child
+    scope: [internal/app/foo.go]
+    depends: [T-BASE]
+    priority: 8
+  - title: Bar child
+    scope: internal/app/bar.go
+    priority: 3
+---
+# T-EPIC. Big epic
+Split this work.
+`
+
+func TestMarkdownFrontmatterEpic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-EPIC.md")
+	if err := os.WriteFile(path, []byte(epicCard), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewMarkdown(dir)
+
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	got := tasks[0]
+	if got.ID != "T-EPIC" || got.Kind != core.TaskKindEpic || got.BaseBranch != "main" ||
+		got.RequireReview != core.ReviewModeHuman {
+		t.Fatalf("epic fields = %+v", got)
+	}
+	if len(got.Plan) != 2 {
+		t.Fatalf("plan = %+v", got.Plan)
+	}
+	if got.Plan[0].Title != "Foo child" || got.Plan[0].Priority != 8 ||
+		len(got.Plan[0].Scope) != 1 || got.Plan[0].Scope[0] != "f:internal/app/foo.go" ||
+		len(got.Plan[0].Depends) != 1 || got.Plan[0].Depends[0] != "T-BASE" {
+		t.Fatalf("first plan entry = %+v", got.Plan[0])
+	}
+	if got.Plan[1].Title != "Bar child" || got.Plan[1].Priority != 3 {
+		t.Fatalf("second plan entry = %+v", got.Plan[1])
+	}
+
+	children, err := s.Children(context.Background(), "T-EPIC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 2 || children[0].ID != "T-EPIC-01" || children[1].ID != "T-EPIC-02" {
+		t.Fatalf("children = %+v", children)
+	}
+	if children[0].Title != "Foo child" || children[0].Priority != 8 || children[0].Kind != core.TaskKindTask {
+		t.Fatalf("first child = %+v", children[0])
+	}
+}
+
+func TestMarkdownCreateEpic(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "docs", "tasks")
+	s := NewMarkdown(dir)
+	task := core.Task{
+		ID:            "T-EPIC-2",
+		Title:         "Create epic",
+		Body:          "Epic body.",
+		Kind:          core.TaskKindEpic,
+		BaseBranch:    "main",
+		RequireReview: core.ReviewModeNone,
+		Plan: []core.ChildSpec{{
+			Title:    "Child one",
+			Scope:    []core.ScopePath{core.ScopeFile("internal/app/create.go")},
+			Depends:  []core.TaskID{"T-BASE"},
+			Priority: 6,
+		}},
+	}
+
+	created, err := s.Create(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(dir, "T-EPIC-2.md")
+	if created.SourceRef != wantPath {
+		t.Fatalf("SourceRef = %q", created.SourceRef)
+	}
+	b, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"kind: epic", "base_branch: main", "require_review: none", "title: Child one", "priority: 6", "internal/app/create.go"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("card missing %q:\n%s", want, b)
+		}
+	}
+
+	tasks, err := s.ListAvailable(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("tasks = %+v", tasks)
+	}
+	got := tasks[0]
+	if got.Kind != core.TaskKindEpic || got.BaseBranch != "main" || got.RequireReview != core.ReviewModeNone {
+		t.Fatalf("round-trip epic fields = %+v", got)
+	}
+	if len(got.Plan) != 1 || got.Plan[0].Title != "Child one" || got.Plan[0].Priority != 6 ||
+		len(got.Plan[0].Scope) != 1 || got.Plan[0].Scope[0] != "f:internal/app/create.go" ||
+		len(got.Plan[0].Depends) != 1 || got.Plan[0].Depends[0] != "T-BASE" {
+		t.Fatalf("round-trip plan = %+v", got.Plan)
+	}
+	children, err := s.Children(context.Background(), "T-EPIC-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 1 || children[0].ID != "T-EPIC-2-01" || children[0].Title != "Child one" {
+		t.Fatalf("children = %+v", children)
+	}
+}
+
+type stubEpicParser struct {
+	calls int
+}
+
+func (p *stubEpicParser) Children(core.Task) []core.Task {
+	p.calls++
+	return []core.Task{{ID: "STUB-01"}}
+}
+
+func TestMarkdownChildrenUsesInjectedParser(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-EPIC.md")
+	if err := os.WriteFile(path, []byte(epicCard), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stub := &stubEpicParser{}
+	s := NewMarkdown(dir)
+	s.Parser = stub
+
+	children, err := s.Children(context.Background(), "T-EPIC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stub.calls != 1 || len(children) != 1 || children[0].ID != "STUB-01" {
+		t.Fatalf("calls = %d, children = %+v", stub.calls, children)
+	}
+}
+
+func TestMarkdownChildrenOfTaskIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "T-PLAIN.md")
+	card := "---\nid: T-PLAIN\ntitle: Plain task\nstatus: available\n---\n"
+	if err := os.WriteFile(path, []byte(card), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	children, err := NewMarkdown(dir).Children(context.Background(), "T-PLAIN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(children) != 0 {
+		t.Fatalf("children = %+v", children)
+	}
+}
+
 func TestScopeClassification(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "pkg"), 0o755); err != nil {

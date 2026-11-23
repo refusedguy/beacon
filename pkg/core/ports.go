@@ -10,6 +10,13 @@ type TaskSource interface {
 	Create(ctx context.Context, task Task) (Task, error)
 }
 
+// EpicParser decomposes an epic task into its child tasks. The default
+// implementation reads the epic's plan and assigns deterministic child IDs.
+// Another decomposition strategy can replace it without changing callers.
+type EpicParser interface {
+	Children(epic Task) []Task
+}
+
 type Workspace struct {
 	Path   string
 	Branch string

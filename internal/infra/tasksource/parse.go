@@ -36,20 +36,113 @@ func (l *stringList) UnmarshalYAML(node *yaml.Node) error {
 }
 
 type yamlFields struct {
-	ID         string     `yaml:"id"`
-	TaskID     string     `yaml:"task_id"`
-	Scope      stringList `yaml:"scope"`
-	OwnerFiles stringList `yaml:"owner_files"`
-	Depends    stringList `yaml:"depends"`
-	DependsOn  stringList `yaml:"depends_on"`
-	Priority   int        `yaml:"priority"`
+	ID            string     `yaml:"id"`
+	TaskID        string     `yaml:"task_id"`
+	Scope         stringList `yaml:"scope"`
+	OwnerFiles    stringList `yaml:"owner_files"`
+	Depends       stringList `yaml:"depends"`
+	DependsOn     stringList `yaml:"depends_on"`
+	Priority      int        `yaml:"priority"`
+	Kind          string     `yaml:"kind"`
+	BaseBranch    string     `yaml:"base_branch"`
+	RequireReview string     `yaml:"require_review"`
+	Plan          []planSpec `yaml:"plan"`
+}
+
+// planSpec is the wire shape of one child in an epic's plan array.
+type planSpec struct {
+	Title    string     `yaml:"title"`
+	Scope    stringList `yaml:"scope"`
+	Depends  stringList `yaml:"depends"`
+	Priority int        `yaml:"priority"`
+}
+
+// epicFields holds the epic-only frontmatter written by Markdown.Create.
+type epicFields struct {
+	Kind          string     `yaml:"kind,omitempty"`
+	BaseBranch    string     `yaml:"base_branch,omitempty"`
+	RequireReview string     `yaml:"require_review,omitempty"`
+	Plan          []planSpec `yaml:"plan,omitempty"`
 }
 
 type taskFields struct {
-	ID       string
-	Scope    []string
-	Depends  []string
-	Priority int
+	ID            string
+	Scope         []string
+	Depends       []string
+	Priority      int
+	Kind          core.TaskKind
+	BaseBranch    string
+	RequireReview core.ReviewMode
+	Plan          []core.ChildSpec
+}
+
+func childSpecs(specs []planSpec, dir string) []core.ChildSpec {
+	out := make([]core.ChildSpec, 0, len(specs))
+	for _, spec := range specs {
+		child := core.ChildSpec{Title: strings.TrimSpace(spec.Title), Priority: spec.Priority}
+		for _, p := range spec.Scope {
+			child.Scope = append(child.Scope, scopeForPath(p, dir))
+		}
+		for _, d := range spec.Depends {
+			if d = strings.TrimSpace(d); d != "" {
+				child.Depends = append(child.Depends, core.TaskID(d))
+			}
+		}
+		out = append(out, child)
+	}
+	return out
+}
+
+func planSpecs(specs []core.ChildSpec) []planSpec {
+	out := make([]planSpec, 0, len(specs))
+	for _, spec := range specs {
+		out = append(out, planSpec{
+			Title:    spec.Title,
+			Scope:    scopeValues(spec.Scope),
+			Depends:  dependencyValues(spec.Depends),
+			Priority: spec.Priority,
+		})
+	}
+	return out
+}
+
+func normalizeKind(s string) core.TaskKind {
+	if strings.EqualFold(strings.TrimSpace(s), "epic") {
+		return core.TaskKindEpic
+	}
+	return core.TaskKindTask
+}
+
+func normalizeReview(s string) core.ReviewMode {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "human", "manual":
+		return core.ReviewModeHuman
+	case "none", "off", "skip":
+		return core.ReviewModeNone
+	default:
+		return core.ReviewModeLLM
+	}
+}
+
+// PlanParser is the default core.EpicParser. It numbers children in plan order.
+type PlanParser struct{}
+
+var _ core.EpicParser = PlanParser{}
+
+func (PlanParser) Children(epic core.Task) []core.Task {
+	out := make([]core.Task, 0, len(epic.Plan))
+	for i, spec := range epic.Plan {
+		out = append(out, core.Task{
+			ID:        core.ChildTaskID(epic.ID, i+1),
+			Title:     strings.TrimSpace(spec.Title),
+			Scope:     spec.Scope,
+			DependsOn: spec.Depends,
+			Priority:  spec.Priority,
+			Status:    core.TaskAvailable,
+			Kind:      core.TaskKindTask,
+		})
+	}
+	return out
 }
 
 // ParseTaskFields reads a fenced YAML block and flat Scope/Depends/Priority lines.
@@ -64,6 +157,10 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			out.Depends = append(out.Depends, yf.Depends...)
 			out.Depends = append(out.Depends, yf.DependsOn...)
 			out.Priority = yf.Priority
+			out.Kind = normalizeKind(yf.Kind)
+			out.BaseBranch = strings.TrimSpace(yf.BaseBranch)
+			out.RequireReview = normalizeReview(yf.RequireReview)
+			out.Plan = childSpecs(yf.Plan, dir)
 		}
 	}
 	for _, line := range strings.Split(strings.ReplaceAll(body, "\r", ""), "\n") {
@@ -77,6 +174,12 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			if n, err := strconv.Atoi(afterColon(line)); err == nil {
 				out.Priority = n
 			}
+		case strings.HasPrefix(line, "Kind:"):
+			out.Kind = normalizeKind(afterColon(line))
+		case strings.HasPrefix(line, "BaseBranch:"), strings.HasPrefix(line, "Base branch:"):
+			out.BaseBranch = afterColon(line)
+		case strings.HasPrefix(line, "RequireReview:"):
+			out.RequireReview = normalizeReview(afterColon(line))
 		case strings.HasPrefix(line, "TaskID:"):
 			out.ID = afterColon(line)
 		}
@@ -88,7 +191,6 @@ func ParseTaskFields(body, dir, depPrefix string) taskFields {
 			out.Depends[i] = normalizeDep(d, depPrefix)
 		}
 	}
-	_ = dir
 	return out
 }
 
