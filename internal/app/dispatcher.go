@@ -32,7 +32,7 @@ type DispatchResult struct {
 
 type DispatchFailure struct {
 	TaskID core.TaskID
-	Err    error
+	Err    string
 }
 
 func newRunID() core.RunID {
@@ -104,7 +104,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		if budget > 0 {
 			if err := d.startOne(ctx, run, task); err != nil {
 				slog.Error("dispatch task", "task", task.ID, "error", err)
-				out.Failures = append(out.Failures, DispatchFailure{task.ID, err})
+				out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
 				_ = run.Apply(core.Event{Kind: core.EvCancel, Reason: err.Error()})
 				_ = d.Store.Save(ctx, run)
 				continue

@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -220,4 +222,79 @@ func TestDispatchReportsStructuredConflicts(t *testing.T) {
 	if !equalPaths(activeSkip.Overlap, []core.ScopePath{core.ScopeFile("docs/tasks/c.md")}) {
 		t.Errorf("active conflict overlap = %+v", activeSkip.Overlap)
 	}
+}
+
+type failingWorkspace struct {
+	*fakeWorkspace
+	err error
+}
+
+func (f failingWorkspace) Create(context.Context, core.Task) (core.Workspace, error) {
+	return core.Workspace{}, f.err
+}
+
+type failingHarness struct {
+	*fakeHarness
+	err error
+}
+
+func (f failingHarness) Spawn(context.Context, core.SpawnRequest) (core.Session, error) {
+	return core.Session{}, f.err
+}
+
+func assertFailureJSON(t *testing.T, failures []DispatchFailure, want string) {
+	t.Helper()
+	b, err := json.Marshal(failures)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0]["Err"] != want {
+		t.Fatalf("failure JSON = %s, want Err %q", b, want)
+	}
+}
+
+func TestDispatchFailureJSONIncludesWorkspaceConflict(t *testing.T) {
+	want := "workspace: conflict: refusing to remove dirty worktree /ws/T-CONFLICT"
+	store := newFakeStore()
+	d := &Dispatcher{
+		Source:  &fakeSource{tasks: []core.Task{{ID: "T-CONFLICT", Status: core.TaskAvailable}}},
+		Planner: NewPlanner(nil),
+		Workspace: failingWorkspace{
+			fakeWorkspace: &fakeWorkspace{},
+			err:           errors.New("conflict: refusing to remove dirty worktree /ws/T-CONFLICT"),
+		},
+		Harness:     &fakeHarness{},
+		Store:       store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFailureJSON(t, res.Failures, want)
+}
+
+func TestDispatchFailureJSONIncludesSpawnTimeout(t *testing.T) {
+	want := "spawn: Post http://127.0.0.1:7432/session: context deadline exceeded"
+	store := newFakeStore()
+	d := &Dispatcher{
+		Source:    &fakeSource{tasks: []core.Task{{ID: "T-SPAWN", Status: core.TaskAvailable}}},
+		Planner:   NewPlanner(nil),
+		Workspace: &fakeWorkspace{},
+		Harness: failingHarness{
+			fakeHarness: &fakeHarness{},
+			err:         errors.New("Post http://127.0.0.1:7432/session: context deadline exceeded"),
+		},
+		Store:       store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFailureJSON(t, res.Failures, want)
 }
