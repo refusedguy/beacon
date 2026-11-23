@@ -4,8 +4,9 @@
 // The candidate is derived from descriptor names and descriptions, so editing a
 // description changes the fingerprint. The command never writes to
 // internal/infra/mcp/contract_test.go: the hand-written golden stays an
-// independent witness. --write updates only the candidate fixture, and --check
-// compares against that fixture without writing anything.
+// independent witness. --emit writes the raw candidate to stdout so an owner
+// can redirect it into the fixture. --check compares against that fixture and
+// writes nothing.
 package main
 
 import (
@@ -247,14 +248,6 @@ func readFixture(root string) ([]byte, error) {
 	return fs.ReadFile(os.DirFS(root), filepath.FromSlash(fixtureRel))
 }
 
-func writeFixture(root string, data []byte) error {
-	path := filepath.Join(root, filepath.FromSlash(fixtureRel))
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0o644)
-}
-
 // compare reports a mismatch between a candidate and the committed fixture.
 // It never writes to either side.
 func compare(candidate, committed []byte) error {
@@ -298,11 +291,11 @@ func selfTest(root string) error {
 
 func run(args []string) int {
 	var root string
-	var checkMode, writeMode, printMode, testMode bool
+	var checkMode, emitMode, printMode, testMode bool
 	flags := flag.NewFlagSet("tools-list-dump", flag.ContinueOnError)
 	flags.StringVar(&root, "root", "", "repository root (auto-detected when empty)")
 	flags.BoolVar(&checkMode, "check", false, "compare the candidate with the committed fixture; never write")
-	flags.BoolVar(&writeMode, "write", false, "regenerate the candidate fixture only")
+	flags.BoolVar(&emitMode, "emit", false, "write the raw candidate to stdout for redirection into the fixture")
 	flags.BoolVar(&printMode, "print", false, "print the candidate size and SHA-256")
 	flags.BoolVar(&testMode, "self-test", false, "run the planted-discrepancy control")
 	if err := flags.Parse(args); err != nil {
@@ -333,12 +326,8 @@ func run(args []string) int {
 		}
 		fmt.Println("self-test passed: planted description changes the candidate and fails the check")
 		return green
-	case writeMode:
-		if err := writeFixture(root, candidate); err != nil {
-			fmt.Fprintf(os.Stderr, "tools-list-dump: write fixture: %v\n", err)
-			return broken
-		}
-		fmt.Printf("tools-list candidate fixture written: %d bytes sha256=%s\n", size, sha)
+	case emitMode:
+		fmt.Print(string(candidate))
 		return green
 	case checkMode:
 		committed, err := readFixture(root)
