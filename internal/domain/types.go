@@ -12,6 +12,14 @@ import (
 	"time"
 )
 
+// IsErr reports whether err wraps a value of type T. The IsXxx classifiers
+// share this one errors.As call. It lives in domain because the layer matrix
+// lets infra import domain but forbids app from importing domain (ADR 0005).
+func IsErr[T error](err error) bool {
+	var target T
+	return errors.As(err, &target)
+}
+
 // Status is the lifecycle state of a Watch.
 type Status string
 

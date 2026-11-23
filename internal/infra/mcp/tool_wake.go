@@ -1231,10 +1231,7 @@ const (
 
 // IsConfirmationRejected reports whether err is any transactional
 // confirmation rejection.
-func IsConfirmationRejected(err error) bool {
-	var rejection *ConfirmationError
-	return errors.As(err, &rejection)
-}
+func IsConfirmationRejected(err error) bool { return domain.IsErr[*ConfirmationError](err) }
 
 // IsConfirmationExpired reports whether err is the deadline rejection. The
 // state is set to expired by the same transaction that returns this error.

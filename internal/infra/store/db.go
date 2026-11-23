@@ -2408,10 +2408,7 @@ func (e *QueueFenceStaleError) Error() string {
 }
 
 // IsQueueFenceStale reports whether err is a stale queue-fence rejection.
-func IsQueueFenceStale(err error) bool {
-	var stale *QueueFenceStaleError
-	return errors.As(err, &stale)
-}
+func IsQueueFenceStale(err error) bool { return domain.IsErr[*QueueFenceStaleError](err) }
 
 func scanQueueTask(scanner interface{ Scan(...any) error }) (QueueTask, error) {
 	var t QueueTask

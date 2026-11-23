@@ -57,7 +57,6 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -174,10 +173,7 @@ func (e *StaleRevisionError) Error() string {
 }
 
 // IsStaleRevision reports whether err is a discarded stale-revision event.
-func IsStaleRevision(err error) bool {
-	var stale *StaleRevisionError
-	return errors.As(err, &stale)
-}
+func IsStaleRevision(err error) bool { return domain.IsErr[*StaleRevisionError](err) }
 
 // AckReceipt is the revision an ack was given at. ADR 0036 §5: the ack fixes
 // the task revision, and a later event carrying an older revision is dropped.
