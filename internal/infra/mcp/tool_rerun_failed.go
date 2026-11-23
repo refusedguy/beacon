@@ -19,6 +19,7 @@ import (
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/shared"
 )
 
 // RerunFailedToolName is the MCP name of the rerun tool.
@@ -159,13 +160,7 @@ func flakyFailedChecks(w domain.Watch) []FailedCheck {
 // filterFailedChecks keeps one named check from the eligible set. The caller
 // has already checked that the set holds only flaky-matched failures.
 func filterFailedChecks(in []FailedCheck, name string) []FailedCheck {
-	out := make([]FailedCheck, 0, 1)
-	for _, fc := range in {
-		if fc.Name == name {
-			out = append(out, fc)
-		}
-	}
-	return out
+	return shared.Filter(in, func(fc FailedCheck) bool { return fc.Name == name })
 }
 
 // rerunIdempotencyKey reuses the domain obligation key with a rerun namespace.

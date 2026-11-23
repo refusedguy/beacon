@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/shared"
 )
 
 // Snapshot is one CI observation of a pull request at a single instant. All
@@ -393,13 +395,9 @@ func requiredGate(name string, c Check, anyRequired bool) bool {
 // informational names are dropped.
 func realFailures(s Snapshot) []string {
 	out := make([]string, 0, len(s.Failures))
-	seen := make(map[string]bool, len(s.Failures))
 	anyRequired := hasRequiredCheck(s)
-	for _, name := range s.Failures {
-		if seen[name] {
-			continue
-		}
-		seen[name] = true
+	unique := shared.DistinctBy(s.Failures, func(name string) string { return name })
+	for _, name := range unique {
 		if NormalizeConclusion(name) == "SUCCESS" {
 			continue
 		}
@@ -563,32 +561,22 @@ type ConflictResult struct {
 	Message string       `json:"message,omitempty"`
 }
 
-// dedupInOrder returns the first occurrence of each normalized value in order.
-// norm rewrites a value before the membership test; keep drops unwanted values.
-func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
-	out := make([]T, 0, len(values))
-	seen := make(map[T]bool, len(values))
-	for _, v := range values {
-		v = norm(v)
-		if !keep(v) || seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	return out
-}
-
 // NewConflictResult builds a ConflictResult. Paths are trimmed, empty entries
 // and duplicates are dropped while keeping the caller's order. The Paths
 // slice is always non-nil so an empty conflict serializes as [] rather than
 // null.
 func NewConflictResult(typ ConflictType, paths []string, message string) ConflictResult {
-	return ConflictResult{
-		Type:    typ,
-		Paths:   dedupInOrder(paths, strings.TrimSpace, func(s string) bool { return s != "" }),
-		Message: message,
+	out := ConflictResult{Type: typ, Paths: []string{}}
+	trimmed := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			trimmed = append(trimmed, p)
+		}
 	}
+	out.Paths = shared.DistinctBy(trimmed, func(p string) string { return p })
+	out.Message = message
+	return out
 }
 
 // Empty reports whether c carries no conflict detail. A zero ConflictResult is

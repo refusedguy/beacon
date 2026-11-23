@@ -19,6 +19,7 @@ import (
 	"github.com/refusedguy/beacon/internal/app/session"
 	"github.com/refusedguy/beacon/internal/infra/opencode"
 	wtinfra "github.com/refusedguy/beacon/internal/infra/worktree"
+	"github.com/refusedguy/beacon/internal/shared"
 )
 
 // agentsServiceHint is printed when the background OpenCode service has not
@@ -273,15 +274,22 @@ func agentRowsFromAgents(agents []opencode.Agent) []agentRow {
 // agent string is the ID and the name so attention and stale matching keep
 // working the same way as with the legacy session.list path.
 func agentRowsFromSessions(sessions []opencode.Session) []agentRow {
-	seen := make(map[string]bool, len(sessions))
-	rows := make([]agentRow, 0, len(sessions))
+	agents := make([]string, 0, len(sessions))
 	for _, s := range sessions {
 		agent := strings.TrimSpace(s.Agent)
-		if agent == "" || seen[agent] {
-			continue
+		if agent != "" {
+			agents = append(agents, agent)
 		}
-		seen[agent] = true
-		rows = append(rows, agentRow{ID: agent, Name: agent})
+	}
+	return agentRowsFromNames(agents)
+}
+
+// agentRowsFromNames builds one row per distinct non-empty agent name.
+func agentRowsFromNames(names []string) []agentRow {
+	unique := shared.DistinctBy(names, func(name string) string { return name })
+	rows := make([]agentRow, 0, len(unique))
+	for _, name := range unique {
+		rows = append(rows, agentRow{ID: name, Name: name})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows
@@ -348,18 +356,14 @@ func parseAgentRowsFromSessions(raw []byte) ([]agentRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, len(sessions))
-	rows := make([]agentRow, 0, len(sessions))
+	agents := make([]string, 0, len(sessions))
 	for _, s := range sessions {
 		agent := strings.TrimSpace(s.Agent)
-		if agent == "" || seen[agent] {
-			continue
+		if agent != "" {
+			agents = append(agents, agent)
 		}
-		seen[agent] = true
-		rows = append(rows, agentRow{ID: agent, Name: agent})
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
-	return rows, nil
+	return agentRowsFromNames(agents), nil
 }
 
 // printAgentRows renders the filtered rows as a table or JSON.
