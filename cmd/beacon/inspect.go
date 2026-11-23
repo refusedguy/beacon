@@ -310,11 +310,11 @@ func renderInspectTable(w io.Writer, view inspectView) {
 		fmt.Fprintf(w, "RUNTIME_STATS %s\n", string(view.RuntimeStats))
 	}
 	if view.Ready != nil {
-		for _, e := range view.Ready {
+		for _, e := range view.Ready.Ready {
 			fmt.Fprintf(w, "READY %s resolved=%s pinned=%s open=%s\n",
 				e.ID, readyDepIDs(e.ResolvedBlockers), readyDepIDs(e.PinnedDependencies), readyDepIDs(e.OpenDependencies))
 		}
-		for _, e := range view.Blocked {
+		for _, e := range view.Ready.Blocked {
 			fmt.Fprintf(w, "BLOCKED %s resolved=%s pinned=%s open=%s\n",
 				e.ID, readyDepIDs(e.ResolvedBlockers), readyDepIDs(e.PinnedDependencies), readyDepIDs(e.OpenDependencies))
 		}

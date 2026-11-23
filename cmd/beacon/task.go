@@ -530,7 +530,7 @@ func buildReadyExplain(tasksDir string) (readyExplainView, error) {
 			dep := readyDep{
 				ID:     target.ID,
 				Type:   taskstore.GateKind(target),
-				Reason: taskstore.GateReason(taskstore.GateDescription(target)),
+				Reason: taskstore.GateReason(readyGateDescription(target)),
 			}
 			switch {
 			case whyClosed(target):
@@ -553,6 +553,18 @@ func buildReadyExplain(tasksDir string) (readyExplainView, error) {
 	sort.Slice(view.Ready, func(i, j int) bool { return view.Ready[i].ID < view.Ready[j].ID })
 	sort.Slice(view.Blocked, func(i, j int) bool { return view.Blocked[i].ID < view.Blocked[j].ID })
 	return view, nil
+}
+
+// readyGateDescription возвращает текст, из которого GateReason читает причину
+// гейта. Поле description в Extra имеет приоритет над Context, как и в движке
+// gated_by, поэтому оба пути видят одну причину.
+func readyGateDescription(c taskstore.Card) string {
+	if c.Extra != nil {
+		if v := strings.TrimSpace(c.Extra["description"]); v != "" {
+			return v
+		}
+	}
+	return c.Context
 }
 
 func sortReadyDeps(deps []readyDep) {
