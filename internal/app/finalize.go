@@ -48,7 +48,14 @@ func (r *Reconciler) cleanupRun(ctx context.Context, run *core.Run) error {
 		return nil
 	}
 	if !clean {
-		slog.Warn("worktree kept: uncommitted changes", "run", run.ID, "path", ws.Path)
+		if !run.State.Terminal() {
+			slog.Warn("worktree kept: uncommitted changes", "run", run.ID, "path", ws.Path)
+			return nil
+		}
+		slog.Info("force removing worktree of terminal run", "run", run.ID, "path", ws.Path)
+		if err := r.Workspace.ForceRemove(ctx, ws); err != nil {
+			slog.Error("force remove worktree", "run", run.ID, "error", err)
+		}
 		return nil
 	}
 	if err := r.Workspace.Remove(ctx, ws); err != nil {
