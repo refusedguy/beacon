@@ -10,8 +10,6 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-const maxExcerptRunes = 1200
-
 type Reconciler struct {
 	Store           core.RunStore
 	SCM             core.ScmGateway
@@ -69,6 +67,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 	case core.VerdictNeedsRebase:
 		if !r.AutoRebase {
 			return core.MergeDecision{Verdict: core.VerdictWait, Reason: "auto_rebase disabled"}, nil
+		}
+		if !obs.Conflict && len(obs.Checks) > 0 && obs.AllRequiredPass(nil) {
+			// Green checks mean the new base commits did not reach the PR scope.
+			return decision, nil
 		}
 		if sameObservation(run, obs) {
 			return decision, nil
@@ -264,8 +266,6 @@ func (r *Reconciler) notify(run *core.Run, subject, body string) error {
 	return r.Notifier.Notify(ctx, core.Notification{RunID: run.ID, Subject: subject, Body: compact(body)})
 }
 
-// notifyParent drops a quiet line in the orchestrator's session so it learns
-// the merge result without being woken. A missing parent or harness is fine.
 func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, state string) {
 	if run.ParentSessionID == "" || r.Harness == nil {
 		return
@@ -282,10 +282,10 @@ func (r *Reconciler) notifyParent(ctx context.Context, run *core.Run, pr int, st
 func compact(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\r", ""))
 	runes := []rune(s)
-	if len(runes) <= maxExcerptRunes {
+	if len(runes) <= 1200 {
 		return s
 	}
-	return string(runes[:maxExcerptRunes]) + "\n...[truncated]"
+	return string(runes[:1200]) + "\n...[truncated]"
 }
 
 // Run drains change events and polls. One failing PR never stops the loop.

@@ -37,6 +37,65 @@ func TestReconcileWaitingCIToAutoRebase(t *testing.T) {
 	}
 }
 
+func TestIndependentBaseChangeDoesNotConsumeRebaseAttempt(t *testing.T) {
+	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha1", BaseSHA: "base-new", PRState: "open", Behind: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+		})
+	run := store.runs["r1"]
+	run.Scope = []core.ScopePath{core.ScopeFile("internal/app/isolated.go")}
+	run.ObservedSHA = "sha1"
+	run.ObservedBaseSHA = "base-old"
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 4; i++ {
+		if _, err := r.Reconcile(context.Background(), 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if scm.rebases != 0 {
+		t.Fatalf("branch updates = %d, want 0", scm.rebases)
+	}
+	got := store.runs["r1"]
+	if got.RebaseAttempts != 0 {
+		t.Fatalf("RebaseAttempts = %d, want 0", got.RebaseAttempts)
+	}
+	if got.State != core.RunWaitingCI {
+		t.Fatalf("state = %s, want waiting_ci", got.State)
+	}
+}
+
+func TestRedPRWithNewBaseStillRebases(t *testing.T) {
+	r, _, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha1", BaseSHA: "base-new", PRState: "open", Behind: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckFailure}},
+		})
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if scm.rebases != 1 {
+		t.Fatalf("branch updates = %d, want 1", scm.rebases)
+	}
+}
+
+func TestConflictWithNeedsRebaseStillRebases(t *testing.T) {
+	r, _, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha1", BaseSHA: "base-new", PRState: "open", Behind: true, Conflict: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+		})
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if scm.rebases != 1 {
+		t.Fatalf("branch updates = %d, want 1", scm.rebases)
+	}
+}
+
 func TestReconcileWaitingCIToWakeAgent(t *testing.T) {
 	r, store, _, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", FailureExcerpt: "panic: boom"})
