@@ -1451,18 +1451,29 @@ type TaskOutputChunk struct {
 	NextOffset int    `json:"nextOffset"`
 }
 
-// BackgroundTask is one long-running task. Its output grows append-only, it can
-// be waited on up to a caller timeout, and its completion is broadcast once
+// maxBackgroundTaskOutputBytes bounds the bytes retained for one task. A chunk
+// that crosses the bound keeps the head and tail and replaces the middle with
+// an explicit marker, so the end of a log is never lost.
+const maxBackgroundTaskOutputBytes = 64 * 1024
+
+// backgroundOutputTruncatedMark is inserted where the middle of a bounded
+// output was dropped. It belongs to the retained stream and to NextOffset.
+const backgroundOutputTruncatedMark = "\n[beacon: output truncated]\n"
+
+// BackgroundTask is one long-running task. Its output is bounded, it can be
+// waited on up to a caller timeout, and its completion is broadcast once
 // through Done. The zero value is unusable; build one with NewBackgroundTask.
 type BackgroundTask struct {
 	handle string
 	clock  taskClock
 
-	mu       sync.Mutex
-	output   []byte
-	done     bool
-	terminal string
-	doneCh   chan struct{}
+	mu         sync.Mutex
+	output     []byte
+	baseOffset int
+	done       bool
+	terminal   string
+	doneCh     chan struct{}
+	onComplete func(string)
 }
 
 // NewBackgroundTask builds a task named by handle. A nil clock falls back to
@@ -1479,36 +1490,57 @@ func NewBackgroundTask(handle string, clock taskClock) *BackgroundTask {
 func (t *BackgroundTask) Handle() string { return t.handle }
 
 // AppendOutput adds chunk to the task output. Bytes appended after completion
-// are kept too, so a late tail is never silently lost.
+// are kept too, so a late tail is never silently lost. Once the output crosses
+// maxBackgroundTaskOutputBytes the middle is replaced by a marker while the
+// head and tail survive.
 func (t *BackgroundTask) AppendOutput(chunk []byte) {
 	if len(chunk) == 0 {
 		return
 	}
 	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.output = append(t.output, chunk...)
-	t.mu.Unlock()
+	if len(t.output) <= maxBackgroundTaskOutputBytes {
+		return
+	}
+	oldEnd := t.baseOffset + len(t.output)
+	mark := []byte(backgroundOutputTruncatedMark)
+	head := (maxBackgroundTaskOutputBytes - len(mark)) / 2
+	tail := maxBackgroundTaskOutputBytes - len(mark) - head
+	kept := make([]byte, 0, maxBackgroundTaskOutputBytes)
+	kept = append(kept, t.output[:head]...)
+	kept = append(kept, mark...)
+	kept = append(kept, t.output[len(t.output)-tail:]...)
+	t.output = kept
+	// Renumber the retained window so its last byte keeps the offset it had
+	// before truncation. A reader that keeps up never sees NextOffset go back.
+	t.baseOffset = oldEnd - len(kept)
 }
 
 // Output returns the output bytes from offset. A negative offset reads from the
 // start; an offset past the end yields an empty chunk whose NextOffset is the
-// current end, so a caller that lost its position can resynchronise. The
-// returned slice is a copy: a caller cannot mutate the task's stored bytes.
+// current end, so a caller that lost its position can resynchronise. A reader
+// behind the retained window also starts at its first byte. The returned slice
+// is a copy: a caller cannot mutate the task's stored bytes.
 func (t *BackgroundTask) Output(offset int) TaskOutputChunk {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if offset < 0 {
-		offset = 0
+	start := offset - t.baseOffset
+	if start < 0 {
+		start = 0
 	}
-	if offset > len(t.output) {
-		offset = len(t.output)
+	if start > len(t.output) {
+		start = len(t.output)
 	}
-	data := append([]byte(nil), t.output[offset:]...)
-	return TaskOutputChunk{Data: data, NextOffset: offset + len(data)}
+	data := append([]byte(nil), t.output[start:]...)
+	return TaskOutputChunk{Data: data, NextOffset: t.baseOffset + start + len(data)}
 }
 
 // Complete marks the task finished with terminal and closes the broadcast
 // channel exactly once. Later calls are no-ops, so a duplicated completion
-// cannot close the channel twice or replace the first terminal status.
+// cannot close the channel twice or replace the first terminal status. A task
+// started through TaskRegistry leaves the registry here; terminal carries the
+// reason, including cancellation.
 func (t *BackgroundTask) Complete(terminal string) {
 	t.mu.Lock()
 	if t.done {
@@ -1518,7 +1550,11 @@ func (t *BackgroundTask) Complete(terminal string) {
 	t.done = true
 	t.terminal = terminal
 	close(t.doneCh)
+	onComplete := t.onComplete
 	t.mu.Unlock()
+	if onComplete != nil {
+		onComplete(t.handle)
+	}
 }
 
 // Done returns the channel closed by Complete. Selecting on it receives the
@@ -1600,17 +1636,26 @@ func (r *TaskRegistry) Start(handle string) (*BackgroundTask, error) {
 		return nil, fmt.Errorf("task: handle already started: %q", handle)
 	}
 	t := NewBackgroundTask(handle, r.clock)
+	t.onComplete = r.remove
 	r.tasks[handle] = t
 	return t, nil
 }
 
 // Get resolves a handle to its task. The bool reports whether the handle is
-// registered.
+// registered. A finished task is no longer registered, so the bool is false.
 func (r *TaskRegistry) Get(handle string) (*BackgroundTask, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	t, ok := r.tasks[handle]
 	return t, ok
+}
+
+// remove unregisters a finished task. Complete calls it without holding the
+// task lock, so the two locks are never taken in the same order.
+func (r *TaskRegistry) remove(handle string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.tasks, handle)
 }
 
 // --- MCP protocol tasks/get contract with TTL and notifications (ADR 0056 f1) ---
@@ -1751,6 +1796,11 @@ type protocolTaskRecord struct {
 	createdAt time.Time
 }
 
+// maxTaskStatusNotifications bounds the notification ring. Only the newest
+// statuses stay readable; the current state still comes from Get, so an
+// evicted note cannot change it.
+const maxTaskStatusNotifications = 256
+
 // ProtocolTaskStore is Beacon's own store for the protocol contract. A clock
 // drives creation timestamps, last-update timestamps and TTL expiry. The work
 // queue and event delivery stay outside this contract (ADR 0056 feature 1).
@@ -1819,6 +1869,10 @@ func (s *ProtocolTaskStore) Get(taskID string) (TaskResult, error) {
 	if rec.task.TTLMs != nil {
 		expires := rec.createdAt.Add(time.Duration(*rec.task.TTLMs) * time.Millisecond)
 		if !s.clock.Now().Before(expires) {
+			// The first expired read still reports CodeGone. The record is
+			// dropped here so a long-lived store does not keep one task per
+			// expired id; a later read reports CodeWatchNotFound.
+			delete(s.tasks, taskID)
 			return TaskResult{}, domain.NewAppError(domain.CodeGone, "tasks/get: task TTL elapsed")
 		}
 	}
@@ -1873,9 +1927,15 @@ func (s *ProtocolTaskStore) Cancel(taskID, reason string) (ProtocolTask, error) 
 	return s.Update(taskID, TaskPatch{Status: TaskStateCancelled, StatusMessage: reason})
 }
 
-// publishLocked records a notification. Callers hold s.mu.
+// publishLocked records a notification in a bounded ring. Callers hold s.mu.
 func (s *ProtocolTaskStore) publishLocked(t ProtocolTask) {
-	s.notes = append(s.notes, TaskStatusNotification{Method: taskStatusNotificationMethod, Params: t})
+	n := TaskStatusNotification{Method: taskStatusNotificationMethod, Params: t}
+	if len(s.notes) >= maxTaskStatusNotifications {
+		copy(s.notes, s.notes[1:])
+		s.notes[len(s.notes)-1] = n
+		return
+	}
+	s.notes = append(s.notes, n)
 }
 
 // Notifications returns the published notifications in order. The slice is a
