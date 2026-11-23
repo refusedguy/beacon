@@ -5,7 +5,9 @@ import { delimiter, join } from "node:path"
 export const BEACON_SERVER = "beacon"
 export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
-export const HEAD_POLL_MS = 3000
+export const BUILD_HASH_FLAG = "--hash"
+export const BUILD_HASH_POLL_MS = 3000
+export const RELOAD_DEBOUNCE_MS = 10000
 
 const defaultDeps = {
   env: process.env,
@@ -14,10 +16,11 @@ const defaultDeps = {
   execFileSync: defaultExecFileSync,
 }
 
-// Shared HEAD baseline for the watcher. A new registration resets it so one
-// commit triggers exactly one reload.
-let lastHead = null
-let headWatcher = null
+// Shared watchdog state. A new registration resets it so one source change
+// causes exactly one rebuild and one reload.
+let lastBuildHash = null
+let pollWatcher = null
+let reloadTimer = null
 
 function pathBinary(name, deps) {
   for (const dir of (deps.env.PATH ?? "").split(delimiter)) {
@@ -28,14 +31,25 @@ function pathBinary(name, deps) {
   return null
 }
 
-function currentHead(root, deps) {
+function currentBuildHash(root, deps) {
+  const script = join(root, ...BEACON_BUILD_SCRIPT.split("/"))
   try {
-    const output = deps.execFileSync("git", ["rev-parse", "HEAD"], {
+    const output = deps.execFileSync("bash", [script, BUILD_HASH_FLAG], {
       cwd: root,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     })
     return String(output).trim() || null
+  } catch {
+    return null
+  }
+}
+
+function recordedBuildHash(local, deps) {
+  const shaPath = `${local}.build-sha`
+  if (!deps.existsSync(shaPath)) return null
+  try {
+    return String(deps.readFileSync(shaPath, "utf8")).trim() || null
   } catch {
     return null
   }
@@ -51,21 +65,13 @@ function runBuild(root, deps) {
 }
 
 function rebuildLocalIfStale(root, local, deps) {
-  const shaPath = `${local}.build-sha`
-  let recorded = null
-  if (deps.existsSync(shaPath)) {
-    try {
-      recorded = String(deps.readFileSync(shaPath, "utf8")).trim()
-    } catch {
-      recorded = null
-    }
+  const recorded = recordedBuildHash(local, deps)
+  if (recorded === null) {
+    runBuild(root, deps)
+    return
   }
-
-  if (recorded !== null) {
-    const head = currentHead(root, deps)
-    if (head && recorded === head) return
-  }
-
+  const current = currentBuildHash(root, deps)
+  if (current && recorded === current) return
   runBuild(root, deps)
 }
 
@@ -104,32 +110,49 @@ export function beaconServerConfig(root, deps = defaultDeps) {
   })
 }
 
-function stopHeadWatcher() {
-  if (headWatcher !== null) {
-    headWatcher.clear(headWatcher.handle)
-    headWatcher = null
+function stopWatchdog() {
+  if (pollWatcher !== null) {
+    pollWatcher.clear(pollWatcher.handle)
+    pollWatcher = null
   }
+  if (reloadTimer !== null) {
+    reloadTimer.clear(reloadTimer.handle)
+    reloadTimer = null
+  }
+  lastBuildHash = null
 }
 
-function watchHead(ctx, root, deps) {
-  if (deps.env.BEACON_BIN) return
-  stopHeadWatcher()
-  lastHead = currentHead(root, deps)
-  const setTimer = globalThis.setInterval
-  const clearTimer = globalThis.clearInterval
+function scheduleReload(ctx) {
+  if (reloadTimer !== null) reloadTimer.clear(reloadTimer.handle)
+  const setTimer = globalThis.setTimeout
+  const clearTimer = globalThis.clearTimeout
   const handle = setTimer(() => {
-    const head = currentHead(root, deps)
-    if (!head || head === lastHead) return
-    lastHead = head
-    ;(async () => {
+    reloadTimer = null
+    void (async () => {
       try {
         await ctx.mcp.reload()
       } catch (error) {
-        console.warn(`beacon MCP: reload after HEAD change failed: ${error.message}`)
+        console.warn(`beacon MCP: reload after source change failed: ${error.message}`)
       }
     })()
-  }, HEAD_POLL_MS)
-  headWatcher = { handle, clear: clearTimer }
+  }, RELOAD_DEBOUNCE_MS)
+  reloadTimer = { handle, clear: clearTimer }
+  if (typeof handle?.unref === "function") handle.unref()
+}
+
+function watchBuildHash(ctx, root, deps) {
+  if (deps.env.BEACON_BIN) return
+  stopWatchdog()
+  lastBuildHash = currentBuildHash(root, deps)
+  const setTimer = globalThis.setInterval
+  const clearTimer = globalThis.clearInterval
+  const handle = setTimer(() => {
+    const hash = currentBuildHash(root, deps)
+    if (!hash || hash === lastBuildHash) return
+    lastBuildHash = hash
+    scheduleReload(ctx)
+  }, BUILD_HASH_POLL_MS)
+  pollWatcher = { handle, clear: clearTimer }
   if (typeof handle?.unref === "function") handle.unref()
 }
 
@@ -147,7 +170,7 @@ export async function registerBeaconMcp(ctx, root, deps = defaultDeps) {
     })
   })
 
-  watchHead(ctx, root, deps)
+  watchBuildHash(ctx, root, deps)
 
   return {
     registration,
