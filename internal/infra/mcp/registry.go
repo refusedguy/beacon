@@ -22,5 +22,6 @@ func ToolCatalog() []ToolSpec {
 		{Name: "beacon_wait", Description: "Wait for a run to reach an active verdict or a terminal state."},
 		{Name: "beacon_control", Description: "Control a run: approve, unblock, cancel, retry or bind a PR."},
 		{Name: "beacon_task_create", Description: "Create and publish a task card. Orchestrator only.", OrchestratorOnly: true},
+		{Name: "beacon_task_delete", Description: "Delete task cards in one commit and push. Orchestrator only.", OrchestratorOnly: true},
 	}
 }

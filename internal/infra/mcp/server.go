@@ -69,6 +69,29 @@ type epicChildArg struct {
 	Priority int      `json:"priority,omitempty"`
 }
 
+// deleteTaskArgs is the input schema of beacon_task_delete.
+type deleteTaskArgs struct {
+	IDs []string `json:"ids"`
+}
+
+var taskDeleteTool = &msdk.Tool{
+	Name:        "beacon_task_delete",
+	Description: "Delete task cards in one commit and push. Orchestrator only.",
+}
+
+func registerTaskDelete(s *msdk.Server, sv Services) {
+	msdk.AddTool(s, taskDeleteTool, func(ctx context.Context, _ *msdk.CallToolRequest, a deleteTaskArgs) (*msdk.CallToolResult, any, error) {
+		if sv.TaskDeleter == nil {
+			return nil, nil, core.Errorf(core.CodeUnavailable, "task deleter is not configured")
+		}
+		deleted, err := sv.TaskDeleter.Delete(ctx, a.IDs)
+		if err != nil {
+			return nil, nil, err
+		}
+		return jsonResult(deleted), nil, nil
+	})
+}
+
 func specScopes(values []string) []core.ScopePath {
 	out := make([]core.ScopePath, 0, len(values))
 	for _, value := range values {

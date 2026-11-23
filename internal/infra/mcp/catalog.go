@@ -12,4 +12,5 @@ var toolRegistrations = []func(*msdk.Server, Services){
 	registerWait,
 	registerControl,
 	registerTaskCreate,
+	registerTaskDelete,
 }
