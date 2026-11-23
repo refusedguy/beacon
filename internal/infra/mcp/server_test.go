@@ -786,6 +786,120 @@ func TestToolsCallUsesCapabilityScopeAndDepartures(t *testing.T) {
 	}
 }
 
+// TestCapabilityScopeRegistryDepartRemovesScope covers LEAK-02: a departure
+// frees the live map entry, keeps the departed channels reachable for a late
+// lookup, and leaves other agents' scopes alone. A repeated departure is a
+// no-op and must not close a channel twice.
+func TestCapabilityScopeRegistryDepartRemovesScope(t *testing.T) {
+	registry := NewCapabilityScopeRegistry(nil, nil)
+	scopeReq := func(id string) *mcpsdk.CallToolRequest {
+		return &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+			Meta: mcpsdk.Meta{sessionIDMetaKey: id},
+		}}
+	}
+	departedKey := CapabilityID("departed-scope")
+	liveKey := CapabilityID("live-scope")
+
+	departed := registry.ScopeFor(scopeReq(string(departedKey)))
+	if departed == nil {
+		t.Fatal("ScopeFor did not create the departed scope")
+	}
+	if err := departed.AddTask("departed-task", ""); err != nil {
+		t.Fatalf("AddTask: %v", err)
+	}
+	live := registry.ScopeFor(scopeReq(string(liveKey)))
+	if live == nil {
+		t.Fatal("ScopeFor did not create the live scope")
+	}
+
+	if !registry.Depart(departedKey, CancelSessionClosed) {
+		t.Fatal("Depart did not find the bound scope")
+	}
+	if _, ok := registry.scopes[departedKey]; ok {
+		t.Fatal("Depart left a live scope entry for the departed key")
+	}
+	if _, ok := registry.scopes[liveKey]; !ok {
+		t.Fatal("Depart removed the scope of a live agent")
+	}
+
+	// A late lookup must see the same departed scope, not a fresh live one.
+	if got := registry.ScopeFor(scopeReq(string(departedKey))); got != departed {
+		t.Fatal("late lookup did not return the departed scope")
+	}
+	if _, ok := registry.scopes[departedKey]; ok {
+		t.Fatal("late lookup recreated a live scope for a departed key")
+	}
+	exit := registry.DeparturesFor(scopeReq(string(departedKey)))
+	select {
+	case <-exit.SessionClosed:
+	default:
+		t.Fatal("departed lookup returned an open session-closed channel")
+	}
+	select {
+	case <-exit.Cancelled:
+		t.Fatal("departure with CancelSessionClosed closed the cancelled channel")
+	default:
+	}
+	if got := registry.DeparturesFor(scopeReq(string(liveKey))).SessionClosed; got == nil {
+		t.Fatal("live agent has no departure channel")
+	} else {
+		select {
+		case <-got:
+			t.Fatal("live agent's departure channel is closed")
+		default:
+		}
+	}
+
+	// A repeated departure finds no live scope, so it cannot close twice.
+	if registry.Depart(departedKey, CancelSessionClosed) {
+		t.Fatal("repeated Depart reported a live scope")
+	}
+	if _, ok := registry.scopes[departedKey]; ok {
+		t.Fatal("repeated Depart recreated a live scope")
+	}
+	if registry.Depart(CapabilityID("never-seen"), CancelCallerCancelled) {
+		t.Fatal("Depart found a scope for an unknown key")
+	}
+}
+
+// TestCapabilityScopeRegistryDepartTombstoneBound proves the departed set is
+// bounded, so removing the live entry does not trade one unbounded map for
+// another. Eviction is oldest-first and drops only departed keys.
+func TestCapabilityScopeRegistryDepartTombstoneBound(t *testing.T) {
+	registry := NewCapabilityScopeRegistry(nil, nil)
+	scopeReq := func(id string) *mcpsdk.CallToolRequest {
+		return &mcpsdk.CallToolRequest{Params: &mcpsdk.CallToolParamsRaw{
+			Meta: mcpsdk.Meta{sessionIDMetaKey: id},
+		}}
+	}
+
+	for i := 0; i < maxDepartedScopes+2; i++ {
+		owner := CapabilityID(fmt.Sprintf("depart-%d", i))
+		if registry.ScopeFor(scopeReq(string(owner))) == nil {
+			t.Fatalf("ScopeFor(%q) returned nil", owner)
+		}
+		if !registry.Depart(owner, CancelCallerCancelled) {
+			t.Fatalf("Depart(%q) did not find the bound scope", owner)
+		}
+	}
+
+	if len(registry.scopes) != 0 {
+		t.Fatalf("live scopes = %d, want 0", len(registry.scopes))
+	}
+	if len(registry.departed) != maxDepartedScopes {
+		t.Fatalf("departed tombstones = %d, want %d", len(registry.departed), maxDepartedScopes)
+	}
+	if len(registry.departedOrder) != maxDepartedScopes {
+		t.Fatalf("departed order = %d, want %d", len(registry.departedOrder), maxDepartedScopes)
+	}
+	if _, ok := registry.departed[CapabilityID("depart-0")]; ok {
+		t.Fatal("oldest tombstone was not evicted")
+	}
+	if _, ok := registry.scopes[CapabilityID("depart-0")]; ok {
+		t.Fatal("evicted departed key was recreated as a live scope")
+	}
+}
+
 // TestToolsCallUsesInjectedCIWaitAndIdempotency drives both ports through
 // tools/call: the expensive operation must run inside the shared gate, and a
 // repeat with the same clientRequestId must reuse the injected result index

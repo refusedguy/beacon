@@ -775,12 +775,25 @@ type Dependencies struct {
 //
 // With no registry wired, wait_result derives its departures from the handler
 // context and binds no capability context, which is the original behaviour.
+//
+// Depart moves a scope out of scopes and into a bounded tombstone map. A late
+// request from a departed key must still see the closed departure channel,
+// otherwise scopeFor would create a fresh live scope and resurrect the record.
+// Tombstones are evicted oldest-first, so the departed set cannot grow without
+// a bound. Only departed keys are evicted; a live agent keeps its scope.
 type CapabilityScopeRegistry struct {
-	mu      sync.Mutex
-	journal CancelJournal
-	clock   domain.Clock
-	scopes  map[CapabilityID]*capabilityScope
+	mu            sync.Mutex
+	journal       CancelJournal
+	clock         domain.Clock
+	scopes        map[CapabilityID]*capabilityScope
+	departed      map[CapabilityID]*capabilityScope
+	departedOrder []CapabilityID
 }
+
+// maxDepartedScopes bounds the tombstones kept for departed callers. The value
+// matches maxWaitStarts in tool_wait_result.go; a larger cap keeps departed
+// contexts reachable longer without changing the live-scope contract.
+const maxDepartedScopes = 4096
 
 type capabilityScope struct {
 	context          *CapabilityContext
@@ -800,9 +813,10 @@ func NewCapabilityScopeRegistry(journal CancelJournal, clock domain.Clock) *Capa
 		clock = waitResultWallClock{}
 	}
 	return &CapabilityScopeRegistry{
-		journal: journal,
-		clock:   clock,
-		scopes:  make(map[CapabilityID]*capabilityScope),
+		journal:  journal,
+		clock:    clock,
+		scopes:   make(map[CapabilityID]*capabilityScope),
+		departed: make(map[CapabilityID]*capabilityScope),
 	}
 }
 
@@ -847,6 +861,12 @@ func (r *CapabilityScopeRegistry) scopeFor(req *mcpsdk.CallToolRequest) *capabil
 	if scope, ok := r.scopes[owner]; ok {
 		return scope
 	}
+	// A departed caller keeps its closed channels in the tombstone map. Return
+	// that scope instead of allocating a fresh one, so a late request cannot
+	// resurrect a departed key or run a wait that never sees the exit.
+	if scope, ok := r.departed[owner]; ok {
+		return scope
+	}
 	scope := &capabilityScope{
 		context:          NewCapabilityContext(owner, r.journal, r.clock),
 		cancelled:        make(chan struct{}),
@@ -859,9 +879,10 @@ func (r *CapabilityScopeRegistry) scopeFor(req *mcpsdk.CallToolRequest) *capabil
 
 // Depart reports that the agent identified by owner disappeared. It closes the
 // channel named by reason; wait_result's depart case then cancels the whole
-// capability tree and journals the reason. Closing is idempotent, and a
-// departure with no matching scope is ignored. An unknown reason is treated as
-// a plain cancellation.
+// capability tree and journals the reason. After closing, the live scope is
+// removed from scopes and kept as a bounded tombstone so a late lookup still
+// sees the departure. Closing is idempotent, and a departure with no matching
+// live scope is ignored. An unknown reason is treated as a plain cancellation.
 func (r *CapabilityScopeRegistry) Depart(owner CapabilityID, reason CancelReason) bool {
 	if r == nil {
 		return false
@@ -885,6 +906,17 @@ func (r *CapabilityScopeRegistry) Depart(owner CapabilityID, reason CancelReason
 	case <-ch:
 	default:
 		close(ch)
+	}
+	// Free the live entry under the same lock that guards scopeFor, so a
+	// concurrent lookup either sees the live scope or the tombstone, never a
+	// half-cleaned state and never a resurrected scope.
+	delete(r.scopes, owner)
+	r.departed[owner] = scope
+	r.departedOrder = append(r.departedOrder, owner)
+	if len(r.departedOrder) > maxDepartedScopes {
+		oldest := r.departedOrder[0]
+		r.departedOrder = r.departedOrder[1:]
+		delete(r.departed, oldest)
 	}
 	r.mu.Unlock()
 	return true
