@@ -1,4 +1,4 @@
-import { join, resolve, sep } from "node:path"
+import { join } from "node:path"
 import { pathToFileURL } from "node:url"
 
 export const SURVIVAL_KEY = "beacon/survival-rules"
@@ -20,54 +20,29 @@ export function agentsFileURI(root) {
   return pathToFileURL(join(root, "AGENTS.md")).href
 }
 
-export function belongsToLocation(ctx, session) {
-  const location = ctx?.location
-  const expected = location?.directory || location?.project?.canonical
-  const actual = session?.directory
-  if (typeof expected !== "string" || !expected) return false
-  if (typeof actual !== "string" || !actual) return false
-  const base = resolve(expected)
-  const dir = resolve(actual)
-  return dir === base || dir.startsWith(base + sep)
-}
-
-export async function listSessions(ctx) {
-  const sessions = []
-  let cursor = null
-  for (;;) {
-    const input = { directory: ctx.location.directory, limit: 100 }
-    if (cursor) input.cursor = cursor
-    const page = await ctx.session.list(input)
-    sessions.push(...(page?.sessions ?? []))
-    if (!page?.cursor?.next) break
-    cursor = page.cursor.next
-  }
-  return sessions
-}
-
-async function putSurvivalRules(ctx, sessionID) {
+export async function ensureSurvivalRules(ctx, sessionID) {
   if (typeof sessionID !== "string" || !sessionID) return false
   const entry = ctx?.session?.instructions?.entry
-  if (typeof entry?.put !== "function") return false
+  if (typeof entry?.list !== "function" || typeof entry?.put !== "function") return false
+
+  const listed = await entry.list({ sessionID })
+  const entries = Array.isArray(listed) ? listed : listed?.entries
+  const current = Array.isArray(entries)
+    ? entries.find((item) => item?.key === SURVIVAL_KEY)
+    : null
+  if (current?.value === SURVIVAL_RULES) return false
+
   await entry.put({ sessionID, key: SURVIVAL_KEY, value: SURVIVAL_RULES })
   return true
-}
-
-export async function syncSurvivalRules(ctx, sessions) {
-  let written = 0
-  for (const item of sessions ?? []) {
-    const session =
-      typeof item === "string" ? await ctx.session.get({ sessionID: item }) : item
-    if (!belongsToLocation(ctx, session)) continue
-    if (await putSurvivalRules(ctx, session?.id)) written++
-  }
-  return written
 }
 
 export async function registerProjectHooks(ctx, root) {
   const agentsURI = agentsFileURI(root)
 
-  const contextHook = await ctx.session.hook("context", (event) => {
+  const contextHook = await ctx.session.hook("context", async (event) => {
+    try {
+      await ensureSurvivalRules(ctx, event?.sessionID)
+    } catch {}
     event.system.push({ type: "text", text: `beacon project root=${root}` })
   })
 
@@ -84,15 +59,8 @@ export async function registerCompactionHook(ctx) {
   try {
     return await ctx.session.hook("compaction", async (event) => {
       try {
-        const sessionID = event?.sessionID ?? event?.session?.id
-        if (sessionID) {
-          await putSurvivalRules(ctx, sessionID)
-          return
-        }
-        await syncSurvivalRules(ctx, await listSessions(ctx))
-      } catch {
-        return
-      }
+        await ensureSurvivalRules(ctx, event?.sessionID ?? event?.session?.id)
+      } catch {}
     })
   } catch {
     return null
@@ -100,10 +68,6 @@ export async function registerCompactionHook(ctx) {
 }
 
 export async function installProjectContext(ctx, root) {
-  try {
-    await syncSurvivalRules(ctx, await listSessions(ctx))
-  } catch {}
-
   const hooks = await registerProjectHooks(ctx, root)
   const compactionHook = await registerCompactionHook(ctx)
 
