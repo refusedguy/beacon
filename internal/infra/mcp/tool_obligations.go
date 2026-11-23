@@ -122,7 +122,7 @@ func (h *ObligationsHandler) revisionOf(watchID string) (uint64, error) {
 			return 0, nil
 		}
 		observe.ActorError("obligations-watch", watchID, err)
-		return 0, domain.NewAppError(domain.CodePersistFailed, "obligations: watch: "+err.Error())
+		return 0, domain.NewAppErrorWithCause(domain.CodePersistFailed, "obligations: watch: "+err.Error(), err)
 	}
 	return w.Revision, nil
 }
@@ -146,7 +146,7 @@ func (h *ObligationsHandler) List(_ context.Context, in ObligationsInput) (Oblig
 	all, err := h.lister.WatchObligations(in.WatchID)
 	if err != nil {
 		observe.ActorError("obligations-list", in.WatchID, err)
-		return ObligationsOutput{}, domain.NewAppError(domain.CodePersistFailed, "obligations: list: "+err.Error())
+		return ObligationsOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "obligations: list: "+err.Error(), err)
 	}
 
 	selected := all

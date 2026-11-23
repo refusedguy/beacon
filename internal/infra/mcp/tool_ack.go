@@ -1111,7 +1111,7 @@ func (h *AckHandler) applyBlockedNotMine(in AckInput, w domain.Watch, sessionID 
 			w.Repo, w.BaseRef, info.FailedChecks, in.WatchID, now)
 		if err != nil {
 			observe.ActorError("ack-blocker-open", in.WatchID, err)
-			return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return BlockedWatch{}, false, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 		blockerID = incident.ID
 		if alreadyBlocked && w.BlockerID == "" {
@@ -1122,7 +1122,7 @@ func (h *AckHandler) applyBlockedNotMine(in AckInput, w domain.Watch, sessionID 
 			if writer, ok := h.store.(ackWatchWriter); ok {
 				if err := writer.SaveWatch(linked); err != nil {
 					observe.ActorError("ack-blocker-link", in.WatchID, err)
-					return BlockedWatch{}, false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+					return BlockedWatch{}, false, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 				}
 			}
 		}
@@ -1171,7 +1171,7 @@ func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
 			active, err := h.blockers.ActiveBlockers()
 			if err != nil {
 				observe.ActorError("ack-blocker-list", w.ID, err)
-				return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+				return false, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 			}
 			for _, incident := range active {
 				for _, id := range incident.BlockedWatchIDs {
@@ -1191,7 +1191,7 @@ func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
 		unblocked, err := h.blockers.ResolveBlocker(blockerID, h.clock.Now())
 		if err != nil {
 			observe.ActorError("ack-blocker-resolve", w.ID, err)
-			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return false, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 		ids := make([]string, 0, len(unblocked))
 		for _, unwound := range unblocked {
@@ -1220,7 +1220,7 @@ func (h *AckHandler) applyBlockedResolved(w domain.Watch) (bool, error) {
 	}
 	if writer, ok := h.store.(ackWatchWriter); ok {
 		if err := writer.SaveWatch(next); err != nil {
-			return false, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return false, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 	}
 	h.rotateGenerations(w.ID)
@@ -1254,7 +1254,7 @@ func (h *AckHandler) blockWatch(w domain.Watch, info domain.BlockedInfo, blocker
 		return nil
 	}
 	if err := writer.SaveWatch(next); err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return nil
 }
@@ -1276,7 +1276,7 @@ func (h *AckHandler) resumeWatch(w domain.Watch) (domain.Watch, error) {
 	}
 	if writer, ok := h.store.(ackWatchWriter); ok {
 		if err := writer.SaveWatch(next); err != nil {
-			return w, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return w, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 	}
 	return next, nil
@@ -1318,7 +1318,7 @@ func (h *AckHandler) continueWatch(in AckInput, w domain.Watch) error {
 	}
 	if writer, ok := h.store.(ackWatchWriter); ok {
 		if err := writer.SaveWatch(next); err != nil {
-			return domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 	}
 	return nil

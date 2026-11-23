@@ -264,7 +264,7 @@ func (h *CIFailedLogHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolReque
 
 	w, err := h.store.Watch(in.WatchID)
 	if err != nil {
-		return nil, CIFailedLogOutput{}, domain.NewAppError(domain.CodeWatchNotFound, "ci_failed_log: watch: "+err.Error())
+		return nil, CIFailedLogOutput{}, domain.NewAppErrorWithCause(domain.CodeWatchNotFound, "ci_failed_log: watch: "+err.Error(), err)
 	}
 
 	failed := collectFailedChecks(w)

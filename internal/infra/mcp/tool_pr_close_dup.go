@@ -206,7 +206,7 @@ func (h *PRCloseDupHandler) Close(ctx context.Context, in PRCloseDupInput) (PRCl
 	w, live, err := h.liveWatch(in.Repo, in.PR)
 	if err != nil {
 		observe.ActorError("pr_close_dup-snapshot", in.Repo, err)
-		return PRCloseDupOutput{}, domain.NewAppError(domain.CodePersistFailed, "pr_close_dup: snapshot: "+err.Error())
+		return PRCloseDupOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "pr_close_dup: snapshot: "+err.Error(), err)
 	}
 	if live {
 		out := prCloseDupOutput(in, PRCloseDupActionNoop, PRCloseDupReasonActiveWatch)
@@ -217,7 +217,7 @@ func (h *PRCloseDupHandler) Close(ctx context.Context, in PRCloseDupInput) (PRCl
 	state, err := h.ci.PRState(ctx, in.Repo, in.PR)
 	if err != nil {
 		observe.ActorError("pr_close_dup-ci", in.Repo, err)
-		return PRCloseDupOutput{}, domain.NewAppError(domain.CodePersistFailed, "pr_close_dup: ci: "+err.Error())
+		return PRCloseDupOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "pr_close_dup: ci: "+err.Error(), err)
 	}
 	switch strings.ToUpper(strings.TrimSpace(state.State)) {
 	case "MERGED":
@@ -236,14 +236,14 @@ func (h *PRCloseDupHandler) Close(ctx context.Context, in PRCloseDupInput) (PRCl
 		branch, err = h.cleanup.HeadBranch(ctx, in.Repo, in.PR)
 		if err != nil {
 			observe.ActorError("pr_close_dup-head", in.Repo, err)
-			return PRCloseDupOutput{}, domain.NewAppError(domain.CodePersistFailed, "pr_close_dup: head branch: "+err.Error())
+			return PRCloseDupOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "pr_close_dup: head branch: "+err.Error(), err)
 		}
 	}
 
 	reason := "duplicate of #" + strconv.Itoa(in.DuplicateOf)
 	if err := h.cleanup.ClosePR(ctx, in.Repo, in.PR, reason); err != nil {
 		observe.ActorError("pr_close_dup-close", in.Repo, err)
-		return PRCloseDupOutput{}, domain.NewAppError(domain.CodePersistFailed, "pr_close_dup: close: "+err.Error())
+		return PRCloseDupOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "pr_close_dup: close: "+err.Error(), err)
 	}
 
 	out := prCloseDupOutput(in, PRCloseDupActionClosed, "")

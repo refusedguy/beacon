@@ -215,15 +215,15 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 
 	lockPath := s.lockPath()
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
-		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskCloseOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskCloseOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		_ = lock.Close()
-		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskCloseOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	defer func() {
 		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
@@ -270,7 +270,7 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 		}
 		if closeReplayNeedsFill(chosen, rec) {
 			if err := s.writeCloseFields(chosen, rec); err != nil {
-				return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+				return TaskCloseOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 			}
 		}
 		// The card was already closed, even when this call filled missing
@@ -304,7 +304,7 @@ func (s *FileTaskCloseStore) Close(ctx context.Context, in TaskCloseInput, close
 		ClosedAt:    strings.TrimSpace(closedAt),
 	}
 	if err := s.writeCloseFields(chosen, rec); err != nil {
-		return TaskCloseOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskCloseOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return TaskCloseOutput{OK: true, CardID: cardID, Status: status, Created: true}, nil
 }
@@ -419,7 +419,7 @@ func closeReplayNeedsFill(c closeCard, rec closeRecord) bool {
 func (s *FileTaskCloseStore) cards() ([]closeCard, error) {
 	entries, err := os.ReadDir(s.TasksDir)
 	if err != nil {
-		return nil, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return nil, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	cards := make([]closeCard, 0, len(entries))
 	for _, e := range entries {

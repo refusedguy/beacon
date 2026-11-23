@@ -251,15 +251,15 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 
 	lockPath := s.lockPath()
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0700); err != nil {
-		return TaskClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskClaimOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
-		return TaskClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskClaimOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		_ = lock.Close()
-		return TaskClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskClaimOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	defer func() {
 		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
@@ -350,7 +350,7 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 		return TaskClaimOutput{}, err
 	}
 	if err := writeClaimFile(chosen.Path, []byte(replaceClaimFields(chosen.Raw, agentID, when))); err != nil {
-		return TaskClaimOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return TaskClaimOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return out, nil
 }
@@ -360,7 +360,7 @@ func (s *FileTaskClaimStore) Claim(ctx context.Context, in TaskClaimInput, claim
 func (s *FileTaskClaimStore) cards() ([]claimCard, error) {
 	entries, err := os.ReadDir(s.TasksDir)
 	if err != nil {
-		return nil, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return nil, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	cards := make([]claimCard, 0, len(entries))
 	for _, e := range entries {

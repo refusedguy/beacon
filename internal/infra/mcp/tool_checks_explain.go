@@ -98,7 +98,7 @@ func (h *ChecksExplainHandler) Explain(in ChecksExplainInput) (ChecksExplainOutp
 	}
 	w, err := h.store.Watch(in.WatchID)
 	if err != nil {
-		return ChecksExplainOutput{}, domain.NewAppError(domain.CodeWatchNotFound, "checks_explain: watch: "+err.Error())
+		return ChecksExplainOutput{}, domain.NewAppErrorWithCause(domain.CodeWatchNotFound, "checks_explain: watch: "+err.Error(), err)
 	}
 
 	out := ChecksExplainOutput{

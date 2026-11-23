@@ -228,7 +228,7 @@ func (c *CancelWatcher) CancelWithReceipt(ctx context.Context, watchID, scope, s
 	}
 
 	if err := c.store.SaveWatch(next); err != nil {
-		return "", domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return "", domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	if err := c.events.Append(ctx, CancelAuditEvent{
 		Kind:         cancelWatchEventKind,
@@ -263,7 +263,7 @@ func (c *CancelWatcher) closeAndRecord(ctx context.Context, w domain.Watch, now 
 		return domain.NewAppError(domain.CodeInvalidInput, "cancel_watch: Watch could not be closed")
 	}
 	if err := c.store.SaveWatch(next); err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	ev.CloseReason = string(reason)
 	if c.events == nil {

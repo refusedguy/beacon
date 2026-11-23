@@ -80,12 +80,12 @@ func (h *ThreadReadHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolReques
 
 	upper, bounded, err := threadCursorBounds(in.Cursor)
 	if err != nil {
-		return nil, ThreadReadOutput{}, domain.NewAppError(domain.CodeInvalidInput, "thread_read: "+err.Error())
+		return nil, ThreadReadOutput{}, domain.NewAppErrorWithCause(domain.CodeInvalidInput, "thread_read: "+err.Error(), err)
 	}
 
 	history, err := h.source.ThreadHistory(ctx, in.ThreadID)
 	if err != nil {
-		return nil, ThreadReadOutput{}, domain.NewAppError(domain.CodeWatchNotFound, "thread_read: history: "+err.Error())
+		return nil, ThreadReadOutput{}, domain.NewAppErrorWithCause(domain.CodeWatchNotFound, "thread_read: history: "+err.Error(), err)
 	}
 
 	ordered := append([]ThreadMessage(nil), history...)
