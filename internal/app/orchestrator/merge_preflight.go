@@ -5,6 +5,7 @@
 package orchestrator
 
 import (
+	"slices"
 	"sort"
 	"strings"
 )
@@ -120,37 +121,33 @@ func mergeMainLabel(branch string) string {
 	return branch
 }
 
+// dedupInOrder returns the first occurrence of each normalized value in order.
+// norm rewrites a value before the membership test; keep drops unwanted values.
+func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
+	out := make([]T, 0, len(values))
+	seen := make(map[T]bool, len(values))
+	for _, v := range values {
+		v = norm(v)
+		if !keep(v) || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
 // mergeVisibleFiles drops tool-created paths, then sorts and deduplicates the
 // rest so a problem's file list is stable between ticks.
 func mergeVisibleFiles(files, toolPaths []string) []string {
-	ignored := make([]string, 0, len(toolPaths))
-	for _, p := range toolPaths {
-		p = strings.TrimSpace(strings.TrimSuffix(p, "/"))
-		if p != "" {
-			ignored = append(ignored, p)
-		}
-	}
-
-	seen := make(map[string]bool)
-	visible := make([]string, 0, len(files))
-	for _, f := range files {
-		f = strings.TrimSpace(f)
-		if f == "" || seen[f] {
-			continue
-		}
-		hidden := false
-		for _, p := range ignored {
-			if f == p || strings.HasPrefix(f, p+"/") {
-				hidden = true
-				break
-			}
-		}
-		if hidden {
-			continue
-		}
-		seen[f] = true
-		visible = append(visible, f)
-	}
+	ignored := dedupInOrder(toolPaths,
+		func(p string) string { return strings.TrimSpace(strings.TrimSuffix(p, "/")) },
+		func(p string) bool { return p != "" })
+	visible := dedupInOrder(files, strings.TrimSpace, func(f string) bool {
+		return f != "" && !slices.ContainsFunc(ignored, func(p string) bool {
+			return f == p || strings.HasPrefix(f, p+"/")
+		})
+	})
 	sort.Strings(visible)
 	return visible
 }

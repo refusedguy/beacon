@@ -190,18 +190,25 @@ func truncateInferenceInput(text string, limit int) (string, bool) {
 	return text[:limit-len(inferenceTruncationMarker)] + inferenceTruncationMarker, true
 }
 
-// uniqueInferenceFiles trims, deduplicates and sorts the file summary.
-func uniqueInferenceFiles(files []string) []string {
-	out := make([]string, 0, len(files))
-	seen := make(map[string]bool, len(files))
-	for _, f := range files {
-		f = strings.TrimSpace(f)
-		if f == "" || seen[f] {
+// dedupInOrder returns the first occurrence of each normalized value in order.
+// norm rewrites a value before the membership test; keep drops unwanted values.
+func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
+	out := make([]T, 0, len(values))
+	seen := make(map[T]bool, len(values))
+	for _, v := range values {
+		v = norm(v)
+		if !keep(v) || seen[v] {
 			continue
 		}
-		seen[f] = true
-		out = append(out, f)
+		seen[v] = true
+		out = append(out, v)
 	}
+	return out
+}
+
+// uniqueInferenceFiles trims, deduplicates and sorts the file summary.
+func uniqueInferenceFiles(files []string) []string {
+	out := dedupInOrder(files, strings.TrimSpace, func(s string) bool { return s != "" })
 	sort.Strings(out)
 	return out
 }

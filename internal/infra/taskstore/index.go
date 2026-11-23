@@ -514,18 +514,24 @@ func (idx *Index) replaceCards(changed []pendingCard, stale []string) error {
 	return nil
 }
 
-// uniqueStrings убирает повторы, сохраняя порядок первого вхождения. Повторные
-// токены в поле карточки не должны ломать первичный ключ таблиц deps и owners.
-func uniqueStrings(values []string) []string {
-	seen := make(map[string]bool, len(values))
-	out := make([]string, 0, len(values))
+// dedupInOrder returns the first occurrence of each normalized value in order.
+// norm rewrites a value before the membership test; keep drops unwanted values.
+func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
+	out := make([]T, 0, len(values))
+	seen := make(map[T]bool, len(values))
 	for _, v := range values {
-		v = strings.TrimSpace(v)
-		if v == "" || seen[v] {
+		v = norm(v)
+		if !keep(v) || seen[v] {
 			continue
 		}
 		seen[v] = true
 		out = append(out, v)
 	}
 	return out
+}
+
+// uniqueStrings убирает повторы, сохраняя порядок первого вхождения. Повторные
+// токены в поле карточки не должны ломать первичный ключ таблиц deps и owners.
+func uniqueStrings(values []string) []string {
+	return dedupInOrder(values, strings.TrimSpace, func(s string) bool { return s != "" })
 }
