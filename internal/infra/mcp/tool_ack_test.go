@@ -223,9 +223,10 @@ func parkedAckWatch() domain.Watch {
 	return w
 }
 
-// TestAckInputSchemaHasContinueOf keeps continueOf in the derived MCP input
-// schema, so a client can send a human answer back to the same task.
-func TestAckInputSchemaHasContinueOf(t *testing.T) {
+// ackInputSchemaHasFields derives the ack input schema and checks that each
+// named property is present. Quoting the field matches a JSON object key.
+func ackInputSchemaHasFields(t *testing.T, fields ...string) {
+	t.Helper()
 	schema, err := jsonschema.For[AckInput](nil)
 	if err != nil {
 		t.Fatalf("input schema: %v", err)
@@ -234,8 +235,29 @@ func TestAckInputSchemaHasContinueOf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal input schema: %v", err)
 	}
-	if !bytes.Contains(raw, []byte(`"continueOf"`)) {
-		t.Fatalf("input schema has no continueOf property: %s", raw)
+	for _, field := range fields {
+		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
+			t.Fatalf("input schema has no %s property: %s", field, raw)
+		}
+	}
+}
+
+// TestAckInputSchemaHasFields keeps the client-facing ack fields in one table.
+// continueOf returns the answer to the same Watch, revision pins the event
+// version, and decision with decisionID carries approve or reject.
+func TestAckInputSchemaHasFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields []string
+	}{
+		{name: "continueOf", fields: []string{"continueOf"}},
+		{name: "revision", fields: []string{"revision"}},
+		{name: "decision", fields: []string{"decision", "decisionID"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ackInputSchemaHasFields(t, tc.fields...)
+		})
 	}
 }
 
@@ -356,22 +378,6 @@ func TestAckContinueOfMustNameSameWatch(t *testing.T) {
 
 // TestSQLObligationStamperClaimedAtIdempotent proves the production stamper
 // persists claimedAt in one transaction and keeps it on a repeat.
-// TestAckInputSchemaHasRevision keeps the task revision in the derived MCP
-// input schema, so a client can pin the version its event was made against.
-func TestAckInputSchemaHasRevision(t *testing.T) {
-	schema, err := jsonschema.For[AckInput](nil)
-	if err != nil {
-		t.Fatalf("input schema: %v", err)
-	}
-	raw, err := json.Marshal(schema)
-	if err != nil {
-		t.Fatalf("marshal input schema: %v", err)
-	}
-	if !bytes.Contains(raw, []byte(`"revision"`)) {
-		t.Fatalf("input schema has no revision property: %s", raw)
-	}
-}
-
 // TestAckReceiptReturnsCommittedRevision proves ADR 0036 §5: the ack reports
 // the Watch revision it was given at, not the webhook event.id of ADR 0034 §4.
 // The ordinary MCP response stays ok-only as T2.23 requires.
@@ -561,24 +567,6 @@ func TestDecisionValidSet(t *testing.T) {
 	for _, bad := range []Decision{"", "maybe", "APPROVE", "approve "} {
 		if bad.Valid() {
 			t.Errorf("decision %q must not be valid", bad)
-		}
-	}
-}
-
-// TestAckInputSchemaHasDecision keeps the decision fields in the derived MCP
-// input schema, so a client can send approve or reject through beacon_ack.
-func TestAckInputSchemaHasDecision(t *testing.T) {
-	schema, err := jsonschema.For[AckInput](nil)
-	if err != nil {
-		t.Fatalf("input schema: %v", err)
-	}
-	raw, err := json.Marshal(schema)
-	if err != nil {
-		t.Fatalf("marshal input schema: %v", err)
-	}
-	for _, field := range []string{"decision", "decisionID"} {
-		if !bytes.Contains(raw, []byte(`"`+field+`"`)) {
-			t.Fatalf("input schema has no %s property: %s", field, raw)
 		}
 	}
 }
