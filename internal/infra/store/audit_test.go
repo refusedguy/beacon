@@ -4,20 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 )
-
-func openAuditDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "audit.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 func auditAt(second int) time.Time {
 	return time.Date(2026, 11, 20, 10, 0, second, 0, time.UTC)
@@ -26,7 +15,7 @@ func auditAt(second int) time.Time {
 // The row is written through d.Write, so it must be visible to a reader on
 // the separate read pool after the call returns.
 func TestAuditRecordInTransaction(t *testing.T) {
-	d := openAuditDB(t)
+	d := openTestDB(t, "audit.db")
 	want := AuditEntry{
 		Actor:     "ses_executor",
 		Ingress:   AuditIngressMCP,
@@ -58,7 +47,7 @@ func TestAuditRecordInTransaction(t *testing.T) {
 // RecordAuditTx is the primitive a privileged command uses to audit itself in
 // the same transaction. A rolled-back transaction must leave no audit row.
 func TestAuditRollbackLeavesNoRecord(t *testing.T) {
-	d := openAuditDB(t)
+	d := openTestDB(t, "audit.db")
 	boom := errors.New("command failed")
 	err := d.Write(context.Background(), func(tx *sql.Tx) error {
 		if err := RecordAuditTx(tx, AuditEntry{
@@ -93,7 +82,7 @@ func TestAuditRollbackLeavesNoRecord(t *testing.T) {
 }
 
 func TestAuditFilterByIngressAndActor(t *testing.T) {
-	d := openAuditDB(t)
+	d := openTestDB(t, "audit.db")
 	entries := []AuditEntry{
 		{Actor: "alice", Ingress: AuditIngressMCP, CommandID: "c1", Action: "merge", At: auditAt(1)},
 		{Actor: "alice", Ingress: AuditIngressTUI, CommandID: "c2", Action: "wake", At: auditAt(2)},
@@ -153,7 +142,7 @@ func TestAuditFilterByIngressAndActor(t *testing.T) {
 }
 
 func TestAuditEmptyDatabase(t *testing.T) {
-	d := openAuditDB(t)
+	d := openTestDB(t, "audit.db")
 	got, err := d.ListAudit(AuditFilter{})
 	if err != nil {
 		t.Fatalf("ListAudit on empty database: %v", err)
@@ -175,7 +164,7 @@ func TestAuditEmptyDatabase(t *testing.T) {
 // that issued them. They differ by action and may arrive on different
 // ingresses.
 func TestAuditMergeAndWakeHaveActor(t *testing.T) {
-	d := openAuditDB(t)
+	d := openTestDB(t, "audit.db")
 	if err := d.RecordAudit(AuditEntry{
 		Actor: "ses_orchestrator", Ingress: AuditIngressMCP,
 		CommandID: "merge-1", Action: "merge", At: auditAt(1),
@@ -206,7 +195,7 @@ func TestAuditMergeAndWakeHaveActor(t *testing.T) {
 }
 
 func TestAuditRejectsIncompleteEntry(t *testing.T) {
-	d := openAuditDB(t)
+	d := openTestDB(t, "audit.db")
 	valid := AuditEntry{
 		Actor: "alice", Ingress: AuditIngressTUI,
 		CommandID: "c1", Action: "cancel", At: auditAt(1),

@@ -73,6 +73,23 @@ func requireUserVersion(t *testing.T, ctx context.Context, db *sql.DB, want int)
 	}
 }
 
+// openTestDB opens a migrated database in a temporary directory and closes it
+// when the test ends. The optional name preserves scenarios that depend on the
+// database file name.
+func openTestDB(t *testing.T, name ...string) *DB {
+	t.Helper()
+	fileName := "state.db"
+	if len(name) > 0 {
+		fileName = name[0]
+	}
+	d, err := Open(filepath.Join(t.TempDir(), fileName))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	return d
+}
+
 func TestOpenFromEmpty(t *testing.T) {
 	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

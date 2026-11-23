@@ -12,18 +12,8 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
-func openSnapshotsDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
-
 func TestSaveSnapshotRoundTrip(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	at := time.Date(2026, 11, 20, 10, 30, 0, 123456789, time.UTC)
 	payload := []byte(`{"watches":[],"counters":{"poll_cycles":7}}`)
 	seq, err := d.SaveSnapshot(Snapshot{SchemaVersion: 3, Payload: payload, CreatedAt: at})
@@ -57,7 +47,7 @@ func TestSaveSnapshotRoundTrip(t *testing.T) {
 }
 
 func TestSnapshotSchemaVersionRoundTripsPerSnapshot(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	base := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 	for i, version := range []int{1, 6, 12} {
 		_, err := d.SaveSnapshot(Snapshot{
@@ -82,7 +72,7 @@ func TestSnapshotSchemaVersionRoundTripsPerSnapshot(t *testing.T) {
 }
 
 func TestLatestSnapshotReturnsNewest(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	base := time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)
 	for i, payload := range []string{"first", "second", "third"} {
 		_, err := d.SaveSnapshot(Snapshot{
@@ -114,7 +104,7 @@ func TestLatestSnapshotReturnsNewest(t *testing.T) {
 }
 
 func TestLatestSnapshotEmptyDB(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	got, found, err := d.LatestSnapshot()
 	if err != nil {
 		t.Fatalf("LatestSnapshot on empty store: %v", err)
@@ -175,7 +165,7 @@ func TestSnapshotSurvivesReopen(t *testing.T) {
 }
 
 func TestSaveSnapshotFillsZeroTime(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	before := time.Now().UTC()
 	if _, err := d.SaveSnapshot(Snapshot{SchemaVersion: 1, Payload: []byte("x")}); err != nil {
 		t.Fatalf("SaveSnapshot: %v", err)
@@ -191,7 +181,7 @@ func TestSaveSnapshotFillsZeroTime(t *testing.T) {
 }
 
 func TestSaveSnapshotTxRollbackLeavesNoSnapshot(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	boom := errors.New("boom")
 	err := d.Write(context.Background(), func(tx *sql.Tx) error {
 		if _, err := SaveSnapshotTx(tx, Snapshot{SchemaVersion: 1, Payload: []byte("x")}); err != nil {
@@ -212,7 +202,7 @@ func TestSaveSnapshotTxRollbackLeavesNoSnapshot(t *testing.T) {
 }
 
 func TestSaveSnapshotRejectsNegativeSchemaVersion(t *testing.T) {
-	d := openSnapshotsDB(t)
+	d := openTestDB(t)
 	if _, err := d.SaveSnapshot(Snapshot{SchemaVersion: -1, Payload: []byte("x")}); err == nil {
 		t.Error("SaveSnapshot with negative schema version succeeded")
 	}

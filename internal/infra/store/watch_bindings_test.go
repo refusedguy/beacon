@@ -4,20 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
 
 func newWatchBindingTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
+	return openTestDB(t)
 }
 
 func watchBindingEntry(watchID string, revision uint64, token int64, configID string) WatchBindingEntry {
@@ -47,7 +40,7 @@ func watchBindingRowCount(t *testing.T, d *DB, watchID string) int {
 // writes the executor row and its Watch binding with the configId. A repeat of
 // the same registration leaves one binding row.
 func TestRegisterWatchExecutorWritesBinding(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 	const (
 		projectKey = "project-a"
 		watchID    = "watch-61"
@@ -93,7 +86,7 @@ func TestRegisterWatchExecutorWritesBinding(t *testing.T) {
 // INTEGER. A binding written after the table is dropped must get the migration
 // shape, including the project_key CHECK.
 func TestWriteWatchBindingUsesCanonicalDDL(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
 		_, err := tx.Exec(`DROP TABLE IF EXISTS watch_bindings`)
 		return err
@@ -113,7 +106,7 @@ func TestWriteWatchBindingUsesCanonicalDDL(t *testing.T) {
 }
 
 func TestWriteWatchBindingCreatesDistinctRows(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 
 	first, err := d.WriteWatchBinding(watchBindingEntry("watch-1", 3, 30, "config-v1"))
 	if err != nil {
@@ -149,7 +142,7 @@ func TestWriteWatchBindingCreatesDistinctRows(t *testing.T) {
 }
 
 func TestWriteWatchBindingOldRevisionDoesNotOverwriteNew(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 
 	newer := watchBindingEntry("watch-1", 9, 90, "config-new")
 	if _, err := d.WriteWatchBinding(newer); err != nil {
@@ -185,7 +178,7 @@ func TestWriteWatchBindingOldRevisionDoesNotOverwriteNew(t *testing.T) {
 }
 
 func TestWriteWatchBindingFencingToken(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 
 	if _, err := d.WriteWatchBinding(watchBindingEntry("watch-1", 2, 20, "first")); err != nil {
 		t.Fatalf("WriteWatchBinding(rev 2, token 20): %v", err)
@@ -210,7 +203,7 @@ func TestWriteWatchBindingFencingToken(t *testing.T) {
 }
 
 func TestWriteWatchBindingDefaultsTokenAndSubscriber(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 	e := watchBindingEntry("watch-1", 5, 0, "config")
 	e.SubscriberID = ""
 
@@ -227,7 +220,7 @@ func TestWriteWatchBindingDefaultsTokenAndSubscriber(t *testing.T) {
 }
 
 func TestWriteWatchBindingRejectsEmptyKeys(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 	for _, e := range []WatchBindingEntry{
 		watchBindingEntry("", 1, 1, "config"),
 		func() WatchBindingEntry {
@@ -254,7 +247,7 @@ func TestWriteWatchBindingRejectsEmptyKeys(t *testing.T) {
 }
 
 func TestWriteWatchBindingConcurrentSameRevision(t *testing.T) {
-	d := newWatchBindingTestDB(t)
+	d := openTestDB(t)
 
 	const writers = 16
 	var wg sync.WaitGroup

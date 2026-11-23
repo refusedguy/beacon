@@ -3,26 +3,15 @@ package store
 import (
 	"context"
 	"database/sql"
-	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func newProjectKeyTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "project-key.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 // TestWriteWatchBindingKeepsTwoProjectsAtSameRevision pins the BCX-34 bug.
 // The old (watch_id, revision) key made the second project's write look like
 // a repeat, so the row was dropped before it reached SQLite.
 func TestWriteWatchBindingKeepsTwoProjectsAtSameRevision(t *testing.T) {
-	d := newProjectKeyTestDB(t)
+	d := openTestDB(t, "project-key.db")
 	const watchID = "shared-watch"
 	for _, project := range []string{"project-a", "project-b"} {
 		e := WatchBindingEntry{
@@ -69,7 +58,7 @@ func TestWriteWatchBindingKeepsTwoProjectsAtSameRevision(t *testing.T) {
 // TestBindWatchKeepsTwoProjectsAtSameRevision covers the other insert path in
 // registry.go, which also used INSERT OR IGNORE with the watch-only key.
 func TestBindWatchKeepsTwoProjectsAtSameRevision(t *testing.T) {
-	d := newProjectKeyTestDB(t)
+	d := openTestDB(t, "project-key.db")
 	const watchID = "shared-watch"
 	for _, project := range []string{"project-a", "project-b"} {
 		b := WatchBinding{
@@ -97,7 +86,7 @@ func TestBindWatchKeepsTwoProjectsAtSameRevision(t *testing.T) {
 // with the old (watch_id, revision) primary key is rebuilt on the next write
 // and keeps the rows already stored.
 func TestWatchBindingProjectKeyRebuildsLegacyTable(t *testing.T) {
-	d := newProjectKeyTestDB(t)
+	d := openTestDB(t, "project-key.db")
 	err := d.Write(context.Background(), func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`DROP TABLE watch_bindings`); err != nil {
 			return err

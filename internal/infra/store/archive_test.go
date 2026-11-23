@@ -12,18 +12,6 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
-func openArchiveDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = d.Close()
-	})
-	return d
-}
-
 func newArchiveWatch(id string, status domain.Status, verdict domain.Verdict, closedAt time.Time, reason string) domain.Watch {
 	return domain.Watch{
 		ID:       id,
@@ -94,7 +82,7 @@ func archivedWatchIDs(t *testing.T, d *DB) []string {
 }
 
 func TestArchiveClosedWatchesMovesOnlyEligible(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-ClosedWatchRetention - time.Hour)
 	recent := now.Add(-24 * time.Hour)
@@ -194,7 +182,7 @@ func TestArchiveClosedWatchesMovesOnlyEligible(t *testing.T) {
 }
 
 func TestArchiveClosedWatchesRetentionBoundary(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	boundary := now.Add(-ClosedWatchRetention)
 	watches := []domain.Watch{
@@ -223,7 +211,7 @@ func TestArchiveClosedWatchesRetentionBoundary(t *testing.T) {
 }
 
 func TestArchiveClosedWatchesSkipsCloseWithoutTerminalReason(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	old := now.Add(-ClosedWatchRetention - time.Hour)
 	watches := []domain.Watch{
@@ -252,7 +240,7 @@ func TestArchiveClosedWatchesSkipsCloseWithoutTerminalReason(t *testing.T) {
 // the marker must survive a restart so a fresh process does not re-run the
 // last hour's work or forget a pass that is due.
 func TestArchiveRunHourlySchedule(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	ctx := context.Background()
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 
@@ -365,7 +353,7 @@ func TestArchiveRunMarkerSurvivesReopen(t *testing.T) {
 // Two cycles can tick at the same time. The single writer and the marker in
 // the same transaction must let exactly one of them perform the pass.
 func TestArchiveRunConcurrentCyclesArchiveOnce(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	ctx := context.Background()
 	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 	for _, id := range []string{"race-1", "race-2", "race-3"} {
@@ -411,7 +399,7 @@ func TestArchiveRunConcurrentCyclesArchiveOnce(t *testing.T) {
 }
 
 func TestArchiveRunRejectsZeroTime(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	ctx := context.Background()
 	if _, err := d.ArchiveRun(ctx, time.Time{}); err == nil {
 		t.Error("ArchiveRun with zero time succeeded")
@@ -422,7 +410,7 @@ func TestArchiveRunRejectsZeroTime(t *testing.T) {
 }
 
 func TestWatchArchiveSchemaHasAllWatchFields(t *testing.T) {
-	d := openArchiveDB(t)
+	d := openTestDB(t)
 	requireTable(t, d.readDB, "watch_archive")
 
 	rows, err := d.readDB.Query(`PRAGMA table_info(watch_archive)`)

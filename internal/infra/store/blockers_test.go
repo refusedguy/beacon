@@ -3,25 +3,14 @@ package store
 import (
 	"bytes"
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
-func openControlPlaneTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
-
 func TestControlPlaneMigration(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	if d.Version() != latestVersion(t) {
 		t.Errorf("Version() = %d, want %d", d.Version(), latestVersion(t))
 	}
@@ -34,7 +23,7 @@ func TestControlPlaneMigration(t *testing.T) {
 }
 
 func TestLiveWatchesIncludesBlocked(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	watches := []domain.Watch{
 		{ID: "live-watch", Status: domain.StatusWatching},
 		{ID: "notify-watch", Status: domain.StatusNotifying},
@@ -79,7 +68,7 @@ func TestLiveWatchesIncludesBlocked(t *testing.T) {
 }
 
 func TestGetOrCreateOpenBlockerDedup(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 
 	first, created, err := d.GetOrCreateOpenBlocker(
@@ -132,7 +121,7 @@ func TestGetOrCreateOpenBlockerDedup(t *testing.T) {
 }
 
 func TestAssignFixerIncrementsAttempts(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Now().UTC()
 	b, _, err := d.GetOrCreateOpenBlocker("org/repo", "main", []string{"ci/test"}, "w1", now)
 	if err != nil {
@@ -166,7 +155,7 @@ func TestAssignFixerIncrementsAttempts(t *testing.T) {
 }
 
 func TestResolveBlockerUnblocksWatches(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 20, 13, 0, 0, 0, time.UTC)
 	b, _, err := d.GetOrCreateOpenBlocker(
 		"org/repo", "main", []string{"ci/test"}, "w1", now)
@@ -245,7 +234,7 @@ func TestResolveBlockerUnblocksWatches(t *testing.T) {
 }
 
 func TestResolveBlockersByBaseGreen(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Now().UTC()
 	green, _, err := d.GetOrCreateOpenBlocker("org/repo", "main", []string{"ci/test"}, "w-green", now)
 	if err != nil {
@@ -300,7 +289,7 @@ func TestResolveBlockersByBaseGreen(t *testing.T) {
 // incidents written before base_ref was recorded use an empty string, while
 // baseRefOf maps the Watch base to main. Resolving a green main must close them.
 func TestResolveBlockersByBaseGreenLegacyEmptyBaseRef(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Now().UTC()
 
 	legacy, _, err := d.GetOrCreateOpenBlocker("org/repo", "", []string{"build"}, "w-legacy", now)
@@ -356,7 +345,7 @@ func TestResolveBlockersByBaseGreenLegacyEmptyBaseRef(t *testing.T) {
 // and ci-provider-probe run with continue-on-error, so they must not open a
 // second incident or keep an incident open when only they fail on base.
 func TestBlockerSignatureIgnoresInformationalChecks(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Now().UTC()
 
 	withInfo, created, err := d.GetOrCreateOpenBlocker("org/repo", "main",
@@ -388,7 +377,7 @@ func TestBlockerSignatureIgnoresInformationalChecks(t *testing.T) {
 }
 
 func TestOrchestratorBindingAndRuntimeStats(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 20, 14, 0, 0, 0, time.UTC)
 	if _, bound, err := d.BoundOrchestrator("project"); err != nil || bound {
 		t.Fatalf("BoundOrchestrator before bind = %v, %v, want unbound", bound, err)
@@ -430,7 +419,7 @@ func TestOrchestratorBindingAndRuntimeStats(t *testing.T) {
 }
 
 func TestMarkObligationDeliveredPersists(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	o := domain.Obligation{
 		ID: "w1:1:s1", WatchID: "w1", Revision: 1, SubscriberID: "s1",
 		VerdictPointer: domain.VerdictReady,
@@ -475,7 +464,7 @@ func TestMarkObligationDeliveredPersists(t *testing.T) {
 }
 
 func TestResetControlPlaneState(t *testing.T) {
-	d := openControlPlaneTestDB(t)
+	d := openTestDB(t)
 	now := time.Now().UTC()
 	if err := d.SaveWatch(domain.Watch{ID: "w1", Status: domain.StatusWatching}); err != nil {
 		t.Fatalf("SaveWatch: %v", err)

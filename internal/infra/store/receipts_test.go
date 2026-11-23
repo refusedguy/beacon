@@ -18,16 +18,6 @@ import (
 
 const testReceiptAt = "2026-11-19T12:00:00Z"
 
-func newReceiptDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
-
 func writeReceiptsFile(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "receipts.jsonl")
@@ -78,7 +68,7 @@ func receiptLineWithVerified(obligationID string, attempt int, outcome string, v
 }
 
 func TestImportReceiptsIdempotent(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "obl-1")
 
 	path := writeReceiptsFile(t, strings.Join([]string{
@@ -138,7 +128,7 @@ func TestImportReceiptsIdempotent(t *testing.T) {
 }
 
 func TestImportReceiptsIgnoresPartialTail(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "obl-tail")
 
 	whole := receiptLine("obl-tail", 1, "posted") + "\n"
@@ -179,7 +169,7 @@ func TestImportReceiptsIgnoresPartialTail(t *testing.T) {
 }
 
 func TestImportReceiptsOutcomeStates(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	for _, id := range []string{"posted", "failed", "none"} {
 		seedReceiptObligation(t, d, id)
 	}
@@ -230,7 +220,7 @@ func TestImportReceiptsOutcomeStates(t *testing.T) {
 }
 
 func TestImportReceiptsIndeterminateNeverPosted(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "indet")
 	path := writeReceiptsFile(t, receiptLine("indet", 1, "indeterminate")+"\n")
 
@@ -254,7 +244,7 @@ func TestImportReceiptsIndeterminateNeverPosted(t *testing.T) {
 }
 
 func TestImportReceiptsRejectsBadLines(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "ok")
 
 	path := writeReceiptsFile(t, strings.Join([]string{
@@ -292,7 +282,7 @@ func TestImportReceiptsRejectsBadLines(t *testing.T) {
 }
 
 func TestImportReceiptsMissingFileIsNoop(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	result, err := d.ImportReceipts(filepath.Join(t.TempDir(), "absent.jsonl"))
 	if err != nil {
 		t.Fatalf("import missing file: %v", err)
@@ -334,7 +324,7 @@ func TestParseReceiptTime(t *testing.T) {
 }
 
 func TestArtifactSourceKindsPersisted(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	for _, id := range []string{"src-branch", "src-pr", "src-worktree"} {
 		seedReceiptObligation(t, d, id)
 	}
@@ -392,7 +382,7 @@ func TestArtifactSourceKindsPersisted(t *testing.T) {
 }
 
 func TestArtifactSourceRejectsPrivateStatePaths(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "src-reject")
 
 	// A free-form path is not a source at all. The typed forms below try to
@@ -460,7 +450,7 @@ func TestClosedPRSourceTerminalVerdict(t *testing.T) {
 }
 
 func TestClosedPRReceiptTerminalWithoutAgentLogs(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "closed-pr")
 
 	line := receiptLineWithSource("closed-pr", 1, "posted",
@@ -495,7 +485,7 @@ func TestClosedPRReceiptTerminalWithoutAgentLogs(t *testing.T) {
 func jsonRaw(s string) json.RawMessage { return json.RawMessage(s) }
 
 func TestRejectDuplicateReceiptRecordedOnRepeat(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 
 	first, err := d.StartTask("req-abc", "task-1", []byte("state"))
 	if err != nil {
@@ -544,7 +534,7 @@ func TestRejectDuplicateReceiptRecordedOnRepeat(t *testing.T) {
 }
 
 func TestReceiptAgentVersionPersisted(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "ver-1")
 
 	line := receiptLineWithVersion("ver-1", 1, "posted",
@@ -572,7 +562,7 @@ func TestReceiptAgentVersionPersisted(t *testing.T) {
 }
 
 func TestReceiptWithoutVersionStillImports(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "ver-old")
 
 	path := writeReceiptsFile(t, receiptLine("ver-old", 1, "posted")+"\n")
@@ -596,7 +586,7 @@ func TestReceiptWithoutVersionStillImports(t *testing.T) {
 }
 
 func TestReceiptMalformedVersionRejected(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "ver-bad")
 
 	lines := []string{
@@ -621,7 +611,7 @@ func TestReceiptMalformedVersionRejected(t *testing.T) {
 }
 
 func TestReceiptVersionStableOnReimport(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "ver-repeat")
 
 	line := receiptLineWithVersion("ver-repeat", 1, "posted",
@@ -647,7 +637,7 @@ func TestReceiptVersionStableOnReimport(t *testing.T) {
 }
 
 func TestReceiptVersionColumnAddedToLegacyTable(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 
 	// A receipts table made by a build before versions were recorded has no
 	// version column. Import must add it and still store the label.
@@ -716,7 +706,7 @@ func TestReceiptVersionColumnAddedToLegacyTable(t *testing.T) {
 // stays inside its task with verified=false as its reason and publishes no
 // deliveredAt, so wait_result keeps waiting.
 func TestImportReceiptsUnverifiedNotStored(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "unverified")
 
 	path := writeReceiptsFile(t, receiptLineWithVerified("unverified", 1, "posted", false)+"\n")
@@ -767,7 +757,7 @@ func TestImportReceiptsUnverifiedNotStored(t *testing.T) {
 }
 
 func TestImportReceiptsUnverifiedKeepsWaitUntilVerified(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "wait")
 
 	unverified := receiptLineWithVerified("wait", 1, "posted", false)
@@ -809,7 +799,7 @@ func TestImportReceiptsUnverifiedKeepsWaitUntilVerified(t *testing.T) {
 }
 
 func TestImportReceiptsLegacyLineWithoutVerifiedIsVerified(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "legacy")
 
 	// A receipts.jsonl written before verification was recorded has no
@@ -839,7 +829,7 @@ func TestImportReceiptsLegacyLineWithoutVerifiedIsVerified(t *testing.T) {
 }
 
 func TestReceiptsOnlyContainVerifiedResults(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	for _, id := range []string{"v-yes", "v-no"} {
 		seedReceiptObligation(t, d, id)
 	}
@@ -875,7 +865,7 @@ func TestReceiptsOnlyContainVerifiedResults(t *testing.T) {
 }
 
 func TestImportReceiptsRejectsNonBoolVerified(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "v-bad")
 
 	line := `{"obligationID":"v-bad","attempt":1,"outcome":"posted","at":"` + testReceiptAt +
@@ -935,7 +925,7 @@ func corruptReceiptObligation(t *testing.T, d *DB, id string) {
 }
 
 func TestEnqueueFencedCommitsTokenDataAndQueueTogether(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "fenced-ok")
 
 	r, raw := mustParseReceipt(t, receiptLine("fenced-ok", 1, "posted"))
@@ -977,7 +967,7 @@ func TestEnqueueFencedCommitsTokenDataAndQueueTogether(t *testing.T) {
 }
 
 func TestEnqueueFencedStaleTokenRefusesWholeWrite(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "fenced-stale")
 
 	first, raw1 := mustParseReceipt(t, receiptLine("fenced-stale", 1, "posted"))
@@ -1024,7 +1014,7 @@ func TestEnqueueFencedStaleTokenRefusesWholeWrite(t *testing.T) {
 }
 
 func TestEnqueueFencedRollbackLeavesNoPartialState(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	corruptReceiptObligation(t, d, "fenced-corrupt")
 
 	r, raw := mustParseReceipt(t, receiptLine("fenced-corrupt", 1, "posted"))
@@ -1055,7 +1045,7 @@ func TestEnqueueFencedRollbackLeavesNoPartialState(t *testing.T) {
 }
 
 func TestEnqueueFencedSameTokenIsIdempotent(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "fenced-same")
 
 	r, raw := mustParseReceipt(t, receiptLine("fenced-same", 1, "posted"))
@@ -1094,7 +1084,7 @@ func TestEnqueueFencedSameTokenIsIdempotent(t *testing.T) {
 }
 
 func TestEnqueueFencedHigherTokenSupersedes(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "fenced-higher")
 
 	r1, raw1 := mustParseReceipt(t, receiptLine("fenced-higher", 1, "posted"))
@@ -1137,7 +1127,7 @@ func TestEnqueueFencedHigherTokenSupersedes(t *testing.T) {
 }
 
 func TestEnqueueFencedRejectsInvalidInput(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "fenced-input")
 	r, raw := mustParseReceipt(t, receiptLine("fenced-input", 1, "posted"))
 	msg := fencedMessage("worker-a", "input")
@@ -1246,7 +1236,7 @@ func TestCheckClaimsKeepsInputOrder(t *testing.T) {
 }
 
 func TestSaveClaimsAndClaimResults(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	claims := []AgentClaim{
 		{ID: "b", Text: "CI failed", Evidence: []ClaimEvidence{{Kind: ClaimSourceCIRun, Ref: "run-9", Observed: true, Passed: false}}},
 		{ID: "a", Text: "tests pass", Evidence: []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "go test", Observed: true, Passed: true}}},
@@ -1270,7 +1260,7 @@ func TestSaveClaimsAndClaimResults(t *testing.T) {
 }
 
 func TestSaveClaimsUpsertById(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	pass := []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "t1", Observed: true, Passed: true}}
 	fail := []ClaimEvidence{{Kind: ClaimSourceTest, Ref: "t1", Observed: true, Passed: false}}
 	if err := d.SaveClaims([]AgentClaim{{ID: "c", Text: "first", Evidence: pass}}); err != nil {
@@ -1289,14 +1279,14 @@ func TestSaveClaimsUpsertById(t *testing.T) {
 }
 
 func TestSaveClaimsRejectsEmptyID(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	if err := d.SaveClaims([]AgentClaim{{ID: "  ", Text: "no id"}}); err == nil {
 		t.Fatal("SaveClaims succeeded with an empty id, want validation error")
 	}
 }
 
 func TestClaimResultsEmptyBeforeFirstSave(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	got, err := d.ClaimResults()
 	if err != nil {
 		t.Fatalf("ClaimResults on empty table: %v", err)
@@ -1310,7 +1300,7 @@ func TestClaimResultsEmptyBeforeFirstSave(t *testing.T) {
 // receipts.jsonl. No source, no verified flag. Such a line must import, set
 // deliveredAt only for posted, and stay a single row on a repeated import.
 func TestImportReceiptsPluginWireShape(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	for _, id := range []string{"wire-posted", "wire-failed"} {
 		seedReceiptObligation(t, d, id)
 	}
@@ -1361,7 +1351,7 @@ func TestImportReceiptsPluginWireShape(t *testing.T) {
 // the committed intent separate from the effect that still has to run.
 
 func TestRecordClientReceiptRepeatReturnsFirstResult(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	in := ClientReceipt{
 		ClientRequestID: "req-repeat",
 		ReceiptJSON:     []byte(`{"kind":"ack","task":"task-1"}`),
@@ -1404,7 +1394,7 @@ func TestRecordClientReceiptRepeatReturnsFirstResult(t *testing.T) {
 }
 
 func TestRecordClientReceiptConflictKeepsFirstRow(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	first, err := d.RecordClientReceipt(ClientReceipt{
 		ClientRequestID: "req-conflict",
 		ReceiptJSON:     []byte(`{"result":"first"}`),
@@ -1449,7 +1439,7 @@ func TestRecordClientReceiptConflictKeepsFirstRow(t *testing.T) {
 }
 
 func TestClientReceiptIntentSeparateFromEffect(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	got, err := d.RecordClientReceipt(ClientReceipt{
 		ClientRequestID: "req-intent",
 		ReceiptJSON:     []byte(`{"kind":"ack"}`),
@@ -1491,7 +1481,7 @@ func TestClientReceiptIntentSeparateFromEffect(t *testing.T) {
 }
 
 func TestClientReceiptEmptyDB(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	r, ok, err := d.ClientReceipt("req-absent")
 	if err != nil || ok {
 		t.Fatalf("ClientReceipt on empty DB = %+v, %v, %v; want not found", r, ok, err)
@@ -1511,7 +1501,7 @@ func TestClientReceiptEmptyDB(t *testing.T) {
 }
 
 func TestClientReceiptDefaultsEffectStatusToPending(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	got, err := d.RecordClientReceipt(ClientReceipt{
 		ClientRequestID: "req-default",
 		ReceiptJSON:     []byte(`{"kind":"ack"}`),
@@ -1526,7 +1516,7 @@ func TestClientReceiptDefaultsEffectStatusToPending(t *testing.T) {
 }
 
 func TestRecordClientReceiptRejectsEmptyKey(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	for _, key := range []string{"", "   "} {
 		if _, err := d.RecordClientReceipt(ClientReceipt{ClientRequestID: key}); err == nil {
 			t.Errorf("RecordClientReceipt(%q) succeeded, want validation error", key)
@@ -1542,7 +1532,7 @@ func TestRecordClientReceiptRejectsEmptyKey(t *testing.T) {
 // ordinary adapter receipts and recording a client receipt in the same store
 // must not change either count: existing calls stay intact.
 func TestClientReceiptsCoexistWithImportedReceipts(t *testing.T) {
-	d := newReceiptDB(t)
+	d := openTestDB(t)
 	seedReceiptObligation(t, d, "coexist")
 	path := writeReceiptsFile(t, receiptLine("coexist", 1, "posted")+"\n")
 	if _, err := d.ImportReceipts(path); err != nil {

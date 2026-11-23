@@ -29,13 +29,7 @@ func (f *failingWriter) Write(ctx context.Context, fn func(*sql.Tx) error) error
 }
 
 func openObservabilityDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
+	return openTestDB(t)
 }
 
 func persistFailed(t *testing.T, err error) *domain.AppError {
@@ -70,7 +64,7 @@ func insertRawEvent(t *testing.T, d *DB, watchID string, payload []byte) int64 {
 }
 
 func TestObservedPersistFailureRecordsLastErrorAndReturnsPersistFailed(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	cause := errors.New("disk full")
 	fw := &failingWriter{err: cause}
 	op := NewObservedPersistWithWriter(d, fw)
@@ -101,7 +95,7 @@ func TestObservedPersistFailureRecordsLastErrorAndReturnsPersistFailed(t *testin
 }
 
 func TestObservedPersistSeqOnlyAfterCommittedWrites(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 
 	// A failure inside the real writer rolls the data transaction back. Seq
@@ -217,7 +211,7 @@ func TestOpenProductionExposesHonestPersistToStats(t *testing.T) {
 }
 
 func TestLoadEventsSkipsCorruptedRowsWithoutStopping(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	insertRawEvent(t, d, "good-1", []byte(`{"kind":"wake-intent","obligationID":"w1:1:s1"}`))
 	badSeq := insertRawEvent(t, d, "bad", []byte(`{"kind":`))
 	insertRawEvent(t, d, "good-2", []byte(`{"ok":true}`))
@@ -244,7 +238,7 @@ func TestLoadEventsSkipsCorruptedRowsWithoutStopping(t *testing.T) {
 }
 
 func TestPersistStatsIsReadOnly(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 
 	err := op.Write(context.Background(), func(tx *sql.Tx) error {
@@ -287,7 +281,7 @@ func TestPersistStatsIsReadOnly(t *testing.T) {
 }
 
 func TestRecordStreamExposesMissingAndDuplicates(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 
 	// A read on a fresh store is zero and does not create the table.
@@ -347,7 +341,7 @@ func TestRecordStreamExposesMissingAndDuplicates(t *testing.T) {
 }
 
 func TestRecordStreamEmptyMissingRoundTrips(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 
 	if err := op.RecordStream(context.Background(), domain.StreamFinal{Chunks: 2}); err != nil {
@@ -363,7 +357,7 @@ func TestRecordStreamEmptyMissingRoundTrips(t *testing.T) {
 }
 
 func TestPersistStatsOnEmptyStoreDoesNotCreateState(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	state, loadErrors, err := d.PersistStats()
 	if err != nil {
 		t.Fatalf("PersistStats: %v", err)
@@ -388,7 +382,7 @@ func TestPersistStatsOnEmptyStoreDoesNotCreateState(t *testing.T) {
 // wake stays woke=false; a start reported on its own stays sent=false; both
 // converge on one row when each is observed in turn.
 func TestRecordWakeKeepsSentAndWokeSeparate(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 
 	empty, err := d.WakeObservations()
@@ -453,7 +447,7 @@ func TestRecordWakeKeepsSentAndWokeSeparate(t *testing.T) {
 // TestRecordWakeDoesNotAdvancePersistSeq keeps the new fact out of the persist
 // block: wake observations are their own observability surface, like streams.
 func TestRecordWakeDoesNotAdvancePersistSeq(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 
 	if err := op.RecordWake(context.Background(), WakeObservation{ObligationID: "obl-1", Sent: true, Woke: true}); err != nil {
@@ -482,7 +476,7 @@ func TestRecordWakeDoesNotAdvancePersistSeq(t *testing.T) {
 // TestRecordWakeRejectsEmptyObligation keeps the boundary honest: a fact with
 // no obligation cannot be attributed to a wake episode.
 func TestRecordWakeRejectsEmptyObligation(t *testing.T) {
-	d := openObservabilityDB(t)
+	d := openTestDB(t)
 	op := NewObservedPersist(d)
 	if err := op.RecordWake(context.Background(), WakeObservation{Sent: true}); err == nil {
 		t.Fatal("RecordWake with empty obligation id: error = nil, want invalid input")

@@ -3,19 +3,8 @@ package store
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 )
-
-func openOutboxTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 // committedOutboxCount reads through the separate read pool, so it sees only
 // committed rows and never the writer's uncommitted transaction.
@@ -36,7 +25,7 @@ func committedOutboxCount(t *testing.T, d *DB) int {
 }
 
 func TestOutboxCommitWritesIntentAndEntry(t *testing.T) {
-	d := openOutboxTestDB(t)
+	d := openTestDB(t)
 	s := NewOutboxStore(d)
 
 	created, err := s.Commit(context.Background(), "cmd-1", "notify", []byte("hello"))
@@ -74,7 +63,7 @@ func TestOutboxCommitWritesIntentAndEntry(t *testing.T) {
 }
 
 func TestOutboxRollbackLeavesNoRow(t *testing.T) {
-	d := openOutboxTestDB(t)
+	d := openTestDB(t)
 	s := NewOutboxStore(d)
 	boom := errors.New("force rollback")
 	s.probe = func() error { return boom }
@@ -95,7 +84,7 @@ func TestOutboxRollbackLeavesNoRow(t *testing.T) {
 }
 
 func TestOutboxRepeatIsIdempotent(t *testing.T) {
-	d := openOutboxTestDB(t)
+	d := openTestDB(t)
 	s := NewOutboxStore(d)
 
 	first, err := s.Commit(context.Background(), "cmd-1", "notify", []byte("hello"))
@@ -126,7 +115,7 @@ func TestOutboxRepeatIsIdempotent(t *testing.T) {
 }
 
 func TestOutboxEffectNotVisibleBeforeCommit(t *testing.T) {
-	d := openOutboxTestDB(t)
+	d := openTestDB(t)
 	s := NewOutboxStore(d)
 
 	seenBefore, probeErr := -1, error(nil)
@@ -161,7 +150,7 @@ func TestOutboxEffectNotVisibleBeforeCommit(t *testing.T) {
 }
 
 func TestOutboxRejectsEmptyIdentity(t *testing.T) {
-	d := openOutboxTestDB(t)
+	d := openTestDB(t)
 	s := NewOutboxStore(d)
 
 	for _, args := range [][2]string{{"", "notify"}, {"cmd-1", ""}} {

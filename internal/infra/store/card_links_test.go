@@ -2,21 +2,10 @@ package store
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 )
-
-func newCardLinkTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 func cardLinkCount(t *testing.T, d *DB) int {
 	t.Helper()
@@ -44,7 +33,7 @@ func storedCardLink(t *testing.T, d *DB, cardID string) CardLink {
 }
 
 func TestLinkCreatesOneRowAndRepeatsAreNoops(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	first, err := d.Link("IDX-07", "watch-1", 123)
 	if err != nil {
@@ -84,7 +73,7 @@ func TestLinkCreatesOneRowAndRepeatsAreNoops(t *testing.T) {
 }
 
 func TestUnlinkIsIdempotent(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	if _, err := d.Link("IDX-07", "watch-1", 123); err != nil {
 		t.Fatalf("Link: %v", err)
@@ -113,7 +102,7 @@ func TestUnlinkIsIdempotent(t *testing.T) {
 }
 
 func TestUnlinkOnFreshStoreDoesNothing(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	removed, err := d.Unlink("IDX-07")
 	if err != nil {
@@ -128,7 +117,7 @@ func TestUnlinkOnFreshStoreDoesNothing(t *testing.T) {
 }
 
 func TestLinkRejectsEmptyIDs(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	for _, tc := range []struct{ cardID, watchID string }{
 		{"", "watch-1"},
@@ -144,7 +133,7 @@ func TestLinkRejectsEmptyIDs(t *testing.T) {
 }
 
 func TestLinkConcurrentSameCardCreatesOneRow(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	const callers = 16
 	var wg sync.WaitGroup
@@ -187,7 +176,7 @@ func TestLinkConcurrentSameCardCreatesOneRow(t *testing.T) {
 }
 
 func TestLinkConcurrentDistinctCardsCreatesEveryRow(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	const callers = 16
 	var wg sync.WaitGroup
@@ -227,7 +216,7 @@ func TestLinkConcurrentDistinctCardsCreatesEveryRow(t *testing.T) {
 }
 
 func TestLinkAndUnlinkConcurrentKeepAtMostOneRow(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	const callers = 16
 	var wg sync.WaitGroup
@@ -259,7 +248,7 @@ func TestLinkAndUnlinkConcurrentKeepAtMostOneRow(t *testing.T) {
 }
 
 func TestLinkCardWatchStoresExplicitIDs(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	// The session id need not match the agent id written in the card. Only the
 	// explicit cardID and watchID from the responses reach the store.
@@ -280,7 +269,7 @@ func TestLinkCardWatchStoresExplicitIDs(t *testing.T) {
 }
 
 func TestLinkCardWatchRejectsEmptyIDs(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	for _, tc := range []struct{ cardID, watchID string }{
 		{"", "watch-9"},
@@ -297,7 +286,7 @@ func TestLinkCardWatchRejectsEmptyIDs(t *testing.T) {
 }
 
 func TestLinkCardWatchConcurrentSamePairCreatesOneRow(t *testing.T) {
-	d := newCardLinkTestDB(t)
+	d := openTestDB(t)
 
 	start := make(chan struct{})
 	type callResult struct {

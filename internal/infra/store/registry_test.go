@@ -69,16 +69,6 @@ func assertCanonicalColumns(t *testing.T, d *DB) {
 	}
 }
 
-func newRegistryTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
-
 func registryExecutor(project, agent string) ExecutorRecord {
 	return ExecutorRecord{
 		ProjectKey:    project,
@@ -103,7 +93,7 @@ func registryBinding(watch string, revision uint64, project, agent string) Watch
 }
 
 func TestUpsertExecutorIdempotent(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 
 	first, err := d.UpsertExecutor(e)
@@ -155,7 +145,7 @@ func TestUpsertExecutorIdempotent(t *testing.T) {
 }
 
 func TestExecutorRuntimeRoundTrip(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 	e.Runtime = "subagent"
 	if _, err := d.UpsertExecutor(e); err != nil {
@@ -197,7 +187,7 @@ func TestExecutorRuntimeRoundTrip(t *testing.T) {
 }
 
 func TestUpsertExecutorSeparateKeys(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 
 	for _, e := range []ExecutorRecord{
 		registryExecutor("project-a", "session-1"),
@@ -221,7 +211,7 @@ func TestUpsertExecutorSeparateKeys(t *testing.T) {
 }
 
 func TestUpsertExecutorRejectsEmptyKeys(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 
 	for _, e := range []ExecutorRecord{
 		registryExecutor("", "session-1"),
@@ -234,7 +224,7 @@ func TestUpsertExecutorRejectsEmptyKeys(t *testing.T) {
 }
 
 func TestBindWatchIdempotent(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	b := registryBinding("watch-1", 7, "project-a", "session-1")
 
 	first, err := d.BindWatch(b)
@@ -274,7 +264,7 @@ func TestBindWatchIdempotent(t *testing.T) {
 }
 
 func TestBindWatchRejectsEmptyKeys(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 
 	for _, b := range []WatchBinding{
 		registryBinding("watch-1", 1, "", "session-1"),
@@ -288,7 +278,7 @@ func TestBindWatchRejectsEmptyKeys(t *testing.T) {
 }
 
 func TestRegisterExecutorIdempotent(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 	b := registryBinding("watch-1", 3, "project-a", "session-1")
 
@@ -333,7 +323,7 @@ func TestRegisterExecutorIdempotent(t *testing.T) {
 }
 
 func TestRegisterExecutorDifferentSessionAddsRow(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 
 	for _, agent := range []string{"session-1", "session-1", "session-2"} {
 		e := registryExecutor("project-a", agent)
@@ -360,7 +350,7 @@ func TestRegisterExecutorDifferentSessionAddsRow(t *testing.T) {
 }
 
 func TestRegisterExecutorRejectsMismatchedBinding(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 	b := registryBinding("watch-1", 1, "project-b", "session-1")
 	if _, err := d.RegisterExecutor(e, b); err == nil {
@@ -369,7 +359,7 @@ func TestRegisterExecutorRejectsMismatchedBinding(t *testing.T) {
 }
 
 func TestRegisterExecutorConcurrent(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 	b := registryBinding("watch-1", 5, "project-a", "session-1")
 
@@ -406,7 +396,7 @@ func TestRegisterExecutorConcurrent(t *testing.T) {
 }
 
 func TestProjectIsolation(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	for _, project := range []string{"project-a", "project-b"} {
 		e := registryExecutor(project, "session-1")
 		b := registryBinding("watch-1", 1, project, "session-1")
@@ -431,7 +421,7 @@ func TestProjectIsolation(t *testing.T) {
 }
 
 func TestCapabilitiesEmptyRoundTrip(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 	e.Capabilities = nil
 	if _, err := d.UpsertExecutor(e); err != nil {
@@ -479,7 +469,7 @@ func TestRegistryReopenKeepsRows(t *testing.T) {
 }
 
 func TestRegisterResultIsUseful(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "session-1")
 	b := registryBinding("watch-1", 9, "project-a", "session-1")
 	res, err := d.RegisterExecutor(e, b)
@@ -495,12 +485,12 @@ func TestRegisterResultIsUseful(t *testing.T) {
 }
 
 func TestMigratedSchemaIsCanonical(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	assertCanonicalColumns(t, d)
 }
 
 func TestFirstUseCreationUsesCanonicalSchema(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	if err := d.Write(context.Background(), func(tx *sql.Tx) error {
 		for _, table := range []string{"agent_registry", "agent_capabilities", "watch_bindings"} {
 			if _, err := tx.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
@@ -525,7 +515,7 @@ func TestFirstUseCreationUsesCanonicalSchema(t *testing.T) {
 }
 
 func TestRegistrySchemaHasSyncColumns(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	// A write runs the on-first-use migration that adds the sync columns.
 	if _, err := d.UpsertExecutor(registryExecutor("project-a", "session-1")); err != nil {
 		t.Fatalf("UpsertExecutor: %v", err)
@@ -542,7 +532,7 @@ func TestRegistrySchemaHasSyncColumns(t *testing.T) {
 }
 
 func TestEnsureRegistrySchemaAddsSyncColumnsToOldTable(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	// Recreate the migration 0005 shape without the sync columns.
 	err := d.Write(context.Background(), func(tx *sql.Tx) error {
 		if _, err := tx.Exec(`DROP TABLE agent_registry`); err != nil {
@@ -594,7 +584,7 @@ func TestEnsureRegistrySchemaAddsSyncColumnsToOldTable(t *testing.T) {
 }
 
 func TestSyncExecutorWritesObservationAndStatus(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	if _, err := d.UpsertExecutor(registryExecutor("project-a", "ses-live")); err != nil {
 		t.Fatalf("UpsertExecutor: %v", err)
 	}
@@ -631,7 +621,7 @@ func TestSyncExecutorWritesObservationAndStatus(t *testing.T) {
 }
 
 func TestSyncExecutorKeepsObservationOnRegister(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	e := registryExecutor("project-a", "ses-live")
 	if _, err := d.UpsertExecutor(e); err != nil {
 		t.Fatalf("UpsertExecutor: %v", err)
@@ -661,7 +651,7 @@ func TestSyncExecutorKeepsObservationOnRegister(t *testing.T) {
 }
 
 func TestSyncExecutorRejectsEmptyKeys(t *testing.T) {
-	d := newRegistryTestDB(t)
+	d := openTestDB(t)
 	for _, tc := range []struct{ project, agent string }{
 		{"", "ses-1"},
 		{"project-a", ""},

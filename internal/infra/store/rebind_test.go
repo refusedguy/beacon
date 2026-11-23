@@ -1,23 +1,12 @@
 package store
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
-
-func openRebindTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 func rebindFixtureWatch(id, orchestratorID string, status domain.Status, withSubscriber bool) domain.Watch {
 	w := domain.Watch{
@@ -42,7 +31,7 @@ func rebindFixtureWatch(id, orchestratorID string, status domain.Status, withSub
 }
 
 func TestRebindOrchestratorReplacesMatchingWatches(t *testing.T) {
-	d := openRebindTestDB(t)
+	d := openTestDB(t)
 	// w1 matches by both the field and the routing subscriber; w2 only by the
 	// field; w3 belongs to another orchestrator; w4 is closed and inactive.
 	fixtures := []domain.Watch{
@@ -117,7 +106,7 @@ func TestRebindOrchestratorReplacesMatchingWatches(t *testing.T) {
 }
 
 func TestRebindOrchestratorDryRunWritesNothing(t *testing.T) {
-	d := openRebindTestDB(t)
+	d := openTestDB(t)
 	original := rebindFixtureWatch("dry", "ses_old", domain.StatusWatching, true)
 	if err := d.SaveWatch(original); err != nil {
 		t.Fatalf("SaveWatch: %v", err)
@@ -145,7 +134,7 @@ func TestRebindOrchestratorDryRunWritesNothing(t *testing.T) {
 }
 
 func TestRebindOrchestratorIncludesBlockedWatches(t *testing.T) {
-	d := openRebindTestDB(t)
+	d := openTestDB(t)
 	blocked := rebindFixtureWatch("blocked", "ses_old", domain.StatusBlocked, true)
 	if err := d.SaveWatch(blocked); err != nil {
 		t.Fatalf("SaveWatch: %v", err)
@@ -173,7 +162,7 @@ func TestRebindOrchestratorIncludesBlockedWatches(t *testing.T) {
 }
 
 func TestBindOrchestratorAndRebind(t *testing.T) {
-	d := openRebindTestDB(t)
+	d := openTestDB(t)
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
 	if err := d.BindOrchestrator("project", "ses_old", "opencode", now); err != nil {
 		t.Fatalf("BindOrchestrator: %v", err)
@@ -214,7 +203,7 @@ func TestBindOrchestratorAndRebind(t *testing.T) {
 }
 
 func TestRebindOrchestratorRejectsInvalidArgs(t *testing.T) {
-	d := openRebindTestDB(t)
+	d := openTestDB(t)
 	for _, tc := range []struct{ from, to string }{
 		{"", "ses_new"},
 		{"ses_old", ""},

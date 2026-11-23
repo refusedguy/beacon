@@ -1,22 +1,11 @@
 package store
 
 import (
-	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
-
-func newBackfillTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 func backfillWatch(id string, status domain.Status, subscribers ...domain.Subscriber) domain.Watch {
 	return domain.Watch{
@@ -54,7 +43,7 @@ func backfillViews(records []ExecutorRecord) []backfillExecutorView {
 }
 
 func TestBackfillRegistryFillsActiveSubscribers(t *testing.T) {
-	d := newBackfillTestDB(t)
+	d := openTestDB(t)
 	watches := []domain.Watch{
 		backfillWatch("watch-1", domain.StatusWatching,
 			domain.Subscriber{
@@ -110,7 +99,7 @@ func TestBackfillRegistryFillsActiveSubscribers(t *testing.T) {
 }
 
 func TestBackfillRegistryDoesNotRewriteExistingRows(t *testing.T) {
-	d := newBackfillTestDB(t)
+	d := openTestDB(t)
 	w := backfillWatch("watch-1", domain.StatusWatching,
 		domain.Subscriber{
 			ID: "ses-1", Role: domain.RoleExecutor,
@@ -145,7 +134,7 @@ func TestBackfillRegistryDoesNotRewriteExistingRows(t *testing.T) {
 }
 
 func TestBackfillRegistrySkipsAddresslessSubscriber(t *testing.T) {
-	d := newBackfillTestDB(t)
+	d := openTestDB(t)
 	w := backfillWatch("watch-1", domain.StatusWatching,
 		domain.Subscriber{ID: "", Role: domain.RoleExecutor, Adapter: "opencode"},
 		domain.Subscriber{ID: "ses-1", Role: domain.RoleExecutor, Adapter: "opencode"},
@@ -167,7 +156,7 @@ func TestBackfillRegistrySkipsAddresslessSubscriber(t *testing.T) {
 }
 
 func TestBackfillRegistryRejectsEmptyProject(t *testing.T) {
-	d := newBackfillTestDB(t)
+	d := openTestDB(t)
 	if _, err := d.BackfillRegistry("  ", []string{"ses-1"}); err == nil {
 		t.Fatal("BackfillRegistry with empty project must fail")
 	}

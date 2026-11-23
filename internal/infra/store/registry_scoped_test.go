@@ -4,23 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
 )
-
-func newScopedTestDB(t *testing.T) *DB {
-	t.Helper()
-	d, err := Open(filepath.Join(t.TempDir(), "scoped.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	return d
-}
 
 // seedScopedRegistry writes two projects into one database. "shared" and
 // "shared-watch" use the same identifier in both projects, so a query that
@@ -29,7 +18,7 @@ func newScopedTestDB(t *testing.T) *DB {
 // currently disagree on the runtime column; this card only reads.
 func seedScopedRegistry(t *testing.T) *DB {
 	t.Helper()
-	d := newScopedTestDB(t)
+	d := openTestDB(t, "scoped.db")
 	now := time.Now().UTC().UnixNano()
 	executors := []struct{ project, agent, target string }{
 		{"project-a", "agent-a", "target-a"},
@@ -109,7 +98,7 @@ func TestNewProjectScopeRejectsEmptyKey(t *testing.T) {
 }
 
 func TestNewScopedRegistryRejectsEmptyOrNil(t *testing.T) {
-	d := newScopedTestDB(t)
+	d := openTestDB(t, "scoped.db")
 
 	if _, err := NewScopedRegistry(d, ProjectScope{}); err == nil {
 		t.Fatal("NewScopedRegistry accepted a zero scope")
