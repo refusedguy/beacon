@@ -49,67 +49,86 @@ type savedCard struct {
 func (d *TaskDeleter) Delete(ctx context.Context, ids []string) (DeleteResult, error) {
 	var out DeleteResult
 	normalized := normalizeIDs(ids)
-	if len(normalized) == 0 {
+	if err := validateIDs(normalized); err != nil {
+		return out, err
+	}
+	refused, err := d.refused(ctx, normalized)
+	if err != nil {
+		return out, err
+	}
+	if len(refused) > 0 {
+		out.Refused = refused
 		return out, nil
 	}
-	for _, id := range normalized {
-		if !validTaskID(id) {
-			return out, core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
-		}
+	results, saved, err := d.removeCards(normalized)
+	if err != nil {
+		return out, err
 	}
-
-	// Check every id before touching the tree so a refusal changes nothing.
-	for _, id := range normalized {
-		if d.Store == nil {
-			break
-		}
-		run, err := d.Store.FindActiveByTask(ctx, core.TaskID(id))
-		if err != nil {
-			return out, err
-		}
-		if run != nil {
-			out.Refused = append(out.Refused, id)
-		}
-	}
-	if len(out.Refused) > 0 {
-		return out, nil
-	}
-
-	dir := d.Root.Path
-	if dir == "" {
-		dir = "."
-	}
-	var saved []savedCard
-	for _, id := range normalized {
-		path := filepath.Join(dir, "docs", "tasks", id+".md")
-		content, err := os.ReadFile(path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				out.Results = append(out.Results, DeletedTask{ID: id, Status: "not_found"})
-				continue
-			}
-			restore(saved)
-			out.Results = nil
-			return out, err
-		}
-		if err := os.Remove(path); err != nil {
-			restore(saved)
-			out.Results = nil
-			return out, err
-		}
-		saved = append(saved, savedCard{path: path, content: content})
-		out.Results = append(out.Results, DeletedTask{ID: id, Status: "deleted"})
-	}
+	out.Results = results
 	if len(saved) == 0 {
 		return out, nil
 	}
 	if err := publishPath(ctx, d.Workspace, d.Root, "docs/tasks", "beacon: delete tasks"); err != nil {
 		restore(saved)
-		out.Results = nil
-		return out, err
+		return DeleteResult{}, err
 	}
 	out.Pushed = true
 	return out, nil
+}
+
+func validateIDs(ids []string) error {
+	for _, id := range ids {
+		if !validTaskID(id) {
+			return core.Errorf(core.CodeInvalidInput, "invalid task id %q", id)
+		}
+	}
+	return nil
+}
+
+// refused checks every id before the tree is touched so a refusal changes nothing.
+func (d *TaskDeleter) refused(ctx context.Context, ids []string) ([]string, error) {
+	var out []string
+	if d.Store == nil {
+		return out, nil
+	}
+	for _, id := range ids {
+		run, err := d.Store.FindActiveByTask(ctx, core.TaskID(id))
+		if err != nil {
+			return nil, err
+		}
+		if run != nil {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+func (d *TaskDeleter) removeCards(ids []string) ([]DeletedTask, []savedCard, error) {
+	dir := d.Root.Path
+	if dir == "" {
+		dir = "."
+	}
+	var results []DeletedTask
+	var saved []savedCard
+	for _, id := range ids {
+		path := filepath.Join(dir, "docs", "tasks", id+".md")
+		content, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			results = append(results, DeletedTask{ID: id, Status: "not_found"})
+			continue
+		}
+		if err != nil {
+			restore(saved)
+			return nil, nil, err
+		}
+		if err := os.Remove(path); err != nil {
+			restore(saved)
+			return nil, nil, err
+		}
+		saved = append(saved, savedCard{path: path, content: content})
+		results = append(results, DeletedTask{ID: id, Status: "deleted"})
+	}
+	return results, saved, nil
 }
 
 func restore(saved []savedCard) {
