@@ -230,33 +230,94 @@ func aliasNames(aliases []Alias) []string {
 	return out
 }
 
-func TestParallelRequestsNeverExceedTwo(t *testing.T) {
-	counter, _, _ := newTestCounter(t, 0)
-	var active, maxActive atomic.Int64
-	srv := newGraphQLServer(t, func(w http.ResponseWriter, r *http.Request, query string) {
-		now := active.Add(1)
-		for {
-			seen := maxActive.Load()
-			if now <= seen || maxActive.CompareAndSwap(seen, now) {
-				break
-			}
-		}
-		time.Sleep(30 * time.Millisecond)
-		active.Add(-1)
-		healthyReply(w, r, query)
-	})
+// TestParallelRequestsStayWithinMaxParallel checks the same limit through two
+// entry points. The handler holds the first MaxParallel requests until all of
+// them arrive, so the overlap is observed rather than given time to happen.
+func TestParallelRequestsStayWithinMaxParallel(t *testing.T) {
+	cases := []struct {
+		name  string
+		reply replyFunc
+		run   func(*Client, *Poller) error
+	}{
+		{
+			name:  "Client.Do",
+			reply: healthyReply,
+			run: func(client *Client, _ *Poller) error {
+				_, err := client.Do(context.Background(), Tier1, AliasesFromWatches(watches(500)))
+				return err
+			},
+		},
+		{
+			name:  "Poller.Tick",
+			reply: func(w http.ResponseWriter, _ *http.Request, query string) { tier1Reply(w, query) },
+			run: func(_ *Client, poller *Poller) error {
+				_, err := poller.Tick(context.Background(), watches(500))
+				return err
+			},
+		},
+	}
 
-	client := NewClient(srv.URL, "", srv.Client(), counter)
-	if _, err := client.Do(context.Background(), Tier1, AliasesFromWatches(watches(500))); err != nil {
-		t.Fatalf("Do: %v", err)
-	}
-	if got := maxActive.Load(); got > MaxParallel {
-		t.Fatalf("max parallel requests = %d, want at most %d", got, MaxParallel)
-	} else if got < 2 {
-		t.Fatalf("max parallel requests = %d, want 2 to prove requests overlap", got)
-	}
-	if calls, sizes := srv.snapshot(); calls != 5 || fmt.Sprint(sizes) != fmt.Sprint([]int{100, 100, 100, 100, 100}) {
-		t.Fatalf("requests = %d, sizes = %v, want five chunks of 100", calls, sizes)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			counter, _, _ := newTestCounter(t, 0)
+			var active, maxActive atomic.Int64
+			arrived := make(chan struct{}, MaxParallel)
+			release := make(chan struct{})
+			var once sync.Once
+			unlock := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(unlock)
+
+			srv := newGraphQLServer(t, func(w http.ResponseWriter, r *http.Request, query string) {
+				now := active.Add(1)
+				for {
+					seen := maxActive.Load()
+					if now <= seen || maxActive.CompareAndSwap(seen, now) {
+						break
+					}
+				}
+				select {
+				case arrived <- struct{}{}:
+				default:
+				}
+				<-release
+				active.Add(-1)
+				tc.reply(w, r, query)
+			})
+
+			client := NewClient(srv.URL, "", srv.Client(), counter)
+			poller := NewPoller(client, counter, nil)
+			done := make(chan error, 1)
+			go func() { done <- tc.run(client, poller) }()
+
+			for i := 0; i < MaxParallel; i++ {
+				select {
+				case <-arrived:
+				case <-time.After(5 * time.Second):
+					t.Fatal("timed out waiting for parallel requests to reach the server")
+				}
+			}
+			if got := maxActive.Load(); got != MaxParallel {
+				t.Fatalf("parallel requests at barrier = %d, want %d", got, MaxParallel)
+			}
+			unlock()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("request: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for requests to finish")
+			}
+
+			if got := maxActive.Load(); got > MaxParallel || got < 2 {
+				t.Fatalf("max parallel requests = %d, want between 2 and %d", got, MaxParallel)
+			}
+			if calls, sizes := srv.snapshot(); calls != 5 ||
+				fmt.Sprint(sizes) != fmt.Sprint([]int{100, 100, 100, 100, 100}) {
+				t.Fatalf("requests = %d, sizes = %v, want five chunks of 100", calls, sizes)
+			}
+		})
 	}
 }
 

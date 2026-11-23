@@ -3,9 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -188,36 +186,6 @@ func TestTier1ChunksAtMost100(t *testing.T) {
 			}
 			seen[alias.Name] = true
 		}
-	}
-}
-
-func TestTier1ParallelRequestsAtMostTwo(t *testing.T) {
-	counter, _, _ := newTestCounter(t, 0)
-	var active, maxActive atomic.Int64
-	srv := newGraphQLServer(t, func(w http.ResponseWriter, r *http.Request, query string) {
-		now := active.Add(1)
-		for {
-			seen := maxActive.Load()
-			if now <= seen || maxActive.CompareAndSwap(seen, now) {
-				break
-			}
-		}
-		time.Sleep(30 * time.Millisecond)
-		active.Add(-1)
-		tier1Reply(w, query)
-	})
-
-	client := NewClient(srv.URL, "", srv.Client(), counter)
-	p := NewPoller(client, counter, nil)
-	if _, err := p.Tick(context.Background(), watches(500)); err != nil {
-		t.Fatalf("Tick: %v", err)
-	}
-	if got := maxActive.Load(); got > MaxParallel || got < 2 {
-		t.Fatalf("max parallel requests = %d, want between 2 and %d", got, MaxParallel)
-	}
-	if calls, sizes := srv.snapshot(); calls != 5 ||
-		fmt.Sprint(sizes) != fmt.Sprint([]int{100, 100, 100, 100, 100}) {
-		t.Fatalf("requests = %d, sizes = %v, want five chunks of 100", calls, sizes)
 	}
 }
 
