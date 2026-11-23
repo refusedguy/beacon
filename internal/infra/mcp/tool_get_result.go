@@ -404,36 +404,32 @@ func (h *GetResultHandler) Handle(ctx context.Context, req *mcpsdk.CallToolReque
 	return nil, out, nil
 }
 
+type nextStep struct{ action, command, hint string }
+
+// nextSteps holds one entry for each verdict the tool maps. An unknown verdict
+// takes nextStepUnknown, so a new domain value never invents a command.
+var nextSteps = map[domain.Verdict]nextStep{
+	domain.VerdictKeepWorking: {NextActionKeepWorking, "", "do not rebase an unchanged head; fix only the failedChecks returned above"},
+	domain.VerdictRebase:      {NextActionRebase, RebaseCommand, "origin/main moved; rebase and push with lease before waiting again"},
+	domain.VerdictRetry:       {NextActionRetry, RetryCommand, "the failure is flaky or cancelled; rerun only the failed jobs"},
+	domain.VerdictBlocked:     {NextActionBlocked, "", "the failure is on main; stop and wait for the blocker to be resolved, do not fix main"},
+	domain.VerdictReady:       {NextActionWait, "", "checks are green; the orchestrator merges, no command is needed here"},
+	domain.VerdictTimeout:     {domain.NextActionDone, "", "the Watch hit a terminal timeout verdict; stop here and do not retry the long-poll wait"}, // BCX-11
+	domain.VerdictMerged:      {NextActionWait, "", "the Watch is finished; there is no next step"},
+	domain.VerdictClosed:      {NextActionWait, "", "the Watch is finished; there is no next step"},
+}
+
+var nextStepUnknown = nextStep{NextActionWait, "", "no verdict yet; finish the turn with waiting, watchID"}
+
 // nextStepFor maps a verdict to the one action the subscriber should take. The
 // mapping is a pure function of the verdict so the same result always teaches
 // the same next step, and a client never has to parse a sentence to branch.
 func nextStepFor(verdict domain.Verdict) (action, command, hint string) {
-	switch verdict {
-	case domain.VerdictKeepWorking:
-		return NextActionKeepWorking, "",
-			"do not rebase an unchanged head; fix only the failedChecks returned above"
-	case domain.VerdictRebase:
-		return NextActionRebase, RebaseCommand,
-			"origin/main moved; rebase and push with lease before waiting again"
-	case domain.VerdictRetry:
-		return NextActionRetry, RetryCommand,
-			"the failure is flaky or cancelled; rerun only the failed jobs"
-	case domain.VerdictBlocked:
-		return NextActionBlocked, "",
-			"the failure is on main; stop and wait for the blocker to be resolved, do not fix main"
-	case domain.VerdictReady:
-		return NextActionWait, "",
-			"checks are green; the orchestrator merges, no command is needed here"
-	case domain.VerdictTimeout:
-		// Terminal verdict, not the retryable long-poll reason. The two used to
-		// share the "timeout" string and gave opposite instructions (BCX-11).
-		return domain.NextActionDone, "",
-			"the Watch hit a terminal timeout verdict; stop here and do not retry the long-poll wait"
-	case domain.VerdictMerged, domain.VerdictClosed:
-		return NextActionWait, "", "the Watch is finished; there is no next step"
-	default:
-		return NextActionWait, "", "no verdict yet; finish the turn with waiting, watchID"
+	step, ok := nextSteps[verdict]
+	if !ok {
+		step = nextStepUnknown
 	}
+	return step.action, step.command, step.hint
 }
 
 // Result reads the Watch, finds the caller's obligation at the current
@@ -1254,39 +1250,42 @@ func gradeExternalAction(w domain.Watch, rubric ResultRubric, iteration int, per
 	}
 }
 
-// evaluateCriterion turns Watch facts into one explained criterion result.
-func evaluateCriterion(w domain.Watch, id CriterionID) CriterionEvaluation {
-	switch id {
-	case CriterionRunFinished:
+var criterionEvaluators = map[CriterionID]func(domain.Watch) CriterionEvaluation{
+	CriterionRunFinished: func(w domain.Watch) CriterionEvaluation {
 		if w.Status == domain.StatusClosed || !w.ClosedAt.IsZero() {
-			return passedCriterion(id, "run reached a terminal state")
+			return passedCriterion(CriterionRunFinished, "run reached a terminal state")
 		}
-		return CriterionEvaluation{Criterion: id, Passed: false,
-			Explanation: "run has not reached a terminal state; status=" + string(w.Status)}
-	case CriterionRequiredChecksOK:
+		return CriterionEvaluation{Criterion: CriterionRunFinished, Passed: false, Explanation: "run has not reached a terminal state; status=" + string(w.Status)}
+	},
+	CriterionRequiredChecksOK: func(w domain.Watch) CriterionEvaluation {
 		failed := failedRequiredCheckNames(w)
 		if len(failed) == 0 {
-			return passedCriterion(id, "no required check failed")
+			return passedCriterion(CriterionRequiredChecksOK, "no required check failed")
 		}
-		return CriterionEvaluation{Criterion: id, Passed: false,
-			Explanation: "required checks failed: " + strings.Join(failed, ", ")}
-	case CriterionMergeReady:
+		return CriterionEvaluation{Criterion: CriterionRequiredChecksOK, Passed: false, Explanation: "required checks failed: " + strings.Join(failed, ", ")}
+	},
+	CriterionMergeReady: func(w domain.Watch) CriterionEvaluation {
 		status := strings.ToUpper(w.Merge.MergeStateStatus)
 		if strings.ToUpper(w.Merge.Mergeable) == "MERGEABLE" && status != "DIRTY" && status != "BEHIND" {
-			return passedCriterion(id, "merge is clean")
+			return passedCriterion(CriterionMergeReady, "merge is clean")
 		}
-		return CriterionEvaluation{Criterion: id, Passed: false,
-			Explanation: fmt.Sprintf("mergeable=%s mergeStateStatus=%s", w.Merge.Mergeable, w.Merge.MergeStateStatus)}
-	case CriterionVerdictReady:
+		return CriterionEvaluation{Criterion: CriterionMergeReady, Passed: false, Explanation: fmt.Sprintf("mergeable=%s mergeStateStatus=%s", w.Merge.Mergeable, w.Merge.MergeStateStatus)}
+	},
+	CriterionVerdictReady: func(w domain.Watch) CriterionEvaluation {
 		if w.Verdict == domain.VerdictReady {
-			return passedCriterion(id, "verdict is ready")
+			return passedCriterion(CriterionVerdictReady, "verdict is ready")
 		}
-		return CriterionEvaluation{Criterion: id, Passed: false,
-			Explanation: "verdict=" + string(w.Verdict)}
-	default:
-		return CriterionEvaluation{Criterion: id, Passed: false,
-			Explanation: "unknown criterion"}
+		return CriterionEvaluation{Criterion: CriterionVerdictReady, Passed: false, Explanation: "verdict=" + string(w.Verdict)}
+	},
+}
+
+// evaluateCriterion turns Watch facts into one explained criterion result.
+func evaluateCriterion(w domain.Watch, id CriterionID) CriterionEvaluation {
+	evaluate, ok := criterionEvaluators[id]
+	if !ok {
+		return CriterionEvaluation{Criterion: id, Passed: false, Explanation: "unknown criterion"}
 	}
+	return evaluate(w)
 }
 
 func passedCriterion(id CriterionID, why string) CriterionEvaluation {

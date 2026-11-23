@@ -1733,6 +1733,8 @@ func TestNextStepForVerdicts(t *testing.T) {
 		{domain.VerdictBlocked, NextActionBlocked, ""},
 		{domain.VerdictReady, NextActionWait, ""},
 		{domain.VerdictWatching, NextActionWait, ""},
+		{domain.VerdictMerged, NextActionWait, ""},
+		{domain.VerdictClosed, NextActionWait, ""},
 		{domain.VerdictTimeout, domain.NextActionDone, ""},
 	}
 	for _, tc := range cases {

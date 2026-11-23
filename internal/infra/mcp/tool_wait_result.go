@@ -428,6 +428,12 @@ const MaxActionRequeries = 3
 // exhausted. It is an exit status of the agent run, not a WaitStopReason.
 const ActionFormatExitStatus = "exit_format"
 
+var actionRequeryDetails = map[ActionErrorKind]string{
+	ActionFormatError:   " The action could not be parsed as a tool call.",
+	ActionBlockedAction: " The action used a command on the blocklist. Replace the blocked command.",
+	ActionCommandSyntax: " The shell command has a syntax error. Fix the syntax.",
+}
+
 // ActionRequeryTemplate returns the separate response prompt for one fixable
 // action error. The prompt names the error, includes the rejected output and
 // the error message, and asks for one corrected action. It carries no verdict
@@ -435,16 +441,11 @@ const ActionFormatExitStatus = "exit_format"
 // template, so the caller ends the run instead of requerying.
 func ActionRequeryTemplate(kind ActionErrorKind, output, message string) string {
 	const head = "The last action was rejected. Send one corrected action only."
-	switch kind {
-	case ActionFormatError:
-		return head + " The action could not be parsed as a tool call.\nRejected output:\n" + output + "\nError: " + message
-	case ActionBlockedAction:
-		return head + " The action used a command on the blocklist. Replace the blocked command.\nRejected output:\n" + output + "\nError: " + message
-	case ActionCommandSyntax:
-		return head + " The shell command has a syntax error. Fix the syntax.\nRejected output:\n" + output + "\nError: " + message
-	default:
+	detail, ok := actionRequeryDetails[kind]
+	if !ok {
 		return ""
 	}
+	return head + detail + "\nRejected output:\n" + output + "\nError: " + message
 }
 
 // ActionRequeryOutcome is the decision for one failed agent action. Requery is
