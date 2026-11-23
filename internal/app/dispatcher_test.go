@@ -242,6 +242,20 @@ func (f failingHarness) Spawn(context.Context, core.SpawnRequest) (core.Session,
 	return core.Session{}, f.err
 }
 
+type claimFailingSource struct {
+	*fakeSource
+	err error
+}
+
+func (f claimFailingSource) Claim(context.Context, core.TaskID) error { return f.err }
+
+type livenessHarness struct {
+	*fakeHarness
+	alive bool
+}
+
+func (h livenessHarness) IsAlive(context.Context, string) (bool, error) { return h.alive, nil }
+
 func assertFailureJSON(t *testing.T, failures []DispatchFailure, want string) {
 	t.Helper()
 	b, err := json.Marshal(failures)
@@ -276,6 +290,77 @@ func TestDispatchFailureJSONIncludesWorkspaceConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFailureJSON(t, res.Failures, want)
+}
+
+func TestDispatchKeepsRunWithLiveWorkerAfterClaimFailure(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	src := &claimFailingSource{
+		fakeSource: &fakeSource{tasks: []core.Task{{ID: "T-LIVE", Status: core.TaskAvailable}}},
+		err:        errors.New("claim rejected"),
+	}
+	h := &livenessHarness{fakeHarness: &fakeHarness{}, alive: true}
+	ws := &fakeWorkspace{}
+	d := &Dispatcher{
+		Source: src, Planner: NewPlanner(nil), Workspace: ws, Harness: h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	res, err := d.Dispatch(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Failures) != 1 {
+		t.Fatalf("failures = %d, want 1", len(res.Failures))
+	}
+	active, err := store.ListActive(ctx)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("active runs = %d, err=%v, want 1", len(active), err)
+	}
+	run := active[0]
+	saved := store.runs[run.ID]
+	if saved.State != core.RunRunning || saved.SessionID == "" {
+		t.Fatalf("state=%s session=%q, want running with a session", saved.State, saved.SessionID)
+	}
+	if saved.WorkspacePath == "" || ws.removed != 0 || h.stops != 0 {
+		t.Fatalf("live worker cleaned up: path=%q removed=%d stops=%d", saved.WorkspacePath, ws.removed, h.stops)
+	}
+
+	c := &Control{Store: store, Harness: h, Workspace: ws}
+	if err := c.WatchPR(ctx, run.ID, 43); err != nil {
+		t.Fatal(err)
+	}
+	if bound := store.runs[run.ID]; bound.State != core.RunWaitingCI || bound.PRNumber != 43 {
+		t.Fatalf("state=%s pr=%d, want %s/43", bound.State, bound.PRNumber, core.RunWaitingCI)
+	}
+}
+
+func TestDispatchClosesRunWhenWorkerIsGone(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	src := &claimFailingSource{
+		fakeSource: &fakeSource{tasks: []core.Task{{ID: "T-DEAD", Status: core.TaskAvailable}}},
+		err:        errors.New("claim rejected"),
+	}
+	h := &livenessHarness{fakeHarness: &fakeHarness{}, alive: false}
+	ws := &fakeWorkspace{}
+	d := &Dispatcher{
+		Source: src, Planner: NewPlanner(nil), Workspace: ws, Harness: h, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+	}
+	if _, err := d.Dispatch(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	recent, err := store.ListRecent(ctx, 10)
+	if err != nil || len(recent) != 1 {
+		t.Fatalf("recent runs = %d, err=%v, want 1", len(recent), err)
+	}
+	saved := store.runs[recent[0].ID]
+	if saved.State != core.RunClosed || saved.Reason != "claim rejected" {
+		t.Fatalf("state=%s reason=%q, want closed with cause", saved.State, saved.Reason)
+	}
+	if h.stops != 1 || ws.removed != 1 {
+		t.Fatalf("stops=%d removals=%d, want 1/1", h.stops, ws.removed)
+	}
 }
 
 func TestDispatchFailureJSONIncludesSpawnTimeout(t *testing.T) {

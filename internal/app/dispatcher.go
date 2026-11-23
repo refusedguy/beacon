@@ -103,10 +103,8 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		}
 		if budget > 0 {
 			if err := d.startOne(ctx, run, task); err != nil {
-				slog.Error("dispatch task", "task", task.ID, "error", err)
 				out.Failures = append(out.Failures, DispatchFailure{task.ID, err.Error()})
-				_ = run.Apply(core.Event{Kind: core.EvCancel, Reason: err.Error()})
-				_ = d.Store.Save(ctx, run)
+				d.handleStartFailure(ctx, run, err)
 				continue
 			}
 			budget--
@@ -147,11 +145,7 @@ func (d *Dispatcher) PromotePending(ctx context.Context) ([]*core.Run, error) {
 			continue
 		}
 		if err := d.startOne(ctx, run, task); err != nil {
-			slog.Error("promote pending run", "run", run.ID, "error", err)
-			_ = run.Apply(core.Event{Kind: core.EvCancel, Reason: err.Error()})
-			if err := d.Store.Save(ctx, run); err != nil {
-				slog.Error("save cancelled run", "run", run.ID, "error", err)
-			}
+			d.handleStartFailure(ctx, run, err)
 			continue
 		}
 		budget--
@@ -170,7 +164,6 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	run.Branch = ws.Branch
 	run.Scope = task.Scope
 	if err := d.Source.MarkInWorkspace(ctx, task.ID, ws.Path, "in_progress"); err != nil {
-		_ = d.Workspace.Remove(ctx, ws)
 		return fmt.Errorf("mark in workspace: %w", err)
 	}
 	session, err := d.Harness.Spawn(ctx, core.SpawnRequest{
@@ -179,7 +172,6 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		Prompt: spawnPrompt(task, run.ID, ws.Path),
 	})
 	if err != nil {
-		_ = d.Workspace.Remove(ctx, ws)
 		return fmt.Errorf("spawn: %w", err)
 	}
 	run.SessionID = session.ID
@@ -191,8 +183,6 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		return err
 	}
 	if err := d.Store.Save(ctx, run); err != nil {
-		_ = d.Harness.Stop(ctx, run.SessionID)
-		_ = d.Workspace.Remove(ctx, ws)
 		return fmt.Errorf("save: %w", err)
 	}
 	logTransitionSpawn(ctx, run.ID, task.ID, ws.Branch)
@@ -200,6 +190,47 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 		return err
 	}
 	return d.Store.SetTaskStatus(ctx, task.ID, "claimed")
+}
+
+// handleStartFailure closes a run only after its worker is gone. A worker that
+// survived the failure can still open a PR, and a closed run cannot receive it.
+func (d *Dispatcher) handleStartFailure(ctx context.Context, run *core.Run, cause error) {
+	slog.Error("dispatch task", "task", run.TaskID, "run", run.ID, "error", cause)
+	if d.workerAlive(ctx, run) {
+		if run.State == core.RunPending {
+			_ = run.Apply(core.Event{Kind: core.EvStart})
+		}
+		run.Reason = cause.Error()
+		run.UpdatedAt = time.Now().UTC()
+		if err := d.Store.Save(ctx, run); err != nil {
+			slog.Error("save live run", "run", run.ID, "error", err)
+		}
+		return
+	}
+	_ = run.Apply(core.Event{Kind: core.EvCancel, Reason: cause.Error()})
+	if err := d.Store.Save(ctx, run); err != nil {
+		slog.Error("save cancelled run", "run", run.ID, "error", err)
+	}
+	if run.SessionID != "" {
+		_ = d.Harness.Stop(ctx, run.SessionID)
+	}
+	if run.WorkspacePath != "" {
+		_ = d.Workspace.Remove(ctx, Workspace{Path: run.WorkspacePath, Branch: run.Branch})
+	}
+}
+
+// workerAlive treats a failed liveness check as alive. Losing the session
+// briefly must not close a run whose worker may still be publishing a PR.
+func (d *Dispatcher) workerAlive(ctx context.Context, run *core.Run) bool {
+	if run.SessionID == "" {
+		return false
+	}
+	alive, err := d.Harness.IsAlive(ctx, run.SessionID)
+	if err != nil {
+		slog.Warn("worker liveness check", "run", run.ID, "error", err)
+		return true
+	}
+	return alive
 }
 
 func (d *Dispatcher) inFlightLimit() int {
