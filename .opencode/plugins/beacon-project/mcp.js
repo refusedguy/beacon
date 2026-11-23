@@ -1,4 +1,4 @@
-import { existsSync as fsExistsSync, readFileSync as fsReadFileSync } from "node:fs"
+import { existsSync as fsExistsSync, statSync as fsStatSync, readdirSync as fsReaddirSync } from "node:fs"
 import { execFileSync as defaultExecFileSync } from "node:child_process"
 import { delimiter, join } from "node:path"
 
@@ -7,10 +7,14 @@ export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
 export const BUILD_HASH_FLAG = "--hash"
 
+const SOURCE_DIRS = ["cmd", "internal", "pkg"]
+const MODULE_FILES = ["go.mod", "go.sum", "go.work"]
+
 const defaultDeps = {
   env: process.env,
   existsSync: fsExistsSync,
-  readFileSync: fsReadFileSync,
+  statSync: fsStatSync,
+  readdirSync: fsReaddirSync,
   execFileSync: defaultExecFileSync,
 }
 
@@ -28,28 +32,53 @@ function pathBinary(name, deps) {
   return null
 }
 
-function currentBuildHash(root, deps) {
-  const script = join(root, ...BEACON_BUILD_SCRIPT.split("/"))
-  try {
-    const output = deps.execFileSync("bash", [script, BUILD_HASH_FLAG], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    })
-    return String(output).trim() || null
-  } catch {
-    return null
+// Yield every build input tracked by scripts/build-beacon.sh. Directories are
+// walked with readdirSync and statSync so the common path never spawns bash.
+function* sourcePaths(root, deps) {
+  for (const name of MODULE_FILES) {
+    const path = join(root, name)
+    if (deps.existsSync(path)) yield path
+  }
+  const stack = SOURCE_DIRS.map((dir) => join(root, dir))
+  while (stack.length) {
+    const dir = stack.pop()
+    let entries
+    try {
+      entries = deps.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of entries) {
+      const path = join(dir, name)
+      let stat
+      try {
+        stat = deps.statSync(path)
+      } catch {
+        continue
+      }
+      if (stat.isDirectory()) stack.push(path)
+      else if (name.endsWith(".go")) yield path
+    }
   }
 }
 
-function recordedBuildHash(local, deps) {
-  const shaPath = `${local}.build-sha`
-  if (!deps.existsSync(shaPath)) return null
+// A binary is fresh when every build input is older than the binary itself.
+// Any stat failure means we could not prove freshness, so we rebuild.
+function sourceNewerThanBinary(root, local, deps) {
+  let binaryMtime
   try {
-    return String(deps.readFileSync(shaPath, "utf8")).trim() || null
+    binaryMtime = deps.statSync(local).mtimeMs
   } catch {
-    return null
+    return true
   }
+  for (const source of sourcePaths(root, deps)) {
+    try {
+      if (deps.statSync(source).mtimeMs > binaryMtime) return true
+    } catch {
+      return true
+    }
+  }
+  return false
 }
 
 function runBuild(root, deps) {
@@ -62,14 +91,7 @@ function runBuild(root, deps) {
 }
 
 function rebuildLocalIfStale(root, local, deps) {
-  const recorded = recordedBuildHash(local, deps)
-  if (recorded === null) {
-    runBuild(root, deps)
-    return
-  }
-  const current = currentBuildHash(root, deps)
-  if (current && recorded === current) return
-  runBuild(root, deps)
+  if (sourceNewerThanBinary(root, local, deps)) runBuild(root, deps)
 }
 
 export function beaconCommand(root, deps = defaultDeps) {

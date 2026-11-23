@@ -16,46 +16,74 @@ import {
 } from "./mcp.js"
 
 const ROOT = "/project"
+const BINARY_MTIME = 1000
 
 function localPaths(root = ROOT) {
   const local = join(root, ".opencode", "bin", "beacon")
   return { local, sha: `${local}.build-sha` }
 }
 
-function fakeDeps({ files = {}, hash = "h0", head = "commit0", env = {} } = {}) {
-  const { sha } = localPaths()
+function fakeDeps({ files = {}, env = {}, mtimes = {}, dirs = {}, statErrors = [] } = {}) {
   const stored = { ...files }
   const execCalls = []
-  const hashValue = () => (typeof hash === "function" ? hash() : hash)
-  const headValue = () => (typeof head === "function" ? head() : head)
+  const statCalls = []
+  const readdirCalls = []
   return {
     execCalls,
+    statCalls,
+    readdirCalls,
     env,
     existsSync: (path) => Object.hasOwn(stored, path),
     readFileSync: (path) => {
       if (!Object.hasOwn(stored, path)) throw new Error(`ENOENT ${path}`)
       return stored[path]
     },
+    statSync: (path) => {
+      statCalls.push(path)
+      if (statErrors.includes(path)) throw new Error(`EACCES ${path}`)
+      const known = Object.hasOwn(mtimes, path) || Object.hasOwn(stored, path) || Object.hasOwn(dirs, path)
+      if (!known) throw new Error(`ENOENT ${path}`)
+      return { mtimeMs: mtimes[path] ?? 0, isDirectory: () => Object.hasOwn(dirs, path) }
+    },
+    readdirSync: (path) => {
+      readdirCalls.push(path)
+      if (!Object.hasOwn(dirs, path)) throw new Error(`ENOENT ${path}`)
+      return dirs[path]
+    },
     execFileSync: (cmd, args, opts) => {
       execCalls.push({ cmd, args, opts })
-      if (cmd === "git") return `${headValue()}\n`
-      if (cmd === "bash") {
-        if (args.includes(BUILD_HASH_FLAG)) return `${hashValue()}\n`
-        stored[sha] = `${hashValue()}\n`
-        return ""
-      }
+      if (cmd === "bash") return ""
       throw new Error(`unexpected exec: ${cmd}`)
     },
   }
 }
 
+// A local binary with no tracked source files is fresh by definition.
 function localBinaryDeps(overrides = {}) {
-  const { local, sha } = localPaths()
+  const { local } = localPaths()
   return fakeDeps({
-    files: { [local]: "binary", [sha]: "h0\n" },
-    hash: "h0",
+    files: { [local]: "binary" },
+    mtimes: { [local]: BINARY_MTIME },
     ...overrides,
   })
+}
+
+// Build a tree with a .go source under cmd/beacon at a controlled mtime.
+function sourceTreeDeps(sourceMtime = 500, { withBuildRecord = true } = {}) {
+  const { local, sha } = localPaths()
+  const cmd = join(ROOT, "cmd")
+  const cmdBeacon = join(cmd, "beacon")
+  const mainGo = join(cmdBeacon, "main.go")
+  const files = { [local]: "binary", [mainGo]: "package main" }
+  if (withBuildRecord) files[sha] = "h0\n"
+  return {
+    mainGo,
+    deps: fakeDeps({
+      files,
+      mtimes: { [local]: BINARY_MTIME, [mainGo]: sourceMtime },
+      dirs: { [cmd]: ["beacon"], [cmdBeacon]: ["main.go"] },
+    }),
+  }
 }
 
 function fakeCtx() {
@@ -78,20 +106,37 @@ function fakeCtx() {
 }
 
 function buildCalls(deps) {
-  return deps.execCalls.filter((call) => call.cmd === "bash" && !call.args.includes(BUILD_HASH_FLAG))
+  return deps.execCalls.filter((call) => call.cmd === "bash")
 }
 
-test("local binary with a matching build hash is used without a rebuild", () => {
+function hashCalls(deps) {
+  return deps.execCalls.filter((call) => call.args.includes(BUILD_HASH_FLAG))
+}
+
+test("a fresh binary is used without a rebuild and without a hash subprocess", () => {
   const { local } = localPaths()
   const deps = localBinaryDeps()
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
   assert.equal(buildCalls(deps).length, 0)
+  assert.equal(hashCalls(deps).length, 0)
 })
 
-test("stale build hash triggers one rebuild and the local binary is still returned", () => {
-  const { local, sha } = localPaths()
-  const deps = fakeDeps({ files: { [local]: "binary", [sha]: "old\n" }, hash: "new" })
+test("one resolution does not spawn bash more than once", () => {
+  const { local } = localPaths()
+  const { deps } = sourceTreeDeps(500)
+
+  for (let i = 0; i < 5; i += 1) {
+    assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
+  }
+
+  assert.equal(buildCalls(deps).length, 0)
+  assert.equal(hashCalls(deps).length, 0)
+})
+
+test("a newer .go source triggers one rebuild with the build script", () => {
+  const { local } = localPaths()
+  const { deps } = sourceTreeDeps(BINARY_MTIME + 1)
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
 
@@ -99,11 +144,47 @@ test("stale build hash triggers one rebuild and the local binary is still return
   assert.equal(builds.length, 1)
   assert.deepEqual(builds[0].args, [join(ROOT, ...BEACON_BUILD_SCRIPT.split("/"))])
   assert.equal(builds[0].opts.cwd, ROOT)
+  assert.equal(hashCalls(deps).length, 0)
 })
 
-test("missing build hash triggers one rebuild", () => {
+test("a newer source under pkg triggers a rebuild", () => {
   const { local } = localPaths()
-  const deps = fakeDeps({ files: { [local]: "binary" }, hash: "h0" })
+  const pkg = join(ROOT, "pkg")
+  const core = join(pkg, "core")
+  const source = join(core, "run.go")
+  const deps = fakeDeps({
+    files: { [local]: "binary", [source]: "package core" },
+    mtimes: { [local]: BINARY_MTIME, [source]: BINARY_MTIME + 1 },
+    dirs: { [pkg]: ["core"], [core]: ["run.go"] },
+  })
+
+  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
+  assert.equal(buildCalls(deps).length, 1)
+})
+
+test("a newer module file triggers a rebuild", () => {
+  const { local } = localPaths()
+  const goMod = join(ROOT, "go.mod")
+  const deps = fakeDeps({
+    files: { [local]: "binary", [goMod]: "module example" },
+    mtimes: { [local]: BINARY_MTIME, [goMod]: BINARY_MTIME + 1 },
+  })
+
+  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
+  assert.equal(buildCalls(deps).length, 1)
+})
+
+test("a missing build record does not rebuild when sources are older", () => {
+  const { local } = localPaths()
+  const deps = sourceTreeDeps(500, { withBuildRecord: false }).deps
+
+  assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
+  assert.equal(buildCalls(deps).length, 0)
+})
+
+test("an unreadable binary is treated as stale", () => {
+  const { local } = localPaths()
+  const deps = fakeDeps({ files: { [local]: "binary" }, statErrors: [local] })
 
   assert.deepEqual(beaconCommand(ROOT, deps), [local, "mcp"])
   assert.equal(buildCalls(deps).length, 1)
@@ -179,8 +260,8 @@ test("registrations are keyed by project root", async (t) => {
   const other = "/other"
   const otherLocal = join(other, ".opencode", "bin", "beacon")
   const otherDeps = fakeDeps({
-    files: { [otherLocal]: "binary", [`${otherLocal}.build-sha`]: "h0\n" },
-    hash: "h0",
+    files: { [otherLocal]: "binary" },
+    mtimes: { [otherLocal]: BINARY_MTIME },
   })
   const second = await registerBeaconMcp(ctx, other, otherDeps)
   t.after(async () => {
@@ -191,6 +272,26 @@ test("registrations are keyed by project root", async (t) => {
   assert.notEqual(first, second)
   assert.equal(registeredBeaconConfig(ROOT), first.config)
   assert.equal(registeredBeaconConfig(other), second.config)
+})
+
+test("four location resolutions spawn no build or hash subprocess", async (t) => {
+  const registrations = []
+  const allDeps = []
+  for (let i = 0; i < 4; i += 1) {
+    const root = `/project-${i}`
+    const local = join(root, ".opencode", "bin", "beacon")
+    const deps = fakeDeps({ files: { [local]: "binary" }, mtimes: { [local]: BINARY_MTIME } })
+    allDeps.push(deps)
+    registrations.push(await registerBeaconMcp(fakeCtx(), root, deps))
+  }
+  t.after(async () => {
+    for (const registration of registrations) await registration.dispose()
+  })
+
+  for (const deps of allDeps) {
+    assert.equal(deps.execCalls.length, 0)
+    assert.equal(hashCalls(deps).length, 0)
+  }
 })
 
 test("registration schedules no timer, reload or daemon command", async (t) => {
