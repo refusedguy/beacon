@@ -1,6 +1,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -1225,6 +1226,63 @@ func TestBackgroundTaskOutputByOffset(t *testing.T) {
 	}
 }
 
+// TestBackgroundTaskOutputBounded fixes the output limit decision: the head
+// and tail survive, the middle is replaced by a marker, and NextOffset keeps
+// pointing at the absolute end so a streaming reader does not jump backwards.
+func TestBackgroundTaskOutputBounded(t *testing.T) {
+	task := NewBackgroundTask("bg-bounded", nil)
+	head := bytes.Repeat([]byte("H"), 1024)
+	tail := bytes.Repeat([]byte("T"), 1024)
+	middle := bytes.Repeat([]byte("m"), maxBackgroundTaskOutputBytes+4096)
+	sentinel := []byte("UNIQUE-CENTER-SENTINEL")
+	copy(middle[len(middle)/2-len(sentinel)/2:], sentinel)
+
+	task.AppendOutput(head)
+	task.AppendOutput(middle)
+	task.AppendOutput(tail)
+	total := len(head) + len(middle) + len(tail)
+
+	chunk := task.Output(0)
+	if len(chunk.Data) != maxBackgroundTaskOutputBytes {
+		t.Fatalf("retained output = %d bytes, want %d", len(chunk.Data), maxBackgroundTaskOutputBytes)
+	}
+	if chunk.NextOffset != total {
+		t.Fatalf("NextOffset = %d, want total appended %d", chunk.NextOffset, total)
+	}
+	if !bytes.HasPrefix(chunk.Data, head) {
+		t.Fatal("output lost its head")
+	}
+	if !bytes.HasSuffix(chunk.Data, tail) {
+		t.Fatal("output lost its tail")
+	}
+	if !bytes.Contains(chunk.Data, []byte(backgroundOutputTruncatedMark)) {
+		t.Fatal("output has no truncation marker")
+	}
+	if bytes.Contains(chunk.Data, sentinel) {
+		t.Fatal("output still holds the dropped middle")
+	}
+
+	// A reader that stopped at the old end sees an empty chunk at the same
+	// absolute offset, not a jump back into the retained window.
+	atEnd := task.Output(chunk.NextOffset)
+	if len(atEnd.Data) != 0 || atEnd.NextOffset != total {
+		t.Fatalf("read at end = %+v, want empty at %d", atEnd, total)
+	}
+
+	// Appending after truncation stays bounded and extends the absolute end.
+	task.AppendOutput([]byte("Z"))
+	after := task.Output(0)
+	if len(after.Data) != maxBackgroundTaskOutputBytes {
+		t.Fatalf("output after append = %d bytes, want %d", len(after.Data), maxBackgroundTaskOutputBytes)
+	}
+	if after.NextOffset != total+1 {
+		t.Fatalf("NextOffset after append = %d, want %d", after.NextOffset, total+1)
+	}
+	if !bytes.HasSuffix(after.Data, []byte("TZ")) {
+		t.Fatal("late tail was not retained")
+	}
+}
+
 func TestBackgroundTaskWaitTimeout(t *testing.T) {
 	clock := &testTaskClock{
 		now:             time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC),
@@ -1368,6 +1426,37 @@ func TestTaskRegistry(t *testing.T) {
 	}
 }
 
+// TestTaskRegistryRemovesFinishedHandle proves a finished task leaves the
+// registry, so a second lookup fails instead of returning a stale handle.
+func TestTaskRegistryRemovesFinishedHandle(t *testing.T) {
+	reg := NewTaskRegistry(&testTaskClock{now: time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)})
+	task, err := reg.Start("job-done")
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if _, err := reg.Start("job-cancelled"); err != nil {
+		t.Fatalf("Start second: %v", err)
+	}
+
+	task.Complete("ok")
+	task.Complete("ok") // a duplicate completion must not panic or re-add
+	if got, ok := reg.Get("job-done"); ok || got != nil {
+		t.Fatalf("Get after completion = %p, ok=%v, want no handle", got, ok)
+	}
+	if _, err := reg.Start("job-done"); err != nil {
+		t.Fatalf("Start should accept the freed handle again: %v", err)
+	}
+
+	second, ok := reg.Get("job-cancelled")
+	if !ok {
+		t.Fatal("Get lost a live handle")
+	}
+	second.Complete("cancelled")
+	if _, ok := reg.Get("job-cancelled"); ok {
+		t.Fatal("Get still finds a cancelled handle")
+	}
+}
+
 // --- MCP protocol tasks/get contract tests (ADR 0056 feature 1) ------------
 
 // TestTasksGetReturnsIDImmediately proves the create call hands back a taskId
@@ -1485,6 +1574,47 @@ func TestTasksGetTTLExpiry(t *testing.T) {
 	assertCode(t, err, domain.CodeInvalidInput)
 }
 
+// TestTasksGetTTLDeletesExpiredRecords proves the first expired read reports
+// CodeGone and drops the record, so the store does not grow one task per
+// expired id and later reads get the honest "not found" answer.
+func TestTasksGetTTLDeletesExpiredRecords(t *testing.T) {
+	clock := &stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)}
+	store := NewProtocolTaskStore(clock)
+	const count = 32
+	ids := make([]string, 0, count)
+	for i := 0; i < count; i++ {
+		created, err := store.Start(1_000, 0)
+		if err != nil {
+			t.Fatalf("Start %d: %v", i, err)
+		}
+		ids = append(ids, created.TaskID)
+	}
+	if len(store.tasks) != count {
+		t.Fatalf("tasks after Start = %d, want %d", len(store.tasks), count)
+	}
+
+	clock.Advance(1_001 * time.Millisecond)
+	for _, id := range ids {
+		_, err := store.Get(id)
+		assertCode(t, err, domain.CodeGone)
+	}
+	if len(store.tasks) != 0 {
+		t.Fatalf("tasks after expiry = %d, want 0", len(store.tasks))
+	}
+	for _, id := range ids {
+		_, err := store.Get(id)
+		assertCode(t, err, domain.CodeWatchNotFound)
+	}
+
+	created, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("Start after cleanup: %v", err)
+	}
+	if _, err := store.Get(created.TaskID); err != nil {
+		t.Fatalf("Get after cleanup: %v", err)
+	}
+}
+
 // TestTasksGetTTLUnlimited covers the null case: ttlMs is emitted as null and
 // an unlimited task survives any clock advance.
 func TestTasksGetTTLUnlimited(t *testing.T) {
@@ -1557,6 +1687,44 @@ func TestTasksGetNotificationsProgressAndResult(t *testing.T) {
 	notes[0].Params.Status = TaskStateFailed
 	if again := store.Notifications(); again[0].Params.Status != TaskStateWorking {
 		t.Fatal("Notifications returned a mutable slice of the store history")
+	}
+}
+
+// TestTasksGetNotificationRing fixes the notification bound: only the newest
+// statuses stay readable, and dropping old notes never changes current status.
+func TestTasksGetNotificationRing(t *testing.T) {
+	store := NewProtocolTaskStore(&stepClock{t: time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)})
+	created, err := store.Start(0, 0)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	const extra = 5
+	total := maxTaskStatusNotifications + extra
+	var last string
+	for i := 0; i < total; i++ {
+		last = fmt.Sprintf("status-%d", i)
+		if _, err := store.Update(created.TaskID, TaskPatch{Status: TaskStateWorking, StatusMessage: last}); err != nil {
+			t.Fatalf("Update %d: %v", i, err)
+		}
+	}
+
+	notes := store.Notifications()
+	if len(notes) != maxTaskStatusNotifications {
+		t.Fatalf("notifications = %d, want %d", len(notes), maxTaskStatusNotifications)
+	}
+	if got := notes[len(notes)-1].Params.StatusMessage; got != last {
+		t.Fatalf("newest notification = %q, want %q", got, last)
+	}
+	if want := fmt.Sprintf("status-%d", extra); notes[0].Params.StatusMessage != want {
+		t.Fatalf("oldest notification = %q, want %q", notes[0].Params.StatusMessage, want)
+	}
+
+	got, err := store.Get(created.TaskID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.StatusMessage != last {
+		t.Fatalf("current status message = %q, want %q", got.StatusMessage, last)
 	}
 }
 
