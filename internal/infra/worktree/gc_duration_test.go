@@ -46,13 +46,19 @@ func TestCollectRecordsOneGCDurationObservation(t *testing.T) {
 	observe.SetDefault(observe.NewRecorder(nil, metrics))
 	t.Cleanup(func() { observe.SetDefault(previous) })
 
-	git := &fakeGit{listOut: gcDurationListing}
-	slow := func(dir string, args ...string) (string, error) {
-		time.Sleep(time.Millisecond)
-		return git.run(dir, args...)
+	oldNow := collectNow
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	step := 0
+	collectNow = func() time.Time {
+		step++
+		return base.Add(time.Duration(step) * time.Millisecond)
 	}
+	t.Cleanup(func() { collectNow = oldNow })
 
-	res, err := Collect(slow, nil)
+	git := &fakeGit{listOut: gcDurationListing}
+	run := git.run
+
+	res, err := Collect(run, nil)
 	if err != nil {
 		t.Fatalf("Collect() error = %v", err)
 	}
@@ -66,7 +72,7 @@ func TestCollectRecordsOneGCDurationObservation(t *testing.T) {
 		t.Fatalf("%s sum = %v, want > 0", HistogramGCDuration, sum)
 	}
 
-	if _, err := Collect(slow, nil); err != nil {
+	if _, err := Collect(run, nil); err != nil {
 		t.Fatalf("second Collect() error = %v", err)
 	}
 	count, _ = gcDurationHistogram(t, metrics)

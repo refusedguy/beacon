@@ -9,32 +9,31 @@ import (
 	"github.com/refusedguy/beacon/internal/infra/worktree"
 )
 
-// mockWorktreeDurations replaces the gc seams with slow fakes. The sleeps keep
-// the millisecond fields above zero without depending on git subprocess timing.
+// mockWorktreeDurations replaces the gc seams with fakes and pins the clock
+// used to time collection and apply. The clock advances one millisecond per
+// read, so each timed section is positive without waiting on real time.
 func mockWorktreeDurations(t *testing.T) {
 	t.Helper()
-	oldList, oldHeads, oldStatus, oldRemove := gcWorktreeList, gcWorktreeHeads, gcWorktreeStatus, gcWorktreeRemove
+	oldList, oldHeads, oldStatus, oldRemove, oldNow := gcWorktreeList, gcWorktreeHeads, gcWorktreeStatus, gcWorktreeRemove, gcNow
 	t.Cleanup(func() {
-		gcWorktreeList, gcWorktreeHeads, gcWorktreeStatus, gcWorktreeRemove = oldList, oldHeads, oldStatus, oldRemove
+		gcWorktreeList, gcWorktreeHeads, gcWorktreeStatus, gcWorktreeRemove, gcNow = oldList, oldHeads, oldStatus, oldRemove, oldNow
 	})
+
+	base := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
+	step := 0
+	gcNow = func() time.Time {
+		step++
+		return base.Add(time.Duration(step) * time.Millisecond)
+	}
 
 	entries := []worktree.Entry{
 		{Dir: "/repo/main", Head: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Branch: "main"},
 		{Dir: "/repo/clean", Head: "1111111111111111111111111111111111111111", Branch: "clean"},
 	}
-	gcWorktreeList = func() ([]worktree.Entry, error) {
-		time.Sleep(2 * time.Millisecond)
-		return entries, nil
-	}
+	gcWorktreeList = func() ([]worktree.Entry, error) { return entries, nil }
 	gcWorktreeHeads = func(*CLI) (map[string]string, error) { return nil, nil }
-	gcWorktreeStatus = func(string) (string, error) {
-		time.Sleep(2 * time.Millisecond)
-		return "", nil
-	}
-	gcWorktreeRemove = func(string) error {
-		time.Sleep(2 * time.Millisecond)
-		return nil
-	}
+	gcWorktreeStatus = func(string) (string, error) { return "", nil }
+	gcWorktreeRemove = func(string) error { return nil }
 }
 
 func gcWorktreeJSON(t *testing.T, args ...string) gcWorktreeReport {

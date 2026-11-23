@@ -790,9 +790,9 @@ func runGCWorktree(c *CLI, args []string) int {
 		return 2
 	}
 
-	collectStart := time.Now()
+	collectStart := gcNow()
 	plan, err := gcWorktreeCollect(c)
-	collectMS := time.Since(collectStart).Milliseconds()
+	collectMS := gcNow().Sub(collectStart).Milliseconds()
 	if err != nil {
 		fmt.Fprintln(c.errOut, err)
 		return 2
@@ -809,7 +809,7 @@ func runGCWorktree(c *CLI, args []string) int {
 
 	failed := false
 	if *apply {
-		applyStart := time.Now()
+		applyStart := gcNow()
 		report.Mode = "applied"
 		report.Removed = 0
 		for i, item := range plan {
@@ -855,7 +855,7 @@ func runGCWorktree(c *CLI, args []string) int {
 				fmt.Fprintf(c.errOut, "beacon gc-worktree: удаление %s: вторая проверка отклонила каталог\n", item.Dir)
 			}
 		}
-		report.ApplyMS = time.Since(applyStart).Milliseconds()
+		report.ApplyMS = gcNow().Sub(applyStart).Milliseconds()
 	}
 
 	if *format == "json" {

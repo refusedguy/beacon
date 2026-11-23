@@ -24,6 +24,10 @@ import (
 // tests read the same series without repeating the literal.
 const HistogramGCDuration = "worktree_gc_duration_seconds"
 
+// collectNow is the clock used for the duration histogram. Tests replace it
+// with a stepped clock so the recorded duration does not depend on wall time.
+var collectNow = time.Now
+
 // Runner runs one git command. An empty dir selects the current working
 // directory. Tests replace Runner so nothing here needs a real repository.
 type Runner func(dir string, args ...string) (string, error)
@@ -306,8 +310,8 @@ func watchInput(watches any) (anchors []WatchAnchor, legacy, fullSet bool) {
 // removal; a parallel handoff holding the same directory wins the slot and the
 // collector keeps the tree instead of racing on a swapped target.
 func Collect(run Runner, watches any, protectedDirs ...string) (Result, error) {
-	start := time.Now()
-	defer func() { observe.Observe(HistogramGCDuration, time.Since(start).Seconds()) }()
+	start := collectNow()
+	defer func() { observe.Observe(HistogramGCDuration, collectNow().Sub(start).Seconds()) }()
 
 	entries, err := List(run)
 	if err != nil {
