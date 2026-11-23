@@ -42,7 +42,7 @@ The endpoint defaults to `http://127.0.0.1:7432` and is set with `--endpoint`. T
 | `beacon_control` | Approve, unblock, cancel or retry a run. | worker |
 | `beacon_task_create` | Create a task card and publish it for dispatch. | orchestrator only |
 
-No other `beacon_*` MCP tool exists. The OpenCode plugin starts the server with `go run ./cmd/beacon mcp` from the project root, so the tool list comes from current source rather than a stale binary. `opencode.json` denies `beacon_task_create` globally and allows it only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit that allow.
+No other `beacon_*` MCP tool exists. The OpenCode plugin starts the server from `.opencode/bin/beacon` when that binary exists. Before each start it compares `.opencode/bin/beacon.build-sha` with `git rev-parse HEAD` and runs `scripts/build-beacon.sh` when the sha file is missing or stale. The build script writes the current HEAD into `beacon.build-sha`, so the tool list comes from current source rather than a stale binary. When no local binary exists, the plugin falls back to `bin/beacon`, a binary on `PATH`, or `go run ./cmd/beacon mcp`. `opencode.json` denies `beacon_task_create` globally and allows it only for the `orchestrator` agent, with a temporary allow for `build`. Workers do not inherit that allow.
 
 Spawn workers with `harness.command: worker` in `.beacon/config.yaml`. The OpenCode harness passes that value as the session agent, so each worker inherits the global deny rule for `beacon_task_create`. A worker must never create task cards. It reports new work to the orchestrator instead.
 
