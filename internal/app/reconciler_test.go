@@ -56,6 +56,80 @@ func TestReconcileWaitingCIToWakeAgent(t *testing.T) {
 	}
 }
 
+func TestReconcileMergeMarksAndCommitsCardBeforeMerge(t *testing.T) {
+	r, store, scm, _, src := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "old-sha", PRState: "open"})
+	scm.observeSeq = []core.Observation{
+		{PRNumber: 42, HeadSHA: "old-sha", PRState: "open"},
+		{PRNumber: 42, HeadSHA: "fresh-sha", PRState: "open"},
+	}
+	log := &callLog{}
+	scm.log = log
+	src.log = log
+	ws := &fakeWorkspace{log: log}
+	r.Workspace = ws
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	mergedAt := -1
+	for i, entry := range log.items {
+		if entry == "merge" {
+			mergedAt = i
+			break
+		}
+	}
+	if mergedAt < 3 || log.items[mergedAt-1] != "observe" ||
+		log.items[mergedAt-2] != "commit:docs/tasks" || log.items[mergedAt-3] != "mark:done" {
+		t.Fatalf("card not marked and committed before merge: %v", log.items)
+	}
+	if len(src.marked) != 1 || src.marked[0].id != "T-1" ||
+		src.marked[0].path != "/ws/T-1" || src.marked[0].status != "done" {
+		t.Fatalf("bad MarkInWorkspace call: %+v", src.marked)
+	}
+	if len(ws.commits) != 1 || ws.commits[0].pathspec != "docs/tasks" ||
+		ws.commits[0].message != "beacon: complete task T-1" {
+		t.Fatalf("bad CommitPath call: %+v", ws.commits)
+	}
+	if scm.mergeSHA != "fresh-sha" {
+		t.Fatalf("merge SHA = %q, want fresh-sha", scm.mergeSHA)
+	}
+	if !store.deliveries["merge:42:fresh-sha"] {
+		t.Fatalf("idempotency key not based on fresh SHA: %v", store.deliveries)
+	}
+}
+
+func TestReconcileMergeSkipsCardForFixer(t *testing.T) {
+	r, store, scm, _, src := newReconciler(t, core.VerdictMerge,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	run := store.runs["r1"]
+	run.IsFixer = true
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	log := &callLog{}
+	scm.log = log
+	src.log = log
+	ws := &fakeWorkspace{log: log}
+	r.Workspace = ws
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.marked) != 0 || len(ws.commits) != 0 {
+		t.Fatalf("fixer marked or committed card: marked=%+v commits=%+v", src.marked, ws.commits)
+	}
+	observes := 0
+	for _, entry := range log.items {
+		if entry == "observe" {
+			observes++
+		}
+	}
+	if observes != 1 {
+		t.Fatalf("fixer re-observed PR: %v", log.items)
+	}
+}
+
 func TestReconcileWaitingCIToMerge(t *testing.T) {
 	r, store, scm, h, src := newReconciler(t, core.VerdictMerge,
 		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})

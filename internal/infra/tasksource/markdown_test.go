@@ -2,6 +2,7 @@ package tasksource
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,6 +142,41 @@ func TestMarkdownFrontmatter(t *testing.T) {
 	tasks, _ = s.ListAvailable(context.Background())
 	if len(tasks) != 0 {
 		t.Fatalf("claimed frontmatter task still available: %+v", tasks)
+	}
+}
+
+func TestMarkdownMarkInWorkspace(t *testing.T) {
+	root := t.TempDir()
+	cardDir := filepath.Join(root, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	card := "---\nid: T-9\ntitle: Workspace card\nstatus: available\n---\n# T-9. Workspace card\n"
+	path := filepath.Join(cardDir, "T-9.md")
+	if err := os.WriteFile(path, []byte(card), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := NewMarkdown(filepath.Join(root, "orchestrator-cards"))
+
+	if err := s.MarkInWorkspace(context.Background(), "T-9", root, "in_progress"); err != nil {
+		t.Fatalf("MarkInWorkspace(in_progress) error = %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "status: in_progress") {
+		t.Fatalf("card not marked in progress: %s", b)
+	}
+	if err := s.MarkInWorkspace(context.Background(), "T-9", root, "done"); err != nil {
+		t.Fatalf("MarkInWorkspace(done) error = %v", err)
+	}
+	b, _ = os.ReadFile(path)
+	if !strings.Contains(string(b), "status: done") {
+		t.Fatalf("card not marked done: %s", b)
+	}
+	if err := s.MarkInWorkspace(context.Background(), "T-MISSING", root, "done"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("MarkInWorkspace(missing) error = %v, want os.ErrNotExist", err)
 	}
 }
 

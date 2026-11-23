@@ -118,6 +118,60 @@ func TestGitWorktreeRemoveCleanWorktreeAndRecreate(t *testing.T) {
 	}
 }
 
+func TestGitWorktreeCommitPathOnlyStagesPathspec(t *testing.T) {
+	wt, _ := newTestGitWorktree(t)
+	ctx := context.Background()
+	ws, err := wt.Create(ctx, core.Task{ID: "T-COMMIT"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	headBefore := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD"))
+	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: complete task T-COMMIT"); err != nil {
+		t.Fatalf("CommitPath() with no diff error = %v", err)
+	}
+	if got := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD")); got != headBefore {
+		t.Fatalf("CommitPath() with no diff created commit %s", got)
+	}
+
+	cardDir := filepath.Join(ws.Path, "docs", "tasks")
+	if err := os.MkdirAll(cardDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cardDir, "T-COMMIT.md"), []byte("---\nid: T-COMMIT\nstatus: done\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws.Path, "agent.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: complete task T-COMMIT"); err != nil {
+		t.Fatalf("CommitPath() error = %v", err)
+	}
+	show := gitCmd(t, ws.Path, "show", "--pretty=format:%s", "--name-only", "HEAD")
+	if !strings.Contains(show, "beacon: complete task T-COMMIT") {
+		t.Fatalf("commit subject missing: %s", show)
+	}
+	if !strings.Contains(show, "docs/tasks/T-COMMIT.md") {
+		t.Fatalf("card not in commit: %s", show)
+	}
+	if strings.Contains(show, "agent.go") {
+		t.Fatalf("agent code staged in commit: %s", show)
+	}
+	if status := gitCmd(t, ws.Path, "status", "--porcelain", "--", "agent.go"); strings.TrimSpace(status) == "" {
+		t.Fatal("agent file was committed instead of left in the worktree")
+	}
+	local := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD"))
+	remote := strings.TrimSpace(gitCmd(t, ws.Path, "ls-remote", "origin", "refs/heads/"+ws.Branch))
+	if remote == "" || !strings.HasPrefix(remote, local) {
+		t.Fatalf("branch not pushed: local=%s remote=%q", local, remote)
+	}
+	if err := wt.CommitPath(ctx, ws, "docs/tasks", "beacon: complete task T-COMMIT"); err != nil {
+		t.Fatalf("second CommitPath() error = %v", err)
+	}
+	if got := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD")); got != local {
+		t.Fatalf("second CommitPath() created commit %s", got)
+	}
+}
+
 func TestGitWorktreeHasChanges(t *testing.T) {
 	wt, _ := newTestGitWorktree(t)
 	ctx := context.Background()

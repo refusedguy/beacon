@@ -6,6 +6,7 @@ type TaskSource interface {
 	ListAvailable(ctx context.Context) ([]Task, error)
 	Claim(ctx context.Context, id TaskID) error
 	Complete(ctx context.Context, id TaskID) error
+	MarkInWorkspace(ctx context.Context, id TaskID, workspacePath, status string) error
 }
 
 type Workspace struct {
@@ -19,6 +20,7 @@ type WorkspaceManager interface {
 	Clean(ctx context.Context, ws Workspace) (bool, error)
 	Remove(ctx context.Context, ws Workspace) error
 	HasChanges(ctx context.Context, ws Workspace, base string) (bool, error)
+	CommitPath(ctx context.Context, ws Workspace, pathspec, message string) error
 }
 
 type SpawnRequest struct {

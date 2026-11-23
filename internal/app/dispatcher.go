@@ -155,6 +155,10 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	run.WorkspacePath = ws.Path
 	run.Branch = ws.Branch
 	run.Scope = task.Scope
+	if err := d.Source.MarkInWorkspace(ctx, task.ID, ws.Path, "in_progress"); err != nil {
+		_ = d.Workspace.Remove(ctx, ws)
+		return fmt.Errorf("mark in workspace: %w", err)
+	}
 	session, err := d.Harness.Spawn(ctx, core.SpawnRequest{
 		Task: task, Workspace: ws, RunID: run.ID,
 		ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
