@@ -467,7 +467,6 @@ func (s *Service) List(o ListOptions) (string, error) {
 		warning = fmt.Sprintf("предупреждение: пробуждение по дате не удалось для %d карточки, см. журнал\n", len(wake.Failed))
 	}
 	var cards []Card
-	var err error
 	if len(o.Statuses) == 1 && o.Statuses[0] == "todo" {
 		cards, err = s.taskStore().ListTodo()
 	} else {
