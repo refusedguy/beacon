@@ -150,30 +150,7 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 }
 
 func (c *TaskCreator) publish(ctx context.Context, id core.TaskID) error {
-	base := c.Root.Base
-	if base == "" {
-		base = c.Root.Branch
-	}
-	if base == "" {
-		base = "main"
-	}
-	commit := func() error {
-		return c.Workspace.CommitPath(ctx, c.Root, "docs/tasks", "beacon: create task "+string(id))
-	}
-	if err := c.rebaseBase(ctx, base); err != nil {
-		return err
-	}
-	if err := commit(); err != nil {
-		var nff *NonFastForwardError
-		if !errors.As(err, &nff) {
-			return err
-		}
-		if err := c.rebaseBase(ctx, base); err != nil {
-			return err
-		}
-		return commit()
-	}
-	return nil
+	return publishPath(ctx, c.Workspace, c.Root, "docs/tasks", "beacon: create task "+string(id))
 }
 
 func (c *TaskCreator) writeTasks(ctx context.Context, tasks []core.Task) ([]core.Task, error) {
@@ -242,12 +219,37 @@ func (c *TaskCreator) result(created []core.Task) CreatedTask {
 	return out
 }
 
-func (c *TaskCreator) rebaseBase(ctx context.Context, base string) error {
-	rebaser, ok := c.Workspace.(BaseRebaser)
-	if !ok {
-		return nil
+// publishPath rebases, commits pathspec and retries one non-fast-forward push. Creation and deletion share it.
+func publishPath(ctx context.Context, ws PathCommitter, root core.Workspace, pathspec, message string) error {
+	base := root.Base
+	if base == "" {
+		base = root.Branch
 	}
-	return rebaser.RebaseBase(ctx, c.Root, base)
+	if base == "" {
+		base = "main"
+	}
+	commit := func() error { return ws.CommitPath(ctx, root, pathspec, message) }
+	if err := rebaseBase(ctx, ws, root, base); err != nil {
+		return err
+	}
+	if err := commit(); err != nil {
+		var nff *NonFastForwardError
+		if !errors.As(err, &nff) {
+			return err
+		}
+		if err := rebaseBase(ctx, ws, root, base); err != nil {
+			return err
+		}
+		return commit()
+	}
+	return nil
+}
+
+func rebaseBase(ctx context.Context, ws PathCommitter, root core.Workspace, base string) error {
+	if rebaser, ok := ws.(BaseRebaser); ok {
+		return rebaser.RebaseBase(ctx, root, base)
+	}
+	return nil
 }
 
 func childTasks(epicID core.TaskID, plan []core.ChildSpec) []core.Task {

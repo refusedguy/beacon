@@ -13,5 +13,6 @@ type Services struct {
 	Status      app.StatusService
 	Wait        app.WaitService
 	TaskCreator *app.TaskCreator
+	TaskDeleter *app.TaskDeleter
 	Remote      func(ctx context.Context, action, runID string, pr int, sha string) error
 }
