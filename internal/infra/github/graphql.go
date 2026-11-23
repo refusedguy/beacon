@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 const (
@@ -325,10 +326,10 @@ func (c *Client) Do(ctx context.Context, tier Tier, aliases []Alias) (*BatchResu
 	}
 
 	var (
-		wg   sync.WaitGroup
-		mu   sync.Mutex
-		errs []error
+		wg sync.WaitGroup
+		mu sync.Mutex
 	)
+	errs := &observe.ErrorCollector{}
 	for _, chunk := range chunks {
 		wg.Add(1)
 		go func(chunk []Alias) {
@@ -337,7 +338,7 @@ func (c *Client) Do(ctx context.Context, tier Tier, aliases []Alias) (*BatchResu
 			case c.semaphore() <- struct{}{}:
 				defer func() { <-c.semaphore() }()
 			case <-ctx.Done():
-				c.appendError(&mu, &errs, ctx.Err())
+				errs.Add(ctx.Err())
 				return
 			}
 			data, cost, err := c.doChunk(ctx, tier, chunk)
@@ -345,7 +346,7 @@ func (c *Client) Do(ctx context.Context, tier Tier, aliases []Alias) (*BatchResu
 			defer mu.Unlock()
 			result.TotalCost += cost
 			if err != nil {
-				errs = append(errs, err)
+				errs.Add(err)
 				return
 			}
 			for name, raw := range data {
@@ -354,8 +355,8 @@ func (c *Client) Do(ctx context.Context, tier Tier, aliases []Alias) (*BatchResu
 		}(chunk)
 	}
 	wg.Wait()
-	if len(errs) > 0 {
-		return result, errors.Join(errs...)
+	if err := errs.Error(); err != nil {
+		return result, err
 	}
 	return result, nil
 }
@@ -425,15 +426,6 @@ func (c *Client) doChunk(ctx context.Context, tier Tier, chunk []Alias) (map[str
 		return parsed.Data, parsed.RateLimit.Cost, nil
 	}
 	return nil, 0, errors.New("graphql: no attempt made")
-}
-
-func (c *Client) appendError(mu *sync.Mutex, errs *[]error, err error) {
-	if err == nil {
-		return
-	}
-	mu.Lock()
-	*errs = append(*errs, err)
-	mu.Unlock()
 }
 
 func (c *Client) semaphore() chan struct{} {
