@@ -125,6 +125,41 @@ func resultObligation(w domain.Watch, subscriber string) domain.Obligation {
 	}
 }
 
+// ackFixtureSetup adjusts the Watch and obligation before the fixture is
+// stored. A setup that changes the Watch identity must rebuild the obligation.
+type ackFixtureSetup func(w *domain.Watch, o *domain.Obligation)
+
+// ackFixtureWithWatch replaces the verdict-derived Watch with an already built
+// one and rebuilds its obligation.
+func ackFixtureWithWatch(w domain.Watch, session string) ackFixtureSetup {
+	return func(cur *domain.Watch, o *domain.Obligation) {
+		*cur = w
+		*o = resultObligation(w, session)
+	}
+}
+
+// newAckResultFixture builds a stored Watch, its obligation and a stamper that
+// already knows the obligation. Callers keep the w, o, store and stamper names
+// used by the ack and get_result tests.
+func newAckResultFixture(t *testing.T, verdict domain.Verdict, session string, setups ...ackFixtureSetup) (domain.Watch, domain.Obligation, *memStore, *recordingStamper) {
+	t.Helper()
+	w := resultFixture(verdict)
+	o := resultObligation(w, session)
+	for _, setup := range setups {
+		setup(&w, &o)
+	}
+	store := newMemStore()
+	if err := store.SaveWatch(w); err != nil {
+		t.Fatalf("SaveWatch: %v", err)
+	}
+	if err := store.SaveObligation(o); err != nil {
+		t.Fatalf("SaveObligation: %v", err)
+	}
+	stamper := newRecordingStamper()
+	stamper.add(o)
+	return w, o, store, stamper
+}
+
 func sortedFailedChecks(in []FailedCheck) []FailedCheck {
 	out := append([]FailedCheck(nil), in...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -175,17 +210,7 @@ func TestGetResultProjectsContractAndStampsRead(t *testing.T) {
 	for _, verdict := range []domain.Verdict{domain.VerdictReady, domain.VerdictKeepWorking} {
 		t.Run(string(verdict), func(t *testing.T) {
 			clock := &stepClock{t: time.Date(2026, 11, 19, 10, 5, 0, 0, time.UTC)}
-			w := resultFixture(verdict)
-			o := resultObligation(w, "session-G")
-			store := newMemStore()
-			if err := store.SaveWatch(w); err != nil {
-				t.Fatalf("SaveWatch: %v", err)
-			}
-			if err := store.SaveObligation(o); err != nil {
-				t.Fatalf("SaveObligation: %v", err)
-			}
-			stamper := newRecordingStamper()
-			stamper.add(o)
+			w, o, store, stamper := newAckResultFixture(t, verdict, "session-G")
 			h := NewGetResultHandler(store, stamper, clock)
 
 			out, err := h.Result(context.Background(), sessionReq("session-G"), GetResultInput{WatchID: w.ID})
@@ -264,18 +289,9 @@ func TestGetResultEchoesWatchConfigID(t *testing.T) {
 		{name: "old watch", configID: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w := resultFixture(domain.VerdictReady)
-			w.ConfigID = tc.configID
-			o := resultObligation(w, "session-C")
-			store := newMemStore()
-			if err := store.SaveWatch(w); err != nil {
-				t.Fatalf("SaveWatch: %v", err)
-			}
-			if err := store.SaveObligation(o); err != nil {
-				t.Fatalf("SaveObligation: %v", err)
-			}
-			stamper := newRecordingStamper()
-			stamper.add(o)
+			w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-C", func(w *domain.Watch, o *domain.Obligation) {
+				w.ConfigID = tc.configID
+			})
 			h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 			out, err := h.Result(context.Background(), sessionReq("session-C"), GetResultInput{WatchID: w.ID})
@@ -301,14 +317,9 @@ func TestGetResultEchoesWatchConfigID(t *testing.T) {
 // TestGetResultRetryBudgetWithoutFlakyFailure checks that a watch with no
 // flaky-matched failure reports no retry budget.
 func TestGetResultRetryBudgetWithoutFlakyFailure(t *testing.T) {
-	w := resultFixture(domain.VerdictKeepWorking)
-	w.Flaky = domain.FlakyConfig{}
-	o := resultObligation(w, "session-B")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-B", func(w *domain.Watch, o *domain.Obligation) {
+		w.Flaky = domain.FlakyConfig{}
+	})
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 	out, err := h.Result(context.Background(), sessionReq("session-B"), GetResultInput{WatchID: w.ID})
@@ -343,16 +354,7 @@ func TestGetResultCancelledCheckIsFailed(t *testing.T) {
 		},
 		Merge: domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
 	}
-	o := resultObligation(w, "session-C")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	_, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-C", ackFixtureWithWatch(w, "session-C"))
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 	out, err := h.Result(context.Background(), sessionReq("session-C"), GetResultInput{WatchID: w.ID})
@@ -394,16 +396,7 @@ func TestGetResultCancelledStateIsFailed(t *testing.T) {
 				},
 				Merge: domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
 			}
-			o := resultObligation(w, "session-CS")
-			store := newMemStore()
-			if err := store.SaveWatch(w); err != nil {
-				t.Fatalf("SaveWatch: %v", err)
-			}
-			if err := store.SaveObligation(o); err != nil {
-				t.Fatalf("SaveObligation: %v", err)
-			}
-			stamper := newRecordingStamper()
-			stamper.add(o)
+			_, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-CS", ackFixtureWithWatch(w, "session-CS"))
 			h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 			out, err := h.Result(context.Background(), sessionReq("session-CS"), GetResultInput{WatchID: w.ID})
@@ -763,17 +756,7 @@ func TestGradeResultBudgetExhaustionAsksHuman(t *testing.T) {
 // needs_input without creating a successor Watch.
 func TestGradeResultParksWatchWhenBudgetExhausted(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictKeepWorking)
-	o := resultObligation(w, "session-human")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-human")
 	h := NewGetResultHandler(store, stamper, clock)
 
 	ev, err := h.GradeResult(context.Background(), w.ID, DefaultResultRubric(), defaultOutcomeIterations, false)
@@ -807,17 +790,7 @@ func TestGradeResultParksWatchWhenBudgetExhausted(t *testing.T) {
 // stops asking for a decision.
 func TestMaxIterationsAnswerRaisesBudgetAndUnparks(t *testing.T) {
 	clock := &stepClock{t: time.Date(2026, 11, 22, 10, 0, 0, 0, time.UTC)}
-	w := resultFixture(domain.VerdictKeepWorking)
-	o := resultObligation(w, "session-answer")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-answer")
 	h := NewGetResultHandler(store, stamper, clock)
 
 	first, err := h.GradeResult(context.Background(), w.ID, DefaultResultRubric(), defaultOutcomeIterations, false)
@@ -904,15 +877,10 @@ func TestGradeResultUnknownCriterion(t *testing.T) {
 // TestGradeResultIsSeparateFromDelivery checks that the grader re-reads Watch
 // facts from the store and leaves the delivery stamps untouched.
 func TestGradeResultIsSeparateFromDelivery(t *testing.T) {
-	w := resultFixture(domain.VerdictReady)
-	w.Status = domain.StatusClosed
-	w.ClosedAt = time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
-	o := resultObligation(w, "session-G")
-	store := newMemStore()
-	_ = store.SaveWatch(w)
-	_ = store.SaveObligation(o)
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-G", func(w *domain.Watch, o *domain.Obligation) {
+		w.Status = domain.StatusClosed
+		w.ClosedAt = time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
+	})
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 	ev, err := h.GradeResult(context.Background(), w.ID, DefaultResultRubric(), 0, false)
@@ -992,16 +960,11 @@ func TestGradeExternalActionLostResponseNeverRetries(t *testing.T) {
 // the task result indeterminate; only a lost response after a performed action
 // does that.
 func TestDeliveryIndeterminateIsNotTaskIndeterminate(t *testing.T) {
-	w := greenWatch()
-	o := resultObligation(w, "session-D")
-	o.Attempts = []domain.Attempt{{N: 1, Outcome: domain.OutcomeIndeterminate, At: time.Now()}}
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
+	w, o, store, _ := newAckResultFixture(t, domain.VerdictReady, "session-D", func(w *domain.Watch, o *domain.Obligation) {
+		*w = greenWatch()
+		*o = resultObligation(*w, "session-D")
+		o.Attempts = []domain.Attempt{{N: 1, Outcome: domain.OutcomeIndeterminate, At: time.Now()}}
+	})
 	h := NewGetResultHandler(store, newRecordingStamper(), &stepClock{t: time.Now()})
 
 	deliveryOnly, err := h.GradeExternalAction(context.Background(), w.ID, DefaultResultRubric(), 0, true, false, o.ID)
@@ -1031,17 +994,7 @@ func TestDeliveryIndeterminateIsNotTaskIndeterminate(t *testing.T) {
 // TestGetResultKeepsLeaseKeyAndFieldOrder proves ADR 0036 §2 is untouched: the
 // new outcome value adds no field and reorders none of the get_result response.
 func TestGetResultKeepsLeaseKeyAndFieldOrder(t *testing.T) {
-	w := resultFixture(domain.VerdictReady)
-	o := resultObligation(w, "session-K")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, _, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-K")
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 	out, err := h.Result(context.Background(), sessionReq("session-K"), GetResultInput{WatchID: w.ID})
@@ -1844,17 +1797,7 @@ func (c *countingExcerptCache) counts() (int, int) {
 
 func excerptTestHandler(t *testing.T, src FailureExcerptSource, cache failureExcerptCache) (*GetResultHandler, domain.Watch) {
 	t.Helper()
-	w := resultFixture(domain.VerdictKeepWorking)
-	o := resultObligation(w, "session-E")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	w, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-E")
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 	h.SetFailureExcerptSource(src)
 	if cache != nil {
@@ -1981,16 +1924,7 @@ func TestFailureExcerptManyAnnotationsKeepMarker(t *testing.T) {
 		answers[name] = strings.Repeat("x", 300)
 	}
 	src := newFakeExcerptSource(answers)
-	o := resultObligation(w, "session-E")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	_, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-E", ackFixtureWithWatch(w, "session-E"))
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 	h.SetFailureExcerptSource(src)
 
@@ -2281,16 +2215,7 @@ func limitResultFixture(t *testing.T, n int) (domain.Watch, *memStore, *recordin
 			State: "FAILURE", Conclusion: "FAILURE", Required: true,
 		}
 	}
-	o := resultObligation(w, "session-limit")
-	store := newMemStore()
-	if err := store.SaveWatch(w); err != nil {
-		t.Fatalf("SaveWatch: %v", err)
-	}
-	if err := store.SaveObligation(o); err != nil {
-		t.Fatalf("SaveObligation: %v", err)
-	}
-	stamper := newRecordingStamper()
-	stamper.add(o)
+	_, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-limit", ackFixtureWithWatch(w, "session-limit"))
 	return w, store, stamper, &stepClock{t: time.Date(2026, 11, 19, 10, 0, 0, 0, time.UTC)}
 }
 

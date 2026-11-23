@@ -69,6 +69,20 @@ func connectWakeServer(t *testing.T, server *mcpsdk.Server) *mcpsdk.ClientSessio
 	return clientSession
 }
 
+// decodeWakeOutput decodes the structured content of a wake tool result.
+func decodeWakeOutput(t *testing.T, result *mcpsdk.CallToolResult) WakeOutput {
+	t.Helper()
+	raw, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out WakeOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	return out
+}
+
 // TestWakeDeliveryModes proves that both real delivery modes are surfaced as
 // success. These are the two branches ADR 0017's ladder can act on.
 func TestWakeDeliveryModes(t *testing.T) {
@@ -255,14 +269,7 @@ func TestWakeOverInMemoryTransport(t *testing.T) {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
 
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Delivery != DeliveryQueue || !out.OK {
 		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
 	}
@@ -361,10 +368,10 @@ func TestWakeInterruptionWinsOverMissingInput(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasHumanFlags proves the two ADR 0028 flags are part of the
-// wake tool's input schema, so an MCP client can send them. The SDK reflects
-// the schema from WakeInput; no hand-written JSON is involved.
-func TestWakeSchemaHasHumanFlags(t *testing.T) {
+// TestWakeInputSchemaHasAllFields checks every field an MCP client needs in
+// the wake input schema. The table replaces the separate tools/list walks that
+// used to live in eight schema tests and three transport tests.
+func TestWakeInputSchemaHasAllFields(t *testing.T) {
 	server := NewServer()
 	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
@@ -384,10 +391,37 @@ func TestWakeSchemaHasHumanFlags(t *testing.T) {
 	if len(inputSchema) == 0 {
 		t.Fatal("wake tool input schema is empty")
 	}
-	for _, flag := range []string{"hasPendingQuestion", "pendingApproval"} {
-		if !strings.Contains(string(inputSchema), flag) {
-			t.Errorf("wake input schema missing %q: %s", flag, inputSchema)
-		}
+
+	cases := []struct {
+		name   string
+		fields []string
+		quoted bool
+	}{
+		{name: "human flags", fields: []string{"hasPendingQuestion", "pendingApproval"}, quoted: true},
+		{name: "source", fields: []string{"source"}},
+		{name: "executor", fields: []string{"executor"}},
+		{name: "woke", fields: []string{"woke"}},
+		{name: "required capabilities", fields: []string{"requiredCapabilities"}},
+		{name: "target worktree", fields: []string{"targetWorktree"}},
+		{name: "wake window", fields: []string{"wakeBetweenMillis"}},
+		{name: "state", fields: []string{"state"}},
+		{name: "prompt", fields: []string{"prompt"}},
+		{name: "doorbell", fields: []string{"mailbox", "broadcast"}},
+		{name: "heartbeat guard", fields: []string{"heartbeatState", "quotaShouldRun", "heartbeatTick"}, quoted: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, field := range tc.fields {
+				if strings.Contains(string(inputSchema), field) {
+					continue
+				}
+				if tc.quoted {
+					t.Errorf("wake input schema missing %q: %s", field, inputSchema)
+				} else {
+					t.Errorf("wake input schema missing %s: %s", field, inputSchema)
+				}
+			}
+		})
 	}
 }
 
@@ -411,14 +445,7 @@ func TestWakeInterruptionOverInMemoryTransport(t *testing.T) {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
 
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if !out.Interrupted || out.Delivery != DeliveryInterrupted {
 		t.Errorf("client saw interrupted=%v delivery=%q, want true/%q", out.Interrupted, out.Delivery, DeliveryInterrupted)
 	}
@@ -510,33 +537,6 @@ func TestWakeReviewSourceDoesNotBreakInterruption(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasSource proves an MCP client can send the message source,
-// so a caller can mark a diff comment as review in the tool call.
-func TestWakeSchemaHasSource(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "source") {
-		t.Errorf("wake input schema missing source: %s", inputSchema)
-	}
-}
-
 // TestWakeReviewOverInMemoryTransport drives a review-source diff comment
 // through a real MCP client and server. It proves both the steer delivery and
 // the source reach the client, not just the in-process handler.
@@ -558,14 +558,7 @@ func TestWakeReviewOverInMemoryTransport(t *testing.T) {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
 
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Delivery != DeliverySteer || !out.OK || out.Source != SourceReview {
 		t.Errorf("client saw delivery=%q ok=%v source=%q, want steer/true/review", out.Delivery, out.OK, out.Source)
 	}
@@ -628,33 +621,6 @@ func TestWakeExecutorOnRefusalAndInterruption(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasExecutor proves an MCP client can send the current executor,
-// so a caller can report a fallback handover through the wake tool.
-func TestWakeSchemaHasExecutor(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "executor") {
-		t.Errorf("wake input schema missing executor: %s", inputSchema)
-	}
-}
-
 // TestWakeExecutorOverInMemoryTransport drives the executor through a real MCP
 // client and server. It proves the field is decoded from the schema and echoed
 // back to the client, not just handled in process.
@@ -674,14 +640,7 @@ func TestWakeExecutorOverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Executor != "hermes" {
 		t.Errorf("client saw executor=%q, want %q", out.Executor, "hermes")
 	}
@@ -757,32 +716,6 @@ func TestWokeOnInterruption(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasWoke proves an MCP client can send the separate woke fact.
-func TestWakeSchemaHasWoke(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "woke") {
-		t.Errorf("wake input schema missing woke: %s", inputSchema)
-	}
-}
-
 // TestWokeOverInMemoryTransport drives woke through a real MCP client and
 // server. It proves the fact is decoded from the schema and echoed back, not
 // just handled in process.
@@ -802,14 +735,7 @@ func TestWokeOverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if !out.Woke || !out.OK || out.Delivery != DeliveryQueue {
 		t.Errorf("client saw woke=%v ok=%v delivery=%q, want true/true/queue", out.Woke, out.OK, out.Delivery)
 	}
@@ -1017,33 +943,6 @@ func TestWakeWithoutCapabilitiesKeepsExplicitTarget(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasRequiredCapabilities proves an MCP client can send the
-// capability request that drives the new selection path.
-func TestWakeSchemaHasRequiredCapabilities(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "requiredCapabilities") {
-		t.Errorf("wake input schema missing requiredCapabilities: %s", inputSchema)
-	}
-}
-
 // TestWakeCapabilityOverInMemoryTransport drives capability selection through
 // a real MCP client and server. It proves the request is decoded from the
 // schema and the chosen target reaches the sender, not just the local handler.
@@ -1068,14 +967,7 @@ func TestWakeCapabilityOverInMemoryTransport(t *testing.T) {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
 
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Delivery != DeliveryQueue || !out.OK {
 		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
 	}
@@ -1308,33 +1200,6 @@ func TestWakeWorktreeWithCapabilities(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasTargetWorktree proves an MCP client can send the worktree
-// path that drives the new addressing path.
-func TestWakeSchemaHasTargetWorktree(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "targetWorktree") {
-		t.Errorf("wake input schema missing targetWorktree: %s", inputSchema)
-	}
-}
-
 // TestWakeWorktreeOverInMemoryTransport drives worktree addressing through a
 // real MCP client and server. It proves the path is decoded from the schema
 // and the session in that worktree receives the delivery.
@@ -1358,14 +1223,7 @@ func TestWakeWorktreeOverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Delivery != DeliveryQueue || !out.OK {
 		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
 	}
@@ -1645,14 +1503,7 @@ func TestWakeFallbackOverInMemoryTransport(t *testing.T) {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
 
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Delivery != DeliveryUnsupported || out.OK || !out.Traced || out.Fallback != FallbackTraced {
 		t.Errorf("client saw delivery=%q ok=%v traced=%v fallback=%q, want unsupported/false/true/traced",
 			out.Delivery, out.OK, out.Traced, out.Fallback)
@@ -1877,33 +1728,6 @@ func TestWakeBetweenFallbackStaggersOnce(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasWakeBetweenMillis proves an MCP client can send the wait
-// window that drives the stagger.
-func TestWakeSchemaHasWakeBetweenMillis(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "wakeBetweenMillis") {
-		t.Errorf("wake input schema missing wakeBetweenMillis: %s", inputSchema)
-	}
-}
-
 // TestWakeBetweenOverInMemoryTransport drives the window through a real MCP
 // client and server. It proves the field is decoded from the schema and the
 // waiter is staggered before delivery.
@@ -1922,14 +1746,7 @@ func TestWakeBetweenOverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.Delivery != DeliveryQueue || !out.OK {
 		t.Errorf("client saw delivery=%q ok=%v, want queue/true", out.Delivery, out.OK)
 	}
@@ -2121,43 +1938,9 @@ func TestWakeStateOverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if out.State != StateRead || !out.State.IsRead() || !out.OK {
 		t.Errorf("client saw state=%q IsRead=%v ok=%v, want read/true/true", out.State, out.State.IsRead(), out.OK)
-	}
-}
-
-// TestWakeSchemaHasState proves an MCP client can send the receipt state, so
-// the environment can report where in its life a message actually is.
-func TestWakeSchemaHasState(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "state") {
-		t.Errorf("wake input schema missing state: %s", inputSchema)
 	}
 }
 
@@ -2866,33 +2649,6 @@ func TestT3_124ConcurrentEqualPromptsStartOneTask(t *testing.T) {
 	}
 }
 
-// TestT3_124WakeSchemaHasPrompt proves the prompt field reaches the input
-// schema derived by go-sdk, so a real client can send it.
-func TestT3_124WakeSchemaHasPrompt(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "prompt") {
-		t.Errorf("wake input schema missing prompt: %s", inputSchema)
-	}
-}
-
 // TestT3_124OverInMemoryTransport drives two equal prompts through a real MCP
 // client and server session, so the schema and the output fields are checked
 // on the same path CI exercises.
@@ -2912,14 +2668,7 @@ func TestT3_124OverInMemoryTransport(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 		}
-		raw, err := json.Marshal(result.StructuredContent)
-		if err != nil {
-			t.Fatalf("marshal structured content: %v", err)
-		}
-		var out WakeOutput
-		if err := json.Unmarshal(raw, &out); err != nil {
-			t.Fatalf("unmarshal structured content: %v", err)
-		}
+		out := decodeWakeOutput(t, result)
 		return out
 	}
 
@@ -3256,28 +3005,6 @@ func TestT3_129OverInMemoryTransport(t *testing.T) {
 	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).WithDoorbell(d))
 	session := connectWakeServer(t, server)
 
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "mailbox") {
-		t.Errorf("wake input schema missing mailbox: %s", inputSchema)
-	}
-	if !strings.Contains(string(inputSchema), "broadcast") {
-		t.Errorf("wake input schema missing broadcast: %s", inputSchema)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ch := startDoorbellListener(ctx, d, "mailbox-MCP")
@@ -3288,14 +3015,7 @@ func TestT3_129OverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if !out.DoorbellRang {
 		t.Error("doorbellRang missing from structured output over MCP, want true")
 	}
@@ -3573,27 +3293,6 @@ func TestT3_135OverInMemoryTransport(t *testing.T) {
 	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver).WithHeartbeatGuard(NewHeartbeatGuard()))
 	session := connectWakeServer(t, server)
 
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	for _, field := range []string{"heartbeatState", "quotaShouldRun", "heartbeatTick"} {
-		if !strings.Contains(string(inputSchema), field) {
-			t.Errorf("wake input schema missing %q: %s", field, inputSchema)
-		}
-	}
-
 	// An open gate releases the wake on the first observation; structured
 	// output must carry the guard facts over MCP.
 	result, err := session.CallTool(context.Background(), &mcpsdk.CallToolParams{
@@ -3605,14 +3304,7 @@ func TestT3_135OverInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CallTool(%s): %v", WakeToolName, err)
 	}
-	raw, err := json.Marshal(result.StructuredContent)
-	if err != nil {
-		t.Fatalf("marshal structured content: %v", err)
-	}
-	var out WakeOutput
-	if err := json.Unmarshal(raw, &out); err != nil {
-		t.Fatalf("unmarshal structured content: %v", err)
-	}
+	out := decodeWakeOutput(t, result)
 	if !out.Guarded || !out.QuotaGateOpen || out.GuardReason != guardReasonGate {
 		t.Errorf("structured guard facts = %+v, want guarded open gate", out)
 	}
