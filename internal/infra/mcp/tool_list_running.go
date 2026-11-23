@@ -682,7 +682,7 @@ func watchOutputs(in []domain.Watch) []WatchOutput {
 func (h *ListRunningHandler) Handle(_ context.Context, _ *mcpsdk.CallToolRequest, in ListRunningInput) (*mcpsdk.CallToolResult, ListRunningOutput, error) {
 	from, err := decodeEventCursor(in.Cursor)
 	if err != nil {
-		return nil, ListRunningOutput{}, domain.NewAppError(domain.CodeInvalidInput, err.Error())
+		return nil, ListRunningOutput{}, domain.NewAppErrorWithCause(domain.CodeInvalidInput, err.Error(), err)
 	}
 
 	snap, err := h.reader.Snapshot()

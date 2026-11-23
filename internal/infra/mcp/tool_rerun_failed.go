@@ -92,7 +92,7 @@ func (h *RerunFailedHandler) Rerun(ctx context.Context, in RerunFailedInput) (Re
 
 	w, err := h.port.Watch(in.WatchID)
 	if err != nil {
-		return RerunFailedOutput{}, domain.NewAppError(domain.CodeWatchNotFound, "rerun_failed: watch: "+err.Error())
+		return RerunFailedOutput{}, domain.NewAppErrorWithCause(domain.CodeWatchNotFound, "rerun_failed: watch: "+err.Error(), err)
 	}
 
 	eligible := flakyFailedChecks(w)
@@ -125,17 +125,17 @@ func (h *RerunFailedHandler) Rerun(ctx context.Context, in RerunFailedInput) (Re
 	}
 	recorded, err := h.port.RerunRecorded(ctx, key)
 	if err != nil {
-		return RerunFailedOutput{}, domain.NewAppError(domain.CodePersistFailed, "rerun_failed: idempotency read: "+err.Error())
+		return RerunFailedOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "rerun_failed: idempotency read: "+err.Error(), err)
 	}
 	if recorded {
 		return out, nil
 	}
 
 	if err := h.port.RerunFailed(ctx, w.Repo, runID); err != nil {
-		return RerunFailedOutput{}, domain.NewAppError(domain.CodePersistFailed, "rerun_failed: provider: "+err.Error())
+		return RerunFailedOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "rerun_failed: provider: "+err.Error(), err)
 	}
 	if err := h.port.SpendRerunBudget(ctx, key, failedCheckNames(eligible)); err != nil {
-		return RerunFailedOutput{}, domain.NewAppError(domain.CodePersistFailed, "rerun_failed: spend budget: "+err.Error())
+		return RerunFailedOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "rerun_failed: spend budget: "+err.Error(), err)
 	}
 	out.Rerun = true
 	out.RetryBudget = budget - 1

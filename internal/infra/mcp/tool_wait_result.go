@@ -1794,7 +1794,7 @@ func (s *WaitResultService) wait(ctx context.Context, subscriberID string, in Wa
 		fn = sharedCIWaitNoop
 	}
 	if err := s.ciGate(ctx, sharedCIWaitKey(w), fn); err != nil {
-		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, "wait_result: shared CI wait failed: "+err.Error())
+		return WaitResultOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, "wait_result: shared CI wait failed: "+err.Error(), err)
 	}
 
 	var sub VerdictSubscription
@@ -1947,7 +1947,7 @@ func (s *WaitResultService) deliver(ctx context.Context, watchID string, status 
 	}
 	obligationID := domain.ObligationKey(watchID, revision, subscriberID)
 	if err := s.writer.MarkRead(ctx, obligationID, at); err != nil {
-		return WaitResultOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return WaitResultOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	ms := waitResultPollAfterMs
 	out := WaitResultOutput{

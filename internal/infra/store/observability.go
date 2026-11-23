@@ -214,7 +214,7 @@ func (p *ObservedPersist) Write(ctx context.Context, fn func(*sql.Tx) error) err
 	}
 
 	if err := p.ensureProgressTable(); err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 
 	withProgress := func(tx *sql.Tx) error {
@@ -228,7 +228,7 @@ func (p *ObservedPersist) Write(ctx context.Context, fn func(*sql.Tx) error) err
 		if recErr := p.recordFailure(ctx, err); recErr != nil {
 			err = errors.Join(err, recErr)
 		}
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return nil
 }
@@ -259,7 +259,7 @@ func (p *ObservedPersist) RecordStream(ctx context.Context, final domain.StreamF
 	}
 	missing, err := json.Marshal(positions)
 	if err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	err = p.db.rawWrite(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.Exec(createStreamHealthSQL); err != nil {
@@ -272,7 +272,7 @@ func (p *ObservedPersist) RecordStream(ctx context.Context, final domain.StreamF
 		return err
 	})
 	if err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return nil
 }
@@ -344,7 +344,7 @@ func (p *ObservedPersist) RecordWake(ctx context.Context, obs WakeObservation) e
 		return err
 	})
 	if err != nil {
-		return domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return nil
 }

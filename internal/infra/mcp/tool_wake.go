@@ -699,7 +699,7 @@ func (h *WakeHandler) applyWakeWindow(ctx context.Context, in WakeInput) error {
 	}
 	if err := sleeper.Sleep(ctx, pick(window)); err != nil {
 		return repairableError(
-			domain.NewAppError(domain.CodeCancelled, "wake: waiting inside wake window was cancelled: "+err.Error()),
+			domain.NewAppErrorWithCause(domain.CodeCancelled, "wake: waiting inside wake window was cancelled: "+err.Error(), err),
 			true,
 			"wake: reissue the wake with a fresh wait window; the previous wait was cancelled",
 			recoveryCursorWindow,

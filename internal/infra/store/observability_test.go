@@ -100,6 +100,18 @@ func TestObservedPersistFailureRecordsLastErrorAndReturnsPersistFailed(t *testin
 	}
 }
 
+func TestObservedPersistFailureKeepsCauseThroughAppError(t *testing.T) {
+	d := openObservabilityDB(t)
+	cause := errors.New("disk full")
+	op := NewObservedPersistWithWriter(d, &failingWriter{err: cause})
+
+	err := op.Write(context.Background(), func(tx *sql.Tx) error { return nil })
+	persistFailed(t, err)
+	if !errors.Is(err, cause) {
+		t.Fatalf("errors.Is(%v, cause) = false, want the original cause reachable through *domain.AppError", err)
+	}
+}
+
 func TestObservedPersistSeqOnlyAfterCommittedWrites(t *testing.T) {
 	d := openObservabilityDB(t)
 	op := NewObservedPersist(d)

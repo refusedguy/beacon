@@ -569,7 +569,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 	if changed {
 		if err := h.store.SaveWatch(updated); err != nil {
 			observe.ActorError("watch_pr-fields", "", err)
-			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return WatchPROutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 		sub.Watch = updated
 	}
@@ -584,7 +584,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		)
 		if err != nil {
 			observe.ActorError("watch_pr-registry", sub.Watch.ID, err)
-			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return WatchPROutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 	}
 
@@ -595,7 +595,7 @@ func (h *WatchPRHandler) Register(ctx context.Context, req *mcpsdk.CallToolReque
 		incident, err := h.blockers.AssignFixer(blockerID, sub.Watch.ID)
 		if err != nil {
 			observe.ActorError("watch_pr-assign-fixer", sub.Watch.ID, err)
-			return WatchPROutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return WatchPROutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 		observe.Event(observe.LevelInfo, "blocker_fixer_assigned", observe.Fields{
 			"blockerID": incident.ID, "watchID": sub.Watch.ID, "fixAttempts": incident.FixAttempts,
@@ -662,7 +662,7 @@ func (h *WatchPRHandler) validateFixFor(in WatchPRInput) (string, error) {
 		}
 		active, err := h.blockers.ActiveBlockers()
 		if err != nil {
-			return "", domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return "", domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 		found := false
 		for _, incident := range active {
@@ -819,7 +819,7 @@ func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, no
 		watches, err = h.store.ActiveWatches()
 	}
 	if err != nil {
-		return nil, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return nil, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 
 	var carried []domain.Subscriber
@@ -830,7 +830,7 @@ func (h *WatchPRHandler) closeSuperseded(repo string, pr int, headSHA string, no
 		}
 		closed, effects := domain.Transition(*w, domain.HeadChangedEvent(headSHA, now))
 		if err := h.store.SaveWatch(closed); err != nil {
-			return nil, domain.NewAppError(domain.CodePersistFailed, err.Error())
+			return nil, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 		}
 		observe.Event(observe.LevelWarn, "watch_pr_superseded", observe.Fields{
 			observe.FieldWatchID: w.ID,

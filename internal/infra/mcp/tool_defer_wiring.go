@@ -132,7 +132,7 @@ func (h *DeferWiringHandler) Defer(ctx context.Context, in DeferWiringInput) (De
 
 	created, err := h.writer.DeferWiring(ctx, card)
 	if err != nil {
-		return DeferWiringOutput{}, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return DeferWiringOutput{}, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	h.seen[key] = card
 	return deferWiringOutput(card, created), nil

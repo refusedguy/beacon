@@ -298,7 +298,7 @@ func (s *SQLObligationStamper) stamp(ctx context.Context, id string, field oblig
 		if errors.As(err, &appErr) {
 			return out, applied, err
 		}
-		return out, applied, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return out, applied, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return out, applied, nil
 }
@@ -1041,7 +1041,7 @@ func mapResultReadError(err error, what string) error {
 	if errors.As(err, &appErr) {
 		return err
 	}
-	return domain.NewAppError(domain.CodeWatchNotFound, what+": "+err.Error())
+	return domain.NewAppErrorWithCause(domain.CodeWatchNotFound, what+": "+err.Error(), err)
 }
 
 // mapResultReadFailure maps a read error on the get_result, grade_result and
@@ -1055,9 +1055,9 @@ func mapResultReadFailure(store resultStoreReader, err error, what string) error
 		return err
 	}
 	if classifier, ok := store.(resultStoreNotFound); ok && classifier.IsNotFound(err) {
-		return domain.NewAppError(domain.CodeWatchNotFound, what+": "+err.Error())
+		return domain.NewAppErrorWithCause(domain.CodeWatchNotFound, what+": "+err.Error(), err)
 	}
-	return domain.NewAppError(domain.CodePersistFailed, what+": "+err.Error())
+	return domain.NewAppErrorWithCause(domain.CodePersistFailed, what+": "+err.Error(), err)
 }
 
 // --- Result rubric, separate from run completion (ADR 0034 §1) -------------
@@ -1328,7 +1328,7 @@ func (h *GetResultHandler) parkForInput(w domain.Watch) (domain.Watch, error) {
 		return next, nil
 	}
 	if err := writer.SaveWatch(next); err != nil {
-		return w, domain.NewAppError(domain.CodePersistFailed, err.Error())
+		return w, domain.NewAppErrorWithCause(domain.CodePersistFailed, err.Error(), err)
 	}
 	return next, nil
 }
