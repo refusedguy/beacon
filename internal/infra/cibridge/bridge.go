@@ -66,6 +66,59 @@ const escalationFile = "ESCALATIONS.md"
 // recheck verdict instead of a rebase, so a stale snapshot never ships.
 const mergeHeldRecheck = "recheck"
 
+// stagingError is the one observability channel for obligation staging. Each
+// site keeps its metric name here, so a failure reaches ActorError even where
+// the old copy used log.Printf or returned without a report.
+func stagingError(metric, watchID string) func(error) {
+	return func(err error) {
+		observe.ActorError(metric, watchID, err)
+	}
+}
+
+// ensureObligation stages o when no obligation exists under its key. The
+// callback keeps the site's error action. The bool result lets the caller keep
+// its own return, continue or return false without a closure capturing control
+// flow. StagedAt comes from now so callers pass the cycle time once.
+func (b *Bridge) ensureObligation(o domain.Obligation, now time.Time, onErr func(error)) bool {
+	if _, err := b.store.Obligation(o.ID); err == nil {
+		return false
+	}
+	o.StagedAt = now
+	if err := b.store.SaveObligation(o); err != nil {
+		if onErr != nil {
+			onErr(err)
+		}
+		return true
+	}
+	return false
+}
+
+// deliveredOrStage stops when the obligation is already delivered or staging
+// failed. It reports a staging failure through onErr and runs onDelivered only
+// for a real delivered marker. The returned obligation comes from the store
+// when one exists, so ladder staging does not overwrite fields from an earlier
+// attempt.
+func (b *Bridge) deliveredOrStage(o domain.Obligation, now time.Time, onErr func(error), onDelivered func()) (domain.Obligation, bool) {
+	o.StagedAt = now
+	staged, err := b.store.Obligation(o.ID)
+	if err == nil {
+		if !staged.DeliveredAt.IsZero() {
+			if onDelivered != nil {
+				onDelivered()
+			}
+			return staged, true
+		}
+		return staged, false
+	}
+	if err := b.store.SaveObligation(o); err != nil {
+		if onErr != nil {
+			onErr(err)
+		}
+		return o, true
+	}
+	return o, false
+}
+
 const (
 	// rebaseCounterSubscriber is the reserved subscriber id of the durable
 	// obligation that records one rebase attempt for a Watch revision. One
@@ -421,15 +474,11 @@ func (b *Bridge) breakerFailures(adapter string) int {
 // recordBreakerFailure appends one durable failure to adapter's counter.
 func (b *Bridge) recordBreakerFailure(adapter string, now time.Time) {
 	id := breakerFailureID(adapter)
-	if _, err := b.store.Obligation(id); err != nil {
-		o := domain.Obligation{
-			ID: id, WatchID: adapter, Revision: 0,
-			SubscriberID: "failures", VerdictPointer: domain.VerdictWatching, StagedAt: now,
-		}
-		if err := b.store.SaveObligation(o); err != nil {
-			observe.ActorError("cibridge-breaker-counter", adapter, err)
-			return
-		}
+	if b.ensureObligation(domain.Obligation{
+		ID: id, WatchID: adapter, Revision: 0,
+		SubscriberID: "failures", VerdictPointer: domain.VerdictWatching, StagedAt: now,
+	}, now, stagingError("cibridge-breaker-counter", adapter)) {
+		return
 	}
 	b.markDelivered(id, now, b.breakerFailures(adapter)+1, "")
 }

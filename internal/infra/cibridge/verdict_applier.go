@@ -72,14 +72,11 @@ func (b *verdictApplier) handleHeadChanged(w domain.Watch, head string, now time
 	}
 	for _, sub := range subs {
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			if err := b.store.SaveObligation(domain.Obligation{
-				ID: id, WatchID: next.ID, Revision: next.Revision,
-				SubscriberID: sub.ID, VerdictPointer: domain.VerdictWatching, StagedAt: now,
-			}); err != nil {
-				observe.ActorError("cibridge-head-obligation", next.ID, err)
-				return
-			}
+		if b.ensureObligation(domain.Obligation{
+			ID: id, WatchID: next.ID, Revision: next.Revision,
+			SubscriberID: sub.ID, VerdictPointer: domain.VerdictWatching, StagedAt: now,
+		}, now, stagingError("cibridge-head-obligation", next.ID)) {
+			return
 		}
 	}
 	if err := b.store.SaveWatch(next); err != nil {
@@ -260,15 +257,11 @@ func (b *verdictApplier) publishMergeWait(w domain.Watch, obs ciObservation, now
 	}
 	for _, sub := range next.Subscribers {
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			o := domain.Obligation{
-				ID: id, WatchID: next.ID, Revision: next.Revision,
-				SubscriberID: sub.ID, VerdictPointer: waitVerdict, StagedAt: now,
-			}
-			if err := b.store.SaveObligation(o); err != nil {
-				observe.ActorError("cibridge-merge-hold-obligation", next.ID, err)
-				continue
-			}
+		if b.ensureObligation(domain.Obligation{
+			ID: id, WatchID: next.ID, Revision: next.Revision,
+			SubscriberID: sub.ID, VerdictPointer: waitVerdict, StagedAt: now,
+		}, now, stagingError("cibridge-merge-hold-obligation", next.ID)) {
+			continue
 		}
 	}
 	observe.VerdictPublished(string(waitVerdict), next.ID, next.PR, next.Revision)
@@ -303,15 +296,11 @@ func (b *verdictApplier) publishActionable(ctx context.Context, w domain.Watch, 
 	// the executor still needs a readable pointer.
 	for _, sub := range next.Subscribers {
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			o := domain.Obligation{
-				ID: id, WatchID: next.ID, Revision: next.Revision,
-				SubscriberID: sub.ID, VerdictPointer: verdict, StagedAt: now,
-			}
-			if err := b.store.SaveObligation(o); err != nil {
-				observe.ActorError("cibridge-obligation", next.ID, err)
-				continue
-			}
+		if b.ensureObligation(domain.Obligation{
+			ID: id, WatchID: next.ID, Revision: next.Revision,
+			SubscriberID: sub.ID, VerdictPointer: verdict, StagedAt: now,
+		}, now, stagingError("cibridge-obligation", next.ID)) {
+			continue
 		}
 		if !roles[string(sub.Role)] {
 			continue
@@ -360,15 +349,11 @@ func (b *verdictApplier) publishRecheck(ctx context.Context, w domain.Watch, obs
 	}
 	for _, sub := range next.Subscribers {
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			o := domain.Obligation{
-				ID: id, WatchID: next.ID, Revision: next.Revision,
-				SubscriberID: sub.ID, VerdictPointer: domain.VerdictRecheck, StagedAt: now,
-			}
-			if err := b.store.SaveObligation(o); err != nil {
-				observe.ActorError("cibridge-recheck-obligation", next.ID, err)
-				continue
-			}
+		if b.ensureObligation(domain.Obligation{
+			ID: id, WatchID: next.ID, Revision: next.Revision,
+			SubscriberID: sub.ID, VerdictPointer: domain.VerdictRecheck, StagedAt: now,
+		}, now, stagingError("cibridge-recheck-obligation", next.ID)) {
+			continue
 		}
 		if !roles[string(sub.Role)] {
 			continue
@@ -625,14 +610,10 @@ func (b *verdictApplier) closeWatch(ctx context.Context, w domain.Watch, verdict
 	for i := range next.Subscribers {
 		sub := next.Subscribers[i]
 		id := domain.ObligationKey(next.ID, next.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			if err := b.store.SaveObligation(domain.Obligation{
-				ID: id, WatchID: next.ID, Revision: next.Revision,
-				SubscriberID: sub.ID, VerdictPointer: verdict, StagedAt: now,
-			}); err != nil {
-				observe.ActorError("cibridge-close-obligation", next.ID, err)
-			}
-		}
+		b.ensureObligation(domain.Obligation{
+			ID: id, WatchID: next.ID, Revision: next.Revision,
+			SubscriberID: sub.ID, VerdictPointer: verdict, StagedAt: now,
+		}, now, stagingError("cibridge-close-obligation", next.ID))
 	}
 	observe.VerdictPublished(string(verdict), next.ID, next.PR, next.Revision)
 	b.cycleEvent(cycleID, "watch_closed", cycleFields{
@@ -681,20 +662,14 @@ func (b *verdictApplier) notifyOrchestratorTerminal(ctx context.Context, w domai
 	}
 
 	obligationID := domain.ObligationKey(w.ID, w.Revision, session)
-	o, err := b.store.Obligation(obligationID)
-	if err == nil && !o.DeliveredAt.IsZero() {
+	o, stop := b.deliveredOrStage(domain.Obligation{
+		ID: obligationID, WatchID: w.ID, Revision: w.Revision,
+		SubscriberID: session, VerdictPointer: verdict, StagedAt: now,
+	}, now, stagingError("cibridge-terminal-obligation", w.ID), func() {
 		observe.WakeSkipped("", w.ID, "terminal confirmation already delivered for this revision")
+	})
+	if stop {
 		return
-	}
-	if err != nil {
-		o = domain.Obligation{
-			ID: obligationID, WatchID: w.ID, Revision: w.Revision,
-			SubscriberID: session, VerdictPointer: verdict, StagedAt: now,
-		}
-		if err := b.store.SaveObligation(o); err != nil {
-			observe.ActorError("cibridge-terminal-obligation", w.ID, err)
-			return
-		}
 	}
 	// Arm the ladder at delivery, as wakeOne does. A subscriber that only owns
 	// a readable pointer never gets here because no wake is addressed to it.
@@ -846,14 +821,11 @@ func (b *verdictApplier) blockedAdapter(w domain.Watch, sessionID string) string
 func (b *verdictApplier) notifyBlocked(ctx context.Context, w domain.Watch, dedup string, now time.Time, cycleID string) bool {
 	for _, sub := range w.Subscribers {
 		id := domain.ObligationKey(w.ID, w.Revision, sub.ID)
-		if _, err := b.store.Obligation(id); err != nil {
-			if err := b.store.SaveObligation(domain.Obligation{
-				ID: id, WatchID: w.ID, Revision: w.Revision,
-				SubscriberID: sub.ID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
-			}); err != nil {
-				log.Printf("cibridge: blocked obligation %s: %v", id, err)
-				return false
-			}
+		if b.ensureObligation(domain.Obligation{
+			ID: id, WatchID: w.ID, Revision: w.Revision,
+			SubscriberID: sub.ID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
+		}, now, stagingError("cibridge-block-obligation", w.ID)) {
+			return false
 		}
 	}
 	sessionID := b.blockedOrchestrator(w)
@@ -864,27 +836,24 @@ func (b *verdictApplier) notifyBlocked(ctx context.Context, w domain.Watch, dedu
 	if b.waker == nil && b.adapterWaker == nil {
 		return false
 	}
-	if delivered, err := b.store.Obligation(dedup); err == nil && !delivered.DeliveredAt.IsZero() {
+	if _, stop := b.deliveredOrStage(domain.Obligation{
+		ID: dedup, WatchID: w.ID, Revision: w.Revision,
+		SubscriberID: "wake", VerdictPointer: domain.VerdictBlocked, StagedAt: now,
+	}, now, stagingError("cibridge-block-dedup-obligation", w.ID), func() {
 		observe.WakeSkipped("", w.ID, "block notice already delivered for this incident")
+	}); stop {
 		return false
-	} else if err != nil {
-		if err := b.store.SaveObligation(domain.Obligation{
-			ID: dedup, WatchID: w.ID, Revision: w.Revision,
-			SubscriberID: "wake", VerdictPointer: domain.VerdictBlocked, StagedAt: now,
-		}); err != nil {
-			log.Printf("cibridge: block dedup obligation %s: %v", dedup, err)
-			return false
-		}
 	}
 
 	obligationID := domain.ObligationKey(w.ID, w.Revision, sessionID)
+	// The ladder is armed only when this key was missing. Keep the existence
+	// check here so an obligation staged by another path keeps its rung.
 	if _, err := b.store.Obligation(obligationID); err != nil {
 		o := domain.Obligation{
 			ID: obligationID, WatchID: w.ID, Revision: w.Revision,
 			SubscriberID: sessionID, VerdictPointer: domain.VerdictBlocked, StagedAt: now,
 		}
-		if err := b.store.SaveObligation(o); err != nil {
-			log.Printf("cibridge: blocked obligation %s: %v", obligationID, err)
+		if b.ensureObligation(o, now, stagingError("cibridge-block-obligation", w.ID)) {
 			return false
 		}
 		b.stage(ctx, o, domain.VerdictBlocked, now)
