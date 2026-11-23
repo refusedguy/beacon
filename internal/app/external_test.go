@@ -104,3 +104,39 @@ func TestFixerMergeSkipsTaskSourceComplete(t *testing.T) {
 		t.Fatalf("complete=%v stops=%d", src.complete, h.stops)
 	}
 }
+
+func TestExternalMergeForceRemovesDirtyWorktree(t *testing.T) {
+	r, _, _, _ := externalReconciler(t, "merged", false)
+	ws := &fakeWorkspace{dirty: true}
+	r.Workspace = ws
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if ws.forcedRemoves != 1 || ws.removed != 0 {
+		t.Fatalf("forcedRemoves = %d, removed = %d; want 1 and 0", ws.forcedRemoves, ws.removed)
+	}
+}
+
+func TestExternalMergeRemovesCleanWorktree(t *testing.T) {
+	r, _, _, _ := externalReconciler(t, "merged", false)
+	ws := &fakeWorkspace{}
+	r.Workspace = ws
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if ws.removed != 1 || ws.forcedRemoves != 0 {
+		t.Fatalf("removed = %d, forcedRemoves = %d; want 1 and 0", ws.removed, ws.forcedRemoves)
+	}
+}
+
+func TestCleanupKeepsActiveRunWorktree(t *testing.T) {
+	ws := &fakeWorkspace{dirty: true}
+	r := &Reconciler{Workspace: ws, Harness: &fakeHarness{}}
+	run := makeRun("r1", 42, core.RunRunning)
+	if err := r.cleanupRun(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if ws.forcedRemoves != 0 || ws.removed != 0 {
+		t.Fatalf("forcedRemoves = %d, removed = %d; want 0 and 0", ws.forcedRemoves, ws.removed)
+	}
+}

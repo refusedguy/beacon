@@ -27,6 +27,7 @@ type WorkspaceManager interface {
 	Create(ctx context.Context, task Task) (Workspace, error)
 	Clean(ctx context.Context, ws Workspace) (bool, error)
 	Remove(ctx context.Context, ws Workspace) error
+	ForceRemove(ctx context.Context, ws Workspace) error
 	HasChanges(ctx context.Context, ws Workspace, base string) (bool, error)
 	CommitPath(ctx context.Context, ws Workspace, pathspec, message string) error
 }

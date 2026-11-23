@@ -205,6 +205,8 @@ func (f *fakeStore) UpdateIncident(_ context.Context, in *core.BaseIncident) err
 
 type fakeWorkspace struct {
 	removed       int
+	forcedRemoves int
+	dirty         bool
 	commits       []commitCall
 	log           *callLog
 	pushes        int
@@ -216,9 +218,13 @@ type fakeWorkspace struct {
 func (f *fakeWorkspace) Create(_ context.Context, t core.Task) (core.Workspace, error) {
 	return core.Workspace{Path: "/ws/" + string(t.ID), Branch: "beacon/" + string(t.ID)}, nil
 }
-func (f *fakeWorkspace) Clean(context.Context, core.Workspace) (bool, error) { return true, nil }
+func (f *fakeWorkspace) Clean(context.Context, core.Workspace) (bool, error) { return !f.dirty, nil }
 func (f *fakeWorkspace) Remove(_ context.Context, _ core.Workspace) error {
 	f.removed++
+	return nil
+}
+func (f *fakeWorkspace) ForceRemove(_ context.Context, _ core.Workspace) error {
+	f.forcedRemoves++
 	return nil
 }
 func (f *fakeWorkspace) HasChanges(context.Context, core.Workspace, string) (bool, error) {
