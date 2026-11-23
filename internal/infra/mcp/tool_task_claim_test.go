@@ -467,6 +467,82 @@ func TestFileTaskClaimDependencyReadiness(t *testing.T) {
 	}
 }
 
+func TestWriteMergedNoteIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	path := writeClaimTestCard(t, dir, "IDX-05", "P1")
+	at := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+
+	if err := WriteMergedNote(dir, path, 1605, at); err != nil {
+		t.Fatalf("first merged note: %v", err)
+	}
+	first, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read card: %v", err)
+	}
+	line := "- PR #1605 MERGED: 2026-11-23 (squash)."
+	if !strings.Contains(string(first), line) {
+		t.Fatalf("card is missing the MERGED note:\n%s", first)
+	}
+
+	if err := WriteMergedNote(dir, path, 1605, at.Add(time.Hour)); err != nil {
+		t.Fatalf("repeated merged note: %v", err)
+	}
+	second, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read card after repeat: %v", err)
+	}
+	if string(second) != string(first) {
+		t.Fatalf("repeat changed the card:\n%s", second)
+	}
+	if n := strings.Count(string(second), "PR #1605 MERGED"); n != 1 {
+		t.Fatalf("MERGED marker count = %d, want 1", n)
+	}
+}
+
+func TestWriteMergedNoteConcurrentWithClaim(t *testing.T) {
+	dir := t.TempDir()
+	path := writeClaimTestCard(t, dir, "IDX-05", "P1")
+	store := &FileTaskClaimStore{TasksDir: dir, StateDir: dir}
+	at := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+
+	errs := make(chan error, 3)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- WriteMergedNote(dir, path, 1605, at)
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := store.Claim(context.Background(), TaskClaimInput{AgentID: "ses_a", CardID: "IDX-05"}, "2026-11-23T10:00:00Z")
+		errs <- err
+	}()
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent write: %v", err)
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read card: %v", err)
+	}
+	text := string(data)
+	if n := strings.Count(text, "PR #1605 MERGED"); n != 1 {
+		t.Fatalf("MERGED marker count = %d, want 1:\n%s", n, text)
+	}
+	for _, want := range []string{"Статус: in_progress", "Агент: ses_a", "## Подтверждение"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("card lost %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestFileTaskClaimDroppedCardUnavailable(t *testing.T) {
 	dir := t.TempDir()
 	writeClaimTestCardWithStatus(t, dir, "AAA-01", "P0", "dropped")
