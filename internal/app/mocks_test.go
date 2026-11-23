@@ -34,6 +34,7 @@ type fakeSource struct {
 	complete    []core.TaskID
 	completeErr error
 	marked      []markCall
+	removed     []core.TaskID
 	log         *callLog
 }
 
@@ -52,6 +53,11 @@ func (f *fakeSource) Complete(_ context.Context, id core.TaskID) error {
 func (f *fakeSource) MarkInWorkspace(_ context.Context, id core.TaskID, path, status string) error {
 	f.marked = append(f.marked, markCall{id: id, path: path, status: status})
 	f.log.add("mark:" + status)
+	return nil
+}
+func (f *fakeSource) Remove(_ context.Context, id core.TaskID) error {
+	f.removed = append(f.removed, id)
+	f.log.add("remove:" + string(id))
 	return nil
 }
 
