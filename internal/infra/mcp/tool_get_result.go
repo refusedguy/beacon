@@ -612,28 +612,7 @@ func cachePut(ctx context.Context, c failureExcerptCache, watchID, headSHA, name
 // package's identifier escaping: annotations are untrusted CI output and must
 // never be able to rewrite an agent's instructions or a tool parameter.
 func escapeUntrusted(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '<':
-			b.WriteString("&lt;")
-		case '>':
-			b.WriteString("&gt;")
-		case '&':
-			b.WriteString("&amp;")
-		case '"':
-			b.WriteString("&quot;")
-		case '\'':
-			b.WriteString("&#39;")
-		default:
-			if r < 0x20 || r == 0x7f {
-				b.WriteString(fmt.Sprintf("\\u%04x", r))
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	return b.String()
+	return domain.EscapeUntrusted(s)
 }
 
 // sanitizeExcerpt redacts secrets, escapes untrusted markup and bounds the

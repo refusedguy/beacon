@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -680,28 +679,6 @@ func liveWatchHeads(c *CLI) (map[string]string, error) {
 	return heads, nil
 }
 
-// watchIDForHead finds a Watch whose recorded head matches the worktree HEAD.
-// Git and the store both write full hashes, but a short HEAD stays comparable
-// through the prefix check. Sorted keys give a stable answer when two Watches
-// record the same head.
-func watchIDForHead(heads map[string]string, head string) string {
-	head = strings.ToLower(strings.TrimSpace(head))
-	if len(head) < 7 {
-		return ""
-	}
-	keys := make([]string, 0, len(heads))
-	for sha := range heads {
-		keys = append(keys, sha)
-	}
-	sort.Strings(keys)
-	for _, sha := range keys {
-		if strings.HasPrefix(sha, head) {
-			return heads[sha]
-		}
-	}
-	return ""
-}
-
 // gcWorktreeDecision turns collected facts into one report line. Facts are
 // checked in this order: a locked worktree, then an active Watch, then a
 // status error, then a dirty tree. Only a clean, unlocked worktree with no
@@ -738,7 +715,7 @@ func gcWorktreeCollect(c *CLI) ([]gcWorktreeResult, error) {
 	}
 	plan := make([]gcWorktreeResult, 0, len(entries))
 	for _, e := range entries {
-		watchID := watchIDForHead(heads, e.Head)
+		watchID := worktree.WatchIDForHead(heads, e.Head)
 		var status string
 		var statusErr error
 		var observedAt time.Time

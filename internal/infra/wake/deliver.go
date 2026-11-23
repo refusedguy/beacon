@@ -482,17 +482,7 @@ func sessionNotFound(err error, out []byte) bool {
 // adapter keys its durable dedup on it, so a replay after a client restart
 // cannot steer the same obligation twice (RS-WK-02).
 func Envelope(p domain.WakePayload) string {
-	var buf strings.Builder
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(map[string]any{
-		"id":           p.ObligationID,
-		"watchID":      p.WatchID,
-		"obligationID": p.ObligationID,
-		"revision":     p.Revision,
-		"verdict":      p.Verdict,
-	})
-	return "<beacon-event>" + strings.TrimSpace(buf.String()) + "</beacon-event>"
+	return domain.RenderEventEnvelope(p.WatchID, p.ObligationID, p.Revision, p.Verdict)
 }
 
 // WatchTarget resolves the orchestrator session that owns a wake pointer. The
@@ -929,17 +919,7 @@ type T202Pointer struct {
 // T202Envelope renders a pointer as the untrusted wake text admitted to a session.
 // The explicit id is the ObligationKey, the same value carried in obligationID.
 func T202Envelope(p T202Pointer) string {
-	var buf strings.Builder
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(map[string]any{
-		"id":           p.ObligationID,
-		"watchID":      p.WatchID,
-		"obligationID": p.ObligationID,
-		"revision":     p.Revision,
-		"verdict":      p.Verdict,
-	})
-	return "<beacon-event>" + strings.TrimSpace(buf.String()) + "</beacon-event>"
+	return domain.RenderEventEnvelope(p.WatchID, p.ObligationID, p.Revision, p.Verdict)
 }
 
 // T202Runner executes an `opencode api` invocation. Tests replace it.
@@ -1386,28 +1366,7 @@ func (r *T211DeliveryRegistry) Get(obligationID string, attempt int) (T210Receip
 // T212escapeUntrusted escapes every character that could turn an identifier
 // into markup, a JSON string delimiter or a control sequence.
 func T212escapeUntrusted(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '<':
-			b.WriteString("&lt;")
-		case '>':
-			b.WriteString("&gt;")
-		case '&':
-			b.WriteString("&amp;")
-		case '"':
-			b.WriteString("&quot;")
-		case '\'':
-			b.WriteString("&#39;")
-		default:
-			if r < 0x20 || r == 0x7f {
-				b.WriteString(fmt.Sprintf("\\u%04x", r))
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	return b.String()
+	return domain.EscapeUntrusted(s)
 }
 
 func T212clamp(s string, max int) string {
