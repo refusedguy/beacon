@@ -71,11 +71,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		if !obs.Conflict && len(obs.Checks) > 0 && obs.AllRequiredPass(nil) {
 			// Green checks mean the new base commits did not reach the PR scope.
 			if run.State == core.RunNeedsAgentFix {
-				if err := run.Apply(core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA}); err != nil {
-					return decision, err
-				}
 				run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
-				return decision, r.Store.Save(ctx, run)
+				return decision, r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksPassed, HeadSHA: obs.HeadSHA})
+			}
+			// A behind PR that GitHub still reports mergeable can merge as-is. Re-evaluate
+			// without the behind invariant so approval rules still apply before merging.
+			if run.State == core.RunWaitingCI {
+				mergeable := obs
+				mergeable.Behind = false
+				if merged := r.Policy.Evaluate(mergeable); merged.Verdict == core.VerdictMerge {
+					run.ObserveSHA(obs.HeadSHA, obs.BaseSHA)
+					return merged, r.merge(ctx, run, obs)
+				}
 			}
 			return decision, nil
 		}
@@ -83,10 +90,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 			return decision, nil
 		}
 		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-			if err := run.Apply(core.Event{Kind: core.EvBehind, Reason: decision.Reason}); err != nil {
-				return decision, err
-			}
-			if err := r.Store.Save(ctx, run); err != nil {
+			if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBehind, Reason: decision.Reason}); err != nil {
 				return decision, err
 			}
 		}
@@ -96,10 +100,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 			return decision, nil
 		}
 		if run.State == core.RunWaitingCI || run.State == core.RunRunning {
-			if err := run.Apply(core.Event{Kind: core.EvChecksFailed, Reason: decision.Reason}); err != nil {
-				return decision, err
-			}
-			if err := r.Store.Save(ctx, run); err != nil {
+			if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvChecksFailed, Reason: decision.Reason}); err != nil {
 				return decision, err
 			}
 		}
@@ -119,10 +120,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		return decision, r.wake(ctx, run, obs, decision.Reason)
 	case core.VerdictBlocked:
 		if run.State != core.RunBlocked {
-			if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: decision.Reason}); err != nil {
-				return decision, err
-			}
-			if err := r.Store.Save(ctx, run); err != nil {
+			if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: decision.Reason}); err != nil {
 				return decision, err
 			}
 		}
@@ -139,6 +137,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, pr int) (decision core.Merge
 		}
 		return decision, nil
 	}
+}
+
+func (r *Reconciler) applyAndSave(ctx context.Context, run *core.Run, e core.Event, observed ...string) error {
+	if err := run.Apply(e); err != nil {
+		return err
+	}
+	if len(observed) == 2 {
+		recordObservation(run, observed[0], observed[1])
+	}
+	return r.Store.Save(ctx, run)
 }
 
 func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observation) error {
@@ -189,10 +197,7 @@ func (r *Reconciler) merge(ctx context.Context, run *core.Run, obs core.Observat
 
 func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observation) error {
 	if !run.CanRebase() {
-		if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"}); err != nil {
-			return err
-		}
-		if err := r.Store.Save(ctx, run); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "rebase attempts exhausted"}); err != nil {
 			return err
 		}
 		return r.notify(run, "rebase exhausted", "automatic rebase attempts exhausted")
@@ -203,21 +208,16 @@ func (r *Reconciler) rebase(ctx context.Context, run *core.Run, obs core.Observa
 	newSHA, err := r.SCM.UpdateBranch(ctx, obs.PRNumber, obs.HeadSHA)
 	if err != nil {
 		logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts+1, "", "failed")
-		if err := run.Apply(core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}); err != nil {
-			return err
-		}
-		recordObservation(run, obs.HeadSHA, obs.BaseSHA)
-		if err := r.Store.Save(ctx, run); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebaseFailed, Reason: err.Error()}, obs.HeadSHA, obs.BaseSHA); err != nil {
 			return err
 		}
 		return r.wake(ctx, run, obs, "automatic rebase failed: "+err.Error())
 	}
-	if err := run.Apply(core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}); err != nil {
+	if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvRebased, HeadSHA: newSHA, Reason: "automatic rebase"}, newSHA, obs.BaseSHA); err != nil {
 		return err
 	}
 	logTransitionRebase(ctx, run.ID, obs.PRNumber, run.RebaseAttempts, newSHA, "rebased")
-	recordObservation(run, newSHA, obs.BaseSHA)
-	return r.Store.Save(ctx, run)
+	return nil
 }
 
 func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observation, reason string) error {
@@ -225,10 +225,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		return nil
 	}
 	if !run.CanWake() {
-		if err := run.Apply(core.Event{Kind: core.EvBlock, Reason: "fix attempts exhausted"}); err != nil {
-			return err
-		}
-		if err := r.Store.Save(ctx, run); err != nil {
+		if err := r.applyAndSave(ctx, run, core.Event{Kind: core.EvBlock, Reason: "fix attempts exhausted"}); err != nil {
 			return err
 		}
 		return r.notify(run, "fix exhausted", "agent fix attempts exhausted")
@@ -246,11 +243,7 @@ func (r *Reconciler) wake(ctx context.Context, run *core.Run, obs core.Observati
 		return fmt.Errorf("wake: %w", err)
 	}
 	logTransitionWake(ctx, run.ID, obs.PRNumber, "woke")
-	if err := run.Apply(core.Event{Kind: core.EvAgentFixed, Reason: reason}); err != nil {
-		return err
-	}
-	recordObservation(run, obs.HeadSHA, obs.BaseSHA)
-	return r.Store.Save(ctx, run)
+	return r.applyAndSave(ctx, run, core.Event{Kind: core.EvAgentFixed, Reason: reason}, obs.HeadSHA, obs.BaseSHA)
 }
 
 func (r *Reconciler) hasAgentSlot(ctx context.Context) bool {
