@@ -220,6 +220,58 @@ func globalConfigPath() (string, error) {
 	return filepath.Join(home, ".config", "beacon", configFileName), nil
 }
 
+// configKeyHandlers dispatches each normalized top-level config key to the
+// handler that overlays it. Handlers receive the original key so parse errors
+// keep the wording of configInt and configString.
+var configKeyHandlers = map[string]func(cfg *Config, path, key string, raw any) error{
+	"maxrebases": func(cfg *Config, path, key string, raw any) error {
+		n, err := configInt(path, key, raw)
+		if err != nil {
+			return err
+		}
+		cfg.MaxRebases = n
+		return nil
+	},
+	"repo": func(cfg *Config, path, key string, raw any) error {
+		s, err := configString(path, key, raw)
+		if err != nil {
+			return err
+		}
+		cfg.Repo = s
+		return nil
+	},
+	"slotstotal": func(cfg *Config, path, key string, raw any) error {
+		n, err := configInt(path, key, raw)
+		if err != nil {
+			return err
+		}
+		cfg.SlotsTotal = n
+		return nil
+	},
+	"orchestratorid": func(cfg *Config, path, key string, raw any) error {
+		s, err := configString(path, key, raw)
+		if err != nil {
+			return err
+		}
+		cfg.OrchestratorID = s
+		return nil
+	},
+	"waketarget": func(cfg *Config, path, key string, raw any) error {
+		s, err := configString(path, key, raw)
+		if err != nil {
+			return err
+		}
+		cfg.WakeTarget = s
+		return nil
+	},
+	"flaky": func(cfg *Config, path, key string, raw any) error {
+		return applyFlakySection(cfg, path, raw)
+	},
+	"paths": func(cfg *Config, path, key string, raw any) error {
+		return applyPathsSection(cfg, path, raw)
+	},
+}
+
 // applyConfigFile reads one YAML file and overlays the keys it contains.
 // Missing files leave the previous layer intact. Keys are normalized so
 // maxRebases, max_rebases and MAX-REBASES all name the same setting; a nested
@@ -240,47 +292,12 @@ func applyConfigFile(cfg *Config, path string) error {
 		return fmt.Errorf("config: %s: ожидается key: value: %w", path, err)
 	}
 	for key, raw := range doc {
-		switch normalizeConfigKey(key) {
-		case "maxrebases":
-			n, err := configInt(path, key, raw)
-			if err != nil {
-				return err
-			}
-			cfg.MaxRebases = n
-		case "repo":
-			s, err := configString(path, key, raw)
-			if err != nil {
-				return err
-			}
-			cfg.Repo = s
-		case "slotstotal":
-			n, err := configInt(path, key, raw)
-			if err != nil {
-				return err
-			}
-			cfg.SlotsTotal = n
-		case "orchestratorid":
-			s, err := configString(path, key, raw)
-			if err != nil {
-				return err
-			}
-			cfg.OrchestratorID = s
-		case "waketarget":
-			s, err := configString(path, key, raw)
-			if err != nil {
-				return err
-			}
-			cfg.WakeTarget = s
-		case "flaky":
-			if err := applyFlakySection(cfg, path, raw); err != nil {
-				return err
-			}
-		case "paths":
-			if err := applyPathsSection(cfg, path, raw); err != nil {
-				return err
-			}
-		default:
+		handler, ok := configKeyHandlers[normalizeConfigKey(key)]
+		if !ok {
 			return fmt.Errorf("config: %s: неизвестный ключ %q", path, key)
+		}
+		if err := handler(cfg, path, key, raw); err != nil {
+			return err
 		}
 	}
 	return nil
