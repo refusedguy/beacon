@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS runs (
   is_fixer INTEGER NOT NULL DEFAULT 0,
   rebase_attempts INTEGER NOT NULL DEFAULT 0,
   fix_attempts INTEGER NOT NULL DEFAULT 0,
-  max_attempts INTEGER NOT NULL DEFAULT 3,
+  max_attempts INTEGER NOT NULL DEFAULT 12,
   reason TEXT NOT NULL DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL

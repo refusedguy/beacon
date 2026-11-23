@@ -15,6 +15,36 @@ func writeConfig(t *testing.T, content string) string {
 	return path
 }
 
+func TestLoadDefaultsToTwelveMergeAttempts(t *testing.T) {
+	c, err := Load(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Merge.MaxAttempts != 12 {
+		t.Fatalf("MaxAttempts = %d, want 12", c.Merge.MaxAttempts)
+	}
+}
+
+func TestLoadMergeMaxAttemptsOverride(t *testing.T) {
+	c, err := Load(writeConfig(t, "merge:\n  max_attempts: 7\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Merge.MaxAttempts != 7 {
+		t.Fatalf("MaxAttempts = %d, want 7", c.Merge.MaxAttempts)
+	}
+}
+
+func TestLoadUnsetMaxAttemptsFallsBackToTwelve(t *testing.T) {
+	c, err := Load(writeConfig(t, "merge:\n  auto_rebase: true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Merge.MaxAttempts != 12 {
+		t.Fatalf("MaxAttempts = %d, want 12", c.Merge.MaxAttempts)
+	}
+}
+
 func TestLoadWebhookSecretLiteral(t *testing.T) {
 	path := writeConfig(t, "webhook:\n  enabled: true\n  secret: 'p$ss{w0rd'\n")
 	c, err := Load(path)

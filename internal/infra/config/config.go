@@ -128,7 +128,7 @@ func Load(path string) (Config, error) {
 		c.BaseBranch = "main"
 	}
 	if c.Merge.MaxAttempts <= 0 {
-		c.Merge.MaxAttempts = 3
+		c.Merge.MaxAttempts = 12
 	}
 	if c.Concurrency.MaxInFlight <= 0 {
 		c.Concurrency.MaxInFlight = 20
@@ -162,7 +162,7 @@ func defaults() Config {
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
 		Harness:      Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:4096"},
-		Merge:        Merge{MaxAttempts: 3, AutoRebase: true},
+		Merge:        Merge{MaxAttempts: 12, AutoRebase: true},
 		OnBaseRed:    OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}
 }
