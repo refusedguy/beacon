@@ -269,18 +269,29 @@ func agentRowsFromAgents(agents []opencode.Agent) []agentRow {
 	return rows
 }
 
+// distinctBy keeps the first item for each trimmed, non-empty key and preserves
+// input order. Callers apply their own stable ordering to the result.
+func distinctBy[T any](in []T, key func(T) string) []T {
+	seen := make(map[string]bool, len(in))
+	out := make([]T, 0, len(in))
+	for _, item := range in {
+		k := strings.TrimSpace(key(item))
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, item)
+	}
+	return out
+}
+
 // agentRowsFromSessions maps HTTP sessions to one row per distinct agent. The
 // agent string is the ID and the name so attention and stale matching keep
 // working the same way as with the legacy session.list path.
 func agentRowsFromSessions(sessions []opencode.Session) []agentRow {
-	seen := make(map[string]bool, len(sessions))
 	rows := make([]agentRow, 0, len(sessions))
-	for _, s := range sessions {
+	for _, s := range distinctBy(sessions, func(s opencode.Session) string { return s.Agent }) {
 		agent := strings.TrimSpace(s.Agent)
-		if agent == "" || seen[agent] {
-			continue
-		}
-		seen[agent] = true
 		rows = append(rows, agentRow{ID: agent, Name: agent})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
@@ -348,18 +359,7 @@ func parseAgentRowsFromSessions(raw []byte) ([]agentRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, len(sessions))
-	rows := make([]agentRow, 0, len(sessions))
-	for _, s := range sessions {
-		agent := strings.TrimSpace(s.Agent)
-		if agent == "" || seen[agent] {
-			continue
-		}
-		seen[agent] = true
-		rows = append(rows, agentRow{ID: agent, Name: agent})
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
-	return rows, nil
+	return agentRowsFromSessions(sessions), nil
 }
 
 // printAgentRows renders the filtered rows as a table or JSON.

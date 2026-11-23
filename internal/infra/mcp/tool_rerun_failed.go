@@ -142,16 +142,22 @@ func (h *RerunFailedHandler) Rerun(ctx context.Context, in RerunFailedInput) (Re
 	return out, nil
 }
 
+// filter keeps the items for which keep reports true, preserving input order.
+func filter[T any](in []T, keep func(T) bool) []T {
+	out := make([]T, 0, len(in))
+	for _, item := range in {
+		if keep(item) {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 // flakyFailedChecks keeps only failed checks that matched the configured flaky
 // set. get_result builds the same set from collectFailedChecks and
 // flakyMatched, so an agent sees the same eligible checks in both tools.
 func flakyFailedChecks(w domain.Watch) []FailedCheck {
-	out := make([]FailedCheck, 0, len(w.Checks))
-	for _, fc := range collectFailedChecks(w) {
-		if fc.FlakyMatched {
-			out = append(out, fc)
-		}
-	}
+	out := filter(collectFailedChecks(w), func(fc FailedCheck) bool { return fc.FlakyMatched })
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
@@ -159,13 +165,7 @@ func flakyFailedChecks(w domain.Watch) []FailedCheck {
 // filterFailedChecks keeps one named check from the eligible set. The caller
 // has already checked that the set holds only flaky-matched failures.
 func filterFailedChecks(in []FailedCheck, name string) []FailedCheck {
-	out := make([]FailedCheck, 0, 1)
-	for _, fc := range in {
-		if fc.Name == name {
-			out = append(out, fc)
-		}
-	}
-	return out
+	return filter(in, func(fc FailedCheck) bool { return fc.Name == name })
 }
 
 // rerunIdempotencyKey reuses the domain obligation key with a rerun namespace.
