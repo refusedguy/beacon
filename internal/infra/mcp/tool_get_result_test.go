@@ -289,7 +289,7 @@ func TestGetResultEchoesWatchConfigID(t *testing.T) {
 		{name: "old watch", configID: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-C", func(w *domain.Watch, o *domain.Obligation) {
+			w, _, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-C", func(w *domain.Watch, o *domain.Obligation) {
 				w.ConfigID = tc.configID
 			})
 			h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
@@ -317,7 +317,7 @@ func TestGetResultEchoesWatchConfigID(t *testing.T) {
 // TestGetResultRetryBudgetWithoutFlakyFailure checks that a watch with no
 // flaky-matched failure reports no retry budget.
 func TestGetResultRetryBudgetWithoutFlakyFailure(t *testing.T) {
-	w, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-B", func(w *domain.Watch, o *domain.Obligation) {
+	w, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-B", func(w *domain.Watch, o *domain.Obligation) {
 		w.Flaky = domain.FlakyConfig{}
 	})
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
@@ -354,7 +354,7 @@ func TestGetResultCancelledCheckIsFailed(t *testing.T) {
 		},
 		Merge: domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
 	}
-	_, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-C", ackFixtureWithWatch(w, "session-C"))
+	_, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-C", ackFixtureWithWatch(w, "session-C"))
 	h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 	out, err := h.Result(context.Background(), sessionReq("session-C"), GetResultInput{WatchID: w.ID})
@@ -396,7 +396,7 @@ func TestGetResultCancelledStateIsFailed(t *testing.T) {
 				},
 				Merge: domain.MergeInfo{Mergeable: "MERGEABLE", MergeStateStatus: "CLEAN"},
 			}
-			_, o, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-CS", ackFixtureWithWatch(w, "session-CS"))
+			_, _, store, stamper := newAckResultFixture(t, domain.VerdictKeepWorking, "session-CS", ackFixtureWithWatch(w, "session-CS"))
 			h := NewGetResultHandler(store, stamper, &stepClock{t: time.Now()})
 
 			out, err := h.Result(context.Background(), sessionReq("session-CS"), GetResultInput{WatchID: w.ID})
@@ -877,7 +877,7 @@ func TestGradeResultUnknownCriterion(t *testing.T) {
 // TestGradeResultIsSeparateFromDelivery checks that the grader re-reads Watch
 // facts from the store and leaves the delivery stamps untouched.
 func TestGradeResultIsSeparateFromDelivery(t *testing.T) {
-	w, o, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-G", func(w *domain.Watch, o *domain.Obligation) {
+	w, _, store, stamper := newAckResultFixture(t, domain.VerdictReady, "session-G", func(w *domain.Watch, o *domain.Obligation) {
 		w.Status = domain.StatusClosed
 		w.ClosedAt = time.Date(2026, 11, 19, 11, 0, 0, 0, time.UTC)
 	})
