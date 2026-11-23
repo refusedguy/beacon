@@ -2,6 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { locationInfo, projectRoot } from "./location.js"
 import { registerBeaconMcp } from "./mcp.js"
 import { installProjectContext } from "./context.js"
+import { BeaconStatusRpc, createCliStatusSource } from "./ui.js"
 
 export const SHELL_GUARD_RULES = Object.freeze([
   {
@@ -75,10 +76,21 @@ export const beaconProject = Plugin.define({
     const context = await installProjectContext(ctx, root, locationInfo(ctx))
     const guard = await registerShellGuard(ctx, ctx?.config ?? {})
 
+    const statusSource = createCliStatusSource({ root })
+    let statusRpc = null
+    try {
+      statusRpc = await ctx.rpc.register(BeaconStatusRpc, {
+        snapshot: () => statusSource.snapshot(),
+      })
+    } catch (error) {
+      console.warn(`beacon status panel: RPC registration failed: ${error.message}`)
+    }
+
     return async () => {
       await guard?.dispose?.()
       await context?.()
       await mcp?.registration?.dispose?.()
+      await statusRpc?.dispose?.()
     }
   },
 })
