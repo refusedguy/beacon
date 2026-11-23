@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -202,5 +203,108 @@ func TestReconcileWaitingCIToMerge(t *testing.T) {
 	}
 	if scm.merges != 1 {
 		t.Fatal("merge was not idempotent")
+	}
+}
+
+// changingSCM reports a PR head that advances only when UpdateBranch succeeds.
+// A failed update leaves the observed head unchanged.
+type changingSCM struct {
+	*fakeSCM
+	head    string
+	updates int
+}
+
+func newChangingSCM(head string) *changingSCM {
+	return &changingSCM{
+		fakeSCM: &fakeSCM{obs: core.Observation{PRNumber: 42, HeadSHA: head, PRState: "open"}},
+		head:    head,
+	}
+}
+
+func (f *changingSCM) Observe(_ context.Context, pr int) (core.Observation, error) {
+	return core.Observation{PRNumber: pr, HeadSHA: f.head, PRState: "open", Behind: true}, nil
+}
+
+func (f *changingSCM) UpdateBranch(_ context.Context, _ int, sha string) (string, error) {
+	f.updates++
+	if f.updateErr != nil {
+		return "", f.updateErr
+	}
+	f.head = "new-" + sha
+	return f.head, nil
+}
+
+func TestRebaseOneHeadAdvanceCausesOneRebase(t *testing.T) {
+	r, _, _, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Behind: true})
+	scm := newChangingSCM("sha2")
+	r.SCM = scm
+
+	for i := 0; i < 4; i++ {
+		if _, err := r.Reconcile(context.Background(), 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if scm.updates != 1 {
+		t.Fatalf("branch updates = %d, want 1", scm.updates)
+	}
+}
+
+func TestRebaseSuccessMarksNewHead(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Behind: true})
+	scm := newChangingSCM("sha2")
+	r.SCM = scm
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.HeadSHA != "new-sha2" {
+		t.Fatalf("HeadSHA = %q, want new-sha2", got.HeadSHA)
+	}
+	if got.ObservedSHA != "new-sha2" {
+		t.Fatalf("ObservedSHA = %q, want new-sha2", got.ObservedSHA)
+	}
+}
+
+func TestRebaseFailureDoesNotRetrySameSHA(t *testing.T) {
+	r, store, _, h, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open", Behind: true})
+	scm := newChangingSCM("sha2")
+	scm.updateErr = errors.New("rebase conflict")
+	r.SCM = scm
+
+	for i := 0; i < 5; i++ {
+		if _, err := r.Reconcile(context.Background(), 42); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if scm.updates != 1 {
+		t.Fatalf("branch updates = %d, want 1", scm.updates)
+	}
+	if len(h.wakes) != 0 {
+		t.Fatalf("agent woken %d times after failed rebase", len(h.wakes))
+	}
+	if got := store.runs["r1"]; got.ObservedSHA != "sha2" {
+		t.Fatalf("ObservedSHA = %q, want sha2", got.ObservedSHA)
+	}
+}
+
+func TestWaitingRunAdvancesObservedSHA(t *testing.T) {
+	r, store, _, _, _ := newReconciler(t, core.VerdictWait,
+		core.Observation{PRNumber: 42, HeadSHA: "sha2", PRState: "open"})
+	scm := newChangingSCM("sha2")
+	r.SCM = scm
+
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunWaitingCI {
+		t.Fatalf("state = %s, want waiting_ci", got.State)
+	}
+	if got.ObservedSHA != "sha2" {
+		t.Fatalf("ObservedSHA = %q, want sha2", got.ObservedSHA)
 	}
 }
