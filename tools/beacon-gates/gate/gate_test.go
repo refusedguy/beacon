@@ -142,6 +142,36 @@ func TestExceptionsApply(t *testing.T) {
 	}
 }
 
+func TestPermanentRowTreeConditions(t *testing.T) {
+	root, err := Fixture(map[string]string{
+		"internal/app/taskcli/service.go": "package taskcli\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+
+	old := PermanentEntry{Rule: "R", Path: "internal/app/taskcli/service.go", Reason: "before split", OnlyIfMissing: "internal/app/taskcli/cards.go"}
+	next := PermanentEntry{Rule: "R", Path: "internal/app/taskcli/cards.go", Reason: "after split", OnlyIfExists: "internal/app/taskcli/cards.go"}
+	ex := Exceptions{Permanent: []PermanentEntry{old, next}}
+
+	// Before the split the old row covers the finding, and the new row is out of scope.
+	fs := []Finding{{Rule: "R", Path: "internal/app/taskcli/service.go"}}
+	if got := ex.Apply(fs, root); len(got) != 0 {
+		t.Fatalf("before split: %v", got)
+	}
+
+	// After the split the old row is skipped, and the new row covers the finding.
+	cards := filepath.Join(root, "internal/app/taskcli/cards.go")
+	if err := os.WriteFile(cards, []byte("package taskcli\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fs = []Finding{{Rule: "R", Path: "internal/app/taskcli/cards.go"}}
+	if got := ex.Apply(fs, root); len(got) != 0 {
+		t.Fatalf("after split: %v", got)
+	}
+}
+
 // Property tests draw every value from a deterministic stream. A failure
 // records its seed so the same input replays without manual reconstruction.
 const (

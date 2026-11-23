@@ -12,7 +12,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # PR-ветке нужен write, чтобы закоммитить пересобранный бинарник.
+  contents: write
 
 jobs:
   gates-binary:
@@ -21,6 +22,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # На PR берём HEAD ветки: сюда же коммитим пересобранный бинарник.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Go
         uses: ./.github/actions/go-runner-setup
@@ -48,7 +52,12 @@ jobs:
           printf 'go.mod go=%s\n' "$(go list -m -f '{{.GoVersion}}')"
 
       - name: Compare committed and rebuilt bytes
+        id: compare
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           committed=tools/beacon-gates/beacon-gates
@@ -61,14 +70,38 @@ jobs:
           printf 'sha256 rebuilt=%s\n' "$(sha256sum "$rebuilt" | cut -d' ' -f1)"
           if cmp -s "$committed" "$rebuilt"; then
             printf 'gates binary matches source\n'
+            printf 'mismatch=false\n' >> "$GITHUB_OUTPUT"
           else
             printf 'gates binary differs from source\n' >&2
+            printf 'mismatch=true\n' >> "$GITHUB_OUTPUT"
             mod_version="$(go list -m -f '{{.GoVersion}}')"
             runner_version="$(go env GOVERSION)"
             runner_version="${runner_version#go}"
             if [ "$mod_version" != "$runner_version" ]; then
               printf 'toolchain mismatch: go.mod=%s runner=%s\n' "$mod_version" "$runner_version" >&2
             fi
-            printf 'rebuild: cd tools/beacon-gates && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-buildid= -s -w" -o beacon-gates .\n' >&2
-            exit 1
+            # На PR бинарник догоняет исходники коммитом в ветку. На main
+            # расхождение остаётся ошибкой: туда workflow не пишет.
+            if [ "$EVENT_NAME" != "pull_request" ] || [ "$PR_HEAD_REPO" != "$REPO" ]; then
+              printf 'rebuild: cd tools/beacon-gates && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-buildid= -s -w" -o beacon-gates .\n' >&2
+              exit 1
+            fi
           fi
+
+      - name: Commit rebuilt gates binary to PR branch
+        if: steps.compare.outputs.mismatch == 'true'
+        shell: bash
+        env:
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/beacon-gates-built" tools/beacon-gates/beacon-gates
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tools/beacon-gates/beacon-gates
+          if git diff --cached --quiet; then
+            printf 'gates binary already up to date\n'
+            exit 0
+          fi
+          git commit -m "chore(gates): rebuild committed binary with pinned Go toolchain"
+          git push origin "HEAD:$PR_HEAD_REF"
