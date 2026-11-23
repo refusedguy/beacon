@@ -113,7 +113,11 @@ func (c *Control) Retry(ctx context.Context, id core.RunID) error {
 	if err := run.Apply(core.Event{Kind: core.EvUnblock, Reason: "retried by operator"}); err != nil {
 		return err
 	}
-	return c.Store.Save(ctx, run)
+	if err := c.Store.Save(ctx, run); err != nil {
+		return err
+	}
+	c.signal(run)
+	return nil
 }
 
 func (c *Control) signal(run *core.Run) {
