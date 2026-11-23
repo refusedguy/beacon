@@ -124,37 +124,3 @@ func (d *DB) ReadAfter(scope string, cursor int64) ([]LogEvent, error) {
 	}
 	return out, rows.Err()
 }
-
-// RetainEventLog erases the committed prefix of the event log at or below
-// cursor and returns the number of rows removed (BCX-38). The delete runs in
-// one writer transaction, so a concurrent Append cannot place a row into the
-// erased range after the cursor was chosen.
-//
-// Replay stays correct because ReadAfter returns only rows with seq greater
-// than the caller's cursor. Removing rows at or below cursor cannot change what
-// such a reader sees. The caller must pick a cursor no newer than the oldest
-// active replay position; a newer cursor would erase events a subscriber has
-// not read. Rows that survive keep their own schema_version, so replay from any
-// remaining seq decodes with the version stamped at append time (ADR 0012).
-func (d *DB) RetainEventLog(cursor int64) (int64, error) {
-	if cursor <= 0 {
-		return 0, domain.NewAppError(domain.CodeInvalidInput,
-			"store: event: retention cursor must be positive")
-	}
-	var deleted int64
-	err := d.Write(context.Background(), func(tx *sql.Tx) error {
-		res, err := tx.Exec(`DELETE FROM events WHERE seq <= ?`, cursor)
-		if err != nil {
-			return fmt.Errorf("store: event: retain: %w", err)
-		}
-		deleted, err = res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("store: event: retain rows: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return deleted, nil
-}

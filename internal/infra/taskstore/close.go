@@ -17,23 +17,13 @@ import (
 var closeStatuses = []string{"blocked", "done", "dropped", "duplicate"}
 
 // closeReasons — канонические значения поля Причина из обзора закрытия задач.
-// Множество экспортируется как общий словарь для вызывающих, но CloseCard не
-// отклоняет другие значения: причина хранится в карточке как есть.
+// CloseCard не отклоняет другие значения: причина хранится в карточке как есть.
 var closeReasons = []string{
 	"completed", "already_landed", "duplicate", "not_planned", "owner_decision", "obsolete",
 }
 
-// CloseStatuses возвращает статусы, которые принимает CloseCard. Копия.
-func CloseStatuses() []string { return append([]string(nil), closeStatuses...) }
-
 // IsCloseStatus сообщает, является ли значение статусом закрытия.
 func IsCloseStatus(v string) bool { return slices.Contains(closeStatuses, v) }
-
-// ValidCloseReasons возвращает канонические причины закрытия. Копия.
-func ValidCloseReasons() []string { return append([]string(nil), closeReasons...) }
-
-// IsCloseReason сообщает, входит ли значение в канонический словарь причин.
-func IsCloseReason(v string) bool { return slices.Contains(closeReasons, v) }
 
 // CloseCardOptions — данные, которые пишутся в карточку при закрытии.
 // Статус и Дубликат проверяются. Время закрытия при пустом значении ставится

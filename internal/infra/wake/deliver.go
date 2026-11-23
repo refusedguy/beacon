@@ -515,8 +515,8 @@ func WatchTarget(w domain.Watch, watchID string) (string, error) {
 // role executor, orchestrator or fixer. A fixer wakes like an executor and
 // carries FixFor, so it owns its own obligation and may be steered too (ADR
 // 0260). No caller session, _meta value, notify target or role-wide broadcast
-// can stand in for that id. Seat addresses are not accepted here: they must go
-// through DeliverToAddress, which resolves one concrete session first (T3.248).
+// can stand in for that id. Seat addresses are not accepted here: the caller
+// must resolve one concrete session first (T3.248).
 func SubscriberTarget(w domain.Watch, watchID, addressee string) (string, error) {
 	if watchID == "" || w.ID != watchID {
 		return "", fmt.Errorf("wake: watchID %q does not name watch %q", watchID, w.ID)
@@ -570,21 +570,6 @@ func recordFixerDelivery(w domain.Watch, target string) {
 			return
 		}
 	}
-}
-
-// DeliverToAddress wakes the single session a member@rig address resolves to.
-// It is the only path that accepts a seat address: the address must first
-// resolve to one concrete ses_... id through resolve, then pass the same
-// SubscriberTarget check as a literal session id. A role-wide or ambiguous
-// address never reaches a deliverer, so a wake can never be broadcast to a role
-// or to every session of a rig (T3.248). The resolved session also owns the
-// obligation, so a seat cannot be steered into another party's session.
-func DeliverToAddress(ctx context.Context, d domain.WakeDeliverer, w domain.Watch, p domain.WakePayload, address string, resolve domain.SessionResolver) error {
-	session, err := domain.ResolveAddress(address, resolve)
-	if err != nil {
-		return err
-	}
-	return DeliverToSubscriber(ctx, d, w, p, session)
 }
 
 // DeliverToWatch wakes the orchestrator of w through d. It is the legacy

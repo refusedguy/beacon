@@ -149,13 +149,6 @@ func validateMeta(m Meta, worktreeDir string) error {
 	return nil
 }
 
-// WriteMeta stores m for worktreeDir. The write goes to a temp file in the
-// same directory and is published with one rename, so a break before the
-// rename leaves the previous record intact.
-func WriteMeta(storeDir, worktreeDir string, m Meta) error {
-	return writeMeta(osMetaFS{}, storeDir, worktreeDir, m)
-}
-
 func writeMeta(fs metaFS, storeDir, worktreeDir string, m Meta) error {
 	m.Path = cleanDir(worktreeDir)
 	m.AgentID = strings.TrimSpace(m.AgentID)
@@ -193,13 +186,6 @@ func writeMeta(fs metaFS, storeDir, worktreeDir string, m Meta) error {
 		return fmt.Errorf("worktree: meta: replace: %w", err)
 	}
 	return nil
-}
-
-// ReadMeta loads the metadata for worktreeDir. A missing file returns
-// ok=false and no error. A corrupt record or one with an unknown agent,
-// permission mode, branch, goal chain, or path is an error.
-func ReadMeta(storeDir, worktreeDir string) (Meta, bool, error) {
-	return readMeta(osMetaFS{}, storeDir, worktreeDir)
 }
 
 func readMeta(fs metaFS, storeDir, worktreeDir string) (Meta, bool, error) {

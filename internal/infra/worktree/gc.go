@@ -461,17 +461,6 @@ func NewIgnoreSpec(rulesPath string) *IgnoreSpec {
 	return s
 }
 
-// WithInterval overrides the refresh throttle. Tests shorten it to observe a
-// rule change without waiting. Production uses IgnoreRefreshInterval.
-func (s *IgnoreSpec) WithInterval(d time.Duration) *IgnoreSpec {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if d > 0 {
-		s.interval = d
-	}
-	return s
-}
-
 // setPatterns compiles raw lines into anchored regexps and bumps version so
 // every cached entry is invalidated on the next access. Caller holds mu.
 func (s *IgnoreSpec) setPatterns(lines []string) {

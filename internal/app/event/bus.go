@@ -11,7 +11,6 @@ package event
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -232,50 +231,6 @@ func (tx *Tx) Emit(env Envelope) error {
 	}
 	tx.staged = append(tx.staged, env)
 	return nil
-}
-
-// MirrorHook runs fn and, when hook mirroring is enabled on the bus, stages a
-// hook_started envelope before the call and a hook_response envelope after it.
-// Both envelopes use EventTypeHook and carry a HookPayload. Mirroring is
-// best-effort: a staging failure never changes the callback error. With the
-// option off the call is a plain fn() and the stream is unchanged.
-func (tx *Tx) MirrorHook(hookEventName string, fn func() error) error {
-	if fn == nil {
-		return nil
-	}
-	if tx == nil || !tx.bus.includeHookEvents() {
-		return fn()
-	}
-
-	started, _ := json.Marshal(HookPayload{
-		HookEventName: hookEventName,
-		Phase:         HookPhaseStarted,
-	})
-	_ = tx.Emit(Envelope{
-		Scope:         HookEventScope,
-		Type:          EventTypeHook,
-		SchemaVersion: HookEventSchemaVersion,
-		Payload:       started,
-	})
-
-	err := fn()
-	response := HookPayload{
-		HookEventName: hookEventName,
-		Phase:         HookPhaseResponse,
-		Outcome:       "success",
-	}
-	if err != nil {
-		response.Outcome = "error"
-		response.Error = err.Error()
-	}
-	payload, _ := json.Marshal(response)
-	_ = tx.Emit(Envelope{
-		Scope:         HookEventScope,
-		Type:          EventTypeHook,
-		SchemaVersion: HookEventSchemaVersion,
-		Payload:       payload,
-	})
-	return err
 }
 
 // Savepoint returns a marker for the current end of the staged batch. Pass it

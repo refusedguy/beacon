@@ -5,7 +5,6 @@
 package worktree
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 )
@@ -19,8 +18,7 @@ type WatchAnchor struct {
 	Branch  string
 	Dir     string
 	// SessionCommits holds the local commits made in this session.
-	// RecordCheckpoint appends one after each edit and each linter fix.
-	// UndoCheckpoint accepts only commits from this list.
+	// CheckUndo accepts only commits from this list.
 	SessionCommits []string
 }
 
@@ -169,31 +167,6 @@ type UndoResult struct {
 	Reason  string
 }
 
-// RecordCheckpoint appends the current HEAD to the Watch anchor. The caller
-// invokes it after each edit and after each linter fix, so the hash stays with
-// the Watch and undo can tell session commits from pushed history.
-func RecordCheckpoint(run Runner, dir string, anchor *WatchAnchor) error {
-	if anchor == nil {
-		return fmt.Errorf("worktree: checkpoint: nil watch anchor")
-	}
-	if run == nil {
-		run = CommandRunner
-	}
-	out, err := run(dir, "rev-parse", "HEAD")
-	if err != nil {
-		return fmt.Errorf("worktree: checkpoint: rev-parse: %w: %s", err, strings.TrimSpace(out))
-	}
-	head := strings.ToLower(firstLine(out))
-	if len(head) < 7 {
-		return fmt.Errorf("worktree: checkpoint: short head %q", head)
-	}
-	if checkpointContains(anchor.SessionCommits, head) {
-		return nil
-	}
-	anchor.SessionCommits = append(anchor.SessionCommits, head)
-	return nil
-}
-
 // CheckUndo applies the undo guards without changing the repository. commit
 // must belong to this session and be the current HEAD. The tree must be clean,
 // the commit must not be a merge and no origin branch may contain it.
@@ -244,43 +217,6 @@ func CheckUndo(run Runner, dir string, anchor WatchAnchor, commit string) UndoRe
 		return res
 	}
 	res.Allowed = true
-	return res
-}
-
-// UndoCheckpoint restores the files changed by commit to its parent and moves
-// HEAD to that parent. The checkout runs before the soft reset, so both the
-// index and the working tree match the earlier state when HEAD moves.
-func UndoCheckpoint(run Runner, dir string, anchor WatchAnchor, commit string) UndoResult {
-	res := CheckUndo(run, dir, anchor, commit)
-	if !res.Allowed {
-		return res
-	}
-	if run == nil {
-		run = CommandRunner
-	}
-	parentOut, err := run(dir, "rev-parse", commit+"^")
-	if err != nil {
-		res.Allowed = false
-		res.Reason = UndoReasonGitError
-		return res
-	}
-	parent := strings.ToLower(firstLine(parentOut))
-	if len(parent) < 7 {
-		res.Allowed = false
-		res.Reason = UndoReasonGitError
-		return res
-	}
-	if out, err := run(dir, "checkout", parent, "--", "."); err != nil {
-		res.Allowed = false
-		res.Reason = UndoReasonGitError + ": checkout: " + strings.TrimSpace(out)
-		return res
-	}
-	if out, err := run(dir, "reset", "--soft", parent); err != nil {
-		res.Allowed = false
-		res.Reason = UndoReasonGitError + ": reset: " + strings.TrimSpace(out)
-		return res
-	}
-	res.NewHead = parent
 	return res
 }
 
