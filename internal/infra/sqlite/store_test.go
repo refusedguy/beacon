@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -89,6 +90,77 @@ func TestSetTaskStatusUnblocksDependent(t *testing.T) {
 	ready, err = store.ListReadyTasks(ctx)
 	if err != nil || len(ready) != 1 || ready[0].ID != "B" {
 		t.Fatalf("after done: %+v %v", ready, err)
+	}
+}
+
+func TestSyncTasksPersistsEpicGraph(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	plan := []core.ChildSpec{{
+		Title: "Child one", Scope: []core.ScopePath{core.ScopeFile("a.go")},
+		Depends: []core.TaskID{"EXT-1"}, Priority: 7,
+	}}
+	tasks := []core.Task{
+		{ID: "T-EPIC", Title: "Epic", Status: core.TaskAvailable,
+			Kind: core.TaskKindEpic, BaseBranch: "main",
+			RequireReview: core.ReviewModeHuman, Plan: plan},
+		{ID: "T-EPIC-01", Title: "Child one", Status: core.TaskAvailable,
+			Kind: core.TaskKindTask, BaseBranch: "beacon/T-EPIC",
+			DependsOn: []core.TaskID{"EXT-1"}, Priority: 7,
+			Scope: []core.ScopePath{core.ScopeFile("a.go")}},
+	}
+	if err := store.SyncTasks(ctx, tasks); err != nil {
+		t.Fatal(err)
+	}
+
+	var kind, base, review, planJSON string
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT kind, base_branch, require_review, plan_json FROM tasks WHERE id='T-EPIC'`,
+	).Scan(&kind, &base, &review, &planJSON); err != nil {
+		t.Fatal(err)
+	}
+	if kind != "epic" || base != "main" || review != "human" {
+		t.Fatalf("epic fields = %q %q %q", kind, base, review)
+	}
+	var gotPlan []core.ChildSpec
+	if err := json.Unmarshal([]byte(planJSON), &gotPlan); err != nil {
+		t.Fatal(err)
+	}
+	if len(gotPlan) != 1 || gotPlan[0].Title != "Child one" || len(gotPlan[0].Depends) != 1 {
+		t.Fatalf("plan = %+v", gotPlan)
+	}
+
+	var childBase string
+	if err := store.db.QueryRowContext(ctx,
+		`SELECT base_branch FROM tasks WHERE id='T-EPIC-01'`,
+	).Scan(&childBase); err != nil {
+		t.Fatal(err)
+	}
+	if childBase != "beacon/T-EPIC" {
+		t.Fatalf("child base = %q", childBase)
+	}
+
+	ready, err := store.ListReadyTasks(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, task := range ready {
+		if task.ID != "T-EPIC-01" {
+			continue
+		}
+		found = true
+		if task.BaseBranch != "beacon/T-EPIC" || task.Kind != core.TaskKindTask {
+			t.Fatalf("ready child = %+v", task)
+		}
+	}
+	if !found {
+		t.Fatalf("epic child is not ready: %+v", ready)
 	}
 }
 
