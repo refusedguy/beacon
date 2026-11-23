@@ -89,8 +89,9 @@ func (g *GitLab) Observe(ctx context.Context, mrIID int) (core.Observation, erro
 			}
 		}
 	}
-	if behind, err := g.behind(ctx, mr); err == nil {
+	if behind, baseSHA, err := g.behind(ctx, mr); err == nil {
 		o.Behind = behind
+		o.BaseSHA = baseSHA
 	}
 	return o, nil
 }
@@ -147,7 +148,7 @@ func (g *GitLab) approvals(ctx context.Context, mrIID int, mr glMR) (int, error)
 	return len(seen), nil
 }
 
-func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, error) {
+func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, string, error) {
 	from, to := mr.TargetBranch, mr.SHA
 	if from == "" {
 		from = mr.DiffRefs.BaseSHA
@@ -156,17 +157,20 @@ func (g *GitLab) behind(ctx context.Context, mr glMR) (bool, error) {
 		to = mr.DiffRefs.HeadSHA
 	}
 	if from == "" || to == "" {
-		return false, nil
+		return false, "", nil
 	}
 	path := "/projects/" + g.project() + "/repository/compare"
 	var cmp struct {
-		BehindBy int `json:"behind_by"`
+		BehindBy   int `json:"behind_by"`
+		BaseCommit struct {
+			ID string `json:"id"`
+		} `json:"base_commit"`
 	}
 	query := url.Values{"from": {from}, "to": {to}}
 	if err := g.getJSON(ctx, path, query, &cmp); err != nil {
-		return false, err
+		return false, "", err
 	}
-	return cmp.BehindBy > 0, nil
+	return cmp.BehindBy > 0, cmp.BaseCommit.ID, nil
 }
 
 func (g *GitLab) UpdateBranch(ctx context.Context, mrIID int, expectedSHA string) (string, error) {

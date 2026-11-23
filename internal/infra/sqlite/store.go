@@ -23,7 +23,7 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, session_id,
+const runColumns = `id, task_id, state, pr_number, head_sha, observed_sha, observed_base_sha, session_id,
  parent_session_id, workspace_path, branch, scope_json, blocked_incident_id, is_fixer,
  rebase_attempts, fix_attempts, max_attempts, reason, created_at, updated_at`
 
@@ -38,17 +38,18 @@ func (s *Store) Save(ctx context.Context, r *core.Run) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO runs (`+runColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+INSERT INTO runs (`+runColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET
  state=excluded.state, pr_number=excluded.pr_number, head_sha=excluded.head_sha,
- observed_sha=excluded.observed_sha, session_id=excluded.session_id,
+ observed_sha=excluded.observed_sha, observed_base_sha=excluded.observed_base_sha,
+ session_id=excluded.session_id,
  parent_session_id=excluded.parent_session_id, workspace_path=excluded.workspace_path,
  branch=excluded.branch, scope_json=excluded.scope_json,
  blocked_incident_id=excluded.blocked_incident_id, is_fixer=excluded.is_fixer,
  rebase_attempts=excluded.rebase_attempts, fix_attempts=excluded.fix_attempts,
  max_attempts=excluded.max_attempts, reason=excluded.reason, updated_at=excluded.updated_at`,
 		string(r.ID), string(r.TaskID), string(r.State), r.PRNumber, r.HeadSHA,
-		r.ObservedSHA, r.SessionID, r.ParentSessionID, r.WorkspacePath, r.Branch,
+		r.ObservedSHA, r.ObservedBaseSHA, r.SessionID, r.ParentSessionID, r.WorkspacePath, r.Branch,
 		string(scope), r.BlockedIncidentID, boolInt(r.IsFixer), r.RebaseAttempts,
 		r.FixAttempts, r.MaxAttempts, r.Reason, r.CreatedAt.UnixNano(), r.UpdatedAt.UnixNano())
 	return err
@@ -118,7 +119,7 @@ func scanRun(row scanner) (*core.Run, error) {
 	var created, updated int64
 	var fixer int
 	err := row.Scan(&id, &task, &state, &r.PRNumber, &r.HeadSHA, &r.ObservedSHA,
-		&r.SessionID, &r.ParentSessionID, &r.WorkspacePath, &r.Branch, &scopeJSON,
+		&r.ObservedBaseSHA, &r.SessionID, &r.ParentSessionID, &r.WorkspacePath, &r.Branch, &scopeJSON,
 		&r.BlockedIncidentID, &fixer, &r.RebaseAttempts, &r.FixAttempts,
 		&r.MaxAttempts, &r.Reason, &created, &updated)
 	if err != nil {
