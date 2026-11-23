@@ -13,6 +13,53 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// TestTypedToolPreservesResultShape pins the result and error shapes the old
+// per-tool adapters produced. The emptyResult flag selects the success result,
+// and an error always returns a nil result with the zero output.
+func TestTypedToolPreservesResultShape(t *testing.T) {
+	sentinel := errors.New("boom")
+	type input struct{ Value string }
+	type output struct{ Value string }
+
+	tests := []struct {
+		name        string
+		emptyResult bool
+		err         error
+		wantResult  bool
+	}{
+		{name: "empty result", emptyResult: true, wantResult: true},
+		{name: "nil result", emptyResult: false, wantResult: false},
+		{name: "error with empty result", emptyResult: true, err: sentinel},
+		{name: "error with nil result", emptyResult: false, err: sentinel},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fn := func(_ context.Context, in input) (output, error) {
+				if tc.err != nil {
+					return output{}, tc.err
+				}
+				return output{Value: in.Value}, nil
+			}
+			result, out, err := typedTool(fn, tc.emptyResult)(context.Background(), &mcpsdk.CallToolRequest{}, input{Value: "x"})
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("err = %v, want %v", err, tc.err)
+			}
+			if (result != nil) != tc.wantResult {
+				t.Fatalf("result present = %v, want %v", result != nil, tc.wantResult)
+			}
+			if tc.err != nil {
+				if out != (output{}) {
+					t.Fatalf("output = %+v, want zero", out)
+				}
+				return
+			}
+			if out.Value != "x" {
+				t.Fatalf("output.Value = %q, want x", out.Value)
+			}
+		})
+	}
+}
+
 // TestClaimSingleOwnerUntilRelease walks the ADR 0032 p4 contract through the
 // tool handlers: one owner holds the task, a retry by that owner is idempotent,
 // a second owner is rejected, and only an explicit release by the owner frees

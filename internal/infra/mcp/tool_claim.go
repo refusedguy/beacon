@@ -57,6 +57,24 @@ import (
 	"github.com/refusedguy/beacon/internal/domain"
 )
 
+// typedTool turns a domain function into a go-sdk typed tool handler. The SDK
+// parses request arguments into I and renders O as structured output.
+// emptyResult picks the success result: an empty CallToolResult when true, nil
+// when false. Errors keep the nil result and zero output of the old per-tool
+// adapters, so error shapes do not change.
+func typedTool[I, O any](fn func(context.Context, I) (O, error), emptyResult bool) func(context.Context, *mcpsdk.CallToolRequest, I) (*mcpsdk.CallToolResult, O, error) {
+	return func(ctx context.Context, _ *mcpsdk.CallToolRequest, in I) (*mcpsdk.CallToolResult, O, error) {
+		out, err := fn(ctx, in)
+		if err != nil {
+			return nil, *new(O), err
+		}
+		if emptyResult {
+			return &mcpsdk.CallToolResult{}, out, nil
+		}
+		return nil, out, nil
+	}
+}
+
 // GenerationLedger is the generation-stamping port shared by beacon_claim and
 // beacon_ack. It is declared here, in infra, so this package never imports the
 // app layer (ADR 0005): the orchestrator claim model implements it and the
@@ -439,43 +457,30 @@ func (h *ClaimHandler) stampGeneration(out ClaimOutput, ownerID string) ClaimOut
 }
 
 // Handle adapts Claim to the go-sdk typed tool handler signature.
-func (h *ClaimHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in ClaimInput) (*mcpsdk.CallToolResult, ClaimOutput, error) {
-	out, err := h.Claim(ctx, in)
-	if err != nil {
-		return nil, ClaimOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *ClaimHandler) Handle(ctx context.Context, req *mcpsdk.CallToolRequest, in ClaimInput) (*mcpsdk.CallToolResult, ClaimOutput, error) {
+	return typedTool(h.Claim, true)(ctx, req, in)
 }
 
 // HandleRelease adapts Release to the go-sdk typed tool handler signature.
-func (h *ClaimHandler) HandleRelease(ctx context.Context, _ *mcpsdk.CallToolRequest, in ReleaseInput) (*mcpsdk.CallToolResult, ReleaseOutput, error) {
-	out, err := h.Release(ctx, in)
-	if err != nil {
-		return nil, ReleaseOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *ClaimHandler) HandleRelease(ctx context.Context, req *mcpsdk.CallToolRequest, in ReleaseInput) (*mcpsdk.CallToolResult, ReleaseOutput, error) {
+	return typedTool(h.Release, true)(ctx, req, in)
 }
 
 // HandleReassign adapts Reassign to the go-sdk typed tool handler signature.
 // It is deliberately not registered as a tool: reassignment is a daemon
 // decision, not a client-facing call, and the seven default tools stay seven.
-func (h *ClaimHandler) HandleReassign(ctx context.Context, _ *mcpsdk.CallToolRequest, in ClaimInput) (*mcpsdk.CallToolResult, ClaimOutput, error) {
-	out, err := h.Reassign(ctx, in)
-	if err != nil {
-		return nil, ClaimOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *ClaimHandler) HandleReassign(ctx context.Context, req *mcpsdk.CallToolRequest, in ClaimInput) (*mcpsdk.CallToolResult, ClaimOutput, error) {
+	return typedTool(h.Reassign, true)(ctx, req, in)
 }
 
 // HandleRecover adapts Recover to a daemon-facing handler. It is deliberately
 // not registered as a tool: recovery is a kernel decision after a crash, not a
 // client-facing call.
-func (h *ClaimHandler) HandleRecover(ctx context.Context, _ *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, RecoveryOutput, error) {
-	out, err := h.Recover(ctx)
-	if err != nil {
-		return nil, RecoveryOutput{}, err
+func (h *ClaimHandler) HandleRecover(ctx context.Context, req *mcpsdk.CallToolRequest) (*mcpsdk.CallToolResult, RecoveryOutput, error) {
+	recoverFn := func(ctx context.Context, _ struct{}) (RecoveryOutput, error) {
+		return h.Recover(ctx)
 	}
-	return &mcpsdk.CallToolResult{}, out, nil
+	return typedTool(recoverFn, true)(ctx, req, struct{}{})
 }
 
 // Claim validates the request at the boundary, then takes the atomic claim.
@@ -876,39 +881,23 @@ func NewWorktreeLeaseHandler(clock domain.Clock) *WorktreeLeaseHandler {
 }
 
 // HandleAcquire adapts Acquire to the go-sdk typed tool handler signature.
-func (h *WorktreeLeaseHandler) HandleAcquire(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeLeaseInput) (*mcpsdk.CallToolResult, WorktreeLeaseOutput, error) {
-	out, err := h.Acquire(ctx, in)
-	if err != nil {
-		return nil, WorktreeLeaseOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *WorktreeLeaseHandler) HandleAcquire(ctx context.Context, req *mcpsdk.CallToolRequest, in WorktreeLeaseInput) (*mcpsdk.CallToolResult, WorktreeLeaseOutput, error) {
+	return typedTool(h.Acquire, true)(ctx, req, in)
 }
 
 // HandleWrite adapts Write to the go-sdk typed tool handler signature.
-func (h *WorktreeLeaseHandler) HandleWrite(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeWriteInput) (*mcpsdk.CallToolResult, WorktreeWriteOutput, error) {
-	out, err := h.Write(ctx, in)
-	if err != nil {
-		return nil, WorktreeWriteOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *WorktreeLeaseHandler) HandleWrite(ctx context.Context, req *mcpsdk.CallToolRequest, in WorktreeWriteInput) (*mcpsdk.CallToolResult, WorktreeWriteOutput, error) {
+	return typedTool(h.Write, true)(ctx, req, in)
 }
 
 // HandleHeartbeat adapts Heartbeat to the go-sdk typed tool handler signature.
-func (h *WorktreeLeaseHandler) HandleHeartbeat(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeHeartbeatInput) (*mcpsdk.CallToolResult, WorktreeHeartbeatOutput, error) {
-	out, err := h.Heartbeat(ctx, in)
-	if err != nil {
-		return nil, WorktreeHeartbeatOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *WorktreeLeaseHandler) HandleHeartbeat(ctx context.Context, req *mcpsdk.CallToolRequest, in WorktreeHeartbeatInput) (*mcpsdk.CallToolResult, WorktreeHeartbeatOutput, error) {
+	return typedTool(h.Heartbeat, true)(ctx, req, in)
 }
 
 // HandleRelease adapts Release to the go-sdk typed tool handler signature.
-func (h *WorktreeLeaseHandler) HandleRelease(ctx context.Context, _ *mcpsdk.CallToolRequest, in WorktreeReleaseInput) (*mcpsdk.CallToolResult, WorktreeReleaseOutput, error) {
-	out, err := h.Release(ctx, in)
-	if err != nil {
-		return nil, WorktreeReleaseOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *WorktreeLeaseHandler) HandleRelease(ctx context.Context, req *mcpsdk.CallToolRequest, in WorktreeReleaseInput) (*mcpsdk.CallToolResult, WorktreeReleaseOutput, error) {
+	return typedTool(h.Release, true)(ctx, req, in)
 }
 
 // Acquire validates the request at the boundary, then leases the whole
@@ -1221,12 +1210,8 @@ func NewHolderLeaseHandler(clock domain.Clock) *HolderLeaseHandler {
 }
 
 // HandleExtend adapts Extend to the go-sdk typed tool handler signature.
-func (h *HolderLeaseHandler) HandleExtend(ctx context.Context, _ *mcpsdk.CallToolRequest, in HolderLeaseExtendInput) (*mcpsdk.CallToolResult, HolderLeaseExtendOutput, error) {
-	out, err := h.Extend(ctx, in)
-	if err != nil {
-		return nil, HolderLeaseExtendOutput{}, err
-	}
-	return &mcpsdk.CallToolResult{}, out, nil
+func (h *HolderLeaseHandler) HandleExtend(ctx context.Context, req *mcpsdk.CallToolRequest, in HolderLeaseExtendInput) (*mcpsdk.CallToolResult, HolderLeaseExtendOutput, error) {
+	return typedTool(h.Extend, true)(ctx, req, in)
 }
 
 // Install validates the request at the boundary, then installs a holder lease.
