@@ -92,6 +92,60 @@ func TestSetTaskStatusUnblocksDependent(t *testing.T) {
 	}
 }
 
+func TestListRecent(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	recent, err := store.ListRecent(ctx, 10)
+	if err != nil || len(recent) != 0 {
+		t.Fatalf("empty result = %+v err=%v", recent, err)
+	}
+
+	type entry struct {
+		id    core.RunID
+		state core.RunState
+	}
+	entries := []entry{
+		{"r0", core.RunMerged},
+		{"r1", core.RunRunning},
+		{"r2", core.RunState("dropped")},
+		{"r3", core.RunClosed},
+	}
+	for _, e := range entries {
+		r := core.NewRun(e.id, "T-1", time.Now().UTC())
+		r.State = e.state
+		if err := store.Save(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	recent, err = store.ListRecent(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []core.RunID{"r3", "r2", "r0"}
+	if len(recent) != len(want) {
+		t.Fatalf("len = %d, want %d: %+v", len(recent), len(want), recent)
+	}
+	for i, id := range want {
+		if recent[i].ID != id {
+			t.Fatalf("recent[%d] = %s, want %s", i, recent[i].ID, id)
+		}
+	}
+
+	recent, err = store.ListRecent(ctx, 2)
+	if err != nil || len(recent) != 2 {
+		t.Fatalf("limited result = %+v err=%v", recent, err)
+	}
+	if recent[0].ID != "r3" || recent[1].ID != "r2" {
+		t.Fatalf("limited order = %+v", recent)
+	}
+}
+
 func TestRunScopeAndIncidentPersistence(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

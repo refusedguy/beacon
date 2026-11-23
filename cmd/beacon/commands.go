@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/refusedguy/beacon/internal/app"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/internal/infra/sqlite"
 	"github.com/refusedguy/beacon/internal/infra/workspace"
@@ -62,7 +63,7 @@ func newDispatchCommand(configPath *string) *cobra.Command {
 }
 
 func newStatusCommand(configPath *string) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Print active runs",
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -71,6 +72,14 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close()
+			recent, _ := cmd.Flags().GetBool("recent")
+			if recent {
+				runs, err := (app.StatusService{Store: store}).Recent(cmd.Context(), 0)
+				if err != nil {
+					return err
+				}
+				return printJSON(runs)
+			}
 			runs, err := store.ListActive(cmd.Context())
 			if err != nil {
 				return err
@@ -78,6 +87,8 @@ func newStatusCommand(configPath *string) *cobra.Command {
 			return printJSON(runs)
 		},
 	}
+	cmd.Flags().Bool("recent", false, "print recently finished runs instead of active ones")
+	return cmd
 }
 
 func newGCCommand(configPath *string) *cobra.Command {

@@ -77,6 +77,10 @@ func (s *Store) ListActive(ctx context.Context) ([]*core.Run, error) {
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state NOT IN ('merged','closed') ORDER BY updated_at`)
 }
 
+func (s *Store) ListRecent(ctx context.Context, limit int) ([]*core.Run, error) {
+	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE state IN ('merged','closed','dropped') ORDER BY updated_at DESC LIMIT ?`, limit)
+}
+
 func (s *Store) ListByIncident(ctx context.Context, incidentID string) ([]*core.Run, error) {
 	return s.queryAll(ctx, `SELECT `+runColumns+` FROM runs WHERE blocked_incident_id=? AND state='blocked'`, incidentID)
 }

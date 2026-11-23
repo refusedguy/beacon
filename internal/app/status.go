@@ -9,8 +9,18 @@ import (
 
 type StatusService struct{ Store RunStore }
 
+// DefaultRecentLimit is the number of finished runs returned when no limit is set.
+const DefaultRecentLimit = 20
+
 func (s StatusService) Active(ctx context.Context) ([]*core.Run, error) {
 	return s.Store.ListActive(ctx)
+}
+
+func (s StatusService) Recent(ctx context.Context, limit int) ([]*core.Run, error) {
+	if limit <= 0 {
+		limit = DefaultRecentLimit
+	}
+	return s.Store.ListRecent(ctx, limit)
 }
 
 type WaitService struct {

@@ -1,4 +1,4 @@
-// Package mcp exposes five worker tools and one orchestrator tool to agents.
+// Package mcp exposes six worker tools and one orchestrator tool to agents.
 package mcp
 
 import (
@@ -32,6 +32,10 @@ type WatchPRArgs struct {
 }
 
 type StatusArgs struct{}
+
+type RecentArgs struct {
+	Limit int `json:"limit"`
+}
 
 type WaitArgs struct {
 	RunID     string `json:"run_id"`
@@ -86,6 +90,13 @@ func NewServer(sv Services) *msdk.Server {
 	})
 	msdk.AddTool(s, &msdk.Tool{Name: "beacon_status", Description: "List active runs, PRs and blockers."}, func(ctx context.Context, _ *msdk.CallToolRequest, _ StatusArgs) (*msdk.CallToolResult, any, error) {
 		runs, err := sv.Status.Active(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return jsonResult(runs), nil, nil
+	})
+	msdk.AddTool(s, &msdk.Tool{Name: "beacon_recent", Description: "List the most recently finished runs."}, func(ctx context.Context, _ *msdk.CallToolRequest, a RecentArgs) (*msdk.CallToolResult, any, error) {
+		runs, err := sv.Status.Recent(ctx, a.Limit)
 		if err != nil {
 			return nil, nil, err
 		}
