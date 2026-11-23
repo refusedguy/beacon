@@ -78,11 +78,19 @@ type CacheResult struct {
 	Reverify  bool           // true when the caller must re-run the full checks
 }
 
+// maxCacheEntries bounds the verdict cache. A Watch cycle stores one entry
+// per distinct (headSHA, suite digest); the bound keeps a long-lived process
+// from holding verdicts for PRs that already closed. LEAK-OBS-01 will confirm
+// the value against a heap profile under real concurrency.
+const maxCacheEntries = 512
+
 // Cache stores results by (headSHA, suite digest). It is safe for concurrent
-// use.
+// use. Entries are kept in insertion order so eviction removes the oldest
+// SHA first, preserving verdicts for the Watches still in flight.
 type Cache struct {
 	mu      sync.Mutex
 	entries map[cacheKey]domain.Verdict
+	order   []cacheKey
 }
 
 type cacheKey struct {
@@ -92,18 +100,30 @@ type cacheKey struct {
 
 // NewCache builds an empty cache.
 func NewCache() *Cache {
-	return &Cache{entries: make(map[cacheKey]domain.Verdict)}
+	return &Cache{
+		entries: make(map[cacheKey]domain.Verdict),
+		order:   make([]cacheKey, 0, maxCacheEntries),
+	}
 }
 
 // Store records a computed verdict for an observation. The entry is keyed by
-// the observation's head SHA and suite digest.
+// the observation's head SHA and suite digest. When the cache is full the
+// oldest entry is dropped; re-storing an existing key does not refresh its
+// position, so one busy SHA cannot crowd out the others.
 func (c *Cache) Store(obs Observation, verdict domain.Verdict) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
 		c.entries = make(map[cacheKey]domain.Verdict)
 	}
-	c.entries[keyFor(obs)] = verdict
+	key := keyFor(obs)
+	if _, exists := c.entries[key]; !exists {
+		c.order = append(c.order, key)
+	}
+	c.entries[key] = verdict
+	for len(c.entries) > maxCacheEntries {
+		c.forget(c.order[0])
+	}
 }
 
 // Lookup returns a cached verdict for an observation without applying any
@@ -117,13 +137,42 @@ func (c *Cache) Lookup(obs Observation) (domain.Verdict, bool) {
 
 // Invalidate removes every entry for headSHA, whatever its digest. A re-run
 // keeps the SHA while resetting suites, so all digests for that SHA become
-// suspect at once.
+// suspect at once. Closing a Watch releases its SHA through InvalidateExcept,
+// which shares this removal path.
 func (c *Cache) Invalidate(headSHA string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for k := range c.entries {
 		if k.headSHA == headSHA {
-			delete(c.entries, k)
+			c.forget(k)
+		}
+	}
+}
+
+// InvalidateExcept removes every entry whose head SHA is absent from active.
+// The batch adapter calls it with the SHAs observed in the current cycle, so a
+// Watch that closed leaves no verdict behind before the bound is reached.
+func (c *Cache) InvalidateExcept(active map[string]struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k := range c.entries {
+		if _, live := active[k.headSHA]; !live {
+			c.forget(k)
+		}
+	}
+}
+
+// forget removes one key from both the entries and the eviction order. The
+// map may be mutated while ranging over it; order is kept in sync so the
+// oldest live key is always at index zero.
+func (c *Cache) forget(key cacheKey) {
+	delete(c.entries, key)
+	for i, k := range c.order {
+		if k == key {
+			copy(c.order[i:], c.order[i+1:])
+			c.order[len(c.order)-1] = cacheKey{}
+			c.order = c.order[:len(c.order)-1]
+			return
 		}
 	}
 }

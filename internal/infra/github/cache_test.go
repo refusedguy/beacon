@@ -221,3 +221,119 @@ func TestCacheConcurrentUse(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCacheCapacityEvictsOldestSHA(t *testing.T) {
+	c := NewCache()
+	obs := observationFor(suiteContexts())
+	for i := 0; i < maxCacheEntries+2; i++ {
+		o := obs
+		o.HeadSHA = fmt.Sprintf("sha-%04d", i)
+		c.Store(o, domain.VerdictReady)
+	}
+
+	if len(c.entries) != maxCacheEntries {
+		t.Fatalf("entries = %d, want %d", len(c.entries), maxCacheEntries)
+	}
+	if len(c.order) != maxCacheEntries {
+		t.Fatalf("order = %d, want %d", len(c.order), maxCacheEntries)
+	}
+	for i := 0; i < 2; i++ {
+		o := obs
+		o.HeadSHA = fmt.Sprintf("sha-%04d", i)
+		if _, ok := c.Lookup(o); ok {
+			t.Fatalf("oldest SHA %d is still cached", i)
+		}
+	}
+	for i := 2; i < maxCacheEntries+2; i++ {
+		o := obs
+		o.HeadSHA = fmt.Sprintf("sha-%04d", i)
+		if v, ok := c.Lookup(o); !ok || v != domain.VerdictReady {
+			t.Fatalf("SHA %d = %q, %t, want ready, true", i, v, ok)
+		}
+	}
+}
+
+func TestStoreExistingKeyDoesNotRefreshPosition(t *testing.T) {
+	c := NewCache()
+	obs := observationFor(suiteContexts())
+	for i := 0; i < maxCacheEntries; i++ {
+		o := obs
+		o.HeadSHA = fmt.Sprintf("sha-%04d", i)
+		c.Store(o, domain.VerdictReady)
+	}
+
+	first := obs
+	first.HeadSHA = "sha-0000"
+	c.Store(first, domain.VerdictReady)
+	if len(c.order) != maxCacheEntries {
+		t.Fatalf("order after re-store = %d, want %d", len(c.order), maxCacheEntries)
+	}
+
+	next := obs
+	next.HeadSHA = "sha-next"
+	c.Store(next, domain.VerdictReady)
+	if len(c.entries) != maxCacheEntries {
+		t.Fatalf("entries = %d, want %d", len(c.entries), maxCacheEntries)
+	}
+	if _, ok := c.Lookup(first); ok {
+		t.Fatal("re-stored oldest SHA was kept ahead of newer entries")
+	}
+	if v, ok := c.Lookup(next); !ok || v != domain.VerdictReady {
+		t.Fatalf("newest SHA = %q, %t, want ready, true", v, ok)
+	}
+}
+
+func TestInvalidateKeepsEvictionOrderInSync(t *testing.T) {
+	c := NewCache()
+	obs := observationFor(suiteContexts())
+	for i := 0; i < maxCacheEntries; i++ {
+		o := obs
+		o.HeadSHA = fmt.Sprintf("sha-%04d", i)
+		c.Store(o, domain.VerdictReady)
+	}
+
+	c.Invalidate("sha-0001")
+	if len(c.order) != maxCacheEntries-1 {
+		t.Fatalf("order after invalidate = %d, want %d", len(c.order), maxCacheEntries-1)
+	}
+
+	next := obs
+	next.HeadSHA = "sha-next"
+	c.Store(next, domain.VerdictReady)
+	if len(c.entries) != maxCacheEntries || len(c.order) != maxCacheEntries {
+		t.Fatalf("sizes = %d entries, %d order; want %d each", len(c.entries), len(c.order), maxCacheEntries)
+	}
+	oldest := obs
+	oldest.HeadSHA = "sha-0000"
+	if _, ok := c.Lookup(oldest); ok {
+		t.Fatal("oldest live SHA was not evicted after invalidation")
+	}
+	if v, ok := c.Lookup(next); !ok || v != domain.VerdictReady {
+		t.Fatalf("newest SHA = %q, %t, want ready, true", v, ok)
+	}
+	for _, key := range c.order {
+		if _, ok := c.entries[key]; !ok {
+			t.Fatalf("order holds ghost key %+v", key)
+		}
+	}
+}
+
+func TestInvalidateExceptReleasesClosedWatchSHA(t *testing.T) {
+	c := NewCache()
+	live := observationFor(suiteContexts())
+	closed := observationFor(suiteContexts())
+	closed.HeadSHA = "sha-closed"
+	c.Store(live, domain.VerdictReady)
+	c.Store(closed, domain.VerdictReady)
+
+	c.InvalidateExcept(map[string]struct{}{live.HeadSHA: {}})
+	if v, ok := c.Lookup(closed); ok {
+		t.Fatalf("closed Watch left verdict %q in the cache", v)
+	}
+	if v, ok := c.Lookup(live); !ok || v != domain.VerdictReady {
+		t.Fatalf("live SHA = %q, %t, want ready, true", v, ok)
+	}
+	if len(c.order) != 1 || c.order[0].headSHA != live.HeadSHA {
+		t.Fatalf("order = %+v, want only the live SHA", c.order)
+	}
+}

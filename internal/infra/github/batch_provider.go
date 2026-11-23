@@ -226,6 +226,7 @@ func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) 
 	pings := make(map[string]bool)
 	prs := make(map[string]domain.PRState, len(prAliases))
 	seenObs := make(map[cacheKey]bool)
+	observed := make(map[string]struct{}, len(prAliases))
 	for _, a := range prAliases {
 		state, suites, err := b.parsePRAlias(ctx, a, result.Data[a.Name])
 		if err != nil {
@@ -242,6 +243,9 @@ func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) 
 		prs[prLookupKey(a.Owner, a.Repo, a.PR)] = state
 
 		obs := batchObservationFor(state, suites)
+		if obs.HeadSHA != "" {
+			observed[obs.HeadSHA] = struct{}{}
+		}
 		if b.cache != nil && obs.HeadSHA != "" && !seenObs[keyFor(obs)] {
 			seenObs[keyFor(obs)] = true
 			if obs.Rerequest || obs.SuiteReset {
@@ -251,6 +255,13 @@ func (b *BatchProvider) fetchBatch(ctx context.Context, watches []domain.Watch) 
 				b.cache.Store(obs, domain.VerdictWatching)
 			}
 		}
+	}
+
+	// Only SHAs fetched in this cycle stay cached. A Watch that closed since
+	// the previous batch has no alias here, so its verdict is released through
+	// the same Invalidate path used by a rerequest or suite reset.
+	if b.cache != nil {
+		b.cache.InvalidateExcept(observed)
 	}
 
 	for _, w := range active {
