@@ -565,27 +565,26 @@ func (a GitHubActionsAdapter) Parse(body []byte) (StatusResult, *domain.AppError
 	return StatusResult{Rollup: roll, Checks: checks, Failures: failures}, nil
 }
 
+var githubPendingStates = map[string]CheckState{
+	"queued": CheckPending, "in_progress": CheckPending,
+	"requested": CheckPending, "waiting": CheckPending,
+}
+
+var githubConclusionStates = map[string]CheckState{
+	"success": CheckSuccess, "failure": CheckFailure,
+	"timed_out": CheckFailure, "startup_failure": CheckFailure,
+	"skipped": CheckSkipped, "neutral": CheckNeutral,
+	"cancelled": CheckNeutral, "canceled": CheckNeutral,
+	"action_required": CheckNeutral, "stale": CheckNeutral,
+}
+
 func githubCheckState(status, conclusion string) (CheckState, bool) {
 	if status != "completed" {
-		switch status {
-		case "queued", "in_progress", "requested", "waiting":
-			return CheckPending, true
-		default:
-			return "", false
-		}
+		state, ok := githubPendingStates[status]
+		return state, ok
 	}
-	switch conclusion {
-	case "success":
-		return CheckSuccess, true
-	case "failure", "timed_out", "startup_failure":
-		return CheckFailure, true
-	case "skipped":
-		return CheckSkipped, true
-	case "neutral", "cancelled", "canceled", "action_required", "stale":
-		return CheckNeutral, true
-	default:
-		return "", false
-	}
+	state, ok := githubConclusionStates[conclusion]
+	return state, ok
 }
 
 // --- GitLab CI ---
@@ -634,24 +633,24 @@ func (a GitLabAdapter) Parse(body []byte) (StatusResult, *domain.AppError) {
 	return StatusResult{Rollup: roll, Checks: checks, Failures: failures}, nil
 }
 
+var gitlabCheckStates = map[string]CheckState{
+	"success": CheckSuccess, "failed": CheckFailure,
+	"canceled": CheckNeutral, "skipped": CheckSkipped,
+	"created": CheckPending, "preparing": CheckPending,
+	"pending": CheckPending, "running": CheckPending,
+	"waiting_for_resource": CheckPending, "scheduled": CheckPending,
+	"manual": CheckPending,
+}
+
 func gitlabCheckState(status string, allowFailure bool) (CheckState, bool) {
-	switch status {
-	case "success":
-		return CheckSuccess, true
-	case "failed":
-		if allowFailure {
-			return CheckNeutral, true
-		}
-		return CheckFailure, true
-	case "canceled":
-		return CheckNeutral, true
-	case "skipped":
-		return CheckSkipped, true
-	case "created", "preparing", "pending", "running", "waiting_for_resource", "scheduled", "manual":
-		return CheckPending, true
-	default:
+	state, ok := gitlabCheckStates[status]
+	if !ok {
 		return "", false
 	}
+	if status == "failed" && allowFailure {
+		return CheckNeutral, true
+	}
+	return state, true
 }
 
 // --- Bitbucket Pipelines ---
