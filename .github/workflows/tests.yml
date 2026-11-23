@@ -135,6 +135,15 @@ jobs:
           beacon_sha=$(sha256sum beacon | cut -d' ' -f1)
           printf 'build ok binary=beacon sha256=%s\n' "$beacon_sha"
 
+      # TCG-13. Блокировка скиллов должна соответствовать файлам на диске.
+      # --check возвращает не 0 при изменённом хеше или новом скилле, поэтому
+      # правка скилла без --write останавливает PR до обновления файла.
+      - name: Skills lock is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./beacon skills-lock --check
+
       # Корректный конфиг проходит проверки схемы, лимитов и индекса. Строка
       # "ok <digest>" подтверждает, что проверка действительно выполнилась.
       - name: Positive config passes registry check

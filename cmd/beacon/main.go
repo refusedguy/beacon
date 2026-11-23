@@ -52,6 +52,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon gc-worktree [--format table|json] [--apply]
   beacon init [--root <dir>] [--force]
   beacon index build [--root <dir>]
+  beacon skills-lock [--write | --check]
   beacon deferred [--format table|json]
   beacon workload [--format table|json]
   beacon metrics [--format json|prometheus]
@@ -92,8 +93,16 @@ var regradeCatalogEntry = command{
 	Usage:   "beacon regrade [--watch <id>] [--dataset <name>] [--split <name>] [--declared <a,b>] [--save <file>] [--format table|json]",
 }
 
+// skillsLockCatalogEntry registers the lock generator in the command catalog.
+// It lives here because catalog.go is outside this card's file ownership.
+var skillsLockCatalogEntry = command{
+	Name:    "skills-lock",
+	Summary: "Пересчитать или проверить skills-lock.json по снимкам скиллов",
+	Usage:   "beacon skills-lock [--write | --check]",
+}
+
 func init() {
-	catalog = append(catalog, spawnCatalogEntry, serverCatalogEntry, regradeCatalogEntry)
+	catalog = append(catalog, spawnCatalogEntry, serverCatalogEntry, regradeCatalogEntry, skillsLockCatalogEntry)
 	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
 
 	// commandFormats lives in catalog.go, outside this card's file ownership.
@@ -292,6 +301,7 @@ func init() {
 		"gc-worktree":  func(c *CLI, args []string) int { return gcWorktreeRunner(c, args) },
 		"init":         func(c *CLI, args []string) int { return initRunner(c, args) },
 		"index":        func(c *CLI, args []string) int { return indexRunner(c, args) },
+		"skills-lock":  func(c *CLI, args []string) int { return c.runSkillsLock(args) },
 		"deferred":     func(c *CLI, args []string) int { return deferredRunner(c, args) },
 		"workload":     func(c *CLI, args []string) int { return workloadRunner(c, args) },
 		"metrics":      func(c *CLI, args []string) int { return metricsRunner(c, args) },
@@ -428,6 +438,44 @@ func (c *CLI) runRegistryCheck(args []string) int {
 		return 2
 	}
 	return registryCheckRunner(checkRegistryConfig(config), c.out)
+}
+
+// runSkillsLock regenerates or checks skills-lock.json. Exactly one mode is
+// required. --write rebuilds the lock from the skill directories on disk,
+// --check exits 1 when the checked-in lock is stale.
+func (c *CLI) runSkillsLock(args []string) int {
+	fs := flag.NewFlagSet("skills-lock", flag.ContinueOnError)
+	write := fs.Bool("write", false, "recompute and write skills-lock.json")
+	check := fs.Bool("check", false, "fail if skills-lock.json is stale")
+	if !parseFlags("skills-lock", args, c.errOut, fs) {
+		return 2
+	}
+	if *write == *check {
+		fmt.Fprintln(c.errOut, "beacon skills-lock: укажите ровно один флаг: --write или --check")
+		return 2
+	}
+	if *write {
+		lock, err := writeSkillsLock(c.root)
+		if err != nil {
+			fmt.Fprintf(c.errOut, "beacon skills-lock --write: %v\n", err)
+			return 2
+		}
+		fmt.Fprintf(c.out, "ok write skills=%d\n", len(lock.Skills))
+		return 0
+	}
+	findings, err := verifySkillsLock(c.root)
+	if err != nil {
+		fmt.Fprintf(c.errOut, "beacon skills-lock --check: %v\n", err)
+		return 2
+	}
+	if len(findings) != 0 {
+		for _, finding := range findings {
+			fmt.Fprintf(c.errOut, "stale %s: %s\n", finding.Name, finding.Problem)
+		}
+		return 1
+	}
+	fmt.Fprintln(c.out, "ok skills-lock актуален")
+	return 0
 }
 
 func writeUsage(w io.Writer) {
