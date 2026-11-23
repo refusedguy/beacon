@@ -52,6 +52,43 @@ func newTestGitWorktree(t *testing.T) (*GitWorktree, string) {
 	return wt, repo
 }
 
+func TestGitWorktreeCreateUsesTaskBaseBranch(t *testing.T) {
+	wt, repo := newTestGitWorktree(t)
+	ctx := context.Background()
+
+	gitCmd(t, repo, "checkout", "-b", "release/1")
+	if err := os.WriteFile(filepath.Join(repo, "base-only.txt"), []byte("release\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo, "add", "base-only.txt")
+	gitCmd(t, repo, "commit", "-m", "release base")
+	releaseSHA := strings.TrimSpace(gitCmd(t, repo, "rev-parse", "HEAD"))
+	gitCmd(t, repo, "push", "origin", "release/1")
+	gitCmd(t, repo, "checkout", "main")
+
+	ws, err := wt.Create(ctx, core.Task{ID: "T-CUSTOM-BASE", BaseBranch: "release/1"})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if ws.Base != releaseSHA {
+		t.Fatalf("workspace base = %q, want %q", ws.Base, releaseSHA)
+	}
+	if head := strings.TrimSpace(gitCmd(t, ws.Path, "rev-parse", "HEAD")); head != releaseSHA {
+		t.Fatalf("worktree HEAD = %q, want %q", head, releaseSHA)
+	}
+	if _, err := os.Stat(filepath.Join(ws.Path, "base-only.txt")); err != nil {
+		t.Fatalf("worktree missing base-branch file: %v", err)
+	}
+
+	mainWS, err := wt.Create(ctx, core.Task{ID: "T-DEFAULT-BASE"})
+	if err != nil {
+		t.Fatalf("Create() without BaseBranch error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(mainWS.Path, "base-only.txt")); !os.IsNotExist(err) {
+		t.Fatalf("default worktree used release branch: %v", err)
+	}
+}
+
 func TestGitWorktreeCleanScopesToWorktreeAndProtectsAgentFiles(t *testing.T) {
 	wt, repo := newTestGitWorktree(t)
 	ctx := context.Background()

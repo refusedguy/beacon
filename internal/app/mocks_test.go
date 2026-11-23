@@ -250,6 +250,7 @@ type parentNotification struct {
 
 type fakeHarness struct {
 	sessions      []string
+	prompts       []string
 	wakes         []core.WakeContext
 	stops         int
 	notifications []parentNotification
@@ -259,6 +260,7 @@ type fakeHarness struct {
 
 func (f *fakeHarness) Spawn(_ context.Context, req core.SpawnRequest) (core.Session, error) {
 	f.sessions = append(f.sessions, string(req.RunID))
+	f.prompts = append(f.prompts, req.Prompt)
 	return core.Session{ID: "sess-" + string(req.RunID)}, nil
 }
 func (f *fakeHarness) Wake(_ context.Context, _ string, w core.WakeContext) error {
@@ -281,6 +283,12 @@ func (f *fakeHarness) Events() <-chan core.HarnessEvent {
 	return f.events
 }
 
+type openedPR struct {
+	head  string
+	base  string
+	title string
+}
+
 type fakeSCM struct {
 	obs        core.Observation
 	obsByPR    map[int]core.Observation
@@ -291,6 +299,7 @@ type fakeSCM struct {
 	merges     int
 	mergeSHA   string
 	foundPR    int
+	openedPRs  []openedPR
 	updateErr  error
 	log        *callLog
 }
@@ -327,6 +336,11 @@ func (f *fakeSCM) BaseBranchStatus(context.Context, string) (core.BaseStatus, er
 	return f.base, nil
 }
 func (f *fakeSCM) FindOpenPRByBranch(context.Context, string) (int, error) {
+	return f.foundPR, nil
+}
+func (f *fakeSCM) OpenPR(_ context.Context, head, base, title string) (int, error) {
+	f.log.add("open_pr")
+	f.openedPRs = append(f.openedPRs, openedPR{head: head, base: base, title: title})
 	return f.foundPR, nil
 }
 
