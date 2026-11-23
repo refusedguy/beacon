@@ -6,12 +6,13 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // GitRunner runs one git command. An empty dir means the process working
@@ -194,15 +195,15 @@ func (r *Rebaser) RebaseAll(ctx context.Context) ([]RebaseResult, error) {
 	worktrees := parseWorktrees(listing)
 
 	results := make([]RebaseResult, 0, len(watches))
-	var errs []error
+	errs := &observe.ErrorCollector{}
 	for _, w := range watches {
 		res, rebaseErr := r.rebaseWatch(ctx, w, worktrees)
 		results = append(results, res)
 		if rebaseErr != nil {
-			errs = append(errs, rebaseErr)
+			errs.Add(rebaseErr)
 		}
 	}
-	return results, errors.Join(errs...)
+	return results, errs.Error()
 }
 
 func (r *Rebaser) rebaseWatch(ctx context.Context, w Watch, worktrees []worktreeInfo) (RebaseResult, error) {
@@ -361,18 +362,18 @@ func (r *Rebaser) headRefName(ctx context.Context, w Watch, worktrees []worktree
 // same paths travel in ConflictError and in the wake reason.
 func (r *Rebaser) conflict(ctx context.Context, w Watch, res RebaseResult) (RebaseResult, error) {
 	files := r.unmergedFiles(ctx, res.Worktree)
-	var errs []error
+	errs := &observe.ErrorCollector{}
 	conflictErr := &ConflictError{PR: w.PR, WatchID: w.ID, Files: files}
 	if _, err := r.Git.Run(ctx, res.Worktree, "rebase", "--abort"); err != nil {
 		conflictErr.AbortErr = err.Error()
 	}
 	res.Err = conflictErr
-	errs = append(errs, conflictErr)
+	errs.Add(conflictErr)
 
 	if r.Updater == nil {
-		errs = append(errs, fmt.Errorf("orchestrator: PR %d has no watch updater for conflict", w.PR))
+		errs.Addf("orchestrator: PR %d has no watch updater for conflict", w.PR)
 	} else if err := r.Updater.SetRebase(ctx, w.ID, files); err != nil {
-		errs = append(errs, fmt.Errorf("orchestrator: PR %d mark rebase: %w", w.PR, err))
+		errs.Addf("orchestrator: PR %d mark rebase: %w", w.PR, err)
 	}
 	if r.Waker != nil {
 		reason := conflictReason(files)
@@ -383,10 +384,10 @@ func (r *Rebaser) conflict(ctx context.Context, w Watch, res RebaseResult) (Reba
 			wakeErr = r.Waker.Wake(ctx, w.ID, w.Revision, VerdictRebase)
 		}
 		if wakeErr != nil {
-			errs = append(errs, fmt.Errorf("orchestrator: PR %d wake executor: %w", w.PR, wakeErr))
+			errs.Addf("orchestrator: PR %d wake executor: %w", w.PR, wakeErr)
 		}
 	}
-	return res, errors.Join(errs...)
+	return res, errs.Error()
 }
 
 // unmergedFiles unions the unmerged paths reported by git diff and by git

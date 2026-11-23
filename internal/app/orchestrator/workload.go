@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // OrchestratorSubscriberID is the stable identity used when the workload
@@ -336,17 +338,17 @@ func RunWorkload(ctx context.Context, st WorkloadStore) (Workload, error) {
 		report.Skipped = skipped
 	}
 
-	var errs []error
+	errs := &observe.ErrorCollector{}
 	for _, w := range watches {
 		if hasWorkloadRole(w, RoleOrchestrator) {
 			continue
 		}
 		sub := WorkloadSubscriber{ID: OrchestratorSubscriberID, Role: RoleOrchestrator}
 		if err := st.Subscribe(ctx, w, sub); err != nil {
-			errs = append(errs, fmt.Errorf("workload: subscribe watch %s: %w", w.ID, err))
+			errs.Addf("workload: subscribe watch %s: %w", w.ID, err)
 			continue
 		}
 		report.Registered++
 	}
-	return report, errors.Join(errs...)
+	return report, errs.Error()
 }

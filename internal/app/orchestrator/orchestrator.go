@@ -1301,13 +1301,13 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 	}
 	started := time.Now()
 	observe.RunStart(len(watches))
-	var errs []error
+	errs := &observe.ErrorCollector{}
 	defer func() {
 		stats := observe.CycleStats{
 			Watches: len(watches), Merges: len(out.Merged), Wakes: len(out.Actions),
 			Duration: time.Since(started),
 		}
-		observe.RunEnd(stats, errors.Join(errs...))
+		observe.RunEnd(stats, errs.Error())
 	}()
 
 	for _, w := range watches {
@@ -1315,20 +1315,20 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 		case w.Blocked != nil:
 			// Blocked wins over a stale ready verdict and over retry. Decide
 			// reads the block first, so a blocked Watch can never merge here.
-			handleBlocked(ctx, st, w, resolver, opts, &out, &errs)
+			handleBlocked(ctx, st, w, resolver, opts, &out, errs)
 		case w.isReady() || isWaitDependency(w.Verdict):
 			// A Watch held on a previous tick is checked again with the same
 			// gate. As soon as the ref is in main, this pass merges it.
 			verdict, reason, err := w.canAutoMerge(ctx, resolver)
 			if err != nil {
 				observe.ActorError("orchestrator", w.ID, err)
-				errs = append(errs, err)
+				errs.Add(err)
 				continue
 			}
 			switch verdict {
 			case VerdictReady:
 				observe.DependenciesResolved(w.ID, w.PR, nil)
-				mergeOne(ctx, st, merger, opts, w, &out, &errs)
+				mergeOne(ctx, st, merger, opts, w, &out, errs)
 			case VerdictWait:
 				// An unsatisfied dependency is nobody's fault: there is no fix
 				// for an executor or a FIX agent to do, so no obligation is
@@ -1343,7 +1343,7 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 				if holder, ok := st.(WatchHolder); ok && !opts.DryRun {
 					if err := holder.HoldWatch(ctx, w.ID, WaitDependencyVerdict(reason)); err != nil {
 						observe.ActorError("dependency-hold", w.ID, err)
-						errs = append(errs, fmt.Errorf("orchestrator: hold watch %s: %w", w.ID, err))
+						errs.Addf("orchestrator: hold watch %s: %w", w.ID, err)
 					}
 				}
 			default:
@@ -1372,10 +1372,10 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 				_, retryApproval := ApprovalActions(w, nil)
 				out.Approvals = append(out.Approvals, retryApproval)
 			}
-			wakeOne(ctx, waker, opts.ReasonWaker, w, w.Verdict, w.Verdict, &out, &errs)
+			wakeOne(ctx, waker, opts.ReasonWaker, w, w.Verdict, w.Verdict, &out, errs)
 		}
 	}
-	return out, errors.Join(errs...)
+	return out, errs.Error()
 }
 
 // handleBlocked turns one blocked Watch into exactly one decision per pass.
@@ -1386,7 +1386,7 @@ func RunWithResolver(ctx context.Context, st Store, merger Merger, waker Waker, 
 // the budget close: without the write BlockedInfo.FixAttempts stays zero and
 // the Watch asks for a FIX agent forever. The switch in RunWithResolver calls
 // this once per Watch, which keeps a single decision from charging twice.
-func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyResolver, opts Options, out *Result, errs *[]error) {
+func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyResolver, opts Options, out *Result, errs *observe.ErrorCollector) {
 	d := Decide(w, resolver, CIState{})
 	if d.Kind == DecisionNotifyOrchestrator && d.Reason == ReasonEscalateHuman {
 		observe.BlockEscalated(w.ID, ReasonEscalateHuman)
@@ -1412,7 +1412,7 @@ func handleBlocked(ctx context.Context, st Store, w Watch, resolver DependencyRe
 	// reported, not hidden: a lost charge would keep the loop spinning.
 	if err := st.RecordFixAttempt(ctx, w.ID); err != nil {
 		observe.ActorError("fix-attempt", w.ID, err)
-		*errs = append(*errs, fmt.Errorf("orchestrator: record fix attempt %s: %w", w.ID, err))
+		errs.Addf("orchestrator: record fix attempt %s: %w", w.ID, err)
 	}
 	observe.FixerSpawned(w.ID)
 }
@@ -1505,7 +1505,7 @@ func withNetworkApproval[T any](ctx context.Context, opts Options, call func() (
 // recordMergeFailure is the single exit for a merge that failed after its
 // budget. A transient failure earns an explicit WARN event. Without it a
 // Watch still marked ready looks healthy although no retry is left.
-func recordMergeFailure(w Watch, command string, err error, out *Result, errs *[]error) {
+func recordMergeFailure(w Watch, command string, err error, out *Result, errs *observe.ErrorCollector) {
 	observe.MergeFailure(w.ID, w.PR, err)
 	observe.ActorError("merger", w.ID, err)
 	if ghci.IsTransientError(err) {
@@ -1520,20 +1520,20 @@ func recordMergeFailure(w Watch, command string, err error, out *Result, errs *[
 		Action: ActionMerge, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
 		Command: command, Message: err.Error(),
 	})
-	*errs = append(*errs, fmt.Errorf("orchestrator: merge PR %d: %w", w.PR, err))
+	errs.Addf("orchestrator: merge PR %d: %w", w.PR, err)
 }
 
 // mergeOne performs the idempotent merge branch for one ready Watch. A
 // CheckedMerger passed in Options owns the gh mergeability gate and the
 // post-merge state confirmation; without one the Merger is trusted on its
 // success return. The caller chooses the guarantee explicitly.
-func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watch, out *Result, errs *[]error) {
+func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watch, out *Result, errs *observe.ErrorCollector) {
 	started := time.Now()
 	defer func() { observe.MergeDuration(time.Since(started)) }()
 	done, err := st.WasMerged(ctx, w.ID, w.Revision)
 	if err != nil {
 		observe.ActorError("merge-ledger", w.ID, err)
-		*errs = append(*errs, fmt.Errorf("orchestrator: merge ledger %s@%d: %w", w.ID, w.Revision, err))
+		errs.Addf("orchestrator: merge ledger %s@%d: %w", w.ID, w.Revision, err)
 		return
 	}
 	if done {
@@ -1556,7 +1556,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 			Action: ActionSandboxDenied, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
 			Message: err.Error(),
 		})
-		*errs = append(*errs, fmt.Errorf("orchestrator: sandbox for PR %d: %w", w.PR, err))
+		errs.Addf("orchestrator: sandbox for PR %d: %w", w.PR, err)
 		return
 	}
 	if opts.DryRun {
@@ -1569,7 +1569,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 	if merger == nil {
 		mergerErr := fmt.Errorf("orchestrator: merger is nil for PR %d", w.PR)
 		observe.MergeFailure(w.ID, w.PR, mergerErr)
-		*errs = append(*errs, mergerErr)
+		errs.Add(mergerErr)
 		return
 	}
 	observe.MergeAttempt(w.ID, w.PR)
@@ -1591,7 +1591,7 @@ func mergeOne(ctx context.Context, st Store, merger Merger, opts Options, w Watc
 // mergeCheckedOne turns one checked outcome into state changes. Only a
 // confirmed MERGE closes the Watch; a held or pending PR is reported without
 // an error so a dirty PR does not produce a multi-line gh hint on every pass.
-func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, opts Options, w Watch, command string, out *Result, errs *[]error) {
+func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, opts Options, w Watch, command string, out *Result, errs *observe.ErrorCollector) {
 	outcome, err := withNetworkApproval(ctx, opts, func() (MergeOutcome, error) {
 		return retryTransient(ctx, func() (MergeOutcome, error) {
 			return merger.MergeChecked(ctx, w.Repo, w.PR)
@@ -1634,11 +1634,11 @@ func mergeCheckedOne(ctx context.Context, st Store, merger CheckedMerger, opts O
 
 // confirmMerge writes the ledger and closes the Watch for a PR the hosting
 // service reported as MERGED. It is shared by checked and plain mergers.
-func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *Result, errs *[]error) {
+func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *Result, errs *observe.ErrorCollector) {
 	observe.MergeSuccess(w.ID, w.PR)
 	if err := st.RecordMerge(ctx, w.ID, w.Revision); err != nil {
 		observe.ActorError("merge-ledger", w.ID, err)
-		*errs = append(*errs, fmt.Errorf("orchestrator: record merge %s@%d: %w", w.ID, w.Revision, err))
+		errs.Addf("orchestrator: record merge %s@%d: %w", w.ID, w.Revision, err)
 	}
 	var closeErr error
 	if closer, ok := st.(RevisionedWatchCloser); ok {
@@ -1648,7 +1648,7 @@ func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *R
 	}
 	if closeErr != nil {
 		observe.ActorError("watch-closer", w.ID, closeErr)
-		*errs = append(*errs, fmt.Errorf("orchestrator: close watch %s: %w", w.ID, closeErr))
+		errs.Addf("orchestrator: close watch %s: %w", w.ID, closeErr)
 	}
 	out.Merged = append(out.Merged, w.PR)
 	out.Actions = append(out.Actions, Action{
@@ -1661,7 +1661,7 @@ func confirmMerge(ctx context.Context, st Store, w Watch, command string, out *R
 // legitimate in this card: the Watch simply stays active for later delivery.
 // The reason is recorded on the Action and passed to an explicit ReasonWaker
 // when the caller supplied one.
-func wakeOne(ctx context.Context, waker Waker, reasonWaker ReasonWaker, w Watch, verdict, reason string, out *Result, errs *[]error) {
+func wakeOne(ctx context.Context, waker Waker, reasonWaker ReasonWaker, w Watch, verdict, reason string, out *Result, errs *observe.ErrorCollector) {
 	if waker == nil {
 		observe.WakeSkipped("", w.ID, "no waker installed")
 		return
@@ -1692,7 +1692,7 @@ func wakeOne(ctx context.Context, waker Waker, reasonWaker ReasonWaker, w Watch,
 	if wakeErr != nil {
 		observe.WakeFailed("", w.ID, wakeErr)
 		observe.ActorError("waker", w.ID, wakeErr)
-		*errs = append(*errs, fmt.Errorf("orchestrator: wake %s: %w", w.ID, wakeErr))
+		errs.Addf("orchestrator: wake %s: %w", w.ID, wakeErr)
 	}
 	out.Actions = append(out.Actions, Action{
 		Action: ActionWake, WatchID: w.ID, PR: w.PR, Revision: w.Revision,
