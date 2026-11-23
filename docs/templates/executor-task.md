@@ -406,11 +406,19 @@ keys: docs, tasks, evals
 scattered-paths: fail
 executor-task:artifact-paths -->
 
+## Premise-check перед кодовым PR
+
+Перед `gh pr create` исполнитель запускает `bash scripts/premise-check.sh <CARD> [--from-backlog <PATH>]`. Скрипт обновляет `origin/main` через `git fetch` и печатает один вердикт: `clean`, `landed` или `duplicate`. Вывод скрипта целиком идёт в тело PR. При `landed` или `duplicate` агент не открывает PR, а возвращает блокер с полным SHA и номером PR по правилу «Блокер с доказательством вместо PR-дубля».
+
+Карточка обязана существовать в store как `docs/tasks/<CARD>.md` или быть явно взятой из бэклога. Для бэклога агент передаёт `--from-backlog <PATH>` и называет тот же путь в теле PR. Без одного из двух источников `clean` недоступен.
+
+Скрипт не повторяет правила закрытия. Формат доказательства и whitelist шаблонов заголовков коммитов лежат в `docs/runbooks/CLOSE-PROCEDURE.md`, раздел «Whitelist шаблонов заголовков коммитов» (TCG-18). Проверка не меняет протокол Watch, текст `waiting, <watchID>` и число MCP-инструментов.
+
 ## Цикл: claim, register, push PR, finish turn
 
 1. **claim.** Получить задачу через `beacon_task_claim`, если оркестратор ещё не выдал её. Сохранить ID, цель, зависимости и OwnerFiles из ответа. Не искать задачу вручную в `docs/tasks/`.
 2. **register.** Вызвать `beacon_watch_pr` с `repo: "refusedguy/beacon"`, `pr`, `headSHA`, `role: "executor"` или `"fixer"` и `notify: { adapter: "opencode", target: "<ses_...>" }`. В `target` идёт РЕАЛЬНЫЙ идентификатор сессии из `_meta["ai.opencode/sessionID"]` или явно переданный `ses_...`. Значение `<cardID>` в `target` запрещено: wake будет доставлен не туда. Повторный вызов с теми же параметрами идемпотентен. Один агент может держать несколько Watch.
-3. **push PR.** Перед `git worktree add ... origin/main` обязателен `git fetch origin main`: база берётся из свежего `origin/main`. Premise-check через `git merge-base --is-ancestor` делать только после fetch. Устаревшая база даёт ложный premise-check и конфликты. Сделать изменения в своём worktree и своей ветке от `origin/main`. Прямые коммиты в `main` запрещены. Локально запускать только `gofmt -w <изменённые_файлы>`. Перед пушем запускать синтаксический предпроход по изменённым файлам и не пушить при ошибке. Полные проверки прогоняет GitHub Actions CI на PR, не запускать `go test ./...`, `go build ./...` и `beacon gates` локально. Запушить ветку и открыть PR в `main` командой `gh pr create --base main --head <ветка>`. В отчёте указать номер PR, headSHA и список файлов.
+3. **push PR.** Перед `git worktree add ... origin/main` обязателен `git fetch origin main`: база берётся из свежего `origin/main`. Premise-check через `git merge-base --is-ancestor` делать только после fetch. Устаревшая база даёт ложный premise-check и конфликты. Для кодового PR дополнительно выполняется проверка из раздела «Premise-check перед кодовым PR». Сделать изменения в своём worktree и своей ветке от `origin/main`. Прямые коммиты в `main` запрещены. Локально запускать только `gofmt -w <изменённые_файлы>`. Перед пушем запускать синтаксический предпроход по изменённым файлам и не пушить при ошибке. Полные проверки прогоняет GitHub Actions CI на PR, не запускать `go test ./...`, `go build ./...` и `beacon gates` локально. Запушить ветку и открыть PR в `main` командой `gh pr create --base main --head <ветка>`. В отчёте указать номер PR, headSHA и список файлов.
 4. **finish turn.** Завершить ход с отчётом ровно `waiting, <watchID>`, подставив сохранённый `watchID`. Не опрашивать состояние в цикле, не крутить `gh pr checks --watch`, не использовать `sleep` и не ждать вручную. Дальше агент спит до вердикта, который разрешает пробуждение.
 
 ## Локальный синтаксический предпроход
