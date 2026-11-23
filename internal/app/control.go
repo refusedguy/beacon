@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"strings"
+	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -24,7 +26,9 @@ func (c *Control) get(ctx context.Context, id core.RunID) (*core.Run, error) {
 	return run, nil
 }
 
-// WatchPR binds a pull request to a running task and subscribes it to reconciliation.
+// WatchPR binds a pull request to a run and subscribes it to reconciliation.
+// WatchPR reopens a run closed by workspace cleanup. The reconciler skips
+// terminal runs, so a binding stored on a closed run is never finalized.
 func (c *Control) WatchPR(ctx context.Context, id core.RunID, pr int) error {
 	run, err := c.get(ctx, id)
 	if err != nil {
@@ -37,12 +41,30 @@ func (c *Control) WatchPR(ctx context.Context, id core.RunID, pr int) error {
 		return core.Errorf(core.CodeConflict, "run %s already watches PR %d", id, run.PRNumber)
 	}
 	if err := run.Apply(core.Event{Kind: core.EvPRRegistered, PRNumber: pr}); err != nil {
-		if run.State != core.RunWaitingCI {
+		switch {
+		case run.State == core.RunWaitingCI:
+			run.PRNumber = pr
+		case run.State == core.RunClosed && strings.HasPrefix(run.Reason, "workspace:"):
+			bound, err := c.Store.FindByPR(ctx, pr)
+			if err != nil {
+				return err
+			}
+			if bound != nil && bound.ID != run.ID {
+				return core.Errorf(core.CodeConflict, "PR %d belongs to run %s", pr, bound.ID)
+			}
+			run.State = core.RunWaitingCI
+			run.Reason = ""
+			run.PRNumber = pr
+			run.UpdatedAt = time.Now().UTC()
+		default:
 			return err
 		}
-		run.PRNumber = pr
 	}
-	return c.Store.Save(ctx, run)
+	if err := c.Store.Save(ctx, run); err != nil {
+		return err
+	}
+	c.signal(run)
+	return nil
 }
 
 func (c *Control) Cancel(ctx context.Context, id core.RunID) error {
