@@ -87,6 +87,25 @@ func (g *GitHubIssues) MarkInWorkspace(context.Context, core.TaskID, string, str
 	return nil
 }
 
+// Create opens a GitHub issue. The issue number becomes the task ID so the
+// Claim and Complete calls can address it.
+func (g *GitHubIssues) Create(ctx context.Context, task core.Task) (core.Task, error) {
+	body, err := issueBody(task)
+	if err != nil {
+		return core.Task{}, err
+	}
+	issue, _, err := g.Client.Issues.Create(ctx, g.Owner, g.Repo, github.CreateIssueRequest{
+		Title: task.Title,
+		Body:  github.Ptr(body),
+	})
+	if err != nil {
+		return core.Task{}, err
+	}
+	created := parseIssue(issue)
+	created.Status = core.TaskAvailable
+	return created, nil
+}
+
 func issueNumber(id core.TaskID) (int, error) {
 	s := strings.TrimPrefix(string(id), "GH-")
 	n, err := strconv.Atoi(s)

@@ -8,7 +8,7 @@ export const SURVIVAL_RULES = [
   '2) Edit only the files listed in Scope: of your task card.',
   '3) Run gofmt -w on changed Go files, then targeted go test for changed packages. Full go test ./... and go vet ./... run in CI on weak machines.',
   '4) Use rg -n PATTERN <explicit-directory>. Do not grep -r the whole tree or find /.',
-  '5) Use only these five MCP tools: beacon_dispatch, beacon_watch_pr, beacon_status, beacon_wait, beacon_control. No other Beacon tool exists.',
+  '5) Workers use only these five MCP tools: beacon_dispatch, beacon_watch_pr, beacon_status, beacon_wait, beacon_control. The sixth tool, beacon_task_create, is for the orchestrator only. No other Beacon tool exists.',
   '6) After opening a pull request, call beacon_watch_pr with your real run ID and PR number.',
   '7) Use beacon_wait to wait and beacon_status to inspect. No gh pr checks --watch and no sleep loop.',
   '8) Use beacon_control only for approve, unblock, cancel and retry on a run.',

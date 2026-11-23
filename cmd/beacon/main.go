@@ -33,19 +33,20 @@ import (
 )
 
 type wiring struct {
-	cfg        config.Config
-	store      *sqlite.Store
-	source     core.TaskSource
-	harness    core.AgentHarness
-	workspace  *workspace.GitWorktree
-	scm        core.ScmGateway
-	policy     core.MergePolicy
-	changes    chan int
-	dispatcher *app.Dispatcher
-	control    *app.Control
-	status     app.StatusService
-	wait       app.WaitService
-	recon      *app.Reconciler
+	cfg         config.Config
+	store       *sqlite.Store
+	source      core.TaskSource
+	harness     core.AgentHarness
+	workspace   *workspace.GitWorktree
+	scm         core.ScmGateway
+	policy      core.MergePolicy
+	changes     chan int
+	dispatcher  *app.Dispatcher
+	control     *app.Control
+	status      app.StatusService
+	wait        app.WaitService
+	taskCreator *app.TaskCreator
+	recon       *app.Reconciler
 }
 
 func wire(path, parentSession string) (*wiring, error) {
@@ -90,6 +91,10 @@ func wire(path, parentSession string) (*wiring, error) {
 		return nil, err
 	}
 	changes := make(chan int, 64)
+	taskCreator := &app.TaskCreator{
+		Source: source, Workspace: wt,
+		Root: core.Workspace{Path: root, Branch: cfg.BaseBranch},
+	}
 	disp := &app.Dispatcher{
 		Source:    source,
 		Planner:   planner.New(planner.Options{ByPath: true, ByDependency: true, Strict: cfg.StrictScope}),
@@ -122,7 +127,8 @@ func wire(path, parentSession string) (*wiring, error) {
 		cfg: cfg, store: store, source: source, harness: h, workspace: wt,
 		scm: scmGW, policy: recon.Policy, changes: changes, dispatcher: disp,
 		control: ctrl, status: app.StatusService{Store: store},
-		wait: app.WaitService{Store: store, Interval: time.Second}, recon: recon,
+		wait:        app.WaitService{Store: store, Interval: time.Second},
+		taskCreator: taskCreator, recon: recon,
 	}, nil
 }
 

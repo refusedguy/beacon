@@ -169,6 +169,29 @@ func (g *GitLabIssues) MarkInWorkspace(context.Context, core.TaskID, string, str
 	return nil
 }
 
+// Create opens a GitLab issue. The issue IID becomes the task ID so the Claim
+// and Complete calls can address it.
+func (g *GitLabIssues) Create(ctx context.Context, task core.Task) (core.Task, error) {
+	body, err := issueBody(task)
+	if err != nil {
+		return core.Task{}, err
+	}
+	data, err := g.request(ctx, http.MethodPost, "/projects/"+g.project()+"/issues", nil, map[string]string{
+		"title":       task.Title,
+		"description": body,
+	})
+	if err != nil {
+		return core.Task{}, err
+	}
+	var issue glIssue
+	if err := json.Unmarshal(data, &issue); err != nil {
+		return core.Task{}, err
+	}
+	created := glParseIssue(issue)
+	created.Status = core.TaskAvailable
+	return created, nil
+}
+
 func glIssueNumber(id core.TaskID) (int, error) {
 	s := strings.TrimPrefix(string(id), "GL-")
 	n, err := strconv.Atoi(s)

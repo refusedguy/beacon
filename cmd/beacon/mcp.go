@@ -20,7 +20,7 @@ import (
 func newMCPCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "mcp",
-		Short: "Serve the five MCP tools over stdio",
+		Short: "Serve five worker MCP tools and one orchestrator tool over stdio",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			parent := os.Getenv("BEACON_PARENT_SESSION")
 			w, err := wire(*configPath, parent)
@@ -30,7 +30,8 @@ func newMCPCommand(configPath *string) *cobra.Command {
 			defer w.close()
 
 			services := beaconmcp.Services{
-				Dispatcher: w.dispatcher, Control: w.control, Status: w.status, Wait: w.wait,
+				Dispatcher: w.dispatcher, Control: w.control, Status: w.status,
+				Wait: w.wait, TaskCreator: w.taskCreator,
 			}
 			if info, err := readConnection(filepath.Dir(w.cfg.StateDB)); err == nil && daemonAlive(w.cfg.StateDB) {
 				client := &remoteClient{info: info, http: &http.Client{Timeout: 5 * time.Second}}
