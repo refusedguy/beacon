@@ -329,14 +329,6 @@ func (h *StatsHandler) SetSharedGateSnapshotReader(r SharedGateSnapshotReader) {
 	h.sharedGate = r
 }
 
-// SetOutcomeReportEnabled opts the handler into the disjoint outcome report.
-// Off by default: a server that has not opted in keeps its previous loadErrors
-// bytes. The report is computed from the same snapshot as the counters, never
-// from a second store.
-func (h *StatsHandler) SetOutcomeReportEnabled(enabled bool) {
-	h.outcomeReport = enabled
-}
-
 // planLimitInfo computes the warning from used and budget. A missing or
 // non-positive budget reports OK rather than dividing by zero.
 func planLimitInfo(used, budget int) PlanLimitInfo {

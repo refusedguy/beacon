@@ -20,7 +20,7 @@ var deferredRunner = func(c *CLI, args []string) int { return runDeferred(c, arg
 func RegisterDeferred(fn func(*CLI, []string) int) { deferredRunner = fn }
 
 // deferredDeps is the single port the command consumes: the same DeferWriter
-// the MCP tool writes through. Tests install a fake with SetDeferredDeps.
+// the MCP tool writes through.
 type deferredDeps struct {
 	Writer mcp.DeferWriter
 	Done   deferredDoneWriter
@@ -35,15 +35,6 @@ type deferredDoneWriter interface {
 type deferredDepsFactory func(*CLI) (deferredDeps, func() error, error)
 
 var makeDeferredDeps deferredDepsFactory = defaultDeferredDeps
-
-// SetDeferredDeps replaces the dependency factory. Passing nil restores the
-// production factory.
-func SetDeferredDeps(fn deferredDepsFactory) {
-	if fn == nil {
-		fn = defaultDeferredDeps
-	}
-	makeDeferredDeps = fn
-}
 
 // deferredStoreDB is the part of *store.DB the adapter uses. Keeping it as an
 // interface lets tests drive the adapter with a fake and check the errors it

@@ -75,28 +75,10 @@ func (p *livePort) PromptWithOptions(ctx context.Context, sessionID, text string
 	return p.client.PromptWithOptions(ctx, sessionID, text, opts)
 }
 
-// serverEnsurer and its shims are kept only so older stand-in tests still
-// compile. No production path installs one: the client reads service.json
-// through Discover and never spawns a server (ADR 0029, ADR 0092).
-type serverEnsurer interface {
-	EnsureServer(context.Context) (opencode.Config, error)
-}
-
-type serverEnsurerFunc func(context.Context) (opencode.Config, error)
-
-func (f serverEnsurerFunc) EnsureServer(ctx context.Context) (opencode.Config, error) {
-	return f(ctx)
-}
-
-var installedServerEnsurer serverEnsurer
-
-// SetServerEnsurer installs a stand-in starter for tests only.
-func SetServerEnsurer(e serverEnsurer) { installedServerEnsurer = e }
-
-func resolveOpencodeConfig(ctx context.Context) (opencode.Config, error) {
-	if installedServerEnsurer != nil {
-		return installedServerEnsurer.EnsureServer(ctx)
-	}
+// resolveOpencodeConfig reads the registration written by opencode serve.
+// There is no fallback starter: Discover is the only source of the config
+// (ADR 0029, ADR 0092).
+func resolveOpencodeConfig() (opencode.Config, error) {
 	return opencode.Discover()
 }
 
@@ -143,7 +125,7 @@ func SetSessionCreator(c interface {
 // newOpencodePort resolves the registration and builds the one client. The
 // address and password come from Discover; no fallback starter is installed.
 func newOpencodePort() (opencodePort, error) {
-	cfg, err := resolveOpencodeConfig(context.Background())
+	cfg, err := resolveOpencodeConfig()
 	if err != nil {
 		return nil, err
 	}

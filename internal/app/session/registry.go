@@ -33,8 +33,7 @@ const (
 )
 
 // DefaultStaleTTL is how old a still-open session must be before
-// ReapStaleSessions treats it as stale. Callers can replace it with
-// SetStaleTTL.
+// ReapStaleSessions treats it as stale.
 const DefaultStaleTTL = 24 * time.Hour
 
 // SessionStore is the durable session port. SaveSession records a session,
@@ -225,14 +224,6 @@ func (r *SessionRegistry) Heartbeat(id string) error {
 		return ErrEmptyID
 	}
 	return r.store.Touch(id, r.clock().UTC())
-}
-
-// SetStaleTTL replaces the age past which a still-open session counts as
-// stale. A non-positive value makes ReapStaleSessions return no rows.
-func (r *SessionRegistry) SetStaleTTL(ttl time.Duration) {
-	if r != nil {
-		r.staleTTL = ttl
-	}
 }
 
 // CloseSession marks id closed at the registry's current time. It needs a

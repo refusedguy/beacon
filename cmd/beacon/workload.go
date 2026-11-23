@@ -25,9 +25,8 @@ var workloadRunner = func(c *CLI, args []string) int { return runWorkload(c, arg
 // RegisterWorkload installs the workload command implementation.
 func RegisterWorkload(fn func(*CLI, []string) int) { workloadRunner = fn }
 
-// workloadDeps is the single port the command consumes. Tests install a fake
-// with SetWorkloadDeps; production builds it from the state store and the
-// watch_pr registration handler.
+// workloadDeps is the single port the command consumes. Production builds it
+// from the state store and the watch_pr registration handler.
 type workloadDeps struct {
 	Store orchestrator.WorkloadStore
 }
@@ -35,15 +34,6 @@ type workloadDeps struct {
 type workloadDepsFactory func(*CLI) (workloadDeps, func() error, error)
 
 var makeWorkloadDeps workloadDepsFactory = defaultWorkloadDeps
-
-// SetWorkloadDeps replaces the dependency factory. Passing nil restores the
-// production factory.
-func SetWorkloadDeps(fn workloadDepsFactory) {
-	if fn == nil {
-		fn = defaultWorkloadDeps
-	}
-	makeWorkloadDeps = fn
-}
 
 // workloadStore adapts the state store and the watch_pr handler to the
 // WorkloadStore port. The handler's Register reuses an existing Watch by its

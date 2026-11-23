@@ -562,12 +562,11 @@ func (p *t3145BothPort) PromptWithOptions(context.Context, string, string, openc
 
 func t3145RestorePorts(t *testing.T) {
 	t.Helper()
-	previousLive, previousSpawn, previousDeliver, previousEnsurer := watchLiveSource, spawnSessionSpawner, deliverTarget, installedServerEnsurer
+	previousLive, previousSpawn, previousDeliver := watchLiveSource, spawnSessionSpawner, deliverTarget
 	t.Cleanup(func() {
 		SetLiveSource(previousLive)
 		SetSessionSpawner(previousSpawn)
 		SetDeliveryTarget(previousDeliver)
-		SetServerEnsurer(previousEnsurer)
 	})
 }
 
@@ -720,38 +719,6 @@ func TestT3145InstallOpenCodePortsInstallsBothWhenClientCanSpawn(t *testing.T) {
 	}
 	if spawnSessionSpawner != port {
 		t.Fatalf("spawn port = %#v, want the client itself", spawnSessionSpawner)
-	}
-	if deliverTarget == nil {
-		t.Fatal("delivery port was not installed by SetOpenCodePort")
-	}
-}
-
-// t3152FullPort is a stand-in for the client after T3.150 and T3.151 merge:
-// the reader port plus the POST routes plus the fallback server starter.
-type t3152FullPort struct {
-	*t3145BothPort
-	config       opencode.Config
-	ensurerCalls int
-}
-
-func (p *t3152FullPort) EnsureServer(context.Context) (opencode.Config, error) {
-	p.ensurerCalls++
-	return p.config, nil
-}
-
-func TestT3152InstallOpenCodePortsInstallsPostAndFallbackPorts(t *testing.T) {
-	t3145RestorePorts(t)
-	t.Cleanup(func() { SetServerEnsurer(nil) })
-	port := &t3152FullPort{
-		t3145BothPort: &t3145BothPort{t3145Port: &t3145Port{}},
-		config:        opencode.Config{URL: "http://127.0.0.1:64000"},
-	}
-
-	installOpenCodePorts(port)
-	SetOpenCodePort(port)
-
-	if spawnSessionSpawner != port {
-		t.Fatalf("spawn port = %#v, want the full stand-in", spawnSessionSpawner)
 	}
 	if deliverTarget == nil {
 		t.Fatal("delivery port was not installed by SetOpenCodePort")

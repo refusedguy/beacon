@@ -93,18 +93,6 @@ func NewService(cfg Config) *Service {
 	return &Service{Cfg: cfg, gateWaiters: noopGateWaiterRegistrar{}}
 }
 
-// SetGateWaiterRegistrar ставит порт регистрации ожидающих. Пустой аргумент
-// возвращает no-op.
-func (s *Service) SetGateWaiterRegistrar(reg GateWaiterRegistrar) {
-	if s == nil {
-		return
-	}
-	if reg == nil {
-		reg = noopGateWaiterRegistrar{}
-	}
-	s.gateWaiters = reg
-}
-
 // RegisterGateWaiter регистрирует ожидающего на гейте через установленный порт.
 func (s *Service) RegisterGateWaiter(ctx context.Context, gateID, waiterID string) error {
 	if s == nil {

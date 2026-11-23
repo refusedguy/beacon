@@ -260,15 +260,6 @@ type prcreateDepsFactory func(*CLI) (prcreateDeps, error)
 
 var makePRCreateDeps prcreateDepsFactory = defaultPRCreateDeps
 
-// SetPRCreateDeps replaces the dependency factory for tests. Passing nil
-// restores the production wiring.
-func SetPRCreateDeps(fn prcreateDepsFactory) {
-	if fn == nil {
-		fn = defaultPRCreateDeps
-	}
-	makePRCreateDeps = fn
-}
-
 func defaultPRCreateDeps(c *CLI) (prcreateDeps, error) {
 	client, err := github.NewPRClient(context.Background())
 	if err != nil {

@@ -130,14 +130,6 @@ func NewBus(journal Journal) *Bus {
 	return &Bus{journal: journal}
 }
 
-// SetIncludeHookEvents enables or disables hook phase mirroring on the bus.
-// The option is off by default; callers opt in before running hooks.
-func (b *Bus) SetIncludeHookEvents(enabled bool) {
-	b.mu.Lock()
-	b.hookEvents.IncludeHookEvents = enabled
-	b.mu.Unlock()
-}
-
 // includeHookEvents reports whether hook phases should be mirrored.
 func (b *Bus) includeHookEvents() bool {
 	b.mu.Lock()
