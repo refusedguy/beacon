@@ -18,6 +18,7 @@ func TestRunTransitions(t *testing.T) {
 		{"rebase", RunNeedsRebase, EvRebased, RunWaitingCI},
 		{"failed ci", RunWaitingCI, EvChecksFailed, RunNeedsAgentFix},
 		{"wake", RunNeedsAgentFix, EvAgentFixed, RunWaitingCI},
+		{"green checks", RunNeedsAgentFix, EvChecksPassed, RunWaitingCI},
 		{"merge", RunWaitingCI, EvMerged, RunMerged},
 		{"block", RunWaitingCI, EvBlock, RunBlocked},
 		{"unblock", RunBlocked, EvUnblock, RunWaitingCI},
