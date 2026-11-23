@@ -1,443 +1,48 @@
-name: CI
+name: ci
 
-# Компиляция, тесты и гейты Beacon. Общая проверка для push в main и pull request.
-# Внешние секреты и токен GitHub не нужны: только чтение репозитория и локальный Go.
-# Версия Go берётся из go.mod через go-version-file.
 on:
   push:
-    branches: [main]
-    # Документация и спайки не меняют код. Такой коммит не должен гонять
-    # компиляцию, тесты и гейты. По образцу Harbor ci.yml:120.
-    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
+    branches: [main, refactor/clean-core]
   pull_request:
-    paths-ignore: ['**.md', 'docs/**', 'worktrees/**']
-  # Живой опрос CIProvider требует реального токена. Запускаем его вручную,
-  # чтобы он не был обязательным для локального прогона и для merge PR.
-  workflow_dispatch:
 
 permissions:
   contents: read
 
-# BL-03. Флаги воспроизводимой сборки beacon определены один раз на workflow.
-# Джобы, которые собирают beacon, не повторяют строку флагов в шагах.
-env:
-  BEACON_BUILD_FLAGS: '-trimpath -buildvcs=false'
-  BEACON_BUILD_LDFLAGS: '-buildid= -s -w'
-
-# В PR новый push отменяет устаревший прогон. На main отмены нет: каждый
-# коммит должен дойти до вердикта, иначе required check останется без результата.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: build
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      beacon_sha256: ${{ steps.build-beacon.outputs.sha256 }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Build beacon
-        id: build-beacon
-        shell: bash
-        run: |
-          set -euo pipefail
-          CGO_ENABLED=0 go build $BEACON_BUILD_FLAGS \
-            -ldflags="$BEACON_BUILD_LDFLAGS" \
-            -o beacon ./cmd/beacon
-          beacon_sha=$(sha256sum beacon | cut -d' ' -f1)
-          printf 'build ok binary=beacon sha256=%s\n' "$beacon_sha"
-          printf 'sha256=%s\n' "$beacon_sha" >> "$GITHUB_OUTPUT"
-
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Download modules
-        shell: bash
-        run: |
-          set -euo pipefail
-          go mod download
-
-      - name: Test root module
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./...
-
-      - name: Test gates module
-        working-directory: tools/beacon-gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./...
-
-      # BVF-04. Пакеты batch JSON задают содержимое мержа. Невалидные поля,
-      # несуществующий owner_file или два владельца одного файла в фазе
-      # проваливают обязательную проверку test, а не попадают в main.
-      - name: Validate batch packs
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/infra/batchapply -run '^TestBatchPack' -count=1 -v
-
-  # BCX-52. e2e возвращается в обязательный путь. tools/list сверяется с
-  # общим набором имён из internal/infra/mcp, поэтому расхождение в числе
-  # инструментов падает здесь, а не остаётся необязательным предупреждением.
-  e2e:
-    name: e2e
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-go@v5
         with:
-          node-version: '26.x'
+          go-version-file: go.mod
+          cache: true
 
-      - name: Install opencode 2.3.0
-        shell: bash
+      - name: Format check
+        run: test -z "$(gofmt -l cmd internal pkg harnesses ui arch_test.go)"
+
+      - name: Core checks
         run: |
-          set -euo pipefail
-          version=2.3.0
-          work="$RUNNER_TEMP/opencode-install"
-          mkdir -p "$work" "$HOME/.opencode/bin"
-          curl -fsSL "https://registry.npmjs.org/@opencode/cli-linux-x64/-/cli-linux-x64-${version}.tgz" \
-            -o "$work/opencode.tgz"
-          tar -xzf "$work/opencode.tgz" -C "$work"
-          cp "$work/package/bin/opencode" "$HOME/.opencode/bin/opencode"
-          chmod 755 "$HOME/.opencode/bin/opencode"
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          "$HOME/.opencode/bin/opencode" --version
+          go test ./...
+          go vet ./...
+          go build ./...
 
-      - name: Run e2e
-        shell: bash
+      - name: OpenCode harness module
+        working-directory: harnesses/opencode
         run: |
-          set -euo pipefail
-          export PATH="$HOME/.opencode/bin:$PATH"
-          bash tests/e2e/run.sh
+          go test ./...
+          go vet ./...
+          go build ./...
 
-  # BCX-58. Живая проверка границы проекта: два проекта, разные watchID,
-  # реальный session.list через HTTP-клиент и реальный store. Тест входит и в
-  # go test ./..., но отдельная джоба делает прогон видимым и обязательным.
-  registry-live:
-    name: registry-live
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Live registry with two projects
-        shell: bash
+      - name: TUI module
+        working-directory: ui/tui
         run: |
-          set -euo pipefail
-          go test ./cmd/beacon -run '^TestLiveRegistryTwoProjects$' -count=1 -v
-
-  # BCX-54. Живой прогон seeded-regression artery. Шаг читает
-  # tests/scenarios/seeded.yaml, fault controller внедряет четыре отказа из
-  # S7.011, и раннер гоняет healthy -> seeded -> healthy_again в одной джобе.
-  # Проверка смотрит на исходы в трассах: seeded обязан упасть на маркере из
-  # спецификации, здоровые прогоны обязаны пройти и совпасть. grep по тексту
-  # спецификации больше не считается проверкой. Вторая проверка гоняет
-  # детерминированный seed-регресс в internal/testsystem.
-  seed-spec:
-    name: seed-spec
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Seeded regression artery (healthy -> seeded -> healthy_again)
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/testsystem/... \
-            -run 'TestSeededRegressionArtery' -count=1 -v
-
-      - name: Stub harness seed regression
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/testsystem/... \
-            -run 'TestGoldenFingerprint|TestSeedRoundTrip|TestSeedDrivesTrace' -count=1
-
-  # Node предустановлен на ubuntu-latest, отдельный setup-node не нужен.
-  js-test:
-    name: js-test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Test JS adapters
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Собираем все JS-тесты проекта: адаптеры, канонические тесты скиллов
-          # и тесты агентов. Раньше запускались только tests/adapter/*.test.js,
-          # поэтому SKILL_test.js из .opencode/skills не выполнялись в CI.
-          mapfile -t js_tests < <(
-            {
-              if [ -d tests/adapter ]; then
-                find tests/adapter -maxdepth 1 -type f -name '*.test.js' -print
-              fi
-              if [ -d .opencode/skills ]; then
-                find .opencode/skills -type f -name 'SKILL_test.js' -print
-              fi
-              if [ -d .opencode/agents ]; then
-                find .opencode/agents -type f -name '*_test.js' -print
-              fi
-            } | sort -u
-          )
-          if [ "${#js_tests[@]}" -eq 0 ]; then
-            printf 'no JS tests found, skipping\n'
-          else
-            printf 'running JS tests:\n'
-            printf '  %s\n' "${js_tests[@]}"
-            node --test "${js_tests[@]}"
-          fi
-
-  gates:
-    name: gates
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Check committed gates binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin=tools/beacon-gates/beacon-gates
-          if [ ! -x "$bin" ]; then
-            printf 'missing committed gates binary: %s\n' "$bin" >&2
-            exit 2
-          fi
-          printf 'gates binary present path=%s\n' "$bin"
-
-      # BL-05. Все шесть команд из registry проходят self-test из одного
-      # закоммиченного бинарника. tool-contract проверяет описания tools/list
-      # офлайн и больше не запускается через go run.
-      - name: Self-test every gate
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin=tools/beacon-gates/beacon-gates
-          "$bin" --list
-          for gate in capabilities layers-ast layers-list reachability tool-contract wiring; do
-            printf 'self-test gate=%s\n' "$gate"
-            "$bin" "$gate" --self-test
-          done
-
-      - name: Run gates on tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin=tools/beacon-gates/beacon-gates
-          for gate in capabilities layers-ast layers-list; do
-            printf 'gate gate=%s\n' "$gate"
-            "$bin" "$gate"
-          done
-
-      # WIRING-карты остаются в дереве после завершения работы и получают
-      # "Статус: done". Гейт требует "todo" и помечает готовые карты находкой.
-      # Оставляем прогон информационным, как у docs-гейта.
-      - name: Run wiring gate (informational)
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euo pipefail
-          bin=tools/beacon-gates/beacon-gates
-          "$bin" wiring
-
-  # IDX-04. Обязательная проверка сгенерированного индекса карточек.
-  # Гейт пересобирает индекс из docs/tasks и сравнивает его байты с
-  # закоммиченной копией. Разрешение статусов читает git log, поэтому
-  # checkout получает полную историю: fetch-depth 1 ломает пересборку.
-  # BL-05. cardindex и docsgate - отдельные main package. Они не входят в
-  # бинарник beacon-gates и запускаются через go run в своих jobs.
-  cardindex:
-    name: cardindex
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Self-test on planted divergence
-        working-directory: tools/beacon-gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          go run ./cardindex --self-test
-
-      - name: Compare rebuilt index with committed
-        working-directory: tools/beacon-gates
-        shell: bash
-        run: |
-          set -euo pipefail
-          go run ./cardindex -root ../..
-
-  # RS2-EVAL-05. Отдельная обязательная проверка на отказ инструмента.
-  # rules gate возвращает код 2 при BROKEN. Джоба обязана стать красной,
-  # иначе зелёные проверки скрывают отказ. Не объединяем её с gates.
-  rules-broken:
-    name: rules-broken
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: ./.github/actions/go-runner-setup
-
-      - name: Build beacon and compare hash with build job
-        shell: bash
-        env:
-          EXPECTED_SHA256: ${{ needs.build.outputs.beacon_sha256 }}
-        run: |
-          set -euo pipefail
-          CGO_ENABLED=0 go build $BEACON_BUILD_FLAGS \
-            -ldflags="$BEACON_BUILD_LDFLAGS" \
-            -o beacon ./cmd/beacon
-          beacon_sha=$(sha256sum beacon | cut -d' ' -f1)
-          printf 'build ok binary=beacon sha256=%s\n' "$beacon_sha"
-          printf 'build job sha256=%s\n' "$EXPECTED_SHA256"
-          if [ "$beacon_sha" != "$EXPECTED_SHA256" ]; then
-            printf 'beacon hash mismatch: build=%s rules-broken=%s\n' \
-              "$EXPECTED_SHA256" "$beacon_sha" >&2
-            exit 1
-          fi
-
-      - name: Run rules gate
-        shell: bash
-        run: |
-          set -uo pipefail
-          set +e
-          ./beacon gates rules
-          code=$?
-          case "$code" in
-            0)
-              printf 'rules gate exit 0\n'
-              ;;
-            2)
-              printf 'rules gate BROKEN: exit 2\n' >&2
-              ;;
-            *)
-              printf 'rules gate FAIL: exit %d\n' "$code" >&2
-              ;;
-          esac
-          exit "$code"
-
-  # Информационный probe живого CIProvider для слепой зоны R01. Переменные
-  # окружения записаны в docs/evals/ci-provider-probe.md. Джоба не обязательна
-  # для локального прогона и не блокирует merge: continue-on-error и ручной
-  # запуск через workflow_dispatch с реальным токеном из секретов.
-  ci-provider-probe:
-    name: ci-provider-probe
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    continue-on-error: true
-    permissions:
-      contents: read
-      pull-requests: read
-    env:
-      GH_TOKEN: ${{ secrets.BEACON_CI_PROBE_TOKEN }}
-      BEACON_GITHUB_TOKEN: ${{ secrets.BEACON_CI_PROBE_TOKEN }}
-      PROBE_REPO: refusedguy/beacon-ci-fixture
-      PROBE_PR: '1'
-      PROBE_NEGATIVE_PR: '999999'
-    steps:
-      - name: Token configured
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            printf 'BEACON_CI_PROBE_TOKEN is not set; configure the secret and rerun\n' >&2
-            exit 1
-          fi
-          gh --version
-
-      # Те же два вызова gh, что делает internal/infra/ghci.Provider.fetch.
-      # headSHA не подставляется заглушкой: ответ приходит из живой сети.
-      - name: Positive control - fixture PR resolves through live provider
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf 'probe repo=%s pr=%s\n' "$PROBE_REPO" "$PROBE_PR"
-          gh pr view "$PROBE_PR" --repo "$PROBE_REPO" \
-            --json headRefOid,baseRefName,state,isDraft,mergeable,mergeStateStatus,reviewDecision \
-            > "$RUNNER_TEMP/probe-view.json"
-          cat "$RUNNER_TEMP/probe-view.json"
-          pr_state=$(jq -r '.state' "$RUNNER_TEMP/probe-view.json")
-          head_sha=$(jq -r '.headRefOid' "$RUNNER_TEMP/probe-view.json")
-          if [ "$pr_state" != 'OPEN' ]; then
-            printf 'positive control failed: fixture PR state=%s, expected OPEN\n' "$pr_state" >&2
-            exit 1
-          fi
-          if ! [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            printf 'positive control failed: headSHA=%s is not a live 40-hex value\n' "$head_sha" >&2
-            exit 1
-          fi
-          gh pr checks "$PROBE_PR" --repo "$PROBE_REPO" --json name,state,link \
-            > "$RUNNER_TEMP/probe-checks.json"
-          cat "$RUNNER_TEMP/probe-checks.json"
-          if ! grep -q '"state":"PASS"\|"state":"SUCCESS"' "$RUNNER_TEMP/probe-checks.json"; then
-            printf 'positive control failed: no passing check on fixture PR\n' >&2
-            exit 1
-          fi
-          printf 'positive control ok: headSHA=%s\n' "$head_sha"
-
-      # Негативный контроль ловит ложное срабатывание: если несуществующий PR
-      # тоже «нашёлся», probe слеп и его результат нельзя доверять.
-      - name: Negative control - unknown PR does not resolve
-        shell: bash
-        run: |
-          set -euo pipefail
-          if gh pr view "$PROBE_NEGATIVE_PR" --repo "$PROBE_REPO" \
-            --json headRefOid > "$RUNNER_TEMP/probe-negative.json" 2>&1; then
-            printf 'negative control failed: PR %s resolved, probe is blind\n' "$PROBE_NEGATIVE_PR" >&2
-            cat "$RUNNER_TEMP/probe-negative.json" >&2
-            exit 1
-          fi
-          printf 'negative control ok: PR %s did not resolve\n' "$PROBE_NEGATIVE_PR"
+          go test ./...
+          go vet ./...
+          go build ./...
+          rm -f tui

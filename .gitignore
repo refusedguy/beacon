@@ -1,41 +1,24 @@
-# Спайки и временные замеры остаются в рабочем дереве, не коммитятся.
-tmp/
+# Go build artifacts
+*.exe
+*.test
+*.out
+ui/tui/tui
 
-# Рабочие каталоги агентов. Живут локально, в репозиторий не идут.
-worktrees/*/
-
-# Общий кэш зависимостей для worktree (ADR 0030 п5, T3.15).
-# Символические ссылки в worktree и общее хранилище в корне не коммитятся.
-node_modules
-.deps-cache/
-
-# Локальные состояния и замки.
-*.db
-*.db-wal
-*.db-shm
-beacon.sock
-*.lock
-
-# Бинарники. Гейты коммитим намеренно, по Harbor и ADR 0016.
+# Local binaries and runtime state
 /beacon
 bin/
-
-# Производные документы: создаются генераторами по запросу, в git не коммитятся (IDX-11).
-docs/FACTS.md
-docs/adrs/README.md
-docs/ROADMAP_STATUS.md
-
-# Отчёты исследований: временные снимки суб-агентов, в репозиторий не идут (BCX-10).
-# Новые отчёты не коммитятся и не показываются в git status.
-# Уже закоммиченные отчёты остаются в истории; нужный отчёт добавляют через git add -f.
-docs/research/
-
-# Beacon runtime state
+.opencode/bin/beacon
 .beacon/state.db*
 .beacon/worktrees/
 .beacon/connection.json
 .beacon/*.lock
 
-ui/tui/tui
+# Caches and logs
+.gocache/
+.gotmp/
+logs/
+tmp/
+node_modules/
 
-.opencode/bin/beacon
+# OS files
+.DS_Store
