@@ -1384,3 +1384,132 @@ func TestDaemonWakerConcurrentSameObligationDeliveredOnce(t *testing.T) {
 		t.Fatalf("obligation was delivered %d times, want 1", 1+extra)
 	}
 }
+
+// A Watch that stops receiving daemon passes is closed for delivery purposes.
+// Once the replay window passes, its keys must leave the in-memory ledger while
+// a Watch that still gets passes keeps its repeat suppression.
+func TestDaemonWakerPrunesDeliveredKeysOfClosedWatch(t *testing.T) {
+	base := time.Date(2026, time.November, 23, 12, 0, 0, 0, time.UTC)
+	now := base
+	watches := map[string]DaemonWatch{
+		"w-closed": {ID: "w-closed", Adapter: WakeDefaultAdapter, SubscriberID: "ses_closed"},
+		"w-live":   {ID: "w-live", Adapter: WakeDefaultAdapter, SubscriberID: "ses_live"},
+	}
+	adapter := &daemonRecordingAdapter{}
+	w := &daemonWaker{
+		lookup:  func(id string) (DaemonWatch, error) { return watches[id], nil },
+		backend: adapter,
+		clock:   func() time.Time { return now },
+	}
+	ctx := context.Background()
+	for _, id := range []string{"w-closed", "w-live"} {
+		if err := w.Wake(ctx, id, 1, VerdictRetry); err != nil {
+			t.Fatalf("Wake(%s): %v", id, err)
+		}
+	}
+	closedKey := obligationKey("w-closed", 1, "ses_closed")
+	liveKey := obligationKey("w-live", 1, "ses_live")
+	if !daemonWakeAlreadyExists(w, closedKey) || !daemonWakeAlreadyExists(w, liveKey) {
+		t.Fatal("both obligations must be recorded before pruning")
+	}
+
+	// Only the live Watch gets another pass. The repeat is suppressed, but it
+	// still proves the Watch is active.
+	now = base.Add(time.Hour)
+	if err := w.Wake(ctx, "w-live", 1, VerdictRetry); err != nil {
+		t.Fatalf("repeat Wake(w-live): %v", err)
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("Deliver calls = %d, want 2 for two obligations", adapter.calls)
+	}
+
+	now = base.Add(deliveredKeyRetention + 30*time.Minute)
+	if removed := w.PruneDeliveredKeys(); removed != 1 {
+		t.Fatalf("pruned keys = %d, want 1", removed)
+	}
+	if daemonWakeAlreadyExists(w, closedKey) {
+		t.Fatal("closed Watch key survived the replay window")
+	}
+	if !daemonWakeAlreadyExists(w, liveKey) {
+		t.Fatal("live Watch key was pruned")
+	}
+	if len(w.deliveredKeys) != 1 {
+		t.Fatalf("deliveredKeys size = %d, want 1", len(w.deliveredKeys))
+	}
+	if again := w.PruneDeliveredKeys(); again != 0 {
+		t.Fatalf("second prune removed %d keys, want 0", again)
+	}
+	if err := w.Wake(ctx, "w-live", 1, VerdictRetry); err != nil {
+		t.Fatalf("post-prune Wake(w-live): %v", err)
+	}
+	if adapter.calls != 2 {
+		t.Fatalf("post-prune repeat delivered again: calls = %d, want 2", adapter.calls)
+	}
+}
+
+// The ledger must not grow with the number of Watches that open, get one
+// delivery and close in sequence.
+func TestDaemonWakerDeliveredKeysStayBoundedAcrossClosedWatches(t *testing.T) {
+	base := time.Date(2026, time.November, 23, 12, 0, 0, 0, time.UTC)
+	now := base
+	watches := map[string]DaemonWatch{}
+	adapter := &daemonRecordingAdapter{}
+	w := &daemonWaker{
+		lookup:  func(id string) (DaemonWatch, error) { return watches[id], nil },
+		backend: adapter,
+		clock:   func() time.Time { return now },
+	}
+	ctx := context.Background()
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("w-seq-%d", i)
+		watches[id] = DaemonWatch{ID: id, Adapter: WakeDefaultAdapter, SubscriberID: "ses_" + id}
+		if err := w.Wake(ctx, id, 1, VerdictRetry); err != nil {
+			t.Fatalf("Wake(%s): %v", id, err)
+		}
+		if len(w.deliveredKeys) != 1 {
+			t.Fatalf("after wake %d: deliveredKeys = %d, want 1", i, len(w.deliveredKeys))
+		}
+		now = now.Add(deliveredKeyRetention + time.Hour)
+		w.PruneDeliveredKeys()
+		if len(w.deliveredKeys) != 0 {
+			t.Fatalf("after prune %d: deliveredKeys = %d, want 0", i, len(w.deliveredKeys))
+		}
+	}
+	if adapter.calls != 6 {
+		t.Fatalf("Deliver calls = %d, want 6", adapter.calls)
+	}
+}
+
+// The daemon pass prunes through the optional Waker capability right after
+// its close step. No composition-root change is needed for the hook to run.
+func TestDaemonRunPrunesDeliveredKeysAfterCloseStep(t *testing.T) {
+	base := time.Date(2026, time.November, 23, 12, 0, 0, 0, time.UTC)
+	now := base
+	adapter := &daemonRecordingAdapter{}
+	w := &daemonWaker{
+		lookup: func(string) (DaemonWatch, error) {
+			return DaemonWatch{ID: "w-pass", Adapter: WakeDefaultAdapter, SubscriberID: "ses_pass"}, nil
+		},
+		backend: adapter,
+		clock:   func() time.Time { return now },
+	}
+	ctx := context.Background()
+	if err := w.Wake(ctx, "w-pass", 1, VerdictRetry); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	key := obligationKey("w-pass", 1, "ses_pass")
+	if !daemonWakeAlreadyExists(w, key) {
+		t.Fatal("obligation must be recorded before the daemon pass")
+	}
+
+	now = base.Add(deliveredKeyRetention + time.Hour)
+	check := &daemonCheckAll{}
+	orch := &daemonOrchestrator{custom: func(context.Context, Waker) error { return nil }}
+	ports := daemonPorts(check, orch, &daemonCloser{}, w, nil)
+	if err := DaemonRun(ctx, ports, time.Hour, true); err != nil {
+		t.Fatalf("DaemonRun: %v", err)
+	}
+	if daemonWakeAlreadyExists(w, key) {
+		t.Fatal("daemon pass did not prune the closed Watch key")
+	}
+}
