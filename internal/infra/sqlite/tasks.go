@@ -15,6 +15,8 @@ var taskColumns = []struct{ name, ddl string }{
 	{"base_branch", "base_branch TEXT NOT NULL DEFAULT ''"},
 	{"require_review", "require_review TEXT NOT NULL DEFAULT ''"},
 	{"plan_json", "plan_json TEXT NOT NULL DEFAULT '[]'"},
+	{"worker_agent", "worker_agent TEXT NOT NULL DEFAULT ''"},
+	{"worker_prompt", "worker_prompt TEXT NOT NULL DEFAULT ''"},
 }
 
 func (s *Store) ensureTaskColumns(ctx context.Context) error {
@@ -82,9 +84,9 @@ func (s *Store) SyncTasks(ctx context.Context, tasks []core.Task) error {
 			kind = "task"
 		}
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, base_branch, require_review, plan_json)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
-			kind, t.BaseBranch, string(t.RequireReview), string(plan)); err != nil {
+INSERT INTO tasks(id, title, body, status, priority, scope_json, source_ref, updated_at, kind, base_branch, require_review, plan_json, worker_agent, worker_prompt)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, string(t.ID), t.Title, t.Body, status, t.Priority, string(scope), t.SourceRef, nowUnix(),
+			kind, t.BaseBranch, string(t.RequireReview), string(plan), t.WorkerAgent, t.WorkerPrompt); err != nil {
 			return err
 		}
 		for _, dep := range t.DependsOn {
@@ -109,7 +111,7 @@ WITH RECURSIVE blocked_chain(task_id, origin, depth) AS (
   JOIN tasks t ON t.id = d.depends_on
   WHERE t.status NOT IN ('done', 'dropped') AND b.depth < 64
 )
-SELECT id, title, body, priority, scope_json, source_ref, kind, base_branch, require_review, plan_json
+SELECT id, title, body, priority, scope_json, source_ref, kind, base_branch, require_review, plan_json, worker_agent, worker_prompt
 FROM tasks
 WHERE status IN ('available', 'todo')
   AND id NOT IN (SELECT task_id FROM blocked_chain)
@@ -132,10 +134,10 @@ func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 	var out []core.Task
 	for rows.Next() {
 		var t core.Task
-		var id, scopeJSON, source, kind, review, planJSON string
+		var id, scopeJSON, source, kind, review, planJSON, workerAgent, workerPrompt string
 		var base sql.NullString
 		if err := rows.Scan(&id, &t.Title, &t.Body, &t.Priority, &scopeJSON, &source,
-			&kind, &base, &review, &planJSON); err != nil {
+			&kind, &base, &review, &planJSON, &workerAgent, &workerPrompt); err != nil {
 			return nil, err
 		}
 		t.ID = core.TaskID(id)
@@ -144,6 +146,8 @@ func (s *Store) ListReadyTasks(ctx context.Context) ([]core.Task, error) {
 		t.Kind = core.TaskKind(kind)
 		t.BaseBranch = base.String
 		t.RequireReview = core.ReviewMode(review)
+		t.WorkerAgent = workerAgent
+		t.WorkerPrompt = workerPrompt
 		if err := json.Unmarshal([]byte(scopeJSON), &t.Scope); err != nil {
 			return nil, err
 		}
