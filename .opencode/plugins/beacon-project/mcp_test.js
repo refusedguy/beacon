@@ -1,4 +1,4 @@
-// Tests for the beacon MCP command resolver and build-hash watchdog.
+// Tests for the beacon MCP command resolver.
 // Run: node --test .opencode/plugins/beacon-project/mcp_test.js
 
 import { test } from "node:test"
@@ -6,11 +6,11 @@ import assert from "node:assert/strict"
 import { delimiter, join } from "node:path"
 import {
   beaconCommand,
+  beaconServerConfig,
   registerBeaconMcp,
+  BEACON_PROJECT_ROOT_ENV,
   BEACON_BUILD_SCRIPT,
   BUILD_HASH_FLAG,
-  BUILD_HASH_POLL_MS,
-  RELOAD_DEBOUNCE_MS,
 } from "./mcp.js"
 
 const ROOT = "/project"
@@ -58,13 +58,15 @@ function localBinaryDeps(overrides = {}) {
 
 function fakeCtx() {
   const reloads = []
+  let disposed = 0
   const editor = { set() {}, update(name, apply) { apply({}) } }
   return {
     reloads,
+    get disposed() { return disposed },
     mcp: {
       async transform(apply) {
         apply(editor)
-        return { dispose() {} }
+        return { dispose() { disposed += 1 } }
       },
       async reload() {
         reloads.push(true)
@@ -73,45 +75,8 @@ function fakeCtx() {
   }
 }
 
-function ctxThatReresolves() {
-  const ctx = fakeCtx()
-  let applyTransform
-  ctx.mcp.transform = (apply) => {
-    applyTransform = apply
-    apply({ set() {}, update() {} })
-    return Promise.resolve({ dispose() {} })
-  }
-  ctx.mcp.reload = async () => {
-    ctx.reloads.push(true)
-    applyTransform({ set() {}, update() {} })
-  }
-  return ctx
-}
-
 function buildCalls(deps) {
   return deps.execCalls.filter((call) => call.cmd === "bash" && !call.args.includes(BUILD_HASH_FLAG))
-}
-
-function hashCalls(deps) {
-  return deps.execCalls.filter((call) => call.cmd === "bash" && call.args.includes(BUILD_HASH_FLAG))
-}
-
-function gitCalls(deps) {
-  return deps.execCalls.filter((call) => call.cmd === "git")
-}
-
-function recorded(deps) {
-  const { sha } = localPaths()
-  return String(deps.readFileSync(sha, "utf8")).trim()
-}
-
-function enableTimers(t) {
-  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] })
-}
-
-async function flush() {
-  await Promise.resolve()
-  await Promise.resolve()
 }
 
 test("local binary with a matching build hash is used without a rebuild", () => {
@@ -191,125 +156,34 @@ test("an empty PATH segment is skipped", () => {
   assert.deepEqual(beaconCommand(ROOT, deps), [join(dir, "beacon"), "mcp"])
 })
 
-test("reload debounce is at least ten seconds", () => {
-  assert.ok(RELOAD_DEBOUNCE_MS >= 10000)
-})
-
-test("a HEAD-only change does not rebuild or reload", async (t) => {
-  enableTimers(t)
-  let head = "commit0"
-  const ctx = ctxThatReresolves()
-  const deps = localBinaryDeps({ head: () => head })
-
-  await registerBeaconMcp(ctx, ROOT, deps)
-  assert.equal(buildCalls(deps).length, 0)
-
-  head = "commit1"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS * 5)
-  await flush()
-
-  assert.equal(gitCalls(deps).length, 0)
-  assert.ok(hashCalls(deps).length >= 5)
-  assert.equal(buildCalls(deps).length, 0)
-  assert.equal(ctx.reloads.length, 0)
-})
-
-test("a source change rebuilds once and reloads once after the debounce", async (t) => {
-  enableTimers(t)
-  let hash = "h0"
-  const ctx = ctxThatReresolves()
-  const deps = localBinaryDeps({ hash: () => hash })
-
-  await registerBeaconMcp(ctx, ROOT, deps)
-  assert.equal(buildCalls(deps).length, 0)
-
-  hash = "h1"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS)
-  assert.equal(ctx.reloads.length, 0, "no reload before the debounce")
-  assert.equal(buildCalls(deps).length, 0, "no rebuild before the debounce")
-
-  t.mock.timers.tick(RELOAD_DEBOUNCE_MS - 1)
-  assert.equal(ctx.reloads.length, 0, "still inside the debounce window")
-
-  t.mock.timers.tick(1)
-  await flush()
-
-  assert.equal(ctx.reloads.length, 1)
-  assert.equal(buildCalls(deps).length, 1)
-  assert.equal(recorded(deps), "h1")
-})
-
-test("rapid successive source changes cause one reload", async (t) => {
-  enableTimers(t)
-  let hash = "h0"
-  const ctx = ctxThatReresolves()
-  const deps = localBinaryDeps({ hash: () => hash })
-
-  await registerBeaconMcp(ctx, ROOT, deps)
-
-  hash = "h1"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS)
-  hash = "h2"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS)
-  hash = "h3"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS)
-  t.mock.timers.tick(RELOAD_DEBOUNCE_MS)
-  await flush()
-
-  assert.equal(ctx.reloads.length, 1)
-  assert.equal(buildCalls(deps).length, 1)
-  assert.equal(recorded(deps), "h3")
-
-  t.mock.timers.tick(BUILD_HASH_POLL_MS * 5)
-  await flush()
-  assert.equal(ctx.reloads.length, 1)
-  assert.equal(buildCalls(deps).length, 1)
-})
-
-test("watchdog is skipped when BEACON_BIN is set", async (t) => {
-  enableTimers(t)
-  const explicit = "/custom/beacon"
-  const { local, sha } = localPaths()
-  const ctx = ctxThatReresolves()
-  const deps = fakeDeps({
-    files: { [local]: "binary", [sha]: "h0\n", [explicit]: "binary" },
-    hash: "h0",
-    env: { BEACON_BIN: explicit },
-  })
-
-  await registerBeaconMcp(ctx, ROOT, deps)
-  t.mock.timers.tick(BUILD_HASH_POLL_MS * 5)
-  await flush()
-
-  assert.equal(deps.execCalls.length, 0)
-  assert.equal(ctx.reloads.length, 0)
-})
-
-test("watchdog does not reload before registration completes", async (t) => {
-  enableTimers(t)
-  let hash = "h0"
-  let releaseTransform
+test("registration sets the server once without starting a watcher or reload", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] })
   const ctx = fakeCtx()
-  ctx.mcp.transform = (apply) => new Promise((resolve) => {
-    releaseTransform = () => {
-      apply({ set() {}, update() {} })
-      resolve({ dispose() {} })
-    }
-  })
+  let hash = "h0"
   const deps = localBinaryDeps({ hash: () => hash })
 
-  const registering = registerBeaconMcp(ctx, ROOT, deps)
+  const result = await registerBeaconMcp(ctx, ROOT, deps)
+  assert.equal(typeof result.registration.dispose, "function")
+
   hash = "h1"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS * 5)
-  assert.equal(ctx.reloads.length, 0)
+  t.mock.timers.tick(60_000)
+  await Promise.resolve()
+  await Promise.resolve()
 
-  releaseTransform()
-  await registering
   assert.equal(ctx.reloads.length, 0)
+  result.registration.dispose()
+  assert.equal(ctx.disposed, 1)
+})
 
-  hash = "h2"
-  t.mock.timers.tick(BUILD_HASH_POLL_MS)
-  t.mock.timers.tick(RELOAD_DEBOUNCE_MS)
-  await flush()
-  assert.equal(ctx.reloads.length, 1)
+test("server config carries the project root and enables the server", () => {
+  const { local } = localPaths()
+  const deps = localBinaryDeps()
+  const config = beaconServerConfig(ROOT, deps)
+
+  assert.equal(config.type, "local")
+  assert.deepEqual(config.command, [local, "mcp"])
+  assert.equal(config.cwd, ROOT)
+  assert.equal(config.environment[BEACON_PROJECT_ROOT_ENV], ROOT)
+  assert.equal(config.disabled, false)
+  assert.throws(() => beaconServerConfig("", deps), /project root is required/)
 })

@@ -6,8 +6,6 @@ export const BEACON_SERVER = "beacon"
 export const BEACON_PROJECT_ROOT_ENV = "BEACON_PROJECT_ROOT"
 export const BEACON_BUILD_SCRIPT = "scripts/build-beacon.sh"
 export const BUILD_HASH_FLAG = "--hash"
-export const BUILD_HASH_POLL_MS = 3000
-export const RELOAD_DEBOUNCE_MS = 10000
 
 const defaultDeps = {
   env: process.env,
@@ -15,12 +13,6 @@ const defaultDeps = {
   readFileSync: fsReadFileSync,
   execFileSync: defaultExecFileSync,
 }
-
-// Shared watchdog state. A new registration resets it so one source change
-// causes exactly one rebuild and one reload.
-let lastBuildHash = null
-let pollWatcher = null
-let reloadTimer = null
 
 function pathBinary(name, deps) {
   for (const dir of (deps.env.PATH ?? "").split(delimiter)) {
@@ -110,74 +102,17 @@ export function beaconServerConfig(root, deps = defaultDeps) {
   })
 }
 
-function stopWatchdog() {
-  if (pollWatcher !== null) {
-    pollWatcher.clear(pollWatcher.handle)
-    pollWatcher = null
-  }
-  if (reloadTimer !== null) {
-    reloadTimer.clear(reloadTimer.handle)
-    reloadTimer = null
-  }
-  lastBuildHash = null
-}
-
-function scheduleReload(ctx) {
-  if (reloadTimer !== null) reloadTimer.clear(reloadTimer.handle)
-  const setTimer = globalThis.setTimeout
-  const clearTimer = globalThis.clearTimeout
-  const handle = setTimer(() => {
-    reloadTimer = null
-    void (async () => {
-      try {
-        await ctx.mcp.reload()
-      } catch (error) {
-        console.warn(`beacon MCP: reload after source change failed: ${error.message}`)
-      }
-    })()
-  }, RELOAD_DEBOUNCE_MS)
-  reloadTimer = { handle, clear: clearTimer }
-  if (typeof handle?.unref === "function") handle.unref()
-}
-
-function watchBuildHash(ctx, root, deps) {
-  if (deps.env.BEACON_BIN) return
-  stopWatchdog()
-  lastBuildHash = currentBuildHash(root, deps)
-  const setTimer = globalThis.setInterval
-  const clearTimer = globalThis.clearInterval
-  const handle = setTimer(() => {
-    const hash = currentBuildHash(root, deps)
-    if (!hash || hash === lastBuildHash) return
-    lastBuildHash = hash
-    scheduleReload(ctx)
-  }, BUILD_HASH_POLL_MS)
-  pollWatcher = { handle, clear: clearTimer }
-  if (typeof handle?.unref === "function") handle.unref()
-}
-
 export async function registerBeaconMcp(ctx, root, deps = defaultDeps) {
-  let current = root
   const registration = await ctx.mcp.transform((editor) => {
-    editor.set(BEACON_SERVER, beaconServerConfig(current, deps))
+    editor.set(BEACON_SERVER, beaconServerConfig(root, deps))
     editor.update(BEACON_SERVER, (server) => {
-      server.cwd = current
+      server.cwd = root
       server.environment = {
         ...(server.environment ?? {}),
-        [BEACON_PROJECT_ROOT_ENV]: current,
+        [BEACON_PROJECT_ROOT_ENV]: root,
       }
       server.disabled = false
     })
   })
-
-  watchBuildHash(ctx, root, deps)
-
-  return {
-    registration,
-    async setRoot(next) {
-      if (typeof next !== "string" || next === current) return
-      current = next
-      await ctx.mcp.reload()
-    },
-  }
+  return { registration }
 }
