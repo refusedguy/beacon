@@ -130,6 +130,101 @@ func TestPlanWaveEmpty(t *testing.T) {
 	}
 }
 
+// TestLaunchPlanWaitsForSequentialSteps covers a plan with a sequential step,
+// a parallel step and another sequential step. The second sequential step may
+// start only after the first one finishes. The parallel elements start together
+// and share the admission slot until the test releases them.
+func TestLaunchPlanWaitsForSequentialSteps(t *testing.T) {
+	lock := newAdmissionLock()
+	plan := wavePlan{Steps: []giantStep{
+		{Cards: []string{"G1"}, Sequential: true},
+		{Cards: []string{"P1", "P2"}},
+		{Cards: []string{"G2"}, Sequential: true},
+	}}
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	parallelStarted := make(chan string, 2)
+	releaseParallel := make(chan struct{})
+	secondStarted := make(chan struct{})
+
+	work := func(card string, child context.Context) {
+		switch card {
+		case "G1":
+			close(firstStarted)
+			select {
+			case <-releaseFirst:
+			case <-child.Done():
+			}
+		case "P1", "P2":
+			parallelStarted <- card
+			select {
+			case <-releaseParallel:
+			case <-child.Done():
+			}
+		case "G2":
+			close(secondStarted)
+		}
+	}
+
+	returned := make(chan []*abortHandle, 1)
+	go func() {
+		returned <- launchPlan(context.Background(), lock, plan, admissionGuard{}, work)
+	}()
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first sequential element did not start")
+	}
+
+	select {
+	case <-returned:
+		t.Fatal("launchPlan returned before the first sequential element finished")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second sequential element started before the first finished")
+	case card := <-parallelStarted:
+		t.Fatalf("parallel element %s started before the first finished", card)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseFirst)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-parallelStarted:
+		case <-time.After(time.Second):
+			t.Fatal("both parallel elements did not start")
+		}
+	}
+
+	select {
+	case <-secondStarted:
+		t.Fatal("second sequential element started while parallel elements held the slot")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseParallel)
+
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second sequential element did not start after the parallel step")
+	}
+
+	var handles []*abortHandle
+	select {
+	case handles = <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("launchPlan did not return after all steps finished")
+	}
+	if len(handles) != 4 {
+		t.Fatalf("handles = %d, want 4", len(handles))
+	}
+}
+
 // TestAdmissionLockParallelShareSlotAndExclusiveWaits covers the admission
 // contract. Two parallel actions run together, and the exclusive action waits
 // for both of them before it starts.

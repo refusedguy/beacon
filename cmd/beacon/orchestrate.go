@@ -866,7 +866,9 @@ func launchElement(
 // launchPlan binds one abort handle to every element of every step. Handles
 // are recorded before the next element launches, so a parent cancellation
 // leaves a handle for each element that started. Elements that did not start
-// are omitted. The order matches the plan order.
+// are omitted. The order matches the plan order. A sequential step waits for
+// its elements before the next step launches. Parallel steps keep launching
+// without a wait, and admissionLock still holds sequential actions exclusive.
 func launchPlan(
 	ctx context.Context,
 	lock *admissionLock,
@@ -876,6 +878,7 @@ func launchPlan(
 ) []*abortHandle {
 	var handles []*abortHandle
 	for _, step := range plan.Steps {
+		var stepHandles []*abortHandle
 		for _, card := range step.Cards {
 			action := dispatchAction{Card: card, SupportsParallel: !step.Sequential}
 			h, result := launchElement(ctx, lock, action, guard, func(child context.Context) {
@@ -883,6 +886,12 @@ func launchPlan(
 			})
 			if result.Started {
 				handles = append(handles, h)
+				stepHandles = append(stepHandles, h)
+			}
+		}
+		if step.Sequential {
+			for _, h := range stepHandles {
+				<-h.Done()
 			}
 		}
 	}
