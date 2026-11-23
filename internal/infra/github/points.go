@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/refusedguy/beacon/internal/domain"
+	"github.com/refusedguy/beacon/internal/infra/observe"
 )
 
 // BudgetPerHour is the hard point budget shared by the REST and GraphQL clients.
@@ -103,16 +104,9 @@ func (c *Counter) Reconcile(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Minute
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_ = c.Sync(ctx)
-		}
-	}
+	observe.RunTicker(ctx, interval, func(ctx context.Context) {
+		_ = c.Sync(ctx)
+	})
 }
 
 // Add records the cost of a response and returns the new point total.

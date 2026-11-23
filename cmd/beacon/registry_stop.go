@@ -360,15 +360,7 @@ func (s registryStopDBStore) SaveState(want registryStopSelection) error {
 // registryStopOpenStore opens the read-only store of a checked stop. It is a
 // seam so tests can replace the database with a stand-in (ADR 0091).
 var registryStopOpenStore = func() (registryStopStore, func() error, error) {
-	dir, err := stateDir()
-	if err != nil {
-		return nil, nil, err
-	}
-	db, err := openProcessStore(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-	return registryStopDBStore{db: db}, func() error { return db.Close() }, nil
+	return openStateDB(func(db *store.DB) registryStopStore { return registryStopDBStore{db: db} })
 }
 
 // runRegistry dispatches the registry subcommands. T5.56 owns stop and T5.55

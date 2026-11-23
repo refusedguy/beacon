@@ -518,6 +518,18 @@ func runDaemonReminders(ctx context.Context, db *store.DB, interval time.Duratio
 	orchestrator.RunNotifyLoop(ctx, daemonReminderNotify(notifier), interval)
 }
 
+// flagExplicit reports whether the command line set the named flag. An
+// explicit flag keeps its value when an environment override is present.
+func flagExplicit(fs *flag.FlagSet, name string) bool {
+	explicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			explicit = true
+		}
+	})
+	return explicit
+}
+
 // runDaemon implements `beacon daemon`. The pass interval uses
 // daemonIntervalDefault and daemonIntervalDescription, so the flag and the
 // CLI usage text describe the same value. It runs the same single cibridge
@@ -536,13 +548,7 @@ func runDaemon(c *CLI, args []string) int {
 	}
 	// An explicit --interval wins over the env override. Without one, the env
 	// value sets the cadence before the adaptive default applies.
-	intervalExplicit := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "interval" {
-			intervalExplicit = true
-		}
-	})
-	if !intervalExplicit {
+	if !flagExplicit(fs, "interval") {
 		if fromEnv, ok := daemonIntervalFromEnv(); ok {
 			*interval = fromEnv
 		}
@@ -1012,15 +1018,8 @@ func runDaemonCardMonitor(ctx context.Context, monitor *tasks.Monitor, db *store
 	if interval <= 0 {
 		interval = daemonCardPollInterval
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			daemonMaintenance(ctx, db)
-			daemonPollCards(ctx, monitor, db, root)
-		}
-	}
+	observe.RunTicker(ctx, interval, func(ctx context.Context) {
+		daemonMaintenance(ctx, db)
+		daemonPollCards(ctx, monitor, db, root)
+	})
 }

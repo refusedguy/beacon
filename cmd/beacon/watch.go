@@ -277,13 +277,7 @@ func runWatch(c *CLI, args []string, liveDeps ...watchLiveDeps) int {
 		return 2
 	}
 	// An explicit --interval wins over the env override.
-	intervalExplicit := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "interval" {
-			intervalExplicit = true
-		}
-	})
-	if !intervalExplicit {
+	if !flagExplicit(fs, "interval") {
 		if fromEnv, ok := watchIntervalFromEnv(); ok {
 			*interval = fromEnv
 		}

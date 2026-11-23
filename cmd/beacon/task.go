@@ -929,28 +929,30 @@ func runTaskLease(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) i
 	}
 }
 
-func leaseAgent(stderr io.Writer, p *parsedArgs) (string, bool) {
+// parseLeaseArgs parses a lease subcommand's flags and resolves --agent. The
+// three lease runners used to build the same validation errors inline; callers
+// keep one error path through failTask.
+func parseLeaseArgs(argv []string, flags, bools map[string]bool) (*parsedArgs, string, error) {
+	p, err := parseTaskArgs(argv, flags, bools)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(p.pos) != 0 {
+		return nil, "", taskstore.Validationf("неожиданный аргумент %q", p.pos[0])
+	}
 	agent := strings.TrimSpace(p.value("agent"))
 	if agent == "" {
-		fmt.Fprintln(stderr, "нужен --agent")
-		return "", false
+		return nil, "", taskstore.Validationf("нужен --agent")
 	}
-	return agent, true
+	return p, agent, nil
 }
 
 func runTaskLeaseAcquire(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
-	p, err := parseTaskArgs(argv, map[string]bool{
+	p, agent, err := parseLeaseArgs(argv, map[string]bool{
 		"agent": true, "glob": true, "worktree": true,
 	}, nil)
 	if err != nil {
 		return failTask(stderr, err)
-	}
-	if len(p.pos) != 0 {
-		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
-	}
-	agent, ok := leaseAgent(stderr, p)
-	if !ok {
-		return taskstore.ExitValidation
 	}
 	globs, worktrees := p.vals["glob"], p.vals["worktree"]
 	if len(globs) == 0 && len(worktrees) == 0 {
@@ -967,16 +969,9 @@ func runTaskLeaseAcquire(argv []string, stdout, stderr io.Writer, cfg taskcli.Co
 }
 
 func runTaskLeaseRelease(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
-	p, err := parseTaskArgs(argv, map[string]bool{"agent": true}, nil)
+	p, agent, err := parseLeaseArgs(argv, map[string]bool{"agent": true}, nil)
 	if err != nil {
 		return failTask(stderr, err)
-	}
-	if len(p.pos) != 0 {
-		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
-	}
-	agent, ok := leaseAgent(stderr, p)
-	if !ok {
-		return taskstore.ExitValidation
 	}
 	svc := taskcli.NewService(cfg)
 	if err := svc.ReleaseFiles(agent, time.Time{}); err != nil {
@@ -987,18 +982,11 @@ func runTaskLeaseRelease(argv []string, stdout, stderr io.Writer, cfg taskcli.Co
 }
 
 func runTaskLeaseCheck(argv []string, stdout, stderr io.Writer, cfg taskcli.Config) int {
-	p, err := parseTaskArgs(argv, map[string]bool{
+	p, agent, err := parseLeaseArgs(argv, map[string]bool{
 		"agent": true, "file": true, "worktree": true,
 	}, map[string]bool{"bypass": true})
 	if err != nil {
 		return failTask(stderr, err)
-	}
-	if len(p.pos) != 0 {
-		return failTask(stderr, taskstore.Validationf("неожиданный аргумент %q", p.pos[0]))
-	}
-	agent, ok := leaseAgent(stderr, p)
-	if !ok {
-		return taskstore.ExitValidation
 	}
 	files := append([]string(nil), p.vals["file"]...)
 	files = append(files, p.vals["worktree"]...)

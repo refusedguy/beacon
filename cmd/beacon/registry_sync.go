@@ -320,15 +320,7 @@ var registrySyncOpenSource = func() (registrySessionSource, error) {
 // registrySyncOpenStore opens the process store that owns agent_registry. The
 // same store backs the stop command, so both subcommands read one registry.
 var registrySyncOpenStore = func() (*store.DB, func() error, error) {
-	dir, err := stateDir()
-	if err != nil {
-		return nil, nil, err
-	}
-	db, err := openProcessStore(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-	return db, func() error { return db.Close() }, nil
+	return openStateDB(func(db *store.DB) *store.DB { return db })
 }
 
 // runRegistrySync reconciles the project registry with the live session list.

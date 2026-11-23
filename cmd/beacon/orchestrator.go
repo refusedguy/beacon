@@ -52,16 +52,25 @@ func SetBindStore(fn bindStoreFactory) {
 	makeBindStore = fn
 }
 
-func defaultBindStore(*CLI) (bindStore, func() error, error) {
+// openStateDB opens the process store and returns the caller's slice of it
+// together with the close function. Both failure paths return before a DB
+// exists, so there is no handle to close. The caller owns the returned close.
+func openStateDB[T any](wrap func(*store.DB) T) (T, func() error, error) {
 	dir, err := stateDir()
 	if err != nil {
-		return nil, nil, err
+		var zero T
+		return zero, nil, err
 	}
 	db, err := openProcessStore(dir)
 	if err != nil {
-		return nil, nil, err
+		var zero T
+		return zero, nil, err
 	}
-	return db, db.Close, nil
+	return wrap(db), db.Close, nil
+}
+
+func defaultBindStore(*CLI) (bindStore, func() error, error) {
+	return openStateDB(func(db *store.DB) bindStore { return db })
 }
 
 // runOrchestratorCommand dispatches `beacon orchestrator bind|rebind`.
@@ -209,15 +218,7 @@ func SetRebindStore(fn rebindStoreFactory) {
 
 // defaultRebindStore opens the same state store the MCP server uses.
 func defaultRebindStore(*CLI) (rebindStore, func() error, error) {
-	dir, err := stateDir()
-	if err != nil {
-		return nil, nil, err
-	}
-	db, err := openProcessStore(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-	return db, db.Close, nil
+	return openStateDB(func(db *store.DB) rebindStore { return db })
 }
 
 // rebindWake is the single summary delivery seam. Production uses the delivery
