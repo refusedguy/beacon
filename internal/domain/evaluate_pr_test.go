@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
@@ -314,5 +315,286 @@ func TestEvaluatePRDoesNotChangeEvaluate(t *testing.T) {
 	got, wake := Evaluate(s, Policy{})
 	if got != VerdictWatching || wake != nil {
 		t.Fatalf("Evaluate = (%q, %#v), want (watching, nil)", got, wake)
+	}
+}
+
+// prCheck builds one CHECK observation from the two facts the priority rows
+// read: the conclusion and the required flag.
+func prCheck(conclusion string, required bool) Check {
+	return Check{State: "COMPLETED", Conclusion: conclusion, Required: required}
+}
+
+// prCheckSetSnapshot trips every blocker at once. Cases clear the earlier rows
+// so the winner cannot change for an accidental reason.
+func prCheckSetSnapshot(checks map[string]Check, failures []string) Snapshot {
+	s := prReadySnapshot()
+	s.HeadSHA = "moved-head"
+	s.MergeStateStatus = "DIRTY"
+	s.Mergeable = "UNKNOWN"
+	s.Rollup = "FAILURE"
+	s.Checks = checks
+	s.Failures = append([]string(nil), failures...)
+	s.BaseFailedChecks = map[string]bool{"ci-build": true}
+	s.At = time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	s.DeadlineAt = s.At.Add(-time.Minute)
+	return s
+}
+
+func prSet(s Snapshot, fn func(*Snapshot)) Snapshot {
+	fn(&s)
+	return s
+}
+
+func prCloneSnapshot(s Snapshot) Snapshot {
+	clone := s
+	if s.Checks != nil {
+		clone.Checks = make(map[string]Check, len(s.Checks))
+		for name, c := range s.Checks {
+			clone.Checks[name] = c
+		}
+	}
+	if s.Failures != nil {
+		clone.Failures = append([]string(nil), s.Failures...)
+	}
+	if s.BaseFailedChecks != nil {
+		clone.BaseFailedChecks = make(map[string]bool, len(s.BaseFailedChecks))
+		for name, failed := range s.BaseFailedChecks {
+			clone.BaseFailedChecks[name] = failed
+		}
+	}
+	if s.Flaky.Used != nil {
+		clone.Flaky.Used = make(map[string]int, len(s.Flaky.Used))
+		for name, used := range s.Flaky.Used {
+			clone.Flaky.Used[name] = used
+		}
+	}
+	return clone
+}
+
+// TestEvaluatePRCheckSetPriority pins first-line-wins for mixed CHECK sets.
+// Each case keeps the winning row, the exact verdict text and the exact wake
+// reason callers observe. Required and informational checks carry failure,
+// pending and success conclusions while several rules apply at once.
+func TestEvaluatePRCheckSetPriority(t *testing.T) {
+	tests := []struct {
+		name    string
+		row     int
+		why     string
+		s       Snapshot
+		want    Verdict
+		wantTxt string
+		wake    []WakeTarget
+	}{
+		{
+			name: "terminal state",
+			row:  1,
+			why:  "row 1: a terminal state closes without waking even when every later row is tripped",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("FAILURE", true),
+				"ci-lint":  prCheck("PENDING", true),
+				"e2e":      prCheck("FAILURE", false),
+			}, []string{"ci-build", "e2e"}), func(s *Snapshot) {
+				s.State = "MERGED"
+			}),
+			want: VerdictMerged, wantTxt: "merged", wake: nil,
+		},
+		{
+			name: "moved head",
+			row:  2,
+			why:  "row 2: a moved head wakes only the executor with head_changed before any check or base row",
+			s: prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("FAILURE", true),
+				"ci-lint":  prCheck("PENDING", true),
+				"e2e":      prCheck("FAILURE", false),
+			}, []string{"ci-build", "e2e"}),
+			want: VerdictWatching, wantTxt: "watching",
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakeHeadChanged}},
+		},
+		{
+			name: "dirty merge state",
+			row:  3,
+			why:  "row 3: DIRTY rebases before the engine reads a failed check on the base",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("FAILURE", true),
+				"ci-lint":  prCheck("PENDING", true),
+				"e2e":      prCheck("FAILURE", false),
+			}, []string{"ci-build", "e2e"}), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+			}),
+			want: VerdictRebase, wantTxt: "rebase",
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakePointer}},
+		},
+		{
+			name: "required failure on base",
+			row:  4,
+			why:  "row 4: a required failure already on the base blocks through the orchestrator before retry and rollup",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("FAILURE", true),
+				"ci-lint":  prCheck("PENDING", true),
+				"e2e":      prCheck("FAILURE", false),
+			}, []string{"ci-build", "e2e"}), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+			}),
+			want: VerdictBlocked, wantTxt: "blocked",
+			wake: []WakeTarget{{Role: RoleOrchestrator, Kind: WakePointer}},
+		},
+		{
+			name: "informational failure on base",
+			row:  6,
+			why:  "row 6: an informational failure on the base and head cannot block when a required check is green",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build":      prCheck("SUCCESS", true),
+				"optional-lint": prCheck("FAILURE", false),
+			}, []string{"optional-lint"}), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.Mergeable = "MERGEABLE"
+				s.BaseFailedChecks = map[string]bool{"optional-lint": true}
+				s.At = time.Time{}
+				s.DeadlineAt = time.Time{}
+			}),
+			want: VerdictReady, wantTxt: "ready",
+			wake: []WakeTarget{{Role: RoleOrchestrator, Kind: WakePointer}},
+		},
+		{
+			name: "required failure on head",
+			row:  5,
+			why:  "row 5: a required failure on the head keeps working and the informational failure beside it is dropped",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("FAILURE", true),
+				"e2e":      prCheck("FAILURE", false),
+			}, []string{"ci-build", "e2e"}), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.BaseFailedChecks = nil
+			}),
+			want: VerdictKeepWorking, wantTxt: "keep_working",
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakePointer}},
+		},
+		{
+			name: "flaky required failure under budget",
+			row:  5,
+			why:  "row 5: a flaky required failure under budget reruns only its own check, never the informational one",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-flaky": prCheck("FAILURE", true),
+				"e2e":      prCheck("FAILURE", false),
+			}, []string{"ci-flaky", "e2e"}), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.BaseFailedChecks = nil
+				s.Flaky = FlakyConfig{
+					Names:      []string{"ci-*"},
+					MaxRetries: 2,
+					Used:       map[string]int{"ci-flaky": 0},
+				}
+			}),
+			want: VerdictRetry, wantTxt: "retry",
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: RerunChecks, RerunChecks: []string{"ci-flaky"}}},
+		},
+		{
+			name: "stale base with a required failure",
+			row:  5,
+			why:  "row 5: a PR behind a repaired main rebases with the exact stale_base_after_main_fix reason",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("FAILURE", true),
+			}, []string{"ci-build"}), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "BEHIND"
+				s.BaseFailedChecks = nil
+				s.BaseChecksKnown = true
+				s.BaseHeadSHA = "main-after-fix"
+			}),
+			want: VerdictRebase, wantTxt: "rebase",
+			wake: []WakeTarget{{Role: RoleExecutor, Kind: WakePointer, Reason: "stale_base_after_main_fix"}},
+		},
+		{
+			name: "pending informational check with green required check",
+			row:  6,
+			why:  "row 6: a pending informational check does not hold a PR whose required check succeeded",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-build": prCheck("SUCCESS", true),
+				"e2e":      prCheck("PENDING", false),
+			}, nil), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.Mergeable = "MERGEABLE"
+				s.BaseFailedChecks = nil
+				s.Rollup = "SUCCESS"
+				s.At = time.Time{}
+				s.DeadlineAt = time.Time{}
+			}),
+			want: VerdictReady, wantTxt: "ready",
+			wake: []WakeTarget{{Role: RoleOrchestrator, Kind: WakePointer}},
+		},
+		{
+			name: "unknown mergeable beats deadline",
+			row:  7,
+			why:  "row 7: mergeable=UNKNOWN pins the REST view before the deadline row is read",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-lint": prCheck("PENDING", true),
+			}, nil), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.BaseFailedChecks = nil
+				s.Rollup = "PENDING"
+			}),
+			want: VerdictWatching, wantTxt: "watching",
+			wake: []WakeTarget{{Kind: WakeRestPin}},
+		},
+		{
+			name: "deadline on a pending required check",
+			row:  8,
+			why:  "row 8: a pending required check past its deadline escalates through the orchestrator",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-lint": prCheck("PENDING", true),
+			}, nil), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.Mergeable = "MERGEABLE"
+				s.BaseFailedChecks = nil
+				s.Rollup = "PENDING"
+			}),
+			want: VerdictTimeout, wantTxt: "timeout",
+			wake: []WakeTarget{{Role: RoleOrchestrator, Kind: WakePointer}},
+		},
+		{
+			name: "pending required check without a deadline",
+			row:  9,
+			why:  "row 9: a pending required check with no deadline watches silently",
+			s: prSet(prCheckSetSnapshot(map[string]Check{
+				"ci-lint": prCheck("PENDING", true),
+			}, nil), func(s *Snapshot) {
+				s.HeadSHA = s.WatchHeadSHA
+				s.MergeStateStatus = "CLEAN"
+				s.Mergeable = "MERGEABLE"
+				s.BaseFailedChecks = nil
+				s.Rollup = "PENDING"
+				s.At = time.Time{}
+				s.DeadlineAt = time.Time{}
+			}),
+			want: VerdictWatching, wantTxt: "watching", wake: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(fmt.Sprintf("row%d/%s", tt.row, tt.name), func(t *testing.T) {
+			before := prCloneSnapshot(tt.s)
+			p := Policy{}
+
+			got, wake := EvaluatePR(tt.s, p)
+			if got != tt.want || string(got) != tt.wantTxt {
+				t.Errorf("verdict = %q (%q), want %q (%q); %s", got, string(got), tt.want, tt.wantTxt, tt.why)
+			}
+			if !reflect.DeepEqual(wake, tt.wake) {
+				t.Errorf("wake = %#v, want %#v; %s", wake, tt.wake, tt.why)
+			}
+			if !reflect.DeepEqual(tt.s, before) {
+				t.Errorf("EvaluatePR mutated the snapshot: %+v, want %+v", tt.s, before)
+			}
+			if p != (Policy{}) {
+				t.Errorf("EvaluatePR mutated the policy: %+v", p)
+			}
+		})
 	}
 }
