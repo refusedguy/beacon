@@ -2,8 +2,7 @@ package scm
 
 import (
 	"context"
-	"fmt"
-	"net/url"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -171,40 +170,63 @@ func (g *GitHub) approvals(ctx context.Context, pr int) (int, error) {
 	return n, nil
 }
 
-// UpdateBranch calls the GitHub "update branch" REST endpoint, then waits for
-// the new head SHA because the endpoint itself returns no body.
+type updateBranchResponse struct {
+	Data struct {
+		UpdatePullRequestBranch struct {
+			PullRequest struct {
+				HeadRefOid string `json:"headRefOid"`
+			} `json:"pullRequest"`
+		} `json:"updatePullRequestBranch"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
+const updateBranchMutation = `mutation($id: ID!, $sha: GitObjectID!) {
+  updatePullRequestBranch(input: {pullRequestId: $id, expectedHeadOid: $sha}) {
+    pullRequest {
+      headRefOid
+    }
+  }
+}`
+
+// UpdateBranch calls the GraphQL mutation updatePullRequestBranch. The public
+// REST API has no branch-update endpoint, so the old PUT returned 404 in
+// production while the httptest mocked success. The mutation returns the new
+// head SHA directly, so no polling is needed.
 func (g *GitHub) UpdateBranch(ctx context.Context, pr int, expectedSHA string) (string, error) {
 	p, _, err := g.Client.PullRequests.Get(ctx, g.Owner, g.Repo, pr)
 	if err != nil {
 		return "", err
 	}
-	branch := p.GetHead().GetRef()
-	path := fmt.Sprintf("repos/%s/%s/branches/%s/update", g.Owner, g.Repo, url.PathEscape(branch))
-	req, err := g.Client.NewRequest(ctx, "PUT", path, map[string]string{"expected_head_sha": expectedSHA})
+	nodeID := p.GetNodeID()
+	if nodeID == "" {
+		return "", core.Errorf(core.CodeUnavailable, "PR %d has no node ID", pr)
+	}
+
+	payload := map[string]any{
+		"query":     updateBranchMutation,
+		"variables": map[string]string{"id": nodeID, "sha": expectedSHA},
+	}
+	req, err := g.Client.NewRequest(ctx, http.MethodPost, "graphql", payload)
 	if err != nil {
 		return "", err
 	}
+	var result updateBranchResponse
 	if _, err := g.guarded(func() (any, error) {
-		_, err := g.Client.Do(req, nil)
-		return nil, err
+		return g.Client.Do(req, &result)
 	}); err != nil {
 		return "", err
 	}
-	for i := 0; i < 12; i++ {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(time.Second):
-		}
-		cur, _, err := g.Client.PullRequests.Get(ctx, g.Owner, g.Repo, pr)
-		if err != nil {
-			return "", err
-		}
-		if sha := cur.GetHead().GetSHA(); sha != "" && sha != expectedSHA {
-			return sha, nil
-		}
+	if len(result.Errors) > 0 {
+		return "", core.Errorf(core.CodeUnavailable, "update branch: %s", result.Errors[0].Message)
 	}
-	return "", core.Errorf(core.CodeUnavailable, "branch %s did not advance", branch)
+	sha := result.Data.UpdatePullRequestBranch.PullRequest.HeadRefOid
+	if sha == "" {
+		return "", core.Errorf(core.CodeUnavailable, "update branch returned no head SHA")
+	}
+	return sha, nil
 }
 
 func (g *GitHub) Merge(ctx context.Context, pr int, expectedSHA, title string) error {
