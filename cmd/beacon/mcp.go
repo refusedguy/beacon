@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -33,17 +35,24 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				Dispatcher: w.dispatcher, Control: w.control, Status: w.status,
 				Wait: w.wait, TaskCreator: w.taskCreator,
 			}
-			if info, err := readConnection(filepath.Dir(w.cfg.StateDB)); err == nil && daemonAlive(w.cfg.StateDB) {
+			info, connErr := readConnection(filepath.Dir(w.cfg.StateDB))
+			if connErr == nil && daemonAlive(w.cfg.StateDB) {
 				client := &remoteClient{info: info, http: &http.Client{Timeout: 5 * time.Second}}
 				services.Remote = client.call
-			} else if lock, err := acquireLock(filepath.Dir(w.cfg.StateDB)); err == nil {
+			} else if lock, err := acquireLock(filepath.Dir(w.cfg.StateDB)); err != nil {
+				slog.Error("acquire daemon lock", "error", err)
+			} else {
 				ctx, cancel := context.WithCancel(cmd.Context())
 				defer lock.Close()
 				defer cancel()
 				if watcher, ok := w.harness.(idleWatcher); ok {
 					go watcher.WatchIdle(ctx)
 				}
-				go func() { _ = w.recon.Run(ctx, w.changes) }()
+				go func() {
+					if err := w.recon.Run(ctx, w.changes); err != nil && !errors.Is(err, context.Canceled) {
+						slog.Error("reconciler loop stopped", "error", err)
+					}
+				}()
 			}
 			return beaconmcp.ServeStdio(beaconmcp.NewServer(services))
 		},
