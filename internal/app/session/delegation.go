@@ -21,6 +21,7 @@ import (
 	"math"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -693,7 +694,7 @@ func (r *Registry) IDs() []ThreadID {
 	for id := range r.threads {
 		out = append(out, id)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	slices.Sort(out)
 	return out
 }
 

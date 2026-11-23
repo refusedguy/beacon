@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -953,36 +954,32 @@ func (r *runner) recordStaleSkipped(id string) {
 	r.staleSkippedIDs = append(r.staleSkippedIDs, id)
 }
 
-// appendUnique keeps one id per list in encounter order. A row is seen at most
-// once in each pass, but the guard makes the report stable if a caller feeds a
-// duplicate id.
-func appendUnique(ids []string, id string) []string {
-	for _, seen := range ids {
-		if seen == id {
-			return ids
-		}
-	}
-	return append(ids, id)
-}
-
 // recordWritten adds one relative path to the CC-04 delta. A duplicate write
 // of the same path is recorded once, as with the id lists above.
 func (r *runner) recordWritten(rel string) {
-	r.writtenPaths = appendUnique(r.writtenPaths, rel)
+	if !slices.Contains(r.writtenPaths, rel) {
+		r.writtenPaths = append(r.writtenPaths, rel)
+	}
 }
 
 func (r *runner) recordCreated(id string) {
-	r.createdIDs = appendUnique(r.createdIDs, id)
+	if !slices.Contains(r.createdIDs, id) {
+		r.createdIDs = append(r.createdIDs, id)
+	}
 }
 
 func (r *runner) recordTieKeptLocal(id string) {
-	r.tieKeptLocalIDs = appendUnique(r.tieKeptLocalIDs, id)
+	if !slices.Contains(r.tieKeptLocalIDs, id) {
+		r.tieKeptLocalIDs = append(r.tieKeptLocalIDs, id)
+	}
 }
 
 // recordUpdated stores one overwritten id and the field names that changed.
 // updatedIssues keeps its CBX-07 count so the existing text line is unchanged.
 func (r *runner) recordUpdated(id string, fields []string) {
-	r.updatedIDs = appendUnique(r.updatedIDs, id)
+	if !slices.Contains(r.updatedIDs, id) {
+		r.updatedIDs = append(r.updatedIDs, id)
+	}
 	if r.changes == nil {
 		r.changes = map[string][]string{}
 	}

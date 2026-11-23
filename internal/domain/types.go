@@ -7,7 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -1063,13 +1063,13 @@ func (a *StreamAssembler) Finish(expected uint64, result []byte) StreamFinal {
 			a.missing = append(a.missing, s)
 		}
 	}
-	sort.Slice(a.missing, func(i, j int) bool { return a.missing[i] < a.missing[j] })
+	slices.Sort(a.missing)
 
 	rest := make([]uint64, 0, len(a.pending))
 	for seq := range a.pending {
 		rest = append(rest, seq)
 	}
-	sort.Slice(rest, func(i, j int) bool { return rest[i] < rest[j] })
+	slices.Sort(rest)
 	ordered := make([]StreamEvent, 0, len(a.ordered)+len(rest))
 	ordered = append(ordered, a.ordered...)
 	for _, seq := range rest {

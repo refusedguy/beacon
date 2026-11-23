@@ -7,6 +7,7 @@ package taskstore
 
 import (
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -26,13 +27,13 @@ var closeReasons = []string{
 func CloseStatuses() []string { return append([]string(nil), closeStatuses...) }
 
 // IsCloseStatus сообщает, является ли значение статусом закрытия.
-func IsCloseStatus(v string) bool { return oneOf(v, closeStatuses...) }
+func IsCloseStatus(v string) bool { return slices.Contains(closeStatuses, v) }
 
 // ValidCloseReasons возвращает канонические причины закрытия. Копия.
 func ValidCloseReasons() []string { return append([]string(nil), closeReasons...) }
 
 // IsCloseReason сообщает, входит ли значение в канонический словарь причин.
-func IsCloseReason(v string) bool { return oneOf(v, closeReasons...) }
+func IsCloseReason(v string) bool { return slices.Contains(closeReasons, v) }
 
 // CloseCardOptions — данные, которые пишутся в карточку при закрытии.
 // Статус и Дубликат проверяются. Время закрытия при пустом значении ставится

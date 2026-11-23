@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -416,7 +417,7 @@ func (s *Service) List(o ListOptions) (string, error) {
 		}
 	}
 	for _, v := range o.Phases {
-		if !oneOf(v, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
+		if !slices.Contains([]string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}, v) {
 			return "", Validationf("неизвестная фаза %q", v)
 		}
 	}
@@ -496,15 +497,6 @@ func (s *Service) List(o ListOptions) (string, error) {
 	return sb.String() + warning, nil
 }
 
-func oneOf(v string, allowed ...string) bool {
-	for _, a := range allowed {
-		if v == a {
-			return true
-		}
-	}
-	return false
-}
-
 func matchSet(v string, set []string) bool {
 	if len(set) == 0 {
 		return true
@@ -538,10 +530,10 @@ func (s *Service) New(o NewOptions) (string, string, error) {
 	if o.Type == "" {
 		o.Type = "task"
 	}
-	if !oneOf(o.Type, "task", "epic") {
+	if !slices.Contains([]string{"task", "epic"}, o.Type) {
 		return "", "", Validationf("неизвестный тип %q", o.Type)
 	}
-	if !oneOf(o.Phase, "P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8") {
+	if !slices.Contains([]string{"P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8"}, o.Phase) {
 		return "", "", Validationf("неверная или отсутствующая фаза %q", o.Phase)
 	}
 	if strings.TrimSpace(o.Title) == "" {
@@ -1221,7 +1213,7 @@ func (s *Service) Defer(o DeferOptions) (string, error) {
 	if target == nil {
 		return "", Validationf("карточка %s не найдена", id)
 	}
-	if oneOf(target.Status, "done", "dropped", "duplicate") {
+	if slices.Contains([]string{"done", "dropped", "duplicate"}, target.Status) {
 		return "", Validationf("карточка %s закрыта со статусом %s", id, target.Status)
 	}
 	text := rewriteDeferFields(target.Raw, "blocked", until)
@@ -2562,15 +2554,6 @@ func validateReservationGlobs(globs []string) ([]string, error) {
 	return out, nil
 }
 
-func appendUnique(list []string, v string) []string {
-	for _, x := range list {
-		if x == v {
-			return list
-		}
-	}
-	return append(list, v)
-}
-
 // ReserveFiles берёт аренду на glob-ы до правки. Аренда advisory: она не
 // проверяет чужие аренды и не мешает писать файл, а только регистрирует заявку.
 // Конфликт проверяется на границе коммита в CheckCommit.
@@ -2689,8 +2672,12 @@ func (s *Service) CheckCommit(agent string, files []string, bypass bool, now tim
 					continue
 				}
 				decision.Blocked = true
-				decision.Files = appendUnique(decision.Files, f)
-				decision.Owners = appendUnique(decision.Owners, r.Agent)
+				if !slices.Contains(decision.Files, f) {
+					decision.Files = append(decision.Files, f)
+				}
+				if !slices.Contains(decision.Owners, r.Agent) {
+					decision.Owners = append(decision.Owners, r.Agent)
+				}
 			}
 		}
 	}
