@@ -1,6 +1,8 @@
 package mcp
 
 import (
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -255,11 +257,7 @@ func subscriptionSnapshot(set map[*dbVerdictSubscription]struct{}) []*dbVerdictS
 	if len(set) == 0 {
 		return nil
 	}
-	out := make([]*dbVerdictSubscription, 0, len(set))
-	for sub := range set {
-		out = append(out, sub)
-	}
-	return out
+	return slices.Collect(maps.Keys(set))
 }
 
 func verdictStateEqual(a, b verdictState) bool {

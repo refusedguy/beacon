@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -372,10 +374,7 @@ func (s *Server) Publish(ev SocketEvent) {
 		return
 	}
 	s.mu.Lock()
-	targets := make([]*socketConn, 0, len(s.clients))
-	for sc := range s.clients {
-		targets = append(targets, sc)
-	}
+	targets := slices.Collect(maps.Keys(s.clients))
 	s.mu.Unlock()
 	for _, sc := range targets {
 		sc.send(frame)
@@ -389,10 +388,7 @@ func (s *Server) Close() error {
 	s.once.Do(func() {
 		s.mu.Lock()
 		s.closed = true
-		targets := make([]*socketConn, 0, len(s.clients))
-		for sc := range s.clients {
-			targets = append(targets, sc)
-		}
+		targets := slices.Collect(maps.Keys(s.clients))
 		s.mu.Unlock()
 
 		s.cancel()

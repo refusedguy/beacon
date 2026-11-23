@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -880,11 +881,7 @@ func StatusForCode(code ErrorCode) int {
 // KnownErrorCodes lists every code in the canonical registry. The returned
 // slice is a copy, so callers cannot mutate the registry through it.
 func KnownErrorCodes() []ErrorCode {
-	codes := make([]ErrorCode, 0, len(statusByErrorCode))
-	for code := range statusByErrorCode {
-		codes = append(codes, code)
-	}
-	return codes
+	return slices.Collect(maps.Keys(statusByErrorCode))
 }
 
 // NewAppError builds an AppError with the status defined by the contract.
