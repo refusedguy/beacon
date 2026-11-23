@@ -182,12 +182,6 @@ func (r *storeMergeStatusReader) SetMergerBound(bound bool) {
 	}
 }
 
-func (r *storeMergeStatusReader) SetResolver(resolver MergeDependencyResolver) {
-	if r != nil {
-		r.resolver = resolver
-	}
-}
-
 func (r *storeMergeStatusReader) MergeStatus(_ context.Context, watchID string) (MergeStatusFacts, error) {
 	if r == nil || r.store == nil {
 		return MergeStatusFacts{}, domain.NewAppError(domain.CodePersistFailed, "merge_status: state store is nil")

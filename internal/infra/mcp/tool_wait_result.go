@@ -1431,19 +1431,6 @@ func (s *WaitResultService) PrecheckJournal() PrecheckJournal {
 	return s.precheckJournal
 }
 
-// SetInfraFailureJournal installs the sink for advisory classifications. A nil
-// argument restores the in-memory journal. A durable sink belongs in the app
-// layer; this package owns only the port and the default.
-func (s *WaitResultService) SetInfraFailureJournal(j domain.InfraFailureJournal) {
-	if s == nil {
-		return
-	}
-	if j == nil {
-		j = NewMemoryInfraFailureJournal()
-	}
-	s.infraJournal = j
-}
-
 // InfraFailureJournal returns the configured advisory sink. It is never nil for
 // a service built by NewWaitResultService.
 func (s *WaitResultService) InfraFailureJournal() domain.InfraFailureJournal {
@@ -1451,19 +1438,6 @@ func (s *WaitResultService) InfraFailureJournal() domain.InfraFailureJournal {
 		return NewMemoryInfraFailureJournal()
 	}
 	return s.infraJournal
-}
-
-// SetActionTrajectory installs the sink for corrected action attempts. A nil
-// argument restores the in-memory trajectory. A durable sink belongs in the
-// app layer; this package owns only the interface and the default.
-func (s *WaitResultService) SetActionTrajectory(t ActionTrajectory) {
-	if s == nil {
-		return
-	}
-	if t == nil {
-		t = NewMemoryActionTrajectory()
-	}
-	s.actionTrajectory = t
 }
 
 // ActionTrajectory returns the configured sink. It is never nil for a service
@@ -1486,19 +1460,6 @@ func (s *WaitResultService) RecordActionAttempt(rec ActionTrajectoryRecord) {
 		rec.At = s.now()
 	}
 	s.ActionTrajectory().RecordActionAttempt(rec)
-}
-
-// SetTerminalOutcomeJournal installs the sink for terminal causes. A nil
-// argument restores the in-memory journal. A durable sink belongs in the app
-// layer; this package owns only the port and the default.
-func (s *WaitResultService) SetTerminalOutcomeJournal(j TerminalOutcomeJournal) {
-	if s == nil {
-		return
-	}
-	if j == nil {
-		j = NewMemoryTerminalOutcomeJournal()
-	}
-	s.terminalJournal = j
 }
 
 // TerminalOutcomeJournal returns the configured sink. It is never nil for a

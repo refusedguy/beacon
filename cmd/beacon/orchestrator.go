@@ -43,15 +43,6 @@ type bindStoreFactory func(*CLI) (bindStore, func() error, error)
 
 var makeBindStore bindStoreFactory = defaultBindStore
 
-// SetBindStore replaces the bind store factory. Passing nil restores the
-// production store.
-func SetBindStore(fn bindStoreFactory) {
-	if fn == nil {
-		fn = defaultBindStore
-	}
-	makeBindStore = fn
-}
-
 func defaultBindStore(*CLI) (bindStore, func() error, error) {
 	dir, err := stateDir()
 	if err != nil {

@@ -52,15 +52,6 @@ type traceDepsFactory func(*CLI) (traceDeps, func() error, error)
 
 var makeTraceDeps traceDepsFactory = defaultTraceDeps
 
-// SetTraceDeps replaces the dependency factory. Passing nil restores the
-// production factory.
-func SetTraceDeps(fn traceDepsFactory) {
-	if fn == nil {
-		fn = defaultTraceDeps
-	}
-	makeTraceDeps = fn
-}
-
 func defaultTraceDeps(_ *CLI) (traceDeps, func() error, error) {
 	dir, err := stateDir()
 	if err != nil {

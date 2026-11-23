@@ -115,13 +115,6 @@ func NewPRCloseDupHandler(cleanup PRCleanup, ci domain.CIProvider, snapshot Snap
 	}
 }
 
-// SetActor overrides the actor label written to observe.
-func (h *PRCloseDupHandler) SetActor(actor string) {
-	if h != nil && actor != "" {
-		h.actor = actor
-	}
-}
-
 // Handle adapts Close to the go-sdk typed tool handler signature.
 func (h *PRCloseDupHandler) Handle(ctx context.Context, _ *mcpsdk.CallToolRequest, in PRCloseDupInput) (*mcpsdk.CallToolResult, PRCloseDupOutput, error) {
 	out, err := h.Close(ctx, in)

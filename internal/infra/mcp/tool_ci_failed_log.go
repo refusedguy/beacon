@@ -228,13 +228,6 @@ func NewCIFailedLogHandler(store resultStoreReader, source CIFailedLogSource) *C
 	return &CIFailedLogHandler{store: store, source: source}
 }
 
-// SetSource overrides the log source. Tests inject a counting fake here.
-func (h *CIFailedLogHandler) SetSource(src CIFailedLogSource) {
-	if h != nil {
-		h.source = src
-	}
-}
-
 // SetCache overrides the full-log cache. Tests inject an in-memory fake to
 // prove the second page does not reach the source again.
 func (h *CIFailedLogHandler) SetCache(cache failureExcerptCache) {

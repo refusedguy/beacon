@@ -383,9 +383,6 @@ var spawnACPRuntimeFactory acpRuntimeFactory = func(cfg wake.ACPRuntimeConfig) (
 	return wake.NewWorkerRuntime(cfg)
 }
 
-// SetACPRuntimeFactory installs the ACP runtime factory used by beacon spawn.
-func SetACPRuntimeFactory(f acpRuntimeFactory) { spawnACPRuntimeFactory = f }
-
 // spawnStatsStore is the runtime_stats port, satisfied by *store.DB.
 type spawnStatsStore interface {
 	SaveRuntimeStats(payload []byte, now time.Time) error
@@ -402,12 +399,6 @@ var (
 	spawnEvents       spawnEventSink
 )
 
-// SetSpawnRuntimeStats installs the runtime_stats sink for ACP updates.
-func SetSpawnRuntimeStats(s spawnStatsStore) { spawnRuntimeStats = s }
-
-// SetSpawnEvents installs the SSE sink (/api/v1/events) for ACP updates.
-func SetSpawnEvents(s spawnEventSink) { spawnEvents = s }
-
 // ACPRunStore is the durable run port used by beacon spawn. *store.DB
 // satisfies it. Tests install a fake so they never touch beacon.db.
 type ACPRunStore interface {
@@ -421,10 +412,6 @@ var (
 	spawnACPRunOnce  sync.Once
 	spawnACPRunDB    ACPRunStore
 )
-
-// SetACPRunStore installs the durable run store used by beacon spawn. A nil
-// value falls back to the lazy store in the project state directory.
-func SetACPRunStore(s ACPRunStore) { spawnACPRunStore = s }
 
 // acpRunStoreForSpawn returns the installed run store, or one on the same
 // beacon.db the session registry and runtime_stats use. Nothing here writes
@@ -583,8 +570,7 @@ type acpSessionStats struct {
 }
 
 // spawnStatsSink lazily opens the state DB so runtime_stats is written even
-// when the composition root has not installed a store yet. A test or the
-// composition root can replace it with SetSpawnRuntimeStats.
+// when the composition root has not installed a store yet.
 var (
 	spawnStatsOnce sync.Once
 	spawnStatsDB   spawnStatsStore
