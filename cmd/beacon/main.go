@@ -99,10 +99,11 @@ func wire(path, parentSession string) (*wiring, error) {
 		Source:    source,
 		Planner:   planner.New(planner.Options{ByPath: true, ByDependency: true, Strict: cfg.StrictScope}),
 		Workspace: wt, Harness: h, Store: store,
-		Concurrency:     core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
-		StrictScope:     cfg.StrictScope,
-		MaxAttempts:     cfg.Merge.MaxAttempts,
-		ParentSessionID: firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
+		Concurrency:        core.Concurrency{MaxInFlight: cfg.Concurrency.MaxInFlight, MaxActiveAgents: cfg.Concurrency.MaxActiveAgents},
+		StrictScope:        cfg.StrictScope,
+		MaxAttempts:        cfg.Merge.MaxAttempts,
+		ParentSessionID:    firstNonEmpty(parentSession, cfg.Harness.ParentSessionID),
+		WorkerInstructions: cfg.Harness.WorkerInstructions,
 	}
 	ctrl := &app.Control{Store: store, Harness: h, Workspace: wt, OnChange: func(pr int) {
 		select {

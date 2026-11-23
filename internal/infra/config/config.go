@@ -12,6 +12,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultWorkerInstructions is prepended to worker spawn prompts when the
+// operator does not configure harness.worker_instructions. It keeps heavy
+// verification off the operator's machine.
+const DefaultWorkerInstructions = "Worker environment: the operator uses a weak PC. Run targeted package tests only (for example, go test ./internal/app). Leave full go build ./..., go test ./..., go vet ./... and golangci-lint to CI."
+
 type Config struct {
 	StateDB      string      `yaml:"state_db"`
 	WorkspaceDir string      `yaml:"workspace_dir"`
@@ -51,14 +56,15 @@ type SCM struct {
 }
 
 type Harness struct {
-	Provider        string `yaml:"provider"`
-	Endpoint        string `yaml:"endpoint"`
-	Model           string `yaml:"model"`
-	Command         string `yaml:"command"`
-	PromptTemplate  string `yaml:"prompt_template"`
-	TokenEnv        string `yaml:"token_env"`
-	Token           string `yaml:"token"`
-	ParentSessionID string `yaml:"parent_session_id"`
+	Provider           string `yaml:"provider"`
+	Endpoint           string `yaml:"endpoint"`
+	Model              string `yaml:"model"`
+	Command            string `yaml:"command"`
+	PromptTemplate     string `yaml:"prompt_template"`
+	TokenEnv           string `yaml:"token_env"`
+	Token              string `yaml:"token"`
+	ParentSessionID    string `yaml:"parent_session_id"`
+	WorkerInstructions string `yaml:"worker_instructions"`
 }
 
 type Merge struct {
@@ -142,6 +148,9 @@ func Load(path string) (Config, error) {
 	if c.OnBaseRed.MaxFixAttempts <= 0 {
 		c.OnBaseRed.MaxFixAttempts = 2
 	}
+	if c.Harness.WorkerInstructions == "" {
+		c.Harness.WorkerInstructions = DefaultWorkerInstructions
+	}
 	return c, nil
 }
 
@@ -161,7 +170,7 @@ func defaults() Config {
 		Concurrency:  Concurrency{MaxInFlight: 20, MaxActiveAgents: 4},
 		TaskSource:   TaskSource{Provider: "markdown", Dir: "docs/tasks"},
 		SCM:          SCM{Provider: "github", TokenEnv: "GITHUB_TOKEN"},
-		Harness:      Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:4096"},
+		Harness:      Harness{Provider: "opencode", Endpoint: "http://127.0.0.1:4096", WorkerInstructions: DefaultWorkerInstructions},
 		Merge:        Merge{MaxAttempts: 12, AutoRebase: true},
 		OnBaseRed:    OnBaseRed{Mode: "spawn_fixer", MaxFixAttempts: 2},
 	}

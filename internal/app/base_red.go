@@ -142,7 +142,11 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	run.WorkspacePath = ws.Path
 	run.Branch = ws.Branch
 	run.ParentSessionID = r.ParentSessionID
-	prompt := fixerPrompt(base, in, task)
+	instructions := ""
+	if r.Dispatcher != nil {
+		instructions = r.Dispatcher.WorkerInstructions
+	}
+	prompt := fixerPrompt(base, in, task, instructions)
 	session, err := r.Harness.Spawn(ctx, core.SpawnRequest{
 		Task: task, Workspace: ws, RunID: run.ID, Prompt: prompt,
 		ParentSessionID: run.ParentSessionID, IsFixer: true,
@@ -166,8 +170,9 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	return r.Store.UpdateIncident(ctx, in)
 }
 
-func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task) string {
+func fixerPrompt(base core.BaseStatus, in *core.BaseIncident, task core.Task, instructions string) string {
 	var b strings.Builder
+	prependWorkerInstructions(&b, instructions)
 	fmt.Fprintf(&b, "Base branch %s is red. Failed checks: %s\n%s\nFix the base branch and open a PR.",
 		base.BaseBranch, in.FailedChecksJSON, compact(base.FailureExcerpt))
 	appendWorkerPrompt(&b, task)

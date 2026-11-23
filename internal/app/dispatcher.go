@@ -13,15 +13,16 @@ import (
 )
 
 type Dispatcher struct {
-	Source          core.TaskSource
-	Planner         ConflictPlanner
-	Workspace       core.WorkspaceManager
-	Harness         core.AgentHarness
-	Store           core.RunStore
-	Concurrency     core.Concurrency
-	StrictScope     bool
-	MaxAttempts     int
-	ParentSessionID string
+	Source             core.TaskSource
+	Planner            ConflictPlanner
+	Workspace          core.WorkspaceManager
+	Harness            core.AgentHarness
+	Store              core.RunStore
+	Concurrency        core.Concurrency
+	StrictScope        bool
+	MaxAttempts        int
+	ParentSessionID    string
+	WorkerInstructions string
 }
 
 type DispatchResult struct {
@@ -169,7 +170,7 @@ func (d *Dispatcher) startOne(ctx context.Context, run *core.Run, task core.Task
 	session, err := d.Harness.Spawn(ctx, core.SpawnRequest{
 		Task: task, Workspace: ws, RunID: run.ID,
 		ParentSessionID: run.ParentSessionID, IsFixer: run.IsFixer,
-		Prompt: spawnPrompt(task, run.ID, ws.Path),
+		Prompt: spawnPrompt(task, run.ID, ws.Path, d.WorkerInstructions),
 	})
 	if err != nil {
 		return fmt.Errorf("spawn: %w", err)
@@ -263,8 +264,9 @@ func firstNonEmptyLocal(values ...string) string {
 	return ""
 }
 
-func spawnPrompt(t core.Task, id core.RunID, ws string) string {
+func spawnPrompt(t core.Task, id core.RunID, ws, instructions string) string {
 	var b strings.Builder
+	prependWorkerInstructions(&b, instructions)
 	fmt.Fprintf(&b, "Run ID: %s\nTask: %s (%s)\nWorkspace: %s\n", id, t.ID, t.Title, ws)
 	if base := strings.TrimSpace(t.BaseBranch); base != "" {
 		fmt.Fprintf(&b, "BaseBranch: %s\nOpen the pull request against %s, not the default branch.\n", base, base)
@@ -272,6 +274,17 @@ func spawnPrompt(t core.Task, id core.RunID, ws string) string {
 	b.WriteString("Implement the task, open a pull request, then call beacon_watch_pr with the run ID and PR number.\n")
 	appendWorkerPrompt(&b, t)
 	return b.String()
+}
+
+// prependWorkerInstructions puts the operator's worker instructions at the
+// start of a spawn prompt. An empty value leaves the stock prompt unchanged.
+func prependWorkerInstructions(b *strings.Builder, instructions string) {
+	text := strings.TrimSpace(instructions)
+	if text == "" {
+		return
+	}
+	b.WriteString(text)
+	b.WriteString("\n\n")
 }
 
 // appendWorkerPrompt adds a card's worker_prompt after the global instructions.
