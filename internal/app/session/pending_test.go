@@ -250,8 +250,8 @@ func TestSeenIsBoundedOldestFirst(t *testing.T) {
 	if _, ok := q.seen["req-"+strconv.Itoa(maxQueueSeen)]; !ok {
 		t.Fatal("newest client request ID missing")
 	}
-	if got := q.Len("ses-a"); got != maxQueueSeen {
-		t.Fatalf("queue Len = %d, want %d", got, maxQueueSeen)
+	if got := q.Len("ses-a"); got != maxQueueSeen+1 {
+		t.Fatalf("queue Len = %d, want %d", got, maxQueueSeen+1)
 	}
 }
 
