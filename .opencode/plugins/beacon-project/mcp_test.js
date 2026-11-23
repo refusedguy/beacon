@@ -7,7 +7,9 @@ import { delimiter, join } from "node:path"
 import {
   beaconCommand,
   beaconServerConfig,
+  registeredBeaconConfig,
   registerBeaconMcp,
+  BEACON_SERVER,
   BEACON_PROJECT_ROOT_ENV,
   BEACON_BUILD_SCRIPT,
   BUILD_HASH_FLAG,
@@ -58,15 +60,15 @@ function localBinaryDeps(overrides = {}) {
 
 function fakeCtx() {
   const reloads = []
-  let disposed = 0
-  const editor = { set() {}, update(name, apply) { apply({}) } }
+  let transforms = 0
   return {
     reloads,
-    get disposed() { return disposed },
+    get transforms() { return transforms },
     mcp: {
       async transform(apply) {
-        apply(editor)
-        return { dispose() { disposed += 1 } }
+        transforms += 1
+        apply({ set() {}, update() {} })
+        return { dispose() {} }
       },
       async reload() {
         reloads.push(true)
@@ -156,23 +158,56 @@ test("an empty PATH segment is skipped", () => {
   assert.deepEqual(beaconCommand(ROOT, deps), [join(dir, "beacon"), "mcp"])
 })
 
-test("registration sets the server once without starting a watcher or reload", async (t) => {
-  t.mock.timers.enable({ apis: ["setInterval", "setTimeout"] })
+test("repeated registration records one server config per project root", async (t) => {
   const ctx = fakeCtx()
-  let hash = "h0"
-  const deps = localBinaryDeps({ hash: () => hash })
+  const deps = localBinaryDeps()
+  const first = await registerBeaconMcp(ctx, ROOT, deps)
+  t.after(() => first.dispose())
 
-  const result = await registerBeaconMcp(ctx, ROOT, deps)
-  assert.equal(typeof result.registration.dispose, "function")
+  const second = await registerBeaconMcp(ctx, ROOT, deps)
 
-  hash = "h1"
-  t.mock.timers.tick(60_000)
-  await Promise.resolve()
-  await Promise.resolve()
+  assert.equal(first, second)
+  assert.equal(first.server, BEACON_SERVER)
+  assert.deepEqual(first.config, beaconServerConfig(ROOT, localBinaryDeps()))
+  assert.equal(registeredBeaconConfig(ROOT), first.config)
+})
 
-  assert.equal(ctx.reloads.length, 0)
-  result.registration.dispose()
-  assert.equal(ctx.disposed, 1)
+test("registrations are keyed by project root", async (t) => {
+  const ctx = fakeCtx()
+  const first = await registerBeaconMcp(ctx, ROOT, localBinaryDeps())
+
+  const other = "/other"
+  const otherLocal = join(other, ".opencode", "bin", "beacon")
+  const otherDeps = fakeDeps({
+    files: { [otherLocal]: "binary", [`${otherLocal}.build-sha`]: "h0\n" },
+    hash: "h0",
+  })
+  const second = await registerBeaconMcp(ctx, other, otherDeps)
+  t.after(async () => {
+    await first.dispose()
+    await second.dispose()
+  })
+
+  assert.notEqual(first, second)
+  assert.equal(registeredBeaconConfig(ROOT), first.config)
+  assert.equal(registeredBeaconConfig(other), second.config)
+})
+
+test("registration schedules no timer, reload or daemon command", async (t) => {
+  const setTimer = t.mock.method(globalThis, "setTimeout", () => ({ unref() {} }))
+  const setInterval = t.mock.method(globalThis, "setInterval", () => ({ unref() {} }))
+  const ctx = fakeCtx()
+  const deps = localBinaryDeps()
+
+  const registration = await registerBeaconMcp(ctx, ROOT, deps)
+  t.after(() => registration.dispose())
+
+  assert.equal(setTimer.mock.callCount(), 0)
+  assert.equal(setInterval.mock.callCount(), 0)
+  assert.equal(ctx.transforms, 0)
+  assert.deepEqual(ctx.reloads, [])
+  assert.deepEqual(buildCalls(deps), [])
+  assert.equal(deps.execCalls.some((call) => call.args.includes("mcp")), false)
 })
 
 test("server config carries the project root and enables the server", () => {
