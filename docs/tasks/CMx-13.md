@@ -16,3 +16,6 @@
 Причина: Fix already landed in origin/main via PR #1856 (commit 8034ac8e 'docs(runbooks): add handoff runbook for cross-agent context transfer (CMx-13) (#1856)'). docs/runbooks/handoff.md exists in main; git merge-base --is-ancestor 8034ac8e origin/main exit 0. No duplicate code PR; this closes the stale todo card.
 Закрыл: ses_cmx13c_executor
 Время закрытия: 2026-11-22T18:11:00Z
+## Подтверждение
+- PR #2090 MERGED: 2026-11-22 (squash).
+

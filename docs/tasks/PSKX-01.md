@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main: PR #1739, коммит ec580c2cdc0daf497c2099059257e9f4ae06b597; git merge-base --is-ancestor ec580c2cdc0daf497c2099059257e9f4ae06b597 origin/main -> exit 0. OwnerFiles docs/templates/executor-task.md и AGENTS.md уже содержат раздел «Форма проекта до кода» и отсылку (PSKX-01) в AGENTS.md:139. Дублирующий код не пишем и дублирующий code-PR не открываем.
 Закрыл: ses_pskx01_executor
 Время закрытия: 2026-11-22T16:55:37Z
+## Подтверждение
+- PR #1973 MERGED: 2026-11-22 (squash).
+

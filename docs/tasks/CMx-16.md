@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main через PR #1860 (merge commit 9f7df68ccc070fea6a19e9f7e10f3ac760acfa8f, docs(design): add agent doc editing rules (CMx-16)). git merge-base --is-ancestor 9f7df68ccc070fea6a19e9f7e10f3ac760acfa8f origin/main дал exit 0. OwnerFile docs/design/agent-docs-rules.md присутствует в origin/main. Дубль кода не создаётся.
 Закрыл: ses_cmx16b_executor
 Время закрытия: 2026-11-22T18:17:38Z
+## Подтверждение
+- PR #2111 MERGED: 2026-11-22 (squash).
+

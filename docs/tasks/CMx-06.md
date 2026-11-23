@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1839 (merge commit 543163501be85e135ca5fb851f5fa38ade62a38b). git merge-base --is-ancestor 543163501be85e135ca5fb851f5fa38ade62a38b origin/main exit 0. docs/design/architecture-scan.md is present in origin/main and satisfies the card: two entry paths, git log --oneline, five friction kinds, CM-03 pointer. No duplicate code written.
 Закрыл: ses_cmx06_executor
 Время закрытия: 2026-11-22T17:20:20Z
+## Подтверждение
+- PR #2028 MERGED: 2026-11-22 (squash).
+

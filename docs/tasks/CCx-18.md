@@ -16,3 +16,6 @@
 Причина: Уже влито в main через PR #1832, коммит 02bc6b7914bc58672b3f09485ebbf0488b817f2a. git merge-base --is-ancestor 02bc6b7914bc58672b3f09485ebbf0488b817f2a origin/main -> exit 0. Дубль кода не создан.
 Закрыл: ses_ccx18b_executor
 Время закрытия: 2026-11-22T18:21:14Z
+## Подтверждение
+- PR #2125 MERGED: 2026-11-22 (squash).
+

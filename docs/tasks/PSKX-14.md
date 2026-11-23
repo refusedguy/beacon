@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1951 (merge commit d9d5c871d86879078f7f30666ec327917f3f968d); AGENTS.md section present in origin/main line 242; git merge-base --is-ancestor exit 0.
 Закрыл: ses_pskx14d_executor
 Время закрытия: 2026-11-22T18:16:27Z
+## Подтверждение
+- PR #2108 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1825 via commit 15885f397ab1e6fd60fb02d673acd8bd4f5de068 (fix(observe): bound check telemetry tags (CCx-17)); git merge-base --is-ancestor 15885f397ab1e6fd60fb02d673acd8bd4f5de068 origin/main exit 0. Fix present in OwnerFiles internal/infra/observe/otel.go and telemetry_contract_test.go. No duplicate code written.
 Закрыл: ses_ccx17b_executor
 Время закрытия: 2026-11-22T18:18:23Z
+## Подтверждение
+- PR #2115 MERGED: 2026-11-22 (squash).
+

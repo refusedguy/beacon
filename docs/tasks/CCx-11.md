@@ -16,3 +16,6 @@
 Причина: Уже влито в main через PR #1866. Merge commit fbf9de0e70ac6e301d868f9a55e804590e0bc276. git merge-base --is-ancestor fbf9de0e70ac6e301d868f9a55e804590e0bc276 origin/main вернул exit 0. Реализация уже в origin/main: MetadataJournalPath, JournalPath, WithJournalPath в internal/app/session/registry.go; ResumeJournal, ErrNoJournalPath, ErrJournalPathMissing в internal/infra/store/sessions.go; три теста в internal/infra/store/sessions_resume_test.go, включая случай 3 исходные строки плюс одна строка resume дают 4 строки в том же файле. Дубль кода не создан.
 Закрыл: ses_ccx11d_executor
 Время закрытия: 2026-11-22T18:09:31Z
+## Подтверждение
+- PR #2088 MERGED: 2026-11-22 (squash).
+

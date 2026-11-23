@@ -16,3 +16,6 @@
 Причина: Already merged via PR #1852, commit 091a00f2f78988754f14417451b4bbecbfa08c0d (docs(runbooks): add retro runbook turning mechanical errors into checks (CMx-11)). git merge-base --is-ancestor 091a00f2f78988754f14417451b4bbecbfa08c0d origin/main exit 0; docs/runbooks/retro.md present in origin/main. No duplicate code written.
 Закрыл: ses_cmx11b_executor
 Время закрытия: 2026-11-22T18:08:16Z
+## Подтверждение
+- PR #2078 MERGED: 2026-11-22 (squash).
+

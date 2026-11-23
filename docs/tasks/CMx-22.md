@@ -16,3 +16,6 @@
 Причина: Fix already landed in PR #1757, merge commit 50a6f324fcf953e259c6b50706ff9d0528a1175e; git merge-base --is-ancestor 50a6f324 origin/main exit 0. Runbook docs/runbooks/rephrase.md present in origin/main. No duplicate code written.
 Закрыл: ses_cmx22_executor
 Время закрытия: 2026-11-22T18:24:11Z
+## Подтверждение
+- PR #2138 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Фикс уже в origin/main: коммит 1972a8570b4ac264a43c56c22a3ce7a2cc9a16a3 из влитого PR #1802 (ветка fix/pskx-03, squash docs(verification): семь вопросов к измерению производительности (PSKX-03)). git merge-base --is-ancestor 1972a857 origin/main даёт exit 0. Оба OwnerFiles уже содержат правку: AGENTS.md отсылает к семи вопросам, docs/runbooks/verification.md содержит раздел Семь вопросов к измерению производительности. Дубль кода не нужен.
 Закрыл: ses_pskx03b_executor
 Время закрытия: 2026-11-22T17:36:51Z
+## Подтверждение
+- PR #2049 MERGED: 2026-11-22 (squash).
+

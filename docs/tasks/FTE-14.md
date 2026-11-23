@@ -17,3 +17,6 @@ baseline: observe.ProviderCall в internal/infra/observe/observe.go:805 пише
 Причина: Premise: FTE-14 already landed in main via PR #1920, merge commit 4d264c8a (feat(observe): add provider_call_total counter with adapter/method/outcome labels). git merge-base --is-ancestor 4d264c8a origin/main exit 0. provider_call_total with adapter/method/outcome labels present in origin/main at internal/infra/observe/{observe.go,metrics.go,coverage_test.go}. No duplicate code written.
 Закрыл: ses_fte14c_executor
 Время закрытия: 2026-11-22T18:13:52Z
+## Подтверждение
+- PR #2100 MERGED: 2026-11-22 (squash).
+

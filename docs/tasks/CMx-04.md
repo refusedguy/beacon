@@ -16,3 +16,6 @@
 Причина: Already landed in origin/main via PR #1838, full SHA 953187b0080a24d0d8e1ff20c50a3c990e9ee0e3 (docs(design): add design-it-twice parallel interface technique (CMx-04)); git merge-base --is-ancestor 953187b0080a24d0d8e1ff20c50a3c990e9ee0e3 origin/main exit 0; docs/design/design-it-twice.md present in origin/main. No duplicate code written.
 Закрыл: ses_cmx04b_executor
 Время закрытия: 2026-11-22T17:07:30Z
+## Подтверждение
+- PR #2005 MERGED: 2026-11-22 (squash).
+

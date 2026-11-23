@@ -16,3 +16,6 @@
 Причина: Уже влито в main через PR #1870. Коммит 6c68bd79aaf12c3160574bf343309f6091e52c10 (merge-коммит PR #1870) является предком origin/main, git merge-base --is-ancestor вернул 0. Проверка identity лежит в cmd/beacon/attach.go (поле Identity в attachSession, registryResumeSession) и internal/app/session/registry.go (ResumeIdentified, ErrSessionIdentityMismatch), тест в cmd/beacon/attach_identity_test.go. Дубль кода не создан.
 Закрыл: ses_ccx10d_executor
 Время закрытия: 2026-11-22T18:07:14Z
+## Подтверждение
+- PR #2072 MERGED: 2026-11-22 (squash).
+

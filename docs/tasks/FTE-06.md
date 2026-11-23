@@ -17,3 +17,6 @@ baseline: cmd/beacon/main.go:253-286 не содержит dispatch для tui. 
 Причина: Уже влито в origin/main через PR #1765, merge commit 37618c0a725f36f6460d4791db1ad84d0580d101; git merge-base --is-ancestor 37618c0a725f36f6460d4791db1ad84d0580d101 origin/main вернул код 0. PR меняет ровно OwnerFiles. Код не дублирую.
 Закрыл: ses_fte06_executor
 Время закрытия: 2026-11-22T17:20:32Z
+## Подтверждение
+- PR #2030 MERGED: 2026-11-22 (squash).
+

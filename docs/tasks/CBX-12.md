@@ -23,3 +23,6 @@ Baseline: beads: cmd/bd/compact_plan.go:28-31 и #6645, случай когда 
 Причина: Реализация уже в origin/main. Коммит b139921312fc23475840804f60aa284ed8e947e8 влит через PR #1762 'feat(gc): compact card history with ordered replay and refusal (CBX-12)'. git merge-base --is-ancestor b1399213 origin/main вернул exit 0. Дубль кода не создаётся.
 Закрыл: ses_cbx12_executor
 Время закрытия: 2026-11-22T18:09:11Z
+## Подтверждение
+- PR #2080 MERGED: 2026-11-22 (squash).
+

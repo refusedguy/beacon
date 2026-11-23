@@ -16,3 +16,6 @@
 Причина: Реализация уже в main. Коммит c4ec7e74ec5d5bbc5c814e263f0b1cd46a455b14, PR #1876. Проверка git merge-base --is-ancestor c4ec7e74 origin/main вернула 0. В main есть SandboxPolicy.ProtectedNames, protectedPathReason и тест internal/app/orchestrator/protected_paths_test.go. Дубль кода не нужен.
 Закрыл: ses_ccx07b_executor
 Время закрытия: 2026-11-22T17:34:41Z
+## Подтверждение
+- PR #2044 MERGED: 2026-11-22 (squash).
+

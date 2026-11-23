@@ -16,3 +16,6 @@
 Причина: Fix already merged into origin/main via PR #1745 (merge commit 731cd50a38205ee510a108845344ec69b48b4eb5); git merge-base --is-ancestor 731cd50a origin/main exit 0. No open duplicate PR. Closing card, status change to reach main via docs PR.
 Закрыл: ses_pskx07b_executor
 Время закрытия: 2026-11-22T17:34:06Z
+## Подтверждение
+- PR #2041 MERGED: 2026-11-22 (squash).
+

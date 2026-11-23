@@ -16,3 +16,6 @@
 Причина: Already landed in origin/main: full SHA 9a0038c7 docs(agents): PSKX-28 minimal diff, one decision per source (#1942); git merge-base --is-ancestor 9a0038c7 origin/main exit 0; AGENTS.md change present, no duplicate code PR.
 Закрыл: ses_pskx28e_executor
 Время закрытия: 2026-11-22T18:42:31Z
+## Подтверждение
+- PR #2166 MERGED: 2026-11-22 (squash).
+

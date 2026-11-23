@@ -16,3 +16,6 @@
 Причина: Уже в main: PR #1773, merge commit 63de1829168450a32e47aba359066091c3da5cfa; git merge-base --is-ancestor 63de1829 origin/main exit 0. Секция «Порог правила» есть в AGENTS.md:24. Дублирующий код не создаётся.
 Закрыл: ses_pskx02c_executor
 Время закрытия: 2026-11-22T17:22:18Z
+## Подтверждение
+- PR #2033 MERGED: 2026-11-22 (squash).
+

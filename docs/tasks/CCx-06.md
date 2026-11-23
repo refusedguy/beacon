@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1833 (merge commit bf42922f47808f3bdbce4549c1f80d0150fa6bf7). git merge-base --is-ancestor bf42922f47808f3bdbce4549c1f80d0150fa6bf7 origin/main exit 0. SandboxPolicy with four modes, write/network checks and docs/evals/ccx06-sandbox-modes.md are present in origin/main. No duplicate code written.
 Закрыл: ses_ccx06b_executor
 Время закрытия: 2026-11-22T17:19:49Z
+## Подтверждение
+- PR #2031 MERGED: 2026-11-22 (squash).
+

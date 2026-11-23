@@ -17,3 +17,6 @@ baseline: git grep retry_open и RetryOpen по internal, cmd и observe даё�
 Причина: Уже влито в main через PR #1943 (SHA 17269244 feat(observe): add retry_open_duration_seconds histogram (FTE-15)); git merge-base --is-ancestor 17269244 origin/main -> exit 0. Гистограмма retry_open_duration_seconds зарегистрирована в internal/infra/observe/metrics.go (HistogramNames) и записывается в observe.go (RetryOpen); тест корзин/sum/count есть в metrics_test.go. Дублирующий код PR не открывается.
 Закрыл: ses_fte15c_executor
 Время закрытия: 2026-11-22T18:16:25Z
+## Подтверждение
+- PR #2107 MERGED: 2026-11-22 (squash).
+

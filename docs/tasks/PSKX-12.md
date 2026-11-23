@@ -16,3 +16,6 @@
 Причина: Already merged into origin/main via PR #1898, merge commit 29c2e64514792ae9eeeb4a91fdb13032409be96b. git merge-base --is-ancestor 29c2e64514792ae9eeeb4a91fdb13032409be96b origin/main exit 0. docs/e2e/README.md already carries the 'Аудит прогона' section with all three outcomes and live-run invariants; no duplicate code change.
 Закрыл: ses_pskx12c_executor
 Время закрытия: 2026-11-22T18:10:41Z
+## Подтверждение
+- PR #2089 MERGED: 2026-11-22 (squash).
+

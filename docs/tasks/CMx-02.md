@@ -16,3 +16,6 @@
 Причина: Premise-check: требование уже влито в origin/main через PR #1841, merge commit 251371eae71bc17f25f49c8b99f5236f6ea637fb (docs(templates): add PR body risk record template (CMx-02)). docs/templates/pr-body.md присутствует в origin/main. git merge-base --is-ancestor 251371ea origin/main -> exit 0. gh pr view 1841: state MERGED, mergedAt 2026-11-22T15:35:22Z. Дубль кода не создаём; отдельный docs-PR несёт только статус карточки и доказательство.
 Закрыл: ses_cmx02b_executor
 Время закрытия: 2026-11-22T16:55:06Z
+## Подтверждение
+- PR #1970 MERGED: 2026-11-22 (squash).
+

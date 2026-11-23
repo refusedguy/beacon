@@ -16,3 +16,6 @@
 Причина: Already landed in origin/main via PR #1725, commit 73cb145e2803fdc25a7646f950538dcb3d933ac8 (git merge-base --is-ancestor origin/main exit 0); touches only OwnerFiles cmd/beacon/orchestrate.go and cmd/beacon/orchestrate_budget_test.go. No duplicate code needed.
 Закрыл: ses_ccx02b_executor
 Время закрытия: 2026-11-22T16:58:55Z
+## Подтверждение
+- PR #1979 MERGED: 2026-11-22 (squash).
+

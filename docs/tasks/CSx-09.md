@@ -17,3 +17,6 @@ baseline: `rg -n 'conformance' internal cmd tests .opencode` на `origin/main` 
 Причина: Already landed in PR #1761 (merge commit 330dd95a4cbf93d56982dfb1dc1e1146c1b84e05); git merge-base --is-ancestor 330dd95a origin/main exit 0. Fix touches both OwnerFiles: internal/infra/store/events_test.go and internal/infra/store/sessions.go. No duplicate code PR; this PR carries only the card close with evidence.
 Закрыл: ses_csx09_executor
 Время закрытия: 2026-11-22T17:41:53Z
+## Подтверждение
+- PR #2054 MERGED: 2026-11-22 (squash).
+

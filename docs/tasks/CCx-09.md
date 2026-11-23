@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1826: commit f1ad10f6 feat(session): reverse scan to compaction cutoff at fork (CCx-09), merge-base --is-ancestor f1ad10f6 origin/main exit 0. Implementation in cmd/beacon/attach.go, internal/app/session/registry.go, cmd/beacon/attach_fork_test.go; no duplicate code. Closing card status to match main.
 Закрыл: ses_ccx09c_executor
 Время закрытия: 2026-11-22T18:01:32Z
+## Подтверждение
+- PR #2068 MERGED: 2026-11-22 (squash).
+

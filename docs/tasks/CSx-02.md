@@ -17,3 +17,6 @@ baseline: `rg -n 'hook_started|hook_response|include_hook_events' internal cmd .
 Причина: Already landed in origin/main via PR #1738, merge commit 171825deded39dd3c72c1c4b9cb4c223bae16f18; git merge-base --is-ancestor 171825de origin/main exit 0. No duplicate code.
 Закрыл: ses_csx02_executor
 Время закрытия: 2026-11-22T16:59:10Z
+## Подтверждение
+- PR #1983 MERGED: 2026-11-22 (squash).
+

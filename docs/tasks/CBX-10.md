@@ -23,3 +23,6 @@ Baseline: beads: internal/doltremote/remote.go:121-133 перечисляет ш
 Причина: Already landed in PR #1815 (merge commit 84fca286168941d00877f490ed1119dea0056067, fix commit e24310b00ae6e2cfd245f091400ed94819947b09). git merge-base --is-ancestor 84fca286 origin/main exit 0. Implementation present in origin/main: cmd/beacon/prcreate.go, internal/infra/github/repo_detect.go, internal/infra/github/repo_detect_test.go.
 Закрыл: ses_cbx10b_executor
 Время закрытия: 2026-11-22T17:44:19Z
+## Подтверждение
+- PR #2057 MERGED: 2026-11-22 (squash).
+

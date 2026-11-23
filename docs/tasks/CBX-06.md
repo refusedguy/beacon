@@ -23,3 +23,6 @@ Baseline: beads: cmd/bd/import_shared.go:22-33, замер 26k issues давал
 Причина: Уже влито в PR #1743 (squash 3a3c303418410308e22894786dc2c44d4b478a33); git merge-base --is-ancestor exit 0. Код CBX-06 (куски записи с фиксацией, пауза, ChunkSize/ChunkPause, отчёт о кусках) уже в origin/main, дубль кода не нужен.
 Закрыл: ses_cbx06_executor
 Время закрытия: 2026-11-22T17:58:07Z
+## Подтверждение
+- PR #2065 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1755 (docs(design): capture prototype as primary source (CMx-19)); merge commit 482b2dca10213fdb1615461602b797bc2c34aea6 is ancestor of origin/main (git merge-base --is-ancestor exit 0); docs/design/prototype-capture.md already on origin/main and satisfies verification. No duplicate code written.
 Закрыл: ses_cmx19_executor
 Время закрытия: 2026-11-22T18:22:15Z
+## Подтверждение
+- PR #2128 MERGED: 2026-11-22 (squash).
+

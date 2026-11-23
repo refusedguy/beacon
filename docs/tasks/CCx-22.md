@@ -16,3 +16,6 @@
 Причина: Already landed in origin/main via commit 87f60b6b (PR #1823) "feat(mcp): model tool namespace and encrypted parameter markers (CCx-22)". git merge-base --is-ancestor 87f60b6b origin/main exit 0. OwnerFiles schema.go/namespace_test.go already contain ToolNamespace, NamespacedTool, SetToolNamespace, ToolNamespaceOf, MarkParameterEncrypted, ParameterEncrypted and SubstituteToolSchema with acceptance test; later schema.go commits 42b96d35 and e0eb1743 are on top. No duplicate code.
 Закрыл: ses_ccx22b_executor
 Время закрытия: 2026-11-22T18:24:13Z
+## Подтверждение
+- PR #2139 MERGED: 2026-11-22 (squash).
+

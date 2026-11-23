@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main: коммит ab6c234a, PR #1791, merge-base --is-ancestor exit 0. Раздел «Объяснение подсистемы» присутствует в docs/templates/executor-task.md. Дубль кода и PR не создаются.
 Закрыл: ses_pskx08_executor
 Время закрытия: 2026-11-22T17:34:39Z
+## Подтверждение
+- PR #2042 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1813, merge commit 0d433be935eda13eeceb5013c0a949472f3f0e25. git merge-base --is-ancestor against origin/main exits 0. The implementation is in internal/infra/worktree/list.go and internal/infra/worktree/backlink_test.go on origin/main, so no duplicate code was written.
 Закрыл: ses_ccx20c_executor
 Время закрытия: 2026-11-22T18:22:38Z
+## Подтверждение
+- PR #2131 MERGED: 2026-11-22 (squash).
+

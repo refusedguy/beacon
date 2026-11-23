@@ -17,3 +17,6 @@ baseline: git grep по cmd/beacon/mcp.go не находит GraphIndexReader, 
 Причина: Already landed: PR #1753, commit 355ba72a feat(mcp): wire ADR 0314 ports in composition root, merged 2026-11-22T14:36:28Z. git merge-base --is-ancestor 355ba72a origin/main exit 0. Diff touched only cmd/beacon/mcp.go and cmd/beacon/mcp_test.go. No duplicate code PR.
 Закрыл: ses_fte01_executor
 Время закрытия: 2026-11-22T16:55:06Z
+## Подтверждение
+- PR #1967 MERGED: 2026-11-22 (squash).
+

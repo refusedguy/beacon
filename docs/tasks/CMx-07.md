@@ -16,3 +16,6 @@
 Причина: Фикс уже в origin/main: squash-коммит 0bcc97035803920d31c2ed624ae810bdaa442c19 (PR #1845), git merge-base --is-ancestor 0bcc9703 origin/main -> exit 0; docs/templates/architecture-report.md присутствует в origin/main. Дубль кода не нужен. В PR переносится только статус карточки с доказательством.
 Закрыл: ses_cmx07b_executor
 Время закрытия: 2026-11-22T17:23:55Z
+## Подтверждение
+- PR #2036 MERGED: 2026-11-22 (squash).
+

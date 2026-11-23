@@ -16,3 +16,6 @@
 Причина: Already landed in origin/main via PR #1931, commit 1f9ad9dcabb73b03b8eaca7006251a76e886a734 (feat(orchestrator): read-only first shell call after resume (CCx-14) (#1931)). git merge-base --is-ancestor 1f9ad9dcabb73b03b8eaca7006251a76e886a734 origin/main exit 0. No duplicate code written.
 Закрыл: ses_ccx14d_executor
 Время закрытия: 2026-11-22T18:11:53Z
+## Подтверждение
+- PR #2098 MERGED: 2026-11-22 (squash).
+

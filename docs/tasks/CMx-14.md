@@ -16,3 +16,6 @@
 Причина: Fix already merged: commit 74b32115009f100066ec5131470c740470bd7664 via PR #1857 adds docs/runbooks/design-tree.md; git merge-base --is-ancestor 74b32115 origin/main exit 0; file present in origin/main. No duplicate code.
 Закрыл: ses_cmx14c_executor
 Время закрытия: 2026-11-22T18:13:05Z
+## Подтверждение
+- PR #2099 MERGED: 2026-11-22 (squash).
+

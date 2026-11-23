@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1909 (merge commit 7d810af7, "feat(batchapply): classify sandbox write denials (CCx-24)"); git merge-base --is-ancestor 7d810af7 origin/main exit 0. Implementation is present in internal/infra/batchapply/apply.go and denial_test.go. No duplicate code written.
 Закрыл: ses_ccx24c_executor
 Время закрытия: 2026-11-22T18:25:13Z
+## Подтверждение
+- PR #2142 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1855, merge commit fad36274ffeae3efc5642b177d5596c11233fb5e (docs(design): triage states and claim check (CMx-09)). docs/design/triage-states.md is present in origin/main; git merge-base --is-ancestor fad36274ffeae3efc5642b177d5596c11233fb5e origin/main exits 0. No duplicate code written.
 Закрыл: ses_cmx09b_executor
 Время закрытия: 2026-11-22T17:41:24Z
+## Подтверждение
+- PR #2053 MERGED: 2026-11-22 (squash).
+

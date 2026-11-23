@@ -16,3 +16,6 @@
 Причина: Fix already landed in main via PR #1849 (commit eda4eaf6590cbce3df05174131676573c427fd66, docs(runbooks): add human wizard runbook (CMx-12)); git merge-base --is-ancestor eda4eaf6590cbce3df05174131676573c427fd66 origin/main exit 0. Runbook docs/runbooks/human-wizard.md present in main with threshold, four stage fields and five script requirements. No duplicate runbook edit.
 Закрыл: ses_cmx12b_executor
 Время закрытия: 2026-11-22T18:11:32Z
+## Подтверждение
+- PR #2092 MERGED: 2026-11-22 (squash).
+

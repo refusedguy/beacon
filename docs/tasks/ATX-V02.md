@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main через PR #1646, коммит 7debcb0d (fix(cibridge): keep informational checks out of blocker incidents (ATX-V02)). git merge-base --is-ancestor 7debcb0d origin/main -> exit 0. Дубль кода не нужен.
 Закрыл: ses_atxv02_executor
 Время закрытия: 2026-11-22T16:55:14Z
+## Подтверждение
+- PR #1976 MERGED: 2026-11-22 (squash).
+

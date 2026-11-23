@@ -16,3 +16,6 @@
 Причина: CCx-13 уже реализован коммитом 552d9e0d (PR #1873) и влит в origin/main. merge-base --is-ancestor 552d9e0d origin/main вернул 0. В cmd/beacon/attach.go есть attachCandidateFits, savedAttachRecord и проверка пригодности кандидата в registryResumeSession. Два теста лежат в cmd/beacon/attach_candidate_test.go. Дубль кода не нужен.
 Закрыл: ses_ccx13d_executor
 Время закрытия: 2026-11-22T18:10:38Z
+## Подтверждение
+- PR #2087 MERGED: 2026-11-22 (squash).
+

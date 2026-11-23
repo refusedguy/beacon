@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main через PR #1853 (merge commit dea78a96, исходный коммит a3328e6c). `git merge-base --is-ancestor dea78a96 origin/main` вернул код выхода 0. docs/design/decision-map.md уже присутствует на main и содержит все шесть элементов из проверки карточки. PR-дубль кода не открывается по ветке 6b.
 Закрыл: ses_cmx10b_executor
 Время закрытия: 2026-11-22T18:08:24Z
+## Подтверждение
+- PR #2075 MERGED: 2026-11-22 (squash).
+

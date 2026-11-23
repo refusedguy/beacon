@@ -16,3 +16,6 @@
 Причина: Implementation already landed in origin/main via PR #1952, commit 30ee1c73 (feat(session): restore requested workspace roots at resume (CCx-15) (#1952)). Verified git merge-base --is-ancestor 30ee1c73 origin/main exit 0. All three OwnerFiles changed in that commit: internal/app/session/registry.go, cmd/beacon/agents.go, internal/app/session/workspace_resume_test.go. No duplicate code written.
 Закрыл: ses_ccx15d_executor
 Время закрытия: 2026-11-22T18:15:23Z
+## Подтверждение
+- PR #2105 MERGED: 2026-11-22 (squash).
+

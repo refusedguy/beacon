@@ -16,3 +16,6 @@
 Причина: Landed in PR #1817, merge commit 8acc95fd8bbbea6fc19848dd1d4013d5f336e459. git merge-base --is-ancestor 8acc95fd... origin/main exits 0. internal/infra/worktree/marker.go already has MarkerVersion, DisallowUnknownFields, ErrMarkerVersion and marker_version_test.go exists in origin/main. No duplicate code written; card close fields shipped in a docs-only PR.
 Закрыл: ses_ccx21c_executor
 Время закрытия: 2026-11-22T18:23:26Z
+## Подтверждение
+- PR #2135 MERGED: 2026-11-22 (squash).
+

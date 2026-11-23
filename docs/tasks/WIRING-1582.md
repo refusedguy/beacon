@@ -19,6 +19,10 @@ PR: 1582
 Причина: Уже влито в main. PR #1906, коммит f48b44b30344f6019cf9847c2e73854acb1c866f (feat(stats): expose shared CI gate snapshot (FTE-03)), добавил в internal/infra/mcp/tool_stats.go порт SharedGateSnapshotReader, метод SetSharedGateSnapshotReader, публикацию CIWaitSnapshot и тест. Проверка git merge-base --is-ancestor f48b44b3 origin/main вернула 0. Привязку адаптера в композитном корне ведёт отдельная карточка WIRING-1906, её OwnerFiles включают server.go и cmd/beacon/mcp.go. Повторного кода и PR с кодом не открываю.
 Закрыл: ses_wiring1582_executor
 Время закрытия: 2026-11-22T18:26:53Z
+
 ## Причина
 
 OwnerFiles PR #1582 включали только internal/infra/store/observability.go. beacon_stats лежит в internal/infra/mcp, а сборка зависимостей живёт в cmd/beacon. Подключение снимка к статистике вынесли в отдельную карточку.
+
+## Подтверждение
+- PR #2145 MERGED: 2026-11-22 (squash).

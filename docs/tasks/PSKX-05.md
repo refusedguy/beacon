@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main: PR #1740, squash-коммит da1d710c54302a8e20e6a012b20d06628f1265f6; git merge-base --is-ancestor da1d710c54302a8e20e6a012b20d06628f1265f6 origin/main -> exit 0. docs/runbooks/verification.md уже содержит раздел «Реестр проверок» с колонкой «Commit синхронизации». Дубль кода не создаётся.
 Закрыл: ses_pskx05_executor
 Время закрытия: 2026-11-22T17:19:54Z
+## Подтверждение
+- PR #2026 MERGED: 2026-11-22 (squash).
+

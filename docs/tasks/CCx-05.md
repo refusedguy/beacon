@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1729 (feat(orchestrator): defer network approval with cancel proxy (CCx-05)), squash merge 8f02f459; git merge-base --is-ancestor 8f02f459 origin/main exit 0. No duplicate code PR; docs-only status PR follows.
 Закрыл: ses_ccx05_executor
 Время закрытия: 2026-11-22T17:13:54Z
+## Подтверждение
+- PR #2018 MERGED: 2026-11-22 (squash).
+

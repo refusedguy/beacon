@@ -16,3 +16,6 @@
 Причина: Fix already merged: commit e718298f88938944fa1b1f9ac303adc408b7579e (PR #1758 "docs(templates): add spec template with testing decisions (CMx-21)"). git merge-base --is-ancestor e718298f origin/main exited 0. docs/templates/spec.md already on origin/main; no duplicate code PR needed.
 Закрыл: ses_cmx21_executor
 Время закрытия: 2026-11-22T18:23:22Z
+## Подтверждение
+- PR #2134 MERGED: 2026-11-22 (squash).
+

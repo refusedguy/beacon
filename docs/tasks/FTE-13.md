@@ -17,3 +17,6 @@ baseline: markOrphaned в internal/infra/cibridge/wake_dispatcher.go:596 сущ�
 Причина: Already landed in PR #1905, merge commit 38d60a6743f28324edd5c75237fd85a692f3f89f; git merge-base --is-ancestor of that SHA against origin/main exit 0. Implementation present in all three OwnerFiles (orphan_wake_total, orphan field, WakeDeliveredOrphan, OrphanWake). No duplicate code.
 Закрыл: ses_fte13c_executor
 Время закрытия: 2026-11-22T18:12:05Z
+## Подтверждение
+- PR #2096 MERGED: 2026-11-22 (squash).
+

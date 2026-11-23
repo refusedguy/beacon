@@ -16,3 +16,6 @@
 Причина: Уже влито в origin/main коммитом ecf36ac3d5e7ef011153293827dcc6920ef1a41d через PR #1859. docs/design/guardrail-smoke.md присутствует в main, merge-base --is-ancestor вернул 0. Дубль кода не создаётся.
 Закрыл: ses_cmx17b_executor
 Время закрытия: 2026-11-22T18:19:08Z
+## Подтверждение
+- PR #2116 MERGED: 2026-11-22 (squash).
+

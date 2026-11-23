@@ -1,6 +1,6 @@
 # WIRING-1822. Connect hookrun modes to card lifecycle events in service.go
 
-Статус: todo
+Статус: done
 Фаза: P3
 Тип: task
 Владелец файлов: internal/app/service.go
@@ -9,8 +9,8 @@ OwnerFiles: internal/app/service.go
 Ссылка: PR 1822
 SourceWatch: watch:refusedguy/beacon:1822:8cd43c41fdfbdd6ad145f865326a1900aa7793b0@1795361182:1800
 PR: 1822
-Агент: нет
-Время: нет
+Агент: ses_wiring1822_executor
+Время: 2026-11-22T18:26:05Z
 Цель: Подключить режимы hookrun к событиям карточки в internal/app/service.go.
 
 Контекст: CD-05 добавила режимы Notify, Sync и Gate в internal/infra/hookrun/modes.go. Карточка запрещает править service.go в этом PR, поэтому приложение пока вызывает только hookrun.Run без выбора режима.
@@ -21,6 +21,12 @@ PR: 1822
 
 Приёмка: Проводка применена, запись в `beacon deferred --format json` имеет status done, CI зелёный.
 
+Причина: already_landed
+Закрыл: beacon
+Время закрытия: 2026-11-22T18:36:19Z
 ## Причина
 
 Точка подключения лежит в internal/app/service.go, который не входит в OwnerFiles карточки CD-05. Выбор режима для каждого события и внедрение Runner требуют отдельного PR и решения владельца по контракту вызова.
+
+## Подтверждение
+- PR #2154 MERGED: 2026-11-22 (squash).

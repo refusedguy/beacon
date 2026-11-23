@@ -16,3 +16,6 @@
 Причина: Уже влито в main через PR #1816, полный SHA f7bae2f438367c1c34be2c3abc20404d93e57457; git merge-base --is-ancestor f7bae2f438367c1c34be2c3abc20404d93e57457 origin/main = 0. Коммит изменил все три OwnerFiles: internal/infra/store/atomic_write.go, internal/infra/store/schema_contract_test.go, docs/evals/ccx16-trace-schema.md. Дубли кода не делаем.
 Закрыл: ses_ccx16c_executor
 Время закрытия: 2026-11-22T18:17:28Z
+## Подтверждение
+- PR #2112 MERGED: 2026-11-22 (squash).
+

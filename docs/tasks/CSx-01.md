@@ -17,3 +17,6 @@ baseline: `rg -n 'asyncTimeout|AsyncHook' internal cmd .opencode` на `origin/m
 Причина: Уже влито в origin/main: PR #1734, коммит 3e472df64263cdebc287a37b2dc1944eec69363b; git merge-base --is-ancestor 3e472df6 origin/main exit 0. Код дублировать не нужно, PR несёт только статус карточки и доказательство.
 Закрыл: ses_csx01_executor
 Время закрытия: 2026-11-22T16:55:12Z
+## Подтверждение
+- PR #1971 MERGED: 2026-11-22 (squash).
+

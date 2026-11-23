@@ -16,3 +16,6 @@
 Причина: Реализация уже влита в main: PR #1869, merge commit 00621a08dad30f713533c9b0700e85c529a76361. git merge-base --is-ancestor <SHA> origin/main -> exit 0. Дубль кода не создавался.
 Закрыл: ses_ccx12c_executor
 Время закрытия: 2026-11-22T18:11:29Z
+## Подтверждение
+- PR #2093 MERGED: 2026-11-22 (squash).
+

@@ -19,6 +19,10 @@ PR: 1608
 Причина: Уже влито в origin/main, дубль кода не создаём. Источник PR #1608 мерджен (e31893b7153cea5e39b344823d858596ea3ba2ad). Серверная часть проводки влита PR #1660 (merge SHA 2d34645b54f45d84dba3a595350f17f8658759da, internal/infra/mcp/server.go): attachTaskClaim принимает Dependencies и связывает GraphIndexReader. Часть composition root и тесты влиты PR #1753 (merge SHA 355ba72a236c67d9ecce0504c6ea2f1c296bb3fa, ровно OwnerFiles cmd/beacon/mcp.go и cmd/beacon/mcp_test.go): buildMCPDependencies связывает GraphIndexReader, RegistryStatsReader и GenerationLedger, mcp_test.go проверяет все три порта. git merge-base --is-ancestor для обоих SHA дал exit 0. Открытого PR с этой же проводкой нет.
 Закрыл: ses_wiring1608_executor
 Время закрытия: 2026-11-22T18:27:28Z
+
 ## Причина
 
 cmd/beacon/mcp.go был занят открытыми PR #1496 и #1601, а beacon_claim не входит в объявленный набор инструментов. Привязку composition root и покрытие mcp_test.go записали отдельной карточкой, чтобы не расширять OwnerFiles PR #1608.
+
+## Подтверждение
+- PR #2146 MERGED: 2026-11-22 (squash).

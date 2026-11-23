@@ -16,3 +16,6 @@
 Причина: Implementation already in origin/main. Rule "Карта возможностей и полнота прогона" added to docs/e2e/README.md by merged PR #1744, commit 938b266a6063b61872eab1d9e04306884e87a269. git merge-base --is-ancestor 938b266a origin/main exit=0. No duplicate code written.
 Закрыл: ses_pskx06_executor
 Время закрытия: 2026-11-22T17:20:04Z
+## Подтверждение
+- PR #2027 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Решение уже влито в origin/main: PR #1746, squash-коммит ebd98317. git merge-base --is-ancestor ebd98317 origin/main вернул 0. Файл docs/design/review-axes.md уже содержит обе оси, все двенадцать запахов и запрет переранжирования. Дубль кода не создан.
 Закрыл: ses_cmx01_executor
 Время закрытия: 2026-11-22T16:55:04Z
+## Подтверждение
+- PR #1968 MERGED: 2026-11-22 (squash).
+

@@ -16,3 +16,6 @@
 Причина: Фикс уже в origin/main: docs/design/integration-branch.md залит PR #1854 коммитом 852628abee2f09f0d0c75deb4e5af625ab65e1cf, git merge-base --is-ancestor 852628abee2f09f0d0c75deb4e5af625ab65e1cf origin/main вернул 0. Дубль кода не создаём.
 Закрыл: ses_cmx08b_executor
 Время закрытия: 2026-11-22T17:35:17Z
+## Подтверждение
+- PR #2046 MERGED: 2026-11-22 (squash).
+

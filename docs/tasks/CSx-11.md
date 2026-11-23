@@ -17,3 +17,6 @@ baseline: `rg -n 'client_composed|verbatim|verbatim_prompts' internal cmd` на 
 Причина: Уже влито в main через PR #1747, commit 5f0ce57e71e1760cf077f186bba15d7016fcc6d9 ('feat(spawn): mark client-composed prompts for verbatim delivery (CSx-11)'). git merge-base --is-ancestor 5f0ce57e71e1760cf077f186bba15d7016fcc6d9 origin/main дав exit 0. Дубль кода не создаём: PR несёт только закрытие карточки с доказательством.
 Закрыл: ses_csx11_executor
 Время закрытия: 2026-11-22T18:08:40Z
+## Подтверждение
+- PR #2079 MERGED: 2026-11-22 (squash).
+

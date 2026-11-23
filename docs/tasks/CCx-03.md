@@ -16,3 +16,6 @@
 Причина: Already landed in PR #1723 (commit 7c48dccd9a458dd1eeceb8b15e1bc0e3c20f134b). git merge-base --is-ancestor 7c48dccd9a458dd1eeceb8b15e1bc0e3c20f134b origin/main exit 0. Owner files cmd/beacon/orchestrate.go and cmd/beacon/orchestrate_ready_test.go already carry the readiness-wait fix.
 Закрыл: ses_ccx03b_executor
 Время закрытия: 2026-11-22T17:03:27Z
+## Подтверждение
+- PR #1995 MERGED: 2026-11-22 (squash).
+

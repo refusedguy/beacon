@@ -23,3 +23,6 @@ Baseline: beads: cmd/bd/import_shared.go:156-161, prefilter сам по себе
 Причина: Already landed in PR #1800, squash commit ab01923b863b805d278974e93d7eb6618f60cac6. Verified git merge-base --is-ancestor ab01923b origin/main exit 0. OwnerFiles internal/infra/batchapply/apply.go and apply_test.go already carry the stale-row prefilter, in-upsert updated_at recheck and force override in main. No duplicate code written.
 Закрыл: ses_cbx07_executor
 Время закрытия: 2026-11-22T17:59:51Z
+## Подтверждение
+- PR #2067 MERGED: 2026-11-22 (squash).
+

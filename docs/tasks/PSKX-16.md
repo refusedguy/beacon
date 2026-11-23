@@ -16,3 +16,6 @@
 Причина: PSKX-16 уже влит в main через PR #1956 (merge commit c1e7dec78f9161af100e3b9f1bb9970fb8bf31ba). `git merge-base --is-ancestor c1e7dec7 origin/main` exit 0. Секция «Углубление задачи перед выдачей» уже присутствует в docs/templates/orchestrator-task.md на origin/main (строки 136-152, содержит «углублённая формулировка» и «сырой материал»). Дублирование изменения документации не требуется.
 Закрыл: ses_pskx16c_executor
 Время закрытия: 2026-11-22T18:18:22Z
+## Подтверждение
+- PR #2114 MERGED: 2026-11-22 (squash).
+

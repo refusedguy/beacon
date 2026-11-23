@@ -16,3 +16,6 @@
 Причина: Fix already landed in origin/main through PR #1809, commit 35545a0afe33f6d875be6a3338964491274a4b8e, docs(verification): четыре исхода провала проверки (PSKX-11). git merge-base --is-ancestor 35545a0a origin/main exits 0. docs/runbooks/verification.md carries the four-outcome table. No duplicate code PR; this close records that the work shipped.
 Закрыл: ses_pskx11b_executor
 Время закрытия: 2026-11-22T18:08:33Z
+## Подтверждение
+- PR #2077 MERGED: 2026-11-22 (squash).
+
