@@ -361,10 +361,11 @@ func TestWakeInterruptionWinsOverMissingInput(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasHumanFlags proves the two ADR 0028 flags are part of the
-// wake tool's input schema, so an MCP client can send them. The SDK reflects
-// the schema from WakeInput; no hand-written JSON is involved.
-func TestWakeSchemaHasHumanFlags(t *testing.T) {
+// assertWakeSchemaFields starts a wake server once and checks that every named
+// field reaches the reflected input schema. Sharing this setup keeps each
+// schema case to a single table row.
+func assertWakeSchemaFields(t *testing.T, fields ...string) {
+	t.Helper()
 	server := NewServer()
 	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
 	session := connectWakeServer(t, server)
@@ -384,10 +385,36 @@ func TestWakeSchemaHasHumanFlags(t *testing.T) {
 	if len(inputSchema) == 0 {
 		t.Fatal("wake tool input schema is empty")
 	}
-	for _, flag := range []string{"hasPendingQuestion", "pendingApproval"} {
-		if !strings.Contains(string(inputSchema), flag) {
-			t.Errorf("wake input schema missing %q: %s", flag, inputSchema)
+	for _, field := range fields {
+		if !strings.Contains(string(inputSchema), field) {
+			t.Errorf("wake input schema missing %q: %s", field, inputSchema)
 		}
+	}
+}
+
+// TestWakeSchemaHasFields checks the nine fields covered by the former
+// TestWakeSchemaHas* tests. The human case keeps both ADR 0028 flags from
+// TestWakeSchemaHasHumanFlags; every other case keeps its original field name.
+func TestWakeSchemaHasFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields []string
+	}{
+		{name: "human", fields: []string{"hasPendingQuestion", "pendingApproval"}},
+		{name: "source", fields: []string{"source"}},
+		{name: "executor", fields: []string{"executor"}},
+		{name: "woke", fields: []string{"woke"}},
+		{name: "requiredCapabilities", fields: []string{"requiredCapabilities"}},
+		{name: "targetWorktree", fields: []string{"targetWorktree"}},
+		{name: "wakeBetweenMillis", fields: []string{"wakeBetweenMillis"}},
+		{name: "state", fields: []string{"state"}},
+		{name: "prompt", fields: []string{"prompt"}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertWakeSchemaFields(t, tc.fields...)
+		})
 	}
 }
 
@@ -510,33 +537,6 @@ func TestWakeReviewSourceDoesNotBreakInterruption(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasSource proves an MCP client can send the message source,
-// so a caller can mark a diff comment as review in the tool call.
-func TestWakeSchemaHasSource(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "source") {
-		t.Errorf("wake input schema missing source: %s", inputSchema)
-	}
-}
-
 // TestWakeReviewOverInMemoryTransport drives a review-source diff comment
 // through a real MCP client and server. It proves both the steer delivery and
 // the source reach the client, not just the in-process handler.
@@ -625,33 +625,6 @@ func TestWakeExecutorOnRefusalAndInterruption(t *testing.T) {
 	if interrupted.Executor != "gemini" || !interrupted.Interrupted {
 		t.Errorf("interruption executor=%q interrupted=%v, want gemini/true",
 			interrupted.Executor, interrupted.Interrupted)
-	}
-}
-
-// TestWakeSchemaHasExecutor proves an MCP client can send the current executor,
-// so a caller can report a fallback handover through the wake tool.
-func TestWakeSchemaHasExecutor(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "executor") {
-		t.Errorf("wake input schema missing executor: %s", inputSchema)
 	}
 }
 
@@ -754,32 +727,6 @@ func TestWokeOnInterruption(t *testing.T) {
 	}
 	if !out.Woke || !out.Interrupted || out.OK {
 		t.Errorf("woke=%v interrupted=%v ok=%v, want true/true/false", out.Woke, out.Interrupted, out.OK)
-	}
-}
-
-// TestWakeSchemaHasWoke proves an MCP client can send the separate woke fact.
-func TestWakeSchemaHasWoke(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "woke") {
-		t.Errorf("wake input schema missing woke: %s", inputSchema)
 	}
 }
 
@@ -1014,33 +961,6 @@ func TestWakeWithoutCapabilitiesKeepsExplicitTarget(t *testing.T) {
 	}
 	if directory.calls != 0 {
 		t.Errorf("directory calls=%d, want 0 when no capabilities are requested", directory.calls)
-	}
-}
-
-// TestWakeSchemaHasRequiredCapabilities proves an MCP client can send the
-// capability request that drives the new selection path.
-func TestWakeSchemaHasRequiredCapabilities(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "requiredCapabilities") {
-		t.Errorf("wake input schema missing requiredCapabilities: %s", inputSchema)
 	}
 }
 
@@ -1305,33 +1225,6 @@ func TestWakeWorktreeWithCapabilities(t *testing.T) {
 	}
 	if !out.OK || sender.lastTarget != "review-w2" {
 		t.Errorf("ok=%v target=%q, want true/review-w2", out.OK, sender.lastTarget)
-	}
-}
-
-// TestWakeSchemaHasTargetWorktree proves an MCP client can send the worktree
-// path that drives the new addressing path.
-func TestWakeSchemaHasTargetWorktree(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "targetWorktree") {
-		t.Errorf("wake input schema missing targetWorktree: %s", inputSchema)
 	}
 }
 
@@ -1877,33 +1770,6 @@ func TestWakeBetweenFallbackStaggersOnce(t *testing.T) {
 	}
 }
 
-// TestWakeSchemaHasWakeBetweenMillis proves an MCP client can send the wait
-// window that drives the stagger.
-func TestWakeSchemaHasWakeBetweenMillis(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "wakeBetweenMillis") {
-		t.Errorf("wake input schema missing wakeBetweenMillis: %s", inputSchema)
-	}
-}
-
 // TestWakeBetweenOverInMemoryTransport drives the window through a real MCP
 // client and server. It proves the field is decoded from the schema and the
 // waiter is staggered before delivery.
@@ -2131,33 +1997,6 @@ func TestWakeStateOverInMemoryTransport(t *testing.T) {
 	}
 	if out.State != StateRead || !out.State.IsRead() || !out.OK {
 		t.Errorf("client saw state=%q IsRead=%v ok=%v, want read/true/true", out.State, out.State.IsRead(), out.OK)
-	}
-}
-
-// TestWakeSchemaHasState proves an MCP client can send the receipt state, so
-// the environment can report where in its life a message actually is.
-func TestWakeSchemaHasState(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "state") {
-		t.Errorf("wake input schema missing state: %s", inputSchema)
 	}
 }
 
@@ -2863,33 +2702,6 @@ func TestT3_124ConcurrentEqualPromptsStartOneTask(t *testing.T) {
 	}
 	if sender.calls != 1 {
 		t.Errorf("sender calls = %d, want 1", sender.calls)
-	}
-}
-
-// TestT3_124WakeSchemaHasPrompt proves the prompt field reaches the input
-// schema derived by go-sdk, so a real client can send it.
-func TestT3_124WakeSchemaHasPrompt(t *testing.T) {
-	server := NewServer()
-	AttachWake(server, NewWakeHandler((&fakeWakeSender{delivery: DeliveryQueue}).Deliver))
-	session := connectWakeServer(t, server)
-
-	var inputSchema []byte
-	for tool, err := range session.Tools(context.Background(), nil) {
-		if err != nil {
-			t.Fatalf("tools/list: %v", err)
-		}
-		if tool.Name == WakeToolName {
-			inputSchema, err = json.Marshal(tool.InputSchema)
-			if err != nil {
-				t.Fatalf("marshal wake input schema: %v", err)
-			}
-		}
-	}
-	if len(inputSchema) == 0 {
-		t.Fatal("wake tool input schema is empty")
-	}
-	if !strings.Contains(string(inputSchema), "prompt") {
-		t.Errorf("wake input schema missing prompt: %s", inputSchema)
 	}
 }
 
