@@ -45,7 +45,7 @@ var catalog = []command{
 	{Name: "index", Summary: "Пересобрать SQLite-индекс карточек", Usage: "beacon index build [--root <dir>]"},
 	{Name: "init", Summary: "Подготовить проект: хуки, шаблоны и проверка MCP", Usage: "beacon init [--root <dir>] [--force]"},
 	{Name: "inspect", Summary: "Показать состояние вотч, блокеров и привязки оркестратора", Usage: "beacon inspect [<pr|watchID>] [--format table|json] [--json]"},
-	{Name: "list", Summary: "Показать каталог команд", Usage: "beacon list [--format table|json]"},
+	{Name: "list", Summary: "Показать каталог команд", Usage: "beacon list [--format table|json] [--markdown]"},
 	{Name: "logs", Summary: "Прочитать структурированные логи проекта", Usage: "beacon logs [--tail 100] [--watch <id>] [--pr <n>] [--errors] [--format table|json] [--json]"},
 	{Name: "mcp", Summary: "Запустить MCP-сервер на stdio", Usage: "beacon mcp"},
 	{Name: "metrics", Summary: "Показать метрики цикла", Usage: "beacon metrics [--format json|prometheus]"},
@@ -142,11 +142,16 @@ func parseCommandFormat(name, format string, errOut io.Writer, showUsage bool) b
 func runList(args []string, out, errOut io.Writer) int {
 	fs := flag.NewFlagSet("list", flag.ContinueOnError)
 	format := fs.String("format", "table", "формат вывода")
+	markdown := fs.Bool("markdown", false, "печатать каталог markdown-таблицей для README")
 	if !parseFlags("list", args, errOut, fs) {
 		return taskstore.ExitValidation
 	}
 	if !parseCommandFormat("list", *format, errOut, true) {
 		return taskstore.ExitValidation
+	}
+	if *markdown {
+		writeCommandMarkdown(out)
+		return taskstore.ExitOK
 	}
 
 	switch *format {
