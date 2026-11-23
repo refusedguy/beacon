@@ -1,11 +1,25 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/refusedguy/beacon/pkg/core"
 )
+
+func equalPaths(a, b []core.ScopePath) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func TestPlannerSelectsTwentyNonOverlappingTasks(t *testing.T) {
 	var tasks []core.Task
@@ -47,8 +61,111 @@ func TestPlannerSkipsOverlappingAndBusyScopes(t *testing.T) {
 	if len(chosen) != 1 || chosen[0].ID != "A" {
 		t.Fatalf("unexpected selection: %+v", chosen)
 	}
-	if len(skipped) != 2 {
+	byID := map[core.TaskID]SkippedTask{}
+	for _, s := range skipped {
+		byID[s.TaskID] = s
+	}
+	if len(byID) != 2 {
 		t.Fatalf("expected 2 skipped, got %+v", skipped)
+	}
+
+	activeSkip, ok := byID["E"]
+	if !ok {
+		t.Fatalf("active conflict not reported: %+v", skipped)
+	}
+	if activeSkip.Code != SkipActiveScopeOverlap {
+		t.Errorf("active conflict code = %q, want %q", activeSkip.Code, SkipActiveScopeOverlap)
+	}
+	if activeSkip.BlockedBy != "Z" {
+		t.Errorf("active conflict blocked_by = %q, want Z", activeSkip.BlockedBy)
+	}
+	if activeSkip.BlockedByRun != "r1" {
+		t.Errorf("active conflict blocked_by_run = %q, want r1", activeSkip.BlockedByRun)
+	}
+	if !equalPaths(activeSkip.Overlap, []core.ScopePath{core.ScopeFile("e.go")}) {
+		t.Errorf("active conflict overlap = %+v", activeSkip.Overlap)
+	}
+	if activeSkip.Reason != "scope overlaps Z on f:e.go" {
+		t.Errorf("active conflict reason = %q", activeSkip.Reason)
+	}
+
+	selectedSkip, ok := byID["B"]
+	if !ok {
+		t.Fatalf("selected conflict not reported: %+v", skipped)
+	}
+	if selectedSkip.Code != SkipSelectedScopeOverlap {
+		t.Errorf("selected conflict code = %q, want %q", selectedSkip.Code, SkipSelectedScopeOverlap)
+	}
+	if selectedSkip.BlockedBy != "A" {
+		t.Errorf("selected conflict blocked_by = %q, want A", selectedSkip.BlockedBy)
+	}
+	if selectedSkip.BlockedByRun != "" {
+		t.Errorf("selected conflict blocked_by_run = %q, want empty", selectedSkip.BlockedByRun)
+	}
+	if !equalPaths(selectedSkip.Overlap, []core.ScopePath{core.ScopeFile("a.go")}) {
+		t.Errorf("selected conflict overlap = %+v", selectedSkip.Overlap)
+	}
+	if selectedSkip.Reason != "scope overlaps A on f:a.go" {
+		t.Errorf("selected conflict reason = %q", selectedSkip.Reason)
+	}
+}
+
+func TestPlannerReportsStatusScopeAndActiveRunCodes(t *testing.T) {
+	done := core.Task{ID: "D", Status: core.TaskDone, Scope: []core.ScopePath{core.ScopeFile("d.go")}}
+	unscoped := core.Task{ID: "U", Status: core.TaskAvailable}
+	busy := core.Task{ID: "R", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("r.go")}}
+	active := []*core.Run{{ID: "r-run", TaskID: "R", State: core.RunRunning, Scope: busy.Scope}}
+
+	_, skipped, err := NewPlanner(nil).Select([]core.Task{done, unscoped, busy}, active, 5, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[core.TaskID]SkippedTask{}
+	for _, s := range skipped {
+		byID[s.TaskID] = s
+	}
+	if len(byID) != 3 {
+		t.Fatalf("expected 3 skipped, got %+v", skipped)
+	}
+	if byID["D"].Code != SkipBadStatus {
+		t.Errorf("status skip code = %q, want %q", byID["D"].Code, SkipBadStatus)
+	}
+	if byID["U"].Code != SkipNoScope {
+		t.Errorf("no-scope skip code = %q, want %q", byID["U"].Code, SkipNoScope)
+	}
+	if byID["R"].Code != SkipActiveRun {
+		t.Errorf("active-run skip code = %q, want %q", byID["R"].Code, SkipActiveRun)
+	}
+	if byID["R"].BlockedBy != "R" || byID["R"].BlockedByRun != "r-run" {
+		t.Errorf("active-run skip = %+v", byID["R"])
+	}
+}
+
+func TestSkippedTaskJSONExposesStructuredFields(t *testing.T) {
+	s := SkippedTask{
+		TaskID:       "T-1",
+		Code:         SkipActiveScopeOverlap,
+		Reason:       "scope overlaps T-2 on f:server.go",
+		BlockedBy:    "T-2",
+		BlockedByRun: "r1",
+		Overlap:      []core.ScopePath{core.ScopeFile("server.go")},
+	}
+	data, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	for _, want := range []string{
+		`"task_id":"T-1"`,
+		`"code":"active_scope_overlap"`,
+		`"reason":"scope overlaps T-2 on f:server.go"`,
+		`"blocked_by":"T-2"`,
+		`"blocked_by_run":"r1"`,
+		`"overlap":["f:server.go"]`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("JSON %s is missing %s", got, want)
+		}
 	}
 }
 

@@ -76,7 +76,13 @@ func (d *Dispatcher) Dispatch(ctx context.Context, n int) (DispatchResult, error
 		if existing, err := d.Store.FindActiveByTask(ctx, task.ID); err != nil {
 			return out, err
 		} else if existing != nil {
-			out.Skipped = append(out.Skipped, SkippedTask{task.ID, "already has an active run"})
+			out.Skipped = append(out.Skipped, SkippedTask{
+				TaskID:       task.ID,
+				Code:         SkipActiveRun,
+				BlockedBy:    task.ID,
+				BlockedByRun: existing.ID,
+				Reason:       "already has an active run",
+			})
 			continue
 		}
 		run := core.NewRun(newRunID(), task.ID, time.Now().UTC())

@@ -110,8 +110,76 @@ func TestDispatchDoesNotRetryActiveTask(t *testing.T) {
 	}
 	for _, s := range res.Skipped {
 		if s.TaskID == tasks[0].ID {
+			if s.Code != SkipActiveRun {
+				t.Errorf("skip code = %q, want %q", s.Code, SkipActiveRun)
+			}
+			if s.BlockedBy != tasks[0].ID {
+				t.Errorf("blocked_by = %q, want %q", s.BlockedBy, tasks[0].ID)
+			}
+			if s.BlockedByRun != "r-existing" {
+				t.Errorf("blocked_by_run = %q, want r-existing", s.BlockedByRun)
+			}
 			return
 		}
 	}
 	t.Fatal("active task was not reported as skipped")
+}
+
+func TestDispatchReportsStructuredConflicts(t *testing.T) {
+	store := newFakeStore()
+	tasks := []core.Task{
+		{ID: "A", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("internal/infra/mcp/server.go")}},
+		{ID: "B", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("internal/infra/mcp/server.go")}},
+		{ID: "C", Status: core.TaskAvailable, Scope: []core.ScopePath{core.ScopeFile("docs/tasks/c.md")}},
+	}
+	active := core.NewRun("r-active", "Z", time.Now().UTC())
+	active.State = core.RunRunning
+	active.Scope = []core.ScopePath{core.ScopeFile("docs/tasks/c.md")}
+	if err := store.Save(context.Background(), active); err != nil {
+		t.Fatal(err)
+	}
+	d := &Dispatcher{
+		Source: &fakeSource{tasks: tasks}, Planner: NewPlanner(nil), Workspace: &fakeWorkspace{},
+		Harness: &fakeHarness{}, Store: store,
+		Concurrency: core.Concurrency{MaxInFlight: 20, MaxActiveAgents: 20},
+	}
+	res, err := d.Dispatch(context.Background(), 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Runs) != 1 || res.Runs[0].TaskID != "A" {
+		t.Fatalf("unexpected runs: %+v", res.Runs)
+	}
+	byID := map[core.TaskID]SkippedTask{}
+	for _, s := range res.Skipped {
+		byID[s.TaskID] = s
+	}
+	if len(byID) != 2 {
+		t.Fatalf("expected 2 skipped, got %+v", res.Skipped)
+	}
+
+	selectedSkip, ok := byID["B"]
+	if !ok {
+		t.Fatalf("selected conflict not reported: %+v", res.Skipped)
+	}
+	if selectedSkip.Code != SkipSelectedScopeOverlap || selectedSkip.BlockedBy != "A" {
+		t.Errorf("selected conflict = %+v", selectedSkip)
+	}
+	if !equalPaths(selectedSkip.Overlap, []core.ScopePath{core.ScopeFile("internal/infra/mcp/server.go")}) {
+		t.Errorf("selected conflict overlap = %+v", selectedSkip.Overlap)
+	}
+	if selectedSkip.Reason != "scope overlaps A on f:internal/infra/mcp/server.go" {
+		t.Errorf("selected conflict reason = %q", selectedSkip.Reason)
+	}
+
+	activeSkip, ok := byID["C"]
+	if !ok {
+		t.Fatalf("active conflict not reported: %+v", res.Skipped)
+	}
+	if activeSkip.Code != SkipActiveScopeOverlap || activeSkip.BlockedBy != "Z" || activeSkip.BlockedByRun != "r-active" {
+		t.Errorf("active conflict = %+v", activeSkip)
+	}
+	if !equalPaths(activeSkip.Overlap, []core.ScopePath{core.ScopeFile("docs/tasks/c.md")}) {
+		t.Errorf("active conflict overlap = %+v", activeSkip.Overlap)
+	}
 }
