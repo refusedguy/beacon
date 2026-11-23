@@ -271,6 +271,20 @@ jobs:
             "$bin" "$gate"
           done
 
+      # CLS-03. Печатает по строке на каждую запись REACH-UNWIRED: символ,
+      # есть ли он в коде, достижим ли из cmd, согласована ли причина с
+      # ADR 0263 и вердикт. Запуск из исходников: закоммиченный бинарник
+      # пересобирается отдельной задачей gates-binary. Шаг информационный,
+      # пока в конфиге лежит удалённый символ из CLEAN-16 и ждёт решения
+      # владельца. Сама команда возвращает 1 на такую запись.
+      - name: Check reachability exceptions (informational)
+        continue-on-error: true
+        working-directory: tools/beacon-gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run . reachability --check-exceptions -root ../..
+
       # WIRING-карты остаются в дереве после завершения работы и получают
       # "Статус: done". Гейт требует "todo" и помечает готовые карты находкой.
       # Оставляем прогон информационным, как у docs-гейта.

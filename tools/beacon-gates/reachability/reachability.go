@@ -54,15 +54,23 @@ type source struct {
 	buildIgnore bool
 }
 
-// analyse returns all reachability findings for root.
-func analyse(root string) ([]gate.Finding, error) {
+// analysis is the parsed reachability graph for one tree. Both the finding
+// scan and the exception audit consume it so the two agree on what "wired"
+// means.
+type analysis struct {
+	files     []*source
+	nodes     map[string]decl
+	reachable map[string]bool
+}
+
+// parseAnalysis builds the graph. One node per (package, name); cmd
+// declarations seed the production flow and everything they reference is
+// wired by definition.
+func parseAnalysis(root string) (*analysis, error) {
 	files, err := parseTree(root)
 	if err != nil {
 		return nil, err
 	}
-
-	// One node per (package, name). cmd declarations are the seed of the
-	// production flow: everything they reference is wired by definition.
 	nodes := map[string]decl{}
 	for _, f := range files {
 		for _, d := range f.decl {
@@ -87,6 +95,16 @@ func analyse(root string) ([]gate.Finding, error) {
 			}
 		}
 	}
+	return &analysis{files: files, nodes: nodes, reachable: reachable}, nil
+}
+
+// analyse returns all reachability findings for root.
+func analyse(root string) ([]gate.Finding, error) {
+	a, err := parseAnalysis(root)
+	if err != nil {
+		return nil, err
+	}
+	files := a.files
 
 	var findings []gate.Finding
 	// Declaration sites for targets, used to attach the source file.
@@ -109,7 +127,7 @@ func analyse(root string) ([]gate.Finding, error) {
 		}
 	}
 	for key, finding := range targetSites {
-		if !reachable[key] {
+		if !a.reachable[key] {
 			findings = append(findings, finding)
 		}
 	}
@@ -375,8 +393,38 @@ func skipCalls(fset *token.FileSet, node ast.Node) []int {
 	return lines
 }
 
+// hasCheckExceptions reports whether args ask for the exception audit.
+func hasCheckExceptions(args []string) bool {
+	for _, a := range args {
+		if a == "--check-exceptions" || a == "-check-exceptions" {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutCheckExceptions removes the audit flag so the shared parser sees
+// only root and min-findings.
+func withoutCheckExceptions(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--check-exceptions" || a == "-check-exceptions" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 // Run executes the gate and returns a process exit code.
 func Run(args []string) int {
+	if hasCheckExceptions(args) {
+		opts, err := gate.ParseOptions(withoutCheckExceptions(args))
+		if err != nil {
+			return gate.Brokenf("%v", err)
+		}
+		return checkExceptions(opts.Root)
+	}
 	opts, err := gate.ParseOptions(args)
 	if err != nil {
 		return gate.Brokenf("%v", err)
