@@ -144,6 +144,56 @@ jobs:
           set -euo pipefail
           ./beacon skills-lock --check
 
+      # TCG-14. Две константы golden обязаны соответствовать байтам tools/list.
+      # --check ничего не перезаписывает, поэтому расхождение останавливает PR.
+      - name: Tools list golden is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./beacon mcp golden --check
+
+      # TCG-14. Генератор работает в отдельном checkout: правка эталона в
+      # рабочем дереве не должна скрыть расхождение. Второй --refresh даёт
+      # пустой diff, значит пересчёт детерминирован.
+      - name: Tools list golden refresh is clean in fresh checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          fresh="$RUNNER_TEMP/golden-refresh"
+          git worktree add --detach "$fresh" HEAD
+          trap 'git worktree remove --force "$fresh"' EXIT
+          (cd "$fresh" && "$GITHUB_WORKSPACE/beacon" mcp golden --refresh)
+          git -C "$fresh" diff --exit-code -- internal/infra/mcp/contract_test.go
+
+      # TCG-14. Подсаженное расхождение роняет --check и не трогает эталон.
+      # После проверки файл откатывается, diff снова пустой.
+      - name: Planted golden drift fails check without rewrite
+        shell: bash
+        run: |
+          set -euo pipefail
+          fresh="$RUNNER_TEMP/golden-drift"
+          git worktree add --detach "$fresh" HEAD
+          trap 'git worktree remove --force "$fresh"' EXIT
+          file="$fresh/internal/infra/mcp/contract_test.go"
+          sed -i 's/^const toolsListGoldenSHA256 = ".*"/const toolsListGoldenSHA256 = "0000000000000000000000000000000000000000000000000000000000000000"/' "$file"
+          planted=$(sha256sum "$file" | cut -d' ' -f1)
+          set +e
+          (cd "$fresh" && "$GITHUB_WORKSPACE/beacon" mcp golden --check)
+          code=$?
+          set -e
+          printf 'planted drift exit=%d\n' "$code"
+          if [ "$code" -ne 1 ]; then
+            printf 'negative control failed: planted drift exit=%d, want 1\n' "$code" >&2
+            exit 1
+          fi
+          after=$(sha256sum "$file" | cut -d' ' -f1)
+          if [ "$after" != "$planted" ]; then
+            printf 'negative control failed: --check rewrote the golden file\n' >&2
+            exit 1
+          fi
+          git -C "$fresh" checkout -- internal/infra/mcp/contract_test.go
+          git -C "$fresh" diff --exit-code -- internal/infra/mcp/contract_test.go
+
       # Корректный конфиг проходит проверки схемы, лимитов и индекса. Строка
       # "ok <digest>" подтверждает, что проверка действительно выполнилась.
       - name: Positive config passes registry check

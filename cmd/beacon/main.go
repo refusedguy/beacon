@@ -34,6 +34,7 @@ const usageText = `beacon — команды сборки и проверки Be
   beacon task <list|new|take> [flags]
   beacon why <task>
   beacon mcp
+  beacon mcp golden [--refresh | --check]
   beacon orchestrate [--dry-run] [--format table|json]
   beacon orchestrator bind [--session <id>] [--dry-run]
   beacon orchestrator rebind --from <old> --to <new> [--dry-run]  (устарело)
@@ -285,7 +286,7 @@ func init() {
 		"gates":        func(c *CLI, args []string) int { return c.runGates(args) },
 		"task":         func(c *CLI, args []string) int { return taskRunner(args, c.out, c.errOut) },
 		"why":          func(c *CLI, args []string) int { return taskRunner(append([]string{"why"}, args...), c.out, c.errOut) },
-		"mcp":          func(c *CLI, args []string) int { return mcpRunner(c.errOut) },
+		"mcp":          func(c *CLI, args []string) int { return c.runMCPCommand(args) },
 		"server":       func(c *CLI, args []string) int { return serverRunner(c.errOut) },
 		"orchestrate":  func(c *CLI, args []string) int { return orchestratorRunner(c, args) },
 		"orchestrator": func(c *CLI, args []string) int { return orchestratorCommandRunner(c, args) },

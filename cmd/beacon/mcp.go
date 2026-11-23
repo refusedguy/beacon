@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -2487,6 +2488,49 @@ func runReconciler(ctx context.Context, cfg reconcileConfig) (func(), error) {
 		release()
 	}, nil
 }
+
+// runMCPCommand routes the golden subcommand and leaves the stdio server on
+// the plain mcp invocation. The runner seam stays unchanged for existing tests.
+func (c *CLI) runMCPCommand(args []string) int {
+	if len(args) > 0 && args[0] == "golden" {
+		return c.runMCPGolden(args[1:])
+	}
+	return mcpRunner(c.errOut)
+}
+
+// runMCPGolden refreshes or checks the two hand-written tools/list constants.
+// The work runs in the mcp package test that owns the single pagination walker,
+// so the CLI never duplicates the serialization path. go test builds from
+// source and keeps BuildVersion empty, the same version the contract test uses.
+func (c *CLI) runMCPGolden(args []string) int {
+	fs := flag.NewFlagSet("mcp golden", flag.ContinueOnError)
+	refresh := fs.Bool("refresh", false, "recompute toolsListByteCount and toolsListGoldenSHA256")
+	check := fs.Bool("check", false, "fail if the checked-in constants are stale")
+	if !parseFlags("mcp golden", args, c.errOut, fs) {
+		return 2
+	}
+	if *refresh == *check {
+		fmt.Fprintln(c.errOut, "beacon mcp golden: укажите ровно один флаг: --refresh или --check")
+		return 2
+	}
+	mode := goldenModeCheckValue
+	if *refresh {
+		mode = goldenModeRefreshValue
+	}
+	res := c.run(c.root, "go", []string{
+		"test", "./internal/infra/mcp",
+		"-run", "^TestGoldenRefreshMode$", "-count=1",
+	}, []string{"BEACON_MCP_GOLDEN=" + mode})
+	emit(res, c.out, c.errOut)
+	return res.code
+}
+
+// The CLI and the mcp test live in different packages, so the mode values are
+// spelled in both places. Both sides use the same wire strings.
+const (
+	goldenModeCheckValue   = "check"
+	goldenModeRefreshValue = "refresh"
+)
 
 // RegisterMCP installs the mcp command implementation.
 func RegisterMCP(fn func(io.Writer) int) {
