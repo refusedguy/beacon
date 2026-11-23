@@ -5,9 +5,10 @@
 package orchestrator
 
 import (
-	"slices"
 	"sort"
 	"strings"
+
+	"github.com/refusedguy/beacon/internal/shared"
 )
 
 // MergeProblemClass names one reason a merge is not safe to start. The four
@@ -121,33 +122,33 @@ func mergeMainLabel(branch string) string {
 	return branch
 }
 
-// dedupInOrder returns the first occurrence of each normalized value in order.
-// norm rewrites a value before the membership test; keep drops unwanted values.
-func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
-	out := make([]T, 0, len(values))
-	seen := make(map[T]bool, len(values))
-	for _, v := range values {
-		v = norm(v)
-		if !keep(v) || seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	return out
-}
-
 // mergeVisibleFiles drops tool-created paths, then sorts and deduplicates the
 // rest so a problem's file list is stable between ticks.
 func mergeVisibleFiles(files, toolPaths []string) []string {
-	ignored := dedupInOrder(toolPaths,
-		func(p string) string { return strings.TrimSpace(strings.TrimSuffix(p, "/")) },
-		func(p string) bool { return p != "" })
-	visible := dedupInOrder(files, strings.TrimSpace, func(f string) bool {
-		return f != "" && !slices.ContainsFunc(ignored, func(p string) bool {
-			return f == p || strings.HasPrefix(f, p+"/")
-		})
+	ignored := make([]string, 0, len(toolPaths))
+	for _, p := range toolPaths {
+		p = strings.TrimSpace(strings.TrimSuffix(p, "/"))
+		if p != "" {
+			ignored = append(ignored, p)
+		}
+	}
+
+	trimmed := make([]string, 0, len(files))
+	for _, f := range files {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			trimmed = append(trimmed, f)
+		}
+	}
+	visible := shared.Filter(trimmed, func(f string) bool {
+		for _, p := range ignored {
+			if f == p || strings.HasPrefix(f, p+"/") {
+				return false
+			}
+		}
+		return true
 	})
+	visible = shared.DistinctBy(visible, func(f string) string { return f })
 	sort.Strings(visible)
 	return visible
 }

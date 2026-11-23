@@ -1,6 +1,7 @@
 {
   "layers": [
     {"name": "internal/domain", "rank": 0},
+    {"name": "internal/shared", "rank": -1},
     {"name": "internal/infra/observe", "rank": 0},
     {"name": "internal/infra", "rank": 1},
     {"name": "tools/beacon-gates", "rank": 1},
@@ -14,6 +15,10 @@
   ],
   "allowed": [
     {"from": "internal/infra", "to": "internal/domain"},
+    {"from": "internal/domain", "to": "internal/shared", "shared": true},
+    {"from": "internal/infra", "to": "internal/shared", "shared": true},
+    {"from": "internal/app", "to": "internal/shared", "shared": true},
+    {"from": "cmd", "to": "internal/shared", "shared": true},
     {"from": "internal/beacon", "to": "internal/infra", "shared": true},
     {"from": "internal/app", "to": "internal/infra"},
     {"from": "cmd", "to": "internal/infra"},

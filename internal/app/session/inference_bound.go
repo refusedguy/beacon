@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/refusedguy/beacon/internal/shared"
 )
 
 // InferenceOutcome names the three ways a bounded model call ends. A result
@@ -190,25 +192,16 @@ func truncateInferenceInput(text string, limit int) (string, bool) {
 	return text[:limit-len(inferenceTruncationMarker)] + inferenceTruncationMarker, true
 }
 
-// dedupInOrder returns the first occurrence of each normalized value in order.
-// norm rewrites a value before the membership test; keep drops unwanted values.
-func dedupInOrder[T comparable](values []T, norm func(T) T, keep func(T) bool) []T {
-	out := make([]T, 0, len(values))
-	seen := make(map[T]bool, len(values))
-	for _, v := range values {
-		v = norm(v)
-		if !keep(v) || seen[v] {
-			continue
-		}
-		seen[v] = true
-		out = append(out, v)
-	}
-	return out
-}
-
 // uniqueInferenceFiles trims, deduplicates and sorts the file summary.
 func uniqueInferenceFiles(files []string) []string {
-	out := dedupInOrder(files, strings.TrimSpace, func(s string) bool { return s != "" })
+	trimmed := make([]string, 0, len(files))
+	for _, f := range files {
+		f = strings.TrimSpace(f)
+		if f != "" {
+			trimmed = append(trimmed, f)
+		}
+	}
+	out := shared.DistinctBy(trimmed, func(f string) string { return f })
 	sort.Strings(out)
 	return out
 }
