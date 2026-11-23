@@ -383,3 +383,66 @@ func TestDispatchFailureJSONIncludesSpawnTimeout(t *testing.T) {
 	}
 	assertFailureJSON(t, res.Failures, want)
 }
+
+func newInstructionDispatcher(h *requestCapturingHarness, instructions string) *Dispatcher {
+	return &Dispatcher{
+		Source: &fakeSource{tasks: []core.Task{{ID: "T-PREFIX", Status: core.TaskAvailable,
+			Scope: []core.ScopePath{core.ScopeFile("prefix.go")}}},
+		},
+		Planner:            NewPlanner(nil),
+		Workspace:          &fakeWorkspace{},
+		Harness:            h,
+		Store:              newFakeStore(),
+		Concurrency:        core.Concurrency{MaxInFlight: 1, MaxActiveAgents: 1},
+		WorkerInstructions: instructions,
+	}
+}
+
+func TestDispatchPrependsWorkerInstructions(t *testing.T) {
+	const custom = "Custom worker instructions from config."
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, custom)
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.requests) != 1 {
+		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
+	}
+	prompt := h.requests[0].Prompt
+	if !strings.HasPrefix(prompt, custom+"\n\n") {
+		t.Fatalf("prompt does not start with configured instructions: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Implement the task, open a pull request, then call beacon_watch_pr") {
+		t.Fatalf("stock prompt content lost: %q", prompt)
+	}
+}
+
+func TestDispatchWithoutWorkerInstructionsKeepsStockPrompt(t *testing.T) {
+	h := &requestCapturingHarness{fakeHarness: &fakeHarness{}}
+	d := newInstructionDispatcher(h, "")
+	if _, err := d.Dispatch(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.requests) != 1 {
+		t.Fatalf("spawn requests = %d, want 1", len(h.requests))
+	}
+	prompt := h.requests[0].Prompt
+	if !strings.HasPrefix(prompt, "Run ID: ") {
+		t.Fatalf("prompt gained an unexpected prefix: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Implement the task, open a pull request, then call beacon_watch_pr") {
+		t.Fatalf("stock prompt content lost: %q", prompt)
+	}
+}
+
+func TestFixerPromptPrependsWorkerInstructions(t *testing.T) {
+	const custom = "Custom worker instructions from config."
+	in := &core.BaseIncident{FailedChecksJSON: "[\"ci\"]"}
+	prompt := fixerPrompt(redBase(), in, core.Task{ID: "FIX-1"}, custom)
+	if !strings.HasPrefix(prompt, custom+"\n\n") {
+		t.Fatalf("fixer prompt does not start with configured instructions: %q", prompt)
+	}
+	if !strings.Contains(prompt, "Base branch main is red") {
+		t.Fatalf("fixer prompt content lost: %q", prompt)
+	}
+}
