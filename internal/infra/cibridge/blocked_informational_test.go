@@ -203,3 +203,18 @@ func TestHandleBlockedFiltersStoredInformationalNames(t *testing.T) {
 		}
 	}
 }
+
+// TestBlockingFailedNamesKeepsUnknownNames pins the fail-closed half of the
+// filter. A name the provider marked informational is dropped, but a name with
+// no per-check data stays: the verdict layer treats such a failure as blocking
+// and hiding it would silence a real gate.
+func TestBlockingFailedNamesKeepsUnknownNames(t *testing.T) {
+	checks := map[string]domain.Check{
+		"ci-info":  {Conclusion: "FAILURE", Required: false},
+		"ci-build": {Conclusion: "FAILURE", Required: true},
+	}
+	got := strings.Join(blockingFailedNames([]string{"ci-info", "ci-build", "ci-no-data"}, checks), ",")
+	if want := "ci-build,ci-no-data"; got != want {
+		t.Fatalf("blockingFailedNames = %q, want %q", got, want)
+	}
+}
