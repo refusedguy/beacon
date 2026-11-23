@@ -72,6 +72,14 @@ func newStatusCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			defer store.Close()
+			snapshot, _ := cmd.Flags().GetBool("snapshot")
+			if snapshot {
+				result, err := (app.SnapshotService{Store: store}).Snapshot(cmd.Context())
+				if err != nil {
+					return err
+				}
+				return printJSON(result)
+			}
 			recent, _ := cmd.Flags().GetBool("recent")
 			if recent {
 				runs, err := (app.StatusService{Store: store}).Recent(cmd.Context(), 0)
@@ -88,6 +96,7 @@ func newStatusCommand(configPath *string) *cobra.Command {
 		},
 	}
 	cmd.Flags().Bool("recent", false, "print recently finished runs instead of active ones")
+	cmd.Flags().Bool("snapshot", false, "print one batched snapshot with runs, history and metrics")
 	return cmd
 }
 

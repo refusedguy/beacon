@@ -35,17 +35,24 @@ export const REASON_WIDTH = 30
  * @property {string} title     Human readable task title, or the raw task ID.
  * @property {number} pr
  * @property {string} sha
+ * @property {string} branch
  * @property {string} reason
  * @property {number} rebaseAttempts
  * @property {number} fixAttempts
  * @property {number} maxAttempts
+ * @property {unknown} createdAt
  * @property {unknown} updatedAt
+ * @property {{waitingCI: number, running: number, blocked: number}} durations
+ * @property {Object[]} timeline
+ * @property {Object[]} decisions
  */
 
 /**
  * @typedef {Object} StatusSnapshot
  * @property {Run[]} active
  * @property {Run[]} recent
+ * @property {Object} [metrics]
+ * @property {unknown} [generatedAt]
  */
 
 /**
@@ -80,6 +87,73 @@ function pick(source, names) {
   return undefined
 }
 
+export function normalizeEvent(value) {
+  const source = value && typeof value === "object" ? value : {}
+  return {
+    id: numberOrZero(pick(source, ["ID", "id"])),
+    at: pick(source, ["At", "at"]),
+    kind: str(pick(source, ["Kind", "kind"])),
+    state: str(pick(source, ["State", "state"])),
+    runID: str(pick(source, ["RunID", "run_id", "runId"])),
+    pr: numberOrZero(pick(source, ["PRNumber", "pr", "pr_number", "prNumber"])),
+    sha: str(pick(source, ["HeadSHA", "head_sha", "headSHA"])),
+    reason: str(pick(source, ["Reason", "reason"])),
+  }
+}
+
+export function normalizeDecision(value) {
+  const source = value && typeof value === "object" ? value : {}
+  const fields = pick(source, ["Fields", "fields"])
+  return {
+    id: numberOrZero(pick(source, ["ID", "id"])),
+    at: pick(source, ["At", "at"]),
+    kind: str(pick(source, ["Kind", "kind"])),
+    runID: str(pick(source, ["RunID", "run_id", "runId"])),
+    taskID: str(pick(source, ["TaskID", "task_id", "taskId"])),
+    pr: numberOrZero(pick(source, ["PRNumber", "pr", "pr_number", "prNumber"])),
+    verdict: str(pick(source, ["Verdict", "verdict"])),
+    action: str(pick(source, ["Action", "action"])),
+    reason: str(pick(source, ["Reason", "reason"])),
+    fields: fields && typeof fields === "object" && !Array.isArray(fields) ? fields : {},
+  }
+}
+
+const METRIC_FIELDS = Object.freeze({
+  dispatchCount: ["dispatch_count", "dispatchCount"],
+  dispatchCycles: ["dispatch_cycles", "dispatchCycles"],
+  skipCount: ["skip_count", "skipCount"],
+  rebaseCount: ["rebase_count", "rebaseCount"],
+  fixCount: ["fix_count", "fixCount"],
+  mergeCount: ["merge_count", "mergeCount"],
+  blockedCount: ["blocked_count", "blockedCount"],
+  ciWaitSeconds: ["ci_wait_seconds", "ciWaitSeconds"],
+  activeCount: ["active_count", "activeCount"],
+  recentCount: ["recent_count", "recentCount"],
+})
+
+function normalizeCounts(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {}
+  const out = {}
+  for (const [key, count] of Object.entries(source)) out[key] = numberOrZero(count)
+  return out
+}
+
+export function normalizeMetrics(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {}
+  const out = { skips: normalizeCounts(pick(source, ["skips", "Skips"])), blocked: normalizeCounts(pick(source, ["blocked", "Blocked"])) }
+  for (const [name, names] of Object.entries(METRIC_FIELDS)) out[name] = numberOrZero(pick(source, names))
+  return out
+}
+
+function normalizeDurations(value) {
+  const source = value && typeof value === "object" ? value : {}
+  return {
+    waitingCI: numberOrZero(pick(source, ["waiting_ci_seconds", "waitingCISeconds", "waitingCI"])),
+    running: numberOrZero(pick(source, ["running_seconds", "runningSeconds", "running"])),
+    blocked: numberOrZero(pick(source, ["blocked_seconds", "blockedSeconds", "blocked"])),
+  }
+}
+
 export function normalizeRun(value) {
   const source = value && typeof value === "object" ? value : {}
   const taskID = str(pick(source, ["TaskID", "task_id", "taskID", "taskId"]))
@@ -91,18 +165,27 @@ export function normalizeRun(value) {
     title: title || taskID,
     pr: numberOrZero(pick(source, ["PRNumber", "pr", "pr_number", "prNumber"])),
     sha: str(pick(source, ["HeadSHA", "head_sha", "headSHA", "sha"])),
+    branch: str(pick(source, ["Branch", "branch"])),
     reason: str(pick(source, ["Reason", "reason"])),
     rebaseAttempts: numberOrZero(pick(source, ["RebaseAttempts", "rebase_attempts", "rebaseAttempts"])),
     fixAttempts: numberOrZero(pick(source, ["FixAttempts", "fix_attempts", "fixAttempts"])),
     maxAttempts: numberOrZero(pick(source, ["MaxAttempts", "max_attempts", "maxAttempts"])),
+    createdAt: pick(source, ["CreatedAt", "created_at", "createdAt"]),
     updatedAt: pick(source, ["UpdatedAt", "updated_at", "updatedAt"]),
+    durations: normalizeDurations(pick(source, ["Durations", "durations"])),
+    timeline: (Array.isArray(pick(source, ["Timeline", "timeline"])) ? pick(source, ["Timeline", "timeline"]) : []).map(normalizeEvent),
+    decisions: (Array.isArray(pick(source, ["Decisions", "decisions"])) ? pick(source, ["Decisions", "decisions"]) : []).map(normalizeDecision),
   }
 }
 
 export function normalizeSnapshot(value) {
   const source = value && typeof value === "object" ? value : {}
   const list = (v) => (Array.isArray(v) ? v : []).map(normalizeRun)
-  return { active: list(source.active), recent: list(source.recent) }
+  const out = { active: list(source.active), recent: list(source.recent) }
+  if (source.metrics !== undefined) out.metrics = normalizeMetrics(source.metrics)
+  const generatedAt = pick(source, ["generated_at", "generatedAt"])
+  if (generatedAt !== undefined) out.generatedAt = generatedAt
+  return out
 }
 
 // A nil Go slice is printed as JSON `null`, which is a normal empty result.
@@ -115,6 +198,17 @@ export function parseRunList(text) {
     return []
   }
   return Array.isArray(value) ? value : []
+}
+
+// The batched CLI call prints one JSON object with every panel section.
+export function parseSnapshot(text) {
+  if (text == null || String(text).trim() === "") return {}
+  try {
+    const value = JSON.parse(String(text))
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {}
+  } catch {
+    return {}
+  }
 }
 
 function stripQuotes(value) {
@@ -156,7 +250,7 @@ export function enrichRuns(root, runs, deps = defaultDeps) {
 }
 
 // beaconCommand resolves the binary plus its `mcp` subcommand. Drop that
-// subcommand; the source adds `status` (and optionally `--recent`) per call.
+// subcommand; the source adds `status --snapshot` once per refresh.
 function baseCommand(root) {
   const parts = beaconCommand(root)
   if (parts[parts.length - 1] === "mcp") parts.pop()
@@ -170,28 +264,44 @@ export class CliStatusSource {
     this.deps = { ...defaultDeps, ...deps }
   }
 
-  async #list(base, recent) {
+  #exec(base, args) {
     const [program, ...rest] = base
-    const args = recent ? [...rest, "status", "--recent"] : [...rest, "status"]
-    const { stdout } = await this.deps.execFile(program, args, {
+    return this.deps.execFile(program, [...rest, ...args], {
       cwd: this.root,
       encoding: "utf8",
       env: { ...process.env, [BEACON_PROJECT_ROOT_ENV]: this.root },
       timeout: RPC_TIMEOUT_MS,
     })
+  }
+
+  async #list(base, recent) {
+    const { stdout } = await this.#exec(base, recent ? ["status", "--recent"] : ["status"])
     return parseRunList(stdout)
+  }
+
+  // One call returns runs, timelines, decisions and metrics. Older binaries
+  // reject --snapshot; fall back to the two legacy calls in that case only.
+  async #raw(base) {
+    try {
+      const { stdout } = await this.#exec(base, ["status", "--snapshot"])
+      return parseSnapshot(stdout)
+    } catch {
+      const [active, recent] = await Promise.all([
+        this.#list(base, false),
+        this.#list(base, true),
+      ])
+      return { active, recent }
+    }
   }
 
   async snapshot() {
     // Resolve once so a stale local binary is rebuilt at most once per poll.
     const base = this.deps.command ? this.deps.command() : baseCommand(this.root)
-    const [activeRaw, recentRaw] = await Promise.all([
-      this.#list(base, false),
-      this.#list(base, true),
-    ])
+    const snapshot = normalizeSnapshot(await this.#raw(base))
     return {
-      active: enrichRuns(this.root, activeRaw, this.deps),
-      recent: enrichRuns(this.root, recentRaw, this.deps),
+      ...snapshot,
+      active: enrichRuns(this.root, snapshot.active, this.deps),
+      recent: enrichRuns(this.root, snapshot.recent, this.deps),
     }
   }
 }
@@ -213,6 +323,21 @@ function standardSchema(check) {
   }
 }
 
+function validateSnapshotOutput(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "output must be an object"
+  if (!Array.isArray(value.active) || !Array.isArray(value.recent)) {
+    return "output must carry active and recent runs"
+  }
+  const metrics = value.metrics
+  if (metrics === undefined) return null
+  if (!metrics || typeof metrics !== "object" || Array.isArray(metrics)) return "metrics must be an object"
+  for (const names of Object.values(METRIC_FIELDS)) {
+    const count = metrics[names[0]]
+    if (count !== undefined && !Number.isFinite(Number(count))) return `metrics.${names[0]} must be numeric`
+  }
+  return null
+}
+
 // Shared by the server plugin that registers the handler and the TUI that calls it.
 export const BeaconStatusRpc = Object.freeze({
   id: BEACON_STATUS_RPC_ID,
@@ -220,8 +345,7 @@ export const BeaconStatusRpc = Object.freeze({
   methods: Object.freeze({
     snapshot: Object.freeze({
       input: standardSchema(() => null),
-      output: standardSchema((value) =>
-        value && typeof value === "object" && !Array.isArray(value) ? null : "output must be an object"),
+      output: standardSchema(validateSnapshotOutput),
     }),
   }),
 })

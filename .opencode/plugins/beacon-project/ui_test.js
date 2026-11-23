@@ -191,12 +191,16 @@ test("parses null, empty and malformed CLI output as an empty list", () => {
   assert.equal(parseRunList(JSON.stringify([makeRun()])).length, 1)
 })
 
-test("CLI source spawns status and status --recent and tolerates null", async () => {
+test("CLI source spawns one batched status call and tolerates null", async () => {
   const calls = []
   const execFile = async (program, args) => {
     calls.push([program, ...args])
-    const recent = args.includes("--recent")
-    return { stdout: recent ? "null" : JSON.stringify([makeRun({ TaskID: "T-9" })]) }
+    return { stdout: JSON.stringify({
+      generated_at: "2026-11-23T10:00:00Z",
+      active: [makeRun({ TaskID: "T-9" })],
+      recent: null,
+      metrics: { dispatch_count: 4, skips: { scope_overlap: 2 }, ci_wait_seconds: 90 },
+    }) }
   }
   const source = new CliStatusSource({
     root: "/p",
@@ -207,10 +211,11 @@ test("CLI source spawns status and status --recent and tolerates null", async ()
   assert.equal(snapshot.active.length, 1)
   assert.equal(snapshot.active[0].title, "T-9", "missing card falls back to the task ID")
   assert.deepEqual(snapshot.recent, [])
-  assert.deepEqual(calls, [
-    ["/bin/beacon", "status"],
-    ["/bin/beacon", "status", "--recent"],
-  ])
+  assert.equal(snapshot.metrics.dispatchCount, 4)
+  assert.equal(snapshot.metrics.skips.scope_overlap, 2)
+  assert.equal(snapshot.metrics.ciWaitSeconds, 90)
+  assert.equal(snapshot.generatedAt, "2026-11-23T10:00:00Z")
+  assert.deepEqual(calls, [["/bin/beacon", "status", "--snapshot"]])
 })
 
 test("status source uses the RPC when it works", async () => {
@@ -250,16 +255,13 @@ test("status source falls back to the CLI when the RPC throws", async () => {
     command: () => ["/bin/beacon"],
     execFile: async (program, args) => {
       calls.push([program, ...args])
-      return { stdout: JSON.stringify([makeRun({ TaskID: "T-7", title: "From CLI" })]) }
+      return { stdout: JSON.stringify({ active: [makeRun({ TaskID: "T-7", title: "From CLI" })], recent: [] }) }
     },
     existsSync: () => false,
   }
   const snapshot = await createStatusSource(ctx, { deps }).snapshot()
   assert.equal(snapshot.active[0].title, "From CLI")
-  assert.deepEqual(calls, [
-    ["/bin/beacon", "status"],
-    ["/bin/beacon", "status", "--recent"],
-  ])
+  assert.deepEqual(calls, [["/bin/beacon", "status", "--snapshot"]])
 })
 
 test("status source uses the CLI when the client has no rpc method", async () => {
@@ -279,6 +281,59 @@ test("RPC definition exposes a validated snapshot method", () => {
   assert.equal(method.input["~standard"].validate({}).value !== undefined, true)
   assert.equal(method.output["~standard"].validate({ active: [], recent: [] }).value !== undefined, true)
   assert.equal("issues" in method.output["~standard"].validate(null), true)
+  assert.equal("issues" in method.output["~standard"].validate([]), true)
+  assert.equal(method.output["~standard"].validate({
+    active: [], recent: [], metrics: { merge_count: 3, skips: { scope_overlap: 1 } },
+  }).value !== undefined, true)
+  assert.equal("issues" in method.output["~standard"].validate({
+    active: [], recent: [], metrics: { merge_count: "three" },
+  }), true)
+})
+
+test("one batched call covers every run and keeps history numeric", async () => {
+  const calls = []
+  const runs = Array.from({ length: 25 }, (_, i) => makeRun({
+    ID: `run-${i}`, TaskID: `T-${i}`,
+    timeline: [{ at: "2026-11-23T10:00:00Z", kind: "checks_pending", state: "waiting_ci" }],
+    decisions: [{ at: "2026-11-23T10:01:00Z", kind: "reconcile.decision", verdict: "merge" }],
+    durations: { waiting_ci_seconds: 60, running_seconds: 5, blocked_seconds: 0 },
+    created_at: "2026-11-23T09:59:00Z", updated_at: "2026-11-23T10:02:00Z",
+  }))
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    return { stdout: JSON.stringify({
+      active: runs, recent: [],
+      metrics: { dispatch_count: 25, rebase_count: 2, fix_count: 1, merge_count: 3, ci_wait_seconds: 1500 },
+    }) }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  const snapshot = await source.snapshot()
+  assert.equal(snapshot.active.length, 25)
+  assert.equal(calls.length, 1, "adding runs must not add CLI calls")
+  assert.equal(snapshot.active[0].timeline[0].state, "waiting_ci")
+  assert.equal(snapshot.active[0].decisions[0].verdict, "merge")
+  assert.equal(snapshot.active[0].durations.waitingCI, 60)
+  assert.equal(snapshot.metrics.dispatchCount, 25)
+  assert.equal(snapshot.metrics.mergeCount, 3)
+  assert.deepEqual(snapshot.metrics.skips, {})
+})
+
+test("CLI source uses legacy calls only when --snapshot is unsupported", async () => {
+  const calls = []
+  const execFile = async (program, args) => {
+    calls.push([program, ...args])
+    if (args.includes("--snapshot")) throw new Error("unknown flag: --snapshot")
+    return { stdout: JSON.stringify(args.includes("--recent") ? [makeRun({ ID: "old" })] : [makeRun({ TaskID: "T-legacy" })]) }
+  }
+  const source = new CliStatusSource({ root: "/p", deps: { command: () => ["/bin/beacon"], execFile, existsSync: () => false } })
+  const snapshot = await source.snapshot()
+  assert.equal(snapshot.active[0].taskID, "T-legacy")
+  assert.equal(snapshot.recent[0].id, "old")
+  assert.deepEqual(calls, [
+    ["/bin/beacon", "status", "--snapshot"],
+    ["/bin/beacon", "status"],
+    ["/bin/beacon", "status", "--recent"],
+  ])
 })
 
 test("errorMessage handles Error, plain object and string", () => {

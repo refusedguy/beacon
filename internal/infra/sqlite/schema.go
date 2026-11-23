@@ -78,6 +78,34 @@ CREATE TABLE IF NOT EXISTS base_incidents (
   resolved_at INTEGER NOT NULL DEFAULT 0,
   UNIQUE (repo, base_branch, signature)
 );
+
+CREATE TABLE IF NOT EXISTS run_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT '',
+  at INTEGER NOT NULL,
+  head_sha TEXT NOT NULL DEFAULT '',
+  pr_number INTEGER NOT NULL DEFAULT 0,
+  reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS run_events_run_at_idx ON run_events(run_id, at);
+
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at INTEGER NOT NULL,
+  cycle_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  run_id TEXT NOT NULL DEFAULT '',
+  task_id TEXT NOT NULL DEFAULT '',
+  pr_number INTEGER NOT NULL DEFAULT 0,
+  verdict TEXT NOT NULL DEFAULT '',
+  action TEXT NOT NULL DEFAULT '',
+  reason TEXT NOT NULL DEFAULT '',
+  fields_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS decisions_run_at_idx ON decisions(run_id, at);
+CREATE INDEX IF NOT EXISTS decisions_kind_at_idx ON decisions(kind, at);
 `
 
 func openDB(path string) (*sql.DB, error) {
@@ -98,7 +126,27 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("runs migration: %w", err)
 	}
+	if err := backfillRunEvents(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("run events migration: %w", err)
+	}
 	return db, nil
+}
+
+// backfillRunEvents gives runs saved before the event table existed a start
+// and an observation using their existing timestamps. It only inserts into the
+// new table and skips runs that already have events, so repeated opens and
+// older state databases keep their rows.
+func backfillRunEvents(db *sql.DB) error {
+	_, err := db.Exec(`
+INSERT INTO run_events (run_id, kind, state, at, head_sha, pr_number, reason)
+SELECT r.id, 'start', 'pending', r.created_at, r.head_sha, r.pr_number, '' FROM runs r
+WHERE NOT EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = r.id)
+UNION ALL
+SELECT r.id, 'observed', r.state, r.updated_at, r.head_sha, r.pr_number, r.reason FROM runs r
+WHERE r.updated_at > r.created_at
+  AND NOT EXISTS (SELECT 1 FROM run_events e WHERE e.run_id = r.id)`)
+	return err
 }
 
 // runMigrationColumns are the observation fields added after the initial runs
