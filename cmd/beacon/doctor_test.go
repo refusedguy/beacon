@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"os"
@@ -111,6 +112,99 @@ func TestDoctorReportsHealthyProjectWithoutLeakingToken(t *testing.T) {
 		if !strings.Contains(text, want) {
 			t.Errorf("doctor output lacks %q: %s", want, text)
 		}
+	}
+}
+
+func TestDoctorFileShapeCheckMCPShapes(t *testing.T) {
+	agents := map[string]any{
+		"orchestrator": map[string]any{},
+		"worker":       map[string]any{},
+	}
+	withAgents := func(extra map[string]any) map[string]any {
+		doc := map[string]any{"agents": agents}
+		for k, v := range extra {
+			doc[k] = v
+		}
+		return doc
+	}
+
+	cases := []struct {
+		name       string
+		doc        map[string]any
+		parent     map[string]any
+		wantLevel  checkLevel
+		wantDetail string
+	}{
+		{
+			name: "root mcp.beacon",
+			doc: withAgents(map[string]any{"mcp": map[string]any{
+				"beacon": map[string]any{},
+			}}),
+			wantLevel:  checkOK,
+			wantDetail: "agents and mcp.beacon present",
+		},
+		{
+			name: "root mcp.servers.beacon",
+			doc: withAgents(map[string]any{"mcp": map[string]any{
+				"servers": map[string]any{"beacon": map[string]any{}},
+			}}),
+			wantLevel:  checkOK,
+			wantDetail: "agents and mcp.servers.beacon present",
+		},
+		{
+			name: "parent mcp.servers.beacon inherited",
+			doc:  withAgents(nil),
+			parent: map[string]any{"mcp": map[string]any{
+				"servers": map[string]any{"beacon": map[string]any{}},
+			}},
+			wantLevel:  checkOK,
+			wantDetail: "agents and mcp.servers.beacon present (workspace parent)",
+		},
+		{
+			name:       "missing everywhere",
+			doc:        withAgents(nil),
+			wantLevel:  checkFail,
+			wantDetail: "missing mcp.beacon",
+		},
+		{
+			name: "agents missing",
+			doc: map[string]any{"mcp": map[string]any{
+				"beacon": map[string]any{},
+			}},
+			wantLevel:  checkFail,
+			wantDetail: "missing orchestrator, worker",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			root := filepath.Join(base, "project")
+			if err := os.MkdirAll(root, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if tc.parent != nil {
+				writeDoctorJSON(t, filepath.Join(base, "opencode.json"), tc.parent)
+			}
+			got := doctorFileShapeCheck(tc.doc, root)
+			if got.level != tc.wantLevel {
+				t.Errorf("level = %v, want %v (detail: %s)", got.level, tc.wantLevel, got.detail)
+			}
+			if got.detail != tc.wantDetail {
+				t.Errorf("detail = %q, want %q", got.detail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func writeDoctorJSON(t *testing.T, path string, v any) {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
