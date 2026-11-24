@@ -12,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/refusedguy/beacon/harnesses/acp"
 	"github.com/refusedguy/beacon/internal/infra/config"
 	"github.com/refusedguy/beacon/pkg/core"
 )
@@ -123,6 +124,43 @@ func TestLoadConfigPinsRelativePathsToProjectRoot(t *testing.T) {
 		if got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}
+	}
+}
+
+func TestNewHarnessBuildsACPProvider(t *testing.T) {
+	cfg := config.Config{Harness: config.Harness{
+		Provider: "ACP", Command: "fake-agent --acp", Model: "sonnet",
+	}}
+	h, err := newHarness(cfg, "", "ses_parent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ah, ok := h.(*acp.Harness)
+	if !ok {
+		t.Fatalf("harness for acp provider = %T, want *acp.Harness", h)
+	}
+	if ah.Command != "fake-agent --acp" || ah.Model != "sonnet" || ah.ParentSessionID != "ses_parent" {
+		t.Fatalf("acp harness = %+v, want command, model and parent from config", ah)
+	}
+	if _, ok := h.(core.ModelResolver); ok {
+		t.Error("acp harness must not claim the model resolver port")
+	}
+}
+
+func TestNewHarnessACPRequiresCommand(t *testing.T) {
+	cfg := config.Config{Harness: config.Harness{Provider: "acp"}}
+	if _, err := newHarness(cfg, "", ""); err == nil {
+		t.Fatal("acp harness without a command should fail")
+	}
+}
+
+func TestResolveModelUsesConfiguredHarness(t *testing.T) {
+	acpCfg := config.Config{Harness: config.Harness{Provider: "acp", Command: "fake-agent"}}
+	if got := resolveModel(acpCfg, "", "ses_parent"); got != nil {
+		t.Fatalf("model for acp = %v, want nil", got)
+	}
+	if got := resolveModel(config.Config{Harness: config.Harness{Provider: "acp"}}, "", ""); got != nil {
+		t.Fatalf("model for invalid config = %v, want nil", got)
 	}
 }
 
