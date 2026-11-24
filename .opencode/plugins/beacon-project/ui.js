@@ -337,12 +337,13 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg }) {
   }
 }
 
-async function setup(ctx) {
+async function setup(ctx, deps = {}) {
+  const load = deps.import ?? ((specifier) => import(specifier))
   const [{ createElement, insert, setProp }, { createSignal }] = await Promise.all([
-    import("@opentui/solid"), import("solid-js"),
+    load("@opentui/solid"), load("solid-js"),
   ])
   let BOLD = 0
-  try { ({ TextAttributes: { BOLD } } = await import("@opentui/core")) } catch {}
+  try { ({ TextAttributes: { BOLD } } = await load("@opentui/core")) } catch {}
   const source = createStatusSource(ctx)
   const theme = ctx.theme
   const [snapshot, setSnapshot] = createSignal(EMPTY_SNAPSHOT)
@@ -360,31 +361,49 @@ async function setup(ctx) {
   const mount = createRowMount({ createElement, insert, setProp }, {
     color, BOLD, onRow: (item) => select(item.runID), hoverBg: theme.background.raised.high,
   })
-  const listBox = () => {
-    const box = createElement("box")
-    setProp(box, "flexDirection", "column")
-    return box
-  }
-  const sidebar = listBox()
-  const footer = listBox()
-  const detail = createElement("box")
-  setProp(detail, "flexDirection", "column")
-  setProp(detail, "flexGrow", 1)
-  const syncDetail = () => {
-    const snap = snapshot()
-    const run = [...snap.active, ...snap.recent].find((r) => r.id === selectedID())
-    setDetailItems(detailLines(run, snap.metrics, Date.now()))
-  }
   const rows = () => snapshotLineItems(snapshot(), error())
-  const applySidebar = mount(sidebar, rows)
-  const applyFooter = mount(footer, rows)
-  const applyDetail = mount(detail, detailItems)
+
   function select(id) {
     if (!id) return
     setSelectedID(id)
     void store[1]((draft) => { draft.id = id }).catch(() => {})
     ctx.ui.panel.open(PANEL_NAME)
   }
+  function syncDetail() {
+    const snap = snapshot()
+    const run = [...snap.active, ...snap.recent].find((r) => r.id === selectedID())
+    setDetailItems(detailLines(run, snap.metrics, Date.now()))
+  }
+
+  // The reconciler's renderer is only active inside a slot render callback.
+  // Creating nodes here reaches it before any renderer exists and throws
+  // "No renderer found", so the first render callback builds every node once.
+  let nodes = null
+  function ensureNodes() {
+    if (nodes) return nodes
+    const listBox = () => {
+      const box = createElement("box")
+      setProp(box, "flexDirection", "column")
+      return box
+    }
+    const sidebar = listBox()
+    const footer = listBox()
+    const detail = createElement("box")
+    setProp(detail, "flexDirection", "column")
+    setProp(detail, "flexGrow", 1)
+    nodes = {
+      sidebar, footer, detail,
+      applySidebar: mount(sidebar, rows),
+      applyFooter: mount(footer, rows),
+      applyDetail: mount(detail, detailItems),
+    }
+    nodes.applySidebar()
+    nodes.applyFooter()
+    syncDetail()
+    nodes.applyDetail()
+    return nodes
+  }
+
   const refresh = async () => {
     if (stopped) return
     try {
@@ -393,21 +412,23 @@ async function setup(ctx) {
       setSnapshot(next ?? EMPTY_SNAPSHOT)
       setError(null)
     } catch (cause) { if (!stopped) setError(errorMessage(cause)) }
-    applySidebar()
-    applyFooter()
+    if (!nodes) return
+    nodes.applySidebar()
+    nodes.applyFooter()
     syncDetail()
-    applyDetail()
+    nodes.applyDetail()
   }
   void refresh()
   timer = setInterval(() => void refresh(), REFRESH_MS)
   const disposers = [
-    ctx.ui.slot({ append: "sidebar.content", render: () => sidebar }),
-    ctx.ui.slot({ append: "home.footer.status", render: () => footer }),
+    ctx.ui.slot({ append: "sidebar.content", render: () => ensureNodes().sidebar }),
+    ctx.ui.slot({ append: "home.footer.status", render: () => ensureNodes().footer }),
     ctx.ui.slot({ append: "session.panel", render: (input) => {
       if (input.name !== PANEL_NAME) return null
+      const n = ensureNodes()
       syncDetail()
-      applyDetail()
-      return detail
+      n.applyDetail()
+      return n.detail
     } }),
     ctx.ui.slot({ append: "app", render: () => {
       ctx.keymap.layer(() => ({ mode: "global", commands: [detailCommand((name) => ctx.ui.panel.open(name))] }))

@@ -353,6 +353,74 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
   assert.equal(container.children[beforeHide - 1].props.visible, false)
 })
 
+test("setup defers every createElement to a slot render callback", async () => {
+  const created = []
+  const ui = {
+    createElement: (tag) => {
+      const node = { tag, props: {}, children: [] }
+      created.push(node)
+      return node
+    },
+    insert: (parent, child) => { parent.children.push(child) },
+    setProp: (node, name, value) => { node.props[name] = value },
+  }
+  const createSignal = (initial) => {
+    let value = initial
+    return [() => value, (next) => { value = typeof next === "function" ? next(value) : next }]
+  }
+  const modules = {
+    "@opentui/solid": ui,
+    "solid-js": { createSignal },
+    "@opentui/core": { TextAttributes: { BOLD: 1 } },
+  }
+  const renderers = Object.create(null)
+  const ctx = {
+    theme: {
+      text: {
+        base: "base", muted: "muted", action: { primary: { base: "action" } },
+        feedback: {
+          error: { base: "error" }, warning: { base: "warning" },
+          success: { base: "success" }, info: { base: "info" },
+        },
+      },
+      background: { raised: { high: "hover" } },
+    },
+    client: { rpc: () => ({ snapshot: async () => ({ active: [], recent: [] }) }) },
+    storage: { store: () => [{ id: "" }, async () => {}] },
+    ui: {
+      slot: ({ append, render }) => {
+        renderers[append] = render
+        return () => { delete renderers[append] }
+      },
+      panel: { open: () => {} },
+    },
+    keymap: { layer: () => {} },
+  }
+
+  const dispose = await beaconStatusDefinition.setup(ctx, { import: (specifier) => modules[specifier] })
+  assert.equal(created.length, 0, "setup must not call createElement before any render callback")
+  for (const name of ["sidebar.content", "home.footer.status", "session.panel", "app"]) {
+    assert.equal(typeof renderers[name], "function", `registers ${name}`)
+  }
+
+  const sidebar = renderers["sidebar.content"]()
+  assert.ok(sidebar, "sidebar render returns a node")
+  assert.ok(created.length > 0, "first render callback creates the nodes")
+
+  const before = created.length
+  assert.equal(renderers["sidebar.content"](), sidebar, "sidebar node is reused")
+  assert.equal(renderers["home.footer.status"]() !== sidebar, true, "footer has its own node")
+  assert.equal(created.length, before, "repeat renders create no new nodes")
+
+  const detail = renderers["session.panel"]({ name: PANEL_NAME })
+  assert.ok(detail, "panel render returns the detail node")
+  assert.equal(renderers["session.panel"]({ name: "other" }), null, "other panels render nothing")
+  assert.equal(created.length, before, "opening the detail panel creates no new nodes")
+
+  dispose()
+  assert.equal(Object.keys(renderers).length, 0, "dispose removes every slot")
+})
+
 test("ui.js uses theme tokens and native text styling only", () => {
   const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
   assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(src), false, "no hardcoded hex colors")
