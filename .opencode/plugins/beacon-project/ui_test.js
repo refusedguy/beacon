@@ -421,6 +421,23 @@ test("setup defers every createElement to a slot render callback", async () => {
   assert.equal(Object.keys(renderers).length, 0, "dispose removes every slot")
 })
 
+test("setup without injected deps keeps the TUI imports literal", async () => {
+  const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
+  for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
+    assert.ok(src.includes(`import("${specifier}")`), `literal import("${specifier}") is present`)
+  }
+  assert.ok(src.includes('import("@opencode/plugin/tui")'), "the TUI plugin import stays literal")
+
+  // With no injected deps, setup must reach the runtime imports rather than
+  // the guard. The TUI peers are absent under node --test, so a module
+  // resolution failure is the only acceptable rejection.
+  await assert.rejects(beaconStatusDefinition.setup({}), (error) => {
+    assert.equal(/unexpected import/.test(error.message), false)
+    assert.match(error.message, /Cannot find package|ERR_MODULE_NOT_FOUND|Cannot find module/)
+    return true
+  })
+})
+
 test("ui.js uses theme tokens and native text styling only", () => {
   const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
   assert.equal(/#[0-9a-fA-F]{3,8}\b/.test(src), false, "no hardcoded hex colors")
