@@ -49,6 +49,7 @@ type wiring struct {
 	taskDeleter *app.TaskDeleter
 	taskUpdater *app.TaskUpdater
 	recon       *app.Reconciler
+	reconcile   *app.ReconcileService
 }
 
 // wiredInfra holds the adapters shared by every application service.
@@ -163,6 +164,7 @@ func wireServices(cfg config.Config, root, parentSession string, infra *wiredInf
 		status:      app.StatusService{Store: infra.store},
 		wait:        app.WaitService{Store: infra.store, Interval: time.Second},
 		taskCreator: creator, taskDeleter: deleter, taskUpdater: updater, recon: recon,
+		reconcile: &app.ReconcileService{Reconciler: recon, Store: infra.store},
 	}
 }
 
