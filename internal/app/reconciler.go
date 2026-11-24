@@ -304,9 +304,24 @@ func (r *Reconciler) Run(ctx context.Context, changes <-chan int) error {
 }
 
 func (r *Reconciler) safeReconcile(ctx context.Context, pr int) {
+	defer func() {
+		if v := recover(); v != nil {
+			slog.Error("reconcile panic recovered", "pr", pr, "run_id", r.runIDForPR(ctx, pr), "panic", v)
+		}
+	}()
 	if _, err := r.Reconcile(ctx, pr); err != nil {
 		slog.Error("reconcile PR", "pr", pr, "error", err)
 	}
+}
+
+// runIDForPR is best effort: the panic may have come from the store itself.
+func (r *Reconciler) runIDForPR(ctx context.Context, pr int) (id string) {
+	defer func() { _ = recover() }()
+	run, err := r.Store.FindByPR(ctx, pr)
+	if err == nil && run != nil {
+		id = string(run.ID)
+	}
+	return id
 }
 
 func (r *Reconciler) interval() time.Duration {

@@ -63,12 +63,19 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	if err != nil {
 		return err
 	}
+	if in == nil {
+		// A resolved incident with the same signature makes the insert a
+		// no-op and the open-incident lookup return (nil, nil). Without an
+		// ID, blocked runs could never be unblocked during recovery.
+		slog.Error("base red incident unavailable", "repo", r.Repo, "base", baseBranch)
+		return nil
+	}
 	active, err := r.Store.ListActive(ctx)
 	if err != nil {
 		return err
 	}
 	for _, other := range active {
-		if other.IsFixer || other.PRNumber == 0 {
+		if other == nil || other.IsFixer || other.PRNumber == 0 {
 			continue
 		}
 		if other.State != core.RunWaitingCI && other.State != core.RunNeedsAgentFix {
@@ -82,11 +89,13 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 			continue
 		}
 		if err := other.Apply(core.Event{Kind: core.EvBlock, Reason: "base_red"}); err != nil {
+			slog.Debug("skip run that cannot accept block", "run", other.ID, "state", other.State, "error", err)
 			continue
 		}
 		other.BlockedIncidentID = in.ID
 		if err := r.Store.Save(ctx, other); err != nil {
-			return err
+			slog.Error("save blocked run", "run", other.ID, "incident", in.ID, "error", err)
+			continue
 		}
 	}
 	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
