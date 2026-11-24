@@ -5,6 +5,12 @@ import {
   RULE, TITLE_WIDTH, VALUE_WIDTH, normalizeSnapshot, str,
 } from "./ui_model.js"
 
+// One-row state bar in the panel header. A single text node carries the whole
+// bar, so the fill is a fixed-width run of block cells and a muted remainder.
+export const STATE_BAR_WIDTH = 12
+export const STATE_BAR_KEYS = Object.freeze(["running", "waiting_ci", "blocked", "merged"])
+const STATE_BAR_LETTER = Object.freeze({ running: "R", waiting_ci: "C", blocked: "B", merged: "M" })
+
 const STATE_VIEW = Object.freeze({
   pending: { marker: "○", color: "muted", label: "PEND" },
   running: { marker: "●", color: "success", label: "RUN" },
@@ -72,6 +78,35 @@ export function metricCounts(view = EMPTY_SNAPSHOT) {
     fix: m.fixCount ?? 0,
   }
 }
+// Counts come from active and recent runs, which already carry every state the
+// panel shows. Up to STATE_BAR_WIDTH cells are handed out proportionally with
+// the largest-remainder method; the unused tail is drawn with shade cells.
+export function stateBarItem(snapshot = EMPTY_SNAPSHOT) {
+  const view = normalizeSnapshot(snapshot)
+  const counts = { running: 0, waiting_ci: 0, blocked: 0, merged: 0 }
+  for (const run of [...view.active, ...view.recent]) {
+    const state = str(run.state).toLowerCase()
+    if (Object.hasOwn(counts, state)) counts[state] += 1
+  }
+  const total = STATE_BAR_KEYS.reduce((sum, key) => sum + counts[key], 0)
+  const filled = Math.min(total, STATE_BAR_WIDTH)
+  const share = total ? filled / total : 0
+  const exact = STATE_BAR_KEYS.map((key) => counts[key] * share)
+  const cells = exact.map(Math.floor)
+  let spare = filled - cells.reduce((sum, n) => sum + n, 0)
+  const byFraction = exact.map((value, i) => ({ i, fraction: value - cells[i] }))
+    .sort((a, b) => b.fraction - a.fraction)
+  for (let i = 0; spare > 0; i += 1, spare -= 1) cells[byFraction[i].i] += 1
+  const bar = STATE_BAR_KEYS.map((key, i) => "█".repeat(cells[i])).join("")
+    + "░".repeat(STATE_BAR_WIDTH - filled)
+  const legend = STATE_BAR_KEYS.map((key) => `${STATE_BAR_LETTER[key]}${counts[key]}`).join(" ")
+  return {
+    content: `states ${bar} ${legend}`,
+    fg: counts.blocked > 0 ? "error" : "base",
+    counts, total, filled, bar, legend,
+  }
+}
+
 export function clockOf(view = EMPTY_SNAPSHOT) {
   const stamps = [...view.active, ...view.recent].map((r) => timeOf(r.updatedAt)).filter(Boolean)
   const at = timeOf(view.generatedAt) || Math.max(0, ...stamps)

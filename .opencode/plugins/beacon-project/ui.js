@@ -8,7 +8,7 @@ import {
   EVENT_IDLE_MS, MAX_ROWS, PANEL_NAME, REFRESH_MS, BeaconStatusRpc, EMPTY_SNAPSHOT,
   createStatusSource, errorMessage, normalizeSnapshot, str, tuiLocation,
 } from "./ui_model.js"
-import { detailCommand, detailLines, metricsLine, snapshotLineItems } from "./ui_view.js"
+import { detailCommand, detailLines, metricsLine, snapshotLineItems, stateBarItem } from "./ui_view.js"
 import { createRunChangeBridge } from "./ui_bridge.js"
 import { pollIntervalMs, pluginOptions, snapshotLimits, statusPanelEnabled, watcherEnabled } from "./options.js"
 
@@ -201,7 +201,17 @@ async function setup(ctx, deps = {}) {
     let entry
     if (key === "sidebar") {
       const sidebar = listBox()
-      entry = { node: sidebar, apply: mount(sidebar, rows, MAX_ROWS) }
+      // One fixed text node, built inside the first render callback like the
+      // row pool. Later applies only set content and fg, never insert.
+      const bar = text("", color("base"), null, true)
+      insert(sidebar, bar)
+      const applyRows = mount(sidebar, rows, MAX_ROWS)
+      const applyBar = () => {
+        const item = stateBarItem(snapshot())
+        setProp(bar, "content", item.content)
+        setProp(bar, "fg", color(item.fg))
+      }
+      entry = { node: sidebar, apply: () => { applyRows(); applyBar() } }
     } else if (key === "footer") {
       const footer = listBox()
       entry = { node: footer, apply: mount(footer, footerItems, FOOTER_ROWS) }
