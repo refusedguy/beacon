@@ -32,6 +32,20 @@ type WorkspaceManager interface {
 	CommitPath(ctx context.Context, ws Workspace, pathspec, message string) error
 }
 
+// ModelRef names the model a harness session should use. The zero value means
+// no model was resolved, so the harness keeps its own default. The JSON tags
+// keep the OpenCode wire shape unchanged.
+type ModelRef struct {
+	ProviderID string `json:"providerID"`
+	ID         string `json:"id"`
+	Variant    string `json:"variant,omitempty"`
+}
+
+// IsZero reports whether no model is set.
+func (m ModelRef) IsZero() bool {
+	return m.ProviderID == "" && m.ID == "" && m.Variant == ""
+}
+
 type SpawnRequest struct {
 	Task      Task
 	Workspace Workspace
@@ -41,7 +55,7 @@ type SpawnRequest struct {
 	ParentSessionID string
 	// ModelRef is the model resolved for this dispatch from the parent
 	// session. It overrides the harness default when set.
-	ModelRef map[string]string
+	ModelRef ModelRef
 	IsFixer  bool
 }
 

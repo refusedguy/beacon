@@ -187,7 +187,7 @@ func wireInfra(cfg config.Config, root, parentSession string) (*wiredInfra, erro
 		workspace: wt, scm: scmGW, changes: make(chan int, 64)}
 	// resolveModel closes over the wired endpoint and token so a dispatch can
 	// look up the parent session's model even when no parent was known at start.
-	infra.resolveModel = func(parent string) map[string]string {
+	infra.resolveModel = func(parent string) core.ModelRef {
 		return resolveModel(cfg, harnessToken, parent)
 	}
 	return infra, nil
@@ -294,20 +294,20 @@ func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, err
 
 // resolveModel uses the configured model, then BEACON_MODEL, then the model
 // of the orchestrator session so workers run with the user's current choice.
-func resolveModel(cfg config.Config, token, parent string) map[string]string {
+func resolveModel(cfg config.Config, token, parent string) core.ModelRef {
 	if v := os.Getenv("BEACON_MODEL"); v != "" {
-		return map[string]string{"providerID": "opencode", "id": v}
+		return core.ModelRef{ProviderID: "opencode", ID: v}
 	}
 	if cfg.Harness.Model != "" {
-		return map[string]string{"providerID": "opencode", "id": cfg.Harness.Model}
+		return core.ModelRef{ProviderID: "opencode", ID: cfg.Harness.Model}
 	}
 	if parent == "" || token == "" || cfg.Harness.Endpoint == "" {
-		return nil
+		return core.ModelRef{}
 	}
 	endpoint := strings.TrimRight(cfg.Harness.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
 	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil
+		return core.ModelRef{}
 	}
 	if user, pass, ok := strings.Cut(token, ":"); ok {
 		req.SetBasicAuth(user, pass)
@@ -317,11 +317,11 @@ func resolveModel(cfg config.Config, token, parent string) map[string]string {
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil
+		return core.ModelRef{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return nil
+		return core.ModelRef{}
 	}
 	var info struct {
 		Data struct {
@@ -333,13 +333,13 @@ func resolveModel(cfg config.Config, token, parent string) map[string]string {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Data.Model.ID == "" {
-		return nil
+		return core.ModelRef{}
 	}
-	ref := map[string]string{"id": info.Data.Model.ID, "providerID": info.Data.Model.ProviderID}
-	if info.Data.Model.Variant != "" {
-		ref["variant"] = info.Data.Model.Variant
+	return core.ModelRef{
+		ProviderID: info.Data.Model.ProviderID,
+		ID:         info.Data.Model.ID,
+		Variant:    info.Data.Model.Variant,
 	}
-	return ref
 }
 
 func firstNonEmpty(values ...string) string {
