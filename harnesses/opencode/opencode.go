@@ -67,29 +67,17 @@ type Config struct {
 	Client          *http.Client
 }
 
-func New(endpoint string, rest ...string) *Harness {
-	h := &Harness{Endpoint: strings.TrimRight(endpoint, "/"), HTTP: &http.Client{Timeout: requestTimeout}}
-	if len(rest) > 0 {
-		h.Model = rest[0]
+// New builds a Harness from cfg. A nil Client gets a default client with the
+// request timeout.
+func New(cfg Config) *Harness {
+	h := &Harness{
+		Endpoint:        strings.TrimRight(cfg.Endpoint, "/"),
+		Model:           cfg.Model,
+		Agent:           cfg.Agent,
+		Token:           cfg.Token,
+		ParentSessionID: cfg.ParentSessionID,
+		HTTP:            &http.Client{Timeout: requestTimeout},
 	}
-	if len(rest) > 1 {
-		h.Agent = rest[1]
-	}
-	if len(rest) > 2 {
-		h.Token = rest[2]
-	}
-	if len(rest) > 3 {
-		h.ParentSessionID = rest[3]
-	}
-	return h
-}
-
-func NewOpenCode(endpoint, model, token string) *Harness {
-	return New(endpoint, model, "", token)
-}
-
-func NewFromConfig(cfg Config) *Harness {
-	h := New(cfg.Endpoint, cfg.Model, cfg.Agent, cfg.Token, cfg.ParentSessionID)
 	if cfg.Client != nil {
 		h.HTTP = cfg.Client
 	}
