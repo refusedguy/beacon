@@ -99,22 +99,19 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 		return core.Workspace{}, err
 	}
 	if _, err := os.Stat(path); err == nil {
-		clean, err := g.Clean(ctx, core.Workspace{Path: path})
-		if err != nil {
+		// A previous dispatch may have left a dirty worktree behind after a
+		// failed spawn. Force-remove it so the task can be dispatched again
+		// instead of failing with a stale-path conflict on every retry.
+		if err := g.ForceRemove(ctx, core.Workspace{Path: path}); err != nil {
 			return core.Workspace{}, err
 		}
-		if !clean {
-			return core.Workspace{}, core.Errorf(core.CodeConflict, "refusing to remove dirty worktree at %s", path)
-		}
-		if _, err := g.run(ctx, "worktree", "remove", path); err != nil {
-			return core.Workspace{}, err
-		}
-		g.refresh(ctx)
 	} else if !os.IsNotExist(err) {
 		return core.Workspace{}, err
 	}
 	if _, err := g.run(ctx, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
-		_, _ = g.run(ctx, "branch", "-D", branch)
+		if _, err := g.run(ctx, "branch", "-D", branch); err != nil {
+			return core.Workspace{}, fmt.Errorf("delete branch %s: %w", branch, err)
+		}
 	}
 	if _, err := g.run(ctx, "worktree", "add", "-b", branch, path, "origin/"+base); err != nil {
 		return core.Workspace{}, err
