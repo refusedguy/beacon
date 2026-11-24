@@ -49,12 +49,12 @@ test("compact header carries the human summary and R C B M counters", () => {
   }
   const items = snapshotLineItems(snapshot, null, NOW)
   assert.equal(items[0].name, "Beacon")
-  assert.equal(items[0].status, "1 running · 1 blocked · 6 needs work")
+  assert.equal(items[0].status, "1 running · 1 blocked")
   assert.equal(items[1].name, "R1 C0 B1 M0")
   const mount = createRowMount(solidModule(), { color: (k) => `theme.${k}`, BOLD: 1 })
   const container = { children: [], tag: "box" }
   mount(container, () => items, 8)
-  assert.equal(container.children[0].children[2].props.content, "1 running · 1 blocked · 6 needs work")
+  assert.equal(container.children[0].children[2].props.content, "1 running · 1 blocked")
 })
 
 test("detail hero wraps the full title and reasons, and exposes fixed action buttons", () => {
@@ -76,13 +76,15 @@ test("detail hero wraps the full title and reasons, and exposes fixed action but
   }
   const run = normalizeRun(makeRun({ State: "blocked" }))
   mount.apply(model, run)
-  assert.ok(findText(mount.node, "Beacon · Run & Control"), "the panel has the approved title")
+  assert.ok(findText(mount.node, "Beacon"), "the panel has the compact title")
   const title = findText(mount.node, model.title)
   assert.ok(title, "hero shows the full title")
   assert.equal(title.props.wrapMode, "word")
   assert.equal(title.props.truncate, false)
-  assert.equal(title.props.flexGrow, 1)
-  assert.equal(title.props.minWidth, 0)
+  assert.equal(title.props.flexGrow, undefined, "the hero title does not grow in the column card")
+  assert.equal(title.props.attributes, 1, "the hero title is bold")
+  const branch = findText(mount.node, model.branch)
+  assert.equal(branch?.props.wrapMode, "word", "branch lives in its own wrapping key-value row")
   const reason = findText(mount.node, model.rows[1].name)
   assert.equal(reason.props.wrapMode, "word", "the reason wraps")
   assert.equal(reason.props.truncate, false)

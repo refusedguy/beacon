@@ -35,7 +35,7 @@ test("state bar builds a proportional one-row visualization", () => {
       makeRun({ ID: "a", State: "running" }), makeRun({ ID: "b", State: "running" }),
       makeRun({ ID: "c", State: "waiting_ci" }), makeRun({ ID: "d", State: "blocked" }),
     ],
-    recent: [makeRun({ ID: "e", State: "merged" })],
+    recent: [makeRun({ ID: "e", TaskID: "T-E", State: "merged" })],
   })
   assert.deepEqual(item.counts, { running: 2, waiting_ci: 1, blocked: 1, merged: 1 })
   assert.equal(item.filled, 5)
@@ -103,7 +103,7 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
   assert.equal(row.props.onMouseDown, handler, "click handler survives")
   assert.equal(row.children[1].props.content, "Second")
   assert.equal(row.children[1].props.fg, "theme.error", "the name follows the state color")
-  assert.equal(row.children[0].props.content, "▲")
+  assert.equal(row.children[0].props.content, "▲ ", "a run marker keeps a trailing space in the live cell")
   assert.equal(row.children[0].props.fg, "theme.error")
   handler()
   assert.equal(picked.length, 1)
