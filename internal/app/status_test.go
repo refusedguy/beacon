@@ -271,8 +271,32 @@ func TestSnapshotWithoutOptionalStoresStillHasNonNullCollections(t *testing.T) {
 	if snap.Daemon == nil || snap.Daemon.State != "absent" {
 		t.Fatalf("daemon = %+v, want absent", snap.Daemon)
 	}
-	if snap.BaseIncident != nil {
-		t.Fatalf("base incident = %+v, want nil without an open incident", snap.BaseIncident)
+	if snap.BaseIncident == nil || snap.BaseIncident.ID != "" || snap.BaseIncident.FailedChecks == nil {
+		t.Fatalf("base incident = %+v, want empty object", snap.BaseIncident)
+	}
+
+	b, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"active", "recent", "queue", "daemon", "base_incident"} {
+		if _, ok := raw[key]; !ok {
+			t.Fatalf("snapshot JSON is missing %q: %s", key, b)
+		}
+	}
+	if got := string(raw["queue"]); got != "[]" {
+		t.Fatalf("queue JSON = %s, want []", got)
+	}
+	if got := string(raw["daemon"]); !strings.Contains(got, `"state":"absent"`) {
+		t.Fatalf("daemon JSON = %s, want state absent", got)
+	}
+	if got := string(raw["base_incident"]); !strings.Contains(got, `"id":""`) ||
+		!strings.Contains(got, `"failed_checks":[]`) {
+		t.Fatalf("base incident JSON = %s, want empty object", got)
 	}
 }
 

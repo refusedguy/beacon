@@ -144,7 +144,12 @@ func (c *TaskCreator) Create(ctx context.Context, in CreateTaskInput) (CreatedTa
 		return out, err
 	}
 	if c.Store != nil {
-		if err := c.Store.SyncTasks(ctx, created); err != nil {
+		available, err := c.Source.ListAvailable(ctx)
+		if err != nil {
+			c.rollback(ctx, created)
+			return out, err
+		}
+		if err := c.Store.SyncTasks(ctx, withCreated(available, created)); err != nil {
 			c.rollback(ctx, created)
 			return out, err
 		}
@@ -355,6 +360,29 @@ func (c *TaskCreator) rollback(ctx context.Context, tasks []core.Task) {
 	for i := len(tasks) - 1; i >= 0; i-- {
 		_ = remover.Remove(ctx, tasks[i].ID)
 	}
+}
+
+// withCreated adds cards that the source has not listed yet to the full
+// available set. SyncTasks replaces the whole graph, so dropping either side
+// would hide cards from dispatch.
+func withCreated(available, created []core.Task) []core.Task {
+	out := make([]core.Task, 0, len(available)+len(created))
+	seen := make(map[core.TaskID]bool, len(available)+len(created))
+	for _, task := range available {
+		if seen[task.ID] {
+			continue
+		}
+		seen[task.ID] = true
+		out = append(out, task)
+	}
+	for _, task := range created {
+		if seen[task.ID] {
+			continue
+		}
+		seen[task.ID] = true
+		out = append(out, task)
+	}
+	return out
 }
 
 func (c *TaskCreator) lookup(ctx context.Context, key string, id core.TaskID, children []core.Task) ([]core.Task, bool) {
