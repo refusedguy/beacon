@@ -173,6 +173,48 @@ func (g *GitWorktree) Create(ctx context.Context, task core.Task) (core.Workspac
 	return core.Workspace{Path: path, Branch: branch, Base: strings.TrimSpace(mergeBase)}, nil
 }
 
+// EnsureBranch publishes branch from origin/base when it is missing on origin.
+// Epic children fetch their base branch before the epic opens a PR, so that
+// branch has to exist independently of the PR. A present branch is a no-op.
+func (g *GitWorktree) EnsureBranch(ctx context.Context, branch, base string) error {
+	branch = safeEpicBranch(branch)
+	if base == "" {
+		base = g.Base
+	}
+	if base == "" {
+		base = "main"
+	}
+	out, err := g.run(ctx, "ls-remote", "--heads", "origin", branch)
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasSuffix(strings.TrimSpace(line), "\trefs/heads/"+branch) {
+			return nil
+		}
+	}
+	if _, err := g.run(ctx, "fetch", "origin", base); err != nil {
+		return err
+	}
+	// Pushing the remote-tracking ref avoids a local branch that would have to
+	// be rolled back, and leaves origin untouched when the push is rejected.
+	if _, err := g.run(ctx, "push", "origin", "origin/"+base+":refs/heads/"+branch); err != nil {
+		return err
+	}
+	slog.InfoContext(ctx, "workspace: created missing base branch", "branch", branch, "base", base)
+	return nil
+}
+
+// safeEpicBranch keeps the beacon/ prefix and sanitizes the id the same way
+// branchName does, so children fetch the ref that EnsureBranch publishes.
+func safeEpicBranch(branch string) string {
+	branch = strings.TrimSpace(branch)
+	if !strings.HasPrefix(branch, "beacon/") {
+		branch = "beacon/" + branch
+	}
+	return "beacon/" + unsafeBranchChars.ReplaceAllString(strings.TrimPrefix(branch, "beacon/"), "-")
+}
+
 func (g *GitWorktree) Clean(ctx context.Context, ws core.Workspace) (bool, error) {
 	if err := checkPath(ws.Path); err != nil {
 		return false, err
