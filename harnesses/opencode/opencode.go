@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -20,7 +21,10 @@ import (
 	"github.com/refusedguy/beacon/pkg/core"
 )
 
-const requestTimeout = 30 * time.Second
+const (
+	requestTimeout     = 30 * time.Second
+	modelLookupTimeout = 3 * time.Second
+)
 
 var (
 	prPattern      = regexp.MustCompile(`(?:pull/|"pr"\s*:\s*)(\d+)`)
@@ -163,6 +167,59 @@ func (h *Harness) modelRef(req core.SpawnRequest) map[string]string {
 		return map[string]string{"providerID": "opencode", "id": h.Model}
 	}
 	return nil
+}
+
+// SetRepo implements core.RepoSetter. The repo roots RefreshWorktrees to this
+// checkout, so a harness that keeps no project registry can ignore it.
+func (h *Harness) SetRepo(root string) { h.Repo = root }
+
+// ResolveModel implements core.ModelResolver. BEACON_MODEL wins, then the
+// configured model, then the parent session's current model read from
+// OpenCode. A worker session does not inherit its parent's model, so dispatch
+// passes the resolved ref when it creates the session.
+func (h *Harness) ResolveModel(parent string) map[string]string {
+	if v := os.Getenv("BEACON_MODEL"); v != "" {
+		return map[string]string{"providerID": "opencode", "id": v}
+	}
+	if h.Model != "" {
+		return map[string]string{"providerID": "opencode", "id": h.Model}
+	}
+	parent = firstNonEmpty(parent, h.ParentSessionID)
+	if parent == "" || h.Token == "" || h.Endpoint == "" {
+		return nil
+	}
+	endpoint := strings.TrimRight(h.Endpoint, "/") + "/api/session/" + url.PathEscape(parent)
+	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil
+	}
+	ApplyAuth(req, h.Token)
+	client := &http.Client{Timeout: modelLookupTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil
+	}
+	var info struct {
+		Data struct {
+			Model struct {
+				ID         string `json:"id"`
+				ProviderID string `json:"providerID"`
+				Variant    string `json:"variant"`
+			} `json:"model"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil || info.Data.Model.ID == "" {
+		return nil
+	}
+	ref := map[string]string{"id": info.Data.Model.ID, "providerID": info.Data.Model.ProviderID}
+	if info.Data.Model.Variant != "" {
+		ref["variant"] = info.Data.Model.Variant
+	}
+	return ref
 }
 
 func messageID(prefix string) string {
@@ -414,4 +471,7 @@ var (
 	_ core.AgentHarness      = (*Harness)(nil)
 	_ core.AgentHarness      = (*OpenCode)(nil)
 	_ core.WorktreeRefresher = (*Harness)(nil)
+	_ core.RepoSetter        = (*Harness)(nil)
+	_ core.ModelResolver     = (*Harness)(nil)
+	_ core.IdleWatcher       = (*Harness)(nil)
 )
