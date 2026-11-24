@@ -26,7 +26,7 @@ The ports added to `pkg/core` are `RepoSetter`, `ModelResolver` and `IdleWatcher
 
 ## Five child cards
 
-The epic plan created five cards in dependency order. The chain is `01 -> 02 -> 04 -> 05`, with `03` independent of that chain.
+The epic plan created five cards in dependency order. Card 01 comes before card 02, which comes before card 04, which comes before card 05. Card 03 is independent of that chain.
 
 | Card | Title | Depends |
 | --- | --- | --- |
