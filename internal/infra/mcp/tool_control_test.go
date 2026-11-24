@@ -19,13 +19,18 @@ import (
 // controlStore is a RunStore that can inject transient write-lock conflicts.
 type controlStore struct {
 	core.RunStore
-	mu       sync.Mutex
-	runs     map[core.RunID]*core.Run
-	failures map[core.RunID]int
+	mu        sync.Mutex
+	runs      map[core.RunID]*core.Run
+	failures  map[core.RunID]int
+	approvals map[core.RunID]string
 }
 
 func newControlStore() *controlStore {
-	return &controlStore{runs: map[core.RunID]*core.Run{}, failures: map[core.RunID]int{}}
+	return &controlStore{
+		runs:      map[core.RunID]*core.Run{},
+		failures:  map[core.RunID]int{},
+		approvals: map[core.RunID]string{},
+	}
 }
 
 func (s *controlStore) add(run *core.Run) {
@@ -62,7 +67,18 @@ func (s *controlStore) Save(_ context.Context, run *core.Run) error {
 	return nil
 }
 
-func (s *controlStore) SetApproval(context.Context, core.RunID, string) error { return nil }
+func (s *controlStore) SetApproval(_ context.Context, id core.RunID, sha string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.approvals[id] = sha
+	return nil
+}
+
+func (s *controlStore) approval(id core.RunID) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.approvals[id]
+}
 
 func (s *controlStore) FindActiveByTask(context.Context, core.TaskID) (*core.Run, error) {
 	return nil, nil
@@ -88,13 +104,29 @@ func controlClient(t *testing.T, sv Services) *msdk.ClientSession {
 
 func callControl(t *testing.T, cs *msdk.ClientSession, args map[string]any) *msdk.CallToolResult {
 	t.Helper()
+	return callTool(t, cs, "beacon_control", args)
+}
+
+func callTool(t *testing.T, cs *msdk.ClientSession, name string, args map[string]any) *msdk.CallToolResult {
+	t.Helper()
 	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
-		Name: "beacon_control", Arguments: args,
+		Name: name, Arguments: args,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return res
+}
+
+func controlRunInState(t *testing.T, id core.RunID, events ...core.Event) *core.Run {
+	t.Helper()
+	run := core.NewRun(id, "T-1", time.Now())
+	for _, event := range events {
+		if err := run.Apply(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return run
 }
 
 func controlText(t *testing.T, res *msdk.CallToolResult) string {
@@ -284,5 +316,209 @@ func TestControlParallelCancelsAllSucceed(t *testing.T) {
 		if got := store.runs[id]; got.State != core.RunClosed {
 			t.Fatalf("run %s = %s, want %s", id, got.State, core.RunClosed)
 		}
+	}
+}
+
+func TestControlApproveBindsSHA(t *testing.T) {
+	for _, tc := range []struct {
+		name, sha, want string
+	}{
+		{"explicit sha", "deadbeef", "deadbeef"},
+		{"run head sha", "", "abc123"}, // omitted sha falls back to run.HeadSHA
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newControlStore()
+			run := core.NewRun("r1", "T-1", time.Now())
+			run.HeadSHA = "abc123"
+			store.add(run)
+			cs := controlClient(t, newControlServices(store))
+
+			args := map[string]any{"action": "approve", "run_id": "r1"}
+			if tc.sha != "" {
+				args["sha"] = tc.sha
+			}
+			res := callControl(t, cs, args)
+			if res.IsError || controlText(t, res) != "ok" {
+				t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+			}
+			if got := store.approval("r1"); got != tc.want {
+				t.Fatalf("approval = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestControlUnblockMovesBlockedRunToWaitingCI(t *testing.T) {
+	store := newControlStore()
+	store.add(controlRunInState(t, "r1",
+		core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock}))
+	cs := controlClient(t, newControlServices(store))
+
+	res := callControl(t, cs, map[string]any{"action": "unblock", "run_id": "r1"})
+	if res.IsError || controlText(t, res) != "ok" {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+	if got := store.runs["r1"].State; got != core.RunWaitingCI {
+		t.Fatalf("state = %s, want %s", got, core.RunWaitingCI)
+	}
+}
+
+func TestControlRetryRearmsRun(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		build     func(t *testing.T) *core.Run
+		wantState core.RunState
+		wantPR    int
+		wantSess  string
+	}{
+		{
+			name: "blocked run resets attempts",
+			build: func(t *testing.T) *core.Run {
+				r := controlRunInState(t, "r1",
+					core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock})
+				r.RebaseAttempts, r.FixAttempts = 2, 2
+				return r
+			},
+			wantState: core.RunWaitingCI,
+		},
+		{
+			name: "closed run without PR returns to pending",
+			build: func(t *testing.T) *core.Run {
+				r := core.NewRun("r1", "T-1", time.Now())
+				r.State = core.RunClosed
+				r.SessionID = "session-1"
+				r.WorkspacePath = "/tmp/work"
+				return r
+			},
+			wantState: core.RunPending,
+		},
+		{
+			name: "closed run with PR returns to waiting_ci",
+			build: func(t *testing.T) *core.Run {
+				r := core.NewRun("r1", "T-1", time.Now())
+				r.State = core.RunClosed
+				r.PRNumber = 42
+				return r
+			},
+			wantState: core.RunWaitingCI,
+			wantPR:    42,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newControlStore()
+			store.add(tc.build(t))
+			cs := controlClient(t, newControlServices(store))
+
+			res := callControl(t, cs, map[string]any{"action": "retry", "run_id": "r1"})
+			if res.IsError || controlText(t, res) != "ok" {
+				t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+			}
+			got := store.runs["r1"]
+			if got.State != tc.wantState || got.PRNumber != tc.wantPR || got.SessionID != tc.wantSess {
+				t.Fatalf("run = %+v, want state %s pr %d session %q", got, tc.wantState, tc.wantPR, tc.wantSess)
+			}
+			if got.RebaseAttempts != 0 || got.FixAttempts != 0 {
+				t.Fatalf("attempts = %d/%d, want 0/0", got.RebaseAttempts, got.FixAttempts)
+			}
+		})
+	}
+}
+
+func TestControlForwardsAllAdvertisedActionsToRemote(t *testing.T) {
+	type forwarded struct {
+		action, runID, sha string
+		pr                 int
+	}
+	var got []forwarded
+	sv := Services{Remote: func(_ context.Context, action, runID string, pr int, sha string) error {
+		got = append(got, forwarded{action: action, runID: runID, sha: sha, pr: pr})
+		return nil
+	}}
+	cs := controlClient(t, sv)
+
+	cases := []forwarded{
+		{action: "approve", runID: "r1", sha: "abc123"},
+		{action: "unblock", runID: "r2"},
+		{action: "cancel", runID: "r3"},
+		{action: "retry", runID: "r4"},
+		{action: "watch", runID: "r5", pr: 42}, // bind a PR: action and pr reach the daemon
+	}
+	for _, tc := range cases {
+		args := map[string]any{"action": tc.action, "run_id": tc.runID}
+		if tc.sha != "" {
+			args["sha"] = tc.sha
+		}
+		if tc.pr != 0 {
+			args["pr"] = tc.pr
+		}
+		res := callControl(t, cs, args)
+		if res.IsError || controlText(t, res) != "ok" {
+			t.Fatalf("%s result = %+v, text = %q", tc.action, res, controlText(t, res))
+		}
+	}
+	if len(got) != len(cases) {
+		t.Fatalf("got %d calls, want %d", len(got), len(cases))
+	}
+	for i, tc := range cases {
+		if got[i] != tc {
+			t.Errorf("call %d = %+v, want %+v", i, got[i], tc)
+		}
+	}
+}
+
+func TestControlBindPRMovesRunToWaitingCI(t *testing.T) {
+	store := newControlStore()
+	store.add(controlRunInState(t, "r1", core.Event{Kind: core.EvStart}))
+	cs := controlClient(t, newControlServices(store))
+
+	res := callTool(t, cs, "beacon_watch_pr", map[string]any{"run_id": "r1", "pr": 42})
+	if res.IsError {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunWaitingCI || got.PRNumber != 42 {
+		t.Fatalf("state = %s pr = %d, want %s pr 42", got.State, got.PRNumber, core.RunWaitingCI)
+	}
+}
+
+func TestControlInvalidTransitionReportsStructuredErrorWithoutPartialSuccess(t *testing.T) {
+	store := newControlStore()
+	store.add(core.NewRun("r1", "T-1", time.Now())) // pending: unblock is invalid
+	store.add(controlRunInState(t, "r2",
+		core.Event{Kind: core.EvStart}, core.Event{Kind: core.EvBlock}))
+	cs := controlClient(t, newControlServices(store))
+
+	got := parseControlBatch(t, callControl(t, cs, map[string]any{
+		"action": "unblock", "run_ids": []any{"r1", "r2"},
+	}))
+	if len(got.Results) != 2 {
+		t.Fatalf("result = %+v", got)
+	}
+	if got.Results[0].ID != "r1" || got.Results[0].Status != "error" ||
+		!strings.Contains(got.Results[0].Error, "invalid_transition") {
+		t.Fatalf("invalid result = %+v", got.Results[0])
+	}
+	if got.Results[1].ID != "r2" || got.Results[1].Status != "ok" {
+		t.Fatalf("valid result = %+v", got.Results[1])
+	}
+	if s := store.runs["r1"].State; s != core.RunPending {
+		t.Fatalf("r1 state = %s, want %s with no partial success", s, core.RunPending)
+	}
+	if s := store.runs["r2"].State; s != core.RunWaitingCI {
+		t.Fatalf("r2 state = %s, want %s", s, core.RunWaitingCI)
+	}
+}
+
+func TestControlSingleInvalidTransitionReturnsStructuredError(t *testing.T) {
+	store := newControlStore()
+	store.add(core.NewRun("r1", "T-1", time.Now()))
+	cs := controlClient(t, newControlServices(store))
+
+	res := callControl(t, cs, map[string]any{"action": "unblock", "run_id": "r1"})
+	if !res.IsError || !strings.Contains(controlText(t, res), "invalid_transition") {
+		t.Fatalf("result = %+v, text = %q", res, controlText(t, res))
+	}
+	if s := store.runs["r1"].State; s != core.RunPending {
+		t.Fatalf("state = %s, want %s with no partial success", s, core.RunPending)
 	}
 }
