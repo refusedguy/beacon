@@ -60,7 +60,7 @@ export function themeStub() {
         success: { base: "success" }, info: { base: "info" },
       },
     },
-    background: { raised: { high: "hover" } },
+    background: { raised: { base: "panel", high: "hover" } },
   }
 }
 

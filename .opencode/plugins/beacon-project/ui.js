@@ -14,9 +14,10 @@ import {
   createStatusSource, errorMessage, str, tuiLocation,
 } from "./ui_model.js"
 import {
-  DETAIL_OPEN, SIDEBAR_OPEN, compactReason, detailCommand, detailModel,
+  DETAIL_OPEN, SIDEBAR_OPEN, detailCommand, detailModel,
   metricsLine, sidebarModel,
 } from "./ui_view.js"
+import { compactReason } from "./ui_alerts.js"
 import { createBox, createLineMount } from "./ui_nodes.js"
 import { createSidebarMount } from "./ui_sidebar.js"
 import { createDetailMount } from "./ui_detail_view.js"
@@ -102,7 +103,8 @@ async function setup(ctx, deps = {}) {
     : key === "muted" ? theme.text.muted
       : key === "action" ? theme.text.action.primary.base
         : key === "raised" ? theme.background.raised.high
-          : key === "border" ? (theme.border?.raised?.base ?? theme.text.action.primary.base)
+          : key === "panel" ? theme.background?.raised?.base
+            : key === "border" ? (theme.border?.raised?.base ?? theme.text.action.primary.base)
             : theme.text.feedback[key]?.base ?? theme.text.muted
   let detailOpen = false
   let stopped = false

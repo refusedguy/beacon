@@ -42,7 +42,7 @@ test("state bar builds proportional colored segments and a human summary", () =>
   assert.ok(big.content.includes(`R${STATE_BAR_WIDTH + 2}`))
   const empty = stateBarItem(EMPTY_SNAPSHOT)
   assert.equal(empty.segments[0].text, "")
-  assert.equal(empty.segments.at(-1).text, "░".repeat(STATE_BAR_WIDTH))
+  assert.equal(empty.segments.at(-1).text, "─".repeat(STATE_BAR_WIDTH))
   assert.ok(empty.content.includes("R0 C0 B0 M0"))
 })
 
@@ -119,13 +119,15 @@ test("a stale transport error keeps the snapshot and clips the marker", () => {
   assert.ok(items.some((i) => i.name === "Still here"))
 })
 
-test("empty snapshot still renders both sections behind a counted header", () => {
+test("empty snapshot shows one idle line and counted headers", () => {
   const items = sidebarModel(EMPTY_SNAPSHOT, null, NOW).items
   assert.deepEqual(items.map((i) => i.name), [
-    "Beacon", "R0 C0 B0 M0", "Active", "No active runs",
-    "No tasks ready", "Queue (0)", "Recent", "No recent runs",
+    "Beacon", "R0 C0 B0 M0", "Active", "Idle · no ready tasks",
+    "Queue", "Recent", "No recent runs",
   ])
-  assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => i.status), ["0", "", "0"])
+  assert.deepEqual(items.filter((i) => i.sectionKey).map((i) => [i.name, i.status]), [
+    ["Active", "0"], ["Queue", "0"], ["Recent", "0"],
+  ])
 })
 
 test("detail model uses four sections with full wrapping text", () => {
@@ -150,7 +152,8 @@ test("detail model uses four sections with full wrapping text", () => {
   assert.deepEqual(model.rows.filter((i) => i.sectionKey).map((i) => i.sectionKey), ["why", "checks", "timeline", "technical"])
   const names = model.rows.map((i) => i.name ?? i.text)
   assert.ok(names.includes(longReason), "the reason is not cut to a fixed width")
-  assert.ok(names.includes("ci success"), "CI checks come from run.checks")
+  assert.ok(names.includes("ci"), "successful checks hide the word success")
+  assert.equal(model.rows.find((i) => i.sectionKey === "checks").status, "1/1 · 28s")
   assert.ok(names.includes("Run created"), "timeline events use human copy")
   assert.ok(model.rows.some((i) => i.marker === "10:01:00  "), "the timeline time sits in its own padded column")
   assert.ok(names.some((n) => n.includes("reconcile.decision merge")))
@@ -169,7 +172,7 @@ test("detail sections collapse to ▶ and Technical defaults to collapsed", () =
   const names = collapsed.rows.map((i) => i.name)
   assert.equal(names.some((n) => n.includes("created")), false)
   assert.equal(names.some((n) => n.includes("reconcile.decision")), false)
-  assert.equal(names.includes("ci success"), false)
+  assert.equal(names.includes("ci"), false)
   assert.equal(collapsed.rows.filter((i) => i.sectionKey).every((i) => i.marker === "▶"), true)
   assert.deepEqual(DETAIL_OPEN, { why: true, checks: true, timeline: true, technical: false })
 })

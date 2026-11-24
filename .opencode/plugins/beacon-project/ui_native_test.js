@@ -35,11 +35,11 @@ function signals() {
   return { createSignal: (v) => { let x = v; return [() => x, (n) => { x = typeof n === "function" ? n(x) : n }] } }
 }
 
-test("state bar fills 38 cells with a compact R C B M legend", () => {
-  assert.equal(STATE_BAR_WIDTH, 38)
+test("state bar fills 30 cells with thin glyphs and a compact R C B M legend", () => {
+  assert.equal(STATE_BAR_WIDTH, 30)
   const item = stateBarItem({ active: [], recent: [], metrics: { merge_count: 51 } })
-  assert.equal(item.bar.length, 38)
-  assert.equal(item.segments.at(-1).text, "░".repeat(38))
+  assert.equal(item.bar.length, 30)
+  assert.equal(item.segments.at(-1).text, "─".repeat(30))
   assert.equal(item.legend, "R0 C0 B0 M51")
 })
 
@@ -75,7 +75,7 @@ test("hero card, Why/Blocker card and each button box carry padding and backgrou
   assert.equal(hero.props.border, true)
   assert.equal(hero.props.borderStyle, "rounded")
   assert.equal(hero.props.marginTop, 1)
-  assert.equal(hero.props.backgroundColor, "theme.raised")
+  assert.equal(hero.props.backgroundColor, "theme.panel")
   for (const key of ["paddingLeft", "paddingRight", "paddingTop", "paddingBottom"]) {
     assert.equal(hero.props[key], 1, `hero has ${key}`)
   }
