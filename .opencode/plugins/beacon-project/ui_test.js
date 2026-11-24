@@ -108,7 +108,7 @@ test("detail panel close control is styled, padded and fires once", async () => 
   const panel = renderers["session.panel"]({ name: PANEL_NAME, close: () => { closeCount++ } })
   const title = findText(panel, "Beacon run detail")
   assert.equal(title.props.attributes, 1, "the header title is bold")
-  assert.ok(findText(panel, "esc"), "an esc hint labels the control")
+  assert.ok(findText(panel, "ctrl+g"), "a ctrl+g hint labels the control")
   const closeButton = findText(panel, "✕")
   assert.ok(closeButton, "the detail panel renders a ✕ text")
   assert.equal(closeButton.props.fg, "error", "the ✕ uses the error feedback color")
