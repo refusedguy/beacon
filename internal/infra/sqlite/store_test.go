@@ -255,6 +255,45 @@ func TestRunScopeAndIncidentPersistence(t *testing.T) {
 	}
 }
 
+func TestCreateIncidentReopensResolvedSignature(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	in, err := store.CreateIncident(ctx, &core.BaseIncident{
+		Repo: "o/r", BaseBranch: "main", Signature: "sig-a",
+		FailedChecksJSON: `["check"]`, Attempts: 2,
+	})
+	if err != nil || in == nil {
+		t.Fatalf("create = %+v err=%v", in, err)
+	}
+	in.Status = "resolved"
+	in.Attempts = 2
+	if err := store.UpdateIncident(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if open, err := store.FindOpenIncident(ctx, "o/r", "main", "sig-a"); err != nil || open != nil {
+		t.Fatalf("resolved incident still open: %+v err=%v", open, err)
+	}
+
+	reopened, err := store.CreateIncident(ctx, &core.BaseIncident{
+		Repo: "o/r", BaseBranch: "main", Signature: "sig-a",
+		FailedChecksJSON: `["check","other"]`,
+	})
+	if err != nil || reopened == nil {
+		t.Fatalf("reopen = %+v err=%v (must not be nil, nil)", reopened, err)
+	}
+	if reopened.Status != "open" || reopened.Attempts != 0 || reopened.FixerRunID != "" {
+		t.Fatalf("reopened incident = %+v", reopened)
+	}
+	if reopened.FailedChecksJSON != `["check","other"]` {
+		t.Fatalf("failed checks = %s", reopened.FailedChecksJSON)
+	}
+}
+
 func TestObservedBaseSHARoundTrip(t *testing.T) {
 	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {

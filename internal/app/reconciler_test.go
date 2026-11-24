@@ -462,6 +462,29 @@ func TestBehindGreenPRMergesWhenMergeable(t *testing.T) {
 	}
 }
 
+func TestGreenBehindNeedsRebaseLeavesStuckState(t *testing.T) {
+	r, store, scm, _, _ := newReconciler(t, core.VerdictNeedsRebase,
+		core.Observation{
+			PRNumber: 42, HeadSHA: "sha2", BaseSHA: "base-new", PRState: "open", Behind: true,
+			Checks: []core.CheckResult{{Name: "ci", State: core.CheckSuccess}},
+		})
+	run := store.runs["r1"]
+	run.State = core.RunNeedsRebase
+	if err := store.Save(context.Background(), run); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	got := store.runs["r1"]
+	if got.State != core.RunWaitingCI {
+		t.Fatalf("state = %s, want waiting_ci", got.State)
+	}
+	if scm.rebases != 0 || scm.merges != 0 {
+		t.Fatalf("rebases=%d merges=%d, want pure state transition", scm.rebases, scm.merges)
+	}
+}
+
 func TestBehindGreenPRWithConflictDoesNotMerge(t *testing.T) {
 	r, store, scm, h, _ := newReconciler(t, core.VerdictNeedsAgentFix,
 		core.Observation{

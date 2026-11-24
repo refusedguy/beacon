@@ -157,6 +157,7 @@ func (r *Reconciler) openEpicPR(ctx context.Context, epic core.Task) error {
 		return r.Store.Save(ctx, run)
 	}
 	run := core.NewRun(core.RunID("epic-"+string(epic.ID)), epic.ID, time.Now().UTC())
+	run.MaxAttempts = r.maxAttempts()
 	run.Branch = epicBranch(epic.ID)
 	if err := run.Apply(core.Event{Kind: core.EvStart}); err != nil {
 		return err

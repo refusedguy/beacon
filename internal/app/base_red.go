@@ -63,6 +63,9 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 	if err != nil {
 		return err
 	}
+	if in == nil {
+		return nil
+	}
 	active, err := r.Store.ListActive(ctx)
 	if err != nil {
 		return err
@@ -86,14 +89,14 @@ func (r *Reconciler) checkBaseRed(ctx context.Context, run *core.Run, obs core.O
 		}
 		other.BlockedIncidentID = in.ID
 		if err := r.Store.Save(ctx, other); err != nil {
-			return err
+			slog.Error("block run on red base", "run", other.ID, "incident", in.ID, "error", err)
 		}
 	}
 	if strings.EqualFold(r.BaseRedMode, "notify_orchestrator") {
 		if err := r.notify(run, "base_red", "base branch is red: "+reason); err != nil {
 			return err
 		}
-		r.notifyParent(ctx, run, run.PRNumber, "blocked: base_red")
+		r.notifyParent(ctx, run, run.PRNumber, "base_red: "+reason)
 		return nil
 	}
 	return r.ensureFixer(ctx, in, base, run)
@@ -132,6 +135,7 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 		return err
 	}
 	run := core.NewRun(id, task.ID, time.Now().UTC())
+	run.MaxAttempts = r.maxAttempts()
 	run.IsFixer = true
 	run.Scope = task.Scope
 	run.WorkspacePath = ws.Path
@@ -163,6 +167,15 @@ func (r *Reconciler) ensureFixer(ctx context.Context, in *core.BaseIncident, bas
 	in.FixerRunID = run.ID
 	in.Attempts++
 	return r.Store.UpdateIncident(ctx, in)
+}
+
+// maxAttempts keeps fixers and epics on the dispatcher's retry budget. The
+// default matches the configured merge max_attempts used for normal runs.
+func (r *Reconciler) maxAttempts() int {
+	if r.Dispatcher != nil && r.Dispatcher.MaxAttempts > 0 {
+		return r.Dispatcher.MaxAttempts
+	}
+	return 12
 }
 
 func (r *Reconciler) canStartFixer(ctx context.Context, in *core.BaseIncident, origin *core.Run) (bool, error) {

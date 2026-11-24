@@ -39,7 +39,11 @@ func (s *Store) CreateIncident(ctx context.Context, in *core.BaseIncident) (*cor
 INSERT INTO base_incidents(id, repo, base_branch, signature, failed_checks_json,
  fixer_run_id, status, attempts, created_at, resolved_at)
 VALUES (?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(repo, base_branch, signature) DO NOTHING`,
+ON CONFLICT(repo, base_branch, signature) DO UPDATE SET
+ id=excluded.id, failed_checks_json=excluded.failed_checks_json,
+ fixer_run_id='', status='open', attempts=0,
+ created_at=excluded.created_at, resolved_at=0
+WHERE base_incidents.status != 'open'`,
 		in.ID, in.Repo, in.BaseBranch, in.Signature, in.FailedChecksJSON,
 		string(in.FixerRunID), in.Status, in.Attempts, in.CreatedAt, in.ResolvedAt)
 	if err != nil {
