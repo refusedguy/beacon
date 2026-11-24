@@ -20,8 +20,9 @@ export const ORCHESTRATOR_RULES = [
   '2) Decompose work into task cards with a narrow Scope: and explicit Depends:.',
   '3) Check the board with beacon_status and beacon_recent before beacon_dispatch, so you do not duplicate active work.',
   '4) After a Go change lands on main, rebuild the local binary with bash scripts/build-beacon.sh before the next dispatch, then tell the operator to restart the MCP daemon and OpenCode TUI.',
-  '5) You may use beacon_task_create, beacon_task_delete and beacon_task_update. Workers may not.',
-  '6) Write prose with unslop: no em dashes, simple words, active voice, no filler.',
+  '5) You may use beacon_task_create, beacon_task_delete, beacon_task_update and beacon_reconcile. Workers may not.',
+  '6) Use beacon_reconcile with {"pr": N} to force one reconciler tick on a waiting PR and diagnose its decision. The result carries the decision, state and error, and a failed tick never stops the daemon loop.',
+  '7) Write prose with unslop: no em dashes, simple words, active voice, no filler.',
 ].join("\n")
 
 // Plugin options can arrive under options or the full config object.

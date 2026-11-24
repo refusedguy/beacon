@@ -5,6 +5,16 @@
       "description": "Default coding agent. Allowed to create tasks until workers move to the worker agent.",
       "permissions": [
         {
+          "action": "beacon_beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
           "action": "beacon_beacon_task_create",
           "effect": "allow",
           "resource": "*"
@@ -40,6 +50,16 @@
       "description": "Creates and dispatches Beacon tasks. The only agent allowed to create tasks.",
       "mode": "all",
       "permissions": [
+        {
+          "action": "beacon_beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_reconcile",
+          "effect": "allow",
+          "resource": "*"
+        },
         {
           "action": "beacon_beacon_task_create",
           "effect": "allow",
@@ -77,6 +97,16 @@
       "mode": "subagent",
       "permissions": [
         {
+          "action": "beacon_beacon_reconcile",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
+          "action": "beacon_reconcile",
+          "effect": "deny",
+          "resource": "*"
+        },
+        {
           "action": "beacon_beacon_task_create",
           "effect": "deny",
           "resource": "*"
@@ -110,6 +140,16 @@
     }
   },
   "permissions": [
+    {
+      "action": "beacon_beacon_reconcile",
+      "effect": "deny",
+      "resource": "*"
+    },
+    {
+      "action": "beacon_reconcile",
+      "effect": "deny",
+      "resource": "*"
+    },
     {
       "action": "beacon_beacon_task_create",
       "effect": "deny",

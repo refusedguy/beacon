@@ -63,9 +63,10 @@ func TestToolCatalogMatchesRegisteredTools(t *testing.T) {
 			orchestratorOnly++
 		}
 	}
-	if orchestratorOnly != 3 || !byName["beacon_task_create"].OrchestratorOnly ||
-		!byName["beacon_task_delete"].OrchestratorOnly || !byName["beacon_task_update"].OrchestratorOnly {
-		t.Fatalf("only task creation, deletion and update should be orchestrator-only: %+v", catalog)
+	if orchestratorOnly != 4 || !byName["beacon_task_create"].OrchestratorOnly ||
+		!byName["beacon_task_delete"].OrchestratorOnly || !byName["beacon_task_update"].OrchestratorOnly ||
+		!byName["beacon_reconcile"].OrchestratorOnly {
+		t.Fatalf("only task creation, deletion, update and reconcile should be orchestrator-only: %+v", catalog)
 	}
 }
 
@@ -576,5 +577,73 @@ func TestTaskUpdateRollsBackWhenCommitFails(t *testing.T) {
 	}
 	if string(content) != "---\nid: T-A\ntitle: Old\n---\nbody\n" {
 		t.Fatalf("failed commit did not restore card: %s", content)
+	}
+}
+
+type stubTickReconciler struct {
+	calls    int
+	pr       int
+	decision core.MergeDecision
+	err      error
+}
+
+func (s *stubTickReconciler) Reconcile(_ context.Context, pr int) (core.MergeDecision, error) {
+	s.calls++
+	s.pr = pr
+	return s.decision, s.err
+}
+
+func callReconcile(t *testing.T, cs *msdk.ClientSession, pr int) app.ReconcileResult {
+	t.Helper()
+	res, err := cs.CallTool(context.Background(), &msdk.CallToolParams{
+		Name:      "beacon_reconcile",
+		Arguments: map[string]any{"pr": pr},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError || len(res.Content) == 0 {
+		t.Fatalf("unexpected reconcile result: %+v", res)
+	}
+	text, ok := res.Content[0].(*msdk.TextContent)
+	if !ok {
+		t.Fatalf("unexpected result: %+v", res.Content)
+	}
+	var out app.ReconcileResult
+	if err := json.Unmarshal([]byte(text.Text), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestReconcileOverInMemoryTransport(t *testing.T) {
+	ticker := &stubTickReconciler{decision: core.MergeDecision{
+		Verdict: core.VerdictWait, Reason: "checks pending", Criterion: "checks",
+	}}
+	cs := deleteClient(t, Services{Reconcile: &app.ReconcileService{Reconciler: ticker}})
+
+	got := callReconcile(t, cs, 42)
+	if ticker.calls != 1 || ticker.pr != 42 {
+		t.Fatalf("reconcile calls = %d, pr = %d", ticker.calls, ticker.pr)
+	}
+	if got.PR != 42 || got.Decision.Verdict != "wait" ||
+		got.Decision.Reason != "checks pending" || got.Decision.Criterion != "checks" {
+		t.Fatalf("result = %+v", got)
+	}
+	if got.Error != "" {
+		t.Fatalf("unexpected error = %q", got.Error)
+	}
+}
+
+func TestReconcileReturnsErrorAsStructuredJSON(t *testing.T) {
+	ticker := &stubTickReconciler{err: errors.New("scm unavailable")}
+	cs := deleteClient(t, Services{Reconcile: &app.ReconcileService{Reconciler: ticker}})
+
+	got := callReconcile(t, cs, 7)
+	if got.Error != "scm unavailable" {
+		t.Fatalf("error = %q", got.Error)
+	}
+	if ticker.calls != 1 {
+		t.Fatalf("reconcile calls = %d", ticker.calls)
 	}
 }

@@ -35,6 +35,7 @@ func newMCPCommand(configPath *string) *cobra.Command {
 				Dispatcher: w.dispatcher, Control: w.control, Status: w.status,
 				Wait: w.wait, TaskCreator: w.taskCreator,
 				TaskDeleter: w.taskDeleter, TaskUpdater: w.taskUpdater,
+				Reconcile: w.reconcile,
 			}
 			dir := filepath.Dir(w.cfg.StateDB)
 			info, connErr := readConnection(dir)

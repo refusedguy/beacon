@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/refusedguy/beacon/pkg/core"
@@ -36,6 +37,67 @@ func (s StatusService) Recent(ctx context.Context, limit int) ([]*core.Run, erro
 		limit = DefaultRecentLimit
 	}
 	return s.Store.ListRecent(ctx, limit)
+}
+
+// TickReconciler is the part of the reconciler a forced tick needs.
+type TickReconciler interface {
+	Reconcile(ctx context.Context, pr int) (core.MergeDecision, error)
+}
+
+// ReconcileDecision is the policy verdict produced by one forced tick.
+type ReconcileDecision struct {
+	Verdict   string `json:"verdict"`
+	Reason    string `json:"reason"`
+	Criterion string `json:"criterion"`
+}
+
+// ReconcileResult is the structured outcome of one forced reconciler tick.
+type ReconcileResult struct {
+	PR       int               `json:"pr"`
+	Decision ReconcileDecision `json:"decision"`
+	State    string            `json:"state"`
+	Error    string            `json:"error,omitempty"`
+}
+
+// ReconcileService runs one reconciler tick on demand. It captures errors and
+// panics in the result so a forced tick can never stop the daemon loop.
+type ReconcileService struct {
+	Reconciler TickReconciler
+	Store      RunStore
+}
+
+// Tick forces exactly one reconciler pass for pr and reports what happened. A
+// panic is recovered into Error, matching the reconciler loop's own guard.
+func (s *ReconcileService) Tick(ctx context.Context, pr int) (out ReconcileResult) {
+	out.PR = pr
+	defer func() {
+		if rec := recover(); rec != nil {
+			out.Error = fmt.Sprintf("reconcile panic: %v", rec)
+		}
+	}()
+	if pr <= 0 {
+		out.Error = "pr must be positive"
+		return out
+	}
+	if s.Reconciler == nil {
+		out.Error = "reconciler is not configured"
+		return out
+	}
+	decision, err := s.Reconciler.Reconcile(ctx, pr)
+	out.Decision = ReconcileDecision{
+		Verdict:   string(decision.Verdict),
+		Reason:    decision.Reason,
+		Criterion: decision.Criterion,
+	}
+	if err != nil {
+		out.Error = err.Error()
+	}
+	if s.Store != nil {
+		if run, lookupErr := s.Store.FindByPR(ctx, pr); lookupErr == nil && run != nil {
+			out.State = string(run.State)
+		}
+	}
+	return out
 }
 
 type WaitService struct {
