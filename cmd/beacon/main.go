@@ -281,7 +281,13 @@ func newHarness(cfg config.Config, token, parent string) (core.AgentHarness, err
 	parent = firstNonEmpty(parent, cfg.Harness.ParentSessionID)
 	switch cfg.Harness.Provider {
 	case "opencode", "":
-		h := opencode.New(cfg.Harness.Endpoint, cfg.Harness.Model, cfg.Harness.Command, token, parent)
+		h := opencode.New(opencode.Config{
+			Endpoint:        cfg.Harness.Endpoint,
+			Model:           cfg.Harness.Model,
+			Agent:           cfg.Harness.Command,
+			Token:           token,
+			ParentSessionID: parent,
+		})
 		h.ModelRef = resolveModel(cfg, token, parent)
 		return h, nil
 	default:
