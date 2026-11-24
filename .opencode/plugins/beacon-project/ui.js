@@ -77,7 +77,9 @@ async function setup(ctx, deps = {}) {
   const color = (key) => key === "base" ? theme.text.base
     : key === "muted" ? theme.text.muted
       : key === "action" ? theme.text.action.primary.base
-        : theme.text.feedback[key]?.base ?? theme.text.muted
+        : key === "raised" ? theme.background.raised.high
+          : key === "border" ? (theme.border?.raised?.base ?? theme.text.action.primary.base)
+            : theme.text.feedback[key]?.base ?? theme.text.muted
   let detailOpen = false
   let stopped = false
   let pollTimer
@@ -152,7 +154,7 @@ async function setup(ctx, deps = {}) {
       entry = createDetailMount(ui, {
         setProp, color, BOLD,
         onItem: (item) => { if (item.sectionKey) toggleSection("detail", item.sectionKey) },
-        onAction: (name) => void runAction(name, selectedRun()),
+        onAction: (name, opts) => void runAction(name, selectedRun(), opts),
         onToggle: () => { if (panelIsOpen()) closeDetail(); else openDetail() },
         onClose: closeDetail,
       })

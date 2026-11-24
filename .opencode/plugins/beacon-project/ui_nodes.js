@@ -43,13 +43,17 @@ export function createLineMount(ui, {
       if (!item) { setProp(box, "visible", false); return }
       const [marker, name, status] = cellsByLine[i]
       const fg = color(item.color ?? "base")
+      // Per-cell overrides let the sidebar color a marker by state while the
+      // title stays in the base tone. Defaults match the original line pool.
+      const markerFG = color(item.markerColor ?? item.color ?? "base")
+      const nameFG = color(item.nameColor ?? item.color ?? "base")
       // The host does not apply the box gap between text cells. Run markers
       // carry markerSpace so "✔" never runs into the title as "✔Hotfix".
       setProp(marker, "content", item.markerSpace && item.marker ? `${item.marker} ` : item.marker ?? "")
-      setProp(marker, "fg", fg)
+      setProp(marker, "fg", markerFG)
       setProp(name, "content", item.text ?? item.name ?? "")
-      setProp(name, "fg", fg)
-      setProp(name, "attributes", item.bold ? BOLD : 0)
+      setProp(name, "fg", nameFG)
+      setProp(name, "attributes", (item.nameBold ?? item.bold) ? BOLD : 0)
       setProp(status, "content", item.status ?? "")
       setProp(status, "fg", item.statusColor ? color(item.statusColor) : fg)
       setProp(box, "visible", true)

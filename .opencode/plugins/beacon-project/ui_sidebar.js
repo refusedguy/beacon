@@ -1,29 +1,93 @@
-// Sidebar slot: a flat list of fixed line nodes beside the native Context and
-// MCP sections. Header, proportional state bar and the two collapsible groups
-// are allocated once in the render callback and only updated by apply().
-import { createBox, createLineMount, createSegmentBar } from "./ui_nodes.js"
+// Sidebar slot: a dedicated Beacon header row, a wide state bar, a muted
+// legend and the pooled Active/Recent line list. The header and Dispatch are
+// real boxes so they align and hover like the native Context/MCP sections.
+import { createBox, createLineMount, createSegmentBar, createText } from "./ui_nodes.js"
+import { truncateSidebarTitle } from "./ui_view.js"
 
 export const SIDEBAR_ACTIVE_LIMIT = 8
 export const SIDEBAR_LINES = 34
 
+// Presentation stays out of the renderer. Active titles keep the base tone and
+// go bold only on attention states; Recent rows stay calm and unbolded. Long
+// names are clipped from the end instead of using the host's middle ellipsis.
+export function sidebarPresentation(items = []) {
+  return items.map((item) => {
+    if (!item.runID) {
+      const isDispatch = item.action === "dispatch"
+      const isSection = Boolean(item.sectionKey)
+      return {
+        ...item,
+        nameColor: isDispatch ? "success" : isSection ? "action" : "muted",
+        nameBold: false,
+        markerColor: item.color ?? "muted",
+        statusColor: "muted",
+      }
+    }
+    const attention = item.color === "error" || item.color === "warning"
+    const recent = item.recent === true
+    const isRef = /^[#T]/.test(String(item.marker ?? ""))
+    return {
+      ...item,
+      name: truncateSidebarTitle(item.name),
+      nameColor: recent ? "muted" : "base",
+      nameBold: recent ? false : attention,
+      markerColor: recent ? "muted" : item.color ?? "muted",
+      statusColor: item.statusColor ?? (recent || isRef ? "muted" : item.color ?? "muted"),
+    }
+  })
+}
+
 export function createSidebarMount(ui, deps) {
-  const { insert } = ui
+  const { insert, setProp } = ui
+  const { color, BOLD, onItem, hoverBg } = deps
+  const set = setProp ?? ((node, key, value) => { node.props[key] = value })
   const container = createBox(ui, { flexDirection: "column", minWidth: 0 })
-  const title = createLineMount(ui, { ...deps, maxLines: 1 })
-  const bar = createSegmentBar(ui, deps.color)
-  const meta = createLineMount(ui, { ...deps, maxLines: 2 })
-  const list = createLineMount(ui, { ...deps, maxLines: SIDEBAR_LINES })
-  title.node.forEach((node) => insert(container, node))
+
+  // Standalone header box at column 0, not a cell of the shared line pool.
+  const header = createBox(ui, {
+    flexDirection: "row", justifyContent: "space-between", minWidth: 0, marginTop: 1,
+  })
+  const headerName = createText(ui, { content: "Beacon", fg: color("action") })
+  set(headerName, "attributes", BOLD)
+  const headerSummary = createText(ui, { content: "", fg: color("muted") })
+  insert(header, headerName); insert(header, headerSummary)
+  insert(container, header)
+
+  const bar = createSegmentBar(ui, color)
   insert(container, bar.node)
+
+  const meta = createLineMount(ui, { ...deps, maxLines: 2 })
   meta.node.forEach((node) => insert(container, node))
+
+  const list = createLineMount(ui, { ...deps, maxLines: SIDEBAR_LINES })
   list.node.forEach((node) => insert(container, node))
+
+  const raised = color("raised")
+  // The Dispatch line becomes a padded, themed button. Pooled rows reset every
+  // apply, so a row that used to be Dispatch never keeps the button styling.
+  const decorateRows = () => list.node.forEach((box) => {
+    const dispatch = box.item?.action === "dispatch"
+    set(box, "marginTop", dispatch ? 1 : 0)
+    set(box, "paddingLeft", dispatch ? 1 : 0)
+    set(box, "paddingRight", dispatch ? 1 : 0)
+    set(box, "backgroundColor", dispatch ? raised : undefined)
+    set(box, "onMouseUp", dispatch ? () => onItem(box.item) : undefined)
+    set(box, "onMouseOver", () => set(box, "backgroundColor", hoverBg))
+    set(box, "onMouseOut", () => set(box, "backgroundColor", dispatch ? raised : undefined))
+  })
+
   const apply = (model, error = null) => {
-    title.apply([{ marker: "", name: "Beacon", status: model.summary, color: "action", bold: true }])
+    // The header carries its item for the click/refresh contract even though
+    // it is no longer allocated by createLineMount.
+    header.item = { name: "Beacon", status: model.summary, color: "action" }
+    set(headerName, "content", "Beacon")
+    set(headerSummary, "content", model.summary ?? "")
     bar.apply(model.segments)
     const metaItems = [{ marker: "", name: model.legend, status: "", color: "muted" }]
     if (error) metaItems.push({ marker: "", name: `[stale] ${error}`, status: "", color: "warning" })
     meta.apply(metaItems)
-    list.apply(model.listItems)
+    list.apply(sidebarPresentation(model.listItems))
+    decorateRows()
   }
-  return { node: container, apply }
+  return { node: container, apply, header, headerName, headerSummary, bar: bar.node }
 }

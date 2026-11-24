@@ -8,67 +8,130 @@ export const DETAIL_LINES = 80
 const ACTION_LABEL = Object.freeze({
   retry: "↻ Retry", approve: "✔ Approve", cancel: "✖ Cancel", copy: "⧉ Copy ID",
 })
-const label = (text) => text.padEnd(10, " ")
+const fieldKey = (text) => text.padEnd(8, " ")
 
 export function createDetailMount(ui, deps) {
   const { insert } = ui
   const { color, BOLD, onAction, onToggle, onClose, setProp } = deps
   const set = setProp ?? ((node, key, value) => { node.props[key] = value })
   const container = createBox(ui, { flexDirection: "column", minWidth: 0, flexGrow: 1 })
+
   const header = createBox(ui, { flexDirection: "row", justifyContent: "space-between", minWidth: 0 })
   const title = createText(ui, { content: "Beacon", fg: color("base"), bold: true })
   set(title, "attributes", BOLD)
   insert(header, title)
-  const controls = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
+  const controls = createBox(ui, { flexDirection: "row", minWidth: 0 })
   const hint = createText(ui, { content: "ctrl+g", fg: color("action"), onMouseUp: onToggle })
+  set(hint, "paddingLeft", 1); set(hint, "paddingRight", 1)
+  const gap = createText(ui, { content: " ", fg: color("muted") })
   const close = createText(ui, { content: "✕", fg: color("error"), onMouseUp: onClose })
-  insert(controls, hint); insert(controls, close)
+  set(close, "paddingLeft", 1); set(close, "paddingRight", 1)
+  insert(controls, hint); insert(controls, gap); insert(controls, close)
   insert(header, controls)
   insert(container, header)
 
-  const card = createBox(ui, { border: true, borderStyle: "single", borderColor: color("action"), flexDirection: "column", minWidth: 0 })
-  const badgeRow = createBox(ui, { flexDirection: "row", justifyContent: "space-between", gap: 1, minWidth: 0 })
+  const heroCard = createBox(ui, {
+    border: true, borderStyle: "rounded", borderColor: color("action"),
+    backgroundColor: color("raised"), paddingLeft: 1, paddingRight: 1,
+    paddingTop: 1, paddingBottom: 1, marginTop: 1,
+    flexDirection: "column", minWidth: 0,
+  })
+  const badgeRow = createBox(ui, { flexDirection: "row", justifyContent: "space-between", minWidth: 0 })
   const badge = createText(ui, { content: "", fg: color("base"), bold: true })
   set(badge, "attributes", BOLD)
   const pr = createText(ui, { content: "", fg: color("info") })
   insert(badgeRow, badge); insert(badgeRow, pr)
-  insert(card, badgeRow)
+  insert(heroCard, badgeRow)
+
   // A non-growing wrapped text node keeps its own height inside the column
   // card. A growing one collapsed to zero height in the real host.
   const heroTitle = createText(ui, { content: "", fg: color("base"), wrap: true })
   set(heroTitle, "attributes", BOLD)
-  insert(card, heroTitle)
+  insert(heroCard, heroTitle)
+
+  const fields = createBox(ui, { flexDirection: "column", minWidth: 0, marginTop: 1 })
   const kvRow = (name) => {
-    const row = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
-    const key = createText(ui, { content: label(name), fg: color("muted") })
+    const row = createBox(ui, { flexDirection: "row", minWidth: 0 })
+    const key = createText(ui, { content: fieldKey(name), fg: color("muted") })
+    const spacer = createText(ui, { content: " ", fg: color("muted") })
     const value = createText(ui, { content: "", fg: color("base"), wrap: true, grow: true })
-    insert(row, key); insert(row, value)
-    insert(card, row)
+    insert(row, key); insert(row, spacer); insert(row, value)
+    insert(fields, row)
     return value
   }
   const taskValue = kvRow("Task")
   const branchValue = kvRow("Branch")
   const phaseValue = kvRow("Phase")
-  const actions = createBox(ui, { flexDirection: "row", gap: 1, minWidth: 0 })
+  insert(heroCard, fields)
+
+  // Each action is a padded box. Copy ID stays mounted and visible so merged
+  // and closed runs can still be copied. Cancel shows an inline confirmation.
+  const showConfirm = (visible) => set(confirmBox, "visible", visible)
+  const actions = createBox(ui, { flexDirection: "row", minWidth: 0, marginTop: 1 })
   const buttons = Object.create(null)
+  const buttonBoxes = Object.create(null)
   for (const name of ACTION_NAMES) {
-    const node = createText(ui, {
-      content: ACTION_LABEL[name], fg: color(name === "cancel" ? "error" : "action"),
-      name: `beacon-action-${name}`, onMouseUp: () => onAction(name),
+    const baseBg = color(name === "cancel" ? "error" : name === "retry" ? "warning" : "raised")
+    const box = createBox(ui, {
+      flexDirection: "row", paddingLeft: 1, paddingRight: 1,
+      marginRight: name === "copy" ? 0 : 1, backgroundColor: baseBg,
+      onMouseOver: () => set(box, "backgroundColor", color("raised")),
+      onMouseOut: () => set(box, "backgroundColor", baseBg),
     })
-    // Copy ID must be visible from the first mount. The host does not reveal a
-    // button that was created with visible=false on a merged run.
-    set(node, "visible", name === "copy")
-    buttons[name] = node
-    insert(actions, node)
+    const text = createText(ui, {
+      content: ACTION_LABEL[name], fg: color(name === "cancel" ? "error" : "action"),
+      name: `beacon-action-${name}`,
+      onMouseUp: () => (name === "cancel" ? showConfirm(true) : onAction(name)),
+    })
+    set(box, "onMouseUp", () => (name === "cancel" ? showConfirm(true) : onAction(name)))
+    set(box, "visible", name === "copy")
+    set(text, "visible", name === "copy")
+    insert(box, text)
+    insert(actions, box)
+    buttons[name] = text
+    buttonBoxes[name] = box
   }
-  insert(card, actions)
-  insert(container, card)
+  insert(heroCard, actions)
+
+  const confirmBox = createBox(ui, {
+    border: true, borderStyle: "rounded", borderColor: color("error"),
+    backgroundColor: color("raised"), paddingLeft: 1, paddingRight: 1,
+    paddingTop: 1, paddingBottom: 1, marginTop: 1,
+    flexDirection: "column", minWidth: 0, visible: false,
+  })
+  const confirmText = createText(ui, { content: "Отменить этот ран?", fg: color("error"), bold: true })
+  set(confirmText, "attributes", BOLD)
+  const confirmActions = createBox(ui, { flexDirection: "row", minWidth: 0, marginTop: 1 })
+  const yes = createText(ui, { content: "Да, отменить", fg: color("error"),
+    onMouseUp: () => { showConfirm(false); onAction("cancel", { confirmed: true }) } })
+  const no = createText(ui, { content: "Нет", fg: color("muted"), onMouseUp: () => showConfirm(false) })
+  insert(confirmActions, yes); insert(confirmActions, no)
+  insert(confirmBox, confirmText); insert(confirmBox, confirmActions)
+  insert(heroCard, confirmBox)
+  insert(container, heroCard)
 
   const scroll = createBox(ui, { scroll: true, flexGrow: 1, minWidth: 0 })
   const body = createLineMount(ui, { ...deps, maxLines: DETAIL_LINES, wrap: true })
   body.node.forEach((node) => insert(scroll, node))
   insert(container, scroll)
+
+  // Section cards and padded keys are host-side props on the pooled row box.
+  // Nothing here reads box.children, so the real host without children works.
+  const decorate = (box, item) => {
+    for (const key of ["border", "borderStyle", "borderColor", "backgroundColor",
+      "paddingLeft", "paddingRight", "paddingTop", "paddingBottom", "marginTop"]) set(box, key, undefined)
+    if (!item) return
+    if (item.kind === "section") set(box, "marginTop", item.name === "Why / Blocker" ? 0 : 1)
+    if (item.kind === "reason") {
+      set(box, "border", true)
+      set(box, "borderStyle", "rounded")
+      set(box, "borderColor", color(item.color === "error" ? "error" : "action"))
+      set(box, "backgroundColor", color("raised"))
+      set(box, "paddingLeft", 1)
+      set(box, "paddingRight", 1)
+      set(box, "marginTop", 1)
+    }
+  }
 
   const apply = (model = {}, run = null) => {
     set(badge, "content", model.badge ?? "")
@@ -81,9 +144,19 @@ export function createDetailMount(ui, deps) {
     const available = new Set(model.actions ?? [])
     set(actions, "visible", Boolean(run))
     for (const name of ACTION_NAMES) {
-      set(buttons[name], "visible", Boolean(run) && (name === "copy" || available.has(name)))
+      const visible = Boolean(run) && (name === "copy" || available.has(name))
+      set(buttons[name], "visible", visible)
+      set(buttonBoxes[name], "visible", visible)
     }
-    body.apply(model.rows ?? [])
+    if (!available.has("cancel")) set(confirmBox, "visible", false)
+    const rows = (model.rows ?? []).map((item) => item.kind === "check"
+      ? { ...item, markerColor: item.marker === "✖" ? "error" : item.marker === "✔" ? "success" : "info" }
+      : item)
+    body.apply(rows)
+    body.node.forEach((box, i) => decorate(box, rows[i]))
   }
-  return { node: container, apply, buttons, open: DETAIL_OPEN }
+  return {
+    node: container, apply, buttons, buttonBoxes, heroCard, confirmBox, body,
+    open: DETAIL_OPEN,
+  }
 }

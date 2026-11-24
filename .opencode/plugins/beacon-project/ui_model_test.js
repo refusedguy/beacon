@@ -86,7 +86,7 @@ test("a merged run drops the reason and shows the real merge total", () => {
   }, null, NOW)
   assert.ok(result.some((line) => line.includes("M37")), "the legend uses metrics.mergeCount")
   assert.equal(result.filter((line) => line.includes("automatic rebase")).length, 0)
-  assert.ok(result.some((line) => line.includes("✔ T-1 MERGED")))
+  assert.ok(result.some((line) => line.includes("✔ T-1 OK")), "recent rows use the calm OK badge")
   assert.ok(result.some((line) => line.includes("#42")))
 })
 
