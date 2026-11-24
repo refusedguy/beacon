@@ -459,7 +459,15 @@ export function createRowMount(ui, { color, BOLD = 0, onRow, hoverBg }) {
 }
 
 async function setup(ctx, deps = {}) {
-  const load = deps.import ?? ((specifier) => import(specifier))
+  // OpenCode's plugin loader rewrites literal import("...") specifiers so they
+  // resolve inside the plugin directory. A dynamic import built from a
+  // variable is invisible to that rewrite and fails with "Cannot find package".
+  const load = deps.import ?? ((specifier) => {
+    if (specifier === "@opentui/solid") return import("@opentui/solid")
+    if (specifier === "solid-js") return import("solid-js")
+    if (specifier === "@opentui/core") return import("@opentui/core")
+    throw new Error(`Unsupported module specifier: ${specifier}`)
+  })
   const [{ createElement, insert, setProp }, { createSignal }] = await Promise.all([
     load("@opentui/solid"), load("solid-js"),
   ])

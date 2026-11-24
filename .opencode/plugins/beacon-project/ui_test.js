@@ -353,6 +353,16 @@ test("row mount reuses nodes across refreshes and keeps the click handler", () =
   assert.equal(container.children[beforeHide - 1].props.visible, false)
 })
 
+test("setup fallback uses literal imports so OpenCode can rewrite the specifiers", () => {
+  const src = readFileSync(new URL("./ui.js", import.meta.url), "utf8")
+  for (const specifier of ["@opentui/solid", "solid-js", "@opentui/core"]) {
+    assert.ok(src.includes(`return import("${specifier}")`), `literal import("${specifier}") present`)
+  }
+  assert.equal(/import\(specifier\)/.test(src), false, "no computed dynamic import fallback")
+  assert.ok(src.includes("deps.import ?? "), "injected import seam is preserved")
+  assert.ok(src.includes('await import("@opencode/plugin/tui")'), "plugin import stays literal")
+})
+
 test("setup defers every createElement to a slot render callback", async () => {
   const created = []
   const ui = {
