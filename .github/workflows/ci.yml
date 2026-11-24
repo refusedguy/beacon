@@ -3,7 +3,13 @@ name: ci
 on:
   push:
     branches: [main, refactor/clean-core]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
 
 permissions:
   contents: read
@@ -20,8 +26,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.26'
           cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
 
       - name: Root module
         run: go build ./...
@@ -43,8 +52,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.26'
           cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
 
       - name: Root module
         run: go vet ./...
@@ -64,8 +76,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.26'
           cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
 
       - name: Root module
         run: go test ./...
@@ -85,8 +100,11 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: '1.26'
           cache: true
+          cache-dependency-path: |
+            go.sum
+            ui/tui/go.sum
 
       - name: Format check
         run: test -z "$(gofmt -l cmd internal pkg harnesses ui arch_test.go)"
@@ -96,15 +114,8 @@ jobs:
         with:
           version: v2.15
 
-  advisory:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
       - name: Production file size advisory
         run: bash scripts/ci-advisory.sh
+
+      - name: Plugin tests
+        run: node --test .opencode/plugins/beacon-project/*_test.js
