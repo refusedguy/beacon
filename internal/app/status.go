@@ -179,6 +179,7 @@ type RunSnapshot struct {
 	CreatedAt         time.Time       `json:"created_at"`
 	UpdatedAt         time.Time       `json:"updated_at"`
 	Durations         Durations       `json:"durations"`
+	CIWallSeconds     int64           `json:"ci_wall_seconds"`
 	Timeline          []RunEvent      `json:"timeline"`
 	Decisions         []Decision      `json:"decisions"`
 	Checks            []CheckSnapshot `json:"checks"`
@@ -475,7 +476,7 @@ func makeRunSnapshot(run *core.Run, timeline map[string][]RunEvent, histories ma
 		RebaseAttempts: run.RebaseAttempts, FixAttempts: run.FixAttempts,
 		MaxAttempts: run.MaxAttempts, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 		Durations: deriveDurations(run, events, now), Timeline: events, Decisions: decisions,
-		Checks: checkSnapshots(run.Checks),
+		Checks: checkSnapshots(run.Checks), CIWallSeconds: core.CIWallSeconds(run.Checks),
 	}
 }
 
